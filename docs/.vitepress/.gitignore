@@ -1,0 +1,6 @@
+/.temp/
+/dist/
+/cache/
+archives/_extract/
+archives/downloaded.tar.gz
+archives/*.tar.gz

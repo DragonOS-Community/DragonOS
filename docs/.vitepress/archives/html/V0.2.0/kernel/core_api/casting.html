@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="zh-CN">
+<head>
+  <meta charset="utf-8" /><meta name="generator" content="Docutils 0.18.1: http://docutils.sourceforge.net/" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>类型转换库API &mdash; DragonOS dev 文档</title>
+      <link rel="stylesheet" type="text/css" href="../../_static/pygments.css" />
+      <link rel="stylesheet" type="text/css" href="../../_static/css/theme.css" />
+
+  
+  <!--[if lt IE 9]>
+    <script src="../../_static/js/html5shiv.min.js"></script>
+  <![endif]-->
+  
+        <script data-url_root="../../" id="documentation_options" src="../../_static/documentation_options.js"></script>
+        <script src="../../_static/jquery.js"></script>
+        <script src="../../_static/underscore.js"></script>
+        <script src="../../_static/_sphinx_javascript_frameworks_compat.js"></script>
+        <script src="../../_static/doctools.js"></script>
+        <script src="../../_static/translations.js"></script>
+    <script src="../../_static/js/theme.js"></script>
+    <link rel="index" title="索引" href="../../genindex.html" />
+    <link rel="search" title="搜索" href="../../search.html" />
+    <link rel="next" title="Notifier Chian 通知链" href="notifier_chain.html" />
+    <link rel="prev" title="原子变量" href="atomic.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="../../index.html" class="icon icon-home">
+            DragonOS
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="../../search.html" method="get">
+    <input type="text" name="q" placeholder="搜索文档" aria-label="搜索文档" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="导航菜单">
+              <p class="caption" role="heading"><span class="caption-text">入门</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../introduction/index.html">DragonOS简介</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../introduction/build_system.html">构建DragonOS</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../introduction/mirrors.html">DragonOS镜像站</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">内核层</span></p>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../configuration/index.html">内核编译配置</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../boot/index.html">引导加载</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">核心API文档</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="kernel_api.html">DragonOS内核核心API</a></li>
+<li class="toctree-l2"><a class="reference internal" href="atomic.html">原子变量</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">类型转换库API</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#id1">1. 数值类型转换</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#id2">1.1. 整数类型与枚举类型之间的转换</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="#arc">2. Arc类型转换</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#arc-dyn-u-arc-t">2.1 从Arc<dyn U>转换为Arc<T></a></li>
+</ul>
+</li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="notifier_chain.html">Notifier Chian 通知链</a></li>
+<li class="toctree-l2"><a class="reference internal" href="softirq.html">软中断</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">锁</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../process_management/index.html">进程管理模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sched/index.html">DragonOS调度</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ipc/index.html">进程间通信</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../memory_management/index.html">内存管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystem/index.html">文件系统</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../debug/index.html">内核调试模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ktest/index.html">内核测试</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu_arch/index.html">处理器架构</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../container/index.html">容器化</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../libs/index.html">其他内核库</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">内核跟踪机制</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../syscall/index.html">系统调用</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">应用层</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../userland/appdev/index.html">应用程序开发文档</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Q&amp;A</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../questions/index.html">常见问题解答</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">DragonOS社区</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../community/code_contribution/index.html">参与开发</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../community/contact/index.html">与社区建立联系</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../community/ChangeLog/index.html">发行日志</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Translations</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../locales/en/index.html">English</a></li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="移动版导航菜单" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../../index.html">DragonOS</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="页面导航">
+  <ul class="wy-breadcrumbs">
+      <li><a href="../../index.html" class="icon icon-home" aria-label="Home"></a></li>
+          <li class="breadcrumb-item"><a href="index.html">核心API文档</a></li>
+      <li class="breadcrumb-item active">类型转换库API</li>
+      <li class="wy-breadcrumbs-aside">
+              <a href="https://github.com/DragonOS-Community/DragonOS/blob/c0d0501/docs/kernel/core_api/casting.md" class="fa fa-github"> 在 GitHub 上编辑</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section class="tex2jax_ignore mathjax_ignore" id="api">
+<h1>类型转换库API<a class="headerlink" href="#api" title="Permalink to this heading"></a></h1>
+<p>  内核提供了一些函数来帮助你在不同的类型之间进行转换。包括以下类型：</p>
+<ul class="simple">
+<li><p>数值类型转换 （使用<code class="docutils literal notranslate"><span class="pre">num-traits</span></code>库）</p></li>
+<li><p>Arc类型转换</p></li>
+</ul>
+<p>  上述没有特殊标明的函数，都是在<code class="docutils literal notranslate"><span class="pre">kernel/src/libs/casting.rs</span></code>中实现的。</p>
+<section id="id1">
+<h2>1. 数值类型转换<a class="headerlink" href="#id1" title="Permalink to this heading"></a></h2>
+<section id="id2">
+<h3>1.1. 整数类型与枚举类型之间的转换<a class="headerlink" href="#id2" title="Permalink to this heading"></a></h3>
+<p>  您可以使用<code class="docutils literal notranslate"><span class="pre">num-traits</span></code>库提供的宏，实现枚举类型和整数类型之间的转换。
+SystemError枚举类型使用了这种方式，您可以在<code class="docutils literal notranslate"><span class="pre">kernel/src/syscall/mod.rs</span></code>中找到它的用法。</p>
+<p>  它首先继承了<code class="docutils literal notranslate"><span class="pre">FromPrimitive,</span> <span class="pre">ToPrimitive</span></code>两个trait，然后这样转换：</p>
+<div class="highlight-rust notranslate"><div class="highlight"><pre><span></span><span class="k">impl</span><span class="w"> </span><span class="n">SystemError</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="sd">/// @brief 把posix错误码转换为系统错误枚举类型。</span>
+<span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="k">fn</span> <span class="nf">from_posix_errno</span><span class="p">(</span><span class="n">errno</span>: <span class="kt">i32</span><span class="p">)</span><span class="w"> </span>-&gt; <span class="nb">Option</span><span class="o">&lt;</span><span class="n">SystemError</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="c1">// posix 错误码是小于0的</span>
+<span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="n">errno</span><span class="w"> </span><span class="o">&gt;=</span><span class="w"> </span><span class="mi">0</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="k">return</span><span class="w"> </span><span class="nb">None</span><span class="p">;</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="o">&lt;</span><span class="bp">Self</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="n">FromPrimitive</span><span class="o">&gt;</span>::<span class="n">from_i32</span><span class="p">(</span><span class="o">-</span><span class="n">errno</span><span class="p">);</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="sd">/// @brief 把系统错误枚举类型转换为负数posix错误码。</span>
+<span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="k">fn</span> <span class="nf">to_posix_errno</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">)</span><span class="w"> </span>-&gt; <span class="kt">i32</span> <span class="p">{</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="o">-&lt;</span><span class="bp">Self</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="n">ToPrimitive</span><span class="o">&gt;</span>::<span class="n">to_i32</span><span class="p">(</span><span class="bp">self</span><span class="p">).</span><span class="n">unwrap</span><span class="p">();</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+</pre></div>
+</div>
+<p>  这两个函数很好的说明了如何使用这两个trait。</p>
+</section>
+</section>
+<section id="arc">
+<h2>2. Arc类型转换<a class="headerlink" href="#arc" title="Permalink to this heading"></a></h2>
+<section id="arc-dyn-u-arc-t">
+<h3>2.1 从Arc<dyn U>转换为Arc<T><a class="headerlink" href="#arc-dyn-u-arc-t" title="Permalink to this heading"></a></h3>
+<p>  当我们需要把一个<code class="docutils literal notranslate"><span class="pre">Arc&lt;dyn</span> <span class="pre">U&gt;</span></code>转换为<code class="docutils literal notranslate"><span class="pre">Arc&lt;T&gt;</span></code>的具体类型指针时，我们要为<code class="docutils literal notranslate"><span class="pre">U</span></code>这个trait实现<code class="docutils literal notranslate"><span class="pre">DowncastArc</span></code>trait。这个trait定义在<code class="docutils literal notranslate"><span class="pre">kernel/src/libs/casting.rs</span></code>中。它要求<code class="docutils literal notranslate"><span class="pre">trait</span> <span class="pre">U</span></code>实现<code class="docutils literal notranslate"><span class="pre">Any</span> <span class="pre">+</span> <span class="pre">Sync</span> <span class="pre">+</span> <span class="pre">Send</span></code>trait.</p>
+<p>  为<code class="docutils literal notranslate"><span class="pre">trait</span> <span class="pre">U:</span> <span class="pre">Any</span> <span class="pre">+</span> <span class="pre">Send</span> <span class="pre">+</span> <span class="pre">Sync</span></code>实现<code class="docutils literal notranslate"><span class="pre">DowncastArc</span></code>trait，需要这样做：</p>
+<div class="highlight-rust notranslate"><div class="highlight"><pre><span></span><span class="k">impl</span><span class="w"> </span><span class="n">DowncastArc</span><span class="w"> </span><span class="k">for</span><span class="w"> </span><span class="k">dyn</span><span class="w"> </span><span class="n">U</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">fn</span> <span class="nf">as_any_arc</span><span class="p">(</span><span class="bp">self</span>: <span class="nc">Arc</span><span class="o">&lt;</span><span class="bp">Self</span><span class="o">&gt;</span><span class="p">)</span><span class="w"> </span>-&gt; <span class="nc">Arc</span><span class="o">&lt;</span><span class="k">dyn</span><span class="w"> </span><span class="n">Any</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="bp">self</span><span class="p">;</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+</pre></div>
+</div>
+<p>  使用<code class="docutils literal notranslate"><span class="pre">DowncastArc</span></code>trait，我们可以这样转换：</p>
+<div class="highlight-rust notranslate"><div class="highlight"><pre><span></span><span class="kd">let</span><span class="w"> </span><span class="n">arc</span>: <span class="nc">Arc</span><span class="o">&lt;</span><span class="k">dyn</span><span class="w"> </span><span class="n">U</span><span class="o">&gt;</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="o">..</span><span class="p">.;</span>
+<span class="kd">let</span><span class="w"> </span><span class="n">arc_t</span>: <span class="nc">Arc</span><span class="o">&lt;</span><span class="n">T</span><span class="o">&gt;</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">arc</span><span class="p">.</span><span class="n">downcast_arc</span>::<span class="o">&lt;</span><span class="n">T</span><span class="o">&gt;</span><span class="p">().</span><span class="n">unwrap</span><span class="p">();</span>
+</pre></div>
+</div>
+<p>  如果<code class="docutils literal notranslate"><span class="pre">arc</span></code>的具体类型不是<code class="docutils literal notranslate"><span class="pre">Arc&lt;T&gt;</span></code>，那么<code class="docutils literal notranslate"><span class="pre">downcast_arc::&lt;T&gt;()</span></code>会返回<code class="docutils literal notranslate"><span class="pre">None</span></code>。</p>
+</section>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="页脚">
+        <a href="atomic.html" class="btn btn-neutral float-left" title="原子变量" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> 上一页</a>
+        <a href="notifier_chain.html" class="btn btn-neutral float-right" title="Notifier Chian 通知链" accesskey="n" rel="next">下一页 <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; 版权所有 2022-2025, DragonOS Community.
+      <span class="commit">版本 <code>c0d0501</code>.
+      </span></p>
+  </div>
+
+  利用 <a href="https://www.sphinx-doc.org/">Sphinx</a> 构建，使用的 
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">主题</a>
+    由 <a href="https://readthedocs.org">Read the Docs</a> 开发.
+  
+<div>
+    <br>
+    官网 <a href="https://dragonos.org">https://dragonos.org</a> | 论坛 <a href="https://bbs.dragonos.org.cn">https://bbs.dragonos.org.cn</a> |  <a href="https://dragonos.org">赞助DragonOS，成就未来！</a>
+</div>
+
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  
+<div class="rst-versions" data-toggle="rst-versions" role="note" aria-label="versions">
+  <span class="rst-current-version" data-toggle="rst-current-version">
+    <span class="fa fa-book"> Other Versions</span>
+    v: V0.2.0
+    <span class="fa fa-caret-down"></span>
+  </span>
+  <div class="rst-other-versions">
+    <dl>
+      <dt>Tags</dt>
+      <dd><a href="../../../V0.1.0/index.html">V0.1.0</a></dd>
+      <dd><a href="../../../V0.1.1/index.html">V0.1.1</a></dd>
+      <dd><a href="../../../V0.1.10/kernel/core_api/casting.html">V0.1.10</a></dd>
+      <dd><a href="../../../V0.1.2/index.html">V0.1.2</a></dd>
+      <dd><a href="../../../V0.1.3/index.html">V0.1.3</a></dd>
+      <dd><a href="../../../V0.1.4/index.html">V0.1.4</a></dd>
+      <dd><a href="../../../V0.1.5/index.html">V0.1.5</a></dd>
+      <dd><a href="../../../V0.1.6/index.html">V0.1.6</a></dd>
+      <dd><a href="../../../V0.1.7/kernel/core_api/casting.html">V0.1.7</a></dd>
+      <dd><a href="../../../V0.1.8/kernel/core_api/casting.html">V0.1.8</a></dd>
+      <dd><a href="../../../V0.1.9/kernel/core_api/casting.html">V0.1.9</a></dd>
+      <dd><a href="casting.html">V0.2.0</a></dd>
+      <dd><a href="../../../V0.3.0/kernel/core_api/casting.html">V0.3.0</a></dd>
+      <dd><a href="../../../V0.4.0/kernel/core_api/casting.html">V0.4.0</a></dd>
+    </dl>
+    <dl>
+      <dt>Branches</dt>
+      <dd><a href="../../../master/kernel/core_api/casting.html">master</a></dd>
+    </dl>
+  </div>
+</div><script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script>  
+
+  <style>
+         .wy-nav-content { max-width: 90%; }
+  </style>
+
+
+
+</body>
+</html>

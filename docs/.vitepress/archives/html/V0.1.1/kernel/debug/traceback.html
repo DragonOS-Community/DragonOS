@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="zh-CN">
+<head>
+  <meta charset="utf-8" /><meta name="generator" content="Docutils 0.18.1: http://docutils.sourceforge.net/" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>内核栈traceback &mdash; DragonOS dev 文档</title>
+      <link rel="stylesheet" type="text/css" href="../../_static/pygments.css" />
+      <link rel="stylesheet" type="text/css" href="../../_static/css/theme.css" />
+
+  
+  <!--[if lt IE 9]>
+    <script src="../../_static/js/html5shiv.min.js"></script>
+  <![endif]-->
+  
+        <script data-url_root="../../" id="documentation_options" src="../../_static/documentation_options.js"></script>
+        <script src="../../_static/jquery.js"></script>
+        <script src="../../_static/underscore.js"></script>
+        <script src="../../_static/_sphinx_javascript_frameworks_compat.js"></script>
+        <script src="../../_static/doctools.js"></script>
+        <script src="../../_static/translations.js"></script>
+    <script src="../../_static/js/theme.js"></script>
+    <link rel="index" title="索引" href="../../genindex.html" />
+    <link rel="search" title="搜索" href="../../search.html" />
+    <link rel="next" title="内核测试" href="../ktest/index.html" />
+    <link rel="prev" title="内核调试模块" href="index.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="../../index.html" class="icon icon-home">
+            DragonOS
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="../../search.html" method="get">
+    <input type="text" name="q" placeholder="搜索文档" aria-label="搜索文档" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="导航菜单">
+              <p class="caption" role="heading"><span class="caption-text">入门</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../introduction/index.html">DragonOS简介</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../introduction/build_system.html">构建DragonOS</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">内核层</span></p>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../boot/index.html">引导加载</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core_api/index.html">核心API文档</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">锁</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../process_management/index.html">进程管理模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sched/index.html">DragonOS调度</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../memory_management/index.html">内存管理文档</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystem/index.html">文件系统</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">内核调试模块</a><ul class="current">
+<li class="toctree-l2 current"><a class="current reference internal" href="#">内核栈traceback</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#id1">简介</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#api">API</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#void-traceback-struct-pt-regs-regs"><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">traceback(struct</span> <span class="pre">pt_regs</span> <span class="pre">*</span> <span class="pre">regs)</span></code></a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="#id4">实现原理</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#id5">未来发展方向</a></li>
+</ul>
+</li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../ktest/index.html">内核测试</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu_arch/index.html">处理器架构</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">应用层</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../userland/libc/index.html">LibC文档</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">系统调用api文档</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../syscall_api/index.html">系统调用API</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">DragonOS社区</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../community/code_contribution/index.html">参与开发</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../community/contact/index.html">与社区建立联系</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../community/ChangeLog/index.html">发行日志</a></li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="移动版导航菜单" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../../index.html">DragonOS</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="页面导航">
+  <ul class="wy-breadcrumbs">
+      <li><a href="../../index.html" class="icon icon-home" aria-label="Home"></a></li>
+          <li class="breadcrumb-item"><a href="index.html">内核调试模块</a></li>
+      <li class="breadcrumb-item active">内核栈traceback</li>
+      <li class="wy-breadcrumbs-aside">
+              <a href="https://github.com/DragonOS-Community/DragonOS/blob/d85ebf1/docs/kernel/debug/traceback.md" class="fa fa-github"> 在 GitHub 上编辑</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section class="tex2jax_ignore mathjax_ignore" id="traceback">
+<h1>内核栈traceback<a class="headerlink" href="#traceback" title="Permalink to this heading"></a></h1>
+<section id="id1">
+<h2>简介<a class="headerlink" href="#id1" title="Permalink to this heading"></a></h2>
+<p>  内核栈traceback的功能位于<code class="docutils literal notranslate"><span class="pre">kernel/debug/traceback/</span></code>文件夹中。为内核态提供traceback的功能，打印调用栈到屏幕上。</p>
+</section>
+<hr class="docutils" />
+<section id="api">
+<h2>API<a class="headerlink" href="#api" title="Permalink to this heading"></a></h2>
+<section id="void-traceback-struct-pt-regs-regs">
+<h3><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">traceback(struct</span> <span class="pre">pt_regs</span> <span class="pre">*</span> <span class="pre">regs)</span></code><a class="headerlink" href="#void-traceback-struct-pt-regs-regs" title="Permalink to this heading"></a></h3>
+<section id="id2">
+<h4>作用<a class="headerlink" href="#id2" title="Permalink to this heading"></a></h4>
+<p>  该接口定义于<code class="docutils literal notranslate"><span class="pre">kernel/debug/traceback/traceback.h</span></code>中，将会对给定内核栈进行traceback，并打印跟踪结果到屏幕上。</p>
+</section>
+<section id="id3">
+<h4>参数<a class="headerlink" href="#id3" title="Permalink to this heading"></a></h4>
+<section id="regs">
+<h5>regs<a class="headerlink" href="#regs" title="Permalink to this heading"></a></h5>
+<p>  要开始追踪的第一层内核栈栈帧（也就是栈的底端）</p>
+</section>
+</section>
+</section>
+</section>
+<hr class="docutils" />
+<section id="id4">
+<h2>实现原理<a class="headerlink" href="#id4" title="Permalink to this heading"></a></h2>
+<p>  当内核第一次链接之后，将会通过Makefile中的命令，运行<code class="docutils literal notranslate"><span class="pre">kernel/debug/kallsyms</span></code>程序，提取内核文件的符号表，然后生成<code class="docutils literal notranslate"><span class="pre">kernel/debug/kallsyms.S</span></code>。该文件的rodata段中存储了text段的函数的符号表。接着，该文件将被编译为<code class="docutils literal notranslate"><span class="pre">kallsyms.o</span></code>。最后，Makefile中再次调用<code class="docutils literal notranslate"><span class="pre">ld</span></code>命令进行链接，将kallsyms.o链接至内核文件。</p>
+<p>  当调用<code class="docutils literal notranslate"><span class="pre">traceback</span></code>函数时，其将遍历该符号表，找到对应的符号并输出。</p>
+</section>
+<hr class="docutils" />
+<section id="id5">
+<h2>未来发展方向<a class="headerlink" href="#id5" title="Permalink to this heading"></a></h2>
+<ul class="simple">
+<li><p>增加写入到日志文件的功能</p></li>
+</ul>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="页脚">
+        <a href="index.html" class="btn btn-neutral float-left" title="内核调试模块" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> 上一页</a>
+        <a href="../ktest/index.html" class="btn btn-neutral float-right" title="内核测试" accesskey="n" rel="next">下一页 <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; 版权所有 2022-2025, DragonOS Community.
+      <span class="commit">版本 <code>d85ebf1</code>.
+      </span></p>
+  </div>
+
+  利用 <a href="https://www.sphinx-doc.org/">Sphinx</a> 构建，使用的 
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">主题</a>
+    由 <a href="https://readthedocs.org">Read the Docs</a> 开发.
+  
+<div>
+    <br>
+    官网 <a href="https://dragonos.org">https://dragonos.org</a> | 论坛 <a href="https://bbs.dragonos.org.cn">https://bbs.dragonos.org.cn</a> |  <a href="https://dragonos.org">赞助DragonOS，成就未来！</a>
+</div>
+
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  
+<div class="rst-versions" data-toggle="rst-versions" role="note" aria-label="versions">
+  <span class="rst-current-version" data-toggle="rst-current-version">
+    <span class="fa fa-book"> Other Versions</span>
+    v: V0.1.1
+    <span class="fa fa-caret-down"></span>
+  </span>
+  <div class="rst-other-versions">
+    <dl>
+      <dt>Tags</dt>
+      <dd><a href="../../../V0.1.0/kernel/debug/traceback.html">V0.1.0</a></dd>
+      <dd><a href="traceback.html">V0.1.1</a></dd>
+      <dd><a href="../../../V0.1.10/kernel/debug/traceback.html">V0.1.10</a></dd>
+      <dd><a href="../../../V0.1.2/kernel/debug/traceback.html">V0.1.2</a></dd>
+      <dd><a href="../../../V0.1.3/kernel/debug/traceback.html">V0.1.3</a></dd>
+      <dd><a href="../../../V0.1.4/kernel/debug/traceback.html">V0.1.4</a></dd>
+      <dd><a href="../../../V0.1.5/kernel/debug/traceback.html">V0.1.5</a></dd>
+      <dd><a href="../../../V0.1.6/kernel/debug/traceback.html">V0.1.6</a></dd>
+      <dd><a href="../../../V0.1.7/kernel/debug/traceback.html">V0.1.7</a></dd>
+      <dd><a href="../../../V0.1.8/kernel/debug/traceback.html">V0.1.8</a></dd>
+      <dd><a href="../../../V0.1.9/kernel/debug/traceback.html">V0.1.9</a></dd>
+      <dd><a href="../../../V0.2.0/kernel/debug/traceback.html">V0.2.0</a></dd>
+      <dd><a href="../../../V0.3.0/kernel/debug/traceback.html">V0.3.0</a></dd>
+      <dd><a href="../../../V0.4.0/kernel/debug/traceback.html">V0.4.0</a></dd>
+    </dl>
+    <dl>
+      <dt>Branches</dt>
+      <dd><a href="../../../master/kernel/debug/traceback.html">master</a></dd>
+    </dl>
+  </div>
+</div><script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script>  
+
+  <style>
+         .wy-nav-content { max-width: 90%; }
+  </style>
+
+
+
+</body>
+</html>

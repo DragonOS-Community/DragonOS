@@ -1,0 +1,415 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="zh-CN">
+<head>
+  <meta charset="utf-8" /><meta name="generator" content="Docutils 0.18.1: http://docutils.sourceforge.net/" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ssh支持 &mdash; DragonOS dev 文档</title>
+      <link rel="stylesheet" type="text/css" href="../../_static/pygments.css" />
+      <link rel="stylesheet" type="text/css" href="../../_static/css/theme.css" />
+
+  
+  <!--[if lt IE 9]>
+    <script src="../../_static/js/html5shiv.min.js"></script>
+  <![endif]-->
+  
+        <script data-url_root="../../" id="documentation_options" src="../../_static/documentation_options.js"></script>
+        <script src="../../_static/jquery.js"></script>
+        <script src="../../_static/underscore.js"></script>
+        <script src="../../_static/_sphinx_javascript_frameworks_compat.js"></script>
+        <script src="../../_static/doctools.js"></script>
+        <script src="../../_static/translations.js"></script>
+    <script src="../../_static/js/theme.js"></script>
+    <link rel="index" title="索引" href="../../genindex.html" />
+    <link rel="search" title="搜索" href="../../search.html" />
+    <link rel="next" title="内核跟踪机制" href="../trace/index.html" />
+    <link rel="prev" title="UNIX" href="unix.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="../../index.html" class="icon icon-home">
+            DragonOS
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="../../search.html" method="get">
+    <input type="text" name="q" placeholder="搜索文档" aria-label="搜索文档" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="导航菜单">
+              <p class="caption" role="heading"><span class="caption-text">入门</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../introduction/index.html">DragonOS简介</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../introduction/build_system.html">构建DragonOS</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../introduction/mirrors.html">DragonOS镜像站</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">内核层</span></p>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../configuration/index.html">内核编译配置</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../boot/index.html">引导加载</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core_api/index.html">核心API文档</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">锁</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../process_management/index.html">进程管理模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sched/index.html">DragonOS调度</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ipc/index.html">进程间通信</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../memory_management/index.html">内存管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystem/index.html">文件系统</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../debug/index.html">内核调试模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ktest/index.html">内核测试</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu_arch/index.html">处理器架构</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../container/index.html">容器化</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../libs/index.html">其他内核库</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">网络子系统</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="inet.html">Internet Protocol Socket</a></li>
+<li class="toctree-l2"><a class="reference internal" href="unix.html">UNIX</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">ssh支持</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#id1">初始化步骤</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#id2">其它可用命令</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#id3">SSH相关的系统文件介绍</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#etc-passwd">/etc/passwd 的作用</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#etc-shadow">/etc/shadow 文件的作用</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#hash">不同hash算法生成的密码前缀</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id4">系统调用支持</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id5">文件系统相关</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#linuxsetgroupsgetgroups">linux的setgroups和getgroups的作用和用法是什么</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="#reference">Reference</a></li>
+</ul>
+</li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">内核跟踪机制</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../syscall/index.html">系统调用</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../device/index.html">Device</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">应用层</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../userland/appdev/index.html">应用程序开发文档</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Q&amp;A</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../questions/index.html">常见问题解答</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">DragonOS社区</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../community/code_contribution/index.html">参与开发</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../community/contact/index.html">与社区建立联系</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../community/ChangeLog/index.html">发行日志</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Translations</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../locales/en/index.html">English</a></li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="移动版导航菜单" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../../index.html">DragonOS</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="页面导航">
+  <ul class="wy-breadcrumbs">
+      <li><a href="../../index.html" class="icon icon-home" aria-label="Home"></a></li>
+          <li class="breadcrumb-item"><a href="index.html">网络子系统</a></li>
+      <li class="breadcrumb-item active">ssh支持</li>
+      <li class="wy-breadcrumbs-aside">
+              <a href="https://github.com/DragonOS-Community/DragonOS/blob/ac64a32/docs/kernel/net/ssh.md" class="fa fa-github"> 在 GitHub 上编辑</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section class="tex2jax_ignore mathjax_ignore" id="ssh">
+<h1>ssh支持<a class="headerlink" href="#ssh" title="Permalink to this heading"></a></h1>
+<p>目前，我们使用一个轻量级的ssh实现<a class="reference external" href="https://matt.ucc.asn.au/dropbear/dropbear.html">dropbear</a>。</p>
+<section id="id1">
+<h2>初始化步骤<a class="headerlink" href="#id1" title="Permalink to this heading"></a></h2>
+<ol class="arabic">
+<li><p>确保/bin/sh存在(应该已经存在，其实是busybox，如果不存在，可以拷贝sysroot/bin目录下的busybox文件: <code class="docutils literal notranslate"><span class="pre">cp</span> <span class="pre">./bin/sysroot/bin/busybox</span> <span class="pre">./bin/sysroot/bin/sh</span></code>)</p></li>
+<li><p>确保/root目录存在(应该已经存在)</p></li>
+<li><p>确保/etc/dropbear目录存在</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>mkdir<span class="w"> </span>/etc/dropbear
+</pre></div>
+</div>
+</li>
+<li><p>确保 /var/log/lastlog文件存在（可以是空文件）(不存在也行)</p></li>
+<li><p>修改root用户的密码</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>busybox<span class="w"> </span>passwd
+</pre></div>
+</div>
+</li>
+<li><p>启动系统后启动dropbear服务器</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>dropbear<span class="w"> </span>-E<span class="w"> </span>-F<span class="w"> </span>-R<span class="w"> </span>-p<span class="w"> </span><span class="m">12580</span>
+</pre></div>
+</div>
+</li>
+<li><p>在本地终端中连接到服务器</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>./dbclient<span class="w"> </span>-p<span class="w"> </span><span class="m">12580</span><span class="w"> </span>root@localhos
+</pre></div>
+</div>
+<p>如果报错：</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>./dbclient:<span class="w"> </span>Connection<span class="w"> </span>to<span class="w"> </span>root@localhost:12580<span class="w"> </span>exited:
+
+ssh-ed25519<span class="w"> </span>host<span class="w"> </span>key<span class="w"> </span>mismatch<span class="w"> </span><span class="k">for</span><span class="w"> </span>localhost<span class="w"> </span>!
+Fingerprint<span class="w"> </span>is<span class="w"> </span>SHA256:hK2KR5QQnSHpcHLYzCVe9IyKEw1NwIXx41K/gyv7NKI
+Expected<span class="w"> </span>SHA256:W8+kSk+aCm2uoc1ZIKU/RQJSKoqWrOKrFf9URhfFaw8
+If<span class="w"> </span>you<span class="w"> </span>know<span class="w"> </span>that<span class="w"> </span>the<span class="w"> </span>host<span class="w"> </span>key<span class="w"> </span>is<span class="w"> </span>correct<span class="w"> </span>you<span class="w"> </span>can
+remove<span class="w"> </span>the<span class="w"> </span>bad<span class="w"> </span>entry<span class="w"> </span>from<span class="w"> </span>~/.ssh/known_hosts
+</pre></div>
+</div>
+<p>解决方法：<code class="docutils literal notranslate"><span class="pre">ssh-keygen</span> <span class="pre">-R</span> <span class="pre">localhost</span></code> 删除已存在的错误host key</p>
+</li>
+<li><p>输入root用户的密码，成功登录后即可使用ssh终端</p></li>
+<li><p>退出ssh终端</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span><span class="nb">exit</span>
+</pre></div>
+</div>
+</li>
+</ol>
+</section>
+<section id="id2">
+<h2>其它可用命令<a class="headerlink" href="#id2" title="Permalink to this heading"></a></h2>
+<p>生成ssh密钥对</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span><span class="c1"># 生成dropbear的ssh密钥对</span>
+dropbearkey<span class="w"> </span>-t<span class="w"> </span>rsa<span class="w"> </span>-f<span class="w"> </span>~/.ssh/id_dropbear
+</pre></div>
+</div>
+<p>将公钥添加到授权列表</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span><span class="c1"># 拷贝公钥到指定目录</span>
+cp<span class="w"> </span>~/.ssh/id_dropbear.pub<span class="w"> </span>./bin/sysroot
+
+<span class="c1"># 使用私钥连接到服务器</span>
+./dbclient<span class="w"> </span>-i<span class="w"> </span>~/.ssh/id_dropbear<span class="w"> </span>-p<span class="w"> </span><span class="m">12580</span><span class="w"> </span>root@localhost
+</pre></div>
+</div>
+</section>
+<section id="id3">
+<h2>SSH相关的系统文件介绍<a class="headerlink" href="#id3" title="Permalink to this heading"></a></h2>
+<section id="etc-passwd">
+<h3>/etc/passwd 的作用<a class="headerlink" href="#etc-passwd" title="Permalink to this heading"></a></h3>
+<ul class="simple">
+<li><p>存储系统用户信息：它包含了每个用户的基本信息，是系统认证和登录的重要数据来源。</p></li>
+<li><p>用于登录和用户管理：系统和应用程序通过读取该文件来验证用户身份、决定用户权限以及加载相应的设置（如默认 shell、主目录等）。</p></li>
+<li><p>提供支持：对于一些应用程序和命令（如 useradd、passwd、chown），它需要通过 /etc/passwd 来获取用户的相关信息。</p></li>
+</ul>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>username:password:UID:GID:GECOS:home_directory:shell
+</pre></div>
+</div>
+<ul class="simple">
+<li><p>username（用户名）：用户的登录名称。例如：root、john、guest 等。</p></li>
+<li><p>password（密码）：用户的加密密码。现在大多数系统会将密码的哈希值存储在 /etc/shadow 文件中，因此这个字段通常是一个占位符（如 x 或 *）。在较旧的系统中，密码可能直接存储在此字段中，但这种做法已不安全。</p></li>
+<li><p>UID（用户 ID）：用户的唯一标识符。每个用户都有一个唯一的 UID，系统通过它来区分不同用户。通常：</p></li>
+<li><p>0 表示 root 用户（超级用户）。</p></li>
+<li><p>普通用户的 UID 从 1000 开始（在一些 Linux 发行版中，可能从 500 开始）。</p></li>
+<li><p>GID（组 ID）：用户所属的主组的 ID。组 ID 是与组名称相关联的数字。通常，每个用户都会有一个与其用户名相同的组。例如，john 用户可能会有一个主组 john，其 GID 可能是 1001。</p></li>
+<li><p>GECOS（用户全名或备注信息）：这个字段通常存储用户的全名、电话号码等可选信息。它可以为空或包含一些描述性文字，通常是通过 chfn 命令进行设置。</p></li>
+<li><p>home_directory（主目录）：用户的登录主目录，用户登录后会被自动带到这个目录。例如：/home/john、/root。如果用户是 root，其主目录通常是 /root。</p></li>
+<li><p>shell（默认 shell）：用户登录时所使用的 shell 程序。通常是 /bin/bash、/bin/sh 或其他 shell 程序。对于没有实际登录权限的系统用户，这个字段可能是 /usr/sbin/nologin 或 /bin/false，以阻止他们登录系统</p></li>
+</ul>
+</section>
+<section id="etc-shadow">
+<h3>/etc/shadow 文件的作用<a class="headerlink" href="#etc-shadow" title="Permalink to this heading"></a></h3>
+<ul class="simple">
+<li><p>存储用户的加密密码：/etc/shadow 文件中保存了每个用户的 加密密码，而不是明文密码。这是一个系统的安全机制，防止密码泄漏。</p></li>
+<li><p>账户过期管理：它还包含了与账户过期、密码过期、账户锁定等相关的信息，帮助系统管理员管理用户的登录权限。</p></li>
+<li><p>增强安全性：相比于早期系统中把密码直接存储在 /etc/passwd 中，/etc/shadow 将密码从可公开访问的文件中移除，使得系统更加安全</p></li>
+</ul>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>username:password:lastchg:min:max:warn:inactive:expire:flag
+</pre></div>
+</div>
+<ul class="simple">
+<li><p>username（用户名）：与 /etc/passwd 中的用户名一致。</p></li>
+<li><p>password（密码）：这是用户的加密密码。如果密码为空，通常是 * 或 !，表示禁用该账户。正常情况下，这里存储的是密码的加密哈希值。</p></li>
+<li><p>lastchg（上次修改日期）：密码最后一次修改的日期，表示自 1970 年 1 月 1 日以来的天数。通常这个值是通过 chage 命令查看和更新的。</p></li>
+<li><p>min（最小密码年龄）：密码的最小使用期限。用户修改密码后，必须等待多少天才能再次修改密码。通常设置为 0，表示没有最小密码年龄限制。</p></li>
+<li><p>max（最大密码年龄）：密码的最大使用期限。超过这个期限，用户必须修改密码。设置为 99999 表示密码永不过期。</p></li>
+<li><p>warn（警告期限）：密码过期前，系统会提前多少天开始警告用户密码即将过期。</p></li>
+<li><p>inactive（非活动期限）：密码过期后，用户仍然有多少天的时间可以继续登录。如果超过该天数，账户将被禁用。</p></li>
+<li><p>expire（账户过期日期）：账户的过期日期，表示自 1970 年 1 月 1 日以来的天数。如果账户过期，用户将无法登录。</p></li>
+<li><p>flag（账户锁定标志）：这个字段用于存储账户是否被锁定。如果这个字段是 !! 或 *，表示用户账号被锁定，不能登录</p></li>
+</ul>
+</section>
+<section id="hash">
+<h3>不同hash算法生成的密码前缀<a class="headerlink" href="#hash" title="Permalink to this heading"></a></h3>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">\$5$</span></code> 前缀（SHA-256）</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">\$6$</span></code> 前缀（SHA-512）</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">\$y$</span></code> 前缀（Yarrow）</p></li>
+</ul>
+</section>
+<section id="id4">
+<h3>系统调用支持<a class="headerlink" href="#id4" title="Permalink to this heading"></a></h3>
+<ul class="simple">
+<li><p>fcntl SETLK <a class="reference external" href="https://man7.org/linux/man-pages/man2/fcntl.2.html">https://man7.org/linux/man-pages/man2/fcntl.2.html</a></p></li>
+<li><p>unlink</p></li>
+<li><p>fsync</p></li>
+<li><p>rename <a class="reference external" href="https://man7.org/linux/man-pages/man2/rename.2.html">https://man7.org/linux/man-pages/man2/rename.2.html</a></p></li>
+<li><p>ioctl TCFLSH</p></li>
+<li><p>renameat2: oldfd: -100, filename_from: /etc/shadow+, newfd: -100, filename_to: /etc/shadow 失败</p></li>
+</ul>
+</section>
+<section id="id5">
+<h3>文件系统相关<a class="headerlink" href="#id5" title="Permalink to this heading"></a></h3>
+<p>/proc/self目录:/proc/self 是一个 符号链接，始终指向 访问它的进程自己的 /proc/[pid] 目录</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>路径</p></th>
+<th class="head"><p>作用</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">/proc/self/cmdline</span></code></p></td>
+<td><p>当前进程的命令行参数</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">/proc/self/exe</span></code></p></td>
+<td><p>当前进程的可执行文件路径（是个符号链接）</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">/proc/self/fd/</span></code></p></td>
+<td><p>当前进程打开的所有文件描述符</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">/proc/self/environ</span></code></p></td>
+<td><p>当前进程的环境变量</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">/proc/self/maps</span></code></p></td>
+<td><p>当前进程的内存映射布局</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">/proc/self/status</span></code></p></td>
+<td><p>当前进程的状态信息（类似于 ps 命令）</p></td>
+</tr>
+</tbody>
+</table>
+<ul class="simple">
+<li><p>/proc/fd/{id} 也是一个符号链接，指向进程打开的文件描述符所对应的文件路径。</p></li>
+<li><p>/dev/pts/0 这些伪终端需要等待主设备/dev/ptmx被关闭的时候删除</p></li>
+<li><p>/root目录必须存在</p></li>
+</ul>
+</section>
+<section id="linuxsetgroupsgetgroups">
+<h3>linux的setgroups和getgroups的作用和用法是什么<a class="headerlink" href="#linuxsetgroupsgetgroups" title="Permalink to this heading"></a></h3>
+<p>在 Linux 中，一个进程有：</p>
+<ul class="simple">
+<li><p>真实用户 ID (real UID)、有效用户 ID (effective UID)</p></li>
+<li><p>真实组 ID (real GID)、有效组 ID (effective GID)</p></li>
+<li><p>附加组 ID 列表（supplementary groups）</p></li>
+</ul>
+<p>附加组 ID 让进程除了主组外，还可以属于其他多个组，从而获得对应组的访问权限</p>
+<section id="id-uid-id-gid">
+<h4>用户 ID (UID) 和 组 ID (GID)<a class="headerlink" href="#id-uid-id-gid" title="Permalink to this heading"></a></h4>
+<p>这两个是权限身份标识，用来决定一个进程能做什么。</p>
+<p>UID（User ID）表示进程属于哪个用户。
+常见种类：</p>
+<ul class="simple">
+<li><p>真实用户 ID (real UID)：启动该进程的用户是谁。</p></li>
+<li><p>有效用户 ID (effective UID)：实际用于权限检查的 UID（比如 setuid 程序可以让 EUID 暂时变成 root）。</p></li>
+<li><p>保存的 set-user-ID（保存切换前的 EUID，用于临时恢复）。</p></li>
+</ul>
+<p>root 用户的 UID 是 0，其它用户一般是从 1000（或 500）开始分配。</p>
+<p>GID（Group ID） 表示进程属于哪个主用户组。同样有 real/effective/saved 三种。
+另外还有 附加组列表（supplementary groups），用来赋予额外的组权限。</p>
+<p>作用：
+当进程访问文件、socket、IPC 等资源时，内核会根据 EUID/EGID + 附加组列表 来判断能否访问。</p>
+</section>
+</section>
+</section>
+<section id="reference">
+<h2>Reference<a class="headerlink" href="#reference" title="Permalink to this heading"></a></h2>
+<ul class="simple">
+<li><p>Linux TTY/PTS概述 <a class="reference external" href="https://liujunming.top/2019/09/03/Linux-TTY-PTS%E6%A6%82%E8%BF%B0/">https://liujunming.top/2019/09/03/Linux-TTY-PTS概述/</a></p></li>
+<li><p>伪终端(pseudo terminal) <a class="reference external" href="https://zhuanlan.zhihu.com/p/678170056">https://zhuanlan.zhihu.com/p/678170056</a></p></li>
+<li><p>硬件终端 terminal(TTY)
+<a class="reference external" href="https://www.cnblogs.com/sparkdev/p/11460821.html">https://www.cnblogs.com/sparkdev/p/11460821.html</a></p></li>
+</ul>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="页脚">
+        <a href="unix.html" class="btn btn-neutral float-left" title="UNIX" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> 上一页</a>
+        <a href="../trace/index.html" class="btn btn-neutral float-right" title="内核跟踪机制" accesskey="n" rel="next">下一页 <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; 版权所有 2022-2025, DragonOS Community.
+      <span class="commit">版本 <code>ac64a32</code>.
+      </span></p>
+  </div>
+
+  利用 <a href="https://www.sphinx-doc.org/">Sphinx</a> 构建，使用的 
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">主题</a>
+    由 <a href="https://readthedocs.org">Read the Docs</a> 开发.
+  
+<div>
+    <br>
+    官网 <a href="https://dragonos.org">https://dragonos.org</a> | 论坛 <a href="https://bbs.dragonos.org.cn">https://bbs.dragonos.org.cn</a> |  <a href="https://dragonos.org">赞助DragonOS，成就未来！</a>
+</div>
+
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  
+<div class="rst-versions" data-toggle="rst-versions" role="note" aria-label="versions">
+  <span class="rst-current-version" data-toggle="rst-current-version">
+    <span class="fa fa-book"> Other Versions</span>
+    v: V0.4.0
+    <span class="fa fa-caret-down"></span>
+  </span>
+  <div class="rst-other-versions">
+    <dl>
+      <dt>Tags</dt>
+      <dd><a href="../../../V0.1.0/index.html">V0.1.0</a></dd>
+      <dd><a href="../../../V0.1.1/index.html">V0.1.1</a></dd>
+      <dd><a href="../../../V0.1.10/index.html">V0.1.10</a></dd>
+      <dd><a href="../../../V0.1.2/index.html">V0.1.2</a></dd>
+      <dd><a href="../../../V0.1.3/index.html">V0.1.3</a></dd>
+      <dd><a href="../../../V0.1.4/index.html">V0.1.4</a></dd>
+      <dd><a href="../../../V0.1.5/index.html">V0.1.5</a></dd>
+      <dd><a href="../../../V0.1.6/index.html">V0.1.6</a></dd>
+      <dd><a href="../../../V0.1.7/index.html">V0.1.7</a></dd>
+      <dd><a href="../../../V0.1.8/index.html">V0.1.8</a></dd>
+      <dd><a href="../../../V0.1.9/index.html">V0.1.9</a></dd>
+      <dd><a href="../../../V0.2.0/index.html">V0.2.0</a></dd>
+      <dd><a href="../../../V0.3.0/index.html">V0.3.0</a></dd>
+      <dd><a href="ssh.html">V0.4.0</a></dd>
+    </dl>
+    <dl>
+      <dt>Branches</dt>
+      <dd><a href="../../../master/kernel/net/ssh.html">master</a></dd>
+    </dl>
+  </div>
+</div><script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script>  
+
+  <style>
+         .wy-nav-content { max-width: 90%; }
+  </style>
+
+
+
+</body>
+</html>

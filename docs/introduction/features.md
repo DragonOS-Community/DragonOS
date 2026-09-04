@@ -1,139 +1,135 @@
-(_genreal_features)=
+# Features of DragonOS {#_genreal_features}
 
-# DragonOS的功能
+## Specifications
 
-## 规范
+- [x] Bootloader: Multiboot2
 
-- [x] 启动引导：Multiboot2
+- [x] Interface: POSIX 2008
 
-- [x] 接口：posix 2008
+## Kernel Layer
 
-## 内核层
+### Memory Management
 
-### 内存管理
+- [x] Page Frame Allocator
+- [x] Small Object Allocator
+- [x] VMA (Virtual Memory Area)
+- [x] Automatic MMIO Address Space Allocation
+- [x] Page Mapper
+- [x] Hardware Abstraction Layer
+- [x] Independent User Address Space Management Mechanism
+- [x] C Interface Compatibility Layer
 
-- [x] 页帧分配器
-- [x] 小对象分配器
-- [x] VMA
-- [x] MMIO地址空间自动分配
-- [x] 页面映射器
-- [x] 硬件抽象层
-- [x] 独立的用户地址空间管理机制
-- [x] C接口兼容层
+### Multicore
 
-### 多核
+- [x] Multicore Boot
+- [x] IPI (Inter-Processor Interrupt) Framework
 
-- [x] 多核引导
-- [x] ipi框架
+### Process Management
 
-### 进程管理
+- [x] Process Creation
+- [x] Process Reclamation
+- [x] Kernel Threads
+- [x] Fork
+- [x] Exec
+- [x] Process Sleep (Supports High-Precision Sleep)
+- [x] Kthread Mechanism
+- [x] Extensible Binary Loader
 
-- [x] 进程创建
-- [x] 进程回收
-- [x] 内核线程
-- [x] fork
-- [x] exec
-- [x] 进程睡眠（支持高精度睡眠）
-- [x] kthread机制
-- [x] 可扩展二进制加载器
+#### Synchronization Primitives
 
-#### 同步原语
+- [x] Mutex
+- [x] Semaphore
+- [x] Atomic Variables
+- [x] Spinlock
+- [x] Wait Queue
 
-- [x] mutex互斥量
-- [x] semaphore信号量
-- [x] atomic原子变量
-- [x] spinlock自旋锁
-- [x] wait_queue等待队列
+### Scheduling
 
-### 调度
+- [x] CFS Scheduler
+- [x] Real-Time Scheduler (FIFO, RR)
+- [x] Single-Core Scheduling
+- [x] Multi-Core Scheduling
+- [x] Load Balancing
 
-- [x] CFS调度器
-- [x] 实时调度器（FIFO、RR）
-- [x] 单核调度
-- [x] 多核调度
-- [x] 负载均衡
+### IPC (Inter-Process Communication)
 
-### IPC
+- [x] Anonymous Pipe
+- [x] Signal
 
-- [x] 匿名pipe管道
-- [x] signal信号
+### File System
 
-### 文件系统
-
-- [x] VFS
-- [x] fat12/16/32
+- [x] VFS (Virtual File System)
+- [x] FAT12/16/32
 - [x] Devfs
 - [x] RamFS
 - [x] Procfs
 - [x] Sysfs
 
-### 异常及中断处理
+### Exception and Interrupt Handling
 
 - [x] APIC
-- [x] softirq 软中断
-- [x] 内核栈traceback
+- [x] Softirq (Soft Interrupt)
+- [x] Kernel Stack Traceback
 
+### Kernel Utility Library
 
-### 内核实用库
-
-- [x] 字符串操作库
-- [x] ELF可执行文件支持
+- [x] String Operation Library
+- [x] ELF Executable Support
 - [x] printk
-- [x] 基础数学库
-- [x] 屏幕管理器
-- [x] textui框架
-- [x] CRC函数库
-- [x] 通知链
+- [x] Basic Math Library
+- [x] Screen Manager
+- [x] TextUI Framework
+- [x] CRC Function Library
+- [x] Notification Chain
 
-### 系统调用
+### System Calls
 
-&emsp;&emsp;[请见系统调用文档](https://docs.dragonos.org/zh_CN/latest/syscall_api/index.html)
+[See System Call Documentation](/kernel/syscall/index.html)
 
-### 测试框架
+### Test Framework
 
 - [x] ktest
 
-### 驱动程序
+### Drivers
 
-- [x] ACPI 高级电源配置模块
-- [x] IDE硬盘
-- [x] AHCI硬盘
-- [x] PCI、PCIe总线
-- [x] XHCI（usb3.0）
-- [x] ps/2 键盘
-- [x] ps/2 鼠标
-- [x] HPET高精度定时器
-- [x] RTC时钟
-- [x] local apic定时器
-- [x] UART串口
-- [x] VBE显示
-- [x] VirtIO网卡
-- [x] x87FPU
-- [x] TTY终端
-- [x] 浮点处理器
+- [x] ACPI (Advanced Configuration and Power Interface) Module
+- [x] IDE Hard Disk
+- [x] AHCI Hard Disk
+- [x] PCI, PCIe Bus
+- [x] XHCI (USB 3.0)
+- [x] PS/2 Keyboard
+- [x] PS/2 Mouse
+- [x] HPET (High Precision Event Timer)
+- [x] RTC (Real-Time Clock)
+- [x] Local APIC Timer
+- [x] UART Serial Port
+- [x] VBE (Video BIOS Extension) Display
+- [x] VirtIO Network Card
+- [x] x87 FPU
+- [x] TTY Terminal
+- [x] Floating Point Processor
 
-
-## 用户层
+## User Layer
 
 ### LibC
 
-- [x] 基础系统调用
-- [x] 基础标准库函数
-- [x] 部分数学函数
+- [x] Basic System Calls
+- [x] Basic Standard Library Functions
+- [x] Partial Mathematical Functions
 
-### shell命令行程序
+### Shell Command Line Programs
 
-- [x] 基于字符串匹配的解析
-- [x] 基本的几个命令
+- [x] Parsing Based on String Matching
+- [x] Basic Commands
 
 ### Http Server
 
-- 使用C编写的简单的Http Server，能够运行静态网站。
+- A simple Http Server written in C, capable of running static websites.
 
-## 软件移植
+## Software Portability
 
-- [x] GCC 11.3.0 （暂时只支持了x86_64的Cross Compiler）[https://github.com/DragonOS-Community/gcc](https://github.com/DragonOS-Community/gcc)
-- [x] binutils 2.38（暂时只支持了x86_64的Cross Compiler）[https://github.com/DragonOS-Community/binutils](https://github.com/DragonOS-Community/binutils)
+- [x] GCC 11.3.0 (Currently only supports x86_64 Cross Compiler) [https://github.com/DragonOS-Community/gcc](https://github.com/DragonOS-Community/gcc)
+- [x] binutils 2.38 (Currently only supports x86_64 Cross Compiler) [https://github.com/DragonOS-Community/binutils](https://github.com/DragonOS-Community/binutils)
 - [x] gmp 6.2.1 [https://github.com/DragonOS-Community/gmp-6.2.1](https://github.com/DragonOS-Community/gmp-6.2.1)
 - [x] mpfr 4.1.1 [https://github.com/DragonOS-Community/mpfr](https://github.com/DragonOS-Community/mpfr)
 - [x] mpc 1.2.1 [https://github.com/DragonOS-Community/mpc](https://github.com/DragonOS-Community/mpc)

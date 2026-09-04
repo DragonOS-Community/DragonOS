@@ -1,0 +1,581 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="zh-CN">
+<head>
+  <meta charset="utf-8" /><meta name="generator" content="Docutils 0.18.1: http://docutils.sourceforge.net/" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>V0.1.0 &mdash; DragonOS dev 文档</title>
+      <link rel="stylesheet" type="text/css" href="../../../../../_static/pygments.css" />
+      <link rel="stylesheet" type="text/css" href="../../../../../_static/css/theme.css" />
+
+  
+  <!--[if lt IE 9]>
+    <script src="../../../../../_static/js/html5shiv.min.js"></script>
+  <![endif]-->
+  
+        <script data-url_root="../../../../../" id="documentation_options" src="../../../../../_static/documentation_options.js"></script>
+        <script src="../../../../../_static/jquery.js"></script>
+        <script src="../../../../../_static/underscore.js"></script>
+        <script src="../../../../../_static/_sphinx_javascript_frameworks_compat.js"></script>
+        <script src="../../../../../_static/doctools.js"></script>
+        <script src="../../../../../_static/translations.js"></script>
+    <script src="../../../../../_static/js/theme.js"></script>
+    <link rel="index" title="索引" href="../../../../../genindex.html" />
+    <link rel="search" title="搜索" href="../../../../../search.html" />
+    <link rel="prev" title="V0.1.1" href="V0.1.1.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="../../../../../index.html" class="icon icon-home">
+            DragonOS
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="../../../../../search.html" method="get">
+    <input type="text" name="q" placeholder="搜索文档" aria-label="搜索文档" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="导航菜单">
+              <p class="caption" role="heading"><span class="caption-text">入门</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../introduction/index.html">DragonOS简介</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../introduction/build_system.html">构建DragonOS</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../introduction/mirrors.html">DragonOS镜像站</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">内核层</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../kernel/configuration/index.html">内核编译配置</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../kernel/boot/index.html">引导加载</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../kernel/core_api/index.html">核心API文档</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../kernel/locking/index.html">锁</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../kernel/process_management/index.html">进程管理模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../kernel/sched/index.html">DragonOS调度</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../kernel/ipc/index.html">进程间通信</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../kernel/memory_management/index.html">内存管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../kernel/filesystem/index.html">文件系统</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../kernel/debug/index.html">内核调试模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../kernel/ktest/index.html">内核测试</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../kernel/cpu_arch/index.html">处理器架构</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../kernel/container/index.html">容器化</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../kernel/libs/index.html">其他内核库</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../kernel/net/index.html">网络子系统</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../kernel/trace/index.html">内核跟踪机制</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../kernel/syscall/index.html">系统调用</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../kernel/device/index.html">Device</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">应用层</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../userland/appdev/index.html">应用程序开发文档</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Q&amp;A</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../questions/index.html">常见问题解答</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">DragonOS社区</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../community/code_contribution/index.html">参与开发</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../community/contact/index.html">与社区建立联系</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../community/ChangeLog/index.html">发行日志</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Translations</span></p>
+<ul class="current">
+<li class="toctree-l1 current"><a class="reference internal" href="../../../index.html">English</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="../../../introduction/index.html">Introduction to DragonOS</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../introduction/build_system.html">Building DragonOS</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../introduction/mirrors.html">DragonOS Mirror Site</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../kernel/configuration/index.html">Kernel Compilation Configuration</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../kernel/boot/index.html">Bootloader</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../kernel/core_api/index.html">Core API Documentation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../kernel/locking/index.html">Locks</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../kernel/process_management/index.html">Process Management Module</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../kernel/sched/index.html">DragonOS Scheduling</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../kernel/ipc/index.html">Interprocess Communication</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../kernel/memory_management/index.html">Memory Management</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../kernel/filesystem/index.html">File System</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../kernel/debug/index.html">Kernel Debug Module</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../kernel/ktest/index.html">Kernel Testing</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../kernel/cpu_arch/index.html">Processor Architecture</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../kernel/container/index.html">Containerization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../kernel/libs/index.html">Other Kernel Libraries</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../kernel/net/index.html">Network Subsystem</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../kernel/trace/index.html">Kernel Tracing Mechanism</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../kernel/syscall/index.html">System Calls</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../kernel/device/index.html">设备</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../userland/appdev/index.html">Application Development Documentation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../questions/index.html">Frequently Asked Questions</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../code_contribution/index.html">Contributing to Development</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../contact/index.html">Get in Touch with the Community</a></li>
+<li class="toctree-l2 current"><a class="reference internal" href="../index.html">Release Notes</a><ul class="current">
+<li class="toctree-l3"><a class="reference internal" href="../V0.4.x/V0.4.0.html">V0.4.0</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../V0.3.x/V0.3.0.html">V.3.0</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../V0.2.x/V0.2.0.html">V0.2.0</a></li>
+<li class="toctree-l3"><a class="reference internal" href="V0.1.10.html">V0.1.10</a></li>
+<li class="toctree-l3"><a class="reference internal" href="V0.1.9.html">V0.1.9</a></li>
+<li class="toctree-l3"><a class="reference internal" href="V0.1.8.html">V0.1.8</a></li>
+<li class="toctree-l3"><a class="reference internal" href="V0.1.7.html">V0.1.7</a></li>
+<li class="toctree-l3"><a class="reference internal" href="V0.1.6.html">V0.1.6</a></li>
+<li class="toctree-l3"><a class="reference internal" href="V0.1.5.html">V0.1.5</a></li>
+<li class="toctree-l3"><a class="reference internal" href="V0.1.4.html">V0.1.4</a></li>
+<li class="toctree-l3"><a class="reference internal" href="V0.1.3.html">V0.1.3</a></li>
+<li class="toctree-l3"><a class="reference internal" href="V0.1.2.html">V0.1.2</a></li>
+<li class="toctree-l3"><a class="reference internal" href="V0.1.1.html">V0.1.1</a></li>
+<li class="toctree-l3 current"><a class="current reference internal" href="#">V0.1.0</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#preface">Preface</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#special-thanks">Special Thanks</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#contributors-list">Contributors List</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#sponsors-list">Sponsors List</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#kernel">Kernel</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#user-environment">User Environment</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#source-code-and-release-image-download">Source Code and Release Image Download</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#open-source-code-declaration">Open Source Code Declaration</a></li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="移动版导航菜单" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../../../../../index.html">DragonOS</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="页面导航">
+  <ul class="wy-breadcrumbs">
+      <li><a href="../../../../../index.html" class="icon icon-home" aria-label="Home"></a></li>
+          <li class="breadcrumb-item"><a href="../../../index.html">English</a></li>
+          <li class="breadcrumb-item"><a href="../index.html">Release Notes</a></li>
+      <li class="breadcrumb-item active">V0.1.0</li>
+      <li class="wy-breadcrumbs-aside">
+              <a href="https://github.com/DragonOS-Community/DragonOS/blob/ac64a32/docs/locales/en/community/ChangeLog/V0.1.x/V0.1.0.md" class="fa fa-github"> 在 GitHub 上编辑</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <div class="admonition note">
+<p class="admonition-title">备注</p>
+<p><strong>AI Translation Notice</strong></p>
+<p>This document was automatically translated by <code class="docutils literal notranslate"><span class="pre">Qwen/Qwen3-8B</span></code> model, for reference only.</p>
+<ul class="simple">
+<li><p>Source document: community/ChangeLog/V0.1.x/V0.1.0.md</p></li>
+<li><p>Translation time: 2025-05-19 01:48:03</p></li>
+<li><p>Translation model: <code class="docutils literal notranslate"><span class="pre">Qwen/Qwen3-8B</span></code></p></li>
+</ul>
+<p>Please report issues via <a class="reference external" href="https://github.com/DragonOS-Community/DragonOS/issues">Community Channel</a></p>
+</div>
+<section class="tex2jax_ignore mathjax_ignore" id="v0-1-0">
+<h1>V0.1.0<a class="headerlink" href="#v0-1-0" title="Permalink to this heading"></a></h1>
+<div class="admonition note">
+<p class="admonition-title">备注</p>
+<p>Author of this document: Longjin <a class="reference external" href="mailto:longjin&#37;&#52;&#48;RinGoTek&#46;cn">longjin<span>&#64;</span>RinGoTek<span>&#46;</span>cn</a></p>
+<p>November 6, 2022</p>
+</div>
+<section id="preface">
+<h2>Preface<a class="headerlink" href="#preface" title="Permalink to this heading"></a></h2>
+<p>  DragonOS has been under development since January 15, 2022, and has now gone through nearly 300 days. In these many days and nights, it’s hard to count how much time has been spent on DragonOS development. I have basically given all my free time to DragonOS, and the estimated total working hours have already exceeded 1000 hours. It feels very rewarding to be able to release the first version.</p>
+<p>  Since July 2022, a number of friends and mentors from six universities or companies have joined the development of DragonOS. I was very happy about this. I think, with everyone’s joint efforts, we can create an operating system that is truly practical! We have held 14 discussion meetings. I believe, with everyone’s joint efforts, in the future, we will be able to create an independent, open, server-oriented open-source operating system that can be used in production environments.</p>
+<p>  Although DragonOS is currently just a toy-level operating system, it’s “only slightly more difficult than a undergraduate graduation project.” However, please don’t underestimate it. Its internal architecture design targets Linux 5.18 and later distributions. Although it has not yet reached the level of Linux, we are working hard to catch up. Thanks to the relevant resources of Linux, DragonOS has learned a lot of design ideas from Linux during its architecture design. The related components have considered scalability and portability as much as possible.</p>
+<p>  A journey of a thousand miles begins with a single step. The release of DragonOS V0.1.0 is a new beginning. <strong>I hope, in the next ten years, we can work together with many partners, and by 2032, build DragonOS into a practical, widely used open-source operating system in the server field!</strong></p>
+<p>  <strong>A hundred boats race, the ones who row first win; in the middle stream, the brave win.</strong> I believe, with the continuous efforts of the community developers in the coming time, our goal will become a reality!</p>
+</section>
+<section id="special-thanks">
+<h2>Special Thanks<a class="headerlink" href="#special-thanks" title="Permalink to this heading"></a></h2>
+<p>  At the time of the release of DragonOS V0.1.0, I would like to express my sincere gratitude to my teachers, predecessors, and school!</p>
+<ul class="simple">
+<li><p><strong>Teacher Yao Zhicheng from Dali Town Central Primary School, Nanhai District, Foshan City</strong>: You are the guide who introduced me to computers and taught me programming. Ten years ago, when we talked, you said, “Our country currently does not have an independent and mature operating system.” This sentence planted the seed of my dream. You cultivated my love for computers, so I chose the major of software engineering. Thank you for your guidance back then, I will never forget your kindness!</p></li>
+<li><p><strong>Shimen Experimental School, Nanhai District, Foshan City</strong>: During the three years I studied at Shimen Experimental School, I am very grateful for the school’s “Strength-based Education” philosophy. Under the guidance of the teachers, I was able to fully develop my personality and talents, and achieved good results. During the three years at Shimen Experimental School, I learned C++, Java, and simple algorithms, and I developed several Android apps, accumulating nearly 6,000 lines of code.</p></li>
+<li><p><strong>Shimen Middle School, Nanhai District, Foshan City</strong>: “The road is long and the task is heavy, never forget to strive” is the school motto of Shimen Middle School. I think this motto should also become the motto of each new generation of youth. During the three years at Shimen Middle School, the education of national sentiment had a great impact on me. I think, as new generation of youth, we should shoulder the responsibility of the times, strive hard, and work for the development of the country, the strength of the nation, and the future of humanity!</p></li>
+<li><p><strong>South China University of Technology</strong>: “Broad learning, careful thinking, clear discernment, and firm action” – at SCUT, I received further learning and development. I broadened my horizons, learned to communicate with many people. Moreover, in the School of Software, I met a group of conscientious and responsible teachers. I am very grateful for the support of the school, which supported us in establishing the project group. I believe, with the support of the school, DragonOS can achieve better development and go further!</p></li>
+<li><p><strong>Professor Wang Guohua from the School of Software, South China University of Technology</strong>: Professor Wang is my teacher for the course “Operating System”. Under her guidance, I gained a deeper understanding of the principles of operating systems, and participated in the “Pan-Delta+ University Students’ Computer Works Competition”. In the Guangdong provincial selection in June 2022, DragonOS won the first prize and the Best Innovation Award.</p></li>
+<li><p><strong>Professor Tang Feng from the School of Software, South China University of Technology</strong>: Professor Tang is our project group’s on-campus mentor. Under her careful guidance, we will continue to move forward, keep our direction, and continuously build an open-source community. I sincerely thank Professor Tang for her guidance!</p></li>
+<li><p><strong><a class="reference external" href="https://github.com/Codetector1374">Yaotian Feng</a></strong>: I met this very capable person on Bilibili. He answered many of my questions. Many times, after I had debugged for several days without any idea, a few words from him would wake me up and help me find the path to solve the problem. He also shared with me the places where I might fall into traps, allowing me to have a psychological expectation when about to fall into a trap, so I wouldn’t feel so uncomfortable, ha ha.</p></li>
+</ul>
+</section>
+<section id="contributors-list">
+<h2>Contributors List<a class="headerlink" href="#contributors-list" title="Permalink to this heading"></a></h2>
+<p>The release of DragonOS V0.1.0 could not have been achieved without the joint efforts of the following friends:</p>
+<ul class="simple">
+<li><p>Longjin <a class="reference external" href="mailto:longjin&#37;&#52;&#48;RinGoTek&#46;cn">longjin<span>&#64;</span>RinGoTek<span>&#46;</span>cn</a></p></li>
+<li><p>zzy666-hw <a class="reference external" href="mailto:zzy666&#37;&#52;&#48;mail&#46;ustc&#46;edu&#46;cn">zzy666<span>&#64;</span>mail<span>&#46;</span>ustc<span>&#46;</span>edu<span>&#46;</span>cn</a></p></li>
+<li><p>Guan Jinquan <a class="reference external" href="mailto:guanjinquan&#37;&#52;&#48;DragonOS&#46;org">guanjinquan<span>&#64;</span>DragonOS<span>&#46;</span>org</a></p></li>
+<li><p>Zhou Yuzhe <a class="reference external" href="mailto:zhouyuzhe&#37;&#52;&#48;DragonOS&#46;org">zhouyuzhe<span>&#64;</span>DragonOS<span>&#46;</span>org</a></p></li>
+<li><p>kkkkkong <a class="reference external" href="mailto:kongweichao&#37;&#52;&#48;DragonOS&#46;org">kongweichao<span>&#64;</span>DragonOS<span>&#46;</span>org</a></p></li>
+<li><p>houmkh <a class="reference external" href="mailto:jiaying&#46;hou&#37;&#52;&#48;qq&#46;com">jiaying<span>&#46;</span>hou<span>&#64;</span>qq<span>&#46;</span>com</a></p></li>
+<li><p>wang904 <a class="reference external" href="mailto:1234366&#37;&#52;&#48;qq&#46;com">1234366<span>&#64;</span>qq<span>&#46;</span>com</a></p></li>
+<li><p>Liric Mechan <a class="reference external" href="mailto:i&#37;&#52;&#48;liric&#46;cn">i<span>&#64;</span>liric<span>&#46;</span>cn</a></p></li>
+<li><p>Mustang <a class="reference external" href="mailto:handsomepd&#37;&#52;&#48;qq&#46;com">handsomepd<span>&#64;</span>qq<span>&#46;</span>com</a></p></li>
+<li><p>Eugene <a class="reference external" href="mailto:caima12138&#37;&#52;&#48;foxmail&#46;com">caima12138<span>&#64;</span>foxmail<span>&#46;</span>com</a></p></li>
+<li><p>kun <a class="reference external" href="mailto:1582068144&#37;&#52;&#48;qq&#46;com">1582068144<span>&#64;</span>qq<span>&#46;</span>com</a></p></li>
+<li><p>zhujikuan <a class="reference external" href="mailto:1335289286&#37;&#52;&#48;qq&#46;com">1335289286<span>&#64;</span>qq<span>&#46;</span>com</a></p></li>
+<li><p>Alloc Alice <a class="reference external" href="mailto:1548742234&#37;&#52;&#48;qq&#46;com">1548742234<span>&#64;</span>qq<span>&#46;</span>com</a></p></li>
+</ul>
+</section>
+<section id="sponsors-list">
+<h2>Sponsors List<a class="headerlink" href="#sponsors-list" title="Permalink to this heading"></a></h2>
+<p>Thank you to the following students for their donations. We will keep working hard!</p>
+<ul class="simple">
+<li><p>TerryLeeSCUT</p></li>
+<li><p>Wu</p></li>
+<li><p>slientbard</p></li>
+</ul>
+</section>
+<section id="kernel">
+<h2>Kernel<a class="headerlink" href="#kernel" title="Permalink to this heading"></a></h2>
+<section id="some-standards-and-specifications-followed">
+<h3>Some Standards and Specifications Followed<a class="headerlink" href="#some-standards-and-specifications-followed" title="Permalink to this heading"></a></h3>
+<ul class="simple">
+<li><p>Bootloader: Multiboot2</p></li>
+<li><p>System Interface: POSIX 2008</p></li>
+</ul>
+</section>
+<section id="hardware-architecture">
+<h3>Hardware Architecture<a class="headerlink" href="#hardware-architecture" title="Permalink to this heading"></a></h3>
+<ul class="simple">
+<li><p>Currently supports running on x86-64 architecture processors</p></li>
+</ul>
+</section>
+<section id="bootloader">
+<h3>Bootloader<a class="headerlink" href="#bootloader" title="Permalink to this heading"></a></h3>
+<ul class="simple">
+<li><p>Uses Grub 2.06 as the bootloader</p></li>
+</ul>
+</section>
+<section id="memory-management">
+<h3>Memory Management<a class="headerlink" href="#memory-management" title="Permalink to this heading"></a></h3>
+<ul class="simple">
+<li><p>Implemented a bitmap-based page allocator</p></li>
+<li><p>Implemented a slab allocator for allocating small, aligned memory blocks</p></li>
+<li><p>Abstracted VMA (Virtual Memory Area)</p></li>
+<li><p>Implemented VMA reverse mapping mechanism</p></li>
+<li><p>Implemented MMIO address space auto-mapping mechanism</p></li>
+</ul>
+</section>
+<section id="multi-core">
+<h3>Multi-core<a class="headerlink" href="#multi-core" title="Permalink to this heading"></a></h3>
+<ul class="simple">
+<li><p>Supports multi-core boot. That is, after DragonOS starts, it will start the AP processor. However, to simplify the implementation of other kernel modules, currently, there are no tasks running on the AP processor.</p></li>
+<li><p>Roughly implemented the IPI (Inter-Processor Interrupt) framework</p></li>
+</ul>
+</section>
+<section id="process-management">
+<h3>Process Management<a class="headerlink" href="#process-management" title="Permalink to this heading"></a></h3>
+<ul class="simple">
+<li><p>Supports process creation and recycling</p></li>
+<li><p>Kernel threads</p></li>
+<li><p>Kthread mechanism</p></li>
+<li><p>User-space and kernel-space process/thread fork/vfork (note that user-space fork and kernel-space fork have some differences; kernel-space fork is more complex)</p></li>
+<li><p>exec allows a process to execute a new executable file</p></li>
+<li><p>Process timer sleep (sleep) (supports high-precision sleep with spin/rdtsc, supports sleep via context switching)</p></li>
+</ul>
+</section>
+<section id="synchronization-primitives">
+<h3>Synchronization Primitives<a class="headerlink" href="#synchronization-primitives" title="Permalink to this heading"></a></h3>
+<ul class="simple">
+<li><p>spinlock spin lock</p></li>
+<li><p>mutex mutex</p></li>
+<li><p>atomic atomic variable</p></li>
+<li><p>wait_queue wait queue</p></li>
+<li><p>semaphore semaphore</p></li>
+</ul>
+</section>
+<section id="scheduling-related">
+<h3>Scheduling Related<a class="headerlink" href="#scheduling-related" title="Permalink to this heading"></a></h3>
+<ul class="simple">
+<li><p>CFS scheduler</p></li>
+<li><p>Single-core scheduling (multi-core load balancing is temporarily not supported)</p></li>
+<li><p>completion “completion” mechanism, allowing a process to wait for a task to complete</p></li>
+</ul>
+</section>
+<section id="ipc-inter-process-communication">
+<h3>IPC (Inter-Process Communication)<a class="headerlink" href="#ipc-inter-process-communication" title="Permalink to this heading"></a></h3>
+<ul class="simple">
+<li><p>Anonymous pipe</p></li>
+</ul>
+</section>
+<section id="file-system">
+<h3>File System<a class="headerlink" href="#file-system" title="Permalink to this heading"></a></h3>
+<ul class="simple">
+<li><p>Basic functionality of the VFS virtual file system</p></li>
+<li><p>FAT32 file system (does not support deleting folders)</p></li>
+<li><p>devfs device file system. Currently, only the keyboard file is registered.</p></li>
+<li><p>rootfs root file system, provides support for other pseudo-file systems before the real disk file system is mounted</p></li>
+<li><p>Mount point abstraction. Currently, file system mounting is implemented, and all mount points are managed in a stack-like manner (optimization is needed in the future)</p></li>
+</ul>
+</section>
+<section id="exception-and-interrupt-handling">
+<h3>Exception and Interrupt Handling<a class="headerlink" href="#exception-and-interrupt-handling" title="Permalink to this heading"></a></h3>
+<ul class="simple">
+<li><p>Handling of processor exceptions</p></li>
+<li><p>Support for APIC</p></li>
+<li><p>Softirq soft interrupt mechanism</p></li>
+<li><p>Ability to trace the kernel stack</p></li>
+</ul>
+</section>
+<section id="kernel-data-structures">
+<h3>Kernel Data Structures<a class="headerlink" href="#kernel-data-structures" title="Permalink to this heading"></a></h3>
+<ul class="simple">
+<li><p>Ordinary binary tree</p></li>
+<li><p>kfifo first-in-first-out buffer</p></li>
+<li><p>Circular linked list</p></li>
+<li><p>IDR mapping data structure</p></li>
+<li><p>IDA ID allocation data component</p></li>
+</ul>
+</section>
+<section id="screen-display">
+<h3>Screen Display<a class="headerlink" href="#screen-display" title="Permalink to this heading"></a></h3>
+<ul class="simple">
+<li><p>VESA VBE display chip driver</p></li>
+<li><p>Implemented a screen manager, supporting multiple display frameworks to be registered with the screen manager</p></li>
+<li><p>Implemented a TextUI text interface framework, capable of rendering text to the screen. Also reserves support for scrollable pages and multiple display windows</p></li>
+<li><p>printk</p></li>
+</ul>
+</section>
+<section id="kernel-utility-library">
+<h3>Kernel Utility Library<a class="headerlink" href="#kernel-utility-library" title="Permalink to this heading"></a></h3>
+<ul class="simple">
+<li><p>String operation library</p></li>
+<li><p>ELF executable file support component</p></li>
+<li><p>Basic math library</p></li>
+<li><p>CRC function library</p></li>
+</ul>
+</section>
+<section id="software-portability">
+<h3>Software Portability<a class="headerlink" href="#software-portability" title="Permalink to this heading"></a></h3>
+<ul class="simple">
+<li><p>Ported the LZ4 compression library (V1.9.3), laying the foundation for future page compression mechanisms</p></li>
+</ul>
+</section>
+<section id="kernel-testing">
+<h3>Kernel Testing<a class="headerlink" href="#kernel-testing" title="Permalink to this heading"></a></h3>
+<ul class="simple">
+<li><p>ktest unit test framework</p></li>
+<li><p>Supports outputting screen content to a file via serial port (COM1)</p></li>
+</ul>
+</section>
+<section id="driver-support">
+<h3>Driver Support<a class="headerlink" href="#driver-support" title="Permalink to this heading"></a></h3>
+<ul class="simple">
+<li><p>IDE hard disk</p></li>
+<li><p>AHCI hard disk (SATA Native)</p></li>
+<li><p>ACPI Advanced Power Configuration module</p></li>
+<li><p>PCI bus driver</p></li>
+<li><p>XHCI host controller driver (USB 3.0)</p></li>
+<li><p>PS/2 keyboard</p></li>
+<li><p>PS/2 mouse</p></li>
+<li><p>HPET high-precision timer</p></li>
+<li><p>RTC clock</p></li>
+<li><p>Local APIC timer</p></li>
+<li><p>UART serial port (supports RS-232)</p></li>
+<li><p>VBE display</p></li>
+<li><p>Virtual tty device</p></li>
+</ul>
+</section>
+<section id="system-calls">
+<h3>System Calls<a class="headerlink" href="#system-calls" title="Permalink to this heading"></a></h3>
+<p>DragonOS currently has a total of 22 valid system calls.</p>
+<ul class="simple">
+<li><p>SYS_PUT_STRING Print characters to the screen</p></li>
+<li><p>SYS_OPEN Open a file</p></li>
+<li><p>SYS_CLOSE Close a file</p></li>
+<li><p>SYS_READ Read from a file</p></li>
+<li><p>SYS_WRITE Write to a file</p></li>
+<li><p>SYS_LSEEK Adjust the file pointer</p></li>
+<li><p>SYS_FORK Fork system call</p></li>
+<li><p>SYS_VFORK Vfork system call</p></li>
+<li><p>SYS_BRK Adjust the heap size to a specified value</p></li>
+<li><p>SYS_SBRK Adjust the heap size by a relative value</p></li>
+<li><p>SYS_REBOOT Reboot (this system call will be removed after sysfs is improved; please do not rely on this system call excessively)</p></li>
+<li><p>SYS_CHDIR Change the working directory of the process</p></li>
+<li><p>SYS_GET_DENTS Get metadata of directory entries</p></li>
+<li><p>SYS_EXECVE Let the current process execute a new program file</p></li>
+<li><p>SYS_WAIT4 Wait for a process to exit</p></li>
+<li><p>SYS_EXIT Exit the current process</p></li>
+<li><p>SYS_MKDIR Create a directory</p></li>
+<li><p>SYS_NANOSLEEP Nanosecond-level sleep (up to 1 second), capable of high-precision sleep when less than 500ns</p></li>
+<li><p>SYS_CLOCK Get the current CPU time</p></li>
+<li><p>SYS_PIPE Create a pipe</p></li>
+<li><p>SYS_MSTAT Get the current memory status information of the system</p></li>
+<li><p>SYS_UNLINK_AT Delete a directory or delete a file link</p></li>
+</ul>
+</section>
+<section id="rust-support">
+<h3>Rust Support<a class="headerlink" href="#rust-support" title="Permalink to this heading"></a></h3>
+<ul class="simple">
+<li><p>Implemented a simple “hello world” in Rust. Plan to gradually shift to using Rust for development in the next version.</p></li>
+</ul>
+</section>
+</section>
+<section id="user-environment">
+<h2>User Environment<a class="headerlink" href="#user-environment" title="Permalink to this heading"></a></h2>
+<section id="libc">
+<h3>LibC<a class="headerlink" href="#libc" title="Permalink to this heading"></a></h3>
+<p>  LibC is the bridge between applications and the operating system. DragonOS’s LibC implements some simple functions.</p>
+<ul class="simple">
+<li><p>malloc heap memory allocator</p></li>
+<li><p>Basic math library</p></li>
+<li><p>A few simple functions related to files</p></li>
+<li><p>pipe</p></li>
+<li><p>fork/vfork</p></li>
+<li><p>clock</p></li>
+<li><p>sleep</p></li>
+<li><p>printf</p></li>
+</ul>
+</section>
+<section id="shell-command-line-programs">
+<h3>Shell Command Line Programs<a class="headerlink" href="#shell-command-line-programs" title="Permalink to this heading"></a></h3>
+<ul class="simple">
+<li><p>Based on simple string matching parsing (not done through the compilation course’s method, so it’s simple and crude)</p></li>
+<li><p>Supported commands: ls, cd, mkdir, exec, about, rmdir, rm, cat, touch, reboot</p></li>
+</ul>
+</section>
+<section id="user-space-driver-programs">
+<h3>User-space Driver Programs<a class="headerlink" href="#user-space-driver-programs" title="Permalink to this heading"></a></h3>
+<ul class="simple">
+<li><p>User-space keyboard driver</p></li>
+</ul>
+</section>
+</section>
+<section id="source-code-and-release-image-download">
+<h2>Source Code and Release Image Download<a class="headerlink" href="#source-code-and-release-image-download" title="Permalink to this heading"></a></h2>
+<p>  You can obtain the source code in the following ways:</p>
+<section id="get-via-git">
+<h3>Get via Git<a class="headerlink" href="#get-via-git" title="Permalink to this heading"></a></h3>
+<ul class="simple">
+<li><p>You can visit <a class="reference external" href="https://github.com/fslongjin/DragonOS/releases">https://github.com/fslongjin/DragonOS/releases</a> to download the release code and the compiled, runnable disk image.</p></li>
+<li><p>We also have a mirror repository on gitee for download: <a class="reference external" href="https://gitee.com/DragonOS/DragonOS">https://gitee.com/DragonOS/DragonOS</a></p></li>
+</ul>
+</section>
+<section id="get-via-dragonos-software-mirror-site">
+<h3>Get via DragonOS Software Mirror Site<a class="headerlink" href="#get-via-dragonos-software-mirror-site" title="Permalink to this heading"></a></h3>
+<p>  To solve the problem of slow and unstable access to GitHub in China, and to make it convenient for developers to download the code of each version of DragonOS, we have specially set up a mirror site. You can access the mirror site through the following address:</p>
+<p>  You can obtain the DragonOS code archive and the compiled, runnable disk image through the mirror site.</p>
+<ul class="simple">
+<li><p><a class="reference external" href="https://mirrors.DragonOS.org">https://mirrors.DragonOS.org</a></p></li>
+<li><p><a class="reference external" href="https://mirrors.DragonOS.org.cn">https://mirrors.DragonOS.org.cn</a></p></li>
+</ul>
+</section>
+</section>
+<section id="open-source-code-declaration">
+<h2>Open Source Code Declaration<a class="headerlink" href="#open-source-code-declaration" title="Permalink to this heading"></a></h2>
+<div class="admonition note">
+<p class="admonition-title">备注</p>
+<p>To promote the healthy development of the DragonOS project, DragonOS is released under the GPLv2 open source protocol. Everyone who can obtain the DragonOS source code and related software products (including but not limited to binary copies and documents) will enjoy the rights granted by us through the GPLv2 protocol, and you must also comply with the obligations stipulated in the protocol.</p>
+<p>This is a rather strict protocol that protects the healthy development of open source software and prevents it from being encroached upon.</p>
+<p>For most people with good intentions, you will not violate our open source protocol.</p>
+<p>We encourage the free spread and promotion of DragonOS, but please ensure that all actions do not infringe on the legitimate rights and interests of others, nor do they violate the GPLv2 protocol.</p>
+<p>Please pay special attention to the fact that those who violate the open source protocol, especially <strong>commercial closed-source use and any plagiarism or academic misconduct</strong>, will be held seriously accountable. (This is the easiest scenario to violate our open source protocol.)</p>
+<p>Also, please note that according to the requirements of the GPLv2 protocol, any software modified or developed based on DragonOS must also be open-sourced under the GPLv2 protocol and must indicate that it is based on DragonOS. It must also ensure that users of these modified versions can easily obtain the original version of DragonOS.</p>
+<p>You must make sure that the DragonOS developers can obtain the source code of your modified version through the same way from public channels, otherwise you will violate the GPLv2 protocol.</p>
+<p>For detailed information about the protocol, please read the <strong>LICENSE</strong> file in the root directory of the project. Please note that according to the requirements of the GPLv2 protocol, <strong>only the English original version has legal effect</strong>. Any translated version is for reference only.</p>
+</div>
+<section id="usage-of-open-source-software">
+<h3>Usage of Open Source Software<a class="headerlink" href="#usage-of-open-source-software" title="Permalink to this heading"></a></h3>
+<p>  During the development of DragonOS, some open source projects’ designs were referenced, or parts of their code were introduced, or they were inspired by them. Below are the list of these open source projects. We sincerely thank the contributors of these open source projects!</p>
+<p>Format: <Project Name> - <Link> - <Open Source License></p>
+<ul class="simple">
+<li><p>Linux - <a class="reference external" href="https://git.kernel.org/">https://git.kernel.org/</a> - GPLv2</p></li>
+<li><p>skiftOS - <a class="reference external" href="https://github.com/skiftOS/skift">https://github.com/skiftOS/skift</a> - MIT</p></li>
+<li><p>FYSOS - <a class="reference external" href="https://github.com/fysnet/FYSOS">https://github.com/fysnet/FYSOS</a> - <a class="reference external" href="https://github.com/fysnet/FYSOS/blob/9a8968e3d6600de34539c028c843f4c06d134039/license.txt">FYSOS’ License</a></p></li>
+<li><p>LemonOS - <a class="reference external" href="https://github.com/LemonOSProject/LemonOS.git">https://github.com/LemonOSProject/LemonOS.git</a> - BSD 2-Clause License</p></li>
+<li><p>LZ4 - <a class="reference external" href="https://github.com/lz4/lz4">https://github.com/lz4/lz4</a> - BSD 2-Clause license</p></li>
+<li><p>SerenityOS - <a class="reference external" href="https://github.com/SerenityOS/serenity.git">https://github.com/SerenityOS/serenity.git</a> - BSD 2-Clause license</p></li>
+<li><p>MINE - 《A Design and Implementation of a 64-bit Operating System》Tian Yu; People’s Posts and Telecommunications Press</p></li>
+<li><p>chcore - 《Modern Operating Systems: Design and Implementation》Chen Haibo, Xia Yubin; Machinery Industry Press</p></li>
+<li><p>SimpleKernel - <a class="reference external" href="https://github.com/Simple-XX/SimpleKernel">https://github.com/Simple-XX/SimpleKernel</a> - MIT</p></li>
+</ul>
+</section>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="页脚">
+        <a href="V0.1.1.html" class="btn btn-neutral float-left" title="V0.1.1" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> 上一页</a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; 版权所有 2022-2025, DragonOS Community.
+      <span class="commit">版本 <code>ac64a32</code>.
+      </span></p>
+  </div>
+
+  利用 <a href="https://www.sphinx-doc.org/">Sphinx</a> 构建，使用的 
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">主题</a>
+    由 <a href="https://readthedocs.org">Read the Docs</a> 开发.
+  
+<div>
+    <br>
+    官网 <a href="https://dragonos.org">https://dragonos.org</a> | 论坛 <a href="https://bbs.dragonos.org.cn">https://bbs.dragonos.org.cn</a> |  <a href="https://dragonos.org">赞助DragonOS，成就未来！</a>
+</div>
+
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  
+<div class="rst-versions" data-toggle="rst-versions" role="note" aria-label="versions">
+  <span class="rst-current-version" data-toggle="rst-current-version">
+    <span class="fa fa-book"> Other Versions</span>
+    v: V0.4.0
+    <span class="fa fa-caret-down"></span>
+  </span>
+  <div class="rst-other-versions">
+    <dl>
+      <dt>Tags</dt>
+      <dd><a href="../../../../../../V0.1.0/index.html">V0.1.0</a></dd>
+      <dd><a href="../../../../../../V0.1.1/index.html">V0.1.1</a></dd>
+      <dd><a href="../../../../../../V0.1.10/index.html">V0.1.10</a></dd>
+      <dd><a href="../../../../../../V0.1.2/index.html">V0.1.2</a></dd>
+      <dd><a href="../../../../../../V0.1.3/index.html">V0.1.3</a></dd>
+      <dd><a href="../../../../../../V0.1.4/index.html">V0.1.4</a></dd>
+      <dd><a href="../../../../../../V0.1.5/index.html">V0.1.5</a></dd>
+      <dd><a href="../../../../../../V0.1.6/index.html">V0.1.6</a></dd>
+      <dd><a href="../../../../../../V0.1.7/index.html">V0.1.7</a></dd>
+      <dd><a href="../../../../../../V0.1.8/index.html">V0.1.8</a></dd>
+      <dd><a href="../../../../../../V0.1.9/index.html">V0.1.9</a></dd>
+      <dd><a href="../../../../../../V0.2.0/locales/en/community/ChangeLog/V0.1.x/V0.1.0.html">V0.2.0</a></dd>
+      <dd><a href="../../../../../../V0.3.0/locales/en/community/ChangeLog/V0.1.x/V0.1.0.html">V0.3.0</a></dd>
+      <dd><a href="V0.1.0.html">V0.4.0</a></dd>
+    </dl>
+    <dl>
+      <dt>Branches</dt>
+      <dd><a href="../../../../../../master/locales/en/community/ChangeLog/V0.1.x/V0.1.0.html">master</a></dd>
+    </dl>
+  </div>
+</div><script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script>  
+
+  <style>
+         .wy-nav-content { max-width: 90%; }
+  </style>
+
+
+
+</body>
+</html>

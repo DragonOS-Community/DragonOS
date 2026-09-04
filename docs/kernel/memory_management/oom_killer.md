@@ -1,317 +1,317 @@
-# OOM Killer 设计说明
+# OOM Killer Design
 
-## 1. 设计背景
+## 1. Design Background
 
-OOM killer 的目标不是“让一次分配成功”，而是在系统已经无法满足内存请求时，选择一个最可能释放足够内存、且相对合适的用户进程终止它，避免内核在同一个失败路径上无意义重试、死循环或系统级死锁。
+The goal of the OOM killer is not to “make one allocation succeed”. When the system can no longer satisfy a memory request, it selects a relatively suitable user process that is most likely to free enough memory and terminates it. That avoids pointless retries on the same failure path, infinite loops, or a system-wide deadlock.
 
-DragonOS 当前已经有基础页帧分配器、页缓存回收线程、用户态缺页处理和进程退出释放地址空间的能力，但还没有 Linux 6.6 那种完整的页分配慢速路径、reclaim、memcg、NUMA/cpuset OOM 域、OOM reaper 与内存水位联动。因此当前 OOM killer 的第一阶段定位是：
+DragonOS already has a basic page-frame allocator, a page-cache reclaim thread, user-space page-fault handling, and the ability to free an address space on process exit. It does not yet have Linux 6.6’s full page-allocation slow path, reclaim, memcg, NUMA/cpuset OOM domains, OOM reaper, or watermark-driven interaction. The first-stage OOM killer is therefore scoped to:
 
-- 解决用户态合法缺页返回 `VM_FAULT_OOM` 后可能在同一 RIP 上反复缺页的问题；
-- 在 x86_64 用户态 page fault 尾部主动进入 `mm::oom`；
-- 选择一个用户地址空间对应的 victim，向相关线程组投递 `SIGKILL`；
-- 等待 victim 的地址空间释放出现可观察进度，再让触发缺页的任务重试 fault；
-- 保留与 Linux OOM 语义一致的评分、不可杀条件、共享 `mm` 处理方向，为后续接入页分配慢速路径打基础。
+- Solve the problem that a legitimate user-space page fault returning `VM_FAULT_OOM` can keep faulting at the same RIP;
+- Enter `mm::oom` from the tail of the x86_64 user-space page-fault path;
+- Select a victim that owns a user address space and deliver `SIGKILL` to the related thread groups;
+- Wait until the victim’s address-space teardown shows observable progress, then let the faulting task retry the fault;
+- Keep scoring, unkilleable conditions, and shared-`mm` handling aligned with Linux OOM semantics, so later work can hook the page-allocation slow path.
 
-当前实现重点在 `kernel/src/mm/oom.rs`，并由 `kernel/src/mm/mod.rs` 导出。
+The current implementation lives mainly in `kernel/src/mm/oom.rs` and is exported from `kernel/src/mm/mod.rs`.
 
-## 2. 当前总体路径
+## 2. Current Overall Path
 
-用户态缺页 OOM 的主路径如下：
+The main user-space page-fault OOM path is:
 
 ```text
 x86_64 #PF
   -> arch/x86_64/mm/fault.rs
   -> PageFaultHandler::handle_mm_fault()
-  -> 返回 VM_FAULT_OOM
+  -> return VM_FAULT_OOM
   -> drop(space_guard)
   -> mm::oom::pagefault_out_of_memory(OomContext)
-       -> 串行化 OOM 选择
-       -> 扫描进程并选择 victim
-       -> 对 victim mm 的所有相关线程组发送 SIGKILL
-       -> 等待 mm 释放进度或当前任务被 kill
-  -> Retry: 重新执行 fault
-  -> CurrentTaskKilled: 处理 pending signal 并返回用户态退出
+       -> serialize OOM selection
+       -> scan processes and select a victim
+       -> send SIGKILL to all thread groups sharing the victim mm
+       -> wait for mm reclaim progress or for the current task to be killed
+  -> Retry: re-execute the fault
+  -> CurrentTaskKilled: handle the pending signal and return to user space to exit
   -> NoVictim: fatal OOM panic
 ```
 
-`arch/x86_64/mm/fault.rs` 在处理 `VM_FAULT_OOM` 前会释放 `space_guard`。这是重要的并发边界：OOM 路径会扫描全局进程、投递信号、等待 wait queue，不能持有地址空间写锁、VMA 锁、页表编辑锁或分配器锁进入。
+`arch/x86_64/mm/fault.rs` drops `space_guard` before handling `VM_FAULT_OOM`. That is an important concurrency boundary: the OOM path scans the global process list, delivers signals, and waits on a wait queue. It must not enter while holding an address-space write lock, a VMA lock, a page-table editing lock, or an allocator lock.
 
-## 3. OOM 可能从哪里来
+## 3. Where OOM Can Come From
 
-当前 `VM_FAULT_OOM` 主要来自用户缺页处理中的实际内存分配失败：
+Today `VM_FAULT_OOM` mainly comes from real allocation failures inside user page-fault handling:
 
-- `PageFaultHandler::handle_normal_fault()` 分配中间页表失败；
-- `do_anonymous_page()` 为私有匿名页调用 `PageMapper::map()` 失败；
-- 共享匿名映射 `shared.get_or_create_page()` 或 `map_phys()` 失败；
-- 文件私有映射 COW 时 `copy_page_as_normal()` 失败；
-- 写保护 fault 中匿名页或私有文件页复制失败；
-- `do_fault_around()` 预分配 PTE 页表失败；
-- 测试专用 `mm::oom::should_inject_fault_oom()` 命中。
+- `PageFaultHandler::handle_normal_fault()` fails to allocate an intermediate page table;
+- `do_anonymous_page()` fails when calling `PageMapper::map()` for a private anonymous page;
+- A shared anonymous mapping fails in `shared.get_or_create_page()` or `map_phys()`;
+- A private file mapping fails in `copy_page_as_normal()` during COW;
+- Copying an anonymous page or a private file page fails on a write-protect fault;
+- `do_fault_around()` fails to preallocate a PTE page table;
+- The test-only `mm::oom::should_inject_fault_oom()` hook hits.
 
-底层页帧分配由 `LockedFrameAllocator` 包装 buddy allocator。`LockedFrameAllocator::allocate()` 当前只尝试直接从 buddy 分配并返回 `Option`，还没有 Linux `__alloc_pages_slowpath()` 那样同步 reclaim、压缩、重试和最终 `out_of_memory()` 的慢路径。`kernel/src/mm/page.rs` 中的 `page_reclaim` 线程会在空闲页低于阈值时回收页缓存中的可回收文件页，但它不是当前分配失败路径上的同步 OOM 判定器。
+Underlying page-frame allocation is a buddy allocator wrapped by `LockedFrameAllocator`. `LockedFrameAllocator::allocate()` currently only tries a direct buddy allocation and returns `Option`. It does not yet have a Linux-style `__alloc_pages_slowpath()` that does synchronous reclaim, compaction, retries, and a final `out_of_memory()`. The `page_reclaim` thread in `kernel/src/mm/page.rs` reclaims reclaimable file pages from the page cache when free pages fall below a threshold, but it is not a synchronous OOM decision point on the current allocation-failure path.
 
-因此，当前 DragonOS OOM killer 的触发点是“用户态合法 page fault 泄漏出的 `VM_FAULT_OOM`”，而不是完整的全局页分配 OOM。
+Therefore the current DragonOS OOM killer is triggered by a `VM_FAULT_OOM` that leaks out of a legitimate user-space page fault, not by a complete global page-allocation OOM.
 
-## 4. `mm::oom` 的关键数据结构
+## 4. Key Data Structures in `mm::oom`
 
-`OomContext` 描述一次 OOM 触发现场：
+`OomContext` describes one OOM trigger site:
 
-- `trigger_pid`：触发 fault 的线程 PID；
-- `trigger_tgid`：触发 fault 的线程组 ID；
-- `fault_address`：缺页地址；
-- `fault_ip`：触发 fault 的指令地址；
-- `order`：本次请求阶数，当前用户 fault 路径固定为 `1` 页。
+- `trigger_pid`: PID of the thread that triggered the fault;
+- `trigger_tgid`: thread-group ID of the thread that triggered the fault;
+- `fault_address`: the faulting address;
+- `fault_ip`: the instruction address that triggered the fault;
+- `order`: the request order; the current user-fault path is fixed to `1` page.
 
-`OomOutcome` 是返回给 arch fault 路径的裁决：
+`OomOutcome` is the verdict returned to the arch fault path:
 
-- `Retry`：已经提交 victim，且观察到释放进度，触发者可以重试缺页；
-- `CurrentTaskKilled`：当前任务已经收到 fatal signal 或正在退出；
-- `NoVictim`：没有可杀 victim 或 OOM 核心无法推进，进入 fatal OOM。
+- `Retry`: a victim has been committed and reclaim progress has been observed, so the triggerer may retry the page fault;
+- `CurrentTaskKilled`: the current task has already received a fatal signal or is exiting;
+- `NoVictim`: there is no killable victim, or the OOM core cannot make progress, so the path enters fatal OOM.
 
-全局状态由 `OOM_STATE: SpinLock<OomState>` 保护：
+Global state is protected by `OOM_STATE: SpinLock<OomState>`:
 
-- `generation`：每次开始选择递增，用来关联一次 victim 提交与等待；
-- `selecting`：表示当前有 CPU 正在选择 victim；
-- `inflight`：表示已有 victim 正在释放内存，其他 OOM 触发者应等待而不是继续杀更多任务。
+- `generation`: incremented each time selection starts; used to associate one victim commit with waiters;
+- `selecting`: a CPU is currently selecting a victim;
+- `inflight`: a victim is already freeing memory, so other OOM triggerers should wait instead of killing more tasks.
 
-`OomVictimState` 记录正在等待的 victim 地址空间：
+`OomVictimState` records the victim address space being waited on:
 
-- `mm_id`：`AddressSpace` 的全局唯一 ID；
-- `mm: Weak<AddressSpace>`：弱引用，避免 OOM 状态持有 `mm` 导致释放不了；
-- `initial_reclaim_generation`：提交 victim 时的释放进度版本；
-- `generation`：对应 OOM 轮次。
+- `mm_id`: the globally unique ID of the `AddressSpace`;
+- `mm: Weak<AddressSpace>`: a weak reference, so OOM state does not pin `mm` and block its release;
+- `initial_reclaim_generation`: the reclaim-progress version at the time the victim was committed;
+- `generation`: the corresponding OOM round.
 
-等待者使用 `OOM_WAITQ`。测试注入使用 `OOM_FAULT_INJECT`，对应 `/proc/sys/vm/oom_fault_inject`，这是 DragonOS-only 的测试接口，不是 Linux ABI，并且受 `CAP_SYS_ADMIN` 限制。
+Waiters use `OOM_WAITQ`. Test injection uses `OOM_FAULT_INJECT`, which maps to `/proc/sys/vm/oom_fault_inject`. That is a DragonOS-only test interface, not a Linux ABI, and it is restricted by `CAP_SYS_ADMIN`.
 
-## 5. victim 选择策略
+## 5. Victim Selection Policy
 
-`select_victim()` 扫描 `ProcessManager::get_all_processes()`，对每个任务：
+`select_victim()` scans `ProcessManager::get_all_processes()` and, for each task:
 
-1. 找到任务的 `user_vm()`，没有用户地址空间的任务不参与；
-2. 归并到线程组 leader，按 TGID 去重；
-3. 读取 leader 的 `oom_score_adj`；
-4. 应用不可杀过滤；
-5. 计算 badness 分数；
-6. 选择分数最高者。
+1. Looks up the task’s `user_vm()`; tasks without a user address space are skipped;
+2. Collapses to the thread-group leader and deduplicates by TGID;
+3. Reads the leader’s `oom_score_adj`;
+4. Applies the unkilleable filters;
+5. Computes a badness score;
+6. Selects the candidate with the highest score.
 
-当前不可杀条件包括：
+Current unkilleable conditions include:
 
-- PID 0；
-- 全局 PID 1；
-- `KTHREAD`；
-- 已带 `EXITING` 标志；
-- 处于 active vfork；
-- `oom_score_adj == -1000`。
+- PID 0;
+- Global PID 1;
+- `KTHREAD`;
+- Already marked `EXITING`;
+- In an active vfork;
+- `oom_score_adj == -1000`.
 
-当前评分公式是：
+The current scoring formula is:
 
 ```text
 score = resident_user_pages + oom_score_adj * total_system_pages / 1000
 ```
 
-其中：
+Where:
 
-- `resident_user_pages` 来自 `AddressSpace::resident_pages()`，表示当前 `mm` 中 present 用户 PTE 的页数；
-- `total_system_pages` 来自 `LockedFrameAllocator.usage().total()`；
-- `oom_score_adj` 范围是 `[-1000, 1000]`。
+- `resident_user_pages` comes from `AddressSpace::resident_pages()` and is the number of present user PTEs in the current `mm`;
+- `total_system_pages` comes from `LockedFrameAllocator.usage().total()`;
+- `oom_score_adj` is in the range `[-1000, 1000]`.
 
-如果分数相同，当前实现优先选择 `resident_pages` 更大的候选；仍相同则选择 TGID 更大的候选。这是 DragonOS 当前的确定性 tie-break，不是 Linux ABI。
+On a score tie, the current implementation prefers the candidate with more `resident_pages`; if still tied, it prefers the larger TGID. That is DragonOS’s current deterministic tie-break, not a Linux ABI.
 
-与 Linux 6.6 对照：Linux `oom_badness()` 的基线是 `get_mm_rss(mm) + swapents + page-table pages`，再加上 `oom_score_adj * totalpages / 1000`。DragonOS 当前没有 swap，也没有把页表页计入评分，因此评分更接近“RSS + oom_score_adj”的阶段性实现。
+Comparison with Linux 6.6: the baseline of Linux `oom_badness()` is `get_mm_rss(mm) + swapents + page-table pages`, plus `oom_score_adj * totalpages / 1000`. DragonOS currently has no swap and does not count page-table pages in the score, so scoring is a staged implementation closer to “RSS + oom_score_adj”.
 
 ## 6. `oom_score_adj`
 
-DragonOS 当前实现 `/proc/[pid]/oom_score_adj`，位置在 `kernel/src/filesystem/procfs/pid/oom_score_adj.rs`。
+DragonOS currently implements `/proc/[pid]/oom_score_adj` in `kernel/src/filesystem/procfs/pid/oom_score_adj.rs`.
 
-语义要点：
+Semantic points:
 
-- 可读写范围是 `[-1000, 1000]`；
-- `-1000` 表示 OOM 不可杀；
-- 非特权写入不能把分数调低到 `oom_score_adj_min` 以下；
-- 拥有 `CAP_SYS_RESOURCE` 的写入会同步更新 `oom_score_adj_min`；
-- 对共享同一 `mm` 的其他线程组，写入会传播 `oom_score_adj`，但 active vfork 场景会跳过传播；
-- `ProcessManager::lock_oom_score_adj()` 用于序列化相关更新。
+- The readable and writable range is `[-1000, 1000]`;
+- `-1000` means the task is unkilleable by OOM;
+- An unprivileged write cannot lower the score below `oom_score_adj_min`;
+- A write with `CAP_SYS_RESOURCE` also updates `oom_score_adj_min`;
+- A write is propagated to other thread groups that share the same `mm`, but propagation is skipped during an active vfork;
+- `ProcessManager::lock_oom_score_adj()` serializes the related updates.
 
-这与 Linux `/proc/[pid]/oom_score_adj` 的核心方向一致：`oom_score_adj_min` 用来防止非特权进程绕过管理员设置的最低保护线；共享同一 `mm` 的进程也应保持一致的 OOM 评分倾向。
+This matches the core direction of Linux `/proc/[pid]/oom_score_adj`: `oom_score_adj_min` prevents an unprivileged process from bypassing the administrator’s minimum protection line, and processes that share the same `mm` should keep a consistent OOM scoring bias.
 
-当前状态：DragonOS 已有 `oom_score_adj`，但 `/proc/[pid]/oom_score` 只读评分展示还不是当前 OOM killer 的核心接口。
+Current status: DragonOS has `oom_score_adj`, but the read-only `/proc/[pid]/oom_score` display is not yet a core interface of this OOM killer.
 
-## 7. SIGKILL 提交与共享地址空间
+## 7. SIGKILL Delivery and Shared Address Spaces
 
-选中 victim 后，`send_oom_sigkill()` 不只杀选中 TGID。它会调用 `kill_targets_for_mm()` 扫描所有进程，找出共享 candidate `AddressSpace` 的线程组 leader，并对每个目标以 `PidType::TGID` 投递 `SIGKILL`。
+After a victim is selected, `send_oom_sigkill()` does not kill only the selected TGID. It calls `kill_targets_for_mm()` to scan all processes, find thread-group leaders that share the candidate `AddressSpace`, and deliver `SIGKILL` to each target with `PidType::TGID`.
 
-这么做是为了匹配 Linux 的重要语义方向：如果多个线程组共享同一个 `mm`，只杀其中一个线程组可能无法释放该地址空间，甚至会让被 OOM kill 的任务卡在退出路径，等待另一个仍在运行并持有同一 `mm` 的任务。Linux `__oom_kill_process()` 也会向共享 victim `mm` 的其他用户进程发送 `SIGKILL`，但跳过 global init 和 kthread。
+This matches an important Linux semantic: if several thread groups share the same `mm`, killing only one of them may not free that address space, and can even stall the OOM-killed task on the exit path while another still-running task holds the same `mm`. Linux `__oom_kill_process()` also sends `SIGKILL` to other user processes that share the victim `mm`, while skipping global init and kthreads.
 
-DragonOS 当前同样跳过 PID 0、PID 1 和 kthread。提交成功后会打印摘要：
+DragonOS currently also skips PID 0, PID 1, and kthreads. After a successful commit it prints a summary:
 
 ```text
 oom-kill: trigger_pid=... trigger_tgid=... victim_tgid=...
           score=... adj=... rss=... order=... addr=... ip=...
 ```
 
-如果当前触发 OOM 的任务本身就是 victim，或者它共享 victim `mm` 且不是 init/kthread，`pagefault_out_of_memory()` 直接返回 `CurrentTaskKilled`，由 fault 路径处理 pending signal。
+If the task that triggered OOM is itself the victim, or it shares the victim `mm` and is not init/kthread, `pagefault_out_of_memory()` returns `CurrentTaskKilled` immediately and the fault path handles the pending signal.
 
-## 8. 等待释放进度
+## 8. Waiting for Reclaim Progress
 
-DragonOS 不把 `resident_user_pages` 下降本身视作 OOM 释放完成。真正用于唤醒 OOM 等待者的是 `AddressSpace::oom_reclaim_generation()`。
+DragonOS does not treat a drop in `resident_user_pages` itself as OOM reclaim completion. What actually wakes OOM waiters is `AddressSpace::oom_reclaim_generation()`.
 
-原因是：清 PTE 和实际释放物理页之间隔着 TLB shootdown。只要其他 CPU 还可能通过 stale TLB 访问旧物理页，内核就不能释放该页。`kernel/src/mm/mmu_gather.rs` 维护了顺序：
+The reason is that clearing a PTE and actually freeing the physical page are separated by a TLB shootdown. As long as another CPU might still access the old physical page through a stale TLB, the kernel cannot free that page. `kernel/src/mm/mmu_gather.rs` maintains this order:
 
-1. 页表项先被清除；
-2. 待释放的 `Arc<Page>` 暂存在 `MmuGather::pending_pages`；
-3. `flush_mmu_tlbonly()` 完成本地和远端 TLB shootdown；
-4. `flush_mmu_free()` 清空 `pending_pages`，触发页引用释放；
-5. 如果确实释放了页，调用 `mm.advance_oom_reclaim_generation()`；
-6. 调用 `mm::oom::notify_mm_reclaim_progress(mm)` 唤醒 OOM 等待者。
+1. Page-table entries are cleared first;
+2. The `Arc<Page>` objects to be freed are held in `MmuGather::pending_pages`;
+3. `flush_mmu_tlbonly()` completes local and remote TLB shootdowns;
+4. `flush_mmu_free()` clears `pending_pages` and drops the page references;
+5. If pages were actually freed, `mm.advance_oom_reclaim_generation()` is called;
+6. `mm::oom::notify_mm_reclaim_progress(mm)` wakes OOM waiters.
 
-`victim_has_progress()` 判断：
+`victim_has_progress()` decides progress as follows:
 
-- `Weak<AddressSpace>` 已无法升级，认为有进展；
-- `mm_id` 不匹配，认为旧 `mm` 生命周期已结束；
-- `oom_reclaim_generation` 相比提交 victim 时发生变化，认为有进展。
+- The `Weak<AddressSpace>` can no longer be upgraded: treat as progress;
+- The `mm_id` does not match: the old `mm` lifetime has ended;
+- `oom_reclaim_generation` has changed since the victim was committed: treat as progress.
 
-如果 `InnerAddressSpace::drop()` 发生，会先 `unmap_all()`，随后调用 `mm::oom::notify_mm_drop(mm_id)` 清除 inflight 状态并唤醒等待者。
+If `InnerAddressSpace::drop()` runs, it first calls `unmap_all()`, then `mm::oom::notify_mm_drop(mm_id)` to clear the inflight state and wake waiters.
 
-## 9. 与进程退出的关系
+## 9. Relationship with Process Exit
 
-OOM killer 通过 `SIGKILL` 促使 victim 走普通退出路径，而不是直接在 OOM 上下文释放别的进程地址空间。
+The OOM killer uses `SIGKILL` to push the victim onto the normal exit path. It does not free another process’s address space directly from the OOM context.
 
-进程退出关键步骤在 `ProcessManager::exit()`：
+The key exit steps are in `ProcessManager::exit()`:
 
-- 先 `mark_exiting()`；
-- 处理 `clear_child_tid`、robust list、vfork completion 等仍可能访问用户地址空间的退出工作；
-- 之后执行类似 Linux `exit_mm()` 的逻辑：
-  - 将当前 CPU 切到 idle 地址空间；
-  - 从 PCB 中 `replace_user_vm(None)`；
-  - 从旧 `mm.active_cpus` 中清除当前 CPU；
-  - 更新 per-CPU TLB 状态；
-- 如果没有其他用户任务仍引用旧 `mm`，调用 `old_vm.write().unmap_all()`；
-- drop 旧 `Arc<AddressSpace>`，最终触发 `InnerAddressSpace::drop()` 中的 `notify_mm_drop()`。
+- First `mark_exiting()`;
+- Handle `clear_child_tid`, the robust list, vfork completion, and other exit work that may still access the user address space;
+- Then run logic similar to Linux `exit_mm()`:
+  - Switch the current CPU to the idle address space;
+  - `replace_user_vm(None)` on the PCB;
+  - Clear the current CPU from the old `mm.active_cpus`;
+  - Update per-CPU TLB state;
+- If no other user task still references the old `mm`, call `old_vm.write().unmap_all()`;
+- Drop the old `Arc<AddressSpace>`, which eventually triggers `notify_mm_drop()` in `InnerAddressSpace::drop()`.
 
-这里有两个不变量：
+There are two invariants here:
 
-- OOM 路径不能直接释放 victim 的 `mm`，必须让 victim 自己经过退出路径，避免破坏 clear tid、robust futex、文件关闭等语义；
-- `user_vm=None` 之后，任务不应再作为 OOM victim 候选，因为它已经没有可通过 OOM kill 释放的用户地址空间。
+- The OOM path must not free the victim’s `mm` directly. The victim must go through its own exit path so clear tid, robust futex, file close, and related semantics are preserved;
+- After `user_vm=None`, the task must not be an OOM victim candidate, because it no longer has a user address space that an OOM kill could free.
 
-## 10. 与信号系统的关系
+## 10. Relationship with the Signal System
 
-OOM 路径使用 `Signal::oom_fatal_signal_pending()` 判断当前任务是否已经注定退出。该 helper 不只检查线程私有 pending `SIGKILL`，还检查：
+The OOM path uses `Signal::oom_fatal_signal_pending()` to decide whether the current task is already destined to exit. That helper does not only check a thread-private pending `SIGKILL`; it also checks:
 
-- 线程组是否已有 group exit code；
-- `sighand.shared_pending` 中是否有 `SIGKILL`；
-- 普通 `fatal_signal_pending()`。
+- Whether the thread group already has a group exit code;
+- Whether `sighand.shared_pending` contains `SIGKILL`;
+- Ordinary `fatal_signal_pending()`.
 
-这是 DragonOS 当前信号模型下的必要补充：OOM victim 投递使用 `PidType::TGID`，信号会进入线程组共享 pending。如果 OOM 等待者只检查线程级 pending，就可能在已经收到进程级 `SIGKILL` 时继续选择新 victim 或重试 fault，造成过度 kill 或 livelock。
+This is a necessary addition under DragonOS’s current signal model: OOM victim delivery uses `PidType::TGID`, so the signal goes into the thread-group shared pending set. If an OOM waiter only checked thread-local pending, it could keep selecting a new victim or retrying the fault after a process-level `SIGKILL` had already been received, causing over-kill or a livelock.
 
-## 11. 并发与生命周期注意点
+## 11. Concurrency and Lifetime Considerations
 
-OOM killer 的关键并发规则如下：
+The OOM killer’s key concurrency rules are:
 
-- `OOM_STATE` 只保护 OOM 选择和 inflight 状态，不保护进程生命周期本身；
-- 选择 victim 时只保存 `Arc<AddressSpace>` 到候选，提交到 inflight 后降级为 `Weak<AddressSpace>`；
-- 等待 OOM slot 或等待释放进度时，不能持有 `OOM_STATE`、`AddressSpace` 写锁、VMA 锁、页表编辑锁或分配器锁；
-- `selecting` 防止多个 CPU 同时选择并提交 victim；
-- `inflight` 防止在已有 victim 正在释放时过度杀进程；
-- 观察到 victim 释放进度后，应清除 `inflight` 并唤醒等待者；
-- `notify_mm_reclaim_progress()` 和 `notify_mm_drop()` 都必须能在 victim 生命周期结束边界安全调用；
-- `resident_user_pages` 是评分统计，不是释放完成判据；
-- `oom_score_adj` 更新需要全局序列化，避免共享 `mm` 传播时出现明显不一致；
-- vfork 期间跳过 victim 或跳过共享 `mm` 分数传播，是为了避免父子共享地址空间但生命周期关系特殊时误伤或破坏 Linux 兼容语义。
+- `OOM_STATE` only protects OOM selection and inflight state; it does not protect process lifetime itself;
+- During victim selection, only an `Arc<AddressSpace>` is stored on the candidate; after commit to inflight it is downgraded to `Weak<AddressSpace>`;
+- While waiting for an OOM slot or for reclaim progress, do not hold `OOM_STATE`, an `AddressSpace` write lock, a VMA lock, a page-table editing lock, or an allocator lock;
+- `selecting` prevents multiple CPUs from selecting and committing a victim at the same time;
+- `inflight` prevents over-killing while a victim is already freeing memory;
+- After victim reclaim progress is observed, clear `inflight` and wake waiters;
+- Both `notify_mm_reclaim_progress()` and `notify_mm_drop()` must be safe to call at the victim lifetime-end boundary;
+- `resident_user_pages` is a scoring statistic, not the completion criterion for reclaim;
+- `oom_score_adj` updates need global serialization so shared-`mm` propagation does not become visibly inconsistent;
+- Skipping a victim or skipping shared-`mm` score propagation during vfork avoids accidentally killing the wrong task, or breaking Linux-compatible semantics, when parent and child share an address space but have a special lifetime relationship.
 
-## 12. fatal OOM
+## 12. Fatal OOM
 
-当 `select_victim()` 找不到候选，或者 `SIGKILL` 提交失败且不是简单的 `ESRCH` 竞态，`pagefault_out_of_memory()` 返回 `NoVictim`。x86_64 fault 路径随后触发 panic：
+When `select_victim()` finds no candidate, or `SIGKILL` delivery fails for a reason other than a simple `ESRCH` race, `pagefault_out_of_memory()` returns `NoVictim`. The x86_64 fault path then panics:
 
 ```text
 fatal user page-fault OOM: pid=... tgid=... addr=... rip=...
 ```
 
-这是当前阶段的明确失败策略。Linux 在全局 OOM 且没有 killable process 时也会认为系统可能已经无法前进，并可能 panic。DragonOS 当前还没有 memcg OOM、sysrq OOM、panic_on_oom 等分支，因此 fatal OOM 只表示当前用户 fault OOM 闭环无法推进。
+That is the explicit failure policy for the current stage. Linux also treats a global OOM with no killable process as a situation where the system may no longer be able to make progress, and it may panic. DragonOS does not yet have memcg OOM, sysrq OOM, `panic_on_oom`, or similar branches, so fatal OOM only means the current user-fault OOM loop cannot advance.
 
-## 13. Linux 6.6 语义对照
+## 13. Linux 6.6 Semantics Comparison
 
-Linux 6.6 的 OOM 设计有几个核心点：
+Linux 6.6 OOM design has several core points:
 
-- `out_of_memory()` 由全局 `oom_lock` 串行化，避免多个上下文过度 kill；
-- 页分配失败通常在 `__alloc_pages_slowpath()` 中完成 reclaim、重试和 `__alloc_pages_may_oom()`；
-- `pagefault_out_of_memory()` 主要处理 memcg OOM 和已有 fatal signal；全局 OOM 通常应由分配上下文负责；
-- `oom_badness()` 基于 RSS、swap、页表页和 `oom_score_adj`；
-- `oom_score_adj == -1000` 保护任务不可被 OOM kill；
-- 如果任务正在退出或已有 fatal signal，Linux 倾向让它尽快释放内存，而不是再杀其他任务；
-- `__oom_kill_process()` 会处理共享 victim `mm` 的其他用户进程；
-- OOM victim 会被 `mark_oom_victim()` 标记，并可能交给 OOM reaper 异步回收；
-- `panic_on_oom`、`oom_kill_allocating_task`、memcg、cpuset、mempolicy、NUMA 都影响最终策略。
+- `out_of_memory()` is serialized by the global `oom_lock` to avoid over-killing from multiple contexts;
+- Page-allocation failure usually does reclaim, retries, and `__alloc_pages_may_oom()` inside `__alloc_pages_slowpath()`;
+- `pagefault_out_of_memory()` mainly handles memcg OOM and an already-pending fatal signal; global OOM is normally the allocation context’s responsibility;
+- `oom_badness()` is based on RSS, swap, page-table pages, and `oom_score_adj`;
+- `oom_score_adj == -1000` protects a task from being OOM-killed;
+- If a task is already exiting or already has a fatal signal, Linux prefers to let it free memory quickly instead of killing more tasks;
+- `__oom_kill_process()` also handles other user processes that share the victim `mm`;
+- An OOM victim is marked with `mark_oom_victim()` and may be handed to the OOM reaper for asynchronous reclaim;
+- `panic_on_oom`, `oom_kill_allocating_task`, memcg, cpuset, mempolicy, and NUMA all affect the final policy.
 
-DragonOS 当前已经对齐的方向：
+Directions DragonOS already aligns with:
 
-- OOM 选择全局串行化；
-- `oom_score_adj` 范围和 `-1000` 不可杀语义；
-- 以 resident pages 作为主要 badness 基线；
-- 处理共享 victim `mm` 的线程组；
-- 避免在已有 fatal signal 或退出中继续 kill；
-- 等待真实释放进度后再重试 fault；
-- 对 no victim 走明确 fatal OOM。
+- Global serialization of OOM selection;
+- The `oom_score_adj` range and the `-1000` unkilleable semantic;
+- Resident pages as the primary badness baseline;
+- Handling thread groups that share the victim `mm`;
+- Avoiding further kills when a fatal signal is already pending or the task is exiting;
+- Waiting for real reclaim progress before retrying the fault;
+- Taking an explicit fatal-OOM path when there is no victim.
 
-当前尚未完整对齐的部分：
+Parts that are not yet fully aligned:
 
-- OOM 触发点还未前移到页分配慢速路径；
-- 没有 memcg OOM 域；
-- 没有 NUMA、cpuset、mempolicy 约束；
-- 没有 swap，评分不包含 swapents；
-- 评分尚未包含页表页；
-- 没有 Linux 风格 `TIF_MEMDIE`、`MMF_OOM_SKIP`、`oom_mm` 标记；
-- 没有独立 OOM reaper；
-- 没有 `panic_on_oom`、`oom_kill_allocating_task`、`oom_dump_tasks` 等 sysctl；
-- `/proc/[pid]/oom_score` 仍需后续补齐。
+- The OOM trigger has not yet been moved forward onto the page-allocation slow path;
+- There is no memcg OOM domain;
+- There are no NUMA, cpuset, or mempolicy constraints;
+- There is no swap, so scoring does not include swapents;
+- Scoring does not yet include page-table pages;
+- There are no Linux-style `TIF_MEMDIE`, `MMF_OOM_SKIP`, or `oom_mm` marks;
+- There is no standalone OOM reaper;
+- There are no `panic_on_oom`, `oom_kill_allocating_task`, `oom_dump_tasks`, or similar sysctls;
+- `/proc/[pid]/oom_score` still needs to be completed later.
 
-## 14. 当前实现边界
+## 14. Current Implementation Boundaries
 
-需要特别说明的当前状态：
+The current status that needs to be called out:
 
-- OOM killer 只覆盖 x86_64 用户态 page fault 的 `VM_FAULT_OOM` 路径；
-- 内核态访问用户地址失败优先走异常表修复或 panic，不进入用户 OOM kill；
-- 普通内核分配、slab 分配、DMA 分配、页缓存分配失败不统一触发 `mm::oom`；
-- page reclaim 线程是后台回收机制，不是页分配失败路径上的同步 reclaim；
-- `oom_fault_inject` 仅用于测试 OOM fault 闭环，不应被用户态程序依赖；
-- `do_swap_page()`、`do_numa_page()` 当前仍未实现，对应 Linux 能力也不应在本文中假设存在；
-- fatal OOM 当前直接 panic，是第一阶段比静默重试更安全的失败方式。
+- The OOM killer only covers the `VM_FAULT_OOM` path of x86_64 user-space page faults;
+- A kernel-mode access to a user address that fails prefers exception-table fixup or panic; it does not enter user OOM kill;
+- Ordinary kernel allocations, slab allocations, DMA allocations, and page-cache allocations do not uniformly trigger `mm::oom` on failure;
+- The page-reclaim thread is a background reclaim mechanism, not synchronous reclaim on the page-allocation failure path;
+- `oom_fault_inject` is only for testing the OOM fault loop and must not be relied on by user-space programs;
+- `do_swap_page()` and `do_numa_page()` are still unimplemented; the corresponding Linux capabilities must not be assumed in this document;
+- Fatal OOM currently panics directly. For the first stage that is a safer failure mode than silently retrying.
 
-## 15. 未来演进方向
+## 15. Future Evolution
 
-后续演进建议按以下顺序推进：
+Later work should proceed in this order:
 
-1. 将 OOM 触发点前移到页分配慢速路径
+1. Move the OOM trigger forward onto the page-allocation slow path
 
-   在 `LockedFrameAllocator` / buddy allocator 上层建立类似 Linux `__alloc_pages_slowpath()` 的同步 reclaim、重试和 OOM 判定流程。用户 page fault 尾部应逐步回到 Linux 风格：只处理 memcg OOM、fatal signal 和“泄漏出的 `VM_FAULT_OOM`”告警/重试。
+   Build a Linux-like `__alloc_pages_slowpath()` flow above `LockedFrameAllocator` / the buddy allocator, with synchronous reclaim, retries, and an OOM decision. The tail of the user page-fault path should gradually return to the Linux style: handle only memcg OOM, fatal signals, and a warning/retry for a leaked `VM_FAULT_OOM`.
 
-2. 建立更完整的 reclaim 与 OOM 闭环
+2. Build a more complete reclaim and OOM loop
 
-   将页缓存 reclaim、dirty writeback、不可回收页判断、分配请求上下文整合到统一慢路径中，而不是只依赖后台线程。
+   Integrate page-cache reclaim, dirty writeback, unreclaimable-page decisions, and allocation-request context into a unified slow path, instead of depending only on a background thread.
 
-3. 引入 OOM victim 标记
+3. Introduce OOM victim marks
 
-   增加类似 Linux `TIF_MEMDIE`、`oom_mm`、`MMF_OOM_SKIP` 的状态，用于区分“已被 OOM kill、应尽快释放”的任务和普通任务，减少重复 kill，并为 OOM reaper 做准备。
+   Add Linux-like `TIF_MEMDIE`, `oom_mm`, and `MMF_OOM_SKIP` state to distinguish tasks that have already been OOM-killed and should free memory quickly from ordinary tasks. That reduces repeated kills and prepares for an OOM reaper.
 
-4. 实现 OOM reaper 或等价机制
+4. Implement an OOM reaper or an equivalent mechanism
 
-   在确保不破坏 robust futex、clear_child_tid、vfork 和用户态退出语义的前提下，异步回收 victim 的可回收匿名页，缩短 OOM stall 时间。
+   Asynchronously reclaim the victim’s reclaimable anonymous pages, without breaking robust futex, `clear_child_tid`, vfork, or user-space exit semantics, so OOM stall time is shorter.
 
-5. 完善 badness 统计
+5. Complete badness accounting
 
-   在 `resident_user_pages` 基础上加入页表页、swap、shmem、file/anon 分类统计，并补齐 `/proc/[pid]/oom_score`。
+   On top of `resident_user_pages`, add page-table pages, swap, shmem, and file/anon classified counters, and fill in `/proc/[pid]/oom_score`.
 
-6. 接入 cgroup v2 memory OOM
+6. Hook cgroup v2 memory OOM
 
-   未来容器场景需要 memory.max、memory.events、oom_kill、oom_group_kill 等语义。memcg OOM 应有自己的 OOM 域，而不是总是全局杀进程。
+   Future container workloads need `memory.max`, `memory.events`, `oom_kill`, `oom_group_kill`, and related semantics. memcg OOM should have its own OOM domain instead of always killing globally.
 
-7. 支持策略 sysctl
+7. Support policy sysctls
 
-   根据 Linux 语义补齐 `panic_on_oom`、`oom_kill_allocating_task`、`oom_dump_tasks` 等策略项，并明确哪些是兼容 ABI，哪些是 DragonOS 内部调试接口。
+   Complete `panic_on_oom`, `oom_kill_allocating_task`, `oom_dump_tasks`, and similar policy knobs according to Linux semantics, and make clear which are compatibility ABI and which are DragonOS-internal debug interfaces.
 
-8. 补齐 NUMA/cpuset/mempolicy 约束
+8. Add NUMA/cpuset/mempolicy constraints
 
-   当 DragonOS 支持相关资源域后，victim 选择必须限制在真正能为本次失败分配释放内存的候选集合中。
+   Once DragonOS supports those resource domains, victim selection must be limited to the candidate set that can actually free memory for the failed allocation.
 
-9. 增强诊断输出
+9. Improve diagnostic output
 
-   OOM 日志应能输出当前内存状态、候选任务表、victim 的 VM/RSS/页表/oom_score_adj 等信息，便于定位真实内存压力来源。
+   OOM logs should print the current memory state, a table of candidate tasks, and the victim’s VM/RSS/page-table/`oom_score_adj` information, so the real source of memory pressure can be located.

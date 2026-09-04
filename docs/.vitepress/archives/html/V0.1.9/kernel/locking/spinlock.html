@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="zh-CN">
+<head>
+  <meta charset="utf-8" /><meta name="generator" content="Docutils 0.18.1: http://docutils.sourceforge.net/" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>自旋锁 &mdash; DragonOS dev 文档</title>
+      <link rel="stylesheet" type="text/css" href="../../_static/pygments.css" />
+      <link rel="stylesheet" type="text/css" href="../../_static/css/theme.css" />
+
+  
+  <!--[if lt IE 9]>
+    <script src="../../_static/js/html5shiv.min.js"></script>
+  <![endif]-->
+  
+        <script data-url_root="../../" id="documentation_options" src="../../_static/documentation_options.js"></script>
+        <script src="../../_static/jquery.js"></script>
+        <script src="../../_static/underscore.js"></script>
+        <script src="../../_static/_sphinx_javascript_frameworks_compat.js"></script>
+        <script src="../../_static/doctools.js"></script>
+        <script src="../../_static/translations.js"></script>
+    <script src="../../_static/js/theme.js"></script>
+    <link rel="index" title="索引" href="../../genindex.html" />
+    <link rel="search" title="搜索" href="../../search.html" />
+    <link rel="next" title="mutex互斥量" href="mutex.html" />
+    <link rel="prev" title="锁的类型及其规则" href="locks.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="../../index.html" class="icon icon-home">
+            DragonOS
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="../../search.html" method="get">
+    <input type="text" name="q" placeholder="搜索文档" aria-label="搜索文档" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="导航菜单">
+              <p class="caption" role="heading"><span class="caption-text">入门</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../introduction/index.html">DragonOS简介</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../introduction/build_system.html">构建DragonOS</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../introduction/mirrors.html">DragonOS镜像站</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">内核层</span></p>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../configuration/index.html">内核编译配置</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../boot/index.html">引导加载</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core_api/index.html">核心API文档</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">锁</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="locks.html">锁的类型及其规则</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">自旋锁</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#id2">1.简介</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#rawspinlock">2. RawSpinLock - 原始自旋锁</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#spinlock">3. SpinLock - 具备守卫的自旋锁</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#id3">3.1. 使用方法</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id4">3.2. 原理</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id5">3.3. 存在的问题</a></li>
+</ul>
+</li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="mutex.html">mutex互斥量</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rwlock.html">RwLock读写锁</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../process_management/index.html">进程管理模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sched/index.html">DragonOS调度</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ipc/index.html">进程间通信</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../memory_management/index.html">内存管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystem/index.html">文件系统</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../debug/index.html">内核调试模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ktest/index.html">内核测试</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu_arch/index.html">处理器架构</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../libs/index.html">其他内核库</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">应用层</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../userland/appdev/index.html">应用程序开发文档</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">系统调用api文档</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../syscall_api/index.html">系统调用API</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">DragonOS社区</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../community/code_contribution/index.html">参与开发</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../community/contact/index.html">与社区建立联系</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../community/ChangeLog/index.html">发行日志</a></li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="移动版导航菜单" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../../index.html">DragonOS</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="页面导航">
+  <ul class="wy-breadcrumbs">
+      <li><a href="../../index.html" class="icon icon-home" aria-label="Home"></a></li>
+          <li class="breadcrumb-item"><a href="index.html">锁</a></li>
+      <li class="breadcrumb-item active">自旋锁</li>
+      <li class="wy-breadcrumbs-aside">
+              <a href="https://github.com/DragonOS-Community/DragonOS/blob/e3b8983/docs/kernel/locking/spinlock.md" class="fa fa-github"> 在 GitHub 上编辑</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <div class="admonition note" id="spinlock-doc">
+<p class="admonition-title">备注</p>
+<p>作者：龙进 <a class="reference external" href="mailto:longjin&#37;&#52;&#48;RinGoTek&#46;cn">longjin<span>&#64;</span>RinGoTek<span>&#46;</span>cn</a></p>
+</div>
+<section class="tex2jax_ignore mathjax_ignore" id="id1">
+<h1>自旋锁<a class="headerlink" href="#id1" title="Permalink to this heading"></a></h1>
+<section id="id2">
+<h2>1.简介<a class="headerlink" href="#id2" title="Permalink to this heading"></a></h2>
+<p>  自旋锁是用于多线程同步的一种锁，线程反复检查锁变量是否可用。由于线程在这一过程中保持运行的状态，因此是一种忙等待。一旦获取了自旋锁，线程会一直保持该锁，直至显式释放自旋锁。</p>
+<p>  DragonOS在<code class="docutils literal notranslate"><span class="pre">kernel/src/lib/spinlock.rs</span></code>文件中，实现了自旋锁。根据功能特性的略微差异，分别提供了<code class="docutils literal notranslate"><span class="pre">RawSpinLock</span></code>和<code class="docutils literal notranslate"><span class="pre">SpinLock</span></code>两种自旋锁。</p>
+</section>
+<section id="rawspinlock">
+<span id="spinlock-doc-rawspinlock"></span><h2>2. RawSpinLock - 原始自旋锁<a class="headerlink" href="#rawspinlock" title="Permalink to this heading"></a></h2>
+<p>  <code class="docutils literal notranslate"><span class="pre">RawSpinLock</span></code>是原始的自旋锁，其数据部分包含一个AtomicBool, 实现了自旋锁的基本功能。其加锁、放锁需要手动确定对应的时机，也就是说，和我们在其他语言中使用的自旋锁一样，
+需要先调用<code class="docutils literal notranslate"><span class="pre">lock()</span></code>方法，然后当离开临界区时，手动调用<code class="docutils literal notranslate"><span class="pre">unlock()</span></code>方法。我们并没有向编译器显式地指定该自旋锁到底保护的是哪些数据。</p>
+<p>  RawSpinLock为程序员提供了非常自由的加锁、放锁控制。但是，正是由于它过于自由，因此在使用它的时候，我们很容易出错。很容易出现“未加锁就访问临界区的数据”、“忘记放锁”、“双重释放”等问题。当使用RawSpinLock时，编译器并不能对这些情况进行检查，这些问题只能在运行时被发现。</p>
+<div class="admonition warning">
+<p class="admonition-title">警告</p>
+<p><code class="docutils literal notranslate"><span class="pre">RawSpinLock</span></code>与C版本的<code class="docutils literal notranslate"><span class="pre">spinlock_t</span></code>不具有二进制兼容性。如果由于暂时的兼容性的需求，要操作C版本的<code class="docutils literal notranslate"><span class="pre">spinlock_t</span></code>,请使用<code class="docutils literal notranslate"><span class="pre">spinlock.rs</span></code>中提供的C版本的spinlock_t的操作函数。</p>
+<p>但是，对于新开发的功能，请不要使用C版本的<code class="docutils literal notranslate"><span class="pre">spinlock_t</span></code>，因为随着代码重构的进行，我们将会移除它。</p>
+</div>
+</section>
+<section id="spinlock">
+<span id="spinlock-doc-spinlock"></span><h2>3. SpinLock - 具备守卫的自旋锁<a class="headerlink" href="#spinlock" title="Permalink to this heading"></a></h2>
+<p>  <code class="docutils literal notranslate"><span class="pre">SpinLock</span></code>在<code class="docutils literal notranslate"><span class="pre">RawSpinLock</span></code>的基础上，进行了封装，能够在编译期检查出“未加锁就访问临界区的数据”、“忘记放锁”、“双重释放”等问题；并且，支持数据的内部可变性。</p>
+<p>  其结构体原型如下：</p>
+<div class="highlight-rust notranslate"><div class="highlight"><pre><span></span><span class="cp">#[derive(Debug)]</span>
+<span class="k">pub</span><span class="w"> </span><span class="k">struct</span> <span class="nc">SpinLock</span><span class="o">&lt;</span><span class="n">T</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">lock</span>: <span class="nc">RawSpinlock</span><span class="p">,</span>
+<span class="w">    </span><span class="sd">/// 自旋锁保护的数据</span>
+<span class="w">    </span><span class="n">data</span>: <span class="nc">UnsafeCell</span><span class="o">&lt;</span><span class="n">T</span><span class="o">&gt;</span><span class="p">,</span>
+<span class="p">}</span>
+</pre></div>
+</div>
+<section id="id3">
+<h3>3.1. 使用方法<a class="headerlink" href="#id3" title="Permalink to this heading"></a></h3>
+<p>  您可以这样初始化一个SpinLock：</p>
+<div class="highlight-rust notranslate"><div class="highlight"><pre><span></span><span class="kd">let</span><span class="w"> </span><span class="n">x</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">SpinLock</span>::<span class="n">new</span><span class="p">(</span><span class="nb">Vec</span>::<span class="n">new</span><span class="p">());</span>
+</pre></div>
+</div>
+<p>  在初始化这个SpinLock时，必须把要保护的数据传入SpinLock，由SpinLock进行管理。</p>
+<p>  当需要读取、修改SpinLock保护的数据时，请先使用SpinLock的<code class="docutils literal notranslate"><span class="pre">lock()</span></code>方法。该方法会返回一个<code class="docutils literal notranslate"><span class="pre">SpinLockGuard</span></code>。您可以使用被保护的数据的成员函数来进行一些操作。或者是直接读取、写入被保护的数据。（相当于您获得了被保护的数据的可变引用）</p>
+<p>  完整示例如下方代码所示：</p>
+<div class="highlight-rust notranslate"><div class="highlight"><pre><span></span><span class="kd">let</span><span class="w"> </span><span class="n">x</span><span class="w"> </span>:<span class="nc">SpinLock</span><span class="o">&lt;</span><span class="nb">Vec</span><span class="o">&lt;</span><span class="kt">i32</span><span class="o">&gt;&gt;=</span><span class="w"> </span><span class="n">SpinLock</span>::<span class="n">new</span><span class="p">(</span><span class="nb">Vec</span>::<span class="n">new</span><span class="p">());</span>
+<span class="w">    </span><span class="p">{</span>
+<span class="w">        </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">g</span><span class="w"> </span>:<span class="nc">SpinLockGuard</span><span class="o">&lt;</span><span class="nb">Vec</span><span class="o">&lt;</span><span class="kt">i32</span><span class="o">&gt;&gt;=</span><span class="w"> </span><span class="n">x</span><span class="p">.</span><span class="n">lock</span><span class="p">();</span>
+<span class="w">        </span><span class="n">g</span><span class="p">.</span><span class="n">push</span><span class="p">(</span><span class="mi">1</span><span class="p">);</span>
+<span class="w">        </span><span class="n">g</span><span class="p">.</span><span class="n">push</span><span class="p">(</span><span class="mi">2</span><span class="p">);</span>
+<span class="w">        </span><span class="n">g</span><span class="p">.</span><span class="n">push</span><span class="p">(</span><span class="mi">2</span><span class="p">);</span>
+<span class="w">        </span><span class="fm">assert!</span><span class="p">(</span><span class="n">g</span><span class="p">.</span><span class="n">as_slice</span><span class="p">()</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="p">[</span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="mi">2</span><span class="p">,</span><span class="w"> </span><span class="mi">2</span><span class="p">]</span><span class="w"> </span><span class="o">||</span><span class="w"> </span><span class="n">g</span><span class="p">.</span><span class="n">as_slice</span><span class="p">()</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="p">[</span><span class="mi">2</span><span class="p">,</span><span class="w"> </span><span class="mi">2</span><span class="p">,</span><span class="w"> </span><span class="mi">1</span><span class="p">]);</span>
+<span class="w">        </span><span class="c1">// 在此处，SpinLock是加锁的状态</span>
+<span class="w">        </span><span class="n">kdebug</span><span class="o">!</span><span class="p">(</span><span class="s">&quot;x={:?}&quot;</span><span class="p">,</span><span class="w"> </span><span class="n">x</span><span class="p">);</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="c1">// 由于上方的变量`g`，也就是SpinLock守卫的生命周期结束，自动释放了SpinLock。因此，在此处，SpinLock是放锁的状态</span>
+<span class="w">    </span><span class="n">kdebug</span><span class="o">!</span><span class="p">(</span><span class="s">&quot;x={:?}&quot;</span><span class="p">,</span><span class="w"> </span><span class="n">x</span><span class="p">);</span>
+</pre></div>
+</div>
+<p>  对于结构体内部的变量，我们可以使用SpinLock进行细粒度的加锁，也就是使用SpinLock包裹需要细致加锁的成员变量，比如这样：</p>
+<div class="highlight-rust notranslate"><div class="highlight"><pre><span></span><span class="k">pub</span><span class="w"> </span><span class="k">struct</span> <span class="nc">a</span><span class="w"> </span><span class="p">{</span>
+<span class="w">  </span><span class="k">pub</span><span class="w"> </span><span class="n">data</span>: <span class="nc">SpinLock</span><span class="o">&lt;</span><span class="n">data_struct</span><span class="o">&gt;</span><span class="p">,</span>
+<span class="p">}</span>
+</pre></div>
+</div>
+<p>  当然，我们也可以对整个结构体进行加锁：</p>
+<div class="highlight-rust notranslate"><div class="highlight"><pre><span></span><span class="k">struct</span> <span class="nc">MyStruct</span><span class="w"> </span><span class="p">{</span>
+<span class="w">  </span><span class="k">pub</span><span class="w"> </span><span class="n">data</span>: <span class="nc">data_struct</span><span class="p">,</span>
+<span class="p">}</span>
+<span class="sd">/// 被全局加锁的结构体</span>
+<span class="k">pub</span><span class="w"> </span><span class="k">struct</span> <span class="nc">LockedMyStruct</span><span class="p">(</span><span class="n">SpinLock</span><span class="o">&lt;</span><span class="n">MyStruct</span><span class="o">&gt;</span><span class="p">);</span>
+</pre></div>
+</div>
+</section>
+<section id="id4">
+<h3>3.2. 原理<a class="headerlink" href="#id4" title="Permalink to this heading"></a></h3>
+<p>  <code class="docutils literal notranslate"><span class="pre">SpinLock</span></code>之所以能够实现编译期检查，是因为它引入了一个<code class="docutils literal notranslate"><span class="pre">SpinLockGuard</span></code>作为守卫。我们在编写代码的时候，保证只有调用<code class="docutils literal notranslate"><span class="pre">SpinLock</span></code>的<code class="docutils literal notranslate"><span class="pre">lock()</span></code>方法加锁后，才能生成一个<code class="docutils literal notranslate"><span class="pre">SpinLockGuard</span></code>。 并且，当我们想要访问受保护的数据的时候，都必须获得一个守卫。然后，我们为<code class="docutils literal notranslate"><span class="pre">SpinLockGuard</span></code>实现了<code class="docutils literal notranslate"><span class="pre">Drop</span></code> trait，当守卫的生命周期结束时，将会自动释放锁。除此以外，没有别的方法能够释放锁。因此我们能够得知，一个上下文中，只要<code class="docutils literal notranslate"><span class="pre">SpinLockGuard</span></code>的生命周期没有结束，那么它就拥有临界区数据的访问权，数据访问就是安全的。</p>
+</section>
+<section id="id5">
+<h3>3.3. 存在的问题<a class="headerlink" href="#id5" title="Permalink to this heading"></a></h3>
+<section id="id6">
+<h4>3.3.1. 双重加锁<a class="headerlink" href="#id6" title="Permalink to this heading"></a></h4>
+<p>  请注意，<code class="docutils literal notranslate"><span class="pre">SpinLock</span></code>支持的编译期检查并不是万能的。它目前无法在编译期检查出“双重加锁”问题。试看这样一个场景：函数A中，获得了锁。然后函数B中继续尝试加锁，那么就造成了“双重加锁”问题。这样在编译期是无法检测出来的。</p>
+<p>  针对这个问题，我们建议采用这样的编程方法：</p>
+<ul class="simple">
+<li><p>如果函数B需要访问临界区内的数据，那么，函数B应当接收一个类型为<code class="docutils literal notranslate"><span class="pre">&amp;SpinLockGuard</span></code>的参数，这个守卫由函数A获得。这样一来，函数B就能访问临界区内的数据。</p></li>
+</ul>
+</section>
+</section>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="页脚">
+        <a href="locks.html" class="btn btn-neutral float-left" title="锁的类型及其规则" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> 上一页</a>
+        <a href="mutex.html" class="btn btn-neutral float-right" title="mutex互斥量" accesskey="n" rel="next">下一页 <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; 版权所有 2022-2025, DragonOS Community.
+      <span class="commit">版本 <code>e3b8983</code>.
+      </span></p>
+  </div>
+
+  利用 <a href="https://www.sphinx-doc.org/">Sphinx</a> 构建，使用的 
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">主题</a>
+    由 <a href="https://readthedocs.org">Read the Docs</a> 开发.
+  
+<div>
+    <br>
+    官网 <a href="https://dragonos.org">https://dragonos.org</a> | 论坛 <a href="https://bbs.dragonos.org.cn">https://bbs.dragonos.org.cn</a> |  <a href="https://dragonos.org">赞助DragonOS，成就未来！</a>
+</div>
+
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  
+<div class="rst-versions" data-toggle="rst-versions" role="note" aria-label="versions">
+  <span class="rst-current-version" data-toggle="rst-current-version">
+    <span class="fa fa-book"> Other Versions</span>
+    v: V0.1.9
+    <span class="fa fa-caret-down"></span>
+  </span>
+  <div class="rst-other-versions">
+    <dl>
+      <dt>Tags</dt>
+      <dd><a href="../../../V0.1.0/index.html">V0.1.0</a></dd>
+      <dd><a href="../../../V0.1.1/index.html">V0.1.1</a></dd>
+      <dd><a href="../../../V0.1.10/kernel/locking/spinlock.html">V0.1.10</a></dd>
+      <dd><a href="../../../V0.1.2/index.html">V0.1.2</a></dd>
+      <dd><a href="../../../V0.1.3/index.html">V0.1.3</a></dd>
+      <dd><a href="../../../V0.1.4/kernel/locking/spinlock.html">V0.1.4</a></dd>
+      <dd><a href="../../../V0.1.5/kernel/locking/spinlock.html">V0.1.5</a></dd>
+      <dd><a href="../../../V0.1.6/kernel/locking/spinlock.html">V0.1.6</a></dd>
+      <dd><a href="../../../V0.1.7/kernel/locking/spinlock.html">V0.1.7</a></dd>
+      <dd><a href="../../../V0.1.8/kernel/locking/spinlock.html">V0.1.8</a></dd>
+      <dd><a href="spinlock.html">V0.1.9</a></dd>
+      <dd><a href="../../../V0.2.0/kernel/locking/spinlock.html">V0.2.0</a></dd>
+      <dd><a href="../../../V0.3.0/kernel/locking/spinlock.html">V0.3.0</a></dd>
+      <dd><a href="../../../V0.4.0/kernel/locking/spinlock.html">V0.4.0</a></dd>
+    </dl>
+    <dl>
+      <dt>Branches</dt>
+      <dd><a href="../../../master/kernel/locking/spinlock.html">master</a></dd>
+    </dl>
+  </div>
+</div><script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script>  
+
+  <style>
+         .wy-nav-content { max-width: 90%; }
+  </style>
+
+
+
+</body>
+</html>

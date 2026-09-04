@@ -1,0 +1,353 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="zh-CN">
+<head>
+  <meta charset="utf-8" /><meta name="generator" content="Docutils 0.18.1: http://docutils.sourceforge.net/" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>开发流程介绍 &mdash; DragonOS dev 文档</title>
+      <link rel="stylesheet" type="text/css" href="../../_static/pygments.css" />
+      <link rel="stylesheet" type="text/css" href="../../_static/css/theme.css" />
+
+  
+  <!--[if lt IE 9]>
+    <script src="../../_static/js/html5shiv.min.js"></script>
+  <![endif]-->
+  
+        <script data-url_root="../../" id="documentation_options" src="../../_static/documentation_options.js"></script>
+        <script src="../../_static/jquery.js"></script>
+        <script src="../../_static/underscore.js"></script>
+        <script src="../../_static/_sphinx_javascript_frameworks_compat.js"></script>
+        <script src="../../_static/doctools.js"></script>
+        <script src="../../_static/translations.js"></script>
+    <script src="../../_static/js/theme.js"></script>
+    <link rel="index" title="索引" href="../../genindex.html" />
+    <link rel="search" title="搜索" href="../../search.html" />
+    <link rel="next" title="C语言代码风格" href="c-coding-style.html" />
+    <link rel="prev" title="参与开发" href="index.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="../../index.html" class="icon icon-home">
+            DragonOS
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="../../search.html" method="get">
+    <input type="text" name="q" placeholder="搜索文档" aria-label="搜索文档" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="导航菜单">
+              <p class="caption" role="heading"><span class="caption-text">入门</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../introduction/index.html">DragonOS简介</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../introduction/build_system.html">构建DragonOS</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../introduction/mirrors.html">DragonOS镜像站</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">内核层</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../kernel/boot/index.html">引导加载</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../kernel/core_api/index.html">核心API文档</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../kernel/locking/index.html">锁</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../kernel/process_management/index.html">进程管理模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../kernel/sched/index.html">DragonOS调度</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../kernel/ipc/index.html">进程间通信</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../kernel/memory_management/index.html">内存管理文档</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../kernel/filesystem/index.html">文件系统</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../kernel/debug/index.html">内核调试模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../kernel/ktest/index.html">内核测试</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../kernel/cpu_arch/index.html">处理器架构</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">应用层</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../userland/libc/index.html">LibC文档</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">系统调用api文档</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../syscall_api/index.html">系统调用API</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">DragonOS社区</span></p>
+<ul class="current">
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">参与开发</a><ul class="current">
+<li class="toctree-l2 current"><a class="current reference internal" href="#">开发流程介绍</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#id2">1.概要</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#id3">2.开发过程是如何运作的？</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#id4">2.1.版本发布周期</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id5">2.2.每个补丁的生命周期</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id6">2.3.开发工具</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id7">2.4.沟通交流</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id8">2.5.如何入门开发？</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="#id9">3.早期设计</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#id10">3.1.定义我们要解决的问题</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id11">3.2.早期讨论</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id12">3.3.在何时发布帖子？</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id13">3.4.获得您所在的组织的支持</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="#id14">4.如何正确的编写代码</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#pull-request">5.发起Pull Request</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#id15">6.后期跟进</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#id16">7.另外的一些话题</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#id17">8.更多信息</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#id18">9.结语</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="c-coding-style.html">C语言代码风格</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rust-coding-style.html">Rust语言代码风格</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../contact/index.html">与社区建立联系</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ChangeLog/index.html">发行日志</a></li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="移动版导航菜单" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../../index.html">DragonOS</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="页面导航">
+  <ul class="wy-breadcrumbs">
+      <li><a href="../../index.html" class="icon icon-home" aria-label="Home"></a></li>
+          <li class="breadcrumb-item"><a href="index.html">参与开发</a></li>
+      <li class="breadcrumb-item active">开发流程介绍</li>
+      <li class="wy-breadcrumbs-aside">
+              <a href="https://github.com/DragonOS-Community/DragonOS/blob/083e891/docs/community/code_contribution/the-development-process.md" class="fa fa-github"> 在 GitHub 上编辑</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section class="tex2jax_ignore mathjax_ignore" id="id1">
+<h1>开发流程介绍<a class="headerlink" href="#id1" title="Permalink to this heading"></a></h1>
+<p>  作为一名想要参与开发的新人，您可能迫切想要了解如何参与开发，仔细阅读这篇文章将能帮助您了解整个开发流程，以及一些注意事项。</p>
+<p>  注：本文参考了Linux文档中的一些思想、内容，非常感谢Linux社区的工作者们的经验！</p>
+<section id="id2">
+<h2>1.概要<a class="headerlink" href="#id2" title="Permalink to this heading"></a></h2>
+<p>对于新人而言，参与开发的过程主要包括以下几步：</p>
+<ul class="simple">
+<li><p><strong>运行DragonOS</strong>：按照文档：<a class="reference internal" href="../../introduction/build_system.html#build-dragonos"><span class="std std-ref">构建DragonOS</span></a>中的教程，编译DragonOS，并成功运行。在运行过程中，如果有任何的疑问，欢迎您在交流群或者BBS上进行反馈！</p></li>
+<li><p><strong>联系Maintainer</strong>：您可以通过邮箱<a class="reference external" href="mailto:longjin&#37;&#52;&#48;DragonOS&#46;org">longjin<span>&#64;</span>DragonOS<span>&#46;</span>org</a>或者QQ<code class="docutils literal notranslate"><span class="pre">184829088</span></code>与龙进取得联系，或者是对应的模块的开发者进行联系（目前您可以通过发行日志上的邮箱与他们建立联系，在将来我们将编写一份“Maintainers List”以便于您能快速找到要联系的人）。
+为了节省您的时间，请简要说明：</p>
+<ul>
+<li><p>如何称呼您</p></li>
+<li><p>您目前掌握的技术能力</p></li>
+<li><p>您希望为DragonOS贡献什么功能，或者进行某个方面的开发，亦或者是想要按照社区的需要来参与新功能开发及bug的修复。</p></li>
+<li><p>如果您是来自高校/科研单位/企业/组织的代表，希望与社区开展合作研究、开发。那么，除使用QQ交流之外，还请麻烦您通过您的教师邮箱/学生邮箱/企业邮箱向<a class="reference external" href="mailto:contact&#37;&#52;&#48;DragonOS&#46;org">contact<span>&#64;</span>DragonOS<span>&#46;</span>org</a>发送一封相关内容的邮件！这么做的目的是为了确认您是来自您的单位，而不是网络上其他人员冒充您的身份。</p></li>
+</ul>
+</li>
+<li><p><strong>加入工作群</strong>：在进一步了解，确认您愿意参与开发后，我们将邀请您加入工作群。</p></li>
+<li><p><strong>开始开发</strong>：正式开始代码开发工作。</p></li>
+</ul>
+<div class="admonition note">
+<p class="admonition-title">备注</p>
+<p>一些小功能的改进以及Bug修复并不一定需要提前与社区建立正式的联系，对于这些patch，您可以直接开发，然后在Github上进行Pull Request. 这也是可以的。</p>
+<p>但是，如果您愿意的话，与Maintainer联系会是一个更好的选择。</p>
+</div>
+</section>
+<section id="id3">
+<h2>2.开发过程是如何运作的？<a class="headerlink" href="#id3" title="Permalink to this heading"></a></h2>
+<p>  如今的DragonOS由于正处于开发的早期阶段，开发者数量不超过50人，因此，现在DragonOS的开发过程是通过比较松散的方式组织起来的。</p>
+<section id="id4">
+<h3>2.1.版本发布周期<a class="headerlink" href="#id4" title="Permalink to this heading"></a></h3>
+<p>  自从2022年11月6日，DragonOS发布第一个版本以来，版本发布就被定义为15~21天发布一个更新版本。由于开发人员数量仍然较少，因此，目前这个时间是21天。我们将版本号定义为<code class="docutils literal notranslate"><span class="pre">x.y.z</span></code>的格式，每21天发布一个<code class="docutils literal notranslate"><span class="pre">z</span></code>版本. 在积累了2～3个月后，当DragonOS引入了足够的新功能，则发布一个<code class="docutils literal notranslate"><span class="pre">y</span></code>版本。请注意，我们仍未定义<code class="docutils literal notranslate"><span class="pre">x</span></code>版本的发行周期。当前，<code class="docutils literal notranslate"><span class="pre">x</span></code>版本号仍然是<code class="docutils literal notranslate"><span class="pre">0</span></code>。</p>
+<p>  创建没有BUG的、具有尽可能少BUG的代码，是每个开发者的目标之一。我们希望在每个<code class="docutils literal notranslate"><span class="pre">y</span></code>版本发布时，能够修复已知的问题。然而，由于在操作系统中，影响问题的变量太多了，以至于我们只能尽全力去减少BUG，我们无法保证<code class="docutils literal notranslate"><span class="pre">y</span></code>版本不存在bug.</p>
+</section>
+<section id="id5">
+<h3>2.2.每个补丁的生命周期<a class="headerlink" href="#id5" title="Permalink to this heading"></a></h3>
+<p>  当您向DragonOS的仓库发起一次PR，那么这次PR就是一个补丁。我们会对您的补丁进行Review，以确保每个补丁都实现了一个希望在主线中进行的更改。并且，Maintainer或者感兴趣的小伙伴会对您的补丁提出修改意见。当时机合适时，您的代码将被合入主线。</p>
+<p>  如果您的补丁的规模比较小，那么，它将会比较快的被合入主线。如果补丁的规模较大，或者存在一些争议，那么我们需要对其进行进一步的讨论及修改、审查，直到它符合要求。</p>
+<p>  每个Patch都会经历这么一个过程（这只是一个概述，详细的描述请看后文）：</p>
+<ul class="simple">
+<li><p><strong>设计</strong>：在这个阶段，我们将明确，这个补丁将要实现什么功能，或者是解决什么问题，以及我们将要采用什么样的方式去完成它。通常来说，这项工作是开发者自己完成的。但是，<strong>我们建议您，在设计了这个补丁之后，能够把您的设计方案公开，和大家讨论这项工作。</strong> 闭门造车容易出错，在与大家沟通的过程中，则能及早的发现设计上的错误，从而节省很多的时间。</p></li>
+<li><p><strong>代码编写</strong>：经过了设计阶段，您已经能够明白自己要实现的到底是一个什么样的东西。您在这个阶段进行代码编写、调试。</p></li>
+<li><p><strong>代码审查</strong>：当完成代码编写后，您可以通过Github发起一个PR，然后您的补丁进入了代码审查阶段。在这一阶段，开发者们，或者是Maintainer会和您进行沟通交流，对您的代码进行评论，以及对发现的问题提出修改建议。</p></li>
+<li><p><strong>合并主线</strong>：如果一切顺利，那么代码将会被合并入主线。若该补丁在合并主线后，被发现具有较大的问题，那么它可能会被回退。重新进入前面的阶段，进行修改。</p></li>
+<li><p><strong>长期维护</strong>：虽然说，代码被合并之后，原来的开发人员可能会在很久一段时间后，不再理会这些代码，但是这种行为可能会给其他开发者们留下不好的印象。其实，当补丁被合并入主线后，其他开发人员会尝试继续维护这些代码，这样能够很大程度的减轻您的维护负担。但是，如果想要这些代码能够长期的被保留下来，持续的发光发热，那么离不开原始开发人员的支持（不然的话，后来的人可能难以理解、维护这些代码），这是一件很有意义的事情。</p></li>
+</ul>
+<p>  对于没有参与过开源项目的同学来说，他们可能会想当然的，简单的把上述流程简化成<strong>合并主线</strong>这一个步骤，这样是不可取的。因为这样会导致很多问题，包括但不限于“写了代码但是效果很差”、“写的东西由于无法满足项目的需求，而不能被合并”。</p>
+</section>
+<section id="id6">
+<h3>2.3.开发工具<a class="headerlink" href="#id6" title="Permalink to this heading"></a></h3>
+<p>  从上面的描述可以看出，为了让开发人员们能高效地进行协作，那么必须使用版本控制工具来管理这个过程。目前，DragonOS使用Git来进行源代码管理。它是一个非常优秀的工具，这是不必多说的。对于每个开发者而言，Git的使用是一项必备的技能；哪怕您只是想学习DragonOS的源代码，您也需要git来获取、同步最新的代码。虽然Git的使用，对于新手来说，有些困难，但是经过一些时间的学习后，还是可以掌握的。</p>
+<p>  git的官方网站为<a class="reference external" href="https://git-scm.com/">https://git-scm.com/</a></p>
+</section>
+<section id="id7">
+<h3>2.4.沟通交流<a class="headerlink" href="#id7" title="Permalink to this heading"></a></h3>
+<p>  DragonOS的主要开发工作是通过飞书以及bbs进行的。对于正准备参与的开发者而言，您可以加入我们的交流讨论QQ群，具体的群号可以在 <a class="reference internal" href="../contact/index.html#get-contact-with-community"><span class="std std-ref">与社区建立联系</span></a> 一文中找到。</p>
+<p>  <strong>何时使用即时通讯软件？</strong> 我们在飞书上创建了工作群，为提高即时沟通的效率，这个群仅供那些真正有意愿、且正在进行或准备进行（能够保证会进行）代码开发的开发者们加入。</p>
+<p>  <strong>何时使用BBS？</strong> 对于一些正式的、需要大家广泛参与，或者是能够帮助尚未参与开发的同学了解当前的开发进度的主题，请您在<a class="reference external" href="https://bbs.DragonOS.org">https://bbs.DragonOS.org</a>上，使用类似于写信件一样的，正式的语言，完整地描述清楚您想表达的内容。这样有助于更多的人快速明白您要表达的是什么，也能提高整体的沟通效率。并且，bbs能够长期保存以往的帖子，这样后来者能更方便的了解“当初开发的时候，人们究竟是怎么想的”。</p>
+<p>  <strong>关于交流讨论会</strong> 除由于法定节假日放假，或特殊情况以外，我们每周末都会召开线上交流讨论会，同步介绍每周的进展。社区成员可以在这里分享自己的方案设计或是一些操作系统相关的知识（分享的话，需要提前跟会议主持人提出，以便妥善安排）。</p>
+<p>  <strong>如何提问？</strong> 下面这些建议能够帮助您与他人开展高效率的对话：</p>
+<ul class="simple">
+<li><p><strong>对于具有主题性的问题，在bbs上发帖进行讨论。</strong> 这样能够让讨论更具有目标性。当谈论到新的主题的时候，请开一个新的帖子，并在原来的帖子中，添加对特定的子问题所在的主题的链接。</p></li>
+<li><p><strong>请礼貌的交流。</strong> 文明的语言能够减少不必要的冲突。技术意见上的冲突是思维的碰撞，但是如果涉及到了不文明的语言，或者在非技术层面，对他人进行攻击，这将破坏和谐讨论的氛围，这是我们反对的。如果有人试图激怒你，请忽略他的消息，别理他就好了。</p></li>
+<li><p><strong>在提问之前，请确保您已经搜索了bbs以及互联网上的解决方案，并描述清楚您的问题的上下文情景、您的思考以及网络上的解决方案。</strong> 一些开发人员会对“明显没有进行认真思考”的问题，表现出不耐烦的态度（因为未经思考的问题会浪费他们大量的时间）。</p></li>
+<li><p><strong>当别人向您提问时</strong>，请您耐心听他人的问题。如果您认为对方的问题过于简单或是未经思考，还请您为对方指个路，告诉对方，在哪些地方，使用什么样的方式搜索，能够得到对解决问题有帮助的资料。有时候，<strong>新手需要的是一个指路人</strong>，他会非常感谢您的！</p></li>
+</ul>
+</section>
+<section id="id8">
+<h3>2.5.如何入门开发？<a class="headerlink" href="#id8" title="Permalink to this heading"></a></h3>
+<p>  DragonOS原采用C语言进行开发，目前正在用Rust重构原有代码、开发新的模块，也就是说，除非您要进行对C语言代码的BUG修复，否则，其余的开发工作，我们都建议您通过Rust完成。因为，它能从语言层面解决那些让我们头疼的内存安全问题。从长期来看，能够提升开发效率以及软件质量。</p>
+<p>  如何开发第一个补丁，是一个非常常见的问题。可以理解的是，个人开发者面对这样一个项目，常常会不知道从哪个地方开始入手。这是一件很正常的事情，因此我们建议您通过上文提到的方式，与社区建立联系，了解目前社区正在做什么，以及需要什么。</p>
+<p>  对于一个新的参与者来说，我们建议您从这样一个步骤开始：</p>
+<div class="highlight-text notranslate"><div class="highlight"><pre><span></span>阅读文档，编译、运行DragonOS，并且尝试使用它目前已有的功能。
+</pre></div>
+</div>
+<p>  然后，您可以通过查看DragonOS的GitHub仓库的project面板，看看目前仍有哪些待解决的问题。可以肯定的是，永远不会缺少待解决的问题，您在解决这些问题的过程中，能够获得一些宝贵的经验。</p>
+</section>
+</section>
+<section id="id9">
+<h2>3.早期设计<a class="headerlink" href="#id9" title="Permalink to this heading"></a></h2>
+<p>  对于软件开发而言，写代码永远不是第一步。在编写代码之前，进行一些必要的设计（提出架构、技术方案），是项目成功的基础工作。在新的补丁开发的早期，花费一些时间进行计划和沟通，往往能够在接下来的阶段节省更多的时间。</p>
+<section id="id10">
+<h3>3.1.定义我们要解决的问题<a class="headerlink" href="#id10" title="Permalink to this heading"></a></h3>
+<p>  与大多数的工程项目一样，在DragonOS中进行开发，首先需要清晰的描述要解决的问题。只有精准的定义了问题，才能找到正确的解决方案。有时候，我们能很轻易的定义问题，比如“编写串口驱动程序，使得它能把屏幕上打印的字符，输出到串口”。</p>
+<p>  但是，有时候，<strong>我们容易将真正的问题与某个解决方案相混淆</strong>，并且还没意识到这一点。</p>
+<p>  在2022年10月时，我发现，在真机调试的时候，需要频繁的拔插硬盘（先连接到电脑，待数据拷贝完毕后，再连接到测试机）。我对这一过程非常的不满，因为很浪费时间。我的直觉想法是：“有没有一种设备，能够一头连接电脑，另一头连接测试机的SATA接口。从测试机的角度看来，这是一块硬盘；测试机对这块磁盘的操作，都转换为了对我的电脑上面的一个磁盘镜像文件的操作。”我的想法就是：“购买/定制一款设备，能够实现上面的这个功能，那就能解决频繁拔插硬盘的烦恼了！”然后我为了寻找这样的设备，询问了一些硬件公司，他们的开价都在2万元左右。</p>
+<p>  我在上面的这个过程中，就犯了一个错误：将真正的问题与某个解决方案相混淆了。真正的问题是：“解决需要频繁的拔插硬盘”，但是，在我的思考的过程中，不知不觉间，将问题转换成了“如何实现一款具有硬盘模拟功能的设备”。后面这个问题，只是某个解决方案下，需要解决的问题，并不是我们要解决的根本问题。</p>
+<p>  对于要解决的根本问题，事实上有更好的解决方案：“制作一个类似于开关一样的转换器，当数据从电脑拷贝到磁盘后，把开关拨向另一边，使得电路与测试机接通”。这个方案的成本估摸着就十几二十块钱。</p>
+<p>  上面的这个故事，告诉我们的是，<strong>在早期设计阶段，我们应当关注的是问题本身——而不是特定的解决方案</strong>。</p>
+<p>  我们需要关注系统的稳定性、长期的可维护性，解决方案必须考虑到这两点。由于系统比较复杂，因此，请您在开始编码之前，与社区的小伙伴讨论您的设计方案，以便您的方案能充分地，从全局的角度，考虑到系统的稳定性、可维护性。</p>
+<p>  <strong>因此，在开发的早期，我们应当对以下三个问题，拥有一个答案</strong>：</p>
+<ul class="simple">
+<li><p>要解决的本质问题是什么？</p></li>
+<li><p>这个问题会影响哪些方面/哪些用户？提出的解决方案应当解决哪些用例、场景？</p></li>
+<li><p>DragonOS目前在解决该问题的方面，具有哪些不足/问题？</p></li>
+</ul>
+<p>  只有考虑清楚了上面三个问题，讨论的解决方案才是有意义的。这是一个架构设计的过程，需要进行仔细的思考。尽管我们目前提倡敏捷开发，但是前期的架构设计仍然是非常重要的。</p>
+</section>
+<section id="id11">
+<h3>3.2.早期讨论<a class="headerlink" href="#id11" title="Permalink to this heading"></a></h3>
+<p>  在实施开发之前，与社区的成员们进行讨论是非常有意义的。这能够通过多种方式节省您的时间，并减少许多不必要的麻烦：</p>
+<ul class="simple">
+<li><p>DragonOS可能以您不知道、不理解的方式，已经解决了相关的问题。DragonOS里面的一些特性、功能细节不是很明显，他们不一定会被写进文档。也许这些细节只是在某个不起眼的注释里面提到了，因此您很难注意到这些。这种细节可能只有一些开发人员知道。因此，与社区沟通能够避免您进行重复的工作。</p></li>
+<li><p>您提出的解决方案中，可能会有一些东西，由于一些原因（比如方案中的一些设计会在将来造成问题、方案的架构设计具有明显缺陷），无法合入主线。</p></li>
+<li><p>其他的开发人员可能已经考虑过这个问题；他们可能有更好的解决方案，或者是更好的想法。并且，他们可能愿意帮助你一起完善你的解决方案。</p></li>
+</ul>
+<p>  Linux文档中提到：闭门造车式的设计和开发，所产生的代码总会有问题，这些问题只有在发布到社区里面的时候才会暴露出来。因此，我们必须吸取前人之鉴，通过与社区开发人员进行早期讨论，从而避免大量的痛苦和额外的工作。</p>
+</section>
+<section id="id12">
+<h3>3.3.在何时发布帖子？<a class="headerlink" href="#id12" title="Permalink to this heading"></a></h3>
+<p>  如果可能的话，在开发的早期阶段发布您的计划、设计，会是一个不错的选择。发帖的时候，您可以描述您正在解决的问题，以及已经制定的一些计划。包括但不限于：如何将设计付诸实施。您在社区内发布帖子，不仅能够帮助您获得一些有用的建议，也能帮助整个DragonOS社区提供有用的信息，使得社区沟通更高效。</p>
+<p>  在这个阶段，可能您发布的帖子并不会引来很多评论，这并不一定意味着您做的不好，或者大家对您所做的工作不感兴趣。当然，也不能就此认为您的设计、想法不存在问题。可能只是因为大家比较忙，看了您的帖子之后，了解到了您的工作，但是大家并不一定有时间进行回复。（但是事实上您发布的信息对他人来说是有用的）</p>
+<p>  在这种情况下，请不要气馁，您最好的做法就是，继续您的工作，并且不时地在您的帖子下分享您的工作，这样能够让社区的成员们随时了解到您的最新进展。</p>
+</section>
+<section id="id13">
+<h3>3.4.获得您所在的组织的支持<a class="headerlink" href="#id13" title="Permalink to this heading"></a></h3>
+<p>  如果您对DragonOS的开发工作，是在您的公司内完成的。那么，很显然，在您把计划、代码发布到社区论坛之前，您必须取得您的经理或上级的许可。</p>
+<p>  同时，请注意，根据我们的授权许可，基于DragonOS操作系统的内核、官方开源的用户库而开发的代码，或者为DragonOS操作系统本身而开发的代码，根据开源授权许可，必须同样以GPLv2协议进行授权发布。如果您所在的组织，违背了GPLv2协议中的要求，以除GPLv2以外的协议开放源代码，或者是进行“闭源使用”，那么DragonOS社区对您的公司/组织所授予的使用DragonOS源代码的授权，将会被自动撤销。这将会面临一系列的法律问题。因此，在这个问题上，公司的管理人员、法律人员如果能越早地就公司要在DragonOS中开发的软件项目达成一致，将能促进您的公司在该项目上的进展。</p>
+<p>  如果您的公司的项目/或者是您研究的项目根据您所在组织的保密规定，不能将其进行过早的披露，那也没有问题。只要您的公司能够确保这部分代码，在其编译而成的二进制产品被发布之时，按照GPLv2协议进行开源，并向开源社区贡献这部分代码即可。</p>
+</section>
+</section>
+<section id="id14">
+<h2>4.如何正确的编写代码<a class="headerlink" href="#id14" title="Permalink to this heading"></a></h2>
+</section>
+<section id="pull-request">
+<h2>5.发起Pull Request<a class="headerlink" href="#pull-request" title="Permalink to this heading"></a></h2>
+</section>
+<section id="id15">
+<h2>6.后期跟进<a class="headerlink" href="#id15" title="Permalink to this heading"></a></h2>
+</section>
+<section id="id16">
+<h2>7.另外的一些话题<a class="headerlink" href="#id16" title="Permalink to this heading"></a></h2>
+</section>
+<section id="id17">
+<h2>8.更多信息<a class="headerlink" href="#id17" title="Permalink to this heading"></a></h2>
+</section>
+<section id="id18">
+<h2>9.结语<a class="headerlink" href="#id18" title="Permalink to this heading"></a></h2>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="页脚">
+        <a href="index.html" class="btn btn-neutral float-left" title="参与开发" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> 上一页</a>
+        <a href="c-coding-style.html" class="btn btn-neutral float-right" title="C语言代码风格" accesskey="n" rel="next">下一页 <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; 版权所有 2022-2025, DragonOS Community.
+      <span class="commit">版本 <code>083e891</code>.
+      </span></p>
+  </div>
+
+  利用 <a href="https://www.sphinx-doc.org/">Sphinx</a> 构建，使用的 
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">主题</a>
+    由 <a href="https://readthedocs.org">Read the Docs</a> 开发.
+  
+<div>
+    <br>
+    官网 <a href="https://dragonos.org">https://dragonos.org</a> | 论坛 <a href="https://bbs.dragonos.org.cn">https://bbs.dragonos.org.cn</a> |  <a href="https://dragonos.org">赞助DragonOS，成就未来！</a>
+</div>
+
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  
+<div class="rst-versions" data-toggle="rst-versions" role="note" aria-label="versions">
+  <span class="rst-current-version" data-toggle="rst-current-version">
+    <span class="fa fa-book"> Other Versions</span>
+    v: V0.1.6
+    <span class="fa fa-caret-down"></span>
+  </span>
+  <div class="rst-other-versions">
+    <dl>
+      <dt>Tags</dt>
+      <dd><a href="../../../V0.1.0/index.html">V0.1.0</a></dd>
+      <dd><a href="../../../V0.1.1/index.html">V0.1.1</a></dd>
+      <dd><a href="../../../V0.1.10/community/code_contribution/the-development-process.html">V0.1.10</a></dd>
+      <dd><a href="../../../V0.1.2/community/code_contribution/the-development-process.html">V0.1.2</a></dd>
+      <dd><a href="../../../V0.1.3/community/code_contribution/the-development-process.html">V0.1.3</a></dd>
+      <dd><a href="../../../V0.1.4/community/code_contribution/the-development-process.html">V0.1.4</a></dd>
+      <dd><a href="../../../V0.1.5/community/code_contribution/the-development-process.html">V0.1.5</a></dd>
+      <dd><a href="the-development-process.html">V0.1.6</a></dd>
+      <dd><a href="../../../V0.1.7/community/code_contribution/the-development-process.html">V0.1.7</a></dd>
+      <dd><a href="../../../V0.1.8/community/code_contribution/the-development-process.html">V0.1.8</a></dd>
+      <dd><a href="../../../V0.1.9/community/code_contribution/the-development-process.html">V0.1.9</a></dd>
+      <dd><a href="../../../V0.2.0/index.html">V0.2.0</a></dd>
+      <dd><a href="../../../V0.3.0/index.html">V0.3.0</a></dd>
+      <dd><a href="../../../V0.4.0/index.html">V0.4.0</a></dd>
+    </dl>
+    <dl>
+      <dt>Branches</dt>
+      <dd><a href="../../../master/index.html">master</a></dd>
+    </dl>
+  </div>
+</div><script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script>  
+
+  <style>
+         .wy-nav-content { max-width: 90%; }
+  </style>
+
+
+
+</body>
+</html>

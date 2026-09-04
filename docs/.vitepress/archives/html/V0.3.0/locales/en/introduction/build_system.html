@@ -1,0 +1,515 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="zh-CN">
+<head>
+  <meta charset="utf-8" /><meta name="generator" content="Docutils 0.18.1: http://docutils.sourceforge.net/" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Building DragonOS &mdash; DragonOS dev 文档</title>
+      <link rel="stylesheet" type="text/css" href="../../../_static/pygments.css" />
+      <link rel="stylesheet" type="text/css" href="../../../_static/css/theme.css" />
+
+  
+  <!--[if lt IE 9]>
+    <script src="../../../_static/js/html5shiv.min.js"></script>
+  <![endif]-->
+  
+        <script data-url_root="../../../" id="documentation_options" src="../../../_static/documentation_options.js"></script>
+        <script src="../../../_static/jquery.js"></script>
+        <script src="../../../_static/underscore.js"></script>
+        <script src="../../../_static/_sphinx_javascript_frameworks_compat.js"></script>
+        <script src="../../../_static/doctools.js"></script>
+        <script src="../../../_static/translations.js"></script>
+    <script src="../../../_static/js/theme.js"></script>
+    <link rel="index" title="索引" href="../../../genindex.html" />
+    <link rel="search" title="搜索" href="../../../search.html" />
+    <link rel="next" title="DragonOS Mirror Site" href="mirrors.html" />
+    <link rel="prev" title="Features of DragonOS" href="features.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="../../../index.html" class="icon icon-home">
+            DragonOS
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="../../../search.html" method="get">
+    <input type="text" name="q" placeholder="搜索文档" aria-label="搜索文档" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="导航菜单">
+              <p class="caption" role="heading"><span class="caption-text">入门</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../introduction/index.html">DragonOS简介</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../introduction/build_system.html">构建DragonOS</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../introduction/mirrors.html">DragonOS镜像站</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">内核层</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../kernel/configuration/index.html">内核编译配置</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../kernel/boot/index.html">引导加载</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../kernel/core_api/index.html">核心API文档</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../kernel/locking/index.html">锁</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../kernel/process_management/index.html">进程管理模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../kernel/sched/index.html">DragonOS调度</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../kernel/ipc/index.html">进程间通信</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../kernel/memory_management/index.html">内存管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../kernel/filesystem/index.html">文件系统</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../kernel/debug/index.html">内核调试模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../kernel/ktest/index.html">内核测试</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../kernel/cpu_arch/index.html">处理器架构</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../kernel/container/index.html">容器化</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../kernel/libs/index.html">其他内核库</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../kernel/net/index.html">网络子系统</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../kernel/trace/index.html">内核跟踪机制</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../kernel/syscall/index.html">系统调用</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">应用层</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../userland/appdev/index.html">应用程序开发文档</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Q&amp;A</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../questions/index.html">常见问题解答</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">DragonOS社区</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../community/code_contribution/index.html">参与开发</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../community/contact/index.html">与社区建立联系</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../community/ChangeLog/index.html">发行日志</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Translations</span></p>
+<ul class="current">
+<li class="toctree-l1 current"><a class="reference internal" href="../index.html">English</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="index.html">Introduction to DragonOS</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">Building DragonOS</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#preface">1. Preface</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#downloading-dragonos-source-code">1.1 Downloading DragonOS Source Code</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="#installation-using-one-click-initialization-script-recommended">2. Installation Using One-Click Initialization Script (Recommended)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#manual-installation">3. Manual Installation</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#dependency-list">3.1 Dependency List</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#installing-docker">3.2 Installing Docker</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#installing-rust">3.3 Installing Rust</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="#building-from-docker-not-recommended">4. Building from Docker (Not Recommended)</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#installing-qemu-virtual-machine">4.1 Installing QEMU Virtual Machine</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#creating-a-disk-image">4.2 Creating a Disk Image</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#running-dragonos">4.3 Running DragonOS</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="#other-notes">5. Other Notes</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#id1">5.1 Creating a Disk Image</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#compiling-and-running-dragonos">5.2 Compiling and Running DragonOS</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="#explanation-of-compilation-commands">6. Explanation of Compilation Commands</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#compiling-for-riscv64">7. Compiling for riscv64</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="mirrors.html">DragonOS Mirror Site</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../kernel/configuration/index.html">Kernel Compilation Configuration</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../kernel/boot/index.html">Bootloader</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../kernel/core_api/index.html">Core API Documentation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../kernel/locking/index.html">Locks</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../kernel/process_management/index.html">Process Management Module</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../kernel/sched/index.html">DragonOS Scheduling</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../kernel/ipc/index.html">Interprocess Communication</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../kernel/memory_management/index.html">Memory Management</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../kernel/filesystem/index.html">File System</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../kernel/debug/index.html">Kernel Debug Module</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../kernel/ktest/index.html">Kernel Testing</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../kernel/cpu_arch/index.html">Processor Architecture</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../kernel/container/index.html">Containerization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../kernel/libs/index.html">Other Kernel Libraries</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../kernel/net/index.html">Network Subsystem</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../kernel/trace/index.html">Kernel Tracing Mechanism</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../kernel/syscall/index.html">System Calls</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../userland/appdev/index.html">Application Development Documentation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../questions/index.html">Frequently Asked Questions</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../community/code_contribution/index.html">Contributing to Development</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../community/contact/index.html">Get in Touch with the Community</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../community/ChangeLog/index.html">Release Notes</a></li>
+</ul>
+</li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="移动版导航菜单" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../../../index.html">DragonOS</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="页面导航">
+  <ul class="wy-breadcrumbs">
+      <li><a href="../../../index.html" class="icon icon-home" aria-label="Home"></a></li>
+          <li class="breadcrumb-item"><a href="../index.html">English</a></li>
+      <li class="breadcrumb-item active">Building DragonOS</li>
+      <li class="wy-breadcrumbs-aside">
+              <a href="https://github.com/DragonOS-Community/DragonOS/blob/1c53c97/docs/locales/en/introduction/build_system.md" class="fa fa-github"> 在 GitHub 上编辑</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <div class="admonition note">
+<p class="admonition-title">备注</p>
+<p><strong>AI Translation Notice</strong></p>
+<p>This document was automatically translated by <code class="docutils literal notranslate"><span class="pre">hunyuan-turbos-latest</span></code> model, for reference only.</p>
+<ul class="simple">
+<li><p>Source document: introduction/build_system.md</p></li>
+<li><p>Translation time: 2025-10-09 14:37:10</p></li>
+<li><p>Translation model: <code class="docutils literal notranslate"><span class="pre">hunyuan-turbos-latest</span></code></p></li>
+</ul>
+<p>Please report issues via <a class="reference external" href="https://github.com/DragonOS-Community/DragonOS/issues">Community Channel</a></p>
+</div>
+<section class="tex2jax_ignore mathjax_ignore" id="building-dragonos">
+<span id="translated-label-build-dragonos-en"></span><h1>Building DragonOS<a class="headerlink" href="#building-dragonos" title="Permalink to this heading"></a></h1>
+<section id="preface">
+<h2>1. Preface<a class="headerlink" href="#preface" title="Permalink to this heading"></a></h2>
+<p>  Regardless of which method you use to compile DragonOS as described later, you must first follow the steps in this section to initialize your development environment.</p>
+<p>  Before you begin, you need a computer running Linux or macOS with an X86-64 processor architecture.</p>
+<p>  For Linux distributions, it is recommended to use those with relatively new package repositories, such as Ubuntu 22, Debian, or Arch Linux, which can save you a lot of trouble.</p>
+<section id="downloading-dragonos-source-code">
+<h3>1.1 Downloading DragonOS Source Code<a class="headerlink" href="#downloading-dragonos-source-code" title="Permalink to this heading"></a></h3>
+<p>Using HTTPS clone:</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>git<span class="w"> </span>clone<span class="w"> </span>https://github.com/DragonOS-Community/DragonOS.git
+<span class="nb">cd</span><span class="w"> </span>DragonOS
+<span class="c1"># 使用镜像源更新子模块</span>
+make<span class="w"> </span>update-submodules-by-mirror
+</pre></div>
+</div>
+<p>For convenience in subsequent development, it is recommended to use SSH cloning (please configure your GitHub SSH key first) to avoid cloning failures due to network issues:</p>
+<p>Using SSH clone (please configure your GitHub SSH key first):</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span><span class="c1"># 使用ssh克隆</span>
+git<span class="w"> </span>clone<span class="w"> </span>git@github.com:DragonOS-Community/DragonOS.git
+<span class="nb">cd</span><span class="w"> </span>DragonOS
+<span class="c1"># 使用镜像源更新子模块</span>
+make<span class="w"> </span>update-submodules-by-mirror
+</pre></div>
+</div>
+</section>
+</section>
+<section id="installation-using-one-click-initialization-script-recommended">
+<h2>2. Installation Using One-Click Initialization Script (Recommended)<a class="headerlink" href="#installation-using-one-click-initialization-script-recommended" title="Permalink to this heading"></a></h2>
+<p>  We provide a one-click initialization script that can install everything with a single command. Simply run the following command in the console:</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span><span class="nb">cd</span><span class="w"> </span>DragonOS
+<span class="nb">cd</span><span class="w"> </span>tools
+bash<span class="w"> </span>bootstrap.sh<span class="w">  </span><span class="c1"># 这里请不要加上sudo, 因为需要安装的开发依赖包是安装在用户环境而非全局环境</span>
+</pre></div>
+</div>
+<div class="admonition note">
+<p class="admonition-title">备注</p>
+<p>The one-click configuration script currently only supports the following systems:</p>
+<ul class="simple">
+<li><p>Ubuntu/Debian/Deepin/UOS and other Debian-based derivatives</p></li>
+<li><p>Gentoo: Due to the characteristics of the Gentoo system, when USE flags or circular dependency issues arise, please handle them according to the emerge prompts. For official dependency handling examples, refer to <a class="reference external" href="https://wiki.gentoo.org/wiki/Handbook:AMD64/Full/Working/zh-cn#.E5.BD.93_Portage_.E6.8A.A5.E9.94.99.E7.9A.84.E6.97.B6.E5.80.99">GentooWiki</a></p></li>
+</ul>
+<p>You are welcome to improve the build scripts for other systems!</p>
+</div>
+<p><strong>If the one-click initialization script runs successfully and outputs the final “Congratulations” screen (as shown below), please close the current terminal and reopen it.</strong></p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span><span class="p">|</span>-----------Congratulations!---------------<span class="p">|</span>
+<span class="p">|</span><span class="w">                                          </span><span class="p">|</span>
+<span class="p">|</span><span class="w">   </span>你成功安装了DragonOS所需的依赖项!<span class="w">          </span><span class="p">|</span>
+<span class="p">|</span><span class="w">                                          </span><span class="p">|</span>
+<span class="p">|</span><span class="w">   </span>请关闭当前终端,<span class="w"> </span>并重新打开一个终端<span class="w">          </span><span class="p">|</span>
+<span class="p">|</span><span class="w">   </span>然后通过以下命令运行:<span class="w">                     </span><span class="p">|</span>
+<span class="p">|</span><span class="w">                                          </span><span class="p">|</span>
+<span class="p">|</span><span class="w">                </span>make<span class="w"> </span>run<span class="w">                  </span><span class="p">|</span>
+<span class="p">|</span><span class="w">                                          </span><span class="p">|</span>
+<span class="p">|</span>------------------------------------------<span class="p">|</span>
+</pre></div>
+</div>
+<p><strong>Then, please proceed directly to <a class="reference internal" href="../../../introduction/build_system.html#build-system-command"><span class="std std-ref">编译命令讲解</span></a> for further reading.</strong></p>
+</section>
+<section id="manual-installation">
+<h2>3. Manual Installation<a class="headerlink" href="#manual-installation" title="Permalink to this heading"></a></h2>
+<section id="dependency-list">
+<h3>3.1 Dependency List<a class="headerlink" href="#dependency-list" title="Permalink to this heading"></a></h3>
+<p>  If the automatic installation script does not support your operating system, you will need to manually install the dependencies. The following is the list of dependencies:</p>
+<p>  Among the following dependencies, except for <code class="docutils literal notranslate"><span class="pre">docker-ce</span></code> and <code class="docutils literal notranslate"><span class="pre">Rust及其工具链</span></code>, the others can be installed via the system’s package manager. For Docker and Rust installation, please refer to the following sections.</p>
+<ul class="simple">
+<li><p>docker-ce</p></li>
+<li><p>llvm-dev</p></li>
+<li><p>libclang-dev</p></li>
+<li><p>clang</p></li>
+<li><p>gcc-multilib</p></li>
+<li><p>qemu qemu-system qemu-kvm</p></li>
+<li><p>build-essential</p></li>
+<li><p>fdisk</p></li>
+<li><p>lsb-release</p></li>
+<li><p>git</p></li>
+<li><p>dosfstools</p></li>
+<li><p>unzip</p></li>
+<li><p>Rust and its toolchain</p></li>
+</ul>
+<p><strong>Please note that if your Linux system is running in a virtual machine, you must enable the Intel VT-x or AMD-V option in the processor settings tab of your VMware/VirtualBox virtual machine; otherwise, DragonOS will not run.</strong></p>
+<div class="admonition note">
+<p class="admonition-title">备注</p>
+<p><em>The QEMU built from some Linux distribution repositories may be incompatible with DragonOS due to its low version. If you encounter this issue, please uninstall QEMU and reinstall it by compiling from source.</em></p>
+<p>Download the QEMU source code from this address: <a class="reference external" href="https://download.qemu.org/">https://download.qemu.org/</a></p>
+<p>After extracting, enter the source code directory and execute the following commands:</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span><span class="c1"># 安装编译依赖项</span>
+sudo<span class="w"> </span>apt<span class="w"> </span>install<span class="w"> </span>-y<span class="w"> </span>autoconf<span class="w"> </span>automake<span class="w"> </span>autotools-dev<span class="w"> </span>curl<span class="w"> </span>libmpc-dev<span class="w"> </span>libmpfr-dev<span class="w"> </span>libgmp-dev<span class="w"> </span><span class="se">\</span>
+<span class="w">              </span>gawk<span class="w"> </span>build-essential<span class="w"> </span>bison<span class="w"> </span>flex<span class="w"> </span>texinfo<span class="w"> </span>gperf<span class="w"> </span>libtool<span class="w"> </span>patchutils<span class="w"> </span>bc<span class="w"> </span><span class="se">\</span>
+<span class="w">              </span>zlib1g-dev<span class="w"> </span>libexpat-dev<span class="w"> </span>pkg-config<span class="w">  </span>libglib2.0-dev<span class="w"> </span>libpixman-1-dev<span class="w"> </span>libsdl2-dev<span class="w"> </span><span class="se">\</span>
+<span class="w">              </span>git<span class="w"> </span>tmux<span class="w"> </span>python3<span class="w"> </span>python3-pip<span class="w"> </span>ninja-build
+
+./configure<span class="w"> </span>--enable-kvm
+make<span class="w"> </span>-j<span class="w"> </span><span class="m">8</span>
+sudo<span class="w"> </span>make<span class="w"> </span>install
+<span class="c1"># 编译安装完成</span>
+</pre></div>
+</div>
+<p>Please note that the compiled QEMU will connect via VNC mode, so you will also need to install a VNC viewer on your computer to connect to the QEMU virtual machine.</p>
+</div>
+</section>
+<section id="installing-docker">
+<h3>3.2 Installing Docker<a class="headerlink" href="#installing-docker" title="Permalink to this heading"></a></h3>
+<p>  You can download and install docker-ce from the Docker official website.</p>
+<blockquote>
+<div><p>For details, please go to: <a class="reference external" href="https://docs.docker.com/engine/install/">https://docs.docker.com/engine/install/</a></p>
+</div></blockquote>
+</section>
+<section id="installing-rust">
+<h3>3.3 Installing Rust<a class="headerlink" href="#installing-rust" title="Permalink to this heading"></a></h3>
+<div class="admonition warning">
+<p class="admonition-title">警告</p>
+<p><strong>[Common Misconception]</strong>: If you plan to compile using Docker, although the Docker image already has the Rust compilation environment installed, your host machine still needs to have the Rust environment installed to enable Rust-Analyzer code suggestions in VSCode and for the <code class="docutils literal notranslate"><span class="pre">make</span> <span class="pre">clean</span></code> command to work properly.</p>
+</div>
+<p>  You can install Rust by entering the following command in the console.</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span><span class="c1"># 这两行用于换源，加速Rust的安装过程</span>
+<span class="nb">export</span><span class="w"> </span><span class="nv">RUSTUP_DIST_SERVER</span><span class="o">=</span>https://mirrors.ustc.edu.cn/rust-static
+<span class="nb">export</span><span class="w"> </span><span class="nv">RUSTUP_UPDATE_ROOT</span><span class="o">=</span>https://mirrors.ustc.edu.cn/rust-static/rustup
+<span class="c1"># 安装Rust</span>
+curl<span class="w"> </span>https://sh.rustup.rs<span class="w"> </span>-sSf<span class="w"> </span><span class="p">|</span><span class="w"> </span>sh<span class="w"> </span>-s<span class="w"> </span>--<span class="w"> </span>--default-toolchain<span class="w"> </span>nightly
+<span class="c1"># 把Rustup加到环境变量</span>
+<span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;export PATH=\&quot;\$HOME/.cargo/bin:\$PATH\&quot;&quot;</span><span class="w"> </span>&gt;&gt;<span class="w"> </span>~/.bashrc
+<span class="nb">source</span><span class="w"> </span>~/.cargo/env
+<span class="nb">source</span><span class="w"> </span><span class="s2">&quot;</span><span class="nv">$HOME</span><span class="s2">/.cargo/env&quot;</span>
+
+<span class="c1"># 更换cargo的索引源</span>
+touch<span class="w"> </span>~/.cargo/config
+<span class="nb">echo</span><span class="w"> </span>-e<span class="w"> </span><span class="s2">&quot;[source.crates-io]   \n \</span>
+<span class="s2">registry = \&quot;https://github.com/rust-lang/crates.io-index\&quot;  \n \</span>
+<span class="s2">\n \</span>
+<span class="s2">replace-with = &#39;dragonos-gitee&#39; \n \</span>
+<span class="s2">[source.dragonos-gitee] \n \</span>
+<span class="s2">registry = \&quot;https://gitee.com/DragonOS/crates.io-index.git\&quot;	 \n \</span>
+<span class="s2">&quot;</span><span class="w"> </span>&gt;<span class="w"> </span>~/.cargo/config
+
+<span class="c1"># 安装DragonOS所需的工具链</span>
+cargo<span class="w"> </span>install<span class="w"> </span>cargo-binutils
+rustup<span class="w"> </span>toolchain<span class="w"> </span>install<span class="w"> </span>nightly
+rustup<span class="w"> </span>default<span class="w"> </span>nightly
+rustup<span class="w"> </span>component<span class="w"> </span>add<span class="w"> </span>rust-src
+rustup<span class="w"> </span>component<span class="w"> </span>add<span class="w"> </span>llvm-tools-preview
+rustup<span class="w"> </span>target<span class="w"> </span>add<span class="w"> </span>x86_64-unknown-none
+<span class="c1"># Rust安装完成</span>
+</pre></div>
+</div>
+<p><strong>At this point, the common dependencies have been installed. You can proceed to the subsequent sections based on your needs.</strong></p>
+<p><strong>For the usage of compilation commands, please refer to: <a class="reference internal" href="../../../introduction/build_system.html#build-system-command"><span class="std std-ref">编译命令讲解</span></a></strong></p>
+</section>
+</section>
+<section id="building-from-docker-not-recommended">
+<h2>4. Building from Docker (Not Recommended)<a class="headerlink" href="#building-from-docker-not-recommended" title="Permalink to this heading"></a></h2>
+<p>  DragonOS provides a Docker compilation environment to facilitate developers in running DragonOS. However, since the coding process still needs to be done on the host machine, you need to install the Rust compilation environment on the host machine.</p>
+<p>  This section assumes all operations are performed under Linux.</p>
+<section id="installing-qemu-virtual-machine">
+<h3>4.1 Installing QEMU Virtual Machine<a class="headerlink" href="#installing-qemu-virtual-machine" title="Permalink to this heading"></a></h3>
+<p>  In this section, we recommend installing QEMU via the command line:</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>sudo<span class="w"> </span>apt<span class="w"> </span>install<span class="w"> </span>-y<span class="w"> </span>qemu<span class="w"> </span>qemu-system<span class="w"> </span>qemu-kvm
+</pre></div>
+</div>
+</section>
+<section id="creating-a-disk-image">
+<h3>4.2 Creating a Disk Image<a class="headerlink" href="#creating-a-disk-image" title="Permalink to this heading"></a></h3>
+<p>  First, you need to create a virtual disk image using the create_hdd_image.sh script in the tools folder. You need to run this command in the tools folder.</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>bash<span class="w"> </span>create_hdd_image.sh
+</pre></div>
+</div>
+</section>
+<section id="running-dragonos">
+<h3>4.3 Running DragonOS<a class="headerlink" href="#running-dragonos" title="Permalink to this heading"></a></h3>
+<p>  If all goes well, this will be the final step to run DragonOS. You only need to execute the following command in the root directory of DragonOS to run DragonOS.</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>make<span class="w"> </span>run-docker
+</pre></div>
+</div>
+<p>  After a short wait, DragonOS will start running.</p>
+<p>  After the QEMU virtual machine is launched, you need to enter the letter <code class="docutils literal notranslate"><span class="pre">c</span></code> in the console and press Enter. This will start the virtual machine.</p>
+<div class="admonition note">
+<p class="admonition-title">备注</p>
+<ol class="arabic simple">
+<li><p>During the first compilation, it may take some time to download Rust-related indexes (several hundred MB in size), so please be patient!</p></li>
+<li><p>The command may require sudo privileges.</p></li>
+</ol>
+</div>
+<p><strong>For the usage of compilation commands, please refer to: <a class="reference internal" href="../../../introduction/build_system.html#build-system-command"><span class="std std-ref">编译命令讲解</span></a></strong></p>
+</section>
+</section>
+<section id="other-notes">
+<h2>5. Other Notes<a class="headerlink" href="#other-notes" title="Permalink to this heading"></a></h2>
+<section id="id1">
+<h3>5.1 Creating a Disk Image<a class="headerlink" href="#id1" title="Permalink to this heading"></a></h3>
+<p>  First, you need to run <code class="docutils literal notranslate"><span class="pre">tools/create_hdd_image.sh</span></code> with <strong>regular user</strong> privileges to create a disk image file for DragonOS. This script will automatically complete the creation of the disk image and move it to the <code class="docutils literal notranslate"><span class="pre">bin/</span></code> directory.</p>
+<p>  Please note that due to permission issues, you must run this script with <strong>regular user</strong> privileges. (When elevated privileges are required after running, the system may ask you for a password.)</p>
+</section>
+<section id="compiling-and-running-dragonos">
+<h3>5.2 Compiling and Running DragonOS<a class="headerlink" href="#compiling-and-running-dragonos" title="Permalink to this heading"></a></h3>
+<ol class="arabic simple">
+<li><p>Install the compilation and runtime environment</p></li>
+<li><p>Enter the DragonOS folder</p></li>
+<li><p>Enter <code class="docutils literal notranslate"><span class="pre">make</span> <span class="pre">run</span></code> to compile, write to the disk image, and run</p></li>
+</ol>
+<p>  After the QEMU virtual machine is launched, you need to enter the letter <code class="docutils literal notranslate"><span class="pre">c</span></code> in the console and press Enter. This will start the virtual machine.</p>
+<div class="admonition note">
+<p class="admonition-title">备注</p>
+<p>During the first compilation, it may take some time to download Rust-related indexes (several hundred MB in size), so please be patient!</p>
+</div>
+<p><strong>For the usage of compilation commands, please refer to: <a class="reference internal" href="../../../introduction/build_system.html#build-system-command"><span class="std std-ref">编译命令讲解</span></a></strong></p>
+</section>
+</section>
+<section id="explanation-of-compilation-commands">
+<span id="translated-label-build-system-command-en"></span><h2>6. Explanation of Compilation Commands<a class="headerlink" href="#explanation-of-compilation-commands" title="Permalink to this heading"></a></h2>
+<ul class="simple">
+<li><p>Local compilation, no run: <code class="docutils literal notranslate"><span class="pre">make</span> <span class="pre">all</span> <span class="pre">-j</span> <span class="pre">您的CPU核心数</span></code></p></li>
+<li><p>Local compilation, write to disk image, no run: <code class="docutils literal notranslate"><span class="pre">make</span> <span class="pre">build</span></code></p></li>
+<li><p>Local compilation, write to disk image, and run in QEMU: <code class="docutils literal notranslate"><span class="pre">make</span> <span class="pre">run</span></code></p></li>
+<li><p>Local compilation, write to disk image, run in headless mode:
+<code class="docutils literal notranslate"><span class="pre">make</span> <span class="pre">run-nographic</span></code></p></li>
+<li><p>Docker compilation, write to disk image: <code class="docutils literal notranslate"><span class="pre">make</span> <span class="pre">docker</span></code></p></li>
+<li><p>Docker compilation, write to disk image, and run in QEMU: <code class="docutils literal notranslate"><span class="pre">make</span> <span class="pre">run-docker</span></code></p></li>
+<li><p>No compilation, directly boot from existing disk image: <code class="docutils literal notranslate"><span class="pre">make</span> <span class="pre">qemu</span></code></p></li>
+<li><p>No compilation, directly boot from existing disk image (headless mode): <code class="docutils literal notranslate"><span class="pre">make</span> <span class="pre">qemu-nographic</span></code></p></li>
+<li><p>Clean up compilation-generated files: <code class="docutils literal notranslate"><span class="pre">make</span> <span class="pre">clean</span></code></p></li>
+<li><p>Compile documentation: <code class="docutils literal notranslate"><span class="pre">make</span> <span class="pre">docs</span></code> (requires manual installation of sphinx and dependencies in <code class="docutils literal notranslate"><span class="pre">requirements.txt</span></code> under docs)</p></li>
+<li><p>Clean up documentation: <code class="docutils literal notranslate"><span class="pre">make</span> <span class="pre">clean-docs</span></code></p></li>
+<li><p>Format code: <code class="docutils literal notranslate"><span class="pre">make</span> <span class="pre">fmt</span></code></p></li>
+<li><p>Run and execute syscall tests: <code class="docutils literal notranslate"><span class="pre">make</span> <span class="pre">test-syscall</span></code></p></li>
+</ul>
+<div class="admonition note">
+<p class="admonition-title">备注</p>
+<p>If you want to run DragonOS in VNC, add the <code class="docutils literal notranslate"><span class="pre">-vnc</span></code> suffix to the above commands. For example: <code class="docutils literal notranslate"><span class="pre">make</span> <span class="pre">run-vnc</span></code></p>
+<p>The QEMU virtual machine will listen for VNC connections on port 5900. You can use a VNC viewer or Remmina to connect to the QEMU virtual machine.</p>
+</div>
+</section>
+<section id="compiling-for-riscv64">
+<h2>7. Compiling for riscv64<a class="headerlink" href="#compiling-for-riscv64" title="Permalink to this heading"></a></h2>
+<p>Since DragonOS has not yet been fully ported to riscv64, the compilation process requires the following steps:</p>
+<ol class="arabic simple">
+<li><p>Modify <code class="docutils literal notranslate"><span class="pre">env.mk</span></code> and <code class="docutils literal notranslate"><span class="pre">.vscode/settings.json</span></code></p></li>
+</ol>
+<p>Change the value of <code class="docutils literal notranslate"><span class="pre">ARCH</span></code> in <code class="docutils literal notranslate"><span class="pre">env.mk</span></code> to <code class="docutils literal notranslate"><span class="pre">riscv64</span></code>, and comment out <code class="docutils literal notranslate"><span class="pre">&quot;rust-analyzer.cargo.target&quot;:</span> <span class="pre">&quot;x86_64-unknown-none&quot;,</span></code> in <code class="docutils literal notranslate"><span class="pre">setting.json</span></code>, replacing it with the line that enables riscv64.</p>
+<ol class="arabic simple" start="2">
+<li><p>Restart rust-analyzer</p></li>
+<li><p>Clean up compilation cache</p></li>
+</ol>
+<p>Due to architectural differences between x86_64 and riscv64, there may be compilation issues caused by caching. Ensure the cache is cleared before running.</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>make<span class="w"> </span>clean
+</pre></div>
+</div>
+<ol class="arabic simple" start="4">
+<li><p>Compile and run for riscv64</p></li>
+</ol>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span><span class="c1"># 下载DragonStub</span>
+git<span class="w"> </span>submodule<span class="w"> </span>update<span class="w"> </span>--init<span class="w"> </span>--recursive<span class="w"> </span>--force
+
+make<span class="w"> </span>run
+</pre></div>
+</div>
+<p>Please note that since QEMU runs in the console, to exit, enter <code class="docutils literal notranslate"><span class="pre">Ctrl+A</span></code> and press <code class="docutils literal notranslate"><span class="pre">X</span></code>.</p>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="页脚">
+        <a href="features.html" class="btn btn-neutral float-left" title="Features of DragonOS" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> 上一页</a>
+        <a href="mirrors.html" class="btn btn-neutral float-right" title="DragonOS Mirror Site" accesskey="n" rel="next">下一页 <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; 版权所有 2022-2025, DragonOS Community.
+      <span class="commit">版本 <code>1c53c97</code>.
+      </span></p>
+  </div>
+
+  利用 <a href="https://www.sphinx-doc.org/">Sphinx</a> 构建，使用的 
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">主题</a>
+    由 <a href="https://readthedocs.org">Read the Docs</a> 开发.
+  
+<div>
+    <br>
+    官网 <a href="https://dragonos.org">https://dragonos.org</a> | 论坛 <a href="https://bbs.dragonos.org.cn">https://bbs.dragonos.org.cn</a> |  <a href="https://dragonos.org">赞助DragonOS，成就未来！</a>
+</div>
+
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  
+<div class="rst-versions" data-toggle="rst-versions" role="note" aria-label="versions">
+  <span class="rst-current-version" data-toggle="rst-current-version">
+    <span class="fa fa-book"> Other Versions</span>
+    v: V0.3.0
+    <span class="fa fa-caret-down"></span>
+  </span>
+  <div class="rst-other-versions">
+    <dl>
+      <dt>Tags</dt>
+      <dd><a href="../../../../V0.1.0/index.html">V0.1.0</a></dd>
+      <dd><a href="../../../../V0.1.1/index.html">V0.1.1</a></dd>
+      <dd><a href="../../../../V0.1.10/index.html">V0.1.10</a></dd>
+      <dd><a href="../../../../V0.1.2/index.html">V0.1.2</a></dd>
+      <dd><a href="../../../../V0.1.3/index.html">V0.1.3</a></dd>
+      <dd><a href="../../../../V0.1.4/index.html">V0.1.4</a></dd>
+      <dd><a href="../../../../V0.1.5/index.html">V0.1.5</a></dd>
+      <dd><a href="../../../../V0.1.6/index.html">V0.1.6</a></dd>
+      <dd><a href="../../../../V0.1.7/index.html">V0.1.7</a></dd>
+      <dd><a href="../../../../V0.1.8/index.html">V0.1.8</a></dd>
+      <dd><a href="../../../../V0.1.9/index.html">V0.1.9</a></dd>
+      <dd><a href="../../../../V0.2.0/locales/en/introduction/build_system.html">V0.2.0</a></dd>
+      <dd><a href="build_system.html">V0.3.0</a></dd>
+      <dd><a href="../../../../V0.4.0/locales/en/introduction/build_system.html">V0.4.0</a></dd>
+    </dl>
+    <dl>
+      <dt>Branches</dt>
+      <dd><a href="../../../../master/locales/en/introduction/build_system.html">master</a></dd>
+    </dl>
+  </div>
+</div><script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script>  
+
+  <style>
+         .wy-nav-content { max-width: 90%; }
+  </style>
+
+
+
+</body>
+</html>

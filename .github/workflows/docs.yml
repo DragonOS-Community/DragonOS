@@ -3,8 +3,6 @@ name: Build current version docs
 on:
   pull_request:
     branches: [ "master" ]
-    # paths:
-    #   - 'docs/**'
 
 env:
     GITHUB_REPOSITORY: ${{ github.repository }}
@@ -18,17 +16,16 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
-      
-    - name: install requirements
+
+    - name: setup node
+      uses: actions/setup-node@v4
+      with:
+        node-version: '22.11.0'
+        cache: npm
+        cache-dependency-path: docs/package-lock.json
+
+    - name: install and build
       working-directory: ./docs
       run: |
-        sudo apt-get update
-        sudo apt-get install -y python3-pip
-        pip3 install -r requirements.txt
-
-    - name: build docs
-      working-directory: ./docs
-      shell: bash -ileo pipefail {0}
-
-      run: |
-        make html
+        npm ci
+        npm run docs:build

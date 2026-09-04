@@ -1,8 +1,8 @@
-# 内核栈traceback
+# Kernel Stack Traceback
 
-## 简介
+## Introduction
 
-&emsp;&emsp;内核栈traceback的功能位于`kernel/debug/traceback/`文件夹中。为内核态提供traceback的功能，打印调用栈到屏幕上。
+The functionality of the kernel stack traceback is located in the `kernel/debug/traceback/` folder. It provides traceback capabilities for the kernel mode, printing the call stack to the screen.
 
 ---
 
@@ -10,26 +10,26 @@
 
 ### `void traceback(struct pt_regs * regs)`
 
-#### 作用
+#### Purpose
 
-&emsp;&emsp;该接口定义于`kernel/debug/traceback/traceback.h`中，将会对给定内核栈进行traceback，并打印跟踪结果到屏幕上。
+This interface is defined in `kernel/debug/traceback/traceback.h`, which will perform a traceback on the given kernel stack and print the trace results to the screen.
 
-#### 参数
+#### Parameters
 
 ##### regs
 
-&emsp;&emsp;要开始追踪的第一层内核栈栈帧（也就是栈的底端）
+The first stack frame of the kernel stack to start the tracing (i.e., the bottom of the stack)
 
 ---
 
-## 实现原理
+## Implementation Principle
 
-&emsp;&emsp;当内核第一次链接之后，将会通过Makefile中的命令，运行`kernel/debug/kallsyms`程序，提取内核文件的符号表，然后生成`kernel/debug/kallsyms.S`。该文件的rodata段中存储了text段的函数的符号表。接着，该文件将被编译为`kallsyms.o`。最后，Makefile中再次调用`ld`命令进行链接，将kallsyms.o链接至内核文件。
+After the kernel is linked for the first time, the Makefile will run the `kernel/debug/kallsyms` program to extract the symbol table of the kernel file, and then generate `kernel/debug/kallsyms.S`. The rodata segment of this file stores the symbol table of the functions in the text segment. Then, this file will be compiled into `kallsyms.o`. Finally, the Makefile will again call the `ld` command to link the kallsyms.o into the kernel file.
 
-&emsp;&emsp;当调用`traceback`函数时，其将遍历该符号表，找到对应的符号并输出。
+When the `traceback` function is called, it will traverse the symbol table to find the corresponding symbols and output them.
 
 ---
 
-## 未来发展方向
+## Future Development Directions
 
-- 增加写入到日志文件的功能
+- Add the capability to write to a log file

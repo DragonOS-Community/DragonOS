@@ -1,0 +1,302 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="zh-CN">
+<head>
+  <meta charset="utf-8" /><meta name="generator" content="Docutils 0.18.1: http://docutils.sourceforge.net/" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>内核测试框架 &mdash; DragonOS dev 文档</title>
+      <link rel="stylesheet" type="text/css" href="../../_static/pygments.css" />
+      <link rel="stylesheet" type="text/css" href="../../_static/css/theme.css" />
+
+  
+  <!--[if lt IE 9]>
+    <script src="../../_static/js/html5shiv.min.js"></script>
+  <![endif]-->
+  
+        <script data-url_root="../../" id="documentation_options" src="../../_static/documentation_options.js"></script>
+        <script src="../../_static/jquery.js"></script>
+        <script src="../../_static/underscore.js"></script>
+        <script src="../../_static/_sphinx_javascript_frameworks_compat.js"></script>
+        <script src="../../_static/doctools.js"></script>
+        <script src="../../_static/translations.js"></script>
+    <script src="../../_static/js/theme.js"></script>
+    <link rel="index" title="索引" href="../../genindex.html" />
+    <link rel="search" title="搜索" href="../../search.html" />
+    <link rel="next" title="处理器架构" href="../cpu_arch/index.html" />
+    <link rel="prev" title="内核测试" href="index.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="../../index.html" class="icon icon-home">
+            DragonOS
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="../../search.html" method="get">
+    <input type="text" name="q" placeholder="搜索文档" aria-label="搜索文档" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="导航菜单">
+              <p class="caption" role="heading"><span class="caption-text">入门</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../introduction/index.html">DragonOS简介</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../introduction/build_system.html">构建DragonOS</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../introduction/mirrors.html">DragonOS镜像站</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">内核层</span></p>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../boot/index.html">引导加载</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core_api/index.html">核心API文档</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">锁</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../process_management/index.html">进程管理模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sched/index.html">DragonOS调度</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ipc/index.html">进程间通信</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../memory_management/index.html">内存管理文档</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystem/index.html">文件系统</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../debug/index.html">内核调试模块</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">内核测试</a><ul class="current">
+<li class="toctree-l2 current"><a class="current reference internal" href="#">内核测试框架</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#id2">使用方法</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#id3">创建自动测试程序</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id4">编写测试用例</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id5">发起测试</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="#api">API文档</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#ktest-start">ktest_start</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#assert">assert</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#ktest">kTEST</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#ktest-case-table">ktest_case_table</a></li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu_arch/index.html">处理器架构</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">应用层</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../userland/libc/index.html">LibC文档</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">系统调用api文档</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../syscall_api/index.html">系统调用API</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">DragonOS社区</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../community/code_contribution/index.html">参与开发</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../community/contact/index.html">与社区建立联系</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../community/ChangeLog/index.html">发行日志</a></li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="移动版导航菜单" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../../index.html">DragonOS</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="页面导航">
+  <ul class="wy-breadcrumbs">
+      <li><a href="../../index.html" class="icon icon-home" aria-label="Home"></a></li>
+          <li class="breadcrumb-item"><a href="index.html">内核测试</a></li>
+      <li class="breadcrumb-item active">内核测试框架</li>
+      <li class="wy-breadcrumbs-aside">
+              <a href="https://github.com/DragonOS-Community/DragonOS/blob/8ad2e35/docs/kernel/ktest/ktest-framework.md" class="fa fa-github"> 在 GitHub 上编辑</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section class="tex2jax_ignore mathjax_ignore" id="id1">
+<h1>内核测试框架<a class="headerlink" href="#id1" title="Permalink to this heading"></a></h1>
+<p>  DragonOS提供了一个测试框架，旨在对内核的一些模块进行自动化测试。内核测试框架位于<code class="docutils literal notranslate"><span class="pre">ktest/</span></code>下。</p>
+<p>  我们可以使用这个测试框架，按照规范编写测试代码，然后在合适的地方使用<code class="docutils literal notranslate"><span class="pre">ktest_start()</span></code>创建一个全新的内核线程并发起测试。</p>
+<section id="id2">
+<h2>使用方法<a class="headerlink" href="#id2" title="Permalink to this heading"></a></h2>
+<section id="id3">
+<h3>创建自动测试程序<a class="headerlink" href="#id3" title="Permalink to this heading"></a></h3>
+<p>  假如您要对kfifo模块进行自动测试，您可以在<code class="docutils literal notranslate"><span class="pre">ktest/</span></code>下，创建一个名为<code class="docutils literal notranslate"><span class="pre">test-kfifo.c</span></code>的测试文件，并编写Makefile。</p>
+<p>  在<code class="docutils literal notranslate"><span class="pre">test-kfifo.c</span></code>中，包含<code class="docutils literal notranslate"><span class="pre">ktest_utils.h</span></code>和<code class="docutils literal notranslate"><span class="pre">ktest.h</span></code>这两个头文件。</p>
+<p>  您需要像下面这样，在<code class="docutils literal notranslate"><span class="pre">test-kfifo.c</span></code>中，创建一个测试用例函数表，并把测试用例函数填写到其中：</p>
+<div class="highlight-c notranslate"><div class="highlight"><pre><span></span><span class="k">static</span><span class="w"> </span><span class="n">ktest_case_table</span><span class="w"> </span><span class="n">kt_kfifo_func_table</span><span class="p">[]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">ktest_kfifo_case0_1</span><span class="p">,</span>
+<span class="p">};</span>
+</pre></div>
+</div>
+<p>  然后创建一个函数，作为kfifo测试的主函数。请注意，您需要将它的声明添加到<code class="docutils literal notranslate"><span class="pre">ktest.h</span></code>中。</p>
+<div class="highlight-c notranslate"><div class="highlight"><pre><span></span><span class="kt">uint64_t</span><span class="w"> </span><span class="nf">ktest_test_kfifo</span><span class="p">(</span><span class="kt">uint64_t</span><span class="w"> </span><span class="n">arg</span><span class="p">)</span>
+<span class="p">{</span>
+<span class="w">    </span><span class="n">kTEST</span><span class="p">(</span><span class="s">&quot;Testing kfifo...&quot;</span><span class="p">);</span>
+<span class="w">    </span><span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="kt">int</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="k">sizeof</span><span class="p">(</span><span class="n">kt_kfifo_func_table</span><span class="p">)</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="k">sizeof</span><span class="p">(</span><span class="n">ktest_case_table</span><span class="p">);</span><span class="w"> </span><span class="o">++</span><span class="n">i</span><span class="p">)</span>
+<span class="w">    </span><span class="p">{</span>
+<span class="w">        </span><span class="n">kTEST</span><span class="p">(</span><span class="s">&quot;Testing case %d&quot;</span><span class="p">,</span><span class="w"> </span><span class="n">i</span><span class="p">);</span>
+<span class="w">        </span><span class="n">kt_kfifo_func_table</span><span class="p">[</span><span class="n">i</span><span class="p">](</span><span class="n">i</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">);</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="n">kTEST</span><span class="p">(</span><span class="s">&quot;kfifo Test done.&quot;</span><span class="p">);</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+</pre></div>
+</div>
+</section>
+<section id="id4">
+<h3>编写测试用例<a class="headerlink" href="#id4" title="Permalink to this heading"></a></h3>
+<p>  您可以创建一个或多个测试用例，命名为：<code class="docutils literal notranslate"><span class="pre">ktest_kfifo_case_xxxxx</span></code>. 在这个例子中，我创建了一个测试用例，命名为：<code class="docutils literal notranslate"><span class="pre">ktest_kfifo_case0_1</span></code>.如下所示：</p>
+<div class="highlight-c notranslate"><div class="highlight"><pre><span></span><span class="k">static</span><span class="w"> </span><span class="kt">long</span><span class="w"> </span><span class="n">ktest_kfifo_case0_1</span><span class="p">(</span><span class="kt">uint64_t</span><span class="w"> </span><span class="n">arg0</span><span class="p">,</span><span class="w"> </span><span class="kt">uint64_t</span><span class="w"> </span><span class="n">arg1</span><span class="p">)</span>
+</pre></div>
+</div>
+<p>  这里最多允许我们传递两个参数到测试函数里面。</p>
+<p>  那么，我们该如何编写测试用例呢？</p>
+<p>  我们主要是需要设置一些情节，以便能测试到目标组件的每个情况。为了检验模块的行为是否符合预期，我们需要使用<code class="docutils literal notranslate"><span class="pre">assert(condition)</span></code>宏函数，对目标<code class="docutils literal notranslate"><span class="pre">condition</span></code>进行校验。若<code class="docutils literal notranslate"><span class="pre">condition</span></code>为1，则表明测试通过。否则，将会输出一行assert failed信息到屏幕上。</p>
+</section>
+<section id="id5">
+<h3>发起测试<a class="headerlink" href="#id5" title="Permalink to this heading"></a></h3>
+<p>  我们可以在pid≥1的内核线程中发起测试。由于DragonOS目前尚不完善，您可以在<code class="docutils literal notranslate"><span class="pre">process/process.c</span></code>中的<code class="docutils literal notranslate"><span class="pre">initial_kernel_thread()</span></code>函数内，发起内核自动测试。具体的代码如下：</p>
+<div class="highlight-c notranslate"><div class="highlight"><pre><span></span><span class="n">ktest_start</span><span class="p">(</span><span class="n">ktest_test_kfifo</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">);</span>
+</pre></div>
+</div>
+<p>  这样就发起了一个内核测试，它会创建一个新的内核线程进行自动测试，您不必担心第一个内核线程会被阻塞。
+  </p>
+</section>
+</section>
+<section id="api">
+<h2>API文档<a class="headerlink" href="#api" title="Permalink to this heading"></a></h2>
+<section id="ktest-start">
+<h3>ktest_start<a class="headerlink" href="#ktest-start" title="Permalink to this heading"></a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">pid_t</span> <span class="pre">ktest_start(uint64_t</span> <span class="pre">(*func)(uint64_t</span> <span class="pre">arg),</span> <span class="pre">uint64_t</span> <span class="pre">arg)</span></code></p>
+<section id="id6">
+<h4>描述<a class="headerlink" href="#id6" title="Permalink to this heading"></a></h4>
+<p>  开启一个新的内核线程以进行测试</p>
+</section>
+<section id="id7">
+<h4>参数<a class="headerlink" href="#id7" title="Permalink to this heading"></a></h4>
+<p><strong>func</strong></p>
+<p>  测试函数. 新的测试线程将会执行该函数，以进行测试。</p>
+<p><strong>arg</strong></p>
+<p>  传递给测试函数的参数</p>
+</section>
+<section id="id8">
+<h4>返回值<a class="headerlink" href="#id8" title="Permalink to this heading"></a></h4>
+<p>  测试线程的pid</p>
+</section>
+</section>
+<section id="assert">
+<h3>assert<a class="headerlink" href="#assert" title="Permalink to this heading"></a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">#define</span> <span class="pre">assert(condition)</span></code></p>
+<section id="id9">
+<h4>描述<a class="headerlink" href="#id9" title="Permalink to this heading"></a></h4>
+<p>  判定condition是否为1，若不为1，则输出一行错误日志信息：</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="p">[</span> <span class="n">kTEST</span> <span class="n">FAILED</span> <span class="p">]</span> <span class="n">Ktest</span> <span class="n">Assertion</span> <span class="n">Failed</span><span class="p">,</span> <span class="n">file</span><span class="p">:</span><span class="o">%</span><span class="n">s</span><span class="p">,</span> <span class="n">Line</span><span class="p">:</span><span class="o">%</span><span class="n">d</span>
+</pre></div>
+</div>
+</section>
+</section>
+<section id="ktest">
+<h3>kTEST<a class="headerlink" href="#ktest" title="Permalink to this heading"></a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">#define</span> <span class="pre">kTEST(...)</span> </code></p>
+<section id="id10">
+<h4>描述<a class="headerlink" href="#id10" title="Permalink to this heading"></a></h4>
+<p>  格式化输出一行以<code class="docutils literal notranslate"><span class="pre">[</span> <span class="pre">kTEST</span> <span class="pre">]</span> <span class="pre">file:%s,</span> <span class="pre">Line:%d</span></code>开头的日志信息。</p>
+</section>
+</section>
+<section id="ktest-case-table">
+<h3>ktest_case_table<a class="headerlink" href="#ktest-case-table" title="Permalink to this heading"></a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">typedef</span> <span class="pre">long</span> <span class="pre">(*ktest_case_table)(uint64_t</span> <span class="pre">arg0,</span> <span class="pre">uint64_t</span> <span class="pre">arg1)</span></code></p>
+<section id="id11">
+<h4>描述<a class="headerlink" href="#id11" title="Permalink to this heading"></a></h4>
+<p>  ktest用例函数的类型定义。</p>
+</section>
+</section>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="页脚">
+        <a href="index.html" class="btn btn-neutral float-left" title="内核测试" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> 上一页</a>
+        <a href="../cpu_arch/index.html" class="btn btn-neutral float-right" title="处理器架构" accesskey="n" rel="next">下一页 <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; 版权所有 2022-2025, DragonOS Community.
+      <span class="commit">版本 <code>8ad2e35</code>.
+      </span></p>
+  </div>
+
+  利用 <a href="https://www.sphinx-doc.org/">Sphinx</a> 构建，使用的 
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">主题</a>
+    由 <a href="https://readthedocs.org">Read the Docs</a> 开发.
+  
+<div>
+    <br>
+    官网 <a href="https://dragonos.org">https://dragonos.org</a> | 论坛 <a href="https://bbs.dragonos.org.cn">https://bbs.dragonos.org.cn</a> |  <a href="https://dragonos.org">赞助DragonOS，成就未来！</a>
+</div>
+
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  
+<div class="rst-versions" data-toggle="rst-versions" role="note" aria-label="versions">
+  <span class="rst-current-version" data-toggle="rst-current-version">
+    <span class="fa fa-book"> Other Versions</span>
+    v: V0.1.3
+    <span class="fa fa-caret-down"></span>
+  </span>
+  <div class="rst-other-versions">
+    <dl>
+      <dt>Tags</dt>
+      <dd><a href="../../../V0.1.0/kernel/ktest/ktest-framework.html">V0.1.0</a></dd>
+      <dd><a href="../../../V0.1.1/kernel/ktest/ktest-framework.html">V0.1.1</a></dd>
+      <dd><a href="../../../V0.1.10/index.html">V0.1.10</a></dd>
+      <dd><a href="../../../V0.1.2/kernel/ktest/ktest-framework.html">V0.1.2</a></dd>
+      <dd><a href="ktest-framework.html">V0.1.3</a></dd>
+      <dd><a href="../../../V0.1.4/kernel/ktest/ktest-framework.html">V0.1.4</a></dd>
+      <dd><a href="../../../V0.1.5/kernel/ktest/ktest-framework.html">V0.1.5</a></dd>
+      <dd><a href="../../../V0.1.6/kernel/ktest/ktest-framework.html">V0.1.6</a></dd>
+      <dd><a href="../../../V0.1.7/kernel/ktest/ktest-framework.html">V0.1.7</a></dd>
+      <dd><a href="../../../V0.1.8/kernel/ktest/ktest-framework.html">V0.1.8</a></dd>
+      <dd><a href="../../../V0.1.9/index.html">V0.1.9</a></dd>
+      <dd><a href="../../../V0.2.0/index.html">V0.2.0</a></dd>
+      <dd><a href="../../../V0.3.0/index.html">V0.3.0</a></dd>
+      <dd><a href="../../../V0.4.0/index.html">V0.4.0</a></dd>
+    </dl>
+    <dl>
+      <dt>Branches</dt>
+      <dd><a href="../../../master/index.html">master</a></dd>
+    </dl>
+  </div>
+</div><script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script>  
+
+  <style>
+         .wy-nav-content { max-width: 90%; }
+  </style>
+
+
+
+</body>
+</html>

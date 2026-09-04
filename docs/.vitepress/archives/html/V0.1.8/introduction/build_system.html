@@ -1,0 +1,428 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="zh-CN">
+<head>
+  <meta charset="utf-8" /><meta name="generator" content="Docutils 0.18.1: http://docutils.sourceforge.net/" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>构建DragonOS &mdash; DragonOS dev 文档</title>
+      <link rel="stylesheet" type="text/css" href="../_static/pygments.css" />
+      <link rel="stylesheet" type="text/css" href="../_static/css/theme.css" />
+
+  
+  <!--[if lt IE 9]>
+    <script src="../_static/js/html5shiv.min.js"></script>
+  <![endif]-->
+  
+        <script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+        <script src="../_static/jquery.js"></script>
+        <script src="../_static/underscore.js"></script>
+        <script src="../_static/_sphinx_javascript_frameworks_compat.js"></script>
+        <script src="../_static/doctools.js"></script>
+        <script src="../_static/translations.js"></script>
+    <script src="../_static/js/theme.js"></script>
+    <link rel="index" title="索引" href="../genindex.html" />
+    <link rel="search" title="搜索" href="../search.html" />
+    <link rel="next" title="DragonOS镜像站" href="mirrors.html" />
+    <link rel="prev" title="DragonOS的功能" href="features.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="../index.html" class="icon icon-home">
+            DragonOS
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="../search.html" method="get">
+    <input type="text" name="q" placeholder="搜索文档" aria-label="搜索文档" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="导航菜单">
+              <p class="caption" role="heading"><span class="caption-text">入门</span></p>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="index.html">DragonOS简介</a></li>
+<li class="toctree-l1 current"><a class="current reference internal" href="#">构建DragonOS</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="#id1">1.写在前面</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#id2">1.1 下载DragonOS的源代码</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="#id3">2.使用一键初始化脚本进行安装（推荐）</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#id4">3.手动安装</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#id5">3.1 依赖清单</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#docker">3.2 安装Docker</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#rust">3.3 安装Rust</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="#id6">4.从Docker构建（不推荐）</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#qemu">4.1 安装qemu虚拟机</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#id7">4.2 创建磁盘镜像</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#id8">4.3 运行DragonOS</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="#id9">5.其他注意事项</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#id10">5.1 创建磁盘镜像</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#id11">5.2 编译、运行DragonOS</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="#build-system-command">6.编译命令讲解</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="mirrors.html">DragonOS镜像站</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">内核层</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../kernel/boot/index.html">引导加载</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel/core_api/index.html">核心API文档</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel/locking/index.html">锁</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel/process_management/index.html">进程管理模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel/sched/index.html">DragonOS调度</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel/ipc/index.html">进程间通信</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel/memory_management/index.html">内存管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel/filesystem/index.html">文件系统</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel/debug/index.html">内核调试模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel/ktest/index.html">内核测试</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel/cpu_arch/index.html">处理器架构</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">应用层</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userland/libc/index.html">LibC文档</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">系统调用api文档</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../syscall_api/index.html">系统调用API</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">DragonOS社区</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../community/code_contribution/index.html">参与开发</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../community/contact/index.html">与社区建立联系</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../community/ChangeLog/index.html">发行日志</a></li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="移动版导航菜单" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../index.html">DragonOS</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="页面导航">
+  <ul class="wy-breadcrumbs">
+      <li><a href="../index.html" class="icon icon-home" aria-label="Home"></a></li>
+      <li class="breadcrumb-item active">构建DragonOS</li>
+      <li class="wy-breadcrumbs-aside">
+              <a href="https://github.com/DragonOS-Community/DragonOS/blob/5db5a56/docs/introduction/build_system.md" class="fa fa-github"> 在 GitHub 上编辑</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section class="tex2jax_ignore mathjax_ignore" id="dragonos">
+<span id="build-dragonos"></span><h1>构建DragonOS<a class="headerlink" href="#dragonos" title="Permalink to this heading"></a></h1>
+<section id="id1">
+<h2>1.写在前面<a class="headerlink" href="#id1" title="Permalink to this heading"></a></h2>
+<p>  无论您采用后文中的何种方式来编译DragonOS，您必须先按照本小节中的步骤，初始化您的开发环境。</p>
+<p>  开始之前，您需要一台运行Linux或MacOS的计算机，并且处理器架构为X86-64.</p>
+<p>  对于Linux发行版，建议使用Ubuntu22、Debian、Arch Linux这样的，仓库软件版本较新的发行版，这能为您减少很多麻烦。</p>
+<section id="id2">
+<h3>1.1 下载DragonOS的源代码<a class="headerlink" href="#id2" title="Permalink to this heading"></a></h3>
+<p>  假设您的计算机上已经安装了git，您可以通过以下命令，获得DragonOS的最新的源代码：</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>git<span class="w"> </span>clone<span class="w"> </span>https://github.com/DragonOS-Community/DragonOS
+<span class="nb">cd</span><span class="w"> </span>DragonOS
+</pre></div>
+</div>
+<div class="admonition warning">
+<p class="admonition-title">警告</p>
+<p>DragonOS的源代码托管在Github上，但是，由于Github在国内的访问速度较慢。可能出现克隆失败的情况，这时只要重试即可。</p>
+<p>当然，我们建议您在github上绑定您的电脑的<strong>ssh公钥</strong>，
+然后通过以下命令来克隆代码，防止频繁出现git clone、pull、push失败的情况。</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>git<span class="w"> </span>clone<span class="w"> </span>git@github.com:DragonOS-Community/DragonOS.git
+</pre></div>
+</div>
+</div>
+</section>
+</section>
+<section id="id3">
+<h2>2.使用一键初始化脚本进行安装（推荐）<a class="headerlink" href="#id3" title="Permalink to this heading"></a></h2>
+<p>  我们提供了一键初始化脚本，可以一键安装，只需要在控制台运行以下命令：</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span><span class="nb">cd</span><span class="w"> </span>tools
+bash<span class="w"> </span>bootstrap.sh<span class="w">  </span><span class="c1"># 这里请不要加上sudo, 因为需要安装的开发依赖包是安装在用户环境而非全局环境</span>
+</pre></div>
+</div>
+<div class="admonition note">
+<p class="admonition-title">备注</p>
+<p>一键配置脚本目前只支持以下系统：</p>
+<ul class="simple">
+<li><p>Ubuntu/Debian/Deepin/UOS 等基于Debian的衍生版本</p></li>
+</ul>
+<p>欢迎您为其他的系统完善构建脚本！</p>
+</div>
+<p><strong>如果一键初始化脚本能够正常运行，并输出最终的“祝贺”界面(如下所示)，请关闭当前终端，然后重新打开。</strong></p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span><span class="p">|</span>-----------Congratulations!---------------<span class="p">|</span>
+<span class="p">|</span><span class="w">                                          </span><span class="p">|</span>
+<span class="p">|</span><span class="w">   </span>你成功安装了DragonOS所需的依赖项!<span class="w">          </span><span class="p">|</span>
+<span class="p">|</span><span class="w">                                          </span><span class="p">|</span>
+<span class="p">|</span><span class="w">   </span>请关闭当前终端,<span class="w"> </span>并重新打开一个终端<span class="w">          </span><span class="p">|</span>
+<span class="p">|</span><span class="w">   </span>然后通过以下命令运行:<span class="w">                     </span><span class="p">|</span>
+<span class="p">|</span><span class="w">                                          </span><span class="p">|</span>
+<span class="p">|</span><span class="w">                </span>make<span class="w"> </span>run<span class="w">                  </span><span class="p">|</span>
+<span class="p">|</span><span class="w">                                          </span><span class="p">|</span>
+<span class="p">|</span>------------------------------------------<span class="p">|</span>
+</pre></div>
+</div>
+<p><strong>接着，请直接跳到<a class="reference internal" href="#build-system-command"><span class="std std-ref">编译命令讲解</span></a>进行阅读！</strong></p>
+</section>
+<section id="id4">
+<h2>3.手动安装<a class="headerlink" href="#id4" title="Permalink to this heading"></a></h2>
+<section id="id5">
+<h3>3.1 依赖清单<a class="headerlink" href="#id5" title="Permalink to this heading"></a></h3>
+<p>  如果自动安装脚本不能支持您的操作系统，那么您需要手动安装依赖程序。以下是依赖项的清单：</p>
+<p>  在以下依赖项中，除了<code class="docutils literal notranslate"><span class="pre">docker-ce</span></code>和<code class="docutils literal notranslate"><span class="pre">Rust及其工具链</span></code>以外，其他的都能通过系统自带的包管理器进行安装。关于docker以及rust的安装，请看后文。</p>
+<ul class="simple">
+<li><p>docker-ce</p></li>
+<li><p>llvm-dev</p></li>
+<li><p>libclang-dev</p></li>
+<li><p>clang</p></li>
+<li><p>gcc-multilib</p></li>
+<li><p>qemu qemu-system qemu-kvm</p></li>
+<li><p>build-essential</p></li>
+<li><p>fdisk</p></li>
+<li><p>lsb-release</p></li>
+<li><p>git</p></li>
+<li><p>dosfstools</p></li>
+<li><p>Rust以及其工具链</p></li>
+</ul>
+<p><strong>请留意，若您的Linux系统是在虚拟机中运行的，还请您在您的VMware/Virtual Box虚拟机的处理器设置选项卡中，开启Intel VT-x或AMD-V选项，否则，DragonOS将无法运行。</strong></p>
+<div class="admonition note">
+<p class="admonition-title">备注</p>
+<p><em>在某些Linux发行版的软件仓库中构建的Qemu可能由于版本过低而不兼容DragonOS，如果遇到这种问题，请卸载Qemu，并采用编译安装的方式重新安装Qemu</em></p>
+<p>在该地址下载Qemu源代码： <a class="reference external" href="https://download.qemu.org/">https://download.qemu.org/</a></p>
+<p>解压后进入源代码目录，然后执行下列命令：</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span><span class="c1"># 安装编译依赖项</span>
+sudo<span class="w"> </span>apt<span class="w"> </span>install<span class="w"> </span>-y<span class="w"> </span>autoconf<span class="w"> </span>automake<span class="w"> </span>autotools-dev<span class="w"> </span>curl<span class="w"> </span>libmpc-dev<span class="w"> </span>libmpfr-dev<span class="w"> </span>libgmp-dev<span class="w"> </span><span class="se">\</span>
+<span class="w">              </span>gawk<span class="w"> </span>build-essential<span class="w"> </span>bison<span class="w"> </span>flex<span class="w"> </span>texinfo<span class="w"> </span>gperf<span class="w"> </span>libtool<span class="w"> </span>patchutils<span class="w"> </span>bc<span class="w"> </span><span class="se">\</span>
+<span class="w">              </span>zlib1g-dev<span class="w"> </span>libexpat-dev<span class="w"> </span>pkg-config<span class="w">  </span>libglib2.0-dev<span class="w"> </span>libpixman-1-dev<span class="w"> </span>libsdl2-dev<span class="w"> </span><span class="se">\</span>
+<span class="w">              </span>git<span class="w"> </span>tmux<span class="w"> </span>python3<span class="w"> </span>python3-pip<span class="w"> </span>ninja-build
+
+./configure<span class="w"> </span>--enable-kvm
+make<span class="w"> </span>-j<span class="w"> </span><span class="m">8</span>
+sudo<span class="w"> </span>make<span class="w"> </span>install
+<span class="c1"># 编译安装完成</span>
+</pre></div>
+</div>
+<p>请注意，编译安装的QEMU，将通过VNC模式进行链接，因此，您还需要在您的计算机上安装VNC viewer以连接至QEMU虚拟机。</p>
+</div>
+</section>
+<section id="docker">
+<h3>3.2 安装Docker<a class="headerlink" href="#docker" title="Permalink to this heading"></a></h3>
+<p>  您可以在docker官网下载安装docker-ce.</p>
+<blockquote>
+<div><p>详细信息请转到： <a class="reference external" href="https://docs.docker.com/engine/install/">https://docs.docker.com/engine/install/</a></p>
+</div></blockquote>
+</section>
+<section id="rust">
+<h3>3.3 安装Rust<a class="headerlink" href="#rust" title="Permalink to this heading"></a></h3>
+<div class="admonition warning">
+<p class="admonition-title">警告</p>
+<p><strong>【常见误区】</strong>：如果您打算采用docker进行编译，尽管docker镜像中已经安装了Rust编译环境，但是，为了能够在VSCode中使用Rust-Analyzer进行代码提示，以及<code class="docutils literal notranslate"><span class="pre">make</span> <span class="pre">clean</span></code>命令能正常运行，您的客户机上仍然需要安装rust环境。</p>
+</div>
+<p>  您可以在控制台输入以下命令，安装rust。</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span><span class="c1"># 这两行用于换源，加速Rust的安装过程</span>
+<span class="nb">export</span><span class="w"> </span><span class="nv">RUSTUP_DIST_SERVER</span><span class="o">=</span>https://mirrors.ustc.edu.cn/rust-static
+<span class="nb">export</span><span class="w"> </span><span class="nv">RUSTUP_UPDATE_ROOT</span><span class="o">=</span>https://mirrors.ustc.edu.cn/rust-static/rustup
+<span class="c1"># 安装Rust</span>
+curl<span class="w"> </span>https://sh.rustup.rs<span class="w"> </span>-sSf<span class="w"> </span><span class="p">|</span><span class="w"> </span>sh<span class="w"> </span>-s<span class="w"> </span>--<span class="w"> </span>--default-toolchain<span class="w"> </span>nightly
+<span class="c1"># 把Rustup加到环境变量</span>
+<span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;export PATH=\&quot;\$HOME/.cargo/bin:\$PATH\&quot;&quot;</span><span class="w"> </span>&gt;&gt;<span class="w"> </span>~/.bashrc
+<span class="nb">source</span><span class="w"> </span>~/.cargo/env
+<span class="nb">source</span><span class="w"> </span><span class="s2">&quot;</span><span class="nv">$HOME</span><span class="s2">/.cargo/env&quot;</span>
+
+<span class="c1"># 更换cargo的索引源</span>
+touch<span class="w"> </span>~/.cargo/config
+<span class="nb">echo</span><span class="w"> </span>-e<span class="w"> </span><span class="s2">&quot;[source.crates-io]   \n \</span>
+<span class="s2">registry = \&quot;https://github.com/rust-lang/crates.io-index\&quot;  \n \</span>
+<span class="s2">\n \</span>
+<span class="s2">replace-with = &#39;dragonos-gitee&#39; \n \</span>
+<span class="s2">[source.dragonos-gitee] \n \</span>
+<span class="s2">registry = \&quot;https://gitee.com/DragonOS/crates.io-index.git\&quot;	 \n \</span>
+<span class="s2">&quot;</span><span class="w"> </span>&gt;<span class="w"> </span>~/.cargo/config
+
+<span class="c1"># 安装DragonOS所需的工具链</span>
+cargo<span class="w"> </span>install<span class="w"> </span>cargo-binutils
+rustup<span class="w"> </span>toolchain<span class="w"> </span>install<span class="w"> </span>nightly
+rustup<span class="w"> </span>default<span class="w"> </span>nightly
+rustup<span class="w"> </span>component<span class="w"> </span>add<span class="w"> </span>rust-src
+rustup<span class="w"> </span>component<span class="w"> </span>add<span class="w"> </span>llvm-tools-preview
+rustup<span class="w"> </span>target<span class="w"> </span>add<span class="w"> </span>x86_64-unknown-none
+<span class="c1"># Rust安装完成</span>
+</pre></div>
+</div>
+<p><strong>至此，公共依赖项已经安装完成，您可以根据自己的需要，阅读后续章节</strong></p>
+<p><strong>关于编译命令的用法，请见：<a class="reference internal" href="#build-system-command"><span class="std std-ref">编译命令讲解</span></a></strong></p>
+</section>
+</section>
+<section id="id6">
+<h2>4.从Docker构建（不推荐）<a class="headerlink" href="#id6" title="Permalink to this heading"></a></h2>
+<p>  DragonOS发布了一个Docker编译环境，便于开发者运行DragonOS。但是，由于编码过程仍需要在客户机上进行，因此，您需要在客户机上安装Rust编译环境。</p>
+<p>  本节假设以下操作均在Linux下进行。</p>
+<section id="qemu">
+<h3>4.1 安装qemu虚拟机<a class="headerlink" href="#qemu" title="Permalink to this heading"></a></h3>
+<p>  在本节中，我们建议您采用命令行安装qemu：</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>sudo<span class="w"> </span>apt<span class="w"> </span>install<span class="w"> </span>-y<span class="w"> </span>qemu<span class="w"> </span>qemu-system<span class="w"> </span>qemu-kvm
+</pre></div>
+</div>
+</section>
+<section id="id7">
+<h3>4.2 创建磁盘镜像<a class="headerlink" href="#id7" title="Permalink to this heading"></a></h3>
+<p>  首先，您需要使用tools文件夹下的create_hdd_image.sh，创建一块虚拟磁盘镜像。您需要在tools文件夹下运行此命令。</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>bash<span class="w"> </span>create_hdd_image.sh
+</pre></div>
+</div>
+</section>
+<section id="id8">
+<h3>4.3 运行DragonOS<a class="headerlink" href="#id8" title="Permalink to this heading"></a></h3>
+<p>  如果不出意外的话，这将是运行DragonOS的最后一步。您只需要在DragonOS的根目录下方，执行以下命令，即可运行DragonOS。</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>make<span class="w"> </span>run-docker
+</pre></div>
+</div>
+<p>  稍等片刻，DragonOS将会被运行。</p>
+<p>  在qemu虚拟机被启动后，我们需要在控制台输入字母<code class="docutils literal notranslate"><span class="pre">c</span></code>，然后回车。这样，虚拟机就会开始执行。</p>
+<div class="admonition note">
+<p class="admonition-title">备注</p>
+<ol class="arabic simple">
+<li><p>首次编译时，由于需要下载Rust相关的索引（几百MB大小），因此需要一定的时间，请耐心等候！</p></li>
+<li><p>输入命令可能需要加上sudo</p></li>
+</ol>
+</div>
+<p><strong>关于编译命令的用法，请见：<a class="reference internal" href="#build-system-command"><span class="std std-ref">编译命令讲解</span></a></strong></p>
+</section>
+</section>
+<section id="id9">
+<h2>5.其他注意事项<a class="headerlink" href="#id9" title="Permalink to this heading"></a></h2>
+<section id="id10">
+<h3>5.1 创建磁盘镜像<a class="headerlink" href="#id10" title="Permalink to this heading"></a></h3>
+<p>  首先，您需要使用<strong>普通用户</strong>权限运行<code class="docutils literal notranslate"><span class="pre">tools/create_hdd_image.sh</span></code>，为DragonOS创建一块磁盘镜像文件。该脚本会自动完成创建磁盘镜像的工作，并将其移动到<code class="docutils literal notranslate"><span class="pre">bin/</span></code>目录下。
+  请注意，由于权限问题，请务必使用<strong>普通用户</strong>权限运行此脚本。（运行后，需要提升权限时，系统可能会要求您输入密码）</p>
+</section>
+<section id="id11">
+<h3>5.2 编译、运行DragonOS<a class="headerlink" href="#id11" title="Permalink to this heading"></a></h3>
+<ol class="arabic simple">
+<li><p>安装编译及运行环境</p></li>
+<li><p>进入DragonOS文件夹</p></li>
+<li><p>输入<code class="docutils literal notranslate"><span class="pre">make</span> <span class="pre">run</span></code>即可编译并写入磁盘镜像，并运行</p></li>
+</ol>
+<p>  在qemu虚拟机被启动后，我们需要在控制台输入字母<code class="docutils literal notranslate"><span class="pre">c</span></code>，然后回车。这样，虚拟机就会开始执行。</p>
+<div class="admonition note">
+<p class="admonition-title">备注</p>
+<p>首次编译时，由于需要下载Rust相关的索引（几百MB大小），因此需要一定的时间，请耐心等候！</p>
+</div>
+<p><strong>关于编译命令的用法，请见：<a class="reference internal" href="#build-system-command"><span class="std std-ref">编译命令讲解</span></a></strong></p>
+</section>
+</section>
+<section id="build-system-command">
+<span id="id12"></span><h2>6.编译命令讲解<a class="headerlink" href="#build-system-command" title="Permalink to this heading"></a></h2>
+<ul class="simple">
+<li><p>本地编译，不运行: <code class="docutils literal notranslate"><span class="pre">make</span> <span class="pre">all</span> <span class="pre">-j</span> <span class="pre">您的CPU核心数</span></code></p></li>
+<li><p>本地编译，并写入磁盘镜像，不运行: <code class="docutils literal notranslate"><span class="pre">make</span> <span class="pre">build</span></code></p></li>
+<li><p>本地编译，写入磁盘镜像，并在QEMU中运行: <code class="docutils literal notranslate"><span class="pre">make</span> <span class="pre">run</span></code></p></li>
+<li><p>Docker编译，并写入磁盘镜像,: <code class="docutils literal notranslate"><span class="pre">make</span> <span class="pre">docker</span></code></p></li>
+<li><p>Docker编译，写入磁盘镜像，并在QEMU中运行: <code class="docutils literal notranslate"><span class="pre">make</span> <span class="pre">run-docker</span></code></p></li>
+<li><p>不编译，直接从已有的磁盘镜像启动: <code class="docutils literal notranslate"><span class="pre">make</span> <span class="pre">qemu</span></code></p></li>
+<li><p>清理编译产生的文件: <code class="docutils literal notranslate"><span class="pre">make</span> <span class="pre">clean</span></code></p></li>
+<li><p>编译文档: <code class="docutils literal notranslate"><span class="pre">make</span> <span class="pre">docs</span></code> （需要手动安装sphinx以及docs下的<code class="docutils literal notranslate"><span class="pre">requirements.txt</span></code>中的依赖）</p></li>
+<li><p>清理文档: <code class="docutils literal notranslate"><span class="pre">make</span> <span class="pre">clean-docs</span></code></p></li>
+</ul>
+<div class="admonition note">
+<p class="admonition-title">备注</p>
+<p>如果您需要在vnc中运行DragonOS，请在上述命令后加上<code class="docutils literal notranslate"><span class="pre">-vnc</span></code>后缀。如：<code class="docutils literal notranslate"><span class="pre">make</span> <span class="pre">run-vnc</span></code></p>
+</div>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="页脚">
+        <a href="features.html" class="btn btn-neutral float-left" title="DragonOS的功能" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> 上一页</a>
+        <a href="mirrors.html" class="btn btn-neutral float-right" title="DragonOS镜像站" accesskey="n" rel="next">下一页 <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; 版权所有 2022-2025, DragonOS Community.
+      <span class="commit">版本 <code>5db5a56</code>.
+      </span></p>
+  </div>
+
+  利用 <a href="https://www.sphinx-doc.org/">Sphinx</a> 构建，使用的 
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">主题</a>
+    由 <a href="https://readthedocs.org">Read the Docs</a> 开发.
+  
+<div>
+    <br>
+    官网 <a href="https://dragonos.org">https://dragonos.org</a> | 论坛 <a href="https://bbs.dragonos.org.cn">https://bbs.dragonos.org.cn</a> |  <a href="https://dragonos.org">赞助DragonOS，成就未来！</a>
+</div>
+
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  
+<div class="rst-versions" data-toggle="rst-versions" role="note" aria-label="versions">
+  <span class="rst-current-version" data-toggle="rst-current-version">
+    <span class="fa fa-book"> Other Versions</span>
+    v: V0.1.8
+    <span class="fa fa-caret-down"></span>
+  </span>
+  <div class="rst-other-versions">
+    <dl>
+      <dt>Tags</dt>
+      <dd><a href="../../V0.1.0/introduction/build_system.html">V0.1.0</a></dd>
+      <dd><a href="../../V0.1.1/introduction/build_system.html">V0.1.1</a></dd>
+      <dd><a href="../../V0.1.10/introduction/build_system.html">V0.1.10</a></dd>
+      <dd><a href="../../V0.1.2/introduction/build_system.html">V0.1.2</a></dd>
+      <dd><a href="../../V0.1.3/introduction/build_system.html">V0.1.3</a></dd>
+      <dd><a href="../../V0.1.4/introduction/build_system.html">V0.1.4</a></dd>
+      <dd><a href="../../V0.1.5/introduction/build_system.html">V0.1.5</a></dd>
+      <dd><a href="../../V0.1.6/introduction/build_system.html">V0.1.6</a></dd>
+      <dd><a href="../../V0.1.7/introduction/build_system.html">V0.1.7</a></dd>
+      <dd><a href="build_system.html">V0.1.8</a></dd>
+      <dd><a href="../../V0.1.9/introduction/build_system.html">V0.1.9</a></dd>
+      <dd><a href="../../V0.2.0/introduction/build_system.html">V0.2.0</a></dd>
+      <dd><a href="../../V0.3.0/introduction/build_system.html">V0.3.0</a></dd>
+      <dd><a href="../../V0.4.0/introduction/build_system.html">V0.4.0</a></dd>
+    </dl>
+    <dl>
+      <dt>Branches</dt>
+      <dd><a href="../../master/introduction/build_system.html">master</a></dd>
+    </dl>
+  </div>
+</div><script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script>  
+
+  <style>
+         .wy-nav-content { max-width: 90%; }
+  </style>
+
+
+
+</body>
+</html>

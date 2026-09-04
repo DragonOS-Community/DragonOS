@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="zh-CN">
+<head>
+  <meta charset="utf-8" /><meta name="generator" content="Docutils 0.18.1: http://docutils.sourceforge.net/" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Notifier Chian 通知链 &mdash; DragonOS dev 文档</title>
+      <link rel="stylesheet" type="text/css" href="../../_static/pygments.css" />
+      <link rel="stylesheet" type="text/css" href="../../_static/css/theme.css" />
+
+  
+  <!--[if lt IE 9]>
+    <script src="../../_static/js/html5shiv.min.js"></script>
+  <![endif]-->
+  
+        <script data-url_root="../../" id="documentation_options" src="../../_static/documentation_options.js"></script>
+        <script src="../../_static/jquery.js"></script>
+        <script src="../../_static/underscore.js"></script>
+        <script src="../../_static/_sphinx_javascript_frameworks_compat.js"></script>
+        <script src="../../_static/doctools.js"></script>
+        <script src="../../_static/translations.js"></script>
+    <script src="../../_static/js/theme.js"></script>
+    <link rel="index" title="索引" href="../../genindex.html" />
+    <link rel="search" title="搜索" href="../../search.html" />
+    <link rel="next" title="软中断" href="softirq.html" />
+    <link rel="prev" title="类型转换库API" href="casting.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="../../index.html" class="icon icon-home">
+            DragonOS
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="../../search.html" method="get">
+    <input type="text" name="q" placeholder="搜索文档" aria-label="搜索文档" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="导航菜单">
+              <p class="caption" role="heading"><span class="caption-text">入门</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../introduction/index.html">DragonOS简介</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../introduction/build_system.html">构建DragonOS</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../introduction/mirrors.html">DragonOS镜像站</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">内核层</span></p>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../configuration/index.html">内核编译配置</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../boot/index.html">引导加载</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">核心API文档</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="kernel_api.html">DragonOS内核核心API</a></li>
+<li class="toctree-l2"><a class="reference internal" href="atomic.html">原子变量</a></li>
+<li class="toctree-l2"><a class="reference internal" href="casting.html">类型转换库API</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">Notifier Chian 通知链</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#id1">1.原理概要</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#id2">2.核心功能</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#id3">2.1 注册回调函数</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id4">2.2 注销回调函数</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id5">2.3 事件通知</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="#id6">3.通知链类型</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#id7">4. 其它问题</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="softirq.html">软中断</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">锁</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../process_management/index.html">进程管理模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sched/index.html">DragonOS调度</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ipc/index.html">进程间通信</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../memory_management/index.html">内存管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystem/index.html">文件系统</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../debug/index.html">内核调试模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ktest/index.html">内核测试</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu_arch/index.html">处理器架构</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../container/index.html">容器化</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../libs/index.html">其他内核库</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../net/index.html">网络子系统</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">内核跟踪机制</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../syscall/index.html">系统调用</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../device/index.html">Device</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">应用层</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../userland/appdev/index.html">应用程序开发文档</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Q&amp;A</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../questions/index.html">常见问题解答</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">DragonOS社区</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../community/code_contribution/index.html">参与开发</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../community/contact/index.html">与社区建立联系</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../community/ChangeLog/index.html">发行日志</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Translations</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../locales/en/index.html">English</a></li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="移动版导航菜单" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../../index.html">DragonOS</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="页面导航">
+  <ul class="wy-breadcrumbs">
+      <li><a href="../../index.html" class="icon icon-home" aria-label="Home"></a></li>
+          <li class="breadcrumb-item"><a href="index.html">核心API文档</a></li>
+      <li class="breadcrumb-item active">Notifier Chian 通知链</li>
+      <li class="wy-breadcrumbs-aside">
+              <a href="https://github.com/DragonOS-Community/DragonOS/blob/ac64a32/docs/kernel/core_api/notifier_chain.md" class="fa fa-github"> 在 GitHub 上编辑</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section class="tex2jax_ignore mathjax_ignore" id="notifier-chian">
+<h1>Notifier Chian 通知链<a class="headerlink" href="#notifier-chian" title="Permalink to this heading"></a></h1>
+<section id="id1">
+<h2>1.原理概要<a class="headerlink" href="#id1" title="Permalink to this heading"></a></h2>
+<p>  通知链是内核中各个子系统之间或子系统内部各个模块之间的事件通知机制。通知链本质上是一个事件处理函数的列表，每个通知链都与某个类型的事件相关（例如 reboot 事件）。当特定的事件发生时，就会调用相应事件的通知链中的回调函数，使子系统/模块对事件响应，并进行相对应的处理。</p>
+<p>  通知链和订阅功能有些类似，可以理解为：有个“通知者”维护了一个列表，“订阅者”将自己的回调函数注册进这个列表（“订阅者”当然也可以注销自己的回调函数）。当某个事件发生需要通知时，“通知者”就遍历这个列表中所有的回调函数并进行调用，这样所有注册的“订阅者”就能针对这个事件做出自己的响应和处理。</p>
+</section>
+<section id="id2">
+<h2>2.核心功能<a class="headerlink" href="#id2" title="Permalink to this heading"></a></h2>
+<section id="id3">
+<h3>2.1 注册回调函数<a class="headerlink" href="#id3" title="Permalink to this heading"></a></h3>
+<p>  将回调函数封装成特定的结构体，并将该结构体注册到指定的通知链当中。相关方法为 <code class="docutils literal notranslate"><span class="pre">register</span></code>，由“订阅者”使用。</p>
+</section>
+<section id="id4">
+<h3>2.2 注销回调函数<a class="headerlink" href="#id4" title="Permalink to this heading"></a></h3>
+<p>  将回调函数从指定的通知链当中进行注销，即从通知链中删去该回调函数。相关方法为 <code class="docutils literal notranslate"><span class="pre">unregister</span></code>，由“订阅者”使用。</p>
+</section>
+<section id="id5">
+<h3>2.3 事件通知<a class="headerlink" href="#id5" title="Permalink to this heading"></a></h3>
+<p>  当某个事件发生时，该事件相关的通知链通过该方法来进行事件通知。<code class="docutils literal notranslate"><span class="pre">call_chain</span></code> 这个方法会遍历通知链中的所有元素，并依次调用注册的回调函数。该方法由“通知者”使用。</p>
+</section>
+</section>
+<section id="id6">
+<h2>3.通知链类型<a class="headerlink" href="#id6" title="Permalink to this heading"></a></h2>
+<p>  每种通知链都有相对应的 <code class="docutils literal notranslate"><span class="pre">register</span></code>，<code class="docutils literal notranslate"><span class="pre">unregister</span></code> 以及 <code class="docutils literal notranslate"><span class="pre">call_chain</span></code> 的接口，其功能同上面所述的核心功能。</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">AtomicNotifierChain</span></code>：原子的通知链，不可睡眠，建议用于中断上下文。</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">BlockingNotifierChain</span></code>：可阻塞的通知链，可以睡眠，建议用在进程上下文。</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">RawNotifierChain</span></code>：原始的通知链，由调用者自行考虑线程安全。</p></li>
+</ul>
+</section>
+<section id="id7">
+<h2>4. 其它问题<a class="headerlink" href="#id7" title="Permalink to this heading"></a></h2>
+<p>  <code class="docutils literal notranslate"><span class="pre">BlockingNotifierChain</span></code> 暂时没实现可睡眠的功能。</p>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="页脚">
+        <a href="casting.html" class="btn btn-neutral float-left" title="类型转换库API" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> 上一页</a>
+        <a href="softirq.html" class="btn btn-neutral float-right" title="软中断" accesskey="n" rel="next">下一页 <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; 版权所有 2022-2025, DragonOS Community.
+      <span class="commit">版本 <code>ac64a32</code>.
+      </span></p>
+  </div>
+
+  利用 <a href="https://www.sphinx-doc.org/">Sphinx</a> 构建，使用的 
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">主题</a>
+    由 <a href="https://readthedocs.org">Read the Docs</a> 开发.
+  
+<div>
+    <br>
+    官网 <a href="https://dragonos.org">https://dragonos.org</a> | 论坛 <a href="https://bbs.dragonos.org.cn">https://bbs.dragonos.org.cn</a> |  <a href="https://dragonos.org">赞助DragonOS，成就未来！</a>
+</div>
+
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  
+<div class="rst-versions" data-toggle="rst-versions" role="note" aria-label="versions">
+  <span class="rst-current-version" data-toggle="rst-current-version">
+    <span class="fa fa-book"> Other Versions</span>
+    v: V0.4.0
+    <span class="fa fa-caret-down"></span>
+  </span>
+  <div class="rst-other-versions">
+    <dl>
+      <dt>Tags</dt>
+      <dd><a href="../../../V0.1.0/index.html">V0.1.0</a></dd>
+      <dd><a href="../../../V0.1.1/index.html">V0.1.1</a></dd>
+      <dd><a href="../../../V0.1.10/kernel/core_api/notifier_chain.html">V0.1.10</a></dd>
+      <dd><a href="../../../V0.1.2/index.html">V0.1.2</a></dd>
+      <dd><a href="../../../V0.1.3/index.html">V0.1.3</a></dd>
+      <dd><a href="../../../V0.1.4/index.html">V0.1.4</a></dd>
+      <dd><a href="../../../V0.1.5/index.html">V0.1.5</a></dd>
+      <dd><a href="../../../V0.1.6/index.html">V0.1.6</a></dd>
+      <dd><a href="../../../V0.1.7/index.html">V0.1.7</a></dd>
+      <dd><a href="../../../V0.1.8/kernel/core_api/notifier_chain.html">V0.1.8</a></dd>
+      <dd><a href="../../../V0.1.9/kernel/core_api/notifier_chain.html">V0.1.9</a></dd>
+      <dd><a href="../../../V0.2.0/kernel/core_api/notifier_chain.html">V0.2.0</a></dd>
+      <dd><a href="../../../V0.3.0/kernel/core_api/notifier_chain.html">V0.3.0</a></dd>
+      <dd><a href="notifier_chain.html">V0.4.0</a></dd>
+    </dl>
+    <dl>
+      <dt>Branches</dt>
+      <dd><a href="../../../master/kernel/core_api/notifier_chain.html">master</a></dd>
+    </dl>
+  </div>
+</div><script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script>  
+
+  <style>
+         .wy-nav-content { max-width: 90%; }
+  </style>
+
+
+
+</body>
+</html>

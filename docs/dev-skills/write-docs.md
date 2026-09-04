@@ -1,32 +1,40 @@
-# 贡献文档
+# Contributing documentation
 
-## 使用 nix
+`docs/zh/` is the Chinese documentation and the `docs/` root is the English documentation (the site default locale). Both are authored by hand: when you change one side, update the other. There is no automatic translation.
 
-### 实时构建预览文档
-
-sphinx-autobuild 作为默认 nix run 目标，写文档只需要
+## npm / VitePress
 
 ```shell
 cd docs
-nix run
+npm install
+npm run docs:dev
 ```
 
-然后访问 8000 端口即可。
+Open the dev server in a browser. The default homepage is English; switch to 简体中文 from the navbar.
 
-### 构建文档为 drv (sphinx-build)
+### Build the static site
 
 ```shell
 cd docs
-nix build
+npm run docs:build
 ```
 
-### 预览构建好的文档 (python http-server)
+Output is written to `docs/.vitepress/dist`.
+
+### Preview the build
 
 ```shell
 cd docs
-nix run .#release
+npm run docs:preview
 ```
 
-## 使用 pip Makefile 构建文档
+From the repository root you can also run `make docs` / `make clean-docs`.
 
-TODO
+## Nix
+
+```shell
+cd docs
+nix run          # vitepress dev
+nix build        # static build
+nix run .#release  # preview the build
+```

@@ -48,7 +48,7 @@
 
 &emsp;&emsp;如果您希望在本地环境中构建和运行DragonOS，可以参考以下文档：
 
-- [构建DragonOS — DragonOS dev 文档](https://docs.dragonos.org.cn/introduction/build_system.html)
+- [构建DragonOS — DragonOS 文档](https://docs.dragonos.org.cn/zh/introduction/build_system.html)
 
 ## 参与开发？
 

@@ -1,0 +1,429 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="zh-CN">
+<head>
+  <meta charset="utf-8" /><meta name="generator" content="Docutils 0.18.1: http://docutils.sourceforge.net/" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>RwLock读写锁 &mdash; DragonOS dev 文档</title>
+      <link rel="stylesheet" type="text/css" href="../../_static/pygments.css" />
+      <link rel="stylesheet" type="text/css" href="../../_static/css/theme.css" />
+
+  
+  <!--[if lt IE 9]>
+    <script src="../../_static/js/html5shiv.min.js"></script>
+  <![endif]-->
+  
+        <script data-url_root="../../" id="documentation_options" src="../../_static/documentation_options.js"></script>
+        <script src="../../_static/jquery.js"></script>
+        <script src="../../_static/underscore.js"></script>
+        <script src="../../_static/_sphinx_javascript_frameworks_compat.js"></script>
+        <script src="../../_static/doctools.js"></script>
+        <script src="../../_static/translations.js"></script>
+    <script src="../../_static/js/theme.js"></script>
+    <link rel="index" title="索引" href="../../genindex.html" />
+    <link rel="search" title="搜索" href="../../search.html" />
+    <link rel="next" title="进程管理模块" href="../process_management/index.html" />
+    <link rel="prev" title="mutex互斥量" href="mutex.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="../../index.html" class="icon icon-home">
+            DragonOS
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="../../search.html" method="get">
+    <input type="text" name="q" placeholder="搜索文档" aria-label="搜索文档" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="导航菜单">
+              <p class="caption" role="heading"><span class="caption-text">入门</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../introduction/index.html">DragonOS简介</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../introduction/build_system.html">构建DragonOS</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../introduction/mirrors.html">DragonOS镜像站</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">内核层</span></p>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../configuration/index.html">内核编译配置</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../boot/index.html">引导加载</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core_api/index.html">核心API文档</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">锁</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="locks.html">锁的类型及其规则</a></li>
+<li class="toctree-l2"><a class="reference internal" href="spinlock.html">自旋锁</a></li>
+<li class="toctree-l2"><a class="reference internal" href="mutex.html">mutex互斥量</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">RwLock读写锁</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#id1">1. 简介</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#dragonos">2. DragonOS中读写锁的实现</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#id2">2.1 读写锁的机理</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id3">2.2 读写锁守卫之间的关系</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id4">2.3 设计的细节</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="#api">3.  读写锁的主要API</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#rwlockapi">3.1 RwLock的主要API</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#writerrwlockwriteguardapi">3.2 WRITER守卫RwLockWriteGuard的主要API</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#upgraderrwlockupgradableguardapi">3.3 UPGRADER守卫RwLockUpgradableGuard的主要API</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="#id6">4. 用法实例</a></li>
+</ul>
+</li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../process_management/index.html">进程管理模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sched/index.html">DragonOS调度</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ipc/index.html">进程间通信</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../memory_management/index.html">内存管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystem/index.html">文件系统</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../debug/index.html">内核调试模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ktest/index.html">内核测试</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu_arch/index.html">处理器架构</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../libs/index.html">其他内核库</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">应用层</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../userland/appdev/index.html">应用程序开发文档</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">系统调用api文档</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../syscall_api/index.html">系统调用API</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">DragonOS社区</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../community/code_contribution/index.html">参与开发</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../community/contact/index.html">与社区建立联系</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../community/ChangeLog/index.html">发行日志</a></li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="移动版导航菜单" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../../index.html">DragonOS</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="页面导航">
+  <ul class="wy-breadcrumbs">
+      <li><a href="../../index.html" class="icon icon-home" aria-label="Home"></a></li>
+          <li class="breadcrumb-item"><a href="index.html">锁</a></li>
+      <li class="breadcrumb-item active">RwLock读写锁</li>
+      <li class="wy-breadcrumbs-aside">
+              <a href="https://github.com/DragonOS-Community/DragonOS/blob/ce48b93/docs/kernel/locking/rwlock.md" class="fa fa-github"> 在 GitHub 上编辑</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section class="tex2jax_ignore mathjax_ignore" id="rwlock">
+<h1>RwLock读写锁<a class="headerlink" href="#rwlock" title="Permalink to this heading"></a></h1>
+<div class="admonition note">
+<p class="admonition-title">备注</p>
+<p>本文作者: sujintao</p>
+<p>Email: <a class="reference external" href="mailto:sujintao&#37;&#52;&#48;dragonos&#46;org">sujintao<span>&#64;</span>dragonos<span>&#46;</span>org</a></p>
+</div>
+<section id="id1">
+<h2>1. 简介<a class="headerlink" href="#id1" title="Permalink to this heading"></a></h2>
+<p>  读写锁是一种在并发环境下保护多进程间共享数据的机制.  相比于普通的spinlock,读写锁将对
+共享数据的访问分为读和写两种类型: 只读取共享数据的访问使用读锁控制,修改共享数据的访问使用
+写锁控制. 读写锁设计允许同时存在多个”读者”(只读取共享数据的访问)和一个”写者”(修改共享数据
+的访问), 对于一些大部分情况都是读访问的共享数据来说,使用读写锁控制访问可以一定程度上提升性能.</p>
+</section>
+<section id="dragonos">
+<h2>2. DragonOS中读写锁的实现<a class="headerlink" href="#dragonos" title="Permalink to this heading"></a></h2>
+<section id="id2">
+<h3>2.1 读写锁的机理<a class="headerlink" href="#id2" title="Permalink to this heading"></a></h3>
+<p>  读写锁的目的是维护多线程系统中的共享变量的一致性. 数据会被包裹在一个RwLock的数据结构中, 一切的访问必须通过RwLock的数据结构进行访问和修改. 每个要访问共享数据的会获得一个守卫(guard), 只读进程获得READER(读者守卫),需要修改共享变量的进程获得WRITER(写者守卫),作为RwLock的”影子”, 线程都根据guard来进行访问和修改操作.</p>
+<p>  在实践中, 读写锁除了READER, WRITER, 还增加了UPGRADER; 这是一种介于READER和WRITER之间的守卫, 这个守卫的作用就是防止WRITER的饿死(Staration).当进程获得UPGRADER时,进程把它当成READER来使用;但是UPGRADER可以进行升级处理,升级后的UPGRADER相当于是一个WRITER守卫,可以对共享数据执行写操作.</p>
+<p>  所有守卫都满足rust原生的RAII机理,当守卫所在的作用域结束时,守卫将自动释放.</p>
+</section>
+<section id="id3">
+<h3>2.2 读写锁守卫之间的关系<a class="headerlink" href="#id3" title="Permalink to this heading"></a></h3>
+<p>  同一时间点, 可以存在多个READER, 即可以同时有多个进程对共享数据进行访问;同一时间只能存在一个WRITER,而且当有一个进程获得WRITER时,不能存在READER和UPGRADER;进程获得UPGRADER的前提条件是,不能有UPGRADER或WRITER存在,但是当有一个进程获得UPGRADER时,进程无法成功申请READER.</p>
+</section>
+<section id="id4">
+<h3>2.3 设计的细节<a class="headerlink" href="#id4" title="Permalink to this heading"></a></h3>
+<section id="id5">
+<h4>2.3.1 RwLock数据结构<a class="headerlink" href="#id5" title="Permalink to this heading"></a></h4>
+<div class="highlight-rust notranslate"><div class="highlight"><pre><span></span><span class="k">pub</span><span class="w"> </span><span class="k">struct</span> <span class="nc">RwLock</span><span class="o">&lt;</span><span class="n">T</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">lock</span>: <span class="nc">AtomicU32</span><span class="p">,</span><span class="c1">//原子变量</span>
+<span class="w">    </span><span class="n">data</span>: <span class="nc">UnsafeCell</span><span class="o">&lt;</span><span class="n">T</span><span class="o">&gt;</span><span class="p">,</span>
+<span class="p">}</span>
+</pre></div>
+</div>
+</section>
+<section id="reader">
+<h4>2.3.2 READER守卫的数据结构<a class="headerlink" href="#reader" title="Permalink to this heading"></a></h4>
+<div class="highlight-rust notranslate"><div class="highlight"><pre><span></span><span class="k">pub</span><span class="w"> </span><span class="k">struct</span> <span class="nc">RwLockReadGuard</span><span class="o">&lt;&#39;</span><span class="na">a</span><span class="p">,</span><span class="w"> </span><span class="n">T</span>: <span class="o">&#39;</span><span class="na">a</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">data</span>: <span class="o">*</span><span class="k">const</span><span class="w"> </span><span class="n">T</span><span class="p">,</span>
+<span class="w">    </span><span class="n">lock</span>: <span class="kp">&amp;</span><span class="o">&#39;</span><span class="na">a</span> <span class="nc">AtomicU32</span><span class="p">,</span>
+<span class="p">}</span>
+</pre></div>
+</div>
+</section>
+<section id="upgrader">
+<h4>2.3.3 UPGRADER守卫的数据结构<a class="headerlink" href="#upgrader" title="Permalink to this heading"></a></h4>
+<div class="highlight-rust notranslate"><div class="highlight"><pre><span></span><span class="k">pub</span><span class="w"> </span><span class="k">struct</span> <span class="nc">RwLockUpgradableGuard</span><span class="o">&lt;&#39;</span><span class="na">a</span><span class="p">,</span><span class="w"> </span><span class="n">T</span>: <span class="o">&#39;</span><span class="na">a</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">data</span>: <span class="o">*</span><span class="k">const</span><span class="w"> </span><span class="n">T</span><span class="p">,</span>
+<span class="w">    </span><span class="n">inner</span>: <span class="kp">&amp;</span><span class="o">&#39;</span><span class="na">a</span> <span class="nc">RwLock</span><span class="o">&lt;</span><span class="n">T</span><span class="o">&gt;</span><span class="p">,</span>
+<span class="p">}</span>
+</pre></div>
+</div>
+</section>
+<section id="writer">
+<h4>2.3.4 WRITER守卫的数据结构<a class="headerlink" href="#writer" title="Permalink to this heading"></a></h4>
+<div class="highlight-rust notranslate"><div class="highlight"><pre><span></span><span class="k">pub</span><span class="w"> </span><span class="k">struct</span> <span class="nc">RwLockWriteGuard</span><span class="o">&lt;&#39;</span><span class="na">a</span><span class="p">,</span><span class="w"> </span><span class="n">T</span>: <span class="o">&#39;</span><span class="na">a</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">data</span>: <span class="o">*</span><span class="k">mut</span><span class="w"> </span><span class="n">T</span><span class="p">,</span>
+<span class="w">    </span><span class="n">inner</span>: <span class="kp">&amp;</span><span class="o">&#39;</span><span class="na">a</span> <span class="nc">RwLock</span><span class="o">&lt;</span><span class="n">T</span><span class="o">&gt;</span><span class="p">,</span>
+<span class="p">}</span>
+</pre></div>
+</div>
+</section>
+<section id="rwlocklock">
+<h4>2.3.5 RwLock的lock的结构介绍<a class="headerlink" href="#rwlocklock" title="Permalink to this heading"></a></h4>
+<p>lock是一个32位原子变量AtomicU32, 它的比特位分配如下:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>                                                       <span class="n">UPGRADER_BIT</span>     <span class="n">WRITER_BIT</span>
+                                                         <span class="o">^</span>                   <span class="o">^</span>
+<span class="n">OVERFLOW_BIT</span>                                             <span class="o">+------+</span>    <span class="o">+-------+</span>
+  <span class="o">^</span>                                                             <span class="o">|</span>    <span class="o">|</span>
+  <span class="o">|</span>                                                             <span class="o">|</span>    <span class="o">|</span>
+<span class="o">+-+--+--------------------------------------------------------+-+--+-+--+</span>
+<span class="o">|</span>    <span class="o">|</span>                                                        <span class="o">|</span>    <span class="o">|</span>    <span class="o">|</span>
+<span class="o">|</span>    <span class="o">|</span>                                                        <span class="o">|</span>    <span class="o">|</span>    <span class="o">|</span>
+<span class="o">|</span>    <span class="o">|</span>             <span class="n">The</span> <span class="n">number</span> <span class="n">of</span> <span class="n">the</span> <span class="n">readers</span>                  <span class="o">|</span>    <span class="o">|</span>    <span class="o">|</span>
+<span class="o">|</span>    <span class="o">|</span>                                                        <span class="o">|</span>    <span class="o">|</span>    <span class="o">|</span>
+<span class="o">+----+--------------------------------------------------------+----+----+</span>
+  <span class="mi">31</span>  <span class="mi">30</span>                                                    <span class="mi">2</span>   <span class="mi">1</span>    <span class="mi">0</span>
+</pre></div>
+</div>
+<p>  (从右到左)第0位表征WRITER是否有效,若WRITER_BIT=1, 则存在一个进程获得了WRITER守卫; 若UPGRADER_BIT=1, 则存在一个进程获得了UPGRADER守卫,第2位到第30位用来二进制表示获得READER守卫的进程数; 第31位是溢出判断位, 若OVERFLOW_BIT=1, 则不再接受新的读者守卫的获得申请.</p>
+</section>
+</section>
+</section>
+<section id="api">
+<h2>3.  读写锁的主要API<a class="headerlink" href="#api" title="Permalink to this heading"></a></h2>
+<section id="rwlockapi">
+<h3>3.1 RwLock的主要API<a class="headerlink" href="#rwlockapi" title="Permalink to this heading"></a></h3>
+<div class="highlight-rust notranslate"><div class="highlight"><pre><span></span><span class="sd">///功能:  输入需要保护的数据类型data,返回一个新的RwLock类型.</span>
+<span class="k">pub</span><span class="w"> </span><span class="k">const</span><span class="w"> </span><span class="k">fn</span> <span class="nf">new</span><span class="p">(</span><span class="n">data</span>: <span class="nc">T</span><span class="p">)</span><span class="w"> </span>-&gt; <span class="nc">Self</span>
+</pre></div>
+</div>
+<div class="highlight-rust notranslate"><div class="highlight"><pre><span></span><span class="sd">///功能: 获得READER守卫</span>
+<span class="k">pub</span><span class="w"> </span><span class="k">fn</span> <span class="nf">read</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">)</span><span class="w"> </span>-&gt; <span class="nc">RwLockReadGuard</span><span class="o">&lt;</span><span class="n">T</span><span class="o">&gt;</span>
+</pre></div>
+</div>
+<div class="highlight-rust notranslate"><div class="highlight"><pre><span></span><span class="sd">///功能: 尝试获得READER守卫</span>
+<span class="k">pub</span><span class="w"> </span><span class="k">fn</span> <span class="nf">try_read</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">)</span><span class="w"> </span>-&gt; <span class="nb">Option</span><span class="o">&lt;</span><span class="n">RwLockReadGuard</span><span class="o">&lt;</span><span class="n">T</span><span class="o">&gt;&gt;</span>
+</pre></div>
+</div>
+<div class="highlight-rust notranslate"><div class="highlight"><pre><span></span><span class="sd">///功能: 获得WRITER守卫</span>
+<span class="k">pub</span><span class="w"> </span><span class="k">fn</span> <span class="nf">write</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">)</span><span class="w"> </span>-&gt; <span class="nc">RwLockWriteGuard</span><span class="o">&lt;</span><span class="n">T</span><span class="o">&gt;</span>
+</pre></div>
+</div>
+<div class="highlight-rust notranslate"><div class="highlight"><pre><span></span><span class="sd">///功能: 尝试获得WRITER守卫</span>
+<span class="k">pub</span><span class="w"> </span><span class="k">fn</span> <span class="nf">try_write</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">)</span><span class="w"> </span>-&gt; <span class="nb">Option</span><span class="o">&lt;</span><span class="n">RwLockWriteGuard</span><span class="o">&lt;</span><span class="n">T</span><span class="o">&gt;&gt;</span>
+</pre></div>
+</div>
+<div class="highlight-rust notranslate"><div class="highlight"><pre><span></span><span class="sd">///功能: 获得UPGRADER守卫</span>
+<span class="k">pub</span><span class="w"> </span><span class="k">fn</span> <span class="nf">upgradeable_read</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">)</span><span class="w"> </span>-&gt; <span class="nc">RwLockUpgradableGuard</span><span class="o">&lt;</span><span class="n">T</span><span class="o">&gt;</span>
+</pre></div>
+</div>
+<div class="highlight-rust notranslate"><div class="highlight"><pre><span></span><span class="sd">///功能: 尝试获得UPGRADER守卫</span>
+<span class="k">pub</span><span class="w"> </span><span class="k">fn</span> <span class="nf">try_upgradeable_read</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">)</span><span class="w"> </span>-&gt; <span class="nb">Option</span><span class="o">&lt;</span><span class="n">RwLockUpgradableGuard</span><span class="o">&lt;</span><span class="n">T</span><span class="o">&gt;&gt;</span>
+</pre></div>
+</div>
+</section>
+<section id="writerrwlockwriteguardapi">
+<h3>3.2 WRITER守卫RwLockWriteGuard的主要API<a class="headerlink" href="#writerrwlockwriteguardapi" title="Permalink to this heading"></a></h3>
+<div class="highlight-rust notranslate"><div class="highlight"><pre><span></span><span class="sd">///功能: 将WRITER降级为READER</span>
+<span class="k">pub</span><span class="w"> </span><span class="k">fn</span> <span class="nf">downgrade</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span><span class="w"> </span>-&gt; <span class="nc">RwLockReadGuard</span><span class="o">&lt;&#39;</span><span class="na">rwlock</span><span class="p">,</span><span class="w"> </span><span class="n">T</span><span class="o">&gt;</span>
+</pre></div>
+</div>
+<div class="highlight-rust notranslate"><div class="highlight"><pre><span></span><span class="sd">///功能: 将WRITER降级为UPGRADER</span>
+<span class="k">pub</span><span class="w"> </span><span class="k">fn</span> <span class="nf">downgrade_to_upgradeable</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span><span class="w"> </span>-&gt; <span class="nc">RwLockUpgradableGuard</span><span class="o">&lt;&#39;</span><span class="na">rwlock</span><span class="p">,</span><span class="w"> </span><span class="n">T</span><span class="o">&gt;</span>
+</pre></div>
+</div>
+</section>
+<section id="upgraderrwlockupgradableguardapi">
+<h3>3.3 UPGRADER守卫RwLockUpgradableGuard的主要API<a class="headerlink" href="#upgraderrwlockupgradableguardapi" title="Permalink to this heading"></a></h3>
+<div class="highlight-rust notranslate"><div class="highlight"><pre><span></span><span class="sd">///功能: 将UPGRADER升级为WRITER</span>
+<span class="k">pub</span><span class="w"> </span><span class="k">fn</span> <span class="nf">upgrade</span><span class="p">(</span><span class="k">mut</span><span class="w"> </span><span class="bp">self</span><span class="p">)</span><span class="w"> </span>-&gt; <span class="nc">RwLockWriteGuard</span><span class="o">&lt;&#39;</span><span class="na">rwlock</span><span class="p">,</span><span class="w"> </span><span class="n">T</span><span class="o">&gt;</span><span class="w"> </span>
+</pre></div>
+</div>
+<div class="highlight-rust notranslate"><div class="highlight"><pre><span></span><span class="sd">///功能: 将UPGRADER降级为READER</span>
+<span class="k">pub</span><span class="w"> </span><span class="k">fn</span> <span class="nf">downgrade</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span><span class="w"> </span>-&gt; <span class="nc">RwLockReadGuard</span><span class="o">&lt;&#39;</span><span class="na">rwlock</span><span class="p">,</span><span class="w"> </span><span class="n">T</span><span class="o">&gt;</span>
+</pre></div>
+</div>
+</section>
+</section>
+<section id="id6">
+<h2>4. 用法实例<a class="headerlink" href="#id6" title="Permalink to this heading"></a></h2>
+<div class="highlight-rust notranslate"><div class="highlight"><pre><span></span><span class="k">static</span><span class="w"> </span><span class="n">LOCK</span>: <span class="nc">RwLock</span><span class="o">&lt;</span><span class="kt">u32</span><span class="o">&gt;</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">RwLock</span>::<span class="n">new</span><span class="p">(</span><span class="mi">100</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="kt">u32</span><span class="p">);</span>
+
+<span class="k">fn</span> <span class="nf">t_read1</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">guard</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">LOCK</span><span class="p">.</span><span class="n">read</span><span class="p">();</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">value</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="o">*</span><span class="n">guard</span><span class="p">;</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">readers_current</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">LOCK</span><span class="p">.</span><span class="n">reader_count</span><span class="p">();</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">writers_current</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">LOCK</span><span class="p">.</span><span class="n">writer_count</span><span class="p">();</span>
+<span class="w">    </span><span class="fm">println!</span><span class="p">(</span>
+<span class="w">        </span><span class="s">&quot;Reader1: the value is {value}</span>
+<span class="s">    There are totally {writers_current} writers, {readers_current} readers&quot;</span>
+<span class="w">    </span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">fn</span> <span class="nf">t_read2</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">guard</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">LOCK</span><span class="p">.</span><span class="n">read</span><span class="p">();</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">value</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="o">*</span><span class="n">guard</span><span class="p">;</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">readers_current</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">LOCK</span><span class="p">.</span><span class="n">reader_count</span><span class="p">();</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">writers_current</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">LOCK</span><span class="p">.</span><span class="n">writer_count</span><span class="p">();</span>
+<span class="w">    </span><span class="fm">println!</span><span class="p">(</span>
+<span class="w">        </span><span class="s">&quot;Reader2: the value is {value}</span>
+<span class="s">    There are totally {writers_current} writers, {readers_current} readers&quot;</span>
+<span class="w">    </span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">fn</span> <span class="nf">t_write</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">guard</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">LOCK</span><span class="p">.</span><span class="n">write</span><span class="p">();</span>
+<span class="w">    </span><span class="o">*</span><span class="n">guard</span><span class="w"> </span><span class="o">+=</span><span class="w"> </span><span class="mi">100</span><span class="p">;</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">writers_current</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">LOCK</span><span class="p">.</span><span class="n">writer_count</span><span class="p">();</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">readers_current</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">LOCK</span><span class="p">.</span><span class="n">reader_count</span><span class="p">();</span>
+<span class="w">    </span><span class="fm">println!</span><span class="p">(</span>
+<span class="w">        </span><span class="s">&quot;Writers: the value is {guard}</span>
+<span class="s">    There are totally {writers_current} writers, {readers_current} readers&quot;</span><span class="p">,</span>
+<span class="w">        </span><span class="n">guard</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="o">*</span><span class="n">guard</span>
+<span class="w">    </span><span class="p">);</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">read_guard</span><span class="o">=</span><span class="n">guard</span><span class="p">.</span><span class="n">downgrade</span><span class="p">();</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">value</span><span class="o">=*</span><span class="n">read_guard</span><span class="p">;</span>
+<span class="w">    </span><span class="fm">println!</span><span class="p">(</span><span class="s">&quot;After downgraded to read_guard: {value}&quot;</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">fn</span> <span class="nf">t_upgrade</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">guard</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">LOCK</span><span class="p">.</span><span class="n">upgradeable_read</span><span class="p">();</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">value</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="o">*</span><span class="n">guard</span><span class="p">;</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">readers_current</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">LOCK</span><span class="p">.</span><span class="n">reader_count</span><span class="p">();</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">writers_current</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">LOCK</span><span class="p">.</span><span class="n">writer_count</span><span class="p">();</span>
+<span class="w">    </span><span class="fm">println!</span><span class="p">(</span>
+<span class="w">        </span><span class="s">&quot;Upgrader1 before upgrade: the value is {value}</span>
+<span class="s">    There are totally {writers_current} writers, {readers_current} readers&quot;</span>
+<span class="w">    </span><span class="p">);</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">upgraded_guard</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">guard</span><span class="p">.</span><span class="n">upgrade</span><span class="p">();</span>
+<span class="w">    </span><span class="o">*</span><span class="n">upgraded_guard</span><span class="w"> </span><span class="o">+=</span><span class="w"> </span><span class="mi">100</span><span class="p">;</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">writers_current</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">LOCK</span><span class="p">.</span><span class="n">writer_count</span><span class="p">();</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">readers_current</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">LOCK</span><span class="p">.</span><span class="n">reader_count</span><span class="p">();</span>
+<span class="w">    </span><span class="fm">println!</span><span class="p">(</span>
+<span class="w">        </span><span class="s">&quot;Upgrader1 after upgrade: the value is {temp}</span>
+<span class="s">    There are totally {writers_current} writers, {readers_current} readers&quot;</span><span class="p">,</span>
+<span class="w">        </span><span class="n">temp</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="o">*</span><span class="n">upgraded_guard</span>
+<span class="w">    </span><span class="p">);</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">downgraded_guard</span><span class="o">=</span><span class="n">upgraded_guard</span><span class="p">.</span><span class="n">downgrade_to_upgradeable</span><span class="p">();</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">value</span><span class="o">=*</span><span class="n">downgraded_guard</span><span class="p">;</span>
+<span class="w">    </span><span class="fm">println!</span><span class="p">(</span><span class="s">&quot;value after downgraded: {value}&quot;</span><span class="p">);</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">read_guard</span><span class="o">=</span><span class="n">downgraded_guard</span><span class="p">.</span><span class="n">downgrade</span><span class="p">();</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">value_</span><span class="o">=*</span><span class="n">read_guard</span><span class="p">;</span>
+<span class="w">    </span><span class="fm">println!</span><span class="p">(</span><span class="s">&quot;value after downgraded to read_guard: {value_}&quot;</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">fn</span> <span class="nf">main</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">r2</span><span class="o">=</span><span class="n">thread</span>::<span class="n">spawn</span><span class="p">(</span><span class="n">t_read2</span><span class="p">);</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">r1</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">thread</span>::<span class="n">spawn</span><span class="p">(</span><span class="n">t_read1</span><span class="p">);</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">t1</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">thread</span>::<span class="n">spawn</span><span class="p">(</span><span class="n">t_write</span><span class="p">);</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">g1</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">thread</span>::<span class="n">spawn</span><span class="p">(</span><span class="n">t_upgrade</span><span class="p">);</span>
+<span class="w">    </span><span class="n">r1</span><span class="p">.</span><span class="n">join</span><span class="p">().</span><span class="n">expect</span><span class="p">(</span><span class="s">&quot;r1&quot;</span><span class="p">);</span>
+<span class="w">    </span><span class="n">t1</span><span class="p">.</span><span class="n">join</span><span class="p">().</span><span class="n">expect</span><span class="p">(</span><span class="s">&quot;t1&quot;</span><span class="p">);</span>
+<span class="w">    </span><span class="n">g1</span><span class="p">.</span><span class="n">join</span><span class="p">().</span><span class="n">expect</span><span class="p">(</span><span class="s">&quot;g1&quot;</span><span class="p">);</span>
+<span class="w">    </span><span class="n">r2</span><span class="p">.</span><span class="n">join</span><span class="p">().</span><span class="n">expect</span><span class="p">(</span><span class="s">&quot;r2&quot;</span><span class="p">);</span>
+<span class="p">}</span>
+</pre></div>
+</div>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="页脚">
+        <a href="mutex.html" class="btn btn-neutral float-left" title="mutex互斥量" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> 上一页</a>
+        <a href="../process_management/index.html" class="btn btn-neutral float-right" title="进程管理模块" accesskey="n" rel="next">下一页 <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; 版权所有 2022-2025, DragonOS Community.
+      <span class="commit">版本 <code>ce48b93</code>.
+      </span></p>
+  </div>
+
+  利用 <a href="https://www.sphinx-doc.org/">Sphinx</a> 构建，使用的 
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">主题</a>
+    由 <a href="https://readthedocs.org">Read the Docs</a> 开发.
+  
+<div>
+    <br>
+    官网 <a href="https://dragonos.org">https://dragonos.org</a> | 论坛 <a href="https://bbs.dragonos.org.cn">https://bbs.dragonos.org.cn</a> |  <a href="https://dragonos.org">赞助DragonOS，成就未来！</a>
+</div>
+
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  
+<div class="rst-versions" data-toggle="rst-versions" role="note" aria-label="versions">
+  <span class="rst-current-version" data-toggle="rst-current-version">
+    <span class="fa fa-book"> Other Versions</span>
+    v: V0.1.10
+    <span class="fa fa-caret-down"></span>
+  </span>
+  <div class="rst-other-versions">
+    <dl>
+      <dt>Tags</dt>
+      <dd><a href="../../../V0.1.0/index.html">V0.1.0</a></dd>
+      <dd><a href="../../../V0.1.1/index.html">V0.1.1</a></dd>
+      <dd><a href="rwlock.html">V0.1.10</a></dd>
+      <dd><a href="../../../V0.1.2/index.html">V0.1.2</a></dd>
+      <dd><a href="../../../V0.1.3/index.html">V0.1.3</a></dd>
+      <dd><a href="../../../V0.1.4/index.html">V0.1.4</a></dd>
+      <dd><a href="../../../V0.1.5/kernel/locking/rwlock.html">V0.1.5</a></dd>
+      <dd><a href="../../../V0.1.6/kernel/locking/rwlock.html">V0.1.6</a></dd>
+      <dd><a href="../../../V0.1.7/kernel/locking/rwlock.html">V0.1.7</a></dd>
+      <dd><a href="../../../V0.1.8/kernel/locking/rwlock.html">V0.1.8</a></dd>
+      <dd><a href="../../../V0.1.9/kernel/locking/rwlock.html">V0.1.9</a></dd>
+      <dd><a href="../../../V0.2.0/kernel/locking/rwlock.html">V0.2.0</a></dd>
+      <dd><a href="../../../V0.3.0/kernel/locking/rwlock.html">V0.3.0</a></dd>
+      <dd><a href="../../../V0.4.0/kernel/locking/rwlock.html">V0.4.0</a></dd>
+    </dl>
+    <dl>
+      <dt>Branches</dt>
+      <dd><a href="../../../master/kernel/locking/rwlock.html">master</a></dd>
+    </dl>
+  </div>
+</div><script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script>  
+
+  <style>
+         .wy-nav-content { max-width: 90%; }
+  </style>
+
+
+
+</body>
+</html>

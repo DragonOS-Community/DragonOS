@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="zh-CN">
+<head>
+  <meta charset="utf-8" /><meta name="generator" content="Docutils 0.18.1: http://docutils.sourceforge.net/" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>gVisor 系统调用测试 &mdash; DragonOS dev 文档</title>
+      <link rel="stylesheet" type="text/css" href="../../_static/pygments.css" />
+      <link rel="stylesheet" type="text/css" href="../../_static/css/theme.css" />
+
+  
+  <!--[if lt IE 9]>
+    <script src="../../_static/js/html5shiv.min.js"></script>
+  <![endif]-->
+  
+        <script data-url_root="../../" id="documentation_options" src="../../_static/documentation_options.js"></script>
+        <script src="../../_static/jquery.js"></script>
+        <script src="../../_static/underscore.js"></script>
+        <script src="../../_static/_sphinx_javascript_frameworks_compat.js"></script>
+        <script src="../../_static/doctools.js"></script>
+        <script src="../../_static/translations.js"></script>
+    <script src="../../_static/js/theme.js"></script>
+    <link rel="index" title="索引" href="../../genindex.html" />
+    <link rel="search" title="搜索" href="../../search.html" />
+    <link rel="next" title="处理器架构" href="../cpu_arch/index.html" />
+    <link rel="prev" title="内核测试" href="index.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="../../index.html" class="icon icon-home">
+            DragonOS
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="../../search.html" method="get">
+    <input type="text" name="q" placeholder="搜索文档" aria-label="搜索文档" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="导航菜单">
+              <p class="caption" role="heading"><span class="caption-text">入门</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../introduction/index.html">DragonOS简介</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../introduction/build_system.html">构建DragonOS</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../introduction/mirrors.html">DragonOS镜像站</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">内核层</span></p>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../configuration/index.html">内核编译配置</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../boot/index.html">引导加载</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core_api/index.html">核心API文档</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">锁</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../process_management/index.html">进程管理模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sched/index.html">DragonOS调度</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ipc/index.html">进程间通信</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../memory_management/index.html">内存管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystem/index.html">文件系统</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../debug/index.html">内核调试模块</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">内核测试</a><ul class="current">
+<li class="toctree-l2 current"><a class="current reference internal" href="#">gVisor 系统调用测试</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#id1">概述</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#id2">自动测试</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#id3">手动测试</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#id4">测试机制</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#id5">白名单模式</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id6">黑名单过滤</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="#id7">更多详细信息</a></li>
+</ul>
+</li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu_arch/index.html">处理器架构</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../container/index.html">容器化</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../libs/index.html">其他内核库</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../net/index.html">网络子系统</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">内核跟踪机制</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../syscall/index.html">系统调用</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../device/index.html">Device</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">应用层</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../userland/appdev/index.html">应用程序开发文档</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Q&amp;A</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../questions/index.html">常见问题解答</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">DragonOS社区</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../community/code_contribution/index.html">参与开发</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../community/contact/index.html">与社区建立联系</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../community/ChangeLog/index.html">发行日志</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Translations</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../locales/en/index.html">English</a></li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="移动版导航菜单" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../../index.html">DragonOS</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="页面导航">
+  <ul class="wy-breadcrumbs">
+      <li><a href="../../index.html" class="icon icon-home" aria-label="Home"></a></li>
+          <li class="breadcrumb-item"><a href="index.html">内核测试</a></li>
+      <li class="breadcrumb-item active">gVisor 系统调用测试</li>
+      <li class="wy-breadcrumbs-aside">
+              <a href="https://github.com/DragonOS-Community/DragonOS/blob/ac64a32/docs/kernel/ktest/gvisor_syscall_test.rst" class="fa fa-github"> 在 GitHub 上编辑</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section id="gvisor">
+<h1>gVisor 系统调用测试<a class="headerlink" href="#gvisor" title="Permalink to this heading"></a></h1>
+<p>DragonOS 集成了 gVisor 系统调用测试套件，用于验证操作系统系统调用实现的兼容性和正确性。</p>
+<section id="id1">
+<h2>概述<a class="headerlink" href="#id1" title="Permalink to this heading"></a></h2>
+<p>gVisor 是 Google 开发的容器运行时沙箱，包含了大量的系统调用兼容性测试。这些测试用于验证操作系统的系统调用实现是否符合 Linux 标准。</p>
+<p>主要特性：</p>
+<ul class="simple">
+<li><p><strong>全面的测试覆盖</strong>：包含数百个系统调用测试用例</p></li>
+<li><p><strong>白名单机制</strong>：默认只运行已验证的测试，逐步完善支持</p></li>
+<li><p><strong>黑名单过滤</strong>：可针对每个测试程序屏蔽特定的测试用例</p></li>
+<li><p><strong>自动化运行</strong>：提供 Makefile 和脚本简化测试流程</p></li>
+</ul>
+</section>
+<section id="id2">
+<h2>自动测试<a class="headerlink" href="#id2" title="Permalink to this heading"></a></h2>
+<p>执行`make test-syscall`命令。该命令将启动DragonOS并自动执行gvisor syscall测试套件，测试完成后会退出qemu。同时根据测试用例成功率选择是成功返回还是失败返回，成功率不等于100%则失败返回。该命令的执行流程如下：</p>
+<ol class="arabic simple">
+<li><p>执行 <cite>toggle_compile_gvisor.sh enable</cite> 注释 <cite>app-blocklist.toml</cite> 中与 gvisor 测试套件相关的屏蔽配置</p></li>
+<li><p>编译DragonOS</p></li>
+<li><p>写入镜像</p></li>
+<li><p>后台qemu无图形模式启动DragonOS，同时设置环境变量`AUTO_TEST`（自动测试选项，目前仅支持syscall测试）和`SYSCALL_TEST_DIR`（测试套所在目录），这两个环境变量会通过命令行参数传递到DragonOS。然后当busybox init进程执行rcS脚本时，该脚本会通过`AUTO_TEST`选项执行对应的测试</p></li>
+<li><p>执行`monitor_test_results.sh`定时查看qemu串口输出内容，并根据测试结果选择成功返回还是失败返回</p></li>
+<li><p>执行 <cite>toggle_compile_gvisor.sh disable</cite> 取消 <cite>app-blocklist.toml</cite> 中相关配置的注释，恢复默认屏蔽状态</p></li>
+</ol>
+<p>对应的workflow配置文件为`test-x86.yml`</p>
+</section>
+<section id="id3">
+<h2>手动测试<a class="headerlink" href="#id3" title="Permalink to this heading"></a></h2>
+<ol class="arabic">
+<li><p>进入测试目录：</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">cd</span><span class="w"> </span>user/apps/tests/syscall/gvisor
+</pre></div>
+</div>
+</li>
+<li><p>在Linux运行白名单测试（自动下载测试套件）：</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>make<span class="w"> </span><span class="nb">test</span>
+</pre></div>
+</div>
+</li>
+<li><p>如果需要运行测试，可通过脚本快速修改配置：</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># 启用 gVisor 测试（注释 blocklist 配置）</span>
+bash<span class="w"> </span>user/apps/tests/syscall/gvisor/toggle_compile_gvisor.sh<span class="w"> </span><span class="nb">enable</span>
+
+<span class="c1"># 测试完成后恢复默认屏蔽</span>
+bash<span class="w"> </span>user/apps/tests/syscall/gvisor/toggle_compile_gvisor.sh<span class="w"> </span>disable
+</pre></div>
+</div>
+</li>
+<li><p>在 DragonOS 系统内运行测试：</p>
+<p>进入安装目录并运行测试程序：</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">cd</span><span class="w"> </span>/opt/tests/gvisor
+./gvisor-test-runner<span class="w"> </span>--help
+</pre></div>
+</div>
+<p>使用 <code class="docutils literal notranslate"><span class="pre">./gvisor-test-runner</span></code> 可以运行具体的测试用例。</p>
+</li>
+<li><p>查看详细文档：</p>
+<p>请参阅 <cite>user/apps/tests/syscall/gvisor/README.md</cite> 获取完整的使用说明。</p>
+</li>
+</ol>
+</section>
+<section id="id4">
+<h2>测试机制<a class="headerlink" href="#id4" title="Permalink to this heading"></a></h2>
+<section id="id5">
+<h3>白名单模式<a class="headerlink" href="#id5" title="Permalink to this heading"></a></h3>
+<p>测试框架默认启用白名单模式，只运行 <code class="docutils literal notranslate"><span class="pre">whitelist.txt</span></code> 中指定的测试程序。这允许逐步验证 DragonOS 的系统调用实现。</p>
+</section>
+<section id="id6">
+<h3>黑名单过滤<a class="headerlink" href="#id6" title="Permalink to this heading"></a></h3>
+<p>对于每个测试程序，可以通过 <code class="docutils literal notranslate"><span class="pre">blocklists/</span></code> 目录下的文件屏蔽特定的测试用例。这对于跳过暂不支持或不稳定的测试非常有用。</p>
+</section>
+</section>
+<section id="id7">
+<h2>更多详细信息<a class="headerlink" href="#id7" title="Permalink to this heading"></a></h2>
+<p>关于 gVisor 系统调用测试的详细使用方法、配置选项和开发指南，请查看测试目录下的 README.md 文档：</p>
+<ul class="simple">
+<li><p>文档位置：<cite>user/apps/tests/syscall/gvisor/README.md</cite></p></li>
+</ul>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="页脚">
+        <a href="index.html" class="btn btn-neutral float-left" title="内核测试" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> 上一页</a>
+        <a href="../cpu_arch/index.html" class="btn btn-neutral float-right" title="处理器架构" accesskey="n" rel="next">下一页 <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; 版权所有 2022-2025, DragonOS Community.
+      <span class="commit">版本 <code>ac64a32</code>.
+      </span></p>
+  </div>
+
+  利用 <a href="https://www.sphinx-doc.org/">Sphinx</a> 构建，使用的 
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">主题</a>
+    由 <a href="https://readthedocs.org">Read the Docs</a> 开发.
+  
+<div>
+    <br>
+    官网 <a href="https://dragonos.org">https://dragonos.org</a> | 论坛 <a href="https://bbs.dragonos.org.cn">https://bbs.dragonos.org.cn</a> |  <a href="https://dragonos.org">赞助DragonOS，成就未来！</a>
+</div>
+
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  
+<div class="rst-versions" data-toggle="rst-versions" role="note" aria-label="versions">
+  <span class="rst-current-version" data-toggle="rst-current-version">
+    <span class="fa fa-book"> Other Versions</span>
+    v: V0.4.0
+    <span class="fa fa-caret-down"></span>
+  </span>
+  <div class="rst-other-versions">
+    <dl>
+      <dt>Tags</dt>
+      <dd><a href="../../../V0.1.0/index.html">V0.1.0</a></dd>
+      <dd><a href="../../../V0.1.1/index.html">V0.1.1</a></dd>
+      <dd><a href="../../../V0.1.10/index.html">V0.1.10</a></dd>
+      <dd><a href="../../../V0.1.2/index.html">V0.1.2</a></dd>
+      <dd><a href="../../../V0.1.3/index.html">V0.1.3</a></dd>
+      <dd><a href="../../../V0.1.4/index.html">V0.1.4</a></dd>
+      <dd><a href="../../../V0.1.5/index.html">V0.1.5</a></dd>
+      <dd><a href="../../../V0.1.6/index.html">V0.1.6</a></dd>
+      <dd><a href="../../../V0.1.7/index.html">V0.1.7</a></dd>
+      <dd><a href="../../../V0.1.8/index.html">V0.1.8</a></dd>
+      <dd><a href="../../../V0.1.9/index.html">V0.1.9</a></dd>
+      <dd><a href="../../../V0.2.0/index.html">V0.2.0</a></dd>
+      <dd><a href="../../../V0.3.0/kernel/ktest/gvisor_syscall_test.html">V0.3.0</a></dd>
+      <dd><a href="gvisor_syscall_test.html">V0.4.0</a></dd>
+    </dl>
+    <dl>
+      <dt>Branches</dt>
+      <dd><a href="../../../master/kernel/ktest/gvisor_syscall_test.html">master</a></dd>
+    </dl>
+  </div>
+</div><script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script>  
+
+  <style>
+         .wy-nav-content { max-width: 90%; }
+  </style>
+
+
+
+</body>
+</html>

@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="zh-CN">
+<head>
+  <meta charset="utf-8" /><meta name="generator" content="Docutils 0.18.1: http://docutils.sourceforge.net/" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>内存分配指南 &mdash; DragonOS dev 文档</title>
+      <link rel="stylesheet" type="text/css" href="../../_static/pygments.css" />
+      <link rel="stylesheet" type="text/css" href="../../_static/css/theme.css" />
+
+  
+  <!--[if lt IE 9]>
+    <script src="../../_static/js/html5shiv.min.js"></script>
+  <![endif]-->
+  
+        <script data-url_root="../../" id="documentation_options" src="../../_static/documentation_options.js"></script>
+        <script src="../../_static/jquery.js"></script>
+        <script src="../../_static/underscore.js"></script>
+        <script src="../../_static/_sphinx_javascript_frameworks_compat.js"></script>
+        <script src="../../_static/doctools.js"></script>
+        <script src="../../_static/translations.js"></script>
+    <script src="../../_static/js/theme.js"></script>
+    <link rel="index" title="索引" href="../../genindex.html" />
+    <link rel="search" title="搜索" href="../../search.html" />
+    <link rel="next" title="MMIO" href="mmio.html" />
+    <link rel="prev" title="内存管理模块简介" href="intro.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="../../index.html" class="icon icon-home">
+            DragonOS
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="../../search.html" method="get">
+    <input type="text" name="q" placeholder="搜索文档" aria-label="搜索文档" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="导航菜单">
+              <p class="caption" role="heading"><span class="caption-text">入门</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../introduction/index.html">DragonOS简介</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../introduction/build_system.html">构建DragonOS</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../introduction/mirrors.html">DragonOS镜像站</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">内核层</span></p>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../configuration/index.html">内核编译配置</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../boot/index.html">引导加载</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core_api/index.html">核心API文档</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">锁</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../process_management/index.html">进程管理模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sched/index.html">DragonOS调度</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ipc/index.html">进程间通信</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">内存管理</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="intro.html">内存管理模块简介</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">内存分配指南</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#id2">1. 安全的分配内存</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#id3">2. 手动管理页帧</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#id4">3. 为用户程序分配内存</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="mmio.html">MMIO</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystem/index.html">文件系统</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../debug/index.html">内核调试模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ktest/index.html">内核测试</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu_arch/index.html">处理器架构</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../libs/index.html">其他内核库</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">应用层</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../userland/appdev/index.html">应用程序开发文档</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">系统调用api文档</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../syscall_api/index.html">系统调用API</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">DragonOS社区</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../community/code_contribution/index.html">参与开发</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../community/contact/index.html">与社区建立联系</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../community/ChangeLog/index.html">发行日志</a></li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="移动版导航菜单" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../../index.html">DragonOS</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="页面导航">
+  <ul class="wy-breadcrumbs">
+      <li><a href="../../index.html" class="icon icon-home" aria-label="Home"></a></li>
+          <li class="breadcrumb-item"><a href="index.html">内存管理</a></li>
+      <li class="breadcrumb-item active">内存分配指南</li>
+      <li class="wy-breadcrumbs-aside">
+              <a href="https://github.com/DragonOS-Community/DragonOS/blob/e3b8983/docs/kernel/memory_management/allocate-memory.md" class="fa fa-github"> 在 GitHub 上编辑</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section class="tex2jax_ignore mathjax_ignore" id="id1">
+<h1>内存分配指南<a class="headerlink" href="#id1" title="Permalink to this heading"></a></h1>
+<p>  本文将讲述如何在内核中进行内存分配。在开始之前，请您先了解一个基本点：DragonOS的内核使用4KB的页来管理内存，并且具有伙伴分配器和slab分配器。并且对用户空间、内核空间均具有特定的管理机制。</p>
+<section id="id2">
+<h2>1. 安全的分配内存<a class="headerlink" href="#id2" title="Permalink to this heading"></a></h2>
+<p>  在默认情况下，KernelAllocator被绑定为全局内存分配器，它会根据请求分配的内存大小，自动选择使用slab还是伙伴分配器。因此，在内核中，使用Rust原生的
+内存分配函数，或者是创建一个<code class="docutils literal notranslate"><span class="pre">Box</span></code>对象等等，都是安全的。</p>
+</section>
+<section id="id3">
+<h2>2. 手动管理页帧<a class="headerlink" href="#id3" title="Permalink to this heading"></a></h2>
+<div class="admonition warning">
+<p class="admonition-title">警告</p>
+<p><strong>请格外小心！</strong> 手动管理页帧脱离了Rust的内存安全机制，因此可能会造成内存泄漏或者是内存错误。</p>
+</div>
+<p>  在某些情况下，我们需要手动分配页帧。例如，我们需要在内核中创建一个新的页表，或者是在内核中创建一个新的地址空间。这时候，我们需要手动分配页帧。使用<code class="docutils literal notranslate"><span class="pre">LockedFrameAllocator</span></code>的<code class="docutils literal notranslate"><span class="pre">allocate()</span></code>函数，能够分配在物理地址上连续的页帧。请注意，由于底层使用的是buddy分配器，因此页帧数目必须是2的n次幂，且最大大小不超过1GB。</p>
+<p>  当需要释放页帧的时候，使用<code class="docutils literal notranslate"><span class="pre">LockedFrameAllocator</span></code>的<code class="docutils literal notranslate"><span class="pre">deallocate()</span></code>函数，或者是<code class="docutils literal notranslate"><span class="pre">deallocate_page_frames()</span></code>函数，能够释放在物理地址上连续的页帧。</p>
+<p>  当您需要映射页帧的时候，可使用<code class="docutils literal notranslate"><span class="pre">KernelMapper::lock()</span></code>函数，获得一个内核映射器对象，然后进行映射。由于KernelMapper是对PageMapper的封装，因此您在获取KernelMapper之后，可以使用PageMapper相关接口对内核空间的映射进行管理。</p>
+<div class="admonition warning">
+<p class="admonition-title">警告</p>
+<p><strong>千万不要</strong> 使用KernelMapper去映射用户地址空间的内存，这会使得这部分内存脱离用户地址空间的管理，从而导致内存错误。</p>
+</div>
+</section>
+<section id="id4">
+<h2>3. 为用户程序分配内存<a class="headerlink" href="#id4" title="Permalink to this heading"></a></h2>
+<p>  在内核中，您可以使用用户地址空间结构体(<code class="docutils literal notranslate"><span class="pre">AddressSpace</span></code>)的<code class="docutils literal notranslate"><span class="pre">mmap()</span></code>,<code class="docutils literal notranslate"><span class="pre">map_anonymous()</span></code>等函数，为用户程序分配内存。这些函数会自动将用户程序的内存映射到用户地址空间中，并且会自动创建VMA结构体。您可以使用<code class="docutils literal notranslate"><span class="pre">AddressSpace</span></code>的<code class="docutils literal notranslate"><span class="pre">munmap()</span></code>函数，将用户程序的内存从用户地址空间中解除映射，并且销毁VMA结构体。调整权限等操作可以使用<code class="docutils literal notranslate"><span class="pre">AddressSpace</span></code>的<code class="docutils literal notranslate"><span class="pre">mprotect()</span></code>函数。</p>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="页脚">
+        <a href="intro.html" class="btn btn-neutral float-left" title="内存管理模块简介" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> 上一页</a>
+        <a href="mmio.html" class="btn btn-neutral float-right" title="MMIO" accesskey="n" rel="next">下一页 <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; 版权所有 2022-2025, DragonOS Community.
+      <span class="commit">版本 <code>e3b8983</code>.
+      </span></p>
+  </div>
+
+  利用 <a href="https://www.sphinx-doc.org/">Sphinx</a> 构建，使用的 
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">主题</a>
+    由 <a href="https://readthedocs.org">Read the Docs</a> 开发.
+  
+<div>
+    <br>
+    官网 <a href="https://dragonos.org">https://dragonos.org</a> | 论坛 <a href="https://bbs.dragonos.org.cn">https://bbs.dragonos.org.cn</a> |  <a href="https://dragonos.org">赞助DragonOS，成就未来！</a>
+</div>
+
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  
+<div class="rst-versions" data-toggle="rst-versions" role="note" aria-label="versions">
+  <span class="rst-current-version" data-toggle="rst-current-version">
+    <span class="fa fa-book"> Other Versions</span>
+    v: V0.1.9
+    <span class="fa fa-caret-down"></span>
+  </span>
+  <div class="rst-other-versions">
+    <dl>
+      <dt>Tags</dt>
+      <dd><a href="../../../V0.1.0/index.html">V0.1.0</a></dd>
+      <dd><a href="../../../V0.1.1/index.html">V0.1.1</a></dd>
+      <dd><a href="../../../V0.1.10/kernel/memory_management/allocate-memory.html">V0.1.10</a></dd>
+      <dd><a href="../../../V0.1.2/index.html">V0.1.2</a></dd>
+      <dd><a href="../../../V0.1.3/index.html">V0.1.3</a></dd>
+      <dd><a href="../../../V0.1.4/index.html">V0.1.4</a></dd>
+      <dd><a href="../../../V0.1.5/index.html">V0.1.5</a></dd>
+      <dd><a href="../../../V0.1.6/index.html">V0.1.6</a></dd>
+      <dd><a href="../../../V0.1.7/index.html">V0.1.7</a></dd>
+      <dd><a href="../../../V0.1.8/kernel/memory_management/allocate-memory.html">V0.1.8</a></dd>
+      <dd><a href="allocate-memory.html">V0.1.9</a></dd>
+      <dd><a href="../../../V0.2.0/kernel/memory_management/allocate-memory.html">V0.2.0</a></dd>
+      <dd><a href="../../../V0.3.0/kernel/memory_management/allocate-memory.html">V0.3.0</a></dd>
+      <dd><a href="../../../V0.4.0/kernel/memory_management/allocate-memory.html">V0.4.0</a></dd>
+    </dl>
+    <dl>
+      <dt>Branches</dt>
+      <dd><a href="../../../master/kernel/memory_management/allocate-memory.html">master</a></dd>
+    </dl>
+  </div>
+</div><script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script>  
+
+  <style>
+         .wy-nav-content { max-width: 90%; }
+  </style>
+
+
+
+</body>
+</html>

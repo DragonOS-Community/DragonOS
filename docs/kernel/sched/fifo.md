@@ -1,20 +1,20 @@
-# FIFO调度器
+# FIFO Scheduler
 
-&emsp;&emsp; FIFO（First-In-First-Out）调度器是DragonOS中实现的一种实时调度策略。FIFO调度器采用先进先出的调度算法，为实时任务提供确定性的调度行为。
+ The FIFO (First-In-First-Out) scheduler is a real-time scheduling policy implemented in DragonOS. The FIFO scheduler adopts an advanced-first-out scheduling algorithm to provide deterministic scheduling behavior for real-time tasks.
 
-## 1. 设计概述
+## 1. Design Overview
 
-&emsp;&emsp; FIFO调度器是为实时任务设计的，其核心特点是：
+ The FIFO scheduler is designed for real-time tasks, with the following core characteristics:
 
-1. **无时间片机制**：FIFO任务一旦获得CPU，将一直运行直到主动释放CPU或被更高优先级的任务抢占
-2. **优先级调度**：支持0-99共100个优先级，数字越小优先级越高
-3. **同优先级FIFO**：相同优先级的任务严格按照入队顺序执行
+1. **No time slice mechanism**: Once a FIFO task obtains the CPU, it will run continuously until it voluntarily releases the CPU or is preempted by a higher-priority task.
+2. **Priority scheduling**: Supports 100 priorities from 0 to 99, where a smaller number indicates a higher priority.
+3. **Same-priority FIFO**: Tasks with the same priority are executed strictly in the order they enter the queue.
 
-## 2. 数据结构
+## 2. Data Structures
 
 ### 2.1 FifoRunQueue
 
-&emsp;&emsp; `FifoRunQueue`是FIFO调度器的运行队列，每个CPU维护一个实例。
+ `FifoRunQueue` is the run queue of the FIFO scheduler, with one instance maintained per CPU.
 
 ```rust
 pub struct FifoRunQueue {
@@ -24,66 +24,66 @@ pub struct FifoRunQueue {
 }
 ```
 
-**设计要点：**
+**Design Highlights:**
 
-- **多级队列**：使用100个`VecDeque`分别存储不同优先级的进程
-- **位图优化**：`active`字段使用128位位图记录哪些优先级队列非空，通过`trailing_zeros()`指令快速定位最高优先级
-- **O(1)选择**：利用位图和双端队列，`pick_next()`操作达到O(1)时间复杂度
+- **Multi-level queues**: Uses 100 `VecDeque` to store processes of different priorities separately.
+- **Bitmap optimization**: The `active` field uses a 128-bit bitmap to record which priority queues are non-empty, quickly locating the highest priority through the `trailing_zeros()` instruction.
+- **O(1) selection**: Utilizes the bitmap and deque to achieve O(1) time complexity for the `pick_next()` operation.
 
 ### 2.2 FifoScheduler
 
-&emsp;&emsp; `FifoScheduler`实现了`Scheduler` trait，提供FIFO调度策略的核心逻辑。
+ `FifoScheduler` implements the `Scheduler` trait, providing the core logic of the FIFO scheduling policy.
 
-## 3. 已实现功能
+## 3. Implemented Features
 
-### 3.1 基础调度操作
+### 3.1 Basic Scheduling Operations
 
-| 函数 | 功能 | 实现状态 |
-|------|------|----------|
-| `enqueue()` | 将进程加入调度队列 | ✅ 已实现 |
-| `dequeue()` | 将进程从调度队列移除 | ✅ 已实现 |
-| `pick_next_task()` | 选择下一个要执行的进程 | ✅ 已实现 |
-| `yield_task()` | 当前进程主动让出CPU | ✅ 已实现 |
+| Function | Functionality | Implementation Status |
+|----------|---------------|-----------------------|
+| `enqueue()` | Add a process to the scheduling queue | ✅ Implemented |
+| `dequeue()` | Remove a process from the scheduling queue | ✅ Implemented |
+| `pick_next_task()` | Select the next process to execute | ✅ Implemented |
+| `yield_task()` | Current process voluntarily yields the CPU | ✅ Implemented |
 
-### 3.2 抢占机制
+### 3.2 Preemption Mechanism
 
-**check_preempt_current()**：当有新进程被唤醒时，检查是否需要抢占当前进程
-- 如果新进程优先级更高，触发抢占
-- 支持实时任务与普通任务之间的抢占
+**check_preempt_current()**: When a new process is awakened, checks whether the current process needs to be preempted.
+- If the new process has a higher priority, preemption is triggered.
+- Supports preemption between real-time tasks and normal tasks.
 
-**tick()**：时钟中断处理
-- 检查是否有更高优先级的任务进入队列
-- 如有则触发重新调度
+**tick()**: Clock interrupt handling.
+- Checks whether a higher-priority task has entered the queue.
+- If so, triggers rescheduling.
 
-### 3.3 调度优先级
+### 3.3 Scheduling Priority
 
-FIFO调度器使用与Linux兼容的优先级范围：
+The FIFO scheduler uses a priority range compatible with Linux:
 
 ```rust
 pub const MAX_RT_PRIO: i32 = 100;  // 实时优先级范围 0-99
 ```
 
-- 优先级0：最高优先级
-- 优先级99：最低实时优先级
-- 优先级>=100：普通进程（CFS调度）
+- Priority 0: Highest priority.
+- Priority 99: Lowest real-time priority.
+- Priority >=100: Normal processes (CFS scheduling).
 
-### 3.4 策略切换
+### 3.4 Policy Switching
 
-通过`ProcessManager::set_fifo_policy()`接口，支持运行时将内核线程切换为FIFO调度策略：
+Through the `ProcessManager::set_fifo_policy()` interface, supports switching kernel threads to the FIFO scheduling policy at runtime:
 
 ```rust
 pub fn set_fifo_policy(pcb: &Arc<ProcessControlBlock>, prio: i32) -> Result<(), SystemError>
 ```
 
-该函数会：
-1. 验证进程必须是内核线程（KTHREAD标志）
-2. 验证优先级在有效范围内（0-99）
-3. 处理进程在运行队列中的状态变更
-4. 触发抢占检查
+This function will:
+1. Verify that the process must be a kernel thread (KTHREAD flag).
+2. Verify that the priority is within the valid range (0-99).
+3. Handle the state change of the process in the run queue.
+4. Trigger preemption checks.
 
-## 4. 调度流程
+## 4. Scheduling Process
 
-### 4.1 进程入队
+### 4.1 Process Enqueue
 
 ```
 enqueue()
@@ -97,7 +97,7 @@ enqueue()
 nr_running++
 ```
 
-### 4.2 选择下一进程
+### 4.2 Selecting the Next Process
 
 ```
 pick_next_task()
@@ -107,7 +107,7 @@ pick_next_task()
 返回该优先级队列队首进程
 ```
 
-### 4.3 抢占判断
+### 4.3 Preemption Judgment
 
 ```
 新进程唤醒 / 时钟中断
@@ -119,41 +119,40 @@ if (新进程优先级 < 当前进程优先级):  // 数字越小优先级越高
 设置重调度标志
 ```
 
-## 5. Demo功能
+## 5. Demo Functionality
 
-&emsp;&emsp; 通过`fifo_demo` feature可以启用演示功能（`kernel/src/sched/fifo_demo.rs`），该功能创建一个FIFO调度的内核线程：
+ The demo functionality can be enabled through the `fifo_demo` feature (`kernel/src/sched/fifo_demo.rs`), which creates a FIFO-scheduled kernel thread:
+- Sets CPU affinity to Core 0.
+- Sets the FIFO scheduling policy with priority 50.
+- Outputs a log every 5 seconds.
 
-- 设置CPU亲和性为Core 0
-- 设置FIFO调度策略，优先级50
-- 每5秒输出一次日志
-
-启用方式：在`Cargo.toml`中添加feature并调用`fifo_demo_init()`
+Enabling method: Add the feature in `Cargo.toml` and call `fifo_demo_init()`.
 
 ## 6. TODO
 
-### 6.1 多核支持
+### 6.1 Multi-core Support
 
-- [ ] 实现多CPU之间的FIFO任务负载均衡
-- [ ] 支持任务的CPU亲和性设置与迁移
+- [ ] Implement FIFO task load balancing among multiple CPUs.
+- [ ] Support setting and migrating CPU affinity for tasks.
 
-### 6.2 调度增强
+### 6.2 Scheduling Enhancements
 
-- [ ] 实现SCHED_RR（时间片轮转）调度策略
-- [ ] 支持动态优先级调整
-- [ ] 添加调度延迟统计和监控
+- [ ] Implement the SCHED_RR (time-slice round-robin) scheduling policy.
+- [ ] Support dynamic priority adjustment.
+- [ ] Add scheduling latency statistics and monitoring.
 
-### 6.3 实时性保障
+### 6.3 Real-time Guarantees
 
-- [ ] 实现实时任务带宽限制
-- [ ] 添加优先级继承机制（防止优先级反转）
-- [ ] 支持EDF（最早截止时间优先）调度策略
+- [ ] Implement real-time task bandwidth limits.
+- [ ] Add priority inheritance mechanism (to prevent priority inversion).
+- [ ] Support EDF (Earliest Deadline First) scheduling policy.
 
-### 6.4 用户态接口
+### 6.4 User-space Interface
 
-- [ ] 实现`sched_setscheduler`系统调用
+- [ ] Implement the `sched_setscheduler` system call.
 
-### 6.5 优化与调试
+### 6.5 Optimization and Debugging
 
-- [ ] 添加FIFO调度器的调试信息输出
-- [ ] 实现调度延迟监控接口
-- [ ] 优化位图操作，支持更多优先级级数
+- [ ] Add debugging information output for the FIFO scheduler.
+- [ ] Implement a scheduling latency monitoring interface.
+- [ ] Optimize bitmap operations to support more priority levels.

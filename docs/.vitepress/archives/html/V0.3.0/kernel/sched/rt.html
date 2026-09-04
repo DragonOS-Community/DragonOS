@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="zh-CN">
+<head>
+  <meta charset="utf-8" /><meta name="generator" content="Docutils 0.18.1: http://docutils.sourceforge.net/" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>实时进程调度器相关的api &mdash; DragonOS dev 文档</title>
+      <link rel="stylesheet" type="text/css" href="../../_static/pygments.css" />
+      <link rel="stylesheet" type="text/css" href="../../_static/css/theme.css" />
+
+  
+  <!--[if lt IE 9]>
+    <script src="../../_static/js/html5shiv.min.js"></script>
+  <![endif]-->
+  
+        <script data-url_root="../../" id="documentation_options" src="../../_static/documentation_options.js"></script>
+        <script src="../../_static/jquery.js"></script>
+        <script src="../../_static/underscore.js"></script>
+        <script src="../../_static/_sphinx_javascript_frameworks_compat.js"></script>
+        <script src="../../_static/doctools.js"></script>
+        <script src="../../_static/translations.js"></script>
+    <script src="../../_static/js/theme.js"></script>
+    <link rel="index" title="索引" href="../../genindex.html" />
+    <link rel="search" title="搜索" href="../../search.html" />
+    <link rel="next" title="内核定时器" href="kernel_timer.html" />
+    <link rel="prev" title="完全公平调度器相关的api" href="cfs.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="../../index.html" class="icon icon-home">
+            DragonOS
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="../../search.html" method="get">
+    <input type="text" name="q" placeholder="搜索文档" aria-label="搜索文档" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="导航菜单">
+              <p class="caption" role="heading"><span class="caption-text">入门</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../introduction/index.html">DragonOS简介</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../introduction/build_system.html">构建DragonOS</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../introduction/mirrors.html">DragonOS镜像站</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">内核层</span></p>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../configuration/index.html">内核编译配置</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../boot/index.html">引导加载</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core_api/index.html">核心API文档</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">锁</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../process_management/index.html">进程管理模块</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">DragonOS调度</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="c_waiting.html">与“等待”相关的api（C语言）</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rust_waiting.html">与“等待”相关的api（rust语言）</a></li>
+<li class="toctree-l2"><a class="reference internal" href="core.html">进程调度器相关的api</a></li>
+<li class="toctree-l2"><a class="reference internal" href="cfs.html">完全公平调度器相关的api</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">实时进程调度器相关的api</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#rtqueue">1. RTQueue 介绍</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#id1">1.1 主要函数</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="#schedulerrt">2. SchedulerRT 介绍</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#id2">2.1 主要函数</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id3">2.2 内核调度策略</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="#q-a">3. Q&amp;A</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="kernel_timer.html">内核定时器</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../ipc/index.html">进程间通信</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../memory_management/index.html">内存管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystem/index.html">文件系统</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../debug/index.html">内核调试模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ktest/index.html">内核测试</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu_arch/index.html">处理器架构</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../container/index.html">容器化</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../libs/index.html">其他内核库</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../net/index.html">网络子系统</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">内核跟踪机制</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../syscall/index.html">系统调用</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">应用层</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../userland/appdev/index.html">应用程序开发文档</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Q&amp;A</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../questions/index.html">常见问题解答</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">DragonOS社区</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../community/code_contribution/index.html">参与开发</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../community/contact/index.html">与社区建立联系</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../community/ChangeLog/index.html">发行日志</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Translations</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../locales/en/index.html">English</a></li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="移动版导航菜单" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../../index.html">DragonOS</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="页面导航">
+  <ul class="wy-breadcrumbs">
+      <li><a href="../../index.html" class="icon icon-home" aria-label="Home"></a></li>
+          <li class="breadcrumb-item"><a href="index.html">DragonOS调度</a></li>
+      <li class="breadcrumb-item active">实时进程调度器相关的api</li>
+      <li class="wy-breadcrumbs-aside">
+              <a href="https://github.com/DragonOS-Community/DragonOS/blob/1c53c97/docs/kernel/sched/rt.md" class="fa fa-github"> 在 GitHub 上编辑</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section class="tex2jax_ignore mathjax_ignore" id="api">
+<h1>实时进程调度器相关的api<a class="headerlink" href="#api" title="Permalink to this heading"></a></h1>
+<p>   RT（realtime scheduler），实时调度器。实时调度是为了完成实时处理任务而分配CPU的调度方法。</p>
+<p>  DragonOS的进程分为“实时进程”和“普通进程”两类；实时进程的优先级高于普通进程，如果当前的系统的执行队列中有“实时进程”，RT调度器会优先选择实时进程；如果队列中会有多个实时进程，调度器会选择优先级最高的实时进程来执行；</p>
+<section id="rtqueue">
+<h2>1. RTQueue 介绍<a class="headerlink" href="#rtqueue" title="Permalink to this heading"></a></h2>
+<p>   RTQueue是用来存放state为running的实时进程的调度队列，每个CPU维护一个RTQueue，主要使用Vec作为主要存储结构来实现。</p>
+<section id="id1">
+<h3>1.1 主要函数<a class="headerlink" href="#id1" title="Permalink to this heading"></a></h3>
+<ol class="arabic simple">
+<li><p>enqueue(): 将pcb入队列</p></li>
+<li><p>dequeue(): 将pcb出队列</p></li>
+</ol>
+</section>
+</section>
+<section id="schedulerrt">
+<h2>2. SchedulerRT 介绍<a class="headerlink" href="#schedulerrt" title="Permalink to this heading"></a></h2>
+<p>   RT调度器类，主要实现了RT调度器类的初始化以及调度功能函数。</p>
+<section id="id2">
+<h3>2.1 主要函数<a class="headerlink" href="#id2" title="Permalink to this heading"></a></h3>
+<ol class="arabic simple">
+<li><p>pick_next_task_rt(): 获取当前CPU中的第一个需要执行的RT pcb</p></li>
+<li><p>sched(): 是对于Scheduler trait的sched()实现，是实时进程进行调度时的逻辑处理，该函数会返回接下来要执行的pcb，若没有符合要求的pcb，返回None</p></li>
+<li><p>enqueue(): 同样是对于Scheduler trait的sched()实现，将一个pcb加入调度器的调度队列</p></li>
+</ol>
+</section>
+<section id="id3">
+<h3>2.2 内核调度策略<a class="headerlink" href="#id3" title="Permalink to this heading"></a></h3>
+<p>   目前在DragonOS中，主要的调度策略有SCHED_NORMAL 策略 | SCHED_FIFO 策略 | SCHED_RT 策略，具体的调度策略为：</p>
+<ol class="arabic simple">
+<li><p>SCHED_NORMAL 策略：
+SCHED_NORMAL 是“绝对公平调度策略”，该策略的进程使用CFS进行调度。</p></li>
+<li><p>SCHED_FIFO 策略：
+SCHED_FIFO是“实时进程调度策略”，这是一种先进先出的调度策略，该策略不涉及到CPU时间片机制，在没有更高优先级进程的前提下，只能等待其他进程主动释放CPU资源；
+在SCHED_FIFO策略中，被调度器调度运行的进程，其运行时长不受限制，可以运行任意长的时间。</p></li>
+<li><p>SCHED_RR 策略：
+SCHED_RR是“实时进程调度策略”，使用的是时间片轮转机制，对应进程的time_slice会在运行时减少，进程使用完CPU时间片后，会加入该CPU的与该进程优先级相同的执行队列中。
+同时，释放CPU资源，CPU的使用权会被分配给下一个执行的进程</p></li>
+</ol>
+</section>
+</section>
+<section id="q-a">
+<h2>3. Q&amp;A<a class="headerlink" href="#q-a" title="Permalink to this heading"></a></h2>
+<p>   几种常用的方法</p>
+<ol class="arabic">
+<li><p>如何创建实时进程</p>
+<div class="highlight-c notranslate"><div class="highlight"><pre><span></span><span class="k">struct</span><span class="w"> </span><span class="nc">process_control_block</span><span class="w"> </span><span class="o">*</span><span class="n">pcb_name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">kthread_run_rt</span><span class="p">(</span><span class="o">&amp;</span><span class="n">fn_name</span><span class="p">,</span><span class="w"> </span><span class="nb">NULL</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;test create rt pcb&quot;</span><span class="p">);</span>
+</pre></div>
+</div>
+<p>其中kthread_run_rt，是创建内核实时线程的宏</p>
+</li>
+<li><p>pcb中涉及到实时进程的字段含义</p>
+<ol class="arabic simple">
+<li><p>policy：实时进程的策略，目前有：SCHED_FIFO与SCHED_RR</p></li>
+<li><p>priority: 实时进程的优先级，范围为0-99，数字越大，表示优先级越高</p></li>
+<li><p>rt_time_slice: 实时进程的时间片，默认为100，随着CPU运行而减少，在rt_time_slice为0时，将时间片赋初值并将该进程加入执行队列。</p></li>
+</ol>
+</li>
+<li><p>如何实时进程存储队列</p>
+<ul class="simple">
+<li><p>目前是使用Vec来保存，因为具体实现的逻辑原因，目前的入队列和出队列都是对队尾的操作，因此会有如下现象：系统中有多个优先级相同的实时进程等待运行时，会出现饥饿现象，也即上一个因为时间片耗尽的进程会在下一个执行，造成同优先级等待的进程饥饿。</p></li>
+</ul>
+</li>
+<li><p>todo</p>
+<ol class="arabic simple">
+<li><p>将存储实时进程的队列使用双向链表存储（或者其他办法解决上述的饥饿问题）</p></li>
+<li><p>目前的实时调度是针对单CPU的，需要实现多CPU的实时调度</p></li>
+<li><p>实现RT进程和普通进程之间的分配带宽的比例</p></li>
+<li><p>多个CPU之间实现负载均衡</p></li>
+</ol>
+</li>
+</ol>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="页脚">
+        <a href="cfs.html" class="btn btn-neutral float-left" title="完全公平调度器相关的api" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> 上一页</a>
+        <a href="kernel_timer.html" class="btn btn-neutral float-right" title="内核定时器" accesskey="n" rel="next">下一页 <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; 版权所有 2022-2025, DragonOS Community.
+      <span class="commit">版本 <code>1c53c97</code>.
+      </span></p>
+  </div>
+
+  利用 <a href="https://www.sphinx-doc.org/">Sphinx</a> 构建，使用的 
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">主题</a>
+    由 <a href="https://readthedocs.org">Read the Docs</a> 开发.
+  
+<div>
+    <br>
+    官网 <a href="https://dragonos.org">https://dragonos.org</a> | 论坛 <a href="https://bbs.dragonos.org.cn">https://bbs.dragonos.org.cn</a> |  <a href="https://dragonos.org">赞助DragonOS，成就未来！</a>
+</div>
+
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  
+<div class="rst-versions" data-toggle="rst-versions" role="note" aria-label="versions">
+  <span class="rst-current-version" data-toggle="rst-current-version">
+    <span class="fa fa-book"> Other Versions</span>
+    v: V0.3.0
+    <span class="fa fa-caret-down"></span>
+  </span>
+  <div class="rst-other-versions">
+    <dl>
+      <dt>Tags</dt>
+      <dd><a href="../../../V0.1.0/index.html">V0.1.0</a></dd>
+      <dd><a href="../../../V0.1.1/index.html">V0.1.1</a></dd>
+      <dd><a href="../../../V0.1.10/kernel/sched/rt.html">V0.1.10</a></dd>
+      <dd><a href="../../../V0.1.2/index.html">V0.1.2</a></dd>
+      <dd><a href="../../../V0.1.3/index.html">V0.1.3</a></dd>
+      <dd><a href="../../../V0.1.4/index.html">V0.1.4</a></dd>
+      <dd><a href="../../../V0.1.5/kernel/sched/rt.html">V0.1.5</a></dd>
+      <dd><a href="../../../V0.1.6/kernel/sched/rt.html">V0.1.6</a></dd>
+      <dd><a href="../../../V0.1.7/kernel/sched/rt.html">V0.1.7</a></dd>
+      <dd><a href="../../../V0.1.8/kernel/sched/rt.html">V0.1.8</a></dd>
+      <dd><a href="../../../V0.1.9/kernel/sched/rt.html">V0.1.9</a></dd>
+      <dd><a href="../../../V0.2.0/kernel/sched/rt.html">V0.2.0</a></dd>
+      <dd><a href="rt.html">V0.3.0</a></dd>
+      <dd><a href="../../../V0.4.0/kernel/sched/rt.html">V0.4.0</a></dd>
+    </dl>
+    <dl>
+      <dt>Branches</dt>
+      <dd><a href="../../../master/kernel/sched/rt.html">master</a></dd>
+    </dl>
+  </div>
+</div><script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script>  
+
+  <style>
+         .wy-nav-content { max-width: 90%; }
+  </style>
+
+
+
+</body>
+</html>

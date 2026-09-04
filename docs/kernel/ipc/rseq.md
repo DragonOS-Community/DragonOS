@@ -1,29 +1,29 @@
-# Restartable Sequences (rseq) 机制
+# Restartable Sequences (rseq) Mechanism
 
-## 1. 概述
+## 1. Overview
 
-Restartable Sequences（rseq，可重启序列）是一种用户态与内核协作的机制，用于实现高效的 per-CPU 数据访问。它允许用户态程序在不使用传统同步原语（如锁或原子操作）的情况下，安全地访问和修改 per-CPU 数据结构。
+Restartable Sequences (rseq, restartable sequences) is a user-space and kernel collaborative mechanism designed for efficient per-CPU data access. It allows user-space programs to safely access and modify per-CPU data structures without using traditional synchronization primitives such as locks or atomic operations.
 
-### 1.1 设计目标
+### 1.1 Design Goals
 
-rseq 的核心目标是提供一种**乐观并发**机制：
+The core objective of rseq is to provide an **optimistic concurrency** mechanism:
 
-- 用户态代码可以假设自己不会被打断，直接操作 per-CPU 数据
-- 如果确实被打断（抢占、信号等），内核负责将执行重定向到恢复路径
-- 这种"要么完整执行，要么从头开始"的语义，避免了传统锁的开销
+- User-space code can assume it won't be interrupted and directly operate on per-CPU data
+- If interruption does occur (preemption, signals, etc.), the kernel redirects execution to a recovery path
+- This "either complete execution or start over" semantics avoids the overhead of traditional locks
 
-### 1.2 典型应用场景
+### 1.2 Typical Use Cases
 
-- **内存分配器**：tcmalloc、jemalloc 等使用 per-CPU 缓存加速分配
-- **引用计数**：per-CPU 引用计数可避免缓存行争用
-- **统计计数器**：per-CPU 计数器的无锁更新
-- **RCU 读侧临界区**：快速获取当前 CPU 信息
+- **Memory allocators**: tcmalloc, jemalloc, etc., use per-CPU caches to accelerate allocation
+- **Reference counting**: per-CPU reference counts can avoid cache line contention
+- **Statistical counters**: lock-free updates of per-CPU counters
+- **RCU read-side critical sections**: quickly obtaining current CPU information
 
-## 2. 核心概念
+## 2. Core Concepts
 
-### 2.1 临界区（Critical Section）
+### 2.1 Critical Section
 
-rseq 临界区是一段用户态代码，具有以下特征：
+An rseq critical section is a segment of user-space code with the following characteristics:
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -44,38 +44,38 @@ rseq 临界区是一段用户态代码，具有以下特征：
 └─────────────────────────────────────────────────────────────┘
 ```
 
-- **start_ip**：临界区起始地址
-- **post_commit_offset**：从 start_ip 到提交点的偏移量
-- **abort_ip**：中断恢复地址，必须位于临界区外
+- **start_ip**: Starting address of the critical section
+- **post_commit_offset**: Offset from start_ip to the commit point
+- **abort_ip**: Interruption recovery address, must be located outside the critical section
 
-### 2.2 用户态数据结构
+### 2.2 User-space Data Structure
 
-用户态需要在 TLS（线程本地存储）中维护一个 `struct rseq` 结构：
+User-space needs to maintain a `struct rseq` structure in TLS (Thread Local Storage):
 
-| 字段 | 大小 | 说明 |
-|------|------|------|
-| cpu_id_start | u32 | 进入临界区时的 CPU ID |
-| cpu_id | u32 | 当前 CPU ID（内核更新） |
-| rseq_cs | u64 | 指向当前临界区描述符的指针 |
-| flags | u32 | 标志位（保留） |
-| node_id | u32 | NUMA 节点 ID |
-| mm_cid | u32 | 内存管理上下文 ID |
+| Field | Size | Description |
+|-------|------|-------------|
+| cpu_id_start | u32 | CPU ID when entering the critical section |
+| cpu_id | u32 | Current CPU ID (updated by kernel) |
+| rseq_cs | u64 | Pointer to the current critical section descriptor |
+| flags | u32 | Flag bits (reserved) |
+| node_id | u32 | NUMA node ID |
+| mm_cid | u32 | Memory management context ID |
 
-### 2.3 临界区描述符
+### 2.3 Critical Section Descriptor
 
-`struct rseq_cs` 描述一个具体的临界区：
+`struct rseq_cs` describes a specific critical section:
 
-| 字段 | 大小 | 说明 |
-|------|------|------|
-| version | u32 | 版本号，必须为 0 |
-| flags | u32 | 标志位 |
-| start_ip | u64 | 临界区起始地址 |
-| post_commit_offset | u64 | 临界区长度 |
-| abort_ip | u64 | 中断恢复地址 |
+| Field | Size | Description |
+|-------|------|-------------|
+| version | u32 | Version number, must be 0 |
+| flags | u32 | Flag bits |
+| start_ip | u64 | Starting address of the critical section |
+| post_commit_offset | u64 | Length of the critical section |
+| abort_ip | u64 | Interruption recovery address |
 
-## 3. 工作原理
+## 3. Working Principle
 
-### 3.1 注册流程
+### 3.1 Registration Process
 
 ```
 用户态                                    内核态
@@ -91,18 +91,18 @@ rseq 临界区是一段用户态代码，具有以下特征：
   │                                         │
 ```
 
-### 3.2 临界区执行
+### 3.2 Critical Section Execution
 
-正常执行时，用户态代码：
+During normal execution, user-space code:
 
-1. 将临界区描述符地址写入 `rseq->rseq_cs`
-2. 读取 `rseq->cpu_id` 获取当前 CPU
-3. 使用该 CPU ID 访问 per-CPU 数据
-4. 完成操作后，清除 `rseq->rseq_cs`
+1. Writes the address of the critical section descriptor to `rseq->rseq_cs`
+2. Reads `rseq->cpu_id` to obtain the current CPU
+3. Uses this CPU ID to access per-CPU data
+4. After completing operations, clears `rseq->rseq_cs`
 
-### 3.3 内核干预时机
+### 3.3 Kernel Intervention Timing
 
-内核在以下事件发生后，返回用户态前进行检查和修正：
+The kernel checks and corrects before returning to user-space after the following events:
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
@@ -119,9 +119,9 @@ rseq 临界区是一段用户态代码，具有以下特征：
 └──────────────────────────────────────────────────────────────┘
 ```
 
-### 3.4 返回用户态前的处理
+### 3.4 Pre-return-to-user-space Processing
 
-当进程即将返回用户态时，内核执行以下步骤：
+When the process is about to return to user-space, the kernel performs the following steps:
 
 ```
                     返回用户态前处理流程
@@ -169,49 +169,49 @@ rseq 临界区是一段用户态代码，具有以下特征：
                       返回用户态
 ```
 
-## 4. 安全机制
+## 4. Safety Mechanisms
 
-### 4.1 签名验证
+### 4.1 Signature Verification
 
-注册时用户提供一个 32 位签名值（sig），内核在处理临界区时会验证：
+During registration, the user provides a 32-bit signature value (sig), which the kernel verifies when processing the critical section:
 
-- 读取 `abort_ip - 4` 处的 4 字节
-- 必须与注册时的签名匹配
-- 防止恶意构造的临界区描述符
+- Reads 4 bytes at `abort_ip - 4`
+- Must match the registered signature
+- Prevents maliciously constructed critical section descriptors
 
-### 4.2 地址验证
+### 4.2 Address Verification
 
-内核对所有用户态地址进行严格验证：
+The kernel strictly verifies all user-space addresses:
 
-- `start_ip`、`abort_ip` 必须在用户地址空间内
-- `start_ip + post_commit_offset` 不能溢出
-- `abort_ip` 必须在临界区外
+- `start_ip`, `abort_ip` must be within the user address space
+- `start_ip + post_commit_offset` cannot overflow
+- `abort_ip` must be outside the critical section
 
-### 4.3 错误处理
+### 4.3 Error Handling
 
-当检测到以下错误时，内核向进程发送 SIGSEGV：
+When the following errors are detected, the kernel sends SIGSEGV to the process:
 
-- 用户内存访问失败
-- 签名不匹配
-- 地址验证失败
-- 版本号不为 0
+- User memory access failure
+- Signature mismatch
+- Address verification failure
+- Version number not equal to 0
 
-## 5. 与进程生命周期的集成
+## 5. Integration with Process Lifecycle
 
 ### 5.1 fork
 
-- **CLONE_VM（线程）**：子线程需要重新注册 rseq
-- **fork（进程）**：子进程继承父进程的 rseq 注册状态
+- **CLONE_VM (threads)**: Child threads need to re-register rseq
+- **fork (processes)**: Child processes inherit the parent's rseq registration state
 
 ### 5.2 execve
 
-执行新程序时，rseq 注册状态被清除，新程序需要重新注册。
+When executing a new program, the rseq registration state is cleared, and the new program needs to re-register.
 
 ### 5.3 exit
 
-进程退出时，rseq 状态随 PCB 一起释放，无需特殊处理。
+When a process exits, the rseq state is released along with the PCB, requiring no special handling.
 
-## 6. 系统调用接口
+## 6. System Call Interface
 
 ### sys_rseq
 
@@ -219,40 +219,40 @@ rseq 临界区是一段用户态代码，具有以下特征：
 long sys_rseq(struct rseq *rseq, u32 rseq_len, int flags, u32 sig);
 ```
 
-**参数：**
-- `rseq`：用户态 rseq 结构的地址
-- `rseq_len`：结构长度（至少 32 字节）
-- `flags`：0 表示注册，RSEQ_FLAG_UNREGISTER (1) 表示注销
-- `sig`：签名值
+**Parameters:**
+- `rseq`: Address of the user-space rseq structure
+- `rseq_len`: Structure length (at least 32 bytes)
+- `flags`: 0 for registration, RSEQ_FLAG_UNREGISTER (1) for deregistration
+- `sig`: Signature value
 
-**返回值：**
-- 成功：0
-- 失败：负的错误码
+**Return Value:**
+- Success: 0
+- Failure: Negative error code
 
-**错误码：**
-| 错误码 | 说明 |
-|--------|------|
-| EINVAL | 参数无效（长度、对齐、flags 等） |
-| EPERM | 签名不匹配 |
-| EBUSY | 已注册（重复注册相同参数） |
-| EFAULT | 地址无效 |
+**Error Codes:**
+| Error Code | Description |
+|------------|-------------|
+| EINVAL | Invalid parameters (length, alignment, flags, etc.) |
+| EPERM | Signature mismatch |
+| EBUSY | Already registered (duplicate registration with same parameters) |
+| EFAULT | Invalid address |
 
-## 7. 辅助向量（auxv）
+## 7. Auxiliary Vector (auxv)
 
-内核通过 ELF 辅助向量向用户态传递 rseq 支持信息：
+The kernel passes rseq support information to user-space through the ELF auxiliary vector:
 
-| 类型 | 值 | 说明 |
-|------|-----|------|
-| AT_RSEQ_FEATURE_SIZE | 27 | rseq 结构大小（32） |
-| AT_RSEQ_ALIGN | 28 | rseq 对齐要求（32） |
+| Type | Value | Description |
+|------|-------|-------------|
+| AT_RSEQ_FEATURE_SIZE | 27 | rseq structure size (32) |
+| AT_RSEQ_ALIGN | 28 | rseq alignment requirement (32) |
 
-用户态库（如 glibc）使用这些信息来：
-- 确定内核是否支持 rseq
-- 正确分配和对齐 TLS 中的 rseq 结构
+User-space libraries (such as glibc) use this information to:
+- Determine whether the kernel supports rseq
+- Correctly allocate and align the rseq structure in TLS
 
-## 8. 使用示例
+## 8. Usage Example
 
-以下伪代码展示了 rseq 的典型使用模式：
+The following pseudocode demonstrates a typical usage pattern of rseq:
 
 ```c
 // 1. 注册 rseq
@@ -289,7 +289,7 @@ done:
     // 操作完成
 ```
 
-## 9. 参考资料
+## 9. References
 
 - [Linux rseq(2) man page](https://man7.org/linux/man-pages/man2/rseq.2.html)
 - [LWN: Restartable sequences](https://lwn.net/Articles/697979/)

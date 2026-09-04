@@ -1,0 +1,694 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="zh-CN">
+<head>
+  <meta charset="utf-8" /><meta name="generator" content="Docutils 0.18.1: http://docutils.sourceforge.net/" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>挂载传播性机制 &mdash; DragonOS dev 文档</title>
+      <link rel="stylesheet" type="text/css" href="../../../_static/pygments.css" />
+      <link rel="stylesheet" type="text/css" href="../../../_static/css/theme.css" />
+
+  
+  <!--[if lt IE 9]>
+    <script src="../../../_static/js/html5shiv.min.js"></script>
+  <![endif]-->
+  
+        <script data-url_root="../../../" id="documentation_options" src="../../../_static/documentation_options.js"></script>
+        <script src="../../../_static/jquery.js"></script>
+        <script src="../../../_static/underscore.js"></script>
+        <script src="../../../_static/_sphinx_javascript_frameworks_compat.js"></script>
+        <script src="../../../_static/doctools.js"></script>
+        <script src="../../../_static/translations.js"></script>
+    <script src="../../../_static/js/theme.js"></script>
+    <link rel="index" title="索引" href="../../../genindex.html" />
+    <link rel="search" title="搜索" href="../../../search.html" />
+    <link rel="next" title="VFS API文档" href="api.html" />
+    <link rel="prev" title="设计" href="design.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="../../../index.html" class="icon icon-home">
+            DragonOS
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="../../../search.html" method="get">
+    <input type="text" name="q" placeholder="搜索文档" aria-label="搜索文档" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="导航菜单">
+              <p class="caption" role="heading"><span class="caption-text">入门</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../introduction/index.html">DragonOS简介</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../introduction/build_system.html">构建DragonOS</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../introduction/mirrors.html">DragonOS镜像站</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">内核层</span></p>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../../configuration/index.html">内核编译配置</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../boot/index.html">引导加载</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../core_api/index.html">核心API文档</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../locking/index.html">锁</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../process_management/index.html">进程管理模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sched/index.html">DragonOS调度</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../ipc/index.html">进程间通信</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../memory_management/index.html">内存管理</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="../index.html">文件系统</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="../overview.html">概述</a></li>
+<li class="toctree-l2 current"><a class="reference internal" href="index.html">VFS虚拟文件系统</a><ul class="current">
+<li class="toctree-l3"><a class="reference internal" href="design.html">设计</a></li>
+<li class="toctree-l3 current"><a class="current reference internal" href="#">挂载传播性机制</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#id2">1. 概述</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id5">2. 传播类型</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#peer-group">3. Peer Group 机制</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id8">4. 事件传播流程</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id10">5. 命名空间交互</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id13">6. 传播类型转换</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id16">7. 设计原则</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#linux">8. 与 Linux 的兼容性</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id20">9. 参考资料</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="api.html">VFS API文档</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mountable_fs.html">设计</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../sysfs.html">SysFS</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../kernfs.html">KernFS</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../unionfs/index.html">联合文件系统</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../../debug/index.html">内核调试模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../ktest/index.html">内核测试</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../cpu_arch/index.html">处理器架构</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../container/index.html">容器化</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../libs/index.html">其他内核库</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../net/index.html">网络子系统</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../trace/index.html">内核跟踪机制</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../syscall/index.html">系统调用</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../device/index.html">Device</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">应用层</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../userland/appdev/index.html">应用程序开发文档</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Q&amp;A</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../questions/index.html">常见问题解答</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">DragonOS社区</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../community/code_contribution/index.html">参与开发</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../community/contact/index.html">与社区建立联系</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../community/ChangeLog/index.html">发行日志</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Translations</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../locales/en/index.html">English</a></li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="移动版导航菜单" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../../../index.html">DragonOS</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="页面导航">
+  <ul class="wy-breadcrumbs">
+      <li><a href="../../../index.html" class="icon icon-home" aria-label="Home"></a></li>
+          <li class="breadcrumb-item"><a href="../index.html">文件系统</a></li>
+          <li class="breadcrumb-item"><a href="index.html">VFS虚拟文件系统</a></li>
+      <li class="breadcrumb-item active">挂载传播性机制</li>
+      <li class="wy-breadcrumbs-aside">
+              <a href="https://github.com/DragonOS-Community/DragonOS/blob/ac64a32/docs/kernel/filesystem/vfs/mount_propagation.md" class="fa fa-github"> 在 GitHub 上编辑</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section class="tex2jax_ignore mathjax_ignore" id="id1">
+<h1>挂载传播性机制<a class="headerlink" href="#id1" title="Permalink to this heading"></a></h1>
+<section id="id2">
+<h2>1. 概述<a class="headerlink" href="#id2" title="Permalink to this heading"></a></h2>
+<p>挂载传播性（Mount Propagation）是 Linux 内核在 2.6.15 版本引入的一项重要特性，DragonOS 对此进行了完整实现。该机制控制在一个挂载点上发生的挂载/卸载事件是否以及如何传播到其他相关的挂载点。</p>
+<section id="id3">
+<h3>1.1 为什么需要挂载传播性？<a class="headerlink" href="#id3" title="Permalink to this heading"></a></h3>
+<p>在容器化和命名空间隔离的场景下，不同进程可能拥有不同的挂载命名空间（Mount Namespace）。传统的挂载行为无法满足以下需求：</p>
+<ol class="arabic simple">
+<li><p><strong>共享存储</strong>：多个容器需要看到相同的存储变化</p></li>
+<li><p><strong>隔离性</strong>：某些容器的挂载变化不应影响其他容器</p></li>
+<li><p><strong>灵活配置</strong>：不同目录树需要不同的传播策略</p></li>
+</ol>
+</section>
+<section id="id4">
+<h3>1.2 核心概念<a class="headerlink" href="#id4" title="Permalink to this heading"></a></h3>
+<p>挂载传播性引入了以下核心概念：</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>概念</p></th>
+<th class="head"><p>说明</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><strong>Peer Group</strong></p></td>
+<td><p>一组共享挂载事件的挂载点集合</p></td>
+</tr>
+<tr class="row-odd"><td><p><strong>传播类型</strong></p></td>
+<td><p>定义挂载点如何参与事件传播</p></td>
+</tr>
+<tr class="row-even"><td><p><strong>Bind Mount</strong></p></td>
+<td><p>将一个目录树绑定到另一个位置</p></td>
+</tr>
+<tr class="row-odd"><td><p><strong>命名空间</strong></p></td>
+<td><p>挂载点的隔离边界</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+</section>
+<section id="id5">
+<h2>2. 传播类型<a class="headerlink" href="#id5" title="Permalink to this heading"></a></h2>
+<p>DragonOS 支持四种传播类型，每种类型定义了不同的事件传播行为：</p>
+<section id="shared">
+<h3>2.1 Shared（共享）<a class="headerlink" href="#shared" title="Permalink to this heading"></a></h3>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>┌─────────────────────────────────────────────────────────┐
+│                     Peer Group                          │
+│  ┌─────────┐         ┌─────────┐         ┌─────────┐   │
+│  │ Mount A │ ◄─────► │ Mount B │ ◄─────► │ Mount C │   │
+│  │ shared  │         │ shared  │         │ shared  │   │
+│  └─────────┘         └─────────┘         └─────────┘   │
+│       │                   │                   │         │
+│       └───────────────────┴───────────────────┘         │
+│              双向传播：mount/umount 事件                 │
+└─────────────────────────────────────────────────────────┘
+</pre></div>
+</div>
+<p><strong>特性</strong>：</p>
+<ul class="simple">
+<li><p>属于同一 Peer Group 的挂载点双向传播事件</p></li>
+<li><p>在任一 Peer 上的 mount/umount 操作会传播到所有其他 Peer</p></li>
+<li><p>通过 <code class="docutils literal notranslate"><span class="pre">MS_SHARED</span></code> 标志设置</p></li>
+</ul>
+<p><strong>典型用例</strong>：</p>
+<ul class="simple">
+<li><p>多个容器需要共享相同的存储视图</p></li>
+<li><p>跨命名空间的实时同步</p></li>
+</ul>
+</section>
+<section id="private">
+<h3>2.2 Private（私有）<a class="headerlink" href="#private" title="Permalink to this heading"></a></h3>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>┌─────────────┐         ┌─────────────┐
+│   Mount A   │         │   Mount B   │
+│   private   │    ✗    │   private   │
+│             │◄───────►│             │
+└─────────────┘         └─────────────┘
+      不传播任何事件
+</pre></div>
+</div>
+<p><strong>特性</strong>：</p>
+<ul class="simple">
+<li><p>挂载事件既不发送也不接收</p></li>
+<li><p>每个挂载点完全独立</p></li>
+<li><p>这是新建挂载的默认类型</p></li>
+</ul>
+<p><strong>典型用例</strong>：</p>
+<ul class="simple">
+<li><p>需要完全隔离的容器</p></li>
+<li><p>临时挂载点</p></li>
+</ul>
+</section>
+<section id="slave">
+<h3>2.3 Slave（从属）<a class="headerlink" href="#slave" title="Permalink to this heading"></a></h3>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>┌─────────────┐         ┌─────────────┐
+│   Master    │ ───────►│    Slave    │
+│   shared    │         │    slave    │
+│             │◄─ ✗ ────│             │
+└─────────────┘         └─────────────┘
+    单向传播：Master → Slave
+</pre></div>
+</div>
+<p><strong>特性</strong>：</p>
+<ul class="simple">
+<li><p>只接收来自 Master 的事件，不向外传播</p></li>
+<li><p>可以有自己的本地挂载变化，但不影响 Master</p></li>
+<li><p>Master 必须是 Shared 类型</p></li>
+</ul>
+<p><strong>典型用例</strong>：</p>
+<ul class="simple">
+<li><p>只读共享视图</p></li>
+<li><p>容器需要看到主机的挂载变化，但不能影响主机</p></li>
+</ul>
+</section>
+<section id="unbindable">
+<h3>2.4 Unbindable（不可绑定）<a class="headerlink" href="#unbindable" title="Permalink to this heading"></a></h3>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>┌─────────────┐         ┌─────────────┐
+│   Mount A   │    ✗    │   Mount B   │
+│ unbindable  │◄───────►│     any     │
+│             │ 禁止bind │             │
+└─────────────┘         └─────────────┘
+</pre></div>
+</div>
+<p><strong>特性</strong>：</p>
+<ul class="simple">
+<li><p>不能被 bind mount</p></li>
+<li><p>不参与任何传播</p></li>
+<li><p>最强的隔离级别</p></li>
+</ul>
+<p><strong>典型用例</strong>：</p>
+<ul class="simple">
+<li><p>敏感数据目录</p></li>
+<li><p>防止意外暴露的系统目录</p></li>
+</ul>
+</section>
+</section>
+<section id="peer-group">
+<h2>3. Peer Group 机制<a class="headerlink" href="#peer-group" title="Permalink to this heading"></a></h2>
+<section id="id6">
+<h3>3.1 什么是 Peer Group？<a class="headerlink" href="#id6" title="Permalink to this heading"></a></h3>
+<p>Peer Group 是共享挂载传播关系的挂载点集合。同一 Peer Group 内的所有 Shared 挂载点会双向传播挂载事件。</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>                    ┌──────────────────────────────────┐
+                    │        Peer Group (ID=42)        │
+                    │                                  │
+  Namespace A       │   ┌─────────┐                    │
+  ┌─────────────────┼───│ /mnt/a  │                    │
+  │                 │   │ shared  │                    │
+  │                 │   └────┬────┘                    │
+  │                 │        │                         │
+  └─────────────────┼────────┼─────────────────────────┤
+                    │        │                         │
+  Namespace B       │        │                         │
+  ┌─────────────────┼────────┼─────────────────────────┤
+  │                 │        │                         │
+  │                 │   ┌────▼────┐                    │
+  │                 │   │ /mnt/b  │                    │
+  │                 │   │ shared  │                    │
+  │                 │   └─────────┘                    │
+  └─────────────────┼──────────────────────────────────┤
+                    └──────────────────────────────────┘
+</pre></div>
+</div>
+</section>
+<section id="id7">
+<h3>3.2 Peer Group 的形成<a class="headerlink" href="#id7" title="Permalink to this heading"></a></h3>
+<p>Peer Group 在以下情况形成或扩展：</p>
+<ol class="arabic simple">
+<li><p><strong>设置 Shared 类型</strong>：当挂载点首次被设为 Shared，分配新的 Group ID</p></li>
+<li><p><strong>Bind Mount</strong>：对 Shared 挂载执行 bind mount，新挂载加入同一 Peer Group</p></li>
+<li><p><strong>命名空间复制</strong>：<code class="docutils literal notranslate"><span class="pre">unshare(CLONE_NEWNS)</span></code> 时，Shared 挂载被复制并加入同一 Peer Group</p></li>
+</ol>
+</section>
+<section id="group-id">
+<h3>3.3 Group ID 分配<a class="headerlink" href="#group-id" title="Permalink to this heading"></a></h3>
+<p>每个 Peer Group 由唯一的 Group ID 标识：</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>Group ID 分配器
+┌─────────────────────────────────────┐
+│  ID Pool: [1, 2, 3, 4, 5, ...]      │
+│                                     │
+│  已分配: {1 → Group A, 3 → Group B} │
+│  可用: {2, 4, 5, ...}               │
+└─────────────────────────────────────┘
+</pre></div>
+</div>
+<ul class="simple">
+<li><p>Group ID 从 1 开始分配</p></li>
+<li><p>0 表示无效/未加入任何组</p></li>
+<li><p>当 Peer Group 为空时，ID 可回收</p></li>
+</ul>
+</section>
+</section>
+<section id="id8">
+<h2>4. 事件传播流程<a class="headerlink" href="#id8" title="Permalink to this heading"></a></h2>
+<section id="mount">
+<h3>4.1 Mount 事件传播<a class="headerlink" href="#mount" title="Permalink to this heading"></a></h3>
+<p>当在 Shared 挂载点上创建新挂载时：</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>步骤 1: 在源挂载点创建子挂载
+┌──────────────┐
+│   /mnt/a     │ ← mount(&quot;&quot;, &quot;/mnt/a/sub&quot;, &quot;ramfs&quot;, ...)
+│   shared     │
+│      │       │
+│   ┌──▼───┐   │
+│   │ sub  │   │
+│   └──────┘   │
+└──────────────┘
+
+步骤 2: 获取 Peer Group 成员
+┌──────────────────────────────────────┐
+│ Peer Group 42:                       │
+│   - /mnt/a (源)                      │
+│   - /mnt/b (Peer)                    │
+│   - /mnt/c (Peer)                    │
+└──────────────────────────────────────┘
+
+步骤 3: 向每个 Peer 传播
+┌──────────────┐  ┌──────────────┐  ┌──────────────┐
+│   /mnt/a     │  │   /mnt/b     │  │   /mnt/c     │
+│   shared     │  │   shared     │  │   shared     │
+│      │       │  │      │       │  │      │       │
+│   ┌──▼───┐   │  │   ┌──▼───┐   │  │   ┌──▼───┐   │
+│   │ sub  │   │  │   │ sub&#39; │   │  │   │ sub&#39;&#39;│   │
+│   └──────┘   │  │   └──────┘   │  │   └──────┘   │
+└──────────────┘  └──────────────┘  └──────────────┘
+      源               复制               复制
+</pre></div>
+</div>
+</section>
+<section id="umount">
+<h3>4.2 Umount 事件传播<a class="headerlink" href="#umount" title="Permalink to this heading"></a></h3>
+<p>当在 Shared 挂载点上卸载子挂载时：</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>步骤 1: umount(&quot;/mnt/a/sub&quot;)
+┌──────────────┐
+│   /mnt/a     │
+│   shared     │
+│      │       │
+│   ┌──▼───┐   │ ← umount
+│   │ sub  │   │
+│   └──────┘   │
+└──────────────┘
+
+步骤 2: 传播到所有 Peer
+┌──────────────┐  ┌──────────────┐  ┌──────────────┐
+│   /mnt/a     │  │   /mnt/b     │  │   /mnt/c     │
+│   shared     │  │   shared     │  │   shared     │
+│              │  │              │  │              │
+│   (empty)    │  │   (empty)    │  │   (empty)    │
+│              │  │              │  │              │
+└──────────────┘  └──────────────┘  └──────────────┘
+  已卸载            传播卸载          传播卸载
+</pre></div>
+</div>
+</section>
+<section id="id9">
+<h3>4.3 传播到 Slave<a class="headerlink" href="#id9" title="Permalink to this heading"></a></h3>
+<p>Slave 挂载点单向接收事件：</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>┌──────────────┐         ┌──────────────┐
+│   Master     │         │    Slave     │
+│   shared     │         │    slave     │
+│      │       │   ───►  │      │       │
+│   ┌──▼───┐   │         │   ┌──▼───┐   │
+│   │ sub  │   │         │   │ sub&#39; │   │
+│   └──────┘   │         │   └──────┘   │
+└──────────────┘         └──────────────┘
+                               │
+                               ▼
+                         Slave 上的本地挂载
+                         不会传播回 Master
+</pre></div>
+</div>
+</section>
+</section>
+<section id="id10">
+<h2>5. 命名空间交互<a class="headerlink" href="#id10" title="Permalink to this heading"></a></h2>
+<section id="id11">
+<h3>5.1 命名空间复制<a class="headerlink" href="#id11" title="Permalink to this heading"></a></h3>
+<p>当调用 <code class="docutils literal notranslate"><span class="pre">unshare(CLONE_NEWNS)</span></code> 创建新的挂载命名空间时：</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>复制前（父进程的命名空间）:
+┌─────────────────────────────────────┐
+│ Mount Namespace (Parent)            │
+│                                     │
+│  /              ┌──────────┐        │
+│  └── mnt/       │ shared   │        │
+│      └── data   │ Group 1  │        │
+│                 └──────────┘        │
+└─────────────────────────────────────┘
+
+unshare(CLONE_NEWNS) 后:
+┌─────────────────────────────────────┐
+│ Mount Namespace (Parent)            │
+│                                     │
+│  /              ┌──────────┐        │
+│  └── mnt/       │ shared   │◄───────┼─┐
+│      └── data   │ Group 1  │        │ │
+│                 └──────────┘        │ │ Peer
+└─────────────────────────────────────┘ │ 关系
+                                        │
+┌─────────────────────────────────────┐ │
+│ Mount Namespace (Child)             │ │
+│                                     │ │
+│  /              ┌──────────┐        │ │
+│  └── mnt/       │ shared   │◄───────┼─┘
+│      └── data   │ Group 1  │        │
+│                 └──────────┘        │
+└─────────────────────────────────────┘
+</pre></div>
+</div>
+<p><strong>关键行为</strong>：</p>
+<ul class="simple">
+<li><p>Private 挂载：简单复制，无 Peer 关系</p></li>
+<li><p>Shared 挂载：复制后加入同一 Peer Group，建立跨命名空间传播</p></li>
+<li><p>Slave 挂载：保持 Slave 关系</p></li>
+<li><p>Unbindable 挂载：不可复制到新命名空间</p></li>
+</ul>
+</section>
+<section id="id12">
+<h3>5.2 跨命名空间传播示例<a class="headerlink" href="#id12" title="Permalink to this heading"></a></h3>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>时间线:
+───────────────────────────────────────────────────►
+
+T1: 父进程创建 shared 挂载
+    Parent NS: /mnt/shared (Group 1)
+
+T2: 子进程 unshare(CLONE_NEWNS)
+    Parent NS: /mnt/shared (Group 1) ◄──┐
+                                        │ Peer
+    Child NS:  /mnt/shared (Group 1) ◄──┘
+
+T3: 父进程在 /mnt/shared/sub 挂载
+    Parent NS: /mnt/shared/sub ←── 新挂载
+              │
+              ▼ 传播
+    Child NS:  /mnt/shared/sub ←── 自动出现
+
+T4: 子进程也能看到 /mnt/shared/sub
+</pre></div>
+</div>
+</section>
+</section>
+<section id="id13">
+<h2>6. 传播类型转换<a class="headerlink" href="#id13" title="Permalink to this heading"></a></h2>
+<section id="id14">
+<h3>6.1 状态转换图<a class="headerlink" href="#id14" title="Permalink to this heading"></a></h3>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>                    ┌───────────────┐
+        MS_SHARED   │               │  MS_PRIVATE
+       ┌───────────►│    SHARED     │◄───────────┐
+       │            │               │            │
+       │            └───────┬───────┘            │
+       │                    │                    │
+       │                    │ MS_SLAVE           │
+       │                    ▼                    │
+┌──────┴──────┐      ┌─────────────┐      ┌─────┴───────┐
+│             │      │             │      │             │
+│   PRIVATE   │◄─────│    SLAVE    │─────►│ UNBINDABLE  │
+│             │      │             │      │             │
+└─────────────┘      └─────────────┘      └─────────────┘
+                     MS_PRIVATE            MS_UNBINDABLE
+</pre></div>
+</div>
+</section>
+<section id="id15">
+<h3>6.2 转换规则<a class="headerlink" href="#id15" title="Permalink to this heading"></a></h3>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>源类型</p></th>
+<th class="head"><p>目标类型</p></th>
+<th class="head"><p>操作</p></th>
+<th class="head"><p>副作用</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>Private</p></td>
+<td><p>Shared</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">mount</span> <span class="pre">--make-shared</span></code></p></td>
+<td><p>分配新 Group ID</p></td>
+</tr>
+<tr class="row-odd"><td><p>Shared</p></td>
+<td><p>Private</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">mount</span> <span class="pre">--make-private</span></code></p></td>
+<td><p>从 Peer Group 移除</p></td>
+</tr>
+<tr class="row-even"><td><p>Shared</p></td>
+<td><p>Slave</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">mount</span> <span class="pre">--make-slave</span></code></p></td>
+<td><p>变为 Peer Group 的接收者</p></td>
+</tr>
+<tr class="row-odd"><td><p>Slave</p></td>
+<td><p>Shared</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">mount</span> <span class="pre">--make-shared</span></code></p></td>
+<td><p>断开与 Master 的连接</p></td>
+</tr>
+<tr class="row-even"><td><p>*</p></td>
+<td><p>Unbindable</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">mount</span> <span class="pre">--make-unbindable</span></code></p></td>
+<td><p>清除所有关系</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+</section>
+<section id="id16">
+<h2>7. 设计原则<a class="headerlink" href="#id16" title="Permalink to this heading"></a></h2>
+<section id="id17">
+<h3>7.1 最小惊讶原则<a class="headerlink" href="#id17" title="Permalink to this heading"></a></h3>
+<ul class="simple">
+<li><p>新挂载默认为 Private，不产生意外的副作用</p></li>
+<li><p>只有显式设置 Shared 才参与传播</p></li>
+<li><p>传播行为明确且可预测</p></li>
+</ul>
+</section>
+<section id="id18">
+<h3>7.2 性能考虑<a class="headerlink" href="#id18" title="Permalink to this heading"></a></h3>
+<ul class="simple">
+<li><p>Peer Group 使用全局注册表管理，O(1) 查找</p></li>
+<li><p>传播操作使用延迟执行，避免阻塞挂载操作</p></li>
+<li><p>弱引用（Weak）避免循环引用和内存泄漏</p></li>
+</ul>
+</section>
+<section id="id19">
+<h3>7.3 一致性保证<a class="headerlink" href="#id19" title="Permalink to this heading"></a></h3>
+<ul class="simple">
+<li><p>使用原子操作和锁保护传播状态</p></li>
+<li><p>传播失败不影响原始操作</p></li>
+<li><p>支持部分传播后的状态恢复</p></li>
+</ul>
+</section>
+</section>
+<section id="linux">
+<h2>8. 与 Linux 的兼容性<a class="headerlink" href="#linux" title="Permalink to this heading"></a></h2>
+<p>DragonOS 的挂载传播性实现遵循 Linux 语义：</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>特性</p></th>
+<th class="head"><p>Linux</p></th>
+<th class="head"><p>DragonOS</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>Shared 传播</p></td>
+<td><p>✓</p></td>
+<td><p>✓</p></td>
+</tr>
+<tr class="row-odd"><td><p>Private 隔离</p></td>
+<td><p>✓</p></td>
+<td><p>✓</p></td>
+</tr>
+<tr class="row-even"><td><p>Slave 单向传播</p></td>
+<td><p>✓</p></td>
+<td><p>✓</p></td>
+</tr>
+<tr class="row-odd"><td><p>Unbindable</p></td>
+<td><p>✓</p></td>
+<td><p>✓</p></td>
+</tr>
+<tr class="row-even"><td><p>跨命名空间传播</p></td>
+<td><p>✓</p></td>
+<td><p>✓</p></td>
+</tr>
+<tr class="row-odd"><td><p>递归传播 (MS_REC)</p></td>
+<td><p>✓</p></td>
+<td><p>✓</p></td>
+</tr>
+<tr class="row-even"><td><p>/proc/self/mountinfo</p></td>
+<td><p>✓</p></td>
+<td><p>部分</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="id20">
+<h2>9. 参考资料<a class="headerlink" href="#id20" title="Permalink to this heading"></a></h2>
+<ol class="arabic simple">
+<li><p><a class="reference external" href="https://www.kernel.org/doc/Documentation/filesystems/sharedsubtree.txt">Linux Kernel Documentation: Shared Subtrees</a></p></li>
+<li><p><a class="reference external" href="https://lwn.net/Articles/159077/">LWN.net: Shared subtrees</a></p></li>
+</ol>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="页脚">
+        <a href="design.html" class="btn btn-neutral float-left" title="设计" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> 上一页</a>
+        <a href="api.html" class="btn btn-neutral float-right" title="VFS API文档" accesskey="n" rel="next">下一页 <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; 版权所有 2022-2025, DragonOS Community.
+      <span class="commit">版本 <code>ac64a32</code>.
+      </span></p>
+  </div>
+
+  利用 <a href="https://www.sphinx-doc.org/">Sphinx</a> 构建，使用的 
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">主题</a>
+    由 <a href="https://readthedocs.org">Read the Docs</a> 开发.
+  
+<div>
+    <br>
+    官网 <a href="https://dragonos.org">https://dragonos.org</a> | 论坛 <a href="https://bbs.dragonos.org.cn">https://bbs.dragonos.org.cn</a> |  <a href="https://dragonos.org">赞助DragonOS，成就未来！</a>
+</div>
+
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  
+<div class="rst-versions" data-toggle="rst-versions" role="note" aria-label="versions">
+  <span class="rst-current-version" data-toggle="rst-current-version">
+    <span class="fa fa-book"> Other Versions</span>
+    v: V0.4.0
+    <span class="fa fa-caret-down"></span>
+  </span>
+  <div class="rst-other-versions">
+    <dl>
+      <dt>Tags</dt>
+      <dd><a href="../../../../V0.1.0/index.html">V0.1.0</a></dd>
+      <dd><a href="../../../../V0.1.1/index.html">V0.1.1</a></dd>
+      <dd><a href="../../../../V0.1.10/index.html">V0.1.10</a></dd>
+      <dd><a href="../../../../V0.1.2/index.html">V0.1.2</a></dd>
+      <dd><a href="../../../../V0.1.3/index.html">V0.1.3</a></dd>
+      <dd><a href="../../../../V0.1.4/index.html">V0.1.4</a></dd>
+      <dd><a href="../../../../V0.1.5/index.html">V0.1.5</a></dd>
+      <dd><a href="../../../../V0.1.6/index.html">V0.1.6</a></dd>
+      <dd><a href="../../../../V0.1.7/index.html">V0.1.7</a></dd>
+      <dd><a href="../../../../V0.1.8/index.html">V0.1.8</a></dd>
+      <dd><a href="../../../../V0.1.9/index.html">V0.1.9</a></dd>
+      <dd><a href="../../../../V0.2.0/index.html">V0.2.0</a></dd>
+      <dd><a href="../../../../V0.3.0/index.html">V0.3.0</a></dd>
+      <dd><a href="mount_propagation.html">V0.4.0</a></dd>
+    </dl>
+    <dl>
+      <dt>Branches</dt>
+      <dd><a href="../../../../master/kernel/filesystem/vfs/mount_propagation.html">master</a></dd>
+    </dl>
+  </div>
+</div><script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script>  
+
+  <style>
+         .wy-nav-content { max-width: 90%; }
+  </style>
+
+
+
+</body>
+</html>

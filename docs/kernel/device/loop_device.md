@@ -1,18 +1,18 @@
-# Loop Device 架构设计
+# Loop Device Architecture Design
 
-本文档阐述 DragonOS 中 loop 设备子系统的架构设计思路，用于指导开发和后续演进。
+This document outlines the architectural design rationale of the loop device subsystem in DragonOS, serving as guidance for development and future evolution.
 
-## 问题背景
+## Problem Background
 
-在操作系统开发中，我们经常面临这样的需求：
-- 如何将一个镜像文件当作块设备使用？
-- 如何在不重启系统的情况下动态创建/删除虚拟块设备？
+In operating system development, we frequently encounter these requirements:
+- How to use an image file as a block device?
+- How to dynamically create/delete virtual block devices without system reboot?
 
-loop 设备正是解决这些问题的关键组件。
+The loop device is the key component addressing these needs.
 
-## 系统架构定位
+## System Architecture Positioning
 
-loop 设备在 DragonOS 架构中扮演着"虚拟化桥梁"的角色：
+The loop device plays the role of a "virtualization bridge" in DragonOS architecture:
 
 ```
 用户态应用
@@ -26,13 +26,13 @@ LoopDevice[] (虚拟块设备数组)
 块设备层 ←→ 后端文件系统
 ```
 
-这种分层设计的核心思想是：**将控制平面与数据平面分离**。
+The core concept of this layered design is: **separating control plane from data plane**.
 
-## 核心设计哲学
+## Core Design Philosophy
 
-### 1. 状态驱动的设备管理
+### 1. State-driven Device Management
 
-我们仿照linux设计引入状态机来管理设备生命周期
+We adopt a state machine approach for device lifecycle management, similar to Linux design:
 
 ```
 Unbound → Bound → Rundown → Deleting
@@ -40,47 +40,47 @@ Unbound → Bound → Rundown → Deleting
 Deleting  Unbound  Deleting
 ```
 
-**设计考量**：
-- 防止非法状态转换（如直接在 Bound 状态删除设备）
-- 提供清晰的设备生命周期语义
-- 为未来的扩展（如设备热插拔）奠定基础
+**Design Considerations**:
+- Prevent illegal state transitions (e.g., deleting a device directly in Bound state)
+- Provide clear device lifecycle semantics
+- Lay foundation for future extensions (e.g., hot-plugging)
 
-### 2. 双重接口策略
+### 2. Dual Interface Strategy
 
-我们的设计刻意区分了两种接口：
+Our design deliberately distinguishes between two interfaces:
 
-**字符控制接口** (`/dev/loop-control`)：
-- 负责设备的生命周期管理
-- 提供用户友好的设备分配/回收机制
-- 与 Linux 标准接口保持兼容
+**Character Control Interface** (`/dev/loop-control`):
+- Manages device lifecycle
+- Provides user-friendly device allocation/recycling mechanisms
+- Maintains compatibility with Linux standard interfaces
 
-**块设备接口** (`/dev/loopX`)：
-- 专注于数据读写功能
-- 提供标准的块设备语义
-- 支持偏移、大小限制等高级功能
+**Block Device Interface** (`/dev/loopX`):
+- Focuses on data read/write functionality
+- Provides standard block device semantics
+- Supports advanced features like offset and size limits
 
-**设计价值**：这种分离使得控制逻辑与数据路径互不干扰，提高了系统的可维护性。
+**Design Value**: This separation ensures control logic and data paths don't interfere, improving system maintainability.
 
-### 3. 安全性优先
+### 3. Security First
 
-在与用户态交互时，我们采用了多重安全检查：
+When interacting with user space, we implement multiple security checks:
 
-- **参数边界检查**：所有偏移和大小都必须 LBA 对齐
-- **内存安全**：使用 `UserBufferReader/Writer` 进行用户态数据拷贝
-- **权限验证**：只读设备拒绝写入操作
-- **状态验证**：每个操作前都检查当前设备状态是否允许
+- **Parameter Boundary Checks**: All offsets and sizes must be LBA-aligned
+- **Memory Safety**: Uses `UserBufferReader/Writer` for user-space data copying
+- **Permission Validation**: Read-only devices reject write operations
+- **State Validation**: Each operation checks if current device state permits it
 
-## 模块协作架构
+## Module Collaboration Architecture
 
-### LoopManager 的定位
-LoopManager 不是简单的设备数组管理器，而是整个子系统的"调度中心"：
+### Role of LoopManager
+LoopManager isn't just a device array manager, but the subsystem's "dispatch center":
 
-- **设备分配策略**：采用"就近分配"原则，优先复用空闲设备
-- **资源池管理**：预注册 8 个设备，避免运行时分配开销
-- **并发安全**：所有设备操作都在锁保护下进行
+- **Device Allocation Policy**: Adopts "nearest allocation" principle, prioritizing reuse of idle devices
+- **Resource Pool Management**: Pre-registers 8 devices to avoid runtime allocation overhead
+- **Concurrency Safety**: All device operations are protected by locks
 
-### LoopDevice 的抽象设计
-LoopDevice 的核心抽象是"**后端文件的块设备视图**"：
+### Abstraction Design of LoopDevice
+The core abstraction of LoopDevice is "**block device view of backend files**":
 
 ```
 用户视角          内部实现
@@ -89,39 +89,38 @@ LoopDevice 的核心抽象是"**后端文件的块设备视图**"：
   块101-200         文件偏移51200-102400
 ```
 
-这种设计允许用户将文件的任意部分映射为块设备，为容器等应用场景提供了极大的灵活性。
+This design allows mapping any part of a file as a block device, providing great flexibility for applications like containers.
 
-## 关键设计
+## Key Designs
 
-### 为什么选择 256 个设备上限？
-- 足够满足大多数应用场景需求
-- 避免无限制增长导致的资源耗尽
-- 与 Linux 系统默认上限保持一致，保证兼容性
+### Why Choose 256 as Device Limit?
+- Sufficient for most application scenarios
+- Avoids resource exhaustion from unlimited growth
+- Maintains compatibility with Linux's default limit
 
-### 为什么预注册 8 个设备？
-- 覆盖常见的测试场景（通常不超过 4-5 个）
-- 减少首次使用的等待时间
-- 提供一个合理的初始工作集
+### Why Pre-register 8 Devices?
+- Covers common testing scenarios (typically ≤4-5 devices)
+- Reduces wait time for first-time usage
+- Provides a reasonable initial working set
 
-### 为什么使用 SpinLock 而不是其他锁？
-- loop 设备操作大多是短时操作
-- 避免复杂的锁层级和死锁问题
-- 简化实现，提高性能
+### Why Use SpinLock Instead of Other Locks?
+- Loop device operations are mostly short-lived
+- Avoids complex lock hierarchies and deadlocks
+- Simplifies implementation and improves performance
 
-## 兼容性考量
+## Compatibility Considerations
 
-我们的设计在很大程度上参考了 Linux loop 驱动的接口，这是有意的选择：
+Our design heavily references Linux loop driver interfaces by intentional choice:
 
-1. **用户态软件兼容**：现有的 loop 工具无需修改即可使用
-2. **API 契约一致性**：避免因接口差异导致的潜在问题
-3. **社区知识复用**：开发者可以复用现有的 loop 设备知识
+1. **User-space Software Compatibility**: Existing loop tools work without modification
+2. **API Contract Consistency**: Avoids potential issues from interface differences
+3. **Community Knowledge Reuse**: Developers can leverage existing loop device knowledge
 
-## 总结
+## Summary
 
-DragonOS 的 loop 设备设计遵循以下核心原则：
-1. **架构清晰**：控制平面与数据平面分离
-2. **状态安全**：基于状态机的设备生命周期管理
-3. **接口兼容**：与 Linux 标准接口保持兼容
-4. **扩展友好**：为未来功能预留架构空间
-5. **测试完备**：通过多层级测试保证质量
-
+DragonOS's loop device design follows these core principles:
+1. **Clear Architecture**: Separation of control and data planes
+2. **State Safety**: State-machine-based device lifecycle management
+3. **Interface Compatibility**: Alignment with Linux standard interfaces
+4. **Extension Friendly**: Architectural space reserved for future features
+5. **Comprehensive Testing**: Quality ensured through multi-level testing

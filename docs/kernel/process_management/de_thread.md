@@ -1,92 +1,91 @@
-# DragonOS 多线程 Exec (De-thread) 机制原理
+# Principle of DragonOS Multi-threaded Exec (De-thread) Mechanism
 
-:::{note}
-
-Author: longjin <longjin@dragonos.org>
- 
+::: info Author
+longjin `<longjin@dragonos.org>`
 :::
 
-## 1. 概述
 
-在 POSIX 标准中，`execve` 系统调用用于执行一个新的程序，替换当前进程的镜像。对于多线程程序（Thread Group），POSIX 要求 `exec` 成功后：
-1.  **PID 保持不变**：进程的 PID（在内核中通常指 TGID，即 Thread Group ID）必须保持不变。
-2.  **单线程化**：原进程组中的所有其他线程都必须被终止，仅保留执行 `exec` 的那个线程（它将成为新的单线程进程）。
+## 1. Overview
 
-如果执行 `exec` 的是线程组的 Leader（主线程），事情相对简单：它只需杀掉其他线程即可。但如果执行 `exec` 的是一个普通线程（非 Leader），情况就变得复杂：**它必须“变身”为 Leader，接管原 Leader 的 PID，并清理掉原 Leader**。这个过程被称为“去线程化”（De-thread）。
+In the POSIX standard, the `execve` system call is used to execute a new program, replacing the current process image. For multi-threaded programs (Thread Group), POSIX requires that after `exec` succeeds:
+1. **PID remains unchanged**: The process's PID (typically referring to TGID, i.e., Thread Group ID, in the kernel) must remain unchanged.
+2. **Single-threaded**: All other threads in the original process group must be terminated, leaving only the thread that executed `exec` (which becomes the new single-threaded process).
 
-本文档详细描述 DragonOS 内核中 `de_thread` 的实现原理、流程及并发控制机制。
+If the thread executing `exec` is the leader of the thread group (main thread), the situation is relatively simple: it only needs to kill the other threads. However, if the thread executing `exec` is an ordinary thread (non-leader), the situation becomes complex: **it must "transform" into the leader, take over the original leader's PID, and clean up the original leader**. This process is called "de-threading" (De-thread).
 
-## 2. 核心挑战
+This document details the implementation principles, processes, and concurrency control mechanisms of `de_thread` in the DragonOS kernel.
 
-1.  **身份窃取 (Identity Theft)**：执行 `exec` 的非 Leader 线程（以下简称 **Exec-Thread**）必须在内核层面交换身份，使得它在用户态和父进程看来，拥有原 Leader 的 PID。
-2.  **并发互斥**：
-    -   同一进程组内可能有两个线程同时调用 `exec`，或者一个调 `exec` 一个调 `exit_group`。必须保证只有一个能成功开始。
-    -   在身份交换的临界区（Critical Section），进程的状态是不稳定的，必须防止父进程通过 `wait` 系统调用看到并回收处于中间状态的旧 Leader。
-3.  **资源继承与清理**：Exec-Thread 需要继承原 Leader 的父子进程关系、子进程列表等，同时负责回收旧 Leader 占用的资源。
+## 2. Core Challenges
 
-## 3. 实现机制
+1. **Identity Theft (Identity Theft)**: The non-leader thread executing `exec` (hereinafter referred to as the **Exec-Thread**) must exchange identities at the kernel level, making it appear to the user space and parent process as having the original leader's PID.
+2. **Concurrency Mutual Exclusion**:
+    - Two threads within the same process group may simultaneously call `exec`, or one calls `exec` while another calls `exit_group`. Only one can successfully start.
+    - In the critical section of identity exchange, the process state is unstable, and it must be prevented for the parent process to see and reclaim the intermediate-state old leader via the `wait` system call.
+3. **Resource Inheritance and Cleanup**: The Exec-Thread needs to inherit the parent-child process relationships, child process lists, etc., of the original leader, while also being responsible for reclaiming the resources occupied by the old leader.
 
-DragonOS 参考了 Linux 内核的设计，但在具体实现上结合了 Rust 的所有权和并发安全特性。
+## 3. Implementation Mechanism
 
-### 3.1 关键数据结构
+DragonOS refers to the design of the Linux kernel but combines it with Rust's ownership and concurrency safety features in the specific implementation.
 
-在 `SigHand`（信号处理结构，由线程组共享）中，引入了以下字段来管理状态：
+### 3.1 Key Data Structures
 
--   `SignalFlags::GROUP_EXEC`：标志位。表示当前线程组正在进行去线程化操作。
--   `group_exec_task`: `Weak<ProcessControlBlock>`。指向正在执行 `exec` 的那个线程。
--   `group_exec_wait_queue`: `WaitQueue`。用于等待组内其他线程退出。
--   `group_exec_notify_count`: `isize`。需要等待退出的线程计数（用于唤醒等待队列）。
+In the `SigHand` (signal handling structure, shared by the thread group), the following fields are introduced to manage the state:
 
-### 3.2 核心流程 (`de_thread`)
+- `SignalFlags::GROUP_EXEC`: Flag bit. Indicates that the current thread group is undergoing de-threading.
+- `group_exec_task`: `Weak<ProcessControlBlock>`. Points to the thread currently executing `exec`.
+- `group_exec_wait_queue`: `WaitQueue`. Used to wait for other threads in the group to exit.
+- `group_exec_notify_count`: `isize`. Count of threads waiting to exit (used to wake up the waiting queue).
 
-`de_thread` 函数位于 `kernel/src/process/exec.rs`，是实现该逻辑的核心。
+### 3.2 Core Process (`de_thread`)
 
-#### 阶段一：发起与互斥
-1.  **加锁并互斥**：调用 `sighand.start_group_exec()`。若 `GROUP_EXEC` 或 `GROUP_EXIT` 已被设置，则返回 `EAGAIN`，保证与并发 `exec`/`exit_group` 互斥。
-2.  **设置执行者**：记录当前线程到 `group_exec_task`，并清空 `group_exec_notify_count`。
-3.  **单线程快路径**：若线程组为空（仅自己），直接设置 `exit_signal = SIGCHLD` 并结束去线程化流程。
+The `de_thread` function is located in `kernel/src/process/exec.rs` and is the core of implementing this logic.
 
-#### 阶段二：终止兄弟线程
-1.  **构建清理列表**：遍历线程组，收集所有仍存活且未处于退出路径的线程（包括旧 Leader）。
-2.  **发送信号**：向清理列表中的线程逐个发送 `SIGKILL`。
-3.  **设置计数**：将清理列表长度写入 `group_exec_notify_count`，用于线程退出时唤醒等待队列。
+#### Phase 1: Initiation and Mutual Exclusion
+1. **Lock and Mutual Exclusion**: Call `sighand.start_group_exec()`. If `GROUP_EXEC` or `GROUP_EXIT` has been set, return `EAGAIN` to ensure mutual exclusion with concurrent `exec`/`exit_group`.
+2. **Set Executor**: Record the current thread in `group_exec_task` and clear `group_exec_notify_count`.
+3. **Single-thread Fast Path**: If the thread group is empty (only itself), directly set `exit_signal = SIGCHLD` and end the de-threading process.
 
-#### 阶段三：等待同步
-1.  **进入等待**：在 `group_exec_wait_queue` 上以 killable 方式睡眠。
-2.  **唤醒条件**：
-    -   遍历 `group_tasks`，确认除当前线程以外已无存活线程；
-    -   若当前不是 Leader，还需确保旧 Leader 已经进入 `Zombie` 或 `Dead` 状态；
-    -   若收到 fatal signal 或等待被打断，则返回 `EAGAIN`。
-    -   *注：其他线程在退出路径（`exit_notify`）中会递减计数并唤醒等待队列；若执行者异常退出，也会在该路径中清理 `GROUP_EXEC` 标志。*
+#### Phase 2: Terminate Sibling Threads
+1. **Build Cleanup List**: Traverse the thread group, collecting all still-alive threads not in the exit path (including the old leader).
+2. **Send Signal**: Send `SIGKILL` to each thread in the cleanup list one by one.
+3. **Set Count**: Write the length of the cleanup list into `group_exec_notify_count` to wake up the waiting queue when threads exit.
 
-#### 阶段四：身份交换 (Identity Theft)
-*仅当 Exec-Thread 不是 Leader 时执行*
+#### Phase 3: Wait for Synchronization
+1. **Enter Wait**: Sleep on `group_exec_wait_queue` in a killable manner.
+2. **Wake-up Conditions**:
+    - Traverse `group_tasks` to confirm no other threads are alive except the current thread;
+    - If the current thread is not the leader, also ensure the old leader has entered the `Zombie` or `Dead` state;
+    - If a fatal signal is received or the wait is interrupted, return `EAGAIN`.
+    - *Note: Other threads in the exit path (`exit_notify`) will decrement the count and wake up the waiting queue; if the executor exits abnormally, it will also clean up the `GROUP_EXEC` flag in this path.*
 
-1.  **PID/TID 交换**：调用 `ProcessManager::exchange_tid_and_raw_pids`。
-    -   在全局进程表中交换两者的 PID 映射关系，并交换 PCB 内部的 TID/PID 字段。
-    -   **结果**：Exec-Thread 获得原 TGID，Old-Leader 获得临时 PID。
-2.  **信号语义调整**：
-    -   新 Leader（Exec-Thread）的 `exit_signal` 设为 `SIGCHLD`；
-    -   Old-Leader 的 `exit_signal` 设为 `INVALID`，避免被当作普通子进程处理。
-3.  **结构调整**：将 Exec-Thread 设为新的 `group_leader`，并清空两侧 `group_tasks`（去线程化后仅剩一个线程）。
-4.  **关系继承**：
-    -   **子进程**：将 Old-Leader 的 `children` 列表整体迁移到 Exec-Thread 下；
-    -   **父进程**：Exec-Thread 继承 Old-Leader 的 `parent`/`real_parent`，并更新 `fork_parent` 为自身。
+#### Phase 4: Identity Exchange (Identity Theft)
+*Only executed when the Exec-Thread is not the leader*
 
-#### 阶段五：资源清理
-1.  **回收旧 Leader**：若 Old-Leader 已是 Zombie 或 Dead，Exec-Thread 直接将其标记为 Dead 并释放 PID 资源。
-2.  **完成**：无论成功/失败，最终都会清除 `GROUP_EXEC` 标志并唤醒等待者。
+1. **PID/TID Exchange**: Call `ProcessManager::exchange_tid_and_raw_pids`.
+    - Swap the PID mapping relationships of the two in the global process table and swap the TID/PID fields inside the PCB.
+    - **Result**: The Exec-Thread obtains the original TGID, and the Old-Leader obtains a temporary PID.
+2. **Signal Semantics Adjustment**:
+    - The `exit_signal` of the new leader (Exec-Thread) is set to `SIGCHLD`;
+    - The `exit_signal` of the Old-Leader is set to `INVALID` to avoid being treated as an ordinary child process.
+3. **Structure Adjustment**: Set the Exec-Thread as the new `group_leader` and clear both sides of `group_tasks` (only one thread remains after de-threading).
+4. **Relationship Inheritance**:
+    - **Child Processes**: Migrate the entire `children` list of the Old-Leader to under the Exec-Thread;
+    - **Parent Process**: The Exec-Thread inherits the `parent`/`real_parent` of the Old-Leader and updates `fork_parent` to itself.
 
-### 3.3 并发保护：防止父进程误回收
+#### Phase 5: Resource Cleanup
+1. **Reclaim Old Leader**: If the Old-Leader is already a Zombie or Dead, the Exec-Thread directly marks it as Dead and releases the PID resource.
+2. **Completion**: Regardless of success or failure, the `GROUP_EXEC` flag is ultimately cleared, and waiters are awakened.
 
-这是实现中最微妙的部分。
+### 3.3 Concurrency Protection: Preventing Parent Process from Incorrectly Reclaiming
 
-**问题场景**：
-在阶段三和阶段四之间，Old-Leader 已经收到 SIGKILL 并退出变成 Zombie 状态。此时，如果父进程调用 `wait()`，它可能会发现 Old-Leader (PID=TGID) 是 Zombie，于是将其回收。
-如果父进程在 Exec-Thread 完成 PID 交换**之前**回收了 Old-Leader，那么 Exec-Thread 就无法窃取该 PID（因为该 PID 对应的进程已经消失了），或者导致逻辑混乱。
+This is the most delicate part of the implementation.
 
-**解决方案**：
-在 `kernel/src/process/exit.rs` 的 `do_wait` 逻辑中，增加了一个检查函数 `reap_blocked_by_group_exec`：
+**Problem Scenario**:
+Between Phase 3 and Phase 4, the Old-Leader has received SIGKILL and exited into a Zombie state. At this time, if the parent process calls `wait()`, it may find the Old-Leader (PID=TGID) is a Zombie and reclaim it.
+If the parent process reclaims the Old-Leader **before** the Exec-Thread completes the PID exchange, the Exec-Thread will not be able to steal that PID (since the process corresponding to that PID has disappeared), or it may cause logical confusion.
+
+**Solution**:
+In the `kernel/src/process/exit.rs`'s `do_wait` logic, a check function `reap_blocked_by_group_exec` is added:
 
 ```rust
 fn reap_blocked_by_group_exec(child_pcb: &Arc<ProcessControlBlock>) -> bool {
@@ -106,9 +105,9 @@ fn reap_blocked_by_group_exec(child_pcb: &Arc<ProcessControlBlock>) -> bool {
 }
 ```
 
-这个检查确保了即使 Old-Leader 变成 Zombie，只要 `GROUP_EXEC` 标志还在且 `exec_task` 不是它，父进程就无法回收它。这为 Exec-Thread 安全地进行 PID/TID 交换提供了保护伞。
+This check ensures that even if the Old-Leader becomes a Zombie, as long as the `GROUP_EXEC` flag is still present and `exec_task` is not it, the parent process cannot reclaim it. This provides a protective umbrella for the Exec-Thread to safely perform the PID/TID exchange.
 
-## 4. 流程图
+## 4. Flowchart
 
 ```mermaid
 sequenceDiagram
@@ -150,10 +149,10 @@ sequenceDiagram
     Note over ET: exec 成功，ET 以 PID=100 运行新程序
 ```
 
-## 5. 参考资料
+## 5. References
 
--   **Linux Kernel Source**: `fs/exec.c` (`de_thread` function)
--   **DragonOS Source**:
-    -   `kernel/src/process/exec.rs`
-    -   `kernel/src/process/exit.rs`
-    -   `kernel/src/ipc/sighand.rs`
+- **Linux Kernel Source**: `fs/exec.c` (`de_thread` function)
+- **DragonOS Source**:
+    - `kernel/src/process/exec.rs`
+    - `kernel/src/process/exit.rs`
+    - `kernel/src/ipc/sighand.rs`

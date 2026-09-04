@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="zh-CN">
+<head>
+  <meta charset="utf-8" /><meta name="generator" content="Docutils 0.18.1: http://docutils.sourceforge.net/" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>完全公平调度器相关的api &mdash; DragonOS dev 文档</title>
+      <link rel="stylesheet" type="text/css" href="../../_static/pygments.css" />
+      <link rel="stylesheet" type="text/css" href="../../_static/css/theme.css" />
+
+  
+  <!--[if lt IE 9]>
+    <script src="../../_static/js/html5shiv.min.js"></script>
+  <![endif]-->
+  
+        <script data-url_root="../../" id="documentation_options" src="../../_static/documentation_options.js"></script>
+        <script src="../../_static/jquery.js"></script>
+        <script src="../../_static/underscore.js"></script>
+        <script src="../../_static/_sphinx_javascript_frameworks_compat.js"></script>
+        <script src="../../_static/doctools.js"></script>
+        <script src="../../_static/translations.js"></script>
+    <script src="../../_static/js/theme.js"></script>
+    <link rel="index" title="索引" href="../../genindex.html" />
+    <link rel="search" title="搜索" href="../../search.html" />
+    <link rel="next" title="实时进程调度器相关的api" href="rt.html" />
+    <link rel="prev" title="进程调度器相关的api" href="core.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="../../index.html" class="icon icon-home">
+            DragonOS
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="../../search.html" method="get">
+    <input type="text" name="q" placeholder="搜索文档" aria-label="搜索文档" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="导航菜单">
+              <p class="caption" role="heading"><span class="caption-text">入门</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../introduction/index.html">DragonOS简介</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../introduction/build_system.html">构建DragonOS</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../introduction/mirrors.html">DragonOS镜像站</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">内核层</span></p>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../boot/index.html">引导加载</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core_api/index.html">核心API文档</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">锁</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../process_management/index.html">进程管理模块</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">DragonOS调度</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="c_waiting.html">与“等待”相关的api（C语言）</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rust_waiting.html">与“等待”相关的api（rust语言）</a></li>
+<li class="toctree-l2"><a class="reference internal" href="core.html">进程调度器相关的api</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">完全公平调度器相关的api</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#cfsqueue">1. CFSQueue 介绍</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#id1">1.1 主要函数</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="#schedulercfs">2. SchedulerCFS 介绍</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#id2">2.1 主要函数</a></li>
+</ul>
+</li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="rt.html">实时进程调度器相关的api</a></li>
+<li class="toctree-l2"><a class="reference internal" href="kernel_timer.html">内核定时器</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../ipc/index.html">进程间通信</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../memory_management/index.html">内存管理文档</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystem/index.html">文件系统</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../debug/index.html">内核调试模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ktest/index.html">内核测试</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu_arch/index.html">处理器架构</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">应用层</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../userland/libc/index.html">LibC文档</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">系统调用api文档</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../syscall_api/index.html">系统调用API</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">DragonOS社区</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../community/code_contribution/index.html">参与开发</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../community/contact/index.html">与社区建立联系</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../community/ChangeLog/index.html">发行日志</a></li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="移动版导航菜单" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../../index.html">DragonOS</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="页面导航">
+  <ul class="wy-breadcrumbs">
+      <li><a href="../../index.html" class="icon icon-home" aria-label="Home"></a></li>
+          <li class="breadcrumb-item"><a href="index.html">DragonOS调度</a></li>
+      <li class="breadcrumb-item active">完全公平调度器相关的api</li>
+      <li class="wy-breadcrumbs-aside">
+              <a href="https://github.com/DragonOS-Community/DragonOS/blob/3a23230/docs/kernel/sched/cfs.md" class="fa fa-github"> 在 GitHub 上编辑</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section class="tex2jax_ignore mathjax_ignore" id="api">
+<h1>完全公平调度器相关的api<a class="headerlink" href="#api" title="Permalink to this heading"></a></h1>
+<p>   CFS（Completely Fair Scheduler），顾名思义，完全公平调度器。CFS作为主线调度器之一，也是最典型的O(1)调度器之一</p>
+<section id="cfsqueue">
+<h2>1. CFSQueue 介绍<a class="headerlink" href="#cfsqueue" title="Permalink to this heading"></a></h2>
+<p>   CFSQueue是用来存放普通进程的调度队列，每个CPU维护一个RTQueue，主要使用Vec作为主要存储结构来实现。</p>
+<section id="id1">
+<h3>1.1 主要函数<a class="headerlink" href="#id1" title="Permalink to this heading"></a></h3>
+<ol class="arabic simple">
+<li><p>enqueue(): 将pcb入队列</p></li>
+<li><p>dequeue(): 将pcb从调度队列中弹出,若队列为空，则返回IDLE进程的pcb</p></li>
+<li><p>sort(): 将进程按照虚拟运行时间的升序进行排列</p></li>
+</ol>
+</section>
+</section>
+<section id="schedulercfs">
+<h2>2. SchedulerCFS 介绍<a class="headerlink" href="#schedulercfs" title="Permalink to this heading"></a></h2>
+<p>   CFS调度器类，主要实现了CFS调度器类的初始化以及调度功能函数。</p>
+<section id="id2">
+<h3>2.1 主要函数<a class="headerlink" href="#id2" title="Permalink to this heading"></a></h3>
+<ol class="arabic simple">
+<li><p>sched(): 是对于Scheduler trait的sched()实现，是实时进程进行调度时的逻辑处理，该函数会返回接下来要执行的pcb，若没有符合要求的pcb，返回None</p></li>
+<li><p>enqueue(): 同样是对于Scheduler trait的sched()实现，将一个pcb加入调度器的调度队列</p></li>
+<li><p>update_cpu_exec_proc_jiffies(): 更新这个cpu上，这个进程的可执行时间。</p></li>
+<li><p>timer_update_jiffies(): 时钟中断到来时，由sched的core模块中的函数，调用本函数，更新CFS进程的可执行时间</p></li>
+</ol>
+</section>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="页脚">
+        <a href="core.html" class="btn btn-neutral float-left" title="进程调度器相关的api" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> 上一页</a>
+        <a href="rt.html" class="btn btn-neutral float-right" title="实时进程调度器相关的api" accesskey="n" rel="next">下一页 <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; 版权所有 2022-2025, DragonOS Community.
+      <span class="commit">版本 <code>3a23230</code>.
+      </span></p>
+  </div>
+
+  利用 <a href="https://www.sphinx-doc.org/">Sphinx</a> 构建，使用的 
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">主题</a>
+    由 <a href="https://readthedocs.org">Read the Docs</a> 开发.
+  
+<div>
+    <br>
+    官网 <a href="https://dragonos.org">https://dragonos.org</a> | 论坛 <a href="https://bbs.dragonos.org.cn">https://bbs.dragonos.org.cn</a> |  <a href="https://dragonos.org">赞助DragonOS，成就未来！</a>
+</div>
+
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  
+<div class="rst-versions" data-toggle="rst-versions" role="note" aria-label="versions">
+  <span class="rst-current-version" data-toggle="rst-current-version">
+    <span class="fa fa-book"> Other Versions</span>
+    v: V0.1.7
+    <span class="fa fa-caret-down"></span>
+  </span>
+  <div class="rst-other-versions">
+    <dl>
+      <dt>Tags</dt>
+      <dd><a href="../../../V0.1.0/index.html">V0.1.0</a></dd>
+      <dd><a href="../../../V0.1.1/index.html">V0.1.1</a></dd>
+      <dd><a href="../../../V0.1.10/kernel/sched/cfs.html">V0.1.10</a></dd>
+      <dd><a href="../../../V0.1.2/index.html">V0.1.2</a></dd>
+      <dd><a href="../../../V0.1.3/index.html">V0.1.3</a></dd>
+      <dd><a href="../../../V0.1.4/index.html">V0.1.4</a></dd>
+      <dd><a href="../../../V0.1.5/kernel/sched/cfs.html">V0.1.5</a></dd>
+      <dd><a href="../../../V0.1.6/kernel/sched/cfs.html">V0.1.6</a></dd>
+      <dd><a href="cfs.html">V0.1.7</a></dd>
+      <dd><a href="../../../V0.1.8/kernel/sched/cfs.html">V0.1.8</a></dd>
+      <dd><a href="../../../V0.1.9/kernel/sched/cfs.html">V0.1.9</a></dd>
+      <dd><a href="../../../V0.2.0/kernel/sched/cfs.html">V0.2.0</a></dd>
+      <dd><a href="../../../V0.3.0/kernel/sched/cfs.html">V0.3.0</a></dd>
+      <dd><a href="../../../V0.4.0/kernel/sched/cfs.html">V0.4.0</a></dd>
+    </dl>
+    <dl>
+      <dt>Branches</dt>
+      <dd><a href="../../../master/kernel/sched/cfs.html">master</a></dd>
+    </dl>
+  </div>
+</div><script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script>  
+
+  <style>
+         .wy-nav-content { max-width: 90%; }
+  </style>
+
+
+
+</body>
+</html>

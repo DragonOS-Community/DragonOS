@@ -1,18 +1,17 @@
-# 为DragonOS开发C/C++应用
+# Developing C/C++ Applications for DragonOS
 
-## 编译环境
+## Compilation Environment
 
-&emsp;&emsp;DragonOS与Linux具有部分二进制兼容性，因此可以使用Linux的musl-gcc进行编译。但是由于DragonOS还不支持动态链接，
-因此要增加编译参数`-static`
+DragonOS has partial binary compatibility with Linux, so you can use the musl-gcc compiler from Linux. However, since DragonOS does not currently support dynamic linking, you need to add the compilation parameter `-static`.
 
-比如，您可以使用
+For example, you can use the following command:
 ```shell
 musl-gcc -static -o hello hello.c
 ```
-来编译一个hello.c文件。
+to compile a hello.c file.
 
-在移植现有程序时，可能需要配置`CFLAGS`和`LDFLAGS`，以及`CPPFLAGS`，以便正确地编译，具体请以实际为准。
+When porting existing programs, you may need to configure `CFLAGS`, `LDFLAGS`, and `CPPFLAGS` to ensure correct compilation. Please refer to the actual requirements.
 
-## 配置dadk
+## Configuring DADK
 
-请参考：[Quick Start | DADK](https://docs.dragonos.org.cn/p/dadk/user-manual/quickstart.html)
+Please refer to: [Quick Start | DADK](https://docs.dragonos.org.cn/p/dadk/user-manual/quickstart.html)

@@ -1,35 +1,36 @@
 # SysFS
 
-:::{note}
-本文作者：黄厅
+::: info Author
+Huang Ting
 
-Email: <huangting@DragonOS.org>
+Email: `<huangting@DragonOS.org>`
 :::
 
-## 1. SysFS和设备驱动模型
 
-### 1.1. 设备、驱动、总线等彼此之间关系错综复杂
+## 1. SysFS and Device Driver Model
 
-&emsp;&emsp;如果想让内核运行流畅，那就必须为每个模块编码实现这些功能。如此一来，内核将变得非常臃肿、冗余。而设备模型的理念即是将这些代码抽象成各模块共用的框架，这样不但代码简洁了，也可让设备驱动开发者摆脱这本让人头痛但又必不可少的一劫，将有限的精力放于设备差异性的实现。
+### 1.1. The relationship between devices, drivers, buses, etc., is complex
 
-&emsp;&emsp;设备模型恰是提供了一个模板，一个被证明过的最优的思路和流程，这减少了开发者设计过程中不必要的错误，也给以后的维护扫除了障碍。
+If you want the kernel to run smoothly, you must code these functionalities for each module. This will make the kernel very bloated and redundant. The idea of the device model is to abstract these codes into a shared framework for all modules. This not only makes the code concise, but also allows device driver developers to avoid the headache of this essential but burdensome task, and focus their limited energy on implementing the differences of the devices.
 
-### 1.2. sysfs是一个基于内存的文件系统，它的作用是将内核信息以文件的方式提供给用户程序使用。
+The device model provides a template, an optimal approach and process that has been proven. This reduces unnecessary errors during the development process and clears the way for future maintenance.
 
-&emsp;&emsp;sysfs可以看成与proc,devfs和devpty同类别的文件系统，该文件系统是虚拟的文件系统，可以更方便对系统设备进行管理。它可以产生一个包含所有系统硬件层次视图，与提供进程和状态信息的proc文件系统十分类似。sysfs把连接在系统上的设备和总线组织成为一个分级的文件，它们可以由用户空间存取，向用户空间导出内核的数据结构以及它们的属性。
+### 1.2. sysfs is a memory-based file system, its role is to provide kernel information in the form of files for user programs to use.
 
-## 2. DragosOS中的设备驱动模型
+sysfs can be seen as a file system similar to proc, devfs, and devpty. This file system is virtual and can make it easier to manage system devices. It can generate a hierarchical view of all system hardware, similar to the proc file system that provides process and status information. sysfs organizes the devices and buses connected to the system into a hierarchical file structure, which can be accessed from user space, exporting kernel data structures and their attributes to user space.
 
-### 2.1 由设备和驱动构成基本元素
+## 2. Device Driver Model in DragonOS
 
-#### 2.1.1. 设备
+### 2.1. The basic elements are composed of devices and drivers
+
+#### 2.1.1. Device
 
 ```rust
 /// @brief: 所有设备都应该实现该trait
 pub trait Device: Any + Send + Sync + Debug {}
 ```
 
-&emsp;&emsp;DragonOS采用全局设备管理器管理系统中所有的设备。
+DragonOS uses a global device manager to manage all devices in the system.
 
 ```rust
 /// @brief Device管理器
@@ -40,14 +41,14 @@ pub struct DeviceManager {
 }
 ```
 
-#### 2.1.2. 驱动
+#### 2.1.2. Driver
 
 ```rust
 /// @brief: 所有驱动驱动都应该实现该trait
 pub trait Driver: Any + Send + Sync + Debug {}
 ```
 
-&emsp;&emsp;同样的，驱动也使用全局的驱动管理器来管理
+Similarly, drivers also use a global driver manager for management.
 
 ```rust
 /// @brief: 驱动管理器
@@ -58,9 +59,9 @@ pub struct DriverManager {
 }
 ```
 
-### 2.2. 总线
+### 2.2. Bus
 
-&emsp;&emsp;总线属于设备的一种类型，同样需要驱动来初始化，同时由于总线的特殊性，使用全局的总线管理器来进行管理。
+Bus is a type of device, and it also needs a driver to initialize. Due to the special nature of buses, a global bus manager is used for management.
 
 ```rust
 /// @brief: 总线驱动trait，所有总线驱动都应实现该trait
@@ -78,17 +79,17 @@ pub struct BusManager {
 }
 ```
 
-&emsp;&emsp;可以看到，每个管理器中均存在sys_info，设备模型通过该成员与sysfs建立联系，sys_info指向sysfs中唯一的inode。对于device而言，对应sysfs下的devices文件夹，其他亦是如此。
+As can be seen, each manager contains a sys_info. The device model establishes a connection with sysfs through this member, and sys_info points to the unique inode in sysfs. For a device, it corresponds to the devices folder under sysfs, and the same applies to other components.
 
-## 3. 驱动开发如何进行
+## 3. How to Develop Drivers
 
-&emsp;&emsp;以平台总线platform为例，platform总线是一种虚拟总线，可以对挂载在其上的设备和驱动进行匹配，并驱动设备。该总线是一类设备，同时也是一类总线，编程时需要创建该设备实例，并为设备实例实现Device trait和Bus trait，以表明该结构是一类总线设备。同时，应该实现总线上的匹配规则，不同的总线匹配规则不同，该总线采用匹配表方式进行匹配，设备和驱动都应该存在一份匹配表，表示驱动支持的设备以及设备支持的驱动。
+Taking the platform bus as an example, the platform bus is a virtual bus that can match devices and drivers mounted on it and drive the devices. This bus is a type of device and also a type of bus. When programming, you need to create an instance of this device and implement the Device trait and Bus trait for the device instance to indicate that this structure is a bus device. At the same time, the matching rules on the bus should be implemented. Different buses have different matching rules. This bus uses a matching table for matching, and both devices and drivers should have a matching table, indicating the devices supported by the driver and the drivers supported by the device.
 
 ```rust
 pub struct CompatibleTable(BTreeSet<&'static str>);
 ```
 
-&emsp;&emsp;对于bus设备而言，需要调用bus_register，将bus注册进系统，并在sysfs中可视化。
+For a bus device, you need to call bus_register to register the bus into the system and visualize it in sysfs.
 
 ```rust
 /// @brief: 总线注册，将总线加入全局总线管理器中，并根据id table在sys/bus和sys/devices下生成文件夹
@@ -106,4 +107,4 @@ pub fn bus_register<T: Bus>(bus: Arc<T>) -> Result<(), DeviceError> {
 }
 ```
 
-&emsp;&emsp;通过bus_register源码可知，该函数不仅在sysfs/bus下生成总线文件夹，同时内部调用device_register，该函数将总线加入设备管理器中，同时在sys/devices下生成设备文件夹。
+From the source code of bus_register, we can see that this function not only generates a bus folder under sysfs/bus, but also internally calls device_register. This function adds the bus to the device manager and generates a device folder under sys/devices.

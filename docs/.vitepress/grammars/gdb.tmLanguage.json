@@ -1,0 +1,31 @@
+{
+  "name": "gdb",
+  "scopeName": "source.gdb",
+  "displayName": "GDB",
+  "repository": {},
+  "patterns": [
+    {
+      "name": "comment.line.number-sign.gdb",
+      "match": "#.*$"
+    },
+    {
+      "name": "keyword.control.gdb",
+      "match": "\\b(bt|backtrace|break|tbreak|watch|rwatch|awatch|catch|commands|condition|delete|disable|enable|ignore|clear|continue|finish|next|nexti|step|stepi|until|advance|return|run|start|kill|attach|detach|interrupt|quit|info|thread|threads|frame|select-frame|print|display|undisplay|set|show|list|disassemble|file|target|help|define|document|source)\\b"
+    },
+    {
+      "name": "constant.numeric.gdb",
+      "match": "\\b(0x[0-9a-fA-F]+|\\d+)\\b"
+    },
+    {
+      "name": "string.quoted.double.gdb",
+      "begin": "\"",
+      "end": "\"",
+      "patterns": [
+        {
+          "name": "constant.character.escape.gdb",
+          "match": "\\\\."
+        }
+      ]
+    }
+  ]
+}

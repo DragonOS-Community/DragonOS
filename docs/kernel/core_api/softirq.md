@@ -1,16 +1,16 @@
-# 软中断
+# Soft Interrupt
 
-&emsp;&emsp;软件中断，也可以被称为中断的下半部，用于延迟处理硬中断（中断上半部）未完成的工作。将中断分为两个阶段可以有效解决中断处理时间过长和中断丢失的问题。
+Software interrupt, also known as the bottom half of an interrupt, is used to delay the processing of work that was not completed by the hard interrupt (the top half of the interrupt). Dividing the interrupt into two stages can effectively solve the problems of long interrupt handling time and interrupt loss.
 
-## 1. 设计思路
+## 1. Design Philosophy
 
-&emsp;&emsp;每个cpu都有自己的pending，软中断是“哪个cpu发起，就哪个cpu执行”，每个cpu的pending不共享。同一个软中断向量可以在多核上同时运行。
+Each CPU has its own pending status. Soft interrupts are "initiated by which CPU, executed by which CPU", and the pending status of each CPU is not shared. The same soft interrupt vector can run concurrently on multiple cores.
 
-&emsp;&emsp;当我们需要注册一个新的软中断时，需要为软中断处理程序实现`SoftirqVec`特征，然后调用`register_softirq`函数，将软中断处理程序注册到软中断机制内。
+When we need to register a new soft interrupt, we need to implement the `SoftirqVec` feature for the soft interrupt handler, and then call the `register_softirq` function to register the soft interrupt handler within the soft interrupt mechanism.
 
-&emsp;&emsp;请注意，由于软中断的可重入、可并发性，所以软中断处理程序需要自己保证线程安全。
+Please note that due to the reentrancy and concurrency of soft interrupts, the soft interrupt handler must ensure thread safety itself.
 
-## 2. 软中断向量号
+## 2. Soft Interrupt Vector Number
 
 ```rust
 pub enum SoftirqNumber {
@@ -21,9 +21,9 @@ pub enum SoftirqNumber {
 }
 ```
 
-## 3. 软中断API
+## 3. Soft Interrupt API
 
-### 3.1. SoftirqVec特征
+### 3.1. SoftirqVec Feature
 
 ```rust
 pub trait SoftirqVec: Send + Sync + Debug {
@@ -31,11 +31,12 @@ pub trait SoftirqVec: Send + Sync + Debug {
 }
 ```
 
-&emsp;&emsp;软中断处理程序需要实现的特征，需要实现`run`函数，用于处理软中断。当软中断被执行时，会调用`run`函数。
+The feature that the soft interrupt handler needs to implement. It needs to implement the `run` function to handle the soft interrupt. When the soft interrupt is executed, the `run` function will be called.
 
-### 3.2. Softirq的API
+### 3.2. Softirq API
 
-#### 3.2.1. 注册软中断向量
+#### 3.2.1. Register Soft Interrupt Vector
+
 ```rust
 pub fn register_softirq(&self,
         softirq_num: SoftirqNumber,
@@ -43,62 +44,61 @@ pub fn register_softirq(&self,
     ) -> Result<i32, SystemError>
 ```
 
-- 参数：
-  
-  - softirq_num：中断向量号
-  
-  - hanlder：中断函数对应的结构体，需要指向实现了`SoftirqVec`特征的结构体变量
+- Parameters:
 
-- 返回：
-  
-  - Ok(i32)：0
-  
-  - Err(SystemError)：错误码
+  - softirq_num: Interrupt vector number
 
-#### 3.2.2. 解注册软中断向量
+  - handler: The structure corresponding to the interrupt function, which needs to point to a structure variable that implements the `SoftirqVec` feature
+
+- Return:
+
+  - Ok(i32): 0
+
+  - Err(SystemError): Error code
+
+#### 3.2.2. Unregister Soft Interrupt Vector
 
 ```rust
 pub fn unregister_softirq(&self, softirq_num: SoftirqNumber)
 ```
 
-- 参数：
-  
-  - softirq_num：中断向量号
+- Parameters:
 
+  - softirq_num: Interrupt vector number
 
-#### 3.2.3. 软中断执行
+#### 3.2.3. Execute Soft Interrupt
 
 ```rust
 pub fn do_softirq(&self)
 ```
 
-- 作用：执行软中断函数（**只在硬中断执行后调用**）
+- Purpose: Execute the soft interrupt function (**only called after hard interrupt execution**)
 
-#### 3.2.4. 清除软中断的pending标志
+#### 3.2.4. Clear the Pending Flag of Soft Interrupt
 
 ```rust
 pub unsafe fn clear_softirq_pending(&self, softirq_num: SoftirqNumber)
 ```
 
-- 作用：清除当前CPU上，指定软中断的pending标志。请注意，这个函数是unsafe的，因为它会直接修改pending标志，而没有加锁。
+- Purpose: Clear the pending flag of the specified soft interrupt on the current CPU. Please note that this function is unsafe because it directly modifies the pending flag without locking.
 
-- 参数：
-  
-  - softirq_num：中断向量号
+- Parameters:
 
-#### 3.2.5. 标志软中断需要执行
+  - softirq_num: Interrupt vector number
+
+#### 3.2.5. Mark Soft Interrupt as to be Executed
 
 ```rust
 pub fn raise_softirq(&self, softirq_num: SoftirqNumber)
 ```
 
-- 作用：标志当前CPU上，指定的软中断需要执行
+- Purpose: Mark the specified soft interrupt as to be executed on the current CPU
 
-- 参数：
-  
-  - softirq_num：中断向量号
+- Parameters:
 
-### 3.3. 使用实例
+  - softirq_num: Interrupt vector number
+
+### 3.3. Usage Example
 
 ```rust
 #[derive(Debug)]
@@ -161,4 +161,3 @@ fn main() {
     softirq_vectors().unregister_softirq(SoftirqNumber::from(softirq_num as u64));
 }
 ```
-

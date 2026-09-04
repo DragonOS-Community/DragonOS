@@ -70,10 +70,7 @@ pub(super) fn defer_native_output_after_tx_backpressure(
 pub(super) struct LocalInputDevice<'a, D: SmolDevice + ?Sized> {
     pub(super) device: &'a mut D,
     pub(super) common: &'a IfaceCommon,
-    pub(super) route_policy: &'a crate::net::route::OutputRouteGuard<'a>,
-    pub(super) owner_ifindex: u32,
-    pub(super) owner_is_up: bool,
-    pub(super) authoritative_ipv4_output: bool,
+    pub(super) backend_policy: OutputBackendPolicy<'a>,
 }
 
 /// Delegates receive to the physical device while routing every response and
@@ -82,10 +79,7 @@ pub(super) struct LocalInputDevice<'a, D: SmolDevice + ?Sized> {
 pub(super) struct RoutedTxDevice<'a, D: SmolDevice + ?Sized> {
     pub(super) device: &'a mut D,
     pub(super) queue: &'a LocalInputQueue,
-    pub(super) route_policy: &'a crate::net::route::OutputRouteGuard<'a>,
-    pub(super) owner_ifindex: u32,
-    pub(super) owner_is_up: bool,
-    pub(super) authoritative_ipv4_output: bool,
+    pub(super) backend_policy: OutputBackendPolicy<'a>,
 }
 
 /// A physical transmit token with a lazily admitted namespace-routed fallback.
@@ -97,10 +91,7 @@ pub(super) struct RoutedTxToken<'a, T: SmolTxToken> {
     pub(super) physical: Option<T>,
     pub(super) routed: Option<LocalInputTxToken<'a>>,
     pub(super) queue: &'a LocalInputQueue,
-    pub(super) route_policy: &'a crate::net::route::OutputRouteGuard<'a>,
-    pub(super) owner_ifindex: u32,
-    pub(super) owner_is_up: bool,
-    pub(super) authoritative_ipv4_output: bool,
+    pub(super) backend_policy: OutputBackendPolicy<'a>,
     pub(super) capabilities: DeviceCapabilities,
 }
 
@@ -110,32 +101,43 @@ pub(super) enum OutputBackendDecision {
     Deferred(Option<crate::net::route::OutputRouteDecision>),
 }
 
-pub(super) fn classify_output_backend(
-    route_policy: &crate::net::route::OutputRouteGuard<'_>,
-    owner_ifindex: u32,
-    owner_is_up: bool,
-    authoritative_ipv4_output: bool,
-    version: smoltcp::wire::IpVersion,
-    destination: smoltcp::wire::IpAddress,
-    meta: PacketMeta,
-) -> OutputBackendDecision {
-    if version != smoltcp::wire::IpVersion::Ipv4 {
-        return OutputBackendDecision::NativeOwner;
-    }
-    let constrained_oif = (meta.id != 0).then_some(meta.id);
-    match route_policy.lookup(destination, constrained_oif) {
-        Some(route) if route.kind == crate::net::route::RTN_LOCAL => {
-            OutputBackendDecision::Deferred(Some(route))
+#[derive(Clone, Copy)]
+pub(super) struct OutputBackendPolicy<'a> {
+    pub(super) routes: &'a crate::net::route::OutputRouteGuard<'a>,
+    pub(super) configured_neighbors: Option<&'a crate::net::neighbor::NeighborReadGuard<'a>>,
+    pub(super) owner_ifindex: u32,
+    pub(super) owner_is_up: bool,
+    pub(super) authoritative_ipv4_output: bool,
+}
+
+impl OutputBackendPolicy<'_> {
+    pub(super) fn classify(
+        self,
+        version: smoltcp::wire::IpVersion,
+        destination: smoltcp::wire::IpAddress,
+        meta: PacketMeta,
+    ) -> OutputBackendDecision {
+        if version != smoltcp::wire::IpVersion::Ipv4 {
+            return OutputBackendDecision::NativeOwner;
         }
-        Some(route)
-            if route.oif == owner_ifindex
-                && owner_is_up
-                && (!authoritative_ipv4_output
-                    || route.table != crate::net::route::RT_TABLE_DEFAULT) =>
-        {
-            OutputBackendDecision::NativeOwner
+        let constrained_oif = (meta.id != 0).then_some(meta.id);
+        match self.routes.lookup(destination, constrained_oif) {
+            Some(route) if route.kind == crate::net::route::RTN_LOCAL => {
+                OutputBackendDecision::Deferred(Some(route))
+            }
+            Some(route)
+                if route.oif == self.owner_ifindex
+                    && self.owner_is_up
+                    && !self.configured_neighbors.is_some_and(|neighbors| {
+                        neighbors.lookup(route.oif, route.next_hop).is_some()
+                    })
+                    && (!self.authoritative_ipv4_output
+                        || route.table != crate::net::route::RT_TABLE_DEFAULT) =>
+            {
+                OutputBackendDecision::NativeOwner
+            }
+            route => OutputBackendDecision::Deferred(route),
         }
-        route => OutputBackendDecision::Deferred(route),
     }
 }
 
@@ -230,10 +232,7 @@ pub(super) struct LocalInputTxToken<'a> {
     pub(super) medium: smoltcp::phy::Medium,
     pub(super) meta: PacketMeta,
     pub(super) disposition: LocalOutputDisposition,
-    pub(super) route_policy: &'a crate::net::route::OutputRouteGuard<'a>,
-    pub(super) owner_ifindex: u32,
-    pub(super) owner_is_up: bool,
-    pub(super) authoritative_ipv4_output: bool,
+    pub(super) backend_policy: OutputBackendPolicy<'a>,
     pub(super) owner_ip_mtu: usize,
     pub(super) reservation: LocalOutputReservation<'a>,
     pub(super) scratch: LocalInputScratch<'a>,
@@ -246,15 +245,7 @@ impl SmolTxToken for LocalInputTxToken<'_> {
         destination: smoltcp::wire::IpAddress,
         meta: PacketMeta,
     ) -> Result<Option<smoltcp::phy::TxEgressOverride>, smoltcp::phy::TxEgressError> {
-        let decision = classify_output_backend(
-            self.route_policy,
-            self.owner_ifindex,
-            self.owner_is_up,
-            self.authoritative_ipv4_output,
-            version,
-            destination,
-            meta,
-        );
+        let decision = self.backend_policy.classify(version, destination, meta);
         self.apply_backend_decision(decision)
     }
 
@@ -286,10 +277,7 @@ impl SmolTxToken for LocalInputTxToken<'_> {
             medium,
             meta,
             disposition,
-            route_policy: _,
-            owner_ifindex: _,
-            owner_is_up: _,
-            authoritative_ipv4_output: _,
+            backend_policy: _,
             owner_ip_mtu: _,
             reservation,
             mut scratch,
@@ -391,15 +379,7 @@ impl<T: SmolTxToken> SmolTxToken for RoutedTxToken<'_, T> {
         destination: smoltcp::wire::IpAddress,
         meta: PacketMeta,
     ) -> Result<Option<smoltcp::phy::TxEgressOverride>, smoltcp::phy::TxEgressError> {
-        let decision = classify_output_backend(
-            self.route_policy,
-            self.owner_ifindex,
-            self.owner_is_up,
-            self.authoritative_ipv4_output,
-            version,
-            destination,
-            meta,
-        );
+        let decision = self.backend_policy.classify(version, destination, meta);
         if matches!(decision, OutputBackendDecision::NativeOwner) {
             if self.physical.is_none() {
                 return Err(smoltcp::phy::TxEgressError::Exhausted);
@@ -410,15 +390,8 @@ impl<T: SmolTxToken> SmolTxToken for RoutedTxToken<'_, T> {
                 context: LocalOutputDisposition::NATIVE_CONTEXT,
             }));
         }
-        let mut routed = local_tx_token(
-            self.queue,
-            self.route_policy,
-            self.owner_ifindex,
-            self.owner_is_up,
-            self.authoritative_ipv4_output,
-            self.capabilities.clone(),
-        )
-        .ok_or(smoltcp::phy::TxEgressError::Exhausted)?;
+        let mut routed = local_tx_token(self.queue, self.backend_policy, self.capabilities.clone())
+            .ok_or(smoltcp::phy::TxEgressError::Exhausted)?;
         let override_ = routed.apply_backend_decision(decision)?;
         self.routed = Some(routed);
         Ok(override_)
@@ -442,15 +415,8 @@ impl<T: SmolTxToken> SmolTxToken for RoutedTxToken<'_, T> {
                 .map(|_| ())
                 .ok_or(smoltcp::phy::TxEgressError::Exhausted);
         }
-        let mut routed = local_tx_token(
-            self.queue,
-            self.route_policy,
-            self.owner_ifindex,
-            self.owner_is_up,
-            self.authoritative_ipv4_output,
-            self.capabilities.clone(),
-        )
-        .ok_or(smoltcp::phy::TxEgressError::Exhausted)?;
+        let mut routed = local_tx_token(self.queue, self.backend_policy, self.capabilities.clone())
+            .ok_or(smoltcp::phy::TxEgressError::Exhausted)?;
         routed.apply_egress_override(Some(egress))?;
         self.routed = Some(routed);
         Ok(())
@@ -481,28 +447,19 @@ impl<'a, D: SmolDevice + ?Sized> LocalInputDevice<'a, D> {
     pub(super) fn new(
         device: &'a mut D,
         common: &'a IfaceCommon,
-        route_policy: &'a crate::net::route::OutputRouteGuard<'a>,
-        owner_ifindex: u32,
-        owner_is_up: bool,
-        authoritative_ipv4_output: bool,
+        backend_policy: OutputBackendPolicy<'a>,
     ) -> Self {
         Self {
             device,
             common,
-            route_policy,
-            owner_ifindex,
-            owner_is_up,
-            authoritative_ipv4_output,
+            backend_policy,
         }
     }
 
     pub(super) fn tx_token(&self) -> Option<LocalInputTxToken<'a>> {
         local_tx_token(
             &self.common.local_input_queue,
-            self.route_policy,
-            self.owner_ifindex,
-            self.owner_is_up,
-            self.authoritative_ipv4_output,
+            self.backend_policy,
             self.device.capabilities(),
         )
     }
@@ -510,10 +467,7 @@ impl<'a, D: SmolDevice + ?Sized> LocalInputDevice<'a, D> {
 
 pub(super) fn local_tx_token<'a>(
     queue: &'a LocalInputQueue,
-    route_policy: &'a crate::net::route::OutputRouteGuard<'a>,
-    owner_ifindex: u32,
-    owner_is_up: bool,
-    authoritative_ipv4_output: bool,
+    backend_policy: OutputBackendPolicy<'a>,
     capabilities: DeviceCapabilities,
 ) -> Option<LocalInputTxToken<'a>> {
     let mut reservation = queue.reserve_output()?;
@@ -526,10 +480,7 @@ pub(super) fn local_tx_token<'a>(
         medium: capabilities.medium,
         meta: PacketMeta::default(),
         disposition: LocalOutputDisposition::NativeOwner,
-        route_policy,
-        owner_ifindex,
-        owner_is_up,
-        authoritative_ipv4_output,
+        backend_policy,
         owner_ip_mtu: capabilities.ip_mtu(),
         reservation,
         scratch,
@@ -601,10 +552,7 @@ impl<D: SmolDevice + ?Sized> SmolDevice for RoutedTxDevice<'_, D> {
                 physical: Some(physical),
                 routed: None,
                 queue: self.queue,
-                route_policy: self.route_policy,
-                owner_ifindex: self.owner_ifindex,
-                owner_is_up: self.owner_is_up,
-                authoritative_ipv4_output: self.authoritative_ipv4_output,
+                backend_policy: self.backend_policy,
                 capabilities,
             },
         ))
@@ -617,10 +565,7 @@ impl<D: SmolDevice + ?Sized> SmolDevice for RoutedTxDevice<'_, D> {
             physical,
             routed: None,
             queue: self.queue,
-            route_policy: self.route_policy,
-            owner_ifindex: self.owner_ifindex,
-            owner_is_up: self.owner_is_up,
-            authoritative_ipv4_output: self.authoritative_ipv4_output,
+            backend_policy: self.backend_policy,
             capabilities,
         })
     }
@@ -734,7 +679,22 @@ pub(super) fn transmit_admitted_routed_output(
         } => {
             iface.common().reset_local_output_tx_backoff();
             match reservation.requeue_deferred(packet, retry_at, probe_sent) {
-                Ok(()) => AdmittedRoutedOutput::Queued(retry_at),
+                Ok(()) => {
+                    let released = iface.net_namespace().is_some_and(|netns| {
+                        crate::net::neighbor::release_deferred_after_enqueue(
+                            &netns,
+                            iface.common(),
+                            oif,
+                            next_hop,
+                        )
+                    });
+                    let retry_at = if released {
+                        crate::time::Instant::now().into()
+                    } else {
+                        retry_at
+                    };
+                    AdmittedRoutedOutput::Queued(retry_at)
+                }
                 Err(packet) => AdmittedRoutedOutput::Drop(packet, SystemError::ENOBUFS),
             }
         }

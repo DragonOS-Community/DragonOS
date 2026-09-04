@@ -15,6 +15,7 @@ normal/open_dangling_symlink
 normal/rtnetlink_link_semantics
 normal/rtnetlink_permission_semantics
 normal/rtnetlink_serialization_semantics
+normal/rtnetlink_neigh_semantics
 normal/socket_getsockopt_semantics
 normal/socket_ioctl_netdev_query
 normal/tcp_self_connect_semantics

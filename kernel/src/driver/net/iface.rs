@@ -186,11 +186,15 @@ pub trait Iface: crate::driver::base::device::Device {
             .map_err(|_| RouteSendError::Failed(SystemError::ENOMEM))?;
         let frame_prepared = Cell::new(false);
         let permanent_neighbor = self
-            .common()
-            .static_neighbors()
-            .iter()
-            .find(|entry| entry.ip_addr == smoltcp::wire::IpAddress::Ipv4(next_hop))
-            .map(|entry| entry.hw_addr);
+            .net_namespace()
+            .and_then(|netns| {
+                crate::net::neighbor::lookup(
+                    &netns,
+                    self.nic_id() as u32,
+                    smoltcp::wire::IpAddress::Ipv4(next_hop),
+                )
+            })
+            .map(smoltcp::wire::HardwareAddress::Ethernet);
 
         let dispatch = {
             let mut interface = self.smol_iface().lock();
@@ -244,8 +248,9 @@ pub trait Iface: crate::driver::base::device::Device {
             return Err(SystemError::EAFNOSUPPORT);
         };
         let napi = self.napi_struct();
-        let netns = napi.is_none().then(|| self.net_namespace()).flatten();
-        if napi.is_none() && netns.is_none() {
+        let owner_netns = self.net_namespace();
+        let scheduler_netns = napi.is_none().then(|| owner_netns.clone()).flatten();
+        if napi.is_none() && scheduler_netns.is_none() {
             return Err(SystemError::ENODEV);
         }
         if let Some(retry_at) = self.common().enqueue_existing_routed_output(
@@ -253,7 +258,8 @@ pub trait Iface: crate::driver::base::device::Device {
             next_hop,
             ip_packet,
         )? {
-            self.common().schedule_local_output(retry_at, napi, netns);
+            self.common()
+                .schedule_local_output(retry_at, napi, scheduler_netns);
             return Ok(());
         }
         let tx_generation = self.common().tx_completion_generation();
@@ -280,7 +286,8 @@ pub trait Iface: crate::driver::base::device::Device {
                     } else {
                         retry_at
                     };
-                    self.common().schedule_local_output(retry_at, napi, netns);
+                    self.common()
+                        .schedule_local_output(retry_at, napi, scheduler_netns);
                     return Ok(());
                 }
                 Err(RouteSendError::Failed(error)) => return Err(error),
@@ -293,7 +300,20 @@ pub trait Iface: crate::driver::base::device::Device {
             retry_at,
             probe_sent,
         )?;
-        self.common().schedule_local_output(retry_at, napi, netns);
+        let retry_at = if owner_netns.as_ref().is_some_and(|netns| {
+            crate::net::neighbor::release_deferred_after_enqueue(
+                netns,
+                self.common(),
+                self.nic_id() as u32,
+                next_hop,
+            )
+        }) {
+            crate::time::Instant::now().into()
+        } else {
+            retry_at
+        };
+        self.common()
+            .schedule_local_output(retry_at, napi, scheduler_netns);
         Ok(())
     }
 
@@ -493,14 +513,6 @@ impl Default for NetDeviceCommonData {
             operstate: Operstate::IF_OPER_UNKNOWN,
         }
     }
-}
-
-#[derive(Debug, Clone)]
-pub struct StaticNeighborEntry {
-    pub ip_addr: smoltcp::wire::IpAddress,
-    pub hw_addr: smoltcp::wire::HardwareAddress,
-    pub state: u16,
-    pub flags: u8,
 }
 
 /// 将网络设备注册到sysfs中

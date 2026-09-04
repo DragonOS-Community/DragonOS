@@ -114,6 +114,7 @@ normal/rtnetlink_addr_semantics
 normal/rtnetlink_route_lifecycle_semantics
 normal/rtnetlink_route_semantics
 normal/rtnetlink_serialization_semantics
+normal/rtnetlink_neigh_semantics
 normal/udp_bind_to_device_semantics
 normal/tty_termios
 normal/inotify_dir_watch

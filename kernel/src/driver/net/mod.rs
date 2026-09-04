@@ -11,7 +11,7 @@ use sysfs::{netdev_emit_uevent, netdev_register_kobject, netdev_unregister_kobje
 
 use crate::driver::net::napi::NapiStruct;
 use crate::driver::net::types::{InterfaceFlags, InterfaceType};
-use crate::libs::rwsem::{RwSem, RwSemReadGuard};
+use crate::libs::rwsem::RwSemReadGuard;
 use crate::libs::spinlock::SpinLock;
 use crate::net::routing::RouterEnableDeviceCommon;
 use crate::process::namespace::net_namespace::NetNamespace;

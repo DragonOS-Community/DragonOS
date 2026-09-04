@@ -6,6 +6,7 @@ use crate::libs::mutex::Mutex;
 use crate::libs::rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use crate::libs::rwsem::{RwSem, RwSemReadGuard, RwSemWriteGuard};
 use crate::libs::wait_queue::WaitQueue;
+use crate::net::neighbor::NeighborTable;
 use crate::net::routing::Router;
 use crate::net::socket::inet::datagram::udp_bindings::UdpBindingTable;
 use crate::net::socket::netlink::table::{
@@ -109,6 +110,8 @@ pub struct NetNamespace {
     /// 注意：该结构会在 bind/connect 等路径被访问，且这些路径可能会获取可睡眠的 Mutex，
     /// 因此这里使用可睡眠的 `RwSem`，避免自旋锁 + schedule 的组合导致崩溃。
     device_list: RwSem<BTreeMap<usize, Arc<dyn Iface>>>,
+    /// Configured, non-aging neighbors owned by this network namespace.
+    neighbor_table: NeighborTable,
     /// Per-netns UDP port reservation and local-delivery table.
     udp_bindings: UdpBindingTable,
     /// Lock-free read-side snapshot for AF_PACKET delivery from NAPI context.
@@ -498,6 +501,7 @@ impl NetNamespace {
             inner: RwLock::new(inner),
             poller: NetnsPoller::new(self_ref.clone()),
             device_list: RwSem::new(BTreeMap::new()),
+            neighbor_table: NeighborTable::new(),
             udp_bindings: UdpBindingTable::default(),
             packet_sockets: RcuArcSlot::new(Arc::new(PacketSocketRegistrySnapshot::default())),
             packet_sockets_writer: Mutex::new(PacketSocketRegistryWriter::new()),
@@ -538,6 +542,7 @@ impl NetNamespace {
             inner: RwLock::new(inner),
             poller: NetnsPoller::new(self_ref.clone()),
             device_list: RwSem::new(BTreeMap::new()),
+            neighbor_table: NeighborTable::new(),
             udp_bindings: UdpBindingTable::default(),
             packet_sockets: RcuArcSlot::new(Arc::new(PacketSocketRegistrySnapshot::default())),
             packet_sockets_writer: Mutex::new(PacketSocketRegistryWriter::new()),
@@ -586,6 +591,10 @@ impl NetNamespace {
 
     pub fn device_list(&self) -> RwSemReadGuard<'_, BTreeMap<usize, Arc<dyn Iface>>> {
         self.device_list.read()
+    }
+
+    pub(crate) fn neighbor_table(&self) -> &NeighborTable {
+        &self.neighbor_table
     }
 
     pub(crate) fn udp_bindings(&self) -> &UdpBindingTable {
@@ -1105,6 +1114,7 @@ impl NetNamespace {
             );
             return;
         }
+        crate::net::neighbor::remove_iface(&rtnl, &netns, *nic_id as u32);
         let Some(removed) = devices.remove(nic_id) else {
             unreachable!("RTNL keeps the checked interface registered")
         };

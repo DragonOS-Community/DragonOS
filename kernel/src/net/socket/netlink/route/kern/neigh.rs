@@ -1,223 +1,317 @@
+use alloc::{sync::Arc, vec::Vec};
+
+use smoltcp::wire::{EthernetAddress, IpAddress, Ipv4Address, Ipv6Address};
+use system_error::SystemError;
+
 use crate::{
-    driver::net::StaticNeighborEntry,
-    net::socket::{
-        netlink::route::message::{
-            attr::neigh::NeighAttr,
-            segment::{neigh::NeighSegment, RouteNlSegment},
+    net::{
+        neighbor::{
+            self, NeighborEntry, NeighborMutationOutcome, NeighborNewFlags, NeighborSnapshot,
+            NeighborUpdate, NUD_FAILED,
         },
-        netlink::{
+        rtnl::RtnlGuard,
+        socket::netlink::{
             message::segment::{
-                header::{CMsgSegHdr, GetRequestFlags, SegHdrCommonFlags},
+                header::{CMsgSegHdr, GetRequestFlags, NewRequestFlags, SegHdrCommonFlags},
                 CSegmentType,
             },
             route::{
                 kern::utils::{
                     finish_response, kernel_notify_header, multicast_notify, RTMGRP_NEIGH,
                 },
-                message::segment::neigh::{NeighSegmentBody, NeighState},
+                message::{
+                    attr::neigh::{NeighAttr, NeighAttrClass},
+                    segment::{
+                        neigh::{NeighSegment, NeighSegmentBody},
+                        RouteNlSegment,
+                    },
+                },
             },
         },
-        AddressFamily,
     },
     process::namespace::net_namespace::NetNamespace,
 };
-use alloc::sync::Arc;
-use alloc::vec::Vec;
-use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, Ipv4Address, Ipv6Address};
-use system_error::SystemError;
+
+const AF_UNSPEC: u8 = 0;
+const AF_INET: u8 = 2;
+const AF_INET6: u8 = 10;
+const NTF_PROXY: u8 = 0x08;
+
+#[derive(Default)]
+struct ParsedNeighborAttrs<'a> {
+    destination: Option<&'a [u8]>,
+    lladdr: Option<&'a [u8]>,
+    ifindex: Option<u32>,
+    master: Option<u32>,
+    flags_ext: Option<u32>,
+    protocol: Option<u8>,
+}
+
+impl<'a> ParsedNeighborAttrs<'a> {
+    /// Apply Linux's `nda_policy` for operations which call
+    /// nlmsg_parse_deprecated(), preserving last-attribute-wins semantics.
+    fn from_policy_segment(segment: &'a NeighSegment) -> Result<Self, SystemError> {
+        let mut parsed = Self::default();
+        for attr in segment.attrs() {
+            validate_neighbor_attr(attr)?;
+            match attr.class() {
+                NeighAttrClass::DST => parsed.destination = Some(attr.payload()),
+                NeighAttrClass::LLADDR => parsed.lladdr = Some(attr.payload()),
+                NeighAttrClass::IFINDEX => parsed.ifindex = Some(read_u32(attr.payload())?),
+                NeighAttrClass::MASTER => parsed.master = Some(read_u32(attr.payload())?),
+                NeighAttrClass::FLAGS_EXT => parsed.flags_ext = Some(read_u32(attr.payload())?),
+                NeighAttrClass::PROTOCOL => parsed.protocol = attr.payload().first().copied(),
+                _ => {}
+            }
+        }
+        Ok(parsed)
+    }
+}
+
+const MAX_ADDR_LEN: usize = 32;
+const NTF_EXT_MANAGED: u32 = 1;
+
+fn validate_neighbor_attr(attr: &NeighAttr) -> Result<(), SystemError> {
+    let payload = attr.payload();
+    match attr.class() {
+        NeighAttrClass::DST | NeighAttrClass::LLADDR if payload.len() > MAX_ADDR_LEN => {
+            Err(SystemError::ERANGE)
+        }
+        NeighAttrClass::CACHEINFO if payload.len() < 16 => Err(SystemError::ERANGE),
+        NeighAttrClass::PROBES
+        | NeighAttrClass::VNI
+        | NeighAttrClass::IFINDEX
+        | NeighAttrClass::MASTER
+            if payload.len() < size_of::<u32>() =>
+        {
+            Err(SystemError::ERANGE)
+        }
+        NeighAttrClass::VLAN | NeighAttrClass::PORT if payload.len() < size_of::<u16>() => {
+            Err(SystemError::ERANGE)
+        }
+        NeighAttrClass::PROTOCOL if payload.is_empty() => Err(SystemError::ERANGE),
+        NeighAttrClass::NH_ID if payload.len() != size_of::<u32>() || attr.is_nested() => {
+            Err(SystemError::EINVAL)
+        }
+        NeighAttrClass::FLAGS_EXT => {
+            if payload.len() != size_of::<u32>() || attr.is_nested() {
+                return Err(SystemError::EINVAL);
+            }
+            let flags = read_u32(payload)?;
+            if flags & !NTF_EXT_MANAGED != 0 {
+                Err(SystemError::EINVAL)
+            } else {
+                Ok(())
+            }
+        }
+        NeighAttrClass::FDB_EXT_ATTRS if !attr.is_nested() => Err(SystemError::EINVAL),
+        NeighAttrClass::FDB_EXT_ATTRS
+            if !payload.is_empty()
+                && payload.len()
+                    < size_of::<crate::net::socket::netlink::message::attr::CAttrHeader>() =>
+        {
+            Err(SystemError::ERANGE)
+        }
+        NeighAttrClass::NDM_STATE_MASK | NeighAttrClass::NDM_FLAGS_MASK => Err(SystemError::EINVAL),
+        _ => Ok(()),
+    }
+}
+
+fn read_u32(payload: &[u8]) -> Result<u32, SystemError> {
+    let bytes = payload.get(..size_of::<u32>()).ok_or(SystemError::EINVAL)?;
+    Ok(u32::from_ne_bytes(
+        bytes.try_into().map_err(|_| SystemError::EINVAL)?,
+    ))
+}
 
 pub(super) fn do_get_neigh(
-    request_segment: &NeighSegment,
+    request: &NeighSegment,
     netns: Arc<NetNamespace>,
 ) -> Result<Vec<RouteNlSegment>, SystemError> {
-    let dump_all = GetRequestFlags::from_bits_truncate(request_segment.header().flags)
-        .contains(GetRequestFlags::DUMP);
-    if !dump_all {
+    if !GetRequestFlags::from_bits_truncate(request.header().flags).contains(GetRequestFlags::DUMP)
+    {
         return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
     }
 
-    let requested_family = request_segment.body().family;
-    let requested_ifindex = if request_segment.body().ifindex > 0 {
-        Some(request_segment.body().ifindex as usize)
+    let family = request.body().family;
+    if request.body().flags == NTF_PROXY {
+        // Linux selects the separate proxy-neighbor table only for this exact
+        // flag value. DragonOS has no proxy table, so never expose normal
+        // configured entries as a proxy dump.
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+    }
+    // DragonOS does not expose NETLINK_GET_STRICT_CHK yet. Linux's non-strict
+    // dump path discards filter-policy errors and continues unfiltered.
+    let attrs = ParsedNeighborAttrs::from_policy_segment(request).unwrap_or_default();
+    let ifindex_filter = attrs.ifindex.filter(|ifindex| *ifindex != 0);
+    if attrs.master.is_some_and(|master| master != 0) {
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+    }
+    let filtered = ifindex_filter.is_some();
+    let entries = if matches!(family, AF_UNSPEC | AF_INET | AF_INET6) {
+        neighbor::snapshot(&netns)?
     } else {
-        None
+        NeighborSnapshot::empty()
     };
-
     let mut response = Vec::new();
-    for (_, iface) in netns.device_list().iter() {
-        if requested_ifindex.is_some_and(|ifindex| iface.nic_id() != ifindex) {
+    response
+        .try_reserve_exact(entries.len().saturating_add(1))
+        .map_err(|_| SystemError::ENOMEM)?;
+
+    for entry in entries.iter().copied() {
+        if !family_matches(family, entry.destination)
+            || ifindex_filter.is_some_and(|ifindex| entry.ifindex != ifindex)
+        {
             continue;
         }
-
-        for entry in iface.common().static_neighbors().iter() {
-            if !family_matches(requested_family, family_of_ip(entry.ip_addr)) {
-                continue;
-            }
-            response.push(RouteNlSegment::NewNeigh(neigh_to_segment(
-                request_segment.header(),
-                iface.nic_id() as i32,
-                entry,
-                CSegmentType::NEWNEIGH,
-            )));
-        }
+        response.push(RouteNlSegment::NewNeigh(neigh_to_segment(
+            request.header(),
+            entry,
+            CSegmentType::NEWNEIGH,
+            true,
+            filtered,
+        )?));
     }
 
-    finish_response(request_segment.header(), true, &mut response)?;
+    finish_response(request.header(), true, &mut response)?;
     Ok(response)
 }
 
 pub(super) fn do_new_neigh(
-    request_segment: &NeighSegment,
+    rtnl: &RtnlGuard,
+    request: &NeighSegment,
     netns: Arc<NetNamespace>,
 ) -> Result<Vec<RouteNlSegment>, SystemError> {
-    if request_segment.body().ifindex <= 0 {
-        return Err(SystemError::EINVAL);
-    }
-    let ifindex =
-        usize::try_from(request_segment.body().ifindex).map_err(|_| SystemError::EINVAL)?;
-    let iface = netns
-        .device_list()
-        .get(&ifindex)
-        .cloned()
-        .ok_or(SystemError::ENODEV)?;
-    let family = request_segment.body().family;
-    let ip = request_segment
-        .attrs()
-        .iter()
-        .find_map(|attr| match attr {
-            NeighAttr::Destination(bytes) => Some(bytes.as_slice()),
-            NeighAttr::LinkLocalAddress(_) => None,
-        })
-        .ok_or(SystemError::EINVAL)
-        .and_then(|bytes| parse_ip(bytes, family))?;
-    let lladdr_bytes = request_segment.attrs().iter().find_map(|attr| match attr {
-        NeighAttr::LinkLocalAddress(bytes) => Some(bytes.as_slice()),
-        NeighAttr::Destination(_) => None,
-    });
-    let hw_addr = match lladdr_bytes {
-        Some(bytes) => parse_mac(bytes)?,
-        None => return Err(SystemError::EINVAL),
+    let attrs = ParsedNeighborAttrs::from_policy_segment(request)?;
+    let destination = attrs.destination.ok_or(SystemError::EINVAL)?;
+    let ifindex = parse_ifindex(request.body().ifindex)?;
+    let iface = if let Some(ifindex) = ifindex {
+        Some(
+            netns
+                .device_list()
+                .get(&(ifindex as usize))
+                .cloned()
+                .ok_or(SystemError::ENODEV)?,
+        )
+    } else {
+        None
     };
+    // For a specified device Linux validates its link address before family;
+    // with ifindex zero it has no device length and reaches family first.
+    let lladdr = if iface.as_ref().is_some_and(|iface| {
+        iface.common().type_() == crate::driver::net::types::InterfaceType::ETHER
+    }) {
+        attrs.lladdr.map(parse_mac).transpose()?
+    } else {
+        None
+    };
+    let destination = parse_ip(destination, request.body().family)?;
+    let ifindex = ifindex.ok_or(SystemError::EINVAL)?;
+    let iface = iface.ok_or(SystemError::EINVAL)?;
+    let nl_flags = NewRequestFlags::from_bits_truncate(request.header().flags);
+    let outcome = neighbor::add(
+        rtnl,
+        &netns,
+        &iface,
+        NeighborUpdate {
+            ifindex,
+            destination,
+            lladdr,
+            state: request.body().state,
+            flags: request.body().flags,
+            protocol: attrs.protocol.unwrap_or(0),
+            flags_ext: attrs.flags_ext.unwrap_or(0),
+        },
+        NeighborNewFlags {
+            replace: nl_flags.contains(NewRequestFlags::REPLACE),
+            excl: nl_flags.contains(NewRequestFlags::EXCL),
+            create: nl_flags.contains(NewRequestFlags::CREATE),
+        },
+    )?;
 
-    let entry = StaticNeighborEntry {
-        ip_addr: ip,
-        hw_addr,
-        state: request_segment.body().state.bits(),
-        flags: request_segment.body().flags,
+    let changed = match outcome {
+        NeighborMutationOutcome::Added(entry) => Some(entry),
+        NeighborMutationOutcome::Updated { new, .. } => Some(new),
+        NeighborMutationOutcome::Unchanged(_) => None,
     };
-    iface.common().set_static_neighbor(entry.clone());
-    multicast_notify(
-        netns,
-        RTMGRP_NEIGH,
-        RouteNlSegment::NewNeigh(neigh_to_segment(
-            &kernel_notify_header(CSegmentType::NEWNEIGH),
-            iface.nic_id() as i32,
-            &entry,
-            CSegmentType::NEWNEIGH,
-        )),
-    );
+    if let Some(entry) = changed {
+        notify_entry(&netns, entry, CSegmentType::NEWNEIGH, true);
+    }
     Ok(Vec::new())
 }
 
 pub(super) fn do_del_neigh(
-    request_segment: &NeighSegment,
+    rtnl: &RtnlGuard,
+    request: &NeighSegment,
     netns: Arc<NetNamespace>,
 ) -> Result<Vec<RouteNlSegment>, SystemError> {
-    if request_segment.body().ifindex <= 0 {
-        return Err(SystemError::EINVAL);
-    }
-    let ifindex =
-        usize::try_from(request_segment.body().ifindex).map_err(|_| SystemError::EINVAL)?;
-    let iface = netns
-        .device_list()
-        .get(&ifindex)
-        .cloned()
-        .ok_or(SystemError::ENODEV)?;
-    let family = request_segment.body().family;
-    let ip = request_segment
+    // Linux's neigh_delete() uses nlmsg_find_attr(), so unlike NEW and dump,
+    // the first duplicate NDA_DST is the selector.
+    let destination = request
         .attrs()
         .iter()
         .find_map(|attr| match attr {
-            NeighAttr::Destination(bytes) => Some(bytes.as_slice()),
-            NeighAttr::LinkLocalAddress(_) => None,
+            attr if attr.class() == NeighAttrClass::DST => Some(attr.payload()),
+            _ => None,
         })
-        .ok_or(SystemError::EINVAL)
-        .and_then(|bytes| parse_ip(bytes, family))?;
-
-    if !iface.common().remove_static_neighbor(ip) {
-        return Err(SystemError::ENOENT);
+        .ok_or(SystemError::EINVAL)?;
+    let ifindex = parse_ifindex(request.body().ifindex)?;
+    let iface = if let Some(ifindex) = ifindex {
+        Some(
+            netns
+                .device_list()
+                .get(&(ifindex as usize))
+                .cloned()
+                .ok_or(SystemError::ENODEV)?,
+        )
+    } else {
+        None
+    };
+    let destination = parse_ip(destination, request.body().family)?;
+    if request.body().flags & NTF_PROXY != 0 {
+        // NTF_PROXY selects Linux's separate proxy-neighbor table. It must
+        // never delete a normal configured entry when that table is absent.
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
     }
+    let iface = iface.ok_or(SystemError::EINVAL)?;
+    let removed = neighbor::delete(rtnl, &netns, &iface, destination)?;
 
-    multicast_notify(
-        netns,
-        RTMGRP_NEIGH,
-        RouteNlSegment::DelNeigh(neigh_to_segment(
-            &kernel_notify_header(CSegmentType::DELNEIGH),
-            iface.nic_id() as i32,
-            &StaticNeighborEntry {
-                ip_addr: ip,
-                hw_addr: HardwareAddress::Ethernet(EthernetAddress::default()),
-                state: request_segment.body().state.bits(),
-                flags: request_segment.body().flags,
-            },
-            CSegmentType::DELNEIGH,
-        )),
-    );
-
+    // Linux first invalidates a valid neighbour, then removes it. Both
+    // notifications carry NUD_FAILED and omit NDA_LLADDR because FAILED is
+    // not a valid neighbour state.
+    let failed = NeighborEntry {
+        state: NUD_FAILED,
+        ..removed
+    };
+    notify_entry(&netns, failed, CSegmentType::NEWNEIGH, false);
+    notify_entry(&netns, failed, CSegmentType::DELNEIGH, false);
     Ok(Vec::new())
 }
 
-fn neigh_to_segment(
-    request_header: &CMsgSegHdr,
-    ifindex: i32,
-    entry: &StaticNeighborEntry,
-    msg_type: CSegmentType,
-) -> NeighSegment {
-    let header = crate::net::socket::netlink::message::segment::header::CMsgSegHdr {
-        len: 0,
-        type_: msg_type as u16,
-        flags: SegHdrCommonFlags::empty().bits(),
-        seq: request_header.seq,
-        pid: request_header.pid,
-    };
-    let body = NeighSegmentBody {
-        family: family_of_ip(entry.ip_addr),
-        ifindex,
-        state: NeighState::from_bits_truncate(entry.state),
-        flags: entry.flags,
-        kind: crate::net::socket::netlink::route::message::segment::route::RouteType::Unicast,
-    };
-    let mut attrs = vec![NeighAttr::Destination(ip_to_bytes(entry.ip_addr))];
-    if let HardwareAddress::Ethernet(addr) = entry.hw_addr {
-        attrs.push(NeighAttr::LinkLocalAddress(addr.as_bytes().to_vec()));
+fn parse_ifindex(ifindex: i32) -> Result<Option<u32>, SystemError> {
+    if ifindex == 0 {
+        return Ok(None);
     }
-    NeighSegment::new(header, body, attrs)
+    u32::try_from(ifindex)
+        .map(Some)
+        .map_err(|_| SystemError::ENODEV)
 }
 
-fn family_matches(requested_family: AddressFamily, actual_family: AddressFamily) -> bool {
-    requested_family == AddressFamily::Unspecified || requested_family == actual_family
+fn family_matches(requested: u8, destination: IpAddress) -> bool {
+    requested == AF_UNSPEC
+        || requested
+            == match destination {
+                IpAddress::Ipv4(_) => AF_INET,
+                IpAddress::Ipv6(_) => AF_INET6,
+            }
 }
 
-fn family_of_ip(ip: IpAddress) -> AddressFamily {
-    match ip {
-        IpAddress::Ipv4(_) => AddressFamily::INet,
-        IpAddress::Ipv6(_) => AddressFamily::INet6,
-    }
-}
-
-fn ip_to_bytes(ip: IpAddress) -> Vec<u8> {
-    match ip {
-        IpAddress::Ipv4(addr) => addr.octets().to_vec(),
-        IpAddress::Ipv6(addr) => addr.octets().to_vec(),
-    }
-}
-
-fn parse_ip(bytes: &[u8], family: AddressFamily) -> Result<IpAddress, SystemError> {
+fn parse_ip(bytes: &[u8], family: u8) -> Result<IpAddress, SystemError> {
     match family {
-        AddressFamily::INet if bytes.len() == 4 => Ok(IpAddress::Ipv4(Ipv4Address::new(
+        AF_INET if bytes.len() >= 4 => Ok(IpAddress::Ipv4(Ipv4Address::new(
             bytes[0], bytes[1], bytes[2], bytes[3],
         ))),
-        AddressFamily::INet6 if bytes.len() == 16 => Ok(IpAddress::Ipv6(Ipv6Address::new(
+        AF_INET6 if bytes.len() >= 16 => Ok(IpAddress::Ipv6(Ipv6Address::new(
             u16::from_be_bytes([bytes[0], bytes[1]]),
             u16::from_be_bytes([bytes[2], bytes[3]]),
             u16::from_be_bytes([bytes[4], bytes[5]]),
@@ -227,16 +321,102 @@ fn parse_ip(bytes: &[u8], family: AddressFamily) -> Result<IpAddress, SystemErro
             u16::from_be_bytes([bytes[12], bytes[13]]),
             u16::from_be_bytes([bytes[14], bytes[15]]),
         ))),
-        _ => Err(SystemError::EINVAL),
+        AF_INET | AF_INET6 => Err(SystemError::EINVAL),
+        _ => Err(SystemError::EAFNOSUPPORT),
     }
 }
 
-fn parse_mac(bytes: &[u8]) -> Result<HardwareAddress, SystemError> {
-    if bytes.len() != 6 {
+fn parse_mac(bytes: &[u8]) -> Result<EthernetAddress, SystemError> {
+    if bytes.len() < 6 {
         return Err(SystemError::EINVAL);
     }
+    let mut mac = [0; 6];
+    mac.copy_from_slice(&bytes[..6]);
+    Ok(EthernetAddress(mac))
+}
 
-    let mut mac = [0u8; 6];
-    mac.copy_from_slice(bytes);
-    Ok(HardwareAddress::Ethernet(EthernetAddress(mac)))
+fn notify_entry(
+    netns: &Arc<NetNamespace>,
+    entry: NeighborEntry,
+    kind: CSegmentType,
+    include_lladdr: bool,
+) {
+    match neigh_to_segment(
+        &kernel_notify_header(kind),
+        entry,
+        kind,
+        include_lladdr,
+        false,
+    ) {
+        Ok(segment) => multicast_notify(
+            netns.clone(),
+            RTMGRP_NEIGH,
+            match kind {
+                CSegmentType::DELNEIGH => RouteNlSegment::DelNeigh(segment),
+                _ => RouteNlSegment::NewNeigh(segment),
+            },
+        ),
+        Err(error) => log::warn!("failed to allocate neighbour notification: {:?}", error),
+    }
+}
+
+fn neigh_to_segment(
+    request_header: &CMsgSegHdr,
+    entry: NeighborEntry,
+    kind: CSegmentType,
+    include_lladdr: bool,
+    dump_filtered: bool,
+) -> Result<NeighSegment, SystemError> {
+    let mut flags = SegHdrCommonFlags::empty();
+    if dump_filtered {
+        flags.insert(SegHdrCommonFlags::DUMP_FILTERED);
+    }
+    let header = CMsgSegHdr {
+        len: 0,
+        type_: kind as u16,
+        flags: flags.bits(),
+        seq: request_header.seq,
+        pid: request_header.pid,
+    };
+    let body = NeighSegmentBody {
+        family: match entry.destination {
+            IpAddress::Ipv4(_) => AF_INET,
+            IpAddress::Ipv6(_) => AF_INET6,
+        },
+        ifindex: i32::try_from(entry.ifindex).map_err(|_| SystemError::EINVAL)?,
+        state: entry.state,
+        flags: entry.flags,
+        kind: entry.kind,
+    };
+    let mut attrs = Vec::new();
+    attrs
+        .try_reserve_exact(3 + usize::from(include_lladdr))
+        .map_err(|_| SystemError::ENOMEM)?;
+    attrs.push(NeighAttr::destination(ip_to_bytes(entry.destination)?));
+    if let Some(lladdr) = include_lladdr.then_some(entry.lladdr).flatten() {
+        attrs.push(NeighAttr::link_local_address(copy_bytes(
+            lladdr.as_bytes(),
+        )?));
+    }
+    // Linux neigh_fill_info() always emits these attributes. Configured
+    // non-aging entries have no probe activity or NUD timer history, so a
+    // stable all-zero cache record is the honest projection of our model.
+    attrs.push(NeighAttr::probes(copy_bytes(&0u32.to_ne_bytes())?));
+    attrs.push(NeighAttr::cache_info(copy_bytes(&[0; 16])?));
+    Ok(NeighSegment::new(header, body, attrs))
+}
+
+fn ip_to_bytes(ip: IpAddress) -> Result<Vec<u8>, SystemError> {
+    match ip {
+        IpAddress::Ipv4(address) => copy_bytes(&address.octets()),
+        IpAddress::Ipv6(address) => copy_bytes(&address.octets()),
+    }
+}
+
+fn copy_bytes(bytes: &[u8]) -> Result<Vec<u8>, SystemError> {
+    let mut copy = Vec::new();
+    copy.try_reserve_exact(bytes.len())
+        .map_err(|_| SystemError::ENOMEM)?;
+    copy.extend_from_slice(bytes);
+    Ok(copy)
 }

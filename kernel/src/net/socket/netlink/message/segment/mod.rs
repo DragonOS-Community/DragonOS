@@ -115,6 +115,9 @@ pub trait SegmentBody: Sized + Clone + Copy {
     fn write_to_buf(&self, buf: &mut Vec<u8>) -> Result<(), SystemError> {
         // log::info!("SegmentBody write_to_buf");
         let c_type = Self::CType::from(*self);
+        let additional_len = Self::total_len_with_padding();
+        buf.try_reserve(additional_len)
+            .map_err(|_| SystemError::ENOMEM)?;
 
         let body_bytes = unsafe {
             core::slice::from_raw_parts(
@@ -128,7 +131,8 @@ pub trait SegmentBody: Sized + Clone + Copy {
         let padding_len = Self::padding_len();
 
         if padding_len > 0 {
-            buf.extend(vec![0u8; padding_len]);
+            let old_len = buf.len();
+            buf.resize(old_len + padding_len, 0);
         }
 
         Ok(())

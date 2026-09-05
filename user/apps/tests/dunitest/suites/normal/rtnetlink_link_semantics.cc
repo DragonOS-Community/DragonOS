@@ -716,10 +716,15 @@ int RunFreshNetnsSysfsProjectionCase() {
     if (result == 0) {
         const std::string class_new = mountpoint + "/class/net/" + renamed;
         const std::string device_new = mountpoint + "/devices/virtual/net/" + renamed;
+        const std::string subsystem = device_new + "/subsystem";
         struct stat class_link_after {};
         struct stat class_target_after {};
         struct stat device_after {};
+        struct stat subsystem_device {};
         struct stat ignored {};
+        char subsystem_target[PATH_MAX] = {};
+        const ssize_t subsystem_target_len =
+            readlink(subsystem.c_str(), subsystem_target, sizeof(subsystem_target));
         if (lstat(class_old.c_str(), &ignored) == 0 || errno != ENOENT ||
             stat(device_old.c_str(), &ignored) == 0 || errno != ENOENT ||
             lstat(class_new.c_str(), &class_link_after) != 0 ||
@@ -729,7 +734,10 @@ int RunFreshNetnsSysfsProjectionCase() {
             class_target_after.st_ino != device_after.st_ino ||
             device_after.st_ino != device_before.st_ino ||
             !DirectoryContainsOnly(mountpoint + "/class/net", renamed) ||
-            !DirectoryContainsOnly(mountpoint + "/devices/virtual/net", renamed)) {
+            !DirectoryContainsOnly(mountpoint + "/devices/virtual/net", renamed) ||
+            subsystem_target_len <= 0 || subsystem_target[0] == '/' ||
+            stat((subsystem + "/" + renamed).c_str(), &subsystem_device) != 0 ||
+            subsystem_device.st_ino != device_after.st_ino) {
             result = 15;
         }
         // The inherited boot mount remains bound to the initial netns.

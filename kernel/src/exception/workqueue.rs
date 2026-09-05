@@ -1,4 +1,12 @@
-use alloc::{boxed::Box, collections::VecDeque, string::ToString, sync::Arc};
+use alloc::{
+    boxed::Box,
+    string::ToString,
+    sync::{Arc, Weak},
+};
+use core::{
+    fmt,
+    sync::atomic::{AtomicBool, Ordering},
+};
 use lazy_static::lazy_static;
 use log;
 
@@ -13,6 +21,8 @@ use crate::{
 /// Represents a work item to be executed in a workqueue.
 pub struct Work {
     func: Box<dyn Fn() + Send + Sync>,
+    next: SpinLock<Option<Arc<Work>>>,
+    pending: AtomicBool,
 }
 
 impl Work {
@@ -21,7 +31,11 @@ impl Work {
     where
         F: Fn() + Send + Sync + 'static,
     {
-        Arc::new(Self { func: Box::new(f) })
+        Arc::new(Self {
+            func: Box::new(f),
+            next: SpinLock::new(None),
+            pending: AtomicBool::new(false),
+        })
     }
 
     /// Execute the work item.
@@ -30,9 +44,23 @@ impl Work {
     }
 }
 
+impl fmt::Debug for Work {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Work")
+            .field("pending", &self.pending.load(Ordering::Relaxed))
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug, Default)]
+struct WorkList {
+    head: Option<Arc<Work>>,
+    tail: Option<Weak<Work>>,
+}
+
 /// A workqueue that manages a list of works and a worker thread.
 pub struct WorkQueue {
-    queue: SpinLock<VecDeque<Arc<Work>>>,
+    queue: SpinLock<WorkList>,
     wait_queue: Arc<WaitQueue>,
     worker: SpinLock<Option<Arc<ProcessControlBlock>>>,
 }
@@ -42,7 +70,7 @@ impl WorkQueue {
     /// This will spawn a kernel thread with the given name.
     pub fn new(name: &str) -> Arc<Self> {
         let wq = Arc::new(Self {
-            queue: SpinLock::new(VecDeque::new()),
+            queue: SpinLock::new(WorkList::default()),
             wait_queue: Arc::new(WaitQueue::default()),
             worker: SpinLock::new(None),
         });
@@ -62,8 +90,39 @@ impl WorkQueue {
 
     /// Enqueue a work item to the workqueue.
     pub fn enqueue(&self, work: Arc<Work>) {
-        self.queue.lock().push_back(work);
+        let mut queue = self.queue.lock();
+        if work.pending.swap(true, Ordering::AcqRel) {
+            return;
+        }
+
+        debug_assert!(work.next.lock().is_none());
+        let new_tail = Arc::downgrade(&work);
+        if let Some(tail) = queue.tail.take().and_then(|tail| tail.upgrade()) {
+            *tail.next.lock() = Some(work);
+        } else {
+            debug_assert!(queue.head.is_none());
+            queue.head = Some(work);
+        }
+        queue.tail = Some(new_tail);
+        drop(queue);
         self.wait_queue.wakeup(None);
+    }
+
+    fn pop(&self) -> Option<Arc<Work>> {
+        let mut queue = self.queue.lock();
+        let work = queue.head.take()?;
+        queue.head = work.next.lock().take();
+        if queue.head.is_none() {
+            queue.tail = None;
+        }
+        // Clear PENDING while holding the queue lock. The work may enqueue
+        // itself once run() starts without racing this dequeue operation.
+        work.pending.store(false, Ordering::Release);
+        Some(work)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.queue.lock().head.is_none()
     }
 }
 
@@ -73,11 +132,11 @@ fn worker_loop(wq: Arc<WorkQueue>) -> i32 {
         // Wait for work
         let _ = wq
             .wait_queue
-            .wait_event_interruptible(|| !wq.queue.lock().is_empty(), None::<fn()>);
+            .wait_event_interruptible(|| !wq.is_empty(), None::<fn()>);
 
         // Process works
         loop {
-            let work = wq.queue.lock().pop_front();
+            let work = wq.pop();
             match work {
                 Some(w) => w.run(),
                 None => break,

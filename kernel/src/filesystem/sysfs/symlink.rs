@@ -105,7 +105,10 @@ impl SysFS {
     ) -> Result<(), SystemError> {
         let target_inode = target.inode().ok_or(SystemError::ENOENT)?;
 
-        let target_abs_path = if inode.namespace_children_enabled() {
+        // A link exposed through a namespace-filtered sysfs view must remain
+        // inside that mount. This covers both class links stored under a
+        // namespace-enabled parent and links inside a tagged device inode.
+        let target_abs_path = if inode.namespace_children_enabled() || inode.namespace().is_some() {
             let target_parent = target_inode.parent().ok_or(SystemError::ENOENT)?;
             self.child_relative_path(inode, &target_parent, &target_inode.name())?
         } else {

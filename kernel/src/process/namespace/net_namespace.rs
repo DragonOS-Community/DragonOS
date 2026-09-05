@@ -6,6 +6,7 @@ use crate::init::initcall::INITCALL_SUBSYS;
 use crate::libs::mutex::Mutex;
 use crate::libs::rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use crate::libs::rwsem::{RwSem, RwSemReadGuard, RwSemWriteGuard};
+use crate::libs::spinlock::SpinLock;
 use crate::libs::wait_queue::WaitQueue;
 use crate::net::neighbor::NeighborTable;
 use crate::net::routing::Router;
@@ -56,6 +57,58 @@ pub static mut NETNS_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 const PACKET_SOCKET_CLEANUP_RETRY_MIN: Duration = Duration::from_millis(100);
 const PACKET_SOCKET_CLEANUP_RETRY_MAX: Duration = Duration::from_secs(5);
+
+type NetnsDeviceMap = BTreeMap<usize, Arc<dyn Iface>>;
+
+#[derive(Debug)]
+struct NetnsTeardownWork {
+    devices: Arc<SpinLock<Option<NetnsDeviceMap>>>,
+    work: Arc<Work>,
+}
+
+impl NetnsTeardownWork {
+    fn new() -> Self {
+        let devices = Arc::new(SpinLock::new(None));
+        let worker_devices = devices.clone();
+        let work = Work::new(move || {
+            let devices = worker_devices
+                .lock()
+                .take()
+                .expect("queued netns teardown work must own its device payload");
+            teardown_netns_devices(devices);
+        });
+        Self { devices, work }
+    }
+
+    fn enqueue(&self, devices: NetnsDeviceMap) {
+        let mut slot = self.devices.lock();
+        debug_assert!(slot.is_none());
+        *slot = Some(devices);
+        drop(slot);
+        NETNS_TEARDOWN_WQ.enqueue(self.work.clone());
+    }
+}
+
+fn teardown_netns_devices(devices: NetnsDeviceMap) {
+    for iface in devices.values() {
+        iface.common().close_tx_and_wait();
+        iface.begin_admin_down();
+    }
+    for iface in devices.values() {
+        if let Some(napi) = iface.napi_struct() {
+            crate::driver::net::napi::napi_pause_and_wait(&napi);
+            iface.quiesce_admin_down();
+            crate::driver::net::napi::napi_disable(&napi);
+        } else {
+            iface.quiesce_admin_down();
+        }
+    }
+    for iface in devices.values() {
+        iface.clear_net_state(crate::driver::net::NetDeivceState::__LINK_STATE_PRESENT);
+        crate::driver::net::netdev_unregister_kobject(iface.clone());
+        iface.clear_net_namespace();
+    }
+}
 
 fn try_snapshot_devices(
     devices: &BTreeMap<usize, Arc<dyn Iface>>,
@@ -113,7 +166,9 @@ pub struct NetNamespace {
     ///
     /// 注意：该结构会在 bind/connect 等路径被访问，且这些路径可能会获取可睡眠的 Mutex，
     /// 因此这里使用可睡眠的 `RwSem`，避免自旋锁 + schedule 的组合导致崩溃。
-    device_list: RwSem<BTreeMap<usize, Arc<dyn Iface>>>,
+    device_list: RwSem<NetnsDeviceMap>,
+    /// Preallocated payload slot and work item for allocation-free final drop.
+    teardown_work: NetnsTeardownWork,
     /// Configured, non-aging neighbors owned by this network namespace.
     neighbor_table: NeighborTable,
     /// Per-netns UDP port reservation and local-delivery table.
@@ -505,6 +560,7 @@ impl NetNamespace {
             inner: RwLock::new(inner),
             poller: NetnsPoller::new(self_ref.clone()),
             device_list: RwSem::new(BTreeMap::new()),
+            teardown_work: NetnsTeardownWork::new(),
             neighbor_table: NeighborTable::new(),
             udp_bindings: UdpBindingTable::default(),
             packet_sockets: RcuArcSlot::new(Arc::new(PacketSocketRegistrySnapshot::default())),
@@ -545,6 +601,7 @@ impl NetNamespace {
             inner: RwLock::new(inner),
             poller: NetnsPoller::new(self_ref.clone()),
             device_list: RwSem::new(BTreeMap::new()),
+            teardown_work: NetnsTeardownWork::new(),
             neighbor_table: NeighborTable::new(),
             udp_bindings: UdpBindingTable::default(),
             packet_sockets: RcuArcSlot::new(Arc::new(PacketSocketRegistrySnapshot::default())),
@@ -1195,33 +1252,14 @@ impl Drop for NetNamespace {
         }
 
         // The last netns Arc may be released by its own NAPI poll stack. Move
-        // the devices out without allocating and defer every blocking teardown
-        // step to process context, where waiting for the in-flight poll cannot
-        // self-deadlock. The namespace-owned FIB and neighbor state disappear
-        // with this object, so the worker only quiesces devices and removes
-        // their driver-core/sysfs projections.
+        // the devices into the preallocated work payload and enqueue it without
+        // allocating. Every blocking teardown step then runs in process context,
+        // where waiting for the in-flight poll cannot self-deadlock. The
+        // namespace-owned FIB and neighbor state disappear with this object, so
+        // the worker only quiesces devices and removes driver-core projections.
         let devices = core::mem::take(self.device_list.get_mut());
         if !devices.is_empty() {
-            NETNS_TEARDOWN_WQ.enqueue(Work::new(move || {
-                for iface in devices.values() {
-                    iface.common().close_tx_and_wait();
-                    iface.begin_admin_down();
-                }
-                for iface in devices.values() {
-                    if let Some(napi) = iface.napi_struct() {
-                        crate::driver::net::napi::napi_pause_and_wait(&napi);
-                        iface.quiesce_admin_down();
-                        crate::driver::net::napi::napi_disable(&napi);
-                    } else {
-                        iface.quiesce_admin_down();
-                    }
-                }
-                for iface in devices.values() {
-                    iface.clear_net_state(crate::driver::net::NetDeivceState::__LINK_STATE_PRESENT);
-                    crate::driver::net::netdev_unregister_kobject(iface.clone());
-                    iface.clear_net_namespace();
-                }
-            }));
+            self.teardown_work.enqueue(devices);
         }
     }
 }

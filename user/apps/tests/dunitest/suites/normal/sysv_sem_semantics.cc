@@ -7,6 +7,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <memory>
 #include <sched.h>
 #include <signal.h>
 #include <stdint.h>
@@ -19,6 +20,7 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+#include <vector>
 
 #ifndef SYS_semget
 #define SYS_semget 64
@@ -1510,9 +1512,11 @@ TEST(SysVSem, SemUndoUnshareSysvsem) {
     int phase[2];
     int supervisor_release[2];
     int old_owner_release[2];
+    int old_owner_ready[2];
     ASSERT_EQ(0, pipe(phase));
     ASSERT_EQ(0, pipe(supervisor_release));
     ASSERT_EQ(0, pipe(old_owner_release));
+    ASSERT_EQ(0, pipe(old_owner_ready));
     pid_t supervisor = fork();
     ASSERT_GE(supervisor, 0);
     ChildGuard supervisor_guard(supervisor);
@@ -1524,10 +1528,13 @@ TEST(SysVSem, SemUndoUnshareSysvsem) {
             _exit(90);
         }
         alignas(16) char stack[16384];
-        CloneUndoArgs args = {sem.id(), -1, old_owner_release[0]};
+        CloneUndoArgs args = {sem.id(), old_owner_ready[1], old_owner_release[0]};
         pid_t old_owner = clone(CloneSysvsemUndoChild, stack + sizeof(stack),
                                 CLONE_SYSVSEM | SIGCHLD, &args);
-        if (old_owner < 0 || unshare(CLONE_SYSVSEM) != 0 ||
+        close(old_owner_ready[1]);
+        char ready;
+        if (old_owner < 0 || !ReadExact(old_owner_ready[0], &ready, sizeof(ready)) ||
+            unshare(CLONE_SYSVSEM) != 0 ||
             !SemUndoOpMustSucceed(sem.id(), 0, 1)) {
             _exit(91);
         }
@@ -1552,6 +1559,8 @@ TEST(SysVSem, SemUndoUnshareSysvsem) {
     phase_write.Close();
     supervisor_read.Close();
     old_owner_read.Close();
+    close(old_owner_ready[0]);
+    close(old_owner_ready[1]);
     char token;
     ASSERT_TRUE(ReadExact(phase_read.get(), &token, sizeof(token)));
     EXPECT_EQ(3, SemCtl(sem.id(), 0, GETVAL, 0))
@@ -1608,6 +1617,58 @@ TEST(SysVSem, SemtimedopCopiesNonNullTimeoutBeforeNsopsValidation) {
         << "non-null timeout must be copied before nsops == 0 is rejected";
 }
 
+TEST(SysVSem, RawSyscallIntArgumentsUseLow32Bits) {
+    static_assert(sizeof(unsigned long) == 8, "64-bit syscall ABI test");
+    const unsigned long high = 1UL << 32;
+    int id = static_cast<int>(syscall(SYS_semget, IPC_PRIVATE, high | 1, IPC_CREAT | 0600));
+    ASSERT_GE(id, 0);
+    SemSet sem(id, true);
+    struct sembuf zero = {0, 0, 0};
+    struct timespec timeout = {0, 0};
+    EXPECT_EQ(0, syscall(SYS_semop, high | id, &zero, high | 1));
+    EXPECT_EQ(0, syscall(SYS_semtimedop, high | id, &zero, high | 1, &timeout));
+    EXPECT_EQ(0, syscall(SYS_semctl, high | id, high, high | GETVAL, 0UL));
+    EXPECT_EQ(0, syscall(SYS_semctl, high | id, high, high | SETVAL, high | 7));
+    EXPECT_EQ(7, SemCtl(id, 0, GETVAL, 0));
+    unsigned short value = 0;
+    EXPECT_EQ(0, syscall(SYS_semctl, high | id, ~0UL, high | GETALL, &value));
+    EXPECT_EQ(7, value) << "GETALL ignores even negative semnum and preserves pointer width";
+    struct seminfo info = {};
+    EXPECT_GE(syscall(SYS_semctl, 0UL, ~0UL, high | IPC_INFO, &info), 0);
+    errno = 0;
+    EXPECT_EQ(-1, syscall(SYS_semctl, 0xffffffffUL, 0UL, IPC_INFO, &info));
+    EXPECT_EQ(EINVAL, errno);
+    errno = 0;
+    EXPECT_EQ(-1, syscall(SYS_semget, IPC_PRIVATE, high | 0xffffffffUL, IPC_CREAT | 0600));
+    EXPECT_EQ(EINVAL, errno);
+}
+
+TEST(SysVSem, RawSyscallCombinedErrorOrder) {
+    SemSet sem(1, IPC_CREAT | 0600);
+    ASSERT_TRUE(sem.valid());
+    struct sembuf zero = {0, 0, 0};
+    struct timespec invalid_value = {0, -1};
+    auto bad_ops = reinterpret_cast<struct sembuf*>(static_cast<uintptr_t>(1));
+    const unsigned long negative_id = 0xffffffffUL;
+    errno = 0;
+    EXPECT_EQ(-1, syscall(SYS_semtimedop, sem.id(), &zero, 501UL, &invalid_value));
+    EXPECT_EQ(E2BIG, errno);
+    errno = 0;
+    EXPECT_EQ(-1, syscall(SYS_semtimedop, sem.id(), bad_ops, 1UL, &invalid_value));
+    EXPECT_EQ(EFAULT, errno);
+    for (long nr : {static_cast<long>(SYS_semop), static_cast<long>(SYS_semtimedop)}) {
+        errno = 0;
+        EXPECT_EQ(-1, syscall(nr, negative_id, &zero, 501UL, nullptr));
+        EXPECT_EQ(E2BIG, errno);
+        errno = 0;
+        EXPECT_EQ(-1, syscall(nr, negative_id, bad_ops, 1UL, nullptr));
+        EXPECT_EQ(EFAULT, errno);
+        errno = 0;
+        EXPECT_EQ(-1, syscall(nr, negative_id, &zero, 1UL, nullptr));
+        EXPECT_EQ(EINVAL, errno);
+    }
+}
+
 TEST(SysVSem, SemUndoIpcNamespaceAndErrnos) {
     SemSet sem(1, IPC_CREAT | 0600);
     ASSERT_TRUE(sem.valid());
@@ -1624,25 +1685,28 @@ TEST(SysVSem, SemUndoIpcNamespaceAndErrnos) {
     EXPECT_EQ(-1, syscall(SYS_semop, sem.id(), &invalid_semnum, 501));
     EXPECT_EQ(E2BIG, errno);
 
-    int report_pipe[2];
-    ASSERT_EQ(0, pipe(report_pipe));
-    pid_t child = fork();
-    ASSERT_GE(child, 0);
-    ChildGuard invalid_child(child);
-    if (child == 0) {
-        close(report_pipe[0]);
-        _exit(RunNamespaceSetnsChild(sem.id(), -1, CLONE_NEWIPC | CLONE_SYSVSEM, report_pipe[1]));
+    for (bool valid_fd : {false, true}) {
+        int report_pipe[2];
+        ASSERT_EQ(0, pipe(report_pipe));
+        pid_t child = fork();
+        ASSERT_GE(child, 0);
+        ChildGuard invalid_child(child);
+        if (child == 0) {
+            close(report_pipe[0]);
+            _exit(RunNamespaceSetnsChild(sem.id(), valid_fd ? report_pipe[1] : -1,
+                                        CLONE_NEWIPC | CLONE_SYSVSEM, report_pipe[1]));
+        }
+        FdGuard report_read(report_pipe[0]);
+        FdGuard report_write(report_pipe[1]);
+        report_write.Close();
+        NamespaceUndoReport report = {};
+        ASSERT_TRUE(ReadNamespaceReportAndReap(report_read.get(), &invalid_child, &report));
+        EXPECT_EQ(-1, report.setns_result);
+        EXPECT_EQ(valid_fd ? EINVAL : EBADF, report.setns_errno);
+        EXPECT_EQ(1, report.value_before_exit);
+        EXPECT_EQ(0, SemCtl(sem.id(), 0, GETVAL, 0))
+            << "failed setns prepare must preserve old debt until child exit";
     }
-    FdGuard report_read(report_pipe[0]);
-    FdGuard report_write(report_pipe[1]);
-    report_write.Close();
-    NamespaceUndoReport report = {};
-    ASSERT_TRUE(ReadNamespaceReportAndReap(report_read.get(), &invalid_child, &report));
-    EXPECT_EQ(-1, report.setns_result);
-    EXPECT_EQ(EINVAL, report.setns_errno);
-    EXPECT_EQ(1, report.value_before_exit);
-    EXPECT_EQ(0, SemCtl(sem.id(), 0, GETVAL, 0))
-        << "failed setns prepare must preserve old debt until child exit";
 }
 
 TEST(SysVSem, SemUndoNamespaceFdDetachesAttachment) {
@@ -2087,6 +2151,99 @@ TEST(SysVSem, RemoveWhileWaiting) {
 }
 
 // ============ concurrency ============
+
+TEST(SysVSem, WaitQueuesGrowForConstAndAlterOperations) {
+    constexpr int kWaiters = 32;
+    for (bool constant : {true, false}) {
+        SemSet sem(1, IPC_CREAT | 0600);
+        ASSERT_TRUE(sem.valid());
+        ASSERT_EQ(0, SemCtl(sem.id(), 0, SETVAL, constant ? 1 : 0));
+        std::vector<std::unique_ptr<ChildGuard>> children;
+        for (int i = 0; i < kWaiters; ++i) {
+            pid_t pid = fork();
+            ASSERT_GE(pid, 0);
+            if (pid == 0) {
+                struct sembuf op = {0, static_cast<short>(constant ? 0 : -1), 0};
+                _exit(SemOp(sem.id(), &op, 1) == 0 ? 0 : 111);
+            }
+            children.emplace_back(new ChildGuard(pid));
+        }
+        ASSERT_TRUE(constant ? WaitForZcnt(sem.id(), 0, kWaiters)
+                             : WaitForNcnt(sem.id(), 0, kWaiters));
+        ASSERT_EQ(0, SemCtl(sem.id(), 0, SETVAL, constant ? 0 : kWaiters));
+        for (auto& child : children) {
+            WaitChildOk(child.get());
+        }
+        EXPECT_EQ(0, SemCtl(sem.id(), 0, GETVAL, 0));
+        EXPECT_EQ(0, SemCtl(sem.id(), 0, constant ? GETZCNT : GETNCNT, 0));
+    }
+}
+
+TEST(SysVSem, IndependentUndoGroupsSteadyStateAndSetall) {
+    constexpr int kWorkers = 32;
+    std::vector<std::unique_ptr<SemSet>> sets;
+    std::vector<std::unique_ptr<ChildGuard>> children;
+    std::vector<std::unique_ptr<FdGuard>> ready_reads;
+    std::vector<std::unique_ptr<FdGuard>> release_writes;
+    for (int i = 0; i < kWorkers; ++i) {
+        sets.emplace_back(new SemSet(1, IPC_CREAT | 0600));
+        ASSERT_TRUE(sets.back()->valid());
+        int ready[2], release[2];
+        ASSERT_EQ(0, pipe(ready));
+        ASSERT_EQ(0, pipe(release));
+        pid_t pid = fork();
+        ASSERT_GE(pid, 0);
+        if (pid == 0) {
+            close(ready[0]);
+            close(release[1]);
+            const int id = sets.back()->id();
+            char token = 1;
+            // Register every group before the parent starts the steady-state phase.
+            if (!SemUndoOpMustSucceed(id, 0, 1) ||
+                !WriteExact(ready[1], &token, 1) || !ReadExact(release[0], &token, 1)) {
+                _exit(112);
+            }
+            for (int j = 0; j < 100; ++j) {
+                if (!SemUndoOpMustSucceed(id, 0, 1) || !SemUndoOpMustSucceed(id, 0, -1)) {
+                    _exit(113);
+                }
+            }
+            if (!WriteExact(ready[1], &token, 1) || !ReadExact(release[0], &token, 1)) {
+                _exit(114);
+            }
+            _exit(0);
+        }
+        children.emplace_back(new ChildGuard(pid));
+        close(ready[1]);
+        close(release[0]);
+        ready_reads.emplace_back(new FdGuard(ready[0]));
+        release_writes.emplace_back(new FdGuard(release[1]));
+    }
+    char token = 1;
+    for (auto& ready : ready_reads) {
+        ASSERT_TRUE(ReadExact(ready->get(), &token, 1));
+    }
+    for (auto& release : release_writes) {
+        ASSERT_TRUE(WriteExact(release->get(), &token, 1));
+    }
+    for (auto& ready : ready_reads) {
+        ASSERT_TRUE(ReadExact(ready->get(), &token, 1));
+    }
+    for (auto& sem : sets) {
+        EXPECT_EQ(1, SemCtl(sem->id(), 0, GETVAL, 0));
+        unsigned short value = 9;
+        ASSERT_EQ(0, SemCtl(sem->id(), 0, SETALL, reinterpret_cast<unsigned long>(&value)));
+    }
+    for (auto& release : release_writes) {
+        ASSERT_TRUE(WriteExact(release->get(), &token, 1));
+    }
+    for (auto& child : children) {
+        WaitChildOk(child.get());
+    }
+    for (auto& sem : sets) {
+        EXPECT_EQ(9, SemCtl(sem->id(), 0, GETVAL, 0)) << "SETALL clears each group's exit debt";
+    }
+}
 
 TEST(SysVSem, ConcurrentWorkers) {
     constexpr int kWorkers = 8;

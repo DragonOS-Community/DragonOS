@@ -31,11 +31,14 @@ impl Syscall for SysSemgetHandle {
 
     fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let key = SemKey::new(args[0] as u32 as usize);
-        let nsems = args[1];
+        let nsems = args[1] as i32;
+        if nsems < 0 {
+            return Err(SystemError::EINVAL);
+        }
         let semflg = SemFlags::from_bits_truncate(args[2] as u32);
         let ipcns = ProcessManager::current_ipcns();
         let mut guard = ipcns.sem.lock();
-        guard.semget(key, nsems, semflg)
+        guard.semget(key, nsems as usize, semflg)
     }
 
     fn entry_format(&self, args: &[usize]) -> Vec<FormattedSyscallParam> {

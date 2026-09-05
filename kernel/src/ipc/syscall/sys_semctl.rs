@@ -139,17 +139,17 @@ pub(super) fn do_kernel_semctl(
 impl SysSemctlHandle {
     #[inline(always)]
     fn semid(args: &[usize]) -> SemId {
-        SemId::new(args[0])
+        SemId::new(args[0] as u32 as usize)
     }
 
     #[inline(always)]
     fn semnum(args: &[usize]) -> usize {
-        args[1]
+        args[1] as u32 as usize
     }
 
     #[inline(always)]
     fn cmd(args: &[usize]) -> SemCtlCmd {
-        SemCtlCmd::from(args[2])
+        SemCtlCmd::from(args[2] as u32 as usize)
     }
 
     #[inline(always)]
@@ -164,7 +164,7 @@ impl Syscall for SysSemctlHandle {
     }
 
     fn handle(&self, args: &[usize], frame: &mut TrapFrame) -> Result<usize, SystemError> {
-        if args[0] > i32::MAX as usize || args[2] > i32::MAX as usize {
+        if (args[0] as i32) < 0 {
             return Err(SystemError::EINVAL);
         }
         let semid = Self::semid(args);

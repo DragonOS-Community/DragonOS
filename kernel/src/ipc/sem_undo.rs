@@ -27,6 +27,9 @@ pub struct SemUndoGroup {
 #[derive(Debug)]
 struct SemUndoGroupState {
     task_owners: usize,
+    /// Published once in the bound IPC namespace's manager registry. Clearing
+    /// records does not unregister a live group; only dead Weak entries expire.
+    registry_registered: bool,
     records: Vec<SemUndoRecord>,
     reserved_records: usize,
     absence_generation: u64,
@@ -235,6 +238,7 @@ impl SemUndoGroup {
             ipc_ns: Arc::downgrade(ipc_ns),
             inner: SpinLock::new(SemUndoGroupState {
                 task_owners: 1,
+                registry_registered: false,
                 records: Vec::new(),
                 reserved_records: 0,
                 absence_generation: 0,
@@ -245,6 +249,16 @@ impl SemUndoGroup {
             }),
         })
         .map_err(|_| SystemError::ENOMEM)
+    }
+
+    /// The bound namespace's manager lock serializes registration callers.
+    pub(crate) fn registry_registered(&self) -> bool {
+        self.inner.lock_irqsave().registry_registered
+    }
+
+    /// Called only after the manager has successfully inserted its Weak entry.
+    pub(crate) fn mark_registry_registered(&self) {
+        self.inner.lock_irqsave().registry_registered = true;
     }
 
     pub(crate) fn verify_ipc_ns(&self, ipc_ns: &Arc<IpcNamespace>) -> Result<(), SystemError> {

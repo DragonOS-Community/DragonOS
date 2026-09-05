@@ -1,16 +1,11 @@
 use crate::alloc::vec::Vec;
 use crate::arch::interrupt::TrapFrame;
 use crate::syscall::table::FormattedSyscallParam;
-use crate::{
-    arch::syscall::nr::SYS_SEMOP,
-    ipc::sem::{PosixSemBuf, SemId},
-    syscall::table::Syscall,
-    syscall::user_access::UserBufferReader,
-};
+use crate::{arch::syscall::nr::SYS_SEMOP, syscall::table::Syscall};
 use syscall_table_macros::declare_syscall;
 use system_error::SystemError;
 
-use super::sys_semtimedop::do_kernel_semtimedop;
+use super::sys_semtimedop::do_user_semtimedop;
 
 pub struct SysSemopHandle;
 
@@ -34,35 +29,13 @@ impl Syscall for SysSemopHandle {
     }
 
     fn handle(&self, args: &[usize], frame: &mut TrapFrame) -> Result<usize, SystemError> {
-        let semid = SemId::new(args[0]);
-        let nsops = args[2];
-        let from_user = frame.is_from_user();
-
-        if nsops == 0 {
-            return Err(SystemError::EINVAL);
-        }
-        if nsops > crate::ipc::sem::SEMOPM {
-            return Err(SystemError::E2BIG);
-        }
-
-        let mut sops: Vec<PosixSemBuf> = vec![
-            PosixSemBuf {
-                sem_num: 0,
-                sem_op: 0,
-                sem_flg: 0,
-            };
-            nsops
-        ];
-        let sops_reader = UserBufferReader::new(
+        do_user_semtimedop(
+            args[0] as i32,
             args[1] as *const u8,
-            core::mem::size_of::<PosixSemBuf>() * nsops,
-            from_user,
-        )?;
-        for (i, op) in sops.iter_mut().enumerate() {
-            sops_reader.copy_one_from_user(op, i * core::mem::size_of::<PosixSemBuf>())?;
-        }
-
-        do_kernel_semtimedop(semid, &sops, None)
+            args[2] as u32 as usize,
+            None,
+            frame.is_from_user(),
+        )
     }
 
     fn entry_format(&self, args: &[usize]) -> Vec<FormattedSyscallParam> {

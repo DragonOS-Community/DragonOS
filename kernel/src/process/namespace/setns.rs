@@ -121,6 +121,15 @@ fn nsfd_target_userns(
 /// - user namespace 当前仅支持通过 `/proc/<pid>/ns/user` 这类 namespace fd 进入
 #[inline(never)]
 pub fn ksys_setns(fd: i32, nstype: i32) -> Result<(), SystemError> {
+    // Linux resolves the fd before validating flags. Keep the file alive, but
+    // release the fd table lock before namespace preparation and permission checks.
+    let current = ProcessManager::current_pcb();
+    let fd_table = current.fd_table();
+    let file = fd_table
+        .read()
+        .get_file_by_fd(fd)
+        .ok_or(SystemError::EBADF)?;
+
     // 1. 解析并校验 flag
     let flags = CloneFlags::from_bits(nstype as u64).ok_or(SystemError::EINVAL)?;
 
@@ -138,14 +147,6 @@ pub fn ksys_setns(fd: i32, nstype: i32) -> Result<(), SystemError> {
     if flags.intersects(!SETNS_VALID_FLAGS) {
         return Err(SystemError::EINVAL);
     }
-
-    // 2. 解析 fd，当前仅支持 pidfd
-    let current = ProcessManager::current_pcb();
-    let fd_table = current.fd_table();
-    let file = fd_table
-        .read()
-        .get_file_by_fd(fd)
-        .ok_or(SystemError::EBADF)?;
 
     // 3. 根据 fd 类型决定 setns 模式：namespace fd / pidfd
     let ns_fd = {

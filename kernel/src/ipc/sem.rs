@@ -412,11 +412,16 @@ impl KernelSemSet {
         }
     }
 
-    fn enqueue_waiter(&mut self, waiter: Arc<SemQueueEntry>) {
-        match Self::pending_queue_for(&waiter.sops) {
-            SemPendingQueue::Const => self.pending_const.push_back(waiter),
-            SemPendingQueue::Alter => self.pending_alter.push_back(waiter),
-        }
+    fn enqueue_waiter(&mut self, waiter: Arc<SemQueueEntry>) -> Result<(), SystemError> {
+        let queue = match Self::pending_queue_for(&waiter.sops) {
+            SemPendingQueue::Const => &mut self.pending_const,
+            SemPendingQueue::Alter => &mut self.pending_alter,
+        };
+        // Preparation may fail, but publishing the waiter must not allocate.
+        // No semaphore values or undo adjustments have been committed here.
+        queue.try_reserve(1).map_err(|_| SystemError::ENOMEM)?;
+        queue.push_back(waiter);
+        Ok(())
     }
 
     fn remove_waiter(&mut self, target: &Arc<SemQueueEntry>) {
@@ -582,7 +587,7 @@ pub struct SemManager {
     /// Total semaphores in the namespace (Linux semmns accounting)
     total_sems: usize,
     #[allow(dead_code)]
-    undo_groups: Arc<Vec<Weak<SemUndoGroup>>>,
+    undo_groups: Vec<Weak<SemUndoGroup>>,
 }
 
 impl Default for SemManager {
@@ -601,7 +606,7 @@ impl SemManager {
             id2sem: HashMap::new(),
             key2id: HashMap::new(),
             total_sems: 0,
-            undo_groups: Arc::new(Vec::new()),
+            undo_groups: Vec::new(),
         }
     }
 
@@ -636,73 +641,24 @@ impl SemManager {
         Ok(self.get_by_semid_checked(semid)?.sems.len())
     }
 
-    #[allow(dead_code)]
-    fn build_undo_registry_replacement(
-        snapshot: &Arc<Vec<Weak<SemUndoGroup>>>,
+    /// Serialize registration with control operations using the manager lock.
+    /// A live group remains registered even when all of its debt is cleared.
+    fn ensure_undo_group_registered(
+        &mut self,
         group: &Arc<SemUndoGroup>,
-    ) -> Result<Arc<Vec<Weak<SemUndoGroup>>>, SystemError> {
-        let mut live = Vec::new();
-        live.try_reserve_exact(snapshot.len().saturating_add(1))
-            .map_err(|_| SystemError::ENOMEM)?;
-        let mut contains_group = false;
-
-        for weak in snapshot.iter() {
-            let Some(existing) = weak.upgrade() else {
-                continue;
-            };
-            contains_group |= Arc::ptr_eq(&existing, group);
-            if !live
-                .iter()
-                .any(|item: &Weak<SemUndoGroup>| item.ptr_eq(weak))
-            {
-                live.push(Arc::downgrade(&existing));
-            }
-        }
-
-        if !contains_group {
-            live.push(Arc::downgrade(group));
-        }
-
-        Arc::try_new(live).map_err(|_| SystemError::ENOMEM)
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn prepare_undo_record_and_registry(
-        ipcns: &Arc<IpcNamespace>,
-        group: &Arc<SemUndoGroup>,
-        semid: SemId,
     ) -> Result<(), SystemError> {
-        loop {
-            let (nsems, snapshot) = {
-                let guard = ipcns.sem.lock();
-                (
-                    guard.validate_semid_nsems(semid)?,
-                    guard.undo_groups.clone(),
-                )
-            };
-
-            let replacement = Self::build_undo_registry_replacement(&snapshot, group)?;
-            let record = group.prepare_record(semid, nsems)?;
-
-            let mut guard = ipcns.sem.lock();
-            if !Arc::ptr_eq(&guard.undo_groups, &snapshot) {
-                drop(record);
-                continue;
-            }
-
-            let current_nsems = guard.validate_semid_nsems(semid)?;
-            if current_nsems != nsems || record.adjustment_count() != current_nsems {
-                drop(record);
-                continue;
-            }
-
-            guard.undo_groups = replacement;
-            match group.commit_prepared_record_noalloc(record) {
-                Ok(()) => return Ok(()),
-                Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => continue,
-                Err(error) => return Err(error),
-            }
+        if group.registry_registered() {
+            return Ok(());
         }
+        if self.undo_groups.len() == self.undo_groups.capacity() {
+            self.compact_undo_registry();
+        }
+        self.undo_groups
+            .try_reserve(1)
+            .map_err(|_| SystemError::ENOMEM)?;
+        self.undo_groups.push(Arc::downgrade(group));
+        group.mark_registry_registered();
+        Ok(())
     }
 
     fn with_undo_record_mut<R>(
@@ -714,9 +670,7 @@ impl SemManager {
     }
 
     fn compact_undo_registry(&mut self) {
-        if let Some(groups) = Arc::get_mut(&mut self.undo_groups) {
-            groups.retain(|weak| weak.strong_count() != 0);
-        }
+        self.undo_groups.retain(|weak| weak.strong_count() != 0);
     }
 
     pub(crate) fn clear_undo_for_setval(&mut self, semid: SemId, semnum: usize) {
@@ -818,18 +772,8 @@ impl SemManager {
         semid: SemId,
     ) -> Result<(), SystemError> {
         let nsems = self.validate_semid_nsems(semid)?;
-        let snapshot = self.undo_groups.clone();
-        let replacement = Self::build_undo_registry_replacement(&snapshot, group)?;
         let record = group.prepare_record(semid, nsems)?;
-        if !Arc::ptr_eq(&self.undo_groups, &snapshot) {
-            drop(record);
-            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-        }
-        if self.validate_semid_nsems(semid)? != nsems {
-            drop(record);
-            return Err(SystemError::EINVAL);
-        }
-        self.undo_groups = replacement;
+        self.ensure_undo_group_registered(group)?;
         group.commit_prepared_record_noalloc(record)
     }
 
@@ -1269,7 +1213,7 @@ impl SemManager {
         };
 
         let entry = loop {
-            let (nsems, snapshot) = {
+            let nsems = {
                 let guard = ipcns.sem.lock();
                 let set = guard.get_by_semid_checked(semid)?;
                 // Match Linux: check semnum bounds (EFBIG) before permissions (EACCES).
@@ -1285,11 +1229,10 @@ impl SemManager {
                     },
                     &target_user_ns,
                 )?;
-                (set.sems.len(), guard.undo_groups.clone())
+                set.sems.len()
             };
 
             let prepared_undo = if let Some(group) = undo_group.as_ref() {
-                let replacement = Self::build_undo_registry_replacement(&snapshot, group)?;
                 let record = group.prepare_record(semid, nsems)?;
                 let entry = Arc::try_new(SemQueueEntry::new_prepared(
                     SemQueueEntry::prepare_sops(sops)?,
@@ -1305,19 +1248,21 @@ impl SemManager {
                     },
                 ))
                 .map_err(|_| SystemError::ENOMEM)?;
-                Some((replacement, entry))
+                Some(entry)
             } else {
                 None
             };
 
             let mut guard = ipcns.sem.lock();
-            if !Arc::ptr_eq(&guard.undo_groups, &snapshot) {
-                continue;
-            }
             if guard.validate_semid_nsems(semid)? != nsems {
                 continue;
             }
-            if let Some((replacement, prepared_entry)) = prepared_undo {
+            if let Some(prepared_entry) = prepared_undo {
+                guard.ensure_undo_group_registered(
+                    undo_group
+                        .as_ref()
+                        .expect("SEM_UNDO operation has a current group"),
+                )?;
                 let mut record_slot = prepared_entry.undo_record.lock_irqsave();
                 let prepared_record = record_slot
                     .take()
@@ -1326,7 +1271,6 @@ impl SemManager {
                     *record_slot = Some(prepared_record);
                     continue;
                 }
-                guard.undo_groups = replacement;
                 let set = guard.get_by_semid_checked_mut(semid)?;
                 let (outcome, kept_record) = undo_group
                     .as_ref()
@@ -1367,7 +1311,7 @@ impl SemManager {
                         }
                         drop(record_slot);
                         prepared_entry.update_blocker(blocker);
-                        set.enqueue_waiter(prepared_entry.clone());
+                        set.enqueue_waiter(prepared_entry.clone())?;
                         break prepared_entry;
                     }
                 }
@@ -1390,7 +1334,7 @@ impl SemManager {
                             .as_ref()
                             .expect("plain queued semop entry is preallocated");
                         prepared_entry.update_blocker(blocker);
-                        set.enqueue_waiter(prepared_entry.clone());
+                        set.enqueue_waiter(prepared_entry.clone())?;
                         break prepared_entry.clone();
                     }
                 }
@@ -1682,7 +1626,7 @@ mod tests {
     ) -> Arc<SemQueueEntry> {
         let (_waiter, waker) = Waiter::new_pair();
         let entry = Arc::new(SemQueueEntry::new(sops, None, waker, blocker));
-        set.enqueue_waiter(entry.clone());
+        set.enqueue_waiter(entry.clone()).unwrap();
         entry
     }
 
@@ -1785,7 +1729,7 @@ mod tests {
                 waker,
                 blocker,
             ));
-            set.enqueue_waiter(entry.clone());
+            set.enqueue_waiter(entry.clone()).unwrap();
             (semid, entry)
         };
         let (pcb, group) = test_pcb_with_group(&ipc_ns);
@@ -1952,7 +1896,7 @@ mod tests {
             },
         ));
         let set = manager.get_by_semid_checked_mut(semid).unwrap();
-        set.enqueue_waiter(entry.clone());
+        set.enqueue_waiter(entry.clone()).unwrap();
         set.sems[0].val = 1;
 
         manager.update_queue_for_test(semid);
@@ -2028,7 +1972,9 @@ mod tests {
 
         let mut manager = ipc_ns.sem.lock();
         let semid = insert_test_set(&mut manager, SemKey::new(51), &[1]);
-        manager.undo_groups = Arc::new(vec![stale_weak, Arc::downgrade(&live)]);
+        manager.undo_groups.push(stale_weak);
+        manager.ensure_undo_group_registered(&live).unwrap();
+        manager.undo_groups.shrink_to_fit();
 
         manager
             .prepare_undo_record_and_registry_for_test(&candidate, semid)
@@ -2037,6 +1983,31 @@ mod tests {
         assert_eq!(manager.live_undo_group_count_for_test(), 2);
         assert!(manager.undo_registry_contains_for_test(&live));
         assert!(manager.undo_registry_contains_for_test(&candidate));
+    }
+
+    #[test]
+    fn live_group_registration_survives_debt_removal_without_duplicates() {
+        let ipc_ns = test_ipc_ns();
+        let group = SemUndoGroup::new_for_test_bound_to(&ipc_ns).unwrap();
+        let mut manager = ipc_ns.sem.lock();
+        let semid = insert_test_set(&mut manager, SemKey::new(150), &[1]);
+        manager
+            .prepare_undo_record_and_registry_for_test(&group, semid)
+            .unwrap();
+        let capacity = manager.undo_groups.capacity();
+        manager.clear_undo_for_setall(semid);
+        manager.discard_undo_for_rmid(semid);
+        assert_eq!(group.record_count_for_test(), 0);
+        for _ in 0..32 {
+            manager.ensure_undo_group_registered(&group).unwrap();
+        }
+        assert!(group.registry_registered());
+        assert_eq!(manager.undo_groups.len(), 1);
+        assert_eq!(manager.undo_groups.capacity(), capacity);
+        manager
+            .prepare_undo_record_and_registry_for_test(&group, semid)
+            .unwrap();
+        assert_eq!(manager.undo_groups.len(), 1);
     }
 
     #[test]
@@ -2152,7 +2123,8 @@ mod tests {
         group_a.insert_test_record(semid, &[11, 12]);
         group_b.insert_test_record(semid, &[21, 22]);
         group_a.insert_test_record(other_semid, &[31, 32]);
-        manager.undo_groups = Arc::new(vec![Arc::downgrade(&group_a), Arc::downgrade(&group_b)]);
+        manager.ensure_undo_group_registered(&group_a).unwrap();
+        manager.ensure_undo_group_registered(&group_b).unwrap();
 
         manager.setval(semid, 0, 9).unwrap();
 
@@ -2174,7 +2146,8 @@ mod tests {
         group_a.insert_test_record(semid, &[1, 2, 3]);
         group_b.insert_test_record(semid, &[4, 5, 6]);
         group_b.insert_test_record(other_semid, &[7, 8, 9]);
-        manager.undo_groups = Arc::new(vec![Arc::downgrade(&group_a), Arc::downgrade(&group_b)]);
+        manager.ensure_undo_group_registered(&group_a).unwrap();
+        manager.ensure_undo_group_registered(&group_b).unwrap();
         let token = SemSetAllToken::new(semid, 3);
 
         manager.setall(token, &[10, 11, 12]).unwrap();
@@ -2195,7 +2168,7 @@ mod tests {
         let semid = insert_test_set(&mut manager, SemKey::new(58), &[0]);
         let group = SemUndoGroup::new_for_test_bound_to(&INIT_IPC_NAMESPACE).unwrap();
         group.insert_test_record(semid, &[7]);
-        manager.undo_groups = Arc::new(vec![Arc::downgrade(&group)]);
+        manager.ensure_undo_group_registered(&group).unwrap();
         let entry = enqueue_undo_waiter_for_test(&mut manager, semid, &group);
 
         manager.setval(semid, 0, 1).unwrap();
@@ -2213,7 +2186,7 @@ mod tests {
         let filler_semid = insert_test_set(&mut manager, SemKey::new(60), &[4]);
         let group = SemUndoGroup::new_for_test_bound_to(&INIT_IPC_NAMESPACE).unwrap();
         group.insert_test_record(old_semid, &[9]);
-        manager.undo_groups = Arc::new(vec![Arc::downgrade(&group)]);
+        manager.ensure_undo_group_registered(&group).unwrap();
         manager.ipc_rmid(old_semid).unwrap();
 
         let new_semid = insert_test_set(&mut manager, SemKey::new(61), &[5]);
@@ -2234,7 +2207,7 @@ mod tests {
         let semid = insert_test_set(&mut manager, SemKey::new(62), &[4]);
         let group = SemUndoGroup::new_for_test_bound_to(&INIT_IPC_NAMESPACE).unwrap();
         group.insert_test_record(semid, &[7]);
-        manager.undo_groups = Arc::new(vec![Arc::downgrade(&group)]);
+        manager.ensure_undo_group_registered(&group).unwrap();
 
         let record = group.prepare_record_for_test(semid, 1).unwrap();
         manager.clear_undo_for_setval(semid, 0);
@@ -2261,7 +2234,7 @@ mod tests {
         let semid = insert_test_set(&mut manager, SemKey::new(63), &[4, 5]);
         let group = SemUndoGroup::new_for_test_bound_to(&INIT_IPC_NAMESPACE).unwrap();
         group.insert_test_record(semid, &[7, -3]);
-        manager.undo_groups = Arc::new(vec![Arc::downgrade(&group)]);
+        manager.ensure_undo_group_registered(&group).unwrap();
 
         let record = group.prepare_record_for_test(semid, 2).unwrap();
         manager.clear_undo_for_setall(semid);
@@ -2289,7 +2262,7 @@ mod tests {
         let semid = insert_test_set(&mut manager, SemKey::new(65), &[4]);
         let group = SemUndoGroup::new_for_test_bound_to(&INIT_IPC_NAMESPACE).unwrap();
         group.insert_test_record(semid, &[7]);
-        manager.undo_groups = Arc::new(vec![Arc::downgrade(&group)]);
+        manager.ensure_undo_group_registered(&group).unwrap();
 
         let record = group.prepare_record_for_test(semid, 1).unwrap();
         manager.clear_undo_for_setval(semid, 0);
@@ -2316,7 +2289,7 @@ mod tests {
         let semid = insert_test_set(&mut manager, SemKey::new(66), &[0]);
         let group = SemUndoGroup::new_for_test_bound_to(&INIT_IPC_NAMESPACE).unwrap();
         group.insert_test_record(semid, &[7]);
-        manager.undo_groups = Arc::new(vec![Arc::downgrade(&group)]);
+        manager.ensure_undo_group_registered(&group).unwrap();
         let entry = enqueue_undo_waiter_for_test(&mut manager, semid, &group);
 
         manager.clear_undo_for_setval(semid, 0);
@@ -2370,7 +2343,8 @@ mod tests {
         manager
             .get_by_semid_checked_mut(semid)
             .unwrap()
-            .enqueue_waiter(entry.clone());
+            .enqueue_waiter(entry.clone())
+            .unwrap();
         entry
     }
 

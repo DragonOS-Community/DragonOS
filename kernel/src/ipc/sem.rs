@@ -16,7 +16,9 @@ use crate::{
     ipc::{
         id::IpcIdAllocator,
         ipc_perm::{self, IpcPerm, IpcPermView, PosixIpcPerm},
-        sem_undo::{PreparedSemUndoRecordAction, SemUndoGroup, SemUndoRecord},
+        sem_undo::{
+            PreparedSemUndoRecord, PreparedSemUndoRecordAction, SemUndoGroup, SemUndoRecord,
+        },
     },
     libs::{
         spinlock::SpinLock,
@@ -390,7 +392,7 @@ struct SemQueueEntry {
     sops: Vec<PosixSemBuf>,
     pid: Option<Arc<Pid>>,
     undo_group: Option<Arc<SemUndoGroup>>,
-    undo_record: SpinLock<Option<SemUndoRecord>>,
+    undo_record: SpinLock<Option<PreparedSemUndoRecord>>,
     waker: Arc<Waker>,
     scratch: SpinLock<SemopScratch>,
     status: SpinLock<SemQueueStatus>,
@@ -401,7 +403,7 @@ impl SemQueueEntry {
         sops: Vec<PosixSemBuf>,
         pid: Option<Arc<Pid>>,
         undo_group: Option<Arc<SemUndoGroup>>,
-        undo_record: Option<SemUndoRecord>,
+        undo_record: Option<PreparedSemUndoRecord>,
         waker: Arc<Waker>,
         scratch: SemopScratch,
         blocker: SemBlockedOp,
@@ -1688,7 +1690,7 @@ impl SemManager {
                     .undo_record
                     .lock_irqsave()
                     .as_ref()
-                    .is_some_and(SemUndoRecord::was_existing);
+                    .is_some_and(PreparedSemUndoRecord::was_existing);
                 if !already_associated {
                     let set = guard.get_by_semid_checked_mut(semid)?;
                     if let Err(capacity) = set.ensure_undo_group_registered_prepared(
@@ -3127,15 +3129,19 @@ mod tests {
         let group = SemUndoGroup::new_for_test_bound_to(&INIT_IPC_NAMESPACE).unwrap();
         group.insert_test_record(semid, &[2]);
 
-        let mut record = group.prepare_record_for_test(semid, 1).unwrap();
+        let record = group.prepare_record_for_test(semid, 1).unwrap();
         let mut scratch = SemopScratch::try_new(1).unwrap();
         let set = manager.get_by_semid_checked_mut(semid).unwrap();
-        let outcome =
-            SemManager::simulate_semop(set, &[undo_sop(0, -2)], Some(&mut record), &mut scratch)
-                .unwrap()
-                .ready_for_test();
-        SemManager::commit_semop(set, outcome, &scratch, None, Some(&mut record));
-        group.commit_prepared_record_noalloc(record).unwrap();
+        group
+            .with_prepared_record_noalloc(record, |record| {
+                let outcome =
+                    SemManager::simulate_semop(set, &[undo_sop(0, -2)], Some(record), &mut scratch)
+                        .unwrap()
+                        .ready_for_test();
+                SemManager::commit_semop(set, outcome, &scratch, None, Some(record));
+                PreparedSemUndoRecordAction::Publish(())
+            })
+            .unwrap();
 
         assert_eq!(group.adjustment_for_test(semid, 0), 4);
     }
@@ -3232,23 +3238,28 @@ mod tests {
         let mut manager = SemManager::new();
         let semid = insert_test_set(&mut manager, SemKey::new(41), &[4]);
         let group = SemUndoGroup::new_for_test_bound_to(&INIT_IPC_NAMESPACE).unwrap();
-        let mut record = group.prepare_record_for_test(semid, 1).unwrap();
+        let record = group.prepare_record_for_test(semid, 1).unwrap();
         let mut scratch = SemopScratch::try_new(3).unwrap();
         let sops = [undo_sop(0, 3), plain_sop(0, -1), undo_sop(0, -2)];
 
         let set = manager.get_by_semid_checked_mut(semid).unwrap();
-        let outcome = SemManager::simulate_semop(set, &sops, Some(&mut record), &mut scratch);
-        assert!(matches!(outcome, Ok(SemopOutcome::Ready(_))));
-        SemManager::commit_semop(
-            set,
-            outcome.unwrap().ready_for_test(),
-            &scratch,
-            None,
-            Some(&mut record),
-        );
+        group
+            .with_prepared_record_noalloc(record, |record| {
+                let outcome = SemManager::simulate_semop(set, &sops, Some(record), &mut scratch);
+                assert!(matches!(outcome, Ok(SemopOutcome::Ready(_))));
+                SemManager::commit_semop(
+                    set,
+                    outcome.unwrap().ready_for_test(),
+                    &scratch,
+                    None,
+                    Some(record),
+                );
+                PreparedSemUndoRecordAction::Publish(())
+            })
+            .unwrap();
 
         assert_eq!(set.sems[0].val, 4);
-        assert_eq!(record.adjustment_for_test(0), -1);
+        assert_eq!(group.adjustment_for_test(semid, 0), -1);
     }
 
     #[test]
@@ -3256,19 +3267,24 @@ mod tests {
         let mut manager = SemManager::new();
         let semid = insert_test_set(&mut manager, SemKey::new(42), &[10]);
         let group = SemUndoGroup::new_for_test_bound_to(&INIT_IPC_NAMESPACE).unwrap();
-        let mut record = group.prepare_record_for_test(semid, 1).unwrap();
-        record.set_adjustment_for_test(0, i16::MAX);
+        group.insert_test_record(semid, &[i16::MAX]);
+        let record = group.prepare_record_for_test(semid, 1).unwrap();
         let mut scratch = SemopScratch::try_new(2).unwrap();
         let sops = [undo_sop(0, -1), undo_sop(0, 1)];
 
         let set = manager.get_by_semid_checked_mut(semid).unwrap();
-        assert!(matches!(
-            SemManager::simulate_semop(set, &sops, Some(&mut record), &mut scratch),
-            Err(SystemError::ERANGE)
-        ));
+        group
+            .with_prepared_record_noalloc(record, |record| {
+                assert!(matches!(
+                    SemManager::simulate_semop(set, &sops, Some(record), &mut scratch),
+                    Err(SystemError::ERANGE)
+                ));
+                PreparedSemUndoRecordAction::Keep(())
+            })
+            .unwrap();
 
         assert_eq!(set.sems[0].val, 10);
-        assert_eq!(record.adjustment_for_test(0), i16::MAX);
+        assert_eq!(group.adjustment_for_test(semid, 0), i16::MAX);
     }
 
     #[test]
@@ -3276,22 +3292,29 @@ mod tests {
         let mut manager = SemManager::new();
         let semid = insert_test_set(&mut manager, SemKey::new(43), &[2]);
         let group = SemUndoGroup::new_for_test_bound_to(&INIT_IPC_NAMESPACE).unwrap();
-        let mut record = group.prepare_record_for_test(semid, 1).unwrap();
+        // Exercise the live record, not just an unpublished candidate.
+        group.insert_test_record(semid, &[0]);
+        let record = group.prepare_record_for_test(semid, 1).unwrap();
         let mut scratch = SemopScratch::try_new(2).unwrap();
         let sops = [undo_sop(0, -1), nowait_sop(0, -2)];
 
         let set = manager.get_by_semid_checked_mut(semid).unwrap();
-        assert!(matches!(
-            SemManager::simulate_semop(set, &sops, Some(&mut record), &mut scratch),
-            Ok(SemopOutcome::Blocked(SemBlockedOp {
-                semnum: 0,
-                wait_type: SemWaitType::Increase,
-                nowait: true,
-            }))
-        ));
+        group
+            .with_prepared_record_noalloc(record, |record| {
+                assert!(matches!(
+                    SemManager::simulate_semop(set, &sops, Some(record), &mut scratch),
+                    Ok(SemopOutcome::Blocked(SemBlockedOp {
+                        semnum: 0,
+                        wait_type: SemWaitType::Increase,
+                        nowait: true,
+                    }))
+                ));
+                PreparedSemUndoRecordAction::Keep(())
+            })
+            .unwrap();
 
         assert_eq!(set.sems[0].val, 2);
-        assert_eq!(record.adjustment_for_test(0), 0);
+        assert_eq!(group.adjustment_for_test(semid, 0), 0);
     }
 
     #[test]
@@ -3299,21 +3322,25 @@ mod tests {
         let mut manager = SemManager::new();
         let semid = insert_test_set(&mut manager, SemKey::new(44), &[0]);
         let group = SemUndoGroup::new_for_test_bound_to(&INIT_IPC_NAMESPACE).unwrap();
-        let mut record = group.prepare_record_for_test(semid, 1).unwrap();
+        let record = group.prepare_record_for_test(semid, 1).unwrap();
         let mut scratch = SemopScratch::try_new(1).unwrap();
         let sops = [undo_sop(0, 0)];
 
         let set = manager.get_by_semid_checked_mut(semid).unwrap();
-        let outcome = SemManager::simulate_semop(set, &sops, Some(&mut record), &mut scratch);
-        assert!(matches!(outcome, Ok(SemopOutcome::Ready(_))));
-        SemManager::commit_semop(
-            set,
-            outcome.unwrap().ready_for_test(),
-            &scratch,
-            None,
-            Some(&mut record),
-        );
-        group.commit_record(record).unwrap();
+        group
+            .with_prepared_record_noalloc(record, |record| {
+                let outcome = SemManager::simulate_semop(set, &sops, Some(record), &mut scratch);
+                assert!(matches!(outcome, Ok(SemopOutcome::Ready(_))));
+                SemManager::commit_semop(
+                    set,
+                    outcome.unwrap().ready_for_test(),
+                    &scratch,
+                    None,
+                    Some(record),
+                );
+                PreparedSemUndoRecordAction::Publish(())
+            })
+            .unwrap();
 
         assert_eq!(set.sems[0].val, 0);
         assert_eq!(group.record_count_for_test(), 1);

@@ -2428,6 +2428,144 @@ TEST(SysVSem, SharedUndoGroupControlChangesStaySetLocal) {
     }
 }
 
+struct LargeSetUndoWorkerArgs {
+    int semid;
+    int worker;
+    const int* fds;
+};
+
+int LargeSetUndoWorker(void* opaque) {
+    const auto& args = *static_cast<LargeSetUndoWorkerArgs*>(opaque);
+    const int ready = args.fds[4 * args.worker + 1];
+    const int gate = args.fds[4 * args.worker + 2];
+    for (int i = 0; i < 8; ++i) {
+        if (args.fds[i] != ready && args.fds[i] != gate) close(args.fds[i]);
+    }
+    for (int phase = 0; phase < 2; ++phase) {
+        char token;
+        if (!ReadExact(gate, &token, 1)) return 125;
+        for (int i = 0; i < 128; ++i) {
+            if (!SemUndoOpMustSucceed(args.semid, 31999, 1)) return 126;
+        }
+        if (!WriteExact(ready, &token, 1)) return 127;
+    }
+    return 0;
+}
+
+int RunLargeSetUndoSupervisor(int semid) {
+    // A failed worker must return an error through the guards, not terminate
+    // this supervisor with SIGPIPE and leave its other worker behind.
+    struct sigaction ignore_pipe = {};
+    ignore_pipe.sa_handler = SIG_IGN;
+    sigemptyset(&ignore_pipe.sa_mask);
+    if (sigaction(SIGPIPE, &ignore_pipe, nullptr) != 0) return 139;
+    // Ensure clone inherits one published group, without changing the value.
+    struct sembuf zero = {31999, 0, SEM_UNDO};
+    if (SemOp(semid, &zero, 1) != 0) return 128;
+    int fds[8];
+    std::vector<std::unique_ptr<FdGuard>> fd_guards;
+    for (int i = 0; i < 8; i += 2) {
+        if (pipe(&fds[i]) != 0) return 129;
+        fd_guards.emplace_back(new FdGuard(fds[i]));
+        fd_guards.emplace_back(new FdGuard(fds[i + 1]));
+    }
+    alignas(16) char stacks[2][16384];
+    LargeSetUndoWorkerArgs args[2] = {{semid, 0, fds}, {semid, 1, fds}};
+    std::vector<std::unique_ptr<ChildGuard>> children;
+    for (int i = 0; i < 2; ++i) {
+        pid_t pid = clone(LargeSetUndoWorker, stacks[i] + sizeof(stacks[i]),
+                          CLONE_SYSVSEM | SIGCHLD, &args[i]);
+        if (pid < 0) return 130;
+        children.emplace_back(new ChildGuard(pid));
+    }
+    for (int i = 0; i < 2; ++i) {
+        fd_guards[4 * i + 1]->Close();
+        fd_guards[4 * i + 2]->Close();
+    }
+    for (int phase = 0; phase < 2; ++phase) {
+        char token = 1;
+        for (int i = 0; i < 2; ++i) {
+            if (!WriteExact(fds[4 * i + 3], &token, 1)) return 131;
+        }
+        for (int i = 0; i < 2; ++i) {
+            if (!ReadExact(fds[4 * i], &token, 1)) return 132;
+        }
+        if (SemCtl(semid, 31999, GETVAL, 0) != 256 + (phase == 0 ? 0 : 7)) return 133;
+        if (phase == 0 && SemCtl(semid, 31999, SETVAL, 7) != 0) return 134;
+    }
+    for (auto& child : children) {
+        int status;
+        pid_t ret;
+        do { ret = waitpid(child->pid(), &status, 0); } while (ret < 0 && errno == EINTR);
+        if (ret != child->pid()) return 135;
+        child->MarkReaped();
+        if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) return 136;
+    }
+    return 0;
+}
+
+TEST(SysVSem, LargeSetSharedUndoUpdatesSurviveSetvalBarrier) {
+    SemSet sem(32000, IPC_CREAT | 0600);
+    ASSERT_TRUE(sem.valid());
+    ASSERT_EQ(0, SemCtl(sem.id(), 0, SETVAL, 13));
+    pid_t supervisor = fork();
+    ASSERT_GE(supervisor, 0);
+    if (supervisor == 0) _exit(RunLargeSetUndoSupervisor(sem.id()));
+    ChildGuard child(supervisor);
+    WaitChildOk(&child);
+    EXPECT_EQ(7, SemCtl(sem.id(), 31999, GETVAL, 0));
+    EXPECT_EQ(13, SemCtl(sem.id(), 0, GETVAL, 0));
+}
+
+TEST(SysVSem, MultiSetExitReplayRacesControlWithoutStaleDebt) {
+    constexpr int kSets = 32;
+    for (int cmd : {SETVAL, SETALL, IPC_RMID}) {
+        std::vector<std::unique_ptr<SemSet>> sets;
+        for (int i = 0; i < kSets; ++i) {
+            sets.emplace_back(new SemSet(1, IPC_CREAT | 0600));
+            ASSERT_TRUE(sets.back()->valid());
+        }
+        int ready[2], release[2];
+        ASSERT_EQ(0, pipe(ready));
+        FdGuard ready_read(ready[0]), ready_write(ready[1]);
+        ASSERT_EQ(0, pipe(release));
+        FdGuard release_read(release[0]), release_write(release[1]);
+        pid_t pid = fork();
+        ASSERT_GE(pid, 0);
+        if (pid == 0) {
+            ready_read.Close();
+            release_write.Close();
+            for (auto& sem : sets) {
+                if (!SemUndoOpMustSucceed(sem->id(), 0, 1)) _exit(137);
+            }
+            char token = 1;
+            _exit(WriteExact(ready_write.get(), &token, 1) &&
+                          ReadExact(release_read.get(), &token, 1) ? 0 : 138);
+        }
+        ChildGuard child(pid);
+        ready_write.Close();
+        release_read.Close();
+        char token;
+        ASSERT_TRUE(ReadExact(ready_read.get(), &token, 1));
+        ASSERT_TRUE(WriteExact(release_write.get(), &token, 1));
+        // Either ordering is valid. This does not assume that a particular
+        // control lands between two replay steps in the exiting task.
+        unsigned short value = 7;
+        for (auto& sem : sets) {
+            ASSERT_EQ(0, SemCtl(sem->id(), 0, cmd,
+                               cmd == SETALL ? reinterpret_cast<unsigned long>(&value) : 7));
+            if (cmd == IPC_RMID) {
+                sem->release();
+                sem.reset(new SemSet(1, IPC_CREAT | 0600));
+                ASSERT_TRUE(sem->valid());
+                ASSERT_EQ(0, SemCtl(sem->id(), 0, SETVAL, 7));
+            }
+        }
+        WaitChildOk(&child);
+        for (auto& sem : sets) EXPECT_EQ(7, SemCtl(sem->id(), 0, GETVAL, 0));
+    }
+}
+
 TEST(SysVSem, IndependentUndoGroupsSteadyStateAndSetall) {
     constexpr int kWorkers = 32;
     std::vector<std::unique_ptr<SemSet>> sets;

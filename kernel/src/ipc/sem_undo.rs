@@ -29,18 +29,10 @@ struct SemUndoGroupState {
     task_owners: usize,
     records: Vec<SemUndoRecord>,
     reserved_records: usize,
-    absence_generation: u64,
     retired: bool,
-    records_taken: bool,
+    replay_started: bool,
     #[cfg(test)]
     replay_count: usize,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PreparedSemUndoRecordState {
-    Existing { expected_revision: u64 },
-    Missing { expected_absence_generation: u64 },
-    Live,
 }
 
 #[derive(Debug)]
@@ -53,8 +45,15 @@ struct PendingSemUndoRecordReservation {
 pub(crate) struct SemUndoRecord {
     semid: SemId,
     adjustments: Box<[i16]>,
-    revision: u64,
-    prepared_state: PreparedSemUndoRecordState,
+}
+
+/// Existing records need no snapshot: simulation reads the current record
+/// while holding the group lock. Only a first-use candidate owns dense storage.
+#[derive(Debug)]
+pub(crate) struct PreparedSemUndoRecord {
+    semid: SemId,
+    nsems: usize,
+    candidate: Option<SemUndoRecord>,
     reservation: Option<PendingSemUndoRecordReservation>,
 }
 
@@ -113,60 +112,20 @@ fn prepare_records_storage_capacity(
     Ok(())
 }
 
-impl SemUndoGroupState {
-    fn bump_absence_generation(&mut self) {
-        self.absence_generation = self.absence_generation.wrapping_add(1);
+impl PreparedSemUndoRecord {
+    pub(crate) fn was_existing(&self) -> bool {
+        self.candidate.is_none()
+    }
+
+    pub(crate) fn adjustment_count(&self) -> usize {
+        self.nsems
     }
 }
 
 impl SemUndoRecord {
-    /// A production record is published only after its group is associated
-    /// with the full semaphore-set ID. Clearing debt preserves that link.
-    pub(crate) fn was_existing(&self) -> bool {
-        matches!(
-            self.prepared_state,
-            PreparedSemUndoRecordState::Existing { .. }
-        )
-    }
-
     #[cfg(test)]
     fn new_live(semid: SemId, adjustments: Box<[i16]>) -> Self {
-        Self {
-            semid,
-            adjustments,
-            revision: 0,
-            prepared_state: PreparedSemUndoRecordState::Live,
-            reservation: None,
-        }
-    }
-
-    fn bump_revision(&mut self) {
-        self.revision = self.revision.wrapping_add(1);
-    }
-
-    fn publish_from(&mut self, record: &SemUndoRecord) {
-        self.adjustments.copy_from_slice(&record.adjustments);
-        self.bump_revision();
-    }
-
-    fn refresh_existing(&mut self, existing: &SemUndoRecord) {
-        self.adjustments.copy_from_slice(&existing.adjustments);
-        self.revision = existing.revision;
-        self.prepared_state = PreparedSemUndoRecordState::Existing {
-            expected_revision: existing.revision,
-        };
-    }
-
-    fn refresh_missing(&mut self, absence_generation: u64) {
-        self.adjustments.fill(0);
-        self.revision = 0;
-        self.prepared_state = PreparedSemUndoRecordState::Missing {
-            expected_absence_generation: absence_generation,
-        };
-    }
-
-    fn mark_live(&mut self) {
-        self.prepared_state = PreparedSemUndoRecordState::Live;
+        Self { semid, adjustments }
     }
 
     pub(crate) fn adjustment(&self, semnum: usize) -> i16 {
@@ -176,7 +135,6 @@ impl SemUndoRecord {
     pub(crate) fn set_adjustment(&mut self, semnum: usize, adjustment: i16) {
         if self.adjustments[semnum] != adjustment {
             self.adjustments[semnum] = adjustment;
-            self.bump_revision();
         }
     }
 
@@ -187,7 +145,6 @@ impl SemUndoRecord {
     pub(crate) fn clear_all_adjustments(&mut self) {
         if self.adjustments.iter().any(|&adjustment| adjustment != 0) {
             self.adjustments.fill(0);
-            self.bump_revision();
         }
     }
 
@@ -246,9 +203,8 @@ impl SemUndoGroup {
                 task_owners: 1,
                 records: Vec::new(),
                 reserved_records: 0,
-                absence_generation: 0,
                 retired: false,
-                records_taken: false,
+                replay_started: false,
                 #[cfg(test)]
                 replay_count: 0,
             }),
@@ -287,16 +243,32 @@ impl SemUndoGroup {
         true
     }
 
-    fn take_retired_records(&self) -> Vec<SemUndoRecord> {
+    /// Claim retirement exactly once without hiding pending debt from semctl.
+    fn begin_replay(&self) -> bool {
         let mut state = self.inner.lock_irqsave();
-        if !state.retired || state.records_taken {
-            return Vec::new();
+        if !state.retired || state.replay_started {
+            return false;
         }
-        state.records_taken = true;
+        state.replay_started = true;
         #[cfg(test)]
         {
             state.replay_count += 1;
         }
+        true
+    }
+
+    /// The caller holds the namespace manager lock until this debt is applied.
+    /// Other records remain visible to SETVAL/SETALL and IPC_RMID between steps.
+    fn pop_retired_record(&self) -> Option<SemUndoRecord> {
+        let mut state = self.inner.lock_irqsave();
+        debug_assert!(state.retired && state.replay_started);
+        state.records.pop()
+    }
+
+    /// Only valid after the bound namespace can no longer be upgraded.
+    fn discard_retired_records(&self) -> Vec<SemUndoRecord> {
+        let mut state = self.inner.lock_irqsave();
+        debug_assert!(state.retired && state.replay_started);
         core::mem::take(&mut state.records)
     }
 
@@ -322,13 +294,8 @@ impl SemUndoGroup {
         self: &Arc<Self>,
         semid: SemId,
         nsems: usize,
-    ) -> Result<SemUndoRecord, SystemError> {
+    ) -> Result<PreparedSemUndoRecord, SystemError> {
         let mut adjustments = Vec::new();
-        adjustments
-            .try_reserve_exact(nsems)
-            .map_err(|_| SystemError::ENOMEM)?;
-        adjustments.resize(nsems, 0);
-
         let mut reserved_storage = Vec::new();
 
         loop {
@@ -341,16 +308,21 @@ impl SemUndoGroup {
                 if existing.adjustments.len() != nsems {
                     return Err(SystemError::EINVAL);
                 }
-                adjustments.copy_from_slice(&existing.adjustments);
-                return Ok(SemUndoRecord {
+                return Ok(PreparedSemUndoRecord {
                     semid,
-                    adjustments: adjustments.into_boxed_slice(),
-                    revision: existing.revision,
-                    prepared_state: PreparedSemUndoRecordState::Existing {
-                        expected_revision: existing.revision,
-                    },
+                    nsems,
+                    candidate: None,
                     reservation: None,
                 });
+            }
+
+            if adjustments.len() != nsems {
+                drop(state);
+                adjustments
+                    .try_reserve_exact(nsems)
+                    .map_err(|_| SystemError::ENOMEM)?;
+                adjustments.resize(nsems, 0);
+                continue;
             }
 
             let required_capacity = state
@@ -375,26 +347,30 @@ impl SemUndoGroup {
                 .reserved_records
                 .checked_add(1)
                 .ok_or(SystemError::ENOMEM)?;
-            return Ok(SemUndoRecord {
+            // into_boxed_slice may shrink an allocation. Do it after releasing
+            // the group lock, with an armed reservation already owning the slot.
+            let reservation = PendingSemUndoRecordReservation::new(self);
+            drop(state);
+            return Ok(PreparedSemUndoRecord {
                 semid,
-                adjustments: adjustments.into_boxed_slice(),
-                revision: 0,
-                prepared_state: PreparedSemUndoRecordState::Missing {
-                    expected_absence_generation: state.absence_generation,
-                },
-                reservation: Some(PendingSemUndoRecordReservation::new(self)),
+                nsems,
+                candidate: Some(SemUndoRecord {
+                    semid,
+                    adjustments: adjustments.into_boxed_slice(),
+                }),
+                reservation: Some(reservation),
             });
         }
     }
 
     #[allow(dead_code)]
-    pub(crate) fn commit_record(&self, record: SemUndoRecord) -> Result<(), SystemError> {
+    pub(crate) fn commit_record(&self, record: PreparedSemUndoRecord) -> Result<(), SystemError> {
         self.commit_prepared_record_noalloc(record)
     }
 
     pub(crate) fn commit_prepared_record_noalloc(
         &self,
-        record: SemUndoRecord,
+        record: PreparedSemUndoRecord,
     ) -> Result<(), SystemError> {
         self.with_prepared_record_noalloc(
             record,
@@ -403,11 +379,18 @@ impl SemUndoGroup {
         .map(|((), _)| ())
     }
 
+    /// Borrow the current record under the group lock, never a stale snapshot.
+    /// The callback must simulate without writes and mutate only on Publish;
+    /// Keep (including errors/blocked operations) must leave the record unchanged.
+    /// SemopScratch provides that separation without an additional transaction.
     pub(crate) fn with_prepared_record_noalloc<R>(
         &self,
-        mut record: SemUndoRecord,
+        mut record: PreparedSemUndoRecord,
         f: impl FnOnce(&mut SemUndoRecord) -> PreparedSemUndoRecordAction<R>,
-    ) -> Result<(R, Option<SemUndoRecord>), SystemError> {
+    ) -> Result<(R, Option<PreparedSemUndoRecord>), SystemError> {
+        // A competing first publisher makes this candidate redundant. Keep
+        // its disposal outside the group lock and return a lightweight token.
+        let mut _retired_candidate = None;
         let mut state = self.inner.lock_irqsave();
         if state.task_owners == 0 || state.retired {
             return Err(SystemError::EINVAL);
@@ -419,18 +402,10 @@ impl SemUndoGroup {
             .position(|item| item.semid == record.semid);
 
         if let Some(index) = existing_index {
-            if state.records[index].adjustments.len() != record.adjustments.len() {
+            if state.records[index].adjustments.len() != record.nsems {
                 return Err(SystemError::EINVAL);
             }
-            let current_revision = state.records[index].revision;
-            let stale = !matches!(
-                record.prepared_state,
-                PreparedSemUndoRecordState::Existing { expected_revision }
-                    if current_revision == expected_revision
-            ) && !matches!(record.prepared_state, PreparedSemUndoRecordState::Live);
-            if stale {
-                record.refresh_existing(&state.records[index]);
-            }
+            _retired_candidate = record.candidate.take();
             if let Some(mut reservation) = record.reservation.take() {
                 state.reserved_records = state
                     .reserved_records
@@ -439,28 +414,20 @@ impl SemUndoGroup {
                 reservation.disarm();
             }
 
-            return match f(&mut record) {
-                PreparedSemUndoRecordAction::Publish(result) => {
-                    state.records[index].publish_from(&record);
-                    Ok((result, None))
-                }
+            return match f(&mut state.records[index]) {
+                PreparedSemUndoRecordAction::Publish(result) => Ok((result, None)),
                 PreparedSemUndoRecordAction::Keep(result) => Ok((result, Some(record))),
             };
         }
 
-        match record.prepared_state {
-            PreparedSemUndoRecordState::Missing {
-                expected_absence_generation,
-            } if expected_absence_generation == state.absence_generation => {}
-            PreparedSemUndoRecordState::Live => {}
-            _ => record.refresh_missing(state.absence_generation),
-        }
-
+        // Existing tokens cannot recreate a record removed by RMID. Missing
+        // candidates stay zero until a successful, locally simulated commit.
+        let candidate = record.candidate.as_mut().ok_or(SystemError::EINVAL)?;
         if state.records.len() >= state.records.capacity() {
             return Err(SystemError::ENOMEM);
         }
 
-        match f(&mut record) {
+        match f(candidate) {
             PreparedSemUndoRecordAction::Publish(result) => {
                 if let Some(mut reservation) = record.reservation.take() {
                     state.reserved_records = state
@@ -469,9 +436,7 @@ impl SemUndoGroup {
                         .expect("SEM_UNDO record reservation count underflow");
                     reservation.disarm();
                 }
-                record.mark_live();
-                state.records.push(record);
-                state.bump_absence_generation();
+                state.records.push(record.candidate.take().unwrap());
                 Ok((result, None))
             }
             PreparedSemUndoRecordAction::Keep(result) => Ok((result, Some(record))),
@@ -494,7 +459,6 @@ impl SemUndoGroup {
     pub(crate) fn remove_record(&self, semid: SemId) {
         let mut state = self.inner.lock_irqsave();
         state.records.retain(|record| record.semid != semid);
-        state.bump_absence_generation();
     }
 
     #[cfg(test)]
@@ -521,7 +485,7 @@ impl SemUndoGroup {
         self: &Arc<Self>,
         semid: SemId,
         nsems: usize,
-    ) -> Result<SemUndoRecord, SystemError> {
+    ) -> Result<PreparedSemUndoRecord, SystemError> {
         self.prepare_record(semid, nsems)
     }
 
@@ -547,7 +511,6 @@ impl SemUndoGroup {
             semid,
             adjustments.to_vec().into_boxed_slice(),
         ));
-        state.bump_absence_generation();
     }
 
     #[cfg(test)]
@@ -599,6 +562,9 @@ pub(crate) fn detach_sem_undo(pcb: &Arc<ProcessControlBlock>) {
 }
 
 fn replay_marked_records(pcb: &Arc<ProcessControlBlock>, group: &Arc<SemUndoGroup>) {
+    if !group.begin_replay() {
+        return;
+    }
     let exiting_tgid = pcb.try_active_pid_ns().and_then(|pid_ns| {
         pcb.task_pid_nr_ns(PidType::TGID, Some(pid_ns))
             .filter(|tgid| tgid.data() != 0)?;
@@ -606,7 +572,7 @@ fn replay_marked_records(pcb: &Arc<ProcessControlBlock>, group: &Arc<SemUndoGrou
     });
 
     let Some(ipc_ns) = group.ipc_ns.upgrade() else {
-        for record in group.take_retired_records() {
+        for record in group.discard_retired_records() {
             log::debug!(
                 "dropping SEM_UNDO record for semid {} after IPC namespace teardown",
                 record.semid.data()
@@ -615,24 +581,26 @@ fn replay_marked_records(pcb: &Arc<ProcessControlBlock>, group: &Arc<SemUndoGrou
         return;
     };
 
-    let mut wakes = SemWakeBatch::default();
-    let mut manager = ipc_ns.sem.lock();
-    let records = group.take_retired_records();
-    for record in &records {
-        SemManager::replay_sem_undo_adjustments(
-            &mut manager,
-            record.semid,
-            &record.adjustments,
-            exiting_tgid.clone(),
-            &mut wakes,
-        );
-        manager.unregister_undo_group(record.semid, group);
-    }
-    // Keep all detached debt inside the original replay critical section:
-    // unlocking earlier would let SETVAL/SETALL miss records not yet replayed.
-    drop(manager);
-    wakes.wake_all();
-    for record in &records {
+    loop {
+        let mut wakes = SemWakeBatch::default();
+        let record = {
+            let mut manager = ipc_ns.sem.lock();
+            let Some(record) = group.pop_retired_record() else {
+                break;
+            };
+            SemManager::replay_sem_undo_adjustments(
+                &mut manager,
+                record.semid,
+                &record.adjustments,
+                exiting_tgid.clone(),
+                &mut wakes,
+            );
+            manager.unregister_undo_group(record.semid, group);
+            record
+        };
+        // Publish and notify one set at a time, like Linux exit_sem. Pending
+        // records stay in the group so interleaved semctl still clears them.
+        wakes.wake_all();
         SemManager::shrink_undo_registry(&ipc_ns, record.semid);
     }
 }
@@ -712,8 +680,8 @@ mod tests {
     use alloc::sync::Arc;
 
     use super::{
-        detach_sem_undo, PreparedSemUndoRecordState, SemUndoAttachment, SemUndoGroup,
-        SemUndoRecord, UnpublishedSemUndoAttachmentGuard,
+        detach_sem_undo, PreparedSemUndoRecord, PreparedSemUndoRecordAction, SemUndoAttachment,
+        SemUndoGroup, SemUndoRecord, UnpublishedSemUndoAttachmentGuard,
     };
     use crate::ipc::sem::SemId;
     use crate::process::{
@@ -761,6 +729,97 @@ mod tests {
             group.prepare_record_for_test(semid, 1),
             Err(SystemError::EINVAL)
         );
+    }
+
+    #[test]
+    fn retired_pending_debt_stays_visible_between_replay_steps() {
+        use crate::ipc::sem::{SemFlags, SemWakeBatch, IPC_PRIVATE};
+        for control in 0..3 {
+            let ipc_ns = second_test_ipc_ns();
+            let group = SemUndoGroup::new_for_test_bound_to(&ipc_ns).unwrap();
+            let (pending, first) = {
+                let mut manager = ipc_ns.sem.lock();
+                let pending = SemId::new(
+                    manager
+                        .semget_for_test(IPC_PRIVATE, 2, SemFlags::IPC_CREAT)
+                        .unwrap(),
+                );
+                let first = SemId::new(
+                    manager
+                        .semget_for_test(IPC_PRIVATE, 1, SemFlags::IPC_CREAT)
+                        .unwrap(),
+                );
+                manager
+                    .prepare_undo_record_and_registry_for_test(&group, pending)
+                    .unwrap();
+                manager
+                    .prepare_undo_record_and_registry_for_test(&group, first)
+                    .unwrap();
+                group.with_record_mut(pending, |record| {
+                    record.adjustments.copy_from_slice(&[7, -3])
+                });
+                group.with_record_mut(first, |record| record.adjustments[0] = 1);
+                (pending, first)
+            };
+            assert!(group.detach_owner_and_mark_last());
+            assert!(group.begin_replay());
+            assert!(!group.begin_replay());
+            // Vec.pop chooses the last inserted set. The other debt must
+            // remain in the same registry visited by the semctl primitives.
+            {
+                let mut wakes = SemWakeBatch::default();
+                let record = {
+                    let mut manager = ipc_ns.sem.lock();
+                    let record = group.pop_retired_record().unwrap();
+                    assert_eq!(record.semid, first);
+                    manager.replay_sem_undo_adjustments(
+                        record.semid,
+                        &record.adjustments,
+                        None,
+                        &mut wakes,
+                    );
+                    manager.unregister_undo_group(record.semid, &group);
+                    record
+                };
+                wakes.wake_all();
+                drop(record);
+            }
+            assert_eq!(group.record_count_for_test(), 1);
+            let mut wakes = SemWakeBatch::default();
+            let mut manager = ipc_ns.sem.lock();
+            match control {
+                0 => manager.setval(pending, 0, 9, &mut wakes).unwrap(),
+                1 => {
+                    let token = manager.prepare_setall(pending).unwrap();
+                    manager.setall(token, &[9, 8], &mut wakes).unwrap();
+                }
+                _ => manager.ipc_rmid(pending, &mut wakes).unwrap(),
+            }
+            let next = group.pop_retired_record();
+            if control == 2 {
+                assert!(next.is_none());
+            } else {
+                let next = next.as_ref().unwrap();
+                assert_eq!(next.adjustment(0), 0);
+                assert_eq!(next.adjustment(1), if control == 0 { -3 } else { 0 });
+                manager.replay_sem_undo_adjustments(
+                    next.semid,
+                    &next.adjustments,
+                    None,
+                    &mut wakes,
+                );
+                manager.unregister_undo_group(next.semid, &group);
+                assert_eq!(
+                    manager.getall(pending).unwrap(),
+                    if control == 0 { vec![9, 0] } else { vec![9, 8] }
+                );
+            }
+            assert!(group.pop_retired_record().is_none());
+            assert!(!group.begin_replay());
+            drop(manager);
+            wakes.wake_all();
+            drop(next);
+        }
     }
 
     #[test]
@@ -840,15 +899,21 @@ mod tests {
     }
 
     #[test]
-    fn prepare_existing_record_copies_current_adjustments() {
+    fn prepare_existing_record_borrows_current_adjustments() {
         let group = SemUndoGroup::new_for_test();
         let semid = SemId::new(101);
         group.insert_test_record(semid, &[7, -3]);
 
         let record = group.prepare_record_for_test(semid, 2).unwrap();
 
-        assert_eq!(record.adjustment_for_test(0), 7);
-        assert_eq!(record.adjustment_for_test(1), -3);
+        assert!(record.was_existing());
+        group
+            .with_prepared_record_noalloc(record, |live| {
+                assert_eq!(live.adjustment_for_test(0), 7);
+                assert_eq!(live.adjustment_for_test(1), -3);
+                PreparedSemUndoRecordAction::Keep(())
+            })
+            .unwrap();
     }
 
     #[test]
@@ -891,8 +956,7 @@ mod tests {
     fn missing_record_reservation_loses_to_competing_insert_with_retry() {
         let group = SemUndoGroup::new_for_test();
         let semid = SemId::new(206);
-        let mut stale = group.prepare_record_for_test(semid, 1).unwrap();
-        stale.set_adjustment_for_test(0, 4);
+        let stale = group.prepare_record_for_test(semid, 1).unwrap();
         group.insert_test_record(semid, &[9]);
 
         assert_eq!(group.commit_record(stale), Ok(()));
@@ -904,8 +968,7 @@ mod tests {
     fn missing_record_reservation_loses_to_rmid_generation_with_retry() {
         let group = SemUndoGroup::new_for_test();
         let semid = SemId::new(207);
-        let mut stale = group.prepare_record_for_test(semid, 1).unwrap();
-        stale.set_adjustment_for_test(0, 4);
+        let stale = group.prepare_record_for_test(semid, 1).unwrap();
         group.remove_record(semid);
 
         assert_eq!(group.commit_record(stale), Ok(()));
@@ -918,17 +981,66 @@ mod tests {
     fn commit_unreserved_missing_record_returns_enomem_without_allocating() {
         let group = SemUndoGroup::new_for_test();
         let before_capacity = group.record_capacity_for_test();
-        let record = SemUndoRecord {
+        let record = PreparedSemUndoRecord {
             semid: SemId::new(203),
-            adjustments: alloc::vec![0].into_boxed_slice(),
-            revision: 0,
-            prepared_state: PreparedSemUndoRecordState::Live,
+            nsems: 1,
+            candidate: Some(SemUndoRecord {
+                semid: SemId::new(203),
+                adjustments: alloc::vec![0].into_boxed_slice(),
+            }),
             reservation: None,
         };
 
         assert_eq!(group.commit_record(record), Err(SystemError::ENOMEM));
         assert_eq!(group.record_count_for_test(), 0);
         assert_eq!(group.record_capacity_for_test(), before_capacity);
+    }
+
+    #[test]
+    fn existing_preparation_reads_current_debt_and_updates_only_one_slot() {
+        let group = SemUndoGroup::new_for_test();
+        let semid = SemId::new(212);
+        group.insert_test_record(semid, &[3, 7]);
+        let prepared = group.prepare_record_for_test(semid, 2).unwrap();
+        assert!(prepared.was_existing());
+        assert!(prepared.candidate.is_none());
+        group.with_record_mut(semid, |live| live.set_adjustment(0, 9));
+        let (_, kept) = group
+            .with_prepared_record_noalloc(prepared, |live| {
+                assert_eq!(live.adjustment(0), 9);
+                PreparedSemUndoRecordAction::Keep(Err::<(), _>(SystemError::ERANGE))
+            })
+            .unwrap();
+        assert_eq!(group.adjustment_for_test(semid, 0), 9);
+        assert_eq!(group.adjustment_for_test(semid, 1), 7);
+        group.with_record_mut(semid, |live| live.clear_all_adjustments());
+        group
+            .with_prepared_record_noalloc(kept.unwrap(), |live| {
+                assert_eq!(live.adjustment(0), 0);
+                live.set_adjustment(1, 4);
+                PreparedSemUndoRecordAction::Publish(())
+            })
+            .unwrap();
+        assert_eq!(group.adjustment_for_test(semid, 0), 0);
+        assert_eq!(group.adjustment_for_test(semid, 1), 4);
+    }
+
+    #[test]
+    fn competing_first_publish_releases_candidate_on_keep() {
+        let group = SemUndoGroup::new_for_test();
+        let semid = SemId::new(213);
+        let pending = group.prepare_record_for_test(semid, 2).unwrap();
+        assert!(!pending.was_existing());
+        group.insert_test_record(semid, &[6, 8]);
+        let (_, kept) = group
+            .with_prepared_record_noalloc(pending, |live| {
+                assert_eq!(live.adjustment(0), 6);
+                PreparedSemUndoRecordAction::Keep(())
+            })
+            .unwrap();
+        assert!(kept.unwrap().was_existing());
+        assert_eq!(group.pending_record_reservations_for_test(), 0);
+        assert_eq!(group.adjustment_for_test(semid, 1), 8);
     }
 
     #[test]

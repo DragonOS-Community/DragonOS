@@ -456,9 +456,18 @@ impl SemUndoGroup {
             .map(f)
     }
 
-    pub(crate) fn remove_record(&self, semid: SemId) {
+    pub(crate) fn take_record(&self, semid: SemId) -> Option<SemUndoRecord> {
         let mut state = self.inner.lock_irqsave();
-        state.records.retain(|record| record.semid != semid);
+        let index = state
+            .records
+            .iter()
+            .position(|record| record.semid == semid)?;
+        Some(state.records.swap_remove(index))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn remove_record(&self, semid: SemId) {
+        drop(self.take_record(semid));
     }
 
     #[cfg(test)]
@@ -786,6 +795,7 @@ mod tests {
             }
             assert_eq!(group.record_count_for_test(), 1);
             let mut wakes = SemWakeBatch::default();
+            let mut removed = None;
             let mut manager = ipc_ns.sem.lock();
             match control {
                 0 => manager.setval(pending, 0, 9, &mut wakes).unwrap(),
@@ -793,7 +803,7 @@ mod tests {
                     let token = manager.prepare_setall(pending).unwrap();
                     manager.setall(token, &[9, 8], &mut wakes).unwrap();
                 }
-                _ => manager.ipc_rmid(pending, &mut wakes).unwrap(),
+                _ => removed = Some(manager.ipc_rmid(pending, &mut wakes).unwrap()),
             }
             let next = group.pop_retired_record();
             if control == 2 {
@@ -818,6 +828,7 @@ mod tests {
             assert!(!group.begin_replay());
             drop(manager);
             wakes.wake_all();
+            drop(removed);
             drop(next);
         }
     }

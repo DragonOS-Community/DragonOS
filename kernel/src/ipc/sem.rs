@@ -554,11 +554,31 @@ enum SemPendingQueue {
     Alter,
 }
 
+/// A live undo registration, reused to own deferred cleanup after removal.
+#[derive(Debug)]
+enum SemUndoAssociation {
+    Group(Weak<SemUndoGroup>),
+    Retired {
+        _group: Arc<SemUndoGroup>,
+        _record: Option<SemUndoRecord>,
+    },
+}
+
+impl SemUndoAssociation {
+    /// Retired slots are only present in a removed, caller-owned set.
+    fn group(&self) -> &Weak<SemUndoGroup> {
+        match self {
+            Self::Group(group) => group,
+            Self::Retired { .. } => unreachable!("retired association in live set"),
+        }
+    }
+}
+
 /// Semaphore set
 #[derive(Debug)]
 pub struct KernelSemSet {
     /// Groups that can carry undo debt for this set, including queued operations.
-    undo_groups: Vec<Weak<SemUndoGroup>>,
+    undo_groups: Vec<SemUndoAssociation>,
     /// Permission information
     pub kern_ipc_perm: IpcPerm,
     /// Semaphores in the set
@@ -581,11 +601,15 @@ impl KernelSemSet {
     fn ensure_undo_group_registered_prepared(
         &mut self,
         group: &Arc<SemUndoGroup>,
-        spare: &mut Vec<Weak<SemUndoGroup>>,
+        spare: &mut Vec<SemUndoAssociation>,
     ) -> Result<(), usize> {
         debug_assert!(spare.is_empty());
         let candidate = Arc::downgrade(group);
-        if self.undo_groups.iter().any(|weak| weak.ptr_eq(&candidate)) {
+        if self
+            .undo_groups
+            .iter()
+            .any(|entry| entry.group().ptr_eq(&candidate))
+        {
             return Ok(());
         }
         if self.undo_groups.len() == self.undo_groups.capacity() {
@@ -598,12 +622,13 @@ impl KernelSemSet {
             spare.append(&mut self.undo_groups);
             core::mem::swap(&mut self.undo_groups, spare);
         }
-        self.undo_groups.push(candidate);
+        self.undo_groups.push(SemUndoAssociation::Group(candidate));
         Ok(())
     }
 
     fn compact_undo_registry(&mut self) {
-        self.undo_groups.retain(|weak| weak.strong_count() != 0);
+        self.undo_groups
+            .retain(|entry| entry.group().strong_count() != 0);
     }
 
     /// Request/publish smaller storage without allocating under the manager
@@ -611,8 +636,8 @@ impl KernelSemSet {
     /// The caller must drop both buffers after unlocking.
     fn shrink_undo_registry_prepared(
         &mut self,
-        spare: &mut Vec<Weak<SemUndoGroup>>,
-        retired: &mut Vec<Weak<SemUndoGroup>>,
+        spare: &mut Vec<SemUndoAssociation>,
+        retired: &mut Vec<SemUndoAssociation>,
     ) -> usize {
         debug_assert!(spare.is_empty());
         debug_assert!(retired.is_empty() && retired.capacity() == 0);
@@ -905,7 +930,8 @@ impl SemManager {
     pub(crate) fn unregister_undo_group(&mut self, semid: SemId, group: &Arc<SemUndoGroup>) {
         if let Ok(set) = self.get_by_semid_checked_mut(semid) {
             let target = Arc::downgrade(group);
-            set.undo_groups.retain(|weak| !weak.ptr_eq(&target));
+            set.undo_groups
+                .retain(|entry| !entry.group().ptr_eq(&target));
         }
     }
 
@@ -968,7 +994,7 @@ impl SemManager {
             return;
         };
         let mut saw_stale = false;
-        for weak in set.undo_groups.iter() {
+        for weak in set.undo_groups.iter().map(SemUndoAssociation::group) {
             let Some(group) = weak.upgrade() else {
                 saw_stale = true;
                 continue;
@@ -989,29 +1015,12 @@ impl SemManager {
             return;
         };
         let mut saw_stale = false;
-        for weak in set.undo_groups.iter() {
+        for weak in set.undo_groups.iter().map(SemUndoAssociation::group) {
             let Some(group) = weak.upgrade() else {
                 saw_stale = true;
                 continue;
             };
             Self::with_undo_record_mut(&group, semid, |record| record.clear_all_adjustments());
-        }
-        if saw_stale {
-            set.compact_undo_registry();
-        }
-    }
-
-    pub(crate) fn discard_undo_for_rmid(&mut self, semid: SemId) {
-        let Ok(set) = self.get_by_semid_checked_mut(semid) else {
-            return;
-        };
-        let mut saw_stale = false;
-        for weak in set.undo_groups.iter() {
-            let Some(group) = weak.upgrade() else {
-                saw_stale = true;
-                continue;
-            };
-            group.remove_record(semid);
         }
         if saw_stale {
             set.compact_undo_registry();
@@ -1028,11 +1037,6 @@ impl SemManager {
         self.clear_undo_for_setall(semid);
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn remove_undo_records_for_rmid(&mut self, semid: SemId) {
-        self.discard_undo_for_rmid(semid);
-    }
-
     #[cfg(test)]
     fn update_queue_for_test(&mut self, semid: SemId) {
         let Ok(set) = self.get_by_semid_checked_mut(semid) else {
@@ -1044,7 +1048,12 @@ impl SemManager {
     #[cfg(test)]
     fn live_undo_group_count_for_test(&self) -> usize {
         let mut groups: Vec<Weak<SemUndoGroup>> = Vec::new();
-        for weak in self.id2sem.values().flat_map(|set| &set.undo_groups) {
+        for weak in self
+            .id2sem
+            .values()
+            .flat_map(|set| &set.undo_groups)
+            .map(SemUndoAssociation::group)
+        {
             if weak.strong_count() != 0 && !groups.iter().any(|old| old.ptr_eq(weak)) {
                 groups.push(weak.clone());
             }
@@ -1057,6 +1066,7 @@ impl SemManager {
         self.id2sem
             .values()
             .flat_map(|set| &set.undo_groups)
+            .map(SemUndoAssociation::group)
             .any(|weak| weak.ptr_eq(&Arc::downgrade(group)))
     }
 
@@ -1065,6 +1075,7 @@ impl SemManager {
         self.id2sem
             .values()
             .flat_map(|set| &set.undo_groups)
+            .map(SemUndoAssociation::group)
             .all(|weak| {
                 weak.upgrade()
                     .is_none_or(|group| group.record_count_for_test() == 0)
@@ -1809,11 +1820,13 @@ impl SemManager {
     }
 
     /// # IPC_RMID: remove the semaphore set and wake all waiters with EIDRM
+    /// The caller must release the manager guard before notifying `wakes` and
+    /// dropping the returned set, which owns all deferred undo/group disposal.
     pub(crate) fn ipc_rmid(
         &mut self,
         id: SemId,
         wakes: &mut SemWakeBatch,
-    ) -> Result<(), SystemError> {
+    ) -> Result<KernelSemSet, SystemError> {
         let decoded = IpcIdAllocator::decode(id.data())?;
         let target_user_ns = ProcessManager::current_ipcns().user_ns.clone();
         let key = {
@@ -1821,16 +1834,27 @@ impl SemManager {
             ipc_perm::check_control_permission(&set.kern_ipc_perm, &target_user_ns)?;
             set.kern_ipc_perm.key
         };
-        self.discard_undo_for_rmid(id);
         let mut set = self
             .id2sem
             .remove(&decoded.idx)
             .ok_or(SystemError::EINVAL)?;
         self.key2id.remove(&SemKey::new(key));
         self.total_sems = self.total_sems.saturating_sub(set.sems.len());
+        // Reuse existing association storage: neither allocation nor undo/group
+        // destruction is allowed here. Even an empty upgraded group stays alive
+        // until the caller drops this removed set outside the manager lock.
+        for association in &mut set.undo_groups {
+            if let Some(group) = association.group().upgrade() {
+                let record = group.take_record(id);
+                *association = SemUndoAssociation::Retired {
+                    _group: group,
+                    _record: record,
+                };
+            }
+        }
         set.complete_all_removed(wakes);
         self.id_allocator.free_idx(decoded.idx);
-        Ok(())
+        Ok(set)
     }
 
     /// # IPC_SET: update permissions (uid/gid/mode) and refresh `sem_ctime`
@@ -2507,7 +2531,8 @@ mod tests {
         let group = SemUndoGroup::new_for_test_bound_to(&INIT_IPC_NAMESPACE).unwrap();
         let set = manager.get_by_semid_checked_mut(semid).unwrap();
         set.undo_groups.reserve_exact(64);
-        set.undo_groups.push(Arc::downgrade(&group));
+        set.undo_groups
+            .push(SemUndoAssociation::Group(Arc::downgrade(&group)));
         let mut spare = Vec::new();
         let mut retired = Vec::new();
         let needed = set.shrink_undo_registry_prepared(&mut spare, &mut retired);
@@ -2515,7 +2540,8 @@ mod tests {
         spare.try_reserve_exact(needed).unwrap();
         // Simulate new associations arriving during unlocked preparation.
         for _ in 0..8 {
-            set.undo_groups.push(Arc::downgrade(&group));
+            set.undo_groups
+                .push(SemUndoAssociation::Group(Arc::downgrade(&group)));
         }
         assert!(set.shrink_undo_registry_prepared(&mut spare, &mut retired) > 0);
         assert_eq!(set.undo_groups.len(), 9);
@@ -2601,7 +2627,7 @@ mod tests {
             .iter()
             .zip(&owners)
         {
-            assert!(weak.ptr_eq(&Arc::downgrade(owner)));
+            assert!(weak.group().ptr_eq(&Arc::downgrade(owner)));
         }
 
         // A concurrent CLONE_SYSVSEM sharer already registered this group.
@@ -2694,9 +2720,11 @@ mod tests {
         assert_eq!(group.adjustment_for_test(signal_semid, 0), 0);
 
         let rmid_entry = enqueue_undo_waiter_for_test(&mut manager, rmid_semid, &group);
-        manager
-            .ipc_rmid(rmid_semid, &mut SemWakeBatch::default())
-            .unwrap();
+        let mut wakes = SemWakeBatch::default();
+        let removed = manager.ipc_rmid(rmid_semid, &mut wakes).unwrap();
+        drop(manager);
+        wakes.wake_all();
+        drop(removed);
         assert_eq!(rmid_entry.completed_result(), Some(Err(SystemError::EIDRM)));
         assert_eq!(group.adjustment_for_test(rmid_semid, 0), 0);
     }
@@ -2732,7 +2760,7 @@ mod tests {
             .get_by_semid_checked_mut(semid)
             .unwrap()
             .undo_groups
-            .push(stale_weak);
+            .push(SemUndoAssociation::Group(stale_weak));
         manager.ensure_undo_group_registered(&live, semid).unwrap();
         manager
             .get_by_semid_checked_mut(semid)
@@ -2764,7 +2792,9 @@ mod tests {
             .undo_groups
             .capacity();
         manager.clear_undo_for_setall(semid);
-        manager.discard_undo_for_rmid(semid);
+        // Synthetic record removal exercises registration deduplication without
+        // putting a live set into the RMID-only retired association state.
+        group.remove_record(semid);
         assert_eq!(group.record_count_for_test(), 0);
         for _ in 0..32 {
             manager.ensure_undo_group_registered(&group, semid).unwrap();
@@ -2884,12 +2914,13 @@ mod tests {
         drop(pcb.take_sem_undo_attachment().unwrap());
         assert!(group.detach_last_owner_for_test());
 
-        {
+        let mut wakes = SemWakeBatch::default();
+        let removed = {
             let mut manager = ipc_ns.sem.lock();
-            manager
-                .ipc_rmid(semid, &mut SemWakeBatch::default())
-                .unwrap();
-        }
+            manager.ipc_rmid(semid, &mut wakes).unwrap()
+        };
+        wakes.wake_all();
+        drop(removed);
         group.replay_marked_records_for_test(&pcb);
 
         let manager = ipc_ns.sem.lock();

@@ -2340,30 +2340,59 @@ TEST(SysVSem, WaitQueuesGrowForConstAndAlterOperations) {
 
 TEST(SysVSem, RemoveWakesBothWaitQueuesInBulk) {
     constexpr int kPairs = 16;
-    SemSet sem(2, IPC_CREAT | 0600);
+    SemSet sem(32000, IPC_CREAT | 0600);
+    SemSet unrelated(1, IPC_CREAT | 0600);
     ASSERT_TRUE(sem.valid());
+    ASSERT_TRUE(unrelated.valid());
     ASSERT_EQ(0, SemCtl(sem.id(), 0, SETVAL, 1));
+    int release[2];
+    ASSERT_EQ(0, pipe(release));
+    FdGuard release_read(release[0]), release_write(release[1]);
     std::vector<std::unique_ptr<ChildGuard>> children;
     for (int i = 0; i < kPairs * 2; ++i) {
         const bool constant = i % 2 == 0;
         pid_t pid = fork();
         ASSERT_GE(pid, 0);
         if (pid == 0) {
+            release_write.Close();
+            // Each independent group owns a dense, published undo record in
+            // addition to its pending operation. RMID must retire both safely.
+            if (!SemUndoOpMustSucceed(sem.id(), 31999, 1) ||
+                !SemUndoOpMustSucceed(unrelated.id(), 0, 1)) {
+                _exit(114);
+            }
             struct sembuf op = {static_cast<unsigned short>(constant ? 0 : 1),
                                 static_cast<short>(constant ? 0 : -1), SEM_UNDO};
             struct timespec timeout = {10, 0};
             int result = SemTimedOp(sem.id(), &op, 1, &timeout);
-            _exit(result == -1 && errno == EIDRM ? 0 : 115);
+            if (result != -1 || errno != EIDRM) _exit(115);
+            char token;
+            ssize_t gate_result;
+            do {
+                gate_result = read(release_read.get(), &token, 1);
+            } while (gate_result < 0 && errno == EINTR);
+            _exit(gate_result == 0 ? 0 : 116);
         }
         children.emplace_back(new ChildGuard(pid));
     }
+    release_read.Close();
     ASSERT_TRUE(WaitForZcnt(sem.id(), 0, kPairs));
     ASSERT_TRUE(WaitForNcnt(sem.id(), 1, kPairs));
+    EXPECT_EQ(kPairs * 2, SemCtl(unrelated.id(), 0, GETVAL, 0));
     ASSERT_EQ(0, SemCtl(sem.id(), 0, IPC_RMID, 0));
     sem.release();
+    SemSet replacement(32000, IPC_CREAT | 0600);
+    ASSERT_TRUE(replacement.valid());
+    ASSERT_EQ(0, SemCtl(replacement.id(), 31999, SETVAL, 9));
+    // Groups cannot exit before replacement initialization. No assumption is
+    // made about immediate index reuse by the cyclic IPC allocator.
+    release_write.Close(); // EOF releases all groups without SIGPIPE on failure.
     for (auto& child : children) {
         WaitChildOk(child.get());
     }
+    EXPECT_EQ(9, SemCtl(replacement.id(), 31999, GETVAL, 0));
+    EXPECT_EQ(0, SemCtl(replacement.id(), 0, GETVAL, 0));
+    EXPECT_EQ(0, SemCtl(unrelated.id(), 0, GETVAL, 0));
 }
 
 TEST(SysVSem, SharedUndoGroupControlChangesStaySetLocal) {

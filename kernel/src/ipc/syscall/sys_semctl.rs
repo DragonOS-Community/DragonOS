@@ -83,8 +83,12 @@ pub(super) fn do_kernel_semctl(
         }
         // Remove the semaphore set
         SemCtlCmd::IpcRmid => {
-            let mut guard = ipcns.sem.lock();
-            guard.ipc_rmid(semid, &mut wakes)?;
+            let removed = {
+                let mut guard = ipcns.sem.lock();
+                guard.ipc_rmid(semid, &mut wakes)?
+            };
+            wakes.wake_all();
+            drop(removed);
             Ok(0)
         }
         // Query a single semaphore

@@ -576,7 +576,36 @@ static void fill_user_xattr_name(char *buf, size_t len) {
     buf[len] = '\0';
 }
 
-static int ext_test_p2_ops() {
+// Background writeback may start at any dirty page. Check coverage and the
+// cache-before-direct ordering, not a particular partition of cached writes.
+static bool direct_drain_trace_valid(uint32_t count, const volatile uint64_t *offsets,
+                                     const volatile uint32_t *sizes,
+                                     const volatile uint32_t *flags, size_t length) {
+    if (length != 3 * 4096 + 17 || count < 4 || count > 6)
+        return false;
+    unsigned covered = 0;
+    const uint32_t cached_count = count - 2;
+    for (uint32_t i = 0; i < cached_count; ++i) {
+        const uint64_t offset = offsets[i];
+        const uint32_t size = sizes[i];
+        if (flags[i] != FUSE_WRITE_CACHE || offset >= length || offset % 4096 != 0 ||
+            size == 0 || size > 8192 || size > length - offset ||
+            (size % 4096 != 0 && offset + size != length))
+            return false;
+        for (size_t page = offset / 4096; page <= (offset + size - 1) / 4096; ++page) {
+            if (covered & (1u << page))
+                return false;
+            covered |= 1u << page;
+        }
+    }
+    return covered == 0xf && offsets[cached_count] == 0 &&
+           sizes[cached_count] == 8192 && flags[cached_count] == FUSE_WRITE_LOCKOWNER &&
+           offsets[cached_count + 1] == 8192 &&
+           sizes[cached_count + 1] == length - 8192 &&
+           flags[cached_count + 1] == FUSE_WRITE_LOCKOWNER;
+}
+
+static int ext_test_p2_ops(bool preflush_direct_tail = false) {
     const char *mp = "/tmp/test_fuse_p2_ops";
     int f = -1;
     int dfd = -1;
@@ -632,9 +661,9 @@ static int ext_test_p2_ops() {
     volatile uint32_t last_write_flags_at_fsync = 0;
     volatile unsigned char extension_write_byte = 0;
     volatile uint64_t large_write_nodeid = 0;
-    volatile uint64_t write_offsets[4] = {0};
-    volatile uint32_t write_sizes[4] = {0};
-    volatile uint32_t write_flags[4] = {0};
+    volatile uint64_t write_offsets[6] = {0};
+    volatile uint32_t write_sizes[6] = {0};
+    volatile uint32_t write_flags[6] = {0};
     volatile int forced_write_errno = 0;
     volatile uint64_t forced_write_offset = UINT64_MAX;
     volatile uint64_t forced_short_write_offset = UINT64_MAX;
@@ -669,7 +698,7 @@ static int ext_test_p2_ops() {
     args.write_offsets = write_offsets;
     args.write_sizes = write_sizes;
     args.write_flags = write_flags;
-    args.write_trace_capacity = 4;
+    args.write_trace_capacity = 6;
     args.forced_write_errno = &forced_write_errno;
     args.forced_write_offset = &forced_write_offset;
     args.forced_short_write_offset = &forced_short_write_offset;
@@ -728,7 +757,6 @@ static int ext_test_p2_ops() {
     }
     if (fuseg_write_all_fd(f, "p2-data") != 0) {
         printf("[FAIL] write created file: %s (errno=%d)\n", strerror(errno), errno);
-        close(f);
         goto fail;
     }
     // LINK returns an attribute snapshot for the same inode.  With
@@ -737,25 +765,21 @@ static int ext_test_p2_ops() {
     snprintf(hard_path, sizeof(hard_path), "%s/p2_hard.txt", mp);
     if (link(created, hard_path) != 0) {
         printf("[FAIL] link dirty writeback file: %s (errno=%d)\n", strerror(errno), errno);
-        close(f);
         goto fail;
     }
     if (write_count != 0) {
         printf("[FAIL] writeback-cache write reached daemon before fsync: writes=%u\n",
                write_count);
-        close(f);
         goto fail;
     }
     if (fsync(f) != 0) {
         printf("[FAIL] fsync(file): %s (errno=%d)\n", strerror(errno), errno);
-        close(f);
         goto fail;
     }
     if (write_count_at_fsync == 0 || last_write_size != strlen("p2-data") ||
         (last_write_flags_at_fsync & FUSE_WRITE_CACHE) == 0) {
         printf("[FAIL] fsync did not drain full cached write first: writes=%u size=%u flags=0x%x\n",
                write_count_at_fsync, last_write_size, last_write_flags_at_fsync);
-        close(f);
         goto fail;
     }
 
@@ -767,22 +791,20 @@ static int ext_test_p2_ops() {
     write_count_at_fsync = 0;
     if (pwrite(f, &extension, 1, 200) != 1) {
         printf("[FAIL] extend dirty writeback file: %s (errno=%d)\n", strerror(errno), errno);
-        close(f);
         goto fail;
     }
     if (fsync(f) != 0) {
         printf("[FAIL] fsync(extended file): %s (errno=%d)\n", strerror(errno), errno);
-        close(f);
         goto fail;
     }
     if (write_count_at_fsync == 0 || last_write_size != 201 ||
         extension_write_byte != (unsigned char)extension) {
         printf("[FAIL] fsync truncated extended cached page: writes=%u size=%u byte=%u\n",
                write_count_at_fsync, last_write_size, extension_write_byte);
-        close(f);
         goto fail;
     }
     close(f);
+    f = -1;
 
     // P3: four locally dirty pages (the last one partial) must be submitted in
     // max_write-sized batches rather than one request per page.
@@ -799,8 +821,6 @@ static int ext_test_p2_ops() {
     if (f < 0 || write(f, batch_data, batch_size) != (ssize_t)batch_size) {
         printf("[FAIL] create batched write file: %s (errno=%d)\n", strerror(errno), errno);
         free(batch_data);
-        if (f >= 0)
-            close(f);
         goto fail;
     }
     large_write_nodeid = last_create_nodeid;
@@ -811,7 +831,6 @@ static int ext_test_p2_ops() {
     if (fsync(f) != 0) {
         printf("[FAIL] fsync batched write: %s (errno=%d)\n", strerror(errno), errno);
         free(batch_data);
-        close(f);
         goto fail;
     }
     if (write_count != 2 || write_offsets[0] != 0 || write_sizes[0] != 8192 ||
@@ -825,10 +844,10 @@ static int ext_test_p2_ops() {
                write_flags[0], (unsigned long long)write_offsets[1], write_sizes[1],
                write_flags[1], (unsigned long long)large_write_nodeid, batch_size);
         free(batch_data);
-        close(f);
         goto fail;
     }
     close(f);
+    f = -1;
 
     // Exercise the asynchronous WRITE|WAIT_AFTER path. Failure of the second
     // max_write batch must be reported, leave only that failed batch dirty,
@@ -840,8 +859,6 @@ static int ext_test_p2_ops() {
     if (f < 0 || write(f, batch_data, batch_size) != (ssize_t)batch_size) {
         printf("[FAIL] create async error file: %s (errno=%d)\n", strerror(errno), errno);
         free(batch_data);
-        if (f >= 0)
-            close(f);
         goto fail;
     }
     large_write_nodeid = last_create_nodeid;
@@ -862,7 +879,6 @@ static int ext_test_p2_ops() {
                (unsigned long long)write_offsets[1], write_sizes[1]);
         forced_write_errno = 0;
         free(batch_data);
-        close(f);
         goto fail;
     }
     forced_write_errno = 0;
@@ -876,7 +892,6 @@ static int ext_test_p2_ops() {
         printf("[FAIL] async EIO retry count=%u write=(%llu,%u) errno=%d\n", write_count,
                (unsigned long long)write_offsets[0], write_sizes[0], errno);
         free(batch_data);
-        close(f);
         goto fail;
     }
 
@@ -885,7 +900,6 @@ static int ext_test_p2_ops() {
     if (pwrite(f, batch_data, batch_size, 0) != (ssize_t)batch_size) {
         printf("[FAIL] redirty async short-write file: %s (errno=%d)\n", strerror(errno), errno);
         free(batch_data);
-        close(f);
         goto fail;
     }
     write_count = 0;
@@ -898,7 +912,6 @@ static int ext_test_p2_ops() {
         printf("[FAIL] async short reply errno/count=%d/%u\n", errno, write_count);
         forced_short_write_offset = UINT64_MAX;
         free(batch_data);
-        close(f);
         goto fail;
     }
     forced_short_write_offset = UINT64_MAX;
@@ -911,7 +924,6 @@ static int ext_test_p2_ops() {
         printf("[FAIL] async short retry count=%u write=(%llu,%u) errno=%d\n", write_count,
                (unsigned long long)write_offsets[0], write_sizes[0], errno);
         free(batch_data);
-        close(f);
         goto fail;
     }
     close(f);
@@ -919,12 +931,13 @@ static int ext_test_p2_ops() {
 
     // A direct write must drain overlapping cached dirty pages through the
     // same stable-size batch path before issuing direct FUSE_WRITE requests.
-    // With max_write=8192, both phases split as 8192 + 4113 and direct writes
-    // must not carry FUSE_WRITE_CACHE. Direct writes do carry the current
+    // Cached batches may be split by background writeback. Direct writes
+    // split as 8192 + 4113 and must not carry FUSE_WRITE_CACHE, but do carry the current
     // file lock owner, matching the ordinary FUSE direct-I/O path.
     memset(batch_backend, 0, sizeof(batch_backend));
     large_write_nodeid = 0;
     snprintf(direct_path, sizeof(direct_path), "%s/p3_direct_drain.txt", mp);
+    write_count = 0;
     f = open(direct_path, O_CREAT | O_RDWR, 0644);
     if (f < 0 || write(f, batch_data, batch_size) != (ssize_t)batch_size) {
         printf("[FAIL] create dirty direct-drain file: %s (errno=%d)\n", strerror(errno),
@@ -933,7 +946,15 @@ static int ext_test_p2_ops() {
         goto fail;
     }
     large_write_nodeid = last_create_nodeid;
-    write_count = 0;
+    // Deterministically exercise the tail-first writeback seen in CI. Keep
+    // these requests in the trace: resetting after write loses early I/O.
+    if (preflush_direct_tail &&
+        syscall(__NR_sync_file_range, f, 12288, 17,
+                SYNC_FILE_RANGE_WRITE | SYNC_FILE_RANGE_WAIT_AFTER) != 0) {
+        printf("[FAIL] preflush direct-drain tail: %s (errno=%d)\n", strerror(errno), errno);
+        free(batch_data);
+        goto fail;
+    }
     dynamic_open_out_flags = FOPEN_DIRECT_IO;
     direct_fd = open(direct_path, O_WRONLY);
     if (direct_fd < 0 || pwrite(direct_fd, batch_data, batch_size, 0) != (ssize_t)batch_size) {
@@ -946,13 +967,8 @@ static int ext_test_p2_ops() {
     dynamic_open_out_flags = 0;
     close(direct_fd);
     direct_fd = -1;
-    if (write_count != 4 || write_offsets[0] != 0 || write_sizes[0] != 8192 ||
-        write_flags[0] != FUSE_WRITE_CACHE || write_offsets[1] != 8192 ||
-        write_sizes[1] != batch_size - 8192 || write_flags[1] != FUSE_WRITE_CACHE ||
-        write_offsets[2] != 0 || write_sizes[2] != 8192 ||
-        write_flags[2] != FUSE_WRITE_LOCKOWNER ||
-        write_offsets[3] != 8192 || write_sizes[3] != batch_size - 8192 ||
-        write_flags[3] != FUSE_WRITE_LOCKOWNER ||
+    if (!direct_drain_trace_valid(write_count, write_offsets, write_sizes, write_flags,
+                                  batch_size) ||
         memcmp(batch_backend, batch_data, batch_size) != 0) {
         printf("[FAIL] direct drain trace count=%u cached=(%llu,%u,0x%x),(%llu,%u,0x%x) direct=(%llu,%u,0x%x),(%llu,%u,0x%x)\n",
                write_count, (unsigned long long)write_offsets[0], write_sizes[0],
@@ -979,13 +995,11 @@ static int ext_test_p2_ops() {
     }
     if (pwrite(f, &sparse_marker, 1, sparse_offset) != 1) {
         printf("[FAIL] sparse cached extension: %s (errno=%d)\n", strerror(errno), errno);
-        close(f);
         goto fail;
     }
     sparse_contents = (unsigned char *)malloc(sparse_size);
     if (!sparse_contents) {
         printf("[FAIL] allocate sparse read buffer\n");
-        close(f);
         goto fail;
     }
     memset(sparse_contents, 0xff, sparse_size);
@@ -993,14 +1007,12 @@ static int ext_test_p2_ops() {
         printf("[FAIL] read sparse extension before fsync: %s (errno=%d)\n", strerror(errno),
                errno);
         free(sparse_contents);
-        close(f);
         goto fail;
     }
     for (size_t i = 0; i < sparse_size - 1; ++i) {
         if (sparse_contents[i] != 0) {
             printf("[FAIL] sparse hole byte %zu is %u\n", i, sparse_contents[i]);
             free(sparse_contents);
-            close(f);
             goto fail;
         }
     }
@@ -1008,16 +1020,15 @@ static int ext_test_p2_ops() {
         printf("[FAIL] sparse dirty tail lost before fsync: got=%u\n",
                sparse_contents[sparse_size - 1]);
         free(sparse_contents);
-        close(f);
         goto fail;
     }
     free(sparse_contents);
     if (fsync(f) != 0) {
         printf("[FAIL] fsync sparse file: %s (errno=%d)\n", strerror(errno), errno);
-        close(f);
         goto fail;
     }
     close(f);
+    f = -1;
 
     if (unlink(hard_path) != 0) {
         printf("[FAIL] unlink dirty-link probe: %s (errno=%d)\n", strerror(errno), errno);
@@ -1056,6 +1067,7 @@ static int ext_test_p2_ops() {
     }
     rn = read(f, rbuf, sizeof(rbuf) - 1);
     close(f);
+    f = -1;
     if (rn < (ssize_t)strlen("p2-data")) {
         printf("[FAIL] read hard link: %s (errno=%d)\n", strerror(errno), errno);
         goto fail;
@@ -1072,6 +1084,7 @@ static int ext_test_p2_ops() {
         goto fail;
     }
     close(f);
+    f = -1;
 
     if (syscall(SYS_renameat2, AT_FDCWD, hard_path, AT_FDCWD, dst_exist, RENAME_NOREPLACE) == 0 ||
         errno != EEXIST) {
@@ -1093,10 +1106,10 @@ static int ext_test_p2_ops() {
     }
     if (fsync(dfd) != 0) {
         printf("[FAIL] fsync(dirfd): %s (errno=%d)\n", strerror(errno), errno);
-        close(dfd);
         goto fail;
     }
     close(dfd);
+    dfd = -1;
 
     usleep(100 * 1000);
 
@@ -1119,6 +1132,12 @@ static int ext_test_p2_ops() {
     return 0;
 
 fail:
+    if (f >= 0) {
+        close(f);
+    }
+    if (dfd >= 0) {
+        close(dfd);
+    }
     if (direct_fd >= 0) {
         close(direct_fd);
     }
@@ -11059,6 +11078,32 @@ fail:
 
 TEST(FuseExtended, OpsAccessCreateSymlinkLinkRename2FlushFsync) {
     ASSERT_EQ(0, ext_test_p2_ops());
+}
+
+TEST(FuseExtended, DirectDrainAfterTailWriteback) {
+    ASSERT_EQ(0, ext_test_p2_ops(true));
+}
+
+TEST(FuseExtended, DirectDrainTraceRejectsIncompleteOrReorderedWrites) {
+    uint64_t offsets[] = {12288, 0, 8192, 0, 8192};
+    uint32_t sizes[] = {17, 8192, 4096, 8192, 4113};
+    uint32_t flags[] = {FUSE_WRITE_CACHE, FUSE_WRITE_CACHE, FUSE_WRITE_CACHE,
+                        FUSE_WRITE_LOCKOWNER, FUSE_WRITE_LOCKOWNER};
+    const size_t length = 3 * 4096 + 17;
+    ASSERT_TRUE(direct_drain_trace_valid(5, offsets, sizes, flags, length));
+    sizes[0] = 16;
+    EXPECT_FALSE(direct_drain_trace_valid(5, offsets, sizes, flags, length));
+    sizes[0] = 17;
+    offsets[2] = 0;
+    EXPECT_FALSE(direct_drain_trace_valid(5, offsets, sizes, flags, length));
+    offsets[2] = 8192;
+    flags[2] = FUSE_WRITE_LOCKOWNER;
+    flags[3] = FUSE_WRITE_CACHE;
+    EXPECT_FALSE(direct_drain_trace_valid(5, offsets, sizes, flags, length));
+    flags[2] = FUSE_WRITE_CACHE;
+    flags[3] = FUSE_WRITE_LOCKOWNER;
+    EXPECT_FALSE(direct_drain_trace_valid(4, offsets, sizes, flags, length));
+    EXPECT_FALSE(direct_drain_trace_valid(7, offsets, sizes, flags, length));
 }
 
 TEST(FuseExtended, DirtyMultibatchNotifyInvalidation) {

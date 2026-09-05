@@ -360,6 +360,13 @@ impl SemQueueEntry {
     }
 }
 
+/// Selects one of the set-global pending queues.
+#[derive(Debug, Clone, Copy)]
+enum SemPendingQueue {
+    Const,
+    Alter,
+}
+
 /// Semaphore set
 #[derive(Debug)]
 pub struct KernelSemSet {
@@ -371,8 +378,10 @@ pub struct KernelSemSet {
     pub sem_otime: i64,
     /// Time of the last metadata change
     pub sem_ctime: i64,
-    /// Waiter queue
-    waiters: VecDeque<Arc<SemQueueEntry>>,
+    /// Pending operation groups containing only zero-wait operations
+    pending_const: VecDeque<Arc<SemQueueEntry>>,
+    /// Pending operation groups containing at least one altering operation
+    pending_alter: VecDeque<Arc<SemQueueEntry>>,
 }
 
 impl KernelSemSet {
@@ -390,36 +399,83 @@ impl KernelSemSet {
             sems,
             sem_otime: 0,
             sem_ctime: PosixTimeSpec::now().tv_sec,
-            waiters: VecDeque::new(),
+            pending_const: VecDeque::new(),
+            pending_alter: VecDeque::new(),
+        }
+    }
+
+    fn pending_queue_for(sops: &[PosixSemBuf]) -> SemPendingQueue {
+        if sops.iter().any(|op| op.sem_op != 0) {
+            SemPendingQueue::Alter
+        } else {
+            SemPendingQueue::Const
         }
     }
 
     fn enqueue_waiter(&mut self, waiter: Arc<SemQueueEntry>) {
-        self.waiters.push_back(waiter);
+        match Self::pending_queue_for(&waiter.sops) {
+            SemPendingQueue::Const => self.pending_const.push_back(waiter),
+            SemPendingQueue::Alter => self.pending_alter.push_back(waiter),
+        }
     }
 
     fn remove_waiter(&mut self, target: &Arc<SemQueueEntry>) {
-        self.waiters.retain(|entry| !Arc::ptr_eq(entry, target));
+        self.pending_const
+            .retain(|entry| !Arc::ptr_eq(entry, target));
+        self.pending_alter
+            .retain(|entry| !Arc::ptr_eq(entry, target));
+    }
+
+    #[cfg(test)]
+    fn pending_is_empty(&self) -> bool {
+        self.pending_const.is_empty() && self.pending_alter.is_empty()
+    }
+
+    fn pending_len(&self, queue: SemPendingQueue) -> usize {
+        match queue {
+            SemPendingQueue::Const => self.pending_const.len(),
+            SemPendingQueue::Alter => self.pending_alter.len(),
+        }
+    }
+
+    fn pending_entry(&self, queue: SemPendingQueue, index: usize) -> Arc<SemQueueEntry> {
+        match queue {
+            SemPendingQueue::Const => self.pending_const[index].clone(),
+            SemPendingQueue::Alter => self.pending_alter[index].clone(),
+        }
+    }
+
+    fn remove_pending(&mut self, queue: SemPendingQueue, index: usize) {
+        match queue {
+            SemPendingQueue::Const => self.pending_const.remove(index),
+            SemPendingQueue::Alter => self.pending_alter.remove(index),
+        };
     }
 
     /// Complete and wake all entries during IPC_RMID under the manager lock.
     fn complete_all_removed(&mut self) {
-        for entry in self.waiters.drain(..) {
+        for entry in self.pending_const.drain(..) {
+            entry.complete(Err(SystemError::EIDRM));
+            entry.waker.wake();
+        }
+        for entry in self.pending_alter.drain(..) {
             entry.complete(Err(SystemError::EIDRM));
             entry.waker.wake();
         }
     }
 
     fn ncnt(&self, semnum: usize) -> usize {
-        self.waiters
+        self.pending_const
             .iter()
+            .chain(self.pending_alter.iter())
             .filter(|entry| entry.is_waiting_on(semnum, SemWaitType::Increase))
             .count()
     }
 
     fn zcnt(&self, semnum: usize) -> usize {
-        self.waiters
+        self.pending_const
             .iter()
+            .chain(self.pending_alter.iter())
             .filter(|entry| entry.is_waiting_on(semnum, SemWaitType::Zero))
             .count()
     }
@@ -950,92 +1006,94 @@ impl SemManager {
         values_changed
     }
 
-    /// Complete every executable queue entry without head-of-line blocking.
-    fn update_queue(set: &mut KernelSemSet, _semid: SemId) {
-        loop {
-            let mut values_changed = false;
-            let mut index = 0;
+    /// Scan one pending queue without head-of-line blocking.
+    fn scan_pending_queue(set: &mut KernelSemSet, queue: SemPendingQueue) -> bool {
+        let mut index = 0;
+        while index < set.pending_len(queue) {
+            let entry = set.pending_entry(queue, index);
 
-            while index < set.waiters.len() {
-                let entry = set.waiters[index].clone();
-
-                if let Some(group) = entry.undo_group.as_ref() {
-                    let result = {
-                        let mut record_slot = entry.undo_record.lock_irqsave();
-                        let Some(record) = record_slot.take() else {
-                            set.waiters.remove(index);
-                            entry.complete(Err(SystemError::EINVAL));
-                            entry.waker.wake();
-                            continue;
-                        };
-                        match group.with_prepared_record_noalloc(record, |record| {
-                            match Self::retry_queued_undo_entry(set, &entry, record) {
-                                Ok(Some(changed)) => {
-                                    PreparedSemUndoRecordAction::Publish(Ok(Some(changed)))
-                                }
-                                Ok(None) => PreparedSemUndoRecordAction::Keep(Ok(None)),
-                                Err(error) => PreparedSemUndoRecordAction::Keep(Err(error)),
-                            }
-                        }) {
-                            Ok((result, kept_record)) => {
-                                *record_slot = kept_record;
-                                result
-                            }
-                            Err(error) => Err(error),
-                        }
+            if let Some(group) = entry.undo_group.as_ref() {
+                let result = {
+                    let mut record_slot = entry.undo_record.lock_irqsave();
+                    let Some(record) = record_slot.take() else {
+                        set.remove_pending(queue, index);
+                        entry.complete(Err(SystemError::EINVAL));
+                        entry.waker.wake();
+                        continue;
                     };
-
-                    match result {
-                        Ok(Some(changed)) => {
-                            values_changed |= changed;
-                            set.waiters.remove(index);
-                            entry.complete(Ok(0));
-                            entry.waker.wake();
-                            if changed {
-                                break;
+                    match group.with_prepared_record_noalloc(record, |record| {
+                        match Self::retry_queued_undo_entry(set, &entry, record) {
+                            Ok(Some(changed)) => {
+                                PreparedSemUndoRecordAction::Publish(Ok(Some(changed)))
                             }
+                            Ok(None) => PreparedSemUndoRecordAction::Keep(Ok(None)),
+                            Err(error) => PreparedSemUndoRecordAction::Keep(Err(error)),
                         }
-                        Ok(None) => index += 1,
-                        Err(error) => {
-                            set.waiters.remove(index);
-                            entry.complete(Err(error));
-                            entry.waker.wake();
+                    }) {
+                        Ok((result, kept_record)) => {
+                            *record_slot = kept_record;
+                            result
                         }
+                        Err(error) => Err(error),
                     }
-                    continue;
-                }
+                };
 
-                let mut scratch = entry.scratch.lock();
-                match Self::simulate_semop(set, &entry.sops, None, &mut scratch) {
-                    Ok(SemopOutcome::Ready(simulation)) => {
-                        let changed =
-                            Self::commit_semop(set, simulation, &scratch, entry.pid.clone(), None);
-                        values_changed |= changed;
-                        set.waiters.remove(index);
+                match result {
+                    Ok(Some(changed)) => {
+                        set.remove_pending(queue, index);
                         entry.complete(Ok(0));
                         entry.waker.wake();
                         if changed {
-                            break;
+                            return true;
                         }
                     }
-                    Ok(SemopOutcome::Blocked(blocker)) if blocker.nowait => {
-                        set.waiters.remove(index);
-                        entry.complete(Err(SystemError::EAGAIN_OR_EWOULDBLOCK));
-                        entry.waker.wake();
-                    }
-                    Ok(SemopOutcome::Blocked(blocker)) => {
-                        entry.update_blocker(blocker);
-                        index += 1;
-                    }
+                    Ok(None) => index += 1,
                     Err(error) => {
-                        set.waiters.remove(index);
+                        set.remove_pending(queue, index);
                         entry.complete(Err(error));
                         entry.waker.wake();
                     }
                 }
+                continue;
             }
 
-            if !values_changed {
+            let mut scratch = entry.scratch.lock();
+            match Self::simulate_semop(set, &entry.sops, None, &mut scratch) {
+                Ok(SemopOutcome::Ready(simulation)) => {
+                    let changed =
+                        Self::commit_semop(set, simulation, &scratch, entry.pid.clone(), None);
+                    set.remove_pending(queue, index);
+                    entry.complete(Ok(0));
+                    entry.waker.wake();
+                    if changed {
+                        return true;
+                    }
+                }
+                Ok(SemopOutcome::Blocked(blocker)) if blocker.nowait => {
+                    set.remove_pending(queue, index);
+                    entry.complete(Err(SystemError::EAGAIN_OR_EWOULDBLOCK));
+                    entry.waker.wake();
+                }
+                Ok(SemopOutcome::Blocked(blocker)) => {
+                    entry.update_blocker(blocker);
+                    index += 1;
+                }
+                Err(error) => {
+                    set.remove_pending(queue, index);
+                    entry.complete(Err(error));
+                    entry.waker.wake();
+                }
+            }
+        }
+        false
+    }
+
+    /// Complete executable const entries before altering entries.
+    fn update_queue(set: &mut KernelSemSet, _semid: SemId) {
+        loop {
+            let const_changed = Self::scan_pending_queue(set, SemPendingQueue::Const);
+            debug_assert!(!const_changed);
+            if !Self::scan_pending_queue(set, SemPendingQueue::Alter) {
                 return;
             }
         }
@@ -1750,7 +1808,7 @@ mod tests {
             .as_ref()
             .map(|pid| pid.pid_nr_ns(&INIT_PID_NAMESPACE));
         let sem_otime = set.sem_otime;
-        let waiters_are_empty = set.waiters.is_empty();
+        let waiters_are_empty = set.pending_is_empty();
         let completed_result = entry.completed_result();
         let record_count = group.record_count_for_test();
 
@@ -1803,7 +1861,7 @@ mod tests {
             .as_ref()
             .is_some_and(|pid| Arc::ptr_eq(pid, &exiting_tgid));
         let sem_otime = set.sem_otime;
-        let waiters_are_empty = set.waiters.is_empty();
+        let waiters_are_empty = set.pending_is_empty();
         let completed_result = entry.completed_result();
         for sem in &mut set.sems {
             sem.pid = None;
@@ -1846,7 +1904,7 @@ mod tests {
         let values = [set.sems[0].val, set.sems[1].val];
         let untouched_pid = set.sems[1].pid.is_none();
         let sem_otime = set.sem_otime;
-        let waiters_are_empty = set.waiters.is_empty();
+        let waiters_are_empty = set.pending_is_empty();
         let completed_result = entry.completed_result();
         for sem in &mut set.sems {
             sem.pid = None;
@@ -2338,6 +2396,43 @@ mod tests {
             sem_op,
             sem_flg: SemFlags::IPC_NOWAIT.bits() as i16,
         }
+    }
+
+    #[test]
+    fn const_waiters_complete_before_altering_waiters() {
+        let mut manager = SemManager::new();
+        let semid = insert_test_set(&mut manager, SemKey::new(67), &[1]);
+        let (altering, constant) = {
+            let set = manager.get_by_semid_checked_mut(semid).unwrap();
+            let altering = enqueue_test_waiter(
+                set,
+                &[plain_sop(0, 0), plain_sop(0, 1)],
+                SemBlockedOp {
+                    semnum: 0,
+                    wait_type: SemWaitType::Zero,
+                    nowait: false,
+                },
+            );
+            let constant = enqueue_test_waiter(
+                set,
+                &[plain_sop(0, 0)],
+                SemBlockedOp {
+                    semnum: 0,
+                    wait_type: SemWaitType::Zero,
+                    nowait: false,
+                },
+            );
+            set.sems[0].val = 0;
+            (altering, constant)
+        };
+
+        manager.update_queue_for_test(semid);
+
+        let set = manager.get_by_semid_checked(semid).unwrap();
+        assert_eq!(constant.completed_result(), Some(Ok(0)));
+        assert_eq!(altering.completed_result(), Some(Ok(0)));
+        assert!(set.pending_is_empty());
+        assert_eq!(set.sems[0].val, 1);
     }
 
     #[test]

@@ -1902,6 +1902,43 @@ TEST(SysVSem, SignalInterruptsBlockedSemop) {
         << "an interrupted operation must not consume a future token";
 }
 
+TEST(SysVSem, ConstWaitersCompleteBeforeAlteringWaiters) {
+    SemSet sem(1, IPC_CREAT | 0600);
+    ASSERT_TRUE(sem.valid());
+    ASSERT_EQ(0, SemCtl(sem.id(), 0, SETVAL, 1));
+
+    const pid_t altering_pid = fork();
+    ASSERT_GE(altering_pid, 0);
+    ChildGuard altering(altering_pid);
+    if (altering_pid == 0) {
+        struct sembuf ops[] = {{0, 0, 0}, {0, 1, 0}};
+        _exit(SemOp(sem.id(), ops, 2) == 0 ? 0 : 11);
+    }
+    ASSERT_TRUE(WaitForZcnt(sem.id(), 0, 1));
+    ASSERT_EQ(1, SemCtl(sem.id(), 0, GETZCNT, 0));
+
+    const pid_t constant_pid = fork();
+    ASSERT_GE(constant_pid, 0);
+    ChildGuard constant(constant_pid);
+    if (constant_pid == 0) {
+        struct sembuf wait_zero = {0, 0, 0};
+        _exit(SemOp(sem.id(), &wait_zero, 1) == 0 ? 0 : 12);
+    }
+    ASSERT_TRUE(WaitForZcnt(sem.id(), 0, 2));
+    ASSERT_EQ(2, SemCtl(sem.id(), 0, GETZCNT, 0));
+
+    ASSERT_EQ(0, SemCtl(sem.id(), 0, SETVAL, 0));
+    const int zcnt_after_setval = SemCtl(sem.id(), 0, GETZCNT, 0);
+    if (zcnt_after_setval != 0) {
+        ASSERT_EQ(0, SemCtl(sem.id(), 0, SETVAL, 0))
+            << "release a waiter left behind by incorrect queue ordering";
+    }
+    EXPECT_EQ(0, zcnt_after_setval);
+    WaitChildOk(&altering);
+    WaitChildOk(&constant);
+    EXPECT_EQ(1, SemCtl(sem.id(), 0, GETVAL, 0));
+}
+
 TEST(SysVSem, WakingSemopCompletesEligibleQueuedOperationsBeforeReturn) {
     SemSet sem(1, IPC_CREAT | 0600);
     ASSERT_TRUE(sem.valid());

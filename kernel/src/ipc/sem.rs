@@ -669,21 +669,45 @@ impl SemManager {
 
     /// Serialize registration with control operations using the manager lock.
     /// A live group remains registered even when all of its debt is cleared.
-    fn ensure_undo_group_registered(
+    /// Insufficient spare capacity requests an unlocked preparation/retry.
+    /// On success, spare retains any replaced allocation for unlocked disposal.
+    fn ensure_undo_group_registered_prepared(
         &mut self,
         group: &Arc<SemUndoGroup>,
-    ) -> Result<(), SystemError> {
+        spare: &mut Vec<Weak<SemUndoGroup>>,
+    ) -> Result<(), usize> {
+        debug_assert!(spare.is_empty());
         if group.registry_registered() {
             return Ok(());
         }
         if self.undo_groups.len() == self.undo_groups.capacity() {
             self.compact_undo_registry();
         }
-        self.undo_groups
-            .try_reserve(1)
-            .map_err(|_| SystemError::ENOMEM)?;
+        if self.undo_groups.len() == self.undo_groups.capacity() {
+            if spare.capacity() <= self.undo_groups.len() {
+                return Err(self.undo_groups.len().saturating_mul(2).max(4));
+            }
+            spare.append(&mut self.undo_groups);
+            core::mem::swap(&mut self.undo_groups, spare);
+        }
         self.undo_groups.push(Arc::downgrade(group));
         group.mark_registry_registered();
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn ensure_undo_group_registered(
+        &mut self,
+        group: &Arc<SemUndoGroup>,
+    ) -> Result<(), SystemError> {
+        let mut spare = Vec::new();
+        if let Err(capacity) = self.ensure_undo_group_registered_prepared(group, &mut spare) {
+            spare
+                .try_reserve(capacity)
+                .map_err(|_| SystemError::ENOMEM)?;
+            self.ensure_undo_group_registered_prepared(group, &mut spare)
+                .unwrap();
+        }
         Ok(())
     }
 
@@ -1240,6 +1264,8 @@ impl SemManager {
 
         let mut queue_spare = VecDeque::new();
         let mut queue_capacity_needed = 0;
+        let mut registry_spare = Vec::new();
+        let mut registry_capacity_needed = 0;
         let entry = loop {
             // Only a genuinely blocking operation requests queue storage.
             // Revalidate the set and re-simulate after dropping the lock: a
@@ -1249,6 +1275,12 @@ impl SemManager {
                     .try_reserve(queue_capacity_needed)
                     .map_err(|_| SystemError::ENOMEM)?;
                 queue_capacity_needed = 0;
+            }
+            if registry_capacity_needed != 0 {
+                registry_spare
+                    .try_reserve(registry_capacity_needed)
+                    .map_err(|_| SystemError::ENOMEM)?;
+                registry_capacity_needed = 0;
             }
             let nsems = {
                 let guard = ipcns.sem.lock();
@@ -1295,11 +1327,15 @@ impl SemManager {
                 continue;
             }
             if let Some(prepared_entry) = prepared_undo {
-                guard.ensure_undo_group_registered(
+                if let Err(capacity) = guard.ensure_undo_group_registered_prepared(
                     undo_group
                         .as_ref()
                         .expect("SEM_UNDO operation has a current group"),
-                )?;
+                    &mut registry_spare,
+                ) {
+                    registry_capacity_needed = capacity;
+                    continue;
+                }
                 let mut record_slot = prepared_entry.undo_record.lock_irqsave();
                 let prepared_record = record_slot
                     .take()
@@ -1389,6 +1425,7 @@ impl SemManager {
         };
 
         drop(queue_spare);
+        drop(registry_spare);
         if let Some(timer) = timer.as_ref() {
             timer.activate();
         }
@@ -1917,6 +1954,49 @@ mod tests {
     #[test]
     fn new_manager_starts_with_empty_undo_registry() {
         assert!(SemManager::new().undo_groups.is_empty());
+    }
+
+    #[test]
+    fn prepared_registry_growth_rechecks_registration_and_capacity() {
+        let mut manager = SemManager::new();
+        let group = SemUndoGroup::new_for_test_bound_to(&INIT_IPC_NAMESPACE).unwrap();
+        let mut spare = Vec::new();
+        let capacity = manager
+            .ensure_undo_group_registered_prepared(&group, &mut spare)
+            .unwrap_err();
+        assert!(!group.registry_registered());
+        assert!(manager.undo_groups.is_empty());
+        spare.try_reserve(capacity).unwrap();
+
+        // Simulate other first-time groups consuming the prepared capacity
+        // while this caller has dropped the manager lock.
+        let mut owners = Vec::new();
+        while manager.undo_groups.len() < spare.capacity() {
+            let owner = SemUndoGroup::new_for_test_bound_to(&INIT_IPC_NAMESPACE).unwrap();
+            manager.ensure_undo_group_registered(&owner).unwrap();
+            owners.push(owner);
+        }
+        let capacity = manager
+            .ensure_undo_group_registered_prepared(&group, &mut spare)
+            .unwrap_err();
+        assert!(!group.registry_registered());
+        spare.try_reserve(capacity).unwrap();
+        manager
+            .ensure_undo_group_registered_prepared(&group, &mut spare)
+            .unwrap();
+        assert!(spare.is_empty());
+        assert!(group.registry_registered());
+        assert_eq!(manager.undo_groups.len(), owners.len() + 1);
+        for (weak, owner) in manager.undo_groups.iter().zip(&owners) {
+            assert!(weak.ptr_eq(&Arc::downgrade(owner)));
+        }
+
+        // A concurrent CLONE_SYSVSEM sharer already registered this group.
+        let mut empty_spare = Vec::new();
+        manager
+            .ensure_undo_group_registered_prepared(&group, &mut empty_spare)
+            .unwrap();
+        assert_eq!(manager.undo_groups.len(), owners.len() + 1);
     }
 
     #[test]

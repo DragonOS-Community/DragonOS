@@ -671,6 +671,51 @@ TEST(SysVSem, GetPidTracksLastSemop) {
     EXPECT_EQ(getpid(), SemCtl(sem.id(), 0, GETPID, 0)) << "SETVAL also updates sempid";
 }
 
+TEST(SysVSem, GetPidPreservesSemUndoActorAfterWaitpidReap) {
+    SemSet sem(1, IPC_CREAT | 0600);
+    ASSERT_TRUE(sem.valid());
+
+    int ready_pipe[2];
+    int release_pipe[2];
+    ASSERT_EQ(0, pipe(ready_pipe));
+    ASSERT_EQ(0, pipe(release_pipe));
+    FdGuard ready_read(ready_pipe[0]);
+    FdGuard ready_write(ready_pipe[1]);
+    FdGuard release_read(release_pipe[0]);
+    FdGuard release_write(release_pipe[1]);
+
+    const pid_t child_pid = fork();
+    ASSERT_GE(child_pid, 0);
+    if (child_pid == 0) {
+        close(ready_pipe[0]);
+        close(release_pipe[1]);
+        char byte = 1;
+        if (!SemUndoOpMustSucceed(sem.id(), 0, 1) ||
+            !WriteExact(ready_pipe[1], &byte, sizeof(byte)) ||
+            !ReadExact(release_pipe[0], &byte, sizeof(byte))) {
+            _exit(1);
+        }
+        _exit(0);
+    }
+    ChildGuard child(child_pid);
+    ready_write.Close();
+    release_read.Close();
+
+    char byte = 0;
+    ASSERT_TRUE(ReadExact(ready_read.get(), &byte, sizeof(byte)));
+    EXPECT_EQ(1, SemCtl(sem.id(), 0, GETVAL, 0));
+
+    struct sembuf parent_op = {0, 1, 0};
+    ASSERT_EQ(0, SemOp(sem.id(), &parent_op, 1));
+    EXPECT_EQ(getpid(), SemCtl(sem.id(), 0, GETPID, 0));
+
+    ASSERT_TRUE(WriteExact(release_write.get(), &byte, sizeof(byte)));
+    WaitChildOk(&child);
+    EXPECT_EQ(1, SemCtl(sem.id(), 0, GETVAL, 0)) << "SEM_UNDO must preserve the parent delta";
+    EXPECT_EQ(child_pid, SemCtl(sem.id(), 0, GETPID, 0))
+        << "GETPID must retain the reaped SEM_UNDO actor identity";
+}
+
 // ============ semop semantics ============
 
 TEST(SysVSem, IncrementDecrement) {

@@ -1601,6 +1601,38 @@ fn run_pr2_selftest() -> Result<(), &'static str> {
         return Err("current slot object was not dropped after slot destruction grace period");
     }
 
+    let prepared_old_drops = Arc::new(AtomicUsize::new(0));
+    let prepared_new_drops = Arc::new(AtomicUsize::new(0));
+    let prepared_slot = RcuArcSlot::new(Arc::new(RcuSelftestDropProbe {
+        id: 11,
+        drops: prepared_old_drops.clone(),
+    }));
+    let prepared_retire = PreparedRcuArcRetire::prepare()
+        .map_err(|_| "prepared RCU retirement reservation failed")?;
+    let retirement = prepared_slot.swap_prepared(
+        Arc::new(RcuSelftestDropProbe {
+            id: 12,
+            drops: prepared_new_drops.clone(),
+        }),
+        prepared_retire,
+    );
+    if prepared_old_drops.load(Ordering::SeqCst) != 0 {
+        return Err("prepared RCU swap dropped the old object before enqueue");
+    }
+    retirement.enqueue();
+    rcu_barrier();
+    if prepared_old_drops.load(Ordering::SeqCst) != 1 {
+        return Err("prepared RCU retirement did not drop the old object after a grace period");
+    }
+    if prepared_slot.load().id != 12 {
+        return Err("prepared RCU swap did not publish the replacement object");
+    }
+    drop(prepared_slot);
+    rcu_barrier();
+    if prepared_new_drops.load(Ordering::SeqCst) != 1 {
+        return Err("prepared RCU replacement was not dropped after slot destruction");
+    }
+
     let with_read_old_drops = Arc::new(AtomicUsize::new(0));
     let with_read_new_drops = Arc::new(AtomicUsize::new(0));
     let with_read_slot = RcuArcSlot::new(Arc::new(RcuSelftestDropProbe {

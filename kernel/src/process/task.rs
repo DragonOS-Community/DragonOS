@@ -28,6 +28,7 @@ use crate::{
         },
     },
     ipc::{
+        sem_undo::{SemUndoAttachment, SemUndoGroup, UnpublishedSemUndoAttachmentGuard},
         sighand::{NaturalParentNotifyPhase, SigHand},
         signal::RestartBlock,
     },
@@ -42,7 +43,7 @@ use crate::{
     process::{
         cred::{cred_cap_issubset, Cred, INIT_CRED, SUID_DUMPABLE, SUID_DUMP_DISABLE},
         kthread::WorkerPrivate,
-        namespace::nsproxy::NsProxy,
+        namespace::{ipc_namespace::IpcNamespace, nsproxy::NsProxy},
         pid::{Pid, PidLink, PidType},
         resource::{RLimit64, RLimitID, RUsage},
         timer::AlarmTimer,
@@ -50,7 +51,7 @@ use crate::{
         ProcessFlags, ProcessItimers, ProcessManager, ProcessSchedulerInfo, ProcessSignalInfo,
         ProcessState, RawPid, ThreadInfo, PTRACE_RELATION_LOCK,
     },
-    rcu::RcuArcSlot,
+    rcu::{PreparedRcuArcRetire, RcuArcSlot},
 };
 
 use crate::process::{posix_timer, ptrace, rseq, seccomp};
@@ -146,6 +147,8 @@ pub struct ProcessControlBlock {
     pub(super) nsproxy: RcuArcSlot<NsProxy>,
     /// The cgroup (v2) this task belongs to.
     pub(super) task_cgroup: RwLock<TaskCgroupRef>,
+
+    pub(super) sem_undo: SpinLock<Option<SemUndoAttachment>>,
 
     pub(super) basic: RwLock<ProcessBasicInfo>,
     pub(super) exec_update_lock: RwSem<()>,
@@ -360,6 +363,66 @@ impl ProcessControlBlock {
         vm.try_acquire()
     }
 
+    pub fn sem_undo_group(&self) -> Option<Arc<SemUndoGroup>> {
+        self.sem_undo
+            .lock_irqsave()
+            .as_ref()
+            .map(SemUndoAttachment::group)
+    }
+
+    pub fn ensure_sem_undo_group(
+        &self,
+        ipc_ns: &Arc<IpcNamespace>,
+    ) -> Result<Arc<SemUndoGroup>, SystemError> {
+        if let Some(group) = self.sem_undo_group() {
+            group.verify_ipc_ns(ipc_ns)?;
+            return Ok(group);
+        }
+
+        let candidate = SemUndoGroup::new(ipc_ns)?;
+        let group = {
+            let mut slot = self.sem_undo.lock_irqsave();
+            if let Some(attachment) = slot.as_ref() {
+                attachment.group()
+            } else {
+                *slot = Some(SemUndoAttachment::new(candidate.clone()));
+                candidate
+            }
+        };
+        group.verify_ipc_ns(ipc_ns)?;
+        Ok(group)
+    }
+
+    pub fn take_sem_undo_attachment(&self) -> Option<SemUndoAttachment> {
+        self.sem_undo.lock_irqsave().take()
+    }
+
+    pub(crate) fn prepare_shared_sem_undo_attachment(
+        &self,
+        ipc_ns: &Arc<IpcNamespace>,
+    ) -> Result<UnpublishedSemUndoAttachmentGuard, SystemError> {
+        let group = self.ensure_sem_undo_group(ipc_ns)?;
+        group.verify_ipc_ns(ipc_ns)?;
+        Ok(UnpublishedSemUndoAttachmentGuard::new(group))
+    }
+
+    pub(crate) fn install_unpublished_sem_undo_attachment(
+        &self,
+        attachment: SemUndoAttachment,
+    ) -> Arc<Self> {
+        let child = self
+            .self_ref
+            .upgrade()
+            .expect("unpublished PCB lost its owning Arc");
+        let mut slot = self.sem_undo.lock_irqsave();
+        assert!(
+            slot.is_none(),
+            "unpublished child already has a SEM_UNDO attachment"
+        );
+        *slot = Some(attachment);
+        child
+    }
+
     #[inline(never)]
     fn do_create_pcb(
         name: String,
@@ -436,6 +499,7 @@ impl ProcessControlBlock {
                 pid_links: core::array::from_fn(|_| PidLink::default()),
                 nsproxy: RcuArcSlot::new(nsproxy),
                 task_cgroup: RwLock::new(task_cgroup),
+                sem_undo: SpinLock::new(None),
                 preempt_count,
                 pagefault_disabled,
                 rcu_read_depth,
@@ -986,9 +1050,47 @@ impl ProcessControlBlock {
     /// - Uses irqsave write lock for concurrency safety.
     /// - Returns `Result` so that callers can extend error handling as needed.
     pub fn set_cred(&self, new: Arc<Cred>) -> Result<(), SystemError> {
+        self.install_cred(new);
+        Ok(())
+    }
+
+    /// Install credentials after every fallible preparation step has completed.
+    pub(crate) fn install_cred(&self, new: Arc<Cred>) {
         let _task_guard = self.task_lock.lock_irqsave();
         self.cred.store_deferred(new);
-        Ok(())
+    }
+
+    /// Publish prepared namespace state without allocating under task_lock.
+    pub(crate) fn install_prepared_namespace_state(
+        &self,
+        new_nsproxy: Arc<NsProxy>,
+        nsproxy_retire: PreparedRcuArcRetire<NsProxy>,
+        new_cred: Option<(Arc<Cred>, PreparedRcuArcRetire<Cred>)>,
+    ) {
+        // Only credential publication needs to stabilize the active mm. Pure
+        // namespace publication also runs inside exec, which already owns the
+        // write side and must not recursively acquire this read lock.
+        let _exec_guard = new_cred.as_ref().map(|_| self.exec_update_read());
+        let active_mm = new_cred.as_ref().and_then(|_| self.basic().user_vm());
+        let (nsproxy_retirement, cred_retirement) = {
+            let _task_guard = self.task_lock.lock_irqsave();
+            let nsproxy_retirement = self.nsproxy.swap_prepared(new_nsproxy, nsproxy_retire);
+            let cred_retirement = new_cred.map(|(cred, retire)| {
+                self.commit_cred_side_effects(&self.cred(), &cred, active_mm.as_ref());
+                self.cred.swap_prepared(cred, retire)
+            });
+            (nsproxy_retirement, cred_retirement)
+        };
+
+        nsproxy_retirement.enqueue();
+        if let Some(retirement) = cred_retirement {
+            retirement.enqueue();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn namespace_unprepared_rcu_stores_for_test(&self) -> usize {
+        self.nsproxy.unprepared_store_count_for_test() + self.cred.unprepared_store_count_for_test()
     }
 
     /// Commit new creds, updating dumpability accordingly
@@ -1000,23 +1102,33 @@ impl ProcessControlBlock {
         let active_mm = self.basic().user_vm();
         let _task_guard = self.task_lock.lock_irqsave();
         let old = self.cred();
+        self.commit_cred_side_effects(&old, &new, active_mm.as_ref());
+        self.cred.store_deferred(new);
+        Ok(())
+    }
+
+    /// Caller holds exec_update_lock and task_lock; publish these effects before creds.
+    fn commit_cred_side_effects(
+        &self,
+        old: &Cred,
+        new: &Cred,
+        active_mm: Option<&Arc<crate::mm::ucontext::AddressSpace>>,
+    ) {
         // Trigger: any of euid/egid/fsuid/fsgid changes, or new permitted is not a subset of old (privilege raise)
         if old.euid != new.euid
             || old.egid != new.egid
             || old.fsuid != new.fsuid
             || old.fsgid != new.fsgid
-            || !cred_cap_issubset(&old, &new)
+            || !cred_cap_issubset(old, new)
         {
             // Publish dumpability before creds; with the read-side fence, checks never see new creds with old dumpable
-            if let Some(mm) = active_mm.as_ref() {
+            if let Some(mm) = active_mm {
                 mm.set_dumpable(SUID_DUMPABLE.load(Ordering::SeqCst) as u8);
             }
             // Also clear the parent-death signal on identity change
             self.set_pdeath_signal(Signal::INVALID);
             fence(Ordering::Release);
         }
-        self.cred.store_deferred(new);
-        Ok(())
     }
 
     pub fn set_execute_path(&self, path: String) {

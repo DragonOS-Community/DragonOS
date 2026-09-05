@@ -74,8 +74,10 @@ pub struct Pid {
     /// tasks[PidType::PID as usize] = 使用该PID作为进程ID的任务
     /// tasks[PidType::TGID as usize] = 使用该PID作为线程组ID的任务
     tasks: [SpinLock<Vec<Weak<ProcessControlBlock>>>; PidType::PIDTYPE_MAX],
-    /// 在各个namespace中的PID值
+    /// PID numbers in each namespace. These remain as identity until final drop.
     numbers: SpinLock<Vec<Option<UPid>>>,
+    /// Owns namespace map registrations and allocator slots until unregistration.
+    registered: Vec<AtomicBool>,
     /// pidfd poll/epoll waiters. Linux keeps this wakeup edge on struct pid.
     pidfd_epitems: EPollItemList,
 }
@@ -94,10 +96,25 @@ impl Pid {
             level,
             tasks: core::array::from_fn(|_| SpinLock::new(Vec::new())),
             numbers: SpinLock::new(vec![None; level as usize + 1]),
+            registered: (0..=level).map(|_| AtomicBool::new(false)).collect(),
             pidfd_epitems: EPollItemList::default(),
         });
 
         pid
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test(nr: RawPid, ns: Arc<PidNamespace>) -> Arc<Self> {
+        let pid = Self::new(ns.level());
+        pid.numbers.lock()[ns.level() as usize] = Some(UPid::new(nr, ns));
+        pid
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_numbers_for_test(&self) {
+        for number in self.numbers.lock().iter_mut() {
+            number.take();
+        }
     }
 
     pub fn dead(&self) -> bool {
@@ -247,10 +264,14 @@ impl Eq for Pid {}
 
 impl Drop for Pid {
     fn drop(&mut self) {
-        // 清理numbers中的UPid引用
-        let numbers_guard = self.numbers.lock();
-        for upid in numbers_guard.iter().flatten() {
-            upid.ns.release_pid_in_ns(upid.nr);
+        let numbers = self.numbers.lock();
+        for (level, upid) in numbers.iter().enumerate() {
+            if self.registered[level].swap(false, Ordering::AcqRel) {
+                let upid = upid
+                    .as_ref()
+                    .expect("registered PID namespace entry must have an identity");
+                upid.ns.release_pid_in_ns(upid.nr);
+            }
         }
     }
 }
@@ -300,6 +321,24 @@ impl Debug for UPid {
 impl ProcessControlBlock {
     pub fn pid(&self) -> Arc<Pid> {
         self.thread_pid.read().clone().unwrap()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_pid_identity_for_test(&self, pid: Arc<Pid>) {
+        let raw_pid = pid
+            .first_upid()
+            .expect("test PID identity must have a namespace number")
+            .nr;
+        self.pid.store(raw_pid, Ordering::Release);
+        self.thread_pid.write().replace(pid.clone());
+        self.sighand().set_pid(PidType::TGID, Some(pid));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_pid_identity_for_test(&self) {
+        self.sighand().set_pid(PidType::TGID, None);
+        self.thread_pid.write().take();
+        self.pid.store(RawPid::new(0), Ordering::Release);
     }
 
     /// 强制设置当前进程的raw_pid
@@ -487,6 +526,7 @@ pub(super) fn alloc_pid(ns: &Arc<PidNamespace>) -> Result<Arc<Pid>, SystemError>
                     let upid = UPid::new(nr, curr_ns.clone());
                     allocated_upids.push((level, upid.clone()));
                     pid.numbers.lock()[level as usize] = Some(upid);
+                    pid.registered[level as usize].store(true, Ordering::Release);
                     current_ns = curr_ns.parent();
                 }
                 Err(e) => {
@@ -511,6 +551,7 @@ fn cleanup_allocated_pids(pid: Arc<Pid>, mut allocated_upids: Vec<(isize, UPid)>
         let curr_ns = upid.ns;
         // 在当前namespace中释放UPid
         curr_ns.release_pid_in_ns(upid.nr);
+        pid.registered[level as usize].store(false, Ordering::Release);
         pid.numbers.lock()[level as usize] = None;
     }
 }
@@ -524,18 +565,13 @@ pub(super) fn free_pid(pid: Arc<Pid>) {
     // let raw_pid = pid.pid_vnr().data();
     let mut level = 0;
     while level <= pid.level {
-        let upid = match pid.numbers.lock()[level as usize].take() {
-            Some(upid) => upid,
-            None => {
-                // PID numbers 已经被释放过了,这可能发生在进程被多次detach的场景
-                // 虽然理论上不应该发生,但为了防御性编程,我们在这里直接返回
-                log::warn!(
-                    "PID numbers at level {} already freed, skipping remaining levels",
-                    level
-                );
-                return;
-            }
-        };
+        if !pid.registered[level as usize].swap(false, Ordering::AcqRel) {
+            level += 1;
+            continue;
+        }
+        let upid = pid.numbers.lock()[level as usize]
+            .clone()
+            .expect("registered PID namespace entry must have an identity");
         // log::debug!(
         //     "Freeing pid: raw:{}, upid.nr:{}, level: {}",
         //     raw_pid,
@@ -646,7 +682,7 @@ impl ProcessControlBlock {
     /// # 特殊情况
     /// * 如果进程的raw_pid为0（通常是空闲进程），则直接返回raw_pid
     #[allow(dead_code)]
-    pub(super) fn task_pid_nr_ns(
+    pub(crate) fn task_pid_nr_ns(
         &self,
         pid_type: PidType,
         ns: Option<Arc<PidNamespace>>,

@@ -8,15 +8,15 @@ use crate::{
             InodeId,
         },
     },
-    ipc::id::IpcIdAllocator,
+    ipc::{
+        id::{IpcIdAllocator, ShmIpcIdAllocator},
+        ipc_perm::{self, IpcPermView, PosixIpcPerm},
+    },
     libs::mutex::Mutex,
     mm::MemoryManagementArch,
     process::{
         cred::{capable, ns_capable, CAPFlags, Cred, Kgid, Kuid},
-        namespace::{
-            ipc_namespace::IpcNamespace,
-            user_namespace::{map_id_down, map_id_up, UserNamespace},
-        },
+        namespace::{ipc_namespace::IpcNamespace, user_namespace::UserNamespace},
         resource::RLimitID,
         ProcessManager, RawPid,
     },
@@ -34,7 +34,6 @@ use system_error::SystemError;
 
 /// 用于创建新的私有IPC对象
 pub const IPC_PRIVATE: ShmKey = ShmKey::new(0);
-const DEFAULT_OVERFLOW_ID: u32 = 65534;
 
 int_like!(ShmId, usize);
 int_like!(ShmKey, usize);
@@ -356,7 +355,7 @@ impl Drop for SysVShmAttachGuard {
 #[derive(Debug)]
 pub struct ShmManager {
     /// ShmId分配器
-    id_allocator: IpcIdAllocator,
+    id_allocator: ShmIpcIdAllocator,
     /// 低位 IPC idx 映射共享内存信息表
     id2shm: HashMap<usize, KernelShm>,
     /// ShmKey映射ShmId表
@@ -378,7 +377,7 @@ impl ShmManager {
 
     pub fn new() -> Self {
         ShmManager {
-            id_allocator: IpcIdAllocator::new(PosixShmMetaInfo::SHMMNI).unwrap(),
+            id_allocator: ShmIpcIdAllocator::new(PosixShmMetaInfo::SHMMNI).unwrap(),
             id2shm: HashMap::new(),
             key2id: HashMap::new(),
             total_pages: 0,
@@ -456,6 +455,16 @@ impl ShmManager {
             .total_pages
             .checked_add(numpages)
             .ok_or(SystemError::ENOSPC)?;
+
+        self.id2shm
+            .try_reserve(1)
+            .map_err(|_| SystemError::ENOMEM)?;
+        if key != IPC_PRIVATE {
+            self.key2id
+                .try_reserve(1)
+                .map_err(|_| SystemError::ENOMEM)?;
+        }
+
         let ipc_id = self.id_allocator.alloc()?;
         let shm_id = ShmId::new(ipc_id.raw);
 
@@ -559,75 +568,6 @@ impl ShmManager {
         None
     }
 
-    fn cred_in_group(cred: &Cred, gid: Kgid) -> bool {
-        cred.fsgid == gid
-            || cred.groups.contains(&gid)
-            || cred
-                .group_info
-                .as_ref()
-                .map(|group_info| group_info.gids.contains(&gid))
-                .unwrap_or(false)
-    }
-
-    fn ipc_permission(
-        kern_ipc_perm: &KernIpcPerm,
-        requested: u32,
-        target_user_ns: &Arc<UserNamespace>,
-    ) -> Result<(), SystemError> {
-        let requested = ((requested >> 6) | (requested >> 3) | requested) & 0o7;
-        if requested == 0 {
-            return Ok(());
-        }
-
-        let cred = ProcessManager::current_pcb().cred();
-        let mut granted = kern_ipc_perm.mode.bits();
-        if cred.euid == kern_ipc_perm.cuid || cred.euid == kern_ipc_perm.uid {
-            granted >>= 6;
-        } else if Self::cred_in_group(&cred, kern_ipc_perm.cgid)
-            || Self::cred_in_group(&cred, kern_ipc_perm.gid)
-        {
-            granted >>= 3;
-        }
-
-        if (requested & !(granted & 0o7)) != 0
-            && !ns_capable(target_user_ns, CAPFlags::CAP_IPC_OWNER)
-        {
-            return Err(SystemError::EACCES);
-        }
-
-        Ok(())
-    }
-
-    fn check_control_permission(
-        kern_ipc_perm: &KernIpcPerm,
-        target_user_ns: &Arc<UserNamespace>,
-    ) -> Result<(), SystemError> {
-        let cred = ProcessManager::current_pcb().cred();
-        if cred.euid == kern_ipc_perm.cuid
-            || cred.euid == kern_ipc_perm.uid
-            || ns_capable(target_user_ns, CAPFlags::CAP_SYS_ADMIN)
-        {
-            Ok(())
-        } else {
-            Err(SystemError::EPERM)
-        }
-    }
-
-    fn check_lock_permission(
-        kern_ipc_perm: &KernIpcPerm,
-        target_user_ns: &Arc<UserNamespace>,
-    ) -> Result<(), SystemError> {
-        let cred = ProcessManager::current_pcb().cred();
-        if cred.euid == kern_ipc_perm.cuid
-            || cred.euid == kern_ipc_perm.uid
-            || ns_capable(target_user_ns, CAPFlags::CAP_IPC_LOCK)
-        {
-            Ok(())
-        } else {
-            Err(SystemError::EPERM)
-        }
-    }
-
     pub(crate) fn charge_memlock_for_shm(size: usize) -> Result<SysVShmMemlockToken, SystemError> {
         let pcb = ProcessManager::current_pcb();
         let rlimit = pcb.get_rlimit(RLimitID::Memlock).rlim_cur;
@@ -662,7 +602,7 @@ impl ShmManager {
         let kernel_shm = self.get_by_shmid_checked(id)?;
         let requested = shmflg.bits() & ShmFlags::PERM_MASK.bits();
         let target_user_ns = ProcessManager::current_ipcns().user_ns.clone();
-        Self::ipc_permission(&kernel_shm.kern_ipc_perm, requested, &target_user_ns)
+        ipc_perm::ipc_permission(&kernel_shm.kern_ipc_perm, requested, &target_user_ns)
     }
 
     fn maybe_take_destroy_candidate_locked(&mut self, id: ShmId) -> Option<KernelShmDestroy> {
@@ -697,7 +637,7 @@ impl ShmManager {
         if executable {
             requested |= Self::IPC_EXEC;
         }
-        Self::ipc_permission(&kernel_shm.kern_ipc_perm, requested, &ipcns.user_ns)?;
+        ipc_perm::ipc_permission(&kernel_shm.kern_ipc_perm, requested, &ipcns.user_ns)?;
         let backing = kernel_shm.backing.clone();
         let backing_inode_id = kernel_shm.backing_inode_id;
         let size = kernel_shm.size();
@@ -809,7 +749,7 @@ impl ShmManager {
         };
         if cmd != ShmCtlCmd::ShmtStatAny {
             let target_user_ns = ProcessManager::current_ipcns().user_ns.clone();
-            Self::ipc_permission(&kernel_shm.kern_ipc_perm, Self::IPC_READ, &target_user_ns)?;
+            ipc_perm::ipc_permission(&kernel_shm.kern_ipc_perm, Self::IPC_READ, &target_user_ns)?;
         }
         let kern_ipc_perm = &kernel_shm.kern_ipc_perm;
         let current_user_ns = ProcessManager::current_user_ns();
@@ -854,7 +794,7 @@ impl ShmManager {
     pub fn ipc_set(&mut self, id: ShmId, shm_id_ds: PosixShmIdDs) -> Result<usize, SystemError> {
         let kernel_shm = self.get_by_shmid_checked_mut(id)?;
         let target_user_ns = ProcessManager::current_ipcns().user_ns.clone();
-        Self::check_control_permission(&kernel_shm.kern_ipc_perm, &target_user_ns)?;
+        ipc_perm::check_control_permission(&kernel_shm.kern_ipc_perm, &target_user_ns)?;
 
         let current_user_ns = ProcessManager::current_user_ns();
         kernel_shm.copy_from(shm_id_ds, &current_user_ns)?;
@@ -866,7 +806,7 @@ impl ShmManager {
         let key = {
             let kernel_shm = self.get_by_shmid_checked_mut(id)?;
             let target_user_ns = ProcessManager::current_ipcns().user_ns.clone();
-            Self::check_control_permission(&kernel_shm.kern_ipc_perm, &target_user_ns)?;
+            ipc_perm::check_control_permission(&kernel_shm.kern_ipc_perm, &target_user_ns)?;
             // Linux do_shm_rmid() marks an attached segment as SHM_DEST and
             // hides its key, but does not refresh shm_ctim. IPC_SET remains
             // the metadata-changing operation that updates shm_ctim.
@@ -882,7 +822,7 @@ impl ShmManager {
     pub(crate) fn shm_lock_begin(&mut self, id: ShmId) -> Result<ShmLockBegin, SystemError> {
         let kernel_shm = self.get_by_shmid_checked_mut(id)?;
         let target_user_ns = ProcessManager::current_ipcns().user_ns.clone();
-        Self::check_lock_permission(&kernel_shm.kern_ipc_perm, &target_user_ns)?;
+        ipc_perm::check_lock_permission(&kernel_shm.kern_ipc_perm, &target_user_ns)?;
         let has_target_ns_cap = ns_capable(&target_user_ns, CAPFlags::CAP_IPC_LOCK);
         if ProcessManager::current_pcb()
             .get_rlimit(RLimitID::Memlock)
@@ -914,7 +854,9 @@ impl ShmManager {
             }
         };
         let target_user_ns = ProcessManager::current_ipcns().user_ns.clone();
-        if let Err(err) = Self::check_lock_permission(&kernel_shm.kern_ipc_perm, &target_user_ns) {
+        if let Err(err) =
+            ipc_perm::check_lock_permission(&kernel_shm.kern_ipc_perm, &target_user_ns)
+        {
             token.release();
             return Err(err);
         }
@@ -932,7 +874,7 @@ impl ShmManager {
     pub fn shm_unlock(&mut self, id: ShmId) -> Result<Option<(Arc<PageCache>, bool)>, SystemError> {
         let kernel_shm = self.get_by_shmid_checked_mut(id)?;
         let target_user_ns = ProcessManager::current_ipcns().user_ns.clone();
-        Self::check_lock_permission(&kernel_shm.kern_ipc_perm, &target_user_ns)?;
+        ipc_perm::check_lock_permission(&kernel_shm.kern_ipc_perm, &target_user_ns)?;
         if !kernel_shm.mode().contains(ShmFlags::SHM_LOCKED) {
             return Ok(None);
         }
@@ -1095,8 +1037,8 @@ impl KernelShm {
         shm_id_ds: PosixShmIdDs,
         user_ns: &Arc<UserNamespace>,
     ) -> Result<(), SystemError> {
-        let uid = KernIpcPerm::make_kuid(user_ns, shm_id_ds.uid())?;
-        let gid = KernIpcPerm::make_kgid(user_ns, shm_id_ds.gid())?;
+        let uid = ipc_perm::make_kuid(user_ns, shm_id_ds.uid())?;
+        let gid = ipc_perm::make_kgid(user_ns, shm_id_ds.gid())?;
         let perm_bits = ShmFlags::from_bits_truncate(shm_id_ds.mode()) & ShmFlags::PERM_MASK;
         self.kern_ipc_perm.uid = uid;
         self.kern_ipc_perm.gid = gid;
@@ -1250,52 +1192,35 @@ impl KernIpcPerm {
             seq,
         }
     }
+}
 
-    fn make_kuid(user_ns: &Arc<UserNamespace>, uid: u32) -> Result<Kuid, SystemError> {
-        let inner = user_ns.inner.lock();
-        map_id_down(&inner.uid_map, uid)
-            .map(|uid| Kuid::new(uid as usize))
-            .ok_or(SystemError::EINVAL)
+impl IpcPermView for KernIpcPerm {
+    fn uid(&self) -> Kuid {
+        self.uid
     }
 
-    fn make_kgid(user_ns: &Arc<UserNamespace>, gid: u32) -> Result<Kgid, SystemError> {
-        let inner = user_ns.inner.lock();
-        map_id_down(&inner.gid_map, gid)
-            .map(|gid| Kgid::new(gid as usize))
-            .ok_or(SystemError::EINVAL)
+    fn gid(&self) -> Kgid {
+        self.gid
     }
 
-    fn kuid_to_user(user_ns: &Arc<UserNamespace>, kuid: Kuid) -> u32 {
-        let Ok(uid) = u32::try_from(kuid.data()) else {
-            return DEFAULT_OVERFLOW_ID;
-        };
-        let inner = user_ns.inner.lock();
-        map_id_up(&inner.uid_map, uid).unwrap_or(DEFAULT_OVERFLOW_ID)
+    fn cuid(&self) -> Kuid {
+        self.cuid
     }
 
-    fn kgid_to_user(user_ns: &Arc<UserNamespace>, kgid: Kgid) -> u32 {
-        let Ok(gid) = u32::try_from(kgid.data()) else {
-            return DEFAULT_OVERFLOW_ID;
-        };
-        let inner = user_ns.inner.lock();
-        map_id_up(&inner.gid_map, gid).unwrap_or(DEFAULT_OVERFLOW_ID)
+    fn cgid(&self) -> Kgid {
+        self.cgid
     }
 
-    fn to_posix(&self, user_ns: &Arc<UserNamespace>) -> Result<PosixIpcPerm, SystemError> {
-        let key = self.key.data() as u32 as i32;
+    fn mode(&self) -> u32 {
+        self.mode.bits()
+    }
 
-        Ok(PosixIpcPerm {
-            key,
-            uid: Self::kuid_to_user(user_ns, self.uid),
-            gid: Self::kgid_to_user(user_ns, self.gid),
-            cuid: Self::kuid_to_user(user_ns, self.cuid),
-            cgid: Self::kgid_to_user(user_ns, self.cgid),
-            mode: self.mode.bits(),
-            seq: self.seq.to_i32().ok_or(SystemError::EOVERFLOW)?,
-            _pad1: 0,
-            _unused1: 0,
-            _unused2: 0,
-        })
+    fn key(&self) -> usize {
+        self.key.data()
+    }
+
+    fn seq(&self) -> usize {
+        self.seq
     }
 }
 
@@ -1413,37 +1338,14 @@ pub struct PosixShmIdDs {
 
 impl PosixShmIdDs {
     pub fn uid(&self) -> u32 {
-        self.shm_perm.uid
+        self.shm_perm.uid()
     }
 
     pub fn gid(&self) -> u32 {
-        self.shm_perm.gid
+        self.shm_perm.gid()
     }
 
     pub fn mode(&self) -> u32 {
-        self.shm_perm.mode
+        self.shm_perm.mode()
     }
-}
-
-/// 共享内存段权限，符合POSIX标准
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
-pub struct PosixIpcPerm {
-    /// IPC对象键值
-    key: i32,
-    /// 当前用户id
-    uid: u32,
-    /// 当前用户组id
-    gid: u32,
-    /// 创建者用户id
-    cuid: u32,
-    /// 创建者组id
-    cgid: u32,
-    /// 权限
-    mode: u32,
-    /// 序列号
-    seq: i32,
-    _pad1: i32,
-    _unused1: usize,
-    _unused2: usize,
 }

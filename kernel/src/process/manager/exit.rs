@@ -15,6 +15,7 @@ use crate::{
     driver::tty::tty_job_control::TtyJobCtrlManager,
     exception::InterruptArch,
     ipc::{
+        sem_undo::detach_sem_undo,
         sighand::{NaturalParentNotifyToken, ReapTransition},
         signal_types::{SigCode, SigInfo, SigType},
     },
@@ -457,6 +458,7 @@ impl ProcessManager {
             compiler_fence(Ordering::SeqCst);
 
             RobustListHead::cleanup_robust_list(&pcb);
+            detach_sem_undo(&pcb);
             // If this process was created via vfork, complete the completion.
             if let Some(vd) = vfork_done {
                 vd.complete_all();
@@ -663,6 +665,10 @@ impl ProcessManager {
     pub(crate) unsafe fn release(pid: RawPid) {
         let pcb = ProcessManager::find(pid);
         if let Some(ref pcb) = pcb {
+            debug_assert!(
+                pcb.sem_undo_group().is_none(),
+                "SEM_UNDO attachment must be detached before ProcessManager::release"
+            );
             ProcessManager::exit_ptrace(pcb);
             ProcessManager::ptrace_unlink_tracee(pcb);
 

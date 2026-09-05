@@ -574,15 +574,59 @@ void ExecLsProgram() {
 
 std::string CollectFdUntilChildExit(int fd, pid_t child, int timeout_ms, int* status) {
     std::string output;
-    for (int elapsed_ms = 0; elapsed_ms < timeout_ms; elapsed_ms += 10) {
+    auto now_ms = []() -> long {
+        struct timespec now = {};
+        if (clock_gettime(CLOCK_MONOTONIC, &now) < 0) {
+            return -1;
+        }
+        return static_cast<long>(now.tv_sec) * 1000 + now.tv_nsec / 1000000;
+    };
+    const long start = now_ms();
+    bool failed = start < 0;
+    bool output_closed = false;
+    auto remaining_ms = [&]() -> long {
+        const long now = now_ms();
+        if (start < 0 || now < 0) {
+            ADD_FAILURE() << "clock_gettime failed while collecting child output";
+            failed = true;
+            return 0;
+        }
+        return timeout_ms - (now - start);
+    };
+    // A drained pipe/PTY can close before its child becomes waitable. Stop
+    // polling that persistent HUP, but continue bounded waits for process exit.
+    auto drain_output = [&]() {
+        while (!output_closed && remaining_ms() > 0) {
+            std::array<char, 256> buf = {};
+            ssize_t n = read(fd, buf.data(), buf.size());
+            if (n > 0) {
+                output.append(buf.data(), static_cast<size_t>(n));
+                continue;
+            }
+            if (n == 0 || (n < 0 && errno == EIO)) {
+                output_closed = true; // Linux PTY masters return EIO after hangup.
+            } else if (errno == EINTR) {
+                continue;
+            } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                ADD_FAILURE() << "read failed while collecting child output: errno=" << errno;
+                failed = true;
+            }
+            break;
+        }
+    };
+    while (!failed) {
+        const long remaining = remaining_ms();
+        if (remaining <= 0) {
+            break;
+        }
         struct pollfd pfd = {
-            .fd = fd,
+            .fd = output_closed ? -1 : fd,
             .events = POLLIN | POLLERR | POLLHUP,
             .revents = 0,
         };
         struct timespec ts = {
             .tv_sec = 0,
-            .tv_nsec = 10 * 1000 * 1000,
+            .tv_nsec = (remaining < 10 ? remaining : 10) * 1000 * 1000,
         };
         sigset_t empty;
         sigemptyset(&empty);
@@ -596,38 +640,13 @@ std::string CollectFdUntilChildExit(int fd, pid_t child, int timeout_ms, int* st
             break;
         }
 
-        if (pret > 0 && (pfd.revents & POLLIN) != 0) {
-            std::array<char, 256> buf = {};
-            for (;;) {
-                ssize_t n = read(fd, buf.data(), buf.size());
-                if (n > 0) {
-                    output.append(buf.data(), static_cast<size_t>(n));
-                    continue;
-                }
-                if (n < 0 && errno == EINTR) {
-                    continue;
-                }
-                if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-                    break;
-                }
-                break;
-            }
+        if (pret > 0 && (pfd.revents & (POLLIN | POLLERR | POLLHUP)) != 0) {
+            drain_output();
         }
 
         pid_t wait_ret = waitpid(child, status, WNOHANG);
         if (wait_ret == child) {
-            for (;;) {
-                std::array<char, 256> buf = {};
-                ssize_t n = read(fd, buf.data(), buf.size());
-                if (n > 0) {
-                    output.append(buf.data(), static_cast<size_t>(n));
-                    continue;
-                }
-                if (n < 0 && errno == EINTR) {
-                    continue;
-                }
-                break;
-            }
+            drain_output();
             return output;
         }
         if (wait_ret < 0 && errno != EINTR) {
@@ -635,14 +654,10 @@ std::string CollectFdUntilChildExit(int fd, pid_t child, int timeout_ms, int* st
                           << strerror(errno) << ")";
             break;
         }
-
-        if (pret > 0 && (pfd.revents & (POLLERR | POLLHUP)) != 0) {
-            continue;
-        }
     }
 
     kill(child, SIGKILL);
-    waitpid(child, status, 0);
+    while (waitpid(child, status, 0) < 0 && errno == EINTR) {}
     ADD_FAILURE() << "child did not exit within " << timeout_ms << " ms, captured: " << output;
     return output;
 }
@@ -2025,6 +2040,50 @@ TEST(CubeSandboxPtyExecChain, ZeroLengthPipeIoMatchesLinux) {
     char observed = 0;
     ASSERT_EQ(1, read(read_end.get(), &observed, 1)) << strerror(errno);
     EXPECT_EQ('x', observed);
+}
+
+void ExpectOutputHangupBeforeChildExit(bool use_pty) {
+    UniqueFd read_end, write_end;
+    if (use_pty) {
+        PtyPair pair = OpenPty();
+        read_end = std::move(pair.master);
+        write_end = std::move(pair.slave);
+    } else {
+        int fds[2];
+        ASSERT_EQ(0, pipe(fds));
+        read_end.reset(fds[0]);
+        write_end.reset(fds[1]);
+    }
+    ASSERT_GE(read_end.get(), 0);
+    ASSERT_GE(write_end.get(), 0);
+    SetNonblock(read_end.get());
+    pid_t child = fork();
+    ASSERT_GE(child, 0);
+    if (child == 0) {
+        read_end.reset();
+        constexpr char marker[] = "output-before-hangup";
+        bool written = WriteAll(write_end.get(), marker, sizeof(marker) - 1);
+        write_end.reset();
+        // Closing output precedes process exit. Persistent HUP must not spend
+        // the collector's timeout as though each ready poll had slept 10 ms.
+        struct timespec delay = {0, 200 * 1000 * 1000};
+        while (nanosleep(&delay, &delay) < 0 && errno == EINTR) {}
+        _exit(written ? 0 : 123);
+    }
+    write_end.reset();
+    int status = 0;
+    std::string output = CollectFdUntilChildExit(read_end.get(), child, 5000, &status);
+    ASSERT_TRUE(WIFEXITED(status)) << "status=" << status;
+    EXPECT_EQ(0, WEXITSTATUS(status));
+    EXPECT_EQ("output-before-hangup", output);
+}
+
+TEST(CubeSandboxPtyExecChain, PipeHangupBeforeChildExitPreservesOutput) {
+    ExpectOutputHangupBeforeChildExit(false);
+}
+
+TEST(CubeSandboxPtyExecChain, PtyHangupBeforeChildExitPreservesOutput) {
+    ExpectOutputHangupBeforeChildExit(true);
 }
 
 TEST(CubeSandboxPtyExecChain, PtyExecDirectUnameEmitsOutputAndExits) {

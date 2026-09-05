@@ -4,6 +4,7 @@ use system_error::SystemError;
 
 use crate::{
     filesystem::{fs::FsStruct, vfs::IndexNode},
+    ipc::sem_undo::detach_sem_undo,
     process::{
         cred::Cred,
         fork::CloneFlags,
@@ -15,6 +16,7 @@ use crate::{
         },
         FsRefsReadGuard, ProcessControlBlock, ProcessManager,
     },
+    rcu::PreparedRcuArcRetire,
 };
 use core::{fmt::Debug, intrinsics::likely};
 
@@ -169,6 +171,10 @@ impl ProcessManager {
          * namespace are unreachable.  In clone parlance, CLONE_SYSVSEM
          * means share undolist with parent, so we must forbid using
          * it along with CLONE_NEWIPC.
+         *
+         * copy_process() rejects this combination before touching child
+         * state. Keep this check only as a defensive boundary for callers of
+         * copy_namespaces(); fork correctness must not depend on reaching it.
          */
 
         if *clone_flags & (CloneFlags::CLONE_NEWIPC | CloneFlags::CLONE_SYSVSEM)
@@ -286,70 +292,142 @@ pub fn exec_task_namespaces() -> Result<(), SystemError> {
     let new_nsproxy = create_new_namespaces(&CloneFlags::empty(), &tsk, user_ns)?;
     // todo: time_ns的逻辑
     let fs_refs = crate::process::lock_fs_refs_copy();
-    switch_task_namespaces(&tsk, new_nsproxy, &fs_refs)?;
+    let prepared =
+        PreparedNamespaceInstall::prepare_for_setns(&tsk, new_nsproxy, None, false, &fs_refs)?;
+    prepared.commit(&tsk, &fs_refs)?;
 
     return Ok(());
 }
 
-pub(crate) fn switch_task_namespaces(
-    tsk: &Arc<ProcessControlBlock>,
+pub(crate) struct PreparedNamespaceInstall {
     new_nsproxy: Arc<NsProxy>,
-    _fs_refs: &FsRefsReadGuard,
-) -> Result<(), SystemError> {
-    // Check sharing before taking our temporary Arc below.  Counting after
-    // cloning the Arc would mistake this function's own reference for a
-    // CLONE_FS peer and reject an otherwise private fs_struct.
-    let fs_is_shared = tsk.fs_struct_is_shared();
-    let fs = tsk.fs_struct();
-    switch_task_namespaces_inner(tsk, &fs, new_nsproxy, fs_is_shared, false)
+    new_fs: Option<Arc<FsStruct>>,
+    new_cred: Option<Arc<Cred>>,
+    detach_sysvsem: bool,
+    nsproxy_retire: PreparedRcuArcRetire<NsProxy>,
+    cred_retire: Option<PreparedRcuArcRetire<Cred>>,
 }
 
-pub(crate) fn switch_task_namespaces_with_fs(
-    tsk: &Arc<ProcessControlBlock>,
-    fs: &Arc<FsStruct>,
-    new_nsproxy: Arc<NsProxy>,
-    _fs_refs: &FsRefsReadGuard,
-) -> Result<(), SystemError> {
-    // unshare(CLONE_NEWNS) passes either a freshly copied fs_struct or the
-    // task's proven-private one, so there is no CLONE_FS peer to reject.
-    switch_task_namespaces_inner(tsk, fs, new_nsproxy, false, true)
+#[derive(Clone, Copy)]
+enum MountPathPreparation {
+    ProjectCopySource,
+    UseNamespaceRoot,
 }
 
-fn switch_task_namespaces_inner(
-    tsk: &Arc<ProcessControlBlock>,
-    fs: &Arc<FsStruct>,
-    new_nsproxy: Arc<NsProxy>,
-    fs_is_shared: bool,
-    project_copy_source: bool,
-) -> Result<(), SystemError> {
-    if !Arc::ptr_eq(tsk.nsproxy().mnt_namespace(), &new_nsproxy.mnt_ns) {
-        if fs_is_shared {
-            return Err(SystemError::EINVAL);
-        }
-        if project_copy_source {
-            prepare_fs_for_new_mntns(fs, &new_nsproxy.mnt_ns)?;
-        } else {
-            // setns installs the target namespace root as both root and cwd;
-            // it must not preserve paths merely because the target happens to
-            // have been cloned from the current namespace.
-            let root = new_nsproxy.mnt_ns.root_inode();
-            fs.set_root(root.clone());
-            fs.set_pwd(root);
-        }
+impl PreparedNamespaceInstall {
+    pub(crate) fn prepare_for_unshare(
+        tsk: &Arc<ProcessControlBlock>,
+        new_nsproxy: Arc<NsProxy>,
+        new_fs: Option<Arc<FsStruct>>,
+        new_cred: Option<Arc<Cred>>,
+        detach_sysvsem: bool,
+        fs_refs: &FsRefsReadGuard,
+    ) -> Result<Self, SystemError> {
+        Self::prepare(
+            tsk,
+            new_nsproxy,
+            new_fs,
+            new_cred,
+            detach_sysvsem,
+            MountPathPreparation::ProjectCopySource,
+            fs_refs,
+        )
     }
 
-    tsk.set_nsproxy(new_nsproxy);
-    Ok(())
-}
+    pub(crate) fn prepare_for_setns(
+        tsk: &Arc<ProcessControlBlock>,
+        new_nsproxy: Arc<NsProxy>,
+        new_cred: Option<Arc<Cred>>,
+        detach_sysvsem: bool,
+        fs_refs: &FsRefsReadGuard,
+    ) -> Result<Self, SystemError> {
+        Self::prepare(
+            tsk,
+            new_nsproxy,
+            None,
+            new_cred,
+            detach_sysvsem,
+            MountPathPreparation::UseNamespaceRoot,
+            fs_refs,
+        )
+    }
 
-pub(crate) fn prepare_fs_for_new_mntns(
-    fs: &Arc<FsStruct>,
-    new_mntns: &Arc<MntNamespace>,
-) -> Result<(), SystemError> {
-    let (new_root, new_pwd) = resolve_fs_paths_for_new_mntns(fs, new_mntns)?;
-    fs.set_root(new_root);
-    fs.set_pwd(new_pwd);
-    Ok(())
+    fn prepare(
+        tsk: &Arc<ProcessControlBlock>,
+        new_nsproxy: Arc<NsProxy>,
+        mut new_fs: Option<Arc<FsStruct>>,
+        new_cred: Option<Arc<Cred>>,
+        detach_sysvsem: bool,
+        mount_paths: MountPathPreparation,
+        _fs_refs: &FsRefsReadGuard,
+    ) -> Result<Self, SystemError> {
+        if !Arc::ptr_eq(tsk.nsproxy().mnt_namespace(), &new_nsproxy.mnt_ns) {
+            if new_fs.is_none() {
+                // Check sharing before taking the temporary fs Arc below.
+                if tsk.fs_struct_is_shared() {
+                    return Err(SystemError::EINVAL);
+                }
+                let current_fs = tsk.fs_struct();
+                new_fs =
+                    Some(Arc::try_new((*current_fs).clone()).map_err(|_| SystemError::ENOMEM)?);
+            }
+
+            let prepared_fs = new_fs
+                .as_ref()
+                .expect("mount namespace switch must prepare an fs_struct");
+            let (new_root, new_pwd) = match mount_paths {
+                MountPathPreparation::ProjectCopySource => {
+                    resolve_fs_paths_for_new_mntns(prepared_fs, &new_nsproxy.mnt_ns)?
+                }
+                MountPathPreparation::UseNamespaceRoot => {
+                    let root = new_nsproxy.mnt_ns.root_inode();
+                    (root.clone(), root)
+                }
+            };
+            prepared_fs.set_root(new_root);
+            prepared_fs.set_pwd(new_pwd);
+        }
+
+        let nsproxy_retire = PreparedRcuArcRetire::prepare().map_err(|_| SystemError::ENOMEM)?;
+        let cred_retire = if new_cred.is_some() {
+            Some(PreparedRcuArcRetire::prepare().map_err(|_| SystemError::ENOMEM)?)
+        } else {
+            None
+        };
+
+        Ok(Self {
+            new_nsproxy,
+            new_fs,
+            new_cred,
+            detach_sysvsem,
+            nsproxy_retire,
+            cred_retire,
+        })
+    }
+
+    pub(crate) fn commit(
+        self,
+        tsk: &Arc<ProcessControlBlock>,
+        fs_refs: &FsRefsReadGuard,
+    ) -> Result<(), SystemError> {
+        let Self {
+            new_nsproxy,
+            new_fs,
+            new_cred,
+            detach_sysvsem,
+            nsproxy_retire,
+            cred_retire,
+        } = self;
+        if detach_sysvsem {
+            detach_sem_undo(tsk);
+        }
+        if let Some(new_fs) = new_fs {
+            tsk.set_fs_struct(new_fs, fs_refs);
+        }
+        let prepared_cred = new_cred.zip(cred_retire);
+        tsk.install_prepared_namespace_state(new_nsproxy, nsproxy_retire, prepared_cred);
+        Ok(())
+    }
 }
 
 type ReboundFsPaths = (Arc<dyn IndexNode>, Arc<dyn IndexNode>);
@@ -369,4 +447,121 @@ fn resolve_fs_paths_for_new_mntns(
 
     let namespace_root = new_mntns.root_inode();
     Ok((namespace_root.clone(), namespace_root))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::process::KernelStack;
+
+    fn test_pcb() -> Arc<ProcessControlBlock> {
+        ProcessControlBlock::new_idle(0, KernelStack::new().unwrap())
+    }
+
+    #[test]
+    fn namespace_only_commit_does_not_reacquire_exec_lock() {
+        let pcb = test_pcb();
+        let old_cred = pcb.cred();
+        let new_nsproxy = Arc::new(pcb.nsproxy().clone_inner());
+        let _exec_guard = pcb.exec_update_write();
+        let fs_refs = crate::process::lock_fs_refs_copy();
+        let prepared = PreparedNamespaceInstall::prepare_for_setns(
+            &pcb,
+            new_nsproxy.clone(),
+            None,
+            false,
+            &fs_refs,
+        )
+        .unwrap();
+
+        prepared.commit(&pcb, &fs_refs).unwrap();
+        assert!(Arc::ptr_eq(&pcb.nsproxy(), &new_nsproxy));
+        assert!(Arc::ptr_eq(&pcb.cred(), &old_cred));
+    }
+
+    #[test]
+    fn namespace_prepare_error_preserves_attachment_and_old_state() {
+        let pcb = test_pcb();
+        let old_nsproxy = pcb.nsproxy();
+        let old_fs = pcb.fs_struct();
+        let old_cred = pcb.cred();
+        let old_group = pcb.ensure_sem_undo_group(&old_nsproxy.ipc_ns).unwrap();
+
+        let mut target = old_nsproxy.clone_inner();
+        target.mnt_ns = old_nsproxy
+            .mnt_ns
+            .copy_mnt_ns(&CloneFlags::CLONE_NEWNS, old_cred.user_ns.clone())
+            .unwrap();
+        let prepared_cred = Cred::new_arc((*old_cred).clone());
+        let fs_refs = crate::process::lock_fs_refs_copy();
+
+        let result = PreparedNamespaceInstall::prepare_for_setns(
+            &pcb,
+            Arc::new(target),
+            Some(prepared_cred),
+            true,
+            &fs_refs,
+        );
+
+        assert_eq!(result.err(), Some(SystemError::EINVAL));
+        assert!(Arc::ptr_eq(&pcb.nsproxy(), &old_nsproxy));
+        assert!(Arc::ptr_eq(&pcb.fs_struct(), &old_fs));
+        assert!(Arc::ptr_eq(&pcb.cred(), &old_cred));
+        assert!(Arc::ptr_eq(&pcb.sem_undo_group().unwrap(), &old_group));
+        assert_eq!(old_group.task_owners_for_test(), 1);
+        assert_eq!(old_group.replay_count_for_test(), 0);
+    }
+
+    #[test]
+    fn rcu_publication_prepare_error_preserves_attachment_and_old_state() {
+        let pcb = test_pcb();
+        let old_nsproxy = pcb.nsproxy();
+        let old_fs = pcb.fs_struct();
+        let old_cred = pcb.cred();
+        let old_group = pcb.ensure_sem_undo_group(&old_nsproxy.ipc_ns).unwrap();
+        let prepared_cred = Cred::new_arc((*old_cred).clone());
+        let fs_refs = crate::process::lock_fs_refs_copy();
+        crate::rcu::fail_next_prepared_arc_retire_for_test();
+
+        let result = PreparedNamespaceInstall::prepare_for_setns(
+            &pcb,
+            old_nsproxy.clone(),
+            Some(prepared_cred),
+            true,
+            &fs_refs,
+        );
+
+        assert_eq!(result.err(), Some(SystemError::ENOMEM));
+        assert!(Arc::ptr_eq(&pcb.nsproxy(), &old_nsproxy));
+        assert!(Arc::ptr_eq(&pcb.fs_struct(), &old_fs));
+        assert!(Arc::ptr_eq(&pcb.cred(), &old_cred));
+        assert!(Arc::ptr_eq(&pcb.sem_undo_group().unwrap(), &old_group));
+        assert_eq!(old_group.task_owners_for_test(), 1);
+        assert_eq!(old_group.replay_count_for_test(), 0);
+    }
+
+    #[test]
+    fn namespace_commit_uses_only_prepared_rcu_publications() {
+        let pcb = test_pcb();
+        let old_nsproxy = pcb.nsproxy();
+        pcb.ensure_sem_undo_group(&old_nsproxy.ipc_ns).unwrap();
+        let prepared_cred = Cred::new_arc((*pcb.cred()).clone());
+        let fs_refs = crate::process::lock_fs_refs_copy();
+        let prepared = PreparedNamespaceInstall::prepare_for_setns(
+            &pcb,
+            old_nsproxy,
+            Some(prepared_cred),
+            true,
+            &fs_refs,
+        )
+        .unwrap();
+        let unprepared_before = pcb.namespace_unprepared_rcu_stores_for_test();
+
+        prepared.commit(&pcb, &fs_refs).unwrap();
+
+        assert_eq!(
+            pcb.namespace_unprepared_rcu_stores_for_test(),
+            unprepared_before
+        );
+    }
 }

@@ -35,7 +35,10 @@ impl SlabAllocator {
         match self.zone.allocate(layout) {
             Ok(nptr) => nptr.as_ptr(),
             Err(AllocationError::OutOfMemory) => {
-                let boxed_page = ObjectPage::new();
+                let Ok(boxed_page) = ObjectPage::try_new() else {
+                    // Propagate backing-page OOM to fallible allocation callers.
+                    return core::ptr::null_mut();
+                };
                 assert_eq!(
                     (boxed_page.as_ref() as *const ObjectPage as usize) & (MMArch::PAGE_SIZE - 1),
                     0

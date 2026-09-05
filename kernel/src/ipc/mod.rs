@@ -1,7 +1,10 @@
 pub mod generic_signal;
 pub mod id;
+pub mod ipc_perm;
 pub mod kill;
 pub mod pipe;
+pub mod sem;
+pub mod sem_undo;
 pub mod shm;
 pub mod sighand;
 pub mod signal;

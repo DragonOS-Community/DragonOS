@@ -97,6 +97,21 @@ bitflags! {
     }
 }
 
+fn validate_semundo_clone_flags(clone_flags: CloneFlags) -> Result<(), SystemError> {
+    if (clone_flags & (CloneFlags::CLONE_NEWIPC | CloneFlags::CLONE_SYSVSEM))
+        == (CloneFlags::CLONE_NEWIPC | CloneFlags::CLONE_SYSVSEM)
+    {
+        Err(SystemError::EINVAL)
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+fn validate_semundo_clone_flags_for_test(clone_flags: CloneFlags) -> Result<(), SystemError> {
+    validate_semundo_clone_flags(clone_flags)
+}
+
 /// ## clone与clone3系统调用的参数载体
 ///
 /// 因为这两个系统调用的参数很多，所以有这样一个载体更灵活
@@ -592,6 +607,7 @@ impl ProcessManager {
         current_trapframe: &TrapFrame,
     ) -> Result<Option<PtraceForkSession>, SystemError> {
         let clone_flags = clone_args.flags;
+        validate_semundo_clone_flags(clone_flags)?;
         // 不允许与不同namespace的进程共享根目录
 
         // exec 去线程化期间不允许创建新线程
@@ -818,6 +834,16 @@ impl ProcessManager {
             )
         });
 
+        // Pre-create the parent's group while allocation failures are still
+        // harmless. The extra child owner is acquired only at publication.
+        let shared_sem_undo_ipc_ns = if clone_flags.contains(CloneFlags::CLONE_SYSVSEM) {
+            let ipc_ns = current_pcb.nsproxy().ipc_ns.clone();
+            current_pcb.ensure_sem_undo_group(&ipc_ns)?;
+            Some(ipc_ns)
+        } else {
+            None
+        };
+
         // alloc_pid
         if pcb.raw_pid() == RawPid::UNASSIGNED {
             // 分层PID分配：在父进程的子PID namespace中为新任务分配PID
@@ -937,6 +963,16 @@ impl ProcessManager {
             Some(PtraceEvent::Fork)
         };
 
+        let mut sem_undo_guard = None;
+        let mut attach_sem_undo = || {
+            if let Some(ipc_ns) = shared_sem_undo_ipc_ns.as_ref() {
+                let mut guard = current_pcb
+                    .prepare_shared_sem_undo_attachment(ipc_ns)
+                    .expect("parent undo group was prepared before publication");
+                guard.install_into(pcb);
+                sem_undo_guard = Some(guard);
+            }
+        };
         let mut inherited_ptrace_session = None;
         let publish_result: Result<(), SystemError> = loop {
             // Keep PGID/SID publication ordered before the relation lock, the
@@ -1007,7 +1043,8 @@ impl ProcessManager {
                 // thread publication have a single linearization order.
                 let inherited_tty = current_pcb.sig_info_irqsave().tty();
                 pcb.sig_info_mut().set_tty(inherited_tty);
-                current_pcb.sighand().with_group_exec_check(|| {
+                if let Err(err) = current_pcb.sighand().with_group_exec_check(|| {
+                    attach_sem_undo();
                     let live = pcb
                         .threads_read_irqsave()
                         .thread_group_live
@@ -1018,13 +1055,16 @@ impl ProcessManager {
                         .threads_write_irqsave()
                         .group_tasks
                         .push(Arc::downgrade(pcb));
-                })?;
+                }) {
+                    break Err(err);
+                }
 
                 let leader_tgid_pid = group_leader.pid();
                 pcb.init_task_pid(PidType::TGID, leader_tgid_pid.clone());
                 pcb.attach_pid(PidType::TGID);
                 Ok(())
             } else {
+                attach_sem_undo();
                 if clone_flags.contains(CloneFlags::CLONE_PARENT) {
                     let inherited_parent = current_pcb.parent_pcb.read_irqsave().clone();
                     let inherited_real_parent = current_pcb.real_parent_pcb.read_irqsave().clone();
@@ -1151,6 +1191,10 @@ impl ProcessManager {
             }
             Self::rollback_failed_fork(current_pcb, None, reserved_cgroup.as_ref());
             return Err(err);
+        }
+
+        if let Some(guard) = sem_undo_guard {
+            guard.disarm();
         }
 
         let published_cgroup = if pcb.raw_pid() > RawPid(0) {
@@ -1328,6 +1372,20 @@ impl ProcessManager {
         cgroup_migrate_vet_dst_with_src(&src, &node, 1)?;
 
         Ok(Some(node))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn newipc_and_sysvsem_are_rejected_before_attachment_prepare() {
+        let flags = CloneFlags::CLONE_NEWIPC | CloneFlags::CLONE_SYSVSEM;
+        assert_eq!(
+            validate_semundo_clone_flags_for_test(flags),
+            Err(SystemError::EINVAL)
+        );
     }
 }
 

@@ -368,7 +368,8 @@ impl PreparedNamespaceInstall {
                     return Err(SystemError::EINVAL);
                 }
                 let current_fs = tsk.fs_struct();
-                new_fs = Some(Arc::new((*current_fs).clone()));
+                new_fs =
+                    Some(Arc::try_new((*current_fs).clone()).map_err(|_| SystemError::ENOMEM)?);
             }
 
             let prepared_fs = new_fs

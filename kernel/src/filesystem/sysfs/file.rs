@@ -60,7 +60,7 @@ impl SysKernFilePriv {
     pub fn callback_read(&self, buf: &mut [u8], offset: usize) -> Result<usize, SystemError> {
         if let Some(attribute) = self.attribute {
             // 当前文件所指向的kobject已经被释放
-            let kobj = self.kobj.upgrade().expect("kobj is None");
+            let kobj = self.kobj.upgrade().ok_or(SystemError::ENODEV)?;
             let len = attribute.show(kobj, buf)?;
             if offset > 0 {
                 if len <= offset {
@@ -73,7 +73,7 @@ impl SysKernFilePriv {
             return Ok(len);
         } else if let Some(bin_attribute) = self.bin_attribute.as_ref() {
             // 当前文件所指向的kobject已经被释放
-            let kobj = self.kobj.upgrade().expect("kobj is None");
+            let kobj = self.kobj.upgrade().ok_or(SystemError::ENODEV)?;
             return bin_attribute.read(kobj, buf, offset);
         } else {
             panic!("attribute and bin_attribute can't be both None");
@@ -83,11 +83,11 @@ impl SysKernFilePriv {
     pub fn callback_write(&self, buf: &[u8], offset: usize) -> Result<usize, SystemError> {
         if let Some(attribute) = self.attribute {
             // 当前文件所指向的kobject已经被释放
-            let kobj = self.kobj.upgrade().expect("kobj is None");
+            let kobj = self.kobj.upgrade().ok_or(SystemError::ENODEV)?;
             return attribute.store(kobj, buf);
         } else if let Some(bin_attribute) = self.bin_attribute.as_ref() {
             // 当前文件所指向的kobject已经被释放
-            let kobj = self.kobj.upgrade().expect("kobj is None");
+            let kobj = self.kobj.upgrade().ok_or(SystemError::ENODEV)?;
             return bin_attribute.write(kobj, buf, offset);
         } else {
             panic!("attribute and bin_attribute can't be both None");

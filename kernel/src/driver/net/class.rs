@@ -65,6 +65,10 @@ impl Class for NetClass {
         return Self::NAME;
     }
 
+    fn namespace_children(&self) -> bool {
+        true
+    }
+
     fn dev_kobj(&self) -> Option<Arc<dyn KObject>> {
         Some(sys_dev_char_kobj() as Arc<dyn KObject>)
     }

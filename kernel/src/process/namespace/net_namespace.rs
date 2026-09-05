@@ -1,6 +1,7 @@
 use crate::driver::net::bridge::BridgeDriver;
 use crate::driver::net::loopback::LoopbackInterface;
 use crate::driver::net::IfacePollScope;
+use crate::exception::workqueue::{Work, WorkQueue};
 use crate::init::initcall::INITCALL_SUBSYS;
 use crate::libs::mutex::Mutex;
 use crate::libs::rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -44,6 +45,8 @@ use unified_init::macros::unified_init;
 lazy_static! {
     /// # 所有网络设备，进程，socket的初始网络命名空间
     pub static ref INIT_NET_NAMESPACE: Arc<NetNamespace> = NetNamespace::new_root();
+    /// Netns teardown may wait for NAPI and must not block unrelated system work.
+    static ref NETNS_TEARDOWN_WQ: Arc<WorkQueue> = WorkQueue::new("netns_cleanup");
 }
 
 /// # 网络命名空间计数器
@@ -75,6 +78,7 @@ fn try_snapshot_devices(
 
 #[unified_init(INITCALL_SUBSYS)]
 pub fn root_net_namespace_init() -> Result<(), SystemError> {
+    lazy_static::initialize(&NETNS_TEARDOWN_WQ);
     // 创建root网络命名空间的轮询线程
     NetNamespace::create_polling_thread(INIT_NET_NAMESPACE.clone(), "root_netns".to_string());
 
@@ -567,7 +571,7 @@ impl NetNamespace {
         // registration lifecycle makes it PRESENT; as in Linux's
         // loopback_net_init(), it remains administratively down until
         // userspace opens the link.
-        crate::driver::net::register_netdevice_in_namespace(&netns, loopback)?;
+        crate::driver::net::register_netdevice(&netns, loopback)?;
 
         Ok(netns)
     }
@@ -1174,6 +1178,51 @@ impl NamespaceOps for NetNamespace {
 impl Drop for NetNamespace {
     fn drop(&mut self) {
         self.poller.stop();
+
+        if let Some(loopback) = self.loopback_iface() {
+            let loopback_iface = loopback as Arc<dyn Iface>;
+            if !self
+                .device_list
+                .get_mut()
+                .get(&crate::net::LOOPBACK_IFINDEX)
+                .is_some_and(|device| Arc::ptr_eq(device, &loopback_iface))
+            {
+                log::error!(
+                    "netns {} final release contains a non-canonical loopback",
+                    self.ns_common.nsid.data()
+                );
+            }
+        }
+
+        // The last netns Arc may be released by its own NAPI poll stack. Move
+        // the devices out without allocating and defer every blocking teardown
+        // step to process context, where waiting for the in-flight poll cannot
+        // self-deadlock. The namespace-owned FIB and neighbor state disappear
+        // with this object, so the worker only quiesces devices and removes
+        // their driver-core/sysfs projections.
+        let devices = core::mem::take(self.device_list.get_mut());
+        if !devices.is_empty() {
+            NETNS_TEARDOWN_WQ.enqueue(Work::new(move || {
+                for iface in devices.values() {
+                    iface.common().close_tx_and_wait();
+                    iface.begin_admin_down();
+                }
+                for iface in devices.values() {
+                    if let Some(napi) = iface.napi_struct() {
+                        crate::driver::net::napi::napi_pause_and_wait(&napi);
+                        iface.quiesce_admin_down();
+                        crate::driver::net::napi::napi_disable(&napi);
+                    } else {
+                        iface.quiesce_admin_down();
+                    }
+                }
+                for iface in devices.values() {
+                    iface.clear_net_state(crate::driver::net::NetDeivceState::__LINK_STATE_PRESENT);
+                    crate::driver::net::netdev_unregister_kobject(iface.clone());
+                    iface.clear_net_namespace();
+                }
+            }));
+        }
     }
 }
 

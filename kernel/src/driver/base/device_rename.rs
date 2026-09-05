@@ -7,7 +7,6 @@ use crate::{
     filesystem::{
         kernfs::{KernFSInode, KernFSRenameSpec, PreparedKernFSRename},
         sysfs::sysfs_instance,
-        vfs::IndexNode,
     },
     libs::casting::DowncastArc,
 };
@@ -56,8 +55,9 @@ pub(crate) fn prepare_class_device_sysfs_rename(
     let class = device.class().ok_or(SystemError::EIO)?;
     let class_kobject = class.subsystem().subsys() as Arc<dyn KObject>;
     let class_parent = class_kobject.inode().ok_or(SystemError::EIO)?;
+    let namespace = device_inode.namespace().ok_or(SystemError::EIO)?;
     let class_link = class_parent
-        .find(&old_sysfs_name)
+        .find_ns(&old_sysfs_name, namespace)
         .map_err(|_| SystemError::EIO)?
         .downcast_arc::<KernFSInode>()
         .ok_or(SystemError::EIO)?;
@@ -68,7 +68,11 @@ pub(crate) fn prepare_class_device_sysfs_rename(
         return Err(SystemError::EIO);
     }
 
-    let target_path = sysfs_instance().child_absolute_path(&device_parent, new_name.as_str())?;
+    let target_path = if class_parent.namespace_children_enabled() {
+        sysfs_instance().child_relative_path(&class_parent, &device_parent, new_name.as_str())?
+    } else {
+        sysfs_instance().child_absolute_path(&device_parent, new_name.as_str())?
+    };
     let old_devpath = sysfs_instance().try_kernfs_path(&device_inode)?;
     let class_name = try_copy_string(&new_name)?;
     let device_spec = KernFSRenameSpec::new(device_inode, new_name);

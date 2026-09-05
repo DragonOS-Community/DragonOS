@@ -653,6 +653,22 @@ impl DeviceManager {
     #[inline(never)]
     #[allow(dead_code)]
     pub fn add_device(&self, device: Arc<dyn Device>) -> Result<(), SystemError> {
+        self.add_device_with_optional_namespace(device, None)
+    }
+
+    pub fn add_device_with_namespace(
+        &self,
+        device: Arc<dyn Device>,
+        namespace: crate::filesystem::kernfs::KernFSNamespaceTag,
+    ) -> Result<(), SystemError> {
+        self.add_device_with_optional_namespace(device, Some(namespace))
+    }
+
+    fn add_device_with_optional_namespace(
+        &self,
+        device: Arc<dyn Device>,
+        namespace: Option<crate::filesystem::kernfs::KernFSNamespaceTag>,
+    ) -> Result<(), SystemError> {
         // 在这里处理与parent相关的逻辑
         let deivce_parent = device.dev_parent().and_then(|x| x.upgrade());
         if let Some(ref dev) = deivce_parent {
@@ -676,7 +692,13 @@ impl DeviceManager {
             device.set_parent(Some(Arc::downgrade(&kobject_parent)));
         }
 
-        KObjectManager::add_kobj(device.clone() as Arc<dyn KObject>).map_err(|e| {
+        let add_result = match namespace {
+            Some(namespace) => {
+                KObjectManager::add_kobj_ns(device.clone() as Arc<dyn KObject>, namespace)
+            }
+            None => KObjectManager::add_kobj(device.clone() as Arc<dyn KObject>),
+        };
+        add_result.map_err(|e| {
             error!("add device '{:?}' failed: {:?}", device.name(), e);
             e
         })?;
@@ -759,7 +781,7 @@ impl DeviceManager {
         &self,
         class: Arc<dyn Class>,
         kobject_parent: Arc<dyn KObject>,
-    ) -> Arc<dyn KObject> {
+    ) -> Result<Arc<dyn KObject>, SystemError> {
         let mut guard = CLASS_DIR_KSET_INSTANCE.write();
         let class_name: String = class.name().to_string();
         let kobject_parent_name = kobject_parent.name();
@@ -767,7 +789,7 @@ impl DeviceManager {
 
         // 检查设备类目录是否已经存在
         if let Some(class_dir) = guard.get(&key) {
-            return class_dir.clone();
+            return Ok(class_dir.clone());
         }
 
         let class_dir: Arc<ClassDir> = ClassDir::new();
@@ -776,12 +798,21 @@ impl DeviceManager {
         class_dir.set_kobj_type(Some(&ClassKObjbectType));
         class_dir.set_parent(Some(Arc::downgrade(&kobject_parent)));
 
-        KObjectManager::add_kobj(class_dir.clone() as Arc<dyn KObject>)
-            .expect("add class dir failed");
+        KObjectManager::add_kobj(class_dir.clone() as Arc<dyn KObject>)?;
+        if class.namespace_children() {
+            let enable_result = class_dir
+                .inode()
+                .ok_or(SystemError::ENOENT)
+                .and_then(|inode| inode.enable_namespace_children());
+            if let Err(error) = enable_result {
+                KObjectManager::remove_kobj(class_dir.clone() as Arc<dyn KObject>);
+                return Err(error);
+            }
+        }
 
         guard.insert(key, class_dir.clone());
 
-        return class_dir;
+        return Ok(class_dir);
     }
 
     /// 获取设备真实的parent kobject
@@ -817,7 +848,7 @@ impl DeviceManager {
             // 是否需要glue dir?
 
             let kobject_parent =
-                self.class_dir_create_and_add(device.class().unwrap(), kobject_parent.clone());
+                self.class_dir_create_and_add(device.class().unwrap(), kobject_parent.clone())?;
 
             return Ok(Some(kobject_parent));
         }
@@ -1153,7 +1184,11 @@ impl DeviceManager {
         sysfs_instance().remove_link(&dev_kobj, "subsystem".to_string());
 
         let subsys_kobj = class.subsystem().subsys() as Arc<dyn KObject>;
-        sysfs_instance().remove_link(&subsys_kobj, dev.name());
+        sysfs_instance().remove_link_to(
+            &subsys_kobj,
+            &(dev.clone() as Arc<dyn KObject>),
+            dev.name(),
+        );
 
         for class_interface in class.subsystem().interfaces() {
             class_interface.remove_device(dev);

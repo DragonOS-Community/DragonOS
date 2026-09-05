@@ -7,7 +7,8 @@ use core::cell::Cell;
 use core::net::Ipv4Addr;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use net_poll_state::{DeadlineClaims, DueResult, PollDeadlines, PublishResult};
-use sysfs::{netdev_emit_uevent, netdev_register_kobject, netdev_unregister_kobject};
+pub(crate) use sysfs::netdev_unregister_kobject;
+use sysfs::{netdev_emit_uevent, netdev_register_kobject};
 
 use crate::driver::net::napi::NapiStruct;
 use crate::driver::net::types::{InterfaceFlags, InterfaceType};

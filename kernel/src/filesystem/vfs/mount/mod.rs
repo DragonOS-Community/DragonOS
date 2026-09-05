@@ -962,6 +962,10 @@ struct MountStateInit {
 
 impl SuperBlockState {
     pub fn new(flags: MountFlags) -> Self {
+        Self::new_with_owner(flags, ProcessManager::current_user_ns())
+    }
+
+    pub fn new_with_owner(flags: MountFlags, owner_user_ns: Arc<UserNamespace>) -> Self {
         let flags = flags & MountFlags::SB_SETTABLE_MASK;
         Self {
             fsnotify_id: NEXT_SUPERBLOCK_FSNOTIFY_ID.fetch_add(1, Ordering::Relaxed),
@@ -969,7 +973,7 @@ impl SuperBlockState {
             fsnotify_object_epoch: AtomicUsize::new(0),
             fsnotify_presence: Arc::new(MountedFsNotifyPresence::default()),
             fsnotify_link_epochs: core::array::from_fn(|_| AtomicUsize::new(0)),
-            owner_user_ns: ProcessManager::current_user_ns(),
+            owner_user_ns,
             flags: RwSem::new(flags),
             synchronous: AtomicBool::new(flags.contains(MountFlags::SYNCHRONOUS)),
             write_count: AtomicUsize::new(0),
@@ -1591,7 +1595,11 @@ impl MountFS {
         mount_flags: MountFlags,
         mount_source: Option<String>,
     ) -> Result<Arc<Self>, SystemError> {
-        let super_block_state = Arc::new(SuperBlockState::new(mount_flags));
+        let owner_user_ns = inner_filesystem
+            .mount_owner_user_ns()
+            .unwrap_or_else(ProcessManager::current_user_ns);
+        let super_block_state =
+            Arc::new(SuperBlockState::new_with_owner(mount_flags, owner_user_ns));
         if let Some(domain) = inner_filesystem.page_cache_writeback_domain() {
             domain.bind(&inner_filesystem, &super_block_state)?;
         }
@@ -4414,7 +4422,12 @@ impl MountFSInode {
 
         let super_block_state = match super_block_state {
             Some(super_block_state) => super_block_state,
-            None => Arc::new(SuperBlockState::new(mount_flags)),
+            None => {
+                let owner_user_ns = inner_fs
+                    .mount_owner_user_ns()
+                    .unwrap_or_else(ProcessManager::current_user_ns);
+                Arc::new(SuperBlockState::new_with_owner(mount_flags, owner_user_ns))
+            }
         };
         if let Some(domain) = inner_fs.page_cache_writeback_domain() {
             domain.bind(&inner_fs, &super_block_state)?;
@@ -4682,7 +4695,10 @@ impl MountFSInode {
             let _namespace_guard = base.mount_fs.super_block_state.dentry_namespace_lock.read();
             // Since downward lookups may cross filesystem boundaries, wrap the
             // exact alias before releasing rename serialization.
-            let inner_inode = base.dentry.inode.find(name)?;
+            let inner_inode = base
+                .mount_fs
+                .inner_filesystem
+                .find_in_view(&base.dentry.inode, name)?;
             let dname = DName::from(name);
             let mount_inode =
                 MountFSInode::new_child(inner_inode.clone(), base.mount_fs.clone(), &base, dname)?;
@@ -5496,7 +5512,9 @@ impl IndexNode for MountFSInode {
         // Mount dentries are currently keyed by UTF-8 DName. Raw-name lookup is
         // still required for metadata/whiteout checks during getdents, so pass
         // byte-only names to the backing filesystem without inventing a lossy key.
-        self.dentry.inode.find_bytes(name)
+        self.mount_fs
+            .inner_filesystem
+            .find_bytes_in_view(&self.dentry.inode, name)
     }
 
     #[inline]
@@ -5524,12 +5542,17 @@ impl IndexNode for MountFSInode {
 
     #[inline]
     fn list(&self) -> Result<alloc::vec::Vec<alloc::string::String>, SystemError> {
-        return self.dentry.inode.list();
+        return self
+            .mount_fs
+            .inner_filesystem
+            .list_in_view(&self.dentry.inode);
     }
 
     #[inline]
     fn list_entries(&self) -> Result<Option<Vec<DirectoryEntry>>, SystemError> {
-        self.dentry.inode.list_entries()
+        self.mount_fs
+            .inner_filesystem
+            .list_entries_in_view(&self.dentry.inode)
     }
 
     fn mount(

@@ -1,13 +1,16 @@
 #include <gtest/gtest.h>
 
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <linux/if_link.h>
 #include <linux/if.h>
 #include <linux/netlink.h>
 #include <linux/rtnetlink.h>
 #include <poll.h>
 #include <sched.h>
+#include <dirent.h>
 #include <sys/ioctl.h>
+#include <sys/mount.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
@@ -392,6 +395,61 @@ std::optional<int> FindIfindex(const char* name) {
     return request.ifr_ifindex;
 }
 
+bool DirectoryContainsOnly(const std::string& path, std::string_view expected) {
+    DIR* directory = opendir(path.c_str());
+    if (directory == nullptr) return false;
+    bool found = false;
+    bool valid = true;
+    while (dirent* entry = readdir(directory)) {
+        const std::string_view name(entry->d_name);
+        if (name == "." || name == "..") continue;
+        if (name != expected || found) {
+            valid = false;
+            break;
+        }
+        found = true;
+    }
+    closedir(directory);
+    return valid && found;
+}
+
+bool SendFileDescriptor(int socket_fd, int file_fd) {
+    char byte = 'F';
+    iovec io {&byte, sizeof(byte)};
+    std::array<unsigned char, CMSG_SPACE(sizeof(int))> control {};
+    msghdr message {};
+    message.msg_iov = &io;
+    message.msg_iovlen = 1;
+    message.msg_control = control.data();
+    message.msg_controllen = control.size();
+    cmsghdr* header = CMSG_FIRSTHDR(&message);
+    header->cmsg_level = SOL_SOCKET;
+    header->cmsg_type = SCM_RIGHTS;
+    header->cmsg_len = CMSG_LEN(sizeof(int));
+    std::memcpy(CMSG_DATA(header), &file_fd, sizeof(file_fd));
+    return sendmsg(socket_fd, &message, 0) == 1;
+}
+
+int ReceiveFileDescriptor(int socket_fd) {
+    char byte = 0;
+    iovec io {&byte, sizeof(byte)};
+    std::array<unsigned char, CMSG_SPACE(sizeof(int))> control {};
+    msghdr message {};
+    message.msg_iov = &io;
+    message.msg_iovlen = 1;
+    message.msg_control = control.data();
+    message.msg_controllen = control.size();
+    if (recvmsg(socket_fd, &message, 0) != 1) return -1;
+    cmsghdr* header = CMSG_FIRSTHDR(&message);
+    if (header == nullptr || header->cmsg_level != SOL_SOCKET ||
+        header->cmsg_type != SCM_RIGHTS || header->cmsg_len != CMSG_LEN(sizeof(int))) {
+        return -1;
+    }
+    int file_fd = -1;
+    std::memcpy(&file_fd, CMSG_DATA(header), sizeof(file_fd));
+    return file_fd;
+}
+
 int SetLinkUp(int fd, int ifindex, bool up, uint32_t seq) {
     struct {
         nlmsghdr header;
@@ -547,9 +605,8 @@ int RunRenameValidationCase() {
         const bool new_visible = stat(new_path.c_str(), &new_target) == 0;
         const bool old_visible = stat(old_path.c_str(), &old_after) == 0;
         if (IsDragonOS()) {
-            // DragonOS intentionally has no sysfs projection for the fresh
-            // namespace. Renaming its lo must not touch the initial-netns
-            // inode visible through this mount.
+            // This inherited sysfs mount remains bound to the initial netns;
+            // renaming fresh-netns lo must not change that projection.
             if (new_visible || !old_visible || old_after.st_ino != old_target.st_ino) {
                 projection_result = 17;
             }
@@ -618,6 +675,115 @@ int RunDragonOsSysfsRenameCase() {
         return 18;
     }
     return result;
+}
+
+int RunFreshNetnsSysfsProjectionCase() {
+    if (unshare(CLONE_NEWUSER | CLONE_NEWNET | CLONE_NEWNS) != 0) return 77;
+    if (mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr) != 0) return 77;
+
+    const std::string mountpoint = "/tmp/dunit-netns-sysfs";
+    if (mkdir(mountpoint.c_str(), 0755) != 0 && errno != EEXIST) return 10;
+    if (mount("sysfs", mountpoint.c_str(), "sysfs", MS_NOSUID | MS_NODEV | MS_NOEXEC,
+              nullptr) != 0) {
+        return errno == EPERM ? 77 : 11;
+    }
+
+    int result = 0;
+    const std::string class_old = mountpoint + "/class/net/lo";
+    const std::string device_old = mountpoint + "/devices/virtual/net/lo";
+    struct stat class_link_before {};
+    struct stat class_target_before {};
+    struct stat device_before {};
+    if (lstat(class_old.c_str(), &class_link_before) != 0 ||
+        stat(class_old.c_str(), &class_target_before) != 0 ||
+        stat(device_old.c_str(), &device_before) != 0 ||
+        class_target_before.st_ino != device_before.st_ino ||
+        !DirectoryContainsOnly(mountpoint + "/class/net", "lo") ||
+        !DirectoryContainsOnly(mountpoint + "/devices/virtual/net", "lo")) {
+        result = 12;
+    }
+
+    FdGuard route(OpenRouteSocket());
+    const auto ifindex = FindIfindex("lo");
+    uint32_t seq = 1;
+    const std::string renamed = "dunitns0";
+    if (result == 0 && (route.Get() < 0 || !ifindex.has_value())) result = 13;
+    if (result == 0 &&
+        SetLink(route.Get(), *ifindex, 0, 0, std::nullopt, renamed, seq++) != 0) {
+        result = 14;
+    }
+
+    if (result == 0) {
+        const std::string class_new = mountpoint + "/class/net/" + renamed;
+        const std::string device_new = mountpoint + "/devices/virtual/net/" + renamed;
+        struct stat class_link_after {};
+        struct stat class_target_after {};
+        struct stat device_after {};
+        struct stat ignored {};
+        if (lstat(class_old.c_str(), &ignored) == 0 || errno != ENOENT ||
+            stat(device_old.c_str(), &ignored) == 0 || errno != ENOENT ||
+            lstat(class_new.c_str(), &class_link_after) != 0 ||
+            stat(class_new.c_str(), &class_target_after) != 0 ||
+            stat(device_new.c_str(), &device_after) != 0 ||
+            class_link_after.st_ino != class_link_before.st_ino ||
+            class_target_after.st_ino != device_after.st_ino ||
+            device_after.st_ino != device_before.st_ino ||
+            !DirectoryContainsOnly(mountpoint + "/class/net", renamed) ||
+            !DirectoryContainsOnly(mountpoint + "/devices/virtual/net", renamed)) {
+            result = 15;
+        }
+        // The inherited boot mount remains bound to the initial netns.
+        if (stat("/sys/class/net/lo", &ignored) != 0 ||
+            stat((std::string("/sys/class/net/") + renamed).c_str(), &ignored) == 0) {
+            result = 16;
+        }
+    }
+
+    if (umount2(mountpoint.c_str(), MNT_DETACH) != 0 && result == 0) result = 17;
+    rmdir(mountpoint.c_str());
+    return result;
+}
+
+int RunStaleSysfsFdCase() {
+    int sockets[2] = {-1, -1};
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) != 0) return 10;
+    const pid_t child = fork();
+    if (child < 0) return 11;
+    if (child == 0) {
+        close(sockets[0]);
+        if (unshare(CLONE_NEWUSER | CLONE_NEWNET | CLONE_NEWNS) != 0 ||
+            mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr) != 0) {
+            _exit(77);
+        }
+        const char* mountpoint = "/tmp/dunit-stale-sysfs";
+        if ((mkdir(mountpoint, 0755) != 0 && errno != EEXIST) ||
+            mount("sysfs", mountpoint, "sysfs", MS_NOSUID | MS_NODEV | MS_NOEXEC,
+                  nullptr) != 0) {
+            _exit(errno == EPERM ? 77 : 12);
+        }
+        const std::string type = std::string(mountpoint) + "/class/net/lo/type";
+        FdGuard attribute(open(type.c_str(), O_RDONLY));
+        if (attribute.Get() < 0 || !SendFileDescriptor(sockets[1], attribute.Get())) _exit(13);
+        umount2(mountpoint, MNT_DETACH);
+        close(sockets[1]);
+        _exit(0);
+    }
+
+    close(sockets[1]);
+    FdGuard attribute(ReceiveFileDescriptor(sockets[0]));
+    close(sockets[0]);
+    int status = 0;
+    if (waitpid(child, &status, 0) != child || !WIFEXITED(status)) return 14;
+    if (WEXITSTATUS(status) == 77) return 77;
+    if (WEXITSTATUS(status) != 0 || attribute.Get() < 0) return 15;
+
+    char buffer[64] = {};
+    errno = 0;
+    const ssize_t read_result = pread(attribute.Get(), buffer, sizeof(buffer), 0);
+    // Namespace and iface objects may remain alive behind RCU/NAPI references,
+    // so an opened fd can still complete. Once the kobject weak reference is
+    // gone, the callback must return ENODEV instead of panicking.
+    return read_result >= 0 || errno == ENODEV ? 0 : 16;
 }
 
 int RunOwnerNetnsMoveUeventCase() {
@@ -975,6 +1141,22 @@ TEST(RtnetlinkLinkSemantics, RenameValidatesNamesFormatsAndProjectedIdentity) {
 TEST(RtnetlinkLinkSemantics, DragonOsInitialNetnsRenamePreservesSysfsInodes) {
     if (!IsDragonOS()) GTEST_SKIP() << "initial-netns sysfs projection is DragonOS coverage";
     EXPECT_EQ(RunChild(RunDragonOsSysfsRenameCase), 0);
+}
+
+TEST(RtnetlinkLinkSemantics, FreshNetworkNamespaceHasMountedSysfsProjection) {
+    const int result = RunChild(RunFreshNetnsSysfsProjectionCase);
+    if (result == 77 && !IsDragonOS()) {
+        GTEST_SKIP() << "host cannot create and mount a network-namespace sysfs view";
+    }
+    EXPECT_EQ(result, 0);
+}
+
+TEST(RtnetlinkLinkSemantics, StaleSysfsAttributeFdFailsWithoutKernelPanic) {
+    const int result = RunStaleSysfsFdCase();
+    if (result == 77 && !IsDragonOS()) {
+        GTEST_SKIP() << "host cannot create and mount a network-namespace sysfs view";
+    }
+    EXPECT_EQ(result, 0);
 }
 
 TEST(RtnetlinkLinkSemantics, MoveUeventIsDeliveredOnlyToOwningNetworkNamespace) {

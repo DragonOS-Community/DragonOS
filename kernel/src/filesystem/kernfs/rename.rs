@@ -3,7 +3,10 @@ use alloc::{string::String, sync::Arc};
 use hashbrown::HashMap;
 use system_error::SystemError;
 
-use super::{KernFS, KernFSInode, KernInodeType};
+use super::{
+    KernFS, KernFSChildKey, KernFSChildKeyRef, KernFSChildren, KernFSInode, KernFSInodeArgs,
+    KernInodeType,
+};
 
 /// One inode re-key requested as part of a two-node kernfs rename.
 ///
@@ -32,8 +35,8 @@ impl KernFSRenameSpec {
 struct PreparedRenameEntry {
     parent: Arc<KernFSInode>,
     inode: Arc<KernFSInode>,
-    old_name: String,
-    new_key: String,
+    old_key: KernFSChildKey,
+    new_key: KernFSChildKey,
     new_inode_name: String,
     symlink_target_absolute_path: Option<String>,
 }
@@ -50,11 +53,12 @@ impl PreparedRenameEntry {
         let parent = spec.inode.parent().ok_or(SystemError::ENOENT)?;
         let old_name = spec.inode.try_name()?;
         let new_inode_name = try_copy_string(&spec.new_name)?;
+        let namespace = spec.inode.namespace();
         Ok(Self {
             parent,
             inode: spec.inode,
-            old_name,
-            new_key: spec.new_name,
+            old_key: KernFSChildKey::new(old_name, namespace),
+            new_key: KernFSChildKey::new(spec.new_name, namespace),
             new_inode_name,
             symlink_target_absolute_path: spec.symlink_target_absolute_path,
         })
@@ -66,27 +70,38 @@ impl PreparedRenameEntry {
 
     fn validate(
         &self,
-        children: &HashMap<String, Arc<KernFSInode>>,
-        lazy: &HashMap<String, fn() -> super::KernFSInodeArgs>,
+        children: &KernFSChildren,
+        lazy: &HashMap<String, fn() -> KernFSInodeArgs>,
     ) -> Result<(), SystemError> {
-        let current = children.get(&self.old_name).ok_or(SystemError::ESTALE)?;
-        if !Arc::ptr_eq(current, &self.inode) || !self.inode.with_name(|name| name == self.old_name)
+        let current = children
+            .get(&KernFSChildKeyRef::new(
+                &self.old_key.name,
+                self.old_key.namespace,
+            ))
+            .ok_or(SystemError::ESTALE)?;
+        if !Arc::ptr_eq(current, &self.inode)
+            || !self.inode.with_name(|name| name == self.old_key.name)
         {
             return Err(SystemError::ESTALE);
         }
-        if self.new_key != self.old_name
-            && (children.contains_key(&self.new_key) || lazy.contains_key(&self.new_key))
+        if self.new_key != self.old_key
+            && (children.contains_key(&KernFSChildKeyRef::new(
+                &self.new_key.name,
+                self.new_key.namespace,
+            )) || lazy.contains_key(&self.new_key.name))
         {
             return Err(SystemError::EEXIST);
         }
         Ok(())
     }
 
-    fn publish(self, children: &mut HashMap<String, Arc<KernFSInode>>) {
-        let inode = children
-            .remove(&self.old_name)
+    fn publish(self, children: &mut KernFSChildren) {
+        children
+            .rekey(
+                &KernFSChildKeyRef::new(&self.old_key.name, self.old_key.namespace),
+                self.new_key,
+            )
             .expect("prepared kernfs rename source disappeared under mutation gate");
-        children.insert(self.new_key, inode);
 
         let mut inner = self.inode.inner.write();
         inner.name = self.new_inode_name;
@@ -117,7 +132,9 @@ impl PreparedKernFSRename {
         Ok(Self { entries })
     }
 
-    /// Revalidates and reserves both parent maps before changing either one.
+    /// Revalidates both parent maps before changing either one. Publication is
+    /// allocation-free because each re-key removes and inserts one entry in the
+    /// same existing namespace bucket.
     pub fn commit(self) -> Result<(), SystemError> {
         let [first, second] = self.entries;
         if Arc::ptr_eq(&first.parent, &second.parent) {
@@ -135,13 +152,6 @@ impl PreparedKernFSRename {
 
         first.validate(&first_children, &first_lazy)?;
         second.validate(&second_children, &second_lazy)?;
-        first_children
-            .try_reserve(1)
-            .map_err(|_| SystemError::ENOMEM)?;
-        second_children
-            .try_reserve(1)
-            .map_err(|_| SystemError::ENOMEM)?;
-
         drop(first_lazy);
         drop(second_lazy);
         first.publish(&mut first_children);
@@ -163,8 +173,6 @@ fn commit_same_parent(
     let lazy = parent.lazy_list.lock();
     first.validate(&children, &lazy)?;
     second.validate(&children, &lazy)?;
-    children.try_reserve(2).map_err(|_| SystemError::ENOMEM)?;
-
     drop(lazy);
     first.publish(&mut children);
     second.publish(&mut children);
@@ -230,14 +238,28 @@ mod tests {
 
         plan.commit().unwrap();
 
-        assert!(!devices.children.lock().contains_key("eth0"));
-        assert!(!class.children.lock().contains_key("eth0"));
+        assert!(!devices
+            .children
+            .lock()
+            .contains_key(&KernFSChildKeyRef::new("eth0", None)));
+        assert!(!class
+            .children
+            .lock()
+            .contains_key(&KernFSChildKeyRef::new("eth0", None)));
         assert!(Arc::ptr_eq(
-            devices.children.lock().get("eth1").unwrap(),
+            devices
+                .children
+                .lock()
+                .get(&KernFSChildKeyRef::new("eth1", None))
+                .unwrap(),
             &device
         ));
         assert!(Arc::ptr_eq(
-            class.children.lock().get("eth1").unwrap(),
+            class
+                .children
+                .lock()
+                .get(&KernFSChildKeyRef::new("eth1", None))
+                .unwrap(),
             &link
         ));
         assert_eq!(device.name(), "eth1");
@@ -269,19 +291,90 @@ mod tests {
         assert_eq!(plan.commit(), Err(SystemError::EEXIST));
 
         assert!(Arc::ptr_eq(
-            devices.children.lock().get("eth0").unwrap(),
+            devices
+                .children
+                .lock()
+                .get(&KernFSChildKeyRef::new("eth0", None))
+                .unwrap(),
             &device
         ));
         assert!(Arc::ptr_eq(
-            class.children.lock().get("eth0").unwrap(),
+            class
+                .children
+                .lock()
+                .get(&KernFSChildKeyRef::new("eth0", None))
+                .unwrap(),
             &link
         ));
-        assert!(!devices.children.lock().contains_key("eth1"));
+        assert!(!devices
+            .children
+            .lock()
+            .contains_key(&KernFSChildKeyRef::new("eth1", None)));
         assert_eq!(device.name(), "eth0");
         assert_eq!(link.name(), "eth0");
         assert_eq!(
             link.inner.read().symlink_target_absolute_path.as_deref(),
             Some("/sys/devices/eth0")
+        );
+    }
+
+    #[test]
+    fn namespace_keys_allow_same_name_and_rename_only_one_view() {
+        let root = KernFS::create_root_inode();
+        let mode = InodeMode::from_bits_truncate(0o755);
+        let devices = root
+            .add_dir("devices".to_string(), mode, None, None)
+            .unwrap();
+        let class = root.add_dir("class".to_string(), mode, None, None).unwrap();
+        devices.enable_namespace_children().unwrap();
+        class.enable_namespace_children().unwrap();
+        let tag_a = super::super::KernFSNamespaceTag::new(11);
+        let tag_b = super::super::KernFSNamespaceTag::new(12);
+        let device_a = devices
+            .add_dir_ns("lo".to_string(), mode, None, None, tag_a)
+            .unwrap();
+        let device_b = devices
+            .add_dir_ns("lo".to_string(), mode, None, None, tag_b)
+            .unwrap();
+        let link_a = class
+            .add_link("lo".to_string(), &device_a, "/sys/devices/lo".to_string())
+            .unwrap();
+        class
+            .add_link("lo".to_string(), &device_b, "/sys/devices/lo".to_string())
+            .unwrap();
+
+        let plan = PreparedKernFSRename::prepare(
+            KernFSRenameSpec::new(device_a.clone(), "lan0".to_string()),
+            KernFSRenameSpec::new(link_a, "lan0".to_string())
+                .with_symlink_target_absolute_path("/sys/devices/lan0".to_string()),
+        )
+        .unwrap();
+        plan.commit().unwrap();
+
+        assert!(devices.find_ns("lo", tag_a).is_err());
+        assert!(Arc::ptr_eq(
+            &devices
+                .find_ns("lan0", tag_a)
+                .unwrap()
+                .downcast_arc::<KernFSInode>()
+                .unwrap(),
+            &device_a
+        ));
+        assert!(Arc::ptr_eq(
+            &devices
+                .find_ns("lo", tag_b)
+                .unwrap()
+                .downcast_arc::<KernFSInode>()
+                .unwrap(),
+            &device_b
+        ));
+        assert_eq!(
+            class.list_ns(tag_a).unwrap(),
+            vec![".".to_string(), "..".to_string(), "lan0".to_string()]
+        );
+        assert_eq!(
+            class.list_ns(tag_b).unwrap(),
+            vec![".".to_string(), "..".to_string(), "lo".to_string()]
         );
     }
 }

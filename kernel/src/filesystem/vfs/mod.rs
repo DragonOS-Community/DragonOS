@@ -2306,6 +2306,43 @@ pub trait FileSystem: Any + Sync + Send + Debug {
     /// @brief 获取当前文件系统的root inode的指针
     fn root_inode(&self) -> Arc<dyn IndexNode>;
 
+    /// Optional owner for a newly created VFS superblock. Bind mounts and
+    /// mount-namespace copies reuse the existing superblock state.
+    fn mount_owner_user_ns(
+        &self,
+    ) -> Option<Arc<crate::process::namespace::user_namespace::UserNamespace>> {
+        None
+    }
+
+    /// Per-filesystem mount view hooks. Pseudo filesystems may override these
+    /// without teaching generic inodes about mount policy.
+    fn find_in_view(
+        &self,
+        inode: &Arc<dyn IndexNode>,
+        name: &str,
+    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+        inode.find(name)
+    }
+
+    fn find_bytes_in_view(
+        &self,
+        inode: &Arc<dyn IndexNode>,
+        name: &[u8],
+    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+        inode.find_bytes(name)
+    }
+
+    fn list_in_view(&self, inode: &Arc<dyn IndexNode>) -> Result<Vec<String>, SystemError> {
+        inode.list()
+    }
+
+    fn list_entries_in_view(
+        &self,
+        inode: &Arc<dyn IndexNode>,
+    ) -> Result<Option<Vec<DirectoryEntry>>, SystemError> {
+        inode.list_entries()
+    }
+
     /// @brief 获取当前文件系统的信息
     fn info(&self) -> FsInfo;
 

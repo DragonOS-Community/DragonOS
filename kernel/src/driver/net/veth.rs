@@ -615,6 +615,10 @@ impl device::Device for VethInterface {
 }
 
 impl Iface for VethInterface {
+    fn destroy_on_netns_exit(&self) -> bool {
+        true
+    }
+
     fn common(&self) -> &IfaceCommon {
         &self.common
     }

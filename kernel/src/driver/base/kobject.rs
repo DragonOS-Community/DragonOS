@@ -17,7 +17,7 @@ use log::{debug, error};
 
 use crate::{
     filesystem::{
-        kernfs::KernFSInode,
+        kernfs::{KernFSInode, KernFSNamespaceTag},
         sysfs::{sysfs_instance, Attribute, AttributeGroup, SysFSOps, SysFSOpsSupport},
     },
     libs::{
@@ -336,6 +336,20 @@ impl KObjectManager {
     }
 
     pub fn add_kobj(kobj: Arc<dyn KObject>) -> Result<(), SystemError> {
+        Self::add_kobj_with_namespace(kobj, None)
+    }
+
+    pub fn add_kobj_ns(
+        kobj: Arc<dyn KObject>,
+        namespace: KernFSNamespaceTag,
+    ) -> Result<(), SystemError> {
+        Self::add_kobj_with_namespace(kobj, Some(namespace))
+    }
+
+    fn add_kobj_with_namespace(
+        kobj: Arc<dyn KObject>,
+        namespace: Option<KernFSNamespaceTag>,
+    ) -> Result<(), SystemError> {
         if let Some(kset) = kobj.kset() {
             kset.join(&kobj);
             // 如果kobject没有parent，那么就将这个kset作为parent
@@ -344,7 +358,7 @@ impl KObjectManager {
             }
         }
 
-        let r = Self::create_dir(kobj.clone());
+        let r = Self::create_dir(kobj.clone(), namespace);
 
         if let Err(e) = r {
             // https://code.dragonos.org.cn/xref/linux-6.1.9/lib/kobject.c?r=&mo=10426&fi=394#224
@@ -363,9 +377,15 @@ impl KObjectManager {
         return Ok(());
     }
 
-    fn create_dir(kobj: Arc<dyn KObject>) -> Result<(), SystemError> {
+    fn create_dir(
+        kobj: Arc<dyn KObject>,
+        namespace: Option<KernFSNamespaceTag>,
+    ) -> Result<(), SystemError> {
         // create dir in sysfs
-        sysfs_instance().create_dir(kobj.clone())?;
+        match namespace {
+            Some(namespace) => sysfs_instance().create_dir_ns(kobj.clone(), namespace)?,
+            None => sysfs_instance().create_dir(kobj.clone())?,
+        };
 
         // create default attributes in sysfs
         if let Some(ktype) = kobj.kobj_type() {

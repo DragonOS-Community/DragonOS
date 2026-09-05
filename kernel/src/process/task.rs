@@ -1067,8 +1067,11 @@ impl ProcessControlBlock {
         nsproxy_retire: PreparedRcuArcRetire<NsProxy>,
         new_cred: Option<(Arc<Cred>, PreparedRcuArcRetire<Cred>)>,
     ) {
-        let _exec_guard = self.exec_update_read();
-        let active_mm = self.basic().user_vm();
+        // Only credential publication needs to stabilize the active mm. Pure
+        // namespace publication also runs inside exec, which already owns the
+        // write side and must not recursively acquire this read lock.
+        let _exec_guard = new_cred.as_ref().map(|_| self.exec_update_read());
+        let active_mm = new_cred.as_ref().and_then(|_| self.basic().user_vm());
         let (nsproxy_retirement, cred_retirement) = {
             let _task_guard = self.task_lock.lock_irqsave();
             let nsproxy_retirement = self.nsproxy.swap_prepared(new_nsproxy, nsproxy_retire);

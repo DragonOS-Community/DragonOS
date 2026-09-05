@@ -458,6 +458,27 @@ mod tests {
     }
 
     #[test]
+    fn namespace_only_commit_does_not_reacquire_exec_lock() {
+        let pcb = test_pcb();
+        let old_cred = pcb.cred();
+        let new_nsproxy = Arc::new(pcb.nsproxy().clone_inner());
+        let _exec_guard = pcb.exec_update_write();
+        let fs_refs = crate::process::lock_fs_refs_copy();
+        let prepared = PreparedNamespaceInstall::prepare_for_setns(
+            &pcb,
+            new_nsproxy.clone(),
+            None,
+            false,
+            &fs_refs,
+        )
+        .unwrap();
+
+        prepared.commit(&pcb, &fs_refs).unwrap();
+        assert!(Arc::ptr_eq(&pcb.nsproxy(), &new_nsproxy));
+        assert!(Arc::ptr_eq(&pcb.cred(), &old_cred));
+    }
+
+    #[test]
     fn namespace_prepare_error_preserves_attachment_and_old_state() {
         let pcb = test_pcb();
         let old_nsproxy = pcb.nsproxy();

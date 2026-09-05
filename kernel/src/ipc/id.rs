@@ -51,7 +51,8 @@ impl<const CAPACITY: usize, const WORDS: usize> FixedIpcIdAllocator<CAPACITY, WO
 
     pub fn alloc(&mut self) -> Result<IpcId, SystemError> {
         let idx = self.find_free_idx().ok_or(SystemError::ENOSPC)?;
-        debug_assert_eq!(self.used.set(idx, true), Some(false));
+        let was_used = self.used.set(idx, true);
+        debug_assert_eq!(was_used, Some(false));
         self.next_idx = if idx + 1 == self.max_ids { 0 } else { idx + 1 };
 
         if let Some(last_idx) = self.last_idx {

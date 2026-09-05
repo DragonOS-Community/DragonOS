@@ -618,7 +618,7 @@ fn replay_marked_records(pcb: &Arc<ProcessControlBlock>, group: &Arc<SemUndoGrou
     let mut wakes = SemWakeBatch::default();
     let mut manager = ipc_ns.sem.lock();
     let records = group.take_retired_records();
-    for record in records {
+    for record in &records {
         SemManager::replay_sem_undo_adjustments(
             &mut manager,
             record.semid,
@@ -626,6 +626,14 @@ fn replay_marked_records(pcb: &Arc<ProcessControlBlock>, group: &Arc<SemUndoGrou
             exiting_tgid.clone(),
             &mut wakes,
         );
+        manager.unregister_undo_group(record.semid, group);
+    }
+    // Keep all detached debt inside the original replay critical section:
+    // unlocking earlier would let SETVAL/SETALL miss records not yet replayed.
+    drop(manager);
+    wakes.wake_all();
+    for record in &records {
+        SemManager::shrink_undo_registry(&ipc_ns, record.semid);
     }
 }
 

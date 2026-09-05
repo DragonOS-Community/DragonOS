@@ -8,7 +8,7 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
-use core::fmt;
+use core::{cell::Cell, fmt};
 
 use hashbrown::HashMap;
 use system_error::SystemError;
@@ -469,6 +469,34 @@ impl KernelSemSet {
         self.undo_groups.retain(|weak| weak.strong_count() != 0);
     }
 
+    /// Request/publish smaller storage without allocating under the manager
+    /// lock. Empty registries are moved into retired without installing spare.
+    /// The caller must drop both buffers after unlocking.
+    fn shrink_undo_registry_prepared(
+        &mut self,
+        spare: &mut Vec<Weak<SemUndoGroup>>,
+        retired: &mut Vec<Weak<SemUndoGroup>>,
+    ) -> usize {
+        debug_assert!(spare.is_empty());
+        debug_assert!(retired.is_empty() && retired.capacity() == 0);
+        let len = self.undo_groups.len();
+        if len == 0 {
+            core::mem::swap(&mut self.undo_groups, retired);
+            return 0;
+        }
+        if self.undo_groups.capacity() <= 4 || len > self.undo_groups.capacity() / 4 {
+            return 0;
+        }
+        if spare.capacity() < len {
+            return len.saturating_mul(2).max(4);
+        }
+        if spare.capacity() < self.undo_groups.capacity() {
+            spare.append(&mut self.undo_groups);
+            core::mem::swap(&mut self.undo_groups, spare);
+        }
+        0
+    }
+
     fn try_allocate_sems(nsems: usize) -> Result<Vec<KernelSem>, SystemError> {
         let mut sems = Vec::new();
         sems.try_reserve_exact(nsems)
@@ -772,6 +800,67 @@ impl SemManager {
         f: impl FnOnce(&mut SemUndoRecord) -> R,
     ) -> Option<R> {
         group.with_record_mut(semid, f)
+    }
+
+    pub(crate) fn unregister_undo_group(&mut self, semid: SemId, group: &Arc<SemUndoGroup>) {
+        if let Ok(set) = self.get_by_semid_checked_mut(semid) {
+            let target = Arc::downgrade(group);
+            set.undo_groups.retain(|weak| !weak.ptr_eq(&target));
+        }
+    }
+
+    /// Reclaim a target registry, never allocating or freeing its buffer under
+    /// the namespace lock. Concurrent growth can make a shrink unnecessary or
+    /// consume the spare capacity; in either case leave the live registry intact.
+    pub(crate) fn shrink_undo_registry(ipcns: &Arc<IpcNamespace>, semid: SemId) {
+        let mut spare = Vec::new();
+        let mut retired = Vec::new();
+        let needed = {
+            let mut manager = ipcns.sem.lock();
+            let Ok(set) = manager.get_by_semid_checked_mut(semid) else {
+                return;
+            };
+            set.shrink_undo_registry_prepared(&mut spare, &mut retired)
+        };
+        if needed == 0 || spare.try_reserve_exact(needed).is_err() {
+            return;
+        }
+        // Allocation is best-effort reclamation, not part of syscall success.
+        let mut manager = ipcns.sem.lock();
+        if let Ok(set) = manager.get_by_semid_checked_mut(semid) {
+            set.shrink_undo_registry_prepared(&mut spare, &mut retired);
+        }
+    }
+
+    fn release_unused_undo_group(
+        ipcns: &Arc<IpcNamespace>,
+        semid: SemId,
+        group: &Arc<SemUndoGroup>,
+    ) {
+        {
+            let mut manager = ipcns.sem.lock();
+            let Ok(set) = manager.get_by_semid_checked(semid) else {
+                return;
+            };
+            if group.with_record_mut(semid, |_| ()).is_some()
+                || set
+                    .pending_const
+                    .iter()
+                    .chain(&set.pending_alter)
+                    .any(|entry| {
+                        entry
+                            .undo_group
+                            .as_ref()
+                            .is_some_and(|owner| Arc::ptr_eq(owner, group))
+                    })
+            {
+                return;
+            }
+            // Other Missing preparations outside the lock re-register before
+            // publication. Existing records (even zero debt) keep their link.
+            manager.unregister_undo_group(semid, group);
+        }
+        Self::shrink_undo_registry(ipcns, semid);
     }
 
     pub(crate) fn clear_undo_for_setval(&mut self, semid: SemId, semnum: usize) {
@@ -1306,6 +1395,16 @@ impl SemManager {
         } else {
             None
         };
+        let registered_missing = Cell::new(false);
+        // Declare before all entries and manager guards. Failed/timeout-only
+        // operations have no published record for final-owner exit to enumerate.
+        defer::defer!({
+            if registered_missing.get() {
+                if let Some(group) = undo_group.as_ref() {
+                    Self::release_unused_undo_group(ipcns, semid, group);
+                }
+            }
+        });
         let mut immediate_scratch = SemopScratch::try_new(sops.len())?;
         let plain_prepared_entry = if has_undo {
             None
@@ -1414,6 +1513,7 @@ impl SemManager {
                         registry_capacity_needed = capacity;
                         continue;
                     }
+                    registered_missing.set(true);
                 }
                 let mut record_slot = prepared_entry.undo_record.lock_irqsave();
                 let prepared_record = record_slot
@@ -2059,6 +2159,45 @@ mod tests {
     #[test]
     fn new_manager_starts_with_empty_undo_registry() {
         assert!(SemManager::new().id2sem.is_empty());
+    }
+
+    #[test]
+    fn undo_registry_shrink_releases_empty_and_rechecks_concurrent_growth() {
+        let mut manager = SemManager::new();
+        let semid = insert_test_set(&mut manager, SemKey::new(152), &[0]);
+        let group = SemUndoGroup::new_for_test_bound_to(&INIT_IPC_NAMESPACE).unwrap();
+        let set = manager.get_by_semid_checked_mut(semid).unwrap();
+        set.undo_groups.reserve_exact(64);
+        set.undo_groups.push(Arc::downgrade(&group));
+        let mut spare = Vec::new();
+        let mut retired = Vec::new();
+        let needed = set.shrink_undo_registry_prepared(&mut spare, &mut retired);
+        assert_eq!(needed, 4);
+        spare.try_reserve_exact(needed).unwrap();
+        // Simulate new associations arriving during unlocked preparation.
+        for _ in 0..8 {
+            set.undo_groups.push(Arc::downgrade(&group));
+        }
+        assert!(set.shrink_undo_registry_prepared(&mut spare, &mut retired) > 0);
+        assert_eq!(set.undo_groups.len(), 9);
+        assert_eq!(set.undo_groups.capacity(), 64);
+        set.undo_groups.truncate(1);
+        assert_eq!(
+            set.shrink_undo_registry_prepared(&mut spare, &mut retired),
+            0
+        );
+        assert_eq!(set.undo_groups.len(), 1);
+        assert_eq!(set.undo_groups.capacity(), 4);
+        assert_eq!(spare.capacity(), 64);
+        // The spare is already allocated when another owner empties the set.
+        // It must not be installed back into the empty registry.
+        set.undo_groups.clear();
+        assert_eq!(
+            set.shrink_undo_registry_prepared(&mut spare, &mut retired),
+            0
+        );
+        assert_eq!(set.undo_groups.capacity(), 0);
+        assert_eq!(retired.capacity(), 4);
     }
 
     #[test]

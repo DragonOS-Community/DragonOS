@@ -2349,6 +2349,69 @@ TEST(SysVSem, IndependentUndoGroupsSteadyStateAndSetall) {
     }
 }
 
+TEST(SysVSem, UndoGroupChurnAcrossPersistentSets) {
+    constexpr int kSets = 16;
+    constexpr int kWorkers = 16;
+    std::vector<std::unique_ptr<SemSet>> sets;
+    for (int i = 0; i < kSets; ++i) {
+        sets.emplace_back(new SemSet(1, IPC_CREAT | 0600));
+        ASSERT_TRUE(sets.back()->valid());
+    }
+    // Keep every set alive across repeated empty -> shared -> empty cycles.
+    for (int round = 0; round < 3; ++round) {
+        int ready[2], release[2];
+        ASSERT_EQ(0, pipe(ready));
+        FdGuard ready_read(ready[0]), ready_write(ready[1]);
+        ASSERT_EQ(0, pipe(release));
+        FdGuard release_read(release[0]), release_write(release[1]);
+        std::vector<std::unique_ptr<ChildGuard>> children;
+        for (int worker = 0; worker < kWorkers; ++worker) {
+            pid_t pid = fork();
+            ASSERT_GE(pid, 0);
+            if (pid == 0) {
+                ready_read.Close();
+                release_write.Close();
+                for (auto& sem : sets) {
+                    // This group has no published record for the set yet.
+                    struct sembuf fail = {0, -32767, SEM_UNDO | IPC_NOWAIT};
+                    if (SemOp(sem->id(), &fail, 1) != -1 || errno != EAGAIN) {
+                        _exit(118);
+                    }
+                    struct sembuf timed = {0, -32767, SEM_UNDO};
+                    struct timespec timeout = {0, 1000000};
+                    if (SemTimedOp(sem->id(), &timed, 1, &timeout) != -1 || errno != EAGAIN ||
+                        !SemUndoOpMustSucceed(sem->id(), 0, 1)) {
+                        _exit(119);
+                    }
+                }
+                char token = 1;
+                _exit(WriteExact(ready_write.get(), &token, 1) &&
+                              ReadExact(release_read.get(), &token, 1) ? 0 : 120);
+            }
+            children.emplace_back(new ChildGuard(pid));
+        }
+        ready_write.Close();
+        release_read.Close();
+        char token = 1;
+        for (int i = 0; i < kWorkers; ++i) {
+            ASSERT_TRUE(ReadExact(ready_read.get(), &token, 1));
+        }
+        for (auto& sem : sets) {
+            EXPECT_EQ(kWorkers, SemCtl(sem->id(), 0, GETVAL, 0));
+        }
+        // Let all owners exit and replay without removing any set.
+        for (int i = 0; i < kWorkers; ++i) {
+            ASSERT_TRUE(WriteExact(release_write.get(), &token, 1));
+        }
+        for (auto& child : children) {
+            WaitChildOk(child.get());
+        }
+        for (auto& sem : sets) {
+            EXPECT_EQ(0, SemCtl(sem->id(), 0, GETVAL, 0));
+        }
+    }
+}
+
 TEST(SysVSem, ConcurrentWorkers) {
     constexpr int kWorkers = 8;
     SemSet sem(1, IPC_CREAT | 0600);

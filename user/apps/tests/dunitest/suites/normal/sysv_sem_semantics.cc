@@ -618,6 +618,20 @@ TEST(SysVSem, SetAllGetAll) {
     EXPECT_EQ(3u, out[2]);
 }
 
+TEST(SysVSem, LargeSetAllGetAll) {
+    constexpr size_t count = 32000;
+    SemSet sem(count, IPC_CREAT | 0600);
+    ASSERT_TRUE(sem.valid()) << "errno=" << errno;
+    std::vector<unsigned short> values(count), actual(count);
+    for (size_t i = 0; i < count; ++i)
+        values[i] = static_cast<unsigned short>(i % 32768);
+    ASSERT_EQ(0, SemCtl(sem.id(), 0, SETALL,
+                        reinterpret_cast<unsigned long>(values.data())));
+    ASSERT_EQ(0, SemCtl(sem.id(), 0, GETALL,
+                        reinterpret_cast<unsigned long>(actual.data())));
+    EXPECT_EQ(values, actual);
+}
+
 TEST(SysVSem, SetAllAtomicRangeError) {
     SemSet sem(3, IPC_CREAT | 0600);
     ASSERT_TRUE(sem.valid());

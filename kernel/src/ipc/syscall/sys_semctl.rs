@@ -118,7 +118,10 @@ pub(super) fn do_kernel_semctl(
                 let guard = ipcns.sem.lock();
                 guard.prepare_setall(semid)?
             };
-            let mut vals: Vec<u16> = vec![0; token.nsems()];
+            let mut vals = Vec::<u16>::new();
+            vals.try_reserve_exact(token.nsems())
+                .map_err(|_| SystemError::ENOMEM)?;
+            vals.resize(token.nsems(), 0);
             let user_buffer_reader = UserBufferReader::new(
                 arg as *const u8,
                 token.nsems() * core::mem::size_of::<u16>(),

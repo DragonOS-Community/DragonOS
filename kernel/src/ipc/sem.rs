@@ -412,15 +412,41 @@ impl KernelSemSet {
         }
     }
 
-    fn enqueue_waiter(&mut self, waiter: Arc<SemQueueEntry>) -> Result<(), SystemError> {
+    /// Return the required capacity without publishing anything if the caller
+    /// must prepare storage outside the namespace lock. `spare` is empty and
+    /// retains the old allocation after a swap, to be freed outside the lock.
+    fn enqueue_waiter_prepared(
+        &mut self,
+        waiter: Arc<SemQueueEntry>,
+        spare: &mut VecDeque<Arc<SemQueueEntry>>,
+    ) -> Result<(), usize> {
+        debug_assert!(spare.is_empty());
         let queue = match Self::pending_queue_for(&waiter.sops) {
             SemPendingQueue::Const => &mut self.pending_const,
             SemPendingQueue::Alter => &mut self.pending_alter,
         };
-        // Preparation may fail, but publishing the waiter must not allocate.
-        // No semaphore values or undo adjustments have been committed here.
-        queue.try_reserve(1).map_err(|_| SystemError::ENOMEM)?;
+        if queue.len() == queue.capacity() {
+            if spare.capacity() <= queue.len() {
+                return Err(queue.len().saturating_mul(2).max(4));
+            }
+            // Capacity covers the existing entries and the new waiter. Moving
+            // Arc handles preserves FIFO order and performs no allocation.
+            spare.extend(queue.drain(..));
+            core::mem::swap(queue, spare);
+        }
         queue.push_back(waiter);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn enqueue_waiter(&mut self, waiter: Arc<SemQueueEntry>) -> Result<(), SystemError> {
+        let mut spare = VecDeque::new();
+        if let Err(capacity) = self.enqueue_waiter_prepared(waiter.clone(), &mut spare) {
+            spare
+                .try_reserve(capacity)
+                .map_err(|_| SystemError::ENOMEM)?;
+            self.enqueue_waiter_prepared(waiter, &mut spare).unwrap();
+        }
         Ok(())
     }
 
@@ -1212,7 +1238,18 @@ impl SemManager {
             )
         };
 
+        let mut queue_spare = VecDeque::new();
+        let mut queue_capacity_needed = 0;
         let entry = loop {
+            // Only a genuinely blocking operation requests queue storage.
+            // Revalidate the set and re-simulate after dropping the lock: a
+            // wakeup, RMID, or another enqueue may have changed the outcome.
+            if queue_capacity_needed != 0 {
+                queue_spare
+                    .try_reserve(queue_capacity_needed)
+                    .map_err(|_| SystemError::ENOMEM)?;
+                queue_capacity_needed = 0;
+            }
             let nsems = {
                 let guard = ipcns.sem.lock();
                 let set = guard.get_by_semid_checked(semid)?;
@@ -1311,7 +1348,12 @@ impl SemManager {
                         }
                         drop(record_slot);
                         prepared_entry.update_blocker(blocker);
-                        set.enqueue_waiter(prepared_entry.clone())?;
+                        if let Err(capacity) =
+                            set.enqueue_waiter_prepared(prepared_entry.clone(), &mut queue_spare)
+                        {
+                            queue_capacity_needed = capacity;
+                            continue;
+                        }
                         break prepared_entry;
                     }
                 }
@@ -1334,13 +1376,19 @@ impl SemManager {
                             .as_ref()
                             .expect("plain queued semop entry is preallocated");
                         prepared_entry.update_blocker(blocker);
-                        set.enqueue_waiter(prepared_entry.clone())?;
+                        if let Err(capacity) =
+                            set.enqueue_waiter_prepared(prepared_entry.clone(), &mut queue_spare)
+                        {
+                            queue_capacity_needed = capacity;
+                            continue;
+                        }
                         break prepared_entry.clone();
                     }
                 }
             }
         };
 
+        drop(queue_spare);
         if let Some(timer) = timer.as_ref() {
             timer.activate();
         }
@@ -1533,7 +1581,11 @@ impl SemManager {
         let set = self.get_by_semid_checked(id)?;
         let target_user_ns = ProcessManager::current_ipcns().user_ns.clone();
         ipc_perm::ipc_permission(&set.kern_ipc_perm, Self::IPC_READ, &target_user_ns)?;
-        Ok(set.sems.iter().map(|s| s.val as u16).collect())
+        let mut vals = Vec::new();
+        vals.try_reserve_exact(set.sems.len())
+            .map_err(|_| SystemError::ENOMEM)?;
+        vals.extend(set.sems.iter().map(|s| s.val as u16));
+        Ok(vals)
     }
 
     /// Validate SETALL before the caller accesses the userspace array.

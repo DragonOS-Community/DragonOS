@@ -823,7 +823,7 @@ mod tests {
         let group = SemUndoGroup::new_for_test_bound_to(&ipc_ns).unwrap();
         let mut manager = ipc_ns.sem.lock();
         let semid = manager
-            .semget(
+            .semget_for_test(
                 crate::ipc::sem::IPC_PRIVATE,
                 1,
                 crate::ipc::sem::SemFlags::IPC_CREAT,

@@ -2224,6 +2224,93 @@ TEST(SysVSem, RemoveWhileWaiting) {
 
 // ============ concurrency ============
 
+TEST(SysVSem, ConcurrentSameKeyCreationPublishesOneSet) {
+    constexpr int kCreators = 12;
+    for (bool exclusive : {false, true}) {
+        const key_t key = UniqueKey();
+        int gate[2];
+        ASSERT_EQ(0, pipe(gate));
+        FdGuard gate_read(gate[0]);
+        FdGuard gate_write(gate[1]);
+        std::vector<std::unique_ptr<ChildGuard>> children;
+        for (int i = 0; i < kCreators; ++i) {
+            pid_t pid = fork();
+            ASSERT_GE(pid, 0);
+            if (pid == 0) {
+                gate_write.Close();
+                char token;
+                if (!ReadExact(gate_read.get(), &token, 1)) _exit(120);
+                int id = SemGet(key, 32000, IPC_CREAT | 0600 | (exclusive ? IPC_EXCL : 0));
+                if (id < 0) _exit(exclusive && errno == EEXIST ? 2 : 121);
+                // A racing creator must find the same published ID, never a duplicate.
+                _exit(SemGet(key, 0, 0600) == id ? 0 : 122);
+            }
+            children.emplace_back(new ChildGuard(pid));
+        }
+        gate_read.Close();
+        const char tokens[kCreators] = {};
+        ASSERT_TRUE(WriteExact(gate_write.get(), tokens, sizeof(tokens)));
+        gate_write.Close();
+        int successes = 0;
+        for (auto& child : children) {
+            int status = 0;
+            pid_t result;
+            do { result = waitpid(child->pid(), &status, 0); } while (result < 0 && errno == EINTR);
+            if (result == child->pid()) child->MarkReaped();
+            ASSERT_GT(result, 0);
+            ASSERT_TRUE(WIFEXITED(status));
+            const int code = WEXITSTATUS(status);
+            EXPECT_TRUE(code == 0 || (exclusive && code == 2)) << code;
+            successes += code == 0;
+        }
+        SemSet published(SemGet(key, 0, 0600), true);
+        ASSERT_TRUE(published.valid());
+        EXPECT_EQ(exclusive ? 1 : kCreators, successes);
+        EXPECT_EQ(0, SemCtl(published.id(), 31999, GETVAL, 0));
+    }
+}
+
+TEST(SysVSem, CancelHeadMiddleTailPreservesBothWaitQueues) {
+    constexpr int kWaiters = 9;
+    for (bool constant : {false, true}) {
+        SemSet sem(1, IPC_CREAT | 0600);
+        ASSERT_TRUE(sem.valid());
+        ASSERT_EQ(0, SemCtl(sem.id(), 0, SETVAL, constant ? 1 : 0));
+        std::vector<std::unique_ptr<ChildGuard>> children;
+        for (int i = 0; i < kWaiters; ++i) {
+            pid_t pid = fork();
+            ASSERT_GE(pid, 0);
+            if (pid == 0) {
+                struct sigaction sa = {};
+                sa.sa_handler = [](int) {};
+                sigemptyset(&sa.sa_mask);
+                if (sigaction(SIGUSR1, &sa, nullptr) != 0) _exit(123);
+                struct sembuf op = {0, static_cast<short>(constant ? 0 : -1), 0};
+                int result = SemOp(sem.id(), &op, 1);
+                const bool cancelled = i == 0 || i == 4 || i == 8;
+                _exit((cancelled ? result == -1 && errno == EINTR : result == 0) ? 0 : 124);
+            }
+            children.emplace_back(new ChildGuard(pid));
+            // Establish insertion order using the ABI, not guessed scheduling delays.
+            ASSERT_TRUE(constant ? WaitForZcnt(sem.id(), 0, i + 1)
+                                 : WaitForNcnt(sem.id(), 0, i + 1));
+        }
+        int remaining = kWaiters;
+        for (int index : {4, 0, 8}) {
+            ASSERT_EQ(0, kill(children[index]->pid(), SIGUSR1));
+            WaitChildOk(children[index].get());
+            --remaining;
+            EXPECT_EQ(remaining, SemCtl(sem.id(), 0, constant ? GETZCNT : GETNCNT, 0));
+        }
+        ASSERT_EQ(0, SemCtl(sem.id(), 0, SETVAL, constant ? 0 : remaining));
+        for (int i = 0; i < kWaiters; ++i) {
+            if (i != 0 && i != 4 && i != 8) WaitChildOk(children[i].get());
+        }
+        EXPECT_EQ(0, SemCtl(sem.id(), 0, GETVAL, 0));
+        EXPECT_EQ(0, SemCtl(sem.id(), 0, constant ? GETZCNT : GETNCNT, 0));
+    }
+}
+
 TEST(SysVSem, WaitQueuesGrowForConstAndAlterOperations) {
     constexpr int kWaiters = 32;
     for (bool constant : {true, false}) {

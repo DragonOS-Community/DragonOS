@@ -4,7 +4,6 @@
 // behavior, including SEM_UNDO lifecycle accounting.
 
 use alloc::{
-    collections::VecDeque,
     sync::{Arc, Weak},
     vec::Vec,
 };
@@ -252,11 +251,137 @@ struct SemBlockedOp {
 
 #[derive(Debug)]
 enum SemQueueStatus {
-    Queued(SemBlockedOp),
+    Queued {
+        blocker: SemBlockedOp,
+        links: Option<SemWaitLinks>,
+    },
     Completed {
         result: Result<usize, SystemError>,
         next_wake: Option<Arc<SemQueueEntry>>,
     },
+}
+
+#[derive(Debug)]
+struct SemWaitLinks {
+    prev: Option<Weak<SemQueueEntry>>,
+    next: Option<Arc<SemQueueEntry>>,
+}
+
+/// Set-private FIFO. All structural changes require the namespace manager lock.
+/// Strong forward / weak backward links avoid cycles; each operation holds at
+/// most one entry status lock at a time.
+#[derive(Debug, Default)]
+struct SemWaitQueue {
+    head: Option<Arc<SemQueueEntry>>,
+    tail: Option<Arc<SemQueueEntry>>,
+}
+
+impl SemWaitQueue {
+    fn push_back(&mut self, entry: Arc<SemQueueEntry>) {
+        {
+            let mut status = entry.status.lock();
+            let SemQueueStatus::Queued { links, .. } = &mut *status else {
+                panic!("cannot enqueue completed semaphore operation");
+            };
+            assert!(links.is_none(), "semaphore operation already linked");
+            *links = Some(SemWaitLinks {
+                prev: self.tail.as_ref().map(Arc::downgrade),
+                next: None,
+            });
+        }
+        if let Some(tail) = self.tail.take() {
+            let mut status = tail.status.lock();
+            let SemQueueStatus::Queued {
+                links: Some(links), ..
+            } = &mut *status
+            else {
+                panic!("semaphore queue tail is not linked");
+            };
+            links.next = Some(entry.clone());
+        } else {
+            self.head = Some(entry.clone());
+        }
+        self.tail = Some(entry);
+    }
+
+    fn remove(&mut self, entry: &Arc<SemQueueEntry>) -> bool {
+        let links = {
+            let mut status = entry.status.lock();
+            match &mut *status {
+                SemQueueStatus::Queued { links, .. } => links.take(),
+                SemQueueStatus::Completed { .. } => None,
+            }
+        };
+        let Some(SemWaitLinks { prev, next }) = links else {
+            return false;
+        };
+        let prev = prev.map(|weak| weak.upgrade().expect("linked predecessor is live"));
+        if let Some(prev) = prev.as_ref() {
+            let mut status = prev.status.lock();
+            let SemQueueStatus::Queued {
+                links: Some(links), ..
+            } = &mut *status
+            else {
+                panic!("semaphore predecessor is not linked");
+            };
+            links.next = next.clone();
+        } else {
+            debug_assert!(self
+                .head
+                .as_ref()
+                .is_some_and(|head| Arc::ptr_eq(head, entry)));
+            self.head = next.clone();
+        }
+        if let Some(next) = next {
+            let mut status = next.status.lock();
+            let SemQueueStatus::Queued {
+                links: Some(links), ..
+            } = &mut *status
+            else {
+                panic!("semaphore successor is not linked");
+            };
+            links.prev = prev.as_ref().map(Arc::downgrade);
+        } else {
+            self.tail = prev;
+        }
+        true
+    }
+
+    fn iter(&self) -> SemWaitIter {
+        SemWaitIter(self.head.clone())
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.head.is_none()
+    }
+}
+
+impl Drop for SemWaitQueue {
+    fn drop(&mut self) {
+        // Detach iteratively, including namespace teardown, never recursively
+        // destroy an arbitrarily long chain of Arc-owned entries.
+        while let Some(entry) = self.head.clone() {
+            self.remove(&entry);
+        }
+    }
+}
+
+struct SemWaitIter(Option<Arc<SemQueueEntry>>);
+
+impl Iterator for SemWaitIter {
+    type Item = Arc<SemQueueEntry>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let entry = self.0.take()?;
+        self.0 = match &*entry.status.lock() {
+            SemQueueStatus::Queued {
+                links: Some(links), ..
+            } => links.next.clone(),
+            _ => None,
+        };
+        Some(entry)
+    }
 }
 
 /// An Arc-owned queue entry shared by the set and the blocked caller.
@@ -300,7 +425,10 @@ impl SemQueueEntry {
             undo_group,
             undo_record: SpinLock::new(undo_record),
             waker,
-            status: SpinLock::new(SemQueueStatus::Queued(blocker)),
+            status: SpinLock::new(SemQueueStatus::Queued {
+                blocker,
+                links: None,
+            }),
         }
     }
 
@@ -333,15 +461,18 @@ impl SemQueueEntry {
 
     fn completed_result(&self) -> Option<Result<usize, SystemError>> {
         match &*self.status.lock() {
-            SemQueueStatus::Queued(_) => None,
+            SemQueueStatus::Queued { .. } => None,
             SemQueueStatus::Completed { result, .. } => Some(result.clone()),
         }
     }
 
     fn update_blocker(&self, blocker: SemBlockedOp) {
         let mut status = self.status.lock();
-        if matches!(&*status, SemQueueStatus::Queued(_)) {
-            *status = SemQueueStatus::Queued(blocker);
+        if let SemQueueStatus::Queued {
+            blocker: current, ..
+        } = &mut *status
+        {
+            *current = blocker;
         }
     }
 
@@ -350,6 +481,10 @@ impl SemQueueEntry {
         if matches!(&*status, SemQueueStatus::Completed { .. }) {
             return false;
         }
+        assert!(
+            matches!(&*status, SemQueueStatus::Queued { links: None, .. }),
+            "semaphore operation must be unlinked before completion"
+        );
         *status = SemQueueStatus::Completed {
             result,
             next_wake: None,
@@ -360,7 +495,7 @@ impl SemQueueEntry {
     fn is_waiting_on(&self, semnum: usize, wait_type: SemWaitType) -> bool {
         matches!(
             &*self.status.lock(),
-            SemQueueStatus::Queued(blocker)
+            SemQueueStatus::Queued { blocker, .. }
                 if blocker.semnum == semnum && blocker.wait_type == wait_type
         )
     }
@@ -395,7 +530,7 @@ impl SemWakeBatch {
         while let Some(entry) = self.head.take() {
             self.head = match &mut *entry.status.lock() {
                 SemQueueStatus::Completed { next_wake, .. } => next_wake.take(),
-                SemQueueStatus::Queued(_) => unreachable!("wake batch contains queued entry"),
+                SemQueueStatus::Queued { .. } => unreachable!("wake batch contains queued entry"),
             };
             // Release the status lock before entering the scheduler. Detaching
             // each link also prevents recursive Arc destruction for large batches.
@@ -431,9 +566,9 @@ pub struct KernelSemSet {
     /// Time of the last metadata change
     pub sem_ctime: i64,
     /// Pending operation groups containing only zero-wait operations
-    pending_const: VecDeque<Arc<SemQueueEntry>>,
+    pending_const: SemWaitQueue,
     /// Pending operation groups containing at least one altering operation
-    pending_alter: VecDeque<Arc<SemQueueEntry>>,
+    pending_alter: SemWaitQueue,
 }
 
 impl KernelSemSet {
@@ -512,8 +647,8 @@ impl KernelSemSet {
             sems,
             sem_otime: 0,
             sem_ctime: PosixTimeSpec::now().tv_sec,
-            pending_const: VecDeque::new(),
-            pending_alter: VecDeque::new(),
+            pending_const: SemWaitQueue::default(),
+            pending_alter: SemWaitQueue::default(),
         }
     }
 
@@ -525,49 +660,17 @@ impl KernelSemSet {
         }
     }
 
-    /// Return the required capacity without publishing anything if the caller
-    /// must prepare storage outside the namespace lock. `spare` is empty and
-    /// retains the old allocation after a swap, to be freed outside the lock.
-    fn enqueue_waiter_prepared(
-        &mut self,
-        waiter: Arc<SemQueueEntry>,
-        spare: &mut VecDeque<Arc<SemQueueEntry>>,
-    ) -> Result<(), usize> {
-        debug_assert!(spare.is_empty());
+    /// The prepared entry itself owns the queue links; publication cannot allocate.
+    fn enqueue_waiter(&mut self, waiter: Arc<SemQueueEntry>) {
         let queue = match Self::pending_queue_for(&waiter.sops) {
             SemPendingQueue::Const => &mut self.pending_const,
             SemPendingQueue::Alter => &mut self.pending_alter,
         };
-        if queue.len() == queue.capacity() {
-            if spare.capacity() <= queue.len() {
-                return Err(queue.len().saturating_mul(2).max(4));
-            }
-            // Capacity covers the existing entries and the new waiter. Moving
-            // Arc handles preserves FIFO order and performs no allocation.
-            spare.extend(queue.drain(..));
-            core::mem::swap(queue, spare);
-        }
         queue.push_back(waiter);
-        Ok(())
-    }
-
-    #[cfg(test)]
-    fn enqueue_waiter(&mut self, waiter: Arc<SemQueueEntry>) -> Result<(), SystemError> {
-        let mut spare = VecDeque::new();
-        if let Err(capacity) = self.enqueue_waiter_prepared(waiter.clone(), &mut spare) {
-            spare
-                .try_reserve(capacity)
-                .map_err(|_| SystemError::ENOMEM)?;
-            self.enqueue_waiter_prepared(waiter, &mut spare).unwrap();
-        }
-        Ok(())
     }
 
     fn remove_waiter(&mut self, target: &Arc<SemQueueEntry>) {
-        self.pending_const
-            .retain(|entry| !Arc::ptr_eq(entry, target));
-        self.pending_alter
-            .retain(|entry| !Arc::ptr_eq(entry, target));
+        self.remove_pending(Self::pending_queue_for(&target.sops), target);
     }
 
     #[cfg(test)]
@@ -575,33 +678,28 @@ impl KernelSemSet {
         self.pending_const.is_empty() && self.pending_alter.is_empty()
     }
 
-    fn pending_len(&self, queue: SemPendingQueue) -> usize {
+    fn pending_iter(&self, queue: SemPendingQueue) -> SemWaitIter {
         match queue {
-            SemPendingQueue::Const => self.pending_const.len(),
-            SemPendingQueue::Alter => self.pending_alter.len(),
+            SemPendingQueue::Const => self.pending_const.iter(),
+            SemPendingQueue::Alter => self.pending_alter.iter(),
         }
     }
 
-    fn pending_entry(&self, queue: SemPendingQueue, index: usize) -> Arc<SemQueueEntry> {
+    fn remove_pending(&mut self, queue: SemPendingQueue, entry: &Arc<SemQueueEntry>) {
         match queue {
-            SemPendingQueue::Const => self.pending_const[index].clone(),
-            SemPendingQueue::Alter => self.pending_alter[index].clone(),
-        }
-    }
-
-    fn remove_pending(&mut self, queue: SemPendingQueue, index: usize) {
-        match queue {
-            SemPendingQueue::Const => self.pending_const.remove(index),
-            SemPendingQueue::Alter => self.pending_alter.remove(index),
+            SemPendingQueue::Const => self.pending_const.remove(entry),
+            SemPendingQueue::Alter => self.pending_alter.remove(entry),
         };
     }
 
     /// Publish removal under the manager lock; the caller wakes after unlocking.
     fn complete_all_removed(&mut self, wakes: &mut SemWakeBatch) {
-        for entry in self.pending_const.drain(..) {
+        for entry in self.pending_const.iter() {
+            self.pending_const.remove(&entry);
             wakes.complete(entry, Err(SystemError::EIDRM));
         }
-        for entry in self.pending_alter.drain(..) {
+        for entry in self.pending_alter.iter() {
+            self.pending_alter.remove(&entry);
             wakes.complete(entry, Err(SystemError::EIDRM));
         }
     }
@@ -846,7 +944,7 @@ impl SemManager {
                 || set
                     .pending_const
                     .iter()
-                    .chain(&set.pending_alter)
+                    .chain(set.pending_alter.iter())
                     .any(|entry| {
                         entry
                             .undo_group
@@ -987,19 +1085,58 @@ impl SemManager {
         self.id_allocator.max_used_index().unwrap_or(0)
     }
 
-    /// # semget: create or look up a semaphore set
+    /// Create or look up a set. Storage preparation and disposal must happen
+    /// outside the namespace spinlock, including when another creator wins.
     pub fn semget(
-        &mut self,
+        ipcns: &Arc<IpcNamespace>,
         key: SemKey,
         nsems: usize,
         semflg: SemFlags,
     ) -> Result<usize, SystemError> {
+        let mut sems = Vec::new();
+        let mut id_spare = HashMap::new();
+        let mut key_spare = HashMap::new();
+        loop {
+            let mut manager = ipcns.sem.lock();
+            if let Some(id) = manager.lookup_semget(key, nsems, semflg)? {
+                return Ok(id);
+            }
+            if sems.is_empty() {
+                drop(manager);
+                sems = KernelSemSet::try_allocate_sems(nsems)?;
+                continue;
+            }
+            if let Err((id_capacity, key_capacity)) =
+                manager.install_create_tables(key, &mut id_spare, &mut key_spare)
+            {
+                drop(manager);
+                id_spare
+                    .try_reserve(id_capacity)
+                    .map_err(|_| SystemError::ENOMEM)?;
+                key_spare
+                    .try_reserve(key_capacity)
+                    .map_err(|_| SystemError::ENOMEM)?;
+                continue;
+            }
+            return manager.create_prepared(key, semflg, &mut sems);
+        }
+    }
+
+    /// None means creation is currently permitted, not a reservation. Call
+    /// again after unlocked preparation to recheck key races and quotas.
+    fn lookup_semget(
+        &self,
+        key: SemKey,
+        nsems: usize,
+        semflg: SemFlags,
+    ) -> Result<Option<usize>, SystemError> {
         if nsems > SEMMSL {
             return Err(SystemError::EINVAL);
         }
 
         if key == IPC_PRIVATE {
-            return self.create(key, nsems, semflg);
+            self.validate_create(nsems)?;
+            return Ok(None);
         }
 
         if let Some(&id) = self.key2id.get(&key) {
@@ -1016,21 +1153,17 @@ impl SemManager {
                 semflg.bits() & SemFlags::PERM_MASK.bits(),
                 &target_user_ns,
             )?;
-            return Ok(id.data());
+            return Ok(Some(id.data()));
         }
 
         if !semflg.contains(SemFlags::IPC_CREAT) {
             return Err(SystemError::ENOENT);
         }
-        self.create(key, nsems, semflg)
+        self.validate_create(nsems)?;
+        Ok(None)
     }
 
-    fn create(
-        &mut self,
-        key: SemKey,
-        nsems: usize,
-        semflg: SemFlags,
-    ) -> Result<usize, SystemError> {
+    fn validate_create(&self, nsems: usize) -> Result<usize, SystemError> {
         if nsems == 0 {
             return Err(SystemError::EINVAL);
         }
@@ -1044,17 +1177,58 @@ impl SemManager {
         if total_after > SEMMNS {
             return Err(SystemError::ENOSPC);
         }
+        Ok(total_after)
+    }
 
-        self.id2sem
-            .try_reserve(1)
-            .map_err(|_| SystemError::ENOMEM)?;
-        if key != IPC_PRIVATE {
-            self.key2id
-                .try_reserve(1)
-                .map_err(|_| SystemError::ENOMEM)?;
+    /// Install preallocated tables only when BOTH have enough room. Rehashing
+    /// still takes O(n) under the lock, but never allocates. The emptied old
+    /// tables remain in the caller's spares for disposal after unlocking.
+    fn install_create_tables(
+        &mut self,
+        key: SemKey,
+        id_spare: &mut HashMap<usize, KernelSemSet>,
+        key_spare: &mut HashMap<SemKey, SemId>,
+    ) -> Result<(), (usize, usize)> {
+        debug_assert!(id_spare.is_empty() && key_spare.is_empty());
+        let grow_ids = self.id2sem.capacity() == self.id2sem.len();
+        let grow_keys = key != IPC_PRIVATE && self.key2id.capacity() == self.key2id.len();
+        let needed_ids = if grow_ids && id_spare.capacity() <= self.id2sem.len() {
+            self.id2sem.len().saturating_mul(2).max(4)
+        } else {
+            0
+        };
+        let needed_keys = if grow_keys && key_spare.capacity() <= self.key2id.len() {
+            self.key2id.len().saturating_mul(2).max(4)
+        } else {
+            0
+        };
+        if needed_ids != 0 || needed_keys != 0 {
+            return Err((needed_ids, needed_keys));
         }
-        let sems = KernelSemSet::try_allocate_sems(nsems)?;
+        if grow_ids {
+            core::mem::swap(&mut self.id2sem, id_spare);
+            for (id, set) in id_spare.drain() {
+                self.id2sem.insert(id, set);
+            }
+        }
+        if grow_keys {
+            core::mem::swap(&mut self.key2id, key_spare);
+            for (key, id) in key_spare.drain() {
+                self.key2id.insert(key, id);
+            }
+        }
+        Ok(())
+    }
 
+    fn create_prepared(
+        &mut self,
+        key: SemKey,
+        semflg: SemFlags,
+        sems: &mut Vec<KernelSem>,
+    ) -> Result<usize, SystemError> {
+        let total_after = self.validate_create(sems.len())?;
+        debug_assert!(self.id2sem.capacity() > self.id2sem.len());
+        debug_assert!(key == IPC_PRIVATE || self.key2id.capacity() > self.key2id.len());
         let ipc_id = self.id_allocator.alloc()?;
         let sem_id = SemId::new(ipc_id.raw);
         let current_cred = ProcessManager::current_pcb().cred();
@@ -1065,7 +1239,7 @@ impl SemManager {
             semflg.bits() & SemFlags::PERM_MASK.bits(),
             ipc_id.seq,
         );
-        let set = KernelSemSet::new(kern_ipc_perm, sems);
+        let set = KernelSemSet::new(kern_ipc_perm, core::mem::take(sems));
 
         if key != IPC_PRIVATE {
             self.key2id.insert(key, sem_id);
@@ -1074,6 +1248,32 @@ impl SemManager {
         self.total_sems = total_after;
 
         Ok(sem_id.data())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn semget_for_test(
+        &mut self,
+        key: SemKey,
+        nsems: usize,
+        flags: SemFlags,
+    ) -> Result<usize, SystemError> {
+        if let Some(id) = self.lookup_semget(key, nsems, flags)? {
+            return Ok(id);
+        }
+        let mut sems = KernelSemSet::try_allocate_sems(nsems)?;
+        let mut ids = HashMap::new();
+        let mut keys = HashMap::new();
+        if let Err((id_capacity, key_capacity)) =
+            self.install_create_tables(key, &mut ids, &mut keys)
+        {
+            ids.try_reserve(id_capacity)
+                .map_err(|_| SystemError::ENOMEM)?;
+            keys.try_reserve(key_capacity)
+                .map_err(|_| SystemError::ENOMEM)?;
+            self.install_create_tables(key, &mut ids, &mut keys)
+                .unwrap();
+        }
+        self.create_prepared(key, flags, &mut sems)
     }
 
     /// Simulate sops in order without changing shared semaphore values or undo records.
@@ -1162,15 +1362,13 @@ impl SemManager {
         queue: SemPendingQueue,
         wakes: &mut SemWakeBatch,
     ) -> bool {
-        let mut index = 0;
-        while index < set.pending_len(queue) {
-            let entry = set.pending_entry(queue, index);
-
+        // Iterator captures the successor before the current entry is unlinked.
+        for entry in set.pending_iter(queue) {
             if let Some(group) = entry.undo_group.as_ref() {
                 let result = {
                     let mut record_slot = entry.undo_record.lock_irqsave();
                     let Some(record) = record_slot.take() else {
-                        set.remove_pending(queue, index);
+                        set.remove_pending(queue, &entry);
                         wakes.complete(entry.clone(), Err(SystemError::EINVAL));
                         continue;
                     };
@@ -1193,15 +1391,15 @@ impl SemManager {
 
                 match result {
                     Ok(Some(changed)) => {
-                        set.remove_pending(queue, index);
+                        set.remove_pending(queue, &entry);
                         wakes.complete(entry.clone(), Ok(0));
                         if changed {
                             return true;
                         }
                     }
-                    Ok(None) => index += 1,
+                    Ok(None) => {}
                     Err(error) => {
-                        set.remove_pending(queue, index);
+                        set.remove_pending(queue, &entry);
                         wakes.complete(entry.clone(), Err(error));
                     }
                 }
@@ -1213,22 +1411,21 @@ impl SemManager {
                 Ok(SemopOutcome::Ready(simulation)) => {
                     let changed =
                         Self::commit_semop(set, simulation, &scratch, entry.pid.clone(), None);
-                    set.remove_pending(queue, index);
+                    set.remove_pending(queue, &entry);
                     wakes.complete(entry.clone(), Ok(0));
                     if changed {
                         return true;
                     }
                 }
                 Ok(SemopOutcome::Blocked(blocker)) if blocker.nowait => {
-                    set.remove_pending(queue, index);
+                    set.remove_pending(queue, &entry);
                     wakes.complete(entry.clone(), Err(SystemError::EAGAIN_OR_EWOULDBLOCK));
                 }
                 Ok(SemopOutcome::Blocked(blocker)) => {
                     entry.update_blocker(blocker);
-                    index += 1;
                 }
                 Err(error) => {
-                    set.remove_pending(queue, index);
+                    set.remove_pending(queue, &entry);
                     wakes.complete(entry.clone(), Err(error));
                 }
             }
@@ -1428,20 +1625,10 @@ impl SemManager {
         };
 
         let mut wakes = SemWakeBatch::default();
-        let mut queue_spare = VecDeque::new();
-        let mut queue_capacity_needed = 0;
         let mut registry_spare = Vec::new();
         let mut registry_capacity_needed = 0;
         let entry = loop {
-            // Only a genuinely blocking operation requests queue storage.
-            // Revalidate the set and re-simulate after dropping the lock: a
-            // wakeup, RMID, or another enqueue may have changed the outcome.
-            if queue_capacity_needed != 0 {
-                queue_spare
-                    .try_reserve(queue_capacity_needed)
-                    .map_err(|_| SystemError::ENOMEM)?;
-                queue_capacity_needed = 0;
-            }
+            // Revalidate after unlocked undo-registry preparation.
             if registry_capacity_needed != 0 {
                 registry_spare
                     .try_reserve(registry_capacity_needed)
@@ -1563,12 +1750,7 @@ impl SemManager {
                         }
                         drop(record_slot);
                         prepared_entry.update_blocker(blocker);
-                        if let Err(capacity) =
-                            set.enqueue_waiter_prepared(prepared_entry.clone(), &mut queue_spare)
-                        {
-                            queue_capacity_needed = capacity;
-                            continue;
-                        }
+                        set.enqueue_waiter(prepared_entry.clone());
                         break prepared_entry;
                     }
                 }
@@ -1591,19 +1773,13 @@ impl SemManager {
                             .as_ref()
                             .expect("plain queued semop entry is preallocated");
                         prepared_entry.update_blocker(blocker);
-                        if let Err(capacity) =
-                            set.enqueue_waiter_prepared(prepared_entry.clone(), &mut queue_spare)
-                        {
-                            queue_capacity_needed = capacity;
-                            continue;
-                        }
+                        set.enqueue_waiter(prepared_entry.clone());
                         break prepared_entry.clone();
                     }
                 }
             }
         };
 
-        drop(queue_spare);
         drop(registry_spare);
         wakes.wake_all();
         if let Some(timer) = timer.as_ref() {
@@ -1910,8 +2086,54 @@ mod tests {
     ) -> Arc<SemQueueEntry> {
         let (_waiter, waker) = Waiter::new_pair();
         let entry = Arc::new(SemQueueEntry::new(sops, None, waker, blocker));
-        set.enqueue_waiter(entry.clone()).unwrap();
+        set.enqueue_waiter(entry.clone());
         entry
+    }
+
+    #[test]
+    fn pending_links_remove_middle_head_tail_and_preserve_fifo() {
+        let mut manager = SemManager::new();
+        let id = insert_test_set(&mut manager, SemKey::new(153), &[0]);
+        let set = manager.get_by_semid_checked_mut(id).unwrap();
+        let ops = [PosixSemBuf {
+            sem_num: 0,
+            sem_op: -1,
+            sem_flg: 0,
+        }];
+        let mut entries = Vec::new();
+        for _ in 0..4 {
+            entries.push(enqueue_test_waiter(
+                set,
+                &ops,
+                SemBlockedOp {
+                    semnum: 0,
+                    wait_type: SemWaitType::Increase,
+                    nowait: false,
+                },
+            ));
+        }
+        set.remove_waiter(&entries[1]);
+        set.remove_waiter(&entries[1]); // An already detached node is harmless.
+        let remaining: Vec<_> = set.pending_alter.iter().collect();
+        assert_eq!(remaining.len(), 3);
+        for (actual, expected) in remaining.iter().zip([0, 2, 3]) {
+            assert!(Arc::ptr_eq(actual, &entries[expected]));
+        }
+        set.remove_waiter(&entries[0]);
+        set.remove_waiter(&entries[3]);
+        assert!(Arc::ptr_eq(
+            set.pending_alter.head.as_ref().unwrap(),
+            &entries[2]
+        ));
+        assert!(Arc::ptr_eq(
+            set.pending_alter.tail.as_ref().unwrap(),
+            &entries[2]
+        ));
+        set.remove_waiter(&entries[2]);
+        assert!(set.pending_is_empty());
+        for entry in entries {
+            assert!(entry.complete(Err(SystemError::EINTR)));
+        }
     }
 
     #[test]
@@ -2013,7 +2235,7 @@ mod tests {
                 waker,
                 blocker,
             ));
-            set.enqueue_waiter(entry.clone()).unwrap();
+            set.enqueue_waiter(entry.clone());
             (semid, entry)
         };
         let (pcb, group) = test_pcb_with_group(&ipc_ns);
@@ -2159,6 +2381,121 @@ mod tests {
     #[test]
     fn new_manager_starts_with_empty_undo_registry() {
         assert!(SemManager::new().id2sem.is_empty());
+    }
+
+    #[test]
+    fn create_tables_require_both_spares_and_recheck_growth() {
+        let mut manager = SemManager::new();
+        let key = SemKey::new(153);
+        let mut ids = HashMap::new();
+        let mut keys = HashMap::new();
+        ids.try_reserve(4).unwrap();
+        assert_eq!(
+            manager.install_create_tables(key, &mut ids, &mut keys),
+            Err((0, 4))
+        );
+        assert_eq!(manager.id2sem.capacity(), 0);
+        assert_eq!(manager.key2id.capacity(), 0);
+        keys.try_reserve(4).unwrap();
+        manager
+            .install_create_tables(key, &mut ids, &mut keys)
+            .unwrap();
+        while manager.id2sem.len() < manager.id2sem.capacity() {
+            let next_key = SemKey::new(200 + manager.id2sem.len());
+            insert_test_set(&mut manager, next_key, &[3]);
+        }
+        let count = manager.id2sem.len();
+        assert_eq!(manager.key2id.len(), count);
+        ids.try_reserve(count + 1).unwrap();
+        keys.try_reserve(count + 1).unwrap();
+        // Competing creations can consume the prepared headroom before the
+        // caller reacquires the lock. Neither live table may be moved yet.
+        while manager.id2sem.len() < ids.capacity() {
+            let next_key = SemKey::new(200 + manager.id2sem.len());
+            insert_test_set(&mut manager, next_key, &[3]);
+        }
+        let live_count = manager.id2sem.len();
+        let capacities = (manager.id2sem.capacity(), manager.key2id.capacity());
+        let (need_ids, need_keys) = manager
+            .install_create_tables(key, &mut ids, &mut keys)
+            .unwrap_err();
+        assert_eq!(
+            capacities,
+            (manager.id2sem.capacity(), manager.key2id.capacity())
+        );
+        assert_eq!(manager.id2sem.len(), live_count);
+        ids.try_reserve(need_ids).unwrap();
+        keys.try_reserve(need_keys).unwrap();
+        manager
+            .install_create_tables(key, &mut ids, &mut keys)
+            .unwrap();
+        assert_eq!(manager.id2sem.len(), live_count);
+        assert_eq!(manager.key2id.len(), live_count);
+        assert!(manager.id2sem.capacity() > live_count);
+        assert!(manager.key2id.capacity() > live_count);
+        assert!(ids.is_empty() && keys.is_empty());
+        assert_eq!((ids.capacity(), keys.capacity()), capacities);
+        for id in manager.key2id.values() {
+            assert_eq!(manager.get_by_semid_checked(*id).unwrap().sems[0].val, 3);
+        }
+    }
+
+    #[test]
+    fn semget_lookup_validates_before_preparing_storage() {
+        let mut manager = SemManager::new();
+        let key = SemKey::new(154);
+        insert_test_set(&mut manager, key, &[0]);
+        assert_eq!(
+            manager.lookup_semget(key, SEMMSL + 1, SemFlags::IPC_CREAT | SemFlags::IPC_EXCL),
+            Err(SystemError::EINVAL)
+        );
+        assert_eq!(
+            manager.lookup_semget(key, 2, SemFlags::IPC_CREAT | SemFlags::IPC_EXCL),
+            Err(SystemError::EEXIST)
+        );
+        assert_eq!(
+            manager.lookup_semget(key, 2, SemFlags::empty()),
+            Err(SystemError::EINVAL)
+        );
+        assert_eq!(
+            manager.lookup_semget(SemKey::new(155), 0, SemFlags::empty()),
+            Err(SystemError::ENOENT)
+        );
+        assert_eq!(
+            manager.lookup_semget(SemKey::new(155), 0, SemFlags::IPC_CREAT),
+            Err(SystemError::EINVAL)
+        );
+        assert_eq!(
+            manager.lookup_semget(IPC_PRIVATE, 1, SemFlags::IPC_EXCL),
+            Ok(None)
+        );
+        manager.total_sems = SEMMNS;
+        assert_eq!(
+            manager.lookup_semget(IPC_PRIVATE, 1, SemFlags::empty()),
+            Err(SystemError::ENOSPC)
+        );
+        assert_eq!(
+            manager.lookup_semget(IPC_PRIVATE, 0, SemFlags::empty()),
+            Err(SystemError::EINVAL)
+        );
+    }
+
+    #[test]
+    fn private_create_never_prepares_key_table() {
+        let mut manager = SemManager::new();
+        let mut ids = HashMap::new();
+        let mut keys = HashMap::new();
+        assert_eq!(
+            manager.install_create_tables(IPC_PRIVATE, &mut ids, &mut keys),
+            Err((4, 0))
+        );
+        ids.try_reserve(4).unwrap();
+        manager
+            .install_create_tables(IPC_PRIVATE, &mut ids, &mut keys)
+            .unwrap();
+        assert!(manager.id2sem.capacity() > 0);
+        assert_eq!(manager.key2id.capacity(), 0);
+        assert_eq!(keys.capacity(), 0);
     }
 
     #[test]
@@ -2311,7 +2648,7 @@ mod tests {
             },
         ));
         let set = manager.get_by_semid_checked_mut(semid).unwrap();
-        set.enqueue_waiter(entry.clone()).unwrap();
+        set.enqueue_waiter(entry.clone());
         set.sems[0].val = 1;
 
         manager.update_queue_for_test(semid);
@@ -2825,8 +3162,7 @@ mod tests {
         manager
             .get_by_semid_checked_mut(semid)
             .unwrap()
-            .enqueue_waiter(entry.clone())
-            .unwrap();
+            .enqueue_waiter(entry.clone());
         entry
     }
 

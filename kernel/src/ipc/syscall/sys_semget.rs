@@ -3,7 +3,7 @@ use crate::arch::interrupt::TrapFrame;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::{
     arch::syscall::nr::SYS_SEMGET,
-    ipc::sem::{SemFlags, SemKey},
+    ipc::sem::{SemFlags, SemKey, SemManager},
     process::ProcessManager,
     syscall::table::Syscall,
 };
@@ -37,8 +37,7 @@ impl Syscall for SysSemgetHandle {
         }
         let semflg = SemFlags::from_bits_truncate(args[2] as u32);
         let ipcns = ProcessManager::current_ipcns();
-        let mut guard = ipcns.sem.lock();
-        guard.semget(key, nsems as usize, semflg)
+        SemManager::semget(&ipcns, key, nsems as usize, semflg)
     }
 
     fn entry_format(&self, args: &[usize]) -> Vec<FormattedSyscallParam> {

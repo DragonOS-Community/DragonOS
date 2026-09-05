@@ -1,18 +1,27 @@
-use core::fmt::Debug;
+use core::{any::Any, fmt::Debug};
 
 use self::{dir::SysKernDirPriv, file::SysKernFilePriv};
 use super::{
-    kernfs::{KernFS, KernFSInode},
-    vfs::{FileSystem, FileSystemMakerData, InodeMode, MountableFileSystem, SuperBlock},
+    kernfs::{KernFS, KernFSInode, KernFSNamespaceTag},
+    vfs::{
+        DirectoryEntry, FileSystem, FileSystemMakerData, IndexNode, InodeMode, MountableFileSystem,
+        SuperBlock,
+    },
 };
 use crate::{
     driver::base::kobject::KObject,
     filesystem::vfs::{mount::MountFlags, FSMAKER},
     libs::{casting::DowncastArc, once::Once},
-    process::ProcessManager,
+    process::{
+        cred::{ns_capable, CAPFlags},
+        namespace::{
+            net_namespace::INIT_NET_NAMESPACE, user_namespace::UserNamespace, NamespaceOps,
+        },
+        ProcessManager,
+    },
     register_mountable_fs,
 };
-use alloc::sync::Arc;
+use alloc::{string::String, sync::Arc, vec::Vec};
 use log::{info, warn};
 use system_error::SystemError;
 
@@ -29,10 +38,6 @@ pub fn sysfs_instance() -> &'static SysFS {
     unsafe {
         return SYSFS_INSTANCE.as_deref().unwrap();
     }
-}
-
-pub fn sysfs_filesystem() -> Result<Arc<SysFS>, SystemError> {
-    unsafe { SYSFS_INSTANCE.as_ref().cloned().ok_or(SystemError::ENODEV) }
 }
 
 pub fn sysfs_init() -> Result<(), SystemError> {
@@ -209,6 +214,8 @@ bitflags! {
 pub struct SysFS {
     root_inode: Arc<KernFSInode>,
     kernfs: Arc<KernFS>,
+    netns_tag: KernFSNamespaceTag,
+    owner_user_ns: Arc<UserNamespace>,
 }
 
 impl SysFS {
@@ -217,13 +224,30 @@ impl SysFS {
 
         let root_inode: Arc<KernFSInode> = kernfs.root_inode().downcast_arc().unwrap();
 
-        let sysfs = SysFS { root_inode, kernfs };
+        // Sysfs is initialized before process management, so the boot mount
+        // binds explicitly to the initial network namespace.
+        let netns = INIT_NET_NAMESPACE.clone();
+        let sysfs = SysFS {
+            root_inode,
+            kernfs,
+            netns_tag: KernFSNamespaceTag::new(netns.ns_common().nsid.data()),
+            owner_user_ns: netns.user_ns().clone(),
+        };
 
         return sysfs;
     }
 
     pub fn root_inode(&self) -> &Arc<KernFSInode> {
         return &self.root_inode;
+    }
+
+    fn view_for(&self, netns_tag: KernFSNamespaceTag, owner_user_ns: Arc<UserNamespace>) -> Self {
+        Self {
+            root_inode: self.root_inode.clone(),
+            kernfs: self.kernfs.clone(),
+            netns_tag,
+            owner_user_ns,
+        }
     }
 
     /// 警告：重复的sysfs entry
@@ -244,6 +268,48 @@ impl FileSystem for SysFS {
 
     fn root_inode(&self) -> Arc<dyn super::vfs::IndexNode> {
         return self.root_inode.clone();
+    }
+
+    fn mount_owner_user_ns(&self) -> Option<Arc<UserNamespace>> {
+        Some(self.owner_user_ns.clone())
+    }
+
+    fn find_in_view(
+        &self,
+        inode: &Arc<dyn IndexNode>,
+        name: &str,
+    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+        let inode = inode
+            .clone()
+            .downcast_arc::<KernFSInode>()
+            .ok_or(SystemError::EINVAL)?;
+        inode.find_ns(name, self.netns_tag)
+    }
+
+    fn find_bytes_in_view(
+        &self,
+        inode: &Arc<dyn IndexNode>,
+        name: &[u8],
+    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+        let name = core::str::from_utf8(name).map_err(|_| SystemError::EIO)?;
+        self.find_in_view(inode, name)
+    }
+
+    fn list_in_view(&self, inode: &Arc<dyn IndexNode>) -> Result<Vec<String>, SystemError> {
+        let inode = inode
+            .clone()
+            .downcast_arc::<KernFSInode>()
+            .ok_or(SystemError::EINVAL)?;
+        inode.list_ns(self.netns_tag)
+    }
+
+    fn list_entries_in_view(
+        &self,
+        _inode: &Arc<dyn IndexNode>,
+    ) -> Result<Option<Vec<DirectoryEntry>>, SystemError> {
+        // Kernfs supplies names lazily; MountFS resolves their metadata through
+        // this same view, so no raw list_entries path can bypass filtering.
+        Ok(None)
     }
 
     fn info(&self) -> super::vfs::FsInfo {
@@ -271,14 +337,36 @@ impl MountableFileSystem for SysFS {
         _raw_data: Option<&str>,
         _source: &str,
     ) -> Result<Option<Arc<dyn FileSystemMakerData + 'static>>, SystemError> {
-        // sysfs 不需要任何额外的挂载数据
-        Ok(None)
+        let netns = ProcessManager::current_netns();
+        if !ns_capable(netns.user_ns(), CAPFlags::CAP_SYS_ADMIN) {
+            return Err(SystemError::EPERM);
+        }
+        Ok(Some(Arc::new(SysFSMountData {
+            netns_tag: KernFSNamespaceTag::new(netns.ns_common().nsid.data()),
+            owner_user_ns: netns.user_ns().clone(),
+        })))
     }
 
     fn make_fs(
-        _data: Option<&dyn FileSystemMakerData>,
+        data: Option<&dyn FileSystemMakerData>,
     ) -> Result<Arc<dyn FileSystem + 'static>, SystemError> {
-        Ok(sysfs_filesystem()?)
+        let data = data
+            .and_then(|data| data.as_any().downcast_ref::<SysFSMountData>())
+            .ok_or(SystemError::EINVAL)?;
+        Ok(Arc::new(
+            sysfs_instance().view_for(data.netns_tag, data.owner_user_ns.clone()),
+        ))
+    }
+}
+
+struct SysFSMountData {
+    netns_tag: KernFSNamespaceTag,
+    owner_user_ns: Arc<UserNamespace>,
+}
+
+impl FileSystemMakerData for SysFSMountData {
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 

@@ -77,6 +77,28 @@ impl SysFS {
         return Ok(dir);
     }
 
+    pub fn create_dir_ns(
+        &self,
+        kobj: Arc<dyn KObject>,
+        namespace: crate::filesystem::kernfs::KernFSNamespaceTag,
+    ) -> Result<Arc<KernFSInode>, SystemError> {
+        let parent = kobj
+            .parent()
+            .and_then(|parent| parent.upgrade())
+            .and_then(|parent| parent.inode())
+            .ok_or(SystemError::ENOENT)?;
+        let private = SysFSKernPrivateData::Dir(SysKernDirPriv::new(kobj.clone()));
+        let dir = parent.add_dir_ns(
+            kobj.name(),
+            InodeMode::from_bits_truncate(0o755),
+            Some(KernInodePrivateData::SysFS(private)),
+            None,
+            namespace,
+        )?;
+        kobj.set_inode(Some(dir.clone()));
+        Ok(dir)
+    }
+
     pub fn ensure_mount_point_path(
         &self,
         components: &[&str],
@@ -185,6 +207,39 @@ impl SysFS {
             .map_err(|_| SystemError::ENOMEM)?;
         path.push_str("/sys");
         path.push_str(&parent_path);
+        path.push('/');
+        path.push_str(child_name);
+        Ok(path)
+    }
+
+    /// Build a mount-independent relative link from `from_dir` to a child of
+    /// `target_parent`. Namespace-aware class links must not embed the boot
+    /// mount's `/sys` path because they are also exposed by later sysfs mounts.
+    pub(crate) fn child_relative_path(
+        &self,
+        from_dir: &Arc<KernFSInode>,
+        target_parent: &Arc<KernFSInode>,
+        child_name: &str,
+    ) -> Result<String, SystemError> {
+        let from_path = self.try_kernfs_path(from_dir)?;
+        let target_path = self.try_kernfs_path(target_parent)?;
+        let parent_depth = from_path
+            .split('/')
+            .filter(|component| !component.is_empty())
+            .count();
+        let mut path = String::new();
+        let capacity = parent_depth
+            .checked_mul(3)
+            .and_then(|length| length.checked_add(target_path.len().saturating_sub(1)))
+            .and_then(|length| length.checked_add(1))
+            .and_then(|length| length.checked_add(child_name.len()))
+            .ok_or(SystemError::ENOMEM)?;
+        path.try_reserve_exact(capacity)
+            .map_err(|_| SystemError::ENOMEM)?;
+        for _ in 0..parent_depth {
+            path.push_str("../");
+        }
+        path.push_str(target_path.trim_start_matches('/'));
         path.push('/');
         path.push_str(child_name);
         Ok(path)

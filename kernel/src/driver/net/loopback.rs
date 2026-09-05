@@ -552,6 +552,10 @@ impl Device for LoopbackInterface {
 }
 
 impl Iface for LoopbackInterface {
+    fn destroy_on_netns_exit(&self) -> bool {
+        true
+    }
+
     fn common(&self) -> &IfaceCommon {
         &self.common
     }

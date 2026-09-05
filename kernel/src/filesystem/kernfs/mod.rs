@@ -1,5 +1,10 @@
 use alloc::string::ToString;
-use core::{cmp::min, fmt::Debug, intrinsics::unlikely};
+use core::{
+    cmp::min,
+    fmt::Debug,
+    intrinsics::unlikely,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 use alloc::{
     string::String,
@@ -30,6 +35,130 @@ pub mod callback;
 mod rename;
 
 pub use rename::{KernFSRenameSpec, PreparedKernFSRename};
+
+/// Stable identity used to distinguish same-named children in a
+/// namespace-aware kernfs directory. It deliberately contains no namespace
+/// object reference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct KernFSNamespaceTag(usize);
+
+impl KernFSNamespaceTag {
+    pub const fn new(value: usize) -> Self {
+        Self(value)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct KernFSChildKey {
+    name: String,
+    namespace: Option<KernFSNamespaceTag>,
+}
+
+impl KernFSChildKey {
+    fn new(name: String, namespace: Option<KernFSNamespaceTag>) -> Self {
+        Self { name, namespace }
+    }
+}
+
+pub(crate) struct KernFSChildKeyRef<'a> {
+    name: &'a str,
+    namespace: Option<KernFSNamespaceTag>,
+}
+
+impl<'a> KernFSChildKeyRef<'a> {
+    pub(crate) fn new(name: &'a str, namespace: Option<KernFSNamespaceTag>) -> Self {
+        Self { name, namespace }
+    }
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct KernFSChildren {
+    buckets: HashMap<Option<KernFSNamespaceTag>, HashMap<String, Arc<KernFSInode>>>,
+}
+
+impl KernFSChildren {
+    pub(crate) fn get(&self, key: &KernFSChildKeyRef<'_>) -> Option<&Arc<KernFSInode>> {
+        self.buckets
+            .get(&key.namespace)
+            .and_then(|bucket| bucket.get(key.name))
+    }
+
+    pub(crate) fn contains_key(&self, key: &KernFSChildKeyRef<'_>) -> bool {
+        self.get(key).is_some()
+    }
+
+    pub(crate) fn insert(
+        &mut self,
+        key: KernFSChildKey,
+        inode: Arc<KernFSInode>,
+    ) -> Option<Arc<KernFSInode>> {
+        self.buckets
+            .entry(key.namespace)
+            .or_default()
+            .insert(key.name, inode)
+    }
+
+    pub(crate) fn remove(&mut self, key: &KernFSChildKeyRef<'_>) -> Option<Arc<KernFSInode>> {
+        let (removed, bucket_empty) = {
+            let bucket = self.buckets.get_mut(&key.namespace)?;
+            let removed = bucket.remove(key.name);
+            (removed, bucket.is_empty())
+        };
+        if bucket_empty {
+            self.buckets.remove(&key.namespace);
+        }
+        removed
+    }
+
+    /// Re-key an existing child without removing its namespace bucket. Rename
+    /// commit relies on this operation being allocation-free after prepare.
+    pub(crate) fn rekey(
+        &mut self,
+        old_key: &KernFSChildKeyRef<'_>,
+        new_key: KernFSChildKey,
+    ) -> Option<()> {
+        if old_key.namespace != new_key.namespace {
+            return None;
+        }
+        let bucket = self.buckets.get_mut(&old_key.namespace)?;
+        let inode = bucket.remove(old_key.name)?;
+        // Removing one entry before inserting its replacement guarantees that
+        // the existing bucket has enough capacity; commit must not allocate.
+        let replaced = bucket.insert(new_key.name, inode);
+        debug_assert!(replaced.is_none());
+        Some(())
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.buckets.is_empty()
+    }
+
+    fn find_name_by_inode(&self, ino: InodeId) -> Option<String> {
+        self.buckets.values().find_map(|bucket| {
+            bucket
+                .iter()
+                .find(|(_, inode)| inode.metadata().unwrap().inode_id == ino)
+                .map(|(name, _)| name.clone())
+        })
+    }
+
+    fn namespace_len(&self, namespace: Option<KernFSNamespaceTag>) -> usize {
+        self.buckets.get(&namespace).map_or(0, HashMap::len)
+    }
+
+    fn extend_names(&self, namespace: Option<KernFSNamespaceTag>, names: &mut Vec<String>) {
+        if let Some(bucket) = self.buckets.get(&namespace) {
+            names.extend(bucket.keys().cloned());
+        }
+    }
+
+    fn drain_values(&mut self) -> Vec<Arc<KernFSInode>> {
+        self.buckets
+            .drain()
+            .flat_map(|(_, bucket)| bucket.into_values())
+            .collect()
+    }
+}
 
 #[derive(Debug)]
 pub struct KernFS {
@@ -120,7 +249,9 @@ impl KernFS {
             fs: RwSem::new(Weak::new()),
             private_data: Mutex::new(None),
             callback: None,
-            children: Mutex::new(HashMap::new()),
+            children: Mutex::new(KernFSChildren::default()),
+            namespace: None,
+            namespace_children: AtomicBool::new(false),
             child_mutation: Mutex::new(()),
             inode_type: KernInodeType::Dir,
             lazy_list: Mutex::new(HashMap::new()),
@@ -143,7 +274,11 @@ pub struct KernFSInode {
     /// 回调函数
     callback: Option<&'static dyn KernFSCallback>,
     /// 子Inode
-    children: Mutex<HashMap<String, Arc<KernFSInode>>>,
+    children: Mutex<KernFSChildren>,
+    /// Namespace identity of this inode in its parent's child map.
+    namespace: Option<KernFSNamespaceTag>,
+    /// Whether direct children must carry a namespace tag.
+    namespace_children: AtomicBool,
     /// Serializes every mutation of `children` and `lazy_list` for this
     /// directory. Readers keep using the map locks directly.
     child_mutation: Mutex<()>,
@@ -298,7 +433,11 @@ impl IndexNode for KernFSInode {
                     .ok_or(SystemError::ENOENT)?);
             }
             name => {
-                if let Some(child) = self.children.lock().get(name).cloned() {
+                if self.namespace_children.load(Ordering::Acquire) {
+                    return Err(SystemError::ENOENT);
+                }
+                let key = KernFSChildKeyRef::new(name, None);
+                if let Some(child) = self.children.lock().get(&key).cloned() {
                     return Ok(child);
                 }
 
@@ -315,10 +454,7 @@ impl IndexNode for KernFSInode {
         }
 
         let children = self.children.lock();
-        let r = children
-            .iter()
-            .find(|(_, v)| v.metadata().unwrap().inode_id == ino)
-            .map(|(k, _)| k.clone());
+        let r = children.find_name_by_inode(ino);
 
         return r.ok_or(SystemError::ENOENT);
     }
@@ -359,13 +495,14 @@ impl IndexNode for KernFSInode {
             return Err(SystemError::ENOTDIR);
         }
 
-        let mut keys: Vec<String> = Vec::new();
+        let children = self.children.lock();
+        let mut keys = Vec::with_capacity(children.namespace_len(None) + 2);
         keys.push(String::from("."));
         keys.push(String::from(".."));
-        self.children
-            .lock()
-            .keys()
-            .for_each(|x| keys.push(x.clone()));
+        if self.namespace_children.load(Ordering::Acquire) {
+            return Err(SystemError::ENOENT);
+        }
+        children.extend_names(None, &mut keys);
 
         return Ok(keys);
     }
@@ -449,16 +586,109 @@ impl IndexNode for KernFSInode {
 }
 
 impl KernFSInode {
+    pub fn namespace(&self) -> Option<KernFSNamespaceTag> {
+        self.namespace
+    }
+
+    pub fn namespace_children_enabled(&self) -> bool {
+        self.namespace_children.load(Ordering::Acquire)
+    }
+
+    /// Make direct children namespace-aware. Like Linux kernfs, this is an
+    /// irreversible directory property and is only valid before children or
+    /// lazy entries are published.
+    pub fn enable_namespace_children(&self) -> Result<(), SystemError> {
+        if self.inode_type != KernInodeType::Dir {
+            return Err(SystemError::ENOTDIR);
+        }
+        let _mutation = self.child_mutation.lock();
+        if !self.children.lock().is_empty() || !self.lazy_list.lock().is_empty() {
+            return Err(SystemError::ENOTEMPTY);
+        }
+        self.namespace_children.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    pub fn find_ns(
+        &self,
+        name: &str,
+        namespace: KernFSNamespaceTag,
+    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+        if name.len() > KernFS::MAX_NAMELEN {
+            return Err(SystemError::ENAMETOOLONG);
+        }
+        if self.inode_type != KernInodeType::Dir {
+            return Err(SystemError::ENOTDIR);
+        }
+        match name {
+            "" | "." => self
+                .self_ref
+                .upgrade()
+                .map(|inode| inode as Arc<dyn IndexNode>)
+                .ok_or(SystemError::ENOENT),
+            ".." => self
+                .inner
+                .read()
+                .parent
+                .upgrade()
+                .map(|inode| inode as Arc<dyn IndexNode>)
+                .ok_or(SystemError::ENOENT),
+            name if self.namespace_children.load(Ordering::Acquire) => self
+                .children
+                .lock()
+                .get(&KernFSChildKeyRef::new(name, Some(namespace)))
+                .cloned()
+                .map(|inode| inode as Arc<dyn IndexNode>)
+                .ok_or(SystemError::ENOENT),
+            name => self.find(name),
+        }
+    }
+
+    pub fn list_ns(&self, namespace: KernFSNamespaceTag) -> Result<Vec<String>, SystemError> {
+        if self.inode_type != KernInodeType::Dir {
+            return Err(SystemError::ENOTDIR);
+        }
+        if !self.namespace_children.load(Ordering::Acquire) {
+            return self.list();
+        }
+        let children = self.children.lock();
+        let mut names = Vec::with_capacity(children.namespace_len(Some(namespace)) + 2);
+        names.push(".".to_string());
+        names.push("..".to_string());
+        children.extend_names(Some(namespace), &mut names);
+        Ok(names)
+    }
+
     /// Create a new KernFSInode with a parent.
     /// Uses Arc::new_cyclic to safely initialize self_ref without unsafe code.
     /// After construction, sets the fs reference from parent if available.
     pub fn new_with_parent(
         parent: Option<Arc<KernFSInode>>,
         name: String,
+        metadata: Metadata,
+        inode_type: KernInodeType,
+        private_data: Option<KernInodePrivateData>,
+        callback: Option<&'static dyn KernFSCallback>,
+    ) -> Arc<KernFSInode> {
+        Self::new_with_parent_ns(
+            parent,
+            name,
+            metadata,
+            inode_type,
+            private_data,
+            callback,
+            None,
+        )
+    }
+
+    fn new_with_parent_ns(
+        parent: Option<Arc<KernFSInode>>,
+        name: String,
         mut metadata: Metadata,
         inode_type: KernInodeType,
         private_data: Option<KernInodePrivateData>,
         callback: Option<&'static dyn KernFSCallback>,
+        namespace: Option<KernFSNamespaceTag>,
     ) -> Arc<KernFSInode> {
         metadata.file_type = inode_type.into();
 
@@ -474,7 +704,9 @@ impl KernFSInode {
             fs: RwSem::new(Weak::new()),
             private_data: Mutex::new(private_data),
             callback,
-            children: Mutex::new(HashMap::new()),
+            children: Mutex::new(KernFSChildren::default()),
+            namespace,
+            namespace_children: AtomicBool::new(false),
             child_mutation: Mutex::new(()),
             inode_type,
             lazy_list: Mutex::new(HashMap::new()),
@@ -535,6 +767,27 @@ impl KernFSInode {
         return self.inner_create(name, KernInodeType::Dir, mode, 0, private_data, callback);
     }
 
+    pub fn add_dir_ns(
+        &self,
+        name: String,
+        mode: InodeMode,
+        private_data: Option<KernInodePrivateData>,
+        callback: Option<&'static dyn KernFSCallback>,
+        namespace: KernFSNamespaceTag,
+    ) -> Result<Arc<KernFSInode>, SystemError> {
+        self.inner_create_ns(
+            name,
+            KernFSInodeArgs {
+                mode,
+                inode_type: KernInodeType::Dir,
+                size: Some(0),
+                private_data,
+                callback,
+            },
+            Some(namespace),
+        )
+    }
+
     /// 在当前inode下增加文件
     ///
     /// ## 参数
@@ -583,11 +836,15 @@ impl KernFSInode {
         if unlikely(self.inode_type != KernInodeType::Dir) {
             return Err(SystemError::ENOTDIR);
         }
-
         let _mutation = self.child_mutation.lock();
+        if self.namespace_children.load(Ordering::Acquire) {
+            return Err(SystemError::EINVAL);
+        }
         let children = self.children.lock();
         let mut lazy_list = self.lazy_list.lock();
-        if children.contains_key(&name) || lazy_list.contains_key(&name) {
+        if children.contains_key(&KernFSChildKeyRef::new(&name, None))
+            || lazy_list.contains_key(&name)
+        {
             return Err(SystemError::EEXIST);
         }
 
@@ -598,7 +855,12 @@ impl KernFSInode {
     fn materialize_lazy_child(&self, name: &str) -> Result<Arc<KernFSInode>, SystemError> {
         let _build_guard = self.lazy_build_lock.lock();
 
-        if let Some(child) = self.children.lock().get(name).cloned() {
+        if let Some(child) = self
+            .children
+            .lock()
+            .get(&KernFSChildKeyRef::new(name, None))
+            .cloned()
+        {
             return Ok(child);
         }
 
@@ -610,27 +872,23 @@ impl KernFSInode {
             .ok_or(SystemError::ENOENT)?;
 
         let args = provider();
-        let inode = self.new_child_inode(
-            name.to_string(),
-            args.inode_type,
-            args.mode,
-            args.size.unwrap_or(4096),
-            args.private_data,
-            args.callback,
-        );
+        let inode = self.new_child_inode(name.to_string(), args, None);
 
         let _mutation = self.child_mutation.lock();
         let mut children = self.children.lock();
-        if let Some(child) = children.get(name).cloned() {
+        if let Some(child) = children.get(&KernFSChildKeyRef::new(name, None)).cloned() {
             return Ok(child);
         }
 
         let mut lazy_list = self.lazy_list.lock();
         if lazy_list.remove(name).is_none() {
-            return children.get(name).cloned().ok_or(SystemError::ENOENT);
+            return children
+                .get(&KernFSChildKeyRef::new(name, None))
+                .cloned()
+                .ok_or(SystemError::ENOENT);
         }
 
-        children.insert(name.to_string(), inode.clone());
+        children.insert(KernFSChildKey::new(name.to_string(), None), inode.clone());
         Ok(inode)
     }
 
@@ -643,17 +901,39 @@ impl KernFSInode {
         private_data: Option<KernInodePrivateData>,
         callback: Option<&'static dyn KernFSCallback>,
     ) -> Result<Arc<KernFSInode>, SystemError> {
+        self.inner_create_ns(
+            name,
+            KernFSInodeArgs {
+                mode,
+                inode_type: file_type,
+                size: Some(size),
+                private_data,
+                callback,
+            },
+            None,
+        )
+    }
+
+    fn inner_create_ns(
+        &self,
+        name: String,
+        args: KernFSInodeArgs,
+        namespace: Option<KernFSNamespaceTag>,
+    ) -> Result<Arc<KernFSInode>, SystemError> {
         let _mutation = self.child_mutation.lock();
+        if self.namespace_children.load(Ordering::Acquire) != namespace.is_some() {
+            return Err(SystemError::EINVAL);
+        }
         let mut children = self.children.lock();
         let lazy_list = self.lazy_list.lock();
-        if children.contains_key(&name) || lazy_list.contains_key(&name) {
+        let borrowed_key = KernFSChildKeyRef::new(&name, namespace);
+        if children.contains_key(&borrowed_key) || lazy_list.contains_key(&name) {
             return Err(SystemError::EEXIST);
         }
 
-        let new_inode =
-            self.new_child_inode(name.clone(), file_type, mode, size, private_data, callback);
+        let new_inode = self.new_child_inode(name.clone(), args, namespace);
 
-        children.insert(name, new_inode.clone());
+        children.insert(KernFSChildKey::new(name, namespace), new_inode.clone());
 
         return Ok(new_inode);
     }
@@ -661,22 +941,17 @@ impl KernFSInode {
     fn new_child_inode(
         &self,
         name: String,
-        file_type: KernInodeType,
-        mode: InodeMode,
-        mut size: usize,
-        private_data: Option<KernInodePrivateData>,
-        callback: Option<&'static dyn KernFSCallback>,
+        args: KernFSInodeArgs,
+        namespace: Option<KernFSNamespaceTag>,
     ) -> Arc<KernFSInode> {
-        match file_type {
-            KernInodeType::Dir | KernInodeType::SymLink => {
-                size = 0;
-            }
-            _ => {}
-        }
+        let size = match args.inode_type {
+            KernInodeType::Dir | KernInodeType::SymLink => 0,
+            _ => args.size.unwrap_or(4096),
+        };
 
         let metadata = Metadata {
             size: size as i64,
-            mode,
+            mode: args.mode,
             uid: 0,
             gid: 0,
             blk_size: 0,
@@ -687,19 +962,20 @@ impl KernFSInode {
             btime: PosixTimeSpec::new(0, 0),
             dev_id: 0,
             inode_id: generate_inode_id(),
-            file_type: file_type.into(),
+            file_type: args.inode_type.into(),
             nlinks: 1,
             raw_dev: DeviceNumber::default(),
             flags: InodeFlags::empty(),
         };
 
-        Self::new_with_parent(
+        Self::new_with_parent_ns(
             Some(self.self_ref.upgrade().unwrap()),
             name,
             metadata,
-            file_type,
-            private_data,
-            callback,
+            args.inode_type,
+            args.private_data,
+            args.callback,
+            namespace,
         )
     }
 
@@ -717,15 +993,35 @@ impl KernFSInode {
     /// - 失败：错误码
     #[allow(dead_code)]
     pub fn remove(&self, name: &str) -> Result<(), SystemError> {
+        self.remove_ns(name, None)
+    }
+
+    pub fn remove_in_namespace(
+        &self,
+        name: &str,
+        namespace: KernFSNamespaceTag,
+    ) -> Result<(), SystemError> {
+        self.remove_ns(name, Some(namespace))
+    }
+
+    fn remove_ns(
+        &self,
+        name: &str,
+        namespace: Option<KernFSNamespaceTag>,
+    ) -> Result<(), SystemError> {
         if unlikely(self.inode_type != KernInodeType::Dir) {
             return Err(SystemError::ENOTDIR);
+        }
+        if self.namespace_children.load(Ordering::Acquire) != namespace.is_some() {
+            return Err(SystemError::EINVAL);
         }
 
         let _mutation = self.child_mutation.lock();
         let mut children = self.children.lock();
-        let inode = children.get(name).ok_or(SystemError::ENOENT)?;
+        let key = KernFSChildKeyRef::new(name, namespace);
+        let inode = children.get(&key).ok_or(SystemError::ENOENT)?;
         if inode.children.lock().is_empty() {
-            children.remove(name);
+            children.remove(&key);
             return Ok(());
         } else {
             return Err(SystemError::ENOTEMPTY);
@@ -750,13 +1046,31 @@ impl KernFSInode {
         target_absolute_path: String,
     ) -> Result<Arc<KernFSInode>, SystemError> {
         // debug!("kernfs add link: name:{name}, target path={target_absolute_path}");
-        let inode = self.inner_create(
+        let namespace = if self.namespace_children.load(Ordering::Acquire) {
+            Some(target.namespace().ok_or(SystemError::EINVAL)?)
+        } else {
+            None
+        };
+        self.add_link_ns(name, target, target_absolute_path, namespace)
+    }
+
+    fn add_link_ns(
+        &self,
+        name: String,
+        target: &Arc<KernFSInode>,
+        target_absolute_path: String,
+        namespace: Option<KernFSNamespaceTag>,
+    ) -> Result<Arc<KernFSInode>, SystemError> {
+        let inode = self.inner_create_ns(
             name,
-            KernInodeType::SymLink,
-            InodeMode::S_IFLNK | InodeMode::S_IRWXUGO,
-            0,
-            None,
-            None,
+            KernFSInodeArgs {
+                mode: InodeMode::S_IFLNK | InodeMode::S_IRWXUGO,
+                inode_type: KernInodeType::SymLink,
+                size: Some(0),
+                private_data: None,
+                callback: None,
+            },
+            namespace,
         )?;
 
         inode.inner.write().symlink_target = Some(Arc::downgrade(target));
@@ -804,12 +1118,12 @@ impl KernFSInode {
     pub fn remove_recursive(&self) {
         let mut children = {
             let _mutation = self.child_mutation.lock();
-            self.children.lock().drain().collect::<Vec<_>>()
+            self.children.lock().drain_values()
         };
-        while let Some((_, child)) = children.pop() {
+        while let Some(child) = children.pop() {
             let mut descendants = {
                 let _mutation = child.child_mutation.lock();
-                child.children.lock().drain().collect::<Vec<_>>()
+                child.children.lock().drain_values()
             };
             children.append(&mut descendants);
         }
@@ -822,7 +1136,10 @@ impl KernFSInode {
         if let Some(parent) = parent {
             let name = self.name();
             let _mutation = parent.child_mutation.lock();
-            parent.children.lock().remove(&name);
+            parent
+                .children
+                .lock()
+                .remove(&KernFSChildKeyRef::new(&name, self.namespace));
         }
         self.remove_recursive();
     }

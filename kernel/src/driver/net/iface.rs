@@ -114,6 +114,13 @@ pub trait Iface: crate::driver::base::device::Device {
     /// 获取网卡的公共信息
     fn common(&self) -> &IfaceCommon;
 
+    /// Whether this software device may be destroyed when its owning
+    /// non-initial network namespace reaches final release. Devices which
+    /// require Linux-style migration back to init_net keep the default.
+    fn destroy_on_netns_exit(&self) -> bool {
+        false
+    }
+
     /// # `mac`
     /// 获取网卡的MAC地址
     ///
@@ -561,13 +568,21 @@ impl Default for NetDeviceCommonData {
 
 /// 将网络设备注册到sysfs中
 /// 参考：https://code.dragonos.org.cn/xref/linux-2.6.39/net/core/dev.c?fi=register_netdev#5373
-pub(super) fn register_netdevice(
+pub(crate) fn register_netdevice(
     netns: &Arc<NetNamespace>,
     dev: Arc<dyn Iface>,
 ) -> Result<(), SystemError> {
+    if !Arc::ptr_eq(
+        netns,
+        &crate::process::namespace::net_namespace::INIT_NET_NAMESPACE,
+    ) && !dev.destroy_on_netns_exit()
+    {
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+    }
+
     // Register driver-core/sysfs first. Until PRESENT and the namespace/FIB
     // transaction both commit, the object is provisional and unannounced.
-    netdev_register_kobject(dev.clone())?;
+    netdev_register_kobject(netns, dev.clone())?;
     if let Err(error) = register_netdevice_in_namespace(netns, dev.clone()) {
         // No add uevent has been sent, so rollback is structural and must not
         // allocate notification state before removing the provisional object.

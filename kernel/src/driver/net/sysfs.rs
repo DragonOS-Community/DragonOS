@@ -7,6 +7,7 @@ use crate::{
         kobject::KObject,
     },
     filesystem::{
+        kernfs::KernFSNamespaceTag,
         sysfs::{
             file::sysfs_emit_str, Attribute, AttributeGroup, SysFSOpsSupport, SYSFS_ATTR_MODE_RO,
             SYSFS_ATTR_MODE_RW,
@@ -21,10 +22,14 @@ use log::{error, warn};
 use system_error::SystemError;
 
 use super::{class::sys_class_net_instance, Iface, NetDeivceState, Operstate};
+use crate::process::namespace::{net_namespace::NetNamespace, NamespaceOps};
 
 /// 将设备注册到`/sys/class/net`目录下
 /// 参考：https://code.dragonos.org.cn/xref/linux-2.6.39/net/core/net-sysfs.c?fi=netdev_register_kobject#1311
-pub fn netdev_register_kobject(dev: Arc<dyn Iface>) -> Result<(), SystemError> {
+pub fn netdev_register_kobject(
+    netns: &Arc<NetNamespace>,
+    dev: Arc<dyn Iface>,
+) -> Result<(), SystemError> {
     let device = dev.clone() as Arc<dyn Device>;
 
     // 初始化设备
@@ -38,7 +43,8 @@ pub fn netdev_register_kobject(dev: Arc<dyn Iface>) -> Result<(), SystemError> {
     // 设置设备的kobject名
     dev.set_name(dev.iface_name());
 
-    if let Err(error) = device_manager().add_device(device.clone()) {
+    let tag = KernFSNamespaceTag::new(netns.ns_common().nsid.data());
+    if let Err(error) = device_manager().add_device_with_namespace(device.clone(), tag) {
         // Driver-core currently exposes a fallible multi-stage add path. If a
         // late stage fails after publishing IN_SYSFS, use its structural
         // teardown path before returning the registration error. No uevent
@@ -63,7 +69,8 @@ pub fn netdev_unregister_kobject(dev: Arc<dyn Iface>) {
 }
 
 /// Prepares the sysfs half of a netdevice rename without changing the logical
-/// interface name. Non-initial namespaces deliberately have no sysfs object.
+/// interface name. The device inode's namespace tag selects the matching
+/// class link while preserving both inode identities.
 pub(crate) fn prepare_netdev_sysfs_rename(
     dev: &Arc<dyn Iface>,
     new_name: String,

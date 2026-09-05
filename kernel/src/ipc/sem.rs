@@ -253,7 +253,10 @@ struct SemBlockedOp {
 #[derive(Debug)]
 enum SemQueueStatus {
     Queued(SemBlockedOp),
-    Completed(Result<usize, SystemError>),
+    Completed {
+        result: Result<usize, SystemError>,
+        next_wake: Option<Arc<SemQueueEntry>>,
+    },
 }
 
 /// An Arc-owned queue entry shared by the set and the blocked caller.
@@ -331,7 +334,7 @@ impl SemQueueEntry {
     fn completed_result(&self) -> Option<Result<usize, SystemError>> {
         match &*self.status.lock() {
             SemQueueStatus::Queued(_) => None,
-            SemQueueStatus::Completed(result) => Some(result.clone()),
+            SemQueueStatus::Completed { result, .. } => Some(result.clone()),
         }
     }
 
@@ -344,10 +347,13 @@ impl SemQueueEntry {
 
     fn complete(&self, result: Result<usize, SystemError>) -> bool {
         let mut status = self.status.lock();
-        if matches!(&*status, SemQueueStatus::Completed(_)) {
+        if matches!(&*status, SemQueueStatus::Completed { .. }) {
             return false;
         }
-        *status = SemQueueStatus::Completed(result);
+        *status = SemQueueStatus::Completed {
+            result,
+            next_wake: None,
+        };
         true
     }
 
@@ -357,6 +363,50 @@ impl SemQueueEntry {
             SemQueueStatus::Queued(blocker)
                 if blocker.semnum == semnum && blocker.wait_type == wait_type
         )
+    }
+}
+
+/// Per-operation completion list. The existing entry status lock protects the
+/// link; no allocation or scheduler operation is needed while the set is locked.
+/// Declare this before manager guards so all exits wake only after unlocking.
+#[derive(Default)]
+pub(crate) struct SemWakeBatch {
+    head: Option<Arc<SemQueueEntry>>,
+    tail: Option<Arc<SemQueueEntry>>,
+}
+
+impl SemWakeBatch {
+    fn complete(&mut self, entry: Arc<SemQueueEntry>, result: Result<usize, SystemError>) {
+        if !entry.complete(result) {
+            return;
+        }
+        if let Some(tail) = self.tail.take() {
+            if let SemQueueStatus::Completed { next_wake, .. } = &mut *tail.status.lock() {
+                *next_wake = Some(entry.clone());
+            }
+        } else {
+            self.head = Some(entry.clone());
+        }
+        self.tail = Some(entry);
+    }
+
+    pub(crate) fn wake_all(&mut self) {
+        self.tail = None;
+        while let Some(entry) = self.head.take() {
+            self.head = match &mut *entry.status.lock() {
+                SemQueueStatus::Completed { next_wake, .. } => next_wake.take(),
+                SemQueueStatus::Queued(_) => unreachable!("wake batch contains queued entry"),
+            };
+            // Release the status lock before entering the scheduler. Detaching
+            // each link also prevents recursive Arc destruction for large batches.
+            entry.waker.wake();
+        }
+    }
+}
+
+impl Drop for SemWakeBatch {
+    fn drop(&mut self) {
+        self.wake_all();
     }
 }
 
@@ -370,6 +420,8 @@ enum SemPendingQueue {
 /// Semaphore set
 #[derive(Debug)]
 pub struct KernelSemSet {
+    /// Groups that can carry undo debt for this set, including queued operations.
+    undo_groups: Vec<Weak<SemUndoGroup>>,
     /// Permission information
     pub kern_ipc_perm: IpcPerm,
     /// Semaphores in the set
@@ -385,6 +437,38 @@ pub struct KernelSemSet {
 }
 
 impl KernelSemSet {
+    /// Live associations survive SETVAL/SETALL. Only RMID or dead groups
+    /// remove them, so an existing undo record proves prior association.
+    /// Insufficient spare capacity requests an unlocked preparation/retry.
+    /// On success, spare retains any replaced allocation for unlocked disposal.
+    fn ensure_undo_group_registered_prepared(
+        &mut self,
+        group: &Arc<SemUndoGroup>,
+        spare: &mut Vec<Weak<SemUndoGroup>>,
+    ) -> Result<(), usize> {
+        debug_assert!(spare.is_empty());
+        let candidate = Arc::downgrade(group);
+        if self.undo_groups.iter().any(|weak| weak.ptr_eq(&candidate)) {
+            return Ok(());
+        }
+        if self.undo_groups.len() == self.undo_groups.capacity() {
+            self.compact_undo_registry();
+        }
+        if self.undo_groups.len() == self.undo_groups.capacity() {
+            if spare.capacity() <= self.undo_groups.len() {
+                return Err(self.undo_groups.len().saturating_mul(2).max(4));
+            }
+            spare.append(&mut self.undo_groups);
+            core::mem::swap(&mut self.undo_groups, spare);
+        }
+        self.undo_groups.push(candidate);
+        Ok(())
+    }
+
+    fn compact_undo_registry(&mut self) {
+        self.undo_groups.retain(|weak| weak.strong_count() != 0);
+    }
+
     fn try_allocate_sems(nsems: usize) -> Result<Vec<KernelSem>, SystemError> {
         let mut sems = Vec::new();
         sems.try_reserve_exact(nsems)
@@ -395,6 +479,7 @@ impl KernelSemSet {
 
     fn new(kern_ipc_perm: IpcPerm, sems: Vec<KernelSem>) -> Self {
         KernelSemSet {
+            undo_groups: Vec::new(),
             kern_ipc_perm,
             sems,
             sem_otime: 0,
@@ -483,15 +568,13 @@ impl KernelSemSet {
         };
     }
 
-    /// Complete and wake all entries during IPC_RMID under the manager lock.
-    fn complete_all_removed(&mut self) {
+    /// Publish removal under the manager lock; the caller wakes after unlocking.
+    fn complete_all_removed(&mut self, wakes: &mut SemWakeBatch) {
         for entry in self.pending_const.drain(..) {
-            entry.complete(Err(SystemError::EIDRM));
-            entry.waker.wake();
+            wakes.complete(entry, Err(SystemError::EIDRM));
         }
         for entry in self.pending_alter.drain(..) {
-            entry.complete(Err(SystemError::EIDRM));
-            entry.waker.wake();
+            wakes.complete(entry, Err(SystemError::EIDRM));
         }
     }
 
@@ -612,8 +695,6 @@ pub struct SemManager {
     key2id: HashMap<SemKey, SemId>,
     /// Total semaphores in the namespace (Linux semmns accounting)
     total_sems: usize,
-    #[allow(dead_code)]
-    undo_groups: Vec<Weak<SemUndoGroup>>,
 }
 
 impl Default for SemManager {
@@ -632,7 +713,6 @@ impl SemManager {
             id2sem: HashMap::new(),
             key2id: HashMap::new(),
             total_sems: 0,
-            undo_groups: Vec::new(),
         }
     }
 
@@ -667,45 +747,20 @@ impl SemManager {
         Ok(self.get_by_semid_checked(semid)?.sems.len())
     }
 
-    /// Serialize registration with control operations using the manager lock.
-    /// A live group remains registered even when all of its debt is cleared.
-    /// Insufficient spare capacity requests an unlocked preparation/retry.
-    /// On success, spare retains any replaced allocation for unlocked disposal.
-    fn ensure_undo_group_registered_prepared(
-        &mut self,
-        group: &Arc<SemUndoGroup>,
-        spare: &mut Vec<Weak<SemUndoGroup>>,
-    ) -> Result<(), usize> {
-        debug_assert!(spare.is_empty());
-        if group.registry_registered() {
-            return Ok(());
-        }
-        if self.undo_groups.len() == self.undo_groups.capacity() {
-            self.compact_undo_registry();
-        }
-        if self.undo_groups.len() == self.undo_groups.capacity() {
-            if spare.capacity() <= self.undo_groups.len() {
-                return Err(self.undo_groups.len().saturating_mul(2).max(4));
-            }
-            spare.append(&mut self.undo_groups);
-            core::mem::swap(&mut self.undo_groups, spare);
-        }
-        self.undo_groups.push(Arc::downgrade(group));
-        group.mark_registry_registered();
-        Ok(())
-    }
-
+    /// Test-only setup; production reserves registry storage before locking.
     #[cfg(test)]
     fn ensure_undo_group_registered(
         &mut self,
         group: &Arc<SemUndoGroup>,
+        semid: SemId,
     ) -> Result<(), SystemError> {
+        let set = self.get_by_semid_checked_mut(semid)?;
         let mut spare = Vec::new();
-        if let Err(capacity) = self.ensure_undo_group_registered_prepared(group, &mut spare) {
+        if let Err(capacity) = set.ensure_undo_group_registered_prepared(group, &mut spare) {
             spare
                 .try_reserve(capacity)
                 .map_err(|_| SystemError::ENOMEM)?;
-            self.ensure_undo_group_registered_prepared(group, &mut spare)
+            set.ensure_undo_group_registered_prepared(group, &mut spare)
                 .unwrap();
         }
         Ok(())
@@ -719,13 +774,12 @@ impl SemManager {
         group.with_record_mut(semid, f)
     }
 
-    fn compact_undo_registry(&mut self) {
-        self.undo_groups.retain(|weak| weak.strong_count() != 0);
-    }
-
     pub(crate) fn clear_undo_for_setval(&mut self, semid: SemId, semnum: usize) {
+        let Ok(set) = self.get_by_semid_checked_mut(semid) else {
+            return;
+        };
         let mut saw_stale = false;
-        for weak in self.undo_groups.iter() {
+        for weak in set.undo_groups.iter() {
             let Some(group) = weak.upgrade() else {
                 saw_stale = true;
                 continue;
@@ -737,13 +791,16 @@ impl SemManager {
             });
         }
         if saw_stale {
-            self.compact_undo_registry();
+            set.compact_undo_registry();
         }
     }
 
     pub(crate) fn clear_undo_for_setall(&mut self, semid: SemId) {
+        let Ok(set) = self.get_by_semid_checked_mut(semid) else {
+            return;
+        };
         let mut saw_stale = false;
-        for weak in self.undo_groups.iter() {
+        for weak in set.undo_groups.iter() {
             let Some(group) = weak.upgrade() else {
                 saw_stale = true;
                 continue;
@@ -751,13 +808,16 @@ impl SemManager {
             Self::with_undo_record_mut(&group, semid, |record| record.clear_all_adjustments());
         }
         if saw_stale {
-            self.compact_undo_registry();
+            set.compact_undo_registry();
         }
     }
 
     pub(crate) fn discard_undo_for_rmid(&mut self, semid: SemId) {
+        let Ok(set) = self.get_by_semid_checked_mut(semid) else {
+            return;
+        };
         let mut saw_stale = false;
-        for weak in self.undo_groups.iter() {
+        for weak in set.undo_groups.iter() {
             let Some(group) = weak.upgrade() else {
                 saw_stale = true;
                 continue;
@@ -765,7 +825,7 @@ impl SemManager {
             group.remove_record(semid);
         }
         if saw_stale {
-            self.compact_undo_registry();
+            set.compact_undo_registry();
         }
     }
 
@@ -789,30 +849,37 @@ impl SemManager {
         let Ok(set) = self.get_by_semid_checked_mut(semid) else {
             return;
         };
-        Self::update_queue(set, semid);
+        Self::update_queue(set, semid, &mut SemWakeBatch::default());
     }
 
     #[cfg(test)]
     fn live_undo_group_count_for_test(&self) -> usize {
-        self.undo_groups
-            .iter()
-            .filter(|weak| weak.upgrade().is_some())
-            .count()
+        let mut groups: Vec<Weak<SemUndoGroup>> = Vec::new();
+        for weak in self.id2sem.values().flat_map(|set| &set.undo_groups) {
+            if weak.strong_count() != 0 && !groups.iter().any(|old| old.ptr_eq(weak)) {
+                groups.push(weak.clone());
+            }
+        }
+        groups.len()
     }
 
     #[cfg(test)]
     fn undo_registry_contains_for_test(&self, group: &Arc<SemUndoGroup>) -> bool {
-        self.undo_groups
-            .iter()
+        self.id2sem
+            .values()
+            .flat_map(|set| &set.undo_groups)
             .any(|weak| weak.ptr_eq(&Arc::downgrade(group)))
     }
 
     #[cfg(test)]
     fn namespace_lifecycle_invariant_for_test(&self) -> bool {
-        self.undo_groups.iter().all(|weak| {
-            weak.upgrade()
-                .is_none_or(|group| group.record_count_for_test() == 0)
-        })
+        self.id2sem
+            .values()
+            .flat_map(|set| &set.undo_groups)
+            .all(|weak| {
+                weak.upgrade()
+                    .is_none_or(|group| group.record_count_for_test() == 0)
+            })
     }
 
     #[cfg(test)]
@@ -823,7 +890,7 @@ impl SemManager {
     ) -> Result<(), SystemError> {
         let nsems = self.validate_semid_nsems(semid)?;
         let record = group.prepare_record(semid, nsems)?;
-        self.ensure_undo_group_registered(group)?;
+        self.ensure_undo_group_registered(group, semid)?;
         group.commit_prepared_record_noalloc(record)
     }
 
@@ -1001,7 +1068,11 @@ impl SemManager {
     }
 
     /// Scan one pending queue without head-of-line blocking.
-    fn scan_pending_queue(set: &mut KernelSemSet, queue: SemPendingQueue) -> bool {
+    fn scan_pending_queue(
+        set: &mut KernelSemSet,
+        queue: SemPendingQueue,
+        wakes: &mut SemWakeBatch,
+    ) -> bool {
         let mut index = 0;
         while index < set.pending_len(queue) {
             let entry = set.pending_entry(queue, index);
@@ -1011,8 +1082,7 @@ impl SemManager {
                     let mut record_slot = entry.undo_record.lock_irqsave();
                     let Some(record) = record_slot.take() else {
                         set.remove_pending(queue, index);
-                        entry.complete(Err(SystemError::EINVAL));
-                        entry.waker.wake();
+                        wakes.complete(entry.clone(), Err(SystemError::EINVAL));
                         continue;
                     };
                     match group.with_prepared_record_noalloc(record, |record| {
@@ -1035,8 +1105,7 @@ impl SemManager {
                 match result {
                     Ok(Some(changed)) => {
                         set.remove_pending(queue, index);
-                        entry.complete(Ok(0));
-                        entry.waker.wake();
+                        wakes.complete(entry.clone(), Ok(0));
                         if changed {
                             return true;
                         }
@@ -1044,8 +1113,7 @@ impl SemManager {
                     Ok(None) => index += 1,
                     Err(error) => {
                         set.remove_pending(queue, index);
-                        entry.complete(Err(error));
-                        entry.waker.wake();
+                        wakes.complete(entry.clone(), Err(error));
                     }
                 }
                 continue;
@@ -1057,16 +1125,14 @@ impl SemManager {
                     let changed =
                         Self::commit_semop(set, simulation, &scratch, entry.pid.clone(), None);
                     set.remove_pending(queue, index);
-                    entry.complete(Ok(0));
-                    entry.waker.wake();
+                    wakes.complete(entry.clone(), Ok(0));
                     if changed {
                         return true;
                     }
                 }
                 Ok(SemopOutcome::Blocked(blocker)) if blocker.nowait => {
                     set.remove_pending(queue, index);
-                    entry.complete(Err(SystemError::EAGAIN_OR_EWOULDBLOCK));
-                    entry.waker.wake();
+                    wakes.complete(entry.clone(), Err(SystemError::EAGAIN_OR_EWOULDBLOCK));
                 }
                 Ok(SemopOutcome::Blocked(blocker)) => {
                     entry.update_blocker(blocker);
@@ -1074,8 +1140,7 @@ impl SemManager {
                 }
                 Err(error) => {
                     set.remove_pending(queue, index);
-                    entry.complete(Err(error));
-                    entry.waker.wake();
+                    wakes.complete(entry.clone(), Err(error));
                 }
             }
         }
@@ -1083,11 +1148,11 @@ impl SemManager {
     }
 
     /// Complete executable const entries before altering entries.
-    fn update_queue(set: &mut KernelSemSet, _semid: SemId) {
+    fn update_queue(set: &mut KernelSemSet, _semid: SemId, wakes: &mut SemWakeBatch) {
         loop {
-            let const_changed = Self::scan_pending_queue(set, SemPendingQueue::Const);
+            let const_changed = Self::scan_pending_queue(set, SemPendingQueue::Const, wakes);
             debug_assert!(!const_changed);
-            if !Self::scan_pending_queue(set, SemPendingQueue::Alter) {
+            if !Self::scan_pending_queue(set, SemPendingQueue::Alter, wakes) {
                 return;
             }
         }
@@ -1127,6 +1192,7 @@ impl SemManager {
         semid: SemId,
         adjustments: &[i16],
         exiting_tgid: Option<Arc<Pid>>,
+        wakes: &mut SemWakeBatch,
     ) {
         let Ok(set) = self.get_by_semid_checked_mut(semid) else {
             return;
@@ -1143,7 +1209,7 @@ impl SemManager {
         }
 
         set.sem_otime = PosixTimeSpec::now().tv_sec;
-        Self::update_queue(set, semid);
+        Self::update_queue(set, semid, wakes);
     }
 
     fn cancel_queued_entry(
@@ -1262,6 +1328,7 @@ impl SemManager {
             )
         };
 
+        let mut wakes = SemWakeBatch::default();
         let mut queue_spare = VecDeque::new();
         let mut queue_capacity_needed = 0;
         let mut registry_spare = Vec::new();
@@ -1327,14 +1394,26 @@ impl SemManager {
                 continue;
             }
             if let Some(prepared_entry) = prepared_undo {
-                if let Err(capacity) = guard.ensure_undo_group_registered_prepared(
-                    undo_group
-                        .as_ref()
-                        .expect("SEM_UNDO operation has a current group"),
-                    &mut registry_spare,
-                ) {
-                    registry_capacity_needed = capacity;
-                    continue;
+                // Only a published record can take the fast path. Missing
+                // (including queued) records must be linked before publication.
+                // Full semid was rechecked above, so Existing cannot refer to a
+                // destroyed/reused set. SETVAL/SETALL retain live associations.
+                let already_associated = prepared_entry
+                    .undo_record
+                    .lock_irqsave()
+                    .as_ref()
+                    .is_some_and(SemUndoRecord::was_existing);
+                if !already_associated {
+                    let set = guard.get_by_semid_checked_mut(semid)?;
+                    if let Err(capacity) = set.ensure_undo_group_registered_prepared(
+                        undo_group
+                            .as_ref()
+                            .expect("SEM_UNDO operation has a current group"),
+                        &mut registry_spare,
+                    ) {
+                        registry_capacity_needed = capacity;
+                        continue;
+                    }
                 }
                 let mut record_slot = prepared_entry.undo_record.lock_irqsave();
                 let prepared_record = record_slot
@@ -1372,7 +1451,7 @@ impl SemManager {
                 match outcome? {
                     None => {
                         drop(record_slot);
-                        Self::update_queue(set, semid);
+                        Self::update_queue(set, semid, &mut wakes);
                         return Ok(0);
                     }
                     Some(blocker) => {
@@ -1398,7 +1477,7 @@ impl SemManager {
                 match Self::simulate_semop(set, sops, None, &mut immediate_scratch)? {
                     SemopOutcome::Ready(simulation) => {
                         Self::commit_semop(set, simulation, &immediate_scratch, pid, None);
-                        Self::update_queue(set, semid);
+                        Self::update_queue(set, semid, &mut wakes);
                         return Ok(0);
                     }
                     SemopOutcome::Blocked(blocker) => {
@@ -1426,6 +1505,7 @@ impl SemManager {
 
         drop(queue_spare);
         drop(registry_spare);
+        wakes.wake_all();
         if let Some(timer) = timer.as_ref() {
             timer.activate();
         }
@@ -1451,7 +1531,11 @@ impl SemManager {
     }
 
     /// # IPC_RMID: remove the semaphore set and wake all waiters with EIDRM
-    pub fn ipc_rmid(&mut self, id: SemId) -> Result<(), SystemError> {
+    pub(crate) fn ipc_rmid(
+        &mut self,
+        id: SemId,
+        wakes: &mut SemWakeBatch,
+    ) -> Result<(), SystemError> {
         let decoded = IpcIdAllocator::decode(id.data())?;
         let target_user_ns = ProcessManager::current_ipcns().user_ns.clone();
         let key = {
@@ -1466,7 +1550,7 @@ impl SemManager {
             .ok_or(SystemError::EINVAL)?;
         self.key2id.remove(&SemKey::new(key));
         self.total_sems = self.total_sems.saturating_sub(set.sems.len());
-        set.complete_all_removed();
+        set.complete_all_removed(wakes);
         self.id_allocator.free_idx(decoded.idx);
         Ok(())
     }
@@ -1557,7 +1641,13 @@ impl SemManager {
     }
 
     /// # SETVAL: set a single semaphore value
-    pub fn setval(&mut self, id: SemId, semnum: usize, val: i32) -> Result<(), SystemError> {
+    pub(crate) fn setval(
+        &mut self,
+        id: SemId,
+        semnum: usize,
+        val: i32,
+        wakes: &mut SemWakeBatch,
+    ) -> Result<(), SystemError> {
         // Match Linux: validate the value (ERANGE), then semnum (EINVAL), then permissions
         // (EACCES).
         if !(0..=SEMVMX).contains(&val) {
@@ -1580,12 +1670,17 @@ impl SemManager {
         sem.val = val;
         sem.pid = ProcessManager::current_pcb().task_pid_ptr(PidType::TGID);
         set.sem_ctime = PosixTimeSpec::now().tv_sec;
-        Self::update_queue(set, id);
+        Self::update_queue(set, id, wakes);
         Ok(())
     }
 
     /// # SETALL: set values of all semaphores in the set without changes on validation failure
-    pub fn setall(&mut self, token: SemSetAllToken, vals: &[u16]) -> Result<(), SystemError> {
+    pub(crate) fn setall(
+        &mut self,
+        token: SemSetAllToken,
+        vals: &[u16],
+        wakes: &mut SemWakeBatch,
+    ) -> Result<(), SystemError> {
         let set_nsems = self
             .get_by_semid_checked(token.id)
             .map_err(|_| SystemError::EIDRM)?
@@ -1609,7 +1704,7 @@ impl SemManager {
             sem.pid = pid.clone();
         }
         set.sem_ctime = PosixTimeSpec::now().tv_sec;
-        Self::update_queue(set, token.id);
+        Self::update_queue(set, token.id, wakes);
         Ok(())
     }
 
@@ -1885,7 +1980,12 @@ mod tests {
         };
         let exiting_tgid = Pid::new_for_test(RawPid::new(4243), INIT_PID_NAMESPACE.clone());
 
-        manager.replay_sem_undo_adjustments(semid, &[1, 1], Some(exiting_tgid.clone()));
+        manager.replay_sem_undo_adjustments(
+            semid,
+            &[1, 1],
+            Some(exiting_tgid.clone()),
+            &mut SemWakeBatch::default(),
+        );
 
         let set = manager.get_by_semid_checked_mut(semid).unwrap();
         let values = [set.sems[0].val, set.sems[1].val];
@@ -1931,7 +2031,12 @@ mod tests {
         };
         let exiting_tgid = Pid::new_for_test(RawPid::new(4244), INIT_PID_NAMESPACE.clone());
 
-        manager.replay_sem_undo_adjustments(semid, &[0, 0], Some(exiting_tgid.clone()));
+        manager.replay_sem_undo_adjustments(
+            semid,
+            &[0, 0],
+            Some(exiting_tgid.clone()),
+            &mut SemWakeBatch::default(),
+        );
 
         let set = manager.get_by_semid_checked_mut(semid).unwrap();
         let values = [set.sems[0].val, set.sems[1].val];
@@ -1953,50 +2058,89 @@ mod tests {
 
     #[test]
     fn new_manager_starts_with_empty_undo_registry() {
-        assert!(SemManager::new().undo_groups.is_empty());
+        assert!(SemManager::new().id2sem.is_empty());
     }
 
     #[test]
     fn prepared_registry_growth_rechecks_registration_and_capacity() {
         let mut manager = SemManager::new();
+        let semid = insert_test_set(&mut manager, SemKey::new(151), &[1]);
         let group = SemUndoGroup::new_for_test_bound_to(&INIT_IPC_NAMESPACE).unwrap();
         let mut spare = Vec::new();
         let capacity = manager
+            .get_by_semid_checked_mut(semid)
+            .unwrap()
             .ensure_undo_group_registered_prepared(&group, &mut spare)
             .unwrap_err();
-        assert!(!group.registry_registered());
-        assert!(manager.undo_groups.is_empty());
+        assert!(!manager.undo_registry_contains_for_test(&group));
+        assert!(manager
+            .get_by_semid_checked(semid)
+            .unwrap()
+            .undo_groups
+            .is_empty());
         spare.try_reserve(capacity).unwrap();
 
         // Simulate other first-time groups consuming the prepared capacity
         // while this caller has dropped the manager lock.
         let mut owners = Vec::new();
-        while manager.undo_groups.len() < spare.capacity() {
+        while manager
+            .get_by_semid_checked(semid)
+            .unwrap()
+            .undo_groups
+            .len()
+            < spare.capacity()
+        {
             let owner = SemUndoGroup::new_for_test_bound_to(&INIT_IPC_NAMESPACE).unwrap();
-            manager.ensure_undo_group_registered(&owner).unwrap();
+            manager.ensure_undo_group_registered(&owner, semid).unwrap();
             owners.push(owner);
         }
         let capacity = manager
+            .get_by_semid_checked_mut(semid)
+            .unwrap()
             .ensure_undo_group_registered_prepared(&group, &mut spare)
             .unwrap_err();
-        assert!(!group.registry_registered());
+        assert!(!manager.undo_registry_contains_for_test(&group));
         spare.try_reserve(capacity).unwrap();
         manager
+            .get_by_semid_checked_mut(semid)
+            .unwrap()
             .ensure_undo_group_registered_prepared(&group, &mut spare)
             .unwrap();
         assert!(spare.is_empty());
-        assert!(group.registry_registered());
-        assert_eq!(manager.undo_groups.len(), owners.len() + 1);
-        for (weak, owner) in manager.undo_groups.iter().zip(&owners) {
+        assert!(manager.undo_registry_contains_for_test(&group));
+        assert_eq!(
+            manager
+                .get_by_semid_checked(semid)
+                .unwrap()
+                .undo_groups
+                .len(),
+            owners.len() + 1
+        );
+        for (weak, owner) in manager
+            .get_by_semid_checked(semid)
+            .unwrap()
+            .undo_groups
+            .iter()
+            .zip(&owners)
+        {
             assert!(weak.ptr_eq(&Arc::downgrade(owner)));
         }
 
         // A concurrent CLONE_SYSVSEM sharer already registered this group.
         let mut empty_spare = Vec::new();
         manager
+            .get_by_semid_checked_mut(semid)
+            .unwrap()
             .ensure_undo_group_registered_prepared(&group, &mut empty_spare)
             .unwrap();
-        assert_eq!(manager.undo_groups.len(), owners.len() + 1);
+        assert_eq!(
+            manager
+                .get_by_semid_checked(semid)
+                .unwrap()
+                .undo_groups
+                .len(),
+            owners.len() + 1
+        );
     }
 
     #[test]
@@ -2072,7 +2216,9 @@ mod tests {
         assert_eq!(group.adjustment_for_test(signal_semid, 0), 0);
 
         let rmid_entry = enqueue_undo_waiter_for_test(&mut manager, rmid_semid, &group);
-        manager.ipc_rmid(rmid_semid).unwrap();
+        manager
+            .ipc_rmid(rmid_semid, &mut SemWakeBatch::default())
+            .unwrap();
         assert_eq!(rmid_entry.completed_result(), Some(Err(SystemError::EIDRM)));
         assert_eq!(group.adjustment_for_test(rmid_semid, 0), 0);
     }
@@ -2104,9 +2250,17 @@ mod tests {
 
         let mut manager = ipc_ns.sem.lock();
         let semid = insert_test_set(&mut manager, SemKey::new(51), &[1]);
-        manager.undo_groups.push(stale_weak);
-        manager.ensure_undo_group_registered(&live).unwrap();
-        manager.undo_groups.shrink_to_fit();
+        manager
+            .get_by_semid_checked_mut(semid)
+            .unwrap()
+            .undo_groups
+            .push(stale_weak);
+        manager.ensure_undo_group_registered(&live, semid).unwrap();
+        manager
+            .get_by_semid_checked_mut(semid)
+            .unwrap()
+            .undo_groups
+            .shrink_to_fit();
 
         manager
             .prepare_undo_record_and_registry_for_test(&candidate, semid)
@@ -2126,20 +2280,45 @@ mod tests {
         manager
             .prepare_undo_record_and_registry_for_test(&group, semid)
             .unwrap();
-        let capacity = manager.undo_groups.capacity();
+        let capacity = manager
+            .get_by_semid_checked(semid)
+            .unwrap()
+            .undo_groups
+            .capacity();
         manager.clear_undo_for_setall(semid);
         manager.discard_undo_for_rmid(semid);
         assert_eq!(group.record_count_for_test(), 0);
         for _ in 0..32 {
-            manager.ensure_undo_group_registered(&group).unwrap();
+            manager.ensure_undo_group_registered(&group, semid).unwrap();
         }
-        assert!(group.registry_registered());
-        assert_eq!(manager.undo_groups.len(), 1);
-        assert_eq!(manager.undo_groups.capacity(), capacity);
+        assert!(manager.undo_registry_contains_for_test(&group));
+        assert_eq!(
+            manager
+                .get_by_semid_checked(semid)
+                .unwrap()
+                .undo_groups
+                .len(),
+            1
+        );
+        assert_eq!(
+            manager
+                .get_by_semid_checked(semid)
+                .unwrap()
+                .undo_groups
+                .capacity(),
+            capacity
+        );
         manager
             .prepare_undo_record_and_registry_for_test(&group, semid)
             .unwrap();
-        assert_eq!(manager.undo_groups.len(), 1);
+        assert_eq!(
+            manager
+                .get_by_semid_checked(semid)
+                .unwrap()
+                .undo_groups
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -2187,12 +2366,19 @@ mod tests {
         };
         let (pcb, group) = test_pcb_with_group(&ipc_ns);
         group.insert_test_record(semid, &[3]);
+        ipc_ns
+            .sem
+            .lock()
+            .ensure_undo_group_registered(&group, semid)
+            .unwrap();
         drop(pcb.take_sem_undo_attachment().unwrap());
         assert!(group.detach_last_owner_for_test());
 
         {
             let mut manager = ipc_ns.sem.lock();
-            manager.setval(semid, 0, 7).unwrap();
+            manager
+                .setval(semid, 0, 7, &mut SemWakeBatch::default())
+                .unwrap();
         }
         group.replay_marked_records_for_test(&pcb);
 
@@ -2212,12 +2398,19 @@ mod tests {
         };
         let (pcb, group) = test_pcb_with_group(&ipc_ns);
         group.insert_test_record(semid, &[3]);
+        ipc_ns
+            .sem
+            .lock()
+            .ensure_undo_group_registered(&group, semid)
+            .unwrap();
         drop(pcb.take_sem_undo_attachment().unwrap());
         assert!(group.detach_last_owner_for_test());
 
         {
             let mut manager = ipc_ns.sem.lock();
-            manager.ipc_rmid(semid).unwrap();
+            manager
+                .ipc_rmid(semid, &mut SemWakeBatch::default())
+                .unwrap();
         }
         group.replay_marked_records_for_test(&pcb);
 
@@ -2255,10 +2448,16 @@ mod tests {
         group_a.insert_test_record(semid, &[11, 12]);
         group_b.insert_test_record(semid, &[21, 22]);
         group_a.insert_test_record(other_semid, &[31, 32]);
-        manager.ensure_undo_group_registered(&group_a).unwrap();
-        manager.ensure_undo_group_registered(&group_b).unwrap();
+        manager
+            .ensure_undo_group_registered(&group_a, semid)
+            .unwrap();
+        manager
+            .ensure_undo_group_registered(&group_b, semid)
+            .unwrap();
 
-        manager.setval(semid, 0, 9).unwrap();
+        manager
+            .setval(semid, 0, 9, &mut SemWakeBatch::default())
+            .unwrap();
 
         assert_eq!(sem_values(&manager, semid), vec![9, 5]);
         assert_eq!(group_a.adjustment_for_test(semid, 0), 0);
@@ -2278,11 +2477,17 @@ mod tests {
         group_a.insert_test_record(semid, &[1, 2, 3]);
         group_b.insert_test_record(semid, &[4, 5, 6]);
         group_b.insert_test_record(other_semid, &[7, 8, 9]);
-        manager.ensure_undo_group_registered(&group_a).unwrap();
-        manager.ensure_undo_group_registered(&group_b).unwrap();
+        manager
+            .ensure_undo_group_registered(&group_a, semid)
+            .unwrap();
+        manager
+            .ensure_undo_group_registered(&group_b, semid)
+            .unwrap();
         let token = SemSetAllToken::new(semid, 3);
 
-        manager.setall(token, &[10, 11, 12]).unwrap();
+        manager
+            .setall(token, &[10, 11, 12], &mut SemWakeBatch::default())
+            .unwrap();
 
         assert_eq!(sem_values(&manager, semid), vec![10, 11, 12]);
         assert_eq!(group_a.adjustment_for_test(semid, 0), 0);
@@ -2300,10 +2505,12 @@ mod tests {
         let semid = insert_test_set(&mut manager, SemKey::new(58), &[0]);
         let group = SemUndoGroup::new_for_test_bound_to(&INIT_IPC_NAMESPACE).unwrap();
         group.insert_test_record(semid, &[7]);
-        manager.ensure_undo_group_registered(&group).unwrap();
+        manager.ensure_undo_group_registered(&group, semid).unwrap();
         let entry = enqueue_undo_waiter_for_test(&mut manager, semid, &group);
 
-        manager.setval(semid, 0, 1).unwrap();
+        manager
+            .setval(semid, 0, 1, &mut SemWakeBatch::default())
+            .unwrap();
 
         assert_eq!(entry.completed_result(), Some(Ok(0)));
         assert_eq!(sem_values(&manager, semid), vec![0]);
@@ -2318,8 +2525,12 @@ mod tests {
         let filler_semid = insert_test_set(&mut manager, SemKey::new(60), &[4]);
         let group = SemUndoGroup::new_for_test_bound_to(&INIT_IPC_NAMESPACE).unwrap();
         group.insert_test_record(old_semid, &[9]);
-        manager.ensure_undo_group_registered(&group).unwrap();
-        manager.ipc_rmid(old_semid).unwrap();
+        manager
+            .ensure_undo_group_registered(&group, old_semid)
+            .unwrap();
+        manager
+            .ipc_rmid(old_semid, &mut SemWakeBatch::default())
+            .unwrap();
 
         let new_semid = insert_test_set(&mut manager, SemKey::new(61), &[5]);
 
@@ -2339,7 +2550,7 @@ mod tests {
         let semid = insert_test_set(&mut manager, SemKey::new(62), &[4]);
         let group = SemUndoGroup::new_for_test_bound_to(&INIT_IPC_NAMESPACE).unwrap();
         group.insert_test_record(semid, &[7]);
-        manager.ensure_undo_group_registered(&group).unwrap();
+        manager.ensure_undo_group_registered(&group, semid).unwrap();
 
         let record = group.prepare_record_for_test(semid, 1).unwrap();
         manager.clear_undo_for_setval(semid, 0);
@@ -2366,7 +2577,7 @@ mod tests {
         let semid = insert_test_set(&mut manager, SemKey::new(63), &[4, 5]);
         let group = SemUndoGroup::new_for_test_bound_to(&INIT_IPC_NAMESPACE).unwrap();
         group.insert_test_record(semid, &[7, -3]);
-        manager.ensure_undo_group_registered(&group).unwrap();
+        manager.ensure_undo_group_registered(&group, semid).unwrap();
 
         let record = group.prepare_record_for_test(semid, 2).unwrap();
         manager.clear_undo_for_setall(semid);
@@ -2394,7 +2605,7 @@ mod tests {
         let semid = insert_test_set(&mut manager, SemKey::new(65), &[4]);
         let group = SemUndoGroup::new_for_test_bound_to(&INIT_IPC_NAMESPACE).unwrap();
         group.insert_test_record(semid, &[7]);
-        manager.ensure_undo_group_registered(&group).unwrap();
+        manager.ensure_undo_group_registered(&group, semid).unwrap();
 
         let record = group.prepare_record_for_test(semid, 1).unwrap();
         manager.clear_undo_for_setval(semid, 0);
@@ -2421,7 +2632,7 @@ mod tests {
         let semid = insert_test_set(&mut manager, SemKey::new(66), &[0]);
         let group = SemUndoGroup::new_for_test_bound_to(&INIT_IPC_NAMESPACE).unwrap();
         group.insert_test_record(semid, &[7]);
-        manager.ensure_undo_group_registered(&group).unwrap();
+        manager.ensure_undo_group_registered(&group, semid).unwrap();
         let entry = enqueue_undo_waiter_for_test(&mut manager, semid, &group);
 
         manager.clear_undo_for_setval(semid, 0);
@@ -2655,7 +2866,10 @@ mod tests {
 
         remove_test_set(&mut manager, id);
 
-        assert_eq!(manager.setall(token, &[7, 8]), Err(SystemError::EIDRM));
+        assert_eq!(
+            manager.setall(token, &[7, 8], &mut SemWakeBatch::default()),
+            Err(SystemError::EIDRM)
+        );
     }
 
     #[test]
@@ -2672,7 +2886,10 @@ mod tests {
             new_id.data() & IpcIdAllocator::IPC_ID_IDX_MASK
         );
 
-        assert_eq!(manager.setall(token, &[7, 8]), Err(SystemError::EIDRM));
+        assert_eq!(
+            manager.setall(token, &[7, 8], &mut SemWakeBatch::default()),
+            Err(SystemError::EIDRM)
+        );
         assert_eq!(sem_values(&manager, new_id), vec![3, 4]);
     }
 }

@@ -2193,6 +2193,96 @@ TEST(SysVSem, WaitQueuesGrowForConstAndAlterOperations) {
     }
 }
 
+TEST(SysVSem, RemoveWakesBothWaitQueuesInBulk) {
+    constexpr int kPairs = 16;
+    SemSet sem(2, IPC_CREAT | 0600);
+    ASSERT_TRUE(sem.valid());
+    ASSERT_EQ(0, SemCtl(sem.id(), 0, SETVAL, 1));
+    std::vector<std::unique_ptr<ChildGuard>> children;
+    for (int i = 0; i < kPairs * 2; ++i) {
+        const bool constant = i % 2 == 0;
+        pid_t pid = fork();
+        ASSERT_GE(pid, 0);
+        if (pid == 0) {
+            struct sembuf op = {static_cast<unsigned short>(constant ? 0 : 1),
+                                static_cast<short>(constant ? 0 : -1), SEM_UNDO};
+            struct timespec timeout = {10, 0};
+            int result = SemTimedOp(sem.id(), &op, 1, &timeout);
+            _exit(result == -1 && errno == EIDRM ? 0 : 115);
+        }
+        children.emplace_back(new ChildGuard(pid));
+    }
+    ASSERT_TRUE(WaitForZcnt(sem.id(), 0, kPairs));
+    ASSERT_TRUE(WaitForNcnt(sem.id(), 1, kPairs));
+    ASSERT_EQ(0, SemCtl(sem.id(), 0, IPC_RMID, 0));
+    sem.release();
+    for (auto& child : children) {
+        WaitChildOk(child.get());
+    }
+}
+
+TEST(SysVSem, SharedUndoGroupControlChangesStaySetLocal) {
+    for (int cmd : {SETVAL, SETALL, IPC_RMID}) {
+        SemSet target(1, IPC_CREAT | 0600);
+        SemSet other(1, IPC_CREAT | 0600);
+        ASSERT_TRUE(target.valid());
+        ASSERT_TRUE(other.valid());
+        int ready[2], release[2];
+        ASSERT_EQ(0, pipe(ready));
+        FdGuard ready_read(ready[0]), ready_write(ready[1]);
+        ASSERT_EQ(0, pipe(release));
+        FdGuard release_read(release[0]), release_write(release[1]);
+        pid_t pid = fork();
+        ASSERT_GE(pid, 0);
+        if (pid == 0) {
+            ready_read.Close();
+            release_write.Close();
+            char token = 1;
+            if (!SemUndoOpMustSucceed(target.id(), 0, 1) ||
+                !SemUndoOpMustSucceed(other.id(), 0, 1) ||
+                !WriteExact(ready_write.get(), &token, 1) ||
+                !ReadExact(release_read.get(), &token, 1)) {
+                _exit(116);
+            }
+            if (cmd != IPC_RMID) {
+                // Existing records must remain associated after a debt clear.
+                if (!SemUndoOpMustSucceed(target.id(), 0, 1) ||
+                    !WriteExact(ready_write.get(), &token, 1) ||
+                    !ReadExact(release_read.get(), &token, 1)) {
+                    _exit(117);
+                }
+            }
+            _exit(0);
+        }
+        ChildGuard child(pid);
+        ready_write.Close();
+        release_read.Close();
+        char token = 1;
+        ASSERT_TRUE(ReadExact(ready_read.get(), &token, 1));
+        unsigned short value = 9;
+        const unsigned long arg = cmd == SETALL ? reinterpret_cast<unsigned long>(&value) : 9;
+        ASSERT_EQ(0, SemCtl(target.id(), 0, cmd, arg));
+        std::unique_ptr<SemSet> replacement;
+        if (cmd == IPC_RMID) {
+            target.release();
+            replacement.reset(new SemSet(1, IPC_CREAT | 0600));
+            ASSERT_TRUE(replacement->valid());
+            ASSERT_EQ(0, SemCtl(replacement->id(), 0, SETVAL, 9));
+        }
+        ASSERT_TRUE(WriteExact(release_write.get(), &token, 1));
+        if (cmd != IPC_RMID) {
+            ASSERT_TRUE(ReadExact(ready_read.get(), &token, 1));
+            EXPECT_EQ(10, SemCtl(target.id(), 0, GETVAL, 0));
+            ASSERT_EQ(0, SemCtl(target.id(), 0, cmd, arg));
+            ASSERT_TRUE(WriteExact(release_write.get(), &token, 1));
+        }
+        WaitChildOk(&child);
+        EXPECT_EQ(0, SemCtl(other.id(), 0, GETVAL, 0)) << "unrelated debt must replay";
+        EXPECT_EQ(9, SemCtl(replacement ? replacement->id() : target.id(), 0, GETVAL, 0))
+            << "cleared or removed debt must not replay";
+    }
+}
+
 TEST(SysVSem, IndependentUndoGroupsSteadyStateAndSetall) {
     constexpr int kWorkers = 32;
     std::vector<std::unique_ptr<SemSet>> sets;

@@ -3,7 +3,7 @@ use crate::arch::interrupt::TrapFrame;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::{
     arch::syscall::nr::SYS_SEMCTL,
-    ipc::sem::{PosixSemIdDs, PosixSemInfo, SemCtlCmd, SemId},
+    ipc::sem::{PosixSemIdDs, PosixSemInfo, SemCtlCmd, SemId, SemWakeBatch},
     process::ProcessManager,
     syscall::table::Syscall,
     syscall::user_access::{UserBufferReader, UserBufferWriter},
@@ -35,6 +35,9 @@ pub(super) fn do_kernel_semctl(
     from_user: bool,
 ) -> Result<usize, SystemError> {
     let ipcns = ProcessManager::current_ipcns();
+    // Declared outside all manager-guard scopes: completion notifications are
+    // delivered after unlocking, including on early returns.
+    let mut wakes = SemWakeBatch::default();
 
     match cmd {
         // Retrieve semaphore system information
@@ -81,7 +84,7 @@ pub(super) fn do_kernel_semctl(
         // Remove the semaphore set
         SemCtlCmd::IpcRmid => {
             let mut guard = ipcns.sem.lock();
-            guard.ipc_rmid(semid)?;
+            guard.ipc_rmid(semid, &mut wakes)?;
             Ok(0)
         }
         // Query a single semaphore
@@ -93,7 +96,7 @@ pub(super) fn do_kernel_semctl(
         SemCtlCmd::SetVal => {
             let val = arg as u32 as i32;
             let mut guard = ipcns.sem.lock();
-            guard.setval(semid, semnum, val)?;
+            guard.setval(semid, semnum, val, &mut wakes)?;
             Ok(0)
         }
         // Get values of all semaphores in the set
@@ -131,7 +134,7 @@ pub(super) fn do_kernel_semctl(
                 user_buffer_reader.copy_one_from_user(v, i * core::mem::size_of::<u16>())?;
             }
             let mut guard = ipcns.sem.lock();
-            guard.setall(token, &vals)?;
+            guard.setall(token, &vals, &mut wakes)?;
             Ok(0)
         }
         // Invalid command

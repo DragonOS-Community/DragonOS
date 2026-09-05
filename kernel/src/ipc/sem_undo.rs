@@ -6,7 +6,7 @@ use alloc::{
 use system_error::SystemError;
 
 use crate::{
-    ipc::sem::{SemId, SemManager},
+    ipc::sem::{SemId, SemManager, SemWakeBatch},
     libs::spinlock::SpinLock,
     process::{namespace::ipc_namespace::IpcNamespace, pid::PidType, ProcessControlBlock},
 };
@@ -27,9 +27,6 @@ pub struct SemUndoGroup {
 #[derive(Debug)]
 struct SemUndoGroupState {
     task_owners: usize,
-    /// Published once in the bound IPC namespace's manager registry. Clearing
-    /// records does not unregister a live group; only dead Weak entries expire.
-    registry_registered: bool,
     records: Vec<SemUndoRecord>,
     reserved_records: usize,
     absence_generation: u64,
@@ -123,6 +120,15 @@ impl SemUndoGroupState {
 }
 
 impl SemUndoRecord {
+    /// A production record is published only after its group is associated
+    /// with the full semaphore-set ID. Clearing debt preserves that link.
+    pub(crate) fn was_existing(&self) -> bool {
+        matches!(
+            self.prepared_state,
+            PreparedSemUndoRecordState::Existing { .. }
+        )
+    }
+
     #[cfg(test)]
     fn new_live(semid: SemId, adjustments: Box<[i16]>) -> Self {
         Self {
@@ -238,7 +244,6 @@ impl SemUndoGroup {
             ipc_ns: Arc::downgrade(ipc_ns),
             inner: SpinLock::new(SemUndoGroupState {
                 task_owners: 1,
-                registry_registered: false,
                 records: Vec::new(),
                 reserved_records: 0,
                 absence_generation: 0,
@@ -249,16 +254,6 @@ impl SemUndoGroup {
             }),
         })
         .map_err(|_| SystemError::ENOMEM)
-    }
-
-    /// The bound namespace's manager lock serializes registration callers.
-    pub(crate) fn registry_registered(&self) -> bool {
-        self.inner.lock_irqsave().registry_registered
-    }
-
-    /// Called only after the manager has successfully inserted its Weak entry.
-    pub(crate) fn mark_registry_registered(&self) {
-        self.inner.lock_irqsave().registry_registered = true;
     }
 
     pub(crate) fn verify_ipc_ns(&self, ipc_ns: &Arc<IpcNamespace>) -> Result<(), SystemError> {
@@ -620,6 +615,7 @@ fn replay_marked_records(pcb: &Arc<ProcessControlBlock>, group: &Arc<SemUndoGrou
         return;
     };
 
+    let mut wakes = SemWakeBatch::default();
     let mut manager = ipc_ns.sem.lock();
     let records = group.take_retired_records();
     for record in records {
@@ -628,6 +624,7 @@ fn replay_marked_records(pcb: &Arc<ProcessControlBlock>, group: &Arc<SemUndoGrou
             record.semid,
             &record.adjustments,
             exiting_tgid.clone(),
+            &mut wakes,
         );
     }
 }

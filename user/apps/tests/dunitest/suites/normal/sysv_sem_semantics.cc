@@ -4,6 +4,8 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
+
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -552,6 +554,62 @@ TEST(SysVSem, IpcInfoAndSemInfo) {
     EXPECT_GE(max_id, 0);
     EXPECT_EQ(before.semusz + 2, info.semusz) << "SEM_INFO semusz is the set count";
     EXPECT_EQ(before.semaem + 5, info.semaem) << "SEM_INFO semaem is the semaphore count";
+}
+
+TEST(SysVSem, InfoMaximumIndexTracksCreateAndRemove) {
+    struct seminfo info = {};
+    const int baseline = SemCtl(0, 0, SEM_INFO, reinterpret_cast<unsigned long>(&info));
+    ASSERT_GE(baseline, 0);
+    const int baseline_count = info.semusz;
+    std::vector<std::unique_ptr<SemSet>> sets;
+    auto expect_max = [&]() {
+        int expected = baseline;
+        for (auto& sem : sets) {
+            // Linux's default SysV IPC index encoding, also used by DragonOS.
+            expected = std::max(expected, sem->id() & 0x7fff);
+        }
+        EXPECT_EQ(expected, SemCtl(0, 0, IPC_INFO, reinterpret_cast<unsigned long>(&info)));
+        EXPECT_EQ(expected, SemCtl(0, 0, SEM_INFO, reinterpret_cast<unsigned long>(&info)));
+        EXPECT_EQ(baseline_count + static_cast<int>(sets.size()), info.semusz);
+    };
+    for (int i = 0; i < 65; ++i) {
+        sets.emplace_back(new SemSet(1, IPC_CREAT | 0600));
+        ASSERT_TRUE(sets.back()->valid());
+        expect_max();
+    }
+    std::sort(sets.begin(), sets.end(), [](const auto& a, const auto& b) {
+        return (a->id() & 0x7fff) < (b->id() & 0x7fff);
+    });
+    sets.erase(sets.begin()); // Nonmaximum removal.
+    expect_max();
+    while (!sets.empty()) {
+        sets.pop_back(); // Maximum removal, including bitmap word boundaries.
+        expect_max();
+    }
+}
+
+TEST(SysVSem, NoopUnsharePreservesUndoAttachment) {
+    SemSet sem(1, IPC_CREAT | 0600);
+    ASSERT_TRUE(sem.valid());
+    pid_t pid = fork();
+    ASSERT_GE(pid, 0);
+    if (pid == 0) {
+        if (!SemUndoOpMustSucceed(sem.id(), 0, 1)) {
+            _exit(121);
+        }
+        // fork gave this child a private fs_struct. Neither operation should
+        // detach its undo group, while normal exit must still replay the debt.
+        for (int i = 0; i < 32; ++i) {
+            if (syscall(SYS_unshare, 0) != 0 || syscall(SYS_unshare, CLONE_FS) != 0 ||
+                SemCtl(sem.id(), 0, GETVAL, 0) != 1) {
+                _exit(122);
+            }
+        }
+        _exit(0);
+    }
+    ChildGuard child(pid);
+    WaitChildOk(&child);
+    EXPECT_EQ(0, SemCtl(sem.id(), 0, GETVAL, 0));
 }
 
 TEST(SysVSem, KeyedCreateRemovalRestoresAccountingAndAllowsReuse) {

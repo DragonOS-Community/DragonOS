@@ -13,6 +13,8 @@ pub struct FixedIpcIdAllocator<const CAPACITY: usize, const WORDS: usize> {
     next_idx: usize,
     seq: usize,
     last_idx: Option<usize>,
+    /// Highest currently allocated index, not the cyclic allocation cursor.
+    max_used_idx: Option<usize>,
 }
 
 pub type IpcIdAllocator = FixedIpcIdAllocator<32768, { bitmap::static_bitmap_size::<32768>() }>;
@@ -46,6 +48,7 @@ impl<const CAPACITY: usize, const WORDS: usize> FixedIpcIdAllocator<CAPACITY, WO
             next_idx: 0,
             seq: 0,
             last_idx: None,
+            max_used_idx: None,
         })
     }
 
@@ -53,6 +56,7 @@ impl<const CAPACITY: usize, const WORDS: usize> FixedIpcIdAllocator<CAPACITY, WO
         let idx = self.find_free_idx().ok_or(SystemError::ENOSPC)?;
         let was_used = self.used.set(idx, true);
         debug_assert_eq!(was_used, Some(false));
+        self.max_used_idx = Some(self.max_used_idx.map_or(idx, |max| max.max(idx)));
         self.next_idx = if idx + 1 == self.max_ids { 0 } else { idx + 1 };
 
         if let Some(last_idx) = self.last_idx {
@@ -90,7 +94,15 @@ impl<const CAPACITY: usize, const WORDS: usize> FixedIpcIdAllocator<CAPACITY, WO
     pub fn free_idx(&mut self, idx: usize) {
         if idx < self.max_ids {
             self.used.set(idx, false);
+            if self.max_used_idx == Some(idx) {
+                self.max_used_idx = self.used.prev_index(idx);
+            }
         }
+    }
+
+    /// Constant-time query; only removing the maximum searches the existing bitmap.
+    pub fn max_used_index(&self) -> Option<usize> {
+        self.max_used_idx
     }
 
     pub fn decode(raw: usize) -> Result<IpcId, SystemError> {
@@ -147,5 +159,37 @@ mod tests {
 
         type InvalidAllocator = FixedIpcIdAllocator<64, 0>;
         assert_eq!(InvalidAllocator::new(64).unwrap_err(), SystemError::EINVAL);
+    }
+
+    #[test]
+    fn max_used_index_tracks_holes_wraparound_and_empty() {
+        let mut allocator = IpcIdAllocator::new(130).unwrap();
+        assert_eq!(allocator.max_used_index(), None);
+        for idx in 0..130 {
+            assert_eq!(allocator.alloc().unwrap().idx, idx);
+            assert_eq!(allocator.max_used_index(), Some(idx));
+        }
+        assert_eq!(allocator.alloc().unwrap_err(), SystemError::ENOSPC);
+        assert_eq!(allocator.max_used_index(), Some(129));
+        allocator.free_idx(130); // Out-of-range free cannot alter the cache.
+        allocator.free_idx(64);
+        assert_eq!(allocator.max_used_index(), Some(129));
+        for idx in (65..130).rev() {
+            allocator.free_idx(idx);
+        }
+        assert_eq!(allocator.max_used_index(), Some(63));
+        // The cyclic allocator reuses the hole across a bitmap word boundary.
+        assert_eq!(allocator.alloc().unwrap().idx, 64);
+        assert_eq!(allocator.max_used_index(), Some(64));
+        for idx in (0..=64).rev() {
+            allocator.free_idx(idx);
+            assert_eq!(allocator.max_used_index(), idx.checked_sub(1));
+        }
+        allocator.free_idx(0); // Repeated free is harmless.
+        assert_eq!(allocator.max_used_index(), None);
+        let id = allocator.alloc().unwrap();
+        assert_eq!(allocator.max_used_index(), Some(id.idx));
+        allocator.free_idx(id.idx); // Models rollback of a reserved ID.
+        assert_eq!(allocator.max_used_index(), None);
     }
 }

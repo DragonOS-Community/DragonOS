@@ -984,7 +984,7 @@ impl SemManager {
     }
 
     fn current_max_index(&self) -> usize {
-        self.id2sem.keys().copied().max().unwrap_or(0)
+        self.id_allocator.max_used_index().unwrap_or(0)
     }
 
     /// # semget: create or look up a semaphore set

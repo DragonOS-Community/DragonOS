@@ -26,9 +26,11 @@ pub fn ksys_unshare(flags: CloneFlags) -> Result<(), SystemError> {
     let new_fs = unshare_fs_struct(flags, &current_pcb, &fs_refs)?;
     let new_nsproxy =
         unshare_nsproxy_namespaces(flags, &current_pcb, new_cred.as_deref(), new_fs.as_ref())?;
-    let prepared =
-        prepare_unshare_install(&current_pcb, flags, new_fs, new_nsproxy, new_cred, &fs_refs)?;
-    prepared.commit(&current_pcb, &fs_refs)?;
+    if let Some(prepared) =
+        prepare_unshare_install(&current_pcb, flags, new_fs, new_nsproxy, new_cred, &fs_refs)?
+    {
+        prepared.commit(&current_pcb, &fs_refs)?;
+    }
 
     // TODO: 处理其他命名空间的 unshare 操作
     // CLONE_FS, CLONE_FILES, CLONE_SIGHAND, CLONE_VM, CLONE_THREAD, CLONE_SYSVSEM,
@@ -44,9 +46,14 @@ fn prepare_unshare_install(
     new_nsproxy: Option<Arc<NsProxy>>,
     new_cred: Option<Arc<Cred>>,
     fs_refs: &FsRefsReadGuard,
-) -> Result<PreparedNamespaceInstall, SystemError> {
-    let new_nsproxy = new_nsproxy.unwrap_or_else(|| current.nsproxy());
+) -> Result<Option<PreparedNamespaceInstall>, SystemError> {
     let detach_sysvsem = flags.intersects(CloneFlags::CLONE_SYSVSEM | CloneFlags::CLONE_NEWIPC);
+    // Match Linux's conditional install: a no-op must not allocate RCU retire
+    // storage or republish the same nsproxy. SYSVSEM detachment is itself work.
+    if new_fs.is_none() && new_nsproxy.is_none() && new_cred.is_none() && !detach_sysvsem {
+        return Ok(None);
+    }
+    let new_nsproxy = new_nsproxy.unwrap_or_else(|| current.nsproxy());
     PreparedNamespaceInstall::prepare_for_unshare(
         current,
         new_nsproxy,
@@ -55,6 +62,7 @@ fn prepare_unshare_install(
         detach_sysvsem,
         fs_refs,
     )
+    .map(Some)
 }
 
 #[inline(always)]
@@ -204,6 +212,19 @@ mod tests {
     }
 
     #[test]
+    fn no_state_unshare_does_not_prepare_an_install() {
+        let pcb = test_pcb();
+        let fs_refs = lock_fs_refs_copy();
+        for flags in [CloneFlags::empty(), CloneFlags::CLONE_FS] {
+            assert!(
+                prepare_unshare_install(&pcb, flags, None, None, None, &fs_refs)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
     fn unshare_sysvsem_detaches_even_when_ipc_namespace_is_unchanged() {
         let pcb = test_pcb();
         let ipc_ns = pcb.nsproxy().ipc_ns.clone();
@@ -212,6 +233,7 @@ mod tests {
 
         let prepared =
             prepare_unshare_install(&pcb, CloneFlags::CLONE_SYSVSEM, None, None, None, &fs_refs)
+                .unwrap()
                 .unwrap();
         prepared.commit(&pcb, &fs_refs).unwrap();
 
@@ -243,6 +265,7 @@ mod tests {
             None,
             &fs_refs,
         )
+        .unwrap()
         .unwrap();
         prepared.commit(&pcb, &fs_refs).unwrap();
 

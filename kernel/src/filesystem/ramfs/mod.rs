@@ -615,8 +615,10 @@ impl IndexNode for LockedRamFSInode {
         };
         // Keep resize_based_fallocate's real allocation guarantee, including
         // holes introduced by sparse writes or growth through truncate.
-        for index in 0..requested_end.div_ceil(MMArch::PAGE_SIZE) {
-            cache.manager().commit_overwrite(index)?;
+        if requested_end != 0 {
+            cache
+                .manager()
+                .preallocate_range(0, (requested_end - 1) >> MMArch::PAGE_SHIFT)?;
         }
         let mut inode = self.0.lock();
         let effective_size = (inode.metadata.size as usize).max(requested_end);

@@ -1012,6 +1012,45 @@ impl PageCacheManager {
         total.checked_sub(present).ok_or(SystemError::EIO)
     }
 
+    /// Populate an inclusive range with zero-filled holes, preserving existing pages.
+    /// Callers serialize size changes/truncation and publish EOF only on success.
+    /// On failure, discard only pages created here that have not been acquired,
+    /// mapped or dirtied by another user; rollback is not a truncate operation.
+    pub fn preallocate_range(&self, first: usize, last: usize) -> Result<(), SystemError> {
+        let missing_pages = self.missing_pages_in_range(first, last)?;
+        let mut created: Vec<(usize, Arc<Page>)> = Vec::new();
+        created
+            .try_reserve_exact(missing_pages)
+            .map_err(|_| SystemError::ENOMEM)?;
+
+        for page_index in first..=last {
+            match self.commit_overwrite_pinned_with_status(page_index) {
+                Ok((pin, was_created)) => {
+                    if was_created {
+                        if created.len() == created.capacity() && created.try_reserve(1).is_err() {
+                            let current_page = pin.page();
+                            drop(pin);
+                            let _ = self.discard_created_page(page_index, &current_page);
+                            for (created_index, created_page) in created.into_iter().rev() {
+                                let _ = self.discard_created_page(created_index, &created_page);
+                            }
+                            return Err(SystemError::ENOMEM);
+                        }
+                        created.push((page_index, pin.page()));
+                    }
+                }
+                Err(error) => {
+                    for (created_index, created_page) in created.into_iter().rev() {
+                        let _ = self.discard_created_page(created_index, &created_page);
+                    }
+                    return Err(error);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     pub fn prefetch_page(&self, page_index: usize) -> Result<(), SystemError> {
         self.upgrade()?.start_async_read(page_index)
     }

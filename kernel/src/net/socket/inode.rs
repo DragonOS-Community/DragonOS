@@ -13,7 +13,7 @@ use system_error::SystemError;
 use super::{
     ioctl::{
         handle_netdev_mutation, handle_netdev_query, handle_siocgifconf, SIOCGIFCONF, SIOCGIFFLAGS,
-        SIOCGIFHWADDR, SIOCGIFINDEX, SIOCGIFMTU, SIOCSIFFLAGS, SIOCSIFMTU,
+        SIOCGIFHWADDR, SIOCGIFINDEX, SIOCGIFMTU, SIOCGIFTXQLEN, SIOCSIFFLAGS, SIOCSIFMTU,
     },
     Socket,
 };
@@ -154,7 +154,7 @@ impl<T: Socket + 'static> IndexNode for T {
     ) -> Result<usize, SystemError> {
         match cmd {
             SIOCGIFCONF => handle_siocgifconf(self.netns(), data),
-            SIOCGIFINDEX | SIOCGIFFLAGS | SIOCGIFMTU | SIOCGIFHWADDR => {
+            SIOCGIFINDEX | SIOCGIFFLAGS | SIOCGIFMTU | SIOCGIFHWADDR | SIOCGIFTXQLEN => {
                 handle_netdev_query(self.netns(), cmd, data)
             }
             SIOCSIFFLAGS | SIOCSIFMTU => handle_netdev_mutation(self.netns(), cmd, data),

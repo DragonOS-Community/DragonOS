@@ -716,12 +716,9 @@ impl Attribute for AttrTxQueueLen {
         SysFSOpsSupport::ATTR_SHOW
     }
 
-    fn show(&self, _kobj: Arc<dyn KObject>, _buf: &mut [u8]) -> Result<usize, SystemError> {
-        todo!("AttrTxQueueLen::show")
-    }
-
-    fn store(&self, _kobj: Arc<dyn KObject>, _buf: &[u8]) -> Result<usize, SystemError> {
-        todo!("AttrTxQueueLen::store")
+    fn show(&self, kobj: Arc<dyn KObject>, buf: &mut [u8]) -> Result<usize, SystemError> {
+        let net_device = kobj.cast::<dyn Iface>().map_err(|_| SystemError::EINVAL)?;
+        sysfs_emit_str(buf, &format!("{}\n", net_device.common().tx_queue_len()))
     }
 }
 

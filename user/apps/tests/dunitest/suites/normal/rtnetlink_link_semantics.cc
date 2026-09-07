@@ -203,6 +203,7 @@ struct LinkSnapshot {
     uint32_t flags;
     uint32_t mtu;
     std::string name;
+    std::optional<uint32_t> tx_queue_len;
 };
 
 struct RouteProbe {
@@ -361,7 +362,7 @@ std::optional<LinkSnapshot> QueryLink(int fd, int ifindex, uint32_t seq) {
 
             const auto* link = reinterpret_cast<const ifinfomsg*>(NLMSG_DATA(header));
             if (link->ifi_index != ifindex) continue;
-            LinkSnapshot result {link->ifi_flags, 0, {}};
+            LinkSnapshot result {link->ifi_flags, 0, {}, std::nullopt};
             bool found_mtu = false;
             bool found_name = false;
             int attr_length = IFLA_PAYLOAD(header);
@@ -370,6 +371,10 @@ std::optional<LinkSnapshot> QueryLink(int fd, int ifindex, uint32_t seq) {
                 if (attr->rta_type == IFLA_MTU && RTA_PAYLOAD(attr) == sizeof(uint32_t)) {
                     std::memcpy(&result.mtu, RTA_DATA(attr), sizeof(result.mtu));
                     found_mtu = true;
+                } else if (attr->rta_type == IFLA_TXQLEN && RTA_PAYLOAD(attr) == sizeof(uint32_t)) {
+                    uint32_t value;
+                    std::memcpy(&value, RTA_DATA(attr), sizeof(value));
+                    result.tx_queue_len = value;
                 } else if (attr->rta_type == IFLA_IFNAME && RTA_PAYLOAD(attr) > 0) {
                     const auto* value = static_cast<const char*>(RTA_DATA(attr));
                     const size_t payload = RTA_PAYLOAD(attr);
@@ -964,6 +969,92 @@ std::optional<uint32_t> QueryLinkMtu(int ifindex) {
             }
             return std::nullopt;
         }
+    }
+}
+
+TEST(RtnetlinkLinkSemantics, TxQueueLengthMatchesIoctlSysfsAndLinkDump) {
+    FdGuard route(OpenRouteSocket());
+    FdGuard single(OpenRouteSocket());
+    FdGuard control(socket(AF_INET, SOCK_DGRAM, 0));
+    ASSERT_GE(route.Get(), 0);
+    ASSERT_GE(single.Get(), 0);
+    ASSERT_GE(control.Get(), 0);
+    struct {
+        nlmsghdr header;
+        ifinfomsg link;
+    } request {};
+    request.header.nlmsg_len = NLMSG_LENGTH(sizeof(ifinfomsg));
+    request.header.nlmsg_type = RTM_GETLINK;
+    request.header.nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
+    request.header.nlmsg_seq = 2258;
+    request.link.ifi_family = AF_UNSPEC;
+    ASSERT_EQ(send(route.Get(), &request, request.header.nlmsg_len, 0),
+              request.header.nlmsg_len);
+
+    bool done = false;
+    bool found_loopback = false;
+    bool found_ethernet = false;
+    // Dump enumerates devices without depending on configured IP addresses.
+    // Bound the receive loop in addition to the socket timeout.
+    for (int batch = 0; batch < 128 && !done; ++batch) {
+        alignas(nlmsghdr) std::array<unsigned char, 32768> buffer {};
+        const ssize_t received = recv(route.Get(), buffer.data(), buffer.size(), MSG_TRUNC);
+        ASSERT_GT(received, 0) << strerror(errno);
+        ASSERT_LE(static_cast<size_t>(received), buffer.size());
+        int remaining = static_cast<int>(received);
+        for (auto* header = reinterpret_cast<nlmsghdr*>(buffer.data());
+             NLMSG_OK(header, remaining); header = NLMSG_NEXT(header, remaining)) {
+            ASSERT_EQ(header->nlmsg_seq, 2258u);
+            ASSERT_EQ(header->nlmsg_flags & NLM_F_DUMP_INTR, 0);
+            if (header->nlmsg_type == NLMSG_DONE) {
+                done = true;
+                break;
+            }
+            ASSERT_EQ(header->nlmsg_type, RTM_NEWLINK);
+            ASSERT_GE(header->nlmsg_len, NLMSG_LENGTH(sizeof(ifinfomsg)));
+            const auto* link = static_cast<const ifinfomsg*>(NLMSG_DATA(header));
+            std::optional<uint32_t> dump_qlen;
+            int length = IFLA_PAYLOAD(header);
+            for (auto* attr = IFLA_RTA(link); RTA_OK(attr, length);
+                 attr = RTA_NEXT(attr, length)) {
+                if (attr->rta_type != IFLA_TXQLEN) continue;
+                ASSERT_FALSE(dump_qlen.has_value());
+                ASSERT_EQ(RTA_PAYLOAD(attr), sizeof(uint32_t));
+                uint32_t value;
+                std::memcpy(&value, RTA_DATA(attr), sizeof(value));
+                dump_qlen = value;
+            }
+            ASSERT_TRUE(dump_qlen.has_value()) << link->ifi_index;
+            const auto snapshot = QueryLink(single.Get(), link->ifi_index, 2259);
+            ASSERT_TRUE(snapshot.has_value());
+            ASSERT_TRUE(snapshot->tx_queue_len.has_value());
+            EXPECT_EQ(*snapshot->tx_queue_len, *dump_qlen);
+            ifreq ifr {};
+            std::strncpy(ifr.ifr_name, snapshot->name.c_str(), IFNAMSIZ - 1);
+            ASSERT_EQ(ioctl(control.Get(), SIOCGIFTXQLEN, &ifr), 0);
+            EXPECT_EQ(static_cast<uint32_t>(ifr.ifr_qlen), *dump_qlen);
+
+            const std::string path = "/sys/class/net/" + snapshot->name + "/tx_queue_len";
+            FdGuard attribute(open(path.c_str(), O_RDONLY));
+            ASSERT_GE(attribute.Get(), 0) << path << ": " << strerror(errno);
+            std::array<char, 32> text {};
+            const ssize_t count = read(attribute.Get(), text.data(), text.size());
+            ASSERT_GT(count, 0) << strerror(errno);
+            EXPECT_EQ(std::string(text.data(), count), std::to_string(*dump_qlen) + "\n");
+            if (IsDragonOS()) {
+                EXPECT_EQ(*dump_qlen, 1000u);
+                struct stat metadata {};
+                ASSERT_EQ(fstat(attribute.Get(), &metadata), 0);
+                EXPECT_EQ(metadata.st_mode & 0222, 0u);
+            }
+            found_loopback |= snapshot->name == "lo";
+            found_ethernet |= link->ifi_type == 1;  // ARPHRD_ETHER
+        }
+    }
+    EXPECT_TRUE(done);
+    EXPECT_TRUE(found_loopback);
+    if (IsDragonOS()) {
+        EXPECT_TRUE(found_ethernet);
     }
 }
 

@@ -23,8 +23,8 @@
 
 namespace {
 
-constexpr std::array<unsigned long, 4> kQueryCommands = {
-    SIOCGIFINDEX, SIOCGIFFLAGS, SIOCGIFMTU, SIOCGIFHWADDR};
+constexpr std::array<unsigned long, 5> kQueryCommands = {
+    SIOCGIFINDEX, SIOCGIFFLAGS, SIOCGIFMTU, SIOCGIFHWADDR, SIOCGIFTXQLEN};
 constexpr unsigned char kSentinel = 0xa5;
 
 class ScopedFd {
@@ -119,6 +119,13 @@ TEST(SocketIoctlNetdevQuery, LoopbackFieldsAndUnionWidths) {
         EXPECT_EQ(static_cast<unsigned char>(ifr.ifr_hwaddr.sa_data[i]), 0);
     }
     ExpectSentinelFrom(ifr, sizeof(sa_family_t) + 6);
+
+    InitIfreq(&ifr, "lo");
+    ASSERT_EQ(ioctl(fd.get(), SIOCGIFTXQLEN, &ifr), 0) << strerror(errno);
+    if (IsDragonOS()) {
+        EXPECT_EQ(ifr.ifr_qlen, 1000);
+    }
+    ExpectSentinelFrom(ifr, sizeof(int));
 }
 
 TEST(SocketIoctlNetdevQuery, NameNormalizationAndAliases) {
@@ -161,6 +168,41 @@ TEST(SocketIoctlNetdevQuery, NameNormalizationAndAliases) {
     EXPECT_EQ(errno, ENODEV);
 }
 
+TEST(SocketIoctlNetdevQuery, TxQueueLengthAcrossSocketFamiliesAndAliases) {
+    for (int family : {AF_INET, AF_UNIX}) {
+        ScopedFd fd(socket(family, SOCK_DGRAM, 0));
+        ASSERT_GE(fd.get(), 0);
+        struct ifreq plain {};
+        InitIfreq(&plain, "lo");
+        ASSERT_EQ(ioctl(fd.get(), SIOCGIFTXQLEN, &plain), 0);
+        struct ifreq alias {};
+        InitIfreq(&alias, "lo:1");
+        alias.ifr_name[IFNAMSIZ - 1] = 'x';
+        ASSERT_EQ(ioctl(fd.get(), SIOCGIFTXQLEN, &alias), 0);
+        EXPECT_EQ(alias.ifr_qlen, plain.ifr_qlen);
+        EXPECT_STREQ(alias.ifr_name, "lo:1");
+        EXPECT_EQ(alias.ifr_name[IFNAMSIZ - 1], '\0');
+        ExpectSentinelFrom(alias, sizeof(int));
+    }
+}
+
+TEST(SocketIoctlNetdevQuery, TxQueueLengthWithoutCapabilities) {
+    const pid_t child = fork();
+    ASSERT_GE(child, 0);
+    if (child == 0) {
+        if (DropAllCapabilities() != 0) _exit(10);
+        ScopedFd fd(socket(AF_INET, SOCK_DGRAM, 0));
+        if (fd.get() < 0) _exit(11);
+        struct ifreq ifr {};
+        InitIfreq(&ifr, "lo");
+        _exit(ioctl(fd.get(), SIOCGIFTXQLEN, &ifr) == 0 ? 0 : 12);
+    }
+    int status = 0;
+    ASSERT_EQ(waitpid(child, &status, 0), child);
+    ASSERT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(WEXITSTATUS(status), 0);
+}
+
 TEST(SocketIoctlNetdevQuery, MissingDeviceAndUserCopyFaults) {
     ScopedFd fd(socket(AF_INET, SOCK_DGRAM, 0));
     ASSERT_GE(fd.get(), 0);
@@ -191,9 +233,11 @@ TEST(SocketIoctlNetdevQuery, MissingDeviceAndUserCopyFaults) {
         static_cast<char*>(mapping) + page_size - sizeof(struct ifreq) + 1);
     std::memset(partial, 0, sizeof(struct ifreq) - 1);
     std::memcpy(partial->ifr_name, "lo", 3);
-    errno = 0;
-    EXPECT_EQ(ioctl(fd.get(), SIOCGIFINDEX, partial), -1);
-    EXPECT_EQ(errno, EFAULT);
+    for (unsigned long command : kQueryCommands) {
+        errno = 0;
+        EXPECT_EQ(ioctl(fd.get(), command, partial), -1) << command;
+        EXPECT_EQ(errno, EFAULT) << command;
+    }
     ASSERT_EQ(mprotect(static_cast<char*>(mapping) + page_size, page_size,
                        PROT_READ | PROT_WRITE),
               0);
@@ -205,9 +249,11 @@ TEST(SocketIoctlNetdevQuery, MissingDeviceAndUserCopyFaults) {
     auto* readonly_ifr = static_cast<struct ifreq*>(readonly);
     InitIfreq(readonly_ifr, "lo");
     ASSERT_EQ(mprotect(readonly, page_size, PROT_READ), 0);
-    errno = 0;
-    EXPECT_EQ(ioctl(fd.get(), SIOCGIFINDEX, readonly_ifr), -1);
-    EXPECT_EQ(errno, EFAULT);
+    for (unsigned long command : kQueryCommands) {
+        errno = 0;
+        EXPECT_EQ(ioctl(fd.get(), command, readonly_ifr), -1) << command;
+        EXPECT_EQ(errno, EFAULT) << command;
+    }
     ASSERT_EQ(mprotect(readonly, page_size, PROT_READ | PROT_WRITE), 0);
     ASSERT_EQ(munmap(readonly, page_size), 0);
 }
@@ -288,6 +334,7 @@ int RunSocketNetnsCase() {
     if (!old_unique.empty()) {
         InitIfreq(&ifr, old_unique.c_str());
         if (ioctl(old_fd.get(), SIOCGIFINDEX, &ifr) != 0) return 11;
+        if (ioctl(old_fd.get(), SIOCGIFTXQLEN, &ifr) != 0) return 22;
     }
 
     ScopedFd new_fd(socket(AF_INET, SOCK_DGRAM, 0));
@@ -301,6 +348,7 @@ int RunSocketNetnsCase() {
         if (ioctl(new_fd.get(), SIOCGIFINDEX, &ifr) != -1 || errno != ENODEV) {
             return 14;
         }
+        if (ioctl(new_fd.get(), SIOCGIFTXQLEN, &ifr) != -1 || errno != ENODEV) return 23;
         if (!Contains(ListInterfaces(old_fd.get()), old_unique)) return 15;
         if (Contains(ListInterfaces(new_fd.get()), old_unique)) return 16;
     } else if (IsDragonOS()) {
@@ -312,6 +360,8 @@ int RunSocketNetnsCase() {
     if (ioctl(new_fd.get(), SIOCGIFHWADDR, &ifr) != 0) return 19;
     if (ioctl(new_fd.get(), SIOCGIFFLAGS, &ifr) != 0) return 20;
     if (ioctl(new_fd.get(), SIOCGIFMTU, &ifr) != 0) return 21;
+    if (ioctl(new_fd.get(), SIOCGIFFLAGS, &ifr) != 0 || (ifr.ifr_flags & IFF_UP)) return 24;
+    if (ioctl(new_fd.get(), SIOCGIFTXQLEN, &ifr) != 0 || ifr.ifr_qlen != 1000) return 25;
     return 0;
 }
 

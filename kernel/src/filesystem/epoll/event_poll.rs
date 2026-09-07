@@ -664,7 +664,7 @@ impl EventPoll {
         let mut pending = stolen.into_iter();
         let mut error = None;
         let mut remaining = Vec::new();
-        while let Some(epitem) = pending.next() {
+        for epitem in pending.by_ref() {
             if res >= max_events as usize {
                 remaining.push(epitem);
                 break;

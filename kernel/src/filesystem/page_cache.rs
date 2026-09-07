@@ -812,6 +812,39 @@ pub struct CopyItem {
     page_index: usize,
     page_offset: usize,
     sub_len: usize,
+    created: bool,
+}
+
+/// Own write preparation until publication, including its failure cleanup.
+/// Page locks and dirty reservations must be dropped before this owner.
+struct PreparedWriteCopies<'a> {
+    cache: &'a PageCache,
+    items: Vec<CopyItem>,
+    rollback: bool,
+}
+
+impl Drop for PreparedWriteCopies<'_> {
+    fn drop(&mut self) {
+        if !self.rollback {
+            return;
+        }
+        for item in self.items.drain(..).rev() {
+            let CopyItem {
+                entry,
+                _pin,
+                page_index,
+                created,
+                ..
+            } = item;
+            drop(_pin);
+            if created {
+                let _ = self
+                    .cache
+                    .manager()
+                    .discard_created_page(page_index, &entry.page);
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -2535,9 +2568,10 @@ impl PageCache {
         &self,
         page_index: usize,
         populate_backend: bool,
-    ) -> Result<(Arc<PageEntry>, PageEntryPin), SystemError> {
+    ) -> Result<(Arc<PageEntry>, PageEntryPin, bool), SystemError> {
         loop {
-            let entry = self.get_or_create_entry(page_index, populate_backend)?;
+            let (entry, created) =
+                self.get_or_create_entry_with_status(page_index, populate_backend)?;
             let guard = self.inner.lock();
             let Some(current) = guard.get_entry(page_index) else {
                 continue;
@@ -2546,7 +2580,7 @@ impl PageCache {
                 continue;
             }
             let pin = entry.pin();
-            return Ok((entry, pin));
+            return Ok((entry, pin, created));
         }
     }
 
@@ -3479,13 +3513,14 @@ impl PageCache {
                 continue;
             }
 
-            let (entry, pin) = self.get_or_create_entry_pinned(page_index, true)?;
+            let (entry, pin, _) = self.get_or_create_entry_pinned(page_index, true)?;
             copies.push(CopyItem {
                 entry,
                 _pin: pin,
                 page_index,
                 page_offset: read_start - page_start,
                 sub_len: page_read_len,
+                created: false,
             });
             ret += page_read_len;
         }
@@ -3508,14 +3543,14 @@ impl PageCache {
     }
 
     pub fn write(&self, offset: usize, buf: &[u8]) -> Result<usize, SystemError> {
-        let (copies, ret) = self.prepare_write_copies(offset, buf.len())?;
+        let (mut copies, ret) = self.prepare_write_copies(offset, buf.len())?;
         let mut dirty_reservation = if ret != 0 {
             Some(self.prepare_page_dirty()?)
         } else {
             None
         };
         let mut src_offset = 0;
-        for item in copies {
+        for item in &copies.items {
             // Prefault before taking the page lock.
             let _ = volatile_read!(buf[src_offset]);
             let mut page_guard = item.entry.page.write();
@@ -3535,6 +3570,7 @@ impl PageCache {
                 self.mark_page_dirty_page_locked(item.page_index, &page_guard)?;
             }
         }
+        copies.rollback = false;
         Ok(ret)
     }
 
@@ -3579,8 +3615,8 @@ impl PageCache {
 
         let (mut copies, ret) = self.prepare_write_copies(offset, buf.len())?;
         debug_assert_eq!(ret, MMArch::PAGE_SIZE);
-        let item = copies.pop().ok_or(SystemError::EIO)?;
-        debug_assert!(copies.is_empty());
+        let item = copies.items.first().ok_or(SystemError::EIO)?;
+        debug_assert_eq!(copies.items.len(), 1);
         debug_assert_eq!(item.page_offset, 0);
         debug_assert_eq!(item.sub_len, MMArch::PAGE_SIZE);
 
@@ -3625,6 +3661,7 @@ impl PageCache {
         // handoff code must retain only its Copy certificate; an Arc is not a
         // membership pin and must not escape as a delayed-map ticket.
         on_published(publication.into_transition(self.instance_id, &current));
+        copies.rollback = false;
         Ok(ret)
     }
 
@@ -3657,8 +3694,8 @@ impl PageCache {
         }
 
         let (mut copies, ret) = self.prepare_write_copies(offset, buf.len())?;
-        let item = copies.pop().ok_or(SystemError::EIO)?;
-        if !copies.is_empty()
+        let item = copies.items.first().ok_or(SystemError::EIO)?;
+        if copies.items.len() != 1
             || ret != buf.len()
             || item.page_index != page_index
             || item.page_offset != page_offset
@@ -3718,6 +3755,7 @@ impl PageCache {
             }
         };
         on_published(publication.into_transition(self.instance_id, &current));
+        copies.rollback = false;
         Ok(ret)
     }
 
@@ -3725,42 +3763,44 @@ impl PageCache {
         &self,
         offset: usize,
         len: usize,
-    ) -> Result<(Vec<CopyItem>, usize), SystemError> {
+    ) -> Result<(PreparedWriteCopies<'_>, usize), SystemError> {
+        let mut copies = PreparedWriteCopies {
+            cache: self,
+            items: Vec::new(),
+            rollback: true,
+        };
         if len == 0 {
-            return Ok((Vec::new(), 0));
+            return Ok((copies, 0));
         }
-
+        let end = offset.checked_add(len).ok_or(SystemError::EFBIG)?;
         let start_page_index = offset >> MMArch::PAGE_SHIFT;
-        let end_page_index = (offset + len - 1) >> MMArch::PAGE_SHIFT;
-        let mut copies: Vec<CopyItem> = Vec::new();
-        let mut ret = 0usize;
+        let end_page_index = (end - 1) >> MMArch::PAGE_SHIFT;
+        copies
+            .items
+            .try_reserve_exact(end_page_index - start_page_index + 1)
+            .map_err(|_| SystemError::ENOMEM)?;
 
         for page_index in start_page_index..=end_page_index {
             let page_start = page_index * MMArch::PAGE_SIZE;
-            let page_end = page_start + MMArch::PAGE_SIZE;
             let write_start = core::cmp::max(offset, page_start);
-            let write_end = core::cmp::min(offset + len, page_end);
-            let page_write_len = write_end.saturating_sub(write_start);
-            if page_write_len == 0 {
-                continue;
-            }
-
+            let write_end = core::cmp::min(end, page_start.saturating_add(MMArch::PAGE_SIZE));
+            let page_write_len = write_end - write_start;
             let full_page_overwrite =
                 write_start == page_start && page_write_len == MMArch::PAGE_SIZE;
             let populate_backend = !self.is_shmem() && !full_page_overwrite;
             self.discard_error_entry(page_index);
-            let (entry, pin) = self.get_or_create_entry_pinned(page_index, populate_backend)?;
-            copies.push(CopyItem {
+            let (entry, pin, created) =
+                self.get_or_create_entry_pinned(page_index, populate_backend)?;
+            copies.items.push(CopyItem {
                 entry,
                 _pin: pin,
                 page_index,
                 page_offset: write_start - page_start,
                 sub_len: page_write_len,
+                created,
             });
-            ret += page_write_len;
         }
-
-        Ok((copies, ret))
+        Ok((copies, len))
     }
 
     /// Two-phase write: prepare and pin every destination page before
@@ -3780,13 +3820,13 @@ impl PageCache {
     where
         F: FnOnce(usize) -> Result<(), SystemError>,
     {
-        let (copies, ret) = self.prepare_write_copies(offset, buf.len())?;
+        let (mut copies, ret) = self.prepare_write_copies(offset, buf.len())?;
         if ret == 0 {
             return Ok(0);
         }
 
         let mut src_offset = 0;
-        for item in &copies {
+        for item in &copies.items {
             // Prefault each source segment before the metadata commit so the
             // remaining page-locked copy path cannot introduce a new failure
             // point after the filesystem publishes the write.
@@ -3797,13 +3837,17 @@ impl PageCache {
         // Lock in ascending page-index order (the same order as `copies`) so
         // readers and writeback cannot observe metadata for the new EOF until
         // all copied bytes and PG_DIRTY transitions are ready to be exposed.
-        let mut page_guards: Vec<_> = copies.iter().map(|item| item.entry.page.write()).collect();
+        let mut page_guards = Vec::new();
+        page_guards
+            .try_reserve_exact(copies.items.len())
+            .map_err(|_| SystemError::ENOMEM)?;
+        page_guards.extend(copies.items.iter().map(|item| item.entry.page.write()));
 
         let mut dirty_reservation = self.prepare_page_dirty()?;
         before_dirty(ret)?;
 
         src_offset = 0;
-        for (item, page_guard) in copies.iter().zip(page_guards.iter_mut()) {
+        for (item, page_guard) in copies.items.iter().zip(page_guards.iter_mut()) {
             unsafe {
                 page_guard.as_slice_mut()[item.page_offset..item.page_offset + item.sub_len]
                     .copy_from_slice(&buf[src_offset..src_offset + item.sub_len]);
@@ -3811,7 +3855,7 @@ impl PageCache {
             page_guard.add_flags(PageFlags::PG_DIRTY);
             src_offset += item.sub_len;
         }
-        for (index, (item, page_guard)) in copies.iter().zip(page_guards.iter()).enumerate() {
+        for (index, (item, page_guard)) in copies.items.iter().zip(page_guards.iter()).enumerate() {
             if index == 0 {
                 self.mark_page_dirty_prepared_page_locked(
                     item.page_index,
@@ -3823,6 +3867,7 @@ impl PageCache {
             }
         }
 
+        copies.rollback = false;
         Ok(ret)
     }
 }

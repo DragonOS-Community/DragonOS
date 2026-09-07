@@ -1749,6 +1749,81 @@ fn run_preallocate_rollback_selftest() -> Result<bool, SystemError> {
     Ok(success && backend.live.load(Ordering::Relaxed) == 0)
 }
 
+fn run_write_prepare_rollback_selftest() -> Result<bool, SystemError> {
+    // Retention admission fails after preparation for an unattached file
+    // cache. All write entry points must keep rollback ownership until then.
+    let file_cache = PageCache::new_unowned(None, None);
+    let full_page = vec![0x33; MMArch::PAGE_SIZE];
+    if file_cache.write(0, &full_page) != Err(SystemError::EIO)
+        || file_cache.manager().pages_count()? != 0
+        || file_cache.write_single_full_page_with_transition(0, &full_page, |_| {})
+            != Err(SystemError::EIO)
+        || file_cache.manager().pages_count()? != 0
+        || file_cache.write_single_page_segment_with_transition(
+            0,
+            &full_page,
+            PageCacheExpectedDirtyTransition::Start,
+            |_| {},
+        ) != Err(SystemError::EIO)
+        || file_cache.manager().pages_count()? != 0
+    {
+        return Ok(false);
+    }
+    let backend = Arc::new(PreallocateFailureBackend {
+        live: AtomicUsize::new(0),
+        limit: AtomicUsize::new(3),
+    });
+    let cache = PageCache::new_shmem(None, Some(backend.clone()));
+    cache.set_unevictable(true);
+    let existing = cache.manager().commit_overwrite(0)?;
+    {
+        let mut page = existing.write();
+        unsafe { page.as_slice_mut()[17] = 0x5a };
+        page.add_flags(PageFlags::PG_DIRTY);
+    }
+    let data = vec![0x7b; 5 * MMArch::PAGE_SIZE];
+    let metadata_called = core::cell::Cell::new(false);
+    for offset in [0, 8 * MMArch::PAGE_SIZE] {
+        let result = cache.write_with_before_dirty(offset, &data, |_| {
+            metadata_called.set(true);
+            Ok(())
+        });
+        if result != Err(SystemError::ENOMEM)
+            || metadata_called.get()
+            || cache.manager().pages_count()? != 1
+            || backend.live.load(Ordering::Relaxed) != 1
+            || unsafe { existing.read().as_slice()[17] != 0x5a }
+        {
+            return Ok(false);
+        }
+    }
+    if cache.write(0, &data) != Err(SystemError::ENOMEM)
+        || cache.manager().pages_count()? != 1
+        || backend.live.load(Ordering::Relaxed) != 1
+    {
+        return Ok(false);
+    }
+    // A filesystem can reject its metadata commit after all pages are ready.
+    backend.limit.store(5, Ordering::Relaxed);
+    if cache.write_with_before_dirty(0, &data, |_| Err(SystemError::ENOSPC))
+        != Err(SystemError::ENOSPC)
+        || cache.manager().pages_count()? != 1
+        || backend.live.load(Ordering::Relaxed) != 1
+        || unsafe { existing.read().as_slice()[17] != 0x5a }
+    {
+        return Ok(false);
+    }
+    if cache.write_with_before_dirty(0, &data, |_| Ok(()))? != data.len()
+        || cache.manager().pages_count()? != 5
+        || unsafe { existing.read().as_slice()[17] != 0x7b }
+    {
+        return Ok(false);
+    }
+    drop(existing);
+    drop(cache);
+    Ok(backend.live.load(Ordering::Relaxed) == 0)
+}
+
 pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, SystemError> {
     if PAGECACHE_ACCOUNTING_SELFTEST_RUNNING
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -1757,6 +1832,10 @@ pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, S
         return Err(SystemError::EBUSY);
     }
     let _running = PageCacheAccountingSelftestGuard;
+
+    if !run_write_prepare_rollback_selftest()? {
+        return Ok("status=fail stage=write_prepare_rollback\n".into());
+    }
 
     if !run_preallocate_rollback_selftest()? {
         return Ok("status=fail stage=preallocate_rollback\n".into());
@@ -3621,6 +3700,6 @@ pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, S
     }
 
     Ok(alloc::format!(
-        "status=ok\npreallocate_rollback=ok\nwriteback_domain_lifecycle=ok\npreallocated_batch_lifecycle=ok\nfile_membership=ok\nshmem_membership=ok\ndirty_membership=ok\ndirty_incarnation=ok\nremote_dirty_publish=ok\nwriteback_membership=ok\nwriteback_admission_order=ok\nwriteback_submission_token=ok\nwriteback_defer_progress=ok\nwriteback_budget_retry=ok\nfault_invalidate_retry_order=ok\ntag_scan_chunk_release=ok\nunevictable_membership=ok\ninflight_teardown=ok\nlate_completion=ok\nglobal_wiring=ok\nlayout=ok\nfile_drop_drift={file_drop_drift}\nshmem_drop_drift={shmem_drop_drift}\ndirty_drop_drift={dirty_drop_drift}\nwriteback_drop_drift={writeback_drop_drift}\nunevictable_drop_drift={unevictable_drop_drift}\nentry_size={entry_size}\nbaseline_size={baseline_size}\n"
+        "status=ok\nwrite_prepare_rollback=ok\npreallocate_rollback=ok\nwriteback_domain_lifecycle=ok\npreallocated_batch_lifecycle=ok\nfile_membership=ok\nshmem_membership=ok\ndirty_membership=ok\ndirty_incarnation=ok\nremote_dirty_publish=ok\nwriteback_membership=ok\nwriteback_admission_order=ok\nwriteback_submission_token=ok\nwriteback_defer_progress=ok\nwriteback_budget_retry=ok\nfault_invalidate_retry_order=ok\ntag_scan_chunk_release=ok\nunevictable_membership=ok\ninflight_teardown=ok\nlate_completion=ok\nglobal_wiring=ok\nlayout=ok\nfile_drop_drift={file_drop_drift}\nshmem_drop_drift={shmem_drop_drift}\ndirty_drop_drift={dirty_drop_drift}\nwriteback_drop_drift={writeback_drop_drift}\nunevictable_drop_drift={unevictable_drop_drift}\nentry_size={entry_size}\nbaseline_size={baseline_size}\n"
     ))
 }

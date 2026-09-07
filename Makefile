@@ -169,8 +169,14 @@ rootfs: check_nix
 	@echo "To change building image type, change the 'rootfsType' to 'vfat' in flake.nix"
 	nix run .#rootfs-x86_64
 
+# Build the deterministic sysconfig payload (bin/sysconfig.tar);
+# it must be up to date before writing the disk image.
+.PHONY: prepare_sysconfig_payload
+prepare_sysconfig_payload:
+	$(MAKE) -C ./user prepare_sysconfig_payload
+
 # 写入磁盘镜像
-write_diskimage: prepare_rootfs_manifest
+write_diskimage: prepare_rootfs_manifest prepare_sysconfig_payload
 ifeq ($(IN_NIX_ENV),1)
 	@echo "⚠️  警告: 在 Nix 环境中使用 'make write_diskimage' 已被弃用"
 	@echo "   请使用: nix run .#rootfs-$(ARCH)"
@@ -183,7 +189,7 @@ else
 endif
 
 # 写入磁盘镜像(uefi)
-write_diskimage-uefi: prepare_rootfs_manifest
+write_diskimage-uefi: prepare_rootfs_manifest prepare_sysconfig_payload
 	bash -c "export ARCH=$(ARCH); export ROOTFS_MANIFEST=$(ROOTFS_MANIFEST); cd tools && $(GRUB_PREPARE_CMD) && sudo DADK=$(DADK) $(GRUB_SKIP_ENV) ARCH=$(ARCH) ROOTFS_MANIFEST=$(ROOTFS_MANIFEST) bash $(ROOT_PATH)/tools/write_disk_image.sh --bios=uefi && cd .."
 # 不编译，直接启动QEMU
 qemu: check_arch

@@ -24,6 +24,14 @@ jobs:
             kernel:
               - 'kernel/**'
 
+  sysconfig-payload-test:
+    name: Sysconfig payload generator test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Run sysconfig payload generator unit tests
+        run: python3 tools/test_build_sysconfig_payload.py
+
   format-check:
     name: Format check ${{ matrix.arch }}
     runs-on: ubuntu-latest

@@ -559,8 +559,14 @@ TEST_F(RamfsFileBacking, SameSizeAndGrowingTruncateClearPastEof) {
     EXPECT_EQ(0, shared[128]);
     EXPECT_EQ(original, shared[0]);
 
+    shared[32] = 0x73;
     shared[128] = 0x72;
     ASSERT_EQ(0, ftruncate(fd_, 64));
+    // Linux ramfs preserves explicitly written bytes exposed by growth.
+    EXPECT_EQ(0x73, shared[32]);
+    unsigned char exposed = 0;
+    ASSERT_EQ(1, pread(fd_, &exposed, 1, 32));
+    EXPECT_EQ(0x73, exposed);
     EXPECT_EQ(0, shared[128]);
     EXPECT_EQ(original, shared[0]);
     struct stat metadata {};

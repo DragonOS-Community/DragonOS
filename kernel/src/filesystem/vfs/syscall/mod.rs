@@ -70,6 +70,7 @@ mod epoll_utils;
 mod sys_epoll_create1;
 mod sys_epoll_ctl;
 mod sys_epoll_pwait;
+mod sys_epoll_pwait2;
 
 pub mod symlink_utils;
 mod sys_copy_file_range;

@@ -1,6 +1,6 @@
 //! System call handler for epoll_wait.
 
-use super::epoll_utils::do_epoll_wait;
+use super::epoll_utils::{do_epoll_wait, epoll_msec_deadline};
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_EPOLL_WAIT;
 use crate::mm::VirtAddr;
@@ -22,7 +22,7 @@ impl Syscall for SysEpollWaitHandle {
         let timeout = Self::timeout(args);
         let events = Self::events(args);
 
-        do_epoll_wait(epfd, events, max_events, timeout)
+        do_epoll_wait(epfd, events, max_events, epoll_msec_deadline(timeout))
     }
 
     fn entry_format(&self, args: &[usize]) -> Vec<FormattedSyscallParam> {

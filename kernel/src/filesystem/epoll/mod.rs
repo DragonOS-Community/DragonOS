@@ -11,7 +11,7 @@ pub mod fs;
 
 /// 与C兼容的Epoll事件结构体
 #[derive(Copy, Clone, Default)]
-#[repr(packed)]
+#[cfg_attr(target_arch = "x86_64", repr(packed))]
 #[repr(C)]
 pub struct EPollEvent {
     /// 表示触发的事件
@@ -32,6 +32,8 @@ impl Debug for EPollEvent {
 }
 
 impl EPollEvent {
+    pub(crate) const DATA_OFFSET: usize = core::mem::offset_of!(Self, data);
+
     pub fn set_events(&mut self, events: u32) {
         self.events = events;
     }

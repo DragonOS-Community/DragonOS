@@ -21,3 +21,5 @@ normal/socket_ioctl_netdev_query
 normal/socket_ioctl_netdev_mutation
 normal/tcp_self_connect_semantics
 normal/poll_timeout_semantics
+
+normal/epoll_pwait2_semantics

@@ -11,8 +11,9 @@ use crate::{
     },
     process::ProcessManager,
     time::{
+        timekeeping::monotonic_now,
         timer::{next_n_us_timer_jiffies, Timer},
-        Duration, Instant, PosixTimeSpec,
+        PosixTimeSpec,
     },
 };
 use core::fmt::Debug;
@@ -378,9 +379,9 @@ impl EventPoll {
 
     pub fn epoll_wait(
         epfd: i32,
-        epoll_event: &mut [EPollEvent],
         max_events: i32,
-        timespec: Option<PosixTimeSpec>,
+        deadline: Option<PosixTimeSpec>,
+        output: &mut dyn FnMut(usize, &EPollEvent) -> Result<(), SystemError>,
     ) -> Result<usize, SystemError> {
         let current_pcb = ProcessManager::current_pcb();
         let fd_table = current_pcb.fd_table();
@@ -392,7 +393,7 @@ impl EventPoll {
             .ok_or(SystemError::EBADF)?;
 
         drop(fd_table_guard);
-        Self::epoll_wait_with_file(ep_file, epoll_event, max_events, timespec)
+        Self::wait_with_output(ep_file, max_events, deadline, output)
     }
 
     /// ## epoll_wait的具体实现
@@ -401,6 +402,36 @@ impl EventPoll {
         epoll_event: &mut [EPollEvent],
         max_events: i32,
         timespec: Option<PosixTimeSpec>,
+    ) -> Result<usize, SystemError> {
+        if max_events <= 0 || epoll_event.len() < max_events as usize {
+            return Err(SystemError::EINVAL);
+        }
+        Self::wait_with_output(
+            ep_file,
+            max_events,
+            timespec.map(Self::timeout_to_deadline),
+            &mut |index, event| {
+                epoll_event[index] = *event;
+                Ok(())
+            },
+        )
+    }
+
+    /// Convert a valid relative timeout once; zero remains the polling sentinel.
+    pub(crate) fn timeout_to_deadline(timeout: PosixTimeSpec) -> PosixTimeSpec {
+        if timeout.is_empty() {
+            timeout
+        } else {
+            monotonic_now().saturating_add_ktime(&timeout)
+        }
+    }
+
+    /// Shared wait engine. The deadline is absolute CLOCK_MONOTONIC.
+    fn wait_with_output(
+        ep_file: Arc<File>,
+        max_events: i32,
+        deadline: Option<PosixTimeSpec>,
+        output: &mut dyn FnMut(usize, &EPollEvent) -> Result<(), SystemError>,
     ) -> Result<usize, SystemError> {
         let current_pcb = ProcessManager::current_pcb();
 
@@ -423,28 +454,14 @@ impl EventPoll {
                 ep_guard.ready_state.clone()
             };
 
-            let mut timeout = false;
-            let mut deadline: Option<Instant> = None;
-            if let Some(timespec) = timespec {
-                if !(timespec.tv_sec > 0 || timespec.tv_nsec > 0) {
-                    // 非阻塞情况
-                    timeout = true;
-                } else {
-                    let timeout_us =
-                        (timespec.tv_sec * 1_000_000 + timespec.tv_nsec / 1_000) as u64;
-                    deadline = Some(Instant::now() + Duration::from_micros(timeout_us));
-                }
-            } else if timespec.is_none() {
-                // 非阻塞情况
-                timeout = false;
-            }
+            let mut timeout = deadline.is_some_and(|time| time.is_empty());
             // 判断epoll上有没有就绪事件（仅需 SpinLock）
             let mut available = Self::ep_events_available_rs(&rs_arc);
 
             loop {
                 if available {
                     // 如果有就绪的事件，则直接返回就绪事件
-                    let sent = Self::ep_send_events(epoll.clone(), epoll_event, max_events)?;
+                    let sent = Self::ep_send_events(epoll.clone(), output, max_events)?;
 
                     // Linux 语义：阻塞等待时，被唤醒但没有可返回事件应继续等待。
                     // 这会发生在并发读/状态变化导致 ready_list 中项目在 poll 时已不再就绪。
@@ -463,10 +480,19 @@ impl EventPoll {
                     return Ok(0);
                 }
 
-                if let Some(deadline) = deadline {
-                    if Instant::now() >= deadline {
-                        return Ok(0);
-                    }
+                // 如果有未处理且未被屏蔽的信号则返回错误
+                if current_pcb.has_pending_signal_fast()
+                    && current_pcb.has_pending_not_masked_signal()
+                {
+                    // Linux epoll_wait(2): interrupted by signal handler -> EINTR.
+                    // Returning ERESTARTSYS would cause userspace to restart the syscall
+                    // (SA_RESTART), which breaks gVisor's UnblockWithSignal expectation.
+                    return Err(SystemError::EINTR);
+                }
+
+                if deadline.is_some_and(|time| monotonic_now().to_ktime_ns() >= time.to_ktime_ns())
+                {
+                    return Ok(0);
                 }
 
                 // 自旋等待一段时间（仅需 SpinLock）
@@ -488,16 +514,6 @@ impl EventPoll {
                     continue;
                 }
 
-                // 如果有未处理且未被屏蔽的信号则返回错误
-                if current_pcb.has_pending_signal_fast()
-                    && current_pcb.has_pending_not_masked_signal()
-                {
-                    // Linux epoll_wait(2): interrupted by signal handler -> EINTR.
-                    // Returning ERESTARTSYS would cause userspace to restart the syscall
-                    // (SA_RESTART), which breaks gVisor's UnblockWithSignal expectation.
-                    return Err(SystemError::EINTR);
-                }
-
                 // 还未等待到事件发生，则睡眠
                 // 构造一次等待（先构造 Waiter/Waker，超时需要通过 Waker::wake 触发）
                 let (waiter, waker) = Waiter::new_pair();
@@ -505,11 +521,13 @@ impl EventPoll {
                 // 注册定时器：用 waker.wake() 来触发 waiter 退出等待（而不是仅唤醒 PCB）
                 let mut timer = None;
                 if let Some(deadline) = deadline {
-                    let remain = deadline.saturating_sub(Instant::now());
-                    if remain == Duration::ZERO {
+                    let remain_ns = deadline
+                        .to_ktime_ns()
+                        .saturating_sub(monotonic_now().to_ktime_ns());
+                    if remain_ns == 0 {
                         timeout = true;
                     } else {
-                        let jiffies = next_n_us_timer_jiffies(remain.total_micros());
+                        let jiffies = next_n_us_timer_jiffies(remain_ns.div_ceil(1_000));
                         let inner: Arc<Timer> =
                             Timer::new(TimeoutWaker::new(waker.clone()), jiffies);
                         timer = Some(inner);
@@ -554,11 +572,12 @@ impl EventPoll {
                 }
 
                 if let Some(timer) = timer {
-                    if timer.as_ref().timeout() {
-                        timeout = true;
-                    } else {
-                        timer.cancel();
-                    }
+                    // A coarse timer firing alone does not establish expiry.
+                    timeout = timer.timeout()
+                        && deadline.is_some_and(|time| {
+                            monotonic_now().to_ktime_ns() >= time.to_ktime_ns()
+                        });
+                    timer.cancel();
                 }
 
                 wait_res?;
@@ -631,12 +650,9 @@ impl EventPoll {
     /// 3. ep_done_scan: 将 ovflist 合并回 ready_list，重入队水平触发项
     fn ep_send_events(
         epoll: LockedEventPoll,
-        user_event: &mut [EPollEvent],
+        output: &mut dyn FnMut(usize, &EPollEvent) -> Result<(), SystemError>,
         max_events: i32,
     ) -> Result<usize, SystemError> {
-        if user_event.len() < max_events as usize {
-            return Err(SystemError::EINVAL);
-        }
         let ep_guard = epoll.0.lock();
         let mut res: usize = 0;
 
@@ -645,9 +661,12 @@ impl EventPoll {
 
         // Phase 2: 遍历偷取的列表（此时 ovflist 吸收并发回调）
         let mut push_back = Vec::new();
-        for epitem in stolen {
+        let mut pending = stolen.into_iter();
+        let mut error = None;
+        let mut remaining = Vec::new();
+        while let Some(epitem) = pending.next() {
             if res >= max_events as usize {
-                push_back.push(epitem);
+                remaining.push(epitem);
                 break;
             }
             let revents = epitem.ep_item_poll();
@@ -666,7 +685,12 @@ impl EventPoll {
                 data: epitem.event.lock_irqsave().data,
             };
 
-            user_event[res] = event;
+            if let Err(err) = output(res, &event) {
+                // Failed delivery must not consume ET/ONESHOT state.
+                remaining.push(epitem);
+                error = Some(err);
+                break;
+            }
             res += 1;
 
             if is_oneshot {
@@ -679,8 +703,17 @@ impl EventPoll {
         }
 
         // Phase 3: 将 ovflist 合并回 ready_list，重入队水平触发项
-        ep_guard.ep_done_scan(push_back);
+        // Unprocessed entries precede delivered LT entries: a small maxevents
+        // must rotate through all ready descriptors rather than starve the tail.
+        remaining.extend(pending);
+        remaining.extend(push_back);
+        ep_guard.ep_done_scan(remaining);
 
+        if res == 0 {
+            if let Some(err) = error {
+                return Err(err);
+            }
+        }
         Ok(res)
     }
 

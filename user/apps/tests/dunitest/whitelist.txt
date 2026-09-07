@@ -124,3 +124,5 @@ normal/sched_tracepoint
 normal/proc_mem_shared
 normal/ptrace_perm_dumpable
 normal/ptrace_x86_debug
+
+normal/epoll_pwait2_semantics

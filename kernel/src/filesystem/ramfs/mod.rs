@@ -576,22 +576,20 @@ impl IndexNode for LockedRamFSInode {
             return Err(SystemError::EFBIG);
         }
         let _size_guard = self.2.write();
-        let (cache, old_size) = {
+        let cache = {
             let mut inode = self.0.lock();
             if inode.metadata.file_type != FileType::File {
                 return Err(SystemError::EINVAL);
             }
             let cache = inode.page_cache.clone().ok_or(SystemError::EIO)?;
-            let old_size = inode.metadata.size as usize;
             inode.metadata.size = len as i64;
-            (cache, old_size)
+            cache
         };
         // Publish EOF before unmapping and invalidating pages. Never hold the
         // inode mutex while acquiring MM locks through truncate.
-        if len < old_size {
-            cache.manager().resize(len)?;
-        }
-        Ok(())
+        // Linux truncate_setsize() also truncates the page cache when size is
+        // unchanged or grows, clearing mmap writes past the new partial EOF.
+        cache.manager().resize(len)
     }
 
     fn fallocate_resize_atomic(

@@ -542,6 +542,32 @@ TEST_F(RamfsFileBacking, TruncateThenExtendDoesNotRestoreDiscardedTail) {
     }
 }
 
+TEST_F(RamfsFileBacking, SameSizeAndGrowingTruncateClearPastEof) {
+    fd_ = open(path_.c_str(), O_CREAT | O_EXCL | O_RDWR, 0600);
+    ASSERT_GE(fd_, 0) << strerror(errno);
+    const unsigned char original = 0x35;
+    ASSERT_EQ(1, write(fd_, &original, 1));
+    shared_ = mmap(nullptr, 2 * kPageSize, PROT_READ | PROT_WRITE,
+                   MAP_SHARED, fd_, 0);
+    ASSERT_NE(MAP_FAILED, shared_) << strerror(errno);
+    auto* shared = static_cast<volatile unsigned char*>(shared_);
+
+    // The final partial page is accessible beyond EOF. Linux ramfs clears
+    // that tail on every truncate, including unchanged and increased sizes.
+    shared[128] = 0x71;
+    ASSERT_EQ(0, ftruncate(fd_, 1));
+    EXPECT_EQ(0, shared[128]);
+    EXPECT_EQ(original, shared[0]);
+
+    shared[128] = 0x72;
+    ASSERT_EQ(0, ftruncate(fd_, 64));
+    EXPECT_EQ(0, shared[128]);
+    EXPECT_EQ(original, shared[0]);
+    struct stat metadata {};
+    ASSERT_EQ(0, fstat(fd_, &metadata));
+    EXPECT_EQ(64, metadata.st_size);
+}
+
 TEST_F(RamfsFileBacking, SymlinkAndFileGrowthPreserveContents) {
     ASSERT_NO_FATAL_FAILURE(create_data_file());
     const std::string link = std::string(directory_) + "/link";

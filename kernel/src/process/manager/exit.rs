@@ -420,46 +420,12 @@ impl ProcessManager {
             pcb.wait_queue.mark_dead();
 
             // Perform post-exit work for the process.
-            let thread = pcb.thread.write_irqsave();
-            let clear_child_tid = thread.clear_child_tid;
-            let vfork_done = thread.vfork_done.clone();
-            drop(thread);
-            if let Some(addr) = clear_child_tid {
-                // Per Linux semantics: first clear *clear_child_tid in userspace,
-                // then futex_wake(addr).
-                let cleared_ok = unsafe {
-                    match clear_user_protected(addr, core::mem::size_of::<i32>()) {
-                        Ok(_) => true,
-                        Err(e) => {
-                            // The clear_child_tid pointer may be invalid or
-                            // unmapped: do not panic because of this.
-                            warn!("clear tid failed: {e:?}");
-                            false
-                        }
-                    }
-                };
-                // If *clear_child_tid cannot be cleared, avoid futex_wake as well
-                // (avoid further invalid userspace accesses).
-                if cleared_ok
-                    && pcb
-                        .basic()
-                        .user_vm()
-                        .expect("User VM Not found")
-                        .user_count()
-                        > 1
-                {
-                    // Linux uses the FUTEX_SHARED flag to wake clear_child_tid.
-                    // This allows cross-process/thread synchronization (e.g.
-                    // pthread_join).
-                    let _ =
-                        Futex::futex_wake(addr, FutexFlag::FLAGS_SHARED, 1, FUTEX_BITSET_MATCH_ANY);
-                }
-            }
+            Self::release_task_futex_state(&pcb);
             compiler_fence(Ordering::SeqCst);
 
-            RobustListHead::cleanup_robust_list(&pcb);
             detach_sem_undo(&pcb);
             // If this process was created via vfork, complete the completion.
+            let vfork_done = pcb.thread.write_irqsave().vfork_done.take();
             if let Some(vd) = vfork_done {
                 vd.complete_all();
             }
@@ -741,6 +707,34 @@ impl ProcessManager {
                     .wakeup_all(Some(ProcessState::Blocked(true)));
             }
         }
+    }
+
+    /// Release the current task's user futex registrations on exit or exec.
+    ///
+    /// The caller must keep the old mm installed in both the PCB and the CPU,
+    /// and retain its user reference until this returns. Like Linux's
+    /// exit_mm_release/exec_mm_release, robust cleanup precedes clear_child_tid.
+    pub(crate) fn release_task_futex_state(pcb: &Arc<ProcessControlBlock>) {
+        RobustListHead::cleanup_robust_list(pcb);
+
+        // Consume the registration even when no user access is needed. In
+        // particular, an exec must not carry this address into the new mm.
+        let clear_child_tid = pcb.thread.write_irqsave().clear_child_tid.take();
+        let Some(addr) = clear_child_tid.filter(|addr| !addr.is_null()) else {
+            return;
+        };
+        let Some(vm) = pcb.basic().user_vm() else {
+            return;
+        };
+        if vm.user_count() <= 1 {
+            return;
+        }
+
+        // No PCB locks are held across faultable user access or futex wake.
+        // Linux ignores put_user failure and still attempts the shared wake:
+        // a read-only mapping can retain a valid futex key and waiting tasks.
+        let _ = unsafe { clear_user_protected(addr, core::mem::size_of::<i32>()) };
+        let _ = Futex::futex_wake(addr, FutexFlag::FLAGS_SHARED, 1, FUTEX_BITSET_MATCH_ANY);
     }
 
     /// Release the old user address space: if no task still uses it, tear down all mappings

@@ -6,7 +6,7 @@ use crate::{
         fcntl::AtFlags,
         open::{do_open_execat, do_open_execat_with_flags},
     },
-    libs::{futex::futex::RobustListHead, rand::rand_bytes},
+    libs::rand::rand_bytes,
     mm::ucontext::AddressSpace,
     process::{
         cred::{SUID_DUMPABLE, SUID_DUMP_DISABLE, SUID_DUMP_USER},
@@ -215,7 +215,7 @@ fn do_execve_internal(
 
             let pcb = ProcessManager::current_pcb();
 
-            commit_exec_robust_list(&pcb, old_vm.as_ref(), &address_space);
+            commit_exec_futex_state(&pcb, old_vm.as_ref(), &address_space);
 
             // close-on-exec 必须属于成功 exec 的 commit 过程，不能留在 syscall wrapper 尾部。
             let dropped_fds = {
@@ -423,14 +423,11 @@ fn do_execve_switch_user_vm(new_vm: Arc<AddressSpace>) -> Option<Arc<AddressSpac
     old_address_space
 }
 
-fn commit_exec_robust_list(
+fn commit_exec_futex_state(
     pcb: &Arc<ProcessControlBlock>,
     old_vm: Option<&Arc<AddressSpace>>,
     new_vm: &Arc<AddressSpace>,
 ) {
-    let Some(head) = pcb.take_robust_list() else {
-        return;
-    };
     let Some(old_vm) = old_vm else {
         return;
     };
@@ -439,9 +436,11 @@ fn commit_exec_robust_list(
         .expect("successful user exec must replace the new address space");
     assert!(Arc::ptr_eq(&replaced, new_vm));
 
-    RobustListHead::cleanup_robust_list_head(pcb, head);
+    // Both registrations belong to the old mm. A missing robust list does not
+    // imply that clear_child_tid is unset (for example after a libc-less exec).
+    ProcessManager::release_task_futex_state(pcb);
 
     let replaced = do_execve_switch_user_vm(new_vm.clone())
-        .expect("robust-list cleanup must leave the old address space installed");
+        .expect("futex cleanup must leave the old address space installed");
     assert!(Arc::ptr_eq(&replaced, old_vm));
 }

@@ -890,11 +890,15 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     }
 
     /// Atomically commit the write-side metadata and non-shrinking size stage
-    /// used by mode-0 fallocate. Implementations that opt into the generic
+    /// used by mode-0 fallocate for the validated, nonempty byte range
+    /// `[offset, requested_end)`. Preserve this range for sparse allocation;
+    /// the resulting size is `max(old_size, requested_end)`.
+    /// Implementations that opt into the generic
     /// resize-backed helper must serialize this with chmod and other content
     /// mutations in their native inode lock domain.
     fn fallocate_resize_atomic(
         &self,
+        _offset: usize,
         _requested_end: usize,
         _lock_owner: u64,
     ) -> Result<SetMetadataMask, SystemError> {

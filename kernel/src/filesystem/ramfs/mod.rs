@@ -594,6 +594,7 @@ impl IndexNode for LockedRamFSInode {
 
     fn fallocate_resize_atomic(
         &self,
+        offset: usize,
         requested_end: usize,
         _lock_owner: u64,
     ) -> Result<SetMetadataMask, SystemError> {
@@ -611,13 +612,12 @@ impl IndexNode for LockedRamFSInode {
             }
             inode.page_cache.clone().ok_or(SystemError::EIO)?
         };
-        // Keep resize_based_fallocate's real allocation guarantee, including
-        // holes introduced by sparse writes or growth through truncate.
-        if requested_end != 0 {
-            cache
-                .manager()
-                .preallocate_range(0, (requested_end - 1) >> MMArch::PAGE_SHIFT)?;
-        }
+        // Allocate only pages intersecting the request. Sparse holes before
+        // offset must remain holes even when EOF already exceeds requested_end.
+        cache.manager().preallocate_range(
+            offset >> MMArch::PAGE_SHIFT,
+            (requested_end - 1) >> MMArch::PAGE_SHIFT,
+        )?;
         let mut inode = self.0.lock();
         let effective_size = (inode.metadata.size as usize).max(requested_end);
         let (metadata, mask) = super::vfs::vcore::prepare_write_side_effect_metadata(

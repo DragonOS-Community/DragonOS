@@ -1700,6 +1700,66 @@ impl PageCacheBackend for PreallocateFailureBackend {
     }
 }
 
+fn run_ramfs_fallocate_range_selftest() -> Result<bool, SystemError> {
+    use crate::filesystem::vfs::{AttribStageObserver, FileType, InodeMode};
+
+    let fs = crate::filesystem::ramfs::RamFS::new();
+    let inode = fs.root_inode().create(
+        "fallocate-range",
+        FileType::File,
+        InodeMode::from_bits_truncate(0o600),
+    )?;
+    let page_size = MMArch::PAGE_SIZE;
+    let data = Mutex::new(FilePrivateData::Unused);
+    // Keep the reproducer bounded: sparse growth itself allocates no pages.
+    inode.resize(16 * page_size)?;
+    let cache = inode.page_cache().ok_or(SystemError::EIO)?;
+    if cache.manager().pages_count()? != 0 {
+        return Ok(false);
+    }
+    let marker_offset = 13 * page_size + 17;
+    inode.write_at(marker_offset, 1, &[0x5a], data.lock())?;
+    // An unaligned request covers only pages 12 and 13, including an existing
+    // dirty page. Repeating it must neither fill preceding holes nor erase data.
+    for _ in 0..2 {
+        let mut publish = || {};
+        inode.fallocate_file(
+            0,
+            12 * page_size + 7,
+            page_size,
+            0,
+            &mut AttribStageObserver::new(&mut publish),
+            data.lock(),
+        )?;
+        if cache.manager().pages_count()? != 2
+            || cache.manager().peek_page(12).is_none()
+            || cache.manager().peek_page(13).is_none()
+            || inode.metadata()?.size != (16 * page_size) as i64
+        {
+            return Ok(false);
+        }
+        let mut marker = [0];
+        inode.read_at(marker_offset, 1, &mut marker, data.lock())?;
+        if marker != [0x5a] {
+            return Ok(false);
+        }
+    }
+    // A page-aligned extension allocates exactly its requested page and grows
+    // EOF without materializing the intervening sparse hole or the next page.
+    let mut publish = || {};
+    inode.fallocate_file(
+        0,
+        17 * page_size,
+        page_size,
+        0,
+        &mut AttribStageObserver::new(&mut publish),
+        data.lock(),
+    )?;
+    Ok(cache.manager().pages_count()? == 3
+        && cache.manager().peek_page(17).is_some()
+        && inode.metadata()?.size == (18 * page_size) as i64)
+}
+
 fn run_preallocate_rollback_selftest() -> Result<bool, SystemError> {
     let backend = Arc::new(PreallocateFailureBackend {
         live: AtomicUsize::new(0),
@@ -1835,6 +1895,10 @@ pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, S
 
     if !run_write_prepare_rollback_selftest()? {
         return Ok("status=fail stage=write_prepare_rollback\n".into());
+    }
+
+    if !run_ramfs_fallocate_range_selftest()? {
+        return Ok("status=fail stage=ramfs_fallocate_range\n".into());
     }
 
     if !run_preallocate_rollback_selftest()? {
@@ -3700,6 +3764,6 @@ pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, S
     }
 
     Ok(alloc::format!(
-        "status=ok\nwrite_prepare_rollback=ok\npreallocate_rollback=ok\nwriteback_domain_lifecycle=ok\npreallocated_batch_lifecycle=ok\nfile_membership=ok\nshmem_membership=ok\ndirty_membership=ok\ndirty_incarnation=ok\nremote_dirty_publish=ok\nwriteback_membership=ok\nwriteback_admission_order=ok\nwriteback_submission_token=ok\nwriteback_defer_progress=ok\nwriteback_budget_retry=ok\nfault_invalidate_retry_order=ok\ntag_scan_chunk_release=ok\nunevictable_membership=ok\ninflight_teardown=ok\nlate_completion=ok\nglobal_wiring=ok\nlayout=ok\nfile_drop_drift={file_drop_drift}\nshmem_drop_drift={shmem_drop_drift}\ndirty_drop_drift={dirty_drop_drift}\nwriteback_drop_drift={writeback_drop_drift}\nunevictable_drop_drift={unevictable_drop_drift}\nentry_size={entry_size}\nbaseline_size={baseline_size}\n"
+        "status=ok\nramfs_fallocate_range=ok\nwrite_prepare_rollback=ok\npreallocate_rollback=ok\nwriteback_domain_lifecycle=ok\npreallocated_batch_lifecycle=ok\nfile_membership=ok\nshmem_membership=ok\ndirty_membership=ok\ndirty_incarnation=ok\nremote_dirty_publish=ok\nwriteback_membership=ok\nwriteback_admission_order=ok\nwriteback_submission_token=ok\nwriteback_defer_progress=ok\nwriteback_budget_retry=ok\nfault_invalidate_retry_order=ok\ntag_scan_chunk_release=ok\nunevictable_membership=ok\ninflight_teardown=ok\nlate_completion=ok\nglobal_wiring=ok\nlayout=ok\nfile_drop_drift={file_drop_drift}\nshmem_drop_drift={shmem_drop_drift}\ndirty_drop_drift={dirty_drop_drift}\nwriteback_drop_drift={writeback_drop_drift}\nunevictable_drop_drift={unevictable_drop_drift}\nentry_size={entry_size}\nbaseline_size={baseline_size}\n"
     ))
 }

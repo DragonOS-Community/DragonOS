@@ -5,6 +5,9 @@ pub struct IfaceCommon {
     pub(super) name: RwLock<String>,
     pub(super) flags: AtomicU32,
     pub(super) mtu: AtomicUsize,
+    /// Linux-visible queue configuration, not a hardware descriptor count.
+    /// Immutable until transmit-queue reconfiguration is supported.
+    tx_queue_len: u32,
     pub(super) type_: InterfaceType,
     tx_admission: tx_admission::TxAdmission,
     pub(super) smol_iface: Mutex<smoltcp::iface::Interface>,
@@ -118,6 +121,7 @@ impl IfaceCommon {
             router_common_data,
             flags: AtomicU32::new(flags.bits()),
             mtu: AtomicUsize::new(mtu),
+            tx_queue_len: 1000,
             type_,
             tx_admission: tx_admission::TxAdmission::new(flags.contains(InterfaceFlags::UP)),
             napi_struct: RwLock::new(None),
@@ -1359,6 +1363,10 @@ impl IfaceCommon {
 
     pub fn type_(&self) -> InterfaceType {
         self.type_
+    }
+
+    pub fn tx_queue_len(&self) -> u32 {
+        self.tx_queue_len
     }
 
     pub fn mtu(&self) -> usize {

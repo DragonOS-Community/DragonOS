@@ -156,6 +156,7 @@ fn iface_to_link_message(
         LinkAttr::Address(iface.mac().as_bytes().to_vec()),
         LinkAttr::Name(CString::new(iface.name()).map_err(|_| SystemError::EINVAL)?),
         LinkAttr::Mtu(iface.mtu() as u32),
+        LinkAttr::TxqLen(iface.common().tx_queue_len()),
         LinkAttr::Promiscuity(flags.promiscuity),
         LinkAttr::Allmulti(flags.allmulti),
     ];

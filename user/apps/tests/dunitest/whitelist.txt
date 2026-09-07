@@ -129,3 +129,5 @@ normal/ptrace_x86_debug
 normal/epoll_pwait2_semantics
 
 normal/elf_file_backing
+
+normal/exec_write_access

@@ -824,14 +824,17 @@ impl BinaryLoader for ElfLoader {
                     ExecError::SystemError(SystemError::ENOENT)
                 })?;
             // log::debug!("opening interpreter at :{}", interpreter_path);
-            interpreter = Some(ExecParam::new(
-                interpreter_file,
-                param.vm().clone(),
-                ExecParamFlags::EXEC,
-                CString::new(interpreter_path).map_err(|_| ExecError::InvalidParemeter)?,
-                param.execfn().clone(),
-                ExecInterpFlags::empty(),
-            ));
+            interpreter = Some(
+                ExecParam::new(
+                    interpreter_file,
+                    param.vm().clone(),
+                    ExecParamFlags::EXEC,
+                    CString::new(interpreter_path).map_err(|_| ExecError::InvalidParemeter)?,
+                    param.execfn().clone(),
+                    ExecInterpFlags::empty(),
+                )
+                .map_err(ExecError::SystemError)?,
+            );
         }
         //TODO 缺少一部分逻辑 https://code.dragonos.org.cn/xref/linux-6.1.9/fs/binfmt_elf.c#931
 

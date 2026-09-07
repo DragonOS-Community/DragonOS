@@ -14,6 +14,7 @@ use super::{
     inode_lifecycle::{InodeRetentionGuard, InodeRetentionKind},
     mount::{MountExternalGuard, MountFSInode, MountFlags},
     utils::should_remove_sgid,
+    write_access::InodeWriteGuard,
     DirectoryEntry, FileSystem, FileType, IndexNode, InodeId, Metadata, SetMetadataMask,
     SpecialNodeData,
 };
@@ -701,6 +702,8 @@ pub struct File {
     /// Pins the mount used to resolve this pathname independently from the
     /// operation inode (which device/FIFO resolution may replace).
     _mount_guard: Option<MountExternalGuard>,
+    /// Writer admission lasts through close and all shared descriptor/VMA owners.
+    _write_access: Option<Arc<InodeWriteGuard>>,
 }
 
 #[derive(Debug, Clone)]
@@ -1239,6 +1242,12 @@ impl File {
             return Err(SystemError::EINVAL);
         }
         let already_open = preopened.is_some();
+        let write_access =
+            if file_type == FileType::File && !is_path && mode.contains(FileMode::FMODE_WRITE) {
+                Some(InodeWriteGuard::writer(inode.clone())?)
+            } else {
+                None
+            };
         let private_data = Mutex::new(match preopened.as_mut() {
             Some(preopened) => preopened.take_private_data(),
             None => private_data_init,
@@ -1314,6 +1323,7 @@ impl File {
             epitems: Arc::new(EPollItemList::default()),
             _inode_retention: inode_retention,
             _mount_guard: mount_guard,
+            _write_access: write_access,
         };
 
         return Ok(f);
@@ -2514,6 +2524,7 @@ impl File {
             epitems: Arc::new(EPollItemList::default()),
             _inode_retention: inode_retention,
             _mount_guard: mount_guard,
+            _write_access: self._write_access.clone(),
         };
         return Some(res);
     }

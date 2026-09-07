@@ -13,6 +13,7 @@ pub mod stat;
 pub mod syscall;
 pub mod utils;
 pub mod vcore;
+pub mod write_access;
 pub mod writeback;
 
 use alloc::{string::String, sync::Arc, vec::Vec};

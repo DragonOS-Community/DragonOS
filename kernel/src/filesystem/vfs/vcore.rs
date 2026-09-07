@@ -787,6 +787,7 @@ where
     let md = inode.metadata()?;
 
     validate_truncate(&inode, &md, len)?;
+    let _write_access = super::write_access::InodeWriteGuard::writer(inode.clone())?;
     let (md, mask) = prepare_write_side_effect_metadata(md, len);
     let r = do_resize(&inode, &md, mask);
     if r.is_ok() {
@@ -864,6 +865,7 @@ pub(crate) fn vfs_open_truncate(
 ) -> Result<(), SystemError> {
     let inode = file.inode();
     validate_truncate(&inode, &context.requested, 0)?;
+    let _write_access = super::write_access::InodeWriteGuard::writer(inode.clone())?;
     inode.resize_open_truncate(
         0,
         current_file_lock_owner_id(),

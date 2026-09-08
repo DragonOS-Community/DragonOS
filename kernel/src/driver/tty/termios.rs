@@ -67,12 +67,13 @@ impl PosixTermios {
     }
 
     pub fn to_kernel_termios(self) -> Termios {
-        // TODO：这里没有考虑非规范模式
+        // Linux copies the raw flag words, including unnamed bits. Preserve
+        // them at the ABI boundary; drivers normalize hardware settings.
         Termios {
-            input_mode: InputMode::from_bits_truncate(self.c_iflag),
-            output_mode: OutputMode::from_bits_truncate(self.c_oflag),
-            control_mode: ControlMode::from_bits_truncate(self.c_cflag),
-            local_mode: LocalMode::from_bits_truncate(self.c_lflag),
+            input_mode: InputMode { bits: self.c_iflag },
+            output_mode: OutputMode { bits: self.c_oflag },
+            control_mode: ControlMode { bits: self.c_cflag },
+            local_mode: LocalMode { bits: self.c_lflag },
             control_characters: self.c_cc,
             line: LineDisciplineType::from_line(self.c_line),
             c_line_abi: self.c_line,
@@ -472,22 +473,24 @@ impl PosixTermio {
         let mut cc = old.control_characters;
         cc[..NCC].copy_from_slice(&self.c_cc);
 
-        let control_mode = ControlMode::from_bits_truncate(
-            (old.control_mode.bits & 0xffff_0000) | self.c_cflag as u32,
-        );
+        // As with termios, neither half of the merged ABI flags may be
+        // truncated to the set of bits currently named by the kernel.
+        let control_mode = ControlMode {
+            bits: (old.control_mode.bits & 0xffff_0000) | self.c_cflag as u32,
+        };
         let (input_speed, output_speed) = Self::speeds_from_cflag(control_mode);
 
         Termios {
-            input_mode: InputMode::from_bits_truncate(
-                (old.input_mode.bits & 0xffff_0000) | self.c_iflag as u32,
-            ),
-            output_mode: OutputMode::from_bits_truncate(
-                (old.output_mode.bits & 0xffff_0000) | self.c_oflag as u32,
-            ),
+            input_mode: InputMode {
+                bits: (old.input_mode.bits & 0xffff_0000) | self.c_iflag as u32,
+            },
+            output_mode: OutputMode {
+                bits: (old.output_mode.bits & 0xffff_0000) | self.c_oflag as u32,
+            },
             control_mode,
-            local_mode: LocalMode::from_bits_truncate(
-                (old.local_mode.bits & 0xffff_0000) | self.c_lflag as u32,
-            ),
+            local_mode: LocalMode {
+                bits: (old.local_mode.bits & 0xffff_0000) | self.c_lflag as u32,
+            },
             control_characters: cc,
             line: LineDisciplineType::from_line(self.c_line),
             c_line_abi: self.c_line,

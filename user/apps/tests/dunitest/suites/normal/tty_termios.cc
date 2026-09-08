@@ -15,6 +15,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <termios.h>
 #include <time.h>
 #include <unistd.h>
@@ -33,6 +34,8 @@ struct TermioCompat {
     unsigned char _pad = 0;  /* match kernel PosixTermio layout */
 };
 
+static_assert(sizeof(TermioCompat) == 18, "Linux generic termio ABI");
+
 #ifndef TCGETA
 #define TCGETA 0x5405
 #endif
@@ -45,6 +48,28 @@ struct TermioCompat {
 #ifndef TCSETAF
 #define TCSETAF 0x5408
 #endif
+
+// TCGETS/TCSETS use 19 control characters, even when libc NCCS is larger.
+constexpr size_t kKernelNccs = 19;
+constexpr int kSetCommands[] = {TCSETS, TCSETSW, TCSETSF, TCSETA, TCSETAW, TCSETAF};
+
+bool IsLegacySet(int cmd) {
+    return cmd == TCSETA || cmd == TCSETAW || cmd == TCSETAF;
+}
+
+int SetAttributes(int fd, int cmd, const struct termios& term) {
+    if (!IsLegacySet(cmd)) {
+        return ioctl(fd, cmd, &term);
+    }
+    TermioCompat legacy = {};
+    legacy.c_iflag = term.c_iflag;
+    legacy.c_oflag = term.c_oflag;
+    legacy.c_cflag = term.c_cflag;
+    legacy.c_lflag = term.c_lflag;
+    legacy.c_line = term.c_line;
+    memcpy(legacy.c_cc, term.c_cc, kNcc);
+    return ioctl(fd, cmd, &legacy);
+}
 
 class UniqueFd {
 public:
@@ -800,6 +825,150 @@ TEST(TtyTermios, TermioMergeHighBits) {
         << "TCSETA should preserve high 16 bits of c_cflag";
     EXPECT_EQ(full.c_lflag & ECHO, 0u)
         << "TCSETA should apply low-16-bit change";
+}
+
+TEST(TtyTermios, SetFamilyPreservesRawFlagsAndLegacyTail) {
+    // Unnamed bits must survive the ABI boundary. Avoid flags normalized by
+    // the PTY driver and the core (CSIZE, PARENB, CREAD, baud masks and ADDRB).
+    constexpr tcflag_t high = 0x80000000u;
+    constexpr tcflag_t unnamed_input_low = 0x8000u;
+    for (int cmd : kSetCommands) {
+        SCOPED_TRACE(cmd);
+        auto pty = OpenRawPty();
+        ASSERT_GE(pty.slave.get(), 0);
+        struct termios initial = {};
+        ASSERT_EQ(tcgetattr(pty.slave.get(), &initial), 0);
+        initial.c_iflag |= high;
+        initial.c_oflag |= high;
+        initial.c_cflag |= high;
+        initial.c_lflag |= high;
+        for (size_t i = kNcc; i < kKernelNccs; ++i) {
+            initial.c_cc[i] = static_cast<cc_t>(0x60 + i);
+        }
+        // Exercise the kernel ABI directly: libc may reserve flag bits for
+        // its own speed bookkeeping before issuing TCSETS.
+        ASSERT_EQ(ioctl(pty.slave.get(), TCSETS, &initial), 0);
+
+        struct termios requested = initial;
+        requested.c_iflag |= unnamed_input_low;
+        requested.c_lflag |= ECHONL;
+        requested.c_cc[VINTR] = 0x1c;
+        ASSERT_EQ(SetAttributes(pty.slave.get(), cmd, requested), 0) << strerror(errno);
+        struct termios back = {};
+        ASSERT_EQ(tcgetattr(pty.slave.get(), &back), 0);
+        EXPECT_EQ(back.c_iflag & (high | unnamed_input_low), high | unnamed_input_low);
+        EXPECT_EQ(back.c_oflag & high, high);
+        EXPECT_EQ(back.c_cflag & high, high);
+        EXPECT_EQ(back.c_lflag & (high | ECHONL), high | ECHONL);
+        EXPECT_EQ(back.c_cc[VINTR], requested.c_cc[VINTR]);
+        for (size_t i = kNcc; i < kKernelNccs; ++i) {
+            EXPECT_EQ(back.c_cc[i], initial.c_cc[i]) << "c_cc[" << i << "]";
+        }
+    }
+}
+
+TEST(TtyTermios, SetFamilyFlushesOnlyForFlushCommands) {
+    for (int cmd : kSetCommands) {
+        SCOPED_TRACE(cmd);
+        auto pty = OpenRawPty();
+        ASSERT_GE(pty.slave.get(), 0);
+        ASSERT_TRUE(SetNonBlocking(pty.slave.get()));
+        struct termios term = {};
+        ASSERT_EQ(tcgetattr(pty.slave.get(), &term), 0);
+        const char old_input = 'a';
+        ASSERT_EQ(write(pty.master.get(), &old_input, 1), 1);
+        struct pollfd ready = {pty.slave.get(), POLLIN, 0};
+        ASSERT_EQ(poll(&ready, 1, 1000), 1);
+        ASSERT_NE(ready.revents & POLLIN, 0);
+
+        ASSERT_EQ(SetAttributes(pty.slave.get(), cmd, term), 0) << strerror(errno);
+        char ch = 0;
+        if (cmd == TCSETSF || cmd == TCSETAF) {
+            errno = 0;
+            EXPECT_EQ(read(pty.slave.get(), &ch, 1), -1);
+            EXPECT_TRUE(errno == EAGAIN || errno == EWOULDBLOCK) << strerror(errno);
+        } else {
+            ASSERT_EQ(read(pty.slave.get(), &ch, 1), 1);
+            EXPECT_EQ(ch, old_input);
+        }
+        const char new_input = 'b';
+        ASSERT_EQ(write(pty.master.get(), &new_input, 1), 1);
+        ASSERT_EQ(ReadEventually(pty.slave.get(), &ch, 1), 1);
+        EXPECT_EQ(ch, new_input);
+    }
+}
+
+TEST(TtyTermios, BadSetPointerDoesNotChangeAttributesOrFlushInput) {
+    for (int cmd : kSetCommands) {
+        SCOPED_TRACE(cmd);
+        auto pty = OpenRawPty();
+        ASSERT_GE(pty.slave.get(), 0);
+        struct termios before = {};
+        ASSERT_EQ(tcgetattr(pty.slave.get(), &before), 0);
+        const char marker = 'x';
+        ASSERT_EQ(write(pty.master.get(), &marker, 1), 1);
+        struct pollfd ready = {pty.slave.get(), POLLIN, 0};
+        ASSERT_EQ(poll(&ready, 1, 1000), 1);
+        ASSERT_NE(ready.revents & POLLIN, 0);
+        errno = 0;
+        EXPECT_EQ(ioctl(pty.slave.get(), cmd, nullptr), -1);
+        EXPECT_EQ(errno, EFAULT);
+        struct termios after = {};
+        ASSERT_EQ(tcgetattr(pty.slave.get(), &after), 0);
+        EXPECT_EQ(after.c_iflag, before.c_iflag);
+        EXPECT_EQ(after.c_oflag, before.c_oflag);
+        EXPECT_EQ(after.c_cflag, before.c_cflag);
+        EXPECT_EQ(after.c_lflag, before.c_lflag);
+        EXPECT_EQ(after.c_line, before.c_line);
+        EXPECT_EQ(memcmp(after.c_cc, before.c_cc, kKernelNccs), 0);
+        char ch = 0;
+        ASSERT_EQ(ReadEventually(pty.slave.get(), &ch, 1), 1);
+        EXPECT_EQ(ch, marker);
+    }
+}
+
+TEST(TtyTermios, LegacyAbiAtPageBoundaryAndZeroPadding) {
+    auto pty = OpenRawPty();
+    ASSERT_GE(pty.slave.get(), 0);
+    const long page_size = sysconf(_SC_PAGESIZE);
+    ASSERT_GT(page_size, static_cast<long>(sizeof(TermioCompat)));
+    void* mapping = mmap(nullptr, 2 * page_size, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    ASSERT_NE(mapping, MAP_FAILED);
+    // Release the mapping even if a fatal assertion below returns early.
+    struct UnmapOnExit {
+        void* addr;
+        size_t size;
+        ~UnmapOnExit() { munmap(addr, size); }
+    } unmap{mapping, static_cast<size_t>(2 * page_size)};
+    ASSERT_EQ(mprotect(static_cast<char*>(mapping) + page_size, page_size, PROT_NONE), 0);
+    auto* legacy = reinterpret_cast<TermioCompat*>(
+        static_cast<char*>(mapping) + page_size - sizeof(TermioCompat));
+    for (int cmd : {TCSETA, TCSETAW, TCSETAF}) {
+        SCOPED_TRACE(cmd);
+        memset(legacy, 0xa5, sizeof(*legacy));
+        ASSERT_EQ(ioctl(pty.slave.get(), TCGETA, legacy), 0) << strerror(errno);
+        EXPECT_EQ(legacy->_pad, 0);
+        legacy->_pad = 0xa5;
+        legacy->c_line = 42;
+        ASSERT_EQ(ioctl(pty.slave.get(), cmd, legacy), 0) << strerror(errno);
+        ASSERT_EQ(ioctl(pty.slave.get(), TCGETA, legacy), 0);
+        EXPECT_EQ(legacy->c_line, 42);
+        EXPECT_EQ(legacy->_pad, 0);
+    }
+}
+
+TEST(TtyTermios, StdinFlushAndLegacySettings) {
+    if (!isatty(STDIN_FILENO)) {
+        GTEST_SKIP() << "stdin is not a TTY; run from the QEMU console for acceptance";
+    }
+    struct termios original = {};
+    ASSERT_EQ(tcgetattr(STDIN_FILENO, &original), 0) << strerror(errno);
+    TermiosRestorer restore(STDIN_FILENO, original);
+    ASSERT_EQ(tcsetattr(STDIN_FILENO, TCSAFLUSH, &original), 0) << strerror(errno);
+    for (int cmd : {TCSETA, TCSETAW, TCSETAF}) {
+        EXPECT_EQ(SetAttributes(STDIN_FILENO, cmd, original), 0) << cmd << ": " << strerror(errno);
+    }
 }
 
 /* --------------------------------------------------------------------------

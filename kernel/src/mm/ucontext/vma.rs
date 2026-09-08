@@ -646,14 +646,12 @@ pub struct VMA {
     pub(super) self_ref: Weak<LockedVMA>,
 
     pub(super) vm_file: Option<Arc<File>>,
-    /// The offset (in pages) of the VMA's backing object (file/shared-anonymous) relative to the entire backing object
+    /// The offset (in pages) of the VMA's backing object (file) relative to the entire backing object
     pub(super) backing_pgoff: Option<usize>,
 
     pub(super) provider: Provider,
     /// SysV SHM attach identity, used for Linux-style VMA open/close lifecycle.
     pub(super) sysv_shm: Option<Arc<SysVShmAttach>>,
-    /// Stable identity of a shared anonymous mapping (used for cross-process futex key sharing)
-    pub(crate) shared_anon: Option<Arc<AnonSharedMapping>>,
 }
 
 impl core::hash::Hash for VMA {
@@ -668,89 +666,6 @@ impl core::hash::Hash for VMA {
 #[derive(Debug)]
 pub enum Provider {
     Allocated, // TODO: others
-}
-
-/// Stable identity of a shared anonymous mapping
-#[derive(Debug)]
-pub struct AnonSharedMapping {
-    pub id: u64,
-    /// Fixed backing size in pages, established at creation time.
-    /// Linux semantics: mremap() expanding a MAP_SHARED|MAP_ANONYMOUS mapping does not grow the
-    /// underlying shmem object; access beyond this size should SIGBUS.
-    size_pages: usize,
-    // Per-page cache keyed by page index within the backing object.
-    pages: SpinLock<HashMap<usize, Arc<Page>>>,
-}
-
-impl AnonSharedMapping {
-    fn new_id() -> u64 {
-        static NEXT_ID: AtomicU64 = AtomicU64::new(1);
-        return NEXT_ID.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn new(size_pages: usize) -> Arc<Self> {
-        Arc::new(Self {
-            id: Self::new_id(),
-            size_pages,
-            pages: SpinLock::new(HashMap::new()),
-        })
-    }
-
-    #[inline(always)]
-    pub fn size_pages(&self) -> usize {
-        self.size_pages
-    }
-
-    /// Get or create a shared page for the given offset atomically.
-    /// This prevents the double-allocation race when multiple processes fault the same page.
-    pub fn get_or_create_page(&self, pgoff: usize) -> Result<Arc<Page>, SystemError> {
-        if let Some(page) = self.lookup_page(pgoff) {
-            return Ok(page);
-        }
-
-        // Page allocation may sleep, so it must not run under the backing's
-        // irqsave spinlock. Keep the existing PageManager mutex until the
-        // candidate is published, and recheck after acquiring it: this closes
-        // the allocate-before-publish window without adding another sleeping
-        // lock or per-index in-flight state.
-        let mut pm = page_manager_lock();
-        if let Some(page) = self.lookup_page(pgoff) {
-            return Ok(page);
-        }
-
-        let mut allocator = LockedFrameAllocator;
-        let candidate = pm.create_one_page(PageType::Normal, PageFlags::empty(), &mut allocator)?;
-        candidate.write().add_backing_lifetime_pin();
-        self.pages.lock_irqsave().insert(pgoff, candidate.clone());
-        Ok(candidate)
-    }
-
-    /// Look up an already instantiated backing page without allocating it.
-    pub fn lookup_page(&self, pgoff: usize) -> Option<Arc<Page>> {
-        let guard = self.pages.lock_irqsave();
-        guard.get(&pgoff).cloned()
-    }
-}
-
-impl Drop for AnonSharedMapping {
-    fn drop(&mut self) {
-        // When the backing object is destroyed, allow cached pages to be freed.
-        let pages: alloc::vec::Vec<Arc<Page>> = {
-            let guard = self.pages.lock_irqsave();
-            guard.values().cloned().collect()
-        };
-
-        let mut pm = page_manager_lock();
-        for page in pages {
-            let paddr = page.phys_address();
-            let mut pg = page.write();
-            pg.remove_backing_lifetime_pin();
-            if pg.can_deallocate() {
-                drop(pg);
-                pm.remove_page(&paddr);
-            }
-        }
-    }
 }
 
 #[allow(dead_code)]
@@ -774,7 +689,6 @@ impl VMA {
             vm_file: file,
             backing_pgoff: pgoff,
             sysv_shm: None,
-            shared_anon: None,
         }
     }
 
@@ -855,7 +769,6 @@ impl VMA {
             backing_pgoff: self.backing_pgoff,
             vm_file: self.vm_file.clone(),
             sysv_shm: self.sysv_shm.clone(),
-            shared_anon: self.shared_anon.clone(),
         };
     }
 
@@ -871,7 +784,6 @@ impl VMA {
             backing_pgoff: self.backing_pgoff,
             vm_file: self.vm_file.clone(),
             sysv_shm: self.sysv_shm.clone(),
-            shared_anon: self.shared_anon.clone(),
         };
     }
 
@@ -1029,6 +941,79 @@ impl VMA {
         }
 
         return Ok(r);
+    }
+
+    /// Eagerly map shared shmem pages on architectures without demand faults.
+    /// The caller owns an empty reserved range and the MM/page-table edit locks.
+    /// Mutable backings also require invalidation exclusion through VMA commit.
+    /// EOF is rejected before publishing any PTE: these architectures cannot
+    /// currently deliver the SIGBUS that a demand-fault implementation would.
+    #[allow(clippy::too_many_arguments)]
+    pub fn map_shmem_eager(
+        destination: VirtPageFrame,
+        page_count: PageFrameCount,
+        vm_flags: VmFlags,
+        flags: EntryFlags<MMArch>,
+        mapper: &mut PageMapper,
+        file: Arc<File>,
+        page_cache: &Arc<crate::filesystem::page_cache::PageCache>,
+        pgoff: usize,
+    ) -> Result<Arc<LockedVMA>, SystemError> {
+        debug_assert!(page_cache.is_shmem() && vm_flags.contains(VmFlags::VM_MAYSHARE));
+        let size = file.inode().metadata()?.size.max(0) as usize;
+        let file_pages = size.div_ceil(MMArch::PAGE_SIZE);
+        let end = pgoff
+            .checked_add(page_count.data())
+            .ok_or(SystemError::EOVERFLOW)?;
+        if end > file_pages {
+            return Err(SystemError::ENXIO);
+        }
+
+        // Pins keep the exact cache entries alive through mapping or rollback.
+        let mut mapped = Vec::new();
+        mapped
+            .try_reserve_exact(page_count.data())
+            .map_err(|_| SystemError::ENOMEM)?;
+        let vma = LockedVMA::new(VMA::new(
+            VirtRegion::new(destination.virt_address(), page_count.bytes()),
+            vm_flags,
+            flags,
+            Some(file),
+            Some(pgoff),
+            false,
+        ));
+        let mlocked = vm_flags.contains(VmFlags::VM_LOCKED);
+        let result = (|| {
+            for index in pgoff..end {
+                let pin = page_cache.manager().commit_overwrite_pinned(index)?;
+                let page = pin.page();
+                if vm_flags.contains(VmFlags::VM_WRITE) {
+                    page_cache.manager().prepare_page_mkwrite(index, &page)?;
+                }
+                let address = destination.next_by(index - pgoff).virt_address();
+                let flush = unsafe { mapper.map_phys(address, page.phys_address(), flags) }
+                    .ok_or(SystemError::ENOMEM)?;
+                flush.flush();
+                page.write().insert_vma(vma.clone(), mlocked);
+                mapped.push((address, pin));
+            }
+            Ok::<(), SystemError>(())
+        })();
+        if let Err(error) = result {
+            for (address, pin) in mapped.into_iter().rev() {
+                let (_, _, flush, _) =
+                    unsafe { mapper.unmap_phys_with_freed_tables(address, true) }
+                        .expect("new shmem PTE disappeared under page-table edit lock");
+                flush.flush();
+                let page = pin.page();
+                page.write().remove_vma(&vma);
+                InnerAddressSpace::remove_page_unevictable_if_unneeded(&page);
+                // Cache membership owns the physical page, including on error.
+            }
+            return Err(error);
+        }
+        vma.lock().set_mapped(true);
+        Ok(vma)
     }
 
     /// Allocate some physical pages from the page allocator, map them to the specified virtual address, and then create a VMA.

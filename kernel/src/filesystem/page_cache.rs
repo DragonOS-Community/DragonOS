@@ -2278,7 +2278,7 @@ impl PageCache {
         self.unevictable.load(Ordering::Relaxed)
     }
 
-    fn is_shmem(&self) -> bool {
+    pub(crate) fn is_shmem(&self) -> bool {
         self.kind == PageCacheKind::Shmem
     }
 

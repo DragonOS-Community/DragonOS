@@ -14,7 +14,6 @@ use alloc::{
     vec::Vec,
 };
 use defer::defer;
-use hashbrown::HashMap;
 use hashbrown::HashSet;
 use ida::IdAllocator;
 use log::{error, warn};
@@ -61,7 +60,6 @@ use super::{
     syscall::{MadvFlags, MapFlags, MremapFlags, ProtFlags},
     MemoryManagementArch, PageTableKind, VirtAddr, VirtRegion, VmFaultReason, VmFlags,
 };
-use crate::arch::mm::LockedFrameAllocator;
 
 /// Default value for MMAP_MIN_ADDR
 /// The following content from Linux 5.19:
@@ -142,6 +140,4 @@ pub use uprobe::{
     UprobeTaskScope, XolPool, XolSlotLease,
 };
 #[allow(unused_imports)]
-pub use vma::{
-    AnonSharedMapping, LockedVMA, PhysmapParams, PresentPfn, Provider, VMASplitResult, VMA,
-};
+pub use vma::{LockedVMA, PhysmapParams, PresentPfn, Provider, VMASplitResult, VMA};

@@ -56,7 +56,7 @@ fn perms_from_vm_flags(vm_flags: VmFlags) -> [u8; 4] {
     } else {
         b'-'
     };
-    let s = if vm_flags.contains(VmFlags::VM_SHARED) {
+    let s = if vm_flags.contains(VmFlags::VM_MAYSHARE) {
         b's'
     } else {
         b'p'
@@ -81,8 +81,16 @@ fn format_dev_inode_and_path(
                     .map(|inode| inode.procfs_path())
                     .unwrap_or_else(|| inode.absolute_path())
                     .unwrap_or_default();
+                // An unlinked internal inode has a diagnostic dname but no
+                // namespace path. Do not apply chroot path stripping to it.
+                let diagnostic = path.is_empty() && md.nlinks == 0;
+                if diagnostic {
+                    if let Ok(name) = inode.dname() {
+                        path = format!("/{} (deleted)", name.as_ref());
+                    }
+                }
                 // 尊重进程的 chroot：去掉根目录前缀
-                if !root_prefix.is_empty() && root_prefix != "/" {
+                if !diagnostic && !root_prefix.is_empty() && root_prefix != "/" {
                     if let Some(rest) = path.strip_prefix(root_prefix) {
                         path = if rest.is_empty() {
                             "/".to_string()

@@ -214,7 +214,7 @@ pub(super) fn mmap_file(
     len: usize,
     offset: usize,
     vm_flags: VmFlags,
-) -> Result<(), SystemError> {
+) -> Result<Arc<File>, SystemError> {
     let (backing_file, _) = backing_file_for_io(inode, file.private_data.lock())?;
     backing_file
         .inode()

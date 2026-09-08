@@ -652,7 +652,7 @@ impl IndexNode for OvlInode {
         len: usize,
         offset: usize,
         vm_flags: VmFlags,
-    ) -> Result<(), SystemError> {
+    ) -> Result<Arc<File>, SystemError> {
         file::mmap_file(self, file, start, len, offset, vm_flags)
     }
 

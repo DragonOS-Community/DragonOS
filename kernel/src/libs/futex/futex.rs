@@ -208,8 +208,6 @@ pub struct FutexKey {
 pub enum SharedKeyKind {
     /// 文件映射的 futex
     File { dev: u64, ino: u64 },
-    /// 显式共享的匿名映射（MAP_SHARED | MAP_ANONYMOUS）
-    SharedAnon { id: u64 },
     /// 私有匿名映射上的 FUTEX_SHARED（栈、堆等）
     /// 只能在同一进程的线程间同步
     PrivateAnonShared { as_id: u64 },
@@ -671,20 +669,16 @@ impl Futex {
         let page_index =
             ((uaddr.data() - vma_guard.region().start().data()) >> MMArch::PAGE_SHIFT) as u64;
 
-        if let Some(shared_anon) = &vma_guard.shared_anon {
-            let base_pgoff = vma_guard.backing_page_offset().unwrap_or(0) as u64;
-            let shared = SharedKey {
-                kind: SharedKeyKind::SharedAnon { id: shared_anon.id },
-                page_offset: base_pgoff + page_index,
-            };
-            let key = FutexKey {
-                ptr: 0,
-                word: 0,
-                offset: offset as u32,
-                key: InnerFutexKey::Shared(shared),
-            };
-            return Ok(key);
-        } else if let Some(file) = vma_guard.vm_file() {
+        let file = vma_guard.vm_file();
+        let anonymous_pages = file
+            .as_ref()
+            .is_some_and(|file| file.inode().mmap_uses_anonymous_pages());
+        if anonymous_pages && !vma_guard.vm_flags().contains(VmFlags::VM_WRITE) {
+            // Read-only anonymous pages cannot participate in shared futexes.
+            // In particular, a retained /dev/zero file is not their identity.
+            return Err(SystemError::EFAULT);
+        }
+        if let Some(file) = file.filter(|_| !anonymous_pages) {
             // 共享文件映射：使用 inode 唯一标识 + 文件页偏移
             let md = file.metadata()?;
             let dev = md.dev_id as u64;

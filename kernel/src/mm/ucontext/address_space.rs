@@ -885,6 +885,23 @@ impl AddressSpace {
         allocate_at_once: bool,
     ) -> Result<VirtPageFrame, SystemError> {
         let len = page_align_up(len);
+        if map_flags.contains(MapFlags::MAP_SHARED) {
+            if len == 0 {
+                return Err(SystemError::EINVAL);
+            }
+            let file =
+                crate::filesystem::tmpfs::create_unlinked_shmem_file("dev/zero", len)?.file();
+            return self.file_mapping_with_file(
+                file,
+                start_vaddr,
+                len,
+                prot_flags,
+                map_flags,
+                0,
+                round_to_min,
+                allocate_at_once,
+            );
+        }
         loop {
             let mut guard = self.write();
             let fixed_hint =
@@ -1085,21 +1102,15 @@ impl AddressSpace {
             return Err(SystemError::EBADF);
         }
 
-        let wants_access = prot_flags != ProtFlags::PROT_NONE;
-        if wants_access && !file_mode.contains(FileMode::FMODE_READ) {
+        // Linux requires a readable mapping fd even for PROT_NONE.
+        if !file_mode.contains(FileMode::FMODE_READ) {
             return Err(SystemError::EACCES);
         }
-        if prot_flags.contains(ProtFlags::PROT_EXEC) && !file_mode.contains(FileMode::FMODE_READ) {
+        if prot_flags.contains(ProtFlags::PROT_WRITE)
+            && map_flags.contains(MapFlags::MAP_SHARED)
+            && !file_mode.contains(FileMode::FMODE_WRITE)
+        {
             return Err(SystemError::EACCES);
-        }
-        if prot_flags.contains(ProtFlags::PROT_WRITE) {
-            if map_flags.contains(MapFlags::MAP_SHARED) {
-                if !file_mode.contains(FileMode::FMODE_WRITE) {
-                    return Err(SystemError::EACCES);
-                }
-            } else if !file_mode.contains(FileMode::FMODE_READ) {
-                return Err(SystemError::EACCES);
-            }
         }
 
         if matches!(file.file_type(), FileType::Pipe | FileType::Dir) {
@@ -1114,7 +1125,6 @@ impl AddressSpace {
         let may_write =
             !map_flags.contains(MapFlags::MAP_SHARED) || file_mode.contains(FileMode::FMODE_WRITE);
         let vma_file = file.inode().mmap_effective_file(&file)?;
-        let mut shared_anon = None;
 
         loop {
             let mut guard = self.write();
@@ -1194,15 +1204,16 @@ impl AddressSpace {
             }
             if may_write {
                 vm_flags |= VmFlags::VM_MAYWRITE;
+            } else {
+                // A read-only shared fd retains MAYSHARE, but cannot create
+                // a writable shared backing (notably mmap_zero in Linux).
+                vm_flags.remove(VmFlags::VM_SHARED);
             }
 
             vm_flags = match vma_file.inode().mmap_vm_flags(&vma_file, vm_flags) {
                 Ok(flags) => flags,
                 Err(err) => map_fail!(err),
             };
-            if vma_file.inode().mmap_uses_shared_anon(vm_flags) && shared_anon.is_none() {
-                shared_anon = Some(AnonSharedMapping::new(page_count.data()));
-            }
 
             if vm_flags.contains(VmFlags::VM_LOCKED) {
                 let error = if map_flags.contains(MapFlags::MAP_LOCKED)
@@ -1292,25 +1303,6 @@ impl AddressSpace {
             } else {
                 false
             };
-            let lazy_vma = if MMArch::PAGE_FAULT_ENABLED {
-                let vma = LockedVMA::new(VMA::new(
-                    region,
-                    vm_flags,
-                    entry_flags,
-                    Some(vma_file.clone()),
-                    Some(pgoff),
-                    false,
-                ));
-                if let Some(sysv_shm) = sysv_shm.clone() {
-                    vma.lock().set_sysv_shm(Some(sysv_shm));
-                }
-                if let Some(shared_anon) = shared_anon.clone() {
-                    vma.lock().shared_anon = Some(shared_anon);
-                }
-                Some(vma)
-            } else {
-                None
-            };
             drop(guard);
             #[cfg(target_arch = "x86_64")]
             if let Some(uprobe_change) = uprobe_change.take() {
@@ -1324,6 +1316,11 @@ impl AddressSpace {
                     .inode()
                     .mmap_file(&vma_file, region.start().data(), len, offset, vm_flags);
             let file_mmap_opened = hook_result.is_ok();
+            let (vma_file, hook_error) = match hook_result {
+                Ok(backing) => (backing, None),
+                Err(SystemError::ENOSYS) => (vma_file.clone(), None),
+                Err(err) => (vma_file.clone(), Some(err)),
+            };
             let mut guard = self.write();
             macro_rules! close_file_mmap_if_opened {
                 () => {
@@ -1365,39 +1362,92 @@ impl AddressSpace {
                 }};
             }
 
-            if let Err(err) = hook_result {
-                if err != SystemError::ENOSYS {
-                    cancel_reservation_and_unlock_pages!();
-                    return Err(err);
-                }
+            if let Some(err) = hook_error {
+                cancel_reservation_and_unlock_pages!();
+                return Err(err);
             }
 
-            let new_vma = if let Some(vma) = lazy_vma {
-                vma
-            } else {
-                let mut flusher = crate::mm::page::DeferredFlusher::new();
-                compiler_fence(Ordering::SeqCst);
-                let _pt_edit = self.page_table_edit();
-                match VMA::zeroed(
-                    page,
-                    page_count,
+            let eager_cache =
+                if !MMArch::PAGE_FAULT_ENABLED && vm_flags.contains(VmFlags::VM_MAYSHARE) {
+                    vma_file
+                        .inode()
+                        .page_cache()
+                        .filter(|cache| cache.is_shmem())
+                } else {
+                    None
+                };
+            // Do not wait on invalidation while holding MM write: truncate
+            // may already be waiting to unmap this address space. Keep the
+            // successful admission through publication in the VMA index.
+            let eager_invalidate = match eager_cache.as_ref() {
+                Some(cache) => match cache.try_invalidate_read() {
+                    Some(invalidate) => Some(invalidate),
+                    None => {
+                        cancel_reservation_and_unlock_pages!();
+                        close_file_mmap_if_opened!();
+                        return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+                    }
+                },
+                None => None,
+            };
+
+            let new_vma = if MMArch::PAGE_FAULT_ENABLED {
+                let vma = LockedVMA::new(VMA::new(
+                    region,
                     vm_flags,
                     entry_flags,
-                    &mut guard.user_mapper.utable,
-                    &mut flusher,
                     Some(vma_file.clone()),
                     Some(pgoff),
-                ) {
+                    false,
+                ));
+                if let Some(sysv_shm) = sysv_shm.clone() {
+                    vma.lock().set_sysv_shm(Some(sysv_shm));
+                }
+                vma
+            } else {
+                let result = {
+                    let mut flusher = crate::mm::page::DeferredFlusher::new();
+                    compiler_fence(Ordering::SeqCst);
+                    let _pt_edit = self.page_table_edit();
+                    if let Some(cache) = eager_cache.as_ref() {
+                        VMA::map_shmem_eager(
+                            page,
+                            page_count,
+                            vm_flags,
+                            entry_flags,
+                            &mut guard.user_mapper.utable,
+                            vma_file.clone(),
+                            cache,
+                            pgoff,
+                        )
+                    } else {
+                        VMA::zeroed(
+                            page,
+                            page_count,
+                            vm_flags,
+                            entry_flags,
+                            &mut guard.user_mapper.utable,
+                            &mut flusher,
+                            Some(vma_file.clone()),
+                            Some(pgoff),
+                        )
+                    }
+                };
+                match result {
                     Ok(vma) => {
                         if let Some(sysv_shm) = sysv_shm.clone() {
                             vma.lock().set_sysv_shm(Some(sysv_shm));
                         }
-                        if let Some(shared_anon) = shared_anon.clone() {
-                            vma.lock().shared_anon = Some(shared_anon);
-                        }
                         vma
                     }
                     Err(err) => {
+                        self.flush_tlb_range(
+                            region.start(),
+                            region.end(),
+                            MMArch::PAGE_SHIFT as u8,
+                            true,
+                        );
+                        drop(eager_invalidate);
                         cancel_reservation_and_unlock_pages!();
                         close_file_mmap_if_opened!();
                         return Err(err);
@@ -1405,8 +1455,21 @@ impl AddressSpace {
                 }
             };
 
+            macro_rules! rollback_unpublished_vma {
+                () => {
+                    if new_vma.mapped() {
+                        let _pt_edit = self.page_table_edit();
+                        let mut tlb = MmuGather::gather(self);
+                        new_vma.unmap(&mut guard.user_mapper.utable, &mut tlb);
+                        tlb.finish();
+                    }
+                };
+            }
+
             let sysv_opened = if let Some(sysv_shm) = sysv_shm.as_ref() {
                 if let Err(err) = sysv_shm.open_vma() {
+                    rollback_unpublished_vma!();
+                    drop(eager_invalidate);
                     cancel_reservation_and_unlock_pages!();
                     close_file_mmap_if_opened!();
                     return Err(err);
@@ -1433,14 +1496,16 @@ impl AddressSpace {
                 .commit_reserved_vma(reservation_id, new_vma.clone())
             {
                 let sysv_to_close = if sysv_opened { sysv_shm.clone() } else { None };
-                release_locked_pages_if_reserved!();
-                drop(guard);
+                rollback_unpublished_vma!();
+                drop(eager_invalidate);
+                cancel_reservation_and_unlock_pages!();
                 close_file_mmap_if_opened!();
                 if let Some(sysv_shm) = sysv_to_close {
                     sysv_shm.close_vma();
                 }
                 return Err(err);
             }
+            drop(eager_invalidate);
 
             // Match Linux's uprobe_mmap ordering: publish probes for the new
             // executable file VMA while the address-space write lock still

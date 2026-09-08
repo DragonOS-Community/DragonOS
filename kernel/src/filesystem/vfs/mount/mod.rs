@@ -5045,8 +5045,8 @@ impl IndexNode for MountFSInode {
         self.dentry.inode.mmap_vm_flags(file, vm_flags)
     }
 
-    fn mmap_uses_shared_anon(&self, vm_flags: VmFlags) -> bool {
-        self.dentry.inode.mmap_uses_shared_anon(vm_flags)
+    fn mmap_uses_anonymous_pages(&self) -> bool {
+        self.dentry.inode.mmap_uses_anonymous_pages()
     }
 
     fn mmap_effective_file(
@@ -5063,7 +5063,7 @@ impl IndexNode for MountFSInode {
         len: usize,
         offset: usize,
         vm_flags: VmFlags,
-    ) -> Result<(), SystemError> {
+    ) -> Result<Arc<super::file::File>, SystemError> {
         self.dentry
             .inode
             .mmap_file(file, start, len, offset, vm_flags)

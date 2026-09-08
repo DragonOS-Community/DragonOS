@@ -61,7 +61,7 @@ pub(super) fn do_kernel_shmget(
                 let shm_manager_guard = ipcns.shm.lock();
                 shm_manager_guard.validate_new_segment_size(size)?
             };
-            let backing = ShmManager::create_default_backing(size)?;
+            let backing = ShmManager::create_default_backing(key, size)?;
             let mut shm_manager_guard = ipcns.shm.lock();
             shm_manager_guard.add_prepared(key, size, shmflg, backing, numpages)
         }
@@ -82,7 +82,7 @@ pub(super) fn do_kernel_shmget(
                 shm_manager_guard.validate_new_segment_size(size)?
             };
 
-            let backing = ShmManager::create_default_backing(size)?;
+            let backing = ShmManager::create_default_backing(key, size)?;
             let mut shm_manager_guard = ipcns.shm.lock();
             if let Some(id) = shm_manager_guard.contains_key(&key).copied() {
                 return existing_segment_result(&mut shm_manager_guard, id, size, shmflg);

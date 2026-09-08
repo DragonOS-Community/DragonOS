@@ -129,7 +129,7 @@ impl IndexNode for FuseNode {
         len: usize,
         offset: usize,
         vm_flags: crate::mm::VmFlags,
-    ) -> Result<(), SystemError> {
+    ) -> Result<Arc<crate::filesystem::vfs::file::File>, SystemError> {
         let _ = (start, len, offset);
         self.check_not_stale()?;
         if file.file_type() != FileType::File {
@@ -152,7 +152,7 @@ impl IndexNode for FuseNode {
         }
 
         self.ensure_page_cache()?;
-        Ok(())
+        Ok(file.clone())
     }
 
     fn getxattr(&self, name: &str, buf: &mut [u8]) -> Result<usize, SystemError> {

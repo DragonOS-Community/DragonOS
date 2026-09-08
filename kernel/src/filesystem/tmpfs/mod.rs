@@ -34,10 +34,12 @@ use alloc::{
 use system_error::SystemError;
 
 use super::vfs::{
-    file::FilePrivateData, mount::MountFlags, utils::DName, FileSystem, FsInfo,
-    FsReconfigureRequest, IndexNode, InodeFlags, InodeId, InodeMode, LinkMutationCoordinator,
-    LinkRemovalOutcome, Metadata, OpenFileBehavior, PostWriteSyncPolicy, RenameOutcome,
-    SetMetadataMask, SpecialNodeData,
+    file::{File, FileFlags, FilePrivateData},
+    mount::MountFlags,
+    utils::DName,
+    FileSystem, FsInfo, FsReconfigureRequest, IndexNode, InodeFlags, InodeId, InodeMode,
+    LinkMutationCoordinator, LinkRemovalOutcome, Metadata, OpenFileBehavior, PostWriteSyncPolicy,
+    RenameOutcome, SetMetadataMask, SpecialNodeData,
 };
 
 use linkme::distributed_slice;
@@ -340,36 +342,36 @@ pub struct Tmpfs {
 
 #[derive(Debug)]
 pub struct TmpfsShmemFile {
-    inode: Arc<dyn IndexNode>,
-    fs: Arc<Tmpfs>,
-    inode_id: InodeId,
-    page_cache: Arc<PageCache>,
-    charged_size: usize,
+    file: Arc<File>,
 }
 
 impl TmpfsShmemFile {
+    pub fn file(&self) -> Arc<File> {
+        self.file.clone()
+    }
+
     pub fn inode(&self) -> Arc<dyn IndexNode> {
-        self.inode.clone()
+        self.file.inode()
     }
 
     pub fn inode_id(&self) -> InodeId {
-        self.inode_id
+        // This wrapper is constructed only from a live internal tmpfs inode.
+        self.file
+            .metadata()
+            .expect("internal shmem metadata")
+            .inode_id
     }
 
     pub fn page_cache(&self) -> Arc<PageCache> {
-        self.page_cache.clone()
+        self.inode()
+            .page_cache()
+            .expect("internal shmem page cache")
     }
 
     pub fn set_locked(&self, locked: bool) -> (Arc<PageCache>, bool) {
         let page_cache = self.page_cache();
         let old_locked = page_cache.set_unevictable(locked);
         (page_cache, old_locked)
-    }
-}
-
-impl Drop for TmpfsShmemFile {
-    fn drop(&mut self) {
-        self.fs.decrease_size(self.charged_size);
     }
 }
 
@@ -717,17 +719,8 @@ impl Tmpfs {
         if size > i64::MAX as usize {
             return Err(SystemError::EOVERFLOW);
         }
-        let charged_size = size
-            .checked_add(MMArch::PAGE_SIZE - 1)
-            .ok_or(SystemError::EOVERFLOW)?
-            & !(MMArch::PAGE_SIZE - 1);
-        let charged_size_u64 = charged_size as u64;
-        let blocks_u64 = Self::bytes_to_blocks_ceil(size as u64);
-        if blocks_u64 > usize::MAX as u64 {
-            return Err(SystemError::EOVERFLOW);
-        }
-        self.increase_size(charged_size_u64)?;
-
+        // Logical size is not resident tmpfs quota. PageCache membership
+        // reserves/releases actual pages, including creation failure rollback.
         let inode_id = generate_inode_id();
         let result: Arc<LockedTmpfsInode> = Arc::new(LockedTmpfsInode::new(TmpfsInode {
             parent: Weak::default(),
@@ -739,7 +732,7 @@ impl Tmpfs {
                 inode_id,
                 size: size as i64,
                 blk_size: TMPFS_BLOCK_SIZE as usize,
-                blocks: blocks_u64 as usize,
+                blocks: 0,
                 atime: PosixTimeSpec::default(),
                 mtime: PosixTimeSpec::default(),
                 ctime: PosixTimeSpec::default(),
@@ -767,30 +760,30 @@ impl Tmpfs {
         let pc = new_tmpfs_page_cache(Arc::downgrade(&inode_dyn), backend, &Arc::downgrade(self))?;
         result.0.lock().page_cache = Some(pc.clone());
 
-        Ok(Arc::new(TmpfsShmemFile {
-            inode: inode_dyn,
-            fs: self.clone(),
-            inode_id,
-            page_cache: pc,
-            charged_size,
-        }))
+        let file = Arc::new(File::new(
+            inode_dyn,
+            FileFlags::O_RDWR | FileFlags::O_LARGEFILE,
+        )?);
+        Ok(Arc::new(TmpfsShmemFile { file }))
     }
 }
 
 lazy_static! {
-    static ref SYSV_SHMEM_TMPFS: Arc<Tmpfs> = Tmpfs::new_internal_shmem(Some(InodeMode::S_IRWXUGO));
+    // Bare tmpfs inodes hold a Weak filesystem reference. Keep the private
+    // mount alive independently of IPC namespaces, files and VMAs.
+    static ref INTERNAL_SHMEM_TMPFS: Arc<Tmpfs> = Tmpfs::new_internal_shmem(Some(InodeMode::S_IRWXUGO));
 }
 
-pub fn create_unlinked_shmem_file(size: usize) -> Result<Arc<TmpfsShmemFile>, SystemError> {
-    static NEXT_SYSV_SHMEM_NAME: AtomicU64 = AtomicU64::new(1);
-    let name = format!(
-        "SYSV{:08x}",
-        NEXT_SYSV_SHMEM_NAME.fetch_add(1, Ordering::Relaxed)
-    );
-    let name = DName::from(name.as_str());
-    SYSV_SHMEM_TMPFS.create_unlinked_shmem_inode(
-        name,
-        InodeMode::S_IRUSR | InodeMode::S_IWUSR,
+/// Create a fixed-size, unlinked shmem object without publishing a path or fd.
+/// The file/inode owns its PageCache; retaining just file() is sufficient.
+/// `name` is diagnostic only and must be chosen by the kernel caller.
+pub fn create_unlinked_shmem_file(
+    name: &str,
+    size: usize,
+) -> Result<Arc<TmpfsShmemFile>, SystemError> {
+    INTERNAL_SHMEM_TMPFS.create_unlinked_shmem_inode(
+        DName::from(name),
+        InodeMode::S_IFREG | InodeMode::S_IRWXUGO,
         size,
     )
 }

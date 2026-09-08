@@ -131,3 +131,5 @@ normal/epoll_pwait2_semantics
 normal/elf_file_backing
 
 normal/exec_write_access
+
+normal/internal_shmem

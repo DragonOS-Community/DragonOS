@@ -429,7 +429,7 @@ impl InnerAddressSpace {
         let Some(old_vma) = self.mappings.contains(old_vaddr) else {
             mremap_fail!(SystemError::EFAULT);
         };
-        let (old_region, vm_flags, vm_file, shared_anon, base_pgoff, sysv_shm) = {
+        let (old_region, vm_flags, vm_file, base_pgoff, sysv_shm) = {
             let g = old_vma.lock();
             let region = *g.region();
             let vma_start = region.start();
@@ -439,14 +439,7 @@ impl InnerAddressSpace {
                 .backing_page_offset()
                 .unwrap_or(0)
                 .saturating_add(off_pages);
-            (
-                region,
-                *g.vm_flags(),
-                g.vm_file(),
-                g.shared_anon.clone(),
-                base,
-                g.sysv_shm(),
-            )
+            (region, *g.vm_flags(), g.vm_file(), base, g.sysv_shm())
         };
         let prot_flags: ProtFlags = vm_flags.into();
 
@@ -762,18 +755,13 @@ impl InnerAddressSpace {
                 vm_flags,
                 entry_flags,
                 vm_file.clone(),
-                if vm_file.is_some() || shared_anon.is_some() {
+                if vm_file.is_some() {
                     Some(base_pgoff)
                 } else {
                     None
                 },
                 false,
             ));
-            if let Some(shared) = shared_anon.clone() {
-                let mut vg = vma.lock();
-                vg.shared_anon = Some(shared);
-                vg.backing_pgoff = Some(base_pgoff);
-            }
             if let Some(sysv_shm) = sysv_shm.clone() {
                 vma.lock().set_sysv_shm(Some(sysv_shm));
             }

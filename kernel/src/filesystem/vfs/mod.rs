@@ -731,8 +731,10 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         Ok(vm_flags)
     }
 
-    /// Whether this file mapping should use MM's per-mmap shared-anonymous backing.
-    fn mmap_uses_shared_anon(&self, _vm_flags: VmFlags) -> bool {
+    /// Whether mappings retaining this inode produce anonymous pages rather
+    /// than file-backed pages (Linux vma_set_anonymous). A replacement file's
+    /// inode supplies the property after mmap_file returns.
+    fn mmap_uses_anonymous_pages(&self) -> bool {
         false
     }
 
@@ -740,15 +742,20 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         Ok(file.clone())
     }
 
+    /// Run mmap admission after the originating file's access checks, outside
+    /// the address-space lock. Success returns the authoritative VMA file;
+    /// an inode may replace it with an internal backing (e.g. shmem).
+    /// The returned file receives subsequent VMA open/close notifications.
     fn mmap_file(
         &self,
-        _file: &Arc<File>,
+        file: &Arc<File>,
         start: usize,
         len: usize,
         offset: usize,
         _vm_flags: VmFlags,
-    ) -> Result<(), SystemError> {
-        self.mmap(start, len, offset)
+    ) -> Result<Arc<File>, SystemError> {
+        self.mmap(start, len, offset)?;
+        Ok(file.clone())
     }
 
     fn read_sync(&self, _offset: usize, _buf: &mut [u8]) -> Result<usize, SystemError> {

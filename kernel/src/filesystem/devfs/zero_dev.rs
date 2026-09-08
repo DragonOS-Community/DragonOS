@@ -1,6 +1,6 @@
 use crate::driver::base::device::device_number::{DeviceNumber, Major};
 use crate::filesystem::devfs::LockedDevFSInode;
-use crate::filesystem::vfs::file::FileFlags;
+use crate::filesystem::vfs::file::{File, FileFlags};
 use crate::filesystem::vfs::InodeMode;
 use crate::filesystem::vfs::{
     utils::DName, vcore::generate_inode_id, FilePrivateData, FileSystem, FileType, IndexNode,
@@ -165,8 +165,23 @@ impl IndexNode for LockedZeroInode {
         Ok(())
     }
 
-    fn mmap_uses_shared_anon(&self, vm_flags: VmFlags) -> bool {
-        vm_flags.contains(VmFlags::VM_SHARED)
+    fn mmap_uses_anonymous_pages(&self) -> bool {
+        true
+    }
+
+    fn mmap_file(
+        &self,
+        file: &Arc<File>,
+        _start: usize,
+        len: usize,
+        _offset: usize,
+        vm_flags: VmFlags,
+    ) -> Result<Arc<File>, SystemError> {
+        if vm_flags.contains(VmFlags::VM_SHARED) {
+            Ok(crate::filesystem::tmpfs::create_unlinked_shmem_file("dev/zero", len)?.file())
+        } else {
+            Ok(file.clone())
+        }
     }
 
     fn parent(&self) -> Result<Arc<dyn IndexNode>, SystemError> {

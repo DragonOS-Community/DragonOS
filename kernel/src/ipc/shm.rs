@@ -489,8 +489,12 @@ impl ShmManager {
         return Ok(shm_id.data());
     }
 
-    pub fn create_default_backing(size: usize) -> Result<SysVShmBackingRef, SystemError> {
-        Ok(create_unlinked_shmem_file(size)?)
+    pub fn create_default_backing(
+        key: ShmKey,
+        size: usize,
+    ) -> Result<SysVShmBackingRef, SystemError> {
+        let name = alloc::format!("SYSV{:08x}", key.data() as u32);
+        Ok(create_unlinked_shmem_file(&name, size)?)
     }
 
     pub fn contains_key(&self, key: &ShmKey) -> Option<&ShmId> {

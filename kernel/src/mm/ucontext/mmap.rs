@@ -71,6 +71,11 @@ impl InnerAddressSpace {
     where
         F: FnMut(&mut Self, &[VirtRegion]) -> Result<(), SystemError>,
     {
+        // Shared mappings need the outer file-mapping reservation and fault
+        // path. Locked callers here only create private stacks, heaps or ELF.
+        if map_flags.contains(MapFlags::MAP_SHARED) {
+            return Err(SystemError::EINVAL.into());
+        }
         let allocate_at_once = if MMArch::PAGE_FAULT_ENABLED {
             allocate_at_once
         } else {
@@ -93,13 +98,6 @@ impl InnerAddressSpace {
                 if allocate_at_once {
                     let vma =
                         VMA::zeroed(page, count, vm_flags, flags, mapper, flusher, None, None)?;
-                    // For shared anonymous mappings, allocate a stable identity
-                    if vm_flags.contains(VmFlags::VM_SHARED) {
-                        let mut g = vma.lock();
-                        g.shared_anon = Some(AnonSharedMapping::new(count.data()));
-                        // Set backing_pgoff to 0 as the base offset for shared-anon mappings.
-                        g.backing_pgoff = Some(0);
-                    }
                     Ok(vma)
                 } else {
                     let vma = LockedVMA::new(VMA::new(
@@ -110,11 +108,6 @@ impl InnerAddressSpace {
                         None,
                         false,
                     ));
-                    if vm_flags.contains(VmFlags::VM_SHARED) {
-                        let mut g = vma.lock();
-                        g.shared_anon = Some(AnonSharedMapping::new(count.data()));
-                        g.backing_pgoff = Some(0);
-                    }
                     Ok(vma)
                 }
             },

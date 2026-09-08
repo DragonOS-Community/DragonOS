@@ -12,10 +12,12 @@ pub struct InnerAddressSpace {
     pub mmap_min: VirtAddr,
     /// User stack information struct
     pub user_stack: Option<UserStack>,
-    /// Main image File and deny-write ownership, released at last mm user teardown.
+    /// Main image ownership, released at last mm user teardown. Tuple elements
+    /// drop in order: release deny-write before the File and its mount pin,
+    /// matching Linux's allow_write_access() before fput().
     pub(crate) exec_write_guard: Option<(
-        Arc<crate::filesystem::vfs::file::File>,
         Arc<crate::filesystem::vfs::write_access::InodeWriteGuard>,
+        Arc<crate::filesystem::vfs::file::File>,
     )>,
 
     pub elf_brk_start: VirtAddr,

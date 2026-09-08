@@ -1,7 +1,6 @@
 #![allow(dead_code)]
 use crate::filesystem::fat::fs::LockedFATInode;
 use crate::filesystem::vfs::IndexNode;
-use crate::mm::truncate::truncate_inode_pages;
 use crate::{
     driver::base::block::{block_device::LBA_SIZE, SeekFrom},
     libs::vec_cursor::VecCursor,
@@ -62,9 +61,35 @@ pub struct FATFile {
     /// on-disk chain has not been measured since this entry was loaded or
     /// truncated. The inode mutex serializes every update to this file.
     chain_extent: Option<(u64, Cluster)>,
+    /// Last logical/physical read position, protected by the inode mutex.
+    /// Forward cold-page reads resume here instead of rescanning the FAT chain.
+    read_cursor: Option<(u64, Cluster)>,
+    /// The directory slot has been removed and may already belong to another file.
+    detached: bool,
 }
 
 impl FATFile {
+    pub(super) fn detach(&mut self) {
+        self.detached = true;
+    }
+
+    fn commit_directory_entry(
+        &self,
+        fs: &Arc<FATFileSystem>,
+        entry: &ShortDirEntry,
+        flush: bool,
+    ) -> Result<(), SystemError> {
+        if self.detached {
+            return Ok(());
+        }
+        let offset = fs.cluster_bytes_offset(self.loc.1 .0) + self.loc.1 .1;
+        if flush {
+            entry.flush(fs, offset)
+        } else {
+            entry.commit_without_barrier(fs, offset)
+        }
+    }
+
     /// @brief 获取文件大小
     #[inline]
     pub fn size(&self) -> u64 {
@@ -85,7 +110,7 @@ impl FATFile {
     /// @return Ok(usize) 成功读取到的字节数
     /// @return Err(SystemError) 读取时出现错误，返回错误码
     pub fn read(
-        &self,
+        &mut self,
         fs: &Arc<FATFileSystem>,
         buf: &mut [u8],
         offset: u64,
@@ -94,16 +119,21 @@ impl FATFile {
             return Ok(0);
         }
 
-        // 文件内的簇偏移量
         let start_cluster_number: u64 = offset / fs.bytes_per_cluster();
-        // 计算对应在分区内的簇号
-        let mut current_cluster = if let Some(c) =
-            fs.get_cluster_by_relative(self.first_cluster, start_cluster_number as usize)
-        {
+        let (cursor_index, cursor_cluster) = self
+            .read_cursor
+            .filter(|(index, _)| *index <= start_cluster_number)
+            .unwrap_or((0, self.first_cluster));
+        let mut current_cluster = if let Some(c) = fs.get_cluster_by_relative(
+            cursor_cluster,
+            (start_cluster_number - cursor_index) as usize,
+        ) {
             c
         } else {
             return Ok(0);
         };
+        let mut current_index = start_cluster_number;
+        self.read_cursor = Some((current_index, current_cluster));
 
         let bytes_remain: u64 = self.size() - offset;
 
@@ -119,6 +149,8 @@ impl FATFile {
             if in_cluster_offset >= fs.bytes_per_cluster() {
                 if let Ok(FATEntry::Next(c)) = fs.get_fat_entry(current_cluster) {
                     current_cluster = c;
+                    current_index += 1;
+                    self.read_cursor = Some((current_index, current_cluster));
                     in_cluster_offset %= fs.bytes_per_cluster();
                 } else {
                     break;
@@ -343,6 +375,7 @@ impl FATFile {
                     }
                     Err(AttachReservedError::Ambiguous(error)) => {
                         self.chain_extent = None;
+                        self.read_cursor = None;
                         return Err(error);
                     }
                 }
@@ -352,6 +385,7 @@ impl FATFile {
         let resulting_first = if old_chain_exists {
             self.first_cluster
         } else {
+            self.read_cursor = None;
             reserved_first.ok_or(SystemError::EIO)?
         };
         if let Some(tail) = reserved_last {
@@ -360,8 +394,7 @@ impl FATFile {
         let mut proposed = self.short_dir_entry;
         proposed.set_first_cluster(resulting_first);
         proposed.file_size = new_size as u32;
-        let short_entry_offset = fs.cluster_bytes_offset(self.loc.1 .0) + self.loc.1 .1;
-        if let Err(error) = proposed.commit_without_barrier(fs, short_entry_offset) {
+        if let Err(error) = self.commit_directory_entry(fs, &proposed, false) {
             // The chain may already be reachable on disk. Keep it as
             // preallocation at the old visible size so a retry reuses it.
             if !old_chain_exists {
@@ -425,28 +458,23 @@ impl FATFile {
             return Ok(());
         }
 
-        let new_last_cluster = new_size.div_ceil(fs.bytes_per_cluster());
-        if let Some(begin_delete) =
-            fs.get_cluster_by_relative(self.first_cluster, new_last_cluster as usize)
-        {
-            fs.deallocate_cluster_chain(begin_delete)?;
-        };
-
+        // Publish the smaller reachable file before releasing clusters. If
+        // reclamation fails, the new size must remain authoritative.
+        let first = self.first_cluster;
+        let keep = new_size.div_ceil(fs.bytes_per_cluster());
+        let mut proposed = self.short_dir_entry;
+        proposed.file_size = new_size as u32;
         if new_size == 0 {
-            assert!(new_last_cluster == 0);
-            self.short_dir_entry.set_first_cluster(Cluster::new(0));
+            proposed.set_first_cluster(Cluster::new(0));
+        }
+        self.commit_directory_entry(fs, &proposed, true)?;
+        self.read_cursor = None;
+        self.chain_extent = None;
+        self.short_dir_entry = proposed;
+        if new_size == 0 {
             self.first_cluster = Cluster::new(0);
         }
-
-        // Truncation changes the tail and can partially preallocate on some
-        // error paths. Re-measure once on the next growth instead of keeping a
-        // second, independently updated truncation state machine.
-        self.chain_extent = None;
-
-        self.set_size(new_size as u32);
-        // 计算短目录项在分区内的字节偏移量
-        let short_entry_offset = fs.cluster_bytes_offset((self.loc.1).0) + (self.loc.1).1;
-        self.short_dir_entry.flush(fs, short_entry_offset)?;
+        fs.truncate_cluster_chain(first, keep as usize)?;
 
         return Ok(());
     }
@@ -963,14 +991,12 @@ impl FATDir {
             FATDirEntryOrShortName::DirEntry(e) => {
                 validate_rename_target(&old_dentry, &e, fs.clone())?;
 
-                if let Some(new_inode) = new_inode {
-                    if let Some(page_cache) = new_inode.page_cache().clone() {
-                        truncate_inode_pages(page_cache, 0);
-                    }
+                if e.is_dir() {
+                    self.remove(fs.clone(), new_name, true)?;
+                } else {
+                    let victim = new_inode.ok_or(SystemError::EIO)?;
+                    victim.remove_file_name(self, fs.clone(), new_name)?;
                 }
-
-                // 允许覆盖：若为非空目录，remove 会返回 ENOTEMPTY（这里只处理空目录或文件）
-                self.remove(fs.clone(), new_name, true)?;
                 e.short_name_raw()
             }
         };
@@ -1018,11 +1044,11 @@ impl FATDir {
             FATDirEntryOrShortName::DirEntry(e) => {
                 validate_rename_target(&old_dentry, &e, fs.clone())?;
 
-                if let Some(page_cache) = new_inode.unwrap().page_cache().clone() {
-                    truncate_inode_pages(page_cache, 0);
+                if e.is_dir() {
+                    target.remove(fs.clone(), new_name, true)?;
+                } else {
+                    new_inode?.remove_file_name(target, fs.clone(), new_name)?;
                 }
-                // 覆盖前删除目标目录项（空目录或文件），不截断源内容
-                target.remove(fs.clone(), new_name, true)?;
                 e.short_name_raw()
             }
         };
@@ -1380,6 +1406,8 @@ impl ShortDirEntry {
                 short_dir_entry: *self,
                 loc: (loc, loc),
                 chain_extent: None,
+                read_cursor: None,
+                detached: false,
             };
 
             // 根据当前短目录项的类型的不同，返回对应的枚举类型。
@@ -1424,6 +1452,8 @@ impl ShortDirEntry {
                 loc,
                 short_dir_entry: *self,
                 chain_extent: None,
+                read_cursor: None,
+                detached: false,
             };
 
             if self.is_file() {

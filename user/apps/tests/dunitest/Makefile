@@ -20,6 +20,7 @@ RESULTS_DIR = results
 BIN_DIR = bin
 BUILD_DIR = build
 EXT4_FIXTURE = $(BUILD_DIR)/fixtures/ext4_inode_identity.img
+EXT4_UNINIT_FIXTURE = $(BUILD_DIR)/fixtures/ext4_uninit_bitmap.img
 
 # 要编译的测试套件目录列表（suites/ 下的子目录名）
 SUITES = demo normal fuse
@@ -58,7 +59,7 @@ $(GTEST_SRC):
 	@mv "$(GTEST_TMP_ROOT)" "$(GTEST_ROOT)"
 	@test -f "$(GTEST_SRC)"
 
-build-suites: $(TEST_BINS) $(EXT4_FIXTURE)
+build-suites: $(TEST_BINS) $(EXT4_FIXTURE) $(EXT4_UNINIT_FIXTURE)
 
 $(EXT4_FIXTURE):
 	@mkdir -p "$(dir $@)"
@@ -69,6 +70,21 @@ $(EXT4_FIXTURE):
 				rm -f "$@"; \
 				truncate -s 8M "$@"; \
 				mke2fs -q -t ext4 -F "$@" ;; \
+			*) printf '%s\n' "$$output" >&2; exit 1 ;; \
+		esac; \
+	}
+
+# Small block groups force a modest payload into legal BLOCK_UNINIT groups.
+# Keep lazy bitmap initialization enabled; never pre-mount this source image.
+$(EXT4_UNINIT_FIXTURE):
+	@mkdir -p "$(dir $@)"
+	@truncate -s 32M "$@"
+	@output=$$(mke2fs -q -t ext4 -F -b 4096 -g 1024 -G 2 -I 256 -O metadata_csum,64bit,flex_bg,^orphan_file "$@" 2>&1) || { \
+		case "$$output" in \
+			*"Invalid filesystem option set:"*"orphan_file"*) \
+				rm -f "$@"; \
+				truncate -s 32M "$@"; \
+				mke2fs -q -t ext4 -F -b 4096 -g 1024 -G 2 -I 256 -O metadata_csum,64bit,flex_bg "$@" ;; \
 			*) printf '%s\n' "$$output" >&2; exit 1 ;; \
 		esac; \
 	}
@@ -99,7 +115,7 @@ install: build
 	@chmod +x $(INSTALL_DIR)/dunitest-runner
 	@cp -rf $(BIN_DIR) $(INSTALL_DIR)/
 	@mkdir -p $(INSTALL_DIR)/fixtures
-	@cp --sparse=always -f $(EXT4_FIXTURE) $(INSTALL_DIR)/fixtures/
+	@cp --sparse=always -f $(EXT4_FIXTURE) $(EXT4_UNINIT_FIXTURE) $(INSTALL_DIR)/fixtures/
 	@cp -f whitelist.txt $(INSTALL_DIR)/whitelist.txt
 	@cp -f no_skip.txt $(INSTALL_DIR)/no_skip.txt
 	@cp -f scripts/run_tests.sh $(INSTALL_DIR)/run_tests.sh

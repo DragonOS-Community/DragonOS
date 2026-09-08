@@ -203,9 +203,10 @@ bitflags! {
 
 #[derive(Debug)]
 pub struct ExecParam {
-    file: Arc<File>,
-    // Loading protection is separate from File/VMA lifetime (notably PT_INTERP).
+    // Release loading protection before the File can drop its mount pin,
+    // including failed loads and interpreter parameters.
     exec_write_guard: Arc<crate::filesystem::vfs::write_access::InodeWriteGuard>,
+    file: Arc<File>,
     vm: Arc<AddressSpace>,
     /// Flags.
     flags: ExecParamFlags,
@@ -394,7 +395,7 @@ impl ExecParam {
         exec_task_namespaces().map_err(ExecError::SystemError)?;
         // The main image stays protected for the mm's user lifetime, including
         // fork. Interpreter ExecParams never call begin_new_exec().
-        self.vm.write().exec_write_guard = Some((self.file.clone(), self.exec_write_guard.clone()));
+        self.vm.write().exec_write_guard = Some((self.exec_write_guard.clone(), self.file.clone()));
         Ok(())
     }
 

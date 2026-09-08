@@ -52,6 +52,16 @@ pub struct BlockGroupDesc {
 unsafe impl AsBytes for BlockGroupDesc {}
 
 impl BlockGroupDesc {
+    const BLOCK_UNINIT: u16 = 0x0002;
+
+    pub fn block_bitmap_uninitialized(&self) -> bool {
+        self.flags & Self::BLOCK_UNINIT != 0
+    }
+
+    pub fn clear_block_bitmap_uninitialized(&mut self) {
+        self.flags &= !Self::BLOCK_UNINIT;
+    }
+
     #[allow(unused)]
     const MIN_BLOCK_GROUP_DESC_SIZE: usize = 32;
     #[allow(unused)]

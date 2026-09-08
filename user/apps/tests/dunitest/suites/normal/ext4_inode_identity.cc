@@ -59,7 +59,7 @@ constexpr unsigned long kLoopCtlGetFree = 0x4C82;
 constexpr unsigned long kLoopSetFd = 0x4C00;
 constexpr unsigned long kLoopClrFd = 0x4C01;
 
-std::string FixturePath() {
+std::string FixturePath(const char* name = "ext4_inode_identity.img") {
     char executable[512] = {};
     ssize_t size = readlink("/proc/self/exe", executable, sizeof(executable) - 1);
     if (size <= 0) {
@@ -73,7 +73,7 @@ std::string FixturePath() {
         }
         path.resize(slash);
     }
-    return path + "/fixtures/ext4_inode_identity.img";
+    return path + "/fixtures/" + name;
 }
 
 void CopySparseFile(const std::string& source, int destination) {
@@ -139,7 +139,7 @@ class LoopExt4 {
         }
     }
 
-    void SetUp() {
+    void SetUp(const char* fixture = "ext4_inode_identity.img") {
         image_ = "/tmp/ext4_inode_identity_" + std::to_string(getpid()) + ".img";
         mount_point_ = "/tmp/ext4_inode_identity_" + std::to_string(getpid()) + "_mnt";
 
@@ -147,7 +147,7 @@ class LoopExt4 {
 
         backing_fd_ = open(image_.c_str(), O_CREAT | O_EXCL | O_RDWR, 0600);
         ASSERT_GE(backing_fd_, 0) << strerror(errno);
-        ASSERT_NO_FATAL_FAILURE(CopySparseFile(FixturePath(), backing_fd_));
+        ASSERT_NO_FATAL_FAILURE(CopySparseFile(FixturePath(fixture), backing_fd_));
         close(backing_fd_);
         backing_fd_ = -1;
 
@@ -2000,6 +2000,67 @@ TEST(Ext4InodeIdentity, BindAliasAndMapsShareDeletedDentryState) {
     ASSERT_EQ(0, rmdir(bind_dir.c_str())) << strerror(errno);
     ASSERT_EQ(0, rmdir(source_dir.c_str())) << strerror(errno);
     ASSERT_EQ(0, rmdir(base.c_str())) << strerror(errno);
+}
+
+TEST(Ext4InodeIdentity, BlockUninitCrossGroupWriteChmodFsyncAndRemount) {
+    LoopExt4 fs;
+    ASSERT_NO_FATAL_FAILURE(fs.SetUp("ext4_uninit_bitmap.img"));
+    ASSERT_NO_FATAL_FAILURE(fs.Mount());
+    const std::string path = fs.mount_point() + "/payload";
+    constexpr size_t kChunk = 64 * 1024;
+    constexpr size_t kSize = 12 * 1024 * 1024;
+    int fd = open(path.c_str(), O_CREAT | O_EXCL | O_RDWR, 0644);
+    ASSERT_GE(fd, 0) << strerror(errno);
+    std::vector<unsigned char> data(kChunk);
+    bool written = true;
+    for (size_t offset = 0; offset < kSize; offset += kChunk) {
+        std::fill(data.begin(), data.end(), offset / kChunk % 251 + 1);
+        ssize_t count = pwrite(fd, data.data(), data.size(), offset);
+        if (count != static_cast<ssize_t>(data.size())) {
+            ADD_FAILURE() << "cross-group write offset=" << offset << " count="
+                          << count << " errno=" << errno;
+            written = false;
+            break;
+        }
+    }
+    // chmod must drain delayed data allocation successfully before publishing
+    // execute permission; fsync and remount prove this is persistent data.
+    int chmod_result = fchmod(fd, 0755);
+    int chmod_error = errno;
+    int sync_result = fsync(fd);
+    int sync_error = errno;
+    int closed = close(fd);
+    ASSERT_TRUE(written);
+    ASSERT_EQ(0, chmod_result) << strerror(chmod_error);
+    ASSERT_EQ(0, sync_result) << strerror(sync_error);
+    ASSERT_EQ(0, closed);
+    for (int pass = 0; pass < 2; ++pass) {
+        if (pass == 1) {
+            ASSERT_NO_FATAL_FAILURE(fs.Unmount());
+            ASSERT_NO_FATAL_FAILURE(fs.Mount());
+        }
+        fd = open(path.c_str(), O_RDONLY);
+        ASSERT_GE(fd, 0) << strerror(errno);
+        struct stat st = {};
+        EXPECT_EQ(0, fstat(fd, &st));
+        EXPECT_EQ(static_cast<off_t>(kSize), st.st_size);
+        EXPECT_EQ(static_cast<mode_t>(0755), st.st_mode & 0777);
+        bool correct = true;
+        for (size_t offset = 0; offset < kSize; offset += kChunk) {
+            ssize_t count = pread(fd, data.data(), data.size(), offset);
+            unsigned char expected = offset / kChunk % 251 + 1;
+            if (count != static_cast<ssize_t>(data.size()) ||
+                !std::all_of(data.begin(), data.end(),
+                             [expected](unsigned char value) { return value == expected; })) {
+                ADD_FAILURE() << "payload mismatch pass=" << pass << " offset=" << offset;
+                correct = false;
+                break;
+            }
+        }
+        EXPECT_EQ(0, close(fd));
+        ASSERT_TRUE(correct);
+    }
+    ASSERT_NO_FATAL_FAILURE(fs.Unmount());
 }
 
 }  // namespace

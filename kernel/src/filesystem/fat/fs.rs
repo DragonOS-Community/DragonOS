@@ -1,5 +1,8 @@
 use crate::arch::MMArch;
+use crate::exception::workqueue::{Work, WorkQueue};
+use crate::filesystem::vfs::inode_lifecycle::{EvictionEpoch, InodeRetentionState};
 use crate::filesystem::vfs::syscall::RenameFlags;
+use crate::libs::{spinlock::SpinLock, wait_queue::WaitQueue};
 use crate::mm::MemoryManagementArch;
 use alloc::string::ToString;
 use alloc::{
@@ -10,6 +13,24 @@ use alloc::{
 use core::cmp::Ordering;
 use core::intrinsics::unlikely;
 use core::num::NonZeroUsize;
+use core::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+
+#[derive(Debug, Default)]
+struct FATReclaimQueue {
+    next: u64,
+    completed: u64,
+    sealed: bool,
+    error: Option<SystemError>,
+}
+
+#[derive(Debug)]
+struct FATInodeLifetime {
+    retention: InodeRetentionState,
+    detached: AtomicBool,
+    // release() can run under arbitrary VFS locks: never take the inode mutex.
+    owner: SpinLock<(Weak<LockedFATInode>, Weak<FATFileSystem>)>,
+}
+
 use core::{any::Any, fmt::Debug};
 use hashbrown::HashMap;
 use log::error;
@@ -53,6 +74,16 @@ const FAT_MAX_NAMELEN: u64 = 255;
 const FAT_LRU_CACHE_SIZE: usize = 4096;
 const FAT_NEGATIVE_CHILDREN_CACHE_SIZE: usize = 256;
 
+impl Default for FATInodeLifetime {
+    fn default() -> Self {
+        Self {
+            retention: InodeRetentionState::new(),
+            detached: AtomicBool::new(false),
+            owner: SpinLock::new((Weak::new(), Weak::new())),
+        }
+    }
+}
+
 /// FAT32文件系统的最大的文件大小
 pub const MAX_FILE_SIZE: u64 = 0xffff_ffff;
 
@@ -94,6 +125,10 @@ impl Eq for Cluster {}
 #[derive(Debug)]
 pub struct FATFileSystem {
     writeback_domain: Arc<PageCacheWritebackDomain>,
+    reclaim_queue: SpinLock<FATReclaimQueue>,
+    /// Serial within this filesystem, independent of other devices.
+    reclaim_worker: Arc<WorkQueue>,
+    reclaim_wait: WaitQueue,
     /// 当前文件系统所在的分区
     pub gendisk: Arc<GenDisk>,
     /// Prevents loop clear/remove for the complete filesystem lifetime.
@@ -137,7 +172,12 @@ pub struct FATFileSystem {
 
 /// FAT文件系统的Inode
 #[derive(Debug)]
-pub struct LockedFATInode(Mutex<FATInode>, RwSem<()>, LinkMutationCoordinator);
+pub struct LockedFATInode(
+    Mutex<FATInode>,
+    RwSem<()>,
+    LinkMutationCoordinator,
+    FATInodeLifetime,
+);
 
 #[derive(Debug)]
 pub struct LockedFATFsInfo(Mutex<FATFsInfo>);
@@ -338,6 +378,7 @@ impl LockedFATInode {
             }),
             RwSem::new(()),
             LinkMutationCoordinator::new(),
+            FATInodeLifetime::default(),
         ));
 
         if !inode.0.lock().inode_type.is_dir() {
@@ -353,6 +394,7 @@ impl LockedFATInode {
         }
 
         inode.0.lock().self_ref = Arc::downgrade(&inode);
+        *inode.3.owner.lock() = (Arc::downgrade(&inode), Arc::downgrade(&fs));
 
         inode.0.lock().synchronize_metadata();
 
@@ -418,7 +460,16 @@ impl LockedFATInode {
             }
         };
         // remove entries
-        old_inode_guard.inode_type = old_dir.rename(fs, old_name, new_name, new_inode)?;
+        let renamed = old_dir.rename(fs, old_name, new_name, new_inode.clone());
+        // Replacement may have detached the victim before a later directory
+        // update fails. Never leave that dead name in the positive cache.
+        if new_inode
+            .as_ref()
+            .is_some_and(|inode| inode.3.detached.load(AtomicOrdering::Acquire))
+        {
+            guard.mark_child_absent(new_name);
+        }
+        old_inode_guard.inode_type = renamed?;
         let old_inode = guard.children.remove(&old_key).unwrap();
         // the new_name should refer to old_inode
         guard.invalidate_negative_children();
@@ -491,13 +542,20 @@ impl LockedFATInode {
             }
         };
 
-        old_inode_guard.inode_type = old_dir.rename_across(
+        let renamed = old_dir.rename_across(
             fs,
             new_dir,
             old_name,
             new_name,
             new_inode.clone().ok_or(SystemError::ENOENT),
-        )?;
+        );
+        if new_inode
+            .as_ref()
+            .is_some_and(|inode| inode.3.detached.load(AtomicOrdering::Acquire))
+        {
+            new_guard.mark_child_absent(new_name);
+        }
+        old_inode_guard.inode_type = renamed?;
         // 将源节点从父目录中删除
         let old_key = to_search_name(old_name);
         let new_key = to_search_name(new_name);
@@ -532,7 +590,120 @@ pub struct FATFsInfo {
     offset: Option<u64>,
 }
 
+impl LockedFATInode {
+    /// The caller serializes directory mutation. Keep the victim inode locked
+    /// through slot removal and detachment so writeback cannot touch a reused slot.
+    pub(super) fn remove_file_name(
+        &self,
+        parent: &FATDir,
+        fs: Arc<FATFileSystem>,
+        name: &str,
+    ) -> Result<(), SystemError> {
+        {
+            let mut inode = self.0.lock();
+            let file = match &mut inode.inode_type {
+                FATDirEntry::File(file) | FATDirEntry::VolId(file) => file,
+                _ => return Err(SystemError::EINVAL),
+            };
+            parent.remove(fs, name, false)?;
+            file.detach();
+            inode.metadata.nlinks = 0;
+            self.3.detached.store(true, AtomicOrdering::Release);
+        }
+        self.schedule_reclaim();
+        Ok(())
+    }
+
+    fn schedule_reclaim(&self) {
+        if !self.3.detached.load(AtomicOrdering::Acquire)
+            || self.3.retention.try_begin_freeing().is_err()
+        {
+            return;
+        }
+        let (inode, fs) = {
+            let owner = self.3.owner.lock();
+            (owner.0.upgrade(), owner.1.upgrade())
+        };
+        let (Some(inode), Some(fs)) = (inode, fs) else {
+            return;
+        };
+        // FIFO publication and epoch assignment share the queue lock. Work
+        // owns both objects; neither release nor Drop performs filesystem I/O.
+        let mut queue = fs.reclaim_queue.lock();
+        if queue.sealed {
+            fs.writeback_domain
+                .record_writeback_error(SystemError::EBUSY);
+            queue.error.get_or_insert(SystemError::EBUSY);
+            return;
+        }
+        let Some(epoch) = queue.next.checked_add(1) else {
+            fs.writeback_domain
+                .record_writeback_error(SystemError::EOVERFLOW);
+            queue.error.get_or_insert(SystemError::EOVERFLOW);
+            return;
+        };
+        queue.next = epoch;
+        let worker_fs = fs.clone();
+        fs.reclaim_worker.enqueue(Work::new(move || {
+            let result = inode.reclaim_detached(&worker_fs);
+            let mut queue = worker_fs.reclaim_queue.lock();
+            if let Err(error) = result {
+                // Replaying a partially completed free could double-free a
+                // reused cluster. Preserve the error, never retry the old head.
+                worker_fs
+                    .writeback_domain
+                    .record_writeback_error(error.clone());
+                queue.error.get_or_insert(error);
+            }
+            queue.completed = epoch;
+            drop(queue);
+            worker_fs.reclaim_wait.wake_all();
+        }));
+    }
+
+    fn reclaim_detached(&self, fs: &Arc<FATFileSystem>) -> Result<(), SystemError> {
+        let (cache, first) = {
+            let inode = self.0.lock();
+            (inode.page_cache.clone(), inode.inode_type.first_cluster())
+        };
+        if let Some(cache) = cache {
+            cache.manager().resize(0)?;
+        }
+        if first.cluster_num >= RESERVED_CLUSTERS as u64 {
+            fs.deallocate_cluster_chain(first)?;
+        }
+        Ok(())
+    }
+}
+
 impl FileSystem for FATFileSystem {
+    fn seal_eviction_queue(&self) -> EvictionEpoch {
+        let mut queue = self.reclaim_queue.lock();
+        queue.sealed = true;
+        EvictionEpoch::new(queue.next)
+    }
+
+    fn drain_evictions_through(&self, epoch: EvictionEpoch) -> Result<(), SystemError> {
+        self.reclaim_wait
+            .wait_until(|| {
+                let queue = self.reclaim_queue.lock();
+                (queue.completed >= epoch.value()).then(|| queue.error.clone())
+            })
+            .map_or(Ok(()), Err)
+    }
+
+    fn sync_fs(&self, wait: bool) -> Result<(), SystemError> {
+        if wait {
+            let epoch = EvictionEpoch::new(self.reclaim_queue.lock().next);
+            let reclaim_result = self.drain_evictions_through(epoch);
+            // A sticky reclamation error must not suppress durability for
+            // other files whose writeback has already completed.
+            let sync_result = self.gendisk.sync();
+            reclaim_result.and(sync_result)?;
+        }
+        Ok(())
+    }
+
     fn page_cache_writeback_domain(&self) -> Option<&Arc<PageCacheWritebackDomain>> {
         Some(&self.writeback_domain)
     }
@@ -811,10 +982,14 @@ impl FATFileSystem {
             }),
             RwSem::new(()),
             LinkMutationCoordinator::new(),
+            FATInodeLifetime::default(),
         ));
 
         let result: Arc<FATFileSystem> = Arc::new(FATFileSystem {
             writeback_domain: PageCacheWritebackDomain::new(),
+            reclaim_queue: SpinLock::new(FATReclaimQueue::default()),
+            reclaim_worker: WorkQueue::try_new_owned("fat_evict")?,
+            reclaim_wait: WaitQueue::default(),
             gendisk,
             _device_mount_holder: device_mount_holder,
             bpb,
@@ -834,6 +1009,8 @@ impl FATFileSystem {
         root_guard.parent = Arc::downgrade(&result.root_inode);
         root_guard.self_ref = Arc::downgrade(&result.root_inode);
         root_guard.fs = Arc::downgrade(&result);
+        *result.root_inode.3.owner.lock() =
+            (Arc::downgrade(&result.root_inode), Arc::downgrade(&result));
         // 释放锁
         drop(root_guard);
 
@@ -1272,6 +1449,37 @@ impl FATFileSystem {
     /// @param start_cluster 簇链的第一个簇
     pub fn deallocate_cluster_chain(&self, start_cluster: Cluster) -> Result<(), SystemError> {
         let _fat_guard = self.fat_lock.lock();
+        self.deallocate_cluster_chain_locked(start_cluster)
+    }
+
+    /// Detach the discarded tail before any of its clusters can be reused.
+    pub(super) fn truncate_cluster_chain(
+        &self,
+        first: Cluster,
+        keep: usize,
+    ) -> Result<(), SystemError> {
+        let _fat_guard = self.fat_lock.lock();
+        let free_start = if keep == 0 {
+            first
+        } else {
+            let tail = self
+                .get_cluster_by_relative(first, keep - 1)
+                .ok_or(SystemError::EIO)?;
+            match self.get_fat_entry(tail)? {
+                FATEntry::Next(next) => {
+                    // On an ambiguous write error, retain the tail rather
+                    // than freeing clusters that may still be reachable.
+                    self.set_entry(tail, FATEntry::EndOfChain)?;
+                    next
+                }
+                FATEntry::EndOfChain => return Ok(()),
+                _ => return Err(SystemError::EIO),
+            }
+        };
+        self.deallocate_cluster_chain_locked(free_start)
+    }
+
+    fn deallocate_cluster_chain_locked(&self, start_cluster: Cluster) -> Result<(), SystemError> {
         let clusters: Vec<Cluster> = self.clusters(start_cluster);
         for c in clusters {
             self.deallocate_cluster_locked(c)?;
@@ -1752,7 +1960,7 @@ impl FATFileSystem {
                 let raw_val: u16 = match fat_entry {
                     FATEntry::Unused => 0,
                     FATEntry::Bad => 0xfff7,
-                    FATEntry::EndOfChain => 0xfdff,
+                    FATEntry::EndOfChain => 0xffff,
                     FATEntry::Next(c) => c.cluster_num as u16,
                 };
 
@@ -2064,6 +2272,14 @@ impl LockedFATInode {
 }
 
 impl IndexNode for LockedFATInode {
+    fn retention_state(&self) -> Option<&InodeRetentionState> {
+        Some(&self.3.retention)
+    }
+
+    fn on_zero_retention(&self) {
+        self.schedule_reclaim();
+    }
+
     fn link_mutation_coordinator(&self) -> Option<&LinkMutationCoordinator> {
         Some(&self.2)
     }
@@ -2126,10 +2342,11 @@ impl IndexNode for LockedFATInode {
     }
 
     fn read_sync(&self, offset: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
-        let guard: MutexGuard<FATInode> = self.0.lock();
-        match &guard.inode_type {
+        let mut guard: MutexGuard<FATInode> = self.0.lock();
+        let fs = guard.fs.upgrade().unwrap();
+        match &mut guard.inode_type {
             FATDirEntry::File(f) | FATDirEntry::VolId(f) => {
-                let r = f.read(&guard.fs.upgrade().unwrap(), buf, offset as u64);
+                let r = f.read(&fs, buf, offset as u64);
                 return r;
             }
 
@@ -2354,16 +2571,18 @@ impl IndexNode for LockedFATInode {
                         guard.metadata.size = len as i64;
                         drop(guard);
                         if let Some(page_cache) = page_cache {
-                            page_cache.manager().resize(len)?;
+                            if let Err(error) = page_cache.manager().resize(len) {
+                                self.0.lock().synchronize_metadata();
+                                return Err(error);
+                            }
                         }
                         let mut guard: MutexGuard<FATInode> = self.0.lock();
                         let fs: &Arc<FATFileSystem> = &guard.fs.upgrade().unwrap();
                         match &mut guard.inode_type {
                             FATDirEntry::File(file) | FATDirEntry::VolId(file) => {
-                                file.truncate(fs, len as u64)?;
+                                let result = file.truncate(fs, len as u64);
                                 guard.synchronize_metadata();
-                                guard.metadata.size = len as i64;
-                                return Ok(());
+                                return result;
                             }
                             FATDirEntry::Dir(_) => return Err(SystemError::ENOSYS),
                             FATDirEntry::UnInit => {
@@ -2522,43 +2741,22 @@ impl IndexNode for LockedFATInode {
     }
 
     fn unlink(&self, name: &str) -> Result<LinkRemovalOutcome, SystemError> {
-        let mut guard: MutexGuard<FATInode> = self.0.lock();
-        let target: Arc<LockedFATInode> = guard.find(name)?;
-        // 对目标inode上锁，以防更改
-        let target_guard: MutexGuard<FATInode> = target.0.lock();
-        // 先从缓存删除
-        let nod = guard.children.remove(&to_search_name(name));
-
-        // 若删除缓存中为管道的文件，则不需要再到磁盘删除
-        if nod.is_some() {
-            let file_type = target_guard.metadata.file_type;
-            if file_type == FileType::Pipe {
-                guard.invalidate_negative_children();
-                guard.mark_child_negative(to_search_name(name));
-                return Ok(LinkRemovalOutcome::LastLink);
-            }
-        }
-
-        let dir = match &guard.inode_type {
-            FATDirEntry::File(_) | FATDirEntry::VolId(_) => {
-                return Err(SystemError::ENOTDIR);
-            }
-            FATDirEntry::Dir(d) => d,
-            FATDirEntry::UnInit => {
-                error!("FATFS: param: Inode_type uninitialized.");
-                return Err(SystemError::EROFS);
-            }
-        };
-        // 检查文件是否存在
-        dir.check_existence(name, Some(false), guard.fs.upgrade().unwrap())?;
-
-        // 再从磁盘删除
-        let r = dir.remove(guard.fs.upgrade().unwrap().clone(), name, true);
-        drop(target_guard);
-        if r.is_ok() {
+        let mut guard = self.0.lock();
+        let target = guard.find(name)?;
+        let file_type = target.0.lock().metadata.file_type;
+        if file_type == FileType::Pipe {
             guard.mark_child_absent(name);
+            return Ok(LinkRemovalOutcome::LastLink);
         }
-        r.map(|_| LinkRemovalOutcome::LastLink)
+        let fs = guard.fs.upgrade().ok_or(SystemError::EIO)?;
+        let dir = match &guard.inode_type {
+            FATDirEntry::Dir(dir) => dir,
+            _ => return Err(SystemError::ENOTDIR),
+        };
+        dir.check_existence(name, Some(false), fs.clone())?;
+        target.remove_file_name(dir, fs, name)?;
+        guard.mark_child_absent(name);
+        Ok(LinkRemovalOutcome::LastLink)
     }
 
     fn rmdir(&self, name: &str) -> Result<(), SystemError> {

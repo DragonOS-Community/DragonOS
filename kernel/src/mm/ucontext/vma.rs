@@ -961,7 +961,7 @@ impl VMA {
     ) -> Result<Arc<LockedVMA>, SystemError> {
         debug_assert!(page_cache.is_shmem() && vm_flags.contains(VmFlags::VM_MAYSHARE));
         let size = file.inode().metadata()?.size.max(0) as usize;
-        let file_pages = size / MMArch::PAGE_SIZE + usize::from(size % MMArch::PAGE_SIZE != 0);
+        let file_pages = size.div_ceil(MMArch::PAGE_SIZE);
         let end = pgoff
             .checked_add(page_count.data())
             .ok_or(SystemError::EOVERFLOW)?;

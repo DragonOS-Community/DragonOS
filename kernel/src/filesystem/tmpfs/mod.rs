@@ -1170,7 +1170,6 @@ impl IndexNode for LockedTmpfsInode {
         };
         let first = offset >> MMArch::PAGE_SHIFT;
         let last = (end - 1) >> MMArch::PAGE_SHIFT;
-        let mut created: Vec<(usize, Arc<Page>)> = Vec::new();
         let missing_pages = page_cache.manager().missing_pages_in_range(first, last)?;
         if fs
             .available_pages()
@@ -1178,43 +1177,7 @@ impl IndexNode for LockedTmpfsInode {
         {
             return Err(SystemError::ENOSPC);
         }
-        created
-            .try_reserve_exact(missing_pages)
-            .map_err(|_| SystemError::ENOMEM)?;
-
-        for page_index in first..=last {
-            match page_cache
-                .manager()
-                .commit_overwrite_pinned_with_status(page_index)
-            {
-                Ok((pin, was_created)) => {
-                    if was_created {
-                        if created.len() == created.capacity() && created.try_reserve(1).is_err() {
-                            let current_page = pin.page();
-                            drop(pin);
-                            let _ = page_cache
-                                .manager()
-                                .discard_created_page(page_index, &current_page);
-                            for (created_index, created_page) in created.into_iter().rev() {
-                                let _ = page_cache
-                                    .manager()
-                                    .discard_created_page(created_index, &created_page);
-                            }
-                            return Err(SystemError::ENOMEM);
-                        }
-                        created.push((page_index, pin.page()));
-                    }
-                }
-                Err(error) => {
-                    for (created_index, created_page) in created.into_iter().rev() {
-                        let _ = page_cache
-                            .manager()
-                            .discard_created_page(created_index, &created_page);
-                    }
-                    return Err(error);
-                }
-            }
-        }
+        page_cache.manager().preallocate_range(first, last)?;
 
         // Linux shmem commits file_modified() only after allocation succeeds.
         // Compute from the current metadata while holding the inode lock so a

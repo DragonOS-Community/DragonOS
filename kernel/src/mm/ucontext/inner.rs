@@ -12,6 +12,11 @@ pub struct InnerAddressSpace {
     pub mmap_min: VirtAddr,
     /// User stack information struct
     pub user_stack: Option<UserStack>,
+    /// Main image File and deny-write ownership, released at last mm user teardown.
+    pub(crate) exec_write_guard: Option<(
+        Arc<crate::filesystem::vfs::file::File>,
+        Arc<crate::filesystem::vfs::write_access::InodeWriteGuard>,
+    )>,
 
     pub elf_brk_start: VirtAddr,
     pub elf_brk: VirtAddr,
@@ -61,6 +66,7 @@ impl InnerAddressSpace {
             brk_start: MMArch::USER_BRK_START,
             brk: MMArch::USER_BRK_START,
             user_stack: None,
+            exec_write_guard: None,
             start_code: VirtAddr(0),
             end_code: VirtAddr(0),
             start_data: VirtAddr(0),
@@ -114,6 +120,7 @@ impl InnerAddressSpace {
         new_guard.end_code = self.end_code;
         new_guard.start_data = self.start_data;
         new_guard.end_data = self.end_data;
+        new_guard.exec_write_guard = self.exec_write_guard.clone();
 
         let mut parent_cow_remaps: Vec<(VirtAddr, EntryFlags<MMArch>)> = Vec::new();
         let mut child_present_pages = 0usize;

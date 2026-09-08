@@ -502,10 +502,14 @@ impl AddressSpace {
     #[inline]
     pub(crate) fn mmput(&self) {
         if self.user_count_dec_and_test() {
-            unsafe {
-                // Take the write lock to unmap first, then set torn_down, forming a critical-section boundary with readers.
-                self.write().unmap_all();
-            }
+            let exec_write_guard = {
+                let mut inner = self.write();
+                unsafe { inner.unmap_all() };
+                inner.exec_write_guard.take()
+            };
+            // A /proc/.../mem reference can outlive the last user. It must not
+            // keep the executable write-protected after the mappings are gone.
+            drop(exec_write_guard);
             self.mark_torn_down();
             crate::mm::oom::note_oom_victim_mm_released(self.id());
         }

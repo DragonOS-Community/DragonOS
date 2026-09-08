@@ -1,9 +1,12 @@
 use core::any::Any;
 use core::intrinsics::unlikely;
 
+use crate::filesystem::page_cache::{PageCache, PageCacheBackend};
 use crate::filesystem::vfs::syscall::RenameFlags;
 use crate::filesystem::vfs::{FileSystemMakerData, FSMAKER};
 use crate::libs::rwsem::RwSem;
+use crate::mm::fault::{PageFaultHandler, PageFaultMessage};
+use crate::mm::VmFaultReason;
 use crate::register_mountable_fs;
 use crate::{
     arch::MMArch,
@@ -168,7 +171,7 @@ fn ramfs_insert_whiteout(dir: &mut RamFSInode, name: &DName) -> Result<(), Syste
             parent: dir.self_ref.clone(),
             self_ref: Weak::default(),
             children: BTreeMap::new(),
-            data: Vec::new(),
+            page_cache: None,
             metadata: Metadata {
                 dev_id: 0,
                 inode_id: generate_inode_id(),
@@ -192,6 +195,7 @@ fn ramfs_insert_whiteout(dir: &mut RamFSInode, name: &DName) -> Result<(), Syste
             name: name.clone(),
         }),
         LinkMutationCoordinator::new(),
+        RwSem::new(()),
     ));
     whiteout.0.lock().self_ref = Arc::downgrade(&whiteout);
     dir.children.insert(name.clone(), whiteout);
@@ -200,7 +204,7 @@ fn ramfs_insert_whiteout(dir: &mut RamFSInode, name: &DName) -> Result<(), Syste
 
 /// @brief 内存文件系统的Inode结构体
 #[derive(Debug)]
-pub struct LockedRamFSInode(pub Mutex<RamFSInode>, LinkMutationCoordinator);
+pub struct LockedRamFSInode(pub Mutex<RamFSInode>, LinkMutationCoordinator, RwSem<()>);
 
 /// @brief 内存文件系统结构体
 #[derive(Debug)]
@@ -224,7 +228,7 @@ pub struct RamFSInode {
     /// 子Inode的B树
     children: BTreeMap<DName, Arc<LockedRamFSInode>>,
     /// 当前inode的数据部分
-    data: Vec<u8>,
+    page_cache: Option<Arc<PageCache>>,
     /// 当前inode的元数据
     metadata: Metadata,
     /// 指向inode所在的文件系统对象的指针
@@ -241,7 +245,7 @@ impl RamFSInode {
             parent: Weak::default(),
             self_ref: Weak::default(),
             children: BTreeMap::new(),
-            data: Vec::new(),
+            page_cache: None,
             metadata: Metadata {
                 dev_id: 0,
                 inode_id: generate_inode_id(),
@@ -267,7 +271,46 @@ impl RamFSInode {
         }
     }
 }
+// Ramfs has no backing store: the shmem mapping is the sole owner of bytes.
+#[derive(Debug)]
+struct RamFSPageCacheBackend(Weak<dyn IndexNode>);
+
+impl PageCacheBackend for RamFSPageCacheBackend {
+    fn read_page(&self, _index: usize, _buf: &mut [u8]) -> Result<usize, SystemError> {
+        Ok(0)
+    }
+
+    fn write_page(&self, _index: usize, buf: &[u8]) -> Result<usize, SystemError> {
+        Ok(buf.len())
+    }
+
+    fn npages(&self) -> usize {
+        self.0
+            .upgrade()
+            .and_then(|inode| inode.metadata().ok())
+            .map(|metadata| (metadata.size.max(0) as usize).div_ceil(MMArch::PAGE_SIZE))
+            .unwrap_or(0)
+    }
+}
+
 impl FileSystem for RamFS {
+    unsafe fn fault(&self, pfm: &mut PageFaultMessage) -> VmFaultReason {
+        PageFaultHandler::pagecache_fault_zero(pfm)
+    }
+
+    unsafe fn page_mkwrite(&self, pfm: &mut PageFaultMessage) -> VmFaultReason {
+        PageFaultHandler::filemap_page_mkwrite(pfm)
+    }
+
+    unsafe fn map_pages(
+        &self,
+        pfm: &mut PageFaultMessage,
+        start: usize,
+        end: usize,
+    ) -> VmFaultReason {
+        PageFaultHandler::filemap_map_pages(pfm, start, end)
+    }
+
     fn page_cache_writeback_domain(
         &self,
     ) -> Option<&Arc<crate::filesystem::page_cache::PageCacheWritebackDomain>> {
@@ -325,6 +368,7 @@ impl RamFS {
         let root: Arc<LockedRamFSInode> = Arc::new(LockedRamFSInode(
             Mutex::new(RamFSInode::new()),
             LinkMutationCoordinator::new(),
+            RwSem::new(()),
         ));
 
         let result: Arc<RamFS> = Arc::new(RamFS {
@@ -376,18 +420,7 @@ impl IndexNode for LockedRamFSInode {
     }
 
     fn truncate(&self, len: usize) -> Result<(), SystemError> {
-        let mut inode = self.0.lock();
-
-        //如果是文件夹，则报错
-        if inode.metadata.file_type == FileType::Dir {
-            return Err(SystemError::EINVAL);
-        }
-
-        //当前文件长度大于_len才进行截断，否则不操作
-        if inode.data.len() > len {
-            inode.data.resize(len, 0);
-        }
-        return Ok(());
+        self.resize(len)
     }
 
     fn close(&self, _data: MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
@@ -451,26 +484,15 @@ impl IndexNode for LockedRamFSInode {
         if buf.len() < len {
             return Err(SystemError::EINVAL);
         }
-        // 加锁
-        let inode: MutexGuard<RamFSInode> = self.0.lock();
-
-        // 检查当前inode是否为一个文件夹，如果是的话，就返回错误
-        if inode.metadata.file_type == FileType::Dir {
-            return Err(SystemError::EISDIR);
-        }
-
-        let start = inode.data.len().min(offset);
-        let end = inode.data.len().min(offset + len);
-
-        // buffer空间不足
-        if buf.len() < (end - start) {
-            return Err(SystemError::ENOBUFS);
-        }
-
-        // 拷贝数据
-        let src = &inode.data[start..end];
-        buf[0..src.len()].copy_from_slice(src);
-        return Ok(src.len());
+        offset.checked_add(len).ok_or(SystemError::EOVERFLOW)?;
+        let cache = {
+            let inode = self.0.lock();
+            if inode.metadata.file_type == FileType::Dir {
+                return Err(SystemError::EISDIR);
+            }
+            inode.page_cache.clone().ok_or(SystemError::EINVAL)?
+        };
+        cache.read(offset, &mut buf[..len])
     }
 
     fn write_at(
@@ -483,25 +505,25 @@ impl IndexNode for LockedRamFSInode {
         if buf.len() < len {
             return Err(SystemError::EINVAL);
         }
-
-        // 加锁
-        let mut inode: MutexGuard<RamFSInode> = self.0.lock();
-
-        // 检查当前inode是否为一个文件夹，如果是的话，就返回错误
-        if inode.metadata.file_type == FileType::Dir {
-            return Err(SystemError::EISDIR);
-        }
-
-        let data: &mut Vec<u8> = &mut inode.data;
-
-        // 如果文件大小比原来的大，那就resize这个数组
-        if offset + len > data.len() {
-            data.resize(offset + len, 0);
-        }
-
-        let target = &mut data[offset..offset + len];
-        target.copy_from_slice(&buf[0..len]);
-        return Ok(len);
+        let end = offset
+            .checked_add(len)
+            .filter(|end| *end <= isize::MAX as usize)
+            .ok_or(SystemError::EFBIG)?;
+        let _size_guard = self.2.read();
+        let cache = {
+            let inode = self.0.lock();
+            if inode.metadata.file_type == FileType::Dir {
+                return Err(SystemError::EISDIR);
+            }
+            inode.page_cache.clone().ok_or(SystemError::EINVAL)?
+        };
+        // PageCache prepares every page before publishing EOF. No inode lock
+        // spans page allocation or user-buffer access.
+        cache.write_with_before_dirty(offset, &buf[..len], |_| {
+            let mut inode = self.0.lock();
+            inode.metadata.size = inode.metadata.size.max(end as i64);
+            Ok(())
+        })
     }
 
     fn fs(&self) -> Arc<dyn FileSystem> {
@@ -513,11 +535,11 @@ impl IndexNode for LockedRamFSInode {
     }
 
     fn metadata(&self) -> Result<Metadata, SystemError> {
-        let inode = self.0.lock();
-        let mut metadata = inode.metadata.clone();
-        metadata.size = inode.data.len() as i64;
+        Ok(self.0.lock().metadata.clone())
+    }
 
-        return Ok(metadata);
+    fn page_cache(&self) -> Option<Arc<PageCache>> {
+        self.0.lock().page_cache.clone()
     }
 
     fn set_metadata(&self, metadata: &Metadata) -> Result<(), SystemError> {
@@ -550,46 +572,60 @@ impl IndexNode for LockedRamFSInode {
     }
 
     fn resize(&self, len: usize) -> Result<(), SystemError> {
-        let mut inode = self.0.lock();
-        if inode.metadata.file_type == FileType::File {
-            inode.data.resize(len, 0);
-            return Ok(());
-        } else {
-            return Err(SystemError::EINVAL);
+        if len > isize::MAX as usize {
+            return Err(SystemError::EFBIG);
         }
+        let _size_guard = self.2.write();
+        let cache = {
+            let mut inode = self.0.lock();
+            if inode.metadata.file_type != FileType::File {
+                return Err(SystemError::EINVAL);
+            }
+            let cache = inode.page_cache.clone().ok_or(SystemError::EIO)?;
+            inode.metadata.size = len as i64;
+            cache
+        };
+        // Publish EOF before unmapping and invalidating pages. Never hold the
+        // inode mutex while acquiring MM locks through truncate.
+        // Linux truncate_setsize() also truncates the page cache when size is
+        // unchanged or grows, clearing mmap writes past the new partial EOF.
+        cache.manager().resize(len)
     }
 
     fn fallocate_resize_atomic(
         &self,
+        offset: usize,
         requested_end: usize,
         _lock_owner: u64,
     ) -> Result<SetMetadataMask, SystemError> {
+        if requested_end > isize::MAX as usize {
+            return Err(SystemError::EFBIG);
+        }
+        let _size_guard = self.2.write();
+        let cache = {
+            let inode = self.0.lock();
+            if inode.metadata.file_type != FileType::File {
+                return Err(SystemError::EINVAL);
+            }
+            if requested_end > inode.metadata.size as usize {
+                super::vfs::vcore::check_file_size_limit(requested_end)?;
+            }
+            inode.page_cache.clone().ok_or(SystemError::EIO)?
+        };
+        // Allocate only pages intersecting the request. Sparse holes before
+        // offset must remain holes even when EOF already exceeds requested_end.
+        cache.manager().preallocate_range(
+            offset >> MMArch::PAGE_SHIFT,
+            (requested_end - 1) >> MMArch::PAGE_SHIFT,
+        )?;
         let mut inode = self.0.lock();
-        if inode.metadata.file_type != FileType::File {
-            return Err(SystemError::EINVAL);
-        }
-        // RamFS stores file contents in `data`; metadata.size is only a cached
-        // field and may lag behind write_at()/resize().  Use the authoritative
-        // length while holding the inode lock so mode-0 fallocate can never
-        // shrink data written through another path.
-        let current_size = inode.data.len();
-        if requested_end > current_size {
-            super::vfs::vcore::check_file_size_limit(requested_end)?;
-            inode
-                .data
-                .try_reserve(requested_end - current_size)
-                .map_err(|_| SystemError::ENOMEM)?;
-        }
-        let effective_size = current_size.max(requested_end);
+        let effective_size = (inode.metadata.size as usize).max(requested_end);
         let (metadata, mask) = super::vfs::vcore::prepare_write_side_effect_metadata(
             inode.metadata.clone(),
             effective_size,
         );
         crate::filesystem::vfs::merge_metadata_masked(&mut inode.metadata, &metadata, mask);
-        if requested_end > current_size {
-            inode.data.resize(requested_end, 0);
-            inode.metadata.size = requested_end as i64;
-        }
+        inode.metadata.size = effective_size as i64;
         Ok(mask)
     }
 
@@ -633,7 +669,7 @@ impl IndexNode for LockedRamFSInode {
                 parent: inode.self_ref.clone(),
                 self_ref: Weak::default(),
                 children: BTreeMap::new(),
-                data: Vec::new(),
+                page_cache: None,
                 metadata: Metadata {
                     dev_id: 0,
                     inode_id: generate_inode_id(),
@@ -658,10 +694,19 @@ impl IndexNode for LockedRamFSInode {
                 name: name.clone(),
             }),
             LinkMutationCoordinator::new(),
+            RwSem::new(()),
         ));
 
         // 初始化inode的自引用的weak指针
         result.0.lock().self_ref = Arc::downgrade(&result);
+        if matches!(file_type, FileType::File | FileType::SymLink) {
+            let inode_weak = Arc::downgrade(&result) as Weak<dyn IndexNode>;
+            let backend = Arc::new(RamFSPageCacheBackend(inode_weak.clone()));
+            let cache = PageCache::new_shmem(Some(inode_weak), Some(backend));
+            // Ramfs has neither disk backing nor swap: data must stay resident.
+            cache.set_unevictable(true);
+            result.0.lock().page_cache = Some(cache);
+        }
 
         // 将子inode插入父inode的B树中
         inode.children.insert(name, result.clone());
@@ -997,7 +1042,7 @@ impl IndexNode for LockedRamFSInode {
                 parent: inode.self_ref.clone(),
                 self_ref: Weak::default(),
                 children: BTreeMap::new(),
-                data: Vec::new(),
+                page_cache: None,
                 metadata: Metadata {
                     dev_id: 0,
                     inode_id: generate_inode_id(),
@@ -1021,6 +1066,7 @@ impl IndexNode for LockedRamFSInode {
                 name: filename.clone(),
             }),
             LinkMutationCoordinator::new(),
+            RwSem::new(()),
         ));
 
         nod.0.lock().self_ref = Arc::downgrade(&nod);

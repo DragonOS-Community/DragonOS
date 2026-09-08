@@ -9,7 +9,6 @@ use core::{
 };
 
 use alloc::{ffi::CString, vec::Vec};
-use defer::defer;
 
 #[cfg(target_arch = "riscv64")]
 use crate::mm::{
@@ -232,19 +231,6 @@ pub unsafe fn clear_user_cow_protected(dest: VirtAddr, len: usize) -> Result<usi
     } else {
         Err(SystemError::EFAULT)
     }
-}
-
-pub unsafe fn copy_to_user(dest: VirtAddr, src: &[u8]) -> Result<usize, SystemError> {
-    access_ok(dest, src.len()).map_err(|_| SystemError::EFAULT)?;
-    MMArch::disable_kernel_wp();
-    defer!({
-        MMArch::enable_kernel_wp();
-    });
-
-    let p = dest.data() as *mut u8;
-    // 拷贝数据
-    p.copy_from_nonoverlapping(src.as_ptr(), src.len());
-    return Ok(src.len());
 }
 
 /// Check and copy a C string from user space.
@@ -1205,7 +1191,13 @@ pub fn user_accessible_len(addr: VirtAddr, size: usize, check_write: bool) -> us
                 Err(_) => return None,
             };
 
-            let backed = file_size.saturating_sub(file_offset_bytes);
+            // File faults admit the entire final partial page. In particular,
+            // ELF padzero and syscall buffers may access bytes past i_size in
+            // that page; only the next whole page must be rejected.
+            let mapped_file_end = file_size
+                .div_ceil(MMArch::PAGE_SIZE)
+                .saturating_mul(MMArch::PAGE_SIZE);
+            let backed = mapped_file_end.saturating_sub(file_offset_bytes);
             Some(core::cmp::min(backed, vma_size))
         });
 

@@ -164,7 +164,7 @@ fn do_execve_internal(
         CString::new(start.filename()).map_err(|_| SystemError::EINVAL)?,
         CString::new(start.execfn()).map_err(|_| SystemError::EINVAL)?,
         start.interp_flags(),
-    );
+    )?;
 
     // 预先设置args，以便shebang处理时可以访问原始参数
     param.init_info_mut().args = argv.clone();
@@ -318,6 +318,8 @@ fn do_execve_internal(
                 do_execve_switch_user_vm(old_vm);
             }
             drop(exec_guard);
+            // Release the script's temporary deny before loading its interpreter.
+            drop(param);
             // 增加递归深度并递归调用
             let new_ctx = ctx.increment_depth();
 

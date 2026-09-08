@@ -787,6 +787,7 @@ where
     let md = inode.metadata()?;
 
     validate_truncate(&inode, &md, len)?;
+    let _write_access = super::write_access::InodeWriteGuard::writer(inode.clone())?;
     let (md, mask) = prepare_write_side_effect_metadata(md, len);
     let r = do_resize(&inode, &md, mask);
     if r.is_ok() {
@@ -864,6 +865,7 @@ pub(crate) fn vfs_open_truncate(
 ) -> Result<(), SystemError> {
     let inode = file.inode();
     validate_truncate(&inode, &context.requested, 0)?;
+    let _write_access = super::write_access::InodeWriteGuard::writer(inode.clone())?;
     inode.resize_open_truncate(
         0,
         current_file_lock_owner_id(),
@@ -961,6 +963,10 @@ pub fn resize_based_fallocate(
         return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
     }
 
+    if len == 0 {
+        return Err(SystemError::EINVAL);
+    }
+
     let new_size = offset.checked_add(len).ok_or(SystemError::EFBIG)?;
     if new_size > isize::MAX as usize {
         return Err(SystemError::EFBIG);
@@ -974,7 +980,7 @@ pub fn resize_based_fallocate(
     // The filesystem re-reads size and metadata inside its native mutation
     // lock. A VFS snapshot cannot safely decide whether a concurrent grow has
     // already satisfied the request or which privilege bits remain to clear.
-    let mask = inode.fallocate_resize_atomic(new_size, lock_owner)?;
+    let mask = inode.fallocate_resize_atomic(offset, new_size, lock_owner)?;
     if mask.contains(SetMetadataMask::MODE) {
         attrib.commit();
     }

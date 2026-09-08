@@ -43,6 +43,9 @@ std::string ReadAll(const char* path) {
 TEST(PageCacheAccounting, MembershipLifecycleIsBalanced) {
     const std::string report = ReadAll(kSelftestPath);
     ASSERT_FALSE(report.empty());
+    EXPECT_NE(std::string::npos, report.find("ramfs_fallocate_range=ok\n")) << report;
+    EXPECT_NE(std::string::npos, report.find("write_prepare_rollback=ok\n")) << report;
+    EXPECT_NE(std::string::npos, report.find("preallocate_rollback=ok\n")) << report;
     EXPECT_NE(std::string::npos, report.find("status=ok\n")) << report;
     EXPECT_NE(std::string::npos, report.find("file_membership=ok\n")) << report;
     EXPECT_NE(std::string::npos, report.find("shmem_membership=ok\n")) << report;

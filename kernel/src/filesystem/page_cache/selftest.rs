@@ -1666,6 +1666,224 @@ fn run_single_page_token_certificate_selftest() -> Result<bool, SystemError> {
         && state.certificate_errors.load(Ordering::Acquire) == 0)
 }
 
+/// Fail only this isolated cache's admission, without exhausting guest RAM.
+#[derive(Debug)]
+struct PreallocateFailureBackend {
+    live: AtomicUsize,
+    limit: AtomicUsize,
+}
+
+impl PageCacheBackend for PreallocateFailureBackend {
+    fn read_page(&self, _index: usize, _buf: &mut [u8]) -> Result<usize, SystemError> {
+        Ok(0)
+    }
+
+    fn write_page(&self, _index: usize, buf: &[u8]) -> Result<usize, SystemError> {
+        Ok(buf.len())
+    }
+
+    fn npages(&self) -> usize {
+        0
+    }
+
+    fn reserve_page(&self) -> Result<(), SystemError> {
+        self.live
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |live| {
+                (live < self.limit.load(Ordering::Relaxed)).then_some(live + 1)
+            })
+            .map(|_| ())
+            .map_err(|_| SystemError::ENOMEM)
+    }
+
+    fn release_page(&self) {
+        self.live.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+fn run_ramfs_fallocate_range_selftest() -> Result<bool, SystemError> {
+    use crate::filesystem::vfs::{AttribStageObserver, FileType, InodeMode};
+
+    let fs = crate::filesystem::ramfs::RamFS::new();
+    let inode = fs.root_inode().create(
+        "fallocate-range",
+        FileType::File,
+        InodeMode::from_bits_truncate(0o600),
+    )?;
+    let page_size = MMArch::PAGE_SIZE;
+    let data = Mutex::new(FilePrivateData::Unused);
+    // Keep the reproducer bounded: sparse growth itself allocates no pages.
+    inode.resize(16 * page_size)?;
+    let cache = inode.page_cache().ok_or(SystemError::EIO)?;
+    if cache.manager().pages_count()? != 0 {
+        return Ok(false);
+    }
+    let marker_offset = 13 * page_size + 17;
+    inode.write_at(marker_offset, 1, &[0x5a], data.lock())?;
+    // An unaligned request covers only pages 12 and 13, including an existing
+    // dirty page. Repeating it must neither fill preceding holes nor erase data.
+    for _ in 0..2 {
+        let mut publish = || {};
+        inode.fallocate_file(
+            0,
+            12 * page_size + 7,
+            page_size,
+            0,
+            &mut AttribStageObserver::new(&mut publish),
+            data.lock(),
+        )?;
+        if cache.manager().pages_count()? != 2
+            || cache.manager().peek_page(12).is_none()
+            || cache.manager().peek_page(13).is_none()
+            || inode.metadata()?.size != (16 * page_size) as i64
+        {
+            return Ok(false);
+        }
+        let mut marker = [0];
+        inode.read_at(marker_offset, 1, &mut marker, data.lock())?;
+        if marker != [0x5a] {
+            return Ok(false);
+        }
+    }
+    // A page-aligned extension allocates exactly its requested page and grows
+    // EOF without materializing the intervening sparse hole or the next page.
+    let mut publish = || {};
+    inode.fallocate_file(
+        0,
+        17 * page_size,
+        page_size,
+        0,
+        &mut AttribStageObserver::new(&mut publish),
+        data.lock(),
+    )?;
+    Ok(cache.manager().pages_count()? == 3
+        && cache.manager().peek_page(17).is_some()
+        && inode.metadata()?.size == (18 * page_size) as i64)
+}
+
+fn run_preallocate_rollback_selftest() -> Result<bool, SystemError> {
+    let backend = Arc::new(PreallocateFailureBackend {
+        live: AtomicUsize::new(0),
+        limit: AtomicUsize::new(3),
+    });
+    let cache = PageCache::new_shmem(None, Some(backend.clone()));
+    cache.set_unevictable(true);
+    let existing = cache.manager().commit_overwrite(0)?;
+    {
+        let mut page = existing.write();
+        unsafe { page.as_slice_mut()[17] = 0x5a };
+        page.add_flags(PageFlags::PG_DIRTY);
+    }
+    // A pre-existing page must survive even when several new pages precede
+    // ENOMEM. Repeating the call must not accumulate unreachable pages.
+    for _ in 0..2 {
+        if cache.manager().preallocate_range(0, 4) != Err(SystemError::ENOMEM)
+            || cache.manager().pages_count()? != 1
+            || backend.live.load(Ordering::Relaxed) != 1
+            || unsafe { existing.read().as_slice()[17] != 0x5a }
+            || !cache
+                .manager()
+                .peek_page(0)
+                .is_some_and(|p| Arc::ptr_eq(&p, &existing))
+        {
+            return Ok(false);
+        }
+    }
+    // Rollback must not discard a page another user still pins or dirtied.
+    let (pin, created) = cache.manager().commit_overwrite_pinned_with_status(1)?;
+    let page = pin.page();
+    if !created || cache.manager().discard_created_page(1, &page)? {
+        return Ok(false);
+    }
+    drop(pin);
+    if !cache.manager().discard_created_page(1, &page)?
+        || cache.manager().discard_created_page(0, &existing)?
+    {
+        return Ok(false);
+    }
+    drop(page);
+    backend.limit.store(5, Ordering::Relaxed);
+    cache.manager().preallocate_range(0, 4)?;
+    let success = cache.manager().pages_count()? == 5 && backend.live.load(Ordering::Relaxed) == 5;
+    drop(existing);
+    drop(cache);
+    Ok(success && backend.live.load(Ordering::Relaxed) == 0)
+}
+
+fn run_write_prepare_rollback_selftest() -> Result<bool, SystemError> {
+    // Retention admission fails after preparation for an unattached file
+    // cache. All write entry points must keep rollback ownership until then.
+    let file_cache = PageCache::new_unowned(None, None);
+    let full_page = vec![0x33; MMArch::PAGE_SIZE];
+    if file_cache.write(0, &full_page) != Err(SystemError::EIO)
+        || file_cache.manager().pages_count()? != 0
+        || file_cache.write_single_full_page_with_transition(0, &full_page, |_| {})
+            != Err(SystemError::EIO)
+        || file_cache.manager().pages_count()? != 0
+        || file_cache.write_single_page_segment_with_transition(
+            0,
+            &full_page,
+            PageCacheExpectedDirtyTransition::Start,
+            |_| {},
+        ) != Err(SystemError::EIO)
+        || file_cache.manager().pages_count()? != 0
+    {
+        return Ok(false);
+    }
+    let backend = Arc::new(PreallocateFailureBackend {
+        live: AtomicUsize::new(0),
+        limit: AtomicUsize::new(3),
+    });
+    let cache = PageCache::new_shmem(None, Some(backend.clone()));
+    cache.set_unevictable(true);
+    let existing = cache.manager().commit_overwrite(0)?;
+    {
+        let mut page = existing.write();
+        unsafe { page.as_slice_mut()[17] = 0x5a };
+        page.add_flags(PageFlags::PG_DIRTY);
+    }
+    let data = vec![0x7b; 5 * MMArch::PAGE_SIZE];
+    let metadata_called = core::cell::Cell::new(false);
+    for offset in [0, 8 * MMArch::PAGE_SIZE] {
+        let result = cache.write_with_before_dirty(offset, &data, |_| {
+            metadata_called.set(true);
+            Ok(())
+        });
+        if result != Err(SystemError::ENOMEM)
+            || metadata_called.get()
+            || cache.manager().pages_count()? != 1
+            || backend.live.load(Ordering::Relaxed) != 1
+            || unsafe { existing.read().as_slice()[17] != 0x5a }
+        {
+            return Ok(false);
+        }
+    }
+    if cache.write(0, &data) != Err(SystemError::ENOMEM)
+        || cache.manager().pages_count()? != 1
+        || backend.live.load(Ordering::Relaxed) != 1
+    {
+        return Ok(false);
+    }
+    // A filesystem can reject its metadata commit after all pages are ready.
+    backend.limit.store(5, Ordering::Relaxed);
+    if cache.write_with_before_dirty(0, &data, |_| Err(SystemError::ENOSPC))
+        != Err(SystemError::ENOSPC)
+        || cache.manager().pages_count()? != 1
+        || backend.live.load(Ordering::Relaxed) != 1
+        || unsafe { existing.read().as_slice()[17] != 0x5a }
+    {
+        return Ok(false);
+    }
+    if cache.write_with_before_dirty(0, &data, |_| Ok(()))? != data.len()
+        || cache.manager().pages_count()? != 5
+        || unsafe { existing.read().as_slice()[17] != 0x7b }
+    {
+        return Ok(false);
+    }
+    drop(existing);
+    drop(cache);
+    Ok(backend.live.load(Ordering::Relaxed) == 0)
+}
+
 pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, SystemError> {
     if PAGECACHE_ACCOUNTING_SELFTEST_RUNNING
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -1674,6 +1892,18 @@ pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, S
         return Err(SystemError::EBUSY);
     }
     let _running = PageCacheAccountingSelftestGuard;
+
+    if !run_write_prepare_rollback_selftest()? {
+        return Ok("status=fail stage=write_prepare_rollback\n".into());
+    }
+
+    if !run_ramfs_fallocate_range_selftest()? {
+        return Ok("status=fail stage=ramfs_fallocate_range\n".into());
+    }
+
+    if !run_preallocate_rollback_selftest()? {
+        return Ok("status=fail stage=preallocate_rollback\n".into());
+    }
 
     if !run_writeback_domain_lifecycle_selftest() {
         return Ok("status=fail stage=writeback_domain_lifecycle\n".into());
@@ -3534,6 +3764,6 @@ pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, S
     }
 
     Ok(alloc::format!(
-        "status=ok\nwriteback_domain_lifecycle=ok\npreallocated_batch_lifecycle=ok\nfile_membership=ok\nshmem_membership=ok\ndirty_membership=ok\ndirty_incarnation=ok\nremote_dirty_publish=ok\nwriteback_membership=ok\nwriteback_admission_order=ok\nwriteback_submission_token=ok\nwriteback_defer_progress=ok\nwriteback_budget_retry=ok\nfault_invalidate_retry_order=ok\ntag_scan_chunk_release=ok\nunevictable_membership=ok\ninflight_teardown=ok\nlate_completion=ok\nglobal_wiring=ok\nlayout=ok\nfile_drop_drift={file_drop_drift}\nshmem_drop_drift={shmem_drop_drift}\ndirty_drop_drift={dirty_drop_drift}\nwriteback_drop_drift={writeback_drop_drift}\nunevictable_drop_drift={unevictable_drop_drift}\nentry_size={entry_size}\nbaseline_size={baseline_size}\n"
+        "status=ok\nramfs_fallocate_range=ok\nwrite_prepare_rollback=ok\npreallocate_rollback=ok\nwriteback_domain_lifecycle=ok\npreallocated_batch_lifecycle=ok\nfile_membership=ok\nshmem_membership=ok\ndirty_membership=ok\ndirty_incarnation=ok\nremote_dirty_publish=ok\nwriteback_membership=ok\nwriteback_admission_order=ok\nwriteback_submission_token=ok\nwriteback_defer_progress=ok\nwriteback_budget_retry=ok\nfault_invalidate_retry_order=ok\ntag_scan_chunk_release=ok\nunevictable_membership=ok\ninflight_teardown=ok\nlate_completion=ok\nglobal_wiring=ok\nlayout=ok\nfile_drop_drift={file_drop_drift}\nshmem_drop_drift={shmem_drop_drift}\ndirty_drop_drift={dirty_drop_drift}\nwriteback_drop_drift={writeback_drop_drift}\nunevictable_drop_drift={unevictable_drop_drift}\nentry_size={entry_size}\nbaseline_size={baseline_size}\n"
     ))
 }

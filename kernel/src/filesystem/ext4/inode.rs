@@ -2412,6 +2412,7 @@ impl IndexNode for LockedExt4Inode {
 
     fn fallocate_resize_atomic(
         &self,
+        _offset: usize,
         requested_end: usize,
         _lock_owner: u64,
     ) -> Result<SetMetadataMask, SystemError> {

@@ -204,6 +204,8 @@ bitflags! {
 #[derive(Debug)]
 pub struct ExecParam {
     file: Arc<File>,
+    // Loading protection is separate from File/VMA lifetime (notably PT_INTERP).
+    exec_write_guard: Arc<crate::filesystem::vfs::write_access::InodeWriteGuard>,
     vm: Arc<AddressSpace>,
     /// Flags.
     flags: ExecParamFlags,
@@ -241,11 +243,14 @@ impl ExecParam {
         filename: CString,
         execfn: CString,
         interp_flags: ExecInterpFlags,
-    ) -> Self {
+    ) -> Result<Self, SystemError> {
+        let exec_write_guard =
+            crate::filesystem::vfs::write_access::InodeWriteGuard::deny_write(file.inode())?;
         let mut init_info = ProcInitInfo::new(execfn.to_string_lossy().as_ref());
         init_info.execfn = Some(execfn.clone());
-        Self {
+        Ok(Self {
             file,
+            exec_write_guard,
             vm,
             flags,
             filename,
@@ -253,7 +258,7 @@ impl ExecParam {
             interp_flags,
             init_info,
             point_of_no_return: false,
-        }
+        })
     }
 
     pub fn vm(&self) -> &Arc<AddressSpace> {
@@ -387,6 +392,9 @@ impl ExecParam {
         me.flags().remove(ProcessFlags::FORKNOEXEC);
 
         exec_task_namespaces().map_err(ExecError::SystemError)?;
+        // The main image stays protected for the mm's user lifetime, including
+        // fork. Interpreter ExecParams never call begin_new_exec().
+        self.vm.write().exec_write_guard = Some((self.file.clone(), self.exec_write_guard.clone()));
         Ok(())
     }
 

@@ -9,6 +9,7 @@ use core::{
 };
 use lazy_static::lazy_static;
 use log;
+use system_error::SystemError;
 
 use crate::{
     libs::{spinlock::SpinLock, wait_queue::WaitQueue},
@@ -65,6 +66,12 @@ pub struct WorkQueue {
     worker: SpinLock<Option<Arc<ProcessControlBlock>>>,
 }
 
+impl fmt::Debug for WorkQueue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WorkQueue").finish_non_exhaustive()
+    }
+}
+
 impl WorkQueue {
     /// Create a new workqueue with the given name.
     /// This will spawn a kernel thread with the given name.
@@ -86,6 +93,28 @@ impl WorkQueue {
         *wq.worker.lock() = Some(worker_pcb);
 
         wq
+    }
+
+    /// Create a serial queue whose worker exits when its last owner is dropped.
+    ///
+    /// Callers must retain the queue until their work finishes; a work item may
+    /// retain its owner for this purpose. Unlike `new`, the sleeping worker
+    /// does not keep the queue or its owner alive indefinitely.
+    pub fn try_new_owned(name: &str) -> Result<Arc<Self>, SystemError> {
+        let wq = Arc::new(Self {
+            queue: SpinLock::new(WorkList::default()),
+            wait_queue: Arc::new(WaitQueue::default()),
+            worker: SpinLock::new(None),
+        });
+        let queue = Arc::downgrade(&wq);
+        let wait_queue = wq.wait_queue.clone();
+        let closure = Box::new(move || owned_worker_loop(queue.clone(), wait_queue.clone()));
+        KernelThreadMechanism::create_and_run(
+            KernelThreadClosure::EmptyClosure((closure, ())),
+            name.to_string(),
+        )
+        .ok_or(SystemError::ENOMEM)?;
+        Ok(wq)
     }
 
     /// Enqueue a work item to the workqueue.
@@ -123,6 +152,29 @@ impl WorkQueue {
 
     fn is_empty(&self) -> bool {
         self.queue.lock().head.is_none()
+    }
+}
+
+impl Drop for WorkQueue {
+    fn drop(&mut self) {
+        // An owned worker waits without holding a strong queue reference.
+        self.wait_queue.wakeup(None);
+    }
+}
+
+fn owned_worker_loop(queue: Weak<WorkQueue>, wait_queue: Arc<WaitQueue>) -> i32 {
+    loop {
+        // Acquire the work in the predicate, then drop the temporary queue
+        // owner before sleeping or running it. Register-before-check in
+        // wait_until covers both enqueue and last-owner destruction wakeups.
+        let work = wait_queue.wait_until(|| match queue.upgrade() {
+            Some(queue) => queue.pop().map(Some),
+            None => Some(None),
+        });
+        match work {
+            Some(work) => work.run(),
+            None => return 0,
+        }
     }
 }
 

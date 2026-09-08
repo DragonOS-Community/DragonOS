@@ -15,10 +15,6 @@ use core::intrinsics::unlikely;
 use core::num::NonZeroUsize;
 use core::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
-lazy_static::lazy_static! {
-    static ref FAT_EVICTION_WQ: Arc<WorkQueue> = WorkQueue::new("fat_evict");
-}
-
 #[derive(Debug, Default)]
 struct FATReclaimQueue {
     next: u64,
@@ -130,6 +126,8 @@ impl Eq for Cluster {}
 pub struct FATFileSystem {
     writeback_domain: Arc<PageCacheWritebackDomain>,
     reclaim_queue: SpinLock<FATReclaimQueue>,
+    /// Serial within this filesystem, independent of other devices.
+    reclaim_worker: Arc<WorkQueue>,
     reclaim_wait: WaitQueue,
     /// 当前文件系统所在的分区
     pub gendisk: Arc<GenDisk>,
@@ -646,7 +644,7 @@ impl LockedFATInode {
         };
         queue.next = epoch;
         let worker_fs = fs.clone();
-        FAT_EVICTION_WQ.enqueue(Work::new(move || {
+        fs.reclaim_worker.enqueue(Work::new(move || {
             let result = inode.reclaim_detached(&worker_fs);
             let mut queue = worker_fs.reclaim_queue.lock();
             if let Err(error) = result {
@@ -990,6 +988,7 @@ impl FATFileSystem {
         let result: Arc<FATFileSystem> = Arc::new(FATFileSystem {
             writeback_domain: PageCacheWritebackDomain::new(),
             reclaim_queue: SpinLock::new(FATReclaimQueue::default()),
+            reclaim_worker: WorkQueue::try_new_owned("fat_evict")?,
             reclaim_wait: WaitQueue::default(),
             gendisk,
             _device_mount_holder: device_mount_holder,
@@ -1012,7 +1011,6 @@ impl FATFileSystem {
         root_guard.fs = Arc::downgrade(&result);
         *result.root_inode.3.owner.lock() =
             (Arc::downgrade(&result.root_inode), Arc::downgrade(&result));
-        lazy_static::initialize(&FAT_EVICTION_WQ);
         // 释放锁
         drop(root_guard);
 

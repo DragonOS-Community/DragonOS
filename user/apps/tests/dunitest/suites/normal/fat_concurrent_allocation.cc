@@ -195,6 +195,76 @@ TEST(FatConcurrentAllocation, FallocateAcrossExactClusterBoundaries) {
   ASSERT_EQ(0, unlink(path.c_str())) << strerror(errno);
 }
 
+TEST(FatConcurrentAllocation, FragmentedColdReadsSurviveTruncateRegrowthAndRename) {
+  struct statfs fs_type {};
+  ASSERT_EQ(0, statfs("/", &fs_type)) << strerror(errno);
+  if (fs_type.f_type != kMsdosSuperMagic) {
+    GTEST_SKIP() << "root filesystem is not FAT";
+  }
+  constexpr size_t kChunk = 64 * 1024;
+  constexpr size_t kSize = 2 * 1024 * 1024;
+  struct statvfs space {};
+  ASSERT_EQ(0, statvfs("/", &space));
+  if (space.f_bavail * space.f_frsize < 3 * kSize) {
+    GTEST_SKIP() << "insufficient free FAT space";
+  }
+  TestFiles files;
+  for (size_t i = 0; i < 2; ++i) {
+    files.fds[i] = open(TestPath(i).c_str(), O_CREAT | O_EXCL | O_RDWR, 0600);
+    ASSERT_GE(files.fds[i], 0) << strerror(errno);
+  }
+  std::vector<uint8_t> chunk(kChunk);
+  // Alternate actual allocation between two files, rather than assuming that
+  // writing a single file produces a fragmented chain. Sync each growth step.
+  for (size_t offset = 0; offset < kSize; offset += kChunk) {
+    for (size_t i = 0; i < chunk.size(); ++i) {
+      chunk[i] = static_cast<uint8_t>(((offset + i) / kBlockSize) % 251 + 1);
+    }
+    ASSERT_TRUE(WriteAll(files.fds[0], chunk.data(), chunk.size()));
+    ASSERT_EQ(0, fsync(files.fds[0])) << strerror(errno);
+    std::fill(chunk.begin(), chunk.end(), 0xde);
+    ASSERT_TRUE(WriteAll(files.fds[1], chunk.data(), chunk.size()));
+    ASSERT_EQ(0, fsync(files.fds[1])) << strerror(errno);
+  }
+  auto check_cold = [&](int fd, bool reverse, size_t preserved) {
+    ASSERT_EQ(0, fsync(fd)) << strerror(errno);
+    ASSERT_EQ(0, posix_fadvise(fd, 0, 0, POSIX_FADV_RANDOM));
+    ASSERT_EQ(0, posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED));
+    std::array<uint8_t, kBlockSize> block;
+    for (size_t n = 0; n < kSize / kBlockSize; ++n) {
+      size_t index = reverse ? kSize / kBlockSize - 1 - n : n;
+      const size_t offset = index * kBlockSize;
+      ASSERT_TRUE(ReadAllAt(fd, block.data(), block.size(), offset))
+          << "offset=" << offset << ": " << strerror(errno);
+      for (size_t i = 0; i < block.size(); ++i) {
+        uint8_t expected = offset + i < preserved
+                               ? static_cast<uint8_t>(index % 251 + 1) : 0;
+        ASSERT_EQ(expected, block[i]) << "offset=" << offset + i;
+      }
+    }
+  };
+  ASSERT_NO_FATAL_FAILURE(check_cold(files.fds[0], false, kSize));
+  ASSERT_NO_FATAL_FAILURE(check_cold(files.fds[0], true, kSize));
+  // Leave the physical lookup cursor at the old tail before freeing it.
+  ASSERT_EQ(0, posix_fadvise(files.fds[0], 0, 0, POSIX_FADV_DONTNEED));
+  std::array<uint8_t, kBlockSize> tail;
+  ASSERT_TRUE(ReadAllAt(files.fds[0], tail.data(), tail.size(), kSize - kBlockSize));
+  constexpr size_t kRetained = 3 * kChunk + 123;
+  ASSERT_EQ(0, ftruncate(files.fds[0], kRetained));
+  ASSERT_EQ(0, fsync(files.fds[0]));
+  // Reuse released space in another chain before growing the original again.
+  std::fill(chunk.begin(), chunk.end(), 0xa7);
+  ASSERT_TRUE(WriteAll(files.fds[1], chunk.data(), chunk.size()));
+  ASSERT_EQ(0, fsync(files.fds[1]));
+  ASSERT_EQ(0, ftruncate(files.fds[0], kSize)) << strerror(errno) << " errno=" << errno;
+  ASSERT_NO_FATAL_FAILURE(check_cold(files.fds[0], false, kRetained));
+  ASSERT_NO_FATAL_FAILURE(check_cold(files.fds[0], true, kRetained));
+  ASSERT_EQ(0, rename(TestPath(0).c_str(), TestPath(2).c_str())) << strerror(errno);
+  files.fds[2] = open(TestPath(2).c_str(), O_RDONLY);
+  ASSERT_GE(files.fds[2], 0) << strerror(errno);
+  ASSERT_NO_FATAL_FAILURE(check_cold(files.fds[2], false, kRetained));
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {

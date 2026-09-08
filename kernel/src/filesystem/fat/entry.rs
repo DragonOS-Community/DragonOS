@@ -62,6 +62,9 @@ pub struct FATFile {
     /// on-disk chain has not been measured since this entry was loaded or
     /// truncated. The inode mutex serializes every update to this file.
     chain_extent: Option<(u64, Cluster)>,
+    /// Last logical/physical read position, protected by the inode mutex.
+    /// Forward cold-page reads resume here instead of rescanning the FAT chain.
+    read_cursor: Option<(u64, Cluster)>,
 }
 
 impl FATFile {
@@ -85,7 +88,7 @@ impl FATFile {
     /// @return Ok(usize) 成功读取到的字节数
     /// @return Err(SystemError) 读取时出现错误，返回错误码
     pub fn read(
-        &self,
+        &mut self,
         fs: &Arc<FATFileSystem>,
         buf: &mut [u8],
         offset: u64,
@@ -94,16 +97,21 @@ impl FATFile {
             return Ok(0);
         }
 
-        // 文件内的簇偏移量
         let start_cluster_number: u64 = offset / fs.bytes_per_cluster();
-        // 计算对应在分区内的簇号
-        let mut current_cluster = if let Some(c) =
-            fs.get_cluster_by_relative(self.first_cluster, start_cluster_number as usize)
-        {
+        let (cursor_index, cursor_cluster) = self
+            .read_cursor
+            .filter(|(index, _)| *index <= start_cluster_number)
+            .unwrap_or((0, self.first_cluster));
+        let mut current_cluster = if let Some(c) = fs.get_cluster_by_relative(
+            cursor_cluster,
+            (start_cluster_number - cursor_index) as usize,
+        ) {
             c
         } else {
             return Ok(0);
         };
+        let mut current_index = start_cluster_number;
+        self.read_cursor = Some((current_index, current_cluster));
 
         let bytes_remain: u64 = self.size() - offset;
 
@@ -119,6 +127,8 @@ impl FATFile {
             if in_cluster_offset >= fs.bytes_per_cluster() {
                 if let Ok(FATEntry::Next(c)) = fs.get_fat_entry(current_cluster) {
                     current_cluster = c;
+                    current_index += 1;
+                    self.read_cursor = Some((current_index, current_cluster));
                     in_cluster_offset %= fs.bytes_per_cluster();
                 } else {
                     break;
@@ -343,6 +353,7 @@ impl FATFile {
                     }
                     Err(AttachReservedError::Ambiguous(error)) => {
                         self.chain_extent = None;
+                        self.read_cursor = None;
                         return Err(error);
                     }
                 }
@@ -352,6 +363,7 @@ impl FATFile {
         let resulting_first = if old_chain_exists {
             self.first_cluster
         } else {
+            self.read_cursor = None;
             reserved_first.ok_or(SystemError::EIO)?
         };
         if let Some(tail) = reserved_last {
@@ -425,23 +437,18 @@ impl FATFile {
             return Ok(());
         }
 
+        // A failed deallocation may already have freed part of the chain.
+        // Never retain a position into it across either success or failure.
+        self.read_cursor = None;
+        self.chain_extent = None;
         let new_last_cluster = new_size.div_ceil(fs.bytes_per_cluster());
-        if let Some(begin_delete) =
-            fs.get_cluster_by_relative(self.first_cluster, new_last_cluster as usize)
-        {
-            fs.deallocate_cluster_chain(begin_delete)?;
-        };
+        fs.truncate_cluster_chain(self.first_cluster, new_last_cluster as usize)?;
 
         if new_size == 0 {
             assert!(new_last_cluster == 0);
             self.short_dir_entry.set_first_cluster(Cluster::new(0));
             self.first_cluster = Cluster::new(0);
         }
-
-        // Truncation changes the tail and can partially preallocate on some
-        // error paths. Re-measure once on the next growth instead of keeping a
-        // second, independently updated truncation state machine.
-        self.chain_extent = None;
 
         self.set_size(new_size as u32);
         // 计算短目录项在分区内的字节偏移量
@@ -1380,6 +1387,7 @@ impl ShortDirEntry {
                 short_dir_entry: *self,
                 loc: (loc, loc),
                 chain_extent: None,
+                read_cursor: None,
             };
 
             // 根据当前短目录项的类型的不同，返回对应的枚举类型。
@@ -1424,6 +1432,7 @@ impl ShortDirEntry {
                 loc,
                 short_dir_entry: *self,
                 chain_extent: None,
+                read_cursor: None,
             };
 
             if self.is_file() {

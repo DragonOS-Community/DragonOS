@@ -1272,6 +1272,37 @@ impl FATFileSystem {
     /// @param start_cluster 簇链的第一个簇
     pub fn deallocate_cluster_chain(&self, start_cluster: Cluster) -> Result<(), SystemError> {
         let _fat_guard = self.fat_lock.lock();
+        self.deallocate_cluster_chain_locked(start_cluster)
+    }
+
+    /// Detach the discarded tail before any of its clusters can be reused.
+    pub(super) fn truncate_cluster_chain(
+        &self,
+        first: Cluster,
+        keep: usize,
+    ) -> Result<(), SystemError> {
+        let _fat_guard = self.fat_lock.lock();
+        let free_start = if keep == 0 {
+            first
+        } else {
+            let tail = self
+                .get_cluster_by_relative(first, keep - 1)
+                .ok_or(SystemError::EIO)?;
+            match self.get_fat_entry(tail)? {
+                FATEntry::Next(next) => {
+                    // On an ambiguous write error, retain the tail rather
+                    // than freeing clusters that may still be reachable.
+                    self.set_entry(tail, FATEntry::EndOfChain)?;
+                    next
+                }
+                FATEntry::EndOfChain => return Ok(()),
+                _ => return Err(SystemError::EIO),
+            }
+        };
+        self.deallocate_cluster_chain_locked(free_start)
+    }
+
+    fn deallocate_cluster_chain_locked(&self, start_cluster: Cluster) -> Result<(), SystemError> {
         let clusters: Vec<Cluster> = self.clusters(start_cluster);
         for c in clusters {
             self.deallocate_cluster_locked(c)?;
@@ -1752,7 +1783,7 @@ impl FATFileSystem {
                 let raw_val: u16 = match fat_entry {
                     FATEntry::Unused => 0,
                     FATEntry::Bad => 0xfff7,
-                    FATEntry::EndOfChain => 0xfdff,
+                    FATEntry::EndOfChain => 0xffff,
                     FATEntry::Next(c) => c.cluster_num as u16,
                 };
 
@@ -2126,10 +2157,11 @@ impl IndexNode for LockedFATInode {
     }
 
     fn read_sync(&self, offset: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
-        let guard: MutexGuard<FATInode> = self.0.lock();
-        match &guard.inode_type {
+        let mut guard: MutexGuard<FATInode> = self.0.lock();
+        let fs = guard.fs.upgrade().unwrap();
+        match &mut guard.inode_type {
             FATDirEntry::File(f) | FATDirEntry::VolId(f) => {
-                let r = f.read(&guard.fs.upgrade().unwrap(), buf, offset as u64);
+                let r = f.read(&fs, buf, offset as u64);
                 return r;
             }
 

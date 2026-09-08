@@ -1,6 +1,7 @@
 #include <fcntl.h>
 #include <gtest/gtest.h>
 #include <sys/stat.h>
+#include <sys/mman.h>
 #include <sys/statfs.h>
 #include <sys/statvfs.h>
 #include <unistd.h>
@@ -263,6 +264,125 @@ TEST(FatConcurrentAllocation, FragmentedColdReadsSurviveTruncateRegrowthAndRenam
   files.fds[2] = open(TestPath(2).c_str(), O_RDONLY);
   ASSERT_GE(files.fds[2], 0) << strerror(errno);
   ASSERT_NO_FATAL_FAILURE(check_cold(files.fds[2], false, kRetained));
+}
+
+void CheckRemovedOpenFile(bool replace_by_rename) {
+  struct statfs fs_type {};
+  ASSERT_EQ(0, statfs("/", &fs_type)) << strerror(errno);
+  if (fs_type.f_type != kMsdosSuperMagic) {
+    GTEST_SKIP() << "root filesystem is not FAT";
+  }
+  constexpr size_t kSize = 256 * 1024;
+  struct statvfs space {};
+  ASSERT_EQ(0, statvfs("/", &space));
+  if (space.f_bavail * space.f_frsize < 4 * kSize + 1024 * 1024) {
+    GTEST_SKIP() << "insufficient free FAT space";
+  }
+  TestFiles files;
+  std::vector<uint8_t> old_data(kSize, 0x31);
+  const std::vector<uint8_t> new_data(kSize, 0x62);
+  files.fds[0] = open(TestPath(0).c_str(), O_CREAT | O_EXCL | O_RDWR, 0600);
+  ASSERT_GE(files.fds[0], 0) << strerror(errno);
+  ASSERT_TRUE(WriteAll(files.fds[0], old_data.data(), old_data.size()));
+  ASSERT_EQ(0, fsync(files.fds[0]));
+  ASSERT_EQ(0, posix_fadvise(files.fds[0], 0, 0, POSIX_FADV_DONTNEED));
+  std::array<uint8_t, kBlockSize> tail;
+  ASSERT_TRUE(ReadAllAt(files.fds[0], tail.data(), tail.size(), kSize - kBlockSize));
+  // The old inode's physical read cursor now points into its last cluster.
+  if (!replace_by_rename) {
+    ASSERT_EQ(0, unlink(TestPath(0).c_str())) << strerror(errno);
+  }
+  files.fds[1] = open(TestPath(replace_by_rename ? 1 : 0).c_str(),
+                      O_CREAT | O_EXCL | O_RDWR, 0600);
+  ASSERT_GE(files.fds[1], 0) << strerror(errno);
+  ASSERT_TRUE(WriteAll(files.fds[1], new_data.data(), new_data.size()));
+  ASSERT_EQ(0, fsync(files.fds[1]));
+  if (replace_by_rename) {
+    ASSERT_EQ(0, rename(TestPath(1).c_str(), TestPath(0).c_str())) << strerror(errno);
+  }
+  files.fds[2] = open(TestPath(2).c_str(), O_CREAT | O_EXCL | O_RDWR, 0600);
+  ASSERT_GE(files.fds[2], 0);
+  std::vector<uint8_t> pressure(2 * kSize, 0xa7);
+  ASSERT_TRUE(WriteAll(files.fds[2], pressure.data(), pressure.size()));
+  ASSERT_EQ(0, fsync(files.fds[2]));
+  auto check_cold = [&](int fd, const std::vector<uint8_t>& expected) {
+    ASSERT_EQ(0, fsync(fd)) << strerror(errno);
+    ASSERT_EQ(0, posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED));
+    std::vector<uint8_t> observed(expected.size());
+    ASSERT_TRUE(ReadAllAt(fd, observed.data(), observed.size(), 0)) << strerror(errno);
+    ASSERT_TRUE(observed == expected) << "cold content mismatch after namespace removal";
+    struct stat st {};
+    ASSERT_EQ(0, fstat(fd, &st));
+    ASSERT_EQ(static_cast<off_t>(expected.size()), st.st_size);
+  };
+  // Check the cursor hit directly before a full cold scan could reset it.
+  ASSERT_EQ(0, posix_fadvise(files.fds[0], 0, 0, POSIX_FADV_DONTNEED));
+  ASSERT_TRUE(ReadAllAt(files.fds[0], tail.data(), tail.size(), kSize - kBlockSize));
+  ASSERT_TRUE(std::all_of(tail.begin(), tail.end(), [](uint8_t b) { return b == 0x31; }));
+  ASSERT_NO_FATAL_FAILURE(check_cold(files.fds[0], old_data));
+  old_data[0] = 0x45;
+  ASSERT_EQ(1, pwrite(files.fds[0], old_data.data(), 1, 0));
+  std::array<uint8_t, kBlockSize> appended;
+  appended.fill(0x56);
+  ASSERT_EQ(static_cast<ssize_t>(appended.size()),
+            pwrite(files.fds[0], appended.data(), appended.size(), old_data.size()));
+  old_data.insert(old_data.end(), appended.begin(), appended.end());
+  ASSERT_NO_FATAL_FAILURE(check_cold(files.fds[0], old_data));
+  const size_t grown_size = old_data.size();
+  constexpr size_t kShrunk = kSize / 2 + 123;
+  ASSERT_EQ(0, ftruncate(files.fds[0], kShrunk)) << strerror(errno);
+  old_data.resize(kShrunk);
+  ASSERT_EQ(0, ftruncate(files.fds[0], grown_size)) << strerror(errno);
+  old_data.resize(grown_size, 0);
+  ASSERT_NO_FATAL_FAILURE(check_cold(files.fds[0], old_data));
+  // Reopen by pathname: stale directory-entry writeback must not overwrite
+  // the replacement file's size or cluster pointer.
+  files.fds[3] = open(TestPath(0).c_str(), O_RDONLY);
+  ASSERT_GE(files.fds[3], 0) << strerror(errno);
+  ASSERT_NO_FATAL_FAILURE(check_cold(files.fds[3], new_data));
+  ASSERT_NO_FATAL_FAILURE(check_cold(files.fds[2], pressure));
+  // A mapping is another live reference to the removed inode. Release the
+  // final fd first, then verify shared writes and delayed inode reclamation.
+  struct MappedPage {
+    void* address = MAP_FAILED;
+    ~MappedPage() {
+      if (address != MAP_FAILED) munmap(address, kBlockSize);
+    }
+  } mapping;
+  mapping.address = mmap(nullptr, kBlockSize, PROT_READ | PROT_WRITE,
+                         MAP_SHARED, files.fds[0], 0);
+  ASSERT_NE(MAP_FAILED, mapping.address) << strerror(errno);
+  struct statvfs before {}, after {};
+  // Drain unrelated dirty allocations (including a freshly downloaded test
+  // binary) before measuring reclamation. The mapping still pins this inode.
+  ASSERT_EQ(0, syncfs(files.fds[3])) << strerror(errno);
+  ASSERT_EQ(0, statvfs("/", &before));
+  int closed = close(files.fds[0]);
+  files.fds[0] = -1;
+  ASSERT_EQ(0, closed);
+  ASSERT_EQ(0, syncfs(files.fds[3])) << strerror(errno);
+  auto* mapped = static_cast<volatile uint8_t*>(mapping.address);
+  EXPECT_EQ(old_data[0], mapped[0]);
+  mapped[3] = 0x7c;
+  EXPECT_EQ(0x7c, mapped[3]);
+  ASSERT_EQ(0, msync(mapping.address, kBlockSize, MS_SYNC)) << strerror(errno);
+  ASSERT_NO_FATAL_FAILURE(check_cold(files.fds[3], new_data));
+  ASSERT_EQ(0, munmap(mapping.address, kBlockSize));
+  mapping.address = MAP_FAILED;
+  ASSERT_EQ(0, syncfs(files.fds[3])) << strerror(errno);
+  ASSERT_EQ(0, statvfs("/", &after));
+  ASSERT_GE(after.f_bfree, before.f_bfree);
+  EXPECT_GE((after.f_bfree - before.f_bfree) * after.f_frsize, old_data.size())
+      << "final munmap plus syncfs must release the removed file's data clusters";
+  ASSERT_NO_FATAL_FAILURE(check_cold(files.fds[3], new_data));
+}
+
+TEST(FatConcurrentAllocation, UnlinkedOpenFileRetainsPrivateChainUntilLastClose) {
+  CheckRemovedOpenFile(false);
+}
+
+TEST(FatConcurrentAllocation, ReplacedOpenFileRetainsPrivateChainUntilLastClose) {
+  CheckRemovedOpenFile(true);
 }
 
 }  // namespace

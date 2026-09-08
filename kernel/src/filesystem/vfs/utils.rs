@@ -21,8 +21,9 @@ use crate::libs::casting::DowncastArc;
 #[derive(Debug)]
 pub struct ResolvedPath {
     inode: Arc<dyn IndexNode>,
-    mount_guard: Option<MountExternalGuard>,
+    // Publish final inode eviction before the mount pin can trigger shutdown.
     _operation_guard: InodeRetentionGuard,
+    mount_guard: Option<MountExternalGuard>,
 }
 
 /// Result of a pathname walk that may stop at a missing final component.

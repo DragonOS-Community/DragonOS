@@ -502,6 +502,9 @@ fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usize, SystemE
         // An open hook may perform atomic O_TRUNC even for O_RDONLY. Hold
         // write access before invoking it and through the post-open truncate,
         // without retaining a writer for the returned read-only description.
+        // This owner outlives the temporary writer even when constructing the
+        // File or truncating it fails and releases the File's mount pin.
+        let _truncate_path = do_truncate.then(|| resolved.derive_existing_owner());
         let _truncate_write_access = if do_truncate {
             Some(super::write_access::InodeWriteGuard::writer(inode.clone())?)
         } else {

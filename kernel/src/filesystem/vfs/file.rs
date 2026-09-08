@@ -695,15 +695,15 @@ pub struct File {
     /// via `eventpoll_release(file)`.  DragonOS keeps the same lifetime edge
     /// here so fd numbers can be safely reused after close.
     epitems: Arc<EPollItemList>,
+    /// Writer admission lasts through close and all shared descriptor/VMA owners.
+    /// Field destruction follows declaration order, after the explicit Drop body.
+    _write_access: Option<Arc<InodeWriteGuard>>,
     /// One semantic inode pin per open file description. Duplicated file
     /// descriptors and VMAs share this `File`, while `O_PATH` still owns it.
-    /// Declared last so the explicit `Drop` body runs `close()` before release.
     _inode_retention: InodeRetentionGuard,
-    /// Pins the mount used to resolve this pathname independently from the
-    /// operation inode (which device/FIFO resolution may replace).
+    /// Release every inode owner before the mount pin can start final shutdown
+    /// and seal the filesystem's eviction queue.
     _mount_guard: Option<MountExternalGuard>,
-    /// Writer admission lasts through close and all shared descriptor/VMA owners.
-    _write_access: Option<Arc<InodeWriteGuard>>,
 }
 
 #[derive(Debug, Clone)]
@@ -1134,6 +1134,7 @@ impl File {
             private_data_init,
             mount_guard,
             None,
+            None,
         )
     }
 
@@ -1145,15 +1146,14 @@ impl File {
         mount_guard: Option<MountExternalGuard>,
         operation_guard: InodeRetentionGuard,
     ) -> Result<Self, SystemError> {
-        let file = Self::new_with_private_data_and_mount_guard(
+        Self::new_with_private_data_and_mount_guard(
             inode,
             flags,
             FilePrivateData::default(),
             mount_guard,
+            Some(operation_guard),
             None,
-        );
-        drop(operation_guard);
-        file
+        )
     }
 
     /// Construct a pathname-backed file from an already-opened inode.
@@ -1164,15 +1164,14 @@ impl File {
         operation_guard: InodeRetentionGuard,
     ) -> Result<Self, SystemError> {
         let inode = preopened.inode();
-        let file = Self::new_with_private_data_and_mount_guard(
+        Self::new_with_private_data_and_mount_guard(
             inode,
             flags,
             FilePrivateData::default(),
             mount_guard,
+            Some(operation_guard),
             Some(preopened),
-        );
-        drop(operation_guard);
-        file
+        )
     }
 
     fn new_with_private_data_and_mount_guard(
@@ -1180,6 +1179,9 @@ impl File {
         mut flags: FileFlags,
         private_data_init: FilePrivateData,
         mount_guard: Option<MountExternalGuard>,
+        // Parameters drop in reverse order on failure: release the operation
+        // pin before the mount pin, just as the completed File does.
+        _operation_guard: Option<InodeRetentionGuard>,
         mut preopened: Option<PreopenedFile>,
     ) -> Result<Self, SystemError> {
         let mut inode = inode;
@@ -1321,9 +1323,9 @@ impl File {
             wb_error_seq: Mutex::new(wb_error_seq),
             sb_error_seq: Mutex::new(sb_error_seq),
             epitems: Arc::new(EPollItemList::default()),
+            _write_access: write_access,
             _inode_retention: inode_retention,
             _mount_guard: mount_guard,
-            _write_access: write_access,
         };
 
         return Ok(f);
@@ -2522,9 +2524,9 @@ impl File {
             wb_error_seq: Mutex::new(*self.wb_error_seq.lock()),
             sb_error_seq: Mutex::new(*self.sb_error_seq.lock()),
             epitems: Arc::new(EPollItemList::default()),
+            _write_access: self._write_access.clone(),
             _inode_retention: inode_retention,
             _mount_guard: mount_guard,
-            _write_access: self._write_access.clone(),
         };
         return Some(res);
     }

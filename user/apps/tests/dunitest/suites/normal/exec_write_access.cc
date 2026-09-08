@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
@@ -7,6 +8,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/mount.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -187,6 +190,69 @@ TEST_F(ExecWriteAccess, SharedMappingKeepsWritableDescriptionAfterClose) {
     ASSERT_NE(MAP_FAILED, mapping);
     EXPECT_EQ(ETXTBSY, exec_errno());
     ASSERT_EQ(0, munmap(mapping, 4096));
+    EXPECT_EQ(0, exec_errno());
+}
+
+// Remove overlay workdir entries after unmount as well as the copied image.
+void remove_tree(const std::string& path) {
+    DIR* dir = opendir(path.c_str());
+    if (!dir) { unlink(path.c_str()); return; }
+    while (dirent* entry = readdir(dir)) {
+        if (strcmp(entry->d_name, ".") && strcmp(entry->d_name, ".."))
+            remove_tree(path + "/" + entry->d_name);
+    }
+    closedir(dir);
+    rmdir(path.c_str());
+}
+
+class OverlayExecWriteAccess : public ExecWriteAccess {
+protected:
+    std::string merged;
+    bool mounted = false;
+    void* mapping = MAP_FAILED;
+    size_t mapping_size = 0;
+
+    void SetUp() override {
+        ASSERT_NO_FATAL_FAILURE(ExecWriteAccess::SetUp());
+        for (const char* name : {"lower", "upper", "work", "merged"})
+            ASSERT_EQ(0, mkdir((directory + "/" + name).c_str(), 0700));
+        ASSERT_EQ(0, rename(image.c_str(), (directory + "/upper/image").c_str()));
+        merged = directory + "/merged";
+        std::string options = "lowerdir=" + directory + "/lower,upperdir=" +
+                              directory + "/upper,workdir=" + directory + "/work";
+        ASSERT_EQ(0, mount("overlay", merged.c_str(), "overlay", 0, options.c_str()))
+            << strerror(errno);
+        mounted = true;
+        image = merged + "/image";
+    }
+
+    void TearDown() override {
+        if (mapping != MAP_FAILED) munmap(mapping, mapping_size);
+        if (mounted) {
+            EXPECT_EQ(0, umount(merged.c_str())) << strerror(errno);
+        }
+        ExecWriteAccess::TearDown();
+        remove_tree(directory);
+    }
+};
+
+TEST_F(OverlayExecWriteAccess, SharedMappingExecFollowsOverlayDescriptionLifetime) {
+    mapping_size = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    int fd = open(image.c_str(), O_RDWR);
+    ASSERT_GE(fd, 0) << strerror(errno);
+    mapping = mmap(nullptr, mapping_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (mapping == MAP_FAILED) {
+        int error = errno;
+        close(fd);
+        FAIL() << strerror(error);
+    }
+    EXPECT_EQ(ETXTBSY, exec_errno());
+    ASSERT_EQ(0, close(fd));
+    // Linux overlay mmap retains the backing file, not the outer writable
+    // description used for overlay executable write exclusion.
+    EXPECT_EQ(0, exec_errno());
+    ASSERT_EQ(0, munmap(mapping, mapping_size));
+    mapping = MAP_FAILED;
     EXPECT_EQ(0, exec_errno());
 }
 

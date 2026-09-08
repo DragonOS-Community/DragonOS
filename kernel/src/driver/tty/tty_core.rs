@@ -651,8 +651,11 @@ impl TtyCore {
         let mut termios = tty.core().termios_write();
         if ret.is_err() {
             termios.control_mode &= ControlMode::HUPCL | ControlMode::CREAD | ControlMode::CLOCAL;
-            termios.control_mode |= old_termios.control_mode
-                & !(ControlMode::HUPCL | ControlMode::CREAD | ControlMode::CLOCAL);
+            // bitflags' !mask truncates unnamed bits. Linux preserves all
+            // old hardware bits outside this software-controlled mask.
+            termios.control_mode |= old_termios
+                .control_mode
+                .difference(ControlMode::HUPCL | ControlMode::CREAD | ControlMode::CLOCAL);
             termios.input_speed = old_termios.input_speed;
             termios.output_speed = old_termios.output_speed;
         }

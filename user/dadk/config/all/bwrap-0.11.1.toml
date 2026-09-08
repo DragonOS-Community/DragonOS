@@ -1,0 +1,24 @@
+name = "bwrap"
+version = "0.11.1"
+description = "bubblewrap - OCI sandbox runtime (static binary)"
+build-once = true
+install-once = true
+target-arch = ["x86_64"]
+
+[task-source]
+type = "build-from-source"
+source = "local"
+source-path = "user/apps/tests/bwrap"
+
+[build]
+build-command = "make install-bwrap"
+
+[install]
+in-dragonos-path = "/bin"
+
+[clean]
+clean-command = "make clean"
+
+[[depends]]
+name = "bwrap tests"
+version = "0.1.0"

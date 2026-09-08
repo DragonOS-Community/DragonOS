@@ -30,6 +30,7 @@ let
       ''
         mkdir -p $out $out/root
         cp -r $src/* $out/
+        mkdir -p $out/var/tmp
       '';
 
   # 使用 buildImage 创建 Docker 镜像（单层）

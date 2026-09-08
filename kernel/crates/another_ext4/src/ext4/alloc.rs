@@ -993,6 +993,70 @@ impl Ext4 {
         core::cmp::min(sb.blocks_per_group() as u64, total - first) as usize
     }
 
+    /// Interpret BLOCK_UNINIT before using a bitmap as allocation state.
+    /// Only the first allocation constructs an owned image; ordinary and
+    /// transaction-staged bitmaps keep their existing storage. Publication of
+    /// the image and clearing the flag remain the caller's responsibility.
+    fn prepare_allocation_bitmap<'a>(
+        &self,
+        sb: &SuperBlock,
+        bg: &BlockGroupRef,
+        image: super::journal_transaction::BlockView<'a>,
+    ) -> Result<super::journal_transaction::BlockView<'a>> {
+        let metadata_csum =
+            sb.has_read_only_compatible_feature(SuperBlock::FEATURE_RO_COMPAT_METADATA_CSUM);
+        if metadata_csum && !bg.verify_checksum(sb.metadata_checksum_seed()) {
+            return_error!(ErrCode::EIO, "Corrupt block-group descriptor checksum");
+        }
+        if !bg.desc.block_bitmap_uninitialized() {
+            if metadata_csum
+                && !bg.desc.verify_block_bitmap_csum(
+                    sb.metadata_checksum_seed(),
+                    &*image,
+                    sb.clusters_per_group() as usize / 8,
+                )
+            {
+                return_error!(ErrCode::EIO, "Corrupt block bitmap checksum");
+            }
+            return Ok(image);
+        }
+        // Legacy GDT_CSUM is outside the mount's supported feature set. A
+        // flag without authenticated descriptor semantics is not permission
+        // to discard the on-disk allocation state.
+        if !metadata_csum || bg.id == 0 {
+            return_error!(ErrCode::EIO, "Invalid uninitialized block group");
+        }
+        let first = Self::block_group_first_block(sb, bg.id);
+        let count = Self::block_group_block_count(sb, bg.id);
+        let end = first + count as u64;
+        let mut bytes = Box::new([0xff; BLOCK_SIZE]);
+        let mut bitmap = Bitmap::new(bytes.as_mut(), BLOCK_SIZE * 8);
+        for bit in 0..count {
+            bitmap.clear_bit(bit);
+        }
+        // The mount already validates and merges all metadata ranges,
+        // including backups and metadata placed across groups by flex_bg.
+        let start = self
+            .system_metadata_ranges
+            .partition_point(|(_, range_end)| *range_end <= first);
+        for &(range_start, range_end) in &self.system_metadata_ranges[start..] {
+            if range_start >= end {
+                break;
+            }
+            for block in core::cmp::max(range_start, first)..core::cmp::min(range_end, end) {
+                bitmap.set_bit((block - first) as usize);
+            }
+        }
+        let free = (0..count).filter(|&bit| bitmap.is_bit_clear(bit)).count() as u64;
+        if free != bg.desc.get_free_blocks_count() {
+            return_error!(ErrCode::EIO, "Invalid uninitialized block-group free count");
+        }
+        Ok(super::journal_transaction::BlockView::Device(Block::new(
+            bg.desc.block_bitmap_block(),
+            bytes,
+        )))
+    }
+
     /// Stage one group-local contiguous data allocation without publishing
     /// any cache or disk metadata.  The caller owns the filesystem-wide
     /// transactional metadata gate, so no direct allocator can race the
@@ -1056,21 +1120,13 @@ impl Ext4 {
                 continue;
             }
             let bitmap_home = bg.desc.block_bitmap_block();
-            let bitmap_block = transaction.read(self.block_device.as_ref(), bitmap_home)?;
+            let bitmap_block = self.prepare_allocation_bitmap(
+                &sb,
+                &bg,
+                transaction.read(self.block_device.as_ref(), bitmap_home)?,
+            )?;
             self.prepare_stats.record_bitmap_io();
             let checksum_bytes = (sb.clusters_per_group() as usize) / 8;
-            if sb.has_read_only_compatible_feature(SuperBlock::FEATURE_RO_COMPAT_METADATA_CSUM) {
-                if !bg.verify_checksum(sb.metadata_checksum_seed()) {
-                    return_error!(ErrCode::EIO, "Corrupt block-group descriptor checksum");
-                }
-                if !bg.desc.verify_block_bitmap_csum(
-                    sb.metadata_checksum_seed(),
-                    &*bitmap_block,
-                    checksum_bytes,
-                ) {
-                    return_error!(ErrCode::EIO, "Corrupt block bitmap checksum");
-                }
-            }
 
             let group_first = Self::block_group_first_block(&sb, bgid);
             let exact_hint = preferred_first
@@ -1111,9 +1167,23 @@ impl Ext4 {
                 .checked_sub(count as u64)
                 .ok_or_else(|| Ext4Error::new(ErrCode::EIO))?;
 
+            // A staged view borrows the transaction. Only an uninitialized
+            // group needs to carry a replacement image across the mutation.
+            let initialized_image = if bg.desc.block_bitmap_uninitialized() {
+                match bitmap_block {
+                    super::journal_transaction::BlockView::Device(block) => Some(block.data),
+                    super::journal_transaction::BlockView::Staged(_) => unreachable!(),
+                }
+            } else {
+                None
+            };
             {
                 let image = self.transaction_block_for_update(transaction, bitmap_home)?;
                 self.prepare_stats.record_bitmap_io();
+                if let Some(initialized) = initialized_image {
+                    image.copy_from_slice(initialized.as_ref());
+                    bg.desc.clear_block_bitmap_uninitialized();
+                }
                 let mut bitmap = Bitmap::new(image, blocks_in_group);
                 if (bit..bit + count_usize).any(|index| !bitmap.is_bit_clear(index)) {
                     return_error!(ErrCode::EIO, "Range allocation changed during planning");
@@ -2082,6 +2152,14 @@ impl Ext4 {
             let old_bitmap_block = bitmap_block.clone();
             let old_bg = BlockGroupRef::new(bg.id, bg.desc);
             let old_sb = sb;
+            bitmap_block = match self.prepare_allocation_bitmap(
+                &sb,
+                &bg,
+                super::journal_transaction::BlockView::Device(bitmap_block),
+            )? {
+                super::journal_transaction::BlockView::Device(block) => block,
+                super::journal_transaction::BlockView::Staged(_) => unreachable!(),
+            };
             let bit = {
                 let mut bitmap = Bitmap::new(&mut *bitmap_block.data, blocks_in_group);
                 match bitmap.find_and_set_first_clear_bit(0, blocks_in_group) {
@@ -2090,6 +2168,17 @@ impl Ext4 {
                 }
             };
             let fblock = Self::block_group_first_block(&sb, bgid) + bit as PBlockId;
+            self.validate_data_blocks(fblock, 1)?;
+            let new_bg_free = bg
+                .desc
+                .get_free_blocks_count()
+                .checked_sub(1)
+                .ok_or_else(|| Ext4Error::new(ErrCode::EIO))?;
+            let new_sb_free = sb
+                .free_blocks_count()
+                .checked_sub(1)
+                .ok_or_else(|| Ext4Error::new(ErrCode::EIO))?;
+            bg.desc.clear_block_bitmap_uninitialized();
 
             // Set block group checksum
             if !bg.desc.update_block_bitmap_csum(
@@ -2103,8 +2192,7 @@ impl Ext4 {
             self.prepare_stats.record_bitmap_io();
 
             // Update block group counters
-            bg.desc
-                .set_free_blocks_count(bg.desc.get_free_blocks_count() - 1);
+            bg.desc.set_free_blocks_count(new_bg_free);
             if let Err(err) = self.write_block_group_with_csum(&mut bg) {
                 return match self.restore_block_allocation_state(
                     &old_bitmap_block,
@@ -2117,7 +2205,7 @@ impl Ext4 {
             }
 
             // Update superblock counters
-            sb.set_free_blocks_count(sb.free_blocks_count() - 1);
+            sb.set_free_blocks_count(new_sb_free);
             if let Err(err) = self.write_super_block(&sb) {
                 return match self.restore_block_allocation_state(
                     &old_bitmap_block,

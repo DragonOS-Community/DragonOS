@@ -859,13 +859,14 @@ pub(crate) fn prepare_open_truncate(metadata_before_open: Metadata) -> OpenTrunc
 }
 
 /// Complete Linux's post-open truncate stage for an existing regular file.
+/// The open caller holds temporary inode write access across the filesystem
+/// open hook and this stage, including for O_RDONLY | O_TRUNC.
 pub(crate) fn vfs_open_truncate(
     file: &File,
     context: &OpenTruncateContext,
 ) -> Result<(), SystemError> {
     let inode = file.inode();
     validate_truncate(&inode, &context.requested, 0)?;
-    let _write_access = super::write_access::InodeWriteGuard::writer(inode.clone())?;
     inode.resize_open_truncate(
         0,
         current_file_lock_owner_id(),

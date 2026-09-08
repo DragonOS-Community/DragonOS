@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <elf.h>
 #include <signal.h>
 #include <sched.h>
 #include <setjmp.h>
@@ -11350,6 +11351,144 @@ TEST(FuseExtended, FopenStreamDisablesRandomIo) {
 TEST(FuseExtended, FopenNonseekableDirectoryDisablesLseek) {
     ASSERT_EQ(0,
               ext_test_fopen_nonseekable_dir_mode(FOPEN_NONSEEKABLE, "/tmp/test_fuse_dir_nonseek"));
+}
+
+TEST(FuseExtended, ReadOnlyAtomicTruncateRejectsRunningExecutableBeforeOpen) {
+#if !defined(__x86_64__)
+    GTEST_SKIP() << "fixture contains x86_64 entry instructions";
+#else
+    char mount_point[] = "/tmp/fuse_exec_trunc_XXXXXX";
+    ASSERT_NE(nullptr, mkdtemp(mount_point));
+    int fuse_fd = open("/dev/fuse", O_RDWR | O_CLOEXEC);
+    if (fuse_fd < 0) {
+        rmdir(mount_point);
+        FAIL() << "open /dev/fuse: " << strerror(errno);
+    }
+    volatile int stop = 0;
+    volatile int init_done = 0;
+    volatile uint32_t open_count = 0;
+    struct fuse_daemon_args args = {};
+    args.fd = fuse_fd;
+    args.stop = &stop;
+    args.init_done = &init_done;
+    args.stop_on_destroy = 1;
+    args.enable_write_ops = 1;
+    args.open_count = &open_count;
+    args.hello_mode_override = S_IFREG | 0755;
+    args.init_out_flags_override = FUSE_INIT_EXT | FUSE_MAX_PAGES | FUSE_ATOMIC_O_TRUNC;
+    pthread_t daemon;
+    if (pthread_create(&daemon, NULL, fuse_daemon_thread, &args) != 0) {
+        close(fuse_fd);
+        rmdir(mount_point);
+        FAIL() << "pthread_create";
+    }
+    bool mounted = false;
+    int retained_reader = -1;
+    int writer = -1;
+    int ready[2] = {-1, -1};
+    pid_t child = -1;
+    // The lambda keeps assertion failures inside a scope whose resources are
+    // always released below, including the paused executable and FUSE daemon.
+    [&]() {
+        char options[256];
+        snprintf(options, sizeof(options), "fd=%d,rootmode=040755,user_id=0,group_id=0", fuse_fd);
+        ASSERT_EQ(0, mount("none", mount_point, "fuse", 0, options)) << strerror(errno);
+        mounted = true;
+        ASSERT_EQ(0, fuseg_wait_init(&init_done));
+        char path[256];
+        snprintf(path, sizeof(path), "%s/hello.txt", mount_point);
+        // Keep a successful read-only truncating fd open in the parent. Its
+        // temporary write authorization must not prevent a later exec.
+        retained_reader = open(path, O_RDONLY | O_TRUNC | O_CLOEXEC);
+        ASSERT_GE(retained_reader, 0) << strerror(errno);
+        unsigned char image[256] = {};
+        Elf64_Ehdr eh = {};
+        memcpy(eh.e_ident, ELFMAG, SELFMAG);
+        eh.e_ident[EI_CLASS] = ELFCLASS64;
+        eh.e_ident[EI_DATA] = ELFDATA2LSB;
+        eh.e_ident[EI_VERSION] = EV_CURRENT;
+        eh.e_type = ET_EXEC;
+        eh.e_machine = EM_X86_64;
+        eh.e_version = EV_CURRENT;
+        eh.e_entry = 0x400080;
+        eh.e_phoff = sizeof(eh);
+        eh.e_ehsize = sizeof(eh);
+        eh.e_phentsize = sizeof(Elf64_Phdr);
+        eh.e_phnum = 1;
+        Elf64_Phdr ph = {};
+        ph.p_type = PT_LOAD;
+        ph.p_flags = PF_R | PF_X;
+        ph.p_vaddr = 0x400000;
+        ph.p_filesz = ph.p_memsz = sizeof(image);
+        ph.p_align = 4096;
+        // write(3, stack byte 0x7b, 1), then pause forever. Readiness proves
+        // exec has completed; no timing assumption substitutes for that fact.
+        const unsigned char entry[] = {
+            0x6a, 0x7b, 0x48, 0x89, 0xe6, 0xba, 0x01, 0x00, 0x00, 0x00,
+            0xbf, 0x03, 0x00, 0x00, 0x00, 0xb8, 0x01, 0x00, 0x00, 0x00,
+            0x0f, 0x05, 0xb8, 0x22, 0x00, 0x00, 0x00, 0x0f, 0x05, 0xeb, 0xf7,
+        };
+        memcpy(image, &eh, sizeof(eh));
+        memcpy(image + eh.e_phoff, &ph, sizeof(ph));
+        memcpy(image + 0x80, entry, sizeof(entry));
+        writer = open(path, O_WRONLY | O_CLOEXEC);
+        ASSERT_GE(writer, 0) << strerror(errno);
+        ASSERT_EQ(static_cast<ssize_t>(sizeof(image)), write(writer, image, sizeof(image)));
+        ASSERT_EQ(0, fsync(writer));
+        int closed = close(writer);
+        writer = -1;
+        ASSERT_EQ(0, closed);
+        ASSERT_EQ(0, pipe(ready));
+        child = fork();
+        ASSERT_GE(child, 0);
+        if (child == 0) {
+            close(ready[0]);
+            if (dup2(ready[1], 3) < 0 || fcntl(3, F_SETFD, 0) < 0)
+                _exit(101);
+            execl(path, path, nullptr);
+            _exit(102);
+        }
+        close(ready[1]);
+        ready[1] = -1;
+        ASSERT_EQ(0, fuseg_wait_readable(ready[0], 3000))
+            << "exec failed or was blocked by retained read-only fd";
+        unsigned char byte = 0;
+        ASSERT_EQ(1, read(ready[0], &byte, 1));
+        ASSERT_EQ(0x7b, byte);
+        const uint32_t opens_before = open_count;
+        errno = 0;
+        int denied = open(path, O_RDONLY | O_TRUNC);
+        const int denied_errno = errno;
+        if (denied >= 0)
+            close(denied);
+        EXPECT_EQ(-1, denied);
+        EXPECT_EQ(ETXTBSY, denied_errno);
+        EXPECT_EQ(opens_before, open_count) << "rejected truncation reached FUSE_OPEN";
+        struct stat st = {};
+        EXPECT_EQ(0, fstat(retained_reader, &st));
+        EXPECT_EQ(static_cast<off_t>(sizeof(image)), st.st_size);
+        unsigned char observed[sizeof(image)] = {};
+        EXPECT_EQ(static_cast<ssize_t>(sizeof(observed)),
+                  pread(retained_reader, observed, sizeof(observed), 0));
+        EXPECT_EQ(0, memcmp(image, observed, sizeof(image))) << "executable was truncated";
+    }();
+    if (child > 0) {
+        kill(child, SIGKILL);
+        int status = 0;
+        EXPECT_EQ(child, waitpid(child, &status, 0));
+    }
+    if (ready[0] >= 0) close(ready[0]);
+    if (ready[1] >= 0) close(ready[1]);
+    if (writer >= 0) close(writer);
+    if (retained_reader >= 0) close(retained_reader);
+    if (mounted) {
+        EXPECT_EQ(0, umount(mount_point)) << strerror(errno);
+    }
+    stop = 1;
+    close(fuse_fd);
+    pthread_join(daemon, NULL);
+    EXPECT_EQ(0, rmdir(mount_point));
+#endif
 }
 
 TEST(FuseExtended, AtomicOTruncUsesOpenWithoutSetattr) {

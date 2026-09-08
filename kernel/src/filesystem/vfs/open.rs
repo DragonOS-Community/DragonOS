@@ -499,6 +499,14 @@ fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usize, SystemE
         // Linux clears O_TRUNC for this phase.
         let do_truncate =
             !created && file_type == FileType::File && how.o_flags.contains(FileFlags::O_TRUNC);
+        // An open hook may perform atomic O_TRUNC even for O_RDONLY. Hold
+        // write access before invoking it and through the post-open truncate,
+        // without retaining a writer for the returned read-only description.
+        let _truncate_write_access = if do_truncate {
+            Some(super::write_access::InodeWriteGuard::writer(inode.clone())?)
+        } else {
+            None
+        };
         let truncate_metadata = do_truncate.then(|| metadata.clone());
         let (inode, mount_guard, operation_guard) = resolved.into_parts();
         let file: File = match preopened {

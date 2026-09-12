@@ -12,7 +12,7 @@ use crate::{
         vfs::{
             self,
             fcntl::AtFlags,
-            mount::MountFlags,
+            mount::{MountFlags, SuperBlockState},
             utils::{user_path_at, DName},
             vcore::try_find_gendisk,
             EvictionEpoch, FileSystem, FileSystemMakerData, FsReconfigureRequest, IndexNode,
@@ -29,7 +29,7 @@ use crate::{
         fault::{PageFaultHandler, PageFaultMessage},
         VmFaultReason,
     },
-    process::ProcessManager,
+    process::{namespace::user_namespace::UserNamespace, ProcessManager},
     register_mountable_fs,
 };
 use alloc::{
@@ -47,7 +47,10 @@ use lazy_static::lazy_static;
 use linkme::distributed_slice;
 use system_error::SystemError;
 
-use super::inode::LockedExt4Inode;
+use super::{
+    inode::LockedExt4Inode,
+    journal::{Ext4Journal, Ext4JournalSyncRequest, Ext4MetadataMutationWait},
+};
 
 #[derive(Debug)]
 struct CanonicalInodeEntry {
@@ -69,28 +72,27 @@ lazy_static! {
     /// Locates the mount-serialization domain for each block device.  The
     /// global lock covers only this in-memory lookup; recovery and writeback
     /// are serialized by the selected device domain.
-    static ref EXT4_DELALLOC_MOUNT_REGISTRY:
+    static ref EXT4_MOUNT_REGISTRY:
         Mutex<BTreeMap<usize, Weak<Ext4MountDomain>>> = Mutex::new(BTreeMap::new());
 }
 
 #[derive(Debug)]
 struct Ext4MountDomain {
-    /// Multiple mounts remain allowed; until VFS shares one canonical
-    /// superblock, publishing a second writable instance permanently disables
-    /// delayed admission on both sides after draining the first.
-    instances: Mutex<Vec<Weak<Ext4FileSystem>>>,
+    /// One complete superblock per device, including PageCache/inode identity.
+    /// This sleeping lock serializes initial recovery and publication only.
+    canonical: Mutex<Weak<Ext4FileSystem>>,
 }
 
 impl Default for Ext4MountDomain {
     fn default() -> Self {
         Self {
-            instances: Mutex::new(Vec::new()),
+            canonical: Mutex::new(Weak::new()),
         }
     }
 }
 
 fn ext4_mount_domain(device: usize) -> Arc<Ext4MountDomain> {
-    let mut registry = EXT4_DELALLOC_MOUNT_REGISTRY.lock();
+    let mut registry = EXT4_MOUNT_REGISTRY.lock();
     registry.retain(|_, domain| domain.strong_count() != 0);
     if let Some(domain) = registry.get(&device).and_then(Weak::upgrade) {
         return domain;
@@ -100,42 +102,17 @@ fn ext4_mount_domain(device: usize) -> Arc<Ext4MountDomain> {
     domain
 }
 
-#[derive(Default)]
-struct DelallocAdmissionRollback {
-    reopen: Vec<Arc<Ext4FileSystem>>,
-    committed: bool,
-}
-
-impl DelallocAdmissionRollback {
-    fn record(&mut self, fs: Arc<Ext4FileSystem>) {
-        self.reopen.push(fs);
-    }
-
-    fn commit(&mut self) {
-        self.committed = true;
-    }
-}
-
-impl Drop for DelallocAdmissionRollback {
-    fn drop(&mut self) {
-        if self.committed {
-            return;
-        }
-        for fs in &self.reopen {
-            fs.reopen_delalloc_admission_after_failed_mount();
-        }
-    }
-}
-
 pub(crate) fn prepare_stats_report() -> String {
     let mut report = String::new();
     let mut registry = EXT4_STATS_REGISTRY.lock();
     registry.retain(|entry| entry.strong_count() != 0);
     for entry in registry.iter().filter_map(Weak::upgrade) {
         let snapshot = entry.fs.prepare_stats_snapshot();
+        let batch = entry.fs.batch_progress();
+        let batch_snapshot = batch.unwrap_or_default();
         let _ = writeln!(
             report,
-            "device={} generation={} enabled={} journal={} reliable_flush={} write_barrier={} calls={} requested_blocks={} mapped_blocks={} missing_blocks={} failures={} elapsed_cycles={} bitmap_io={} gdt_io={} superblock_io={} inode_io={} extent_io={} zero_io={}",
+            "device={} generation={} enabled={} journal={} reliable_flush={} write_barrier={} calls={} requested_blocks={} mapped_blocks={} missing_blocks={} failures={} elapsed_cycles={} bitmap_io={} gdt_io={} superblock_io={} inode_io={} extent_io={} zero_io={} batch={} accepted={} durable={} running={} frozen={} failed={}",
             entry.raw_dev.data(),
             snapshot.generation,
             snapshot.enabled as usize,
@@ -154,6 +131,12 @@ pub(crate) fn prepare_stats_report() -> String {
             snapshot.inode_io,
             snapshot.extent_io,
             snapshot.zero_io,
+            batch.is_some() as usize,
+            batch_snapshot.accepted,
+            batch_snapshot.durable,
+            batch_snapshot.running_blocks,
+            batch_snapshot.frozen_blocks,
+            batch_snapshot.failed as usize,
         );
     }
     report
@@ -167,26 +150,8 @@ pub(super) struct Ext4InodeTombstone {
     resolved: bool,
 }
 
-#[derive(Debug)]
-struct Ext4MetadataMutationWait {
-    wait_queue: WaitQueue,
-}
-
-impl Ext4MetadataMutationWait {
-    fn new() -> Self {
-        Self {
-            wait_queue: WaitQueue::default(),
-        }
-    }
-}
-
-impl another_ext4::MetadataMutationWaker for Ext4MetadataMutationWait {
-    fn wake_all(&self) {
-        self.wait_queue.wake_all();
-    }
-}
-
 pub struct Ext4FileSystem {
+    pub(super) journal: Option<Arc<Ext4Journal>>,
     pub(super) writeback_domain: Arc<PageCacheWritebackDomain>,
     /// 对应 another_ext4 中的实际文件系统
     pub(super) fs: another_ext4::Ext4,
@@ -207,6 +172,8 @@ pub struct Ext4FileSystem {
     /// Keeps this device's mount-serialization domain alive for the complete
     /// filesystem lifetime.
     _mount_domain: Arc<Ext4MountDomain>,
+    mount_owner: Arc<UserNamespace>,
+    mount_state: Mutex<Option<Arc<SuperBlockState>>>,
 
     /// Unique lower authority and strong owners for the Stage-3b single-head
     /// delayed mapper.  An inode is present exactly while it owns a live
@@ -333,6 +300,30 @@ impl Ext4MountOptions {
 }
 
 impl FileSystem for Ext4FileSystem {
+    fn begin_sync_writeback(&self) -> Option<alloc::boxed::Box<dyn vfs::FileSystemSyncGuard>> {
+        self.begin_journal_sync().map(|guard| {
+            alloc::boxed::Box::new(guard) as alloc::boxed::Box<dyn vfs::FileSystemSyncGuard>
+        })
+    }
+
+    fn shared_mount_superblock_state(&self, flags: MountFlags) -> Option<Arc<SuperBlockState>> {
+        let mut state = self.mount_state.lock();
+        Some(
+            state
+                .get_or_insert_with(|| {
+                    Arc::new(SuperBlockState::new_with_owner(
+                        flags,
+                        self.mount_owner.clone(),
+                    ))
+                })
+                .clone(),
+        )
+    }
+
+    fn mount_owner_user_ns(&self) -> Option<Arc<UserNamespace>> {
+        Some(self.mount_owner.clone())
+    }
+
     fn page_cache_writeback_domain(&self) -> Option<&Arc<PageCacheWritebackDomain>> {
         Some(&self.writeback_domain)
     }
@@ -425,6 +416,7 @@ impl FileSystem for Ext4FileSystem {
     }
 
     fn sync_fs(&self, wait: bool) -> Result<(), SystemError> {
+        let _sync_request = wait.then(|| self.begin_journal_sync());
         let flush_result = self.flush_dirty_inodes();
         let eviction_epoch = wait.then(|| {
             // Capture after dirty metadata flush: releasing the last AsyncWork
@@ -441,11 +433,7 @@ impl FileSystem for Ext4FileSystem {
             flush_result
         };
         if wait {
-            if self._mount_options.write_barrier {
-                result.and_then(|_| self.fs.flush_device().map_err(SystemError::from))
-            } else {
-                result
-            }
+            result.and_then(|_| self.finish_sync_durability_boundary())
         } else {
             result
         }
@@ -455,11 +443,15 @@ impl FileSystem for Ext4FileSystem {
         if self._mount_options.read_only {
             return;
         }
-        if let Err(error) = self.flush_dirty_inodes() {
-            log::error!(
-                "ext4: failed final metadata sync after delayed-map drain: {:?}",
-                error
-            );
+        let flush = self.flush_dirty_inodes();
+        // Always drain/join, including a preceding metadata error. Published
+        // completion owners cannot be discarded by an early-return error path.
+        let drained = self
+            .journal
+            .as_ref()
+            .map_or(Ok(()), |journal| journal.shutdown(self));
+        if let Err(error) = flush.and(drained) {
+            log::error!("ext4: final journal drain failed: {:?}", error);
             self.fail_stop_lifecycle();
             self.terminalize_idle_delalloc_after_fail_stop();
             return;
@@ -507,13 +499,60 @@ impl Ext4FileSystem {
 
     pub(super) fn retry_metadata_contention<T>(
         &self,
-        mut operation: impl FnMut() -> core::result::Result<T, another_ext4::Ext4Error>,
+        operation: impl FnMut() -> core::result::Result<T, another_ext4::Ext4Error>,
     ) -> Result<T, SystemError> {
+        self.retry_metadata_operation(operation, true)
+    }
+
+    /// Sample after releasing the previous preference: its Drop itself wakes
+    /// readers. Waiting on the earlier token would otherwise self-wake a busy
+    /// retry loop while an unrelated reader is still doing I/O.
+    pub(super) fn prepare_metadata_writer_wait(
+        &self,
+        observed: u64,
+    ) -> core::result::Result<
+        (u64, Option<another_ext4::MetadataWriterWait<'_>>),
+        another_ext4::Ext4Error,
+    > {
+        let after_release = self.fs.metadata_mutation_generation();
+        let intent = self.fs.begin_metadata_writer_wait()?;
+        let observed = if intent.is_some() {
+            after_release
+        } else {
+            observed
+        };
+        Ok((observed, intent))
+    }
+
+    pub(super) fn retry_metadata_read_contention<T>(
+        &self,
+        operation: impl FnMut() -> core::result::Result<T, another_ext4::Ext4Error>,
+    ) -> Result<T, SystemError> {
+        self.retry_metadata_operation(operation, false)
+    }
+
+    fn retry_metadata_operation<T>(
+        &self,
+        mut operation: impl FnMut() -> core::result::Result<T, another_ext4::Ext4Error>,
+        writer: bool,
+    ) -> Result<T, SystemError> {
+        let mut writer_wait = None;
         loop {
             let observed = self.fs.metadata_mutation_generation();
-            match operation() {
+            let result = operation();
+            // A preference spans one wait and the following attempt only.
+            // Capacity waits at an idle gate must not block public readers.
+            drop(writer_wait.take());
+            match result {
                 Ok(value) => return Ok(value),
                 Err(error) if error.code() == another_ext4::ErrCode::EAGAIN => {
+                    let observed = if writer {
+                        let (observed, intent) = self.prepare_metadata_writer_wait(observed)?;
+                        writer_wait = intent;
+                        observed
+                    } else {
+                        observed
+                    };
                     self.wait_metadata_mutation_progress(observed)?;
                 }
                 Err(error) => return Err(error.into()),
@@ -557,18 +596,6 @@ impl Ext4FileSystem {
         self.delalloc_admission_open.store(false, Ordering::Release);
     }
 
-    /// Restore admission on a healthy mapper-owning filesystem after a
-    /// prospective sibling writable mount failed.
-    ///
-    /// The caller holds the per-device mount-domain lock, so a successful
-    /// reopen cannot race publication of another writable instance.
-    fn reopen_delalloc_admission_after_failed_mount(&self) {
-        let lifecycle_error = self.lifecycle_error.lock();
-        if self.delalloc_mapper_authority.is_some() && lifecycle_error.is_none() {
-            self.delalloc_admission_open.store(true, Ordering::Release);
-        }
-    }
-
     fn drain_registered_delalloc(&self) -> Result<(), SystemError> {
         loop {
             let owners: Vec<_> = self.delalloc_inodes.lock().values().cloned().collect();
@@ -602,10 +629,26 @@ impl Ext4FileSystem {
     /// writeback, rather than flushing every ordinary metadata transaction.
     /// Read-only and `nobarrier` mounts do not issue a device flush.
     pub(super) fn finish_sync_durability_boundary(&self) -> Result<(), SystemError> {
-        if self._mount_options.read_only || !self._mount_options.write_barrier {
+        if self._mount_options.read_only {
             return Ok(());
         }
-        self.fs.flush_device().map_err(SystemError::from)
+        if let Some(journal) = &self.journal {
+            let target = self
+                .fs
+                .batch_progress()
+                .expect("journal worker requires batch mode")
+                .accepted;
+            journal.wait_through(target)?;
+        }
+        if self._mount_options.write_barrier {
+            self.fs.flush_device().map_err(SystemError::from)
+        } else {
+            Ok(())
+        }
+    }
+
+    pub(super) fn begin_journal_sync(&self) -> Option<Ext4JournalSyncRequest> {
+        self.journal.as_ref().map(Ext4Journal::sync_request)
     }
 
     pub(super) fn schedule_inode_eviction(
@@ -1281,29 +1324,38 @@ impl Ext4FileSystem {
         lazy_static::initialize(&EXT4_EVICTION_WQ);
         let raw_dev = mount_data.device_num();
         let mount_domain = ext4_mount_domain(raw_dev.data() as usize);
-        let mut mounted_instances = mount_domain.instances.lock();
-        let existing_writable: Vec<_> = {
-            mounted_instances.retain(|entry| entry.strong_count() != 0);
-            mounted_instances
-                .iter()
-                .filter_map(Weak::upgrade)
-                .filter(|fs| !fs._mount_options.read_only)
-                .collect()
-        };
-        let mut admission_rollback = DelallocAdmissionRollback::default();
-        if !mount_options.read_only {
-            for existing in &existing_writable {
-                let was_open = existing.delalloc_admission_open();
-                if was_open {
-                    // Record before close/drain so every failure exit restores
-                    // this instance, including an error from the drain itself.
-                    admission_rollback.record(existing.clone());
+        let owner = ProcessManager::current_user_ns();
+        let mut canonical = mount_domain.canonical.lock();
+        loop {
+            let Some(existing) = canonical.upgrade() else {
+                break;
+            };
+            let existing_state = existing.mount_state.lock().clone();
+            if let Some(state) = existing_state {
+                if state.shutdown_started() {
+                    // Final shutdown may need the filesystem/device domain.
+                    // Never wait for it while holding the factory lock.
+                    drop(canonical);
+                    state.wait_for_shutdown_if_started();
+                    canonical = mount_domain.canonical.lock();
+                    if canonical
+                        .upgrade()
+                        .is_some_and(|current| Arc::ptr_eq(&current, &existing))
+                    {
+                        *canonical = Weak::new();
+                    }
+                    continue;
                 }
-                existing.close_delalloc_admission();
-                existing.drain_registered_delalloc()?;
             }
+            if existing._mount_options.read_only != mount_options.read_only
+                || !Arc::ptr_eq(&existing.mount_owner, &owner)
+            {
+                return Err(SystemError::EBUSY);
+            }
+            // Like get_tree_bdev, a compatible mount reuses the existing
+            // configuration and never replays a live filesystem's journal.
+            return Ok(existing);
         }
-        let delalloc_unique_writable = !mount_options.read_only && existing_writable.is_empty();
         // Writable mounts recover the journal and the validated legacy orphan
         // chain before this filesystem is published to the VFS.
         let prospective = (|| {
@@ -1318,14 +1370,24 @@ impl Ext4FileSystem {
             let root_attr = fs.getattr(another_ext4::EXT4_ROOT_INO)?;
             Ok::<_, SystemError>((fs, root_attr))
         })();
-        let (fs, root_attr) = prospective?;
+        let (mut fs, root_attr) = prospective?;
+        // Recovery is complete. Every runtime metadata path now uses the
+        // authoritative batch view before this mount becomes visible.
+        fs.enable_batching(256)?;
         let metadata_mutation_wait = Arc::new(Ext4MetadataMutationWait::new());
         fs.install_metadata_mutation_waker(metadata_mutation_wait.clone())?;
-        let delalloc_mapper_authority = if !delalloc_unique_writable {
+        let delalloc_mapper_authority = if mount_options.read_only {
             None
         } else {
             fs.delalloc_append_mapper_authority().ok()
         };
+        let journal = fs
+            .batch_progress()
+            .map(|_| Ext4Journal::new(metadata_mutation_wait.clone()))
+            .transpose()?;
+        if let Some(journal) = &journal {
+            fs.install_batch_progress_waker(journal.progress_waker());
+        }
         let root_inode: Arc<LockedExt4Inode> =
             Arc::new_cyclic(|self_ref: &Weak<LockedExt4Inode>| LockedExt4Inode {
                 inner: Mutex::new(Ext4Inode::new_mount_root(
@@ -1348,6 +1410,7 @@ impl Ext4FileSystem {
             });
 
         let fs = Arc::new(Ext4FileSystem {
+            journal,
             writeback_domain: PageCacheWritebackDomain::new(),
             fs,
             raw_dev,
@@ -1356,6 +1419,8 @@ impl Ext4FileSystem {
             dirty_inodes: Mutex::new(Vec::new()),
             inode_table: Mutex::new(BTreeMap::new()),
             _mount_domain: mount_domain.clone(),
+            mount_owner: owner,
+            mount_state: Mutex::new(None),
             delalloc_mapper_authority,
             delalloc_inodes: Mutex::new(BTreeMap::new()),
             delalloc_wait: WaitQueue::default(),
@@ -1369,14 +1434,6 @@ impl Ext4FileSystem {
             eviction_wait: WaitQueue::default(),
             _mount_options: mount_options,
         });
-        mounted_instances.push(Arc::downgrade(&fs));
-        admission_rollback.commit();
-        drop(mounted_instances);
-        let mut stats_registry = EXT4_STATS_REGISTRY.lock();
-        stats_registry.retain(|entry| entry.strong_count() != 0);
-        stats_registry.push(Arc::downgrade(&fs));
-        drop(stats_registry);
-
         let mut guard = fs.root_inode.inner.lock();
         guard.fs_ptr = Arc::downgrade(&fs);
         guard.cached_file_size = Some(root_attr.size);
@@ -1389,6 +1446,17 @@ impl Ext4FileSystem {
                 lifecycle: fs.root_inode.lifecycle().clone(),
             },
         );
+
+        if let Some(journal) = &fs.journal {
+            journal.start(&fs)?;
+        }
+        // Publish only after root back-pointers and canonical identity exist.
+        *canonical = Arc::downgrade(&fs);
+        drop(canonical);
+        let mut stats_registry = EXT4_STATS_REGISTRY.lock();
+        stats_registry.retain(|entry| entry.strong_count() != 0);
+        stats_registry.push(Arc::downgrade(&fs));
+        drop(stats_registry);
 
         Ok(fs)
     }
@@ -1428,6 +1496,11 @@ impl Drop for Ext4InodeTombstone {
 
 impl Drop for Ext4FileSystem {
     fn drop(&mut self) {
+        if let Some(journal) = &self.journal {
+            if let Err(error) = journal.stop_and_join() {
+                log::error!("ext4: journal worker cleanup failed: {:?}", error);
+            }
+        }
         if self.delalloc_inodes.lock().is_empty() {
             return;
         }

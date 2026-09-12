@@ -1259,9 +1259,15 @@ impl SuperBlockState {
         self.shutdown_wait.wake_all();
     }
 
+    /// A fresh mount must not revive a superblock whose final teardown won
+    /// the construction-pin race. Dead instances may be replaced by a factory.
+    pub(crate) fn shutdown_started(&self) -> bool {
+        self.lifecycle.lock().state != SuperBlockLifecycleState::Active
+    }
+
     /// Wait only when this unmount started the final superblock shutdown.
     /// A still-active shared superblock needs no shutdown completion wait.
-    fn wait_for_shutdown_if_started(&self) {
+    pub(crate) fn wait_for_shutdown_if_started(&self) {
         self.shutdown_wait.wait_until(|| {
             let state = self.lifecycle.lock().state;
             (state != SuperBlockLifecycleState::Dying).then_some(())
@@ -1586,6 +1592,30 @@ pub struct MountFSInode {
 }
 
 impl MountFS {
+    /// Resolve one mount's superblock identity without performing backend I/O.
+    /// Bind/copy callers supply their state explicitly; ordinary mounts may
+    /// opt into a canonical state through the filesystem's narrow hook.
+    fn new_mount_superblock_state(
+        inner: &Arc<dyn FileSystem>,
+        flags: MountFlags,
+    ) -> Result<Arc<SuperBlockState>, SystemError> {
+        if let Some(state) = inner.shared_mount_superblock_state(flags) {
+            if state.shutdown_started() {
+                return Err(SystemError::ESTALE);
+            }
+            if state.flags().contains(MountFlags::RDONLY) != flags.contains(MountFlags::RDONLY)
+                || !Arc::ptr_eq(state.owner_user_ns(), &ProcessManager::current_user_ns())
+            {
+                return Err(SystemError::EBUSY);
+            }
+            return Ok(state);
+        }
+        let owner = inner
+            .mount_owner_user_ns()
+            .unwrap_or_else(ProcessManager::current_user_ns);
+        Ok(Arc::new(SuperBlockState::new_with_owner(flags, owner)))
+    }
+
     pub fn new(
         inner_filesystem: Arc<dyn FileSystem>,
         root_inner_inode: Option<Arc<dyn IndexNode>>,
@@ -1595,18 +1625,13 @@ impl MountFS {
         mount_flags: MountFlags,
         mount_source: Option<String>,
     ) -> Result<Arc<Self>, SystemError> {
-        let owner_user_ns = inner_filesystem
-            .mount_owner_user_ns()
-            .unwrap_or_else(ProcessManager::current_user_ns);
-        let super_block_state =
-            Arc::new(SuperBlockState::new_with_owner(mount_flags, owner_user_ns));
+        let super_block_state = Self::new_mount_superblock_state(&inner_filesystem, mount_flags)?;
         if let Some(domain) = inner_filesystem.page_cache_writeback_domain() {
             domain.bind(&inner_filesystem, &super_block_state)?;
         }
-        assert!(
-            super_block_state.try_add_external_pin(),
-            "a fresh superblock accepts its construction reservation"
-        );
+        if !super_block_state.try_add_external_pin() {
+            return Err(SystemError::ESTALE);
+        }
         Ok(Self::new_with_super_block_state(
             inner_filesystem,
             root_inner_inode,
@@ -3178,6 +3203,7 @@ impl MountFS {
             return Ok(());
         }
 
+        let _sync_request = self.inner_filesystem.begin_sync_writeback();
         self.sync_inodes_of_mount()
     }
 
@@ -3240,6 +3266,11 @@ impl MountFS {
         if self.is_sb_readonly() {
             return Ok(());
         }
+
+        // Accepted filesystem metadata may complete the PageCache I/O below.
+        // Keep one request across this whole bounded sync, including later
+        // inode submissions, rather than allocating one guard per mapping.
+        let _sync_request = self.inner_filesystem.begin_sync_writeback();
 
         // writeback_inodes_sb(sb) — void
         let mut last_err = self.sync_inodes_of_mount();
@@ -4375,6 +4406,17 @@ impl MountFSInode {
             return Err(SystemError::EINVAL);
         }
 
+        let state = match super_block_state {
+            Some(state) => state,
+            None => MountFS::new_mount_superblock_state(&inner_fs, mount_flags)?,
+        };
+        // Root metadata is a backend operation. Keep final teardown from
+        // closing its admission before the construction pin has been acquired.
+        let _umount = state.umount_read();
+        if state.shutdown_started() {
+            return Err(SystemError::ESTALE);
+        }
+
         let metadata = self.dentry.inode.metadata()?;
         let root_metadata = root_inner_inode.metadata()?;
         let is_dir = metadata.file_type == FileType::Dir;
@@ -4388,7 +4430,7 @@ impl MountFSInode {
             root_inner_inode,
             root_dentry,
             mount_flags,
-            super_block_state,
+            Some(state.clone()),
             bind_source,
         )
     }
@@ -4422,12 +4464,7 @@ impl MountFSInode {
 
         let super_block_state = match super_block_state {
             Some(super_block_state) => super_block_state,
-            None => {
-                let owner_user_ns = inner_fs
-                    .mount_owner_user_ns()
-                    .unwrap_or_else(ProcessManager::current_user_ns);
-                Arc::new(SuperBlockState::new_with_owner(mount_flags, owner_user_ns))
-            }
+            None => MountFS::new_mount_superblock_state(&inner_fs, mount_flags)?,
         };
         if let Some(domain) = inner_fs.page_cache_writeback_domain() {
             domain.bind(&inner_fs, &super_block_state)?;
@@ -5733,6 +5770,10 @@ impl IndexNode for MountFSInode {
 }
 
 impl FileSystem for MountFS {
+    fn begin_sync_writeback(&self) -> Option<alloc::boxed::Box<dyn super::FileSystemSyncGuard>> {
+        self.inner_filesystem.begin_sync_writeback()
+    }
+
     fn page_cache_writeback_domain(
         &self,
     ) -> Option<&Arc<crate::filesystem::page_cache::PageCacheWritebackDomain>> {

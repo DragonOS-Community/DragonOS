@@ -12,13 +12,21 @@ mod alloc;
 mod dir;
 mod extent;
 mod high_level;
+mod metadata_gate;
+#[cfg(test)]
+use metadata_gate::METADATA_GATE_DIRECT_MAX;
+use metadata_gate::{MetadataMutationGate, MetadataMutationGuard};
+pub use metadata_gate::{MetadataMutationWaker, MetadataWriterWait};
 mod journal;
+mod journal_batch;
+pub use journal_batch::BatchProgress;
 mod journal_recovery;
 mod journal_transaction;
 mod link;
 mod low_level;
 mod orphan;
 mod rw;
+mod xattr;
 mod xattr_reclaim;
 
 #[cfg(any(test, feature = "test-api"))]
@@ -540,156 +548,12 @@ impl PrepareStats {
 pub(super) enum MetadataMutationMode {
     ReadOnly,
     Journal(journal_transaction::JournalTransactionCore),
+    Batched(journal_batch::JournalBatchCore),
     Direct(journal_transaction::DirectTransactionCore),
 }
 
-/// Non-blocking gate separating legacy direct writers from journal snapshots.
-///
-/// The top bit denotes an exclusive transactional owner; the remaining bits
-/// count direct writers. Acquisition is lock-free rather than per-caller
-/// wait-free: it never sleeps or waits for an incompatible owner, which is
-/// essential because guards intentionally span block-device I/O.
-pub trait MetadataMutationWaker: Send + Sync {
-    /// Wake every upper-layer waiter which may have observed the previous
-    /// metadata-mutation generation.
-    ///
-    /// This callback runs after a guard releases the atomic gate state or when
-    /// the filesystem first enters fail-stop. It must not block or call back
-    /// into this filesystem.
-    fn wake_all(&self);
-}
-
-struct MetadataMutationGate {
-    state: AtomicUsize,
-    generation: AtomicU64,
-    waker_installed: AtomicBool,
-    waker: spin::Once<Arc<dyn MetadataMutationWaker>>,
-}
-
-const METADATA_GATE_EXCLUSIVE: usize = 1usize << (usize::BITS - 1);
-const METADATA_GATE_DIRECT_MAX: usize = METADATA_GATE_EXCLUSIVE - 1;
 const P6_2_STATS_ENABLED: bool = option_env!("DRAGONOS_P6_2_STATS").is_some();
 static NEXT_PREPARE_STATS_GENERATION: AtomicUsize = AtomicUsize::new(1);
-
-impl MetadataMutationGate {
-    const fn new() -> Self {
-        Self {
-            state: AtomicUsize::new(0),
-            generation: AtomicU64::new(0),
-            waker_installed: AtomicBool::new(false),
-            waker: spin::Once::new(),
-        }
-    }
-
-    fn install_waker(&self, waker: Arc<dyn MetadataMutationWaker>) -> Result<()> {
-        if self
-            .waker_installed
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return Err(Ext4Error::new(ErrCode::EINVAL));
-        }
-        self.waker.call_once(|| waker);
-        Ok(())
-    }
-
-    #[inline]
-    fn generation(&self) -> u64 {
-        self.generation.load(Ordering::Acquire)
-    }
-
-    fn notify_progress(&self) {
-        self.generation.fetch_add(1, Ordering::Release);
-        if let Some(waker) = self.waker.get() {
-            waker.wake_all();
-        }
-    }
-
-    fn try_direct(&self) -> Result<MetadataMutationGuard<'_>> {
-        let mut state = self.state.load(Ordering::Relaxed);
-        loop {
-            if state & METADATA_GATE_EXCLUSIVE != 0 {
-                return Err(Ext4Error::new(ErrCode::EAGAIN));
-            }
-            if state == METADATA_GATE_DIRECT_MAX {
-                // This is a corrupted/impossible owner count, not contention:
-                // no finite gate-release event can make a fabricated maximum
-                // count a safe acquisition.
-                return Err(Ext4Error::new(ErrCode::EIO));
-            }
-            match self.state.compare_exchange_weak(
-                state,
-                state + 1,
-                Ordering::Acquire,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => {
-                    return Ok(MetadataMutationGuard {
-                        gate: self,
-                        exclusive: false,
-                    });
-                }
-                // Retry only a compatible direct-count collision. Observing an
-                // exclusive owner is rejected at the top of the next iteration;
-                // no acquisition waits for an I/O-spanning owner to depart.
-                //
-                // Do not turn a retry limit into EAGAIN: generation advances
-                // only when the last direct owner exits, so compatible count
-                // churn has no matching progress event for an upper-layer
-                // waiter. Such a rejection could strand an otherwise
-                // compatible caller until the whole direct cohort drains.
-                Err(observed) => state = observed,
-            }
-        }
-    }
-
-    fn try_transactional(&self) -> Result<MetadataMutationGuard<'_>> {
-        self.state
-            .compare_exchange(
-                0,
-                METADATA_GATE_EXCLUSIVE,
-                Ordering::Acquire,
-                Ordering::Relaxed,
-            )
-            .map_err(|_| Ext4Error::new(ErrCode::EAGAIN))?;
-        Ok(MetadataMutationGuard {
-            gate: self,
-            exclusive: true,
-        })
-    }
-}
-
-pub(super) struct MetadataMutationGuard<'a> {
-    gate: &'a MetadataMutationGate,
-    exclusive: bool,
-}
-
-impl core::fmt::Debug for MetadataMutationGuard<'_> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("MetadataMutationGuard")
-            .field("exclusive", &self.exclusive)
-            .finish_non_exhaustive()
-    }
-}
-
-impl Drop for MetadataMutationGuard<'_> {
-    fn drop(&mut self) {
-        if self.exclusive {
-            debug_assert_eq!(
-                self.gate.state.load(Ordering::Relaxed),
-                METADATA_GATE_EXCLUSIVE
-            );
-            self.gate.state.store(0, Ordering::Release);
-            self.gate.notify_progress();
-        } else {
-            let previous = self.gate.state.fetch_sub(1, Ordering::Release);
-            debug_assert!(previous > 0 && previous < METADATA_GATE_EXCLUSIVE);
-            if previous == 1 {
-                self.gate.notify_progress();
-            }
-        }
-    }
-}
 
 /// Maximum number of inodes to cache in memory.
 const INODE_CACHE_SIZE: usize = 512;
@@ -1050,16 +914,37 @@ impl Ext4 {
         self.metadata_mutation_barrier.install_waker(waker)
     }
 
+    /// Install batch progress separately: a read-view release changes gate
+    /// progress but supplies no journal work. Install before publication.
+    pub fn install_batch_progress_waker(&self, waker: Arc<dyn MetadataMutationWaker>) {
+        if let MetadataMutationMode::Batched(core) = &self.metadata_mode {
+            core.install_waker(waker);
+        }
+    }
+
     /// Snapshot the metadata gate progress generation before attempting an
     /// operation which may return gate-contention `EAGAIN`.
     #[inline]
     pub fn metadata_mutation_generation(&self) -> u64 {
-        self.metadata_mutation_barrier.generation()
+        let gate = self.metadata_mutation_barrier.generation();
+        // Both monotone progress domains participate in the equality token:
+        // a completed checkpoint can unblock capacity without releasing a gate.
+        match &self.metadata_mode {
+            MetadataMutationMode::Batched(core) => gate.wrapping_add(core.progress().generation),
+            _ => gate,
+        }
+    }
+
+    /// Hold across an exclusive operation's contention wait and next retry.
+    /// Read-only retries must not register a writer preference of their own.
+    pub fn begin_metadata_writer_wait(&self) -> Result<Option<MetadataWriterWait<'_>>> {
+        self.metadata_mutation_barrier.writer_wait()
     }
 
     /// Whether all future metadata mutations are terminally rejected.
     pub fn metadata_mutations_terminal(&self) -> bool {
         self.poisoned.lock().is_some()
+            || matches!(&self.metadata_mode, MetadataMutationMode::Batched(core) if core.is_poisoned())
     }
 
     /// Host-only synchronization point immediately before fail-stop tries to
@@ -1118,17 +1003,13 @@ impl Ext4 {
         }
         drop(poisoned);
         if first {
+            if let MetadataMutationMode::Batched(core) = &self.metadata_mode {
+                core.fail_stop();
+            }
             // A fail-stop can occur without a live gate owner. Publish it as
             // progress so upper waiters do not sleep forever awaiting Drop.
             self.metadata_mutation_barrier.notify_progress();
         }
-    }
-
-    pub(super) fn poison_on_error<T>(&self, result: Result<T>) -> Result<T> {
-        if result.is_err() {
-            self.poison(ErrCode::EIO);
-        }
-        result
     }
 
     pub(super) fn lock_inode_mutations(
@@ -1145,6 +1026,16 @@ impl Ext4 {
             .into_iter()
             .map(|index| self.inode_mutation_locks[index].lock())
             .collect()
+    }
+
+    /// Keep a multi-block public read in one logical metadata view. Compatible
+    /// readers can overlap; publication is excluded, checkpoint I/O is not.
+    pub(super) fn lock_metadata_read_view(&self) -> Result<Option<MetadataMutationGuard<'_>>> {
+        if matches!(self.metadata_mode, MetadataMutationMode::Batched(_)) {
+            self.metadata_mutation_barrier.try_read_view().map(Some)
+        } else {
+            Ok(None)
+        }
     }
 
     /// Enter a complete legacy/direct metadata mutation operation.

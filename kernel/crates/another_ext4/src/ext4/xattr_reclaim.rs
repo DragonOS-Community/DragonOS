@@ -81,6 +81,13 @@ impl Ext4 {
         if block_id == 0 {
             return Ok(None);
         }
+        // Detaching one external reference releases this inode's block
+        // charge even when another inode still owns the shared block.
+        let remaining_blocks = inode
+            .inode
+            .fs_block_count()
+            .checked_sub(1)
+            .ok_or_else(|| Ext4Error::new(ErrCode::EIO))?;
         let sb = self.read_super_block_cached();
         self.validate_xattr_block_allocation(transaction, block_id)?;
         let image = transaction.read(self.block_device.as_ref(), block_id)?;
@@ -120,10 +127,12 @@ impl Ext4 {
             // transaction as the shared reference-count decrement, otherwise
             // a restartable reclaim would decrement the block repeatedly.
             inode.inode.set_xattr_block(0);
+            inode.inode.set_fs_block_count(remaining_blocks);
             self.transaction_stage_inode_with_csum(transaction, inode)?;
             Ok(None)
         } else {
             inode.inode.set_xattr_block(0);
+            inode.inode.set_fs_block_count(remaining_blocks);
             self.transaction_stage_inode_with_csum(transaction, inode)?;
             Ok(Some(block_id))
         }

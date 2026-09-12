@@ -108,6 +108,12 @@ fn sync_file_range(
     };
     let manager = page_cache.manager();
 
+    // WRITE-only remains asynchronous. Waiting ranges must push accepted
+    // filesystem metadata before their first PageCache completion wait.
+    let _sync_request = flags
+        .intersects(SyncFileRangeFlags::WAIT_BEFORE | SyncFileRangeFlags::WAIT_AFTER)
+        .then(|| inode.fs().begin_sync_writeback());
+
     if flags.contains(SyncFileRangeFlags::WAIT_BEFORE) {
         manager.wait_writeback_range(start_index, end_index)?;
         file.check_and_advance_wb_error(&page_cache)?;

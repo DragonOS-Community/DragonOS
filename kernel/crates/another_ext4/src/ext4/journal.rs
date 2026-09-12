@@ -4,6 +4,15 @@ use crate::ext4_defs::{AsBytes, Block, BlockDevice, InodeRef, SuperBlock};
 use crate::jbd2::Superblock as JournalSuperblock;
 use crate::prelude::*;
 
+/// Publication is deliberately separate from disk commit failures. Accepted
+/// operations may never be rolled back, even if the worker later fails before
+/// writing a commit record.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum MetadataPublication {
+    Durable,
+    Accepted(u64),
+}
+
 fn validate_journal_inode(sb: &SuperBlock, inode: &InodeRef) -> Result<()> {
     if !inode.inode.is_file()
         || !inode.inode.uses_extents()
@@ -156,7 +165,10 @@ impl Ext4 {
     }
 
     pub fn uses_journal(&self) -> bool {
-        matches!(self.metadata_mode, MetadataMutationMode::Journal(_))
+        matches!(
+            self.metadata_mode,
+            MetadataMutationMode::Journal(_) | MetadataMutationMode::Batched(_)
+        )
     }
 
     pub(super) fn supports_direct_range_stage(&self) -> bool {
@@ -168,7 +180,7 @@ impl Ext4 {
         // Clearing RECOVER is a metadata state transition and must not race a
         // direct writer even if the VFS normally excludes writers at umount.
         let _metadata_guard = self.lock_transactional_metadata_mutation()?;
-        let journal = match &self.metadata_mode {
+        let can_shutdown = match &self.metadata_mode {
             MetadataMutationMode::ReadOnly => return Err(Ext4Error::new(ErrCode::EROFS)),
             MetadataMutationMode::Direct(core) => {
                 if !core.can_shutdown() || self.poisoned.lock().is_some() {
@@ -187,9 +199,10 @@ impl Ext4 {
                 }
                 return Ok(());
             }
-            MetadataMutationMode::Journal(core) => core,
+            MetadataMutationMode::Journal(core) => core.can_shutdown(),
+            MetadataMutationMode::Batched(core) => core.can_shutdown(),
         };
-        if !journal.can_shutdown() {
+        if !can_shutdown {
             return Err(Ext4Error::new(ErrCode::EIO));
         }
         // Every synchronous transaction checkpoints and clears s_start before
@@ -197,8 +210,75 @@ impl Ext4 {
         // to clear RECOVER as Linux does at clean shutdown.
         let mut sb = self.read_super_block_cached();
         sb.set_incompatible_feature(SuperBlock::FEATURE_INCOMPAT_RECOVER, false);
-        self.write_super_block(&sb)?;
+        let mut block = self.block_device.read_block(0)?;
+        sb.set_checksum();
+        block.write_offset_as(crate::constants::BASE_OFFSET, &sb);
+        self.block_device.write_block(&block)?;
         self.block_device.flush()
+    }
+
+    /// Consume the recovered synchronous journal before the mount is exposed.
+    /// All runtime metadata writers must already use private operations.
+    pub fn enable_batching(&mut self, block_budget: usize) -> Result<()> {
+        if matches!(self.metadata_mode, MetadataMutationMode::Journal(_)) {
+            let old = core::mem::replace(&mut self.metadata_mode, MetadataMutationMode::ReadOnly);
+            let MetadataMutationMode::Journal(journal) = old else {
+                unreachable!()
+            };
+            self.metadata_mode = MetadataMutationMode::Batched(journal.into_batch(block_budget)?);
+        }
+        Ok(())
+    }
+
+    pub fn batch_progress(&self) -> Option<super::BatchProgress> {
+        match &self.metadata_mode {
+            MetadataMutationMode::Batched(core) => Some(core.progress()),
+            _ => None,
+        }
+    }
+
+    pub fn request_batch_commit(&self) {
+        if let MetadataMutationMode::Batched(core) = &self.metadata_mode {
+            core.request_seal();
+        }
+    }
+
+    pub fn commit_pending_batch(&self) -> Result<Option<u64>> {
+        match &self.metadata_mode {
+            MetadataMutationMode::Batched(core) => core
+                .commit_pending(self.block_device.as_ref())
+                .map_err(|failure| {
+                    self.poison(ErrCode::EIO);
+                    failure.error
+                }),
+            _ => Ok(None),
+        }
+    }
+
+    pub fn close_batch_admission(&self) {
+        if let MetadataMutationMode::Batched(core) = &self.metadata_mode {
+            core.close();
+        }
+    }
+
+    pub(super) fn commit_metadata_operation(
+        &self,
+        transaction: journal_transaction::Transaction<'_>,
+    ) -> core::result::Result<MetadataPublication, journal_transaction::CommitError> {
+        if transaction.is_batch() {
+            transaction
+                .publish(self)
+                .map(MetadataPublication::Accepted)
+                .map_err(|error| journal_transaction::CommitError {
+                    error,
+                    failure: journal_transaction::CommitFailure::BeforeCommit,
+                    poisoned: self.metadata_mutations_terminal(),
+                })
+        } else {
+            transaction
+                .commit(self.block_device.as_ref(), self)
+                .map(|()| MetadataPublication::Durable)
+        }
     }
 
     #[allow(dead_code)]
@@ -209,6 +289,7 @@ impl Ext4 {
         let result = match &self.metadata_mode {
             MetadataMutationMode::ReadOnly => Err(Ext4Error::new(ErrCode::EROFS)),
             MetadataMutationMode::Journal(core) => core.start(credits),
+            MetadataMutationMode::Batched(core) => return core.start(credits),
             MetadataMutationMode::Direct(core) => core.start(credits),
         };
         self.normalize_transaction_start(result)
@@ -217,6 +298,7 @@ impl Ext4 {
     pub(super) fn transaction_credits_fit(&self, credits: usize) -> Result<bool> {
         match &self.metadata_mode {
             MetadataMutationMode::Journal(core) => core.credits_fit(credits),
+            MetadataMutationMode::Batched(core) => core.credits_fit(credits),
             MetadataMutationMode::ReadOnly => Err(Ext4Error::new(ErrCode::EROFS)),
             MetadataMutationMode::Direct(_) => Ok(true),
         }
@@ -229,7 +311,9 @@ impl Ext4 {
         let result = match &self.metadata_mode {
             MetadataMutationMode::Direct(core) => core.start_direct_range(credits),
             MetadataMutationMode::ReadOnly => Err(Ext4Error::new(ErrCode::EROFS)),
-            MetadataMutationMode::Journal(_) => Err(Ext4Error::new(ErrCode::ENOTSUP)),
+            MetadataMutationMode::Journal(_) | MetadataMutationMode::Batched(_) => {
+                Err(Ext4Error::new(ErrCode::ENOTSUP))
+            }
         };
         self.normalize_transaction_start(result)
     }
@@ -394,6 +478,7 @@ impl Ext4 {
     pub(super) fn journal_owns_block_range(&self, start: PBlockId, end: PBlockId) -> bool {
         match &self.metadata_mode {
             MetadataMutationMode::Journal(journal) => journal.owns_block_range(start, end),
+            MetadataMutationMode::Batched(journal) => journal.owns_block_range(start, end),
             MetadataMutationMode::ReadOnly | MetadataMutationMode::Direct(_) => false,
         }
     }
@@ -405,8 +490,9 @@ impl journal_transaction::CachePublisher for Ext4 {
         // validated bitmap/table addresses. Therefore system_metadata_ranges
         // remains immutable here; journal replay is the only path which can
         // replace the complete SB/BGD snapshot and rebuilds it explicitly.
-        // Home blocks are durable at this point.  Decode cacheable value
-        // snapshots directly from the transaction-owned images; all updates
+        // This is the logical publication boundary (also durable for the
+        // synchronous backend). Decode value snapshots from private images;
+        // a batched checkpoint never calls this publisher. All updates
         // below are infallible and allocation-free.
         if let Some(block0) = blocks.get(&0) {
             let sb = SuperBlock::from_bytes(&block0.bytes()[crate::constants::BASE_OFFSET..]);

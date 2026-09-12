@@ -78,85 +78,6 @@ impl Ext4 {
         u32::try_from(size / BLOCK_SIZE as u64).map_err(|_| Ext4Error::new(ErrCode::EIO))
     }
 
-    pub(super) fn dir_has_insert_space(
-        &self,
-        dir: &InodeRef,
-        child: &InodeRef,
-        name: &str,
-    ) -> Result<bool> {
-        Self::validate_dir_name(name)?;
-        for iblock in 0..Self::dir_data_block_count(dir)? {
-            let fblock = self.extent_query(dir, iblock)?;
-            let mut candidate = DirBlock::new(self.read_block(fblock)?);
-            if self.validate_dir_block(dir, iblock, &candidate)? == DirBlockLayout::Htree {
-                continue;
-            }
-            if candidate.insert(
-                name,
-                child.id,
-                child.inode.file_type(),
-                self.metadata_csum_enabled(),
-            ) {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    }
-
-    /// Prepare one checksum-valid empty directory block without publishing a
-    /// name.  If initialization fails, the allocation is rolled back before
-    /// any extent references it.  Once extent publication starts, failures are
-    /// indeterminate and the caller must poison the mount.
-    pub(super) fn prepare_empty_dir_slot(&self, dir: &mut InodeRef) -> Result<()> {
-        let mut empty = DirBlock::new(Block::new(0, Box::new([0; BLOCK_SIZE])));
-        let metadata_csum = self.metadata_csum_enabled();
-        empty.init(metadata_csum);
-        self.set_dir_block_checksum(dir, &mut empty, DirBlockLayout::Leaf)?;
-        let iblock = self.extent_next_data_lblock(dir)?;
-        let old_size = dir.inode.size();
-        let old_blocks = dir.inode.fs_block_count();
-        let new_size = old_size
-            .checked_add(BLOCK_SIZE as u64)
-            .ok_or_else(|| crate::format_error!(ErrCode::EFBIG, "Directory size overflow"))?;
-        let new_blocks = old_blocks.checked_add(1).ok_or_else(|| {
-            crate::format_error!(ErrCode::EFBIG, "Directory block count overflow")
-        })?;
-        dir.inode.set_size(new_size);
-        dir.inode.set_fs_block_count(new_blocks);
-        if let Err(error) = self.extent_query_or_create_initialized(
-            dir,
-            iblock,
-            1,
-            Some(empty.block().data.clone()),
-        ) {
-            dir.inode.set_size(old_size);
-            dir.inode.set_fs_block_count(old_blocks);
-            // Extent publication may have reached disk before reporting an
-            // error; freeing pblock could create a dangling mapping.
-            self.poison(ErrCode::EIO);
-            return Err(error);
-        }
-        let total_blocks = match self.extent_all_data_blocks(dir).and_then(|data| {
-            self.extent_all_tree_blocks(dir).and_then(|tree| {
-                data.len().checked_add(tree.len()).ok_or_else(|| {
-                    crate::format_error!(ErrCode::EFBIG, "Directory blocks overflow")
-                })
-            })
-        }) {
-            Ok(total) => total,
-            Err(error) => {
-                self.poison(ErrCode::EIO);
-                return Err(error);
-            }
-        };
-        dir.inode.set_fs_block_count(total_blocks as u64);
-        if let Err(error) = self.write_inode_with_csum(dir) {
-            self.poison(ErrCode::EIO);
-            return Err(error);
-        }
-        Ok(())
-    }
-
     /// Stage insertion into an existing directory data block.  The read-only
     /// scan consumes no journal credit; only the matching free-space block is
     /// copied into the transaction image.  Directory growth requires extent
@@ -171,7 +92,7 @@ impl Ext4 {
     ) -> Result<()> {
         Self::validate_dir_name(name)?;
         for iblock in 0..Self::dir_data_block_count(dir)? {
-            let fblock = self.extent_query(dir, iblock)?;
+            let fblock = self.transaction_extent_query(transaction, dir, iblock)?;
             let view = transaction.read(self.block_device.as_ref(), fblock)?;
             let mut dir_block = DirBlock::new(Block::new(fblock, Box::new(*view)));
             let layout = self.validate_dir_block(dir, iblock, &dir_block)?;
@@ -194,6 +115,59 @@ impl Ext4 {
             "Atomic relink requires free space in directory {}",
             dir.id
         );
+    }
+
+    /// Insert a name, including any directory/extent growth, in one private
+    /// operation. Reuse the existing insertion and right-spine algorithms;
+    /// none of the allocation or new directory contents reaches home early.
+    pub(super) fn transaction_dir_add(
+        &self,
+        transaction: &mut super::journal_transaction::Transaction<'_>,
+        dir: &mut InodeRef,
+        child: &InodeRef,
+        name: &str,
+    ) -> Result<()> {
+        match self.transaction_dir_add_existing(transaction, dir, child, name) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.code() == ErrCode::ENOSPC => {}
+            Err(error) => return Err(error),
+        }
+        let iblock = Self::dir_data_block_count(dir)?;
+        let plan = self.transaction_right_spine_append_plan(transaction, dir, iblock)?;
+        let home =
+            self.transaction_alloc_metadata_block(transaction, dir.id, plan.preferred_first)?;
+        let node_count = if plan.can_merge(home, 1) {
+            0
+        } else {
+            plan.new_nodes()
+        };
+        let mut nodes = Vec::new();
+        nodes
+            .try_reserve_exact(node_count)
+            .map_err(|_| Ext4Error::new(ErrCode::ENOMEM))?;
+        for _ in 0..node_count {
+            nodes.push(self.transaction_alloc_metadata_block(transaction, dir.id, Some(home))?);
+        }
+        let mut block = DirBlock::new(Block::new(home, Box::new([0; BLOCK_SIZE])));
+        block.init(self.metadata_csum_enabled());
+        if !block.insert(
+            name,
+            child.id,
+            child.inode.file_type(),
+            self.metadata_csum_enabled(),
+        ) {
+            return Err(Ext4Error::new(ErrCode::EIO));
+        }
+        self.set_dir_block_checksum(dir, &mut block, DirBlockLayout::Leaf)?;
+        transaction.stage(home, block.block().data.clone())?;
+        self.stage_journaled_right_spine_append(transaction, dir, &plan, &nodes, home, 1)?;
+        let size = dir
+            .inode
+            .size()
+            .checked_add(BLOCK_SIZE as u64)
+            .ok_or_else(|| Ext4Error::new(ErrCode::EFBIG))?;
+        dir.inode.set_size(size);
+        self.transaction_stage_inode_with_csum(transaction, dir)
     }
 
     /// Find a directory entry that matches a given name under a parent directory
@@ -331,43 +305,6 @@ impl Ext4 {
         Ok(())
     }
 
-    /// Remove a entry from a directory
-    pub(super) fn dir_remove_entry(&self, dir: &InodeRef, name: &str) -> Result<()> {
-        Self::validate_dir_name(name)?;
-        trace!("Dir remove entry: dir {}, name {}", dir.id, name);
-        let total_blocks = Self::dir_data_block_count(dir)?;
-        // Check each block
-        let mut iblock: LBlockId = 0;
-        while iblock < total_blocks {
-            // Get the parent physical block id
-            let fblock = self.extent_query(dir, iblock)?;
-            // Load the block from disk
-            let mut dir_block = DirBlock::new(self.read_block(fblock)?);
-            let layout = self.validate_dir_block(dir, iblock, &dir_block)?;
-            if layout == DirBlockLayout::Htree {
-                iblock += 1;
-                continue;
-            }
-            // Try removing the entry
-            if dir_block.remove(name, self.metadata_csum_enabled()) {
-                // Update checksum
-                self.set_dir_block_checksum(dir, &mut dir_block, layout)?;
-                // Write the block back to disk
-                self.write_block(dir_block.block())?;
-                return Ok(());
-            }
-            // Current block has no enough space
-            iblock += 1;
-        }
-        // Not found the target entry
-        return_error!(
-            ErrCode::ENOENT,
-            "Directory entry not found: dir {}, name {}",
-            dir.id,
-            name
-        );
-    }
-
     /// Stage removal of a directory entry in a transaction-private image.
     /// No namespace change becomes visible on disk or through caches until the
     /// caller commits the same transaction as its link-count updates.
@@ -385,7 +322,7 @@ impl Ext4 {
         );
         let total_blocks = Self::dir_data_block_count(dir)?;
         for iblock in 0..total_blocks {
-            let fblock = self.extent_query(dir, iblock)?;
+            let fblock = self.transaction_extent_query(transaction, dir, iblock)?;
             // Scanning must not consume a credit for every non-matching block
             // in a large directory. `read` still observes an already-staged
             // image if this helper is composed with another directory update.
@@ -427,43 +364,6 @@ impl Ext4 {
         Ok(entries)
     }
 
-    /// Replace a directory entry's inode in place.
-    /// Used for atomic rename when target exists (equivalent to Linux ext4_setent).
-    pub(super) fn dir_replace_entry(
-        &self,
-        dir: &InodeRef,
-        name: &str,
-        new_inode: InodeId,
-        new_type: FileType,
-    ) -> Result<()> {
-        Self::validate_dir_name(name)?;
-        trace!(
-            "Dir replace entry: dir {}, name {}, new_inode {}",
-            dir.id,
-            name,
-            new_inode
-        );
-        let total_blocks = Self::dir_data_block_count(dir)?;
-        let mut iblock: LBlockId = 0;
-        while iblock < total_blocks {
-            let fblock = self.extent_query(dir, iblock)?;
-            let mut dir_block = DirBlock::new(self.read_block(fblock)?);
-            let layout = self.validate_dir_block(dir, iblock, &dir_block)?;
-            if dir_block.replace(name, new_inode, new_type, self.metadata_csum_enabled()) {
-                self.set_dir_block_checksum(dir, &mut dir_block, layout)?;
-                self.write_block(dir_block.block())?;
-                return Ok(());
-            }
-            iblock += 1;
-        }
-        return_error!(
-            ErrCode::ENOENT,
-            "Directory entry not found for replace: dir {}, name {}",
-            dir.id,
-            name
-        );
-    }
-
     /// Stage an in-place directory-entry replacement in the caller's
     /// transaction (the JBD2 equivalent of Linux `ext4_setent()`).
     ///
@@ -489,7 +389,7 @@ impl Ext4 {
         );
         let total_blocks = Self::dir_data_block_count(dir)?;
         for iblock in 0..total_blocks {
-            let fblock = self.extent_query(dir, iblock)?;
+            let fblock = self.transaction_extent_query(transaction, dir, iblock)?;
             let view = transaction.read(self.block_device.as_ref(), fblock)?;
             let mut dir_block = DirBlock::new(Block::new(fblock, Box::new(*view)));
             let layout = self.validate_dir_block(dir, iblock, &dir_block)?;

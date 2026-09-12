@@ -996,9 +996,24 @@ impl Ext4 {
     /// header or entry.  Linux performs the equivalent check in
     /// `ext4_extent_block_csum_verify()`.
     fn read_extent_block(&self, inode_ref: &InodeRef, pblock: PBlockId) -> Result<Block> {
+        self.read_extent_block_from_view(inode_ref, pblock, None)
+    }
+
+    fn read_extent_block_from_view(
+        &self,
+        inode_ref: &InodeRef,
+        pblock: PBlockId,
+        transaction: Option<&super::journal_transaction::Transaction<'_>>,
+    ) -> Result<Block> {
         self.ensure_valid_pblock(inode_ref.id, pblock, "extent tree node")?;
         self.validate_data_blocks(pblock, 1)?;
-        let block = self.read_block(pblock)?;
+        let block = match transaction {
+            Some(tx) => Block::new(
+                pblock,
+                Box::new(*tx.read(self.block_device.as_ref(), pblock)?),
+            ),
+            None => self.read_block(pblock)?,
+        };
         self.prepare_stats.record_extent_io();
         self.verify_extent_block_checksum(inode_ref, &block.data[..])?;
         Ok(block)
@@ -1259,8 +1274,12 @@ impl Ext4 {
         image[tail_offset..tail_offset + 4].copy_from_slice(&checksum.to_le_bytes());
     }
 
-    /// Write an extent block to disk with checksum in the extent tail.
-    fn write_extent_block(&self, block: &mut Block, inode_ref: &InodeRef) -> Result<()> {
+    fn write_extent_block_with_metadata(
+        &self,
+        metadata: &mut super::rw::MetadataIo<'_, '_, '_>,
+        block: &mut Block,
+        inode_ref: &InodeRef,
+    ) -> Result<()> {
         let tail_offset = BLOCK_SIZE - core::mem::size_of::<crate::ext4_defs::ExtentTail>();
         let csum = extent_block_checksum(
             self.read_super_block_cached().metadata_checksum_seed(),
@@ -1270,7 +1289,8 @@ impl Ext4 {
         );
         // Write checksum into the tail
         block.data[tail_offset..tail_offset + 4].copy_from_slice(&csum.to_le_bytes());
-        self.write_block(block)
+        metadata
+            .write_block(block)
             .inspect(|_| self.prepare_stats.record_extent_io())
     }
 }
@@ -1295,7 +1315,25 @@ impl ExtentSearchStep {
 impl Ext4 {
     /// Given a logic block id, find the corresponding fs block id.
     pub(super) fn extent_query(&self, inode_ref: &InodeRef, iblock: LBlockId) -> Result<PBlockId> {
-        let path = self.find_extent(inode_ref, iblock)?;
+        self.extent_query_from_view(inode_ref, iblock, None)
+    }
+
+    pub(super) fn transaction_extent_query(
+        &self,
+        transaction: &super::journal_transaction::Transaction<'_>,
+        inode_ref: &InodeRef,
+        iblock: LBlockId,
+    ) -> Result<PBlockId> {
+        self.extent_query_from_view(inode_ref, iblock, Some(transaction))
+    }
+
+    fn extent_query_from_view(
+        &self,
+        inode_ref: &InodeRef,
+        iblock: LBlockId,
+        transaction: Option<&super::journal_transaction::Transaction<'_>>,
+    ) -> Result<PBlockId> {
+        let path = self.find_extent_from_view(inode_ref, iblock, transaction)?;
         // Leaf is the last element of the path
         let leaf = path.last().ok_or(format_error!(
             ErrCode::EIO,
@@ -1308,7 +1346,8 @@ impl Ext4 {
             let ex_node = if leaf.pblock != 0 {
                 // Load the extent node
                 self.ensure_valid_pblock(inode_ref.id, leaf.pblock, "extent leaf node")?;
-                block_data = self.read_extent_block(inode_ref, leaf.pblock)?;
+                block_data =
+                    self.read_extent_block_from_view(inode_ref, leaf.pblock, transaction)?;
                 // Load the next extent header
                 ExtentNode::from_bytes(&*block_data.data)
             } else {
@@ -1348,7 +1387,38 @@ impl Ext4 {
         block_count: u32,
         initial_image: Option<Box<[u8; BLOCK_SIZE]>>,
     ) -> Result<PBlockId> {
-        let path = self.find_extent(inode_ref, iblock)?;
+        let mut metadata = super::rw::MetadataIo::direct(self);
+        self.extent_query_or_create_with_metadata(
+            &mut metadata,
+            inode_ref,
+            iblock,
+            block_count,
+            initial_image,
+        )
+    }
+
+    pub(super) fn transaction_extent_query_or_create(
+        &self,
+        transaction: &mut super::journal_transaction::Transaction<'_>,
+        inode_ref: &mut InodeRef,
+        iblock: LBlockId,
+    ) -> Result<PBlockId> {
+        let mut metadata = super::rw::MetadataIo::transaction(self, transaction);
+        let home =
+            self.extent_query_or_create_with_metadata(&mut metadata, inode_ref, iblock, 1, None)?;
+        metadata.write_inode_with_csum(inode_ref)?;
+        Ok(home)
+    }
+
+    fn extent_query_or_create_with_metadata(
+        &self,
+        metadata: &mut super::rw::MetadataIo<'_, '_, '_>,
+        inode_ref: &mut InodeRef,
+        iblock: LBlockId,
+        block_count: u32,
+        initial_image: Option<Box<[u8; BLOCK_SIZE]>>,
+    ) -> Result<PBlockId> {
+        let path = self.find_extent_from_view(inode_ref, iblock, metadata.transaction_ref())?;
         // Leaf is the last element of the path
         let leaf = path.last().ok_or(format_error!(
             ErrCode::EIO,
@@ -1358,7 +1428,11 @@ impl Ext4 {
         // Note: block data must be defined here to keep it alive
         let mut block_data: Block;
         let ex_node = if leaf.pblock != 0 {
-            block_data = self.read_extent_block(inode_ref, leaf.pblock)?;
+            block_data = self.read_extent_block_from_view(
+                inode_ref,
+                leaf.pblock,
+                metadata.transaction_ref(),
+            )?;
             ExtentNodeMut::from_bytes(&mut *block_data.data)
         } else {
             // Root node
@@ -1391,9 +1465,9 @@ impl Ext4 {
                 // extent node.  Metadata-node allocations below continue to
                 // use alloc_block directly.
                 let fblock = if let Some(image) = initial_image {
-                    self.alloc_initialized_data_block(inode_ref, image)?
+                    metadata.allocate_initialized_data(inode_ref, image)?
                 } else {
-                    self.alloc_zeroed_data_block(inode_ref)?
+                    metadata.allocate_initialized_data(inode_ref, Box::new([0; BLOCK_SIZE]))?
                 };
                 let new_ext = Extent::new(iblock, fblock, block_count as u16);
 
@@ -1407,22 +1481,30 @@ impl Ext4 {
                         let prev_idx = insert_pos - 1;
                         if leaf_pblock != 0 {
                             // Re-read the leaf block and update
-                            let mut leaf_block = self.read_extent_block(inode_ref, leaf_pblock)?;
+                            let mut leaf_block = self.read_extent_block_from_view(
+                                inode_ref,
+                                leaf_pblock,
+                                metadata.transaction_ref(),
+                            )?;
                             let mut leaf_node = ExtentNodeMut::from_bytes(&mut *leaf_block.data);
                             *leaf_node.extent_mut_at(prev_idx) = merged;
-                            self.write_extent_block(&mut leaf_block, inode_ref)?;
+                            self.write_extent_block_with_metadata(
+                                metadata,
+                                &mut leaf_block,
+                                inode_ref,
+                            )?;
                         } else {
                             // Root node
                             let mut root = inode_ref.inode.extent_root_mut();
                             *root.extent_mut_at(prev_idx) = merged;
-                            self.write_inode_with_csum(inode_ref)?;
+                            metadata.write_inode_with_csum(inode_ref)?;
                         }
                         return Ok(fblock);
                     }
                 }
 
                 // Cannot merge, insert as a new extent entry
-                self.insert_extent(inode_ref, &path, &new_ext)?;
+                self.insert_extent(metadata, inode_ref, &path, &new_ext)?;
                 Ok(fblock)
             }
         }
@@ -1562,8 +1644,13 @@ impl Ext4 {
         Ok(())
     }
 
-    /// Find the given logic block id in the extent tree, return the search path
-    fn find_extent(&self, inode_ref: &InodeRef, iblock: LBlockId) -> Result<Vec<ExtentSearchStep>> {
+    /// Find a logical block in the selected live or operation-private view.
+    fn find_extent_from_view(
+        &self,
+        inode_ref: &InodeRef,
+        iblock: LBlockId,
+        transaction: Option<&super::journal_transaction::Transaction<'_>>,
+    ) -> Result<Vec<ExtentSearchStep>> {
         let mut path: Vec<ExtentSearchStep> = Vec::new();
         let mut ex_node = inode_ref.inode.extent_root();
         let mut pblock = 0;
@@ -1587,7 +1674,7 @@ impl Ext4 {
             let next = ex_idx.leaf();
             self.ensure_valid_pblock(inode_ref.id, next, "extent index target")?;
             // Note: block data cannot be released until the next assigment
-            block_data = self.read_extent_block(inode_ref, next)?;
+            block_data = self.read_extent_block_from_view(inode_ref, next, transaction)?;
             // Load the next extent header
             ex_node = ExtentNode::from_bytes(&*block_data.data);
             self.validate_extent_node(inode_ref.id, &ex_node)?;
@@ -1603,6 +1690,7 @@ impl Ext4 {
     /// Insert a new extent into the extent tree.
     fn insert_extent(
         &self,
+        metadata: &mut super::rw::MetadataIo<'_, '_, '_>,
         inode_ref: &mut InodeRef,
         path: &[ExtentSearchStep],
         new_ext: &Extent,
@@ -1617,20 +1705,21 @@ impl Ext4 {
             let mut leaf_node = inode_ref.inode.extent_root_mut();
             // Insert the extent
             let res = leaf_node.insert_extent(new_ext, leaf.index.unwrap_err());
-            self.write_inode_with_csum(inode_ref)?;
+            metadata.write_inode_with_csum(inode_ref)?;
             // Handle split
             return if let Err(split) = res {
-                self.split_root(inode_ref, &split)
+                self.split_root(metadata, inode_ref, &split)
             } else {
                 Ok(())
             };
         }
         // 2. Leaf is not root, load the leaf node
-        let mut leaf_block = self.read_extent_block(inode_ref, leaf.pblock)?;
+        let mut leaf_block =
+            self.read_extent_block_from_view(inode_ref, leaf.pblock, metadata.transaction_ref())?;
         let mut leaf_node = ExtentNodeMut::from_bytes(&mut *leaf_block.data);
         // Insert the extent
         let res = leaf_node.insert_extent(new_ext, leaf.index.unwrap_err());
-        self.write_extent_block(&mut leaf_block, inode_ref)?;
+        self.write_extent_block_with_metadata(metadata, &mut leaf_block, inode_ref)?;
         // Handle split
         if let Err(mut split) = res {
             // Handle split until root
@@ -1644,7 +1733,7 @@ impl Ext4 {
                         inode_ref.id
                     )
                 })?;
-                let res = self.split(inode_ref, parent.pblock, parent_index, &split)?;
+                let res = self.split(metadata, inode_ref, parent.pblock, parent_index, &split)?;
                 // Handle split again
                 if let Err(split_again) = res {
                     // Insertion to parent also causes split, continue to solve
@@ -1654,7 +1743,7 @@ impl Ext4 {
                 }
             }
             // Root node needs to be split
-            self.split_root(inode_ref, &split)
+            self.split_root(metadata, inode_ref, &split)
         } else {
             Ok(())
         }
@@ -1669,13 +1758,14 @@ impl Ext4 {
     /// This function will create a new leaf node to store the split part.
     fn split(
         &self,
+        metadata: &mut super::rw::MetadataIo<'_, '_, '_>,
         inode_ref: &mut InodeRef,
         parent_pblock: PBlockId,
         child_pos: usize,
         split: &[FakeExtent],
     ) -> Result<core::result::Result<(), Vec<FakeExtent>>> {
-        let right_bid = self.alloc_block(inode_ref)?;
-        let mut right_block = self.read_block(right_bid)?;
+        let right_bid = metadata.allocate_block(inode_ref)?;
+        let mut right_block = metadata.read_block(right_bid)?;
         let mut right_node = ExtentNodeMut::from_bytes(&mut *right_block.data);
 
         // Insert the split half to right node
@@ -1697,19 +1787,23 @@ impl Ext4 {
             let mut parent_node = inode_ref.inode.extent_root_mut();
             parent_depth = parent_node.header().depth();
             res = parent_node.insert_extent_index(&extent_index, child_pos + 1);
-            self.write_inode_with_csum(inode_ref)?;
+            metadata.write_inode_with_csum(inode_ref)?;
         } else {
             // Parent is not root
-            let mut parent_block = self.read_extent_block(inode_ref, parent_pblock)?;
+            let mut parent_block = self.read_extent_block_from_view(
+                inode_ref,
+                parent_pblock,
+                metadata.transaction_ref(),
+            )?;
             let mut parent_node = ExtentNodeMut::from_bytes(&mut *parent_block.data);
             parent_depth = parent_node.header().depth();
             res = parent_node.insert_extent_index(&extent_index, child_pos + 1);
-            self.write_extent_block(&mut parent_block, inode_ref)?;
+            self.write_extent_block_with_metadata(metadata, &mut parent_block, inode_ref)?;
         }
 
         // Right node is the child of parent, so its depth is 1 less than parent
         right_node.header_mut().set_depth(parent_depth - 1);
-        self.write_extent_block(&mut right_block, inode_ref)?;
+        self.write_extent_block_with_metadata(metadata, &mut right_block, inode_ref)?;
 
         Ok(res)
     }
@@ -1720,12 +1814,17 @@ impl Ext4 {
     /// The root node has already been split by calling `insert_extent` or
     /// `insert_extent_index`, and the split part is stored in `split`.
     /// This function will create a new leaf node to store the split part.
-    fn split_root(&self, inode_ref: &mut InodeRef, split: &[FakeExtent]) -> Result<()> {
+    fn split_root(
+        &self,
+        metadata: &mut super::rw::MetadataIo<'_, '_, '_>,
+        inode_ref: &mut InodeRef,
+        split: &[FakeExtent],
+    ) -> Result<()> {
         // Create left and right blocks
-        let l_bid = self.alloc_block(inode_ref)?;
-        let r_bid = self.alloc_block(inode_ref)?;
-        let mut l_block = self.read_block(l_bid)?;
-        let mut r_block = self.read_block(r_bid)?;
+        let l_bid = metadata.allocate_block(inode_ref)?;
+        let r_bid = metadata.allocate_block(inode_ref)?;
+        let mut l_block = metadata.read_block(l_bid)?;
+        let mut r_block = metadata.read_block(r_bid)?;
 
         // Load root, left, right nodes
         let mut root = inode_ref.inode.extent_root_mut();
@@ -1755,9 +1854,9 @@ impl Ext4 {
         *root.extent_index_mut_at(1) = ExtentIndex::new(right.extent_at(0).start_lblock(), r_bid);
 
         // Sync to disk
-        self.write_extent_block(&mut l_block, inode_ref)?;
-        self.write_extent_block(&mut r_block, inode_ref)?;
-        self.write_inode_with_csum(inode_ref)?;
+        self.write_extent_block_with_metadata(metadata, &mut l_block, inode_ref)?;
+        self.write_extent_block_with_metadata(metadata, &mut r_block, inode_ref)?;
+        metadata.write_inode_with_csum(inode_ref)?;
 
         Ok(())
     }

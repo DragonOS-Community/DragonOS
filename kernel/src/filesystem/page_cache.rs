@@ -60,15 +60,17 @@ pub(crate) use writeback::{
     PageCacheWritebackDispatchOutcome,
 };
 use writeback::{
-    run_async_writeback_budget_retry_selftest, ClaimedWritebackBatch, TaggedWritebackBudgetRetry,
-    TaggedWritebackIncarnationRetry, TaggedWritebackSubmission, WritebackBatchRange,
-    WritebackClaimOutcome, WritebackSubmitOutcome, PAGECACHE_WRITEBACK_WQS,
+    run_async_writeback_budget_retry_selftest, run_submitted_writeback_selftest,
+    ClaimedWritebackBatch, TaggedWritebackBudgetRetry, TaggedWritebackIncarnationRetry,
+    TaggedWritebackSubmission, WritebackBatchRange, WritebackClaimOutcome, WritebackSubmitOutcome,
+    PAGECACHE_WRITEBACK_WQS,
 };
 pub use writeback::{
     AsyncPageCacheBackend, PageCacheBackend, PageCacheWritebackAdmissionOrder,
     PageCacheWritebackBindResult, PageCacheWritebackCancellationContext,
-    PageCacheWritebackDescriptor, PageCacheWritebackProgress, PageCacheWritebackProgressOutcome,
-    PageCacheWritebackSnapshotPhase, PageCacheWritebackSubmission, PageCacheWritebackSubmitResult,
+    PageCacheWritebackCompletion, PageCacheWritebackDescriptor, PageCacheWritebackProgress,
+    PageCacheWritebackProgressOutcome, PageCacheWritebackSnapshotPhase,
+    PageCacheWritebackSubmission, PageCacheWritebackSubmitResult,
 };
 
 static PAGE_CACHE_ID: AtomicUsize = AtomicUsize::new(0);

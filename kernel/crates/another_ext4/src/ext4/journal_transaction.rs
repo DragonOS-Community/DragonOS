@@ -6,6 +6,7 @@
 //! that no filesystem spin lock is held while block I/O is in flight.
 #![allow(dead_code)] // Activated only after every production metadata writer uses handles.
 
+use super::journal_batch::{retire, reusable, reuse_restart, JournalBatchCore, RetiredRange};
 use crate::constants::BLOCK_SIZE;
 use crate::ext4_defs::{Block, BlockDevice};
 use crate::jbd2::{
@@ -76,13 +77,14 @@ impl StagedBlock {
     }
 }
 
-/// Publishes metadata images after the selected backend has completed its
-/// commit point. Journal commits publish after a durable checkpoint; direct
-/// commits publish after every synchronous home-block write has succeeded.
+/// Publishes metadata images at the selected backend's logical commit point.
+/// Synchronous journal commits publish after a durable checkpoint; batch
+/// operations publish at acceptance. Old batch checkpoints never republish.
+/// Direct commits publish after every synchronous home write has succeeded.
 pub trait CachePublisher: Send + Sync {
-    /// Publish already-checkpointed images to in-memory caches.
+    /// Publish the operation's final images to in-memory caches.
     ///
-    /// This callback runs after the home-block flush, so it must not allocate,
+    /// This is an irrevocable logical publication, so it must not allocate,
     /// perform I/O, or otherwise fail.  Borrowing the transaction's map also
     /// lets publishers inspect the final image for a particular home block
     /// without building a temporary collection.
@@ -204,6 +206,22 @@ impl JournalTransactionCore {
         self.poison.load(Ordering::Acquire) != CLEAN
     }
 
+    /// Transfer the single recovered journal owner into batching. Recovery
+    /// and host callers may continue using the original synchronous backend;
+    /// a mounted filesystem cannot retain another owner of the same context.
+    pub(super) fn into_batch(self, block_budget: usize) -> Result<JournalBatchCore> {
+        if self.is_poisoned() {
+            return Err(Ext4Error::new(ErrCode::EROFS));
+        }
+        if !self.can_shutdown() {
+            return Err(Ext4Error::new(ErrCode::EAGAIN));
+        }
+        if self.context.lock().superblock.start != 0 {
+            return Err(Ext4Error::new(ErrCode::EIO));
+        }
+        JournalBatchCore::from_journal(self, block_budget)
+    }
+
     pub fn can_shutdown(&self) -> bool {
         !self.writer.load(Ordering::Acquire) && !self.is_poisoned()
     }
@@ -279,21 +297,23 @@ impl JournalTransactionCore {
 }
 
 #[derive(Clone, Copy)]
-enum TransactionCoreRef<'a> {
+pub(super) enum TransactionCoreRef<'a> {
     Journal(&'a JournalTransactionCore),
     Direct(&'a DirectTransactionCore),
+    Batch(&'a JournalBatchCore),
 }
 
 pub struct Transaction<'a> {
     core: TransactionCoreRef<'a>,
     credits: usize,
     staged: BTreeMap<PBlockId, StagedBlock>,
+    retired: Vec<RetiredRange>,
     preserve_originals: bool,
     owns_writer: bool,
 }
 
 impl Transaction<'_> {
-    fn new(
+    pub(super) fn new(
         core: TransactionCoreRef<'_>,
         credits: usize,
         preserve_originals: bool,
@@ -302,6 +322,7 @@ impl Transaction<'_> {
             core,
             credits,
             staged: BTreeMap::new(),
+            retired: Vec::new(),
             preserve_originals,
             owns_writer: true,
         }
@@ -309,6 +330,9 @@ impl Transaction<'_> {
     /// Replace the final image for `home`.  Re-staging the same home block does
     /// not consume another credit and subsequent reads observe the replacement.
     pub fn stage(&mut self, home: PBlockId, image: Box<[u8; BLOCK_SIZE]>) -> Result<()> {
+        if let TransactionCoreRef::Batch(core) = self.core {
+            core.validate_home(home)?;
+        }
         if !self.staged.contains_key(&home) && self.staged.len() == self.credits {
             return Err(Ext4Error::new(ErrCode::E2BIG));
         }
@@ -323,13 +347,14 @@ impl Transaction<'_> {
         Ok(())
     }
 
-    /// Credits which are still available for previously untouched home blocks.
+    /// Remaining operation budget for new metadata homes or retired ranges.
     ///
     /// Batched operations use this only to stop at a restartable boundary
     /// before beginning their next logical mutation. Re-staging an existing
     /// home remains free and the transaction is still the final authority.
     pub(super) fn remaining_credits(&self) -> usize {
-        self.credits.saturating_sub(self.staged.len())
+        self.credits
+            .saturating_sub(self.staged.len().max(self.retired.len()))
     }
 
     /// Return the transaction-private final image of `home` for mutation.
@@ -346,7 +371,7 @@ impl Transaction<'_> {
             if self.staged.len() == self.credits {
                 return Err(Ext4Error::new(ErrCode::E2BIG));
             }
-            let block = device.read_block(home)?;
+            let block = self.read_base(device, home)?;
             let original = self.preserve_originals.then(|| block.data.clone());
             self.staged.insert(
                 home,
@@ -369,8 +394,87 @@ impl Transaction<'_> {
         if let Some(block) = self.staged.get(&home) {
             Ok(BlockView::Staged(block.bytes()))
         } else {
-            Ok(BlockView::Device(device.read_block(home)?))
+            Ok(BlockView::Device(self.read_base(device, home)?))
         }
+    }
+
+    fn read_base(&self, device: &dyn BlockDevice, home: PBlockId) -> Result<Block> {
+        match self.core {
+            TransactionCoreRef::Batch(core) => core.read_metadata(device, home),
+            _ => device.read_block(home),
+        }
+    }
+
+    pub fn is_batch(&self) -> bool {
+        matches!(self.core, TransactionCoreRef::Batch(_))
+    }
+
+    /// Record retirement before clearing allocation metadata. Synchronous
+    /// backends already exclude reuse until their checkpoint completes.
+    pub fn retire_blocks(&mut self, start: PBlockId, count: u64) -> Result<()> {
+        let range = RetiredRange::blocks(start, count)?;
+        if self.is_batch() {
+            retire(&mut self.retired, self.credits, range)?;
+        }
+        Ok(())
+    }
+
+    pub fn retire_inode(&mut self, id: InodeId) -> Result<()> {
+        if self.is_batch() {
+            retire(&mut self.retired, self.credits, RetiredRange::inode(id))?;
+        }
+        Ok(())
+    }
+
+    pub fn block_range_reusable(&self, start: PBlockId, count: u64) -> Result<bool> {
+        let range = RetiredRange::blocks(start, count)?;
+        Ok(reusable(&self.retired, range)
+            && match self.core {
+                TransactionCoreRef::Batch(core) => core.resource_reusable(range),
+                _ => true,
+            })
+    }
+
+    pub fn inode_reusable(&self, id: InodeId) -> bool {
+        let range = RetiredRange::inode(id);
+        reusable(&self.retired, range)
+            && match self.core {
+                TransactionCoreRef::Batch(core) => core.resource_reusable(range),
+                _ => true,
+            }
+    }
+
+    /// On a quarantined candidate return the first possible restart address.
+    /// Allocators skip whole freed extents instead of probing each block while
+    /// holding their accounting lock. None means the candidate is reusable.
+    pub fn block_reuse_restart(&self, start: PBlockId, count: u64) -> Result<Option<PBlockId>> {
+        let range = RetiredRange::blocks(start, count)?;
+        Ok(reuse_restart(&self.retired, range).max(match self.core {
+            TransactionCoreRef::Batch(core) => core.resource_reuse_restart(range),
+            _ => None,
+        }))
+    }
+
+    /// True means a published retirement can progress after this operation
+    /// drops its token. Private-only frees cannot be checkpointed separately
+    /// from an atomic operation and must not create an endless EAGAIN retry.
+    pub fn request_retirement_progress(&self) -> bool {
+        match self.core {
+            TransactionCoreRef::Batch(core) => core.request_retirement_progress(),
+            _ => false,
+        }
+    }
+
+    /// Accept an operation into the live metadata view. This is deliberately
+    /// distinct from `commit`: successful publication is not durability, and
+    /// subsequent disk failures must never trigger reservation rollback.
+    pub fn publish(mut self, publisher: &dyn CachePublisher) -> Result<u64> {
+        let TransactionCoreRef::Batch(core) = self.core else {
+            return Err(Ext4Error::new(ErrCode::EINVAL));
+        };
+        let result = core.publish(&mut self.staged, &mut self.retired, publisher);
+        self.release_writer();
+        result
     }
 
     pub fn abort(mut self) {
@@ -389,6 +493,11 @@ impl Transaction<'_> {
         match self.core {
             TransactionCoreRef::Journal(_) => self.commit_journal(device, publisher),
             TransactionCoreRef::Direct(_) => self.commit_direct(device, publisher),
+            TransactionCoreRef::Batch(_) => self.fail(
+                Ext4Error::new(ErrCode::EINVAL),
+                CommitFailure::BeforeCommit,
+                false,
+            ),
         }
     }
 
@@ -531,8 +640,111 @@ impl Transaction<'_> {
         let TransactionCoreRef::Journal(core) = self.core else {
             unreachable!()
         };
+        let images = self.staged.values().collect::<Vec<_>>();
+        let result = core.commit_images(device, &images, || publisher.publish(&self.staged));
+        self.release_writer();
+        result
+    }
+
+    fn fail<T>(
+        &mut self,
+        error: Ext4Error,
+        failure: CommitFailure,
+        poison: bool,
+    ) -> core::result::Result<T, CommitError> {
+        if poison {
+            match self.core {
+                TransactionCoreRef::Journal(core) => core.poison(),
+                TransactionCoreRef::Direct(core) => core.poison(),
+                TransactionCoreRef::Batch(core) => core.fail_stop(),
+            }
+        }
+        self.release_writer();
+        Err(CommitError {
+            error,
+            failure,
+            poisoned: poison,
+        })
+    }
+
+    fn release_writer(&mut self) {
+        if self.owns_writer {
+            self.owns_writer = false;
+            match self.core {
+                TransactionCoreRef::Journal(core) => core.writer.store(false, Ordering::Release),
+                TransactionCoreRef::Direct(core) => core.writer.store(false, Ordering::Release),
+                TransactionCoreRef::Batch(core) => core.release_operation(),
+            }
+        }
+    }
+}
+
+impl JournalTransactionCore {
+    pub(super) fn validate_home(&self, home: PBlockId) -> Result<()> {
+        let context = self.context.lock();
+        if home >= context.target_blocks || context.journal_blocks.contains(&home) {
+            return Err(Ext4Error::new(ErrCode::EINVAL));
+        }
+        Ok(())
+    }
+
+    /// Borrow immutable frozen images without copying their 4 KiB payloads.
+    /// The batch owner is the only caller and owns the disk writer until return.
+    pub(super) fn commit_batch_images(
+        &self,
+        device: &dyn BlockDevice,
+        images: &[&StagedBlock],
+    ) -> core::result::Result<(), CommitError> {
+        if self.is_poisoned() {
+            return self.commit_error(
+                Ext4Error::new(ErrCode::EROFS),
+                CommitFailure::BeforeCommit,
+                true,
+            );
+        }
+        if self
+            .writer
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            return self.commit_error(
+                Ext4Error::new(ErrCode::EAGAIN),
+                CommitFailure::BeforeCommit,
+                false,
+            );
+        }
+        // Live caches were published at acceptance. Checkpoint must never
+        // republish these older images over the next Running batch.
+        let result = self.commit_images(device, images, || {});
+        self.writer.store(false, Ordering::Release);
+        result
+    }
+
+    fn commit_error<T>(
+        &self,
+        error: Ext4Error,
+        failure: CommitFailure,
+        poison: bool,
+    ) -> core::result::Result<T, CommitError> {
+        if poison {
+            self.poison();
+        }
+        Err(CommitError {
+            error,
+            failure,
+            poisoned: poison,
+        })
+    }
+
+    fn commit_images(
+        &self,
+        device: &dyn BlockDevice,
+        images: &[&StagedBlock],
+        publish: impl FnOnce(),
+    ) -> core::result::Result<(), CommitError> {
+        let core = self;
         if !device.supports_reliable_flush() {
-            return self.fail(
+            return core.commit_error(
                 Ext4Error::new(ErrCode::ENOTSUP),
                 CommitFailure::BeforeCommit,
                 false,
@@ -548,11 +760,12 @@ impl Transaction<'_> {
                 Arc::clone(&context.journal_blocks),
                 context.target_blocks,
                 context.head,
-                context.superblock_image.clone(),
+                *context.superblock_image,
             )
         };
+        let sb_image = Box::new(sb_image);
         let needed =
-            required_log_blocks(self.staged.len(), sb.features).map_err(|error| CommitError {
+            required_log_blocks(images.len(), sb.features).map_err(|error| CommitError {
                 error,
                 failure: CommitFailure::BeforeCommit,
                 poisoned: false,
@@ -564,7 +777,7 @@ impl Transaction<'_> {
                 poisoned: false,
             })?
         {
-            return self.fail(
+            return core.commit_error(
                 Ext4Error::new(ErrCode::E2BIG),
                 CommitFailure::BeforeCommit,
                 false,
@@ -577,12 +790,12 @@ impl Transaction<'_> {
             failure: CommitFailure::BeforeCommit,
             poisoned: false,
         })?;
-        if self
-            .staged
-            .values()
+        if images
+            .iter()
+            .copied()
             .any(|block| block.home >= target_blocks || journal_blocks.contains(&block.home))
         {
-            return self.fail(
+            return core.commit_error(
                 Ext4Error::new(ErrCode::EINVAL),
                 CommitFailure::BeforeCommit,
                 false,
@@ -591,7 +804,7 @@ impl Transaction<'_> {
         // Finish every fallible format operation before the first write.  Once
         // the active tail reaches disk, all remaining failures are I/O failures
         // which must poison the mount.
-        let encoded = encode_log(&sb, sequence, &self.staged).map_err(|error| CommitError {
+        let encoded = encode_log_images(&sb, sequence, images).map_err(|error| CommitError {
             error,
             failure: CommitFailure::BeforeCommit,
             poisoned: false,
@@ -620,7 +833,7 @@ impl Transaction<'_> {
         })?;
         let scratch_blocks = encoded
             .len()
-            .max(self.staged.len())
+            .max(images.len())
             .min(MAX_COALESCED_WRITE_BLOCKS);
         let scratch_capacity =
             scratch_blocks
@@ -644,7 +857,7 @@ impl Transaction<'_> {
         if let Err(error) = write_journal_superblock(device, &mapping, &active_sb_image)
             .and_then(|_| device.flush())
         {
-            return self.fail(error, CommitFailure::BeforeCommit, true);
+            return core.commit_error(error, CommitFailure::BeforeCommit, true);
         }
 
         debug_assert_eq!(encoded.len() + 1, positions.len());
@@ -670,40 +883,40 @@ impl Transaction<'_> {
             if let Err(error) =
                 write_contiguous_blocks(device, blocks, &mut write_scratch, scratch_blocks)
             {
-                return self.fail(error, CommitFailure::BeforeCommit, true);
+                return core.commit_error(error, CommitFailure::BeforeCommit, true);
             }
             segment_start = segment_end;
         }
         if let Err(error) = device.flush() {
-            return self.fail(error, CommitFailure::BeforeCommit, true);
+            return core.commit_error(error, CommitFailure::BeforeCommit, true);
         }
 
         let commit_logical = *positions.last().unwrap();
         if let Err(error) = write_bytes(device, mapping[commit_logical as usize], &commit) {
-            return self.fail(error, CommitFailure::CommitUncertain, true);
+            return core.commit_error(error, CommitFailure::CommitUncertain, true);
         }
         if let Err(error) = device.flush() {
-            return self.fail(error, CommitFailure::CommitUncertain, true);
+            return core.commit_error(error, CommitFailure::CommitUncertain, true);
         }
 
-        let home_blocks = self
-            .staged
-            .values()
+        let home_blocks = images
+            .iter()
+            .copied()
             .map(|staged| (staged.home, staged.bytes()));
         if let Err(error) =
             write_contiguous_blocks(device, home_blocks, &mut write_scratch, scratch_blocks)
         {
-            return self.fail(error, CommitFailure::CheckpointFailed, true);
+            return core.commit_error(error, CommitFailure::CheckpointFailed, true);
         }
         if let Err(error) = device.flush() {
-            return self.fail(error, CommitFailure::CheckpointFailed, true);
+            return core.commit_error(error, CommitFailure::CheckpointFailed, true);
         }
-        publisher.publish(&self.staged);
+        publish();
 
         if let Err(error) =
             write_journal_superblock(device, &mapping, &clean_sb_image).and_then(|_| device.flush())
         {
-            return self.fail(error, CommitFailure::TailUpdateFailed, true);
+            return core.commit_error(error, CommitFailure::TailUpdateFailed, true);
         }
         {
             let mut context = core.context.lock();
@@ -712,38 +925,7 @@ impl Transaction<'_> {
             context.head = ring_next(&sb, commit_logical);
             context.superblock_image = clean_sb_image;
         }
-        self.release_writer();
         Ok(())
-    }
-
-    fn fail<T>(
-        &mut self,
-        error: Ext4Error,
-        failure: CommitFailure,
-        poison: bool,
-    ) -> core::result::Result<T, CommitError> {
-        if poison {
-            match self.core {
-                TransactionCoreRef::Journal(core) => core.poison(),
-                TransactionCoreRef::Direct(core) => core.poison(),
-            }
-        }
-        self.release_writer();
-        Err(CommitError {
-            error,
-            failure,
-            poisoned: poison,
-        })
-    }
-
-    fn release_writer(&mut self) {
-        if self.owns_writer {
-            self.owns_writer = false;
-            match self.core {
-                TransactionCoreRef::Journal(core) => core.writer.store(false, Ordering::Release),
-                TransactionCoreRef::Direct(core) => core.writer.store(false, Ordering::Release),
-            }
-        }
     }
 }
 
@@ -830,9 +1012,17 @@ fn encode_log(
     sequence: u32,
     staged: &BTreeMap<PBlockId, StagedBlock>,
 ) -> Result<Vec<Box<[u8; BLOCK_SIZE]>>> {
+    let all = staged.values().collect::<Vec<_>>();
+    encode_log_images(sb, sequence, &all)
+}
+
+fn encode_log_images(
+    sb: &Superblock,
+    sequence: u32,
+    all: &[&StagedBlock],
+) -> Result<Vec<Box<[u8; BLOCK_SIZE]>>> {
     let seed = checksum_seed(&sb.uuid);
     let per_descriptor = tags_per_descriptor(sb.features)?;
-    let all = staged.values().collect::<Vec<_>>();
     let mut output = Vec::new();
     for group in all.chunks(per_descriptor) {
         let mut descriptor = Box::new([0; BLOCK_SIZE]);
@@ -1411,6 +1601,282 @@ mod tests {
 
     fn context() -> JournalContext {
         context_with_ring(8, 7)
+    }
+
+    #[test]
+    fn batch_coalesces_operations_without_claiming_durability() {
+        let core = JournalBatchCore::new(context_with_ring(64, 1), 32).unwrap();
+        let device = MemoryDevice::new();
+        let publisher = Publisher(AtomicUsize::new(0));
+        for value in 1..=20 {
+            let mut operation = core.start(1).unwrap();
+            assert_eq!(operation.read_for_update(&device, 2).unwrap()[0], value - 1);
+            operation.read_for_update(&device, 2).unwrap()[0] = value;
+            assert_eq!(operation.publish(&publisher).unwrap(), value as u64);
+        }
+        assert_eq!(core.progress().running_blocks, 1);
+        assert_eq!(core.progress().durable, 0);
+        assert_eq!(device.flushes.load(Ordering::SeqCst), 0);
+        core.request_seal();
+        assert_eq!(core.commit_pending(&device).unwrap(), Some(20));
+        assert_eq!(device.flushes.load(Ordering::SeqCst), 5);
+        assert_eq!(device.stable_block(2).unwrap()[0], 20);
+        assert_eq!(core.progress().durable, 20);
+        assert_eq!(publisher.0.load(Ordering::SeqCst), 20);
+    }
+
+    /// Runs an operation exactly inside a device read/flush. This deterministic
+    /// interleaving exercises unlocked I/O without timing-dependent threads.
+    struct InterleavedDevice {
+        inner: MemoryDevice,
+        read_hook: spin::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+        flush_hook: spin::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+        flush_hook_at: AtomicUsize,
+    }
+
+    impl InterleavedDevice {
+        fn new() -> Self {
+            Self {
+                inner: MemoryDevice::new(),
+                read_hook: spin::Mutex::new(None),
+                flush_hook: spin::Mutex::new(None),
+                flush_hook_at: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl BlockDevice for InterleavedDevice {
+        fn read_block(&self, home: PBlockId) -> Result<Block> {
+            let snapshot = self.inner.read_block(home)?;
+            let hook = if home == 2 {
+                self.read_hook.lock().take()
+            } else {
+                None
+            };
+            if let Some(hook) = hook {
+                hook();
+            }
+            Ok(snapshot)
+        }
+        fn write_block(&self, block: &Block) -> Result<()> {
+            self.inner.write_block(block)
+        }
+        fn flush(&self) -> Result<()> {
+            let hook = if self.inner.flushes.load(Ordering::SeqCst)
+                == self.flush_hook_at.load(Ordering::SeqCst)
+            {
+                self.flush_hook.lock().take()
+            } else {
+                None
+            };
+            if let Some(hook) = hook {
+                hook();
+            }
+            self.inner.flush()
+        }
+        fn supports_reliable_flush(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn batch_old_checkpoint_preserves_new_running_image_and_live_cache() {
+        let core = Arc::new(JournalBatchCore::new(context(), 4).unwrap());
+        let device = Arc::new(InterleavedDevice::new());
+        let publisher = Arc::new(Publisher(AtomicUsize::new(0)));
+        let mut operation = core.start(1).unwrap();
+        operation.stage(2, Box::new([1; BLOCK_SIZE])).unwrap();
+        operation.publish(publisher.as_ref()).unwrap();
+        let next_core = Arc::clone(&core);
+        let next_device = Arc::clone(&device);
+        let next_publisher = Arc::clone(&publisher);
+        *device.flush_hook.lock() = Some(Box::new(move || {
+            assert_eq!(next_core.progress().frozen_blocks, 1);
+            let mut operation = next_core.start(1).unwrap();
+            assert_eq!(
+                operation.read_for_update(next_device.as_ref(), 2).unwrap()[0],
+                1
+            );
+            operation.read_for_update(next_device.as_ref(), 2).unwrap()[0] = 2;
+            operation.publish(next_publisher.as_ref()).unwrap();
+            assert_eq!(
+                next_core.commit_pending(next_device.as_ref()).unwrap(),
+                None
+            );
+        }));
+        core.request_seal();
+        assert_eq!(core.commit_pending(device.as_ref()).unwrap(), Some(1));
+        assert_eq!(device.inner.stable_block(2).unwrap()[0], 1);
+        assert_eq!(core.read_metadata(device.as_ref(), 2).unwrap().data[0], 2);
+        assert_eq!(core.progress().accepted, 2);
+        assert_eq!(core.progress().durable, 1);
+        assert_eq!(publisher.0.load(Ordering::SeqCst), 2);
+        core.request_seal();
+        assert_eq!(core.commit_pending(device.as_ref()).unwrap(), Some(2));
+        assert_eq!(device.inner.stable_block(2).unwrap()[0], 2);
+        assert_eq!(publisher.0.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn batch_cold_read_retries_when_publication_was_already_checkpointed() {
+        let core = Arc::new(JournalBatchCore::new(context(), 4).unwrap());
+        let device = Arc::new(InterleavedDevice::new());
+        let next_core = Arc::clone(&core);
+        let next_device = Arc::clone(&device);
+        *device.read_hook.lock() = Some(Box::new(move || {
+            let mut operation = next_core.start(1).unwrap();
+            operation.stage(2, Box::new([7; BLOCK_SIZE])).unwrap();
+            operation.publish(&Publisher(AtomicUsize::new(0))).unwrap();
+            next_core.request_seal();
+            next_core.commit_pending(next_device.as_ref()).unwrap();
+        }));
+        assert_eq!(core.read_metadata(device.as_ref(), 2).unwrap().data[0], 7);
+        assert_eq!(core.progress().running_blocks, 0);
+        assert_eq!(core.progress().frozen_blocks, 0);
+    }
+
+    #[test]
+    fn batch_capacity_and_seal_respect_private_operation_boundary() {
+        let core = JournalBatchCore::new(context(), 2).unwrap();
+        let device = MemoryDevice::new();
+        let publisher = Publisher(AtomicUsize::new(0));
+        assert_eq!(core.start(3).err().unwrap().code(), ErrCode::E2BIG);
+        let mut operation = core.start(1).unwrap();
+        operation.stage(2, Box::new([1; BLOCK_SIZE])).unwrap();
+        core.request_seal();
+        assert_eq!(core.commit_pending(&device).unwrap(), None);
+        operation.publish(&publisher).unwrap();
+        assert_eq!(core.start(1).err().unwrap().code(), ErrCode::EAGAIN);
+        assert_eq!(core.commit_pending(&device).unwrap(), Some(1));
+        let operation = core.start(1).unwrap();
+        core.request_seal();
+        operation.abort();
+        assert_eq!(core.commit_pending(&device).unwrap(), None);
+        assert!(core.start(1).is_ok());
+    }
+
+    #[test]
+    fn batch_same_home_operations_have_bounded_completion_admission() {
+        let core = JournalBatchCore::new(context(), 2).unwrap();
+        let device = MemoryDevice::new();
+        let publisher = Publisher(AtomicUsize::new(0));
+        core.start(1).unwrap().publish(&publisher).unwrap();
+        assert_eq!(core.progress().running_operations, 0);
+        for value in 1..=2 {
+            let mut operation = core.start(1).unwrap();
+            operation.stage(2, Box::new([value; BLOCK_SIZE])).unwrap();
+            operation.publish(&publisher).unwrap();
+        }
+        assert_eq!(core.progress().running_blocks, 1);
+        assert_eq!(core.progress().running_operations, 2);
+        assert!(core.progress().seal_requested);
+        assert_eq!(core.start(1).err().unwrap().code(), ErrCode::EAGAIN);
+        assert_eq!(core.commit_pending(&device).unwrap(), Some(2));
+        assert_eq!(core.progress().running_operations, 0);
+        assert!(core.start(1).is_ok());
+    }
+
+    #[test]
+    fn batch_retirements_survive_frozen_checkpoint_until_clean_tail() {
+        let core = Arc::new(JournalBatchCore::new(context(), 4).unwrap());
+        let device = Arc::new(InterleavedDevice::new());
+        let publisher = Arc::new(Publisher(AtomicUsize::new(0)));
+        // The last barrier is after homes were checkpointed. Reuse must still
+        // be blocked until this clean-tail flush has completed successfully.
+        device.flush_hook_at.store(4, Ordering::SeqCst);
+        let mut operation = core.start(2).unwrap();
+        operation.stage(2, Box::new([1; BLOCK_SIZE])).unwrap();
+        operation.retire_blocks(20, 10).unwrap();
+        operation.retire_inode(7).unwrap();
+        assert!(!operation.block_range_reusable(29, 1).unwrap());
+        assert!(!operation.inode_reusable(7));
+        operation.publish(publisher.as_ref()).unwrap();
+        assert!(!core.block_range_reusable(20, 1).unwrap());
+        let next_core = Arc::clone(&core);
+        let next_publisher = Arc::clone(&publisher);
+        *device.flush_hook.lock() = Some(Box::new(move || {
+            assert!(!next_core.block_range_reusable(20, 10).unwrap());
+            assert!(!next_core.inode_reusable(7));
+            let mut operation = next_core.start(2).unwrap();
+            assert!(!operation.block_range_reusable(20, 1).unwrap());
+            operation.stage(3, Box::new([2; BLOCK_SIZE])).unwrap();
+            operation.retire_blocks(30, 10).unwrap();
+            operation.retire_inode(8).unwrap();
+            operation.publish(next_publisher.as_ref()).unwrap();
+        }));
+        core.request_seal();
+        core.commit_pending(device.as_ref()).unwrap();
+        assert!(core.block_range_reusable(20, 10).unwrap());
+        assert!(core.inode_reusable(7));
+        assert!(!core.block_range_reusable(30, 10).unwrap());
+        assert!(!core.inode_reusable(8));
+        core.request_seal();
+        core.commit_pending(device.as_ref()).unwrap();
+        assert!(core.block_range_reusable(20, 20).unwrap());
+        assert!(core.inode_reusable(8));
+    }
+
+    #[test]
+    fn batch_retirement_capacity_failure_stays_private_and_ranges_coalesce() {
+        let core = JournalBatchCore::new(context(), 2).unwrap();
+        let mut operation = core.start(1).unwrap();
+        operation.retire_blocks(20, 10).unwrap();
+        operation.retire_blocks(30, 10).unwrap();
+        assert!(!operation.block_range_reusable(39, 1).unwrap());
+        assert!(operation.block_range_reusable(40, 1).unwrap());
+        assert_eq!(
+            operation.retire_inode(7).unwrap_err().code(),
+            ErrCode::E2BIG
+        );
+        assert_eq!(core.progress().accepted, 0);
+        assert!(core.block_range_reusable(20, 20).unwrap());
+        operation.abort();
+        assert!(core.block_range_reusable(20, 20).unwrap());
+    }
+
+    #[test]
+    fn batch_reclaim_budget_stops_before_fragmented_retirements_exhaust_it() {
+        let core = JournalBatchCore::new(context_with_ring(64, 1), 32).unwrap();
+        let mut operation = core.start(32).unwrap();
+        operation.stage(2, Box::new([1; BLOCK_SIZE])).unwrap();
+        for index in 0..18 {
+            assert!(operation.remaining_credits() >= 15);
+            operation.retire_blocks(200 + index * 2, 1).unwrap();
+        }
+        // All releases share one bitmap home. Counting only metadata images
+        // would still report 31 credits and overrun retirement capacity.
+        assert_eq!(operation.staged.len(), 1);
+        assert_eq!(operation.remaining_credits(), 14);
+    }
+
+    #[test]
+    fn batch_every_disk_failure_is_post_publication_fail_stop() {
+        let baseline = MemoryDevice::new();
+        let core = JournalBatchCore::new(context(), 4).unwrap();
+        let publisher = Publisher(AtomicUsize::new(0));
+        let mut operation = core.start(1).unwrap();
+        operation.stage(2, Box::new([1; BLOCK_SIZE])).unwrap();
+        operation.publish(&publisher).unwrap();
+        core.request_seal();
+        core.commit_pending(&baseline).unwrap();
+        for fail_at in 0..baseline.operation.load(Ordering::SeqCst) {
+            let device = MemoryDevice::new();
+            device.fail_at.store(fail_at, Ordering::SeqCst);
+            let core = JournalBatchCore::new(context(), 4).unwrap();
+            let mut operation = core.start(1).unwrap();
+            operation.stage(2, Box::new([1; BLOCK_SIZE])).unwrap();
+            operation.retire_blocks(20, 10).unwrap();
+            operation.publish(&publisher).unwrap();
+            core.request_seal();
+            let error = core.commit_pending(&device).unwrap_err();
+            assert!(error.poisoned);
+            assert!(core.progress().failed);
+            assert_eq!(core.progress().accepted, 1);
+            assert_eq!(core.progress().durable, 0);
+            assert!(!core.block_range_reusable(20, 10).unwrap());
+            assert_eq!(core.read_metadata(&device, 2).unwrap().data[0], 1);
+            assert_eq!(core.start(1).err().unwrap().code(), ErrCode::EROFS);
+        }
     }
 
     fn context_with_ring(max_len: u32, head: u32) -> JournalContext {

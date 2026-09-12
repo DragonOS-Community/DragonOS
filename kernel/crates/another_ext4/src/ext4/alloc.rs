@@ -1,3 +1,4 @@
+use super::rw::MetadataIo;
 use super::{
     AllocationClass, AllocationState, DelallocClaim, DelallocConsumptionRecord, DelallocLease,
     DelallocReservation, DelallocReservationId, DelallocReservationUse, Ext4,
@@ -1099,6 +1100,7 @@ impl Ext4 {
             .filter(|group| *group < bg_count)
             .unwrap_or(preferred_inode_group);
         let count_usize = count as usize;
+        let mut saw_retired = false;
 
         // This is a speculative fast path.  Bound its metadata I/O under the
         // transaction writer gate; on a miss the caller aborts the
@@ -1139,19 +1141,44 @@ impl Ext4 {
                         && (*bit..*bit + count_usize)
                             .all(|index| bitmap_block[index / 8] & (1 << (index % 8)) == 0)
                 });
-            let bit = exact_hint.or_else(|| {
-                (!require_preferred)
-                    .then(|| {
-                        Bitmap::first_clear_run_in(
-                            &*bitmap_block,
-                            blocks_in_group,
-                            0,
-                            blocks_in_group,
-                            count_usize,
-                        )
-                    })
-                    .flatten()
-            });
+            let mut bit = exact_hint;
+            if let Some(candidate) = bit {
+                if !transaction
+                    .block_range_reusable(group_first + candidate as u64, count as u64)?
+                {
+                    saw_retired = true;
+                    bit = None;
+                }
+            }
+            if bit.is_none() && !require_preferred {
+                let mut cursor = 0;
+                while let Some(candidate) = Bitmap::first_clear_run_in(
+                    &*bitmap_block,
+                    blocks_in_group,
+                    cursor,
+                    blocks_in_group,
+                    count_usize,
+                ) {
+                    match transaction
+                        .block_reuse_restart(group_first + candidate as u64, count as u64)?
+                    {
+                        None => {
+                            bit = Some(candidate);
+                            break;
+                        }
+                        Some(end) => {
+                            saw_retired = true;
+                            // A freed extent may span thousands of blocks;
+                            // jump over its retirement in one bounded probe.
+                            cursor =
+                                core::cmp::min(end - group_first, blocks_in_group as u64) as usize;
+                            if cursor >= blocks_in_group {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
             let Some(bit) = bit else { continue };
             let first = group_first
                 .checked_add(bit as PBlockId)
@@ -1215,6 +1242,9 @@ impl Ext4 {
                 consumption,
             ));
         }
+        if saw_retired && transaction.request_retirement_progress() {
+            return_error!(ErrCode::EAGAIN, "Free blocks await journal checkpoint");
+        }
         return_error!(ErrCode::ENOSPC, "No contiguous direct range available");
     }
 
@@ -1247,6 +1277,35 @@ impl Ext4 {
         )?;
         debug_assert!(consumption.is_none());
         Ok(allocation)
+    }
+
+    /// Allocate one metadata block, searching every group before ENOSPC.
+    /// Directory growth has no legacy fallback and must not inherit the eager
+    /// data fast path's speculative probe limit. The caller initializes the
+    /// private block image before publishing any reference to it.
+    pub(super) fn transaction_alloc_metadata_block(
+        &self,
+        transaction: &mut super::journal_transaction::Transaction<'_>,
+        inode_id: InodeId,
+        preferred_first: Option<PBlockId>,
+    ) -> Result<PBlockId> {
+        let groups = self
+            .transaction_read_super_block(transaction)?
+            .block_group_count();
+        let (allocation, consumption) = self.transaction_alloc_range_with_class(
+            transaction,
+            TransactionRangeAllocationRequest {
+                inode_id,
+                preferred_first,
+                require_preferred: false,
+                count: 1,
+                class: AllocationClass::Unreserved,
+                reservation_use: DelallocReservationUse::Metadata,
+                probe_limit: groups,
+            },
+        )?;
+        debug_assert!(consumption.is_none());
+        Ok(allocation.first)
     }
 
     /// Materialise an already reserved delayed-allocation data range.
@@ -1332,6 +1391,108 @@ impl Ext4 {
     ) -> Result<()> {
         let mut allocation = self.alloc_lock.lock();
         allocation.rollback_delalloc_consumption(consumption)
+    }
+
+    /// Validate an entire delayed operation before publishing any live image.
+    /// The allocator guard spans the memory-only publication, so finalisation
+    /// cannot fail or race another owner after readers can observe the mapping.
+    /// On error all leases/debits are untouched and the caller rolls them back.
+    pub(super) fn publish_delalloc_operation(
+        &self,
+        transaction: super::journal_transaction::Transaction<'_>,
+        leases: &mut [&mut DelallocLease],
+        consumptions: &mut [&mut DelallocConsumption],
+    ) -> Result<u64> {
+        if !transaction.is_batch() || leases.is_empty() || consumptions.is_empty() {
+            return Err(Ext4Error::new(ErrCode::EINVAL));
+        }
+        let mut allocation = self.alloc_lock.lock();
+        let mut released_metadata = 0u64;
+        for (index, lease) in leases.iter().enumerate() {
+            if !lease.active
+                || lease.id.mount_generation != allocation.mount_generation
+                || leases[..index].iter().any(|prior| prior.id == lease.id)
+            {
+                return Err(Ext4Error::new(ErrCode::EINVAL));
+            }
+            let claim = allocation
+                .delalloc_claims
+                .get(&lease.id)
+                .ok_or_else(|| Ext4Error::new(ErrCode::EIO))?;
+            let mut count = 0u64;
+            let mut data = 0u64;
+            let mut metadata = 0u64;
+            for debit in consumptions.iter() {
+                let record = allocation
+                    .delalloc_consumptions
+                    .get(&debit.serial)
+                    .ok_or_else(|| Ext4Error::new(ErrCode::EINVAL))?;
+                if record.reservation == lease.id {
+                    count = count
+                        .checked_add(1)
+                        .ok_or_else(|| Ext4Error::new(ErrCode::EIO))?;
+                    let blocks = match record.use_kind {
+                        DelallocReservationUse::Data => &mut data,
+                        DelallocReservationUse::Metadata => &mut metadata,
+                    };
+                    *blocks = blocks
+                        .checked_add(record.blocks)
+                        .ok_or_else(|| Ext4Error::new(ErrCode::EIO))?;
+                }
+            }
+            if count == 0
+                || count != claim.inflight_consumptions
+                || claim.data_blocks != 0
+                || data != lease.data_blocks
+                || metadata.checked_add(claim.metadata_blocks) != Some(lease.metadata_blocks)
+            {
+                return Err(Ext4Error::new(ErrCode::EIO));
+            }
+            released_metadata = released_metadata
+                .checked_add(claim.metadata_blocks)
+                .ok_or_else(|| Ext4Error::new(ErrCode::EIO))?;
+        }
+        for (index, debit) in consumptions.iter().enumerate() {
+            let record = allocation
+                .delalloc_consumptions
+                .get(&debit.serial)
+                .ok_or_else(|| Ext4Error::new(ErrCode::EINVAL))?;
+            if !debit.unresolved
+                || debit.mount_generation != allocation.mount_generation
+                || consumptions[..index]
+                    .iter()
+                    .any(|prior| prior.serial == debit.serial)
+                || !leases.iter().any(|lease| lease.id == record.reservation)
+            {
+                return Err(Ext4Error::new(ErrCode::EINVAL));
+            }
+        }
+        let reserved_metadata = allocation
+            .reserved_metadata_blocks
+            .checked_sub(released_metadata)
+            .ok_or_else(|| Ext4Error::new(ErrCode::EIO))?;
+        // Batch publication performs no device I/O. Its fallible scratch
+        // reservations precede cache publication; after acceptance only
+        // infallible ownership transfer remains.
+        let sequence = match self
+            .commit_metadata_operation(transaction)
+            .map_err(|error| error.error)?
+        {
+            super::journal::MetadataPublication::Accepted(sequence) => sequence,
+            super::journal::MetadataPublication::Durable => {
+                unreachable!("batch publication cannot be synchronous")
+            }
+        };
+        for debit in consumptions.iter_mut() {
+            allocation.delalloc_consumptions.remove(&debit.serial);
+            debit.resolve();
+        }
+        for lease in leases.iter_mut() {
+            allocation.delalloc_claims.remove(&lease.id);
+            lease.deactivate();
+        }
+        allocation.reserved_metadata_blocks = reserved_metadata;
+        Ok(sequence)
     }
 
     /// Commit a delayed data debit after the mapping transaction has either
@@ -1474,6 +1635,10 @@ impl Ext4 {
             .checked_add(count as u64)
             .filter(|value| *value <= sb.block_count())
             .ok_or_else(|| format_error!(ErrCode::EINVAL, "Invalid filesystem free count"))?;
+        // Reserve quarantine ownership before any bitmap bit is cleared.
+        // A full retirement budget aborts this private operation, never a
+        // previously published free or a partially durable transaction.
+        transaction.retire_blocks(first, count as u64)?;
         {
             let image = self.transaction_block_for_update(transaction, bitmap_block_id)?;
             let mut bitmap = Bitmap::new(image, blocks_in_group);
@@ -1559,6 +1724,7 @@ impl Ext4 {
             } else {
                 None
             };
+        transaction.retire_inode(inode_id)?;
         {
             let image = self.transaction_block_for_update(transaction, bitmap_block_id)?;
             let mut bitmap = Bitmap::new(image, inode_count);
@@ -1586,7 +1752,7 @@ impl Ext4 {
         self.transaction_stage_super_block(transaction, &sb)
     }
 
-    /// Create a new inode with its final owner, returning the inode and its number.
+    /// Create a new inode with its final owner.
     #[inline(never)]
     pub(super) fn create_inode_with_owner(
         &self,
@@ -1594,84 +1760,84 @@ impl Ext4 {
         uid: u32,
         gid: u32,
     ) -> Result<InodeRef> {
-        self.ensure_mutable()?;
-        // Allocate an inode
-        let is_dir = mode.file_type() == FileType::Directory;
-        let id = self.alloc_inode(is_dir)?;
-
-        let initialized = (|| {
-            let generation = self.next_inode_generation(id)?;
-            let mut inode = Box::new(Inode::default());
-            inode.set_generation(generation);
-            inode.set_mode(mode);
-            inode.set_uid(uid);
-            inode.set_gid(gid);
-            inode.extent_init();
-            let mut inode_ref = InodeRef::new(id, inode);
-            self.write_inode_with_csum(&mut inode_ref)?;
-            Ok(inode_ref)
-        })();
-        let inode_ref = match initialized {
-            Ok(inode_ref) => inode_ref,
-            Err(error) => {
-                if self.rollback_new_inode(id, is_dir).is_err() {
-                    self.poison(ErrCode::EIO);
-                }
-                return Err(error);
-            }
-        };
-
-        trace!("Alloc inode {} ok", inode_ref.id);
-        Ok(inode_ref)
+        self.create_inode_with_metadata(&mut MetadataIo::direct(self), mode, uid, gid, None)
     }
 
-    /// Create a device inode (character or block device).
-    ///
-    /// Unlike `create_inode()`, this function:
-    /// - Does NOT initialize the extent tree
-    /// - Stores the device number in i_block[0..1] (Linux ext4 standard)
-    #[inline(never)]
-    pub(super) fn create_device_inode(
+    /// Stage inode allocation and initialization in the caller's operation.
+    /// On error the caller must abort the entire transaction.
+    pub(super) fn transaction_create_inode_with_owner(
         &self,
+        transaction: &mut super::journal_transaction::Transaction<'_>,
+        mode: InodeMode,
+        uid: u32,
+        gid: u32,
+    ) -> Result<InodeRef> {
+        self.create_inode_with_metadata(
+            &mut MetadataIo::transaction(self, transaction),
+            mode,
+            uid,
+            gid,
+            None,
+        )
+    }
+
+    /// Stage a device inode using the same allocation algorithm as direct mode.
+    /// On error the caller must abort the entire transaction.
+    pub(super) fn transaction_create_device_inode(
+        &self,
+        transaction: &mut super::journal_transaction::Transaction<'_>,
         mode: InodeMode,
         major: u32,
         minor: u32,
         uid: u32,
         gid: u32,
     ) -> Result<InodeRef> {
-        self.ensure_mutable()?;
-        // Device nodes are never directories
-        let id = self.alloc_inode(false)?;
+        self.create_inode_with_metadata(
+            &mut MetadataIo::transaction(self, transaction),
+            mode,
+            uid,
+            gid,
+            Some((major, minor)),
+        )
+    }
 
+    fn create_inode_with_metadata(
+        &self,
+        metadata: &mut MetadataIo<'_, '_, '_>,
+        mode: InodeMode,
+        uid: u32,
+        gid: u32,
+        device: Option<(u32, u32)>,
+    ) -> Result<InodeRef> {
+        self.ensure_mutable()?;
+        let is_dir = device.is_none() && mode.file_type() == FileType::Directory;
+        let id = self.alloc_inode(metadata, is_dir)?;
         let initialized = (|| {
-            let generation = self.next_inode_generation(id)?;
+            // Read through the operation so a reused table slot never obtains
+            // its generation from an older durable image or value cache.
+            let previous = metadata.read_inode(id)?.inode.generation();
+            let next = previous.wrapping_add(1);
             let mut inode = Box::new(Inode::default());
-            inode.set_generation(generation);
+            inode.set_generation(if next == 0 { 1 } else { next });
             inode.set_mode(mode);
             inode.set_uid(uid);
             inode.set_gid(gid);
-            inode.set_device(major, minor);
+            match device {
+                Some((major, minor)) => inode.set_device(major, minor),
+                None => inode.extent_init(),
+            }
             let mut inode_ref = InodeRef::new(id, inode);
-            self.write_inode_with_csum(&mut inode_ref)?;
+            metadata.write_inode_with_csum(&mut inode_ref)?;
             Ok(inode_ref)
         })();
-        let inode_ref = match initialized {
-            Ok(inode_ref) => inode_ref,
-            Err(error) => {
-                if self.rollback_new_inode(id, false).is_err() {
-                    self.poison(ErrCode::EIO);
-                }
-                return Err(error);
+        if initialized.is_err() && !metadata.is_transactional() {
+            // Direct mode may already have allocated on disk. Private mode
+            // must discard the operation instead of writing a rollback home.
+            if self.rollback_new_inode(id, is_dir).is_err() {
+                self.poison(ErrCode::EIO);
             }
-        };
-
-        trace!(
-            "Alloc device inode {} ({}:{}) ok",
-            inode_ref.id,
-            major,
-            minor
-        );
-        Ok(inode_ref)
+        }
+        initialized
     }
 
     /// Create(initialize) the root inode of the file system
@@ -1729,12 +1895,6 @@ impl Ext4 {
         // Invalidate inode cache entry
         self.inode_cache.lock().invalidate(inode_id);
         Ok(())
-    }
-
-    fn next_inode_generation(&self, inode_id: InodeId) -> Result<u32> {
-        let previous = self.read_inode_uncached(inode_id)?.inode.generation();
-        let next = previous.wrapping_add(1);
-        Ok(if next == 0 { 1 } else { next })
     }
 
     fn rollback_new_inode(&self, inode_id: InodeId, is_dir: bool) -> Result<()> {
@@ -1896,7 +2056,10 @@ impl Ext4 {
         loop {
             let mut inode = self.validate_reclaim_inode(inode_id, generation)?;
             if !inode.inode.uses_extents() {
-                if inode.inode.fs_block_count() != 0 {
+                // Inline symlinks and device inodes may own an external
+                // xattr block, which the common detach phase releases below.
+                let xattr_blocks = u64::from(inode.inode.xattr_block() != 0);
+                if inode.inode.fs_block_count() != xattr_blocks {
                     return_error!(ErrCode::EIO, "Non-extent orphan owns blocks");
                 }
                 break;
@@ -2062,8 +2225,10 @@ impl Ext4 {
         &self,
         transaction: super::journal_transaction::Transaction<'_>,
     ) -> Result<()> {
-        if let Err(error) = transaction.commit(self.block_device.as_ref(), self) {
-            self.poison(ErrCode::EIO);
+        if let Err(error) = self.commit_metadata_operation(transaction) {
+            if error.poisoned {
+                self.poison(ErrCode::EIO);
+            }
             return Err(error.error);
         }
         Ok(())
@@ -2322,15 +2487,16 @@ impl Ext4 {
     }
 
     /// Allocate a new inode, returning the inode number.
-    fn alloc_inode(&self, is_dir: bool) -> Result<InodeId> {
+    fn alloc_inode(&self, metadata: &mut MetadataIo<'_, '_, '_>, is_dir: bool) -> Result<InodeId> {
         let _alloc_guard = self.alloc_lock.lock();
-        let mut sb = self.read_super_block_cached();
+        let mut sb = metadata.read_super_block()?;
         let bg_count = sb.block_group_count();
+        let mut saw_retired = false;
 
         let mut bgid = 0;
         while bgid < bg_count {
             // Load block group descriptor
-            let mut bg = self.read_block_group(bgid)?;
+            let mut bg = metadata.read_block_group(bgid)?;
             // If there are no free inodes in this block group, try the next one
             if bg.desc.free_inodes_count() == 0 {
                 bgid += 1;
@@ -2338,7 +2504,7 @@ impl Ext4 {
             }
             // Load inode bitmap
             let bitmap_block_id = bg.desc.inode_bitmap_block();
-            let mut bitmap_block = self.read_block(bitmap_block_id)?;
+            let mut bitmap_block = metadata.read_block(bitmap_block_id)?;
             let old_bitmap_block = bitmap_block.clone();
             let old_bg = BlockGroupRef::new(bg.id, bg.desc);
             let old_sb = sb;
@@ -2347,13 +2513,26 @@ impl Ext4 {
             // the checksum covers the fixed inodes_per_group bitmap length.
             let idx_in_bg = {
                 let mut bitmap = Bitmap::new(&mut *bitmap_block.data, inode_count);
-                bitmap
-                    .find_and_set_first_clear_bit(0, inode_count)
-                    .ok_or(format_error!(
-                        ErrCode::ENOSPC,
-                        "No free inodes in block group {}",
-                        bgid
-                    ))? as u32
+                let mut next = 0;
+                let mut found = None;
+                while let Some(index) = bitmap.find_and_set_first_clear_bit(next, inode_count) {
+                    let inode_id = bgid * sb.inodes_per_group() + index as u32 + 1;
+                    if metadata.inode_reusable(inode_id) {
+                        found = Some(index as u32);
+                        break;
+                    }
+                    // This image is still private; rejected retired slots
+                    // remain free in the logical bitmap but unavailable to
+                    // allocation until the owning batch cleans its tail.
+                    bitmap.clear_bit(index);
+                    saw_retired = true;
+                    next = index + 1;
+                }
+                let Some(index) = found else {
+                    bgid += 1;
+                    continue;
+                };
+                index
             };
             // Update bitmap in disk
             if !bg.desc.update_inode_bitmap_csum(
@@ -2363,7 +2542,7 @@ impl Ext4 {
             ) {
                 return_error!(ErrCode::EIO, "Invalid inode bitmap checksum length");
             }
-            self.write_block(&bitmap_block)?;
+            metadata.write_block(&bitmap_block)?;
 
             // Modify block group counters
             bg.desc
@@ -2377,10 +2556,11 @@ impl Ext4 {
                 unused = inode_count as u32 - (idx_in_bg + 1);
                 bg.desc.set_itable_unused(unused);
             }
-            if let Err(error) = self.write_block_group_with_csum(&mut bg) {
-                if self
-                    .restore_inode_allocation_state(&old_bitmap_block, &old_bg, &old_sb)
-                    .is_err()
+            if let Err(error) = metadata.write_block_group_with_csum(&mut bg) {
+                if !metadata.is_transactional()
+                    && self
+                        .restore_inode_allocation_state(&old_bitmap_block, &old_bg, &old_sb)
+                        .is_err()
                 {
                     self.poison(ErrCode::EIO);
                 }
@@ -2389,10 +2569,11 @@ impl Ext4 {
 
             // Update superblock counters
             sb.set_free_inodes_count(sb.free_inodes_count() - 1);
-            if let Err(error) = self.write_super_block(&sb) {
-                if self
-                    .restore_inode_allocation_state(&old_bitmap_block, &old_bg, &old_sb)
-                    .is_err()
+            if let Err(error) = metadata.write_super_block(&sb) {
+                if !metadata.is_transactional()
+                    && self
+                        .restore_inode_allocation_state(&old_bitmap_block, &old_bg, &old_sb)
+                        .is_err()
                 {
                     self.poison(ErrCode::EIO);
                 }
@@ -2405,6 +2586,9 @@ impl Ext4 {
             return Ok(inode_id);
         }
         trace!("no free inode");
+        if saw_retired && metadata.request_retirement_progress() {
+            return_error!(ErrCode::EAGAIN, "Free inodes await journal checkpoint");
+        }
         return_error!(ErrCode::ENOSPC, "No free inodes in block group {}", bgid);
     }
 

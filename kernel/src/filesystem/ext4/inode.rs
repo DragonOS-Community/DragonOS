@@ -7,10 +7,11 @@ use crate::{
             AsyncPageCacheBackend, PageCache, PageCacheBackend, PageCacheDirtyCertificate,
             PageCacheExpectedDirtyTransition, PageCacheWritebackAdmissionOrder,
             PageCacheWritebackBindResult, PageCacheWritebackCancellationContext,
-            PageCacheWritebackDescriptor, PageCacheWritebackDispatchOutcome,
-            PageCacheWritebackProgress, PageCacheWritebackProgressOutcome,
-            PageCacheWritebackProtocol, PageCacheWritebackSnapshotPhase,
-            PageCacheWritebackSubmission, PageCacheWritebackSubmitResult,
+            PageCacheWritebackCompletion, PageCacheWritebackDescriptor,
+            PageCacheWritebackDispatchOutcome, PageCacheWritebackProgress,
+            PageCacheWritebackProgressOutcome, PageCacheWritebackProtocol,
+            PageCacheWritebackSnapshotPhase, PageCacheWritebackSubmission,
+            PageCacheWritebackSubmitResult,
         },
         vfs::{
             self, syscall::RenameFlags, utils::DName, vcore::generate_inode_id, FilePrivateData,
@@ -47,6 +48,7 @@ use num::ToPrimitive;
 use system_error::SystemError;
 
 use super::filesystem::Ext4FileSystem;
+use super::journal::Ext4JournalCompletion;
 
 const WHITEOUT_DEV: DeviceNumber = DeviceNumber::new(Major::UNNAMED_MAJOR, 0);
 
@@ -734,6 +736,7 @@ struct Ext4DelayedSubmission {
     entries: Vec<ClaimedDelallocEntry>,
     claim_incarnation: u64,
     progress: Arc<Ext4DelallocProgress>,
+    completion: Option<Arc<PageCacheWritebackCompletion>>,
 }
 
 struct ClaimedDelallocEntry {
@@ -742,6 +745,22 @@ struct ClaimedDelallocEntry {
 }
 
 impl Ext4DelayedSubmission {
+    fn finish_durable(&mut self) -> Result<(), SystemError> {
+        {
+            let mut guard = self.inode.inner.lock();
+            for entry in self.entries.iter() {
+                guard.durable_mtime_version =
+                    guard.durable_mtime_version.max(entry.pending.mtime_version);
+                guard.durable_ctime_version =
+                    guard.durable_ctime_version.max(entry.pending.ctime_version);
+            }
+        }
+        self.finish_completed()?;
+        self.progress
+            .publish(PageCacheWritebackProgressOutcome::Progress);
+        Ok(())
+    }
+
     fn claimed_entries_match(
         state: &ProductionDelallocState,
         entries: &[ClaimedDelallocEntry],
@@ -946,6 +965,25 @@ impl Ext4DelayedSubmission {
     }
 }
 
+impl Ext4JournalCompletion for Ext4DelayedSubmission {
+    fn complete(mut self: Box<Self>, result: Result<(), SystemError>) {
+        let result = result.and_then(|()| self.finish_durable());
+        if let Err(error) = &result {
+            self.finish_terminal();
+            self.progress
+                .publish(PageCacheWritebackProgressOutcome::Failed(error.clone()));
+        }
+        let completion = self
+            .completion
+            .take()
+            .expect("accepted writeback owns completion");
+        // Completion can synchronously enter PageCache and release retention.
+        // Drop filesystem claim state before entering that independent domain.
+        drop(self);
+        completion.complete(result);
+    }
+}
+
 impl PageCacheWritebackSubmission for Ext4EagerSubmission {
     fn submit(
         self: Box<Self>,
@@ -985,6 +1023,31 @@ impl PageCacheWritebackSubmission for Ext4DelayedSubmission {
             self.finish_terminal();
             return Err(SystemError::EIO);
         }
+        // Reserve bounded completion ownership before taking any mount,
+        // inode or pool lock. Publication must never be followed by ENOMEM.
+        let journal = self.fs.journal.clone();
+        let mut completion_reservation = if let Some(journal) = journal {
+            match journal.reserve_completion() {
+                Ok(reservation) => {
+                    self.completion = Some(PageCacheWritebackCompletion::new());
+                    Some(reservation)
+                }
+                Err(SystemError::ENOMEM) => {
+                    self.restore_ready(false)?;
+                    self.progress
+                        .publish(PageCacheWritebackProgressOutcome::Progress);
+                    return Err(SystemError::ENOMEM);
+                }
+                Err(error) => {
+                    self.finish_terminal();
+                    self.progress
+                        .publish(PageCacheWritebackProgressOutcome::Failed(error.clone()));
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
         let Some(authority) = self.fs.delalloc_mapper_authority.as_ref() else {
             self.finish_terminal();
             self.progress
@@ -1045,6 +1108,7 @@ impl PageCacheWritebackSubmission for Ext4DelayedSubmission {
                 let mut pool_slot = self.inode.delalloc_pool.lock();
                 let pool = pool_slot.as_mut().ok_or(SystemError::EIO)?;
 
+                let mut writer_wait = None;
                 let outcome = loop {
                     let observed = self.fs.fs.metadata_mutation_generation();
                     let outcome = self
@@ -1056,6 +1120,7 @@ impl PageCacheWritebackSubmission for Ext4DelayedSubmission {
                             &publications,
                             pool,
                         );
+                    drop(writer_wait.take());
                     if matches!(
                         outcome,
                         another_ext4::DelallocAppendBlockSubmitOutcome::RetryableNotPublished(
@@ -1065,23 +1130,13 @@ impl PageCacheWritebackSubmission for Ext4DelayedSubmission {
                         // Preserve the exact claimed pages, reservations and
                         // pool while sleeping on the filesystem-wide owner
                         // which can actually make this transaction runnable.
+                        let (observed, intent) = self.fs.prepare_metadata_writer_wait(observed)?;
+                        writer_wait = intent;
                         self.fs.wait_metadata_mutation_progress(observed)?;
                         continue;
                     }
                     break outcome;
                 };
-                if matches!(
-                    outcome,
-                    another_ext4::DelallocAppendBlockSubmitOutcome::Completed
-                ) {
-                    let mut guard = self.inode.inner.lock();
-                    for entry in self.entries.iter() {
-                        guard.durable_mtime_version =
-                            guard.durable_mtime_version.max(entry.pending.mtime_version);
-                        guard.durable_ctime_version =
-                            guard.durable_ctime_version.max(entry.pending.ctime_version);
-                    }
-                }
                 Ok(outcome)
             })();
         let outcome = match outcome {
@@ -1101,10 +1156,23 @@ impl PageCacheWritebackSubmission for Ext4DelayedSubmission {
         };
         match outcome {
             another_ext4::DelallocAppendBlockSubmitOutcome::Completed => {
-                self.finish_completed()?;
-                self.progress
-                    .publish(PageCacheWritebackProgressOutcome::Progress);
+                self.finish_durable()?;
                 Ok(PageCacheWritebackSubmitResult::Completed)
+            }
+            another_ext4::DelallocAppendBlockSubmitOutcome::Published(sequence) => {
+                let Some(reservation) = completion_reservation.take() else {
+                    self.finish_terminal();
+                    return Err(SystemError::EIO);
+                };
+                let completion = self
+                    .completion
+                    .as_ref()
+                    .expect("reserved completion")
+                    .clone();
+                // All submission locks were scoped inside the closure above.
+                // The reservation consumes this existing Box without allocation.
+                reservation.publish(sequence, self);
+                Ok(PageCacheWritebackSubmitResult::Submitted(completion))
             }
             another_ext4::DelallocAppendBlockSubmitOutcome::RetryableNotPublished(
                 another_ext4::ErrCode::EAGAIN,
@@ -1376,6 +1444,7 @@ impl PageCacheBackend for Ext4PageCacheBackend {
                     entries: claimed,
                     claim_incarnation: incarnation,
                     progress,
+                    completion: None,
                 },
             )));
         }
@@ -1602,12 +1671,18 @@ impl IndexNode for LockedExt4Inode {
             let guard = self.inner.lock();
             (guard.concret_fs(), guard.inner_inode_num)
         };
-        let file_type = fs.fs.getattr(inode_num)?.ftype;
+        let file_type = fs
+            .retry_metadata_read_contention(|| fs.fs.getattr(inode_num))?
+            .ftype;
         match file_type {
             FileType::Directory => Err(SystemError::EISDIR),
             FileType::Unknown => Err(SystemError::EROFS),
-            FileType::RegularFile => fs.fs.read(inode_num, offset, buf).map_err(Into::into),
-            FileType::SymLink => fs.fs.readlink(inode_num, offset, buf).map_err(Into::into),
+            FileType::RegularFile => fs
+                .retry_metadata_read_contention(|| fs.fs.read(inode_num, offset, buf))
+                .map_err(Into::into),
+            FileType::SymLink => fs
+                .retry_metadata_read_contention(|| fs.fs.readlink(inode_num, offset, buf))
+                .map_err(Into::into),
             _ => Err(SystemError::EINVAL),
         }
     }
@@ -1709,7 +1784,9 @@ impl IndexNode for LockedExt4Inode {
                 match cached_size {
                     Some(size) => size,
                     None => {
-                        let size = fs.fs.getattr(inode_num)?.size;
+                        let size = fs
+                            .retry_metadata_read_contention(|| fs.fs.getattr(inode_num))?
+                            .size;
                         self.inner.lock().cached_file_size = Some(size);
                         size
                     }
@@ -1806,7 +1883,9 @@ impl IndexNode for LockedExt4Inode {
             let guard = self.inner.lock();
             (guard.concret_fs(), guard.inner_inode_num)
         };
-        let file_type = fs.fs.getattr(inode_num)?.ftype;
+        let file_type = fs
+            .retry_metadata_read_contention(|| fs.fs.getattr(inode_num))?
+            .ftype;
         match file_type {
             FileType::Directory => Err(SystemError::EISDIR),
             FileType::Unknown => Err(SystemError::EROFS),
@@ -1855,7 +1934,8 @@ impl IndexNode for LockedExt4Inode {
             guard.children.remove(&dname);
         }
         let fs = guard.concret_fs();
-        let next_inode = fs.fs.lookup(guard.inner_inode_num, name)?;
+        let next_inode =
+            fs.retry_metadata_read_contention(|| fs.fs.lookup(guard.inner_inode_num, name))?;
         // 通过self_ref获取Arc<Self>，然后转换为Arc<dyn IndexNode>
         let self_arc = guard.self_ref.upgrade().ok_or(SystemError::ENOENT)?;
         let inode =
@@ -1880,7 +1960,8 @@ impl IndexNode for LockedExt4Inode {
     fn list(&self) -> Result<Vec<String>, SystemError> {
         let _operation = self.begin_operation()?;
         let guard = self.inner.lock();
-        let dentry = guard.concret_fs().fs.listdir(guard.inner_inode_num)?;
+        let fs = guard.concret_fs();
+        let dentry = fs.retry_metadata_read_contention(|| fs.fs.listdir(guard.inner_inode_num))?;
         let mut list = Vec::new();
         for entry in dentry {
             list.push(entry.name());
@@ -1909,8 +1990,8 @@ impl IndexNode for LockedExt4Inode {
         let _other_operation = other_arc.begin_operation()?;
         let other_inode_num = other_arc.inner.lock().inner_inode_num;
 
-        let my_attr = ext4.getattr(inode_num)?;
-        let other_attr = ext4.getattr(other_inode_num)?;
+        let my_attr = fs.retry_metadata_read_contention(|| ext4.getattr(inode_num))?;
+        let other_attr = fs.retry_metadata_read_contention(|| ext4.getattr(other_inode_num))?;
 
         if my_attr.ftype != another_ext4::FileType::Directory {
             return Err(SystemError::ENOTDIR);
@@ -1920,7 +2001,10 @@ impl IndexNode for LockedExt4Inode {
             return Err(SystemError::EISDIR);
         }
 
-        if ext4.lookup(inode_num, name).is_ok() {
+        if fs
+            .retry_metadata_read_contention(|| ext4.lookup(inode_num, name))
+            .is_ok()
+        {
             return Err(SystemError::EEXIST);
         }
 
@@ -1945,12 +2029,16 @@ impl IndexNode for LockedExt4Inode {
         let fs = guard.concret_fs();
         let ext4 = &fs.fs;
         let inode_num = guard.inner_inode_num;
-        let attr = ext4.getattr(inode_num)?;
+        let attr = fs.retry_metadata_read_contention(|| ext4.getattr(inode_num))?;
         if attr.ftype != another_ext4::FileType::Directory {
             return Err(SystemError::ENOTDIR);
         }
-        let target_num = ext4.lookup(inode_num, name)?;
-        if ext4.getattr(target_num)?.ftype == FileType::Directory {
+        let target_num = fs.retry_metadata_read_contention(|| ext4.lookup(inode_num, name))?;
+        if fs
+            .retry_metadata_read_contention(|| ext4.getattr(target_num))?
+            .ftype
+            == FileType::Directory
+        {
             return Err(SystemError::EISDIR);
         }
         let self_arc = guard.self_ref.upgrade().ok_or(SystemError::ENOENT)?;
@@ -1962,7 +2050,7 @@ impl IndexNode for LockedExt4Inode {
         let target_lifecycle = target.lifecycle().clone();
         let _link_mutation = target_lifecycle.lock_link_mutation();
         let _target_operation = target.begin_operation()?;
-        match ext4.lookup(inode_num, name) {
+        match fs.retry_metadata_read_contention(|| ext4.lookup(inode_num, name)) {
             Ok(current) if current == target_num => {}
             Ok(_) => return Err(SystemError::EAGAIN_OR_EWOULDBLOCK),
             Err(error) => return Err(error.into()),
@@ -1990,7 +2078,7 @@ impl IndexNode for LockedExt4Inode {
                 guard.cached_file_size,
             )
         };
-        let attr = fs.fs.getattr(inode_num)?;
+        let attr = fs.retry_metadata_read_contention(|| fs.fs.getattr(inode_num))?;
         // Disk attributes provide non-cached fields. Read the authoritative
         // in-memory values afterwards so a concurrent atime update cannot be
         // hidden by a stale pre-getattr snapshot.
@@ -2037,6 +2125,8 @@ impl IndexNode for LockedExt4Inode {
 
     fn sync(&self) -> Result<(), SystemError> {
         let _operation = self.begin_operation()?;
+        let fs = self.inner.lock().concret_fs();
+        let _journal_sync = fs.begin_journal_sync();
         let snapshot = if let Some(page_cache) = self.page_cache() {
             let (snapshot, range) =
                 page_cache
@@ -2056,6 +2146,8 @@ impl IndexNode for LockedExt4Inode {
 
     fn datasync(&self) -> Result<(), SystemError> {
         let _operation = self.begin_operation()?;
+        let fs = self.inner.lock().concret_fs();
+        let _journal_sync = fs.begin_journal_sync();
         let snapshot = if let Some(page_cache) = self.page_cache() {
             let (snapshot, range) =
                 page_cache
@@ -2089,6 +2181,8 @@ impl IndexNode for LockedExt4Inode {
         _data: PrivateData,
     ) -> Result<(), SystemError> {
         let _operation = self.begin_operation()?;
+        let fs = self.inner.lock().concret_fs();
+        let _journal_sync = fs.begin_journal_sync();
         let snapshot = if let Some(page_cache) = self.page_cache() {
             let start_index = start >> MMArch::PAGE_SHIFT;
             let end_index = end >> MMArch::PAGE_SHIFT;
@@ -2385,7 +2479,10 @@ impl IndexNode for LockedExt4Inode {
                     let cached_size = self.inner.lock().cached_file_size;
                     let current_size = match cached_size {
                         Some(size) => size,
-                        None => fs.fs.getattr(inode_num)?.size,
+                        None => {
+                            fs.retry_metadata_read_contention(|| fs.fs.getattr(inode_num))?
+                                .size
+                        }
                     };
                     // After truncate_locked() asks for another unmap pass, the
                     // inode size already equals len.  Preserve that pending
@@ -2531,10 +2628,15 @@ impl IndexNode for LockedExt4Inode {
         let fs = guard.concret_fs();
         let concret_fs = &fs.fs;
         let inode_num = guard.inner_inode_num;
-        if concret_fs.getattr(inode_num)?.ftype != FileType::Directory {
+        if fs
+            .retry_metadata_read_contention(|| concret_fs.getattr(inode_num))?
+            .ftype
+            != FileType::Directory
+        {
             return Err(SystemError::ENOTDIR);
         }
-        let target_num = concret_fs.lookup(inode_num, name)?;
+        let target_num =
+            fs.retry_metadata_read_contention(|| concret_fs.lookup(inode_num, name))?;
         if target_num == inode_num {
             return Err(if name == "." {
                 SystemError::EINVAL
@@ -2542,10 +2644,18 @@ impl IndexNode for LockedExt4Inode {
                 SystemError::ENOTEMPTY
             });
         }
-        if concret_fs.getattr(target_num)?.ftype != FileType::Directory {
+        if fs
+            .retry_metadata_read_contention(|| concret_fs.getattr(target_num))?
+            .ftype
+            != FileType::Directory
+        {
             return Err(SystemError::ENOTDIR);
         }
-        if concret_fs.listdir(target_num)?.len() > 2 {
+        if fs
+            .retry_metadata_read_contention(|| concret_fs.listdir(target_num))?
+            .len()
+            > 2
+        {
             return Err(SystemError::ENOTEMPTY);
         }
         let self_arc = guard.self_ref.upgrade().ok_or(SystemError::ENOENT)?;
@@ -2556,16 +2666,16 @@ impl IndexNode for LockedExt4Inode {
         )?;
         let target_lifecycle = target.lifecycle().clone();
         let _link_mutation = target_lifecycle.lock_link_mutation();
-        match concret_fs.lookup(inode_num, name) {
+        match fs.retry_metadata_read_contention(|| concret_fs.lookup(inode_num, name)) {
             Ok(current) if current == target_num => {}
             Ok(_) => return Err(SystemError::EAGAIN_OR_EWOULDBLOCK),
             Err(error) => return Err(error.into()),
         }
-        let target_attr = concret_fs.getattr(target_num)?;
+        let target_attr = fs.retry_metadata_read_contention(|| concret_fs.getattr(target_num))?;
         if target_attr.ftype != FileType::Directory {
             return Err(SystemError::ENOTDIR);
         }
-        match concret_fs.listdir(target_num) {
+        match fs.retry_metadata_read_contention(|| concret_fs.listdir(target_num)) {
             Ok(entries) if entries.len() <= 2 => {}
             Ok(_) => return Err(SystemError::ENOTEMPTY),
             Err(error) => return Err(error.into()),
@@ -2589,12 +2699,16 @@ impl IndexNode for LockedExt4Inode {
         let ext4 = &fs.fs;
         let inode_num = guard.inner_inode_num;
 
-        if ext4.getattr(inode_num)?.ftype == FileType::SymLink {
+        if fs
+            .retry_metadata_read_contention(|| ext4.getattr(inode_num))?
+            .ftype
+            == FileType::SymLink
+        {
             return Err(SystemError::EPERM);
         }
 
         // 调用another_ext4库的getxattr接口
-        let value = ext4.getxattr(inode_num, name)?;
+        let value = fs.retry_metadata_read_contention(|| ext4.getxattr(inode_num, name))?;
 
         // 如果缓冲区为空，只返回需要的长度
         if buf.is_empty() {
@@ -2620,7 +2734,11 @@ impl IndexNode for LockedExt4Inode {
         let ext4 = &fs.fs;
         let inode_num = guard.inner_inode_num;
 
-        if ext4.getattr(inode_num)?.ftype == FileType::SymLink {
+        if fs
+            .retry_metadata_read_contention(|| ext4.getattr(inode_num))?
+            .ftype
+            == FileType::SymLink
+        {
             return Err(SystemError::EPERM);
         }
 
@@ -2640,10 +2758,11 @@ impl IndexNode for LockedExt4Inode {
     fn listxattr(&self, buf: &mut [u8]) -> Result<usize, SystemError> {
         let _operation = self.begin_operation()?;
         let guard = self.inner.lock();
-        let ext4 = &guard.concret_fs().fs;
+        let fs = guard.concret_fs();
+        let ext4 = &fs.fs;
         let inode_num = guard.inner_inode_num;
 
-        let names = ext4.listxattr(inode_num)?;
+        let names = fs.retry_metadata_read_contention(|| ext4.listxattr(inode_num))?;
         let total_len = names.iter().try_fold(0usize, |acc, name| {
             acc.checked_add(name.len())
                 .and_then(|len| len.checked_add(1))
@@ -2676,7 +2795,11 @@ impl IndexNode for LockedExt4Inode {
         let ext4 = &fs.fs;
         let inode_num = guard.inner_inode_num;
 
-        if ext4.getattr(inode_num)?.ftype == FileType::SymLink {
+        if fs
+            .retry_metadata_read_contention(|| ext4.getattr(inode_num))?
+            .ftype
+            == FileType::SymLink
+        {
             return Err(SystemError::EPERM);
         }
 
@@ -2709,7 +2832,11 @@ impl IndexNode for LockedExt4Inode {
         // no fallible parent lookup remains after the namespace transaction.
         let self_arc = guard.self_ref.upgrade().ok_or(SystemError::ENOENT)?;
 
-        if ext4.getattr(inode_num)?.ftype != FileType::Directory {
+        if fs
+            .retry_metadata_read_contention(|| ext4.getattr(inode_num))?
+            .ftype
+            != FileType::Directory
+        {
             return Err(SystemError::ENOTDIR);
         }
 
@@ -2819,7 +2946,10 @@ impl IndexNode for LockedExt4Inode {
         let new_dname = DName::from(new_name);
 
         // NOREPLACE check (VFS layer responsibility - ext4 lib doesn't know about flags)
-        if flags.contains(RenameFlags::NOREPLACE) && ext4.lookup(target_inode_num, new_name).is_ok()
+        if flags.contains(RenameFlags::NOREPLACE)
+            && ext4_fs
+                .retry_metadata_read_contention(|| ext4.lookup(target_inode_num, new_name))
+                .is_ok()
         {
             return Err(SystemError::EEXIST);
         }
@@ -2848,12 +2978,15 @@ impl IndexNode for LockedExt4Inode {
         }
 
         // Capture the replacement target while both parent namespace locks are held.
-        let dst_inode_num = match ext4.lookup(target_inode_num, new_name) {
+        let dst_inode_num = match ext4_fs
+            .retry_metadata_read_contention(|| ext4.lookup(target_inode_num, new_name))
+        {
             Ok(inode) => Some(inode),
-            Err(error) if error.code() == another_ext4::ErrCode::ENOENT => None,
+            Err(SystemError::ENOENT) => None,
             Err(error) => return Err(error.into()),
         };
-        let src_child_num = ext4.lookup(src_inode_num, old_name)?;
+        let src_child_num =
+            ext4_fs.retry_metadata_read_contention(|| ext4.lookup(src_inode_num, old_name))?;
         if dst_inode_num == Some(src_child_num) {
             return Ok(vfs::RenameOutcome::NoOp);
         }
@@ -2878,15 +3011,24 @@ impl IndexNode for LockedExt4Inode {
             .as_ref()
             .map(|lifecycle| lifecycle.lock_link_mutation());
         if let Some(dst_inode_num) = dst_inode_num {
-            let src_type = ext4.getattr(src_child_num)?.ftype;
-            let dst_type = ext4.getattr(dst_inode_num)?.ftype;
+            let src_type = ext4_fs
+                .retry_metadata_read_contention(|| ext4.getattr(src_child_num))?
+                .ftype;
+            let dst_type = ext4_fs
+                .retry_metadata_read_contention(|| ext4.getattr(dst_inode_num))?
+                .ftype;
             match (
                 src_type == FileType::Directory,
                 dst_type == FileType::Directory,
             ) {
                 (true, false) => return Err(SystemError::ENOTDIR),
                 (false, true) => return Err(SystemError::EISDIR),
-                (true, true) if ext4.listdir(dst_inode_num)?.len() > 2 => {
+                (true, true)
+                    if ext4_fs
+                        .retry_metadata_read_contention(|| ext4.listdir(dst_inode_num))?
+                        .len()
+                        > 2 =>
+                {
                     return Err(SystemError::ENOTEMPTY);
                 }
                 _ => {}
@@ -2907,7 +3049,10 @@ impl IndexNode for LockedExt4Inode {
                 .ok_or(SystemError::ENOENT)?;
             for _ in 0..32 {
                 let candidate = format!(".dragonos-whiteout-{}", generate_inode_id().data());
-                if ext4.lookup(src_inode_num, &candidate).is_ok() {
+                if ext4_fs
+                    .retry_metadata_read_contention(|| ext4.lookup(src_inode_num, &candidate))
+                    .is_ok()
+                {
                     continue;
                 }
                 let allocation = ext4_fs.begin_allocation()?;
@@ -3917,6 +4062,8 @@ impl LockedExt4Inode {
     }
 
     pub(super) fn drain_delalloc_before_eager(&self) -> Result<(), SystemError> {
+        let fs = self.inner.lock().concret_fs();
+        let mut journal_sync = None;
         loop {
             let (page_cache, first_page, last_page) = {
                 let guard = self.inner.lock();
@@ -3946,6 +4093,12 @@ impl LockedExt4Inode {
                     last_offset / MMArch::PAGE_SIZE,
                 )
             };
+            // Empty drains are ordinary metadata operations, not durability
+            // requests. Only force progress when a real delayed head can make
+            // the following PageCache wait depend on journal completion.
+            if journal_sync.is_none() {
+                journal_sync = fs.begin_journal_sync();
+            }
             page_cache
                 .manager()
                 .writeback_range(first_page, last_page)?;
@@ -3963,6 +4116,8 @@ impl LockedExt4Inode {
         offset: usize,
         len: usize,
     ) -> Result<(), SystemError> {
+        let fs = self.inner.lock().concret_fs();
+        let mut journal_sync = None;
         if len == 0 {
             return Ok(());
         }
@@ -4015,6 +4170,9 @@ impl LockedExt4Inode {
                     submit_last / MMArch::PAGE_SIZE,
                 )
             };
+            if journal_sync.is_none() {
+                journal_sync = fs.begin_journal_sync();
+            }
             page_cache.manager().writeback_range(batch.0, batch.1)?;
         }
 
@@ -4107,9 +4265,12 @@ impl LockedExt4Inode {
         fs: &Arc<Ext4FileSystem>,
         mut handle: another_ext4::InodeReclaimHandle,
     ) -> Result<(), (another_ext4::Ext4Error, another_ext4::InodeReclaimHandle)> {
+        let mut writer_wait = None;
         loop {
             let observed = fs.fs.metadata_mutation_generation();
-            match fs.fs.reclaim_inode(handle) {
+            let result = fs.fs.reclaim_inode(handle);
+            drop(writer_wait.take());
+            match result {
                 Ok(()) => return Ok(()),
                 Err(failure) => {
                     let (error, returned_handle) = failure.into_parts();
@@ -4117,6 +4278,13 @@ impl LockedExt4Inode {
                         return Err((error, returned_handle));
                     }
                     handle = returned_handle;
+                    let observed = match fs.prepare_metadata_writer_wait(observed) {
+                        Ok((observed, intent)) => {
+                            writer_wait = intent;
+                            observed
+                        }
+                        Err(error) => return Err((error, handle)),
+                    };
                     if fs.wait_metadata_mutation_progress(observed).is_err() {
                         return Err((
                             another_ext4::Ext4Error::new(another_ext4::ErrCode::EIO),
@@ -4138,9 +4306,12 @@ impl LockedExt4Inode {
         let _link_mutation = lifecycle.lock_link_mutation();
         let tombstone = fs.begin_freeing(&inode)?;
         let _reuse = fs.begin_reclaim();
+        let mut writer_wait = None;
         let handle = loop {
             let observed = fs.fs.metadata_mutation_generation();
-            match fs.fs.unlink(parent_inode_num, name) {
+            let result = fs.fs.unlink(parent_inode_num, name);
+            drop(writer_wait.take());
+            match result {
                 Ok(Some(handle)) => break handle,
                 Ok(None) => {
                     let error = SystemError::EIO;
@@ -4148,6 +4319,17 @@ impl LockedExt4Inode {
                     return Err(error);
                 }
                 Err(error) if error.code() == another_ext4::ErrCode::EAGAIN => {
+                    let observed = match fs.prepare_metadata_writer_wait(observed) {
+                        Ok((observed, intent)) => {
+                            writer_wait = intent;
+                            observed
+                        }
+                        Err(error) => {
+                            let error = SystemError::from(error);
+                            let _ = fs.poison_freeing(tombstone, error.clone());
+                            return Err(error);
+                        }
+                    };
                     if let Err(error) = fs.wait_metadata_mutation_progress(observed) {
                         let _ = fs.poison_freeing(tombstone, error.clone());
                         return Err(error);
@@ -4297,7 +4479,7 @@ impl LockedExt4Inode {
         parent: Option<Weak<LockedExt4Inode>>,
     ) -> Result<Arc<Self>, SystemError> {
         let fs = fs_ptr.upgrade().ok_or(SystemError::EIO)?;
-        let attr = fs.fs.getattr(inode_num)?;
+        let attr = fs.retry_metadata_read_contention(|| fs.fs.getattr(inode_num))?;
         Self::new_with_attr(inode_num, fs_ptr, dname, parent, &attr)
     }
 
@@ -4712,7 +4894,10 @@ impl LockedExt4Inode {
         let size = if size_dirty {
             Some(match cached_size {
                 Some(size) => size,
-                None => fs.fs.getattr(inode_num)?.size,
+                None => {
+                    fs.retry_metadata_read_contention(|| fs.fs.getattr(inode_num))?
+                        .size
+                }
             })
         } else {
             None
@@ -4785,7 +4970,9 @@ impl LockedExt4Inode {
             let file_size = match guard.cached_file_size {
                 Some(size) => size,
                 None => {
-                    let size = fs.fs.getattr(guard.inner_inode_num)?.size;
+                    let size = fs
+                        .retry_metadata_read_contention(|| fs.fs.getattr(guard.inner_inode_num))?
+                        .size;
                     guard.cached_file_size = Some(size);
                     size
                 }

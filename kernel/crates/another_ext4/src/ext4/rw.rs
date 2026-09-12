@@ -3,6 +3,156 @@ use crate::constants::*;
 use crate::ext4_defs::*;
 use crate::prelude::*;
 
+/// Explicit metadata image access for algorithms shared by direct and journal
+/// operations. File payload I/O never goes through this context. A journal
+/// context owns no global cache side effects: publication belongs to its caller.
+/// Keeping the transaction borrow here prevents private images escaping an
+/// operation or being mistaken for the mounted filesystem's live view.
+pub(super) struct MetadataIo<'fs, 'tx, 'core> {
+    fs: &'fs Ext4,
+    transaction: Option<&'tx mut super::journal_transaction::Transaction<'core>>,
+}
+
+impl<'fs, 'tx, 'core> MetadataIo<'fs, 'tx, 'core> {
+    pub(super) fn direct(fs: &'fs Ext4) -> Self {
+        Self {
+            fs,
+            transaction: None,
+        }
+    }
+
+    pub(super) fn transaction(
+        fs: &'fs Ext4,
+        transaction: &'tx mut super::journal_transaction::Transaction<'core>,
+    ) -> Self {
+        Self {
+            fs,
+            transaction: Some(transaction),
+        }
+    }
+
+    pub(super) fn transaction_ref(
+        &self,
+    ) -> Option<&super::journal_transaction::Transaction<'core>> {
+        self.transaction.as_deref()
+    }
+
+    /// Allocate a tree metadata block through the same operation as its
+    /// parent pointer. Direct mode retains its existing allocation protocol.
+    pub(super) fn allocate_block(&mut self, inode: &mut InodeRef) -> Result<PBlockId> {
+        match self.transaction.as_deref_mut() {
+            Some(transaction) => {
+                let home = self
+                    .fs
+                    .transaction_alloc_metadata_block(transaction, inode.id, None)?;
+                let blocks = inode
+                    .inode
+                    .fs_block_count()
+                    .checked_add(1)
+                    .ok_or_else(|| Ext4Error::new(ErrCode::EFBIG))?;
+                inode.inode.set_fs_block_count(blocks);
+                Ok(home)
+            }
+            None => self.fs.alloc_block(inode),
+        }
+    }
+
+    pub(super) fn allocate_initialized_data(
+        &mut self,
+        inode: &mut InodeRef,
+        image: Box<[u8; BLOCK_SIZE]>,
+    ) -> Result<PBlockId> {
+        if self.transaction.is_none() {
+            return self.fs.alloc_initialized_data_block(inode, image);
+        }
+        let home = self.allocate_block(inode)?;
+        // Payload bypasses metadata staging; the journal's first flush orders
+        // this successful write before the mapping's commit record.
+        self.fs.block_device.write_block(&Block::new(home, image))?;
+        Ok(home)
+    }
+
+    pub(super) fn request_retirement_progress(&self) -> bool {
+        self.transaction
+            .as_deref()
+            .is_some_and(|tx| tx.request_retirement_progress())
+    }
+
+    pub(super) fn inode_reusable(&self, id: InodeId) -> bool {
+        self.transaction
+            .as_deref()
+            .is_none_or(|tx| tx.inode_reusable(id))
+    }
+
+    pub(super) fn is_transactional(&self) -> bool {
+        self.transaction.is_some()
+    }
+
+    pub(super) fn read_block(&self, id: PBlockId) -> Result<Block> {
+        match self.transaction.as_deref() {
+            Some(transaction) => {
+                let image = transaction.read(self.fs.block_device.as_ref(), id)?;
+                Ok(Block::new(id, Box::new(*image)))
+            }
+            None => self.fs.read_block(id),
+        }
+    }
+
+    pub(super) fn write_block(&mut self, block: &Block) -> Result<()> {
+        match self.transaction.as_deref_mut() {
+            Some(transaction) => transaction.stage(block.id, block.data.clone()),
+            None => self.fs.write_block(block),
+        }
+    }
+
+    pub(super) fn read_super_block(&self) -> Result<SuperBlock> {
+        match self.transaction.as_deref() {
+            Some(transaction) => self.fs.transaction_read_super_block(transaction),
+            None => Ok(self.fs.read_super_block_cached()),
+        }
+    }
+
+    pub(super) fn write_super_block(&mut self, sb: &SuperBlock) -> Result<()> {
+        match self.transaction.as_deref_mut() {
+            Some(transaction) => self.fs.transaction_stage_super_block(transaction, sb),
+            None => self.fs.write_super_block(sb),
+        }
+    }
+
+    pub(super) fn read_block_group(&self, id: BlockGroupId) -> Result<BlockGroupRef> {
+        match self.transaction.as_deref() {
+            Some(transaction) => self.fs.transaction_read_block_group(transaction, id),
+            None => self.fs.read_block_group(id),
+        }
+    }
+
+    pub(super) fn write_block_group_with_csum(&mut self, bg: &mut BlockGroupRef) -> Result<()> {
+        match self.transaction.as_deref_mut() {
+            Some(transaction) => self
+                .fs
+                .transaction_stage_block_group_with_csum(transaction, bg),
+            None => self.fs.write_block_group_with_csum(bg),
+        }
+    }
+
+    pub(super) fn read_inode(&self, id: InodeId) -> Result<InodeRef> {
+        // Geometry is immutable while mounted. The inode image, unlike its
+        // position, must come from the current operation and bypass value cache.
+        let (block, offset) = self.fs.inode_disk_pos(id)?;
+        let image = self.read_block(block)?;
+        Ok(InodeRef::new(id, Box::new(image.read_offset_as(offset))))
+    }
+
+    pub(super) fn write_inode_with_csum(&mut self, inode: &mut InodeRef) -> Result<()> {
+        match self.transaction.as_deref_mut() {
+            Some(transaction) => self
+                .fs
+                .transaction_stage_inode_with_csum(transaction, inode),
+            None => self.fs.write_inode_with_csum(inode),
+        }
+    }
+}
+
 impl Ext4 {
     /// Obtain a transaction-private metadata block image for mutation.
     /// Repeated calls for the same block merge changes in one staged image.
@@ -92,11 +242,22 @@ impl Ext4 {
 
     /// Read a block from block device
     pub(super) fn read_block(&self, block_id: PBlockId) -> Result<Block> {
-        self.block_device.read_block(block_id)
+        match &self.metadata_mode {
+            super::MetadataMutationMode::Batched(core) => {
+                core.read_metadata(self.block_device.as_ref(), block_id)
+            }
+            _ => self.block_device.read_block(block_id),
+        }
     }
 
     /// Write a block to block device
     pub(super) fn write_block(&self, block: &Block) -> Result<()> {
+        if matches!(self.metadata_mode, super::MetadataMutationMode::Batched(_)) {
+            // A runtime metadata writer bypassing a private operation is a
+            // contract violation, never an alternate write-through route.
+            self.poison(ErrCode::EIO);
+            return Err(Ext4Error::new(ErrCode::EIO));
+        }
         self.block_device.write_block(block)
     }
 
@@ -136,6 +297,11 @@ impl Ext4 {
     /// Read an inode from cache or block device, return an `InodeRef` that
     /// combines the inode and its id.
     pub(super) fn read_inode(&self, inode_id: InodeId) -> Result<InodeRef> {
+        // Callers hold a read/direct/exclusive metadata gate through lookup
+        // and cold insertion. Logical publication takes the exclusive gate
+        // and invalidates changed inode-table homes, so a cold reader cannot
+        // insert an older value after publication. Transaction-private reads
+        // use MetadataIo::read_inode and deliberately bypass this cache.
         // Try cache first
         if let Some(cached) = self.inode_cache.lock().get(inode_id) {
             return Ok(cached);

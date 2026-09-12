@@ -55,8 +55,6 @@ pub struct IfaceCommon {
     pub(super) bootstrap_routes: Mutex<Vec<BootstrapRoute>>,
     /// TCP close(2) 语义辅助：延迟回收 smoltcp TCP socket（Linux-like）。
     pub(super) tcp_close_defer: crate::net::tcp_close_defer::TcpCloseDefer,
-    /// TCP listener/backlog 语义辅助（Linux-like 丢 SYN 等）。
-    pub(super) tcp_listener_backlog: crate::net::tcp_listener_backlog::TcpListenerBacklog,
     pub(super) ipv4_multicast_refcnt: Mutex<Vec<(smoltcp::wire::Ipv4Address, usize)>>,
     /// Serializes configured receive-mode flags with AF_PACKET references.
     pub(super) receive_mode: Mutex<ReceiveModeState>,
@@ -129,7 +127,6 @@ impl IfaceCommon {
             address_metadata: Mutex::new(address_metadata),
             bootstrap_routes: Mutex::new(Vec::new()),
             tcp_close_defer: crate::net::tcp_close_defer::TcpCloseDefer::new(),
-            tcp_listener_backlog: crate::net::tcp_listener_backlog::TcpListenerBacklog::new(),
             ipv4_multicast_refcnt: Mutex::new(Vec::new()),
             receive_mode: Mutex::new(ReceiveModeState {
                 configured_flags: flags.bits(),
@@ -137,17 +134,6 @@ impl IfaceCommon {
                 packet_allmulti: 0,
             }),
         }
-    }
-
-    /// Register an active TCP listener port on this iface.
-    pub fn register_tcp_listen_port(&self, port: u16, backlog: usize) {
-        self.tcp_listener_backlog
-            .register_tcp_listen_port(port, backlog);
-    }
-
-    /// Unregister an active TCP listener port on this iface.
-    pub fn unregister_tcp_listen_port(&self, port: u16) {
-        self.tcp_listener_backlog.unregister_tcp_listen_port(port);
     }
 
     pub fn ipv4_multicast_join_ref(
@@ -180,13 +166,6 @@ impl IfaceCommon {
             .smol_iface
             .lock()
             .leave_multicast_group(smoltcp::wire::IpAddress::Ipv4(group));
-    }
-
-    /// 驱动收包入口使用的通用丢包策略（避免驱动理解 L4 语义）。
-    #[inline]
-    pub fn should_drop_rx_packet(&self, packet: &[u8]) -> bool {
-        self.tcp_listener_backlog
-            .should_drop_backlog_full_tcp_syn_ip(packet)
     }
 
     pub(super) fn enqueue_local_input(&self, packet: LocalInputPacket) -> Result<(), SystemError> {
@@ -581,9 +560,14 @@ impl IfaceCommon {
                 authoritative_ipv4_output,
             });
 
-            // 刷新 listener 缓存：必须在持有 sockets 锁的前提下进行，且不得额外分配。
-            self.tcp_listener_backlog
-                .refresh_listen_socket_present(&sockets);
+            // Refresh logical listener eligibility under SocketSet serialization
+            // before either namespace-local or device ingress. Port-table methods
+            // never acquire SocketSet, preserving the one-way lock order.
+            if let Some(netns) = netns.as_ref() {
+                netns
+                    .tcp_port_manager()
+                    .refresh_tcp_listener_selection(&mut sockets);
+            }
 
             let (has_events, poll_again, deadline_rearm) = {
                 let local_result = if routed_this_round
@@ -769,9 +753,13 @@ impl IfaceCommon {
                 authoritative_ipv4_output,
             });
 
-            // 刷新 listener 缓存：必须在持有 sockets 锁的前提下进行，且不得额外分配。
-            self.tcp_listener_backlog
-                .refresh_listen_socket_present(&sockets);
+            // Apply the same selection to both local handoff and device ingress
+            // for the entire serialized NAPI batch.
+            if let Some(netns) = netns.as_ref() {
+                netns
+                    .tcp_port_manager()
+                    .refresh_tcp_listener_selection(&mut sockets);
+            }
 
             let mut processed = 0usize;
             let mut had_packet = false;

@@ -150,6 +150,8 @@ pub struct TcpSocket {
     pub(crate) self_ref: Weak<Self>,
     pub(crate) pollee: AtomicUsize,
     pub(crate) netns: Arc<NetNamespace>,
+    /// Socket credentials are captured at creation, independent of the bind caller.
+    pub(crate) owner_uid: u32,
     pub(crate) epoll_items: EPollItems,
     pub(crate) fasync_items: FAsyncItems,
     pub(crate) options: TcpSocketOptions,
@@ -184,6 +186,7 @@ impl TcpSocket {
             self_ref: me.clone(),
             pollee: AtomicUsize::new(pollee_bits),
             netns,
+            owner_uid: ProcessManager::current_pcb().cred().euid.data() as u32,
             epoll_items: EPollItems::default(),
             fasync_items: FAsyncItems::default(),
             options: TcpSocketOptions::new(),

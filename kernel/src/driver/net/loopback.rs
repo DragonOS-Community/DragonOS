@@ -223,29 +223,20 @@ impl phy::Device for LoopbackDriver {
         &mut self,
         _timestamp: smoltcp::time::Instant,
     ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        loop {
-            let buffer = self.inner.lock().loopback_receive();
-            // receive 队列为空，返回 None 以通知上层没有可以 receive 的包
-            if buffer.is_empty() {
-                return None;
-            }
-
-            if let Some(iface) = self.iface() {
-                if iface.should_drop_rx_packet(&buffer) {
-                    // Drop this packet and try the next one in the queue.
-                    continue;
-                }
-            }
-
-            let rx = LoopbackRxToken {
-                buffer,
-                driver: self.clone(),
-            };
-            let tx = LoopbackTxToken {
-                driver: self.clone(),
-            };
-            return Some((rx, tx));
+        let buffer = self.inner.lock().loopback_receive();
+        // receive 队列为空，返回 None 以通知上层没有可以 receive 的包
+        if buffer.is_empty() {
+            return None;
         }
+
+        let rx = LoopbackRxToken {
+            buffer,
+            driver: self.clone(),
+        };
+        let tx = LoopbackTxToken {
+            driver: self.clone(),
+        };
+        return Some((rx, tx));
     }
     /// ## Loopback驱动处理发送数据包事件
     /// Loopback驱动在需要发送数据时会调用这个函数来获取一个发送令牌。
@@ -613,10 +604,6 @@ impl Iface for LoopbackInterface {
         }
         self.inject_local_ipv4_packet(self.nic_id() as u32, self.mac(), ip_packet, false)
             .map_err(Into::into)
-    }
-
-    fn should_drop_rx_packet(&self, packet: &[u8]) -> bool {
-        self.common.should_drop_rx_packet(packet)
     }
 
     fn addr_assign_type(&self) -> u8 {

@@ -311,6 +311,7 @@ impl super::TcpSocket {
                 Ok(())
             }),
             PSO::REUSEADDR => Self::set_bool_option(self.so_reuseaddr(), val, |_| Ok(())),
+            PSO::REUSEPORT => Self::set_bool_option(self.so_reuseport(), val, |_| Ok(())),
             PSO::BROADCAST => Self::set_bool_option(self.so_broadcast(), val, |_| Ok(())),
             PSO::PASSCRED => Self::set_bool_option(self.so_passcred(), val, |_| Ok(())),
             PSO::NO_CHECK => Self::set_bool_option(self.so_no_check(), val, |_| Ok(())),
@@ -575,6 +576,7 @@ impl super::TcpSocket {
             }
             PSO::KEEPALIVE => Self::write_bool_opt_i32(value, self.so_keepalive_enabled()),
             PSO::REUSEADDR => Self::write_bool_opt_i32(value, self.so_reuseaddr()),
+            PSO::REUSEPORT => Self::write_bool_opt_i32(value, self.so_reuseport()),
             PSO::BROADCAST => Self::write_bool_opt_i32(value, self.so_broadcast()),
             PSO::PASSCRED => Self::write_bool_opt_i32(value, self.so_passcred()),
             PSO::NO_CHECK => Self::write_bool_opt_i32(value, self.so_no_check()),

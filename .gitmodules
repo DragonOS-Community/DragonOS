@@ -1,3 +1,6 @@
 [submodule "kernel/submodules/DragonStub"]
 	path = kernel/submodules/DragonStub
 	url = https://github.com/DragonOS-Community/DragonStub.git
+[submodule "kernel/submodules/smoltcp"]
+	path = kernel/submodules/smoltcp
+	url = https://github.com/DragonOS-Community/smoltcp.git

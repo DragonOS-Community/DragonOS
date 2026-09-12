@@ -355,11 +355,7 @@ pub trait BlockDevice: Device {
             return Err(SystemError::EINVAL);
         }
         let bio = self.submit_bio_read(lba_id_start, count)?;
-        let data = bio.wait()?;
-        if data.len() != expected {
-            return Err(SystemError::EIO);
-        }
-        buf[..expected].copy_from_slice(&data);
+        bio.wait_read_into(&mut buf[..expected])?;
         Ok(expected)
     }
 
@@ -481,7 +477,7 @@ pub trait BlockDevice: Device {
             Ok(()) => Ok(bio),
             Err(SystemError::ENOSYS) => {
                 log::trace!("BlockDevice submit_bio_read ENOSYS, falling back to sync read");
-                let buf_ptr = bio.buffer_mut();
+                let buf_ptr = unsafe { bio.buffer_mut() };
                 let buf = unsafe { &mut *buf_ptr };
                 let expected = count.checked_mul(LBA_SIZE).ok_or(SystemError::EOVERFLOW)?;
                 let completed = self.read_at_sync(lba_start, count, &mut buf[..expected])?;

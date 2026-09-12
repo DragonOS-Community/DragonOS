@@ -157,6 +157,9 @@ pub struct Ext4FileSystem {
     pub(super) fs: another_ext4::Ext4,
     /// 当前文件系统对应的设备号
     pub(super) raw_dev: DeviceNumber,
+    /// Strong device owner used by ext4 PageCache batch reads. Keeping this
+    /// exact partition object avoids a late device-number lookup after submit.
+    pub(super) gendisk: Arc<GenDisk>,
     /// Prevents loop clear/remove for the complete filesystem lifetime.
     _device_mount_holder: GenDiskMountGuard,
 
@@ -1395,8 +1398,10 @@ impl Ext4FileSystem {
                     Ext4InodeTimes::from(&root_attr),
                 )),
                 io_lock: Mutex::new(()),
+                mapping_io: super::inode::Ext4MappingIoDomain::new(),
                 metadata_commit_lock: Mutex::new(()),
                 size_lock: RwSem::new(()),
+                size_change_lock: RwSem::new(()),
                 namespace_lock: Mutex::new(()),
                 link_mutation_coordinator: vfs::LinkMutationCoordinator::new(),
                 lifecycle: Ext4InodeLifecycle::new(),
@@ -1414,6 +1419,7 @@ impl Ext4FileSystem {
             writeback_domain: PageCacheWritebackDomain::new(),
             fs,
             raw_dev,
+            gendisk: mount_data,
             _device_mount_holder: device_mount_holder,
             root_inode,
             dirty_inodes: Mutex::new(Vec::new()),

@@ -291,7 +291,7 @@ impl Ext4 {
             block.init();
             (block, false)
         } else {
-            let image = transaction.read(self.block_device.as_ref(), old_home)?;
+            let image = transaction.read(self, old_home)?;
             let (header, ea_inode) = validate_xattr_block_for_release(&*image)
                 .ok_or_else(|| Ext4Error::new(ErrCode::EIO))?;
             if ea_inode {

@@ -5,7 +5,8 @@ use crate::{
     filesystem::{
         page_cache::{
             AsyncPageCacheBackend, PageCache, PageCacheBackend, PageCacheDirtyCertificate,
-            PageCacheExpectedDirtyTransition, PageCacheWritebackAdmissionOrder,
+            PageCacheExpectedDirtyTransition, PageCacheReadBatchCompletion,
+            PageCacheReadBatchRequest, PageCacheWritebackAdmissionOrder,
             PageCacheWritebackBindResult, PageCacheWritebackCancellationContext,
             PageCacheWritebackCompletion, PageCacheWritebackDescriptor,
             PageCacheWritebackDispatchOutcome, PageCacheWritebackProgress,
@@ -23,7 +24,7 @@ use crate::{
     libs::{
         casting::DowncastArc,
         mutex::{Mutex, MutexGuard},
-        rwsem::{RwSem, RwSemReadGuard},
+        rwsem::{RwSem, RwSemReadGuard, RwSemWriteGuard},
         spinlock::SpinLock,
         wait_queue::WaitQueue,
     },
@@ -48,6 +49,7 @@ use num::ToPrimitive;
 use system_error::SystemError;
 
 use super::filesystem::Ext4FileSystem;
+use super::gendisk::SubmittedExt4Read;
 use super::journal::Ext4JournalCompletion;
 
 const WHITEOUT_DEV: DeviceNumber = DeviceNumber::new(Major::UNNAMED_MAJOR, 0);
@@ -187,6 +189,86 @@ impl Ext4InodeLifecycle {
 pub(super) struct Ext4InodeOperation {
     lifecycle: Arc<Ext4InodeLifecycle>,
     owner: RawPid,
+}
+
+#[derive(Debug, Default)]
+struct Ext4MappingIoState {
+    active_reads: usize,
+    mutation_closed: bool,
+}
+
+/// Pins extent mappings from planning until every submitted read BIO retires.
+///
+/// Mapping mutators close the domain while holding `io_lock`, then wait here
+/// before changing or freeing extents. Read completion never needs `io_lock`,
+/// so this ordering cannot form a lock cycle.
+#[derive(Debug)]
+pub(super) struct Ext4MappingIoDomain {
+    state: Mutex<Ext4MappingIoState>,
+    wait_queue: WaitQueue,
+}
+
+impl Ext4MappingIoDomain {
+    pub(super) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(Ext4MappingIoState::default()),
+            wait_queue: WaitQueue::default(),
+        })
+    }
+
+    fn begin_read(self: &Arc<Self>) -> Result<Ext4MappingReadPermit, SystemError> {
+        let mut state = self.state.lock();
+        if state.mutation_closed {
+            return Err(SystemError::EBUSY);
+        }
+        state.active_reads = state
+            .active_reads
+            .checked_add(1)
+            .ok_or(SystemError::EOVERFLOW)?;
+        Ok(Ext4MappingReadPermit {
+            domain: self.clone(),
+        })
+    }
+
+    fn close_for_mutation(&self) -> Ext4MappingMutationGuard<'_> {
+        {
+            let mut state = self.state.lock();
+            debug_assert!(!state.mutation_closed);
+            state.mutation_closed = true;
+        }
+        self.wait_queue
+            .wait_until(|| (self.state.lock().active_reads == 0).then_some(()));
+        Ext4MappingMutationGuard { domain: self }
+    }
+}
+
+struct Ext4MappingReadPermit {
+    domain: Arc<Ext4MappingIoDomain>,
+}
+
+impl Drop for Ext4MappingReadPermit {
+    fn drop(&mut self) {
+        let wake = {
+            let mut state = self.domain.state.lock();
+            debug_assert!(state.active_reads > 0);
+            state.active_reads = state.active_reads.saturating_sub(1);
+            state.active_reads == 0
+        };
+        if wake {
+            self.domain.wait_queue.wake_all();
+        }
+    }
+}
+
+struct Ext4MappingMutationGuard<'a> {
+    domain: &'a Ext4MappingIoDomain,
+}
+
+impl Drop for Ext4MappingMutationGuard<'_> {
+    fn drop(&mut self) {
+        self.domain.state.lock().mutation_closed = false;
+        self.domain.wait_queue.wake_all();
+    }
 }
 
 /// Keeps the ext4 mmap write-preparation critical section alive until the
@@ -694,10 +776,14 @@ pub struct Ext4Inode {
 pub struct LockedExt4Inode {
     pub(super) inner: Mutex<Ext4Inode>,
     pub(super) io_lock: Mutex<()>,
+    pub(super) mapping_io: Arc<Ext4MappingIoDomain>,
     /// Orders timestamp publication by VFS version across delayed mapper
     /// transactions and frozen fsync metadata commits.
     pub(super) metadata_commit_lock: Mutex<()>,
     pub(super) size_lock: RwSem<()>,
+    /// Serializes a truncate's complete lower-size/PageCache cleanup window
+    /// against writers which may extend cached EOF.
+    pub(super) size_change_lock: RwSem<()>,
     pub(super) namespace_lock: Mutex<()>,
     pub(super) link_mutation_coordinator: LinkMutationCoordinator,
     pub(super) lifecycle: Arc<Ext4InodeLifecycle>,
@@ -713,6 +799,38 @@ pub struct LockedExt4Inode {
 #[derive(Debug)]
 struct Ext4PageCacheBackend {
     inode: Weak<LockedExt4Inode>,
+}
+
+struct Ext4SubmittedReadSegment {
+    first_slot: usize,
+    page_count: usize,
+    last_page_valid_bytes: usize,
+    request: SubmittedExt4Read,
+    payload: Vec<u8>,
+}
+
+enum Ext4PreparedReadSegment {
+    Zero {
+        first_slot: usize,
+        page_count: usize,
+        last_page_valid_bytes: usize,
+    },
+    Mapped {
+        first_slot: usize,
+        page_count: usize,
+        last_page_valid_bytes: usize,
+        physical_start: u64,
+        payload: Vec<u8>,
+    },
+}
+
+struct Ext4ReadWorkerState {
+    submitted: Vec<Ext4SubmittedReadSegment>,
+    inode: Arc<LockedExt4Inode>,
+    operation: Ext4InodeOperation,
+    fs: Arc<Ext4FileSystem>,
+    completion: PageCacheReadBatchCompletion,
+    mapping_read: Ext4MappingReadPermit,
 }
 
 impl Ext4PageCacheBackend {
@@ -1223,6 +1341,236 @@ impl PageCacheWritebackSubmission for Ext4DelayedSubmission {
 }
 
 impl PageCacheBackend for Ext4PageCacheBackend {
+    fn read_batch_pages(&self) -> usize {
+        super::gendisk::EXT4_BLOCKS_PER_BULK_IO
+    }
+
+    fn read_window_limit(
+        &self,
+        start_index: usize,
+        requested_pages: usize,
+    ) -> Result<usize, SystemError> {
+        let inode = self.inode()?;
+        let _size = inode.size_lock.read();
+        let file_size = inode
+            .inner
+            .lock()
+            .cached_file_size
+            .ok_or(SystemError::EIO)? as usize;
+        let start = start_index
+            .checked_mul(MMArch::PAGE_SIZE)
+            .ok_or(SystemError::EOVERFLOW)?;
+        let requested = requested_pages
+            .checked_mul(MMArch::PAGE_SIZE)
+            .ok_or(SystemError::EOVERFLOW)?;
+        Ok(file_size.saturating_sub(start).min(requested))
+    }
+
+    fn submit_read_batch(
+        self: Arc<Self>,
+        request: PageCacheReadBatchRequest,
+        completion: PageCacheReadBatchCompletion,
+    ) {
+        // Build the queued owner before submitting any BIO. After the device
+        // accepts a request, completion and mapping-exclusion lifetime must no
+        // longer depend on another allocation succeeding.
+        let work_state = Arc::new(Mutex::new(None));
+        let worker_state = work_state.clone();
+        let work = Work::new(move || {
+            let Some(state) = worker_state.lock().take() else {
+                return;
+            };
+            let Ext4ReadWorkerState {
+                submitted,
+                inode: _inode,
+                operation: _operation,
+                fs: _fs,
+                completion,
+                mapping_read,
+            } = state;
+            for mut segment in submitted {
+                let result = segment.request.wait_read_into(&mut segment.payload);
+                match result {
+                    Ok(()) => {
+                        let _ = completion.complete_data(
+                            segment.first_slot,
+                            segment.page_count,
+                            &segment.payload,
+                            segment.last_page_valid_bytes,
+                        );
+                    }
+                    Err(error) => {
+                        let _ = completion.complete_error(
+                            segment.first_slot,
+                            segment.page_count,
+                            error,
+                        );
+                    }
+                }
+            }
+            drop(mapping_read);
+        });
+        let mut completion = Some(completion);
+        let result = (|| -> Result<Ext4ReadWorkerState, SystemError> {
+            let inode = self.inode()?;
+            let operation = inode.begin_operation()?;
+            let _size = inode.size_lock.read();
+            let _io = inode.io_lock.lock();
+            let mapping_read = inode.mapping_io.begin_read()?;
+            let (fs, inode_num, file_size) = {
+                let guard = inode.inner.lock();
+                (
+                    guard.concret_fs(),
+                    guard.inner_inode_num,
+                    guard.cached_file_size.ok_or(SystemError::EIO)? as usize,
+                )
+            };
+            let offset = request
+                .start_index
+                .checked_mul(MMArch::PAGE_SIZE)
+                .ok_or(SystemError::EOVERFLOW)?;
+            let capacity = request
+                .page_count
+                .checked_mul(MMArch::PAGE_SIZE)
+                .ok_or(SystemError::EOVERFLOW)?;
+            let stable_valid = file_size.saturating_sub(offset).min(capacity);
+            if stable_valid != request.valid_bytes {
+                return Err(SystemError::EIO);
+            }
+            let plan = fs.retry_metadata_read_contention(|| {
+                fs.fs.plan_read(
+                    inode_num,
+                    offset,
+                    capacity,
+                    request.page_count.min(16) as u32,
+                )
+            })?;
+            if plan.valid_bytes != request.valid_bytes {
+                return Err(SystemError::EIO);
+            }
+
+            // Finish every fallible allocation before the first BIO is
+            // submitted. Once a device owns a request, no later ENOMEM may
+            // drop its lifetime permit before retirement.
+            let mut prepared = Vec::new();
+            prepared
+                .try_reserve_exact(plan.segments.len())
+                .map_err(|_| SystemError::ENOMEM)?;
+            for segment in plan.segments {
+                let logical_start = segment.logical_start() as usize;
+                let first_byte = logical_start
+                    .checked_mul(another_ext4::BLOCK_SIZE)
+                    .ok_or(SystemError::EOVERFLOW)?;
+                let first_slot =
+                    first_byte.checked_sub(offset).ok_or(SystemError::EIO)? / MMArch::PAGE_SIZE;
+                let page_count = segment.block_count() as usize;
+                let segment_end = first_slot
+                    .checked_add(page_count)
+                    .ok_or(SystemError::EOVERFLOW)?;
+                let last_valid = if segment_end == request.page_count {
+                    let tail = request.valid_bytes % MMArch::PAGE_SIZE;
+                    if tail == 0 {
+                        MMArch::PAGE_SIZE
+                    } else {
+                        tail
+                    }
+                } else {
+                    MMArch::PAGE_SIZE
+                };
+                match segment {
+                    another_ext4::ReadSegment::Zero { .. } => {
+                        prepared.push(Ext4PreparedReadSegment::Zero {
+                            first_slot,
+                            page_count,
+                            last_page_valid_bytes: last_valid,
+                        });
+                    }
+                    another_ext4::ReadSegment::Mapped { physical_start, .. } => {
+                        let payload_len = page_count
+                            .checked_mul(MMArch::PAGE_SIZE)
+                            .ok_or(SystemError::EOVERFLOW)?;
+                        let mut payload = Vec::new();
+                        payload
+                            .try_reserve_exact(payload_len)
+                            .map_err(|_| SystemError::ENOMEM)?;
+                        payload.resize(payload_len, 0);
+                        prepared.push(Ext4PreparedReadSegment::Mapped {
+                            first_slot,
+                            page_count,
+                            last_page_valid_bytes: last_valid,
+                            physical_start,
+                            payload,
+                        });
+                    }
+                }
+            }
+
+            let mut submitted = Vec::new();
+            submitted
+                .try_reserve_exact(prepared.len())
+                .map_err(|_| SystemError::ENOMEM)?;
+            for segment in prepared {
+                match segment {
+                    Ext4PreparedReadSegment::Zero {
+                        first_slot,
+                        page_count,
+                        last_page_valid_bytes,
+                    } => {
+                        let _ = completion
+                            .as_ref()
+                            .expect("completion owner")
+                            .complete_zero(first_slot, page_count, last_page_valid_bytes);
+                    }
+                    Ext4PreparedReadSegment::Mapped {
+                        first_slot,
+                        page_count,
+                        last_page_valid_bytes,
+                        physical_start,
+                        payload,
+                    } => match fs.gendisk.submit_ext4_read(physical_start, page_count) {
+                        Ok(submission) => submitted.push(Ext4SubmittedReadSegment {
+                            first_slot,
+                            page_count,
+                            last_page_valid_bytes,
+                            request: submission,
+                            payload,
+                        }),
+                        Err(error) => {
+                            let _ = completion
+                                .as_ref()
+                                .expect("completion owner")
+                                .complete_error(first_slot, page_count, error);
+                        }
+                    },
+                }
+            }
+            drop(_io);
+            drop(_size);
+            Ok(Ext4ReadWorkerState {
+                submitted,
+                inode,
+                operation,
+                fs,
+                completion: completion.take().expect("completion transfers to worker"),
+                mapping_read,
+            })
+        })();
+
+        let state = match result {
+            Ok(state) => state,
+            Err(error) => {
+                let completion = completion.take().expect("failed preparation retains owner");
+                let unfinished = completion.unfinished();
+                if unfinished > 0 {
+                    let _ = completion.complete_error(0, request.page_count, error);
+                }
+                return;
+            }
+        };
+        *work_state.lock() = Some(state);
+        schedule_work(work);
+    }
+
     fn read_page(&self, index: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
         let offset = index
             .checked_mul(MMArch::PAGE_SIZE)
@@ -1708,6 +2056,7 @@ impl IndexNode for LockedExt4Inode {
         data: PrivateData,
     ) -> Result<usize, SystemError> {
         let _operation = self.begin_operation()?;
+        let _size_change = self.size_change_lock.read();
         let len = core::cmp::min(len, buf.len());
         if len == 0 {
             return Ok(0);
@@ -2210,11 +2559,11 @@ impl IndexNode for LockedExt4Inode {
     }
 
     fn set_metadata(&self, metadata: &vfs::Metadata) -> Result<(), SystemError> {
+        let requested_size = metadata.size.max(0) as usize;
         let _operation = self.begin_operation()?;
+        let size_change = self.size_change_lock.write();
         let _delalloc_admission = self.close_production_delalloc_admission()?;
         self.drain_delalloc_before_eager()?;
-        let _io_guard = self.io_lock.lock();
-        let _metadata_commit = self.metadata_commit_lock.lock();
         let mode = metadata.mode.union(InodeMode::from(metadata.file_type));
 
         let to_ext4_time =
@@ -2239,47 +2588,51 @@ impl IndexNode for LockedExt4Inode {
         let next_ctime_version = before_ctime_version
             .checked_add(1)
             .ok_or(SystemError::EOVERFLOW)?;
-        let ext4 = &fs.fs;
-        fs.retry_metadata_contention(|| {
-            ext4.setattr(
-                inode_num,
-                another_ext4::SetAttr {
-                    mode: Some(another_ext4::InodeMode::from_bits_truncate(
-                        mode.bits() as u16
-                    )),
-                    uid: Some(metadata.uid as u32),
-                    gid: Some(metadata.gid as u32),
-                    size: Some(metadata.size as u64),
-                    atime: Some(to_ext4_time(&metadata.atime)),
-                    mtime: Some(to_ext4_time(&metadata.mtime)),
-                    ctime: Some(to_ext4_time(&metadata.ctime)),
-                    crtime: Some(to_ext4_time(&metadata.btime)),
-                },
-            )
+        self.commit_size_mutation(&size_change, &fs, inode_num, requested_size, || {
+            let _metadata_commit = self.metadata_commit_lock.lock();
+            let ext4 = &fs.fs;
+            fs.retry_metadata_contention(|| {
+                ext4.setattr(
+                    inode_num,
+                    another_ext4::SetAttr {
+                        mode: Some(another_ext4::InodeMode::from_bits_truncate(
+                            mode.bits() as u16
+                        )),
+                        uid: Some(metadata.uid as u32),
+                        gid: Some(metadata.gid as u32),
+                        size: Some(requested_size as u64),
+                        atime: Some(to_ext4_time(&metadata.atime)),
+                        mtime: Some(to_ext4_time(&metadata.mtime)),
+                        ctime: Some(to_ext4_time(&metadata.ctime)),
+                        crtime: Some(to_ext4_time(&metadata.btime)),
+                    },
+                )
+            })?;
+            {
+                let mut guard = self.inner.lock();
+                guard.cached_file_size = Some(requested_size as u64);
+                guard.dirty_state.remove(InodeDirtyState::SIZE_DIRTY);
+                if guard.cached_atime_version == before_atime_version {
+                    guard.cached_times.atime = to_ext4_time(&metadata.atime);
+                    guard.cached_atime_version = next_atime_version;
+                    guard.durable_atime_version = guard.cached_atime_version;
+                    guard.dirty_state.remove(InodeDirtyState::ATIME_DIRTY);
+                }
+                if guard.cached_mtime_version == before_mtime_version {
+                    guard.cached_times.mtime = to_ext4_time(&metadata.mtime);
+                    guard.cached_mtime_version = next_mtime_version;
+                    guard.durable_mtime_version = guard.cached_mtime_version;
+                    guard.dirty_state.remove(InodeDirtyState::MTIME_DIRTY);
+                }
+                if guard.cached_ctime_version == before_ctime_version {
+                    guard.cached_times.ctime = to_ext4_time(&metadata.ctime);
+                    guard.cached_ctime_version = next_ctime_version;
+                    guard.durable_ctime_version = guard.cached_ctime_version;
+                    guard.dirty_state.remove(InodeDirtyState::CTIME_DIRTY);
+                }
+            }
+            Ok(())
         })?;
-        {
-            let mut guard = self.inner.lock();
-            guard.cached_file_size = Some(metadata.size as u64);
-            if guard.cached_atime_version == before_atime_version {
-                guard.cached_times.atime = to_ext4_time(&metadata.atime);
-                guard.cached_atime_version = next_atime_version;
-                guard.durable_atime_version = guard.cached_atime_version;
-                guard.dirty_state.remove(InodeDirtyState::ATIME_DIRTY);
-            }
-            if guard.cached_mtime_version == before_mtime_version {
-                guard.cached_times.mtime = to_ext4_time(&metadata.mtime);
-                guard.cached_mtime_version = next_mtime_version;
-                guard.durable_mtime_version = guard.cached_mtime_version;
-                guard.dirty_state.remove(InodeDirtyState::MTIME_DIRTY);
-            }
-            if guard.cached_ctime_version == before_ctime_version {
-                guard.cached_times.ctime = to_ext4_time(&metadata.ctime);
-                guard.cached_ctime_version = next_ctime_version;
-                guard.durable_ctime_version = guard.cached_ctime_version;
-                guard.dirty_state.remove(InodeDirtyState::CTIME_DIRTY);
-            }
-            guard.dirty_state.remove(InodeDirtyState::SIZE_DIRTY);
-        }
         self.release_clean_metadata_queue_owner(&fs);
 
         Ok(())
@@ -2420,20 +2773,15 @@ impl IndexNode for LockedExt4Inode {
 
     fn resize(&self, len: usize) -> Result<(), SystemError> {
         let _operation = self.begin_operation()?;
+        let size_change = self.size_change_lock.write();
         let _delalloc_admission = self.close_production_delalloc_admission()?;
         self.drain_delalloc_before_eager()?;
-        let (fs, inode_num, page_cache) = {
+        let (fs, inode_num) = {
             let guard = self.inner.lock();
-            (
-                guard.concret_fs(),
-                guard.inner_inode_num,
-                guard.page_cache.clone(),
-            )
+            (guard.concret_fs(), guard.inner_inode_num)
         };
-        let apply_resize = || -> Result<(), SystemError> {
-            let _io_guard = self.io_lock.lock();
+        self.commit_size_mutation(&size_change, &fs, inode_num, len, || {
             let ext4 = &fs.fs;
-            // 仅调整文件大小，其他属性保持不变
             fs.retry_metadata_contention(|| {
                 ext4.setattr(
                     inode_num,
@@ -2457,54 +2805,7 @@ impl IndexNode for LockedExt4Inode {
             }
             self.release_clean_metadata_queue_owner(&fs);
             Ok(())
-        };
-
-        if let Some(page_cache) = page_cache {
-            let hole_start_page = len
-                .checked_add(MMArch::PAGE_SIZE - 1)
-                .ok_or(SystemError::EFBIG)?
-                >> MMArch::PAGE_SHIFT;
-            let mut truncate_pending = false;
-            loop {
-                // Match PageCache::truncate(), but acquire ext4's size lock
-                // after invalidate_write so mmap faults and regular writes
-                // use one global order: invalidate -> size -> inode I/O.
-                page_cache.unmap_mapping_pages_even_cow(hole_start_page, None)?;
-                let (shrinking, committed) = {
-                    let _invalidate = page_cache.invalidate_write();
-                    let _size_guard = self.size_lock.write();
-                    // Classify against the authoritative size while holding the
-                    // same lock that serializes the update.  A function-entry
-                    // snapshot can become stale after a concurrent extension.
-                    let cached_size = self.inner.lock().cached_file_size;
-                    let current_size = match cached_size {
-                        Some(size) => size,
-                        None => {
-                            fs.retry_metadata_read_contention(|| fs.fs.getattr(inode_num))?
-                                .size
-                        }
-                    };
-                    // After truncate_locked() asks for another unmap pass, the
-                    // inode size already equals len.  Preserve that pending
-                    // cache truncation unless a concurrent resize moved the
-                    // authoritative size below this request.
-                    let shrinking = len < current_size as usize
-                        || (truncate_pending && len == current_size as usize);
-                    apply_resize()?;
-                    let committed = !shrinking || page_cache.truncate_locked(len)?;
-                    (shrinking, committed)
-                };
-                if committed {
-                    if shrinking {
-                        page_cache.unmap_mapping_pages_even_cow(hole_start_page, None)?;
-                    }
-                    return Ok(());
-                }
-                truncate_pending = shrinking;
-            }
-        }
-        let _size_guard = self.size_lock.write();
-        apply_resize()
+        })
     }
 
     fn fallocate_resize_atomic(
@@ -2514,8 +2815,11 @@ impl IndexNode for LockedExt4Inode {
         _lock_owner: u64,
     ) -> Result<SetMetadataMask, SystemError> {
         let _operation = self.begin_operation()?;
+        let _size_change = self.size_change_lock.write();
         let _delalloc_admission = self.close_production_delalloc_admission()?;
         self.drain_delalloc_before_eager()?;
+        let page_cache = self.page_cache();
+        let _invalidate = page_cache.as_ref().map(|cache| cache.invalidate_write());
         let _size_guard = self.size_lock.write();
         let _io_guard = self.io_lock.lock();
         let _metadata_commit = self.metadata_commit_lock.lock();
@@ -3194,6 +3498,63 @@ impl IndexNode for LockedExt4Inode {
 }
 
 impl LockedExt4Inode {
+    /// Run one lower-filesystem size mutation under the single lock order used
+    /// by truncate, full setattr and readahead mapping pins.
+    fn commit_size_mutation<F>(
+        &self,
+        _size_change: &RwSemWriteGuard<'_, ()>,
+        fs: &Arc<Ext4FileSystem>,
+        inode_num: u32,
+        len: usize,
+        mut commit: F,
+    ) -> Result<(), SystemError>
+    where
+        F: FnMut() -> Result<(), SystemError>,
+    {
+        let Some(page_cache) = self.page_cache() else {
+            let _size = self.size_lock.write();
+            let _io = self.io_lock.lock();
+            let _mapping = self.mapping_io.close_for_mutation();
+            return commit();
+        };
+        let hole_start_page = len
+            .checked_add(MMArch::PAGE_SIZE - 1)
+            .ok_or(SystemError::EFBIG)?
+            >> MMArch::PAGE_SHIFT;
+        let mut shrinking = None;
+        let mut lower_committed = false;
+        loop {
+            page_cache.unmap_mapping_pages_even_cow(hole_start_page, None)?;
+            let (shrinking, committed) = {
+                let _invalidate = page_cache.invalidate_write();
+                let _size = self.size_lock.write();
+                let cached_size = self.inner.lock().cached_file_size;
+                let current_size = match cached_size {
+                    Some(size) => size,
+                    None => {
+                        fs.retry_metadata_read_contention(|| fs.fs.getattr(inode_num))?
+                            .size
+                    }
+                };
+                let shrinking = *shrinking.get_or_insert(len < current_size as usize);
+                if !lower_committed {
+                    let _io = self.io_lock.lock();
+                    let _mapping = self.mapping_io.close_for_mutation();
+                    commit()?;
+                    lower_committed = true;
+                }
+                let committed = !shrinking || page_cache.truncate_locked(len)?;
+                (shrinking, committed)
+            };
+            if committed {
+                if shrinking {
+                    page_cache.unmap_mapping_pages_even_cow(hole_start_page, None)?;
+                }
+                return Ok(());
+            }
+        }
+    }
+
     fn close_production_delalloc_admission_locked<'a>(
         &'a self,
         production: &mut ProductionDelallocState,
@@ -4502,8 +4863,10 @@ impl LockedExt4Inode {
                 Ext4InodeTimes::from(attr),
             )),
             io_lock: Mutex::new(()),
+            mapping_io: Ext4MappingIoDomain::new(),
             metadata_commit_lock: Mutex::new(()),
             size_lock: RwSem::new(()),
+            size_change_lock: RwSem::new(()),
             namespace_lock: Mutex::new(()),
             link_mutation_coordinator: LinkMutationCoordinator::new(),
             lifecycle,

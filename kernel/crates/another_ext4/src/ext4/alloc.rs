@@ -1122,11 +1122,8 @@ impl Ext4 {
                 continue;
             }
             let bitmap_home = bg.desc.block_bitmap_block();
-            let bitmap_block = self.prepare_allocation_bitmap(
-                &sb,
-                &bg,
-                transaction.read(self.block_device.as_ref(), bitmap_home)?,
-            )?;
+            let bitmap_block =
+                self.prepare_allocation_bitmap(&sb, &bg, transaction.read(self, bitmap_home)?)?;
             self.prepare_stats.record_bitmap_io();
             let checksum_bytes = (sb.clusters_per_group() as usize) / 8;
 
@@ -1613,7 +1610,7 @@ impl Ext4 {
             if !bg.verify_checksum(sb.metadata_checksum_seed()) {
                 return_error!(ErrCode::EIO, "Corrupt block-group descriptor checksum");
             }
-            let bitmap_image = transaction.read(self.block_device.as_ref(), bitmap_block_id)?;
+            let bitmap_image = transaction.read(self, bitmap_block_id)?;
             if !bg.desc.verify_block_bitmap_csum(
                 sb.metadata_checksum_seed(),
                 &*bitmap_image,
@@ -1696,7 +1693,7 @@ impl Ext4 {
             if !bg.verify_checksum(sb.metadata_checksum_seed()) {
                 return_error!(ErrCode::EIO, "Corrupt block-group descriptor checksum");
             }
-            let bitmap_image = transaction.read(self.block_device.as_ref(), bitmap_block_id)?;
+            let bitmap_image = transaction.read(self, bitmap_block_id)?;
             if !bg.desc.verify_inode_bitmap_csum(
                 sb.metadata_checksum_seed(),
                 &*bitmap_image,

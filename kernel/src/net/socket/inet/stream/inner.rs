@@ -1029,19 +1029,17 @@ impl Listening {
             })
         });
 
-        if let Some(position) = position {
+        let events = if let Some(position) = position {
             self.connect
                 .store(position, core::sync::atomic::Ordering::Relaxed);
-            pollee.fetch_or(
-                EPollEventType::EPOLL_LISTEN_CAN_ACCEPT.bits() as usize,
-                core::sync::atomic::Ordering::Relaxed,
-            );
+            EPollEventType::EPOLL_LISTEN_CAN_ACCEPT.bits() as usize
         } else {
-            pollee.fetch_and(
-                !EPollEventType::EPOLL_LISTEN_CAN_ACCEPT.bits() as usize,
-                core::sync::atomic::Ordering::Relaxed,
-            );
-        }
+            0
+        };
+        // Listening readiness is determined solely by completed accept slots.
+        // In particular, do not inherit Init's HUP or a previous connection's
+        // writable/error flags across bind/listen and shutdown/listen.
+        pollee.store(events, core::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn get_name(&self) -> smoltcp::wire::IpEndpoint {

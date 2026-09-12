@@ -215,6 +215,13 @@ impl TcpSocket {
             _ => (inner, Some(SystemError::EINVAL)),
         };
         writer.replace(listening);
+        if err.is_none() {
+            if let Some(inner::Inner::Listening(listening)) = writer.as_ref() {
+                // Publish the new state's readiness before listen returns; a
+                // caller may read pollee before the next interface notification.
+                listening.update_io_events(&self.pollee);
+            }
+        }
         drop(writer);
 
         if let Some(err) = err {

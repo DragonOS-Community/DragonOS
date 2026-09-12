@@ -6,8 +6,8 @@
 //! It must only be selected after *all* runtime metadata access uses this view.
 
 use super::journal_transaction::{
-    CachePublisher, CommitError, JournalContext, JournalTransactionCore, StagedBlock, Transaction,
-    TransactionCoreRef,
+    CachePublisher, CommitError, JournalContext, JournalTransactionCore, MetadataBlockSource,
+    StagedBlock, Transaction, TransactionCoreRef,
 };
 use super::MetadataMutationWaker;
 use crate::constants::BLOCK_SIZE;
@@ -66,6 +66,10 @@ impl RetiredRange {
 
     fn overlaps(self, other: Self) -> bool {
         self.inode == other.inode && self.start < other.end && other.start < self.end
+    }
+
+    pub(super) fn block_bounds(self) -> Option<(PBlockId, PBlockId)> {
+        (!self.inode).then_some((self.start, self.end))
     }
 }
 
@@ -371,7 +375,7 @@ impl JournalBatchCore {
             state.generation = state.generation.wrapping_add(1);
             next
         };
-        publisher.publish(staged);
+        publisher.publish_accepted(staged, sequence, retired);
         incoming.extend(core::mem::take(staged).into_values());
         // Capacity and all validation were settled before the first visible
         // cache change. Sorted Vec insertion moves only small block owners,
@@ -407,7 +411,11 @@ impl JournalBatchCore {
     /// Read from the latest accepted view. Allocate the destination before
     /// locking; a cold read is revalidated after I/O even when an intervening
     /// checkpoint removed the last overlay version of this home.
-    pub fn read_metadata(&self, device: &dyn BlockDevice, home: PBlockId) -> Result<Block> {
+    pub(super) fn read_metadata<S: MetadataBlockSource + ?Sized>(
+        &self,
+        source: &S,
+        home: PBlockId,
+    ) -> Result<Block> {
         self.validate_home(home)?;
         let mut image = Box::new([0; BLOCK_SIZE]);
         loop {
@@ -422,7 +430,7 @@ impl JournalBatchCore {
                 }
                 state.generation
             };
-            let disk = device.read_block(home)?;
+            let disk = source.read_committed_metadata(home)?;
             let state = self.state.lock();
             if state.publishing {
                 return Err(Ext4Error::new(ErrCode::EAGAIN));
@@ -521,6 +529,22 @@ impl JournalBatchCore {
         &self,
         device: &dyn BlockDevice,
     ) -> core::result::Result<Option<u64>, CommitError> {
+        self.commit_pending_inner(device, None)
+    }
+
+    pub(super) fn commit_pending_with_publisher(
+        &self,
+        device: &dyn BlockDevice,
+        publisher: &dyn CachePublisher,
+    ) -> core::result::Result<Option<u64>, CommitError> {
+        self.commit_pending_inner(device, Some(publisher))
+    }
+
+    fn commit_pending_inner(
+        &self,
+        device: &dyn BlockDevice,
+        publisher: Option<&dyn CachePublisher>,
+    ) -> core::result::Result<Option<u64>, CommitError> {
         let (mut frozen, sequence) = {
             let mut state = self.state.lock();
             if state.failed || state.committing || state.active || !state.seal_requested {
@@ -575,6 +599,9 @@ impl JournalBatchCore {
             state.generation = state.generation.wrapping_add(1);
             state.frozen.take()
         };
+        if let Some(publisher) = publisher {
+            publisher.checkpoint(sequence, &frozen.blocks);
+        }
         drop(old_owner);
         let recycled = Arc::get_mut(&mut frozen).expect("only worker owns retired frozen images");
         recycled.blocks.clear();

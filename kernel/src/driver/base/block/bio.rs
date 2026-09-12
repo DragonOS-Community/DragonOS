@@ -134,8 +134,13 @@ impl BioRequest {
         Ok(())
     }
 
-    /// 获取缓冲区的可变引用（仅用于提交时）
-    pub fn buffer_mut(&self) -> *mut [u8] {
+    /// 获取缓冲区的可变指针，供块设备在 BIO 完成前提交 DMA 或回收结果。
+    ///
+    /// # Safety
+    ///
+    /// 调用者必须独占设备侧对缓冲区的访问，并保证所有访问在调用
+    /// [`Self::complete`] 前结束。BIO 进入终态后，等待者可以无锁读取该缓冲区。
+    pub unsafe fn buffer_mut(&self) -> *mut [u8] {
         let mut inner = self.inner.lock_irqsave();
         inner.buffer.as_mut_slice() as *mut [u8]
     }
@@ -146,11 +151,18 @@ impl BioRequest {
         inner.buffer.as_slice() as *const [u8]
     }
 
-    /// 将数据写入BIO缓冲区（用于同步回退路径）
-    pub fn write_buffer(&self, data: &[u8]) {
+    /// 将数据写入 BIO 缓冲区（用于同步回退路径）。
+    ///
+    /// 提交状态把缓冲区所有权移交给设备，因此安全写入只允许发生在 `Init`；
+    /// 等待者随后可以在终态发布后于锁外复制较大的 DMA 数据。
+    pub fn write_buffer(&self, data: &[u8]) -> Result<(), SystemError> {
         let mut inner = self.inner.lock_irqsave();
+        if inner.state != BioState::Init {
+            return Err(SystemError::EINVAL);
+        }
         let copy_len = data.len().min(inner.buffer.len());
         inner.buffer.as_mut_slice()[..copy_len].copy_from_slice(&data[..copy_len]);
+        Ok(())
     }
 
     /// 获取BIO类型
@@ -198,22 +210,40 @@ impl BioRequest {
             let callbacks = core::mem::take(&mut inner.complete_callbacks);
             (inner.completion.clone(), callbacks)
         };
+        // Publish the completion predicate before invoking callbacks. A
+        // callback may re-enter `wait*()` on this BIO; signaling afterwards
+        // would deadlock that callback and every callback behind it.
+        completion.complete();
         for cb in callbacks {
             cb(result.clone());
         }
-        completion.complete();
     }
 
     pub fn on_complete<F>(&self, callback: F)
     where
         F: Fn(Result<usize, SystemError>) + Send + Sync + 'static,
     {
-        let mut inner = self.inner.lock_irqsave();
-        if let Some(result) = inner.result.clone() {
-            callback(result);
-            return;
+        let mut callback = Some(Box::new(callback) as BioCompleteCallback);
+        let completed = {
+            let mut inner = self.inner.lock_irqsave();
+            if let Some(result) = inner.result.clone() {
+                Some(result)
+            } else {
+                inner.complete_callbacks.push(
+                    callback
+                        .take()
+                        .expect("callback is owned until registration"),
+                );
+                None
+            }
+        };
+        // A callback is allowed to inspect the BIO. Never invoke it while
+        // holding the BIO spin lock, including the already-completed race.
+        if let Some(result) = completed {
+            callback
+                .take()
+                .expect("completed callback was not registered")(result);
         }
-        inner.complete_callbacks.push(Box::new(callback));
     }
 
     /// 等待BIO完成并返回结果
@@ -233,6 +263,36 @@ impl BioRequest {
             Some(Err(e)) => Err(e.clone()),
             None => Err(SystemError::EIO),
         }
+    }
+
+    /// Wait for an exact read completion and copy the DMA payload directly
+    /// into the caller's buffer. This avoids the intermediate `Vec` allocated
+    /// by [`Self::wait`] and never exposes the DMA buffer pointer after submit.
+    pub fn wait_read_into(&self, dst: &mut [u8]) -> Result<usize, SystemError> {
+        let completion = self.inner.lock_irqsave().completion.clone();
+        completion.wait_for_completion()?;
+
+        let (source, expected) = {
+            let inner = self.inner.lock_irqsave();
+            let expected = Self::expected_len(&inner);
+            if inner.bio_type != BioType::Read || dst.len() != expected {
+                return Err(SystemError::EINVAL);
+            }
+            match inner.result.as_ref() {
+                Some(Ok(completed)) if *completed == expected => {
+                    (inner.buffer.as_slice().as_ptr(), expected)
+                }
+                Some(Ok(_)) => return Err(SystemError::EIO),
+                Some(Err(error)) => return Err(error.clone()),
+                None => return Err(SystemError::EIO),
+            }
+        };
+        // Completion retires device ownership before it wakes us. BioRequest
+        // owns a fixed-size DMA buffer for its whole lifetime, so the pointer
+        // remains stable and read-only while `&self` is alive. Keep the 64 KiB
+        // worst-case copy outside the IRQ-disabled spin-lock section.
+        dst.copy_from_slice(unsafe { core::slice::from_raw_parts(source, expected) });
+        Ok(expected)
     }
 
     /// Wait for completion without copying the DMA payload. This is the

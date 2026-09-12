@@ -4479,6 +4479,7 @@ mod tests {
         let sb = block.read_offset_as::<SuperBlock>(BASE_OFFSET);
         Ext4 {
             block_device,
+            metadata_cache: crate::ext4::MetadataBlockCache::new(16),
             cached_super_block: spin::Mutex::new(sb),
             cached_block_groups: Vec::new(),
             system_metadata_ranges: Vec::new(),

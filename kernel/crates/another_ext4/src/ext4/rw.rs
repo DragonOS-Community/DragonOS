@@ -13,6 +13,19 @@ pub(super) struct MetadataIo<'fs, 'tx, 'core> {
     transaction: Option<&'tx mut super::journal_transaction::Transaction<'core>>,
 }
 
+impl super::journal_transaction::MetadataBlockSource for Ext4 {
+    fn read_committed_metadata(&self, home: PBlockId) -> Result<Block> {
+        if !matches!(self.metadata_mode, super::MetadataMutationMode::Batched(_)) {
+            return self.block_device.read_block(home);
+        }
+        let outcome = self.metadata_cache.read(self.block_device.as_ref(), home);
+        if outcome.notify_progress {
+            self.metadata_mutation_barrier.notify_progress();
+        }
+        outcome.result
+    }
+}
+
 impl<'fs, 'tx, 'core> MetadataIo<'fs, 'tx, 'core> {
     pub(super) fn direct(fs: &'fs Ext4) -> Self {
         Self {
@@ -91,7 +104,7 @@ impl<'fs, 'tx, 'core> MetadataIo<'fs, 'tx, 'core> {
     pub(super) fn read_block(&self, id: PBlockId) -> Result<Block> {
         match self.transaction.as_deref() {
             Some(transaction) => {
-                let image = transaction.read(self.fs.block_device.as_ref(), id)?;
+                let image = transaction.read(self.fs, id)?;
                 Ok(Block::new(id, Box::new(*image)))
             }
             None => self.fs.read_block(id),
@@ -161,7 +174,7 @@ impl Ext4 {
         transaction: &'tx mut super::journal_transaction::Transaction<'_>,
         block_id: PBlockId,
     ) -> Result<&'tx mut [u8; BLOCK_SIZE]> {
-        transaction.read_for_update(self.block_device.as_ref(), block_id)
+        transaction.read_for_update(self, block_id)
     }
 
     /// Stage block 0 with a checksum-correct ext4 superblock while preserving
@@ -187,7 +200,7 @@ impl Ext4 {
         &self,
         transaction: &super::journal_transaction::Transaction<'_>,
     ) -> Result<SuperBlock> {
-        let image = transaction.read(self.block_device.as_ref(), 0)?;
+        let image = transaction.read(self, 0)?;
         Ok(SuperBlock::from_bytes(&image[BASE_OFFSET..]))
     }
 
@@ -198,7 +211,7 @@ impl Ext4 {
         block_group_id: BlockGroupId,
     ) -> Result<BlockGroupRef> {
         let (block_id, offset) = self.block_group_disk_pos(block_group_id)?;
-        let image = transaction.read(self.block_device.as_ref(), block_id)?;
+        let image = transaction.read(self, block_id)?;
         Ok(BlockGroupRef::new(
             block_group_id,
             BlockGroupDesc::from_bytes(&image[offset..]),
@@ -243,10 +256,10 @@ impl Ext4 {
     /// Read a block from block device
     pub(super) fn read_block(&self, block_id: PBlockId) -> Result<Block> {
         match &self.metadata_mode {
-            super::MetadataMutationMode::Batched(core) => {
-                core.read_metadata(self.block_device.as_ref(), block_id)
-            }
-            _ => self.block_device.read_block(block_id),
+            super::MetadataMutationMode::Batched(core) => core.read_metadata(self, block_id),
+            _ => super::journal_transaction::MetadataBlockSource::read_committed_metadata(
+                self, block_id,
+            ),
         }
     }
 

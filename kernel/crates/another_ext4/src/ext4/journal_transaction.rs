@@ -81,7 +81,7 @@ impl StagedBlock {
 /// Synchronous journal commits publish after a durable checkpoint; batch
 /// operations publish at acceptance. Old batch checkpoints never republish.
 /// Direct commits publish after every synchronous home write has succeeded.
-pub trait CachePublisher: Send + Sync {
+pub(super) trait CachePublisher: Send + Sync {
     /// Publish the operation's final images to in-memory caches.
     ///
     /// This is an irrevocable logical publication, so it must not allocate,
@@ -89,6 +89,39 @@ pub trait CachePublisher: Send + Sync {
     /// lets publishers inspect the final image for a particular home block
     /// without building a temporary collection.
     fn publish(&self, blocks: &BTreeMap<PBlockId, StagedBlock>);
+
+    fn publish_home_current(
+        &self,
+        blocks: &BTreeMap<PBlockId, StagedBlock>,
+        _retired: &[RetiredRange],
+    ) {
+        self.publish(blocks);
+    }
+
+    /// Publish one batched transaction at its logical acceptance point. The
+    /// default preserves publishers which only maintain decoded value caches.
+    fn publish_accepted(
+        &self,
+        blocks: &BTreeMap<PBlockId, StagedBlock>,
+        _sequence: u64,
+        _retired: &[RetiredRange],
+    ) {
+        self.publish(blocks);
+    }
+
+    /// Notify discardable caches that the exact Frozen images reached their
+    /// home blocks. Old checkpoints must never republish their payload.
+    fn checkpoint(&self, _sequence: u64, _blocks: &[StagedBlock]) {}
+}
+
+pub(super) trait MetadataBlockSource {
+    fn read_committed_metadata(&self, home: PBlockId) -> Result<Block>;
+}
+
+impl<T: BlockDevice + ?Sized> MetadataBlockSource for T {
+    fn read_committed_metadata(&self, home: PBlockId) -> Result<Block> {
+        self.read_block(home)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -362,16 +395,16 @@ impl Transaction<'_> {
     /// The first access snapshots the device block and consumes one credit;
     /// later accesses return the same image, providing read-your-writes and
     /// naturally merging updates to shared metadata blocks.
-    pub fn read_for_update<'a>(
+    pub(super) fn read_for_update<'a, S: MetadataBlockSource + ?Sized>(
         &'a mut self,
-        device: &dyn BlockDevice,
+        source: &S,
         home: PBlockId,
     ) -> Result<&'a mut [u8; BLOCK_SIZE]> {
         if !self.staged.contains_key(&home) {
             if self.staged.len() == self.credits {
                 return Err(Ext4Error::new(ErrCode::E2BIG));
             }
-            let block = self.read_base(device, home)?;
+            let block = self.read_base(source, home)?;
             let original = self.preserve_originals.then(|| block.data.clone());
             self.staged.insert(
                 home,
@@ -390,18 +423,26 @@ impl Transaction<'_> {
             .as_mut())
     }
 
-    pub fn read<'a>(&'a self, device: &dyn BlockDevice, home: PBlockId) -> Result<BlockView<'a>> {
+    pub(super) fn read<'a, S: MetadataBlockSource + ?Sized>(
+        &'a self,
+        source: &S,
+        home: PBlockId,
+    ) -> Result<BlockView<'a>> {
         if let Some(block) = self.staged.get(&home) {
             Ok(BlockView::Staged(block.bytes()))
         } else {
-            Ok(BlockView::Device(self.read_base(device, home)?))
+            Ok(BlockView::Device(self.read_base(source, home)?))
         }
     }
 
-    fn read_base(&self, device: &dyn BlockDevice, home: PBlockId) -> Result<Block> {
+    fn read_base<S: MetadataBlockSource + ?Sized>(
+        &self,
+        source: &S,
+        home: PBlockId,
+    ) -> Result<Block> {
         match self.core {
-            TransactionCoreRef::Batch(core) => core.read_metadata(device, home),
-            _ => device.read_block(home),
+            TransactionCoreRef::Batch(core) => core.read_metadata(source, home),
+            _ => source.read_committed_metadata(home),
         }
     }
 
@@ -468,7 +509,7 @@ impl Transaction<'_> {
     /// Accept an operation into the live metadata view. This is deliberately
     /// distinct from `commit`: successful publication is not durability, and
     /// subsequent disk failures must never trigger reservation rollback.
-    pub fn publish(mut self, publisher: &dyn CachePublisher) -> Result<u64> {
+    pub(super) fn publish(mut self, publisher: &dyn CachePublisher) -> Result<u64> {
         let TransactionCoreRef::Batch(core) = self.core else {
             return Err(Ext4Error::new(ErrCode::EINVAL));
         };
@@ -481,7 +522,7 @@ impl Transaction<'_> {
         self.release_writer();
     }
 
-    pub fn commit(
+    pub(super) fn commit(
         mut self,
         device: &dyn BlockDevice,
         publisher: &dyn CachePublisher,
@@ -578,7 +619,7 @@ impl Transaction<'_> {
         if let Err(error) = write_bytes(device, inode_home, inode.bytes()) {
             return self.fail(error, CommitFailure::CommitUncertain, true);
         }
-        publisher.publish(&self.staged);
+        publisher.publish_home_current(&self.staged, &self.retired);
         self.release_writer();
         Ok(())
     }
@@ -627,7 +668,7 @@ impl Transaction<'_> {
                 return self.fail(error, CommitFailure::CheckpointFailed, true);
             }
         }
-        publisher.publish(&self.staged);
+        publisher.publish_home_current(&self.staged, &self.retired);
         self.release_writer();
         Ok(())
     }
@@ -641,7 +682,9 @@ impl Transaction<'_> {
             unreachable!()
         };
         let images = self.staged.values().collect::<Vec<_>>();
-        let result = core.commit_images(device, &images, || publisher.publish(&self.staged));
+        let result = core.commit_images(device, &images, || {
+            publisher.publish_home_current(&self.staged, &self.retired)
+        });
         self.release_writer();
         result
     }

@@ -46,7 +46,7 @@ impl Ext4 {
         if bitmap_block == 0 || bitmap_block >= sb.block_count() {
             return Err(Ext4Error::new(ErrCode::EIO));
         }
-        let bitmap = transaction.read(self.block_device.as_ref(), bitmap_block)?;
+        let bitmap = transaction.read(self, bitmap_block)?;
         if sb.has_read_only_compatible_feature(SuperBlock::FEATURE_RO_COMPAT_METADATA_CSUM) {
             let checksum_bytes = sb.clusters_per_group() as usize / 8;
             if !bg.verify_checksum(sb.metadata_checksum_seed())
@@ -90,7 +90,7 @@ impl Ext4 {
             .ok_or_else(|| Ext4Error::new(ErrCode::EIO))?;
         let sb = self.read_super_block_cached();
         self.validate_xattr_block_allocation(transaction, block_id)?;
-        let image = transaction.read(self.block_device.as_ref(), block_id)?;
+        let image = transaction.read(self, block_id)?;
         let (mut header, has_ea_inode) = validate_xattr_block_for_release(&*image)
             .ok_or_else(|| Ext4Error::new(ErrCode::EIO))?;
         if has_ea_inode {

@@ -1,13 +1,50 @@
 use alloc::boxed::Box;
+use alloc::sync::Arc;
 use kdepends::another_ext4;
 use system_error::SystemError;
 
-use crate::driver::base::block::block_device::LBA_SIZE;
 use crate::driver::base::block::gendisk::GenDisk;
+use crate::driver::base::block::{bio::BioRequest, block_device::LBA_SIZE};
 
-const EXT4_BLOCKS_PER_BULK_WRITE: usize = 16;
+pub(super) const EXT4_BLOCKS_PER_BULK_IO: usize = 16;
+
+/// One accepted contiguous ext4 read. The BIO and its DMA storage stay owned
+/// until `wait_read_into` observes device retirement.
+pub(super) struct SubmittedExt4Read {
+    bio: Arc<BioRequest>,
+    expected_bytes: usize,
+}
+
+impl SubmittedExt4Read {
+    pub(super) fn wait_read_into(self, dst: &mut [u8]) -> Result<(), SystemError> {
+        if dst.len() != self.expected_bytes {
+            return Err(SystemError::EINVAL);
+        }
+        self.bio.wait_read_into(dst)?;
+        Ok(())
+    }
+}
 
 impl GenDisk {
+    pub(super) fn submit_ext4_read(
+        &self,
+        start: u64,
+        ext4_block_count: usize,
+    ) -> Result<SubmittedExt4Read, SystemError> {
+        if ext4_block_count == 0 || ext4_block_count > EXT4_BLOCKS_PER_BULK_IO {
+            return Err(SystemError::EINVAL);
+        }
+        let expected_bytes = ext4_block_count
+            .checked_mul(another_ext4::BLOCK_SIZE)
+            .ok_or(SystemError::EOVERFLOW)?;
+        let (lba_start, lba_count) = self.checked_ext4_range(start, ext4_block_count)?;
+        let bio = self.block_device()?.submit_bio_read(lba_start, lba_count)?;
+        Ok(SubmittedExt4Read {
+            bio,
+            expected_bytes,
+        })
+    }
+
     fn convert_from_ext4_blkid(&self, ext4_blkid: u64) -> (usize, usize, usize) {
         // another_ext4 的逻辑块固定为 4096 字节（another_ext4::BLOCK_SIZE）。
         //
@@ -94,6 +131,44 @@ impl another_ext4::BlockDevice for GenDisk {
         Ok(another_ext4::Block::new(block_id, buf))
     }
 
+    fn read_blocks(
+        &self,
+        start: u64,
+        data: &mut [u8],
+    ) -> core::result::Result<(), another_ext4::Ext4Error> {
+        if data.is_empty() || !data.len().is_multiple_of(another_ext4::BLOCK_SIZE) {
+            return Err(another_ext4::Ext4Error::new(another_ext4::ErrCode::EINVAL));
+        }
+
+        for (chunk_index, chunk) in data
+            .chunks_mut(EXT4_BLOCKS_PER_BULK_IO * another_ext4::BLOCK_SIZE)
+            .enumerate()
+        {
+            let block_offset = chunk_index
+                .checked_mul(EXT4_BLOCKS_PER_BULK_IO)
+                .ok_or_else(|| another_ext4::Ext4Error::new(another_ext4::ErrCode::EFBIG))?;
+            let chunk_start = start
+                .checked_add(block_offset as u64)
+                .ok_or_else(|| another_ext4::Ext4Error::new(another_ext4::ErrCode::EFBIG))?;
+            let ext4_blocks = chunk.len() / another_ext4::BLOCK_SIZE;
+            let (lba_start, lba_count) = self
+                .checked_ext4_range(chunk_start, ext4_blocks)
+                .map_err(|error| {
+                    another_ext4::Ext4Error::new(Self::map_system_error_to_ext4(&error))
+                })?;
+            let completed = self
+                .block_device()
+                .and_then(|bdev| bdev.read_at(lba_start, lba_count, chunk))
+                .map_err(|error| {
+                    another_ext4::Ext4Error::new(Self::map_system_error_to_ext4(&error))
+                })?;
+            if completed != chunk.len() {
+                return Err(another_ext4::Ext4Error::new(another_ext4::ErrCode::EIO));
+            }
+        }
+        Ok(())
+    }
+
     fn write_block(
         &self,
         block: &another_ext4::Block,
@@ -127,11 +202,11 @@ impl another_ext4::BlockDevice for GenDisk {
         }
 
         for (chunk_index, chunk) in data
-            .chunks(EXT4_BLOCKS_PER_BULK_WRITE * another_ext4::BLOCK_SIZE)
+            .chunks(EXT4_BLOCKS_PER_BULK_IO * another_ext4::BLOCK_SIZE)
             .enumerate()
         {
             let block_offset = chunk_index
-                .checked_mul(EXT4_BLOCKS_PER_BULK_WRITE)
+                .checked_mul(EXT4_BLOCKS_PER_BULK_IO)
                 .ok_or_else(|| another_ext4::Ext4Error::new(another_ext4::ErrCode::EFBIG))?;
             let chunk_start = start
                 .checked_add(block_offset as u64)

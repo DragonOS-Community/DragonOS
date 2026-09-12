@@ -373,7 +373,7 @@ fn complete_used_requests(device: &Arc<VirtIOBlkDevice>, token_map: &Arc<BioToke
         let count = bio.count();
         let result = match bio.bio_type() {
             BioType::Read => {
-                let buf_ptr = bio.buffer_mut();
+                let buf_ptr = unsafe { bio.buffer_mut() };
                 let buf = unsafe { &mut *buf_ptr };
                 match unsafe {
                     device_inner.complete_read_blocks(
@@ -1613,7 +1613,7 @@ fn submit_bio_to_virtio(
         let device_inner = inner.device_inner.as_mut().ok_or(SystemError::ENODEV)?;
         match bio_type {
             BioType::Read => {
-                let buf_ptr = bio.buffer_mut();
+                let buf_ptr = unsafe { bio.buffer_mut() };
                 let buf = unsafe { &mut *buf_ptr };
                 Some(
                     unsafe {

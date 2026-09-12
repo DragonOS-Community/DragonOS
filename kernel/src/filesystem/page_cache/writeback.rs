@@ -744,10 +744,49 @@ pub trait PageCacheWritebackSubmission: Send {
     fn cancel(self: Box<Self>, context: PageCacheWritebackCancellationContext);
 }
 
-pub trait PageCacheBackend: Send + Sync + core::fmt::Debug {
+pub trait PageCacheBackend: Send + Sync + core::fmt::Debug + 'static {
     fn read_page(&self, index: usize, buf: &mut [u8]) -> Result<usize, SystemError>;
     fn write_page(&self, index: usize, buf: &[u8]) -> Result<usize, SystemError>;
     fn npages(&self) -> usize;
+
+    /// Clip a speculative read window against a stable backend EOF. PageCache
+    /// calls this while holding invalidate_read, before it inserts Loading
+    /// pages, so a backend whose size writers take invalidate_write can return
+    /// one authoritative bound for reservation and submission.
+    fn read_window_limit(
+        &self,
+        start_index: usize,
+        requested_pages: usize,
+    ) -> Result<usize, SystemError> {
+        let start = start_index
+            .checked_mul(MMArch::PAGE_SIZE)
+            .ok_or(SystemError::EOVERFLOW)?;
+        let requested = requested_pages
+            .checked_mul(MMArch::PAGE_SIZE)
+            .ok_or(SystemError::EOVERFLOW)?;
+        let size = self
+            .npages()
+            .checked_mul(MMArch::PAGE_SIZE)
+            .ok_or(SystemError::EOVERFLOW)?;
+        Ok(size.saturating_sub(start).min(requested))
+    }
+
+    /// Maximum number of pages this backend can usefully submit together.
+    /// The default preserves the existing per-page workqueue behavior.
+    fn read_batch_pages(&self) -> usize {
+        1
+    }
+
+    /// Accept ownership of every Loading slot in `completion`. Planning or
+    /// submission failures are reported through per-page completion; there is
+    /// deliberately no second caller-side rollback result.
+    fn submit_read_batch(
+        self: Arc<Self>,
+        request: super::PageCacheReadBatchRequest,
+        completion: super::PageCacheReadBatchCompletion,
+    ) {
+        super::read_batch::submit_default_read_batch(self, request, completion);
+    }
 
     /// Reserve one filesystem block before publishing a new cache page.
     fn reserve_page(&self) -> Result<(), SystemError> {

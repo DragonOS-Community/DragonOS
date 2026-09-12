@@ -47,12 +47,14 @@ use crate::{libs::align::page_align_up, mm::page::PageType};
 use lazy_static::lazy_static;
 
 mod mapping;
+mod read_batch;
 mod read_dma;
 mod selftest;
 mod writeback;
 use mapping::FileVmaIndex;
 pub(crate) use mapping::PageCacheFaultInvalidateRead;
 pub use mapping::UnmapMappingMode;
+pub use read_batch::{PageCacheReadBatchCompletion, PageCacheReadBatchRequest};
 pub use read_dma::PageCacheReadDmaReservation;
 pub(crate) use selftest::{run_accounting_debug_selftest, run_completion_domain_debug_selftest};
 pub(crate) use writeback::{
@@ -3474,8 +3476,75 @@ impl PageCache {
     }
 
     pub fn read_pages(&self, start_page_index: usize, page_num: usize) -> Result<(), SystemError> {
-        for i in 0..page_num {
-            self.start_async_read(start_page_index + i)?;
+        if page_num == 0 {
+            return Ok(());
+        }
+        start_page_index
+            .checked_add(page_num)
+            .ok_or(SystemError::EOVERFLOW)?;
+
+        let cache = self.manager.upgrade()?;
+        let Some(backend) = cache.backend() else {
+            for offset in 0..page_num {
+                cache.start_async_read(start_page_index + offset)?;
+            }
+            return Ok(());
+        };
+
+        // Size writers for a batch-capable backend must take
+        // invalidate_write. This keeps the preflight EOF stable through every
+        // Loading reservation and synchronous submit below.
+        let _invalidate = cache.invalidate_read();
+        let valid_bytes = backend.read_window_limit(start_page_index, page_num)?;
+        if valid_bytes == 0 {
+            return Ok(());
+        }
+        let clipped_pages = valid_bytes.div_ceil(MMArch::PAGE_SIZE).min(page_num);
+        let max_batch_pages = backend.read_batch_pages().max(1);
+        let end = start_page_index + clipped_pages;
+        let mut cursor = start_page_index;
+        while cursor < end {
+            let run = {
+                let inner = cache.inner.lock();
+                while cursor < end && inner.get_entry(cursor).is_some() {
+                    cursor += 1;
+                }
+                let run_start = cursor;
+                while cursor < end
+                    && cursor - run_start < max_batch_pages
+                    && inner.get_entry(cursor).is_none()
+                {
+                    cursor += 1;
+                }
+                (run_start, cursor - run_start)
+            };
+            if run.1 == 0 {
+                continue;
+            }
+
+            let domain_io = cache.try_acquire_domain_io()?;
+            let completion =
+                match PageCacheReadBatchCompletion::reserve(&cache, run.0, run.1, domain_io) {
+                    Ok(completion) => completion,
+                    // A racing reader installed one of these pages after the
+                    // scan. It owns the fill; a later cache read will wait on it.
+                    Err(SystemError::EEXIST) => {
+                        cursor = run.0;
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
+            let relative_start = (run.0 - start_page_index) * MMArch::PAGE_SIZE;
+            let run_capacity = run.1 * MMArch::PAGE_SIZE;
+            let run_valid = valid_bytes.saturating_sub(relative_start).min(run_capacity);
+            backend.clone().submit_read_batch(
+                PageCacheReadBatchRequest {
+                    start_index: run.0,
+                    page_count: run.1,
+                    valid_bytes: run_valid,
+                },
+                completion,
+            );
         }
         Ok(())
     }

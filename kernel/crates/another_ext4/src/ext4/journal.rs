@@ -1,4 +1,4 @@
-use super::{journal_recovery, journal_transaction, Ext4, MetadataMutationMode};
+use super::{journal_recovery, journal_transaction, Ext4, MetadataMutationMode, PublicationPoint};
 use crate::constants::BLOCK_SIZE;
 use crate::ext4_defs::{AsBytes, Block, BlockDevice, InodeRef, SuperBlock};
 use crate::jbd2::Superblock as JournalSuperblock;
@@ -226,6 +226,7 @@ impl Ext4 {
                 unreachable!()
             };
             self.metadata_mode = MetadataMutationMode::Batched(journal.into_batch(block_budget)?);
+            self.metadata_cache = super::MetadataBlockCache::new(super::METADATA_CACHE_BLOCKS);
         }
         Ok(())
     }
@@ -246,7 +247,7 @@ impl Ext4 {
     pub fn commit_pending_batch(&self) -> Result<Option<u64>> {
         match &self.metadata_mode {
             MetadataMutationMode::Batched(core) => core
-                .commit_pending(self.block_device.as_ref())
+                .commit_pending_with_publisher(self.block_device.as_ref(), self)
                 .map_err(|failure| {
                     self.poison(ErrCode::EIO);
                     failure.error
@@ -484,8 +485,11 @@ impl Ext4 {
     }
 }
 
-impl journal_transaction::CachePublisher for Ext4 {
-    fn publish(&self, blocks: &BTreeMap<PBlockId, journal_transaction::StagedBlock>) {
+impl Ext4 {
+    fn publish_typed_metadata_caches(
+        &self,
+        blocks: &BTreeMap<PBlockId, journal_transaction::StagedBlock>,
+    ) {
         // Normal transactions change descriptor counters/checksums, never the
         // validated bitmap/table addresses. Therefore system_metadata_ranges
         // remains immutable here; journal replay is the only path which can
@@ -518,6 +522,75 @@ impl journal_transaction::CachePublisher for Ext4 {
                 .map(|(block, _)| !blocks.contains_key(&block))
                 .unwrap_or(false)
         });
+    }
+}
+
+impl journal_transaction::CachePublisher for Ext4 {
+    fn publish(&self, blocks: &BTreeMap<PBlockId, journal_transaction::StagedBlock>) {
+        let mut notify = false;
+        for block in blocks.values() {
+            notify |= self.metadata_cache.publish_existing(
+                block.home(),
+                block.bytes(),
+                PublicationPoint::HomeCurrent,
+            );
+        }
+        self.publish_typed_metadata_caches(blocks);
+        if notify {
+            self.metadata_mutation_barrier.notify_progress();
+        }
+    }
+
+    fn publish_home_current(
+        &self,
+        blocks: &BTreeMap<PBlockId, journal_transaction::StagedBlock>,
+        retired: &[super::journal_batch::RetiredRange],
+    ) {
+        let mut notify = false;
+        for block in blocks.values() {
+            notify |= self.metadata_cache.publish_existing(
+                block.home(),
+                block.bytes(),
+                PublicationPoint::HomeCurrent,
+            );
+        }
+        notify |= self
+            .metadata_cache
+            .invalidate_block_ranges(retired.iter().filter_map(|range| range.block_bounds()));
+        self.publish_typed_metadata_caches(blocks);
+        if notify {
+            self.metadata_mutation_barrier.notify_progress();
+        }
+    }
+
+    fn publish_accepted(
+        &self,
+        blocks: &BTreeMap<PBlockId, journal_transaction::StagedBlock>,
+        sequence: u64,
+        retired: &[super::journal_batch::RetiredRange],
+    ) {
+        let mut notify = false;
+        for block in blocks.values() {
+            notify |= self.metadata_cache.publish_existing(
+                block.home(),
+                block.bytes(),
+                PublicationPoint::Accepted { sequence },
+            );
+        }
+        // Retirement wins if an operation both staged and freed a home.
+        notify |= self
+            .metadata_cache
+            .invalidate_block_ranges(retired.iter().filter_map(|range| range.block_bounds()));
+        self.publish_typed_metadata_caches(blocks);
+        if notify {
+            self.metadata_mutation_barrier.notify_progress();
+        }
+    }
+
+    fn checkpoint(&self, sequence: u64, blocks: &[journal_transaction::StagedBlock]) {
+        for block in blocks {
+            self.metadata_cache.checkpoint(sequence, &[block.home()]);
+        }
     }
 }
 

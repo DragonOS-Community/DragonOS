@@ -11,7 +11,10 @@ use core::{
 mod alloc;
 mod dir;
 mod extent;
+pub use extent::{ReadPlan, ReadSegment};
 mod high_level;
+mod metadata_cache;
+use metadata_cache::{MetadataBlockCache, PublicationPoint};
 mod metadata_gate;
 #[cfg(test)]
 use metadata_gate::METADATA_GATE_DIRECT_MAX;
@@ -36,6 +39,8 @@ pub use low_level::{
     DelallocAppendBlockSubmitOutcome, DelallocAppendMapperAuthority, DelallocExtentNodePool,
 };
 pub use low_level::{InodeOwner, SetAttr};
+
+const METADATA_CACHE_BLOCKS: usize = 1024;
 
 /// Simple fixed-size inode cache.
 /// When full, the entire cache is cleared (simple but effective for common workloads).
@@ -341,6 +346,9 @@ impl AllocationState {
 /// The Ext4 filesystem implementation.
 pub struct Ext4 {
     block_device: Arc<dyn BlockDevice>,
+    /// Bounded raw metadata acceleration. Journal overlays remain the
+    /// authoritative accepted view; this cache is always discardable.
+    metadata_cache: MetadataBlockCache,
     /// Cached superblock to avoid repeated disk reads.
     /// The superblock is loaded once at mount time and updated
     /// in memory whenever it is written to disk.
@@ -809,6 +817,7 @@ impl Ext4 {
         }
         Ok(Self {
             block_device,
+            metadata_cache: MetadataBlockCache::new(0),
             cached_super_block: spin::Mutex::new(sb),
             cached_block_groups,
             system_metadata_ranges,

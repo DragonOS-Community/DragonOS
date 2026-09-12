@@ -5,6 +5,126 @@ use crate::format_error;
 use crate::prelude::*;
 use core::cmp::min;
 
+/// One bounded, logically contiguous part of a block-aligned file read.
+///
+/// `Mapped` segments are also physically contiguous and may therefore be
+/// submitted as one multi-block request. `Zero` covers sparse holes and
+/// unwritten extents and must not issue data I/O.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReadSegment {
+    Mapped {
+        logical_start: u32,
+        physical_start: u64,
+        blocks: u32,
+    },
+    Zero {
+        logical_start: u32,
+        blocks: u32,
+    },
+}
+
+impl ReadSegment {
+    pub fn logical_start(&self) -> u32 {
+        match self {
+            Self::Mapped { logical_start, .. } | Self::Zero { logical_start, .. } => *logical_start,
+        }
+    }
+
+    pub fn block_count(&self) -> u32 {
+        match self {
+            Self::Mapped { blocks, .. } | Self::Zero { blocks, .. } => *blocks,
+        }
+    }
+}
+
+/// Stable lower-filesystem plan for one block-aligned read window.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReadPlan {
+    /// Bytes before the inode-size snapshot's EOF. The final planned block may
+    /// contain fewer valid bytes; its caller must zero the unread tail.
+    pub valid_bytes: usize,
+    pub segments: Vec<ReadSegment>,
+}
+
+struct ReadPlanState {
+    request_start: u64,
+    request_end: u64,
+    cursor: u64,
+    max_segment_blocks: u32,
+    segments: Vec<ReadSegment>,
+}
+
+impl ReadPlanState {
+    fn push(&mut self, segment: ReadSegment) -> Result<()> {
+        let mut logical = segment.logical_start();
+        let mut physical = match segment {
+            ReadSegment::Mapped { physical_start, .. } => Some(physical_start),
+            ReadSegment::Zero { .. } => None,
+        };
+        let mut remaining = segment.block_count();
+        while remaining > 0 {
+            let merged = match (self.segments.last_mut(), physical) {
+                (
+                    Some(ReadSegment::Mapped {
+                        logical_start,
+                        physical_start,
+                        blocks,
+                    }),
+                    Some(next_physical),
+                ) if logical_start.checked_add(*blocks) == Some(logical)
+                    && physical_start.checked_add(u64::from(*blocks)) == Some(next_physical)
+                    && *blocks < self.max_segment_blocks =>
+                {
+                    let add = remaining.min(self.max_segment_blocks - *blocks);
+                    *blocks += add;
+                    add
+                }
+                (
+                    Some(ReadSegment::Zero {
+                        logical_start,
+                        blocks,
+                    }),
+                    None,
+                ) if logical_start.checked_add(*blocks) == Some(logical)
+                    && *blocks < self.max_segment_blocks =>
+                {
+                    let add = remaining.min(self.max_segment_blocks - *blocks);
+                    *blocks += add;
+                    add
+                }
+                _ => 0,
+            };
+            let consumed = if merged > 0 {
+                merged
+            } else {
+                let blocks = remaining.min(self.max_segment_blocks);
+                self.segments.push(match physical {
+                    Some(physical_start) => ReadSegment::Mapped {
+                        logical_start: logical,
+                        physical_start,
+                        blocks,
+                    },
+                    None => ReadSegment::Zero {
+                        logical_start: logical,
+                        blocks,
+                    },
+                });
+                blocks
+            };
+            logical = logical
+                .checked_add(consumed)
+                .ok_or_else(|| Ext4Error::new(ErrCode::EIO))?;
+            if let Some(value) = physical.as_mut() {
+                *value = value
+                    .checked_add(u64::from(consumed))
+                    .ok_or_else(|| Ext4Error::new(ErrCode::EIO))?;
+            }
+            remaining -= consumed;
+        }
+        Ok(())
+    }
+}
+
 /// One contiguous tail of the right-most data extent removed from a tree.
 ///
 /// The caller owns allocation accounting: `metadata_blocks` have already been
@@ -215,7 +335,7 @@ impl Ext4 {
                 let block = if let Some(transaction) = transaction {
                     self.ensure_valid_pblock(inode.id, home, "extent tree node")?;
                     self.validate_data_blocks(home, 1)?;
-                    let block = transaction.read(self.block_device.as_ref(), home)?;
+                    let block = transaction.read(self, home)?;
                     self.verify_transaction_extent_block(inode, &*block)?;
                     block
                 } else {
@@ -321,7 +441,7 @@ impl Ext4 {
                 .path
                 .last()
                 .ok_or_else(|| Ext4Error::new(ErrCode::EINVAL))?;
-            let leaf_view = transaction.read(self.block_device.as_ref(), leaf_home)?;
+            let leaf_view = transaction.read(self, leaf_home)?;
             self.verify_transaction_extent_block(inode, &*leaf_view)?;
             let leaf = ExtentNode::from_bytes(&*leaf_view);
             self.validate_extent_node(inode.id, &leaf)?;
@@ -353,7 +473,7 @@ impl Ext4 {
 
                 for parent_home in plan.path[..plan.path.len() - 1].iter().rev() {
                     let carry_index = carry.ok_or_else(|| Ext4Error::new(ErrCode::EIO))?;
-                    let view = transaction.read(self.block_device.as_ref(), *parent_home)?;
+                    let view = transaction.read(self, *parent_home)?;
                     self.verify_transaction_extent_block(inode, &*view)?;
                     let parent = ExtentNode::from_bytes(&*view);
                     self.validate_extent_node(inode.id, &parent)?;
@@ -493,7 +613,7 @@ impl Ext4 {
             let block = if let Some(transaction) = transaction {
                 self.ensure_valid_pblock(inode.id, home, "extent tree node")?;
                 self.validate_data_blocks(home, 1)?;
-                let block = transaction.read(self.block_device.as_ref(), home)?;
+                let block = transaction.read(self, home)?;
                 self.verify_transaction_extent_block(inode, &*block)?;
                 block
             } else {
@@ -871,7 +991,7 @@ impl Ext4 {
                     return Err(Ext4Error::new(ErrCode::EINVAL));
                 }
 
-                let image = transaction.read(self.block_device.as_ref(), home)?;
+                let image = transaction.read(self, home)?;
                 self.verify_transaction_extent_block(inode, &*image)?;
                 let leaf = ExtentNode::from_bytes(&*image);
                 self.validate_extent_node(inode.id, &leaf)?;
@@ -909,7 +1029,7 @@ impl Ext4 {
         }
         if let Some(home) = leaf_home {
             {
-                let image = transaction.read(self.block_device.as_ref(), home)?;
+                let image = transaction.read(self, home)?;
                 self.verify_transaction_extent_block(inode, &*image)?;
                 let node = ExtentNode::from_bytes(&*image);
                 self.validate_extent_node(inode.id, &node)?;
@@ -1008,10 +1128,7 @@ impl Ext4 {
         self.ensure_valid_pblock(inode_ref.id, pblock, "extent tree node")?;
         self.validate_data_blocks(pblock, 1)?;
         let block = match transaction {
-            Some(tx) => Block::new(
-                pblock,
-                Box::new(*tx.read(self.block_device.as_ref(), pblock)?),
-            ),
+            Some(tx) => Block::new(pblock, Box::new(*tx.read(self, pblock)?)),
             None => self.read_block(pblock)?,
         };
         self.prepare_stats.record_extent_io();
@@ -1044,7 +1161,7 @@ impl Ext4 {
         };
         while let Some(pblock) = next {
             self.ensure_valid_pblock(inode_ref.id, pblock, "extent tail node")?;
-            let image = transaction.read(self.block_device.as_ref(), pblock)?;
+            let image = transaction.read(self, pblock)?;
             self.verify_transaction_extent_block(inode_ref, &*image)?;
             let node = ExtentNode::from_bytes(&*image);
             self.validate_extent_node(inode_ref.id, &node)?;
@@ -1118,7 +1235,7 @@ impl Ext4 {
             let mut pblock = root.extent_index_at(last).leaf();
             loop {
                 self.ensure_valid_pblock(inode_ref.id, pblock, "extent tail node")?;
-                let image = transaction.read(self.block_device.as_ref(), pblock)?;
+                let image = transaction.read(self, pblock)?;
                 self.verify_transaction_extent_block(inode_ref, &*image)?;
                 let node = ExtentNode::from_bytes(&*image);
                 self.validate_extent_node(inode_ref.id, &node)?;
@@ -1178,7 +1295,7 @@ impl Ext4 {
         // A full last extent leaves its leaf empty only when it was that leaf's
         // sole entry.  Otherwise stage the shortened leaf and stop cascading.
         let leaf_entries = {
-            let image = transaction.read(self.block_device.as_ref(), leaf_pblock)?;
+            let image = transaction.read(self, leaf_pblock)?;
             ExtentNode::from_bytes(&*image).header().entries_count()
         };
         if leaf_entries > 1 {
@@ -1202,7 +1319,7 @@ impl Ext4 {
             }
             let pblock = path[level];
             let entries = {
-                let image = transaction.read(self.block_device.as_ref(), pblock)?;
+                let image = transaction.read(self, pblock)?;
                 ExtentNode::from_bytes(&*image).header().entries_count()
             };
             if entries == 0 {
@@ -1313,6 +1430,221 @@ impl ExtentSearchStep {
 }
 
 impl Ext4 {
+    /// Resolve one block-aligned file window into bounded data and zero ranges.
+    ///
+    /// The inode and every extent node are observed under one metadata read
+    /// view. `valid_bytes` records that inode-size snapshot; bytes beyond it in
+    /// the final block are EOF and must be zeroed by the caller.
+    ///
+    /// A plan does not pin allocated blocks. The caller must hold its inode
+    /// mapping exclusion across this call and I/O submission, so truncate or
+    /// extent replacement cannot recycle a mapped block in between.
+    pub fn plan_read(
+        &self,
+        file: u32,
+        offset: usize,
+        len: usize,
+        max_segment_blocks: u32,
+    ) -> Result<ReadPlan> {
+        let _view = self.lock_metadata_read_view()?;
+        let inode_ref = self.read_inode(file)?;
+        self.build_read_plan_from_inode(&inode_ref, offset, len, max_segment_blocks)
+    }
+
+    fn build_read_plan_from_inode(
+        &self,
+        inode_ref: &InodeRef,
+        offset: usize,
+        len: usize,
+        max_segment_blocks: u32,
+    ) -> Result<ReadPlan> {
+        if !inode_ref.inode.is_file() {
+            return Err(format_error!(
+                ErrCode::EISDIR,
+                "Inode {} is not a file",
+                inode_ref.id
+            ));
+        }
+        if !offset.is_multiple_of(BLOCK_SIZE)
+            || !len.is_multiple_of(BLOCK_SIZE)
+            || max_segment_blocks == 0
+        {
+            return Err(Ext4Error::new(ErrCode::EINVAL));
+        }
+        offset
+            .checked_add(len)
+            .ok_or_else(|| Ext4Error::new(ErrCode::EFBIG))?;
+        if len == 0 {
+            return Ok(ReadPlan {
+                valid_bytes: 0,
+                segments: Vec::new(),
+            });
+        }
+
+        let file_size =
+            usize::try_from(inode_ref.inode.size()).map_err(|_| Ext4Error::new(ErrCode::EFBIG))?;
+        if offset >= file_size {
+            return Ok(ReadPlan {
+                valid_bytes: 0,
+                segments: Vec::new(),
+            });
+        }
+        let valid_bytes = min(len, file_size - offset);
+        let start_lblock =
+            u32::try_from(offset / BLOCK_SIZE).map_err(|_| Ext4Error::new(ErrCode::EFBIG))?;
+        let block_count = valid_bytes
+            .checked_add(BLOCK_SIZE - 1)
+            .ok_or_else(|| Ext4Error::new(ErrCode::EFBIG))?
+            / BLOCK_SIZE;
+        let block_count = u32::try_from(block_count).map_err(|_| Ext4Error::new(ErrCode::EFBIG))?;
+        let end_lblock = u64::from(start_lblock) + u64::from(block_count);
+        if end_lblock > (1u64 << 32) {
+            return Err(Ext4Error::new(ErrCode::EFBIG));
+        }
+
+        let root = inode_ref.inode.extent_root();
+        let mut state = ReadPlanState {
+            request_start: u64::from(start_lblock),
+            request_end: end_lblock,
+            cursor: u64::from(start_lblock),
+            max_segment_blocks,
+            segments: Vec::new(),
+        };
+        self.collect_read_segments(
+            inode_ref,
+            &root,
+            root.header().depth(),
+            0,
+            1u64 << 32,
+            &mut state,
+        )?;
+        if state.cursor < state.request_end {
+            state.push(ReadSegment::Zero {
+                logical_start: u32::try_from(state.cursor)
+                    .map_err(|_| Ext4Error::new(ErrCode::EIO))?,
+                blocks: u32::try_from(state.request_end - state.cursor)
+                    .map_err(|_| Ext4Error::new(ErrCode::EIO))?,
+            })?;
+        }
+        Ok(ReadPlan {
+            valid_bytes,
+            segments: state.segments,
+        })
+    }
+
+    fn collect_read_segments(
+        &self,
+        inode_ref: &InodeRef,
+        node: &ExtentNode<'_>,
+        expected_depth: u16,
+        subtree_start: u64,
+        subtree_end: u64,
+        state: &mut ReadPlanState,
+    ) -> Result<()> {
+        self.validate_extent_node(inode_ref.id, node)?;
+        if node.header().depth() != expected_depth || subtree_start >= subtree_end {
+            return Err(format_error!(
+                ErrCode::EIO,
+                "extent tree depth or bounds invalid on inode {}",
+                inode_ref.id
+            ));
+        }
+        let entries = node.header().entries_count() as usize;
+        if expected_depth == 0 {
+            for pos in 0..entries {
+                let extent = node.extent_at(pos);
+                let extent_start = u64::from(extent.start_lblock());
+                let extent_end = extent_start
+                    .checked_add(u64::from(extent.block_count()))
+                    .ok_or_else(|| Ext4Error::new(ErrCode::EIO))?;
+                if extent_start < subtree_start || extent_end > subtree_end {
+                    return Err(format_error!(
+                        ErrCode::EIO,
+                        "extent outside parent bounds on inode {}",
+                        inode_ref.id
+                    ));
+                }
+                self.ensure_valid_pblock(inode_ref.id, extent.start_pblock(), "extent data range")?;
+                self.validate_data_blocks(extent.start_pblock(), u64::from(extent.block_count()))?;
+                if extent_end <= state.request_start {
+                    continue;
+                }
+                if extent_start >= state.request_end {
+                    break;
+                }
+                let overlap_start = state.cursor.max(extent_start).max(state.request_start);
+                let overlap_end = state.request_end.min(extent_end);
+                if overlap_start >= overlap_end {
+                    continue;
+                }
+                if state.cursor < overlap_start {
+                    state.push(ReadSegment::Zero {
+                        logical_start: u32::try_from(state.cursor)
+                            .map_err(|_| Ext4Error::new(ErrCode::EIO))?,
+                        blocks: u32::try_from(overlap_start - state.cursor)
+                            .map_err(|_| Ext4Error::new(ErrCode::EIO))?,
+                    })?;
+                }
+                let blocks = u32::try_from(overlap_end - overlap_start)
+                    .map_err(|_| Ext4Error::new(ErrCode::EIO))?;
+                let physical_start = extent
+                    .start_pblock()
+                    .checked_add(overlap_start - extent_start)
+                    .ok_or_else(|| Ext4Error::new(ErrCode::EIO))?;
+                let segment = if extent.is_unwritten() {
+                    ReadSegment::Zero {
+                        logical_start: u32::try_from(overlap_start)
+                            .map_err(|_| Ext4Error::new(ErrCode::EIO))?,
+                        blocks,
+                    }
+                } else {
+                    ReadSegment::Mapped {
+                        logical_start: u32::try_from(overlap_start)
+                            .map_err(|_| Ext4Error::new(ErrCode::EIO))?,
+                        physical_start,
+                        blocks,
+                    }
+                };
+                state.push(segment)?;
+                state.cursor = overlap_end;
+            }
+            return Ok(());
+        }
+
+        for pos in 0..entries {
+            let index = node.extent_index_at(pos);
+            let child_start = u64::from(index.start_lblock());
+            let child_end = if pos + 1 < entries {
+                u64::from(node.extent_index_at(pos + 1).start_lblock())
+            } else {
+                subtree_end
+            };
+            if child_start < subtree_start || child_start >= child_end || child_end > subtree_end {
+                return Err(format_error!(
+                    ErrCode::EIO,
+                    "extent index outside parent bounds on inode {}",
+                    inode_ref.id
+                ));
+            }
+            if child_end <= state.request_start || child_start >= state.request_end {
+                continue;
+            }
+            let child_pblock = index.leaf();
+            self.ensure_valid_pblock(inode_ref.id, child_pblock, "extent child node")?;
+            let child_block = self.read_extent_block_from_view(inode_ref, child_pblock, None)?;
+            let child = ExtentNode::from_bytes(&*child_block.data);
+            self.collect_read_segments(
+                inode_ref,
+                &child,
+                expected_depth - 1,
+                child_start,
+                child_end,
+                state,
+            )?;
+        }
+        Ok(())
+    }
+
     /// Given a logic block id, find the corresponding fs block id.
     pub(super) fn extent_query(&self, inode_ref: &InodeRef, iblock: LBlockId) -> Result<PBlockId> {
         self.extent_query_from_view(inode_ref, iblock, None)
@@ -1983,11 +2315,16 @@ mod tests {
         sb_block: Block,
     }
 
+    struct PlanBlockDevice {
+        base: StubBlockDevice,
+        blocks: BTreeMap<PBlockId, Block>,
+    }
+
     impl StubBlockDevice {
         fn with_block_count(block_count: u32) -> Self {
             let mut data = [0u8; BLOCK_SIZE];
             let off = BASE_OFFSET;
-            data[off..off + 4].copy_from_slice(&block_count.to_le_bytes());
+            data[off + 4..off + 8].copy_from_slice(&block_count.to_le_bytes());
             Self {
                 sb_block: Block::new(0, Box::new(data)),
             }
@@ -2015,12 +2352,39 @@ mod tests {
         }
     }
 
+    impl BlockDevice for PlanBlockDevice {
+        fn read_block(&self, block_id: PBlockId) -> Result<Block> {
+            self.blocks
+                .get(&block_id)
+                .cloned()
+                .map(Ok)
+                .unwrap_or_else(|| self.base.read_block(block_id))
+        }
+
+        fn write_block(&self, _block: &Block) -> Result<()> {
+            Ok(())
+        }
+
+        fn flush(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn supports_reliable_flush(&self) -> bool {
+            true
+        }
+    }
+
     fn make_test_fs(block_count: u32) -> Ext4 {
         let block_device = Arc::new(StubBlockDevice::with_block_count(block_count));
+        make_test_fs_with_device(block_device)
+    }
+
+    fn make_test_fs_with_device(block_device: Arc<dyn BlockDevice>) -> Ext4 {
         let block = block_device.read_block(0).unwrap();
         let sb = block.read_offset_as::<SuperBlock>(BASE_OFFSET);
         Ext4 {
             block_device,
+            metadata_cache: crate::ext4::MetadataBlockCache::new(16),
             cached_super_block: spin::Mutex::new(sb),
             cached_block_groups: Vec::new(),
             system_metadata_ranges: Vec::new(),
@@ -2040,6 +2404,21 @@ mod tests {
         }
     }
 
+    fn make_read_inode(size: u64, extents: &[Extent]) -> InodeRef {
+        let mut inode_ref = InodeRef::new(7, Box::default());
+        inode_ref.inode.set_mode(InodeMode::from_type_and_perm(
+            FileType::RegularFile,
+            InodeMode::ALL_RW,
+        ));
+        inode_ref.inode.set_size(size);
+        inode_ref.inode.extent_init();
+        let mut root = inode_ref.inode.extent_root_mut();
+        for (pos, extent) in extents.iter().enumerate() {
+            root.insert_extent(extent, pos).unwrap();
+        }
+        inode_ref
+    }
+
     fn make_metadata_csum_test_fs(block_count: u32) -> Ext4 {
         let mut device = StubBlockDevice::with_block_count(block_count);
         // ext4_super_block: s_feature_ro_compat at byte 100, UUID at 104.
@@ -2054,6 +2433,7 @@ mod tests {
             .read_offset_as::<SuperBlock>(BASE_OFFSET);
         Ext4 {
             block_device,
+            metadata_cache: crate::ext4::MetadataBlockCache::new(16),
             cached_super_block: spin::Mutex::new(sb),
             cached_block_groups: Vec::new(),
             system_metadata_ranges: Vec::new(),
@@ -2078,6 +2458,135 @@ mod tests {
         let fs = make_test_fs(16);
         let err = fs.ensure_valid_pblock(2, 16, "test").unwrap_err();
         assert_eq!(err.code(), ErrCode::EIO);
+    }
+
+    #[test]
+    fn read_plan_coalesces_holes_and_unwritten_extents_and_caps_segments() {
+        let fs = make_test_fs(1024);
+        let mut unwritten = Extent::new(7, 200, 2);
+        unwritten.mark_unwritten();
+        let inode_ref = make_read_inode(
+            (10 * BLOCK_SIZE) as u64,
+            &[Extent::new(0, 100, 2), Extent::new(4, 104, 2), unwritten],
+        );
+
+        let plan = fs
+            .build_read_plan_from_inode(&inode_ref, 0, 10 * BLOCK_SIZE, 3)
+            .unwrap();
+
+        assert_eq!(plan.valid_bytes, 10 * BLOCK_SIZE);
+        assert_eq!(
+            plan.segments,
+            vec![
+                ReadSegment::Mapped {
+                    logical_start: 0,
+                    physical_start: 100,
+                    blocks: 2,
+                },
+                ReadSegment::Zero {
+                    logical_start: 2,
+                    blocks: 2,
+                },
+                ReadSegment::Mapped {
+                    logical_start: 4,
+                    physical_start: 104,
+                    blocks: 2,
+                },
+                ReadSegment::Zero {
+                    logical_start: 6,
+                    blocks: 3,
+                },
+                ReadSegment::Zero {
+                    logical_start: 9,
+                    blocks: 1,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn read_plan_reports_partial_eof_without_mapping_past_its_last_block() {
+        let fs = make_test_fs(1024);
+        let inode_ref = make_read_inode((5 * BLOCK_SIZE + 123) as u64, &[Extent::new(0, 100, 12)]);
+
+        let plan = fs
+            .build_read_plan_from_inode(&inode_ref, 4 * BLOCK_SIZE, 4 * BLOCK_SIZE, 8)
+            .unwrap();
+
+        assert_eq!(plan.valid_bytes, BLOCK_SIZE + 123);
+        assert_eq!(
+            plan.segments,
+            vec![ReadSegment::Mapped {
+                logical_start: 4,
+                physical_start: 104,
+                blocks: 2,
+            }]
+        );
+    }
+
+    #[test]
+    fn read_plan_rejects_invalid_contract_and_corrupt_physical_range() {
+        let fs = make_test_fs(128);
+        let inode_ref = make_read_inode(BLOCK_SIZE as u64, &[Extent::new(0, 127, 2)]);
+
+        assert_eq!(
+            fs.build_read_plan_from_inode(&inode_ref, 1, BLOCK_SIZE, 1)
+                .unwrap_err()
+                .code(),
+            ErrCode::EINVAL
+        );
+        assert_eq!(
+            fs.build_read_plan_from_inode(&inode_ref, 0, BLOCK_SIZE, 0)
+                .unwrap_err()
+                .code(),
+            ErrCode::EINVAL
+        );
+        assert_eq!(
+            fs.build_read_plan_from_inode(&inode_ref, 0, BLOCK_SIZE, 1)
+                .unwrap_err()
+                .code(),
+            ErrCode::EIO
+        );
+    }
+
+    #[test]
+    fn read_plan_only_loads_extent_subtrees_intersecting_the_window() {
+        let mut device = StubBlockDevice::with_block_count(1024);
+        let mut leaf_data = [0u8; BLOCK_SIZE];
+        let mut leaf = ExtentNodeMut::from_bytes(&mut leaf_data);
+        leaf.init(0, 0);
+        leaf.insert_extent(&Extent::new(100, 500, 4), 0).unwrap();
+        device.sb_block.data[BASE_OFFSET + 4..BASE_OFFSET + 8]
+            .copy_from_slice(&1024u32.to_le_bytes());
+        // Block 10 is intentionally absent. Reading it would produce an
+        // invalid extent header and fail this request.
+        let mut blocks = BTreeMap::new();
+        blocks.insert(20, Block::new(20, Box::new(leaf_data)));
+        let block_device = Arc::new(PlanBlockDevice {
+            base: device,
+            blocks,
+        });
+        let fs = make_test_fs_with_device(block_device);
+
+        let mut inode_ref = make_read_inode((104 * BLOCK_SIZE) as u64, &[]);
+        let mut root = inode_ref.inode.extent_root_mut();
+        root.init(1, 0);
+        root.insert_extent_index(&ExtentIndex::new(0, 10), 0)
+            .unwrap();
+        root.insert_extent_index(&ExtentIndex::new(100, 20), 1)
+            .unwrap();
+
+        let plan = fs
+            .build_read_plan_from_inode(&inode_ref, 100 * BLOCK_SIZE, 4 * BLOCK_SIZE, 16)
+            .unwrap();
+        assert_eq!(
+            plan.segments,
+            vec![ReadSegment::Mapped {
+                logical_start: 100,
+                physical_start: 500,
+                blocks: 4,
+            }]
+        );
     }
 
     #[test]

@@ -1677,12 +1677,12 @@ impl IndexNode for LockedExt4Inode {
         match file_type {
             FileType::Directory => Err(SystemError::EISDIR),
             FileType::Unknown => Err(SystemError::EROFS),
-            FileType::RegularFile => fs
-                .retry_metadata_read_contention(|| fs.fs.read(inode_num, offset, buf))
-                .map_err(Into::into),
-            FileType::SymLink => fs
-                .retry_metadata_read_contention(|| fs.fs.readlink(inode_num, offset, buf))
-                .map_err(Into::into),
+            FileType::RegularFile => {
+                fs.retry_metadata_read_contention(|| fs.fs.read(inode_num, offset, buf))
+            }
+            FileType::SymLink => {
+                fs.retry_metadata_read_contention(|| fs.fs.readlink(inode_num, offset, buf))
+            }
             _ => Err(SystemError::EINVAL),
         }
     }
@@ -2053,7 +2053,7 @@ impl IndexNode for LockedExt4Inode {
         match fs.retry_metadata_read_contention(|| ext4.lookup(inode_num, name)) {
             Ok(current) if current == target_num => {}
             Ok(_) => return Err(SystemError::EAGAIN_OR_EWOULDBLOCK),
-            Err(error) => return Err(error.into()),
+            Err(error) => return Err(error),
         }
         let reclaim = fs.retry_metadata_contention(|| ext4.unlink(inode_num, name))?;
         let outcome = if reclaim.is_some() {
@@ -2669,7 +2669,7 @@ impl IndexNode for LockedExt4Inode {
         match fs.retry_metadata_read_contention(|| concret_fs.lookup(inode_num, name)) {
             Ok(current) if current == target_num => {}
             Ok(_) => return Err(SystemError::EAGAIN_OR_EWOULDBLOCK),
-            Err(error) => return Err(error.into()),
+            Err(error) => return Err(error),
         }
         let target_attr = fs.retry_metadata_read_contention(|| concret_fs.getattr(target_num))?;
         if target_attr.ftype != FileType::Directory {
@@ -2678,7 +2678,7 @@ impl IndexNode for LockedExt4Inode {
         match fs.retry_metadata_read_contention(|| concret_fs.listdir(target_num)) {
             Ok(entries) if entries.len() <= 2 => {}
             Ok(_) => return Err(SystemError::ENOTEMPTY),
-            Err(error) => return Err(error.into()),
+            Err(error) => return Err(error),
         }
         let reclaim = fs.retry_metadata_contention(|| concret_fs.rmdir(inode_num, name))?;
         target.handoff_namespace_reclaim(reclaim)?;
@@ -2983,7 +2983,7 @@ impl IndexNode for LockedExt4Inode {
         {
             Ok(inode) => Some(inode),
             Err(SystemError::ENOENT) => None,
-            Err(error) => return Err(error.into()),
+            Err(error) => return Err(error),
         };
         let src_child_num =
             ext4_fs.retry_metadata_read_contention(|| ext4.lookup(src_inode_num, old_name))?;

@@ -1981,6 +1981,10 @@ pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, S
         ));
     }
 
+    if !run_submitted_writeback_selftest()? {
+        return Ok("status=fail stage=submitted_writeback\n".into());
+    }
+
     let writeback_budget_retry = run_async_writeback_budget_retry_selftest();
     if !writeback_budget_retry {
         return Ok("status=fail stage=writeback_budget_retry\n".into());
@@ -2528,7 +2532,7 @@ pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, S
     let submit_defer_progress = match submit_defer_batch {
         Some(batch) => match PageCacheManager::submit_writeback_batch(batch) {
             Ok(WritebackSubmitOutcome::Deferred(progress)) => Some(progress),
-            Ok(WritebackSubmitOutcome::Completed)
+            Ok(WritebackSubmitOutcome::Completed | WritebackSubmitOutcome::Submitted)
             | Ok(WritebackSubmitOutcome::Failed(_))
             | Err(_) => None,
         },
@@ -3764,6 +3768,6 @@ pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, S
     }
 
     Ok(alloc::format!(
-        "status=ok\nramfs_fallocate_range=ok\nwrite_prepare_rollback=ok\npreallocate_rollback=ok\nwriteback_domain_lifecycle=ok\npreallocated_batch_lifecycle=ok\nfile_membership=ok\nshmem_membership=ok\ndirty_membership=ok\ndirty_incarnation=ok\nremote_dirty_publish=ok\nwriteback_membership=ok\nwriteback_admission_order=ok\nwriteback_submission_token=ok\nwriteback_defer_progress=ok\nwriteback_budget_retry=ok\nfault_invalidate_retry_order=ok\ntag_scan_chunk_release=ok\nunevictable_membership=ok\ninflight_teardown=ok\nlate_completion=ok\nglobal_wiring=ok\nlayout=ok\nfile_drop_drift={file_drop_drift}\nshmem_drop_drift={shmem_drop_drift}\ndirty_drop_drift={dirty_drop_drift}\nwriteback_drop_drift={writeback_drop_drift}\nunevictable_drop_drift={unevictable_drop_drift}\nentry_size={entry_size}\nbaseline_size={baseline_size}\n"
+        "status=ok\nramfs_fallocate_range=ok\nwrite_prepare_rollback=ok\npreallocate_rollback=ok\nwriteback_domain_lifecycle=ok\npreallocated_batch_lifecycle=ok\nfile_membership=ok\nshmem_membership=ok\ndirty_membership=ok\ndirty_incarnation=ok\nremote_dirty_publish=ok\nwriteback_membership=ok\nwriteback_admission_order=ok\nwriteback_submission_token=ok\nwriteback_defer_progress=ok\nwriteback_budget_retry=ok\nsubmitted_writeback=ok\nfault_invalidate_retry_order=ok\ntag_scan_chunk_release=ok\nunevictable_membership=ok\ninflight_teardown=ok\nlate_completion=ok\nglobal_wiring=ok\nlayout=ok\nfile_drop_drift={file_drop_drift}\nshmem_drop_drift={shmem_drop_drift}\ndirty_drop_drift={dirty_drop_drift}\nwriteback_drop_drift={writeback_drop_drift}\nunevictable_drop_drift={unevictable_drop_drift}\nentry_size={entry_size}\nbaseline_size={baseline_size}\n"
     ))
 }

@@ -47,6 +47,10 @@ class TempFile {
         return path_.c_str();
     }
 
+    int fd() const {
+        return fd_;
+    }
+
   private:
     std::string path_;
     int fd_ = -1;
@@ -175,6 +179,34 @@ TEST(Ext4Xattr, CreateReplaceFlagsAndFailurePreserveValue) {
     errno = 0;
     EXPECT_EQ(-1, removexattr(file.path(), kName));
     EXPECT_EQ(ENODATA, errno);
+}
+
+TEST(Ext4Xattr, UnlinkWithAttributeKeepsFilesystemWritableAfterSync) {
+    struct statfs st = {};
+    ASSERT_EQ(0, statfs("/root", &st)) << strerror(errno);
+    if (st.f_type != kExt4SuperMagic) {
+        GTEST_SKIP() << "/root is not ext4";
+    }
+    {
+        TempFile file;
+        ASSERT_TRUE(file.valid()) << strerror(errno);
+        ASSERT_EQ(0, setxattr(file.path(), "user.reclaim", "retained", 8, 0))
+            << strerror(errno);
+        // Leave the attribute attached when close/unlink triggers eviction.
+    }
+    int directory = open("/root", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    ASSERT_GE(directory, 0) << strerror(errno);
+    int synced = syncfs(directory);
+    int sync_error = errno;
+    close(directory);
+    ASSERT_EQ(0, synced) << "reclaim syncfs: " << strerror(sync_error);
+
+    TempFile next;
+    ASSERT_TRUE(next.valid()) << "creation after reclaim: " << strerror(errno);
+    const char payload[] = "filesystem remains writable";
+    ASSERT_EQ(static_cast<ssize_t>(sizeof(payload)), write(next.fd(), payload, sizeof(payload)))
+        << strerror(errno);
+    ASSERT_EQ(0, fsync(next.fd())) << "fsync after reclaim: " << strerror(errno);
 }
 
 int main(int argc, char** argv) {

@@ -508,6 +508,171 @@ pub enum PageCacheWritebackBindResult {
     Deferred(Arc<dyn PageCacheWritebackProgress>),
 }
 
+struct WritebackCompletionState {
+    result: Option<Result<(), SystemError>>,
+    batch: Option<ClaimedWritebackBatch>,
+    registered: bool,
+}
+
+/// One accepted writeback's terminal notification. The producer must retain
+/// this handle and complete it on success, failure, cancellation and shutdown.
+/// Publication and registration share a lock, so either ordering invokes the
+/// consumer exactly once. Duplicate producer notifications are ignored.
+///
+/// `complete` may synchronously finish PageCache entries, release inode
+/// retention and dispatch retries. Call it outside filesystem transaction,
+/// inode, admission and PageCache locks; those paths may acquire these locks.
+pub struct PageCacheWritebackCompletion {
+    state: Mutex<WritebackCompletionState>,
+}
+
+impl PageCacheWritebackCompletion {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(WritebackCompletionState {
+                result: None,
+                batch: None,
+                registered: false,
+            }),
+        })
+    }
+
+    /// Returns true only for the first terminal notification.
+    pub fn complete(&self, result: Result<(), SystemError>) -> bool {
+        let batch = {
+            let mut state = self.state.lock();
+            if state.result.is_some() {
+                return false;
+            }
+            state.result = Some(result.clone());
+            state.batch.take()
+        };
+        if let Some(batch) = batch {
+            PageCacheManager::finish_submitted_writeback(batch, result);
+        }
+        true
+    }
+
+    fn register(&self, batch: ClaimedWritebackBatch) {
+        let result = {
+            let mut state = self.state.lock();
+            assert!(!state.registered, "writeback completion registered twice");
+            state.registered = true;
+            match state.result.clone() {
+                Some(result) => result,
+                None => {
+                    state.batch = Some(batch);
+                    return;
+                }
+            }
+        };
+        PageCacheManager::finish_submitted_writeback(batch, result);
+    }
+}
+
+/// Exercise accepted completion using real claim/snapshot/page completion,
+/// including the separate tagged start and completion predicates. No producer
+/// thread is needed: both linearization orders are deliberately controlled.
+pub(super) fn run_submitted_writeback_selftest() -> Result<bool, SystemError> {
+    struct Submission(Arc<PageCacheWritebackCompletion>);
+    impl PageCacheWritebackSubmission for Submission {
+        fn submit(
+            self: Box<Self>,
+            _descriptor: &PageCacheWritebackDescriptor,
+            _data: &[u8],
+        ) -> Result<PageCacheWritebackSubmitResult, SystemError> {
+            Ok(PageCacheWritebackSubmitResult::Submitted(self.0))
+        }
+        fn cancel(self: Box<Self>, _context: PageCacheWritebackCancellationContext) {}
+    }
+
+    for (early, redirty, failed) in [
+        (true, false, false),
+        (false, false, false),
+        (false, true, false),
+        (false, false, true),
+    ] {
+        let cache = PageCache::new_unowned(None, None);
+        let page = cache.get_or_create_page_zero(0)?;
+        let epoch = 0x6b00;
+        let entry = {
+            let _transition = cache.tagged_writeback_lock.lock();
+            let mut inner = cache.inner.lock();
+            let entry = inner.get_entry(0).ok_or(SystemError::EIO)?;
+            page.write().add_flags(PageFlags::PG_DIRTY);
+            entry.account_state_transition(entry.state(), PageState::Dirty);
+            entry.set_state(PageState::Dirty);
+            entry.set_writeback_tag(epoch);
+            inner.dirty_pages.insert(0);
+            entry
+        };
+        let claim = {
+            let _invalidate = cache.invalidate_read();
+            PageCacheManager::claim_and_snapshot_tagged_locked(
+                &cache,
+                WritebackBatchRange::new(0, 0),
+                MMArch::PAGE_SIZE,
+                &entry,
+                epoch,
+                false,
+                None,
+            )?
+        };
+        let WritebackClaimOutcome::Claimed(mut batch) = claim else {
+            return Ok(false);
+        };
+        let completion = PageCacheWritebackCompletion::new();
+        batch.submission = Some(Box::new(Submission(completion.clone())));
+        if early && !completion.complete(Ok(())) {
+            return Ok(false);
+        }
+        if !matches!(
+            PageCacheManager::submit_writeback_batch(batch)?,
+            WritebackSubmitOutcome::Submitted
+        ) {
+            return Ok(false);
+        }
+        if !early {
+            if entry.state() != PageState::Writeback
+                || PageCacheManager::has_pending_tagged_writeback_submission(
+                    &cache, 0, 0, epoch, false,
+                )
+                || !PageCacheManager::has_pending_tagged_writeback_submission(
+                    &cache, 0, 0, epoch, true,
+                )
+            {
+                completion.complete(Err(SystemError::EIO));
+                return Ok(false);
+            }
+            // The start boundary must return while completion is outstanding.
+            PageCacheManager::wait_tagged_writeback_submission(&cache, 0, 0, epoch)?;
+            if redirty {
+                page.write().add_flags(PageFlags::PG_DIRTY);
+            }
+            if !completion.complete(if failed {
+                Err(SystemError::EIO)
+            } else {
+                Ok(())
+            }) {
+                return Ok(false);
+            }
+        }
+        let expected = if redirty || failed {
+            PageState::Dirty
+        } else {
+            PageState::UpToDate
+        };
+        if completion.complete(Ok(()))
+            || entry.state() != expected
+            || !cache.tagged_writeback_submissions.lock().is_empty()
+            || page.read().flags().contains(PageFlags::PG_ERROR) != failed
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 /// Submission-time outcome of a previously bound writeback token.
 ///
 /// Unlike `Err`, `Deferred` is not a writeback failure: PageCache returns the
@@ -515,6 +680,8 @@ pub enum PageCacheWritebackBindResult {
 /// synchronous caller wait for the supplied progress ticket before retrying.
 pub enum PageCacheWritebackSubmitResult {
     Completed,
+    /// Accepted; pages and exact-generation ownership remain in Writeback.
+    Submitted(Arc<PageCacheWritebackCompletion>),
     Deferred(Arc<dyn PageCacheWritebackProgress>),
 }
 
@@ -547,13 +714,12 @@ pub enum PageCacheWritebackCancellationContext {
 /// claim until it explicitly resolves that claim on every success or error
 /// path.
 ///
-/// This first-generation token contract is completion-oriented: returning
-/// `Completed` lets PageCache clean the pages immediately.  It therefore
-/// cannot represent a lower layer which has merely accepted asynchronous I/O
-/// while completion remains outstanding.  Such a backend must keep using a
-/// completion-preserving path until PageCache grows an explicit
-/// `Submitted(completion_handle)` result; it must never return `Completed`
-/// early and let `WAIT_AFTER` observe clean pages before the actual I/O.
+/// `Completed` permits immediate PageCache completion. `Submitted` transfers
+/// completion to the supplied one-shot handle: the backend must own its data
+/// and private claim until terminal notification, without borrowing `data` or
+/// `descriptor`. `Deferred` means no accepted I/O and remains a retry.
+/// Backends must bound their accepted in-flight resources before returning
+/// Submitted; the PageCache worker slot is released after registration.
 ///
 /// `cancel()` receives the exact lock context. In particular, only
 /// `AfterAdmissionWithInvalidateRead` may use the split ext4 finalizer which
@@ -869,6 +1035,7 @@ impl PageCacheBackend for AsyncPageCacheBackend {
 
 #[derive(Debug)]
 pub(super) struct TaggedWritebackSubmission {
+    accepted: bool,
     epoch: u64,
     first_index: usize,
     last_index: usize,
@@ -1057,13 +1224,15 @@ pub(super) enum WritebackClaimOutcome {
 
 pub(super) enum WritebackSubmitOutcome {
     Completed,
+    Submitted,
     Failed(SystemError),
     Deferred(Arc<dyn PageCacheWritebackProgress>),
 }
 
 enum WritebackNextBatchOutcome {
     NoBatch,
-    Completed,
+    /// A batch was completed or accepted; range waits own completion.
+    Progress,
     Deferred(Arc<dyn PageCacheWritebackProgress>),
 }
 
@@ -1548,6 +1717,17 @@ impl PageCacheManager {
         first_error.map_or(Ok(()), Err)
     }
 
+    fn finish_submitted_writeback(batch: ClaimedWritebackBatch, result: Result<(), SystemError>) {
+        let cache = batch.cache.clone();
+        let epoch = batch.retry_writeback_tag;
+        let first = batch.first_index;
+        let last = batch.descriptor.last_index();
+        // Publish page state and errseq before retiring the exact tagged
+        // completion obligation. No filesystem or completion-state lock is held.
+        let _ = Self::complete_writeback_batch(batch, result);
+        Self::finish_tagged_writeback_submission(&cache, epoch, first, last);
+    }
+
     /// Return an intentionally deferred batch to the Dirty set without
     /// reporting a writeback error.  The submission token has already
     /// finalized its filesystem-private claim and supplied the progress ticket
@@ -1731,6 +1911,18 @@ impl PageCacheManager {
                 );
                 completion?;
                 Ok(WritebackSubmitOutcome::Completed)
+            }
+            Ok(PageCacheWritebackSubmitResult::Submitted(completion)) => {
+                // Publish acceptance before registration: an already-complete
+                // handle may immediately retire the same tagged record.
+                Self::accept_tagged_writeback_submission(
+                    &submission_cache,
+                    submission_epoch,
+                    submission_first,
+                    submission_last,
+                );
+                completion.register(batch);
+                Ok(WritebackSubmitOutcome::Submitted)
             }
             Ok(PageCacheWritebackSubmitResult::Deferred(progress)) => {
                 Self::defer_writeback_batch(batch);
@@ -1944,7 +2136,7 @@ impl PageCacheManager {
             WritebackClaimOutcome::FailedRecorded(error) => return Err(error),
         };
         match Self::submit_writeback_batch(batch)? {
-            WritebackSubmitOutcome::Completed => Ok(true),
+            WritebackSubmitOutcome::Completed | WritebackSubmitOutcome::Submitted => Ok(true),
             WritebackSubmitOutcome::Failed(error) => Err(error),
             WritebackSubmitOutcome::Deferred(_) => {
                 panic!("stable-size writeback must not submit a deferred token")
@@ -2345,7 +2537,9 @@ impl PageCacheManager {
             }
             WritebackClaimOutcome::FailedRecorded(error) => Err(error),
             WritebackClaimOutcome::Claimed(batch) => match Self::submit_writeback_batch(batch)? {
-                WritebackSubmitOutcome::Completed => Ok(WritebackNextBatchOutcome::Completed),
+                WritebackSubmitOutcome::Completed | WritebackSubmitOutcome::Submitted => {
+                    Ok(WritebackNextBatchOutcome::Progress)
+                }
                 WritebackSubmitOutcome::Failed(error) => Err(error),
                 WritebackSubmitOutcome::Deferred(progress) => {
                     Ok(WritebackNextBatchOutcome::Deferred(progress))
@@ -2490,7 +2684,7 @@ impl PageCacheManager {
             loop {
                 match self.writeback_next_batch(&cache, &inode, start_index, end_index, None)? {
                     WritebackNextBatchOutcome::NoBatch => break,
-                    WritebackNextBatchOutcome::Completed => continue,
+                    WritebackNextBatchOutcome::Progress => continue,
                     WritebackNextBatchOutcome::Deferred(progress) => {
                         // `writeback_next_batch()` has completed the token
                         // transition and released all PageCache/admission
@@ -2614,7 +2808,7 @@ impl PageCacheManager {
             .ok_or(SystemError::EIO)?;
         match self.writeback_next_batch(&cache, &inode, start_index, end_index, Some(admitted))? {
             WritebackNextBatchOutcome::NoBatch => Ok(PageCacheWritebackDispatchOutcome::Idle),
-            WritebackNextBatchOutcome::Completed => Ok(PageCacheWritebackDispatchOutcome::Progress),
+            WritebackNextBatchOutcome::Progress => Ok(PageCacheWritebackDispatchOutcome::Progress),
             WritebackNextBatchOutcome::Deferred(_) => {
                 Ok(PageCacheWritebackDispatchOutcome::Deferred)
             }
@@ -2748,10 +2942,36 @@ impl PageCacheManager {
             .tagged_writeback_submissions
             .lock()
             .push(TaggedWritebackSubmission {
+                accepted: false,
                 epoch,
                 first_index,
                 last_index,
             });
+    }
+
+    fn accept_tagged_writeback_submission(
+        cache: &PageCache,
+        epoch: Option<u64>,
+        first_index: usize,
+        last_index: usize,
+    ) {
+        let Some(epoch) = epoch else {
+            return;
+        };
+        {
+            let _transition = cache.tagged_writeback_lock.lock();
+            let mut pending = cache.tagged_writeback_submissions.lock();
+            let submission = pending
+                .iter_mut()
+                .find(|submission| {
+                    submission.epoch == epoch
+                        && submission.first_index == first_index
+                        && submission.last_index == last_index
+                })
+                .expect("accepted writeback lost its tagged registration");
+            submission.accepted = true;
+        }
+        Self::notify_tagged_writeback_progress(cache);
     }
 
     fn finish_tagged_writeback_submission(
@@ -2786,13 +3006,15 @@ impl PageCacheManager {
         start_index: usize,
         end_index: usize,
         epoch: u64,
+        include_accepted: bool,
     ) -> bool {
         cache
             .tagged_writeback_submissions
             .lock()
             .iter()
             .any(|submission| {
-                submission.epoch != 0
+                (include_accepted || !submission.accepted)
+                    && submission.epoch != 0
                     && submission.epoch <= epoch
                     && submission.first_index <= end_index
                     && start_index <= submission.last_index
@@ -2937,7 +3159,7 @@ impl PageCacheManager {
             return Ok(());
         };
         loop {
-            Self::wait_tagged_writeback_submission(cache, start_index, end_index, epoch)?;
+            Self::wait_tagged_writeback_pending(cache, start_index, end_index, epoch, true)?;
 
             // Claim clears the tag immediately before publishing Writeback.
             // A submission-time defer can restore it after this wait, so the
@@ -2956,6 +3178,7 @@ impl PageCacheManager {
                     start_index,
                     end_index,
                     epoch,
+                    true,
                 )
             {
                 return Ok(());
@@ -2969,6 +3192,16 @@ impl PageCacheManager {
         end_index: usize,
         epoch: u64,
     ) -> Result<(), SystemError> {
+        Self::wait_tagged_writeback_pending(cache, start_index, end_index, epoch, false)
+    }
+
+    fn wait_tagged_writeback_pending(
+        cache: &Arc<PageCache>,
+        start_index: usize,
+        end_index: usize,
+        epoch: u64,
+        include_accepted: bool,
+    ) -> Result<(), SystemError> {
         loop {
             let observed = {
                 let _tagged_writeback_transition = cache.tagged_writeback_lock.lock();
@@ -2979,6 +3212,7 @@ impl PageCacheManager {
                             start_index,
                             end_index,
                             epoch,
+                            include_accepted,
                         );
                 if !pending {
                     return Ok(());
@@ -2998,6 +3232,7 @@ impl PageCacheManager {
                         start_index,
                         end_index,
                         epoch,
+                        include_accepted,
                     ))
                     || cache.tagged_writeback_progress.load(Ordering::Acquire) != observed
                 {
@@ -3353,7 +3588,7 @@ impl PageCacheManager {
             let outcome = Self::submit_writeback_batch(batch);
             drop(permit);
             match outcome {
-                Ok(WritebackSubmitOutcome::Completed) => {
+                Ok(WritebackSubmitOutcome::Completed | WritebackSubmitOutcome::Submitted) => {
                     if last_index == usize::MAX {
                         if let Some(cache) = cache.upgrade() {
                             Self::notify_tagged_writeback_progress(&cache);
@@ -3706,14 +3941,17 @@ impl PageCacheManager {
                         continue;
                     }
                     match Self::submit_writeback_batch(batch) {
-                        Ok(WritebackSubmitOutcome::Completed) => {
+                        Ok(
+                            WritebackSubmitOutcome::Completed | WritebackSubmitOutcome::Submitted,
+                        ) => {
                             drop(permit);
                             if last_index == usize::MAX {
                                 Self::notify_tagged_writeback_progress(cache);
                                 return;
                             }
-                            // The submit result is now known.  Only a
-                            // completed head permits claiming its successor.
+                            // Acceptance permits claiming a successor. An
+                            // outstanding completion retains its own
+                            // Writeback ownership.
                             cursor = last_index + 1;
                         }
                         Ok(WritebackSubmitOutcome::Deferred(progress)) => {
@@ -4223,10 +4461,14 @@ impl PageCacheManager {
                     break;
                 };
                 match Self::submit_writeback_batch(batch) {
-                    Ok(WritebackSubmitOutcome::Completed) if last_index != usize::MAX => {
+                    Ok(WritebackSubmitOutcome::Completed | WritebackSubmitOutcome::Submitted)
+                        if last_index != usize::MAX =>
+                    {
                         cursor = last_index + 1;
                     }
-                    Ok(WritebackSubmitOutcome::Completed) => break,
+                    Ok(WritebackSubmitOutcome::Completed | WritebackSubmitOutcome::Submitted) => {
+                        break
+                    }
                     Ok(WritebackSubmitOutcome::Failed(_)) => break,
                     Ok(WritebackSubmitOutcome::Deferred(progress)) => {
                         Self::schedule_reclaimer_deferred_retry(

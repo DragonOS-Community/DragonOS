@@ -166,8 +166,8 @@ class LoopExt4 {
         ASSERT_EQ(0, ioctl(loop_fd_, kLoopSetFd, backing_fd_)) << strerror(errno);
     }
 
-    void Mount() {
-        ASSERT_EQ(0, mount(loop_path_.c_str(), mount_point_.c_str(), "ext4", 0, nullptr))
+    void Mount(unsigned long flags = 0) {
+        ASSERT_EQ(0, mount(loop_path_.c_str(), mount_point_.c_str(), "ext4", flags, nullptr))
             << strerror(errno);
         mounted_ = true;
     }
@@ -195,13 +195,13 @@ class LoopExt4 {
         EXPECT_EQ(0, close(probe));
     }
 
-    void MountSecond() {
-        ASSERT_TRUE(mounted_);
+    void MountSecond(const char* options = nullptr) {
+        ASSERT_TRUE(mounted_ || detached_);
         ASSERT_FALSE(second_mounted_);
         second_mount_point_ = "/tmp/ext4_inode_identity_" + std::to_string(getpid())
             + "_second_mnt";
         ASSERT_EQ(0, mkdir(second_mount_point_.c_str(), 0700)) << strerror(errno);
-        ASSERT_EQ(0, mount(loop_path_.c_str(), second_mount_point_.c_str(), "ext4", 0, nullptr))
+        ASSERT_EQ(0, mount(loop_path_.c_str(), second_mount_point_.c_str(), "ext4", 0, options))
             << strerror(errno);
         second_mounted_ = true;
     }
@@ -246,6 +246,10 @@ class LoopExt4 {
         mount_point_.clear();
         ASSERT_EQ(0, unlink(image_.c_str())) << strerror(errno);
         image_.clear();
+    }
+
+    const std::string& loop_path() const {
+        return loop_path_;
     }
 
     const std::string& mount_point() const {
@@ -912,9 +916,9 @@ TEST(Ext4InodeIdentity, DelayedAndEagerWritesPersistCtimeAcrossRemount) {
 
     // This is an overwrite of an already mapped block, so it exercises the
     // eager buffered fallback rather than the append-only delayed mapper.
-    // Keep a second mount alive as an independent on-disk observer: checking
-    // it immediately after fsync proves that fsync itself committed the
-    // timestamp, without relying on the first mount's later clean unmount.
+    // A second mount shares Linux's canonical inode and must observe the
+    // same timestamp. Persistence is checked after both mounts are removed;
+    // a live second mount is not an independent on-disk observer.
     ASSERT_NO_FATAL_FAILURE(fs.MountSecond());
     sleep(1);
     ASSERT_EQ(1, pwrite(fd, "B", 1, 0)) << strerror(errno);
@@ -1010,18 +1014,141 @@ TEST(Ext4InodeIdentity, ConcurrentAppendRecordsRemainAtomicAndDurable) {
 }
 
 TEST(Ext4InodeIdentity, SameBlockDeviceCanBeMountedTwice) {
-    // Linux reuses a block device's superblock for a compatible second mount.
-    // DragonOS does not have that shared-superblock layer yet, but a dormant
-    // delayed-allocation experiment must not turn the established mount(2)
-    // behavior into unconditional EBUSY. This test intentionally asserts
-    // only mount namespace admission; page-cache sharing is a separate VFS
-    // design task and must not be emulated by this ext4 regression test.
+    LoopExt4 fs;
+    ASSERT_NO_FATAL_FAILURE(fs.SetUp());
+    ASSERT_NO_FATAL_FAILURE(fs.Mount());
+    const std::string first = fs.mount_point() + "/shared";
+    int first_fd = open(first.c_str(), O_CREAT | O_EXCL | O_RDWR, 0600);
+    ASSERT_GE(first_fd, 0) << strerror(errno);
+    ASSERT_EQ(4, write(first_fd, "live", 4)) << strerror(errno);
+
+    // Repeated mount options do not reconfigure an existing superblock.
+    // In particular, this must not start a second lower journal/cache.
+    ASSERT_NO_FATAL_FAILURE(fs.MountSecond("nobarrier"));
+    const std::string second = fs.second_mount_point() + "/shared";
+    int second_fd = open(second.c_str(), O_RDWR);
+    ASSERT_GE(second_fd, 0) << strerror(errno);
+    char bytes[4] = {};
+    ASSERT_EQ(4, pread(second_fd, bytes, sizeof(bytes), 0)) << strerror(errno);
+    EXPECT_EQ(0, memcmp(bytes, "live", sizeof(bytes)));
+    struct stat one = {}, two = {};
+    ASSERT_EQ(0, fstat(first_fd, &one)) << strerror(errno);
+    ASSERT_EQ(0, fstat(second_fd, &two)) << strerror(errno);
+    EXPECT_EQ(one.st_dev, two.st_dev);
+    EXPECT_EQ(one.st_ino, two.st_ino);
+
+    ASSERT_EQ(4, pwrite(second_fd, "both", 4, 0)) << strerror(errno);
+    ASSERT_EQ(4, pread(first_fd, bytes, sizeof(bytes), 0)) << strerror(errno);
+    EXPECT_EQ(0, memcmp(bytes, "both", sizeof(bytes)));
+    const std::string linked = fs.second_mount_point() + "/alias";
+    ASSERT_EQ(0, link(second.c_str(), linked.c_str())) << strerror(errno);
+    ASSERT_EQ(0, fstat(first_fd, &one)) << strerror(errno);
+    EXPECT_EQ(static_cast<nlink_t>(2), one.st_nlink);
+    ASSERT_EQ(0, close(first_fd)) << strerror(errno);
+    ASSERT_EQ(0, close(second_fd)) << strerror(errno);
+    ASSERT_NO_FATAL_FAILURE(fs.UnmountSecond());
+    ASSERT_NO_FATAL_FAILURE(fs.Unmount());
+}
+
+TEST(Ext4InodeIdentity, UnmountOneSharedMountKeepsOtherWritable) {
     LoopExt4 fs;
     ASSERT_NO_FATAL_FAILURE(fs.SetUp());
     ASSERT_NO_FATAL_FAILURE(fs.Mount());
     ASSERT_NO_FATAL_FAILURE(fs.MountSecond());
-    ASSERT_NO_FATAL_FAILURE(fs.UnmountSecond());
+    const std::string second = fs.second_mount_point() + "/survivor";
+    int fd = open(second.c_str(), O_CREAT | O_EXCL | O_RDWR, 0600);
+    ASSERT_GE(fd, 0) << strerror(errno);
+    ASSERT_EQ(4, write(fd, "part", 4)) << strerror(errno);
     ASSERT_NO_FATAL_FAILURE(fs.Unmount());
+    ASSERT_EQ(4, write(fd, "done", 4)) << strerror(errno);
+    ASSERT_EQ(0, fsync(fd)) << strerror(errno);
+    ASSERT_EQ(0, close(fd)) << strerror(errno);
+    ASSERT_NO_FATAL_FAILURE(fs.UnmountSecond());
+
+    ASSERT_NO_FATAL_FAILURE(fs.Mount());
+    fd = open((fs.mount_point() + "/survivor").c_str(), O_RDONLY);
+    ASSERT_GE(fd, 0) << strerror(errno);
+    char bytes[8] = {};
+    ASSERT_EQ(8, read(fd, bytes, sizeof(bytes))) << strerror(errno);
+    EXPECT_EQ(0, memcmp(bytes, "partdone", sizeof(bytes)));
+    ASSERT_EQ(0, close(fd)) << strerror(errno);
+    ASSERT_NO_FATAL_FAILURE(fs.Unmount());
+}
+
+TEST(Ext4InodeIdentity, LazyDetachedOpenFileSharesSubsequentMount) {
+    LoopExt4 fs;
+    ASSERT_NO_FATAL_FAILURE(fs.SetUp());
+    ASSERT_NO_FATAL_FAILURE(fs.Mount());
+    int old_fd = open((fs.mount_point() + "/detached_shared").c_str(),
+                      O_CREAT | O_EXCL | O_RDWR, 0600);
+    ASSERT_GE(old_fd, 0) << strerror(errno);
+    ASSERT_EQ(4, write(old_fd, "held", 4)) << strerror(errno);
+    ASSERT_NO_FATAL_FAILURE(fs.Detach());
+    ASSERT_NO_FATAL_FAILURE(fs.MountSecond());
+    int new_fd = open((fs.second_mount_point() + "/detached_shared").c_str(), O_RDWR);
+    ASSERT_GE(new_fd, 0) << strerror(errno);
+    char bytes[4] = {};
+    ASSERT_EQ(4, pread(new_fd, bytes, sizeof(bytes), 0)) << strerror(errno);
+    EXPECT_EQ(0, memcmp(bytes, "held", sizeof(bytes)));
+    ASSERT_EQ(0, close(old_fd)) << strerror(errno);
+    ASSERT_EQ(4, pwrite(new_fd, "kept", 4, 0)) << strerror(errno);
+    ASSERT_EQ(0, fsync(new_fd)) << strerror(errno);
+    ASSERT_EQ(0, close(new_fd)) << strerror(errno);
+    ASSERT_NO_FATAL_FAILURE(fs.UnmountSecond());
+    ASSERT_NO_FATAL_FAILURE(fs.FinishDetached());
+}
+
+TEST(Ext4InodeIdentity, RepeatedMountRejectsReadonlyModeConflict) {
+    LoopExt4 fs;
+    ASSERT_NO_FATAL_FAILURE(fs.SetUp());
+    const std::string other = fs.mount_point() + "_conflict";
+    ASSERT_EQ(0, mkdir(other.c_str(), 0700)) << strerror(errno);
+    for (unsigned long first_flags : {0UL, static_cast<unsigned long>(MS_RDONLY)}) {
+        ASSERT_NO_FATAL_FAILURE(fs.Mount(first_flags));
+        errno = 0;
+        int result = mount(fs.loop_path().c_str(), other.c_str(), "ext4",
+                           first_flags ^ MS_RDONLY, nullptr);
+        int saved_errno = errno;
+        if (result == 0) {
+            EXPECT_EQ(0, umount(other.c_str())) << strerror(errno);
+        }
+        EXPECT_EQ(-1, result);
+        EXPECT_EQ(EBUSY, saved_errno);
+        ASSERT_NO_FATAL_FAILURE(fs.Unmount());
+    }
+    ASSERT_EQ(0, rmdir(other.c_str())) << strerror(errno);
+}
+
+TEST(Ext4InodeIdentity, RepeatedMountRacesLastUnmount) {
+    LoopExt4 fs;
+    ASSERT_NO_FATAL_FAILURE(fs.SetUp());
+    const std::string other = fs.mount_point() + "_racer";
+    ASSERT_EQ(0, mkdir(other.c_str(), 0700)) << strerror(errno);
+    for (int iteration = 0; iteration < 8; ++iteration) {
+        ASSERT_NO_FATAL_FAILURE(fs.Mount());
+        std::atomic<bool> start{false};
+        int result = -1;
+        int mount_error = 0;
+        std::thread mounter([&] {
+            while (!start.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+            result = mount(fs.loop_path().c_str(), other.c_str(), "ext4", 0, nullptr);
+            mount_error = errno;
+        });
+        start.store(true, std::memory_order_release);
+        fs.Unmount();
+        mounter.join();
+        ASSERT_EQ(0, result) << strerror(mount_error);
+        const std::string path = other + "/raced";
+        int fd = open(path.c_str(), O_CREAT | O_RDWR, 0600);
+        ASSERT_GE(fd, 0) << strerror(errno);
+        ASSERT_EQ(1, pwrite(fd, "R", 1, iteration)) << strerror(errno);
+        ASSERT_EQ(0, fsync(fd)) << strerror(errno);
+        ASSERT_EQ(0, close(fd)) << strerror(errno);
+        ASSERT_EQ(0, umount(other.c_str())) << strerror(errno);
+    }
+    ASSERT_EQ(0, rmdir(other.c_str())) << strerror(errno);
 }
 
 TEST(Ext4InodeIdentity, OpenFileSurvivesFinalUnlink) {

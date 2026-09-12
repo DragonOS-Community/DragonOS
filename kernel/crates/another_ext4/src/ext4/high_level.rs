@@ -115,13 +115,18 @@ impl Ext4 {
         let parent_id = self.generic_lookup(root, &parent_path)?;
         // Get the child inode
         let child_id = self.lookup(parent_id, file_name)?;
-        let child = self.read_inode(child_id)?;
-        // Check if child is a non-empty directory
-        if child.inode.is_dir() && self.dir_list_entries(&child)?.len() > 2 {
-            return_error!(ErrCode::ENOTEMPTY, "Directory {} not empty", path);
-        }
+        let is_dir = {
+            // Keep the cold inode-cache insertion and directory inspection
+            // in one view; release it before entering the mutating operation.
+            let _view = self.lock_metadata_read_view()?;
+            let child = self.read_inode(child_id)?;
+            if child.inode.is_dir() && self.dir_list_entries(&child)?.len() > 2 {
+                return_error!(ErrCode::ENOTEMPTY, "Directory {} not empty", path);
+            }
+            child.inode.is_dir()
+        };
         // Unlink the file
-        let reclaim = if child.inode.is_dir() {
+        let reclaim = if is_dir {
             self.rmdir(parent_id, file_name)
         } else {
             self.unlink(parent_id, file_name)

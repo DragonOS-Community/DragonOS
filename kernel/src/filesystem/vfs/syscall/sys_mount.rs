@@ -485,60 +485,59 @@ fn do_new_mount(
     mount_flags: MountFlags,
 ) -> Result<Arc<MountFS>, SystemError> {
     let fs_type_str = filesystemtype.ok_or(SystemError::EINVAL)?;
-    // Linux accepts a NULL source for nodev filesystems and reports it as
-    // "none" in mountinfo. Keep an explicitly supplied empty string distinct.
-    let fs = produce_fs(
-        &fs_type_str,
-        data.as_deref(),
-        source.as_deref().unwrap_or(""),
-        mount_flags,
-    )
-    .inspect_err(|e| {
-        log::warn!("Failed to produce filesystem: {:?}", e);
-    })?;
-    let source = source.unwrap_or_else(|| String::from("none"));
+    loop {
+        // Linux accepts a NULL source for nodev filesystems. Keep an
+        // explicitly supplied empty string distinct from the display name.
+        let fs = produce_fs(
+            &fs_type_str,
+            data.as_deref(),
+            source.as_deref().unwrap_or(""),
+            mount_flags,
+        )
+        .inspect_err(|e| {
+            log::warn!("Failed to produce filesystem: {:?}", e);
+        })?;
+        let mnt_inode = target_inode
+            .clone()
+            .downcast_arc::<MountFSInode>()
+            .ok_or(SystemError::EINVAL)?;
+        let (to_mount_fs, root_inner_inode) = fs
+            .clone()
+            .downcast_arc::<MountFS>()
+            .map(|it| (it.inner_filesystem(), it.root_inner_inode()))
+            .unwrap_or_else(|| {
+                let root_inner_inode = fs.root_inode();
+                (fs, root_inner_inode)
+            });
 
-    let new_mount_res: Result<Arc<MountFS>, SystemError> =
-        if let Some(mnt_inode) = target_inode.clone().downcast_arc::<MountFSInode>() {
-            let (to_mount_fs, root_inner_inode) = fs
-                .clone()
-                .downcast_arc::<MountFS>()
-                .map(|it| (it.inner_filesystem(), it.root_inner_inode()))
-                .unwrap_or_else(|| {
-                    let root_inner_inode = fs.root_inode();
-                    (fs, root_inner_inode)
-                });
-
-            let prepared = mnt_inode.prepare_subtree_with_root_dentry(
-                to_mount_fs,
-                root_inner_inode,
-                None,
-                mount_flags,
-                None,
-                None,
-            )?;
-            prepared.set_mount_source(Some(source.clone()));
-            if let Err(error) = mnt_inode.publish_prepared_subtree(&prepared) {
-                MountFS::deactivate_disconnected_subtree(&prepared);
-                return Err(error);
+        let prepared = match mnt_inode.prepare_subtree_with_root_dentry(
+            to_mount_fs.clone(),
+            root_inner_inode,
+            None,
+            mount_flags,
+            None,
+            None,
+        ) {
+            Ok(prepared) => prepared,
+            Err(SystemError::ESTALE)
+                if to_mount_fs
+                    .shared_mount_superblock_state(mount_flags)
+                    .is_some_and(|state| state.shutdown_started()) =>
+            {
+                // The last unmount beat this construction reservation. No
+                // topology has been published. Re-enter the factory, which
+                // waits for final shutdown before recovering a new instance.
+                continue;
             }
-            Ok(prepared)
-        } else {
-            // A pathname usable as a mountpoint in this namespace resolves to
-            // a MountFSInode. A bare inode can be reached through an internal
-            // pseudo-filesystem magic link (for example /proc/self/fd/N), but
-            // it is not attached to the caller's mount namespace.
-            Err(SystemError::EINVAL)
+            Err(error) => return Err(error),
         };
-
-    let new_mount = new_mount_res?;
-    // Legacy non-MountFS targets cannot propagate before this point. Normal
-    // namespace mounts set the source on their detached MountFS above.
-    if new_mount.mount_source().is_none() {
-        new_mount.set_mount_source(Some(source));
+        prepared.set_mount_source(Some(source.clone().unwrap_or_else(|| String::from("none"))));
+        if let Err(error) = mnt_inode.publish_prepared_subtree(&prepared) {
+            MountFS::deactivate_disconnected_subtree(&prepared);
+            return Err(error);
+        }
+        return Ok(prepared);
     }
-
-    Ok(new_mount)
 }
 #[inline(never)]
 fn copy_mount_string(raw: Option<*const u8>) -> Result<Option<String>, SystemError> {

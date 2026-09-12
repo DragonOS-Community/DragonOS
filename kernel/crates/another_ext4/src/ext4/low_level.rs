@@ -233,6 +233,8 @@ impl core::fmt::Debug for DelallocAppendMapperAuthority {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DelallocAppendBlockSubmitOutcome {
     Completed,
+    /// Mapping is live and leases are consumed; completion awaits this batch.
+    Published(u64),
     RetryableNotPublished(ErrCode),
     Terminal(ErrCode),
 }
@@ -429,9 +431,9 @@ impl Ext4 {
         if target_lblock == eof_lblock {
             return Err(Ext4Error::new(ErrCode::EINVAL));
         }
-        let mut block = self.read_block(pblock)?;
+        let mut block = self.block_device.read_block(pblock)?;
         block.data[tail_offset..].fill(0);
-        self.write_block(&block)?;
+        self.block_device.write_block(&block)?;
         Ok(true)
     }
 
@@ -732,12 +734,12 @@ impl Ext4 {
         failure.map_or(Ok(()), Err)
     }
 
-    fn finish_unpublished_delalloc_error(
+    fn finish_unpublished_delalloc_error<T>(
         &self,
         cleanup: Result<()>,
         lease: &mut DelallocLease,
         original: Ext4Error,
-    ) -> Result<()> {
+    ) -> Result<T> {
         if cleanup.is_ok() {
             return Err(original);
         }
@@ -824,7 +826,7 @@ impl Ext4 {
         pool: Option<&mut DelallocExtentNodePool>,
         strict_aligned: bool,
         journal_credits_bound: Option<usize>,
-    ) -> Result<()> {
+    ) -> Result<Option<u64>> {
         let mut pool = pool;
         self.ensure_mutable()?;
         if !self.uses_journal()
@@ -908,7 +910,7 @@ impl Ext4 {
         let credits =
             validate_delalloc_journal_credit_bound(actual_credits, journal_credits_bound)?;
         let mut transaction = self.transaction_start(credits)?;
-        let (allocation, data_consumption) = match self.transaction_alloc_delalloc_range(
+        let (allocation, mut data_consumption) = match self.transaction_alloc_delalloc_range(
             &mut transaction,
             id,
             extent_plan.preferred_first,
@@ -999,9 +1001,13 @@ impl Ext4 {
         let mut initialized = [0u8; BLOCK_SIZE];
         initialized[..visible_len].copy_from_slice(request.payload);
         if !strict_aligned {
-            if let Err(error) =
+            let tail_result = if transaction.is_batch() {
+                self.write_delalloc_append_eof_tail(&inode, on_disk_eof, request.offset)
+                    .map(|_| ())
+            } else {
                 self.zero_delalloc_append_eof_tail(&inode, on_disk_eof, request.offset)
-            {
+            };
+            if let Err(error) = tail_result {
                 let cleanup = self.abort_delalloc_append_block_transaction_many(
                     transaction,
                     data_consumption,
@@ -1024,7 +1030,11 @@ impl Ext4 {
             );
             return self.finish_unpublished_delalloc_error(cleanup, lease, error);
         }
-        if let Err(error) = self.block_device.flush() {
+        if let Err(error) = if transaction.is_batch() {
+            Ok(())
+        } else {
+            self.block_device.flush()
+        } {
             let cleanup = self.abort_delalloc_append_block_transaction_many(
                 transaction,
                 data_consumption,
@@ -1064,6 +1074,47 @@ impl Ext4 {
             return self.finish_unpublished_delalloc_error(cleanup, lease, error);
         }
 
+        if transaction.is_batch() {
+            let result = (|| {
+                let mut leases = Vec::new();
+                let mut debits = Vec::new();
+                leases
+                    .try_reserve_exact(1 + metadata_pool_indices.len())
+                    .map_err(|_| Ext4Error::new(ErrCode::ENOMEM))?;
+                debits
+                    .try_reserve_exact(1 + metadata_consumptions.len())
+                    .map_err(|_| Ext4Error::new(ErrCode::ENOMEM))?;
+                leases.push(&mut *lease);
+                if let Some(pool) = pool.as_deref_mut() {
+                    for (index, lease) in pool.leases.iter_mut().enumerate() {
+                        if metadata_pool_indices.contains(&index) {
+                            leases.push(lease);
+                        }
+                    }
+                }
+                debits.push(&mut data_consumption);
+                debits.extend(metadata_consumptions.iter_mut());
+                self.publish_delalloc_operation(transaction, &mut leases, &mut debits)
+            })();
+            return match result {
+                Ok(sequence) => {
+                    if let Some(pool) = pool.as_deref_mut() {
+                        for index in metadata_pool_indices.into_iter().rev() {
+                            drop(pool.leases.swap_remove(index));
+                        }
+                    }
+                    Ok(Some(sequence))
+                }
+                Err(error) => {
+                    let cleanup = self.rollback_delalloc_consumptions_many(
+                        data_consumption,
+                        metadata_consumptions,
+                    );
+                    self.finish_unpublished_delalloc_error(cleanup, lease, error)
+                }
+            };
+        }
+
         match transaction.commit(self.block_device.as_ref(), self) {
             Ok(()) => {
                 let mut data_consumption = data_consumption;
@@ -1080,7 +1131,7 @@ impl Ext4 {
                     self.poison(ErrCode::EIO);
                     return Err(Ext4Error::new(ErrCode::EIO));
                 }
-                Ok(())
+                Ok(None)
             }
             Err(error) => {
                 if error.failure == super::journal_transaction::CommitFailure::BeforeCommit {
@@ -1218,7 +1269,7 @@ impl Ext4 {
         reservations: &mut [&mut DelallocAppendBlockReservation],
         publications: &[DelallocAppendBlockPublication<'_>],
         pool: &mut DelallocExtentNodePool,
-    ) -> Result<()> {
+    ) -> Result<Option<u64>> {
         self.ensure_mutable()?;
         if !self.uses_journal()
             || reservations.is_empty()
@@ -1403,7 +1454,9 @@ impl Ext4 {
                 )?;
                 run_start = run_end;
             }
-            self.block_device.flush()?;
+            if !transaction.is_batch() {
+                self.block_device.flush()?;
+            }
 
             let last_publication = publications
                 .last()
@@ -1430,6 +1483,56 @@ impl Ext4 {
                 return Err(Ext4Error::new(ErrCode::EIO));
             }
             return Err(error);
+        }
+
+        if transaction.is_batch() {
+            let result = (|| {
+                let mut leases = Vec::new();
+                let mut debits = Vec::new();
+                leases
+                    .try_reserve_exact(reservations.len() + metadata_pool_indices.len())
+                    .map_err(|_| Ext4Error::new(ErrCode::ENOMEM))?;
+                debits
+                    .try_reserve_exact(data_consumptions.len() + metadata_consumptions.len())
+                    .map_err(|_| Ext4Error::new(ErrCode::ENOMEM))?;
+                leases.extend(
+                    reservations
+                        .iter_mut()
+                        .map(|reservation| &mut reservation.lease),
+                );
+                for (index, lease) in pool.leases.iter_mut().enumerate() {
+                    if metadata_pool_indices.contains(&index) {
+                        leases.push(lease);
+                    }
+                }
+                debits.extend(data_consumptions.iter_mut());
+                debits.extend(metadata_consumptions.iter_mut());
+                self.publish_delalloc_operation(transaction, &mut leases, &mut debits)
+            })();
+            return match result {
+                Ok(sequence) => {
+                    for index in metadata_pool_indices.into_iter().rev() {
+                        drop(pool.leases.swap_remove(index));
+                    }
+                    Ok(Some(sequence))
+                }
+                Err(error) => {
+                    if self
+                        .rollback_delalloc_consumption_vectors(
+                            data_consumptions,
+                            metadata_consumptions,
+                        )
+                        .is_err()
+                    {
+                        self.poison(ErrCode::EIO);
+                        for reservation in reservations.iter_mut() {
+                            reservation.lease.deactivate();
+                        }
+                        return Err(Ext4Error::new(ErrCode::EIO));
+                    }
+                    Err(error)
+                }
+            };
         }
 
         match transaction.commit(self.block_device.as_ref(), self) {
@@ -1466,7 +1569,7 @@ impl Ext4 {
                     self.poison(ErrCode::EIO);
                     return Err(error);
                 }
-                Ok(())
+                Ok(None)
             }
             Err(error)
                 if !error.poisoned
@@ -1532,7 +1635,8 @@ impl Ext4 {
         }
         let outcome = self.submit_delalloc_append_batch_inner(reservations, publications, pool);
         let result = match outcome {
-            Ok(()) => DelallocAppendBlockSubmitOutcome::Completed,
+            Ok(None) => DelallocAppendBlockSubmitOutcome::Completed,
+            Ok(Some(sequence)) => DelallocAppendBlockSubmitOutcome::Published(sequence),
             Err(error)
                 if reservations
                     .iter()
@@ -1616,6 +1720,12 @@ impl Ext4 {
         publication: DelallocAppendBlockPublication<'_>,
         pool: Option<&mut DelallocExtentNodePool>,
     ) -> DelallocAppendBlockSubmitOutcome {
+        // Accepted publication consumed this capability even if its later
+        // disk commit failed. Authority rejection must not relabel that
+        // terminal ownership as a retryable, unpublished operation.
+        if !reservation.lease.active {
+            return DelallocAppendBlockSubmitOutcome::Terminal(ErrCode::EINVAL);
+        }
         if let Err(error) = self.validate_delalloc_append_mapper_authority(authority) {
             // A capability issued by this exact mount must not remain live
             // when validation fails only because another writer has already
@@ -1893,7 +2003,8 @@ impl Ext4 {
             strict_aligned,
             journal_credits_bound,
         ) {
-            Ok(()) => DelallocAppendBlockSubmitOutcome::Completed,
+            Ok(None) => DelallocAppendBlockSubmitOutcome::Completed,
+            Ok(Some(sequence)) => DelallocAppendBlockSubmitOutcome::Published(sequence),
             // The mapper can terminalise a lease itself after a commit
             // failure. Re-check after the call as well as before it so that
             // path never falls through to the pre-existing-fail-stop
@@ -1978,8 +2089,16 @@ impl Ext4 {
         request: DelallocAppendBlockWriteback<'_>,
         lease: &mut DelallocLease,
     ) -> Result<()> {
+        if self.batch_progress().is_some() {
+            // This legacy host-only Result API cannot convey accepted but
+            // incomplete ownership. Batched tests use the typed outcome API.
+            return Err(Ext4Error::new(ErrCode::ENOTSUP));
+        }
         match self.submit_delalloc_append_block(id, request, lease) {
             DelallocAppendBlockSubmitOutcome::Completed => Ok(()),
+            DelallocAppendBlockSubmitOutcome::Published(_) => {
+                unreachable!("synchronous host facade")
+            }
             DelallocAppendBlockSubmitOutcome::RetryableNotPublished(error)
             | DelallocAppendBlockSubmitOutcome::Terminal(error) => Err(Ext4Error::new(error)),
         }
@@ -2608,7 +2727,7 @@ impl Ext4 {
         }
         self.prepare_stats.record_inode_io();
         let commit_result = if journaled {
-            transaction.commit(self.block_device.as_ref(), self)
+            self.commit_metadata_operation(transaction).map(|_| ())
         } else {
             transaction.commit_direct_range(
                 self.block_device.as_ref(),
@@ -2635,36 +2754,6 @@ impl Ext4 {
         Ok(TransactionalRangePrepare::Handled)
     }
 
-    fn xattr_checksum_seed(&self) -> Result<Option<MetadataChecksumSeed>> {
-        let sb = self.read_super_block_cached();
-        if !sb.has_read_only_compatible_feature(SuperBlock::FEATURE_RO_COMPAT_METADATA_CSUM) {
-            return Ok(None);
-        }
-        Ok(Some(sb.metadata_checksum_seed()))
-    }
-
-    fn verify_xattr_block_checksum(&self, block_id: PBlockId, block: &XattrBlock) -> Result<()> {
-        if let Some(seed) = self.xattr_checksum_seed()? {
-            if !block.verify_checksum(seed, block_id) {
-                return Err(Ext4Error::new(ErrCode::EIO));
-            }
-        }
-        Ok(())
-    }
-
-    fn update_xattr_block_checksum(
-        &self,
-        block_id: PBlockId,
-        block: &mut XattrBlock,
-    ) -> Result<()> {
-        if let Some(seed) = self.xattr_checksum_seed()? {
-            if !block.update_checksum(seed, block_id) {
-                return Err(Ext4Error::new(ErrCode::EIO));
-            }
-        }
-        Ok(())
-    }
-
     fn read_extent_or_hole(
         &self,
         file: &InodeRef,
@@ -2674,7 +2763,7 @@ impl Ext4 {
     ) -> Result<()> {
         match self.extent_query(file, iblock) {
             Ok(fblock) => {
-                let block = self.read_block(fblock)?;
+                let block = self.block_device.read_block(fblock)?;
                 buf.copy_from_slice(block.read_offset(block_offset, buf.len()));
             }
             Err(err) if err.code() == ErrCode::ENOENT => {
@@ -2699,6 +2788,7 @@ impl Ext4 {
     ///
     /// `EINVAL` if the inode-table entry is physically free.
     pub fn getattr(&self, id: InodeId) -> Result<FileAttr> {
+        let _view = self.lock_metadata_read_view()?;
         let inode = self.read_inode(id)?;
         if inode.inode.mode().bits() == 0 {
             return_error!(ErrCode::EINVAL, "Invalid inode {}", id);
@@ -2744,7 +2834,7 @@ impl Ext4 {
     /// `EINVAL` if the inode is invalid (mode == 0).
     pub fn setattr(&self, id: InodeId, attr: SetAttr) -> Result<()> {
         self.ensure_mutable()?;
-        let _metadata_guard = self.lock_direct_metadata_mutation()?;
+        let _metadata_guard = self.lock_transactional_metadata_mutation()?;
         let _mutation_guard = self.inode_mutation_locks[self.inode_mutation_lock_index(id)].lock();
         let mut inode = self.read_inode(id)?;
         if inode.inode.mode().bits() == 0 {
@@ -2777,17 +2867,22 @@ impl Ext4 {
         if let Some(crtime) = attr.crtime {
             inode.inode.set_crtime(crtime);
         }
-        self.write_inode_with_csum(&mut inode)?;
+        let mut transaction = self.transaction_start(1)?;
+        self.transaction_stage_inode_with_csum(&mut transaction, &mut inode)?;
+        self.commit_metadata_operation(transaction)
+            .map(|_| ())
+            .map_err(|error| error.error)?;
         Ok(())
     }
 
     fn recompute_inode_block_count(&self, inode: &mut InodeRef) -> Result<()> {
         let data_blocks = self.extent_all_data_blocks(inode)?.len() as u64;
         let tree_blocks = self.extent_all_tree_blocks(inode)?.len() as u64;
+        let xattr_blocks = u64::from(inode.inode.xattr_block() != 0);
         let sectors_per_block = (BLOCK_SIZE / INODE_BLOCK_SIZE) as u64;
         inode
             .inode
-            .set_block_count((data_blocks + tree_blocks) * sectors_per_block);
+            .set_block_count((data_blocks + tree_blocks + xattr_blocks) * sectors_per_block);
         Ok(())
     }
 
@@ -2824,7 +2919,24 @@ impl Ext4 {
                     }
                     Err(err) if err.code() == ErrCode::ENOENT => {
                         self.prepare_stats.record_missing();
-                        self.extent_query_or_create(inode, iblock, 1)?;
+                        if self.uses_journal() {
+                            // One missing mapping is a restartable allocation
+                            // boundary; do not accumulate an unbounded range
+                            // under one finite journal reservation.
+                            let credits =
+                                5 * usize::from(inode.inode.extent_root().header().depth()) + 16;
+                            let mut transaction = self.transaction_start(credits)?;
+                            self.transaction_extent_query_or_create(
+                                &mut transaction,
+                                inode,
+                                iblock,
+                            )?;
+                            self.commit_metadata_operation(transaction)
+                                .map(|_| ())
+                                .map_err(|error| error.error)?;
+                        } else {
+                            self.extent_query_or_create(inode, iblock, 1)?;
+                        }
                         self.extent_query(inode, iblock).map_err(|err| {
                             format_error!(
                                 ErrCode::EIO,
@@ -2839,7 +2951,7 @@ impl Ext4 {
                     Err(err) => return Err(err),
                 }
             }
-            if changed {
+            if changed && !self.uses_journal() {
                 self.recompute_inode_block_count(inode)?;
                 self.write_inode_with_csum(inode)?;
             }
@@ -2859,7 +2971,7 @@ impl Ext4 {
         len: usize,
     ) -> Result<()> {
         self.ensure_mutable()?;
-        let _metadata_guard = self.lock_direct_metadata_mutation()?;
+        let _metadata_guard = self.lock_transactional_metadata_mutation()?;
         let _mutation_guard = self.inode_mutation_locks[self.inode_mutation_lock_index(id)].lock();
         let mut inode = self.read_inode(id)?;
         if inode.inode.mode().bits() == 0 {
@@ -2883,7 +2995,24 @@ impl Ext4 {
         _mtime: Option<u32>,
     ) -> Result<()> {
         self.ensure_mutable()?;
-        if self.uses_journal() || self.supports_direct_range_stage() {
+        if self.uses_journal() {
+            let _metadata_guard = self.lock_transactional_metadata_mutation()?;
+            let _mutation_guard =
+                self.inode_mutation_locks[self.inode_mutation_lock_index(id)].lock();
+            let mut inode = self.read_inode(id)?;
+            if inode.inode.mode().bits() == 0 {
+                return Err(Ext4Error::new(ErrCode::EINVAL));
+            }
+            self.reject_external_linked_tail_mutation(&inode)?;
+            if matches!(
+                self.try_prepare_transactional_range(&mut inode, offset, len)?,
+                TransactionalRangePrepare::Handled
+            ) {
+                return Ok(());
+            }
+            return self.ensure_blocks_for_write_range_locked(&mut inode, offset, len);
+        }
+        if self.supports_direct_range_stage() {
             // Classify the request under a compatible direct guard first.
             // Unsupported small, overwrite, sparse, and oversized writes can
             // continue through the legacy allocator without ever contending
@@ -2944,7 +3073,7 @@ impl Ext4 {
         ctime: Option<u32>,
     ) -> Result<()> {
         self.ensure_mutable()?;
-        let _metadata_guard = self.lock_direct_metadata_mutation()?;
+        let _metadata_guard = self.lock_transactional_metadata_mutation()?;
         let _mutation_guard = self.inode_mutation_locks[self.inode_mutation_lock_index(id)].lock();
         let mut inode = self.read_inode(id)?;
         if inode.inode.mode().bits() == 0 {
@@ -2967,7 +3096,11 @@ impl Ext4 {
         if let Some(ctime) = ctime {
             inode.inode.set_ctime(ctime);
         }
-        self.write_inode_with_csum(&mut inode)?;
+        let mut transaction = self.transaction_start(1)?;
+        self.transaction_stage_inode_with_csum(&mut transaction, &mut inode)?;
+        self.commit_metadata_operation(transaction)
+            .map(|_| ())
+            .map_err(|error| error.error)?;
         Ok(())
     }
 
@@ -2977,38 +3110,6 @@ impl Ext4 {
     /// Call this after successful page-cache write to finalise the new file size.
     pub fn commit_inode_size(&self, id: InodeId, size: u64, mtime: Option<u32>) -> Result<()> {
         self.commit_inode_metadata(id, Some(size), None, mtime, None)
-    }
-
-    /// Link a newly created inode into `parent`.
-    ///
-    /// If linking fails, this function frees the newly allocated inode to avoid leaks.
-    fn link_new_inode_or_free(
-        &self,
-        parent: &mut InodeRef,
-        child: &mut InodeRef,
-        name: &str,
-    ) -> Result<()> {
-        match self.link_inode_classified(parent, child, name, false) {
-            Ok(()) => Ok(()),
-            Err(super::link::LinkFailure::Indeterminate(link_err)) => {
-                self.poison(ErrCode::EIO);
-                Err(link_err)
-            }
-            Err(super::link::LinkFailure::Unmodified(link_err)) => {
-                if let Err(cleanup_err) = self.free_inode(child) {
-                    trace!(
-                        "link failed for new inode {} (name {}), cleanup failed: {:?}; original link error: {:?}",
-                        child.id,
-                        name,
-                        cleanup_err,
-                        link_err
-                    );
-                    self.poison(ErrCode::EIO);
-                    return Err(cleanup_err);
-                }
-                Err(link_err)
-            }
-        }
     }
 
     /// Create a file. This function will not check the existence of
@@ -3055,7 +3156,7 @@ impl Ext4 {
         owner: InodeOwner,
     ) -> Result<FileAttr> {
         self.ensure_mutable()?;
-        let _metadata_guard = self.lock_direct_metadata_mutation()?;
+        let _metadata_guard = self.lock_transactional_metadata_mutation()?;
         let _namespace_guard = self.namespace_lock.lock();
         let _mutation_guards = self.lock_inode_mutations(&[parent]);
         let mut parent = self.read_inode(parent)?;
@@ -3064,8 +3165,19 @@ impl Ext4 {
             return_error!(ErrCode::ENOTDIR, "Inode {} is not a directory", parent.id);
         }
         // Create child inode and link it to parent directory
-        let mut child = self.create_inode_with_owner(mode, owner.uid, owner.gid)?;
-        self.link_new_inode_or_free(&mut parent, &mut child, name)?;
+        let credits = self.namespace_transaction_credits(
+            &[&parent],
+            if mode.file_type() == FileType::Directory {
+                20
+            } else {
+                4
+            },
+        )?;
+        let mut transaction = self.transaction_start(credits)?;
+        let mut child =
+            self.transaction_create_inode_with_owner(&mut transaction, mode, owner.uid, owner.gid)?;
+        self.transaction_link_inode(&mut transaction, &mut parent, &mut child, name, false)?;
+        self.commit_namespace_transaction(transaction)?;
         Ok(Self::file_attr(&child))
     }
 
@@ -3086,7 +3198,7 @@ impl Ext4 {
             return_error!(ErrCode::ENAMETOOLONG, "Symbolic link target is too long");
         }
 
-        let _metadata_guard = self.lock_direct_metadata_mutation()?;
+        let _metadata_guard = self.lock_transactional_metadata_mutation()?;
         let _namespace_guard = self.namespace_lock.lock();
         let _mutation_guards = self.lock_inode_mutations(&[parent]);
         let mut parent = self.read_inode(parent)?;
@@ -3095,31 +3207,29 @@ impl Ext4 {
         }
 
         let mode = InodeMode::SOFTLINK | InodeMode::ALL_RWX;
-        let mut child = self.create_inode_with_owner(mode, owner.uid, owner.gid)?;
-        let initialized = if target.len() < child.inode.inline_block().len() {
-            child
-                .inode
-                .set_fast_symlink(target.as_bytes())
-                .and_then(|_| self.write_inode_with_csum(&mut child))
+        // Four allocation/initialization homes plus a one-block long target
+        // allocation (bitmap, GDT, SB). The new inode has an inline extent root.
+        let credits = self.namespace_transaction_credits(&[&parent], 7)?;
+        let mut transaction = self.transaction_start(credits)?;
+        let mut child =
+            self.transaction_create_inode_with_owner(&mut transaction, mode, owner.uid, owner.gid)?;
+        if target.len() < child.inode.inline_block().len() {
+            child.inode.set_fast_symlink(target.as_bytes())?;
         } else {
             let mut image = Box::new([0; BLOCK_SIZE]);
             image[..target.len()].copy_from_slice(target.as_bytes());
-            self.extent_query_or_create_initialized(&mut child, 0, 1, Some(image))
-                .and_then(|_| self.recompute_inode_block_count(&mut child))
-                .and_then(|_| {
-                    child.inode.set_size(target.len() as u64);
-                    self.write_inode_with_csum(&mut child)
-                })
-        };
-        if let Err(init_error) = initialized {
-            if let Err(cleanup_error) = self.free_inode(&mut child) {
-                self.poison(ErrCode::EIO);
-                return Err(cleanup_error);
-            }
-            return Err(init_error);
+            let allocation =
+                self.transaction_alloc_metadata_block(&mut transaction, child.id, None)?;
+            // Payload bypasses metadata staging. It is initialized before any
+            // reader can reach it; journal's first flush orders it on this device.
+            self.block_device
+                .write_block(&Block::new(allocation, image))?;
+            self.stage_direct_append_extent(&mut child, 0, allocation, 1)?;
+            child.inode.set_size(target.len() as u64);
         }
-
-        self.link_new_inode_or_free(&mut parent, &mut child, name)?;
+        self.transaction_stage_inode_with_csum(&mut transaction, &mut child)?;
+        self.transaction_link_inode(&mut transaction, &mut parent, &mut child, name, false)?;
+        self.commit_namespace_transaction(transaction)?;
         Ok(Self::file_attr(&child))
     }
 
@@ -3189,7 +3299,7 @@ impl Ext4 {
         owner: InodeOwner,
     ) -> Result<FileAttr> {
         self.ensure_mutable()?;
-        let _metadata_guard = self.lock_direct_metadata_mutation()?;
+        let _metadata_guard = self.lock_transactional_metadata_mutation()?;
         let _namespace_guard = self.namespace_lock.lock();
         let _mutation_guards = self.lock_inode_mutations(&[parent]);
         let mut parent_ref = self.read_inode(parent)?;
@@ -3204,10 +3314,18 @@ impl Ext4 {
         }
 
         // Create device inode (uses create_device_inode which sets device number)
-        let mut child = self.create_device_inode(mode, major, minor, owner.uid, owner.gid)?;
-
-        // Link to parent directory
-        self.link_new_inode_or_free(&mut parent_ref, &mut child, name)?;
+        let credits = self.namespace_transaction_credits(&[&parent_ref], 4)?;
+        let mut transaction = self.transaction_start(credits)?;
+        let mut child = self.transaction_create_device_inode(
+            &mut transaction,
+            mode,
+            major,
+            minor,
+            owner.uid,
+            owner.gid,
+        )?;
+        self.transaction_link_inode(&mut transaction, &mut parent_ref, &mut child, name, false)?;
+        self.commit_namespace_transaction(transaction)?;
 
         trace!("mknod {} ({}:{}) -> inode {}", name, major, minor, child.id);
         Ok(Self::file_attr(&child))
@@ -3230,6 +3348,7 @@ impl Ext4 {
     ///
     /// * `EISDIR` - `file` is not a regular file
     pub fn read(&self, file: InodeId, offset: usize, buf: &mut [u8]) -> Result<usize> {
+        let _view = self.lock_metadata_read_view()?;
         // Get the inode of the file
         let file = self.read_inode(file)?;
         if !file.inode.is_file() {
@@ -3282,6 +3401,7 @@ impl Ext4 {
     /// - For fast symlink (length <= 60), content is stored in inode.i_block (here inode.block[60])
     /// - For non-fast symlink, content is stored in data blocks, reusing extent read path
     pub fn readlink(&self, inode_id: InodeId, offset: usize, buf: &mut [u8]) -> Result<usize> {
+        let _view = self.lock_metadata_read_view()?;
         let inode_ref = self.read_inode(inode_id)?;
         if !inode_ref.inode.is_softlink() {
             return_error!(ErrCode::EINVAL, "Inode {} is not a symlink", inode_id);
@@ -3349,7 +3469,7 @@ impl Ext4 {
     /// * `ENOSPC` - no space left on device
     pub fn write(&self, file: InodeId, offset: usize, data: &[u8]) -> Result<usize> {
         self.ensure_mutable()?;
-        let _metadata_guard = self.lock_direct_metadata_mutation()?;
+        let _metadata_guard = self.lock_transactional_metadata_mutation()?;
         let write_size = data.len();
         if write_size == 0 {
             return Ok(0);
@@ -3372,9 +3492,9 @@ impl Ext4 {
             let block_offset = (offset + cursor) % BLOCK_SIZE;
             let write_len = min(BLOCK_SIZE - block_offset, write_size - cursor);
             let fblock = self.extent_query(&file, iblock)?;
-            let mut block = self.read_block(fblock)?;
+            let mut block = self.block_device.read_block(fblock)?;
             block.write_offset(block_offset, &data[cursor..cursor + write_len]);
-            self.write_block(&block)?;
+            self.block_device.write_block(&block)?;
             cursor += write_len;
             iblock += 1;
         }
@@ -3387,7 +3507,15 @@ impl Ext4 {
         if new_end > file.inode.size() as usize {
             file.inode.set_size(new_end as u64);
         }
-        self.write_inode_with_csum(&mut file)?;
+        if self.uses_journal() {
+            let mut transaction = self.transaction_start(1)?;
+            self.transaction_stage_inode_with_csum(&mut transaction, &mut file)?;
+            self.commit_metadata_operation(transaction)
+                .map(|_| ())
+                .map_err(|error| error.error)?;
+        } else {
+            self.write_inode_with_csum(&mut file)?;
+        }
 
         Ok(cursor)
     }
@@ -3450,9 +3578,9 @@ impl Ext4 {
                 self.block_device
                     .write_blocks(fblock, &data[cursor..cursor + write_len])?;
             } else {
-                let mut block = self.read_block(fblock)?;
+                let mut block = self.block_device.read_block(fblock)?;
                 block.write_offset(block_offset, &data[cursor..cursor + write_len]);
-                self.write_block(&block)?;
+                self.block_device.write_block(&block)?;
             }
         }
 
@@ -3542,7 +3670,10 @@ impl Ext4 {
         if child.inode.is_dir() {
             return_error!(ErrCode::EISDIR, "Cannot link a directory");
         }
-        self.link_inode(&mut parent, &mut child, name, true)?;
+        let credits = self.namespace_transaction_credits(&[&parent], 3)?;
+        let mut transaction = self.transaction_start(credits)?;
+        self.transaction_link_inode(&mut transaction, &mut parent, &mut child, name, true)?;
+        self.commit_namespace_transaction(transaction)?;
         Ok(())
     }
 
@@ -3695,7 +3826,11 @@ impl Ext4 {
 
         // 4. 检查目标是否存在
         let target_dir_ref = new_parent_ref.as_ref().unwrap_or(&parent_ref);
-        let existing = self.dir_find_entry(target_dir_ref, new_name).ok();
+        let existing = match self.dir_find_entry(target_dir_ref, new_name) {
+            Ok(inode) => Some(inode),
+            Err(error) if error.code() == ErrCode::ENOENT => None,
+            Err(error) => return Err(error),
+        };
         let mut mutation_ids = vec![parent, new_parent, child_id];
         if let Some(existing_id) = existing {
             mutation_ids.push(existing_id);
@@ -3860,13 +3995,7 @@ impl Ext4 {
                     self.transaction_stage_inode_with_csum(&mut transaction, &mut existing_inode)?;
                 }
 
-                if let Err(error) = transaction.commit(self.block_device.as_ref(), self) {
-                    // Once commit processing starts, failures can leave an
-                    // uncertain committed/checkpointed state.  Fail-stop every
-                    // subsequent metadata writer on this mount.
-                    self.poison(ErrCode::EIO);
-                    return Err(error.error);
-                }
+                self.commit_namespace_transaction(transaction)?;
                 if final_target {
                     reclaim = Some(InodeReclaimHandle::new(
                         existing_inode.id,
@@ -3876,51 +4005,43 @@ impl Ext4 {
                 // 文件的 link count 不变（只是换了名字/位置）
             }
             None => {
-                // 情况 C：目标不存在 → 简单重命名
-                // Without a journal, any failure after the first namespace
-                // write fail-stops this mount so a partial rename cannot be
-                // followed by further allocation or metadata mutation.
-
-                // C-1. 在目标父目录添加新条目（先 add）
+                // Publish destination insertion, source removal and parent
+                // changes as one operation, including destination growth.
+                let target_dir = new_parent_ref.as_ref().unwrap_or(&parent_ref);
+                let credits = self.namespace_transaction_credits(&[target_dir], 4)?;
+                let mut transaction = self.transaction_start(credits)?;
                 let target_dir = new_parent_ref.as_mut().unwrap_or(&mut parent_ref);
-                match self.dir_add_entry_classified(target_dir, &child, new_name) {
-                    Ok(()) => {}
-                    Err(super::dir::DirAddFailure::Unmodified(error)) => return Err(error),
-                    Err(super::dir::DirAddFailure::Indeterminate(error)) => {
-                        self.poison(ErrCode::EIO);
-                        return Err(error);
-                    }
-                }
-
-                // C-2. 从源父目录删除旧条目（后 delete）
-                self.poison_on_error(self.dir_remove_entry(&parent_ref, name))?;
-
-                // C-3. 目录跨目录移动时，原子更新 ".." 并调整 link count
+                self.transaction_dir_add(&mut transaction, target_dir, &child, new_name)?;
+                self.transaction_dir_remove_entry(&mut transaction, &parent_ref, name)?;
                 if child_is_dir && parent != new_parent {
-                    // ".." 原地替换：旧父 → 新父，单次 I/O，无中间态
-                    self.poison_on_error(self.dir_replace_entry(
+                    self.transaction_dir_replace_entry(
+                        &mut transaction,
                         &child,
                         "..",
                         new_parent,
                         FileType::Directory,
-                    ))?;
-
-                    // 源父目录失去 ".." 引用
-                    parent_ref
-                        .inode
-                        .set_link_count(parent_ref.inode.link_count() - 1);
-                    self.poison_on_error(self.write_inode_with_csum(&mut parent_ref))?;
-
-                    // 目标父目录获得 ".." 引用
-                    let new_parent_dir = new_parent_ref.as_mut().ok_or(format_error!(
-                        ErrCode::EINVAL,
-                        "rename: missing new parent reference for directory move"
-                    ))?;
-                    new_parent_dir
-                        .inode
-                        .set_link_count(new_parent_dir.inode.link_count() + 1);
-                    self.poison_on_error(self.write_inode_with_csum(new_parent_dir))?;
+                    )?;
+                    parent_ref.inode.set_link_count(
+                        parent_ref
+                            .inode
+                            .link_count()
+                            .checked_sub(1)
+                            .ok_or_else(|| Ext4Error::new(ErrCode::EIO))?,
+                    );
+                    self.transaction_stage_inode_with_csum(&mut transaction, &mut parent_ref)?;
+                    let new_parent_dir = new_parent_ref
+                        .as_mut()
+                        .ok_or_else(|| Ext4Error::new(ErrCode::EIO))?;
+                    new_parent_dir.inode.set_link_count(
+                        new_parent_dir
+                            .inode
+                            .link_count()
+                            .checked_add(1)
+                            .ok_or_else(|| Ext4Error::new(ErrCode::EMLINK))?,
+                    );
+                    self.transaction_stage_inode_with_csum(&mut transaction, new_parent_dir)?;
                 }
+                self.commit_namespace_transaction(transaction)?;
                 // 文件：无 ".."，nlink 不变（只换了名字/位置）
                 // 目录同目录：".." 已指向正确的父，link count 不变
             }
@@ -3954,7 +4075,7 @@ impl Ext4 {
         new_name: &str,
     ) -> Result<()> {
         self.ensure_mutable()?;
-        let _metadata_guard = self.lock_direct_metadata_mutation()?;
+        let _metadata_guard = self.lock_transactional_metadata_mutation()?;
         let _namespace_guard = self.namespace_lock.lock();
         // 1. 验证父目录
         let (mut parent_ref, mut new_parent_ref) = self.read_rename_dirs(parent, new_parent)?;
@@ -3992,64 +4113,95 @@ impl Ext4 {
             }
         }
 
+        // Two dirents, two possible ".." blocks and two parent inode homes.
+        let mut transaction = self.transaction_start(6)?;
         // 5. 原子交换：原地替换目录项的 inode 引用
         if parent == new_parent {
-            self.poison_on_error(self.dir_replace_entry(&parent_ref, name, new_id, new_type))?;
-            self.poison_on_error(self.dir_replace_entry(&parent_ref, new_name, old_id, old_type))?;
+            self.transaction_dir_replace_entry(
+                &mut transaction,
+                &parent_ref,
+                name,
+                new_id,
+                new_type,
+            )?;
+            self.transaction_dir_replace_entry(
+                &mut transaction,
+                &parent_ref,
+                new_name,
+                old_id,
+                old_type,
+            )?;
         } else {
-            self.poison_on_error(self.dir_replace_entry(&parent_ref, name, new_id, new_type))?;
+            self.transaction_dir_replace_entry(
+                &mut transaction,
+                &parent_ref,
+                name,
+                new_id,
+                new_type,
+            )?;
             let new_parent_dir = new_parent_ref.as_ref().ok_or(format_error!(
                 ErrCode::EINVAL,
                 "rename_exchange: missing new parent reference for cross-dir exchange"
             ))?;
-            self.poison_on_error(self.dir_replace_entry(
+            self.transaction_dir_replace_entry(
+                &mut transaction,
                 new_parent_dir,
                 new_name,
                 old_id,
                 old_type,
-            ))?;
+            )?;
         }
 
-        // 6. 跨目录时更新目录的 ".." 指向和父目录 link_count
+        // Update each moved directory's parent. Equal-type exchange has no
+        // net nlink change, so do not transiently overflow either parent.
         if parent != new_parent {
             if old_is_dir {
-                self.poison_on_error(self.dir_replace_entry(
+                self.transaction_dir_replace_entry(
+                    &mut transaction,
                     &old_inode,
                     "..",
                     new_parent,
                     FileType::Directory,
-                ))?;
-                parent_ref
-                    .inode
-                    .set_link_count(parent_ref.inode.link_count() - 1);
-                self.poison_on_error(self.write_inode_with_csum(&mut parent_ref))?;
-                let np = new_parent_ref.as_mut().ok_or(format_error!(
-                    ErrCode::EINVAL,
-                    "rename_exchange: missing new parent reference for old_dir update"
-                ))?;
-                np.inode.set_link_count(np.inode.link_count() + 1);
-                self.poison_on_error(self.write_inode_with_csum(np))?;
+                )?;
             }
             if new_is_dir {
-                self.poison_on_error(self.dir_replace_entry(
+                self.transaction_dir_replace_entry(
+                    &mut transaction,
                     &new_inode,
                     "..",
                     parent,
                     FileType::Directory,
-                ))?;
-                let np = new_parent_ref.as_mut().ok_or(format_error!(
-                    ErrCode::EINVAL,
-                    "rename_exchange: missing new parent reference for new_dir update"
-                ))?;
-                np.inode.set_link_count(np.inode.link_count() - 1);
-                self.poison_on_error(self.write_inode_with_csum(np))?;
-                parent_ref
-                    .inode
-                    .set_link_count(parent_ref.inode.link_count() + 1);
-                self.poison_on_error(self.write_inode_with_csum(&mut parent_ref))?;
+                )?;
+            }
+            if old_is_dir != new_is_dir {
+                let np = new_parent_ref
+                    .as_mut()
+                    .ok_or_else(|| Ext4Error::new(ErrCode::EIO))?;
+                let (losing, gaining) = if old_is_dir {
+                    (&mut parent_ref, np)
+                } else {
+                    (np, &mut parent_ref)
+                };
+                losing.inode.set_link_count(
+                    losing
+                        .inode
+                        .link_count()
+                        .checked_sub(1)
+                        .ok_or_else(|| Ext4Error::new(ErrCode::EIO))?,
+                );
+                gaining.inode.set_link_count(
+                    gaining
+                        .inode
+                        .link_count()
+                        .checked_add(1)
+                        .ok_or_else(|| Ext4Error::new(ErrCode::EMLINK))?,
+                );
+                self.transaction_stage_inode_with_csum(&mut transaction, losing)?;
+                self.transaction_stage_inode_with_csum(&mut transaction, gaining)?;
             }
         }
 
+        self.commit_namespace_transaction(transaction)?;
         Ok(())
     }
 
@@ -4096,7 +4248,7 @@ impl Ext4 {
         owner: InodeOwner,
     ) -> Result<FileAttr> {
         self.ensure_mutable()?;
-        let _metadata_guard = self.lock_direct_metadata_mutation()?;
+        let _metadata_guard = self.lock_transactional_metadata_mutation()?;
         let _namespace_guard = self.namespace_lock.lock();
         let _mutation_guards = self.lock_inode_mutations(&[parent]);
         let mut parent = self.read_inode(parent)?;
@@ -4106,18 +4258,15 @@ impl Ext4 {
         }
         // Create file/directory
         let mode = mode & InodeMode::PERM_MASK | InodeMode::DIRECTORY;
-        let mut child = self.create_inode_with_owner(mode, owner.uid, owner.gid)?;
-        // Add "." entry
+        let credits = self.namespace_transaction_credits(&[&parent], 20)?;
+        let mut transaction = self.transaction_start(credits)?;
+        let mut child =
+            self.transaction_create_inode_with_owner(&mut transaction, mode, owner.uid, owner.gid)?;
         let child_self = child.clone();
-        if let Err(error) = self.dir_add_entry(&mut child, &child_self, ".") {
-            if self.free_inode(&mut child).is_err() {
-                self.poison(ErrCode::EIO);
-            }
-            return Err(error);
-        }
+        self.transaction_dir_add(&mut transaction, &mut child, &child_self, ".")?;
         child.inode.set_link_count(1);
-        // Link the new inode
-        self.link_new_inode_or_free(&mut parent, &mut child, name)?;
+        self.transaction_link_inode(&mut transaction, &mut parent, &mut child, name, false)?;
+        self.commit_namespace_transaction(transaction)?;
         Ok(Self::file_attr(&child))
     }
 
@@ -4137,6 +4286,7 @@ impl Ext4 {
     /// * `ENOTDIR` - `parent` is not a directory
     /// * `ENOENT` - `name` does not exist in `parent`
     pub fn lookup(&self, parent: InodeId, name: &str) -> Result<InodeId> {
+        let _view = self.lock_metadata_read_view()?;
         let parent = self.read_inode(parent)?;
         // Can only lookup in a directory
         if !parent.inode.is_dir() {
@@ -4159,6 +4309,7 @@ impl Ext4 {
     ///
     /// `ENOTDIR` - `inode` is not a directory
     pub fn listdir(&self, inode: InodeId) -> Result<Vec<DirEntry>> {
+        let _view = self.lock_metadata_read_view()?;
         let inode_ref = self.read_inode(inode)?;
         // Can only list a directory
         if inode_ref.inode.file_type() != FileType::Directory {
@@ -4209,184 +4360,6 @@ impl Ext4 {
         }
         // Remove directory entry
         self.unlink_inode(&mut parent_ref, &mut child, name)
-    }
-
-    /// Get extended attribute of a file.
-    ///
-    /// # Params
-    ///
-    /// * `inode` - the inode of the file
-    /// * `name` - the name of the attribute
-    ///
-    /// # Return
-    ///
-    /// `Ok(value)` - the value of the attribute
-    ///
-    /// # Error
-    ///
-    /// `ENODATA` - the attribute does not exist
-    pub fn getxattr(&self, inode: InodeId, name: &str) -> Result<Vec<u8>> {
-        let inode_ref = self.read_inode(inode)?;
-        let xattr_block_id = inode_ref.inode.xattr_block();
-        if xattr_block_id == 0 {
-            return_error!(ErrCode::ENODATA, "Xattr {} does not exist", name);
-        }
-        let xattr_block = XattrBlock::new(self.read_block(xattr_block_id)?);
-        self.verify_xattr_block_checksum(xattr_block_id, &xattr_block)?;
-        match xattr_block.get(name) {
-            Some(value) => Ok(value.to_owned()),
-            None => Err(format_error!(
-                ErrCode::ENODATA,
-                "Xattr {} does not exist",
-                name
-            )),
-        }
-    }
-
-    /// Set extended attribute of a file.
-    ///
-    /// # Params
-    ///
-    /// * `inode` - the inode of the file
-    /// * `name` - the name of the attribute
-    /// * `value` - the value of the attribute
-    ///
-    /// # Error
-    ///
-    /// `ENOSPC` - xattr block does not have enough space
-    pub fn setxattr(&self, inode: InodeId, name: &str, value: &[u8]) -> Result<()> {
-        self.ensure_mutable()?;
-        self.setxattr_with_flags(inode, name, value, false, false)
-    }
-
-    /// Set extended attribute of a file with Linux create/replace semantics.
-    ///
-    /// Existing xattr blocks are modified on a cloned candidate block first and
-    /// written back only after the whole operation succeeds. This preserves the
-    /// old value when replacing with a value that does not fit.
-    pub fn setxattr_with_flags(
-        &self,
-        inode: InodeId,
-        name: &str,
-        value: &[u8],
-        create: bool,
-        replace: bool,
-    ) -> Result<()> {
-        self.ensure_mutable()?;
-        let _metadata_guard = self.lock_direct_metadata_mutation()?;
-        let _mutation_guard =
-            self.inode_mutation_locks[self.inode_mutation_lock_index(inode)].lock();
-        let mut inode_ref = self.read_inode(inode)?;
-        let xattr_block_id = inode_ref.inode.xattr_block();
-        if xattr_block_id == 0 {
-            if replace {
-                return_error!(ErrCode::ENODATA, "Xattr {} does not exist", name);
-            }
-            // lazy allocate xattr block
-            let pblock = self.alloc_block(&mut inode_ref)?;
-            let old_xattr_block = xattr_block_id;
-            let result = (|| {
-                let mut xattr_block = XattrBlock::new(self.read_block(pblock)?);
-                xattr_block.init();
-                if !xattr_block.insert(name, value) {
-                    return_error!(
-                        ErrCode::ENOSPC,
-                        "Xattr block of Inode {} does not have enough space",
-                        inode
-                    );
-                }
-                self.update_xattr_block_checksum(pblock, &mut xattr_block)?;
-                self.write_block(&xattr_block.block())?;
-                inode_ref.inode.set_xattr_block(pblock);
-                self.write_inode_with_csum(&mut inode_ref)?;
-                Ok(())
-            })();
-            if let Err(err) = result {
-                inode_ref.inode.set_xattr_block(old_xattr_block);
-                return match self.dealloc_block(&mut inode_ref, pblock) {
-                    Ok(()) => Err(err),
-                    Err(rollback_err) => Err(rollback_err),
-                };
-            }
-            return Ok(());
-        }
-
-        let xattr_block = XattrBlock::new(self.read_block(xattr_block_id)?);
-        self.verify_xattr_block_checksum(xattr_block_id, &xattr_block)?;
-        let exists = xattr_block.get(name).is_some();
-        if exists && create {
-            return_error!(ErrCode::EEXIST, "Xattr {} already exists", name);
-        }
-        if !exists && replace {
-            return_error!(ErrCode::ENODATA, "Xattr {} does not exist", name);
-        }
-
-        let mut new_xattr_block = xattr_block;
-        if exists {
-            let _ = new_xattr_block.remove(name);
-        }
-        if new_xattr_block.insert(name, value) {
-            self.update_xattr_block_checksum(xattr_block_id, &mut new_xattr_block)?;
-            self.write_block(&new_xattr_block.block())?;
-            Ok(())
-        } else {
-            return_error!(
-                ErrCode::ENOSPC,
-                "Xattr block of Inode {} does not have enough space",
-                inode
-            );
-        }
-    }
-
-    /// Remove extended attribute of a file.
-    ///
-    /// # Params
-    ///
-    /// * `inode` - the inode of the file
-    /// * `name` - the name of the attribute
-    ///
-    /// # Error
-    ///
-    /// `ENODATA` - the attribute does not exist
-    pub fn removexattr(&self, inode: InodeId, name: &str) -> Result<()> {
-        self.ensure_mutable()?;
-        let _metadata_guard = self.lock_direct_metadata_mutation()?;
-        let _mutation_guard =
-            self.inode_mutation_locks[self.inode_mutation_lock_index(inode)].lock();
-        let inode_ref = self.read_inode(inode)?;
-        let xattr_block_id = inode_ref.inode.xattr_block();
-        if xattr_block_id == 0 {
-            return_error!(ErrCode::ENODATA, "Xattr {} does not exist", name);
-        }
-        let mut xattr_block = XattrBlock::new(self.read_block(xattr_block_id)?);
-        self.verify_xattr_block_checksum(xattr_block_id, &xattr_block)?;
-        if xattr_block.remove(name) {
-            self.update_xattr_block_checksum(xattr_block_id, &mut xattr_block)?;
-            self.write_block(&xattr_block.block())?;
-            Ok(())
-        } else {
-            return_error!(ErrCode::ENODATA, "Xattr {} does not exist", name);
-        }
-    }
-
-    /// List extended attributes of a file.
-    ///
-    /// # Params
-    ///
-    /// * `inode` - the inode of the file
-    ///
-    /// # Returns
-    ///
-    /// A list of extended attributes of the file.
-    pub fn listxattr(&self, inode: InodeId) -> Result<Vec<String>> {
-        let inode_ref = self.read_inode(inode)?;
-        let xattr_block_id = inode_ref.inode.xattr_block();
-        if xattr_block_id == 0 {
-            return Ok(Vec::new());
-        }
-        let xattr_block = XattrBlock::new(self.read_block(xattr_block_id)?);
-        self.verify_xattr_block_checksum(xattr_block_id, &xattr_block)?;
-        Ok(xattr_block.list())
     }
 }
 

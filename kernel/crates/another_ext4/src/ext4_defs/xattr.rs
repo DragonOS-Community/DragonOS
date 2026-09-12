@@ -202,7 +202,7 @@ pub struct XattrEntry {
     value_inum: u32,
     /// Length of attribute value.
     value_size: u32,
-    /// Hash value of attribute name and attribute value (UNUSED by now)
+    /// Linux hash of the stored name suffix and padded inline value
     hash: u32,
     /// Attribute name, max 255 bytes.
     name: [u8; 255],
@@ -507,7 +507,37 @@ impl XattrBlock {
         // Insert value to `[ins_value_pos-ins_value_size, ins_value_pos)`
         self.0.write_offset(ins_value_pos - ins_value_size, value);
 
+        self.rehash();
         true
+    }
+
+    /// Linux ext4_xattr_hash_entry/ext4_xattr_rehash. The namespace prefix
+    /// is encoded separately and is not part of the entry hash. Inline values
+    /// are hashed as zero-padded little-endian words, including the final word.
+    fn rehash(&mut self) {
+        let mut offset = size_of::<XattrHeader>();
+        let mut block_hash = 0u32;
+        let mut shareable = true;
+        while self.0.data[offset] != 0 {
+            let mut entry: XattrEntry = self.0.read_offset_as(offset);
+            let mut hash = 0u32;
+            for byte in &entry.name[..entry.name_len as usize] {
+                hash = hash.rotate_left(5) ^ u32::from(*byte);
+            }
+            let start = entry.value_offset as usize;
+            let end = start + (entry.value_size as usize).div_ceil(4) * 4;
+            for word in self.0.data[start..end].chunks_exact(4) {
+                hash = hash.rotate_left(16) ^ u32::from_le_bytes(word.try_into().unwrap());
+            }
+            entry.hash = hash;
+            shareable &= hash != 0;
+            block_hash = block_hash.rotate_left(16) ^ hash;
+            self.0.write_offset_as(offset, &entry);
+            offset += entry.used_size();
+        }
+        let mut header: XattrHeader = self.0.read_offset_as(0);
+        header.hash = if shareable { block_hash } else { 0 };
+        self.0.write_offset_as(0, &header);
     }
 
     /// Remove a xattr entry from the block. Return true if success.
@@ -577,6 +607,7 @@ impl XattrBlock {
             p_entry2 += entry.used_size();
         }
 
+        self.rehash();
         true
     }
 }
@@ -584,6 +615,27 @@ impl XattrBlock {
 #[cfg(test)]
 mod release_tests {
     use super::*;
+
+    #[test]
+    fn mutation_hashes_name_suffix_and_padded_values_like_linux() {
+        let mut block = XattrBlock::new(Block::new(9, Box::new([0; BLOCK_SIZE])));
+        block.init();
+        assert!(block.insert("user.a", &[1, 2, 3]));
+        let first: XattrEntry = block.0.read_offset_as(size_of::<XattrHeader>());
+        assert_eq!(first.hash, 0x0062_0201);
+        let header: XattrHeader = block.0.read_offset_as(0);
+        assert_eq!(header.hash, first.hash);
+        assert!(block.remove("user.a"));
+        assert_eq!(block.0.read_offset_as::<XattrHeader>(0).hash, 0);
+        assert!(block.insert("user.a", &[]));
+        assert_eq!(
+            block
+                .0
+                .read_offset_as::<XattrEntry>(size_of::<XattrHeader>())
+                .hash,
+            97
+        );
+    }
 
     fn add_inline_entry(
         bytes: &mut [u8; BLOCK_SIZE],

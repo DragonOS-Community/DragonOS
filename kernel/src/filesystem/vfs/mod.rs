@@ -16,7 +16,7 @@ pub mod vcore;
 pub mod write_access;
 pub mod writeback;
 
-use alloc::{string::String, sync::Arc, vec::Vec};
+use alloc::{boxed::Box, string::String, sync::Arc, vec::Vec};
 use core::{
     any::Any,
     fmt::{Debug, Display, Write},
@@ -2303,8 +2303,19 @@ impl WritebackControl {
     }
 }
 
+/// Lifetime-only request that lets a filesystem promptly submit metadata
+/// required by a bounded data-writeback wait. Dropping it ends the request.
+pub trait FileSystemSyncGuard: Send {}
+
 /// @brief 所有文件系统都应该实现的trait
 pub trait FileSystem: Any + Sync + Send + Debug {
+    /// Called before a synchronous PageCache wait, not after it. Backends
+    /// with accepted asynchronous metadata use this to push the relevant
+    /// batches; the PageCache range still defines the finite completion target.
+    fn begin_sync_writeback(&self) -> Option<Box<dyn FileSystemSyncGuard>> {
+        None
+    }
+
     /// Return the stable writeback/shutdown domain for file-backed mappings.
     /// In-memory and pseudo filesystems must explicitly return `None`.
     fn page_cache_writeback_domain(
@@ -2317,6 +2328,17 @@ pub trait FileSystem: Any + Sync + Send + Debug {
     }
     /// @brief 获取当前文件系统的root inode的指针
     fn root_inode(&self) -> Arc<dyn IndexNode>;
+
+    /// Optional canonical state for repeated mounts of this filesystem.
+    /// A backend opting in must return the same state for its whole lifetime,
+    /// with no I/O, and recreate the backend only after final shutdown. VFS
+    /// retains ownership of mount counts, construction pins and teardown.
+    fn shared_mount_superblock_state(
+        &self,
+        _flags: MountFlags,
+    ) -> Option<Arc<mount::SuperBlockState>> {
+        None
+    }
 
     /// Optional owner for a newly created VFS superblock. Bind mounts and
     /// mount-namespace copies reuse the existing superblock state.

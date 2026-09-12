@@ -15,9 +15,9 @@ mod prelude;
 pub use constants::{BLOCK_SIZE, EXT4_ROOT_INO, INODE_BLOCK_SIZE};
 pub use error::{ErrCode, Ext4Error};
 pub use ext4::{
-    DelallocAppendBlockPublication, DelallocAppendBlockReservation,
+    BatchProgress, DelallocAppendBlockPublication, DelallocAppendBlockReservation,
     DelallocAppendBlockSubmitOutcome, DelallocAppendMapperAuthority, DelallocExtentNodePool,
-    DelallocLease, Ext4, InodeOwner, MetadataMutationWaker, SetAttr,
+    DelallocLease, Ext4, InodeOwner, MetadataMutationWaker, MetadataWriterWait, SetAttr,
 };
 // The bounded append mapper implementation is compiled in normal builds, but
 // its raw facade remains test-only until the DragonOS VFS can supply the

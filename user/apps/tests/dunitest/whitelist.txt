@@ -36,6 +36,7 @@ normal/mmap_truncate_cow
 normal/sysv_shm_semantics
 normal/sysv_sem_semantics
 normal/sched_affinity
+normal/sched_default_nice
 normal/sched_policy_semantics
 normal/sync_file_range
 normal/splice_concurrent_io

@@ -56,7 +56,7 @@ use self::{
     clock::{ClockUpdataFlag, SchedClock},
     cputime::{irq_time_read, CpuTimeFunc, IrqTime},
     fair::{CfsRunQueue, CompletelyFairScheduler, FairSchedEntity},
-    prio::{PrioUtil, MAX_RT_PRIO},
+    prio::{PrioUtil, DEFAULT_PRIO, MAX_PRIO, MAX_RT_PRIO, NICE_WIDTH},
     realtime::RealtimeScheduler,
 };
 
@@ -318,7 +318,12 @@ impl LoadWeight {
 
     pub const NICE_0_LOAD_SHIFT: u32 = Self::SCHED_FIXEDPOINT_SHIFT + Self::SCHED_FIXEDPOINT_SHIFT;
     pub const NICE_0_LOAD: u64 = 1u64 << Self::NICE_0_LOAD_SHIFT;
-    pub const SCHED_PRIO_TO_WEIGHT: [u64; 40] = [
+    /// Relative weights of the fair scheduling class, indexed by
+    /// `prio - MAX_RT_PRIO` for `prio` in `[MAX_RT_PRIO, MAX_PRIO)`.
+    ///
+    /// The length is `NICE_WIDTH` rather than a literal so the table cannot
+    /// drift away from the priority range it indexes.
+    pub const SCHED_PRIO_TO_WEIGHT: [u64; NICE_WIDTH as usize] = [
         88761, 71755, 56483, 46273, 36291, 29154, 23254, 18705, 14949, 11916, 9548, 7620, 6100,
         4904, 3906, 3121, 2501, 1991, 1586, 1277, 1024, 820, 655, 526, 423, 335, 272, 215, 172,
         137, 110, 87, 70, 56, 45, 36, 29, 23, 18, 15,
@@ -339,9 +344,20 @@ impl LoadWeight {
         self.inv_weight = 0;
     }
 
+    /// Loads the fair class weight for a fair class priority.
+    ///
+    /// `prio` must be an internal priority in `[MAX_RT_PRIO, MAX_PRIO)`. The
+    /// assert is deliberately not a clamp: a clamp would silently give an
+    /// out-of-domain priority (for example an RT task, or a stale value
+    /// computed from the wrong priority space) the weight of nice 19, hiding
+    /// the caller's bug behind a plausible looking runqueue weight.
     pub fn set_load_weight_from_prio(&mut self, prio: i32) {
-        let index = (prio - MAX_RT_PRIO).clamp(0, Self::SCHED_PRIO_TO_WEIGHT.len() as i32 - 1);
-        self.update_load_set(Self::scale_load(Self::SCHED_PRIO_TO_WEIGHT[index as usize]));
+        assert!(
+            (MAX_RT_PRIO..MAX_PRIO).contains(&prio),
+            "set_load_weight_from_prio: prio {prio} is not a fair class priority in [{MAX_RT_PRIO}, {MAX_PRIO})"
+        );
+        let index = (prio - MAX_RT_PRIO) as usize;
+        self.update_load_set(Self::scale_load(Self::SCHED_PRIO_TO_WEIGHT[index]));
     }
 
     /// ## 更新负载权重的倒数
@@ -424,6 +440,20 @@ impl LoadWeight {
         weight << Self::SCHED_FIXEDPOINT_SHIFT
     }
 }
+
+// Linux states this invariant in `kernel/sched/sched.h`: the fair class weight
+// for nice 0 must be exactly NICE_0_LOAD.
+//
+// DragonOS relies on it in two independent places — `FairSchedEntity::new`
+// starts every entity at `NICE_0_LOAD`, and `sched_fork` derives the load from
+// `static_prio` via `set_load_weight_from_prio` — and the two only agree while
+// `DEFAULT_PRIO` maps to the table's NICE_0_LOAD entry. Pinning it here means a
+// future change to the priority space fails the build instead of silently
+// giving non-forked tasks a different weight from forked ones.
+const _: () = assert!(
+    LoadWeight::scale_load(LoadWeight::SCHED_PRIO_TO_WEIGHT[(DEFAULT_PRIO - MAX_RT_PRIO) as usize])
+        == LoadWeight::NICE_0_LOAD
+);
 
 pub trait SchedArch {
     /// 开启当前核心的调度

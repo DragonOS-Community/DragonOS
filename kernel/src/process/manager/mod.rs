@@ -7,6 +7,7 @@ use core::{
 use alloc::{sync::Arc, vec::Vec};
 use hashbrown::HashMap;
 use log::{debug, error, info};
+use system_error::SystemError;
 
 use crate::{
     libs::{
@@ -42,9 +43,40 @@ static NR_VISIBLE_THREADS: AtomicUsize = AtomicUsize::new(0);
 static TOTAL_FORKS: AtomicU64 = AtomicU64::new(0);
 static TOTAL_CONTEXT_SWITCHES: AtomicU64 = AtomicU64::new(0);
 
-pub(crate) fn all_process() -> &'static SpinLock<Option<HashMap<RawPid, Arc<ProcessControlBlock>>>>
-{
+/// The global task registry.
+///
+/// Private to this module on purpose: a caller that wants to *act* on the tasks
+/// needs [`snapshot_all_processes`], so that no other code can hold the registry
+/// lock across the per-task scheduler locks. See the note there.
+fn all_process() -> &'static SpinLock<Option<HashMap<RawPid, Arc<ProcessControlBlock>>>> {
     &ALL_PROCESS
+}
+
+/// Clone the published `Arc` of every known task, without holding the registry
+/// lock across the caller's real work.
+///
+/// Use this rather than holding `all_process()` yourself whenever the caller
+/// is going to *act* on each task: those actions need other scheduler locks,
+/// and neither `pi_lock` nor a runqueue lock may be nested inside the registry
+/// lock. The lock is held only long enough to clone `Arc`s, and the capacity
+/// is reserved outside the IRQ-disabled section so the clone cannot allocate
+/// with interrupts off.
+pub(crate) fn snapshot_all_processes() -> Result<Vec<Arc<ProcessControlBlock>>, SystemError> {
+    let mut tasks = Vec::new();
+    loop {
+        let all = all_process().lock_irqsave();
+        let required = all.as_ref().map(|map| map.len()).unwrap_or(0);
+        if tasks.capacity() >= required {
+            if let Some(map) = all.as_ref() {
+                tasks.extend(map.values().cloned());
+            }
+            return Ok(tasks);
+        }
+        drop(all);
+        tasks
+            .try_reserve(required)
+            .map_err(|_| SystemError::ENOMEM)?;
+    }
 }
 
 #[inline]

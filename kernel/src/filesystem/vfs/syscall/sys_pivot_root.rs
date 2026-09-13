@@ -13,7 +13,7 @@ use crate::{
         FileType, IndexNode, MAX_PATHLEN, VFS_MAX_FOLLOW_SYMLINK_TIMES,
     },
     libs::casting::DowncastArc,
-    process::{all_process, lock_fs_refs_pivot, ProcessControlBlock, ProcessManager},
+    process::{lock_fs_refs_pivot, snapshot_all_processes, ProcessControlBlock, ProcessManager},
     syscall::{
         table::{FormattedSyscallParam, Syscall},
         user_access::vfs_check_and_clone_cstr,
@@ -173,26 +173,6 @@ fn inode_as_mountpoint(inode: &Arc<dyn IndexNode>) -> Result<Arc<MountFSInode>, 
         .clone()
         .downcast_arc::<MountFSInode>()
         .ok_or(SystemError::EINVAL)
-}
-
-fn snapshot_all_processes() -> Result<Vec<Arc<ProcessControlBlock>>, SystemError> {
-    let mut tasks = Vec::new();
-    loop {
-        let all = all_process().lock_irqsave();
-        let required = all.as_ref().map(|map| map.len()).unwrap_or(0);
-        if tasks.capacity() >= required {
-            if let Some(map) = all.as_ref() {
-                // Capacity was reserved outside the IRQ-disabled section, so
-                // cloning the published PCB Arcs here cannot allocate.
-                tasks.extend(map.values().cloned());
-            }
-            return Ok(tasks);
-        }
-        drop(all);
-        tasks
-            .try_reserve(required)
-            .map_err(|_| SystemError::ENOMEM)?;
-    }
 }
 
 fn repair_fs_refs(

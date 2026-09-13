@@ -38,6 +38,7 @@ normal/sysv_sem_semantics
 normal/sched_affinity
 normal/sched_default_nice
 normal/sched_policy_semantics
+normal/sched_priority_syscall
 normal/sync_file_range
 normal/splice_concurrent_io
 normal/rcu_selftest

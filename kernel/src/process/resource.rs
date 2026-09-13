@@ -174,8 +174,15 @@ pub enum RLimitID {
     Sigpending = 11,
     /// Max bytes in POSIX mqueues
     Msgqueue = 12,
-    /// Max nice prio allowed to raise to
-    ///  0-39 for nice level 19 .. -20
+    /// Max nice prio allowed to raise to, in the encoding produced by
+    /// [`crate::sched::prio::PrioUtil::nice_to_rlimit`]: `1` for nice 19 up to
+    /// `40` for nice -20. The default `{0, 0}` therefore denies any nice
+    /// reduction to an unprivileged task, which matches Linux.
+    ///
+    /// Linux's `include/uapi/asm-generic/resource.h` documents this as `0-39`;
+    /// that comment is off by one relative to its own `nice_to_rlimit()`
+    /// helper, which yields `[1, 40]`. The helper is what the kernel compares
+    /// against, so `[1, 40]` is the range that matters here.
     Nice = 13,
     /// Max realtime priority
     Rtprio = 14,

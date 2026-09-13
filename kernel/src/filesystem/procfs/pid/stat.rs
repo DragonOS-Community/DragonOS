@@ -15,7 +15,10 @@ use crate::{
         vfs::{FilePrivateData, IndexNode, InodeMode},
     },
     process::{pid::PidType, resource::RUsageWho, ProcessState, RawPid},
-    sched::{cputime::ns_to_clock_t, prio::PrioUtil},
+    sched::{
+        cputime::ns_to_clock_t,
+        prio::{PrioUtil, MAX_RT_PRIO},
+    },
 };
 use alloc::{
     format,
@@ -165,7 +168,11 @@ impl FileOps for StatFileOps {
         let child_usage = pcb
             .get_rusage(RUsageWho::RUsageChildren)
             .unwrap_or_default();
-        let priority = pcb.sched_info().prio() as i64;
+        // Field 18 is Linux's `task_prio()`, the dynamic priority offset into
+        // the realtime range, and field 19 is the nice value itself. They are
+        // two different numbers: a fair task at nice 0 reports `20` and `0`,
+        // which is what `ps` and `top` print as `PRI` and `NI`.
+        let priority = (pcb.sched_info().prio() - MAX_RT_PRIO) as i64;
         let nice = PrioUtil::prio_to_nice(pcb.sched_info().static_prio()) as i64;
         let num_threads = pcb
             .task_pid_ptr(PidType::TGID)

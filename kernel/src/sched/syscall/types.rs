@@ -12,6 +12,12 @@ pub(super) struct KernelSchedParam {
 
 const _: () = assert!(core::mem::size_of::<KernelSchedParam>() == 4);
 
+/// Legacy `getpriority()`/`setpriority()` selector ABI
+/// (`include/uapi/linux/resource.h`).
+pub(super) const PRIO_PROCESS: i32 = 0;
+pub(super) const PRIO_PGRP: i32 = 1;
+pub(super) const PRIO_USER: i32 = 2;
+
 pub(super) const SCHED_OTHER: i32 = 0;
 pub(super) const SCHED_FIFO: i32 = 1;
 pub(super) const SCHED_RR: i32 = 2;

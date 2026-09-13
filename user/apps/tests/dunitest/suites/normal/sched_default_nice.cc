@@ -7,6 +7,10 @@
 // /proc/<pid>/stat field 19, and its user mode CPU time must be accounted to
 // the `user` column of /proc/stat rather than to `nice`.
 //
+// Field 18 is the other half of the same ABI: it is `task_prio()`, the
+// priority offset into the realtime range, so it reports 20 for a fair task at
+// nice 0 rather than the raw internal priority.
+//
 // Every expectation below is the Linux ABI value; nothing here copies
 // DragonOS's current output as the expected value.
 
@@ -34,6 +38,8 @@ namespace {
 constexpr long kNiceWidth = 40;
 constexpr long kMinNice = -20;
 constexpr long kMaxNice = 19;
+constexpr long kMaxRtPrio = 100;
+constexpr long kDefaultPrio = 120;
 
 struct RawSchedParam {
     int32_t sched_priority;
@@ -146,6 +152,15 @@ void ExpectDefaultNice(pid_t pid, const char* what) {
                        << ", DEFAULT_PRIO=120); got nice=" << nice
                        << " (stat field " << kFieldNice << "=" << nice
                        << ", field " << kFieldPriority << "=" << priority << ")";
+
+    // Linux `task_prio()` is `p->prio - MAX_RT_PRIO`, not the nice value, and
+    // for a task in the fair class `p->prio == p->static_prio == nice +
+    // DEFAULT_PRIO`, so the two fields are always exactly 20 apart. `ps` and
+    // `top` print them as the PRI and NI columns; reporting `prio` itself in
+    // field 18 makes PRI read back as 120 for an untouched task.
+    EXPECT_EQ(nice + kDefaultPrio - kMaxRtPrio, priority)
+        << what << " must report task_prio() == nice + 20 in stat field " << kFieldPriority
+        << "; got priority=" << priority << " with nice=" << nice;
 }
 
 // Child exit codes. The parent maps these back to a message, so a failing case

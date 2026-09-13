@@ -12,7 +12,8 @@ use crate::{
     },
     process::{ProcessControlBlock, ProcessState},
     sched::{
-        cpu_is_online, fair::FairSchedEntity, prio::MAX_PRIO, LinuxSchedPolicy, OnRq, SchedClass,
+        cpu_is_online, fair::FairSchedEntity, prio::DEFAULT_PRIO, LinuxSchedPolicy, OnRq,
+        SchedClass,
     },
     smp::cpu::{AtomicProcessorId, ProcessorId},
 };
@@ -148,9 +149,12 @@ impl ProcessSchedulerInfo {
             sched_entity: FairSchedEntity::new(),
             on_rq: SpinLock::new(OnRq::None),
             placement: SpinLock::new(NewTaskPlacement::default()),
-            prio: AtomicI32::new(MAX_PRIO - 20),
-            static_prio: AtomicI32::new(MAX_PRIO - 20),
-            normal_prio: AtomicI32::new(MAX_PRIO - 20),
+            // A task starts at the Linux default priority (nice 0). `sched_fork`
+            // then overwrites all three according to the parent's values and the
+            // reset-on-fork flag; this is only the pre-fork initial state.
+            prio: AtomicI32::new(DEFAULT_PRIO),
+            static_prio: AtomicI32::new(DEFAULT_PRIO),
+            normal_prio: AtomicI32::new(DEFAULT_PRIO),
         };
     }
 

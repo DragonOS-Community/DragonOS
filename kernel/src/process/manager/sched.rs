@@ -385,11 +385,21 @@ impl ProcessManager {
             pcb.sched_info().set_normal_prio(new_prio);
             pi_guard.set_sched_reset_on_fork(new_reset);
 
-            if account_class_change
-                && old_class != SchedClass::Fair
-                && new_class == SchedClass::Fair
-            {
-                crate::sched::fair::CompletelyFairScheduler::switched_to_fair(rq, pcb);
+            if old_class != SchedClass::Fair && new_class == SchedClass::Fair {
+                // Linux __setscheduler_params() calls set_load_weight() while
+                // the old RT class is still installed, which writes the fair
+                // entity's weight directly before switched_to_fair() attaches
+                // its PELT contribution. An RT task may have changed its
+                // static nice value while outside Fair, so retaining the old
+                // weight here would give it the wrong CPU share on return.
+                pcb.sched_info()
+                    .sched_entity()
+                    .force_mut()
+                    .load
+                    .set_load_weight_from_prio(pcb.sched_info().static_prio());
+                if account_class_change {
+                    crate::sched::fair::CompletelyFairScheduler::switched_to_fair(rq, pcb);
+                }
             }
 
             if queued {
@@ -461,22 +471,23 @@ impl ProcessManager {
             // reads, so they go straight into the task.
             //
             // Linux arrives at the same entity through `set_load_weight()`.
-            // Two of the three things its `reweight_entity()` does there are
-            // deliberately absent: the entity's PELT averages are not part of
-            // any runqueue average yet — the enqueue attaches them — so there
-            // is nothing to take back out and put in again, and the runqueue's
-            // own `load` is not adjusted either. The lag rescale is the part
-            // that carries over.
+            // Runqueue bookkeeping is deliberately absent because this entity
+            // has never been attached, but the entity-local parts of off-rq
+            // `reweight_entity()` still apply: lag, weight, and the
+            // weight-dependent PELT load average all change together.
             let se = pcb.sched_info().sched_entity();
             let weight = LoadWeight::weight_from_prio(new_static_prio);
             // Linux rescales the lag with the weight because
             // `lag_i = w_i * (V - v_i)`. A task reaches this state from `fork()`
             // carrying the zero-initial `vlag`, so this preserves the invariant
             // rather than moving today's value.
-            se.force_mut().vlag = se.vlag * se.load.weight as i64 / weight as i64;
-            se.force_mut()
-                .load
-                .set_load_weight_from_prio(new_static_prio);
+            let se_mut = se.force_mut();
+            se_mut.vlag = se_mut.vlag * se_mut.load.weight as i64 / weight as i64;
+            se_mut.load.update_load_set(weight);
+            let divider = se_mut.avg.get_pelt_divider();
+            se_mut.avg.load_avg = LoadWeight::scale_load_down(weight) as usize
+                * se_mut.avg.load_sum as usize
+                / divider;
 
             pcb.sched_info().set_static_prio(new_static_prio);
             // DragonOS has neither realtime boosting nor priority inheritance,

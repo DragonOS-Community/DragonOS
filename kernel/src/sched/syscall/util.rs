@@ -1,13 +1,74 @@
 /// 调度系统调用相关的工具函数
-use alloc::{sync::Arc, vec, vec::Vec};
+use alloc::{sync::Arc, vec::Vec};
 
 use system_error::SystemError;
 
 use crate::process::cred::{CAPFlags, Cred};
-use crate::process::pid::{pid_membership_lock, PidType};
+use crate::process::namespace::user_namespace::map_id_down;
+use crate::process::pid::{pid_membership_lock, Pid, PidType};
 use crate::process::{snapshot_all_processes, ProcessControlBlock, ProcessManager, RawPid};
 
 use super::types::{PRIO_PGRP, PRIO_PROCESS, PRIO_USER};
+
+pub(super) enum PrioTargets {
+    One(Option<Arc<ProcessControlBlock>>),
+    Many(alloc::vec::IntoIter<Arc<ProcessControlBlock>>),
+}
+
+impl Iterator for PrioTargets {
+    type Item = Arc<ProcessControlBlock>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::One(target) => target.take(),
+            Self::Many(targets) => targets.next(),
+        }
+    }
+}
+
+/// Snapshot every task in a process group without allocating while IRQs or
+/// membership state are locked.
+///
+/// Thread publication and PGID changes both serialize through
+/// `pid_membership_lock()`. Keeping it across the leader walk and each
+/// leader-owned thread list therefore gives the same complete-set boundary as
+/// Linux's tasklist read lock. Capacity is prepared before entering that
+/// boundary; a concurrent fork can make the estimate stale, so the loop
+/// rechecks after taking the lock and retries allocation outside it.
+fn snapshot_pgrp_tasks(pgrp: &Arc<Pid>) -> Result<Vec<Arc<ProcessControlBlock>>, SystemError> {
+    let mut tasks = Vec::new();
+    loop {
+        let membership_guard = pid_membership_lock();
+        let required = pgrp
+            .tasks_iter(PidType::PGID)
+            .try_fold(0usize, |count, leader| {
+                count
+                    .checked_add(1)?
+                    .checked_add(leader.threads_read_irqsave().group_tasks().len())
+            })
+            .ok_or(SystemError::ENOMEM)?;
+
+        if tasks.capacity() < required {
+            drop(membership_guard);
+            tasks
+                .try_reserve(required)
+                .map_err(|_| SystemError::ENOMEM)?;
+            continue;
+        }
+
+        for leader in pgrp.tasks_iter(PidType::PGID) {
+            let threads = leader.threads_read_irqsave();
+            tasks.push(leader.clone());
+            tasks.extend(
+                threads
+                    .group_tasks()
+                    .iter()
+                    .filter_map(|thread| thread.upgrade()),
+            );
+        }
+        return Ok(tasks);
+    }
+}
 
 /// Resolve the `which`/`who` selector pair of `getpriority()`/`setpriority()`
 /// into the set of tasks the call applies to.
@@ -29,21 +90,18 @@ use super::types::{PRIO_PGRP, PRIO_PROCESS, PRIO_USER};
 /// The result is a snapshot. Both callers take per-task scheduler locks, and
 /// neither the global registry lock nor a PID list lock may be held across
 /// those.
-pub(super) fn resolve_prio_targets(
-    which: i32,
-    who: i32,
-) -> Result<Vec<Arc<ProcessControlBlock>>, SystemError> {
+pub(super) fn resolve_prio_targets(which: i32, who: i32) -> Result<PrioTargets, SystemError> {
     match which {
         PRIO_PROCESS => {
             if who == 0 {
-                return Ok(vec![ProcessManager::current_pcb()]);
+                return Ok(PrioTargets::One(Some(ProcessManager::current_pcb())));
             }
             // `find_task_by_vpid()` rather than `find_sched_target()`: the
             // latter rejects a negative pid with `EINVAL`, which is the wrong
             // answer here.
             ProcessManager::find_task_by_vpid(RawPid::from(who as usize))
-                .map(|pcb| vec![pcb])
                 .ok_or(SystemError::ESRCH)
+                .map(|target| PrioTargets::One(Some(target)))
         }
         PRIO_PGRP => {
             let pgrp = if who == 0 {
@@ -55,51 +113,42 @@ pub(super) fn resolve_prio_targets(
                 return Err(SystemError::ESRCH);
             };
 
-            // The process group index holds one link per thread group, but
-            // Linux's `do_each_pid_thread()` then walks every thread of each
-            // linked group, and a nice value belongs to a task. Expanding here
-            // keeps a thread that diverged through `PRIO_PROCESS` visible both
-            // to the maximum `getpriority()` takes and to the assignment
-            // `setpriority()` performs.
-            //
-            // The membership lock is held for the same reason `kill_pgrp`
-            // takes it: `setpgid()`, `setsid()` and `de_thread()` move these
-            // links, and a group observed mid-transfer has no completed set of
-            // members.
-            let leaders: Vec<_> = {
-                let _membership_guard = pid_membership_lock();
-                pgrp.tasks_iter(PidType::PGID).collect()
-            };
-            let mut tasks = Vec::new();
-            for leader in leaders {
-                tasks.extend(ProcessManager::thread_group_tasks_snapshot(leader));
-            }
+            // The process-group index holds one link per thread group, while
+            // Linux's `do_each_pid_thread()` expands each link to every task.
+            // The shared helper preserves that complete-set boundary here.
+            let tasks = snapshot_pgrp_tasks(&pgrp)?;
             if tasks.is_empty() {
                 return Err(SystemError::ESRCH);
             }
-            Ok(tasks)
+            Ok(PrioTargets::Many(tasks.into_iter()))
         }
         PRIO_USER => {
-            // DragonOS has a single uid space, so comparing against `Cred::uid`
-            // directly is the whole of Linux's `make_kuid()` plus `uid_eq()`
-            // here. A `who` that names no uid matches no task, which Linux
-            // reports as `ESRCH` as well.
+            let current_cred = ProcessManager::current_pcb().cred();
             let uid = if who == 0 {
-                ProcessManager::current_pcb().cred().uid.data()
+                // Linux bypasses make_kuid() for zero and selects the caller's
+                // kernel-global real uid directly.
+                current_cred.uid.data()
             } else {
-                who as usize
+                // `who` is declared as an `int`, but Linux passes it to
+                // make_kuid() as a 32-bit unsigned `uid_t`. Preserve that bit
+                // pattern before mapping from the caller's user namespace to
+                // the kernel-global uid stored in Cred. In particular, -2 is
+                // the valid uid 0xfffffffe rather than a sign-extended usize.
+                let mapped = {
+                    let user_ns = current_cred.user_ns.inner.lock();
+                    map_id_down(&user_ns.uid_map, who as u32)
+                };
+                mapped.map(|uid| uid as usize).ok_or(SystemError::ESRCH)?
             };
             // Linux filters on `task_pid_vnr() != 0` so that the swapper task
             // and anything living outside the caller's PID namespace drops out
             // of the `for_each_process_thread()` walk.
-            let tasks: Vec<_> = snapshot_all_processes()?
-                .into_iter()
-                .filter(|pcb| pcb.task_pid_vnr().data() != 0 && pcb.cred().uid.data() == uid)
-                .collect();
+            let mut tasks = snapshot_all_processes()?;
+            tasks.retain(|pcb| pcb.task_pid_vnr().data() != 0 && pcb.cred().uid.data() == uid);
             if tasks.is_empty() {
                 return Err(SystemError::ESRCH);
             }
-            Ok(tasks)
+            Ok(PrioTargets::Many(tasks.into_iter()))
         }
         _ => Err(SystemError::EINVAL),
     }

@@ -27,6 +27,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fcntl.h>
 #include <sys/resource.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
@@ -47,6 +48,12 @@ constexpr int kFieldNice = 19;
 // A uid that no task in the test environment holds, used for the
 // "selects nothing" case of PRIO_USER.
 constexpr uid_t kUnusedUid = 0x5A5A;
+
+// Linux receives PRIO_USER's `who` as an int but converts it to uid_t before
+// calling make_kuid().  The upper half of the 32-bit UID space must therefore
+// retain its unsigned bit pattern even though the same bits spell a negative
+// int at the syscall boundary.
+constexpr uid_t kHighUid = 0xfffffffeU;
 
 // The nice values the PRIO_PGRP and PRIO_USER selectors are asked to apply.
 // The second is strictly above the first because a nice value *below* the
@@ -156,6 +163,17 @@ bool ReadAll(int fd, void* value, size_t size) {
         read_bytes += static_cast<size_t>(n);
     }
     return true;
+}
+
+int WriteTextFile(const char* path, const char* text) {
+    const int fd = open(path, O_WRONLY);
+    if (fd < 0) return errno;
+
+    const size_t size = strlen(text);
+    const bool wrote = WriteAll(fd, text, size);
+    const int write_errno = wrote ? 0 : errno;
+    if (close(fd) != 0 && write_errno == 0) return errno;
+    return write_errno;
 }
 
 // Runs `body` in a forked child and copies the single `Result` it returns back
@@ -734,6 +752,111 @@ TEST(Setpriority, PgrpAndUserSelectorsApplyToSelf) {
     EXPECT_EQ(kMaxNice - kSelectorUserNice + 1, observation.user_self_raw_value)
         << "getpriority(PRIO_USER, 0) must select the caller's real uid (errno "
         << observation.user_self_raw_errno << ")";
+}
+
+struct HighUidObservation {
+    int setresuid_errno;
+    uid_t uid;
+    int set_errno;
+    long raw_value;
+    int raw_errno;
+    int libc_value;
+    int libc_errno;
+};
+
+HighUidObservation ObserveHighUidSelector() {
+    HighUidObservation observation {};
+
+    errno = 0;
+    if (setresuid(kHighUid, kHighUid, 0) != 0) {
+        observation.setresuid_errno = errno;
+        return observation;
+    }
+    observation.uid = getuid();
+
+    if (RawSetpriority(PRIO_USER, static_cast<int>(kHighUid), kSelectorUserNice,
+                       &observation.set_errno) != 0) {
+        return observation;
+    }
+    observation.raw_value =
+        RawGetpriority(PRIO_USER, static_cast<int>(kHighUid), &observation.raw_errno);
+    errno = 0;
+    observation.libc_value = getpriority(PRIO_USER, static_cast<int>(kHighUid));
+    observation.libc_errno = errno;
+    return observation;
+}
+
+TEST(Setpriority, PrioUserPreservesUnsignedUidBits) {
+    HighUidObservation observation {};
+    const ::testing::AssertionResult child_ran =
+        RunInChild(ObserveHighUidSelector, &observation);
+    ASSERT_TRUE(child_ran);
+
+    ASSERT_EQ(0, observation.setresuid_errno)
+        << "setresuid(" << kHighUid << "): " << strerror(observation.setresuid_errno);
+    ASSERT_EQ(kHighUid, observation.uid);
+    ASSERT_EQ(0, observation.set_errno)
+        << "setpriority(PRIO_USER, " << kHighUid << ", " << kSelectorUserNice
+        << "): " << strerror(observation.set_errno);
+    EXPECT_EQ(kMaxNice - kSelectorUserNice + 1, observation.raw_value)
+        << "raw getpriority(PRIO_USER, " << kHighUid << ") (errno "
+        << observation.raw_errno << ")";
+    EXPECT_EQ(kSelectorUserNice, observation.libc_value)
+        << "getpriority(PRIO_USER, " << kHighUid << ") (errno " << observation.libc_errno
+        << ")";
+}
+
+struct MappedUidObservation {
+    int setresuid_errno;
+    int unshare_errno;
+    int uid_map_errno;
+    int set_errno;
+    long raw_value;
+    int raw_errno;
+};
+
+MappedUidObservation ObserveMappedUidSelector() {
+    MappedUidObservation observation {};
+
+    errno = 0;
+    if (setresuid(kUnusedUid, kUnusedUid, 0) != 0) {
+        observation.setresuid_errno = errno;
+        return observation;
+    }
+    if (unshare(CLONE_NEWUSER) != 0) {
+        observation.unshare_errno = errno;
+        return observation;
+    }
+
+    char map[64] = {};
+    snprintf(map, sizeof(map), "42 %u 1\n", static_cast<unsigned>(kUnusedUid));
+    observation.uid_map_errno = WriteTextFile("/proc/self/uid_map", map);
+    if (observation.uid_map_errno != 0) return observation;
+
+    if (RawSetpriority(PRIO_USER, 42, kSelectorUserNice, &observation.set_errno) != 0) {
+        return observation;
+    }
+    observation.raw_value = RawGetpriority(PRIO_USER, 42, &observation.raw_errno);
+    return observation;
+}
+
+TEST(Setpriority, PrioUserMapsUidThroughCallerNamespace) {
+    MappedUidObservation observation {};
+    const ::testing::AssertionResult child_ran =
+        RunInChild(ObserveMappedUidSelector, &observation);
+    ASSERT_TRUE(child_ran);
+
+    ASSERT_EQ(0, observation.setresuid_errno)
+        << "setresuid(" << kUnusedUid << "): " << strerror(observation.setresuid_errno);
+    ASSERT_EQ(0, observation.unshare_errno)
+        << "unshare(CLONE_NEWUSER): " << strerror(observation.unshare_errno);
+    ASSERT_EQ(0, observation.uid_map_errno)
+        << "write(/proc/self/uid_map): " << strerror(observation.uid_map_errno);
+    ASSERT_EQ(0, observation.set_errno)
+        << "setpriority(PRIO_USER, 42, " << kSelectorUserNice << "): "
+        << strerror(observation.set_errno);
+    EXPECT_EQ(kMaxNice - kSelectorUserNice + 1, observation.raw_value)
+        << "raw getpriority(PRIO_USER, 42) (errno " << observation.raw_errno << ")";
 }
 
 // ---------------------------------------------------------------------------

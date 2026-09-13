@@ -15,6 +15,7 @@
 # - DUNITEST_PATTERN: dunitest runner pattern filter
 # - DRAGONOS_QEMU_SMP: 覆盖 vCPU 拓扑，例如 1,cores=1,threads=1,sockets=1
 # - DRAGONOS_QEMU_SERIAL_SOCKET: nographic 模式下使用独立 Unix socket 承载 guest virtconsole
+# - DRAGONOS_QEMU_CONSOLE_TERM: x86_64 nographic 控制台使用的 guest terminfo 名称
 # - DRAGONOS_QEMU_ARGV_FILE: 以 JSON 数组记录实际执行的 QEMU argv（目标必须不存在）
 # - DRAGONOS_QEMU_DISK_IMAGE: 覆盖主磁盘镜像路径
 # - DRAGONOS_QEMU_SNAPSHOT: 设为1时以 QEMU snapshot 模式运行，避免修改基线镜像
@@ -757,7 +758,9 @@ fi
 
 
 if [ ${QEMU_NOGRAPHIC} == true ]; then
+    qemu_console_transport="stdio"
     if [ -n "${DRAGONOS_QEMU_SERIAL_SOCKET:-}" ]; then
+      qemu_console_transport="socket"
       qemu_serial_socket_dir="$(dirname "${DRAGONOS_QEMU_SERIAL_SOCKET}")"
       qemu_serial_socket_real_dir="$(realpath -e -- "${qemu_serial_socket_dir}" 2>/dev/null || true)"
       if [[ "${DRAGONOS_QEMU_SERIAL_SOCKET}" != /* ]] || \
@@ -778,6 +781,23 @@ if [ ${QEMU_NOGRAPHIC} == true ]; then
       QEMU_SERIAL_ARGS=(-serial none -monitor none -chardev "socket,id=${QEMU_CONSOLE_CHARDEV_ID},path=${DRAGONOS_QEMU_SERIAL_SOCKET},server=on,wait=off,logfile=${QEMU_SERIAL_LOG_FILE}")
     else
       QEMU_SERIAL_ARGS=(-serial chardev:mux -monitor chardev:mux -chardev "stdio,id=mux,mux=on,signal=off,logfile=${QEMU_SERIAL_LOG_FILE}")
+    fi
+
+    if [ "${ARCH}" = "x86_64" ]; then
+      # shellcheck source=qemu/console-term.sh
+      if ! . "${ROOT_PATH}/tools/qemu/console-term.sh"; then
+        echo "[ERROR] failed to load the console TERM resolver"
+        exit 1
+      fi
+      if ! dragonos_resolve_console_term "${qemu_console_transport}"; then
+        exit 1
+      fi
+      if [ -n "${DRAGONOS_RESOLVED_CONSOLE_TERM}" ]; then
+        KERNEL_CMDLINE+=" TERM=${DRAGONOS_RESOLVED_CONSOLE_TERM} "
+        echo "[INFO] Guest console TERM=${DRAGONOS_RESOLVED_CONSOLE_TERM} (source=${DRAGONOS_RESOLVED_CONSOLE_TERM_SOURCE})"
+      else
+        echo "[INFO] Guest console TERM uses the current init fallback"
+      fi
     fi
 
     # 添加 virtio console 设备

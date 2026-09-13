@@ -14,6 +14,7 @@
 
 let
   qemuFirmware = if preferSystemQemu then null else pkgs.callPackage ./qemu-firmware.nix { };
+  consoleTermHelper = ./console-term.sh;
 
   baseConfig = {
     nographic = true;
@@ -348,9 +349,26 @@ let
       # 原脚本是 rm -rf ... -> qemu -> rm -rf ...
 
       EXTRA_CMDLINE="${qemuConfig.cmdlineExtra}"
+      CONSOLE_TERM_CMDLINE=""
+
+      ${lib.optionalString (arch == "x86_64") ''
+        if ! . ${consoleTermHelper}; then
+          echo "[ERROR] failed to load the console TERM resolver"
+          exit 1
+        fi
+        if ! dragonos_resolve_console_term stdio; then
+          exit 1
+        fi
+        if [ -n "$DRAGONOS_RESOLVED_CONSOLE_TERM" ]; then
+          CONSOLE_TERM_CMDLINE="TERM=$DRAGONOS_RESOLVED_CONSOLE_TERM"
+          echo "[INFO] Guest console TERM=$DRAGONOS_RESOLVED_CONSOLE_TERM (source=$DRAGONOS_RESOLVED_CONSOLE_TERM_SOURCE)"
+        else
+          echo "[INFO] Guest console TERM uses the current init fallback"
+        fi
+      ''}
 
       # FIXED: 补全缺失的默认内核参数 AUTO_TEST 和 SYSCALL_TEST_DIR
-      FINAL_CMDLINE="rw init=${initProgram} AUTO_TEST=${testOpt.autotest} SYSCALL_TEST_DIR=${testOpt.syscall.testDir} DUNITEST_DIR=${testOpt.dunitest.testDir} ${lib.optionalString (testOpt.autotest == "dunit") "dragonos.net_test_fixtures"} $EXTRA_CMDLINE"
+      FINAL_CMDLINE="rw init=${initProgram} AUTO_TEST=${testOpt.autotest} SYSCALL_TEST_DIR=${testOpt.syscall.testDir} DUNITEST_DIR=${testOpt.dunitest.testDir} ${lib.optionalString (testOpt.autotest == "dunit") "dragonos.net_test_fixtures"} $EXTRA_CMDLINE $CONSOLE_TERM_CMDLINE"
 
       ARCH_FLAGS=( ${lib.escapeShellArgs commonArchArgs} )
       ${archSpecificBash}

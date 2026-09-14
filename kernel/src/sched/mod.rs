@@ -344,20 +344,31 @@ impl LoadWeight {
         self.inv_weight = 0;
     }
 
-    /// Loads the fair class weight for a fair class priority.
+    /// Scaled fair class weight for a fair class priority.
     ///
     /// `prio` must be an internal priority in `[MAX_RT_PRIO, MAX_PRIO)`. The
     /// assert is deliberately not a clamp: a clamp would silently give an
     /// out-of-domain priority (for example an RT task, or a stale value
     /// computed from the wrong priority space) the weight of nice 19, hiding
     /// the caller's bug behind a plausible looking runqueue weight.
-    pub fn set_load_weight_from_prio(&mut self, prio: i32) {
+    ///
+    /// This is the single place that maps a priority to a scaled weight, so
+    /// the assert and the table index cannot drift apart between the
+    /// assign-into-a-fresh-entity path ([`Self::set_load_weight_from_prio`])
+    /// and the reweight-an-existing-entity path
+    /// ([`crate::sched::fair::CfsRunQueue::reweight_entity`]).
+    pub const fn weight_from_prio(prio: i32) -> u64 {
         assert!(
-            (MAX_RT_PRIO..MAX_PRIO).contains(&prio),
-            "set_load_weight_from_prio: prio {prio} is not a fair class priority in [{MAX_RT_PRIO}, {MAX_PRIO})"
+            prio >= MAX_RT_PRIO && prio < MAX_PRIO,
+            "weight_from_prio: prio is outside [MAX_RT_PRIO, MAX_PRIO)"
         );
         let index = (prio - MAX_RT_PRIO) as usize;
-        self.update_load_set(Self::scale_load(Self::SCHED_PRIO_TO_WEIGHT[index]));
+        Self::scale_load(Self::SCHED_PRIO_TO_WEIGHT[index])
+    }
+
+    /// Loads the fair class weight for a fair class priority.
+    pub fn set_load_weight_from_prio(&mut self, prio: i32) {
+        self.update_load_set(Self::weight_from_prio(prio));
     }
 
     /// ## 更新负载权重的倒数
@@ -713,6 +724,22 @@ impl CpuRunQueue {
                 .highest_prio()
                 .is_some_and(|highest| highest < new_prio as usize)
         {
+            self.resched_current();
+        }
+
+        // Linux `prio_changed_fair()`: the running task just made itself less
+        // important, so it has to give the CPU back. Unlike the realtime case
+        // there is no queue scan — the fair class picks by virtual runtime, so
+        // the only thing that can immediately deserve the CPU more is the
+        // already-runnable set, which `resched_current()` will re-evaluate.
+        //
+        // Priority is inverted: a numerically larger `prio` is a *lower*
+        // priority, i.e. a larger nice value.
+        //
+        // `rq->cfs.nr_running == 1` means the task is the only runnable fair
+        // task, so a reschedule could only re-elect it; Linux skips the
+        // request entirely and so does this.
+        if new_class == SchedClass::Fair && new_prio > old_prio && self.cfs.nr_running() > 1 {
             self.resched_current();
         }
     }

@@ -9,8 +9,10 @@ use crate::{
     libs::cpumask::CpuMask,
     process::{ProcessControlBlock, ProcessFlags, ProcessManager, ProcessState},
     sched::{
-        cpu_rq, enqueue_task_on_cpu, select_task_rq, DequeueFlag, EnqueueFlag, LinuxSchedPolicy,
-        OnRq, SchedClass, WakeupFlags,
+        cpu_rq, enqueue_task_on_cpu,
+        prio::{PrioUtil, MAX_NICE, MIN_NICE},
+        select_task_rq, CpuRunQueue, DequeueFlag, EnqueueFlag, LinuxSchedPolicy, LoadWeight, OnRq,
+        SchedClass, WakeupFlags,
     },
     smp::{core::smp_get_processor_id, kick_cpu},
 };
@@ -38,6 +40,18 @@ enum SchedulerUpdate {
         expected_policy: LinuxSchedPolicy,
         expected_rt_priority: Option<i32>,
         rt_priority: Option<i32>,
+    },
+    /// Linux `set_user_nice()`. Unlike the two variants above this one does not
+    /// change the base policy, and it is the only variant here that writes
+    /// `static_prio`; the other two leave it as the fair-priority floor they
+    /// fall back to.
+    ///
+    /// The caller decides and the commit simply applies, exactly as Linux
+    /// splits `can_nice()` from `set_user_nice()`: the nice value is absolute
+    /// rather than a delta, so nothing in the commit depends on the value the
+    /// authorization was evaluated against.
+    Nice {
+        nice: i32,
     },
 }
 
@@ -207,6 +221,9 @@ impl ProcessManager {
                 expected_rt_priority: None,
                 rt_priority: None,
             } => None,
+            // Changing the nice value never implies a realtime priority, and
+            // it leaves the target's base policy alone.
+            SchedulerUpdate::Nice { .. } => None,
             SchedulerUpdate::Parameters { .. } => return Err(SystemError::EINVAL),
         };
         if rt_priority
@@ -227,9 +244,24 @@ impl ProcessManager {
 
             // Published tasks retain their last rq while sleeping or exiting.
             // A task without a CPU can have a Fair entity bound to another rq,
-            // so this PR deliberately rejects that unplaced state.
-            let Some(target_cpu) = pcb.sched_info().on_cpu() else {
-                return Err(SystemError::EINVAL);
+            // so a policy change deliberately rejects that unplaced state.
+            let target_cpu = match pcb.sched_info().on_cpu() {
+                Some(target_cpu) => target_cpu,
+                None => {
+                    // The one unplaced task a nice change does have to serve is
+                    // a fork child: `copy_process()` publishes its pid long
+                    // before `wake_up_new_task()` gives it a CPU, so a caller
+                    // that was handed it by a `PRIO_USER`/`PRIO_PGRP` walk
+                    // (or that raced a `fork()`) does reach it here. Linux
+                    // re-nices such a child like any other task, and the
+                    // `pi_lock` this loop holds is what its `task_rq_lock()`
+                    // would have provided, so the commit below runs without a
+                    // runqueue.
+                    if let SchedulerUpdate::Nice { nice } = update {
+                        return Self::commit_nice(pcb, None, nice).map(|_| true);
+                    }
+                    return Err(SystemError::EINVAL);
+                }
             };
             let rq = cpu_rq(target_cpu.data() as usize);
             let (rq, rq_guard) = rq.self_lock();
@@ -253,6 +285,17 @@ impl ProcessManager {
             }
 
             rq.update_rq_clock();
+
+            // A nice change is not a policy change, and it does not fit the
+            // (policy, prio, reset) triple the rest of this loop commits:
+            // a realtime task keeps its effective priority, and a fair task
+            // needs its load weight re-applied rather than only its `prio`
+            // rewritten. Handling it here keeps the pi_lock -> rq_lock
+            // acquisition and the migration-stability loop in exactly one
+            // place instead of duplicating them.
+            if let SchedulerUpdate::Nice { nice } = update {
+                return Self::commit_nice(pcb, Some(rq), nice).map(|_| true);
+            }
 
             let old_policy = pcb.sched_info().policy();
             let old_prio = pcb.sched_info().prio();
@@ -289,6 +332,13 @@ impl ProcessManager {
                         }
                     };
                     (old_policy, priority, old_reset)
+                }
+                // `Nice` returned through `commit_nice()` above, before this
+                // triple was sampled. The arm is written out instead of being
+                // folded into a wildcard so that a new variant still fails to
+                // compile until it is handled here.
+                SchedulerUpdate::Nice { .. } => {
+                    unreachable!("nice updates are committed before the policy triple")
                 }
             };
             let new_class = new_policy.base_sched_class();
@@ -335,11 +385,21 @@ impl ProcessManager {
             pcb.sched_info().set_normal_prio(new_prio);
             pi_guard.set_sched_reset_on_fork(new_reset);
 
-            if account_class_change
-                && old_class != SchedClass::Fair
-                && new_class == SchedClass::Fair
-            {
-                crate::sched::fair::CompletelyFairScheduler::switched_to_fair(rq, pcb);
+            if old_class != SchedClass::Fair && new_class == SchedClass::Fair {
+                // Linux __setscheduler_params() calls set_load_weight() while
+                // the old RT class is still installed, which writes the fair
+                // entity's weight directly before switched_to_fair() attaches
+                // its PELT contribution. An RT task may have changed its
+                // static nice value while outside Fair, so retaining the old
+                // weight here would give it the wrong CPU share on return.
+                pcb.sched_info()
+                    .sched_entity()
+                    .force_mut()
+                    .load
+                    .set_load_weight_from_prio(pcb.sched_info().static_prio());
+                if account_class_change {
+                    crate::sched::fair::CompletelyFairScheduler::switched_to_fair(rq, pcb);
+                }
             }
 
             if queued {
@@ -361,6 +421,139 @@ impl ProcessManager {
             drop(pi_guard);
             return Ok(true);
         }
+    }
+
+    /// Change a task's nice value, following Linux `set_user_nice()`
+    /// (`kernel/sched/core.c`).
+    pub(crate) fn set_scheduler_nice(
+        pcb: &Arc<ProcessControlBlock>,
+        nice: i32,
+    ) -> Result<(), SystemError> {
+        Self::update_scheduler(pcb, SchedulerUpdate::Nice { nice }).map(|_| ())
+    }
+
+    /// The commit half of [`Self::set_scheduler_nice`]. The caller holds the
+    /// target's `pi_lock`, and `rq` is the target's runqueue whenever it has
+    /// one.
+    fn commit_nice(
+        pcb: &Arc<ProcessControlBlock>,
+        rq: Option<&mut CpuRunQueue>,
+        nice: i32,
+    ) -> Result<(), SystemError> {
+        // An out-of-range nice is clamped, never rejected. Linux behaves the
+        // same way; only a bad `which` selector is an error.
+        let new_static_prio = PrioUtil::nice_to_prio(nice.clamp(MIN_NICE, MAX_NICE));
+        if new_static_prio == pcb.sched_info().static_prio() {
+            // Already in place. Linux returns without touching the runqueue so
+            // that a redundant `setpriority()` cannot move the task within its
+            // queue.
+            return Ok(());
+        }
+
+        let class = pcb.sched_info().sched_class();
+        if class != SchedClass::Fair {
+            // `update_scheduler` rejects the idle class before reaching here,
+            // so this is the realtime case. Linux takes its `rt`/`dl` early
+            // return here: it records the nice value and stops, because a
+            // realtime task's effective priority comes from `rt_priority`,
+            // `p->prio` is left alone, and the task must not be requeued. That
+            // is also why the load weight is not touched: an RT entity is
+            // never on a fair runqueue.
+            pcb.sched_info().set_static_prio(new_static_prio);
+            return Ok(());
+        }
+
+        let Some(rq) = rq else {
+            // A fork child that has not been enqueued yet: `wake_up_new_task()`
+            // has not run, so the task is published but holds no queue position
+            // and has no peer on a runqueue to preempt. The priority triple and
+            // the load weight written here are exactly what the pending enqueue
+            // reads, so they go straight into the task.
+            //
+            // Linux arrives at the same entity through `set_load_weight()`.
+            // Runqueue bookkeeping is deliberately absent because this entity
+            // has never been attached, but the entity-local parts of off-rq
+            // `reweight_entity()` still apply: lag, weight, and the
+            // weight-dependent PELT load average all change together.
+            let se = pcb.sched_info().sched_entity();
+            let weight = LoadWeight::weight_from_prio(new_static_prio);
+            // Linux rescales the lag with the weight because
+            // `lag_i = w_i * (V - v_i)`. A task reaches this state from `fork()`
+            // carrying the zero-initial `vlag`, so this preserves the invariant
+            // rather than moving today's value.
+            let se_mut = se.force_mut();
+            se_mut.vlag = se_mut.vlag * se_mut.load.weight as i64 / weight as i64;
+            se_mut.load.update_load_set(weight);
+            let divider = se_mut.avg.get_pelt_divider();
+            se_mut.avg.load_avg = LoadWeight::scale_load_down(weight) as usize
+                * se_mut.avg.load_sum as usize
+                / divider;
+
+            pcb.sched_info().set_static_prio(new_static_prio);
+            // DragonOS has neither realtime boosting nor priority inheritance,
+            // so Linux's `effective_prio()` degenerates to `static_prio` here.
+            pcb.sched_info().set_normal_prio(new_static_prio);
+            pcb.sched_info().set_prio(new_static_prio);
+            return Ok(());
+        };
+
+        let queued = *pcb.sched_info().on_rq.lock_irqsave() == OnRq::Queued;
+        let running = Arc::ptr_eq(&rq.current(), pcb);
+        // Mirrors the `account_class_change` reasoning in `update_scheduler`:
+        // a dead task that has left the runqueue already had its PELT
+        // contribution removed by the final switch-out, so reweighting it
+        // would push that load back into the cfs_rq.
+        let reweight = !pcb.sched_info().state().is_exited() || queued || running;
+
+        if queued {
+            // `DEQUEUE_SAVE` without `DEQUEUE_MOVE`, matching `set_user_nice()`
+            // (`core.c`). With `DEQUEUE_MOVE` also set, `dequeue_entity()`
+            // advances `min_vruntime` — see the flag test in `fair.rs` and the
+            // comment on it in Linux's `fair.c` — and the task would be placed
+            // further back than it started when it is re-enqueued below.
+            rq.dequeue_task(
+                pcb.clone(),
+                DequeueFlag::DEQUEUE_SAVE | DequeueFlag::DEQUEUE_NOCLOCK,
+            );
+        }
+        if running {
+            rq.put_prev_task_for_class(class, pcb.clone());
+        }
+
+        let old_prio = pcb.sched_info().prio();
+        pcb.sched_info().set_static_prio(new_static_prio);
+        // DragonOS has neither realtime boosting nor priority inheritance, so
+        // Linux's `effective_prio()` degenerates to `static_prio` here.
+        pcb.sched_info().set_normal_prio(new_static_prio);
+        pcb.sched_info().set_prio(new_static_prio);
+
+        if reweight {
+            let se = pcb.sched_info().sched_entity();
+            let weight = LoadWeight::weight_from_prio(new_static_prio);
+            // The reweight below is a raw write into the entity, so the lock
+            // the caller holds is only the right serialization point if the
+            // entity really belongs to it.
+            debug_assert!(
+                core::ptr::eq(Arc::as_ptr(&se.cfs_rq().rq()), rq as *const CpuRunQueue),
+                "the reweighted entity must belong to the runqueue being held"
+            );
+            // Safe because the caller holds this runqueue's lock, which is the
+            // serialization point for the entity's weight.
+            se.cfs_rq().force_mut().reweight_entity(se.clone(), weight);
+        }
+
+        if queued {
+            rq.enqueue_task(
+                pcb.clone(),
+                EnqueueFlag::ENQUEUE_RESTORE | EnqueueFlag::ENQUEUE_NOCLOCK,
+            );
+        }
+        if running {
+            rq.set_next_task_for_class(class, pcb.clone());
+        }
+
+        rq.check_scheduler_changed(pcb, class, old_prio);
+        Ok(())
     }
 
     /// Set a trusted kernel thread to the SCHED_FIFO policy.

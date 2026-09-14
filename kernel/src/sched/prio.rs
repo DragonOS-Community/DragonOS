@@ -27,6 +27,11 @@ const _: () = {
     assert!(NICE_WIDTH == 40);
     assert!(MAX_PRIO == 140);
     assert!(DEFAULT_PRIO == 120);
+    // Endpoints of the RLIMIT_NICE encoding. libc recovers the nice value from
+    // the raw getpriority result with `20 - raw`, so these two numbers are
+    // user visible through `getpriority()`.
+    assert!(PrioUtil::nice_to_rlimit(MIN_NICE) == 40);
+    assert!(PrioUtil::nice_to_rlimit(MAX_NICE) == 1);
 };
 
 pub struct PrioUtil;
@@ -46,6 +51,21 @@ impl PrioUtil {
     pub fn prio_to_nice(prio: i32) -> i32 {
         debug_assert!((MAX_RT_PRIO..MAX_PRIO).contains(&prio));
         prio - DEFAULT_PRIO
+    }
+
+    /// Encode a nice value the way `getpriority()`/`setpriority()` and
+    /// `RLIMIT_NICE` do, matching Linux (`include/linux/sched/prio.h`).
+    ///
+    /// The mapping is `MAX_NICE - nice + 1`, so it is monotonically decreasing:
+    /// nice `19` becomes `1` and nice `-20` becomes `40`. The raw
+    /// `getpriority` syscall returns this encoding, and libc recovers the nice
+    /// value with `20 - raw`; `RLIMIT_NICE` is expressed in the same units, so
+    /// "at most this nice" is "at least this rlimit value".
+    ///
+    /// Domain: `nice` is in `[MIN_NICE, MAX_NICE]`.
+    #[inline]
+    pub const fn nice_to_rlimit(nice: i32) -> i64 {
+        (MAX_NICE - nice + 1) as i64
     }
 
     #[inline]

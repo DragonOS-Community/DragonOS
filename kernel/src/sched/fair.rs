@@ -412,6 +412,17 @@ impl CfsRunQueue {
         self.rq.upgrade().unwrap()
     }
 
+    /// Number of runnable fair tasks on this runqueue, the currently running
+    /// one included. Linux spells this `cfs_rq->nr_running`.
+    ///
+    /// This is the counter that tells a priority change whether there is any
+    /// other fair task it could hand the CPU to; `h_nr_running` adds the
+    /// children of a task group, which DragonOS does not implement.
+    #[inline]
+    pub fn nr_running(&self) -> u64 {
+        self.nr_running
+    }
+
     #[inline]
     pub fn set_rq(&mut self, rq: Weak<CpuRunQueue>) {
         self.rq = rq;

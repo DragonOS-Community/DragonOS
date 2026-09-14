@@ -41,12 +41,14 @@ impl StatusFileOps {
             .unwrap()
     }
 
-    /// 生成 status 文件内容
+    /// Render the contents of `status` for the task this node points at.
+    ///
+    /// This mirrors Linux 6.6 `proc_pid_status()`, where the inode's `struct pid`
+    /// selects the task, so `/proc/<pid>/status` and `/proc/<pid>/task/<tid>/status`
+    /// share one implementation (`Tgid` still comes from the thread group). The
+    /// two selections differ only while `exec` hands the group over in de_thread.
     fn generate_status_content(&self) -> Result<Vec<u8>, SystemError> {
-        let pcb = self
-            .target
-            .thread_group_leader()
-            .ok_or(SystemError::ESRCH)?;
+        let pcb = self.target.task().ok_or(SystemError::ESRCH)?;
         let view_pid_ns = self.target.view_pid_ns();
         let mut pdata = Vec::new();
 

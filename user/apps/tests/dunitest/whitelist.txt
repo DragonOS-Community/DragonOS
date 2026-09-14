@@ -136,3 +136,4 @@ normal/elf_file_backing
 normal/exec_write_access
 
 normal/internal_shmem
+normal/proc_task_status

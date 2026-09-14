@@ -1242,21 +1242,49 @@ impl SelfConnected {
         }
     }
 
-    pub fn update_io_events(&self, pollee: &AtomicUsize) {
-        // Linux 6.6: tcp_poll() 只在 shutdown == SHUTDOWN_MASK 或 state == TCP_CLOSE 时才置
-        // EPOLLHUP。self-connect 在语义上等价于 ESTABLISHED，因此这里要清掉历史残留
-        // （套接字在 bind() 后即被 iface 通知，Init 分支会打上 EPOLLHUP），
-        // 与 Established::update_io_events() 中“已连接则清 HUP/RDHUP/ERR”的处理保持一致。
-        pollee.fetch_and(
-            !(EPollEventType::EPOLLHUP | EPollEventType::EPOLLRDHUP | EPollEventType::EPOLLERR)
-                .bits() as usize,
-            Ordering::Relaxed,
-        );
-
+    /// 重算 self-connect 套接字的就绪掩码。
+    ///
+    /// `recv_shutdown` 是外层 `TcpSocket` 记录的 `SHUT_RD` 状态（内层只跟踪发送侧）。
+    ///
+    /// Linux 6.6 `tcp_poll()` 的挂断语义：
+    /// ```c
+    ///     if (shutdown == SHUTDOWN_MASK || state == TCP_CLOSE)
+    ///         mask |= EPOLLHUP;
+    ///     if (shutdown & RCV_SHUTDOWN)
+    ///         mask |= EPOLLIN | EPOLLRDNORM | EPOLLRDHUP;
+    /// ```
+    /// self-connect 发出的 FIN 会回到自己（`tcp_fin()` 收到 FIN 时置 `RCV_SHUTDOWN`），
+    /// 因此 `SHUT_WR` 之后本端的 `sk_shutdown` 已经是 `SHUTDOWN_MASK`：读侧同时进入 EOF，
+    /// `poll()` 应报 `EPOLLRDHUP | EPOLLHUP`（Linux 实测为 `IN|OUT|HUP|RDHUP`）。
+    /// 只有 `SHUT_RD` 时是半关闭，只报 `EPOLLRDHUP`，不得报 `EPOLLHUP`。
+    /// 连接仍完全建立时必须清掉历史残留：套接字在 `bind()` 后即被 iface 通知，
+    /// `Init` 分支会打上 `EPOLLHUP`，不清理会让 `poll`/`epoll` 永久误报挂断。
+    /// `EPOLLERR` 在 self-connect 上没有产生路径，只清不置。
+    pub fn update_io_events(&self, pollee: &AtomicUsize, recv_shutdown: bool) {
         let state = self.state.lock();
-        let writable = !state.send_shutdown && state.buf.len() < state.rx_cap;
-        let readable = !state.buf.is_empty() || state.send_shutdown;
+        let send_shutdown = state.send_shutdown;
+        let writable = !send_shutdown && state.buf.len() < state.rx_cap;
+        let readable = !state.buf.is_empty() || send_shutdown;
         drop(state);
+
+        let read_shutdown = send_shutdown || recv_shutdown;
+
+        let hangup_bits =
+            (EPollEventType::EPOLLHUP | EPollEventType::EPOLLRDHUP | EPollEventType::EPOLLERR)
+                .bits() as usize;
+        let mut rebuilt = 0usize;
+        if read_shutdown {
+            rebuilt |= EPollEventType::EPOLLRDHUP.bits() as usize;
+        }
+        if send_shutdown {
+            // 自身 FIN 回环到读侧，`SHUT_WR` 之后 sk_shutdown 已是 SHUTDOWN_MASK。
+            rebuilt |= EPollEventType::EPOLLHUP.bits() as usize;
+        }
+
+        // 一次性清除并重建，避免清除与置位之间被并发观察到一个不存在的中间态。
+        let _ = pollee.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |bits| {
+            Some((bits & !hangup_bits) | rebuilt)
+        });
 
         if writable {
             pollee.fetch_or(

@@ -10,9 +10,8 @@
 //   3. once a thread is gone, the path must not serve another task.
 //
 // Pid/Tgid scoping by pid namespace is provided by ProcPidTarget and is not
-// covered here: a procfs mounted inside a new pid namespace does not let us
-// address its threads, for reasons tracked separately (see the design doc
-// docs/kernel/filesystem/proc/task-status-plan.md, section 8.2).
+// covered here: a procfs mounted inside a new pid namespace does not let this
+// suite address its threads.
 
 #include <gtest/gtest.h>
 
@@ -424,7 +423,7 @@ TEST(ProcTaskStatus, NonLeaderThreadStatusDescribesThread) {
     EXPECT_NE("0", Field(fields, "Tgid"));
     // A thread inherits its creator's parent, so this must agree with the
     // process view while the parent is alive. Reparenting only rewrites the
-    // group leader today, which is a separate pre-existing gap (doc 8.4).
+    // group leader today, which is a separate pre-existing gap.
     EXPECT_EQ(Field(ParseStatus(proc_before), "Ppid"), Field(fields, "Ppid"));
 
     // The thread state must come from the worker (blocked), not from the leader.

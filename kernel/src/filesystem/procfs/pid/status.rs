@@ -12,7 +12,7 @@ use crate::{
         },
         vfs::{FilePrivateData, IndexNode, InodeMode},
     },
-    process::pid::PidType,
+    process::{pid::PidType, RawPid},
 };
 use alloc::{
     borrow::ToOwned,
@@ -41,12 +41,14 @@ impl StatusFileOps {
             .unwrap()
     }
 
-    /// 生成 status 文件内容
+    /// Render the contents of `status` for the task this node points at.
+    ///
+    /// This mirrors Linux 6.6 `proc_pid_status()`, where the inode's `struct pid`
+    /// selects the task, so `/proc/<pid>/status` and `/proc/<pid>/task/<tid>/status`
+    /// share one implementation (`Tgid` still comes from the thread group). The
+    /// two selections differ only while `exec` hands the group over in de_thread.
     fn generate_status_content(&self) -> Result<Vec<u8>, SystemError> {
-        let pcb = self
-            .target
-            .thread_group_leader()
-            .ok_or(SystemError::ESRCH)?;
+        let pcb = self.target.task().ok_or(SystemError::ESRCH)?;
         let view_pid_ns = self.target.view_pid_ns();
         let mut pdata = Vec::new();
 
@@ -87,7 +89,15 @@ impl StatusFileOps {
         pdata.append(&mut format!("\nState:\t{:?}", state).as_bytes().to_owned());
 
         // Tgid
-        pdata.append(&mut format!("\nTgid:\t{}", self.target.tgid().data()).into());
+        //
+        // Mirror Linux 6.6 `task_tgid_nr_ns()` in proc_pid_status(): the group
+        // id is derived from the task pinned above, never from a second PID
+        // lookup. Re-resolving the link here would emit `Tgid:\t0` while `Pid`
+        // still names the task, if the thread detaches it in between.
+        let tgid = pcb
+            .task_pid_nr_ns(PidType::TGID, Some(view_pid_ns.clone()))
+            .unwrap_or(RawPid::new(0));
+        pdata.append(&mut format!("\nTgid:\t{}", tgid.data()).into());
 
         // Pid
         pdata.append(

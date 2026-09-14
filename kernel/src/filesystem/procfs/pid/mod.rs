@@ -121,6 +121,12 @@ impl ProcPidTarget {
         Some((cred.euid.data(), cred.egid.data()))
     }
 
+    /// Thread group id of this target in the view PID namespace.
+    ///
+    /// Re-resolves the `PidType::PID` link, so it yields 0 once the task
+    /// detaches that link. A procfs file that has already pinned `task()` must
+    /// derive `Tgid` from that task instead, the way Linux `proc_pid_status()`
+    /// reuses the pinned task through `task_tgid_nr_ns()`.
     pub fn tgid(&self) -> RawPid {
         self.thread_group_pid()
             .map(|pid| pid.pid_nr_ns(&self.view_pid_ns))

@@ -34,6 +34,10 @@ pub struct StatFileOps {
     scope: StatScope,
 }
 
+/// Which resource-usage accounting view `/proc/<pid>/stat` reports.
+///
+/// This only selects between process-wide and per-thread statistics; which task
+/// is rendered is always `target.task()`.
 #[derive(Clone, Copy, Debug)]
 pub enum StatScope {
     ThreadGroup,

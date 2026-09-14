@@ -454,7 +454,7 @@ impl TcpSocket {
             }
             Some(inner::Inner::SelfConnected(sc)) => {
                 sc.set_recv_buffer_size(rx_size);
-                sc.update_io_events(&self.pollee);
+                sc.update_io_events(&self.pollee, self.is_recv_shutdown());
             }
             Some(inner::Inner::Connecting(connecting)) => {
                 connecting.with_mut(|socket| {

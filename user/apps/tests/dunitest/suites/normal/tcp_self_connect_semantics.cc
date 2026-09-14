@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <pthread.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -131,6 +132,25 @@ struct SendAllResult {
     int error {0};
 };
 
+struct PollOutcome {
+    int ret;
+    short revents {0};
+};
+
+// poll(2) 中 POLLHUP/POLLERR 总是上报，POLLRDHUP 需要显式请求。
+constexpr int kPollEvents = POLLIN | POLLOUT | POLLRDHUP;
+
+PollOutcome PollNow(int socket_fd, int events) {
+    pollfd descriptor {};
+    descriptor.fd = socket_fd;
+    descriptor.events = static_cast<short>(events);
+    const int ret = poll(&descriptor, 1, 0);
+    PollOutcome outcome;
+    outcome.ret = ret;
+    outcome.revents = descriptor.revents;
+    return outcome;
+}
+
 SendAllResult SendAll(int socket_fd, const std::uint8_t* data, std::size_t length) {
     SendAllResult result;
     while (result.bytes_sent < length) {
@@ -223,6 +243,88 @@ TEST_P(TcpSelfConnectSemantics, ReceiveShutdownDoesNotEraseCurrentReadProgress) 
         << ErrnoString(errno);
     EXPECT_TRUE(std::equal(kPayload.begin(), kPayload.end(), buffer.begin()));
     EXPECT_EQ(recv(recv_socket_fd.Get(), buffer.data(), buffer.size(), 0), 0);
+}
+
+// self-connect 建立完成后，poll() 不得报告任何挂断位。
+// 套接字在 bind() 窗口期会被 iface 打上 POLLHUP，每次 poll 都必须按当前状态重算并清掉它，
+// 否则 poll(fd, POLLIN, 0) 会在整个连接生命周期内恒返回 1。
+TEST_P(TcpSelfConnectSemantics, PollReportsNoHangupWhileConnectionIsOpen) {
+    FdGuard socket_fd = CreateSelfConnectedSocket(GetParam());
+    ASSERT_GE(socket_fd.Get(), 0);
+
+    const PollOutcome outcome = PollNow(socket_fd.Get(), kPollEvents);
+    ASSERT_EQ(outcome.ret, 1) << "poll revents=" << outcome.revents;
+    EXPECT_NE(outcome.revents & POLLOUT, 0) << "revents=" << outcome.revents;
+    EXPECT_EQ(outcome.revents & (POLLHUP | POLLRDHUP | POLLERR), 0)
+        << "已建立的 self-connect 不得残留挂断位: revents=" << outcome.revents;
+}
+
+// self-connect 发出的 FIN 会回到自己（Linux tcp_fin() 收到 FIN 时置 RCV_SHUTDOWN），
+// 因此 SHUT_WR 之后本端 sk_shutdown 已经是 SHUTDOWN_MASK：
+// Linux 6.6 tcp_poll() 会同时报告 POLLRDHUP 与 POLLHUP（实测 revents=IN|OUT|HUP|RDHUP）。
+// 已排队的字节仍然可读，挂断位与“数据可读”不互斥。
+TEST_P(TcpSelfConnectSemantics, PollWriteShutdownReportsFullHangup) {
+    FdGuard socket_fd = CreateSelfConnectedSocket(GetParam());
+    ASSERT_GE(socket_fd.Get(), 0);
+
+    constexpr std::array<std::uint8_t, 6> kPayload {1, 2, 3, 4, 5, 6};
+    std::array<std::uint8_t, 16> buffer {};
+    ASSERT_EQ(send(socket_fd.Get(), kPayload.data(), kPayload.size(), 0),
+              static_cast<ssize_t>(kPayload.size()))
+        << "send before shutdown failed: " << ErrnoString(errno);
+    ASSERT_EQ(shutdown(socket_fd.Get(), SHUT_WR), 0)
+        << "shutdown(SHUT_WR) failed: " << ErrnoString(errno);
+
+    const PollOutcome outcome = PollNow(socket_fd.Get(), kPollEvents);
+    ASSERT_EQ(outcome.ret, 1) << "poll revents=" << outcome.revents;
+    EXPECT_NE(outcome.revents & POLLIN, 0) << "revents=" << outcome.revents;
+    EXPECT_NE(outcome.revents & POLLOUT, 0)
+        << "SHUT_WR 之后必须报告 POLLOUT，send() 才能被唤醒并返回 EPIPE: revents="
+        << outcome.revents;
+    EXPECT_NE(outcome.revents & POLLRDHUP, 0) << "revents=" << outcome.revents;
+    EXPECT_NE(outcome.revents & POLLHUP, 0)
+        << "自身 FIN 回环等价于双向关闭，必须报告 POLLHUP: revents=" << outcome.revents;
+    EXPECT_EQ(outcome.revents & POLLERR, 0) << "revents=" << outcome.revents;
+
+    ASSERT_EQ(read(socket_fd.Get(), buffer.data(), buffer.size()),
+              static_cast<ssize_t>(kPayload.size()))
+        << "SHUT_WR 不得丢弃已排队的读侧数据: " << ErrnoString(errno);
+    EXPECT_TRUE(std::equal(kPayload.begin(), kPayload.end(), buffer.begin()));
+    EXPECT_EQ(read(socket_fd.Get(), buffer.data(), buffer.size()), 0);
+}
+
+// SHUT_RD 只是半关闭：Linux 6.6 tcp_poll() 此时只置 RCV_SHUTDOWN，
+// 报告 POLLRDHUP（以及 POLLIN），不得报告 POLLHUP。
+TEST_P(TcpSelfConnectSemantics, PollReadShutdownReportsHalfClose) {
+    FdGuard socket_fd = CreateSelfConnectedSocket(GetParam());
+    ASSERT_GE(socket_fd.Get(), 0);
+
+    ASSERT_EQ(shutdown(socket_fd.Get(), SHUT_RD), 0)
+        << "shutdown(SHUT_RD) failed: " << ErrnoString(errno);
+
+    const PollOutcome outcome = PollNow(socket_fd.Get(), kPollEvents);
+    ASSERT_EQ(outcome.ret, 1) << "poll revents=" << outcome.revents;
+    EXPECT_NE(outcome.revents & POLLIN, 0) << "revents=" << outcome.revents;
+    EXPECT_NE(outcome.revents & POLLRDHUP, 0)
+        << "SHUT_RD 关闭读侧，必须报告 POLLRDHUP: revents=" << outcome.revents;
+    EXPECT_EQ(outcome.revents & POLLHUP, 0)
+        << "SHUT_RD 只是半关闭，不得报告 POLLHUP: revents=" << outcome.revents;
+    EXPECT_EQ(outcome.revents & POLLERR, 0) << "revents=" << outcome.revents;
+}
+
+// SHUT_RDWR 之后 sk_shutdown == SHUTDOWN_MASK，Linux 报告 POLLHUP|POLLRDHUP。
+TEST_P(TcpSelfConnectSemantics, PollDoubleShutdownReportsFullHangup) {
+    FdGuard socket_fd = CreateSelfConnectedSocket(GetParam());
+    ASSERT_GE(socket_fd.Get(), 0);
+
+    ASSERT_EQ(shutdown(socket_fd.Get(), SHUT_RDWR), 0)
+        << "shutdown(SHUT_RDWR) failed: " << ErrnoString(errno);
+
+    const PollOutcome outcome = PollNow(socket_fd.Get(), kPollEvents);
+    ASSERT_EQ(outcome.ret, 1) << "poll revents=" << outcome.revents;
+    EXPECT_NE(outcome.revents & POLLRDHUP, 0) << "revents=" << outcome.revents;
+    EXPECT_NE(outcome.revents & POLLHUP, 0) << "revents=" << outcome.revents;
+    EXPECT_EQ(outcome.revents & POLLERR, 0) << "revents=" << outcome.revents;
 }
 
 TEST_P(TcpSelfConnectSemantics, ConcurrentReadSendAndWriteShutdownCompletes) {

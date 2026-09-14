@@ -785,6 +785,21 @@ impl Listening {
     }
 
     pub fn update_io_events(&self, pollee: &AtomicUsize) {
+        // Linux 6.6: tcp_poll() 对 TCP_LISTEN 直接早返回 inet_csk_listen_poll()，其返回值
+        // 只可能是 EPOLLIN | EPOLLRDNORM（accept 队列非空）或 0 —— LISTEN 套接字的就绪掩码
+        // 每次都是重算的，永远不会出现 EPOLLHUP / EPOLLRDHUP / EPOLLERR。
+        //
+        // DragonOS 的 pollee 是累积式（置位/清除）的，所以必须显式清掉历史残留：
+        // 套接字在 bind() 后就注册进了 iface 的通知链，而那时它还处于 Init 状态，
+        // Init 分支按 Linux 非 LISTEN（TCP_CLOSE）的语义打过 EPOLLHUP。
+        // 不清理的话，这个 HUP 会粘滞整个 listen 生命周期，使
+        // poll(listen_fd, POLLIN, 0) 恒返回就绪（gVisor PollAroundAccept）。
+        pollee.fetch_and(
+            !(EPollEventType::EPOLLHUP | EPollEventType::EPOLLRDHUP | EPollEventType::EPOLLERR)
+                .bits() as usize,
+            core::sync::atomic::Ordering::Relaxed,
+        );
+
         // log::info!("Listening::update_io_events");
         let position = self.inners.iter().position(|inner| {
             inner.with::<smoltcp::socket::tcp::Socket, _, _>(|socket| socket.is_active())
@@ -1228,6 +1243,16 @@ impl SelfConnected {
     }
 
     pub fn update_io_events(&self, pollee: &AtomicUsize) {
+        // Linux 6.6: tcp_poll() 只在 shutdown == SHUTDOWN_MASK 或 state == TCP_CLOSE 时才置
+        // EPOLLHUP。self-connect 在语义上等价于 ESTABLISHED，因此这里要清掉历史残留
+        // （套接字在 bind() 后即被 iface 通知，Init 分支会打上 EPOLLHUP），
+        // 与 Established::update_io_events() 中“已连接则清 HUP/RDHUP/ERR”的处理保持一致。
+        pollee.fetch_and(
+            !(EPollEventType::EPOLLHUP | EPollEventType::EPOLLRDHUP | EPollEventType::EPOLLERR)
+                .bits() as usize,
+            Ordering::Relaxed,
+        );
+
         let state = self.state.lock();
         let writable = !state.send_shutdown && state.buf.len() < state.rx_cap;
         let readable = !state.buf.is_empty() || state.send_shutdown;

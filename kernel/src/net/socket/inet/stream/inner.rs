@@ -77,6 +77,7 @@ where
 pub struct TcpBinding {
     pub id: TcpBindId,
     pub local: smoltcp::wire::IpEndpoint,
+    family: smoltcp::wire::IpVersion,
     netns: Arc<NetNamespace>,
     released: AtomicBool,
     /// Linux SOCK_BINDPORT_LOCK: only an explicit nonzero bind preserves the
@@ -88,12 +89,14 @@ impl TcpBinding {
     fn new(
         id: TcpBindId,
         local: smoltcp::wire::IpEndpoint,
+        family: smoltcp::wire::IpVersion,
         netns: Arc<NetNamespace>,
         explicit_port: bool,
     ) -> Self {
         Self {
             id,
             local,
+            family,
             netns,
             released: AtomicBool::new(false),
             explicit_port,
@@ -139,6 +142,7 @@ impl TcpBinding {
         let id = TcpBindId::new();
         let port = self.netns.tcp_port_manager().bind_tcp_ephemeral_port(
             self.local.addr,
+            self.family,
             reuseaddr,
             reuseport,
             owner_uid,
@@ -147,6 +151,7 @@ impl TcpBinding {
         *self = Self::new(
             id,
             smoltcp::wire::IpEndpoint::new(self.local.addr, port),
+            self.family,
             self.netns.clone(),
             false,
         );
@@ -240,10 +245,7 @@ impl Init {
         match self {
             Init::Bound(Bound { inner, mut binding }) if binding.is_released() => {
                 let old_iface = inner.iface().clone();
-                let ver = match binding.local.addr {
-                    smoltcp::wire::IpAddress::Ipv4(_) => smoltcp::wire::IpVersion::Ipv4,
-                    smoltcp::wire::IpAddress::Ipv6(_) => smoltcp::wire::IpVersion::Ipv6,
-                };
+                let ver = binding.family;
                 let smoltcp::socket::Socket::Tcp(socket) = inner.into_socket() else {
                     unreachable!("TCP BoundInner should contain a TCP socket");
                 };
@@ -298,6 +300,7 @@ impl Init {
                 let bind_port = if local_endpoint.port == 0 {
                     match netns.tcp_port_manager().bind_tcp_ephemeral_port(
                         local_endpoint.addr,
+                        ver,
                         reuseaddr,
                         reuseport,
                         owner_uid,
@@ -315,6 +318,7 @@ impl Init {
                     if let Err(err) = netns.tcp_port_manager().bind_tcp_port(
                         local_endpoint.port,
                         local_endpoint.addr,
+                        ver,
                         reuseaddr,
                         reuseport,
                         owner_uid,
@@ -332,7 +336,13 @@ impl Init {
                 let final_endpoint = smoltcp::wire::IpEndpoint::new(local_endpoint.addr, bind_port);
                 Ok(Init::Bound(Bound {
                     inner: bound,
-                    binding: TcpBinding::new(id, final_endpoint, netns, local_endpoint.port != 0),
+                    binding: TcpBinding::new(
+                        id,
+                        final_endpoint,
+                        ver,
+                        netns,
+                        local_endpoint.port != 0,
+                    ),
                 }))
             }
             Init::Bound(_) => {
@@ -365,7 +375,7 @@ impl Init {
                 let id = TcpBindId::new();
                 let bound_port = match netns
                     .tcp_port_manager()
-                    .bind_tcp_ephemeral_port(address, reuseaddr, reuseport, owner_uid, id)
+                    .bind_tcp_ephemeral_port(address, ver, reuseaddr, reuseport, owner_uid, id)
                 {
                     Ok(port) => port,
                     Err(err) => {
@@ -378,7 +388,7 @@ impl Init {
                 let endpoint = smoltcp::wire::IpEndpoint::new(address, bound_port);
                 Ok(Bound {
                     inner: bound,
-                    binding: TcpBinding::new(id, endpoint, netns, false),
+                    binding: TcpBinding::new(id, endpoint, ver, netns, false),
                 })
             }
             Init::Bound(_) => Err((self, SystemError::EINVAL)),
@@ -603,10 +613,7 @@ impl Init {
             Init::Unbound((_, version)) => Closed::new(version),
             Init::Bound(Bound { inner, binding }) => {
                 binding.release();
-                let version = match binding.local.addr {
-                    smoltcp::wire::IpAddress::Ipv4(_) => smoltcp::wire::IpVersion::Ipv4,
-                    smoltcp::wire::IpAddress::Ipv6(_) => smoltcp::wire::IpVersion::Ipv6,
-                };
+                let version = binding.family;
                 let _ = inner.into_socket();
                 Closed::new(version)
             }
@@ -706,10 +713,7 @@ impl Connecting {
                     smoltcp::socket::Socket::Tcp(s) => s,
                     _ => panic!("Connecting socket is not TCP"),
                 };
-                let ver = match self.local.addr {
-                    smoltcp::wire::IpAddress::Ipv4(_) => smoltcp::wire::IpVersion::Ipv4,
-                    smoltcp::wire::IpAddress::Ipv6(_) => smoltcp::wire::IpVersion::Ipv6,
-                };
+                let ver = self.binding.family;
                 let err = match result {
                     ConnectResult::ShutdownReset | ConnectResult::ShutdownResetConsumed => {
                         SystemError::ECONNRESET

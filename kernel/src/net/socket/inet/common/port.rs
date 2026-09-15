@@ -1,7 +1,7 @@
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use hashbrown::HashMap;
-use smoltcp::wire::IpAddress;
+use smoltcp::wire::{IpAddress, IpVersion};
 use system_error::SystemError;
 
 use crate::{arch::rand::rand, libs::mutex::Mutex, process::ProcessManager};
@@ -84,6 +84,7 @@ impl PortManager {
     pub fn bind_tcp_ephemeral_port(
         &self,
         addr: IpAddress,
+        family: IpVersion,
         reuseaddr: bool,
         reuseport: bool,
         uid: u32,
@@ -97,7 +98,7 @@ impl PortManager {
         let mut remaining = range;
         while remaining > 0 {
             let port = self.get_ephemeral_port(Types::Tcp)?;
-            match self.bind_tcp_port(port, addr, reuseaddr, reuseport, uid, id) {
+            match self.bind_tcp_port(port, addr, family, reuseaddr, reuseport, uid, id) {
                 Ok(()) => return Ok(port),
                 Err(SystemError::EADDRINUSE) => {
                     // Race: another thread grabbed the port after we checked.
@@ -115,6 +116,7 @@ impl PortManager {
         &self,
         port: u16,
         addr: IpAddress,
+        family: IpVersion,
         reuseaddr: bool,
         reuseport: bool,
         uid: u32,
@@ -125,6 +127,7 @@ impl PortManager {
         }
         let member = TcpPortBinding {
             addr,
+            family,
             reuseaddr,
             reuseport,
             uid,
@@ -165,8 +168,7 @@ impl PortManager {
         if !bucket.members[index].listening {
             static LISTEN_ORDER: AtomicU64 = AtomicU64::new(1);
             candidate.listen_order = LISTEN_ORDER.fetch_add(1, Ordering::Relaxed);
-            candidate.hash_tail =
-                candidate.addr.version() == smoltcp::wire::IpVersion::Ipv6 && candidate.reuseport;
+            candidate.hash_tail = candidate.family == IpVersion::Ipv6 && candidate.reuseport;
             if candidate.reuseport {
                 // Linux chooses an existing group through a currently reuseport-
                 // enabled listener; membership itself survives option changes.
@@ -179,6 +181,7 @@ impl PortManager {
                             && m.reuseport
                             && m.uid == candidate.uid
                             && m.addr == candidate.addr
+                            && m.family == candidate.family
                     })
                     .max_by_key(|m| m.lookup_order())
                 {
@@ -278,6 +281,8 @@ impl TcpBindId {
 #[derive(Debug, Clone)]
 struct TcpPortBinding {
     addr: IpAddress,
+    // Socket family survives IPv4-mapped address normalization.
+    family: IpVersion,
     reuseaddr: bool,
     reuseport: bool,
     uid: u32,
@@ -326,12 +331,13 @@ impl TcpPortBucket {
             return false;
         };
         // Exact and wildcard address layers are resolved by the stack. Within
-        // one layer use the first listener in Linux hash-list order.
+        // one layer Linux prefers AF_INET to mapped AF_INET6, then uses
+        // hash-list order. Groups never cross socket families.
         let first = self
             .members
             .iter()
             .filter(|m| m.listening && m.addr == member.addr)
-            .max_by_key(|m| m.lookup_order())
+            .max_by_key(|m| (m.family == IpVersion::Ipv4, m.lookup_order()))
             .expect("active member must have a listener in its address layer");
         if first.reuseport {
             match first.group {
@@ -436,8 +442,60 @@ mod tests {
         uid: u32,
     ) -> Result<TcpBindId, SystemError> {
         let id = TcpBindId::new();
-        pm.bind_tcp_port(PORT, addr, ra, rp, uid, id)?;
+        pm.bind_tcp_port(PORT, addr, addr.version(), ra, rp, uid, id)?;
         Ok(id)
+    }
+
+    // The syscall layer normalizes mapped IPv6 addresses before admission.
+    fn bind_family(pm: &PortManager, family: smoltcp::wire::IpVersion) -> TcpBindId {
+        let id = TcpBindId::new();
+        pm.bind_tcp_port(PORT, loopback(), family, false, true, 1000, id)
+            .unwrap();
+        id
+    }
+
+    #[test]
+    fn ipv4_beats_mapped_ipv6_in_both_listen_orders() {
+        use smoltcp::wire::IpVersion::{Ipv4, Ipv6};
+        for ipv6_first in [false, true] {
+            let pm = PortManager::default();
+            let a = bind_family(&pm, Ipv4);
+            let b = bind_family(&pm, Ipv6);
+            for id in if ipv6_first { [b, a] } else { [a, b] } {
+                pm.listen_tcp_port(PORT, id).unwrap();
+            }
+            {
+                let table = pm.tcp_port_table.lock();
+                assert!(table[&PORT].listener_is_selected(a.get()));
+                assert!(!table[&PORT].listener_is_selected(b.get()));
+            }
+            pm.stop_tcp_listen(PORT, a);
+            assert!(pm.tcp_port_table.lock()[&PORT].listener_is_selected(b.get()));
+            pm.listen_tcp_port(PORT, a).unwrap();
+            assert!(!pm.tcp_port_table.lock()[&PORT].listener_is_selected(b.get()));
+        }
+    }
+
+    #[test]
+    fn mapped_group_survives_ipv4_priority_and_member_close() {
+        use smoltcp::wire::IpVersion::{Ipv4, Ipv6};
+        let pm = PortManager::default();
+        let a = bind_family(&pm, Ipv6);
+        let b = bind_family(&pm, Ipv6);
+        let v4 = bind_family(&pm, Ipv4);
+        for id in [a, v4, b] {
+            pm.listen_tcp_port(PORT, id).unwrap();
+        }
+        pm.stop_tcp_listen(PORT, v4);
+        {
+            let table = pm.tcp_port_table.lock();
+            assert!(table[&PORT].listener_is_selected(a.get()));
+            assert!(table[&PORT].listener_is_selected(b.get()));
+        }
+        pm.unbind_tcp_port(PORT, a);
+        assert!(pm.tcp_port_table.lock()[&PORT].listener_is_selected(b.get()));
+        pm.listen_tcp_port(PORT, v4).unwrap();
+        assert!(!pm.tcp_port_table.lock()[&PORT].listener_is_selected(b.get()));
     }
 
     #[test]

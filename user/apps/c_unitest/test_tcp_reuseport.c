@@ -689,6 +689,54 @@ static void test_different_uid(void)
     close_fd(&listener);
 }
 
+/* Keep family separate from the transport address: both listen on IPv4
+ * loopback, but only AF_INET should receive until that listener closes. */
+static int mapped_family_case(bool ipv6_first)
+{
+    int listeners[2] = {-1, -1};
+    int client = -1, accepted = -1, ok = 0;
+    uint16_t port = 0;
+    struct sockaddr_in6 mapped = {0};
+
+    listeners[0] = make_bound(AF_INET, false, 0, 0, 1, &port);
+    listeners[1] = socket(AF_INET6, SOCK_STREAM, 0);
+    mapped.sin6_family = AF_INET6;
+    mapped.sin6_port = htons(port);
+    if (listeners[0] < 0 || listeners[1] < 0 ||
+        inet_pton(AF_INET6, "::ffff:127.0.0.1", &mapped.sin6_addr) != 1 ||
+        set_bool_opt(listeners[1], SO_REUSEPORT, 1) < 0 ||
+        bind(listeners[1], (struct sockaddr *)&mapped, sizeof(mapped)) < 0 ||
+        listen(listeners[ipv6_first ? 1 : 0], 4) < 0 ||
+        listen(listeners[ipv6_first ? 0 : 1], 4) < 0)
+        goto out;
+    for (int i = 0; i < DISTRIBUTION_SAMPLES; i++) {
+        client = connect_loopback(AF_INET, port);
+        if (client < 0 || accept_selected(listeners, 2, &accepted) != 0)
+            goto out;
+        close_fd(&accepted);
+        close_fd(&client);
+    }
+    close_fd(&listeners[0]);
+    client = connect_loopback(AF_INET, port);
+    if (client < 0 || accept_selected(&listeners[1], 1, &accepted) != 0)
+        goto out;
+    ok = 1;
+out:
+    if (!ok)
+        fail_errno("mapped family selection");
+    close_fd(&accepted);
+    close_fd(&client);
+    close_fd(&listeners[0]);
+    close_fd(&listeners[1]);
+    return ok;
+}
+
+static void test_mapped_family_priority(void)
+{
+    result("AF_INET wins when mapped AF_INET6 listens first", mapped_family_case(true));
+    result("AF_INET wins when mapped AF_INET6 listens last", mapped_family_case(false));
+}
+
 static void timeout_handler(int signo)
 {
     (void)signo;
@@ -719,6 +767,7 @@ int main(void)
     test_shutdown_relisten();
     test_dynamic_options();
     test_different_uid();
+    test_mapped_family_priority();
 
     alarm(0);
     printf("Summary: PASS=%d FAIL=%d SKIP=%d\n", passed, failed, skipped);

@@ -1,5 +1,47 @@
 # TCP SO_REUSEPORT 验证记录
 
+## 2026-09-15：两项 P2 回归修复
+
+本轮以 `d6658cd0` / smoltcp `3e0cfb4` 为基线，已按语义拆分为本地提交，未推送。
+
+- `8cf9a856`：保留 socket family、修正监听组与选择优先级，附对应回归。
+- `d31a375f`：创建时从 fsuid 捕获所有者，附凭证切换回归。
+- 本验证记录单独提交；提交整理未改变已验收的实现和测试内容。
+
+- 原始 socket family 独立于归一化传输地址，贯穿显式绑定、自动绑定、释放后续租、
+  重绑及连接失败恢复。只有同 family 的监听器可以合组；同一 IPv4 地址层优先选择
+  AF_INET，然后才按原有 hash-list 顺序选择组。端口共享准入仍允许跨 family，
+  smoltcp 的地址分层、已有四元组和满载不 fallback 逻辑保持不变。
+- socket 创建时从 `fsuid` 捕获 owner；后续凭证变化不改变该所有者。
+- Linux 6.6 一手依据：
+  [inet_reuseport_add_sock / compute_score / __inet_hash](https://raw.githubusercontent.com/torvalds/linux/v6.6/net/ipv4/inet_hashtables.c)、
+  [sock_alloc](https://raw.githubusercontent.com/torvalds/linux/v6.6/net/socket.c)、
+  [inet_csk_bind_conflict](https://raw.githubusercontent.com/torvalds/linux/v6.6/net/ipv4/inet_connection_sock.c)。
+
+回归证据：
+
+- family 修复前真实 PortManager 测试：16 通过、1 失败，失败断言为 mapped IPv6
+  监听器不应同时被选中。日志 `/tmp/reuseport-p2-port-red.log`。
+- 最终 PortManager：18 通过；新增两种 listen 顺序、停止/重启 AF_INET、
+  mapped 同 family 组成员存续测试。日志 `/tmp/reuseport-p2-port-final.log`。
+- C 回归新增 6 项：两种 listen 顺序各 80 次 IPv4 连接均由 AF_INET 接收，
+  随后关闭 AF_INET 验证 mapped 监听器接管；4 项凭证测试覆盖 fsuid/euid 分离及
+  socket 创建后的两种 fsuid 切换方向。root 下凭证设置失败计失败，不静默跳过。
+- Linux root 对照：19 通过、0 失败、0 跳过。
+  日志 `/tmp/reuseport-p2-linux-root-final.log`。
+- DragonOS fsuid 修复前：16 通过、3 失败、0 跳过，退出码 1；
+  三个失败分别为不同 fsuid 拒绝、相同 fsuid 允许、创建后恢复 fsuid 不改变所有者。
+  日志 `/tmp/reuseport-p2-guest-red.log`。
+- 最终 `make kernel`：通过；日志 `/tmp/reuseport-p2-kernel-final.log`。
+- DragonOS 最终 C 回归：19 通过、0 失败、0 跳过，退出码 0；
+  日志 `/tmp/reuseport-p2-guest-green.log`。fsuid 修复前的三个失败全部转绿。
+- 测试内核 SHA256：`346a14f00e38f971b1f9f3d02ca97bc26825b3efeecd9a788212f04c63a9aea6`。
+  guest 与安装目录测试程序 SHA256 一致：
+  `57255d1eec307e4e7fcb9a83110a2b6cfd66e7efbd9e960e22f2c18b0eba82fc`。
+- guest 使用仓库 `make qemu-nographic` 入口、KVM、snapshot 和独立串口执行
+  `/bin/test_tcp_reuseport`，不启动 GUI，也不把 C 程序包装为 gtest。
+- 本轮未修改 smoltcp，未重复其全量测试或默认 gVisor 白名单；验证重点为上述专项。
+
 ## 原子提交整理
 
 2026-09-12：以主仓库 `7edf3e48` 和 smoltcp `ebeaec6` 为基线拆分本地提交。

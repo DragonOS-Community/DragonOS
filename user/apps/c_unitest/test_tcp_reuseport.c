@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/fsuid.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -737,6 +738,67 @@ static void test_mapped_family_priority(void)
     result("AF_INET wins when mapped AF_INET6 listens last", mapped_family_case(false));
 }
 
+/* Each child changes its credentials independently. The parent listener's
+ * creation-time fsuid is zero; bind/listen must compare socket owners. */
+static void test_fsuid_ownership(void)
+{
+    const char *names[] = {
+        "equal euid but different fsuid rejects reuseport",
+        "different euid but equal fsuid permits reuseport",
+        "restoring fsuid after socket creation does not change its owner",
+        "changing fsuid after socket creation does not change its owner",
+    };
+    if (geteuid() != 0 || setfsuid((uid_t)-1) != 0) {
+        for (int i = 0; i < 4; i++)
+            skip(names[i], "requires initial root euid and fsuid");
+        return;
+    }
+    for (int i = 0; i < 4; i++) {
+        uint16_t port = 0;
+        int listener = make_bound(AF_INET, false, 0, 0, 1, &port);
+        if (listener < 0 || listen(listener, 4) < 0) {
+            result(names[i], 0);
+            close_fd(&listener);
+            continue;
+        }
+        pid_t child = fork();
+        if (child == 0) {
+            int peer;
+            /* Both requested fsuids are in real/effective/saved IDs. This
+             * does not rely on privileged arbitrary setfsuid support. */
+            if (setresuid(65534, i == 1 ? 65534 : 0, 0) < 0)
+                _exit(2);
+            uid_t creation_fsuid = (i == 0 || i == 2) ? 65534 : 0;
+            setfsuid(creation_fsuid);
+            if ((uid_t)setfsuid((uid_t)-1) != creation_fsuid)
+                _exit(2);
+            peer = socket(AF_INET, SOCK_STREAM, 0);
+            if (peer < 0 || set_bool_opt(peer, SO_REUSEPORT, 1) < 0)
+                _exit(3);
+            if (i >= 2) {
+                uid_t bind_fsuid = i == 2 ? 0 : 65534;
+                setfsuid(bind_fsuid);
+                if ((uid_t)setfsuid((uid_t)-1) != bind_fsuid)
+                    _exit(2);
+            }
+            int rc = bind_addr(peer, AF_INET, false, port);
+            if (i == 0 || i == 2)
+                _exit(rc < 0 && errno == EADDRINUSE ? 0 : 1);
+            _exit(rc == 0 && listen(peer, 4) == 0 ? 0 : 1);
+        }
+        int status = 0;
+        pid_t waited;
+        do {
+            waited = child < 0 ? -1 : waitpid(child, &status, 0);
+        } while (waited < 0 && errno == EINTR);
+        /* Root-capable tests fail on credential setup errors instead of
+         * silently skipping the regression they are intended to cover. */
+        result(names[i], waited == child && child > 0 &&
+               WIFEXITED(status) && WEXITSTATUS(status) == 0);
+        close_fd(&listener);
+    }
+}
+
 static void timeout_handler(int signo)
 {
     (void)signo;
@@ -768,6 +830,7 @@ int main(void)
     test_dynamic_options();
     test_different_uid();
     test_mapped_family_priority();
+    test_fsuid_ownership();
 
     alarm(0);
     printf("Summary: PASS=%d FAIL=%d SKIP=%d\n", passed, failed, skipped);

@@ -186,7 +186,9 @@ impl TcpSocket {
             self_ref: me.clone(),
             pollee: AtomicUsize::new(pollee_bits),
             netns,
-            owner_uid: ProcessManager::current_pcb().cred().euid.data() as u32,
+            // Linux sock_alloc initializes socket ownership from current_fsuid.
+            // Keep this creation-time owner across later credential changes.
+            owner_uid: ProcessManager::current_pcb().cred().fsuid.data() as u32,
             epoll_items: EPollItems::default(),
             fasync_items: FAsyncItems::default(),
             options: TcpSocketOptions::new(),

@@ -95,6 +95,10 @@ impl ProcfsSeq {
 /// how much a seq file buffers. Bounding a slice the same way keeps a large read
 /// from turning into a large per-fd buffer for a record source that can render
 /// arbitrarily much, such as the mapping table of `/proc/[pid]/maps`.
+///
+/// Only an incremental source is held to it: the sources that render one whole
+/// record ([`proc_read_snapshot()`], i.e. Linux `single_open()`) put that record
+/// in the fd's buffer in one piece, which is what makes an fd a snapshot of it.
 const SEQ_SLICE_MAX: usize = MMArch::PAGE_SIZE;
 
 /// Serves one procfs record the way Linux `seq_read_iter()` does.
@@ -106,10 +110,12 @@ const SEQ_SLICE_MAX: usize = MMArch::PAGE_SIZE;
 ///
 /// `source` is handed the cursor of the previous slice (`None` for the first
 /// slice of a record), how many bytes the reader still wants, and an empty
-/// buffer to render into. The wanted byte count is an upper bound on the slice,
-/// never more than [`SEQ_SLICE_MAX`], so an incremental source may have to be
-/// entered several times before one read is satisfied. It returns the cursor to
-/// resume from, or `None` when the record ends after this slice.
+/// buffer to render into. The wanted byte count is a budget, never more than
+/// [`SEQ_SLICE_MAX`]: an incremental source stops after roughly that much and is
+/// entered again for the next slice, so one read may need several slices, while
+/// a source that renders one whole record ignores the budget on purpose. The
+/// source returns the cursor to resume from, or `None` when the record ends
+/// after this slice.
 ///
 /// Position rules mirror `seq_read_iter()`/`seq_lseek()`:
 /// - `offset == 0`: rewind, so the record is rendered again;
@@ -120,8 +126,8 @@ const SEQ_SLICE_MAX: usize = MMArch::PAGE_SIZE;
 /// - a seek past the end of the record parks the fd at the requested offset, so
 ///   reading there reports EOF instead of rendering the record again.
 ///
-/// An empty request (`len == 0`, or a full buffer) returns 0 without touching
-/// the fd, and a source that fails after this call already copied bytes out
+/// An empty request (`len == 0`, or a full buffer) returns 0 without rendering
+/// anything, and a source that fails after this call already copied bytes out
 /// still reports those bytes, as `seq_read_iter()` returns `copied` and discards
 /// the error once it copied something.
 pub(super) fn proc_read_seq<F>(

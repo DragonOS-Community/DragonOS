@@ -8,7 +8,10 @@ use system_error::SystemError;
 
 use crate::{
     libs::once::Once,
-    process::{cred::Cred, namespace::pid_namespace::INIT_PID_NAMESPACE, ProcessManager},
+    process::{
+        cred::Cred, namespace::net_namespace::NetNamespace,
+        namespace::pid_namespace::INIT_PID_NAMESPACE, ProcessManager,
+    },
 };
 
 use super::vfs::mount::MountFlags;
@@ -61,7 +64,7 @@ pub struct ProcfsFilePrivateData {
     /// still tears the mappings down while this fd stays open. Each read
     /// re-checks the user count (`mmget_not_zero()`), which is how both files
     /// learn that there is nothing left to serve.
-    pub pinned_vm: Option<Arc<AddressSpace>>,
+    pub(crate) pinned_vm: Option<Arc<AddressSpace>>,
     /// Streaming state of a seq-style record (Linux `struct seq_file`). Only
     /// `utils::proc_read_seq()` and `utils::proc_read_snapshot()` touch it.
     pub(crate) seq: utils::ProcfsSeq,
@@ -69,6 +72,10 @@ pub struct ProcfsFilePrivateData {
     /// `/proc/[pid]/{mounts,mountinfo,mountstats}`, as `mounts_open_common()`
     /// does; `None` for every other procfs file.
     pub(crate) mount_view: Option<MountView>,
+    /// Network namespace pinned by `open()` for the files under `/proc/net`,
+    /// as `seq_open_net()` stores it in `seq_net_private`; `None` for every
+    /// other procfs file.
+    pub(crate) net_ns: Option<Arc<NetNamespace>>,
 }
 
 impl ProcfsFilePrivateData {
@@ -78,6 +85,7 @@ impl ProcfsFilePrivateData {
             pinned_vm: None,
             seq: utils::ProcfsSeq::default(),
             mount_view: None,
+            net_ns: None,
         }
     }
 }

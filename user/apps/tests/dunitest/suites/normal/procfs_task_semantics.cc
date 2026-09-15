@@ -1,6 +1,7 @@
 // procfs task semantics (issue #2283).
 //
-// Three behaviours are pinned here, each against the Linux 6.6 model:
+// The behaviours pinned here follow the Linux 6.6 model, one section per
+// thread of the analysis:
 //
 //   1. one fd sees one record. Linux serves these files through
 //      single_open()/seq_read_iter(), so a read() that reached EOF keeps
@@ -12,7 +13,10 @@
 //      so /proc/<pid>/task/<tid>/status and /proc/<pid>/status agree on Ppid;
 //   3. /proc/<nr> resolves any task that still holds a PID link (Linux
 //      proc_pid_lookup() -> find_task_by_pid_ns()), while /proc *lists* group
-//      leaders only (Linux next_tgid()).
+//      leaders only (Linux next_tgid()). Everything below such a directory
+//      reads the task it names: the fd and fdinfo subtrees walk its files
+//      table, mounts/mountinfo render its root, and stat reports whole
+//      thread-group accounting even for a hidden tid.
 //
 // Companion analysis:
 //   docs/kernel/filesystem/proc/procfs-task-semantics-root-cause.md
@@ -34,6 +38,7 @@
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -272,84 +277,6 @@ private:
     std::string saved_;
 };
 
-// Long-lived worker thread: publishes its tid, then blocks until the owner
-// closes the release pipe. The destructor always joins, so a failing ASSERT
-// cannot leave a blocked thread behind for the next case.
-class Worker {
-public:
-    Worker() = default;
-    ~Worker() { Stop(); }
-    Worker(const Worker&) = delete;
-    Worker& operator=(const Worker&) = delete;
-
-    bool Start() {
-        if (pipe(ready_) != 0 || pipe(release_) != 0) {
-            return false;
-        }
-        if (pthread_create(&thread_, nullptr, Main, this) != 0) {
-            return false;
-        }
-        started_ = true;
-        char byte = 0;
-        ssize_t n = 0;
-        do {
-            n = read(ready_[0], &byte, 1);
-        } while (n < 0 && errno == EINTR);
-        if (n != 1) {
-            Stop();
-            return false;
-        }
-        return true;
-    }
-
-    void Stop() {
-        if (release_[0] >= 0) {
-            close(release_[0]);
-            release_[0] = -1;
-        }
-        if (release_[1] >= 0) {
-            close(release_[1]);
-            release_[1] = -1;
-        }
-        if (started_) {
-            pthread_join(thread_, nullptr);
-            started_ = false;
-        }
-        if (ready_[0] >= 0) {
-            close(ready_[0]);
-            ready_[0] = -1;
-        }
-        if (ready_[1] >= 0) {
-            close(ready_[1]);
-            ready_[1] = -1;
-        }
-    }
-
-    long tid() const { return tid_; }
-
-private:
-    static void* Main(void* arg) {
-        Worker* self = static_cast<Worker*>(arg);
-        prctl(PR_SET_NAME, "worker", 0, 0, 0);
-        self->tid_ = GetTid();
-        const char ready = 'r';
-        if (write(self->ready_[1], &ready, 1) != 1) {
-            return nullptr;
-        }
-        char buf[8];
-        while (read(self->release_[0], buf, sizeof(buf)) > 0) {
-        }
-        return nullptr;
-    }
-
-    int ready_[2] = {-1, -1};
-    int release_[2] = {-1, -1};
-    long tid_ = 0;
-    pthread_t thread_ = {};
-    bool started_ = false;
-};
-
-
 // Reads one line with 1-byte reads, leaving the fd on a line boundary.
 bool ReadLine(int fd, std::string* line) {
     line->clear();
@@ -493,6 +420,133 @@ bool ReadRaw(int fd, void* data, size_t len) {
     }
     return true;
 }
+
+/// Channels a probe thread exchanges with its owner: one fixed-size report out,
+/// a park until the release pipe reports EOF, and the owner's own argument, the
+/// way pthread_create() hands one to a start routine.
+struct ProbePayload {
+    int report_wfd;
+    int release_rfd;
+    void* arg;
+};
+
+/// Blocks until the owner closes the release pipe.
+void ParkUntilReleased(int release_rfd) {
+    char buf[8];
+    while (read(release_rfd, buf, sizeof(buf)) > 0) {
+    }
+}
+
+/// Owns a probe thread, the pipes it reports over, and a join that always runs,
+/// so a failed assertion cannot leave the thread parked behind the case.
+///
+/// Prepare() opens the pipes before Launch() starts the body, so a body that
+/// needs to name a pipe descriptor can be handed it in its argument. The table
+/// is shared with the thread, so a body that gave itself a private copy has to
+/// close its own copy of the release write end, or the park below can never see
+/// the owner release it.
+class ProbeThread {
+public:
+    using Body = void* (*)(void*);
+
+    ProbeThread() = default;
+    ~ProbeThread() { Stop(); }
+    ProbeThread(const ProbeThread&) = delete;
+    ProbeThread& operator=(const ProbeThread&) = delete;
+
+    bool Prepare() {
+        if (pipe(report_) != 0 || pipe(release_) != 0) {
+            return false;
+        }
+        payload_.report_wfd = report_[1];
+        payload_.release_rfd = release_[0];
+        return true;
+    }
+
+    /// The descriptor a body has to leave alone, or close in a private copy of
+    /// the table, to make the parked thread release.
+    int release_write_fd() const { return release_[1]; }
+
+    bool Launch(Body body, void* arg) {
+        payload_.arg = arg;
+        if (pthread_create(&thread_, nullptr, body, &payload_) != 0) {
+            return false;
+        }
+        started_ = true;
+        return true;
+    }
+
+    /// The thread's fixed-size report. The pipes stay open until Stop(), the
+    /// way the descriptor table is shared with the thread.
+    bool ReadReport(void* out, size_t len) { return ReadRaw(report_[0], out, len); }
+
+    void Stop() {
+        if (release_[1] >= 0) {
+            close(release_[1]);
+            release_[1] = -1;
+        }
+        if (started_) {
+            pthread_join(thread_, nullptr);
+            started_ = false;
+        }
+        for (int i = 0; i < 2; ++i) {
+            if (report_[i] >= 0) {
+                close(report_[i]);
+                report_[i] = -1;
+            }
+            if (release_[i] >= 0) {
+                close(release_[i]);
+                release_[i] = -1;
+            }
+        }
+    }
+
+private:
+    ProbePayload payload_ = {-1, -1, nullptr};
+    int report_[2] = {-1, -1};
+    int release_[2] = {-1, -1};
+    pthread_t thread_ = {};
+    bool started_ = false;
+};
+
+/// Names itself "worker", publishes its tid, then parks: the plain probe thread
+/// the tid-addressed cases send in.
+void* TidWorker(void* arg) {
+    ProbePayload* payload = static_cast<ProbePayload*>(arg);
+    prctl(PR_SET_NAME, "worker", 0, 0, 0);
+    const long tid = GetTid();
+    WriteRaw(payload->report_wfd, &tid, sizeof(tid));
+    ParkUntilReleased(payload->release_rfd);
+    return nullptr;
+}
+
+/// Long-lived worker thread: publishes its tid, then blocks until the owner
+/// closes the release pipe. The destructor always joins, so a failing ASSERT
+/// cannot leave a blocked thread behind for the next case.
+class Worker {
+public:
+    Worker() = default;
+    ~Worker() { Stop(); }
+    Worker(const Worker&) = delete;
+    Worker& operator=(const Worker&) = delete;
+
+    bool Start() {
+        if (!probe_.Prepare() || !probe_.Launch(TidWorker, nullptr) ||
+            !probe_.ReadReport(&tid_, sizeof(tid_))) {
+            Stop();
+            return false;
+        }
+        return true;
+    }
+
+    void Stop() { probe_.Stop(); }
+
+    long tid() const { return tid_; }
+
+private:
+    ProbeThread probe_;
+    long tid_ = 0;
+};
 
 bool WaitForExit(pid_t pid) {
     for (int i = 0; i < kPollTimeoutMs / 10; ++i) {
@@ -802,7 +856,7 @@ TEST(ProcfsTaskSemantics, OomScoreAdjStaysStream) {
 // 2. thread-level re-parenting
 // ---------------------------------------------------------------------------
 
-struct ReparentReport {
+struct GroupReparentReport {
     long original_parent;
     long new_parent;
     long leader_ppid;
@@ -810,69 +864,49 @@ struct ReparentReport {
     long worker_tid;
 };
 
-// Publishes the worker's tid over a pipe and then stays alive long enough for
-// the owner to observe the thread group.
-void* PublishTidWorker(void* arg) {
-    const int wfd = *static_cast<const int*>(arg);
-    prctl(PR_SET_NAME, "worker", 0, 0, 0);
-    const long tid = GetTid();
-    const ssize_t ignored = write(wfd, &tid, sizeof(tid));
-    (void)ignored;
-    for (int i = 0; i < 400; ++i) {
-        usleep(25000);
-    }
-    return nullptr;
-}
-
-// Read a `long` published by PublishTidWorker; -1 when the pipe closed short.
-long ReadPublishedTid(int rfd) {
-    long tid = 0;
-    size_t got = 0;
-    while (got < sizeof(tid)) {
-        const ssize_t n = read(rfd, reinterpret_cast<char*>(&tid) + got, sizeof(tid) - got);
-        if (n <= 0) {
-            break;
-        }
-        got += static_cast<size_t>(n);
-    }
-    return got == sizeof(tid) ? tid : -1;
-}
-
 // When a thread group is re-parented, every thread must report the new parent:
 // /proc/<pid>/task/<tid>/status used to keep the dead parent while
 // /proc/<pid>/status reported the adopter.
+//
+// The parent is not put to sleep and hoped to still be there: it waits on a
+// pipe until the group has read the Ppid that names it and has its second
+// thread parked, so the observation cannot lose the race against the exit that
+// triggers the re-parenting.
 TEST(ProcfsTaskSemantics, ThreadPpidFollowsGroupReparent) {
-    int pipefd[2];
-    ASSERT_EQ(0, pipe(pipefd)) << "pipe failed: errno=" << errno;
+    int ready[2];
+    int report[2];
+    ASSERT_EQ(0, pipe(ready)) << "pipe failed: errno=" << errno;
+    ASSERT_EQ(0, pipe(report)) << "pipe failed: errno=" << errno;
 
-    const pid_t top = fork();
-    ASSERT_GE(top, 0) << "fork failed: errno=" << errno;
-    if (top == 0) {
-        close(pipefd[0]);
-        const pid_t mid = fork();
-        if (mid == 0) {
-            int tidpipe[2];
-            if (pipe(tidpipe) != 0) {
+    const pid_t dying = fork();
+    ASSERT_GE(dying, 0) << "fork failed: errno=" << errno;
+    if (dying == 0) {
+        // This process only exists to die: its exit is what re-parents the
+        // group below. The pipes are duplicated into that group, so the
+        // descriptors this process does not need are closed only after the
+        // fork that created it.
+        close(report[0]);
+        const pid_t group = fork();
+        if (group == 0) {
+            close(ready[0]);
+            GroupReparentReport rep = {};
+            Worker worker;
+            if (!worker.Start()) {
                 _exit(3);
             }
-            pthread_t th;
-            if (pthread_create(&th, nullptr, PublishTidWorker, &tidpipe[1]) != 0) {
-                _exit(3);
-            }
-            const long worker_tid = ReadPublishedTid(tidpipe[0]);
-            close(tidpipe[0]);
-            close(tidpipe[1]);
-            if (worker_tid <= 0) {
-                _exit(3);
-            }
-
-            ReparentReport rep = {};
-            rep.worker_tid = worker_tid;
+            rep.worker_tid = worker.tid();
             rep.original_parent = getppid();
-            for (int i = 0; i < 2000; ++i) {
-                if (getppid() != rep.original_parent) {
-                    break;
-                }
+
+            // Let the parent go only now that `original_parent` is sampled, and
+            // keep the second thread parked until both views were read back, so
+            // neither number can be lost to a dead target.
+            const char go = 'g';
+            if (write(ready[1], &go, 1) != 1) {
+                _exit(3);
+            }
+            close(ready[1]);
+
+            for (int i = 0; i < 2000 && getppid() == rep.original_parent; ++i) {
                 usleep(5000);
             }
             rep.new_parent = getppid();
@@ -884,38 +918,38 @@ TEST(ProcfsTaskSemantics, ThreadPpidFollowsGroupReparent) {
             } else {
                 rep.leader_ppid = -1;
             }
-            const std::string thread_path = TaskStatusPath(getpid(), rep.worker_tid);
             read_err = 0;
-            if (ReadWholePath(thread_path, &text, &read_err)) {
+            if (ReadWholePath(TaskStatusPath(getpid(), rep.worker_tid), &text, &read_err)) {
                 rep.thread_ppid = strtol(Field(ParseStatus(text), "Ppid").c_str(), nullptr, 10);
             } else {
                 rep.thread_ppid = -read_err;
             }
-            const ssize_t ignored = write(pipefd[1], &rep, sizeof(rep));
-            (void)ignored;
-            _exit(0);
+
+            const bool reported = WriteRaw(report[1], &rep, sizeof(rep));
+            worker.Stop();
+            _exit(reported ? 0 : 3);
         }
-        // The middle process is the one that dies; its exit is what re-parents
-        // the worker's whole thread group.
-        usleep(400000);
+        close(ready[1]);
+        close(report[1]);
+        char token = 0;
+        ssize_t n = 0;
+        do {
+            n = read(ready[0], &token, 1);
+        } while (n < 0 && errno == EINTR);
+        close(ready[0]);
         _exit(0);
     }
 
-    close(pipefd[1]);
-    ReparentReport rep = {};
-    size_t got = 0;
-    while (got < sizeof(rep)) {
-        const ssize_t n = read(pipefd[0], reinterpret_cast<char*>(&rep) + got, sizeof(rep) - got);
-        if (n <= 0) {
-            break;
-        }
-        got += static_cast<size_t>(n);
-    }
-    close(pipefd[0]);
+    close(ready[0]);
+    close(ready[1]);
+    close(report[1]);
+    GroupReparentReport rep = {};
+    const bool got = ReadRaw(report[0], &rep, sizeof(rep));
+    close(report[0]);
     int status = 0;
-    waitpid(top, &status, 0);
+    waitpid(dying, &status, 0);
 
-    ASSERT_EQ(sizeof(rep), got) << "the re-parented thread group did not report";
+    ASSERT_TRUE(got) << "the re-parented thread group did not report";
     ASSERT_GT(rep.original_parent, 0L);
     ASSERT_GT(rep.new_parent, 0L);
     EXPECT_NE(rep.original_parent, rep.new_parent)
@@ -1019,20 +1053,16 @@ TEST(ProcfsTaskSemantics, TaskSubtreeSurvivesLeaderExit) {
     ASSERT_GE(mid, 0) << "fork failed: errno=" << errno;
     if (mid == 0) {
         close(pipefd[0]);
-        int tidpipe[2];
-        if (pipe(tidpipe) != 0) {
+        Worker worker;
+        if (!worker.Start()) {
             _exit(3);
         }
-        pthread_t th;
-        if (pthread_create(&th, nullptr, PublishTidWorker, &tidpipe[1]) != 0) {
-            _exit(3);
-        }
-        const long tid = ReadPublishedTid(tidpipe[0]);
-        close(tidpipe[0]);
-        close(tidpipe[1]);
-        const ssize_t ignored = write(pipefd[1], &tid, sizeof(tid));
-        (void)ignored;
+        const long tid = worker.tid();
+        const bool reported = WriteRaw(pipefd[1], &tid, sizeof(tid));
         close(pipefd[1]);
+        if (!reported) {
+            _exit(3);
+        }
         usleep(100000);
         // Only the group leader must exit, leaving the group alive. This uses
         // exit(2) rather than pthread_exit(): the latter performs a forced
@@ -1043,18 +1073,25 @@ TEST(ProcfsTaskSemantics, TaskSubtreeSurvivesLeaderExit) {
 
     close(pipefd[1]);
     long worker_tid = 0;
-    size_t got = 0;
-    while (got < sizeof(worker_tid)) {
-        const ssize_t n = read(pipefd[0], reinterpret_cast<char*>(&worker_tid) + got,
-                               sizeof(worker_tid) - got);
-        if (n <= 0) {
-            break;
-        }
-        got += static_cast<size_t>(n);
-    }
+    const bool published = ReadRaw(pipefd[0], &worker_tid, sizeof(worker_tid));
     close(pipefd[0]);
-    ASSERT_EQ(sizeof(worker_tid), got) << "the worker tid was not published";
-    usleep(300000);
+    ASSERT_TRUE(published) << "the worker tid was not published";
+
+    // Wait for the leader to actually be gone instead of assuming it after a
+    // fixed delay: every assertion below is only about the shape the group has
+    // once its leader exited.
+    bool leader_exited = false;
+    for (int i = 0; i < kPollTimeoutMs / 10 && !leader_exited; ++i) {
+        std::string text;
+        int err = 0;
+        if (ReadWholePath(StatusPath(mid), &text, &err)) {
+            leader_exited = Field(ParseStatus(text), "State").find("Exited") != std::string::npos;
+        }
+        if (!leader_exited) {
+            usleep(10000);
+        }
+    }
+    ASSERT_TRUE(leader_exited) << "the group leader never exited";
 
     const std::vector<std::string> tids = ListDir(StatusPath(mid, "task"));
     EXPECT_EQ(2u, tids.size()) << "the task subtree must list the zombie leader and the worker";
@@ -1365,6 +1402,341 @@ TEST(ProcfsTaskSemantics, SeekPastEndStaysEofAndRewindReRenders) {
     std::string again;
     EXPECT_EQ(0, ReadToEof(fd.get(), kReadChunk, &again)) << "rewind failed";
     EXPECT_EQ(whole, again) << "rewinding must render the record again";
+}
+
+// ---------------------------------------------------------------------------
+// 4. per-thread state behind a hidden tid
+// ---------------------------------------------------------------------------
+//
+// Linux builds /proc/<nr> from the task proc_pid_lookup() found, so everything
+// below it reads *that* task: proc_fd_link()/proc_readfd_common() walk its
+// files table, mounts_open_common() pins its mount namespace and root, and
+// proc_tgid_stat() still reports whole-thread-group accounting. The cases below
+// pin that against a thread which took private state, and against a hidden tid
+// whose stat record used to mix the per-thread and thread-group views.
+
+#ifndef SYS_close_range
+#define SYS_close_range 436
+#endif
+#ifndef SYS_unshare
+#define SYS_unshare 272
+#endif
+
+/// close_range(2) flag that gives the calling thread its own files table.
+constexpr unsigned kCloseRangeUnshare = 1u << 1;
+/// unshare(2) flag that gives the calling thread its own fs_struct.
+constexpr unsigned kCloneFs = 0x00000200;
+namespace {
+
+/// Reports a thread's tid plus what its private-table setup did.
+struct PrivateTableReport {
+    long tid;
+    int unshare_errno;
+};
+
+/// What the private-table probe has to name: the descriptor it punches out of
+/// its own copy of the table, and the release write end it has to close in that
+/// copy before parking.
+struct PrivateTableArg {
+    int punch_fd;
+    int release_wfd;
+};
+
+/// Tid of the thread that burned CPU, and the burn's own result.
+struct BusyReport {
+    long tid;
+};
+
+/// Fields of a /proc/<pid>/stat line, indexed from 1 (field 1 is the pid).
+/// Linux keeps the command in field 2 inside parentheses, so the split happens
+/// after the closing one.
+std::vector<std::string> ParseStatFields(const std::string& text) {
+    std::vector<std::string> fields;
+    const size_t open = text.find('(');
+    const size_t close = text.rfind(')');
+    if (open == std::string::npos || close == std::string::npos || close < open) {
+        return fields;
+    }
+    fields.push_back(Trim(text.substr(0, open)));
+    fields.push_back(text.substr(open + 1, close - open - 1));
+    size_t pos = close + 1;
+    while (pos < text.size()) {
+        while (pos < text.size() && (text[pos] == ' ' || text[pos] == '\n' || text[pos] == '\0')) {
+            ++pos;
+        }
+        size_t end = pos;
+        while (end < text.size() && text[end] != ' ' && text[end] != '\n' && text[end] != '\0') {
+            ++end;
+        }
+        if (end > pos) {
+            fields.push_back(text.substr(pos, end - pos));
+        }
+        pos = end;
+    }
+    return fields;
+}
+
+/// One numeric field of a /proc/<pid>/stat line, or -1 when the file cannot be
+/// read or the field is missing.
+long StatFieldOf(const std::string& path, size_t index) {
+    std::string text;
+    int err = 0;
+    if (!ReadWholePath(path, &text, &err)) {
+        return -1;
+    }
+    const std::vector<std::string> fields = ParseStatFields(text);
+    if (index == 0 || index > fields.size()) {
+        return -1;
+    }
+    return strtol(fields[index - 1].c_str(), nullptr, 10);
+}
+
+/// Gives the calling thread a files table of its own with one descriptor
+/// punched out of it. Only close_range(CLOSE_RANGE_UNSHARE) hands a single
+/// thread a private table, so this is the setup the hidden-tid fd paths have to
+/// follow.
+void* PrivateTableWorker(void* arg) {
+    ProbePayload* payload = static_cast<ProbePayload*>(arg);
+    const PrivateTableArg* setup = static_cast<const PrivateTableArg*>(payload->arg);
+    PrivateTableReport report = {};
+    report.tid = GetTid();
+    const long unshared = syscall(SYS_close_range, setup->punch_fd, setup->punch_fd,
+                                  kCloseRangeUnshare);
+    report.unshare_errno = (unshared == 0) ? 0 : errno;
+    // This thread's table is private now, so it holds its own copy of the
+    // release write end: leaving it open would keep the park below from seeing
+    // the owner release the pipe.
+    close(setup->release_wfd);
+    WriteRaw(payload->report_wfd, &report, sizeof(report));
+    ParkUntilReleased(payload->release_rfd);
+    return nullptr;
+}
+
+/// Whether `/proc/<tid>/stat` and `/proc/<pid>/stat` report the same CPU time.
+struct PrivateRootReport {
+    long tid;
+    int unshare_errno;
+    int chroot_errno;
+};
+
+/// Gives the calling thread its own fs_struct, changes its root, then parks.
+void* PrivateRootWorker(void* arg) {
+    ProbePayload* payload = static_cast<ProbePayload*>(arg);
+    PrivateRootReport report = {};
+    report.tid = GetTid();
+    const long unshared = syscall(SYS_unshare, kCloneFs);
+    report.unshare_errno = (unshared == 0) ? 0 : errno;
+    if (unshared == 0) {
+        report.chroot_errno = ChrootAway() ? 0 : ENOENT;
+    }
+    WriteRaw(payload->report_wfd, &report, sizeof(report));
+    ParkUntilReleased(payload->release_rfd);
+    return nullptr;
+}
+
+long long MonotonicMs() {
+    struct timespec ts = {};
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return static_cast<long long>(ts.tv_sec) * 1000 + ts.tv_nsec / 1000000;
+}
+
+/// Burns user time in this thread, which is not the group leader, then parks.
+void* BusyWorker(void* arg) {
+    ProbePayload* payload = static_cast<ProbePayload*>(arg);
+    BusyReport report = {};
+    report.tid = GetTid();
+    const long long started = MonotonicMs();
+    volatile unsigned long long sink = 1;
+    while (MonotonicMs() - started < 300) {
+        for (int i = 0; i < 100000; ++i) {
+            sink = sink * 6364136223846793005ULL + 1442695040888963407ULL;
+        }
+    }
+    WriteRaw(payload->report_wfd, &report, sizeof(report));
+    ParkUntilReleased(payload->release_rfd);
+    return nullptr;
+}
+
+}  // namespace
+
+// A thread that took its own files table with close_range(CLOSE_RANGE_UNSHARE)
+// can hold a descriptor set the group leader does not. Linux resolves
+// /proc/<tid>/fd and fdinfo through get_proc_task(inode), so the thread's own
+// directory reports what it closed and the leader's still reports the
+// descriptor it kept.
+TEST(ProcfsTaskSemantics, TidFdSubtreeUsesTheThreadsFilesTable) {
+    const pid_t pid = getpid();
+    // The descriptor the thread punches out of its own copy. The leader keeps
+    // it, which is what makes the two views tell each other.
+    UniqueFd punch(open("/proc/version", O_RDONLY));
+    ASSERT_TRUE(punch.valid()) << "cannot open the descriptor to punch: errno=" << errno;
+
+    ProbeThread probe;
+    ASSERT_TRUE(probe.Prepare()) << "cannot create the probe pipes: errno=" << errno;
+    PrivateTableArg setup = {punch.get(), probe.release_write_fd()};
+    ASSERT_TRUE(probe.Launch(PrivateTableWorker, &setup))
+        << "pthread_create failed: errno=" << errno;
+
+    PrivateTableReport report = {};
+    ASSERT_TRUE(probe.ReadReport(&report, sizeof(report)))
+        << "the probe thread did not report: errno=" << errno;
+    ASSERT_EQ(0, report.unshare_errno)
+        << "close_range(CLOSE_RANGE_UNSHARE) failed: errno=" << report.unshare_errno;
+
+    const std::string fd_name = std::to_string(punch.get());
+    const std::string group_fd_dir = StatusPath(pid, "fd");
+    const std::string thread_fd_dir = TidPath(report.tid, "fd");
+
+    // The leader still holds the descriptor, so the thread really took a copy
+    // of the table instead of closing the group's descriptor.
+    EXPECT_TRUE(Contains(ListDir(group_fd_dir), fd_name))
+        << group_fd_dir << " lost fd " << fd_name << ": the thread closed the group's table";
+
+    // The thread's directory is the one that must not list it.
+    EXPECT_FALSE(Contains(ListDir(thread_fd_dir), fd_name))
+        << thread_fd_dir << " lists fd " << fd_name << ", which the thread removed from its table";
+
+    char link_target[256] = {0};
+    const std::string link_path = TidPath(report.tid, ("fd/" + fd_name).c_str());
+    const ssize_t link_len = readlink(link_path.c_str(), link_target, sizeof(link_target) - 1);
+    const int link_errno = errno;
+    EXPECT_LT(link_len, 0) << link_path << " resolved fd " << fd_name << " of the group's table to "
+                           << std::string(link_target, sizeof(link_target));
+    EXPECT_EQ(ENOENT, link_errno) << link_path << ": errno=" << strerror(link_errno);
+
+    // fdinfo resolves through the same table: the entry is gone for the thread
+    // and still there for the leader.
+    UniqueFd thread_fdinfo(
+        open(TidPath(report.tid, ("fdinfo/" + fd_name).c_str()).c_str(), O_RDONLY));
+    EXPECT_FALSE(thread_fdinfo.valid())
+        << "the thread's fdinfo resolved fd " << fd_name << ", which it removed from its table";
+    UniqueFd group_fdinfo(open(StatusPath(pid, ("fdinfo/" + fd_name).c_str()).c_str(), O_RDONLY));
+    EXPECT_TRUE(group_fdinfo.valid())
+        << "the leader lost its own fdinfo entry: errno=" << errno;
+}
+
+// Observes /proc/<tid>/mounts from a thread with its own root. Runs in a forked
+// child: if the guest refused to unshare the fs_struct, chroot() would move the
+// whole suite's root, which must not be allowed to happen in the test process.
+int CheckTidMountView() {
+    ProbeThread probe;
+    if (!probe.Prepare() || !probe.Launch(PrivateRootWorker, nullptr)) {
+        return 1;
+    }
+
+    PrivateRootReport report = {};
+    const bool reported = probe.ReadReport(&report, sizeof(report));
+    int result = 1;
+    if (reported && report.unshare_errno == 0 && report.chroot_errno == 0) {
+        const std::string leader_path = "/proc/" + std::to_string(getpid()) + "/mounts";
+        const std::string tid_path = "/proc/" + std::to_string(report.tid) + "/mounts";
+        std::string leader;
+        std::string thread_view;
+        int err = 0;
+        if (ReadWholePath(leader_path, &leader, &err) && ReadWholePath(tid_path, &thread_view, &err)) {
+            // A non-empty leader record keeps the comparison from being
+            // vacuous; only the thread changed its root, so the two must differ.
+            result = (leader.empty() || thread_view == leader) ? 2 : 0;
+        }
+    }
+    // The probe owns the pipes and the join, so returning releases the parked
+    // thread even when an early branch gave up on the comparison.
+    return result;
+}
+
+// /proc/<tid>/mounts renders from the task the proc inode names: a thread that
+// unshared its fs_struct and changed root must not report the group leader's
+// view. Linux mounts_open_common() pins get_proc_task(inode), not the leader.
+TEST(ProcfsTaskSemantics, TidMountsUsesTheThreadsRoot) {
+    const pid_t child = fork();
+    ASSERT_GE(child, 0) << "fork failed: errno=" << errno;
+    if (child == 0) {
+        _exit(CheckTidMountView());
+    }
+    ReapedChild child_guard(child);
+
+    int status = 0;
+    bool reaped = false;
+    for (int i = 0; i < kPollTimeoutMs / 10; ++i) {
+        if (waitpid(child, &status, WNOHANG) == child) {
+            reaped = true;
+            break;
+        }
+        usleep(10000);
+    }
+    ASSERT_TRUE(reaped) << "the child did not finish";
+    child_guard.Disarm();
+    ASSERT_TRUE(WIFEXITED(status)) << "the child did not exit normally";
+
+    const int code = WEXITSTATUS(status);
+    if (code == 1) {
+        GTEST_SKIP() << "the guest cannot give a thread its own root";
+    }
+    EXPECT_EQ(0, code) << "a thread's /proc/<tid>/mounts reported the group leader's view";
+}
+
+// `/proc/<nr>/stat` is proc_tgid_stat() even when `nr` names a non-leader
+// thread, so its CPU time (14/15) aggregates the thread group the same way its
+// fault counters (10/12) do. Reading one task group through two directories
+// must not produce two different totals.
+TEST(ProcfsTaskSemantics, TidStatReportsThreadGroupUsage) {
+    const pid_t pid = getpid();
+    ProbeThread probe;
+    ASSERT_TRUE(probe.Prepare()) << "cannot create the probe pipes: errno=" << errno;
+    ASSERT_TRUE(probe.Launch(BusyWorker, nullptr)) << "pthread_create failed: errno=" << errno;
+
+    BusyReport report = {};
+    ASSERT_TRUE(probe.ReadReport(&report, sizeof(report)))
+        << "the busy thread did not report: errno=" << errno;
+    ASSERT_GT(report.tid, 0L);
+    ASSERT_NE(report.tid, GetTid()) << "the probe is not a separate thread";
+
+    // The group leader has run the whole suite while the probe thread burned
+    // 300ms of user time, so the per-thread and thread-group totals differ by
+    // far more than the tick granularity of the two reads.
+    const long group_utime = StatFieldOf(StatusPath(pid, "stat"), 14);
+    const long tid_utime = StatFieldOf(TidPath(report.tid, "stat"), 14);
+    const long thread_utime = StatFieldOf(TaskStatusPath(pid, report.tid, "stat"), 14);
+    ASSERT_GE(group_utime, 0L) << "cannot read /proc/<pid>/stat";
+    ASSERT_GE(tid_utime, 0L) << "cannot read /proc/<tid>/stat";
+    ASSERT_GE(thread_utime, 0L) << "cannot read /proc/<pid>/task/<tid>/stat";
+
+    EXPECT_NEAR(static_cast<double>(group_utime), static_cast<double>(tid_utime), 3.0)
+        << "the hidden tid path reported utime=" << tid_utime
+        << " while the group leader reported " << group_utime
+        << ": the record mixed per-thread CPU time with thread-group accounting";
+    EXPECT_GT(thread_utime, 0L) << "the thread that burned CPU reported none";
+    EXPECT_LE(thread_utime, tid_utime + 3)
+        << "the per-thread view " << thread_utime << " is above the group total " << tid_utime;
+}
+
+// /proc/net/arp is served one entry per slice (Linux arp_seq_ops), so a reader
+// that takes the record one byte at a time must reassemble it exactly, header
+// included. A renderer that treated every slice as the first would repeat the
+// header; one that dropped its cursor would lose entries.
+//
+// A guest without a network device renders the header alone, so what this pins
+// there is the slicing contract (one header, byte-exact reassembly) rather than
+// a populated table.
+TEST(ProcfsTaskSemantics, ArpChunkedReadReassemblesTheSameRecord) {
+    std::string whole;
+    int err = 0;
+    ASSERT_TRUE(ReadWholePath("/proc/net/arp", &whole, &err))
+        << "cannot read /proc/net/arp: errno=" << err;
+    ASSERT_FALSE(whole.empty()) << "/proc/net/arp produced no record";
+
+    UniqueFd fd(open("/proc/net/arp", O_RDONLY));
+    ASSERT_TRUE(fd.valid()) << "cannot open /proc/net/arp: errno=" << errno;
+    std::string chunked;
+    ASSERT_EQ(0, ReadToEof(fd.get(), 1, &chunked)) << "single-byte read failed: errno=" << errno;
+    EXPECT_EQ(whole, chunked) << "the single-byte read did not reassemble the record";
+
+    const std::string header =
+        "IP address       HW type     Flags       HW address            Mask     Device\n";
+    ASSERT_GE(chunked.size(), header.size()) << "the record is shorter than its header";
+    EXPECT_EQ(header, chunked.substr(0, header.size()));
+    EXPECT_EQ(std::string::npos, chunked.find(header, header.size()))
+        << "the header was rendered again on a later slice";
 }
 
 int main(int argc, char** argv) {

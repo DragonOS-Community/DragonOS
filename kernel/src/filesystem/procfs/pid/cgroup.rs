@@ -34,10 +34,13 @@ impl CgroupFileOps {
     }
 
     fn generate_content(&self) -> Result<Vec<u8>, SystemError> {
-        let target = self
-            .target
-            .thread_group_leader()
-            .ok_or(SystemError::ESRCH)?;
+        // Linux `proc_cgroup_show()` runs on `get_proc_task(inode)`, so a
+        // hidden tid reports the membership of the thread it names. The only
+        // migration path, `cgroup.procs`, moves the whole thread group and
+        // skips its exited members, exactly as `cgroup_attach_task()` does with
+        // `while_each_thread()` over the `PF_EXITING` check, so the two
+        // directories still agree.
+        let target = self.target.task().ok_or(SystemError::ESRCH)?;
         let viewer = ProcessManager::current_pcb();
 
         let target_cg = target.task_cgroup_node();

@@ -3,7 +3,6 @@
 //! 以单行格式返回进程的状态信息，兼容 Linux procfs 格式
 
 use core::fmt::Write;
-use core::sync::atomic::Ordering;
 
 use crate::libs::mutex::MutexGuard;
 use crate::{
@@ -178,9 +177,10 @@ fn generate_linux_proc_stat_line(snapshot: &ProcStatSnapshot) -> String {
     line.push_ull(snapshot.majflt as u64); // 12 majflt
     line.push_ull(snapshot.cmajflt as u64); // 13 cmajflt
 
-    // 14/15: CPU time of this task. For `whole=1` (i.e. `/proc/<pid>/stat`)
-    // Linux aggregates the whole thread group; DragonOS does not implement that
-    // aggregation yet, which is a pre-existing deviation.
+    // 14/15: CPU time under the accounting view the caller selected, the same
+    // one behind fields 10/12. Linux `whole=1` (i.e. `/proc/<pid>/stat` and a
+    // hidden-tid `/proc/<nr>/stat`) aggregates the whole thread group, while
+    // `/proc/<pid>/task/<tid>/stat` reports the thread alone.
     line.push_ull(snapshot.utime); // 14 utime
     line.push_ull(snapshot.stime); // 15 stime
     line.push_ll(0); // 16 cutime
@@ -255,14 +255,21 @@ impl StatFileOps {
                 .map(|tty| tty.core().device_number().new_encode_dev() as i32)
                 .unwrap_or(0)
         };
-        let cpu_time = pcb.cputime();
-        let utime = ns_to_clock_t(cpu_time.utime.load(Ordering::Relaxed));
-        let stime = ns_to_clock_t(cpu_time.stime.load(Ordering::Relaxed));
-        let fault_usage = match self.scope {
+        let usage = match self.scope {
             StatScope::ThreadGroup => pcb.get_rusage(RUsageWho::RUsageSelf),
             StatScope::Thread => pcb.get_rusage(RUsageWho::RusageThread),
         }
         .unwrap_or_default();
+        // Fields 14/15 come from the same accounting view as the fault counters
+        // in 10/12: Linux `do_task_stat()` takes `thread_group_cputime_adjusted()`
+        // when `whole` is set, and `/proc/<nr>/stat` is `proc_tgid_stat()`
+        // (whole = 1) even when `nr` names a non-leader thread. Reporting the
+        // faults of the group next to the CPU time of one thread would make two
+        // directories of the same task group disagree about the group.
+        let (utime, stime) = (
+            ns_to_clock_t(usage.ru_utime.to_ns()),
+            ns_to_clock_t(usage.ru_stime.to_ns()),
+        );
         let child_usage = pcb
             .get_rusage(RUsageWho::RUsageChildren)
             .unwrap_or_default();
@@ -320,9 +327,9 @@ impl StatFileOps {
             policy,
             utime,
             stime,
-            minflt: fault_usage.ru_minflt,
+            minflt: usage.ru_minflt,
             cminflt: child_usage.ru_minflt,
-            majflt: fault_usage.ru_majflt,
+            majflt: usage.ru_majflt,
             cmajflt: child_usage.ru_majflt,
         });
         Ok(content.into_bytes())

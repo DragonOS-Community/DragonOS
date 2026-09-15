@@ -38,12 +38,13 @@ impl Debug for MountView {
 }
 
 impl MountView {
-    /// Pins the view of `task`, whose thread group leader the caller resolved
-    /// already (`mounts_open_common()` reports `ESRCH` before it gets here).
+    /// Pins the view of `task`, which the caller resolved from the proc inode
+    /// already (`mounts_open_common()` reports `EINVAL` for a task that is gone
+    /// before it gets here).
     ///
-    /// The failures follow that function: a task without a root directory is
-    /// `ENOENT`, like the `!task->fs` check, and a root that is not a mount is
-    /// `EINVAL`, like its invalid-`root` check.
+    /// A task without a root directory is `ENOENT`, like the `!task->fs` check
+    /// there. A root that is not a mount cannot happen for one that has an
+    /// `fs_struct`, so that arm is defensive.
     pub(crate) fn capture(task: &Arc<ProcessControlBlock>) -> Result<Self, SystemError> {
         let ns = task.nsproxy().mnt_ns.clone();
         let root = task

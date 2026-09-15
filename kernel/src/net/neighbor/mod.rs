@@ -18,7 +18,7 @@ use crate::{
         routing::uapi::arp::{ArpFlags, ArpHrd},
         rtnl::RtnlGuard,
     },
-    process::{namespace::net_namespace::NetNamespace, ProcessManager},
+    process::namespace::net_namespace::NetNamespace,
 };
 
 pub(crate) use table::{NeighborReadGuard, NeighborSnapshot, NeighborTable};
@@ -207,12 +207,15 @@ pub(crate) fn release_deferred_after_enqueue(
     common.release_configured_neighbor(ifindex, next_hop)
 }
 
-/// Returns the current netns ARP view. Configured permanent entries shadow a
+/// Returns the ARP view of `netns`. Configured permanent entries shadow a
 /// dynamic smoltcp entry with the same `(ifindex, IPv4)` key. Linux omits
 /// NUD_NOARP entries from `/proc/net/arp`.
-pub fn get_arp_entries() -> Vec<ArpEntry> {
-    let netns = ProcessManager::current_netns();
-    let configured = match snapshot(&netns) {
+///
+/// The caller names the namespace instead of the function taking the current
+/// one, because `/proc/net/arp` pins it at open (`seq_open_net()`) and a read
+/// must not mix two namespaces into one record.
+pub fn get_arp_entries(netns: &Arc<NetNamespace>) -> Vec<ArpEntry> {
+    let configured = match snapshot(netns) {
         Ok(entries) => entries,
         Err(error) => {
             log::warn!("failed to snapshot configured ARP entries: {:?}", error);

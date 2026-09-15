@@ -34,7 +34,12 @@ impl FdDirOps {
     }
 
     fn get_process(&self) -> Option<Arc<crate::process::ProcessControlBlock>> {
-        self.target.thread_group_leader()
+        // Linux resolves the directory's `get_proc_task(inode)`, so a hidden
+        // tid shows the files table of *that thread*: a thread that took a
+        // private one with `close_range(CLOSE_RANGE_UNSHARE)` must not read the
+        // leader's. For `/proc/<tgid>` the two agree, because the tgid resolves
+        // to the leader.
+        self.target.task()
     }
 }
 
@@ -140,10 +145,9 @@ impl FdSymOps {
 
 impl SymOps for FdSymOps {
     fn read_link(&self, buf: &mut [u8]) -> Result<usize, SystemError> {
-        let process = self
-            .target
-            .thread_group_leader()
-            .ok_or(SystemError::ENOENT)?;
+        // `proc_fd_link()` walks `get_proc_task(inode)->files`, so the link is
+        // resolved against the thread this node names, not the group leader.
+        let process = self.target.task().ok_or(SystemError::ENOENT)?;
 
         // 先获取文件对象的 clone，然后立即释放 fd_table 锁
         // 避免在持有锁时调用可能获取其他锁的方法（如 absolute_path）
@@ -208,7 +212,7 @@ impl SymOps for FdSymOps {
     }
 
     fn special_node(&self) -> Option<SpecialNodeData> {
-        let process = self.target.thread_group_leader()?;
+        let process = self.target.task()?;
 
         // 获取文件对象
         let file = {

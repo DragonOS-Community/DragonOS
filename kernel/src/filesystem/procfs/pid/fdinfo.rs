@@ -33,7 +33,9 @@ impl FdInfoDirOps {
     }
 
     fn get_process(&self) -> Option<Arc<crate::process::ProcessControlBlock>> {
-        self.target.thread_group_leader()
+        // `proc_readfd_common()`/`seq_show()` walk `get_proc_task(inode)`, so a
+        // hidden tid reports the descriptor table of the thread it names.
+        self.target.task()
     }
 }
 
@@ -132,7 +134,7 @@ impl FdInfoFileOps {
     }
 
     fn is_current(&self) -> bool {
-        let Some(process) = self.target.thread_group_leader() else {
+        let Some(process) = self.target.task() else {
             return false;
         };
         let Some(fd_table) = process.basic().try_fd_table().clone() else {

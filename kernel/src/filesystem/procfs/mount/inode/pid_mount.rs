@@ -43,15 +43,17 @@ impl FileOps for MountProcFileOps {
     }
 
     fn open(&self, data: &mut MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
-        // Linux `mounts_open_common()` resolves the target once at open time and
-        // keeps its mount namespace and root path in the seq private data, so a
-        // `setns()`, `unshare()` or `chroot()` performed afterwards cannot
-        // change what this fd reports. The record itself is rendered on the
-        // first read, like any other `seq_file`.
-        let task = self
-            .target
-            .thread_group_leader()
-            .ok_or(SystemError::ESRCH)?;
+        // Linux `mounts_open_common()` resolves `get_proc_task(inode)` once at
+        // open time and keeps its mount namespace and root path in the seq
+        // private data, so a `setns()`, `unshare()` or `chroot()` performed
+        // afterwards cannot change what this fd reports. The record itself is
+        // rendered on the first read, like any other `seq_file`.
+        //
+        // The task is the one this node names, not the group leader: a thread
+        // can unshare its mount namespace or its `fs_struct`, and Linux then
+        // reports that thread's view. For a `/proc/<tgid>` node both are the
+        // leader.
+        let task = self.target.task().ok_or(SystemError::EINVAL)?;
         let view = MountView::capture(&task)?;
         let FilePrivateData::Procfs(pdata) = &mut **data else {
             return Err(SystemError::EINVAL);

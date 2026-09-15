@@ -115,6 +115,14 @@ impl ProcPidTarget {
         self.pid.pid_nr_ns(&self.view_pid_ns)
     }
 
+    /// The task this node names, the way Linux `get_proc_task(inode)` resolves
+    /// the proc inode. A `/proc/<tgid>` node names the group leader, a
+    /// `/proc/<tid>` node the thread, and either can be gone.
+    ///
+    /// Files that report per-task state (`files`, `fs_struct`, `nsproxy`) read
+    /// from here; files backed by state the whole group shares (`mm`,
+    /// `sighand`, credentials) may use [`Self::thread_group_leader()`] instead,
+    /// which is the same task for a `/proc/<tgid>` node.
     pub fn task(&self) -> Option<Arc<ProcessControlBlock>> {
         self.pid.pid_task(PidType::PID)
     }
@@ -170,8 +178,11 @@ impl PidDirOps {
             .unwrap()
     }
 
+    /// The task this directory names, for the entries that only exist when it
+    /// does (`fd`/`fdinfo`, which Linux creates with `proc_pid_make_inode()` on
+    /// the same `get_proc_task(inode)` their readers use).
     fn get_process(&self) -> Option<Arc<ProcessControlBlock>> {
-        self.target.thread_group_leader()
+        self.target.task()
     }
 
     pub(super) fn is_current_target(&self) -> bool {

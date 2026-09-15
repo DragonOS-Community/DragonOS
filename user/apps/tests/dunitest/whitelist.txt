@@ -137,3 +137,4 @@ normal/exec_write_access
 
 normal/internal_shmem
 normal/proc_task_status
+normal/proc_stat_sched_fields

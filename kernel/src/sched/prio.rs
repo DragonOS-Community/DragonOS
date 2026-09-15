@@ -53,6 +53,16 @@ impl PrioUtil {
         prio - DEFAULT_PRIO
     }
 
+    /// Linux `task_prio()`: the value `/proc/<pid>/stat` reports as field 18.
+    ///
+    /// It is an internal priority expressed as an offset into the realtime
+    /// range, so a realtime task reports a negative value (`-1 - rt_priority`)
+    /// and a fair task reports `nice + 20`.
+    #[inline]
+    pub fn task_prio(prio: i32) -> i32 {
+        prio - MAX_RT_PRIO
+    }
+
     /// Encode a nice value the way `getpriority()`/`setpriority()` and
     /// `RLIMIT_NICE` do, matching Linux (`include/linux/sched/prio.h`).
     ///

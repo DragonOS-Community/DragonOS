@@ -2001,8 +2001,19 @@ impl ProcessControlBlock {
         *self.task_cgroup.write() = TaskCgroupRef::new(node);
     }
 
+    /// Linux `task_struct::exit_signal`: `-1` for a thread group member, `0`
+    /// for a clone child that sends no signal, `>0` for the signal delivered to
+    /// the parent on exit.
+    ///
+    /// Only clone, `de_thread()` and the exit paths rewrite it; a task that has
+    /// exited keeps the value it was created with.
+    #[inline]
+    pub fn exit_signal(&self) -> i32 {
+        self.exit_signal.load(Ordering::SeqCst)
+    }
+
     pub fn is_thread_group_leader(&self) -> bool {
-        self.exit_signal.load(Ordering::SeqCst) >= 0
+        self.exit_signal() >= 0
     }
 
     pub(crate) fn thread_group_has_live_nonleader_threads(&self) -> bool {

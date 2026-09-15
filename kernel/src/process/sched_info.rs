@@ -12,8 +12,10 @@ use crate::{
     },
     process::{ProcessControlBlock, ProcessState},
     sched::{
-        cpu_is_online, fair::FairSchedEntity, prio::DEFAULT_PRIO, LinuxSchedPolicy, OnRq,
-        SchedClass,
+        cpu_is_online,
+        fair::FairSchedEntity,
+        prio::{PrioUtil, DEFAULT_PRIO},
+        LinuxSchedPolicy, OnRq, SchedClass,
     },
     smp::cpu::{AtomicProcessorId, ProcessorId},
 };
@@ -416,6 +418,34 @@ impl ProcessSchedulerInfo {
     #[inline]
     pub fn set_normal_prio(&self, val: i32) {
         self.normal_prio.store(val, Ordering::Relaxed);
+    }
+
+    /// Linux `task_struct::rt_priority`: the user visible realtime priority
+    /// (`1..=99`), or `0` for a task whose policy is not realtime.
+    ///
+    /// DragonOS does not keep a separate copy of that value. A realtime task's
+    /// [`ProcessSchedulerInfo::normal_prio`] is its internal realtime priority
+    /// (lower value wins), and the user visible value is the mirrored offset
+    /// computed by [`PrioUtil::internal_rt_prio_to_user`] -- the same
+    /// conversion `sched_getparam(2)` reports.
+    #[inline]
+    pub fn rt_priority(&self) -> u32 {
+        if !self.policy().is_realtime() {
+            return 0;
+        }
+
+        match PrioUtil::internal_rt_prio_to_user(self.normal_prio()) {
+            Some(priority) => priority as u32,
+            // `set_scheduler()` publishes the policy and the priorities as
+            // separate atomics, so a lock-free reader can briefly observe a
+            // realtime policy together with the previous fair `normal_prio`.
+            // Report the neutral value, which is what Linux stores for a task
+            // that is not realtime, instead of an out-of-range offset.
+            // `sched_getparam(2)` reads the same state under `pi_lock` and
+            // reports EIO for a lasting inconsistency: it can report an error,
+            // while a single procfs field cannot.
+            None => 0,
+        }
     }
 
     /// Set all priorities at once.

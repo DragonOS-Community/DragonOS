@@ -9,7 +9,7 @@ use crate::{
         procfs::{
             pid::ProcPidTarget,
             template::{Builder, FileOps, ProcFileBuilder},
-            utils::proc_read,
+            utils::proc_read_snapshot,
         },
         vfs::{FilePrivateData, IndexNode, InodeMode},
     },
@@ -186,9 +186,12 @@ impl FileOps for MapsFileOps {
         offset: usize,
         len: usize,
         buf: &mut [u8],
-        _data: MutexGuard<FilePrivateData>,
+        mut data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        let content = generate_maps_content(&self.target)?;
-        proc_read(offset, len, buf, &content)
+        // One fd sees one snapshot of the whole mapping table, so a mapping that
+        // appears while the reader is mid-stream cannot tear the byte stream.
+        proc_read_snapshot(offset, len, buf, &mut data, || {
+            generate_maps_content(&self.target)
+        })
     }
 }

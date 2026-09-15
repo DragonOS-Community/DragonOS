@@ -11,7 +11,7 @@ use crate::{
         procfs::{
             pid::ProcPidTarget,
             template::{Builder, FileOps, ProcFileBuilder},
-            utils::proc_read,
+            utils::proc_read_snapshot,
         },
         vfs::{FilePrivateData, IndexNode, InodeMode},
     },
@@ -21,6 +21,7 @@ use crate::{
 use alloc::{
     string::{String, ToString},
     sync::{Arc, Weak},
+    vec::Vec,
 };
 use system_error::SystemError;
 
@@ -235,14 +236,12 @@ fn generate_linux_proc_stat_line(snapshot: &ProcStatSnapshot) -> String {
     line.finish()
 }
 
-impl FileOps for StatFileOps {
-    fn read_at(
-        &self,
-        offset: usize,
-        len: usize,
-        buf: &mut [u8],
-        _data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError> {
+impl StatFileOps {
+    /// Render the single line reported by this file.
+    ///
+    /// Linux serves `/proc/<pid>/stat` through `single_open()`, so the line is
+    /// produced when the file is read and then frozen for that fd.
+    fn generate_content(&self) -> Result<Vec<u8>, SystemError> {
         let pcb = self.target.task().ok_or(SystemError::ESRCH)?;
 
         let (comm, user_vm) = {
@@ -326,6 +325,18 @@ impl FileOps for StatFileOps {
             majflt: fault_usage.ru_majflt,
             cmajflt: child_usage.ru_majflt,
         });
-        proc_read(offset, len, buf, content.as_bytes())
+        Ok(content.into_bytes())
+    }
+}
+
+impl FileOps for StatFileOps {
+    fn read_at(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &mut [u8],
+        mut data: MutexGuard<FilePrivateData>,
+    ) -> Result<usize, SystemError> {
+        proc_read_snapshot(offset, len, buf, &mut data, || self.generate_content())
     }
 }

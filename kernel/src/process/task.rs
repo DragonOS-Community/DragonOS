@@ -225,8 +225,13 @@ pub struct ProcessControlBlock {
     pub(super) seccomp_filter: SpinLock<Option<Arc<seccomp::SeccompFilter>>>,
 
     /// Parent process pointer.
+    ///
+    /// Per-task: every task gets its own copy at fork (see the `CLONE_PARENT` /
+    /// `CLONE_THREAD` branches in `fork.rs`), and re-parenting updates the
+    /// whole thread group member by member, the way Linux
+    /// `forget_original_parent()` walks `for_each_thread()`.
     pub(super) parent_pcb: RwLock<Weak<ProcessControlBlock>>,
-    /// Real (original) parent process pointer.
+    /// Real (original) parent process pointer. Per-task, see `parent_pcb`.
     pub(super) real_parent_pcb: RwLock<Weak<ProcessControlBlock>>,
     /// The natural parent pointer for wait operations.
     ///
@@ -234,6 +239,11 @@ pub struct ProcessControlBlock {
     /// task_struct::parent, whereas DragonOS models parent_pcb/real_parent_pcb
     /// on the thread-group leader. This field preserves the thread-level parent
     /// relationship required by wait.
+    ///
+    /// Re-parenting updates it together with the other three pointers. The only
+    /// Linux difference is the `if (likely(!t->ptrace))` guard: a traced task's
+    /// `->parent` is its tracer. DragonOS keeps tracing in the ptrace relation
+    /// table instead, so there is nothing to guard here today.
     pub(super) wait_parent_pcb: RwLock<Weak<ProcessControlBlock>>,
     /// Thread-level natural-parent compensation for PTRACE_TRACEME.
     ///
@@ -1293,19 +1303,54 @@ impl ProcessControlBlock {
         }
     }
 
+    /// Update the parent links of one task.
+    ///
+    /// The four parent pointers are per-task state (`fork.rs` copies them into
+    /// every newly created task, and `CLONE_THREAD` children inherit them
+    /// independently), so a thread group is only fully re-parented when every
+    /// member is updated. Linux does the same with `for_each_thread()` in
+    /// `forget_original_parent()`.
+    ///
+    /// Linux additionally guards the wait parent with `if (likely(!t->ptrace))`:
+    /// a traced task's `->parent` is its tracer, not the new parent. DragonOS
+    /// keeps the tracer relationship in `process::ptrace`'s relation table
+    /// (`ptracer_of()`) and never writes it into `wait_parent_pcb`, so the
+    /// unconditional update is equivalent today. If tracing is ever modelled
+    /// through these fields, the guard has to be added here as well.
+    fn reparent_one_task_locked(
+        task: &Arc<ProcessControlBlock>,
+        new_parent: &Arc<ProcessControlBlock>,
+        parent_pid_in_child_ns: RawPid,
+    ) {
+        *task.parent_pcb.write_irqsave() = Arc::downgrade(new_parent);
+        *task.real_parent_pcb.write_irqsave() = Arc::downgrade(new_parent);
+        *task.wait_parent_pcb.write_irqsave() = Arc::downgrade(new_parent);
+        *task.fork_parent_pcb.write_irqsave() = Arc::downgrade(new_parent);
+
+        // `basic.ppid` has no reader today (`stat`/`status` derive Ppid from
+        // `parent_pcb()`), but it belongs to the same parent record and must
+        // stay consistent with the pointers above.
+        task.basic.write_irqsave().ppid = parent_pid_in_child_ns;
+    }
+
+    /// Attach a whole child thread group to `new_parent`.
+    ///
+    /// Only the group leader is registered in `children`, so the caller passes
+    /// the leader; the leader's group list is then walked to update every
+    /// member. Updating just the leader would make
+    /// `/proc/<pid>/task/<tid>/status` report a different `Ppid` than
+    /// `/proc/<pid>/status` for the same thread group.
     fn reparent_child_to_locked(
         child: &Arc<ProcessControlBlock>,
         new_parent: &Arc<ProcessControlBlock>,
     ) {
-        *child.parent_pcb.write_irqsave() = Arc::downgrade(new_parent);
-        *child.real_parent_pcb.write_irqsave() = Arc::downgrade(new_parent);
-        *child.wait_parent_pcb.write_irqsave() = Arc::downgrade(new_parent);
-        *child.fork_parent_pcb.write_irqsave() = Arc::downgrade(new_parent);
-
         let parent_pid_in_child_ns = new_parent
             .task_pid_nr_ns(PidType::PID, Some(child.active_pid_ns()))
             .unwrap_or(RawPid::new(0));
-        child.basic.write_irqsave().ppid = parent_pid_in_child_ns;
+
+        for task in ProcessManager::thread_group_tasks_snapshot(child.clone()) {
+            Self::reparent_one_task_locked(&task, new_parent, parent_pid_in_child_ns);
+        }
 
         ProcessControlBlock::link_child_to_parent_list(child, new_parent);
 

@@ -53,6 +53,11 @@ pub struct ProcfsFilePrivateData {
     pub data: Vec<u8>,
     pub open_cred: Arc<Cred>,
     pub pinned_vm: Option<Arc<AddressSpace>>,
+    /// Continuation position for seq-style files (mirrors Linux `seq_file::m->read_pos`).
+    ///
+    /// `None` means this fd has not rendered yet; `Some(p)` means the snapshot is
+    /// ready and the next read continues at `p`. See `utils::proc_read_snapshot()`.
+    pub read_pos: Option<usize>,
 }
 
 impl ProcfsFilePrivateData {
@@ -61,6 +66,7 @@ impl ProcfsFilePrivateData {
             data: Vec::new(),
             open_cred: ProcessManager::current_pcb().cred(),
             pinned_vm: None,
+            read_pos: None,
         }
     }
 }

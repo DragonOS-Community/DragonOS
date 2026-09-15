@@ -4,7 +4,7 @@ use crate::{
     filesystem::{
         procfs::{
             template::{Builder, FileOps, ProcFileBuilder},
-            utils::{proc_read, trim_string},
+            utils::{proc_read_snapshot, trim_string},
         },
         vfs::{FilePrivateData, IndexNode, InodeMode},
     },
@@ -135,9 +135,12 @@ impl FileOps for StatFileOps {
         offset: usize,
         len: usize,
         buf: &mut [u8],
-        _data: MutexGuard<FilePrivateData>,
+        mut data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        let content = Self::generate_stat_content();
-        proc_read(offset, len, buf, &content)
+        // `seq_file`: Linux opens `/proc/stat` through `single_open_size()`
+        // (`fs/proc/stat.c`), so one fd sees one rendered record.
+        proc_read_snapshot(offset, len, buf, &mut data, || {
+            Ok(Self::generate_stat_content())
+        })
     }
 }

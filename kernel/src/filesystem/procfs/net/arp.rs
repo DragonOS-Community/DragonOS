@@ -8,7 +8,7 @@
 use crate::filesystem::{
     procfs::{
         template::{Builder, FileOps, ProcFileBuilder},
-        utils::proc_read,
+        utils::proc_read_snapshot,
     },
     vfs::{FilePrivateData, IndexNode, InodeMode},
 };
@@ -81,9 +81,12 @@ impl FileOps for ArpFileOps {
         offset: usize,
         len: usize,
         buf: &mut [u8],
-        _data: MutexGuard<FilePrivateData>,
+        mut data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        let content = Self::generate_arp_content();
-        proc_read(offset, len, buf, &content)
+        // `seq_file` (Linux `proc_create_net(&arp_seq_ops)`, `net/ipv4/arp.c`): one
+        // fd sees one rendered record.
+        proc_read_snapshot(offset, len, buf, &mut data, || {
+            Ok(Self::generate_arp_content())
+        })
     }
 }

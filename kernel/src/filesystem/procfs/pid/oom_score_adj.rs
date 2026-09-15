@@ -6,7 +6,7 @@ use crate::{
         procfs::{
             pid::ProcPidTarget,
             template::{Builder, FileOps, ProcFileBuilder},
-            utils::proc_read,
+            utils::{proc_read, proc_read_snapshot},
         },
         vfs::{FilePrivateData, IndexNode, InodeMode},
     },
@@ -53,12 +53,14 @@ impl FileOps for OomScoreFileOps {
         offset: usize,
         len: usize,
         buf: &mut [u8],
-        _data: MutexGuard<FilePrivateData>,
+        mut data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        let pcb = self.target_process()?;
-        let score = crate::mm::oom::proc_oom_score(&pcb);
-        let content = format!("{}\n", score);
-        proc_read(offset, len, buf, content.as_bytes())
+        // `single_open()`: one fd sees one oom_score record.
+        proc_read_snapshot(offset, len, buf, &mut data, || {
+            let pcb = self.target_process()?;
+            let score = crate::mm::oom::proc_oom_score(&pcb);
+            Ok(format!("{}\n", score).into_bytes())
+        })
     }
 }
 
@@ -169,6 +171,10 @@ impl FileOps for OomScoreAdjFileOps {
         buf: &mut [u8],
         _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
+        // Reverse guardrail: Linux serves `oom_score_adj` through `snprintf()` +
+        // `simple_read_from_buffer()` (`fs/proc/base.c`), not `seq_file`, so this
+        // read stays stream-style and must not be frozen per fd. Only
+        // `oom_score` (above) is a `single_open()` file.
         let pcb = self.target_process()?;
         let score = pcb.sig_info_irqsave().oom_score_adj();
         let content = format!("{}\n", score);

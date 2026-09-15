@@ -8,6 +8,7 @@ use crate::{
         procfs::{
             pid::ProcPidTarget,
             template::{Builder, FileOps, ProcFileBuilder},
+            utils::proc_read_snapshot,
             ProcfsFilePrivateData,
         },
         vfs::{FilePrivateData, IndexNode, InodeMode},
@@ -368,34 +369,33 @@ impl FileOps for IdMapFileOps {
         offset: usize,
         len: usize,
         buf: &mut [u8],
-        data: MutexGuard<FilePrivateData>,
+        mut data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        let user_ns = self.get_user_ns()?;
+        // Read the opener credential before `data` is mutably borrowed by the
+        // snapshot helper. The target namespace is resolved by the renderer, so
+        // a continuation read never touches the target task.
         let opener_cred = Self::open_cred_from_data(&data)?;
-        let inner = user_ns.inner.lock();
-        let ctx = IdMapWriteContext {
-            map_type: self.map_type,
-            target_ns: user_ns.clone(),
-            opener_cred,
-            target_owner: inner.owner,
-            target_flags: inner.flags,
-            target_parent_could_setfcap: inner.parent_could_setfcap,
-        };
 
-        let content = match self.map_type {
-            MapType::Uid => self.generate_content(&inner.uid_map, &ctx),
-            MapType::Gid => self.generate_content(&inner.gid_map, &ctx),
-        };
+        // Linux serves uid_map/gid_map through `seq_read()` (`fs/proc/base.c`), so
+        // the map text is frozen for the lifetime of the fd.
+        proc_read_snapshot(offset, len, buf, &mut data, || {
+            let user_ns = self.get_user_ns()?;
+            let inner = user_ns.inner.lock();
+            let ctx = IdMapWriteContext {
+                map_type: self.map_type,
+                target_ns: user_ns.clone(),
+                opener_cred,
+                target_owner: inner.owner,
+                target_flags: inner.flags,
+                target_parent_could_setfcap: inner.parent_could_setfcap,
+            };
 
-        let content_bytes = content.as_bytes();
-        if offset >= content_bytes.len() {
-            return Ok(0);
-        }
-
-        let end = (offset + len).min(content_bytes.len());
-        let to_copy = end - offset;
-        buf[..to_copy].copy_from_slice(&content_bytes[offset..end]);
-        Ok(to_copy)
+            Ok(match self.map_type {
+                MapType::Uid => self.generate_content(&inner.uid_map, &ctx),
+                MapType::Gid => self.generate_content(&inner.gid_map, &ctx),
+            }
+            .into_bytes())
+        })
     }
 
     fn write_at(
@@ -474,29 +474,26 @@ impl FileOps for SetgroupsFileOps {
         offset: usize,
         len: usize,
         buf: &mut [u8],
-        _data: MutexGuard<FilePrivateData>,
+        mut data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        let pcb = self
-            .target
-            .thread_group_leader()
-            .ok_or(SystemError::ESRCH)?;
-        let user_ns = pcb.cred().user_ns.clone();
-        let inner = user_ns.inner.lock();
-
-        let content = if (inner.flags & USERNS_SETGROUPS_ALLOWED) != 0 {
-            "allow\n"
-        } else {
-            "deny\n"
-        };
-
-        let content_bytes = content.as_bytes();
-        if offset >= content_bytes.len() {
-            return Ok(0);
-        }
-        let end = (offset + len).min(content_bytes.len());
-        let to_copy = end - offset;
-        buf[..to_copy].copy_from_slice(&content_bytes[offset..end]);
-        Ok(to_copy)
+        // Linux `proc_setgroups_operations` reads through `seq_read()`
+        // (`fs/proc/base.c:3219`), so one fd sees one `allow`/`deny` record.
+        proc_read_snapshot(offset, len, buf, &mut data, || {
+            let allowed = {
+                let pcb = self
+                    .target
+                    .thread_group_leader()
+                    .ok_or(SystemError::ESRCH)?;
+                let user_ns = pcb.cred().user_ns.clone();
+                let inner = user_ns.inner.lock();
+                (inner.flags & USERNS_SETGROUPS_ALLOWED) != 0
+            };
+            Ok(if allowed {
+                b"allow\n".to_vec()
+            } else {
+                b"deny\n".to_vec()
+            })
+        })
     }
 
     fn write_at(

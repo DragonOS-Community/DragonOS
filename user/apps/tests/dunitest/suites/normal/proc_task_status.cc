@@ -64,12 +64,12 @@ private:
     int fd_ = -1;
 };
 
-// Procfs files are regenerated on every read_at() while the file position stays
-// a plain byte offset, so a second read() at a stale offset can hand back tail
-// bytes of a longer re-render. One read(2), with a buffer far larger than these
-// files, therefore yields exactly one coherent snapshot; callers that need the
-// whole file (and every compared field is checked for presence) would notice if
-// the content ever outgrew the buffer.
+// Seq-family procfs files now hand out one frozen snapshot per open(): the
+// first read() renders the record and later reads replay the remainder of that
+// same buffer, so a single read(2) with a buffer far larger than these files
+// yields exactly one coherent snapshot. Every compared field is checked for
+// presence, so a truncated snapshot would be reported as a missing field rather
+// than silently passing.
 constexpr size_t kSnapshotBufSize = 4096;
 
 bool ReadProcSnapshot(const std::string& path, std::string* out, int* err_out) {
@@ -422,8 +422,9 @@ TEST(ProcTaskStatus, NonLeaderThreadStatusDescribesThread) {
     EXPECT_EQ(std::to_string(pid), Field(fields, "Tgid"));
     EXPECT_NE("0", Field(fields, "Tgid"));
     // A thread inherits its creator's parent, so this must agree with the
-    // process view while the parent is alive. Reparenting only rewrites the
-    // group leader today, which is a separate pre-existing gap.
+    // process view while the parent is alive. Re-parenting has to rewrite every
+    // thread as well; that direction is covered by
+    // ProcfsTaskSemantics.ThreadPpidFollowsGroupReparent.
     EXPECT_EQ(Field(ParseStatus(proc_before), "Ppid"), Field(fields, "Ppid"));
 
     // The thread state must come from the worker (blocked), not from the leader.

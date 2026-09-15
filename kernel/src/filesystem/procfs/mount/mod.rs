@@ -8,4 +8,4 @@ pub(crate) mod format;
 pub(crate) mod inode;
 mod render;
 
-pub(crate) use render::{open_mount_file_for_target, read_cached_mount_file, ProcMountRenderKind};
+pub(crate) use render::{render_mount_file_for_task, ProcMountRenderKind};

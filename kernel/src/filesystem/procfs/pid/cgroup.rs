@@ -7,7 +7,7 @@ use crate::{
         procfs::{
             pid::ProcPidTarget,
             template::{Builder, FileOps, ProcFileBuilder},
-            utils::proc_read,
+            utils::proc_read_snapshot,
         },
         vfs::{FilePrivateData, IndexNode, InodeMode},
     },
@@ -54,9 +54,9 @@ impl FileOps for CgroupFileOps {
         offset: usize,
         len: usize,
         buf: &mut [u8],
-        _data: MutexGuard<FilePrivateData>,
+        mut data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        let content = self.generate_content()?;
-        proc_read(offset, len, buf, &content)
+        // `single_open()`: one fd sees one cgroup record.
+        proc_read_snapshot(offset, len, buf, &mut data, || self.generate_content())
     }
 }

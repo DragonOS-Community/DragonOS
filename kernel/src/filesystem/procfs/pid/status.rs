@@ -8,7 +8,7 @@ use crate::{
         procfs::{
             pid::ProcPidTarget,
             template::{Builder, FileOps, ProcFileBuilder},
-            utils::{proc_read, trim_string},
+            utils::{proc_read_snapshot, trim_string},
         },
         vfs::{FilePrivateData, IndexNode, InodeMode},
     },
@@ -219,11 +219,13 @@ impl FileOps for StatusFileOps {
         offset: usize,
         len: usize,
         buf: &mut [u8],
-        _data: MutexGuard<FilePrivateData>,
+        mut data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        let content = self.generate_status_content()?;
-        // log::info!("Generated /proc/[pid]/status content");
-
-        proc_read(offset, len, buf, &content)
+        // Linux serves `/proc/<pid>/status` through `single_open()`, so one fd
+        // sees one record: EOF stays EOF even while `Time`/`Stime`/`vrtime`
+        // keep growing, and repositioning re-renders.
+        proc_read_snapshot(offset, len, buf, &mut data, || {
+            self.generate_status_content()
+        })
     }
 }

@@ -8,8 +8,9 @@ use crate::{
         FileSystem, MountFS,
     },
     libs::casting::DowncastArc,
-    process::ProcessControlBlock,
 };
+
+use super::MountView;
 
 #[derive(Debug)]
 pub(crate) struct ProcMountEntry {
@@ -26,20 +27,15 @@ pub(crate) struct ProcMountEntry {
 }
 
 pub(crate) fn collect_visible_mounts(
-    target: &Arc<ProcessControlBlock>,
+    view: &MountView,
 ) -> Result<(Vec<ProcMountEntry>, String), SystemError> {
-    let root = target
-        .try_fs_struct()
-        .ok_or(SystemError::ESRCH)?
-        .root()
-        .downcast_arc::<MountFSInode>()
-        .ok_or(SystemError::EINVAL)?;
+    let root = view.root.clone();
 
     if root.is_disconnected() {
         return Ok((Vec::new(), "/".to_string()));
     }
     let root_mount = root.mount_fs();
-    let mount_namespace = target.nsproxy().mnt_ns.clone();
+    let mount_namespace = view.ns.clone();
     let mut mounts = Vec::new();
     let mount_root = root_mount
         .root_inode()

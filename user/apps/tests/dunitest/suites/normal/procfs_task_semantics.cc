@@ -26,8 +26,11 @@
 #include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/prctl.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -43,6 +46,12 @@ namespace {
 
 constexpr size_t kReadChunk = 128;
 constexpr int kPollTimeoutMs = 2000;
+
+/// Argument that turns the test binary into the exec()ed helper of
+/// MapsStreamKeepsTheAddressSpaceOpenedOn: it maps a marker region, reports its
+/// address on the inherited pipe and parks, so the parent can watch the target
+/// change address spaces while an fd streams /proc/<pid>/maps.
+constexpr char kMapsExecParkArg[] = "procfs_task_semantics_maps_exec_park";
 
 class UniqueFd {
 public:
@@ -339,6 +348,151 @@ private:
     pthread_t thread_ = {};
     bool started_ = false;
 };
+
+
+// Reads one line with 1-byte reads, leaving the fd on a line boundary.
+bool ReadLine(int fd, std::string* line) {
+    line->clear();
+    for (;;) {
+        char c = 0;
+        const ssize_t n = read(fd, &c, 1);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return false;
+        }
+        if (n == 0) {
+            return !line->empty();
+        }
+        line->push_back(c);
+        if (c == '\n') {
+            return true;
+        }
+        if (line->size() > 4096) {
+            return false;
+        }
+    }
+}
+
+// True when a mapping line of `maps` covers `addr`. Ranges are compared instead
+// of whole lines so that merging with a neighbouring mapping cannot make the
+// check miss.
+bool MapsCover(const std::string& maps, unsigned long addr) {
+    size_t pos = 0;
+    while (pos < maps.size()) {
+        const size_t nl = maps.find('\n', pos);
+        const std::string line =
+            (nl == std::string::npos) ? maps.substr(pos) : maps.substr(pos, nl - pos);
+        unsigned long start = 0;
+        unsigned long end = 0;
+        if (sscanf(line.c_str(), "%lx-%lx", &start, &end) == 2 && start <= addr && addr < end) {
+            return true;
+        }
+        if (nl == std::string::npos) {
+            break;
+        }
+        pos = nl + 1;
+    }
+    return false;
+}
+
+// chroot() into a directory that exists or can be created here. Returns false
+// when the environment offers none, so the caller can skip instead of failing.
+bool ChrootAway() {
+    const char* const kCandidates[] = {"/dunitest-chroot", "/tmp", "/dev"};
+    for (const char* dir : kCandidates) {
+        if (mkdir(dir, 0755) != 0 && errno != EEXIST) {
+            continue;
+        }
+        if (chroot(dir) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Runs in a forked child, so chroot() cannot disturb the suite. Returns 0 when
+// the fd kept the view it was opened with, 1 when the environment cannot show
+// the difference, and 2 when the fd followed the new root.
+int CheckPinnedMountView() {
+    UniqueFd fd(open("/proc/self/mountinfo", O_RDONLY));
+    if (!fd.valid()) {
+        return 1;
+    }
+    std::string before;
+    if (ReadToEof(fd.get(), kReadChunk, &before) != 0 || before.empty()) {
+        return 1;
+    }
+
+    if (!ChrootAway()) {
+        return 1;
+    }
+    // Evidence that the root really changed: /proc is no longer reachable.
+    UniqueFd unreachable(open("/proc/self/mountinfo", O_RDONLY));
+    if (unreachable.valid()) {
+        return 1;
+    }
+
+    // Rewinding forces a re-render: a fd that resolved the target again would
+    // render from the new root instead of the one pinned at open.
+    if (lseek(fd.get(), 0, SEEK_SET) != 0) {
+        return 1;
+    }
+    std::string after;
+    if (ReadToEof(fd.get(), kReadChunk, &after) != 0) {
+        return 1;
+    }
+    return after == before ? 0 : 2;
+}
+
+// Reads one byte, retrying on EINTR. Returns -1 with errno set when the read
+// fails, 0 at EOF and 1 when a byte was stored.
+int ReadByte(int fd, char* out) {
+    for (;;) {
+        const ssize_t n = read(fd, out, 1);
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        return static_cast<int>(n);
+    }
+}
+
+// Fixed-size payload exchanged with the exec()ed helper over a pipe.
+bool WriteRaw(int fd, const void* data, size_t len) {
+    const char* p = static_cast<const char*>(data);
+    size_t done = 0;
+    while (done < len) {
+        const ssize_t n = write(fd, p + done, len - done);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return false;
+        }
+        done += static_cast<size_t>(n);
+    }
+    return true;
+}
+
+bool ReadRaw(int fd, void* data, size_t len) {
+    char* p = static_cast<char*>(data);
+    size_t done = 0;
+    while (done < len) {
+        const ssize_t n = read(fd, p + done, len - done);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return false;
+        }
+        if (n == 0) {
+            return false;
+        }
+        done += static_cast<size_t>(n);
+    }
+    return true;
+}
 
 bool WaitForExit(pid_t pid) {
     for (int i = 0; i < kPollTimeoutMs / 10; ++i) {
@@ -920,7 +1074,315 @@ TEST(ProcfsTaskSemantics, TaskSubtreeSurvivesLeaderExit) {
     EXPECT_TRUE(WaitForExit(mid));
 }
 
+
+// ---------------------------------------------------------------------------
+// Guardrails for the read paths that changed shape in the same fix
+// ---------------------------------------------------------------------------
+
+// /proc/<pid>/maps keeps streaming the mappings that exist when the reader asks
+// for the next line, the way Linux m_start()/m_next() re-enter the iteration,
+// while the fd still holds one line instead of a copy of the whole table: a
+// mapping created after the first read shows up in the rest of the stream.
+TEST(ProcfsTaskSemantics, MapsStreamsMappingsAddedAfterFirstRead) {
+    UniqueFd fd(open("/proc/self/maps", O_RDONLY));
+    ASSERT_TRUE(fd.valid()) << "cannot open /proc/self/maps: errno=" << errno;
+
+    std::string first;
+    ASSERT_TRUE(ReadLine(fd.get(), &first)) << "cannot read the first mapping";
+    std::string second;
+    ASSERT_TRUE(ReadLine(fd.get(), &second)) << "cannot read the second mapping";
+
+    const size_t kLen = 1u << 20;
+    void* added = mmap(nullptr, kLen, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    ASSERT_NE(MAP_FAILED, added) << "mmap failed: errno=" << errno;
+    const unsigned long added_start = reinterpret_cast<unsigned long>(added);
+
+    std::string rest;
+    EXPECT_EQ(0, ReadToEof(fd.get(), kReadChunk, &rest)) << "draining /proc/self/maps failed";
+
+    std::string fresh;
+    int err = 0;
+    EXPECT_TRUE(ReadWholePath("/proc/self/maps", &fresh, &err)) << "errno=" << err;
+
+    EXPECT_TRUE(MapsCover(fresh, added_start)) << "/proc/self/maps lost the mapping the test created";
+    EXPECT_TRUE(MapsCover(rest, added_start))
+        << "a mapping created after the first read never showed up in the stream: the fd "
+           "served a record that was frozen before it existed";
+
+    munmap(added, kLen);
+}
+
+// The length of a read must not change the record it returns. /proc/<pid>/maps
+// is rendered one slice at a time, so a single read asking for far more than one
+// mapping line reassembles the record from several slices; it must still
+// describe exactly what a chunked read of the same position describes.
+//
+// Both buffers live on the stack, so neither read can move the mapping table the
+// other one observes.
+TEST(ProcfsTaskSemantics, MapsLargeReadReassemblesTheSameRecord) {
+    const size_t kMarkerLen = 1u << 20;
+    void* marker =
+        mmap(nullptr, kMarkerLen, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    ASSERT_NE(MAP_FAILED, marker) << "mmap failed: errno=" << errno;
+    const unsigned long marker_start = reinterpret_cast<unsigned long>(marker);
+
+    UniqueFd fd(open("/proc/self/maps", O_RDONLY));
+    ASSERT_TRUE(fd.valid()) << "cannot open /proc/self/maps: errno=" << errno;
+
+    // Several slices: this is much larger than one mapping line.
+    char whole[16 * 1024];
+    ssize_t n = 0;
+    do {
+        n = pread(fd.get(), whole, sizeof(whole), 0);
+    } while (n < 0 && errno == EINTR);
+    ASSERT_GT(n, 0) << "large pread failed: errno=" << errno;
+
+    // The same position, read in small chunks.
+    char chunked[sizeof(whole)];
+    ssize_t m = 0;
+    while (m < static_cast<ssize_t>(sizeof(chunked))) {
+        const ssize_t got = pread(fd.get(), chunked + m, kReadChunk, static_cast<off_t>(m));
+        if (got < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            FAIL() << "chunked pread failed: errno=" << errno;
+        }
+        if (got == 0) {
+            break;
+        }
+        m += got;
+    }
+
+    ASSERT_EQ(n, m) << "the record ends at a different place depending on the read length";
+    EXPECT_EQ(0, memcmp(whole, chunked, static_cast<size_t>(n)))
+        << "the record a read returns depends on how much it asked for";
+    EXPECT_TRUE(MapsCover(std::string(whole, static_cast<size_t>(n)), marker_start))
+        << "the mapping this test created is missing from the record";
+
+    munmap(marker, kMarkerLen);
+}
+
+// /proc/<pid>/mountinfo renders the view its open() pinned, the way
+// mounts_open_common() takes get_mnt_ns() + get_fs_root(): changing the root
+// after opening the fd must not change what that fd reports.
+TEST(ProcfsTaskSemantics, MountInfoKeepsTheRootPinnedAtOpen) {
+    const pid_t child = fork();
+    ASSERT_GE(child, 0) << "fork failed: errno=" << errno;
+    if (child == 0) {
+        _exit(CheckPinnedMountView());
+    }
+    ReapedChild child_guard(child);
+
+    int status = 0;
+    bool reaped = false;
+    for (int i = 0; i < kPollTimeoutMs / 10; ++i) {
+        if (waitpid(child, &status, WNOHANG) == child) {
+            reaped = true;
+            break;
+        }
+        usleep(10000);
+    }
+    ASSERT_TRUE(reaped) << "the child did not finish";
+    child_guard.Disarm();
+    ASSERT_TRUE(WIFEXITED(status)) << "the child did not exit normally";
+
+    const int code = WEXITSTATUS(status);
+    if (code == 1) {
+        GTEST_SKIP() << "the guest cannot change its root to show the difference";
+    }
+    EXPECT_EQ(0, code) << "mountinfo followed a root change made after open()";
+}
+
+// ---------------------------------------------------------------------------
+// Guardrails for the streaming read path added on top of the record snapshot
+// ---------------------------------------------------------------------------
+
+// /proc/<pid>/maps streams one mapping per slice, so killing the target between
+// two reads leaves the fd holding the tail of the line it was in the middle of.
+// Those bytes are already the reader's: Linux `seq_read_iter()` returns `copied`
+// and drops `err` once it copied something, so they must come back instead of
+// being thrown away with the `-ESRCH` the *next* record fails with (`m_start()`
+// cannot resolve the target any more).
+TEST(ProcfsTaskSemantics, MapsStreamKeepsCopiedBytesWhenTargetDies) {
+    const pid_t child = fork();
+    ASSERT_GE(child, 0) << "fork failed: errno=" << errno;
+    if (child == 0) {
+        for (;;) {
+            pause();
+        }
+    }
+    ReapedChild child_guard(child);
+
+    const std::string path = "/proc/" + std::to_string(child) + "/maps";
+    UniqueFd stream(open(path.c_str(), O_RDONLY));
+    ASSERT_TRUE(stream.valid()) << "cannot open " << path << ": errno=" << errno;
+
+    // One byte stops the fd inside the first mapping, so the rest of that line
+    // is still buffered when the target goes away.
+    char first = 0;
+    ASSERT_EQ(1, ReadByte(stream.get(), &first)) << "first chunk failed: errno=" << errno;
+
+    std::string whole;
+    int err = 0;
+    ASSERT_TRUE(ReadWholePath(path, &whole, &err)) << "cannot read " << path << ": errno=" << err;
+    ASSERT_GT(whole.size(), 1u) << path << " produced no record";
+    ASSERT_EQ(first, whole[0]);
+
+    kill(child, SIGKILL);
+    ASSERT_TRUE(WaitForExit(child)) << "the target was not reaped";
+    child_guard.Disarm();
+
+    char tail[256];
+    ssize_t rest = 0;
+    do {
+        rest = read(stream.get(), tail, sizeof(tail));
+    } while (rest < 0 && errno == EINTR);
+    ASSERT_GT(rest, 0) << "the bytes the fd already held were dropped: errno=" << errno;
+    EXPECT_EQ(whole.substr(1, static_cast<size_t>(rest)),
+              std::string(tail, static_cast<size_t>(rest)))
+        << "the fd served something other than the record it started";
+
+    // ... and only then does the unfinished record report its failure.
+    errno = 0;
+    EXPECT_EQ(-1, read(stream.get(), tail, sizeof(tail)))
+        << "the stream continued after the target was gone";
+    EXPECT_EQ(ESRCH, errno) << "errno=" << errno;
+}
+
+// The address a /proc/<pid>/maps fd resumes from only means something inside the
+// address space the fd was opened on, so the file pins it the way Linux
+// `proc_maps_open()` -> `proc_mem_open()` does. An execve() in the target must
+// therefore leave this fd serving the record it started, not continue (or
+// restart, or truncate) its stream in the new image.
+//
+// The helper exec()s this binary again, so the new image has the same mappings
+// plus one marker region it reports back; a fresh read of /proc/<pid>/maps
+// proves that image is in place.
+TEST(ProcfsTaskSemantics, MapsStreamKeepsTheAddressSpaceOpenedOn) {
+    int wake_pipe[2] = {-1, -1};
+    int report_pipe[2] = {-1, -1};
+    ASSERT_EQ(0, pipe(wake_pipe)) << "pipe failed: errno=" << errno;
+    ASSERT_EQ(0, pipe(report_pipe)) << "pipe failed: errno=" << errno;
+
+    const pid_t child = fork();
+    ASSERT_GE(child, 0) << "fork failed: errno=" << errno;
+    if (child == 0) {
+        close(wake_pipe[1]);
+        close(report_pipe[0]);
+        // The helper must keep both ends across execve(), whatever the default
+        // close-on-exec state of this kernel is.
+        fcntl(wake_pipe[0], F_SETFD, 0);
+        fcntl(report_pipe[1], F_SETFD, 0);
+        char go = 0;
+        while (ReadByte(wake_pipe[0], &go) < 0) {
+        }
+        char report_fd[16];
+        snprintf(report_fd, sizeof(report_fd), "%d", report_pipe[1]);
+        char* const argv[] = {const_cast<char*>("/proc/self/exe"),
+                              const_cast<char*>(kMapsExecParkArg), report_fd, nullptr};
+        char* const envp[] = {nullptr};
+        execve("/proc/self/exe", argv, envp);
+        _exit(127);
+    }
+
+    close(wake_pipe[0]);
+    close(report_pipe[1]);
+    UniqueFd wake(wake_pipe[1]);
+    UniqueFd report(report_pipe[0]);
+    ReapedChild child_guard(child);
+
+    const std::string path = "/proc/" + std::to_string(child) + "/maps";
+    UniqueFd stream(open(path.c_str(), O_RDONLY));
+    ASSERT_TRUE(stream.valid()) << "cannot open " << path << ": errno=" << errno;
+
+    char first = 0;
+    ASSERT_EQ(1, ReadByte(stream.get(), &first)) << "first chunk failed: errno=" << errno;
+
+    // The record this fd started on, taken while the target is parked on the
+    // pipe (so its mappings cannot move under the test).
+    std::string whole;
+    int err = 0;
+    ASSERT_TRUE(ReadWholePath(path, &whole, &err)) << "cannot read " << path << ": errno=" << err;
+    ASSERT_GT(whole.size(), 1u) << path << " produced no record";
+    ASSERT_EQ(first, whole[0]);
+
+    // Let the target execve() and report where its new image mapped a marker.
+    ASSERT_TRUE(WriteRaw(wake.get(), "x", 1)) << "cannot wake the target: errno=" << errno;
+    unsigned long marker = 0;
+    ASSERT_TRUE(ReadRaw(report.get(), &marker, sizeof(marker)))
+        << "the exec()ed target did not report its marker";
+
+    std::string fresh;
+    ASSERT_TRUE(ReadWholePath(path, &fresh, &err)) << "cannot read " << path << ": errno=" << err;
+    ASSERT_TRUE(MapsCover(fresh, marker))
+        << "the exec()ed image never published its marker, so this case cannot observe anything";
+    // The two records have to be tellable apart, or serving the new one would
+    // look the same as serving the old one. Comparing whole records, not the
+    // marker address on its own: a new mapping can land on an address the old
+    // table already covered with a different range.
+    ASSERT_NE(whole, fresh)
+        << "both records describe the same address space, so this case cannot tell them apart";
+
+    // The fd keeps serving the address space it was opened on, and only that
+    // one: it drains the rest of the line it was inside when the target left,
+    // and the mappings of that address space are gone with the execve() (Linux
+    // `proc_mem_open()` drops the user reference again, "but do not pin its
+    // memory"), so `m_start()` reports EOF instead of continuing the stream.
+    std::string rest;
+    err = ReadToEof(stream.get(), kReadChunk, &rest);
+    EXPECT_EQ(0, err) << "continuation read failed: errno=" << err;
+    std::string reassembled;
+    reassembled.push_back(first);
+    reassembled += rest;
+    const size_t first_line = whole.find('\n');
+    ASSERT_NE(std::string::npos, first_line) << "the record has no line break";
+    EXPECT_EQ(whole.substr(0, first_line + 1), reassembled)
+        << "the stream moved on past the address space it was opened on";
+}
+
+// A position past the end of a record is EOF, not a rewind: reading there
+// returns 0 and keeps returning 0, exactly as `seq_lseek()` -> `traverse()`
+// leaves the fd, and moving back to 0 renders the record again
+// (`seq_read_iter()`'s `ki_pos == 0` reset).
+TEST(ProcfsTaskSemantics, SeekPastEndStaysEofAndRewindReRenders) {
+    UniqueFd fd(open("/proc/version", O_RDONLY));
+    ASSERT_TRUE(fd.valid()) << "cannot open /proc/version: errno=" << errno;
+
+    std::string whole;
+    ASSERT_EQ(0, ReadToEof(fd.get(), kReadChunk, &whole)) << "chunked read failed";
+    ASSERT_FALSE(whole.empty());
+
+    const off_t far = 1 << 20;
+    ASSERT_EQ(far, lseek(fd.get(), far, SEEK_SET)) << "lseek failed: errno=" << errno;
+    char buf[16];
+    EXPECT_EQ(0, read(fd.get(), buf, sizeof(buf))) << "a seek past the end must report EOF";
+    EXPECT_EQ(0, read(fd.get(), buf, sizeof(buf))) << "EOF must stay EOF";
+    EXPECT_EQ(0, pread(fd.get(), buf, sizeof(buf), far))
+        << "pread() at the same position must report EOF as well";
+
+    ASSERT_EQ(0, lseek(fd.get(), 0, SEEK_SET)) << "lseek failed: errno=" << errno;
+    std::string again;
+    EXPECT_EQ(0, ReadToEof(fd.get(), kReadChunk, &again)) << "rewind failed";
+    EXPECT_EQ(whole, again) << "rewinding must render the record again";
+}
+
 int main(int argc, char** argv) {
+    if (argc >= 3 && strcmp(argv[1], kMapsExecParkArg) == 0) {
+        const int report_fd = atoi(argv[2]);
+        const size_t kMarkerLen = 4u << 20;
+        void* marker =
+            mmap(nullptr, kMarkerLen, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        const unsigned long addr =
+            (marker == MAP_FAILED) ? 0UL : reinterpret_cast<unsigned long>(marker);
+        if (addr != 0) {
+            WriteRaw(report_fd, &addr, sizeof(addr));
+        }
+        close(report_fd);
+        for (;;) {
+            pause();
+        }
+    }
     ::testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();
 }

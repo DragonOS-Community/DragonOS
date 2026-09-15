@@ -384,7 +384,7 @@ impl FileOps for IdMapFileOps {
             let ctx = IdMapWriteContext {
                 map_type: self.map_type,
                 target_ns: user_ns.clone(),
-                opener_cred,
+                opener_cred: opener_cred.clone(),
                 target_owner: inner.owner,
                 target_flags: inner.flags,
                 target_parent_could_setfcap: inner.parent_could_setfcap,

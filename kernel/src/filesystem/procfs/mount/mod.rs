@@ -7,5 +7,7 @@ mod fields;
 pub(crate) mod format;
 pub(crate) mod inode;
 mod render;
+mod view;
 
-pub(crate) use render::{render_mount_file_for_task, ProcMountRenderKind};
+pub(crate) use render::{render_mount_file, ProcMountRenderKind};
+pub(crate) use view::MountView;

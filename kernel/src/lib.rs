@@ -17,6 +17,18 @@
 #![feature(sync_unsafe_cell)]
 #![feature(linkage)]
 #![feature(panic_can_unwind)]
+// The kernel's object graph is one strongly-connected component, so proving
+// `Send`/`Sync` for a type such as `File` walks an obligation chain of roughly
+// 130 levels through it -- just past rustc's default budget of 128, which
+// overflowed as `E0275` on riscv64 and loongarch64 once `/proc/net/arp` began
+// pinning its network namespace per file. The budget is load-bearing rather
+// than cosmetic: the generated code measurably differs between budgets (the
+// kernel crate's `.text` grows by ~2.6% from 128 to 256), so it is not a cap
+// that is never reached. 256 is the value rustc suggests for this diagnostic
+// and sets the budget to about twice the measured depth. If it ever overflows
+// again, measure the new depth and raise the limit; do not drop an edge from
+// the type graph to fit the budget.
+#![recursion_limit = "256"]
 #![allow(
     static_mut_refs,
     non_local_definitions,

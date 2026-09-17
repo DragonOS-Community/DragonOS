@@ -10,7 +10,10 @@ use crate::{
     driver::tty::{tty_driver::TtyOperation, virtual_terminal::vc_manager},
     filesystem::procfs::{klog::LogMessage, kmsg::KMSG},
     time::PosixTimeSpec,
+    // libs::spinlock::SpinLock,
 };
+
+// static OUTPUT_LOCK: SpinLock<()> = SpinLock::new(());
 
 #[macro_export]
 macro_rules! print {
@@ -36,6 +39,8 @@ impl PrintkWriter {
     /// 并输出白底黑字
     /// @param str: 要写入的字符
     pub fn __write_string(&mut self, s: &str) {
+        // DEBUG 调试的时候可以将这里取消注释，可以避免日志输出混在一起
+        // let _guard = OUTPUT_LOCK.lock();
         if let Some(current_vc) = vc_manager().current_vc() {
             // tty已经初始化了之后才输出到屏幕
             let port = current_vc.port();

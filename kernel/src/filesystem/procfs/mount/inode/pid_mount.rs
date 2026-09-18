@@ -2,10 +2,10 @@ use core::fmt::Debug;
 
 use crate::filesystem::{
     procfs::{
-        mount::{render_mount_file, MountView, ProcMountRenderKind},
+        mount::{render_mount_slice, MountView, ProcMountRenderKind},
         pid::ProcPidTarget,
         template::{Builder, FileOps, ProcFileBuilder},
-        utils::proc_read_snapshot,
+        utils::proc_read_seq,
     },
     vfs::{FilePrivateData, IndexNode, InodeMode},
 };
@@ -46,8 +46,8 @@ impl FileOps for MountProcFileOps {
         // Linux `mounts_open_common()` resolves `get_proc_task(inode)` once at
         // open time and keeps its mount namespace and root path in the seq
         // private data, so a `setns()`, `unshare()` or `chroot()` performed
-        // afterwards cannot change what this fd reports. The record itself is
-        // rendered on the first read, like any other `seq_file`.
+        // afterwards cannot change what this fd reports. The records are
+        // produced by the reads, like any other `seq_file`.
         //
         // The task is the one this node names, not the group leader: a thread
         // can unshare its mount namespace or its `fs_struct`, and Linux then
@@ -81,8 +81,18 @@ impl FileOps for MountProcFileOps {
             };
             pdata.mount_view.clone().ok_or(SystemError::EINVAL)?
         };
-        proc_read_snapshot(offset, len, buf, &mut data, move || {
-            render_mount_file(&view, self.kind)
+        // One slice is one output block, so an fd *keeps* a page of the table
+        // rather than a copy of all of it (a container may hold up to
+        // `mount-max` mounts and the reader up to `RLIMIT_NOFILE` fds); a slice
+        // still walks the namespace's mounts to find the ones that follow the
+        // cursor, which is work rather than retention (see
+        // `render_mount_slice()`). The cursor is the mount id the slice reached,
+        // so a mount created after an earlier slice is reported by a later one,
+        // the way `seq_read_iter()` re-enters `show()` per record, while a mount
+        // the topology took out of the pinned root in between is not reported at
+        // all.
+        proc_read_seq(offset, len, buf, &mut data, |cursor, budget, out| {
+            render_mount_slice(&view, self.kind, cursor, budget, out)
         })
     }
 }

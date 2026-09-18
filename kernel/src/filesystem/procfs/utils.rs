@@ -94,7 +94,8 @@ impl ProcfsSeq {
 /// (`fs/seq_file.c:seq_read_iter()`), so a reader's read length does not decide
 /// how much a seq file buffers. Bounding a slice the same way keeps a large read
 /// from turning into a large per-fd buffer for a record source that can render
-/// arbitrarily much, such as the mapping table of `/proc/[pid]/maps`.
+/// arbitrarily much, such as the mapping table of `/proc/[pid]/maps` or the
+/// mount table of `/proc/[pid]/mountinfo`.
 ///
 /// Only an incremental source is held to it: the sources that render one whole
 /// record ([`proc_read_snapshot()`], i.e. Linux `single_open()`) put that record

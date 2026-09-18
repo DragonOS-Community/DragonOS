@@ -8,7 +8,9 @@
 //      returning 0 even while the record grows, and moving the file position
 //      re-renders. Before the fix every read() re-rendered and the stale byte
 //      offset sliced the *new* render, so a second read() could hand back tail
-//      bytes of a longer record;
+//      bytes of a longer record. The mount tables below stream one mount per
+//      slice, so a mount created after an earlier slice is reported by a later
+//      one, and opening a fd pins the mount namespace and the root together;
 //   2. re-parenting a thread group rewrites the parent links of every thread,
 //      so /proc/<pid>/task/<tid>/status and /proc/<pid>/status agree on Ppid;
 //   3. /proc/<nr> resolves any task that still holds a PID link (Linux
@@ -27,12 +29,14 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/mount.h>
 #include <sys/prctl.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
@@ -1737,6 +1741,319 @@ TEST(ProcfsTaskSemantics, ArpChunkedReadReassemblesTheSameRecord) {
     EXPECT_EQ(header, chunked.substr(0, header.size()));
     EXPECT_EQ(std::string::npos, chunked.find(header, header.size()))
         << "the header was rendered again on a later slice";
+}
+
+// ---------------------------------------------------------------------------
+// Guardrails for the streaming mount table
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// `unshare(2)` flag that asks for a mount namespace of its own.
+constexpr unsigned kCloneNewMountNs = 0x00020000;
+
+/// The first two fields of a mountinfo record: the id of the mount and the id
+/// of the mount it is attached below.
+struct MountIdPair {
+    unsigned long id;
+    unsigned long parent;
+};
+
+/// The id pair of the first record of `record`.
+bool FirstMountIdPair(const std::string& record, MountIdPair* out) {
+    const size_t end = record.find('\n');
+    const std::string line = (end == std::string::npos) ? record : record.substr(0, end);
+    return sscanf(line.c_str(), "%lu %lu", &out->id, &out->parent) == 2;
+}
+
+/// Reads one byte of `path`, mounts a tmpfs on `dir` while that fd stays open,
+/// then drains the fd. Returns 0 when the rest of the stream reports the mount
+/// point, 2 when it does not, 3 when the table produced no first record, and 1
+/// when the guest cannot run the setup.
+int CheckMountCreatedAfterFirstReadIsStreamed(const char* path, const std::string& dir) {
+    UniqueFd fd(open(path, O_RDONLY));
+    if (!fd.valid()) {
+        return 1;
+    }
+    char first = 0;
+    if (ReadByte(fd.get(), &first) != 1) {
+        // Every namespace has a root mount, so a table that hands out no record
+        // at its first byte is the regression this case exists for, not an
+        // environment the guest cannot provide.
+        return 3;
+    }
+
+    if (mkdir(dir.c_str(), 0755) != 0 && errno != EEXIST) {
+        return 1;
+    }
+    if (mount("none", dir.c_str(), "tmpfs", 0, nullptr) != 0) {
+        return 1;
+    }
+
+    std::string rest(1, first);
+    const int read_errno = ReadToEof(fd.get(), kReadChunk, &rest);
+    const bool streamed = rest.find(dir) != std::string::npos;
+    umount(dir.c_str());
+    rmdir(dir.c_str());
+    return (read_errno == 0 && streamed) ? 0 : 2;
+}
+
+/// Runs the check for both names the mount table is reachable under. Runs in a
+/// forked child that took a mount namespace of its own, so the tmpfs the case
+/// mounts cannot leak into the rest of the suite.
+int CheckMountStreamChild() {
+    if (syscall(SYS_unshare, kCloneNewMountNs) != 0) {
+        return 1;
+    }
+    const int mountinfo = CheckMountCreatedAfterFirstReadIsStreamed(
+        "/proc/self/mountinfo", "/tmp/dunitest_mount_stream_info");
+    if (mountinfo != 0) {
+        return mountinfo;
+    }
+    return CheckMountCreatedAfterFirstReadIsStreamed("/proc/self/mounts",
+                                                     "/tmp/dunitest_mount_stream");
+}
+
+/// Announces `step` to the owner and waits for it to answer.
+bool AnnounceAndWait(int report_wfd, int go_rfd, int step) {
+    return WriteRaw(report_wfd, &step, sizeof(step)) && ReadRaw(go_rfd, &step, sizeof(step));
+}
+
+/// How long the child below keeps taking mount namespaces before it stops on
+/// its own. It is longer than the reader's window on purpose: the reader stops
+/// the child by closing the pipe, and this bound only keeps a child whose owner
+/// is already gone from unsharing forever.
+constexpr long long kNamespaceLoopChildMs = 6000;
+
+/// Takes a mount namespace of its own, announces it and waits for the owner,
+/// then keeps replacing its mount namespace until the owner closes the pipe or
+/// the child reaches its own deadline. Returns 0 when it stopped, and the errno
+/// of the step that failed otherwise. Runs in a forked child: the owner needs a
+/// task that keeps moving through mount namespaces, each with the root that came
+/// with it.
+int CheckNamespaceLoopChild(int report_wfd, int go_rfd) {
+    const long long deadline = MonotonicMs() + kNamespaceLoopChildMs;
+    bool announced = false;
+    while (MonotonicMs() < deadline) {
+        if (syscall(SYS_unshare, kCloneNewMountNs) != 0) {
+            const int failed = errno;
+            return failed != 0 ? failed : 1;
+        }
+        if (!announced) {
+            announced = true;
+            if (!AnnounceAndWait(report_wfd, go_rfd, 1)) {
+                return 1;
+            }
+        }
+        struct pollfd release = {go_rfd, POLLIN, 0};
+        if (poll(&release, 1, 0) > 0) {
+            return 0;
+        }
+    }
+    return 0;
+}
+
+}  // namespace
+
+// A mount created after an earlier slice of /proc/<pid>/mountinfo belongs to a
+// later slice: Linux renders one record per show() call, so the iteration sees
+// the topology the namespace has when the reader asks for the next record. An
+// fd that rendered the table once, on its first read, keeps serving that render
+// and never reports the new mount point.
+TEST(ProcfsTaskSemantics, MountTableStreamsMountsCreatedAfterFirstRead) {
+    const pid_t child = fork();
+    ASSERT_GE(child, 0) << "fork failed: errno=" << errno;
+    if (child == 0) {
+        _exit(CheckMountStreamChild());
+    }
+    ReapedChild child_guard(child);
+
+    int status = 0;
+    bool reaped = false;
+    for (int i = 0; i < kPollTimeoutMs / 10; ++i) {
+        if (waitpid(child, &status, WNOHANG) == child) {
+            reaped = true;
+            break;
+        }
+        usleep(10000);
+    }
+    ASSERT_TRUE(reaped) << "the child did not finish";
+    child_guard.Disarm();
+    ASSERT_TRUE(WIFEXITED(status)) << "the child did not exit normally";
+
+    const int code = WEXITSTATUS(status);
+    if (code == 1) {
+        GTEST_SKIP() << "the guest cannot open a mount table or mount a tmpfs in a private "
+                        "mount namespace";
+    }
+    ASSERT_NE(3, code) << "the first read of the mount table produced no record";
+    EXPECT_EQ(0, code)
+        << "the rest of the stream did not report a mount created after the first read";
+}
+
+// The read length must not decide what the fd reports: /proc/<pid>/mountinfo
+// hands out one slice of records per read, so a read that takes the record one
+// byte at a time reassembles it exactly. A renderer that treated every slice as
+// the first would repeat the leading records, and one that dropped its cursor
+// would lose records. The two reads of a path are taken back to back and nothing
+// else in this suite mounts in the namespace the case itself runs in (the cases
+// that mount do so in a child of their own with a mount namespace of its own),
+// so the record cannot move between them and the comparison can be exact.
+TEST(ProcfsTaskSemantics, MountTableChunkedReadReassemblesTheSameRecord) {
+    const std::pair<const char*, bool> kPaths[] = {
+        {"/proc/self/mountinfo", true},
+        {"/proc/self/mounts", true},
+        {"/proc/self/mountstats", false},
+    };
+    for (const auto& [path, non_empty] : kPaths) {
+        std::string whole;
+        int err = 0;
+        ASSERT_TRUE(ReadWholePath(path, &whole, &err)) << path << ": errno=" << err;
+        if (non_empty) {
+            ASSERT_FALSE(whole.empty()) << path << " produced no record";
+        }
+
+        UniqueFd fd(open(path, O_RDONLY));
+        ASSERT_TRUE(fd.valid()) << path << ": errno=" << errno;
+        std::string chunked;
+        ASSERT_EQ(0, ReadToEof(fd.get(), 1, &chunked)) << path << ": single-byte read failed";
+        EXPECT_EQ(whole, chunked) << path << ": the record a read returns depends on its length";
+    }
+}
+
+// Opening the file pins the mount namespace and the root that the record is
+// rendered from, and a mount namespace switch publishes the two as one unit, so
+// a reader of /proc/<pid>/mountinfo can only ever see a whole generation. The
+// child below keeps replacing its mount namespace while the owner reads, and
+// every record must look like a whole generation: a record whose first mount is
+// its own parent is the signature of a capture that took the mount namespace of
+// one generation and the root of the next (a namespace root is rendered with
+// the id of its invisible parent). A guest that reports a namespace root as its
+// own parent cannot show the difference and is skipped.
+TEST(ProcfsTaskSemantics, MountViewIsOneNamespaceGeneration) {
+    int report[2] = {-1, -1};
+    int go[2] = {-1, -1};
+    ASSERT_EQ(0, pipe(report)) << "pipe failed: errno=" << errno;
+    ASSERT_EQ(0, pipe(go)) << "pipe failed: errno=" << errno;
+
+    const pid_t child = fork();
+    ASSERT_GE(child, 0) << "fork failed: errno=" << errno;
+    if (child == 0) {
+        close(report[0]);
+        close(go[1]);
+        _exit(CheckNamespaceLoopChild(report[1], go[0]));
+    }
+    ReapedChild child_guard(child);
+    close(report[1]);
+    close(go[0]);
+
+    const std::string path = "/proc/" + std::to_string(child) + "/mountinfo";
+    int step = 0;
+    if (!ReadRaw(report[0], &step, sizeof(step))) {
+        close(report[0]);
+        close(go[1]);
+        GTEST_SKIP() << "the child could not unshare a mount namespace";
+    }
+    ASSERT_EQ(1, step);
+    std::string quiet;
+    int err = 0;
+    if (!ReadWholePath(path, &quiet, &err)) {
+        close(report[0]);
+        close(go[1]);
+        GTEST_SKIP() << "cannot read " << path << ": errno=" << err;
+    }
+    MountIdPair quiet_root = {};
+    if (!FirstMountIdPair(quiet, &quiet_root)) {
+        close(report[0]);
+        close(go[1]);
+        GTEST_SKIP() << "this guest renders no mountinfo record";
+    }
+    if (quiet_root.id == quiet_root.parent) {
+        close(report[0]);
+        close(go[1]);
+        GTEST_SKIP() << "this guest reports a namespace root with its own id as parent";
+    }
+    int answer = 1;
+    ASSERT_TRUE(WriteRaw(go[1], &answer, sizeof(answer)));
+
+    // An empty record is tolerated on purpose: a kernel that pins the two slots
+    // in two steps can leave the reader with the root of one generation and the
+    // mount namespace of the other, and the mounts of the pinned namespace are
+    // then unreachable from the pinned root, so the record comes back empty
+    // (Linux 6.6 does this on a measurable share of such reads). The property
+    // this case pins has to hold either way: a record that is not a whole
+    // generation is a mixture.
+    bool mixed = false;
+    std::string mixed_record;
+    bool read_failed = false;
+    int failed_errno = 0;
+    size_t empty_records = 0;
+    std::set<unsigned long> generations;
+    size_t reads = 0;
+    const long long deadline = MonotonicMs() + 1500;
+    while (MonotonicMs() < deadline && reads < 20000) {
+        std::string record;
+        int read_errno = 0;
+        const bool readable = ReadWholePath(path, &record, &read_errno);
+        ++reads;
+        if (!readable) {
+            // A generation that cannot be rendered at all is a failure of its
+            // own: the two slots are published as one pair, so every read has a
+            // whole generation to render and none of them may fail.
+            read_failed = true;
+            failed_errno = read_errno;
+            break;
+        }
+        MountIdPair root = {};
+        if (!FirstMountIdPair(record, &root)) {
+            // Every generation has a root mount, so a record with no mount in it
+            // is counted rather than ignored: a run that only ever saw those is
+            // not the same as one that only ever saw a single generation.
+            ++empty_records;
+            continue;
+        }
+        generations.insert(root.id);
+        if (root.id == root.parent) {
+            mixed = true;
+            mixed_record = record;
+            break;
+        }
+    }
+
+    // Stop the child and reap it before reporting, so a failing assertion
+    // cannot leave it unsharing behind the case.
+    close(go[1]);
+    close(report[0]);
+    int status = 0;
+    bool reaped = false;
+    for (int i = 0; i < kPollTimeoutMs / 10; ++i) {
+        if (waitpid(child, &status, WNOHANG) == child) {
+            reaped = true;
+            break;
+        }
+        usleep(10000);
+    }
+    ASSERT_TRUE(reaped) << "the child did not stop";
+    ASSERT_TRUE(WIFEXITED(status)) << "the child did not exit normally";
+    // Reap before reporting and disarm the guard last, so a failed assertion
+    // above still kills a child that is still taking mount namespaces.
+    child_guard.Disarm();
+    const int code = WEXITSTATUS(status);
+    if (code != 0) {
+        GTEST_SKIP() << "the child could not keep taking mount namespaces: errno=" << code;
+    }
+
+    EXPECT_FALSE(read_failed) << "a read of " << path << " failed: errno=" << failed_errno;
+    EXPECT_FALSE(mixed) << "a read mixed the mount namespace of one generation with the root of "
+                           "the next:\n"
+                        << mixed_record;
+    if (!read_failed && !mixed && generations.size() < 2) {
+        // Whether the reader meets more than one generation is up to the
+        // scheduler, so a run that only ever saw one generation says nothing
+        // about the property and is not a failure of it.
+        GTEST_SKIP() << "the reader never saw the child change mount namespace (" << reads
+                     << " reads, " << empty_records << " of them without a record)";
+    }
 }
 
 int main(int argc, char** argv) {

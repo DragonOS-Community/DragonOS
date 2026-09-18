@@ -39,6 +39,15 @@ pub(crate) enum ProcMountRenderKind {
 /// advances the cursor, the way `seq_path_root()` makes `show_vfsmnt()` return
 /// without emitting a record.
 ///
+/// The cursor is a watermark over the table, not a re-derivation of it: a mount
+/// whose id a slice has already reached is never handed out again, even when it
+/// becomes reachable afterwards (an `MS_MOVE` that brings an existing mount
+/// under the pinned root keeps that mount's id). Linux's cursor node has the
+/// same shape -- `m_stop()` moves it after the last mount it emitted
+/// (`fs/namespace.c`), and an `MS_MOVE` keeps the mount's place in `ns->list`
+/// (`attach_recursive_mnt()` inserts only a newly attached mount at the tail),
+/// so a mount the iterator already passed is likewise not reported again.
+///
 /// The mounts the slice does not render are still enumerated, because the mount
 /// tree is what says which mounts the namespace has and the table is ordered by
 /// a key only a mount carries; the walk behind
@@ -62,7 +71,10 @@ pub(crate) enum ProcMountRenderKind {
 /// `budget` bounds the slice to roughly that many bytes: the renderer stops
 /// after the record that crossed the bound, so the result is one page plus at
 /// most one record, the same way `seq_read_iter()` refills `m->buf` and grows it
-/// only for a single record that cannot fit.
+/// only for a single record that cannot fit. The driver also bounds the slice by
+/// what the reader asked for (`proc_read_seq()`), so a reader that asks for one
+/// byte takes a one-record slice and pays one enumeration per record, while one
+/// that asks for a page or more pays one per output block.
 ///
 /// `out` is where the slice is appended: the caller hands in the buffer of a
 /// slice that was just emptied, and the record a slice stops on stays in it

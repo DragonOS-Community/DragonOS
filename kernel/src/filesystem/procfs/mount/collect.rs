@@ -182,9 +182,12 @@ impl VisibleMount {
         view: &MountView,
     ) -> Result<Option<Self>, SystemError> {
         let mount = candidate.mount.clone();
-        // A mount the walk reached is attached to the topology, and the walk is
-        // re-taken per record, so a mount an umount took out of the pinned root
-        // in between is passed over: it is no longer part of the table either.
+        // The enumeration and this record are two snapshots, so the record
+        // re-checks its own place instead of trusting the walk: a mount an
+        // umount detached, or one the pinned root no longer reaches because the
+        // topology moved it, is passed over -- it is not part of the table the
+        // reader is being handed either (Linux reaches the same result by
+        // letting `seq_path_root()` skip it).
         let Some(mountpoint) = mount.self_mountpoint() else {
             return Ok(None);
         };
@@ -267,7 +270,10 @@ pub(crate) fn collect_mount_candidates(
 ///
 /// Mount ids are allocated in increasing order and never reused
 /// (`MountId::alloc()`), so "already reached" is exactly "id at or below the
-/// cursor".
+/// cursor". A mount that becomes reachable below the cursor is deliberately
+/// left out: the cursor is the reader's watermark over the table, and the
+/// contract it implements is spelled out in
+/// [`render_mount_slice()`](super::render_mount_slice).
 fn push_candidate(
     candidates: &mut Vec<ProcMountCandidate>,
     mount: &Arc<MountFS>,

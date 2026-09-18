@@ -5,7 +5,7 @@ use system_error::SystemError;
 use crate::filesystem::vfs::mount::with_topology_snapshot;
 
 use super::{
-    collect::{collect_mount_candidates, ProcMountEntry},
+    collect::{collect_mount_candidates, ProcMountEntry, VisibleMount},
     fields::MountProcFields,
     format::{mountinfo_line, mounts_line, mountstats_line},
     MountView,
@@ -16,6 +16,27 @@ pub(crate) enum ProcMountRenderKind {
     Mounts,
     MountInfo,
     MountStats,
+}
+
+// The shortest possible record is the `mounts` format with four empty fields:
+// three field separators plus " 0 0\n". Escaping only expands path tokens, so
+// their original lengths can tighten this bound without calling a filesystem.
+const MIN_MOUNT_LINE_BYTES: usize = 8;
+
+fn minimum_line_len(mount: &VisibleMount, kind: ProcMountRenderKind) -> usize {
+    let path_len = mount.mountpoint_display.len();
+    match kind {
+        ProcMountRenderKind::Mounts => MIN_MOUNT_LINE_BYTES
+            .saturating_add(path_len)
+            .saturating_add(mount.per_mount_options.len()),
+        ProcMountRenderKind::MountInfo => MIN_MOUNT_LINE_BYTES
+            .saturating_add(path_len)
+            .saturating_add(mount.mountinfo_root.len())
+            .saturating_add(mount.per_mount_options.len())
+            .saturating_add(mount.super_block_options.len())
+            .saturating_add(mount.mountinfo_tags.len()),
+        ProcMountRenderKind::MountStats => MIN_MOUNT_LINE_BYTES.saturating_add(path_len),
+    }
 }
 
 /// Renders one slice of the mount-family record (`mounts` / `mountinfo` /
@@ -51,13 +72,13 @@ pub(crate) enum ProcMountRenderKind {
 /// The mounts the slice does not render are still enumerated, because the mount
 /// tree is what says which mounts the namespace has and the table is ordered by
 /// a key only a mount carries; the walk behind
-/// [`collect_mount_candidates()`] costs no record fields for them, so one slice
-/// costs one enumeration of the namespace's mounts -- a walk plus a sort, taken
-/// under the global mount lifecycle snapshot, and with one transient list per
-/// mount it visits -- plus a record for each mount it hands out.  A reader that
-/// drains the whole table pays that enumeration once per slice, so its cost
-/// grows with the table times the number of slices, while what the fd itself
-/// keeps between reads stays one output block.
+/// [`collect_mount_candidates()`] costs no record fields for them. One slice
+/// enumerates and sorts the candidates, then captures enough visible mounts
+/// to meet the output budget by a conservative lower bound of each formatted
+/// line, under the same topology snapshot. The
+/// filesystem callbacks run after releasing that snapshot. A
+/// reader that drains the table pays one enumeration per slice, while the fd
+/// itself keeps only one output block.
 ///
 /// Linux's `m_start()` resumes an iteration instead of re-deriving it, which
 /// needs the ordered mount list (`ns->list`) plus the cursor node an fd keeps
@@ -86,24 +107,33 @@ pub(crate) fn render_mount_slice(
     budget: usize,
     out: &mut Vec<u8>,
 ) -> Result<Option<usize>, SystemError> {
-    // The candidates are enumerated from one topology snapshot, and each record
-    // the slice hands out resolves its own place in the topology under a
-    // snapshot of its own: see `ProcMountEntry::resolve()`.  Only the records
-    // that fit the slice are resolved, so a slice covers one output block rather
-    // than the whole table.  The enumeration itself has to stay in the snapshot:
-    // an edge commit such as `mount --move` publishes its two parents' mount
-    // point maps one after the other, so an unlocked walk could meet the same
-    // mount through both of them and list it twice.
-    let candidates = with_topology_snapshot(|| collect_mount_candidates(view, cursor))?;
+    // Linux m_start()/m_stop() holds namespace_sem across a seq buffer's
+    // records. Capture the topology fields for this buffer under one snapshot:
+    // an MS_REC propagation change must not put different generations in two
+    // lines of one read. The selected Vec lives outside the closure so an error
+    // releases the topology lock before dropping any superblock snapshot pins.
+    let mut selected = Vec::new();
+    let mut covered_bytes = 0usize;
+    let has_more = with_topology_snapshot(|| -> Result<bool, SystemError> {
+        let candidates = collect_mount_candidates(view, cursor)?;
+        for (index, candidate) in candidates.iter().enumerate() {
+            if let Some(visible) = VisibleMount::resolve_in_snapshot(candidate, view)? {
+                covered_bytes = covered_bytes.saturating_add(minimum_line_len(&visible, kind));
+                selected.push(visible);
+                if covered_bytes >= budget {
+                    return Ok(index + 1 < candidates.len());
+                }
+            }
+        }
+        Ok(false)
+    })?;
+    let selected_count = selected.len();
+    let last_selected_id = selected.last().map(|mount| mount.mount_id);
     let mut record = String::new();
 
-    for (index, candidate) in candidates.iter().enumerate() {
-        // A mount the slice passes over is still a mount the reader's table has
-        // reached: the cursor is the reader's place in the table, not the
-        // number of records it has been handed.
-        let Some(entry) = ProcMountEntry::resolve(candidate, view)? else {
-            continue;
-        };
+    for (index, visible) in selected.into_iter().enumerate() {
+        let min_line_len = minimum_line_len(&visible, kind);
+        let entry = ProcMountEntry::from_visible(visible);
         record.clear();
         let fields = MountProcFields::from_entry(&entry)?;
         match kind {
@@ -111,17 +141,21 @@ pub(crate) fn render_mount_slice(
             ProcMountRenderKind::MountInfo => mountinfo_line::render(&fields, &mut record)?,
             ProcMountRenderKind::MountStats => mountstats_line::render(&fields, &mut record)?,
         }
+        debug_assert!(record.len() >= min_line_len);
         out.extend_from_slice(record.as_bytes());
         if out.len() >= budget {
             // A record that crossed the bound is handed out with this slice;
             // only a slice that has nothing left to reach ends the record.
-            return Ok(if index + 1 < candidates.len() {
-                Some(candidate.mount_id)
+            return Ok(if index + 1 < selected_count || has_more {
+                Some(entry.mount_id)
             } else {
                 None
             });
         }
     }
 
-    Ok(None)
+    // If there are more candidates, the minimum line length proves the selected
+    // records filled the budget. This arm is defensive if a formatter changes.
+    debug_assert!(!has_more || out.len() >= budget);
+    Ok(if has_more { last_selected_id } else { None })
 }

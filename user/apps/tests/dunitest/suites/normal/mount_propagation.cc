@@ -202,6 +202,31 @@ bool parse_mountinfo_tags(char* line, const char* mount_point, PropagationTags* 
     return token != nullptr;
 }
 
+void scan_propagation_line(const char* line, const char* const* mount_points, size_t count,
+                           PropagationTags* tags, bool* found) {
+    for (size_t i = 0; i < count; ++i) {
+        if (found[i]) {
+            continue;
+        }
+        char copy[2048] = {};
+        const size_t line_len = strnlen(line, sizeof(copy) - 1);
+        memcpy(copy, line, line_len);
+        copy[line_len] = '\0';
+        if (parse_mountinfo_tags(copy, mount_points[i], &tags[i])) {
+            found[i] = true;
+        }
+    }
+}
+
+bool all_propagation_paths_found(const bool* found, size_t count) {
+    for (size_t i = 0; i < count; ++i) {
+        if (!found[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool read_propagation_snapshot(const char* const* mount_points, size_t count,
                                PropagationTags* tags) {
     FILE* fp = fopen("/proc/self/mountinfo", "r");
@@ -216,26 +241,51 @@ bool read_propagation_snapshot(const char* const* mount_points, size_t count,
     }
     char line[2048] = {};
     while (fgets(line, sizeof(line), fp) != nullptr) {
-        for (size_t i = 0; i < count; ++i) {
-            if (found[i]) {
-                continue;
-            }
-            char copy[sizeof(line)] = {};
-            const size_t line_len = strnlen(line, sizeof(copy) - 1);
-            memcpy(copy, line, line_len);
-            copy[line_len] = '\0';
-            if (parse_mountinfo_tags(copy, mount_points[i], &tags[i])) {
-                found[i] = true;
-            }
-        }
+        scan_propagation_line(line, mount_points, count, tags, found);
     }
     fclose(fp);
-    for (size_t i = 0; i < count; ++i) {
-        if (!found[i]) {
-            return false;
-        }
+    return all_propagation_paths_found(found, count);
+}
+
+// Linux holds namespace_sem only from m_start() to m_stop() for one seq buffer
+// fill. DragonOS also takes a separate topology snapshot for each 4 KiB slice,
+// even when one read() asks for more. Limit the request to one x86_64 page and
+// accept it only if all three target lines are complete within that slice.
+bool read_propagation_snapshot_once(const char* const* mount_points, size_t count,
+                                    PropagationTags* tags) {
+    bool found[8] = {};
+    if (count > sizeof(found) / sizeof(found[0])) {
+        return false;
     }
-    return true;
+    int fd = open("/proc/self/mountinfo", O_RDONLY);
+    if (fd < 0) {
+        return false;
+    }
+    constexpr size_t kMountinfoSliceBytes = 4096;
+    char contents[kMountinfoSliceBytes + 1] = {};
+    ssize_t length;
+    do {
+        length = read(fd, contents, kMountinfoSliceBytes);
+    } while (length < 0 && errno == EINTR);
+    close(fd);
+    if (length <= 0) {
+        return false;
+    }
+
+    // Only complete lines from this one seq slice count. If the target mounts
+    // are not all present, the test cannot claim an atomic observation.
+    char* line = contents;
+    char* const end = contents + length;
+    while (line < end) {
+        char* newline = static_cast<char*>(memchr(line, '\n', end - line));
+        if (newline == nullptr) {
+            break;
+        }
+        *newline = '\0';
+        scan_propagation_line(line, mount_points, count, tags, found);
+        line = newline + 1;
+    }
+    return all_propagation_paths_found(found, count);
 }
 
 bool snapshot_is_uniform(const PropagationTags* tags, size_t count) {
@@ -1577,6 +1627,14 @@ TEST_F(MountPropagationTest, RecursiveChangesAreAtomicAgainstSnapshotsAndNamespa
     ASSERT_EQ(0, mount("", grandchild, "ramfs", 0, nullptr)) << strerror(errno);
     ASSERT_EQ(0, ensure_dir(dynamic)) << strerror(errno);
 
+    // This test compares three records from one seq slice. Check the fixture
+    // layout before workers race so an enlarged mount table has a clear error
+    // instead of being reported as a propagation atomicity failure.
+    const char* snapshot_paths[] = {base, child, grandchild};
+    PropagationTags initial_tags[3] = {};
+    ASSERT_TRUE(read_propagation_snapshot_once(snapshot_paths, 3, initial_tags))
+        << "test mounts must fit as complete lines in the first mountinfo page";
+
     int start_pipe[2] = {-1, -1};
     ASSERT_EQ(0, pipe(start_pipe)) << strerror(errno);
     int activity_pipe[2] = {-1, -1};
@@ -1718,7 +1776,7 @@ TEST_F(MountPropagationTest, RecursiveChangesAreAtomicAgainstSnapshotsAndNamespa
         for (size_t i = 0; i < 2; ++i) {
             PropagationTags tags[3] = {};
             if (!read_exact(activity_pipe[0], &token, 1) || token != phase_tokens[i] ||
-                !read_propagation_snapshot(paths, 3, tags) || !snapshot_is_uniform(tags, 3) ||
+                !read_propagation_snapshot_once(paths, 3, tags) || !snapshot_is_uniform(tags, 3) ||
                 (tags[0].shared > 0) != phase_is_shared[i] ||
                 !write_exact(ready_pipe[1], &token, 1)) {
                 _exit(10);
@@ -1728,7 +1786,7 @@ TEST_F(MountPropagationTest, RecursiveChangesAreAtomicAgainstSnapshotsAndNamespa
             _exit(9);
         }
         PropagationTags midpoint_tags[3] = {};
-        if (!read_propagation_snapshot(paths, 3, midpoint_tags) ||
+        if (!read_propagation_snapshot_once(paths, 3, midpoint_tags) ||
             !snapshot_is_uniform(midpoint_tags, 3) ||
             !write_exact(ready_pipe[1], "X", 1)) {
             _exit(10);
@@ -1746,7 +1804,7 @@ TEST_F(MountPropagationTest, RecursiveChangesAreAtomicAgainstSnapshotsAndNamespa
                 _exit(9);
             }
             PropagationTags tags[3] = {};
-            if (!read_propagation_snapshot(paths, 3, tags) || !snapshot_is_uniform(tags, 3)) {
+            if (!read_propagation_snapshot_once(paths, 3, tags) || !snapshot_is_uniform(tags, 3)) {
                 _exit(10);
             }
         }
@@ -1777,7 +1835,7 @@ TEST_F(MountPropagationTest, RecursiveChangesAreAtomicAgainstSnapshotsAndNamespa
         }
         const char* paths[] = {base, child, grandchild};
         PropagationTags tags[3] = {};
-        if (!read_propagation_snapshot(paths, 3, tags) || !snapshot_is_uniform(tags, 3)) {
+        if (!read_propagation_snapshot_once(paths, 3, tags) || !snapshot_is_uniform(tags, 3)) {
             _exit(13);
         }
         if (!write_exact(worker_done_pipe[1], "D", 1)) {

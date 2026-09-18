@@ -4,7 +4,7 @@ use system_error::SystemError;
 
 use crate::{
     filesystem::vfs::{
-        mount::{append_comma_options, with_topology_snapshot, MountFSInode, MountSnapshotGuard},
+        mount::{append_comma_options, MountFSInode, MountSnapshotGuard},
         FileSystem, MountFS,
     },
     libs::casting::DowncastArc,
@@ -18,8 +18,9 @@ use super::MountView;
 /// slice still has to enumerate every mount above the cursor to know which ones
 /// follow. Keeping a mount that a slice does not render down to identity is
 /// what makes that enumeration a topology step instead of a whole record: the
-/// fields of a mount are built by [`ProcMountEntry::resolve()`], and only for
-/// the mounts the slice hands out.
+/// topology fields of a mount are built by
+/// [`VisibleMount::resolve_in_snapshot()`], and only for the mounts the slice
+/// hands out.
 #[derive(Debug)]
 pub(crate) struct ProcMountCandidate {
     /// Mount id: the key the table order and the reader's cursor use.
@@ -44,72 +45,45 @@ pub(crate) struct ProcMountEntry {
     pub mountinfo_tags: String,
 }
 
-/// One mount of the table as the current topology shows it: the mount point and
-/// root path it is rendered from, and the pin that keeps its superblock behind
-/// them.
+/// One mount of the table as one topology snapshot shows it: its paths,
+/// propagation state, mount flags and superblock lifetime pin.
 ///
-/// This is what a record needs from the mount topology, so it is resolved as
-/// one piece while that snapshot is held.  The fields left over are built from
-/// it afterwards, because they run filesystem code: see
-/// [`ProcMountEntry::resolve()`].
-struct VisibleMount {
-    mount: Arc<MountFS>,
-    mountpoint_display: String,
-    parent_mount_id: usize,
-    mountinfo_root: String,
+/// All records in one seq slice capture this state under the same topology
+/// lock. Filesystem methods and inode metadata reads run afterwards, via
+/// [`ProcMountEntry::from_visible()`] and the renderer.
+pub(crate) struct VisibleMount {
+    pub mount: Arc<MountFS>,
+    pub mountpoint_display: String,
+    pub parent_mount_id: usize,
+    pub mountinfo_root: String,
+    pub mount_id: usize,
+    pub per_mount_options: String,
+    pub super_block_options: String,
+    pub mountinfo_tags: String,
     /// Keeps the superblock backend alive while the rest of the record is
     /// built from it, without making an ordinary umount report the mount busy.
-    pin: MountSnapshotGuard,
+    pub pin: MountSnapshotGuard,
 }
 
 impl ProcMountEntry {
-    /// Resolves the record of `candidate`, or `None` when the mount is not part
-    /// of `view`'s table.
-    ///
-    /// The mount's place in the topology -- the paths it is rendered from and
-    /// the pin its superblock needs -- is taken under one topology snapshot per
-    /// record, the way `seq_path_root()` renders a path from the topology of the
-    /// call it serves.  The rest of the record is built with that snapshot
-    /// released, because it runs filesystem code (the source name and the extra
-    /// mount options of the filesystem, then the metadata of the mount root,
-    /// which reads the on-disk inode of a disk filesystem): a filesystem that
-    /// needs the topology lock itself must not be called under it, and a slow
-    /// one must not stall the mount lifecycle lock every mount in the system
-    /// shares.
-    pub(crate) fn resolve(
-        candidate: &ProcMountCandidate,
-        view: &MountView,
-    ) -> Result<Option<Self>, SystemError> {
-        let Some(visible) = with_topology_snapshot(|| VisibleMount::resolve(candidate, view))?
-        else {
-            return Ok(None);
-        };
-        Ok(Some(Self::from_visible(visible)?))
-    }
-
-    /// Builds the fields every mount-family record shares, from a mount whose
-    /// superblock the snapshot pin already keeps alive.
-    fn from_visible(visible: VisibleMount) -> Result<Self, SystemError> {
+    /// Completes a topology snapshot after releasing its lock. `fs_type()` is
+    /// a filesystem method and must run outside the mount lifecycle lock.
+    pub(crate) fn from_visible(visible: VisibleMount) -> Self {
         let VisibleMount {
             mount,
             mountpoint_display,
             parent_mount_id,
             mountinfo_root,
+            mount_id,
+            per_mount_options,
+            super_block_options,
+            mountinfo_tags,
             pin,
         } = visible;
-        let mount_flags = mount.mount_flags();
-        let mut per_mount_options = mount_flags.proc_rw_token().to_string();
-        append_comma_options(&mut per_mount_options, mount_flags.proc_per_mount_options());
-        let super_block_flags = mount.super_block_flags();
-        let mut super_block_options = super_block_flags.proc_rw_token().to_string();
-        append_comma_options(
-            &mut super_block_options,
-            super_block_flags.proc_super_block_options(),
-        );
-        Ok(Self {
-            mount_id: mount.mount_id().into(),
+        Self {
+            mount_id,
             fstype: mount.fs_type().to_string(),
-            mountinfo_tags: mount.propagation().proc_mountinfo_tags(),
+            mountinfo_tags,
             per_mount_options,
             super_block_options,
             mount,
@@ -117,14 +91,14 @@ impl ProcMountEntry {
             mountinfo_root,
             parent_mount_id,
             _lifecycle_pin: pin,
-        })
+        }
     }
 }
 
 impl VisibleMount {
-    /// Resolves `candidate` from `view`, or `None` when the mount is not part
-    /// of `view`'s table.  The caller holds the topology snapshot.
-    fn resolve(
+    /// Resolve one candidate under the caller's topology snapshot. Every
+    /// visible mount in one seq slice is resolved in the same critical section.
+    pub(crate) fn resolve_in_snapshot(
         candidate: &ProcMountCandidate,
         view: &MountView,
     ) -> Result<Option<Self>, SystemError> {
@@ -182,12 +156,9 @@ impl VisibleMount {
         view: &MountView,
     ) -> Result<Option<Self>, SystemError> {
         let mount = candidate.mount.clone();
-        // The enumeration and this record are two snapshots, so the record
-        // re-checks its own place instead of trusting the walk: a mount an
-        // umount detached, or one the pinned root no longer reaches because the
-        // topology moved it, is passed over -- it is not part of the table the
-        // reader is being handed either (Linux reaches the same result by
-        // letting `seq_path_root()` skip it).
+        // Enumeration and record collection share one topology snapshot. A
+        // mount in the namespace tree can still be outside the pinned root;
+        // like Linux's `seq_path_root()`, skip a mount that root cannot reach.
         let Some(mountpoint) = mount.self_mountpoint() else {
             return Ok(None);
         };
@@ -216,7 +187,20 @@ impl VisibleMount {
         // on the superblock, and the `try_pin_snapshot()` failure arm is
         // defensive.
         let pin = mount.try_pin_snapshot()?;
+        let mount_flags = mount.mount_flags();
+        let mut per_mount_options = mount_flags.proc_rw_token().to_string();
+        append_comma_options(&mut per_mount_options, mount_flags.proc_per_mount_options());
+        let super_block_flags = mount.super_block_flags();
+        let mut super_block_options = super_block_flags.proc_rw_token().to_string();
+        append_comma_options(
+            &mut super_block_options,
+            super_block_flags.proc_super_block_options(),
+        );
         Ok(Self {
+            mount_id: mount.mount_id().into(),
+            mountinfo_tags: mount.propagation().proc_mountinfo_tags(),
+            per_mount_options,
+            super_block_options,
             mount,
             mountpoint_display,
             parent_mount_id,

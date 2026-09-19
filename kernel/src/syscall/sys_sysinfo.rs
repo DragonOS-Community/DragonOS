@@ -2,7 +2,6 @@ use crate::arch::interrupt::TrapFrame;
 use crate::arch::mm::LockedFrameAllocator;
 use crate::arch::syscall::nr::SYS_SYSINFO;
 use crate::mm::allocator::page_frame::FrameAllocator;
-use crate::mm::allocator::slab::slab_usage;
 use crate::process::ProcessManager;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
@@ -97,12 +96,13 @@ fn do_sysinfo(info: *mut PosixSysInfo) -> Result<usize, SystemError> {
     let mut sysinfo = PosixSysInfo::default();
 
     let mem = unsafe { LockedFrameAllocator.usage() };
-    let slab_usage = unsafe { slab_usage() };
 
     sysinfo.uptime = uptime_secs();
     sysinfo.loads = [0; 3];
     sysinfo.totalram = mem.total().bytes() as u64;
-    sysinfo.freeram = mem.free().bytes() as u64 + slab_usage.free();
+    // Linux reports buddy-allocator free pages here. Free object slots inside
+    // resident slab pages are not free physical memory.
+    sysinfo.freeram = mem.free().bytes() as u64;
     sysinfo.sharedram = 0;
     sysinfo.bufferram = 0;
     sysinfo.totalswap = 0;

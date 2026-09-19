@@ -5,6 +5,7 @@ use std::alloc::Layout;
 use std::collections::HashSet;
 use std::mem::{size_of, transmute};
 use std::prelude::v1::*;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::*;
 use test::Bencher;
@@ -330,6 +331,63 @@ fn test_readme() -> Result<(), AllocationError> {
 
     let allocated = zone.allocate(layout)?;
     unsafe { zone.deallocate(allocated, layout, &SlabCallback) }?;
+
+    Ok(())
+}
+
+static RECLAIMED_RESIDENT_PAGES: AtomicUsize = AtomicUsize::new(0);
+
+struct ReclaimingSlabCallback;
+
+impl CallBack for ReclaimingSlabCallback {
+    unsafe fn free_slab_page(&self, base_addr: *mut u8, size: usize) {
+        assert_eq!(size, OBJECT_PAGE_SIZE);
+        RECLAIMED_RESIDENT_PAGES.fetch_add(1, Ordering::SeqCst);
+        std::alloc::dealloc(
+            base_addr,
+            Layout::from_size_align(OBJECT_PAGE_SIZE, OBJECT_PAGE_SIZE).unwrap(),
+        );
+    }
+}
+
+static RECLAIMING_SLAB_CALLBACK: ReclaimingSlabCallback = ReclaimingSlabCallback;
+
+#[test]
+fn zone_usage_tracks_resident_pages_across_reclaim_paths() -> Result<(), AllocationError> {
+    let mut pager = Pager::new();
+    let mut zone: ZoneAllocator = Default::default();
+    let layout = Layout::from_size_align(2048, 1).unwrap();
+
+    let first_page = pager.allocate_page().expect("Can't allocate first page");
+    let second_page = pager.allocate_page().expect("Can't allocate second page");
+    unsafe {
+        zone.refill(layout, first_page)?;
+        zone.refill(layout, second_page)?;
+    }
+    assert_eq!(zone.usage().total(), (2 * OBJECT_PAGE_SIZE) as u64);
+
+    let first = zone.allocate(layout)?;
+    let second = zone.allocate(layout)?;
+    assert_eq!(zone.usage().total(), (2 * OBJECT_PAGE_SIZE) as u64);
+
+    let reclaimed_before = RECLAIMED_RESIDENT_PAGES.load(Ordering::SeqCst);
+    unsafe { zone.deallocate(first, layout, &RECLAIMING_SLAB_CALLBACK) }?;
+    assert_eq!(zone.usage().total(), (2 * OBJECT_PAGE_SIZE) as u64);
+
+    unsafe { zone.deallocate(second, layout, &RECLAIMING_SLAB_CALLBACK) }?;
+    assert_eq!(zone.usage().total(), OBJECT_PAGE_SIZE as u64);
+    assert_eq!(
+        RECLAIMED_RESIDENT_PAGES.load(Ordering::SeqCst) - reclaimed_before,
+        1
+    );
+
+    zone.try_reclaim_base_pages(usize::MAX, |page| unsafe {
+        std::alloc::dealloc(
+            page.cast::<u8>(),
+            Layout::from_size_align(OBJECT_PAGE_SIZE, OBJECT_PAGE_SIZE).unwrap(),
+        );
+    });
+    assert_eq!(zone.usage().total(), 0);
 
     Ok(())
 }

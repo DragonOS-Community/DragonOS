@@ -13,6 +13,7 @@ use crate::{
         vfs::{FilePrivateData, IndexNode, InodeMode},
     },
     mm::allocator::page_frame::FrameAllocator,
+    mm::allocator::slab::slab_usage,
     mm::page_cache_stats,
 };
 use alloc::{
@@ -40,6 +41,7 @@ impl MeminfoFileOps {
         use crate::arch::MMArch;
 
         let usage = unsafe { LockedFrameAllocator.usage() };
+        let slab_kb = slab_usage().total() >> 10;
         let stats = page_cache_stats::snapshot();
         let page_kb = (MMArch::PAGE_SIZE >> 10) as u64;
         let cached_pages = stats.file_pages.saturating_sub(stats.shmem_pages);
@@ -86,13 +88,18 @@ impl MeminfoFileOps {
                 .as_bytes()
                 .to_owned(),
         );
-        data.append(&mut format!("Slab:\t\t{} kB\n", 0u64).as_bytes().to_owned());
+        data.append(&mut format!("Slab:\t\t{} kB\n", slab_kb).as_bytes().to_owned());
         data.append(
             &mut format!("SReclaimable:\t{} kB\n", 0u64)
                 .as_bytes()
                 .to_owned(),
         );
-        data.append(&mut format!("SUnreclaim:\t{} kB\n", 0u64).as_bytes().to_owned());
+        // DragonOS currently has no typed reclaimable slab caches/shrinkers.
+        data.append(
+            &mut format!("SUnreclaim:\t{} kB\n", slab_kb)
+                .as_bytes()
+                .to_owned(),
+        );
 
         // 去除多余的 \0 并在结尾添加 \0
         trim_string(&mut data);

@@ -11,6 +11,7 @@ use core::{
     alloc::{AllocError, GlobalAlloc, Layout},
     intrinsics::unlikely,
     ptr::NonNull,
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use super::{
@@ -28,34 +29,82 @@ pub trait LocalAlloc {
 
 pub struct KernelAllocator;
 
+/// Bytes currently owned by kernel heap allocations that bypass the size-class
+/// allocator and are backed directly by buddy pages.
+static LARGE_ALLOCATION_BYTES: AtomicU64 = AtomicU64::new(0);
+
+#[inline]
+fn buddy_frame_count(layout: Layout) -> PageFrameCount {
+    let count = (page_align_up(layout.size()) / MMArch::PAGE_SIZE).next_power_of_two();
+    PageFrameCount::new(count)
+}
+
+#[inline]
+fn debit_large_allocation(bytes: u64) {
+    LARGE_ALLOCATION_BYTES
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_sub(bytes)
+        })
+        .expect("large kernel allocation accounting underflow");
+}
+
+pub(super) fn large_allocation_bytes() -> u64 {
+    LARGE_ALLOCATION_BYTES.load(Ordering::Relaxed)
+}
+
 impl KernelAllocator {
     unsafe fn alloc_in_buddy(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
-        // 计算需要申请的页数，向上取整
-        let count = (page_align_up(layout.size()) / MMArch::PAGE_SIZE).next_power_of_two();
-        let page_frame_count = PageFrameCount::new(count);
+        let page_frame_count = buddy_frame_count(layout);
         let (phy_addr, allocated_frame_count) = LockedFrameAllocator
             .allocate(page_frame_count)
             .ok_or(AllocError)?;
+        if allocated_frame_count != page_frame_count {
+            LockedFrameAllocator.free(phy_addr, allocated_frame_count);
+            return Err(AllocError);
+        }
+        debug_assert_eq!(allocated_frame_count, page_frame_count);
 
-        let virt_addr = unsafe { MMArch::phys_2_virt(phy_addr).ok_or(AllocError)? };
+        let Some(virt_addr) = (unsafe { MMArch::phys_2_virt(phy_addr) }) else {
+            LockedFrameAllocator.free(phy_addr, allocated_frame_count);
+            return Err(AllocError);
+        };
         if unlikely(virt_addr.is_null()) {
+            LockedFrameAllocator.free(phy_addr, allocated_frame_count);
             return Err(AllocError);
         }
 
+        let allocated_bytes = allocated_frame_count.bytes();
         let slice = unsafe {
-            core::slice::from_raw_parts_mut(
-                virt_addr.data() as *mut u8,
-                allocated_frame_count.data() * MMArch::PAGE_SIZE,
-            )
+            core::slice::from_raw_parts_mut(virt_addr.data() as *mut u8, allocated_bytes)
         };
+        LARGE_ALLOCATION_BYTES
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(allocated_bytes as u64)
+            })
+            .expect("large kernel allocation accounting overflow");
         return Ok(NonNull::from(slice));
     }
 
-    pub(super) unsafe fn free_in_buddy(&self, ptr: *mut u8, layout: Layout) {
-        // 由于buddy分配的页数量是2的幂，因此释放的时候也需要按照2的幂向上取整。
-        let count = (page_align_up(layout.size()) / MMArch::PAGE_SIZE).next_power_of_two();
-        let page_frame_count = PageFrameCount::new(count);
+    /// Transfers a direct buddy allocation into the size-class slab domain.
+    /// The backing pages remain allocated; only their accounting owner changes.
+    pub(super) fn transfer_large_allocation_to_slab(&self, layout: Layout) {
+        debug_assert!(allocator_select_condition(layout));
+        debit_large_allocation(buddy_frame_count(layout).bytes() as u64);
+    }
+
+    /// Frees buddy pages whose accounting is owned by another allocator.
+    pub(super) unsafe fn free_buddy_raw(&self, ptr: *mut u8, layout: Layout) {
+        let page_frame_count = buddy_frame_count(layout);
         let phy_addr = MMArch::virt_2_phys(VirtAddr::new(ptr as usize)).unwrap();
+        LockedFrameAllocator.free(phy_addr, page_frame_count);
+    }
+
+    unsafe fn dealloc_large(&self, ptr: *mut u8, layout: Layout) {
+        let page_frame_count = buddy_frame_count(layout);
+        // Validate the address before changing accounting. A failed conversion
+        // must not leave a live allocation unaccounted.
+        let phy_addr = MMArch::virt_2_phys(VirtAddr::new(ptr as usize)).unwrap();
+        debit_large_allocation(page_frame_count.bytes() as u64);
         LockedFrameAllocator.free(phy_addr, page_frame_count);
     }
 }
@@ -103,7 +152,7 @@ impl LocalAlloc for KernelAllocator {
 
     unsafe fn local_dealloc(&self, ptr: *mut u8, layout: Layout) {
         if allocator_select_condition(layout) {
-            self.free_in_buddy(ptr, layout)
+            self.dealloc_large(ptr, layout)
         } else {
             let mut guard = SLABALLOCATOR.lock_irqsave();
             if let Some(ref mut slab) = *guard {

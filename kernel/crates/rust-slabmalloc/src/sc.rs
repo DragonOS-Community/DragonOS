@@ -99,6 +99,14 @@ impl<'a, P: AllocablePage> SCAllocator<'a, P> {
         self.size
     }
 
+    /// Returns the number of backing pages currently owned by this allocator.
+    ///
+    /// Every page belongs to exactly one of the empty, partial, or full lists,
+    /// so the list lengths are the authoritative resident-page accounting.
+    pub(crate) fn resident_pages(&self) -> usize {
+        self.empty_slabs.elements + self.slabs.elements + self.full_slabs.elements
+    }
+
     /// Add a new ObjectPage.
     fn insert_partial_slab(&mut self, new_head: &'a mut P) {
         new_head.set_page_state(PageState::Partial);

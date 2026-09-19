@@ -8,7 +8,8 @@ use crate::{
     driver::base::block::SeekFrom,
     filesystem::vfs::{
         fcntl::AtFlags,
-        file::{File, FileDescriptorTable},
+        fdtable::FileDescriptorTable,
+        file::File,
         open::do_open_execat,
         permission::{check_inode_permission, PermissionMask},
     },

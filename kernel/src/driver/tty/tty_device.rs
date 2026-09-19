@@ -626,22 +626,13 @@ impl IndexNode for TtyDevice {
                 let flags = FileFlags::from_bits(arg as u32).ok_or(SystemError::EINVAL)?;
                 let cloexec = flags.contains(FileFlags::O_CLOEXEC);
                 let slave_inode = ptm_peer_inode(tty)?;
-                let fd_table = ProcessManager::current_pcb().fd_table();
-                let reserved_fd = fd_table.write().reserve_fd(cloexec)?;
-                let file = match File::new(slave_inode, flags) {
-                    Ok(file) => file,
-                    Err(err) => {
-                        fd_table.write().release_reserved_fd(reserved_fd);
-                        return Err(err);
-                    }
-                };
-                return match fd_table.write().install_reserved_fd(reserved_fd, file) {
-                    Ok(fd) => Ok(fd as usize),
-                    Err(err) => {
-                        fd_table.write().release_reserved_fd(reserved_fd);
-                        Err(err)
-                    }
-                };
+                let current = ProcessManager::current_pcb();
+                let reservation =
+                    current
+                        .fd_table()
+                        .reserve::<1>(current.nofile_soft_limit(), 0, cloexec)?;
+                let file = File::new(slave_inode, flags)?;
+                return reservation.install(file).map(|fd| fd as usize);
             }
             TtyIoctlCmd::TIOCGWINSZ => {
                 let core = tty.core();

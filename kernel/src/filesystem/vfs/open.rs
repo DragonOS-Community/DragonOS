@@ -283,8 +283,9 @@ fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usize, SystemE
     // Match Linux's get_unused_fd_flags() ordering: reserve the descriptor
     // before pathname lookup and before create/truncate/open side effects.
     let cloexec = how.o_flags.contains(FileFlags::O_CLOEXEC);
-    let fd_table = ProcessManager::current_pcb().fd_table();
-    let reservation = fd_table.write().reserve_fd(cloexec)?;
+    let current = ProcessManager::current_pcb();
+    let fd_table = current.fd_table();
+    let reservation = fd_table.reserve::<1>(current.nofile_soft_limit(), 0, cloexec)?;
     let open_result = (|| -> Result<File, SystemError> {
         let path = path.trim();
         // Linux makes O_CREAT|O_EXCL imply O_NOFOLLOW for the final component.
@@ -531,18 +532,8 @@ fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usize, SystemE
         Ok(file)
     })();
 
-    let file = match open_result {
-        Ok(file) => file,
-        Err(error) => {
-            fd_table.write().release_reserved_fd(reservation);
-            return Err(error);
-        }
-    };
-    let result = fd_table
-        .write()
-        .install_reserved_fd(reservation, file)
-        .map(|fd| fd as usize);
-    result
+    let file = open_result?;
+    reservation.install(file).map(|fd| fd as usize)
 }
 
 /// 为exec打开可执行文件
@@ -663,7 +654,7 @@ pub fn do_utimensat(
             }
 
             let binding = ProcessManager::current_pcb().fd_table();
-            let fd_table_guard = binding.write();
+            let fd_table_guard = binding.read();
             let file = fd_table_guard
                 .get_file_by_fd(dirfd)
                 .ok_or(SystemError::EBADF)?;

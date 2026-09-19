@@ -51,7 +51,7 @@ impl Syscall for SysSendfileHandle {
 
         let (out_file, in_file) = {
             let binding = ProcessManager::current_pcb().fd_table();
-            let fd_table_guard = binding.write();
+            let fd_table_guard = binding.read();
 
             let out_file = fd_table_guard
                 .get_file_by_fd(out_fd)

@@ -33,10 +33,9 @@ impl Syscall for SysDup2Handle {
     fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let oldfd = Self::oldfd(args);
         let newfd = Self::newfd(args);
-        let binding = ProcessManager::current_pcb().fd_table();
-        let mut fd_table_guard = binding.write();
-        let (newfd, dropped) = do_dup2(oldfd, newfd, &mut fd_table_guard)?;
-        drop(fd_table_guard);
+        let current = ProcessManager::current_pcb();
+        let binding = current.fd_table();
+        let (newfd, dropped) = do_dup2(oldfd, newfd, &binding, current.nofile_soft_limit())?;
         if let Some(dropped) = dropped {
             if let Err(err) = dropped.finish_close() {
                 log::warn!("dup2 implicit close failed after fd replacement: {:?}", err);

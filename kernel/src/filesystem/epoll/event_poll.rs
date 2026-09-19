@@ -143,9 +143,7 @@ impl EventPoll {
 
         let current_pcb = ProcessManager::current_pcb();
         let fd_table = current_pcb.fd_table();
-        let mut fd_table_guard = fd_table.write();
-
-        let fd = fd_table_guard.alloc_fd(ep_file, None, cloexec)?;
+        let fd = fd_table.alloc_fd(ep_file, cloexec, current_pcb.nofile_soft_limit())?;
 
         Ok(fd as usize)
     }

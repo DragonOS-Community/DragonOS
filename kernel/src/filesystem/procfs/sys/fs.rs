@@ -41,17 +41,17 @@ impl DirOps for FsDirOps {
         dir: &ProcDir<Self>,
         name: &str,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
-        if name != "mount-max" && name != "suid_dumpable" {
+        if name != "mount-max" && name != "nr_open" && name != "suid_dumpable" {
             return Err(SystemError::ENOENT);
         }
         let mut cached_children = dir.cached_children().write();
         if let Some(child) = cached_children.get(name) {
             return Ok(child.clone());
         }
-        let inode = if name == "mount-max" {
-            MountMaxFileOps::new_inode(dir.self_ref_weak().clone())
-        } else {
-            SuidDumpableFileOps::new_inode(dir.self_ref_weak().clone())
+        let inode = match name {
+            "mount-max" => MountMaxFileOps::new_inode(dir.self_ref_weak().clone()),
+            "nr_open" => NrOpenFileOps::new_inode(dir.self_ref_weak().clone()),
+            _ => SuidDumpableFileOps::new_inode(dir.self_ref_weak().clone()),
         };
         cached_children.insert(name.to_string(), inode.clone());
         Ok(inode)
@@ -63,6 +63,9 @@ impl DirOps for FsDirOps {
         cached_children
             .entry("mount-max".to_string())
             .or_insert_with(|| MountMaxFileOps::new_inode(self_weak.clone()));
+        cached_children
+            .entry("nr_open".to_string())
+            .or_insert_with(|| NrOpenFileOps::new_inode(self_weak.clone()));
         cached_children
             .entry("suid_dumpable".to_string())
             .or_insert_with(|| SuidDumpableFileOps::new_inode(self_weak));
@@ -116,11 +119,58 @@ impl FileOps for MountMaxFileOps {
         if offset != 0 {
             return Ok(buf.len());
         }
-        let (value, consumed) = parse_mount_max(buf)?;
+        let (value, consumed) = parse_numeric_sysctl(buf)?;
         if !(1..=i32::MAX as i64).contains(&value) {
             return Err(SystemError::EINVAL);
         }
         set_mount_max(value as u32)?;
+        Ok(consumed)
+    }
+}
+
+#[derive(Debug)]
+struct NrOpenFileOps;
+
+impl NrOpenFileOps {
+    fn new_inode(parent: Weak<dyn IndexNode>) -> Arc<dyn IndexNode> {
+        ProcFileBuilder::new(Self, InodeMode::from_bits_truncate(0o644))
+            .parent(parent)
+            .build()
+            .unwrap()
+    }
+}
+
+impl FileOps for NrOpenFileOps {
+    fn read_at(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &mut [u8],
+        _data: MutexGuard<FilePrivateData>,
+    ) -> Result<usize, SystemError> {
+        if offset != 0 {
+            return Ok(0);
+        }
+        let content = format!("{}\n", crate::filesystem::vfs::fdtable::nr_open());
+        proc_read(offset, len, buf, content.as_bytes())
+    }
+
+    fn write_at(
+        &self,
+        offset: usize,
+        _len: usize,
+        buf: &[u8],
+        _data: MutexGuard<FilePrivateData>,
+    ) -> Result<usize, SystemError> {
+        if ProcessManager::current_pcb().cred().euid.data() != 0 {
+            return Err(SystemError::EPERM);
+        }
+        if offset != 0 {
+            return Ok(buf.len());
+        }
+        let (value, consumed) = parse_numeric_sysctl(buf)?;
+        let value = usize::try_from(value).map_err(|_| SystemError::EINVAL)?;
+        crate::filesystem::vfs::fdtable::set_nr_open(value)?;
         Ok(consumed)
     }
 }
@@ -170,7 +220,7 @@ impl FileOps for SuidDumpableFileOps {
         if offset != 0 {
             return Ok(buf.len());
         }
-        let (value, consumed) = parse_mount_max(buf)?;
+        let (value, consumed) = parse_numeric_sysctl(buf)?;
         // Only 0/1/2 are valid values
         if !(0..=2).contains(&value) {
             return Err(SystemError::EINVAL);
@@ -183,7 +233,7 @@ impl FileOps for SuidDumpableFileOps {
 /// Parse one Linux numeric-sysctl token. Linux consumes leading whitespace,
 /// one base-0 signed integer and the whitespace immediately following it. A
 /// later token is left for a short write rather than rejecting the first one.
-fn parse_mount_max(buf: &[u8]) -> Result<(i64, usize), SystemError> {
+fn parse_numeric_sysctl(buf: &[u8]) -> Result<(i64, usize), SystemError> {
     let mut cursor = 0;
     while cursor < buf.len() && buf[cursor].is_ascii_whitespace() {
         cursor += 1;

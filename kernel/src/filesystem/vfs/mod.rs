@@ -1,6 +1,7 @@
 pub mod append_lock;
 pub mod fasync;
 pub mod fcntl;
+pub mod fdtable;
 pub mod file;
 pub mod flock;
 pub mod inode_lifecycle;

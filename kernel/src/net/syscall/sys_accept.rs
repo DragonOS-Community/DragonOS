@@ -114,10 +114,11 @@ pub(crate) fn do_accept(
 
     let cloexec = flags & FileFlags::O_CLOEXEC.bits() != 0;
 
-    let new_fd = ProcessManager::current_pcb().fd_table().write().alloc_fd(
+    let current = ProcessManager::current_pcb();
+    let new_fd = current.fd_table().alloc_fd(
         File::new_socket(new_socket, file_mode)?,
-        None,
         cloexec,
+        current.nofile_soft_limit(),
     )?;
 
     if !addr.is_null() {

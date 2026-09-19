@@ -191,10 +191,10 @@ pub fn kvm_dev_ioctl_create_vm(_vmtype: usize) -> Result<usize, SystemError> {
     // 创建vm文件，返回文件描述符
     let vm_inode = LockedVmInode::new();
     let file: File = File::new(vm_inode, FileFlags::O_RDWR)?;
-    let r = ProcessManager::current_pcb()
+    let current = ProcessManager::current_pcb();
+    let r = current
         .fd_table()
-        .write()
-        .alloc_fd(file, None, false)
+        .alloc_fd(file, false, current.nofile_soft_limit())
         .map(|fd| fd as usize);
     return r;
 }

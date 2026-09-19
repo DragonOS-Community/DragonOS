@@ -12,7 +12,8 @@ use crate::{
     filesystem::{
         cgroup2::{cgroup2_check_attach_permissions, cgroup2_inode_to_node},
         vfs::{
-            file::{File, FileDescriptorTable, FileFlags, ReservedFd},
+            fdtable::{FdReservation, FileDescriptorTable},
+            file::{File, FileFlags},
             FileType,
         },
     },
@@ -788,11 +789,6 @@ impl ProcessManager {
             )
         });
 
-        // Resource limits were shared (CLONE_THREAD) or copied (fork) when
-        // the unpublished PCB was constructed. Preserve the existing eager
-        // RLIMIT_NOFILE fd-table sizing after copy_files().
-        pcb.sync_fd_table_to_nofile_limit();
-
         // 继承 executable_path
         // 修复：fork时需要复制父进程的可执行文件路径，而不是使用进程名
         // 这样才能正确支持通过/proc/self/exe重新执行程序
@@ -910,8 +906,8 @@ impl ProcessManager {
             None
         };
 
-        let mut reserved_pidfd: Option<ReservedFd> = None;
-        let mut pidfd_file: Option<File> = None;
+        let mut reserved_pidfd: Option<FdReservation<1>> = None;
+        let mut pidfd_file: Option<Arc<File>> = None;
         if clone_flags.contains(CloneFlags::CLONE_PIDFD) {
             let pid = pcb.pid();
             let prepared = match PidFd::prepare(current_pcb, pid, FileFlags::empty(), false) {
@@ -921,7 +917,7 @@ impl ProcessManager {
                     return Err(err);
                 }
             };
-            let fd = prepared.reservation.fd();
+            let fd = prepared.reservation.fd(0);
 
             let write_pidfd_result = (|| -> Result<(), SystemError> {
                 let mut writer = UserBufferWriter::new(
@@ -932,10 +928,6 @@ impl ProcessManager {
                 writer.copy_one_to_user(&(fd as i32), 0)
             })();
             if let Err(err) = write_pidfd_result {
-                current_pcb
-                    .fd_table()
-                    .write()
-                    .release_reserved_fd(prepared.reservation);
                 Self::rollback_failed_fork(current_pcb, None, reserved_cgroup.as_ref());
                 return Err(err);
             }
@@ -1183,12 +1175,7 @@ impl ProcessManager {
             break result;
         };
         if let Err(err) = publish_result {
-            if let Some(reservation) = reserved_pidfd.take() {
-                current_pcb
-                    .fd_table()
-                    .write()
-                    .release_reserved_fd(reservation);
-            }
+            drop(reserved_pidfd.take());
             Self::rollback_failed_fork(current_pcb, None, reserved_cgroup.as_ref());
             return Err(err);
         }
@@ -1243,12 +1230,11 @@ impl ProcessManager {
         // reservation invariant was violated, not a recoverable fork error.
         match (reserved_pidfd.take(), pidfd_file.take()) {
             (Some(reservation), Some(file)) => {
-                let installed = current_pcb
-                    .fd_table()
-                    .write()
-                    .install_reserved_fd(reservation, file)
+                let expected = reservation.fd(0);
+                let installed = reservation
+                    .install_arc(file)
                     .expect("reserved pidfd slot changed before fork publication");
-                assert_eq!(installed, reservation.fd());
+                assert_eq!(installed, expected);
             }
             (None, None) => {}
             _ => unreachable!("pidfd reservation and file must be prepared together"),
@@ -1288,11 +1274,7 @@ impl ProcessManager {
         reserved_cgroup: Option<&Arc<crate::cgroup::CgroupNode>>,
     ) {
         if let Some(fd) = installed_pidfd {
-            let dropped = {
-                let fd_table = current_pcb.fd_table();
-                let mut fd_table_guard = fd_table.write();
-                fd_table_guard.drop_fd(fd)
-            };
+            let dropped = current_pcb.fd_table().drop_fd(fd);
             match dropped {
                 Ok(dropped) => {
                     if let Err(err) = dropped.finish_close() {

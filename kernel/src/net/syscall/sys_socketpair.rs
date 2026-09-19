@@ -123,9 +123,6 @@ pub(super) fn do_socketpair(
         Err(err) => return Err(err),
     };
 
-    let binding = ProcessManager::current_pcb().fd_table();
-    let mut fd_table_guard = binding.write();
-
     // Linux socketpair(2) semantics:
     // - known non-UNIX families with a valid type return EOPNOTSUPP
     // - invalid/unsupported type returns ESOCKTNOSUPPORT before family-specific pairing logic
@@ -142,6 +139,14 @@ pub(super) fn do_socketpair(
     if protocol != 0 && protocol != AddressFamily::Unix as usize {
         return Err(SystemError::EPROTONOSUPPORT);
     }
+
+    let current = ProcessManager::current_pcb();
+    let cloexec = socket_type.contains(PosixArgsSocketType::CLOEXEC);
+    let reservation = current
+        .fd_table()
+        .reserve::<2>(current.nofile_soft_limit(), 0, cloexec)?;
+    fds[0] = reservation.fd(0);
+    fds[1] = reservation.fd(1);
 
     let nonblocking = socket_type.contains(PosixArgsSocketType::NONBLOCK);
 
@@ -171,19 +176,10 @@ pub(super) fn do_socketpair(
         }
     };
 
-    let cloexec = socket_type.contains(PosixArgsSocketType::CLOEXEC);
-
-    fds[0] = fd_table_guard.alloc_fd(
-        File::new_socket(socket_a, FileFlags::O_RDWR)?,
-        None,
-        cloexec,
-    )?;
-    fds[1] = fd_table_guard.alloc_fd(
-        File::new_socket(socket_b, FileFlags::O_RDWR)?,
-        None,
-        cloexec,
-    )?;
-
-    drop(fd_table_guard);
+    let file_a = File::new_socket(socket_a, FileFlags::O_RDWR)?;
+    let file_b = File::new_socket(socket_b, FileFlags::O_RDWR)?;
+    let file_a = alloc::sync::Arc::try_new(file_a).map_err(|_| SystemError::ENOMEM)?;
+    let file_b = alloc::sync::Arc::try_new(file_b).map_err(|_| SystemError::ENOMEM)?;
+    reservation.install_arc_pair(file_a, file_b)?;
     Ok(0)
 }

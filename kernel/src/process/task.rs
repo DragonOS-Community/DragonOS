@@ -8,7 +8,7 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
-use log::{error, warn};
+use log::warn;
 use system_error::SystemError;
 
 use crate::{
@@ -22,10 +22,7 @@ use crate::{
     exception::InterruptArch,
     filesystem::{
         fs::FsStruct,
-        vfs::{
-            file::{FileDescriptorTable, FileDescriptorVec},
-            FileType, IndexNode,
-        },
+        vfs::{fdtable::FileDescriptorTable, FileType, IndexNode},
     },
     ipc::{
         sem_undo::{SemUndoAttachment, SemUndoGroup, UnpublishedSemUndoAttachmentGuard},
@@ -640,12 +637,12 @@ impl ProcessControlBlock {
             rlim_max: 0,
         }; RLimitID::Nlimits as usize];
 
-        // Linux typical defaults: soft limit 1024, hard limit adjustable via
-        // setrlimit. The file descriptor table auto-expands based on
-        // RLIMIT_NOFILE.
+        // Keep the process policy independent from fd-table storage. This
+        // matches Linux's common 1024 soft default while leaving room for an
+        // unprivileged process to raise the soft limit up to 4096.
         arr[RLimitID::Nofile as usize] = RLimit64 {
-            rlim_cur: FileDescriptorVec::MAX_CAPACITY as u64,
-            rlim_max: FileDescriptorVec::MAX_CAPACITY as u64,
+            rlim_cur: 1024,
+            rlim_max: 4096,
         };
 
         arr[RLimitID::Stack as usize] = RLimit64 {
@@ -683,6 +680,11 @@ impl ProcessControlBlock {
         self.rlimits.read()[res as usize]
     }
 
+    #[inline]
+    pub fn nofile_soft_limit(&self) -> usize {
+        self.get_rlimit(RLimitID::Nofile).rlim_cur as usize
+    }
+
     pub fn set_rlimit(
         &self,
         res: RLimitID,
@@ -697,14 +699,12 @@ impl ProcessControlBlock {
         // When rlim_cur is 0, no new file descriptors can be allocated, but
         // existing fds remain usable.
 
-        // For RLIMIT_NOFILE, check against the system's maximum capacity limit.
-        if res == RLimitID::Nofile {
-            if newv.rlim_cur > FileDescriptorVec::MAX_CAPACITY as u64 {
-                return Err(SystemError::EINVAL);
-            }
-            if newv.rlim_max > FileDescriptorVec::MAX_CAPACITY as u64 {
-                return Err(SystemError::EINVAL);
-            }
+        // Linux rejects a hard nofile limit above fs.nr_open with EPERM. The
+        // soft limit is already constrained by soft <= hard above.
+        if res == RLimitID::Nofile
+            && newv.rlim_max > crate::filesystem::vfs::fdtable::nr_open() as u64
+        {
+            return Err(SystemError::EPERM);
         }
 
         // The whole thread group shares this lock. Compare the hard limit and
@@ -723,47 +723,7 @@ impl ProcessControlBlock {
             cur
         };
 
-        // File-descriptor allocation always enforces the shared limit and
-        // grows on demand. Keep eager resizing as a lock-order-safe
-        // best-effort optimization; a failure must not roll back over a newer
-        // concurrent group update.
-        if res == RLimitID::Nofile {
-            if let Err(e) = self.adjust_fd_table_for_rlimit_change(newv.rlim_cur as usize) {
-                warn!("Failed to resize fd table after RLIMIT_NOFILE update: {e:?}");
-            }
-        }
-
         Ok(cur)
-    }
-
-    /// Match the eager fd-table capacity optimization to the resource limits
-    /// already shared or copied when this PCB was constructed. Allocation
-    /// paths still enforce the shared RLIMIT_NOFILE on every operation.
-    pub(crate) fn sync_fd_table_to_nofile_limit(&self) {
-        let nofile_limit = self.get_rlimit(RLimitID::Nofile).rlim_cur as usize;
-        if let Err(e) = self.adjust_fd_table_for_rlimit_change(nofile_limit) {
-            error!(
-                "Failed to adjust fd table after inheriting RLIMIT_NOFILE: {:?}",
-                e
-            );
-        }
-    }
-
-    /// Adjust the file descriptor table when RLIMIT_NOFILE changes.
-    ///
-    /// ## Parameters
-    /// - `new_rlimit_nofile`: The new RLIMIT_NOFILE value.
-    ///
-    /// ## Returns
-    /// - `Ok(())`: Adjustment succeeded.
-    /// - `Err(SystemError)`: Adjustment failed.
-    fn adjust_fd_table_for_rlimit_change(
-        &self,
-        new_rlimit_nofile: usize,
-    ) -> Result<(), system_error::SystemError> {
-        let fd_table = self.basic.read().try_fd_table().unwrap();
-        let mut fd_table_guard = fd_table.write();
-        fd_table_guard.adjust_for_rlimit_change(new_rlimit_nofile)
     }
 
     /// Returns the current process's lock hold count.

@@ -1090,12 +1090,12 @@ pub fn do_inotify_init1(flags: u32) -> Result<usize, SystemError> {
     file.set_mode_flags(FileMode::FMODE_NONOTIFY);
 
     let cloexec = flags.contains(InotifyInitFlags::IN_CLOEXEC);
-    let binding = ProcessManager::current_pcb().fd_table();
-    let mut fd_table_guard = binding.write();
+    let current = ProcessManager::current_pcb();
+    let binding = current.fd_table();
     // On alloc_fd failure the file is dropped → File::drop → close → shutdown → roll
     // back the instance count, so there is no need to roll back manually here.
-    fd_table_guard
-        .alloc_fd(file, None, cloexec)
+    binding
+        .alloc_fd(file, cloexec, current.nofile_soft_limit())
         .map(|fd| fd as usize)
 }
 

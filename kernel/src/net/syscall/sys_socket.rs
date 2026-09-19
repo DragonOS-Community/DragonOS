@@ -109,9 +109,9 @@ pub(super) fn do_socket(
 
     let file = File::new_socket(inode, FileFlags::O_RDWR)?;
     // 把socket添加到当前进程的文件描述符表中
-    ProcessManager::current_pcb()
+    let current = ProcessManager::current_pcb();
+    current
         .fd_table()
-        .write()
-        .alloc_fd(file, None, is_close_on_exec)
+        .alloc_fd(file, is_close_on_exec, current.nofile_soft_limit())
         .map(|x| x as usize)
 }

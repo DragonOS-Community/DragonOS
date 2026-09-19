@@ -218,12 +218,10 @@ fn do_execve_internal(
             commit_exec_futex_state(&pcb, old_vm.as_ref(), &address_space);
 
             // close-on-exec 必须属于成功 exec 的 commit 过程，不能留在 syscall wrapper 尾部。
-            let dropped_fds = {
-                let fd_table = pcb.fd_table();
-                let dropped = fd_table.write().close_on_exec();
-                dropped
-            };
-            for dropped in dropped_fds {
+            let fd_table = pcb.fd_table();
+            let mut cursor = 0;
+            while let Some((next, dropped)) = fd_table.take_next_cloexec(cursor) {
+                cursor = next;
                 if let Err(err) = dropped.finish_close() {
                     log::error!("execve close_on_exec flush failed: {:?}", err);
                 }

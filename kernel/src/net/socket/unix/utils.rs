@@ -6,24 +6,12 @@ use crate::syscall::user_access::UserBufferWriter;
 
 /// Best-effort rollback for file descriptors allocated during SCM_RIGHTS delivery.
 ///
-/// This is used when copying control messages to userspace fails after we have
-/// already allocated fds in the current process.
+/// SCM_RIGHTS partial-delivery semantics are intentionally kept separate from
+/// the fixed-size atomic reservation used by pipe/socketpair.
 pub(super) fn rollback_allocated_fds(fds: &[i32]) {
-    if fds.is_empty() {
-        return;
-    }
-
-    let fd_table_binding = ProcessManager::current_pcb().fd_table();
-    let mut dropped_fds = alloc::vec::Vec::new();
-    let mut fd_table = fd_table_binding.write();
-    for &fd in fds {
-        if let Ok(dropped) = fd_table.drop_fd(fd) {
-            dropped_fds.push(dropped);
-        }
-    }
-    drop(fd_table);
-    for dropped in dropped_fds {
-        let _ = dropped.finish_close();
+    let dropped = ProcessManager::current_pcb().fd_table().drop_fds(fds);
+    for file in dropped {
+        let _ = file.finish_close();
     }
 }
 

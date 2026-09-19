@@ -139,4 +139,5 @@ normal/internal_shmem
 normal/fd_table_semantics
 normal/proc_task_status
 normal/proc_stat_sched_fields
+normal/slab_memory_accounting
 normal/procfs_task_semantics

@@ -2,6 +2,7 @@
 
 use crate::libs::mutex::MutexGuard;
 use crate::{
+    arch::MMArch,
     filesystem::{
         procfs::{
             template::{Builder, FileOps, ProcFileBuilder},
@@ -9,7 +10,7 @@ use crate::{
         },
         vfs::{FilePrivateData, IndexNode, InodeMode},
     },
-    mm::{fault, oom, page_cache_stats},
+    mm::{allocator::slab::slab_usage, fault, oom, page_cache_stats, MemoryManagementArch},
 };
 use alloc::{borrow::ToOwned, format, sync::Arc, sync::Weak, vec::Vec};
 use system_error::SystemError;
@@ -27,6 +28,8 @@ enum VmstatSource {
     OomKill,
     PageFaults,
     PageMajorFaults,
+    SlabReclaimable,
+    SlabUnreclaimable,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -97,11 +100,11 @@ const VMSTAT_FIELDS: &[VmstatField] = &[
     },
     VmstatField {
         name: "nr_slab_reclaimable",
-        source: VmstatSource::Zero,
+        source: VmstatSource::SlabReclaimable,
     },
     VmstatField {
         name: "nr_slab_unreclaimable",
-        source: VmstatSource::Zero,
+        source: VmstatSource::SlabUnreclaimable,
     },
     VmstatField {
         name: "nr_isolated_anon",
@@ -461,6 +464,7 @@ impl VmstatFileOps {
 
     fn generate_vmstat_content() -> Vec<u8> {
         let stats = page_cache_stats::snapshot();
+        let slab_pages = slab_usage().total() / MMArch::PAGE_SIZE as u64;
         let mut data: Vec<u8> = Vec::new();
 
         for field in VMSTAT_FIELDS {
@@ -476,6 +480,8 @@ impl VmstatFileOps {
                 VmstatSource::OomKill => oom::oom_kill_count(),
                 VmstatSource::PageFaults => fault::page_fault_count(),
                 VmstatSource::PageMajorFaults => fault::page_major_fault_count(),
+                VmstatSource::SlabReclaimable => 0,
+                VmstatSource::SlabUnreclaimable => slab_pages,
             };
             data.append(&mut format!("{} {}\n", field.name, value).as_bytes().to_owned());
         }

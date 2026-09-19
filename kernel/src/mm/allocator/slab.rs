@@ -7,6 +7,8 @@ use slabmalloc::*;
 use crate::libs::spinlock::SpinLock;
 use crate::{arch::MMArch, mm::MemoryManagementArch, KERNEL_ALLOCATOR};
 
+use super::kernel_allocator::large_allocation_bytes;
+
 // 全局slab分配器
 pub(crate) static SLABALLOCATOR: SpinLock<Option<SlabAllocator>> = SpinLock::new(None);
 
@@ -47,6 +49,9 @@ impl SlabAllocator {
                 self.zone
                     .refill(layout, leaked_page)
                     .expect("Could not refill?");
+                // ObjectPage was allocated through the large-object buddy path.
+                // Refill has now transferred ownership to the size-class lists.
+                KERNEL_ALLOCATOR.transfer_large_allocation_to_slab(Layout::new::<ObjectPage>());
                 self.zone
                     .allocate(layout)
                     .expect("Should succeed after refill")
@@ -80,12 +85,14 @@ pub unsafe fn slab_init() {
     SLABINITSTATE = true.into();
 }
 
-pub unsafe fn slab_usage() -> SlabUsage {
-    let mut guard = SLABALLOCATOR.lock_irqsave();
-    guard
-        .as_mut()
+pub fn slab_usage() -> SlabUsage {
+    let guard = SLABALLOCATOR.lock_irqsave();
+    let size_class_bytes = guard
+        .as_ref()
         .map(|slab| slab.zone.usage())
-        .unwrap_or_else(|| SlabUsage::new(0, 0))
+        .unwrap_or_else(|| SlabUsage::new(0))
+        .total();
+    SlabUsage::new(size_class_bytes + large_allocation_bytes())
 }
 
 /// 归还slab_page给buddy的回调
@@ -94,6 +101,6 @@ impl CallBack for SlabCallback {
     unsafe fn free_slab_page(&self, base_addr: *mut u8, size: usize) {
         assert_eq!(base_addr as usize & (MMArch::PAGE_SIZE - 1), 0); // 确认地址4k对齐
         assert_eq!(size, MMArch::PAGE_SIZE); // 确认释放的slab_page大小
-        KERNEL_ALLOCATOR.free_in_buddy(base_addr, Layout::from_size_align_unchecked(size, 1));
+        KERNEL_ALLOCATOR.free_buddy_raw(base_addr, Layout::from_size_align_unchecked(size, 1));
     }
 }

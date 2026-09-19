@@ -1166,50 +1166,16 @@ impl Socket for UnixStreamSocket {
 
         // 2) SCM_RIGHTS
         if has_rights {
-            let remaining = control_len - write_off;
-            let data_avail = remaining.saturating_sub(cmsg_align(hdr_len));
-            let max_fds = data_avail / core::mem::size_of::<i32>();
-            let fit = core::cmp::min(max_fds, scm_rights.len());
-            if fit == 0 {
-                msg.msg_flags |= MSG_CTRUNC;
-                msg.msg_controllen = write_off;
-                return Ok(ret_len);
-            }
-
-            if fit < scm_rights.len() {
-                msg.msg_flags |= MSG_CTRUNC;
-            }
-
-            let cloexec = _flags.contains(socket::PMSG::CMSG_CLOEXEC);
-            let mut received_fds: alloc::vec::Vec<i32> = alloc::vec::Vec::with_capacity(fit);
-            let current = ProcessManager::current_pcb();
-            let fd_table = current.fd_table();
-            for file in scm_rights.iter().take(fit) {
-                // SCM_RIGHTS 复制的是 fd 引用，必须共享同一个 open file description。
-                let new_fd =
-                    fd_table.alloc_fd_arc(file.clone(), cloexec, current.nofile_soft_limit())?;
-                received_fds.push(new_fd);
-            }
-
-            let data_len = received_fds.len() * core::mem::size_of::<i32>();
-            let fd_bytes: &[u8] = unsafe {
-                core::slice::from_raw_parts(received_fds.as_ptr() as *const u8, data_len)
-            };
             let mut buf = CmsgBuffer {
                 ptr: control_ptr,
                 len: control_len,
                 write_off: &mut write_off,
             };
-            if let Err(error) = buf.put(
+            buf.put_rights(
                 &mut msg.msg_flags,
-                SOL_SOCKET,
-                SCM_RIGHTS,
-                data_len,
-                fd_bytes,
-            ) {
-                super::rollback_allocated_fds(&received_fds);
-                return Err(error);
-            }
+                &scm_rights,
+                _flags.contains(socket::PMSG::CMSG_CLOEXEC),
+            );
         }
 
         msg.msg_controllen = write_off;

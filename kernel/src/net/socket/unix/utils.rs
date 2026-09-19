@@ -1,19 +1,11 @@
 use crate::process::ProcessManager;
+use alloc::sync::Arc;
 use core::mem::size_of;
 use system_error::SystemError;
 
+use crate::filesystem::vfs::file::File;
 use crate::syscall::user_access::UserBufferWriter;
-
-/// Best-effort rollback for file descriptors allocated during SCM_RIGHTS delivery.
-///
-/// SCM_RIGHTS partial-delivery semantics are intentionally kept separate from
-/// the fixed-size atomic reservation used by pipe/socketpair.
-pub(super) fn rollback_allocated_fds(fds: &[i32]) {
-    let dropped = ProcessManager::current_pcb().fd_table().drop_fds(fds);
-    for file in dropped {
-        let _ = file.finish_close();
-    }
-}
+use crate::syscall::user_buffer::UserBuffer;
 
 // ===== Ancillary message (cmsg) support =====
 
@@ -52,6 +44,79 @@ pub struct CmsgBuffer<'a> {
 }
 
 impl<'a> CmsgBuffer<'a> {
+    /// Linux scm_detach_fds: deliver a successful prefix, never roll back a
+    /// published fd. Ancillary failures do not discard the received payload.
+    pub(super) fn put_rights(&mut self, msg_flags: &mut i32, rights: &[Arc<File>], cloexec: bool) {
+        let hdr_len = size_of::<Cmsghdr>();
+        let remaining = self.len.saturating_sub(*self.write_off);
+        let fit = if self.ptr.is_null() {
+            0
+        } else {
+            (remaining.saturating_sub(hdr_len) / size_of::<i32>()).min(rights.len())
+        };
+        let current = ProcessManager::current_pcb();
+        let table = current.fd_table();
+        let mut delivered = 0;
+        for file in rights.iter().take(fit) {
+            let Ok(reservation) = table.reserve::<1>(current.nofile_soft_limit(), 0, cloexec)
+            else {
+                break;
+            };
+            let offset = hdr_len + delivered * size_of::<i32>();
+            if self
+                .write_rights_field(offset, &reservation.fd(0).to_ne_bytes())
+                .is_err()
+            {
+                // Dropping this reservation only releases its unpublished slot.
+                break;
+            }
+            reservation.commit_arc(file.clone());
+            delivered += 1;
+        }
+
+        if delivered != 0 {
+            let data_len = delivered * size_of::<i32>();
+            // Header faults preserve the delivered fds and the old offset;
+            // only an incomplete fd prefix implies MSG_CTRUNC.
+            if self.write_rights_header(data_len).is_ok() {
+                *self.write_off += (hdr_len + cmsg_align(data_len)).min(remaining);
+            }
+        }
+        if delivered < rights.len() {
+            *msg_flags |= MSG_CTRUNC;
+        }
+    }
+
+    /// scm_detach_fds writes level, type, then length, stopping at the first
+    /// fault. This differs from put(), which writes the header before data.
+    fn write_rights_header(&self, data_len: usize) -> Result<(), SystemError> {
+        let cmsg_len = size_of::<Cmsghdr>() + data_len;
+        self.write_rights_field(
+            core::mem::offset_of!(Cmsghdr, cmsg_level),
+            &SOL_SOCKET.to_ne_bytes(),
+        )?;
+        self.write_rights_field(
+            core::mem::offset_of!(Cmsghdr, cmsg_type),
+            &SCM_RIGHTS.to_ne_bytes(),
+        )?;
+        self.write_rights_field(
+            core::mem::offset_of!(Cmsghdr, cmsg_len),
+            &cmsg_len.to_ne_bytes(),
+        )
+    }
+
+    /// Write just the current field, so an inaccessible later page does not
+    /// prevent delivery of the writable prefix. Do not form a user Rust slice.
+    fn write_rights_field(&self, offset: usize, bytes: &[u8]) -> Result<(), SystemError> {
+        let addr = (self.ptr as usize)
+            .checked_add(*self.write_off)
+            .and_then(|addr| addr.checked_add(offset))
+            .ok_or(SystemError::EFAULT)?;
+        UserBuffer::new_protected(addr as *mut u8, bytes.len(), true)?
+            .write_to_user(0, bytes)
+            .map(|_| ())
+    }
+
     /// Writes a control message following Linux put_cmsg semantics:
     /// - Writes if there is at least CMSG_LEN(full_len) space (no trailing padding required).
     /// - Copies at most what fits and sets MSG_CTRUNC if truncated.

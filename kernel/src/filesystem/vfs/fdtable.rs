@@ -1373,17 +1373,6 @@ impl FileDescriptorTable {
         self.inner.write().drop_fd(fd)
     }
 
-    pub(crate) fn drop_fds(&self, fds: &[i32]) -> Vec<DroppedFd> {
-        let mut state = self.inner.write();
-        let mut dropped = Vec::new();
-        for &fd in fds {
-            if let Ok(file) = state.drop_fd(fd) {
-                dropped.push(file);
-            }
-        }
-        dropped
-    }
-
     pub fn duplicate_exact(
         &self,
         oldfd: i32,
@@ -1491,6 +1480,15 @@ impl<const N: usize> FdReservation<N> {
 }
 
 impl FdReservation<1> {
+    /// Publish an already allocated file after its reserved number was copied
+    /// to userspace. Reservation owns a materialized, uninstalled slot: close
+    /// cannot remove it and dup2/dup3 cannot replace it. No allocation or
+    /// recoverable failure is possible here.
+    pub fn commit_arc(self, file: Arc<File>) -> i32 {
+        self.install_arc(file)
+            .expect("reserved fd must remain available until commit")
+    }
+
     pub fn install(self, file: File) -> Result<i32, SystemError> {
         let file = Arc::try_new(file).map_err(|_| SystemError::ENOMEM)?;
         self.install_arc(file)

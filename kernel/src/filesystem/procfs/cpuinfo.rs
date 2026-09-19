@@ -5,7 +5,7 @@ use crate::{
     filesystem::{
         procfs::{
             template::{Builder, FileOps, ProcFileBuilder},
-            utils::proc_read,
+            utils::proc_read_snapshot,
         },
         vfs::{IndexNode, InodeMode},
     },
@@ -34,22 +34,26 @@ impl FileOps for CpuInfoFileOps {
         offset: usize,
         len: usize,
         buf: &mut [u8],
-        _: crate::libs::mutex::MutexGuard<crate::filesystem::vfs::FilePrivateData>,
+        mut data: crate::libs::mutex::MutexGuard<crate::filesystem::vfs::FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        let mut data: Vec<u8> = vec![];
-        let cpu_manager = smp_cpu_manager();
+        // `seq_file` (Linux `seq_open(&cpuinfo_op)`, `fs/proc/cpuinfo.c`): one
+        // fd sees one rendered record.
+        proc_read_snapshot(offset, len, buf, &mut data, || {
+            let mut content: Vec<u8> = vec![];
+            let cpu_manager = smp_cpu_manager();
 
-        // 遍历所有present的CPU
-        for cpu_id in cpu_manager.present_cpus().iter_cpu() {
-            // 生成每个 CPU 的信息
-            let cpu_info = generate_cpu_info(cpu_id);
-            data.extend_from_slice(cpu_info.as_bytes());
+            // Walk every present CPU.
+            for cpu_id in cpu_manager.present_cpus().iter_cpu() {
+                // Render this CPU's record.
+                let cpu_info = generate_cpu_info(cpu_id);
+                content.extend_from_slice(cpu_info.as_bytes());
 
-            // 在每个CPU信息之间添加空行分隔
-            data.push(b'\n');
-        }
+                // Blank line between CPU records, as Linux does.
+                content.push(b'\n');
+            }
 
-        proc_read(offset, len, buf, &data)
+            Ok(content)
+        })
     }
 }
 

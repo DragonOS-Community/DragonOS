@@ -423,14 +423,32 @@ impl PreparedNamespaceInstall {
         } else {
             None
         };
-        if let Some(new_fs) = new_fs {
-            tsk.set_fs_struct(new_fs, &fs_refs);
-        }
+        // A mount namespace switch replaces the task's root together with its
+        // nsproxy, so the two are published in one task_lock section: a reader
+        // that snapshots them (`ProcessControlBlock::namespace_state()`) must
+        // not see the mount namespace of one generation with the root of the
+        // next. A publication that replaces the fs slot holds
+        // `fs_slot_update_lock` across it, so it stays serialized with an
+        // in-place root/pwd rewrite of the fs_struct being replaced; the
+        // publications that only re-point the nsproxy (`execve()`, and `setns()`
+        // for a namespace other than the mount namespace) have no slot to
+        // serialize and do not take that lock.
         let prepared_cred = new_cred.zip(cred_retire);
-        tsk.install_prepared_namespace_state(new_nsproxy, nsproxy_retire, prepared_cred);
+        let slot_update = new_fs.is_some().then(|| tsk.lock_fs_slot_update());
+        let retired_fs = tsk.install_prepared_namespace_state(
+            new_nsproxy,
+            nsproxy_retire,
+            prepared_cred,
+            new_fs,
+            &fs_refs,
+        );
+        drop(slot_update);
         // Keep copy-to-publication atomic against pivot_root, but do not make
         // unrelated fs topology writers wait for semaphore replay/wakeup work.
         drop(fs_refs);
+        // The replaced fs_struct's path-pin destructors may enqueue deferred
+        // cleanup work, so it is released outside every lock taken above.
+        drop(retired_fs);
         if let Some(replay) = undo_replay {
             replay.replay();
         }

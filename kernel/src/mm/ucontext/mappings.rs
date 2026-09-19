@@ -67,7 +67,6 @@ impl UserMappings {
     /// Check whether any VMA in the current process contains the specified virtual address.
     ///
     /// Returns the Arc pointer of the VMA containing the address if found, otherwise returns None.
-    #[allow(dead_code)]
     pub fn contains(&self, vaddr: VirtAddr) -> Option<Arc<LockedVMA>> {
         let (_, vma) = self.vmas_by_start.range(..=vaddr).next_back()?;
         if vma.lock().region.contains(vaddr) {
@@ -85,7 +84,6 @@ impl UserMappings {
     /// ## Returns
     /// - Some(Arc<LockedVMA>): The VMA containing the address or the nearest subsequent VMA
     /// - None: No VMA found
-    #[allow(dead_code)]
     pub fn find_nearest(&self, vaddr: VirtAddr) -> Option<Arc<LockedVMA>> {
         if let Some(vma) = self.contains(vaddr) {
             return Some(vma);

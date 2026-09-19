@@ -6,7 +6,7 @@
 use crate::filesystem::{
     procfs::{
         template::{Builder, FileOps, ProcFileBuilder},
-        utils::proc_read,
+        utils::proc_read_snapshot,
     },
     vfs::{FilePrivateData, IndexNode, InodeMode},
 };
@@ -35,8 +35,12 @@ impl FileOps for VersionSignatureFileOps {
         offset: usize,
         len: usize,
         buf: &mut [u8],
-        _data: MutexGuard<FilePrivateData>,
+        mut data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        proc_read(offset, len, buf, Self::VERSION_SIGNATURE)
+        // Like the other one-record procfs files, this keeps a single record per
+        // fd, so a later read cannot observe a different version string.
+        proc_read_snapshot(offset, len, buf, &mut data, || {
+            Ok(Self::VERSION_SIGNATURE.to_vec())
+        })
     }
 }

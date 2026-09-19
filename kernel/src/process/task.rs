@@ -225,8 +225,13 @@ pub struct ProcessControlBlock {
     pub(super) seccomp_filter: SpinLock<Option<Arc<seccomp::SeccompFilter>>>,
 
     /// Parent process pointer.
+    ///
+    /// Per-task: every task gets its own copy at fork (see the `CLONE_PARENT` /
+    /// `CLONE_THREAD` branches in `fork.rs`), and re-parenting updates the
+    /// whole thread group member by member, the way Linux
+    /// `forget_original_parent()` walks `for_each_thread()`.
     pub(super) parent_pcb: RwLock<Weak<ProcessControlBlock>>,
-    /// Real (original) parent process pointer.
+    /// Real (original) parent process pointer. Per-task, see `parent_pcb`.
     pub(super) real_parent_pcb: RwLock<Weak<ProcessControlBlock>>,
     /// The natural parent pointer for wait operations.
     ///
@@ -234,6 +239,11 @@ pub struct ProcessControlBlock {
     /// task_struct::parent, whereas DragonOS models parent_pcb/real_parent_pcb
     /// on the thread-group leader. This field preserves the thread-level parent
     /// relationship required by wait.
+    ///
+    /// Re-parenting updates it together with the other three pointers. The only
+    /// Linux difference is the `if (likely(!t->ptrace))` guard: a traced task's
+    /// `->parent` is its tracer. DragonOS keeps tracing in the ptrace relation
+    /// table instead, so there is nothing to guard here today.
     pub(super) wait_parent_pcb: RwLock<Weak<ProcessControlBlock>>,
     /// Thread-level natural-parent compensation for PTRACE_TRACEME.
     ///
@@ -310,6 +320,32 @@ pub struct ProcessControlBlock {
     /// Resource limits are shared by a thread group, like Linux's
     /// `signal_struct::rlim`. A process fork receives a copied Arc.
     pub(super) rlimits: Arc<RwLock<[RLimit64; RLimitID::Nlimits as usize]>>,
+}
+
+/// The namespace state of a task, taken as one pair.
+///
+/// `nsproxy` and the `fs` slot describe the same generation of a task: a mount
+/// namespace switch (`setns()`/`unshare(CLONE_NEWNS)`, and the same switch
+/// performed by `execve()`) replaces the task's root together with its
+/// `nsproxy`, so a reader that took the two slots in separate critical sections
+/// could combine the old mount namespace with the new root, and
+/// `/proc/[pid]/{mounts,mountinfo,mountstats}` would then render paths and
+/// topology from two different namespaces.
+///
+/// [`ProcessControlBlock::namespace_state()`] and
+/// [`ProcessControlBlock::install_prepared_namespace_state()`] are the read and
+/// write sides of that pair.  The other writer of the `nsproxy` slot,
+/// [`ProcessControlBlock::set_nsproxy()`], publishes it alone. Neither of its
+/// callers can be observed mid-transition: a forked child rebinds its root in
+/// the same fork, before the child is reachable through `/proc`, and a kernel
+/// thread moved to the initial namespace already has that namespace's
+/// filesystem context, because kernel threads share the kthread daemon's `fs`
+/// (the daemon clones them with `CLONE_FS`, see `kthread.rs`).
+pub(crate) struct TaskNamespaceState {
+    /// Namespace proxy the task had when the pair was taken.
+    pub nsproxy: Arc<NsProxy>,
+    /// Filesystem context of the same instant; `None` after `exit_fs()`.
+    pub fs: Option<Arc<FsStruct>>,
 }
 
 impl ProcessControlBlock {
@@ -1006,9 +1042,22 @@ impl ProcessControlBlock {
         _fs_refs: &super::FsRefsReadGuard,
     ) -> Arc<FsStruct> {
         let _slot_update = self.fs_slot_update_lock.lock();
+        self.swap_fs_slot_locked(fs)
+    }
+
+    /// Replace the fs slot with `fs` and hand the previous owner back.
+    ///
+    /// The caller must hold `fs_slot_update_lock`, so the transition is
+    /// serialized with an operation that rewrites the referenced `FsStruct` in
+    /// place. A replacement that also republishes the task's `nsproxy` (a mount
+    /// namespace switch) additionally holds `task_lock`: see
+    /// [`Self::install_prepared_namespace_state()`].
+    ///
+    /// The previous owner is returned rather than dropped here, because its
+    /// path-pin destructors may enqueue deferred cleanup work.
+    fn swap_fs_slot_locked(&self, fs: Arc<FsStruct>) -> Arc<FsStruct> {
         let mut guard = self.fs.write();
-        let old = guard.replace(fs).expect("live task must have an fs_struct");
-        old
+        guard.replace(fs).expect("live task must have an fs_struct")
     }
 
     /// Drop this task's reference to its filesystem context during exit.
@@ -1060,32 +1109,65 @@ impl ProcessControlBlock {
         self.cred.store_deferred(new);
     }
 
+    /// Snapshot the namespace state of this task as one coherent pair, the way
+    /// Linux `mounts_open_common()` reads `task->nsproxy` and `task->fs` under
+    /// one `task_lock()`.
+    ///
+    /// Both slots are read inside the same `task_lock` critical section that
+    /// publishes them ([`Self::install_prepared_namespace_state()`]), so the
+    /// result is exactly one generation: it never mixes the mount namespace of
+    /// one publication with the root of the next.
+    pub(crate) fn namespace_state(&self) -> TaskNamespaceState {
+        let _task_guard = self.task_lock.lock_irqsave();
+        TaskNamespaceState {
+            nsproxy: self.nsproxy(),
+            fs: self.fs.read().clone(),
+        }
+    }
+
     /// Publish prepared namespace state without allocating under task_lock.
+    ///
+    /// `new_fs` and `new_nsproxy` are installed in the same `task_lock` critical
+    /// section, because a mount namespace switch replaces the task's root and
+    /// its `nsproxy` as one unit: [`Self::namespace_state()`] readers must never
+    /// observe half of that pair. The replaced `fs` owner is returned instead of
+    /// being dropped here, so its path-pin destructors run after the caller
+    /// released the locks.
+    ///
+    /// The caller holds `fs_slot_update_lock` when `new_fs` is `Some`, which is
+    /// what serializes the slot transition with an in-place rewrite of the
+    /// replaced `FsStruct`; `_fs_refs` is not read here, and is the caller's
+    /// proof of the same contract as [`Self::set_fs_struct()`]: the mount
+    /// references of the fs context are stabilized while the slot is replaced.
     pub(crate) fn install_prepared_namespace_state(
         &self,
         new_nsproxy: Arc<NsProxy>,
         nsproxy_retire: PreparedRcuArcRetire<NsProxy>,
         new_cred: Option<(Arc<Cred>, PreparedRcuArcRetire<Cred>)>,
-    ) {
+        new_fs: Option<Arc<FsStruct>>,
+        _fs_refs: &super::FsRefsReadGuard,
+    ) -> Option<Arc<FsStruct>> {
         // Only credential publication needs to stabilize the active mm. Pure
         // namespace publication also runs inside exec, which already owns the
         // write side and must not recursively acquire this read lock.
         let _exec_guard = new_cred.as_ref().map(|_| self.exec_update_read());
         let active_mm = new_cred.as_ref().and_then(|_| self.basic().user_vm());
-        let (nsproxy_retirement, cred_retirement) = {
+        let (retired_fs, nsproxy_retirement, cred_retirement) = {
             let _task_guard = self.task_lock.lock_irqsave();
+            let retired_fs = new_fs.map(|fs| self.swap_fs_slot_locked(fs));
             let nsproxy_retirement = self.nsproxy.swap_prepared(new_nsproxy, nsproxy_retire);
             let cred_retirement = new_cred.map(|(cred, retire)| {
                 self.commit_cred_side_effects(&self.cred(), &cred, active_mm.as_ref());
                 self.cred.swap_prepared(cred, retire)
             });
-            (nsproxy_retirement, cred_retirement)
+            (retired_fs, nsproxy_retirement, cred_retirement)
         };
 
         nsproxy_retirement.enqueue();
         if let Some(retirement) = cred_retirement {
             retirement.enqueue();
         }
+        retired_fs
     }
 
     #[cfg(test)]
@@ -1293,19 +1375,54 @@ impl ProcessControlBlock {
         }
     }
 
+    /// Update the parent links of one task.
+    ///
+    /// The four parent pointers are per-task state (`fork.rs` copies them into
+    /// every newly created task, and `CLONE_THREAD` children inherit them
+    /// independently), so a thread group is only fully re-parented when every
+    /// member is updated. Linux does the same with `for_each_thread()` in
+    /// `forget_original_parent()`.
+    ///
+    /// Linux additionally guards the wait parent with `if (likely(!t->ptrace))`:
+    /// a traced task's `->parent` is its tracer, not the new parent. DragonOS
+    /// keeps the tracer relationship in `process::ptrace`'s relation table
+    /// (`ptracer_of()`) and never writes it into `wait_parent_pcb`, so the
+    /// unconditional update is equivalent today. If tracing is ever modelled
+    /// through these fields, the guard has to be added here as well.
+    fn reparent_one_task_locked(
+        task: &Arc<ProcessControlBlock>,
+        new_parent: &Arc<ProcessControlBlock>,
+        parent_pid_in_child_ns: RawPid,
+    ) {
+        *task.parent_pcb.write_irqsave() = Arc::downgrade(new_parent);
+        *task.real_parent_pcb.write_irqsave() = Arc::downgrade(new_parent);
+        *task.wait_parent_pcb.write_irqsave() = Arc::downgrade(new_parent);
+        *task.fork_parent_pcb.write_irqsave() = Arc::downgrade(new_parent);
+
+        // `basic.ppid` has no reader today (`stat`/`status` derive Ppid from
+        // `parent_pcb()`), but it belongs to the same parent record and must
+        // stay consistent with the pointers above.
+        task.basic.write_irqsave().ppid = parent_pid_in_child_ns;
+    }
+
+    /// Attach a whole child thread group to `new_parent`.
+    ///
+    /// Only the group leader is registered in `children`, so the caller passes
+    /// the leader; the leader's group list is then walked to update every
+    /// member. Updating just the leader would make
+    /// `/proc/<pid>/task/<tid>/status` report a different `Ppid` than
+    /// `/proc/<pid>/status` for the same thread group.
     fn reparent_child_to_locked(
         child: &Arc<ProcessControlBlock>,
         new_parent: &Arc<ProcessControlBlock>,
     ) {
-        *child.parent_pcb.write_irqsave() = Arc::downgrade(new_parent);
-        *child.real_parent_pcb.write_irqsave() = Arc::downgrade(new_parent);
-        *child.wait_parent_pcb.write_irqsave() = Arc::downgrade(new_parent);
-        *child.fork_parent_pcb.write_irqsave() = Arc::downgrade(new_parent);
-
         let parent_pid_in_child_ns = new_parent
             .task_pid_nr_ns(PidType::PID, Some(child.active_pid_ns()))
             .unwrap_or(RawPid::new(0));
-        child.basic.write_irqsave().ppid = parent_pid_in_child_ns;
+
+        for task in ProcessManager::thread_group_tasks_snapshot(child.clone()) {
+            Self::reparent_one_task_locked(&task, new_parent, parent_pid_in_child_ns);
+        }
 
         ProcessControlBlock::link_child_to_parent_list(child, new_parent);
 

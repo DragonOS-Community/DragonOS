@@ -10,7 +10,7 @@ use crate::{
         procfs::{
             pid::ProcPidTarget,
             template::{Builder, FileOps, ProcFileBuilder},
-            utils::proc_read,
+            utils::proc_read_snapshot,
         },
         vfs::{FilePrivateData, IndexNode, InodeMode},
     },
@@ -159,9 +159,11 @@ impl FileOps for LimitsFile {
         offset: usize,
         len: usize,
         buf: &mut [u8],
-        _data: MutexGuard<FilePrivateData>,
+        mut data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        let content = self.generate_limits_content()?;
-        proc_read(offset, len, buf, content.as_bytes())
+        // `single_open()`: one fd sees one rlimit record.
+        proc_read_snapshot(offset, len, buf, &mut data, || {
+            Ok(self.generate_limits_content()?.into_bytes())
+        })
     }
 }

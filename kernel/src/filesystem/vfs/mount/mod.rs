@@ -481,6 +481,15 @@ lazy_static! {
 }
 
 impl MountId {
+    /// Allocate the identity a mount reports in `/proc/[pid]/mountinfo`.
+    ///
+    /// Ids are handed out in strictly increasing order and are never reused,
+    /// which makes them a total order over the mounts that exist at any point
+    /// in time: a mount created later always sorts above every mount that
+    /// already exists. The mount tables rely on that, because an fd resumes a
+    /// partially read table from the id it reached. Linux gets the same effect
+    /// from a list position (`ns->list` plus the cursor node an fd links into
+    /// it) even though `ida_alloc()` may hand a freed id out again.
     fn alloc() -> Self {
         let id = NEXT_MOUNT_ID
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))

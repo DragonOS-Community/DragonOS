@@ -3,7 +3,7 @@ use crate::{
     filesystem::{
         procfs::{
             template::{Builder, FileOps, ProcFileBuilder},
-            utils::{proc_read, trim_string},
+            utils::{proc_read_snapshot, trim_string},
         },
         vfs::{FilePrivateData, IndexNode, InodeMode},
     },
@@ -71,9 +71,11 @@ impl FileOps for LoadavgFileOps {
         offset: usize,
         len: usize,
         buf: &mut [u8],
-        _data: MutexGuard<FilePrivateData>,
+        mut data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        let content = Self::generate_loadavg_content();
-        proc_read(offset, len, buf, &content)
+        // `single_open()`: one fd sees one load-average record.
+        proc_read_snapshot(offset, len, buf, &mut data, || {
+            Ok(Self::generate_loadavg_content())
+        })
     }
 }

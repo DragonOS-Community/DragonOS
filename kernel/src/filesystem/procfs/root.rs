@@ -110,10 +110,16 @@ impl DirOps for RootDirOps {
         dir: &ProcDir<Self>,
         name: &str,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
+        // Lookup goes through the PID link, like Linux `proc_pid_lookup()`
+        // (`find_task_by_pid_ns()`), so any task that still holds a PID link can
+        // be named by its own tid. Directory listing keeps using the TGID link
+        // in `populate_children()` and therefore yields leaders only, matching
+        // Linux `next_tgid()`. The asymmetry between lookup and listing is
+        // intentional and matches Linux.
         // 首先检查是否是 PID 目录
         if let Ok(pid) = name.parse::<RawPid>() {
             // 检查进程是否存在
-            if let Some(target) = crate::filesystem::procfs::pid::ProcPidTarget::from_tgid_in_ns(
+            if let Some(target) = crate::filesystem::procfs::pid::ProcPidTarget::from_pid_in_ns(
                 self.pid_ns.clone(),
                 pid,
             ) {
@@ -163,8 +169,21 @@ impl DirOps for RootDirOps {
         // 获取缓存写锁并填充
         let mut cached_children = dir.cached_children().write();
 
+        // A numeric entry stays valid only while its tid still resolves as a
+        // thread group id. `lookup_child()` creates entries through the PID link
+        // (any live task), so without this filter a directory opened by looking
+        // up a non-leader tid would leak into the listing. Linux `next_tgid()`
+        // lists leaders only, and so must this.
         cached_children.retain(|name, child| {
-            name.parse::<RawPid>().is_err() || self.validate_child(child.as_ref())
+            let Ok(pid) = name.parse::<RawPid>() else {
+                return true;
+            };
+            self.validate_child(child.as_ref())
+                && crate::filesystem::procfs::pid::ProcPidTarget::from_tgid_in_ns(
+                    self.pid_ns.clone(),
+                    pid,
+                )
+                .is_some()
         });
 
         // 填充进程目录（只传递 PID）

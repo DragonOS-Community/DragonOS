@@ -9,7 +9,7 @@ use crate::{
         procfs::{
             pid::ProcPidTarget,
             template::{Builder, FileOps, ProcFileBuilder},
-            utils::proc_read,
+            utils::proc_read_snapshot,
         },
         vfs::{FilePrivateData, IndexNode, InodeMode},
     },
@@ -42,35 +42,38 @@ impl FileOps for StatmFileOps {
         offset: usize,
         len: usize,
         buf: &mut [u8],
-        _data: MutexGuard<FilePrivateData>,
+        mut data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        let pcb = self
-            .target
-            .thread_group_leader()
-            .ok_or(SystemError::ESRCH)?;
+        // `single_open()`: one fd sees one statm record.
+        proc_read_snapshot(offset, len, buf, &mut data, || {
+            let pcb = self
+                .target
+                .thread_group_leader()
+                .ok_or(SystemError::ESRCH)?;
 
-        let user_vm = {
-            let basic = pcb.basic();
-            basic.user_vm()
-        };
+            let user_vm = {
+                let basic = pcb.basic();
+                basic.user_vm()
+            };
 
-        // 获取进程内存信息（简化实现）
-        let (size_pages, resident_pages) = user_vm
-            .map(|vm| {
-                let guard = vm.read_guard_no_reservations();
-                // statm 第一列为总虚拟内存页数，第二列使用 OOM/RSS 维护的常驻页计数。
-                let size_pages = (guard
-                    .vma_usage_bytes()
-                    .saturating_add(MMArch::PAGE_SIZE - 1))
-                    >> MMArch::PAGE_SHIFT;
-                (size_pages, vm.resident_pages())
-            })
-            .unwrap_or((0, 0));
+            // Process memory information (simplified: no shared/text/lib/data).
+            let (size_pages, resident_pages) = user_vm
+                .map(|vm| {
+                    let guard = vm.read_guard_no_reservations();
+                    // Field 1 is total virtual pages; field 2 uses the RAS-maintained resident page count.
+                    let size_pages = (guard
+                        .vma_usage_bytes()
+                        .saturating_add(MMArch::PAGE_SIZE - 1))
+                        >> MMArch::PAGE_SHIFT;
+                    (size_pages, vm.resident_pages())
+                })
+                .unwrap_or((0, 0));
 
-        // statm 格式: size resident shared text lib data dt
-        // 简化实现，只返回 size/resident，其他字段为 0
-        let content = format!("{} {} 0 0 0 0 0\n", size_pages, resident_pages);
+            // statm layout: size resident shared text lib data dt.
+            // Only size/resident are implemented; the remaining fields stay 0.
+            let content = format!("{} {} 0 0 0 0 0\n", size_pages, resident_pages);
 
-        proc_read(offset, len, buf, content.as_bytes())
+            Ok(content.into_bytes())
+        })
     }
 }

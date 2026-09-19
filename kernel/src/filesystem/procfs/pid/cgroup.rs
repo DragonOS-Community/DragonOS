@@ -7,7 +7,7 @@ use crate::{
         procfs::{
             pid::ProcPidTarget,
             template::{Builder, FileOps, ProcFileBuilder},
-            utils::proc_read,
+            utils::proc_read_snapshot,
         },
         vfs::{FilePrivateData, IndexNode, InodeMode},
     },
@@ -34,10 +34,13 @@ impl CgroupFileOps {
     }
 
     fn generate_content(&self) -> Result<Vec<u8>, SystemError> {
-        let target = self
-            .target
-            .thread_group_leader()
-            .ok_or(SystemError::ESRCH)?;
+        // Linux `proc_cgroup_show()` runs on `get_proc_task(inode)`, so a
+        // hidden tid reports the membership of the thread it names. The only
+        // migration path, `cgroup.procs`, moves the whole thread group and
+        // skips its exited members, exactly as `cgroup_attach_task()` does with
+        // `while_each_thread()` over the `PF_EXITING` check, so the two
+        // directories still agree.
+        let target = self.target.task().ok_or(SystemError::ESRCH)?;
         let viewer = ProcessManager::current_pcb();
 
         let target_cg = target.task_cgroup_node();
@@ -54,9 +57,9 @@ impl FileOps for CgroupFileOps {
         offset: usize,
         len: usize,
         buf: &mut [u8],
-        _data: MutexGuard<FilePrivateData>,
+        mut data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        let content = self.generate_content()?;
-        proc_read(offset, len, buf, &content)
+        // `single_open()`: one fd sees one cgroup record.
+        proc_read_snapshot(offset, len, buf, &mut data, || self.generate_content())
     }
 }

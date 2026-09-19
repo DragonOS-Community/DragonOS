@@ -73,9 +73,26 @@ impl ProcPidTarget {
         Self { view_pid_ns, pid }
     }
 
+    /// Resolve `nr` as a thread-group id, the way Linux `next_tgid()` does.
+    ///
+    /// Requires the `PIDTYPE_TGID` link, which only the group leader holds, so
+    /// this resolves leaders only. Used for `/proc` directory *listing*, where
+    /// Linux also lists leaders only (`next_tgid()` in `fs/proc/base.c`).
     pub fn from_tgid_in_ns(view_pid_ns: Arc<PidNamespace>, pid: RawPid) -> Option<Self> {
         let target_pid = view_pid_ns.find_pid_in_ns(pid)?;
         target_pid.pid_task(PidType::TGID)?;
+        Some(Self::new(view_pid_ns, target_pid))
+    }
+
+    /// Resolve `nr` as a task id, the way Linux `proc_pid_lookup()` does.
+    ///
+    /// `find_task_by_pid_ns()` goes through `PIDTYPE_PID`, which every task
+    /// (including a non-leader thread and a not-yet-reaped zombie) holds
+    /// through its own `thread_pid`, so any task with a live PID link can be
+    /// named by its tid. Used for `/proc/<nr>` *lookup*.
+    pub fn from_pid_in_ns(view_pid_ns: Arc<PidNamespace>, pid: RawPid) -> Option<Self> {
+        let target_pid = view_pid_ns.find_pid_in_ns(pid)?;
+        target_pid.pid_task(PidType::PID)?;
         Some(Self::new(view_pid_ns, target_pid))
     }
 
@@ -98,6 +115,14 @@ impl ProcPidTarget {
         self.pid.pid_nr_ns(&self.view_pid_ns)
     }
 
+    /// The task this node names, the way Linux `get_proc_task(inode)` resolves
+    /// the proc inode. A `/proc/<tgid>` node names the group leader, a
+    /// `/proc/<tid>` node the thread, and either can be gone.
+    ///
+    /// Files that report per-task state (`files`, `fs_struct`, `nsproxy`) read
+    /// from here; files backed by state the whole group shares (`mm`,
+    /// `sighand`, credentials) may use [`Self::thread_group_leader()`] instead,
+    /// which is the same task for a `/proc/<tgid>` node.
     pub fn task(&self) -> Option<Arc<ProcessControlBlock>> {
         self.pid.pid_task(PidType::PID)
     }
@@ -153,12 +178,19 @@ impl PidDirOps {
             .unwrap()
     }
 
+    /// The task this directory names, for the entries that only exist when it
+    /// does (`fd`/`fdinfo`, which Linux creates with `proc_pid_make_inode()` on
+    /// the same `get_proc_task(inode)` their readers use).
     fn get_process(&self) -> Option<Arc<ProcessControlBlock>> {
-        self.target.thread_group_leader()
+        self.target.task()
     }
 
     pub(super) fn is_current_target(&self) -> bool {
-        ProcPidTarget::from_tgid_in_ns(self.target.view_pid_ns().clone(), self.target.vpid())
+        // Cache-validity check: the same tid number must still resolve to the
+        // same `Arc<Pid>`. It has to use the same rule as `lookup_child()`,
+        // otherwise a directory resolved by a non-leader tid would never match
+        // its cached entry and would be rebuilt on every lookup.
+        ProcPidTarget::from_pid_in_ns(self.target.view_pid_ns().clone(), self.target.vpid())
             .map(|target| self.target.same_pid_object(&target))
             .unwrap_or(false)
     }

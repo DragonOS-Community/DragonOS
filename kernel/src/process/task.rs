@@ -637,12 +637,13 @@ impl ProcessControlBlock {
             rlim_max: 0,
         }; RLimitID::Nlimits as usize];
 
-        // Keep the process policy independent from fd-table storage. This
-        // matches Linux's common 1024 soft default while leaving room for an
-        // unprivileged process to raise the soft limit up to 4096.
+        // Preserve DragonOS's established userspace limit. The fd table is
+        // now allocated on demand, so a high logical limit no longer implies
+        // a large per-process allocation.
+        const DEFAULT_NOFILE_LIMIT: u64 = 1024 * 1024;
         arr[RLimitID::Nofile as usize] = RLimit64 {
-            rlim_cur: 1024,
-            rlim_max: 4096,
+            rlim_cur: DEFAULT_NOFILE_LIMIT,
+            rlim_max: DEFAULT_NOFILE_LIMIT,
         };
 
         arr[RLimitID::Stack as usize] = RLimit64 {

@@ -13,6 +13,7 @@
 namespace {
 
 constexpr char kNrOpenPath[] = "/proc/sys/fs/nr_open";
+constexpr rlim_t kHighFdCompatibilityLimit = 66002;
 
 long read_nr_open() {
     int fd = open(kNrOpenPath, O_RDONLY);
@@ -44,6 +45,13 @@ int write_nr_open(long value) {
     close(fd);
     errno = saved_errno;
     return n == len ? 0 : -1;
+}
+
+TEST(FdTableSemantics, DefaultLimitSupportsHighFdCompatibility) {
+    struct rlimit limit = {};
+    ASSERT_EQ(0, getrlimit(RLIMIT_NOFILE, &limit)) << strerror(errno);
+    EXPECT_GE(limit.rlim_cur, kHighFdCompatibilityLimit);
+    EXPECT_GE(limit.rlim_max, kHighFdCompatibilityLimit);
 }
 
 TEST(FdTableSemantics, NrOpenRejectsOutOfRangeValues) {

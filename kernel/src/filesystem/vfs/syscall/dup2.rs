@@ -5,19 +5,6 @@ use crate::filesystem::vfs::{
     file::FileFlags,
 };
 
-pub fn do_dup2(
-    oldfd: i32,
-    newfd: i32,
-    fd_table: &FileDescriptorTable,
-    soft_limit: usize,
-) -> Result<(usize, Option<DroppedFd>), SystemError> {
-    if oldfd == newfd {
-        fd_table.get_file_by_fd(oldfd).ok_or(SystemError::EBADF)?;
-        return Ok((newfd as usize, None));
-    }
-    do_dup3(oldfd, newfd, FileFlags::empty(), fd_table, soft_limit)
-}
-
 pub fn do_dup3(
     oldfd: i32,
     newfd: i32,

@@ -4,7 +4,8 @@
 //! contiguous `Vec<Option<Arc<File>>>` allocations therefore become high-order
 //! physically contiguous buddy allocations. This module keeps the common
 //! 0..63 range inline and materializes the remaining descriptor space as a
-//! fixed-depth page index. Slot storage is always one order-0 page.
+//! fixed-depth page index. Slot storage uses independently allocated 4 KiB
+//! blocks, which are order-0 pages on the currently runnable architectures.
 
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use bitmap::{static_bitmap, StaticBitmap};
@@ -15,16 +16,18 @@ use core::{
 
 use system_error::SystemError;
 
-use crate::{
-    arch::MMArch,
-    libs::rwsem::{RwSem, RwSemReadGuard},
-    mm::MemoryManagementArch,
-};
+use crate::libs::rwsem::{RwSem, RwSemReadGuard};
 
 use super::file::{File, FileMode};
 
 const INLINE_FDS: usize = usize::BITS as usize;
 const BITS_PER_WORD: usize = usize::BITS as usize;
+/// Bytes in one independently allocated descriptor-slot block.
+///
+/// This is a property of the fd-table layout, not of an architecture's
+/// partially implemented page-size declaration. Keeping the block at 4 KiB
+/// bounds every growth step while avoiding high-order buddy allocations.
+const SLOT_BLOCK_BYTES: usize = 4096;
 const CHUNK_SHIFT: usize = 9;
 const CHUNK_FDS: usize = 1 << CHUNK_SHIFT;
 const INDEX_SHIFT: usize = 8;
@@ -37,9 +40,7 @@ static NR_OPEN: AtomicUsize = AtomicUsize::new(DEFAULT_NR_OPEN);
 static NEXT_LOCK_OWNER_ID: AtomicUsize = AtomicUsize::new(1);
 
 const _: () = {
-    assert!(
-        size_of::<Option<Arc<File>>>() * CHUNK_FDS == <MMArch as MemoryManagementArch>::PAGE_SIZE
-    );
+    assert!(size_of::<Option<Arc<File>>>() * CHUNK_FDS == SLOT_BLOCK_BYTES);
     assert!(size_of::<static_bitmap!(CHUNK_FDS)>() == CHUNK_FDS / 8);
     assert!(size_of::<static_bitmap!(INDEX_FANOUT)>() == INDEX_FANOUT / 8);
     assert!(ROOT_ENTRIES_MAX * GROUP_SPAN > i32::MAX as usize);
@@ -202,7 +203,7 @@ impl FdDirectory {
     fn try_new() -> Result<Box<Self>, SystemError> {
         // All-zero is valid here: Rust guarantees the null representation for
         // Option<Box<_>>, and StaticBitmap is backed by integer words. The
-        // 2112-byte layout is allocated as one buddy order-0 page.
+        // 2112-byte layout remains within one fd-table allocation block.
         // SAFETY: every field's all-zero representation is valid as described
         // above, so the complete value is initialized.
         unsafe {
@@ -222,9 +223,9 @@ struct FdGroup {
 
 const _: () = {
     assert!(size_of::<FdDirectory>() > 2048);
-    assert!(size_of::<FdDirectory>() <= <MMArch as MemoryManagementArch>::PAGE_SIZE);
+    assert!(size_of::<FdDirectory>() <= SLOT_BLOCK_BYTES);
     assert!(size_of::<FdGroup>() > 2048);
-    assert!(size_of::<FdGroup>() <= <MMArch as MemoryManagementArch>::PAGE_SIZE);
+    assert!(size_of::<FdGroup>() <= SLOT_BLOCK_BYTES);
 };
 
 impl FdGroup {

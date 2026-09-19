@@ -1,7 +1,7 @@
 use core::ffi::c_int;
 
 use crate::arch::syscall::nr::SYS_DUP2;
-use crate::filesystem::vfs::syscall::dup2::do_dup2;
+use crate::filesystem::vfs::{file::FileFlags, syscall::dup2::do_dup3};
 use crate::{
     arch::interrupt::TrapFrame,
     process::ProcessManager,
@@ -33,10 +33,19 @@ impl Syscall for SysDup2Handle {
     fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let oldfd = Self::oldfd(args);
         let newfd = Self::newfd(args);
-        let binding = ProcessManager::current_pcb().fd_table();
-        let mut fd_table_guard = binding.write();
-        let (newfd, dropped) = do_dup2(oldfd, newfd, &mut fd_table_guard)?;
-        drop(fd_table_guard);
+        let current = ProcessManager::current_pcb();
+        let binding = current.fd_table();
+        if oldfd == newfd {
+            binding.get_file_by_fd(oldfd).ok_or(SystemError::EBADF)?;
+            return Ok(newfd as usize);
+        }
+        let (newfd, dropped) = do_dup3(
+            oldfd,
+            newfd,
+            FileFlags::empty(),
+            &binding,
+            current.nofile_soft_limit(),
+        )?;
         if let Some(dropped) = dropped {
             if let Err(err) = dropped.finish_close() {
                 log::warn!("dup2 implicit close failed after fd replacement: {:?}", err);

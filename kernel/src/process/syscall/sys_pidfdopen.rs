@@ -53,17 +53,10 @@ impl Syscall for SysPidFdOpen {
         // 存入pcb
         // Linux 的 __pidfd_prepare() 无条件对 pidfd 设置 O_CLOEXEC，
         // 无论用户传入什么 flags，pidfd 始终是 close-on-exec 的。
-        let reservation = prepared.reservation;
-        let file = prepared.file;
-        let fd_table = current.fd_table();
-        let mut fd_table = fd_table.write();
-        match fd_table.install_reserved_fd(reservation, file) {
-            Ok(fd) => Ok(fd as usize),
-            Err(err) => {
-                fd_table.release_reserved_fd(reservation);
-                Err(err)
-            }
-        }
+        prepared
+            .reservation
+            .install_arc(prepared.file)
+            .map(|fd| fd as usize)
     }
 
     fn entry_format(&self, args: &[usize]) -> Vec<FormattedSyscallParam> {

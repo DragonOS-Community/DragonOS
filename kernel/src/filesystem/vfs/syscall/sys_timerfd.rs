@@ -80,10 +80,10 @@ impl Syscall for SysTimerFdCreate {
         let file =
             File::new_with_private_data(inode, file_flags, FilePrivateData::TimerFd(file_flags))?;
         let cloexec = flags.contains(TimerFdCreateFlags::TFD_CLOEXEC);
-        ProcessManager::current_pcb()
+        let current = ProcessManager::current_pcb();
+        current
             .fd_table()
-            .write()
-            .alloc_fd(file, None, cloexec)
+            .alloc_fd(file, cloexec, current.nofile_soft_limit())
             .map(|fd| fd as usize)
     }
 

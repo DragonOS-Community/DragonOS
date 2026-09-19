@@ -136,6 +136,7 @@ normal/elf_file_backing
 normal/exec_write_access
 
 normal/internal_shmem
+normal/fd_table_semantics
 normal/proc_task_status
 normal/proc_stat_sched_fields
 normal/procfs_task_semantics

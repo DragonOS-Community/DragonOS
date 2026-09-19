@@ -73,9 +73,9 @@ impl Syscall for SysIoctlHandle {
             }
             FIONCLEX | FIOCLEX => {
                 // close_on_exec 是 per-fd 属性，需要通过 fd 表设置
-                let binding = ProcessManager::current_pcb().fd_table();
-                let mut fd_table_guard = binding.write();
-                fd_table_guard.set_cloexec(fd as i32, cmd == FIOCLEX);
+                ProcessManager::current_pcb()
+                    .fd_table()
+                    .set_cloexec(fd as i32, cmd == FIOCLEX)?;
                 return Ok(0);
             }
             FIOASYNC => {

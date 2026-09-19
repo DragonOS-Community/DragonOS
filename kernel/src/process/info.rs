@@ -8,7 +8,7 @@ use core::sync::atomic::AtomicUsize;
 use crate::{
     arch::ipc::signal::{SigSet, Signal},
     driver::tty::tty_core::TtyCore,
-    filesystem::vfs::file::{FileDescriptorTable, FileDescriptorVec},
+    filesystem::vfs::fdtable::{FdTableState, FileDescriptorTable},
     ipc::signal_types::{SigInfo, SigPending},
     libs::rwlock::RwLock,
     mm::{ucontext::AddressSpace, VirtAddr},
@@ -212,7 +212,7 @@ impl ProcessBasicInfo {
         cwd: String,
         user_vm: Option<Arc<AddressSpace>>,
     ) -> RwLock<Self> {
-        let fd_table = Arc::new(FileDescriptorTable::new(FileDescriptorVec::new()));
+        let fd_table = Arc::new(FileDescriptorTable::new(FdTableState::new()));
         return RwLock::new(Self {
             ppid,
             name,
@@ -310,11 +310,11 @@ mod fd_table_attachment_tests {
     use alloc::sync::Arc;
 
     use super::FdTableAttachment;
-    use crate::filesystem::vfs::file::{FileDescriptorTable, FileDescriptorVec};
+    use crate::filesystem::vfs::fdtable::{FdTableState, FileDescriptorTable};
 
     #[test]
     fn observer_arcs_do_not_count_as_task_sharing() {
-        let table = Arc::new(FileDescriptorTable::new(FileDescriptorVec::new()));
+        let table = Arc::new(FileDescriptorTable::new(FdTableState::new()));
         let owner = FdTableAttachment::new(table);
         let observer = owner.observer();
         let another_observer = observer.clone();

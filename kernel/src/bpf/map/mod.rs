@@ -247,11 +247,11 @@ pub fn bpf_map_create(attr: &bpf_attr) -> Result<usize> {
         }
     };
     let bpf_map = BpfMap::new(map, map_meta);
-    let fd_table = ProcessManager::current_pcb().fd_table();
+    let current = ProcessManager::current_pcb();
+    let fd_table = current.fd_table();
     let file = File::new(Arc::new(bpf_map), FileFlags::O_RDWR | FileFlags::O_CLOEXEC)?;
     let fd = fd_table
-        .write()
-        .alloc_fd(file, None, true)
+        .alloc_fd(file, true, current.nofile_soft_limit())
         .map(|x| x as usize)?;
     info!("create map with fd: [{}]", fd);
     Ok(fd)

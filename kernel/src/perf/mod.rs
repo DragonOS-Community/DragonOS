@@ -553,10 +553,10 @@ pub fn perf_event_open(
         cache.set_inode(Arc::downgrade(&(perf_event.clone() as _)))?;
     }
     let file = File::new(perf_event, file_mode)?;
-    let fd_table = ProcessManager::current_pcb().fd_table();
+    let current = ProcessManager::current_pcb();
+    let fd_table = current.fd_table();
     let fd = fd_table
-        .write()
-        .alloc_fd(file, None, cloexec)
+        .alloc_fd(file, cloexec, current.nofile_soft_limit())
         .map(|x| x as usize)?;
     Ok(fd)
 }

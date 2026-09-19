@@ -6,7 +6,8 @@ use system_error::SystemError;
 use crate::filesystem::{
     epoll::{EPollEventType, EPollItem},
     vfs::{
-        file::{File, FileFlags, FilePrivateData, ReservedFd},
+        fdtable::FdReservation,
+        file::{File, FileFlags, FilePrivateData},
         vcore::generate_inode_id,
         FileSystem, FileType, FsInfo, IndexNode, InodeFlags, InodeMode, Magic, Metadata,
         PollableInode, SuperBlock,
@@ -261,8 +262,8 @@ impl ProcessControlBlock {
 }
 
 pub struct PreparedPidFd {
-    pub reservation: ReservedFd,
-    pub file: File,
+    pub reservation: FdReservation<1>,
+    pub file: Arc<File>,
 }
 
 pub struct PidFd;
@@ -292,14 +293,10 @@ impl PidFd {
             return Err(SystemError::EINVAL);
         }
 
-        let reservation = task.fd_table().write().reserve_fd(true)?;
-        let file = match Self::create_file(pid, flags) {
-            Ok(file) => file,
-            Err(err) => {
-                task.fd_table().write().release_reserved_fd(reservation);
-                return Err(err);
-            }
-        };
+        let reservation = task
+            .fd_table()
+            .reserve::<1>(task.nofile_soft_limit(), 0, true)?;
+        let file = Arc::try_new(Self::create_file(pid, flags)?).map_err(|_| SystemError::ENOMEM)?;
 
         Ok(PreparedPidFd { reservation, file })
     }

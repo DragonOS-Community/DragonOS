@@ -37,27 +37,26 @@ pub fn stdio_init() -> Result<(), SystemError> {
     /*
        按照规定，进程的文件描述符数组的前三个位置，分别是stdin, stdout, stderr
     */
+    let current = ProcessManager::current_pcb();
+    let nofile_limit = current.nofile_soft_limit();
     assert_eq!(
-        ProcessManager::current_pcb()
+        current
             .fd_table()
-            .write()
-            .alloc_fd(stdin, None, false)
+            .alloc_fd(stdin, false, nofile_limit)
             .unwrap(),
         0
     );
     assert_eq!(
-        ProcessManager::current_pcb()
+        current
             .fd_table()
-            .write()
-            .alloc_fd(stdout, None, false)
+            .alloc_fd(stdout, false, nofile_limit)
             .unwrap(),
         1
     );
     assert_eq!(
-        ProcessManager::current_pcb()
+        current
             .fd_table()
-            .write()
-            .alloc_fd(stderr, None, false)
+            .alloc_fd(stderr, false, nofile_limit)
             .unwrap(),
         2
     );

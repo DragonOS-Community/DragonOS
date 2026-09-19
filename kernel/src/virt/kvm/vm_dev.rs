@@ -226,10 +226,10 @@ fn kvm_vm_ioctl_create_vcpu(id: u32) -> Result<usize, SystemError> {
 
     let vcpu_inode = LockedVcpuInode::new();
     let file: File = File::new(vcpu_inode, FileFlags::O_RDWR)?;
-    let r = ProcessManager::current_pcb()
+    let current = ProcessManager::current_pcb();
+    let r = current
         .fd_table()
-        .write()
-        .alloc_fd(file, None, false)
+        .alloc_fd(file, false, current.nofile_soft_limit())
         .map(|fd| fd as usize);
     return r;
 }

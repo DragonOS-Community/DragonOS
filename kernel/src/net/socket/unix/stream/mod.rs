@@ -1182,14 +1182,13 @@ impl Socket for UnixStreamSocket {
 
             let cloexec = _flags.contains(socket::PMSG::CMSG_CLOEXEC);
             let mut received_fds: alloc::vec::Vec<i32> = alloc::vec::Vec::with_capacity(fit);
-            {
-                let fd_table_binding = ProcessManager::current_pcb().fd_table();
-                let mut fd_table = fd_table_binding.write();
-                for file in scm_rights.iter().take(fit) {
-                    // SCM_RIGHTS 复制的是 fd 引用，必须共享同一个 open file description。
-                    let new_fd = fd_table.alloc_fd_arc(file.clone(), None, cloexec)?;
-                    received_fds.push(new_fd);
-                }
+            let current = ProcessManager::current_pcb();
+            let fd_table = current.fd_table();
+            for file in scm_rights.iter().take(fit) {
+                // SCM_RIGHTS 复制的是 fd 引用，必须共享同一个 open file description。
+                let new_fd =
+                    fd_table.alloc_fd_arc(file.clone(), cloexec, current.nofile_soft_limit())?;
+                received_fds.push(new_fd);
             }
 
             let data_len = received_fds.len() * core::mem::size_of::<i32>();
@@ -1201,7 +1200,7 @@ impl Socket for UnixStreamSocket {
                 len: control_len,
                 write_off: &mut write_off,
             };
-            if let Err(e) = buf.put(
+            if let Err(error) = buf.put(
                 &mut msg.msg_flags,
                 SOL_SOCKET,
                 SCM_RIGHTS,
@@ -1209,7 +1208,7 @@ impl Socket for UnixStreamSocket {
                 fd_bytes,
             ) {
                 super::rollback_allocated_fds(&received_fds);
-                return Err(e);
+                return Err(error);
             }
         }
 

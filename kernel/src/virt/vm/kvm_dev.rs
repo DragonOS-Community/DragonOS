@@ -89,7 +89,9 @@ impl LockedKvmInode {
         let current = ProcessManager::current_pcb();
 
         let file = File::new(instance, FileFlags::O_RDWR)?;
-        let fd = current.fd_table().write().alloc_fd(file, None, false)?;
+        let fd = current
+            .fd_table()
+            .alloc_fd(file, false, current.nofile_soft_limit())?;
         return Ok(fd as usize);
     }
 }

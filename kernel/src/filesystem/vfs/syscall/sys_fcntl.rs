@@ -11,7 +11,6 @@ use crate::{
         fcntl::{FcntlCommand, PosixFlock, FD_CLOEXEC, F_UNLCK},
         file::FileFlags,
         posix_lock::{get_posix_lock, set_posix_lock},
-        syscall::dup2::{do_dup2, do_dup3},
     },
     process::ProcessManager,
     syscall::table::{FormattedSyscallParam, Syscall},
@@ -87,38 +86,13 @@ impl SysFcntlHandle {
         // debug!("fcntl ({cmd:?}) fd: {fd}, arg={arg}");
         match cmd {
             FcntlCommand::DupFd | FcntlCommand::DupFdCloexec => {
-                // RLIMIT_NOFILE 检查
-                let nofile = ProcessManager::current_pcb()
-                    .get_rlimit(crate::process::resource::RLimitID::Nofile)
-                    .rlim_cur as usize;
-                let arg_i32 = arg as i32;
-                if arg_i32 < 0 || arg >= nofile {
-                    return Err(SystemError::EBADF);
-                }
-                let binding = ProcessManager::current_pcb().fd_table();
-                let mut fd_table_guard = binding.write();
-
-                // 在RLIMIT_NOFILE范围内查找可用的文件描述符
-                for i in arg..nofile {
-                    if fd_table_guard.fd_slot_available(i as i32) {
-                        let (newfd, dropped) = if cmd == FcntlCommand::DupFd {
-                            do_dup2(fd, i as i32, &mut fd_table_guard)?
-                        } else {
-                            do_dup3(fd, i as i32, FileFlags::O_CLOEXEC, &mut fd_table_guard)?
-                        };
-                        drop(fd_table_guard);
-                        if let Some(dropped) = dropped {
-                            if let Err(err) = dropped.finish_close() {
-                                log::warn!(
-                                    "fcntl dup implicit close failed after fd replacement: {:?}",
-                                    err
-                                );
-                            }
-                        }
-                        return Ok(newfd);
-                    }
-                }
-                return Err(SystemError::EMFILE);
+                let current = ProcessManager::current_pcb();
+                let nofile = current.nofile_soft_limit();
+                let table = current.fd_table();
+                let cloexec = cmd == FcntlCommand::DupFdCloexec;
+                table
+                    .duplicate_min(fd, arg as i32, cloexec, nofile)
+                    .map(|newfd| newfd as usize)
             }
             FcntlCommand::GetFd => {
                 // Get file descriptor flags (close_on_exec is per-fd).
@@ -136,15 +110,11 @@ impl SysFcntlHandle {
             }
             FcntlCommand::SetFd => {
                 // Set file descriptor flags (close_on_exec is per-fd).
-                let binding = ProcessManager::current_pcb().fd_table();
-                let mut fd_table_guard = binding.write();
-
-                if fd_table_guard.get_file_by_fd(fd).is_some() {
-                    let arg = arg as u32;
-                    fd_table_guard.set_cloexec(fd, arg & FD_CLOEXEC != 0);
-                    return Ok(0);
-                }
-                return Err(SystemError::EBADF);
+                let arg = arg as u32;
+                ProcessManager::current_pcb()
+                    .fd_table()
+                    .set_cloexec(fd, arg & FD_CLOEXEC != 0)?;
+                Ok(0)
             }
 
             FcntlCommand::GetFlags => {
@@ -167,7 +137,7 @@ impl SysFcntlHandle {
                 // File access mode (O_RDONLY, O_WRONLY, O_RDWR) and file creation flags
                 // (O_CREAT, O_EXCL, O_NOCTTY, O_TRUNC) in arg are ignored.
                 let binding = ProcessManager::current_pcb().fd_table();
-                let fd_table_guard = binding.write();
+                let fd_table_guard = binding.read();
 
                 if let Some(file) = fd_table_guard.get_file_by_fd(fd) {
                     let arg = arg as u32;

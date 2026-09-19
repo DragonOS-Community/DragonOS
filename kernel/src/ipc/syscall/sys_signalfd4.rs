@@ -58,9 +58,9 @@ impl Syscall for SysSignalFd4Handle {
 
             let file = File::new(inode, file_flags)?;
             let cloexec = flags.contains(SignalFdFlags::SFD_CLOEXEC);
-            let binding = ProcessManager::current_pcb().fd_table();
-            let mut fd_table_guard = binding.write();
-            let fd = fd_table_guard.alloc_fd(file, None, cloexec)?;
+            let current = ProcessManager::current_pcb();
+            let binding = current.fd_table();
+            let fd = binding.alloc_fd(file, cloexec, current.nofile_soft_limit())?;
             return Ok(fd as usize);
         }
 
@@ -90,9 +90,8 @@ impl Syscall for SysSignalFd4Handle {
         let _ = file.set_flags(new_flags);
 
         // close_on_exec 是 per-fd 属性，需要通过 fd 表设置
-        let fd_table = pcb.fd_table();
-        let mut fd_table_guard = fd_table.write();
-        fd_table_guard.set_cloexec(fd, flags.contains(SignalFdFlags::SFD_CLOEXEC));
+        pcb.fd_table()
+            .set_cloexec(fd, flags.contains(SignalFdFlags::SFD_CLOEXEC))?;
 
         Ok(fd as usize)
     }

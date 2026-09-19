@@ -19,16 +19,12 @@ impl Syscall for SysDupHandle {
 
     fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let oldfd = Self::oldfd(args);
-        let binding = ProcessManager::current_pcb().fd_table();
-        let mut fd_table_guard = binding.write();
-
-        let old_file = fd_table_guard
-            .get_file_by_fd(oldfd)
-            .ok_or(SystemError::EBADF)?;
+        let current = ProcessManager::current_pcb();
+        let binding = current.fd_table();
 
         // dup 共享同一个 open file description（Arc<File>），cloexec 默认 false
-        let res = fd_table_guard
-            .alloc_fd_arc(old_file, None, false)
+        let res = binding
+            .duplicate(oldfd, false, current.nofile_soft_limit())
             .map(|x| x as usize);
         return res;
     }

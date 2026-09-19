@@ -6,7 +6,7 @@ use system_error::SystemError;
 
 use crate::{
     arch::{interrupt::TrapFrame, syscall::nr::SYS_CLOSE_RANGE},
-    filesystem::vfs::file::FileDescriptorTable,
+    filesystem::vfs::fdtable::FileDescriptorTable,
     process::ProcessManager,
     sched::cond_resched,
     syscall::table::{FormattedSyscallParam, Syscall},
@@ -46,7 +46,7 @@ impl Syscall for SysCloseRangeHandle {
 syscall_table_macros::declare_syscall!(SYS_CLOSE_RANGE, SysCloseRangeHandle);
 
 fn close_range_in_table(table: &Arc<FileDescriptorTable>, first: u32, last: u32) {
-    let Some(end) = table.read().close_range_end(last) else {
+    let Some(end) = table.close_range_end(last) else {
         return;
     };
     let mut cursor = first as usize;
@@ -57,9 +57,7 @@ fn close_range_in_table(table: &Arc<FileDescriptorTable>, first: u32, last: u32)
     let mut work = 0usize;
     loop {
         let remaining_budget = CLOSE_RANGE_WORK_BUDGET - work;
-        let scan = table
-            .write()
-            .take_next_open_in_range(cursor, end, remaining_budget.max(1));
+        let scan = table.take_next_open_in_range(cursor, end, remaining_budget.max(1));
         cursor = scan.next;
         work += scan.scanned;
 
@@ -83,7 +81,7 @@ fn close_range_in_table(table: &Arc<FileDescriptorTable>, first: u32, last: u32)
 }
 
 fn set_cloexec_in_table(table: &Arc<FileDescriptorTable>, first: u32, last: u32) {
-    table.write().set_cloexec_range(first, last);
+    table.set_cloexec_range(first, last);
 }
 
 fn do_close_range(first: u32, last: u32, flags: u32) -> Result<usize, SystemError> {

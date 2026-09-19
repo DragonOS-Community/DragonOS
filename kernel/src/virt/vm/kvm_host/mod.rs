@@ -174,10 +174,10 @@ impl Vm {
 
         let file = File::new(vcpu_inode, FileFlags::from_bits_truncate(0x777))?;
 
-        let fd = ProcessManager::current_pcb()
+        let current = ProcessManager::current_pcb();
+        let fd = current
             .fd_table()
-            .write()
-            .alloc_fd(file, None, false)?;
+            .alloc_fd(file, false, current.nofile_soft_limit())?;
 
         Ok(fd as usize)
     }

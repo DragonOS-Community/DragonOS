@@ -9,6 +9,7 @@ TEST(ProcessSignalFork, PosixForkAndJobControlUnavailableOnWindows) {
 #else
 
 #include <errno.h>
+#include <poll.h>
 #include <pthread.h>
 #include <sched.h>
 #include <signal.h>
@@ -248,7 +249,112 @@ void RunMultithreadedSignalChild(int ready_fd) {
     }
 }
 
+volatile sig_atomic_t async_signal_seen = 0;
+volatile sig_atomic_t async_signal_stop = 0;
+
+void RecordAsyncSignal(int signal) {
+    if (signal == SIGUSR1) {
+        async_signal_seen = 1;
+    } else if (signal == SIGUSR2) {
+        async_signal_stop = 1;
+    }
+}
+
+void RunAsyncSignalReturnStress(bool syscall_heavy) {
+    int ready_pipe[2];
+    ASSERT_EQ(0, pipe(ready_pipe));
+    const pid_t child = fork();
+    if (child < 0) {
+        const int error = errno;
+        close(ready_pipe[0]);
+        close(ready_pipe[1]);
+        FAIL() << "fork failed: " << strerror(error);
+    }
+    if (child == 0) {
+        close(ready_pipe[0]);
+        async_signal_seen = 0;
+        async_signal_stop = 0;
+        struct sigaction action {};
+        action.sa_handler = RecordAsyncSignal;
+        sigemptyset(&action.sa_mask);
+        if (sigaction(SIGUSR1, &action, nullptr) != 0 ||
+            sigaction(SIGUSR2, &action, nullptr) != 0) {
+            _exit(121);
+        }
+        action.sa_handler = SIG_DFL;
+        if (sigaction(SIGALRM, &action, nullptr) != 0) {
+            _exit(122);
+        }
+        sigset_t unblocked;
+        sigemptyset(&unblocked);
+        sigaddset(&unblocked, SIGUSR1);
+        sigaddset(&unblocked, SIGUSR2);
+        sigaddset(&unblocked, SIGALRM);
+        if (sigprocmask(SIG_UNBLOCK, &unblocked, nullptr) != 0) {
+            _exit(123);
+        }
+        alarm(10);
+        WriteByteOrExit(ready_pipe[1], 'R');
+        close(ready_pipe[1]);
+
+        const pid_t expected_pid = getpid();
+        volatile unsigned long work = 1;
+        while (!async_signal_stop || !async_signal_seen) {
+            // Keep real userspace work between kernel entries, including in
+            // the syscall-heavy case. Unsigned arithmetic wraps intentionally.
+            const int iterations = syscall_heavy ? 32 : 32768;
+            for (int i = 0; i < iterations; ++i) {
+                work = work * 1664525UL + 1013904223UL;
+            }
+            if (syscall(SYS_getpid) != expected_pid || sched_yield() != 0) {
+                _exit(124);
+            }
+        }
+        // A successful exit must include a kernel entry after signal return.
+        _exit(syscall(SYS_getpid) == expected_pid ? 0 : 125);
+    }
+
+    ChildProcessGuard child_guard(child);
+    close(ready_pipe[1]);
+    bool ready = false;
+    pollfd descriptor {ready_pipe[0], POLLIN, 0};
+    for (int i = 0; i < 50; ++i) {
+        const int result = poll(&descriptor, 1, 100);
+        if (result > 0) {
+            ready = (descriptor.revents & POLLIN) && ReadByte(ready_pipe[0]);
+            break;
+        }
+        if (result < 0 && errno != EINTR) {
+            break;
+        }
+    }
+    close(ready_pipe[0]);
+    ASSERT_TRUE(ready) << "child did not install signal handlers within timeout";
+
+    // Ordinary signals may coalesce; require delivery, not a precise count.
+    for (int i = 0; i < 4096; ++i) {
+        ASSERT_EQ(0, kill(child, SIGUSR1)) << strerror(errno);
+        if (i % 16 == 15) {
+            SleepForMillis(1);
+        }
+    }
+    ASSERT_EQ(0, kill(child, SIGUSR2)) << strerror(errno);
+    int status = 0;
+    ASSERT_TRUE(WaitForExit(child, &status, 500)) << "signal return workload timed out";
+    child_guard.Release();
+    ASSERT_TRUE(WIFEXITED(status)) << "child status=" << status;
+    EXPECT_EQ(0, WEXITSTATUS(status));
+}
+
 }  // namespace
+
+TEST(ProcessSignalFork, AsyncSignalsDuringSyscallReturns) {
+    RunAsyncSignalReturnStress(true);
+}
+
+TEST(ProcessSignalFork, AsyncSignalsDuringUserspaceExecution) {
+    RunAsyncSignalReturnStress(false);
+}
 
 TEST(ProcessSignalFork, SigchldHandlerCanImmediatelyReapExitedChild) {
     struct sigaction action {};

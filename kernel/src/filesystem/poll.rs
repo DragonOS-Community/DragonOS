@@ -418,7 +418,7 @@ pub fn poll_select_finish(
         PollTimeType::TimeVal | PollTimeType::OldTimeVal => {
             let rtv = PosixTimeval {
                 tv_sec: rts.tv_sec,
-                tv_usec: (rts.tv_nsec / 1000) as i32,
+                tv_usec: rts.tv_nsec / 1000,
             };
             let mut tvwriter = UserBufferWriter::new(
                 user_time_ptr as *mut PosixTimeval,

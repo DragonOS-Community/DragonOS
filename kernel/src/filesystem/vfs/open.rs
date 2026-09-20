@@ -722,6 +722,16 @@ pub fn do_utimensat(
 }
 
 pub fn do_utimes(path: &str, times: Option<[PosixTimeval; 2]>) -> Result<usize, SystemError> {
+    // Validate before converting microseconds to nanoseconds. Unlike timer
+    // intervals, file timestamps may legitimately have negative seconds.
+    if let Some(values) = times {
+        if values
+            .iter()
+            .any(|value| !(0..1_000_000).contains(&value.tv_usec))
+        {
+            return Err(SystemError::EINVAL);
+        }
+    }
     // log::debug!("do_utimes: path:{:?}, times:{:?}", path, times);
     let (inode_begin, path) = user_path_at(
         &ProcessManager::current_pcb(),

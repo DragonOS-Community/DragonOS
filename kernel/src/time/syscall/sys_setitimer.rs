@@ -33,7 +33,7 @@ impl ItimerType {
                         let remaining_jiffies = Jiffies::new(expires - now);
                         let remaining_duration = Duration::from(remaining_jiffies);
                         old_itv.it_value.tv_sec = remaining_duration.as_secs() as i64;
-                        old_itv.it_value.tv_usec = remaining_duration.subsec_micros() as i32;
+                        old_itv.it_value.tv_usec = remaining_duration.subsec_micros().into();
                     }
                 }
                 old_itv
@@ -182,6 +182,20 @@ fn handle_itimer(
     new_value_ptr: *const Itimerval,
     old_value_ptr: *mut Itimerval,
 ) -> Result<usize, SystemError> {
+    // Validate full-width ABI fields before narrowing to timer units, writing
+    // old_value, or changing the current timer. Invalid input is transactional.
+    let new_config = if new_value_ptr.is_null() {
+        None
+    } else {
+        let reader = UserBufferReader::new(new_value_ptr, size_of::<Itimerval>(), true)?;
+        let config = reader.read_one_from_user::<Itimerval>(0)?;
+        for value in [config.it_value, config.it_interval] {
+            if value.tv_sec < 0 || !(0..1_000_000).contains(&value.tv_usec) {
+                return Err(SystemError::EINVAL);
+            }
+        }
+        Some(config)
+    };
     let mut itimers = pcb.itimers_irqsave();
 
     // old_value: 获取旧值并写入用户空间
@@ -192,13 +206,8 @@ fn handle_itimer(
         writer.copy_one_to_user(&old_itv, 0)?;
     }
 
-    // new_value: 从用户空间读取新值并设置
-    if !new_value_ptr.is_null() {
-        let mut new_config = Itimerval::default();
-        let reader = UserBufferReader::new(new_value_ptr, size_of::<Itimerval>(), true)?;
-        reader.copy_one_from_user(&mut new_config, 0)?;
-
-        which.set_new_value(pcb.clone(), &mut itimers, new_config);
+    if let Some(config) = new_config {
+        which.set_new_value(pcb.clone(), &mut itimers, config);
     }
     Ok(0)
 }

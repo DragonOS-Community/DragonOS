@@ -829,7 +829,7 @@ impl ProcInitInfo {
     /// ## Returns
     ///
     /// A tuple where the first element is the final user stack pointer and the
-    /// second element is the starting address of the `envp` pointer array.
+    /// second element is the starting address of the `argv` pointer array.
     pub unsafe fn push_at(
         &mut self,
         ustack: &mut UserStack,
@@ -838,24 +838,10 @@ impl ProcInitInfo {
         self.push_str(ustack, &self.proc_name)?;
 
         // Then push the environment variables onto the stack.
-        let mut envps = Vec::new();
-        envps
-            .try_reserve_exact(self.envs.len())
-            .map_err(|_| SystemError::ENOMEM)?;
-        for env in &self.envs {
-            self.push_str(ustack, env)?;
-            envps.push(ustack.sp());
-        }
+        let envps = self.push_strings(ustack, &self.envs)?;
 
         // Then push the arguments onto the stack.
-        let mut argps = Vec::new();
-        argps
-            .try_reserve_exact(self.args.len())
-            .map_err(|_| SystemError::ENOMEM)?;
-        for arg in &self.args {
-            self.push_str(ustack, arg)?;
-            argps.push(ustack.sp());
-        }
+        let argps = self.push_strings(ustack, &self.args)?;
 
         // Push the random number and store its pointer in auxv.
         self.push_slice(ustack, &[self.rand_num])?;
@@ -903,6 +889,27 @@ impl ProcInitInfo {
         self.push_slice(ustack, &[self.args.len()])?;
 
         return Ok((ustack.sp(), argv_ptr));
+    }
+
+    /// Copy strings in reverse onto the downward-growing stack, matching Linux's
+    /// contiguous, ascending-address string layout. Process-title implementations
+    /// rely on this layout when computing the writable argument string span.
+    /// Return pointers in the original logical order, not the copy order.
+    fn push_strings(
+        &self,
+        ustack: &mut UserStack,
+        strings: &[CString],
+    ) -> Result<Vec<VirtAddr>, SystemError> {
+        let mut pointers = Vec::new();
+        pointers
+            .try_reserve_exact(strings.len())
+            .map_err(|_| SystemError::ENOMEM)?;
+        for string in strings.iter().rev() {
+            self.push_str(ustack, string)?;
+            pointers.push(ustack.sp());
+        }
+        pointers.reverse();
+        Ok(pointers)
     }
 
     fn remaining_stack_words(&self, envc: usize, argc: usize) -> usize {

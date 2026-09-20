@@ -72,6 +72,7 @@ normal/root_mount_cmdline
 normal/kernel_cmdline_compat
 normal/proc_pid_reuse_cache
 normal/proc_self_exec_cmdline
+normal/exec_string_layout
 normal/proc_thread_accounting
 normal/user_namespace_id_map
 normal/tty_tcflush

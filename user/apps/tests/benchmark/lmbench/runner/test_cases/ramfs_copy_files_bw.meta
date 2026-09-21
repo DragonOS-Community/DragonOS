@@ -1,0 +1,11 @@
+# Extraction/metadata for ramfs_copy_files_bw (KEY=VALUE; parsed by run.sh)
+CATEGORY=filesystem
+BINARY=lmdd
+METRIC_TYPE=bandwidth
+UNIT=MB/s
+BIGGER_IS_BETTER=1
+# lmdd prints "<X> MB in <Y> secs, <Z> MB/sec"; value is the field before MB/sec.
+SEARCH_PATTERN=MB in
+RESULT_INDEX=NF-1
+NTH_OCCURRENCE=1
+DESCRIPTION=ramfs file copy bandwidth via lmdd

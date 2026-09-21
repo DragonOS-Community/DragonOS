@@ -1,0 +1,12 @@
+# Extraction/metadata for signal_prot_lat (KEY=VALUE; parsed by run.sh)
+CATEGORY=signal
+BINARY=lat_sig
+METRIC_TYPE=latency
+UNIT=microseconds
+BIGGER_IS_BETTER=0
+# lat_sig prot prints "Protection fault: <N> microseconds" (prefix confirmed via
+# strings; requires a test file at runtime per the .sh).
+SEARCH_PATTERN=Protection fault
+RESULT_INDEX=NF-1
+NTH_OCCURRENCE=1
+DESCRIPTION=Signal protection fault latency via lat_sig prot

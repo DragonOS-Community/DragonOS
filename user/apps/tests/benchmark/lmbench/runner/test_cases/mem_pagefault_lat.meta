@@ -1,0 +1,11 @@
+# Extraction/metadata for mem_pagefault_lat (KEY=VALUE; parsed by run.sh)
+CATEGORY=memory
+BINARY=lat_pagefault
+METRIC_TYPE=latency
+UNIT=microseconds
+BIGGER_IS_BETTER=0
+# lat_pagefault prints "Pagefaults on <file>: <N> microseconds".
+SEARCH_PATTERN=^Pagefaults
+RESULT_INDEX=NF-1
+NTH_OCCURRENCE=1
+DESCRIPTION=Page fault latency via lat_pagefault

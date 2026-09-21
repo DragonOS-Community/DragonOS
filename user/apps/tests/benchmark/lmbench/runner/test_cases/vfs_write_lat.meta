@@ -1,0 +1,11 @@
+# Extraction/metadata for vfs_write_lat (KEY=VALUE; parsed by run.sh)
+CATEGORY=vfs
+BINARY=lat_syscall
+METRIC_TYPE=latency
+UNIT=microseconds
+BIGGER_IS_BETTER=0
+# lat_syscall write prints "Simple write: <N> microseconds".
+SEARCH_PATTERN=Simple write
+RESULT_INDEX=NF-1
+NTH_OCCURRENCE=1
+DESCRIPTION=write syscall latency via lat_syscall write

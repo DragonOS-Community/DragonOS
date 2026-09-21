@@ -3192,13 +3192,41 @@ impl MountFS {
             return Ok(());
         };
         let mut last_err = Ok(());
-        for page_cache in domain.snapshot() {
-            if !page_cache.has_dirty_or_writeback_work() {
-                continue;
+        let mut members = domain
+            .snapshot()
+            .into_iter()
+            .filter(|cache| cache.has_dirty_or_writeback_work());
+        let mut pending = Vec::new();
+        pending
+            .try_reserve_exact(crate::filesystem::page_cache::DOMAIN_WRITEBACK_WINDOW)
+            .map_err(|_| SystemError::ENOMEM)?;
+        loop {
+            let mut count = 0;
+            for page_cache in members
+                .by_ref()
+                .take(crate::filesystem::page_cache::DOMAIN_WRITEBACK_WINDOW)
+            {
+                count += 1;
+                match page_cache.start_sync_for_domain() {
+                    Ok(writeback) => pending.push(writeback),
+                    Err(error) => {
+                        self.record_wb_error(error.clone());
+                        last_err = Err(error);
+                    }
+                }
             }
-            if let Err(e) = page_cache.sync_for_domain() {
-                log::warn!("sync_inodes_of_mount: page cache sync failed: {:?}", e);
-                last_err = Err(e);
+            if count == 0 {
+                break;
+            }
+            // Submit across mappings before forcing durable completion. An
+            // outer guard would seal each small file before the next starts.
+            let _sync_request = self.inner_filesystem.begin_sync_writeback();
+            for writeback in pending.drain(..) {
+                if let Err(error) = writeback.finish() {
+                    log::warn!("sync_inodes_of_mount: page cache sync failed: {:?}", error);
+                    self.record_wb_error(error.clone());
+                    last_err = Err(error);
+                }
             }
         }
         last_err
@@ -3212,7 +3240,6 @@ impl MountFS {
             return Ok(());
         }
 
-        let _sync_request = self.inner_filesystem.begin_sync_writeback();
         self.sync_inodes_of_mount()
     }
 
@@ -3275,11 +3302,6 @@ impl MountFS {
         if self.is_sb_readonly() {
             return Ok(());
         }
-
-        // Accepted filesystem metadata may complete the PageCache I/O below.
-        // Keep one request across this whole bounded sync, including later
-        // inode submissions, rather than allocating one guard per mapping.
-        let _sync_request = self.inner_filesystem.begin_sync_writeback();
 
         // writeback_inodes_sb(sb) — void
         let mut last_err = self.sync_inodes_of_mount();

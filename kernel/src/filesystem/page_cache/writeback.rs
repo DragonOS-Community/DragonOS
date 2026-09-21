@@ -9,6 +9,56 @@ use super::{
 
 static PAGE_CACHE_WRITEBACK_TAG_EPOCH: AtomicU64 = AtomicU64::new(1);
 const MAX_ASYNC_WRITEBACK_BATCHES: usize = PAGECACHE_IO_WORKERS * 2;
+pub(crate) const DOMAIN_WRITEBACK_WINDOW: usize = MAX_ASYNC_WRITEBACK_BATCHES;
+
+/// A frozen range must survive a partially failed start: earlier batches may
+/// already be owned by workers and still need draining by a domain sync.
+struct StartedWriteback<T> {
+    frozen: T,
+    range: PageCacheWritebackRange,
+    error: Option<SystemError>,
+}
+
+impl<T> StartedWriteback<T> {
+    fn into_result(self) -> Result<(T, PageCacheWritebackRange), SystemError> {
+        match self.error {
+            Some(error) => Err(error),
+            None => Ok((self.frozen, self.range)),
+        }
+    }
+}
+
+/// Pins the canonical inode through data completion and metadata writeback.
+/// A range alone only owns a Weak<PageCache>; the last dirty-page completion
+/// may otherwise release the inode's last retention owner before write_inode.
+pub(crate) struct PageCacheDomainWriteback {
+    cache: Arc<PageCache>,
+    inode: Arc<dyn IndexNode>,
+    _retention: InodeRetentionGuard,
+    started: StartedWriteback<()>,
+    error_since: crate::libs::errseq::ErrSeqValue,
+}
+
+impl PageCacheDomainWriteback {
+    pub(crate) fn finish(self) -> Result<(), SystemError> {
+        let waited = self.started.range.wait_for_completion();
+        let error = self
+            .started
+            .error
+            .or_else(|| waited.err())
+            .or_else(|| self.cache.check_writeback_error_since(self.error_since));
+        if let Some(error) = error {
+            return Err(error);
+        }
+        self.inode
+            .write_inode(&WritebackControl::sync_all_for_sync())
+            .map_err(|error| {
+                self.cache
+                    .record_writeback_error_with_superblock(error.clone());
+                error
+            })
+    }
+}
 static PAGECACHE_WRITEBACK_RR: AtomicUsize = AtomicUsize::new(0);
 static ASYNC_WRITEBACK_BATCHES: AtomicUsize = AtomicUsize::new(0);
 static ASYNC_WRITEBACK_COMPLETIONS: AtomicU64 = AtomicU64::new(0);
@@ -1329,6 +1379,30 @@ impl PageCacheWritebackRange {
 }
 
 impl PageCacheManager {
+    pub(crate) fn start_sync_for_domain(&self) -> Result<PageCacheDomainWriteback, SystemError> {
+        let cache = self.upgrade()?;
+        let inode = cache
+            .inode()
+            .and_then(|inode| inode.upgrade())
+            .ok_or(SystemError::EIO)?;
+        let retention = InodeRetentionGuard::new(inode.clone(), InodeRetentionKind::AsyncWork)?;
+        let error_since = cache.sample_writeback_error();
+        let started = self.start_writeback_range_impl(
+            0,
+            usize::MAX,
+            || Ok(()),
+            crate::sched::sched_yield,
+            true,
+        )?;
+        Ok(PageCacheDomainWriteback {
+            cache,
+            inode,
+            _retention: retention,
+            started,
+            error_since,
+        })
+    }
+
     fn lock_writeback_protocol(
         cache: &PageCache,
         protocol: PageCacheWritebackProtocol,
@@ -2640,10 +2714,12 @@ impl PageCacheManager {
             }
             let (entries, last_scanned) = {
                 let inner = cache.inner.lock();
-                let mut entries = Vec::new();
-                entries
-                    .try_reserve_exact(WAIT_BATCH_ENTRIES)
-                    .map_err(|_| SystemError::ENOMEM)?;
+                // Completion must remain drainable under memory pressure.
+                // In particular a domain-sync handle must not lose earlier
+                // untagged I/O merely because its wait cannot allocate.
+                let mut entries: [Option<(Arc<PageEntry>, u64)>; WAIT_BATCH_ENTRIES] =
+                    [const { None }; WAIT_BATCH_ENTRIES];
+                let mut entry_count = 0;
                 let mut last_scanned = None;
                 let mut scanned = 0usize;
                 for index in inner.page_indices.range(cursor..=end_index) {
@@ -2659,9 +2735,10 @@ impl PageCacheManager {
                     if entry.state() == PageState::Writeback
                         && frontier.is_none_or(|frontier| incarnation <= frontier)
                     {
-                        entries.push((entry.clone(), incarnation));
+                        entries[entry_count] = Some((entry.clone(), incarnation));
+                        entry_count += 1;
                     }
-                    if entries.len() == WAIT_BATCH_ENTRIES || scanned == WAIT_SCAN_INDICES {
+                    if entry_count == WAIT_BATCH_ENTRIES || scanned == WAIT_SCAN_INDICES {
                         break;
                     }
                 }
@@ -2670,7 +2747,7 @@ impl PageCacheManager {
             let Some(last_scanned) = last_scanned else {
                 break;
             };
-            for (entry, incarnation) in entries {
+            for (entry, incarnation) in entries.into_iter().flatten() {
                 if let Err(error) = Self::wait_writeback_entry_incarnation(entry, incarnation) {
                     first_error.get_or_insert(error);
                 }
@@ -3613,74 +3690,92 @@ impl PageCacheManager {
         permit: AsyncWritebackPermit,
         batch: ClaimedWritebackBatch,
     ) {
+        let work_state = Mutex::new(Some((permit, batch)));
+        schedule_pagecache_writeback(Work::new(move || {
+            let Some((permit, batch)) = work_state.lock().take() else {
+                return;
+            };
+            Self::run_tagged_writeback_submission(
+                cache.clone(),
+                inode.clone(),
+                continuation,
+                last_index,
+                permit,
+                batch,
+            );
+        }));
+    }
+
+    fn run_tagged_writeback_submission(
+        cache: Weak<PageCache>,
+        inode: Weak<dyn IndexNode>,
+        continuation: TaggedWritebackCursor,
+        last_index: usize,
+        permit: AsyncWritebackPermit,
+        batch: ClaimedWritebackBatch,
+    ) {
         let TaggedWritebackCursor {
             start_index,
             frozen_end,
             epoch,
             cursor: retry_cursor,
         } = continuation;
-        let work_state = Mutex::new(Some((permit, batch)));
-        schedule_pagecache_writeback(Work::new(move || {
-            let Some((permit, batch)) = work_state.lock().take() else {
-                return;
-            };
-            let outcome = Self::submit_writeback_batch(batch);
-            drop(permit);
-            match outcome {
-                Ok(WritebackSubmitOutcome::Completed | WritebackSubmitOutcome::Submitted) => {
-                    if last_index == usize::MAX {
-                        if let Some(cache) = cache.upgrade() {
-                            Self::notify_tagged_writeback_progress(&cache);
-                        }
-                        return;
+        let outcome = Self::submit_writeback_batch(batch);
+        drop(permit);
+        match outcome {
+            Ok(WritebackSubmitOutcome::Completed | WritebackSubmitOutcome::Submitted) => {
+                if last_index == usize::MAX {
+                    if let Some(cache) = cache.upgrade() {
+                        Self::notify_tagged_writeback_progress(&cache);
                     }
-                    Self::schedule_tagged_writeback_drain_with_permit(
-                        cache.clone(),
-                        inode.clone(),
+                    return;
+                }
+                Self::schedule_tagged_writeback_drain_with_permit(
+                    cache.clone(),
+                    inode.clone(),
+                    start_index,
+                    frozen_end,
+                    epoch,
+                    last_index + 1,
+                    None,
+                );
+            }
+            Ok(WritebackSubmitOutcome::Deferred(progress)) => {
+                Self::schedule_tagged_writeback_retry(
+                    progress,
+                    cache.clone(),
+                    inode.clone(),
+                    start_index,
+                    frozen_end,
+                    epoch,
+                    retry_cursor,
+                );
+            }
+            Ok(WritebackSubmitOutcome::Failed(_)) => {
+                if let Some(cache) = cache.upgrade() {
+                    // Batch completion already recorded the error. Do not
+                    // leave later tags waiting for a continuation that
+                    // cannot be scheduled after a terminal failure.
+                    Self::retire_tagged_writeback_generation(
+                        &cache,
                         start_index,
                         frozen_end,
                         epoch,
-                        last_index + 1,
-                        None,
                     );
-                }
-                Ok(WritebackSubmitOutcome::Deferred(progress)) => {
-                    Self::schedule_tagged_writeback_retry(
-                        progress,
-                        cache.clone(),
-                        inode.clone(),
-                        start_index,
-                        frozen_end,
-                        epoch,
-                        retry_cursor,
-                    );
-                }
-                Ok(WritebackSubmitOutcome::Failed(_)) => {
-                    if let Some(cache) = cache.upgrade() {
-                        // Batch completion already recorded the error. Do not
-                        // leave later tags waiting for a continuation that
-                        // cannot be scheduled after a terminal failure.
-                        Self::retire_tagged_writeback_generation(
-                            &cache,
-                            start_index,
-                            frozen_end,
-                            epoch,
-                        );
-                    }
-                }
-                Err(error) => {
-                    if let Some(cache) = cache.upgrade() {
-                        Self::abandon_tagged_writeback_generation(
-                            &cache,
-                            start_index,
-                            frozen_end,
-                            epoch,
-                            error,
-                        );
-                    }
                 }
             }
-        }));
+            Err(error) => {
+                if let Some(cache) = cache.upgrade() {
+                    Self::abandon_tagged_writeback_generation(
+                        &cache,
+                        start_index,
+                        frozen_end,
+                        epoch,
+                        error,
+                    );
+                }
+            }
+        }
     }
 
     fn schedule_tagged_writeback_retry(
@@ -4076,8 +4171,24 @@ impl PageCacheManager {
         start_index: usize,
         end_index: usize,
         freeze: F,
-        mut chunk_released: C,
+        chunk_released: C,
     ) -> Result<(T, PageCacheWritebackRange), SystemError>
+    where
+        F: FnOnce() -> Result<T, SystemError>,
+        C: FnMut(),
+    {
+        self.start_writeback_range_impl(start_index, end_index, freeze, chunk_released, false)?
+            .into_result()
+    }
+
+    fn start_writeback_range_impl<T, F, C>(
+        &self,
+        start_index: usize,
+        end_index: usize,
+        freeze: F,
+        mut chunk_released: C,
+        submit_first_token_inline: bool,
+    ) -> Result<StartedWriteback<T>, SystemError>
     where
         F: FnOnce() -> Result<T, SystemError>,
         C: FnMut(),
@@ -4091,16 +4202,17 @@ impl PageCacheManager {
         let mut invalidate = cache.invalidate_write();
         let frozen_filesystem_state = freeze()?;
         if start_index > end_index {
-            return Ok((
-                frozen_filesystem_state,
-                PageCacheWritebackRange {
+            return Ok(StartedWriteback {
+                frozen: frozen_filesystem_state,
+                range: PageCacheWritebackRange {
                     cache: Arc::downgrade(&cache),
                     start_index,
                     frozen_end: None,
                     writeback_frontier: 0,
                     epoch: 0,
                 },
-            ));
+                error: None,
+            });
         }
 
         // Freeze the caller-visible dirty set with an epoch tag, equivalent to
@@ -4137,16 +4249,17 @@ impl PageCacheManager {
             epoch
         };
         let Some(frozen_end) = dirty_end.into_iter().chain(preexisting_writeback_end).max() else {
-            return Ok((
-                frozen_filesystem_state,
-                PageCacheWritebackRange {
+            return Ok(StartedWriteback {
+                frozen: frozen_filesystem_state,
+                range: PageCacheWritebackRange {
                     cache: Arc::downgrade(&cache),
                     start_index,
                     frozen_end: None,
                     writeback_frontier: 0,
                     epoch,
                 },
-            ));
+                error: None,
+            });
         };
         let mut tagged_new = false;
         let mut tag_cursor = start_index;
@@ -4209,93 +4322,43 @@ impl PageCacheManager {
         // Backend claim/admission takes invalidate-read. Release the writer
         // only after both metadata and page tags have been frozen.
         drop(invalidate);
+        drop(_tag_scan);
         if !tagged_new {
-            return Ok((frozen_filesystem_state, operation));
+            return Ok(StartedWriteback {
+                frozen: frozen_filesystem_state,
+                range: operation,
+                error: None,
+            });
         }
 
-        let inode = match cache.inode().and_then(|inode| inode.upgrade()) {
-            Some(inode) => inode,
-            None => {
-                Self::abandon_tagged_writeback_generation(
-                    &cache,
-                    start_index,
-                    frozen_end,
-                    epoch,
-                    SystemError::EIO,
-                );
-                return Err(SystemError::EIO);
-            }
-        };
-        let _domain_io = match cache.try_acquire_domain_io_classified() {
-            Ok(permit) => permit,
-            Err(super::PageCacheDomainIoAdmissionError::Closed) => {
-                Self::retire_tagged_writeback_generation(&cache, start_index, frozen_end, epoch);
-                return Err(SystemError::ESTALE);
-            }
-            Err(super::PageCacheDomainIoAdmissionError::Unavailable(error)) => {
-                Self::abandon_tagged_writeback_generation(
-                    &cache,
-                    start_index,
-                    frozen_end,
-                    epoch,
-                    error.clone(),
-                );
-                return Err(error);
-            }
-        };
-
-        // `SYNC_FILE_RANGE_WRITE` is an asynchronous writeout starter: it
-        // publishes Dirty -> Writeback and queues legacy I/O, but must not
-        // run a synchronous backend write_pages() to completion on the
-        // syscall stack. Tagged batches additionally register a precise
-        // submission-boundary record. WAIT_BEFORE|WRITE waits for workers to
-        // cross that record, while ordinary WRITE returns after dispatch.
-        //
-        // A token queue stops after its first claimed head. Its submit result
-        // or defer continuation is the only path allowed to inspect a
-        // successor, preserving delayed-allocation head-first order.
-        let mut cursor = start_index;
-        loop {
-            let (target_index, target_entry, tagged_end) =
-                match Self::find_tagged_writeback_target(&cache, cursor, frozen_end, epoch) {
-                    TaggedWritebackSearch::Done => {
-                        Self::notify_tagged_writeback_progress(&cache);
-                        break;
-                    }
-                    TaggedWritebackSearch::Advance(next_cursor) => {
-                        cursor = next_cursor;
-                        crate::sched::sched_yield();
-                        continue;
-                    }
-                    TaggedWritebackSearch::Target { index, entry, end } => (index, entry, end),
-                };
-
-            let Some(permit) = AsyncWritebackPermit::try_acquire() else {
-                // WRITE is an asynchronous starter. A saturated batch budget
-                // leaves the next frozen tag Dirty and registers a one-shot
-                // drain retry; it must not wait for an older write_pages()
-                // call to finish on the syscall stack.
-                Self::schedule_tagged_writeback_budget_retry(
-                    &cache,
-                    &inode,
-                    start_index,
-                    frozen_end,
-                    epoch,
-                    cursor,
-                );
-                break;
+        // Keep the frozen range even on a partially failed dispatch. Domain
+        // sync must wait earlier accepted batches under its completion guard.
+        let dispatch = (|| -> Result<(), SystemError> {
+            let inode = match cache.inode().and_then(|inode| inode.upgrade()) {
+                Some(inode) => inode,
+                None => {
+                    Self::abandon_tagged_writeback_generation(
+                        &cache,
+                        start_index,
+                        frozen_end,
+                        epoch,
+                        SystemError::EIO,
+                    );
+                    return Err(SystemError::EIO);
+                }
             };
-            let claim = match self.claim_tagged_batch_with_admission(
-                &cache,
-                &inode,
-                WritebackBatchRange::new(target_index, tagged_end),
-                &target_entry,
-                epoch,
-                _domain_io.as_ref(),
-            ) {
-                Ok(claim) => claim,
-                Err(error) => {
-                    drop(permit);
+            let _domain_io = match cache.try_acquire_domain_io_classified() {
+                Ok(permit) => permit,
+                Err(super::PageCacheDomainIoAdmissionError::Closed) => {
+                    Self::retire_tagged_writeback_generation(
+                        &cache,
+                        start_index,
+                        frozen_end,
+                        epoch,
+                    );
+                    return Err(SystemError::ESTALE);
+                }
+                Err(super::PageCacheDomainIoAdmissionError::Unavailable(error)) => {
                     Self::abandon_tagged_writeback_generation(
                         &cache,
                         start_index,
@@ -4306,123 +4369,200 @@ impl PageCacheManager {
                     return Err(error);
                 }
             };
-            match claim {
-                WritebackClaimOutcome::Deferred(progress) => {
-                    drop(permit);
-                    // The callback is registered before WRITE returns, so a
-                    // claim-time defer has a producer-owned progress edge
-                    // rather than relying on an unrelated later reclaim.
-                    Self::schedule_tagged_writeback_retry(
-                        progress,
-                        Arc::downgrade(&cache),
-                        Arc::downgrade(&inode),
+
+            // `SYNC_FILE_RANGE_WRITE` is an asynchronous writeout starter: it
+            // publishes Dirty -> Writeback and queues legacy I/O, but must not
+            // run a synchronous backend write_pages() to completion on the
+            // syscall stack. Tagged batches additionally register a precise
+            // submission-boundary record. WAIT_BEFORE|WRITE waits for workers to
+            // cross that record, while ordinary WRITE returns after dispatch.
+            //
+            // A token queue stops after its first claimed head. Its submit result
+            // or defer continuation is the only path allowed to inspect a
+            // successor, preserving delayed-allocation head-first order.
+            let mut cursor = start_index;
+            loop {
+                let (target_index, target_entry, tagged_end) =
+                    match Self::find_tagged_writeback_target(&cache, cursor, frozen_end, epoch) {
+                        TaggedWritebackSearch::Done => {
+                            Self::notify_tagged_writeback_progress(&cache);
+                            break;
+                        }
+                        TaggedWritebackSearch::Advance(next_cursor) => {
+                            cursor = next_cursor;
+                            crate::sched::sched_yield();
+                            continue;
+                        }
+                        TaggedWritebackSearch::Target { index, entry, end } => (index, entry, end),
+                    };
+
+                let Some(permit) = AsyncWritebackPermit::try_acquire() else {
+                    // WRITE is an asynchronous starter. A saturated batch budget
+                    // leaves the next frozen tag Dirty and registers a one-shot
+                    // drain retry; it must not wait for an older write_pages()
+                    // call to finish on the syscall stack.
+                    Self::schedule_tagged_writeback_budget_retry(
+                        &cache,
+                        &inode,
                         start_index,
                         frozen_end,
                         epoch,
-                        target_index,
+                        cursor,
                     );
                     break;
-                }
-                WritebackClaimOutcome::FailedRecorded(error) => {
-                    drop(permit);
-                    // The claimed batch has already been completed back to
-                    // Dirty and its error recorded by PageCache. Only retire
-                    // the remaining frozen tags here.
-                    Self::retire_tagged_writeback_generation(
-                        &cache,
-                        start_index,
-                        frozen_end,
-                        epoch,
-                    );
-                    return Err(error);
-                }
-                WritebackClaimOutcome::NoBatch => {
-                    drop(permit);
-                    let retry_incarnation = {
-                        let inner = cache.inner.lock();
-                        inner.pages.get(&target_index).and_then(|current| {
-                            (Arc::ptr_eq(current, &target_entry)
-                                && inner.dirty_pages.contains(&target_index)
-                                && current.writeback_tag() == epoch)
-                                .then(|| current.writeback_incarnation.load(Ordering::Acquire))
-                        })
-                    };
-                    if let Some(observed_incarnation) = retry_incarnation {
-                        if let Err(error) = Self::register_tagged_writeback_incarnation_retry(
+                };
+                let claim = match self.claim_tagged_batch_with_admission(
+                    &cache,
+                    &inode,
+                    WritebackBatchRange::new(target_index, tagged_end),
+                    &target_entry,
+                    epoch,
+                    _domain_io.as_ref(),
+                ) {
+                    Ok(claim) => claim,
+                    Err(error) => {
+                        drop(permit);
+                        Self::abandon_tagged_writeback_generation(
                             &cache,
+                            start_index,
+                            frozen_end,
+                            epoch,
+                            error.clone(),
+                        );
+                        return Err(error);
+                    }
+                };
+                match claim {
+                    WritebackClaimOutcome::Deferred(progress) => {
+                        drop(permit);
+                        // The callback is registered before WRITE returns, so a
+                        // claim-time defer has a producer-owned progress edge
+                        // rather than relying on an unrelated later reclaim.
+                        Self::schedule_tagged_writeback_retry(
+                            progress,
+                            Arc::downgrade(&cache),
                             Arc::downgrade(&inode),
-                            target_entry,
-                            observed_incarnation,
+                            start_index,
+                            frozen_end,
+                            epoch,
+                            target_index,
+                        );
+                        break;
+                    }
+                    WritebackClaimOutcome::FailedRecorded(error) => {
+                        drop(permit);
+                        // The claimed batch has already been completed back to
+                        // Dirty and its error recorded by PageCache. Only retire
+                        // the remaining frozen tags here.
+                        Self::retire_tagged_writeback_generation(
+                            &cache,
+                            start_index,
+                            frozen_end,
+                            epoch,
+                        );
+                        return Err(error);
+                    }
+                    WritebackClaimOutcome::NoBatch => {
+                        drop(permit);
+                        let retry_incarnation = {
+                            let inner = cache.inner.lock();
+                            inner.pages.get(&target_index).and_then(|current| {
+                                (Arc::ptr_eq(current, &target_entry)
+                                    && inner.dirty_pages.contains(&target_index)
+                                    && current.writeback_tag() == epoch)
+                                    .then(|| current.writeback_incarnation.load(Ordering::Acquire))
+                            })
+                        };
+                        if let Some(observed_incarnation) = retry_incarnation {
+                            if let Err(error) = Self::register_tagged_writeback_incarnation_retry(
+                                &cache,
+                                Arc::downgrade(&inode),
+                                target_entry,
+                                observed_incarnation,
+                                TaggedWritebackCursor {
+                                    start_index,
+                                    frozen_end,
+                                    epoch,
+                                    cursor: target_index,
+                                },
+                            ) {
+                                Self::abandon_tagged_writeback_generation(
+                                    &cache,
+                                    start_index,
+                                    frozen_end,
+                                    epoch,
+                                    error.clone(),
+                                );
+                                return Err(error);
+                            }
+                            break;
+                        }
+                        if target_index == usize::MAX {
+                            Self::notify_tagged_writeback_progress(&cache);
+                            break;
+                        }
+                        cursor = target_index + 1;
+                    }
+                    WritebackClaimOutcome::Claimed(batch) => {
+                        let last_index = batch
+                            .entries
+                            .last()
+                            .map(|(index, _, _)| *index)
+                            .unwrap_or(target_index);
+                        if batch.submission.is_none() {
+                            // Legacy has no Deferred outcome, so it may retain
+                            // established parallel background writeback. The
+                            // worker clears the per-generation submission record
+                            // only after PageCache completion and errseq
+                            // publication make the batch result observable.
+                            let work_state = Mutex::new(Some((permit, batch)));
+                            schedule_pagecache_writeback(Work::new(move || {
+                                let Some((permit, batch)) = work_state.lock().take() else {
+                                    return;
+                                };
+                                let _permit = permit;
+                                let _ = Self::submit_writeback_batch(batch);
+                            }));
+                            if last_index == usize::MAX {
+                                break;
+                            }
+                            cursor = last_index + 1;
+                            continue;
+                        }
+
+                        let submit = if submit_first_token_inline {
+                            Self::run_tagged_writeback_submission
+                        } else {
+                            Self::schedule_tagged_writeback_submission
+                        };
+                        // Only the first Token head is run inline, after all
+                        // scan/invalidate/admission locks have been released.
+                        // Its successor uses the same asynchronous continuation.
+                        submit(
+                            Arc::downgrade(&cache),
+                            Arc::downgrade(&inode),
                             TaggedWritebackCursor {
                                 start_index,
                                 frozen_end,
                                 epoch,
                                 cursor: target_index,
                             },
-                        ) {
-                            Self::abandon_tagged_writeback_generation(
-                                &cache,
-                                start_index,
-                                frozen_end,
-                                epoch,
-                                error.clone(),
-                            );
-                            return Err(error);
-                        }
+                            last_index,
+                            permit,
+                            batch,
+                        );
                         break;
                     }
-                    if target_index == usize::MAX {
-                        Self::notify_tagged_writeback_progress(&cache);
-                        break;
-                    }
-                    cursor = target_index + 1;
-                }
-                WritebackClaimOutcome::Claimed(batch) => {
-                    let last_index = batch
-                        .entries
-                        .last()
-                        .map(|(index, _, _)| *index)
-                        .unwrap_or(target_index);
-                    if batch.submission.is_none() {
-                        // Legacy has no Deferred outcome, so it may retain
-                        // established parallel background writeback. The
-                        // worker clears the per-generation submission record
-                        // only after PageCache completion and errseq
-                        // publication make the batch result observable.
-                        let work_state = Mutex::new(Some((permit, batch)));
-                        schedule_pagecache_writeback(Work::new(move || {
-                            let Some((permit, batch)) = work_state.lock().take() else {
-                                return;
-                            };
-                            let _permit = permit;
-                            let _ = Self::submit_writeback_batch(batch);
-                        }));
-                        if last_index == usize::MAX {
-                            break;
-                        }
-                        cursor = last_index + 1;
-                        continue;
-                    }
-
-                    Self::schedule_tagged_writeback_submission(
-                        Arc::downgrade(&cache),
-                        Arc::downgrade(&inode),
-                        TaggedWritebackCursor {
-                            start_index,
-                            frozen_end,
-                            epoch,
-                            cursor: target_index,
-                        },
-                        last_index,
-                        permit,
-                        batch,
-                    );
-                    break;
                 }
             }
-        }
 
-        Ok((frozen_filesystem_state, operation))
+            Ok(())
+        })();
+        Ok(StartedWriteback {
+            frozen: frozen_filesystem_state,
+            range: operation,
+            error: dispatch.err(),
+        })
     }
 
     /// Schedule one bounded reclaimer batch without doing page/MM work on the

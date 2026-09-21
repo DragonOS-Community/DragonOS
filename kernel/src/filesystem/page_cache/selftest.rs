@@ -565,13 +565,14 @@ impl PageCacheWritebackSubmission for PageCacheSubmissionSelftestToken {
             return Err(SystemError::EIO);
         }
         if self.state.defer_next_submit.swap(false, Ordering::AcqRel) {
-            self.state
-                .deferred_after_submit
-                .fetch_add(1, Ordering::Relaxed);
             let progress = self.state.deferred_progress();
             let previous = self.state.private_claims.fetch_sub(1, Ordering::AcqRel);
             assert_eq!(previous, 1, "submission token private claim underflow");
             self.resolved = true;
+            self.state
+                .deferred_after_submit
+                .fetch_add(1, Ordering::Release);
+            self.state.progress_wait.wake_all();
             return Ok(PageCacheWritebackSubmitResult::Deferred(progress));
         }
         if self.state.fail_next_submit.swap(false, Ordering::AcqRel) {
@@ -1563,6 +1564,70 @@ fn run_remote_dirty_publish_selftest() -> Result<bool, SystemError> {
         && removal_after_token_release)
 }
 
+/// Exercise domain start separately from its completion/error boundary.
+fn run_domain_writeback_start_selftest() -> Result<bool, SystemError> {
+    use crate::filesystem::vfs::{FileType, InodeMode};
+
+    // Reuse the token fixture, but supply a real inode for domain retention
+    // and stable size. The separate shmem cache needs no mounted filesystem.
+    for (fail_inline, fail_after_defer) in [(false, false), (true, false), (false, true)] {
+        let fs = crate::filesystem::ramfs::RamFS::new();
+        let inode = fs.root_inode().create(
+            "domain-writeback",
+            FileType::File,
+            InodeMode::from_bits_truncate(0o600),
+        )?;
+        inode.resize(MMArch::PAGE_SIZE)?;
+        let state = Arc::new(PageCacheSubmissionSelftestState::default());
+        let backend: Arc<dyn PageCacheBackend> = Arc::new(PageCacheSubmissionSelftestBackend {
+            state: state.clone(),
+            admission_order: PageCacheWritebackAdmissionOrder::AdmissionBeforeInvalidate,
+            snapshot_phase: PageCacheWritebackSnapshotPhase::WithinAdmission,
+        });
+        let cache = PageCache::new_shmem(Some(Arc::downgrade(&inode)), Some(backend));
+        let page = cache.get_or_create_page_zero(0)?;
+        {
+            let mut locked = page.write();
+            locked.add_flags(PageFlags::PG_DIRTY);
+            cache.mark_page_dirty_page_locked(0, &locked)?;
+        }
+        state.fail_next_submit.store(fail_inline, Ordering::Release);
+        state
+            .defer_next_submit
+            .store(fail_after_defer, Ordering::Release);
+        let pending = cache.manager().start_sync_for_domain()?;
+        if fail_after_defer {
+            // Global writeback-budget contention may legitimately postpone
+            // the first attempt. Wait for the actual producer event, not an
+            // assumption that this machine was idle when start was called.
+            state.progress_wait.wait_until(|| {
+                (state.deferred_after_submit.load(Ordering::Acquire) != 0).then_some(())
+            });
+            state.fail_next_submit.store(true, Ordering::Release);
+            state.release_deferred_progress();
+        }
+        let result = pending.finish();
+        let expected_result = if fail_inline || fail_after_defer {
+            result == Err(SystemError::EIO) && state.failed_submissions.load(Ordering::Acquire) == 1
+        } else {
+            result.is_ok() && state.submitted.load(Ordering::Acquire) == 1
+        };
+        let resolved = state.private_claims.load(Ordering::Acquire) == 0
+            && state.submitted_while_admitted.load(Ordering::Acquire) == 0
+            && state.admission_depth.load(Ordering::Acquire) == 0
+            && state.fallback_writes.load(Ordering::Acquire) == 0
+            && cache.inner.lock().writeback_pages.is_empty();
+        let removed = cache.manager.remove_page(0)?.is_some();
+        let paddr = page.phys_address();
+        page_manager_lock().remove_page(&paddr);
+        let _ = page_reclaimer_lock().remove_page(&paddr);
+        if !expected_result || !resolved || !removed {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 /// Exercise the descriptor half of the front-dirty certificate independently
 /// from the future ext4 consumer.  In particular, g1 must remain frozen in
 /// its already-bound descriptor while a writer creates g2 during g1's
@@ -2012,6 +2077,10 @@ pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, S
     let writeback_budget_retry = run_async_writeback_budget_retry_selftest();
     if !writeback_budget_retry {
         return Ok("status=fail stage=writeback_budget_retry\n".into());
+    }
+
+    if !run_domain_writeback_start_selftest()? {
+        return Ok("status=fail stage=domain_writeback_start\n".into());
     }
 
     // All pre-existing fixture paths expect an immediate claim.  Keep their

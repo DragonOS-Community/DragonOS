@@ -58,8 +58,8 @@ pub use read_batch::{PageCacheReadBatchCompletion, PageCacheReadBatchRequest};
 pub use read_dma::PageCacheReadDmaReservation;
 pub(crate) use selftest::{run_accounting_debug_selftest, run_completion_domain_debug_selftest};
 pub(crate) use writeback::{
-    async_writeback_progress_snapshot, wait_for_async_writeback_progress,
-    PageCacheWritebackDispatchOutcome,
+    async_writeback_progress_snapshot, wait_for_async_writeback_progress, PageCacheDomainWriteback,
+    PageCacheWritebackDispatchOutcome, DOMAIN_WRITEBACK_WINDOW,
 };
 use writeback::{
     run_async_writeback_budget_retry_selftest, run_submitted_writeback_selftest,
@@ -386,7 +386,7 @@ pub struct PageCacheWritebackDomain {
 
 pub(crate) trait PageCacheDomainMember: Send + Sync {
     fn has_dirty_or_writeback_work(&self) -> bool;
-    fn sync_for_domain(&self) -> Result<(), SystemError>;
+    fn start_sync_for_domain(&self) -> Result<PageCacheDomainWriteback, SystemError>;
     fn retire_for_domain(&self) -> Result<(), SystemError>;
 }
 
@@ -3948,8 +3948,8 @@ impl PageCacheDomainMember for PageCache {
         self.has_dirty_or_writeback_pages()
     }
 
-    fn sync_for_domain(&self) -> Result<(), SystemError> {
-        self.manager.sync()
+    fn start_sync_for_domain(&self) -> Result<PageCacheDomainWriteback, SystemError> {
+        self.manager.start_sync_for_domain()
     }
 
     fn retire_for_domain(&self) -> Result<(), SystemError> {

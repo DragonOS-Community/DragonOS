@@ -728,6 +728,142 @@ TEST(Ext4InodeIdentity, LargeAppendBatchesAndPartialTailSurviveRemount) {
     ASSERT_NO_FATAL_FAILURE(fs.Unmount());
 }
 
+TEST(Ext4InodeIdentity, DomainSyncMixedFilesSurviveRemount) {
+    LoopExt4 fs;
+    ASSERT_NO_FATAL_FAILURE(fs.SetUp());
+    ASSERT_NO_FATAL_FAILURE(fs.Mount());
+    constexpr int kFiles = 18;  // More than two eight-inode submission windows.
+    for (int file = 0; file < kFiles; ++file) {
+        const size_t size = (file == kFiles - 1 ? 129 : 3) * 4096 + 37;
+        const std::string data(size, static_cast<char>('A' + file));
+        const std::string path = fs.mount_point() + "/domain_" + std::to_string(file);
+        int fd = open(path.c_str(), O_CREAT | O_EXCL | O_WRONLY, 0600);
+        ASSERT_GE(fd, 0) << strerror(errno);
+        ASSERT_NO_FATAL_FAILURE(WriteAll(fd, data.data(), data.size()));
+        ASSERT_EQ(0, close(fd));  // No per-file fsync: exercise domain synchronization.
+    }
+    int directory = open(fs.mount_point().c_str(), O_RDONLY | O_DIRECTORY);
+    ASSERT_GE(directory, 0) << strerror(errno);
+    ASSERT_EQ(0, syscall(__NR_syncfs, directory)) << strerror(errno);
+    ASSERT_EQ(0, close(directory));
+    ASSERT_NO_FATAL_FAILURE(fs.Unmount());
+    ASSERT_NO_FATAL_FAILURE(fs.Mount());
+    // Remount validates recovery and ownership, not a crash-at-syncfs boundary:
+    // unmount itself is allowed to perform additional synchronization.
+    for (int file = 0; file < kFiles; ++file) {
+        const size_t size = (file == kFiles - 1 ? 129 : 3) * 4096 + 37;
+        const std::string path = fs.mount_point() + "/domain_" + std::to_string(file);
+        int fd = open(path.c_str(), O_RDONLY);
+        ASSERT_GE(fd, 0) << strerror(errno);
+        struct stat st = {};
+        ASSERT_EQ(0, fstat(fd, &st));
+        ASSERT_EQ(static_cast<off_t>(size), st.st_size);
+        std::string data(size, '\0');
+        size_t done = 0;
+        while (done < size) {
+            ssize_t count = read(fd, data.data() + done, size - done);
+            if (count < 0 && errno == EINTR) {
+                continue;
+            }
+            ASSERT_GT(count, 0) << strerror(errno);
+            done += static_cast<size_t>(count);
+        }
+        EXPECT_EQ(std::string(size, static_cast<char>('A' + file)), data);
+        char tail;
+        EXPECT_EQ(0, read(fd, &tail, 1));
+        ASSERT_EQ(0, close(fd));
+    }
+    ASSERT_NO_FATAL_FAILURE(fs.Unmount());
+}
+
+TEST(Ext4InodeIdentity, ConcurrentDomainSyncAndRedirtyComplete) {
+    LoopExt4 fs;
+    ASSERT_NO_FATAL_FAILURE(fs.SetUp());
+    ASSERT_NO_FATAL_FAILURE(fs.Mount());
+    constexpr int kFiles = 17;
+    constexpr int kRounds = 16;
+    for (int file = 0; file < kFiles; ++file) {
+        const std::string path = fs.mount_point() + "/redirty_" + std::to_string(file);
+        int fd = open(path.c_str(), O_CREAT | O_EXCL | O_WRONLY, 0600);
+        ASSERT_GE(fd, 0) << strerror(errno);
+        const std::string data(4096, 'I');
+        ASSERT_NO_FATAL_FAILURE(WriteAll(fd, data.data(), data.size()));
+        ASSERT_EQ(0, close(fd));
+    }
+    int directory = open(fs.mount_point().c_str(), O_RDONLY | O_DIRECTORY);
+    ASSERT_GE(directory, 0) << strerror(errno);
+    std::atomic<bool> start{false};
+    std::atomic<int> first_error{0};
+    auto record_error = [&](int error) {
+        int expected = 0;
+        first_error.compare_exchange_strong(expected, error);
+    };
+    std::thread writer([&] {
+        while (!start.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        for (int round = 0; round < kRounds; ++round) {
+            for (int file = 0; file < kFiles; ++file) {
+                const std::string path = fs.mount_point() + "/redirty_" + std::to_string(file);
+                int fd = open(path.c_str(), O_WRONLY);
+                if (fd < 0) {
+                    record_error(errno);
+                    return;
+                }
+                const std::string data(4096, static_cast<char>(1 + round + file));
+                size_t done = 0;
+                while (done < data.size()) {
+                    ssize_t count = pwrite(fd, data.data() + done, data.size() - done, done);
+                    if (count < 0 && errno == EINTR) {
+                        continue;
+                    }
+                    if (count <= 0) {
+                        record_error(count < 0 ? errno : EIO);
+                        close(fd);
+                        return;
+                    }
+                    done += static_cast<size_t>(count);
+                }
+                if (close(fd) != 0) {
+                    record_error(errno);
+                    return;
+                }
+            }
+        }
+    });
+    std::thread syncer([&] {
+        while (!start.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        for (int round = 0; round < kRounds; ++round) {
+            if (syscall(__NR_syncfs, directory) != 0) {
+                record_error(errno);
+                return;
+            }
+        }
+    });
+    start.store(true, std::memory_order_release);
+    writer.join();
+    syncer.join();
+    const int final_sync = syscall(__NR_syncfs, directory);
+    const int final_error = errno;
+    ASSERT_EQ(0, close(directory));
+    ASSERT_EQ(0, first_error.load()) << strerror(first_error.load());
+    ASSERT_EQ(0, final_sync) << strerror(final_error);
+    ASSERT_NO_FATAL_FAILURE(fs.Unmount());
+    ASSERT_NO_FATAL_FAILURE(fs.Mount());
+    for (int file = 0; file < kFiles; ++file) {
+        const std::string path = fs.mount_point() + "/redirty_" + std::to_string(file);
+        int fd = open(path.c_str(), O_RDONLY);
+        ASSERT_GE(fd, 0) << strerror(errno);
+        std::string data(4096, '\0');
+        ASSERT_EQ(static_cast<ssize_t>(data.size()), pread(fd, data.data(), data.size(), 0));
+        EXPECT_EQ(std::string(4096, static_cast<char>(kRounds + file)), data);
+        ASSERT_EQ(0, close(fd));
+    }
+    ASSERT_NO_FATAL_FAILURE(fs.Unmount());
+}
+
 TEST(Ext4InodeIdentity, ConcurrentDelallocInodesCompleteAndRecover) {
     constexpr int kWriters = 4;
     constexpr size_t kPageSize = 4096;

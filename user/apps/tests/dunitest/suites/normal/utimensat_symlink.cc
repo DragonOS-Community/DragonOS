@@ -1,5 +1,7 @@
 #include <gtest/gtest.h>
 
+#include "loop_ext4_test_support.h"
+
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
@@ -20,9 +22,15 @@ const timespec kNewTimes[2] = {{1700000000, 0}, {1700000001, 0}};
 class UtimensatSymlinkTest : public ::testing::TestWithParam<const char*> {
 protected:
     void SetUp() override {
-        char cwd[PATH_MAX];
-        ASSERT_NE(nullptr, getcwd(cwd, sizeof(cwd)));
-        const std::string base = std::strcmp(GetParam(), ".") == 0 ? cwd : GetParam();
+        std::string base = GetParam();
+        if (base == "ext4") {
+            ASSERT_NO_FATAL_FAILURE(ext4_.SetUp());
+            ASSERT_NO_FATAL_FAILURE(ext4_.Mount());
+            base = ext4_.mount_point();
+            // The permission test drops privileges: only its real directory,
+            // not the fixture's mount point, should deny traversal.
+            ASSERT_EQ(0, chmod(base.c_str(), 0755)) << std::strerror(errno);
+        }
         char path[PATH_MAX];
         ASSERT_LT(std::snprintf(path, sizeof(path), "%s/dunitest_utimens_XXXXXX", base.c_str()),
                   static_cast<int>(sizeof(path)));
@@ -33,7 +41,7 @@ protected:
         ASSERT_GE(fd, 0) << std::strerror(errno);
         EXPECT_EQ(7, write(fd, "payload", 7));
         EXPECT_EQ(0, close(fd));
-        ASSERT_EQ(0, symlink("real", Path("alias").c_str()));
+        ASSERT_EQ(0, symlink("real", Path("alias").c_str())) << std::strerror(errno);
         ASSERT_EQ(0, utimensat(AT_FDCWD, Path("real/file").c_str(), kOldTimes, 0));
         dirfd_ = open(dir_.c_str(), O_RDONLY | O_DIRECTORY);
         ASSERT_GE(dirfd_, 0);
@@ -66,6 +74,7 @@ protected:
 
     std::string dir_;
     int dirfd_ = -1;
+    dunitest::LoopExt4 ext4_;
 };
 
 TEST_P(UtimensatSymlinkTest, FollowsRelativeIntermediateLink) {
@@ -224,9 +233,9 @@ TEST_P(UtimensatSymlinkTest, FutimensFdPathRemainsUnchanged) {
     ExpectTimes("real/file", kNewTimes);
 }
 
-INSTANTIATE_TEST_SUITE_P(Filesystems, UtimensatSymlinkTest, ::testing::Values("/tmp", "."),
+INSTANTIATE_TEST_SUITE_P(Filesystems, UtimensatSymlinkTest, ::testing::Values("/tmp", "ext4"),
                         [](const ::testing::TestParamInfo<const char*>& info) {
-                            return info.index == 0 ? "Tmp" : "Cwd";
+                            return info.index == 0 ? "Tmp" : "Ext4";
                         });
 
 }  // namespace

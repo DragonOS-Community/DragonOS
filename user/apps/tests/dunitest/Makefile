@@ -99,6 +99,8 @@ $(BIN_DIR)/%_test: suites/%.cc $(GTEST_OBJ)
 	@echo "编译测例: $< -> $@"
 	@$(CXX) $(CXXFLAGS) $(GTEST_INCLUDES) "$<" $(GTEST_OBJ) -o "$@"
 
+$(BIN_DIR)/normal/ext4_inode_identity_test $(BIN_DIR)/normal/utimensat_symlink_test: suites/normal/loop_ext4_test_support.h
+
 run: build
 	@$(RUNNER_BIN) --bin-dir $(BIN_DIR) --results-dir $(RESULTS_DIR)
 

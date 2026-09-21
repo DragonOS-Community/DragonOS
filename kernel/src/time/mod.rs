@@ -187,7 +187,7 @@ impl From<PosixTimeval> for PosixTimeSpec {
     fn from(value: PosixTimeval) -> Self {
         PosixTimeSpec {
             tv_sec: value.tv_sec,
-            tv_nsec: value.tv_usec as i64 * 1000,
+            tv_nsec: value.tv_usec * 1000,
         }
     }
 }

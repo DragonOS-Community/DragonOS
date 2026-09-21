@@ -156,6 +156,7 @@ impl DelallocAppendBlockReservation {
 // right spine can allocate one node at every existing level plus a promoted
 // root, hence at most six new extent-tree blocks in one submission.
 const DELALLOC_APPEND_MAX_NEW_EXTENT_NODES: usize = 6;
+const DELALLOC_APPEND_MAX_BATCH_BLOCKS: usize = 64;
 // Home-image bound for one append:
 //   10 = inode/path plus the data allocation bitmap/GDT/superblock envelope;
 //   4 per new node = node image plus its allocation bitmap/GDT/superblock.
@@ -175,8 +176,25 @@ fn delalloc_append_journal_credits(metadata_blocks: usize) -> Result<usize> {
 }
 
 fn delalloc_append_batch_journal_credits(blocks: usize) -> Result<usize> {
-    DELALLOC_APPEND_MAX_JOURNAL_CREDITS
-        .checked_mul(blocks)
+    if !(1..=DELALLOC_APPEND_MAX_BATCH_BLOCKS).contains(&blocks) {
+        return Err(Ext4Error::new(ErrCode::E2BIG));
+    }
+    // Count unique metadata homes for one inode's consecutive right-end
+    // appends, not a complete worst-case tree split for every data block:
+    //   2 * blocks: data allocation bitmap and GDT, even across block groups;
+    //   5: the initial external right spine (maximum supported depth);
+    //   3 * 6: new extent nodes, each with its allocation bitmap and GDT;
+    //   2: the shared inode and superblock.
+    // At most one leaf split and its upward cascade can occur: every NEW
+    // external node has 340 slots, so <=64 appends cannot fill it again.
+    // An inline promotion copies at most four old entries (4+64 < 340).
+    // This remains safe for old nodes with smaller eh_max and fragmented
+    // allocations. It must not be reused for arbitrary inserts or a larger
+    // batch without revisiting that proof. Single-block lease bounds stay
+    // unchanged; transaction admission still checks the actual image limit.
+    blocks
+        .checked_mul(2)
+        .and_then(|credits| credits.checked_add(5 + 3 * DELALLOC_APPEND_MAX_NEW_EXTENT_NODES + 2))
         .ok_or_else(|| Ext4Error::new(ErrCode::E2BIG))
 }
 
@@ -1251,7 +1269,7 @@ impl Ext4 {
         authority: &DelallocAppendMapperAuthority,
     ) -> Result<usize> {
         self.validate_delalloc_append_mapper_authority(authority)?;
-        for blocks in (1..=64).rev() {
+        for blocks in (1..=DELALLOC_APPEND_MAX_BATCH_BLOCKS).rev() {
             let credits = delalloc_append_batch_journal_credits(blocks)?;
             if self.transaction_credits_fit(credits)? {
                 return Ok(blocks);
@@ -1274,7 +1292,7 @@ impl Ext4 {
         if !self.uses_journal()
             || reservations.is_empty()
             || reservations.len() != publications.len()
-            || reservations.len() > 64
+            || reservations.len() > DELALLOC_APPEND_MAX_BATCH_BLOCKS
         {
             return Err(Ext4Error::new(ErrCode::EINVAL));
         }
@@ -4372,6 +4390,43 @@ mod tests {
 
     struct CountingMetadataWaker {
         wakes: AtomicUsize,
+    }
+
+    #[test]
+    fn append_batch_credits_count_shared_metadata_once() {
+        for (blocks, expected) in [(1, 27), (7, 39), (8, 41), (64, 153)] {
+            assert_eq!(
+                delalloc_append_batch_journal_credits(blocks).unwrap(),
+                expected
+            );
+        }
+        for blocks in [0, 65, usize::MAX] {
+            assert_eq!(
+                delalloc_append_batch_journal_credits(blocks)
+                    .unwrap_err()
+                    .code(),
+                ErrCode::E2BIG
+            );
+        }
+        let mut previous = 0;
+        for blocks in 1..=DELALLOC_APPEND_MAX_BATCH_BLOCKS {
+            let credits = delalloc_append_batch_journal_credits(blocks).unwrap();
+            assert!(credits > previous && credits <= 256);
+            previous = credits;
+        }
+    }
+
+    #[test]
+    fn append_batch_cannot_fill_a_new_extent_node_twice() {
+        let mut external = [0u8; BLOCK_SIZE];
+        let mut node = ExtentNodeMut::from_bytes(&mut external);
+        node.init(0, 0);
+        let external_capacity = node.header().max_entries_count() as usize;
+        let mut inline = [0u8; 60];
+        let mut root = ExtentNodeMut::from_bytes(&mut inline);
+        root.init(0, 0);
+        let inline_capacity = root.header().max_entries_count() as usize;
+        assert!(inline_capacity + DELALLOC_APPEND_MAX_BATCH_BLOCKS < external_capacity);
     }
 
     impl MetadataMutationWaker for CountingMetadataWaker {

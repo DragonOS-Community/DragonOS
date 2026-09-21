@@ -1,5 +1,18 @@
 use super::*;
 
+impl UdpSocket {
+    /// Keep the socket's address family at the name-query ABI boundary while
+    /// routing and receive matching continue to use normalized IPv4 endpoints.
+    fn name_endpoint(&self, mut endpoint: IpEndpoint) -> Endpoint {
+        if self.ip_version == IpVersion::Ipv6 {
+            if let Ipv4(addr) = endpoint.addr {
+                endpoint.addr = Ipv6(addr.to_ipv6_mapped());
+            }
+        }
+        Endpoint::Ip(endpoint)
+    }
+}
+
 impl Socket for UdpSocket {
     fn netns(&self) -> Arc<crate::process::namespace::net_namespace::NetNamespace> {
         UdpSocket::netns(self)
@@ -440,7 +453,7 @@ impl Socket for UdpSocket {
 
     fn remote_endpoint(&self) -> Result<Endpoint, SystemError> {
         match self.inner.read().as_ref() {
-            Some(UdpInner::Bound(bound)) => Ok(Endpoint::Ip(bound.remote_endpoint()?)),
+            Some(UdpInner::Bound(bound)) => Ok(self.name_endpoint(bound.remote_endpoint()?)),
             Some(_) => Err(SystemError::ENOTCONN),
             None => Err(SystemError::EBADF),
         }
@@ -486,7 +499,7 @@ impl Socket for UdpSocket {
                     }
                 };
 
-                Ok(Endpoint::Ip(IpEndpoint::new(local_addr, port)))
+                Ok(self.name_endpoint(IpEndpoint::new(local_addr, port)))
             }
             Some(_) => match self.ip_version {
                 IpVersion::Ipv4 => Ok(Endpoint::Ip(UNSPECIFIED_LOCAL_ENDPOINT_V4)),

@@ -293,6 +293,8 @@ pub struct ProcessControlBlock {
     /// Thread-group-level resource accumulation for exited threads. Aligns with
     /// Linux signal_struct's exited thread statistics.
     pub(super) exited_thread_group_rusage: SpinLock<RUsage>,
+    /// Leader-owned RSS peak (in pages) retained from detached address spaces.
+    pub(super) historical_maxrss_pages: AtomicUsize,
     /// Resource accumulation for children successfully reaped by the wait family;
     /// aligns with getrusage(RUSAGE_CHILDREN).
     pub(super) children_rusage: SpinLock<RUsage>,
@@ -581,6 +583,7 @@ impl ProcessControlBlock {
                 maj_flt: AtomicU64::new(0),
                 exited_thread_group_cputime_ns: SpinLock::new(0),
                 exited_thread_group_rusage: SpinLock::new(RUsage::default()),
+                historical_maxrss_pages: AtomicUsize::new(0),
                 children_rusage: SpinLock::new(RUsage::default()),
                 robust_list: RwLock::new(None),
                 rseq_state: RwLock::new(rseq::RseqState::new()),

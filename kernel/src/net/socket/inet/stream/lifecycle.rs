@@ -225,11 +225,9 @@ impl TcpSocket {
                 );
                 match listen_result {
                     Ok(listening) => {
-                        // DragonOS backlog emulation: listener is represented by multiple
-                        // smoltcp TCP sockets. When all LISTEN sockets are consumed,
-                        // Linux commonly drops incoming SYN (no RST). To implement this
-                        // without changing smoltcp semantics, register the active listen port
-                        // in the iface common registry.
+                        // A logical listener remains live when all physical
+                        // accept slots are occupied. Publish its receive domain
+                        // for smoltcp's unmatched-SYN fallback.
                         //
                         // For INADDR_ANY listeners, listen sockets span multiple interfaces,
                         // so register on each unique interface.
@@ -239,11 +237,10 @@ impl TcpSocket {
                         for b in &listening.inners {
                             let nic_id = b.iface().nic_id();
                             if !registered_ifaces.contains(&nic_id) {
-                                b.iface().common().register_tcp_listen_port(
+                                b.iface().common().register_tcp_listener(
                                     listening.reservation.as_ref().unwrap().id,
                                     listening.domain,
                                     port,
-                                    backlog,
                                 );
                                 b.iface().common().bind_socket(me.clone());
                                 registered_ifaces.push(nic_id);
@@ -556,9 +553,7 @@ impl TcpSocket {
                         for b in &listening.inners {
                             let nic_id = b.iface().nic_id();
                             if !unregistered.contains(&nic_id) {
-                                b.iface()
-                                    .common()
-                                    .unregister_tcp_listen_port(reservation_id);
+                                b.iface().common().unregister_tcp_listener(reservation_id);
                                 b.iface().common().unbind_socket(me.clone());
                                 unregistered.push(nic_id);
                             }
@@ -825,9 +820,7 @@ impl TcpSocket {
                     for b in &ls.inners {
                         let nic_id = b.iface().nic_id();
                         if !cleaned.contains(&nic_id) {
-                            b.iface()
-                                .common()
-                                .unregister_tcp_listen_port(reservation_id);
+                            b.iface().common().unregister_tcp_listener(reservation_id);
                             b.iface().common().unbind_socket(me.clone());
                             cleaned.push(nic_id);
                         }

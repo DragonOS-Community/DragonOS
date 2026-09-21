@@ -77,6 +77,9 @@ syscall_table_macros::declare_syscall!(SYS_LISTEN, SysListenHandle);
 /// * `Ok(usize)` - 0 on success
 /// * `Err(SystemError)` - Error code if operation fails
 pub(super) fn do_listen(fd: usize, backlog: usize) -> Result<usize, SystemError> {
+    // Linux takes an int and compares it as unsigned against somaxconn.
+    // Negative values therefore select the limit rather than failing listen.
+    let backlog = (backlog as u32 as usize).min(4096);
     ProcessManager::current_pcb()
         .get_socket_inode(fd as i32)?
         .as_socket()

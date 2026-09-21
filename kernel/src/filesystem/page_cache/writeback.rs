@@ -52,10 +52,9 @@ impl PageCacheDomainWriteback {
         }
         self.inode
             .write_inode(&WritebackControl::sync_all_for_sync())
-            .map_err(|error| {
+            .inspect_err(|error| {
                 self.cache
                     .record_writeback_error_with_superblock(error.clone());
-                error
             })
     }
 }

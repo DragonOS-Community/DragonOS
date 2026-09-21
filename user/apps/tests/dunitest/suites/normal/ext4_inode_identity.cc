@@ -683,6 +683,51 @@ TEST(Ext4InodeIdentity, DelallocQueuePublishesAndRecoversInOrder) {
     ASSERT_NO_FATAL_FAILURE(fs.Unmount());
 }
 
+TEST(Ext4InodeIdentity, LargeAppendBatchesAndPartialTailSurviveRemount) {
+    LoopExt4 fs;
+    ASSERT_NO_FATAL_FAILURE(fs.SetUp());
+    ASSERT_NO_FATAL_FAILURE(fs.Mount());
+    const std::string path = fs.mount_point() + "/large_append";
+    // Cross two maximum-sized append batches and end with a partial page.
+    constexpr size_t kSize = 129 * 4096 + 37;
+    std::vector<unsigned char> expected(kSize);
+    for (size_t i = 0; i < expected.size(); ++i) {
+        expected[i] = static_cast<unsigned char>((i / 4096 + i % 251) % 256);
+    }
+    int fd = open(path.c_str(), O_CREAT | O_EXCL | O_RDWR, 0600);
+    ASSERT_GE(fd, 0) << strerror(errno);
+    size_t done = 0;
+    while (done < expected.size()) {
+        ssize_t count = write(fd, expected.data() + done,
+                              std::min<size_t>(64 * 1024, expected.size() - done));
+        ASSERT_GT(count, 0) << strerror(errno);
+        done += count;
+    }
+    ASSERT_EQ(0, fdatasync(fd)) << strerror(errno);
+    ASSERT_EQ(static_cast<off_t>(kSize), lseek(fd, 0, SEEK_CUR));
+    ASSERT_EQ(0, fsync(fd)) << strerror(errno);
+    ASSERT_EQ(0, close(fd));
+    ASSERT_NO_FATAL_FAILURE(fs.Unmount());
+    ASSERT_NO_FATAL_FAILURE(fs.Mount());
+    fd = open(path.c_str(), O_RDONLY);
+    ASSERT_GE(fd, 0) << strerror(errno);
+    struct stat st = {};
+    ASSERT_EQ(0, fstat(fd, &st));
+    EXPECT_EQ(static_cast<off_t>(kSize), st.st_size);
+    std::vector<unsigned char> actual(kSize);
+    done = 0;
+    while (done < actual.size()) {
+        ssize_t count = read(fd, actual.data() + done, actual.size() - done);
+        ASSERT_GT(count, 0) << strerror(errno);
+        done += count;
+    }
+    EXPECT_EQ(expected, actual);
+    unsigned char beyond;
+    EXPECT_EQ(0, read(fd, &beyond, 1));
+    ASSERT_EQ(0, close(fd));
+    ASSERT_NO_FATAL_FAILURE(fs.Unmount());
+}
+
 TEST(Ext4InodeIdentity, ConcurrentDelallocInodesCompleteAndRecover) {
     constexpr int kWriters = 4;
     constexpr size_t kPageSize = 4096;

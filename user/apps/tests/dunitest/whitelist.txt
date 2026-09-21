@@ -54,6 +54,7 @@ normal/test_tlb_shootdown
 normal/pid_namespace_fork
 normal/uts_namespace
 normal/tcp_bind_semantics
+normal/tcp_dual_stack_semantics
 normal/tcp_close_semantics
 normal/tcp_listen_poll_semantics
 normal/tcp_self_connect_semantics

@@ -406,12 +406,6 @@ pub trait Iface: crate::driver::base::device::Device {
         &self.common().sockets
     }
 
-    /// # `port_manager`
-    /// 用于管理网卡的端口
-    fn port_manager(&self) -> &PortManager {
-        &self.common().port_manager
-    }
-
     fn addr_assign_type(&self) -> u8;
 
     fn net_device_type(&self) -> u16;

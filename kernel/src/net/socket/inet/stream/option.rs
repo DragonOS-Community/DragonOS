@@ -107,6 +107,31 @@ impl From<Options> for i32 {
 
 /// TCP socket option setters.
 impl super::TcpSocket {
+    pub(super) fn set_ipv6_only(&self, val: &[u8]) -> Result<(), SystemError> {
+        if self.ip_version != smoltcp::wire::IpVersion::Ipv6 {
+            return Err(SystemError::ENOPROTOOPT);
+        }
+        let value = byte_parser::read_i32(val)? != 0;
+        let guard = self.inner.write();
+        if !matches!(
+            guard.as_ref(),
+            Some(inner::Inner::Init(inner::Init::Unbound(_)))
+        ) {
+            return Err(SystemError::EINVAL);
+        }
+        self.options
+            .ipv6_only
+            .store(value, core::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    pub(super) fn get_ipv6_only(&self, value: &mut [u8]) -> Result<usize, SystemError> {
+        if self.ip_version != smoltcp::wire::IpVersion::Ipv6 {
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        }
+        Self::write_bool_opt_i32(value, &self.options.ipv6_only)
+    }
+
     const MAX_TCP_KEEPIDLE: i32 = 32767;
     const MAX_TCP_KEEPINTVL: i32 = 32767;
     const MAX_TCP_KEEPCNT: i32 = 127;

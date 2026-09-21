@@ -1,34 +1,96 @@
-use core::sync::atomic::{AtomicU16, Ordering};
+use alloc::{sync::Arc, vec::Vec};
+use core::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use hashbrown::HashMap;
+use smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint, IpVersion};
 use system_error::SystemError;
 
-use crate::{
-    arch::rand::rand,
-    libs::mutex::Mutex,
-    process::{ProcessManager, RawPid},
-};
+use crate::process::namespace::net_namespace::NetNamespace;
+use crate::{arch::rand::rand, libs::mutex::Mutex, process::ProcessManager};
 
-use super::Types::{self, *};
+/// A normalized TCP receive domain. Mapped IPv6 addresses are normalized to
+/// IPv4 before construction; only the IPv6 wildcard may cover both families.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TcpBindDomain {
+    pub addr: IpAddress,
+    pub ip_version: Option<IpVersion>,
+}
 
-/// Per-interface TCP port manager.
-///
-/// UDP reservations are network-namespace-wide and live in `UdpBindingTable`,
-/// because Linux device-bound sockets can legally share a port across ifaces.
+impl TcpBindDomain {
+    pub fn new(addr: IpAddress, v6_only: bool) -> Self {
+        let ip_version = if addr.version() == IpVersion::Ipv6 && addr.is_unspecified() && !v6_only {
+            None
+        } else {
+            Some(addr.version())
+        };
+        Self { addr, ip_version }
+    }
+
+    pub fn matches(&self, addr: IpAddress) -> bool {
+        self.ip_version
+            .is_none_or(|version| version == addr.version())
+            && (self.addr.is_unspecified() || self.addr == addr)
+    }
+
+    fn overlaps(&self, other: Self) -> bool {
+        if let (Some(a), Some(b)) = (self.ip_version, other.ip_version) {
+            if a != b {
+                return false;
+            }
+        }
+        self.addr.is_unspecified() || other.addr.is_unspecified() || self.addr == other.addr
+    }
+
+    pub fn listen_endpoint(&self, port: u16) -> IpListenEndpoint {
+        if self.addr.is_unspecified() {
+            port.into()
+        } else {
+            IpEndpoint::new(self.addr, port).into()
+        }
+    }
+}
+
+#[derive(Debug)]
+struct Binding {
+    id: u64,
+    domain: TcpBindDomain,
+}
+
+/// Network-namespace TCP reservations, independently of the interface hosting
+/// the smoltcp socket. Check and insertion are atomic under one table lock.
 #[derive(Debug)]
 pub struct PortManager {
-    // TCP 端口记录表
-    tcp_port_table: Mutex<HashMap<u16, RawPid>>,
+    bindings: Mutex<HashMap<u16, Vec<Binding>>>,
+    next_id: AtomicU64,
+    next_ephemeral: AtomicU16,
 }
 
 impl Default for PortManager {
     fn default() -> Self {
         Self {
-            tcp_port_table: Mutex::new(HashMap::new()),
+            bindings: Mutex::new(HashMap::new()),
+            next_id: AtomicU64::new(1),
+            next_ephemeral: AtomicU16::new(0),
         }
     }
 }
 
 pub const DEFAULT_LOCAL_PORT_RANGE: u32 = (32768u32 << 16) | 60999u32;
+
+/// Unique ownership of a reservation. Accepted children deliberately have no
+/// reservation; state transitions move this token instead of copying a port.
+#[derive(Debug)]
+pub struct TcpPortReservation {
+    netns: Arc<NetNamespace>,
+    pub id: u64,
+    pub port: u16,
+    pub domain: TcpBindDomain,
+}
+
+impl Drop for TcpPortReservation {
+    fn drop(&mut self) {
+        self.netns.tcp_ports().unbind(self.port, self.id);
+    }
+}
 
 impl PortManager {
     pub fn local_port_range() -> (u16, u16) {
@@ -39,92 +101,58 @@ impl PortManager {
         ProcessManager::current_netns().set_local_port_range(min, max)
     }
 
-    /// @brief 自动分配一个相对应协议中未被使用的PORT，如果动态端口均已被占用，返回错误码 EADDRINUSE
-    pub fn get_ephemeral_port(&self, socket_type: Types) -> Result<u16, SystemError> {
-        // TODO: selects non-conflict high port
-        static EPHEMERAL_PORT: AtomicU16 = AtomicU16::new(0);
-        let (min, max) = Self::local_port_range();
-        let range = (max - min) as u32 + 1;
-        if range == 0 {
-            return Err(SystemError::EINVAL);
-        }
-        let current = EPHEMERAL_PORT.load(Ordering::Relaxed);
-        if current < min || current > max {
-            let initial = min + (rand() % range as usize) as u16;
-            EPHEMERAL_PORT.store(initial, Ordering::Relaxed);
-        }
-
-        let mut remaining = range;
-        while remaining > 0 {
-            let old = EPHEMERAL_PORT
-                .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |cur| {
-                    let cur = if cur < min || cur > max { min } else { cur };
-                    Some(if cur >= max { min } else { cur + 1 })
-                })
-                .unwrap_or_else(|cur| cur);
-            let port = if old < min || old >= max {
-                min
-            } else {
-                old + 1
-            };
-
-            // 使用 ListenTable 检查端口是否被占用
-            match socket_type {
-                Tcp => {
-                    let guard = self.tcp_port_table.lock();
-                    if guard.get(&port).is_none() {
-                        drop(guard);
-                        return Ok(port);
-                    }
+    pub fn reserve(
+        netns: Arc<NetNamespace>,
+        domain: TcpBindDomain,
+        port: u16,
+    ) -> Result<TcpPortReservation, SystemError> {
+        let manager = netns.tcp_ports();
+        let (min, max) = netns.local_port_range();
+        let count = u32::from(max) - u32::from(min) + 1;
+        let mut bindings = manager.bindings.lock();
+        let initial = manager.next_ephemeral.load(Ordering::Relaxed);
+        let mut candidate = if port != 0 {
+            port
+        } else if initial >= min && initial <= max {
+            initial
+        } else {
+            min + (rand() % count as usize) as u16
+        };
+        for _ in 0..if port == 0 { count } else { 1 } {
+            let bucket = bindings.entry(candidate).or_default();
+            if !bucket.iter().any(|binding| domain.overlaps(binding.domain)) {
+                bucket.try_reserve(1).map_err(|_| SystemError::ENOMEM)?;
+                let id = manager.next_id.fetch_add(1, Ordering::Relaxed);
+                bucket.push(Binding { id, domain });
+                if port == 0 {
+                    manager.next_ephemeral.store(
+                        if candidate == max { min } else { candidate + 1 },
+                        Ordering::Relaxed,
+                    );
                 }
-                _ => panic!("{:?} cann't get a port", socket_type),
+                drop(bindings);
+                return Ok(TcpPortReservation {
+                    netns,
+                    id,
+                    port: candidate,
+                    domain,
+                });
             }
-            remaining -= 1;
-        }
-        return Err(SystemError::EADDRINUSE);
-    }
-
-    #[inline]
-    pub fn bind_ephemeral_port(&self, socket_type: Types) -> Result<u16, SystemError> {
-        let (min, max) = Self::local_port_range();
-        let range = (max - min) as u32 + 1;
-        if range == 0 {
-            return Err(SystemError::EINVAL);
-        }
-        let mut remaining = range;
-        while remaining > 0 {
-            let port = self.get_ephemeral_port(socket_type)?;
-            match self.bind_port(socket_type, port) {
-                Ok(()) => return Ok(port),
-                Err(SystemError::EADDRINUSE) => {
-                    // Race: another thread grabbed the port after we checked.
-                    remaining -= 1;
-                    continue;
-                }
-                Err(e) => return Err(e),
+            if port != 0 {
+                break;
             }
+            candidate = if candidate == max { min } else { candidate + 1 };
         }
         Err(SystemError::EADDRINUSE)
     }
 
-    /// @brief 检测给定端口是否已被占用，如果未被占用则在 TCP 对应的表中记录
-    ///
-    pub fn bind_port(&self, socket_type: Types, port: u16) -> Result<(), SystemError> {
-        if port > 0 && socket_type == Tcp {
-            let mut guard = self.tcp_port_table.lock();
-            if guard.get(&port).is_some() {
-                return Err(SystemError::EADDRINUSE);
+    fn unbind(&self, port: u16, id: u64) {
+        let mut bindings = self.bindings.lock();
+        if let Some(bucket) = bindings.get_mut(&port) {
+            bucket.retain(|binding| binding.id != id);
+            if bucket.is_empty() {
+                bindings.remove(&port);
             }
-            guard.insert(port, ProcessManager::current_pid());
         }
-        return Ok(());
-    }
-
-    /// @brief 在对应的端口记录表中将端口和 socket 解绑
-    /// should call this function when socket is closed or aborted
-    pub fn unbind_port(&self, socket_type: Types, port: u16) {
-        if socket_type == Tcp {
-            self.tcp_port_table.lock().remove(&port);
-        };
     }
 }

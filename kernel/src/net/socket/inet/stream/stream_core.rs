@@ -20,6 +20,8 @@ type EP = crate::filesystem::epoll::EPollEventType;
 
 #[derive(Debug)]
 pub struct TcpSocketOptions {
+    /// Updates are serialized with bind/connect by `TcpSocket::inner`.
+    pub(crate) ipv6_only: AtomicBool,
     /// SO_SNDTIMEO (microseconds). u64::MAX means "no timeout".
     pub(crate) send_timeout_us: AtomicU64,
     /// SO_RCVTIMEO (microseconds). u64::MAX means "no timeout".
@@ -90,6 +92,7 @@ pub struct TcpSocketOptions {
 impl TcpSocketOptions {
     fn new() -> Self {
         Self {
+            ipv6_only: AtomicBool::new(false),
             send_timeout_us: AtomicU64::new(u64::MAX),
             recv_timeout_us: AtomicU64::new(u64::MAX),
 

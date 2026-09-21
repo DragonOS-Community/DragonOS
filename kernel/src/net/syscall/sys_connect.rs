@@ -4,7 +4,6 @@ use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_CONNECT;
 use crate::mm::VirtAddr;
 use crate::net::posix::SockAddr;
-use crate::net::socket::endpoint::Endpoint;
 use crate::process::ProcessManager;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
 use alloc::string::ToString;
@@ -101,11 +100,9 @@ pub(super) fn do_connect(
     addr: *const SockAddr,
     addrlen: u32,
 ) -> Result<usize, SystemError> {
-    let endpoint: Endpoint = SockAddr::to_endpoint(addr, addrlen)?;
-    ProcessManager::current_pcb()
-        .get_socket_inode(fd as i32)?
-        .as_socket()
-        .unwrap()
-        .connect(endpoint)?;
+    let inode = ProcessManager::current_pcb().get_socket_inode(fd as i32)?;
+    let socket = inode.as_socket().unwrap();
+    let endpoint = socket.endpoint_from_user(addr, addrlen)?;
+    socket.connect(endpoint)?;
     Ok(0)
 }

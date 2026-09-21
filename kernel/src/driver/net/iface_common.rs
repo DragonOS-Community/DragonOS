@@ -24,8 +24,6 @@ pub struct IfaceCommon {
     /// The stack has accepted namespace-local ingress and must keep applying
     /// authoritative output routing until its socket/deferred work quiesces.
     pub(super) namespace_routed_stack: AtomicBool,
-    /// 端口管理器
-    pub(super) port_manager: PortManager,
     /// Scheduler-owned deadlines for independently published protocol and
     /// local-output work. Immediate work stays with the current poll owner.
     pub(super) poll_deadlines: PollDeadlines,
@@ -113,7 +111,6 @@ impl IfaceCommon {
             bound_socket_count: AtomicUsize::new(0),
             pending_routed_socket_count: AtomicUsize::new(0),
             namespace_routed_stack: AtomicBool::new(false),
-            port_manager: PortManager::default(),
             poll_deadlines: PollDeadlines::new(),
             local_output_tx_backoff_us: AtomicU64::new(Self::LOCAL_OUTPUT_TX_BACKOFF_MIN_US),
             tx_completion_generation: AtomicU64::new(0),
@@ -140,14 +137,20 @@ impl IfaceCommon {
     }
 
     /// Register an active TCP listener port on this iface.
-    pub fn register_tcp_listen_port(&self, port: u16, backlog: usize) {
+    pub fn register_tcp_listen_port(
+        &self,
+        id: u64,
+        domain: crate::net::socket::inet::common::port::TcpBindDomain,
+        port: u16,
+        backlog: usize,
+    ) {
         self.tcp_listener_backlog
-            .register_tcp_listen_port(port, backlog);
+            .register_tcp_listen_port(id, domain, port, backlog);
     }
 
     /// Unregister an active TCP listener port on this iface.
-    pub fn unregister_tcp_listen_port(&self, port: u16) {
-        self.tcp_listener_backlog.unregister_tcp_listen_port(port);
+    pub fn unregister_tcp_listen_port(&self, id: u64) {
+        self.tcp_listener_backlog.unregister_tcp_listen_port(id);
     }
 
     pub fn ipv4_multicast_join_ref(

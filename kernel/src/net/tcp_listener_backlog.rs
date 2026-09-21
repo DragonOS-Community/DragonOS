@@ -15,12 +15,15 @@
 use alloc::vec::Vec;
 
 use crate::libs::rwsem::RwSem;
+use crate::net::socket::inet::common::port::TcpBindDomain;
 use smoltcp::wire::{
-    EthernetFrame, EthernetProtocol, IpProtocol, Ipv4Packet, Ipv6Packet, TcpPacket,
+    EthernetFrame, EthernetProtocol, IpAddress, IpProtocol, Ipv4Packet, Ipv6Packet, TcpPacket,
 };
 
 #[derive(Debug, Clone, Copy)]
 struct TcpListenPortInfo {
+    id: u64,
+    domain: TcpBindDomain,
     port: u16,
     /// backlog==0 时启用：当"本轮 poll 里 LISTEN socket 被消耗完"后，后续纯 SYN 直接丢弃（不让 smoltcp 回 RST）。
     drop_syn_when_full: bool,
@@ -43,17 +46,25 @@ impl TcpListenerBacklog {
         }
     }
 
-    pub fn register_tcp_listen_port(&self, port: u16, backlog: usize) {
+    pub fn register_tcp_listen_port(
+        &self,
+        id: u64,
+        domain: TcpBindDomain,
+        port: u16,
+        backlog: usize,
+    ) {
         let mut guard = self.ports.write();
         // gVisor 期望 listen(backlog=0) 只允许 1 个 pending，额外 SYN 应 timeout（丢包）。
         // backlog>0 时维持 smoltcp 默认行为（当前策略），避免把本应尽快暴露的错误（RST）变成超时。
         let drop_syn_when_full = backlog == 0;
-        if let Some(e) = guard.iter_mut().find(|e| e.port == port) {
+        if let Some(e) = guard.iter_mut().find(|e| e.id == id) {
             e.drop_syn_when_full = drop_syn_when_full;
             // 保守：假设 present，等待下一次 poll 刷新。
             e.listen_socket_present = true;
         } else {
             guard.push(TcpListenPortInfo {
+                id,
+                domain,
                 port,
                 drop_syn_when_full,
                 listen_socket_present: true,
@@ -61,9 +72,9 @@ impl TcpListenerBacklog {
         }
     }
 
-    pub fn unregister_tcp_listen_port(&self, port: u16) {
+    pub fn unregister_tcp_listen_port(&self, id: u64) {
         let mut guard = self.ports.write();
-        if let Some(i) = guard.iter().position(|e| e.port == port) {
+        if let Some(i) = guard.iter().position(|e| e.id == id) {
             guard.swap_remove(i);
         }
     }
@@ -78,7 +89,8 @@ impl TcpListenerBacklog {
             for item in sockets.items() {
                 if let smoltcp::socket::Socket::Tcp(tcp) = &item.socket {
                     if tcp.state() == smoltcp::socket::tcp::State::Listen
-                        && tcp.listen_endpoint().port == entry.port
+                        && tcp.listen_endpoint() == entry.domain.listen_endpoint(entry.port)
+                        && tcp.listen_ip_version() == entry.domain.ip_version
                     {
                         present = true;
                         break;
@@ -100,6 +112,7 @@ impl TcpListenerBacklog {
     /// - 仅当目的端口注册为 backlog==0 且本轮 poll 已经“消耗掉 LISTEN socket”时，才会丢弃。
     pub fn should_drop_backlog_full_tcp_syn_ip(&self, ip_packet: &[u8]) -> bool {
         let mut dst_port: Option<u16> = None;
+        let mut dst_addr: Option<IpAddress> = None;
         let mut is_pure_syn = false;
 
         if !self.any_drop_syn_ports() {
@@ -137,6 +150,7 @@ impl TcpListenerBacklog {
                     return false;
                 }
                 if let Ok(tcp) = TcpPacket::new_checked(pkt4.payload()) {
+                    dst_addr = Some(IpAddress::Ipv4(pkt4.dst_addr()));
                     dst_port = Some(tcp.dst_port());
                     is_pure_syn = tcp.syn() && !tcp.ack();
                 }
@@ -145,6 +159,11 @@ impl TcpListenerBacklog {
             // IPv6 可能包含扩展头，这里做一个保守跳过：能到 TCP 则解析，否则不丢。
             let data = maybe_ip;
             if data.len() < 40 {
+                return false;
+            }
+            if let Ok(packet) = Ipv6Packet::new_checked(data) {
+                dst_addr = Some(IpAddress::Ipv6(packet.dst_addr()));
+            } else {
                 return false;
             }
             let mut next = data[6];
@@ -199,9 +218,9 @@ impl TcpListenerBacklog {
             return false;
         }
 
-        let port = match dst_port {
-            Some(p) => p,
-            None => return false,
+        let (port, addr) = match (dst_port, dst_addr) {
+            (Some(port), Some(addr)) => (port, addr),
+            _ => return false,
         };
         if !is_pure_syn {
             return false;
@@ -209,7 +228,10 @@ impl TcpListenerBacklog {
 
         // backlog==0 策略：同一轮 poll 内只允许第一个 SYN 通过，其余纯 SYN 丢弃以避免 RST。
         let mut guard = self.ports.write();
-        let Some(entry) = guard.iter_mut().find(|e| e.port == port) else {
+        let Some(entry) = guard
+            .iter_mut()
+            .find(|e| e.port == port && e.domain.matches(addr))
+        else {
             return false;
         };
         if !entry.drop_syn_when_full {

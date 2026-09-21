@@ -272,6 +272,24 @@ impl From<Endpoint> for SockAddr {
 impl SockAddr {
     /// @brief 把用户传入的SockAddr转换为Endpoint结构体
     pub fn to_endpoint(addr: *const SockAddr, len: u32) -> Result<Endpoint, SystemError> {
+        let mut endpoint = Self::to_endpoint_preserving_mapped(addr, len)?;
+        if let Endpoint::Ip(ip) = &mut endpoint {
+            if let smoltcp::wire::IpAddress::Ipv6(addr) = ip.addr {
+                if let Some(mapped) = addr.to_ipv4_mapped() {
+                    ip.addr = smoltcp::wire::IpAddress::Ipv4(mapped);
+                }
+            }
+        }
+        Ok(endpoint)
+    }
+
+    /// Preserve the sockaddr family until the protocol validates it. In
+    /// particular, TCP must distinguish AF_INET6 mapped input from AF_INET
+    /// input before applying IPV6_V6ONLY and normalizing the transport address.
+    pub fn to_endpoint_preserving_mapped(
+        addr: *const SockAddr,
+        len: u32,
+    ) -> Result<Endpoint, SystemError> {
         // 统一的上限检查：防止 addrlen 过大导致内核读取越界内存
         // 参考 Linux kernel net/socket.c:move_addr_to_kernel()
         if len > MAX_SOCKADDR_LEN {
@@ -338,13 +356,7 @@ impl SockAddr {
                 let addr_in6 = reader.buffer_protected(0)?.read_one::<SockAddrIn6>(0)?;
 
                 let addr = core::net::Ipv6Addr::from(addr_in6.sin6_addr);
-                // Handle IPv4-mapped IPv6 addresses (::ffff:a.b.c.d)
-                // These should be treated as IPv4 addresses for binding/connecting
-                let ip: smoltcp::wire::IpAddress = if let Some(ipv4) = addr.to_ipv4_mapped() {
-                    smoltcp::wire::IpAddress::Ipv4(ipv4)
-                } else {
-                    smoltcp::wire::IpAddress::Ipv6(addr)
-                };
+                let ip = smoltcp::wire::IpAddress::Ipv6(addr);
                 let port = u16::from_be(addr_in6.sin6_port);
                 return Ok(Endpoint::Ip(smoltcp::wire::IpEndpoint::new(ip, port)));
             }

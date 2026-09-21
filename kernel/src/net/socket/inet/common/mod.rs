@@ -13,17 +13,6 @@ pub mod multicast;
 pub use multicast::{apply_ipv4_membership, apply_ipv4_multicast_if, Ipv4MulticastMembership};
 use system_error::SystemError;
 
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum Types {
-    Raw,
-    Icmp,
-    Udp,
-    Tcp,
-    Dhcpv4,
-    Dns,
-}
-
 /**
  * 目前，以下设计仍然没有考虑多网卡的listen问题，仅只解决了socket在绑定单网卡下的问题。
  */
@@ -177,7 +166,6 @@ impl BoundInner {
             Ok(result) => result,
             Err(err) => return Err((socket, err)),
         };
-        // let bound_port = iface.port_manager().bind_ephemeral_port(socket_type)?;
         let handle = target.stack_owner.sockets().lock().add(socket);
         // let endpoint = smoltcp::wire::IpEndpoint::new(local_addr, bound_port);
         Ok((
@@ -188,10 +176,6 @@ impl BoundInner {
             },
             target.local_addr,
         ))
-    }
-
-    pub fn port_manager(&self) -> &PortManager {
-        self.iface.port_manager()
     }
 
     pub fn with_mut<T: smoltcp::socket::AnySocket<'static>, R, F: FnMut(&mut T) -> R>(

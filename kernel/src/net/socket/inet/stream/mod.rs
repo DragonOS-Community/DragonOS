@@ -33,7 +33,28 @@ mod stream_core;
 
 pub use stream_core::TcpSocket;
 
+impl TcpSocket {
+    /// Keep on-wire IPv4 addresses internally, and preserve AF_INET6 at the
+    /// sockaddr ABI boundary for mapped connections accepted by dual-stack TCP.
+    fn name_endpoint(&self, mut endpoint: smoltcp::wire::IpEndpoint) -> Endpoint {
+        if self.ip_version == smoltcp::wire::IpVersion::Ipv6 {
+            if let smoltcp::wire::IpAddress::Ipv4(addr) = endpoint.addr {
+                endpoint.addr = smoltcp::wire::IpAddress::Ipv6(addr.to_ipv6_mapped());
+            }
+        }
+        Endpoint::Ip(endpoint)
+    }
+}
+
 impl Socket for TcpSocket {
+    fn endpoint_from_user(
+        &self,
+        addr: *const crate::net::posix::SockAddr,
+        len: u32,
+    ) -> Result<Endpoint, SystemError> {
+        crate::net::posix::SockAddr::to_endpoint_preserving_mapped(addr, len)
+    }
+
     fn netns(&self) -> Arc<crate::process::namespace::net_namespace::NetNamespace> {
         TcpSocket::netns(self)
     }
@@ -64,7 +85,7 @@ impl Socket for TcpSocket {
     fn local_endpoint(&self) -> Result<Endpoint, SystemError> {
         let inner = self.inner.read();
         let inner = inner.as_ref().ok_or(SystemError::ENOTCONN)?;
-        Ok(Endpoint::Ip(inner.local_endpoint()))
+        Ok(self.name_endpoint(inner.local_endpoint()))
     }
 
     fn remote_endpoint(&self) -> Result<Endpoint, SystemError> {
@@ -72,12 +93,15 @@ impl Socket for TcpSocket {
         let inner = inner.as_ref().ok_or(SystemError::ENOTCONN)?;
         inner
             .remote_endpoint()
-            .map(Endpoint::Ip)
+            .map(|endpoint| self.name_endpoint(endpoint))
             .ok_or(SystemError::ENOTCONN)
     }
 
     fn option(&self, level: PSOL, name: usize, value: &mut [u8]) -> Result<usize, SystemError> {
         match level {
+            PSOL::IPV6 if name == crate::net::socket::PIPV6::V6ONLY as usize => {
+                self.get_ipv6_only(value)
+            }
             PSOL::IP => {
                 let optname =
                     IpOption::try_from(name as u32).map_err(|_| SystemError::ENOPROTOOPT)?;
@@ -172,7 +196,7 @@ impl Socket for TcpSocket {
                 }
             }
         }
-        .map(|(sock, ep)| (sock as Arc<dyn Socket>, Endpoint::Ip(ep)))
+        .map(|(sock, ep)| (sock as Arc<dyn Socket>, self.name_endpoint(ep)))
     }
 
     fn recv(&self, buffer: &mut [u8], flags: PMSG) -> Result<usize, SystemError> {
@@ -382,6 +406,9 @@ impl Socket for TcpSocket {
 
     fn set_option(&self, level: PSOL, name: usize, val: &[u8]) -> Result<(), SystemError> {
         match level {
+            PSOL::IPV6 if name == crate::net::socket::PIPV6::V6ONLY as usize => {
+                self.set_ipv6_only(val)
+            }
             PSOL::IP => {
                 let opt = crate::net::socket::IpOption::try_from(name as u32)
                     .map_err(|_| SystemError::ENOPROTOOPT)?;

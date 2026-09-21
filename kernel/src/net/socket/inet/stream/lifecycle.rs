@@ -1,6 +1,5 @@
 use crate::net::socket::common::ShutdownBit;
 use crate::net::socket::inet::InetSocket;
-use crate::net::socket::inet::Types;
 use crate::net::tcp_close_defer::{
     DeferredTcpCloseKind, DeferredTcpCloseReason, DeferredTcpCloseRequest,
 };
@@ -31,6 +30,38 @@ struct CloseAction {
 }
 
 impl TcpSocket {
+    /// Normalize mapped sockaddr input while holding `inner`, so a concurrent
+    /// IPV6_V6ONLY update cannot change the domain between validation and bind.
+    fn normalize_endpoint(
+        &self,
+        mut endpoint: smoltcp::wire::IpEndpoint,
+        connecting: bool,
+    ) -> Result<smoltcp::wire::IpEndpoint, SystemError> {
+        use smoltcp::wire::{IpAddress, IpVersion};
+        if endpoint.addr.version() != self.ip_version {
+            return Err(SystemError::EAFNOSUPPORT);
+        }
+        if let IpAddress::Ipv6(addr) = endpoint.addr {
+            if let Some(mapped) = addr.to_ipv4_mapped() {
+                if self
+                    .options
+                    .ipv6_only
+                    .load(core::sync::atomic::Ordering::Relaxed)
+                {
+                    return Err(if connecting {
+                        SystemError::ENETUNREACH
+                    } else {
+                        SystemError::EINVAL
+                    });
+                }
+                endpoint.addr = IpAddress::Ipv4(mapped);
+            } else if !connecting && addr.is_multicast() && self.ip_version == IpVersion::Ipv6 {
+                return Err(SystemError::EINVAL);
+            }
+        }
+        Ok(endpoint)
+    }
+
     fn kick_iface_after_tcp_state_change(
         iface: &Arc<dyn crate::net::Iface>,
         poll_rounds: usize,
@@ -142,10 +173,23 @@ impl TcpSocket {
 
     pub fn do_bind(&self, local_endpoint: smoltcp::wire::IpEndpoint) -> Result<(), SystemError> {
         let mut writer = self.inner.write();
+        let local_endpoint = self.normalize_endpoint(local_endpoint, false)?;
+        let v6_only = self
+            .options
+            .ipv6_only
+            .load(core::sync::atomic::Ordering::Relaxed);
         match writer.take().expect("Tcp inner::Inner is None") {
-            inner::Inner::Init(inner) => match inner.bind(local_endpoint, self.netns()) {
+            inner::Inner::Init(inner) => match inner.bind(local_endpoint, self.netns(), v6_only) {
                 Ok(bound) => {
-                    if let inner::Init::Bound((ref bound, _)) = bound {
+                    // Linux inet6_bind() makes a concrete native IPv6 binding v6-only.
+                    if local_endpoint.addr.version() == smoltcp::wire::IpVersion::Ipv6
+                        && !local_endpoint.addr.is_unspecified()
+                    {
+                        self.options
+                            .ipv6_only
+                            .store(true, core::sync::atomic::Ordering::Relaxed);
+                    }
+                    if let inner::Init::Bound((ref bound, _, _)) = bound {
                         bound
                             .iface()
                             .common()
@@ -172,7 +216,13 @@ impl TcpSocket {
         let inner = writer.take().expect("Tcp inner::Inner is None");
         let (listening, err) = match inner {
             inner::Inner::Init(init) => {
-                let listen_result = init.listen(backlog, self.netns());
+                let listen_result = init.listen(
+                    backlog,
+                    self.netns(),
+                    self.options
+                        .ipv6_only
+                        .load(core::sync::atomic::Ordering::Relaxed),
+                );
                 match listen_result {
                     Ok(listening) => {
                         // DragonOS backlog emulation: listener is represented by multiple
@@ -189,7 +239,12 @@ impl TcpSocket {
                         for b in &listening.inners {
                             let nic_id = b.iface().nic_id();
                             if !registered_ifaces.contains(&nic_id) {
-                                b.iface().common().register_tcp_listen_port(port, backlog);
+                                b.iface().common().register_tcp_listen_port(
+                                    listening.reservation.as_ref().unwrap().id,
+                                    listening.domain,
+                                    port,
+                                    backlog,
+                                );
                                 b.iface().common().bind_socket(me.clone());
                                 registered_ifaces.push(nic_id);
                             }
@@ -253,6 +308,12 @@ impl TcpSocket {
                         remote,
                     )
                 })?;
+                socket.options.ipv6_only.store(
+                    self.options
+                        .ipv6_only
+                        .load(core::sync::atomic::Ordering::Relaxed),
+                    core::sync::atomic::Ordering::Relaxed,
+                );
                 {
                     let mut inner_guard = socket.inner.write();
                     if let Some(inner::Inner::Established(established)) = inner_guard.as_mut() {
@@ -271,11 +332,12 @@ impl TcpSocket {
         &self,
         remote_endpoint: smoltcp::wire::IpEndpoint,
     ) -> Result<(), SystemError> {
+        let mut writer = self.inner.write();
+        let remote_endpoint = self.normalize_endpoint(remote_endpoint, true)?;
         let remote_endpoint =
             crate::net::socket::inet::common::normalize_unspecified_endpoint_to_loopback(
                 remote_endpoint,
             );
-        let mut writer = self.inner.write();
         let inner = writer.take().expect("Tcp inner::Inner is None");
         let (init, result) = match inner {
             inner::Inner::Init(init) => {
@@ -284,21 +346,28 @@ impl TcpSocket {
                 // smoltcp cannot model this with a single TCP socket instance, so we special-case
                 // it into `Inner::SelfConnected`.
                 match init {
-                    inner::Init::Bound((bound, local)) if local == remote_endpoint => {
+                    inner::Init::Bound((bound, local, reservation)) if local == remote_endpoint => {
                         // Capture an effective queue capacity from the underlying socket's recv buffer.
                         let rx_cap = bound
                             .with::<smoltcp::socket::tcp::Socket, _, _>(|s| s.recv_capacity())
                             .clamp(1 << 20, super::constants::MAX_SOCKET_BUFFER);
                         (
                             inner::Inner::SelfConnected(inner::SelfConnected::new(
-                                bound, local, rx_cap,
+                                bound,
+                                local,
+                                rx_cap,
+                                reservation,
                             )),
                             Ok(()),
                         )
                     }
                     other => {
-                        let conn_result =
-                            other.connect(remote_endpoint, self.netns(), self.self_ref.clone());
+                        let conn_result = other.connect(
+                            remote_endpoint,
+                            self.netns(),
+                            self.self_ref.clone(),
+                            self.ip_version,
+                        );
                         match conn_result {
                             Ok(connecting) => (
                                 inner::Inner::Connecting(connecting),
@@ -473,7 +542,7 @@ impl TcpSocket {
                 if how.contains(ShutdownBit::SHUT_RD) {
                     let original_listen_sockets = listening.inners.len();
                     let local = listening.get_name();
-                    let port = local.port;
+                    let reservation_id = listening.reservation.as_ref().unwrap().id;
 
                     // Unregister listen port and unbind socket from all unique interfaces.
                     // For INADDR_ANY listeners, listen sockets span multiple interfaces.
@@ -483,7 +552,9 @@ impl TcpSocket {
                         for b in &listening.inners {
                             let nic_id = b.iface().nic_id();
                             if !unregistered.contains(&nic_id) {
-                                b.iface().common().unregister_tcp_listen_port(port);
+                                b.iface()
+                                    .common()
+                                    .unregister_tcp_listen_port(reservation_id);
                                 b.iface().common().unbind_socket(me.clone());
                                 unregistered.push(nic_id);
                             }
@@ -515,7 +586,11 @@ impl TcpSocket {
                     // Do not record SHUT_RD bit here because recv() on an unconnected
                     // stream socket should not become EOF just due to this operation.
                     (
-                        inner::Inner::Init(inner::Init::Bound((keep, local))),
+                        inner::Inner::Init(inner::Init::Bound((
+                            keep,
+                            local,
+                            listening.reservation.take().unwrap(),
+                        ))),
                         ShutdownBit::from_bits_truncate(0),
                     )
                 } else {
@@ -666,16 +741,14 @@ impl TcpSocket {
                     let (new_inner, _) = conn.into_result();
                     writer.replace(new_inner);
                 } else {
-                    let conn = unsafe { conn.into_established_after_unbind() };
+                    let mut conn = unsafe { conn.into_established_after_unbind() };
                     let handle = conn.handle();
                     let local_port = conn.get_name().port;
                     let iface = conn.iface().clone();
                     let me: alloc::sync::Weak<dyn InetSocket> = self.self_ref.clone();
                     conn.with_mut(|socket| socket.abort());
                     let initial_state = conn.with(|socket| socket.state());
-                    if conn.owns_port() {
-                        iface.port_manager().unbind_port(Types::Tcp, local_port);
-                    }
+                    conn.release_port();
                     iface.common().defer_tcp_close(DeferredTcpCloseRequest {
                         handle,
                         local_port,
@@ -691,7 +764,7 @@ impl TcpSocket {
                     writer.replace(inner::Inner::Established(conn));
                 }
             }
-            inner::Inner::Established(es) => {
+            inner::Inner::Established(mut es) => {
                 // A successful connect can still have a publisher racing from
                 // start_connect(). Cancel its transferable lease before this
                 // closed socket can be reinserted into iface bounds.
@@ -703,9 +776,7 @@ impl TcpSocket {
                 let close_action = self.decide_established_close(&es);
                 es.with_mut(|socket| Self::apply_close_action(socket, close_action));
                 let initial_state = es.with(|socket| socket.state());
-                if es.owns_port() {
-                    iface.port_manager().unbind_port(Types::Tcp, local_port);
-                }
+                es.release_port();
                 iface.common().defer_tcp_close(DeferredTcpCloseRequest {
                     handle,
                     local_port,
@@ -720,16 +791,13 @@ impl TcpSocket {
                 post_poll_iface = Some(iface);
                 writer.replace(inner::Inner::Established(es));
             }
-            inner::Inner::SelfConnected(sc) => {
+            inner::Inner::SelfConnected(mut sc) => {
                 // Release the bound handle and switch to explicit Closed to avoid stale handle access.
                 let ver = match sc.get_name().addr {
                     smoltcp::wire::IpAddress::Ipv6(_) => smoltcp::wire::IpVersion::Ipv6,
                     _ => smoltcp::wire::IpVersion::Ipv4,
                 };
-                let port = sc.get_name().port;
-                let iface = sc.iface().clone();
                 sc.release();
-                iface.port_manager().unbind_port(Types::Tcp, port);
                 writer.replace(inner::Inner::Closed(inner::Closed::new(ver)));
             }
             inner::Inner::Listening(mut ls) => {
@@ -742,7 +810,7 @@ impl TcpSocket {
                 }
                 // close(listen_fd) should stop listening on the port.
                 let original_listen_sockets = ls.inners.len();
-                let port = ls.get_name().port;
+                let reservation_id = ls.reservation.as_ref().unwrap().id;
                 let post_close_iface = ls.inners.first().map(|b| b.iface().clone());
                 // Unregister listen port and unbind socket from all unique interfaces.
                 // For INADDR_ANY listeners, listen sockets span multiple interfaces,
@@ -753,7 +821,9 @@ impl TcpSocket {
                     for b in &ls.inners {
                         let nic_id = b.iface().nic_id();
                         if !cleaned.contains(&nic_id) {
-                            b.iface().common().unregister_tcp_listen_port(port);
+                            b.iface()
+                                .common()
+                                .unregister_tcp_listen_port(reservation_id);
                             b.iface().common().unbind_socket(me.clone());
                             cleaned.push(nic_id);
                         }

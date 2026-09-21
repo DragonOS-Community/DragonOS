@@ -96,6 +96,17 @@ pub trait Socket: PollableInode + IndexNode {
     /// 对应于POSIX的bind函数，用于绑定到本机指定的端点
     fn bind(&self, endpoint: Endpoint) -> Result<(), SystemError>;
 
+    /// Decode a user sockaddr with this protocol's address-family policy.
+    /// Existing protocols retain mapped-address normalization; protocols that
+    /// validate the original family can preserve it until their own boundary.
+    fn endpoint_from_user(
+        &self,
+        addr: *const crate::net::posix::SockAddr,
+        len: u32,
+    ) -> Result<Endpoint, SystemError> {
+        crate::net::posix::SockAddr::to_endpoint(addr, len)
+    }
+
     /// # `close`
     /// 关闭socket
     fn do_close(&self) -> Result<(), SystemError>;

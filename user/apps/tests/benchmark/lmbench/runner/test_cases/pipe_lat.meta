@@ -1,0 +1,11 @@
+# Extraction/metadata for pipe_lat
+CATEGORY=ipc
+BINARY=lat_pipe
+METRIC_TYPE=latency
+UNIT=microseconds
+BIGGER_IS_BETTER=0
+# lat_pipe prints "Pipe latency: <N> microseconds".
+SEARCH_PATTERN=Pipe latency
+RESULT_INDEX=NF-1
+NTH_OCCURRENCE=1
+DESCRIPTION=Pipe round-trip latency via lat_pipe

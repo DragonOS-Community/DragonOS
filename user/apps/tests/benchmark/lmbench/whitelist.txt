@@ -1,0 +1,70 @@
+# LMbench 基准测试白名单
+# 每行一个测例名(对应 runner/test_cases/<name>.sh,不带路径/后缀)
+# 以 # 开头为注释,空行忽略。runner 只跑此列表中的测例。
+#
+# 全量启用:48 个测例覆盖各类别。.meta 在 host 侧用 guest 同款 lmbench 二进制
+# 提取(见 docs/superpowers/specs/2026-07-30-lmbench-fullsuite-meta-extraction-design.md);
+# 部分工具在 host 跑不通(lat_fifo/bw_unix/lat_sem/lat_syscall null/bw_tcp 等),
+# 其 .meta 基于 strings 提取的输出格式 + lmbench 标准格式推断,标注待 guest 校准。
+
+# memory
+mem_copy_bw
+mem_read_bw
+mem_write_bw
+mem_mmap_bw
+mem_mmap_lat
+mem_pagefault_lat
+
+# process
+process_fork_lat
+process_exec_lat
+process_ctx_lat
+process_getppid_lat
+process_shell_lat
+
+# ipc
+pipe_lat
+pipe_bw
+fifo_lat
+unix_lat
+unix_bw
+unix_connect_lat
+semaphore_lat
+
+# signal
+signal_catch_lat
+signal_install_lat
+signal_prot_lat
+
+# vfs
+vfs_open_lat
+vfs_read_lat
+vfs_write_lat
+vfs_fstat_lat
+vfs_stat_lat
+vfs_fcntl_lat
+vfs_select_lat
+vfs_read_pagecache_bw
+
+# filesystem
+ext4_create_delete_files_0k_ops
+ext4_create_delete_files_10k_ops
+ramfs_create_delete_files_0k_ops
+ramfs_create_delete_files_10k_ops
+ext4_copy_files_bw
+ramfs_copy_files_bw
+
+# network
+tcp_loopback_lat
+tcp_loopback_bw_128
+tcp_loopback_bw_4k
+tcp_loopback_bw_64k
+tcp_loopback_connect_lat
+tcp_loopback_select_lat
+tcp_loopback_http_bw
+tcp_virtio_lat
+tcp_virtio_bw_128
+tcp_virtio_bw_64k
+tcp_virtio_connect_lat
+udp_loopback_lat
+udp_virtio_lat

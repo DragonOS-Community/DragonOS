@@ -1,0 +1,11 @@
+# Extraction/metadata for vfs_open_lat
+CATEGORY=vfs
+BINARY=lat_syscall
+METRIC_TYPE=latency
+UNIT=microseconds
+BIGGER_IS_BETTER=0
+# lat_syscall open prints "Simple open/close: <N> microseconds".
+SEARCH_PATTERN=open/close
+RESULT_INDEX=NF-1
+NTH_OCCURRENCE=1
+DESCRIPTION=open/close syscall latency via lat_syscall open

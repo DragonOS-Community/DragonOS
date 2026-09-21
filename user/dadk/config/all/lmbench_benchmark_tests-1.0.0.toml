@@ -1,0 +1,40 @@
+# 用户程序名称（必须与 config/app-blocklist.toml 中的条目一致）
+name = "lmbench benchmark tests"
+# 版本号
+version = "1.0.0"
+# 用户程序描述信息
+description = "LMbench 性能基准测试套件（测例脚本 + guest 端 runner）"
+# （可选）是否只构建一次
+build-once = false
+# （可选）是否只安装一次
+install-once = false
+# 目标架构
+target-arch = ["x86_64"]
+
+# 任务源
+[task-source]
+# 构建类型
+type = "build-from-source"
+# 构建来源
+source = "local"
+# 路径或URL
+source-path = "user/apps/tests/benchmark/lmbench"
+
+# 构建相关信息
+[build]
+# 仅安装 shell 脚本/元数据到 rootfs（无需编译）
+build-command = "make install"
+
+# 安装相关信息
+[install]
+# 安装到DragonOS的路径
+in-dragonos-path = "/opt/tests/benchmark/lmbench"
+
+# 清除相关信息
+[clean]
+clean-command = "make clean"
+
+# 依赖:lmbench 二进制（会连带其 glibc 依赖一起被 DADK 构建/安装）
+[[depends]]
+name = "lmbench_bin_ubuntu2404"
+version = "3.0"

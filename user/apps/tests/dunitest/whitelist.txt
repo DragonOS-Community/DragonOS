@@ -57,6 +57,7 @@ normal/tcp_bind_semantics
 normal/tcp_dual_stack_semantics
 normal/tcp_close_semantics
 normal/tcp_listen_poll_semantics
+normal/tcp_relisten
 normal/tcp_self_connect_semantics
 normal/poll_timeout_semantics
 normal/udp_ipv6_send_semantics

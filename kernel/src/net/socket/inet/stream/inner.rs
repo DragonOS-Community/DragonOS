@@ -314,17 +314,10 @@ impl Init {
         // Linux semantics: listen(backlog=0) is valid. In practice it still allows
         // one pending connection in the accept queue (see sk_acceptq_is_full logic).
         // DragonOS uses multiple smoltcp TCP sockets to emulate accept queue slots.
-        if backlog > u16::MAX as usize {
-            return Err((
-                Init::Bound((inner, local, reservation)),
-                SystemError::EINVAL,
-            ));
-        }
-
         // Backlog emulation:
         // - backlog==0 => emulate a single accept slot
         // - cap to avoid excessive socket allocations (FIXME: refactor backlog mechanism)
-        let backlog = core::cmp::min(if backlog == 0 { 1 } else { backlog }, 8);
+        let backlog = Listening::slot_capacity(backlog);
 
         let mut inners = Vec::new();
         let is_any_addr = listen_addr.addr.is_none();
@@ -336,8 +329,8 @@ impl Init {
                 // arriving on an interface without a listen socket gets no response (RST
                 // or silent drop depending on smoltcp version).
                 //
-                // Strategy: place ≥1 listen socket on each interface. Any remaining
-                // backlog slots go to the primary interface.
+                // Establish interface coverage first; grow_slots below applies
+                // the same capacity to every covered interface.
                 let device_list = netns.device_list();
                 for (_, iface) in device_list.iter() {
                     if alloc::sync::Arc::ptr_eq(iface, inner.iface()) {
@@ -346,32 +339,6 @@ impl Init {
                     let new_listen = socket::inet::BoundInner::bind_on_iface(
                         new_listen_smoltcp_socket(listen_addr, domain.ip_version)?,
                         iface.clone(),
-                        inner.netns(),
-                    )?;
-                    inners.push(new_listen);
-                }
-                // Fill remaining backlog slots on the primary interface.
-                let remaining = backlog.saturating_sub(1 + inners.len());
-                for _ in 0..remaining {
-                    let new_listen = socket::inet::BoundInner::bind_on_iface(
-                        new_listen_smoltcp_socket(listen_addr, domain.ip_version)?,
-                        inner.iface().clone(),
-                        inner.netns(),
-                    )?;
-                    inners.push(new_listen);
-                }
-            } else {
-                // Specific address: all backlog sockets go to the same interface.
-                let additional_sockets = backlog.saturating_sub(1);
-                for _ in 0..additional_sockets {
-                    let new_listen = socket::inet::BoundInner::bind(
-                        new_listen_smoltcp_socket(listen_addr, domain.ip_version)?,
-                        listen_addr
-                            .addr
-                            .as_ref()
-                            .unwrap_or(&smoltcp::wire::IpAddress::from(
-                                smoltcp::wire::Ipv4Address::UNSPECIFIED,
-                            )),
                         inner.netns(),
                     )?;
                     inners.push(new_listen);
@@ -385,23 +352,36 @@ impl Init {
             return Err((Init::Bound((inner, local, reservation)), err));
         }
 
-        if let Err(err) = inner.with_mut::<smoltcp::socket::tcp::Socket, _, _>(|socket| {
-            socket.set_listen_ip_version(domain.ip_version);
-            socket.listen(listen_addr).map_err(|err| match err {
-                tcp::ListenError::InvalidState => SystemError::EINVAL,
-                tcp::ListenError::Unaddressable => SystemError::EINVAL,
+        let primary_index = inners.len();
+        inners.push(inner);
+        if let Err(err) = Listening::grow_slots(&mut inners, backlog, listen_addr, domain) {
+            let inner = inners.remove(primary_index);
+            for bound in inners {
+                bound.release();
+            }
+            return Err((Init::Bound((inner, local, reservation)), err));
+        }
+
+        if let Err(err) =
+            inners[primary_index].with_mut::<smoltcp::socket::tcp::Socket, _, _>(|socket| {
+                socket.set_listen_ip_version(domain.ip_version);
+                socket.listen(listen_addr).map_err(|err| match err {
+                    tcp::ListenError::InvalidState => SystemError::EINVAL,
+                    tcp::ListenError::Unaddressable => SystemError::EINVAL,
+                })
             })
-        }) {
+        {
+            let inner = inners.remove(primary_index);
             for bound in &inners {
                 bound.release();
             }
             return Err((Init::Bound((inner, local, reservation)), err));
         }
 
-        inners.push(inner);
         return Ok(Listening {
             inners,
-            connect: AtomicUsize::new(0),
+            slots_per_iface: backlog,
+            shrink_pending: false,
             listen_addr,
             local,
             domain,
@@ -778,7 +758,9 @@ impl Connecting {
 #[derive(Debug)]
 pub struct Listening {
     pub inners: Vec<socket::inet::BoundInner>,
-    connect: AtomicUsize,
+    // Pending connections may temporarily keep the vector above this target.
+    slots_per_iface: usize,
+    shrink_pending: bool,
     listen_addr: smoltcp::wire::IpListenEndpoint,
     local: smoltcp::wire::IpEndpoint,
     pub domain: TcpBindDomain,
@@ -786,21 +768,155 @@ pub struct Listening {
 }
 
 impl Listening {
-    pub fn accept(&mut self) -> Result<(Established, smoltcp::wire::IpEndpoint), SystemError> {
-        let connected: &mut socket::inet::BoundInner = self
-            .inners
-            .get_mut(self.connect.load(core::sync::atomic::Ordering::Relaxed))
-            .unwrap();
+    fn slot_capacity(backlog: usize) -> usize {
+        // Bounded per-interface emulation, not Linux's global accept queue.
+        // At 256 KiB per socket this uses at most 2 MiB per interface.
+        backlog.clamp(1, 8)
+    }
 
-        if connected.with::<smoltcp::socket::tcp::Socket, _, _>(|socket| !socket.is_active()) {
-            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+    pub(super) fn has_excess_slots(&self) -> bool {
+        self.shrink_pending
+    }
+
+    fn can_remove_slot(&self, index: usize) -> bool {
+        self.inners
+            .iter()
+            .filter(|bound| Arc::ptr_eq(bound.iface(), self.inners[index].iface()))
+            .count()
+            > self.slots_per_iface
+    }
+
+    pub(super) fn trim_excess(&mut self) {
+        // Reap dead children before idle slots, so shrinking does not retain a
+        // dead handle instead of a healthy listener on that interface.
+        for state in [tcp::State::Closed, tcp::State::Listen] {
+            let mut index = 0;
+            while index < self.inners.len() {
+                let remove = self.can_remove_slot(index)
+                    && self.inners[index].with_mut::<tcp::Socket, _, _>(|socket| {
+                        if socket.state() == state {
+                            // Check and close under the same SocketSet lock so a
+                            // concurrent poll cannot consume the slot in between.
+                            socket.close();
+                            true
+                        } else {
+                            false
+                        }
+                    });
+                if remove {
+                    self.inners.remove(index).release();
+                } else {
+                    index += 1;
+                }
+            }
         }
+        self.shrink_pending = (0..self.inners.len()).any(|index| self.can_remove_slot(index));
+        self.rearm_closed_slots();
+    }
+
+    fn rearm_closed_slots(&self) {
+        // A retained child may have reset while other slots were removed.
+        // Rearm it under the same lock as the state check. The nonzero local
+        // endpoint was validated when the listener was created.
+        for bound in &self.inners {
+            bound.with_mut::<tcp::Socket, _, _>(|socket| {
+                if socket.state() == tcp::State::Closed {
+                    socket
+                        .listen(self.listen_addr)
+                        .expect("valid listener endpoint");
+                }
+            });
+        }
+    }
+
+    fn grow_slots(
+        inners: &mut Vec<socket::inet::BoundInner>,
+        target: usize,
+        listen_addr: smoltcp::wire::IpListenEndpoint,
+        domain: TcpBindDomain,
+    ) -> Result<(), SystemError> {
+        // Prepare sockets before publishing any new handles; keep existing
+        // connections and the previous capacity on a recoverable failure.
+        let mut sockets = Vec::new();
+        for (index, bound) in inners.iter().enumerate() {
+            if inners[..index]
+                .iter()
+                .any(|other| Arc::ptr_eq(other.iface(), bound.iface()))
+            {
+                continue;
+            }
+            let count = inners
+                .iter()
+                .filter(|other| Arc::ptr_eq(other.iface(), bound.iface()))
+                .count();
+            for _ in count..target {
+                sockets.push((
+                    new_listen_smoltcp_socket(listen_addr, domain.ip_version)?,
+                    bound.iface().clone(),
+                    bound.netns(),
+                ));
+            }
+        }
+        let mut added = Vec::new();
+        for (socket, iface, netns) in sockets {
+            match socket::inet::BoundInner::bind_on_iface(socket, iface, netns) {
+                Ok(bound) => added.push(bound),
+                Err(err) => {
+                    for bound in added {
+                        bound.release();
+                    }
+                    return Err(err);
+                }
+            }
+        }
+        inners.extend(added);
+        Ok(())
+    }
+
+    pub(super) fn set_backlog(&mut self, backlog: usize) -> Result<(), SystemError> {
+        let target = Self::slot_capacity(backlog);
+        Self::grow_slots(&mut self.inners, target, self.listen_addr, self.domain)?;
+        self.slots_per_iface = target;
+        self.trim_excess();
+        for (index, bound) in self.inners.iter().enumerate() {
+            if self.inners[..index]
+                .iter()
+                .any(|other| Arc::ptr_eq(other.iface(), bound.iface()))
+            {
+                continue;
+            }
+            bound.iface().common().register_tcp_listen_port(
+                self.reservation.as_ref().unwrap().id,
+                self.domain,
+                self.local.port,
+                backlog,
+            );
+        }
+        Ok(())
+    }
+
+    pub fn accept(&mut self) -> Result<(Established, smoltcp::wire::IpEndpoint), SystemError> {
+        // Resizing can invalidate vector indices. Select the current live slot
+        // under the caller's inner write lock instead of caching a poll index.
+        let index = self
+            .inners
+            .iter()
+            .position(|bound| bound.with::<tcp::Socket, _, _>(|socket| socket.is_active()))
+            .ok_or(SystemError::EAGAIN_OR_EWOULDBLOCK)?;
+
+        let retire = self.can_remove_slot(index);
+        let connected = &mut self.inners[index];
 
         let remote_endpoint = connected.with::<smoltcp::socket::tcp::Socket, _, _>(|socket| {
             socket
                 .remote_endpoint()
                 .expect("A Connected Tcp With No Remote Endpoint")
         });
+
+        if retire {
+            let connected = self.inners.remove(index);
+            return Ok((Established::new(connected, None), remote_endpoint));
+        }
 
         // log::debug!("local at {:?}", local_endpoint);
 
@@ -834,6 +950,9 @@ impl Listening {
     }
 
     pub fn update_io_events(&self, pollee: &AtomicUsize) {
+        // A retained pending child can reset after shrink has completed. It
+        // must become a listen slot again, not permanently consume capacity.
+        self.rearm_closed_slots();
         // Linux 6.6: tcp_poll() 对 TCP_LISTEN 直接早返回 inet_csk_listen_poll()，其返回值
         // 只可能是 EPOLLIN | EPOLLRDNORM（accept 队列非空）或 0 —— LISTEN 套接字的就绪掩码
         // 每次都是重算的，永远不会出现 EPOLLHUP / EPOLLRDHUP / EPOLLERR。
@@ -850,13 +969,11 @@ impl Listening {
         );
 
         // log::info!("Listening::update_io_events");
-        let position = self.inners.iter().position(|inner| {
+        let ready = self.inners.iter().any(|inner| {
             inner.with::<smoltcp::socket::tcp::Socket, _, _>(|socket| socket.is_active())
         });
 
-        if let Some(position) = position {
-            self.connect
-                .store(position, core::sync::atomic::Ordering::Relaxed);
+        if ready {
             pollee.fetch_or(
                 EPollEventType::EPOLL_LISTEN_CAN_ACCEPT.bits() as usize,
                 core::sync::atomic::Ordering::Relaxed,

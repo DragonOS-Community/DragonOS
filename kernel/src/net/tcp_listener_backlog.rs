@@ -59,8 +59,8 @@ impl TcpListenerBacklog {
         let drop_syn_when_full = backlog == 0;
         if let Some(e) = guard.iter_mut().find(|e| e.id == id) {
             e.drop_syn_when_full = drop_syn_when_full;
-            // 保守：假设 present，等待下一次 poll 刷新。
-            e.listen_socket_present = true;
+            // A repeated listen must not grant a SYN to an already full
+            // listener. The next SocketSet-locked poll refreshes this cache.
         } else {
             guard.push(TcpListenPortInfo {
                 id,

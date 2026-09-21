@@ -254,6 +254,10 @@ impl TcpSocket {
                     Err((init, err)) => (inner::Inner::Init(init), Some(err)),
                 }
             }
+            inner::Inner::Listening(mut listening) => {
+                let err = listening.set_backlog(backlog).err();
+                (inner::Inner::Listening(listening), err)
+            }
             _ => (inner, Some(SystemError::EINVAL)),
         };
         writer.replace(listening);

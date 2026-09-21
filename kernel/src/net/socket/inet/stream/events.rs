@@ -20,7 +20,22 @@ impl TcpSocket {
             let _ = self.flush_cork_buffer();
         }
 
-        let inner_guard = self.inner.read();
+        let mut inner_guard = self.inner.read();
+        if matches!(inner_guard.as_ref(), Some(inner::Inner::Listening(ls)) if ls.has_excess_slots())
+        {
+            // A pending handshake can return to LISTEN after RST without an
+            // accept. Reclaim its surplus slot through the existing event path.
+            // Never upgrade while retaining the read lock; close/listen may
+            // change the state before the write lock is acquired.
+            drop(inner_guard);
+            {
+                let mut writer = self.inner.write();
+                if let Some(inner::Inner::Listening(listening)) = writer.as_mut() {
+                    listening.trim_excess();
+                }
+            }
+            inner_guard = self.inner.read();
+        }
         match inner_guard.as_ref() {
             None => false,
             Some(inner::Inner::Init(_)) => {

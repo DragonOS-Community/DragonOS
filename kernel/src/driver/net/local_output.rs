@@ -506,14 +506,6 @@ impl<D: SmolDevice + ?Sized> SmolDevice for LocalInputDevice<'_, D> {
         // input remains queued for a later poll.
         let tx_token = self.tx_token()?;
         let packet = self.common.local_input_queue.pop()?;
-        // Namespace-local delivery is an ingress path in its own right.
-        // Apply the same pre-stack policy as a driver receive queue so a
-        // routed local packet cannot bypass listener/backlog semantics. Stop
-        // this ingress round after one policy drop to keep NAPI work bounded;
-        // the non-empty local queue schedules the next round.
-        if self.common.should_drop_rx_packet(&packet.ip_packet) {
-            return None;
-        }
         let ingress_ifindex = packet.ingress_ifindex;
         let frame = packet.into_frame(self.device.capabilities().medium).ok()?;
         let mut meta = PacketMeta::default();

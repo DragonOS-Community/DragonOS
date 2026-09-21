@@ -381,18 +381,6 @@ pub trait Iface: crate::driver::base::device::Device {
         Ok(())
     }
 
-    /// # `should_drop_rx_packet`
-    /// 驱动收包入口可选调用：询问“上层(协议栈/Socket 语义)”是否需要丢弃该包。
-    ///
-    /// 说明：
-    /// - 默认不丢弃；
-    /// - 驱动层不应理解 TCP/UDP 等协议语义，这个 hook 用于实现 Linux 兼容语义（如 backlog 满丢 SYN）
-    ///   且不修改 smoltcp。
-    #[inline]
-    fn should_drop_rx_packet(&self, _packet: &[u8]) -> bool {
-        false
-    }
-
     /// @brief 获取smoltcp的网卡接口类型
     #[inline(always)]
     fn smol_iface(&self) -> &Mutex<smoltcp::iface::Interface> {

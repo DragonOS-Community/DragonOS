@@ -153,6 +153,44 @@ impl BoundInner {
         })
     }
 
+    /// Atomically hand off a completed TCP listener slot and install its
+    /// replacement on the same interface. The replacement is prepared outside
+    /// SocketSet, so a failed state check cannot expose or leak a new listener.
+    pub(super) fn accept_tcp(
+        &mut self,
+        mut replacement: smoltcp::socket::tcp::Socket<'static>,
+    ) -> Result<(Self, smoltcp::wire::IpEndpoint, smoltcp::wire::IpEndpoint), SystemError> {
+        use smoltcp::socket::tcp::{Socket, State};
+
+        let iface = self.iface.clone();
+        let mut sockets = iface.sockets().lock();
+        let socket = sockets.get_mut::<Socket>(self.handle);
+        if !matches!(socket.state(), State::Established | State::CloseWait) {
+            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+        }
+        let (Some(local), Some(remote)) = (socket.local_endpoint(), socket.remote_endpoint())
+        else {
+            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+        };
+        replacement.set_listener_enabled(socket.listener_enabled());
+        socket.set_listener_id(None);
+
+        // No ingress can observe the handoff between these operations. Keep the
+        // accepted transport's handle and move this listener to the new slot.
+        let accepted_handle = self.handle;
+        self.handle = sockets.add(replacement);
+        drop(sockets);
+        Ok((
+            Self {
+                handle: accepted_handle,
+                iface,
+                netns: self.netns.clone(),
+            },
+            local,
+            remote,
+        ))
+    }
+
     pub fn bind_ephemeral<T>(
         socket: T,
         // socket_type: Types,

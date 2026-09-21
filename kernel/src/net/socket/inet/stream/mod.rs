@@ -33,6 +33,19 @@ mod stream_core;
 
 pub use stream_core::TcpSocket;
 
+impl TcpSocket {
+    /// Keep the transport tuple in its native family, but report addresses in
+    /// the socket's ABI family (including dual-stack IPv4 connections).
+    fn user_endpoint(&self, mut endpoint: smoltcp::wire::IpEndpoint) -> Endpoint {
+        if self.ip_version == smoltcp::wire::IpVersion::Ipv6 {
+            if let smoltcp::wire::IpAddress::Ipv4(addr) = endpoint.addr {
+                endpoint.addr = smoltcp::wire::IpAddress::Ipv6(addr.to_ipv6_mapped());
+            }
+        }
+        Endpoint::Ip(endpoint)
+    }
+}
+
 impl Socket for TcpSocket {
     fn netns(&self) -> Arc<crate::process::namespace::net_namespace::NetNamespace> {
         TcpSocket::netns(self)
@@ -64,7 +77,7 @@ impl Socket for TcpSocket {
     fn local_endpoint(&self) -> Result<Endpoint, SystemError> {
         let inner = self.inner.read();
         let inner = inner.as_ref().ok_or(SystemError::ENOTCONN)?;
-        Ok(Endpoint::Ip(inner.local_endpoint()))
+        Ok(self.user_endpoint(inner.local_endpoint()))
     }
 
     fn remote_endpoint(&self) -> Result<Endpoint, SystemError> {
@@ -72,7 +85,7 @@ impl Socket for TcpSocket {
         let inner = inner.as_ref().ok_or(SystemError::ENOTCONN)?;
         inner
             .remote_endpoint()
-            .map(Endpoint::Ip)
+            .map(|endpoint| self.user_endpoint(endpoint))
             .ok_or(SystemError::ENOTCONN)
     }
 
@@ -172,7 +185,10 @@ impl Socket for TcpSocket {
                 }
             }
         }
-        .map(|(sock, ep)| (sock as Arc<dyn Socket>, Endpoint::Ip(ep)))
+        .map(|(sock, ep)| {
+            let endpoint = sock.user_endpoint(ep);
+            (sock as Arc<dyn Socket>, endpoint)
+        })
     }
 
     fn recv(&self, buffer: &mut [u8], flags: PMSG) -> Result<usize, SystemError> {

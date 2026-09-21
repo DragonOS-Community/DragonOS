@@ -36,6 +36,8 @@ DragonOS now has repository mirrors on multiple hosting platforms:
 ```shell
 git clone https://atomgit.com/DragonOS-Community/DragonOS.git
 cd DragonOS
+# 初始化内核依赖的子模块
+make update-submodules-by-mirror
 ```
 
 ## Activating the Kernel Compilation Environment

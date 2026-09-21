@@ -52,6 +52,8 @@ pub struct TcpSocketOptions {
     pub(crate) so_filter_attached: AtomicBool,
     /// SO_REUSEADDR
     pub(crate) so_reuseaddr: AtomicBool,
+    /// SO_REUSEPORT
+    pub(crate) so_reuseport: AtomicBool,
     /// SO_BROADCAST
     pub(crate) so_broadcast: AtomicBool,
     /// SO_PASSCRED
@@ -108,6 +110,7 @@ impl TcpSocketOptions {
             tcp_user_timeout: AtomicI32::new(0),
             so_filter_attached: AtomicBool::new(false),
             so_reuseaddr: AtomicBool::new(false),
+            so_reuseport: AtomicBool::new(false),
             so_broadcast: AtomicBool::new(false),
             so_passcred: AtomicBool::new(false),
             so_no_check: AtomicBool::new(false),
@@ -147,6 +150,8 @@ pub struct TcpSocket {
     pub(crate) self_ref: Weak<Self>,
     pub(crate) pollee: AtomicUsize,
     pub(crate) netns: Arc<NetNamespace>,
+    /// Socket credentials are captured at creation, independent of the bind caller.
+    pub(crate) owner_uid: u32,
     pub(crate) epoll_items: EPollItems,
     pub(crate) fasync_items: FAsyncItems,
     pub(crate) options: TcpSocketOptions,
@@ -181,6 +186,9 @@ impl TcpSocket {
             self_ref: me.clone(),
             pollee: AtomicUsize::new(pollee_bits),
             netns,
+            // Linux sock_alloc initializes socket ownership from current_fsuid.
+            // Keep this creation-time owner across later credential changes.
+            owner_uid: ProcessManager::current_pcb().cred().fsuid.data() as u32,
             epoll_items: EPollItems::default(),
             fasync_items: FAsyncItems::default(),
             options: TcpSocketOptions::new(),
@@ -342,6 +350,11 @@ impl TcpSocket {
     #[inline]
     pub(crate) fn so_reuseaddr(&self) -> &AtomicBool {
         &self.options.so_reuseaddr
+    }
+
+    #[inline]
+    pub(crate) fn so_reuseport(&self) -> &AtomicBool {
+        &self.options.so_reuseport
     }
 
     #[inline]

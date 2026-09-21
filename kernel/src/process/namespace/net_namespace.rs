@@ -193,6 +193,8 @@ pub struct NetNamespace {
     unix_abstract_table: Arc<UnixAbstractTable>,
     /// Per-netns IPv4 ephemeral port range (ip_local_port_range)
     local_port_range: AtomicU32,
+    /// TCP port ownership spans all interfaces in this network namespace.
+    tcp_port_manager: crate::net::socket::inet::common::PortManager,
     /// 当前网络命名空间的 loopback 网卡。
     loopback_iface: RcuOptionArcSlot<LoopbackInterface>,
     /// 当前网络命名空间的默认网卡。
@@ -545,6 +547,10 @@ impl InnerNetNamespace {
 }
 
 impl NetNamespace {
+    pub fn tcp_port_manager(&self) -> &crate::net::socket::inet::common::PortManager {
+        &self.tcp_port_manager
+    }
+
     pub fn new_root() -> Arc<Self> {
         let inner = InnerNetNamespace {
             router: Router::new("root_netns_router".to_string()),
@@ -570,6 +576,7 @@ impl NetNamespace {
             netlink_socket_table: NetlinkSocketTable::default(),
             netlink_kernel_socket: RwSem::new(generate_supported_netlink_kernel_sockets()),
             unix_abstract_table: unix_abstract_table.clone(),
+            tcp_port_manager: crate::net::socket::inet::common::PortManager::default(),
             local_port_range: AtomicU32::new(
                 crate::net::socket::inet::common::port::DEFAULT_LOCAL_PORT_RANGE,
             ),
@@ -611,6 +618,7 @@ impl NetNamespace {
             netlink_socket_table: NetlinkSocketTable::default(),
             netlink_kernel_socket: RwSem::new(generate_supported_netlink_kernel_sockets()),
             unix_abstract_table: unix_abstract_table.clone(),
+            tcp_port_manager: crate::net::socket::inet::common::PortManager::default(),
             local_port_range: AtomicU32::new(
                 crate::net::socket::inet::common::port::DEFAULT_LOCAL_PORT_RANGE,
             ),

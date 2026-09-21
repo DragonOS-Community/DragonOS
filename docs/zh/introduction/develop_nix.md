@@ -36,6 +36,8 @@ DragonOS 现在在多个托管平台上都有仓库镜像
 ```shell
 git clone https://atomgit.com/DragonOS-Community/DragonOS.git
 cd DragonOS
+# 初始化内核依赖的子模块
+make update-submodules-by-mirror
 ```
 
 ## 激活内核编译环境

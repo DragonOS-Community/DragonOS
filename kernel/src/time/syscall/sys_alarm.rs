@@ -29,6 +29,11 @@ impl Syscall for SysAlarm {
         let alarm = pcb_alarm.as_ref();
         //alarm第一次调用
         if alarm.is_none() {
+            // alarm(0) disarms the timer, even when no alarm was previously set.
+            // Do not turn cancellation into an immediately expiring SIGALRM.
+            if second.is_zero() {
+                return Ok(0);
+            }
             //注册alarm定时器
             let new_alarm = Some(AlarmTimer::alarm_timer_init(pcb.clone(), second.as_secs()));
             *pcb_alarm = new_alarm;

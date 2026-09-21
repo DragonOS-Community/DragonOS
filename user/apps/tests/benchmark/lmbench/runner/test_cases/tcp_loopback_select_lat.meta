@@ -1,0 +1,11 @@
+# Extraction/metadata for tcp_loopback_select_lat (KEY=VALUE; parsed by run.sh)
+CATEGORY=network
+BINARY=lat_select
+METRIC_TYPE=latency
+UNIT=microseconds
+BIGGER_IS_BETTER=0
+# lat_select tcp prints "Select on <N> tcp fd's: <M> microseconds".
+SEARCH_PATTERN=Select on
+RESULT_INDEX=NF-1
+NTH_OCCURRENCE=1
+DESCRIPTION=select on tcp fd latency via lat_select tcp

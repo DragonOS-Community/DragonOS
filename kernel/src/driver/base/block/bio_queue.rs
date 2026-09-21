@@ -63,9 +63,11 @@ impl BioQueue {
     }
 
     /// 批量取出请求（用于worker线程）
-    pub fn drain_batch(&self) -> Vec<Arc<BioRequest>> {
+    pub fn drain_batch(&self, limit: usize) -> Vec<Arc<BioRequest>> {
         let mut inner = self.inner.lock_irqsave();
-        let batch_size = self.batch_size.min(inner.queue.len());
+        // Transfer only requests that the caller can retain and process. A
+        // budget boundary must never discard the tail of an already drained Vec.
+        let batch_size = self.batch_size.min(limit).min(inner.queue.len());
         if batch_size == 0 {
             return Vec::new();
         }

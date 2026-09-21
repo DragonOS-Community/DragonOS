@@ -914,7 +914,14 @@ impl UdpSocket {
             return;
         }
 
-        let mut off = offender.unwrap_or_else(|| IpEndpoint::new(self.unspecified_addr(), 0));
+        let Some(mut off) = offender else {
+            return;
+        };
+        // A dual-stack socket may send IPv4 packets. Linux handles their
+        // oversize errors on the IPv4 path, without an IPv6 error queue entry.
+        if !matches!(off.addr, Ipv6(addr) if addr.to_ipv4_mapped().is_none()) {
+            return;
+        }
         if off.addr.is_unspecified() {
             off.addr = smoltcp::wire::IpAddress::v6(0, 0, 0, 0, 0, 0, 0, 1);
         }
@@ -1330,7 +1337,7 @@ impl UdpSocket {
         }
 
         if let Err(SystemError::EMSGSIZE) = result {
-            self.enqueue_ipv6_emsgsize_errqueue(buf.len(), to);
+            self.enqueue_ipv6_emsgsize_errqueue(buf.len(), dest);
         }
 
         result

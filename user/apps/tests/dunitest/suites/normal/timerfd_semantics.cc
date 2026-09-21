@@ -24,6 +24,10 @@ class UniqueFd {
     UniqueFd(const UniqueFd &) = delete;
     UniqueFd &operator=(const UniqueFd &) = delete;
     int get() const { return fd_; }
+    void reset(int fd) {
+        if (fd_ >= 0) close(fd_);
+        fd_ = fd;
+    }
 
   private:
     int fd_;
@@ -219,7 +223,7 @@ TEST(TimerFdSemantics, AbsoluteAndPastDeadlines) {
 
 TEST(TimerFdSemantics, SameDeadlineTimersRemainIndependent) {
     constexpr int kTimerCount = 32;
-    int fds[kTimerCount];
+    UniqueFd fds[kTimerCount];
     pollfd poll_fds[kTimerCount];
 
     itimerspec value = {};
@@ -227,31 +231,51 @@ TEST(TimerFdSemantics, SameDeadlineTimersRemainIndependent) {
     value.it_value = AddMilliseconds(value.it_value, 500);
 
     for (int i = 0; i < kTimerCount; ++i) {
-        fds[i] = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
-        ASSERT_GE(fds[i], 0) << strerror(errno);
-        ASSERT_EQ(0, timerfd_settime(fds[i], TFD_TIMER_ABSTIME, &value, nullptr));
-        poll_fds[i] = {fds[i], POLLIN, 0};
+        fds[i].reset(timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK));
+        ASSERT_GE(fds[i].get(), 0) << strerror(errno);
+        ASSERT_EQ(0, timerfd_settime(fds[i].get(), TFD_TIMER_ABSTIME, &value, nullptr));
+        poll_fds[i] = {fds[i].get(), POLLIN, 0};
     }
 
     itimerspec disarm = {};
     for (int i = 0; i < kTimerCount; i += 2) {
-        ASSERT_EQ(0, timerfd_settime(fds[i], 0, &disarm, nullptr));
+        ASSERT_EQ(0, timerfd_settime(fds[i].get(), 0, &disarm, nullptr));
     }
 
-    ASSERT_EQ(kTimerCount / 2, poll(poll_fds, kTimerCount, 2000));
+    // Equal deadlines do not make expiry callbacks atomically visible to poll.
+    // Collect each active timer once under a single monotonic timeout budget.
+    timespec deadline = {};
+    ASSERT_EQ(0, clock_gettime(CLOCK_MONOTONIC, &deadline));
+    deadline = AddMilliseconds(deadline, 2000);
+    int completed = 0;
+    while (completed < kTimerCount / 2) {
+        timespec now = {};
+        ASSERT_EQ(0, clock_gettime(CLOCK_MONOTONIC, &now));
+        const int64_t remaining_ns = (deadline.tv_sec - now.tv_sec) * INT64_C(1000000000)
+                                     + deadline.tv_nsec - now.tv_nsec;
+        ASSERT_GT(remaining_ns, 0) << "completed timers: " << completed;
+        const int timeout_ms = static_cast<int>((remaining_ns + 999999) / 1000000);
+        const int ready = poll(poll_fds, kTimerCount, timeout_ms);
+        if (ready < 0 && errno == EINTR) continue;
+        ASSERT_GT(ready, 0) << "completed timers: " << completed << ", errno: " << errno;
+        for (int i = 0; i < kTimerCount; ++i) {
+            if (poll_fds[i].revents == 0) continue;
+            ASSERT_EQ(POLLIN, poll_fds[i].revents);
+            ASSERT_EQ(1, i % 2) << "disarmed timer became readable: " << i;
+            uint64_t ticks = 0;
+            ASSERT_EQ(8, read(fds[i].get(), &ticks, sizeof(ticks)));
+            EXPECT_EQ(1u, ticks);
+            poll_fds[i].fd = -1;
+            ++completed;
+        }
+    }
+    EXPECT_EQ(kTimerCount / 2, completed);
+    // Cancelled timers must stay empty; consumed one-shots must not fire twice.
     for (int i = 0; i < kTimerCount; ++i) {
         uint64_t ticks = 0;
-        if (i % 2 == 0) {
-            EXPECT_EQ(0, poll_fds[i].revents);
-            errno = 0;
-            EXPECT_EQ(-1, read(fds[i], &ticks, sizeof(ticks)));
-            EXPECT_EQ(EAGAIN, errno);
-        } else {
-            EXPECT_EQ(POLLIN, poll_fds[i].revents);
-            ASSERT_EQ(8, read(fds[i], &ticks, sizeof(ticks)));
-            EXPECT_EQ(1u, ticks);
-        }
-        close(fds[i]);
+        errno = 0;
+        EXPECT_EQ(-1, read(fds[i].get(), &ticks, sizeof(ticks)));
+        EXPECT_EQ(EAGAIN, errno);
     }
 }
 

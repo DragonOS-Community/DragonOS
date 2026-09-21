@@ -9,6 +9,7 @@
 #include <netinet/in.h>
 #include <netdb.h>
 #include <fcntl.h>
+#include <linux/errqueue.h>
 #include <sys/syscall.h>
 #include <sys/socket.h>
 #include <sys/mman.h>
@@ -75,7 +76,101 @@ uint16_t LocalPort(int fd) {
     return ntohs(address.sin6_port);
 }
 
+void CheckOversizeErrqueue(int fd, const sockaddr* destination, socklen_t length,
+                          const sockaddr_in6* expected_error_address) {
+    std::vector<char> payload(65536, 'x');
+    errno = 0;
+    ASSERT_EQ(sendto(fd, payload.data(), payload.size(), 0, destination, length), -1);
+    ASSERT_EQ(errno, EMSGSIZE);
+
+    alignas(cmsghdr) char control[256] {};
+    sockaddr_in6 address {};
+    msghdr msg {};
+    msg.msg_name = &address;
+    msg.msg_namelen = sizeof(address);
+    msg.msg_control = control;
+    msg.msg_controllen = sizeof(control);
+    errno = 0;
+    const ssize_t result = recvmsg(fd, &msg, MSG_ERRQUEUE | MSG_DONTWAIT);
+    if (expected_error_address == nullptr) {
+        ASSERT_EQ(result, -1);
+        EXPECT_EQ(errno, EAGAIN);
+        return;
+    }
+    ASSERT_EQ(result, 0) << ErrnoString(errno);
+    EXPECT_NE(msg.msg_flags & MSG_ERRQUEUE, 0);
+    EXPECT_EQ(msg.msg_flags & MSG_CTRUNC, 0);
+    ASSERT_EQ(msg.msg_namelen, sizeof(address));
+    EXPECT_EQ(address.sin6_family, AF_INET6);
+    EXPECT_EQ(address.sin6_port, expected_error_address->sin6_port);
+    EXPECT_EQ(std::memcmp(&address.sin6_addr, &expected_error_address->sin6_addr,
+                          sizeof(in6_addr)), 0);
+    const cmsghdr* cmsg = CMSG_FIRSTHDR(&msg);
+    ASSERT_NE(cmsg, nullptr);
+    EXPECT_EQ(cmsg->cmsg_level, IPPROTO_IPV6);
+    EXPECT_EQ(cmsg->cmsg_type, IPV6_RECVERR);
+    ASSERT_GE(cmsg->cmsg_len, CMSG_LEN(sizeof(sock_extended_err)));
+    sock_extended_err error {};
+    std::memcpy(&error, CMSG_DATA(cmsg), sizeof(error));
+    EXPECT_EQ(error.ee_errno, static_cast<unsigned>(EMSGSIZE));
+    EXPECT_EQ(error.ee_origin, SO_EE_ORIGIN_LOCAL);
+    msg.msg_namelen = sizeof(address);
+    msg.msg_controllen = sizeof(control);
+    errno = 0;
+    EXPECT_EQ(recvmsg(fd, &msg, MSG_ERRQUEUE | MSG_DONTWAIT), -1);
+    EXPECT_EQ(errno, EAGAIN);
+}
+
 }  // namespace
+
+TEST(UdpIpv6SendSemantics, OversizeErrqueueUsesPacketFamily) {
+    // IPv4 socket, IPv6 socket with IPv4 sockaddr, mapped IPv6, native IPv6.
+    for (int mode = 0; mode < 4; ++mode) {
+        for (bool connected : {false, true}) {
+            for (int errors : {0, 1}) {
+                SCOPED_TRACE(testing::Message() << "mode=" << mode
+                             << " connected=" << connected << " recverr=" << errors);
+                FdGuard fd(socket(mode == 0 ? AF_INET : AF_INET6, SOCK_DGRAM, 0));
+                ASSERT_GE(fd.Get(), 0);
+                ASSERT_EQ(setsockopt(fd.Get(), mode == 0 ? IPPROTO_IP : IPPROTO_IPV6,
+                                    mode == 0 ? IP_RECVERR : IPV6_RECVERR,
+                                    &errors, sizeof(errors)), 0);
+                sockaddr_in ipv4 {};
+                ipv4.sin_family = AF_INET;
+                ipv4.sin_port = htons(12345);
+                ipv4.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+                sockaddr_in6 ipv6 = MakeIpv6Addr(mode == 3 ? "::1" : "::ffff:127.0.0.1", 12345);
+                const sockaddr* dest = mode < 2 ? reinterpret_cast<sockaddr*>(&ipv4)
+                                                : reinterpret_cast<sockaddr*>(&ipv6);
+                const socklen_t length = mode < 2 ? sizeof(ipv4) : sizeof(ipv6);
+                if (connected) {
+                    ASSERT_EQ(connect(fd.Get(), dest, length), 0);
+                }
+                ASSERT_NO_FATAL_FAILURE(CheckOversizeErrqueue(
+                    fd.Get(), connected ? nullptr : dest, connected ? 0 : length,
+                    mode == 3 && errors ? &ipv6 : nullptr));
+            }
+        }
+    }
+}
+
+TEST(UdpIpv6SendSemantics, OversizeSendtoErrqueueUsesExplicitDestination) {
+    for (bool native_destination : {false, true}) {
+        SCOPED_TRACE(native_destination);
+        FdGuard fd(socket(AF_INET6, SOCK_DGRAM, 0));
+        ASSERT_GE(fd.Get(), 0);
+        const int on = 1;
+        ASSERT_EQ(setsockopt(fd.Get(), IPPROTO_IPV6, IPV6_RECVERR, &on, sizeof(on)), 0);
+        // Connecting to a mapped peer can select an IPv4-only source, for which
+        // Linux rejects a native IPv6 override before checking its payload.
+        sockaddr_in6 peer = MakeIpv6Addr("::1", 12345);
+        sockaddr_in6 dest = MakeIpv6Addr(native_destination ? "::1" : "::ffff:127.0.0.1", 12346);
+        ASSERT_EQ(connect(fd.Get(), reinterpret_cast<sockaddr*>(&peer), sizeof(peer)), 0);
+        ASSERT_NO_FATAL_FAILURE(CheckOversizeErrqueue(
+            fd.Get(), reinterpret_cast<sockaddr*>(&dest), sizeof(dest),
+            native_destination ? &dest : nullptr));
+    }
+}
 
 TEST(UdpIpv6SendSemantics, DualStackNamesPreserveIpv6SocketFamily) {
     for (bool mapped : {false, true}) {

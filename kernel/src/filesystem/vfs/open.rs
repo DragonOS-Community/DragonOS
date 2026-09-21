@@ -636,12 +636,13 @@ pub fn do_utimensat(
         Some(path) => {
             let (inode_begin, path) =
                 user_path_at(&ProcessManager::current_pcb(), dirfd, path.as_str())?;
-            let inode = if flags.contains(UtimensFlags::AT_SYMLINK_NOFOLLOW) {
-                inode_begin.lookup(path.as_str())?
-            } else {
-                inode_begin.lookup_follow_symlink(path.as_str(), VFS_MAX_FOLLOW_SYMLINK_TIMES)?
-            };
-            inode
+            // AT_SYMLINK_NOFOLLOW applies only to the final component;
+            // intermediate directory symlinks must still be followed.
+            inode_begin.lookup_follow_symlink2(
+                path.as_str(),
+                VFS_MAX_FOLLOW_SYMLINK_TIMES,
+                !flags.contains(UtimensFlags::AT_SYMLINK_NOFOLLOW),
+            )?
         }
         None => {
             // Linux-specific extension: pathname == NULL means operate on the

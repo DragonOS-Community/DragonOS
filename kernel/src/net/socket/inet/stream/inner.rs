@@ -878,20 +878,6 @@ impl Listening {
         Self::grow_slots(&mut self.inners, target, self.listen_addr, self.domain)?;
         self.slots_per_iface = target;
         self.trim_excess();
-        for (index, bound) in self.inners.iter().enumerate() {
-            if self.inners[..index]
-                .iter()
-                .any(|other| Arc::ptr_eq(other.iface(), bound.iface()))
-            {
-                continue;
-            }
-            bound.iface().common().register_tcp_listen_port(
-                self.reservation.as_ref().unwrap().id,
-                self.domain,
-                self.local.port,
-                backlog,
-            );
-        }
         Ok(())
     }
 

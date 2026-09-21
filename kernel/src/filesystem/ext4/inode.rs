@@ -28,7 +28,7 @@ use crate::{
         spinlock::SpinLock,
         wait_queue::WaitQueue,
     },
-    mm::MemoryManagementArch,
+    mm::{fault::FaultRetryWait, MemoryManagementArch},
     process::{ProcessManager, RawPid},
     time::{PosixTimeSpec, TimeArch},
 };
@@ -276,6 +276,18 @@ impl Drop for Ext4MappingMutationGuard<'_> {
 pub(super) struct Ext4MmapWriteGuard<'a> {
     _operation: Ext4InodeOperation,
     _size_guard: RwSemReadGuard<'a, ()>,
+    pub(super) file_size: usize,
+}
+
+#[derive(Debug)]
+struct Ext4MmapWriteRetryWait {
+    inode: Arc<LockedExt4Inode>,
+}
+
+impl FaultRetryWait for Ext4MmapWriteRetryWait {
+    fn wait(&self) -> Result<(), SystemError> {
+        self.inode.wait_for_mmap_write()
+    }
 }
 
 pub(super) struct ProductionDelallocAdmissionGuard<'a> {
@@ -5393,18 +5405,34 @@ impl LockedExt4Inode {
     /// This is the ext4 counterpart of Linux `ext4_page_mkwrite()`: page-cache
     /// dirtying alone is insufficient for a sparse page because writeback uses
     /// `write_data_only()` and therefore requires the backing block to exist.
-    pub(super) fn prepare_mmap_write(
+    pub(super) fn try_prepare_mmap_write(
         &self,
         page_index: usize,
     ) -> Result<Ext4MmapWriteGuard<'_>, SystemError> {
         let operation = self.begin_operation()?;
-        let _delalloc_admission = self.close_production_delalloc_admission()?;
-        self.drain_delalloc_before_eager()?;
-        let size_guard = self.size_lock.read();
-        let io_guard = self.io_lock.lock();
-        let _metadata_commit = self.metadata_commit_lock.lock();
+        // Faults hold AddressSpace::write(). Writeback can hold these inode
+        // locks while mkclean_page() acquires AddressSpace::read(), so neither
+        // lock contention nor delayed-allocation draining may sleep here.
+        let size_guard = self
+            .size_lock
+            .try_read()
+            .ok_or(SystemError::EAGAIN_OR_EWOULDBLOCK)?;
+        let io_guard = self
+            .io_lock
+            .try_lock()
+            .map_err(|_| SystemError::EAGAIN_OR_EWOULDBLOCK)?;
+        let _metadata_commit = self
+            .metadata_commit_lock
+            .try_lock()
+            .map_err(|_| SystemError::EAGAIN_OR_EWOULDBLOCK)?;
         let (fs, inode_num, file_size) = {
             let mut guard = self.inner.lock();
+            // Production publishers also hold io_lock. Keep the empty check
+            // and extent preparation in that same critical section. Do not
+            // create an admission guard here: its Drop reacquires io_lock.
+            if guard.delalloc.production.head().is_some() {
+                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+            }
             let fs = guard.concret_fs();
             let file_size = match guard.cached_file_size {
                 Some(size) => size,
@@ -5467,7 +5495,37 @@ impl LockedExt4Inode {
         Ok(Ext4MmapWriteGuard {
             _operation: operation,
             _size_guard: size_guard,
+            file_size: file_size as usize,
         })
+    }
+
+    pub(super) fn mmap_write_retry_wait(&self) -> Result<Arc<dyn FaultRetryWait>, SystemError> {
+        // The file may own a MountFS wrapper; retain the underlying ext4 inode
+        // through its own weak self reference rather than downcasting that Arc.
+        let inode = self
+            .inner
+            .lock()
+            .self_ref
+            .upgrade()
+            .ok_or(SystemError::ENOENT)?;
+        Ok(Arc::new(Ext4MmapWriteRetryWait { inode }))
+    }
+
+    /// Called only after the fault consumer has released its MM guard. A
+    /// successful wait permits a retry; it does not certify an old VMA/page.
+    fn wait_for_mmap_write(&self) -> Result<(), SystemError> {
+        let _operation = self.begin_operation()?;
+        let _admission = self.close_production_delalloc_admission()?;
+        self.drain_delalloc_before_eager()?;
+        {
+            // Wait for the competing inode operation without retaining any
+            // of its locks across MM reacquisition. Release io_lock before
+            // _admission's Drop, which acquires it again.
+            let _size = self.size_lock.read();
+            let _io = self.io_lock.lock();
+            let _metadata_commit = self.metadata_commit_lock.lock();
+        }
+        Ok(())
     }
 }
 

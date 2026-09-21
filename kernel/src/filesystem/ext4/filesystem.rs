@@ -403,10 +403,18 @@ impl FileSystem for Ext4FileSystem {
         let Some(inode) = inode_ref.as_any_ref().downcast_ref::<LockedExt4Inode>() else {
             return VmFaultReason::VM_FAULT_SIGBUS;
         };
-        let Ok(_prepare_guard) = inode.prepare_mmap_write(page_index) else {
-            return VmFaultReason::VM_FAULT_SIGBUS;
+        let prepare_guard = match inode.try_prepare_mmap_write(page_index) {
+            Ok(guard) => guard,
+            Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
+                let Ok(wait) = inode.mmap_write_retry_wait() else {
+                    return VmFaultReason::VM_FAULT_SIGBUS;
+                };
+                pfm.set_retry_wait(wait);
+                return VmFaultReason::VM_FAULT_RETRY;
+            }
+            Err(_) => return VmFaultReason::VM_FAULT_SIGBUS,
         };
-        PageFaultHandler::filemap_page_mkwrite(pfm)
+        PageFaultHandler::filemap_page_mkwrite_with_stable_size(pfm, prepare_guard.file_size)
     }
 
     unsafe fn map_pages(

@@ -145,3 +145,4 @@ normal/slab_memory_accounting
 normal/procfs_task_semantics
 normal/timeval_abi
 normal/posix_timer_relative
+normal/alarm_zero

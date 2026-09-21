@@ -267,6 +267,9 @@ fn do_execve_internal(
             #[cfg(target_arch = "x86_64")]
             crate::mm::ucontext::uprobe::uprobe_registry_task_exec(&pcb, old_vm.as_ref());
             // The uprobe must first detach from the old mm before releasing the last user reference to that mm.
+            if let Some(old_vm) = old_vm.as_ref() {
+                pcb.preserve_maxrss(old_vm);
+            }
             ProcessManager::release_old_user_vm_if_last(old_vm.as_ref());
             if let Some(completion) = pcb.thread.write_irqsave().vfork_done.take() {
                 completion.complete_all();

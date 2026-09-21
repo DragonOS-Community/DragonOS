@@ -4,6 +4,11 @@ use system_error::SystemError;
 use alloc::sync::Arc;
 use core::{ffi::c_long, sync::atomic::Ordering};
 
+use crate::{
+    arch::MMArch,
+    mm::{ucontext::AddressSpace, MemoryManagementArch},
+};
+
 use super::{ProcessControlBlock, ProcessManager};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -275,6 +280,10 @@ impl ProcessControlBlock {
     /// Preserve signal_struct-like group statistics across a non-leader exec
     /// leader handoff. All other group members are quiesced before this runs.
     pub(crate) fn inherit_thread_group_rusage_from(&self, old_leader: &ProcessControlBlock) {
+        self.historical_maxrss_pages.fetch_max(
+            old_leader.historical_maxrss_pages.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
         let exited = *old_leader.exited_thread_group_rusage.lock();
         self.exited_thread_group_rusage
             .lock()
@@ -284,23 +293,43 @@ impl ProcessControlBlock {
         self.children_rusage.lock().add_assign_saturating(&children);
     }
 
+    /// Preserve the old mm's peak before exec/exit drops its user reference.
+    pub(crate) fn preserve_maxrss(&self, mm: &AddressSpace) {
+        self.leader_for_rusage()
+            .historical_maxrss_pages
+            .fetch_max(mm.peak_resident_pages(), Ordering::Relaxed);
+    }
+
+    /// RSS is shared even for RUSAGE_THREAD; do not sum it across tasks.
+    fn maxrss_kib(&self) -> usize {
+        let leader = self.leader_for_rusage();
+        let history = leader.historical_maxrss_pages.load(Ordering::Relaxed);
+        let mm = self.basic().user_vm();
+        let pages = mm
+            .as_ref()
+            .map_or(history, |mm| history.max(mm.peak_resident_pages()));
+        pages.saturating_mul(MMArch::PAGE_SIZE / 1024)
+    }
+
     /// 获取进程资源使用情况
     pub fn get_rusage(&self, who: RUsageWho) -> Option<RUsage> {
-        match who {
-            RUsageWho::RUsageSelf => Some(self.thread_group_rusage()),
+        let mut usage = match who {
+            RUsageWho::RUsageSelf => self.thread_group_rusage(),
             RUsageWho::RUsageBoth => {
                 let mut rusage = self.thread_group_rusage();
                 let leader = self.leader_for_rusage();
                 let children = *leader.children_rusage.lock();
                 rusage.add_assign_saturating(&children);
-                Some(rusage)
+                rusage
             }
-            RUsageWho::RusageThread => Some(self.task_rusage()),
+            RUsageWho::RusageThread => self.task_rusage(),
             RUsageWho::RUsageChildren => {
                 let leader = self.leader_for_rusage();
                 let rusage = *leader.children_rusage.lock();
-                Some(rusage)
+                return Some(rusage);
             }
-        }
+        };
+        usage.ru_maxrss = usage.ru_maxrss.max(self.maxrss_kib());
+        Some(usage)
     }
 }

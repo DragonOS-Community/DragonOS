@@ -3,6 +3,7 @@
 #endif
 
 #include <errno.h>
+#include <algorithm>
 #include <fcntl.h>
 #include <new>
 #include <memory>
@@ -15,6 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/prctl.h>
+#include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
@@ -2012,6 +2014,7 @@ TEST(WaitRusage, ExplicitSigignSigchldAutoreapsWithoutChildRusage) {
   struct rusage after {};
   ASSERT_EQ(0, getrusage(RUSAGE_CHILDREN, &after)) << strerror(errno);
   EXPECT_EQ(RusageCpuUsec(before), RusageCpuUsec(after));
+  EXPECT_EQ(before.ru_maxrss, after.ru_maxrss);
 
   ASSERT_EQ(0, sigaction(SIGCHLD, &old_action, nullptr)) << strerror(errno);
 }
@@ -2040,6 +2043,8 @@ TEST(WaitRusage, WNowaitDoesNotReapAndWait4AccountsChildUsage) {
   struct rusage after_nowait {};
   ASSERT_EQ(0, getrusage(RUSAGE_CHILDREN, &after_nowait)) << strerror(errno);
   EXPECT_EQ(RusageCpuUsec(before), RusageCpuUsec(after_nowait));
+  EXPECT_EQ(before.ru_maxrss, after_nowait.ru_maxrss);
+  EXPECT_GT(nowait_usage.ru_maxrss, 0);
 
   int status = 0;
   struct rusage waited_usage {};
@@ -2052,6 +2057,8 @@ TEST(WaitRusage, WNowaitDoesNotReapAndWait4AccountsChildUsage) {
   ASSERT_EQ(0, getrusage(RUSAGE_CHILDREN, &after_wait)) << strerror(errno);
   EXPECT_GE(RusageCpuUsec(after_wait) - RusageCpuUsec(before),
             RusageCpuUsec(waited_usage));
+  EXPECT_EQ(std::max(before.ru_maxrss, waited_usage.ru_maxrss),
+            after_wait.ru_maxrss);
 
   errno = 0;
   EXPECT_EQ(-1, wait4(child, nullptr, WNOHANG, nullptr));
@@ -2081,7 +2088,192 @@ TEST(WaitRusage, Wait4IncludesExitedThreadCpuTime) {
   EXPECT_GE(RusageCpuUsec(usage), 100000u);
 }
 
+namespace {
+
+constexpr size_t kRssBytes = 64 * 1024 * 1024;
+// Linux may batch RSS accounting; do not assert an exact anonymous-page count.
+constexpr long kRssToleranceKb = 4 * 1024;
+constexpr long kRssMinimumKb = kRssBytes / 1024 - kRssToleranceKb;
+
+void* TouchRss(size_t bytes) {
+  const long page_size = sysconf(_SC_PAGESIZE);
+  if (page_size <= 0) return MAP_FAILED;
+  void* mapping = mmap(nullptr, bytes, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (mapping == MAP_FAILED) return mapping;
+  volatile char* pages = static_cast<volatile char*>(mapping);
+  for (size_t offset = 0; offset < bytes; offset += page_size) pages[offset] = 1;
+  return mapping;
+}
+
+void ExpectRssChild(pid_t child) {
+  ASSERT_GT(child, 0) << strerror(errno);
+  int status = 0;
+  ASSERT_EQ(child, waitpid(child, &status, 0)) << strerror(errno);
+  ASSERT_TRUE(WIFEXITED(status)) << status;
+  EXPECT_EQ(0, WEXITSTATUS(status));
+}
+
+void ExecRssProbe(const char* mode) {
+  execl("/proc/self/exe", "wait_rusage_test", mode,
+        static_cast<char*>(nullptr));
+  _exit(90);
+}
+
+void* ThreadExecRssProbe(void*) {
+  ExecRssProbe("--maxrss-probe");
+  return nullptr;
+}
+
+struct ThreadRssResult {
+  long self = 0;
+  long thread = 0;
+  int error = 0;
+};
+
+void* ReadThreadRss(void* argument) {
+  auto* result = static_cast<ThreadRssResult*>(argument);
+  struct rusage self {}, thread {};
+  if (getrusage(RUSAGE_SELF, &self) != 0 ||
+      getrusage(RUSAGE_THREAD, &thread) != 0) {
+    result->error = 1;
+    return nullptr;
+  }
+  result->self = self.ru_maxrss;
+  result->thread = thread.ru_maxrss;
+  return nullptr;
+}
+
+void RunRssExecTest(const char* mode) {
+  const pid_t child = fork();
+  if (child == 0) {
+    if (TouchRss(kRssBytes) == MAP_FAILED) _exit(10);
+    // No query before exec: preserving the old mm cannot depend on getrusage.
+    ExecRssProbe(mode);
+  }
+  ExpectRssChild(child);
+}
+
+}  // namespace
+
+TEST(WaitRusage, MaxRssRetainsUnobservedPeakAfterMunmap) {
+  const pid_t child = fork();
+  if (child == 0) {
+    void* mapping = TouchRss(kRssBytes);
+    if (mapping == MAP_FAILED) _exit(10);
+    // Intentionally do not sample while the allocation is still resident.
+    if (munmap(mapping, kRssBytes) != 0) _exit(11);
+    struct rusage usage {};
+    if (getrusage(RUSAGE_SELF, &usage) != 0) _exit(12);
+    _exit(usage.ru_maxrss >= kRssMinimumKb ? 0 : 13);
+  }
+  ExpectRssChild(child);
+}
+
+TEST(WaitRusage, MaxRssIsSharedByThreads) {
+  const pid_t child = fork();
+  if (child == 0) {
+    void* mapping = TouchRss(kRssBytes);
+    if (mapping == MAP_FAILED) _exit(10);
+    ThreadRssResult result;
+    pthread_t worker {};
+    if (pthread_create(&worker, nullptr, ReadThreadRss, &result) != 0) _exit(11);
+    if (pthread_join(worker, nullptr) != 0) _exit(12);
+    if (result.error || result.self < kRssMinimumKb ||
+        result.thread < kRssMinimumKb ||
+        labs(result.self - result.thread) > kRssToleranceKb) _exit(13);
+    if (munmap(mapping, kRssBytes) != 0) _exit(14);
+    struct rusage after {};
+    if (getrusage(RUSAGE_SELF, &after) != 0 ||
+        after.ru_maxrss < result.self) _exit(15);
+    _exit(0);
+  }
+  ExpectRssChild(child);
+}
+
+TEST(WaitRusage, MaxRssForkDoesNotInheritReleasedPeak) {
+  const pid_t child = fork();
+  if (child == 0) {
+    void* mapping = TouchRss(kRssBytes);
+    if (mapping == MAP_FAILED || munmap(mapping, kRssBytes) != 0) _exit(10);
+    struct rusage parent {};
+    if (getrusage(RUSAGE_SELF, &parent) != 0 ||
+        parent.ru_maxrss < kRssMinimumKb) _exit(11);
+    const pid_t grandchild = fork();
+    if (grandchild == 0) {
+      struct rusage fresh {};
+      if (getrusage(RUSAGE_SELF, &fresh) != 0) _exit(12);
+      _exit(fresh.ru_maxrss + 32 * 1024 < parent.ru_maxrss ? 0 : 13);
+    }
+    int status = 0;
+    if (grandchild < 0 || waitpid(grandchild, &status, 0) != grandchild ||
+        !WIFEXITED(status)) _exit(14);
+    _exit(WEXITSTATUS(status));
+  }
+  ExpectRssChild(child);
+}
+
+TEST(WaitRusage, MaxRssSurvivesExec) {
+  RunRssExecTest("--maxrss-probe");
+}
+
+TEST(WaitRusage, MaxRssSurvivesNonLeaderExecHandoff) {
+  // First exec removes the large mm. The subsequent worker exec must transfer
+  // the old leader's saved history, not merely sample the small current mm.
+  RunRssExecTest("--maxrss-thread-exec");
+}
+
+TEST(WaitRusage, MaxRssChildrenUsesMaximumIncludingGrandchildren) {
+  const pid_t supervisor = fork();
+  if (supervisor == 0) {
+    struct rusage children {};
+    if (getrusage(RUSAGE_CHILDREN, &children) != 0 ||
+        children.ru_maxrss != 0) _exit(10);
+    for (int iteration = 0; iteration < 2; ++iteration) {
+      const pid_t child = fork();
+      if (child == 0) {
+        if (iteration == 0) {
+          const pid_t grandchild = fork();
+          if (grandchild == 0) {
+            if (TouchRss(kRssBytes) == MAP_FAILED) _exit(11);
+            _exit(0);  // No query: exit must preserve this peak.
+          }
+          int status = 0;
+          if (grandchild < 0 || waitpid(grandchild, &status, 0) != grandchild ||
+              !WIFEXITED(status) || WEXITSTATUS(status) != 0) _exit(12);
+        } else if (TouchRss(kRssBytes / 2) == MAP_FAILED) {
+          _exit(13);
+        }
+        _exit(0);
+      }
+      int status = 0;
+      struct rusage waited {}, after {};
+      if (child < 0 || wait4(child, &status, 0, &waited) != child ||
+          !WIFEXITED(status) || WEXITSTATUS(status) != 0) _exit(14);
+      if (iteration == 0 && waited.ru_maxrss < kRssMinimumKb) _exit(15);
+      if (getrusage(RUSAGE_CHILDREN, &after) != 0 ||
+          after.ru_maxrss != std::max(children.ru_maxrss, waited.ru_maxrss))
+        _exit(16);
+      children = after;
+    }
+    _exit(0);
+  }
+  ExpectRssChild(supervisor);
+}
+
 int main(int argc, char** argv) {
+  if (argc == 2 && strcmp(argv[1], "--maxrss-probe") == 0) {
+    struct rusage usage {};
+    return getrusage(RUSAGE_SELF, &usage) == 0 &&
+                   usage.ru_maxrss >= kRssMinimumKb ? 0 : 91;
+  }
+  if (argc == 2 && strcmp(argv[1], "--maxrss-thread-exec") == 0) {
+    pthread_t worker {};
+    if (pthread_create(&worker, nullptr, ThreadExecRssProbe, nullptr) != 0)
+      return 92;
+    pthread_join(worker, nullptr);
+    return 93;  // Successful exec never returns to either old thread.
+  }
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
 }

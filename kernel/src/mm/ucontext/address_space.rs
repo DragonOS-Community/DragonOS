@@ -63,6 +63,8 @@ pub struct AddressSpace {
     page_table_edit_lock: Mutex<()>,
     /// Per-mm resident user pages, counted by present user PTEs.
     resident_user_pages: AtomicUsize,
+    /// Peak resident user pages over this address space's lifetime.
+    peak_resident_user_pages: AtomicUsize,
     /// Monotonic OOM reclaim progress generation.
     ///
     /// This is advanced only after unmapped pages have passed the required TLB
@@ -360,6 +362,7 @@ impl AddressSpace {
             tlb_gen: AtomicU64::new(0),
             page_table_edit_lock: Mutex::new(()),
             resident_user_pages: AtomicUsize::new(0),
+            peak_resident_user_pages: AtomicUsize::new(0),
             oom_reclaim_generation: AtomicU64::new(0),
             torn_down: AtomicBool::new(false),
             // Baseline 1 stands for the first task installing this space (exec'd table or deep-copied child).
@@ -690,6 +693,15 @@ impl AddressSpace {
         self.resident_user_pages.load(Ordering::Relaxed)
     }
 
+    /// Like Linux get_mm_hiwater_rss(), include the current count while an
+    /// accounting update may still be publishing its high-water mark.
+    #[inline]
+    pub fn peak_resident_pages(&self) -> usize {
+        self.peak_resident_user_pages
+            .load(Ordering::Relaxed)
+            .max(self.resident_pages())
+    }
+
     #[inline(always)]
     pub fn oom_reclaim_generation(&self) -> u64 {
         self.oom_reclaim_generation.load(Ordering::Acquire)
@@ -708,7 +720,11 @@ impl AddressSpace {
     #[inline(always)]
     pub fn account_present_pages_add(&self, count: usize) {
         if count != 0 {
-            self.resident_user_pages.fetch_add(count, Ordering::Relaxed);
+            let resident = self.resident_user_pages.fetch_add(count, Ordering::Relaxed) + count;
+            // Use this increment's result: a concurrent unmap must not hide
+            // the peak before we record it.
+            self.peak_resident_user_pages
+                .fetch_max(resident, Ordering::Relaxed);
         }
     }
 

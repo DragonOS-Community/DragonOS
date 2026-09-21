@@ -1283,6 +1283,73 @@ TEST(Ext4InodeIdentity, RelatimeSkipsRecentAtimeNewerThanMtimeAndCtime) {
     ASSERT_NO_FATAL_FAILURE(fs.Unmount());
 }
 
+void RunBufferedDirtySharedWritePersists(bool read_before_write) {
+    constexpr size_t kPageSize = 4096;
+    constexpr size_t kPageCount = 8;
+    constexpr size_t kLength = kPageSize * kPageCount;
+    constexpr size_t kMappedOffset = 64;
+
+    LoopExt4 fs;
+    ASSERT_NO_FATAL_FAILURE(fs.SetUp());
+    ASSERT_NO_FATAL_FAILURE(fs.Mount());
+
+    const std::string path = fs.mount_point() + "/buffered_dirty_shared";
+    int fd = open(path.c_str(), O_CREAT | O_EXCL | O_RDWR, 0600);
+    ASSERT_GE(fd, 0) << strerror(errno);
+    ASSERT_EQ(0, ftruncate(fd, 3)) << strerror(errno);
+    std::vector<char> expected(kLength, 0);
+    for (size_t page = 0; page < kPageCount; ++page) {
+        const size_t offset = (page + 1) * kPageSize - 1;
+        expected[offset] = static_cast<char>('A' + page);
+        ASSERT_EQ(1, pwrite(fd, &expected[offset], 1, offset)) << strerror(errno);
+    }
+
+    // Do not fsync before the first mmap store: pending buffered writes are
+    // the prerequisite for the ext4 page_mkwrite/writeback lock regression.
+    void* mapping = mmap(nullptr, kLength, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    ASSERT_NE(MAP_FAILED, mapping) << strerror(errno);
+    auto* bytes = static_cast<volatile char*>(mapping);
+    for (size_t page = 0; page < kPageCount; ++page) {
+        const size_t offset = page * kPageSize + kMappedOffset;
+        if (read_before_write) {
+            // Install a read-only PTE before taking the write-protect fault.
+            const char observed = bytes[offset];
+            EXPECT_EQ(0, observed);
+        }
+        const char value = static_cast<char>('a' + page);
+        bytes[offset] = value;
+        expected[offset] = value;
+    }
+
+    ASSERT_EQ(0, msync(mapping, kLength, MS_SYNC)) << strerror(errno);
+    ASSERT_EQ(0, fsync(fd)) << strerror(errno);
+    ASSERT_EQ(0, munmap(mapping, kLength)) << strerror(errno);
+    ASSERT_EQ(0, close(fd)) << strerror(errno);
+    ASSERT_NO_FATAL_FAILURE(fs.Unmount());
+    ASSERT_NO_FATAL_FAILURE(fs.Mount());
+
+    // Reopening after remount must recover both the original buffered bytes
+    // and the mmap stores from the backing filesystem, not a live page cache.
+    fd = open(path.c_str(), O_RDONLY);
+    ASSERT_GE(fd, 0) << strerror(errno);
+    std::vector<char> observed(kLength);
+    const ssize_t count = pread(fd, observed.data(), observed.size(), 0);
+    const int read_error = errno;
+    EXPECT_EQ(0, close(fd)) << strerror(errno);
+    EXPECT_EQ(static_cast<ssize_t>(kLength), count) << strerror(read_error);
+    EXPECT_EQ(expected, observed);
+    ASSERT_EQ(0, unlink(path.c_str())) << strerror(errno);
+    ASSERT_NO_FATAL_FAILURE(fs.Unmount());
+}
+
+TEST(Ext4InodeIdentity, BufferedDirtySharedDirectWritePersists) {
+    ASSERT_NO_FATAL_FAILURE(RunBufferedDirtySharedWritePersists(false));
+}
+
+TEST(Ext4InodeIdentity, BufferedDirtySharedReadThenWritePersists) {
+    ASSERT_NO_FATAL_FAILURE(RunBufferedDirtySharedWritePersists(true));
+}
+
 TEST(Ext4InodeIdentity, DirtySharedMappingSurvivesUnlinkAndFdClose) {
     LoopExt4 fs;
     ASSERT_NO_FATAL_FAILURE(fs.SetUp());

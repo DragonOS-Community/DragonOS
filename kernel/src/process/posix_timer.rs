@@ -1,7 +1,7 @@
 //! POSIX interval timers (timer_create/timer_settime/...) for a process.
 //!
-//! This is a minimal-but-correct implementation for gVisor `timers.cc` tests:
-//! - CLOCK_MONOTONIC based timers
+//! Currently supported:
+//! - Relative CLOCK_REALTIME / CLOCK_MONOTONIC timers (no TIMER_ABSTIME)
 //! - SIGEV_NONE / SIGEV_SIGNAL / SIGEV_THREAD / SIGEV_THREAD_ID
 //! - coalescing: at most one pending signal per (signo,timerid); overruns accumulate
 
@@ -125,8 +125,10 @@ impl ProcessPosixTimers {
         clockid: PosixClockID,
         sev: Option<PosixSigevent>,
     ) -> Result<i32, SystemError> {
-        // gVisor tests only use CLOCK_MONOTONIC.
-        if clockid != PosixClockID::Monotonic {
+        // Like Linux, relative CLOCK_REALTIME timers use monotonic elapsed time
+        // so wall-clock changes do not affect their deadlines. Keep the original
+        // clock ID; timer_settime currently rejects absolute-mode flags.
+        if !matches!(clockid, PosixClockID::Realtime | PosixClockID::Monotonic) {
             return Err(SystemError::EINVAL);
         }
 

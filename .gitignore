@@ -33,3 +33,9 @@ __pycache__/
 *.cpio.xz
 *.cpio*
 .direnv/
+
+# worktrees
+*worktree*/
+
+# Claude Code agent worktrees (local isolation dirs, never for VCS)
+.claude/worktrees/

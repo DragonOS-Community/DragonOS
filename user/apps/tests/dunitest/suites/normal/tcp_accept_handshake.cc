@@ -140,7 +140,13 @@ class TcpAcceptHandshake : public testing::Test {
             pollfd event{packet_.get(), POLLIN, 0};
             ASSERT_GE(poll(&event, 1, 100), 0);
             unsigned char packet[2048];
-            ssize_t size = recv(packet_.get(), packet, sizeof(packet), 0);
+            sockaddr_ll source{};
+            socklen_t source_length = sizeof(source);
+            ssize_t size = recvfrom(packet_.get(), packet, sizeof(packet), 0,
+                                    reinterpret_cast<sockaddr*>(&source), &source_length);
+            // Observe the reply entering the peer, not an incidental outgoing
+            // copy produced if this synthetic destination is routed again.
+            if (size >= 0 && source.sll_pkttype != PACKET_HOST) continue;
             if (size < 54 || packet[12] != 8 || packet[13] != 0) continue;
             auto* ip = packet + 14;
             const size_t header = (ip[0] & 15) * 4;

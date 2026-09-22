@@ -205,6 +205,12 @@ impl VethDriver {
         let Some(iface) = self.inner.lock().self_iface_ref.upgrade() else {
             return IngressDisposition::Local;
         };
+        // Like Linux's ptype_all taps, packet sockets observe ingress before
+        // bridge/routing can consume it, not only frames delivered locally.
+        let packet_iface: Arc<dyn Iface> = iface.clone();
+        let pkt_type = crate::net::socket::packet::classify_packet(data, &packet_iface);
+        crate::net::socket::packet::deliver_to_packet_sockets(&packet_iface, data, pkt_type);
+
         if let Some(bridge_data) = iface.common_bridge_data() {
             Veth::to_bridge(&bridge_data, data);
             return IngressDisposition::Consumed;
@@ -329,7 +335,6 @@ impl phy::TxToken for VethTxToken {
 
 pub struct VethRxToken {
     buffer: Vec<u8>,
-    driver: VethDriver,
 }
 
 impl RxToken for VethRxToken {
@@ -337,15 +342,7 @@ impl RxToken for VethRxToken {
     where
         F: FnOnce(&[u8]) -> R,
     {
-        let packet = self.buffer.as_slice();
-
-        // 向注册的 packet socket 分发数据包
-        if let Some(iface) = self.driver.iface() {
-            let pkt_type = crate::net::socket::packet::classify_packet(packet, &iface);
-            crate::net::socket::packet::deliver_to_packet_sockets(&iface, packet, pkt_type);
-        }
-
-        f(packet)
+        f(self.buffer.as_slice())
     }
 }
 
@@ -368,10 +365,7 @@ impl phy::Device for VethDriver {
         guard.recv_local().map(|buf| {
             // log::info!("VethDriver received data: {:?}", buf);
             (
-                VethRxToken {
-                    buffer: buf,
-                    driver: self.clone(),
-                },
+                VethRxToken { buffer: buf },
                 VethTxToken {
                     driver: self.clone(),
                 },

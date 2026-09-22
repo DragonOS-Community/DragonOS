@@ -7,7 +7,7 @@ use crate::filesystem::epoll::EPollEventType;
 use crate::libs::rwsem::RwSem;
 use crate::net::socket::{
     self,
-    inet::common::port::{PortManager, TcpBindDomain, TcpPortReservation},
+    inet::common::port::{TcpBindDomain, TcpPortOwner, TcpPortReservation},
 };
 use crate::process::namespace::net_namespace::NetNamespace;
 use alloc::boxed::Box;
@@ -48,7 +48,13 @@ fn new_smoltcp_socket_with_size(
 ) -> smoltcp::socket::tcp::Socket<'static> {
     let rx_buffer = smoltcp::socket::tcp::SocketBuffer::new(vec![0; rx_size]);
     let tx_buffer = smoltcp::socket::tcp::SocketBuffer::new(vec![0; tx_size]);
-    smoltcp::socket::tcp::Socket::new(rx_buffer, tx_buffer)
+    let mut socket = smoltcp::socket::tcp::Socket::new(rx_buffer, tx_buffer);
+    socket.set_time_wait_duration(smoltcp::time::Duration::from_secs(60));
+    socket.set_tsval_generator(Some(|| {
+        let now: smoltcp::time::Instant = crate::time::Instant::now().into();
+        now.total_millis() as u32
+    }));
+    socket
 }
 
 fn new_smoltcp_socket() -> smoltcp::socket::tcp::Socket<'static> {
@@ -59,6 +65,7 @@ fn new_listen_smoltcp_socket<T>(
     local_endpoint: T,
     ip_version: Option<smoltcp::wire::IpVersion>,
     device: Option<NonZeroU32>,
+    reservation: &TcpPortReservation,
 ) -> Result<smoltcp::socket::tcp::Socket<'static>, SystemError>
 where
     T: Into<smoltcp::wire::IpListenEndpoint>,
@@ -66,6 +73,9 @@ where
     let mut socket = new_smoltcp_socket();
     socket.set_listen_ip_version(ip_version);
     socket.set_listen_bound_device(device);
+    socket.set_lifecycle_observer(Some(reservation.prepare_child(Arc::new(
+        SocketDeviceBinding::from_ifindex(device.map_or(0, NonZeroU32::get) as usize),
+    ))?));
     socket.listen(local_endpoint).map_err(|e| match e {
         tcp::ListenError::InvalidState => SystemError::EINVAL, // TODO: Check is right impl
         tcp::ListenError::Unaddressable => SystemError::EADDRINUSE,
@@ -132,6 +142,7 @@ impl Init {
         netns: Arc<NetNamespace>,
         v6_only: bool,
         device_binding: Arc<SocketDeviceBinding>,
+        owner: &TcpPortOwner,
     ) -> Result<Self, (Self, SystemError)> {
         match self {
             Init::Unbound((mut socket, ver)) => {
@@ -147,11 +158,10 @@ impl Init {
                     }
                 };
 
-                let reservation = match PortManager::reserve(
-                    netns,
+                let reservation = match owner.reserve(
                     TcpBindDomain::new(local_endpoint.addr, v6_only),
                     local_endpoint.port,
-                    device_binding,
+                    netns.local_port_range(),
                 ) {
                     Ok(reservation) => reservation,
                     Err(err) => {
@@ -179,6 +189,7 @@ impl Init {
         remote_endpoint: smoltcp::wire::IpEndpoint,
         netns: Arc<NetNamespace>,
         device_binding: Arc<SocketDeviceBinding>,
+        owner: &TcpPortOwner,
     ) -> Result<
         (
             socket::inet::BoundInner,
@@ -206,11 +217,10 @@ impl Init {
                             return Err((Self::Unbound((Box::new(socket), ver)), err))
                         }
                     };
-                let reservation = match PortManager::reserve(
-                    netns,
+                let reservation = match owner.reserve_connect(
                     TcpBindDomain::new(address, false),
-                    0,
-                    device_binding,
+                    remote_endpoint,
+                    netns.local_port_range(),
                 ) {
                     Ok(reservation) => reservation,
                     Err(err) => {
@@ -233,12 +243,61 @@ impl Init {
         netns: Arc<NetNamespace>,
         wrapper: Weak<dyn socket::inet::InetSocket>,
         ver: smoltcp::wire::IpVersion,
-        device_binding: Arc<SocketDeviceBinding>,
+        owner: &TcpPortOwner,
     ) -> Result<Connecting, (Self, SystemError)> {
-        let (mut inner, mut local, mut reservation) = match self {
-            Init::Unbound(_) => {
-                self.bind_to_ephemeral(remote_endpoint, netns.clone(), device_binding.clone())?
+        let automatic = matches!(self, Init::Unbound(_));
+        let (low, high) = netns.local_port_range();
+        let attempts = if automatic {
+            usize::from(high - low) + 1
+        } else {
+            1
+        };
+        let mut pending = self;
+        for _ in 0..attempts {
+            match pending.connect_once(
+                remote_endpoint,
+                netns.clone(),
+                wrapper.clone(),
+                ver,
+                owner,
+                automatic,
+            ) {
+                Err((Init::Bound((inner, _, reservation)), SystemError::EADDRNOTAVAIL))
+                    if automatic =>
+                {
+                    // A candidate may collide with a protected TIME_WAIT after
+                    // reservation. Retry the next ephemeral port without
+                    // changing an explicit user binding or bypassing protection.
+                    let smoltcp::socket::Socket::Tcp(mut socket) = inner.into_socket() else {
+                        unreachable!("TCP connection candidate");
+                    };
+                    socket.set_lifecycle_observer(None);
+                    drop(reservation);
+                    pending = Init::Unbound((Box::new(socket), ver));
+                }
+                result => return result,
             }
+        }
+        Err((pending, SystemError::EADDRNOTAVAIL))
+    }
+
+    fn connect_once(
+        self,
+        remote_endpoint: smoltcp::wire::IpEndpoint,
+        netns: Arc<NetNamespace>,
+        wrapper: Weak<dyn socket::inet::InetSocket>,
+        ver: smoltcp::wire::IpVersion,
+        owner: &TcpPortOwner,
+        automatic: bool,
+    ) -> Result<Connecting, (Self, SystemError)> {
+        let device_binding = owner.device_binding();
+        let (mut inner, mut local, mut reservation) = match self {
+            Init::Unbound(_) => self.bind_to_ephemeral(
+                remote_endpoint,
+                netns.clone(),
+                device_binding.clone(),
+                owner,
+            )?,
             Init::Bound(inner) => inner,
         };
         if let Err(err) = socket::inet::common::ensure_bound_dual_stack_remote_compatible(
@@ -275,16 +334,40 @@ impl Init {
                 return Err((Init::Bound((inner, original_local, reservation)), err));
             }
         };
-        let result = inner.with_mut::<smoltcp::socket::tcp::Socket, _, _>(|socket| {
+        let result = {
+            let mut sockets = inner.iface().sockets().lock();
+            let socket = sockets.get_mut::<tcp::Socket>(inner.handle());
             socket.set_bound_device(NonZeroU32::new(device_binding.ifindex() as u32));
-            socket
-                .connect(
-                    inner.iface().smol_iface().lock().context(),
-                    remote_endpoint,
-                    local,
-                )
-                .map_err(|_| SystemError::ECONNREFUSED)
-        });
+            socket.set_lifecycle_observer(Some(reservation.lifecycle_observer()));
+            let is_loopback = |addr: smoltcp::wire::IpAddress| match addr {
+                smoltcp::wire::IpAddress::Ipv4(addr) => addr.is_loopback(),
+                smoltcp::wire::IpAddress::Ipv6(addr) => addr.is_loopback(),
+            };
+            let loopback = is_loopback(local.addr)
+                || is_loopback(remote_endpoint.addr)
+                || netns.loopback_iface().is_some_and(|iface| {
+                    use crate::driver::net::Iface;
+                    device_binding.ifindex() == iface.nic_id()
+                });
+            let policy = if automatic {
+                tcp::TimeWaitReuse::Automatic { loopback }
+            } else {
+                tcp::TimeWaitReuse::Explicit
+            };
+            let mut interface = inner.iface().smol_iface().lock();
+            let context = interface.context();
+            // A rejected reuse attempt emits no packet and need not cause a
+            // poll. Its safety deadline must use this transaction's time, not
+            // the last received packet's time. Sample after both locks.
+            context.now = crate::time::Instant::now().into();
+            sockets
+                .connect_tcp(inner.handle(), context, remote_endpoint, local, policy)
+                .map_err(|err| match err {
+                    tcp::ConnectError::AddressInUse => SystemError::EADDRNOTAVAIL,
+                    tcp::ConnectError::InvalidState => SystemError::EINVAL,
+                    tcp::ConnectError::Unaddressable => SystemError::ECONNREFUSED,
+                })
+        };
         match result {
             Ok(_) => {
                 // Narrow only after the last fallible step. Widening on rollback
@@ -321,6 +404,7 @@ impl Init {
         netns: Arc<NetNamespace>,
         v6_only: bool,
         device_binding: Arc<SocketDeviceBinding>,
+        owner: &TcpPortOwner,
     ) -> Result<Listening, (Self, SystemError)> {
         // If unbound, auto-bind to INADDR_ANY:ephemeral (Linux compat).
         let bound_self = if matches!(self, Init::Unbound(_)) {
@@ -337,7 +421,13 @@ impl Init {
                 }
             };
             let auto_bind_ep = smoltcp::wire::IpEndpoint::new(unspec_addr, 0);
-            match self.bind(auto_bind_ep, netns.clone(), v6_only, device_binding.clone()) {
+            match self.bind(
+                auto_bind_ep,
+                netns.clone(),
+                v6_only,
+                device_binding.clone(),
+                owner,
+            ) {
                 Ok(bound) => bound,
                 Err((init, err)) => return Err((init, err)),
             }
@@ -357,6 +447,10 @@ impl Init {
                 SystemError::EINVAL,
             ));
         }
+        let promotion = match reservation.promote_listener() {
+            Ok(promotion) => promotion,
+            Err(err) => return Err((Init::Bound((inner, local, reservation)), err)),
+        };
         // log::debug!("listen at {:?}, backlog {}", listen_addr, backlog);
         //
         // Linux semantics: listen(backlog=0) is valid. In practice it still allows
@@ -389,6 +483,7 @@ impl Init {
                             listen_addr,
                             domain.ip_version,
                             NonZeroU32::new(device_binding.ifindex() as u32),
+                            &reservation,
                         )?,
                         iface.clone(),
                         inner.netns(),
@@ -406,9 +501,14 @@ impl Init {
 
         let primary_index = inners.len();
         inners.push(inner);
-        if let Err(err) =
-            Listening::grow_slots(&mut inners, backlog, listen_addr, domain, &device_binding)
-        {
+        if let Err(err) = Listening::grow_slots(
+            &mut inners,
+            backlog,
+            listen_addr,
+            domain,
+            &device_binding,
+            &reservation,
+        ) {
             let inner = inners.remove(primary_index);
             for bound in inners {
                 bound.release();
@@ -420,6 +520,9 @@ impl Init {
             inners[primary_index].with_mut::<smoltcp::socket::tcp::Socket, _, _>(|socket| {
                 socket.set_listen_ip_version(domain.ip_version);
                 socket.set_listen_bound_device(NonZeroU32::new(device_binding.ifindex() as u32));
+                socket.set_lifecycle_observer(Some(reservation.prepare_child(Arc::new(
+                    SocketDeviceBinding::from_ifindex(device_binding.ifindex()),
+                ))?));
                 socket.listen(listen_addr).map_err(|err| match err {
                     tcp::ListenError::InvalidState => SystemError::EINVAL,
                     tcp::ListenError::Unaddressable => SystemError::EINVAL,
@@ -433,6 +536,7 @@ impl Init {
             return Err((Init::Bound((inner, local, reservation)), err));
         }
 
+        promotion.commit();
         return Ok(Listening {
             inners,
             slots_per_iface: backlog,
@@ -550,17 +654,27 @@ impl Connecting {
             | ConnectResult::RefusedConsumed
             | ConnectResult::ShutdownReset
             | ConnectResult::ShutdownResetConsumed => {
-                drop(self.reservation);
-                let socket = self.inner.into_socket();
-                let socket = match socket {
-                    smoltcp::socket::Socket::Tcp(s) => s,
-                    _ => panic!("Connecting socket is not TCP"),
-                };
                 let err = match result {
                     ConnectResult::ShutdownReset | ConnectResult::ShutdownResetConsumed => {
                         SystemError::ECONNRESET
                     }
                     _ => SystemError::ECONNREFUSED,
+                };
+                if let Some(domain) = self.reservation.locked_bind_domain {
+                    // Like tcp_disconnect(), restore the user's bind address
+                    // after source selection, but retain a nonzero port lock.
+                    self.reservation.update_domain(domain);
+                    let local = smoltcp::wire::IpEndpoint::new(domain.addr, self.reservation.port);
+                    return (
+                        Inner::Init(Init::Bound((self.inner, local, self.reservation))),
+                        Err(err),
+                    );
+                }
+                drop(self.reservation);
+                let socket = self.inner.into_socket();
+                let socket = match socket {
+                    smoltcp::socket::Socket::Tcp(s) => s,
+                    _ => panic!("Connecting socket is not TCP"),
                 };
                 (
                     Inner::Init(Init::Unbound((Box::new(socket), self.ver))),
@@ -941,6 +1055,7 @@ impl Listening {
         listen_addr: smoltcp::wire::IpListenEndpoint,
         domain: TcpBindDomain,
         device_binding: &SocketDeviceBinding,
+        reservation: &TcpPortReservation,
     ) -> Result<(), SystemError> {
         // Prepare sockets before publishing any new handles; keep existing
         // connections and the previous capacity on a recoverable failure.
@@ -962,6 +1077,7 @@ impl Listening {
                         listen_addr,
                         domain.ip_version,
                         NonZeroU32::new(device_binding.ifindex() as u32),
+                        reservation,
                     )?,
                     bound.iface().clone(),
                     bound.netns(),
@@ -992,6 +1108,9 @@ impl Listening {
             self.listen_addr,
             self.domain,
             &self.device_binding,
+            self.reservation
+                .as_ref()
+                .expect("open listener reservation"),
         )?;
         self.slots_per_iface = target;
         self.trim_excess();
@@ -1001,13 +1120,13 @@ impl Listening {
     pub fn accept(&mut self) -> Result<(Established, smoltcp::wire::IpEndpoint), SystemError> {
         // Resizing can invalidate vector indices. Select the current live slot
         // under the caller's inner write lock instead of caching a poll index.
-        let (index, local_endpoint, remote_endpoint) = self
+        let index = self
             .inners
             .iter()
             .enumerate()
             .find_map(|(index, bound)| {
                 bound.with::<tcp::Socket, _, _>(|socket| {
-                    Self::accept_endpoints(socket).map(|(local, peer)| (index, local, peer))
+                    Self::accept_endpoints(socket).map(|_| index)
                 })
             })
             .ok_or(SystemError::EAGAIN_OR_EWOULDBLOCK)?;
@@ -1016,9 +1135,15 @@ impl Listening {
         let connected = &mut self.inners[index];
 
         if retire {
+            let (reservation, local_endpoint, remote_endpoint) = Self::claim_child(connected)?;
             let connected = self.inners.remove(index);
             return Ok((
-                Established::with_endpoints(connected, None, local_endpoint, remote_endpoint),
+                Established::with_endpoints(
+                    connected,
+                    Some(reservation),
+                    local_endpoint,
+                    remote_endpoint,
+                ),
                 remote_endpoint,
             ));
         }
@@ -1034,6 +1159,9 @@ impl Listening {
                     self.listen_addr,
                     self.domain.ip_version,
                     NonZeroU32::new(self.device_binding.ifindex() as u32),
+                    self.reservation
+                        .as_ref()
+                        .expect("open listener reservation"),
                 )?,
                 connected.iface().clone(),
                 connected.netns(),
@@ -1044,6 +1172,9 @@ impl Listening {
                     self.listen_addr,
                     self.domain.ip_version,
                     NonZeroU32::new(self.device_binding.ifindex() as u32),
+                    self.reservation
+                        .as_ref()
+                        .expect("open listener reservation"),
                 )?,
                 self.listen_addr
                     .addr
@@ -1055,14 +1186,46 @@ impl Listening {
             )?
         };
 
+        let (reservation, local_endpoint, remote_endpoint) = match Self::claim_child(connected) {
+            Ok(child) => child,
+            Err(err) => {
+                new_listen.release();
+                return Err(err);
+            }
+        };
+
         // swap the connected socket with the new_listen socket
         // TODO is smoltcp socket swappable?
         core::mem::swap(&mut new_listen, connected);
 
         return Ok((
-            Established::with_endpoints(new_listen, None, local_endpoint, remote_endpoint),
+            Established::with_endpoints(
+                new_listen,
+                Some(reservation),
+                local_endpoint,
+                remote_endpoint,
+            ),
             remote_endpoint,
         ));
+    }
+
+    fn claim_child(
+        bound: &socket::inet::BoundInner,
+    ) -> Result<
+        (
+            TcpPortReservation,
+            smoltcp::wire::IpEndpoint,
+            smoltcp::wire::IpEndpoint,
+        ),
+        SystemError,
+    > {
+        bound.with::<tcp::Socket, _, _>(|socket| {
+            let (local, remote) =
+                Self::accept_endpoints(socket).ok_or(SystemError::EAGAIN_OR_EWOULDBLOCK)?;
+            let observer = socket.lifecycle_observer().ok_or(SystemError::EINVAL)?;
+            let reservation = bound.netns().tcp_ports().claim_fd(observer.identity())?;
+            Ok((reservation, local, remote))
+        })
     }
 
     pub fn update_io_events(&self, pollee: &AtomicUsize) {
@@ -1132,6 +1295,12 @@ pub struct Established {
 }
 
 impl Established {
+    pub fn port_owner(&self) -> TcpPortOwner {
+        self.reservation
+            .as_ref()
+            .expect("established FD owns its TCP binding")
+            .owner()
+    }
     pub fn new(inner: socket::inet::BoundInner, reservation: Option<TcpPortReservation>) -> Self {
         let local = inner
             .with::<smoltcp::socket::tcp::Socket, _, _>(|socket| socket.local_endpoint())

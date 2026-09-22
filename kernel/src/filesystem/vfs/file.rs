@@ -2616,6 +2616,11 @@ impl File {
         new_flags = FileFlags::from_bits_truncate(new_bits);
 
         self.private_data.lock().update_flags(new_flags)?;
+        // Socket operations such as accept consult their cached mode. Keep it
+        // coherent for both F_SETFL and FIONBIO, under the same update lock.
+        if let Some(socket) = self.inode.as_socket() {
+            socket.set_nonblocking(new_flags.contains(FileFlags::O_NONBLOCK));
+        }
         // 更新文件的打开模式
         *self.flags.write() = new_flags;
 

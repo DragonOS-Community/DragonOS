@@ -30,10 +30,15 @@ impl<T: Socket + 'static> IndexNode for T {
     fn open(
         &self,
         data: MutexGuard<FilePrivateData>,
-        _: &crate::filesystem::vfs::file::FileFlags,
+        flags: &crate::filesystem::vfs::file::FileFlags,
     ) -> Result<(), SystemError> {
         match &*data {
             FilePrivateData::SocketCreate => {
+                // The new open file description owns the mode. In particular,
+                // accept does not inherit the listener's O_NONBLOCK.
+                self.set_nonblocking(
+                    flags.contains(crate::filesystem::vfs::file::FileFlags::O_NONBLOCK),
+                );
                 self.open_file_counter().fetch_add(1, Ordering::Release);
                 Ok(())
             }

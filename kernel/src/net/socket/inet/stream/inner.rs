@@ -768,6 +768,23 @@ pub struct Listening {
 }
 
 impl Listening {
+    /// Ordinary passive opens become acceptable only after the final ACK.
+    /// A peer may already have sent FIN, so CLOSE_WAIT remains acceptable.
+    /// Snapshot both endpoints under the caller's SocketSet lock: a later RST
+    /// can clear the tuple before the accepted socket is constructed.
+    fn accept_endpoints(
+        socket: &tcp::Socket,
+    ) -> Option<(smoltcp::wire::IpEndpoint, smoltcp::wire::IpEndpoint)> {
+        if matches!(
+            socket.state(),
+            tcp::State::Established | tcp::State::CloseWait
+        ) {
+            Some((socket.local_endpoint()?, socket.remote_endpoint()?))
+        } else {
+            None
+        }
+    }
+
     fn slot_capacity(backlog: usize) -> usize {
         // Bounded per-interface emulation, not Linux's global accept queue.
         // At 256 KiB per socket this uses at most 2 MiB per interface.
@@ -884,24 +901,26 @@ impl Listening {
     pub fn accept(&mut self) -> Result<(Established, smoltcp::wire::IpEndpoint), SystemError> {
         // Resizing can invalidate vector indices. Select the current live slot
         // under the caller's inner write lock instead of caching a poll index.
-        let index = self
+        let (index, local_endpoint, remote_endpoint) = self
             .inners
             .iter()
-            .position(|bound| bound.with::<tcp::Socket, _, _>(|socket| socket.is_active()))
+            .enumerate()
+            .find_map(|(index, bound)| {
+                bound.with::<tcp::Socket, _, _>(|socket| {
+                    Self::accept_endpoints(socket).map(|(local, peer)| (index, local, peer))
+                })
+            })
             .ok_or(SystemError::EAGAIN_OR_EWOULDBLOCK)?;
 
         let retire = self.can_remove_slot(index);
         let connected = &mut self.inners[index];
 
-        let remote_endpoint = connected.with::<smoltcp::socket::tcp::Socket, _, _>(|socket| {
-            socket
-                .remote_endpoint()
-                .expect("A Connected Tcp With No Remote Endpoint")
-        });
-
         if retire {
             let connected = self.inners.remove(index);
-            return Ok((Established::new(connected, None), remote_endpoint));
+            return Ok((
+                Established::with_endpoints(connected, None, local_endpoint, remote_endpoint),
+                remote_endpoint,
+            ));
         }
 
         // log::debug!("local at {:?}", local_endpoint);
@@ -932,7 +951,10 @@ impl Listening {
         // TODO is smoltcp socket swappable?
         core::mem::swap(&mut new_listen, connected);
 
-        return Ok((Established::new(new_listen, None), remote_endpoint));
+        return Ok((
+            Established::with_endpoints(new_listen, None, local_endpoint, remote_endpoint),
+            remote_endpoint,
+        ));
     }
 
     pub fn update_io_events(&self, pollee: &AtomicUsize) {
@@ -956,7 +978,7 @@ impl Listening {
 
         // log::info!("Listening::update_io_events");
         let ready = self.inners.iter().any(|inner| {
-            inner.with::<smoltcp::socket::tcp::Socket, _, _>(|socket| socket.is_active())
+            inner.with::<tcp::Socket, _, _>(|socket| Self::accept_endpoints(socket).is_some())
         });
 
         if ready {
@@ -1015,6 +1037,15 @@ impl Established {
                 smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address::UNSPECIFIED),
                 0,
             ));
+        Self::with_endpoints(inner, reservation, local, peer)
+    }
+
+    fn with_endpoints(
+        inner: socket::inet::BoundInner,
+        reservation: Option<TcpPortReservation>,
+        local: smoltcp::wire::IpEndpoint,
+        peer: smoltcp::wire::IpEndpoint,
+    ) -> Self {
         Self {
             inner,
             local,

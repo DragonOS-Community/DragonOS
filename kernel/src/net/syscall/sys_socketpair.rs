@@ -176,8 +176,12 @@ pub(super) fn do_socketpair(
         }
     };
 
-    let file_a = File::new_socket(socket_a, FileFlags::O_RDWR)?;
-    let file_b = File::new_socket(socket_b, FileFlags::O_RDWR)?;
+    let mut file_flags = FileFlags::O_RDWR;
+    if nonblocking {
+        file_flags.insert(FileFlags::O_NONBLOCK);
+    }
+    let file_a = File::new_socket(socket_a, file_flags)?;
+    let file_b = File::new_socket(socket_b, file_flags)?;
     let file_a = alloc::sync::Arc::try_new(file_a).map_err(|_| SystemError::ENOMEM)?;
     let file_b = alloc::sync::Arc::try_new(file_b).map_err(|_| SystemError::ENOMEM)?;
     reservation.install_arc_pair(file_a, file_b)?;

@@ -602,7 +602,7 @@ impl Iface for LoopbackInterface {
         if ip_packet.len() > self.mtu() {
             return Err(SystemError::EMSGSIZE.into());
         }
-        self.inject_local_ipv4_packet(self.nic_id() as u32, self.mac(), ip_packet, false)
+        self.inject_local_ip_packet(self.nic_id() as u32, self.mac(), ip_packet, false)
             .map_err(Into::into)
     }
 

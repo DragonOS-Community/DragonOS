@@ -64,9 +64,8 @@ pub(super) fn defer_native_output_after_tx_backpressure(
 
 /// A namespace-local view over the target interface's transport stack.
 /// Ingress retains the physical ifindex. Output is staged until the smoltcp
-/// locks are released: IPv4 may then select another device through the
-/// namespace FIB, while native same-interface and non-IPv4 traffic keeps the
-/// underlying device path.
+/// locks are released: unicast IP may then select another device through the
+/// namespace FIB, while native link-local control traffic keeps the device path.
 pub(super) struct LocalInputDevice<'a, D: SmolDevice + ?Sized> {
     pub(super) device: &'a mut D,
     pub(super) common: &'a IfaceCommon,
@@ -74,7 +73,7 @@ pub(super) struct LocalInputDevice<'a, D: SmolDevice + ?Sized> {
 }
 
 /// Delegates receive to the physical device while routing every response and
-/// standalone IPv4 transmission through the same deferred output FIFO as
+/// standalone routed IP transmission through the same deferred output FIFO as
 /// namespace-local input.
 pub(super) struct RoutedTxDevice<'a, D: SmolDevice + ?Sized> {
     pub(super) device: &'a mut D,
@@ -125,17 +124,31 @@ pub(super) struct OutputBackendPolicy<'a> {
     pub(super) configured_neighbors: Option<&'a crate::net::neighbor::NeighborReadGuard<'a>>,
     pub(super) owner_ifindex: u32,
     pub(super) owner_is_up: bool,
-    pub(super) authoritative_ipv4_output: bool,
+    pub(super) authoritative_output: bool,
 }
 
 impl OutputBackendPolicy<'_> {
+    fn outbound_ip_mtu(
+        self,
+        destination: smoltcp::wire::IpAddress,
+        meta: PacketMeta,
+        native_mtu: usize,
+    ) -> usize {
+        match self.classify(destination.version(), destination, meta) {
+            OutputBackendDecision::Deferred(Some(route)) => route.ip_mtu.min(u16::MAX as usize),
+            // A missing route must not prevent TCP from advancing its timers.
+            // Actual packet dispatch still rejects the missing route.
+            _ => native_mtu,
+        }
+    }
+
     pub(super) fn classify(
         self,
         version: smoltcp::wire::IpVersion,
         destination: smoltcp::wire::IpAddress,
         meta: PacketMeta,
     ) -> OutputBackendDecision {
-        if version != smoltcp::wire::IpVersion::Ipv4 {
+        if version == smoltcp::wire::IpVersion::Ipv6 && destination.is_multicast() {
             return OutputBackendDecision::NativeOwner;
         }
         let constrained_oif = (meta.id != 0).then_some(meta.id);
@@ -149,7 +162,7 @@ impl OutputBackendPolicy<'_> {
                     && !self.configured_neighbors.is_some_and(|neighbors| {
                         neighbors.lookup(route.oif, route.next_hop).is_some()
                     })
-                    && (!self.authoritative_ipv4_output
+                    && (!self.authoritative_output
                         || route.table != crate::net::route::RT_TABLE_DEFAULT) =>
             {
                 OutputBackendDecision::NativeOwner
@@ -344,15 +357,7 @@ impl LocalInputTxToken<'_> {
                     context: LocalOutputDisposition::local_context(route.oif),
                 }));
             }
-            let smoltcp::wire::IpAddress::Ipv4(next_hop) = route.next_hop else {
-                self.medium = smoltcp::phy::Medium::Ip;
-                self.disposition = LocalOutputDisposition::Drop;
-                return Ok(Some(smoltcp::phy::TxEgressOverride {
-                    medium: smoltcp::phy::Medium::Ip,
-                    ip_mtu: self.owner_ip_mtu,
-                    context: LocalOutputDisposition::DROP_CONTEXT,
-                }));
-            };
+            let next_hop = route.next_hop;
             self.medium = smoltcp::phy::Medium::Ip;
             // The address owner and selected egress may have different MTUs.
             // Grow only the token that actually needs the larger route MTU;
@@ -506,6 +511,11 @@ pub(super) fn local_tx_token<'a>(
 }
 
 impl<D: SmolDevice + ?Sized> SmolDevice for LocalInputDevice<'_, D> {
+    fn outbound_ip_mtu(&self, destination: smoltcp::wire::IpAddress, meta: PacketMeta) -> usize {
+        self.backend_policy
+            .outbound_ip_mtu(destination, meta, self.device.capabilities().ip_mtu())
+    }
+
     type RxToken<'a>
         = LocalInputRxToken
     where
@@ -541,6 +551,11 @@ impl<D: SmolDevice + ?Sized> SmolDevice for LocalInputDevice<'_, D> {
 }
 
 impl<D: SmolDevice + ?Sized> SmolDevice for RoutedTxDevice<'_, D> {
+    fn outbound_ip_mtu(&self, destination: smoltcp::wire::IpAddress, meta: PacketMeta) -> usize {
+        self.backend_policy
+            .outbound_ip_mtu(destination, meta, self.device.capabilities().ip_mtu())
+    }
+
     type RxToken<'a>
         = RoutedRxToken<D::RxToken<'a>>
     where
@@ -623,7 +638,7 @@ pub(super) fn transmit_routed_stack_output(
     };
     if packet.medium != smoltcp::phy::Medium::Ip
         || packet.frame.len() > ip_mtu
-        || packet.frame.first().map(|byte| byte >> 4) != Some(4)
+        || smoltcp::wire::IpVersion::of_packet(&packet.frame).ok() != Some(next_hop.version())
     {
         return LocalOutputTransmitResult::Drop(packet, SystemError::EINVAL);
     }
@@ -635,7 +650,7 @@ pub(super) fn transmit_routed_stack_output(
         };
         return LocalOutputTransmitResult::Drop(packet, error);
     }
-    match iface.route_and_send(&smoltcp::wire::IpAddress::Ipv4(next_hop), &packet.frame) {
+    match iface.route_and_send(&next_hop, &packet.frame) {
         Ok(()) => LocalOutputTransmitResult::Sent(packet),
         Err(RouteSendError::RetryAt {
             retry_at,
@@ -738,7 +753,7 @@ where
         LocalOutputDisposition::Local { oif, ip_mtu } => {
             if packet.medium != smoltcp::phy::Medium::Ip
                 || packet.frame.len() > ip_mtu
-                || packet.frame.first().map(|byte| byte >> 4) != Some(4)
+                || smoltcp::wire::IpVersion::of_packet(&packet.frame).is_err()
             {
                 return LocalOutputTransmitResult::Drop(packet, SystemError::EINVAL);
             }
@@ -748,7 +763,7 @@ where
             if packet.frame.len() > iface.mtu() {
                 return LocalOutputTransmitResult::Drop(packet, SystemError::EMSGSIZE);
             }
-            match iface.inject_local_ipv4_packet(oif, iface.mac(), &packet.frame, false) {
+            match iface.inject_local_ip_packet(oif, iface.mac(), &packet.frame, false) {
                 Ok(()) => LocalOutputTransmitResult::Sent(packet),
                 // This is receive-backlog congestion, not physical TX
                 // backpressure. Linux may drop locally delivered packets when

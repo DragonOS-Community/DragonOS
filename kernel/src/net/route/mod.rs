@@ -29,6 +29,7 @@ pub(crate) use lifecycle::{
     commit_addresses, prepare_address_link_change, prepare_link_state_change, register_iface,
     unregister_iface, AddressLinkChange, PreparedAddressRouteCommit, PreparedLinkStateChange,
 };
+pub(crate) use source::resolve_ipv6_output_route;
 pub(crate) use source::{resolve_ipv4_output_flow, resolve_ipv4_route, Ipv4OutputFlow};
 use transaction::{
     prepare_with_devices, projection_for_iface, transact_single, transact_with_devices,

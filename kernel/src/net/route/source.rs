@@ -1,4 +1,4 @@
-//! IPv4 output-route and source-address resolution.
+//! Output-route and source-address validation for socket and routing callers.
 //!
 //! Socket and rtnetlink callers consume this module's result instead of
 //! independently interpreting FIB source policy.
@@ -131,4 +131,46 @@ pub(crate) fn resolve_ipv4_output_flow(
         oif: resolved.decision.oif,
         source: resolved.source,
     })
+}
+
+/// Validate an already selected native IPv6 source against the output route.
+/// Source selection itself remains in the existing socket source policy.
+/// In particular, IPv6 never uses IPv4's explicit-device on-link fallback.
+pub(crate) fn resolve_ipv6_output_route(
+    netns: &Arc<NetNamespace>,
+    destination: IpAddress,
+    required_oif: Option<u32>,
+    fixed_source: Option<IpAddress>,
+) -> Result<super::OutputRouteDecision, SystemError> {
+    if !matches!(destination, IpAddress::Ipv6(_)) {
+        return Err(SystemError::EAFNOSUPPORT);
+    }
+    let devices = netns.device_list();
+    let router = netns.router();
+    let routes = super::lock_output_routes(&router, devices);
+    let route = routes
+        .lookup(destination, required_oif)
+        .ok_or(SystemError::ENETUNREACH)?;
+    let iface = routes
+        .devices
+        .get(&(route.oif as usize))
+        .ok_or(SystemError::ENETUNREACH)?;
+    if route.kind != RTN_LOCAL && !iface.flags().contains(InterfaceFlags::UP) {
+        return Err(SystemError::ENETDOWN);
+    }
+    if let Some(source) = fixed_source {
+        if !matches!(source, IpAddress::Ipv6(_))
+            || !routes.devices.values().any(|candidate| {
+                crate::net::address::iface_accepts_local_address(candidate, source)
+            })
+        {
+            return Err(SystemError::EADDRNOTAVAIL);
+        }
+        if super::is_ipv6_link_local(source)
+            && !crate::net::address::iface_accepts_local_address(iface, source)
+        {
+            return Err(SystemError::EADDRNOTAVAIL);
+        }
+    }
+    Ok(route)
 }

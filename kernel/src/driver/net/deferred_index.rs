@@ -2,15 +2,16 @@ use alloc::vec::Vec;
 use system_error::SystemError;
 
 pub(super) type NodeId = usize;
+pub(super) type RouteIndexKey = [u8; 21];
 
 #[derive(Clone, Copy, Debug)]
 enum Node {
     Free { next: Option<NodeId> },
-    Leaf { key: u64, slot: usize },
+    Leaf { key: RouteIndexKey, slot: usize },
     Branch { bit: u8, children: [NodeId; 2] },
 }
 
-/// A fallibly allocated Patricia index for attacker-controlled 64-bit keys.
+/// A fallibly allocated Patricia index for complete (family, ifindex, address) keys.
 ///
 /// Branch bits strictly increase from root to leaf, bounding every lookup by
 /// the key width without depending on secret hash entropy. Node IDs remain
@@ -29,7 +30,7 @@ impl DeferredRouteIndex {
         self.leaves
     }
 
-    pub(super) fn get(&self, key: u64) -> Option<(NodeId, usize)> {
+    pub(super) fn get(&self, key: RouteIndexKey) -> Option<(NodeId, usize)> {
         let leaf = self.find_leaf(key)?;
         match self.nodes[leaf] {
             Node::Leaf {
@@ -48,7 +49,7 @@ impl DeferredRouteIndex {
     }
 
     /// Inserts a key after `try_reserve_insert`; this method cannot allocate.
-    pub(super) fn insert_prepared(&mut self, key: u64, slot: usize) -> NodeId {
+    pub(super) fn insert_prepared(&mut self, key: RouteIndexKey, slot: usize) -> NodeId {
         debug_assert!(self.get(key).is_none());
         let Some(root) = self.root else {
             let leaf = self.alloc_prepared(Node::Leaf { key, slot });
@@ -64,8 +65,14 @@ impl DeferredRouteIndex {
             Node::Leaf { key, .. } => key,
             _ => unreachable!("Patricia traversal ends at a leaf"),
         };
-        let differing_bit = (key ^ existing_key).leading_zeros() as u8;
-        debug_assert!(differing_bit < 64);
+        let differing_byte = key
+            .iter()
+            .zip(existing_key)
+            .position(|(a, b)| *a != b)
+            .expect("inserted Patricia keys are distinct");
+        let differing_bit = (differing_byte * 8
+            + (key[differing_byte] ^ existing_key[differing_byte]).leading_zeros() as usize)
+            as u8;
 
         let mut parent = None;
         let mut current = root;
@@ -95,7 +102,7 @@ impl DeferredRouteIndex {
         leaf
     }
 
-    pub(super) fn set_slot(&mut self, leaf: NodeId, key: u64, slot: usize) {
+    pub(super) fn set_slot(&mut self, leaf: NodeId, key: RouteIndexKey, slot: usize) {
         match &mut self.nodes[leaf] {
             Node::Leaf {
                 key: leaf_key,
@@ -108,7 +115,7 @@ impl DeferredRouteIndex {
         }
     }
 
-    pub(super) fn remove(&mut self, key: u64) -> Option<usize> {
+    pub(super) fn remove(&mut self, key: RouteIndexKey) -> Option<usize> {
         let root = self.root?;
         if let Node::Leaf {
             key: leaf_key,
@@ -153,7 +160,7 @@ impl DeferredRouteIndex {
         Some(slot)
     }
 
-    fn find_leaf(&self, key: u64) -> Option<NodeId> {
+    fn find_leaf(&self, key: RouteIndexKey) -> Option<NodeId> {
         let mut current = self.root?;
         loop {
             match self.nodes[current] {
@@ -166,8 +173,8 @@ impl DeferredRouteIndex {
         }
     }
 
-    fn direction(key: u64, bit: u8) -> usize {
-        ((key >> (63 - bit)) & 1) as usize
+    fn direction(key: RouteIndexKey, bit: u8) -> usize {
+        ((key[bit as usize / 8] >> (7 - bit % 8)) & 1) as usize
     }
 
     fn branch_children(&self, node: NodeId) -> [NodeId; 2] {
@@ -207,5 +214,48 @@ impl DeferredRouteIndex {
         };
         self.free_head = Some(node);
         self.free_count += 1;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_key_bit_survives_insert_remove_and_slot_updates() {
+        let mut index = DeferredRouteIndex::default();
+        // Include the all-zero key and every differing bit, especially the
+        // high IPv6 bytes which the old 64-bit key could not represent.
+        let mut keys = alloc::vec![[0; 21]];
+        for bit in 0..168 {
+            let mut key = [0; 21];
+            key[bit / 8] = 1 << (7 - bit % 8);
+            keys.push(key);
+        }
+        for (slot, key) in keys.iter().copied().enumerate() {
+            index.try_reserve_insert().unwrap();
+            index.insert_prepared(key, slot);
+        }
+        assert_eq!(index.len(), keys.len());
+        for (slot, key) in keys.iter().copied().enumerate() {
+            let (leaf, actual) = index.get(key).unwrap();
+            assert_eq!(actual, slot);
+            index.set_slot(leaf, key, slot + 1000);
+        }
+        // Alternating removals exercise root replacement and stable leaf IDs.
+        for parity in 0..2 {
+            for slot in (parity..keys.len()).step_by(2) {
+                assert_eq!(index.remove(keys[slot]), Some(slot + 1000));
+                assert!(index.get(keys[slot]).is_none());
+            }
+        }
+        assert_eq!(index.len(), 0);
+        for (slot, key) in keys.iter().copied().enumerate().rev() {
+            index.try_reserve_insert().unwrap();
+            index.insert_prepared(key, slot);
+        }
+        for (slot, key) in keys.iter().copied().enumerate() {
+            assert_eq!(index.get(key).unwrap().1, slot);
+        }
     }
 }

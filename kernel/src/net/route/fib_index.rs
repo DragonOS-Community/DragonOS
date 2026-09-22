@@ -325,6 +325,13 @@ impl FibIndex {
         })
     }
 
+    pub(super) fn has_ipv6_routes(&self, table: u32) -> bool {
+        self.prefix_counts.contains_key(&PrefixDomain {
+            table,
+            family: AddressFamily::Ipv6,
+        })
+    }
+
     /// Reserve every bucket needed by a later infallible commit.
     pub(super) fn prepare_insert(&mut self, route: RouteEntry) -> Result<(), SystemError> {
         let result = (|| {

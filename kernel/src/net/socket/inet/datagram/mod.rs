@@ -1026,6 +1026,28 @@ impl UdpSocket {
             Some((local, dest, connected_source)) => {
                 let (required_oif, multicast_source) =
                     output_flow::socket_constraints(self, dest.addr)?;
+                if matches!(dest.addr, smoltcp::wire::IpAddress::Ipv6(_))
+                    && !dest.addr.is_multicast()
+                {
+                    let source = local
+                        .addr
+                        .filter(|source| !source.is_unspecified())
+                        .or(connected_source);
+                    let route = crate::net::route::resolve_ipv6_output_route(
+                        &self.netns,
+                        dest.addr,
+                        required_oif,
+                        source,
+                    )?;
+                    // Native IPv6 source fragmentation is not implemented.
+                    // Report the limit before enqueueing, rather than losing
+                    // an accepted datagram at the physical egress.
+                    if route.kind != crate::net::route::RTN_LOCAL
+                        && buf.len() > route.ip_mtu.saturating_sub(40 + 8)
+                    {
+                        return Err(SystemError::EMSGSIZE);
+                    }
+                }
                 output_flow::resolve_ipv4_send_flow(
                     &self.netns,
                     local,

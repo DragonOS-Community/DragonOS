@@ -519,21 +519,18 @@ fn get_ephemeral_bind_target(
 
 /// Selects the SocketSet owner for a source chosen on `egress_iface`.
 ///
-/// IPv4 local delivery follows the namespace local FIB and may therefore
-/// target a different interface from egress. Native IPv6 output is still
-/// interface-local, so IPv6 retains the egress stack until the routed-output
-/// backend supports that family as well.
+/// Local delivery follows the namespace local FIB and may therefore target
+/// a different interface from egress, for either IP family.
 pub(crate) fn ephemeral_target_for_source(
     netns: &Arc<NetNamespace>,
     egress_iface: Arc<dyn Iface>,
     local_addr: smoltcp::wire::IpAddress,
     no_source_error: SystemError,
 ) -> Result<EphemeralBindTarget, SystemError> {
-    let stack_owner = match local_addr {
-        smoltcp::wire::IpAddress::Ipv4(address) if !address.is_unspecified() => {
-            crate::net::route::local_address_owner(netns, local_addr).ok_or(no_source_error)?
-        }
-        _ => egress_iface,
+    let stack_owner = if !local_addr.is_unspecified() {
+        crate::net::route::local_address_owner(netns, local_addr).ok_or(no_source_error)?
+    } else {
+        egress_iface
     };
     Ok(EphemeralBindTarget {
         stack_owner,

@@ -40,11 +40,11 @@ pub struct Router {
     pub(in crate::net) fib: RwSem<crate::net::route::FibTable>,
     pub(self) nat_tracker: Arc<ConnTracker>,
     pub ns: RwSem<Weak<NetNamespace>>,
-    /// Execution mode for IPv4 output. It is derived from the committed FIB
+    /// Execution mode for namespace-routed output. It is derived from the committed FIB
     /// at rest and forced on while a writer publishes the FIB's per-interface
     /// smoltcp projections, making the complete control-plane transaction the
     /// only observable generation.
-    authoritative_ipv4_output: AtomicBool,
+    authoritative_output: AtomicBool,
 }
 
 /// Write access to the namespace FIB.
@@ -55,7 +55,7 @@ pub struct Router {
 /// having to remember a separate generation handoff.
 pub(in crate::net) struct RouterFibWriteGuard<'a> {
     fib: RwSemWriteGuard<'a, crate::net::route::FibTable>,
-    authoritative_ipv4_output: &'a AtomicBool,
+    authoritative_output: &'a AtomicBool,
 }
 
 impl core::ops::Deref for RouterFibWriteGuard<'_> {
@@ -74,10 +74,8 @@ impl core::ops::DerefMut for RouterFibWriteGuard<'_> {
 
 impl Drop for RouterFibWriteGuard<'_> {
     fn drop(&mut self) {
-        self.authoritative_ipv4_output.store(
-            self.fib.requires_authoritative_ipv4_output(),
-            Ordering::Release,
-        );
+        self.authoritative_output
+            .store(self.fib.requires_authoritative_output(), Ordering::Release);
     }
 }
 
@@ -87,7 +85,7 @@ impl Router {
             fib: RwSem::new(crate::net::route::FibTable::default()),
             nat_tracker: Arc::new(ConnTracker::default()),
             ns: RwSem::new(Weak::default()),
-            authoritative_ipv4_output: AtomicBool::new(false),
+            authoritative_output: AtomicBool::new(false),
         })
     }
 
@@ -98,7 +96,7 @@ impl Router {
             fib: RwSem::new(crate::net::route::FibTable::default()),
             ns: RwSem::new(Weak::default()),
             nat_tracker: Arc::new(ConnTracker::default()),
-            authoritative_ipv4_output: AtomicBool::new(false),
+            authoritative_output: AtomicBool::new(false),
         })
     }
 
@@ -110,16 +108,15 @@ impl Router {
         // restarts. Consequently no data-plane reader can enter between two
         // per-interface projection updates. Drop restores the mode derived
         // from the newly committed FIB before releasing the write lock.
-        self.authoritative_ipv4_output
-            .store(true, Ordering::Release);
+        self.authoritative_output.store(true, Ordering::Release);
         RouterFibWriteGuard {
             fib,
-            authoritative_ipv4_output: &self.authoritative_ipv4_output,
+            authoritative_output: &self.authoritative_output,
         }
     }
 
-    pub(crate) fn requires_authoritative_ipv4_output(&self) -> bool {
-        self.authoritative_ipv4_output.load(Ordering::Acquire)
+    pub(crate) fn requires_authoritative_output(&self) -> bool {
+        self.authoritative_output.load(Ordering::Acquire)
     }
 
     pub fn lookup_ingress_route(
@@ -215,7 +212,7 @@ pub trait RouterEnableDevice: Iface {
                             return Err(None);
                         }
                         interface
-                            .inject_local_ipv4_packet(
+                            .inject_local_ip_packet(
                                 self.nic_id() as u32,
                                 ether_frame.src_addr(),
                                 ipv4_packet_mut.as_ref(),
@@ -229,7 +226,7 @@ pub trait RouterEnableDevice: Iface {
                             return Err(None);
                         }
                         interface
-                            .inject_local_ipv4_packet(
+                            .inject_local_ip_packet(
                                 self.nic_id() as u32,
                                 ether_frame.src_addr(),
                                 ipv4_packet_mut.as_ref(),
@@ -287,8 +284,40 @@ pub trait RouterEnableDevice: Iface {
                 Err(None)
             }
             smoltcp::wire::EthernetProtocol::Ipv6 => {
-                log::warn!("IPv6 is not supported yet, ignoring packet");
-                Err(None)
+                let packet = smoltcp::wire::Ipv6Packet::new_checked(ether_frame.payload())
+                    .map_err(|_| Some(SystemError::EINVAL))?;
+                let repr = smoltcp::wire::Ipv6Repr::parse(&packet)
+                    .map_err(|_| Some(SystemError::EINVAL))?;
+                // Scoped destinations and neighbor discovery belong to the
+                // physical receiving interface, not the address owner. In
+                // particular a unicast NA must update that interface's cache.
+                if repr.dst_addr.is_multicast()
+                    || repr.dst_addr.is_unicast_link_local()
+                    || repr.dst_addr.is_loopback()
+                    || repr.dst_addr.is_unspecified()
+                    || ipv6_is_neighbor_discovery(&packet).map_err(Some)?
+                {
+                    return Err(None);
+                }
+                let Some(IngressRouteDecision::Local(interface)) = self
+                    .netns_router()
+                    .lookup_ingress_route(repr.dst_addr.into(), self.nic_id() as u32)
+                else {
+                    // This path implements host delivery only, not IPv6
+                    // forwarding. Let the physical stack reject other input.
+                    return Err(None);
+                };
+                if interface.nic_id() == self.nic_id() {
+                    return Err(None);
+                }
+                interface
+                    .inject_local_ip_packet(
+                        self.nic_id() as u32,
+                        ether_frame.src_addr(),
+                        &ether_frame.payload()[..40 + repr.payload_len],
+                        false,
+                    )
+                    .map_err(Some)
             }
             _ => {
                 log::warn!(
@@ -441,6 +470,55 @@ pub trait RouterEnableDevice: Iface {
     fn netns_router(&self) -> Arc<Router> {
         self.net_namespace()
             .map_or_else(init_netns_router, |ns| ns.router())
+    }
+}
+
+/// Recognize the IPv6 formats accepted by smoltcp without bypassing its
+/// validation of NDP checksums, hop limit, or options. Hop-by-hop is the only
+/// extension header currently dispatched by that stack.
+fn ipv6_is_neighbor_discovery(
+    packet: &smoltcp::wire::Ipv6Packet<&[u8]>,
+) -> Result<bool, SystemError> {
+    use smoltcp::wire::{IpProtocol, Ipv6ExtHeader};
+    let mut protocol = packet.next_header();
+    let mut payload = packet.payload();
+    if protocol == IpProtocol::HopByHop {
+        let header = Ipv6ExtHeader::new_checked(payload).map_err(|_| SystemError::EINVAL)?;
+        protocol = header.next_header();
+        let header_len = (usize::from(header.header_len()) + 1) * 8;
+        payload = payload.get(header_len..).ok_or(SystemError::EINVAL)?;
+    }
+    Ok(protocol == IpProtocol::Icmpv6
+        && payload
+            .first()
+            .is_some_and(|kind| (133..=137).contains(kind)))
+}
+
+#[cfg(test)]
+mod ipv6_input_tests {
+    use super::ipv6_is_neighbor_discovery;
+    use smoltcp::wire::Ipv6Packet;
+
+    #[test]
+    fn neighbor_discovery_is_recognized_with_supported_extension_header() {
+        // The physical smoltcp interface still validates ICMPv6 and checksum.
+        let mut bytes = [0u8; 56];
+        bytes[0] = 0x60;
+        bytes[4..6].copy_from_slice(&16u16.to_be_bytes());
+        bytes[6] = 0; // Hop-by-hop.
+        bytes[40] = 58; // ICMPv6 follows the 8-byte extension.
+        bytes[48] = 136; // A unicast NA is still link-scoped protocol traffic.
+        assert!(ipv6_is_neighbor_discovery(&Ipv6Packet::new_checked(&bytes[..]).unwrap()).unwrap());
+        bytes[48] = 129; // Ordinary echo replies must remain routable.
+        assert!(
+            !ipv6_is_neighbor_discovery(&Ipv6Packet::new_checked(&bytes[..]).unwrap()).unwrap()
+        );
+        bytes[6] = 58;
+        bytes[40] = 135; // Direct NS, no extension.
+        assert!(ipv6_is_neighbor_discovery(&Ipv6Packet::new_checked(&bytes[..]).unwrap()).unwrap());
+        bytes[6] = 0;
+        bytes[41] = 2; // Truncated extension cannot be indexed unchecked.
+        assert!(ipv6_is_neighbor_discovery(&Ipv6Packet::new_checked(&bytes[..]).unwrap()).is_err());
     }
 }
 

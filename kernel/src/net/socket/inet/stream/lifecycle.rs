@@ -349,6 +349,17 @@ impl TcpSocket {
         // Explicit-source and self-connect paths need the same device/route
         // validation as implicit binding, before changing the socket state.
         if let Some(inner::Inner::Init(inner::Init::Bound((_, local, _)))) = writer.as_ref() {
+            if matches!(local.addr, smoltcp::wire::IpAddress::Ipv6(_))
+                && !local.addr.is_unspecified()
+            {
+                let device = self.device_binding.resolve_iface(&self.netns)?;
+                crate::net::route::resolve_ipv6_output_route(
+                    &self.netns,
+                    remote_endpoint.addr,
+                    device.map(|iface| iface.nic_id() as u32),
+                    Some(local.addr),
+                )?;
+            }
             if local.addr.version() == smoltcp::wire::IpVersion::Ipv4
                 && !local.addr.is_unspecified()
             {

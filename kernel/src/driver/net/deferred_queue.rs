@@ -1,5 +1,5 @@
 use super::{
-    deferred_index::{DeferredRouteIndex, NodeId},
+    deferred_index::{DeferredRouteIndex, NodeId, RouteIndexKey},
     local_queue::{LocalOutputDisposition, LocalOutputPacket},
 };
 use alloc::{collections::VecDeque, vec::Vec};
@@ -7,12 +7,58 @@ use alloc::{collections::VecDeque, vec::Vec};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct DeferredRouteKey {
     pub(super) oif: u32,
-    pub(super) next_hop: smoltcp::wire::Ipv4Address,
+    pub(super) next_hop: smoltcp::wire::IpAddress,
 }
 
 impl DeferredRouteKey {
-    fn packed(self) -> u64 {
-        ((self.oif as u64) << 32) | u32::from_be_bytes(self.next_hop.octets()) as u64
+    fn packed(self) -> RouteIndexKey {
+        let mut key = [0; 21];
+        key[1..5].copy_from_slice(&self.oif.to_be_bytes());
+        match self.next_hop {
+            smoltcp::wire::IpAddress::Ipv4(address) => {
+                key[0] = 4;
+                key[17..].copy_from_slice(&address.octets());
+            }
+            smoltcp::wire::IpAddress::Ipv6(address) => {
+                key[0] = 6;
+                key[5..].copy_from_slice(&address.octets());
+            }
+        }
+        key
+    }
+}
+
+#[cfg(test)]
+mod key_tests {
+    use super::*;
+    use smoltcp::wire::{IpAddress, Ipv4Address, Ipv6Address};
+
+    #[test]
+    fn family_device_and_all_address_bytes_identify_a_neighbor() {
+        let v4 = DeferredRouteKey {
+            oif: 2,
+            next_hop: IpAddress::Ipv4(Ipv4Address::new(192, 0, 2, 1)),
+        };
+        let mut bytes = [0; 16];
+        bytes[12..].copy_from_slice(&[192, 0, 2, 1]);
+        let v6 = DeferredRouteKey {
+            oif: 2,
+            next_hop: IpAddress::Ipv6(Ipv6Address::from(bytes)),
+        };
+        assert_ne!(v4.packed(), v6.packed());
+        assert_ne!(v6.packed(), DeferredRouteKey { oif: 3, ..v6 }.packed());
+        for byte in 0..16 {
+            let mut different = bytes;
+            different[byte] ^= 0x80;
+            assert_ne!(
+                v6.packed(),
+                DeferredRouteKey {
+                    next_hop: IpAddress::Ipv6(Ipv6Address::from(different)),
+                    ..v6
+                }
+                .packed()
+            );
+        }
     }
 }
 
@@ -43,7 +89,7 @@ pub(super) struct DeferredRouteLimits {
 
 /// Per-interface neighbor-resolution backlog.
 ///
-/// The hash index gives direct access by `(oif, next_hop)`, while `heap` is an
+/// The Patricia index gives bounded access by `(oif, next_hop)`, while `heap` is an
 /// indexed min-heap whose root is the next schedulable neighbor. In-flight
 /// buckets sort after every schedulable bucket and therefore never publish a
 /// stale retry deadline. Both structures are protected by the containing
@@ -300,7 +346,7 @@ impl DeferredRouteQueue {
     /// compaction and heap rebuilding are each performed only once.
     pub(super) fn release_resolved(
         &mut self,
-        mut is_resolved: impl FnMut(smoltcp::wire::Ipv4Address) -> bool,
+        mut is_resolved: impl FnMut(smoltcp::wire::IpAddress) -> bool,
         ready: &mut VecDeque<LocalOutputPacket>,
     ) {
         let mut removed_any = false;

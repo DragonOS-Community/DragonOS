@@ -173,7 +173,7 @@ pub struct NetNamespace {
     neighbor_table: NeighborTable,
     /// Per-netns UDP port reservation and local-delivery table.
     udp_bindings: UdpBindingTable,
-    tcp_ports: crate::net::socket::inet::common::PortManager,
+    tcp_ports: Arc<crate::net::socket::inet::common::PortManager>,
     /// Lock-free read-side snapshot for AF_PACKET delivery from NAPI context.
     packet_sockets: RcuArcSlot<PacketSocketRegistrySnapshot>,
     /// Serializes all plain/fanout topology updates and owns group IDs.
@@ -564,7 +564,7 @@ impl NetNamespace {
             teardown_work: NetnsTeardownWork::new(),
             neighbor_table: NeighborTable::new(),
             udp_bindings: UdpBindingTable::default(),
-            tcp_ports: crate::net::socket::inet::common::PortManager::default(),
+            tcp_ports: Arc::new(crate::net::socket::inet::common::PortManager::default()),
             packet_sockets: RcuArcSlot::new(Arc::new(PacketSocketRegistrySnapshot::default())),
             packet_sockets_writer: Mutex::new(PacketSocketRegistryWriter::new()),
             packet_sockets_need_cleanup: AtomicBool::new(false),
@@ -606,7 +606,7 @@ impl NetNamespace {
             teardown_work: NetnsTeardownWork::new(),
             neighbor_table: NeighborTable::new(),
             udp_bindings: UdpBindingTable::default(),
-            tcp_ports: crate::net::socket::inet::common::PortManager::default(),
+            tcp_ports: Arc::new(crate::net::socket::inet::common::PortManager::default()),
             packet_sockets: RcuArcSlot::new(Arc::new(PacketSocketRegistrySnapshot::default())),
             packet_sockets_writer: Mutex::new(PacketSocketRegistryWriter::new()),
             packet_sockets_need_cleanup: AtomicBool::new(false),
@@ -668,7 +668,7 @@ impl NetNamespace {
         &self.udp_bindings
     }
 
-    pub(crate) fn tcp_ports(&self) -> &crate::net::socket::inet::common::PortManager {
+    pub(crate) fn tcp_ports(&self) -> &Arc<crate::net::socket::inet::common::PortManager> {
         &self.tcp_ports
     }
 

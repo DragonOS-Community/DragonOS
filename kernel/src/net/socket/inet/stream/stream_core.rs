@@ -8,6 +8,7 @@ use crate::libs::mutex::Mutex;
 use crate::libs::rwsem::RwSem;
 use crate::libs::wait_queue::WaitQueue;
 use crate::net::socket::common::EPollItems;
+use crate::net::socket::inet::common::port::TcpPortOwner;
 use crate::net::socket::inet::common::SocketDeviceBinding;
 use crate::net::socket::Socket;
 use crate::process::namespace::net_namespace::NetNamespace;
@@ -53,8 +54,6 @@ pub struct TcpSocketOptions {
 
     /// SO_ATTACH_FILTER: whether a filter is attached.
     pub(crate) so_filter_attached: AtomicBool,
-    /// SO_REUSEADDR
-    pub(crate) so_reuseaddr: AtomicBool,
     /// SO_BROADCAST
     pub(crate) so_broadcast: AtomicBool,
     /// SO_PASSCRED
@@ -111,7 +110,6 @@ impl TcpSocketOptions {
             tcp_window_clamp: AtomicUsize::new(0),
             tcp_user_timeout: AtomicI32::new(0),
             so_filter_attached: AtomicBool::new(false),
-            so_reuseaddr: AtomicBool::new(false),
             so_broadcast: AtomicBool::new(false),
             so_passcred: AtomicBool::new(false),
             so_no_check: AtomicBool::new(false),
@@ -152,6 +150,8 @@ pub struct TcpSocket {
     pub(crate) pollee: AtomicUsize,
     pub(crate) netns: Arc<NetNamespace>,
     pub(crate) device_binding: Arc<SocketDeviceBinding>,
+    /// SO_REUSEADDR and bind/protocol ownership share one namespace authority.
+    pub(crate) port_owner: TcpPortOwner,
     pub(crate) epoll_items: EPollItems,
     pub(crate) fasync_items: FAsyncItems,
     pub(crate) options: TcpSocketOptions,
@@ -174,14 +174,13 @@ impl TcpSocket {
         ip_version: smoltcp::wire::IpVersion,
         me: &Weak<Self>,
     ) -> Self {
-        let inherited_device = match &inner {
-            inner::Inner::Established(est) => est.with(|socket| {
-                socket
-                    .bound_device()
-                    .map_or(0, |device| device.get() as usize)
-            }),
-            _ => 0,
+        let port_owner = match &inner {
+            inner::Inner::Established(est) => est.port_owner(),
+            _ => netns
+                .tcp_ports()
+                .new_owner(Arc::new(SocketDeviceBinding::from_ifindex(0))),
         };
+        let device_binding = port_owner.device_binding();
         Self {
             inner: RwSem::new(Some(inner)),
             shutdown: AtomicUsize::new(0),
@@ -194,7 +193,8 @@ impl TcpSocket {
             self_ref: me.clone(),
             pollee: AtomicUsize::new(pollee_bits),
             netns,
-            device_binding: Arc::new(SocketDeviceBinding::from_ifindex(inherited_device)),
+            device_binding,
+            port_owner,
             epoll_items: EPollItems::default(),
             fasync_items: FAsyncItems::default(),
             options: TcpSocketOptions::new(),
@@ -350,11 +350,6 @@ impl TcpSocket {
     #[inline]
     pub(crate) fn so_filter_attached(&self) -> &AtomicBool {
         &self.options.so_filter_attached
-    }
-
-    #[inline]
-    pub(crate) fn so_reuseaddr(&self) -> &AtomicBool {
-        &self.options.so_reuseaddr
     }
 
     #[inline]

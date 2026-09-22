@@ -184,6 +184,7 @@ impl TcpSocket {
                 self.netns(),
                 v6_only,
                 self.device_binding.clone(),
+                &self.port_owner,
             ) {
                 Ok(bound) => {
                     // Linux inet6_bind() makes a concrete native IPv6 binding v6-only.
@@ -228,6 +229,7 @@ impl TcpSocket {
                         .ipv6_only
                         .load(core::sync::atomic::Ordering::Relaxed),
                     self.device_binding.clone(),
+                    &self.port_owner,
                 );
                 match listen_result {
                     Ok(listening) => {
@@ -381,7 +383,7 @@ impl TcpSocket {
                     self.netns(),
                     self.self_ref.clone(),
                     self.ip_version,
-                    self.device_binding.clone(),
+                    &self.port_owner,
                 ) {
                     Ok(connecting) => (
                         inner::Inner::Connecting(connecting),
@@ -725,13 +727,15 @@ impl TcpSocket {
                 // Ensure we have the latest state from smoltcp
                 let _ = conn.update_io_events(&self.pollee);
 
-                if conn.failure_reason().is_some() {
+                if conn.failure_reason().is_some() || conn.is_refused_consumed() {
                     conn.consume_error();
                     let (new_inner, _) = conn.into_result();
-                    writer.replace(new_inner);
-                } else if conn.is_refused_consumed() {
-                    let (new_inner, _) = conn.into_result();
-                    writer.replace(new_inner);
+                    let inner::Inner::Init(init) = new_inner else {
+                        unreachable!("failed connection returns an initial socket");
+                    };
+                    // A failed explicit connect retains its binding for retry,
+                    // but close must still remove the protocol handle.
+                    writer.replace(inner::Inner::Closed(init.close()));
                 } else {
                     let mut conn = unsafe { conn.into_established_after_unbind() };
                     let handle = conn.handle();

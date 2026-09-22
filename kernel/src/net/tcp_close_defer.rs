@@ -1,4 +1,4 @@
-//! TCP close(2) 语义辅助：延迟回收 smoltcp TCP socket，贴近 Linux 行为且不修改 smoltcp。
+//! TCP close(2) 语义辅助：在途访问结束后回收完整 socket，保留协议生命周期。
 //!
 //! Linux 语义简述：
 //! - close(fd) 仅释放文件描述符引用，内核仍会让 TCP 状态机继续运行（发送 FIN/重传/进入 TIME_WAIT 等）；
@@ -7,11 +7,11 @@
 //! DragonOS/smoltcp 适配点：
 //! - smoltcp 的 `SocketHandle` 必须留在 `SocketSet` 里才能继续推进状态机；
 //! - 但 close(fd) 后包裹该 handle 的 `TcpSocket` 可能立刻 drop，因此需要一个
-//!   “独立于 TcpSocket 生命周期”的回收队列来保存 handle，等状态到 Closed 再 remove。
+//!   独立回收队列来保存 handle；Closed 后移除，TIME_WAIT 则转交轻量协议表。
 
 use alloc::sync::Weak;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::libs::mutex::Mutex;
 use crate::net::socket::inet::InetSocket;
@@ -83,6 +83,8 @@ struct ClosingTcpSocket {
 pub struct TcpCloseDefer {
     closing: Mutex<Vec<ClosingTcpSocket>>,
     pending: AtomicUsize,
+    /// Compact TIME_WAIT entries still need namespace-routed replies and timers.
+    time_wait_pending: AtomicBool,
     reap_cursor: AtomicUsize,
     stats: Mutex<TcpCloseDeferStats>,
 }
@@ -92,6 +94,7 @@ impl TcpCloseDefer {
         Self {
             closing: Mutex::new(Vec::new()),
             pending: AtomicUsize::new(0),
+            time_wait_pending: AtomicBool::new(false),
             reap_cursor: AtomicUsize::new(0),
             stats: Mutex::new(TcpCloseDeferStats::default()),
         }
@@ -129,7 +132,7 @@ impl TcpCloseDefer {
 
     #[inline]
     pub fn has_pending(&self) -> bool {
-        self.pending.load(Ordering::Acquire) != 0
+        self.pending.load(Ordering::Acquire) != 0 || self.time_wait_pending.load(Ordering::Acquire)
     }
 
     #[inline]
@@ -150,6 +153,8 @@ impl TcpCloseDefer {
         now: smoltcp::time::Instant,
         sockets: &mut smoltcp::iface::SocketSet<'static>,
     ) {
+        self.time_wait_pending
+            .store(sockets.has_tcp_time_wait(), Ordering::Release);
         let mut closing = self.closing.lock();
         if closing.is_empty() {
             return;
@@ -185,7 +190,11 @@ impl TcpCloseDefer {
                     > 0;
 
             if should_abort_post_close_data
-                || (orphan_timed_out && !matches!(state, smoltcp::socket::tcp::State::Closed))
+                || (orphan_timed_out
+                    && !matches!(
+                        state,
+                        smoltcp::socket::tcp::State::Closed | smoltcp::socket::tcp::State::TimeWait
+                    ))
             {
                 sockets
                     .get_mut::<smoltcp::socket::tcp::Socket>(handle)
@@ -234,7 +243,18 @@ impl TcpCloseDefer {
                     i += 1;
                     continue;
                 }
-                sockets.remove(handle);
+                if state == smoltcp::socket::tcp::State::TimeWait {
+                    // Move protocol state and its port observer together. Dropping
+                    // the full socket must not release the tuple or its timer.
+                    if !sockets.detach_tcp_time_wait(handle) {
+                        // The final ACK may still be waiting for a TX token.
+                        i += 1;
+                        continue;
+                    }
+                    self.time_wait_pending.store(true, Ordering::Release);
+                } else {
+                    sockets.remove(handle);
+                }
                 closing.swap_remove(i);
                 self.pending.fetch_sub(1, Ordering::Release);
                 let mut stats = self.stats.lock();

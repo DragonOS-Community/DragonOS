@@ -533,9 +533,9 @@ impl IfaceCommon {
             let routed_this_round = route_policy.is_some();
             let owner_is_up = scope == IfacePollScope::Full;
 
-            let timestamp = crate::time::Instant::now().into();
             let mut sockets = self.sockets.lock();
             let mut interface = self.smol_iface.lock();
+            let timestamp = crate::time::Instant::now().into();
             if self.poll_scope() != scope {
                 drop(interface);
                 drop(sockets);
@@ -720,9 +720,9 @@ impl IfaceCommon {
             let routed_this_round = route_policy.is_some();
             let owner_is_up = scope == IfacePollScope::Full;
 
-            let timestamp = crate::time::Instant::now().into();
             let mut sockets = self.sockets.lock();
             let mut interface = self.smol_iface.lock();
+            let timestamp = crate::time::Instant::now().into();
             if self.poll_scope() != scope {
                 drop(interface);
                 drop(sockets);
@@ -863,6 +863,8 @@ impl IfaceCommon {
             } else {
                 let _ = interface.poll_egress(timestamp, device, &mut sockets);
             }
+
+            self.tcp_close_defer.reap_closed(timestamp, &mut sockets);
 
             self.release_resolved_routed_outputs(
                 &mut interface,

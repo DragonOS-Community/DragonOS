@@ -21,6 +21,13 @@ RUN_START_TIMEOUT="${BENCH_RUN_START_TIMEOUT:-600}"  # until run begins
 TOTAL_TIMEOUT="${BENCH_TOTAL_TIMEOUT:-3600}"    # whole run (benchmarks are slow)
 IDLE_TIMEOUT="${BENCH_IDLE_TIMEOUT:-600}"       # no serial output
 
+# QEMU's stdio backend leaves the shared terminal in raw mode. Restore only
+# output newline handling so host messages start at column zero; retain raw
+# input for the guest console. Non-interactive runs have no terminal to adjust.
+if [ -t 1 ]; then
+    stty opost onlcr < /dev/tty 2>/dev/null || true
+fi
+
 get_qemu_pid() { [ -f "${VMSTATE_DIR}/pid" ] && cat "${VMSTATE_DIR}/pid" || echo ""; }
 
 clean_up() {

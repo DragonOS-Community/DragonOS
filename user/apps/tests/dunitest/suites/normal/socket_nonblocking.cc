@@ -6,6 +6,7 @@
 #include <signal.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
+#include <sys/uio.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -93,6 +94,66 @@ class Sockets {
 };
 
 class SocketNonblocking : public testing::TestWithParam<int> {};
+
+// Exercise file-style socket reads as used by TLS BIOs, not just recv().
+void CheckFileReadNonblocking(int kind, ssize_t (*read_bytes)(int, char*)) {
+    Bounded([&] {
+        Sockets sockets;
+        int pair[2];
+        ASSERT_NO_FATAL_FAILURE(sockets.Pair(kind, pair));
+        int alias = sockets.Keep(dup(pair[0]));
+        ASSERT_GE(alias, 0);
+        int enabled = 1;
+        ASSERT_EQ(0, ioctl(pair[0], FIONBIO, &enabled));
+        int flags = fcntl(alias, F_GETFL);
+        ASSERT_GE(flags, 0);
+        ASSERT_NE(0, flags & O_NONBLOCK);
+
+        char bytes[2] = {};
+        ASSERT_EQ(-1, read_bytes(alias, bytes));
+        ASSERT_EQ(EAGAIN, errno);
+        // One byte avoids assuming that a stream read fills its buffer.
+        ASSERT_EQ(1, send(pair[1], "x", 1, MSG_NOSIGNAL));
+        pollfd ready{alias, POLLIN, 0};
+        ASSERT_EQ(1, poll(&ready, 1, 1000));
+        ASSERT_EQ(1, read_bytes(alias, bytes));
+        EXPECT_EQ('x', bytes[0]);
+        EXPECT_EQ(0, bytes[1]);
+        ASSERT_EQ(-1, read_bytes(alias, bytes));
+        ASSERT_EQ(EAGAIN, errno);
+
+        enabled = 0;
+        ASSERT_EQ(0, ioctl(alias, FIONBIO, &enabled));
+        flags = fcntl(pair[0], F_GETFL);
+        ASSERT_GE(flags, 0);
+        ASSERT_EQ(0, flags & O_NONBLOCK);
+        ssize_t sent = -1;
+        std::thread writer([&] {
+            usleep(50000);
+            sent = send(pair[1], "y", 1, MSG_NOSIGNAL);
+        });
+        ssize_t received = read_bytes(pair[0], bytes);
+        int error = errno;
+        writer.join();
+        ASSERT_EQ(1, sent);
+        ASSERT_EQ(1, received) << "errno=" << error;
+        EXPECT_EQ('y', bytes[0]);
+        EXPECT_EQ(0, bytes[1]);
+    });
+}
+
+TEST_P(SocketNonblocking, IoctlToggleAndDrainAffectRead) {
+    CheckFileReadNonblocking(GetParam(), [](int fd, char* bytes) {
+        return read(fd, bytes, 2);
+    });
+}
+
+TEST_P(SocketNonblocking, IoctlToggleAndDrainAffectReadv) {
+    CheckFileReadNonblocking(GetParam(), [](int fd, char* bytes) {
+        iovec buffers[] = {{bytes, 1}, {bytes + 1, 1}};
+        return readv(fd, buffers, 2);
+    });
+}
 
 TEST_P(SocketNonblocking, IoctlToggleAndDupAffectReceive) {
     Bounded([&] {

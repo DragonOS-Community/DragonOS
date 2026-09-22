@@ -194,7 +194,7 @@ impl IfaceCommon {
     pub(super) fn enqueue_routed_output(
         &self,
         oif: u32,
-        next_hop: smoltcp::wire::Ipv4Address,
+        next_hop: smoltcp::wire::IpAddress,
         ip_packet: &[u8],
         retry_at: smoltcp::time::Instant,
         probe_sent: bool,
@@ -211,7 +211,7 @@ impl IfaceCommon {
     pub(super) fn prepare_routed_output(
         &self,
         oif: u32,
-        next_hop: smoltcp::wire::Ipv4Address,
+        next_hop: smoltcp::wire::IpAddress,
         ip_packet: &[u8],
     ) -> Result<(LocalOutputPacket, LocalOutputReservation<'_>), SystemError> {
         if ip_packet.len() > self.mtu.load(Ordering::Acquire) {
@@ -253,7 +253,7 @@ impl IfaceCommon {
     pub(super) fn enqueue_existing_routed_output(
         &self,
         oif: u32,
-        next_hop: smoltcp::wire::Ipv4Address,
+        next_hop: smoltcp::wire::IpAddress,
         ip_packet: &[u8],
     ) -> Result<Option<smoltcp::time::Instant>, SystemError> {
         let pending = self
@@ -381,12 +381,8 @@ impl IfaceCommon {
         }
         let ifindex = self.iface_id as u32;
         self.local_input_queue.release_resolved_outputs(|next_hop| {
-            configured.is_some_and(|neighbors| {
-                neighbors
-                    .lookup(ifindex, smoltcp::wire::IpAddress::Ipv4(next_hop))
-                    .is_some()
-            }) || interface
-                .is_neighbor_resolved(timestamp, smoltcp::wire::IpAddress::Ipv4(next_hop))
+            configured.is_some_and(|neighbors| neighbors.lookup(ifindex, next_hop).is_some())
+                || interface.is_neighbor_resolved(timestamp, next_hop)
         });
     }
 
@@ -419,16 +415,15 @@ impl IfaceCommon {
         &self,
         netns: Option<&Arc<NetNamespace>>,
         needs_routed_poll: bool,
-        authoritative_ipv4_output: bool,
-        configured_ipv4_output: bool,
+        authoritative_output: bool,
+        configured_output: bool,
     ) -> PollModeRecheck {
-        if !authoritative_ipv4_output
-            && netns.is_some_and(|netns| netns.router().requires_authoritative_ipv4_output())
+        if !authoritative_output
+            && netns.is_some_and(|netns| netns.router().requires_authoritative_output())
         {
             PollModeRecheck::Authoritative
         } else if (!needs_routed_poll && self.needs_namespace_routing())
-            || (!configured_ipv4_output
-                && netns.is_some_and(crate::net::neighbor::has_ipv4_entries))
+            || (!configured_output && netns.is_some_and(crate::net::neighbor::has_ethernet_entries))
         {
             PollModeRecheck::Routed
         } else {
@@ -514,17 +509,17 @@ impl IfaceCommon {
             }
 
             let netns = self.net_namespace();
-            let authoritative_ipv4_output = force_authoritative
+            let authoritative_output = force_authoritative
                 || netns
                     .as_ref()
-                    .is_some_and(|netns| netns.router().requires_authoritative_ipv4_output());
-            let configured_ipv4_output = netns
+                    .is_some_and(|netns| netns.router().requires_authoritative_output());
+            let configured_output = netns
                 .as_ref()
-                .is_some_and(crate::net::neighbor::has_ipv4_entries);
+                .is_some_and(crate::net::neighbor::has_ethernet_entries);
             let needs_routed_poll = self.needs_namespace_routing()
                 || scope == IfacePollScope::LocalOnly
-                || authoritative_ipv4_output
-                || configured_ipv4_output;
+                || authoritative_output
+                || configured_output;
             let router = if needs_routed_poll {
                 netns.as_ref().map(|netns| netns.router())
             } else {
@@ -549,7 +544,7 @@ impl IfaceCommon {
                 continue;
             }
             let configured_neighbors = netns.as_ref().and_then(|netns| {
-                crate::net::neighbor::has_ipv4_entries(netns)
+                crate::net::neighbor::has_ethernet_entries(netns)
                     .then(|| crate::net::neighbor::read(netns))
             });
 
@@ -559,8 +554,8 @@ impl IfaceCommon {
             let restart = self.recheck_poll_mode(
                 netns.as_ref(),
                 needs_routed_poll,
-                authoritative_ipv4_output,
-                configured_ipv4_output,
+                authoritative_output,
+                configured_output,
             );
             if restart != PollModeRecheck::Current {
                 drop(configured_neighbors);
@@ -576,7 +571,7 @@ impl IfaceCommon {
                 configured_neighbors: configured_neighbors.as_ref(),
                 owner_ifindex: self.iface_id as u32,
                 owner_is_up,
-                authoritative_ipv4_output,
+                authoritative_output,
             });
 
             let (has_events, poll_again, deadline_rearm) = {
@@ -701,17 +696,17 @@ impl IfaceCommon {
             }
 
             let netns = self.net_namespace();
-            let authoritative_ipv4_output = force_authoritative
+            let authoritative_output = force_authoritative
                 || netns
                     .as_ref()
-                    .is_some_and(|netns| netns.router().requires_authoritative_ipv4_output());
-            let configured_ipv4_output = netns
+                    .is_some_and(|netns| netns.router().requires_authoritative_output());
+            let configured_output = netns
                 .as_ref()
-                .is_some_and(crate::net::neighbor::has_ipv4_entries);
+                .is_some_and(crate::net::neighbor::has_ethernet_entries);
             let needs_routed_poll = self.needs_namespace_routing()
                 || scope == IfacePollScope::LocalOnly
-                || authoritative_ipv4_output
-                || configured_ipv4_output;
+                || authoritative_output
+                || configured_output;
             let router = if needs_routed_poll {
                 netns.as_ref().map(|netns| netns.router())
             } else {
@@ -736,15 +731,15 @@ impl IfaceCommon {
                 continue;
             }
             let configured_neighbors = netns.as_ref().and_then(|netns| {
-                crate::net::neighbor::has_ipv4_entries(netns)
+                crate::net::neighbor::has_ethernet_entries(netns)
                     .then(|| crate::net::neighbor::read(netns))
             });
 
             let restart = self.recheck_poll_mode(
                 netns.as_ref(),
                 needs_routed_poll,
-                authoritative_ipv4_output,
-                configured_ipv4_output,
+                authoritative_output,
+                configured_output,
             );
             if restart != PollModeRecheck::Current {
                 drop(configured_neighbors);
@@ -760,7 +755,7 @@ impl IfaceCommon {
                 configured_neighbors: configured_neighbors.as_ref(),
                 owner_ifindex: self.iface_id as u32,
                 owner_is_up,
-                authoritative_ipv4_output,
+                authoritative_output,
             });
 
             let mut processed = 0usize;
@@ -1417,7 +1412,7 @@ impl IfaceCommon {
     pub(crate) fn release_configured_neighbor(
         &self,
         ifindex: u32,
-        next_hop: smoltcp::wire::Ipv4Address,
+        next_hop: smoltcp::wire::IpAddress,
     ) -> bool {
         self.local_input_queue.release_neighbor(ifindex, next_hop)
     }
@@ -1428,7 +1423,7 @@ impl IfaceCommon {
     pub(crate) fn configured_neighbor_committed(
         &self,
         ifindex: u32,
-        next_hop: smoltcp::wire::Ipv4Address,
+        next_hop: smoltcp::wire::IpAddress,
     ) {
         if self.release_configured_neighbor(ifindex, next_hop) {
             self.schedule_registered_local_output(crate::time::Instant::now().into());

@@ -8,7 +8,7 @@ use super::{
     fib_index::{projection_key, AliasPlacement, BroadcastLookup, FibIndex, ProjectionKey},
     is_ipv4, RouteDeleteSelector, RouteEntry, RouteLookupResult, RouteMutationOutcome,
     RouteNewFlags, RouteNotifications, RouteSourcePolicy, RT_SCOPE_LINK, RT_TABLE_DEFAULT,
-    RT_TABLE_LOCAL,
+    RT_TABLE_LOCAL, RT_TABLE_MAIN,
 };
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -621,9 +621,11 @@ impl FibTable {
 
     /// A flat smoltcp LPM projection cannot preserve RPDB table priority when
     /// a more-specific default-table route overlaps a main-table route. Keep
-    /// such namespaces on the authoritative IPv4 egress path instead.
-    pub(in crate::net) fn requires_authoritative_ipv4_output(&self) -> bool {
-        self.index.has_ipv4_routes(RT_TABLE_DEFAULT)
+    /// such namespaces on the authoritative egress path instead. IPv6 also
+    /// needs that path when main-table routing is configured: a socketless
+    /// ICMPv6 reply may leave through a different interface from its owner.
+    pub(in crate::net) fn requires_authoritative_output(&self) -> bool {
+        self.index.has_ipv4_routes(RT_TABLE_DEFAULT) || self.index.has_ipv6_routes(RT_TABLE_MAIN)
     }
 
     pub(super) fn resolve_gateway(

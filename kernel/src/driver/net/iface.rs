@@ -181,7 +181,7 @@ pub trait Iface: crate::driver::base::device::Device {
         self.raw_transmit(&frame)
     }
 
-    /// Sends an already-routed IPv4 packet through this interface.
+    /// Sends an already-routed IP packet through this interface.
     ///
     /// Ethernet devices share this implementation so FIB eligibility cannot
     /// drift from driver-specific forwarding hooks. smoltcp resolves the
@@ -193,10 +193,9 @@ pub trait Iface: crate::driver::base::device::Device {
         next_hop: &smoltcp::wire::IpAddress,
         ip_packet: &[u8],
     ) -> Result<(), RouteSendError> {
-        let smoltcp::wire::IpAddress::Ipv4(next_hop) = *next_hop else {
-            return Err(SystemError::EAFNOSUPPORT.into());
-        };
-        let frame_capacity = (14usize + ip_packet.len()).max(42);
+        // A short original packet may instead emit an ARP request or an
+        // IPv6 Neighbor Solicitation (Ethernet + IPv6 + NS with SLLAO).
+        let frame_capacity = (14usize + ip_packet.len()).max(86);
         let mut frame = Vec::new();
         frame
             .try_reserve_exact(frame_capacity)
@@ -204,24 +203,18 @@ pub trait Iface: crate::driver::base::device::Device {
         let frame_prepared = Cell::new(false);
         let permanent_neighbor = self
             .net_namespace()
-            .and_then(|netns| {
-                crate::net::neighbor::lookup(
-                    &netns,
-                    self.nic_id() as u32,
-                    smoltcp::wire::IpAddress::Ipv4(next_hop),
-                )
-            })
+            .and_then(|netns| crate::net::neighbor::lookup(&netns, self.nic_id() as u32, *next_hop))
             .map(smoltcp::wire::HardwareAddress::Ethernet);
 
         let dispatch = {
             let mut interface = self.smol_iface().lock();
-            interface.dispatch_ipv4_packet(
+            interface.dispatch_ip_packet(
                 crate::time::Instant::now().into(),
                 PreparedFrameTxToken {
                     frame: &mut frame,
                     prepared: &frame_prepared,
                 },
-                next_hop,
+                *next_hop,
                 permanent_neighbor,
                 ip_packet,
             )
@@ -234,20 +227,20 @@ pub trait Iface: crate::driver::base::device::Device {
         }
         match dispatch {
             Ok(()) => Ok(()),
-            Err(smoltcp::iface::Ipv4PacketDispatchError::NeighborPending { retry_at }) => {
+            Err(smoltcp::iface::IpPacketDispatchError::NeighborPending { retry_at }) => {
                 Err(RouteSendError::RetryAt {
                     retry_at,
                     probe_sent,
                 })
             }
-            Err(smoltcp::iface::Ipv4PacketDispatchError::NoRoute) => {
+            Err(smoltcp::iface::IpPacketDispatchError::NoRoute) => {
                 Err(SystemError::ENETUNREACH.into())
             }
-            Err(smoltcp::iface::Ipv4PacketDispatchError::Exhausted) => {
+            Err(smoltcp::iface::IpPacketDispatchError::Exhausted) => {
                 Err(SystemError::EAGAIN_OR_EWOULDBLOCK.into())
             }
-            Err(smoltcp::iface::Ipv4PacketDispatchError::Malformed)
-            | Err(smoltcp::iface::Ipv4PacketDispatchError::InvalidHardwareAddress) => {
+            Err(smoltcp::iface::IpPacketDispatchError::Malformed)
+            | Err(smoltcp::iface::IpPacketDispatchError::InvalidHardwareAddress) => {
                 Err(SystemError::EINVAL.into())
             }
         }
@@ -261,9 +254,7 @@ pub trait Iface: crate::driver::base::device::Device {
         next_hop: &smoltcp::wire::IpAddress,
         ip_packet: &[u8],
     ) -> Result<(), SystemError> {
-        let smoltcp::wire::IpAddress::Ipv4(next_hop) = *next_hop else {
-            return Err(SystemError::EAFNOSUPPORT);
-        };
+        let next_hop = *next_hop;
         if ip_packet.len() > self.mtu() {
             return Err(SystemError::EMSGSIZE);
         }
@@ -283,35 +274,34 @@ pub trait Iface: crate::driver::base::device::Device {
             return Ok(());
         }
         let tx_generation = self.common().tx_completion_generation();
-        let (retry_at, probe_sent) =
-            match self.route_and_send(&smoltcp::wire::IpAddress::Ipv4(next_hop), ip_packet) {
-                Ok(()) => return Ok(()),
-                Err(RouteSendError::RetryAt {
-                    retry_at,
-                    probe_sent,
-                }) => (retry_at, probe_sent),
-                Err(RouteSendError::Failed(SystemError::ENOBUFS))
-                | Err(RouteSendError::Failed(SystemError::EAGAIN_OR_EWOULDBLOCK)) => {
-                    let now: smoltcp::time::Instant = crate::time::Instant::now().into();
-                    let delay_us = self.common().next_local_output_tx_backoff_us();
-                    let retry_at = now + smoltcp::time::Duration::from_micros(delay_us);
-                    let (packet, reservation) = self.common().prepare_routed_output(
-                        self.nic_id() as u32,
-                        next_hop,
-                        ip_packet,
-                    )?;
-                    reservation.requeue_backpressured(packet, retry_at);
-                    let retry_at = if self.common().release_tx_backpressure_after(tx_generation) {
-                        now
-                    } else {
-                        retry_at
-                    };
-                    self.common()
-                        .schedule_local_output(retry_at, napi, scheduler_netns);
-                    return Ok(());
-                }
-                Err(RouteSendError::Failed(error)) => return Err(error),
-            };
+        let (retry_at, probe_sent) = match self.route_and_send(&next_hop, ip_packet) {
+            Ok(()) => return Ok(()),
+            Err(RouteSendError::RetryAt {
+                retry_at,
+                probe_sent,
+            }) => (retry_at, probe_sent),
+            Err(RouteSendError::Failed(SystemError::ENOBUFS))
+            | Err(RouteSendError::Failed(SystemError::EAGAIN_OR_EWOULDBLOCK)) => {
+                let now: smoltcp::time::Instant = crate::time::Instant::now().into();
+                let delay_us = self.common().next_local_output_tx_backoff_us();
+                let retry_at = now + smoltcp::time::Duration::from_micros(delay_us);
+                let (packet, reservation) = self.common().prepare_routed_output(
+                    self.nic_id() as u32,
+                    next_hop,
+                    ip_packet,
+                )?;
+                reservation.requeue_backpressured(packet, retry_at);
+                let retry_at = if self.common().release_tx_backpressure_after(tx_generation) {
+                    now
+                } else {
+                    retry_at
+                };
+                self.common()
+                    .schedule_local_output(retry_at, napi, scheduler_netns);
+                return Ok(());
+            }
+            Err(RouteSendError::Failed(error)) => return Err(error),
+        };
 
         self.common().enqueue_routed_output(
             self.nic_id() as u32,
@@ -337,11 +327,11 @@ pub trait Iface: crate::driver::base::device::Device {
         Ok(())
     }
 
-    /// Hands a namespace-local IPv4 packet to this interface's protocol stack
+    /// Hands a namespace-local IP packet to this interface's protocol stack
     /// without emitting it on the link. The shared queue in `IfaceCommon`
     /// makes local delivery a protocol-stack capability rather than an
     /// optional device-driver feature.
-    fn inject_local_ipv4_packet(
+    fn inject_local_ip_packet(
         &self,
         ingress_ifindex: u32,
         source_mac: smoltcp::wire::EthernetAddress,

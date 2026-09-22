@@ -34,6 +34,12 @@ impl LocalInputPacket {
     }
 
     pub(super) fn into_frame(self, medium: smoltcp::phy::Medium) -> Result<Vec<u8>, SystemError> {
+        let ethertype = match smoltcp::wire::IpVersion::of_packet(&self.ip_packet)
+            .map_err(|_| SystemError::EINVAL)?
+        {
+            smoltcp::wire::IpVersion::Ipv4 => [0x08, 0x00],
+            smoltcp::wire::IpVersion::Ipv6 => [0x86, 0xdd],
+        };
         if medium == smoltcp::phy::Medium::Ip {
             return Ok(self.ip_packet);
         }
@@ -46,7 +52,7 @@ impl LocalInputPacket {
             .map_err(|_| SystemError::ENOMEM)?;
         frame.extend_from_slice(&self.destination_mac.0);
         frame.extend_from_slice(&self.source_mac.0);
-        frame.extend_from_slice(&[0x08, 0x00]);
+        frame.extend_from_slice(&ethertype);
         frame.extend_from_slice(&self.ip_packet);
         Ok(frame)
     }
@@ -83,51 +89,123 @@ pub(super) enum LocalOutputDisposition {
     },
     Routed {
         oif: u32,
-        next_hop: smoltcp::wire::Ipv4Address,
+        next_hop: smoltcp::wire::IpAddress,
         ip_mtu: usize,
     },
     Drop,
 }
 
 impl LocalOutputDisposition {
-    pub(super) const DROP_CONTEXT: u64 = 0;
-    const LOCAL_CONTEXT: u64 = 1 << 63;
-    // Reserved opaque smoltcp fragment context. Valid ifindices use the
-    // positive i32 range, so neither routed nor local encodings can collide
-    // with the all-ones value.
-    pub(super) const NATIVE_CONTEXT: u64 = u64::MAX;
+    pub(super) const DROP_CONTEXT: [u64; 3] = [0; 3];
+    pub(super) const NATIVE_CONTEXT: [u64; 3] = [1, 0, 0];
+    const LOCAL_TAG: u64 = 2;
+    const IPV4_TAG: u64 = 4;
+    const IPV6_TAG: u64 = 6;
 
-    pub(super) fn routed_context(oif: u32, next_hop: smoltcp::wire::Ipv4Address) -> u64 {
+    pub(super) fn routed_context(oif: u32, next_hop: smoltcp::wire::IpAddress) -> [u64; 3] {
         debug_assert_ne!(oif, 0);
-        debug_assert_eq!(oif & (1 << 31), 0);
-        ((oif as u64) << 32) | u32::from_be_bytes(next_hop.octets()) as u64
+        match next_hop {
+            smoltcp::wire::IpAddress::Ipv4(address) => [
+                ((oif as u64) << 32) | Self::IPV4_TAG,
+                0,
+                u32::from_be_bytes(address.octets()) as u64,
+            ],
+            smoltcp::wire::IpAddress::Ipv6(address) => {
+                let bytes = address.octets();
+                [
+                    ((oif as u64) << 32) | Self::IPV6_TAG,
+                    u64::from_be_bytes(bytes[..8].try_into().unwrap()),
+                    u64::from_be_bytes(bytes[8..].try_into().unwrap()),
+                ]
+            }
+        }
     }
 
-    pub(super) fn local_context(oif: u32) -> u64 {
+    pub(super) fn local_context(oif: u32) -> [u64; 3] {
         debug_assert_ne!(oif, 0);
-        debug_assert_eq!(oif & (1 << 31), 0);
-        Self::LOCAL_CONTEXT | ((oif as u64) << 32)
+        [((oif as u64) << 32) | Self::LOCAL_TAG, 0, 0]
     }
 
-    pub(super) fn from_context(context: u64, ip_mtu: usize) -> Self {
+    pub(super) fn from_context(context: [u64; 3], ip_mtu: usize) -> Self {
         if context == Self::NATIVE_CONTEXT {
             return Self::NativeOwner;
         }
-        if context & Self::LOCAL_CONTEXT != 0 {
-            return Self::Local {
-                oif: ((context >> 32) as u32) & !(1 << 31),
-                ip_mtu,
-            };
-        }
-        let oif = (context >> 32) as u32;
+        let oif = (context[0] >> 32) as u32;
         if oif == 0 {
             return Self::Drop;
         }
-        let octets = (context as u32).to_be_bytes();
+        let next_hop = match context[0] & u32::MAX as u64 {
+            Self::LOCAL_TAG if context[1..] == [0, 0] => return Self::Local { oif, ip_mtu },
+            Self::IPV4_TAG if context[1] == 0 && context[2] <= u32::MAX as u64 => {
+                smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address::from(
+                    (context[2] as u32).to_be_bytes(),
+                ))
+            }
+            Self::IPV6_TAG => {
+                let mut bytes = [0; 16];
+                bytes[..8].copy_from_slice(&context[1].to_be_bytes());
+                bytes[8..].copy_from_slice(&context[2].to_be_bytes());
+                smoltcp::wire::IpAddress::Ipv6(smoltcp::wire::Ipv6Address::from(bytes))
+            }
+            _ => return Self::Drop,
+        };
         Self::Routed {
             oif,
-            next_hop: smoltcp::wire::Ipv4Address::new(octets[0], octets[1], octets[2], octets[3]),
+            next_hop,
             ip_mtu,
+        }
+    }
+}
+
+#[cfg(test)]
+mod context_tests {
+    use super::*;
+    use smoltcp::wire::{IpAddress, Ipv4Address, Ipv6Address};
+
+    #[test]
+    fn routed_context_preserves_both_families_and_full_ipv6_address() {
+        let addresses = [
+            IpAddress::Ipv4(Ipv4Address::new(192, 0, 2, 1)),
+            IpAddress::Ipv6(Ipv6Address::from([
+                0xfd, 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0, 0x11, 0x22, 0x33, 0xc0, 0, 2,
+                1,
+            ])),
+        ];
+        for address in addresses {
+            for ifindex in [1, 42, i32::MAX as u32] {
+                let context = LocalOutputDisposition::routed_context(ifindex, address);
+                let LocalOutputDisposition::Routed {
+                    oif,
+                    next_hop,
+                    ip_mtu,
+                } = LocalOutputDisposition::from_context(context, 1280)
+                else {
+                    panic!("routed context changed disposition")
+                };
+                assert_eq!((oif, next_hop, ip_mtu), (ifindex, address, 1280));
+            }
+        }
+        assert!(matches!(
+            LocalOutputDisposition::from_context(LocalOutputDisposition::local_context(42), 1500),
+            LocalOutputDisposition::Local {
+                oif: 42,
+                ip_mtu: 1500
+            }
+        ));
+        assert!(matches!(
+            LocalOutputDisposition::from_context(LocalOutputDisposition::NATIVE_CONTEXT, 1500),
+            LocalOutputDisposition::NativeOwner
+        ));
+        assert!(matches!(
+            LocalOutputDisposition::from_context(LocalOutputDisposition::DROP_CONTEXT, 1500),
+            LocalOutputDisposition::Drop
+        ));
+        // Unknown tags and malformed IPv4 payloads fail closed.
+        for context in [[(42 << 32) | 3, 0, 0], [(42 << 32) | 4, 1, 0], [6, 1, 2]] {
+            assert!(matches!(
+                LocalOutputDisposition::from_context(context, 1500),
+                LocalOutputDisposition::Drop
+            ));
         }
     }
 }
@@ -604,7 +682,7 @@ impl LocalInputQueue {
 
     pub(super) fn release_resolved_outputs(
         &self,
-        mut is_resolved: impl FnMut(smoltcp::wire::Ipv4Address) -> bool,
+        mut is_resolved: impl FnMut(smoltcp::wire::IpAddress) -> bool,
     ) {
         let mut output = self.output.lock();
         let LocalOutputQueueState {
@@ -615,7 +693,7 @@ impl LocalInputQueue {
         deferred_routes.release_resolved(&mut is_resolved, packets);
     }
 
-    pub(super) fn release_neighbor(&self, oif: u32, next_hop: smoltcp::wire::Ipv4Address) -> bool {
+    pub(super) fn release_neighbor(&self, oif: u32, next_hop: smoltcp::wire::IpAddress) -> bool {
         let mut output = self.output.lock();
         let LocalOutputQueueState {
             packets,

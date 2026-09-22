@@ -114,8 +114,8 @@ pub(crate) fn read(netns: &Arc<NetNamespace>) -> NeighborReadGuard<'_> {
     netns.neighbor_table().read()
 }
 
-pub(crate) fn has_ipv4_entries(netns: &Arc<NetNamespace>) -> bool {
-    netns.neighbor_table().has_ipv4_entries()
+pub(crate) fn has_ethernet_entries(netns: &Arc<NetNamespace>) -> bool {
+    netns.neighbor_table().has_ethernet_entries()
 }
 
 /// Allocation-complete removal of all configured neighbors owned by one
@@ -185,9 +185,7 @@ fn release_deferred_neighbor(iface: &Arc<dyn Iface>, entry: NeighborEntry) {
     if !entry.ethernet_output {
         return;
     }
-    let IpAddress::Ipv4(next_hop) = entry.destination else {
-        return;
-    };
+    let next_hop = entry.destination;
     iface
         .common()
         .configured_neighbor_committed(entry.ifindex, next_hop);
@@ -199,9 +197,9 @@ pub(crate) fn release_deferred_after_enqueue(
     netns: &Arc<NetNamespace>,
     common: &IfaceCommon,
     ifindex: u32,
-    next_hop: smoltcp::wire::Ipv4Address,
+    next_hop: IpAddress,
 ) -> bool {
-    if lookup(netns, ifindex, IpAddress::Ipv4(next_hop)).is_none() {
+    if lookup(netns, ifindex, next_hop).is_none() {
         return false;
     }
     common.release_configured_neighbor(ifindex, next_hop)

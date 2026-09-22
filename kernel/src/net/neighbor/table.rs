@@ -26,9 +26,9 @@ use super::{
 #[derive(Debug)]
 pub(crate) struct NeighborTable {
     entries: RwSem<Vec<NeighborEntry>>,
-    /// Lock-free gate for the IPv4 egress path. The exact mapping remains in
+    /// Lock-free gate for configured Ethernet egress. The exact mapping remains in
     /// `entries`; this count only decides whether a poll must consult it.
-    ipv4_entries: AtomicUsize,
+    ethernet_entries: AtomicUsize,
 }
 
 /// Allocation-free view for packet paths that perform multiple lookups while
@@ -92,7 +92,7 @@ impl NeighborTable {
     pub(crate) fn new() -> Self {
         Self {
             entries: RwSem::new(Vec::new()),
-            ipv4_entries: AtomicUsize::new(0),
+            ethernet_entries: AtomicUsize::new(0),
         }
     }
 
@@ -157,11 +157,11 @@ impl NeighborTable {
                     flags: update.flags,
                     kind: RTN_UNICAST,
                 };
-                if entry.ethernet_output && matches!(entry.destination, IpAddress::Ipv4(_)) {
+                if entry.ethernet_output {
                     // Publish the conservative slow-path gate before the
                     // non-fallible insert, so a packet cannot miss a committed
                     // configured mapping.
-                    self.ipv4_entries.fetch_add(1, AtomicOrdering::Release);
+                    self.ethernet_entries.fetch_add(1, AtomicOrdering::Release);
                 }
                 entries.insert(index, entry);
                 Ok(NeighborMutationOutcome::Added(entry))
@@ -178,8 +178,8 @@ impl NeighborTable {
         let mut entries = self.entries.write();
         let index = find(&entries, ifindex, destination).map_err(|_| SystemError::ENOENT)?;
         let removed = entries.remove(index);
-        if removed.ethernet_output && matches!(removed.destination, IpAddress::Ipv4(_)) {
-            self.ipv4_entries.fetch_sub(1, AtomicOrdering::Release);
+        if removed.ethernet_output {
+            self.ethernet_entries.fetch_sub(1, AtomicOrdering::Release);
         }
         Ok(removed)
     }
@@ -208,8 +208,8 @@ impl NeighborTable {
         Ok(NeighborSnapshot { entries: snapshot })
     }
 
-    pub(super) fn has_ipv4_entries(&self) -> bool {
-        self.ipv4_entries.load(AtomicOrdering::Acquire) != 0
+    pub(super) fn has_ethernet_entries(&self) -> bool {
+        self.ethernet_entries.load(AtomicOrdering::Acquire) != 0
     }
 
     pub(super) fn prepare_iface_purge(
@@ -258,19 +258,17 @@ impl NeighborTable {
         entries: &mut Vec<NeighborEntry>,
         range: core::ops::Range<usize>,
     ) {
-        let removed_ipv4 = entries[range.clone()]
+        let removed_ethernet = entries[range.clone()]
             .iter()
-            .filter(|entry| {
-                entry.ethernet_output && matches!(entry.destination, IpAddress::Ipv4(_))
-            })
+            .filter(|entry| entry.ethernet_output)
             .count();
         entries.drain(range);
-        if removed_ipv4 != 0 {
+        if removed_ethernet != 0 {
             // Keep a stale-positive gate until the mappings are gone. A packet
             // may take the slow path unnecessarily, but can never miss a
             // configured mapping that is still published.
-            self.ipv4_entries
-                .fetch_sub(removed_ipv4, AtomicOrdering::Release);
+            self.ethernet_entries
+                .fetch_sub(removed_ethernet, AtomicOrdering::Release);
         }
     }
 }

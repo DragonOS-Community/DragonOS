@@ -59,21 +59,6 @@ impl TcpSocket {
             Some(inner::Inner::Established(established)) => {
                 established.update_io_events(&self.pollee);
 
-                // If SHUT_WR was requested while there were pending TX bytes, send FIN once
-                // the TX queue drains to preserve Linux-like semantics.
-                if self.is_send_shutdown()
-                    && self
-                        .send_fin_deferred
-                        .load(core::sync::atomic::Ordering::Relaxed)
-                {
-                    let pending = established.with(|socket| socket.send_queue());
-                    if pending == 0 {
-                        established.with_mut(|socket| socket.close());
-                        self.send_fin_deferred
-                            .store(false, core::sync::atomic::Ordering::Relaxed);
-                    }
-                }
-
                 // If SHUT_WR, set EPOLLOUT so send() wakes up and returns EPIPE.
                 if self.is_send_shutdown() {
                     self.pollee.fetch_or(
@@ -81,36 +66,19 @@ impl TcpSocket {
                         core::sync::atomic::Ordering::Relaxed,
                     );
                 }
-                // If SHUT_RD, set EPOLLIN so recv() wakes up and returns 0 (EOF).
+                // Linux tcp_poll combines local shutdown with transport state:
+                // receive shutdown is a half-close even before a peer FIN.
                 if self.is_recv_shutdown() {
                     self.pollee.fetch_or(
-                        (EP::EPOLLIN | EP::EPOLLRDNORM).bits() as usize,
+                        (EP::EPOLLIN | EP::EPOLLRDNORM | EP::EPOLLRDHUP).bits() as usize,
                         core::sync::atomic::Ordering::Relaxed,
                     );
-                }
-
-                // Note: EPOLLHUP/EPOLLRDHUP/EPOLLERR are now handled in
-                // Established::update_io_events() based on socket state.
-                false
-            }
-            Some(inner::Inner::SelfConnected(sc)) => {
-                // Self-connect is modeled by an internal receive queue. Readable becomes true
-                // when the queue has data OR after SHUT_WR (EOF). Writable depends on queue
-                // free space unless SHUT_WR (then send() returns EPIPE).
-                sc.update_io_events(&self.pollee, self.is_recv_shutdown());
-
-                // Match established behavior for shutdown bits.
-                if self.is_send_shutdown() {
-                    self.pollee.fetch_or(
-                        (EP::EPOLLOUT | EP::EPOLLWRNORM).bits() as usize,
-                        core::sync::atomic::Ordering::Relaxed,
-                    );
-                }
-                if self.is_recv_shutdown() {
-                    self.pollee.fetch_or(
-                        (EP::EPOLLIN | EP::EPOLLRDNORM).bits() as usize,
-                        core::sync::atomic::Ordering::Relaxed,
-                    );
+                    if self.is_send_shutdown() {
+                        self.pollee.fetch_or(
+                            EP::EPOLLHUP.bits() as usize,
+                            core::sync::atomic::Ordering::Relaxed,
+                        );
+                    }
                 }
                 false
             }

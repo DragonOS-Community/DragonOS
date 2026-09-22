@@ -145,8 +145,9 @@ impl IfaceCommon {
         id: u64,
         domain: crate::net::socket::inet::common::port::TcpBindDomain,
         port: u16,
+        device: u32,
     ) {
-        self.tcp_listeners.register(id, domain, port);
+        self.tcp_listeners.register(id, domain, port, device);
     }
 
     /// Unregister an active TCP listener port on this iface.

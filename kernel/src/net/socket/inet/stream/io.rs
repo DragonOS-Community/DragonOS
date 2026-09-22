@@ -79,29 +79,19 @@ impl TcpSocket {
         }
     }
 
+    // Called with the empty cork buffer locked. Shutdown and enqueue use the
+    // same cork -> inner order, so no data can be published behind this FIN.
     fn maybe_complete_shutdown_wr_fin(&self) {
         if !self.is_send_shutdown() {
             return;
         }
-        if !self
-            .send_fin_deferred
-            .swap(false, core::sync::atomic::Ordering::Relaxed)
-        {
-            return;
-        }
-
         let mut writer = self.inner.write();
-        let inner = match writer.take() {
-            Some(inner) => inner,
-            None => return,
-        };
-        match inner {
-            inner::Inner::Established(established) => {
+        if let Some(inner::Inner::Established(established)) = writer.as_mut() {
+            if self
+                .send_fin_deferred
+                .swap(false, core::sync::atomic::Ordering::Relaxed)
+            {
                 established.with_mut(|socket| socket.close());
-                writer.replace(inner::Inner::Established(established));
-            }
-            other => {
-                writer.replace(other);
             }
         }
     }
@@ -378,8 +368,6 @@ impl TcpSocket {
         let mut total_read = 0;
 
         loop {
-            // SelfConnected does not rely on protocol-stack progress; avoid calling iface.poll()
-            // here to prevent hangs when running the whole syscall test suite.
             if let Some(iface) = self.stack_poll_iface_snapshot() {
                 if let Some(netns) = iface.common().net_namespace() {
                     netns.wakeup_poll_thread();
@@ -396,40 +384,6 @@ impl TcpSocket {
                 inner::Inner::Established(established) => established.with_mut(|socket| {
                     self.recv_established(socket, &mut buf[total_read..], flags)
                 }),
-                inner::Inner::SelfConnected(sc) => {
-                    // Self-connect: data path is a local queue.
-                    let mut current_buf = &mut buf[total_read..];
-                    let mut recv_exhausted = false;
-                    if self.is_recv_shutdown() {
-                        let remaining = self.recv_shutdown.remaining_limit();
-                        if remaining == 0 {
-                            sc.discard_all();
-                            recv_exhausted = true;
-                        } else {
-                            let cap = core::cmp::min(current_buf.len(), remaining);
-                            current_buf = &mut current_buf[..cap];
-                        }
-                    }
-
-                    if recv_exhausted {
-                        Ok(0)
-                    } else {
-                        let peek = flags.contains(PMSG::PEEK);
-                        let trunc = flags.contains(PMSG::TRUNC);
-                        match sc.recv_into(current_buf, peek, trunc) {
-                            Ok(n) => {
-                                if self.is_recv_shutdown()
-                                    && !peek
-                                    && self.recv_shutdown.record_read(n)
-                                {
-                                    sc.discard_all();
-                                }
-                                Ok(n)
-                            }
-                            Err(error) => Err(error),
-                        }
-                    }
-                }
                 inner::Inner::Connecting(connecting) => {
                     if let Some(err) = connecting.failure_reason() {
                         connecting.consume_error();
@@ -509,33 +463,6 @@ impl TcpSocket {
             {
                 inner::Inner::Established(established) => {
                     self.recv_established_to_user(established, user_buffer, total_read)
-                }
-                inner::Inner::SelfConnected(sc) => {
-                    let mut limit = user_buffer.len().saturating_sub(total_read);
-                    let mut recv_exhausted = false;
-                    if self.is_recv_shutdown() {
-                        let remaining = self.recv_shutdown.remaining_limit();
-                        if remaining == 0 {
-                            sc.discard_all();
-                            recv_exhausted = true;
-                        } else {
-                            limit = core::cmp::min(limit, remaining);
-                        }
-                    }
-
-                    if recv_exhausted {
-                        Ok(0)
-                    } else {
-                        match sc.recv_to_user(user_buffer, total_read, limit) {
-                            Ok(n) => {
-                                if self.is_recv_shutdown() && self.recv_shutdown.record_read(n) {
-                                    sc.discard_all();
-                                }
-                                Ok(n)
-                            }
-                            Err(error) => Err(error),
-                        }
-                    }
                 }
                 inner::Inner::Connecting(connecting) => {
                     if let Some(err) = connecting.failure_reason() {
@@ -668,6 +595,9 @@ impl TcpSocket {
         // keep ordering by enqueueing new bytes behind them, and opportunistically flush.
         {
             let mut cork_buf = self.cork_buf.lock();
+            if self.is_send_shutdown() {
+                return Err(SystemError::EPIPE);
+            }
             if !cork_buf.is_empty() {
                 let cap = self
                     .send_buf_size()
@@ -710,6 +640,9 @@ impl TcpSocket {
                 .send_buf_size()
                 .load(core::sync::atomic::Ordering::Relaxed);
             let mut cork_buf = self.cork_buf.lock();
+            if self.is_send_shutdown() {
+                return Err(SystemError::EPIPE);
+            }
             let free = cap.saturating_sub(cork_buf.len());
             if free == 0 {
                 return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
@@ -770,22 +703,6 @@ impl TcpSocket {
     }
 
     fn try_send_direct(&self, buf: &[u8]) -> Result<usize, SystemError> {
-        // Self-connect fast path: avoid smoltcp and iface polling.
-        let self_connected_result = {
-            let inner_guard = self.inner.read();
-            if let Some(inner::Inner::SelfConnected(sc)) = inner_guard.as_ref() {
-                Some(sc.send_slice(buf, self.is_send_shutdown()))
-            } else {
-                None
-            }
-        };
-        if let Some(result) = self_connected_result {
-            let n = result?;
-            // Wake reader (same fd in another thread) and refresh events. `inner_guard`
-            // must be gone because notify() refreshes events by reading `inner` again.
-            self.notify();
-            return Ok(n);
-        }
         // TODO: add nonblock check of connecting socket
         //
         // IMPORTANT: to avoid "all sleepers, no pollers" stalls on loopback (gVisor BlockingLargeSend),

@@ -151,6 +151,18 @@ PollOutcome PollNow(int socket_fd, int events) {
     return outcome;
 }
 
+void WaitForEvent(int socket_fd, short event) {
+    // Request only the prerequisite event: POLLOUT or already queued POLLIN
+    // would return immediately while a FIN is still travelling through TCP.
+    pollfd descriptor {};
+    descriptor.fd = socket_fd;
+    descriptor.events = event;
+    ASSERT_EQ(poll(&descriptor, 1, 5000), 1)
+        << "waiting for event=" << event << ": " << ErrnoString(errno);
+    ASSERT_NE(descriptor.revents & event, 0)
+        << "requested event=" << event << ", revents=" << descriptor.revents;
+}
+
 SendAllResult SendAll(int socket_fd, const std::uint8_t* data, std::size_t length) {
     SendAllResult result;
     while (result.bytes_sent < length) {
@@ -188,6 +200,7 @@ TEST_P(TcpSelfConnectSemantics, PartialProgressWinsOverWouldBlock) {
     ASSERT_EQ(send(socket_fd.Get(), kReadPayload.data(), kReadPayload.size(), 0),
               static_cast<ssize_t>(kReadPayload.size()))
         << "send before read failed: " << ErrnoString(errno);
+    ASSERT_NO_FATAL_FAILURE(WaitForEvent(socket_fd.Get(), POLLIN));
     ASSERT_EQ(read(socket_fd.Get(), buffer.data(), buffer.size()),
               static_cast<ssize_t>(kReadPayload.size()))
         << "read must return progress copied before the second probe observed EAGAIN: "
@@ -204,6 +217,8 @@ TEST_P(TcpSelfConnectSemantics, PartialProgressWinsOverWouldBlock) {
     ASSERT_EQ(send(socket_fd.Get(), kRecvPayload.data(), kRecvPayload.size(), 0),
               static_cast<ssize_t>(kRecvPayload.size()))
         << "send before recv failed: " << ErrnoString(errno);
+    // A successful send queues bytes; Nagle/delayed ACK may defer delivery.
+    ASSERT_NO_FATAL_FAILURE(WaitForEvent(socket_fd.Get(), POLLIN));
     ASSERT_EQ(recv(socket_fd.Get(), buffer.data(), buffer.size(), MSG_DONTWAIT),
               static_cast<ssize_t>(kRecvPayload.size()))
         << "recv must return progress copied before the second probe observed EAGAIN: "
@@ -275,6 +290,8 @@ TEST_P(TcpSelfConnectSemantics, PollWriteShutdownReportsFullHangup) {
     ASSERT_EQ(shutdown(socket_fd.Get(), SHUT_WR), 0)
         << "shutdown(SHUT_WR) failed: " << ErrnoString(errno);
 
+    // The receive shutdown becomes visible only after our FIN loops back.
+    ASSERT_NO_FATAL_FAILURE(WaitForEvent(socket_fd.Get(), POLLRDHUP));
     const PollOutcome outcome = PollNow(socket_fd.Get(), kPollEvents);
     ASSERT_EQ(outcome.ret, 1) << "poll revents=" << outcome.revents;
     EXPECT_NE(outcome.revents & POLLIN, 0) << "revents=" << outcome.revents;
@@ -291,6 +308,25 @@ TEST_P(TcpSelfConnectSemantics, PollWriteShutdownReportsFullHangup) {
         << "SHUT_WR 不得丢弃已排队的读侧数据: " << ErrnoString(errno);
     EXPECT_TRUE(std::equal(kPayload.begin(), kPayload.end(), buffer.begin()));
     EXPECT_EQ(read(socket_fd.Get(), buffer.data(), buffer.size()), 0);
+}
+
+TEST_P(TcpSelfConnectSemantics, WriteShutdownFlushesCorkedDataBeforeEof) {
+    FdGuard socket_fd = CreateSelfConnectedSocket(GetParam());
+    ASSERT_GE(socket_fd.Get(), 0);
+
+    constexpr std::array<std::uint8_t, 6> payload {1, 2, 3, 4, 5, 6};
+    ASSERT_EQ(send(socket_fd.Get(), payload.data(), payload.size(), MSG_MORE),
+              static_cast<ssize_t>(payload.size()));
+    ASSERT_EQ(shutdown(socket_fd.Get(), SHUT_WR), 0) << ErrnoString(errno);
+    ASSERT_NO_FATAL_FAILURE(WaitForEvent(socket_fd.Get(), POLLRDHUP));
+
+    std::array<std::uint8_t, 16> buffer {};
+    ASSERT_EQ(recv(socket_fd.Get(), buffer.data(), buffer.size(), MSG_DONTWAIT),
+              static_cast<ssize_t>(payload.size()));
+    EXPECT_TRUE(std::equal(payload.begin(), payload.end(), buffer.begin()));
+    EXPECT_EQ(recv(socket_fd.Get(), buffer.data(), buffer.size(), MSG_DONTWAIT), 0);
+    EXPECT_EQ(send(socket_fd.Get(), payload.data(), payload.size(), MSG_NOSIGNAL), -1);
+    EXPECT_EQ(errno, EPIPE);
 }
 
 // SHUT_RD 只是半关闭：Linux 6.6 tcp_poll() 此时只置 RCV_SHUTDOWN，

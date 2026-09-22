@@ -213,17 +213,17 @@ impl super::TcpSocket {
         Self::write_i32_opt(value, v)
     }
 
-    /// Helper to get a socket property with a default for closed/self-connected/none states.
+    /// Helper to get a socket property with a default for closed/uninitialized states.
     ///
     /// This pattern is repeated when getting socket options that need to handle
-    /// cases where the socket is closed, self-connected, or not yet initialized.
+    /// cases where the socket is closed or not yet initialized.
     #[inline]
     fn with_socket_property<F, R>(&self, default: R, f: F) -> R
     where
         F: FnOnce(&inner::Inner) -> R,
     {
         match self.inner.read().as_ref() {
-            Some(inner::Inner::Closed(_)) | Some(inner::Inner::SelfConnected(_)) | None => default,
+            Some(inner::Inner::Closed(_)) | None => default,
             Some(inner) => f(inner),
         }
     }
@@ -243,6 +243,19 @@ impl super::TcpSocket {
     /// Sets a SOL_SOCKET option.
     pub(super) fn set_socket_option(&self, opt: PSO, val: &[u8]) -> Result<(), SystemError> {
         match opt {
+            PSO::BINDTODEVICE => {
+                let mut inner = self.inner.write();
+                let mut update = self.device_binding.prepare_update(&self.netns, val)?;
+                let device = update
+                    .target_iface()
+                    .and_then(|iface| core::num::NonZeroU32::new(iface.nic_id() as u32));
+                match inner.as_mut().expect("TCP state is present") {
+                    inner::Inner::Listening(listener) => listener.set_bound_device(device),
+                    state => state.for_each_socket_mut(|socket| socket.set_bound_device(device)),
+                }
+                update.commit();
+                Ok(())
+            }
             PSO::SNDTIMEO_OLD | PSO::SNDTIMEO_NEW => {
                 let d = parse_timeval_opt(val)?;
                 let us = d.map(|v| v.total_micros()).unwrap_or(u64::MAX);
@@ -544,6 +557,10 @@ impl super::TcpSocket {
         value: &mut [u8],
     ) -> Result<usize, SystemError> {
         match opt {
+            PSO::BINDTODEVICE => {
+                let _state = self.inner.read();
+                self.device_binding.get(&self.netns, value)
+            }
             PSO::ACCEPTCONN => {
                 let shutdown = self.shutdown.load(core::sync::atomic::Ordering::Acquire);
                 let is_listening = self.is_listening();

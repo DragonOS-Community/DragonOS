@@ -30,6 +30,15 @@ impl Default for SocketDeviceBinding {
 }
 
 impl SocketDeviceBinding {
+    /// Construct independent state for a connection inheriting a listener's
+    /// SYN-time device constraint. Subsequent parent/child updates are separate.
+    pub(crate) fn from_ifindex(ifindex: usize) -> Self {
+        Self {
+            ifindex: AtomicUsize::new(ifindex),
+            update_lock: Mutex::new(()),
+        }
+    }
+
     #[inline]
     pub fn ifindex(&self) -> usize {
         self.ifindex.load(Ordering::Acquire)

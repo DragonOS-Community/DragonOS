@@ -1,16 +1,15 @@
-use alloc::collections::VecDeque;
+use crate::net::socket::inet::common::SocketDeviceBinding;
 use alloc::sync::{Arc, Weak};
+use core::num::NonZeroU32;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::filesystem::epoll::EPollEventType;
-use crate::libs::mutex::Mutex;
 use crate::libs::rwsem::RwSem;
 use crate::net::socket::{
     self,
     inet::common::port::{PortManager, TcpBindDomain, TcpPortReservation},
 };
 use crate::process::namespace::net_namespace::NetNamespace;
-use crate::syscall::user_buffer::UserBuffer;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use smoltcp;
@@ -59,12 +58,14 @@ fn new_smoltcp_socket() -> smoltcp::socket::tcp::Socket<'static> {
 fn new_listen_smoltcp_socket<T>(
     local_endpoint: T,
     ip_version: Option<smoltcp::wire::IpVersion>,
+    device: Option<NonZeroU32>,
 ) -> Result<smoltcp::socket::tcp::Socket<'static>, SystemError>
 where
     T: Into<smoltcp::wire::IpListenEndpoint>,
 {
     let mut socket = new_smoltcp_socket();
     socket.set_listen_ip_version(ip_version);
+    socket.set_listen_bound_device(device);
     socket.listen(local_endpoint).map_err(|e| match e {
         tcp::ListenError::InvalidState => SystemError::EINVAL, // TODO: Check is right impl
         tcp::ListenError::Unaddressable => SystemError::EADDRINUSE,
@@ -110,6 +111,7 @@ impl Init {
                 new_sock.set_timeout(socket.timeout());
                 new_sock.set_hop_limit(socket.hop_limit());
                 new_sock.set_listen_ip_version(socket.listen_ip_version());
+                new_sock.set_bound_device(socket.bound_device());
 
                 **socket = new_sock;
                 Ok(())
@@ -129,9 +131,11 @@ impl Init {
         local_endpoint: smoltcp::wire::IpEndpoint,
         netns: Arc<NetNamespace>,
         v6_only: bool,
+        device_binding: Arc<SocketDeviceBinding>,
     ) -> Result<Self, (Self, SystemError)> {
         match self {
-            Init::Unbound((socket, ver)) => {
+            Init::Unbound((mut socket, ver)) => {
+                socket.set_bound_device(NonZeroU32::new(device_binding.ifindex() as u32));
                 let bound = match socket::inet::BoundInner::bind_recoverable(
                     *socket,
                     &local_endpoint.addr,
@@ -147,6 +151,7 @@ impl Init {
                     netns,
                     TcpBindDomain::new(local_endpoint.addr, v6_only),
                     local_endpoint.port,
+                    device_binding,
                 ) {
                     Ok(reservation) => reservation,
                     Err(err) => {
@@ -173,6 +178,7 @@ impl Init {
         self,
         remote_endpoint: smoltcp::wire::IpEndpoint,
         netns: Arc<NetNamespace>,
+        device_binding: Arc<SocketDeviceBinding>,
     ) -> Result<
         (
             socket::inet::BoundInner,
@@ -182,27 +188,38 @@ impl Init {
         (Self, SystemError),
     > {
         match self {
-            Init::Unbound((socket, ver)) => {
-                let (bound, address) = match socket::inet::BoundInner::bind_ephemeral_recoverable(
-                    *socket,
-                    remote_endpoint.addr,
-                    netns.clone(),
-                ) {
-                    Ok(result) => result,
-                    Err((socket, err)) => {
-                        return Err((Self::Unbound((Box::new(socket), ver)), err))
-                    }
+            Init::Unbound((mut socket, ver)) => {
+                let device = match device_binding.resolve_iface(&netns) {
+                    Ok(device) => device,
+                    Err(err) => return Err((Self::Unbound((socket, ver)), err)),
                 };
-                let reservation =
-                    match PortManager::reserve(netns, TcpBindDomain::new(address, false), 0) {
-                        Ok(reservation) => reservation,
-                        Err(err) => {
-                            let smoltcp::socket::Socket::Tcp(socket) = bound.into_socket() else {
-                                unreachable!("TCP BoundInner should contain a TCP socket");
-                            };
-                            return Err((Self::Unbound((Box::new(socket), ver)), err));
+                socket.set_bound_device(NonZeroU32::new(device_binding.ifindex() as u32));
+                let (bound, address) =
+                    match socket::inet::BoundInner::bind_ephemeral_recoverable_on_device(
+                        *socket,
+                        remote_endpoint.addr,
+                        netns.clone(),
+                        device,
+                    ) {
+                        Ok(result) => result,
+                        Err((socket, err)) => {
+                            return Err((Self::Unbound((Box::new(socket), ver)), err))
                         }
                     };
+                let reservation = match PortManager::reserve(
+                    netns,
+                    TcpBindDomain::new(address, false),
+                    0,
+                    device_binding,
+                ) {
+                    Ok(reservation) => reservation,
+                    Err(err) => {
+                        let smoltcp::socket::Socket::Tcp(socket) = bound.into_socket() else {
+                            unreachable!("TCP BoundInner should contain a TCP socket");
+                        };
+                        return Err((Self::Unbound((Box::new(socket), ver)), err));
+                    }
+                };
                 let endpoint = smoltcp::wire::IpEndpoint::new(address, reservation.port);
                 Ok((bound, endpoint, reservation))
             }
@@ -216,9 +233,12 @@ impl Init {
         netns: Arc<NetNamespace>,
         wrapper: Weak<dyn socket::inet::InetSocket>,
         ver: smoltcp::wire::IpVersion,
+        device_binding: Arc<SocketDeviceBinding>,
     ) -> Result<Connecting, (Self, SystemError)> {
-        let (inner, local, reservation) = match self {
-            Init::Unbound(_) => self.bind_to_ephemeral(remote_endpoint, netns)?,
+        let (mut inner, mut local, mut reservation) = match self {
+            Init::Unbound(_) => {
+                self.bind_to_ephemeral(remote_endpoint, netns.clone(), device_binding.clone())?
+            }
             Init::Bound(inner) => inner,
         };
         if let Err(err) = socket::inet::common::ensure_bound_dual_stack_remote_compatible(
@@ -227,11 +247,20 @@ impl Init {
         ) {
             return Err((Init::Bound((inner, local, reservation)), err));
         }
+        let original_local = local;
+        let original_iface = inner.iface().clone();
         if local.addr.is_unspecified() {
-            return Err((
-                Init::Bound((inner, local, reservation)),
-                SystemError::EINVAL,
-            ));
+            let target = device_binding.resolve_iface(&netns).and_then(|device| {
+                socket::inet::common::tcp_connect_target(&remote_endpoint.addr, &netns, device)
+            });
+            let target = match target {
+                Ok(target) => target,
+                Err(err) => return Err((Init::Bound((inner, local, reservation)), err)),
+            };
+            if let Err(err) = inner.move_closed_tcp_to_iface(target.stack_owner) {
+                return Err((Init::Bound((inner, local, reservation)), err));
+            }
+            local.addr = target.local_addr;
         }
         // Publish before taking the SocketSet lock and making the first SYN
         // visible to poll. The RAII reservation survives until Connecting is
@@ -239,9 +268,15 @@ impl Init {
         // socket lifetime.
         let registration = match ConnectingRegistration::try_new(inner.iface().clone(), wrapper) {
             Ok(registration) => registration,
-            Err(err) => return Err((Init::Bound((inner, local, reservation)), err)),
+            Err(err) => {
+                inner
+                    .move_closed_tcp_to_iface(original_iface)
+                    .expect("inactive TCP placement rollback");
+                return Err((Init::Bound((inner, original_local, reservation)), err));
+            }
         };
         let result = inner.with_mut::<smoltcp::socket::tcp::Socket, _, _>(|socket| {
+            socket.set_bound_device(NonZeroU32::new(device_binding.ifindex() as u32));
             socket
                 .connect(
                     inner.iface().smol_iface().lock().context(),
@@ -251,15 +286,27 @@ impl Init {
                 .map_err(|_| SystemError::ECONNREFUSED)
         });
         match result {
-            Ok(_) => Ok(Connecting::new(
-                inner,
-                registration,
-                local,
-                remote_endpoint,
-                reservation,
-                ver,
-            )),
-            Err(err) => Err((Init::Bound((inner, local, reservation)), err)),
+            Ok(_) => {
+                // Narrow only after the last fallible step. Widening on rollback
+                // could overlap a bind admitted while the domain was narrower.
+                if original_local.addr.is_unspecified() {
+                    reservation.update_domain(TcpBindDomain::new(local.addr, false));
+                }
+                Ok(Connecting::new(
+                    inner,
+                    registration,
+                    local,
+                    remote_endpoint,
+                    reservation,
+                    ver,
+                ))
+            }
+            Err(err) => {
+                inner
+                    .move_closed_tcp_to_iface(original_iface)
+                    .expect("failed connect leaves TCP closed");
+                Err((Init::Bound((inner, original_local, reservation)), err))
+            }
         }
     }
 
@@ -273,6 +320,7 @@ impl Init {
         backlog: usize,
         netns: Arc<NetNamespace>,
         v6_only: bool,
+        device_binding: Arc<SocketDeviceBinding>,
     ) -> Result<Listening, (Self, SystemError)> {
         // If unbound, auto-bind to INADDR_ANY:ephemeral (Linux compat).
         let bound_self = if matches!(self, Init::Unbound(_)) {
@@ -289,7 +337,7 @@ impl Init {
                 }
             };
             let auto_bind_ep = smoltcp::wire::IpEndpoint::new(unspec_addr, 0);
-            match self.bind(auto_bind_ep, netns.clone(), v6_only) {
+            match self.bind(auto_bind_ep, netns.clone(), v6_only, device_binding.clone()) {
                 Ok(bound) => bound,
                 Err((init, err)) => return Err((init, err)),
             }
@@ -337,7 +385,11 @@ impl Init {
                         continue; // primary inner already covers this iface
                     }
                     let new_listen = socket::inet::BoundInner::bind_on_iface(
-                        new_listen_smoltcp_socket(listen_addr, domain.ip_version)?,
+                        new_listen_smoltcp_socket(
+                            listen_addr,
+                            domain.ip_version,
+                            NonZeroU32::new(device_binding.ifindex() as u32),
+                        )?,
                         iface.clone(),
                         inner.netns(),
                     )?;
@@ -354,7 +406,9 @@ impl Init {
 
         let primary_index = inners.len();
         inners.push(inner);
-        if let Err(err) = Listening::grow_slots(&mut inners, backlog, listen_addr, domain) {
+        if let Err(err) =
+            Listening::grow_slots(&mut inners, backlog, listen_addr, domain, &device_binding)
+        {
             let inner = inners.remove(primary_index);
             for bound in inners {
                 bound.release();
@@ -365,6 +419,7 @@ impl Init {
         if let Err(err) =
             inners[primary_index].with_mut::<smoltcp::socket::tcp::Socket, _, _>(|socket| {
                 socket.set_listen_ip_version(domain.ip_version);
+                socket.set_listen_bound_device(NonZeroU32::new(device_binding.ifindex() as u32));
                 socket.listen(listen_addr).map_err(|err| match err {
                     tcp::ListenError::InvalidState => SystemError::EINVAL,
                     tcp::ListenError::Unaddressable => SystemError::EINVAL,
@@ -386,6 +441,7 @@ impl Init {
             local,
             domain,
             reservation: Some(reservation),
+            device_binding,
         });
     }
 
@@ -765,9 +821,39 @@ pub struct Listening {
     local: smoltcp::wire::IpEndpoint,
     pub domain: TcpBindDomain,
     pub reservation: Option<TcpPortReservation>,
+    device_binding: Arc<SocketDeviceBinding>,
 }
 
 impl Listening {
+    /// Update idle slots and the overflow lookup under the same SocketSet lock.
+    /// Handshake/accepted snapshots remain owned by each TCP socket.
+    pub(super) fn set_bound_device(&mut self, device: Option<NonZeroU32>) {
+        for (index, bound) in self.inners.iter().enumerate() {
+            if self.inners[..index]
+                .iter()
+                .any(|other| Arc::ptr_eq(other.iface(), bound.iface()))
+            {
+                continue;
+            }
+            let mut sockets = bound.iface().sockets().lock();
+            for slot in &self.inners {
+                if Arc::ptr_eq(slot.iface(), bound.iface()) {
+                    sockets
+                        .get_mut::<tcp::Socket>(slot.handle())
+                        .set_listen_bound_device(device);
+                }
+            }
+            if let Some(reservation) = &self.reservation {
+                bound.iface().common().register_tcp_listener(
+                    reservation.id,
+                    self.domain,
+                    self.local.port,
+                    device.map_or(0, NonZeroU32::get),
+                );
+            }
+        }
+    }
+
     /// Ordinary passive opens become acceptable only after the final ACK.
     /// A peer may already have sent FIN, so CLOSE_WAIT remains acceptable.
     /// Snapshot both endpoints under the caller's SocketSet lock: a later RST
@@ -838,6 +924,9 @@ impl Listening {
         for bound in &self.inners {
             bound.with_mut::<tcp::Socket, _, _>(|socket| {
                 if socket.state() == tcp::State::Closed {
+                    socket.set_listen_bound_device(NonZeroU32::new(
+                        self.device_binding.ifindex() as u32
+                    ));
                     socket
                         .listen(self.listen_addr)
                         .expect("valid listener endpoint");
@@ -851,6 +940,7 @@ impl Listening {
         target: usize,
         listen_addr: smoltcp::wire::IpListenEndpoint,
         domain: TcpBindDomain,
+        device_binding: &SocketDeviceBinding,
     ) -> Result<(), SystemError> {
         // Prepare sockets before publishing any new handles; keep existing
         // connections and the previous capacity on a recoverable failure.
@@ -868,7 +958,11 @@ impl Listening {
                 .count();
             for _ in count..target {
                 sockets.push((
-                    new_listen_smoltcp_socket(listen_addr, domain.ip_version)?,
+                    new_listen_smoltcp_socket(
+                        listen_addr,
+                        domain.ip_version,
+                        NonZeroU32::new(device_binding.ifindex() as u32),
+                    )?,
                     bound.iface().clone(),
                     bound.netns(),
                 ));
@@ -892,7 +986,13 @@ impl Listening {
 
     pub(super) fn set_backlog(&mut self, backlog: usize) -> Result<(), SystemError> {
         let target = Self::slot_capacity(backlog);
-        Self::grow_slots(&mut self.inners, target, self.listen_addr, self.domain)?;
+        Self::grow_slots(
+            &mut self.inners,
+            target,
+            self.listen_addr,
+            self.domain,
+            &self.device_binding,
+        )?;
         self.slots_per_iface = target;
         self.trim_excess();
         Ok(())
@@ -930,13 +1030,21 @@ impl Listening {
         // where each interface has its own listen socket in the smoltcp SocketSet.
         let mut new_listen = if self.listen_addr.addr.is_none() {
             socket::inet::BoundInner::bind_on_iface(
-                new_listen_smoltcp_socket(self.listen_addr, self.domain.ip_version)?,
+                new_listen_smoltcp_socket(
+                    self.listen_addr,
+                    self.domain.ip_version,
+                    NonZeroU32::new(self.device_binding.ifindex() as u32),
+                )?,
                 connected.iface().clone(),
                 connected.netns(),
             )?
         } else {
             socket::inet::BoundInner::bind(
-                new_listen_smoltcp_socket(self.listen_addr, self.domain.ip_version)?,
+                new_listen_smoltcp_socket(
+                    self.listen_addr,
+                    self.domain.ip_version,
+                    NonZeroU32::new(self.device_binding.ifindex() as u32),
+                )?,
                 self.listen_addr
                     .addr
                     .as_ref()
@@ -1221,278 +1329,12 @@ impl Established {
     }
 }
 
-/// Linux-compatible TCP "self-connect" (connect to the same local addr:port on the same socket).
-///
-/// Linux allows this with a single socket FD, and bytes written to the socket are readable
-/// back from the same socket. smoltcp's TCP socket cannot model this with a single instance,
-/// because a TCP endpoint should not receive its own outbound segments.
-///
-/// We implement the user-visible semantics by internally queueing sent bytes into a local
-/// receive queue, and driving readiness/EOF based on shutdown state.
-#[derive(Debug)]
-pub struct SelfConnected {
-    inner: socket::inet::BoundInner,
-    reservation: Option<TcpPortReservation>,
-    local: smoltcp::wire::IpEndpoint,
-    state: Mutex<SelfConnectedState>,
-}
-
-#[derive(Debug)]
-struct SelfConnectedState {
-    /// Effective receive capacity for the loopback queue (bytes).
-    rx_cap: usize,
-    buf: VecDeque<u8>,
-    /// Ordered EOF marker for the self-connected byte stream.
-    ///
-    /// This must be protected by the same lock as `buf`: a concurrent
-    /// `send()` and `shutdown(SHUT_WR)` must linearize as either
-    /// data-before-FIN or FIN-before-send, never as an independently visible EOF.
-    send_shutdown: bool,
-}
-
-impl SelfConnected {
-    pub fn new(
-        inner: socket::inet::BoundInner,
-        local: smoltcp::wire::IpEndpoint,
-        rx_cap: usize,
-        reservation: TcpPortReservation,
-    ) -> Self {
-        Self {
-            inner,
-            local,
-            reservation: Some(reservation),
-            state: Mutex::new(SelfConnectedState {
-                rx_cap,
-                buf: VecDeque::new(),
-                send_shutdown: false,
-            }),
-        }
-    }
-
-    #[allow(dead_code)]
-    pub fn iface(&self) -> &Arc<dyn crate::driver::net::Iface> {
-        self.inner.iface()
-    }
-
-    #[allow(dead_code)]
-    pub fn handle(&self) -> smoltcp::iface::SocketHandle {
-        self.inner.handle()
-    }
-
-    #[inline]
-    pub fn get_name(&self) -> smoltcp::wire::IpEndpoint {
-        self.local
-    }
-
-    #[inline]
-    pub fn get_peer_name(&self) -> smoltcp::wire::IpEndpoint {
-        self.local
-    }
-
-    #[inline]
-    pub fn recv_queue(&self) -> usize {
-        self.state.lock().buf.len()
-    }
-
-    pub fn discard_all(&self) {
-        self.state.lock().buf.clear();
-    }
-
-    pub fn set_recv_buffer_size(&self, rx_size: usize) {
-        self.state.lock().rx_cap = rx_size;
-    }
-
-    pub fn recv_capacity(&self) -> usize {
-        self.state.lock().rx_cap
-    }
-
-    pub fn send_capacity(&self) -> usize {
-        // For self-connect, use the same capacity for "send" as the local receive queue.
-        self.state.lock().rx_cap
-    }
-
-    pub fn send_slice(&self, data: &[u8], send_shutdown: bool) -> Result<usize, SystemError> {
-        if send_shutdown {
-            return Err(SystemError::EPIPE);
-        }
-        if data.is_empty() {
-            return Ok(0);
-        }
-
-        let mut state = self.state.lock();
-        if state.send_shutdown {
-            return Err(SystemError::EPIPE);
-        }
-
-        let free = state.rx_cap.saturating_sub(state.buf.len());
-        if free == 0 {
-            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-        }
-        let n = core::cmp::min(free, data.len());
-        state.buf.extend(data[..n].iter().copied());
-        Ok(n)
-    }
-
-    /// Set the send_shutdown flag (called when SHUT_WR is performed).
-    pub fn set_send_shutdown(&self) {
-        self.state.lock().send_shutdown = true;
-    }
-
-    /// Check if send_shutdown flag is set.
-    #[inline]
-    #[allow(dead_code)]
-    pub fn is_send_shutdown(&self) -> bool {
-        self.state.lock().send_shutdown
-    }
-
-    pub fn recv_into(&self, out: &mut [u8], peek: bool, trunc: bool) -> Result<usize, SystemError> {
-        if out.is_empty() {
-            return Ok(0);
-        }
-        let mut state = self.state.lock();
-        if state.buf.is_empty() {
-            // EOF after SHUT_WR once all queued data is drained.
-            if state.send_shutdown {
-                return Ok(0);
-            }
-            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-        }
-
-        let n = core::cmp::min(out.len(), state.buf.len());
-        if !trunc {
-            for (i, b) in state.buf.iter().take(n).enumerate() {
-                out[i] = *b;
-            }
-        }
-
-        if !peek {
-            for _ in 0..n {
-                let _ = state.buf.pop_front();
-            }
-        }
-        Ok(n)
-    }
-
-    pub fn recv_to_user(
-        &self,
-        out: &mut UserBuffer<'_>,
-        offset: usize,
-        max_len: usize,
-    ) -> Result<usize, SystemError> {
-        if offset > out.len() {
-            return Err(SystemError::EINVAL);
-        }
-        let available = core::cmp::min(out.len() - offset, max_len);
-        if available == 0 {
-            return Ok(0);
-        }
-
-        let mut state = self.state.lock();
-        if state.buf.is_empty() {
-            if state.send_shutdown {
-                return Ok(0);
-            }
-            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-        }
-
-        let n = core::cmp::min(available, state.buf.len());
-        let mut tmp = Vec::with_capacity(n);
-        tmp.extend(state.buf.iter().take(n).copied());
-
-        match out.write_to_user(offset, &tmp) {
-            Ok(_) => {
-                for _ in 0..n {
-                    let _ = state.buf.pop_front();
-                }
-                Ok(n)
-            }
-            Err(SystemError::EFAULT) => Err(SystemError::EFAULT),
-            Err(e) => Err(e),
-        }
-    }
-
-    /// 重算 self-connect 套接字的就绪掩码。
-    ///
-    /// `recv_shutdown` 是外层 `TcpSocket` 记录的 `SHUT_RD` 状态（内层只跟踪发送侧）。
-    ///
-    /// Linux 6.6 `tcp_poll()` 的挂断语义：
-    /// ```c
-    ///     if (shutdown == SHUTDOWN_MASK || state == TCP_CLOSE)
-    ///         mask |= EPOLLHUP;
-    ///     if (shutdown & RCV_SHUTDOWN)
-    ///         mask |= EPOLLIN | EPOLLRDNORM | EPOLLRDHUP;
-    /// ```
-    /// self-connect 发出的 FIN 会回到自己（`tcp_fin()` 收到 FIN 时置 `RCV_SHUTDOWN`），
-    /// 因此 `SHUT_WR` 之后本端的 `sk_shutdown` 已经是 `SHUTDOWN_MASK`：读侧同时进入 EOF，
-    /// `poll()` 应报 `EPOLLRDHUP | EPOLLHUP`（Linux 实测为 `IN|OUT|HUP|RDHUP`）。
-    /// 只有 `SHUT_RD` 时是半关闭，只报 `EPOLLRDHUP`，不得报 `EPOLLHUP`。
-    /// 连接仍完全建立时必须清掉历史残留：套接字在 `bind()` 后即被 iface 通知，
-    /// `Init` 分支会打上 `EPOLLHUP`，不清理会让 `poll`/`epoll` 永久误报挂断。
-    /// `EPOLLERR` 在 self-connect 上没有产生路径，只清不置。
-    pub fn update_io_events(&self, pollee: &AtomicUsize, recv_shutdown: bool) {
-        let state = self.state.lock();
-        let send_shutdown = state.send_shutdown;
-        let writable = !send_shutdown && state.buf.len() < state.rx_cap;
-        let readable = !state.buf.is_empty() || send_shutdown;
-        drop(state);
-
-        let read_shutdown = send_shutdown || recv_shutdown;
-
-        let hangup_bits =
-            (EPollEventType::EPOLLHUP | EPollEventType::EPOLLRDHUP | EPollEventType::EPOLLERR)
-                .bits() as usize;
-        let mut rebuilt = 0usize;
-        if read_shutdown {
-            rebuilt |= EPollEventType::EPOLLRDHUP.bits() as usize;
-        }
-        if send_shutdown {
-            // 自身 FIN 回环到读侧，`SHUT_WR` 之后 sk_shutdown 已是 SHUTDOWN_MASK。
-            rebuilt |= EPollEventType::EPOLLHUP.bits() as usize;
-        }
-
-        // 一次性清除并重建，避免清除与置位之间被并发观察到一个不存在的中间态。
-        let _ = pollee.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |bits| {
-            Some((bits & !hangup_bits) | rebuilt)
-        });
-
-        if writable {
-            pollee.fetch_or(
-                (EPollEventType::EPOLLOUT | EPollEventType::EPOLLWRNORM).bits() as usize,
-                Ordering::Relaxed,
-            );
-        } else {
-            pollee.fetch_and(
-                !(EPollEventType::EPOLLOUT | EPollEventType::EPOLLWRNORM).bits() as usize,
-                Ordering::Relaxed,
-            );
-        }
-
-        if readable {
-            pollee.fetch_or(
-                (EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM).bits() as usize,
-                Ordering::Relaxed,
-            );
-        } else {
-            pollee.fetch_and(
-                !(EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM).bits() as usize,
-                Ordering::Relaxed,
-            );
-        }
-    }
-
-    pub fn release(&mut self) {
-        self.inner.release();
-        self.reservation.take();
-    }
-}
-
 #[derive(Debug)]
 pub enum Inner {
     Init(Init),
     Connecting(Connecting),
     Listening(Listening),
     Established(Established),
-    SelfConnected(SelfConnected),
     Closed(Closed),
 }
 
@@ -1509,11 +1351,6 @@ impl Inner {
             Inner::Connecting(conn) => conn.with(f),
             Inner::Listening(listen) => listen.inners[0].with(f),
             Inner::Established(est) => est.with(f),
-            Inner::SelfConnected(_) => {
-                // SelfConnected keeps a BoundInner for resource management, but does not
-                // model its data path via smoltcp. Avoid touching the underlying socket.
-                panic!("Inner::with_socket called on SelfConnected socket")
-            }
             Inner::Closed(_) => {
                 // Closed 状态不应再触达任何 smoltcp socket。
                 // 调用者应当在更上层对 Closed 做分支处理。
@@ -1538,7 +1375,6 @@ impl Inner {
                 }
             }
             Inner::Established(est) => est.with_mut(f),
-            Inner::SelfConnected(_) => {}
             Inner::Closed(_) => {}
         }
     }
@@ -1546,7 +1382,6 @@ impl Inner {
     pub fn send_buffer_size(&self) -> usize {
         match self {
             Inner::Closed(_) => 0,
-            Inner::SelfConnected(sc) => sc.send_capacity(),
             _ => self.with_socket(|socket| socket.send_capacity()),
         }
     }
@@ -1554,7 +1389,6 @@ impl Inner {
     pub fn recv_buffer_size(&self) -> usize {
         match self {
             Inner::Closed(_) => 0,
-            Inner::SelfConnected(sc) => sc.recv_capacity(),
             _ => self.with_socket(|socket| socket.recv_capacity()),
         }
     }
@@ -1566,7 +1400,6 @@ impl Inner {
             Inner::Connecting(conn) => Some(conn.inner.iface()),
             Inner::Listening(listen) => Some(listen.inners[0].iface()),
             Inner::Established(est) => Some(est.inner.iface()),
-            Inner::SelfConnected(sc) => Some(sc.inner.iface()),
             Inner::Closed(_) => None,
         }
     }
@@ -1589,7 +1422,6 @@ impl Inner {
             Inner::Connecting(conn) => conn.get_name(),
             Inner::Listening(listen) => listen.get_name(),
             Inner::Established(est) => est.get_name(),
-            Inner::SelfConnected(sc) => sc.get_name(),
             Inner::Closed(closed) => match closed.ver {
                 smoltcp::wire::IpVersion::Ipv4 => smoltcp::wire::IpEndpoint::new(
                     smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address::UNSPECIFIED),
@@ -1609,7 +1441,6 @@ impl Inner {
             Inner::Listening(_) => None,
             Inner::Connecting(conn) => Some(conn.get_peer_name()),
             Inner::Established(est) => Some(est.get_peer_name()),
-            Inner::SelfConnected(sc) => Some(sc.get_peer_name()),
             Inner::Closed(_) => None,
         }
     }

@@ -162,7 +162,19 @@ impl BoundInner {
     where
         T: smoltcp::socket::AnySocket<'static>,
     {
-        let target = match get_ephemeral_bind_target(&remote, netns.clone()) {
+        Self::bind_ephemeral_recoverable_on_device(socket, remote, netns, None)
+    }
+
+    pub(crate) fn bind_ephemeral_recoverable_on_device<T>(
+        socket: T,
+        remote: smoltcp::wire::IpAddress,
+        netns: Arc<NetNamespace>,
+        device: Option<Arc<dyn Iface>>,
+    ) -> Result<(Self, smoltcp::wire::IpAddress), (T, SystemError)>
+    where
+        T: smoltcp::socket::AnySocket<'static>,
+    {
+        let target = match tcp_connect_target(&remote, &netns, device) {
             Ok(result) => result,
             Err(err) => return Err((socket, err)),
         };
@@ -191,6 +203,34 @@ impl BoundInner {
 
     pub fn iface(&self) -> &Arc<dyn Iface> {
         &self.iface
+    }
+
+    /// Place an inactive TCP endpoint before its first SYN is published.
+    /// Notification ownership is updated by the caller after releasing inner.
+    pub(crate) fn move_closed_tcp_to_iface(
+        &mut self,
+        iface: Arc<dyn Iface>,
+    ) -> Result<(), SystemError> {
+        if Arc::ptr_eq(&self.iface, &iface) {
+            return Ok(());
+        }
+        let socket = {
+            let mut sockets = self.iface.sockets().lock();
+            if sockets
+                .get::<smoltcp::socket::tcp::Socket>(self.handle)
+                .state()
+                != smoltcp::socket::tcp::State::Closed
+            {
+                return Err(SystemError::EINVAL);
+            }
+            sockets.remove(self.handle)
+        };
+        let smoltcp::socket::Socket::Tcp(socket) = socket else {
+            unreachable!("validated TCP socket");
+        };
+        self.handle = iface.sockets().lock().add(socket);
+        self.iface = iface;
+        Ok(())
     }
 
     pub fn move_udp_to_iface(&mut self, iface: Arc<dyn Iface>) -> Result<(), SystemError> {
@@ -385,6 +425,17 @@ fn loopback_iface_contains_v6(iface: &Arc<dyn Iface>, v6_addr: smoltcp::wire::Ip
 /// Get a suitable iface to deal with sendto/connect request if the socket is not bound to an iface.
 /// Linux-like behavior: for implicit bind on connect/sendto, the stack must be able to select a
 /// valid local source address for the given remote destination.
+pub(crate) fn tcp_connect_target(
+    remote: &smoltcp::wire::IpAddress,
+    netns: &Arc<NetNamespace>,
+    device: Option<Arc<dyn Iface>>,
+) -> Result<EphemeralBindTarget, SystemError> {
+    match device {
+        Some(iface) => ephemeral_bind_target_on_iface(netns, iface, remote),
+        None => get_ephemeral_bind_target(remote, netns.clone()),
+    }
+}
+
 fn get_ephemeral_bind_target(
     remote_ip_addr: &smoltcp::wire::IpAddress,
     netns: Arc<NetNamespace>,

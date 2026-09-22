@@ -82,6 +82,24 @@ pub(super) struct RoutedTxDevice<'a, D: SmolDevice + ?Sized> {
     pub(super) backend_policy: OutputBackendPolicy<'a>,
 }
 
+/// Metadata describes the physical ingress, not the TCP SocketSet owner.
+pub(super) struct RoutedRxToken<T> {
+    inner: T,
+    ifindex: u32,
+}
+
+impl<T: RxToken> RxToken for RoutedRxToken<T> {
+    fn consume<R, F: FnOnce(&[u8]) -> R>(self, f: F) -> R {
+        self.inner.consume(f)
+    }
+
+    fn meta(&self) -> PacketMeta {
+        let mut meta = self.inner.meta();
+        meta.id = self.ifindex;
+        meta
+    }
+}
+
 /// A physical transmit token with a lazily admitted namespace-routed fallback.
 ///
 /// The physical token remains the common path. `LocalInputTxToken` is used
@@ -524,7 +542,7 @@ impl<D: SmolDevice + ?Sized> SmolDevice for LocalInputDevice<'_, D> {
 
 impl<D: SmolDevice + ?Sized> SmolDevice for RoutedTxDevice<'_, D> {
     type RxToken<'a>
-        = D::RxToken<'a>
+        = RoutedRxToken<D::RxToken<'a>>
     where
         Self: 'a;
     type TxToken<'a>
@@ -539,7 +557,10 @@ impl<D: SmolDevice + ?Sized> SmolDevice for RoutedTxDevice<'_, D> {
         let capabilities = self.device.capabilities();
         let (rx_token, physical) = self.device.receive(timestamp)?;
         Some((
-            rx_token,
+            RoutedRxToken {
+                inner: rx_token,
+                ifindex: self.backend_policy.owner_ifindex,
+            },
             RoutedTxToken {
                 physical: Some(physical),
                 routed: None,

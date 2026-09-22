@@ -60,6 +60,7 @@ normal/tcp_listen_poll_semantics
 normal/tcp_relisten
 normal/tcp_listener_overflow
 normal/tcp_accept_handshake
+normal/tcp_device_binding
 normal/socket_nonblocking
 normal/tcp_self_connect_semantics
 normal/poll_timeout_semantics

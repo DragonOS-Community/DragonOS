@@ -179,7 +179,12 @@ impl TcpSocket {
             .ipv6_only
             .load(core::sync::atomic::Ordering::Relaxed);
         match writer.take().expect("Tcp inner::Inner is None") {
-            inner::Inner::Init(inner) => match inner.bind(local_endpoint, self.netns(), v6_only) {
+            inner::Inner::Init(inner) => match inner.bind(
+                local_endpoint,
+                self.netns(),
+                v6_only,
+                self.device_binding.clone(),
+            ) {
                 Ok(bound) => {
                     // Linux inet6_bind() makes a concrete native IPv6 binding v6-only.
                     if local_endpoint.addr.version() == smoltcp::wire::IpVersion::Ipv6
@@ -222,6 +227,7 @@ impl TcpSocket {
                     self.options
                         .ipv6_only
                         .load(core::sync::atomic::Ordering::Relaxed),
+                    self.device_binding.clone(),
                 );
                 match listen_result {
                     Ok(listening) => {
@@ -241,6 +247,7 @@ impl TcpSocket {
                                     listening.reservation.as_ref().unwrap().id,
                                     listening.domain,
                                     port,
+                                    self.device_binding.ifindex() as u32,
                                 );
                                 b.iface().common().bind_socket(me.clone());
                                 registered_ifaces.push(nic_id);
@@ -339,48 +346,41 @@ impl TcpSocket {
             crate::net::socket::inet::common::normalize_unspecified_endpoint_to_loopback(
                 remote_endpoint,
             );
+        // Explicit-source and self-connect paths need the same device/route
+        // validation as implicit binding, before changing the socket state.
+        if let Some(inner::Inner::Init(inner::Init::Bound((_, local, _)))) = writer.as_ref() {
+            if local.addr.version() == smoltcp::wire::IpVersion::Ipv4
+                && !local.addr.is_unspecified()
+            {
+                let device = self.device_binding.resolve_iface(&self.netns)?;
+                crate::net::route::resolve_ipv4_route(
+                    &self.netns,
+                    remote_endpoint.addr,
+                    device.map(|iface| iface.nic_id() as u32),
+                    Some(local.addr),
+                )?;
+            }
+        }
         let inner = writer.take().expect("Tcp inner::Inner is None");
+        let old_iface = inner.iface().cloned();
         let (init, result) = match inner {
             inner::Inner::Init(init) => {
-                // Linux-compatible self-connect: connect() to our own bound addr:port on the
-                // same socket is allowed and results in a socket that can send/recv to itself.
-                // smoltcp cannot model this with a single TCP socket instance, so we special-case
-                // it into `Inner::SelfConnected`.
-                match init {
-                    inner::Init::Bound((bound, local, reservation)) if local == remote_endpoint => {
-                        // Capture an effective queue capacity from the underlying socket's recv buffer.
-                        let rx_cap = bound
-                            .with::<smoltcp::socket::tcp::Socket, _, _>(|s| s.recv_capacity())
-                            .clamp(1 << 20, super::constants::MAX_SOCKET_BUFFER);
-                        (
-                            inner::Inner::SelfConnected(inner::SelfConnected::new(
-                                bound,
-                                local,
-                                rx_cap,
-                                reservation,
-                            )),
-                            Ok(()),
-                        )
-                    }
-                    other => {
-                        let conn_result = other.connect(
-                            remote_endpoint,
-                            self.netns(),
-                            self.self_ref.clone(),
-                            self.ip_version,
-                        );
-                        match conn_result {
-                            Ok(connecting) => (
-                                inner::Inner::Connecting(connecting),
-                                if !self.is_nonblock() {
-                                    Ok(())
-                                } else {
-                                    Err(SystemError::EINPROGRESS)
-                                },
-                            ),
-                            Err((init, err)) => (inner::Inner::Init(init), Err(err)),
-                        }
-                    }
+                match init.connect(
+                    remote_endpoint,
+                    self.netns(),
+                    self.self_ref.clone(),
+                    self.ip_version,
+                    self.device_binding.clone(),
+                ) {
+                    Ok(connecting) => (
+                        inner::Inner::Connecting(connecting),
+                        if self.is_nonblock() {
+                            Err(SystemError::EINPROGRESS)
+                        } else {
+                            Ok(())
+                        },
+                    ),
+                    Err((init, err)) => (inner::Inner::Init(init), Err(err)),
                 }
             }
             inner::Inner::Connecting(connecting) => {
@@ -409,17 +409,12 @@ impl TcpSocket {
             inner::Inner::Established(inner) => {
                 (inner::Inner::Established(inner), Err(SystemError::EISCONN))
             }
-            inner::Inner::SelfConnected(inner) => (
-                inner::Inner::SelfConnected(inner),
-                Err(SystemError::EISCONN),
-            ),
             inner::Inner::Closed(_) => (inner, Err(SystemError::ENOTCONN)),
         };
 
-        // 先落状态再做 iface 侧绑定，避免与 poll 路径形成锁顺序反转死锁：
-        // - poll: bounds.read -> socket.notify -> socket.inner.read/write
-        // - connect: socket.inner.write -> bounds.write  (会与上面互锁)
-        // SelfConnected 不依赖协议栈推进，不应触发 iface.poll()
+        // Publish the state before releasing inner. Connection registration
+        // retains its own cancellation-aware handoff; polling runs only after
+        // dropping inner.
         let need_poll_progress = matches!(init, inner::Inner::Connecting(_));
         let registration_publisher = match &init {
             inner::Inner::Connecting(connecting) => Some(connecting.registration_publisher()),
@@ -427,6 +422,20 @@ impl TcpSocket {
         };
         let maybe_iface = init.iface().cloned();
         writer.replace(init);
+
+        // Current iface notifications release the bounds snapshot lock before
+        // calling into a socket. Keep cleanup serialized with a subsequent
+        // connect, which could otherwise publish a new registration here.
+        if let Some(old_iface) = old_iface {
+            if !maybe_iface
+                .as_ref()
+                .is_some_and(|iface| Arc::ptr_eq(iface, &old_iface))
+            {
+                old_iface
+                    .common()
+                    .unbind_socket(self.self_ref.upgrade().unwrap());
+            }
+        }
         drop(writer);
 
         // 关键语义：connect(2) 进入 Connecting 状态后，socket 必须能被网络轮询推进。
@@ -464,7 +473,6 @@ impl TcpSocket {
         let (replace, result) = match inner {
             inner::Inner::Connecting(conn) => conn.into_result(),
             inner::Inner::Established(es) => (inner::Inner::Established(es), Ok(())), // TODO check established
-            inner::Inner::SelfConnected(sc) => (inner::Inner::SelfConnected(sc), Ok(())),
             _ => {
                 log::warn!("TODO: connecting socket error options");
                 (inner, Err(SystemError::EINVAL))
@@ -482,11 +490,7 @@ impl TcpSocket {
 
         if how.contains(ShutdownBit::SHUT_WR) {
             if let Err(e) = self.flush_cork_buffer() {
-                if e == SystemError::EAGAIN_OR_EWOULDBLOCK {
-                    // Defer FIN until cork-buffered bytes are flushed into the TCP stack.
-                    self.send_fin_deferred
-                        .store(true, core::sync::atomic::Ordering::Relaxed);
-                } else {
+                if e != SystemError::EAGAIN_OR_EWOULDBLOCK {
                     return Err(e);
                 }
             }
@@ -498,6 +502,10 @@ impl TcpSocket {
 
         // Linux/gVisor 语义：TIME_WAIT/Closed 的 stream socket 上 shutdown 应返回 ENOTCONN。
         // 但 Listening 和 Connecting 状态下的 shutdown 是允许的。
+        // Serialize pending cork data, FIN and the shutdown bit with send's
+        // enqueue path. A concurrent flusher may have returned early above.
+        // Keep the same cork -> inner order as cork-flush completion.
+        let cork_buf = self.cork_buf.lock();
         let mut writer = self.inner.write();
         let inner = writer.take().expect("Tcp inner::Inner is None");
 
@@ -518,17 +526,11 @@ impl TcpSocket {
                 }
 
                 if how.contains(ShutdownBit::SHUT_WR) {
-                    let pending = established.with(|socket| socket.send_queue());
-                    if pending > 0 {
-                        // Defer FIN until all queued data has been sent.
-                        self.send_fin_deferred
-                            .store(true, core::sync::atomic::Ordering::Relaxed);
-                    } else if self
-                        .send_fin_deferred
-                        .load(core::sync::atomic::Ordering::Relaxed)
-                    {
-                        // FIN will be sent once deferred bytes are fully flushed.
-                    } else {
+                    self.send_fin_deferred
+                        .store(!cork_buf.is_empty(), core::sync::atomic::Ordering::Relaxed);
+                    if cork_buf.is_empty() {
+                        // smoltcp orders FIN after its queued data; waiting for
+                        // ACKs here would unnecessarily delay shutdown.
                         established.with_mut(|socket| socket.close());
                     }
                     post_poll_rounds =
@@ -609,16 +611,9 @@ impl TcpSocket {
                     }
 
                     if how.contains(ShutdownBit::SHUT_WR) {
-                        let pending = established.with(|socket| socket.send_queue());
-                        if pending > 0 {
-                            self.send_fin_deferred
-                                .store(true, core::sync::atomic::Ordering::Relaxed);
-                        } else if self
-                            .send_fin_deferred
-                            .load(core::sync::atomic::Ordering::Relaxed)
-                        {
-                            // FIN will be sent once deferred bytes are fully flushed.
-                        } else {
+                        self.send_fin_deferred
+                            .store(!cork_buf.is_empty(), core::sync::atomic::Ordering::Relaxed);
+                        if cork_buf.is_empty() {
                             established.with_mut(|socket| socket.close());
                         }
                         post_poll_rounds =
@@ -647,20 +642,6 @@ impl TcpSocket {
                     )
                 }
             }
-            inner::Inner::SelfConnected(sc) => {
-                // SelfConnected: shutdown affects only the user-visible data path.
-                // - SHUT_WR: subsequent send() returns EPIPE; recv() returns EOF once queue drains.
-                // - SHUT_RD: subsequent recv() returns 0.
-                // No smoltcp close/abort is needed.
-                if how.contains(ShutdownBit::SHUT_WR) {
-                    sc.set_send_shutdown();
-                }
-                if how.contains(ShutdownBit::SHUT_RD) {
-                    let queued = sc.recv_queue();
-                    self.recv_shutdown.init(queued);
-                }
-                (inner::Inner::SelfConnected(sc), how)
-            }
             other => {
                 writer.replace(other);
                 return Err(SystemError::ENOTCONN);
@@ -676,6 +657,7 @@ impl TcpSocket {
 
         writer.replace(replace);
         drop(writer);
+        drop(cork_buf);
 
         // 唤醒等待者（含 poll/epoll），让状态变化可见。
         if let Some(iface) = post_poll_iface {
@@ -789,15 +771,6 @@ impl TcpSocket {
                     core::cmp::max(post_poll_rounds, TCP_ESTABLISHED_CLOSE_POST_POLL_ROUNDS);
                 post_poll_iface = Some(iface);
                 writer.replace(inner::Inner::Established(es));
-            }
-            inner::Inner::SelfConnected(mut sc) => {
-                // Release the bound handle and switch to explicit Closed to avoid stale handle access.
-                let ver = match sc.get_name().addr {
-                    smoltcp::wire::IpAddress::Ipv6(_) => smoltcp::wire::IpVersion::Ipv6,
-                    _ => smoltcp::wire::IpVersion::Ipv4,
-                };
-                sc.release();
-                writer.replace(inner::Inner::Closed(inner::Closed::new(ver)));
             }
             inner::Inner::Listening(mut ls) => {
                 // Each backlog slot can already be in a state that emits FIN

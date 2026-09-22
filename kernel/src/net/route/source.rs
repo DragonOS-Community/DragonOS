@@ -43,6 +43,17 @@ pub(crate) fn resolve_ipv4_route(
     let devices = netns.device_list();
     let router = netns.router();
     let fib = router.fib.read();
+    // Linux's default route_localnet=0 rejects loopback sources on an
+    // explicitly selected non-loopback device, including TCP self-connect.
+    if let (Some(IpAddress::Ipv4(source)), Some(oif)) = (fixed_source, required_oif) {
+        if source.is_loopback()
+            && devices
+                .get(&(oif as usize))
+                .is_some_and(|iface| !iface.flags().contains(InterfaceFlags::LOOPBACK))
+        {
+            return Err(SystemError::EINVAL);
+        }
+    }
     // Linux derives an output device from a fixed local source only for
     // multicast and limited broadcast when no caller supplied an OIF. This is
     // the ip_route_output_key_hash_rcu() compatibility path that lets an

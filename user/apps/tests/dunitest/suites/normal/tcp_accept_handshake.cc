@@ -57,6 +57,7 @@ class TcpAcceptHandshake : public testing::Test {
     int interface_ = 0;
     uint16_t port_ = 0;
     uint32_t server_sequence_ = 0;
+    uint16_t peer_port_ = kPeerPort;
     std::array<unsigned char, 6> source_mac_{}, destination_mac_{};
 
     void SetUp() override {
@@ -126,7 +127,7 @@ class TcpAcceptHandshake : public testing::Test {
         Put32(ip + 12, kPeer); Put32(ip + 16, kServer);
         Put16(ip + 10, Checksum(ip, 20));
         auto* tcp = ip + 20;
-        Put16(tcp, kPeerPort); Put16(tcp + 2, port_);
+        Put16(tcp, peer_port_); Put16(tcp + 2, port_);
         Put32(tcp + 4, sequence); Put32(tcp + 8, acknowledgement);
         tcp[12] = 0x50; tcp[13] = flags; Put16(tcp + 14, 65535);
         const uint32_t pseudo = (kPeer >> 16) + (kPeer & 0xffff) +
@@ -155,7 +156,7 @@ class TcpAcceptHandshake : public testing::Test {
                 Get32(ip + 16) != kPeer) continue;
             auto* tcp = ip + header;
             if ((uint16_t(tcp[0]) << 8 | tcp[1]) != port_ ||
-                (uint16_t(tcp[2]) << 8 | tcp[3]) != kPeerPort ||
+                (uint16_t(tcp[2]) << 8 | tcp[3]) != peer_port_ ||
                 (tcp[13] & required_flags) != required_flags ||
                 (acknowledgement != 0 && Get32(tcp + 8) != acknowledgement)) continue;
             server_sequence_ = Get32(tcp + 4);
@@ -166,6 +167,22 @@ class TcpAcceptHandshake : public testing::Test {
     void StartHandshake() {
         ASSERT_NO_FATAL_FAILURE(Segment(0x02, kInitialSequence, 0));
         ASSERT_NO_FATAL_FAILURE(WaitReply(0x12));
+    }
+    void ExpectDevice(int fd, const char* expected) {
+        char device[IFNAMSIZ]{};
+        socklen_t length = sizeof(device);
+        ASSERT_EQ(getsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, device, &length), 0);
+        EXPECT_EQ(length, strlen(expected) + 1);
+        EXPECT_STREQ(device, expected);
+    }
+    void AcceptAndCheckDevice(const char* device) {
+        ASSERT_NO_FATAL_FAILURE(Segment(0x10, kInitialSequence + 1, server_sequence_ + 1));
+        pollfd event{listener_.get(), POLLIN, 0};
+        ASSERT_EQ(poll(&event, 1, 3000), 1);
+        Fd accepted(accept4(listener_.get(), nullptr, nullptr, SOCK_NONBLOCK));
+        ASSERT_GE(accepted.get(), 0) << strerror(errno);
+        ASSERT_NO_FATAL_FAILURE(ExpectDevice(accepted.get(), device));
+        ASSERT_NO_FATAL_FAILURE(Segment(0x14, kInitialSequence + 1, server_sequence_ + 1));
     }
 };
 
@@ -204,6 +221,27 @@ TEST_F(TcpAcceptHandshake, FinalAckWithFinRemainsAcceptable) {
     char byte;
     EXPECT_EQ(recv(accepted.get(), &byte, 1, 0), 0);
     ASSERT_NO_FATAL_FAILURE(Segment(0x14, kInitialSequence + 2, server_sequence_ + 1));
+}
+
+TEST_F(TcpAcceptHandshake, AcceptedAndReplenishedSlotsKeepDeviceBinding) {
+    // With one listener slot, the second connection must use a replenished slot.
+    ASSERT_EQ(listen(listener_.get(), 1), 0);
+    for (int i = 0; i < 3; ++i) {
+        ASSERT_NO_FATAL_FAILURE(StartHandshake());
+        ASSERT_NO_FATAL_FAILURE(AcceptAndCheckDevice("veth2"));
+        ++peer_port_;
+    }
+}
+
+TEST_F(TcpAcceptHandshake, PendingChildKeepsDeviceWhenListenerChanges) {
+    ASSERT_NO_FATAL_FAILURE(StartHandshake());
+    constexpr char new_device[] = "veth1";
+    ASSERT_EQ(setsockopt(listener_.get(), SOL_SOCKET, SO_BINDTODEVICE,
+                         new_device, sizeof(new_device)), 0);
+    ASSERT_NO_FATAL_FAILURE(ExpectDevice(listener_.get(), "veth1"));
+    // The SYN arrived on veth2 before the change. Its ACK and the accepted
+    // child must retain that snapshot even though future SYNs use veth1.
+    ASSERT_NO_FATAL_FAILURE(AcceptAndCheckDevice("veth2"));
 }
 }  // namespace
 

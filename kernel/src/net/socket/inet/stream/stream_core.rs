@@ -8,6 +8,7 @@ use crate::libs::mutex::Mutex;
 use crate::libs::rwsem::RwSem;
 use crate::libs::wait_queue::WaitQueue;
 use crate::net::socket::common::EPollItems;
+use crate::net::socket::inet::common::SocketDeviceBinding;
 use crate::net::socket::Socket;
 use crate::process::namespace::net_namespace::NetNamespace;
 use crate::process::ProcessManager;
@@ -150,6 +151,7 @@ pub struct TcpSocket {
     pub(crate) self_ref: Weak<Self>,
     pub(crate) pollee: AtomicUsize,
     pub(crate) netns: Arc<NetNamespace>,
+    pub(crate) device_binding: Arc<SocketDeviceBinding>,
     pub(crate) epoll_items: EPollItems,
     pub(crate) fasync_items: FAsyncItems,
     pub(crate) options: TcpSocketOptions,
@@ -172,6 +174,14 @@ impl TcpSocket {
         ip_version: smoltcp::wire::IpVersion,
         me: &Weak<Self>,
     ) -> Self {
+        let inherited_device = match &inner {
+            inner::Inner::Established(est) => est.with(|socket| {
+                socket
+                    .bound_device()
+                    .map_or(0, |device| device.get() as usize)
+            }),
+            _ => 0,
+        };
         Self {
             inner: RwSem::new(Some(inner)),
             shutdown: AtomicUsize::new(0),
@@ -184,6 +194,7 @@ impl TcpSocket {
             self_ref: me.clone(),
             pollee: AtomicUsize::new(pollee_bits),
             netns,
+            device_binding: Arc::new(SocketDeviceBinding::from_ifindex(inherited_device)),
             epoll_items: EPollItems::default(),
             fasync_items: FAsyncItems::default(),
             options: TcpSocketOptions::new(),
@@ -248,7 +259,7 @@ impl TcpSocket {
     pub(super) fn stack_poll_iface_snapshot(&self) -> Option<Arc<dyn crate::net::Iface>> {
         let inner = self.inner.read();
         match inner.as_ref() {
-            Some(inner::Inner::SelfConnected(_)) | None => None,
+            None => None,
             Some(inner) => inner.iface().cloned(),
         }
     }
@@ -266,7 +277,6 @@ impl TcpSocket {
             .as_ref()
             .map(|inner| match inner {
                 inner::Inner::Closed(_) => 0,
-                inner::Inner::SelfConnected(sc) => sc.recv_queue(),
                 _ => inner.with_socket(|s| s.recv_queue()),
             })
             .unwrap_or(0)
@@ -454,10 +464,6 @@ impl TcpSocket {
                     socket.set_recv_buffer_size(rx_size);
                 });
                 established.update_io_events(&self.pollee);
-            }
-            Some(inner::Inner::SelfConnected(sc)) => {
-                sc.set_recv_buffer_size(rx_size);
-                sc.update_io_events(&self.pollee, self.is_recv_shutdown());
             }
             Some(inner::Inner::Connecting(connecting)) => {
                 connecting.with_mut(|socket| {

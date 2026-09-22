@@ -4,6 +4,7 @@ use hashbrown::HashMap;
 use smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint, IpVersion};
 use system_error::SystemError;
 
+use super::device_binding::SocketDeviceBinding;
 use crate::process::namespace::net_namespace::NetNamespace;
 use crate::{arch::rand::rand, libs::mutex::Mutex, process::ProcessManager};
 
@@ -53,6 +54,7 @@ impl TcpBindDomain {
 struct Binding {
     id: u64,
     domain: TcpBindDomain,
+    device: Arc<SocketDeviceBinding>,
 }
 
 /// Network-namespace TCP reservations, independently of the interface hosting
@@ -92,6 +94,21 @@ impl Drop for TcpPortReservation {
     }
 }
 
+impl TcpPortReservation {
+    /// A successful implicit source selection narrows a wildcard reservation
+    /// without allocating a new port or repeating bind-time conflict checks.
+    pub(crate) fn update_domain(&mut self, domain: TcpBindDomain) {
+        let mut bindings = self.netns.tcp_ports().bindings.lock();
+        if let Some(binding) = bindings
+            .get_mut(&self.port)
+            .and_then(|bucket| bucket.iter_mut().find(|binding| binding.id == self.id))
+        {
+            binding.domain = domain;
+        }
+        self.domain = domain;
+    }
+}
+
 impl PortManager {
     pub fn local_port_range() -> (u16, u16) {
         ProcessManager::current_netns().local_port_range()
@@ -105,6 +122,7 @@ impl PortManager {
         netns: Arc<NetNamespace>,
         domain: TcpBindDomain,
         port: u16,
+        device: Arc<SocketDeviceBinding>,
     ) -> Result<TcpPortReservation, SystemError> {
         let manager = netns.tcp_ports();
         let (min, max) = netns.local_port_range();
@@ -120,10 +138,14 @@ impl PortManager {
         };
         for _ in 0..if port == 0 { count } else { 1 } {
             let bucket = bindings.entry(candidate).or_default();
-            if !bucket.iter().any(|binding| domain.overlaps(binding.domain)) {
+            if !bucket.iter().any(|binding| {
+                let a = device.ifindex();
+                let b = binding.device.ifindex();
+                (a == 0 || b == 0 || a == b) && domain.overlaps(binding.domain)
+            }) {
                 bucket.try_reserve(1).map_err(|_| SystemError::ENOMEM)?;
                 let id = manager.next_id.fetch_add(1, Ordering::Relaxed);
-                bucket.push(Binding { id, domain });
+                bucket.push(Binding { id, domain, device });
                 if port == 0 {
                     manager.next_ephemeral.store(
                         if candidate == max { min } else { candidate + 1 },

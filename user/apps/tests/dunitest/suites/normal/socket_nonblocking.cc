@@ -4,6 +4,7 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
+#include <sys/epoll.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
@@ -254,6 +255,61 @@ TEST_P(ListenerNonblocking, IoctlMakesEmptyAcceptReturnAgain) {
         ASSERT_EQ(EAGAIN, error);
     });
 }
+TEST_P(ListenerNonblocking, ConsumedReadinessDoesNotBlockControlEvents) {
+    Bounded([&] {
+        Sockets sockets;
+        int listener;
+        sockaddr_in address;
+        ASSERT_NO_FATAL_FAILURE(sockets.Listen(&listener, &address));
+        int alias = sockets.Keep(dup(listener));
+        ASSERT_GE(alias, 0);
+        int enabled = 1;
+        ASSERT_EQ(0, ioctl(listener, FIONBIO, &enabled));
+
+        int control[2];
+        ASSERT_EQ(0, socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, control));
+        sockets.Keep(control[0]);
+        sockets.Keep(control[1]);
+        int epoll = sockets.Keep(epoll_create1(EPOLL_CLOEXEC));
+        ASSERT_GE(epoll, 0);
+        for (int fd : {listener, control[0]}) {
+            epoll_event event{};
+            event.events = EPOLLIN;
+            event.data.fd = fd;
+            ASSERT_EQ(0, epoll_ctl(epoll, EPOLL_CTL_ADD, fd, &event));
+        }
+
+        int client = sockets.New(AF_INET, SOCK_STREAM);
+        ASSERT_GE(client, 0);
+        ASSERT_EQ(0, connect(client, reinterpret_cast<sockaddr*>(&address), sizeof(address)));
+        epoll_event event{};
+        ASSERT_EQ(1, epoll_wait(epoll, &event, 1, 1000));
+        ASSERT_EQ(listener, event.data.fd);
+        ASSERT_NE(0u, event.events & EPOLLIN);
+
+        // Another user of the shared listener can consume a reported event.
+        // Keep the connection alive so EOF cannot supply an unrelated event.
+        ASSERT_GE(sockets.Keep(accept(alias, nullptr, nullptr)), 0);
+        ASSERT_EQ(1, send(control[1], "q", 1, MSG_NOSIGNAL));
+        int accepted = GetParam() ? accept4(listener, nullptr, nullptr, SOCK_NONBLOCK)
+                                  : accept(listener, nullptr, nullptr);
+        int error = errno;
+        sockets.Keep(accepted);
+        ASSERT_EQ(-1, accepted);
+        ASSERT_EQ(EAGAIN, error);
+
+        // A stale listener event must not prevent an event-driven worker from
+        // returning to epoll and handling its control channel.
+        event = {};
+        ASSERT_EQ(1, epoll_wait(epoll, &event, 1, 1000));
+        ASSERT_EQ(control[0], event.data.fd);
+        ASSERT_NE(0u, event.events & EPOLLIN);
+        char command = 0;
+        ASSERT_EQ(1, recv(control[0], &command, 1, 0));
+        EXPECT_EQ('q', command);
+    });
+}
+
 INSTANTIATE_TEST_SUITE_P(Calls, ListenerNonblocking, testing::Bool());
 
 TEST(SocketNonblockingFlags, AcceptedSocketFlagsAreExplicit) {

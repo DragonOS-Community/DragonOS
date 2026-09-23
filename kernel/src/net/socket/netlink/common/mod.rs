@@ -108,6 +108,7 @@ where
         to: Option<NetlinkSocketAddr>,
         flags: crate::net::socket::PMSG,
     ) -> Result<usize, SystemError> {
+        Self::check_send_len(buf.len())?;
         let destination_is_explicit = to.is_some();
         let send_bytes = select_remote_and_bind(
             &self.inner,
@@ -132,6 +133,7 @@ where
         to: Option<NetlinkSocketAddr>,
         flags: crate::net::socket::PMSG,
     ) -> Result<usize, SystemError> {
+        Self::check_send_len(buf.len())?;
         let destination_is_explicit = to.is_some();
         let send_bytes = select_remote_and_bind(
             &self.inner,
@@ -298,6 +300,7 @@ where
         reader: &UserBufferReader<'_>,
         len: usize,
     ) -> Result<alloc::vec::Vec<u8>, SystemError> {
+        Self::check_send_len(len)?;
         let effective_len = if self.protocol == u32::from(StandardNetlinkProtocol::ROUTE) {
             Self::route_effective_send_len(reader, len)?
         } else {
@@ -305,6 +308,13 @@ where
         };
 
         crate::net::socket::base::copy_user_buffer_to_vec(reader, effective_len)
+    }
+
+    fn check_send_len(len: usize) -> Result<(), SystemError> {
+        if P::max_send_len().is_some_and(|limit| len > limit) {
+            return Err(SystemError::EMSGSIZE);
+        }
+        Ok(())
     }
 
     fn recv_from_inner(
@@ -316,6 +326,7 @@ where
     {
         if let Some(addr) = address {
             let endpoint = addr.try_into()?;
+            P::check_connect(&endpoint, &self.netns)?;
             self.inner
                 .write()
                 .connect(&endpoint, self.wait_queue.clone(), self.netns())?;
@@ -341,7 +352,7 @@ where
         self.inner
             .read()
             .check_io_events()
-            .contains(EPollEventType::EPOLLIN)
+            .intersects(EPollEventType::EPOLLIN | EPollEventType::EPOLLERR)
     }
 
     pub fn do_poll(&self) -> usize {
@@ -402,6 +413,8 @@ where
     ) -> Result<(), system_error::SystemError> {
         let endpoint = endpoint.try_into()?;
 
+        P::check_connect(&endpoint, &self.netns)?;
+
         self.inner
             .write()
             .connect(&endpoint, self.wait_queue.clone(), self.netns())
@@ -412,6 +425,7 @@ where
         endpoint: crate::net::socket::endpoint::Endpoint,
     ) -> Result<(), system_error::SystemError> {
         let endpoint = endpoint.try_into()?;
+        P::check_bind(&endpoint, &self.netns)?;
         self.update_membership_capacity_for_bind(&endpoint);
 
         self.inner
@@ -483,7 +497,16 @@ where
         flags: PMSG,
     ) -> Result<usize, SystemError> {
         let iovs = unsafe { IoVecs::from_user(msg.msg_iov, msg.msg_iovlen, true)? };
-        let mut buf = iovs.new_buf(true)?;
+        let mut buf = if let Some(limit) = P::max_recv_len() {
+            let len = iovs.total_len().min(limit);
+            let mut buf = Vec::new();
+            buf.try_reserve_exact(len)
+                .map_err(|_| SystemError::ENOMEM)?;
+            buf.resize(len, 0);
+            buf
+        } else {
+            iovs.new_buf(true)?
+        };
 
         let (copy_len, orig_len, endpoint) = self.recv_from_inner(&mut buf, flags, None)?;
         iovs.scatter_exact(&buf[..copy_len])?;
@@ -536,6 +559,16 @@ where
             PSOL::SOCKET => {
                 let opt = PSO::try_from(name as u32).map_err(|_| SystemError::ENOPROTOOPT)?;
                 match opt {
+                    PSO::ERROR
+                        if self.protocol == u32::from(StandardNetlinkProtocol::NETFILTER) =>
+                    {
+                        let error = match &*self.inner.read() {
+                            Inner::Unbound(_) => None,
+                            Inner::Bound(bound) => bound.receive_queue.take_error(),
+                        };
+                        let value_errno = error.map_or(0, |error| -error.to_posix_errno());
+                        Ok(write_i32_getsockopt(value, value_errno))
+                    }
                     PSO::TYPE => {
                         let v = self.socket_type as i32;
                         Ok(write_i32_getsockopt(value, v))
@@ -589,6 +622,7 @@ where
 
     fn send_msg(&self, msg: &crate::net::posix::MsgHdr, flags: PMSG) -> Result<usize, SystemError> {
         let iovs = unsafe { IoVecs::from_user(msg.msg_iov, msg.msg_iovlen, false)? };
+        Self::check_send_len(iovs.total_len())?;
         let mut data = iovs.gather()?;
         let original_len = data.len();
         let effective_len = if self.protocol == u32::from(StandardNetlinkProtocol::ROUTE) {
@@ -638,12 +672,14 @@ where
                     NetlinkSockOpt::try_from(name as u32).map_err(|_| SystemError::ENOPROTOOPT)?;
                 match opt {
                     NetlinkSockOpt::AddMembership => {
+                        P::check_membership(&self.netns)?;
                         let groups = read_group_membership_sockopt::<P>(val)?;
                         self.ensure_membership_capacity();
                         self.inner.write().add_groups(groups);
                         Ok(())
                     }
                     NetlinkSockOpt::DropMembership => {
+                        P::check_membership(&self.netns)?;
                         let groups = read_group_membership_sockopt::<P>(val)?;
                         self.ensure_membership_capacity();
                         self.inner.write().drop_groups(groups);

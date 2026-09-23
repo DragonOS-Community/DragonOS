@@ -3,6 +3,7 @@ pub use multicast::MulticastMessage;
 
 use crate::net::socket::netlink::addr::multicast::GroupIdSet;
 use crate::net::socket::netlink::kobject::message::KobjectUeventMessage;
+use crate::net::socket::netlink::netfilter::{NetfilterKernelSocket, NetfilterMessage};
 use crate::net::socket::netlink::route::kern::NetlinkRouteKernelSocket;
 use crate::net::socket::netlink::route::message::RouteNlMessage;
 use crate::process::namespace::net_namespace::NetNamespace;
@@ -10,7 +11,10 @@ use crate::process::ProcessManager;
 use crate::{libs::rand, net::socket::netlink::addr::NetlinkSocketAddr};
 use crate::{
     libs::rwsem::RwSem,
-    net::socket::netlink::{receiver::MessageReceiver, table::multicast::MulticastGroup},
+    net::socket::netlink::{
+        receiver::{MessageQueue, MessageReceiver},
+        table::multicast::MulticastGroup,
+    },
 };
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
@@ -27,6 +31,7 @@ const MAX_GROUPS: u32 = 64;
 pub struct NetlinkSocketTable {
     route: Arc<RwSem<ProtocolSocketTable<RouteNlMessage>>>,
     kobject_uevent: Arc<RwSem<ProtocolSocketTable<KobjectUeventMessage>>>,
+    netfilter: Arc<RwSem<ProtocolSocketTable<NetfilterMessage>>>,
 }
 
 impl Default for NetlinkSocketTable {
@@ -34,6 +39,7 @@ impl Default for NetlinkSocketTable {
         Self {
             route: Arc::new(RwSem::new(ProtocolSocketTable::new())),
             kobject_uevent: Arc::new(RwSem::new(ProtocolSocketTable::new())),
+            netfilter: Arc::new(RwSem::new(ProtocolSocketTable::new())),
         }
     }
 }
@@ -45,6 +51,10 @@ impl NetlinkSocketTable {
 
     pub fn kobject_uevent(&self) -> Arc<RwSem<ProtocolSocketTable<KobjectUeventMessage>>> {
         self.kobject_uevent.clone()
+    }
+
+    pub fn netfilter(&self) -> Arc<RwSem<ProtocolSocketTable<NetfilterMessage>>> {
+        self.netfilter.clone()
     }
 }
 
@@ -207,6 +217,36 @@ pub trait SupportedNetlinkProtocol: Debug {
 
     fn multicast_group_count() -> u32;
 
+    fn new_message_queue() -> MessageQueue<Self::Message> {
+        MessageQueue::new()
+    }
+
+    fn max_send_len() -> Option<usize> {
+        None
+    }
+
+    fn max_recv_len() -> Option<usize> {
+        None
+    }
+
+    fn check_bind(
+        _addr: &NetlinkSocketAddr,
+        _netns: &Arc<NetNamespace>,
+    ) -> Result<(), SystemError> {
+        Ok(())
+    }
+
+    fn check_connect(
+        _addr: &NetlinkSocketAddr,
+        _netns: &Arc<NetNamespace>,
+    ) -> Result<(), SystemError> {
+        Ok(())
+    }
+
+    fn check_membership(_netns: &Arc<NetNamespace>) -> Result<(), SystemError> {
+        Ok(())
+    }
+
     fn socket_table(netns: Arc<NetNamespace>) -> Arc<RwSem<ProtocolSocketTable<Self::Message>>>;
 
     fn bind(
@@ -225,6 +265,14 @@ pub trait SupportedNetlinkProtocol: Debug {
         netns: Arc<NetNamespace>,
     ) -> Result<(), SystemError> {
         Self::socket_table(netns).read().unicast(dst_port, message)
+    }
+
+    fn report_overrun(dst_port: u32, netns: Arc<NetNamespace>) {
+        let table = Self::socket_table(netns);
+        let table = table.read();
+        if let Some(receiver) = table.unicast_sockets.get(&dst_port) {
+            receiver.report_overrun();
+        }
     }
 
     //todo 多播消息用
@@ -261,6 +309,9 @@ impl SupportedNetlinkProtocol for NetlinkRouteProtocol {
 #[derive(Debug)]
 pub struct NetlinkKobjectUeventProtocol;
 
+#[derive(Debug)]
+pub struct NetlinkNetfilterProtocol;
+
 impl SupportedNetlinkProtocol for NetlinkKobjectUeventProtocol {
     type Message = KobjectUeventMessage;
 
@@ -290,6 +341,9 @@ pub fn generate_supported_netlink_kernel_sockets() -> HashMap<u32, Arc<dyn Netli
         HashMap::with_capacity(MAX_ALLOWED_PROTOCOL_ID as usize);
     let route_socket = Arc::new(NetlinkRouteKernelSocket::new());
     sockets.insert(route_socket.protocol().into(), route_socket);
+
+    let netfilter_socket = Arc::new(NetfilterKernelSocket);
+    sockets.insert(netfilter_socket.protocol().into(), netfilter_socket);
 
     // Add other supported netlink kernel sockets here
     sockets

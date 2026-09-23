@@ -7,7 +7,7 @@ use crate::{
         netlink::{
             addr::{multicast::GroupIdSet, NetlinkSocketAddr},
             common::bound::BoundNetlink,
-            receiver::{MessageQueue, MessageReceiver},
+            receiver::MessageReceiver,
             table::SupportedNetlinkProtocol,
         },
         utils::datagram_common,
@@ -65,7 +65,7 @@ impl<P: SupportedNetlinkProtocol> datagram_common::Unbound for UnboundNetlink<P>
         wait_queue: Arc<WaitQueue>,
         netns: Arc<NetNamespace>,
     ) -> Result<BoundNetlink<P::Message>, SystemError> {
-        let message_queue = MessageQueue::<P::Message>::new();
+        let message_queue = P::new_message_queue();
         let bound_handle = {
             let endpoint = {
                 let mut endpoint = *endpoint;
@@ -95,7 +95,7 @@ impl<P: SupportedNetlinkProtocol> datagram_common::Unbound for UnboundNetlink<P>
         wait_queue: Arc<WaitQueue>,
         netns: Arc<NetNamespace>,
     ) -> Result<BoundNetlink<P::Message>, SystemError> {
-        let message_queue = MessageQueue::<P::Message>::new();
+        let message_queue = P::new_message_queue();
 
         let bound_handle = {
             let endpoint = {

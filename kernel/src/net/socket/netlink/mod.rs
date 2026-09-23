@@ -13,6 +13,7 @@ pub mod addr;
 mod common;
 pub(crate) mod kobject;
 mod message;
+mod netfilter;
 mod receiver;
 mod route;
 pub mod table;
@@ -33,6 +34,9 @@ pub fn create_netlink_socket(
         }
         Ok(StandardNetlinkProtocol::KOBJECT_UEVENT) => {
             NetlinkKobjectUeventSocket::new(is_nonblock, socket_type, protocol)
+        }
+        Ok(StandardNetlinkProtocol::NETFILTER) => {
+            netfilter::NetlinkNetfilterSocket::new(is_nonblock, socket_type, protocol)
         }
         Ok(_) => {
             log::warn!(

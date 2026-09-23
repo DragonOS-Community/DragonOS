@@ -48,6 +48,13 @@ fn new_smoltcp_socket_with_size(
 ) -> smoltcp::socket::tcp::Socket<'static> {
     let rx_buffer = smoltcp::socket::tcp::SocketBuffer::new(vec![0; rx_size]);
     let tx_buffer = smoltcp::socket::tcp::SocketBuffer::new(vec![0; tx_size]);
+    socket_with_buffers(rx_buffer, tx_buffer)
+}
+
+fn socket_with_buffers(
+    rx_buffer: tcp::SocketBuffer<'static>,
+    tx_buffer: tcp::SocketBuffer<'static>,
+) -> tcp::Socket<'static> {
     let mut socket = smoltcp::socket::tcp::Socket::new(rx_buffer, tx_buffer);
     socket.set_time_wait_duration(smoltcp::time::Duration::from_secs(60));
     socket.set_tsval_generator(Some(|| {
@@ -70,7 +77,15 @@ fn new_listen_smoltcp_socket<T>(
 where
     T: Into<smoltcp::wire::IpListenEndpoint>,
 {
-    let mut socket = new_smoltcp_socket();
+    let mut rx = Vec::new();
+    let mut tx = Vec::new();
+    rx.try_reserve_exact(DEFAULT_RX_BUF_SIZE)
+        .map_err(|_| SystemError::ENOMEM)?;
+    tx.try_reserve_exact(DEFAULT_TX_BUF_SIZE)
+        .map_err(|_| SystemError::ENOMEM)?;
+    rx.resize(DEFAULT_RX_BUF_SIZE, 0);
+    tx.resize(DEFAULT_TX_BUF_SIZE, 0);
+    let mut socket = socket_with_buffers(tcp::SocketBuffer::new(rx), tcp::SocketBuffer::new(tx));
     socket.set_listen_ip_version(ip_version);
     socket.set_listen_bound_device(device);
     socket.set_lifecycle_observer(Some(reservation.prepare_child(Arc::new(
@@ -101,6 +116,23 @@ pub enum Init {
 }
 
 impl Init {
+    fn after_failed_connect(
+        inner: super::bound::TcpBound,
+        mut reservation: TcpPortReservation,
+        ver: smoltcp::wire::IpVersion,
+    ) -> Self {
+        if let Some(domain) = reservation.locked_bind_domain {
+            reservation.update_domain(domain);
+            let local = smoltcp::wire::IpEndpoint::new(domain.addr, reservation.port);
+            return Self::Bound((inner, local, reservation));
+        }
+        drop(reservation);
+        let smoltcp::socket::Socket::Tcp(socket) = inner.into_socket() else {
+            unreachable!("TCP binding contains TCP");
+        };
+        Self::Unbound((Box::new(socket), ver))
+    }
+
     pub(super) fn new(ver: smoltcp::wire::IpVersion) -> Self {
         Init::Unbound((Box::new(new_smoltcp_socket()), ver))
     }
@@ -442,7 +474,7 @@ impl Init {
         // DragonOS uses multiple smoltcp TCP sockets to emulate accept queue slots.
         // Backlog emulation:
         // - backlog==0 => emulate a single accept slot
-        // - cap to avoid excessive socket allocations (FIXME: refactor backlog mechanism)
+        // Keep logical capacity separate from allocated transport slots.
         let backlog = Listening::slot_capacity(backlog);
 
         let mut inners = Vec::new();
@@ -450,7 +482,7 @@ impl Init {
         inners.push(inner);
         if let Err(err) = Listening::grow_slots(
             &mut inners,
-            backlog,
+            1,
             listen_addr,
             domain,
             &device_binding,
@@ -607,24 +639,12 @@ impl Connecting {
                     }
                     _ => SystemError::ECONNREFUSED,
                 };
-                if let Some(domain) = self.reservation.locked_bind_domain {
-                    // Like tcp_disconnect(), restore the user's bind address
-                    // after source selection, but retain a nonzero port lock.
-                    self.reservation.update_domain(domain);
-                    let local = smoltcp::wire::IpEndpoint::new(domain.addr, self.reservation.port);
-                    return (
-                        Inner::Init(Init::Bound((self.inner, local, self.reservation))),
-                        Err(err),
-                    );
-                }
-                drop(self.reservation);
-                let socket = self.inner.into_socket();
-                let socket = match socket {
-                    smoltcp::socket::Socket::Tcp(s) => s,
-                    _ => panic!("Connecting socket is not TCP"),
-                };
                 (
-                    Inner::Init(Init::Unbound((Box::new(socket), self.ver))),
+                    Inner::Init(Init::after_failed_connect(
+                        self.inner,
+                        self.reservation,
+                        self.ver,
+                    )),
                     Err(err),
                 )
             }
@@ -925,9 +945,44 @@ impl Listening {
     }
 
     fn slot_capacity(backlog: usize) -> usize {
-        // Bounded accept-slot emulation: at 256 KiB per slot, at most 2 MiB
-        // per listener, independent of the number of interfaces.
-        backlog.clamp(1, 8)
+        // Linux admits one extra pending child (acceptq length > backlog).
+        // sys_listen has already bounded backlog by somaxconn.
+        backlog.saturating_add(1)
+    }
+
+    pub(super) fn prepare_syn(&mut self, local: smoltcp::wire::IpEndpoint, device: u32) {
+        if local.port != self.local.port
+            || !self.domain.matches(local.addr)
+            || (self.device_binding.ifindex() != 0
+                && self.device_binding.ifindex() != device as usize)
+        {
+            return;
+        }
+        if self.shrink_pending {
+            self.trim_excess();
+        } else {
+            self.rearm_closed_slots();
+        }
+        if self.inners.len() >= self.target_slots
+            || self.inners.iter().any(|bound| {
+                bound.with::<tcp::Socket, _, _>(|socket| socket.state() == tcp::State::Listen)
+            })
+        {
+            return;
+        }
+        let target = self.inners.len() + 1;
+        // Allocation pressure leaves the logical listener registered, so the
+        // normal overflow path drops SYN for retransmission rather than RST.
+        let _ = Self::grow_slots(
+            &mut self.inners,
+            target,
+            self.listen_addr,
+            self.domain,
+            &self.device_binding,
+            self.reservation
+                .as_ref()
+                .expect("open listener reservation"),
+        );
     }
 
     pub(super) fn has_excess_slots(&self) -> bool {
@@ -995,6 +1050,12 @@ impl Listening {
         // Prepare sockets before publishing any new handles; keep existing
         // connections and the previous capacity on a recoverable failure.
         let mut sockets = Vec::new();
+        sockets
+            .try_reserve(target.saturating_sub(inners.len()))
+            .map_err(|_| SystemError::ENOMEM)?;
+        inners
+            .try_reserve(target.saturating_sub(inners.len()))
+            .map_err(|_| SystemError::ENOMEM)?;
         if let Some(bound) = inners.first() {
             for _ in inners.len()..target {
                 sockets.push(new_listen_smoltcp_socket(
@@ -1014,16 +1075,6 @@ impl Listening {
 
     pub(super) fn set_backlog(&mut self, backlog: usize) -> Result<(), SystemError> {
         let target = Self::slot_capacity(backlog);
-        Self::grow_slots(
-            &mut self.inners,
-            target,
-            self.listen_addr,
-            self.domain,
-            &self.device_binding,
-            self.reservation
-                .as_ref()
-                .expect("open listener reservation"),
-        )?;
         self.target_slots = target;
         self.trim_excess();
         Ok(())
@@ -1180,6 +1231,9 @@ pub struct Established {
     peer: smoltcp::wire::IpEndpoint,
     reservation: Option<TcpPortReservation>,
     connecting_registration: Option<ConnectingRegistrationLease>,
+    /// Linux socket::state confirmation is independent of TCP transport state.
+    /// Protected by TcpSocket::inner; I/O and readiness do not acknowledge it.
+    connect_confirmed: bool,
 }
 
 impl Established {
@@ -1217,6 +1271,7 @@ impl Established {
             peer,
             reservation,
             connecting_registration: None,
+            connect_confirmed: true,
         }
     }
 
@@ -1227,7 +1282,35 @@ impl Established {
     ) -> Self {
         let mut established = Self::new(inner, reservation);
         established.connecting_registration = Some(registration);
+        established.connect_confirmed = false;
         established
+    }
+
+    pub fn connect_confirmed(&self) -> bool {
+        self.connect_confirmed
+    }
+
+    pub fn confirm_connect(&mut self) {
+        self.connect_confirmed = true;
+    }
+
+    pub fn finish_connect(
+        mut self,
+        ver: smoltcp::wire::IpVersion,
+    ) -> (Inner, Result<(), SystemError>) {
+        if !self.connect_confirmed && self.with(|socket| socket.state() == tcp::State::Closed) {
+            self.cancel_connecting_registration();
+            let reservation = self
+                .reservation
+                .take()
+                .expect("live connecting FD owns binding");
+            return (
+                Inner::Init(Init::after_failed_connect(self.inner, reservation, ver)),
+                Err(SystemError::ECONNABORTED),
+            );
+        }
+        self.confirm_connect();
+        (Inner::Established(self), Ok(()))
     }
 
     pub(super) fn cancel_connecting_registration(&self) {

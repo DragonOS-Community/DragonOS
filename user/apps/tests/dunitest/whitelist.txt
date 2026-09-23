@@ -159,3 +159,5 @@ normal/tcp_port_lifetime
 normal/tcp_address_migration
 normal/tcp_connect_completion
 normal/tcp_namespace_progress
+normal/tcp_listen_backlog
+normal/tcp_connect_confirmation

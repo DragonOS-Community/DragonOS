@@ -48,6 +48,7 @@ pub struct TcpStack {
     close_defer: TcpCloseDefer,
     listeners: Arc<TcpListenerRegistry>,
     pending: AtomicBool,
+    polling: AtomicBool,
     deadline: AtomicU64,
 }
 
@@ -75,6 +76,7 @@ impl TcpStack {
             close_defer: TcpCloseDefer::new(),
             listeners,
             pending: AtomicBool::new(false),
+            polling: AtomicBool::new(false),
             deadline: AtomicU64::new(NO_DEADLINE),
         }
     }
@@ -153,16 +155,25 @@ impl TcpStack {
     /// Progress one bounded input batch and one ordinary smoltcp output pass.
     /// No output submission or upper-layer notification runs under TCP locks.
     pub fn poll(&self) -> bool {
+        if self
+            .polling
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            self.request_poll();
+            return false;
+        }
+        struct PollGuard<'a>(&'a AtomicBool);
+        impl Drop for PollGuard<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+        let _poll_guard = PollGuard(&self.polling);
         let Some(namespace) = self.namespace.upgrade() else {
             return false;
         };
         self.pending.store(false, Ordering::Release);
-        let router = namespace.router();
-        let routes = crate::net::route::lock_output_routes(&router, namespace.device_list());
-        let mut sockets = self.sockets.lock();
-        let mut context = self.context.lock();
-        let now: smoltcp::time::Instant = crate::time::Instant::now().into();
-        let mut device = self.output.device(&routes);
         let mut input_blocked = false;
         for _ in 0..POLL_BUDGET {
             let packet = {
@@ -173,6 +184,25 @@ impl TcpStack {
                 input.in_flight += 1;
                 packet
             };
+            // IP admission and TCP validation already happened on the device.
+            // Reserve listener capacity outside protocol/router locks, using
+            // the same inner -> SocketSet order as listen/accept/shutdown.
+            if let Ok(tcp) = smoltcp::wire::TcpPacket::new_checked(&packet.segment[..]) {
+                if tcp.syn() && !tcp.ack() && !tcp.rst() {
+                    let bounds = self.bounds.read_irqsave().clone();
+                    let local =
+                        smoltcp::wire::IpEndpoint::new(packet.ip.dst_addr(), tcp.dst_port());
+                    for socket in bounds.iter() {
+                        socket.prepare_tcp_syn(local, packet.meta.id);
+                    }
+                }
+            }
+            let router = namespace.router();
+            let routes = crate::net::route::lock_output_routes(&router, namespace.device_list());
+            let mut sockets = self.sockets.lock();
+            let mut context = self.context.lock();
+            let now: smoltcp::time::Instant = crate::time::Instant::now().into();
+            let mut device = self.output.device(&routes);
             if !context.process_tcp_ingress(
                 now,
                 &mut device,
@@ -191,6 +221,12 @@ impl TcpStack {
             input.in_flight -= 1;
             input.bytes -= packet.segment.capacity();
         }
+        let router = namespace.router();
+        let routes = crate::net::route::lock_output_routes(&router, namespace.device_list());
+        let mut sockets = self.sockets.lock();
+        let mut context = self.context.lock();
+        let now: smoltcp::time::Instant = crate::time::Instant::now().into();
+        let mut device = self.output.device(&routes);
         context.poll_egress(now, &mut device, &mut sockets);
         let close_deadline = self.close_defer.reap_closed(now, &mut sockets);
         let mut poll_at = match (context.poll_at(now, &sockets), close_deadline) {

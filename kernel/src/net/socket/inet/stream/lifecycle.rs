@@ -387,10 +387,20 @@ impl TcpSocket {
             inner::Inner::Listening(inner) => {
                 (inner::Inner::Listening(inner), Err(SystemError::EISCONN))
             }
+            inner::Inner::Established(established) if !established.connect_confirmed() => {
+                (inner::Inner::Established(established), Ok(()))
+            }
             inner::Inner::Established(inner) => {
                 (inner::Inner::Established(inner), Err(SystemError::EISCONN))
             }
             inner::Inner::Closed(_) => (inner, Err(SystemError::ENOTCONN)),
+        };
+
+        let (init, result) = match init {
+            inner::Inner::Established(established) if result.is_ok() => {
+                established.finish_connect(self.ip_version)
+            }
+            other => (other, result),
         };
 
         // Publish the state before releasing inner. Connection registration
@@ -451,11 +461,17 @@ impl TcpSocket {
         let inner = write_state.take().expect("Tcp inner::Inner is None");
         let (replace, result) = match inner {
             inner::Inner::Connecting(conn) => conn.into_result(),
-            inner::Inner::Established(es) => (inner::Inner::Established(es), Ok(())), // TODO check established
+            inner::Inner::Established(es) => (inner::Inner::Established(es), Ok(())),
             _ => {
                 log::warn!("TODO: connecting socket error options");
                 (inner, Err(SystemError::EINVAL))
             } // TODO socket error options
+        };
+        let (replace, result) = match replace {
+            inner::Inner::Established(established) if result.is_ok() => {
+                established.finish_connect(self.ip_version)
+            }
+            other => (other, result),
         };
         write_state.replace(replace);
         result
@@ -489,7 +505,7 @@ impl TcpSocket {
         let inner = writer.take().expect("Tcp inner::Inner is None");
 
         let (replace, record_bits) = match inner {
-            inner::Inner::Established(established) => {
+            inner::Inner::Established(mut established) => {
                 let state = established.with(|socket| socket.state());
                 if matches!(
                     state,
@@ -498,6 +514,7 @@ impl TcpSocket {
                     writer.replace(inner::Inner::Established(established));
                     return Err(SystemError::ENOTCONN);
                 }
+                established.confirm_connect();
 
                 if how.contains(ShutdownBit::SHUT_WR) {
                     self.send_fin_deferred
@@ -566,7 +583,8 @@ impl TcpSocket {
             }
             inner::Inner::Connecting(connecting) => {
                 if connecting.is_transport_established() {
-                    let established = unsafe { connecting.into_established() };
+                    let mut established = unsafe { connecting.into_established() };
+                    established.confirm_connect();
 
                     if how.contains(ShutdownBit::SHUT_WR) {
                         self.send_fin_deferred

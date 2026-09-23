@@ -577,6 +577,13 @@ impl Socket for TcpSocket {
 }
 
 impl InetSocket for TcpSocket {
+    fn prepare_tcp_syn(&self, local: smoltcp::wire::IpEndpoint, device: u32) {
+        let mut inner = self.inner.write();
+        if let Some(inner::Inner::Listening(listener)) = inner.as_mut() {
+            listener.prepare_syn(local, device);
+        }
+    }
+
     fn on_iface_events(&self) {
         // TcpStack::poll() 在网络轮询线程/中断上下文中推进 smoltcp socket 状态。
         // 这里负责把 smoltcp 的状态变化同步到 TcpSocket 的 pollee/Connecting 结果中，

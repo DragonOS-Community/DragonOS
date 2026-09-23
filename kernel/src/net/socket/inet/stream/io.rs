@@ -17,17 +17,6 @@ use super::TcpSocket;
 
 const USER_RECV_STAGING_SIZE: usize = 64 * 1024;
 
-#[inline]
-fn discard_recv_queue(socket: &mut smoltcp::socket::tcp::Socket) {
-    while socket.can_recv() {
-        match socket.recv(|data| (data.len(), data.len())) {
-            Ok(0) => break,
-            Ok(_) => {}
-            Err(_) => break,
-        }
-    }
-}
-
 impl TcpSocket {
     fn maybe_schedule_cork_timeout(&self) {
         if !self
@@ -102,17 +91,7 @@ impl TcpSocket {
         buf: &mut [u8],
         flags: PMSG,
     ) -> Result<usize, SystemError> {
-        let mut current_buf = buf;
-        let is_recv_shutdown = self.is_recv_shutdown();
-        if is_recv_shutdown {
-            let remaining = self.recv_shutdown.remaining_limit();
-            if remaining == 0 {
-                discard_recv_queue(socket);
-                return Ok(0);
-            }
-            let cap = core::cmp::min(current_buf.len(), remaining);
-            current_buf = &mut current_buf[..cap];
-        }
+        let current_buf = buf;
 
         if !socket.can_recv() {
             if !socket.may_recv() {
@@ -124,7 +103,13 @@ impl TcpSocket {
                     }
                 };
             }
-            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+            // Linux drains queued bytes before observing local SHUT_RD. It
+            // does not freeze the readable length when shutdown is requested.
+            return if self.is_recv_shutdown() {
+                Ok(0)
+            } else {
+                Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
+            };
         }
 
         // gVisor tcp_socket.cc MsgTrunc* tests: for TCP stream, MSG_TRUNC means
@@ -166,9 +151,6 @@ impl TcpSocket {
 
             if total == 0 {
                 return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-            }
-            if is_recv_shutdown && self.recv_shutdown.record_read(total) {
-                discard_recv_queue(socket);
             }
             return Ok(total);
         }
@@ -218,9 +200,6 @@ impl TcpSocket {
         if total == 0 {
             return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
         }
-        if is_recv_shutdown && self.recv_shutdown.record_read(total) {
-            discard_recv_queue(socket);
-        }
         Ok(total)
     }
 
@@ -234,16 +213,7 @@ impl TcpSocket {
             return Err(SystemError::EINVAL);
         }
 
-        let mut user_remaining = user_buffer.len() - offset;
-        let is_recv_shutdown = self.is_recv_shutdown();
-        if is_recv_shutdown {
-            let remaining = self.recv_shutdown.remaining_limit();
-            if remaining == 0 {
-                established.with_mut(discard_recv_queue);
-                return Ok(0);
-            }
-            user_remaining = core::cmp::min(user_remaining, remaining);
-        }
+        let user_remaining = user_buffer.len() - offset;
 
         if user_remaining == 0 {
             return Ok(0);
@@ -255,7 +225,11 @@ impl TcpSocket {
                 return Ok(true);
             }
             if socket.may_recv() {
-                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+                return if self.is_recv_shutdown() {
+                    Ok(false)
+                } else {
+                    Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
+                };
             }
             match socket.recv(|_data| (0usize, ())) {
                 Ok(()) | Err(smoltcp::socket::tcp::RecvError::Finished) => Ok(false),
@@ -324,8 +298,15 @@ impl TcpSocket {
             // The stack may have processed FIN/RST after the allocation-time readiness probe.
             // Re-evaluate the terminal state instead of turning EOF into a spurious EAGAIN.
             return established.with_mut(|socket| {
-                if socket.can_recv() || socket.may_recv() {
+                if socket.can_recv() {
                     return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+                }
+                if socket.may_recv() {
+                    return if self.is_recv_shutdown() {
+                        Ok(0)
+                    } else {
+                        Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
+                    };
                 }
                 match socket.recv(|_data| (0usize, ())) {
                     Ok(()) | Err(smoltcp::socket::tcp::RecvError::Finished) => Ok(0),
@@ -335,9 +316,6 @@ impl TcpSocket {
                 }
             });
         }
-        if is_recv_shutdown && self.recv_shutdown.record_read(total) {
-            established.with_mut(discard_recv_queue);
-        }
         Ok(total)
     }
 
@@ -346,16 +324,16 @@ impl TcpSocket {
             self.notify();
         }
 
-        if let Some(iface) = self.stack_poll_iface_snapshot() {
+        if let Some(iface) = self.stack_poll_snapshot() {
             // After a successful TCP recv() we may have just freed a significant portion of the
             // receive window. On loopback/blocking-large-send paths, sender progress depends on
             // promptly turning that freed window into ACK/window-update processing and sender-side
             // wakeups. A single poll is not always enough to complete the roundtrip, so mirror the
             // send path and drive the stack until quiescent.
-            if let Some(netns) = iface.common().net_namespace() {
-                netns.wakeup_poll_thread();
+            if let Some(netns) = iface.net_namespace() {
+                netns.wakeup_tcp_poll();
             }
-            super::poll_util::poll_iface_until_quiescent(iface.as_ref());
+            super::poll_util::poll_stack_batch(iface.as_ref());
         }
     }
 
@@ -368,11 +346,11 @@ impl TcpSocket {
         let mut total_read = 0;
 
         loop {
-            if let Some(iface) = self.stack_poll_iface_snapshot() {
-                if let Some(netns) = iface.common().net_namespace() {
-                    netns.wakeup_poll_thread();
+            if let Some(iface) = self.stack_poll_snapshot() {
+                if let Some(netns) = iface.net_namespace() {
+                    netns.wakeup_tcp_poll();
                 }
-                super::poll_util::poll_iface_until_quiescent(iface.as_ref());
+                super::poll_util::poll_stack_batch(iface.as_ref());
             }
 
             let iter_result = match self
@@ -448,11 +426,11 @@ impl TcpSocket {
         let mut total_read = offset;
 
         loop {
-            if let Some(iface) = self.stack_poll_iface_snapshot() {
-                if let Some(netns) = iface.common().net_namespace() {
-                    netns.wakeup_poll_thread();
+            if let Some(iface) = self.stack_poll_snapshot() {
+                if let Some(netns) = iface.net_namespace() {
+                    netns.wakeup_tcp_poll();
                 }
-                super::poll_util::poll_iface_until_quiescent(iface.as_ref());
+                super::poll_util::poll_stack_batch(iface.as_ref());
             }
 
             let iter_result = match self
@@ -513,13 +491,6 @@ impl TcpSocket {
         nonblock: bool,
         waitall: bool,
     ) -> Result<usize, SystemError> {
-        if self.is_recv_shutdown() {
-            let limit = self.recv_shutdown.limit();
-            if limit == 0 {
-                return Ok(0);
-            }
-        }
-
         if nonblock {
             return self.try_read_to_user_buffer(user_buffer);
         }
@@ -534,8 +505,8 @@ impl TcpSocket {
                     }
                 }
                 Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
-                    if let Some(iface) = self.stack_poll_iface_snapshot() {
-                        super::poll_util::poll_iface_until_quiescent(iface.as_ref());
+                    if let Some(iface) = self.stack_poll_snapshot() {
+                        super::poll_util::poll_stack_batch(iface.as_ref());
                     }
                     let events = self.check_io_event();
                     if events.intersects(
@@ -710,17 +681,17 @@ impl TcpSocket {
         // - poll BEFORE sending: to drain acks/advance state and make more send capacity available
         // - poll AFTER sending: to actually transmit queued segments and process immediate loopback delivery
         // Additionally, wake the netns poll thread so timers/retransmits can progress even if callers sleep.
-        let maybe_iface = self.stack_poll_iface_snapshot();
+        let maybe_iface = self.stack_poll_snapshot();
         if let Some(iface) = maybe_iface.as_ref() {
-            if let Some(netns) = iface.common().net_namespace() {
-                netns.wakeup_poll_thread();
+            if let Some(netns) = iface.net_namespace() {
+                netns.wakeup_tcp_poll();
             }
             // Loopback / fast-path correctness:
             // Poll once may only enqueue TX (or only process RX) without completing the
             // loopback roundtrip (TX->RX->ACK). If we return EAGAIN too early here,
             // acks processed shortly afterwards can free send buffer and make POLLOUT
             // appear spuriously (gVisor PollWithFullBufferBlocks).
-            super::poll_util::poll_iface_until_quiescent(iface.as_ref());
+            super::poll_util::poll_stack_batch(iface.as_ref());
         }
 
         // Fast path: Established.
@@ -734,10 +705,10 @@ impl TcpSocket {
         }
         if let Some(ret) = result {
             if let Some(iface) = maybe_iface.as_ref() {
-                if let Some(netns) = iface.common().net_namespace() {
-                    netns.wakeup_poll_thread();
+                if let Some(netns) = iface.net_namespace() {
+                    netns.wakeup_tcp_poll();
                 }
-                super::poll_util::poll_iface_until_quiescent(iface.as_ref());
+                super::poll_util::poll_stack_batch(iface.as_ref());
             }
             return ret;
         }
@@ -778,10 +749,10 @@ impl TcpSocket {
             // Drop lock before polling to avoid lock-order inversion with iface.poll()->notify().
             drop(writer);
             if let Some(iface) = maybe_iface.as_ref() {
-                if let Some(netns) = iface.common().net_namespace() {
-                    netns.wakeup_poll_thread();
+                if let Some(netns) = iface.net_namespace() {
+                    netns.wakeup_tcp_poll();
                 }
-                super::poll_util::poll_iface_until_quiescent(iface.as_ref());
+                super::poll_util::poll_stack_batch(iface.as_ref());
             }
             return ret;
         }

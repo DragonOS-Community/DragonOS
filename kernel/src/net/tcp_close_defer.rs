@@ -11,13 +11,11 @@
 
 use alloc::sync::Weak;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::libs::mutex::Mutex;
 use crate::net::socket::inet::InetSocket;
 
 const TCP_ORPHAN_MAX_LIFETIME_SECS: u64 = 60;
-const TCP_CLOSE_REAP_BUDGET: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeferredTcpCloseKind {
@@ -82,10 +80,6 @@ struct ClosingTcpSocket {
 #[derive(Debug)]
 pub struct TcpCloseDefer {
     closing: Mutex<Vec<ClosingTcpSocket>>,
-    pending: AtomicUsize,
-    /// Compact TIME_WAIT entries still need namespace-routed replies and timers.
-    time_wait_pending: AtomicBool,
-    reap_cursor: AtomicUsize,
     stats: Mutex<TcpCloseDeferStats>,
 }
 
@@ -93,9 +87,6 @@ impl TcpCloseDefer {
     pub fn new() -> Self {
         Self {
             closing: Mutex::new(Vec::new()),
-            pending: AtomicUsize::new(0),
-            time_wait_pending: AtomicBool::new(false),
-            reap_cursor: AtomicUsize::new(0),
             stats: Mutex::new(TcpCloseDeferStats::default()),
         }
     }
@@ -114,7 +105,6 @@ impl TcpCloseDefer {
             _reason: request.reason,
             abort_on_post_close_data: request.abort_on_post_close_data,
         });
-        self.pending.fetch_add(1, Ordering::Release);
         drop(guard);
 
         let mut stats = self.stats.lock();
@@ -128,11 +118,6 @@ impl TcpCloseDefer {
             DeferredTcpCloseReason::ZeroLinger => stats.zero_linger_abort += 1,
             _ => {}
         }
-    }
-
-    #[inline]
-    pub fn has_pending(&self) -> bool {
-        self.pending.load(Ordering::Acquire) != 0 || self.time_wait_pending.load(Ordering::Acquire)
     }
 
     #[inline]
@@ -152,19 +137,15 @@ impl TcpCloseDefer {
         &self,
         now: smoltcp::time::Instant,
         sockets: &mut smoltcp::iface::SocketSet<'static>,
-    ) {
-        self.time_wait_pending
-            .store(sockets.has_tcp_time_wait(), Ordering::Release);
+    ) -> Option<smoltcp::time::Instant> {
         let mut closing = self.closing.lock();
         if closing.is_empty() {
-            return;
+            return None;
         }
-        let max_scan = closing.len().min(TCP_CLOSE_REAP_BUDGET);
+        let max_scan = closing.len();
         let mut scanned = 0usize;
-        let mut i = self
-            .reap_cursor
-            .load(Ordering::Relaxed)
-            .min(closing.len() - 1);
+        let mut i = 0;
+        let mut next_deadline = None;
         while scanned < max_scan && !closing.is_empty() {
             if i >= closing.len() {
                 i = 0;
@@ -181,6 +162,18 @@ impl TcpCloseDefer {
             let age = now - closing[i].deferred_at;
             let orphan_timed_out =
                 age >= smoltcp::time::Duration::from_secs(TCP_ORPHAN_MAX_LIFETIME_SECS);
+            let orphan_deadline = closing[i].deferred_at
+                + smoltcp::time::Duration::from_secs(TCP_ORPHAN_MAX_LIFETIME_SECS);
+            if !orphan_timed_out
+                && !matches!(
+                    state,
+                    smoltcp::socket::tcp::State::Closed | smoltcp::socket::tcp::State::TimeWait
+                )
+            {
+                next_deadline = Some(next_deadline.map_or(orphan_deadline, |deadline| {
+                    core::cmp::min(deadline, orphan_deadline)
+                }));
+            }
 
             let should_abort_post_close_data = closing[i].abort_on_post_close_data
                 && !matches!(state, smoltcp::socket::tcp::State::Closed)
@@ -232,6 +225,9 @@ impl TcpCloseDefer {
                         .is_some();
                 let is_reset_close = closing[i]._kind == DeferredTcpCloseKind::Reset;
                 if rst_pending && !is_reset_close && !orphan_timed_out {
+                    next_deadline = Some(next_deadline.map_or(orphan_deadline, |deadline| {
+                        core::cmp::min(deadline, orphan_deadline)
+                    }));
                     i += 1;
                     continue;
                 }
@@ -251,12 +247,10 @@ impl TcpCloseDefer {
                         i += 1;
                         continue;
                     }
-                    self.time_wait_pending.store(true, Ordering::Release);
                 } else {
                     sockets.remove(handle);
                 }
                 closing.swap_remove(i);
-                self.pending.fetch_sub(1, Ordering::Release);
                 let mut stats = self.stats.lock();
                 stats.closed_reaped += 1;
                 if rst_pending {
@@ -267,10 +261,6 @@ impl TcpCloseDefer {
             i += 1;
         }
 
-        if closing.is_empty() {
-            self.reap_cursor.store(0, Ordering::Relaxed);
-        } else {
-            self.reap_cursor.store(i % closing.len(), Ordering::Relaxed);
-        }
+        next_deadline
     }
 }

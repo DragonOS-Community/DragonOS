@@ -16,7 +16,6 @@ use crate::process::ProcessManager;
 
 use super::constants;
 use super::inner;
-use super::shutdown::ShutdownRecvTracker;
 
 type EP = crate::filesystem::epoll::EPollEventType;
 
@@ -161,7 +160,6 @@ pub struct TcpSocket {
     pub(crate) recv_lock: Mutex<()>,
     pub(crate) cork_flush_in_progress: AtomicBool,
     pub(crate) cork_timer_active: AtomicBool,
-    pub(crate) recv_shutdown: ShutdownRecvTracker,
     pub(crate) ip_version: smoltcp::wire::IpVersion,
 }
 
@@ -202,7 +200,6 @@ impl TcpSocket {
             recv_lock: Mutex::new(()),
             cork_flush_in_progress: AtomicBool::new(false),
             cork_timer_active: AtomicBool::new(false),
-            recv_shutdown: ShutdownRecvTracker::new(),
             ip_version,
         }
     }
@@ -254,13 +251,13 @@ impl TcpSocket {
     /// Returns an owned interface snapshot for paths that need to progress smoltcp.
     ///
     /// The `inner` guard is always released before this function returns. Callers may
-    /// therefore poll the interface without allowing `Iface::poll() -> notify()` to
+    /// therefore poll the interface without allowing `TcpStack::poll() -> notify()` to
     /// recursively acquire `inner` while an outer read guard is still alive.
-    pub(super) fn stack_poll_iface_snapshot(&self) -> Option<Arc<dyn crate::net::Iface>> {
+    pub(super) fn stack_poll_snapshot(&self) -> Option<Arc<crate::net::tcp_stack::TcpStack>> {
         let inner = self.inner.read();
         match inner.as_ref() {
             None => None,
-            Some(inner) => inner.iface().cloned(),
+            Some(inner) => inner.stack().cloned(),
         }
     }
 
@@ -458,7 +455,7 @@ impl TcpSocket {
                     socket.set_send_buffer_size(tx_size);
                     socket.set_recv_buffer_size(rx_size);
                 });
-                established.update_io_events(&self.pollee);
+                established.update_io_events(&self.pollee, self.shutdown_bits());
             }
             Some(inner::Inner::Connecting(connecting)) => {
                 connecting.with_mut(|socket| {
@@ -488,7 +485,7 @@ impl TcpSocket {
     }
 
     #[inline]
-    fn shutdown_bits(&self) -> crate::net::socket::common::ShutdownBit {
+    pub(super) fn shutdown_bits(&self) -> crate::net::socket::common::ShutdownBit {
         crate::net::socket::common::ShutdownBit::from_bits_truncate(
             self.shutdown.load(core::sync::atomic::Ordering::Relaxed),
         )

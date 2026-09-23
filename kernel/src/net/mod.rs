@@ -17,6 +17,7 @@ pub mod socket;
 pub mod syscall;
 pub mod tcp_close_defer;
 pub mod tcp_listener;
+pub mod tcp_stack;
 
 /// Linux reserves interface index 1 for the loopback device in every netns.
 pub const LOOPBACK_IFINDEX: usize = 1;

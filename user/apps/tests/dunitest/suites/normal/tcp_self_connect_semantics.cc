@@ -6,11 +6,14 @@
 #include <netinet/in.h>
 #include <poll.h>
 #include <pthread.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
+#include <sys/uio.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <string>
@@ -235,6 +238,9 @@ TEST_P(TcpSelfConnectSemantics, ReceiveShutdownDoesNotEraseCurrentReadProgress) 
     ASSERT_EQ(send(socket_fd.Get(), kPayload.data(), kPayload.size(), 0),
               static_cast<ssize_t>(kPayload.size()))
         << "send before shutdown failed: " << ErrnoString(errno);
+    // send() publishes output; asynchronous local delivery may not yet have
+    // populated the receive queue. This test exercises already queued data.
+    ASSERT_NO_FATAL_FAILURE(WaitForEvent(socket_fd.Get(), POLLIN));
     ASSERT_EQ(shutdown(socket_fd.Get(), SHUT_RD), 0)
         << "shutdown(SHUT_RD) failed: " << ErrnoString(errno);
 
@@ -250,6 +256,7 @@ TEST_P(TcpSelfConnectSemantics, ReceiveShutdownDoesNotEraseCurrentReadProgress) 
     ASSERT_EQ(send(recv_socket_fd.Get(), kPayload.data(), kPayload.size(), 0),
               static_cast<ssize_t>(kPayload.size()))
         << "send before recv shutdown failed: " << ErrnoString(errno);
+    ASSERT_NO_FATAL_FAILURE(WaitForEvent(recv_socket_fd.Get(), POLLIN));
     ASSERT_EQ(shutdown(recv_socket_fd.Get(), SHUT_RD), 0)
         << "shutdown(SHUT_RD) before recv failed: " << ErrnoString(errno);
     ASSERT_EQ(recv(recv_socket_fd.Get(), buffer.data(), buffer.size(), 0),
@@ -258,6 +265,78 @@ TEST_P(TcpSelfConnectSemantics, ReceiveShutdownDoesNotEraseCurrentReadProgress) 
         << ErrnoString(errno);
     EXPECT_TRUE(std::equal(kPayload.begin(), kPayload.end(), buffer.begin()));
     EXPECT_EQ(recv(recv_socket_fd.Get(), buffer.data(), buffer.size(), 0), 0);
+}
+
+// SHUT_RD is not a frozen receive quota: Linux still reads subsequently queued
+// data before reporting EOF. Use a separate peer so delivery is independent of
+// the shutdown endpoint and verify actual queue length, not EOF's POLLIN bit.
+TEST_P(TcpSelfConnectSemantics, ReceiveShutdownReadsLaterPeerData) {
+    const int family = GetParam();
+    FdGuard listener(socket(family, SOCK_STREAM, 0));
+    ASSERT_GE(listener.Get(), 0);
+    sockaddr_storage storage{};
+    socklen_t size;
+    if (family == AF_INET) {
+        auto* address = reinterpret_cast<sockaddr_in*>(&storage);
+        address->sin_family = family;
+        address->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        size = sizeof(*address);
+    } else {
+        auto* address = reinterpret_cast<sockaddr_in6*>(&storage);
+        address->sin6_family = family;
+        address->sin6_addr = in6addr_loopback;
+        size = sizeof(*address);
+    }
+    ASSERT_EQ(bind(listener.Get(), reinterpret_cast<sockaddr*>(&storage), size), 0);
+    ASSERT_EQ(listen(listener.Get(), 1), 0);
+    ASSERT_EQ(getsockname(listener.Get(), reinterpret_cast<sockaddr*>(&storage), &size), 0);
+    FdGuard client(socket(family, SOCK_STREAM | SOCK_NONBLOCK, 0));
+    ASSERT_GE(client.Get(), 0);
+    if (connect(client.Get(), reinterpret_cast<sockaddr*>(&storage), size) != 0) {
+        ASSERT_EQ(errno, EINPROGRESS);
+    }
+    ASSERT_NO_FATAL_FAILURE(WaitForEvent(listener.Get(), POLLIN));
+    FdGuard peer(accept(listener.Get(), nullptr, nullptr));
+    ASSERT_GE(peer.Get(), 0);
+    ASSERT_NO_FATAL_FAILURE(WaitForEvent(client.Get(), POLLOUT));
+    int error = -1;
+    size = sizeof(error);
+    ASSERT_EQ(getsockopt(client.Get(), SOL_SOCKET, SO_ERROR, &error, &size), 0);
+    ASSERT_EQ(error, 0);
+    ASSERT_EQ(shutdown(client.Get(), SHUT_RD), 0);
+    std::array<char, 16> buffer{};
+    EXPECT_EQ(read(client.Get(), buffer.data(), buffer.size()), 0);
+    EXPECT_EQ(recv(client.Get(), buffer.data(), buffer.size(), MSG_DONTWAIT), 0);
+
+    auto await_queued = [&](int expected) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+        int queued = 0;
+        do {
+            ASSERT_EQ(ioctl(client.Get(), FIONREAD, &queued), 0);
+            if (queued >= expected) return;
+            usleep(1000);
+        } while (std::chrono::steady_clock::now() < deadline);
+        FAIL() << "queued=" << queued << ", expected=" << expected;
+    };
+    constexpr char payload[] = "abcdef";
+    ASSERT_EQ(send(peer.Get(), payload, 6, MSG_NOSIGNAL), 6);
+    ASSERT_NO_FATAL_FAILURE(await_queued(6));
+    ASSERT_EQ(recv(client.Get(), buffer.data(), 2, MSG_PEEK | MSG_DONTWAIT), 2);
+    EXPECT_EQ(std::string(buffer.data(), 2), "ab");
+    buffer.fill('!');
+    ASSERT_EQ(recv(client.Get(), buffer.data(), 2, MSG_TRUNC | MSG_DONTWAIT), 2);
+    EXPECT_EQ(buffer[0], '!');
+    EXPECT_EQ(buffer[1], '!');
+    iovec vectors[]{{buffer.data(), 2}, {buffer.data() + 2, 8}};
+    ASSERT_EQ(readv(client.Get(), vectors, 2), 4);
+    EXPECT_EQ(std::string(buffer.data(), 4), "cdef");
+    EXPECT_EQ(read(client.Get(), buffer.data(), buffer.size()), 0);
+
+    ASSERT_EQ(send(peer.Get(), payload, 6, MSG_NOSIGNAL), 6);
+    ASSERT_NO_FATAL_FAILURE(await_queued(6));
+    ASSERT_EQ(recv(client.Get(), buffer.data(), buffer.size(), MSG_DONTWAIT), 6);
+    EXPECT_EQ(std::string(buffer.data(), 6), "abcdef");
+    EXPECT_EQ(recv(client.Get(), buffer.data(), buffer.size(), MSG_DONTWAIT), 0);
 }
 
 // self-connect 建立完成后，poll() 不得报告任何挂断位。

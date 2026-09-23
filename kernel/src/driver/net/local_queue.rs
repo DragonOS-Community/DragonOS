@@ -729,7 +729,6 @@ impl LocalInputQueue {
         &self,
         routed: &AtomicBool,
         bound_socket_count: &AtomicUsize,
-        deferred_close_pending: bool,
         routed_fragments_pending: bool,
     ) {
         // Serialize the empty observation with both enqueue paths. If an
@@ -743,7 +742,6 @@ impl LocalInputQueue {
             && output.deferred_routes.is_empty()
             && output.reserved_frames == 0
             && bound_socket_count.load(Ordering::Acquire) == 0
-            && !deferred_close_pending
             && !routed_fragments_pending
         {
             routed.store(false, Ordering::Release);

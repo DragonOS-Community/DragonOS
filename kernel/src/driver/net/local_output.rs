@@ -128,7 +128,7 @@ pub(super) struct OutputBackendPolicy<'a> {
 }
 
 impl OutputBackendPolicy<'_> {
-    fn outbound_ip_mtu(
+    pub(super) fn outbound_ip_mtu(
         self,
         destination: smoltcp::wire::IpAddress,
         meta: PacketMeta,
@@ -148,7 +148,10 @@ impl OutputBackendPolicy<'_> {
         destination: smoltcp::wire::IpAddress,
         meta: PacketMeta,
     ) -> OutputBackendDecision {
-        if version == smoltcp::wire::IpVersion::Ipv6 && destination.is_multicast() {
+        if self.owner_ifindex != 0
+            && version == smoltcp::wire::IpVersion::Ipv6
+            && destination.is_multicast()
+        {
             return OutputBackendDecision::NativeOwner;
         }
         let constrained_oif = (meta.id != 0).then_some(meta.id);

@@ -18,9 +18,6 @@ pub struct IfaceCommon {
     /// Lock-free lifecycle summary for DOWN-owner protocol progress. The
     /// vector remains authoritative; this count only decides poll eligibility.
     pub(super) bound_socket_count: AtomicUsize,
-    /// Sockets that can already emit through smoltcp but have not yet been
-    /// published in `bounds`.
-    pending_routed_socket_count: AtomicUsize,
     /// The stack has accepted namespace-local ingress and must keep applying
     /// authoritative output routing until its socket/deferred work quiesces.
     pub(super) namespace_routed_stack: AtomicBool,
@@ -51,10 +48,6 @@ pub struct IfaceCommon {
     /// Routes supplied by constructors before the interface joins a netns.
     /// Drained transactionally by netns registration; never authoritative.
     pub(super) bootstrap_routes: Mutex<Vec<BootstrapRoute>>,
-    /// TCP close(2) 语义辅助：延迟回收 smoltcp TCP socket（Linux-like）。
-    pub(super) tcp_close_defer: crate::net::tcp_close_defer::TcpCloseDefer,
-    /// Listener facts shared with smoltcp's unmatched-SYN fallback.
-    tcp_listeners: Arc<crate::net::tcp_listener::TcpListenerRegistry>,
     pub(super) ipv4_multicast_refcnt: Mutex<Vec<(smoltcp::wire::Ipv4Address, usize)>>,
     /// Serializes configured receive-mode flags with AF_PACKET references.
     pub(super) receive_mode: Mutex<ReceiveModeState>,
@@ -102,9 +95,7 @@ impl IfaceCommon {
                 label: None,
             })
             .collect();
-        let tcp_listeners = Arc::new(crate::net::tcp_listener::TcpListenerRegistry::new());
-        let mut sockets = smoltcp::iface::SocketSet::new(Vec::new());
-        sockets.set_tcp_listen_registry(Some(tcp_listeners.clone()));
+        let sockets = smoltcp::iface::SocketSet::new(Vec::new());
         IfaceCommon {
             iface_id,
             name: RwLock::new(name),
@@ -112,7 +103,6 @@ impl IfaceCommon {
             sockets: Mutex::new(sockets),
             bounds: RwLock::new(Arc::new(Vec::new())),
             bound_socket_count: AtomicUsize::new(0),
-            pending_routed_socket_count: AtomicUsize::new(0),
             namespace_routed_stack: AtomicBool::new(false),
             poll_deadlines: PollDeadlines::new(),
             local_output_tx_backoff_us: AtomicU64::new(Self::LOCAL_OUTPUT_TX_BACKOFF_MIN_US),
@@ -128,8 +118,6 @@ impl IfaceCommon {
             local_input_queue: LocalInputQueue::new(),
             address_metadata: Mutex::new(address_metadata),
             bootstrap_routes: Mutex::new(Vec::new()),
-            tcp_close_defer: crate::net::tcp_close_defer::TcpCloseDefer::new(),
-            tcp_listeners,
             ipv4_multicast_refcnt: Mutex::new(Vec::new()),
             receive_mode: Mutex::new(ReceiveModeState {
                 configured_flags: flags.bits(),
@@ -137,22 +125,6 @@ impl IfaceCommon {
                 packet_allmulti: 0,
             }),
         }
-    }
-
-    /// Register an active TCP listener port on this iface.
-    pub fn register_tcp_listener(
-        &self,
-        id: u64,
-        domain: crate::net::socket::inet::common::port::TcpBindDomain,
-        port: u16,
-        device: u32,
-    ) {
-        self.tcp_listeners.register(id, domain, port, device);
-    }
-
-    /// Unregister an active TCP listener port on this iface.
-    pub fn unregister_tcp_listener(&self, id: u64) {
-        self.tcp_listeners.unregister(id);
     }
 
     pub fn ipv4_multicast_join_ref(
@@ -393,19 +365,7 @@ impl IfaceCommon {
     pub(super) fn needs_namespace_routing(&self) -> bool {
         self.has_local_work()
             || self.namespace_routed_stack.load(Ordering::Acquire)
-            || self.has_published_or_pending_sockets()
-            || self.tcp_close_defer.has_pending()
-    }
-
-    /// Pairs with the publication handoff: a producer publishes `bounds`
-    /// before releasing its pending reservation. Reading pending first means
-    /// that observing zero synchronizes the following bound-count read with
-    /// the already completed publication; observing the old nonzero value is
-    /// itself sufficient to keep routed polling active.
-    fn has_published_or_pending_sockets(&self) -> bool {
-        let pending = self.pending_routed_socket_count.load(Ordering::Acquire);
-        let published = self.bound_socket_count.load(Ordering::Acquire);
-        pending != 0 || published != 0
+            || self.bound_socket_count.load(Ordering::Acquire) != 0
     }
 
     /// Revalidates the lock-free routing-mode snapshot after both protocol
@@ -431,18 +391,6 @@ impl IfaceCommon {
         }
     }
 
-    pub(crate) fn begin_routed_socket_publication(&self) {
-        self.pending_routed_socket_count
-            .fetch_add(1, Ordering::Release);
-    }
-
-    pub(crate) fn finish_routed_socket_publication(&self) {
-        let previous = self
-            .pending_routed_socket_count
-            .fetch_sub(1, Ordering::Release);
-        debug_assert!(previous != 0);
-    }
-
     pub(super) fn clear_namespace_routing_if_idle(&self) {
         // Reacquire the protocol lock after output draining so the fragment
         // observation and latch clear cannot race another poller's interval
@@ -452,7 +400,6 @@ impl IfaceCommon {
         self.local_input_queue.clear_routed_if_idle(
             &self.namespace_routed_stack,
             &self.bound_socket_count,
-            self.tcp_close_defer.has_pending(),
             routed_fragments_pending,
         );
     }
@@ -477,12 +424,6 @@ impl IfaceCommon {
         } else {
             IfacePollScope::None
         }
-    }
-
-    /// Defer removing a TCP socket from the SocketSet until it reaches Closed.
-    pub fn defer_tcp_close(&self, request: crate::net::tcp_close_defer::DeferredTcpCloseRequest) {
-        let now = crate::time::Instant::now().into();
-        self.tcp_close_defer.defer_tcp_close(now, request);
     }
 
     pub fn poll<D>(&self, device: &mut D) -> bool
@@ -598,11 +539,6 @@ impl IfaceCommon {
                 } else {
                     None
                 };
-
-                // Reclaim/advance orphaned TCP sockets after smoltcp has processed ingress.
-                // If this aborts an orphan, compute poll_at afterwards so the pending RST is
-                // scheduled immediately instead of waiting for an unrelated future poll.
-                self.tcp_close_defer.reap_closed(timestamp, &mut sockets);
 
                 self.release_resolved_routed_outputs(
                     &mut interface,
@@ -863,8 +799,6 @@ impl IfaceCommon {
             } else {
                 let _ = interface.poll_egress(timestamp, device, &mut sockets);
             }
-
-            self.tcp_close_defer.reap_closed(timestamp, &mut sockets);
 
             self.release_resolved_routed_outputs(
                 &mut interface,
@@ -1226,6 +1160,7 @@ impl IfaceCommon {
         let mut sockets = self.sockets.lock();
         *namespace = Arc::downgrade(&ns);
         sockets.set_udp_ingress_handler(Some(ingress));
+        sockets.set_tcp_ingress_handler(Some(ns.tcp_stack().clone()));
         Ok(())
     }
 
@@ -1234,6 +1169,7 @@ impl IfaceCommon {
         let mut sockets = self.sockets.lock();
         *namespace = Weak::new();
         sockets.set_udp_ingress_handler(None);
+        sockets.set_tcp_ingress_handler(None);
     }
 
     /// Runs a construction-time mutation while preventing namespace

@@ -380,21 +380,26 @@ impl FileOps for IdMapFileOps {
         // the map text is frozen for the lifetime of the fd.
         proc_read_snapshot(offset, len, buf, &mut data, || {
             let user_ns = self.get_user_ns()?;
-            let inner = user_ns.inner.lock();
-            let ctx = IdMapWriteContext {
-                map_type: self.map_type,
-                target_ns: user_ns.clone(),
-                opener_cred: opener_cred.clone(),
-                target_owner: inner.owner,
-                target_flags: inner.flags,
-                target_parent_could_setfcap: inner.parent_could_setfcap,
+            let (map, ctx) = {
+                let inner = user_ns.inner.lock();
+                let ctx = IdMapWriteContext {
+                    map_type: self.map_type,
+                    target_ns: user_ns.clone(),
+                    opener_cred: opener_cred.clone(),
+                    target_owner: inner.owner,
+                    target_flags: inner.flags,
+                    target_parent_could_setfcap: inner.parent_could_setfcap,
+                };
+                let map = match self.map_type {
+                    MapType::Uid => inner.uid_map.clone(),
+                    MapType::Gid => inner.gid_map.clone(),
+                };
+                (map, ctx)
             };
 
-            Ok(match self.map_type {
-                MapType::Uid => self.generate_content(&inner.uid_map, &ctx),
-                MapType::Gid => self.generate_content(&inner.gid_map, &ctx),
-            }
-            .into_bytes())
+            // Rendering may read the same namespace again (the init namespace
+            // has no parent), so release its non-reentrant lock first.
+            Ok(self.generate_content(&map, &ctx).into_bytes())
         })
     }
 

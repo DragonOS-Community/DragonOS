@@ -23,7 +23,7 @@ jobs:
     # Allow the 55-minute guest test budget plus build, cleanup, and diagnostics.
     timeout-minutes: 75
     container:
-      image: dragonos/dragonos-dev:v1.23
+      image: dragonos/dragonos-dev:v1.24
       options: --privileged -v /dev:/dev
     steps:
       - name: Checkout DragonOS code

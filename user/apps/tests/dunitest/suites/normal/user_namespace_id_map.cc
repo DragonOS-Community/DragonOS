@@ -682,6 +682,20 @@ void expect_child_success(const char* case_name, int (*fn)(std::string*)) {
     EXPECT_EQ(0, WEXITSTATUS(status)) << case_name << ": " << detail;
 }
 
+TEST(UserNamespaceIdMap, InitialNamespaceMapsAreReadable) {
+    std::string self_user_ns;
+    std::string init_user_ns;
+    ASSERT_EQ(0, read_link_text("/proc/self/ns/user", &self_user_ns));
+    ASSERT_EQ(0, read_link_text("/proc/1/ns/user", &init_user_ns));
+    ASSERT_EQ(self_user_ns, init_user_ns);
+
+    for (const char* path : {"/proc/self/uid_map", "/proc/self/gid_map"}) {
+        std::string content;
+        ASSERT_EQ(0, read_text_file(path, &content)) << path;
+        EXPECT_FALSE(content.empty()) << path;
+    }
+}
+
 TEST(UserNamespaceIdMap, RootlessSingleAndNestedSelfMaps) {
     expect_child_success("rootless_nested_id_map_flow", run_rootless_nested_id_map_flow);
 }

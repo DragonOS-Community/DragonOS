@@ -701,11 +701,8 @@ TEST(ProcfsTaskSemantics, SeekEndIsEinval) {
 // test runs; the rest are compared structurally, because their numbers change
 // between two reads on Linux as well.
 //
-// uid_map/gid_map are deliberately absent: reading the *init* user namespace's
-// own map deadlocks DragonOS before this change as well (read_at holds
-// UserNamespace::inner and generate_content() re-locks the same namespace,
-// because an init namespace has no parent to display). That is a separate
-// pre-existing bug, so it must not be pinned here.
+// uid_map/gid_map are covered by user_namespace_id_map.cc rather than repeated
+// in this generic procfs snapshot matrix.
 TEST(ProcfsTaskSemantics, SnapshotSurvivesChunkedRead) {
     const char* const kStrict[] = {
         "/proc/version",

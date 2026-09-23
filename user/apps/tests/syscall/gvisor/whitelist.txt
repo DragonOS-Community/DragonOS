@@ -153,3 +153,4 @@ uidgid_test
 partitial_bad_buffer_test
 sysinfo_test
 ptrace_test
+alarm_test

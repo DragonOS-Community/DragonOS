@@ -284,6 +284,7 @@ pub struct UnixDatagramSocket {
     self_weak: Weak<UnixDatagramSocket>,
 
     passcred: AtomicBool,
+    reuse_options: super::UnixReuseOptions,
 
     is_read_shutdown: AtomicBool,
     is_write_shutdown: AtomicBool,
@@ -320,6 +321,7 @@ impl UnixDatagramSocket {
             self_weak: weak.clone(),
 
             passcred: AtomicBool::new(false),
+            reuse_options: super::UnixReuseOptions::default(),
 
             is_read_shutdown: AtomicBool::new(false),
             is_write_shutdown: AtomicBool::new(false),
@@ -710,6 +712,9 @@ impl Socket for UnixDatagramSocket {
             .map_err(|_| SystemError::ENOPROTOOPT)?;
 
         match opt {
+            crate::net::socket::PSO::REUSEADDR | crate::net::socket::PSO::REUSEPORT => {
+                self.reuse_options.set(opt, optval)
+            }
             crate::net::socket::PSO::SNDBUF | crate::net::socket::PSO::SNDBUFFORCE => {
                 let requested = Self::parse_u32_opt(optval)? as usize;
                 let new_size = Self::effective_sockbuf(requested);
@@ -1246,6 +1251,9 @@ impl Socket for UnixDatagramSocket {
         let opt =
             crate::net::socket::PSO::try_from(name as u32).map_err(|_| SystemError::ENOPROTOOPT)?;
         match opt {
+            crate::net::socket::PSO::REUSEADDR | crate::net::socket::PSO::REUSEPORT => {
+                self.reuse_options.get(opt, value)
+            }
             crate::net::socket::PSO::TYPE => {
                 let v = PSOCK::Datagram as i32;
                 Ok(write_i32_getsockopt(value, v))

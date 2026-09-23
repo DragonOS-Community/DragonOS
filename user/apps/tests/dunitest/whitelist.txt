@@ -71,6 +71,7 @@ normal/socket_readv_semantics
 normal/socket_ioctl_netdev_query
 normal/socket_ioctl_netdev_mutation
 normal/unix_socket_shutdown
+normal/unix_reuse_options
 normal/unix_scm_rights
 fuse/fuse_core
 fuse/fuse_extended

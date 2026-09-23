@@ -1,7 +1,7 @@
 use crate::net::socket::inet::common::SocketDeviceBinding;
 use alloc::sync::{Arc, Weak};
 use core::num::NonZeroU32;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::filesystem::epoll::EPollEventType;
 use crate::libs::rwsem::RwSem;
@@ -23,6 +23,15 @@ use super::registration::{
 // pub const DEFAULT_METADATA_BUF_SIZE: usize = 1024;
 pub const DEFAULT_RX_BUF_SIZE: usize = 128 * 1024;
 pub const DEFAULT_TX_BUF_SIZE: usize = 128 * 1024;
+
+/// Translate an accepted reset using the transport state before the RST.
+pub(super) fn reset_error(state: tcp::State) -> SystemError {
+    match state {
+        tcp::State::SynSent => SystemError::ECONNREFUSED,
+        tcp::State::CloseWait => SystemError::EPIPE,
+        _ => SystemError::ECONNRESET,
+    }
+}
 
 /// 显式的“已关闭”状态：不再绑定/访问 smoltcp SocketSet 中的任何 handle。
 ///
@@ -544,15 +553,12 @@ impl Init {
     }
 }
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 enum ConnectResult {
     Connected,
     #[default]
     Connecting,
-    Refused,
-    RefusedConsumed,
-    ShutdownReset,
-    ShutdownResetConsumed,
+    Failed(Option<SystemError>),
 }
 
 #[derive(Debug)]
@@ -562,11 +568,6 @@ pub struct Connecting {
     ver: smoltcp::wire::IpVersion,
     registration: ConnectingRegistration,
     result: RwSem<ConnectResult>,
-    /// Track if the connection was ever in ESTABLISHED state.
-    /// This is needed because for loopback, SYN+ACK and RST can be processed in the same poll,
-    /// so we might miss the ESTABLISHED state. If we were ever established, receiving RST
-    /// should not be treated as "connection refused" but as "connection reset".
-    was_established: AtomicBool,
     local: smoltcp::wire::IpEndpoint,
     remote: smoltcp::wire::IpEndpoint,
 }
@@ -586,7 +587,6 @@ impl Connecting {
             ver,
             registration,
             result: RwSem::new(ConnectResult::Connecting),
-            was_established: AtomicBool::new(false),
             local,
             remote,
         }
@@ -612,7 +612,11 @@ impl Connecting {
     }
 
     pub fn into_result(mut self) -> (Inner, Result<(), SystemError>) {
-        let result = *self.result.read();
+        let result = self.with_mut(|socket| {
+            let mut result = self.result.write();
+            Self::refresh_result(socket, &mut result);
+            result.clone()
+        });
         match result {
             ConnectResult::Connecting => (
                 Inner::Connecting(self),
@@ -625,20 +629,14 @@ impl Connecting {
                         self.inner,
                         Some(self.reservation),
                         registration,
+                        self.local,
+                        self.remote,
                     )),
                     Ok(()),
                 )
             }
-            ConnectResult::Refused
-            | ConnectResult::RefusedConsumed
-            | ConnectResult::ShutdownReset
-            | ConnectResult::ShutdownResetConsumed => {
-                let err = match result {
-                    ConnectResult::ShutdownReset | ConnectResult::ShutdownResetConsumed => {
-                        SystemError::ECONNRESET
-                    }
-                    _ => SystemError::ECONNREFUSED,
-                };
+            ConnectResult::Failed(error) => {
+                let err = error.unwrap_or(SystemError::ECONNABORTED);
                 (
                     Inner::Init(Init::after_failed_connect(
                         self.inner,
@@ -680,6 +678,8 @@ impl Connecting {
             self.inner,
             Some(self.reservation),
             registration,
+            self.local,
+            self.remote,
         )
     }
 
@@ -691,168 +691,64 @@ impl Connecting {
         Established::new(self.inner, Some(self.reservation))
     }
 
-    /// Returns `true` when `conn_result` becomes ready, which indicates that the caller should
-    /// invoke the `into_result()` method as soon as possible.
-    ///
-    /// Since `into_result()` needs to be called only once, this method will return `true`
-    /// _exactly_ once. The caller is responsible for not missing this event.
+    /// Resolve the handshake before an error consumer can remove the reset.
+    /// Both the transport and result are locked by the caller, in that order.
+    fn refresh_result(socket: &mut tcp::Socket, result: &mut ConnectResult) {
+        if !matches!(result, ConnectResult::Connecting) {
+            return;
+        }
+        let state = socket.state();
+        let reset_state = socket.reset_state();
+        let completed = matches!(
+            reset_state.unwrap_or(state),
+            tcp::State::Established
+                | tcp::State::CloseWait
+                | tcp::State::FinWait1
+                | tcp::State::FinWait2
+                | tcp::State::Closing
+                | tcp::State::LastAck
+                | tcp::State::TimeWait
+        );
+        if completed {
+            *result = ConnectResult::Connected;
+        } else if let Some(reset_state) = socket.take_reset() {
+            // Transfer a failed handshake's error into its result. It must not
+            // remain independently consumable from the transport socket.
+            *result = ConnectResult::Failed(Some(reset_error(reset_state)));
+        } else if !socket.is_open() {
+            // Preserve the pre-existing non-RST connection failure behavior.
+            *result = ConnectResult::Failed(Some(SystemError::ECONNREFUSED));
+        }
+    }
+
     #[must_use]
-    pub(super) fn update_io_events(&self, pollee: &core::sync::atomic::AtomicUsize) -> bool {
-        self.inner
-            .with_mut(|socket: &mut smoltcp::socket::tcp::Socket| {
-                let mut result = self.result.write();
-                let state = socket.state();
-
-                // Track if we ever reach ESTABLISHED state
-                if matches!(state, tcp::State::Established | tcp::State::CloseWait) {
-                    self.was_established
-                        .store(true, core::sync::atomic::Ordering::Relaxed);
+    pub(super) fn update_io_events(&self, pollee: &AtomicUsize) -> bool {
+        self.inner.with_mut(|socket: &mut tcp::Socket| {
+            let mut result = self.result.write();
+            Self::refresh_result(socket, &mut result);
+            let mut events = EPollEventType::empty();
+            match &*result {
+                ConnectResult::Connected => {
+                    // The owner promotes this to Established before returning
+                    // readiness; Established then publishes the transport state.
+                    events = EPollEventType::EPOLLOUT | EPollEventType::EPOLLWRNORM;
                 }
-
-                let was_established = self
-                    .was_established
-                    .load(core::sync::atomic::Ordering::Relaxed);
-
-                // Heuristic: if socket has valid remote endpoint AND local endpoint in CLOSED state,
-                // it likely completed the handshake before receiving RST. This helps detect the case
-                // where SYN+ACK and RST are processed in the same poll() call for loopback.
-                let endpoints_valid =
-                    socket.local_endpoint().is_some() && socket.remote_endpoint().is_some();
-                let likely_was_established =
-                    was_established || (matches!(state, tcp::State::Closed) && endpoints_valid);
-
-                // Only update result if not already final
-                if !matches!(
-                    *result,
-                    ConnectResult::Refused
-                        | ConnectResult::Connected
-                        | ConnectResult::RefusedConsumed
-                        | ConnectResult::ShutdownReset
-                        | ConnectResult::ShutdownResetConsumed
-                ) {
-                    if matches!(state, tcp::State::Established | tcp::State::CloseWait) {
-                        // log::debug!(
-                        //     "tcp connected: state={:?} local={:?} remote={:?}",
-                        //     state,
-                        //     socket.local_endpoint(),
-                        //     socket.remote_endpoint()
-                        // );
-                        *result = ConnectResult::Connected;
-                    } else if socket.is_open() {
-                        *result = ConnectResult::Connecting;
-                    } else {
-                        // Socket is closed. Determine if it was ever established.
-                        if likely_was_established {
-                            // Connection was established, then closed (e.g., received RST after handshake)
-                            log::debug!(
-                                "tcp connection reset: state={:?} local={:?} remote={:?}",
-                                state,
-                                socket.local_endpoint(),
-                                socket.remote_endpoint()
-                            );
-                            *result = ConnectResult::Connected;
-                        } else {
-                            // Connection was never established (refused)
-                            // log::debug!(
-                            //     "tcp connect refused: state={:?} local={:?} remote={:?}",
-                            //     state,
-                            //     socket.local_endpoint(),
-                            //     socket.remote_endpoint()
-                            // );
-                            *result = ConnectResult::Refused;
-                        }
+                ConnectResult::Failed(error) => {
+                    events = EPollEventType::EPOLLIN
+                        | EPollEventType::EPOLLRDNORM
+                        | EPollEventType::EPOLLOUT
+                        | EPollEventType::EPOLLWRNORM
+                        | EPollEventType::EPOLLHUP
+                        | EPollEventType::EPOLLRDHUP;
+                    if error.is_some() {
+                        events |= EPollEventType::EPOLLERR;
                     }
                 }
-
-                // Update pollee based on current result
-                // CRITICAL: For Connecting state, we only set POLLOUT | POLLWRNORM when connect
-                // completes (success or failure). We do NOT set POLLHUP/POLLRDHUP here!
-                // Those events will be set by Established::update_io_events() after the state
-                // transition, which correctly reflects the actual socket state.
-
-                match *result {
-                    ConnectResult::Connected => {
-                        // Connection attempt completed successfully
-                        // Set only POLLOUT | POLLWRNORM to indicate connect() completed.
-                        // Clear all other flags - Established::update_io_events() will set
-                        // the correct flags after state transition.
-                        pollee.fetch_or(
-                            (EPollEventType::EPOLLOUT | EPollEventType::EPOLLWRNORM).bits()
-                                as usize,
-                            Ordering::Relaxed,
-                        );
-                        // Clear error/hangup bits - they should not be set while in Connecting state
-                        pollee.fetch_and(
-                            !(EPollEventType::EPOLLIN
-                                | EPollEventType::EPOLLERR
-                                | EPollEventType::EPOLLHUP
-                                | EPollEventType::EPOLLRDHUP
-                                | EPollEventType::EPOLLRDNORM)
-                                .bits() as usize,
-                            Ordering::Relaxed,
-                        );
-                    }
-                    ConnectResult::Refused
-                    | ConnectResult::RefusedConsumed
-                    | ConnectResult::ShutdownReset
-                    | ConnectResult::ShutdownResetConsumed => {
-                        // Connection attempt refused (or reset during handshake).
-                        // This is equivalent to a closed socket with error.
-                        // Should be readable, writable, and have HUP/ERR set.
-
-                        let mut events_to_set = EPollEventType::EPOLLIN
-                            | EPollEventType::EPOLLRDNORM
-                            | EPollEventType::EPOLLOUT
-                            | EPollEventType::EPOLLWRNORM
-                            | EPollEventType::EPOLLHUP
-                            | EPollEventType::EPOLLRDHUP;
-
-                        // If error not consumed yet, set EPOLLERR
-                        if matches!(
-                            *result,
-                            ConnectResult::Refused | ConnectResult::ShutdownReset
-                        ) {
-                            events_to_set |= EPollEventType::EPOLLERR;
-                        }
-
-                        pollee.fetch_or(events_to_set.bits() as usize, Ordering::Relaxed);
-
-                        // If error IS consumed, clear EPOLLERR (if it was set previously)
-                        if matches!(
-                            *result,
-                            ConnectResult::RefusedConsumed | ConnectResult::ShutdownResetConsumed
-                        ) {
-                            pollee.fetch_and(
-                                !(EPollEventType::EPOLLERR).bits() as usize,
-                                Ordering::Relaxed,
-                            );
-                        }
-                    }
-                    ConnectResult::Connecting => {
-                        // Still connecting - clear all events
-                        pollee.fetch_and(
-                            !(EPollEventType::EPOLLIN
-                                | EPollEventType::EPOLLOUT
-                                | EPollEventType::EPOLLERR
-                                | EPollEventType::EPOLLHUP
-                                | EPollEventType::EPOLLRDHUP
-                                | EPollEventType::EPOLLRDNORM
-                                | EPollEventType::EPOLLWRNORM)
-                                .bits() as usize,
-                            Ordering::Relaxed,
-                        );
-                    }
-                }
-
-                matches!(
-                    *result,
-                    ConnectResult::Refused
-                        | ConnectResult::Connected
-                        | ConnectResult::RefusedConsumed
-                        | ConnectResult::ShutdownReset
-                        | ConnectResult::ShutdownResetConsumed
-                )
-            })
+                ConnectResult::Connecting => {}
+            }
+            pollee.store(events.bits() as usize, Ordering::Release);
+            !matches!(*result, ConnectResult::Connecting)
+        })
     }
 
     pub fn get_name(&self) -> smoltcp::wire::IpEndpoint {
@@ -864,31 +760,46 @@ impl Connecting {
     }
 
     pub fn failure_reason(&self) -> Option<SystemError> {
-        match *self.result.read() {
-            ConnectResult::Refused => Some(SystemError::ECONNREFUSED),
-            ConnectResult::ShutdownReset => Some(SystemError::ECONNRESET),
-            _ => None,
-        }
+        self.with_mut(|socket| {
+            let mut result = self.result.write();
+            Self::refresh_result(socket, &mut result);
+            match &*result {
+                ConnectResult::Failed(error) => error.clone(),
+                _ => None,
+            }
+        })
     }
 
-    pub fn consume_error(&self) {
-        let mut guard = self.result.write();
-        match *guard {
-            ConnectResult::Refused => *guard = ConnectResult::RefusedConsumed,
-            ConnectResult::ShutdownReset => *guard = ConnectResult::ShutdownResetConsumed,
-            _ => {}
-        }
+    pub fn take_error(&self) -> Option<SystemError> {
+        self.take_error_inner(true)
+    }
+
+    /// A completed handshake must use the receive path, which drains data and
+    /// honors a received FIN before considering a pending reset.
+    pub fn take_connect_error(&self) -> Option<SystemError> {
+        self.take_error_inner(false)
+    }
+
+    fn take_error_inner(&self, include_connected: bool) -> Option<SystemError> {
+        self.with_mut(|socket| {
+            let mut result = self.result.write();
+            Self::refresh_result(socket, &mut result);
+            match &mut *result {
+                ConnectResult::Failed(error) => error.take(),
+                ConnectResult::Connected if include_connected => {
+                    socket.take_reset().map(reset_error)
+                }
+                _ => None,
+            }
+        })
     }
 
     pub fn is_refused_consumed(&self) -> bool {
-        matches!(
-            *self.result.read(),
-            ConnectResult::RefusedConsumed | ConnectResult::ShutdownResetConsumed
-        )
+        matches!(*self.result.read(), ConnectResult::Failed(None))
     }
 
     pub fn set_shutdown_reset(&self) {
-        *self.result.write() = ConnectResult::ShutdownReset;
+        *self.result.write() = ConnectResult::Failed(Some(SystemError::ECONNRESET));
     }
 }
 
@@ -1279,8 +1190,10 @@ impl Established {
         inner: super::bound::TcpBound,
         reservation: Option<TcpPortReservation>,
         registration: ConnectingRegistrationLease,
+        local: smoltcp::wire::IpEndpoint,
+        peer: smoltcp::wire::IpEndpoint,
     ) -> Self {
-        let mut established = Self::new(inner, reservation);
+        let mut established = Self::with_endpoints(inner, reservation, local, peer);
         established.connecting_registration = Some(registration);
         established.connect_confirmed = false;
         established
@@ -1299,6 +1212,9 @@ impl Established {
         ver: smoltcp::wire::IpVersion,
     ) -> (Inner, Result<(), SystemError>) {
         if !self.connect_confirmed && self.with(|socket| socket.state() == tcp::State::Closed) {
+            let error = self
+                .with_mut(|socket| socket.take_reset().map(reset_error))
+                .unwrap_or(SystemError::ECONNABORTED);
             self.cancel_connecting_registration();
             let reservation = self
                 .reservation
@@ -1306,7 +1222,7 @@ impl Established {
                 .expect("live connecting FD owns binding");
             return (
                 Inner::Init(Init::after_failed_connect(self.inner, reservation, ver)),
-                Err(SystemError::ECONNABORTED),
+                Err(error),
             );
         }
         self.confirm_connect();
@@ -1359,13 +1275,16 @@ impl Established {
     pub fn send_slice(&self, buf: &[u8]) -> Result<usize, SystemError> {
         self.inner
             .with_mut::<smoltcp::socket::tcp::Socket, _, _>(|socket| {
+                // Background cork flushes also use this method. Return the
+                // terminal send condition without consuming the reset; the
+                // user-facing boundary atomically substitutes a pending error.
                 if socket.can_send() {
                     socket
                         .send_slice(buf)
                         .map_err(|_| SystemError::ECONNABORTED)
                 } else {
                     match socket.state() {
-                        smoltcp::socket::tcp::State::Closed => Err(SystemError::ECONNRESET),
+                        smoltcp::socket::tcp::State::Closed => Err(SystemError::EPIPE),
                         smoltcp::socket::tcp::State::TimeWait
                         | smoltcp::socket::tcp::State::Closing
                         | smoltcp::socket::tcp::State::LastAck => Err(SystemError::EPIPE),
@@ -1401,7 +1320,7 @@ impl Established {
 
                 use crate::net::socket::common::ShutdownBit;
                 let read_closed = fin_received || shutdown.contains(ShutdownBit::SHUT_RD);
-                let write_closed = shutdown.contains(ShutdownBit::SHUT_WR);
+                let write_closed = is_closed || shutdown.contains(ShutdownBit::SHUT_WR);
                 let mut events = EPollEventType::empty();
                 if socket.can_send() || write_closed {
                     events |= EPollEventType::EPOLLOUT | EPollEventType::EPOLLWRNORM;
@@ -1416,6 +1335,9 @@ impl Established {
                 // SHUT_WR plus peer FIN is a full hangup even in CLOSING.
                 if is_closed || (read_closed && write_closed) {
                     events |= EPollEventType::EPOLLHUP;
+                }
+                if socket.reset_state().is_some() {
+                    events |= EPollEventType::EPOLLERR;
                 }
                 // Publish one coherent snapshot while the transport lock is
                 // held; concurrent refreshers cannot publish an older state.

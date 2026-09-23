@@ -1,4 +1,5 @@
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::sync::atomic::AtomicUsize;
 use system_error::SystemError;
 
@@ -34,6 +35,84 @@ mod stream_core;
 pub use stream_core::TcpSocket;
 
 impl TcpSocket {
+    fn send_with_progress(
+        &self,
+        buffer: &[u8],
+        _flags: PMSG,
+        report_error: bool,
+    ) -> Result<usize, SystemError> {
+        if buffer.is_empty() {
+            // Linux 语义：write(fd, "", 0) / send(fd, ..., 0) 直接返回 0。
+            return Ok(0);
+        }
+
+        if self.is_nonblock() || _flags.contains(PMSG::DONTWAIT) {
+            let ret = self.try_send(buffer, report_error);
+            if let Ok(n) = ret {
+                if n > 0 {
+                    self.notify();
+                }
+            }
+            return ret;
+        }
+
+        // Linux 语义（tcp_sendmsg）：阻塞发送会尽量持续发送直到：
+        // 1) 请求数据全部写入；或
+        // 2) 在尚未写入任何字节前遇到错误（返回错误）；或
+        // 3) 已写入部分数据后遇到错误/中断（返回短写）。
+        let mut total_sent = 0usize;
+
+        while total_sent < buffer.len() {
+            match self.try_send(&buffer[total_sent..], report_error && total_sent == 0) {
+                Ok(n) => {
+                    if n == 0 {
+                        if total_sent > 0 {
+                            break;
+                        }
+                        return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+                    }
+                    total_sent += n;
+                    self.notify();
+                    continue;
+                }
+                Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
+                    // loopback 场景需要把协议栈推进到“真正可写/不可写”的稳定状态，避免丢唤醒。
+                    if let Some(iface) = self.stack_poll_snapshot() {
+                        poll_util::poll_stack_batch(iface.as_ref());
+                    }
+
+                    // 与 recv/connect 同理，不能只看缓存事件位；等待前需要主动刷新。
+                    let events = self.check_io_event();
+                    if events.intersects(EP::EPOLLOUT | EP::EPOLLHUP | EP::EPOLLERR) {
+                        continue;
+                    }
+
+                    let wait_ret = self.wait_queue.wait_event_io_interruptible_timeout(
+                        || {
+                            self.check_io_event()
+                                .intersects(EP::EPOLLOUT | EP::EPOLLHUP | EP::EPOLLERR)
+                        },
+                        self.send_timeout(),
+                    );
+                    if let Err(e) = wait_ret {
+                        if total_sent > 0 {
+                            break;
+                        }
+                        return Err(e);
+                    }
+                }
+                Err(e) => {
+                    if total_sent > 0 {
+                        break;
+                    }
+                    return Err(e);
+                }
+            }
+        }
+
+        Ok(total_sent)
+    }
+
     /// Keep on-wire IPv4 addresses internally, and preserve AF_INET6 at the
     /// sockaddr ABI boundary for mapped connections accepted by dual-stack TCP.
     fn name_endpoint(&self, mut endpoint: smoltcp::wire::IpEndpoint) -> Endpoint {
@@ -290,77 +369,8 @@ impl Socket for TcpSocket {
         self.read_to_user_buffer_impl(user_buffer)
     }
 
-    fn send(&self, buffer: &[u8], _flags: PMSG) -> Result<usize, SystemError> {
-        if buffer.is_empty() {
-            // Linux 语义：write(fd, "", 0) / send(fd, ..., 0) 直接返回 0。
-            return Ok(0);
-        }
-
-        if self.is_nonblock() || _flags.contains(PMSG::DONTWAIT) {
-            let ret = self.try_send(buffer);
-            if let Ok(n) = ret {
-                if n > 0 {
-                    self.notify();
-                }
-            }
-            return ret;
-        }
-
-        // Linux 语义（tcp_sendmsg）：阻塞发送会尽量持续发送直到：
-        // 1) 请求数据全部写入；或
-        // 2) 在尚未写入任何字节前遇到错误（返回错误）；或
-        // 3) 已写入部分数据后遇到错误/中断（返回短写）。
-        let mut total_sent = 0usize;
-
-        while total_sent < buffer.len() {
-            match self.try_send(&buffer[total_sent..]) {
-                Ok(n) => {
-                    if n == 0 {
-                        if total_sent > 0 {
-                            break;
-                        }
-                        return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-                    }
-                    total_sent += n;
-                    self.notify();
-                    continue;
-                }
-                Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
-                    // loopback 场景需要把协议栈推进到“真正可写/不可写”的稳定状态，避免丢唤醒。
-                    if let Some(iface) = self.stack_poll_snapshot() {
-                        poll_util::poll_stack_batch(iface.as_ref());
-                    }
-
-                    // 与 recv/connect 同理，不能只看缓存事件位；等待前需要主动刷新。
-                    let events = self.check_io_event();
-                    if events.intersects(EP::EPOLLOUT | EP::EPOLLHUP | EP::EPOLLERR) {
-                        continue;
-                    }
-
-                    let wait_ret = self.wait_queue.wait_event_io_interruptible_timeout(
-                        || {
-                            self.check_io_event()
-                                .intersects(EP::EPOLLOUT | EP::EPOLLHUP | EP::EPOLLERR)
-                        },
-                        self.send_timeout(),
-                    );
-                    if let Err(e) = wait_ret {
-                        if total_sent > 0 {
-                            break;
-                        }
-                        return Err(e);
-                    }
-                }
-                Err(e) => {
-                    if total_sent > 0 {
-                        break;
-                    }
-                    return Err(e);
-                }
-            }
-        }
-
-        Ok(total_sent)
+    fn send(&self, buffer: &[u8], flags: PMSG) -> Result<usize, SystemError> {
+        self.send_with_progress(buffer, flags, true)
     }
 
     fn send_buffer_size(&self) -> usize {
@@ -540,17 +550,37 @@ impl Socket for TcpSocket {
         reader: &crate::syscall::user_access::UserBufferReader<'_>,
         len: usize,
         flags: PMSG,
-        address: Option<Endpoint>,
+        _address: Option<Endpoint>,
     ) -> Result<usize, SystemError> {
         const STREAM_SEND_CHUNK: usize = crate::arch::MMArch::PAGE_SIZE;
-        crate::net::socket::base::send_user_buffer_via_kernel_buf(
-            self,
-            reader,
-            len,
-            flags,
-            address,
-            STREAM_SEND_CHUNK,
-        )
+        if len == 0 {
+            return self.send_with_progress(&[], flags, true);
+        }
+        // Retain bounded user-memory staging while carrying progress across
+        // chunks: an error following an earlier chunk must remain pending.
+        let scratch_len = core::cmp::min(STREAM_SEND_CHUNK, len);
+        let mut scratch = Vec::new();
+        scratch
+            .try_reserve(scratch_len)
+            .map_err(|_| SystemError::ENOMEM)?;
+        scratch.resize(scratch_len, 0);
+        let mut total = 0;
+        while total < len {
+            let want = core::cmp::min(scratch.len(), len - total);
+            if let Err(error) = reader.copy_from_user(&mut scratch[..want], total) {
+                return if total == 0 { Err(error) } else { Ok(total) };
+            }
+            match self.send_with_progress(&scratch[..want], flags, total == 0) {
+                Ok(sent) => {
+                    total += sent;
+                    if sent < want {
+                        break;
+                    }
+                }
+                Err(error) => return if total == 0 { Err(error) } else { Ok(total) },
+            }
+        }
+        Ok(total)
     }
 
     fn epoll_items(&self) -> &EPollItems {

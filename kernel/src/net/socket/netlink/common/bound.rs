@@ -48,6 +48,9 @@ impl<Message: 'static + Debug> BoundNetlink<Message> {
 
     pub fn check_io_events_common(&self) -> EPollEventType {
         let mut events = EPollEventType::EPOLLOUT;
+        if self.receive_queue.has_error() {
+            events |= EPollEventType::EPOLLERR;
+        }
 
         let receive_queue = self.receive_queue.0.lock();
         if !receive_queue.is_empty() {

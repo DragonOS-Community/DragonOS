@@ -6,10 +6,9 @@ use crate::filesystem::cgroup2::cgroup2_inode_to_node;
 use crate::include::bindings::linux_bpf::{
     bpf_attach_type, bpf_attr, bpf_attr__bindgen_ty_10, BPF_F_QUERY_EFFECTIVE,
 };
-use crate::mm::VirtAddr;
 use crate::process::cred::{capable, CAPFlags};
 use crate::process::ProcessManager;
-use crate::syscall::user_access::write_one_to_user_protected;
+use crate::syscall::user_access::UserBufferWriter;
 use core::mem::{offset_of, size_of};
 use num_traits::FromPrimitive;
 use system_error::SystemError;
@@ -47,11 +46,13 @@ fn is_cgroup_attach_type(value: u32) -> bool {
     )
 }
 
-fn user_query_field(base: *mut u8, offset: usize) -> Result<VirtAddr, SystemError> {
-    (base as usize)
+fn write_query_field(base: *mut u8, offset: usize, value: u32) -> Result<(), SystemError> {
+    let addr = (base as usize)
         .checked_add(offset)
-        .map(VirtAddr::new)
-        .ok_or(SystemError::EFAULT)
+        .ok_or(SystemError::EFAULT)?;
+    let mut writer = UserBufferWriter::new(addr as *mut u8, size_of::<u32>(), true)?;
+    writer.copy_to_user_protected(&value.to_ne_bytes(), 0)?;
+    Ok(())
 }
 
 pub(super) fn bpf_prog_query(attr: &bpf_attr, user_attr: *mut u8) -> Result<usize, SystemError> {
@@ -109,13 +110,15 @@ pub(super) fn bpf_prog_query(attr: &bpf_attr, user_attr: *mut u8) -> Result<usiz
     // BPF_PROG_ATTACH and BPF_LINK_CREATE cannot install cgroup programs yet.
     // When they are added, query must read the same attachment state.
     let zero: u32 = 0;
-    let flags_addr =
-        user_query_field(user_attr, offset_of!(bpf_attr__bindgen_ty_10, attach_flags))?;
-    unsafe { write_one_to_user_protected(flags_addr, &zero)? };
-    let count_addr = user_query_field(
+    write_query_field(
+        user_attr,
+        offset_of!(bpf_attr__bindgen_ty_10, attach_flags),
+        zero,
+    )?;
+    write_query_field(
         user_attr,
         offset_of!(bpf_attr__bindgen_ty_10, __bindgen_anon_2),
+        zero,
     )?;
-    unsafe { write_one_to_user_protected(count_addr, &zero)? };
     Ok(0)
 }

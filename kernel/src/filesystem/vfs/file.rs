@@ -2384,13 +2384,17 @@ impl File {
             let (ino, d_type) = if let Some(metadata) = metadata {
                 metadata
             } else {
-                let metadata = match name {
-                    b"." => inode.metadata(),
-                    b".." => inode.parent().and_then(|parent| parent.metadata()),
-                    _ => inode.find_bytes(name).and_then(|child| child.metadata()),
+                let entry = match name {
+                    b"." => inode.metadata().map(|md| (inode.reported_ino(&md), md)),
+                    b".." => inode.parent().and_then(|parent| {
+                        parent.metadata().map(|md| (parent.reported_ino(&md), md))
+                    }),
+                    _ => inode
+                        .find_bytes(name)
+                        .and_then(|child| child.metadata().map(|md| (child.reported_ino(&md), md))),
                 };
-                let metadata = match metadata {
-                    Ok(metadata) => metadata,
+                let (ino, metadata) = match entry {
+                    Ok(entry) => entry,
                     Err(SystemError::ENOENT) => {
                         state.next_index += 1;
                         self.offset.store(next_cookie, Ordering::SeqCst);
@@ -2399,7 +2403,7 @@ impl File {
                     Err(error) => return Err(error),
                 };
                 (
-                    metadata.inode_id.into() as u64,
+                    ino.into() as u64,
                     metadata.file_type.get_file_type_num() as u8,
                 )
             };

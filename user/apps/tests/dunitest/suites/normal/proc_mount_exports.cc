@@ -1,7 +1,10 @@
 #include <gtest/gtest.h>
 
+#include <stddef.h>
+#include <stdint.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <linux/stat.h>
 #include <regex>
 #include <sched.h>
 #include <stdio.h>
@@ -9,7 +12,10 @@
 #include <sys/mount.h>
 #include <sys/prctl.h>
 #include <sys/stat.h>
+#include <sys/statfs.h>
+#include <sys/syscall.h>
 #include <sys/types.h>
+#include <sys/utsname.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -21,6 +27,49 @@
 #endif
 
 namespace {
+
+constexpr ino_t kProcRootIno = 1;
+constexpr long kProcSuperMagic = 0x9fa0;
+
+struct TestDirent64 {
+    uint64_t ino;
+    int64_t off;
+    unsigned short reclen;
+    unsigned char type;
+    char name[1];
+};
+
+bool running_on_dragonos() {
+    struct utsname info = {};
+    return uname(&info) == 0 && strstr(info.release, "dragonos") != nullptr;
+}
+
+bool proc_dot_has_root_ino(int fd) {
+    alignas(8) char entries[4096];
+    const long count = syscall(SYS_getdents64, fd, entries, sizeof(entries));
+    if (count <= 0) {
+        return false;
+    }
+    for (size_t offset = 0; offset < static_cast<size_t>(count);) {
+        if (static_cast<size_t>(count) - offset < sizeof(TestDirent64)) {
+            return false;
+        }
+        const auto* entry = reinterpret_cast<const TestDirent64*>(entries + offset);
+        if (entry->reclen < sizeof(TestDirent64) ||
+            entry->reclen > static_cast<size_t>(count) - offset) {
+            return false;
+        }
+        const size_t name_size = entry->reclen - offsetof(TestDirent64, name);
+        if (memchr(entry->name, '\0', name_size) == nullptr) {
+            return false;
+        }
+        if (strcmp(entry->name, ".") == 0) {
+            return entry->ino == kProcRootIno;
+        }
+        offset += entry->reclen;
+    }
+    return false;
+}
 
 struct ChildProcessGuard {
     pid_t pid = -1;
@@ -179,6 +228,73 @@ bool can_use_mount_namespaces() {
 }
 
 }  // namespace
+
+TEST(ProcMountExports, ProcRootReportsLinuxInodeNumber) {
+    struct stat path_stat = {};
+    struct stat fd_stat = {};
+    struct stat self_stat = {};
+    struct statfs fs_stat = {};
+    struct statx statx_result = {};
+
+    ASSERT_EQ(0, stat("/proc", &path_stat)) << strerror(errno);
+    const int fd = open("/proc", O_RDONLY | O_DIRECTORY);
+    ASSERT_GE(fd, 0) << strerror(errno);
+    ASSERT_EQ(0, fstat(fd, &fd_stat)) << strerror(errno);
+    ASSERT_EQ(0, fstatfs(fd, &fs_stat)) << strerror(errno);
+    ASSERT_EQ(0, syscall(SYS_statx, AT_FDCWD, "/proc", 0, STATX_INO, &statx_result))
+        << strerror(errno);
+    ASSERT_EQ(0, stat("/proc/self", &self_stat)) << strerror(errno);
+
+    EXPECT_EQ(kProcRootIno, path_stat.st_ino);
+    EXPECT_EQ(kProcRootIno, fd_stat.st_ino);
+    EXPECT_EQ(static_cast<uint64_t>(kProcRootIno), statx_result.stx_ino);
+    EXPECT_EQ(kProcSuperMagic, fs_stat.f_type);
+    EXPECT_NE(kProcRootIno, self_stat.st_ino);
+    EXPECT_TRUE(proc_dot_has_root_ino(fd));
+    close(fd);
+}
+
+TEST(ProcMountExports, AnotherProcMountAlsoReportsRootInodeOne) {
+    ASSERT_EQ(0, ensure_dir("/tmp")) << strerror(errno);
+    char target[128] = {};
+    snprintf(target, sizeof(target), "/tmp/dkc007_proc_root_%d", getpid());
+    ASSERT_EQ(0, mkdir(target, 0700)) << strerror(errno);
+
+    const pid_t child = fork();
+    if (child == 0) {
+        if (unshare(CLONE_NEWNS) != 0) {
+            _exit(errno == EPERM ? 77 : 1);
+        }
+        if (mount("", "/", nullptr, MS_REC | MS_PRIVATE, nullptr) != 0 ||
+            mount("proc", target, "proc", 0, nullptr) != 0) {
+            _exit(2);
+        }
+        struct stat st = {};
+        struct statfs fs = {};
+        const int fd = open(target, O_RDONLY | O_DIRECTORY);
+        const bool valid = fd >= 0 && stat(target, &st) == 0 && fstatfs(fd, &fs) == 0 &&
+                           st.st_ino == kProcRootIno && fs.f_type == kProcSuperMagic &&
+                           proc_dot_has_root_ino(fd);
+        if (fd >= 0) {
+            close(fd);
+        }
+        _exit(valid ? 0 : 3);
+    }
+
+    int status = 0;
+    if (child > 0) {
+        while (waitpid(child, &status, 0) < 0 && errno == EINTR) {
+        }
+    }
+    const int cleanup_error = rmdir(target);
+    ASSERT_EQ(0, cleanup_error) << strerror(errno);
+    ASSERT_GE(child, 0) << strerror(errno);
+    ASSERT_TRUE(WIFEXITED(status));
+    if (WEXITSTATUS(status) == 77 && !running_on_dragonos()) {
+        GTEST_SKIP() << "host cannot create an isolated mount namespace";
+    }
+    EXPECT_EQ(0, WEXITSTATUS(status)) << "isolated procfs mount check failed";
+}
 
 TEST(ProcMountExports, ProcMountsSymlinkTarget) {
     char target[256] = {};

@@ -27,7 +27,7 @@ use crate::{
             vmstat::VmstatFileOps,
             Builder, PROCFS_BLOCK_SIZE, PROCFS_MAX_NAMELEN,
         },
-        vfs::{FileSystemMakerData, IndexNode, InodeMode, FSMAKER},
+        vfs::{FileSystemMakerData, IndexNode, InodeId, InodeMode, Metadata, FSMAKER},
     },
     process::{namespace::pid_namespace::PidNamespace, ProcessManager, RawPid},
     register_mountable_fs,
@@ -105,6 +105,12 @@ impl RootDirOps {
 }
 
 impl DirOps for RootDirOps {
+    fn reported_ino(&self, _metadata: &Metadata) -> InodeId {
+        // Linux PROC_ROOT_INO. Keep the generated internal ID distinct across
+        // procfs instances; only the user-visible number is fixed.
+        InodeId::new(1)
+    }
+
     fn lookup_child(
         &self,
         dir: &ProcDir<Self>,

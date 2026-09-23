@@ -289,7 +289,7 @@ pub fn vfs_getattr(
         kstat.ctime.tv_nsec = metadata.ctime.tv_nsec;
     }
     if request_mask.contains(PosixStatxMask::STATX_INO) {
-        kstat.ino = metadata.inode_id.into() as u64;
+        kstat.ino = inode.reported_ino(&metadata).into() as u64;
     }
     if request_mask.contains(PosixStatxMask::STATX_SIZE) {
         kstat.size = metadata.size as usize;

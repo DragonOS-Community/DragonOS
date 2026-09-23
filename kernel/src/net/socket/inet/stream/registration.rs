@@ -1,10 +1,9 @@
-//! Linearizes TCP connection-state publication with iface notification ownership.
+//! Linearizes TCP connection-state publication with stack notification ownership.
 
 use alloc::sync::{Arc, Weak};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-use crate::libs::mutex::Mutex;
-use crate::net::{socket, Iface};
+use crate::net::socket;
 use system_error::SystemError;
 
 #[derive(Debug)]
@@ -15,10 +14,9 @@ pub(super) struct ConnectingRegistration {
 
 #[derive(Debug)]
 struct ConnectingRegistrationState {
-    iface: Arc<dyn Iface>,
+    stack: Arc<crate::net::tcp_stack::TcpStack>,
     wrapper: Weak<dyn socket::inet::InetSocket>,
     state: AtomicUsize,
-    routing_publication: Mutex<Option<socket::inet::common::RoutedSocketPublication>>,
 }
 
 #[derive(Debug)]
@@ -34,17 +32,14 @@ impl ConnectingRegistration {
     const CANCELLED: usize = 3;
 
     pub(super) fn try_new(
-        iface: Arc<dyn Iface>,
+        stack: Arc<crate::net::tcp_stack::TcpStack>,
         wrapper: Weak<dyn socket::inet::InetSocket>,
     ) -> Result<Self, SystemError> {
-        let routing_publication =
-            socket::inet::common::RoutedSocketPublication::begin(iface.clone());
         Ok(Self {
             state: Arc::try_new(ConnectingRegistrationState {
-                iface,
+                stack,
                 wrapper,
                 state: AtomicUsize::new(Self::PENDING),
-                routing_publication: Mutex::new(Some(routing_publication)),
             })
             .map_err(|_| SystemError::ENOMEM)?,
             retained: false,
@@ -67,10 +62,6 @@ impl ConnectingRegistration {
 }
 
 impl ConnectingRegistrationState {
-    fn release_routing_publication(&self) {
-        drop(self.routing_publication.lock().take());
-    }
-
     fn cancel(&self) {
         let previous = self
             .state
@@ -80,9 +71,8 @@ impl ConnectingRegistrationState {
             ConnectingRegistration::PUBLISHED | ConnectingRegistration::RETAINED
         ) {
             if let Some(wrapper) = self.wrapper.upgrade() {
-                self.iface.common().unbind_socket(wrapper);
+                self.stack.unbind_socket(wrapper);
             }
-            self.release_routing_publication();
         }
     }
 }
@@ -103,13 +93,12 @@ impl ConnectingRegistrationPublisher {
             self.0
                 .state
                 .store(ConnectingRegistration::CANCELLED, Ordering::Release);
-            self.0.release_routing_publication();
             return;
         };
 
         // bind_socket is idempotent under one bounds lock, so an explicitly
         // bound socket never observes an unregister/register gap here.
-        self.0.iface.common().bind_socket(wrapper.clone());
+        self.0.stack.bind_socket(wrapper.clone());
         match self.0.state.compare_exchange(
             ConnectingRegistration::PENDING,
             ConnectingRegistration::PUBLISHED,
@@ -120,14 +109,10 @@ impl ConnectingRegistrationPublisher {
             | Err(ConnectingRegistration::PUBLISHED)
             | Err(ConnectingRegistration::RETAINED) => {}
             Err(ConnectingRegistration::CANCELLED) => {
-                self.0.iface.common().unbind_socket(wrapper);
+                self.0.stack.unbind_socket(wrapper);
             }
             Err(_) => unreachable!(),
         }
-
-        // Either bounds owns the notification lifetime, or cancellation has
-        // rolled the insertion back. This is the only safe handoff point.
-        self.0.release_routing_publication();
     }
 }
 

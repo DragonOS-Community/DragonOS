@@ -174,6 +174,7 @@ pub struct NetNamespace {
     /// Per-netns UDP port reservation and local-delivery table.
     udp_bindings: UdpBindingTable,
     tcp_ports: Arc<crate::net::socket::inet::common::PortManager>,
+    tcp_stack: Arc<crate::net::tcp_stack::TcpStack>,
     /// Lock-free read-side snapshot for AF_PACKET delivery from NAPI context.
     packet_sockets: RcuArcSlot<PacketSocketRegistrySnapshot>,
     /// Serializes all plain/fanout topology updates and owns group IDs.
@@ -401,13 +402,27 @@ impl NetnsPoller {
             // classification and timeout calculation must use a fresh clock
             // sample so time spent there cannot postpone an already-due TCP
             // timer by one additional timeout interval.
-            let observed_generation = self.deadline_generation.load(Ordering::Acquire);
-            let deadline_now_us = Instant::now().total_micros() as u64;
+            let mut observed_generation = self.deadline_generation.load(Ordering::Acquire);
+            let mut deadline_now_us = Instant::now().total_micros() as u64;
+
+            // TCP protocol ownership is namespace-wide, independent of netdev
+            // UP/NAPI state. One batch per scheduler iteration prevents every
+            // interface from scanning the same TCP socket collection.
+            if netns.tcp_stack.poll_due(deadline_now_us) {
+                netns.tcp_stack.poll();
+                // Still service physical work during sustained TCP input.
+                // Resnapshot after the batch before calculating our timeout.
+                observed_generation = self.deadline_generation.load(Ordering::Acquire);
+                deadline_now_us = Instant::now().total_micros() as u64;
+            }
 
             // Classify and atomically claim due protocol deadlines. The
             // device-list lock is only used for topology lookup; no direct
             // protocol poll or yield is performed while it is held.
-            let mut next_us = cleanup_retry_at;
+            let mut next_us = match (cleanup_retry_at, netns.tcp_stack.deadline_us()) {
+                (Some(cleanup), Some(tcp)) => Some(core::cmp::min(cleanup, tcp)),
+                (cleanup, tcp) => cleanup.or(tcp),
+            };
             let mut direct_due = Vec::new();
             {
                 let devices = netns.device_list.read();
@@ -565,6 +580,7 @@ impl NetNamespace {
             neighbor_table: NeighborTable::new(),
             udp_bindings: UdpBindingTable::default(),
             tcp_ports: Arc::new(crate::net::socket::inet::common::PortManager::default()),
+            tcp_stack: Arc::new(crate::net::tcp_stack::TcpStack::new(self_ref.clone())),
             packet_sockets: RcuArcSlot::new(Arc::new(PacketSocketRegistrySnapshot::default())),
             packet_sockets_writer: Mutex::new(PacketSocketRegistryWriter::new()),
             packet_sockets_need_cleanup: AtomicBool::new(false),
@@ -607,6 +623,7 @@ impl NetNamespace {
             neighbor_table: NeighborTable::new(),
             udp_bindings: UdpBindingTable::default(),
             tcp_ports: Arc::new(crate::net::socket::inet::common::PortManager::default()),
+            tcp_stack: Arc::new(crate::net::tcp_stack::TcpStack::new(self_ref.clone())),
             packet_sockets: RcuArcSlot::new(Arc::new(PacketSocketRegistrySnapshot::default())),
             packet_sockets_writer: Mutex::new(PacketSocketRegistryWriter::new()),
             packet_sockets_need_cleanup: AtomicBool::new(false),
@@ -670,6 +687,14 @@ impl NetNamespace {
 
     pub(crate) fn tcp_ports(&self) -> &Arc<crate::net::socket::inet::common::PortManager> {
         &self.tcp_ports
+    }
+
+    pub fn tcp_stack(&self) -> &Arc<crate::net::tcp_stack::TcpStack> {
+        &self.tcp_stack
+    }
+
+    pub fn wakeup_tcp_poll(&self) {
+        self.tcp_stack.request_poll();
     }
 
     pub fn register_packet_socket(&self, socket: Weak<PacketSocket>) -> Result<(), SystemError> {

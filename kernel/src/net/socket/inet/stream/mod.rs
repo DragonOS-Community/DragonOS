@@ -12,6 +12,7 @@ use crate::net::socket::unix::utils::{CmsgBuffer, SOL_SOCKET};
 use crate::net::socket::{common::ShutdownBit, endpoint::Endpoint, Socket, PMSG, PSO, PSOL};
 use crate::time::syscall::PosixTimeval;
 
+mod bound;
 mod constants;
 mod info;
 mod inner;
@@ -28,7 +29,6 @@ mod events;
 mod io;
 mod lifecycle;
 mod poll_util;
-mod shutdown;
 mod stream_core;
 
 pub use stream_core::TcpSocket;
@@ -200,13 +200,6 @@ impl Socket for TcpSocket {
     }
 
     fn recv(&self, buffer: &mut [u8], flags: PMSG) -> Result<usize, SystemError> {
-        if self.is_recv_shutdown() {
-            let limit = self.recv_shutdown.limit();
-            if limit == 0 {
-                return Ok(0);
-            }
-        }
-
         if self.is_nonblock() || flags.contains(PMSG::DONTWAIT) {
             let ret = self.try_recv_with_flags(buffer, flags);
             if let Ok(n) = ret {
@@ -246,8 +239,8 @@ impl Socket for TcpSocket {
                     // - Poll 1: TX sends data to loopback queue, RX processes existing packets
                     // - Poll 2: RX processes the data we just transmitted (loopback roundtrip)
                     // Without this loop, we'd wait for the poll thread to complete the roundtrip.
-                    if let Some(iface) = self.stack_poll_iface_snapshot() {
-                        poll_util::poll_iface_until_quiescent(iface.as_ref());
+                    if let Some(iface) = self.stack_poll_snapshot() {
+                        poll_util::poll_stack_batch(iface.as_ref());
                     }
                     // 与 connect() 同理，不能只依赖缓存的 pollee 位。
                     // 否则若“最后一次 notify() 先发生、而当前线程尚未真正入睡”，
@@ -334,8 +327,8 @@ impl Socket for TcpSocket {
                 }
                 Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
                     // loopback 场景需要把协议栈推进到“真正可写/不可写”的稳定状态，避免丢唤醒。
-                    if let Some(iface) = self.stack_poll_iface_snapshot() {
-                        poll_util::poll_iface_until_quiescent(iface.as_ref());
+                    if let Some(iface) = self.stack_poll_snapshot() {
+                        poll_util::poll_stack_batch(iface.as_ref());
                     }
 
                     // 与 recv/connect 同理，不能只看缓存事件位；等待前需要主动刷新。
@@ -585,7 +578,7 @@ impl Socket for TcpSocket {
 
 impl InetSocket for TcpSocket {
     fn on_iface_events(&self) {
-        // Iface::poll() 在网络轮询线程/中断上下文中推进 smoltcp socket 状态。
+        // TcpStack::poll() 在网络轮询线程/中断上下文中推进 smoltcp socket 状态。
         // 这里负责把 smoltcp 的状态变化同步到 TcpSocket 的 pollee/Connecting 结果中，
         // 以便 connect/accept/epoll 等等待者能被正确唤醒并观察到状态前进。
         //

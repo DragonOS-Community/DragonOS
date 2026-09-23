@@ -35,27 +35,6 @@ pub(crate) struct EphemeralBindTarget {
     pub(crate) local_addr: smoltcp::wire::IpAddress,
 }
 
-/// Keeps namespace-routed polling active across a protocol-state publication
-/// window. It is independent of the notification list so connect and close
-/// can preserve the same output invariant without changing their lock order.
-#[derive(Debug)]
-pub(crate) struct RoutedSocketPublication {
-    iface: Arc<dyn Iface>,
-}
-
-impl RoutedSocketPublication {
-    pub(crate) fn begin(iface: Arc<dyn Iface>) -> Self {
-        iface.common().begin_routed_socket_publication();
-        Self { iface }
-    }
-}
-
-impl Drop for RoutedSocketPublication {
-    fn drop(&mut self) {
-        self.iface.common().finish_routed_socket_publication();
-    }
-}
-
 /// Returns whether a concrete bind address has a unique local-delivery owner.
 /// Wildcard, multicast, and broadcast sockets remain interface-scoped and use
 /// the device-selection policy instead.
@@ -203,34 +182,6 @@ impl BoundInner {
 
     pub fn iface(&self) -> &Arc<dyn Iface> {
         &self.iface
-    }
-
-    /// Place an inactive TCP endpoint before its first SYN is published.
-    /// Notification ownership is updated by the caller after releasing inner.
-    pub(crate) fn move_closed_tcp_to_iface(
-        &mut self,
-        iface: Arc<dyn Iface>,
-    ) -> Result<(), SystemError> {
-        if Arc::ptr_eq(&self.iface, &iface) {
-            return Ok(());
-        }
-        let socket = {
-            let mut sockets = self.iface.sockets().lock();
-            if sockets
-                .get::<smoltcp::socket::tcp::Socket>(self.handle)
-                .state()
-                != smoltcp::socket::tcp::State::Closed
-            {
-                return Err(SystemError::EINVAL);
-            }
-            sockets.remove(self.handle)
-        };
-        let smoltcp::socket::Socket::Tcp(socket) = socket else {
-            unreachable!("validated TCP socket");
-        };
-        self.handle = iface.sockets().lock().add(socket);
-        self.iface = iface;
-        Ok(())
     }
 
     pub fn move_udp_to_iface(&mut self, iface: Arc<dyn Iface>) -> Result<(), SystemError> {
@@ -671,7 +622,7 @@ fn is_loopback_destination(remote_ip_addr: &smoltcp::wire::IpAddress) -> bool {
     }
 }
 
-fn bind_addr_not_found_error(
+pub(crate) fn bind_addr_not_found_error(
     addr: &smoltcp::wire::IpAddress,
     netns: &Arc<NetNamespace>,
 ) -> SystemError {

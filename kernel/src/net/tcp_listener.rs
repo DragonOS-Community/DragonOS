@@ -18,7 +18,7 @@ struct Listener {
     device: u32,
 }
 
-/// Per-interface listener facts, with no owning socket or interface references.
+/// Namespace TCP listener facts, with no owning socket or interface references.
 #[derive(Debug)]
 pub struct TcpListenerRegistry {
     listeners: RwSem<Vec<Listener>>,

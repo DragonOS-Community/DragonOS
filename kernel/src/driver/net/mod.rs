@@ -44,6 +44,7 @@ mod iface_common;
 mod iface_deadline;
 mod local_output;
 mod local_queue;
+pub(crate) mod tcp_output;
 mod tx_admission;
 
 pub use iface::*;

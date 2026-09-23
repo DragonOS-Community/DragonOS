@@ -35,3 +35,6 @@ normal/epoll_pwait2_semantics
 normal/internal_shmem
 normal/proc_task_status
 normal/tcp_port_lifetime
+normal/tcp_address_migration
+normal/tcp_connect_completion
+normal/tcp_namespace_progress

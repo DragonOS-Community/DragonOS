@@ -677,7 +677,7 @@ impl TcpSocket {
                 let _ = conn.update_io_events(&self.pollee);
 
                 if conn.failure_reason().is_some() || conn.is_refused_consumed() {
-                    conn.consume_error();
+                    let _ = conn.take_error();
                     let (new_inner, _) = conn.into_result();
                     let inner::Inner::Init(init) = new_inner else {
                         unreachable!("failed connection returns an initial socket");

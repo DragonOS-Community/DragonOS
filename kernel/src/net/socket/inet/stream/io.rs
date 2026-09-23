@@ -85,11 +85,26 @@ impl TcpSocket {
         }
     }
 
+    fn recv_reset_result(
+        socket: &mut smoltcp::socket::tcp::Socket,
+        report_error: bool,
+    ) -> Result<usize, SystemError> {
+        // A short successful read must leave the error for the next syscall.
+        if !report_error && socket.reset_state().is_some() {
+            return Ok(0);
+        }
+        socket
+            .take_reset()
+            .map(inner::reset_error)
+            .map_or(Ok(0), Err)
+    }
+
     fn recv_established(
         &self,
         socket: &mut smoltcp::socket::tcp::Socket,
         buf: &mut [u8],
         flags: PMSG,
+        report_error: bool,
     ) -> Result<usize, SystemError> {
         let current_buf = buf;
 
@@ -99,7 +114,7 @@ impl TcpSocket {
                     Ok(()) => Ok(0),
                     Err(smoltcp::socket::tcp::RecvError::Finished) => Ok(0),
                     Err(smoltcp::socket::tcp::RecvError::InvalidState) => {
-                        Err(SystemError::ECONNRESET)
+                        Self::recv_reset_result(socket, report_error)
                     }
                 };
             }
@@ -158,7 +173,9 @@ impl TcpSocket {
         if flags.contains(PMSG::PEEK) {
             return match socket.peek_slice(current_buf) {
                 Ok(size) => Ok(size),
-                Err(smoltcp::socket::tcp::RecvError::InvalidState) => Err(SystemError::ECONNRESET),
+                Err(smoltcp::socket::tcp::RecvError::InvalidState) => {
+                    Self::recv_reset_result(socket, report_error)
+                }
                 Err(smoltcp::socket::tcp::RecvError::Finished) => Ok(0),
             };
         }
@@ -208,6 +225,7 @@ impl TcpSocket {
         established: &inner::Established,
         user_buffer: &mut UserBuffer<'_>,
         offset: usize,
+        report_error: bool,
     ) -> Result<usize, SystemError> {
         if offset > user_buffer.len() {
             return Err(SystemError::EINVAL);
@@ -233,7 +251,9 @@ impl TcpSocket {
             }
             match socket.recv(|_data| (0usize, ())) {
                 Ok(()) | Err(smoltcp::socket::tcp::RecvError::Finished) => Ok(false),
-                Err(smoltcp::socket::tcp::RecvError::InvalidState) => Err(SystemError::ECONNRESET),
+                Err(smoltcp::socket::tcp::RecvError::InvalidState) => {
+                    Self::recv_reset_result(socket, report_error).map(|_| false)
+                }
             }
         })?;
         if !readable {
@@ -311,7 +331,7 @@ impl TcpSocket {
                 match socket.recv(|_data| (0usize, ())) {
                     Ok(()) | Err(smoltcp::socket::tcp::RecvError::Finished) => Ok(0),
                     Err(smoltcp::socket::tcp::RecvError::InvalidState) => {
-                        Err(SystemError::ECONNRESET)
+                        Self::recv_reset_result(socket, report_error)
                     }
                 }
             });
@@ -353,6 +373,7 @@ impl TcpSocket {
                 super::poll_util::poll_stack_batch(iface.as_ref());
             }
 
+            self.update_events();
             let iter_result = match self
                 .inner
                 .read()
@@ -360,22 +381,26 @@ impl TcpSocket {
                 .expect("Tcp inner::Inner is None")
             {
                 inner::Inner::Established(established) => established.with_mut(|socket| {
-                    self.recv_established(socket, &mut buf[total_read..], flags)
+                    self.recv_established(socket, &mut buf[total_read..], flags, total_read == 0)
                 }),
                 inner::Inner::Connecting(connecting) => {
-                    if let Some(err) = connecting.failure_reason() {
-                        connecting.consume_error();
-                        return Err(err);
+                    if let Some(err) = connecting.take_connect_error() {
+                        Err(err)
+                    } else if connecting.is_connected() {
+                        continue;
+                    } else if connecting.is_refused_consumed() {
+                        Ok(0)
+                    } else {
+                        Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
                     }
-                    if connecting.is_refused_consumed() {
-                        return Ok(0);
-                    }
-                    Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
                 }
                 inner::Inner::Init(_) | inner::Inner::Closed(_) => Err(SystemError::ENOTCONN),
                 _ => Err(SystemError::EINVAL),
             };
 
+            // The inner and SocketSet guards are gone before refreshing the
+            // cached readiness after a possible error consumption.
+            self.update_events();
             match iter_result {
                 Ok(n) => {
                     // For PEEK, we don't loop/accumulate because we are not consuming.
@@ -433,29 +458,35 @@ impl TcpSocket {
                 super::poll_util::poll_stack_batch(iface.as_ref());
             }
 
+            self.update_events();
             let iter_result = match self
                 .inner
                 .read()
                 .as_ref()
                 .expect("Tcp inner::Inner is None")
             {
-                inner::Inner::Established(established) => {
-                    self.recv_established_to_user(established, user_buffer, total_read)
-                }
+                inner::Inner::Established(established) => self.recv_established_to_user(
+                    established,
+                    user_buffer,
+                    total_read,
+                    total_read == 0,
+                ),
                 inner::Inner::Connecting(connecting) => {
-                    if let Some(err) = connecting.failure_reason() {
-                        connecting.consume_error();
-                        return Err(err);
+                    if let Some(err) = connecting.take_connect_error() {
+                        Err(err)
+                    } else if connecting.is_connected() {
+                        continue;
+                    } else if connecting.is_refused_consumed() {
+                        Ok(0)
+                    } else {
+                        Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
                     }
-                    if connecting.is_refused_consumed() {
-                        return Ok(0);
-                    }
-                    Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
                 }
                 inner::Inner::Init(_) | inner::Inner::Closed(_) => Err(SystemError::ENOTCONN),
                 _ => Err(SystemError::EINVAL),
             };
 
+            self.update_events();
             match iter_result {
                 Ok(n) => {
                     total_read += n;
@@ -553,7 +584,39 @@ impl TcpSocket {
         self.recv_to_user_buffer_impl(user_buffer, self.is_nonblock(), false)
     }
 
-    pub fn try_send(&self, buf: &[u8]) -> Result<usize, SystemError> {
+    pub(super) fn take_pending_error(&self) -> Option<SystemError> {
+        match self.inner.read().as_ref() {
+            Some(inner::Inner::Connecting(connecting)) => connecting.take_error(),
+            Some(inner::Inner::Established(established)) => {
+                established.with_mut(|socket| socket.take_reset().map(inner::reset_error))
+            }
+            _ => None,
+        }
+    }
+
+    pub(super) fn try_send(&self, buf: &[u8], report_error: bool) -> Result<usize, SystemError> {
+        // Background cork flushes use try_send_direct and must leave the error
+        // available to SO_ERROR or a subsequent user I/O operation.
+        if report_error {
+            if let Some(error) = self.take_pending_error() {
+                self.update_events();
+                return Err(error);
+            }
+        }
+        let result = self.try_send_inner(buf);
+        if let Err(error) = result {
+            let error = if report_error {
+                self.take_pending_error().unwrap_or(error)
+            } else {
+                error
+            };
+            self.update_events();
+            return Err(error);
+        }
+        result
+    }
+
+    fn try_send_inner(&self, buf: &[u8]) -> Result<usize, SystemError> {
         if buf.is_empty() {
             // Linux 语义：对 SOCK_STREAM，写入 0 字节应当立刻成功返回 0，且不阻塞。
             return Ok(0);
@@ -562,78 +625,66 @@ impl TcpSocket {
             return Err(SystemError::EPIPE);
         }
 
-        // If there are pending cork-buffered bytes (e.g., uncork flush hit EAGAIN),
-        // keep ordering by enqueueing new bytes behind them, and opportunistically flush.
-        {
-            let mut cork_buf = self.cork_buf.lock();
+        // Cork enqueue uses the same cork -> inner -> SocketSet order as
+        // shutdown. Checking the transport and accepting bytes are atomic with
+        // respect to ingress, including a reset whose SO_ERROR was consumed.
+        let cork_enabled = self
+            .options
+            .tcp_cork
+            .load(core::sync::atomic::Ordering::Relaxed);
+        let mut cork_buf = self.cork_buf.lock();
+        if !cork_buf.is_empty() || cork_enabled {
             if self.is_send_shutdown() {
                 return Err(SystemError::EPIPE);
             }
-            if !cork_buf.is_empty() {
-                let cap = self
-                    .send_buf_size()
-                    .load(core::sync::atomic::Ordering::Relaxed);
+            let cap = self
+                .send_buf_size()
+                .load(core::sync::atomic::Ordering::Relaxed);
+            let mut enqueue = |socket: &mut smoltcp::socket::tcp::Socket| {
+                if !socket.may_send() {
+                    return if matches!(
+                        socket.state(),
+                        smoltcp::socket::tcp::State::SynSent
+                            | smoltcp::socket::tcp::State::SynReceived
+                    ) {
+                        Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
+                    } else {
+                        Err(SystemError::EPIPE)
+                    };
+                }
                 let free = cap.saturating_sub(cork_buf.len());
                 if free == 0 {
                     return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
                 }
                 let n = core::cmp::min(free, buf.len());
                 cork_buf.extend_from_slice(&buf[..n]);
-                drop(cork_buf);
-
-                if !self
-                    .options
-                    .tcp_cork
-                    .load(core::sync::atomic::Ordering::Relaxed)
-                {
-                    if let Err(e) = self.flush_cork_buffer() {
-                        if e != SystemError::EAGAIN_OR_EWOULDBLOCK {
-                            return Err(e);
-                        }
+                Ok(n)
+            };
+            let accepted = match self.inner.read().as_ref() {
+                Some(inner::Inner::Established(established)) => established.with_mut(&mut enqueue),
+                Some(inner::Inner::Connecting(connecting)) => connecting.with_mut(&mut enqueue),
+                _ => Err(SystemError::EPIPE),
+            }?;
+            let flush = !cork_enabled
+                || cork_buf.len()
+                    >= self
+                        .tcp_max_seg()
+                        .load(core::sync::atomic::Ordering::Relaxed);
+            drop(cork_buf);
+            if flush {
+                if let Err(error) = self.flush_cork_buffer() {
+                    if error == SystemError::EAGAIN_OR_EWOULDBLOCK {
                         self.maybe_schedule_cork_timeout();
                     }
-                } else {
-                    self.maybe_schedule_cork_timeout();
-                }
-                return Ok(n);
-            }
-        }
-
-        if self
-            .options
-            .tcp_cork
-            .load(core::sync::atomic::Ordering::Relaxed)
-        {
-            let mss = self
-                .tcp_max_seg()
-                .load(core::sync::atomic::Ordering::Relaxed);
-            let cap = self
-                .send_buf_size()
-                .load(core::sync::atomic::Ordering::Relaxed);
-            let mut cork_buf = self.cork_buf.lock();
-            if self.is_send_shutdown() {
-                return Err(SystemError::EPIPE);
-            }
-            let free = cap.saturating_sub(cork_buf.len());
-            if free == 0 {
-                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-            }
-            let n = core::cmp::min(free, buf.len());
-            cork_buf.extend_from_slice(&buf[..n]);
-            if cork_buf.len() >= mss {
-                drop(cork_buf);
-                if let Err(e) = self.flush_cork_buffer() {
-                    if e != SystemError::EAGAIN_OR_EWOULDBLOCK {
-                        return Err(e);
-                    }
-                    self.maybe_schedule_cork_timeout();
+                    // Bytes were accepted before the flush. Preserve a later
+                    // error and report this successful short write.
                 }
             } else {
-                drop(cork_buf);
                 self.maybe_schedule_cork_timeout();
             }
-            return Ok(n);
+            return Ok(accepted);
         }
+        drop(cork_buf);
         self.try_send_direct(buf)
     }
 
@@ -718,6 +769,18 @@ impl TcpSocket {
         if let Some(inner) = writer.take() {
             let ret = match inner {
                 inner::Inner::Connecting(conn) => {
+                    // A background flush may observe a failed connect, but
+                    // must not consume its result or replace its owner state.
+                    if !conn.is_connected() {
+                        let error = if conn.failure_reason().is_some() || conn.is_refused_consumed()
+                        {
+                            SystemError::EPIPE
+                        } else {
+                            SystemError::EAGAIN_OR_EWOULDBLOCK
+                        };
+                        writer.replace(inner::Inner::Connecting(conn));
+                        return Err(error);
+                    }
                     let (new_inner, res) = conn.into_result();
                     match new_inner {
                         inner::Inner::Established(est) => {

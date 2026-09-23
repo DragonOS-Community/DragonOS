@@ -162,3 +162,4 @@ normal/tcp_namespace_progress
 normal/tcp_listen_backlog
 normal/tcp_connect_confirmation
 normal/netlink_netfilter
+normal/tcp_pending_error

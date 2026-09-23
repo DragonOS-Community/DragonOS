@@ -577,16 +577,11 @@ impl super::TcpSocket {
                 Self::write_i32_opt(value, v)
             }
             PSO::ERROR => {
-                let err = match self.inner.read().as_ref() {
-                    Some(inner::Inner::Connecting(c)) => {
-                        let err = c.failure_reason().map(|e| -e.to_posix_errno()).unwrap_or(0);
-                        if err != 0 {
-                            c.consume_error();
-                        }
-                        err
-                    }
-                    _ => 0,
-                };
+                let err = self
+                    .take_pending_error()
+                    .map(|error| -error.to_posix_errno())
+                    .unwrap_or(0);
+                self.update_events();
                 Self::write_i32_opt(value, err)
             }
             PSO::TYPE => Self::write_i32_opt(value, PSOCK::Stream as i32),

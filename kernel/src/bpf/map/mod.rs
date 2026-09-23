@@ -243,7 +243,8 @@ pub fn bpf_map_create(attr: &bpf_attr) -> Result<usize> {
             Box::new(lru_per_cpu_hash_map)
         }
         _ => {
-            unimplemented!("bpf map type {:?} not implemented", map_meta.map_type)
+            // Linux map_create rejects map types without available map ops.
+            return Err(SystemError::EINVAL);
         }
     };
     let bpf_map = BpfMap::new(map, map_meta);
@@ -361,13 +362,6 @@ pub fn bpf_map_delete_elem(attr: &bpf_attr) -> Result<usize> {
     let key = key_buf.read_from_user(0)?;
     map.inner_map.lock().delete_elem(key)?;
     Ok(0)
-}
-
-/// Iterate and fetch multiple elements in a map.
-///
-/// See https://ebpf-docs.dylanreimerink.nl/linux/syscall/BPF_MAP_LOOKUP_BATCH/
-pub fn bpf_map_lookup_batch(_attr: &bpf_attr) -> Result<usize> {
-    todo!()
 }
 
 /// Look up an element with the given key in the map referred to by the file descriptor fd,

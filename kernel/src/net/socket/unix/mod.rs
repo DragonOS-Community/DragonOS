@@ -8,7 +8,7 @@ use system_error::SystemError;
 
 use self::utils::*;
 
-use super::PSOCK;
+use super::{PSO, PSOCK};
 use crate::process::namespace::net_namespace::NetNamespace;
 use crate::{
     filesystem::vfs::{
@@ -26,6 +26,44 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::hash::Hash;
+use core::sync::atomic::{AtomicBool, Ordering};
+
+/// SOL_SOCKET reuse options shared by AF_UNIX socket types. Unix address
+/// binding does not use SO_REUSEADDR, but the setting is observable per socket.
+#[derive(Debug, Default)]
+pub(super) struct UnixReuseOptions {
+    reuse_addr: AtomicBool,
+}
+
+impl UnixReuseOptions {
+    pub(super) fn set(&self, option: PSO, value: &[u8]) -> Result<(), SystemError> {
+        let source = value.get(..4).ok_or(SystemError::EINVAL)?;
+        let mut bytes = [0u8; 4];
+        bytes.copy_from_slice(source);
+        let enabled = i32::from_ne_bytes(bytes) != 0;
+        match option {
+            PSO::REUSEADDR => {
+                self.reuse_addr.store(enabled, Ordering::Relaxed);
+                Ok(())
+            }
+            PSO::REUSEPORT if enabled => Err(SystemError::EOPNOTSUPP_OR_ENOTSUP),
+            PSO::REUSEPORT => Ok(()),
+            _ => Err(SystemError::ENOPROTOOPT),
+        }
+    }
+
+    pub(super) fn get(&self, option: PSO, value: &mut [u8]) -> Result<usize, SystemError> {
+        let enabled = match option {
+            PSO::REUSEADDR => self.reuse_addr.load(Ordering::Relaxed),
+            PSO::REUSEPORT => false,
+            _ => return Err(SystemError::ENOPROTOOPT),
+        };
+        Ok(super::common::write_i32_getsockopt(
+            value,
+            i32::from(enabled),
+        ))
+    }
+}
 
 /// Unix domain credential payload for SCM_CREDENTIALS.
 ///

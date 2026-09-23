@@ -104,6 +104,7 @@ pub struct UnixStreamSocket {
     is_seqpacket: bool,
 
     passcred: AtomicBool,
+    reuse_options: super::UnixReuseOptions,
 
     linger: Mutex<Linger>,
 
@@ -151,6 +152,7 @@ impl UnixStreamSocket {
             fasync_items: FAsyncItems::default(),
             peer: Mutex::new(None),
             passcred: AtomicBool::new(false),
+            reuse_options: super::UnixReuseOptions::default(),
 
             linger: Mutex::new(Linger::default()),
             connreset_pending: AtomicBool::new(false),
@@ -183,6 +185,7 @@ impl UnixStreamSocket {
             fasync_items: FAsyncItems::default(),
             peer: Mutex::new(None),
             passcred: AtomicBool::new(false),
+            reuse_options: super::UnixReuseOptions::default(),
 
             linger: Mutex::new(Linger::default()),
             connreset_pending: AtomicBool::new(false),
@@ -676,6 +679,9 @@ impl Socket for UnixStreamSocket {
         let opt = crate::net::socket::PSO::try_from(optname as u32)
             .map_err(|_| SystemError::ENOPROTOOPT)?;
         match opt {
+            crate::net::socket::PSO::REUSEADDR | crate::net::socket::PSO::REUSEPORT => {
+                self.reuse_options.set(opt, optval)
+            }
             crate::net::socket::PSO::SNDBUF | crate::net::socket::PSO::SNDBUFFORCE => {
                 let requested = Self::parse_i32_opt(optval)?;
                 if requested < 0 {
@@ -1445,6 +1451,9 @@ impl Socket for UnixStreamSocket {
         let opt =
             crate::net::socket::PSO::try_from(name as u32).map_err(|_| SystemError::ENOPROTOOPT)?;
         match opt {
+            crate::net::socket::PSO::REUSEADDR | crate::net::socket::PSO::REUSEPORT => {
+                self.reuse_options.get(opt, value)
+            }
             crate::net::socket::PSO::TYPE => {
                 let v = if self.is_seqpacket {
                     PSOCK::SeqPacket as i32

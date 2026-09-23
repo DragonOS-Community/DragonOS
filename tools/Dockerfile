@@ -1,4 +1,4 @@
-FROM ubuntu:jammy
+FROM ubuntu:24.04
 
 # 设置环境变量
 ENV TZ=Asia/Shanghai
@@ -16,7 +16,8 @@ COPY *.sh ./
 
 # 设置sudo免密码
 RUN apt update && \
-    apt install --no-install-recommends -y ca-certificates curl gnupg wget sudo apt-utils && \
+    apt install --no-install-recommends -y \
+        apt-utils ca-certificates curl gnupg libbpf-dev linux-libc-dev sudo wget && \
     bash bootstrap.sh --default --ci && \
     git config --global --add safe.directory '*' && \
     sudo apt autoremove -q -y && \

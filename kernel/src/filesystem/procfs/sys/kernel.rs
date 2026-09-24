@@ -12,7 +12,7 @@ use crate::{
         vfs::{FilePrivateData, IndexNode, InodeMode},
     },
     libs::mutex::MutexGuard,
-    process::{namespace::uts_namespace::NewUtsName, ProcessManager},
+    process::{cred::CAP_LAST_CAP, namespace::uts_namespace::NewUtsName, ProcessManager},
 };
 use alloc::{
     format,
@@ -49,6 +49,16 @@ impl DirOps for KernelDirOps {
         name: &str,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         match name {
+            "cap_last_cap" => {
+                let mut cached_children = dir.cached_children().write();
+                if let Some(child) = cached_children.get(name) {
+                    return Ok(child.clone());
+                }
+
+                let inode = CapLastCapFileOps::new_inode(dir.self_ref_weak().clone());
+                cached_children.insert(name.to_string(), inode.clone());
+                return Ok(inode);
+            }
             "printk" => {
                 let mut cached_children = dir.cached_children().write();
                 if let Some(child) = cached_children.get(name) {
@@ -96,6 +106,9 @@ impl DirOps for KernelDirOps {
     fn populate_children(&self, dir: &ProcDir<Self>) {
         let mut cached_children = dir.cached_children().write();
         cached_children
+            .entry("cap_last_cap".to_string())
+            .or_insert_with(|| CapLastCapFileOps::new_inode(dir.self_ref_weak().clone()));
+        cached_children
             .entry("printk".to_string())
             .or_insert_with(|| PrintkFileOps::new_inode(dir.self_ref_weak().clone()));
         cached_children
@@ -118,6 +131,37 @@ impl DirOps for KernelDirOps {
             .or_insert_with(|| {
                 UtsStringFileOps::new_inode(dir.self_ref_weak().clone(), UtsStringKind::Domainname)
             });
+    }
+}
+
+#[derive(Debug)]
+struct CapLastCapFileOps;
+
+impl CapLastCapFileOps {
+    fn new_inode(parent: Weak<dyn IndexNode>) -> Arc<dyn IndexNode> {
+        ProcFileBuilder::new(Self, InodeMode::from_bits_truncate(0o444))
+            .parent(parent)
+            .read_only_sysctl()
+            .build()
+            .unwrap()
+    }
+}
+
+impl FileOps for CapLastCapFileOps {
+    fn read_at(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &mut [u8],
+        _data: MutexGuard<FilePrivateData>,
+    ) -> Result<usize, SystemError> {
+        // Linux proc_dointvec treats every non-zero read position as EOF,
+        // including a short first read.
+        if offset != 0 {
+            return Ok(0);
+        }
+        let content = format!("{CAP_LAST_CAP}\n");
+        proc_read(0, len, buf, content.as_bytes())
     }
 }
 

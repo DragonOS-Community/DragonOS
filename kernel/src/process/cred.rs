@@ -26,10 +26,13 @@ pub const SUID_DUMP_ROOT: i32 = 2;
 /// Global suid_dumpable switch (/proc/sys/fs/suid_dumpable).
 pub static SUID_DUMPABLE: AtomicI32 = AtomicI32::new(SUID_DUMP_DISABLE);
 
+/// Highest capability number recognized by this kernel (Linux 6.6: CAP_CHECKPOINT_RESTORE).
+pub const CAP_LAST_CAP: usize = 40;
+
 bitflags! {
     pub struct CAPFlags:u64{
         const CAP_EMPTY_SET = 0;
-        const CAP_FULL_SET = (1 << 41) - 1;
+        const CAP_FULL_SET = (1u64 << (CAP_LAST_CAP + 1)) - 1;
 
         // 具体的capability定义，与Linux保持一致
         const CAP_CHOWN = 1 << 0;
@@ -72,7 +75,7 @@ bitflags! {
         const CAP_AUDIT_READ = 1 << 37;
         const CAP_PERFMON = 1 << 38;
         const CAP_BPF = 1 << 39;
-        const CAP_CHECKPOINT_RESTORE = 1 << 40;
+        const CAP_CHECKPOINT_RESTORE = 1 << CAP_LAST_CAP;
     }
 }
 

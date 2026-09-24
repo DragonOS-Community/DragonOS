@@ -40,6 +40,8 @@ static ALL_PROCESS: SpinLock<Option<HashMap<RawPid, Arc<ProcessControlBlock>>>> 
     SpinLock::new(None);
 pub(super) static PTRACE_RELATION_LOCK: SpinLock<()> = SpinLock::new(());
 static NR_VISIBLE_THREADS: AtomicUsize = AtomicUsize::new(0);
+static MAX_THREADS: AtomicUsize = AtomicUsize::new(20);
+const MAX_THREADS_SYSCTL: usize = 0x3fff_ffff;
 static TOTAL_FORKS: AtomicU64 = AtomicU64::new(0);
 static TOTAL_CONTEXT_SWITCHES: AtomicU64 = AtomicU64::new(0);
 
@@ -97,6 +99,38 @@ pub(crate) fn account_successful_fork() {
 #[inline]
 pub fn nr_threads() -> u32 {
     NR_VISIBLE_THREADS.load(Ordering::Relaxed) as u32
+}
+
+#[inline]
+pub fn max_threads() -> usize {
+    MAX_THREADS.load(Ordering::Relaxed)
+}
+
+pub fn set_max_threads(value: usize) -> Result<(), SystemError> {
+    if !(1..=MAX_THREADS_SYSCTL).contains(&value) {
+        return Err(SystemError::EINVAL);
+    }
+    MAX_THREADS.store(value, Ordering::Relaxed);
+    Ok(())
+}
+
+fn init_max_threads() {
+    use crate::arch::mm::LockedFrameAllocator;
+    use crate::mm::allocator::page_frame::FrameAllocator;
+    use crate::process::kstack::KernelStack;
+
+    let total_bytes = unsafe { LockedFrameAllocator.usage() }.total().bytes();
+    // A PCB owns both a kernel and a syscall stack. Guarded stacks reserve
+    // another stack-sized physical region for each guard area.
+    let stack_bytes = 2
+        * KernelStack::SIZE
+        * if cfg!(feature = "kstack_protect") {
+            2
+        } else {
+            1
+        };
+    let limit = (total_bytes / (stack_bytes * 8)).clamp(20, MAX_THREADS_SYSCTL);
+    MAX_THREADS.store(limit, Ordering::Relaxed);
 }
 
 #[inline]
@@ -264,6 +298,8 @@ impl ProcessManager {
         {
             panic!("ProcessManager has been initialized!");
         }
+
+        init_max_threads();
 
         unsafe {
             compiler_fence(Ordering::SeqCst);

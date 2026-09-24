@@ -140,7 +140,9 @@ impl<F: FileOps + 'static> IndexNode for ProcFile<F> {
     fn as_any_ref(&self) -> &dyn core::any::Any;
     fn set_metadata(&self, metadata: &Metadata) -> Result<(), SystemError> {
         let current = self.common.metadata()?;
-        if current.flags.contains(InodeFlags::S_SYSCTL_READONLY)
+        if current
+            .flags
+            .intersects(InodeFlags::S_SYSCTL_READONLY | InodeFlags::S_PROC_SYSCTL)
             && (current.mode != metadata.mode
                 || current.uid != metadata.uid
                 || current.gid != metadata.gid)
@@ -162,7 +164,7 @@ impl<F: FileOps + 'static> IndexNode for ProcFile<F> {
             .common
             .metadata()?
             .flags
-            .contains(InodeFlags::S_SYSCTL_READONLY)
+            .intersects(InodeFlags::S_SYSCTL_READONLY | InodeFlags::S_PROC_SYSCTL)
             && mask.intersects(SetMetadataMask::MODE | SetMetadataMask::UID | SetMetadataMask::GID)
         {
             return Err(SystemError::EPERM);

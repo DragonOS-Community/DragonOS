@@ -26,6 +26,7 @@ normal/open_dangling_symlink
 normal/utimensat_symlink
 normal/mount_move
 normal/mount_limit
+normal/threads_max
 normal/mount_object_topology
 normal/overlayfs_semantics
 normal/overlayfs_mount_validation

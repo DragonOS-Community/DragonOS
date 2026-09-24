@@ -58,8 +58,8 @@ pub(crate) use manager::{
 };
 #[allow(unused_imports)]
 pub use manager::{
-    nr_context_switches, nr_threads, total_forks, ProcessManager, SwitchResult,
-    PROCESS_SWITCH_RESULT,
+    max_threads, nr_context_switches, nr_threads, set_max_threads, total_forks, ProcessManager,
+    SwitchResult, PROCESS_SWITCH_RESULT,
 };
 use manager::{PTRACE_RELATION_LOCK, __PROCESS_MANAGEMENT_INIT_DONE};
 use pid::alloc_pid;

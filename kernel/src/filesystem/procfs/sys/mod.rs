@@ -5,6 +5,7 @@
 mod fs;
 mod kernel;
 mod net;
+mod numeric;
 mod vm;
 
 use crate::filesystem::{

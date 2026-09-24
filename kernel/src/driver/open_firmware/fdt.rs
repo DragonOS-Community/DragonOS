@@ -307,7 +307,6 @@ impl OpenFirmwareFdtDriver {
         }
 
         let fdt = fdt.unwrap();
-        self.early_reserve_fdt_itself(&fdt);
 
         let reserved_mem_nodes = fdt.memory_reservations();
 
@@ -320,8 +319,15 @@ impl OpenFirmwareFdtDriver {
             }
         }
 
+        // 必须先处理 `/reserved-memory`（其中可能包含固件声明的 no-map 区域），
+        // 再保留 FDT 自身。否则 FDT 落在固件 no-map 区域内部时，
+        // `early_init_dt_reserve_memory` 会因为该区域与已保留的 FDT 重叠而返回
+        // EBUSY，导致固件内存没有被标记保留；随后 bump allocator 会从固件内存
+        // 分配页表，写入时触发 PMP store access fault。
         self.fdt_scan_reserved_mem(&fdt)
             .expect("Failed to scan reserved memory");
+
+        self.early_reserve_fdt_itself(&fdt);
     }
 
     /// 保留fdt自身的内存空间

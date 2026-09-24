@@ -1,4 +1,5 @@
 use core::ptr::addr_of;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 /// 向控制台打印字符串。
 ///
@@ -20,7 +21,32 @@ use core::ptr::addr_of;
 /// console_putstr(message);
 /// ```
 pub fn console_putstr(s: &[u8]) {
-    // 原本的是适配opensbi的, 但是对rustsbi的适配存在问题, 不能正确的解析'\r'
+    // 该函数可能在 `SbiDriver::early_init` 之前被调用（例如 `scm_init`
+    // 的早期日志），此时扩展还没有探测过，先补一次探测，避免误走 legacy 分支。
+    SbiDriver::ensure_probed();
+
+    // 优先使用 Debug Console 扩展（DBCN）。新版 RustSBI 已经移除了
+    // 废弃的 legacy console（EID 0x01），如果只用 `legacy::console_putchar`，
+    // 在它上面运行时会一直空转且没有任何输出。
+    if SbiDriver::extensions().contains(SBIExtensions::CONSOLE) {
+        for &c in s {
+            match c {
+                b'\n' => {
+                    sbi_rt::console_write_byte(b'\r');
+                    sbi_rt::console_write_byte(b'\n');
+                }
+                b'\r' => {
+                    sbi_rt::console_write_byte(b'\r');
+                }
+                _ => {
+                    sbi_rt::console_write_byte(c);
+                }
+            }
+        }
+        return;
+    }
+
+    // 回退到 legacy console，兼容未实现 DBCN 的 SBI 实现（例如 OpenSBI）。
     for &c in s {
         match c {
             b'\n' => {
@@ -72,6 +98,9 @@ bitflags! {
 
 static mut EXTENSIONS: SBIExtensions = SBIExtensions::empty();
 
+/// `early_init` 是否已经完成过一次扩展探测。
+static PROBED: AtomicBool = AtomicBool::new(false);
+
 #[derive(Debug)]
 pub struct SbiDriver;
 
@@ -80,6 +109,18 @@ impl SbiDriver {
     pub fn early_init() {
         unsafe {
             EXTENSIONS = Self::probe_extensions();
+        }
+        PROBED.store(true, Ordering::SeqCst);
+    }
+
+    /// 如果还没有探测过扩展，就先探测一次。
+    ///
+    /// 早期日志（如 `scm_init`）发生在 `early_init` 之前，需要在第一次输出前
+    /// 保证扩展信息可用，否则会错误地回退到 legacy console。
+    #[inline]
+    fn ensure_probed() {
+        if !PROBED.load(Ordering::SeqCst) {
+            Self::early_init();
         }
     }
 

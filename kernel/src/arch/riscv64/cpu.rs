@@ -40,6 +40,26 @@ pub unsafe fn cpu_reset() -> ! {
 
 static mut LOCAL_CONTEXT: Option<PerCpuVar<LocalContext>> = None;
 
+/// 早期启动（堆尚未就绪、`tp` 还未指向堆上的 `LocalContext`）时使用的静态上下文。
+///
+/// `setup_trap_vector()` 一旦安装，任何同步异常都会进入 `handle_exception`，
+/// 而 trap 入口会用 `tp` 去访问 `LocalContext`。堆上的 `LOCAL_CONTEXT` 要等到
+/// `mm_init` 之后才建立，所以这里在安装 trap 向量之前先把 `tp` 指向一个静态
+/// 上下文，避免早期异常在 trap 入口解引用空 `tp` 而无限递归。
+static mut BOOT_LOCAL_CONTEXT: core::mem::MaybeUninit<LocalContext> =
+    core::mem::MaybeUninit::uninit();
+
+/// 在安装 trap 向量之前，把 `tp` 指向静态的启动上下文。
+///
+/// # Safety
+/// 只能在启动 hart 上、且在 `init_local_context()` 建立堆上上下文之前调用一次。
+pub(super) unsafe fn init_boot_local_context(cpu: ProcessorId) {
+    let ctx = &raw mut BOOT_LOCAL_CONTEXT;
+    (*ctx).write(LocalContext::new(cpu));
+    riscv::register::sscratch::write(0);
+    riscv::register::tp::write(ctx as usize);
+}
+
 #[inline(always)]
 pub(super) fn local_context() -> &'static PerCpuVar<LocalContext> {
     unsafe { LOCAL_CONTEXT.as_ref().unwrap() }

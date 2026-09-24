@@ -5320,6 +5320,10 @@ impl IndexNode for MountFSInode {
         Ok(md)
     }
 
+    fn reported_ino(&self, metadata: &super::Metadata) -> InodeId {
+        self.dentry.inode.reported_ino(metadata)
+    }
+
     fn inode_generation(&self) -> u64 {
         self.dentry.registry_generation
     }

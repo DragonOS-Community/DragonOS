@@ -112,6 +112,10 @@ impl<Ops: DirOps + 'static> IndexNode for ProcDir<Ops> {
         Ok(metadata)
     }
 
+    fn reported_ino(&self, metadata: &Metadata) -> InodeId {
+        self.inner.reported_ino(metadata)
+    }
+
     fn read_at(
         &self,
         _offset: usize,
@@ -242,6 +246,10 @@ impl<Ops: DirOps + 'static> IndexNode for ProcDir<Ops> {
 }
 
 pub trait DirOps: Sync + Send + Sized + Debug {
+    fn reported_ino(&self, metadata: &Metadata) -> InodeId {
+        metadata.inode_id
+    }
+
     fn lookup_child(
         &self,
         dir: &ProcDir<Self>,

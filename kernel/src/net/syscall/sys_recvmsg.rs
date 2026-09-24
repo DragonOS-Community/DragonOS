@@ -2,13 +2,18 @@ use system_error::SystemError;
 
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_RECVMSG;
-use crate::filesystem::vfs::{file::FileFlags, iov::IoVecs};
+use crate::filesystem::vfs::{
+    file::{File, FileFlags},
+    iov::IoVecs,
+    FileType,
+};
 use crate::net::posix::MsgHdr;
 use crate::net::socket;
 use crate::process::ProcessManager;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
 use crate::syscall::user_access::{UserBufferReader, UserBufferWriter};
 use alloc::string::ToString;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 /// System call handler for the `recvmsg` syscall
@@ -95,6 +100,22 @@ pub(super) fn do_recvmsg(
     flags: u32,
     from_user: bool,
 ) -> Result<usize, SystemError> {
+    let file = {
+        let binding = ProcessManager::current_pcb().fd_table();
+        let guard = binding.read();
+        guard.get_file_by_fd(fd as i32).ok_or(SystemError::EBADF)?
+    };
+    do_recvmsg_with_file(&file, msg, flags, from_user)
+}
+
+/// Keep the same open file alive across recvmsg/recvmmsg waits. In particular,
+/// do not look up the fd a second time after another thread can close/reuse it.
+pub(super) fn do_recvmsg_with_file(
+    file: &Arc<File>,
+    msg: *mut MsgHdr,
+    flags: u32,
+    from_user: bool,
+) -> Result<usize, SystemError> {
     if msg.is_null() {
         return Err(SystemError::EFAULT);
     }
@@ -115,16 +136,14 @@ pub(super) fn do_recvmsg(
     let iovs = unsafe { IoVecs::from_user(kmsg.msg_iov, kmsg.msg_iovlen, true)? };
 
     // Honor O_NONBLOCK set via fcntl(F_SETFL) by translating it to MSG_DONTWAIT.
-    let file_nonblock = {
-        let binding = ProcessManager::current_pcb().fd_table();
-        let guard = binding.read();
-        let file = guard.get_file_by_fd(fd as i32).ok_or(SystemError::EBADF)?;
-        file.flags().contains(FileFlags::O_NONBLOCK)
-    };
+    if file.file_type() != FileType::Socket {
+        return Err(SystemError::ENOTSOCK);
+    }
+    let file_nonblock = file.flags().contains(FileFlags::O_NONBLOCK);
 
     let (buf, recv_size, used_recv_msg) = {
-        let socket_inode = ProcessManager::current_pcb().get_socket_inode(fd as i32)?;
-        let socket = socket_inode.as_socket().unwrap();
+        let socket_inode = file.inode();
+        let socket = socket_inode.as_socket().ok_or(SystemError::ENOTSOCK)?;
 
         let mut pmsg_flags = socket::PMSG::from_bits_truncate(flags);
         if file_nonblock {

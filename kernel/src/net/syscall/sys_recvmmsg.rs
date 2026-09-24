@@ -3,7 +3,7 @@ use system_error::SystemError;
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_RECVMMSG;
 use crate::filesystem::epoll::EPollEventType;
-use crate::filesystem::vfs::file::FileFlags;
+use crate::filesystem::vfs::{file::FileFlags, FileType};
 use crate::libs::wait_queue::{TimeoutWaker, Waiter};
 use crate::net::posix::MsgHdr;
 use crate::net::socket;
@@ -78,15 +78,17 @@ impl Syscall for SysRecvmmsgHandle {
             (Some(Duration::from_micros(us)), Some(Instant::now()))
         };
 
-        let file_nonblock = {
+        let file = {
             let binding = ProcessManager::current_pcb().fd_table();
             let guard = binding.read();
-            let file = guard.get_file_by_fd(fd as i32).ok_or(SystemError::EBADF)?;
-            file.flags().contains(FileFlags::O_NONBLOCK)
+            guard.get_file_by_fd(fd as i32).ok_or(SystemError::EBADF)?
         };
-
-        let socket_inode = ProcessManager::current_pcb().get_socket_inode(fd as i32)?;
-        let sock = socket_inode.as_socket().unwrap();
+        if file.file_type() != FileType::Socket {
+            return Err(SystemError::ENOTSOCK);
+        }
+        let file_nonblock = file.flags().contains(FileFlags::O_NONBLOCK);
+        let socket_inode = file.inode();
+        let sock = socket_inode.as_socket().ok_or(SystemError::ENOTSOCK)?;
 
         // Wait-for-one semantics: after receiving the first message, don't block for subsequent.
         let wait_for_one = !timeout.is_null() || (flags & socket::PMSG::WAITFORONE.bits()) != 0;
@@ -121,8 +123,8 @@ impl Syscall for SysRecvmmsgHandle {
             let base = unsafe { (msgvec as *mut u8).add(i * core::mem::size_of::<MMsgHdr>()) };
             let msg_hdr_ptr = base as *mut MsgHdr;
 
-            match crate::net::syscall::sys_recvmsg::do_recvmsg(
-                fd,
+            match crate::net::syscall::sys_recvmsg::do_recvmsg_with_file(
+                &file,
                 msg_hdr_ptr,
                 this_flags,
                 frame.is_from_user(),

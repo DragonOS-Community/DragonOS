@@ -46,7 +46,11 @@ fn is_cgroup_attach_type(value: u32) -> bool {
     )
 }
 
-fn write_query_field(base: *mut u8, offset: usize, value: u32) -> Result<(), SystemError> {
+pub(super) fn write_query_field(
+    base: *mut u8,
+    offset: usize,
+    value: u32,
+) -> Result<(), SystemError> {
     let addr = (base as usize)
         .checked_add(offset)
         .ok_or(SystemError::EFAULT)?;
@@ -81,6 +85,14 @@ pub(super) fn bpf_prog_query(attr: &bpf_attr, user_attr: *mut u8) -> Result<usiz
         return Err(SystemError::EINVAL);
     }
 
+    let effective = query.query_flags & BPF_F_QUERY_EFFECTIVE != 0;
+    if effective && query.prog_attach_flags != 0 {
+        return Err(SystemError::EINVAL);
+    }
+    if query.attach_type == bpf_attach_type::BPF_CGROUP_DEVICE as u32 {
+        return super::cgroup_device::query(attr, user_attr);
+    }
+
     let fd = unsafe { query.__bindgen_anon_1.target_fd } as i32;
     let file = ProcessManager::current_pcb()
         .fd_table()
@@ -93,10 +105,6 @@ pub(super) fn bpf_prog_query(attr: &bpf_attr, user_attr: *mut u8) -> Result<usiz
         return Err(SystemError::ENOENT);
     }
 
-    let effective = query.query_flags & BPF_F_QUERY_EFFECTIVE != 0;
-    if effective && query.prog_attach_flags != 0 {
-        return Err(SystemError::EINVAL);
-    }
     let prog_cnt = unsafe { query.__bindgen_anon_2.prog_cnt };
     if query.attach_type == bpf_attach_type::BPF_LSM_CGROUP as u32
         && !effective
@@ -107,8 +115,7 @@ pub(super) fn bpf_prog_query(attr: &bpf_attr, user_attr: *mut u8) -> Result<usiz
         return Err(SystemError::EINVAL);
     }
 
-    // BPF_PROG_ATTACH and BPF_LINK_CREATE cannot install cgroup programs yet.
-    // When they are added, query must read the same attachment state.
+    // Other cgroup attachment types still have no management support.
     let zero: u32 = 0;
     write_query_field(
         user_attr,

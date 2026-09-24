@@ -1,4 +1,5 @@
 use crate::include::bindings::linux_bpf::{bpf_attach_type, bpf_attr, bpf_prog_type};
+use crate::process::cred::{capable, CAPFlags};
 use crate::syscall::user_access::{check_and_clone_cstr, UserBufferReader};
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -86,10 +87,31 @@ impl TryFrom<&bpf_attr> for BpfProgMeta {
         let prog_type = bpf_prog_type::from_u32(u.prog_type).ok_or(SystemError::EINVAL)?;
         let expected_attach_type =
             bpf_attach_type::from_u32(u.expected_attach_type).ok_or(SystemError::EINVAL)?;
+        // Bound and authorize the request before copying any user-controlled
+        // program or license data. The device interpreter has a deliberately
+        // smaller bound than Linux's general-purpose verifier.
+        let is_device = prog_type == bpf_prog_type::BPF_PROG_TYPE_CGROUP_DEVICE;
+        if is_device
+            && (!(capable(CAPFlags::CAP_BPF) || capable(CAPFlags::CAP_SYS_ADMIN))
+                || !(capable(CAPFlags::CAP_NET_ADMIN) || capable(CAPFlags::CAP_SYS_ADMIN)))
+        {
+            return Err(SystemError::EPERM);
+        }
+        let max_insns = if is_device { 8192 } else { 1_000_000 };
+        if u.insn_cnt == 0 || u.insn_cnt > max_insns {
+            return Err(SystemError::E2BIG);
+        }
+        let insns_len = (u.insn_cnt as usize)
+            .checked_mul(8)
+            .ok_or(SystemError::E2BIG)?;
         unsafe {
-            let insns_buf =
-                UserBufferReader::new(u.insns as *mut u8, u.insn_cnt as usize * 8, true)?;
-            let insns = insns_buf.read_from_user::<u8>(0)?.to_vec();
+            let insns_buf = UserBufferReader::new(u.insns as *mut u8, insns_len, true)?;
+            let mut insns = Vec::new();
+            insns
+                .try_reserve_exact(insns_len)
+                .map_err(|_| SystemError::ENOMEM)?;
+            insns.resize(insns_len, 0);
+            insns_buf.copy_from_user_protected(&mut insns, 0)?;
             let name_slice =
                 core::slice::from_raw_parts(u.prog_name.as_ptr() as *const u8, u.prog_name.len());
             let prog_name = CStr::from_bytes_until_nul(name_slice)
@@ -97,7 +119,8 @@ impl TryFrom<&bpf_attr> for BpfProgMeta {
                 .to_str()
                 .map_err(|_| SystemError::EINVAL)?
                 .to_string();
-            let license = check_and_clone_cstr(u.license as *const u8, None)?;
+            // Linux BPF_PROG_LOAD reads at most 127 bytes plus NUL.
+            let license = check_and_clone_cstr(u.license as *const u8, Some(128))?;
             Ok(Self {
                 prog_flags: u.prog_flags,
                 prog_type,

@@ -499,6 +499,10 @@ impl Cgroup2Inode {
             }
         }
         if Arc::ptr_eq(&src, cgroup) {
+            let _cgroup_guard = cgroup_accounting_lock().lock();
+            if !cgroup_root().is_online(cgroup) {
+                return Err(SystemError::ENOENT);
+            }
             return Ok(buf.len());
         }
         Self::check_attach_permissions(this.fs().root_inode(), &src, cgroup)?;
@@ -669,33 +673,28 @@ impl IndexNode for Cgroup2Inode {
         Cgroup2Inode::prune_stale_dir_cache(&this)?;
         let child = Cgroup2Inode::lookup_child(&this, name)?;
 
-        let _cgroup = {
+        let child_cgroup = {
             let inner = child.inner.lock();
             match &inner.kind {
-                Cgroup2InodeKind::Dir { cgroup, .. } => {
-                    if cgroup.has_children() {
-                        return Err(SystemError::ENOTEMPTY);
-                    }
-                    if cgroup.has_tasks() {
-                        return Err(SystemError::EBUSY);
-                    }
-                    cgroup.clone()
-                }
+                Cgroup2InodeKind::Dir { cgroup, .. } => cgroup.clone(),
                 _ => return Err(SystemError::ENOTDIR),
             }
         };
-
-        {
-            let parent_cgroup = this.inner.lock();
-            if let Cgroup2InodeKind::Dir { cgroup: p, .. } = &parent_cgroup.kind {
-                cgroup_root().remove_child(p, name)?;
-            }
-        }
+        let parent_cgroup = this.cgroup().ok_or(SystemError::ENOTDIR)?;
+        // Do not hold an inode spin lock while waiting for the cgroup
+        // structure mutex. The core transaction checks tasks, reserved fork
+        // charges and online state together with removal.
+        cgroup_root().remove_child(&parent_cgroup, name, &child_cgroup)?;
 
         let mut inner = self.inner.lock();
         match &mut inner.kind {
             Cgroup2InodeKind::Dir { children, .. } => {
-                children.remove(name);
+                if children
+                    .get(name)
+                    .is_some_and(|cached| Arc::ptr_eq(cached, &child))
+                {
+                    children.remove(name);
+                }
                 Ok(())
             }
             _ => Err(SystemError::ENOTDIR),

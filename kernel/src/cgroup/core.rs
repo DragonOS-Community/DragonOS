@@ -3,15 +3,49 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
+use core::cmp::Reverse;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use hashbrown::{HashMap, HashSet};
 use system_error::SystemError;
 
 use crate::{
+    bpf::prog::{device::DeviceAccess, BpfProg},
     cgroup::{CgroupCpuState, CgroupFreezerState, CgroupMemoryState},
-    libs::{rwlock::RwLock, spinlock::SpinLock},
+    include::bindings::linux_bpf::{
+        bpf_prog_type, BPF_F_ALLOW_MULTI, BPF_F_ALLOW_OVERRIDE, BPF_F_REPLACE,
+    },
+    libs::{mutex::Mutex, rwlock::RwLock, spinlock::SpinLock},
     process::RawPid,
 };
+
+/// `BPF_F_PREORDER` is not generated in the current Linux BPF bindings.
+pub const BPF_DEVICE_F_PREORDER: u32 = 1 << 6;
+const BPF_CGROUP_MAX_PROGS: usize = 64;
+type DeviceSnapshotUpdates = Vec<(Arc<CgroupNode>, Arc<Vec<Arc<BpfProg>>>)>;
+
+#[derive(Debug, Clone)]
+struct AttachedDeviceProgram {
+    prog: Arc<BpfProg>,
+    flags: u32,
+}
+
+#[derive(Debug)]
+struct DeviceBpfState {
+    direct: Vec<AttachedDeviceProgram>,
+    flags: u32,
+    /// Immutable effective chain; readers only clone this Arc under the node lock.
+    effective: Arc<Vec<Arc<BpfProg>>>,
+}
+
+impl DeviceBpfState {
+    fn empty() -> Self {
+        Self {
+            direct: Vec::new(),
+            flags: 0,
+            effective: Arc::new(Vec::new()),
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct CgroupNode {
@@ -29,6 +63,7 @@ pub struct CgroupNode {
     local_pids_counter: AtomicUsize,
     subtree_pids_counter: AtomicUsize,
     subtree_task_counter: AtomicUsize,
+    device_bpf: RwLock<DeviceBpfState>,
 }
 
 impl CgroupNode {
@@ -48,6 +83,7 @@ impl CgroupNode {
             local_pids_counter: AtomicUsize::new(0),
             subtree_pids_counter: AtomicUsize::new(0),
             subtree_task_counter: AtomicUsize::new(0),
+            device_bpf: RwLock::new(DeviceBpfState::empty()),
         })
     }
 
@@ -67,6 +103,7 @@ impl CgroupNode {
             local_pids_counter: AtomicUsize::new(0),
             subtree_pids_counter: AtomicUsize::new(0),
             subtree_task_counter: AtomicUsize::new(0),
+            device_bpf: RwLock::new(DeviceBpfState::empty()),
         })
     }
 
@@ -298,6 +335,19 @@ impl CgroupNode {
 
         false
     }
+
+    /// Apply the complete effective chain to one device operation. Linux does
+    /// not short-circuit this chain when a program denies access.
+    pub fn allows_device_access(&self, access: DeviceAccess) -> bool {
+        let programs = self.device_bpf.read().effective.clone();
+        let mut allowed = true;
+        for program in programs.iter() {
+            if !program.run_device(access) {
+                allowed = false;
+            }
+        }
+        allowed
+    }
 }
 
 #[derive(Debug)]
@@ -305,6 +355,9 @@ pub struct CgroupRoot {
     root: Arc<CgroupNode>,
     next_id: AtomicUsize,
     all_nodes: SpinLock<HashMap<usize, Arc<CgroupNode>>>,
+    /// Serializes hierarchy changes and device-program state transitions. An
+    /// accounting-lock holder must never acquire this sleeping lock.
+    structure_lock: Mutex<()>,
 }
 
 impl CgroupRoot {
@@ -317,6 +370,7 @@ impl CgroupRoot {
             root,
             next_id: AtomicUsize::new(2),
             all_nodes: SpinLock::new(all_nodes),
+            structure_lock: Mutex::new(()),
         })
     }
 
@@ -329,6 +383,13 @@ impl CgroupRoot {
         self.all_nodes.lock().get(&id).cloned()
     }
 
+    pub fn is_online(&self, node: &Arc<CgroupNode>) -> bool {
+        self.all_nodes
+            .lock()
+            .get(&node.id())
+            .is_some_and(|online| Arc::ptr_eq(online, node))
+    }
+
     pub fn create_child(
         &self,
         parent: &Arc<CgroupNode>,
@@ -337,42 +398,369 @@ impl CgroupRoot {
         if name.is_empty() || name == "." || name == ".." || name.contains('/') {
             return Err(SystemError::EINVAL);
         }
-        //先找寻有无节点，避免重复创建
-        {
-            let children = parent.children.read();
-            if let Some(existing) = children.get(name) {
-                return Ok(existing.clone());
-            }
+        let _structure_guard = self.structure_lock.lock();
+        if !self.is_online(parent) {
+            return Err(SystemError::ENOENT);
+        }
+        if let Some(existing) = parent.children.read().get(name) {
+            return Ok(existing.clone());
         }
 
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let child = CgroupNode::new_child(id, name.to_string(), parent);
-
-        {
-            let mut children = parent.children.write();
-            if let Some(existing) = children.get(name) {
-                return Ok(existing.clone());
-            }
-            children.insert(name.to_string(), child.clone());
-        }
+        child.device_bpf.write().effective = parent.device_bpf.read().effective.clone();
+        parent
+            .children
+            .write()
+            .insert(name.to_string(), child.clone());
 
         self.all_nodes.lock().insert(id, child.clone());
         Ok(child)
     }
 
-    pub fn remove_child(&self, parent: &Arc<CgroupNode>, name: &str) -> Result<(), SystemError> {
-        let child = {
-            let children = parent.children.read();
-            children.get(name).cloned().ok_or(SystemError::ENOENT)?
-        };
-        //有孩子时返回busy错误
-        if child.has_children() || child.has_tasks() {
-            return Err(SystemError::EBUSY);
+    pub fn remove_child(
+        &self,
+        parent: &Arc<CgroupNode>,
+        name: &str,
+        expected: &Arc<CgroupNode>,
+    ) -> Result<(), SystemError> {
+        let _structure_guard = self.structure_lock.lock();
+        if !self.is_online(parent) {
+            return Err(SystemError::ENOENT);
+        }
+        let child = parent
+            .children
+            .read()
+            .get(name)
+            .cloned()
+            .ok_or(SystemError::ENOENT)?;
+        if !Arc::ptr_eq(&child, expected) {
+            return Err(SystemError::ENOENT);
         }
 
-        parent.children.write().remove(name);
-        self.all_nodes.lock().remove(&child.id());
+        // A fork reserves a pids charge before publishing task membership.
+        // Keep the accounting lock through both the emptiness check and the
+        // online-registry removal so migration/fork cannot target a dying node.
+        let accounting_guard = cgroup_accounting_lock().lock();
+        if child.has_children() {
+            return Err(SystemError::ENOTEMPTY);
+        }
+        if child.has_tasks() || child.pids_current_count() != 0 {
+            return Err(SystemError::EBUSY);
+        }
+        let removed_child = parent.children.write().remove_entry(name);
+        let removed = self.all_nodes.lock().remove(&child.id());
+        drop(accounting_guard);
+
+        // Open directory FDs may keep this node alive; they do not keep its
+        // attachments installed after rmdir. Drop program refs outside locks.
+        let empty_state = DeviceBpfState::empty();
+        let old_state = core::mem::replace(&mut *child.device_bpf.write(), empty_state);
+        drop(_structure_guard);
+        drop(old_state);
+        drop(removed);
+        drop(removed_child);
         Ok(())
+    }
+
+    /// Legacy `BPF_PROG_ATTACH` for `BPF_CGROUP_DEVICE`. All descendants are
+    /// prepared before any visible policy is changed.
+    pub fn attach_device_program(
+        &self,
+        node: &Arc<CgroupNode>,
+        prog: Arc<BpfProg>,
+        flags: u32,
+        replace: Option<Arc<BpfProg>>,
+    ) -> Result<(), SystemError> {
+        if prog.prog_type() != bpf_prog_type::BPF_PROG_TYPE_CGROUP_DEVICE
+            || replace
+                .as_ref()
+                .is_some_and(|old| old.prog_type() != bpf_prog_type::BPF_PROG_TYPE_CGROUP_DEVICE)
+        {
+            return Err(SystemError::EINVAL);
+        }
+        let allowed_flags =
+            BPF_F_ALLOW_OVERRIDE | BPF_F_ALLOW_MULTI | BPF_F_REPLACE | BPF_DEVICE_F_PREORDER;
+        if flags & !allowed_flags != 0
+            || flags & BPF_F_ALLOW_OVERRIDE != 0 && flags & BPF_F_ALLOW_MULTI != 0
+            || flags & BPF_F_REPLACE != 0 && flags & BPF_F_ALLOW_MULTI == 0
+            || (flags & BPF_F_REPLACE != 0) != replace.is_some()
+        {
+            return Err(SystemError::EINVAL);
+        }
+
+        let _structure_guard = self.structure_lock.lock();
+        if !self.is_online(node) {
+            return Err(SystemError::ENOENT);
+        }
+        if !Self::hierarchy_allows_device_attach(node) {
+            return Err(SystemError::EPERM);
+        }
+
+        let current = node.device_bpf.read();
+        let mode = flags & (BPF_F_ALLOW_OVERRIDE | BPF_F_ALLOW_MULTI);
+        if !current.direct.is_empty() && current.flags != mode {
+            return Err(SystemError::EPERM);
+        }
+        if current.direct.len() >= BPF_CGROUP_MAX_PROGS {
+            return Err(SystemError::E2BIG);
+        }
+        let mut direct = Vec::new();
+        direct
+            .try_reserve(current.direct.len() + 1)
+            .map_err(|_| SystemError::ENOMEM)?;
+        direct.extend(current.direct.iter().cloned());
+        drop(current);
+
+        if mode & BPF_F_ALLOW_MULTI == 0 {
+            let entry = AttachedDeviceProgram { prog, flags };
+            if direct.is_empty() {
+                direct.push(entry);
+            } else {
+                direct[0] = entry;
+            }
+        } else {
+            if direct.iter().any(|entry| {
+                Arc::ptr_eq(&entry.prog, &prog)
+                    && replace.as_ref().is_none_or(|old| !Arc::ptr_eq(old, &prog))
+            }) {
+                return Err(SystemError::EINVAL);
+            }
+            let entry = AttachedDeviceProgram { prog, flags };
+            if let Some(replace) = replace {
+                let old = direct
+                    .iter_mut()
+                    .find(|candidate| Arc::ptr_eq(&candidate.prog, &replace))
+                    .ok_or(SystemError::ENOENT)?;
+                *old = entry;
+            } else {
+                direct.push(entry);
+            }
+        }
+
+        let mut updates = self.prepare_device_snapshots(node, &direct, mode)?;
+        let old_direct = {
+            let mut state = node.device_bpf.write();
+            state.flags = mode;
+            core::mem::replace(&mut state.direct, direct)
+        };
+        Self::publish_device_snapshots(&mut updates);
+        drop(_structure_guard);
+        drop(old_direct);
+        Ok(())
+    }
+
+    pub fn detach_device_program(
+        &self,
+        node: &Arc<CgroupNode>,
+        prog: Option<&Arc<BpfProg>>,
+    ) -> Result<(), SystemError> {
+        let _structure_guard = self.structure_lock.lock();
+        if !self.is_online(node) {
+            return Err(SystemError::ENOENT);
+        }
+        let current = node.device_bpf.read();
+        if current.direct.is_empty() {
+            return Err(SystemError::ENOENT);
+        }
+        let index = if current.flags & BPF_F_ALLOW_MULTI != 0 {
+            let prog = prog.ok_or(SystemError::EINVAL)?;
+            current
+                .direct
+                .iter()
+                .position(|entry| Arc::ptr_eq(&entry.prog, prog))
+                .ok_or(SystemError::ENOENT)?
+        } else {
+            // Legacy NONE and OVERRIDE modes ignore a supplied program FD.
+            0
+        };
+        let mut direct = Vec::new();
+        direct
+            .try_reserve(current.direct.len().saturating_sub(1))
+            .map_err(|_| SystemError::ENOMEM)?;
+        direct.extend(current.direct.iter().enumerate().filter_map(|(i, entry)| {
+            if i == index {
+                None
+            } else {
+                Some(entry.clone())
+            }
+        }));
+        let mode = if direct.is_empty() { 0 } else { current.flags };
+        drop(current);
+
+        let mut updates = self.prepare_device_snapshots(node, &direct, mode)?;
+        let old_direct = {
+            let mut state = node.device_bpf.write();
+            state.flags = mode;
+            core::mem::replace(&mut state.direct, direct)
+        };
+        Self::publish_device_snapshots(&mut updates);
+        drop(_structure_guard);
+        drop(old_direct);
+        Ok(())
+    }
+
+    /// Return a stable copy of direct/effective IDs and direct per-program
+    /// flags. The caller performs all user copies after releasing this lock.
+    pub fn query_device_programs(
+        &self,
+        node: &Arc<CgroupNode>,
+        effective: bool,
+    ) -> Result<(u32, Vec<u32>, Vec<u32>), SystemError> {
+        let _structure_guard = self.structure_lock.lock();
+        if !self.is_online(node) {
+            return Err(SystemError::ENOENT);
+        }
+        let state = node.device_bpf.read();
+        let programs = if effective {
+            state.effective.as_slice()
+        } else {
+            &[]
+        };
+        let count = if effective {
+            programs.len()
+        } else {
+            state.direct.len()
+        };
+        let mut ids = Vec::new();
+        let mut attach_flags = Vec::new();
+        ids.try_reserve_exact(count)
+            .map_err(|_| SystemError::ENOMEM)?;
+        if !effective {
+            attach_flags
+                .try_reserve_exact(count)
+                .map_err(|_| SystemError::ENOMEM)?;
+        }
+        if effective {
+            ids.extend(programs.iter().map(|prog| prog.id()));
+        } else {
+            ids.extend(state.direct.iter().map(|entry| entry.prog.id()));
+            attach_flags.resize(count, state.flags);
+        }
+        Ok((if effective { 0 } else { state.flags }, ids, attach_flags))
+    }
+
+    fn hierarchy_allows_device_attach(node: &Arc<CgroupNode>) -> bool {
+        let mut parent = node.parent();
+        while let Some(ancestor) = parent {
+            let state = ancestor.device_bpf.read();
+            if state.flags & BPF_F_ALLOW_MULTI != 0 {
+                return true;
+            }
+            if !state.direct.is_empty() {
+                return state.flags & BPF_F_ALLOW_OVERRIDE != 0;
+            }
+            parent = ancestor.parent();
+        }
+        true
+    }
+
+    /// Iterate the Linux effective-chain candidates, retaining the original
+    /// per-cgroup FIFO index for the global PREORDER ordering.
+    fn visit_effective_device_programs<F>(
+        node: &Arc<CgroupNode>,
+        changed: &Arc<CgroupNode>,
+        direct: &[AttachedDeviceProgram],
+        flags: u32,
+        mut visit: F,
+    ) where
+        F: FnMut(usize, usize, &AttachedDeviceProgram),
+    {
+        let mut current = Some(node.clone());
+        let mut count = 0;
+        let mut depth = 0;
+        while let Some(ancestor) = current {
+            let state = ancestor.device_bpf.read();
+            let (entries, mode) = if Arc::ptr_eq(&ancestor, changed) {
+                (direct, flags)
+            } else {
+                (state.direct.as_slice(), state.flags)
+            };
+            if count == 0 || mode & BPF_F_ALLOW_MULTI != 0 {
+                for (index, entry) in entries.iter().enumerate() {
+                    visit(depth, index, entry);
+                }
+                count += entries.len();
+            }
+            current = ancestor.parent();
+            depth += 1;
+        }
+    }
+
+    fn prepare_device_snapshots(
+        &self,
+        changed: &Arc<CgroupNode>,
+        direct: &[AttachedDeviceProgram],
+        flags: u32,
+    ) -> Result<DeviceSnapshotUpdates, SystemError> {
+        let mut nodes = Vec::new();
+        nodes.try_reserve(1).map_err(|_| SystemError::ENOMEM)?;
+        nodes.push(changed.clone());
+        let mut index = 0;
+        while index < nodes.len() {
+            let current = nodes[index].clone();
+            let child_count = current.children.read().len();
+            nodes
+                .try_reserve(child_count)
+                .map_err(|_| SystemError::ENOMEM)?;
+            nodes.extend(current.children.read().values().cloned());
+            index += 1;
+        }
+
+        let mut snapshots = Vec::new();
+        snapshots
+            .try_reserve_exact(nodes.len())
+            .map_err(|_| SystemError::ENOMEM)?;
+        for node in nodes {
+            let mut preorder_count = 0usize;
+            let mut normal_count = 0usize;
+            Self::visit_effective_device_programs(&node, changed, direct, flags, |_, _, entry| {
+                if entry.flags & BPF_DEVICE_F_PREORDER != 0 {
+                    preorder_count += 1;
+                } else {
+                    normal_count += 1;
+                }
+            });
+
+            let mut preorder = Vec::new();
+            let mut normal = Vec::new();
+            preorder
+                .try_reserve_exact(preorder_count)
+                .map_err(|_| SystemError::ENOMEM)?;
+            normal
+                .try_reserve_exact(normal_count)
+                .map_err(|_| SystemError::ENOMEM)?;
+            Self::visit_effective_device_programs(
+                &node,
+                changed,
+                direct,
+                flags,
+                |depth, local_index, entry| {
+                    if entry.flags & BPF_DEVICE_F_PREORDER != 0 {
+                        preorder.push((Reverse(depth), local_index, entry.prog.clone()));
+                    } else {
+                        normal.push(entry.prog.clone());
+                    }
+                },
+            );
+            preorder.sort_unstable_by_key(|(depth, index, _)| (*depth, *index));
+            let mut effective = Vec::new();
+            effective
+                .try_reserve_exact(preorder_count + normal_count)
+                .map_err(|_| SystemError::ENOMEM)?;
+            effective.extend(preorder.into_iter().map(|(_, _, prog)| prog));
+            effective.extend(normal);
+            snapshots.push((node, Arc::new(effective)));
+        }
+        Ok(snapshots)
+    }
+
+    fn publish_device_snapshots(updates: &mut DeviceSnapshotUpdates) {
+        // Swapping leaves all old snapshots in `updates`, to be dropped only
+        // after the structure lock is released by the caller.
+        for (node, snapshot) in updates {
+            core::mem::swap(&mut node.device_bpf.write().effective, snapshot);
+        }
     }
 
     #[allow(dead_code)]
@@ -507,6 +895,12 @@ pub fn cgroup_common_ancestor(left: &Arc<CgroupNode>, right: &Arc<CgroupNode>) -
 }
 //一个已经作为管理节点的node不能同时作为迁移目的地承载普通节点
 pub fn cgroup_migrate_vet_dst(dst: &Arc<CgroupNode>) -> Result<(), SystemError> {
+    // Callers hold CGROUP_ACCOUNTING_LOCK. rmdir takes the same lock before
+    // removing the node from the online registry, so a successful migration
+    // cannot attach a task to a directory which has already been removed.
+    if !cgroup_root().is_online(dst) {
+        return Err(SystemError::ENOENT);
+    }
     if dst.parent().is_some() && dst.subtree_control().iter().any(|ctrl| ctrl == "memory") {
         return Err(SystemError::EBUSY);
     }
@@ -514,6 +908,9 @@ pub fn cgroup_migrate_vet_dst(dst: &Arc<CgroupNode>) -> Result<(), SystemError> 
 }
 //fork前pids.max检查
 pub fn cgroup_can_fork_in(node: &Arc<CgroupNode>, new_tasks: usize) -> Result<(), SystemError> {
+    if !cgroup_root().is_online(node) {
+        return Err(SystemError::ENOENT);
+    }
     let mut cur = Some(node.clone());
     while let Some(cg) = cur {
         if let Some(max) = cg.pids_max() {

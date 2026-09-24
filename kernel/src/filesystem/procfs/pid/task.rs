@@ -2,7 +2,10 @@
 //!
 //! 列出进程的所有线程，每个线程对应一个子目录 /proc/[pid]/task/[tid]
 
-use super::{mem::MemFileOps, oom_score_adj::OomScoreAdjFileOps, status::StatusFileOps};
+use super::{
+    fd::FdDirOps, fdinfo::FdInfoDirOps, mem::MemFileOps, oom_score_adj::OomScoreAdjFileOps,
+    status::StatusFileOps,
+};
 use crate::{
     filesystem::{
         procfs::{
@@ -204,7 +207,7 @@ impl TidDirOps {
         fn(&TidDirOps, Weak<dyn IndexNode>) -> Arc<dyn IndexNode>,
     )] = &[
         // Each entry resolves the task it renders on its own. `stat`/`status`/
-        // `mem`/`ns` render the task this node points at (`target.task()`),
+        // `mem`/`ns`/`fd`/`fdinfo` render the task this node points at (`target.task()`),
         // which is also the task whose fields they describe. `oom_score_adj` is
         // a thread-group property that has to agree with
         // `/proc/<pid>/oom_score_adj`, so it resolves the group leader instead.
@@ -221,6 +224,12 @@ impl TidDirOps {
         }),
         ("ns", |ops, parent| {
             NsDirOps::new_inode(ops.target.clone(), parent)
+        }),
+        ("fd", |ops, parent| {
+            FdDirOps::new_inode(ops.target.clone(), parent)
+        }),
+        ("fdinfo", |ops, parent| {
+            FdInfoDirOps::new_inode(ops.target.clone(), parent)
         }),
         ("oom_score_adj", |ops, parent| {
             OomScoreAdjFileOps::new_inode(ops.target.clone(), parent)

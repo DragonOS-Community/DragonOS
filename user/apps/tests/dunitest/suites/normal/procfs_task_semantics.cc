@@ -1560,6 +1560,45 @@ void* BusyWorker(void* arg) {
 
 }  // namespace
 
+// /proc/thread-self resolves through /proc/<tgid>/task/<tid>, not through the
+// separately implemented top-level /proc/<tid> directory.
+TEST(ProcfsTaskSemantics, TaskTidFdAndFdinfoDirectories) {
+    UniqueFd held(open("/proc/version", O_RDONLY));
+    ASSERT_TRUE(held.valid()) << "cannot open probe fd: errno=" << errno;
+
+    ProbeThread probe;
+    ASSERT_TRUE(probe.Prepare());
+    ASSERT_TRUE(probe.Launch(TidWorker, nullptr));
+    long worker_tid = -1;
+    ASSERT_TRUE(probe.ReadReport(&worker_tid, sizeof(worker_tid)));
+
+    const std::string fd_name = std::to_string(held.get());
+    const pid_t pid = getpid();
+    for (std::string base : {
+             std::string("/proc/thread-self"),
+             TaskStatusPath(pid, GetTid(), ""),
+             TaskStatusPath(pid, worker_tid, ""),
+         }) {
+        if (base.back() == '/') {
+            base.pop_back();
+        }
+        const std::string fd_dir = base + "/fd";
+        const std::string fdinfo_dir = base + "/fdinfo";
+        UniqueFd fd(open(fd_dir.c_str(), O_RDONLY | O_DIRECTORY));
+        ASSERT_TRUE(fd.valid()) << fd_dir << ": errno=" << errno;
+        UniqueFd fdinfo(open(fdinfo_dir.c_str(), O_RDONLY | O_DIRECTORY));
+        ASSERT_TRUE(fdinfo.valid()) << fdinfo_dir << ": errno=" << errno;
+        EXPECT_TRUE(Contains(ListDir(fd_dir), fd_name)) << fd_dir;
+
+        char target[256];
+        const std::string link = fd_dir + "/" + fd_name;
+        EXPECT_GT(readlink(link.c_str(), target, sizeof(target)), 0) << link << ": errno=" << errno;
+        const std::string info = fdinfo_dir + "/" + fd_name;
+        UniqueFd entry(open(info.c_str(), O_RDONLY));
+        EXPECT_TRUE(entry.valid()) << info << ": errno=" << errno;
+    }
+}
+
 // A thread that took its own files table with close_range(CLOSE_RANGE_UNSHARE)
 // can hold a descriptor set the group leader does not. Linux resolves
 // /proc/<tid>/fd and fdinfo through get_proc_task(inode), so the thread's own
@@ -1587,6 +1626,12 @@ TEST(ProcfsTaskSemantics, TidFdSubtreeUsesTheThreadsFilesTable) {
     const std::string fd_name = std::to_string(punch.get());
     const std::string group_fd_dir = StatusPath(pid, "fd");
     const std::string thread_fd_dir = TidPath(report.tid, "fd");
+    const std::string task_fd_dir = TaskStatusPath(pid, report.tid, "fd");
+    const std::string task_fdinfo_dir = TaskStatusPath(pid, report.tid, "fdinfo");
+    UniqueFd task_fd(open(task_fd_dir.c_str(), O_RDONLY | O_DIRECTORY));
+    ASSERT_TRUE(task_fd.valid()) << task_fd_dir << ": errno=" << errno;
+    UniqueFd task_fdinfo(open(task_fdinfo_dir.c_str(), O_RDONLY | O_DIRECTORY));
+    ASSERT_TRUE(task_fdinfo.valid()) << task_fdinfo_dir << ": errno=" << errno;
 
     // The leader still holds the descriptor, so the thread really took a copy
     // of the table instead of closing the group's descriptor.
@@ -1596,6 +1641,10 @@ TEST(ProcfsTaskSemantics, TidFdSubtreeUsesTheThreadsFilesTable) {
     // The thread's directory is the one that must not list it.
     EXPECT_FALSE(Contains(ListDir(thread_fd_dir), fd_name))
         << thread_fd_dir << " lists fd " << fd_name << ", which the thread removed from its table";
+    const auto task_fds = ListDir(task_fd_dir);
+    EXPECT_FALSE(task_fds.empty()) << task_fd_dir << " could not be listed or has no live fds";
+    EXPECT_FALSE(Contains(task_fds, fd_name))
+        << task_fd_dir << " lists fd " << fd_name << ", which the thread removed from its table";
 
     char link_target[256] = {0};
     const std::string link_path = TidPath(report.tid, ("fd/" + fd_name).c_str());
@@ -1604,6 +1653,12 @@ TEST(ProcfsTaskSemantics, TidFdSubtreeUsesTheThreadsFilesTable) {
     EXPECT_LT(link_len, 0) << link_path << " resolved fd " << fd_name << " of the group's table to "
                            << std::string(link_target, sizeof(link_target));
     EXPECT_EQ(ENOENT, link_errno) << link_path << ": errno=" << strerror(link_errno);
+    const std::string task_link_path = task_fd_dir + "/" + fd_name;
+    const ssize_t task_link_len = readlink(task_link_path.c_str(), link_target, sizeof(link_target));
+    const int task_link_errno = errno;
+    EXPECT_EQ(-1, task_link_len)
+        << task_link_path << " resolved a closed fd";
+    EXPECT_EQ(ENOENT, task_link_errno) << task_link_path;
 
     // fdinfo resolves through the same table: the entry is gone for the thread
     // and still there for the leader.
@@ -1611,6 +1666,11 @@ TEST(ProcfsTaskSemantics, TidFdSubtreeUsesTheThreadsFilesTable) {
         open(TidPath(report.tid, ("fdinfo/" + fd_name).c_str()).c_str(), O_RDONLY));
     EXPECT_FALSE(thread_fdinfo.valid())
         << "the thread's fdinfo resolved fd " << fd_name << ", which it removed from its table";
+    UniqueFd task_thread_fdinfo(open((task_fdinfo_dir + "/" + fd_name).c_str(), O_RDONLY));
+    const int task_fdinfo_errno = errno;
+    EXPECT_FALSE(task_thread_fdinfo.valid())
+        << "the task subtree's fdinfo resolved fd " << fd_name << ", which it removed";
+    EXPECT_EQ(ENOENT, task_fdinfo_errno) << task_fdinfo_dir;
     UniqueFd group_fdinfo(open(StatusPath(pid, ("fdinfo/" + fd_name).c_str()).c_str(), O_RDONLY));
     EXPECT_TRUE(group_fdinfo.valid())
         << "the leader lost its own fdinfo entry: errno=" << errno;

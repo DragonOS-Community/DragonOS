@@ -349,6 +349,8 @@ pub struct Ext4 {
     /// Bounded raw metadata acceleration. Journal overlays remain the
     /// authoritative accepted view; this cache is always discardable.
     metadata_cache: MetadataBlockCache,
+    orphan_index: spin::Mutex<orphan::LegacyOrphanIndex>,
+    orphan_index_valid: Arc<AtomicBool>,
     /// Cached superblock to avoid repeated disk reads.
     /// The superblock is loaded once at mount time and updated
     /// in memory whenever it is written to disk.
@@ -818,6 +820,8 @@ impl Ext4 {
         Ok(Self {
             block_device,
             metadata_cache: MetadataBlockCache::new(0),
+            orphan_index: spin::Mutex::new(orphan::LegacyOrphanIndex::default()),
+            orphan_index_valid: Arc::new(AtomicBool::new(false)),
             cached_super_block: spin::Mutex::new(sb),
             cached_block_groups,
             system_metadata_ranges,

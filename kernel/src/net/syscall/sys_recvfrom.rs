@@ -2,7 +2,7 @@ use system_error::SystemError;
 
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_RECVFROM;
-use crate::filesystem::vfs::file::FileFlags;
+use crate::filesystem::vfs::{file::FileFlags, FileType};
 use crate::mm::VirtAddr;
 use crate::net::posix::SockAddr;
 use crate::net::socket;
@@ -72,7 +72,11 @@ impl Syscall for SysRecvfromHandle {
         }
 
         // Create mutable buffer slice
-        let buf_slice = unsafe { core::slice::from_raw_parts_mut(buf, len) };
+        let buf_slice = if len == 0 {
+            &mut []
+        } else {
+            unsafe { core::slice::from_raw_parts_mut(buf, len) }
+        };
 
         do_recvfrom(fd, buf_slice, flags, addr, addrlen)
     }
@@ -150,15 +154,19 @@ pub(super) fn do_recvfrom(
     addr_len: *mut u32,
 ) -> Result<usize, SystemError> {
     // Honor O_NONBLOCK set via fcntl(F_SETFL) by translating it to MSG_DONTWAIT.
-    let file_nonblock = {
+    let file = {
         let binding = ProcessManager::current_pcb().fd_table();
         let guard = binding.read();
-        let file = guard.get_file_by_fd(fd as i32).ok_or(SystemError::EBADF)?;
-        file.flags().contains(FileFlags::O_NONBLOCK)
+        guard.get_file_by_fd(fd as i32).ok_or(SystemError::EBADF)?
     };
+    if file.file_type() != FileType::Socket {
+        return Err(SystemError::ENOTSOCK);
+    }
+    let file_nonblock = file.flags().contains(FileFlags::O_NONBLOCK);
 
-    let socket_inode = ProcessManager::current_pcb().get_socket_inode(fd as i32)?;
-    let socket = socket_inode.as_socket().unwrap();
+    // Retain the file while recv may block, even if another thread closes/reuses fd.
+    let socket_inode = file.inode();
+    let socket = socket_inode.as_socket().ok_or(SystemError::ENOTSOCK)?;
 
     let mut pmsg_flags = socket::PMSG::from_bits_truncate(flags);
     if file_nonblock {

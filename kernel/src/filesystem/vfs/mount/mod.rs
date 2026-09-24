@@ -7,7 +7,7 @@ use super::{
 };
 use crate::{
     driver::base::device::device_number::{DeviceNumber, Major},
-    exception::workqueue::{schedule_work, Work},
+    exception::workqueue::{schedule_work, Work, WorkQueue},
     filesystem::{
         fsnotify::{
             self, FsNotifyObjectId, FsNotifyObjectState, FsNotifyTarget, MountedFsNotifyPresence,
@@ -99,6 +99,16 @@ lazy_static! {
     /// topology is protected separately by `MOUNT_LIFECYCLE_LOCK`; readers
     /// acquire it first when both are needed.
     static ref DENTRY_TOPOLOGY_LOCK: RwSem<()> = RwSem::new(());
+    // Shutdown waits for filesystem producers queued on SYSTEM_WQ. Sharing
+    // that single worker would prevent those producers from dropping their
+    // domain I/O permits while shutdown waits for the domain to drain.
+    static ref SUPERBLOCK_SHUTDOWN_WQ: Arc<WorkQueue> = WorkQueue::new("sb_shutdown");
+}
+
+pub(crate) fn init_shutdown_workqueue() {
+    // Final external pins may be released from contexts which cannot create
+    // a worker. Initialize before entering userspace, alongside SYSTEM_WQ.
+    lazy_static::initialize(&SUPERBLOCK_SHUTDOWN_WQ);
 }
 
 /// Stable snapshot of both mount edges and dentry parent/name relationships.
@@ -3389,7 +3399,7 @@ impl MountFS {
     }
 
     fn schedule_final_shutdown(mount: Arc<Self>) {
-        schedule_work(Work::new(move || mount.finish_final_shutdown()));
+        SUPERBLOCK_SHUTDOWN_WQ.enqueue(Work::new(move || mount.finish_final_shutdown()));
     }
 
     fn finish_final_shutdown(&self) {

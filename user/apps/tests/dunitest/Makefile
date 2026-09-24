@@ -114,7 +114,9 @@ $(BIN_DIR)/%_test: suites/%.cc $(GTEST_OBJ)
 	@echo "编译测例: $< -> $@"
 	@$(CXX) $(CXXFLAGS) $(GTEST_INCLUDES) "$<" $(GTEST_OBJ) -o "$@"
 
-$(BIN_DIR)/normal/ext4_inode_identity_test $(BIN_DIR)/normal/ext4_truncate_delalloc_test $(BIN_DIR)/normal/utimensat_symlink_test: suites/normal/loop_ext4_test_support.h
+$(BIN_DIR)/normal/ext4_inode_identity_test $(BIN_DIR)/normal/utimensat_symlink_test: suites/normal/loop_ext4_test_support.h
+
+$(addprefix $(BIN_DIR)/normal/ext4_truncate_,$(addsuffix _test,dirty synced remounted)): suites/normal/loop_ext4_test_support.h suites/normal/ext4_truncate_delalloc_test.h
 
 run: build
 	@$(RUNNER_BIN) --bin-dir $(BIN_DIR) --results-dir $(RESULTS_DIR)

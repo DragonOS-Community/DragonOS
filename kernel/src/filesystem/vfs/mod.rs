@@ -307,6 +307,10 @@ pub fn merge_metadata_masked(target: &mut Metadata, requested: &Metadata, mask: 
     }
 }
 
+/// Calculates a masked attribute update from the inode's current metadata.
+pub type MetadataUpdate<'a> =
+    dyn FnMut(&Metadata) -> Result<(Metadata, SetMetadataMask), SystemError> + 'a;
+
 /// Apply Linux relatime rules and update only the inode access time.
 ///
 /// Local filesystems call this while holding the lock that protects their
@@ -1029,6 +1033,21 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
             return Ok(());
         }
         self.set_metadata(metadata)
+    }
+
+    /// Compute and apply an attribute change from the current inode state.
+    ///
+    /// Filesystems with a shared, mutable inode can override this to keep
+    /// permission checks and the masked update under their metadata lock.
+    /// The default retains the existing VFS behavior and setter checks.
+    fn update_metadata_masked(
+        &self,
+        update: &mut MetadataUpdate<'_>,
+    ) -> Result<SetMetadataMask, SystemError> {
+        let current = self.metadata()?;
+        let (requested, mask) = update(&current)?;
+        self.set_metadata_masked(&requested, mask)?;
+        Ok(mask)
     }
 
     /// Atomically evaluate atime policy and update only atime.

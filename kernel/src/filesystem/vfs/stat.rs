@@ -359,7 +359,7 @@ pub fn vfs_fstat(dfd: i32) -> Result<KStat, SystemError> {
         .read()
         .get_file_by_fd(dfd)
         .ok_or(SystemError::EBADF)?;
-    let inode = file.inode();
+    let inode = file.path_inode();
 
     // Get attributes using vfs_getattr with basic stats mask
     vfs_getattr(&inode, PosixStatxMask::STATX_BASIC_STATS, AtFlags::empty())

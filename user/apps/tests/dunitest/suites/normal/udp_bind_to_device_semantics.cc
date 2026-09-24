@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <net/if.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -280,3 +281,69 @@ int main(int argc, char** argv) {
     testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();
 }
+
+// Regression for #2302: a wildcard-bound reply must have a concrete source
+// address so that a connected peer can consume the packet reported by poll.
+class UdpConnectedLoopbackReply : public ::testing::TestWithParam<bool> {};
+
+TEST_P(UdpConnectedLoopbackReply, WildcardAndExplicitBindAreReadable) {
+    for (in_addr_t bind_address : {INADDR_ANY, INADDR_LOOPBACK}) {
+        SCOPED_TRACE(bind_address);
+        const bool nonblocking = GetParam();
+        FdGuard server(socket(AF_INET, SOCK_DGRAM, 0));
+        FdGuard client(socket(AF_INET, SOCK_DGRAM | (nonblocking ? SOCK_NONBLOCK : 0), 0));
+        ASSERT_GE(server.Get(), 0);
+        ASSERT_GE(client.Get(), 0);
+        // Bound blocking receives as well: a false readiness indication must
+        // fail the test instead of hanging the whole suite.
+        timeval timeout = {.tv_sec = 2, .tv_usec = 0};
+        for (int fd : {server.Get(), client.Get()}) {
+            ASSERT_EQ(setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)), 0);
+        }
+
+        sockaddr_in address = {};
+        address.sin_family = AF_INET;
+        address.sin_addr.s_addr = htonl(bind_address);
+        ASSERT_EQ(bind(server.Get(), reinterpret_cast<sockaddr*>(&address), sizeof(address)), 0);
+        socklen_t address_len = sizeof(address);
+        ASSERT_EQ(getsockname(server.Get(), reinterpret_cast<sockaddr*>(&address), &address_len), 0);
+        const in_port_t server_port = address.sin_port;
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        ASSERT_EQ(connect(client.Get(), reinterpret_cast<sockaddr*>(&address), sizeof(address)), 0);
+
+        const char request[] = {'p', 'i', 'n', 'g'};
+        ASSERT_EQ(send(client.Get(), request, sizeof(request), 0), 4) << strerror(errno);
+        pollfd ready = {.fd = server.Get(), .events = POLLIN, .revents = 0};
+        ASSERT_EQ(poll(&ready, 1, 2000), 1);
+        ASSERT_TRUE(ready.revents & POLLIN);
+        char payload[4] = {};
+        sockaddr_in peer = {};
+        socklen_t peer_len = sizeof(peer);
+        ASSERT_EQ(recvfrom(server.Get(), payload, sizeof(payload), 0,
+                           reinterpret_cast<sockaddr*>(&peer), &peer_len), 4) << strerror(errno);
+        EXPECT_EQ(memcmp(payload, request, sizeof(request)), 0);
+        EXPECT_EQ(peer.sin_addr.s_addr, htonl(INADDR_LOOPBACK));
+        ASSERT_EQ(sendto(server.Get(), payload, sizeof(payload), 0,
+                         reinterpret_cast<sockaddr*>(&peer), peer_len), 4) << strerror(errno);
+
+        ready = {.fd = client.Get(), .events = POLLIN, .revents = 0};
+        ASSERT_EQ(poll(&ready, 1, 2000), 1);
+        ASSERT_TRUE(ready.revents & POLLIN);
+        peer = {};
+        peer_len = sizeof(peer);
+        ASSERT_EQ(recvfrom(client.Get(), payload, sizeof(payload), 0,
+                           reinterpret_cast<sockaddr*>(&peer), &peer_len), 4) << strerror(errno);
+        EXPECT_EQ(peer.sin_family, AF_INET);
+        EXPECT_EQ(peer.sin_addr.s_addr, htonl(INADDR_LOOPBACK));
+        EXPECT_EQ(peer.sin_port, server_port);
+        EXPECT_EQ(memcmp(payload, request, sizeof(request)), 0);
+        ready.revents = 0;
+        EXPECT_EQ(poll(&ready, 1, 0), 0);
+        errno = 0;
+        EXPECT_EQ(recv(client.Get(), payload, sizeof(payload), MSG_DONTWAIT), -1);
+        EXPECT_EQ(errno, EAGAIN);
+    }
+}
+
+INSTANTIATE_TEST_SUITE_P(BlockingAndNonblocking, UdpConnectedLoopbackReply,
+                         ::testing::Bool());

@@ -35,6 +35,14 @@ pub(super) struct StreamRecvmsgMeta {
     pub(super) scm_rights: Vec<Arc<File>>,
 }
 
+/// A zero-byte result can mean either a queued stream with a zero-length
+/// destination or a true EOF. Keep that distinction while holding the reader
+/// lock; the socket layer uses it to order queued data before pending errors.
+pub(super) enum StreamReadOutcome<T> {
+    Data(T),
+    Eof,
+}
+
 pub(super) struct SeqpacketRecvMeta {
     pub(super) copy_len: usize,
     pub(super) orig_len: usize,
@@ -230,6 +238,8 @@ impl Connected {
         buf: &[u8],
         is_seqpacket: bool,
         sndbuf_limit: usize,
+        cred: Option<UCred>,
+        rights: &[Arc<File>],
     ) -> Result<(usize, Wrapping<usize>, usize), SystemError> {
         let is_empty = buf.is_empty();
         if is_empty {
@@ -239,37 +249,28 @@ impl Connected {
             }
         }
 
-        // shutdown(2) semantics:
-        // - If this end has SHUT_WR, sending must fail with EPIPE.
-        // - If peer has SHUT_RD, sending must fail with EPIPE.
-        {
-            let guard = self.writer.lock();
-            if guard.is_send_shutdown() || guard.is_recv_shutdown() {
-                return Err(SystemError::EPIPE);
-            }
-        }
-
-        //todo 判断辅助数据
-        let buffer = if is_seqpacket {
-            let mut buffer = Vec::with_capacity(buf.len() + 4);
-            let len = buf.len() as u32;
-            buffer.extend_from_slice(&len.to_ne_bytes());
-            buffer.extend_from_slice(buf);
-            buffer
-        } else {
-            buf.to_vec()
-        };
         let mut guard = self.writer.lock();
+        // SHUT_WR and the peer's SHUT_RD reject the send before any allocation.
+        if guard.is_send_shutdown() || guard.is_recv_shutdown() {
+            return Err(SystemError::EPIPE);
+        }
 
         let queued = guard.len();
         let start = guard.tail();
 
         if is_seqpacket {
             // SOCK_SEQPACKET requires all-or-nothing record enqueue.
-            if queued.saturating_add(buffer.len()) > sndbuf_limit || guard.free_len() < buffer.len()
-            {
+            let needed = buf
+                .len()
+                .checked_add(size_of::<u32>())
+                .ok_or(SystemError::EMSGSIZE)?;
+            if queued.saturating_add(needed) > sndbuf_limit || guard.free_len() < needed {
                 return Err(SystemError::ENOBUFS);
             }
+            let mut buffer = Vec::with_capacity(needed);
+            let len = buf.len() as u32;
+            buffer.extend_from_slice(&len.to_ne_bytes());
+            buffer.extend_from_slice(buf);
             guard.push_slice(&buffer);
             return Ok((buf.len(), start, buffer.len()));
         }
@@ -281,33 +282,38 @@ impl Connected {
             return Err(SystemError::ENOBUFS);
         }
 
-        guard.push_slice(&buf[..max_write]);
+        guard
+            .push_slice_with_scm(&buf[..max_write], Some((cred, rights.to_vec())))
+            .ok_or(SystemError::EIO)?;
         Ok((max_write, start, max_write))
     }
 
-    pub fn try_recv(&self, buf: &mut [u8], is_seqpacket: bool) -> Result<usize, SystemError> {
-        if is_seqpacket {
-            Ok(self
-                .try_recv_seqpacket_meta(buf, false)?
-                .map_or(0, |meta| meta.copy_len))
-        } else {
-            let avail_len = {
-                let guard = self.reader.lock();
-                let len = guard.len();
-                if len == 0 {
-                    // SHUT_RD and peer SHUT_WR both become EOF once queued
-                    // bytes have been consumed.
-                    if guard.is_read_shutdown() {
-                        return Ok(0);
-                    }
-                    return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-                }
-                len
+    pub(super) fn try_recv_stream(
+        &self,
+        buf: &mut [u8],
+        peek: bool,
+    ) -> Result<StreamReadOutcome<usize>, SystemError> {
+        let mut guard = self.reader.lock();
+        let available = guard.len();
+        if available == 0 {
+            return if guard.is_read_shutdown() {
+                Ok(StreamReadOutcome::Eof)
+            } else {
+                Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
             };
-            let len = core::cmp::min(buf.len(), avail_len);
-            self.reader.lock().pop_slice(&mut buf[..len]);
-            Ok(len)
         }
+
+        let len = buf.len().min(available);
+        if len != 0 {
+            if peek {
+                guard.peek_slice(&mut buf[..len]).ok_or(SystemError::EIO)?;
+            } else {
+                guard.pop_slice(&mut buf[..len]).ok_or(SystemError::EIO)?;
+            }
+        } else if !peek {
+            guard.discard_rights_at_head();
+        }
+        Ok(StreamReadOutcome::Data(len))
     }
 
     /// Copy one read directly to userspace and commit queue consumption only
@@ -378,28 +384,6 @@ impl Connected {
         guard.consume(copy_len).ok_or(SystemError::EIO)?;
         *queue_consumed = true;
         Ok(copy_len)
-    }
-
-    pub fn try_peek(&self, buf: &mut [u8], is_seqpacket: bool) -> Result<usize, SystemError> {
-        if is_seqpacket {
-            Ok(self
-                .try_recv_seqpacket_meta(buf, true)?
-                .map_or(0, |meta| meta.copy_len))
-        } else {
-            let guard = self.reader.lock();
-            let avail_len = guard.len();
-            if avail_len == 0 {
-                if guard.is_read_shutdown() {
-                    return Ok(0);
-                }
-                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-            }
-            let len = core::cmp::min(buf.len(), avail_len);
-            if guard.peek_slice(&mut buf[..len]).is_none() {
-                return Err(SystemError::EFAULT);
-            }
-            Ok(len)
-        }
     }
 
     /// Receive exactly one SOCK_SEQPACKET record.
@@ -579,17 +563,13 @@ impl Connected {
         out: &mut crate::syscall::user_buffer::UserBuffer<'_>,
         peek: bool,
         want_creds: bool,
-    ) -> Result<StreamRecvmsgMeta, SystemError> {
+    ) -> Result<StreamReadOutcome<StreamRecvmsgMeta>, SystemError> {
         let mut guard = self.reader.lock();
 
         let avail_len = guard.len();
         if avail_len == 0 {
             if guard.is_read_shutdown() {
-                return Ok(StreamRecvmsgMeta {
-                    copy_len: 0,
-                    scm_cred: None,
-                    scm_rights: Vec::new(),
-                });
+                return Ok(StreamReadOutcome::Eof);
             }
             return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
         }
@@ -607,21 +587,22 @@ impl Connected {
 
             if !peek {
                 guard.consume_preserve_records(n).ok_or(SystemError::EIO)?;
-
-                // Once any bytes of the rights-carrying record are consumed via
-                // recvmsg, rights are either delivered or discarded, but must not
-                // be visible again.
-                if let Some(start) = plan.rights_start {
-                    guard.clear_rights_at(start);
-                }
             }
         }
 
-        Ok(StreamRecvmsgMeta {
+        // Linux detaches queued rights on non-PEEK recvmsg even when the user
+        // requested zero payload bytes. The stream data itself remains queued.
+        if !peek {
+            if let Some(start) = plan.rights_start {
+                guard.clear_rights_at(start);
+            }
+        }
+
+        Ok(StreamReadOutcome::Data(StreamRecvmsgMeta {
             copy_len: n,
             scm_cred: plan.cred,
             scm_rights: plan.rights,
-        })
+        }))
     }
 
     pub(super) fn check_io_events(&self) -> EPollEventType {

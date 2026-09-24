@@ -203,16 +203,17 @@ impl<T: Pod> RingBuffer<T> {
         }
     }
 
-    pub(super) fn plan_stream_recvmsg(&self, max: usize, want_creds: bool) -> StreamRecvmsgPlan {
-        if max == 0 {
-            return StreamRecvmsgPlan {
-                bytes: 0,
-                cred: None,
-                rights: Vec::new(),
-                rights_start: None,
-            };
+    /// A zero-length non-PEEK stream recv sees the queued byte but discards
+    /// its attached rights, just like a nonzero read that starts this record.
+    pub fn discard_rights_at_head(&self) {
+        let head = self.head();
+        let mut q = self.scm_queue.lock();
+        if let Some(record) = q.iter_mut().find(|r| r.start <= head && r.end() > head) {
+            record.rights.clear();
         }
+    }
 
+    pub(super) fn plan_stream_recvmsg(&self, max: usize, want_creds: bool) -> StreamRecvmsgPlan {
         let head = self.head();
         let q = self.scm_queue.lock();
         if q.is_empty() {
@@ -251,6 +252,17 @@ impl<T: Pod> RingBuffer<T> {
         };
 
         let base_cred = if want_creds { q[i].cred } else { None };
+        if max == 0 {
+            let rights = q[i].rights.clone();
+            let rights_start = (!rights.is_empty()).then_some(q[i].start);
+            return StreamRecvmsgPlan {
+                bytes: 0,
+                cred: base_cred,
+                rights,
+                rights_start,
+            };
+        }
+
         let mut pos = head;
         let mut remaining = max;
         let mut bytes = 0usize;
@@ -478,6 +490,17 @@ impl<T: Pod, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
     }
 
     pub fn push_slice(&mut self, items: &[T]) -> Option<()> {
+        self.push_slice_with_scm(items, None)
+    }
+
+    /// Publish a stream chunk and its ancillary metadata as one visible unit.
+    /// The consumer takes buffer.read before scm_queue, so preserve that lock
+    /// order and advance tail only after both bytes and metadata are ready.
+    pub fn push_slice_with_scm(
+        &mut self,
+        items: &[T],
+        scm: Option<(Option<UCred>, Vec<Arc<File>>)>,
+    ) -> Option<()> {
         let rb = &self.ring_buffer;
         let nitems = items.len();
 
@@ -512,6 +535,10 @@ impl<T: Pod, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
         }
 
         write_guard[start..start + remaining_items.len()].copy_from_slice(remaining_items);
+
+        if let Some((cred, rights)) = scm {
+            rb.push_scm_at(tail, nitems, cred, rights);
+        }
 
         // Advance the tail by the number of items written
         rb.advance_tail(tail, nitems);
@@ -803,6 +830,10 @@ impl<T: Pod, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
 
     pub fn clear_rights_at(&self, start: Wrapping<usize>) {
         self.ring_buffer.clear_rights_at(start)
+    }
+
+    pub fn discard_rights_at_head(&self) {
+        self.ring_buffer.discard_rights_at_head()
     }
 
     pub fn resize(&self, new_capacity: usize) -> Result<(), SystemError> {

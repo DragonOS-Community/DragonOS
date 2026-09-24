@@ -189,3 +189,5 @@ normal/cgroup_cpuset
 normal/cgroup_threaded
 normal/udp_source_route
 fuse/stat_blocks
+
+normal/ext4_truncate_delalloc

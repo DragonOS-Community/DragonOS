@@ -137,7 +137,32 @@ pub fn check_inode_permission(
             }
             Ok(())
         }
+    }?;
+    check_device_inode_permission(metadata, mask)
+}
+
+/// Device BPF is an additional VFS permission layer, independent of DAC and
+/// the filesystem's remote-permission policy. This also runs for F_OK, where
+/// Linux passes an access type with no READ/WRITE bits.
+pub(crate) fn check_device_inode_permission(
+    metadata: &Metadata,
+    mask: PermissionMask,
+) -> Result<(), SystemError> {
+    if !matches!(
+        metadata.file_type,
+        FileType::CharDevice | FileType::BlockDevice
+    ) || metadata.raw_dev.data() == 0
+    {
+        return Ok(());
     }
+    let mut access = 0u16;
+    if mask.contains(PermissionMask::MAY_READ) {
+        access |= 2;
+    }
+    if mask.contains(PermissionMask::MAY_WRITE) {
+        access |= 4;
+    }
+    crate::bpf::check_device_permission(metadata.file_type, metadata.raw_dev, access)
 }
 
 /// Check whether the current task may suppress access-time updates for an inode.

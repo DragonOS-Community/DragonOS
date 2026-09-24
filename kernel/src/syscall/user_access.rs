@@ -382,7 +382,11 @@ impl UserBufferReader<'_> {
             return Err(SystemError::EFAULT);
         }
         return Ok(Self {
-            buffer: unsafe { core::slice::from_raw_parts(addr as *const u8, len) },
+            buffer: if len == 0 {
+                &[]
+            } else {
+                unsafe { core::slice::from_raw_parts(addr as *const u8, len) }
+            },
         });
     }
 
@@ -763,7 +767,11 @@ impl<'a> UserBufferWriter<'a> {
             return Err(SystemError::EFAULT);
         }
         return Ok(Self {
-            buffer: unsafe { core::slice::from_raw_parts_mut(addr as *mut u8, len) },
+            buffer: if len == 0 {
+                &mut []
+            } else {
+                unsafe { core::slice::from_raw_parts_mut(addr as *mut u8, len) }
+            },
         });
     }
 

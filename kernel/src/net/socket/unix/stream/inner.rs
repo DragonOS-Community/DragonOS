@@ -35,6 +35,12 @@ pub(super) struct StreamRecvmsgMeta {
     pub(super) scm_rights: Vec<Arc<File>>,
 }
 
+pub(super) struct SeqpacketRecvMeta {
+    pub(super) copy_len: usize,
+    pub(super) orig_len: usize,
+    pub(super) truncated: bool,
+}
+
 #[derive(Debug)]
 pub(super) enum Inner {
     Init(Init),
@@ -281,8 +287,9 @@ impl Connected {
 
     pub fn try_recv(&self, buf: &mut [u8], is_seqpacket: bool) -> Result<usize, SystemError> {
         if is_seqpacket {
-            let (copy_len, _orig_len, _truncated) = self.try_recv_seqpacket_meta(buf, false)?;
-            Ok(copy_len)
+            Ok(self
+                .try_recv_seqpacket_meta(buf, false)?
+                .map_or(0, |meta| meta.copy_len))
         } else {
             let avail_len = {
                 let guard = self.reader.lock();
@@ -375,8 +382,9 @@ impl Connected {
 
     pub fn try_peek(&self, buf: &mut [u8], is_seqpacket: bool) -> Result<usize, SystemError> {
         if is_seqpacket {
-            let (copy_len, _orig_len, _truncated) = self.try_recv_seqpacket_meta(buf, true)?;
-            Ok(copy_len)
+            Ok(self
+                .try_recv_seqpacket_meta(buf, true)?
+                .map_or(0, |meta| meta.copy_len))
         } else {
             let guard = self.reader.lock();
             let avail_len = guard.len();
@@ -396,23 +404,23 @@ impl Connected {
 
     /// Receive exactly one SOCK_SEQPACKET record.
     ///
-    /// Returns `(copy_len, orig_len, truncated)`.
+    /// Returns `Some` for a record (including an empty one), `None` for EOF.
     /// - `copy_len` is the number of bytes copied into `buf`.
     /// - `orig_len` is the record's original payload length.
     /// - `truncated` is true if `buf` was smaller than the record.
     ///
     /// If `peek` is true, the record is not consumed.
-    pub fn try_recv_seqpacket_meta(
+    pub(super) fn try_recv_seqpacket_meta(
         &self,
         buf: &mut [u8],
         peek: bool,
-    ) -> Result<(usize, usize, bool), SystemError> {
+    ) -> Result<Option<SeqpacketRecvMeta>, SystemError> {
         let mut guard = self.reader.lock();
         if guard.len() < size_of::<u32>() {
             // A complete record can never arrive after either read-side
             // shutdown condition becomes final.
             if guard.is_read_shutdown() {
-                return Ok((0, 0, false));
+                return Ok(None);
             }
             return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
         }
@@ -440,13 +448,21 @@ impl Connected {
                     return Err(SystemError::EFAULT);
                 }
             }
-            return Ok((copy_len, record_len, truncated));
+            return Ok(Some(SeqpacketRecvMeta {
+                copy_len,
+                orig_len: record_len,
+                truncated,
+            }));
         }
 
         // Consume header.
         guard.pop_slice(&mut len_buf);
         if record_len == 0 {
-            return Ok((0, 0, false));
+            return Ok(Some(SeqpacketRecvMeta {
+                copy_len: 0,
+                orig_len: 0,
+                truncated: false,
+            }));
         }
 
         if copy_len != 0 {
@@ -464,29 +480,37 @@ impl Connected {
             }
         }
 
-        Ok((copy_len, record_len, truncated))
+        Ok(Some(SeqpacketRecvMeta {
+            copy_len,
+            orig_len: record_len,
+            truncated,
+        }))
+    }
+
+    fn seqpacket_record_len(&self) -> Option<usize> {
+        let guard = self.reader.lock();
+        if guard.len() < size_of::<u32>() {
+            return None;
+        }
+
+        let mut len_buf = [0u8; 4];
+        guard.peek_slice(&mut len_buf)?;
+
+        let len = u32::from_ne_bytes(len_buf) as usize;
+        (guard.len() >= size_of::<u32>() + len).then_some(len)
+    }
+
+    pub(super) fn recv_ready(&self, is_seqpacket: bool) -> bool {
+        if is_seqpacket {
+            self.seqpacket_record_len().is_some()
+        } else {
+            !self.reader.lock().is_empty()
+        }
     }
 
     pub(super) fn readable_len(&self, is_seqpacket: bool) -> usize {
         if is_seqpacket {
-            let guard = self.reader.lock();
-            if guard.len() < size_of::<u32>() {
-                return 0;
-            }
-
-            let mut len_buf = [0u8; 4];
-            if guard.peek_slice(&mut len_buf).is_none() {
-                return 0;
-            }
-
-            let len = u32::from_ne_bytes(len_buf) as usize;
-            // If the header is present but the payload isn't fully queued yet,
-            // report 0 (can't read a full record without blocking).
-            if guard.len() < size_of::<u32>() + len {
-                return 0;
-            }
-
-            len
+            self.seqpacket_record_len().unwrap_or(0)
         } else {
             self.reader.lock().len()
         }

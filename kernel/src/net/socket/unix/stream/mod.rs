@@ -406,7 +406,7 @@ impl UnixStreamSocket {
             .expect("UnixStreamSocket inner is None")
         {
             Inner::Connected(connected) => {
-                connected.readable_len(self.is_seqpacket) != 0 || connected.recv_closed()
+                connected.recv_ready(self.is_seqpacket) || connected.recv_closed()
             }
             _ => false,
         }
@@ -820,7 +820,7 @@ impl Socket for UnixStreamSocket {
     }
 
     fn recv(&self, buffer: &mut [u8], _flags: socket::PMSG) -> Result<usize, SystemError> {
-        if buffer.is_empty() {
+        if buffer.is_empty() && !self.is_seqpacket {
             return Ok(0);
         }
 
@@ -832,17 +832,33 @@ impl Socket for UnixStreamSocket {
         let mut total_read = 0usize;
 
         loop {
+            // Linux's seqpacket receive checks the pending socket error before
+            // selecting a queued record, including for MSG_PEEK.
+            if self.is_seqpacket {
+                let ring_reset = self.take_connreset_from_peer();
+                let socket_reset = self
+                    .connreset_pending
+                    .swap(false, core::sync::atomic::Ordering::SeqCst);
+                if ring_reset || socket_reset {
+                    return Err(SystemError::ECONNRESET);
+                }
+            }
+
+            let mut received_record = false;
             let result = if self.is_seqpacket {
                 let peek = _flags.contains(socket::PMSG::PEEK);
                 match self.inner.read().as_ref().expect("inner is None") {
                     Inner::Connected(connected) => connected
                         .try_recv_seqpacket_meta(buffer, peek)
-                        .map(|(copy_len, orig_len, _truncated)| {
-                            if _flags.contains(socket::PMSG::TRUNC) {
-                                orig_len
-                            } else {
-                                copy_len
-                            }
+                        .map(|record| {
+                            record.map_or(0, |meta| {
+                                received_record = true;
+                                if _flags.contains(socket::PMSG::TRUNC) {
+                                    meta.orig_len
+                                } else {
+                                    meta.copy_len
+                                }
+                            })
                         }),
                     _ => Err(SystemError::ENOTCONN),
                 }
@@ -883,7 +899,7 @@ impl Socket for UnixStreamSocket {
                             return Err(SystemError::ECONNRESET);
                         }
                     }
-                    if n != 0 && !_flags.contains(socket::PMSG::PEEK) {
+                    if (n != 0 || received_record) && !_flags.contains(socket::PMSG::PEEK) {
                         self.wake_peer_writable();
                     }
                     total_read += n;
@@ -1041,10 +1057,13 @@ impl Socket for UnixStreamSocket {
                         // using pop_slice(), which discards record metadata.
                         let snapshot = connected.scm_snapshot_for_recvmsg();
                         match connected.try_recv_seqpacket_meta(&mut buf[..], peek) {
-                            Ok((copy_len, orig_len, truncated)) => {
+                            Ok(Some(meta)) => {
                                 if !peek {
                                     self.wake_peer_writable();
                                 }
+                                let copy_len = meta.copy_len;
+                                let orig_len = meta.orig_len;
+                                let truncated = meta.truncated;
                                 if copy_len != 0 {
                                     iovs.scatter_exact(&buf[..copy_len])?;
                                 }
@@ -1058,6 +1077,9 @@ impl Socket for UnixStreamSocket {
                                 break (
                                     copy_len, orig_len, truncated, ret_len, scm_cred, scm_rights,
                                 );
+                            }
+                            Ok(None) => {
+                                break (0, 0, false, 0, None, alloc::vec::Vec::new());
                             }
                             Err(SystemError::EAGAIN_OR_EWOULDBLOCK) if !nonblock => {
                                 self.wait_queue.wait_event_interruptible_timeout(
@@ -1225,7 +1247,10 @@ impl Socket for UnixStreamSocket {
         }
 
         // If send succeeded, notify peer's fasync_items for SIGIO
-        if result.is_ok() && result.as_ref().unwrap().0 > 0 {
+        if result
+            .as_ref()
+            .is_ok_and(|(_, _, written_len)| *written_len > 0)
+        {
             // Wake EPOLLIN waiters on the peer. This is required for EPOLLET semantics
             // in gVisor tests (a second write should re-trigger EPOLLIN even if the
             // socket remains readable).
@@ -1306,10 +1331,10 @@ impl Socket for UnixStreamSocket {
         }
 
         // Send payload first; ancillary data is associated with the bytes sent.
-        let (sent, start, _written_len) = self.send_with_timeout(&buf, _flags)?;
+        let (sent, start, written_len) = self.send_with_timeout(&buf, _flags)?;
 
         // Notify peer on successful write.
-        if sent > 0 {
+        if written_len > 0 {
             self.wake_peer_readable();
         }
 

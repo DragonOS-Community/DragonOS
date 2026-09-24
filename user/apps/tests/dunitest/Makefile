@@ -142,13 +142,15 @@ $(BIN_DIR)/%_test: suites/%.cc $(GTEST_OBJ)
 	@echo "编译测例: $< -> $@"
 	@$(CXX) $(CXXFLAGS) $(GTEST_INCLUDES) "$<" $(GTEST_OBJ) -o "$@"
 
-$(BIN_DIR)/normal/ext4_inode_identity_test $(BIN_DIR)/normal/ext4_truncate_delalloc_test $(BIN_DIR)/normal/utimensat_symlink_test $(BIN_DIR)/normal/mount_idmap_test $(BIN_DIR)/normal/mount_filecaps_test $(BIN_DIR)/normal/ext4_fallocate_test $(BIN_DIR)/normal/stat_blocks_test $(BIN_DIR)/normal/fat_directory_entries_test: suites/normal/loop_ext4_test_support.h
+$(BIN_DIR)/normal/ext4_inode_identity_test $(BIN_DIR)/normal/utimensat_symlink_test $(BIN_DIR)/normal/mount_idmap_test $(BIN_DIR)/normal/mount_filecaps_test $(BIN_DIR)/normal/ext4_fallocate_test $(BIN_DIR)/normal/stat_blocks_test $(BIN_DIR)/normal/fat_directory_entries_test: suites/normal/loop_ext4_test_support.h
 
 $(BIN_DIR)/normal/mount_propagation_test $(BIN_DIR)/normal/test_pivot_root_test: suites/normal/user_namespace_test_support.h
 
 $(BIN_DIR)/normal/mount_idmap_test $(BIN_DIR)/normal/proc_fd_permission_test: suites/normal/cap_common.h
 
 $(BIN_DIR)/fuse/stat_blocks_test: suites/fuse/fuse_gtest_common.h suites/fuse/fuse_test_simplefs_local.h
+
+$(addprefix $(BIN_DIR)/normal/ext4_truncate_,$(addsuffix _test,dirty synced remounted)): suites/normal/loop_ext4_test_support.h suites/normal/ext4_truncate_delalloc_test.h
 
 $(BIN_DIR)/normal/forward_mtu_test: suites/normal/forward_mtu_nft_support.h
 $(BIN_DIR)/normal/endpoint_pmtu_test $(BIN_DIR)/normal/udp_source_route_test: suites/normal/rtnetlink_route_test_support.h

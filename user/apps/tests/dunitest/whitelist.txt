@@ -190,4 +190,6 @@ normal/cgroup_threaded
 normal/udp_source_route
 fuse/stat_blocks
 
-normal/ext4_truncate_delalloc
+normal/ext4_truncate_dirty
+normal/ext4_truncate_synced
+normal/ext4_truncate_remounted

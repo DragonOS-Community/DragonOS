@@ -19,7 +19,7 @@ pub fn current_cpu_id() -> ProcessorId {
     let ptr: *const LocalContext = riscv::register::tp::read() as *const LocalContext;
 
     if core::intrinsics::unlikely(ptr.is_null()) {
-        return boot_params().read_irqsave().arch.boot_hartid;
+        return ProcessorId::new(unsafe { super::init::BOOT_HARTID });
     }
 
     unsafe { (*ptr).current_cpu() }

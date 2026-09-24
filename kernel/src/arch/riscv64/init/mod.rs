@@ -62,7 +62,7 @@ impl ArchBootParams {
     }
 }
 
-static mut BOOT_HARTID: u32 = 0;
+pub(super) static mut BOOT_HARTID: u32 = 0;
 static mut BOOT_FDT_PADDR: PhysAddr = PhysAddr::new(0);
 
 #[no_mangle]

@@ -817,6 +817,11 @@ impl Backlog {
         let conn = incoming_conns.pop_front();
         drop(guard);
 
+        if conn.is_some() {
+            // Acceptors and connectors share this queue. Wake every class so
+            // an accept waiter cannot consume a connector's capacity wakeup.
+            self.wait_queue.wake_all();
+        }
         conn.ok_or(SystemError::EAGAIN_OR_EWOULDBLOCK)
     }
 
@@ -824,8 +829,7 @@ impl Backlog {
         let old_backlog = self.backlog.swap(backlog, Ordering::Relaxed);
 
         if old_backlog < backlog {
-            self.wait_queue
-                .wakeup(Some(crate::process::ProcessState::Blocked(true)));
+            self.wait_queue.wake_all();
         }
     }
 
@@ -839,6 +843,9 @@ impl Backlog {
             return;
         };
 
+        // Connectors retain the backlog after its listener has closed. Wake
+        // them to observe the terminal state instead of waiting forever.
+        self.wait_queue.wake_all();
         while let Some(sock) = q.pop_front() {
             let _ = sock.do_close();
         }
@@ -882,7 +889,7 @@ impl Backlog {
         let mut guard = self.incoming_conns.lock();
 
         let Some(incoming_conns) = &mut *guard else {
-            return Err((init, SystemError::EINVAL));
+            return Err((init, SystemError::ECONNREFUSED));
         };
 
         // Linux uses sk_acceptq_is_full(): ack_backlog > max_ack_backlog.
@@ -943,11 +950,7 @@ impl Backlog {
 
         incoming_conns.push_back(server_socket);
         drop(guard);
-        // The client still holds its inner write lock here; only touch the
-        // listener when publishing the newly acceptable connection.
-        if let Some(listener) = self.listener.upgrade() {
-            listener.wake_self_readable();
-        }
+        self.wait_queue.wake_all();
         Ok(client_conn)
     }
 
@@ -955,14 +958,13 @@ impl Backlog {
     where
         F: FnMut() -> Result<(), SystemError>,
     {
-        wq_wait_event_interruptible!(
-            self.wait_queue,
-            match cond() {
-                Err(e) if e.eq(&SystemError::EAGAIN_OR_EWOULDBLOCK) => false,
-                _res => true,
-            },
-            {}
-        )
+        // Preserve the operation result separately from interruption of the
+        // wait itself. In particular, do not re-run a successful connect as a
+        // boolean predicate (the next attempt would report EISCONN).
+        self.wait_queue.wait_until_interruptible(|| match cond() {
+            Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => None,
+            result => Some(result),
+        })?
     }
 }
 

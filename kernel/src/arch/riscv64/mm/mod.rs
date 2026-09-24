@@ -387,8 +387,8 @@ impl MemoryManagementArch for RiscV64MMArch {
     const PAGE_SHARED_EXEC: usize = Self::PAGE_WRITE_EXEC;
 
     const PAGE_COPY_NOEXEC: usize = 0;
-    const PAGE_READONLY: usize = 0;
-    const PAGE_READONLY_EXEC: usize = 0;
+    const PAGE_READONLY: usize = Self::PAGE_READ;
+    const PAGE_READONLY_EXEC: usize = Self::PAGE_READ_EXEC;
 
     const PROTECTION_MAP: [EntryFlags<MMArch>; 16] = protection_map();
 

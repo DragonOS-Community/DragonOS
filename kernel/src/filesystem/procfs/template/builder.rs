@@ -1,6 +1,6 @@
 use crate::filesystem::{
     procfs::template::{DirOps, FileOps, ProcDir, ProcFile, ProcSym, SymOps},
-    vfs::{FileSystem, IndexNode, InodeMode},
+    vfs::{FileSystem, IndexNode, InodeFlags, InodeMode},
 };
 use alloc::sync::{Arc, Weak};
 use system_error::SystemError;
@@ -47,6 +47,7 @@ pub trait Builder<Ops> {
 pub struct ProcFileBuilder<F: FileOps> {
     file: F,
     common: BuilderCommon,
+    flags: InodeFlags,
 }
 
 impl<F: FileOps> ProcFileBuilder<F> {
@@ -57,6 +58,12 @@ impl<F: FileOps> ProcFileBuilder<F> {
 
     pub fn fs(mut self, fs: Weak<dyn FileSystem>) -> Self {
         self.common.set_fs(fs);
+        self
+    }
+
+    /// Mark a proc sysctl as read-only even for callers with DAC override.
+    pub fn read_only_sysctl(mut self) -> Self {
+        self.flags.insert(InodeFlags::S_SYSCTL_READONLY);
         self
     }
 }
@@ -76,6 +83,7 @@ where
         Self {
             file,
             common: BuilderCommon::new(mode),
+            flags: InodeFlags::empty(),
         }
     }
 
@@ -100,6 +108,7 @@ where
             self.common.is_volatile,
             self.common.mode,
             self.common.data,
+            self.flags,
         ))
     }
 }

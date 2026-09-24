@@ -425,6 +425,8 @@ bitflags! {
         const S_VERITY = (1 << 16);
         /// 内核正在使用的文件（如cachefiles）
         const S_KERNEL_FILE = (1 << 17);
+        /// Read-only proc sysctl: write access cannot be granted by DAC capabilities.
+        const S_SYSCTL_READONLY = (1 << 18);
     }
 }
 

@@ -124,6 +124,15 @@ pub fn check_inode_permission(
     {
         return Err(SystemError::EPERM);
     }
+    // Linux proc_sys_permission does not let root or CAP_DAC_OVERRIDE bypass
+    // a read-only sysctl entry. Check before generic DAC capability overrides.
+    if mask.contains(PermissionMask::MAY_WRITE)
+        && metadata
+            .flags
+            .contains(super::InodeFlags::S_SYSCTL_READONLY)
+    {
+        return Err(SystemError::EACCES);
+    }
 
     let cred = ProcessManager::current_pcb().cred();
     match inode.try_fs().map(|fs| fs.permission_policy()) {

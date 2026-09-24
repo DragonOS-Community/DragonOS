@@ -6,6 +6,7 @@ use crate::{
         vfs::{
             file::FileFlags, vcore::generate_inode_id, FilePrivateData, FileSystem, FileType,
             IndexNode, InodeFlags, InodeMode, Metadata, OpenFileBehavior, PostWriteSyncPolicy,
+            SetMetadataMask,
         },
     },
     time::PosixTimeSpec,
@@ -34,6 +35,7 @@ impl<F: FileOps> ProcFile<F> {
         is_volatile: bool,
         mode: InodeMode,
         data: usize,
+        flags: InodeFlags,
     ) -> Arc<Self> {
         let common = {
             let metadata = Metadata {
@@ -48,7 +50,7 @@ impl<F: FileOps> ProcFile<F> {
                 btime: PosixTimeSpec::default(),
                 file_type: FileType::File,
                 mode,
-                flags: InodeFlags::empty(),
+                flags,
                 nlinks: 1,
                 uid: 0,
                 gid: 0,
@@ -136,7 +138,37 @@ impl<F: FileOps + 'static> IndexNode for ProcFile<F> {
 
     fn fs(&self) -> Arc<dyn FileSystem>;
     fn as_any_ref(&self) -> &dyn core::any::Any;
-    fn set_metadata(&self, metadata: &Metadata) -> Result<(), SystemError>;
+    fn set_metadata(&self, metadata: &Metadata) -> Result<(), SystemError> {
+        let current = self.common.metadata()?;
+        if current.flags.contains(InodeFlags::S_SYSCTL_READONLY)
+            && (current.mode != metadata.mode
+                || current.uid != metadata.uid
+                || current.gid != metadata.gid)
+        {
+            return Err(SystemError::EPERM);
+        }
+        self.common.set_metadata(metadata)
+    }
+
+    fn set_metadata_masked(
+        &self,
+        metadata: &Metadata,
+        mask: SetMetadataMask,
+    ) -> Result<(), SystemError> {
+        if mask.is_empty() {
+            return Ok(());
+        }
+        if self
+            .common
+            .metadata()?
+            .flags
+            .contains(InodeFlags::S_SYSCTL_READONLY)
+            && mask.intersects(SetMetadataMask::MODE | SetMetadataMask::UID | SetMetadataMask::GID)
+        {
+            return Err(SystemError::EPERM);
+        }
+        self.common.set_metadata(metadata)
+    }
 
     fn metadata(&self) -> Result<Metadata, SystemError> {
         let mut metadata = self.common.metadata()?;

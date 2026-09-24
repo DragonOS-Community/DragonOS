@@ -25,6 +25,34 @@ impl Drop for PageCacheAccountingSelftestGuard {
     }
 }
 
+fn run_registry_churn_selftest() -> bool {
+    let mut registry = PageCacheRegistry::new();
+    // Keep a live prefix larger than the scan budget. A one-entry sweep cannot
+    // keep up with one new short-lived mapping per insertion in this case.
+    let live: Vec<_> = (0..64)
+        .map(|_| PageCache::new_unowned(None, None))
+        .collect();
+    for cache in &live {
+        registry.register(cache);
+    }
+    for _ in 0..4096 {
+        let transient = PageCache::new_unowned(None, None);
+        registry.register(&transient);
+        drop(transient);
+        if registry.entries.len() > 2 * live.len() {
+            return false;
+        }
+    }
+    // Every still-live mapping must remain discoverable after cursor wrapping
+    // and swap-removing dead entries. Cleanup must never discard a live entry.
+    live.iter().all(|cache| {
+        registry
+            .entries
+            .iter()
+            .any(|weak| Weak::ptr_eq(weak, &Arc::downgrade(cache)))
+    })
+}
+
 fn run_writeback_domain_lifecycle_selftest() -> bool {
     let domain = PageCacheWritebackDomain::new();
     let cache = PageCache::new_unowned(None, None);
@@ -1978,6 +2006,10 @@ pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, S
     }
     let _running = PageCacheAccountingSelftestGuard;
 
+    if !run_registry_churn_selftest() {
+        return Ok("status=fail stage=registry_churn\n".into());
+    }
+
     if !run_write_prepare_rollback_selftest()? {
         return Ok("status=fail stage=write_prepare_rollback\n".into());
     }
@@ -3861,6 +3893,6 @@ pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, S
     }
 
     Ok(alloc::format!(
-        "status=ok\nramfs_fallocate_range=ok\nwrite_prepare_rollback=ok\npreallocate_rollback=ok\nwriteback_domain_lifecycle=ok\ndetached_read_batch_completion=ok\npreallocated_batch_lifecycle=ok\nfile_membership=ok\nshmem_membership=ok\ndirty_membership=ok\ndirty_incarnation=ok\nremote_dirty_publish=ok\nwriteback_membership=ok\nwriteback_admission_order=ok\nwriteback_submission_token=ok\nwriteback_defer_progress=ok\nwriteback_budget_retry=ok\nsubmitted_writeback=ok\nfault_invalidate_retry_order=ok\ntag_scan_chunk_release=ok\nunevictable_membership=ok\ninflight_teardown=ok\nlate_completion=ok\nglobal_wiring=ok\nlayout=ok\nfile_drop_drift={file_drop_drift}\nshmem_drop_drift={shmem_drop_drift}\ndirty_drop_drift={dirty_drop_drift}\nwriteback_drop_drift={writeback_drop_drift}\nunevictable_drop_drift={unevictable_drop_drift}\nentry_size={entry_size}\nbaseline_size={baseline_size}\n"
+        "status=ok\nregistry_churn=ok\nramfs_fallocate_range=ok\nwrite_prepare_rollback=ok\npreallocate_rollback=ok\nwriteback_domain_lifecycle=ok\ndetached_read_batch_completion=ok\npreallocated_batch_lifecycle=ok\nfile_membership=ok\nshmem_membership=ok\ndirty_membership=ok\ndirty_incarnation=ok\nremote_dirty_publish=ok\nwriteback_membership=ok\nwriteback_admission_order=ok\nwriteback_submission_token=ok\nwriteback_defer_progress=ok\nwriteback_budget_retry=ok\nsubmitted_writeback=ok\nfault_invalidate_retry_order=ok\ntag_scan_chunk_release=ok\nunevictable_membership=ok\ninflight_teardown=ok\nlate_completion=ok\nglobal_wiring=ok\nlayout=ok\nfile_drop_drift={file_drop_drift}\nshmem_drop_drift={shmem_drop_drift}\ndirty_drop_drift={dirty_drop_drift}\nwriteback_drop_drift={writeback_drop_drift}\nunevictable_drop_drift={unevictable_drop_drift}\nentry_size={entry_size}\nbaseline_size={baseline_size}\n"
     ))
 }

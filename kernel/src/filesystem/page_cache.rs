@@ -352,7 +352,8 @@ lazy_static! {
         }
         wqs
     };
-    static ref PAGECACHE_REGISTRY: SpinLock<Vec<Weak<PageCache>>> = SpinLock::new(Vec::new());
+    static ref PAGECACHE_REGISTRY: SpinLock<PageCacheRegistry> =
+        SpinLock::new(PageCacheRegistry::new());
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -613,16 +614,53 @@ pub(crate) fn schedule_pagecache_io(work: Arc<Work>) {
     PAGECACHE_IO_WQS[idx].enqueue(work);
 }
 
+// Weak references retain the Arc allocation even after the mapping is dead.
+// Reclaim a bounded number on every insertion, rather than accumulating dead
+// mappings until somebody explicitly writes to drop_caches.
+struct PageCacheRegistry {
+    entries: Vec<Weak<PageCache>>,
+    cursor: usize,
+}
+
+impl PageCacheRegistry {
+    const SCAN_BUDGET: usize = 16;
+
+    const fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+            cursor: 0,
+        }
+    }
+
+    fn register(&mut self, cache: &Arc<PageCache>) {
+        for _ in 0..Self::SCAN_BUDGET {
+            if self.entries.is_empty() {
+                self.cursor = 0;
+                break;
+            }
+            if self.cursor >= self.entries.len() {
+                self.cursor = 0;
+            }
+            // Do not upgrade here: dropping a temporary last strong reference
+            // could run PageCache teardown while the registry spinlock is held.
+            if self.entries[self.cursor].strong_count() == 0 {
+                self.entries.swap_remove(self.cursor);
+            } else {
+                self.cursor += 1;
+            }
+        }
+        self.entries.push(Arc::downgrade(cache));
+    }
+}
+
 fn register_page_cache(cache: &Arc<PageCache>) {
-    PAGECACHE_REGISTRY
-        .lock_irqsave()
-        .push(Arc::downgrade(cache));
+    PAGECACHE_REGISTRY.lock_irqsave().register(cache);
 }
 
 pub fn list_page_caches() -> Vec<Arc<PageCache>> {
     let mut guard = PAGECACHE_REGISTRY.lock_irqsave();
     let mut caches = Vec::new();
-    guard.retain(|weak| {
+    guard.entries.retain(|weak| {
         if let Some(cache) = weak.upgrade() {
             caches.push(cache);
             true
@@ -630,6 +668,7 @@ pub fn list_page_caches() -> Vec<Arc<PageCache>> {
             false
         }
     });
+    guard.cursor = 0;
     caches
 }
 

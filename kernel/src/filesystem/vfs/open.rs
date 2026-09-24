@@ -17,10 +17,10 @@ use super::{
     VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
 use crate::libs::casting::DowncastArc;
+use crate::process::namespace::user_namespace::map_id_down;
 use crate::{filesystem::vfs::syscall::UtimensFlags, process::cred::Kgid};
 use crate::{
     process::cred::CAPFlags,
-    process::cred::GroupInfo,
     time::{syscall::PosixTimeval, PosixTimeSpec},
 };
 use crate::{process::ProcessManager, syscall::user_access::vfs_check_and_clone_cstr};
@@ -125,16 +125,22 @@ pub fn do_fchmodat(dirfd: i32, path: *const u8, mode: InodeMode) -> Result<usize
 /// fchmod：对已解析的 inode 进行 chmod（供 `sys_fchmod` 复用）。
 pub fn do_fchmod(inode: Arc<dyn IndexNode>, mode: InodeMode) -> Result<usize, SystemError> {
     let cred = ProcessManager::current_pcb().cred();
-    let mut metadata = inode.metadata()?;
-
-    // Linux 语义：chmod/fchmod 需要是 inode 所有者，或具备 CAP_FOWNER
-    if cred.fsuid.data() != metadata.uid && !cred.has_capability(CAPFlags::CAP_FOWNER) {
-        return Err(SystemError::EPERM);
-    }
-
-    metadata.mode = chmod_preserve_type(metadata.mode, mode);
-    metadata.ctime = PosixTimeSpec::now();
-    inode.set_metadata_masked(&metadata, SetMetadataMask::MODE | SetMetadataMask::CTIME)?;
+    inode.update_metadata_masked(&mut |current| {
+        // A pipe may change owners concurrently; evaluate permission from the
+        // same metadata snapshot that its inode commits under the inner lock.
+        if !cred.is_owner_or_capable(current) {
+            return Err(SystemError::EPERM);
+        }
+        let mut metadata = current.clone();
+        metadata.mode = chmod_preserve_type(current.mode, mode);
+        let gid = Kgid::from(current.gid);
+        let has_fsetid = cred.has_capability_wrt_inode_uidgid(current, CAPFlags::CAP_FSETID);
+        if !has_fsetid && cred.fsgid.data() != current.gid && !cred.getgroups().contains(&gid) {
+            metadata.mode.remove(InodeMode::S_ISGID);
+        }
+        metadata.ctime = PosixTimeSpec::now();
+        Ok((metadata, SetMetadataMask::MODE | SetMetadataMask::CTIME))
+    })?;
     // fsnotify: attribute change → IN_ATTRIB.
     fsnotify::fsnotify_inode(FsEvent::ATTRIB, &inode);
     Ok(0)
@@ -170,74 +176,94 @@ fn chown_common(inode: Arc<dyn IndexNode>, uid: usize, gid: usize) -> Result<usi
     // register-width inputs before interpreting (uid_t)-1 as "no change".
     let uid = uid as u32 as usize;
     let gid = gid as u32 as usize;
-    let mut meta = inode.metadata()?;
     let cred = ProcessManager::current_pcb().cred();
-    let current_uid = cred.uid.data();
-    let current_gid = cred.gid.data();
-    let mut group_info = GroupInfo::default();
-    if let Some(info) = cred.group_info.as_ref() {
-        group_info = info.clone();
-    }
+    let fsuid = cred.fsuid.data();
+    let fsgid = cred.fsgid.data();
+    let group_info = cred.group_info.clone().unwrap_or_default();
 
     // Linux semantics: uid/gid passed in as (uid_t)-1/(gid_t)-1 mean "do not change".
     let is_no_change = |id: usize| id == u32::MAX as usize;
     let change_uid = !is_no_change(uid);
     let change_gid = !is_no_change(gid);
-    let old_gid = meta.gid;
-    let old_mode = meta.mode;
+    // Syscall IDs are local to current_user_ns, while inode IDs are global.
+    // Linux make_kuid/make_kgid rejects unmapped requested IDs with EINVAL.
+    let (uid, gid) = {
+        let inner = cred.user_ns.inner.lock();
+        let uid = if change_uid {
+            map_id_down(&inner.uid_map, uid as u32).ok_or(SystemError::EINVAL)? as usize
+        } else {
+            uid
+        };
+        let gid = if change_gid {
+            map_id_down(&inner.gid_map, gid as u32).ok_or(SystemError::EINVAL)? as usize
+        } else {
+            gid
+        };
+        (uid, gid)
+    };
+    let mask = inode.update_metadata_masked(&mut |current| {
+        let mut meta = current.clone();
+        let old_mode = current.mode;
+        let has_chown = cred.has_capability_wrt_inode_uidgid(current, CAPFlags::CAP_CHOWN);
+        let has_fsetid = cred.has_capability_wrt_inode_uidgid(current, CAPFlags::CAP_FSETID);
 
-    // 检查权限
-    match current_uid {
-        0 => {
-            if change_uid {
-                meta.uid = uid;
-            }
-            if change_gid {
-                meta.gid = gid;
+        // Linux chown_ok/chgrp_ok: retaining one's own uid, or choosing an
+        // owned file's group, is allowed; arbitrary changes require CAP_CHOWN.
+        if change_uid && !has_chown && (fsuid != current.uid || uid != current.uid) {
+            return Err(SystemError::EPERM);
+        }
+        if change_gid
+            && !has_chown
+            && (fsuid != current.uid
+                || (gid != current.gid
+                    && gid != fsgid
+                    && !cred.getgroups().contains(&Kgid::from(gid))
+                    && !group_info.gids.contains(&Kgid::from(gid))))
+        {
+            return Err(SystemError::EPERM);
+        }
+        if change_uid {
+            meta.uid = uid;
+        }
+        if change_gid {
+            meta.gid = gid;
+        }
+
+        // Linux clears setid bits on chown of non-directories. A resulting
+        // MODE update still requires owner/CAP_FOWNER, even for (-1, -1).
+        if meta.file_type != FileType::Dir {
+            meta.mode.remove(InodeMode::S_ISUID);
+            if should_remove_sgid_on_chown(meta.mode, current.gid, &cred, &group_info, has_fsetid) {
+                meta.mode.remove(InodeMode::S_ISGID);
             }
         }
-        _ => {
-            // 非文件所有者不能更改信息，且不能更改uid
-            if current_uid != meta.uid || (change_uid && uid != meta.uid) {
-                return Err(SystemError::EPERM);
-            }
-            if change_gid {
-                if gid != current_gid && !group_info.gids.contains(&Kgid::from(gid)) {
-                    return Err(SystemError::EPERM);
-                }
-                meta.gid = gid;
-            }
-        }
-    }
-
-    // Linux 语义：
-    // - chown 目录：不清除 suid/sgid（setgid 目录用于组继承）
-    // - chown 普通文件：总是清除 suid；sgid 按 Linux setattr_should_drop_sgid 规则清理
-    //   - 若 S_IXGRP 置位：无条件清除 sgid
-    //   - 否则（mandatory locking 语义）：仅当调用者不在文件所属组且无 CAP_FSETID 时清除
-    if meta.file_type != FileType::Dir {
-        // suid always must be killed on chown for non-directories
-        meta.mode.remove(InodeMode::S_ISUID);
-
-        if should_remove_sgid_on_chown(meta.mode, old_gid, current_gid, &cred, &group_info) {
+        // When clearing SUID turns chown into a MODE update, Linux
+        // setattr_prepare checks SGID against the requested *new* GID.
+        if meta.mode != old_mode
+            && meta.mode.contains(InodeMode::S_ISGID)
+            && !has_fsetid
+            && fsgid != meta.gid
+            && !cred.getgroups().contains(&Kgid::from(meta.gid))
+            && !group_info.gids.contains(&Kgid::from(meta.gid))
+        {
             meta.mode.remove(InodeMode::S_ISGID);
         }
-    }
-    let mut mask = SetMetadataMask::empty();
-    if change_uid {
-        mask.insert(SetMetadataMask::UID);
-    }
-    if change_gid {
-        mask.insert(SetMetadataMask::GID);
-    }
-    if meta.mode != old_mode {
-        mask.insert(SetMetadataMask::MODE);
-    }
-    // Linux chown always updates ctime, even for chown(-1, -1). A ctime-only
-    // update is not, however, exposed as IN_ATTRIB.
-    meta.ctime = PosixTimeSpec::now();
-    mask.insert(SetMetadataMask::CTIME);
-    inode.set_metadata_masked(&meta, mask)?;
+        if meta.mode != old_mode && !cred.is_owner_or_capable(current) {
+            return Err(SystemError::EPERM);
+        }
+        let mut mask = SetMetadataMask::CTIME;
+        if change_uid {
+            mask.insert(SetMetadataMask::UID);
+        }
+        if change_gid {
+            mask.insert(SetMetadataMask::GID);
+        }
+        if meta.mode != old_mode {
+            mask.insert(SetMetadataMask::MODE);
+        }
+        meta.ctime = PosixTimeSpec::now();
+        Ok((meta, mask))
+    })?;
     if mask.intersects(SetMetadataMask::UID | SetMetadataMask::GID | SetMetadataMask::MODE) {
         fsnotify::fsnotify_inode(FsEvent::ATTRIB, &inode);
     }
@@ -256,7 +282,7 @@ pub fn ksys_fchown(fd: i32, uid: usize, gid: usize) -> Result<usize, SystemError
         return Err(SystemError::EBADF);
     }
 
-    let inode = file.inode();
+    let inode = file.path_inode();
 
     drop(fd_table);
     return chown_common(inode, uid, gid);
@@ -666,57 +692,47 @@ pub fn do_utimensat(
                 return Err(SystemError::EBADF);
             }
 
-            file.inode()
+            file.path_inode()
         }
     };
-    let now = PosixTimeSpec::now();
-    let mut meta = inode.metadata()?;
-
-    let both_omit =
-        times.is_some_and(|times| times[0].tv_nsec == UTIME_OMIT && times[1].tv_nsec == UTIME_OMIT);
-    if both_omit {
-        return Ok(0);
-    }
     let both_now =
         times.is_none_or(|times| times[0].tv_nsec == UTIME_NOW && times[1].tv_nsec == UTIME_NOW);
-    check_timestamp_update_permission(&inode, &meta, both_now)?;
-
-    if let Some([atime, mtime]) = times {
+    inode.update_metadata_masked(&mut |current| {
+        check_timestamp_update_permission(&inode, current, both_now)?;
+        let mut meta = current.clone();
+        let now = PosixTimeSpec::now();
         let mut mask = SetMetadataMask::empty();
-        if atime.tv_nsec == UTIME_NOW {
-            meta.atime = now;
-            mask.insert(SetMetadataMask::ATIME);
-        } else if atime.tv_nsec != UTIME_OMIT {
-            meta.atime = atime;
-            mask.insert(SetMetadataMask::ATIME);
-        }
-        if mtime.tv_nsec == UTIME_NOW {
-            meta.mtime = now;
-            mask.insert(SetMetadataMask::MTIME);
-        } else if mtime.tv_nsec != UTIME_OMIT {
-            meta.mtime = mtime;
-            mask.insert(SetMetadataMask::MTIME);
-        }
-        if !mask.is_empty() {
+        if let Some([atime, mtime]) = times {
+            if atime.tv_nsec == UTIME_NOW {
+                meta.atime = now;
+                mask.insert(SetMetadataMask::ATIME);
+            } else if atime.tv_nsec != UTIME_OMIT {
+                meta.atime = atime;
+                mask.insert(SetMetadataMask::ATIME);
+            }
+            if mtime.tv_nsec == UTIME_NOW {
+                meta.mtime = now;
+                mask.insert(SetMetadataMask::MTIME);
+            } else if mtime.tv_nsec != UTIME_OMIT {
+                meta.mtime = mtime;
+                mask.insert(SetMetadataMask::MTIME);
+            }
             meta.ctime = now;
             mask.insert(SetMetadataMask::CTIME);
             if both_now {
                 mask.insert(SetMetadataMask::TIMES_BY_WRITE);
             }
-        }
-        inode.set_metadata_masked(&meta, mask)?;
-    } else {
-        meta.atime = now;
-        meta.mtime = now;
-        meta.ctime = now;
-        inode.set_metadata_masked(
-            &meta,
-            SetMetadataMask::ATIME
+        } else {
+            meta.atime = now;
+            meta.mtime = now;
+            meta.ctime = now;
+            mask = SetMetadataMask::ATIME
                 | SetMetadataMask::MTIME
                 | SetMetadataMask::CTIME
-                | SetMetadataMask::TIMES_BY_WRITE,
-        )?;
-    }
+                | SetMetadataMask::TIMES_BY_WRITE;
+        }
+        Ok((meta, mask))
+    })?;
     // fsnotify: timestamp change → IN_ATTRIB.
     fsnotify::fsnotify_inode(FsEvent::ATTRIB, &inode);
     return Ok(0);
@@ -740,30 +756,22 @@ pub fn do_utimes(path: &str, times: Option<[PosixTimeval; 2]>) -> Result<usize, 
         path,
     )?;
     let inode = inode_begin.lookup_follow_symlink(path.as_str(), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
-    let mut meta = inode.metadata()?;
-    check_timestamp_update_permission(&inode, &meta, times.is_none())?;
-
-    if let Some([atime, mtime]) = times {
-        meta.atime = PosixTimeSpec::from(atime);
-        meta.mtime = PosixTimeSpec::from(mtime);
-        meta.ctime = PosixTimeSpec::now();
-        inode.set_metadata_masked(
-            &meta,
-            SetMetadataMask::ATIME | SetMetadataMask::MTIME | SetMetadataMask::CTIME,
-        )?;
-    } else {
+    inode.update_metadata_masked(&mut |current| {
+        check_timestamp_update_permission(&inode, current, times.is_none())?;
+        let mut meta = current.clone();
         let now = PosixTimeSpec::now();
-        meta.atime = now;
-        meta.mtime = now;
+        let mut mask = SetMetadataMask::ATIME | SetMetadataMask::MTIME | SetMetadataMask::CTIME;
+        if let Some([atime, mtime]) = times {
+            meta.atime = PosixTimeSpec::from(atime);
+            meta.mtime = PosixTimeSpec::from(mtime);
+        } else {
+            meta.atime = now;
+            meta.mtime = now;
+            mask.insert(SetMetadataMask::TIMES_BY_WRITE);
+        }
         meta.ctime = now;
-        inode.set_metadata_masked(
-            &meta,
-            SetMetadataMask::ATIME
-                | SetMetadataMask::MTIME
-                | SetMetadataMask::CTIME
-                | SetMetadataMask::TIMES_BY_WRITE,
-        )?;
-    }
+        Ok((meta, mask))
+    })?;
     // fsnotify: a successful utimes(2) timestamp update → IN_ATTRIB.
     fsnotify::fsnotify_inode(FsEvent::ATTRIB, &inode);
     return Ok(0);
@@ -775,7 +783,7 @@ fn check_timestamp_update_permission(
     may_use_write_permission: bool,
 ) -> Result<(), SystemError> {
     let cred = ProcessManager::current_pcb().cred();
-    if cred.fsuid.data() == metadata.uid || cred.has_capability(CAPFlags::CAP_FOWNER) {
+    if cred.is_owner_or_capable(metadata) {
         return Ok(());
     }
     if may_use_write_permission {

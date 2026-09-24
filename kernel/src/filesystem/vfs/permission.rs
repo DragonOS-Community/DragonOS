@@ -8,6 +8,7 @@ use crate::{
     filesystem::vfs::{mount::MountFS, FileType, InodeMode},
     libs::casting::DowncastArc,
     process::cred::{CAPFlags, Cred},
+    process::namespace::user_namespace::map_id_up,
     process::ProcessManager,
 };
 use alloc::sync::Arc;
@@ -222,6 +223,35 @@ impl Cred {
     #[inline]
     pub fn is_owner(&self, metadata: &Metadata) -> bool {
         self.fsuid.data() == metadata.uid
+    }
+
+    /// Linux capable_wrt_inode_uidgid(): a capability in a user namespace
+    /// cannot authorize changes to an inode whose owner IDs are unmapped.
+    pub fn has_capability_wrt_inode_uidgid(&self, metadata: &Metadata, cap: CAPFlags) -> bool {
+        if !self.has_capability(cap) {
+            return false;
+        }
+        let (Ok(uid), Ok(gid)) = (u32::try_from(metadata.uid), u32::try_from(metadata.gid)) else {
+            return false;
+        };
+        let inner = self.user_ns.inner.lock();
+        map_id_up(&inner.uid_map, uid).is_some() && map_id_up(&inner.gid_map, gid).is_some()
+    }
+
+    /// Linux inode_owner_or_capable(): CAP_FOWNER only needs the inode UID
+    /// mapped; an exact fsuid owner match needs no capability.
+    pub fn is_owner_or_capable(&self, metadata: &Metadata) -> bool {
+        if self.is_owner(metadata) {
+            return true;
+        }
+        if !self.has_capability(CAPFlags::CAP_FOWNER) {
+            return false;
+        }
+        let Ok(uid) = u32::try_from(metadata.uid) else {
+            return false;
+        };
+        let inner = self.user_ns.inner.lock();
+        map_id_up(&inner.uid_map, uid).is_some()
     }
 
     /// 检查进程是否在 inode 的所属组中

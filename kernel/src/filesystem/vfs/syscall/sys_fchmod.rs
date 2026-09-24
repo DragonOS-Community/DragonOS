@@ -34,7 +34,7 @@ impl Syscall for SysFchmodHandle {
 
         // 通过 inode 修改元数据（保留文件类型位，仅替换权限/特殊位）
         // 注意：read()/write() 权限只在 open 时检查，chmod 不影响已打开 fd 的读写能力。
-        do_fchmod(file.inode(), mode)
+        do_fchmod(file.path_inode(), mode)
     }
 
     fn entry_format(&self, args: &[usize]) -> Vec<FormattedSyscallParam> {

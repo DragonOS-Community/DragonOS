@@ -113,6 +113,7 @@ normal/page_cache_accounting
 normal/page_fault_accounting
 normal/pipe_release_wakeup
 normal/pipe_waitqueue_wakeup
+normal/pipe_metadata
 normal/oom_killer_semantics
 normal/spawn_exec_pipe_race
 normal/tty_pty_hangup

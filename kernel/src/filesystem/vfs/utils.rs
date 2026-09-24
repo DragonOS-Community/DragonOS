@@ -386,12 +386,10 @@ pub fn should_remove_sgid(mode: InodeMode, gid: usize, cred: &Arc<Cred>) -> bool
 pub fn should_remove_sgid_on_chown(
     mode: InodeMode,
     old_gid: usize,
-    current_gid: usize,
     cred: &Arc<Cred>,
     group_info: &crate::process::cred::GroupInfo,
+    has_cap_fsetid: bool,
 ) -> bool {
-    use crate::process::cred::CAPFlags;
-
     if !mode.contains(InodeMode::S_ISGID) {
         return false;
     }
@@ -404,11 +402,9 @@ pub fn should_remove_sgid_on_chown(
     // 注意：Linux 这里检查的是"原 inode gid"，在 notify_change 前尚未更新。
     let kgid = Kgid::from(old_gid);
     let in_group = cred.fsgid.data() == old_gid
-        || cred.egid.data() == old_gid
-        || current_gid == old_gid
         || cred.getgroups().contains(&kgid)
         || group_info.gids.contains(&kgid)
-        || cred.has_capability(CAPFlags::CAP_FSETID);
+        || has_cap_fsetid;
 
     // 仅当调用者不在原文件所属组且无 CAP_FSETID 时清除
     !in_group

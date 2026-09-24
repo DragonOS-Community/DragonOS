@@ -10,9 +10,10 @@ use crate::{
         vfs::{
             fasync::{FAsyncItem, FAsyncItems, FASYNC_POLL_IN, FASYNC_POLL_OUT},
             file::FileFlags,
+            merge_metadata_masked,
             vcore::generate_inode_id,
             FilePrivateData, FileSystem, FileType, FsInfo, IndexNode, InodeFlags, InodeMode, Magic,
-            Metadata, PollableInode, SuperBlock,
+            Metadata, MetadataUpdate, PollableInode, SetMetadataMask, SuperBlock,
         },
     },
     ipc::signal::send_kernel_signal_to_current,
@@ -234,6 +235,9 @@ impl PipeFsPrivateData {
 /// @brief 管道文件i节点(锁)
 #[derive(Debug)]
 pub struct LockedPipeInode {
+    /// Serializes attribute read/check/commit without holding the I/O spinlock
+    /// across VFS permission checks. Lock order: metadata_transaction -> inner.
+    metadata_transaction: Mutex<()>,
     /// Serializes writes and output-side splice operations for this pipe.
     ///
     /// Lock order is `writer_transaction` -> `inner`. A blocking writer drops
@@ -584,6 +588,15 @@ impl LockedPipeInode {
     }
 
     pub fn new() -> Arc<Self> {
+        Self::new_with_owner(0, 0, PosixTimeSpec::default())
+    }
+
+    /// Create an anonymous pipe with the creator's filesystem IDs and time.
+    pub fn new_anonymous(uid: usize, gid: usize) -> Arc<Self> {
+        Self::new_with_owner(uid, gid, PosixTimeSpec::now())
+    }
+
+    fn new_with_owner(uid: usize, gid: usize, time: PosixTimeSpec) -> Arc<Self> {
         let inner = InnerPipeInode {
             self_ref: Weak::default(),
             valid_cnt: 0,
@@ -597,18 +610,18 @@ impl LockedPipeInode {
             metadata: Metadata {
                 dev_id: 0,
                 inode_id: generate_inode_id(),
-                size: PIPE_BUFF_SIZE as i64,
+                size: 0,
                 blk_size: 0,
                 blocks: 0,
-                atime: PosixTimeSpec::default(),
-                mtime: PosixTimeSpec::default(),
-                ctime: PosixTimeSpec::default(),
+                atime: time,
+                mtime: time,
+                ctime: time,
                 btime: PosixTimeSpec::default(),
                 file_type: FileType::Pipe,
-                mode: InodeMode::from_bits_truncate(0o666),
+                mode: InodeMode::S_IFIFO | InodeMode::from_bits_truncate(0o600),
                 nlinks: 1,
-                uid: 0,
-                gid: 0,
+                uid,
+                gid,
                 raw_dev: Default::default(),
                 flags: InodeFlags::empty(),
             },
@@ -620,6 +633,7 @@ impl LockedPipeInode {
             w_counter: 0,   // 初始化写端计数器
         };
         let result = Arc::new(Self {
+            metadata_transaction: Mutex::new(()),
             writer_transaction: Mutex::new(()),
             inner: SpinLock::new(inner),
             read_wait_queue: WaitQueue::default(),
@@ -811,7 +825,6 @@ impl LockedPipeInode {
         }
 
         inner.buf_size = new_size;
-        inner.metadata.size = new_size as i64;
 
         let writer_wake = Self::writer_wake_action(&mut inner);
         let pollflag = inner.poll_both_ends();
@@ -2090,6 +2103,27 @@ impl IndexNode for LockedPipeInode {
     fn metadata(&self) -> Result<crate::filesystem::vfs::Metadata, SystemError> {
         let inode = self.inner.lock();
         return Ok(inode.metadata.clone());
+    }
+
+    fn set_metadata_masked(
+        &self,
+        metadata: &Metadata,
+        mask: SetMetadataMask,
+    ) -> Result<(), SystemError> {
+        let _transaction = self.metadata_transaction.lock();
+        merge_metadata_masked(&mut self.inner.lock().metadata, metadata, mask);
+        Ok(())
+    }
+
+    fn update_metadata_masked(
+        &self,
+        update: &mut MetadataUpdate<'_>,
+    ) -> Result<SetMetadataMask, SystemError> {
+        let _transaction = self.metadata_transaction.lock();
+        let current = self.inner.lock().metadata.clone();
+        let (requested, mask) = update(&current)?;
+        merge_metadata_masked(&mut self.inner.lock().metadata, &requested, mask);
+        Ok(mask)
     }
 
     fn close(&self, data: MutexGuard<FilePrivateData>) -> Result<(), SystemError> {

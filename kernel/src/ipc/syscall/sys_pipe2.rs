@@ -26,7 +26,8 @@ pub(super) fn do_kernel_pipe2(fd: *mut i32, flags: FileFlags) -> Result<usize, S
 
     let mut user_buffer = UserBufferWriter::new(fd, core::mem::size_of::<[c_int; 2]>(), true)?;
     let fd = user_buffer.buffer::<i32>(0)?;
-    let pipe_ptr = LockedPipeInode::new();
+    let cred = ProcessManager::current_pcb().cred();
+    let pipe_ptr = LockedPipeInode::new_anonymous(cred.fsuid.data(), cred.fsgid.data());
 
     let read_file = File::new(
         pipe_ptr.clone(),

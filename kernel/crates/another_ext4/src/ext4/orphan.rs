@@ -15,6 +15,72 @@ pub(super) struct LegacyOrphanChain {
     pub(super) inodes: Vec<InodeId>,
 }
 
+/// Membership and predecessor links for a completely validated logical chain.
+/// The metadata mutation gate excludes writers while this index is used.
+/// Transaction-private updates are invalidated on abort, never rolled forward
+/// by an older batch checkpoint.
+#[derive(Default)]
+pub(super) struct LegacyOrphanIndex {
+    head: InodeId,
+    entries: BTreeMap<InodeId, (InodeId, InodeId)>,
+}
+
+impl LegacyOrphanIndex {
+    fn from_chain(chain: &[InodeId]) -> Self {
+        let mut result = Self::default();
+        result.head = chain.first().copied().unwrap_or(0);
+        for (position, id) in chain.iter().copied().enumerate() {
+            let previous = position.checked_sub(1).map(|i| chain[i]).unwrap_or(0);
+            let next = chain.get(position + 1).copied().unwrap_or(0);
+            result.entries.insert(id, (previous, next));
+        }
+        result
+    }
+
+    fn predecessor(&self, id: InodeId) -> Result<InodeId> {
+        self.entries
+            .get(&id)
+            .map(|entry| entry.0)
+            .ok_or_else(corruption)
+    }
+
+    fn add(&mut self, id: InodeId, old_head: InodeId) -> Result<()> {
+        if id == 0 || self.head != old_head || self.entries.contains_key(&id) {
+            return Err(corruption());
+        }
+        if old_head != 0 && self.entries.get(&old_head).map(|entry| entry.0) != Some(0) {
+            return Err(corruption());
+        }
+        self.entries.insert(id, (0, old_head));
+        if let Some(entry) = self.entries.get_mut(&old_head) {
+            entry.0 = id;
+        }
+        self.head = id;
+        Ok(())
+    }
+
+    fn remove(&mut self, id: InodeId, next: InodeId) -> Result<()> {
+        let (previous, expected_next) = *self.entries.get(&id).ok_or_else(corruption)?;
+        if next != expected_next
+            || (previous == 0 && self.head != id)
+            || (previous != 0 && self.entries.get(&previous).map(|entry| entry.1) != Some(id))
+            || (next != 0 && self.entries.get(&next).map(|entry| entry.0) != Some(id))
+        {
+            return Err(corruption());
+        }
+        if let Some(entry) = self.entries.get_mut(&previous) {
+            entry.1 = next;
+        } else {
+            self.head = next;
+        }
+        if let Some(entry) = self.entries.get_mut(&next) {
+            entry.0 = previous;
+        }
+        self.entries.remove(&id);
+        Ok(())
+    }
+}
+
 /// The durable role of an inode in the legacy orphan chain.
 ///
 /// A linked tail is not interchangeable with a final-unlink orphan.  The
@@ -140,17 +206,38 @@ impl Ext4 {
         Err(corruption())
     }
 
-    /// Verify that `inode_id` is a member of the complete, valid legacy list.
-    ///
-    /// Reclaim calls this while holding the target inode's mutation shard.  A
-    /// complete bounded walk is intentional: accepting a locally plausible
-    /// node from a corrupt list could permanently lose the remainder at final
-    /// deletion.
+    /// Query a completely validated logical list. Callers hold a metadata
+    /// mutation/read gate (or the unpublished mount-recovery exclusion).
+    /// The first query after construction or an aborted update validates the
+    /// complete chain; subsequent queries use transaction-maintained links.
     pub(super) fn legacy_orphan_contains(&self, inode_id: InodeId) -> Result<bool> {
-        Ok(self
-            .validate_legacy_orphan_chain()?
-            .inodes
-            .contains(&inode_id))
+        self.ensure_orphan_index()?;
+        Ok(self.orphan_index.lock().entries.contains_key(&inode_id))
+    }
+
+    fn ensure_orphan_index(&self) -> Result<()> {
+        use core::sync::atomic::Ordering;
+        if self.orphan_index_valid.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        // Do not hold a spinlock while validating metadata through block I/O.
+        // The caller's metadata gate excludes every chain mutation. Compatible
+        // read callers can build the same validated snapshot concurrently.
+        let chain = self.validate_legacy_orphan_chain()?;
+        *self.orphan_index.lock() = LegacyOrphanIndex::from_chain(&chain.inodes);
+        self.orphan_index_valid.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    fn index_orphan_add(
+        &self,
+        transaction: &mut super::journal_transaction::Transaction<'_>,
+        inode: InodeId,
+        old_head: InodeId,
+    ) -> Result<()> {
+        self.ensure_orphan_index()?;
+        transaction.track_orphan_index(self.orphan_index_valid.clone());
+        self.orphan_index.lock().add(inode, old_head)
     }
 
     /// Insert a zero-link inode at the head of the legacy orphan list in the
@@ -172,6 +259,7 @@ impl Ext4 {
         if old_head == inode.id || (old_head != 0 && !valid_orphan_number(self, old_head)) {
             return Err(corruption());
         }
+        self.index_orphan_add(transaction, inode.id, old_head)?;
         inode.inode.set_next_orphan(old_head);
         self.transaction_stage_inode_with_csum(transaction, inode)?;
         sb.set_last_orphan(inode.id);
@@ -202,6 +290,7 @@ impl Ext4 {
         if old_head == inode.id || (old_head != 0 && !valid_orphan_number(self, old_head)) {
             return Err(corruption());
         }
+        self.index_orphan_add(transaction, inode.id, old_head)?;
         inode.inode.set_next_orphan(old_head);
         self.transaction_stage_inode_with_csum(transaction, inode)?;
         sb.set_last_orphan(inode.id);
@@ -279,8 +368,9 @@ impl Ext4 {
 
     /// Remove an inode from the legacy orphan chain in the caller's final
     /// reclaim transaction. Both head and non-head deletion are supported.
-    /// The walk is bounded by `s_inodes_count` and validates every visited
-    /// inode before changing either the predecessor or superblock image.
+    /// The validated index finds the predecessor without a full chain walk.
+    /// Allocation, checksums, generation and links are checked against the
+    /// authoritative local images before staging predecessor/head changes.
     pub(super) fn transaction_orphan_del(
         &self,
         transaction: &mut super::journal_transaction::Transaction<'_>,
@@ -293,46 +383,43 @@ impl Ext4 {
             return Err(corruption());
         }
 
-        let mut current = sb.last_orphan();
-        let mut predecessor: Option<InodeRef> = None;
-        let mut visited = BTreeSet::new();
-        while current != 0 {
-            if !valid_orphan_number(self, current)
-                || visited.len() >= sb.inode_count() as usize
-                || !visited.insert(current)
-                || !self.inode_is_allocated(current)?
-            {
-                return Err(corruption());
-            }
-            let current_inode = self.read_inode_uncached(current)?;
-            if !inode_checksum_valid(sb, &current_inode)
-                || current_inode.inode.file_type() == FileType::Unknown
-            {
-                return Err(corruption());
-            }
-            let next = current_inode.inode.next_orphan();
-            if next != 0 && !valid_orphan_number(self, next) {
-                return Err(corruption());
-            }
-            if current == target {
-                if current_inode.inode.generation() != inode.inode.generation()
-                    || next != target_next
-                {
-                    return Err(corruption());
-                }
-                if let Some(mut pred) = predecessor {
-                    pred.inode.set_next_orphan(target_next);
-                    self.transaction_stage_inode_with_csum(transaction, &mut pred)?;
-                } else {
-                    sb.set_last_orphan(target_next);
-                    self.transaction_stage_super_block(transaction, sb)?;
-                }
-                return Ok(());
-            }
-            predecessor = Some(current_inode);
-            current = next;
+        self.ensure_orphan_index()?;
+        let predecessor = self.orphan_index.lock().predecessor(target)?;
+        // The index identifies the predecessor; authoritative local images
+        // still establish allocation, checksum, generation and exact links.
+        if !self.inode_is_allocated(target)? {
+            return Err(corruption());
         }
-        Err(corruption())
+        let current = self.read_inode_uncached(target)?;
+        if !inode_checksum_valid(sb, &current)
+            || current.inode.file_type() == FileType::Unknown
+            || current.inode.generation() != inode.inode.generation()
+            || current.inode.next_orphan() != target_next
+        {
+            return Err(corruption());
+        }
+        if predecessor != 0 {
+            if !self.inode_is_allocated(predecessor)? {
+                return Err(corruption());
+            }
+            let mut pred = self.read_inode_uncached(predecessor)?;
+            if !inode_checksum_valid(sb, &pred)
+                || pred.inode.file_type() == FileType::Unknown
+                || pred.inode.next_orphan() != target
+            {
+                return Err(corruption());
+            }
+            pred.inode.set_next_orphan(target_next);
+            self.transaction_stage_inode_with_csum(transaction, &mut pred)?;
+        } else {
+            if sb.last_orphan() != target {
+                return Err(corruption());
+            }
+            sb.set_last_orphan(target_next);
+            self.transaction_stage_super_block(transaction, sb)?;
+        }
+        transaction.track_orphan_index(self.orphan_index_valid.clone());
+        self.orphan_index.lock().remove(target, target_next)
     }
 
     /// Reject formats whose orphan state this implementation cannot update.
@@ -451,6 +538,34 @@ impl LegacyOrphanReader for Ext4 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validated_index_tracks_head_middle_tail_and_reuse() {
+        let mut index = LegacyOrphanIndex::from_chain(&[11, 12, 13]);
+        assert_eq!(index.predecessor(11).unwrap(), 0);
+        assert_eq!(index.predecessor(13).unwrap(), 12);
+        index.remove(12, 13).unwrap();
+        assert_eq!(index.predecessor(13).unwrap(), 11);
+        index.remove(11, 13).unwrap();
+        assert_eq!(index.predecessor(13).unwrap(), 0);
+        index.add(12, 13).unwrap();
+        index.remove(13, 0).unwrap();
+        index.remove(12, 0).unwrap();
+        assert!(index.entries.is_empty());
+        assert_eq!(index.head, 0);
+    }
+
+    #[test]
+    fn validated_index_rejects_inconsistent_transitions() {
+        let mut index = LegacyOrphanIndex::from_chain(&[11, 12, 13]);
+        assert!(index.add(12, 11).is_err());
+        assert!(index.add(14, 12).is_err());
+        assert!(index.remove(12, 0).is_err());
+        assert!(index.remove(14, 0).is_err());
+        assert_eq!(index.head, 11);
+        assert_eq!(index.entries.len(), 3);
+        assert_eq!(index.predecessor(13).unwrap(), 12);
+    }
 
     struct MockReader {
         nodes: BTreeMap<InodeId, (bool, OrphanNode)>,

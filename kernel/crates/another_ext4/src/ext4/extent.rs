@@ -2954,6 +2954,8 @@ mod tests {
         Ext4 {
             block_device,
             metadata_cache: crate::ext4::MetadataBlockCache::new(16),
+            orphan_index: spin::Mutex::new(crate::ext4::orphan::LegacyOrphanIndex::default()),
+            orphan_index_valid: Arc::new(core::sync::atomic::AtomicBool::new(false)),
             cached_super_block: spin::Mutex::new(sb),
             cached_block_groups: Vec::new(),
             system_metadata_ranges: Vec::new(),
@@ -3003,6 +3005,8 @@ mod tests {
         Ext4 {
             block_device,
             metadata_cache: crate::ext4::MetadataBlockCache::new(16),
+            orphan_index: spin::Mutex::new(crate::ext4::orphan::LegacyOrphanIndex::default()),
+            orphan_index_valid: Arc::new(core::sync::atomic::AtomicBool::new(false)),
             cached_super_block: spin::Mutex::new(sb),
             cached_block_groups: Vec::new(),
             system_metadata_ranges: Vec::new(),

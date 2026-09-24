@@ -11,6 +11,7 @@ normal/test_pivot_root
 normal/mount_propagation
 normal/mount_object_topology
 normal/mount_limit
+normal/threads_max
 normal/open_dangling_symlink
 normal/utimensat_symlink
 normal/rtnetlink_link_semantics

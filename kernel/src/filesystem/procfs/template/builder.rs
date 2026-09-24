@@ -66,6 +66,12 @@ impl<F: FileOps> ProcFileBuilder<F> {
         self.flags.insert(InodeFlags::S_SYSCTL_READONLY);
         self
     }
+
+    /// Apply Linux proc_sys_permission and prevent changing sysctl ownership/mode.
+    pub fn sysctl_permissions(mut self) -> Self {
+        self.flags.insert(InodeFlags::S_PROC_SYSCTL);
+        self
+    }
 }
 
 impl<F> Builder<F> for ProcFileBuilder<F>

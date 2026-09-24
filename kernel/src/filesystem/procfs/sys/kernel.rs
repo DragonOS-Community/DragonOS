@@ -23,6 +23,8 @@ use alloc::{
 use core::sync::atomic::{AtomicU32, Ordering};
 use system_error::SystemError;
 
+use super::numeric::parse_numeric_sysctl;
+
 static OVERFLOW_UID: AtomicU32 = AtomicU32::new(DEFAULT_OVERFLOW_ID);
 static OVERFLOW_GID: AtomicU32 = AtomicU32::new(DEFAULT_OVERFLOW_ID);
 
@@ -56,6 +58,15 @@ impl DirOps for KernelDirOps {
                 }
 
                 let inode = CapLastCapFileOps::new_inode(dir.self_ref_weak().clone());
+                cached_children.insert(name.to_string(), inode.clone());
+                return Ok(inode);
+            }
+            "threads-max" => {
+                let mut cached_children = dir.cached_children().write();
+                if let Some(child) = cached_children.get(name) {
+                    return Ok(child.clone());
+                }
+                let inode = ThreadsMaxFileOps::new_inode(dir.self_ref_weak().clone());
                 cached_children.insert(name.to_string(), inode.clone());
                 return Ok(inode);
             }
@@ -108,6 +119,9 @@ impl DirOps for KernelDirOps {
         cached_children
             .entry("cap_last_cap".to_string())
             .or_insert_with(|| CapLastCapFileOps::new_inode(dir.self_ref_weak().clone()));
+        cached_children
+            .entry("threads-max".to_string())
+            .or_insert_with(|| ThreadsMaxFileOps::new_inode(dir.self_ref_weak().clone()));
         cached_children
             .entry("printk".to_string())
             .or_insert_with(|| PrintkFileOps::new_inode(dir.self_ref_weak().clone()));
@@ -162,6 +176,57 @@ impl FileOps for CapLastCapFileOps {
         }
         let content = format!("{CAP_LAST_CAP}\n");
         proc_read(0, len, buf, content.as_bytes())
+    }
+}
+
+#[derive(Debug)]
+struct ThreadsMaxFileOps;
+
+impl ThreadsMaxFileOps {
+    fn new_inode(parent: Weak<dyn IndexNode>) -> Arc<dyn IndexNode> {
+        ProcFileBuilder::new(Self, InodeMode::from_bits_truncate(0o644))
+            .parent(parent)
+            .sysctl_permissions()
+            .build()
+            .unwrap()
+    }
+}
+
+impl FileOps for ThreadsMaxFileOps {
+    fn read_at(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &mut [u8],
+        _data: MutexGuard<FilePrivateData>,
+    ) -> Result<usize, SystemError> {
+        if offset != 0 {
+            return Ok(0);
+        }
+        let content = format!("{}\n", crate::process::max_threads());
+        proc_read(0, len, buf, content.as_bytes())
+    }
+
+    fn write_at(
+        &self,
+        offset: usize,
+        _len: usize,
+        buf: &[u8],
+        _data: MutexGuard<FilePrivateData>,
+    ) -> Result<usize, SystemError> {
+        if ProcessManager::current_pcb().cred().euid.data() != 0 {
+            return Err(SystemError::EPERM);
+        }
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        if offset != 0 {
+            return Ok(buf.len());
+        }
+        let (value, consumed) = parse_numeric_sysctl(buf)?;
+        let value = usize::try_from(value).map_err(|_| SystemError::EINVAL)?;
+        crate::process::set_max_threads(value)?;
+        Ok(consumed)
     }
 }
 

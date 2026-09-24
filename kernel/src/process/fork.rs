@@ -307,7 +307,7 @@ impl ProcessManager {
             name,
             new_kstack,
             args.flags.contains(CloneFlags::CLONE_THREAD),
-        );
+        )?;
         let ptrace_fork_session = Self::copy_process(&current_pcb, &pcb, args, current_trapframe)
             .map_err(|e| {
             error!(
@@ -680,6 +680,12 @@ impl ProcessManager {
             && !((clone_flags & (CloneFlags::CLONE_DETACHED | CloneFlags::CLONE_THREAD)).is_empty())
         {
             return Err(SystemError::EINVAL);
+        }
+
+        // Match Linux copy_process(): the check is intentionally not a
+        // reservation. Concurrent forks may slightly exceed the limit.
+        if crate::process::nr_threads() as usize >= crate::process::max_threads() {
+            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
         }
 
         // TODO: 克隆前应该锁信号处理，等待克隆完成后再处理

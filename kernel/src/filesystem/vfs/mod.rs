@@ -427,6 +427,8 @@ bitflags! {
         const S_KERNEL_FILE = (1 << 17);
         /// Read-only proc sysctl: write access cannot be granted by DAC capabilities.
         const S_SYSCTL_READONLY = (1 << 18);
+        /// Linux proc sysctl DAC uses global effective IDs, not fsuid/caps.
+        const S_PROC_SYSCTL = (1 << 19);
     }
 }
 

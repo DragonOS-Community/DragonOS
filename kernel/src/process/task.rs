@@ -360,14 +360,25 @@ impl ProcessControlBlock {
     /// ## Returns
     ///
     /// A new PCB.
-    pub fn new(name: String, kstack: KernelStack, share_resource_limits: bool) -> Arc<Self> {
+    pub fn new(
+        name: String,
+        kstack: KernelStack,
+        share_resource_limits: bool,
+    ) -> Result<Arc<Self>, SystemError> {
         let current = ProcessManager::current_pcb();
         let rlimits = if share_resource_limits {
             current.rlimits.clone()
         } else {
             Arc::new(RwLock::new(*current.rlimits.read()))
         };
-        return Self::do_create_pcb(name, kstack, false, Some(rlimits));
+        let syscall_stack = KernelStack::new()?;
+        Ok(Self::do_create_pcb(
+            name,
+            kstack,
+            syscall_stack,
+            false,
+            Some(rlimits),
+        ))
     }
 
     /// Create a new idle process.
@@ -376,7 +387,8 @@ impl ProcessControlBlock {
     /// initialization.
     pub fn new_idle(cpu_id: u32, kstack: KernelStack) -> Arc<Self> {
         let name = format!("idle-{}", cpu_id);
-        return Self::do_create_pcb(name, kstack, true, None);
+        let syscall_stack = KernelStack::new().expect("idle syscall stack allocation failed");
+        return Self::do_create_pcb(name, kstack, syscall_stack, true, None);
     }
 
     /// Returns whether the process is a kernel thread.
@@ -462,6 +474,7 @@ impl ProcessControlBlock {
     fn do_create_pcb(
         name: String,
         kstack: KernelStack,
+        syscall_stack: KernelStack,
         is_idle: bool,
         rlimits: Option<Arc<RwLock<[RLimit64; RLimitID::Nlimits as usize]>>>,
     ) -> Arc<Self> {
@@ -545,7 +558,7 @@ impl ProcessControlBlock {
                 visible_thread_accounted: AtomicBool::new(false),
                 task_lock: SpinLock::new(()),
                 kernel_stack: RwLock::new(kstack),
-                syscall_stack: RwLock::new(KernelStack::new().unwrap()),
+                syscall_stack: RwLock::new(syscall_stack),
                 worker_private: SpinLock::new(None),
                 sched_info,
                 arch_info,

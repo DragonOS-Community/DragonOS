@@ -12,11 +12,20 @@ use crate::{
 };
 
 #[derive(Debug)]
-struct KthreadSelftestCallback;
+struct KthreadSelftestCallback {
+    usermode: bool,
+}
+
+static KTHREAD_SELFTEST: KthreadSelftestCallback = KthreadSelftestCallback { usermode: false };
+static USERMODE_SELFTEST: KthreadSelftestCallback = KthreadSelftestCallback { usermode: true };
 
 impl KernFSCallback for KthreadSelftestCallback {
     fn open(&self, mut data: KernCallbackData) -> Result<(), SystemError> {
-        let report = crate::process::kthread::run_debug_selftests()?;
+        let report = if self.usermode {
+            crate::process::usermodehelper::run_debug_selftest()?
+        } else {
+            crate::process::kthread::run_debug_selftests()?
+        };
         data.file_private_data_mut()
             .replace(KernFilePrivateData::DebugTextSnapshot(report));
         Ok(())
@@ -69,7 +78,14 @@ pub fn init_debugfs_kthread() -> Result<(), SystemError> {
         InodeMode::S_IRUSR,
         Some(4096),
         None,
-        Some(&KthreadSelftestCallback),
+        Some(&KTHREAD_SELFTEST),
+    )?;
+    kthread.add_file(
+        "usermode_helper_selftest".to_string(),
+        InodeMode::S_IRUSR,
+        Some(4096),
+        None,
+        Some(&USERMODE_SELFTEST),
     )?;
     Ok(())
 }

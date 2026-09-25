@@ -5257,6 +5257,38 @@ impl IndexNode for MountFSInode {
         self.dentry.inode.mmap_vm_flags(file, vm_flags)
     }
 
+    fn prepare_mmap_file(
+        &self,
+        file: &Arc<File>,
+        vm_flags: VmFlags,
+    ) -> Result<(VmFlags, bool), SystemError> {
+        self.dentry.inode.prepare_mmap_file(file, vm_flags)
+    }
+
+    fn finish_mmap_prepare(&self) {
+        self.dentry.inode.finish_mmap_prepare()
+    }
+
+    fn get_seals(&self) -> Result<u32, SystemError> {
+        self.dentry.inode.get_seals()
+    }
+
+    fn add_seals(&self, seals: u32) -> Result<(), SystemError> {
+        self.dentry.inode.add_seals(seals)
+    }
+
+    fn proc_fd_link_target(&self) -> Option<Vec<u8>> {
+        self.dentry.inode.proc_fd_link_target()
+    }
+
+    fn begin_remote_write(&self) -> bool {
+        self.dentry.inode.begin_remote_write()
+    }
+
+    fn end_remote_write(&self) {
+        self.dentry.inode.end_remote_write()
+    }
+
     fn mmap_uses_anonymous_pages(&self) -> bool {
         self.dentry.inode.mmap_uses_anonymous_pages()
     }

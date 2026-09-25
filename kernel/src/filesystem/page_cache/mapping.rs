@@ -3,6 +3,7 @@ use super::{
     HashMap, LockedVMA, MMArch, MemoryManagementArch, MmuGather, Ordering, PageCache,
     PageCacheManager, PageState, RwSemReadGuard, RwSemWriteGuard, SystemError, Vec, Weak,
 };
+use crate::mm::page::PageFlags;
 
 #[derive(Debug, Default)]
 pub(super) struct FileVmaIndex {
@@ -394,6 +395,101 @@ impl PageCache {
         }
     }
 
+    /// Deallocate a shmem byte range without changing i_size.  Full pages
+    /// become sparse holes; a partial boundary is zeroed in its existing page.
+    /// The caller serializes content mutations and validates file seals.
+    pub fn punch_hole(&self, start: usize, end: usize) -> Result<(), SystemError> {
+        if start >= end {
+            return Ok(());
+        }
+        let affected_first = start >> MMArch::PAGE_SHIFT;
+        let affected_end = page_align_up(end) >> MMArch::PAGE_SHIFT;
+        let full_first = page_align_up(start) >> MMArch::PAGE_SHIFT;
+        let full_end = end >> MMArch::PAGE_SHIFT;
+        loop {
+            // Never acquire invalidate_write while holding an MM lock.  The
+            // removal pass rechecks map_count and retries any fault race.
+            self.unmap_mapping_pages(affected_first, Some(affected_end))?;
+            let committed = {
+                let _invalidate = self.invalidate_write();
+                if !self.remove_page_range_locked(full_first, Some(full_end), None)? {
+                    false
+                } else {
+                    if !start.is_multiple_of(MMArch::PAGE_SIZE) {
+                        let page_end = ((affected_first + 1) << MMArch::PAGE_SHIFT).min(end);
+                        self.zero_existing_page_bytes(
+                            affected_first,
+                            start % MMArch::PAGE_SIZE,
+                            page_end - (affected_first << MMArch::PAGE_SHIFT),
+                        )?;
+                    }
+                    if !end.is_multiple_of(MMArch::PAGE_SIZE) && affected_end - 1 != affected_first
+                    {
+                        self.zero_existing_page_bytes(
+                            affected_end - 1,
+                            0,
+                            end % MMArch::PAGE_SIZE,
+                        )?;
+                    } else if start.is_multiple_of(MMArch::PAGE_SIZE)
+                        && !end.is_multiple_of(MMArch::PAGE_SIZE)
+                    {
+                        self.zero_existing_page_bytes(affected_first, 0, end % MMArch::PAGE_SIZE)?;
+                    }
+                    true
+                }
+            };
+            if committed {
+                return Ok(());
+            }
+        }
+    }
+
+    fn zero_existing_page_bytes(
+        &self,
+        index: usize,
+        start: usize,
+        end: usize,
+    ) -> Result<(), SystemError> {
+        if start >= end {
+            return Ok(());
+        }
+        loop {
+            let entry = { self.inner.lock().get_entry(index) };
+            let Some(entry) = entry else {
+                return Ok(());
+            };
+            match entry.state() {
+                PageState::Loading => {
+                    let _ = entry.wait_ready();
+                    continue;
+                }
+                PageState::Writeback => {
+                    let _ = entry.wait_queue.wait_until(|| match entry.state() {
+                        PageState::Writeback => None,
+                        PageState::Error => Some(Err(SystemError::EIO)),
+                        _ => Some(Ok(())),
+                    });
+                    continue;
+                }
+                PageState::Error => return Err(SystemError::EIO),
+                _ => {}
+            }
+            let mut page = entry.page.write();
+            let same_entry = self
+                .inner
+                .lock()
+                .get_entry(index)
+                .is_some_and(|current| Arc::ptr_eq(&current, &entry));
+            if !same_entry {
+                continue;
+            }
+            unsafe { page.as_slice_mut()[start..end].fill(0) };
+            page.add_flags(PageFlags::PG_DIRTY);
+            self.mark_page_dirty_page_locked(index, &page)?;
+            return Ok(());
+        }
+    }
+
     /// Drop budget tickets whose last frozen page was removed by truncate.
     ///
     /// A budget-saturated WRITE leaves its page Dirty/tagged until a permit is
@@ -448,15 +544,34 @@ impl PageCache {
     /// unmap-and-lock sequence when this returns `false`.
     pub(crate) fn truncate_locked(&self, new_size: usize) -> Result<bool, SystemError> {
         let first_full_truncate_page = page_align_up(new_size) >> MMArch::PAGE_SHIFT;
+        self.remove_page_range_locked(first_full_truncate_page, None, Some(new_size))
+    }
+
+    /// Common removal engine for truncate and shmem hole punching.  The
+    /// caller owns invalidate_write and has unmapped the affected PTE range.
+    fn remove_page_range_locked(
+        &self,
+        first_page: usize,
+        end_page: Option<usize>,
+        truncate_tail_at: Option<usize>,
+    ) -> Result<bool, SystemError> {
         let mut removed_tagged_page = false;
         let truncate_indices: Vec<usize> = {
             let guard = self.inner.lock();
-            guard
-                .pages
-                .keys()
-                .copied()
-                .filter(|index| *index >= first_full_truncate_page)
-                .collect()
+            if let Some(end) =
+                end_page.filter(|end| end.saturating_sub(first_page) < guard.pages.len())
+            {
+                (first_page..end)
+                    .filter(|index| guard.pages.contains_key(index))
+                    .collect()
+            } else {
+                guard
+                    .pages
+                    .keys()
+                    .copied()
+                    .filter(|index| *index >= first_page && end_page.is_none_or(|end| *index < end))
+                    .collect()
+            }
         };
 
         for page_index in truncate_indices {
@@ -566,7 +681,9 @@ impl PageCache {
             PageCacheManager::notify_tagged_writeback_progress(self);
         }
 
-        if new_size > 0 && !new_size.is_multiple_of(MMArch::PAGE_SIZE) {
+        if let Some(new_size) =
+            truncate_tail_at.filter(|size| *size > 0 && !size.is_multiple_of(MMArch::PAGE_SIZE))
+        {
             let last_page_index = (new_size - 1) >> MMArch::PAGE_SHIFT;
             let last_len = new_size - (last_page_index << MMArch::PAGE_SHIFT);
             loop {

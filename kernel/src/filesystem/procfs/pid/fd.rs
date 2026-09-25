@@ -178,6 +178,11 @@ impl SymOps for FdSymOps {
 
         // 现在安全地获取文件的路径
         let inode = file.path_inode();
+        if let Some(target) = inode.proc_fd_link_target() {
+            let copy_len = target.len().min(buf.len());
+            buf[..copy_len].copy_from_slice(&target[..copy_len]);
+            return Ok(copy_len);
+        }
         let path_result = if let Some(mount_inode) = inode
             .clone()
             .downcast_arc::<crate::filesystem::vfs::mount::MountFSInode>(

@@ -36,6 +36,7 @@ mod sys_getdents;
 mod sys_ioctl;
 mod sys_linkat;
 mod sys_lseek;
+mod sys_memfd_create;
 mod sys_mkdirat;
 pub mod sys_mknodat;
 mod sys_openat;

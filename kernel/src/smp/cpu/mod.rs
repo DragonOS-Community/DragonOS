@@ -213,6 +213,17 @@ impl SmpCpuManager {
         &self.possible_cpus
     }
 
+    /// Snapshot CPUs which can currently run ordinary tasks.
+    pub fn online_cpus(&self) -> CpuMask {
+        let mut online = CpuMask::new();
+        for cpu in self.possible_cpus.iter_cpu() {
+            if self.is_online_cpu(cpu) {
+                online.set(cpu, true);
+            }
+        }
+        online
+    }
+
     pub fn possible_cpus_count(&self) -> u32 {
         self.possible_cnt.load(core::sync::atomic::Ordering::SeqCst)
     }

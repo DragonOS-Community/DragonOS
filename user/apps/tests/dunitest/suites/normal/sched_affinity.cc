@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <climits>
 #include <errno.h>
 #include <pthread.h>
 #include <sched.h>
@@ -197,6 +198,129 @@ TEST_F(SchedAffinityFixture, EmptyMaskRejected) {
     errno = 0;
     EXPECT_EQ(-1, sched_setaffinity(0, sizeof(empty), &empty));
     EXPECT_EQ(EINVAL, errno);
+}
+
+TEST_F(SchedAffinityFixture, NonexistentCpuIsDroppedWhenAnotherCpuIsAllowed) {
+    constexpr int kNonexistentCpu = CPU_SETSIZE - 1;
+    if (CPU_ISSET(kNonexistentCpu, &original_)) {
+        GTEST_SKIP() << "highest cpu_set_t bit is available";
+    }
+
+    cpu_set_t requested = original_;
+    CPU_SET(kNonexistentCpu, &requested);
+    ASSERT_EQ(0, syscall(SYS_sched_setaffinity, 0, sizeof(requested), &requested))
+        << strerror(errno);
+
+    cpu_set_t actual;
+    CPU_ZERO(&actual);
+    ASSERT_EQ(0, sched_getaffinity(0, sizeof(actual), &actual)) << strerror(errno);
+    ExpectCpuSetEq(original_, actual);
+}
+
+TEST_F(SchedAffinityFixture, OnlyNonexistentCpuIsRejected) {
+    constexpr int kNonexistentCpu = CPU_SETSIZE - 1;
+    if (CPU_ISSET(kNonexistentCpu, &original_)) {
+        GTEST_SKIP() << "highest cpu_set_t bit is available";
+    }
+
+    cpu_set_t requested;
+    CPU_ZERO(&requested);
+    CPU_SET(kNonexistentCpu, &requested);
+    errno = 0;
+    EXPECT_EQ(-1, syscall(SYS_sched_setaffinity, 0, sizeof(requested), &requested));
+    EXPECT_EQ(EINVAL, errno);
+}
+
+TEST_F(SchedAffinityFixture, LongMaskIgnoresNonzeroTail) {
+    unsigned char requested[sizeof(cpu_set_t) + sizeof(unsigned long)] = {};
+    memcpy(requested, &original_, sizeof(original_));
+    requested[sizeof(cpu_set_t)] = 1;
+
+    ASSERT_EQ(0, syscall(SYS_sched_setaffinity, 0, sizeof(requested), requested))
+        << strerror(errno);
+
+    cpu_set_t actual;
+    CPU_ZERO(&actual);
+    ASSERT_EQ(0, sched_getaffinity(0, sizeof(actual), &actual)) << strerror(errno);
+    ExpectCpuSetEq(original_, actual);
+}
+
+TEST_F(SchedAffinityFixture, GetAffinityRejectsShortAndUnalignedLengths) {
+    cpu_set_t result;
+    CPU_ZERO(&result);
+    errno = 0;
+    EXPECT_EQ(-1, syscall(SYS_sched_getaffinity, 0, sizeof(unsigned long) - 1, &result));
+    EXPECT_EQ(EINVAL, errno);
+    errno = 0;
+    EXPECT_EQ(-1, syscall(SYS_sched_getaffinity, 0, sizeof(result) - 1, &result));
+    EXPECT_EQ(EINVAL, errno);
+}
+
+TEST_F(SchedAffinityFixture, SetAffinityFaultPrecedesMissingPid) {
+    errno = 0;
+    EXPECT_EQ(-1, syscall(SYS_sched_setaffinity, INT_MAX - 1, sizeof(unsigned long),
+                          reinterpret_cast<void*>(1)));
+    EXPECT_EQ(EFAULT, errno);
+
+    errno = 0;
+    EXPECT_EQ(-1, syscall(SYS_sched_setaffinity, INT_MAX - 1, 0, nullptr));
+    EXPECT_EQ(ESRCH, errno);
+}
+
+TEST_F(SchedAffinityFixture, LengthUsesUnsignedIntAbi) {
+    constexpr unsigned long kHighLength = (1UL << 32) | sizeof(cpu_set_t);
+    ASSERT_EQ(0, syscall(SYS_sched_setaffinity, 0, kHighLength, &original_)) << strerror(errno);
+
+    cpu_set_t result;
+    CPU_ZERO(&result);
+    cpu_set_t baseline;
+    CPU_ZERO(&baseline);
+    const long expected_size = syscall(SYS_sched_getaffinity, 0, sizeof(baseline), &baseline);
+    ASSERT_GT(expected_size, 0);
+    EXPECT_EQ(expected_size, syscall(SYS_sched_getaffinity, 0, kHighLength, &result));
+    ExpectCpuSetEq(original_, result);
+}
+
+TEST_F(SchedAffinityFixture, GetAffinityLengthMultiplyWrapsAsUnsignedInt) {
+    cpu_set_t result;
+    CPU_ZERO(&result);
+    errno = 0;
+    EXPECT_EQ(-1, syscall(SYS_sched_getaffinity, 0, 1UL << 29, &result));
+    EXPECT_EQ(EINVAL, errno);
+}
+
+TEST_F(SchedAffinityFixture, GetAffinityBadOutputPointerReturnsFault) {
+    errno = 0;
+    EXPECT_EQ(-1, syscall(SYS_sched_getaffinity, 0, sizeof(cpu_set_t),
+                          reinterpret_cast<void*>(1)));
+    EXPECT_EQ(EFAULT, errno);
+}
+
+TEST_F(SchedAffinityFixture, DifferentEffectiveUidCanReadButCannotSet) {
+    if (geteuid() != 0) {
+        GTEST_SKIP() << "requires root to create a real/effective UID split";
+    }
+
+    const pid_t parent = getpid();
+    pid_t child = fork();
+    ASSERT_GE(child, 0);
+    if (child == 0) {
+        if (setresuid(0, 1000, 0) != 0) _exit(40);
+
+        cpu_set_t parent_mask;
+        CPU_ZERO(&parent_mask);
+        if (sched_getaffinity(parent, sizeof(parent_mask), &parent_mask) != 0) _exit(41);
+
+        errno = 0;
+        if (sched_setaffinity(parent, sizeof(parent_mask), &parent_mask) != -1) _exit(42);
+        if (errno != EPERM) _exit(43);
+        _exit(0);
+    }
+
+    int status = 0;
+    ASSERT_EQ(child, waitpid(child, &status, 0));
+    ASSERT_TRUE(WIFEXITED(status)) << "child status=" << status;
+    EXPECT_EQ(0, WEXITSTATUS(status));
 }
 
 TEST_F(SchedAffinityFixture, ChildCanUpdateOwnAffinityRoundTrip) {

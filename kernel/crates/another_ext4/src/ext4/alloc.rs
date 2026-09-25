@@ -1932,7 +1932,11 @@ impl Ext4 {
         let _metadata_guard = self.lock_transactional_metadata_mutation()?;
         let _mutation_guard =
             self.inode_mutation_locks[self.inode_mutation_lock_index(handle.inode_id)].lock();
-        self.reclaim_inode_lifetime(handle.inode_id, handle.generation, self.uses_journal())
+        // A no-journal O_TMPFILE is still enrolled on the durable orphan
+        // list. Ordinary no-journal final unlinks are not; determine the
+        // cleanup obligation from actual membership rather than mount mode.
+        let orphaned = self.uses_journal() || self.legacy_orphan_contains(handle.inode_id)?;
+        self.reclaim_inode_lifetime(handle.inode_id, handle.generation, orphaned)
     }
 
     /// Reclaim a mount-recovery orphan without manufacturing a VFS lifetime

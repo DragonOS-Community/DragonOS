@@ -520,9 +520,6 @@ pub(crate) fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usi
         let metadata = inode.metadata()?;
         let file_type: FileType = metadata.file_type;
 
-        // No filesystem currently implements anonymous inode creation. Still
-        // resolve and check the target directory before reporting unsupported,
-        // as Linux's path_openat() does for valid O_TMPFILE requests.
         if how.o_flags.contains(FileFlags::__O_TMPFILE) {
             if file_type != FileType::Dir {
                 return Err(SystemError::ENOTDIR);
@@ -532,7 +529,17 @@ pub(crate) fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usi
                 &metadata,
                 PermissionMask::MAY_WRITE | PermissionMask::MAY_EXEC,
             )?;
-            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+            let umask = current.fs_struct().umask();
+            let create_mode = apply_umask_for_create(how.mode, umask);
+            let tmpfile = inode.tmpfile(create_mode, &how.o_flags)?;
+            let (_, mount_guard, _directory_operation) = resolved.into_parts();
+            let tmp_path = ResolvedPath::from_existing_mount(tmpfile.inode(), mount_guard)?;
+            let (tmp_inode, mount_guard, operation_guard) = tmp_path.into_parts();
+            let file =
+                File::new_with_mount_guard(tmp_inode, how.o_flags, mount_guard, operation_guard)?;
+            file.notify_open_event();
+            drop(tmpfile);
+            return Ok(file);
         }
 
         if !how.o_flags.contains(FileFlags::O_PATH)

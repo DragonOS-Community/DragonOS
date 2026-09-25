@@ -8,9 +8,10 @@ use super::Result;
 use crate::bpf::map::array_map::{ArrayMap, PerCpuArrayMap, PerfEventArrayMap};
 use crate::bpf::map::hash_map::PerCpuHashMap;
 use crate::bpf::map::util::{BpfMapGetNextKeyArg, BpfMapMeta, BpfMapUpdateArg};
+use crate::filesystem::anon_inode::{anon_inode_metadata, anon_inode_path, AnonInodeFs};
 use crate::filesystem::vfs::file::{File, FileFlags};
 use crate::filesystem::vfs::InodeMode;
-use crate::filesystem::vfs::{FilePrivateData, FileSystem, FileType, IndexNode, Metadata};
+use crate::filesystem::vfs::{FilePrivateData, FileSystem, IndexNode, Metadata};
 use crate::include::bindings::linux_bpf::{bpf_attr, bpf_map_type};
 use crate::libs::casting::DowncastArc;
 use crate::libs::mutex::MutexGuard;
@@ -161,12 +162,11 @@ impl IndexNode for BpfMap {
     }
 
     fn metadata(&self) -> Result<Metadata> {
-        let meta = Metadata {
-            mode: InodeMode::from_bits_truncate(0o755),
-            file_type: FileType::File,
-            ..Default::default()
-        };
-        Ok(meta)
+        Ok(anon_inode_metadata(InodeMode::S_IRUSR | InodeMode::S_IWUSR))
+    }
+
+    fn stat_mode(&self, metadata: &Metadata) -> InodeMode {
+        metadata.mode
     }
 
     fn resize(&self, _len: usize) -> Result<()> {
@@ -174,7 +174,7 @@ impl IndexNode for BpfMap {
     }
 
     fn fs(&self) -> Arc<dyn FileSystem> {
-        todo!("BpfMap does not have a filesystem")
+        AnonInodeFs::instance()
     }
 
     fn as_any_ref(&self) -> &dyn Any {
@@ -186,7 +186,7 @@ impl IndexNode for BpfMap {
     }
 
     fn absolute_path(&self) -> core::result::Result<String, SystemError> {
-        Ok(String::from("BpfMap"))
+        Ok(anon_inode_path("bpf-map"))
     }
 }
 

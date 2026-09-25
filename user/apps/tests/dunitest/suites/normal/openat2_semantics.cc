@@ -211,7 +211,7 @@ TEST_F(OpenAt2Test, ScopedCreateAndLiteralInternalWhitespace) {
     EXPECT_EQ(0, unlink(spaced.c_str()));
 }
 
-TEST_F(OpenAt2Test, TmpfileRequiresDirectoryAndFilesystemSupport) {
+TEST_F(OpenAt2Test, TmpfileRequiresDirectoryAndCreatesUnnamedFile) {
     errno = 0;
     int fd = OpenAt2(dirfd_, "inside", OpenHow{O_TMPFILE | O_RDWR, 0600, 0});
     EXPECT_EQ(-1, fd);
@@ -219,11 +219,12 @@ TEST_F(OpenAt2Test, TmpfileRequiresDirectoryAndFilesystemSupport) {
 
     errno = 0;
     fd = OpenAt2(dirfd_, ".", OpenHow{O_TMPFILE | O_RDWR, 0600, 0});
-    if (fd >= 0) {
-        EXPECT_EQ(0, close(fd));
-    } else {
-        EXPECT_EQ(EOPNOTSUPP, errno);
-    }
+    ASSERT_GE(fd, 0) << strerror(errno);
+    struct stat st = {};
+    ASSERT_EQ(0, fstat(fd, &st));
+    EXPECT_TRUE(S_ISREG(st.st_mode));
+    EXPECT_EQ(0UL, st.st_nlink);
+    EXPECT_EQ(0, close(fd));
 }
 
 TEST_F(OpenAt2Test, AccessModeThreeStillChecksReadAndWritePermission) {

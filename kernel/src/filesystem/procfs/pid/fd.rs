@@ -230,7 +230,9 @@ impl SymOps for FdSymOps {
             fd_table_guard.get_file_by_fd(self.fd)?
         };
 
-        // 返回文件的 inode 引用，使得 fstatat 等操作可以通过魔法链接工作
-        Some(SpecialNodeData::Reference(file.path_inode()))
+        // Keep the open file description alive until the path walker can
+        // retain the target inode. An inode Arc alone does not prevent a
+        // zero-link ext4 O_TMPFILE from entering final reclaim.
+        Some(SpecialNodeData::FileReference(file))
     }
 }

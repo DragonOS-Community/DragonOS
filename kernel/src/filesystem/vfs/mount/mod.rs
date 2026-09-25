@@ -947,6 +947,39 @@ impl VfsDentry {
             }),
         }))
     }
+
+    /// An O_TMPFILE dentry has a parent for path rendering, but no namespace
+    /// edge: lookup must never discover it before linkat publishes a name.
+    fn new_tmpfile(
+        inode: Arc<dyn IndexNode>,
+        parent: Arc<VfsDentry>,
+        fsnotify_superblock: usize,
+        fsnotify_object_state: Option<Arc<FsNotifyObjectState>>,
+    ) -> Result<Arc<Self>, SystemError> {
+        let metadata = inode.metadata()?;
+        let generation = inode.inode_generation();
+        Ok(Arc::new(Self {
+            id: DentryId::alloc(),
+            inode,
+            registry_child: metadata.inode_id,
+            registry_generation: generation,
+            fsnotify_superblock,
+            file_type: metadata.file_type,
+            mount_gate: Mutex::new(()),
+            children_gate: Mutex::new(()),
+            mount_edges: AtomicUsize::new(0),
+            automount_gate: Mutex::new(()),
+            anonymous: false,
+            negative_fsnotify_interest_epoch: AtomicUsize::new(0),
+            state: Mutex::new(VfsDentryState {
+                name: Some(DName::from(format!("#{}", metadata.inode_id.data()))),
+                parent: Some(parent),
+                disconnected: true,
+                fsnotify_object_state,
+                fsnotify_checked_epoch: 0,
+            }),
+        }))
+    }
 }
 
 impl Drop for VfsDentry {
@@ -4731,6 +4764,28 @@ impl MountFSInode {
         }))
     }
 
+    fn new_tmpfile(
+        inner_inode: Arc<dyn IndexNode>,
+        parent: &Arc<MountFSInode>,
+    ) -> Result<Arc<Self>, SystemError> {
+        let mount_fs = parent.mount_fs.clone();
+        let metadata = inner_inode.metadata()?;
+        let object_state = mount_fs
+            .super_block_state
+            .fsnotify_object_state(metadata.inode_id, inner_inode.inode_generation());
+        let dentry = VfsDentry::new_tmpfile(
+            inner_inode,
+            parent.dentry.clone(),
+            mount_fs.super_block_state.fsnotify_id,
+            object_state,
+        )?;
+        Ok(Arc::new_cyclic(|self_ref| Self {
+            dentry,
+            mount_fs,
+            self_ref: self_ref.clone(),
+        }))
+    }
+
     fn update_move_dentries(
         source: &Arc<MountFSInode>,
         old_name: DName,
@@ -5974,6 +6029,19 @@ impl IndexNode for MountFSInode {
         drop(children_guard);
         preopened.replace_inode(wrapped?);
         Ok(preopened)
+    }
+
+    fn tmpfile(
+        &self,
+        mode: InodeMode,
+        flags: &FileFlags,
+    ) -> Result<super::UnlinkedFile, SystemError> {
+        self.ensure_mount_writable()?;
+        let parent = self.self_ref.upgrade().ok_or(SystemError::ENOENT)?;
+        let mut unlinked = self.dentry.inode.tmpfile(mode, flags)?;
+        let wrapped = Self::new_tmpfile(unlinked.inode(), &parent)?;
+        unlinked.replace_inode(wrapped);
+        Ok(unlinked)
     }
 
     fn link(&self, name: &str, other: &Arc<dyn IndexNode>) -> Result<(), SystemError> {

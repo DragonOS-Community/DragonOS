@@ -10,14 +10,13 @@ use core::any::Any;
 use system_error::SystemError;
 
 use crate::{
-    arch::MMArch,
     filesystem::{
+        anon_inode::{anon_inode_metadata, anon_inode_path, AnonInodeFs},
         epoll::{event_poll::EventPoll, EPollEventType, EPollItem},
         vfs::{
             file::{FileFlags, FilePrivateData},
-            vcore::generate_inode_id,
-            FileSystem, FileType, FsInfo, IndexNode, InodeFlags, InodeMode, Magic, Metadata,
-            OpenFileBehavior, PollableInode, PostWriteSyncPolicy, SuperBlock,
+            FileSystem, IndexNode, InodeMode, Metadata, OpenFileBehavior, PollableInode,
+            PostWriteSyncPolicy,
         },
     },
     libs::{
@@ -25,7 +24,6 @@ use crate::{
         spinlock::SpinLock,
         wait_queue::WaitQueue,
     },
-    mm::MemoryManagementArch,
     process::{posix_timer::PosixItimerspec, ProcessManager},
     syscall::user_buffer::UserBuffer,
     time::{
@@ -42,7 +40,6 @@ const KTIME_MAX_NS: u64 = i64::MAX as u64;
 const KTIME_SEC_MAX: i64 = i64::MAX / NSEC_PER_SEC as i64;
 
 lazy_static::lazy_static! {
-    static ref TIMERFD_FS: Arc<TimerFdFs> = Arc::new(TimerFdFs);
     // Registry operations only run in task context.  A sleeping mutex keeps
     // Vec allocation and O(N) cleanup out of irq-disabled spinlock sections.
     static ref REALTIME_TIMERFDS: Mutex<BTreeMap<usize, Weak<TimerFdInode>>> =
@@ -133,50 +130,6 @@ impl TimerFdState {
 }
 
 #[derive(Debug)]
-pub struct TimerFdFs;
-
-impl TimerFdFs {
-    fn instance() -> Arc<Self> {
-        TIMERFD_FS.clone()
-    }
-}
-
-impl FileSystem for TimerFdFs {
-    fn page_cache_writeback_domain(
-        &self,
-    ) -> Option<&Arc<crate::filesystem::page_cache::PageCacheWritebackDomain>> {
-        None
-    }
-
-    fn root_inode(&self) -> Arc<dyn IndexNode> {
-        TimerFdInode::new(PosixClockID::Monotonic)
-    }
-
-    fn info(&self) -> FsInfo {
-        FsInfo {
-            blk_dev_id: 0,
-            max_name_len: 255,
-        }
-    }
-
-    fn as_any_ref(&self) -> &dyn Any {
-        self
-    }
-
-    fn name(&self) -> &str {
-        "timerfd"
-    }
-
-    fn super_block(&self) -> SuperBlock {
-        SuperBlock::new(
-            Magic::EVENTFD_MAGIC,
-            <MMArch as MemoryManagementArch>::PAGE_SIZE as u64,
-            255,
-        )
-    }
-}
-
-#[derive(Debug)]
 pub struct TimerFdInode {
     state: SpinLock<TimerFdState>,
     operation: Mutex<()>,
@@ -207,24 +160,7 @@ impl TimerFdInode {
             operation: Mutex::new(()),
             wait_queue: WaitQueue::default(),
             epitems: EPollItemList::default(),
-            metadata: Metadata {
-                dev_id: 0,
-                inode_id: generate_inode_id(),
-                size: 0,
-                blk_size: 0,
-                blocks: 0,
-                atime: PosixTimeSpec::default(),
-                mtime: PosixTimeSpec::default(),
-                ctime: PosixTimeSpec::default(),
-                btime: PosixTimeSpec::default(),
-                file_type: FileType::File,
-                mode: InodeMode::from_bits_truncate(0o600),
-                nlinks: 1,
-                uid: 0,
-                gid: 0,
-                raw_dev: Default::default(),
-                flags: InodeFlags::empty(),
-            },
+            metadata: anon_inode_metadata(InodeMode::S_IRUSR | InodeMode::S_IWUSR),
             self_weak: weak.clone(),
         })
     }
@@ -816,8 +752,12 @@ impl IndexNode for TimerFdInode {
         Ok(self.metadata.clone())
     }
 
+    fn stat_mode(&self, metadata: &Metadata) -> InodeMode {
+        metadata.mode
+    }
+
     fn fs(&self) -> Arc<dyn FileSystem> {
-        TimerFdFs::instance()
+        AnonInodeFs::instance()
     }
 
     fn as_any_ref(&self) -> &dyn Any {
@@ -833,7 +773,7 @@ impl IndexNode for TimerFdInode {
     }
 
     fn absolute_path(&self) -> Result<String, SystemError> {
-        Ok(String::from("timerfd"))
+        Ok(anon_inode_path("[timerfd]"))
     }
 }
 

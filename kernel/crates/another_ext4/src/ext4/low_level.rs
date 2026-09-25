@@ -3199,6 +3199,46 @@ impl Ext4 {
         Ok(Self::file_attr(&child))
     }
 
+    /// Allocate an unlinked regular inode for O_TMPFILE. In journal mode the
+    /// inode allocation and orphan-list insertion are one durable operation.
+    pub fn tmpfile_with_owner_and_attr(
+        &self,
+        parent: InodeId,
+        mode: InodeMode,
+        owner: InodeOwner,
+    ) -> Result<(FileAttr, InodeReclaimHandle)> {
+        self.ensure_mutable()?;
+        let _metadata_guard = self.lock_transactional_metadata_mutation()?;
+        let _namespace_guard = self.namespace_lock.lock();
+        let _mutation_guards = self.lock_inode_mutations(&[parent]);
+        let parent_ref = self.read_inode(parent)?;
+        if !parent_ref.inode.is_dir() {
+            return_error!(ErrCode::ENOTDIR, "Inode {} is not a directory", parent);
+        }
+        if parent_ref.inode.link_count() == 0 {
+            // ext4_new_inode rejects creation beneath an unlinked directory;
+            // unlike tmpfs, O_TMPFILE still goes through that allocator.
+            return_error!(ErrCode::EPERM, "Directory {} has no links", parent);
+        }
+        if mode.file_type() != FileType::RegularFile {
+            return_error!(ErrCode::EINVAL, "O_TMPFILE requires a regular inode");
+        }
+        let mut transaction = self.transaction_start(8)?;
+        let mut child =
+            self.transaction_create_inode_with_owner(&mut transaction, mode, owner.uid, owner.gid)?;
+        debug_assert_eq!(child.inode.link_count(), 0);
+        // Keep the orphan record even without a journal: otherwise a crash
+        // after a successful O_TMPFILE open but before the last close would
+        // permanently leak an inode which has no directory entry. Direct
+        // mode still cannot guarantee multi-home crash atomicity.
+        let mut sb = self.read_super_block_cached();
+        self.transaction_orphan_add_zero_link(&mut transaction, &mut child, &mut sb)?;
+        self.commit_namespace_transaction(transaction)?;
+        let attr = Self::file_attr(&child);
+        let reclaim = InodeReclaimHandle::new(child.id, child.inode.generation());
+        Ok((attr, reclaim))
+    }
+
     /// Create a symbolic link whose target is initialized before its name is
     /// published in the parent directory.
     pub fn symlink_with_owner_and_attr(

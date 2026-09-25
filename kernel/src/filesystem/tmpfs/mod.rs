@@ -314,6 +314,7 @@ fn tmpfs_insert_whiteout(dir: &mut TmpfsInode, name: &DName) -> Result<(), Syste
         special_node: None,
         inline_symlink: None,
         name: name.clone(),
+        tmpfile_linkable: false,
     }));
     whiteout.0.lock().self_ref = Arc::downgrade(&whiteout);
     dir.children.insert(name.clone(), whiteout);
@@ -494,6 +495,8 @@ pub struct TmpfsInode {
     special_node: Option<SpecialNodeData>,
     inline_symlink: Option<String>,
     name: DName,
+    /// Linux I_LINKABLE equivalent for a never-published O_TMPFILE inode.
+    tmpfile_linkable: bool,
 }
 
 impl TmpfsInode {
@@ -525,6 +528,7 @@ impl TmpfsInode {
             special_node: None,
             inline_symlink: None,
             name: Default::default(),
+            tmpfile_linkable: false,
         }
     }
 }
@@ -889,6 +893,7 @@ impl Tmpfs {
                 special_node: None,
                 inline_symlink: None,
                 name,
+                tmpfile_linkable: false,
             },
             memfd,
         ));
@@ -1584,6 +1589,7 @@ impl IndexNode for LockedTmpfsInode {
             special_node: None,
             inline_symlink: inline.then(|| target.to_string()),
             name: name.clone(),
+            tmpfile_linkable: false,
         }));
         result.0.lock().self_ref = Arc::downgrade(&result);
 
@@ -1656,6 +1662,7 @@ impl IndexNode for LockedTmpfsInode {
             special_node: None,
             inline_symlink: None,
             name: name.clone(),
+            tmpfile_linkable: false,
         }));
 
         result.0.lock().self_ref = Arc::downgrade(&result);
@@ -1684,6 +1691,75 @@ impl IndexNode for LockedTmpfsInode {
         Ok(result)
     }
 
+    fn tmpfile(
+        &self,
+        mode: InodeMode,
+        flags: &FileFlags,
+    ) -> Result<super::vfs::UnlinkedFile, SystemError> {
+        let parent = self.0.lock();
+        // O_TMPFILE creates no child name. Linux permits it through a dirfd
+        // whose directory was removed after the fd was opened.
+        if parent.metadata.file_type != FileType::Dir {
+            return Err(SystemError::ENOTDIR);
+        }
+        if parent.metadata.flags.contains(InodeFlags::S_IMMUTABLE) {
+            return Err(SystemError::EPERM);
+        }
+        let cred = ProcessManager::current_pcb().cred();
+        cred.inode_permission(
+            &parent.metadata,
+            (crate::filesystem::vfs::permission::PermissionMask::MAY_WRITE
+                | crate::filesystem::vfs::permission::PermissionMask::MAY_EXEC)
+                .bits(),
+        )?;
+        let init = crate::filesystem::vfs::permission::child_inode_init(
+            &parent.metadata,
+            FileType::File,
+            mode,
+        );
+        let now = PosixTimeSpec::now();
+        let inode_id = generate_inode_id();
+        let fs = parent.fs.clone();
+        let result = Arc::new(LockedTmpfsInode::new(TmpfsInode {
+            parent: parent.self_ref.clone(),
+            self_ref: Weak::default(),
+            children: BTreeMap::new(),
+            page_cache: None,
+            metadata: Metadata {
+                dev_id: 0,
+                inode_id,
+                size: 0,
+                blk_size: 0,
+                blocks: 0,
+                atime: now,
+                mtime: now,
+                ctime: now,
+                btime: now,
+                file_type: FileType::File,
+                mode: init.mode,
+                flags: InodeFlags::empty(),
+                nlinks: 0,
+                uid: init.uid,
+                gid: init.gid,
+                raw_dev: DeviceNumber::default(),
+            },
+            fs: fs.clone(),
+            special_node: None,
+            inline_symlink: None,
+            name: DName::from(format!("#{}", inode_id.data())),
+            tmpfile_linkable: !flags.contains(FileFlags::O_EXCL),
+        }));
+        result.0.lock().self_ref = Arc::downgrade(&result);
+        let inode_dyn: Arc<dyn IndexNode> = result.clone();
+        let backend = Arc::new(TmpfsPageCacheBackend::new(
+            Arc::downgrade(&inode_dyn),
+            fs.clone(),
+        ));
+        let page_cache = new_tmpfs_page_cache(Arc::downgrade(&inode_dyn), backend, &fs)?;
+        result.0.lock().page_cache = Some(page_cache);
+        super::vfs::UnlinkedFile::new(inode_dyn)
+    }
+
     fn link(&self, name: &str, other: &Arc<dyn IndexNode>) -> Result<(), SystemError> {
         // downcast 用于获取类型特定功能（跨文件系统检查已在 VFS 层完成）
         let other: &LockedTmpfsInode = other
@@ -1701,10 +1777,15 @@ impl IndexNode for LockedTmpfsInode {
             return Err(SystemError::EEXIST);
         }
 
+        if other_locked.metadata.nlinks == 0 && !other_locked.tmpfile_linkable {
+            return Err(SystemError::ENOENT);
+        }
+
         inode
             .children
             .insert(name, other_locked.self_ref.upgrade().unwrap());
         other_locked.metadata.nlinks += 1;
+        other_locked.tmpfile_linkable = false;
         let now = PosixTimeSpec::now();
         other_locked.metadata.ctime = now;
         tmpfs_touch_dir(&mut inode, now);
@@ -2060,6 +2141,7 @@ impl IndexNode for LockedTmpfsInode {
             special_node: None,
             inline_symlink: None,
             name: filename.clone(),
+            tmpfile_linkable: false,
         }));
 
         nod.0.lock().self_ref = Arc::downgrade(&nod);

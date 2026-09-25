@@ -16,6 +16,18 @@ use super::{
 };
 use crate::libs::casting::DowncastArc;
 
+bitflags! {
+    /// Path-walk restrictions shared by openat2 and the VFS resolver.
+    pub struct OpenHowResolve: u64 {
+        const RESOLVE_NO_XDEV = 0x01;
+        const RESOLVE_NO_MAGICLINKS = 0x02;
+        const RESOLVE_NO_SYMLINKS = 0x04;
+        const RESOLVE_BENEATH = 0x08;
+        const RESOLVE_IN_ROOT = 0x10;
+        const RESOLVE_CACHED = 0x20;
+    }
+}
+
 /// A resolved inode plus the mount and operation ownership required while a
 /// syscall performs permission, truncate, and open work on it.
 #[derive(Debug)]
@@ -39,6 +51,64 @@ pub enum OwnedLookupOutcome {
         name: String,
         must_be_dir: bool,
     },
+}
+
+/// Constraints for one openat2 path walk. Ordinary VFS lookups do not create
+/// this object and retain their existing fast path.
+#[derive(Debug)]
+pub struct PathWalkOptions {
+    pub resolve: OpenHowResolve,
+    pub scope_root: Option<ResolvedPath>,
+    epoch: usize,
+}
+
+impl PathWalkOptions {
+    pub fn new(resolve: OpenHowResolve, scope_root: Option<ResolvedPath>) -> Self {
+        let epoch = if scope_root.is_some() {
+            super::mount::topology_epoch_snapshot()
+        } else {
+            0
+        };
+        Self {
+            resolve,
+            scope_root,
+            epoch,
+        }
+    }
+
+    pub fn validate_inode(&self, inode: &Arc<dyn IndexNode>) -> Result<(), SystemError> {
+        if let Some(root) = &self.scope_root {
+            let root = root
+                .inode()
+                .downcast_arc::<MountFSInode>()
+                .ok_or(SystemError::ESTALE)?;
+            let inode = inode
+                .clone()
+                .downcast_arc::<MountFSInode>()
+                .ok_or(SystemError::ESTALE)?;
+            if !super::mount::validate_scoped_path(&root, &inode, self.epoch)? {
+                return Err(SystemError::EXDEV);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn validate_path(&self, path: &ResolvedPath) -> Result<(), SystemError> {
+        self.validate_inode(&path.inode())
+    }
+
+    pub fn is_scope_root(&self, inode: &Arc<dyn IndexNode>) -> bool {
+        let Some(root) = &self.scope_root else {
+            return false;
+        };
+        match (
+            root.inode().downcast_arc::<MountFSInode>(),
+            inode.clone().downcast_arc::<MountFSInode>(),
+        ) {
+            (Some(root), Some(inode)) => inode.same_path_ref(&root),
+            _ => false,
+        }
+    }
 }
 
 impl ResolvedPath {

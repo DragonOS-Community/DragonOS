@@ -1615,6 +1615,12 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         None
     }
 
+    /// Stable classification of a magic symlink, independent of whether its
+    /// target can still be resolved at the instant of lookup.
+    fn is_magic_link(&self) -> bool {
+        false
+    }
+
     /// # dname - 返回目录名
     ///
     /// 此函数用于返回一个目录名。
@@ -1815,6 +1821,7 @@ impl dyn IndexNode {
             follow_final_symlink,
             None,
             false,
+            None,
         )? {
             PathWalkOutcome::Found(inode, _) => Ok(inode),
             PathWalkOutcome::MissingFinal { .. } => Err(SystemError::ENOENT),
@@ -1836,6 +1843,7 @@ impl dyn IndexNode {
             follow_final_symlink,
             Some(start.derive()?),
             false,
+            None,
         )? {
             PathWalkOutcome::Found(_, ownership) => ownership.ok_or(SystemError::ESTALE),
             PathWalkOutcome::MissingFinal { .. } => Err(SystemError::ENOENT),
@@ -1857,6 +1865,42 @@ impl dyn IndexNode {
             follow_final_symlink,
             Some(start.derive()?),
             true,
+            None,
+        )? {
+            PathWalkOutcome::Found(_, ownership) => ownership
+                .map(utils::OwnedLookupOutcome::Found)
+                .ok_or(SystemError::ESTALE),
+            PathWalkOutcome::MissingFinal {
+                ownership,
+                name,
+                must_be_dir,
+                ..
+            } => ownership
+                .map(|parent| utils::OwnedLookupOutcome::MissingFinal {
+                    parent,
+                    name,
+                    must_be_dir,
+                })
+                .ok_or(SystemError::ESTALE),
+        }
+    }
+
+    /// Owned open lookup with openat2 restrictions applied during every step.
+    pub fn lookup_openat2_owned(
+        &self,
+        start: &utils::ResolvedPath,
+        path: &str,
+        max_follow_times: usize,
+        follow_final_symlink: bool,
+        options: &utils::PathWalkOptions,
+    ) -> Result<utils::OwnedLookupOutcome, SystemError> {
+        match self.do_lookup_follow_symlink_owned(
+            path,
+            max_follow_times,
+            follow_final_symlink,
+            Some(start.derive()?),
+            true,
+            Some(options),
         )? {
             PathWalkOutcome::Found(_, ownership) => ownership
                 .map(utils::OwnedLookupOutcome::Found)
@@ -1883,6 +1927,7 @@ impl dyn IndexNode {
         follow_final_symlink: bool,
         mut ownership: Option<utils::ResolvedPath>,
         return_missing_final: bool,
+        options: Option<&utils::PathWalkOptions>,
     ) -> Result<PathWalkOutcome, SystemError> {
         if self.metadata()?.file_type != FileType::Dir {
             return Err(SystemError::ENOTDIR);
@@ -1890,11 +1935,14 @@ impl dyn IndexNode {
 
         // Linux 语义：绝对路径应当以"进程 fs root"（可被 chroot 改变）为起点
         let fs_struct = ProcessManager::current_pcb().fs_struct();
-        let process_root_path = if ownership.is_some() {
-            Some(fs_struct.root_resolved()?)
-        } else {
-            None
-        };
+        let process_root_path =
+            if let Some(root) = options.and_then(|options| options.scope_root.as_ref()) {
+                Some(root.derive()?)
+            } else if ownership.is_some() {
+                Some(fs_struct.root_resolved()?)
+            } else {
+                None
+            };
         let process_root_inode = process_root_path
             .as_ref()
             .map(|path| path.inode())
@@ -1905,6 +1953,13 @@ impl dyn IndexNode {
         // result: 上一个被找到的inode
         // rest_path: 还没有查找的路径
         let (mut result, mut rest_path) = if let Some(rest) = path.strip_prefix('/') {
+            if options.is_some_and(|options| {
+                options
+                    .resolve
+                    .contains(utils::OpenHowResolve::RESOLVE_BENEATH)
+            }) {
+                return Err(SystemError::EXDEV);
+            }
             if ownership.is_some() {
                 ownership = Some(
                     process_root_path
@@ -1916,7 +1971,12 @@ impl dyn IndexNode {
             (process_root_inode.clone(), String::from(rest))
         } else {
             // 是相对路径
-            (self.find(".")?, String::from(path))
+            let start = if options.is_some() {
+                ownership.as_ref().ok_or(SystemError::ESTALE)?.inode()
+            } else {
+                self.find(".")?
+            };
+            (start, String::from(path))
         };
 
         let mut symlink_follows_remaining = max_follow_times;
@@ -1957,10 +2017,26 @@ impl dyn IndexNode {
             // 进程 root 边界：当解析到进程 root 时，".." 不允许逃逸，应当停留在 root。
             // 这对应 Linux 的路径解析语义（参照 namei.c 中对 root 的处理）。
             if name == ".." {
-                let cur_md = result.metadata()?;
-                let root_md = process_root_inode.metadata()?;
-                if cur_md.dev_id == root_md.dev_id && cur_md.inode_id == root_md.inode_id {
-                    continue;
+                if let Some(options) = options {
+                    if options.scope_root.is_some() {
+                        options.validate_inode(&result)?;
+                        if options.is_scope_root(&result) {
+                            if options
+                                .resolve
+                                .contains(utils::OpenHowResolve::RESOLVE_BENEATH)
+                            {
+                                return Err(SystemError::EXDEV);
+                            }
+                            continue;
+                        }
+                    }
+                }
+                if options.is_none_or(|options| options.scope_root.is_none()) {
+                    let cur_md = result.metadata()?;
+                    let root_md = process_root_inode.metadata()?;
+                    if cur_md.dev_id == root_md.dev_id && cur_md.inode_id == root_md.inode_id {
+                        continue;
+                    }
                 }
             }
 
@@ -1970,7 +2046,20 @@ impl dyn IndexNode {
             // missing final component and the base restored for a relative
             // symlink target.
             let parent_ownership = ownership.take();
-            let inode = match result.find(&name) {
+            let lookup = if options.is_some_and(|options| {
+                options
+                    .resolve
+                    .contains(utils::OpenHowResolve::RESOLVE_NO_XDEV)
+            }) {
+                if let Some(mounted) = result.clone().downcast_arc::<mount::MountFSInode>() {
+                    mounted.find_no_xdev(&name)
+                } else {
+                    result.find(&name)
+                }
+            } else {
+                result.find(&name)
+            };
+            let inode = match lookup {
                 Ok(inode) => inode,
                 Err(error)
                     if return_missing_final
@@ -2028,6 +2117,26 @@ impl dyn IndexNode {
                     continue;
                 }
 
+                if let Some(options) = options {
+                    if options
+                        .resolve
+                        .contains(utils::OpenHowResolve::RESOLVE_NO_SYMLINKS)
+                    {
+                        return Err(SystemError::ELOOP);
+                    }
+                    if inode.is_magic_link() {
+                        if options
+                            .resolve
+                            .contains(utils::OpenHowResolve::RESOLVE_NO_MAGICLINKS)
+                        {
+                            return Err(SystemError::ELOOP);
+                        }
+                        if options.scope_root.is_some() {
+                            return Err(SystemError::EXDEV);
+                        }
+                    }
+                }
+
                 symlink_follows_remaining -= 1;
 
                 // 首先检查是否是"魔法链接"（如 /proc/self/fd/N）
@@ -2042,6 +2151,19 @@ impl dyn IndexNode {
                     _ => None,
                 };
                 if let Some(target_inode) = magic_target {
+                    if options.is_some_and(|options| {
+                        options
+                            .resolve
+                            .contains(utils::OpenHowResolve::RESOLVE_NO_XDEV)
+                    }) {
+                        let source_mount = inode.clone().downcast_arc::<mount::MountFSInode>();
+                        let target_mount =
+                            target_inode.clone().downcast_arc::<mount::MountFSInode>();
+                        if !matches!((source_mount, target_mount), (Some(source), Some(target)) if Arc::ptr_eq(&source.mount_fs(), &target.mount_fs()))
+                        {
+                            return Err(SystemError::EXDEV);
+                        }
+                    }
                     if ownership.is_some() {
                         ownership = Some(utils::ResolvedPath::new(target_inode.clone())?);
                     }
@@ -2100,6 +2222,27 @@ impl dyn IndexNode {
                 // 绝对路径：从进程 root 开始
                 // 相对路径：从当前 result（symlink 所在目录）开始
                 if let Some(rest) = new_path.strip_prefix('/') {
+                    if options.is_some_and(|options| {
+                        options
+                            .resolve
+                            .contains(utils::OpenHowResolve::RESOLVE_BENEATH)
+                    }) {
+                        return Err(SystemError::EXDEV);
+                    }
+                    if options.is_some_and(|options| {
+                        options
+                            .resolve
+                            .contains(utils::OpenHowResolve::RESOLVE_NO_XDEV)
+                    }) {
+                        let from = inode.clone().downcast_arc::<mount::MountFSInode>();
+                        let to = process_root_inode
+                            .clone()
+                            .downcast_arc::<mount::MountFSInode>();
+                        if !matches!((from, to), (Some(from), Some(to)) if Arc::ptr_eq(&from.mount_fs(), &to.mount_fs()))
+                        {
+                            return Err(SystemError::EXDEV);
+                        }
+                    }
                     result = process_root_inode.clone();
                     if ownership.is_some() {
                         ownership = Some(

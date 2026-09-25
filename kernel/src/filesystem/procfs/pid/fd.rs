@@ -144,6 +144,10 @@ impl FdSymOps {
 }
 
 impl SymOps for FdSymOps {
+    fn is_magic_link(&self) -> bool {
+        true
+    }
+
     fn read_link(&self, buf: &mut [u8]) -> Result<usize, SystemError> {
         // `proc_fd_link()` walks `get_proc_task(inode)->files`, so the link is
         // resolved against the thread this node names, not the group leader.

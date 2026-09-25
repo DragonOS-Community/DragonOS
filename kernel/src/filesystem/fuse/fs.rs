@@ -542,13 +542,10 @@ pub fn fuse_try_automount_submount(
 ) -> Result<(), SystemError> {
     use crate::filesystem::vfs::mount::MountFlags;
 
+    if !fuse_submount_enabled(fuse_node) {
+        return Ok(());
+    }
     let attr_flags = fuse_node.lookup_attr_flags();
-    if (attr_flags & FUSE_ATTR_SUBMOUNT) == 0 {
-        return Ok(());
-    }
-    if !fuse_node.conn().supports_submounts() {
-        return Ok(());
-    }
 
     mountpoint.serialize_automount(|| {
         if mountpoint.mount_fs().lookup_top(mountpoint).is_some() {
@@ -576,6 +573,13 @@ pub fn fuse_try_automount_submount(
             Err(error) => Err(error),
         }
     })
+}
+
+/// Whether looking up this node may trigger a mount. Kept separate so a
+/// NO_XDEV walk can reject the crossing before the automount side effect.
+pub(crate) fn fuse_submount_enabled(fuse_node: &FuseNode) -> bool {
+    (fuse_node.lookup_attr_flags() & FUSE_ATTR_SUBMOUNT) != 0
+        && fuse_node.conn().supports_submounts()
 }
 
 impl MountableFileSystem for FuseFS {

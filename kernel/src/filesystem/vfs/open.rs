@@ -7,10 +7,10 @@ use super::{
     file::{File, FileFlags, PreopenedFile},
     mount::{MountFSInode, MountFlags},
     permission::PermissionMask,
-    syscall::{OpenHow, OpenHowResolve},
+    syscall::OpenHow,
     utils::{
-        should_remove_sgid_on_chown, user_path_at, user_resolved_path_at, OwnedLookupOutcome,
-        ResolvedPath,
+        should_remove_sgid_on_chown, user_path_at, user_resolved_path_at, OpenHowResolve,
+        OwnedLookupOutcome, ResolvedPath,
     },
     vcore::{check_parent_dir_permission_inode, prepare_open_truncate, vfs_open_truncate},
     FileType, FsPermissionPolicy, IndexNode, InodeMode, SetMetadataMask, MAX_PATHLEN,
@@ -298,11 +298,17 @@ pub fn do_sys_open(
     return do_sys_openat2(dfd, path, how);
 }
 
-fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usize, SystemError> {
+pub(crate) fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usize, SystemError> {
     // log::debug!("openat2: dirfd: {}, path: {}, how: {:?}",dirfd, path, how);
     // Linux 6.6 rejects this contradictory creation request before lookup, so
     // the result must not depend on whether the pathname already exists.
     if how.o_flags.contains(FileFlags::O_CREAT) && how.o_flags.contains(FileFlags::O_DIRECTORY) {
+        return Err(SystemError::EINVAL);
+    }
+    if how.o_flags.contains(FileFlags::__O_TMPFILE)
+        && (!how.o_flags.contains(FileFlags::O_DIRECTORY)
+            || how.o_flags.access_flags() == FileFlags::O_RDONLY)
+    {
         return Err(SystemError::EINVAL);
     }
     // Match Linux's get_unused_fd_flags() ordering: reserve the descriptor
@@ -312,7 +318,6 @@ fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usize, SystemE
     let fd_table = current.fd_table();
     let reservation = fd_table.reserve::<1>(current.nofile_soft_limit(), 0, cloexec)?;
     let open_result = (|| -> Result<File, SystemError> {
-        let path = path.trim();
         // Linux makes O_CREAT|O_EXCL imply O_NOFOLLOW for the final component.
         let follow_symlink = !(how.o_flags.contains(FileFlags::O_NOFOLLOW)
             || how.o_flags.contains(FileFlags::O_CREAT) && how.o_flags.contains(FileFlags::O_EXCL));
@@ -320,19 +325,49 @@ fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usize, SystemE
         if path.is_empty() {
             return Err(SystemError::ENOENT);
         }
+        if how.resolve.contains(OpenHowResolve::RESOLVE_CACHED) {
+            // MountFS has no nonblocking name-cache lookup contract yet. A
+            // cache-only request must not enter find_in_view or readlink.
+            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+        }
 
         // Check for a trailing slash on the path: if it ends with a slash, the target must be a directory
         let path_ends_with_slash = path.ends_with('/');
 
-        let (start_path, path) =
-            user_resolved_path_at(&ProcessManager::current_pcb(), dirfd, path)?;
+        // IN_ROOT must select and validate dirfd even for an absolute pathname.
+        let (start_path, path) = if how.resolve.contains(OpenHowResolve::RESOLVE_IN_ROOT) {
+            let (start, _) = user_resolved_path_at(&ProcessManager::current_pcb(), dirfd, ".")?;
+            (start, String::from(path))
+        } else {
+            user_resolved_path_at(&ProcessManager::current_pcb(), dirfd, path)?
+        };
+        let scope_root = if how
+            .resolve
+            .intersects(OpenHowResolve::RESOLVE_BENEATH | OpenHowResolve::RESOLVE_IN_ROOT)
+        {
+            Some(start_path.derive()?)
+        } else {
+            None
+        };
+        let walk_options = (!how.resolve.is_empty())
+            .then(|| super::utils::PathWalkOptions::new(how.resolve, scope_root));
         let inode_begin = start_path.inode();
-        let resolved = inode_begin.lookup_follow_symlink_or_missing_owned(
-            &start_path,
-            &path,
-            VFS_MAX_FOLLOW_SYMLINK_TIMES,
-            follow_symlink,
-        );
+        let resolved = if let Some(options) = &walk_options {
+            inode_begin.lookup_openat2_owned(
+                &start_path,
+                &path,
+                VFS_MAX_FOLLOW_SYMLINK_TIMES,
+                follow_symlink,
+                options,
+            )
+        } else {
+            inode_begin.lookup_follow_symlink_or_missing_owned(
+                &start_path,
+                &path,
+                VFS_MAX_FOLLOW_SYMLINK_TIMES,
+                follow_symlink,
+            )
+        };
         let mut created = false;
         let mut preopened: Option<PreopenedFile> = None;
         let resolved = match resolved {
@@ -357,6 +392,9 @@ fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usize, SystemE
                         return Err(SystemError::ENAMETOOLONG);
                     }
                     let parent_inode = parent_resolved.inode();
+                    if let Some(options) = &walk_options {
+                        options.validate_path(&parent_resolved)?;
+                    }
                     let parent_md = parent_inode.metadata()?;
                     // The parent must be a directory
                     if parent_md.file_type != FileType::Dir {
@@ -384,6 +422,9 @@ fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usize, SystemE
                             0,
                         );
                     };
+                    if let Some(options) = &walk_options {
+                        options.validate_path(&parent_resolved)?;
+                    }
                     let inode: Arc<dyn IndexNode> = if let Some(mounted) =
                         parent_inode.clone().downcast_arc::<MountFSInode>()
                     {
@@ -431,8 +472,28 @@ fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usize, SystemE
         };
         drop(start_path);
         let inode = resolved.inode();
+        if !created {
+            if let Some(options) = &walk_options {
+                options.validate_path(&resolved)?;
+            }
+        }
         let metadata = inode.metadata()?;
         let file_type: FileType = metadata.file_type;
+
+        // No filesystem currently implements anonymous inode creation. Still
+        // resolve and check the target directory before reporting unsupported,
+        // as Linux's path_openat() does for valid O_TMPFILE requests.
+        if how.o_flags.contains(FileFlags::__O_TMPFILE) {
+            if file_type != FileType::Dir {
+                return Err(SystemError::ENOTDIR);
+            }
+            super::permission::check_inode_permission(
+                &inode,
+                &metadata,
+                PermissionMask::MAY_WRITE | PermissionMask::MAY_EXEC,
+            )?;
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        }
 
         if !how.o_flags.contains(FileFlags::O_PATH)
             && (file_type == FileType::CharDevice || file_type == FileType::BlockDevice)
@@ -470,7 +531,7 @@ fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usize, SystemE
             }
             // Write access is not allowed on directories
             let acc_mode = how.o_flags.access_flags();
-            if acc_mode == FileFlags::O_WRONLY || acc_mode == FileFlags::O_RDWR {
+            if acc_mode != FileFlags::O_RDONLY {
                 return Err(SystemError::EISDIR);
             }
         }
@@ -486,7 +547,10 @@ fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usize, SystemE
                 FileFlags::O_RDWR => {
                     need.insert(PermissionMask::MAY_READ | PermissionMask::MAY_WRITE)
                 }
-                _ => {}
+                // Linux ACC_MODE(3) also requires read and write DAC checks,
+                // although a descriptor opened this way is not readable or
+                // writable through read(2)/write(2).
+                _ => need.insert(PermissionMask::MAY_READ | PermissionMask::MAY_WRITE),
             }
             if how.o_flags.contains(FileFlags::O_TRUNC) {
                 need.insert(PermissionMask::MAY_WRITE);
@@ -537,6 +601,11 @@ fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usize, SystemE
             None
         };
         let truncate_metadata = do_truncate.then(|| metadata.clone());
+        if !created {
+            if let Some(options) = &walk_options {
+                options.validate_path(&resolved)?;
+            }
+        }
         let (inode, mount_guard, operation_guard) = resolved.into_parts();
         let file: File = match preopened {
             Some(opened) => File::new_preopened_with_mount_guard(

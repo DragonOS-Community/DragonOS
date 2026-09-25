@@ -463,6 +463,10 @@ bitflags! {
 
         const O_PATH = 0o10000000;
 
+        /// Raw high bit of O_TMPFILE; Linux also requires O_DIRECTORY.
+        const __O_TMPFILE = 0o20000000;
+        const O_TMPFILE = Self::__O_TMPFILE.bits | Self::O_DIRECTORY.bits;
+
         const O_PATH_FLAGS = Self::O_DIRECTORY.bits|Self::O_NOFOLLOW.bits|Self::O_CLOEXEC.bits|Self::O_PATH.bits;
     }
 }

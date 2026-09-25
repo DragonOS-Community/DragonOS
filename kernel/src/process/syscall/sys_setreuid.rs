@@ -1,6 +1,6 @@
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_SETREUID;
-use crate::process::cred::Cred;
+use crate::process::cred::{CAPFlags, Cred};
 use crate::process::syscall::id_utils;
 use crate::process::ProcessManager;
 use crate::syscall::table::FormattedSyscallParam;
@@ -32,14 +32,10 @@ impl Syscall for SysSetReUid {
     /// - 非特权进程只能将 ruid/euid 设置为当前 ruid/euid/suid 之一
     /// - 如果设置了 ruid，或者 euid 被设置为与旧 ruid 不同的值，则 suid = new_euid
     fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
-        let ruid = Self::ruid(args);
-        let euid = Self::euid(args);
-
-        id_utils::validate_id(ruid)?;
-        id_utils::validate_id(euid)?;
-
         let pcb = ProcessManager::current_pcb();
         let old_cred = pcb.cred();
+        let ruid = id_utils::map_uid_arg(&old_cred.user_ns, Self::ruid(args), true)?;
+        let euid = id_utils::map_uid_arg(&old_cred.user_ns, Self::euid(args), true)?;
 
         let old_ruid = old_cred.uid.data();
         let old_euid = old_cred.euid.data();
@@ -48,7 +44,7 @@ impl Syscall for SysSetReUid {
         let new_ruid = id_utils::resolve_id(ruid, old_ruid);
         let new_euid = id_utils::resolve_id(euid, old_euid);
 
-        let is_privileged = old_cred.euid.data() == 0;
+        let is_privileged = old_cred.has_capability(CAPFlags::CAP_SETUID);
         id_utils::check_setre_permissions(
             old_ruid,
             old_euid,
@@ -65,8 +61,8 @@ impl Syscall for SysSetReUid {
         }
         if !id_utils::is_no_change(euid) {
             new_cred.seteuid(new_euid);
-            new_cred.setfsuid(new_euid);
         }
+        new_cred.setfsuid(new_euid);
 
         // 更新 suid 的规则
         // 如果设置了 ruid，或者 euid 被设置为与旧 ruid 不同的值，则 suid = new_euid

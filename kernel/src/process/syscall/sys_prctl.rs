@@ -107,11 +107,11 @@ impl Syscall for SysPrctl {
                 // Linux: PR_SET_KEEPCAPS 仅允许 0/1，其他值返回 EINVAL。
                 match arg2 {
                     0 => {
-                        current.set_keepcaps(false);
+                        current.set_keepcaps(false)?;
                         Ok(0)
                     }
                     1 => {
-                        current.set_keepcaps(true);
+                        current.set_keepcaps(true)?;
                         Ok(0)
                     }
                     _ => Err(SystemError::EINVAL),

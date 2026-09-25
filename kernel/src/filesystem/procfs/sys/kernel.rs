@@ -20,15 +20,13 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::Ordering;
 use system_error::SystemError;
 
 use super::numeric::parse_numeric_sysctl;
 
-static OVERFLOW_UID: AtomicU32 = AtomicU32::new(DEFAULT_OVERFLOW_ID);
-static OVERFLOW_GID: AtomicU32 = AtomicU32::new(DEFAULT_OVERFLOW_ID);
+use crate::process::namespace::user_namespace::{OVERFLOW_GID, OVERFLOW_UID};
 
-const DEFAULT_OVERFLOW_ID: u32 = 65534;
 const MAX_OVERFLOW_ID: u32 = 65535;
 
 /// /proc/sys/kernel 目录的 DirOps 实现

@@ -14,7 +14,7 @@ use crate::{
         vfs::{FilePrivateData, IndexNode, InodeMode},
     },
     process::{
-        cred::{cap_capable, CAPFlags, Cred},
+        cred::{cap_capable, ns_capable, CAPFlags, Cred},
         namespace::user_namespace::{
             map_id_down, map_id_range_down, map_id_up, UidGidExtent, UidGidMap, UserNamespace,
             UID_GID_MAP_MAX_BASE_EXTENTS, UID_GID_MAP_MAX_EXTENTS, USERNS_SETGROUPS_ALLOWED,
@@ -133,6 +133,26 @@ impl IdMapFileOps {
         Ok(open_cred.clone())
     }
 
+    fn pinned_user_ns(
+        data: &MutexGuard<FilePrivateData>,
+    ) -> Result<Arc<UserNamespace>, SystemError> {
+        let FilePrivateData::Procfs(ProcfsFilePrivateData { user_ns, .. }) = &**data else {
+            return Err(SystemError::EINVAL);
+        };
+        user_ns.clone().ok_or(SystemError::EINVAL)
+    }
+
+    fn pin_user_ns(
+        data: &mut MutexGuard<FilePrivateData>,
+        user_ns: Arc<UserNamespace>,
+    ) -> Result<(), SystemError> {
+        let FilePrivateData::Procfs(private) = &mut **data else {
+            return Err(SystemError::EINVAL);
+        };
+        private.user_ns = Some(user_ns);
+        Ok(())
+    }
+
     fn generate_content(&self, map: &UidGidMap, ctx: &IdMapWriteContext) -> String {
         let nr = map.get_nr_extents() as usize;
         if nr == 0 {
@@ -187,7 +207,7 @@ impl IdMapFileOps {
                 count: parts[2].parse::<u32>().map_err(|_| SystemError::EINVAL)?,
             };
 
-            self.validate_new_extent(&new_extents, &extent)?;
+            Self::validate_new_extent(&new_extents, &extent)?;
             new_extents.push(extent);
         }
 
@@ -199,7 +219,6 @@ impl IdMapFileOps {
     }
 
     fn validate_new_extent(
-        &self,
         new_extents: &[UidGidExtent],
         extent: &UidGidExtent,
     ) -> Result<(), SystemError> {
@@ -209,22 +228,22 @@ impl IdMapFileOps {
 
         let upper_last = extent
             .first
-            .checked_add(extent.count - 1)
+            .checked_add(extent.count)
             .ok_or(SystemError::EINVAL)?;
         let lower_last = extent
             .lower_first
-            .checked_add(extent.count - 1)
+            .checked_add(extent.count)
             .ok_or(SystemError::EINVAL)?;
 
         for prev in new_extents {
-            let prev_upper_last = prev.first + prev.count - 1;
-            let prev_lower_last = prev.lower_first + prev.count - 1;
+            let prev_upper_last = prev.first + prev.count;
+            let prev_lower_last = prev.lower_first + prev.count;
 
-            if prev.first <= upper_last && prev_upper_last >= extent.first {
+            if prev.first < upper_last && prev_upper_last > extent.first {
                 return Err(SystemError::EINVAL);
             }
 
-            if prev.lower_first <= lower_last && prev_lower_last >= extent.lower_first {
+            if prev.lower_first < lower_last && prev_lower_last > extent.lower_first {
                 return Err(SystemError::EINVAL);
             }
         }
@@ -303,7 +322,9 @@ impl IdMapFileOps {
 
         let parent_ns = ctx.target_parent_ns()?;
         let parent_cap = ctx.map_type.parent_cap();
-        if ctx.opener_has_cap(&parent_ns, parent_cap) {
+        // A privileged mapping requires the capability both in the current
+        // writer and in the credentials captured when this file was opened.
+        if ns_capable(&parent_ns, parent_cap) && ctx.opener_has_cap(&parent_ns, parent_cap) {
             return Ok(());
         }
 
@@ -363,7 +384,57 @@ impl IdMapFileOps {
     }
 }
 
+#[cfg(test)]
+mod extent_validation_tests {
+    use super::*;
+
+    #[test]
+    fn invalid_id_cannot_be_part_of_a_map_extent() {
+        let extent = UidGidExtent {
+            first: u32::MAX - 1,
+            lower_first: 1000,
+            count: 2,
+        };
+        assert_eq!(
+            IdMapFileOps::validate_new_extent(&[], &extent),
+            Err(SystemError::EINVAL)
+        );
+        let extent = UidGidExtent {
+            first: 0,
+            lower_first: u32::MAX - 1,
+            count: 2,
+        };
+        assert_eq!(
+            IdMapFileOps::validate_new_extent(&[], &extent),
+            Err(SystemError::EINVAL)
+        );
+    }
+
+    #[test]
+    fn adjacent_valid_extents_do_not_overlap() {
+        let first = UidGidExtent {
+            first: 0,
+            lower_first: 1000,
+            count: 1,
+        };
+        let second = UidGidExtent {
+            first: 1,
+            lower_first: 1001,
+            count: 1,
+        };
+        assert_eq!(IdMapFileOps::validate_new_extent(&[first], &second), Ok(()));
+    }
+}
+
 impl FileOps for IdMapFileOps {
+    fn open(
+        &self,
+        data: &mut MutexGuard<FilePrivateData>,
+        _flags: &crate::filesystem::vfs::file::FileFlags,
+    ) -> Result<(), SystemError> {
+        Self::pin_user_ns(data, self.get_user_ns()?)
+    }
+
     fn read_at(
         &self,
         offset: usize,
@@ -375,11 +446,11 @@ impl FileOps for IdMapFileOps {
         // snapshot helper. The target namespace is resolved by the renderer, so
         // a continuation read never touches the target task.
         let opener_cred = Self::open_cred_from_data(&data)?;
+        let user_ns = Self::pinned_user_ns(&data)?;
 
         // Linux serves uid_map/gid_map through `seq_read()` (`fs/proc/base.c`), so
         // the map text is frozen for the lifetime of the fd.
         proc_read_snapshot(offset, len, buf, &mut data, || {
-            let user_ns = self.get_user_ns()?;
             let (map, ctx) = {
                 let inner = user_ns.inner.lock();
                 let ctx = IdMapWriteContext {
@@ -411,7 +482,7 @@ impl FileOps for IdMapFileOps {
         data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         let opener_cred = Self::open_cred_from_data(&data)?;
-        let user_ns = self.get_user_ns()?;
+        let user_ns = Self::pinned_user_ns(&data)?;
 
         if !cap_capable(&opener_cred, &user_ns, CAPFlags::CAP_SYS_ADMIN) {
             return Err(SystemError::EPERM);
@@ -474,6 +545,22 @@ impl SetgroupsFileOps {
 }
 
 impl FileOps for SetgroupsFileOps {
+    fn open(
+        &self,
+        data: &mut MutexGuard<FilePrivateData>,
+        flags: &crate::filesystem::vfs::file::FileFlags,
+    ) -> Result<(), SystemError> {
+        let pcb = self
+            .target
+            .thread_group_leader()
+            .ok_or(SystemError::ESRCH)?;
+        let user_ns = pcb.cred().user_ns.clone();
+        if !flags.is_read_only() && !ns_capable(&user_ns, CAPFlags::CAP_SYS_ADMIN) {
+            return Err(SystemError::EACCES);
+        }
+        IdMapFileOps::pin_user_ns(data, user_ns)
+    }
+
     fn read_at(
         &self,
         offset: usize,
@@ -481,15 +568,11 @@ impl FileOps for SetgroupsFileOps {
         buf: &mut [u8],
         mut data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
+        let user_ns = IdMapFileOps::pinned_user_ns(&data)?;
         // Linux `proc_setgroups_operations` reads through `seq_read()`
         // (`fs/proc/base.c:3219`), so one fd sees one `allow`/`deny` record.
         proc_read_snapshot(offset, len, buf, &mut data, || {
             let allowed = {
-                let pcb = self
-                    .target
-                    .thread_group_leader()
-                    .ok_or(SystemError::ESRCH)?;
-                let user_ns = pcb.cred().user_ns.clone();
                 let inner = user_ns.inner.lock();
                 (inner.flags & USERNS_SETGROUPS_ALLOWED) != 0
             };
@@ -506,17 +589,13 @@ impl FileOps for SetgroupsFileOps {
         offset: usize,
         _len: usize,
         buf: &[u8],
-        _data: MutexGuard<FilePrivateData>,
+        data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         if offset != 0 || buf.len() >= PROC_ID_MAP_MAX_WRITE {
             return Err(SystemError::EINVAL);
         }
 
-        let pcb = self
-            .target
-            .thread_group_leader()
-            .ok_or(SystemError::ESRCH)?;
-        let user_ns = pcb.cred().user_ns.clone();
+        let user_ns = IdMapFileOps::pinned_user_ns(&data)?;
         let mut inner = user_ns.inner.lock();
 
         let input = core::str::from_utf8(buf).map_err(|_| SystemError::EINVAL)?;

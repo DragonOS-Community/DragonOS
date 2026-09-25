@@ -1,6 +1,11 @@
 use system_error::SystemError;
 
 use crate::filesystem::vfs::stat::KStat;
+use crate::process::{
+    cred::{Kgid, Kuid},
+    namespace::user_namespace::{from_kgid_munged, from_kuid_munged},
+    ProcessManager,
+};
 
 #[repr(C)]
 #[derive(Default, Clone, Copy)]
@@ -51,9 +56,9 @@ impl TryFrom<KStat> for PosixStat {
         tmp.st_mode = kstat.mode.bits();
         tmp.st_nlink = kstat.nlink.try_into().map_err(|_| SystemError::EOVERFLOW)?;
 
-        // todo: 处理user namespace (https://code.dragonos.org.cn/xref/linux-6.6.21/fs/stat.c#415)
-        tmp.st_uid = kstat.uid;
-        tmp.st_gid = kstat.gid;
+        let user_ns = ProcessManager::current_user_ns();
+        tmp.st_uid = from_kuid_munged(&user_ns, Kuid::new(kstat.uid as usize));
+        tmp.st_gid = from_kgid_munged(&user_ns, Kgid::new(kstat.gid as usize));
 
         tmp.st_rdev = kstat.rdev.new_encode_dev() as usize;
         tmp.st_size = kstat.size as isize;

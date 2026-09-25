@@ -1,6 +1,6 @@
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_SETREGID;
-use crate::process::cred::Cred;
+use crate::process::cred::{CAPFlags, Cred};
 use crate::process::syscall::id_utils;
 use crate::process::ProcessManager;
 use crate::syscall::table::FormattedSyscallParam;
@@ -32,14 +32,10 @@ impl Syscall for SysSetReGid {
     /// - 非特权进程只能将 rgid/egid 设置为当前 rgid/egid/sgid 之一
     /// - 如果设置了 rgid，或者 egid 被设置为与旧 rgid 不同的值，则 sgid = new_egid
     fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
-        let rgid = Self::rgid(args);
-        let egid = Self::egid(args);
-
-        id_utils::validate_id(rgid)?;
-        id_utils::validate_id(egid)?;
-
         let pcb = ProcessManager::current_pcb();
         let old_cred = pcb.cred();
+        let rgid = id_utils::map_gid_arg(&old_cred.user_ns, Self::rgid(args), true)?;
+        let egid = id_utils::map_gid_arg(&old_cred.user_ns, Self::egid(args), true)?;
 
         let old_rgid = old_cred.gid.data();
         let old_egid = old_cred.egid.data();
@@ -48,7 +44,7 @@ impl Syscall for SysSetReGid {
         let new_rgid = id_utils::resolve_id(rgid, old_rgid);
         let new_egid = id_utils::resolve_id(egid, old_egid);
 
-        let is_privileged = old_cred.euid.data() == 0;
+        let is_privileged = old_cred.has_capability(CAPFlags::CAP_SETGID);
         id_utils::check_setre_permissions(
             old_rgid,
             old_egid,
@@ -65,8 +61,8 @@ impl Syscall for SysSetReGid {
         }
         if !id_utils::is_no_change(egid) {
             new_cred.setegid(new_egid);
-            new_cred.setfsgid(new_egid);
         }
+        new_cred.setfsgid(new_egid);
 
         // 更新 sgid 的规则
         // 如果设置了 rgid，或者 egid 被设置为与旧 rgid 不同的值，则 sgid = new_egid

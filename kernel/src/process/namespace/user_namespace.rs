@@ -5,7 +5,10 @@ use core::fmt::Debug;
 use core::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
 
 use crate::libs::spinlock::SpinLock;
-use crate::process::{Cred, ProcessManager};
+use crate::process::{
+    cred::{Kgid, Kuid},
+    Cred, ProcessManager,
+};
 use system_error::SystemError;
 
 use super::nsproxy::NsCommon;
@@ -29,6 +32,11 @@ pub const UID_GID_MAP_MAX_EXTENTS: usize = 340;
 
 /// 允许 setgroups 的标志位
 pub const USERNS_SETGROUPS_ALLOWED: u32 = 1;
+
+/// Values used when a kernel-global ID has no mapping in the caller's user namespace.
+/// These are global sysctls, not properties of an individual namespace.
+pub static OVERFLOW_UID: AtomicU32 = AtomicU32::new(65534);
+pub static OVERFLOW_GID: AtomicU32 = AtomicU32::new(65534);
 
 /// UID/GID 映射表
 /// 采用小映射优化：≤5 个 extent 使用内联数组，否则堆分配
@@ -166,16 +174,69 @@ pub fn map_id_up(map: &UidGidMap, id: u32) -> Option<u32> {
 /// 范围 down 映射：验证 [id, id+count) 都能被映射
 pub fn map_id_range_down(map: &UidGidMap, id: u32, count: u32) -> Option<u32> {
     if count == 0 {
-        return Some(id);
-    }
-    let end = id.saturating_add(count - 1);
-    let mapped_start = map_id_down(map, id)?;
-    let mapped_end = map_id_down(map, end)?;
-    // 验证映射是连续的
-    if mapped_end != mapped_start.saturating_add(count - 1) {
         return None;
     }
-    Some(mapped_start)
+    let end = id.checked_add(count - 1)?;
+    let nr = map.get_nr_extents() as usize;
+    let extents = if nr <= UID_GID_MAP_MAX_BASE_EXTENTS {
+        &map.extent[..nr]
+    } else {
+        map.forward.as_deref()?
+    };
+    // Linux map_id_range_down requires the *entire* interval to fit in one
+    // extent, even when two neighbouring extents appear numerically adjacent.
+    let candidate = if nr <= UID_GID_MAP_MAX_BASE_EXTENTS {
+        extents
+            .iter()
+            .find(|extent| id >= extent.first && id < extent.first + extent.count)
+    } else {
+        let index = match extents.binary_search_by_key(&id, |extent| extent.first) {
+            Ok(index) => index,
+            Err(0) => return None,
+            Err(index) => index - 1,
+        };
+        extents.get(index)
+    };
+    candidate.and_then(|extent| {
+        let last = extent.first.checked_add(extent.count - 1)?;
+        (id >= extent.first && end <= last).then(|| extent.lower_first + (id - extent.first))
+    })
+}
+
+/// Map a user-visible ID to the kernel-global credential ID. An unmapped ID,
+/// including the reserved all-ones value, is invalid for credential updates.
+pub fn make_kuid(ns: &UserNamespace, uid: u32) -> Result<Kuid, SystemError> {
+    if uid == u32::MAX {
+        return Err(SystemError::EINVAL);
+    }
+    map_id_down(&ns.inner.lock().uid_map, uid)
+        .filter(|id| *id != u32::MAX)
+        .map(|id| Kuid::new(id as usize))
+        .ok_or(SystemError::EINVAL)
+}
+
+pub fn make_kgid(ns: &UserNamespace, gid: u32) -> Result<Kgid, SystemError> {
+    if gid == u32::MAX {
+        return Err(SystemError::EINVAL);
+    }
+    map_id_down(&ns.inner.lock().gid_map, gid)
+        .filter(|id| *id != u32::MAX)
+        .map(|id| Kgid::new(id as usize))
+        .ok_or(SystemError::EINVAL)
+}
+
+pub fn from_kuid_munged(ns: &UserNamespace, kuid: Kuid) -> u32 {
+    u32::try_from(kuid.data())
+        .ok()
+        .and_then(|id| map_id_up(&ns.inner.lock().uid_map, id))
+        .unwrap_or_else(|| OVERFLOW_UID.load(AtomicOrdering::Relaxed))
+}
+
+pub fn from_kgid_munged(ns: &UserNamespace, kgid: Kgid) -> u32 {
+    u32::try_from(kgid.data())
+        .ok()
+        .and_then(|id| map_id_up(&ns.inner.lock().gid_map, id))
+        .unwrap_or_else(|| OVERFLOW_GID.load(AtomicOrdering::Relaxed))
 }
 
 lazy_static! {
@@ -183,14 +244,14 @@ lazy_static! {
 }
 
 pub struct UserNamespace {
-    pub parent: Option<Weak<UserNamespace>>,
+    /// Keep every ancestor alive while this namespace is referenced.
+    pub parent: Option<Arc<UserNamespace>>,
     nscommon: NsCommon,
     self_ref: Weak<UserNamespace>,
     pub inner: SpinLock<InnerUserNamespace>,
 }
 
 pub struct InnerUserNamespace {
-    pub children: Vec<Arc<UserNamespace>>,
     /// UID 映射表
     pub uid_map: UidGidMap,
     /// GID 映射表
@@ -221,7 +282,6 @@ impl UserNamespace {
             nscommon: NsCommon::new(0, NamespaceType::User),
             parent: None,
             inner: SpinLock::new(InnerUserNamespace {
-                children: Vec::new(),
                 uid_map: UidGidMap::new_identity(),
                 gid_map: UidGidMap::new_identity(),
                 projid_map: UidGidMap::default(),
@@ -240,7 +300,7 @@ impl UserNamespace {
 
     /// 获取父命名空间
     pub fn parent_ns(&self) -> Option<Arc<UserNamespace>> {
-        self.parent.as_ref().and_then(|p| p.upgrade())
+        self.parent.clone()
     }
 
     /// 检查当前用户命名空间是否是另一个用户命名空间的祖先
@@ -251,8 +311,8 @@ impl UserNamespace {
             let current_level = current.level();
             match current_level.cmp(&self_level) {
                 Ordering::Greater => {
-                    if let Some(parent) = current.parent.as_ref().and_then(|p| p.upgrade()) {
-                        current = parent;
+                    if let Some(parent) = current.parent.as_ref() {
+                        current = parent.clone();
                         continue;
                     } else {
                         return false;
@@ -281,24 +341,33 @@ impl UserNamespace {
         // 2. chroot 检查（简化版：检查当前 fs.root 是否与 init 不同）
         // TODO: 实现更严格的 chroot 检查
 
-        // 3. 创建者的 euid/egid 在父 ns 中必须有有效映射
-        // 对于 init_user_ns，这总是成立的（identity mapping）
-        // 对于子 ns，需要验证映射存在
+        // Linux create_user_ns requires the creator's effective IDs to be
+        // mapped in the parent namespace before granting capabilities in the
+        // child. Do not use the munged (overflow) value for this check.
+        {
+            let inner = parent_ns.inner.lock();
+            let euid = u32::try_from(cred.euid.data()).map_err(|_| SystemError::EPERM)?;
+            let egid = u32::try_from(cred.egid.data()).map_err(|_| SystemError::EPERM)?;
+            if map_id_up(&inner.uid_map, euid).is_none()
+                || map_id_up(&inner.gid_map, egid).is_none()
+            {
+                return Err(SystemError::EPERM);
+            }
+        }
 
         // 4. 创建新的 UserNamespace
         let new_ns = Arc::new_cyclic(|self_ref| {
             let ns = Self {
                 self_ref: self_ref.clone(),
                 nscommon: NsCommon::new(parent_ns.level() + 1, NamespaceType::User),
-                parent: Some(Arc::downgrade(&parent_ns)),
+                parent: Some(parent_ns.clone()),
                 inner: SpinLock::new(InnerUserNamespace {
-                    children: Vec::new(),
                     uid_map: UidGidMap::default(),
                     gid_map: UidGidMap::default(),
                     projid_map: UidGidMap::default(),
                     owner: cred.euid.data(),
                     group: cred.egid.data(),
-                    flags: USERNS_SETGROUPS_ALLOWED,
+                    flags: 0,
                     parent_could_setfcap: cred
                         .cap_effective
                         .contains(crate::process::cred::CAPFlags::CAP_SETFCAP),
@@ -307,10 +376,11 @@ impl UserNamespace {
             ns
         });
 
-        // 5. 将新 ns 添加到父 ns 的 children 列表
+        // Inherit the parent's policy under the same lock used by
+        // /proc/*/setgroups. The child is not externally visible yet.
         {
-            let mut parent_inner = parent_ns.inner.lock();
-            parent_inner.children.push(new_ns.clone());
+            let parent_inner = parent_ns.inner.lock();
+            new_ns.inner.lock().flags = parent_inner.flags;
         }
 
         Ok(new_ns)
@@ -349,6 +419,7 @@ impl ProcessManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::process::cred::INIT_CRED;
     use alloc::vec;
 
     fn make_extent(first: u32, lower_first: u32, count: u32) -> UidGidExtent {
@@ -479,7 +550,7 @@ mod tests {
     #[test]
     fn test_map_id_range_down_zero_count() {
         let map = UidGidMap::default();
-        assert_eq!(map_id_range_down(&map, 42, 0), Some(42));
+        assert_eq!(map_id_range_down(&map, 42, 0), None);
     }
 
     #[test]
@@ -494,6 +565,33 @@ mod tests {
         let map = make_map_inline(&[make_extent(0, 100, 10), make_extent(100, 200, 10)]);
         // 跨越两个不连续的 extent，映射不连续
         assert_eq!(map_id_range_down(&map, 0, 20), None);
+    }
+
+    #[test]
+    fn test_map_id_range_down_rejects_malicious_endpoint_match() {
+        // Endpoints look contiguous globally, but parent ID 1 maps to 2000.
+        // Accepting a child range [0, 3) would grant the unmapped global 1001.
+        let map = make_map_inline(&[
+            make_extent(0, 1000, 1),
+            make_extent(1, 2000, 1),
+            make_extent(2, 1002, 1),
+        ]);
+        assert_eq!(map_id_range_down(&map, 0, 3), None);
+        assert_eq!(map_id_range_down(&map, 0, 1), Some(1000));
+    }
+
+    #[test]
+    fn test_map_id_range_down_heap_requires_single_extent() {
+        let map = make_map_heap(&[
+            make_extent(0, 1000, 1),
+            make_extent(1, 2000, 1),
+            make_extent(2, 1002, 1),
+            make_extent(3, 3000, 1),
+            make_extent(4, 4000, 1),
+            make_extent(5, 5000, 1),
+        ]);
+        assert_eq!(map_id_range_down(&map, 0, 3), None);
+        assert_eq!(map_id_range_down(&map, 5, 1), Some(5000));
     }
 
     #[test]
@@ -545,5 +643,33 @@ mod tests {
                 assert_eq!(back, child_id);
             }
         }
+    }
+
+    #[test]
+    fn child_namespace_is_reclaimed_when_last_reference_drops() {
+        let child = UserNamespace::create_user_ns(&INIT_CRED).unwrap();
+        let weak_child = Arc::downgrade(&child);
+        drop(child);
+        assert!(weak_child.upgrade().is_none());
+    }
+
+    #[test]
+    fn live_grandchild_keeps_parent_alive() {
+        let child = UserNamespace::create_user_ns(&INIT_CRED).unwrap();
+        {
+            let mut inner = child.inner.lock();
+            inner.uid_map = make_map_inline(&[make_extent(0, 0, 1)]);
+            inner.gid_map = make_map_inline(&[make_extent(0, 0, 1)]);
+        }
+        let mut cred = (**INIT_CRED).clone();
+        cred.user_ns = child.clone();
+        let grandchild = UserNamespace::create_user_ns(&cred).unwrap();
+        let weak_parent = Arc::downgrade(&child);
+        drop(cred);
+        drop(child);
+        assert!(weak_parent.upgrade().is_some());
+        assert_eq!(grandchild.parent_ns().unwrap().level(), 1);
+        drop(grandchild);
+        assert!(weak_parent.upgrade().is_none());
     }
 }

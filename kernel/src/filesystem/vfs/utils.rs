@@ -323,14 +323,10 @@ impl AsRef<str> for DName {
 /// 如果调用者在指定组内，返回 `true`；否则返回 `false`
 pub fn is_caller_in_group(cred: &Arc<Cred>, gid: usize) -> bool {
     let kgid = Kgid::from(gid);
-    let mut in_group = cred.fsgid.data() == gid
+    let in_group = cred.fsgid.data() == gid
         || cred.gid.data() == gid
         || cred.egid.data() == gid
         || cred.getgroups().contains(&kgid);
-
-    if let Some(info) = cred.group_info.as_ref() {
-        in_group |= info.gids.contains(&kgid);
-    }
 
     in_group
 }
@@ -373,7 +369,6 @@ pub fn should_remove_sgid(mode: InodeMode, gid: usize, cred: &Arc<Cred>) -> bool
 /// - `old_gid`: chown 前的原组 ID
 /// - `current_gid`: 当前调用者的 gid
 /// - `cred`: 调用者的凭证
-/// - `group_info`: 调用者的组信息
 ///
 /// # 返回值
 ///
@@ -387,7 +382,6 @@ pub fn should_remove_sgid_on_chown(
     mode: InodeMode,
     old_gid: usize,
     cred: &Arc<Cred>,
-    group_info: &crate::process::cred::GroupInfo,
     has_cap_fsetid: bool,
 ) -> bool {
     if !mode.contains(InodeMode::S_ISGID) {
@@ -401,10 +395,8 @@ pub fn should_remove_sgid_on_chown(
 
     // 注意：Linux 这里检查的是"原 inode gid"，在 notify_change 前尚未更新。
     let kgid = Kgid::from(old_gid);
-    let in_group = cred.fsgid.data() == old_gid
-        || cred.getgroups().contains(&kgid)
-        || group_info.gids.contains(&kgid)
-        || has_cap_fsetid;
+    let in_group =
+        cred.fsgid.data() == old_gid || cred.getgroups().contains(&kgid) || has_cap_fsetid;
 
     // 仅当调用者不在原文件所属组且无 CAP_FSETID 时清除
     !in_group

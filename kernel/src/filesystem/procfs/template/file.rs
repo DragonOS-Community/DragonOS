@@ -113,7 +113,11 @@ pub trait FileOps: Sync + Send + Sized + Debug {
     }
 
     /// 打开文件时调用，可用于按 open 时上下文初始化 procfs 私有数据
-    fn open(&self, _data: &mut MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
+    fn open(
+        &self,
+        _data: &mut MutexGuard<FilePrivateData>,
+        _flags: &FileFlags,
+    ) -> Result<(), SystemError> {
         Ok(())
     }
 
@@ -215,11 +219,11 @@ impl<F: FileOps + 'static> IndexNode for ProcFile<F> {
     fn open(
         &self,
         mut data: MutexGuard<FilePrivateData>,
-        _flags: &FileFlags,
+        flags: &FileFlags,
     ) -> Result<(), SystemError> {
         // 设置 procfs 私有数据，使得 lseek(SEEK_END) 返回 EINVAL
         *data = FilePrivateData::Procfs(ProcfsFilePrivateData::new());
-        self.inner.open(&mut data)
+        self.inner.open(&mut data, flags)
     }
 
     fn close(&self, _data: MutexGuard<FilePrivateData>) -> Result<(), SystemError> {

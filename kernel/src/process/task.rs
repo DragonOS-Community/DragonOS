@@ -216,8 +216,6 @@ pub struct ProcessControlBlock {
 
     /// prctl(PR_SET/GET_KEEPCAPS) state: thread-level (task) semantics.
     /// When true, the process retains capabilities after changing UID/GID.
-    pub(super) keepcaps: AtomicBool,
-
     pub(super) seccomp_mode: AtomicU8,
     pub(super) seccomp_filter: SpinLock<Option<Arc<seccomp::SeccompFilter>>>,
 
@@ -574,7 +572,6 @@ impl ProcessControlBlock {
                 pdeath_signal: AtomicSignal::new(Signal::INVALID),
 
                 no_new_privs: AtomicBool::new(false),
-                keepcaps: AtomicBool::new(false),
                 seccomp_mode: AtomicU8::new(seccomp::SeccompMode::Disabled as u8),
                 seccomp_filter: SpinLock::new(None),
                 parent_pcb: RwLock::new(ppcb.clone()),
@@ -887,12 +884,14 @@ impl ProcessControlBlock {
 
     #[inline(always)]
     pub fn keepcaps(&self) -> bool {
-        self.keepcaps.load(Ordering::SeqCst)
+        self.cred().keepcaps
     }
 
     #[inline(always)]
-    pub fn set_keepcaps(&self, value: bool) {
-        self.keepcaps.store(value, Ordering::SeqCst);
+    pub fn set_keepcaps(&self, value: bool) -> Result<(), SystemError> {
+        let mut cred = (*self.cred()).clone();
+        cred.keepcaps = value;
+        self.commit_cred(Cred::new_arc(cred))
     }
 
     #[inline(always)]

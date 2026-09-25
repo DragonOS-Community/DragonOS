@@ -249,6 +249,15 @@ fn do_execve_internal(
             if let Err(err) = Syscall::arch_do_execve(regs, &param, &result, user_sp, argv_ptr) {
                 return finish_exec_error(&param, old_vm.as_ref(), err);
             }
+            // Linux clears SECURE_KEEP_CAPS on a successful exec. Keep it in
+            // Cred so this publication cannot race with a userns credential
+            // install; do not clear it before the last fallible exec step.
+            let old_cred = pcb.cred();
+            if old_cred.keepcaps {
+                let mut new_cred = (*old_cred).clone();
+                new_cred.keepcaps = false;
+                pcb.install_cred(crate::process::cred::Cred::new_arc(new_cred));
+            }
             // A successful exec does not inherit ptrace hardware debug state.
             exec_pcb.flush_ptrace_hw_debug_regs();
             // After commit, reset dumpability according to the new credentials.

@@ -520,6 +520,11 @@ impl ProcessManager {
             }
             ProcessManager::exit_notify(&pcb);
 
+            // This task will never resume to run its stack-local destructors.
+            // Transfer only current_pcb to the scheduler; retaining these Arc
+            // clones would keep the exited PCB and both kernel stacks alive.
+            drop(group_leader);
+            drop(pcb);
             __schedule_with_current(SchedMode::SM_NONE, current_pcb);
             error!("raw_pid {raw_pid:?} exited but sched again!");
             #[allow(clippy::empty_loop)]

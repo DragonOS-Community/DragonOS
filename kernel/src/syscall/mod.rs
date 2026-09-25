@@ -86,6 +86,9 @@ impl Syscall {
             let _ = current_pcb.ptrace_report_syscall(false, nr_raw as u64, &seccomp_args);
             return Ok(frame.get_syscall_return());
         }
+        // Seccomp and syscall handlers may exit without unwinding this stack.
+        // Entry tracing is finished; do not retain the task across dispatch.
+        drop(current_pcb);
         let mut dispatch_nr = nr_raw as usize;
         let mut dispatch_args = crate::process::seccomp::frame_syscall_args(frame);
         seccomp_args = dispatch_args;

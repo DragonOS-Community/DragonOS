@@ -339,6 +339,10 @@ pub enum FilePrivateData {
     Kernfs(Option<KernFilePrivateData>),
     /// timerfd open-file-description flags (notably O_NONBLOCK).
     TimerFd(FileFlags),
+    /// Configurable filesystem context shared by dup/fork aliases.
+    FsContext(Arc<crate::filesystem::vfs::mount_api::context::FsContext>),
+    /// Ownership of a detached mount tree until it is attached or finally closed.
+    DetachedMount(Arc<crate::filesystem::vfs::mount::DetachedMountTree>),
     /// 不需要文件私有信息
     Unused,
 }

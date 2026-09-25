@@ -966,6 +966,8 @@ pub fn create_memfd_file(
 }
 
 impl MountableFileSystem for Tmpfs {
+    const SUPPORTS_FSCONFIG_LEGACY_OPTIONS: bool = true;
+
     fn make_mount_data(
         raw_data: Option<&str>,
         _source: &str,

@@ -28,9 +28,12 @@ use crate::{
             vmstat::VmstatFileOps,
             Builder, PROCFS_BLOCK_SIZE, PROCFS_MAX_NAMELEN,
         },
-        vfs::{FileSystemMakerData, IndexNode, InodeId, InodeMode, Metadata, FSMAKER},
+        vfs::{
+            FileSystemMakerData, FsCreationContext, IndexNode, InodeId, InodeMode, Metadata,
+            FSMAKER,
+        },
     },
-    process::{namespace::pid_namespace::PidNamespace, ProcessManager, RawPid},
+    process::{namespace::pid_namespace::PidNamespace, RawPid},
     register_mountable_fs,
 };
 use alloc::{
@@ -303,12 +306,20 @@ impl MountableFileSystem for ProcFS {
     /// 与需要挂载选项的文件系统（如带有大小限制的 tmpfs）不同，
     /// procfs 的行为完全由内核状态决定，不需要额外的配置参数。
     fn make_mount_data(
-        _raw_data: Option<&str>,
-        _source: &str,
+        raw_data: Option<&str>,
+        source: &str,
     ) -> Result<Option<Arc<dyn crate::filesystem::vfs::FileSystemMakerData + 'static>>, SystemError>
     {
+        Self::make_mount_data_in_context(raw_data, source, &FsCreationContext::current())
+    }
+
+    fn make_mount_data_in_context(
+        _raw_data: Option<&str>,
+        _source: &str,
+        context: &FsCreationContext,
+    ) -> Result<Option<Arc<dyn FileSystemMakerData + 'static>>, SystemError> {
         Ok(Some(Arc::new(ProcMountData {
-            pid_ns: ProcessManager::current_pcb().active_pid_ns(),
+            pid_ns: context.pid_ns.clone(),
         })))
     }
 

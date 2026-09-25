@@ -1533,6 +1533,8 @@ impl Drop for Ext4FileSystem {
 }
 
 impl MountableFileSystem for Ext4FileSystem {
+    const SUPPORTS_FSCONFIG_LEGACY_OPTIONS: bool = true;
+
     fn make_fs_with_flags(
         data: Option<&dyn FileSystemMakerData>,
         mount_flags: MountFlags,

@@ -80,6 +80,7 @@ mod sys_copy_file_range;
 mod sys_fstat;
 mod sys_fsync;
 pub mod sys_mount;
+mod sys_mount_api;
 mod sys_sendfile;
 mod sys_splice;
 mod sys_sync;

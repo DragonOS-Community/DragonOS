@@ -1,5 +1,46 @@
 use crate::arch::rand::rand;
+use crate::libs::spinlock::SpinLock;
+use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, Ordering};
+use system_error::SystemError;
+
+/// A provider of entropy suitable for security-sensitive kernel uses.
+///
+/// This is separate from the legacy `rand_bytes`, whose clock/LCG sources
+/// are not suitable for key serial allocation.
+pub trait SecureEntropySource: Send + Sync {
+    fn fill_bytes(&self, output: &mut [u8]) -> Result<(), SystemError>;
+}
+
+static SECURE_ENTROPY_SOURCE: SpinLock<Option<Arc<dyn SecureEntropySource>>> = SpinLock::new(None);
+
+pub fn register_secure_entropy_source(
+    source: Arc<dyn SecureEntropySource>,
+) -> Result<(), SystemError> {
+    let mut slot = SECURE_ENTROPY_SOURCE.lock();
+    if slot.is_some() {
+        return Err(SystemError::EBUSY);
+    }
+    *slot = Some(source);
+    Ok(())
+}
+
+/// Fill a kernel buffer without falling back to the legacy weak generator.
+pub fn secure_random_bytes(output: &mut [u8]) -> Result<(), SystemError> {
+    if output.is_empty() {
+        return Ok(());
+    }
+    let source = SECURE_ENTROPY_SOURCE
+        .lock()
+        .as_ref()
+        .cloned()
+        .ok_or(SystemError::EAGAIN_OR_EWOULDBLOCK)?;
+    if let Err(error) = source.fill_bytes(output) {
+        output.fill(0);
+        return Err(error);
+    }
+    Ok(())
+}
 
 bitflags! {
     pub struct GRandFlags: u8{

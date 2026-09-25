@@ -6,7 +6,7 @@ use system_error::SystemError;
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_SCHED_GETAFFINITY;
 use crate::process::{ProcessManager, RawPid};
-use crate::sched::syscall::util::has_sched_permission;
+use crate::smp::cpu::smp_cpu_manager;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
 use crate::syscall::user_access::copy_to_user_protected;
 
@@ -19,10 +19,16 @@ impl Syscall for SysSchedGetaffinity {
 
     fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let pid = args[0] as i32;
-        let size = args[1];
+        let size = args[1] as u32;
         let set_vaddr = args[2];
 
-        if size == 0 {
+        let nr_cpu_ids = smp_cpu_manager()
+            .possible_cpus()
+            .last()
+            .map_or(0, |cpu| cpu.data() + 1);
+        if size.wrapping_mul(8) < nr_cpu_ids
+            || !(size as usize).is_multiple_of(core::mem::size_of::<usize>())
+        {
             return Err(SystemError::EINVAL);
         }
 
@@ -33,14 +39,9 @@ impl Syscall for SysSchedGetaffinity {
                 .ok_or(SystemError::ESRCH)?
         };
 
-        let current_pcb = ProcessManager::current_pcb();
-        if !has_sched_permission(&current_pcb, &target_pcb) {
-            return Err(SystemError::EPERM);
-        }
-
-        let mask = target_pcb.sched_info().cpus_allowed();
+        let mask = &target_pcb.sched_info().cpus_allowed() & &smp_cpu_manager().online_cpus();
         let src = unsafe { mask.inner().as_bytes() };
-        let copy_len = core::cmp::min(size, src.len());
+        let copy_len = core::cmp::min(size as usize, src.len());
 
         unsafe { copy_to_user_protected(crate::mm::VirtAddr::new(set_vaddr), &src[..copy_len])? };
 

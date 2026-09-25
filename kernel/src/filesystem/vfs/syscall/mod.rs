@@ -25,6 +25,7 @@ mod sys_fallocate;
 mod sys_fchdir;
 mod sys_fchmod;
 mod sys_fchmodat;
+mod sys_fchmodat2;
 mod sys_fchown;
 mod sys_fchownat;
 mod sys_fcntl;

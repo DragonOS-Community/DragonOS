@@ -702,6 +702,9 @@ pub struct File {
     /// One semantic inode pin per open file description. Duplicated file
     /// descriptors and VMAs share this `File`, while `O_PATH` still owns it.
     _inode_retention: InodeRetentionGuard,
+    /// FIFO/device I/O uses another inode, but the original pathname must
+    /// remain live for file->f_path operations until this description closes.
+    _path_inode_retention: Option<InodeRetentionGuard>,
     /// Release every inode owner before the mount pin can start final shutdown
     /// and seal the filesystem's eviction queue.
     _mount_guard: Option<MountExternalGuard>,
@@ -809,7 +812,9 @@ impl File {
             .as_ref()
             .map(MountExternalGuard::derive)
             .transpose()?;
-        super::utils::ResolvedPath::from_existing_mount(self.inode.clone(), mount_guard)
+        // `self.inode` can be the runtime I/O inode of a FIFO or device.
+        // Path-based operations must use the inode paired with this mount pin.
+        super::utils::ResolvedPath::from_existing_mount(self.path_inode(), mount_guard)
     }
 
     #[inline]
@@ -1240,6 +1245,14 @@ impl File {
         // open fails, the local guard releases exactly once on this error path.
         let inode_retention =
             InodeRetentionGuard::new(inode.clone(), InodeRetentionKind::OpenFileDescription)?;
+        let path_inode_retention = if Arc::ptr_eq(&inode, &path_inode) {
+            None
+        } else {
+            Some(InodeRetentionGuard::new(
+                path_inode.clone(),
+                InodeRetentionKind::OpenFileDescription,
+            )?)
+        };
 
         if is_path && preopened.is_some() {
             return Err(SystemError::EINVAL);
@@ -1326,6 +1339,7 @@ impl File {
             epitems: Arc::new(EPollItemList::default()),
             _write_access: write_access,
             _inode_retention: inode_retention,
+            _path_inode_retention: path_inode_retention,
             _mount_guard: mount_guard,
         };
 
@@ -2469,6 +2483,10 @@ impl File {
         let inode_retention =
             InodeRetentionGuard::new(self.inode.clone(), InodeRetentionKind::OpenFileDescription)
                 .ok()?;
+        let path_inode_retention = self
+            ._path_inode_retention
+            .as_ref()
+            .map(|retention| retention.derive_existing(InodeRetentionKind::OpenFileDescription));
         let flags = self.flags();
         let mut mode = self.mode();
         let private_data = Mutex::new(self.private_data.lock().clone());
@@ -2531,6 +2549,7 @@ impl File {
             epitems: Arc::new(EPollItemList::default()),
             _write_access: self._write_access.clone(),
             _inode_retention: inode_retention,
+            _path_inode_retention: path_inode_retention,
             _mount_guard: mount_guard,
         };
         return Some(res);

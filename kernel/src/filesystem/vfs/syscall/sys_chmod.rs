@@ -3,7 +3,7 @@ use system_error::SystemError;
 use crate::arch::syscall::nr::SYS_CHMOD;
 use crate::{
     arch::interrupt::TrapFrame,
-    filesystem::vfs::{fcntl::AtFlags, open::do_fchmodat, InodeMode},
+    filesystem::vfs::{fcntl::AtFlags, open::do_fchmodat},
     syscall::table::{FormattedSyscallParam, Syscall},
 };
 use alloc::vec::Vec;
@@ -18,11 +18,7 @@ impl Syscall for SysChmodHandle {
     fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let pathname = Self::pathname(args);
         let mode = Self::mode(args);
-        return do_fchmodat(
-            AtFlags::AT_FDCWD.bits(),
-            pathname,
-            InodeMode::from_bits(mode).ok_or(SystemError::EINVAL)?,
-        );
+        do_fchmodat(AtFlags::AT_FDCWD.bits(), pathname, mode, 0)
     }
 
     fn entry_format(&self, args: &[usize]) -> Vec<FormattedSyscallParam> {

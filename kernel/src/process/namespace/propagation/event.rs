@@ -333,10 +333,21 @@ fn propagation_targets(source: &Arc<MountFS>) -> Vec<PropagationTarget> {
 
     let mut pending = source.propagation().slaves();
     for peer in result.iter().map(|target| &target.mount) {
-        pending.extend(peer.propagation().slaves());
+        if !peer
+            .namespace()
+            .is_some_and(|namespace| namespace.is_anonymous())
+        {
+            pending.extend(peer.propagation().slaves());
+        }
     }
     while let Some(slave) = pending.pop() {
         if !visited.insert(slave.mount_id().data()) {
+            continue;
+        }
+        if slave
+            .namespace()
+            .is_some_and(|namespace| namespace.is_anonymous())
+        {
             continue;
         }
         pending.extend(slave.propagation().slaves());
@@ -345,6 +356,16 @@ fn propagation_targets(source: &Arc<MountFS>) -> Vec<PropagationTarget> {
             kind: PropagationTargetKind::Slave,
         });
     }
+    // Linux's IS_MNT_NEW() includes mounts in an anonymous mount namespace:
+    // pnode.c::propagate_one() skips them until move_mount publishes the tree.
+    // Anonymous peers remain group members, but neither receive propagation
+    // nor expose their own slave lists until the tree is attached.
+    result.retain(|target| {
+        !target
+            .mount
+            .namespace()
+            .is_some_and(|namespace| namespace.is_anonymous())
+    });
     result
 }
 

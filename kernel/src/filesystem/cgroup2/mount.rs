@@ -6,9 +6,9 @@ use system_error::SystemError;
 use crate::{
     cgroup::{cgroup_root, CgroupNode},
     filesystem::vfs::{
-        FileSystem, FileSystemMakerData, FsInfo, Magic, MountableFileSystem, SuperBlock,
+        FileSystem, FileSystemMakerData, FsCreationContext, FsInfo, Magic, MountableFileSystem,
+        SuperBlock,
     },
-    process::ProcessManager,
 };
 
 use super::{inode::Cgroup2Inode, CGROUP2_BLOCK_SIZE, CGROUP2_MAX_NAMELEN};
@@ -87,9 +87,19 @@ impl FileSystem for Cgroup2Fs {
 }
 
 impl MountableFileSystem for Cgroup2Fs {
+    const SUPPORTS_FSCONFIG_LEGACY_OPTIONS: bool = true;
+
     fn make_mount_data(
         raw_data: Option<&str>,
+        source: &str,
+    ) -> Result<Option<Arc<dyn FileSystemMakerData + 'static>>, SystemError> {
+        Self::make_mount_data_in_context(raw_data, source, &FsCreationContext::current())
+    }
+
+    fn make_mount_data_in_context(
+        raw_data: Option<&str>,
         _source: &str,
+        context: &FsCreationContext,
     ) -> Result<Option<Arc<dyn FileSystemMakerData + 'static>>, SystemError> {
         let mut nsdelegate = false;
         if let Some(opts) = raw_data {
@@ -107,11 +117,7 @@ impl MountableFileSystem for Cgroup2Fs {
             }
         }
 
-        let root_cgroup = ProcessManager::current_pcb()
-            .nsproxy()
-            .cgroup_ns
-            .root_cgroup()
-            .clone();
+        let root_cgroup = context.cgroup_ns.root_cgroup().clone();
         Ok(Some(Arc::new(Cgroup2MountData {
             root_cgroup,
             nsdelegate,

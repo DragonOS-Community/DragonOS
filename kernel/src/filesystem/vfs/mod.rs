@@ -7,6 +7,7 @@ pub mod flock;
 pub mod inode_lifecycle;
 pub mod iov;
 pub mod mount;
+pub mod mount_api;
 pub mod open;
 pub mod permission;
 pub mod posix_lock;
@@ -2484,6 +2485,7 @@ bitflags! {
         const EVENTFD_MAGIC = 0x45564446; // "EVDF" in ASCII
         const INOTIFY_MAGIC = 0x494E4F54; // "INOT" in ASCII
         const PIDFD_MAGIC = 0x50494446; // "PIDF" in ASCII
+        const ANON_INODEFS_MAGIC = 0x09041934;
         // Linux UAPI: SOCKFS_MAGIC.
         const SOCKFS_MAGIC = 0x534f434b;
         const OVERLAYFS_MAGIC = 0x794c7630;
@@ -2818,6 +2820,21 @@ impl DowncastArc for dyn FileSystem {
 
 /// # 可以被挂载的文件系统应该实现的trait
 pub trait MountableFileSystem: FileSystem {
+    /// Only makers that reject unknown and malformed individual legacy
+    /// options may accept fsconfig's flag/string parameter stream.
+    const SUPPORTS_FSCONFIG_LEGACY_OPTIONS: bool = false;
+
+    /// Let a filesystem pin resources named by an fsconfig string parameter
+    /// when the parameter is supplied, not later at CREATE. The default
+    /// retains the previous state for filesystems without pathname options.
+    fn prepare_fsconfig_string(
+        _key: &str,
+        _value: &str,
+        previous: Option<&FsconfigPreparedData>,
+    ) -> Result<Option<FsconfigPreparedData>, SystemError> {
+        Ok(previous.cloned())
+    }
+
     fn make_mount_data(
         _raw_data: Option<&str>,
         _source: &str,
@@ -2839,6 +2856,25 @@ pub trait MountableFileSystem: FileSystem {
     ) -> Result<Arc<dyn FileSystem + 'static>, SystemError> {
         Self::make_fs(data)
     }
+
+    /// New mount API keeps the creator's identity and relevant namespace
+    /// references in the fs_context.  Existing mount(2) makers retain their
+    /// behavior through these default methods.
+    fn make_mount_data_in_context(
+        raw_data: Option<&str>,
+        source: &str,
+        _context: &FsCreationContext,
+    ) -> Result<Option<Arc<dyn FileSystemMakerData + 'static>>, SystemError> {
+        Self::make_mount_data(raw_data, source)
+    }
+
+    fn make_fs_in_context(
+        data: Option<&dyn FileSystemMakerData>,
+        mount_flags: MountFlags,
+        _context: &FsCreationContext,
+    ) -> Result<Arc<dyn FileSystem + 'static>, SystemError> {
+        Self::make_fs_with_flags(data, mount_flags)
+    }
 }
 
 /// # 注册一个可以被挂载文件系统
@@ -2853,18 +2889,42 @@ pub trait MountableFileSystem: FileSystem {
 macro_rules! register_mountable_fs {
     ($fs:ident, $maker_name:ident, $fs_name:literal) => {
         impl $fs {
-            fn make_fs_bridge(
+            fn prepare_fsconfig_string_bridge(
+                key: &str,
+                value: &str,
+                previous: Option<&$crate::filesystem::vfs::FsconfigPreparedData>,
+            ) -> Result<Option<$crate::filesystem::vfs::FsconfigPreparedData>, SystemError> {
+                <$fs as MountableFileSystem>::prepare_fsconfig_string(key, value, previous)
+            }
+
+            fn make_fs_legacy_bridge(
                 data: Option<&dyn FileSystemMakerData>,
                 mount_flags: $crate::filesystem::vfs::mount::MountFlags,
             ) -> Result<Arc<dyn FileSystem>, SystemError> {
                 <$fs as MountableFileSystem>::make_fs_with_flags(data, mount_flags)
             }
 
-            fn make_mount_data_bridge(
+            fn make_mount_data_legacy_bridge(
                 raw_data: Option<&str>,
                 source: &str,
             ) -> Result<Option<Arc<dyn FileSystemMakerData + 'static>>, SystemError> {
                 <$fs as MountableFileSystem>::make_mount_data(raw_data, source)
+            }
+
+            fn make_fs_bridge(
+                data: Option<&dyn FileSystemMakerData>,
+                mount_flags: $crate::filesystem::vfs::mount::MountFlags,
+                context: &$crate::filesystem::vfs::FsCreationContext,
+            ) -> Result<Arc<dyn FileSystem>, SystemError> {
+                <$fs as MountableFileSystem>::make_fs_in_context(data, mount_flags, context)
+            }
+
+            fn make_mount_data_bridge(
+                raw_data: Option<&str>,
+                source: &str,
+                context: &$crate::filesystem::vfs::FsCreationContext,
+            ) -> Result<Option<Arc<dyn FileSystemMakerData + 'static>>, SystemError> {
+                <$fs as MountableFileSystem>::make_mount_data_in_context(raw_data, source, context)
             }
         }
 
@@ -2876,13 +2936,36 @@ macro_rules! register_mountable_fs {
                     as fn(
                         Option<&dyn FileSystemMakerData>,
                         $crate::filesystem::vfs::mount::MountFlags,
+                        &$crate::filesystem::vfs::FsCreationContext,
                     ) -> Result<Arc<dyn FileSystem + 'static>, SystemError>),
                 &($fs::make_mount_data_bridge
                     as fn(
                         Option<&str>,
                         &str,
+                        &$crate::filesystem::vfs::FsCreationContext,
                     )
                         -> Result<Option<Arc<dyn FileSystemMakerData + 'static>>, SystemError>),
+                &($fs::make_fs_legacy_bridge
+                    as fn(
+                        Option<&dyn FileSystemMakerData>,
+                        $crate::filesystem::vfs::mount::MountFlags,
+                    ) -> Result<Arc<dyn FileSystem + 'static>, SystemError>),
+                &($fs::make_mount_data_legacy_bridge
+                    as fn(
+                        Option<&str>,
+                        &str,
+                    )
+                        -> Result<Option<Arc<dyn FileSystemMakerData + 'static>>, SystemError>),
+                &($fs::prepare_fsconfig_string_bridge
+                    as fn(
+                        &str,
+                        &str,
+                        Option<&$crate::filesystem::vfs::FsconfigPreparedData>,
+                    ) -> Result<
+                        Option<$crate::filesystem::vfs::FsconfigPreparedData>,
+                        SystemError,
+                    >),
+                <$fs as MountableFileSystem>::SUPPORTS_FSCONFIG_LEGACY_OPTIONS,
             );
     };
 }
@@ -2924,6 +3007,10 @@ pub struct FileSystemMaker {
     name: &'static str,
     /// 用于创建挂载数据的函数
     builder: &'static MountDataBuilder,
+    legacy_maker: &'static LegacyFSMakerFunction,
+    legacy_builder: &'static LegacyMountDataBuilder,
+    prepare_fsconfig_string: &'static FsconfigStringPreparer,
+    supports_fsconfig_legacy_options: bool,
 }
 
 impl FileSystemMaker {
@@ -2931,20 +3018,76 @@ impl FileSystemMaker {
         name: &'static str,
         maker: &'static FSMakerFunction,
         builder: &'static MountDataBuilder,
+        legacy_maker: &'static LegacyFSMakerFunction,
+        legacy_builder: &'static LegacyMountDataBuilder,
+        prepare_fsconfig_string: &'static FsconfigStringPreparer,
+        supports_fsconfig_legacy_options: bool,
     ) -> FileSystemMaker {
         FileSystemMaker {
             maker,
             name,
             builder,
+            legacy_maker,
+            legacy_builder,
+            prepare_fsconfig_string,
+            supports_fsconfig_legacy_options,
         }
+    }
+
+    pub fn supports_fsconfig_legacy_options(&self) -> bool {
+        self.supports_fsconfig_legacy_options
+    }
+
+    pub fn prepare_fsconfig_string(
+        &self,
+        key: &str,
+        value: &str,
+        previous: Option<&FsconfigPreparedData>,
+    ) -> Result<Option<FsconfigPreparedData>, SystemError> {
+        (self.prepare_fsconfig_string)(key, value, previous)
     }
 
     pub fn build(
         &self,
         data: Option<&dyn FileSystemMakerData>,
         mount_flags: MountFlags,
+        context: &FsCreationContext,
     ) -> Result<Arc<dyn FileSystem>, SystemError> {
-        (self.maker)(data, mount_flags)
+        (self.maker)(data, mount_flags, context)
+    }
+
+    fn build_legacy(
+        &self,
+        data: Option<&dyn FileSystemMakerData>,
+        mount_flags: MountFlags,
+    ) -> Result<Arc<dyn FileSystem>, SystemError> {
+        (self.legacy_maker)(data, mount_flags)
+    }
+}
+
+/// Creation identity retained by an fs-context fd. Legacy mount(2) uses its
+/// original maker path, which also works before process management is ready.
+#[derive(Clone)]
+pub struct FsCreationContext {
+    pub cred: Arc<crate::process::Cred>,
+    pub pid_ns: Arc<crate::process::namespace::pid_namespace::PidNamespace>,
+    pub net_ns: Arc<crate::process::namespace::net_namespace::NetNamespace>,
+    pub mnt_ns: Arc<crate::process::namespace::mnt::MntNamespace>,
+    pub cgroup_ns: Arc<crate::process::namespace::cgroup_namespace::CgroupNamespace>,
+    pub fsconfig_prepared: Option<FsconfigPreparedData>,
+}
+
+impl FsCreationContext {
+    pub fn current() -> Self {
+        let pcb = ProcessManager::current_pcb();
+        Self {
+            cred: pcb.cred(),
+            pid_ns: pcb.active_pid_ns(),
+            net_ns: ProcessManager::current_netns(),
+            mnt_ns: ProcessManager::current_mntns(),
+            cgroup_ns: pcb.nsproxy().cgroup_ns.clone(),
+            fsconfig_prepared: None,
+        }
     }
 }
 
@@ -2952,11 +3095,30 @@ pub trait FileSystemMakerData: Send + Sync {
     fn as_any(&self) -> &dyn Any;
 }
 
+/// Filesystem-owned, immutable state prepared at fsconfig parameter time.
+pub type FsconfigPreparedData = Arc<dyn Any + Send + Sync>;
+pub type FsconfigStringPreparer = fn(
+    key: &str,
+    value: &str,
+    previous: Option<&FsconfigPreparedData>,
+) -> Result<Option<FsconfigPreparedData>, SystemError>;
+
 pub type FSMakerFunction = fn(
     data: Option<&dyn FileSystemMakerData>,
     mount_flags: MountFlags,
+    context: &FsCreationContext,
 ) -> Result<Arc<dyn FileSystem>, SystemError>;
 pub type MountDataBuilder =
+    fn(
+        raw_data: Option<&str>,
+        source: &str,
+        context: &FsCreationContext,
+    ) -> Result<Option<Arc<dyn FileSystemMakerData + 'static>>, SystemError>;
+pub type LegacyFSMakerFunction = fn(
+    data: Option<&dyn FileSystemMakerData>,
+    mount_flags: MountFlags,
+) -> Result<Arc<dyn FileSystem>, SystemError>;
+pub type LegacyMountDataBuilder =
     fn(
         raw_data: Option<&str>,
         source: &str,
@@ -2991,17 +3153,41 @@ pub fn produce_fs(
     source: &str,
     mount_flags: MountFlags,
 ) -> Result<Arc<dyn FileSystem>, SystemError> {
+    match filesystem_maker(filesystem) {
+        Some(maker) => {
+            let mount_data = (maker.legacy_builder)(data, source)?;
+            let mount_data_ref = mount_data.as_ref().map(|arc| arc.as_ref());
+            maker.build_legacy(mount_data_ref, mount_flags)
+        }
+        None => {
+            log::error!("mismatch filesystem type : {}", filesystem);
+            Err(SystemError::ENODEV)
+        }
+    }
+}
+
+pub fn filesystem_maker(filesystem: &str) -> Option<&'static FileSystemMaker> {
     let canonical_filesystem = if filesystem.starts_with("fuse.") {
         "fuse"
     } else {
         filesystem
     };
 
-    match FSMAKER.iter().find(|&m| m.name == canonical_filesystem) {
+    FSMAKER.iter().find(|m| m.name == canonical_filesystem)
+}
+
+pub fn produce_fs_in_context(
+    filesystem: &str,
+    data: Option<&str>,
+    source: &str,
+    mount_flags: MountFlags,
+    context: &FsCreationContext,
+) -> Result<Arc<dyn FileSystem>, SystemError> {
+    match filesystem_maker(filesystem) {
         Some(maker) => {
-            let mount_data = (maker.builder)(data, source)?;
+            let mount_data = (maker.builder)(data, source, context)?;
             let mount_data_ref = mount_data.as_ref().map(|arc| arc.as_ref());
-            maker.build(mount_data_ref, mount_flags)
+            maker.build(mount_data_ref, mount_flags, context)
         }
         None => {
             log::error!("mismatch filesystem type : {}", filesystem);

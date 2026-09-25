@@ -643,7 +643,7 @@ fn do_bind_mount(
             return Err(SystemError::EINVAL);
         }
         if !flags.contains(MountFlags::REC)
-            && has_locked_children_in_view_locked(&source_mfs, &source_mount_inode)?
+            && MountFS::has_locked_children_in_view_locked(&source_mfs, &source_mount_inode)?
         {
             return Err(SystemError::EINVAL);
         }
@@ -666,8 +666,8 @@ fn do_bind_mount(
         // The root edge is the publication point, so lookup never observes a
         // half-copied recursive bind tree.
         if flags.contains(MountFlags::REC) {
-            if let Err(error) = do_recursive_bind_mount_locked(&source_mfs, &target_mfs) {
-                MountFS::deactivate_disconnected_subtree(&target_mfs);
+            if let Err(error) = MountFS::copy_visible_submounts_locked(&source_mfs, &target_mfs) {
+                MountFS::abandon_unpublished_tree(&target_mfs);
                 return Err(error);
             }
         }
@@ -680,29 +680,6 @@ fn do_bind_mount(
     }
 
     Ok(())
-}
-
-/// Linux rejects a non-recursive bind when it would uncover locked child
-/// mounts below the selected source dentry (has_locked_children()).
-/// Caller holds the mount+dentry topology snapshot.
-fn has_locked_children_in_view_locked(
-    source_mount: &Arc<MountFS>,
-    source_root: &Arc<MountFSInode>,
-) -> Result<bool, SystemError> {
-    let mut pending = source_mount.mount_children();
-    while let Some(child) = pending.pop() {
-        let mountpoint = child.self_mountpoint().ok_or(SystemError::EINVAL)?;
-        if mountpoint
-            .relative_path_from_snapshot(source_root)?
-            .is_none()
-        {
-            continue;
-        }
-        if child.is_locked() {
-            return Ok(true);
-        }
-    }
-    Ok(false)
 }
 
 /// Change the propagation type of a mount point.
@@ -806,57 +783,6 @@ fn do_move_mount(
         .downcast_arc::<MountFSInode>()
         .ok_or(SystemError::EINVAL)?;
     current_mntns.move_mount(&source_mfs, &target_mountpoint)?;
-
-    Ok(())
-}
-
-/// Recursively bind mount all submounts from source to target.
-///
-/// This function traverses the source mount tree and creates corresponding
-/// bind mounts at the target location for all submounts.
-///
-/// # Arguments
-/// * `source_mfs` - The source MountFS to copy submounts from
-/// * `target_mfs` - The target bind clone corresponding to `source_mfs`.
-///
-/// # Returns
-/// * `Ok(())` on success
-/// * `Err(SystemError)` on failure
-///
-/// Caller holds the mount+dentry topology snapshot for the complete detached copy.
-fn do_recursive_bind_mount_locked(
-    source_mfs: &Arc<MountFS>,
-    target_mfs: &Arc<MountFS>,
-) -> Result<(), SystemError> {
-    let mut pending = vec![(source_mfs.clone(), target_mfs.clone())];
-    while let Some((source_parent, target_parent)) = pending.pop() {
-        for source_child in source_parent.mount_children() {
-            let source_mountpoint = source_child.self_mountpoint().ok_or(SystemError::EINVAL)?;
-            let target_mountpoint =
-                match target_parent.wrapper_for_dentry(source_mountpoint.shared_dentry()) {
-                    Ok(mountpoint) => mountpoint,
-                    Err(SystemError::EXDEV) => continue,
-                    Err(error) => return Err(error),
-                };
-
-            // Match Linux copy_tree(): first discard mounts outside the
-            // selected source view, then apply unbindable/locked semantics.
-            // The recursive-bind root was rejected by do_bind_mount above.
-            if source_child.propagation().is_unbindable() {
-                if source_child.is_locked() {
-                    return Err(SystemError::EPERM);
-                }
-                continue;
-            }
-
-            let target_child = source_child.deepcopy(Some(target_mountpoint.clone()))?;
-            if let Err(error) = target_parent.attach_top(&target_mountpoint, target_child.clone()) {
-                MountFS::deactivate_disconnected_subtree(&target_child);
-                return Err(error);
-            }
-            pending.push((source_child, target_child));
-        }
-    }
 
     Ok(())
 }

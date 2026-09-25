@@ -43,7 +43,7 @@ impl OverlayMountData {
         })
     }
 
-    fn parse_lower_dirs(raw: &str) -> Result<Vec<String>, SystemError> {
+    pub(super) fn parse_lower_dirs(raw: &str) -> Result<Vec<String>, SystemError> {
         let mut lower_dirs = Vec::new();
         for dir in raw.split(':') {
             if dir.is_empty() {

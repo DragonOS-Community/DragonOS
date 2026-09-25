@@ -10,11 +10,33 @@
 
 #include <array>
 #include <cerrno>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <string>
 
 namespace {
+
+// Linux v6.6 include/uapi/linux/bpf.h: keep the extended query test
+// independent of the build host's (possibly older) UAPI headers.
+struct BpfQueryAttr66 {
+  uint32_t target_fd;
+  uint32_t attach_type;
+  uint32_t query_flags;
+  uint32_t attach_flags;
+  alignas(8) uint64_t prog_ids;
+  uint32_t prog_cnt;
+  uint32_t reserved;
+  alignas(8) uint64_t prog_attach_flags;
+  alignas(8) uint64_t link_ids;
+  alignas(8) uint64_t link_attach_flags;
+  uint64_t revision;
+};
+static_assert(sizeof(BpfQueryAttr66) == 64);
+static_assert(offsetof(BpfQueryAttr66, prog_attach_flags) == 32);
+static_assert(offsetof(BpfQueryAttr66, link_ids) == 40);
+static_assert(offsetof(BpfQueryAttr66, revision) == 56);
+constexpr uint32_t kBpfLsmCgroup = 43;
 
 bool HasNetAdmin() {
   __user_cap_header_struct header{};
@@ -102,7 +124,10 @@ TEST(BpfSyscallAbi, EmptyCgroupQueryAndFlagsValidation) {
   if (!HasNetAdmin()) GTEST_SKIP() << "CAP_NET_ADMIN required by Linux";
   const int fd = open("/sys/fs/cgroup", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
   if (fd < 0) GTEST_SKIP() << "cgroup2 mount unavailable";
-  auto attr = InvalidDeviceQuery();
+  struct {
+    BpfQueryAttr66 query;
+  } attr{};
+  attr.query.attach_type = BPF_CGROUP_DEVICE;
   attr.query.target_fd = fd;
   attr.query.query_flags = BPF_F_QUERY_EFFECTIVE;
   attr.query.attach_flags = 123;
@@ -123,7 +148,7 @@ TEST(BpfSyscallAbi, EmptyCgroupQueryAndFlagsValidation) {
   EXPECT_EQ(errno, EINVAL);
 
   attr.query.prog_attach_flags = 0;
-  attr.query.attach_type = BPF_LSM_CGROUP;
+  attr.query.attach_type = kBpfLsmCgroup;
   attr.query.query_flags = 0;
   uint32_t prog_id = 0;
   attr.query.prog_cnt = 1;

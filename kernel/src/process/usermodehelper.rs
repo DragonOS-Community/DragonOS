@@ -6,6 +6,7 @@
 //! existing wait/reap path merely by dropping the KTHREAD flag.
 
 use alloc::{boxed::Box, ffi::CString, string::String, sync::Arc, vec::Vec};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use system_error::SystemError;
 
@@ -18,6 +19,7 @@ use crate::{
     ipc::signal_types::Sigaction,
     libs::spinlock::SpinLock,
     process::{
+        cred::Cred,
         execve::do_execve,
         fork::CloneFlags,
         kthread::{KernelThreadClosure, KernelThreadCreateInfo, KernelThreadMechanism},
@@ -52,11 +54,27 @@ pub struct UserModeHelper {
     result: Arc<HelperResult>,
 }
 
+type HelperExit = Box<dyn FnOnce(&Result<i32, SystemError>) + Send>;
+
 impl UserModeHelper {
     pub fn start(
         path: String,
         argv: Vec<CString>,
         envp: Vec<CString>,
+    ) -> Result<Self, SystemError> {
+        Self::start_with_context(path, argv, envp, None, None)
+    }
+
+    /// Start a helper with credentials prepared by a trusted kernel caller.
+    /// The optional completion runs in the supervisor after the child has
+    /// been reaped, even if its exec fails.  The requester need not wait for
+    /// that point to learn that a request-key construction was instantiated.
+    pub(crate) fn start_with_context(
+        path: String,
+        argv: Vec<CString>,
+        envp: Vec<CString>,
+        cred: Option<Arc<Cred>>,
+        on_exit: Option<HelperExit>,
     ) -> Result<Self, SystemError> {
         // This architecture still has no kthread bootstrap or user switch.
         // Refuse the request instead of reaching either platform todo!().
@@ -69,11 +87,16 @@ impl UserModeHelper {
 
         let result = Arc::try_new(HelperResult::new()).map_err(|_| SystemError::ENOMEM)?;
         let worker_result = result.clone();
-        let args = SpinLock::new(Some((path, argv, envp)));
+        let args = SpinLock::new(Some((path, argv, envp, cred, on_exit)));
         let closure = KernelThreadClosure::EmptyClosure((
             Box::new(move || {
-                let (path, argv, envp) = args.lock().take().expect("helper closure ran twice");
-                worker_result.complete(run_supervisor(path, argv, envp));
+                let (path, argv, envp, cred, on_exit) =
+                    args.lock().take().expect("helper closure ran twice");
+                let status = run_supervisor(path, argv, envp, cred);
+                if let Some(callback) = on_exit {
+                    callback(&status);
+                }
+                worker_result.complete(status);
                 0
             }),
             (),
@@ -102,6 +125,7 @@ fn run_supervisor(
     path: String,
     argv: Vec<CString>,
     envp: Vec<CString>,
+    cred: Option<Arc<Cred>>,
 ) -> Result<i32, SystemError> {
     let parent = ProcessManager::current_pcb();
     // A real SIGCHLD disposition (without SA_NOCLDWAIT) is required for
@@ -113,7 +137,7 @@ fn run_supervisor(
     let exec_error = Arc::try_new(SpinLock::new(None)).map_err(|_| SystemError::ENOMEM)?;
     let child_error = exec_error.clone();
     let closure = KernelThreadClosure::UserMode(Box::new(move || {
-        run_child_prepare(path, argv, envp, child_error)
+        run_child_prepare(path, argv, envp, cred, child_error)
     }));
     let info = KernelThreadCreateInfo::new(closure, "usermode-helper-exec".into());
     // Calling create() here would reparent the child to kthreadd. The direct
@@ -139,9 +163,13 @@ fn run_child_prepare(
     path: String,
     argv: Vec<CString>,
     envp: Vec<CString>,
+    cred: Option<Arc<Cred>>,
     exec_error: Arc<SpinLock<Option<SystemError>>>,
 ) -> Result<TrapFrame, SystemError> {
     let child = ProcessManager::current_pcb();
+    if let Some(cred) = cred {
+        child.install_cred(cred);
+    }
     let fd_table = match Arc::try_new(FileDescriptorTable::new(FdTableState::new())) {
         Ok(table) => table,
         Err(_) => {
@@ -179,16 +207,24 @@ fn run_child_prepare(
 /// A bounded in-guest check of the real exec, error, and wait/reap paths.
 /// Invoked only by the root-readable debugfs selftest file.
 pub(crate) fn run_debug_selftest() -> Result<String, SystemError> {
-    let ok = UserModeHelper::start(
+    let callback_seen = Arc::new(AtomicBool::new(false));
+    let callback_flag = callback_seen.clone();
+    let ok = UserModeHelper::start_with_context(
         "/bin/busybox".into(),
         vec![
             CString::new("busybox").unwrap(),
             CString::new("true").unwrap(),
         ],
         Vec::new(),
+        None,
+        Some(Box::new(move |result| {
+            if matches!(result, Ok(0)) {
+                callback_flag.store(true, Ordering::Release);
+            }
+        })),
     )?
     .wait()?;
-    if ok != 0 {
+    if ok != 0 || !callback_seen.load(Ordering::Acquire) {
         return Err(SystemError::EIO);
     }
 

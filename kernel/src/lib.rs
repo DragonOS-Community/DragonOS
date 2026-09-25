@@ -78,6 +78,7 @@ mod perf;
 mod process;
 mod rcu;
 mod sched;
+mod security;
 mod smp;
 mod syscall;
 mod text_patch;

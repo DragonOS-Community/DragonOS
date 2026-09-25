@@ -806,6 +806,16 @@ impl ProcessManager {
         };
         let clone_into_cgroup_target = Self::resolve_clone_into_cgroup_target(&clone_args)?;
 
+        // Linux copy_creds(): construct any child-only keyring while the PCB
+        // is still unpublished.  A failed allocation returns from clone
+        // without making a child visible or retaining partial keyring state.
+        if let Some(child_cred) = pcb
+            .cred()
+            .prepare_fork_keyrings(clone_flags.contains(CloneFlags::CLONE_THREAD))?
+        {
+            pcb.set_cred(child_cred)?;
+        }
+
         // The default CPU is selected by wake_up_new_task(). Preserve only an
         // explicit hint here, outside the fs publication barrier.
         pcb.sched_info().mark_new_task(clone_args.target_cpu);

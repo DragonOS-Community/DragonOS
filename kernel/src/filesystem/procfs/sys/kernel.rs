@@ -23,6 +23,7 @@ use alloc::{
 use core::sync::atomic::Ordering;
 use system_error::SystemError;
 
+use super::keys::KeysDirOps;
 use super::numeric::parse_numeric_sysctl;
 
 use crate::process::namespace::user_namespace::{OVERFLOW_GID, OVERFLOW_UID};
@@ -49,6 +50,15 @@ impl DirOps for KernelDirOps {
         name: &str,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         match name {
+            "keys" => {
+                let mut cached_children = dir.cached_children().write();
+                if let Some(child) = cached_children.get(name) {
+                    return Ok(child.clone());
+                }
+                let inode = KeysDirOps::new_inode(dir.self_ref_weak().clone());
+                cached_children.insert(name.to_string(), inode.clone());
+                return Ok(inode);
+            }
             "cap_last_cap" => {
                 let mut cached_children = dir.cached_children().write();
                 if let Some(child) = cached_children.get(name) {
@@ -114,6 +124,9 @@ impl DirOps for KernelDirOps {
 
     fn populate_children(&self, dir: &ProcDir<Self>) {
         let mut cached_children = dir.cached_children().write();
+        cached_children
+            .entry("keys".to_string())
+            .or_insert_with(|| KeysDirOps::new_inode(dir.self_ref_weak().clone()));
         cached_children
             .entry("cap_last_cap".to_string())
             .or_insert_with(|| CapLastCapFileOps::new_inode(dir.self_ref_weak().clone()));

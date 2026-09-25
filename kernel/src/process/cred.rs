@@ -1,10 +1,12 @@
-use alloc::sync::{Arc, Weak};
+use alloc::sync::Arc;
 use core::sync::atomic::{AtomicI32, AtomicUsize};
 
 use alloc::vec::Vec;
 
 use super::namespace::user_namespace::{UserNamespace, INIT_USER_NAMESPACE};
 use crate::process::ProcessManager;
+use crate::security::keys::{KeyRef, SpecialKeyringKind};
+use system_error::SystemError;
 
 const GLOBAL_ROOT_UID: Kuid = Kuid(0);
 const GLOBAL_ROOT_GID: Kgid = Kgid(0);
@@ -28,6 +30,9 @@ pub static SUID_DUMPABLE: AtomicI32 = AtomicI32::new(SUID_DUMP_DISABLE);
 
 /// Highest capability number recognized by this kernel (Linux 6.6: CAP_CHECKPOINT_RESTORE).
 pub const CAP_LAST_CAP: usize = 40;
+
+/// Linux's initial destination for request_key() results.
+pub const KEY_REQKEY_DEFL_THREAD_KEYRING: i32 = 1;
 
 bitflags! {
     pub struct CAPFlags:u64{
@@ -88,7 +93,6 @@ pub enum CredFsCmp {
 /// 凭证集
 #[derive(Debug, Clone)]
 pub struct Cred {
-    pub self_ref: Weak<Cred>,
     /// 进程实际uid
     pub uid: Kuid,
     /// 进程实际gid
@@ -120,6 +124,13 @@ pub struct Cred {
     /// Linux SECURE_KEEP_CAPS (a credential property, cleared by userns and exec).
     pub keepcaps: bool,
     pub user_ns: Arc<UserNamespace>,
+    /// Credentials own the task's keyring references.  Links in a keyring
+    /// remain shared across credential copies, as in Linux.
+    pub thread_keyring: Option<KeyRef>,
+    pub process_keyring: Option<KeyRef>,
+    pub session_keyring: Option<KeyRef>,
+    pub request_key_auth: Option<KeyRef>,
+    pub jit_keyring: i32,
 }
 
 impl Cred {
@@ -127,8 +138,7 @@ impl Cred {
         // 默认 init 进程能力集对齐 Linux init_cred：
         // permitted/effective/bset 为 full set，ambient 为空。
         let init_caps = CAPFlags::CAP_FULL_SET;
-        Arc::new_cyclic(|weak_self| Self {
-            self_ref: weak_self.clone(),
+        Arc::new(Self {
             uid: GLOBAL_ROOT_UID,
             gid: GLOBAL_ROOT_GID,
             suid: GLOBAL_ROOT_UID,
@@ -145,21 +155,86 @@ impl Cred {
             cap_ambient: CAPFlags::CAP_EMPTY_SET,
             keepcaps: false,
             user_ns: INIT_USER_NAMESPACE.clone(),
+            thread_keyring: None,
+            process_keyring: None,
+            session_keyring: None,
+            request_key_auth: None,
+            jit_keyring: KEY_REQKEY_DEFL_THREAD_KEYRING,
         })
     }
 
     pub fn new_arc(cred: Cred) -> Arc<Self> {
-        Arc::new_cyclic(|weak_self| {
-            let mut new_cred = cred;
-            new_cred.self_ref = weak_self.clone();
-            new_cred
-        })
+        Arc::new(cred)
+    }
+
+    /// Use when preparing a credential in a fallible fork or exec phase.
+    pub fn try_new_arc(cred: Cred) -> Result<Arc<Self>, SystemError> {
+        Arc::try_new(cred).map_err(|_| SystemError::ENOMEM)
+    }
+
+    /// Linux copy_creds(): a new thread receives a fresh thread keyring if
+    /// the creator had one; a new process never inherits the process keyring.
+    /// A session keyring and request-key context are copied by reference.
+    pub fn prepare_fork_keyrings(
+        &self,
+        clone_thread: bool,
+    ) -> Result<Option<Arc<Self>>, SystemError> {
+        let needs_copy =
+            self.thread_keyring.is_some() || (!clone_thread && self.process_keyring.is_some());
+        if !needs_copy {
+            return Ok(None);
+        }
+
+        let mut next = self.clone();
+        if self.thread_keyring.is_some() {
+            next.thread_keyring = if clone_thread {
+                Some(crate::security::keys::create_special_keyring(
+                    &next,
+                    SpecialKeyringKind::Thread,
+                )?)
+            } else {
+                None
+            };
+        }
+        if !clone_thread {
+            next.process_keyring = None;
+        }
+        Ok(Some(Self::try_new_arc(next)?))
+    }
+
+    /// Prepare before exec's last fallible operation.  The successful commit
+    /// then only publishes an already allocated credential.
+    pub fn prepare_exec_keyrings(&self) -> Result<Option<Arc<Self>>, SystemError> {
+        if !self.keepcaps && self.thread_keyring.is_none() && self.process_keyring.is_none() {
+            return Ok(None);
+        }
+        let mut next = self.clone();
+        next.keepcaps = false;
+        next.thread_keyring = None;
+        next.process_keyring = None;
+        Ok(Some(Self::try_new_arc(next)?))
+    }
+
+    /// Linux commit_creds() updates the permission owner of an existing
+    /// thread ring when fsuid/fsgid changes, without moving its quota charge.
+    /// Call before acquiring the task publication lock: the key state mutex
+    /// may sleep and must never nest below task_lock.
+    pub(crate) fn sync_thread_keyring_owner(&self, old: &Cred) {
+        if self.fsuid != old.fsuid || self.fsgid != old.fsgid {
+            if let Some(thread_keyring) = self.thread_keyring.as_ref() {
+                crate::security::keys::set_key_owner_uid_gid(
+                    thread_keyring,
+                    self.fsuid,
+                    self.fsgid,
+                );
+            }
+        }
     }
 
     #[allow(dead_code)]
     /// Compare two credentials with respect to filesystem access.
     pub fn fscmp(&self, other: Arc<Cred>) -> CredFsCmp {
-        if Arc::ptr_eq(&self.self_ref.upgrade().unwrap(), &other) {
+        if core::ptr::eq(self, other.as_ref()) {
             return CredFsCmp::Equal;
         }
 

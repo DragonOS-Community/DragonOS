@@ -828,6 +828,11 @@ fi
 # ps: 下面这条使用tap的方式，无法dhcp获取到ip，暂时不知道为什么
 # QEMU_DEVICES="-device ahci,id=ahci -device ide-hd,drive=disk,bus=ahci.0 -net nic,netdev=nic0 -netdev tap,id=nic0,model=virtio-net-pci,script=qemu/ifup-nat,downscript=qemu/ifdown-nat -usb -device qemu-xhci,id=xhci,p2=8,p3=4 "
 QEMU_DEVICE_ARGS+=("${QEMU_DEVICE_DISK_ARGS[@]}")
+if [ "${ARCH}" = "riscv64" ]; then
+  QEMU_DEVICE_ARGS+=(-device virtio-rng-device)
+else
+  QEMU_DEVICE_ARGS+=(-device virtio-rng-pci)
+fi
 QEMU_DEVICE_ARGS+=(
   -netdev "user,id=hostnet0,hostfwd=tcp::${HOST_PORT}-:12580"
   -device "virtio-net-pci,vectors=5,netdev=hostnet0,id=net0"

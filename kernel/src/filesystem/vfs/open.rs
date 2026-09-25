@@ -13,7 +13,7 @@ use super::{
         OwnedLookupOutcome, ResolvedPath,
     },
     vcore::{check_parent_dir_permission_inode, prepare_open_truncate, vfs_open_truncate},
-    FileType, FsPermissionPolicy, IndexNode, InodeMode, SetMetadataMask, MAX_PATHLEN,
+    FileType, FsPermissionPolicy, IndexNode, InodeFlags, InodeMode, SetMetadataMask, MAX_PATHLEN,
     VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
 use crate::libs::casting::DowncastArc;
@@ -109,29 +109,69 @@ pub(super) fn do_faccessat(
     return Ok(0);
 }
 
-pub fn do_fchmodat(dirfd: i32, path: *const u8, mode: InodeMode) -> Result<usize, SystemError> {
+/// The syscall ABI passes `umode_t` (16 bits), even though the register is wider.
+pub fn chmod_mode_from_user(mode: u32) -> InodeMode {
+    InodeMode::from_bits_truncate(mode as u16 as u32)
+}
+
+pub fn do_fchmodat(
+    dirfd: i32,
+    path: *const u8,
+    mode: u32,
+    flags: u32,
+) -> Result<usize, SystemError> {
+    let allowed = (AtFlags::AT_SYMLINK_NOFOLLOW | AtFlags::AT_EMPTY_PATH).bits() as u32;
+    if flags & !allowed != 0 {
+        return Err(SystemError::EINVAL);
+    }
     let path = vfs_check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
     let path = path.to_str().map_err(|_| SystemError::EINVAL)?;
 
-    if path.is_empty() {
-        return Err(SystemError::ENOENT);
-    }
+    let current = ProcessManager::current_pcb();
+    let resolved = if path.is_empty() {
+        if flags & AtFlags::AT_EMPTY_PATH.bits() as u32 == 0 {
+            return Err(SystemError::ENOENT);
+        }
+        if dirfd == AtFlags::AT_FDCWD.bits() {
+            current.fs_struct().pwd_resolved()?
+        } else {
+            current
+                .fd_table()
+                .get_file_by_fd(dirfd)
+                .ok_or(SystemError::EBADF)?
+                .resolved_path()?
+        }
+    } else {
+        let (start, rest) = user_resolved_path_at(&current, dirfd, path)?;
+        start.inode().lookup_follow_symlink_owned(
+            &start,
+            &rest,
+            VFS_MAX_FOLLOW_SYMLINK_TIMES,
+            flags & AtFlags::AT_SYMLINK_NOFOLLOW.bits() as u32 == 0,
+        )?
+    };
 
-    let (inode, path) = user_path_at(&ProcessManager::current_pcb(), dirfd, path)?;
-
-    let target_inode = inode.lookup_follow_symlink(path.as_str(), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
-
-    do_fchmod(target_inode, mode)
+    do_fchmod(resolved.inode(), chmod_mode_from_user(mode))
 }
 
 /// fchmod：对已解析的 inode 进行 chmod（供 `sys_fchmod` 复用）。
 pub fn do_fchmod(inode: Arc<dyn IndexNode>, mode: InodeMode) -> Result<usize, SystemError> {
     let cred = ProcessManager::current_pcb().cred();
     inode.update_metadata_masked(&mut |current| {
+        if current
+            .flags
+            .intersects(InodeFlags::S_IMMUTABLE | InodeFlags::S_APPEND)
+        {
+            return Err(SystemError::EPERM);
+        }
         // A pipe may change owners concurrently; evaluate permission from the
         // same metadata snapshot that its inode commits under the inner lock.
         if !cred.is_owner_or_capable(current) {
             return Err(SystemError::EPERM);
+        }
+        // Linux 6.6 notify_change(ATTR_MODE) rejects chmod on a symlink.
+        if current.file_type == FileType::SymLink {
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
         }
         let mut metadata = current.clone();
         metadata.mode = chmod_preserve_type(current.mode, mode);

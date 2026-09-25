@@ -261,7 +261,9 @@ pub(crate) struct UserNamespaceKeyrings {
     /// Internal `.user_reg` ring, created once and retained by the namespace.
     pub register: Option<KeyRef>,
     /// Ordinary named session rings do not gain an extra lifetime owner here.
-    pub named: BTreeMap<Vec<u8>, WeakKeyRef>,
+    /// Multiple rings may share a name when their owners/permissions differ.
+    /// Weak entries never extend a ring's lifetime.
+    pub named: BTreeMap<Vec<u8>, Vec<WeakKeyRef>>,
 }
 
 pub struct InnerUserNamespace {

@@ -289,6 +289,77 @@ TEST_F(KeysCoreTest, RejoinedNamedSessionRetainsPossessorRights) {
     EXPECT_EQ(0, WaitForChild(child));
 }
 
+TEST_F(KeysCoreTest, NamedSessionLookupKeepsDistinctLiveCandidates) {
+    constexpr char name[] = "dunitest-named-session-collision";
+    constexpr unsigned long owner_setattr = 0x00200000UL;
+    constexpr unsigned long owner_search = 0x00080000UL;
+    constexpr unsigned long possessor_all = 0x3f000000UL;
+    const long first = Keyctl(KEYCTL_JOIN_SESSION_KEYRING, Ptr(name));
+    ASSERT_GT(first, 0) << strerror(errno);
+    ASSERT_EQ(0, Keyctl(KEYCTL_SETPERM, Arg(first),
+                        possessor_all | owner_setattr));
+
+    // Keep the first ring alive after leaving it, but do not make it
+    // searchable by a non-possessing process yet.
+    const long user = Keyctl(KEYCTL_GET_KEYRING_ID,
+                             Arg(KEY_SPEC_USER_KEYRING), 1);
+    ASSERT_GT(user, 0) << strerror(errno);
+    ASSERT_EQ(0, Keyctl(KEYCTL_LINK, Arg(first), Arg(user)));
+    ASSERT_GT(Keyctl(KEYCTL_JOIN_SESSION_KEYRING), 0);
+
+    int ready[2] = {-1, -1};
+    int release[2] = {-1, -1};
+    ASSERT_EQ(0, pipe(ready));
+    ASSERT_EQ(0, pipe(release));
+    const pid_t child = fork();
+    ASSERT_GE(child, 0) << strerror(errno);
+    if (child == 0) {
+        close(ready[0]);
+        close(release[1]);
+        const long second = Keyctl(KEYCTL_JOIN_SESSION_KEYRING, Ptr(name));
+        if (second <= 0 || second == first) _exit(10);
+        const int serial = static_cast<int>(second);
+        if (write(ready[1], &serial, sizeof(serial)) != sizeof(serial)) _exit(11);
+        char done;
+        if (read(release[0], &done, 1) != 1) _exit(12);
+        _exit(0);
+    }
+    close(ready[1]);
+    close(release[0]);
+    int second = -1;
+    const ssize_t got = read(ready[0], &second, sizeof(second));
+    close(ready[0]);
+    EXPECT_EQ(static_cast<ssize_t>(sizeof(second)), got);
+    EXPECT_NE(first, second);
+
+    // The owner may now search the first candidate.  The second candidate
+    // remains alive and cannot replace the first entry in the name index.
+    EXPECT_EQ(0, Keyctl(KEYCTL_SETPERM, Arg(first),
+                        possessor_all | owner_setattr | owner_search));
+    EXPECT_EQ(first, Keyctl(KEYCTL_JOIN_SESSION_KEYRING, Ptr(name)));
+    const char done = 'x';
+    EXPECT_EQ(1, write(release[1], &done, 1));
+    close(release[1]);
+    EXPECT_EQ(0, WaitForChild(child));
+}
+
+TEST_F(KeysCoreTest, AddKeyKeyringIsPublishedForNamedSessionLookup) {
+    constexpr char name[] = "dunitest-add-keyring-name";
+    const long created = AddKey("keyring", name, nullptr, 0, session_);
+    ASSERT_GT(created, 0) << strerror(errno);
+    ASSERT_EQ(0, Keyctl(KEYCTL_SETPERM, Arg(created),
+                        0x3f280000UL));  // Possessor all, owner SEARCH/SETATTR.
+    EXPECT_EQ(created, Keyctl(KEYCTL_JOIN_SESSION_KEYRING, Ptr(name)));
+}
+
+TEST_F(KeysCoreTest, UserKeyringIsPublishedForNamedSessionLookup) {
+    const long user = Keyctl(KEYCTL_GET_KEYRING_ID,
+                             Arg(KEY_SPEC_USER_KEYRING), 1);
+    ASSERT_GT(user, 0) << strerror(errno);
+    const std::string name = "_uid." + std::to_string(getuid());
+    EXPECT_EQ(user, Keyctl(KEYCTL_JOIN_SESSION_KEYRING, Ptr(name.c_str())));
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {

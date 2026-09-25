@@ -79,14 +79,16 @@ pub fn create_special_keyring(
             },
         ),
     };
-    allocate_keyring(
+    let ring = allocate_keyring(
         Vec::from(description),
         cred.uid,
         cred.gid,
         permissions,
         quota_mode,
         KeyFlags::empty(),
-    )
+    )?;
+    KeyStore::publish_named_keyring(&ring, &cred.user_ns);
+    Ok(ring)
 }
 
 /// The requestor ring is private to one construction and its name includes
@@ -95,14 +97,16 @@ pub(crate) fn create_requestor_keyring(
     cred: &Cred,
     target_serial: i32,
 ) -> Result<KeyRef, SystemError> {
-    allocate_keyring(
+    let ring = allocate_keyring(
         format!("_req.{target_serial}").into_bytes(),
         cred.uid,
         cred.gid,
         KEY_POS_ALL | KEY_USR_VIEW | KEY_USR_READ,
         QuotaMode::Overrun,
         KeyFlags::empty(),
-    )
+    )?;
+    KeyStore::publish_named_keyring(&ring, &cred.user_ns);
+    Ok(ring)
 }
 
 /// Linux `key_fsuid_changed`/`key_fsgid_changed` change permission ownership
@@ -134,8 +138,12 @@ pub fn user_keyrings(cred: &Cred) -> Result<(KeyRef, KeyRef), SystemError> {
         )?;
         registry.register = Some(register);
     }
-    let register = registry.register.as_ref().expect("register initialized");
-    let user = match ring::search(register, KeyType::Keyring, &user_name, cred, false) {
+    let register = registry
+        .register
+        .as_ref()
+        .expect("register initialized")
+        .clone();
+    let user = match ring::search(&register, KeyType::Keyring, &user_name, cred, false) {
         Ok(found) => found,
         Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
             let created = allocate_keyring(
@@ -146,12 +154,13 @@ pub fn user_keyrings(cred: &Cred) -> Result<(KeyRef, KeyRef), SystemError> {
                 QuotaMode::Limited,
                 KeyFlags::UID_KEYRING,
             )?;
-            ring::link(register, &created)?;
+            ring::link(&register, &created)?;
+            KeyStore::publish_named_keyring_locked(&created, &cred.user_ns, &mut registry);
             created
         }
         Err(error) => return Err(error),
     };
-    let session = match ring::search(register, KeyType::Keyring, &session_name, cred, false) {
+    let session = match ring::search(&register, KeyType::Keyring, &session_name, cred, false) {
         Ok(found) => found,
         Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
             let created = allocate_keyring(
@@ -163,7 +172,8 @@ pub fn user_keyrings(cred: &Cred) -> Result<(KeyRef, KeyRef), SystemError> {
                 KeyFlags::UID_KEYRING,
             )?;
             ring::link(&created, &user)?;
-            ring::link(register, &created)?;
+            ring::link(&register, &created)?;
+            KeyStore::publish_named_keyring_locked(&created, &cred.user_ns, &mut registry);
             created
         }
         Err(error) => return Err(error),
@@ -334,19 +344,29 @@ pub fn join_session_keyring(name: Option<Vec<u8>>) -> Result<i32, SystemError> {
             return Err(SystemError::EINVAL);
         }
         let mut named = old.user_ns.keyrings.lock();
-        let existing = named.named.get(&name).and_then(KeyStore::lookup_weak);
-        let existing = existing.filter(|key| {
-            let visible = {
-                let state = key.state.lock();
-                !state.invalidated
-                    && state.revoked_at.is_none()
-                    && u32::try_from(state.quota.account().uid().data())
-                        .ok()
-                        .and_then(|uid| map_id_up(&old.user_ns.inner.lock().uid_map, uid))
-                        .is_some()
-            };
-            visible && permission::check_permission(key, &old, KeyPermission::Search).is_ok()
-        });
+        let mut existing = None;
+        if let Some(candidates) = named.named.get(&name) {
+            for weak in candidates {
+                let Some(key) = KeyStore::lookup_weak(weak) else {
+                    continue;
+                };
+                let visible = {
+                    let state = key.state.lock();
+                    !state.invalidated
+                        && state.revoked_at.is_none()
+                        && u32::try_from(state.quota.account().uid().data())
+                            .ok()
+                            .and_then(|uid| map_id_up(&old.user_ns.inner.lock().uid_map, uid))
+                            .is_some()
+                };
+                if visible
+                    && permission::check_permission(&key, &old, KeyPermission::Search).is_ok()
+                {
+                    existing = Some(key);
+                    break;
+                }
+            }
+        }
         match existing {
             Some(key) => key,
             None => {
@@ -358,7 +378,7 @@ pub fn join_session_keyring(name: Option<Vec<u8>>) -> Result<i32, SystemError> {
                     QuotaMode::Limited,
                     KeyFlags::empty(),
                 )?;
-                named.named.insert(name, key.downgrade());
+                KeyStore::publish_named_keyring_locked(&key, &old.user_ns, &mut named);
                 key
             }
         }
@@ -386,6 +406,14 @@ pub fn join_session_keyring(name: Option<Vec<u8>>) -> Result<i32, SystemError> {
 /// Queue this task's session ring for installation by its real creating
 /// parent at the next return-to-user boundary.  The child never changes the
 /// parent's credentials directly; the parent clones its then-current Cred.
+#[cfg(not(target_arch = "x86_64"))]
+pub fn session_to_parent() -> Result<usize, SystemError> {
+    // These architectures do not yet have a sleepable return-to-user hook.
+    // Do not acknowledge a handoff that cannot be consumed by the parent.
+    Err(SystemError::ENOSYS)
+}
+
+#[cfg(target_arch = "x86_64")]
 pub fn session_to_parent() -> Result<usize, SystemError> {
     let ring = lookup_key(-3, false, false, Some(KeyPermission::Link))?;
     let current = ProcessManager::current_pcb();

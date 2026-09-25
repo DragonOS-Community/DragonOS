@@ -147,6 +147,9 @@ fn add_key(args: &[usize]) -> Result<usize, SystemError> {
         state.quota.mark_instantiated();
     }
     ring::link(&destination, &key)?;
+    if key_type == KeyType::Keyring {
+        KeyStore::publish_named_keyring(&key, &cred.user_ns);
+    }
     Ok(key.serial as usize)
 }
 

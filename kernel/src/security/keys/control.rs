@@ -419,7 +419,7 @@ fn keyctl_set_timeout(args: [usize; 4]) -> Result<usize, SystemError> {
         Some(realtime_now().tv_sec.saturating_add(seconds as i64))
     };
     key.state.lock().expiry = expiry;
-    object::schedule_gc();
+    object::schedule_expiry_gc(expiry);
     Ok(0)
 }
 

@@ -22,7 +22,10 @@ use system_error::SystemError;
 use crate::{
     exception::workqueue::{Work, WorkQueue},
     libs::{mutex::Mutex, rand::secure_random_bytes, wait_queue::WaitQueue},
-    process::cred::{Kgid, Kuid},
+    process::{
+        cred::{Kgid, Kuid},
+        namespace::user_namespace::{UserNamespace, UserNamespaceKeyrings},
+    },
     time::{
         timekeeping::realtime_now,
         timer::{next_n_us_timer_jiffies, Timer, TimerFunction},
@@ -133,6 +136,28 @@ pub struct Key {
     pub state: Mutex<KeyState>,
     construction_wait: WaitQueue,
     external_refs: AtomicUsize,
+    /// The non-owning name index is removed when this key is reclaimed.
+    named_namespace: Mutex<Option<Weak<UserNamespace>>>,
+}
+
+impl Drop for Key {
+    fn drop(&mut self) {
+        let Some(namespace) = self
+            .named_namespace
+            .lock()
+            .take()
+            .and_then(|ns| ns.upgrade())
+        else {
+            return;
+        };
+        let mut keyrings = namespace.keyrings.lock();
+        if let Some(candidates) = keyrings.named.get_mut(&self.description) {
+            candidates.retain(|candidate| !core::ptr::eq(candidate.weak.as_ptr(), self));
+            if candidates.is_empty() {
+                keyrings.named.remove(&self.description);
+            }
+        }
+    }
 }
 
 impl Key {
@@ -385,26 +410,44 @@ fn record_deadline(registry: &mut Registry, deadline: (Option<i64>, bool)) {
     }
 }
 
+/// A newly assigned expiry only has to shorten the next cleanup deadline.
+/// Stale early timers are harmless: the GC pass recomputes the live minimum.
+/// Keeping the earlier timer also avoids a full registry scan for each
+/// KEYCTL_SET_TIMEOUT in a large batch.
+fn ensure_gc_timer(deadline: i64) {
+    let now = realtime_now().tv_sec;
+    if deadline <= now {
+        schedule_gc();
+        return;
+    }
+    let mut slot = KEY_GC_TIMER.lock();
+    if slot
+        .as_ref()
+        .is_some_and(|(at, timer)| *at <= deadline && *at > now && !timer.timeout())
+    {
+        return;
+    }
+    let delay_us = deadline.saturating_sub(now).max(1) as u64;
+    let jiffies = next_n_us_timer_jiffies(delay_us.saturating_mul(1_000_000));
+    let timer = Timer::new(Box::new(KeyGcTimer), jiffies);
+    if let Some((_, old)) = slot.replace((deadline, timer.clone())) {
+        old.cancel();
+    }
+    timer.activate();
+}
+
 /// Keep one timer for the earliest future cleanup, rather than a timer per
-/// key.  Replacing/cancelling it happens only in the dedicated GC worker.
+/// key.  This runs after a completed GC pass, including expiry/revoke scans.
 fn arm_gc_timer(deadline: Option<i64>, due_in_scan: bool, pass_epoch: u64) {
     let now = realtime_now().tv_sec;
-    let timer_unchanged = KEY_GC_TIMER
-        .lock()
-        .as_ref()
-        .is_some_and(|(at, timer)| Some(*at) == deadline && *at > now && !timer.timeout());
-    if !timer_unchanged {
-        let new_timer = deadline.filter(|&at| at > now).map(|at| {
-            let delay_us = at.saturating_sub(now).max(1) as u64;
-            let jiffies = next_n_us_timer_jiffies(delay_us.saturating_mul(1_000_000));
-            (at, Timer::new(Box::new(KeyGcTimer), jiffies))
-        });
-        let old = core::mem::replace(&mut *KEY_GC_TIMER.lock(), new_timer.clone());
-        if let Some((_, timer)) = old {
-            timer.cancel();
-        }
-        if let Some((_, timer)) = new_timer {
-            timer.activate();
+    if let Some(at) = deadline.filter(|&at| at > now) {
+        ensure_gc_timer(at);
+    } else {
+        // Do not cancel a timer installed by a concurrent SET_TIMEOUT after
+        // this scan started.  A stale timer merely causes one extra pass.
+        let mut slot = KEY_GC_TIMER.lock();
+        if slot.as_ref().is_some_and(|(_, timer)| timer.timeout()) {
+            slot.take();
         }
     }
     if (due_in_scan || deadline.is_some_and(|at| at <= now))
@@ -414,6 +457,15 @@ fn arm_gc_timer(deadline: Option<i64>, due_in_scan: bool, pass_epoch: u64) {
         // its containing ring has already been visited.  Retry once per
         // request epoch, but do not spin forever on an externally held key.
         KEY_GC_WQ.enqueue(KEY_GC_WORK.clone());
+    }
+}
+
+/// Set a key's cleanup deadline without rescanning all keys.  An immediate
+/// deadline still asks the worker to remove expired links promptly.
+pub fn schedule_expiry_gc(expiry: Option<i64>) {
+    if let Some(expiry) = expiry {
+        let delay = QUOTA_LIMITS.gc_delay.load(Ordering::Relaxed) as i64;
+        ensure_gc_timer(expiry.saturating_add(delay));
     }
 }
 
@@ -621,6 +673,7 @@ impl KeyStore {
             }),
             construction_wait: WaitQueue::default(),
             external_refs: AtomicUsize::new(1),
+            named_namespace: Mutex::new(None),
         })
         .map_err(|_| SystemError::ENOMEM)?;
         let mut registry = SERIAL_REGISTRY.lock();
@@ -647,6 +700,29 @@ impl KeyStore {
             return None;
         }
         Registry::live_ref(key)
+    }
+
+    /// Publish an ordinary named keyring only after its owning link or
+    /// credential reference has been installed.  The namespace index never
+    /// extends the key's lifetime; Key::drop removes the entry after GC.
+    pub fn publish_named_keyring(key: &KeyRef, namespace: &Arc<UserNamespace>) {
+        let mut names = namespace.keyrings.lock();
+        Self::publish_named_keyring_locked(key, namespace, &mut names);
+    }
+
+    pub(crate) fn publish_named_keyring_locked(
+        key: &KeyRef,
+        namespace: &Arc<UserNamespace>,
+        names: &mut UserNamespaceKeyrings,
+    ) {
+        debug_assert_eq!(key.key_type, KeyType::Keyring);
+        debug_assert_ne!(key.description[0], b'.');
+        names
+            .named
+            .entry(key.description.clone())
+            .or_default()
+            .push(key.downgrade());
+        *key.named_namespace.lock() = Some(Arc::downgrade(namespace));
     }
 
     /// Bounded serial-ordered snapshot for procfs iteration.  Reserve before

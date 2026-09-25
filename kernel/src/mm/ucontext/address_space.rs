@@ -1231,6 +1231,14 @@ impl AddressSpace {
                 Err(err) => map_fail!(err),
             };
 
+            // The reservation serializes seal addition with mapping creation.
+            // It must precede MAP_FIXED's irreversible removal of old VMAs.
+            let (mut vm_flags, _mmap_admission) =
+                match crate::filesystem::vfs::MmapAdmission::prepare(&vma_file, vm_flags) {
+                    Ok(prepared) => prepared,
+                    Err(err) => map_fail!(err),
+                };
+
             if vm_flags.contains(VmFlags::VM_LOCKED) {
                 let error = if map_flags.contains(MapFlags::MAP_LOCKED)
                     && !InnerAddressSpace::has_mlock_quota()

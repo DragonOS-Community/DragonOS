@@ -24,6 +24,7 @@ normal/mount_reconfigure
 normal/mount_propagation
 normal/open_dangling_symlink
 normal/openat2_semantics
+normal/memfd_semantics
 normal/utimensat_symlink
 normal/mount_move
 normal/mount_limit

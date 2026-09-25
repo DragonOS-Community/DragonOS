@@ -740,6 +740,39 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         Ok(vm_flags)
     }
 
+    /// Reserve a writable shared mapping before MAP_FIXED can discard an old
+    /// VMA.  The bool requests a matching `finish_mmap_prepare` on every exit.
+    fn prepare_mmap_file(
+        &self,
+        _file: &Arc<File>,
+        vm_flags: VmFlags,
+    ) -> Result<(VmFlags, bool), SystemError> {
+        Ok((vm_flags, false))
+    }
+
+    fn finish_mmap_prepare(&self) {}
+
+    fn get_seals(&self) -> Result<u32, SystemError> {
+        Err(SystemError::EINVAL)
+    }
+
+    fn add_seals(&self, _seals: u32) -> Result<(), SystemError> {
+        Err(SystemError::EINVAL)
+    }
+
+    /// The raw target of an anonymous file's /proc/*/fd symlink, if any.
+    fn proc_fd_link_target(&self) -> Option<Vec<u8>> {
+        None
+    }
+
+    /// Pin an in-flight remote write after the VMA has been found but before
+    /// the address-space lock is dropped. `end_remote_write` balances true.
+    fn begin_remote_write(&self) -> bool {
+        false
+    }
+
+    fn end_remote_write(&self) {}
+
     /// Whether mappings retaining this inode produce anonymous pages rather
     /// than file-backed pages (Linux vma_set_anonymous). A replacement file's
     /// inode supplies the property after mmap_file returns.
@@ -1742,6 +1775,33 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         _advise: i32,
     ) -> Result<usize, SystemError> {
         Err(SystemError::ENOSYS)
+    }
+}
+
+/// Lifetime of a filesystem's pre-MAP_FIXED mmap reservation.  Dropping it
+/// releases the pending writer on success, error, or a retry of address lookup.
+pub struct MmapAdmission {
+    inode: Option<Arc<dyn IndexNode>>,
+}
+
+impl MmapAdmission {
+    pub fn prepare(file: &Arc<File>, flags: VmFlags) -> Result<(VmFlags, Self), SystemError> {
+        let inode = file.inode();
+        let (flags, reserved) = inode.prepare_mmap_file(file, flags)?;
+        Ok((
+            flags,
+            Self {
+                inode: reserved.then_some(inode),
+            },
+        ))
+    }
+}
+
+impl Drop for MmapAdmission {
+    fn drop(&mut self) {
+        if let Some(inode) = self.inode.take() {
+            inode.finish_mmap_prepare();
+        }
     }
 }
 

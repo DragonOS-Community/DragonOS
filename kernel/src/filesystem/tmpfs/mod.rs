@@ -3,6 +3,9 @@ use core::fmt::Write;
 use core::intrinsics::unlikely;
 use core::sync::atomic::{AtomicU64, Ordering};
 
+mod seals;
+use seals::{MemfdSeals, F_ALL_SEALS, F_SEAL_EXEC, F_SEAL_SEAL};
+
 use crate::filesystem::page_cache::{PageCache, PageCacheBackend, PageCacheWritebackDomain};
 use crate::filesystem::vfs::syscall::RenameFlags;
 use crate::filesystem::vfs::{FileSystemMakerData, FSMAKER};
@@ -38,8 +41,8 @@ use super::vfs::{
     mount::MountFlags,
     utils::DName,
     FileSystem, FsInfo, FsReconfigureRequest, IndexNode, InodeFlags, InodeId, InodeMode,
-    LinkMutationCoordinator, LinkRemovalOutcome, Metadata, OpenFileBehavior, PostWriteSyncPolicy,
-    RenameOutcome, SetMetadataMask, SpecialNodeData,
+    LinkMutationCoordinator, LinkRemovalOutcome, Metadata, MetadataUpdate, OpenFileBehavior,
+    PostWriteSyncPolicy, RenameOutcome, SetMetadataMask, SpecialNodeData,
 };
 
 use linkme::distributed_slice;
@@ -318,15 +321,120 @@ fn tmpfs_insert_whiteout(dir: &mut TmpfsInode, name: &DName) -> Result<(), Syste
 }
 
 #[derive(Debug)]
-pub struct LockedTmpfsInode(pub Mutex<TmpfsInode>, RwSem<()>, LinkMutationCoordinator);
+pub struct LockedTmpfsInode(
+    pub Mutex<TmpfsInode>,
+    RwSem<()>,
+    LinkMutationCoordinator,
+    Option<Mutex<MemfdSeals>>,
+    Option<Vec<u8>>,
+);
 
 impl LockedTmpfsInode {
     fn new(inode: TmpfsInode) -> Self {
+        Self::new_with_memfd(inode, None)
+    }
+
+    fn new_with_memfd(inode: TmpfsInode, memfd: Option<(Vec<u8>, u32)>) -> Self {
+        let (seals, name) = match memfd {
+            Some((name, bits)) => (Some(Mutex::new(MemfdSeals::new(bits))), Some(name)),
+            None => (None, None),
+        };
         Self(
             Mutex::new(inode),
             RwSem::new(()),
             LinkMutationCoordinator::new(),
+            seals,
+            name,
         )
+    }
+
+    pub fn get_seals(&self) -> Result<u32, SystemError> {
+        if self.0.lock().metadata.file_type != FileType::File {
+            return Err(SystemError::EINVAL);
+        }
+        Ok(self
+            .3
+            .as_ref()
+            .map_or(F_SEAL_SEAL, |state| state.lock().bits))
+    }
+
+    pub fn add_seals(&self, requested: u32) -> Result<(), SystemError> {
+        if requested & !F_ALL_SEALS != 0 {
+            return Err(SystemError::EINVAL);
+        }
+        let _size_guard = self.1.write();
+        let executable = {
+            let inode = self.0.lock();
+            if inode.metadata.file_type != FileType::File {
+                return Err(SystemError::EINVAL);
+            }
+            inode.metadata.mode.bits() & 0o111 != 0
+        };
+        let Some(state) = self.3.as_ref() else {
+            return Err(SystemError::EPERM);
+        };
+        state.lock().add(requested, executable)
+    }
+
+    pub fn prepare_memfd_mmap(
+        &self,
+        flags: crate::mm::VmFlags,
+    ) -> Result<(crate::mm::VmFlags, bool), SystemError> {
+        match self.3.as_ref() {
+            Some(state) => state.lock().prepare_map(flags),
+            None => Ok((flags, false)),
+        }
+    }
+
+    pub fn finish_memfd_mmap_prepare(&self) {
+        if let Some(state) = self.3.as_ref() {
+            let mut state = state.lock();
+            state.pending_writable_maps -= 1;
+        }
+    }
+
+    fn memfd_map_open(&self, flags: crate::mm::VmFlags) -> bool {
+        if !flags.contains(crate::mm::VmFlags::VM_SHARED | crate::mm::VmFlags::VM_MAYWRITE) {
+            return false;
+        }
+        if let Some(state) = self.3.as_ref() {
+            state.lock().writable_maps += 1;
+            return true;
+        }
+        false
+    }
+
+    fn memfd_map_close(&self, flags: crate::mm::VmFlags) {
+        if flags.contains(crate::mm::VmFlags::VM_SHARED | crate::mm::VmFlags::VM_MAYWRITE) {
+            if let Some(state) = self.3.as_ref() {
+                state.lock().writable_maps -= 1;
+            }
+        }
+    }
+
+    pub fn pin_memfd_remote_write(&self) -> bool {
+        if let Some(state) = self.3.as_ref() {
+            state.lock().remote_writers += 1;
+            return true;
+        }
+        false
+    }
+
+    pub fn unpin_memfd_remote_write(&self) {
+        if let Some(state) = self.3.as_ref() {
+            state.lock().remote_writers -= 1;
+        }
+    }
+
+    fn check_exec_mode_change(&self, old: InodeMode, new: InodeMode) -> Result<(), SystemError> {
+        if (old.bits() ^ new.bits()) & 0o111 != 0 {
+            if let Some(state) = self.3.as_ref() {
+                if state.lock().bits & F_SEAL_EXEC != 0 {
+                    return Err(SystemError::EPERM);
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -474,6 +582,35 @@ impl FileSystemMakerData for TmpfsMountData {
 }
 
 impl FileSystem for Tmpfs {
+    fn vma_open(
+        &self,
+        file: &Arc<File>,
+        _region: crate::mm::VirtRegion,
+        vm_flags: crate::mm::VmFlags,
+    ) -> super::vfs::VmaOpenRollback {
+        let inode = file.inode();
+        let Some(inode) = inode.as_any_ref().downcast_ref::<LockedTmpfsInode>() else {
+            return super::vfs::VmaOpenRollback::NotRequired;
+        };
+        if inode.memfd_map_open(vm_flags) {
+            super::vfs::VmaOpenRollback::Close
+        } else {
+            super::vfs::VmaOpenRollback::NotRequired
+        }
+    }
+
+    fn vma_close(
+        &self,
+        file: &Arc<File>,
+        _region: crate::mm::VirtRegion,
+        vm_flags: crate::mm::VmFlags,
+    ) {
+        let inode = file.inode();
+        if let Some(inode) = inode.as_any_ref().downcast_ref::<LockedTmpfsInode>() {
+            inode.memfd_map_close(vm_flags);
+        }
+    }
+
     fn page_cache_writeback_domain(&self) -> Option<&Arc<PageCacheWritebackDomain>> {
         self.writeback_domain.as_ref()
     }
@@ -715,6 +852,7 @@ impl Tmpfs {
         name: DName,
         mode: InodeMode,
         size: usize,
+        memfd: Option<(Vec<u8>, u32)>,
     ) -> Result<Arc<TmpfsShmemFile>, SystemError> {
         if size > i64::MAX as usize {
             return Err(SystemError::EOVERFLOW);
@@ -722,34 +860,38 @@ impl Tmpfs {
         // Logical size is not resident tmpfs quota. PageCache membership
         // reserves/releases actual pages, including creation failure rollback.
         let inode_id = generate_inode_id();
-        let result: Arc<LockedTmpfsInode> = Arc::new(LockedTmpfsInode::new(TmpfsInode {
-            parent: Weak::default(),
-            self_ref: Weak::default(),
-            children: BTreeMap::new(),
-            page_cache: None,
-            metadata: Metadata {
-                dev_id: 0,
-                inode_id,
-                size: size as i64,
-                blk_size: TMPFS_BLOCK_SIZE as usize,
-                blocks: 0,
-                atime: PosixTimeSpec::default(),
-                mtime: PosixTimeSpec::default(),
-                ctime: PosixTimeSpec::default(),
-                btime: PosixTimeSpec::default(),
-                file_type: FileType::File,
-                mode,
-                flags: InodeFlags::empty(),
-                nlinks: 0,
-                uid: 0,
-                gid: 0,
-                raw_dev: DeviceNumber::default(),
+        let cred = ProcessManager::current_pcb().cred();
+        let result: Arc<LockedTmpfsInode> = Arc::new(LockedTmpfsInode::new_with_memfd(
+            TmpfsInode {
+                parent: Weak::default(),
+                self_ref: Weak::default(),
+                children: BTreeMap::new(),
+                page_cache: None,
+                metadata: Metadata {
+                    dev_id: 0,
+                    inode_id,
+                    size: size as i64,
+                    blk_size: TMPFS_BLOCK_SIZE as usize,
+                    blocks: 0,
+                    atime: PosixTimeSpec::default(),
+                    mtime: PosixTimeSpec::default(),
+                    ctime: PosixTimeSpec::default(),
+                    btime: PosixTimeSpec::default(),
+                    file_type: FileType::File,
+                    mode,
+                    flags: InodeFlags::empty(),
+                    nlinks: 0,
+                    uid: cred.fsuid.data(),
+                    gid: cred.fsgid.data(),
+                    raw_dev: DeviceNumber::default(),
+                },
+                fs: Arc::downgrade(self),
+                special_node: None,
+                inline_symlink: None,
+                name,
             },
-            fs: Arc::downgrade(self),
-            special_node: None,
-            inline_symlink: None,
-            name,
-        }));
+            memfd,
+        ));
 
         result.0.lock().self_ref = Arc::downgrade(&result);
         let inode_dyn: Arc<dyn IndexNode> = result.clone();
@@ -785,7 +927,42 @@ pub fn create_unlinked_shmem_file(
         DName::from(name),
         InodeMode::S_IFREG | InodeMode::S_IRWXUGO,
         size,
+        None,
     )
+}
+
+/// Construct a user-visible memfd on the existing private shmem filesystem.
+/// The caller owns fd allocation; a failed allocation simply drops the inode.
+pub fn create_memfd_file(
+    user_name: Vec<u8>,
+    allow_sealing: bool,
+    noexec_seal: bool,
+) -> Result<Arc<File>, SystemError> {
+    let initial_seals = if noexec_seal {
+        F_SEAL_EXEC
+    } else if allow_sealing {
+        0
+    } else {
+        F_SEAL_SEAL
+    };
+    let mode = if noexec_seal {
+        InodeMode::S_IFREG
+            | InodeMode::S_IRUSR
+            | InodeMode::S_IWUSR
+            | InodeMode::S_IRGRP
+            | InodeMode::S_IWGRP
+            | InodeMode::S_IROTH
+            | InodeMode::S_IWOTH
+    } else {
+        InodeMode::S_IFREG | InodeMode::S_IRWXUGO
+    };
+    let shmem = INTERNAL_SHMEM_TMPFS.create_unlinked_shmem_inode(
+        DName::from("memfd"),
+        mode,
+        0,
+        Some((user_name, initial_seals)),
+    )?;
+    Ok(shmem.file())
 }
 
 impl MountableFileSystem for Tmpfs {
@@ -826,6 +1003,57 @@ impl IndexNode for LockedTmpfsInode {
 
     fn mmap(&self, _start: usize, _len: usize, _offset: usize) -> Result<(), SystemError> {
         Ok(())
+    }
+
+    fn prepare_mmap_file(
+        &self,
+        _file: &Arc<File>,
+        vm_flags: crate::mm::VmFlags,
+    ) -> Result<(crate::mm::VmFlags, bool), SystemError> {
+        self.prepare_memfd_mmap(vm_flags)
+    }
+
+    fn finish_mmap_prepare(&self) {
+        self.finish_memfd_mmap_prepare()
+    }
+
+    fn mmap_file(
+        &self,
+        file: &Arc<File>,
+        start: usize,
+        len: usize,
+        offset: usize,
+        vm_flags: crate::mm::VmFlags,
+    ) -> Result<Arc<File>, SystemError> {
+        self.mmap(start, len, offset)?;
+        self.memfd_map_open(vm_flags);
+        Ok(file.clone())
+    }
+
+    fn get_seals(&self) -> Result<u32, SystemError> {
+        LockedTmpfsInode::get_seals(self)
+    }
+
+    fn add_seals(&self, seals: u32) -> Result<(), SystemError> {
+        LockedTmpfsInode::add_seals(self, seals)
+    }
+
+    fn proc_fd_link_target(&self) -> Option<Vec<u8>> {
+        self.4.as_ref().map(|name| {
+            let mut target = Vec::with_capacity(7 + name.len() + 10);
+            target.extend_from_slice(b"/memfd:");
+            target.extend_from_slice(name);
+            target.extend_from_slice(b" (deleted)");
+            target
+        })
+    }
+
+    fn begin_remote_write(&self) -> bool {
+        self.pin_memfd_remote_write()
+    }
+
+    fn end_remote_write(&self) {
+        self.unpin_memfd_remote_write()
     }
 
     fn truncate(&self, len: usize) -> Result<(), SystemError> {
@@ -1014,7 +1242,15 @@ impl IndexNode for LockedTmpfsInode {
             return Err(SystemError::EISDIR);
         }
         let page_cache = inode.page_cache.clone().ok_or(SystemError::EIO)?;
-        let write_end = offset.checked_add(len).ok_or(SystemError::EFBIG)?;
+        offset.checked_add(len).ok_or(SystemError::EFBIG)?;
+        let permitted_len = if let Some(state) = self.3.as_ref() {
+            state
+                .lock()
+                .permitted_write_len(offset, len, inode.metadata.size as usize)?
+        } else {
+            len
+        };
+        let write_end = offset + permitted_len;
         drop(inode);
 
         let start_page_index = offset >> MMArch::PAGE_SHIFT;
@@ -1087,7 +1323,9 @@ impl IndexNode for LockedTmpfsInode {
     }
 
     fn set_metadata(&self, metadata: &Metadata) -> Result<(), SystemError> {
+        let _guard = self.1.write();
         let mut inode = self.0.lock();
+        self.check_exec_mode_change(inode.metadata.mode, metadata.mode)?;
         inode.metadata.atime = metadata.atime;
         inode.metadata.mtime = metadata.mtime;
         inode.metadata.ctime = metadata.ctime;
@@ -1096,6 +1334,35 @@ impl IndexNode for LockedTmpfsInode {
         inode.metadata.uid = metadata.uid;
         inode.metadata.gid = metadata.gid;
         Ok(())
+    }
+
+    fn set_metadata_masked(
+        &self,
+        metadata: &Metadata,
+        mask: SetMetadataMask,
+    ) -> Result<(), SystemError> {
+        let _guard = self.1.write();
+        let mut inode = self.0.lock();
+        if mask.contains(SetMetadataMask::MODE) {
+            self.check_exec_mode_change(inode.metadata.mode, metadata.mode)?;
+        }
+        crate::filesystem::vfs::merge_metadata_masked(&mut inode.metadata, metadata, mask);
+        Ok(())
+    }
+
+    fn update_metadata_masked(
+        &self,
+        update: &mut MetadataUpdate<'_>,
+    ) -> Result<SetMetadataMask, SystemError> {
+        let _guard = self.1.write();
+        let current = self.0.lock().metadata.clone();
+        let (requested, mask) = update(&current)?;
+        let mut inode = self.0.lock();
+        if mask.contains(SetMetadataMask::MODE) {
+            self.check_exec_mode_change(inode.metadata.mode, requested.mode)?;
+        }
+        crate::filesystem::vfs::merge_metadata_masked(&mut inode.metadata, &requested, mask);
+        Ok(mask)
     }
 
     fn update_atime(&self, now: PosixTimeSpec, relatime: bool) -> Result<(), SystemError> {
@@ -1114,6 +1381,9 @@ impl IndexNode for LockedTmpfsInode {
 
             let old_size = inode.metadata.size as usize;
             let new_size = len;
+            if let Some(state) = self.3.as_ref() {
+                state.lock().check_resize(old_size, new_size)?;
+            }
 
             // Linux truncate_setsize() writes the new i_size before truncating page cache.
             // Drop the inode lock before page-cache unmap/truncate so page faults do not
@@ -1141,7 +1411,9 @@ impl IndexNode for LockedTmpfsInode {
         data: MutexGuard<FilePrivateData>,
     ) -> Result<(), SystemError> {
         drop(data);
-        if mode != 0 {
+        const KEEP_SIZE: i32 = 0x01;
+        const PUNCH_HOLE: i32 = 0x02;
+        if mode != 0 && mode != KEEP_SIZE && mode != (KEEP_SIZE | PUNCH_HOLE) {
             return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
         }
         if len == 0 {
@@ -1155,8 +1427,51 @@ impl IndexNode for LockedTmpfsInode {
 
         let _size_guard = self.1.write();
         let cred = ProcessManager::current_pcb().cred();
+        if mode & PUNCH_HOLE != 0 {
+            let (page_cache, size) = {
+                let inode = self.0.lock();
+                if let Some(state) = self.3.as_ref() {
+                    if state.lock().bits & (seals::F_SEAL_WRITE | seals::F_SEAL_FUTURE_WRITE) != 0 {
+                        return Err(SystemError::EPERM);
+                    }
+                }
+                (
+                    inode.page_cache.clone().ok_or(SystemError::EIO)?,
+                    inode.metadata.size.max(0) as usize,
+                )
+            };
+            if offset < size {
+                page_cache.punch_hole(offset, end.min(size))?;
+                let mode_changed = {
+                    let mut inode = self.0.lock();
+                    let (metadata, mask) =
+                        crate::filesystem::vfs::vcore::prepare_write_side_effect_metadata_with_cred(
+                            inode.metadata.clone(),
+                            size,
+                            &cred,
+                        );
+                    crate::filesystem::vfs::merge_metadata_masked(
+                        &mut inode.metadata,
+                        &metadata,
+                        mask,
+                    );
+                    mask.contains(SetMetadataMask::MODE)
+                };
+                if mode_changed {
+                    attrib.commit();
+                }
+            }
+            let _ = lock_owner;
+            return Ok(());
+        }
         let (page_cache, fs) = {
             let inode = self.0.lock();
+            if let Some(state) = self.3.as_ref() {
+                if end > inode.metadata.size as usize && state.lock().bits & seals::F_SEAL_GROW != 0
+                {
+                    return Err(SystemError::EPERM);
+                }
+            }
             let page_cache = inode.page_cache.clone().ok_or(SystemError::EIO)?;
             let fs = inode.fs.upgrade().ok_or(SystemError::EIO)?;
             (page_cache, fs)
@@ -1177,7 +1492,11 @@ impl IndexNode for LockedTmpfsInode {
         // concurrent chmod cannot be overwritten by a pre-allocation snapshot.
         let mode_changed = {
             let mut inode = self.0.lock();
-            let effective_size = core::cmp::max(inode.metadata.size.max(0) as usize, end);
+            let effective_size = if mode & KEEP_SIZE != 0 {
+                inode.metadata.size.max(0) as usize
+            } else {
+                core::cmp::max(inode.metadata.size.max(0) as usize, end)
+            };
             let (metadata, mask) =
                 crate::filesystem::vfs::vcore::prepare_write_side_effect_metadata_with_cred(
                     inode.metadata.clone(),

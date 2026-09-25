@@ -48,7 +48,7 @@ pub struct TcpStack {
     close_defer: TcpCloseDefer,
     listeners: Arc<TcpListenerRegistry>,
     pending: AtomicBool,
-    polling: AtomicBool,
+    poll_lock: Mutex<()>,
     deadline: AtomicU64,
 }
 
@@ -76,7 +76,7 @@ impl TcpStack {
             close_defer: TcpCloseDefer::new(),
             listeners,
             pending: AtomicBool::new(false),
-            polling: AtomicBool::new(false),
+            poll_lock: Mutex::new(()),
             deadline: AtomicU64::new(NO_DEADLINE),
         }
     }
@@ -153,23 +153,11 @@ impl TcpStack {
     }
 
     /// Progress one bounded input batch and one ordinary smoltcp output pass.
-    /// No output submission or upper-layer notification runs under TCP locks.
+    /// A caller that queued data must not mistake another poller's ownership
+    /// for an idle stack: the next poll pass must run after that owner exits.
+    /// No upper-layer notification runs under TCP locks.
     pub fn poll(&self) -> bool {
-        if self
-            .polling
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            self.request_poll();
-            return false;
-        }
-        struct PollGuard<'a>(&'a AtomicBool);
-        impl Drop for PollGuard<'_> {
-            fn drop(&mut self) {
-                self.0.store(false, Ordering::Release);
-            }
-        }
-        let _poll_guard = PollGuard(&self.polling);
+        let poll_guard = self.poll_lock.lock();
         let Some(namespace) = self.namespace.upgrade() else {
             return false;
         };
@@ -248,6 +236,9 @@ impl TcpStack {
         drop(routes);
         drop(router);
         let output_pending = self.output.drain(&namespace, POLL_BUDGET);
+        // Notification may flush a socket's TCP cork and call poll() again.
+        // The protocol pass is complete, so release serialization first.
+        drop(poll_guard);
         self.notify_all_bound_sockets();
         if immediate || output_pending {
             self.request_poll();

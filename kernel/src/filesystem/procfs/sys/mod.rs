@@ -4,6 +4,7 @@
 
 mod fs;
 mod kernel;
+mod keys;
 mod net;
 mod numeric;
 mod vm;

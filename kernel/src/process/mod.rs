@@ -27,6 +27,7 @@ pub mod timer;
 pub mod trace;
 #[cfg(target_arch = "x86_64")]
 pub mod uprobe;
+pub mod usermodehelper;
 pub mod utils;
 pub mod wait;
 

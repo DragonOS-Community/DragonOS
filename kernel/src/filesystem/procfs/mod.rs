@@ -20,6 +20,7 @@ use mount::MountView;
 
 mod cmdline;
 mod cpuinfo;
+mod keys;
 pub mod klog;
 pub mod kmsg;
 mod kmsg_file;

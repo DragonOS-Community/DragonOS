@@ -9,6 +9,7 @@ use crate::{
         procfs::{
             cmdline::CmdlineFileOps,
             cpuinfo::CpuInfoFileOps,
+            keys::{KeyUsersFileOps, KeysFileOps},
             kmsg_file::KmsgFileOps,
             loadavg::LoadavgFileOps,
             meminfo::MeminfoFileOps,
@@ -86,6 +87,8 @@ impl RootDirOps {
     )] = &[
         ("cmdline", CmdlineFileOps::new_inode),
         ("cpuinfo", CpuInfoFileOps::new_inode),
+        ("keys", KeysFileOps::new_inode),
+        ("key-users", KeyUsersFileOps::new_inode),
         ("kmsg", KmsgFileOps::new_inode),
         ("loadavg", LoadavgFileOps::new_inode),
         ("meminfo", MeminfoFileOps::new_inode),

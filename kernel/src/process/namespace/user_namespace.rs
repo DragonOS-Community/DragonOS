@@ -1,14 +1,16 @@
+use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::cmp::Ordering;
 use core::fmt::Debug;
 use core::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
 
-use crate::libs::spinlock::SpinLock;
+use crate::libs::{mutex::Mutex, spinlock::SpinLock};
 use crate::process::{
     cred::{Kgid, Kuid},
     Cred, ProcessManager,
 };
+use crate::security::keys::{object::WeakKeyRef, KeyRef};
 use system_error::SystemError;
 
 use super::nsproxy::NsCommon;
@@ -249,6 +251,19 @@ pub struct UserNamespace {
     nscommon: NsCommon,
     self_ref: Weak<UserNamespace>,
     pub inner: SpinLock<InnerUserNamespace>,
+    /// Named keyring lookup is scoped to this user namespace.  The register
+    /// ring owns the per-UID links; this index is deliberately non-owning.
+    pub(crate) keyrings: Mutex<UserNamespaceKeyrings>,
+}
+
+#[derive(Default)]
+pub(crate) struct UserNamespaceKeyrings {
+    /// Internal `.user_reg` ring, created once and retained by the namespace.
+    pub register: Option<KeyRef>,
+    /// Ordinary named session rings do not gain an extra lifetime owner here.
+    /// Multiple rings may share a name when their owners/permissions differ.
+    /// Weak entries never extend a ring's lifetime.
+    pub named: BTreeMap<Vec<u8>, Vec<WeakKeyRef>>,
 }
 
 pub struct InnerUserNamespace {
@@ -281,6 +296,7 @@ impl UserNamespace {
             self_ref: self_ref.clone(),
             nscommon: NsCommon::new(0, NamespaceType::User),
             parent: None,
+            keyrings: Mutex::new(UserNamespaceKeyrings::default()),
             inner: SpinLock::new(InnerUserNamespace {
                 uid_map: UidGidMap::new_identity(),
                 gid_map: UidGidMap::new_identity(),
@@ -361,6 +377,7 @@ impl UserNamespace {
                 self_ref: self_ref.clone(),
                 nscommon: NsCommon::new(parent_ns.level() + 1, NamespaceType::User),
                 parent: Some(parent_ns.clone()),
+                keyrings: Mutex::new(UserNamespaceKeyrings::default()),
                 inner: SpinLock::new(InnerUserNamespace {
                     uid_map: UidGidMap::default(),
                     gid_map: UidGidMap::default(),

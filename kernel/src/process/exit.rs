@@ -309,9 +309,21 @@ pub fn kernel_wait4(
     kwo.ret_rusage = rusage_buf;
 
     // 调用do_wait，执行等待
-    let r = do_wait(&mut kwo)?;
+    let r = do_wait(&mut kwo, false)?;
 
     Ok((r, kwo.ret_status))
+}
+
+/// Wait for a direct helper child to exit and reap it even if the supervising
+/// kernel thread has a pending signal. Only positive PIDs are accepted; user
+/// wait(2) retains its ordinary interruptible behavior.
+pub(crate) fn kernel_wait4_uninterruptible(pid: i32) -> Result<(usize, i32), SystemError> {
+    if pid <= 0 {
+        return Err(SystemError::EINVAL);
+    }
+    let mut kwo = KernelWaitOption::new(WaitSelector::from_wait4_pid(pid)?, WaitOption::WEXITED);
+    let reaped = do_wait(&mut kwo, true)?;
+    Ok((reaped, kwo.ret_status))
 }
 
 /// waitid 的内核实现：基于 do_wait，返回 0，必要时写回 siginfo 与 rusage
@@ -333,7 +345,7 @@ pub fn kernel_waitid(
     // waitid 不强制 WEXITED，由调用者通过 options 指定
 
     // 走通用等待
-    let wait_ret = do_wait(&mut kwo)?;
+    let wait_ret = do_wait(&mut kwo, false)?;
     if wait_ret == 0 && pidfd_nonblock && !original_options.contains(WaitOption::WNOHANG) {
         return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
     }
@@ -789,7 +801,7 @@ fn scan_result_or_wait(scan: ScanDecision) -> Result<Option<usize>, SystemError>
 }
 
 /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/kernel/exit.c#1573
-fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
+fn do_wait(kwo: &mut KernelWaitOption, uninterruptible_pid: bool) -> Result<usize, SystemError> {
     // todo: 在signal struct里面增加等待队列，并在这里初始化子进程退出的回调，使得子进程退出时，能唤醒当前进程。
 
     kwo.no_task_error = Some(SystemError::ECHILD);
@@ -833,27 +845,35 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                 }
 
                 let mut ready: Option<Result<Option<usize>, SystemError>> = None;
-                let wait_res = wait_queue_owner.wait_queue.wait_event_interruptible(
-                    || match check_child(kwo) {
-                        Ok(Some(pid)) => {
-                            ready = Some(Ok(Some(pid)));
-                            true
-                        }
-                        Ok(None) => false,
-                        Err(err) => {
-                            ready = Some(Err(err));
-                            true
-                        }
-                    },
-                    None::<fn()>,
-                );
+                let mut child_ready = || match check_child(kwo) {
+                    Ok(Some(pid)) => {
+                        ready = Some(Ok(Some(pid)));
+                        true
+                    }
+                    Ok(None) => false,
+                    Err(err) => {
+                        ready = Some(Err(err));
+                        true
+                    }
+                };
+                let wait_res = if uninterruptible_pid {
+                    wait_queue_owner
+                        .wait_queue
+                        .wait_event_uninterruptible(&mut child_ready, None::<fn()>)
+                } else {
+                    wait_queue_owner
+                        .wait_queue
+                        .wait_event_interruptible(&mut child_ready, None::<fn()>)
+                };
 
                 match wait_res {
                     Ok(()) => {
                         if let Some(r) = ready.take() {
                             break r.map(|pid| pid.unwrap_or(0));
                         }
-                        if ProcessManager::current_pcb().has_pending_signal_fast() {
+                        if !uninterruptible_pid
+                            && ProcessManager::current_pcb().has_pending_signal_fast()
+                        {
                             break Err(SystemError::ERESTARTSYS);
                         }
                         // 伪唤醒，继续等待

@@ -214,6 +214,10 @@ fn do_execve_internal(
             address_space.write().user_stack = Some(ustack_message);
 
             let pcb = ProcessManager::current_pcb();
+            let prepared_exec_cred = match pcb.cred().prepare_exec_keyrings() {
+                Ok(prepared) => prepared,
+                Err(err) => return finish_exec_error(&param, old_vm.as_ref(), err),
+            };
 
             commit_exec_futex_state(&pcb, old_vm.as_ref(), &address_space);
 
@@ -249,14 +253,11 @@ fn do_execve_internal(
             if let Err(err) = Syscall::arch_do_execve(regs, &param, &result, user_sp, argv_ptr) {
                 return finish_exec_error(&param, old_vm.as_ref(), err);
             }
-            // Linux clears SECURE_KEEP_CAPS on a successful exec. Keep it in
-            // Cred so this publication cannot race with a userns credential
-            // install; do not clear it before the last fallible exec step.
-            let old_cred = pcb.cred();
-            if old_cred.keepcaps {
-                let mut new_cred = (*old_cred).clone();
-                new_cred.keepcaps = false;
-                pcb.install_cred(crate::process::cred::Cred::new_arc(new_cred));
+            // Successful exec clears thread/process keyrings and KEEP_CAPS,
+            // while retaining the session keyring.  Preparation happened
+            // before the last fallible call above; commit cannot now fail.
+            if let Some(cred) = prepared_exec_cred {
+                pcb.install_cred(cred);
             }
             // A successful exec does not inherit ptrace hardware debug state.
             exec_pcb.flush_ptrace_hw_debug_regs();

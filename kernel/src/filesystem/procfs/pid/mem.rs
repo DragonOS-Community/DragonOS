@@ -54,7 +54,11 @@ impl MemFileOps {
 }
 
 impl FileOps for MemFileOps {
-    fn open(&self, data: &mut MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
+    fn open(
+        &self,
+        data: &mut MutexGuard<FilePrivateData>,
+        _flags: &crate::filesystem::vfs::file::FileFlags,
+    ) -> Result<(), SystemError> {
         let target = self.target.task().ok_or(SystemError::ESRCH)?;
         let pinned = {
             let _exec_guard = target.exec_update_read();

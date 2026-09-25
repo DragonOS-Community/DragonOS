@@ -1,6 +1,6 @@
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_SETGID;
-use crate::process::cred::Cred;
+use crate::process::cred::{CAPFlags, Cred};
 use crate::process::syscall::id_utils;
 use crate::process::ProcessManager;
 use crate::syscall::table::FormattedSyscallParam;
@@ -22,24 +22,18 @@ impl Syscall for SysSetGid {
     }
 
     fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
-        let gid = Self::gid(args);
-        // setgid 不接受 -1，使用专门的验证函数
-        id_utils::validate_setuid_id(gid)?;
-
         let pcb = ProcessManager::current_pcb();
         let old_cred = pcb.cred();
+        let gid = id_utils::map_gid_arg(&old_cred.user_ns, Self::gid(args), false)?;
         let mut new_cred: Cred = (*old_cred).clone();
 
-        if old_cred.euid.data() == 0 {
+        if old_cred.has_capability(CAPFlags::CAP_SETGID) {
             // 特权进程：设置所有 GID
             new_cred.setgid(gid);
             new_cred.setegid(gid);
             new_cred.setsgid(gid);
             new_cred.setfsgid(gid);
-        } else if old_cred.gid.data() == gid
-            || old_cred.egid.data() == gid
-            || old_cred.sgid.data() == gid
-        {
+        } else if old_cred.gid.data() == gid || old_cred.sgid.data() == gid {
             // 非特权进程：只能设置 egid 为当前 rgid/egid/sgid 之一
             new_cred.setegid(gid);
             new_cred.setfsgid(gid);

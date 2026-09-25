@@ -117,8 +117,8 @@ pub struct Cred {
     pub cap_bset: CAPFlags,
     /// Ambient capability set
     pub cap_ambient: CAPFlags,
-    /// supplementary groups for euid/fsgid
-    pub group_info: Option<GroupInfo>,
+    /// Linux SECURE_KEEP_CAPS (a credential property, cleared by userns and exec).
+    pub keepcaps: bool,
     pub user_ns: Arc<UserNamespace>,
 }
 
@@ -143,7 +143,7 @@ impl Cred {
             cap_effective: init_caps,
             cap_bset: init_caps,
             cap_ambient: CAPFlags::CAP_EMPTY_SET,
-            group_info: None,
+            keepcaps: false,
             user_ns: INIT_USER_NAMESPACE.clone(),
         })
     }
@@ -177,39 +177,14 @@ impl Cred {
             return CredFsCmp::Greater;
         }
 
-        if self.group_info == other.group_info {
+        if self.groups == other.groups {
             return CredFsCmp::Equal;
         }
-
-        if let (Some(ga), Some(gb)) = (&self.group_info, &other.group_info) {
-            let ga_count = ga.gids.len();
-            let gb_count = gb.gids.len();
-
-            if ga_count < gb_count {
-                return CredFsCmp::Less;
-            }
-            if ga_count > gb_count {
-                return CredFsCmp::Greater;
-            }
-
-            for i in 0..ga_count {
-                if ga.gids[i] < gb.gids[i] {
-                    return CredFsCmp::Less;
-                }
-                if ga.gids[i] > gb.gids[i] {
-                    return CredFsCmp::Greater;
-                }
-            }
-        } else {
-            if self.group_info.is_none() {
-                return CredFsCmp::Less;
-            }
-            if other.group_info.is_none() {
-                return CredFsCmp::Greater;
-            }
+        match self.groups.cmp(&other.groups) {
+            core::cmp::Ordering::Less => CredFsCmp::Less,
+            core::cmp::Ordering::Equal => CredFsCmp::Equal,
+            core::cmp::Ordering::Greater => CredFsCmp::Greater,
         }
-
-        return CredFsCmp::Equal;
     }
 
     pub fn setuid(&mut self, uid: usize) {
@@ -289,14 +264,12 @@ pub fn cap_capable(cred: &Cred, targ_ns: &Arc<UserNamespace>, cap: CAPFlags) -> 
         }
 
         let ns_owner = ns.inner.lock().owner;
-        if let Some(ref parent_weak) = ns.parent {
-            if let Some(parent_ns) = parent_weak.upgrade() {
-                if Arc::ptr_eq(&parent_ns, &cred.user_ns) && ns_owner == cred.euid.data() {
-                    return true;
-                }
-                ns = parent_ns;
-                continue;
+        if let Some(parent_ns) = ns.parent.as_ref() {
+            if Arc::ptr_eq(parent_ns, &cred.user_ns) && ns_owner == cred.euid.data() {
+                return true;
             }
+            ns = parent_ns.clone();
+            continue;
         }
 
         return false;
@@ -337,16 +310,13 @@ pub fn cred_cap_issubset(old: &Cred, new: &Cred) -> bool {
     // Across namespaces: walk the parent chain checking each owner against old's euid
     while !Arc::ptr_eq(&ns, &INIT_USER_NAMESPACE) {
         let ns_owner = ns.inner.lock().owner;
-        let Some(parent_weak) = ns.parent.as_ref() else {
+        let Some(parent_ns) = ns.parent.as_ref() else {
             return false;
         };
-        let Some(parent_ns) = parent_weak.upgrade() else {
-            return false;
-        };
-        if Arc::ptr_eq(&old.user_ns, &parent_ns) && ns_owner == old.euid.data() {
+        if Arc::ptr_eq(&old.user_ns, parent_ns) && ns_owner == old.euid.data() {
             return true;
         }
-        ns = parent_ns;
+        ns = parent_ns.clone();
     }
     false
 }
@@ -364,15 +334,11 @@ pub fn ns_capable_setid(ns: &Arc<UserNamespace>, cap: CAPFlags) -> bool {
 /// - uid/gid/euid/egid/fsuid/fsgid **不改变**
 /// - user_ns 指向新的 namespace
 pub fn set_cred_user_ns(cred: &mut Cred, user_ns: Arc<UserNamespace>) {
+    cred.keepcaps = false;
     cred.cap_inheritable = CAPFlags::CAP_EMPTY_SET;
     cred.cap_permitted = CAPFlags::CAP_FULL_SET;
     cred.cap_effective = CAPFlags::CAP_FULL_SET;
     cred.cap_ambient = CAPFlags::CAP_EMPTY_SET;
     cred.cap_bset = CAPFlags::CAP_FULL_SET;
     cred.user_ns = user_ns;
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct GroupInfo {
-    pub gids: Vec<Kgid>,
 }

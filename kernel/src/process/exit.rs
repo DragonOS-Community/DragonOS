@@ -9,8 +9,8 @@ use crate::{
     driver::tty::tty_core::TtyCore,
     ipc::{sighand::ReapTransition, signal_types::SignalFlags},
     process::{
-        namespace::user_namespace::map_id_up, pid::PidType, ptrace, wait::WaitSelector,
-        ProcessState,
+        cred::Kuid, namespace::user_namespace::from_kuid_munged, pid::PidType, ptrace,
+        wait::WaitSelector, ProcessState,
     },
     syscall::user_access::UserBufferWriter,
 };
@@ -20,8 +20,6 @@ use alloc::{
 };
 use core::sync::atomic::Ordering;
 use system_error::SystemError;
-
-const DEFAULT_OVERFLOW_UID: u32 = 65534;
 
 /// 将内核中保存的 wstatus（已经按 wait4 语义左移过的编码值）
 /// 转换为 waitid 语义下的 si_status（低 8 位退出码）。
@@ -455,10 +453,8 @@ fn wait_visible_pid(child_pcb: &Arc<ProcessControlBlock>) -> RawPid {
 
 fn waitid_visible_uid(child_pcb: &Arc<ProcessControlBlock>) -> u32 {
     let child_uid = child_pcb.cred().uid.data();
-    let child_uid = u32::try_from(child_uid).unwrap_or(DEFAULT_OVERFLOW_UID);
     let current_user_ns = ProcessManager::current_pcb().cred().user_ns.clone();
-    let inner = current_user_ns.inner.lock();
-    map_id_up(&inner.uid_map, child_uid).unwrap_or(DEFAULT_OVERFLOW_UID)
+    from_kuid_munged(&current_user_ns, Kuid::new(child_uid))
 }
 
 fn waitid_info(child_pcb: &Arc<ProcessControlBlock>, status: i32, cause: i32) -> WaitIdInfo {

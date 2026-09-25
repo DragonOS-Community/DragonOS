@@ -181,7 +181,6 @@ fn chown_common(inode: Arc<dyn IndexNode>, uid: usize, gid: usize) -> Result<usi
     let cred = ProcessManager::current_pcb().cred();
     let fsuid = cred.fsuid.data();
     let fsgid = cred.fsgid.data();
-    let group_info = cred.group_info.clone().unwrap_or_default();
 
     // Linux semantics: uid/gid passed in as (uid_t)-1/(gid_t)-1 mean "do not change".
     let is_no_change = |id: usize| id == u32::MAX as usize;
@@ -219,8 +218,7 @@ fn chown_common(inode: Arc<dyn IndexNode>, uid: usize, gid: usize) -> Result<usi
             && (fsuid != current.uid
                 || (gid != current.gid
                     && gid != fsgid
-                    && !cred.getgroups().contains(&Kgid::from(gid))
-                    && !group_info.gids.contains(&Kgid::from(gid))))
+                    && !cred.getgroups().contains(&Kgid::from(gid))))
         {
             return Err(SystemError::EPERM);
         }
@@ -235,7 +233,7 @@ fn chown_common(inode: Arc<dyn IndexNode>, uid: usize, gid: usize) -> Result<usi
         // MODE update still requires owner/CAP_FOWNER, even for (-1, -1).
         if meta.file_type != FileType::Dir {
             meta.mode.remove(InodeMode::S_ISUID);
-            if should_remove_sgid_on_chown(meta.mode, current.gid, &cred, &group_info, has_fsetid) {
+            if should_remove_sgid_on_chown(meta.mode, current.gid, &cred, has_fsetid) {
                 meta.mode.remove(InodeMode::S_ISGID);
             }
         }
@@ -246,7 +244,6 @@ fn chown_common(inode: Arc<dyn IndexNode>, uid: usize, gid: usize) -> Result<usi
             && !has_fsetid
             && fsgid != meta.gid
             && !cred.getgroups().contains(&Kgid::from(meta.gid))
-            && !group_info.gids.contains(&Kgid::from(meta.gid))
         {
             meta.mode.remove(InodeMode::S_ISGID);
         }

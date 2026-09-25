@@ -236,7 +236,11 @@ fn append_map_line(vma: &Arc<LockedVMA>, root_prefix: &str, out: &mut Vec<u8>) {
 }
 
 impl FileOps for MapsFileOps {
-    fn open(&self, data: &mut MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
+    fn open(
+        &self,
+        data: &mut MutexGuard<FilePrivateData>,
+        _flags: &crate::filesystem::vfs::file::FileFlags,
+    ) -> Result<(), SystemError> {
         // Linux `proc_maps_open()` -> `proc_mem_open()`: the target's address
         // space is taken under the exec lock, so this fd is bound to the space
         // it was opened on and an `execve()` between two reads cannot move the

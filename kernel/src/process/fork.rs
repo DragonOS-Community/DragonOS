@@ -526,7 +526,7 @@ impl ProcessManager {
     /// 复制 prctl 相关的进程/线程状态。
     ///
     /// - no_new_privs：线程级语义，clone/fork 继承，execve 保持（execve 不走这里）。
-    /// - keepcaps：clone/fork 继承。
+    /// - keepcaps：作为 Cred 字段由 copy_creds 自然继承。
     /// - dumpable: inherited naturally via the shared or cloned AddressSpace.
     fn copy_prctl_state(
         _clone_flags: &CloneFlags,
@@ -537,9 +537,6 @@ impl ProcessManager {
         if current_pcb.no_new_privs() != 0 {
             new_pcb.set_no_new_privs(true);
         }
-
-        // KEEPCAPS
-        new_pcb.set_keepcaps(current_pcb.keepcaps());
 
         Ok(())
     }
@@ -829,12 +826,7 @@ impl ProcessManager {
 
         // 拷贝namespace。CLONE_NEWNS 的 fs 路径投影依赖刚复制的 fs_struct，
         // 因而这两步必须相邻且同处 publication barrier 内。
-        Self::copy_namespaces(&clone_flags, current_pcb, pcb, &fs_refs_copy).unwrap_or_else(|e| {
-            panic!(
-                "fork: Failed to copy namespaces from current process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
-                current_pcb.raw_pid(), pcb.raw_pid(), e
-            )
-        });
+        Self::copy_namespaces(&clone_flags, current_pcb, pcb, &fs_refs_copy)?;
 
         // Pre-create the parent's group while allocation failures are still
         // harmless. The extra child owner is acquired only at publication.

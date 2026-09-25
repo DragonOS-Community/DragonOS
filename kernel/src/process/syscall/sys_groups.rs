@@ -4,6 +4,7 @@ use crate::arch::syscall::nr::SYS_SETGROUPS;
 use crate::process::cred::CAPFlags;
 use crate::process::cred::Cred;
 use crate::process::cred::Kgid;
+use crate::process::namespace::user_namespace::{from_kgid_munged, make_kgid};
 use crate::process::ProcessManager;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
@@ -26,22 +27,29 @@ impl Syscall for SysGetGroups {
     fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let pcb = ProcessManager::current_pcb();
         let cred = pcb.cred();
-        let size = args[0];
+        let size = args[0] as i32;
+        if size < 0 {
+            return Err(SystemError::EINVAL);
+        }
+        let size = size as usize;
         if size == 0 {
             return Ok(cred.getgroups().len());
         }
-        if size < cred.getgroups().len() || size > NGROUPS_MAX {
+        if size < cred.getgroups().len() {
             return Err(SystemError::EINVAL);
+        }
+        if cred.getgroups().is_empty() {
+            return Ok(0);
         }
 
         let mut tmp: Vec<u32> = Vec::with_capacity(cred.getgroups().len());
         for gid in cred.getgroups().iter() {
-            tmp.push(gid.data() as u32);
+            tmp.push(from_kgid_munged(&cred.user_ns, *gid));
         }
 
         // 使用 buffer_protected 方式进行基于异常表保护的拷贝
         let mut user_buffer =
-            UserBufferWriter::new(args[1] as *mut u32, size * size_of::<u32>(), true)?;
+            UserBufferWriter::new(args[1] as *mut u32, tmp.len() * size_of::<u32>(), true)?;
         let mut buffer = user_buffer.buffer_protected(0)?;
 
         for (i, gid) in tmp.iter().enumerate() {
@@ -82,10 +90,14 @@ impl Syscall for SysSetGroups {
             return Err(SystemError::EPERM);
         }
 
-        let mut cred = (*pcb.cred()).clone();
-        let size = args[0];
+        let size = args[0] as i32;
+        if size < 0 {
+            return Err(SystemError::EINVAL);
+        }
+        let size = size as usize;
         if size == 0 {
             // clear all supplementary groups
+            let mut cred = (*current_cred).clone();
             cred.setgroups(Vec::new());
             pcb.commit_cred(Cred::new_arc(cred))?;
             return Ok(0);
@@ -107,10 +119,12 @@ impl Syscall for SysSetGroups {
             .map(|chunk| u32::from_ne_bytes(chunk.try_into().unwrap()))
             .collect();
 
-        let groups: Vec<Kgid> = raw_groups
+        let mut groups: Vec<Kgid> = raw_groups
             .into_iter()
-            .map(|g| Kgid::from(g as usize))
-            .collect();
+            .map(|g| make_kgid(&user_ns, g))
+            .collect::<Result<_, _>>()?;
+        groups.sort_unstable();
+        let mut cred = (*current_cred).clone();
         cred.setgroups(groups);
         pcb.commit_cred(Cred::new_arc(cred))?;
         Ok(0)

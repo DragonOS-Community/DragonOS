@@ -137,12 +137,16 @@ fn is_plain_special_inode(inode: &Arc<dyn IndexNode>) -> bool {
 fn resolve_device_special_inode(
     inode: Arc<dyn IndexNode>,
     file_type: FileType,
+    path_metadata: Option<&Metadata>,
 ) -> Result<Arc<dyn IndexNode>, SystemError> {
     if !matches!(file_type, FileType::CharDevice | FileType::BlockDevice) {
         return Ok(inode);
     }
 
-    let raw_dev = inode.metadata()?.raw_dev;
+    let raw_dev = match path_metadata {
+        Some(metadata) => metadata.raw_dev,
+        None => inode.metadata()?.raw_dev,
+    };
     if raw_dev == Default::default() {
         return Ok(inode);
     }
@@ -1141,6 +1145,7 @@ impl File {
             mount_guard,
             None,
             None,
+            None,
         )
     }
 
@@ -1151,6 +1156,7 @@ impl File {
         flags: FileFlags,
         mount_guard: Option<MountExternalGuard>,
         operation_guard: InodeRetentionGuard,
+        cached_path_metadata: Option<Metadata>,
     ) -> Result<Self, SystemError> {
         Self::new_with_private_data_and_mount_guard(
             inode,
@@ -1159,6 +1165,7 @@ impl File {
             mount_guard,
             Some(operation_guard),
             None,
+            cached_path_metadata,
         )
     }
 
@@ -1177,6 +1184,7 @@ impl File {
             mount_guard,
             Some(operation_guard),
             Some(preopened),
+            None,
         )
     }
 
@@ -1189,10 +1197,14 @@ impl File {
         // pin before the mount pin, just as the completed File does.
         _operation_guard: Option<InodeRetentionGuard>,
         mut preopened: Option<PreopenedFile>,
+        cached_path_metadata: Option<Metadata>,
     ) -> Result<Self, SystemError> {
         let mut inode = inode;
         let path_inode = inode.clone();
-        let mut file_type = inode.metadata()?.file_type;
+        let mut file_type = match cached_path_metadata.as_ref() {
+            Some(metadata) => metadata.file_type,
+            None => inode.metadata()?.file_type,
+        };
         let is_path = flags.contains(FileFlags::O_PATH);
 
         if !is_path {
@@ -1200,7 +1212,11 @@ impl File {
             let is_named_pipe = if file_type == FileType::Pipe {
                 if let Some(SpecialNodeData::Pipe(pipe_inode)) = inode.special_node() {
                     inode = pipe_inode;
-                    file_type = inode.metadata()?.file_type;
+                    file_type = if cached_path_metadata.is_some() {
+                        inode.cached_metadata()?.file_type
+                    } else {
+                        inode.metadata()?.file_type
+                    };
                     true
                 } else {
                     false
@@ -1214,10 +1230,14 @@ impl File {
                 flags.insert(FileFlags::O_LARGEFILE);
             }
 
-            inode = resolve_device_special_inode(inode, file_type)?;
+            inode = resolve_device_special_inode(inode, file_type, cached_path_metadata.as_ref())?;
         }
 
-        let metadata = inode.metadata()?;
+        let metadata = match cached_path_metadata.as_ref() {
+            Some(metadata) if Arc::ptr_eq(&inode, &path_inode) => metadata.clone(),
+            _ if cached_path_metadata.is_some() => inode.cached_metadata()?,
+            _ => inode.metadata()?,
+        };
         if !is_path && metadata.flags.contains(InodeFlags::S_APPEND) {
             flags.insert(FileFlags::O_APPEND);
         }
@@ -1226,7 +1246,11 @@ impl File {
         let canonical_metadata = if Arc::ptr_eq(&canonical_inode, &inode) {
             metadata.clone()
         } else {
-            canonical_inode.metadata()?
+            if cached_path_metadata.is_some() {
+                canonical_inode.cached_metadata()?
+            } else {
+                canonical_inode.metadata()?
+            }
         };
         let posix_lock_key = (canonical_metadata.dev_id, canonical_metadata.inode_id);
         let append_lock_domain = if file_type == FileType::File && !is_path {

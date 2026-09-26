@@ -1397,6 +1397,16 @@ impl SuperBlockState {
         name: Option<DName>,
     ) -> Result<Arc<VfsDentry>, SystemError> {
         let metadata = inode.metadata()?;
+        self.get_or_create_dentry_with_metadata(parent, inode, name, &metadata)
+    }
+
+    fn get_or_create_dentry_with_metadata(
+        &self,
+        parent: Option<&Arc<VfsDentry>>,
+        inode: Arc<dyn IndexNode>,
+        name: Option<DName>,
+        metadata: &super::Metadata,
+    ) -> Result<Arc<VfsDentry>, SystemError> {
         let child = metadata.inode_id;
         let child_generation = inode.inode_generation();
         let key = DentryRegistryKey {
@@ -4739,6 +4749,24 @@ impl MountFSInode {
         Ok(Self::from_dentry(dentry, mount_fs))
     }
 
+    fn new_child_cached(
+        inner_inode: Arc<dyn IndexNode>,
+        mount_fs: Arc<MountFS>,
+        parent: &Arc<MountFSInode>,
+        name: DName,
+    ) -> Result<Arc<Self>, SystemError> {
+        let metadata = inner_inode.cached_metadata()?;
+        let dentry = mount_fs
+            .super_block_state
+            .get_or_create_dentry_with_metadata(
+                Some(&parent.dentry),
+                inner_inode,
+                Some(name),
+                &metadata,
+            )?;
+        Ok(Self::from_dentry(dentry, mount_fs))
+    }
+
     fn new_anonymous(
         inner_inode: Arc<dyn IndexNode>,
         dname: DName,
@@ -5242,7 +5270,26 @@ impl MountFSInode {
                 self.do_parent().map(|inode| inode as Arc<dyn IndexNode>)
             }
             _ => self
-                .do_find_with_no_xdev(name, true)
+                .do_find_with_no_xdev(name, true, false)
+                .map(|inode| inode as Arc<dyn IndexNode>),
+        }
+    }
+
+    pub(crate) fn cached_find_no_xdev(
+        &self,
+        name: &str,
+    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+        match name {
+            "" | "." => self
+                .self_ref
+                .upgrade()
+                .map(|inode| inode as Arc<dyn IndexNode>)
+                .ok_or(SystemError::ENOENT),
+            // Parent traversal currently needs mount-topology/namespace locks
+            // that can be held across slow work. Retry by ref-walking instead.
+            ".." => Err(SystemError::EAGAIN_OR_EWOULDBLOCK),
+            _ => self
+                .do_find_with_no_xdev(name, true, true)
                 .map(|inode| inode as Arc<dyn IndexNode>),
         }
     }
@@ -5256,13 +5303,18 @@ impl MountFSInode {
     }
 
     fn do_find(&self, name: &str) -> Result<Arc<MountFSInode>, SystemError> {
-        self.do_find_with_no_xdev(name, false)
+        self.do_find_with_no_xdev(name, false, false)
+    }
+
+    fn do_find_cached(&self, name: &str) -> Result<Arc<MountFSInode>, SystemError> {
+        self.do_find_with_no_xdev(name, false, true)
     }
 
     fn do_find_with_no_xdev(
         &self,
         name: &str,
         no_xdev: bool,
+        cache_only: bool,
     ) -> Result<Arc<MountFSInode>, SystemError> {
         let base = if no_xdev {
             self.self_ref.upgrade().ok_or(SystemError::ENOENT)?
@@ -5270,17 +5322,45 @@ impl MountFSInode {
             self.overlaid_inode()
         };
         let (inner_inode, mount_inode) = {
-            let _children_guard = base.dentry.children_gate.lock();
-            let _namespace_guard = base.mount_fs.super_block_state.dentry_namespace_lock.read();
+            let _children_guard = if cache_only {
+                base.dentry
+                    .children_gate
+                    .try_lock()
+                    .map_err(|_| SystemError::EAGAIN_OR_EWOULDBLOCK)?
+            } else {
+                base.dentry.children_gate.lock()
+            };
+            let _namespace_guard = if cache_only {
+                base.mount_fs
+                    .super_block_state
+                    .dentry_namespace_lock
+                    .try_read()
+                    .ok_or(SystemError::EAGAIN_OR_EWOULDBLOCK)?
+            } else {
+                base.mount_fs.super_block_state.dentry_namespace_lock.read()
+            };
             // Since downward lookups may cross filesystem boundaries, wrap the
             // exact alias before releasing rename serialization.
-            let inner_inode = base
-                .mount_fs
-                .inner_filesystem
-                .find_in_view(&base.dentry.inode, name)?;
+            let inner_inode = if cache_only {
+                base.mount_fs
+                    .inner_filesystem
+                    .cached_find_in_view(&base.dentry.inode, name)?
+            } else {
+                base.mount_fs
+                    .inner_filesystem
+                    .find_in_view(&base.dentry.inode, name)?
+            };
             let dname = DName::from(name);
-            let mount_inode =
-                MountFSInode::new_child(inner_inode.clone(), base.mount_fs.clone(), &base, dname)?;
+            let mount_inode = if cache_only {
+                MountFSInode::new_child_cached(
+                    inner_inode.clone(),
+                    base.mount_fs.clone(),
+                    &base,
+                    dname,
+                )?
+            } else {
+                MountFSInode::new_child(inner_inode.clone(), base.mount_fs.clone(), &base, dname)?
+            };
             (inner_inode, mount_inode)
         };
         // FUSE automount may acquire the global mount topology lock; never hold
@@ -5288,6 +5368,9 @@ impl MountFSInode {
         if let Some(fuse_node) =
             inner_inode.downcast_arc::<crate::filesystem::fuse::inode::FuseNode>()
         {
+            if cache_only {
+                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+            }
             if no_xdev && crate::filesystem::fuse::fs::fuse_submount_enabled(&fuse_node) {
                 return Err(SystemError::EXDEV);
             }
@@ -5872,6 +5955,18 @@ impl IndexNode for MountFSInode {
         Ok(md)
     }
 
+    fn cached_metadata(&self) -> Result<super::Metadata, SystemError> {
+        let mut md = self.dentry.inode.cached_metadata()?;
+        if md.dev_id == 0 {
+            md.dev_id = self.mount_fs.super_block_state.unnamed_dev()?.data() as usize;
+        }
+        Ok(md)
+    }
+
+    fn cached_symlink_target(&self) -> Result<String, SystemError> {
+        self.dentry.inode.cached_symlink_target()
+    }
+
     fn reported_ino(&self, metadata: &super::Metadata) -> InodeId {
         self.dentry.inode.reported_ino(metadata)
     }
@@ -6139,6 +6234,20 @@ impl IndexNode for MountFSInode {
             // Directly call the find method of the filesystem the current inode belongs to.
             // Since downward lookups may cross filesystem boundaries, we need to attempt inode replacement.
             _ => self.do_find(name).map(|inode| inode as Arc<dyn IndexNode>),
+        }
+    }
+
+    fn cached_find(&self, name: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
+        match name {
+            "" | "." => self
+                .self_ref
+                .upgrade()
+                .map(|inode| inode.overlaid_inode() as Arc<dyn IndexNode>)
+                .ok_or(SystemError::ENOENT),
+            ".." => Err(SystemError::EAGAIN_OR_EWOULDBLOCK),
+            _ => self
+                .do_find_cached(name)
+                .map(|inode| inode as Arc<dyn IndexNode>),
         }
     }
 

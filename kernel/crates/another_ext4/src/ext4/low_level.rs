@@ -2815,6 +2815,19 @@ impl Ext4 {
         Ok(Self::file_attr(&inode))
     }
 
+    /// Read only an already resident inode image. A miss must not reach the
+    /// block device: openat2(RESOLVE_CACHED) can retry without that flag.
+    pub fn getattr_cached(&self, id: InodeId) -> Result<Option<FileAttr>> {
+        let _view = self.lock_metadata_read_view()?;
+        let Some(inode) = self.inode_cache.lock().get(id) else {
+            return Ok(None);
+        };
+        if inode.inode.mode().bits() == 0 {
+            return_error!(ErrCode::EINVAL, "Invalid inode {}", id);
+        }
+        Ok(Some(Self::file_attr(&inode)))
+    }
+
     fn file_attr(inode: &InodeRef) -> FileAttr {
         // Get device number for device nodes
         let rdev = if inode.inode.is_device() {
@@ -4526,6 +4539,23 @@ mod tests {
         );
         assert_eq!(attr.links, 2);
         assert_eq!(attr.rdev, (259, 0x1_0002));
+    }
+
+    #[test]
+    fn getattr_cached_never_falls_back_to_the_block_device() {
+        let fs = make_test_fs(16);
+        assert!(fs.getattr_cached(42).unwrap().is_none());
+
+        let mut inode = Box::new(Inode::default());
+        inode.set_mode(InodeMode::FILE | InodeMode::from_bits_retain(0o600));
+        inode.set_uid(1234);
+        fs.inode_cache.lock().insert(InodeRef::new(42, inode));
+        let attr = fs.getattr_cached(42).unwrap().expect("cached inode");
+        assert_eq!(attr.uid, 1234);
+        assert_eq!(attr.perm.bits(), 0o600);
+
+        fs.inode_cache.lock().invalidate(42);
+        assert!(fs.getattr_cached(42).unwrap().is_none());
     }
 
     struct StubBlockDevice {

@@ -105,6 +105,13 @@ pub fn inode_cache_write_read_test(ext4: &Ext4) {
     // getattr should reflect the new size (from cache)
     let attr = ext4.getattr(fid).expect("getattr failed");
     assert_eq!(attr.size, 12345, "cached inode should reflect written size");
+    assert_eq!(
+        ext4.getattr_cached(fid)
+            .expect("cached getattr failed")
+            .expect("getattr warmed the inode cache")
+            .size,
+        12345
+    );
 
     // Write more data at an offset
     let data2 = vec![99u8; 5000];
@@ -134,11 +141,17 @@ pub fn inode_cache_write_read_test(ext4: &Ext4) {
     .expect("setattr failed");
 
     let attr3 = ext4.getattr(fid).expect("getattr after setattr failed");
+    let cached_attr3 = ext4
+        .getattr_cached(fid)
+        .expect("cached getattr after setattr failed")
+        .expect("getattr warmed the inode cache");
     assert_eq!(attr3.uid, 1000, "uid should be updated");
     assert_eq!(attr3.gid, 2000, "gid should be updated");
     assert_eq!(attr3.atime, 1234567890, "atime should be updated");
     // size should still be 25000
     assert_eq!(attr3.size, 25000, "size should be preserved after setattr");
+    assert_eq!(cached_attr3.uid, attr3.uid);
+    assert_eq!(cached_attr3.gid, attr3.gid);
 
     // Cleanup
     let handle = ext4
@@ -178,6 +191,12 @@ pub fn inode_cache_invalidation_test(ext4: &Ext4) {
     );
 
     ext4.reclaim_inode(handle).expect("reclaim failed");
+    assert!(
+        ext4.getattr_cached(fid)
+            .expect("cached getattr after reclaim failed")
+            .is_none(),
+        "reclaimed inode must not remain cached"
+    );
 
     // After free, getattr should fail (inode link_count == 0)
     let result = ext4.getattr(fid);

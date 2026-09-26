@@ -1029,6 +1029,17 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         return Err(SystemError::ENOSYS);
     }
 
+    /// Metadata already resident in memory for RESOLVE_CACHED path lookup.
+    /// Implementations must not start device/remote I/O; uncertainty is EAGAIN.
+    fn cached_metadata(&self) -> Result<Metadata, SystemError> {
+        Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
+    }
+
+    /// An already resident symlink target. Never fall back to read_at here.
+    fn cached_symlink_target(&self) -> Result<String, SystemError> {
+        Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
+    }
+
     /// Mode exposed by stat(2). Most inodes store the permission bits and
     /// file type separately; Linux anon_inode objects deliberately report
     /// mode 0600 without a file type and override this default.
@@ -1340,6 +1351,12 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     fn find(&self, _name: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
         // 若文件系统没有实现此方法，则返回"不支持"
         return Err(SystemError::ENOSYS);
+    }
+
+    /// Lookup from an authoritative in-memory name cache without backend I/O.
+    /// A cold/uncertain entry returns EAGAIN, not ENOENT.
+    fn cached_find(&self, _name: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
+        Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
     }
 
     /// Look up a child by its raw directory-entry name. Filesystems whose
@@ -2010,7 +2027,24 @@ impl dyn IndexNode {
         return_missing_final: bool,
         options: Option<&utils::PathWalkOptions>,
     ) -> Result<PathWalkOutcome, SystemError> {
-        if self.metadata()?.file_type != FileType::Dir {
+        let cache_only = options.is_some_and(|options| {
+            options
+                .resolve
+                .contains(utils::OpenHowResolve::RESOLVE_CACHED)
+        });
+        let lookup_metadata = |inode: &Arc<dyn IndexNode>| {
+            if cache_only {
+                inode.cached_metadata()
+            } else {
+                inode.metadata()
+            }
+        };
+        let start_metadata = if cache_only {
+            self.cached_metadata()?
+        } else {
+            self.metadata()?
+        };
+        if start_metadata.file_type != FileType::Dir {
             return Err(SystemError::ENOTDIR);
         }
 
@@ -2068,13 +2102,13 @@ impl dyn IndexNode {
         // 逐级查找文件
         while !rest_path.is_empty() {
             // 当前这一级不是文件夹
-            if result.metadata()?.file_type != FileType::Dir {
+            if lookup_metadata(&result)?.file_type != FileType::Dir {
                 return Err(SystemError::ENOTDIR);
             }
 
             // 检查当前目录的执行权限（搜索权限）
             // 这确保了进程有权限遍历到此目录（对 Remote 权限模型的 FS，该检查会被绕过）
-            let metadata = result.metadata()?;
+            let metadata = lookup_metadata(&result)?;
             permission::check_inode_permission(&result, &metadata, PermissionMask::MAY_EXEC)?;
 
             let name;
@@ -2113,8 +2147,8 @@ impl dyn IndexNode {
                     }
                 }
                 if options.is_none_or(|options| options.scope_root.is_none()) {
-                    let cur_md = result.metadata()?;
-                    let root_md = process_root_inode.metadata()?;
+                    let cur_md = lookup_metadata(&result)?;
+                    let root_md = lookup_metadata(&process_root_inode)?;
                     if cur_md.dev_id == root_md.dev_id && cur_md.inode_id == root_md.inode_id {
                         continue;
                     }
@@ -2127,16 +2161,27 @@ impl dyn IndexNode {
             // missing final component and the base restored for a relative
             // symlink target.
             let parent_ownership = ownership.take();
-            let lookup = if options.is_some_and(|options| {
+            let no_xdev = options.is_some_and(|options| {
                 options
                     .resolve
                     .contains(utils::OpenHowResolve::RESOLVE_NO_XDEV)
-            }) {
+            });
+            let lookup = if no_xdev {
                 if let Some(mounted) = result.clone().downcast_arc::<mount::MountFSInode>() {
-                    mounted.find_no_xdev(&name)
+                    if cache_only {
+                        mounted.cached_find_no_xdev(&name)
+                    } else {
+                        mounted.find_no_xdev(&name)
+                    }
                 } else {
-                    result.find(&name)
+                    if cache_only {
+                        result.cached_find(&name)
+                    } else {
+                        result.find(&name)
+                    }
                 }
+            } else if cache_only {
+                result.cached_find(&name)
             } else {
                 result.find(&name)
             };
@@ -2158,7 +2203,7 @@ impl dyn IndexNode {
             if parent_ownership.is_some() {
                 ownership = Some(utils::ResolvedPath::new(inode.clone())?);
             }
-            let file_type = inode.metadata()?.file_type;
+            let file_type = lookup_metadata(&inode)?.file_type;
             // 如果已经是路径的最后一个部分，并且不希望跟随最后的符号链接
             if !has_more_components && !follow_final_symlink && file_type == FileType::SymLink {
                 // Linux 语义：若 pathname 以 '/' 结尾，则必须解析为目录，
@@ -2220,10 +2265,22 @@ impl dyn IndexNode {
 
                 symlink_follows_remaining -= 1;
 
+                // Magic links can project a live file or mount and need their
+                // own nonblocking snapshot protocol. Ordinary cached symlinks
+                // only need the cached target; do not call special_node(),
+                // whose backing inode lock can wait for filesystem I/O.
+                if cache_only && inode.is_magic_link() {
+                    return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+                }
+
                 // 首先检查是否是"魔法链接"（如 /proc/self/fd/N）
                 // 这些链接的 readlink 返回的路径可能不可解析（如 pipe:[xxx]），
                 // 但它们有一个 special_node 指向真实的 inode
-                let special_node = inode.special_node();
+                let special_node = if cache_only {
+                    None
+                } else {
+                    inode.special_node()
+                };
                 let magic_target = match special_node.as_ref() {
                     Some(SpecialNodeData::Reference(target_inode))
                     | Some(SpecialNodeData::MountProjectedReference {
@@ -2264,31 +2321,35 @@ impl dyn IndexNode {
                 // read bound. Read once into a PATH_MAX-sized buffer: some of
                 // those implementations intentionally ignore the offset and
                 // therefore cannot be consumed in chunks.
-                if symlink_buffer.is_none() {
-                    let mut buffer = Vec::new();
-                    buffer
-                        .try_reserve_exact(MAX_PATHLEN)
-                        .map_err(|_| SystemError::ENOMEM)?;
-                    buffer.resize(MAX_PATHLEN, 0);
-                    symlink_buffer = Some(buffer);
-                }
-                let content = symlink_buffer.as_mut().expect("symlink buffer initialized");
-                // 读取符号链接
-                // TODO:We need to clarify which interfaces require private data and which do not
-                let len = inode.read_at(
-                    0,
-                    MAX_PATHLEN,
-                    content,
-                    Mutex::new(FilePrivateData::Unused).lock(),
-                )?;
-                if len >= MAX_PATHLEN {
+                let link_path = if cache_only {
+                    inode.cached_symlink_target()?
+                } else {
+                    if symlink_buffer.is_none() {
+                        let mut buffer = Vec::new();
+                        buffer
+                            .try_reserve_exact(MAX_PATHLEN)
+                            .map_err(|_| SystemError::ENOMEM)?;
+                        buffer.resize(MAX_PATHLEN, 0);
+                        symlink_buffer = Some(buffer);
+                    }
+                    let content = symlink_buffer.as_mut().expect("symlink buffer initialized");
+                    // TODO:We need to clarify which interfaces require private data and which do not
+                    let len = inode.read_at(
+                        0,
+                        MAX_PATHLEN,
+                        content,
+                        Mutex::new(FilePrivateData::Unused).lock(),
+                    )?;
+                    if len >= MAX_PATHLEN {
+                        return Err(SystemError::ENAMETOOLONG);
+                    }
+                    String::from(
+                        ::core::str::from_utf8(&content[..len]).map_err(|_| SystemError::EINVAL)?,
+                    )
+                };
+                if link_path.len() >= MAX_PATHLEN {
                     return Err(SystemError::ENAMETOOLONG);
                 }
-
-                // 将读到的数据转换为utf8字符串（先转为str，再转为String）
-                let link_path = String::from(
-                    ::core::str::from_utf8(&content[..len]).map_err(|_| SystemError::EINVAL)?,
-                );
 
                 // 拼接路径：将 symlink 目标 + 剩余路径组合
                 let new_path = if rest_path.is_empty() {
@@ -2348,7 +2409,7 @@ impl dyn IndexNode {
             result = inode;
         }
 
-        if trailing_slash && result.metadata()?.file_type != FileType::Dir {
+        if trailing_slash && lookup_metadata(&result)?.file_type != FileType::Dir {
             return Err(SystemError::ENOTDIR);
         }
 
@@ -2615,6 +2676,16 @@ pub trait FileSystem: Any + Sync + Send + Debug {
         name: &str,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         inode.find(name)
+    }
+
+    /// Cache-only mount-view lookup. The default must not bypass view-specific
+    /// name resolution (for example sysfs network namespaces).
+    fn cached_find_in_view(
+        &self,
+        _inode: &Arc<dyn IndexNode>,
+        _name: &str,
+    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+        Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
     }
 
     fn find_bytes_in_view(

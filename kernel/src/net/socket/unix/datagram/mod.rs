@@ -3,7 +3,6 @@ use crate::{
     filesystem::vfs::iov::IoVecs,
     filesystem::vfs::{
         fasync::{FAsyncItems, FASYNC_POLL_IN},
-        utils::DName,
         vcore::generate_inode_id,
         InodeId,
     },
@@ -19,7 +18,7 @@ use crate::{
                 EPollItems,
             },
             endpoint::Endpoint,
-            unix::{UnixEndpoint, UnixEndpointBound},
+            unix::{UnixBinding, UnixEndpoint, UnixEndpointBound, UnixSocketType},
             AddressFamily, Socket, PMSG, PSOCK, PSOL,
         },
     },
@@ -87,9 +86,10 @@ impl DatagramMessage {
 #[derive(Debug)]
 struct Inner {
     /// 本地绑定地址
-    local_addr: Option<UnixEndpointBound>,
+    local_addr: Option<UnixBinding>,
     /// 连接的对端地址（用于 connect 后的 send）
     peer_addr: Option<UnixEndpointBound>,
+    closed: bool,
     /// 接收队列 - 保存接收到的数据报
     recv_queue: VecDeque<DatagramMessage>,
     /// 接收队列的最大容量（消息数量）
@@ -103,6 +103,7 @@ impl Inner {
         Self {
             local_addr: None,
             peer_addr: None,
+            closed: false,
             recv_queue: VecDeque::new(),
             recv_queue_capacity: Self::DEFAULT_RECV_QUEUE_CAPACITY,
         }
@@ -116,23 +117,13 @@ impl Inner {
         if self.local_addr.is_some() {
             return endpoint.bind_unnamed();
         }
-        let bound_addr = endpoint.bind_in(netns)?;
+        let bound_addr = endpoint.bind_in(netns, UnixSocketType::Datagram)?;
         self.local_addr = Some(bound_addr);
         Ok(())
     }
 
-    fn connect(
-        &mut self,
-        endpoint: UnixEndpoint,
-        netns: &Arc<NetNamespace>,
-    ) -> Result<(), SystemError> {
-        let peer_addr = endpoint.connect_in(netns)?;
-        self.peer_addr = Some(peer_addr);
-        Ok(())
-    }
-
     fn local_endpoint(&self) -> Option<UnixEndpointBound> {
-        self.local_addr.clone()
+        self.local_addr.as_ref().map(UnixBinding::address)
     }
 
     fn peer_endpoint(&self) -> Option<UnixEndpointBound> {
@@ -140,6 +131,9 @@ impl Inner {
     }
 
     fn push_message(&mut self, msg: DatagramMessage) -> Result<(), SystemError> {
+        if self.closed {
+            return Err(SystemError::ECONNREFUSED);
+        }
         if self.recv_queue.len() >= self.recv_queue_capacity {
             return Err(SystemError::ENOBUFS);
         }
@@ -156,102 +150,44 @@ impl Inner {
     }
 }
 
-/// 抽象套接字的键：namespace ID + 抽象名称
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct AbstractSocketKey {
-    nsid: usize,
-    name: Arc<[u8]>,
-}
-
-impl AbstractSocketKey {
-    fn new(nsid: usize, name: Arc<[u8]>) -> Self {
-        Self { nsid, name }
-    }
-}
-
-/// 抽象名称绑定的 socket 表
-struct AbstractSocketTable {
-    inner: RwSem<HashMap<AbstractSocketKey, Weak<UnixDatagramSocket>>>,
-}
-
-impl AbstractSocketTable {
-    fn new() -> Self {
-        Self {
-            inner: RwSem::new(HashMap::new()),
-        }
-    }
-
-    fn insert(&self, nsid: usize, name: Arc<[u8]>, socket: Weak<UnixDatagramSocket>) {
-        self.inner
-            .write()
-            .insert(AbstractSocketKey::new(nsid, name), socket);
-    }
-
-    fn remove(&self, nsid: usize, name: Arc<[u8]>) -> Option<Weak<UnixDatagramSocket>> {
-        self.inner
-            .write()
-            .remove(&AbstractSocketKey::new(nsid, name))
-    }
-
-    fn get(&self, nsid: usize, name: Arc<[u8]>) -> Option<Arc<UnixDatagramSocket>> {
-        self.inner
-            .read()
-            .get(&AbstractSocketKey::new(nsid, name))
-            .and_then(Weak::upgrade)
-    }
-}
-
 /// Unix 域数据报 Socket 的绑定表
 /// 用于根据地址查找对应的 socket
 struct BindTable {
-    /// 路径绑定的 socket
-    path_sockets: RwSem<HashMap<DName, Weak<UnixDatagramSocket>>>,
-    /// 抽象名称绑定的 socket
-    abstract_sockets: AbstractSocketTable,
+    sockets: RwSem<HashMap<UnixEndpointBound, Weak<UnixDatagramSocket>>>,
 }
 
 impl BindTable {
     fn new() -> Self {
         Self {
-            path_sockets: RwSem::new(HashMap::new()),
-            abstract_sockets: AbstractSocketTable::new(),
+            sockets: RwSem::new(HashMap::new()),
         }
     }
 
-    fn register(&self, addr: &UnixEndpointBound, socket: &Arc<UnixDatagramSocket>) {
-        match addr {
-            UnixEndpointBound::Path(path) => {
-                self.path_sockets
-                    .write()
-                    .insert(path.clone(), Arc::downgrade(socket));
-            }
-            UnixEndpointBound::Abstract(handle) => {
-                self.abstract_sockets
-                    .insert(handle.nsid(), handle.name(), Arc::downgrade(socket));
-            }
+    fn register(
+        &self,
+        addr: &UnixEndpointBound,
+        socket: &Arc<UnixDatagramSocket>,
+    ) -> Result<(), SystemError> {
+        let mut sockets = self.sockets.write();
+        if sockets.get(addr).and_then(Weak::upgrade).is_some() {
+            return Err(SystemError::EADDRINUSE);
         }
+        sockets.insert(addr.clone(), Arc::downgrade(socket));
+        Ok(())
     }
 
-    fn unregister(&self, addr: &UnixEndpointBound) {
-        match addr {
-            UnixEndpointBound::Path(path) => {
-                self.path_sockets.write().remove(path);
-            }
-            UnixEndpointBound::Abstract(handle) => {
-                self.abstract_sockets.remove(handle.nsid(), handle.name());
-            }
+    fn unregister(&self, addr: &UnixEndpointBound, socket: &UnixDatagramSocket) {
+        let mut sockets = self.sockets.write();
+        if sockets
+            .get(addr)
+            .is_some_and(|entry| core::ptr::eq(entry.as_ptr(), socket))
+        {
+            sockets.remove(addr);
         }
     }
 
     fn lookup(&self, addr: &UnixEndpointBound) -> Option<Arc<UnixDatagramSocket>> {
-        match addr {
-            UnixEndpointBound::Path(path) => {
-                self.path_sockets.read().get(path).and_then(Weak::upgrade)
-            }
-            UnixEndpointBound::Abstract(handle) => {
-                self.abstract_sockets.get(handle.nsid(), handle.name())
-            }
-        }
+        self.sockets.read().get(addr).and_then(Weak::upgrade)
     }
 }
 
@@ -291,6 +227,13 @@ pub struct UnixDatagramSocket {
 }
 
 impl UnixDatagramSocket {
+    fn forget_dead_peer(&self, expected: &UnixEndpointBound) {
+        let mut inner = self.inner.lock();
+        if inner.peer_addr.as_ref() == Some(expected) {
+            inner.peer_addr = None;
+        }
+    }
+
     /// 默认的缓冲区大小
     pub const DEFAULT_BUF_SIZE: usize = 64 * 1024;
     pub const MIN_SOCKET_BUF_SIZE: usize = 1024;
@@ -329,43 +272,44 @@ impl UnixDatagramSocket {
     }
 
     /// 创建一对已连接的 Unix 数据报 socket
-    pub fn new_pair(is_nonblocking: bool) -> (Arc<Self>, Arc<Self>) {
+    pub fn new_pair(is_nonblocking: bool) -> Result<(Arc<Self>, Arc<Self>), SystemError> {
         let socket_a = Self::new(is_nonblocking);
         let socket_b = Self::new(is_nonblocking);
 
         let netns = socket_a.netns.clone();
 
         // 为每个 socket 分配一个临时的抽象地址
-        let addr_a = netns
-            .unix_abstract_table()
-            .alloc_ephemeral_abstract_name()
-            .ok();
-        let addr_b = netns
-            .unix_abstract_table()
-            .alloc_ephemeral_abstract_name()
-            .ok();
+        let addr_a = UnixBinding::abstract_name(
+            netns
+                .unix_abstract_table()
+                .alloc_ephemeral_abstract_name(UnixSocketType::Datagram)?,
+        );
+        let addr_b = UnixBinding::abstract_name(
+            netns
+                .unix_abstract_table()
+                .alloc_ephemeral_abstract_name(UnixSocketType::Datagram)?,
+        );
+
+        let peer_a = addr_a.address();
+        let peer_b = addr_b.address();
 
         // 设置本地和对端地址
         {
             let mut inner_a = socket_a.inner.lock();
-            inner_a.local_addr = addr_a.clone().map(UnixEndpointBound::Abstract);
-            inner_a.peer_addr = addr_b.clone().map(UnixEndpointBound::Abstract);
+            inner_a.local_addr = Some(addr_a);
+            inner_a.peer_addr = Some(peer_b.clone());
         }
         {
             let mut inner_b = socket_b.inner.lock();
-            inner_b.local_addr = addr_b.clone().map(UnixEndpointBound::Abstract);
-            inner_b.peer_addr = addr_a.clone().map(UnixEndpointBound::Abstract);
+            inner_b.local_addr = Some(addr_b);
+            inner_b.peer_addr = Some(peer_a.clone());
         }
 
         // 注册到绑定表
-        if let Some(ref addr) = addr_a {
-            BIND_TABLE.register(&UnixEndpointBound::Abstract(addr.clone()), &socket_a);
-        }
-        if let Some(ref addr) = addr_b {
-            BIND_TABLE.register(&UnixEndpointBound::Abstract(addr.clone()), &socket_b);
-        }
+        BIND_TABLE.register(&peer_a, &socket_a)?;
+        BIND_TABLE.register(&peer_b, &socket_b)?;
 
-        (socket_a, socket_b)
+        Ok((socket_a, socket_b))
     }
 
     pub fn ioctl_fionread(&self) -> usize {
@@ -666,27 +610,33 @@ impl Socket for UnixDatagramSocket {
 
     fn connect(&self, endpoint: Endpoint) -> Result<(), SystemError> {
         let unix_endpoint = UnixEndpoint::try_from(endpoint)?;
-        self.inner.lock().connect(unix_endpoint, &self.netns)
+        let peer_addr = unix_endpoint.connect_in(&self.netns, UnixSocketType::Datagram)?;
+        BIND_TABLE
+            .lookup(&peer_addr)
+            .ok_or(SystemError::ECONNREFUSED)?;
+        let mut inner = self.inner.lock();
+        if inner.closed {
+            return Err(SystemError::EBADF);
+        }
+        inner.peer_addr = Some(peer_addr);
+        Ok(())
     }
 
     fn bind(&self, endpoint: Endpoint) -> Result<(), SystemError> {
         let unix_endpoint = UnixEndpoint::try_from(endpoint)?;
 
-        // 先绑定地址
-        let (bound_addr, should_register) = {
-            let mut inner = self.inner.lock();
-            let was_unbound = inner.local_addr.is_none();
-            inner.bind(unix_endpoint, &self.netns)?;
-            (inner.local_addr.clone(), was_unbound)
-        };
-
-        // 注册到绑定表（filesystem / abstract）。
-        // 使用创建时保存的 Weak<Self> 来获取 Arc<Self>。
-        if should_register {
-            if let Some(addr) = bound_addr {
-                if let Some(this) = self.self_weak.upgrade() {
-                    BIND_TABLE.register(&addr, &this);
-                }
+        let mut inner = self.inner.lock();
+        if inner.closed {
+            return Err(SystemError::EBADF);
+        }
+        let was_unbound = inner.local_addr.is_none();
+        inner.bind(unix_endpoint, &self.netns)?;
+        if was_unbound {
+            let addr = inner.local_endpoint().ok_or(SystemError::EINVAL)?;
+            let this = self.self_weak.upgrade().ok_or(SystemError::EBADF)?;
+            if let Err(error) = BIND_TABLE.register(&addr, &this) {
+                inner.local_addr.take();
+                return Err(error);
             }
         }
 
@@ -1063,11 +1013,15 @@ impl Socket for UnixDatagramSocket {
             .inner
             .lock()
             .peer_endpoint()
-            .ok_or(SystemError::EDESTADDRREQ)?;
+            .ok_or(SystemError::ENOTCONN)?;
 
         let nonblock = self.is_nonblocking() || flags.contains(PMSG::DONTWAIT);
         if nonblock {
-            return Self::convert_enobufs_to_eagain(self.try_send_to(buffer, &peer_addr));
+            let result = Self::convert_enobufs_to_eagain(self.try_send_to(buffer, &peer_addr));
+            if result == Err(SystemError::ECONNREFUSED) {
+                self.forget_dead_peer(&peer_addr);
+            }
+            return result;
         }
 
         loop {
@@ -1078,6 +1032,10 @@ impl Socket for UnixDatagramSocket {
                         || self.send_buffer_available(buffer.len()),
                         self.send_timeout(),
                     )?;
+                }
+                Err(SystemError::ECONNREFUSED) => {
+                    self.forget_dead_peer(&peer_addr);
+                    return Err(SystemError::ECONNREFUSED);
                 }
                 Err(e) => return Err(e),
             }
@@ -1092,18 +1050,19 @@ impl Socket for UnixDatagramSocket {
         let buf = iovs.gather()?;
 
         // Resolve destination.
-        let target_addr = if !msg.msg_name.is_null() {
+        let connected_send = msg.msg_name.is_null();
+        let target_addr = if !connected_send {
             let endpoint = crate::net::posix::SockAddr::to_endpoint(
                 msg.msg_name as *const crate::net::posix::SockAddr,
                 msg.msg_namelen,
             )?;
             let unix_endpoint = UnixEndpoint::try_from(endpoint)?;
-            unix_endpoint.connect_in(&self.netns)?
+            unix_endpoint.connect_in(&self.netns, UnixSocketType::Datagram)?
         } else {
             self.inner
                 .lock()
                 .peer_endpoint()
-                .ok_or(SystemError::EDESTADDRREQ)?
+                .ok_or(SystemError::ENOTCONN)?
         };
 
         // Parse SCM_RIGHTS / SCM_CREDENTIALS from msg_control.
@@ -1161,12 +1120,16 @@ impl Socket for UnixDatagramSocket {
 
         let nonblock = self.is_nonblocking() || _flags.contains(PMSG::DONTWAIT);
         if nonblock {
-            return Self::convert_enobufs_to_eagain(self.try_send_to_with_rights(
+            let result = Self::convert_enobufs_to_eagain(self.try_send_to_with_rights(
                 &buf,
                 &target_addr,
                 rights_files,
                 force_creds,
             ));
+            if connected_send && result == Err(SystemError::ECONNREFUSED) {
+                self.forget_dead_peer(&target_addr);
+            }
+            return result;
         }
 
         loop {
@@ -1183,6 +1146,10 @@ impl Socket for UnixDatagramSocket {
                         self.send_timeout(),
                     )?;
                 }
+                Err(SystemError::ECONNREFUSED) if connected_send => {
+                    self.forget_dead_peer(&target_addr);
+                    return Err(SystemError::ECONNREFUSED);
+                }
                 Err(e) => return Err(e),
             }
         }
@@ -1195,7 +1162,7 @@ impl Socket for UnixDatagramSocket {
         address: Endpoint,
     ) -> Result<usize, SystemError> {
         let unix_endpoint = UnixEndpoint::try_from(address)?;
-        let target_addr = unix_endpoint.connect_in(&self.netns)?;
+        let target_addr = unix_endpoint.connect_in(&self.netns, UnixSocketType::Datagram)?;
 
         let nonblock = self.is_nonblocking() || flags.contains(PMSG::DONTWAIT);
         if nonblock {
@@ -1301,12 +1268,18 @@ impl Socket for UnixDatagramSocket {
     }
 
     fn do_close(&self) -> Result<(), SystemError> {
-        // 先从绑定表中注销，防止新消息进入
-        let inner = self.inner.lock();
-        if let Some(ref addr) = inner.local_addr {
-            BIND_TABLE.unregister(addr);
+        let mut inner = self.inner.lock();
+        if inner.closed {
+            return Ok(());
         }
+        inner.closed = true;
+        if let Some(ref addr) = inner.local_addr {
+            BIND_TABLE.unregister(&addr.address, self);
+        }
+        let local_addr = inner.local_addr.take();
+        inner.peer_addr.take();
         drop(inner);
+        drop(local_addr);
 
         // 清空接收队列并释放所有发送端记账
         // 注意：需要在获取 inner 锁之后操作，但释放记账时不能持有 inner 锁
@@ -1364,7 +1337,7 @@ impl Drop for UnixDatagramSocket {
         // 从绑定表中注销，释放地址
         let inner = self.inner.lock();
         if let Some(ref addr) = inner.local_addr {
-            BIND_TABLE.unregister(addr);
+            BIND_TABLE.unregister(&addr.address, self);
         }
         // 注意：不在这里释放接收队列中的记账
         // 因为 Drop 运行时其他 socket 可能已经被 drop，访问它们不安全

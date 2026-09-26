@@ -163,12 +163,12 @@ pub(super) fn do_socketpair(
             (a, b)
         }
         (AddressFamily::Unix, PSOCK::Datagram) => {
-            let (a, b) = UnixDatagramSocket::new_pair(nonblocking);
+            let (a, b) = UnixDatagramSocket::new_pair(nonblocking)?;
             (a, b)
         }
         // Linux supports AF_UNIX + SOCK_RAW and maps it to SOCK_DGRAM.
         (AddressFamily::Unix, PSOCK::Raw) => {
-            let (a, b) = UnixDatagramSocket::new_pair(nonblocking);
+            let (a, b) = UnixDatagramSocket::new_pair(nonblocking)?;
             (a, b)
         }
         _ => {

@@ -604,9 +604,42 @@ impl Socket for UnixStreamSocket {
         let backlog = get_backlog(&remote_addr)?;
 
         if self.is_nonblocking() {
-            self.try_connect(&backlog)
-        } else {
-            backlog.pause_until(|| self.try_connect(&backlog))
+            return self.try_connect(&backlog);
+        }
+
+        let timeout = self.send_timeout();
+        let started = Instant::now();
+        loop {
+            match self.try_connect(&backlog) {
+                Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
+                    let remaining = timeout.map(|limit| {
+                        let elapsed = Instant::now().saturating_sub(started);
+                        Duration::from_micros(
+                            limit.total_micros().saturating_sub(elapsed.total_micros()),
+                        )
+                    });
+                    let result = backlog.wait_for_space(remaining);
+
+                    // A wakeup can make the predicate true even if a signal is
+                    // pending. Preserve Linux's signal priority before retrying.
+                    if result == Err(SystemError::ERESTARTSYS)
+                        || crate::arch::ipc::signal::Signal::signal_pending_state(
+                            true,
+                            false,
+                            &ProcessManager::current_pcb(),
+                        )
+                    {
+                        return Err(if timeout.is_some() {
+                            SystemError::EINTR
+                        } else {
+                            SystemError::ERESTARTSYS
+                        });
+                    }
+
+                    result?;
+                }
+                result => return result,
+            }
         }
     }
 
@@ -632,7 +665,6 @@ impl Socket for UnixStreamSocket {
                 let config = ListenerConfig {
                     backlog,
                     is_seqpacket: self.is_seqpacket,
-                    wait_queue: self.wait_queue.clone(),
                     listener: self.self_weak.clone(),
                     sndbuf_effective: self.sndbuf.load(Ordering::Relaxed),
                     rcvbuf_effective: self.rcvbuf.load(Ordering::Relaxed),

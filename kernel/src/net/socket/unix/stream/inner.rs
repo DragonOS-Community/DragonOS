@@ -10,6 +10,7 @@ use crate::net::socket::unix::UCred;
 use crate::net::socket::unix::{UnixEndpoint, UnixEndpointBound};
 use crate::net::socket::Socket;
 use crate::process::namespace::net_namespace::NetNamespace;
+use crate::time::Duration;
 use alloc::collections::BTreeMap;
 use alloc::collections::VecDeque;
 use alloc::sync::{Arc, Weak};
@@ -117,7 +118,8 @@ impl Init {
             return Err((SystemError::EINVAL, self));
         };
 
-        Ok(Listener::new(addr, config))
+        Listener::new(addr.clone(), config)
+            .ok_or((SystemError::EADDRINUSE, Self { addr: Some(addr) }))
     }
 }
 
@@ -623,15 +625,15 @@ pub(super) struct Listener {
 }
 
 impl Listener {
-    pub(super) fn new(addr: UnixEndpointBound, config: ListenerConfig) -> Self {
+    pub(super) fn new(addr: UnixEndpointBound, config: ListenerConfig) -> Option<Self> {
         let params = BacklogParams {
             addr,
             is_shutdown: false,
             config,
         };
-        let backlog = BACKLOG_TABLE.add_backlog(params).unwrap();
+        let backlog = BACKLOG_TABLE.add_backlog(params)?;
 
-        Self { backlog }
+        Some(Self { backlog })
     }
 
     pub(super) fn endpoint(&self) -> Endpoint {
@@ -683,7 +685,7 @@ impl Listener {
 
 impl Drop for Listener {
     fn drop(&mut self) {
-        unregister_backlog(self.backlog.addr())
+        BACKLOG_TABLE.unregister_backlog(&self.backlog)
     }
 }
 
@@ -715,8 +717,19 @@ impl BacklogTable {
         self.backlog_sockets.read().get(addr).cloned()
     }
 
-    fn remove_backlog(&self, addr: &UnixEndpointBound) -> Option<Arc<Backlog>> {
-        self.backlog_sockets.write().remove(addr)
+    fn unregister_backlog(&self, backlog: &Arc<Backlog>) {
+        // Wait for any in-flight enqueue without holding the global table lock.
+        let pending = backlog.incoming_conns.lock().take();
+        {
+            let mut table = self.backlog_sockets.write();
+            if table
+                .get(backlog.addr())
+                .is_some_and(|entry| Arc::ptr_eq(entry, backlog))
+            {
+                table.remove(backlog.addr());
+            }
+        }
+        backlog.shutdown_pending(pending);
     }
 }
 
@@ -727,7 +740,6 @@ static BACKLOG_TABLE: BacklogTable = BacklogTable::new();
 pub(super) struct ListenerConfig {
     pub(super) backlog: usize,
     pub(super) is_seqpacket: bool,
-    pub(super) wait_queue: Arc<WaitQueue>,
     pub(super) listener: Weak<UnixStreamSocket>,
     pub(super) sndbuf_effective: usize,
     pub(super) rcvbuf_effective: usize,
@@ -749,7 +761,8 @@ pub(super) struct Backlog {
     sndbuf_effective: AtomicUsize,
     rcvbuf_effective: AtomicUsize,
     incoming_conns: Mutex<Option<VecDeque<Arc<UnixStreamSocket>>>>,
-    wait_queue: Arc<WaitQueue>,
+    /// Connectors wait for queue capacity, independently of accept's readability waiters.
+    connect_wait_queue: WaitQueue,
     listener: Weak<UnixStreamSocket>,
     is_seqpacket: bool,
     netns: Arc<NetNamespace>,
@@ -761,7 +774,6 @@ impl Backlog {
         let ListenerConfig {
             backlog,
             is_seqpacket,
-            wait_queue,
             listener,
             sndbuf_effective,
             rcvbuf_effective,
@@ -780,7 +792,7 @@ impl Backlog {
             sndbuf_effective: AtomicUsize::new(sndbuf_effective),
             rcvbuf_effective: AtomicUsize::new(rcvbuf_effective),
             incoming_conns: Mutex::new(incoming_sockets),
-            wait_queue,
+            connect_wait_queue: WaitQueue::default(),
             listener,
             is_seqpacket,
             netns,
@@ -817,6 +829,11 @@ impl Backlog {
         let conn = incoming_conns.pop_front();
         drop(guard);
 
+        if conn.is_some() {
+            self.connect_wait_queue
+                .wakeup(Some(crate::process::ProcessState::Blocked(true)));
+        }
+
         conn.ok_or(SystemError::EAGAIN_OR_EWOULDBLOCK)
     }
 
@@ -824,16 +841,14 @@ impl Backlog {
         let old_backlog = self.backlog.swap(backlog, Ordering::Relaxed);
 
         if old_backlog < backlog {
-            self.wait_queue
-                .wakeup(Some(crate::process::ProcessState::Blocked(true)));
+            self.connect_wait_queue
+                .wakeup_all(Some(crate::process::ProcessState::Blocked(true)));
         }
     }
 
-    fn shutdown_pending(&self) {
-        let pending = {
-            let mut guard = self.incoming_conns.lock();
-            guard.take()
-        };
+    fn shutdown_pending(&self, pending: Option<VecDeque<Arc<UnixStreamSocket>>>) {
+        self.connect_wait_queue
+            .wakeup_all(Some(crate::process::ProcessState::Blocked(true)));
 
         let Some(mut q) = pending else {
             return;
@@ -843,16 +858,6 @@ impl Backlog {
             let _ = sock.do_close();
         }
     }
-
-    // fn is_shutdown(&self) -> bool {
-    //     self.is_shutdown
-    // }
-
-    // fn shutdown(&self) {
-    //     *self.incoming_conns.lock() = None;
-    //     self.wait_queue
-    //         .wakeup_all(Some(crate::process::ProcessState::Blocked(true)));
-    // }
 
     fn check_io_events(&self) -> EPollEventType {
         if self
@@ -882,7 +887,7 @@ impl Backlog {
         let mut guard = self.incoming_conns.lock();
 
         let Some(incoming_conns) = &mut *guard else {
-            return Err((init, SystemError::EINVAL));
+            return Err((init, SystemError::ECONNREFUSED));
         };
 
         // Linux uses sk_acceptq_is_full(): ack_backlog > max_ack_backlog.
@@ -951,24 +956,20 @@ impl Backlog {
         Ok(client_conn)
     }
 
-    pub(super) fn pause_until<F>(&self, mut cond: F) -> Result<(), SystemError>
-    where
-        F: FnMut() -> Result<(), SystemError>,
-    {
-        wq_wait_event_interruptible!(
-            self.wait_queue,
-            match cond() {
-                Err(e) if e.eq(&SystemError::EAGAIN_OR_EWOULDBLOCK) => false,
-                _res => true,
-            },
-            {}
-        )
-    }
-}
+    /// Wait until a connect attempt can be retried or the listener is closed.
+    pub(super) fn wait_for_space(&self, timeout: Option<Duration>) -> Result<(), SystemError> {
+        let ready = || {
+            let guard = self.incoming_conns.lock();
+            guard
+                .as_ref()
+                .is_none_or(|incoming| incoming.len() <= self.backlog.load(Ordering::Relaxed))
+                .then_some(())
+        };
 
-fn unregister_backlog(addr: &UnixEndpointBound) {
-    if let Some(backlog) = BACKLOG_TABLE.remove_backlog(addr) {
-        backlog.shutdown_pending();
+        match timeout {
+            Some(timeout) => self.connect_wait_queue.wait_until_timeout(ready, timeout),
+            None => self.connect_wait_queue.wait_until_interruptible(ready),
+        }
     }
 }
 

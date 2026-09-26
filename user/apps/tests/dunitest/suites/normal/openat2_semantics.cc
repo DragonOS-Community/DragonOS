@@ -234,18 +234,17 @@ TEST_F(OpenAt2Test, CachedLookupOnTmpfs) {
     EXPECT_EQ(0, rmdir(path));
 }
 
-TEST_F(OpenAt2Test, CachedExt4NeverReturnsReplacedInode) {
-    struct statfs fs = {};
-    constexpr long kExt4Magic = 0xEF53;
-    if (statfs("/root", &fs) != 0 || fs.f_type != kExt4Magic) {
-        GTEST_SKIP() << "/root is not ext4";
-    }
-    char path[] = "/root/dunitest_cached_ext4_XXXXXX";
+TEST_F(OpenAt2Test, CachedLookupNeverReturnsReplacedInode) {
+    // CI's default root filesystem is FAT, while the Ubuntu profile uses
+    // ext4. Both must either return the current entry or request a retry;
+    // neither may return an inode replaced by rename.
+    char path[] = "/dunitest_cached_lookup_XXXXXX";
     ASSERT_NE(nullptr, mkdtemp(path)) << strerror(errno);
     int parent = open(path, O_PATH | O_DIRECTORY);
     ASSERT_GE(parent, 0) << strerror(errno);
     int first = openat(parent, "name", O_CREAT | O_WRONLY, 0600);
     ASSERT_GE(first, 0) << strerror(errno);
+    ASSERT_EQ(1, write(first, "a", 1));
     struct stat before = {};
     ASSERT_EQ(0, fstat(first, &before));
     ASSERT_EQ(0, close(first));
@@ -256,7 +255,9 @@ TEST_F(OpenAt2Test, CachedExt4NeverReturnsReplacedInode) {
     if (fd >= 0) {
         struct stat observed = {};
         ASSERT_EQ(0, fstat(fd, &observed));
+        EXPECT_EQ(before.st_dev, observed.st_dev);
         EXPECT_EQ(before.st_ino, observed.st_ino);
+        EXPECT_EQ(before.st_size, observed.st_size);
         EXPECT_EQ(0, close(fd));
     } else {
         EXPECT_EQ(EAGAIN, errno);
@@ -264,17 +265,25 @@ TEST_F(OpenAt2Test, CachedExt4NeverReturnsReplacedInode) {
 
     int replacement = openat(parent, "replacement", O_CREAT | O_WRONLY, 0600);
     ASSERT_GE(replacement, 0) << strerror(errno);
+    ASSERT_EQ(2, write(replacement, "bb", 2));
     struct stat after = {};
     ASSERT_EQ(0, fstat(replacement, &after));
-    ASSERT_NE(before.st_ino, after.st_ino);
+    ASSERT_NE(before.st_size, after.st_size);
     ASSERT_EQ(0, close(replacement));
     ASSERT_EQ(0, renameat(parent, "replacement", parent, "name"));
+    int current = openat(parent, "name", O_PATH);
+    ASSERT_GE(current, 0) << strerror(errno);
+    struct stat expected = {};
+    ASSERT_EQ(0, fstat(current, &expected));
+    ASSERT_EQ(0, close(current));
     errno = 0;
     fd = OpenAt2(parent, "name", cached);
     if (fd >= 0) {
         struct stat observed = {};
         ASSERT_EQ(0, fstat(fd, &observed));
-        EXPECT_EQ(after.st_ino, observed.st_ino);
+        EXPECT_EQ(expected.st_dev, observed.st_dev);
+        EXPECT_EQ(expected.st_ino, observed.st_ino);
+        EXPECT_EQ(expected.st_size, observed.st_size);
         EXPECT_EQ(0, close(fd));
     } else {
         EXPECT_EQ(EAGAIN, errno);

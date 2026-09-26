@@ -586,6 +586,14 @@ impl FileSystemMakerData for TmpfsMountData {
 }
 
 impl FileSystem for Tmpfs {
+    fn cached_find_in_view(
+        &self,
+        inode: &Arc<dyn IndexNode>,
+        name: &str,
+    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+        inode.cached_find(name)
+    }
+
     fn vma_open(
         &self,
         file: &Arc<File>,
@@ -1329,6 +1337,24 @@ impl IndexNode for LockedTmpfsInode {
         Ok(inode.metadata.clone())
     }
 
+    fn cached_metadata(&self) -> Result<Metadata, SystemError> {
+        Ok(self
+            .0
+            .try_lock()
+            .map_err(|_| SystemError::EAGAIN_OR_EWOULDBLOCK)?
+            .metadata
+            .clone())
+    }
+
+    fn cached_symlink_target(&self) -> Result<String, SystemError> {
+        self.0
+            .try_lock()
+            .map_err(|_| SystemError::EAGAIN_OR_EWOULDBLOCK)?
+            .inline_symlink
+            .clone()
+            .ok_or(SystemError::EAGAIN_OR_EWOULDBLOCK)
+    }
+
     fn set_metadata(&self, metadata: &Metadata) -> Result<(), SystemError> {
         let _guard = self.1.write();
         let mut inode = self.0.lock();
@@ -2027,6 +2053,34 @@ impl IndexNode for LockedTmpfsInode {
                     .ok_or(SystemError::ENOENT)?
                     .clone())
             }
+        }
+    }
+
+    fn cached_find(&self, name: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
+        let inode = self
+            .0
+            .try_lock()
+            .map_err(|_| SystemError::EAGAIN_OR_EWOULDBLOCK)?;
+        if inode.metadata.file_type != FileType::Dir {
+            return Err(SystemError::ENOTDIR);
+        }
+        match name {
+            "" | "." => inode
+                .self_ref
+                .upgrade()
+                .map(|inode| inode as Arc<dyn IndexNode>)
+                .ok_or(SystemError::ENOENT),
+            ".." => inode
+                .parent
+                .upgrade()
+                .map(|inode| inode as Arc<dyn IndexNode>)
+                .ok_or(SystemError::ENOENT),
+            name => inode
+                .children
+                .get(&DName::from(name))
+                .cloned()
+                .map(|child| child as Arc<dyn IndexNode>)
+                .ok_or(SystemError::EAGAIN_OR_EWOULDBLOCK),
         }
     }
 

@@ -303,6 +303,14 @@ impl Ext4MountOptions {
 }
 
 impl FileSystem for Ext4FileSystem {
+    fn cached_find_in_view(
+        &self,
+        inode: &Arc<dyn IndexNode>,
+        name: &str,
+    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+        inode.cached_find(name)
+    }
+
     fn begin_sync_writeback(&self) -> Option<alloc::boxed::Box<dyn vfs::FileSystemSyncGuard>> {
         self.begin_journal_sync().map(|guard| {
             alloc::boxed::Box::new(guard) as alloc::boxed::Box<dyn vfs::FileSystemSyncGuard>
@@ -827,6 +835,32 @@ impl Ext4FileSystem {
             return Err(SystemError::ESTALE);
         }
         inode.lifecycle().begin_operation().map(drop)
+    }
+
+    /// Cache-only counterpart: no lock may wait behind a cold lookup or
+    /// reclaim operation that could be performing filesystem I/O.
+    pub(super) fn validate_inode_cached(
+        &self,
+        inode: &Arc<LockedExt4Inode>,
+    ) -> Result<(), SystemError> {
+        let inode_num = inode
+            .inner
+            .try_lock()
+            .map_err(|_| SystemError::EAGAIN_OR_EWOULDBLOCK)?
+            .inner_inode_num;
+        let table = self
+            .inode_table
+            .try_lock()
+            .map_err(|_| SystemError::EAGAIN_OR_EWOULDBLOCK)?;
+        let entry = table
+            .get(&inode_num)
+            .ok_or(SystemError::EAGAIN_OR_EWOULDBLOCK)?;
+        if !Weak::ptr_eq(&entry.inode, &Arc::downgrade(inode))
+            || !Arc::ptr_eq(&entry.lifecycle, inode.lifecycle())
+        {
+            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+        }
+        inode.lifecycle().try_begin_operation().map(drop)
     }
 
     pub(super) fn begin_freeing(

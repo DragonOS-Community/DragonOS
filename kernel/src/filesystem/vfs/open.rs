@@ -365,12 +365,6 @@ pub(crate) fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usi
         if path.is_empty() {
             return Err(SystemError::ENOENT);
         }
-        if how.resolve.contains(OpenHowResolve::RESOLVE_CACHED) {
-            // MountFS has no nonblocking name-cache lookup contract yet. A
-            // cache-only request must not enter find_in_view or readlink.
-            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-        }
-
         // Check for a trailing slash on the path: if it ends with a slash, the target must be a directory
         let path_ends_with_slash = path.ends_with('/');
 
@@ -517,7 +511,11 @@ pub(crate) fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usi
                 options.validate_path(&resolved)?;
             }
         }
-        let metadata = inode.metadata()?;
+        let metadata = if how.resolve.contains(OpenHowResolve::RESOLVE_CACHED) {
+            inode.cached_metadata()?
+        } else {
+            inode.metadata()?
+        };
         let file_type: FileType = metadata.file_type;
 
         if how.o_flags.contains(FileFlags::__O_TMPFILE) {
@@ -535,8 +533,13 @@ pub(crate) fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usi
             let (_, mount_guard, _directory_operation) = resolved.into_parts();
             let tmp_path = ResolvedPath::from_existing_mount(tmpfile.inode(), mount_guard)?;
             let (tmp_inode, mount_guard, operation_guard) = tmp_path.into_parts();
-            let file =
-                File::new_with_mount_guard(tmp_inode, how.o_flags, mount_guard, operation_guard)?;
+            let file = File::new_with_mount_guard(
+                tmp_inode,
+                how.o_flags,
+                mount_guard,
+                operation_guard,
+                None,
+            )?;
             file.notify_open_event();
             drop(tmpfile);
             return Ok(file);
@@ -661,7 +664,15 @@ pub(crate) fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usi
                 mount_guard,
                 operation_guard,
             )?,
-            None => File::new_with_mount_guard(inode, how.o_flags, mount_guard, operation_guard)?,
+            None => File::new_with_mount_guard(
+                inode,
+                how.o_flags,
+                mount_guard,
+                operation_guard,
+                how.resolve
+                    .contains(OpenHowResolve::RESOLVE_CACHED)
+                    .then_some(metadata),
+            )?,
         };
 
         // Linux emits OPEN from do_dentry_open() before handle_truncate().

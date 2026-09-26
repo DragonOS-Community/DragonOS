@@ -73,10 +73,6 @@ unsafe extern "C" fn kernel_main(hartid: usize, fdt_paddr: usize) -> ! {
         BOOT_HARTID = hartid as u32;
         BOOT_FDT_PADDR = fdt_paddr;
     }
-    // 在安装 trap 向量之前先给 `tp` 一个有效的静态上下文：trap 入口
-    // (`handle_exception`) 会通过 `tp` 访问 `LocalContext`，而堆上的
-    // `LOCAL_CONTEXT` 要等 `mm_init` 之后才建立。否则早期同步异常会在
-    // trap 入口解引用空 `tp` 而无限递归。
     unsafe { super::cpu::init_boot_local_context(ProcessorId::new(BOOT_HARTID)) };
     setup_trap_vector();
     start_kernel();

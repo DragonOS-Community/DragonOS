@@ -180,9 +180,8 @@ impl LowAddressRemapping {
     pub unsafe fn remap_at_low_address(
         mapper: &mut crate::mm::page::PageMapper<MMArch, &mut BumpAllocator<MMArch>>,
     ) {
-        // 由 SBI 固件直接启动时（没有 DragonStub），不存在 kernel load info。
-        // 低地址重映射只服务于 SMP 启动，而 riscv64 目前尚未实现 SMP，
-        // 因此这种情况下没有需要映射的内容。
+        // Direct SBI boot has no DragonStub load info. Skip the low mapping
+        // used for SMP startup, which is not yet supported on riscv64.
         let Some(info) = efi_manager().kernel_load_info() else {
             return;
         };
@@ -207,8 +206,7 @@ impl LowAddressRemapping {
         let mut mapper = KernelMapper::lock();
         assert!(mapper.as_mut().is_some());
 
-        // 没有 kernel load info 时（例如由 SBI 固件直接启动），也就没有建立过
-        // 低地址映射，无需取消。
+        // No low mapping was created without load info.
         let Some(info) = efi_manager().kernel_load_info() else {
             return;
         };

@@ -112,30 +112,12 @@ impl Init {
         EPollEventType::EPOLLHUP | EPollEventType::EPOLLOUT
     }
 
-    pub(super) fn listen(
-        self,
-        backlog: usize,
-        is_seqpacket: bool,
-        wait_queue: Arc<WaitQueue>,
-        listener: Weak<UnixStreamSocket>,
-        sndbuf_effective: usize,
-        rcvbuf_effective: usize,
-        netns: Arc<NetNamespace>,
-    ) -> Result<Listener, (SystemError, Self)> {
+    pub(super) fn listen(self, config: ListenerConfig) -> Result<Listener, (SystemError, Self)> {
         let Some(addr) = self.addr else {
             return Err((SystemError::EINVAL, self));
         };
 
-        Ok(Listener::new(
-            addr,
-            backlog,
-            is_seqpacket,
-            wait_queue,
-            listener,
-            sndbuf_effective,
-            rcvbuf_effective,
-            netns,
-        ))
+        Ok(Listener::new(addr, config))
     }
 }
 
@@ -641,26 +623,11 @@ pub(super) struct Listener {
 }
 
 impl Listener {
-    pub(super) fn new(
-        addr: UnixEndpointBound,
-        backlog: usize,
-        is_seqpacket: bool,
-        wait_queue: Arc<WaitQueue>,
-        listener: Weak<UnixStreamSocket>,
-        sndbuf_effective: usize,
-        rcvbuf_effective: usize,
-        netns: Arc<NetNamespace>,
-    ) -> Self {
+    pub(super) fn new(addr: UnixEndpointBound, config: ListenerConfig) -> Self {
         let params = BacklogParams {
             addr,
-            backlog,
-            is_seqpacket,
             is_shutdown: false,
-            wait_queue,
-            listener,
-            sndbuf_effective,
-            rcvbuf_effective,
-            netns,
+            config,
         };
         let backlog = BACKLOG_TABLE.add_backlog(params).unwrap();
 
@@ -755,18 +722,24 @@ impl BacklogTable {
 
 static BACKLOG_TABLE: BacklogTable = BacklogTable::new();
 
+/// Socket state captured at `listen(2)` time that the resulting backlog needs.
+#[derive(Clone)]
+pub(super) struct ListenerConfig {
+    pub(super) backlog: usize,
+    pub(super) is_seqpacket: bool,
+    pub(super) wait_queue: Arc<WaitQueue>,
+    pub(super) listener: Weak<UnixStreamSocket>,
+    pub(super) sndbuf_effective: usize,
+    pub(super) rcvbuf_effective: usize,
+    pub(super) netns: Arc<NetNamespace>,
+}
+
 /// Parameters for creating a new backlog entry
 #[derive(Clone)]
 struct BacklogParams {
     addr: UnixEndpointBound,
-    backlog: usize,
-    is_seqpacket: bool,
     is_shutdown: bool,
-    wait_queue: Arc<WaitQueue>,
-    listener: Weak<UnixStreamSocket>,
-    sndbuf_effective: usize,
-    rcvbuf_effective: usize,
-    netns: Arc<NetNamespace>,
+    config: ListenerConfig,
 }
 
 #[derive(Debug)]
@@ -785,22 +758,32 @@ pub(super) struct Backlog {
 
 impl Backlog {
     fn new(params: BacklogParams) -> Self {
+        let ListenerConfig {
+            backlog,
+            is_seqpacket,
+            wait_queue,
+            listener,
+            sndbuf_effective,
+            rcvbuf_effective,
+            netns,
+        } = params.config;
+
         let incoming_sockets = if params.is_shutdown {
             None
         } else {
-            Some(VecDeque::with_capacity(params.backlog))
+            Some(VecDeque::with_capacity(backlog))
         };
 
         Self {
             addr: params.addr,
-            backlog: AtomicUsize::new(params.backlog),
-            sndbuf_effective: AtomicUsize::new(params.sndbuf_effective),
-            rcvbuf_effective: AtomicUsize::new(params.rcvbuf_effective),
+            backlog: AtomicUsize::new(backlog),
+            sndbuf_effective: AtomicUsize::new(sndbuf_effective),
+            rcvbuf_effective: AtomicUsize::new(rcvbuf_effective),
             incoming_conns: Mutex::new(incoming_sockets),
-            wait_queue: params.wait_queue,
-            listener: params.listener,
-            is_seqpacket: params.is_seqpacket,
-            netns: params.netns,
+            wait_queue,
+            listener,
+            is_seqpacket,
+            netns,
             _is_shutdown: params.is_shutdown,
         }
     }

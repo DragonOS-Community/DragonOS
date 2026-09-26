@@ -30,7 +30,7 @@ use crate::{
 use alloc::sync::{Arc, Weak};
 use core::num::Wrapping;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
-use inner::{Connected, Init, Inner, StreamReadOutcome};
+use inner::{Connected, Init, Inner, ListenerConfig, StreamReadOutcome};
 use system_error::SystemError;
 
 use crate::filesystem::vfs::iov::IoVecs;
@@ -629,17 +629,16 @@ impl Socket for UnixStreamSocket {
 
         let (inner, err) = match writer.take().expect("UnixStreamSocket inner is None") {
             Inner::Init(init) => {
-                let snd = self.sndbuf.load(Ordering::Relaxed);
-                let rcv = self.rcvbuf.load(Ordering::Relaxed);
-                match init.listen(
+                let config = ListenerConfig {
                     backlog,
-                    self.is_seqpacket,
-                    self.wait_queue.clone(),
-                    self.self_weak.clone(),
-                    snd,
-                    rcv,
-                    self.netns.clone(),
-                ) {
+                    is_seqpacket: self.is_seqpacket,
+                    wait_queue: self.wait_queue.clone(),
+                    listener: self.self_weak.clone(),
+                    sndbuf_effective: self.sndbuf.load(Ordering::Relaxed),
+                    rcvbuf_effective: self.rcvbuf.load(Ordering::Relaxed),
+                    netns: self.netns.clone(),
+                };
+                match init.listen(config) {
                     Ok(listener) => (Inner::Listener(listener), None),
                     Err((err, init)) => (Inner::Init(init), Some(err)),
                 }

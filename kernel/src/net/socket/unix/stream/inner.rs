@@ -7,7 +7,7 @@ use crate::net::socket::endpoint::Endpoint;
 use crate::net::socket::unix::ring_buffer::{RbConsumer, RbProducer, RingBuffer};
 use crate::net::socket::unix::stream::UnixStreamSocket;
 use crate::net::socket::unix::UCred;
-use crate::net::socket::unix::{UnixEndpoint, UnixEndpointBound};
+use crate::net::socket::unix::{UnixBinding, UnixEndpoint, UnixEndpointBound, UnixSocketType};
 use crate::net::socket::Socket;
 use crate::process::namespace::net_namespace::NetNamespace;
 use crate::time::Duration;
@@ -73,7 +73,7 @@ impl Inner {
 
 #[derive(Debug)]
 pub struct Init {
-    addr: Option<UnixEndpointBound>,
+    addr: Option<UnixBinding>,
     // todo shutdown
     // is_read_shutdown: AtomicBool,
     // is_write_shutdown: AtomicBool,
@@ -88,13 +88,14 @@ impl Init {
         &mut self,
         endpoint_to_bind: UnixEndpoint,
         netns: &Arc<NetNamespace>,
+        socket_type: UnixSocketType,
     ) -> Result<(), SystemError> {
         if self.addr.is_some() {
             log::error!("the socket is already bound");
             return endpoint_to_bind.bind_unnamed();
         }
 
-        let bound_addr = endpoint_to_bind.bind_in(netns)?;
+        let bound_addr = endpoint_to_bind.bind_in(netns, socket_type)?;
         self.addr = Some(bound_addr);
 
         Ok(())
@@ -106,7 +107,7 @@ impl Init {
     }
 
     pub(super) fn endpoint(&self) -> Option<Endpoint> {
-        self.addr.clone().map(|addr| addr.into())
+        self.addr.as_ref().map(|addr| addr.address().into())
     }
 
     pub(super) fn check_io_events(&self) -> EPollEventType {
@@ -118,14 +119,14 @@ impl Init {
             return Err((SystemError::EINVAL, self));
         };
 
-        Listener::new(addr.clone(), config)
-            .ok_or((SystemError::EADDRINUSE, Self { addr: Some(addr) }))
+        Listener::new(addr, config)
+            .map_err(|addr| (SystemError::EADDRINUSE, Self { addr: Some(addr) }))
     }
 }
 
 #[derive(Debug)]
 pub struct Connected {
-    addr: Option<UnixEndpointBound>,
+    addr: Option<UnixBinding>,
     peer_addr: Option<UnixEndpointBound>,
     reader: Mutex<RbConsumer<u8>>,
     writer: Mutex<RbProducer<u8>>,
@@ -133,21 +134,22 @@ pub struct Connected {
 
 impl Connected {
     pub(super) fn new_pair(
-        addr: Option<UnixEndpointBound>,
+        addr: Option<UnixBinding>,
         peer_addr: Option<UnixEndpointBound>,
     ) -> (Self, Self) {
         let (this_writer, peer_reader) = RingBuffer::new(UNIX_STREAM_DEFAULT_BUF_SIZE).split();
         let (peer_writer, this_reader) = RingBuffer::new(UNIX_STREAM_DEFAULT_BUF_SIZE).split();
 
+        let local_addr = addr.as_ref().map(UnixBinding::address);
         let this = Connected {
-            addr: addr.clone(),
+            addr,
             peer_addr: peer_addr.clone(),
             reader: Mutex::new(this_reader),
             writer: Mutex::new(this_writer),
         };
         let peer = Connected {
-            addr: peer_addr,
-            peer_addr: addr,
+            addr: peer_addr.map(UnixBinding::borrowed),
+            peer_addr: local_addr,
             reader: Mutex::new(peer_reader),
             writer: Mutex::new(peer_writer),
         };
@@ -158,13 +160,17 @@ impl Connected {
     pub(super) fn endpoint(&self) -> Endpoint {
         // Client sockets may connect without bind(2); getsockname(2) must not panic.
         self.addr
-            .clone()
-            .map(Into::into)
+            .as_ref()
+            .map(|addr| addr.address().into())
             .unwrap_or(Endpoint::Unix(UnixEndpoint::Unnamed))
     }
 
-    pub(super) fn set_endpoint(&mut self, addr: Option<UnixEndpointBound>) {
+    pub(super) fn set_endpoint(&mut self, addr: Option<UnixBinding>) {
         self.addr = addr;
+    }
+
+    pub(super) fn take_binding(&mut self) -> Option<UnixBinding> {
+        self.addr.take()
     }
 
     pub(super) fn peer_endpoint(&self) -> Option<UnixEndpointBound> {
@@ -180,12 +186,13 @@ impl Connected {
         &mut self,
         addr_to_bind: UnixEndpoint,
         netns: &Arc<NetNamespace>,
+        socket_type: UnixSocketType,
     ) -> Result<(), SystemError> {
         if self.addr.is_some() {
             return addr_to_bind.bind_unnamed();
         }
 
-        let bound_addr = addr_to_bind.bind_in(netns)?;
+        let bound_addr = addr_to_bind.bind_in(netns, socket_type)?;
         self.set_endpoint(Some(bound_addr));
 
         Ok(())
@@ -621,23 +628,27 @@ impl Connected {
 
 #[derive(Debug)]
 pub(super) struct Listener {
+    addr: UnixBinding,
     backlog: Arc<Backlog>,
 }
 
 impl Listener {
-    pub(super) fn new(addr: UnixEndpointBound, config: ListenerConfig) -> Option<Self> {
+    pub(super) fn new(addr: UnixBinding, config: ListenerConfig) -> Result<Self, UnixBinding> {
         let params = BacklogParams {
-            addr,
+            addr: addr.address(),
             is_shutdown: false,
             config,
         };
-        let backlog = BACKLOG_TABLE.add_backlog(params)?;
+        let backlog = match BACKLOG_TABLE.add_backlog(params) {
+            Ok(backlog) => backlog,
+            Err(()) => return Err(addr),
+        };
 
-        Some(Self { backlog })
+        Ok(Self { addr, backlog })
     }
 
     pub(super) fn endpoint(&self) -> Endpoint {
-        self.backlog.addr().clone().into()
+        self.addr.address().into()
     }
 
     pub fn listen(&self, backlog: usize) {
@@ -700,35 +711,35 @@ impl BacklogTable {
         }
     }
 
-    fn add_backlog(&self, params: BacklogParams) -> Option<Arc<Backlog>> {
+    fn add_backlog(&self, params: BacklogParams) -> Result<Arc<Backlog>, ()> {
         let mut guard = self.backlog_sockets.write();
         if guard.contains_key(&params.addr) {
-            return None;
+            return Err(());
         }
 
         let addr = params.addr.clone();
         let new_backlog = Arc::new(Backlog::new(params));
         guard.insert(addr, new_backlog.clone());
 
-        Some(new_backlog)
+        Ok(new_backlog)
     }
 
     fn get_backlog(&self, addr: &UnixEndpointBound) -> Option<Arc<Backlog>> {
-        self.backlog_sockets.read().get(addr).cloned()
+        let backlog = self.backlog_sockets.read().get(addr).cloned()?;
+        (!backlog.is_closed()).then_some(backlog)
     }
 
     fn unregister_backlog(&self, backlog: &Arc<Backlog>) {
-        // Wait for any in-flight enqueue without holding the global table lock.
+        // Close this listener first, without blocking unrelated table operations.
         let pending = backlog.incoming_conns.lock().take();
+        let mut table = self.backlog_sockets.write();
+        if table
+            .get(backlog.addr())
+            .is_some_and(|entry| Arc::ptr_eq(entry, backlog))
         {
-            let mut table = self.backlog_sockets.write();
-            if table
-                .get(backlog.addr())
-                .is_some_and(|entry| Arc::ptr_eq(entry, backlog))
-            {
-                table.remove(backlog.addr());
-            }
+            table.remove(backlog.addr());
         }
+        drop(table);
         backlog.shutdown_pending(pending);
     }
 }
@@ -747,7 +758,6 @@ pub(super) struct ListenerConfig {
 }
 
 /// Parameters for creating a new backlog entry
-#[derive(Clone)]
 struct BacklogParams {
     addr: UnixEndpointBound,
     is_shutdown: bool,
@@ -820,6 +830,10 @@ impl Backlog {
         &self.addr
     }
 
+    pub(super) fn is_closed(&self) -> bool {
+        self.incoming_conns.lock().is_none()
+    }
+
     fn pop_incoming(&self) -> Result<Arc<UnixStreamSocket>, SystemError> {
         let mut guard = self.incoming_conns.lock();
 
@@ -881,8 +895,14 @@ impl Backlog {
         client_rcvbuf_effective: usize,
     ) -> Result<Connected, (Init, SystemError)> {
         if is_seqpacket != self.is_seqpacket {
-            //todo 这里应该是专门为sock_stream和socket_seqpacket分别创建两个socket table
-            return Err((init, SystemError::ECONNREFUSED));
+            return Err((
+                init,
+                if matches!(self.addr, UnixEndpointBound::Path(_)) {
+                    SystemError::EPROTOTYPE
+                } else {
+                    SystemError::ECONNREFUSED
+                },
+            ));
         }
         let mut guard = self.incoming_conns.lock();
 
@@ -897,7 +917,7 @@ impl Backlog {
             return Err((init, SystemError::EAGAIN_OR_EWOULDBLOCK));
         }
 
-        let (client_conn, server_conn) = init.into_connected(self.addr.clone());
+        let (mut client_conn, server_conn) = init.into_connected(self.addr.clone());
 
         // Apply buffer sizes that may have been configured before connect.
         let client_snd_cap = super::ring_cap_for_effective_sockbuf(client_sndbuf_effective);
@@ -914,20 +934,37 @@ impl Backlog {
 
         debug_assert!(c2s_cap.is_power_of_two());
         debug_assert!(s2c_cap.is_power_of_two());
-        let restore_init = || Init {
-            addr: client_conn.addr.clone(),
-        };
         if let Err(e) = client_conn.resize_sendbuf(c2s_cap) {
-            return Err((restore_init(), e));
+            return Err((
+                Init {
+                    addr: client_conn.take_binding(),
+                },
+                e,
+            ));
         }
         if let Err(e) = server_conn.resize_recvbuf(c2s_cap) {
-            return Err((restore_init(), e));
+            return Err((
+                Init {
+                    addr: client_conn.take_binding(),
+                },
+                e,
+            ));
         }
         if let Err(e) = server_conn.resize_sendbuf(s2c_cap) {
-            return Err((restore_init(), e));
+            return Err((
+                Init {
+                    addr: client_conn.take_binding(),
+                },
+                e,
+            ));
         }
         if let Err(e) = client_conn.resize_recvbuf(s2c_cap) {
-            return Err((restore_init(), e));
+            return Err((
+                Init {
+                    addr: client_conn.take_binding(),
+                },
+                e,
+            ));
         }
 
         let server_socket =

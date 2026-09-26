@@ -1,0 +1,11 @@
+# Extraction/metadata for mem_mmap_lat (KEY=VALUE; parsed by run.sh)
+CATEGORY=memory
+BINARY=lat_mmap
+METRIC_TYPE=latency
+UNIT=microseconds
+BIGGER_IS_BETTER=0
+# lat_mmap prints "<size_MB> <latency_us>"; take the latency (last field).
+SEARCH_PATTERN=^[0-9]
+RESULT_INDEX=NF
+NTH_OCCURRENCE=1
+DESCRIPTION=Memory mmap latency via lat_mmap (4MB)

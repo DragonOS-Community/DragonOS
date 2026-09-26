@@ -1717,6 +1717,21 @@ pub struct MountFSInode {
     self_ref: Weak<MountFSInode>,
 }
 
+impl Drop for MountFSInode {
+    fn drop(&mut self) {
+        let mut cache = self.mount_fs.wrapper_cache.lock();
+        // Another lookup can replace this dead weak entry before its final
+        // strong owner's destructor obtains the lock. Remove only our own
+        // projection, never the concurrently created replacement.
+        if cache
+            .get(&self.dentry.id)
+            .is_some_and(|entry| Weak::ptr_eq(entry, &self.self_ref))
+        {
+            cache.remove(&self.dentry.id);
+        }
+    }
+}
+
 impl MountFS {
     /// Resolve one mount's superblock identity without performing backend I/O.
     /// Bind/copy callers supply their state explicitly; ordinary mounts may

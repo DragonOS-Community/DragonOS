@@ -1,0 +1,12 @@
+# Extraction/metadata for process_shell_lat (KEY=VALUE; parsed by run.sh)
+CATEGORY=process
+BINARY=lat_proc
+METRIC_TYPE=latency
+UNIT=microseconds
+BIGGER_IS_BETTER=0
+# lat_proc shell prints "Process fork+/bin/sh -c: <N> microseconds"; anchor "Process fork".
+# Requires /var/tmp/lmbench/hello (lmbench hello binary) at guest runtime.
+SEARCH_PATTERN=Process fork
+RESULT_INDEX=NF-1
+NTH_OCCURRENCE=1
+DESCRIPTION=Process fork+shell latency via lat_proc shell

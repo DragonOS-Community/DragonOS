@@ -1,6 +1,6 @@
 #!/bin/sh
 
-export PATH=/bin:/usr/bin:/usr/local/bin
+export PATH=/bin:/usr/bin:/usr/local/bin:/usr/sbin:/sbin
 
 echo "[rcS] Running system init script..."
 /bin/about.elf
@@ -64,4 +64,6 @@ if [ "$AUTO_TEST" = "syscall" ]; then
     /bin/busybox sh $SYSCALL_TEST_DIR/run_tests.sh
 elif [ "$AUTO_TEST" = "dunit" ]; then
     /bin/busybox sh $DUNITEST_DIR/run_tests.sh
+elif [ "$AUTO_TEST" = "benchmark" ]; then
+    /bin/busybox sh $BENCHMARK_TEST_DIR/run.sh
 fi

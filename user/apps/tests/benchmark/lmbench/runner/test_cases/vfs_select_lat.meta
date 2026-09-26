@@ -1,0 +1,11 @@
+# Extraction/metadata for vfs_select_lat (KEY=VALUE; parsed by run.sh)
+CATEGORY=vfs
+BINARY=lat_select
+METRIC_TYPE=latency
+UNIT=microseconds
+BIGGER_IS_BETTER=0
+# lat_select file prints "Select on <N> fd's: <M> microseconds".
+SEARCH_PATTERN=Select on
+RESULT_INDEX=NF-1
+NTH_OCCURRENCE=1
+DESCRIPTION=select on file fd latency via lat_select file

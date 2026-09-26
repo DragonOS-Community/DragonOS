@@ -1,0 +1,11 @@
+# Extraction/metadata for vfs_fcntl_lat (KEY=VALUE; parsed by run.sh)
+CATEGORY=vfs
+BINARY=lat_fcntl
+METRIC_TYPE=latency
+UNIT=microseconds
+BIGGER_IS_BETTER=0
+# lat_fcntl prints "Fcntl lock latency: <N> microseconds".
+SEARCH_PATTERN=Fcntl lock latency
+RESULT_INDEX=NF-1
+NTH_OCCURRENCE=1
+DESCRIPTION=fcntl lock latency via lat_fcntl

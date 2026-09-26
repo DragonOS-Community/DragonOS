@@ -115,6 +115,11 @@
               testDir = "/opt/gvisor";
               version = "20251218";
             };
+            bwrap = {
+              enable = true;
+              testDir = "/opt/tests/bwrap";
+              version = "20260525";
+            };
             dunitest = {
               enable = true;
               testDir = "/opt/tests/dunitest";

@@ -386,9 +386,13 @@ impl MemoryManagementArch for RiscV64MMArch {
     const PAGE_SHARED: usize = Self::PAGE_WRITE;
     const PAGE_SHARED_EXEC: usize = Self::PAGE_WRITE_EXEC;
 
-    const PAGE_COPY_NOEXEC: usize = 0;
-    const PAGE_READONLY: usize = 0;
-    const PAGE_READONLY_EXEC: usize = 0;
+    // These are used by `vm_get_page_prot`/`VMA::set_flags` when a mapping's
+    // protection is recomputed (e.g. the ELF loader's temporary-write ->
+    // final-protection mprotect). They must carry the present/user/accessed
+    // base bits; zeroing them made every R/RX remap publish a non-present PTE.
+    const PAGE_COPY_NOEXEC: usize = Self::PAGE_COPY;
+    const PAGE_READONLY: usize = Self::PAGE_READ;
+    const PAGE_READONLY_EXEC: usize = Self::PAGE_READ_EXEC;
 
     const PROTECTION_MAP: [EntryFlags<MMArch>; 16] = protection_map();
 
@@ -399,15 +403,29 @@ impl MemoryManagementArch for RiscV64MMArch {
 
 const fn protection_map() -> [EntryFlags<MMArch>; 16] {
     let mut map = [0; 16];
+    // riscv64 has no user page-fault handler (`PAGE_FAULT_ENABLED == false`), so
+    // a private writable mapping cannot rely on a write fault to become
+    // writable and must be published writable directly. Fault-capable
+    // architectures keep the read-only COW encoding.
+    let private_write = if MMArch::PAGE_FAULT_ENABLED {
+        MMArch::PAGE_COPY
+    } else {
+        MMArch::PAGE_WRITE | MMArch::ENTRY_FLAG_DIRTY
+    };
+    let private_write_exec = if MMArch::PAGE_FAULT_ENABLED {
+        MMArch::PAGE_COPY_EXEC
+    } else {
+        MMArch::PAGE_WRITE_EXEC | MMArch::ENTRY_FLAG_DIRTY
+    };
     map[VmFlags::VM_NONE.bits()] = MMArch::PAGE_NONE;
     map[VmFlags::VM_READ.bits()] = MMArch::PAGE_READONLY;
-    map[VmFlags::VM_WRITE.bits()] = MMArch::PAGE_COPY;
-    map[VmFlags::VM_WRITE.bits() | VmFlags::VM_READ.bits()] = MMArch::PAGE_COPY;
+    map[VmFlags::VM_WRITE.bits()] = private_write;
+    map[VmFlags::VM_WRITE.bits() | VmFlags::VM_READ.bits()] = private_write;
     map[VmFlags::VM_EXEC.bits()] = MMArch::PAGE_READONLY_EXEC;
     map[VmFlags::VM_EXEC.bits() | VmFlags::VM_READ.bits()] = MMArch::PAGE_READONLY_EXEC;
-    map[VmFlags::VM_EXEC.bits() | VmFlags::VM_WRITE.bits()] = MMArch::PAGE_COPY_EXEC;
+    map[VmFlags::VM_EXEC.bits() | VmFlags::VM_WRITE.bits()] = private_write_exec;
     map[VmFlags::VM_EXEC.bits() | VmFlags::VM_WRITE.bits() | VmFlags::VM_READ.bits()] =
-        MMArch::PAGE_COPY_EXEC;
+        private_write_exec;
     map[VmFlags::VM_SHARED.bits()] = MMArch::PAGE_NONE;
     map[VmFlags::VM_SHARED.bits() | VmFlags::VM_READ.bits()] = MMArch::PAGE_READONLY;
     map[VmFlags::VM_SHARED.bits() | VmFlags::VM_WRITE.bits()] = MMArch::PAGE_SHARED;

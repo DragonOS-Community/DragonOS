@@ -71,7 +71,8 @@ impl Iterator for EFIMemoryDescIter<'_> {
     type Item = MemoryDescriptor;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.offset + size_of::<Self::Item>() > self.inner.size {
+        let stride = self.inner.desc_size;
+        if self.offset + stride > self.inner.size {
             return None;
         }
 
@@ -81,7 +82,7 @@ impl Iterator for EFIMemoryDescIter<'_> {
         }
 
         let vaddr = self.inner.vaddr? + self.offset;
-        self.offset += size_of::<Self::Item>();
+        self.offset += stride;
         let res = unsafe { *(vaddr.data() as *const Self::Item) };
         return Some(res);
     }

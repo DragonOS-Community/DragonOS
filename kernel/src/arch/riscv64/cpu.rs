@@ -19,7 +19,7 @@ pub fn current_cpu_id() -> ProcessorId {
     let ptr: *const LocalContext = riscv::register::tp::read() as *const LocalContext;
 
     if core::intrinsics::unlikely(ptr.is_null()) {
-        return boot_params().read_irqsave().arch.boot_hartid;
+        return ProcessorId::new(unsafe { super::init::BOOT_HARTID });
     }
 
     unsafe { (*ptr).current_cpu() }
@@ -39,6 +39,21 @@ pub unsafe fn cpu_reset() -> ! {
 }
 
 static mut LOCAL_CONTEXT: Option<PerCpuVar<LocalContext>> = None;
+
+/// Provides a valid `tp` for early traps before heap-backed contexts are available.
+static mut BOOT_LOCAL_CONTEXT: core::mem::MaybeUninit<LocalContext> =
+    core::mem::MaybeUninit::uninit();
+
+/// Sets up the boot context before installing the trap vector.
+///
+/// # Safety
+/// Call only once on the boot hart, before `init_local_context()`.
+pub(super) unsafe fn init_boot_local_context(cpu: ProcessorId) {
+    let ctx = &raw mut BOOT_LOCAL_CONTEXT;
+    (*ctx).write(LocalContext::new(cpu));
+    riscv::register::sscratch::write(0);
+    riscv::register::tp::write(ctx as usize);
+}
 
 #[inline(always)]
 pub(super) fn local_context() -> &'static PerCpuVar<LocalContext> {

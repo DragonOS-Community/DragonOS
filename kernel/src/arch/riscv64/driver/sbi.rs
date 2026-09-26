@@ -1,4 +1,5 @@
 use core::ptr::addr_of;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 /// 向控制台打印字符串。
 ///
@@ -20,7 +21,27 @@ use core::ptr::addr_of;
 /// console_putstr(message);
 /// ```
 pub fn console_putstr(s: &[u8]) {
-    // 原本的是适配opensbi的, 但是对rustsbi的适配存在问题, 不能正确的解析'\r'
+    SbiDriver::ensure_probed();
+
+    // Prefer DBCN for firmware that does not provide the legacy console.
+    if SbiDriver::extensions().contains(SBIExtensions::CONSOLE) {
+        for &c in s {
+            match c {
+                b'\n' => {
+                    sbi_rt::console_write_byte(b'\r');
+                    sbi_rt::console_write_byte(b'\n');
+                }
+                b'\r' => {
+                    sbi_rt::console_write_byte(b'\r');
+                }
+                _ => {
+                    sbi_rt::console_write_byte(c);
+                }
+            }
+        }
+        return;
+    }
+
     for &c in s {
         match c {
             b'\n' => {
@@ -72,6 +93,8 @@ bitflags! {
 
 static mut EXTENSIONS: SBIExtensions = SBIExtensions::empty();
 
+static PROBED: AtomicBool = AtomicBool::new(false);
+
 #[derive(Debug)]
 pub struct SbiDriver;
 
@@ -80,6 +103,15 @@ impl SbiDriver {
     pub fn early_init() {
         unsafe {
             EXTENSIONS = Self::probe_extensions();
+        }
+        PROBED.store(true, Ordering::SeqCst);
+    }
+
+    /// Early logging may precede `early_init`; probe before choosing a console.
+    #[inline]
+    fn ensure_probed() {
+        if !PROBED.load(Ordering::SeqCst) {
+            Self::early_init();
         }
     }
 

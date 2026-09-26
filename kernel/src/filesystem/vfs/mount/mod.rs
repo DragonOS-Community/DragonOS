@@ -1732,6 +1732,72 @@ impl Drop for MountFSInode {
     }
 }
 
+/// Exercise wrapper-cache replacement against the real `MountFSInode::drop`
+/// path. Each invocation owns a private mount, so concurrent debugfs readers
+/// cannot share cache state or perturb a live namespace.
+pub(crate) fn run_mount_wrapper_cache_debug_selftest() -> Result<String, SystemError> {
+    let inner: Arc<dyn FileSystem> = crate::filesystem::ramfs::RamFS::new();
+    let mount = MountFS::new(
+        inner,
+        None,
+        None,
+        MountPropagation::new_private(),
+        None,
+        MountFlags::empty(),
+        None,
+    )?;
+    if let Err(error) = mount.activate() {
+        mount.deactivate();
+        return Err(error);
+    }
+
+    let old = mount.mountpoint_root_inode();
+    let dentry = old.dentry.clone();
+    let replacement = Arc::new_cyclic(|self_ref| MountFSInode {
+        dentry: dentry.clone(),
+        mount_fs: mount.clone(),
+        self_ref: self_ref.clone(),
+    });
+    mount
+        .wrapper_cache
+        .lock()
+        .insert(dentry.id, Arc::downgrade(&replacement));
+
+    // This is the exact state reached when lookup replaces an expired Weak
+    // before the old wrapper's destructor obtains wrapper_cache. Dropping the
+    // old object now invokes the production destructor; an unconditional
+    // removal would erase `replacement` and fail the lookup identity check.
+    drop(old);
+    let resolved = mount.mountpoint_root_inode();
+    let replacement_survives_old_drop = Arc::ptr_eq(&resolved, &replacement)
+        && mount
+            .wrapper_cache
+            .lock()
+            .get(&dentry.id)
+            .and_then(Weak::upgrade)
+            .is_some_and(|cached| Arc::ptr_eq(&cached, &replacement));
+
+    drop(resolved);
+    drop(replacement);
+    let replacement_final_drop = !mount.wrapper_cache.lock().contains_key(&dentry.id);
+    mount.deactivate();
+
+    Ok(alloc::format!(
+        "status={}\nreplacement_survives_old_drop={}\nreplacement_final_drop={}\n",
+        if replacement_survives_old_drop && replacement_final_drop {
+            "ok"
+        } else {
+            "fail"
+        },
+        if replacement_survives_old_drop {
+            "ok"
+        } else {
+            "fail"
+        },
+        if replacement_final_drop { "ok" } else { "fail" },
+    ))
+}
+
 impl MountFS {
     /// Resolve one mount's superblock identity without performing backend I/O.
     /// Bind/copy callers supply their state explicitly; ordinary mounts may

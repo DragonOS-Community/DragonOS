@@ -343,6 +343,7 @@ pub struct Transaction<'a> {
     retired: Vec<RetiredRange>,
     preserve_originals: bool,
     owns_writer: bool,
+    orphan_index: Option<Arc<AtomicBool>>,
 }
 
 impl Transaction<'_> {
@@ -358,8 +359,19 @@ impl Transaction<'_> {
             retired: Vec::new(),
             preserve_originals,
             owns_writer: true,
+            orphan_index: None,
         }
     }
+    /// The caller owns the exclusive metadata gate until this transaction is
+    /// consumed. Index changes are provisional until logical publication.
+    pub(super) fn track_orphan_index(&mut self, valid: Arc<AtomicBool>) {
+        if let Some(previous) = &self.orphan_index {
+            debug_assert!(Arc::ptr_eq(previous, &valid));
+        } else {
+            self.orphan_index = Some(valid);
+        }
+    }
+
     /// Replace the final image for `home`.  Re-staging the same home block does
     /// not consume another credit and subsequent reads observe the replacement.
     pub fn stage(&mut self, home: PBlockId, image: Box<[u8; BLOCK_SIZE]>) -> Result<()> {
@@ -514,6 +526,9 @@ impl Transaction<'_> {
             return Err(Ext4Error::new(ErrCode::EINVAL));
         };
         let result = core.publish(&mut self.staged, &mut self.retired, publisher);
+        if result.is_ok() {
+            self.orphan_index = None;
+        }
         self.release_writer();
         result
     }
@@ -620,6 +635,7 @@ impl Transaction<'_> {
             return self.fail(error, CommitFailure::CommitUncertain, true);
         }
         publisher.publish_home_current(&self.staged, &self.retired);
+        self.orphan_index = None;
         self.release_writer();
         Ok(())
     }
@@ -669,6 +685,7 @@ impl Transaction<'_> {
             }
         }
         publisher.publish_home_current(&self.staged, &self.retired);
+        self.orphan_index = None;
         self.release_writer();
         Ok(())
     }
@@ -685,6 +702,9 @@ impl Transaction<'_> {
         let result = core.commit_images(device, &images, || {
             publisher.publish_home_current(&self.staged, &self.retired)
         });
+        if result.is_ok() {
+            self.orphan_index = None;
+        }
         self.release_writer();
         result
     }
@@ -974,6 +994,9 @@ impl JournalTransactionCore {
 
 impl Drop for Transaction<'_> {
     fn drop(&mut self) {
+        if let Some(valid) = self.orphan_index.take() {
+            valid.store(false, Ordering::Release);
+        }
         self.release_writer();
     }
 }
@@ -1345,6 +1368,77 @@ mod tests {
     impl CachePublisher for Publisher {
         fn publish(&self, blocks: &BTreeMap<PBlockId, StagedBlock>) {
             self.0.fetch_add(blocks.len(), Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn orphan_index_is_invalidated_by_abort_drop_and_commit_failure() {
+        for action in 0..3 {
+            let valid = Arc::new(AtomicBool::new(true));
+            let device = MemoryDevice::new();
+            let publisher = Publisher(AtomicUsize::new(0));
+            let core = DirectTransactionCore::new(128).unwrap();
+            let mut operation = core.start(1).unwrap();
+            operation.track_orphan_index(valid.clone());
+            operation.stage(2, Box::new([2; BLOCK_SIZE])).unwrap();
+            match action {
+                0 => operation.abort(),
+                1 => drop(operation),
+                _ => {
+                    device.fail_at.store(0, Ordering::SeqCst);
+                    assert!(operation.commit(&device, &publisher).is_err());
+                }
+            }
+            assert!(!valid.load(Ordering::Acquire));
+        }
+    }
+
+    #[test]
+    fn orphan_index_survives_successful_logical_publication() {
+        let device = MemoryDevice::new();
+        let publisher = Publisher(AtomicUsize::new(0));
+        let direct = DirectTransactionCore::new(128).unwrap();
+        let valid = Arc::new(AtomicBool::new(true));
+        let mut operation = direct.start(1).unwrap();
+        operation.track_orphan_index(valid.clone());
+        operation.stage(2, Box::new([2; BLOCK_SIZE])).unwrap();
+        operation.commit(&device, &publisher).unwrap();
+        assert!(valid.load(Ordering::Acquire));
+
+        let journal = JournalTransactionCore::new(context_with_ring(64, 1)).unwrap();
+        let mut operation = staged_journal_transaction(&journal, 1);
+        operation.track_orphan_index(valid.clone());
+        operation.commit(&device, &publisher).unwrap();
+        assert!(valid.load(Ordering::Acquire));
+
+        let batch = JournalBatchCore::new(context_with_ring(64, 1), 32).unwrap();
+        let mut operation = batch.start(1).unwrap();
+        operation.track_orphan_index(valid.clone());
+        operation.stage(2, Box::new([3; BLOCK_SIZE])).unwrap();
+        operation.publish(&publisher).unwrap();
+        assert!(valid.load(Ordering::Acquire));
+        // A newer operation's abort invalidates the current logical index;
+        // checkpointing the older accepted batch must not revive it.
+        let mut aborted = batch.start(1).unwrap();
+        aborted.track_orphan_index(valid.clone());
+        aborted.abort();
+        batch.request_seal();
+        batch.commit_pending(&device).unwrap();
+        assert!(!valid.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn orphan_index_is_invalidated_at_every_journal_failure_boundary() {
+        for failure in 0..14 {
+            let device = MemoryDevice::new();
+            device.fail_at.store(failure, Ordering::SeqCst);
+            let publisher = Publisher(AtomicUsize::new(0));
+            let journal = JournalTransactionCore::new(context_with_ring(64, 1)).unwrap();
+            let valid = Arc::new(AtomicBool::new(true));
+            let mut operation = staged_journal_transaction(&journal, 1);
+            operation.track_orphan_index(valid.clone());
+            let result = operation.commit(&device, &publisher);
+            assert_eq!(valid.load(Ordering::Acquire), result.is_ok());
         }
     }
 

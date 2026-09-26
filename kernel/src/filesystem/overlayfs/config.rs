@@ -7,9 +7,9 @@ pub(super) const OVL_MAX_STACK: usize = 500;
 
 #[derive(Debug)]
 pub struct OverlayMountData {
-    pub(super) upper_dir: String,
+    pub(super) upper_dir: Option<String>,
     pub(super) lower_dirs: Vec<String>,
-    pub(super) work_dir: String,
+    pub(super) work_dir: Option<String>,
 }
 
 impl OverlayMountData {
@@ -36,10 +36,17 @@ impl OverlayMountData {
             }
         }
 
+        let lower_dirs = lower_dirs.ok_or(SystemError::EINVAL)?;
+        if (upper_dir.is_none() && lower_dirs.len() < 2)
+            || (upper_dir.is_some() && work_dir.is_none())
+        {
+            return Err(SystemError::EINVAL);
+        }
+
         Ok(OverlayMountData {
-            upper_dir: upper_dir.ok_or(SystemError::EINVAL)?,
-            lower_dirs: lower_dirs.ok_or(SystemError::EINVAL)?,
-            work_dir: work_dir.ok_or(SystemError::EINVAL)?,
+            upper_dir,
+            lower_dirs,
+            work_dir,
         })
     }
 

@@ -2649,6 +2649,12 @@ pub trait FileSystem: Any + Sync + Send + Debug {
     /// @brief 获取当前文件系统的root inode的指针
     fn root_inode(&self) -> Arc<dyn IndexNode>;
 
+    /// Superblock flags intrinsic to this filesystem instance. Applied when a
+    /// new mount superblock state is created, independently of caller flags.
+    fn required_superblock_flags(&self) -> mount::MountFlags {
+        mount::MountFlags::empty()
+    }
+
     /// Optional canonical state for repeated mounts of this filesystem.
     /// A backend opting in must return the same state for its whole lifetime,
     /// with no I/O, and recreate the backend only after final shutdown. VFS

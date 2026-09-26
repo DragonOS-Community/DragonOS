@@ -103,6 +103,7 @@ pub(super) fn write_at_with_sync(
     sync_intent: vfs::WriteSyncIntent,
     data: crate::libs::mutex::MutexGuard<vfs::FilePrivateData>,
 ) -> Result<vfs::DelegatedWriteResult, SystemError> {
+    inode.overlay_fs()?.require_upper()?;
     if len == 0 {
         let (backing_file, _) = backing_file_for_io(inode, data)?;
         return backing_file.pwrite_with_sync_intent(offset, len, buf, sync_intent);

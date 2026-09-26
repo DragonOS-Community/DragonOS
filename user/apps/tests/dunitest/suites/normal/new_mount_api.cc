@@ -6,9 +6,12 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/mount.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
+#include <sys/xattr.h>
 #include <unistd.h>
 
 #include <string>
@@ -559,6 +562,194 @@ TEST_F(NewMountApiTest, OverlayFsconfigPinsLayerAtParameterTime) {
         << strerror(errno);
     close(treefd);
     EXPECT_TRUE(exists(dst() + "/marker"));
+}
+
+TEST_F(NewMountApiTest, OverlayLowerOnlyMountIsReadOnly) {
+    ASSERT_EQ(0, make_dir(src())) << strerror(errno);
+    ASSERT_EQ(0, make_dir(dst())) << strerror(errno);
+    ASSERT_EQ(0, mount("tmpfs", src().c_str(), "tmpfs", 0, nullptr)) << strerror(errno);
+    const std::string lower1 = src() + "/lower1";
+    const std::string lower2 = src() + "/lower2";
+    ASSERT_EQ(0, make_dir(lower1)) << strerror(errno);
+    ASSERT_EQ(0, make_dir(lower2)) << strerror(errno);
+    ASSERT_EQ(0, write_marker(lower1 + "/marker")) << strerror(errno);
+
+    const int fsfd = fsopen_type("overlay", kFsopenCloexec);
+    ASSERT_GE(fsfd, 0) << strerror(errno);
+    const std::string lowers = lower1 + ":" + lower2;
+    ASSERT_EQ(0, fsconfig_call(fsfd, kFsconfigSetString, "lowerdir", lowers.c_str(), 0))
+        << strerror(errno);
+    ASSERT_EQ(0, fsconfig_call(fsfd, kFsconfigCreate, nullptr, nullptr, 0))
+        << strerror(errno);
+    const int treefd = fsmount_fd(fsfd, kFsmountCloexec, 0);
+    close(fsfd);
+    ASSERT_GE(treefd, 0) << strerror(errno);
+    ASSERT_EQ(0, move_mount_at(treefd, "", AT_FDCWD, dst().c_str(),
+                               kMoveMountFromEmptyPath)) << strerror(errno);
+    close(treefd);
+    EXPECT_TRUE(exists(dst() + "/marker"));
+
+    struct statvfs fsstat = {};
+    ASSERT_EQ(0, statvfs(dst().c_str(), &fsstat)) << strerror(errno);
+    EXPECT_NE(0UL, fsstat.f_flag & ST_RDONLY);
+
+    errno = 0;
+    EXPECT_EQ(-1, open((dst() + "/marker").c_str(), O_WRONLY));
+    EXPECT_EQ(EROFS, errno);
+    const int readonly_fd = open((dst() + "/marker").c_str(), O_RDONLY);
+    ASSERT_GE(readonly_fd, 0) << strerror(errno);
+    errno = 0;
+    EXPECT_EQ(-1, fchmod(readonly_fd, 0600));
+    EXPECT_EQ(EROFS, errno);
+    errno = 0;
+    EXPECT_EQ(-1, fsetxattr(readonly_fd, "user.lower_only", "x", 1, 0));
+    EXPECT_EQ(EROFS, errno);
+    errno = 0;
+    EXPECT_EQ(MAP_FAILED, mmap(nullptr, 4096, PROT_READ | PROT_WRITE, MAP_SHARED,
+                               readonly_fd, 0));
+    EXPECT_EQ(EACCES, errno);
+    void* readable_map = mmap(nullptr, 4096, PROT_READ, MAP_SHARED, readonly_fd, 0);
+    ASSERT_NE(MAP_FAILED, readable_map) << strerror(errno);
+    errno = 0;
+    EXPECT_EQ(-1, mprotect(readable_map, 4096, PROT_READ | PROT_WRITE));
+    EXPECT_EQ(EACCES, errno);
+    EXPECT_EQ(0, munmap(readable_map, 4096));
+    close(readonly_fd);
+    errno = 0;
+    EXPECT_EQ(-1, mkdir((dst() + "/new").c_str(), 0700));
+    EXPECT_EQ(EROFS, errno);
+    errno = 0;
+    EXPECT_EQ(-1, truncate((dst() + "/marker").c_str(), 0));
+    EXPECT_EQ(EROFS, errno);
+    errno = 0;
+    EXPECT_EQ(-1, link((dst() + "/marker").c_str(), (dst() + "/link").c_str()));
+    EXPECT_EQ(EROFS, errno);
+    errno = 0;
+    EXPECT_EQ(-1, rename((dst() + "/marker").c_str(), (dst() + "/renamed").c_str()));
+    EXPECT_EQ(EROFS, errno);
+    errno = 0;
+    EXPECT_EQ(-1, mount(nullptr, dst().c_str(), nullptr, MS_REMOUNT, nullptr));
+    EXPECT_EQ(EROFS, errno);
+    // Linux ignores legacy overlay-private options on a read-only remount.
+    EXPECT_EQ(0, mount(nullptr, dst().c_str(), nullptr, MS_REMOUNT | MS_RDONLY,
+                       "lowerdir=/does-not-exist")) << strerror(errno);
+    errno = 0;
+    EXPECT_EQ(-1, mount(nullptr, dst().c_str(), nullptr, MS_REMOUNT,
+                        "lowerdir=/does-not-exist"));
+    EXPECT_EQ(EROFS, errno);
+    EXPECT_TRUE(exists(lower1 + "/marker"));
+    const std::string bound = src() + "/bound";
+    ASSERT_EQ(0, make_dir(bound)) << strerror(errno);
+    ASSERT_EQ(0, mount(dst().c_str(), bound.c_str(), nullptr, MS_BIND, nullptr))
+        << strerror(errno);
+    errno = 0;
+    EXPECT_EQ(-1, open((bound + "/marker").c_str(), O_WRONLY));
+    EXPECT_EQ(EROFS, errno);
+    errno = 0;
+    EXPECT_EQ(-1, mount(nullptr, bound.c_str(), nullptr, MS_REMOUNT, nullptr));
+    EXPECT_EQ(EROFS, errno);
+    EXPECT_EQ(0, umount(bound.c_str())) << strerror(errno);
+    EXPECT_EQ(0, rmdir(bound.c_str())) << strerror(errno);
+    struct stat lower_stat = {};
+    ASSERT_EQ(0, stat((lower1 + "/marker").c_str(), &lower_stat));
+    EXPECT_EQ(0644U, lower_stat.st_mode & 0777);
+    EXPECT_EQ(1, lower_stat.st_size);
+}
+
+TEST_F(NewMountApiTest, OverlayLowerOnlyLegacyMount) {
+    ASSERT_EQ(0, make_dir(src())) << strerror(errno);
+    ASSERT_EQ(0, make_dir(dst())) << strerror(errno);
+    ASSERT_EQ(0, mount("tmpfs", src().c_str(), "tmpfs", 0, nullptr)) << strerror(errno);
+    const std::string lower1 = src() + "/lower1";
+    const std::string lower2 = src() + "/lower2";
+    ASSERT_EQ(0, make_dir(lower1)) << strerror(errno);
+    ASSERT_EQ(0, make_dir(lower2)) << strerror(errno);
+    ASSERT_EQ(0, write_marker(lower1 + "/marker")) << strerror(errno);
+    const std::string options = "lowerdir=" + lower1 + ":" + lower2;
+    ASSERT_EQ(0, mount("overlay", dst().c_str(), "overlay", 0, options.c_str()))
+        << strerror(errno);
+    EXPECT_TRUE(exists(dst() + "/marker"));
+    errno = 0;
+    EXPECT_EQ(-1, mkdir((dst() + "/new").c_str(), 0700));
+    EXPECT_EQ(EROFS, errno);
+}
+
+TEST_F(NewMountApiTest, OverlayLowerOnlyRequiresTwoLayers) {
+    ASSERT_EQ(0, make_dir(src())) << strerror(errno);
+    ASSERT_EQ(0, mount("tmpfs", src().c_str(), "tmpfs", 0, nullptr)) << strerror(errno);
+    const std::string lower = src() + "/lower";
+    ASSERT_EQ(0, make_dir(lower)) << strerror(errno);
+    const int fsfd = fsopen_type("overlay", kFsopenCloexec);
+    ASSERT_GE(fsfd, 0) << strerror(errno);
+    ASSERT_EQ(0, fsconfig_call(fsfd, kFsconfigSetString, "lowerdir", lower.c_str(), 0))
+        << strerror(errno);
+    errno = 0;
+    EXPECT_EQ(-1, fsconfig_call(fsfd, kFsconfigCreate, nullptr, nullptr, 0));
+    EXPECT_EQ(EINVAL, errno);
+    close(fsfd);
+}
+
+TEST_F(NewMountApiTest, OverlayLowerOnlyValidatesIgnoredWorkdir) {
+    ASSERT_EQ(0, make_dir(src())) << strerror(errno);
+    ASSERT_EQ(0, make_dir(dst())) << strerror(errno);
+    ASSERT_EQ(0, mount("tmpfs", src().c_str(), "tmpfs", 0, nullptr)) << strerror(errno);
+    const std::string lower1 = src() + "/lower1";
+    const std::string lower2 = src() + "/lower2";
+    ASSERT_EQ(0, make_dir(lower1)) << strerror(errno);
+    ASSERT_EQ(0, make_dir(lower2)) << strerror(errno);
+    const std::string options = "lowerdir=" + lower1 + ":" + lower2 +
+                                ",workdir=" + src() + "/missing";
+    errno = 0;
+    EXPECT_EQ(-1, mount("overlay", dst().c_str(), "overlay", 0, options.c_str()));
+    EXPECT_EQ(ENOENT, errno);
+}
+
+TEST_F(NewMountApiTest, OverlayLowerOnlyRejectsNondirectoryWorkdir) {
+    ASSERT_EQ(0, make_dir(src())) << strerror(errno);
+    ASSERT_EQ(0, make_dir(dst())) << strerror(errno);
+    ASSERT_EQ(0, mount("tmpfs", src().c_str(), "tmpfs", 0, nullptr)) << strerror(errno);
+    const std::string lower1 = src() + "/lower1";
+    const std::string lower2 = src() + "/lower2";
+    const std::string work = src() + "/file";
+    ASSERT_EQ(0, make_dir(lower1)) << strerror(errno);
+    ASSERT_EQ(0, make_dir(lower2)) << strerror(errno);
+    ASSERT_EQ(0, write_marker(work)) << strerror(errno);
+
+    const std::string options = "lowerdir=" + lower1 + ":" + lower2 + ",workdir=" + work;
+    errno = 0;
+    EXPECT_EQ(-1, mount("overlay", dst().c_str(), "overlay", 0, options.c_str()));
+    EXPECT_EQ(EINVAL, errno);
+    const int fsfd = fsopen_type("overlay", kFsopenCloexec);
+    ASSERT_GE(fsfd, 0) << strerror(errno);
+    errno = 0;
+    EXPECT_EQ(-1, fsconfig_call(fsfd, kFsconfigSetString, "workdir", work.c_str(), 0));
+    EXPECT_EQ(EINVAL, errno);
+    close(fsfd);
+}
+
+TEST_F(NewMountApiTest, OverlayLowerOnlyRejectsReadonlyWorkdirMount) {
+    ASSERT_EQ(0, make_dir(src())) << strerror(errno);
+    ASSERT_EQ(0, make_dir(dst())) << strerror(errno);
+    ASSERT_EQ(0, mount("tmpfs", src().c_str(), "tmpfs", 0, nullptr)) << strerror(errno);
+    const std::string lower1 = src() + "/lower1";
+    const std::string lower2 = src() + "/lower2";
+    const std::string work = src() + "/work";
+    ASSERT_EQ(0, make_dir(lower1)) << strerror(errno);
+    ASSERT_EQ(0, make_dir(lower2)) << strerror(errno);
+    ASSERT_EQ(0, make_dir(work)) << strerror(errno);
+    ASSERT_EQ(0, mount(nullptr, src().c_str(), nullptr, MS_REMOUNT | MS_RDONLY, nullptr))
+        << strerror(errno);
+
+    const std::string options = "lowerdir=" + lower1 + ":" + lower2 + ",workdir=" + work;
+    errno = 0;
+    EXPECT_EQ(-1, mount("overlay", dst().c_str(), "overlay", 0, options.c_str()));
+    EXPECT_EQ(EINVAL, errno);
+    const int fsfd = fsopen_type("overlay", kFsopenCloexec);
+    ASSERT_GE(fsfd, 0) << strerror(errno);
+    errno = 0;
+    EXPECT_EQ(-1, fsconfig_call(fsfd, kFsconfigSetString, "workdir", work.c_str(), 0));
+    EXPECT_EQ(EINVAL, errno);
+    close(fsfd);
 }
 
 }  // namespace

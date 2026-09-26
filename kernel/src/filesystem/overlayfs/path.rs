@@ -6,13 +6,16 @@ use system_error::SystemError;
 
 impl OvlInode {
     pub(super) fn upper_root_inode(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
-        let upper_mnt = self.overlay_fs()?.ovl_upper_mnt();
+        let upper_mnt = self
+            .overlay_fs()?
+            .ovl_upper_mnt()
+            .ok_or(SystemError::EROFS)?;
         let upper_inode = upper_mnt.upper_inode.lock();
         upper_inode.clone().ok_or(SystemError::EROFS)
     }
 
     pub(super) fn workdir_inode(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
-        Ok(self.overlay_fs()?.workdir.clone())
+        self.overlay_fs()?.workdir.clone().ok_or(SystemError::EROFS)
     }
 
     pub(super) fn child_redirect(&self, name: &str) -> String {

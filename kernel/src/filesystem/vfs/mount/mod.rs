@@ -1733,6 +1733,7 @@ impl MountFS {
         flags: MountFlags,
         owner_user_ns: Arc<UserNamespace>,
     ) -> Result<Arc<SuperBlockState>, SystemError> {
+        let flags = flags | inner.required_superblock_flags();
         if let Some(state) = inner.shared_mount_superblock_state(flags) {
             if state.shutdown_started() {
                 return Err(SystemError::ESTALE);

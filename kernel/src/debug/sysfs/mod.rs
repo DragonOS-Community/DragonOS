@@ -32,6 +32,7 @@ fn debugfs_init() -> Result<(), SystemError> {
     super::mm::init_debugfs_mm()?;
     super::page_cache::init_debugfs_page_cache()?;
     super::timekeeping::init_debugfs_timekeeping()?;
+    super::vfs::init_debugfs_vfs()?;
     return Ok(());
 }
 

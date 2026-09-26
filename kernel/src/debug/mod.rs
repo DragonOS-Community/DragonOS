@@ -16,3 +16,4 @@ pub mod sysfs;
 pub mod timekeeping;
 pub mod traceback;
 pub mod tracing;
+pub mod vfs;

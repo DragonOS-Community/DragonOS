@@ -2,14 +2,21 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <sys/mount.h>
+#include <sys/stat.h>
 #include <string.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <string>
+#include <thread>
+#include <vector>
 
 namespace {
 
 constexpr const char* kSelftestPath = "/sys/kernel/debug/page_cache/accounting_selftest";
+constexpr const char* kWrapperCacheSelftestPath =
+    "/sys/kernel/debug/vfs/mount_wrapper_cache_selftest";
 
 std::string ReadAll(const char* path) {
     int fd = open(path, O_RDONLY);
@@ -38,6 +45,33 @@ std::string ReadAll(const char* path) {
     return content;
 }
 
+class ScopedTmpfsMount {
+public:
+    explicit ScopedTmpfsMount(const char* tag)
+        : path_(std::string("/tmp/") + tag + "_" + std::to_string(getpid())) {}
+
+    bool Mount() {
+        if (mkdir(path_.c_str(), 0700) != 0 && errno != EEXIST) {
+            return false;
+        }
+        mounted_ = mount("none", path_.c_str(), "tmpfs", 0, nullptr) == 0;
+        return mounted_;
+    }
+
+    ~ScopedTmpfsMount() {
+        if (mounted_) {
+            umount(path_.c_str());
+        }
+        rmdir(path_.c_str());
+    }
+
+    const std::string& path() const { return path_; }
+
+private:
+    std::string path_;
+    bool mounted_ = false;
+};
+
 }  // namespace
 
 TEST(PageCacheAccounting, MembershipLifecycleIsBalanced) {
@@ -63,6 +97,56 @@ TEST(PageCacheAccounting, MembershipLifecycleIsBalanced) {
     EXPECT_NE(std::string::npos, report.find("late_completion=ok\n")) << report;
     EXPECT_NE(std::string::npos, report.find("global_wiring=ok\n")) << report;
     EXPECT_NE(std::string::npos, report.find("layout=ok\n")) << report;
+}
+
+TEST(PageCacheAccounting, MountWrapperReplacementKeepsNewCacheEntry) {
+    const std::string report = ReadAll(kWrapperCacheSelftestPath);
+    ASSERT_FALSE(report.empty());
+    EXPECT_NE(std::string::npos, report.find("replacement_survives_old_drop=ok\n")) << report;
+    EXPECT_NE(std::string::npos, report.find("replacement_final_drop=ok\n")) << report;
+    EXPECT_NE(std::string::npos, report.find("status=ok\n")) << report;
+}
+
+TEST(PageCacheAccounting, ConcurrentOpenCloseUsesOneTmpfsDentrySafely) {
+    ScopedTmpfsMount tmpfs("mount_wrapper_concurrency");
+    ASSERT_TRUE(tmpfs.Mount()) << strerror(errno);
+    const std::string path = tmpfs.path() + "/shared";
+    int fd = open(path.c_str(), O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0600);
+    ASSERT_GE(fd, 0) << strerror(errno);
+    ASSERT_EQ(0, close(fd)) << strerror(errno);
+
+    constexpr size_t kWorkers = 8;
+    constexpr size_t kIterationsPerWorker = 4096;
+    std::atomic<size_t> ready{0};
+    std::atomic<bool> start{false};
+    std::atomic<size_t> failures{0};
+    std::vector<std::thread> workers;
+    workers.reserve(kWorkers);
+    for (size_t worker = 0; worker < kWorkers; ++worker) {
+        workers.emplace_back([&] {
+            ready.fetch_add(1, std::memory_order_release);
+            while (!start.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+            for (size_t iteration = 0; iteration < kIterationsPerWorker; ++iteration) {
+                const int current = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+                if (current < 0 || close(current) != 0) {
+                    failures.fetch_add(1, std::memory_order_relaxed);
+                    return;
+                }
+            }
+        });
+    }
+    while (ready.load(std::memory_order_acquire) != kWorkers) {
+        std::this_thread::yield();
+    }
+    start.store(true, std::memory_order_release);
+    for (auto& worker : workers) {
+        worker.join();
+    }
+
+    EXPECT_EQ(0U, failures.load());
+    EXPECT_EQ(0, unlink(path.c_str())) << strerror(errno);
 }
 
 int main(int argc, char** argv) {

@@ -12,7 +12,7 @@ use crate::net::socket::Socket;
 use crate::process::namespace::net_namespace::NetNamespace;
 use alloc::collections::BTreeMap;
 use alloc::collections::VecDeque;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::mem::size_of;
 use core::num::Wrapping;
@@ -57,12 +57,12 @@ pub(super) enum Inner {
 }
 
 impl Inner {
-    pub(super) fn check_io_events(&self) -> EPollEventType {
+    pub(super) fn check_io_events(&self, sndbuf: usize, is_seqpacket: bool) -> EPollEventType {
         let mut events = EPollEventType::empty();
 
         events |= match self {
             Inner::Init(init) => init.check_io_events(),
-            Inner::Connected(connected) => connected.check_io_events(),
+            Inner::Connected(connected) => connected.check_io_events(sndbuf, is_seqpacket),
             Inner::Listener(listener) => listener.check_io_events(),
         };
 
@@ -117,6 +117,7 @@ impl Init {
         backlog: usize,
         is_seqpacket: bool,
         wait_queue: Arc<WaitQueue>,
+        listener: Weak<UnixStreamSocket>,
         sndbuf_effective: usize,
         rcvbuf_effective: usize,
         netns: Arc<NetNamespace>,
@@ -130,6 +131,7 @@ impl Init {
             backlog,
             is_seqpacket,
             wait_queue,
+            listener,
             sndbuf_effective,
             rcvbuf_effective,
             netns,
@@ -229,8 +231,13 @@ impl Connected {
         self.reader.lock().take_connreset_pending()
     }
 
-    pub(super) fn send_free_len(&self) -> usize {
-        self.writer.lock().free_len()
+    /// Snapshot send readiness under one writer lock. `closed` is reported
+    /// separately because poll must wake a closed writer to observe EPIPE.
+    pub(super) fn send_state(&self, needed: usize, sndbuf: usize) -> (bool, bool) {
+        let writer = self.writer.lock();
+        let closed = writer.is_send_shutdown() || writer.is_recv_shutdown();
+        let writable = writer.free_len() >= needed && writer.len().saturating_add(needed) <= sndbuf;
+        (writable && !closed, closed)
     }
 
     pub(super) fn try_send(
@@ -514,11 +521,6 @@ impl Connected {
         self.writer.lock().set_send_shutdown();
     }
 
-    pub(super) fn send_closed(&self) -> bool {
-        let guard = self.writer.lock();
-        guard.is_send_shutdown() || guard.is_recv_shutdown()
-    }
-
     pub(super) fn recv_closed(&self) -> bool {
         self.reader.lock().is_read_shutdown()
     }
@@ -605,7 +607,7 @@ impl Connected {
         }))
     }
 
-    pub(super) fn check_io_events(&self) -> EPollEventType {
+    pub(super) fn check_io_events(&self, sndbuf: usize, is_seqpacket: bool) -> EPollEventType {
         let mut events = EPollEventType::empty();
 
         let reader = self.reader.lock();
@@ -618,11 +620,9 @@ impl Connected {
         }
         drop(reader);
 
-        let writer = self.writer.lock();
-        let send_shutdown = writer.is_send_shutdown() || writer.is_recv_shutdown();
-        // Preserve the existing writable calculation for live sockets; this
-        // change only adds Linux's shutdown-is-writable escape from poll.
-        if !writer.is_empty() || send_shutdown {
+        let min_write = if is_seqpacket { size_of::<u32>() } else { 1 };
+        let (writable, send_shutdown) = self.send_state(min_write, sndbuf);
+        if writable || send_shutdown {
             events |= EPollEventType::EPOLLOUT
                 | EPollEventType::EPOLLWRNORM
                 | EPollEventType::EPOLLWRBAND;
@@ -646,6 +646,7 @@ impl Listener {
         backlog: usize,
         is_seqpacket: bool,
         wait_queue: Arc<WaitQueue>,
+        listener: Weak<UnixStreamSocket>,
         sndbuf_effective: usize,
         rcvbuf_effective: usize,
         netns: Arc<NetNamespace>,
@@ -656,6 +657,7 @@ impl Listener {
             is_seqpacket,
             is_shutdown: false,
             wait_queue,
+            listener,
             sndbuf_effective,
             rcvbuf_effective,
             netns,
@@ -761,6 +763,7 @@ struct BacklogParams {
     is_seqpacket: bool,
     is_shutdown: bool,
     wait_queue: Arc<WaitQueue>,
+    listener: Weak<UnixStreamSocket>,
     sndbuf_effective: usize,
     rcvbuf_effective: usize,
     netns: Arc<NetNamespace>,
@@ -774,6 +777,7 @@ pub(super) struct Backlog {
     rcvbuf_effective: AtomicUsize,
     incoming_conns: Mutex<Option<VecDeque<Arc<UnixStreamSocket>>>>,
     wait_queue: Arc<WaitQueue>,
+    listener: Weak<UnixStreamSocket>,
     is_seqpacket: bool,
     netns: Arc<NetNamespace>,
     _is_shutdown: bool,
@@ -794,6 +798,7 @@ impl Backlog {
             rcvbuf_effective: AtomicUsize::new(params.rcvbuf_effective),
             incoming_conns: Mutex::new(incoming_sockets),
             wait_queue: params.wait_queue,
+            listener: params.listener,
             is_seqpacket: params.is_seqpacket,
             netns: params.netns,
             _is_shutdown: params.is_shutdown,
@@ -873,7 +878,7 @@ impl Backlog {
             .as_ref()
             .is_some_and(|conns| !conns.is_empty())
         {
-            EPollEventType::EPOLLIN
+            EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM
         } else {
             EPollEventType::empty()
         }
@@ -954,8 +959,12 @@ impl Backlog {
         *server_socket.peer.lock() = Some(Arc::downgrade(&client_socket));
 
         incoming_conns.push_back(server_socket);
-        self.wait_queue
-            .wakeup(Some(crate::process::ProcessState::Blocked(true)));
+        drop(guard);
+        // The client still holds its inner write lock here; only touch the
+        // listener when publishing the newly acceptable connection.
+        if let Some(listener) = self.listener.upgrade() {
+            listener.wake_self_readable();
+        }
         Ok(client_conn)
     }
 

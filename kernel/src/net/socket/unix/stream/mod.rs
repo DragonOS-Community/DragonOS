@@ -247,13 +247,13 @@ impl UnixStreamSocket {
         let Inner::Connected(connected) = inner else {
             return false;
         };
-        if connected.send_closed() {
-            return false;
-        }
-
         let sndbuf = self.sndbuf.load(Ordering::Relaxed);
-        let queued = connected.outq_len(self.is_seqpacket);
-        connected.send_free_len() > 0 && queued < sndbuf
+        let min_write = if self.is_seqpacket {
+            core::mem::size_of::<u32>()
+        } else {
+            1
+        };
+        connected.send_state(min_write, sndbuf).0
     }
 
     fn wake_self_writable(&self) {
@@ -262,22 +262,28 @@ impl UnixStreamSocket {
         if self.is_self_writable_now() {
             let _ = EventPoll::wakeup_epoll(
                 self.epoll_items().as_ref(),
-                EPollEventType::EPOLLOUT | EPollEventType::EPOLLWRNORM,
+                EPollEventType::EPOLLOUT
+                    | EPollEventType::EPOLLWRNORM
+                    | EPollEventType::EPOLLWRBAND,
             );
             self.fasync_items.send_sigio(FASYNC_POLL_OUT);
         }
     }
 
+    fn wake_self_readable(&self) {
+        self.fasync_items.send_sigio(FASYNC_POLL_IN);
+        self.wait_queue
+            .wakeup(Some(crate::process::ProcessState::Blocked(true)));
+        let _ = EventPoll::wakeup_epoll(
+            self.epoll_items().as_ref(),
+            EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM,
+        );
+    }
+
     fn wake_peer_readable(&self) {
         if let Some(peer_weak) = self.peer.lock().as_ref() {
             if let Some(peer) = peer_weak.upgrade() {
-                peer.fasync_items.send_sigio(FASYNC_POLL_IN);
-                peer.wait_queue
-                    .wakeup(Some(crate::process::ProcessState::Blocked(true)));
-                let _ = EventPoll::wakeup_epoll(
-                    peer.epoll_items().as_ref(),
-                    EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM,
-                );
+                peer.wake_self_readable();
             }
         }
     }
@@ -517,20 +523,17 @@ impl UnixStreamSocket {
                             .expect("UnixStreamSocket inner is None")
                         {
                             Inner::Connected(connected) => {
-                                if connected.send_closed() {
+                                let sndbuf = self.sndbuf.load(Ordering::Relaxed);
+                                let need = if self.is_seqpacket {
+                                    pending.len().saturating_add(core::mem::size_of::<u32>())
+                                } else {
+                                    1
+                                };
+                                let (writable, closed) = connected.send_state(need, sndbuf);
+                                if closed {
                                     return true;
                                 }
-
-                                let sndbuf = self.sndbuf.load(Ordering::Relaxed);
-                                let queued = connected.outq_len(self.is_seqpacket);
-
-                                if self.is_seqpacket {
-                                    let need = pending.len() + core::mem::size_of::<u32>();
-                                    connected.send_free_len() >= need
-                                        && queued.saturating_add(need) <= sndbuf
-                                } else {
-                                    connected.send_free_len() > 0 && queued < sndbuf
-                                }
+                                writable
                             }
                             _ => true,
                         },
@@ -632,6 +635,7 @@ impl Socket for UnixStreamSocket {
                     backlog,
                     self.is_seqpacket,
                     self.wait_queue.clone(),
+                    self.self_weak.clone(),
                     snd,
                     rcv,
                     self.netns.clone(),
@@ -1572,7 +1576,8 @@ impl Socket for UnixStreamSocket {
                                 | EPollEventType::EPOLLRDNORM
                                 | EPollEventType::EPOLLHUP
                                 | EPollEventType::EPOLLOUT
-                                | EPollEventType::EPOLLWRNORM,
+                                | EPollEventType::EPOLLWRNORM
+                                | EPollEventType::EPOLLWRBAND,
                         );
                         peer.fasync_items.send_sigio(FASYNC_POLL_HUP);
                     }
@@ -1642,7 +1647,9 @@ impl Socket for UnixStreamSocket {
         self.inner
             .read()
             .as_ref()
-            .map(Inner::check_io_events)
+            .map(|inner| {
+                inner.check_io_events(self.sndbuf.load(Ordering::Relaxed), self.is_seqpacket)
+            })
             // Concurrent close has already made the socket terminal and
             // emitted its wakeups. Event queries racing with it must observe
             // HUP rather than panic on the consumed Inner value.

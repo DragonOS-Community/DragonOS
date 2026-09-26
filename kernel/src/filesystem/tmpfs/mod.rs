@@ -915,7 +915,7 @@ impl Tmpfs {
         let pc = new_tmpfs_page_cache(Arc::downgrade(&inode_dyn), backend, &Arc::downgrade(self))?;
         result.0.lock().page_cache = Some(pc.clone());
 
-        let file = Arc::new(File::new(
+        let file = Arc::new(File::new_pseudo(
             inode_dyn,
             FileFlags::O_RDWR | FileFlags::O_LARGEFILE,
         )?);

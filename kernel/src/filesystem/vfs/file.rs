@@ -785,6 +785,13 @@ mod readdir_tests {
     }
 }
 
+/// Only kernel-created pseudo-file descriptions bypass pathname writer
+/// accounting. A fresh VFS open of the same inode is always regular.
+enum FileOpenOrigin {
+    Regular(Option<Metadata>),
+    InternalPseudo,
+}
+
 impl File {
     fn configure_base_open_mode(inode: &Arc<dyn IndexNode>, mode: &mut FileMode) {
         mode.remove(
@@ -1124,6 +1131,27 @@ impl File {
         Self::new_with_private_data(inode, flags, FilePrivateData::default())
     }
 
+    /// Construct an internal pseudo-file description without a pathname open.
+    ///
+    /// Like Linux `alloc_file_pseudo()` and `alloc_file_clone()`, this preserves
+    /// FMODE_WRITE but does not acquire the inode's pathname write-access count.
+    /// Reopening the inode through a path (including /proc/self/fd) must use
+    /// `File::new()` so executable write exclusion still applies.
+    pub(crate) fn new_pseudo(
+        inode: Arc<dyn IndexNode>,
+        flags: FileFlags,
+    ) -> Result<Self, SystemError> {
+        Self::new_with_private_data_and_mount_guard(
+            inode,
+            flags,
+            FilePrivateData::default(),
+            None,
+            None,
+            None,
+            FileOpenOrigin::InternalPseudo,
+        )
+    }
+
     /// Create a new file object with an explicit initial FilePrivateData.
     ///
     /// This is primarily used for objects that are not created via VFS open(2)
@@ -1145,7 +1173,7 @@ impl File {
             mount_guard,
             None,
             None,
-            None,
+            FileOpenOrigin::Regular(None),
         )
     }
 
@@ -1165,7 +1193,7 @@ impl File {
             mount_guard,
             Some(operation_guard),
             None,
-            cached_path_metadata,
+            FileOpenOrigin::Regular(cached_path_metadata),
         )
     }
 
@@ -1184,7 +1212,7 @@ impl File {
             mount_guard,
             Some(operation_guard),
             Some(preopened),
-            None,
+            FileOpenOrigin::Regular(None),
         )
     }
 
@@ -1197,8 +1225,12 @@ impl File {
         // pin before the mount pin, just as the completed File does.
         _operation_guard: Option<InodeRetentionGuard>,
         mut preopened: Option<PreopenedFile>,
-        cached_path_metadata: Option<Metadata>,
+        origin: FileOpenOrigin,
     ) -> Result<Self, SystemError> {
+        let (cached_path_metadata, account_write_access) = match origin {
+            FileOpenOrigin::Regular(metadata) => (metadata, true),
+            FileOpenOrigin::InternalPseudo => (None, false),
+        };
         let mut inode = inode;
         let path_inode = inode.clone();
         let mut file_type = match cached_path_metadata.as_ref() {
@@ -1282,12 +1314,15 @@ impl File {
             return Err(SystemError::EINVAL);
         }
         let already_open = preopened.is_some();
-        let write_access =
-            if file_type == FileType::File && !is_path && mode.contains(FileMode::FMODE_WRITE) {
-                Some(InodeWriteGuard::writer(inode.clone())?)
-            } else {
-                None
-            };
+        let write_access = if account_write_access
+            && file_type == FileType::File
+            && !is_path
+            && mode.contains(FileMode::FMODE_WRITE)
+        {
+            Some(InodeWriteGuard::writer(inode.clone())?)
+        } else {
+            None
+        };
         let private_data = Mutex::new(match preopened.as_mut() {
             Some(preopened) => preopened.take_private_data(),
             None => private_data_init,

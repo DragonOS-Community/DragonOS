@@ -8,12 +8,13 @@ use core::{any::Any, fmt};
 use system_error::SystemError;
 
 use crate::{
+    filesystem::anon_inode::{anon_inode_metadata, anon_inode_path, AnonInodeFs},
     filesystem::vfs::{
         file::{File, FileFlags, FilePrivateData},
         filesystem_maker,
         mount::{DetachedMountTree, MountFlags},
-        produce_fs_in_context, FileSystem, FileType, FsCreationContext, FsInfo,
-        FsconfigPreparedData, IndexNode, InodeMode, Magic, Metadata, SuperBlock,
+        produce_fs_in_context, FileSystem, FsCreationContext, FsconfigPreparedData, IndexNode,
+        InodeMode, Metadata,
     },
     libs::mutex::{Mutex, MutexGuard},
     mm::MemoryManagementArch,
@@ -346,58 +347,13 @@ pub fn create_mount_from_fs_context(
 }
 
 #[derive(Debug)]
-struct FsContextFileSystem;
-
-impl FileSystem for FsContextFileSystem {
-    fn page_cache_writeback_domain(
-        &self,
-    ) -> Option<&Arc<crate::filesystem::page_cache::PageCacheWritebackDomain>> {
-        None
-    }
-
-    fn root_inode(&self) -> Arc<dyn IndexNode> {
-        Arc::new(FsContextInode::new())
-    }
-
-    fn info(&self) -> FsInfo {
-        FsInfo {
-            blk_dev_id: 0,
-            max_name_len: 255,
-        }
-    }
-
-    fn as_any_ref(&self) -> &dyn Any {
-        self
-    }
-
-    fn name(&self) -> &str {
-        "anon_inode"
-    }
-
-    fn super_block(&self) -> SuperBlock {
-        SuperBlock::new(
-            Magic::ANON_INODEFS_MAGIC,
-            <crate::arch::MMArch as MemoryManagementArch>::PAGE_SIZE as u64,
-            255,
-        )
-    }
-}
-
-lazy_static::lazy_static! {
-    static ref FSCONTEXT_FS: Arc<FsContextFileSystem> = Arc::new(FsContextFileSystem);
-}
-
-#[derive(Debug)]
 struct FsContextInode {
     metadata: Metadata,
 }
 
 impl FsContextInode {
     fn new() -> Self {
-        let metadata = Metadata::new(
-            FileType::File,
-            InodeMode::S_IFREG | InodeMode::S_IRUSR | InodeMode::S_IWUSR,
-        );
+        let metadata = anon_inode_metadata(InodeMode::S_IRUSR | InodeMode::S_IWUSR);
         Self { metadata }
     }
 }
@@ -442,7 +398,7 @@ impl IndexNode for FsContextInode {
     }
 
     fn fs(&self) -> Arc<dyn FileSystem> {
-        FSCONTEXT_FS.clone()
+        AnonInodeFs::instance()
     }
 
     fn as_any_ref(&self) -> &dyn Any {
@@ -453,7 +409,11 @@ impl IndexNode for FsContextInode {
         Ok(self.metadata.clone())
     }
 
+    fn stat_mode(&self, metadata: &Metadata) -> InodeMode {
+        metadata.mode
+    }
+
     fn absolute_path(&self) -> Result<String, SystemError> {
-        Ok(String::from("anon_inode:[fscontext]"))
+        Ok(anon_inode_path("[fscontext]"))
     }
 }

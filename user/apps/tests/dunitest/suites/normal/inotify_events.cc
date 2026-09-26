@@ -1104,10 +1104,12 @@ TEST(InotifySelfEvents, RelinkFromAnotherDisconnectedAliasCancelsDelete) {
     ASSERT_GE(second_fd, 0);
 
     ASSERT_EQ(unlink(first.c_str()), 0) << strerror(errno);
-    ASSERT_EQ(unlink(second.c_str()), 0) << strerror(errno);
+    // A disconnected *path* may still be linked through its fd while the
+    // inode has another live name. Linux rejects resurrection after nlink=0.
     constexpr int kAtEmptyPath = 0x1000;
     ASSERT_EQ(linkat(first_fd, "", AT_FDCWD, restored.c_str(), kAtEmptyPath), 0)
         << strerror(errno);
+    ASSERT_EQ(unlink(second.c_str()), 0) << strerror(errno);
 
     char procfd[64];
     snprintf(procfd, sizeof(procfd), "/proc/self/fd/%d", second_fd);

@@ -323,8 +323,7 @@ pub fn vfs_getattr(
             StxAttributes::STATX_ATTR_AUTOMOUNT | StxAttributes::STATX_ATTR_DAX;
     }
 
-    // 把文件类型加入mode里面 （todo: 在具体的文件系统里面去实现这个操作。这里只是权宜之计）
-    kstat.mode |= metadata.file_type.into();
+    kstat.mode = inode.stat_mode(&metadata);
 
     return Ok(kstat);
 }

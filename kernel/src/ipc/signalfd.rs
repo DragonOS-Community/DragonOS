@@ -8,70 +8,19 @@ use core::mem::size_of;
 use bitflags::bitflags;
 
 use crate::arch::ipc::signal::{SigSet, Signal};
-use crate::arch::MMArch;
+use crate::filesystem::anon_inode::{anon_inode_metadata, anon_inode_path, AnonInodeFs};
 use crate::filesystem::epoll::event_poll::EventPoll;
 use crate::filesystem::epoll::{EPollEventType, EPollItem};
 use crate::filesystem::vfs::file::FileFlags;
 use crate::filesystem::vfs::{
-    vcore::generate_inode_id, FilePrivateData, FileSystem, FileType, FsInfo, IndexNode, InodeFlags,
-    InodeMode, Magic, Metadata, PollableInode, SuperBlock,
+    FilePrivateData, FileSystem, IndexNode, InodeMode, Metadata, PollableInode,
 };
 use crate::ipc::sighand::SigHand;
 use crate::libs::mutex::MutexGuard;
 use crate::libs::spinlock::{SpinLock, SpinLockGuard};
-use crate::mm::MemoryManagementArch;
 use crate::process::ProcessManager;
 use crate::syscall::user_access::UserBufferReader;
 use system_error::SystemError;
-
-lazy_static::lazy_static! {
-    static ref SIGNALFD_FS: Arc<SignalFdFs> = Arc::new(SignalFdFs);
-}
-
-#[derive(Debug)]
-pub struct SignalFdFs;
-
-impl SignalFdFs {
-    pub fn instance() -> Arc<Self> {
-        SIGNALFD_FS.clone()
-    }
-}
-
-impl FileSystem for SignalFdFs {
-    fn page_cache_writeback_domain(
-        &self,
-    ) -> Option<&Arc<crate::filesystem::page_cache::PageCacheWritebackDomain>> {
-        None
-    }
-
-    fn root_inode(&self) -> Arc<dyn IndexNode> {
-        // signalfd 为伪文件系统（anon_inode 风格），root inode 不会被真正使用。
-        Arc::new(SignalFdInode::new(SigSet::empty(), SignalFdFlags::empty()))
-    }
-
-    fn info(&self) -> FsInfo {
-        FsInfo {
-            blk_dev_id: 0,
-            max_name_len: 255,
-        }
-    }
-
-    fn as_any_ref(&self) -> &dyn Any {
-        self
-    }
-
-    fn name(&self) -> &str {
-        "signalfd"
-    }
-
-    fn super_block(&self) -> SuperBlock {
-        SuperBlock::new(
-            Magic::EVENTFD_MAGIC,
-            <MMArch as MemoryManagementArch>::PAGE_SIZE as u64,
-            255,
-        )
-    }
-}
 
 bitflags! {
     pub struct SignalFdFlags: u32 {
@@ -118,24 +67,7 @@ struct SignalFdEPollRegistration {
 
 impl SignalFdInode {
     pub fn new(mask: SigSet, flags: SignalFdFlags) -> Self {
-        let metadata = Metadata {
-            dev_id: 0,
-            inode_id: generate_inode_id(),
-            size: 0,
-            blk_size: 0,
-            blocks: 0,
-            atime: crate::time::PosixTimeSpec::default(),
-            mtime: crate::time::PosixTimeSpec::default(),
-            ctime: crate::time::PosixTimeSpec::default(),
-            btime: crate::time::PosixTimeSpec::default(),
-            file_type: FileType::CharDevice,
-            mode: InodeMode::from_bits_truncate(0o600),
-            nlinks: 1,
-            uid: 0,
-            gid: 0,
-            raw_dev: Default::default(),
-            flags: InodeFlags::empty(),
-        };
+        let metadata = anon_inode_metadata(InodeMode::S_IRUSR | InodeMode::S_IWUSR);
         Self {
             state: SpinLock::new(SignalFdState {
                 mask,
@@ -303,7 +235,7 @@ impl IndexNode for SignalFdInode {
     }
 
     fn fs(&self) -> Arc<dyn FileSystem> {
-        SignalFdFs::instance()
+        AnonInodeFs::instance()
     }
 
     fn as_any_ref(&self) -> &dyn Any {
@@ -318,12 +250,16 @@ impl IndexNode for SignalFdInode {
         Ok(self.state.lock_irqsave().metadata.clone())
     }
 
+    fn stat_mode(&self, metadata: &Metadata) -> InodeMode {
+        metadata.mode
+    }
+
     fn as_pollable_inode(&self) -> Result<&dyn PollableInode, SystemError> {
         Ok(self)
     }
 
     fn absolute_path(&self) -> Result<String, SystemError> {
-        Ok(String::from("signalfd"))
+        Ok(anon_inode_path("[signalfd]"))
     }
 }
 

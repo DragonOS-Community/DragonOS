@@ -1415,6 +1415,7 @@ impl Ext4FileSystem {
                 lifecycle: Ext4InodeLifecycle::new(),
                 retention: vfs::InodeRetentionState::new(),
                 pending_reclaim: SpinLock::new(None),
+                tmpfile_linkable: AtomicBool::new(false),
                 eviction_scheduled: SpinLock::new(false),
                 retention_callback_self: self_ref.clone(),
                 eviction_filesystem: SpinLock::new(Weak::new()),

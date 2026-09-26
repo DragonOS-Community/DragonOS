@@ -23,7 +23,7 @@ use crate::arch::syscall::nr::{SYS_INOTIFY_ADD_WATCH, SYS_INOTIFY_INIT1, SYS_INO
 // SYS_INOTIFY_INIT exists only on x86_64 (the Linux generic syscall ABI uses inotify_init1 instead).
 #[cfg(target_arch = "x86_64")]
 use crate::arch::syscall::nr::SYS_INOTIFY_INIT;
-use crate::arch::MMArch;
+use crate::filesystem::anon_inode::{anon_inode_metadata, anon_inode_path, AnonInodeFs};
 use crate::filesystem::epoll::event_poll::EventPoll;
 use crate::filesystem::epoll::{EPollEventType, EPollItem};
 use crate::filesystem::fsnotify::{
@@ -35,12 +35,11 @@ use crate::filesystem::vfs::file::{File, FileFlags, FileMode, FilePrivateData};
 use crate::filesystem::vfs::permission::{check_inode_permission, PermissionMask};
 use crate::filesystem::vfs::utils::user_path_at;
 use crate::filesystem::vfs::{
-    FileSystem, FileType, FsInfo, IndexNode, InodeMode, Magic, Metadata, PollableInode, SuperBlock,
-    NAME_MAX, VFS_MAX_FOLLOW_SYMLINK_TIMES,
+    FileSystem, FileType, IndexNode, InodeMode, Metadata, PollableInode, NAME_MAX,
+    VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
 use crate::libs::casting::DowncastArc;
 use crate::libs::mutex::{Mutex, MutexGuard};
-use crate::mm::MemoryManagementArch;
 use crate::process::namespace::NamespaceOps;
 use crate::process::ProcessManager;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
@@ -451,61 +450,6 @@ impl FsNotifyBackend for InotifyBackend {
     fn queue_nonempty(&self) -> bool {
         let q = self.state.events.lock();
         !q.list.is_empty() || q.overflow_pending
-    }
-}
-
-// ============================================================================
-// Pseudo filesystem
-// ============================================================================
-
-lazy_static::lazy_static! {
-    static ref INOTIFY_FS: Arc<InotifyFs> = Arc::new(InotifyFs);
-}
-
-/// inotify pseudo filesystem (analogous to `EventFdFs`, not actually mounted).
-#[derive(Debug)]
-pub struct InotifyFs;
-
-impl InotifyFs {
-    pub fn instance() -> Arc<InotifyFs> {
-        INOTIFY_FS.clone()
-    }
-}
-
-impl FileSystem for InotifyFs {
-    fn page_cache_writeback_domain(
-        &self,
-    ) -> Option<&Arc<crate::filesystem::page_cache::PageCacheWritebackDomain>> {
-        None
-    }
-    fn root_inode(&self) -> Arc<dyn IndexNode> {
-        // Never actually called: inotify is not mounted.
-        Arc::new(InotifyInode::new(
-            false,
-            vec![InotifyQuotaKey {
-                user_namespace: 0,
-                euid: 0,
-            }],
-        ))
-    }
-
-    fn info(&self) -> FsInfo {
-        FsInfo {
-            blk_dev_id: 0,
-            max_name_len: 255,
-        }
-    }
-
-    fn as_any_ref(&self) -> &dyn Any {
-        self
-    }
-
-    fn name(&self) -> &str {
-        "inotify"
-    }
-
-    fn super_block(&self) -> SuperBlock {
-        SuperBlock::new(Magic::INOTIFY_MAGIC, MMArch::PAGE_SIZE as u64, 255)
     }
 }
 
@@ -1030,11 +974,11 @@ impl IndexNode for InotifyInode {
     }
 
     fn metadata(&self) -> Result<Metadata, SystemError> {
-        Ok(Metadata {
-            mode: InodeMode::from_bits_truncate(0o400),
-            file_type: FileType::File,
-            ..Default::default()
-        })
+        Ok(anon_inode_metadata(InodeMode::S_IRUSR | InodeMode::S_IWUSR))
+    }
+
+    fn stat_mode(&self, metadata: &Metadata) -> InodeMode {
+        metadata.mode
     }
 
     fn resize(&self, _len: usize) -> Result<(), SystemError> {
@@ -1042,7 +986,7 @@ impl IndexNode for InotifyInode {
     }
 
     fn fs(&self) -> Arc<dyn FileSystem> {
-        InotifyFs::instance()
+        AnonInodeFs::instance()
     }
 
     fn as_any_ref(&self) -> &dyn Any {
@@ -1058,7 +1002,7 @@ impl IndexNode for InotifyInode {
     }
 
     fn absolute_path(&self) -> Result<String, SystemError> {
-        Ok(String::from("inotify"))
+        Ok(anon_inode_path("inotify"))
     }
 }
 

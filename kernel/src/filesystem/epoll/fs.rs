@@ -1,3 +1,4 @@
+use crate::filesystem::anon_inode::{anon_inode_metadata, anon_inode_path, AnonInodeFs};
 use alloc::string::String;
 
 use crate::{
@@ -60,7 +61,7 @@ impl IndexNode for EPollInode {
     }
 
     fn fs(&self) -> Arc<dyn crate::filesystem::vfs::FileSystem> {
-        todo!()
+        AnonInodeFs::instance()
     }
 
     fn as_any_ref(&self) -> &dyn core::any::Any {
@@ -72,7 +73,13 @@ impl IndexNode for EPollInode {
     }
 
     fn metadata(&self) -> Result<Metadata, SystemError> {
-        Ok(Metadata::default())
+        Ok(anon_inode_metadata(
+            crate::filesystem::vfs::InodeMode::S_IRUSR | crate::filesystem::vfs::InodeMode::S_IWUSR,
+        ))
+    }
+
+    fn stat_mode(&self, metadata: &Metadata) -> crate::filesystem::vfs::InodeMode {
+        metadata.mode
     }
 
     fn close(&self, _data: MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
@@ -93,7 +100,7 @@ impl IndexNode for EPollInode {
     }
 
     fn absolute_path(&self) -> Result<String, SystemError> {
-        Ok(String::from("epoll"))
+        Ok(anon_inode_path("[eventpoll]"))
     }
 
     fn as_pollable_inode(&self) -> Result<&dyn PollableInode, SystemError> {

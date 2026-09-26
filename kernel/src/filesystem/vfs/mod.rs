@@ -49,7 +49,9 @@ use crate::{
     time::PosixTimeSpec,
 };
 
-pub use self::inode_lifecycle::{EvictionEpoch, InodeRetentionKind, InodeRetentionState};
+pub use self::inode_lifecycle::{
+    EvictionEpoch, InodeRetentionKind, InodeRetentionState, UnlinkedFile,
+};
 pub use self::{
     file::{
         DelegatedWriteResult, FilePrivateData, OpenFileBehavior, PostWriteSyncPolicy,
@@ -464,6 +466,9 @@ pub enum SpecialNodeData {
     BlockDevice(Arc<dyn BlockDevice>),
     /// 指向其他 inode 的引用（用于 /proc/self/fd/N 这种魔法链接）
     Reference(Arc<dyn IndexNode>),
+    /// A procfd magic link keeps the open file description alive until the
+    /// path walker has acquired its own inode operation ownership.
+    FileReference(Arc<File>),
     /// A magic-link target that belongs to the producer's inner filesystem
     /// and must retain that filesystem's mount projection.
     ///
@@ -1024,6 +1029,13 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         return Err(SystemError::ENOSYS);
     }
 
+    /// Mode exposed by stat(2). Most inodes store the permission bits and
+    /// file type separately; Linux anon_inode objects deliberately report
+    /// mode 0600 without a file type and override this default.
+    fn stat_mode(&self, metadata: &Metadata) -> InodeMode {
+        metadata.mode | metadata.file_type.into()
+    }
+
     /// Inode number exposed through stat and directory entries. Filesystems
     /// with fixed on-disk numbers may differ from the VFS's internal inode ID.
     fn reported_ino(&self, metadata: &Metadata) -> InodeId {
@@ -1194,6 +1206,14 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         _flags: &FileFlags,
     ) -> Result<PreopenedFile, SystemError> {
         Err(SystemError::ENOSYS)
+    }
+
+    /// Create an unnamed regular file in this directory's filesystem.
+    ///
+    /// The inode starts with no directory entry and zero links. Filesystems
+    /// that do not implement O_TMPFILE report EOPNOTSUPP, as on Linux.
+    fn tmpfile(&self, _mode: InodeMode, _flags: &FileFlags) -> Result<UnlinkedFile, SystemError> {
+        Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
     }
 
     /// @brief 在当前目录下创建一个新的inode，并传入一个简单的data字段，方便进行初始化。
@@ -2203,12 +2223,14 @@ impl dyn IndexNode {
                 // 首先检查是否是"魔法链接"（如 /proc/self/fd/N）
                 // 这些链接的 readlink 返回的路径可能不可解析（如 pipe:[xxx]），
                 // 但它们有一个 special_node 指向真实的 inode
-                let magic_target = match inode.special_node() {
+                let special_node = inode.special_node();
+                let magic_target = match special_node.as_ref() {
                     Some(SpecialNodeData::Reference(target_inode))
                     | Some(SpecialNodeData::MountProjectedReference {
                         target: target_inode,
                         ..
-                    }) => Some(target_inode),
+                    }) => Some(target_inode.clone()),
+                    Some(SpecialNodeData::FileReference(file)) => Some(file.path_inode()),
                     _ => None,
                 };
                 if let Some(target_inode) = magic_target {

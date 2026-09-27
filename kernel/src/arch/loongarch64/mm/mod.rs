@@ -33,6 +33,11 @@ impl MemoryManagementArch for LoongArch64MMArch {
 
     const ENTRY_FLAG_PRESENT: usize = 0;
 
+    // TODO(loongarch64): these R/W encodings are placeholders (all zero), so
+    // `PageEntry::has_write()` degenerates to `true` (and the previous
+    // `ENTRY_FLAG_READWRITE` test to `false`). Harmless while
+    // `PAGE_FAULT_ENABLED` is false; revisit when LoongArch64 page tables and
+    // faults are implemented.
     const ENTRY_FLAG_READONLY: usize = 0;
 
     const ENTRY_FLAG_WRITEABLE: usize = 0;

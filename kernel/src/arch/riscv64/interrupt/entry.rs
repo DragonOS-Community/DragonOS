@@ -1,7 +1,11 @@
-use crate::arch::{
-    asm::csr::{CSR_SCAUSE, CSR_SEPC, CSR_SSCRATCH, CSR_SSTATUS, CSR_STVAL, SR_SPP},
-    cpu::LocalContext,
-    interrupt::TrapFrame,
+use crate::{
+    arch::{
+        asm::csr::{CSR_SCAUSE, CSR_SEPC, CSR_SSCRATCH, CSR_SSTATUS, CSR_STVAL, SR_SPP},
+        cpu::LocalContext,
+        interrupt::TrapFrame,
+        CurrentIrqArch,
+    },
+    exception::InterruptArch,
 };
 use asm_macros::{restore_from_x6_to_x31, save_from_x6_to_x31};
 use kdepends::memoffset::offset_of;
@@ -164,6 +168,12 @@ unsafe extern "C" fn _save_context() -> ! {
     )
 }
 
+unsafe extern "C" fn riscv64_enter_user() {
+	// 按理说上游都应该保证中断关闭，此处仅做二次确认
+    CurrentIrqArch::interrupt_disable();
+    crate::rcu::user_enter();
+}
+
 #[unsafe(naked)]
 #[no_mangle]
 pub unsafe extern "C" fn ret_from_exception() -> ! {
@@ -173,6 +183,10 @@ pub unsafe extern "C" fn ret_from_exception() -> ! {
             andi s0, s0, {sr_spp}
             
             bnez s0, 3f
+
+            // All user returns pass here.
+            // Notify RCU before restoring user registers and sscratch.
+            call {enter_user}
 
             // Save unwound kernel stack pointer in thread_info
             addi s0, sp, {trap_frame_size_on_stack}
@@ -211,6 +225,7 @@ pub unsafe extern "C" fn ret_from_exception() -> ! {
         ),
         off_status = const offset_of!(TrapFrame, status),
         sr_spp = const SR_SPP,
+        enter_user = sym riscv64_enter_user,
         trap_frame_size_on_stack = const TrapFrame::SIZE_ON_STACK,
         lc_off_kernel_sp = const offset_of!(LocalContext, kernel_sp),
         csr_scratch = const CSR_SSCRATCH,

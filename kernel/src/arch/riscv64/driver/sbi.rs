@@ -23,62 +23,29 @@ use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 pub fn console_putstr(s: &[u8]) {
     SbiDriver::ensure_probed();
 
-    // Use the Debug Console extension (DBCN) when the firmware advertises it;
-    // fall back to the legacy console otherwise (e.g. OpenSBI). New RustSBI
-    // builds no longer expose the deprecated legacy console (EID 0x01), so
-    // relying on it alone would spin without printing anything.
-    if SbiDriver::dbcn_usable() && dbcn_write(s) {
-        return;
+    for &c in s {
+        if c == b'\n' {
+            console_write_byte(b'\r');
+        }
+        console_write_byte(c);
     }
-
-    legacy_write(s);
 }
 
 /// Latched once a DBCN write has been rejected, so later output goes straight to
 /// the legacy console instead of retrying a firmware that does not honour DBCN.
 static DBCN_FAILED: AtomicBool = AtomicBool::new(false);
 
-/// Writes `s` through the Debug Console extension, expanding `\n` to CRLF.
-///
-/// Returns `false` at the first rejected byte and latches [`DBCN_FAILED`] so the
-/// caller falls back to the legacy console instead of losing output silently.
-fn dbcn_write(s: &[u8]) -> bool {
-    let write = |byte: u8| -> bool {
-        if sbi_rt::console_write_byte(byte).is_err() {
-            DBCN_FAILED.store(true, Ordering::Relaxed);
-            return false;
+/// Prefer DBCN when available; on failure, retry only this byte via legacy.
+/// Later bytes also use legacy, so an already-written prefix is not repeated.
+fn console_write_byte(byte: u8) {
+    if SbiDriver::dbcn_usable() {
+        if sbi_rt::console_write_byte(byte).is_ok() {
+            return;
         }
-        true
-    };
-
-    for &c in s {
-        let ok = match c {
-            b'\n' => write(b'\r') && write(b'\n'),
-            _ => write(c),
-        };
-        if !ok {
-            return false;
-        }
+        DBCN_FAILED.store(true, Ordering::Relaxed);
     }
-    true
-}
-
-/// Writes `s` through the deprecated legacy console (EID 0x01).
-fn legacy_write(s: &[u8]) {
-    for &c in s {
-        match c {
-            b'\n' => {
-                #[allow(deprecated)]
-                sbi_rt::legacy::console_putchar(b'\r' as usize);
-                #[allow(deprecated)]
-                sbi_rt::legacy::console_putchar(b'\n' as usize);
-            }
-            _ => {
-                #[allow(deprecated)]
-                sbi_rt::legacy::console_putchar(c as usize);
-            }
-        }
-    }
+    #[allow(deprecated)]
+    sbi_rt::legacy::console_putchar(byte as usize);
 }
 
 bitflags! {

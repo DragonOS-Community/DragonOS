@@ -622,6 +622,7 @@ impl Socket for UnixStreamSocket {
 
         let timeout = self.send_timeout();
         let started = Instant::now();
+        let mut retry = None;
         loop {
             let remote_addr = endpoint.connect_in(&self.netns, self.unix_socket_type())?;
             let backlog = match get_backlog(&remote_addr) {
@@ -637,7 +638,12 @@ impl Socket for UnixStreamSocket {
                     get_backlog(&current)?
                 }
             };
-            match self.try_connect(&backlog) {
+            let result = self.try_connect(&backlog);
+            // Release the previous wait's responsibility after the enqueue
+            // attempt, before registering another wait. Its original backlog
+            // may differ from the freshly resolved one after a rebind.
+            drop(retry.take());
+            match result {
                 Err(SystemError::ECONNREFUSED) if backlog.is_closed() => continue,
                 Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
                     if self.is_nonblocking() {
@@ -653,7 +659,7 @@ impl Socket for UnixStreamSocket {
 
                     // A wakeup can make the predicate true even if a signal is
                     // pending. Preserve Linux's signal priority before retrying.
-                    if result == Err(SystemError::ERESTARTSYS)
+                    if matches!(result, Err(SystemError::ERESTARTSYS))
                         || crate::arch::ipc::signal::Signal::signal_pending_state(
                             true,
                             false,
@@ -667,7 +673,7 @@ impl Socket for UnixStreamSocket {
                         });
                     }
 
-                    result?;
+                    retry = Some(result?);
                 }
                 result => return result,
             }

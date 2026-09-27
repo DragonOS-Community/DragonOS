@@ -786,6 +786,27 @@ pub(super) struct Backlog {
     _is_shutdown: bool,
 }
 
+/// Responsibility for retrying a capacity wait, not a reservation of a slot.
+/// Keep this alive across address resolution and the next enqueue attempt so
+/// every cancellation/error path passes on capacity it did not consume.
+pub(super) struct BacklogRetry {
+    backlog: Arc<Backlog>,
+}
+
+impl Drop for BacklogRetry {
+    fn drop(&mut self) {
+        let has_space = self
+            .backlog
+            .incoming_conns
+            .lock()
+            .as_ref()
+            .is_some_and(|incoming| incoming.len() <= self.backlog.backlog.load(Ordering::Relaxed));
+        if has_space {
+            self.backlog.connect_wait_queue.wake_one();
+        }
+    }
+}
+
 impl Backlog {
     fn new(params: BacklogParams) -> Self {
         let ListenerConfig {
@@ -1016,7 +1037,13 @@ impl Backlog {
     }
 
     /// Wait until a connect attempt can be retried or the listener is closed.
-    pub(super) fn wait_for_space(&self, timeout: Option<Duration>) -> Result<(), SystemError> {
+    pub(super) fn wait_for_space(
+        self: &Arc<Self>,
+        timeout: Option<Duration>,
+    ) -> Result<BacklogRetry, SystemError> {
+        let retry = BacklogRetry {
+            backlog: self.clone(),
+        };
         let ready = || {
             let guard = self.incoming_conns.lock();
             guard
@@ -1028,7 +1055,12 @@ impl Backlog {
         match timeout {
             Some(timeout) => self.connect_wait_queue.wait_until_timeout(ready, timeout),
             None => self.connect_wait_queue.wait_until_interruptible(ready),
-        }
+        }?;
+
+        // WaitQueue has removed/closed our waker before either returning this
+        // guard or dropping it on error. Never hand off inside `ready`: it runs
+        // while our own waker may still be registered and could wake itself.
+        Ok(retry)
     }
 }
 

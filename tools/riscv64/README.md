@@ -34,8 +34,18 @@ done
 ```
 
 默认使用 QEMU 自带 OpenSBI（`-bios default`）、单 hart、2 GiB 内存和新建 FAT
-磁盘。进入 BusyBox 后发送串口命令，收到独立一行 `DRAGONOS-SMOKE-OK` 才返回 0；
+磁盘。脚本先校验内核 ELF 的 RISC-V 架构；进入 BusyBox 后执行 shell 内建命令
+`test -r /bin/sh && printf 'DRAGONOS-%s\n' SMOKE-OK`，收到独立一行
+`DRAGONOS-SMOKE-OK` 才返回 0。
+此测试暂只覆盖进入用户态及 shell 内建命令，不覆盖 fork/exec 外部程序；
+外部命令触发的 RISC-V 子进程 RCU 状态异常留待后续修复并恢复覆盖。
+退出时清理测试磁盘，保留日志。
 
 `OPENSBI_FIRMWARE` 可指定 OpenSBI `fw_dynamic.bin`；`DRAGONOS_BOOT_TIMEOUT_SECS`
 设置启动超时（默认 180 秒）。构建目录、缓存、日志默认在 `bin/riscv64-smoke-*`，
 可用 `DRAGONOS_WORK_DIR`、`DRAGONOS_CACHE_DIR`、`DRAGONOS_LOG_DIR` 覆盖。
+
+`.github/workflows/riscv64-smoke.yml` 在 PR、主分支推送和手动触发时运行：
+仅构建 riscv64 内核，并使用本次构建的 RISC-V 内核及 EFI
+产物测试三条启动路径。启动依赖可缓存，内核每次重新构建；失败会使 CI 失败，
+串口日志作为 artifact 保留。

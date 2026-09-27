@@ -368,8 +368,14 @@ impl MemoryManagementArch for RiscV64MMArch {
 
     const PAGE_READ: usize = PAGE_ENTRY_BASE | Self::ENTRY_FLAG_READONLY;
 
-    const PAGE_WRITE: usize =
-        PAGE_ENTRY_BASE | Self::ENTRY_FLAG_READONLY | Self::ENTRY_FLAG_WRITEABLE;
+    // Writable entries carry `DIRTY`: riscv64 has no user page-fault handler to
+    // set `D` lazily (`PAGE_FAULT_ENABLED == false`), so a `W=1, D=0` entry
+    // would fault on the first store. `PAGE_SHARED`/`PAGE_SHARED_EXEC` alias
+    // these constants, so private and shared writable mappings behave alike.
+    const PAGE_WRITE: usize = PAGE_ENTRY_BASE
+        | Self::ENTRY_FLAG_READONLY
+        | Self::ENTRY_FLAG_WRITEABLE
+        | Self::ENTRY_FLAG_DIRTY;
 
     const PAGE_EXEC: usize = PAGE_ENTRY_BASE | Self::ENTRY_FLAG_EXEC;
 
@@ -379,7 +385,8 @@ impl MemoryManagementArch for RiscV64MMArch {
     const PAGE_WRITE_EXEC: usize = PAGE_ENTRY_BASE
         | Self::ENTRY_FLAG_READONLY
         | Self::ENTRY_FLAG_EXEC
-        | Self::ENTRY_FLAG_WRITEABLE;
+        | Self::ENTRY_FLAG_WRITEABLE
+        | Self::ENTRY_FLAG_DIRTY;
 
     const PAGE_COPY: usize = Self::PAGE_READ;
     const PAGE_COPY_EXEC: usize = Self::PAGE_READ_EXEC;
@@ -406,16 +413,18 @@ const fn protection_map() -> [EntryFlags<MMArch>; 16] {
     // riscv64 has no user page-fault handler (`PAGE_FAULT_ENABLED == false`), so
     // a private writable mapping cannot rely on a write fault to become
     // writable and must be published writable directly. Fault-capable
-    // architectures keep the read-only COW encoding.
+    // architectures keep the read-only COW encoding. `PAGE_WRITE` and
+    // `PAGE_WRITE_EXEC` already carry `DIRTY`, so shared writable entries are
+    // consistent with these.
     let private_write = if MMArch::PAGE_FAULT_ENABLED {
         MMArch::PAGE_COPY
     } else {
-        MMArch::PAGE_WRITE | MMArch::ENTRY_FLAG_DIRTY
+        MMArch::PAGE_WRITE
     };
     let private_write_exec = if MMArch::PAGE_FAULT_ENABLED {
         MMArch::PAGE_COPY_EXEC
     } else {
-        MMArch::PAGE_WRITE_EXEC | MMArch::ENTRY_FLAG_DIRTY
+        MMArch::PAGE_WRITE_EXEC
     };
     map[VmFlags::VM_NONE.bits()] = MMArch::PAGE_NONE;
     map[VmFlags::VM_READ.bits()] = MMArch::PAGE_READONLY;

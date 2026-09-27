@@ -27,9 +27,9 @@ impl Drop for PageCacheAccountingSelftestGuard {
 
 fn run_registry_churn_selftest() -> bool {
     let mut registry = PageCacheRegistry::new();
-    // Keep a live prefix larger than the scan budget. A one-entry sweep cannot
-    // keep up with one new short-lived mapping per insertion in this case.
-    let live: Vec<_> = (0..64)
+    // Bound stale entries during churn behind a live prefix. This phase alone
+    // does not prove that the scan will revisit the prefix after it dies.
+    let mut live: Vec<_> = (0..64)
         .map(|_| PageCache::new_unowned(None, None))
         .collect();
     for cache in &live {
@@ -45,12 +45,43 @@ fn run_registry_churn_selftest() -> bool {
     }
     // Every still-live mapping must remain discoverable after cursor wrapping
     // and swap-removing dead entries. Cleanup must never discard a live entry.
-    live.iter().all(|cache| {
+    if !live.iter().all(|cache| {
         registry
             .entries
             .iter()
             .any(|weak| Weak::ptr_eq(weak, &Arc::downgrade(cache)))
-    })
+    }) {
+        return false;
+    }
+
+    // Retain some original mappings, retire the old prefix, and publish new
+    // live mappings before resuming churn. A scan stuck deleting only the
+    // newest transient can stay bounded yet leave this expired prefix behind.
+    let mut survivors = live.split_off(48);
+    let expired: Vec<_> = live.iter().map(Arc::downgrade).collect();
+    drop(live);
+    for _ in 0..16 {
+        let cache = PageCache::new_unowned(None, None);
+        registry.register(&cache);
+        survivors.push(cache);
+    }
+    for _ in 0..4096 {
+        let transient = PageCache::new_unowned(None, None);
+        registry.register(&transient);
+        drop(transient);
+        if registry.entries.len() > 128 {
+            return false;
+        }
+    }
+    expired
+        .iter()
+        .all(|dead| !registry.entries.iter().any(|weak| Weak::ptr_eq(weak, dead)))
+        && survivors.iter().all(|cache| {
+            registry
+                .entries
+                .iter()
+                .any(|weak| Weak::ptr_eq(weak, &Arc::downgrade(cache)))
+        })
 }
 
 fn run_writeback_domain_lifecycle_selftest() -> bool {

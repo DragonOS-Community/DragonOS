@@ -71,7 +71,7 @@ impl Iterator for EFIMemoryDescIter<'_> {
     type Item = MemoryDescriptor;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let stride = self.inner.desc_size;
+        let stride = self.inner.desc_size.max(size_of::<Self::Item>());
         if self.offset + stride > self.inner.size {
             return None;
         }

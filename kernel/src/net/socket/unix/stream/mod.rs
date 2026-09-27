@@ -22,7 +22,7 @@ use crate::{
             endpoint::Endpoint,
             unix::{
                 stream::inner::{get_backlog, Backlog},
-                UnixEndpoint,
+                UnixEndpoint, UnixSocketType,
             },
         },
     },
@@ -121,6 +121,14 @@ pub struct UnixStreamSocket {
 }
 
 impl UnixStreamSocket {
+    fn unix_socket_type(&self) -> UnixSocketType {
+        if self.is_seqpacket {
+            UnixSocketType::SeqPacket
+        } else {
+            UnixSocketType::Stream
+        }
+    }
+
     /// 默认的元数据缓冲区大小
     #[allow(dead_code)]
     pub const DEFAULT_METADATA_BUF_SIZE: usize = 1024;
@@ -600,18 +608,31 @@ impl Socket for UnixStreamSocket {
     }
 
     fn connect(&self, server_endpoint: Endpoint) -> Result<(), SystemError> {
-        let remote_addr = UnixEndpoint::try_from(server_endpoint)?.connect_in(&self.netns)?;
-        let backlog = get_backlog(&remote_addr)?;
-
-        if self.is_nonblocking() {
-            return self.try_connect(&backlog);
-        }
+        let endpoint = UnixEndpoint::try_from(server_endpoint)?;
 
         let timeout = self.send_timeout();
         let started = Instant::now();
         loop {
+            let remote_addr = endpoint.connect_in(&self.netns, self.unix_socket_type())?;
+            let backlog = match get_backlog(&remote_addr) {
+                Ok(backlog) => backlog,
+                Err(error) => {
+                    // The listener can close after name resolution but before
+                    // its backlog is found. Retry only if the name now denotes
+                    // another socket instance; a stable miss is a real refusal.
+                    let current = endpoint.connect_in(&self.netns, self.unix_socket_type())?;
+                    if current == remote_addr {
+                        return Err(error);
+                    }
+                    get_backlog(&current)?
+                }
+            };
             match self.try_connect(&backlog) {
+                Err(SystemError::ECONNREFUSED) if backlog.is_closed() => continue,
                 Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
+                    if self.is_nonblocking() {
+                        return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+                    }
                     let remaining = timeout.map(|limit| {
                         let elapsed = Instant::now().saturating_sub(started);
                         Duration::from_micros(
@@ -648,8 +669,10 @@ impl Socket for UnixStreamSocket {
 
         let mut writer = self.inner.write();
         match writer.as_mut().expect("UnixStreamSocket inner is None") {
-            Inner::Init(init) => init.bind(addr, &self.netns),
-            Inner::Connected(connected) => connected.bind(addr, &self.netns),
+            Inner::Init(init) => init.bind(addr, &self.netns, self.unix_socket_type()),
+            Inner::Connected(connected) => {
+                connected.bind(addr, &self.netns, self.unix_socket_type())
+            }
             Inner::Listener(_listener) => addr.bind_unnamed(),
         }
     }

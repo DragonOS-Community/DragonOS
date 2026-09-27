@@ -522,15 +522,18 @@ impl PageFaultHandler {
         {
             let _pt_edit = mm.page_table_edit();
             let mapper = &mut pfm.mapper;
-            if mapper.get_entry(address, MMArch::PAGE_LEVELS - 1).is_none() {
+            if mapper
+                .get_entry(address, MMArch::PAGE_LEVELS.saturating_sub(1))
+                .is_none()
+            {
                 mapper
-                    .allocate_table(address, MMArch::PAGE_LEVELS - 2)
+                    .allocate_table(address, MMArch::PAGE_LEVELS.saturating_sub(2))
                     .expect("failed to allocate second-level page table");
             }
         }
         let page_flags = vma.lock().flags();
 
-        for level in (1..MMArch::PAGE_LEVELS - 1).rev() {
+        for level in (1..MMArch::PAGE_LEVELS.saturating_sub(1)).rev() {
             {
                 let _pt_edit = mm.page_table_edit();
                 let mapper = &mut pfm.mapper;

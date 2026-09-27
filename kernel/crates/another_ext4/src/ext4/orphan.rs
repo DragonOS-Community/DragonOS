@@ -27,8 +27,10 @@ pub(super) struct LegacyOrphanIndex {
 
 impl LegacyOrphanIndex {
     fn from_chain(chain: &[InodeId]) -> Self {
-        let mut result = Self::default();
-        result.head = chain.first().copied().unwrap_or(0);
+        let mut result = Self {
+            head: chain.first().copied().unwrap_or(0),
+            ..Self::default()
+        };
         for (position, id) in chain.iter().copied().enumerate() {
             let previous = position.checked_sub(1).map(|i| chain[i]).unwrap_or(0);
             let next = chain.get(position + 1).copied().unwrap_or(0);

@@ -20,6 +20,27 @@ struct ConnectResult {
     int error;
 };
 
+class ScopedFd {
+public:
+    explicit ScopedFd(int fd = -1) : fd_(fd) {}
+    ~ScopedFd() {
+        if (fd_ >= 0) close(fd_);
+    }
+
+    ScopedFd(const ScopedFd&) = delete;
+    ScopedFd& operator=(const ScopedFd&) = delete;
+
+    int get() const { return fd_; }
+
+    void reset(int fd = -1) {
+        if (fd_ >= 0) close(fd_);
+        fd_ = fd;
+    }
+
+private:
+    int fd_;
+};
+
 void RunFullBacklogConnect(Release release, int type) {
     sockaddr_un address{};
     address.sun_family = AF_UNIX;
@@ -116,6 +137,23 @@ void RunFullBacklogConnect(Release release, int type) {
         if (release == Release::Accept || release == Release::Grow ||
             release == Release::LargeTimeout) {
             EXPECT_EQ(0, result.status);
+            if (result.status == 0) {
+                // Each successful connect must have its own accept-ready entry.
+                const int count = release == Release::Grow ? 2 : 1;
+                for (int i = 0; i < count; ++i) {
+                    pollfd ready{listener, POLLIN, 0};
+                    const int ready_status = poll(&ready, 1, 5000);
+                    EXPECT_EQ(1, ready_status) << "successful connect was not accept-ready";
+                    if (ready_status != 1) break;
+                    EXPECT_NE(0, ready.revents & POLLIN);
+                    if (!(ready.revents & POLLIN)) break;
+                    ScopedFd accepted(accept(listener, nullptr, nullptr));
+                    EXPECT_GE(accepted.get(), 0) << strerror(errno);
+                    if (accepted.get() < 0) break;
+                }
+                pollfd drained{listener, POLLIN, 0};
+                EXPECT_EQ(0, poll(&drained, 1, 0)) << "unexpected extra accepted connection";
+            }
         } else {
             EXPECT_EQ(-1, result.status);
             const int expected = release == Release::Close ? ECONNREFUSED
@@ -384,6 +422,67 @@ TEST_P(UnixConnectBacklog, NonblockingFullBacklogReturnsEagain) {
     close(second);
     close(first);
     close(listener);
+}
+
+TEST_P(UnixConnectBacklog, RepeatedConnectAcceptTransfersDataAndEof) {
+    sockaddr_un address{};
+    address.sun_family = AF_UNIX;
+    const int name_len = snprintf(address.sun_path + 1, sizeof(address.sun_path) - 1,
+                                  "dkc033-cycles-%d-%d", getpid(), GetParam());
+    ASSERT_GT(name_len, 0);
+    const socklen_t addr_len = offsetof(sockaddr_un, sun_path) + 1 + name_len;
+
+    ScopedFd listener(socket(AF_UNIX, GetParam() | SOCK_NONBLOCK, 0));
+    ASSERT_GE(listener.get(), 0) << strerror(errno);
+    ASSERT_EQ(0, bind(listener.get(), reinterpret_cast<sockaddr*>(&address), addr_len))
+        << strerror(errno);
+    ASSERT_EQ(0, listen(listener.get(), 0)) << strerror(errno);
+
+    for (int iteration = 0; iteration < 1024; ++iteration) {
+        SCOPED_TRACE(iteration);
+        ScopedFd client(socket(AF_UNIX, GetParam(), 0));
+        ASSERT_GE(client.get(), 0) << strerror(errno);
+        ASSERT_EQ(0, connect(client.get(), reinterpret_cast<sockaddr*>(&address), addr_len))
+            << strerror(errno);
+
+        pollfd ready{listener.get(), POLLIN, 0};
+        ASSERT_EQ(1, poll(&ready, 1, 5000)) << "listener did not become accept-ready";
+        ASSERT_NE(0, ready.revents & POLLIN);
+        ScopedFd peer(accept(listener.get(), nullptr, nullptr));
+        ASSERT_GE(peer.get(), 0) << strerror(errno);
+
+        ASSERT_EQ(1, write(client.get(), "x", 1));
+        char byte = 0;
+        ASSERT_EQ(1, read(peer.get(), &byte, 1));
+        EXPECT_EQ('x', byte);
+        client.reset();
+        ASSERT_EQ(0, read(peer.get(), &byte, 1));
+    }
+}
+
+TEST_P(UnixConnectBacklog, ConnectedSocketReconnectReturnsEisconn) {
+    sockaddr_un address{};
+    address.sun_family = AF_UNIX;
+    const int name_len = snprintf(address.sun_path + 1, sizeof(address.sun_path) - 1,
+                                  "dkc033-eisconn-%d-%d", getpid(), GetParam());
+    ASSERT_GT(name_len, 0);
+    const socklen_t addr_len = offsetof(sockaddr_un, sun_path) + 1 + name_len;
+
+    ScopedFd listener(socket(AF_UNIX, GetParam(), 0));
+    ASSERT_GE(listener.get(), 0) << strerror(errno);
+    ASSERT_EQ(0, bind(listener.get(), reinterpret_cast<sockaddr*>(&address), addr_len))
+        << strerror(errno);
+    ASSERT_EQ(0, listen(listener.get(), 0)) << strerror(errno);
+    ScopedFd client(socket(AF_UNIX, GetParam(), 0));
+    ASSERT_GE(client.get(), 0) << strerror(errno);
+    ASSERT_EQ(0, connect(client.get(), reinterpret_cast<sockaddr*>(&address), addr_len))
+        << strerror(errno);
+    ScopedFd peer(accept(listener.get(), nullptr, nullptr));
+    ASSERT_GE(peer.get(), 0) << strerror(errno);
+
+    errno = 0;
+    EXPECT_EQ(-1, connect(client.get(), reinterpret_cast<sockaddr*>(&address), addr_len));
+    EXPECT_EQ(EISCONN, errno);
 }
 
 INSTANTIATE_TEST_SUITE_P(StreamAndSeqpacket, UnixConnectBacklog,

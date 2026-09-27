@@ -4,70 +4,20 @@ use alloc::{string::String, sync::Arc, vec::Vec};
 use system_error::SystemError;
 
 use crate::filesystem::{
+    anon_inode::{anon_inode_metadata, anon_inode_path, AnonInodeFs},
     epoll::{EPollEventType, EPollItem},
     vfs::{
         fdtable::FdReservation,
         file::{File, FileFlags, FilePrivateData},
-        vcore::generate_inode_id,
-        FileSystem, FileType, FsInfo, IndexNode, InodeFlags, InodeMode, Magic, Metadata,
-        PollableInode, SuperBlock,
+        FileSystem, IndexNode, InodeMode, Metadata, PollableInode,
     },
 };
 use crate::libs::mutex::MutexGuard;
-use crate::mm::MemoryManagementArch;
 
 use super::{
     pid::{Pid, PidPrivateData, PidType},
     ProcessControlBlock,
 };
-
-lazy_static::lazy_static! {
-    static ref PIDFD_FS: Arc<PidFdFs> = Arc::new(PidFdFs);
-}
-
-#[derive(Debug)]
-pub struct PidFdFs;
-
-impl PidFdFs {
-    fn instance() -> Arc<Self> {
-        PIDFD_FS.clone()
-    }
-}
-
-impl FileSystem for PidFdFs {
-    fn page_cache_writeback_domain(
-        &self,
-    ) -> Option<&Arc<crate::filesystem::page_cache::PageCacheWritebackDomain>> {
-        None
-    }
-
-    fn root_inode(&self) -> Arc<dyn IndexNode> {
-        Arc::new(PidFdInode::new())
-    }
-
-    fn info(&self) -> FsInfo {
-        FsInfo {
-            blk_dev_id: 0,
-            max_name_len: 255,
-        }
-    }
-
-    fn as_any_ref(&self) -> &dyn Any {
-        self
-    }
-
-    fn name(&self) -> &str {
-        "pidfd"
-    }
-
-    fn super_block(&self) -> SuperBlock {
-        SuperBlock::new(
-            Magic::PIDFD_MAGIC,
-            <crate::arch::MMArch as MemoryManagementArch>::PAGE_SIZE as u64,
-            255,
-        )
-    }
-}
 
 #[derive(Debug)]
 pub struct PidFdInode {
@@ -77,24 +27,7 @@ pub struct PidFdInode {
 impl PidFdInode {
     fn new() -> Self {
         Self {
-            metadata: Metadata {
-                dev_id: 0,
-                inode_id: generate_inode_id(),
-                size: 0,
-                blk_size: 0,
-                blocks: 0,
-                atime: crate::time::PosixTimeSpec::default(),
-                mtime: crate::time::PosixTimeSpec::default(),
-                ctime: crate::time::PosixTimeSpec::default(),
-                btime: crate::time::PosixTimeSpec::default(),
-                file_type: FileType::File,
-                mode: InodeMode::from_bits_truncate(0o600),
-                nlinks: 1,
-                uid: 0,
-                gid: 0,
-                raw_dev: Default::default(),
-                flags: InodeFlags::empty(),
-            },
+            metadata: anon_inode_metadata(InodeMode::S_IRUSR | InodeMode::S_IWUSR),
         }
     }
 }
@@ -137,7 +70,7 @@ impl IndexNode for PidFdInode {
     }
 
     fn fs(&self) -> Arc<dyn FileSystem> {
-        PidFdFs::instance()
+        AnonInodeFs::instance()
     }
 
     fn as_any_ref(&self) -> &dyn Any {
@@ -152,8 +85,12 @@ impl IndexNode for PidFdInode {
         Ok(self.metadata.clone())
     }
 
+    fn stat_mode(&self, metadata: &Metadata) -> InodeMode {
+        metadata.mode
+    }
+
     fn absolute_path(&self) -> Result<String, SystemError> {
-        Ok(String::from("anon_inode:[pidfd]"))
+        Ok(anon_inode_path("[pidfd]"))
     }
 
     fn as_pollable_inode(&self) -> Result<&dyn PollableInode, SystemError> {

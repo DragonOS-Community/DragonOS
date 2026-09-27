@@ -96,6 +96,7 @@ impl OvlInode {
         context: Option<&DentryMutationContext<'_>>,
     ) -> Result<CopyUpOutcome, SystemError> {
         let fs = self.overlay_fs()?;
+        fs.require_upper()?;
         let caller_cred = ProcessManager::current_pcb().cred();
         let _cred_guard = CredOverrideGuard::new(fs.backing_cred.clone())?;
         let mut upper_inode = self.upper_inode.lock();
@@ -305,7 +306,7 @@ impl OvlInode {
     fn lower_dir_inodes(&self, path: &str) -> Result<Vec<Arc<dyn IndexNode>>, SystemError> {
         let fs = self.overlay_fs()?;
         let mut lowers = Vec::new();
-        for layer in fs.layers.iter().skip(1) {
+        for layer in fs.layers.iter().filter(|layer| layer.index != 0) {
             if let Some(lower_root) = layer.mnt.lower_inodes.first() {
                 match lower_root.lookup(path) {
                     Ok(inode) if inode.metadata()?.file_type == FileType::Dir => lowers.push(inode),

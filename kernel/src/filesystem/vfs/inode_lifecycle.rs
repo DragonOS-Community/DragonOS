@@ -127,6 +127,32 @@ pub struct InodeRetentionGuard {
     kind: InodeRetentionKind,
 }
 
+/// Owns an unlinked inode between filesystem creation and File construction.
+/// An Arc alone cannot prevent ext4's deferred zero-link eviction.
+#[derive(Debug)]
+pub struct UnlinkedFile {
+    inode: Arc<dyn IndexNode>,
+    _operation: InodeRetentionGuard,
+}
+
+impl UnlinkedFile {
+    pub fn new(inode: Arc<dyn IndexNode>) -> Result<Self, SystemError> {
+        let operation = InodeRetentionGuard::new(inode.clone(), InodeRetentionKind::Operation)?;
+        Ok(Self {
+            inode,
+            _operation: operation,
+        })
+    }
+
+    pub fn inode(&self) -> Arc<dyn IndexNode> {
+        self.inode.clone()
+    }
+
+    pub fn replace_inode(&mut self, inode: Arc<dyn IndexNode>) {
+        self.inode = inode;
+    }
+}
+
 impl InodeRetentionGuard {
     pub fn new(inode: Arc<dyn IndexNode>, kind: InodeRetentionKind) -> Result<Self, SystemError> {
         inode.retain(kind)?;

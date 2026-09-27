@@ -9,11 +9,9 @@ use system_error::SystemError;
 
 use crate::process::{
     cred::{ns_capable, CAPFlags, Cred, Kgid, Kuid},
-    namespace::user_namespace::{map_id_down, map_id_up, UserNamespace},
+    namespace::user_namespace::{from_kgid_munged, from_kuid_munged, UserNamespace},
     ProcessManager,
 };
-
-const DEFAULT_OVERFLOW_ID: u32 = 65534;
 
 /// Permission bits shared by all SysV IPC objects, matching Linux `ipc_perm.mode`.
 pub const PERM_MASK: u32 = 0o777;
@@ -60,10 +58,10 @@ pub trait IpcPermView {
     fn to_posix(&self, user_ns: &Arc<UserNamespace>) -> Result<PosixIpcPerm, SystemError> {
         Ok(PosixIpcPerm {
             key: self.key() as u32 as i32,
-            uid: kuid_to_user(user_ns, self.uid()),
-            gid: kgid_to_user(user_ns, self.gid()),
-            cuid: kuid_to_user(user_ns, self.cuid()),
-            cgid: kgid_to_user(user_ns, self.cgid()),
+            uid: from_kuid_munged(user_ns, self.uid()),
+            gid: from_kgid_munged(user_ns, self.gid()),
+            cuid: from_kuid_munged(user_ns, self.cuid()),
+            cgid: from_kgid_munged(user_ns, self.cgid()),
             mode: self.mode(),
             seq: self.seq().to_i32().ok_or(SystemError::EOVERFLOW)?,
             _pad1: 0,
@@ -194,44 +192,10 @@ pub fn check_lock_permission<P: IpcPermView>(
 }
 
 fn cred_in_group(cred: &Cred, gid: Kgid) -> bool {
-    cred.fsgid == gid
-        || cred.groups.contains(&gid)
-        || cred
-            .group_info
-            .as_ref()
-            .map(|group_info| group_info.gids.contains(&gid))
-            .unwrap_or(false)
+    cred.fsgid == gid || cred.groups.contains(&gid)
 }
 
-pub fn make_kuid(user_ns: &Arc<UserNamespace>, uid: u32) -> Result<Kuid, SystemError> {
-    let inner = user_ns.inner.lock();
-    map_id_down(&inner.uid_map, uid)
-        .map(|uid| Kuid::new(uid as usize))
-        .ok_or(SystemError::EINVAL)
-}
-
-pub fn make_kgid(user_ns: &Arc<UserNamespace>, gid: u32) -> Result<Kgid, SystemError> {
-    let inner = user_ns.inner.lock();
-    map_id_down(&inner.gid_map, gid)
-        .map(|gid| Kgid::new(gid as usize))
-        .ok_or(SystemError::EINVAL)
-}
-
-pub fn kuid_to_user(user_ns: &Arc<UserNamespace>, kuid: Kuid) -> u32 {
-    let Ok(uid) = u32::try_from(kuid.data()) else {
-        return DEFAULT_OVERFLOW_ID;
-    };
-    let inner = user_ns.inner.lock();
-    map_id_up(&inner.uid_map, uid).unwrap_or(DEFAULT_OVERFLOW_ID)
-}
-
-pub fn kgid_to_user(user_ns: &Arc<UserNamespace>, kgid: Kgid) -> u32 {
-    let Ok(gid) = u32::try_from(kgid.data()) else {
-        return DEFAULT_OVERFLOW_ID;
-    };
-    let inner = user_ns.inner.lock();
-    map_id_up(&inner.gid_map, gid).unwrap_or(DEFAULT_OVERFLOW_ID)
-}
+pub use crate::process::namespace::user_namespace::{make_kgid, make_kuid};
 
 /// IPC permission object in the userspace ABI, matching Linux `struct ipc_perm` (48 bytes on x86_64).
 #[repr(C)]

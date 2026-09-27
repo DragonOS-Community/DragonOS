@@ -584,6 +584,43 @@ TEST(TcpCloseSemantics, ShutdownWrThenZeroLingerCloseAborts) {
         << "expected EPIPE/ECONNRESET, got " << ErrnoString(saved_errno);
 }
 
+TEST(TcpCloseSemantics, ZeroLingerDoesNotOvertakeSentDualStackData) {
+    signal(SIGPIPE, SIG_IGN);
+
+    // The accepted socket is the sender, matching gVisor's reversed dual-stack
+    // case. Repeated short connections exercise contention with the TCP poller.
+    for (int iteration = 0; iteration < 100; ++iteration) {
+        SCOPED_TRACE(iteration);
+        TcpPair pair;
+        ASSERT_TRUE(InitDualStackTcpPair(&pair));
+
+        linger linger_opt {
+            .l_onoff = 1,
+            .l_linger = 0,
+        };
+        ASSERT_EQ(0,
+                  setsockopt(pair.server_fd.Get(),
+                             SOL_SOCKET,
+                             SO_LINGER,
+                             &linger_opt,
+                             sizeof(linger_opt)));
+
+        char sent[1000] = {};
+        ASSERT_EQ(static_cast<ssize_t>(sizeof(sent)),
+                  write(pair.server_fd.Get(), sent, sizeof(sent)))
+            << ErrnoString(errno);
+        pair.server_fd.Reset();
+
+        // As in the reference test, a peer write may race with the reset.
+        const ssize_t peer_write = write(pair.client_fd.Get(), sent, sizeof(sent));
+        (void)peer_write;
+        char received[sizeof(sent)] = {};
+        ASSERT_EQ(static_cast<ssize_t>(sizeof(received)),
+                  read(pair.client_fd.Get(), received, sizeof(received)))
+            << ErrnoString(errno);
+    }
+}
+
 TEST(TcpCloseSemantics, ShutdownWrThenUnreadDataCloseAborts) {
     signal(SIGPIPE, SIG_IGN);
     TcpPair pair;

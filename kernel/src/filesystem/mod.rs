@@ -1,3 +1,4 @@
+pub mod anon_inode;
 pub mod cgroup2;
 pub mod debugfs;
 pub mod devfs;

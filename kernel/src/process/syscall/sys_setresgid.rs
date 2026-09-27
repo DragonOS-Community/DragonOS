@@ -1,6 +1,6 @@
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_SETRESGID;
-use crate::process::cred::Cred;
+use crate::process::cred::{CAPFlags, Cred};
 use crate::process::syscall::id_utils;
 use crate::process::ProcessManager;
 use crate::syscall::table::FormattedSyscallParam;
@@ -30,16 +30,11 @@ impl Syscall for SysSetResGid {
     }
 
     fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
-        let rgid = Self::rgid(args);
-        let egid = Self::egid(args);
-        let sgid = Self::sgid(args);
-
-        id_utils::validate_id(rgid)?;
-        id_utils::validate_id(egid)?;
-        id_utils::validate_id(sgid)?;
-
         let pcb = ProcessManager::current_pcb();
         let old_cred = pcb.cred();
+        let rgid = id_utils::map_gid_arg(&old_cred.user_ns, Self::rgid(args), true)?;
+        let egid = id_utils::map_gid_arg(&old_cred.user_ns, Self::egid(args), true)?;
+        let sgid = id_utils::map_gid_arg(&old_cred.user_ns, Self::sgid(args), true)?;
 
         let old_rgid = old_cred.gid.data();
         let old_egid = old_cred.egid.data();
@@ -49,7 +44,15 @@ impl Syscall for SysSetResGid {
         let new_egid = id_utils::resolve_id(egid, old_egid);
         let new_sgid = id_utils::resolve_id(sgid, old_sgid);
 
-        let is_privileged = old_cred.euid.data() == 0;
+        if new_rgid == old_rgid
+            && new_sgid == old_sgid
+            && new_egid == old_egid
+            && (id_utils::is_no_change(egid) || new_egid == old_cred.fsgid.data())
+        {
+            return Ok(0);
+        }
+
+        let is_privileged = old_cred.has_capability(CAPFlags::CAP_SETGID);
         id_utils::check_setres_permissions(
             old_rgid,
             old_egid,
@@ -73,9 +76,7 @@ impl Syscall for SysSetResGid {
         }
 
         // fsgid 跟随 egid
-        if !id_utils::is_no_change(egid) {
-            new_cred.setfsgid(new_egid);
-        }
+        new_cred.setfsgid(new_egid);
 
         pcb.commit_cred(Cred::new_arc(new_cred))?;
         Ok(0)

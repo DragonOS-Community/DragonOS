@@ -216,8 +216,6 @@ pub struct ProcessControlBlock {
 
     /// prctl(PR_SET/GET_KEEPCAPS) state: thread-level (task) semantics.
     /// When true, the process retains capabilities after changing UID/GID.
-    pub(super) keepcaps: AtomicBool,
-
     pub(super) seccomp_mode: AtomicU8,
     pub(super) seccomp_filter: SpinLock<Option<Arc<seccomp::SeccompFilter>>>,
 
@@ -307,6 +305,9 @@ pub struct ProcessControlBlock {
 
     /// Credential set for the process as a subject.
     pub(super) cred: RcuArcSlot<Cred>,
+    /// KEYCTL_SESSION_TO_PARENT handoff.  Consumed by this task at its next
+    /// return-to-userspace boundary, never by the child in another context.
+    pending_session_keyring: SpinLock<Option<crate::security::keys::KeyRef>>,
     pub(super) self_ref: Weak<ProcessControlBlock>,
 
     pub(super) restart_block: SpinLock<Option<RestartBlock>>,
@@ -360,14 +361,25 @@ impl ProcessControlBlock {
     /// ## Returns
     ///
     /// A new PCB.
-    pub fn new(name: String, kstack: KernelStack, share_resource_limits: bool) -> Arc<Self> {
+    pub fn new(
+        name: String,
+        kstack: KernelStack,
+        share_resource_limits: bool,
+    ) -> Result<Arc<Self>, SystemError> {
         let current = ProcessManager::current_pcb();
         let rlimits = if share_resource_limits {
             current.rlimits.clone()
         } else {
             Arc::new(RwLock::new(*current.rlimits.read()))
         };
-        return Self::do_create_pcb(name, kstack, false, Some(rlimits));
+        let syscall_stack = KernelStack::new()?;
+        Ok(Self::do_create_pcb(
+            name,
+            kstack,
+            syscall_stack,
+            false,
+            Some(rlimits),
+        ))
     }
 
     /// Create a new idle process.
@@ -376,7 +388,8 @@ impl ProcessControlBlock {
     /// initialization.
     pub fn new_idle(cpu_id: u32, kstack: KernelStack) -> Arc<Self> {
         let name = format!("idle-{}", cpu_id);
-        return Self::do_create_pcb(name, kstack, true, None);
+        let syscall_stack = KernelStack::new().expect("idle syscall stack allocation failed");
+        return Self::do_create_pcb(name, kstack, syscall_stack, true, None);
     }
 
     /// Returns whether the process is a kernel thread.
@@ -462,6 +475,7 @@ impl ProcessControlBlock {
     fn do_create_pcb(
         name: String,
         kstack: KernelStack,
+        syscall_stack: KernelStack,
         is_idle: bool,
         rlimits: Option<Arc<RwLock<[RLimit64; RLimitID::Nlimits as usize]>>>,
     ) -> Arc<Self> {
@@ -545,7 +559,7 @@ impl ProcessControlBlock {
                 visible_thread_accounted: AtomicBool::new(false),
                 task_lock: SpinLock::new(()),
                 kernel_stack: RwLock::new(kstack),
-                syscall_stack: RwLock::new(KernelStack::new().unwrap()),
+                syscall_stack: RwLock::new(syscall_stack),
                 worker_private: SpinLock::new(None),
                 sched_info,
                 arch_info,
@@ -561,7 +575,6 @@ impl ProcessControlBlock {
                 pdeath_signal: AtomicSignal::new(Signal::INVALID),
 
                 no_new_privs: AtomicBool::new(false),
-                keepcaps: AtomicBool::new(false),
                 seccomp_mode: AtomicU8::new(seccomp::SeccompMode::Disabled as u8),
                 seccomp_filter: SpinLock::new(None),
                 parent_pcb: RwLock::new(ppcb.clone()),
@@ -588,6 +601,7 @@ impl ProcessControlBlock {
                 robust_list: RwLock::new(None),
                 rseq_state: RwLock::new(rseq::RseqState::new()),
                 cred: RcuArcSlot::new(cred),
+                pending_session_keyring: SpinLock::new(None),
                 self_ref: weak.clone(),
                 restart_block: SpinLock::new(None),
                 executable_path: RwLock::new(name),
@@ -874,12 +888,14 @@ impl ProcessControlBlock {
 
     #[inline(always)]
     pub fn keepcaps(&self) -> bool {
-        self.keepcaps.load(Ordering::SeqCst)
+        self.cred().keepcaps
     }
 
     #[inline(always)]
-    pub fn set_keepcaps(&self, value: bool) {
-        self.keepcaps.store(value, Ordering::SeqCst);
+    pub fn set_keepcaps(&self, value: bool) -> Result<(), SystemError> {
+        let mut cred = (*self.cred()).clone();
+        cred.keepcaps = value;
+        self.commit_cred(Cred::new_arc(cred))
     }
 
     #[inline(always)]
@@ -1069,6 +1085,9 @@ impl ProcessControlBlock {
 
     /// Install credentials after every fallible preparation step has completed.
     pub(crate) fn install_cred(&self, new: Arc<Cred>) {
+        if new.thread_keyring.is_some() {
+            new.sync_thread_keyring_owner(&self.cred());
+        }
         let _task_guard = self.task_lock.lock_irqsave();
         self.cred.store_deferred(new);
     }
@@ -1116,6 +1135,11 @@ impl ProcessControlBlock {
         // write side and must not recursively acquire this read lock.
         let _exec_guard = new_cred.as_ref().map(|_| self.exec_update_read());
         let active_mm = new_cred.as_ref().and_then(|_| self.basic().user_vm());
+        if let Some((cred, _)) = new_cred.as_ref() {
+            if cred.thread_keyring.is_some() {
+                cred.sync_thread_keyring_owner(&self.cred());
+            }
+        }
         let (retired_fs, nsproxy_retirement, cred_retirement) = {
             let _task_guard = self.task_lock.lock_irqsave();
             let retired_fs = new_fs.map(|fs| self.swap_fs_slot_locked(fs));
@@ -1146,11 +1170,39 @@ impl ProcessControlBlock {
         // credentials; exec uses the write side of this same lock.
         let _exec_guard = self.exec_update_read();
         let active_mm = self.basic().user_vm();
+        if new.thread_keyring.is_some() {
+            new.sync_thread_keyring_owner(&self.cred());
+        }
         let _task_guard = self.task_lock.lock_irqsave();
         let old = self.cred();
         self.commit_cred_side_effects(&old, &new, active_mm.as_ref());
         self.cred.store_deferred(new);
         Ok(())
+    }
+
+    /// Queue a child-requested session handoff.  A later request replaces the
+    /// previous one, matching Linux task_work_cancel_func() + task_work_add().
+    pub(crate) fn queue_session_keyring(
+        &self,
+        ring: crate::security::keys::KeyRef,
+    ) -> Option<crate::security::keys::KeyRef> {
+        self.pending_session_keyring.lock().replace(ring)
+    }
+
+    pub(crate) fn take_pending_session_keyring(&self) -> Option<crate::security::keys::KeyRef> {
+        self.pending_session_keyring.lock().take()
+    }
+
+    /// Keep a queued handoff across a transient allocation failure without
+    /// replacing a newer child request that arrived meanwhile.
+    pub(crate) fn restore_pending_session_keyring_if_empty(
+        &self,
+        ring: crate::security::keys::KeyRef,
+    ) {
+        let mut pending = self.pending_session_keyring.lock();
+        if pending.is_none() {
+            *pending = Some(ring);
+        }
     }
 
     /// Caller holds exec_update_lock and task_lock; publish these effects before creds.

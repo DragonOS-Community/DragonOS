@@ -55,6 +55,7 @@ fn remove(
     context: Option<&DentryMutationContext<'_>>,
 ) -> Result<vfs::LinkRemovalOutcome, SystemError> {
     let fs = inode.overlay_fs()?;
+    fs.require_upper()?;
     // rmdir keeps the mount-wide commit lock because it nests a child directory
     // emptiness check. Unlink only needs the stable parent namespace lock.
     let _commit_guard = is_dir.then(|| fs.mutation_lock.lock());
@@ -164,6 +165,7 @@ pub(super) fn link(
     other: &Arc<dyn IndexNode>,
 ) -> Result<(), system_error::SystemError> {
     let fs = inode.overlay_fs()?;
+    fs.require_upper()?;
     let state = inode.dir_state()?;
     let _mutation_guard = state.mutation_lock.lock();
 

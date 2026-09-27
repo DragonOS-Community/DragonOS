@@ -379,6 +379,7 @@ let
 
       # 动态网络配置（使用动态分配的端口）
       NET_ARGS=( "-netdev" "user,id=hostnet0,hostfwd=tcp::$HOST_PORT-:12580" "-device" "virtio-net-pci,vectors=5,netdev=hostnet0,id=net0" )
+      RNG_ARGS=( "-device" "${if arch == "riscv64" then "virtio-rng-device" else "virtio-rng-pci"}" )
 
       echo -e "================== DragonOS QEMU Command Preview =================="
       echo -e "Binary: sudo ${qemuBin}"
@@ -387,6 +388,7 @@ let
       echo -e "Boot Args: ''${BOOT_ARGS[*]}"
       echo -e "Disk Args: ''${DISK_ARGS[*]}"
       echo -e "Net Args: ''${NET_ARGS[*]}"
+      echo -e "Rng Args: ''${RNG_ARGS[*]}"
       echo -e "Vsock Args: ''${VSOCK_ARGS[*]}"
       echo -e "Host Port: $HOST_PORT"
       echo -e "=================================================================="
@@ -406,7 +408,7 @@ let
                 GDB_ARGS+=( "-S" )
               fi
             ''}
-            sudo bash -c 'pidfile="$1"; shift; echo $$ > "$pidfile"; exec "$@"' bash "$VMSTATE_DIR/pid" ${qemuBin} ${qemuFlagsStr} "''${NET_ARGS[@]}" ${
+            sudo bash -c 'pidfile="$1"; shift; echo $$ > "$pidfile"; exec "$@"' bash "$VMSTATE_DIR/pid" ${qemuBin} ${qemuFlagsStr} "''${NET_ARGS[@]}" "''${RNG_ARGS[@]}" ${
               if qemuFirmware != null then "-L ${qemuFirmware}" else ""
             } "''${ARCH_FLAGS[@]}" "''${BOOT_ARGS[@]}" "''${DISK_ARGS[@]}" "''${VSOCK_ARGS[@]}" ${lib.optionalString debug ''"''${GDB_ARGS[@]}"''} "$@"
           ''
@@ -418,7 +420,7 @@ let
                 GDB_ARGS+=( "-S" )
               fi
             ''}
-            sudo ${qemuBin} ${qemuFlagsStr} "''${NET_ARGS[@]}" ${
+            sudo ${qemuBin} ${qemuFlagsStr} "''${NET_ARGS[@]}" "''${RNG_ARGS[@]}" ${
               if qemuFirmware != null then "-L ${qemuFirmware}" else ""
             } "''${ARCH_FLAGS[@]}" "''${BOOT_ARGS[@]}" "''${DISK_ARGS[@]}" "''${VSOCK_ARGS[@]}" ${lib.optionalString debug ''"''${GDB_ARGS[@]}"''} "$@"
           ''

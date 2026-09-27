@@ -68,7 +68,7 @@ impl SysVShmBacking for TmpfsShmemFile {
         } else {
             FileFlags::O_RDWR | FileFlags::O_LARGEFILE
         };
-        Ok(Arc::new(File::new(self.inode(), flags)?))
+        Ok(Arc::new(File::new_pseudo(self.inode(), flags)?))
     }
 
     fn resident_pages(&self) -> Result<usize, SystemError> {

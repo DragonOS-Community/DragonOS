@@ -214,6 +214,10 @@ fn do_execve_internal(
             address_space.write().user_stack = Some(ustack_message);
 
             let pcb = ProcessManager::current_pcb();
+            let prepared_exec_cred = match pcb.cred().prepare_exec_keyrings() {
+                Ok(prepared) => prepared,
+                Err(err) => return finish_exec_error(&param, old_vm.as_ref(), err),
+            };
 
             commit_exec_futex_state(&pcb, old_vm.as_ref(), &address_space);
 
@@ -248,6 +252,12 @@ fn do_execve_internal(
             // 否则父子仍可能共享 files_struct，child 的 close_on_exec() 会污染父进程。
             if let Err(err) = Syscall::arch_do_execve(regs, &param, &result, user_sp, argv_ptr) {
                 return finish_exec_error(&param, old_vm.as_ref(), err);
+            }
+            // Successful exec clears thread/process keyrings and KEEP_CAPS,
+            // while retaining the session keyring.  Preparation happened
+            // before the last fallible call above; commit cannot now fail.
+            if let Some(cred) = prepared_exec_cred {
+                pcb.install_cred(cred);
             }
             // A successful exec does not inherit ptrace hardware debug state.
             exec_pcb.flush_ptrace_hw_debug_regs();

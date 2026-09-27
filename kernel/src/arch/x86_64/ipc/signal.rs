@@ -1004,6 +1004,7 @@ impl SignalArch for X86_64SignalArch {
     ///
     /// 参考： https://code.dragonos.org.cn/xref/linux-6.1.9/arch/x86/kernel/signal.c#865
     unsafe fn do_signal_or_restart(frame: &mut TrapFrame) {
+        crate::security::keys::apply_pending_session_keyring();
         // Before returning to user space, check JOBCTL_TRAP_STOP and initiate a
         // PTRACE_EVENT_STOP ptrace_stop.
         // Sources: a fork'd seized child's initial stop, PTRACE_INTERRUPT, ptraced group-stop.

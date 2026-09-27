@@ -2,6 +2,7 @@ use super::mmio::virtio_probe_mmio;
 use super::transport_pci::PciTransport;
 use super::virtio_fs::virtio_fs;
 use super::virtio_impl::HalImpl;
+use super::virtio_rng::virtio_rng;
 use crate::driver::base::device::bus::Bus;
 use crate::driver::base::device::{Device, DeviceId};
 use crate::driver::block::virtio_blk::virtio_blk;
@@ -79,6 +80,7 @@ pub(super) fn virtio_device_init(
             warn!("Not support virtio_input device for now");
         }
         DeviceType::Network => virtio_net(transport, dev_id, dev_parent),
+        DeviceType::EntropySource => virtio_rng(transport),
         DeviceType::FileSystem => virtio_fs(transport, dev_id, dev_parent),
         DeviceType::Pmem => virtio_pmem(transport, dev_id, dev_parent),
         DeviceType::Socket => virtio_vsock(transport, dev_id, dev_parent),

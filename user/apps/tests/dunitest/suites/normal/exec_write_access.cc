@@ -10,6 +10,7 @@
 #include <sys/mman.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -17,6 +18,45 @@
 
 namespace {
 std::string self_path;
+
+#ifndef MFD_CLOEXEC
+#define MFD_CLOEXEC 0x0001
+#define MFD_ALLOW_SEALING 0x0002
+#endif
+#ifndef F_SEAL_EXEC
+#define F_SEAL_EXEC 0x0020
+#endif
+
+int clone_self_memfd() {
+    int source = open(self_path.c_str(), O_RDONLY);
+    if (source < 0) return -1;
+    int fd = static_cast<int>(syscall(SYS_memfd_create, "exec-write-access",
+                                      MFD_ALLOW_SEALING | MFD_CLOEXEC));
+    if (fd < 0) {
+        close(source);
+        return -1;
+    }
+    char buffer[16384];
+    ssize_t n;
+    while ((n = read(source, buffer, sizeof(buffer))) > 0) {
+        ssize_t done = 0;
+        while (done < n) {
+            ssize_t written = write(fd, buffer + done, n - done);
+            if (written <= 0) {
+                close(source);
+                close(fd);
+                return -1;
+            }
+            done += written;
+        }
+    }
+    close(source);
+    if (n < 0 || fchmod(fd, 0511) < 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
 
 bool byte_io(int fd, bool writing) {
     char byte = 'R';
@@ -31,6 +71,7 @@ class ExecWriteAccess : public ::testing::Test {
 protected:
     std::string directory, image, alias;
     pid_t child = -1;
+    int memfd = -1;
     int ready[2] = {-1, -1}, release[2] = {-1, -1};
 
     void SetUp() override {
@@ -73,12 +114,13 @@ protected:
             while (waitpid(child, &status, 0) < 0 && errno == EINTR) {}
         }
         for (int fd : ready) if (fd >= 0) close(fd);
+        if (memfd >= 0) close(memfd);
         unlink(alias.c_str());
         unlink(image.c_str());
         rmdir(directory.c_str());
     }
 
-    void start(bool fork_then_exec = false) {
+    void start(bool fork_then_exec = false, const std::string& executable = "") {
         child = fork();
         ASSERT_GE(child, 0);
         if (child == 0) {
@@ -87,7 +129,8 @@ protected:
             char output[24], input[24];
             snprintf(output, sizeof(output), "%d", ready[1]);
             snprintf(input, sizeof(input), "%d", release[0]);
-            execl(image.c_str(), image.c_str(),
+            const char* path = executable.empty() ? image.c_str() : executable.c_str();
+            execl(path, path,
                   fork_then_exec ? "--fork-image" : "--hold-image",
                   output, input, self_path.c_str(), nullptr);
             _exit(errno);
@@ -109,10 +152,11 @@ protected:
         ASSERT_EQ(0, WEXITSTATUS(status));
     }
 
-    int exec_errno() {
+    int exec_errno(const std::string& executable = "") {
         pid_t pid = fork();
         if (pid == 0) {
-            execl(image.c_str(), image.c_str(), "--exit-image", nullptr);
+            const char* path = executable.empty() ? image.c_str() : executable.c_str();
+            execl(path, path, "--exit-image", nullptr);
             _exit(errno);
         }
         if (pid < 0) return -1;
@@ -263,6 +307,47 @@ TEST_F(ExecWriteAccess, RejectedFormatReleasesTemporaryDeny) {
     close(fd);
     EXPECT_EQ(ENOEXEC, exec_errno());
     expect_writable();
+}
+
+TEST_F(ExecWriteAccess, InternalMemfdExecAndProcfdReopenHaveDistinctWriteCounts) {
+    memfd = clone_self_memfd();
+    ASSERT_GE(memfd, 0) << strerror(errno);
+    const std::string procfd = "/proc/self/fd/" + std::to_string(memfd);
+    ASSERT_EQ(O_RDWR, fcntl(memfd, F_GETFL) & O_ACCMODE);
+
+    // Linux alloc_file_pseudo() leaves the initial O_RDWR fd open while exec
+    // succeeds. A fresh path open through procfs must still count as a writer.
+    EXPECT_EQ(0, exec_errno(procfd));
+    int reopened = open(procfd.c_str(), O_RDWR);
+    ASSERT_GE(reopened, 0) << strerror(errno);
+    EXPECT_EQ(ETXTBSY, exec_errno(procfd));
+    ASSERT_EQ(0, close(reopened));
+    EXPECT_EQ(0, exec_errno(procfd));
+
+    // Match runc's sealing order without closing the original writable fd.
+    ASSERT_EQ(0, fcntl(memfd, F_ADD_SEALS, F_SEAL_EXEC));
+    ASSERT_EQ(0, fcntl(memfd, F_ADD_SEALS,
+                       F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE));
+    const char byte = 'x';
+    errno = 0;
+    EXPECT_EQ(-1, pwrite(memfd, &byte, 1, 0));
+    EXPECT_EQ(EPERM, errno);
+    EXPECT_EQ(0, exec_errno(procfd));
+
+    ASSERT_NO_FATAL_FAILURE(start(false, procfd));
+    errno = 0;
+    EXPECT_EQ(-1, open(procfd.c_str(), O_RDWR));
+    EXPECT_EQ(ETXTBSY, errno);
+    ASSERT_NO_FATAL_FAILURE(finish());
+}
+
+TEST_F(ExecWriteAccess, OpenTmpfileStillCountsAsPathWriter) {
+    // O_TMPFILE is opened via a directory path; it is not alloc_file_pseudo.
+    int fd = open(directory.c_str(), O_TMPFILE | O_RDWR, 0700);
+    ASSERT_GE(fd, 0) << strerror(errno);
+    const std::string procfd = "/proc/self/fd/" + std::to_string(fd);
+    EXPECT_EQ(ETXTBSY, exec_errno(procfd));
+    EXPECT_EQ(0, close(fd));
 }
 
 TEST_F(ExecWriteAccess, ScriptIsWritableWhileItsInterpreterRuns) {

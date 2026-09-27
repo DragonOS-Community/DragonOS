@@ -1,15 +1,14 @@
 use super::vfs::PollableInode;
-use crate::arch::MMArch;
+use crate::filesystem::anon_inode::{anon_inode_metadata, anon_inode_path, AnonInodeFs};
 use crate::filesystem::epoll::event_poll::EPollItemList;
 use crate::filesystem::vfs::file::FileFlags;
 use crate::filesystem::vfs::{InodeMode, OpenFileBehavior, PostWriteSyncPolicy};
 use crate::filesystem::{
     epoll::{event_poll::EventPoll, EPollEventType, EPollItem},
-    vfs::{FilePrivateData, FileSystem, FileType, FsInfo, IndexNode, Magic, Metadata, SuperBlock},
+    vfs::{FilePrivateData, FileSystem, IndexNode, Metadata},
 };
 use crate::libs::mutex::{Mutex, MutexGuard};
 use crate::libs::wait_queue::WaitQueue;
-use crate::mm::MemoryManagementArch;
 use crate::process::ProcessManager;
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -20,59 +19,8 @@ use system_error::SystemError;
 
 const EVENTFD_MAX: u64 = u64::MAX - 1;
 
-lazy_static::lazy_static! {
-    static ref EVENTFD_FS: Arc<EventFdFs> = Arc::new(EventFdFs);
-}
-
 pub static EVENTFD_ID_ALLOCATOR: Mutex<IdAllocator> =
     Mutex::new(IdAllocator::new(0, u32::MAX as usize).unwrap());
-
-/// EventFd 文件系统
-///
-/// EventFd 是一个伪文件系统，类似于 PipeFS，用于支持 eventfd 文件描述符
-#[derive(Debug)]
-pub struct EventFdFs;
-
-impl EventFdFs {
-    /// 获取全局 EventFdFs 实例
-    pub fn instance() -> Arc<EventFdFs> {
-        EVENTFD_FS.clone()
-    }
-}
-
-impl FileSystem for EventFdFs {
-    fn page_cache_writeback_domain(
-        &self,
-    ) -> Option<&Arc<crate::filesystem::page_cache::PageCacheWritebackDomain>> {
-        None
-    }
-
-    fn root_inode(&self) -> Arc<dyn IndexNode> {
-        // EventFdFs 没有真正的根 inode，但我们需要实现这个方法
-        // 返回一个空的 eventfd inode 作为占位符
-        // 注意：这通常不会被调用，因为 eventfd 不是挂载的文件系统
-        Arc::new(EventFdInode::new(EventFd::new(0, EventFdFlags::empty(), 0)))
-    }
-
-    fn info(&self) -> FsInfo {
-        FsInfo {
-            blk_dev_id: 0,
-            max_name_len: 255,
-        }
-    }
-
-    fn as_any_ref(&self) -> &dyn Any {
-        self
-    }
-
-    fn name(&self) -> &str {
-        "eventfd"
-    }
-
-    fn super_block(&self) -> SuperBlock {
-        SuperBlock::new(Magic::EVENTFD_MAGIC, MMArch::PAGE_SIZE as u64, 255)
-    }
-}
 
 bitflags! {
     pub struct EventFdFlags: u32{
@@ -302,12 +250,11 @@ impl IndexNode for EventFdInode {
     }
 
     fn metadata(&self) -> Result<Metadata, SystemError> {
-        let meta = Metadata {
-            mode: InodeMode::from_bits_truncate(0o755),
-            file_type: FileType::File,
-            ..Default::default()
-        };
-        Ok(meta)
+        Ok(anon_inode_metadata(InodeMode::S_IRUSR | InodeMode::S_IWUSR))
+    }
+
+    fn stat_mode(&self, metadata: &Metadata) -> InodeMode {
+        metadata.mode
     }
 
     fn resize(&self, _len: usize) -> Result<(), SystemError> {
@@ -315,7 +262,7 @@ impl IndexNode for EventFdInode {
     }
 
     fn fs(&self) -> Arc<dyn FileSystem> {
-        EventFdFs::instance()
+        AnonInodeFs::instance()
     }
 
     fn as_any_ref(&self) -> &dyn Any {
@@ -331,6 +278,6 @@ impl IndexNode for EventFdInode {
     }
 
     fn absolute_path(&self) -> Result<String, SystemError> {
-        Ok(String::from("eventfd"))
+        Ok(anon_inode_path("[eventfd]"))
     }
 }

@@ -1,6 +1,6 @@
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_SETUID;
-use crate::process::cred::Cred;
+use crate::process::cred::{CAPFlags, Cred};
 use crate::process::syscall::id_utils;
 use crate::process::ProcessManager;
 use crate::syscall::table::FormattedSyscallParam;
@@ -22,12 +22,9 @@ impl Syscall for SysSetUid {
     }
 
     fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
-        let uid = Self::uid(args);
-        // setuid 不接受 -1，使用专门的验证函数
-        id_utils::validate_setuid_id(uid)?;
-
         let pcb = ProcessManager::current_pcb();
         let old_cred = pcb.cred();
+        let uid = id_utils::map_uid_arg(&old_cred.user_ns, Self::uid(args), false)?;
 
         let old_ruid = old_cred.uid.data();
         let old_euid = old_cred.euid.data();
@@ -35,16 +32,13 @@ impl Syscall for SysSetUid {
 
         let mut new_cred = (*old_cred).clone();
 
-        if old_cred.euid.data() == 0 {
+        if old_cred.has_capability(CAPFlags::CAP_SETUID) {
             // 特权进程：设置所有 UID
             new_cred.setuid(uid);
             new_cred.seteuid(uid);
             new_cred.setsuid(uid);
             new_cred.setfsuid(uid);
-        } else if uid == old_cred.uid.data()
-            || uid == old_cred.euid.data()
-            || uid == old_cred.suid.data()
-        {
+        } else if uid == old_cred.uid.data() || uid == old_cred.suid.data() {
             // 非特权进程：只能设置 euid 为当前 ruid/euid/suid 之一
             new_cred.seteuid(uid);
             new_cred.setfsuid(uid);

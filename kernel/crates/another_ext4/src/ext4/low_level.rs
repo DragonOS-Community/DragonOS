@@ -2815,6 +2815,19 @@ impl Ext4 {
         Ok(Self::file_attr(&inode))
     }
 
+    /// Read only an already resident inode image. A miss must not reach the
+    /// block device: openat2(RESOLVE_CACHED) can retry without that flag.
+    pub fn getattr_cached(&self, id: InodeId) -> Result<Option<FileAttr>> {
+        let _view = self.lock_metadata_read_view()?;
+        let Some(inode) = self.inode_cache.lock().get(id) else {
+            return Ok(None);
+        };
+        if inode.inode.mode().bits() == 0 {
+            return_error!(ErrCode::EINVAL, "Invalid inode {}", id);
+        }
+        Ok(Some(Self::file_attr(&inode)))
+    }
+
     fn file_attr(inode: &InodeRef) -> FileAttr {
         // Get device number for device nodes
         let rdev = if inode.inode.is_device() {
@@ -3197,6 +3210,46 @@ impl Ext4 {
         self.transaction_link_inode(&mut transaction, &mut parent, &mut child, name, false)?;
         self.commit_namespace_transaction(transaction)?;
         Ok(Self::file_attr(&child))
+    }
+
+    /// Allocate an unlinked regular inode for O_TMPFILE. In journal mode the
+    /// inode allocation and orphan-list insertion are one durable operation.
+    pub fn tmpfile_with_owner_and_attr(
+        &self,
+        parent: InodeId,
+        mode: InodeMode,
+        owner: InodeOwner,
+    ) -> Result<(FileAttr, InodeReclaimHandle)> {
+        self.ensure_mutable()?;
+        let _metadata_guard = self.lock_transactional_metadata_mutation()?;
+        let _namespace_guard = self.namespace_lock.lock();
+        let _mutation_guards = self.lock_inode_mutations(&[parent]);
+        let parent_ref = self.read_inode(parent)?;
+        if !parent_ref.inode.is_dir() {
+            return_error!(ErrCode::ENOTDIR, "Inode {} is not a directory", parent);
+        }
+        if parent_ref.inode.link_count() == 0 {
+            // ext4_new_inode rejects creation beneath an unlinked directory;
+            // unlike tmpfs, O_TMPFILE still goes through that allocator.
+            return_error!(ErrCode::EPERM, "Directory {} has no links", parent);
+        }
+        if mode.file_type() != FileType::RegularFile {
+            return_error!(ErrCode::EINVAL, "O_TMPFILE requires a regular inode");
+        }
+        let mut transaction = self.transaction_start(8)?;
+        let mut child =
+            self.transaction_create_inode_with_owner(&mut transaction, mode, owner.uid, owner.gid)?;
+        debug_assert_eq!(child.inode.link_count(), 0);
+        // Keep the orphan record even without a journal: otherwise a crash
+        // after a successful O_TMPFILE open but before the last close would
+        // permanently leak an inode which has no directory entry. Direct
+        // mode still cannot guarantee multi-home crash atomicity.
+        let mut sb = self.read_super_block_cached();
+        self.transaction_orphan_add_zero_link(&mut transaction, &mut child, &mut sb)?;
+        self.commit_namespace_transaction(transaction)?;
+        let attr = Self::file_attr(&child);
+        let reclaim = InodeReclaimHandle::new(child.id, child.inode.generation());
+        Ok((attr, reclaim))
     }
 
     /// Create a symbolic link whose target is initialized before its name is
@@ -4486,6 +4539,23 @@ mod tests {
         );
         assert_eq!(attr.links, 2);
         assert_eq!(attr.rdev, (259, 0x1_0002));
+    }
+
+    #[test]
+    fn getattr_cached_never_falls_back_to_the_block_device() {
+        let fs = make_test_fs(16);
+        assert!(fs.getattr_cached(42).unwrap().is_none());
+
+        let mut inode = Box::new(Inode::default());
+        inode.set_mode(InodeMode::FILE | InodeMode::from_bits_retain(0o600));
+        inode.set_uid(1234);
+        fs.inode_cache.lock().insert(InodeRef::new(42, inode));
+        let attr = fs.getattr_cached(42).unwrap().expect("cached inode");
+        assert_eq!(attr.uid, 1234);
+        assert_eq!(attr.perm.bits(), 0o600);
+
+        fs.inode_cache.lock().invalidate(42);
+        assert!(fs.getattr_cached(42).unwrap().is_none());
     }
 
     struct StubBlockDevice {

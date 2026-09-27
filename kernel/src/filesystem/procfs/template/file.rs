@@ -6,6 +6,7 @@ use crate::{
         vfs::{
             file::FileFlags, vcore::generate_inode_id, FilePrivateData, FileSystem, FileType,
             IndexNode, InodeFlags, InodeMode, Metadata, OpenFileBehavior, PostWriteSyncPolicy,
+            SetMetadataMask,
         },
     },
     time::PosixTimeSpec,
@@ -34,6 +35,7 @@ impl<F: FileOps> ProcFile<F> {
         is_volatile: bool,
         mode: InodeMode,
         data: usize,
+        flags: InodeFlags,
     ) -> Arc<Self> {
         let common = {
             let metadata = Metadata {
@@ -48,7 +50,7 @@ impl<F: FileOps> ProcFile<F> {
                 btime: PosixTimeSpec::default(),
                 file_type: FileType::File,
                 mode,
-                flags: InodeFlags::empty(),
+                flags,
                 nlinks: 1,
                 uid: 0,
                 gid: 0,
@@ -111,7 +113,11 @@ pub trait FileOps: Sync + Send + Sized + Debug {
     }
 
     /// 打开文件时调用，可用于按 open 时上下文初始化 procfs 私有数据
-    fn open(&self, _data: &mut MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
+    fn open(
+        &self,
+        _data: &mut MutexGuard<FilePrivateData>,
+        _flags: &FileFlags,
+    ) -> Result<(), SystemError> {
         Ok(())
     }
 
@@ -136,7 +142,39 @@ impl<F: FileOps + 'static> IndexNode for ProcFile<F> {
 
     fn fs(&self) -> Arc<dyn FileSystem>;
     fn as_any_ref(&self) -> &dyn core::any::Any;
-    fn set_metadata(&self, metadata: &Metadata) -> Result<(), SystemError>;
+    fn set_metadata(&self, metadata: &Metadata) -> Result<(), SystemError> {
+        let current = self.common.metadata()?;
+        if current
+            .flags
+            .intersects(InodeFlags::S_SYSCTL_READONLY | InodeFlags::S_PROC_SYSCTL)
+            && (current.mode != metadata.mode
+                || current.uid != metadata.uid
+                || current.gid != metadata.gid)
+        {
+            return Err(SystemError::EPERM);
+        }
+        self.common.set_metadata(metadata)
+    }
+
+    fn set_metadata_masked(
+        &self,
+        metadata: &Metadata,
+        mask: SetMetadataMask,
+    ) -> Result<(), SystemError> {
+        if mask.is_empty() {
+            return Ok(());
+        }
+        if self
+            .common
+            .metadata()?
+            .flags
+            .intersects(InodeFlags::S_SYSCTL_READONLY | InodeFlags::S_PROC_SYSCTL)
+            && mask.intersects(SetMetadataMask::MODE | SetMetadataMask::UID | SetMetadataMask::GID)
+        {
+            return Err(SystemError::EPERM);
+        }
+        self.common.set_metadata(metadata)
+    }
 
     fn metadata(&self) -> Result<Metadata, SystemError> {
         let mut metadata = self.common.metadata()?;
@@ -181,11 +219,11 @@ impl<F: FileOps + 'static> IndexNode for ProcFile<F> {
     fn open(
         &self,
         mut data: MutexGuard<FilePrivateData>,
-        _flags: &FileFlags,
+        flags: &FileFlags,
     ) -> Result<(), SystemError> {
         // 设置 procfs 私有数据，使得 lseek(SEEK_END) 返回 EINVAL
         *data = FilePrivateData::Procfs(ProcfsFilePrivateData::new());
-        self.inner.open(&mut data)
+        self.inner.open(&mut data, flags)
     }
 
     fn close(&self, _data: MutexGuard<FilePrivateData>) -> Result<(), SystemError> {

@@ -44,6 +44,7 @@ fn move_to_impl(
         .ok_or(SystemError::EXDEV)?;
 
     let fs = inode.overlay_fs()?;
+    fs.require_upper()?;
     let source_state = inode.dir_state()?;
     let target_state = target_ovl.dir_state()?;
     let _commit_guard = fs.mutation_lock.lock();

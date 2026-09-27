@@ -5,6 +5,7 @@ use crate::filesystem::vfs::permission::PermissionMask;
 use crate::filesystem::vfs::syscall::AtFlags;
 use crate::filesystem::vfs::utils::rsplit_path;
 use crate::filesystem::vfs::utils::user_path_at;
+use crate::filesystem::vfs::utils::ResolvedPath;
 use crate::filesystem::vfs::FileType;
 use crate::filesystem::vfs::IndexNode;
 use crate::filesystem::vfs::InodeFlags;
@@ -57,34 +58,48 @@ pub fn do_linkat(
     let follow_last_symlink = flags.contains(AtFlags::AT_SYMLINK_FOLLOW);
     let pcb = ProcessManager::current_pcb();
 
+    // Hold the open file description across linkat. The bare inode Arc does
+    // not count as an ext4 semantic owner: a concurrent close could otherwise
+    // begin final zero-link eviction before link_with_post_commit starts.
+    let old_file = if old.is_empty() && flags.contains(AtFlags::AT_EMPTY_PATH) {
+        let binding = pcb.fd_table();
+        let file = binding
+            .read()
+            .get_file_by_fd(oldfd)
+            .ok_or(SystemError::EBADF)?;
+        Some(file)
+    } else {
+        None
+    };
+
     // 得到源路径的inode
-    let old_inode: Arc<dyn IndexNode> = if old.is_empty() {
+    let (old_inode, _old_path_guard): (Arc<dyn IndexNode>, Option<ResolvedPath>) = if old.is_empty()
+    {
         if flags.contains(AtFlags::AT_EMPTY_PATH) {
             // 在AT_EMPTY_PATH启用时，old可以为空，old_inode实际为oldfd所指文件，但该文件不能为目录。
-            let binding = pcb.fd_table();
-            let fd_table_guard = binding.read();
-            let file = fd_table_guard
-                .get_file_by_fd(oldfd)
-                .ok_or(SystemError::EBADF)?;
-            let old_inode = file.inode();
-            old_inode
+            // The fd's path inode retains the selected mount identity even
+            // when the runtime I/O inode differs for a special file.
+            (old_file.as_ref().unwrap().path_inode(), None)
         } else {
             return Err(SystemError::ENOENT);
         }
     } else {
         let (old_begin_inode, old_remain_path) = user_path_at(&pcb, oldfd, old)?;
-        old_begin_inode.lookup_follow_symlink2(
+        let start = ResolvedPath::new(old_begin_inode.clone())?;
+        let resolved = old_begin_inode.lookup_follow_symlink_owned(
+            &start,
             &old_remain_path,
             VFS_MAX_FOLLOW_SYMLINK_TIMES,
             follow_last_symlink,
-        )?
+        )?;
+        (resolved.inode(), Some(resolved))
     };
 
     // 得到新创建节点的父节点
     let (new_begin_inode, new_remain_path) = user_path_at(&pcb, newfd, new)?;
     let (new_name, new_parent_path) = rsplit_path(&new_remain_path);
     let new_parent = new_begin_inode
-        .lookup_follow_symlink(new_parent_path.unwrap_or("/"), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
+        .lookup_follow_symlink(new_parent_path.unwrap_or("."), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
 
     let new_parent_metadata = new_parent.metadata()?;
     if new_parent_metadata.file_type != FileType::Dir {
@@ -152,6 +167,7 @@ pub fn do_linkat(
         new_parent.link(new_name, &old_inode)?;
         notify();
     }
+    drop(old_file);
     Ok(0)
 }
 

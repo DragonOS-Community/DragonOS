@@ -10,7 +10,9 @@ use crate::{
     },
     exception::InterruptArch,
     ipc::signal_types::{SigCode, SigInfo, SigType},
-    process::{namespace::user_namespace::map_id_up, pid::PidType, ProcessState},
+    process::{
+        cred::Kuid, namespace::user_namespace::from_kuid_munged, pid::PidType, ProcessState,
+    },
     sched::{schedule, SchedMode},
 };
 use alloc::sync::Arc;
@@ -59,15 +61,11 @@ pub fn ptrace_signal(
                 .and_then(|parent| parent.task_pid_nr_ns(PidType::PID, Some(pcb.active_pid_ns())))
                 .map(|p| p.data())
                 .unwrap_or(0);
-            // Fall back to overflowuid (default 65534) when the cross-user-namespace mapping fails
-            const OVERFLOWUID: u32 = 65534;
+            let tracer_ns = pcb.cred().user_ns.clone();
             let sender_uid = sender
                 .as_ref()
-                .map(|p| {
-                    let kuid = p.cred().uid.data() as u32;
-                    map_id_up(&pcb.cred().user_ns.inner.lock().uid_map, kuid).unwrap_or(OVERFLOWUID)
-                })
-                .unwrap_or(OVERFLOWUID);
+                .map(|p| from_kuid_munged(&tracer_ns, p.cred().uid))
+                .unwrap_or_else(|| from_kuid_munged(&tracer_ns, Kuid::new(usize::MAX)));
             *i = SigInfo::new(
                 injected,
                 0,

@@ -42,7 +42,11 @@ impl FileOps for MountProcFileOps {
         self.target.owner_uid_gid()
     }
 
-    fn open(&self, data: &mut MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
+    fn open(
+        &self,
+        data: &mut MutexGuard<FilePrivateData>,
+        _flags: &crate::filesystem::vfs::file::FileFlags,
+    ) -> Result<(), SystemError> {
         // Linux `mounts_open_common()` resolves `get_proc_task(inode)` once at
         // open time and keeps its mount namespace and root path in the seq
         // private data, so a `setns()`, `unshare()` or `chroot()` performed

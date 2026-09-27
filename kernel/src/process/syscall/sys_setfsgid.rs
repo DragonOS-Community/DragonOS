@@ -1,7 +1,8 @@
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_SETFSGID;
+use crate::process::cred::CAPFlags;
 use crate::process::cred::Cred;
-use crate::process::cred::Kgid;
+use crate::process::namespace::user_namespace::{from_kgid_munged, make_kgid};
 use crate::process::ProcessManager;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
@@ -22,20 +23,26 @@ impl Syscall for SysSetFsgid {
     }
 
     fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
-        let fsgid = Self::fsgid(args);
-        let fsgid = Kgid::new(fsgid);
-
         let pcb = ProcessManager::current_pcb();
         let old_cred = pcb.cred();
         let old_fsgid = old_cred.fsgid;
+        let old_visible = from_kgid_munged(&old_cred.user_ns, old_fsgid) as usize;
+        let Ok(fsgid) = make_kgid(&old_cred.user_ns, Self::fsgid(args) as u32) else {
+            return Ok(old_visible);
+        };
 
-        if fsgid == old_cred.gid || fsgid == old_cred.egid || fsgid == old_cred.sgid {
+        if fsgid != old_fsgid
+            && (fsgid == old_cred.gid
+                || fsgid == old_cred.egid
+                || fsgid == old_cred.sgid
+                || old_cred.has_capability(CAPFlags::CAP_SETGID))
+        {
             let mut new_cred: Cred = (*old_cred).clone();
             new_cred.setfsgid(fsgid.data());
             pcb.commit_cred(Cred::new_arc(new_cred))?;
         }
 
-        Ok(old_fsgid.data())
+        Ok(old_visible)
     }
 
     fn entry_format(&self, args: &[usize]) -> Vec<FormattedSyscallParam> {

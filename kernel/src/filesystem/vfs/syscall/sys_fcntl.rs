@@ -348,6 +348,24 @@ impl SysFcntlHandle {
                 // set_pipe_size 内部会验证大小是否合法
                 return pipe_inode.set_pipe_size(arg);
             }
+            FcntlCommand::GetSeals | FcntlCommand::AddSeals => {
+                let binding = ProcessManager::current_pcb().fd_table();
+                let file = binding
+                    .read()
+                    .get_file_by_fd(fd)
+                    .ok_or(SystemError::EBADF)?;
+                if cmd == FcntlCommand::GetSeals {
+                    return file.inode().get_seals().map(|bits| bits as usize);
+                }
+                if !file
+                    .mode()
+                    .contains(crate::filesystem::vfs::file::FileMode::FMODE_WRITE)
+                {
+                    return Err(SystemError::EPERM);
+                }
+                file.inode().add_seals(arg as u32)?;
+                return Ok(0);
+            }
             _ => {
                 // TODO: unimplemented
                 // 未实现的命令，返回0，不报错。

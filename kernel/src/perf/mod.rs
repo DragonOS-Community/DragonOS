@@ -11,13 +11,14 @@ pub(crate) use util::{PERF_TYPE_KPROBE, PERF_TYPE_UPROBE};
 
 use crate::arch::MMArch;
 use crate::bpf::prog::BpfProg;
+use crate::filesystem::anon_inode::{anon_inode_metadata, anon_inode_path, AnonInodeFs};
 use crate::filesystem::epoll::event_poll::EPollItemList;
 use crate::filesystem::epoll::{event_poll::EventPoll, EPollEventType, EPollItem};
 use crate::filesystem::page_cache::PageCache;
 use crate::filesystem::vfs::file::{File, FileFlags};
 use crate::filesystem::vfs::InodeMode;
 use crate::filesystem::vfs::{
-    FilePrivateData, FileSystem, FileType, FsInfo, IndexNode, Metadata, PollableInode, SuperBlock,
+    FilePrivateData, FileSystem, FsInfo, IndexNode, Metadata, PollableInode, SuperBlock,
 };
 use crate::include::bindings::linux_bpf::{
     perf_event_attr, perf_event_sample_format, perf_sw_ids, perf_type_id,
@@ -321,12 +322,11 @@ impl IndexNode for PerfEventInode {
     }
 
     fn metadata(&self) -> Result<Metadata> {
-        let meta = Metadata {
-            mode: InodeMode::from_bits_truncate(0o755),
-            file_type: FileType::File,
-            ..Default::default()
-        };
-        Ok(meta)
+        Ok(anon_inode_metadata(InodeMode::S_IRUSR | InodeMode::S_IWUSR))
+    }
+
+    fn stat_mode(&self, metadata: &Metadata) -> InodeMode {
+        metadata.mode
     }
 
     fn resize(&self, _len: usize) -> Result<()> {
@@ -369,8 +369,7 @@ impl IndexNode for PerfEventInode {
     }
 
     fn fs(&self) -> Arc<dyn FileSystem> {
-        // panic!("PerfEvent does not have a filesystem")
-        Arc::new(PerfFakeFs)
+        PERF_FS.clone()
     }
 
     fn as_any_ref(&self) -> &dyn Any {
@@ -390,7 +389,7 @@ impl IndexNode for PerfEventInode {
     }
 
     fn absolute_path(&self) -> core::result::Result<String, SystemError> {
-        Ok(String::from("perf_event"))
+        Ok(anon_inode_path("[perf_event]"))
     }
 }
 
@@ -413,6 +412,12 @@ impl PollableInode for PerfEventInode {
     }
 }
 
+lazy_static! {
+    static ref PERF_FS: Arc<PerfFakeFs> = Arc::new(PerfFakeFs);
+}
+
+/// Perf keeps a specialised page-fault policy for mmap buffers. It shares
+/// anon_inodefs' observable metadata, but not its generic fault operations.
 #[derive(Debug)]
 struct PerfFakeFs;
 
@@ -424,11 +429,11 @@ impl FileSystem for PerfFakeFs {
     }
 
     fn root_inode(&self) -> Arc<dyn IndexNode> {
-        panic!("PerfFakeFs does not have a root inode")
+        AnonInodeFs::instance().root_inode()
     }
 
     fn info(&self) -> FsInfo {
-        panic!("PerfFakeFs does not have a filesystem info")
+        AnonInodeFs::instance().info()
     }
 
     fn as_any_ref(&self) -> &dyn Any {
@@ -436,11 +441,11 @@ impl FileSystem for PerfFakeFs {
     }
 
     fn name(&self) -> &str {
-        "perf"
+        "anon_inode"
     }
 
     fn super_block(&self) -> SuperBlock {
-        panic!("PerfFakeFs does not have a super block")
+        AnonInodeFs::instance().super_block()
     }
     unsafe fn fault(&self, pfm: &mut PageFaultMessage) -> VmFaultReason {
         let inode_ref = {

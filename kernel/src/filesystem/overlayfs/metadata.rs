@@ -504,10 +504,7 @@ fn check_metadata_mutation_permission(
         }
         if mask.contains(SetMetadataMask::GID)
             && requested.gid != cred.gid.data()
-            && !cred
-                .group_info
-                .as_ref()
-                .is_some_and(|groups| groups.gids.contains(&Kgid::from(requested.gid)))
+            && !cred.groups.contains(&Kgid::from(requested.gid))
         {
             return Err(SystemError::EPERM);
         }

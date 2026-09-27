@@ -137,12 +137,16 @@ fn is_plain_special_inode(inode: &Arc<dyn IndexNode>) -> bool {
 fn resolve_device_special_inode(
     inode: Arc<dyn IndexNode>,
     file_type: FileType,
+    path_metadata: Option<&Metadata>,
 ) -> Result<Arc<dyn IndexNode>, SystemError> {
     if !matches!(file_type, FileType::CharDevice | FileType::BlockDevice) {
         return Ok(inode);
     }
 
-    let raw_dev = inode.metadata()?.raw_dev;
+    let raw_dev = match path_metadata {
+        Some(metadata) => metadata.raw_dev,
+        None => inode.metadata()?.raw_dev,
+    };
     if raw_dev == Default::default() {
         return Ok(inode);
     }
@@ -339,6 +343,10 @@ pub enum FilePrivateData {
     Kernfs(Option<KernFilePrivateData>),
     /// timerfd open-file-description flags (notably O_NONBLOCK).
     TimerFd(FileFlags),
+    /// Configurable filesystem context shared by dup/fork aliases.
+    FsContext(Arc<crate::filesystem::vfs::mount_api::context::FsContext>),
+    /// Ownership of a detached mount tree until it is attached or finally closed.
+    DetachedMount(Arc<crate::filesystem::vfs::mount::DetachedMountTree>),
     /// 不需要文件私有信息
     Unused,
 }
@@ -462,6 +470,10 @@ bitflags! {
         const O_SYNC = Self::__O_SYNC.bits | Self::O_DSYNC.bits;
 
         const O_PATH = 0o10000000;
+
+        /// Raw high bit of O_TMPFILE; Linux also requires O_DIRECTORY.
+        const __O_TMPFILE = 0o20000000;
+        const O_TMPFILE = Self::__O_TMPFILE.bits | Self::O_DIRECTORY.bits;
 
         const O_PATH_FLAGS = Self::O_DIRECTORY.bits|Self::O_NOFOLLOW.bits|Self::O_CLOEXEC.bits|Self::O_PATH.bits;
     }
@@ -694,6 +706,9 @@ pub struct File {
     /// One semantic inode pin per open file description. Duplicated file
     /// descriptors and VMAs share this `File`, while `O_PATH` still owns it.
     _inode_retention: InodeRetentionGuard,
+    /// FIFO/device I/O uses another inode, but the original pathname must
+    /// remain live for file->f_path operations until this description closes.
+    _path_inode_retention: Option<InodeRetentionGuard>,
     /// Release every inode owner before the mount pin can start final shutdown
     /// and seal the filesystem's eviction queue.
     _mount_guard: Option<MountExternalGuard>,
@@ -770,6 +785,13 @@ mod readdir_tests {
     }
 }
 
+/// Only kernel-created pseudo-file descriptions bypass pathname writer
+/// accounting. A fresh VFS open of the same inode is always regular.
+enum FileOpenOrigin {
+    Regular(Option<Metadata>),
+    InternalPseudo,
+}
+
 impl File {
     fn configure_base_open_mode(inode: &Arc<dyn IndexNode>, mode: &mut FileMode) {
         mode.remove(
@@ -801,7 +823,9 @@ impl File {
             .as_ref()
             .map(MountExternalGuard::derive)
             .transpose()?;
-        super::utils::ResolvedPath::from_existing_mount(self.inode.clone(), mount_guard)
+        // `self.inode` can be the runtime I/O inode of a FIFO or device.
+        // Path-based operations must use the inode paired with this mount pin.
+        super::utils::ResolvedPath::from_existing_mount(self.path_inode(), mount_guard)
     }
 
     #[inline]
@@ -1107,6 +1131,27 @@ impl File {
         Self::new_with_private_data(inode, flags, FilePrivateData::default())
     }
 
+    /// Construct an internal pseudo-file description without a pathname open.
+    ///
+    /// Like Linux `alloc_file_pseudo()` and `alloc_file_clone()`, this preserves
+    /// FMODE_WRITE but does not acquire the inode's pathname write-access count.
+    /// Reopening the inode through a path (including /proc/self/fd) must use
+    /// `File::new()` so executable write exclusion still applies.
+    pub(crate) fn new_pseudo(
+        inode: Arc<dyn IndexNode>,
+        flags: FileFlags,
+    ) -> Result<Self, SystemError> {
+        Self::new_with_private_data_and_mount_guard(
+            inode,
+            flags,
+            FilePrivateData::default(),
+            None,
+            None,
+            None,
+            FileOpenOrigin::InternalPseudo,
+        )
+    }
+
     /// Create a new file object with an explicit initial FilePrivateData.
     ///
     /// This is primarily used for objects that are not created via VFS open(2)
@@ -1128,6 +1173,7 @@ impl File {
             mount_guard,
             None,
             None,
+            FileOpenOrigin::Regular(None),
         )
     }
 
@@ -1138,6 +1184,7 @@ impl File {
         flags: FileFlags,
         mount_guard: Option<MountExternalGuard>,
         operation_guard: InodeRetentionGuard,
+        cached_path_metadata: Option<Metadata>,
     ) -> Result<Self, SystemError> {
         Self::new_with_private_data_and_mount_guard(
             inode,
@@ -1146,6 +1193,7 @@ impl File {
             mount_guard,
             Some(operation_guard),
             None,
+            FileOpenOrigin::Regular(cached_path_metadata),
         )
     }
 
@@ -1164,6 +1212,7 @@ impl File {
             mount_guard,
             Some(operation_guard),
             Some(preopened),
+            FileOpenOrigin::Regular(None),
         )
     }
 
@@ -1176,10 +1225,18 @@ impl File {
         // pin before the mount pin, just as the completed File does.
         _operation_guard: Option<InodeRetentionGuard>,
         mut preopened: Option<PreopenedFile>,
+        origin: FileOpenOrigin,
     ) -> Result<Self, SystemError> {
+        let (cached_path_metadata, account_write_access) = match origin {
+            FileOpenOrigin::Regular(metadata) => (metadata, true),
+            FileOpenOrigin::InternalPseudo => (None, false),
+        };
         let mut inode = inode;
         let path_inode = inode.clone();
-        let mut file_type = inode.metadata()?.file_type;
+        let mut file_type = match cached_path_metadata.as_ref() {
+            Some(metadata) => metadata.file_type,
+            None => inode.metadata()?.file_type,
+        };
         let is_path = flags.contains(FileFlags::O_PATH);
 
         if !is_path {
@@ -1187,7 +1244,11 @@ impl File {
             let is_named_pipe = if file_type == FileType::Pipe {
                 if let Some(SpecialNodeData::Pipe(pipe_inode)) = inode.special_node() {
                     inode = pipe_inode;
-                    file_type = inode.metadata()?.file_type;
+                    file_type = if cached_path_metadata.is_some() {
+                        inode.cached_metadata()?.file_type
+                    } else {
+                        inode.metadata()?.file_type
+                    };
                     true
                 } else {
                     false
@@ -1201,10 +1262,14 @@ impl File {
                 flags.insert(FileFlags::O_LARGEFILE);
             }
 
-            inode = resolve_device_special_inode(inode, file_type)?;
+            inode = resolve_device_special_inode(inode, file_type, cached_path_metadata.as_ref())?;
         }
 
-        let metadata = inode.metadata()?;
+        let metadata = match cached_path_metadata.as_ref() {
+            Some(metadata) if Arc::ptr_eq(&inode, &path_inode) => metadata.clone(),
+            _ if cached_path_metadata.is_some() => inode.cached_metadata()?,
+            _ => inode.metadata()?,
+        };
         if !is_path && metadata.flags.contains(InodeFlags::S_APPEND) {
             flags.insert(FileFlags::O_APPEND);
         }
@@ -1213,7 +1278,11 @@ impl File {
         let canonical_metadata = if Arc::ptr_eq(&canonical_inode, &inode) {
             metadata.clone()
         } else {
-            canonical_inode.metadata()?
+            if cached_path_metadata.is_some() {
+                canonical_inode.cached_metadata()?
+            } else {
+                canonical_inode.metadata()?
+            }
         };
         let posix_lock_key = (canonical_metadata.dev_id, canonical_metadata.inode_id);
         let append_lock_domain = if file_type == FileType::File && !is_path {
@@ -1232,17 +1301,28 @@ impl File {
         // open fails, the local guard releases exactly once on this error path.
         let inode_retention =
             InodeRetentionGuard::new(inode.clone(), InodeRetentionKind::OpenFileDescription)?;
+        let path_inode_retention = if Arc::ptr_eq(&inode, &path_inode) {
+            None
+        } else {
+            Some(InodeRetentionGuard::new(
+                path_inode.clone(),
+                InodeRetentionKind::OpenFileDescription,
+            )?)
+        };
 
         if is_path && preopened.is_some() {
             return Err(SystemError::EINVAL);
         }
         let already_open = preopened.is_some();
-        let write_access =
-            if file_type == FileType::File && !is_path && mode.contains(FileMode::FMODE_WRITE) {
-                Some(InodeWriteGuard::writer(inode.clone())?)
-            } else {
-                None
-            };
+        let write_access = if account_write_access
+            && file_type == FileType::File
+            && !is_path
+            && mode.contains(FileMode::FMODE_WRITE)
+        {
+            Some(InodeWriteGuard::writer(inode.clone())?)
+        } else {
+            None
+        };
         let private_data = Mutex::new(match preopened.as_mut() {
             Some(preopened) => preopened.take_private_data(),
             None => private_data_init,
@@ -1318,6 +1398,7 @@ impl File {
             epitems: Arc::new(EPollItemList::default()),
             _write_access: write_access,
             _inode_retention: inode_retention,
+            _path_inode_retention: path_inode_retention,
             _mount_guard: mount_guard,
         };
 
@@ -2461,6 +2542,10 @@ impl File {
         let inode_retention =
             InodeRetentionGuard::new(self.inode.clone(), InodeRetentionKind::OpenFileDescription)
                 .ok()?;
+        let path_inode_retention = self
+            ._path_inode_retention
+            .as_ref()
+            .map(|retention| retention.derive_existing(InodeRetentionKind::OpenFileDescription));
         let flags = self.flags();
         let mut mode = self.mode();
         let private_data = Mutex::new(self.private_data.lock().clone());
@@ -2523,6 +2608,7 @@ impl File {
             epitems: Arc::new(EPollItemList::default()),
             _write_access: self._write_access.clone(),
             _inode_retention: inode_retention,
+            _path_inode_retention: path_inode_retention,
             _mount_guard: mount_guard,
         };
         return Some(res);

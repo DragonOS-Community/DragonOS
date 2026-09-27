@@ -20,6 +20,7 @@ use mount::MountView;
 
 mod cmdline;
 mod cpuinfo;
+mod keys;
 pub mod klog;
 pub mod kmsg;
 mod kmsg_file;
@@ -76,6 +77,8 @@ pub struct ProcfsFilePrivateData {
     /// as `seq_open_net()` stores it in `seq_net_private`; `None` for every
     /// other procfs file.
     pub(crate) net_ns: Option<Arc<NetNamespace>>,
+    /// User namespace pinned by opening /proc/[pid]/{uid_map,gid_map,setgroups}.
+    pub(crate) user_ns: Option<Arc<crate::process::namespace::user_namespace::UserNamespace>>,
 }
 
 impl ProcfsFilePrivateData {
@@ -86,6 +89,7 @@ impl ProcfsFilePrivateData {
             seq: utils::ProcfsSeq::default(),
             mount_view: None,
             net_ns: None,
+            user_ns: None,
         }
     }
 }

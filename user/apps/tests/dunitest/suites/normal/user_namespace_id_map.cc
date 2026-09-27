@@ -2,10 +2,14 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <grp.h>
+#include <linux/capability.h>
 #include <sched.h>
 #include <signal.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <sys/prctl.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -225,7 +229,7 @@ int hold_clone_entry(void* opaque) {
     return 0;
 }
 
-int run_in_new_userns(UserNsRunner runner, void* arg, std::string* detail) {
+int run_in_new_userns(UserNsRunner runner, void* arg, std::string* detail, int extra_flags = 0) {
     int pipefd[2] = {-1, -1};
     if (pipe(pipefd) != 0) {
         *detail = errno_detail("pipe", errno);
@@ -239,7 +243,7 @@ int run_in_new_userns(UserNsRunner runner, void* arg, std::string* detail) {
         .status_fd = pipefd[1],
     };
 
-    pid_t child = clone(clone_runner_entry, stack.data() + stack.size(), CLONE_NEWUSER | SIGCHLD,
+    pid_t child = clone(clone_runner_entry, stack.data() + stack.size(), CLONE_NEWUSER | extra_flags | SIGCHLD,
                         &ctx);
     if (child < 0) {
         int err = errno;
@@ -369,7 +373,14 @@ int read_userns_link_for_pid(pid_t pid, std::string* out) {
 int run_second_level_userns(void* opaque, std::string* detail) {
     const NestedLevelArgs& args = *static_cast<const NestedLevelArgs*>(opaque);
 
-    int err = write_text_file("/proc/self/uid_map", "0 0 1\n");
+    std::string inherited_policy;
+    int err = read_text_file("/proc/self/setgroups", &inherited_policy);
+    if (err != 0 || inherited_policy != "deny\n") {
+        *detail = "nested user namespace did not inherit setgroups=deny";
+        return 1;
+    }
+
+    err = write_text_file("/proc/self/uid_map", "0 0 1\n");
     if (err != 0) {
         *detail = errno_detail("write nested uid_map", err);
         return 1;
@@ -384,6 +395,11 @@ int run_second_level_userns(void* opaque, std::string* detail) {
     err = write_text_file("/proc/self/gid_map", "0 0 1\n");
     if (err != 0) {
         *detail = errno_detail("write nested gid_map", err);
+        return 1;
+    }
+
+    if (getuid() != 0 || geteuid() != 0 || getgid() != 0 || getegid() != 0) {
+        *detail = "nested namespace IDs were not translated to local zero";
         return 1;
     }
 
@@ -408,7 +424,12 @@ int run_first_level_userns(void* opaque, std::string* detail) {
     const std::string first_uid_map = "0 " + std::to_string(args.uid) + " 1\n";
     const std::string first_gid_map = "0 " + std::to_string(args.gid) + " 1\n";
 
-    int err = write_text_file("/proc/self/uid_map", first_uid_map);
+    int err = write_text_file("/proc/self/uid_map", "4294967294 1000 2\n");
+    if (err != EINVAL) {
+        *detail = "uid_map accepted extent covering invalid UID";
+        return 1;
+    }
+    err = write_text_file("/proc/self/uid_map", first_uid_map);
     if (err != 0) {
         *detail = errno_detail("write first uid_map", err);
         return 1;
@@ -433,6 +454,50 @@ int run_first_level_userns(void* opaque, std::string* detail) {
     err = write_text_file("/proc/self/gid_map", first_gid_map);
     if (err != 0) {
         *detail = errno_detail("write first gid_map after deny", err);
+        return 1;
+    }
+
+    if (getuid() != 0 || geteuid() != 0 || getgid() != 0 || getegid() != 0) {
+        *detail = "first namespace IDs were not translated to local zero";
+        return 1;
+    }
+    uid_t ruid = 1, euid = 1, suid = 1;
+    gid_t rgid = 1, egid = 1, sgid = 1;
+    if (getresuid(&ruid, &euid, &suid) != 0 || ruid != 0 || euid != 0 || suid != 0 ||
+        getresgid(&rgid, &egid, &sgid) != 0 || rgid != 0 || egid != 0 || sgid != 0) {
+        *detail = "getresuid/getresgid returned global IDs";
+        return 1;
+    }
+    // uid_t/gid_t syscall arguments are 32-bit even when passed in 64-bit registers.
+    if (syscall(SYS_setuid, 1ULL << 32) != 0 || syscall(SYS_setgid, 1ULL << 32) != 0 ||
+        getuid() != 0 || getgid() != 0) {
+        *detail = "setuid/setgid did not truncate arguments to the ABI width";
+        return 1;
+    }
+    errno = 0;
+    if (setuid(1) != -1 || errno != EINVAL) {
+        *detail = "setuid accepted an unmapped local ID";
+        return 1;
+    }
+    errno = 0;
+    if (setgid(1) != -1 || errno != EINVAL) {
+        *detail = "setgid accepted an unmapped local ID";
+        return 1;
+    }
+
+    char path[96] = {};
+    snprintf(path, sizeof(path), "/tmp/dkc015-id-%d", getpid());
+    int fd = open(path, O_CREAT | O_EXCL | O_RDWR, 0600);
+    if (fd < 0) {
+        *detail = errno_detail("create identity stat fixture", errno);
+        return 1;
+    }
+    struct stat st = {};
+    bool stat_ok = fstat(fd, &st) == 0 && st.st_uid == 0 && st.st_gid == 0;
+    close(fd);
+    unlink(path);
+    if (!stat_ok) {
+        *detail = "fstat did not translate global owner into namespace IDs";
         return 1;
     }
 
@@ -484,6 +549,281 @@ int run_rootless_nested_id_map_flow(std::string* detail) {
         .gid = gid,
     };
     return run_in_new_userns(run_first_level_userns, &args, detail);
+}
+
+int reject_child_range_across_parent_extents(void*, std::string* detail) {
+    int err = write_text_file("/proc/self/uid_map", "0 0 3\n");
+    if (err != EPERM) {
+        *detail = "nested map spanning parent extents returned " + std::to_string(err) +
+                  ", expected EPERM";
+        return 1;
+    }
+    return 0;
+}
+
+int run_discontinuous_parent_map_flow(std::string* detail) {
+    if (geteuid() != 0) return 0;
+    int ready[2] = {-1, -1};
+    int release[2] = {-1, -1};
+    if (pipe(ready) != 0 || pipe(release) != 0) {
+        *detail = errno_detail("create map synchronization pipes", errno);
+        return 1;
+    }
+    pid_t child = fork();
+    if (child < 0) {
+        *detail = errno_detail("fork map target", errno);
+        return 1;
+    }
+    if (child == 0) {
+        close(ready[0]);
+        close(release[1]);
+        if (unshare(CLONE_NEWUSER) != 0) _exit(2);
+        char byte = 'r';
+        if (write(ready[1], &byte, 1) != 1) _exit(3);
+        if (read(release[0], &byte, 1) != 1) _exit(4);
+        std::string nested_detail;
+        int rc = run_in_new_userns(reject_child_range_across_parent_extents, nullptr,
+                                   &nested_detail);
+        _exit(rc == 0 ? 0 : 5);
+    }
+    close(ready[1]);
+    close(release[0]);
+    char byte = 0;
+    bool child_ready = read(ready[0], &byte, 1) == 1;
+    close(ready[0]);
+    int uid_err = EIO, gid_err = EIO;
+    if (child_ready) {
+        char path[64] = {};
+        snprintf(path, sizeof(path), "/proc/%d/uid_map", child);
+        uid_err = write_text_file(path, "0 0 1\n1 1000 1\n2 2 1\n");
+        snprintf(path, sizeof(path), "/proc/%d/gid_map", child);
+        gid_err = write_text_file(path, "0 0 1\n");
+    }
+    byte = 'g';
+    bool released = write(release[1], &byte, 1) == 1;
+    close(release[1]);
+    int status = 0;
+    if (!wait_for_child_exit(child, &status, kChildWaitTimeoutSec, true, detail) ||
+        !WIFEXITED(status) || WEXITSTATUS(status) != 0 || uid_err != 0 || gid_err != 0 ||
+        !released) {
+        *detail = "parent map write errors uid=" + std::to_string(uid_err) +
+                  " gid=" + std::to_string(gid_err) +
+                  " child_status=" + std::to_string(WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+        return 1;
+    }
+    return 0;
+}
+
+int run_dropped_map_writer_flow(std::string* detail) {
+    if (geteuid() != 0) return 0;
+    HeldClone held;
+    if (!spawn_held_clone(CLONE_NEWUSER, &held, detail)) return 1;
+
+    char path[64] = {};
+    snprintf(path, sizeof(path), "/proc/%d/uid_map", held.pid);
+    int fd = open(path, O_WRONLY);
+    if (fd < 0) {
+        *detail = errno_detail("open child uid_map", errno);
+        cleanup_held_clone(&held);
+        return 1;
+    }
+
+    pid_t writer = fork();
+    if (writer < 0) {
+        *detail = errno_detail("fork dropped map writer", errno);
+        close(fd);
+        cleanup_held_clone(&held);
+        return 1;
+    }
+    constexpr char kWideMap[] = "0 0 1\n1 1 1\n";
+    if (writer == 0) {
+        if (setuid(1000) != 0) _exit(2);
+        errno = 0;
+        ssize_t written = write(fd, kWideMap, sizeof(kWideMap) - 1);
+        _exit(written == -1 && errno == EPERM ? 0 : 3);
+    }
+    int status = 0;
+    bool waited = wait_for_child_exit(writer, &status, kChildWaitTimeoutSec, true, detail);
+    // A rejected write must leave the map empty and the original opener may
+    // still install the same map with its own current CAP_SETUID.
+    ssize_t written = waited ? write(fd, kWideMap, sizeof(kWideMap) - 1) : -1;
+    close(fd);
+    cleanup_held_clone(&held);
+    if (!waited || !WIFEXITED(status) || WEXITSTATUS(status) != 0 ||
+        written != static_cast<ssize_t>(sizeof(kWideMap) - 1)) {
+        *detail = "a dropped writer changed uid_map through a pre-opened fd";
+        return 1;
+    }
+    return 0;
+}
+
+int run_map_fd_after_target_exit_flow(std::string* detail) {
+    if (geteuid() != 0) return 0;
+    HeldClone held;
+    if (!spawn_held_clone(CLONE_NEWUSER, &held, detail)) return 1;
+    char path[64] = {};
+    snprintf(path, sizeof(path), "/proc/%d/uid_map", held.pid);
+    int uid_fd = open(path, O_RDWR);
+    snprintf(path, sizeof(path), "/proc/%d/gid_map", held.pid);
+    int gid_fd = open(path, O_RDWR);
+    snprintf(path, sizeof(path), "/proc/%d/setgroups", held.pid);
+    int setgroups_fd = open(path, O_RDWR);
+    cleanup_held_clone(&held);
+    if (uid_fd < 0 || gid_fd < 0 || setgroups_fd < 0) {
+        *detail = "failed to open userns map/control files before target exit";
+        if (uid_fd >= 0) close(uid_fd);
+        if (gid_fd >= 0) close(gid_fd);
+        if (setgroups_fd >= 0) close(setgroups_fd);
+        return 1;
+    }
+
+    constexpr char kMap[] = "0 0 1\n";
+    constexpr char kDeny[] = "deny\n";
+    bool ok = write(uid_fd, kMap, sizeof(kMap) - 1) ==
+                  static_cast<ssize_t>(sizeof(kMap) - 1) &&
+              write(setgroups_fd, kDeny, sizeof(kDeny) - 1) ==
+                  static_cast<ssize_t>(sizeof(kDeny) - 1) &&
+              write(gid_fd, kMap, sizeof(kMap) - 1) ==
+                  static_cast<ssize_t>(sizeof(kMap) - 1);
+    char buf[64] = {};
+    if (ok) {
+        ok = lseek(uid_fd, 0, SEEK_SET) == 0 &&
+             read(uid_fd, buf, sizeof(buf) - 1) > 0 &&
+             std::string(buf) == expected_map_line(0, 0, 1);
+    }
+    close(uid_fd);
+    close(gid_fd);
+    close(setgroups_fd);
+    if (!ok) {
+        *detail = "an open map/control fd lost its user namespace after target exit";
+        return 1;
+    }
+    return 0;
+}
+
+int run_setgroups_open_capability_flow(std::string* detail) {
+    if (geteuid() != 0) return 0;
+    // An ancestor with euid equal to a user namespace's owner has all
+    // capabilities *in that namespace*, even after dropping CAP_SYS_ADMIN.
+    // Create the target as uid 1000, then regain euid 0 in this test process.
+    if (setresuid(0, 1000, 0) != 0) {
+        *detail = errno_detail("drop euid before creating target namespace", errno);
+        return 1;
+    }
+    HeldClone held;
+    bool spawned = spawn_held_clone(CLONE_NEWUSER, &held, detail);
+    if (setresuid(0, 0, 0) != 0) {
+        *detail = errno_detail("restore root euid", errno);
+        if (spawned) cleanup_held_clone(&held);
+        return 1;
+    }
+    if (!spawned) return 1;
+    char path[64] = {};
+    snprintf(path, sizeof(path), "/proc/%d/setgroups", held.pid);
+    int authorized_fd = open(path, O_WRONLY);
+    if (authorized_fd < 0) {
+        *detail = errno_detail("open setgroups with CAP_SYS_ADMIN", errno);
+        cleanup_held_clone(&held);
+        return 1;
+    }
+    pid_t writer = fork();
+    if (writer < 0) {
+        *detail = errno_detail("fork setgroups writer", errno);
+        close(authorized_fd);
+        cleanup_held_clone(&held);
+        return 1;
+    }
+    if (writer == 0) {
+        __user_cap_header_struct hdr = {.version = _LINUX_CAPABILITY_VERSION_3, .pid = 0};
+        __user_cap_data_struct caps[2] = {};
+        if (syscall(SYS_capget, &hdr, caps) != 0) _exit(2);
+        caps[CAP_SYS_ADMIN / 32].effective &= ~(1u << (CAP_SYS_ADMIN % 32));
+        if (syscall(SYS_capset, &hdr, caps) != 0) _exit(3);
+        int read_fd = open(path, O_RDONLY);
+        if (read_fd < 0) _exit(4);
+        close(read_fd);
+        errno = 0;
+        int denied_fd = open(path, O_WRONLY);
+        if (denied_fd >= 0) close(denied_fd);
+        if (denied_fd != -1 || errno != EACCES) _exit(5);
+        constexpr char kDeny[] = "deny\n";
+        if (write(authorized_fd, kDeny, sizeof(kDeny) - 1) !=
+            static_cast<ssize_t>(sizeof(kDeny) - 1)) _exit(6);
+        _exit(0);
+    }
+    int status = 0;
+    bool waited = wait_for_child_exit(writer, &status, kChildWaitTimeoutSec, true, detail);
+    close(authorized_fd);
+    cleanup_held_clone(&held);
+    if (!waited || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        *detail = "setgroups open-time CAP_SYS_ADMIN check or pre-opened fd semantics failed; child=" +
+                  std::to_string(WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+        return 1;
+    }
+    return 0;
+}
+
+int verify_clone_vm_userns_child(void*, std::string* detail) {
+    std::string current_ns;
+    std::string init_ns;
+    int err = read_link_text("/proc/self/ns/user", &current_ns);
+    if (err == 0) err = read_link_text("/proc/1/ns/user", &init_ns);
+    if (err != 0 || current_ns == init_ns || prctl(PR_GET_KEEPCAPS) != 0) {
+        *detail = "CLONE_NEWUSER|CLONE_VM inherited old user namespace or keepcaps";
+        return 1;
+    }
+    return 0;
+}
+
+int run_clone_vm_userns_flow(std::string* detail) {
+    if (prctl(PR_SET_KEEPCAPS, 1) != 0) {
+        *detail = errno_detail("set keepcaps", errno);
+        return 1;
+    }
+    return run_in_new_userns(verify_clone_vm_userns_child, nullptr, detail, CLONE_VM);
+}
+
+int run_id_and_groups_abi_flow(std::string* detail) {
+    if (geteuid() != 0) return 0;
+
+    gid_t groups[] = {3, 1, 2};
+    if (setgroups(3, groups) != 0) {
+        *detail = errno_detail("setgroups", errno);
+        return 1;
+    }
+    gid_t result[5] = {99, 99, 99, 99, 99};
+    if (getgroups(0, nullptr) != 3 || getgroups(5, result) != 3 ||
+        result[0] != 1 || result[1] != 2 || result[2] != 3 ||
+        result[3] != 99 || result[4] != 99) {
+        *detail = "getgroups size/sort/copy semantics differ from Linux";
+        return 1;
+    }
+    gid_t invalid_group = static_cast<gid_t>(-1);
+    errno = 0;
+    if (setgroups(1, &invalid_group) != -1 || errno != EINVAL || getgroups(5, result) != 3 ||
+        result[0] != 1 || result[1] != 2 || result[2] != 3) {
+        *detail = "invalid setgroups changed the group list or returned the wrong error";
+        return 1;
+    }
+    errno = 0;
+    if (syscall(SYS_getgroups, -1, result) != -1 || errno != EINVAL) {
+        *detail = "negative getgroups size was not rejected";
+        return 1;
+    }
+
+    if (syscall(SYS_setfsuid, 1000) != 0 || syscall(SYS_setfsuid, -1) != 1000) {
+        *detail = "setfsuid did not update/read the FS UID";
+        return 1;
+    }
+    if (setresuid(-1, -1, -1) != 0 || syscall(SYS_setfsuid, -1) != 1000) {
+        *detail = "no-op setresuid changed the FS UID";
+        return 1;
+    }
+    if (setreuid(-1, -1) != 0 || syscall(SYS_setfsuid, -1) != 0) {
+        *detail = "setreuid did not reset the FS UID to the effective UID";
+        return 1;
+    }
+    return 0;
 }
 
 int run_unshare_newuser_changes_namespace(std::string* detail) {
@@ -698,6 +1038,30 @@ TEST(UserNamespaceIdMap, InitialNamespaceMapsAreReadable) {
 
 TEST(UserNamespaceIdMap, RootlessSingleAndNestedSelfMaps) {
     expect_child_success("rootless_nested_id_map_flow", run_rootless_nested_id_map_flow);
+}
+
+TEST(UserNamespaceIdMap, ChildCannotBridgeDiscontinuousParentMap) {
+    expect_child_success("discontinuous_parent_map_flow", run_discontinuous_parent_map_flow);
+}
+
+TEST(UserNamespaceIdMap, PreopenedMapFdDoesNotRetainWriterPrivilege) {
+    expect_child_success("dropped_map_writer_flow", run_dropped_map_writer_flow);
+}
+
+TEST(UserNamespaceIdMap, MapFdPinsNamespaceAfterTargetExit) {
+    expect_child_success("map_fd_after_target_exit_flow", run_map_fd_after_target_exit_flow);
+}
+
+TEST(UserNamespaceIdMap, SetgroupsWriteRequiresAdminAtOpen) {
+    expect_child_success("setgroups_open_capability_flow", run_setgroups_open_capability_flow);
+}
+
+TEST(UserNamespaceIdMap, CloneVmStillCreatesNewUserNamespace) {
+    expect_child_success("clone_vm_userns_flow", run_clone_vm_userns_flow);
+}
+
+TEST(UserNamespaceIdMap, CredentialAndGroupsAbi) {
+    expect_child_success("id_and_groups_abi_flow", run_id_and_groups_abi_flow);
 }
 
 TEST(UserNamespaceControl, UnshareNewUserChangesNamespace) {

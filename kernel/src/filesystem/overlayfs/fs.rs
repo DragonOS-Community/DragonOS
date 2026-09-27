@@ -4,12 +4,16 @@ use super::inode::{DirState, OvlInode, OvlLinkState};
 use crate::driver::base::device::device_number::DeviceNumber;
 use crate::filesystem::vfs::mount::{MountFS, MountFSInode};
 use crate::filesystem::vfs::{
-    self, vcore::generate_inode_id, FileSystem, FileSystemMakerData, FileType, FsInfo, IndexNode,
-    InodeId, LinkMutationCoordinator, MountableFileSystem, SuperBlock,
+    self,
+    fcntl::AtFlags,
+    utils::{user_resolved_path_at, ResolvedPath},
+    vcore::generate_inode_id,
+    FileSystem, FileSystemMakerData, FileType, FsCreationContext, FsInfo, FsReconfigureRequest,
+    FsconfigPreparedData, IndexNode, InodeId, LinkMutationCoordinator, MountableFileSystem,
+    SuperBlock, VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
 use crate::libs::{casting::DowncastArc, mutex::Mutex};
-use crate::process::Cred;
-use crate::process::ProcessManager;
+use crate::process::{Cred, ProcessManager};
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
@@ -21,6 +25,42 @@ use system_error::SystemError;
 const MAX_MOUNT_ANCESTOR_DEPTH: usize = vfs::MAX_PATHLEN;
 const INODE_CACHE_PRUNE_INTERVAL: usize = 256;
 type LowerRoot = (String, Arc<dyn IndexNode>);
+
+/// Path objects fixed when each fsconfig parameter is supplied. The resulting
+/// overlay filesystem retains these pins for its entire lifetime.
+#[derive(Debug, Clone, Default)]
+struct OverlayFsconfigPaths {
+    upper: Option<Arc<ResolvedPath>>,
+    work: Option<Arc<ResolvedPath>>,
+    lowers: Option<Vec<Arc<ResolvedPath>>>,
+}
+
+fn resolve_fsconfig_layer(name: &str) -> Result<Arc<ResolvedPath>, SystemError> {
+    let pcb = ProcessManager::current_pcb();
+    let (start, rest) = user_resolved_path_at(&pcb, AtFlags::AT_FDCWD.bits(), name)?;
+    let path = start.inode().lookup_follow_symlink_owned(
+        &start,
+        &rest,
+        VFS_MAX_FOLLOW_SYMLINK_TIMES,
+        true,
+    )?;
+    if path.inode().metadata()?.file_type != FileType::Dir {
+        return Err(SystemError::EINVAL);
+    }
+    Arc::try_new(path).map_err(|_| SystemError::ENOMEM)
+}
+
+fn validate_workdir(inode: &Arc<dyn IndexNode>) -> Result<(), SystemError> {
+    if inode.metadata()?.file_type != FileType::Dir
+        || inode
+            .clone()
+            .downcast_arc::<MountFSInode>()
+            .is_some_and(|inode| inode.mount_fs().is_readonly())
+    {
+        return Err(SystemError::EINVAL);
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(super) struct RealInodeIdentity {
@@ -375,12 +415,13 @@ pub(super) struct OverlayFS {
     pub(super) numfs: u32,
     #[allow(dead_code)]
     pub(super) numdatalayer: usize,
-    pub(super) layers: Vec<OvlLayer>, // layer 0 is read-write, subsequent layers are read-only
-    pub(super) workdir: Arc<dyn IndexNode>,
+    pub(super) layers: Vec<OvlLayer>, // index 0 is upper when present; lowers have index >= 1
+    pub(super) workdir: Option<Arc<dyn IndexNode>>,
     pub(super) root_inode: Arc<OvlInode>,
     pub(super) super_block: SuperBlock,
     pub(super) mutation_lock: Mutex<()>,
     pub(super) backing_cred: Arc<Cred>,
+    _backing_paths: Option<Arc<OverlayFsconfigPaths>>,
     pub(super) samefs: bool,
     inode_cache: Mutex<OvlInodeCache>,
     link_state_cache: Mutex<OvlLinkStateCache>,
@@ -393,6 +434,30 @@ pub(super) struct OverlayFS {
 }
 
 impl FileSystem for OverlayFS {
+    fn required_superblock_flags(&self) -> crate::filesystem::vfs::mount::MountFlags {
+        if self.ovl_upper_mnt().is_none() {
+            crate::filesystem::vfs::mount::MountFlags::RDONLY
+        } else {
+            crate::filesystem::vfs::mount::MountFlags::empty()
+        }
+    }
+
+    fn reconfigure(
+        &self,
+        request: FsReconfigureRequest<'_>,
+    ) -> Result<crate::filesystem::vfs::mount::MountFlags, SystemError> {
+        let flags = request.sb_flags & request.sb_flags_mask;
+        if self.ovl_upper_mnt().is_none()
+            && !flags.contains(crate::filesystem::vfs::mount::MountFlags::RDONLY)
+        {
+            return Err(SystemError::EROFS);
+        }
+        if !request.oldapi && request.raw_data.is_some_and(|raw| !raw.trim().is_empty()) {
+            return Err(SystemError::EINVAL);
+        }
+        Ok(flags)
+    }
+
     fn page_cache_writeback_domain(
         &self,
     ) -> Option<&Arc<crate::filesystem::page_cache::PageCacheWritebackDomain>> {
@@ -424,8 +489,15 @@ impl FileSystem for OverlayFS {
 }
 
 impl OverlayFS {
-    pub(super) fn ovl_upper_mnt(&self) -> Arc<OvlInode> {
-        self.layers[0].mnt.clone()
+    pub(super) fn ovl_upper_mnt(&self) -> Option<Arc<OvlInode>> {
+        self.layers
+            .first()
+            .filter(|layer| layer.index == 0)
+            .map(|layer| layer.mnt.clone())
+    }
+
+    pub(super) fn require_upper(&self) -> Result<(), SystemError> {
+        self.ovl_upper_mnt().map(|_| ()).ok_or(SystemError::EROFS)
     }
 
     pub(super) fn intern_inode(
@@ -776,7 +848,12 @@ impl OverlayFS {
         let target_fs = Self::canonical_backing_fs(inode);
         // Origin records describe a lower object. Prefer a lower layer when the
         // upper and lower directories happen to share the same filesystem.
-        for layer in self.layers.iter().skip(1).chain(self.layers.iter().take(1)) {
+        for layer in self
+            .layers
+            .iter()
+            .filter(|layer| layer.index != 0)
+            .chain(self.layers.iter().filter(|layer| layer.index == 0))
+        {
             let real = if layer.index == 0 {
                 layer.mnt.upper_inode.lock().clone()
             } else {
@@ -866,41 +943,115 @@ impl OverlayFS {
 }
 
 impl MountableFileSystem for OverlayFS {
+    const SUPPORTS_FSCONFIG_LEGACY_OPTIONS: bool = true;
+
+    fn prepare_fsconfig_string(
+        key: &str,
+        value: &str,
+        previous: Option<&FsconfigPreparedData>,
+    ) -> Result<Option<FsconfigPreparedData>, SystemError> {
+        let mut paths = match previous {
+            Some(previous) => previous
+                .downcast_ref::<OverlayFsconfigPaths>()
+                .ok_or(SystemError::EINVAL)?
+                .clone(),
+            None => OverlayFsconfigPaths::default(),
+        };
+        match key {
+            "upperdir" => paths.upper = Some(resolve_fsconfig_layer(value)?),
+            "workdir" => {
+                let work = resolve_fsconfig_layer(value)?;
+                validate_workdir(&work.inode())?;
+                paths.work = Some(work);
+            }
+            "lowerdir" => {
+                let names = OverlayMountData::parse_lower_dirs(value)?;
+                let mut lowers = Vec::new();
+                lowers
+                    .try_reserve(names.len())
+                    .map_err(|_| SystemError::ENOMEM)?;
+                for name in names {
+                    lowers.push(resolve_fsconfig_layer(&name)?);
+                }
+                paths.lowers = Some(lowers);
+            }
+            _ => return Err(SystemError::EINVAL),
+        }
+        Ok(Some(Arc::try_new(paths).map_err(|_| SystemError::ENOMEM)?))
+    }
+
     fn make_fs(
         data: Option<&dyn FileSystemMakerData>,
+    ) -> Result<Arc<dyn FileSystem + 'static>, SystemError> {
+        Self::make_fs_in_context(
+            data,
+            crate::filesystem::vfs::mount::MountFlags::empty(),
+            &FsCreationContext::current(),
+        )
+    }
+
+    fn make_fs_in_context(
+        data: Option<&dyn FileSystemMakerData>,
+        _mount_flags: crate::filesystem::vfs::mount::MountFlags,
+        context: &FsCreationContext,
     ) -> Result<Arc<dyn FileSystem + 'static>, SystemError> {
         let mount_data = data
             .and_then(|d| d.as_any().downcast_ref::<OverlayMountData>())
             .ok_or(SystemError::EINVAL)?;
-        let root_inode = ProcessManager::current_mntns().root_inode();
-        let upper_inode = root_inode
-            .lookup(&mount_data.upper_dir)
-            .map_err(|_| SystemError::EINVAL)?;
-        let upper_file_type = upper_inode.metadata()?.file_type;
-        if upper_file_type != FileType::Dir {
-            return Err(SystemError::EINVAL);
-        }
-        let upper_layer = OvlLayer {
-            mnt: Arc::new(OvlInode::new(
-                mount_data.upper_dir.clone(),
-                upper_file_type,
-                Some(upper_inode.clone()),
-                Vec::new(),
-                None,
-                Arc::try_new(LinkMutationCoordinator::new()).map_err(|_| SystemError::ENOMEM)?,
-            )),
-            index: 0,
-            fsid: 0,
+        let prepared = context
+            .fsconfig_prepared
+            .as_ref()
+            .map(|paths| {
+                paths
+                    .clone()
+                    .downcast::<OverlayFsconfigPaths>()
+                    .map_err(|_| SystemError::EINVAL)
+            })
+            .transpose()?;
+        let root_inode = context.mnt_ns.root_inode();
+        let upper_inode = match &mount_data.upper_dir {
+            Some(name) => Some(match &prepared {
+                Some(paths) => paths.upper.as_ref().ok_or(SystemError::EINVAL)?.inode(),
+                None => root_inode.lookup(name).map_err(|_| SystemError::EINVAL)?,
+            }),
+            None => None,
+        };
+        let upper_layer = match (&mount_data.upper_dir, &upper_inode) {
+            (Some(name), Some(inode)) => {
+                if inode.metadata()?.file_type != FileType::Dir {
+                    return Err(SystemError::EINVAL);
+                }
+                Some(OvlLayer {
+                    mnt: Arc::new(OvlInode::new(
+                        name.clone(),
+                        FileType::Dir,
+                        Some(inode.clone()),
+                        Vec::new(),
+                        None,
+                        Arc::try_new(LinkMutationCoordinator::new())
+                            .map_err(|_| SystemError::ENOMEM)?,
+                    )),
+                    index: 0,
+                    fsid: 0,
+                })
+            }
+            _ => None,
         };
 
         let lower_roots: Result<Vec<LowerRoot>, SystemError> = mount_data
             .lower_dirs
             .iter()
-            .map(|dir| {
-                let lower_inode = ProcessManager::current_mntns()
-                    .root_inode()
-                    .lookup(dir)
-                    .map_err(|_| SystemError::EINVAL)?;
+            .enumerate()
+            .map(|(index, dir)| {
+                let lower_inode = match &prepared {
+                    Some(paths) => paths
+                        .lowers
+                        .as_ref()
+                        .and_then(|lowers| lowers.get(index))
+                        .ok_or(SystemError::EINVAL)?
+                        .inode(),
+                    None => root_inode.lookup(dir).map_err(|_| SystemError::EINVAL)?,
+                };
                 if lower_inode.metadata()?.file_type != FileType::Dir {
                     return Err(SystemError::EINVAL);
                 }
@@ -933,22 +1084,34 @@ impl MountableFileSystem for OverlayFS {
 
         let lower_layers = lower_layers?;
 
-        let workdir_inode = root_inode
-            .lookup(&mount_data.work_dir)
-            .map_err(|_| SystemError::EINVAL)?;
-        if workdir_inode.metadata()?.file_type != FileType::Dir {
-            return Err(SystemError::EINVAL);
+        // Linux validates a supplied workdir even when it ultimately ignores
+        // the option for a lower-only overlay. Recheck after fsconfig as the
+        // backing mount can become read-only before CREATE.
+        let workdir_inode = match &mount_data.work_dir {
+            Some(name) => Some(match &prepared {
+                Some(paths) => paths.work.as_ref().ok_or(SystemError::EINVAL)?.inode(),
+                None => root_inode.lookup(name)?,
+            }),
+            _ => None,
+        };
+        if let Some(work) = &workdir_inode {
+            validate_workdir(work)?;
         }
-        if !Arc::ptr_eq(&upper_inode.fs(), &workdir_inode.fs())
-            || Self::layers_overlap_either_direction(&upper_inode, &workdir_inode)?
-        {
-            return Err(SystemError::EINVAL);
+        if let (Some(upper), Some(work)) = (&upper_inode, &workdir_inode) {
+            if work.metadata()?.file_type != FileType::Dir
+                || !Arc::ptr_eq(&upper.fs(), &work.fs())
+                || Self::layers_overlap_either_direction(upper, work)?
+            {
+                return Err(SystemError::EINVAL);
+            }
         }
         for (i, (_, lower_inode)) in lower_roots.iter().enumerate() {
-            if Self::layer_is_same_or_descendant_of(lower_inode, &upper_inode)?
-                || Self::layer_is_same_or_descendant_of(lower_inode, &workdir_inode)?
-            {
-                return Err(SystemError::ELOOP);
+            if let (Some(upper), Some(work)) = (&upper_inode, &workdir_inode) {
+                if Self::layer_is_same_or_descendant_of(lower_inode, upper)?
+                    || Self::layer_is_same_or_descendant_of(lower_inode, work)?
+                {
+                    return Err(SystemError::ELOOP);
+                }
             }
 
             for (_, other_lower_inode) in lower_roots.iter().skip(i + 1) {
@@ -963,17 +1126,20 @@ impl MountableFileSystem for OverlayFS {
         }
 
         let mut layers = Vec::new();
-        layers.push(upper_layer);
+        if let Some(upper) = upper_layer {
+            layers.push(upper);
+        }
         layers.extend(lower_layers);
 
-        let upper_backing_fs = Self::canonical_backing_fs(&upper_inode);
-        let samefs = lower_roots
-            .iter()
-            .all(|(_, lower)| Arc::ptr_eq(&upper_backing_fs, &Self::canonical_backing_fs(lower)));
+        let reference_backing_fs =
+            Self::canonical_backing_fs(upper_inode.as_ref().unwrap_or(&lower_roots[0].1));
+        let samefs = lower_roots.iter().all(|(_, lower)| {
+            Arc::ptr_eq(&reference_backing_fs, &Self::canonical_backing_fs(lower))
+        });
         let root_inode = Arc::new(OvlInode::new(
             String::new(),
-            upper_file_type,
-            Some(upper_inode),
+            FileType::Dir,
+            upper_inode,
             lower_roots
                 .iter()
                 .map(|(_, lower_inode)| lower_inode.clone())
@@ -983,7 +1149,7 @@ impl MountableFileSystem for OverlayFS {
         ));
 
         let super_block = SuperBlock::new(vfs::Magic::OVERLAYFS_MAGIC, 4096, 255);
-        let backing_cred = ProcessManager::current_pcb().cred();
+        let backing_cred = context.cred.clone();
         let fs = Arc::new_cyclic(|weak_fs| {
             for layer in &layers {
                 layer.mnt.set_fs(weak_fs.clone());
@@ -1000,6 +1166,7 @@ impl MountableFileSystem for OverlayFS {
                 super_block: super_block.clone(),
                 mutation_lock: Mutex::new(()),
                 backing_cred,
+                _backing_paths: prepared,
                 samefs,
                 inode_cache: Mutex::new(OvlInodeCache::default()),
                 link_state_cache: Mutex::new(OvlLinkStateCache::default()),

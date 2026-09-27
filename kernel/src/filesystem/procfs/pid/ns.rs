@@ -188,7 +188,11 @@ impl FileOps for NamespaceFileOps {
         Err(SystemError::EINVAL)
     }
 
-    fn open(&self, data: &mut MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
+    fn open(
+        &self,
+        data: &mut MutexGuard<FilePrivateData>,
+        _flags: &crate::filesystem::vfs::file::FileFlags,
+    ) -> Result<(), SystemError> {
         **data = FilePrivateData::Namespace(self.snapshot.data.clone());
         Ok(())
     }
@@ -199,6 +203,10 @@ impl FileOps for NamespaceFileOps {
 }
 
 impl SymOps for NsSymOps {
+    fn is_magic_link(&self) -> bool {
+        true
+    }
+
     fn read_link(&self, buf: &mut [u8]) -> Result<usize, SystemError> {
         let ino = namespace_snapshot(&self.target, self.ns_type)?.nsid.data();
         let target = format!("{}:[{}]", self.ns_type.name(), ino);

@@ -1,5 +1,6 @@
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_GETRESUID;
+use crate::process::namespace::user_namespace::from_kuid_munged;
 use crate::process::ProcessManager;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
@@ -25,7 +26,7 @@ impl SysGetResUid {
     /// 使用异常表保护的方式向用户空间写入单个 u32 值
     fn write_id_protected(ptr: *mut u32, value: u32) -> Result<(), SystemError> {
         if ptr.is_null() {
-            return Ok(());
+            return Err(SystemError::EFAULT);
         }
         let mut writer = UserBufferWriter::new(ptr, core::mem::size_of::<u32>(), true)?;
         let mut buffer = writer.buffer_protected(0)?;
@@ -42,9 +43,9 @@ impl Syscall for SysGetResUid {
         let pcb = ProcessManager::current_pcb();
         let cred = pcb.cred();
 
-        let ruid: u32 = cred.uid.data() as u32;
-        let euid: u32 = cred.euid.data() as u32;
-        let suid: u32 = cred.suid.data() as u32;
+        let ruid = from_kuid_munged(&cred.user_ns, cred.uid);
+        let euid = from_kuid_munged(&cred.user_ns, cred.euid);
+        let suid = from_kuid_munged(&cred.user_ns, cred.suid);
 
         Self::write_id_protected(Self::ruidp(args), ruid)?;
         Self::write_id_protected(Self::euidp(args), euid)?;

@@ -124,8 +124,33 @@ pub fn check_inode_permission(
     {
         return Err(SystemError::EPERM);
     }
+    // Linux proc_sys_permission does not let root or CAP_DAC_OVERRIDE bypass
+    // a read-only sysctl entry. Check before generic DAC capability overrides.
+    if mask.contains(PermissionMask::MAY_WRITE)
+        && metadata
+            .flags
+            .contains(super::InodeFlags::S_SYSCTL_READONLY)
+    {
+        return Err(SystemError::EACCES);
+    }
 
     let cred = ProcessManager::current_pcb().cred();
+    if metadata.flags.contains(super::InodeFlags::S_PROC_SYSCTL) {
+        // Linux proc_sys_permission uses global euid/egid and does not grant
+        // CAP_DAC_OVERRIDE a bypass (including caps in a child userns).
+        let mode = metadata.mode.bits();
+        let allowed = if cred.euid.data() == 0 {
+            (mode >> 6) & 7
+        } else if cred.egid.data() == 0 || cred.groups.iter().any(|gid| gid.data() == 0) {
+            (mode >> 3) & 7
+        } else {
+            mode & 7
+        };
+        if mask.bits() & PermissionMask::MAY_RWX.bits() & !allowed != 0 {
+            return Err(SystemError::EACCES);
+        }
+        return check_device_inode_permission(metadata, mask);
+    }
     match inode.try_fs().map(|fs| fs.permission_policy()) {
         None | Some(FsPermissionPolicy::Dac) => cred.inode_permission(metadata, mask.bits()),
         Some(FsPermissionPolicy::Remote) => {

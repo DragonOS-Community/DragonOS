@@ -146,7 +146,11 @@ impl FdInfoFileOps {
 }
 
 impl FileOps for FdInfoFileOps {
-    fn open(&self, _data: &mut MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
+    fn open(
+        &self,
+        _data: &mut MutexGuard<FilePrivateData>,
+        _flags: &crate::filesystem::vfs::file::FileFlags,
+    ) -> Result<(), SystemError> {
         if self.is_current() {
             Ok(())
         } else {

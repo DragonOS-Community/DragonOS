@@ -1,6 +1,6 @@
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_SETRESUID;
-use crate::process::cred::Cred;
+use crate::process::cred::{CAPFlags, Cred};
 use crate::process::syscall::id_utils;
 use crate::process::ProcessManager;
 use crate::syscall::table::FormattedSyscallParam;
@@ -32,16 +32,11 @@ impl Syscall for SysSetResUid {
     /// 参考: https://man7.org/linux/man-pages/man2/setresuid.2.html
     /// 参考: https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/sys.c#setresuid
     fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
-        let ruid = Self::ruid(args);
-        let euid = Self::euid(args);
-        let suid = Self::suid(args);
-
-        id_utils::validate_id(ruid)?;
-        id_utils::validate_id(euid)?;
-        id_utils::validate_id(suid)?;
-
         let pcb = ProcessManager::current_pcb();
         let old_cred = pcb.cred();
+        let ruid = id_utils::map_uid_arg(&old_cred.user_ns, Self::ruid(args), true)?;
+        let euid = id_utils::map_uid_arg(&old_cred.user_ns, Self::euid(args), true)?;
+        let suid = id_utils::map_uid_arg(&old_cred.user_ns, Self::suid(args), true)?;
 
         let old_ruid = old_cred.uid.data();
         let old_euid = old_cred.euid.data();
@@ -51,7 +46,15 @@ impl Syscall for SysSetResUid {
         let new_euid = id_utils::resolve_id(euid, old_euid);
         let new_suid = id_utils::resolve_id(suid, old_suid);
 
-        let is_privileged = old_cred.euid.data() == 0;
+        if new_ruid == old_ruid
+            && new_suid == old_suid
+            && new_euid == old_euid
+            && (id_utils::is_no_change(euid) || new_euid == old_cred.fsuid.data())
+        {
+            return Ok(0);
+        }
+
+        let is_privileged = old_cred.has_capability(CAPFlags::CAP_SETUID);
         id_utils::check_setres_permissions(
             old_ruid,
             old_euid,
@@ -90,9 +93,7 @@ impl Syscall for SysSetResUid {
         );
 
         // fsuid 跟随 euid
-        if !id_utils::is_no_change(euid) {
-            new_cred.setfsuid(new_euid);
-        }
+        new_cred.setfsuid(new_euid);
 
         pcb.commit_cred(Cred::new_arc(new_cred))?;
 

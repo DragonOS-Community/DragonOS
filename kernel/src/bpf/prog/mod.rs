@@ -9,9 +9,10 @@ use crate::bpf::map::BpfMap;
 use crate::bpf::prog::device::{DeviceAccess, DeviceProgram};
 use crate::bpf::prog::util::{BpfProgMeta, BpfProgVerifierInfo};
 use crate::bpf::prog::verifier::BpfProgVerifier;
+use crate::filesystem::anon_inode::{anon_inode_metadata, anon_inode_path, AnonInodeFs};
 use crate::filesystem::vfs::file::{File, FileFlags};
 use crate::filesystem::vfs::InodeMode;
-use crate::filesystem::vfs::{FilePrivateData, FileSystem, FileType, IndexNode, Metadata};
+use crate::filesystem::vfs::{FilePrivateData, FileSystem, IndexNode, Metadata};
 use crate::include::bindings::linux_bpf::{bpf_attr, bpf_prog_type, BPF_F_SLEEPABLE};
 use crate::libs::mutex::MutexGuard;
 use crate::libs::spinlock::SpinLock;
@@ -121,12 +122,11 @@ impl IndexNode for BpfProg {
     }
 
     fn metadata(&self) -> Result<Metadata> {
-        let meta = Metadata {
-            mode: InodeMode::from_bits_truncate(0o755),
-            file_type: FileType::File,
-            ..Default::default()
-        };
-        Ok(meta)
+        Ok(anon_inode_metadata(InodeMode::S_IRUSR | InodeMode::S_IWUSR))
+    }
+
+    fn stat_mode(&self, metadata: &Metadata) -> InodeMode {
+        metadata.mode
     }
 
     fn resize(&self, _len: usize) -> Result<()> {
@@ -134,7 +134,7 @@ impl IndexNode for BpfProg {
     }
 
     fn fs(&self) -> Arc<dyn FileSystem> {
-        panic!("BpfProg does not have a filesystem")
+        AnonInodeFs::instance()
     }
 
     fn as_any_ref(&self) -> &dyn Any {
@@ -146,7 +146,7 @@ impl IndexNode for BpfProg {
     }
 
     fn absolute_path(&self) -> core::result::Result<String, SystemError> {
-        Ok(String::from("BPF Program"))
+        Ok(anon_inode_path("bpf-prog"))
     }
 }
 

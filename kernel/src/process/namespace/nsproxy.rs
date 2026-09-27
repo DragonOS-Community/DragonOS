@@ -138,7 +138,8 @@ impl ProcessManager {
         //     child_pcb.basic().name()
         // );
         if likely(!clone_flags.intersects(
-            CloneFlags::CLONE_NEWNS
+            CloneFlags::CLONE_NEWUSER
+                | CloneFlags::CLONE_NEWNS
                 | CloneFlags::CLONE_NEWUTS
                 | CloneFlags::CLONE_NEWIPC
                 | CloneFlags::CLONE_NEWPID

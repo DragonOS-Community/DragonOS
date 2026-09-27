@@ -129,6 +129,12 @@ pub enum KernelThreadClosure {
     StaticUsizeClosure((&'static fn(usize) -> i32, usize)),
     EmptyClosure((Box<dyn Fn() -> i32 + Send + Sync>, ())),
     StaticEmptyClosure((&'static fn() -> i32, ())),
+    /// A one-shot preparation step that returns a user trap frame. The
+    /// bootstrap drops the callback before switching to userspace, because
+    /// that switch never returns to run Rust destructors.
+    UserMode(
+        Box<dyn FnOnce() -> Result<crate::arch::interrupt::TrapFrame, SystemError> + Send + Sync>,
+    ),
     IrqThread(
         (
             &'static dyn Fn(Arc<IrqAction>) -> Result<(), SystemError>,
@@ -148,6 +154,7 @@ impl KernelThreadClosure {
             Self::EmptyClosure((func, _arg)) => func(),
             Self::StaticUsizeClosure((func, arg)) => func(arg),
             Self::StaticEmptyClosure((func, _arg)) => func(),
+            Self::UserMode(_) => unreachable!("user-mode closures run in the bootstrap"),
             Self::IrqThread((func, arg)) => {
                 func(arg).map(|_| 0).unwrap_or_else(|e| e.to_posix_errno())
             }
@@ -826,7 +833,9 @@ pub unsafe extern "C" fn kernel_thread_bootstrap_stage2(ptr: *const KernelThread
     current.set_name(info.name().clone());
     info.setup_pcb(&current);
 
-    let closure: Box<KernelThreadClosure> = info.take_closure().unwrap();
+    // Moving out of Box releases the allocation before any non-returning
+    // user-mode switch. A Box kept on this stack would leak on every exec.
+    let closure: KernelThreadClosure = *info.take_closure().unwrap();
     let to_mark_sleep = info.to_mark_sleep();
 
     if to_mark_sleep {
@@ -849,7 +858,18 @@ pub unsafe extern "C" fn kernel_thread_bootstrap_stage2(ptr: *const KernelThread
     let mut retval = SystemError::EINTR.to_posix_errno();
 
     if !KernelThreadMechanism::should_stop(&ProcessManager::current_pcb()) {
-        retval = closure.run();
+        retval = match closure {
+            KernelThreadClosure::UserMode(prepare) => match prepare() {
+                Ok(frame) => {
+                    let current = ProcessManager::current_pcb();
+                    current.worker_private().take();
+                    drop(current);
+                    unsafe { crate::arch::process::arch_switch_to_user(frame) }
+                }
+                Err(error) => error.to_posix_errno(),
+            },
+            other => other.run(),
+        };
     }
 
     let current = ProcessManager::current_pcb();

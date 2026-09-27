@@ -27,7 +27,7 @@ use crate::{
     process::{
         exit::wstatus_to_waitid_exit_info,
         kthread::KernelThreadMechanism,
-        namespace::user_namespace::map_id_up,
+        namespace::user_namespace::from_kuid_munged,
         pid::{Pid, PidType},
         ptrace, ProcessControlBlock, ProcessFlags, ProcessManager, ProcessState, RawPid,
     },
@@ -63,8 +63,6 @@ impl ChildExitSiginfoSnapshot {
 }
 
 impl ProcessManager {
-    const DEFAULT_OVERFLOW_UID: u32 = 65534;
-
     /// Notify the parent process after a child process exits.
     #[inline(never)]
     fn exit_notify(current: &Arc<ProcessControlBlock>) {
@@ -225,11 +223,8 @@ impl ProcessManager {
         let pid = child
             .task_pid_nr_ns(PidType::PID, Some(parent.active_pid_ns()))
             .unwrap_or(RawPid::new(0));
-        let child_uid =
-            u32::try_from(child.cred().uid.data()).unwrap_or(Self::DEFAULT_OVERFLOW_UID);
         let parent_user_ns = parent.cred().user_ns.clone();
-        let uid = map_id_up(&parent_user_ns.inner.lock().uid_map, child_uid)
-            .unwrap_or(Self::DEFAULT_OVERFLOW_UID);
+        let uid = from_kuid_munged(&parent_user_ns, child.cred().uid);
         let rusage = child.exit_notification_rusage();
         let utime = i64::try_from(ns_to_clock_t(rusage.ru_utime.to_ns())).unwrap_or(i64::MAX);
         let stime = i64::try_from(ns_to_clock_t(rusage.ru_stime.to_ns())).unwrap_or(i64::MAX);

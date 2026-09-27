@@ -7,14 +7,15 @@ use system_error::SystemError;
 use crate::{
     driver::virtio::virtio_fs::{virtio_fs_find_instance, VirtioFsInstance},
     filesystem::vfs::{
-        file::File, mount::MountFS, FilePrivateData, FileSystem, FileSystemMakerData, FsInfo,
-        IndexNode, MountableFileSystem, SuperBlock, VmaOpenRollback, FSMAKER,
+        file::File, mount::MountFS, FilePrivateData, FileSystem, FileSystemMakerData,
+        FsCreationContext, FsInfo, IndexNode, MountableFileSystem, SuperBlock, VmaOpenRollback,
+        FSMAKER,
     },
     mm::{
         fault::{FaultFlags, PageFaultMessage},
         MemoryManagementArch, VirtRegion, VmFaultReason, VmFlags,
     },
-    process::ProcessManager,
+    process::Cred,
     register_mountable_fs,
 };
 
@@ -173,10 +174,8 @@ impl VirtioFsFs {
 
     fn parse_mount_options(
         raw: Option<&str>,
+        cred: &Cred,
     ) -> Result<(u32, u32, u32, bool, bool, DaxMountMode), SystemError> {
-        let pcb = ProcessManager::current_pcb();
-        let cred = pcb.cred();
-
         let mut rootmode: Option<u32> = None;
         let mut user_id: Option<u32> = None;
         let mut group_id: Option<u32> = None;
@@ -316,12 +315,20 @@ impl MountableFileSystem for VirtioFsFs {
         raw_data: Option<&str>,
         source: &str,
     ) -> Result<Option<Arc<dyn FileSystemMakerData + 'static>>, SystemError> {
+        Self::make_mount_data_in_context(raw_data, source, &FsCreationContext::current())
+    }
+
+    fn make_mount_data_in_context(
+        raw_data: Option<&str>,
+        source: &str,
+        context: &FsCreationContext,
+    ) -> Result<Option<Arc<dyn FileSystemMakerData + 'static>>, SystemError> {
         if source.is_empty() {
             return Err(SystemError::EINVAL);
         }
 
         let (rootmode, user_id, group_id, default_permissions, allow_other, dax_mode) =
-            Self::parse_mount_options(raw_data)?;
+            Self::parse_mount_options(raw_data, &context.cred)?;
         let instance = virtio_fs_find_instance(source).ok_or(SystemError::ENODEV)?;
         let cache_window = instance.cache_window();
         if dax_mode == DaxMountMode::Always

@@ -31,9 +31,12 @@ pub enum KernelStackType {
 // causing an error.
 static KSTACK_LOCK: SpinLock<()> = SpinLock::new(());
 
-unsafe fn alloc_from_kernel_space() -> (VirtAddr, PhysAddr) {
+unsafe fn alloc_from_kernel_space() -> Result<(VirtAddr, PhysAddr), SystemError> {
+    use crate::arch::mm::kernel_page_flags;
     use crate::arch::MMArch;
-    use crate::mm::allocator::page_frame::{allocate_page_frames, PageFrameCount};
+    use crate::mm::allocator::page_frame::{
+        allocate_page_frames, deallocate_page_frames, PageFrameCount, PhysPageFrame,
+    };
     use crate::mm::kernel_mapper::KernelMapper;
     use crate::mm::page::EntryFlags;
     use crate::mm::MemoryManagementArch;
@@ -51,9 +54,12 @@ unsafe fn alloc_from_kernel_space() -> (VirtAddr, PhysAddr) {
     let need_size = KernelStack::SIZE * 2;
     let page_num = PageFrameCount::new(need_size.div_ceil(MMArch::PAGE_SIZE).next_power_of_two());
 
-    let (paddr, _count) = allocate_page_frames(page_num).expect("kernel stack alloc failed");
+    let (paddr, _count) = allocate_page_frames(page_num).ok_or(SystemError::ENOMEM)?;
 
-    let guard_vaddr = MMArch::phys_2_virt(paddr).unwrap();
+    let Some(guard_vaddr) = MMArch::phys_2_virt(paddr) else {
+        deallocate_page_frames(PhysPageFrame::new(paddr), page_num);
+        return Err(SystemError::EFAULT);
+    };
     let _kstack_paddr = paddr + KernelStack::SIZE;
     let kstack_vaddr = guard_vaddr + KernelStack::SIZE;
 
@@ -62,12 +68,24 @@ unsafe fn alloc_from_kernel_space() -> (VirtAddr, PhysAddr) {
     let guard_flags = EntryFlags::new();
 
     let mut kernel_mapper = KernelMapper::lock();
-    let kernel_mapper = kernel_mapper.as_mut().unwrap();
+    let Some(kernel_mapper) = kernel_mapper.as_mut() else {
+        deallocate_page_frames(PhysPageFrame::new(paddr), page_num);
+        return Err(SystemError::EFAULT);
+    };
 
-    for i in 0..KernelStack::SIZE / MMArch::PAGE_SIZE {
+    for (mapped, i) in (0..KernelStack::SIZE / MMArch::PAGE_SIZE).enumerate() {
         let guard_page_vaddr = guard_vaddr + i * MMArch::PAGE_SIZE;
-        // Map the guard page
-        let flusher = kernel_mapper.remap(guard_page_vaddr, guard_flags).unwrap();
+        let Some(flusher) = kernel_mapper.remap(guard_page_vaddr, guard_flags) else {
+            for j in 0..mapped {
+                let addr = guard_vaddr + j * MMArch::PAGE_SIZE;
+                kernel_mapper
+                    .remap(addr, kernel_page_flags(addr))
+                    .expect("kernel stack guard rollback failed")
+                    .flush();
+            }
+            deallocate_page_frames(PhysPageFrame::new(paddr), page_num);
+            return Err(SystemError::EFAULT);
+        };
         flusher.flush();
     }
 
@@ -85,7 +103,7 @@ unsafe fn alloc_from_kernel_space() -> (VirtAddr, PhysAddr) {
     //     kstack_vaddr.data(),
     //     _kstack_paddr.data()
     // );
-    (guard_vaddr, paddr)
+    Ok((guard_vaddr, paddr))
 }
 
 unsafe fn dealloc_from_kernel_space(vaddr: VirtAddr, paddr: PhysAddr) {
@@ -129,7 +147,7 @@ impl KernelStack {
     pub fn new() -> Result<Self, SystemError> {
         if cfg!(feature = "kstack_protect") {
             unsafe {
-                let (kstack_vaddr, kstack_paddr) = alloc_from_kernel_space();
+                let (kstack_vaddr, kstack_paddr) = alloc_from_kernel_space()?;
                 let real_kstack_vaddr = kstack_vaddr + KernelStack::SIZE;
                 Ok(Self {
                     stack: Some(

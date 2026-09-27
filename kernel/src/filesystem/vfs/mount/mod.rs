@@ -31,7 +31,7 @@ use crate::{
                 abort_mount_propagation, commit_mount_propagation_locked, detach_mount_propagation,
                 ensure_subtree_shared, inherit_bind_mount_propagation,
                 prepare_mount_propagation_locked, propagate_umount_sources,
-                propagation_umount_busy, MountPropagation,
+                propagation_umount_busy, MountPropagation, PreparedRegistrations,
             },
             user_namespace::UserNamespace,
         },
@@ -66,6 +66,33 @@ use system_error::SystemError;
 /// A lower layer must never acquire the lifecycle/topology layers in reverse.
 pub(crate) static MOUNT_LIFECYCLE_LOCK: Mutex<()> = Mutex::new(());
 static NEXT_SUPERBLOCK_FSNOTIFY_ID: AtomicUsize = AtomicUsize::new(1);
+/// Changes only for committed dentry/mount topology writes. Scoped pathname
+/// walks compare snapshots while holding both topology locks; ordinary lookup
+/// and mount pin admission must not advance it.
+static TOPOLOGY_EPOCH: AtomicUsize = AtomicUsize::new(0);
+
+#[inline]
+fn advance_topology_epoch() {
+    TOPOLOGY_EPOCH.fetch_add(1, Ordering::Release);
+}
+
+pub(crate) fn topology_epoch_snapshot() -> usize {
+    let _topology = lock_mount_topology();
+    TOPOLOGY_EPOCH.load(Ordering::Acquire)
+}
+
+/// Validate a scoped path against the same mount/dentry snapshot as the epoch.
+pub(crate) fn validate_scoped_path(
+    root: &Arc<MountFSInode>,
+    path: &Arc<MountFSInode>,
+    epoch: usize,
+) -> Result<bool, SystemError> {
+    let _topology = lock_mount_topology();
+    if TOPOLOGY_EPOCH.load(Ordering::Acquire) != epoch {
+        return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+    }
+    path.is_descendant_of_snapshot(root)
+}
 
 lazy_static! {
     /// Serializes pathname rendering against alias rename/disconnect. Mount
@@ -248,7 +275,20 @@ impl DentryMutationContext<'_> {
     }
 
     fn release_locked(&self) {
-        self.guard.borrow_mut().take();
+        if let Some(guard) = self.guard.borrow_mut().take() {
+            advance_topology_epoch();
+            drop(guard);
+        }
+    }
+}
+
+impl Drop for DentryMutationContext<'_> {
+    fn drop(&mut self) {
+        // Many successful paths let the context's field drop release the
+        // writer implicitly. Publish before that unlock, not afterwards.
+        if self.guard.get_mut().is_some() {
+            advance_topology_epoch();
+        }
     }
 }
 
@@ -682,6 +722,40 @@ pub struct MountExternalGuard {
     mount: Arc<MountFS>,
 }
 
+/// A detached mount tree is owned by one open file description.  Duplicated
+/// descriptors share this Arc; dropping its last owner releases the tree, but
+/// attaching the tree transfers lifetime to the destination namespace.
+pub struct DetachedMountTree {
+    root: Arc<MountFS>,
+    anonymous_ns: Mutex<Option<Arc<MntNamespace>>>,
+}
+
+impl Debug for DetachedMountTree {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("DetachedMountTree")
+            .field("root", &self.root)
+            .finish()
+    }
+}
+
+impl DetachedMountTree {
+    pub fn root(&self) -> Arc<MountFS> {
+        self.root.clone()
+    }
+
+    pub fn root_inode(&self) -> Arc<MountFSInode> {
+        self.root.mountpoint_root_inode()
+    }
+
+    pub(crate) fn anonymous_namespace(&self) -> Option<Arc<MntNamespace>> {
+        self.anonymous_ns.lock().clone()
+    }
+
+    pub(crate) fn take_anonymous_namespace(&self) -> Option<Arc<MntNamespace>> {
+        self.anonymous_ns.lock().take()
+    }
+}
+
 /// Keeps the superblock backend alive while a topology snapshot is rendered,
 /// without making ordinary umount report the mount busy.
 #[derive(Debug)]
@@ -868,6 +942,39 @@ impl VfsDentry {
                 name: Some(dname),
                 parent: None,
                 disconnected: false,
+                fsnotify_object_state,
+                fsnotify_checked_epoch: 0,
+            }),
+        }))
+    }
+
+    /// An O_TMPFILE dentry has a parent for path rendering, but no namespace
+    /// edge: lookup must never discover it before linkat publishes a name.
+    fn new_tmpfile(
+        inode: Arc<dyn IndexNode>,
+        parent: Arc<VfsDentry>,
+        fsnotify_superblock: usize,
+        fsnotify_object_state: Option<Arc<FsNotifyObjectState>>,
+    ) -> Result<Arc<Self>, SystemError> {
+        let metadata = inode.metadata()?;
+        let generation = inode.inode_generation();
+        Ok(Arc::new(Self {
+            id: DentryId::alloc(),
+            inode,
+            registry_child: metadata.inode_id,
+            registry_generation: generation,
+            fsnotify_superblock,
+            file_type: metadata.file_type,
+            mount_gate: Mutex::new(()),
+            children_gate: Mutex::new(()),
+            mount_edges: AtomicUsize::new(0),
+            automount_gate: Mutex::new(()),
+            anonymous: false,
+            negative_fsnotify_interest_epoch: AtomicUsize::new(0),
+            state: Mutex::new(VfsDentryState {
+                name: Some(DName::from(format!("#{}", metadata.inode_id.data()))),
+                parent: Some(parent),
+                disconnected: true,
                 fsnotify_object_state,
                 fsnotify_checked_epoch: 0,
             }),
@@ -1290,6 +1397,16 @@ impl SuperBlockState {
         name: Option<DName>,
     ) -> Result<Arc<VfsDentry>, SystemError> {
         let metadata = inode.metadata()?;
+        self.get_or_create_dentry_with_metadata(parent, inode, name, &metadata)
+    }
+
+    fn get_or_create_dentry_with_metadata(
+        &self,
+        parent: Option<&Arc<VfsDentry>>,
+        inode: Arc<dyn IndexNode>,
+        name: Option<DName>,
+        metadata: &super::Metadata,
+    ) -> Result<Arc<VfsDentry>, SystemError> {
         let child = metadata.inode_id;
         let child_generation = inode.inode_generation();
         let key = DentryRegistryKey {
@@ -1608,20 +1725,27 @@ impl MountFS {
         inner: &Arc<dyn FileSystem>,
         flags: MountFlags,
     ) -> Result<Arc<SuperBlockState>, SystemError> {
+        Self::new_mount_superblock_state_in_owner(inner, flags, ProcessManager::current_user_ns())
+    }
+
+    fn new_mount_superblock_state_in_owner(
+        inner: &Arc<dyn FileSystem>,
+        flags: MountFlags,
+        owner_user_ns: Arc<UserNamespace>,
+    ) -> Result<Arc<SuperBlockState>, SystemError> {
+        let flags = flags | inner.required_superblock_flags();
         if let Some(state) = inner.shared_mount_superblock_state(flags) {
             if state.shutdown_started() {
                 return Err(SystemError::ESTALE);
             }
             if state.flags().contains(MountFlags::RDONLY) != flags.contains(MountFlags::RDONLY)
-                || !Arc::ptr_eq(state.owner_user_ns(), &ProcessManager::current_user_ns())
+                || !Arc::ptr_eq(state.owner_user_ns(), &owner_user_ns)
             {
                 return Err(SystemError::EBUSY);
             }
             return Ok(state);
         }
-        let owner = inner
-            .mount_owner_user_ns()
-            .unwrap_or_else(ProcessManager::current_user_ns);
+        let owner = inner.mount_owner_user_ns().unwrap_or(owner_user_ns);
         Ok(Arc::new(SuperBlockState::new_with_owner(flags, owner)))
     }
 
@@ -1718,6 +1842,19 @@ impl MountFS {
         &self,
         self_mountpoint: Option<Arc<MountFSInode>>,
     ) -> Result<Arc<Self>, SystemError> {
+        self.deepcopy_with_root(
+            self_mountpoint,
+            self.root_inner_inode.clone(),
+            self.root_dentry.clone(),
+        )
+    }
+
+    fn deepcopy_with_root(
+        &self,
+        self_mountpoint: Option<Arc<MountFSInode>>,
+        root_inner_inode: Arc<dyn IndexNode>,
+        root_dentry: Arc<VfsDentry>,
+    ) -> Result<Arc<Self>, SystemError> {
         if let Some(domain) = self.inner_filesystem.page_cache_writeback_domain() {
             domain.bind(&self.inner_filesystem, &self.super_block_state)?;
         }
@@ -1730,8 +1867,8 @@ impl MountFS {
 
         let mountfs = Arc::new_cyclic(|self_ref| MountFS {
             inner_filesystem: self.inner_filesystem.clone(),
-            root_inner_inode: self.root_inner_inode.clone(),
-            root_dentry: self.root_dentry.clone(),
+            root_inner_inode,
+            root_dentry,
             root_inode: Mutex::new(Weak::new()),
             wrapper_cache: Mutex::new(BTreeMap::new()),
             mountpoints: Mutex::new(HashMap::new()),
@@ -1756,6 +1893,212 @@ impl MountFS {
 
         register_mounted_superblock(&mountfs);
         Ok(mountfs)
+    }
+
+    /// Clone exactly the visible child mounts below this mount's selected
+    /// root.  The caller holds the combined mount/dentry topology snapshot;
+    /// the same helper is used by recursive bind and open_tree(CLONE|RECURSIVE).
+    pub(crate) fn copy_visible_submounts_locked(
+        source: &Arc<Self>,
+        target: &Arc<Self>,
+    ) -> Result<(), SystemError> {
+        let mut pending = vec![(source.clone(), target.clone())];
+        while let Some((source_parent, target_parent)) = pending.pop() {
+            for source_child in source_parent.mount_children() {
+                let source_mountpoint =
+                    source_child.self_mountpoint().ok_or(SystemError::EINVAL)?;
+                let target_mountpoint =
+                    match target_parent.wrapper_for_dentry(source_mountpoint.shared_dentry()) {
+                        Ok(mountpoint) => mountpoint,
+                        Err(SystemError::EXDEV) => continue,
+                        Err(error) => return Err(error),
+                    };
+                if source_child.propagation().is_unbindable() {
+                    if source_child.is_locked() {
+                        return Err(SystemError::EPERM);
+                    }
+                    continue;
+                }
+                let target_child = source_child.deepcopy(Some(target_mountpoint.clone()))?;
+                if let Err(error) =
+                    target_parent.attach_top(&target_mountpoint, target_child.clone())
+                {
+                    Self::abandon_unpublished_tree(&target_child);
+                    return Err(error);
+                }
+                pending.push((source_child, target_child));
+            }
+        }
+        Ok(())
+    }
+
+    /// Linux's has_locked_children() rule: a nonrecursive clone must not
+    /// expose a locked mount below the selected source dentry.
+    pub(crate) fn has_locked_children_in_view_locked(
+        source: &Arc<Self>,
+        selected: &Arc<MountFSInode>,
+    ) -> Result<bool, SystemError> {
+        for child in source.mount_children() {
+            let mountpoint = child.self_mountpoint().ok_or(SystemError::EINVAL)?;
+            if mountpoint.relative_path_from_snapshot(selected)?.is_some() && child.is_locked() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn collect_tree(root: &Arc<Self>) -> Vec<Arc<Self>> {
+        let mut mounts = Vec::new();
+        let mut pending = vec![root.clone()];
+        while let Some(mount) = pending.pop() {
+            pending.extend(mount.mount_children());
+            mounts.push(mount);
+        }
+        mounts
+    }
+
+    /// Tear down a cloned tree whose peer/slave registrations have not yet
+    /// been committed. Running normal propagation detach on those copied
+    /// flags would mutate the still-live source group by mistake.
+    pub(crate) fn abandon_unpublished_tree(root: &Arc<Self>) {
+        for mount in Self::collect_tree(root) {
+            mount.mark_propagation_detached();
+        }
+        Self::deactivate_disconnected_subtree(root);
+    }
+
+    pub(crate) fn collect_detached_tree(root: &Arc<Self>) -> Result<Vec<Arc<Self>>, SystemError> {
+        let mut mounts = Vec::new();
+        let mut pending = vec![root.clone()];
+        while let Some(mount) = pending.pop() {
+            let children = mount.try_mount_children()?;
+            pending
+                .try_reserve(children.len())
+                .map_err(|_| SystemError::ENOMEM)?;
+            pending.extend(children);
+            mounts.try_reserve(1).map_err(|_| SystemError::ENOMEM)?;
+            mounts.push(mount);
+        }
+        Ok(mounts)
+    }
+
+    /// A newly made filesystem becomes usable through a detached mount fd.
+    pub fn create_detached_tree(
+        inner_fs: Arc<dyn FileSystem>,
+        superblock_flags: MountFlags,
+        mount_flags: MountFlags,
+        source: Option<String>,
+        owner_user_ns: Arc<UserNamespace>,
+    ) -> Result<Arc<DetachedMountTree>, SystemError> {
+        // Filesystem construction and dentry metadata must stay outside the
+        // mount-topology lock.
+        // Some legacy makers return an already wrapped MountFS.  As with
+        // mount(2), make a new mount object for its underlying filesystem;
+        // wrapping MountFS again would create a false superblock identity.
+        let (inner_fs, root_inode) = inner_fs
+            .clone()
+            .downcast_arc::<MountFS>()
+            .map(|mount| (mount.inner_filesystem(), mount.root_inner_inode()))
+            .unwrap_or_else(|| {
+                let root = inner_fs.root_inode();
+                (inner_fs, root)
+            });
+        let super_block_state =
+            Self::new_mount_superblock_state_in_owner(&inner_fs, superblock_flags, owner_user_ns)?;
+        if let Some(domain) = inner_fs.page_cache_writeback_domain() {
+            domain.bind(&inner_fs, &super_block_state)?;
+        }
+        if !super_block_state.try_add_external_pin() {
+            return Err(SystemError::ESTALE);
+        }
+        let root = Self::new_with_super_block_state(
+            inner_fs,
+            Some(root_inode),
+            None,
+            None,
+            MountPropagation::new_private(),
+            None,
+            mount_flags,
+            MountStateInit {
+                super_block_state,
+                mount_source: source,
+                construction_reserved: true,
+            },
+        );
+        let anonymous_ns = {
+            let _topology = MOUNT_LIFECYCLE_LOCK.lock();
+            let prepared = root.activate().and_then(|()| {
+                MntNamespace::new_anonymous(
+                    root.clone(),
+                    vec![root.clone()],
+                    ProcessManager::current_mntns().user_ns().clone(),
+                )
+            });
+            match prepared {
+                Ok(namespace) => namespace,
+                Err(error) => {
+                    Self::deactivate_disconnected_subtree(&root);
+                    return Err(error);
+                }
+            }
+        };
+        Ok(Arc::new(DetachedMountTree {
+            root,
+            anonymous_ns: Mutex::new(Some(anonymous_ns)),
+        }))
+    }
+
+    /// Clone the selected dentry, not necessarily the source mount's root.
+    /// The complete visible subtree is copied under one topology snapshot.
+    pub fn clone_detached_tree(
+        source: &Arc<MountFSInode>,
+        recursive: bool,
+    ) -> Result<Arc<DetachedMountTree>, SystemError> {
+        with_topology_snapshot(|| {
+            let source_mount = source.mount_fs();
+            if !source_mount.is_live()
+                || !source_mount.is_belongs_to_mntns(&ProcessManager::current_mntns())
+                || source_mount.propagation().is_unbindable()
+            {
+                return Err(SystemError::EINVAL);
+            }
+            if !recursive && Self::has_locked_children_in_view_locked(&source_mount, source)? {
+                return Err(SystemError::EINVAL);
+            }
+            let root = source_mount.deepcopy_with_root(
+                None,
+                source.underlying_inode(),
+                source.shared_dentry(),
+            )?;
+            root.unlock_mount();
+            let prepared = (|| {
+                if recursive {
+                    Self::copy_visible_submounts_locked(&source_mount, &root)?;
+                }
+                let members = Self::collect_tree(&root);
+                let registrations = PreparedRegistrations::prepare(&members)?;
+                for mount in &members {
+                    mount.activate()?;
+                }
+                let anonymous_ns = MntNamespace::new_anonymous(
+                    root.clone(),
+                    members,
+                    ProcessManager::current_mntns().user_ns().clone(),
+                )?;
+                registrations.commit();
+                Ok(anonymous_ns)
+            })();
+            match prepared {
+                Ok(anonymous_ns) => Ok(Arc::new(DetachedMountTree {
+                    root,
+                    anonymous_ns: Mutex::new(Some(anonymous_ns)),
+                })),
+                Err(error) => {
+                    Self::abandon_unpublished_tree(&root);
+                    Err(error)
+                }
+            }
+        })
     }
 
     pub fn mount_flags(&self) -> MountFlags {
@@ -1890,6 +2233,7 @@ impl MountFS {
             .dentry
             .mount_edges
             .fetch_add(1, Ordering::Release);
+        advance_topology_epoch();
         Ok(())
     }
 
@@ -1951,6 +2295,7 @@ impl MountFS {
                 .dentry
                 .mount_edges
                 .fetch_add(1, Ordering::Release);
+            advance_topology_epoch();
             return Ok(());
         };
         stack.push(mount_fs.clone());
@@ -1969,9 +2314,11 @@ impl MountFS {
             let removed = stack.pop();
             debug_assert!(removed.is_some_and(|mount| Arc::ptr_eq(&mount, &mount_fs)));
             stack.push(covered);
+            advance_topology_epoch();
             return Err(error);
         }
         covered.tucked_under.store(true, Ordering::Release);
+        advance_topology_epoch();
         Ok(())
     }
 
@@ -2147,6 +2494,7 @@ impl MountFS {
                     .mount_edges
                     .fetch_add(restored_count - 1, Ordering::Release);
             }
+            advance_topology_epoch();
             Ok(mount_fs.clone())
         })
     }
@@ -2226,7 +2574,9 @@ impl MountFS {
             .iter()
             .position(|child| Arc::ptr_eq(child, old))
             .ok_or(SystemError::ENOENT)?;
-        Ok(core::mem::replace(&mut stack[index], replacement))
+        let removed = core::mem::replace(&mut stack[index], replacement);
+        advance_topology_epoch();
+        Ok(removed)
     }
 
     pub(crate) fn detach_exact_keep_slot(
@@ -2271,6 +2621,7 @@ impl MountFS {
             .dentry
             .mount_edges
             .fetch_sub(1, Ordering::Release);
+        advance_topology_epoch();
         Ok(removed)
     }
 
@@ -2310,6 +2661,7 @@ impl MountFS {
         if stack.is_empty() {
             mountpoints.remove(&key);
         }
+        advance_topology_epoch();
         Ok(removed)
     }
 
@@ -2408,6 +2760,45 @@ impl MountFS {
             "namespace accounting must be released before clearing ownership"
         );
         membership.owner = None;
+    }
+
+    /// Temporarily transfer an anonymous tree member while both namespaces
+    /// are serialized by the mount lifecycle lock. The destination's pending
+    /// reservation becomes committed only after its root edge is published.
+    pub(crate) fn transfer_anonymous_namespace(
+        &self,
+        from: &Arc<MntNamespace>,
+        to: &Arc<MntNamespace>,
+    ) {
+        let mut membership = self.namespace.write();
+        assert!(
+            membership.accounted
+                && membership
+                    .owner
+                    .as_ref()
+                    .is_some_and(|owner| Weak::ptr_eq(owner, &Arc::downgrade(from))),
+            "anonymous tree member must be accounted in its source namespace"
+        );
+        membership.owner = Some(Arc::downgrade(to));
+        membership.accounted = false;
+    }
+
+    pub(crate) fn restore_anonymous_namespace(
+        &self,
+        from: &Arc<MntNamespace>,
+        to: &Arc<MntNamespace>,
+    ) {
+        let mut membership = self.namespace.write();
+        assert!(
+            !membership.accounted
+                && membership
+                    .owner
+                    .as_ref()
+                    .is_some_and(|owner| Weak::ptr_eq(owner, &Arc::downgrade(to))),
+            "failed anonymous transfer must restore exactly its source owner"
+        );
+        membership.owner = Some(Arc::downgrade(from));
+        membership.accounted = true;
     }
 
     pub(crate) fn can_mark_namespace_accounted(&self, namespace: &Arc<MntNamespace>) -> bool {
@@ -2696,6 +3087,29 @@ impl MountFS {
         lifecycle.construction_reserved = false;
         lifecycle.state = MountLifecycleState::Live;
         Ok(())
+    }
+
+    /// Drop an anonymous namespace's complete tree while retaining connected
+    /// descendants for existing path/file pins. The caller holds the mount
+    /// lifecycle lock and has already removed namespace accounting.
+    pub(crate) fn release_anonymous_tree_locked(root: &Arc<Self>, members: &[Arc<Self>]) {
+        if members.len() == 1 || members.iter().all(|mount| !mount.has_external_pins()) {
+            Self::deactivate_disconnected_subtree(root);
+            return;
+        }
+        // The anonymous namespace is gone. A pinned lazy component must no
+        // longer remain discoverable as a peer/slave propagation target.
+        for mount in members {
+            mount.detach_propagation_once();
+        }
+        let component = DetachedMountComponent::new(root, members);
+        for mount in members {
+            let mut lifecycle = mount.lifecycle.lock();
+            component.add_initial_pins(lifecycle.external_pins);
+            lifecycle.state = MountLifecycleState::DetachedConnected;
+            lifecycle.detached_component = Some(component.clone());
+        }
+        component.finish_initialization();
     }
 
     /// Remove one published mount from superblock activity exactly once.
@@ -4264,6 +4678,50 @@ impl MountFSInode {
         Err(SystemError::ELOOP)
     }
 
+    /// Check ancestry without rendering a pathname. The caller holds the
+    /// mount/dentry topology snapshot, so every parent edge is stable here.
+    fn is_descendant_of_snapshot(&self, root: &Arc<MountFSInode>) -> Result<bool, SystemError> {
+        let mut slow = self.self_ref.upgrade().ok_or(SystemError::ENOENT)?;
+        let mut fast = Some(slow.clone());
+        loop {
+            if slow.same_path_ref(root) {
+                return Ok(true);
+            }
+            slow = match Self::ancestor_step_from_snapshot(&slow)? {
+                Some(parent) => parent,
+                None => return Ok(false),
+            };
+            fast = match fast {
+                Some(cursor) => match Self::ancestor_step_from_snapshot(&cursor)? {
+                    Some(parent) => Self::ancestor_step_from_snapshot(&parent)?,
+                    None => None,
+                },
+                None => None,
+            };
+            if fast
+                .as_ref()
+                .is_some_and(|cursor| slow.same_path_ref(cursor))
+            {
+                return Err(SystemError::ELOOP);
+            }
+        }
+    }
+
+    fn ancestor_step_from_snapshot(
+        current: &Arc<MountFSInode>,
+    ) -> Result<Option<Arc<MountFSInode>>, SystemError> {
+        if current.dentry.id == current.mount_fs.root_dentry.id {
+            return Ok(current.mount_fs.self_mountpoint());
+        }
+        let state = current.dentry.state.lock();
+        if state.disconnected {
+            return Ok(None);
+        }
+        let parent = state.parent.clone().ok_or(SystemError::ENOENT)?;
+        drop(state);
+        Ok(Some(current.mount_fs.wrapper_for_existing_edge(parent)))
+    }
+
     fn from_dentry(dentry: Arc<VfsDentry>, mount_fs: Arc<MountFS>) -> Arc<Self> {
         let mut cache = mount_fs.wrapper_cache.lock();
         if let Some(cached) = cache.get(&dentry.id).and_then(Weak::upgrade) {
@@ -4292,6 +4750,24 @@ impl MountFSInode {
         Ok(Self::from_dentry(dentry, mount_fs))
     }
 
+    fn new_child_cached(
+        inner_inode: Arc<dyn IndexNode>,
+        mount_fs: Arc<MountFS>,
+        parent: &Arc<MountFSInode>,
+        name: DName,
+    ) -> Result<Arc<Self>, SystemError> {
+        let metadata = inner_inode.cached_metadata()?;
+        let dentry = mount_fs
+            .super_block_state
+            .get_or_create_dentry_with_metadata(
+                Some(&parent.dentry),
+                inner_inode,
+                Some(name),
+                &metadata,
+            )?;
+        Ok(Self::from_dentry(dentry, mount_fs))
+    }
+
     fn new_anonymous(
         inner_inode: Arc<dyn IndexNode>,
         dname: DName,
@@ -4310,6 +4786,28 @@ impl MountFSInode {
         // Anonymous magic-link targets have no directory edge and therefore
         // cannot be rediscovered by dentry ID. Caching their wrappers would
         // retain one stale Weak key for every namespace-link traversal.
+        Ok(Arc::new_cyclic(|self_ref| Self {
+            dentry,
+            mount_fs,
+            self_ref: self_ref.clone(),
+        }))
+    }
+
+    fn new_tmpfile(
+        inner_inode: Arc<dyn IndexNode>,
+        parent: &Arc<MountFSInode>,
+    ) -> Result<Arc<Self>, SystemError> {
+        let mount_fs = parent.mount_fs.clone();
+        let metadata = inner_inode.metadata()?;
+        let object_state = mount_fs
+            .super_block_state
+            .fsnotify_object_state(metadata.inode_id, inner_inode.inode_generation());
+        let dentry = VfsDentry::new_tmpfile(
+            inner_inode,
+            parent.dentry.clone(),
+            mount_fs.super_block_state.fsnotify_id,
+            object_state,
+        )?;
         Ok(Arc::new_cyclic(|self_ref| Self {
             dentry,
             mount_fs,
@@ -4756,20 +5254,114 @@ impl MountFSInode {
         }
     }
 
+    /// One pathname step which must not enter or leave a mount, including an
+    /// automount. Checking here matters: ordinary `find` folds mount stacks
+    /// before the generic path walker can inspect the result.
+    pub(crate) fn find_no_xdev(&self, name: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
+        match name {
+            "" | "." => self
+                .self_ref
+                .upgrade()
+                .map(|inode| inode as Arc<dyn IndexNode>)
+                .ok_or(SystemError::ENOENT),
+            ".." => {
+                if self.is_mountpoint_root()? && self.mount_fs.self_mountpoint().is_some() {
+                    return Err(SystemError::EXDEV);
+                }
+                self.do_parent().map(|inode| inode as Arc<dyn IndexNode>)
+            }
+            _ => self
+                .do_find_with_no_xdev(name, true, false)
+                .map(|inode| inode as Arc<dyn IndexNode>),
+        }
+    }
+
+    pub(crate) fn cached_find_no_xdev(
+        &self,
+        name: &str,
+    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+        match name {
+            "" | "." => self
+                .self_ref
+                .upgrade()
+                .map(|inode| inode as Arc<dyn IndexNode>)
+                .ok_or(SystemError::ENOENT),
+            // Parent traversal currently needs mount-topology/namespace locks
+            // that can be held across slow work. Retry by ref-walking instead.
+            ".." => Err(SystemError::EAGAIN_OR_EWOULDBLOCK),
+            _ => self
+                .do_find_with_no_xdev(name, true, true)
+                .map(|inode| inode as Arc<dyn IndexNode>),
+        }
+    }
+
+    fn overlaid_inode_no_xdev(&self) -> Result<Arc<MountFSInode>, SystemError> {
+        let current = self.self_ref.upgrade().ok_or(SystemError::ENOENT)?;
+        if current.mount_fs.lookup_top(&current).is_some() {
+            return Err(SystemError::EXDEV);
+        }
+        Ok(current)
+    }
+
     fn do_find(&self, name: &str) -> Result<Arc<MountFSInode>, SystemError> {
-        let base = self.overlaid_inode();
+        self.do_find_with_no_xdev(name, false, false)
+    }
+
+    fn do_find_cached(&self, name: &str) -> Result<Arc<MountFSInode>, SystemError> {
+        self.do_find_with_no_xdev(name, false, true)
+    }
+
+    fn do_find_with_no_xdev(
+        &self,
+        name: &str,
+        no_xdev: bool,
+        cache_only: bool,
+    ) -> Result<Arc<MountFSInode>, SystemError> {
+        let base = if no_xdev {
+            self.self_ref.upgrade().ok_or(SystemError::ENOENT)?
+        } else {
+            self.overlaid_inode()
+        };
         let (inner_inode, mount_inode) = {
-            let _children_guard = base.dentry.children_gate.lock();
-            let _namespace_guard = base.mount_fs.super_block_state.dentry_namespace_lock.read();
+            let _children_guard = if cache_only {
+                base.dentry
+                    .children_gate
+                    .try_lock()
+                    .map_err(|_| SystemError::EAGAIN_OR_EWOULDBLOCK)?
+            } else {
+                base.dentry.children_gate.lock()
+            };
+            let _namespace_guard = if cache_only {
+                base.mount_fs
+                    .super_block_state
+                    .dentry_namespace_lock
+                    .try_read()
+                    .ok_or(SystemError::EAGAIN_OR_EWOULDBLOCK)?
+            } else {
+                base.mount_fs.super_block_state.dentry_namespace_lock.read()
+            };
             // Since downward lookups may cross filesystem boundaries, wrap the
             // exact alias before releasing rename serialization.
-            let inner_inode = base
-                .mount_fs
-                .inner_filesystem
-                .find_in_view(&base.dentry.inode, name)?;
+            let inner_inode = if cache_only {
+                base.mount_fs
+                    .inner_filesystem
+                    .cached_find_in_view(&base.dentry.inode, name)?
+            } else {
+                base.mount_fs
+                    .inner_filesystem
+                    .find_in_view(&base.dentry.inode, name)?
+            };
             let dname = DName::from(name);
-            let mount_inode =
-                MountFSInode::new_child(inner_inode.clone(), base.mount_fs.clone(), &base, dname)?;
+            let mount_inode = if cache_only {
+                MountFSInode::new_child_cached(
+                    inner_inode.clone(),
+                    base.mount_fs.clone(),
+                    &base,
+                    dname,
+                )?
+            } else {
+                MountFSInode::new_child(inner_inode.clone(), base.mount_fs.clone(), &base, dname)?
+            };
             (inner_inode, mount_inode)
         };
         // FUSE automount may acquire the global mount topology lock; never hold
@@ -4777,9 +5369,21 @@ impl MountFSInode {
         if let Some(fuse_node) =
             inner_inode.downcast_arc::<crate::filesystem::fuse::inode::FuseNode>()
         {
-            crate::filesystem::fuse::fs::fuse_try_automount_submount(&fuse_node, &mount_inode)?;
+            if cache_only {
+                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+            }
+            if no_xdev && crate::filesystem::fuse::fs::fuse_submount_enabled(&fuse_node) {
+                return Err(SystemError::EXDEV);
+            }
+            if !no_xdev {
+                crate::filesystem::fuse::fs::fuse_try_automount_submount(&fuse_node, &mount_inode)?;
+            }
         }
-        Ok(mount_inode.overlaid_inode())
+        if no_xdev {
+            mount_inode.overlaid_inode_no_xdev()
+        } else {
+            Ok(mount_inode.overlaid_inode())
+        }
     }
 
     pub(super) fn do_parent(&self) -> Result<Arc<MountFSInode>, SystemError> {
@@ -5113,6 +5717,38 @@ impl IndexNode for MountFSInode {
         self.dentry.inode.mmap_vm_flags(file, vm_flags)
     }
 
+    fn prepare_mmap_file(
+        &self,
+        file: &Arc<File>,
+        vm_flags: VmFlags,
+    ) -> Result<(VmFlags, bool), SystemError> {
+        self.dentry.inode.prepare_mmap_file(file, vm_flags)
+    }
+
+    fn finish_mmap_prepare(&self) {
+        self.dentry.inode.finish_mmap_prepare()
+    }
+
+    fn get_seals(&self) -> Result<u32, SystemError> {
+        self.dentry.inode.get_seals()
+    }
+
+    fn add_seals(&self, seals: u32) -> Result<(), SystemError> {
+        self.dentry.inode.add_seals(seals)
+    }
+
+    fn proc_fd_link_target(&self) -> Option<Vec<u8>> {
+        self.dentry.inode.proc_fd_link_target()
+    }
+
+    fn begin_remote_write(&self) -> bool {
+        self.dentry.inode.begin_remote_write()
+    }
+
+    fn end_remote_write(&self) {
+        self.dentry.inode.end_remote_write()
+    }
+
     fn mmap_uses_anonymous_pages(&self) -> bool {
         self.dentry.inode.mmap_uses_anonymous_pages()
     }
@@ -5320,6 +5956,18 @@ impl IndexNode for MountFSInode {
         Ok(md)
     }
 
+    fn cached_metadata(&self) -> Result<super::Metadata, SystemError> {
+        let mut md = self.dentry.inode.cached_metadata()?;
+        if md.dev_id == 0 {
+            md.dev_id = self.mount_fs.super_block_state.unnamed_dev()?.data() as usize;
+        }
+        Ok(md)
+    }
+
+    fn cached_symlink_target(&self) -> Result<String, SystemError> {
+        self.dentry.inode.cached_symlink_target()
+    }
+
     fn reported_ino(&self, metadata: &super::Metadata) -> InodeId {
         self.dentry.inode.reported_ino(metadata)
     }
@@ -5479,6 +6127,19 @@ impl IndexNode for MountFSInode {
         Ok(preopened)
     }
 
+    fn tmpfile(
+        &self,
+        mode: InodeMode,
+        flags: &FileFlags,
+    ) -> Result<super::UnlinkedFile, SystemError> {
+        self.ensure_mount_writable()?;
+        let parent = self.self_ref.upgrade().ok_or(SystemError::ENOENT)?;
+        let mut unlinked = self.dentry.inode.tmpfile(mode, flags)?;
+        let wrapped = Self::new_tmpfile(unlinked.inode(), &parent)?;
+        unlinked.replace_inode(wrapped);
+        Ok(unlinked)
+    }
+
     fn link(&self, name: &str, other: &Arc<dyn IndexNode>) -> Result<(), SystemError> {
         self.link_with_post_commit(name, other, || {})
     }
@@ -5574,6 +6235,20 @@ impl IndexNode for MountFSInode {
             // Directly call the find method of the filesystem the current inode belongs to.
             // Since downward lookups may cross filesystem boundaries, we need to attempt inode replacement.
             _ => self.do_find(name).map(|inode| inode as Arc<dyn IndexNode>),
+        }
+    }
+
+    fn cached_find(&self, name: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
+        match name {
+            "" | "." => self
+                .self_ref
+                .upgrade()
+                .map(|inode| inode.overlaid_inode() as Arc<dyn IndexNode>)
+                .ok_or(SystemError::ENOENT),
+            ".." => Err(SystemError::EAGAIN_OR_EWOULDBLOCK),
+            _ => self
+                .do_find_cached(name)
+                .map(|inode| inode as Arc<dyn IndexNode>),
         }
     }
 
@@ -5706,6 +6381,11 @@ impl IndexNode for MountFSInode {
             &parent,
             DName::from(filename),
         )?);
+    }
+
+    #[inline]
+    fn is_magic_link(&self) -> bool {
+        self.dentry.inode.is_magic_link()
     }
 
     #[inline]

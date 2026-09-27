@@ -4,7 +4,11 @@ use crate::{
     arch::filesystem::stat::PosixStat,
     driver::base::device::device_number::DeviceNumber,
     filesystem::vfs::{mount::is_mountpoint_root, vcore::do_file_lookup_at},
-    process::ProcessManager,
+    process::{
+        cred::{Kgid, Kuid},
+        namespace::user_namespace::{from_kgid_munged, from_kuid_munged},
+        ProcessManager,
+    },
     syscall::user_access::UserBufferWriter,
     time::PosixTimeSpec,
 };
@@ -319,8 +323,7 @@ pub fn vfs_getattr(
             StxAttributes::STATX_ATTR_AUTOMOUNT | StxAttributes::STATX_ATTR_DAX;
     }
 
-    // 把文件类型加入mode里面 （todo: 在具体的文件系统里面去实现这个操作。这里只是权宜之计）
-    kstat.mode |= metadata.file_type.into();
+    kstat.mode = inode.stat_mode(&metadata);
 
     return Ok(kstat);
 }
@@ -421,8 +424,9 @@ fn cp_statx(kstat: KStat, user_buf_ptr: usize) -> Result<(), SystemError> {
     statx.stx_blksize = kstat.blksize;
     statx.stx_attributes = kstat.attributes & !StxAttributes::STATX_ATTR_CHANGE_MONOTONIC;
     statx.stx_nlink = kstat.nlink;
-    statx.stx_uid = kstat.uid;
-    statx.stx_gid = kstat.gid;
+    let user_ns = ProcessManager::current_user_ns();
+    statx.stx_uid = from_kuid_munged(&user_ns, Kuid::new(kstat.uid as usize));
+    statx.stx_gid = from_kgid_munged(&user_ns, Kgid::new(kstat.gid as usize));
     statx.stx_mode = kstat.mode;
     statx.stx_inode = kstat.ino;
     statx.stx_size = kstat.size as i64;
@@ -522,9 +526,9 @@ impl TryFrom<KStat> for GenericPosixStat {
         tmp.st_mode = kstat.mode.bits();
         tmp.st_nlink = kstat.nlink;
 
-        // todo: 处理user namespace (https://code.dragonos.org.cn/xref/linux-6.6.21/fs/stat.c#415)
-        tmp.st_uid = kstat.uid;
-        tmp.st_gid = kstat.gid;
+        let user_ns = ProcessManager::current_user_ns();
+        tmp.st_uid = from_kuid_munged(&user_ns, Kuid::new(kstat.uid as usize));
+        tmp.st_gid = from_kgid_munged(&user_ns, Kgid::new(kstat.gid as usize));
 
         // 兼容 Linux 的 dev 编码语义，使用 new_encode_dev 返回 gnu_dev_makedev 风格的值。
         tmp.st_rdev = kstat.rdev.new_encode_dev() as u64;

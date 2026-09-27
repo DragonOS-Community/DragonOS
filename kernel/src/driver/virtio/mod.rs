@@ -16,6 +16,7 @@ pub mod virtio;
 pub mod virtio_fs;
 pub mod virtio_impl;
 pub mod virtio_pmem;
+pub mod virtio_rng;
 pub mod virtio_vsock;
 
 /// virtio 设备厂商ID

@@ -92,6 +92,10 @@ pub trait SymOps: Sync + Send + Sized + Debug {
         None
     }
 
+    fn is_magic_link(&self) -> bool {
+        false
+    }
+
     /// 是否是自引用的魔法链接（如 /proc/*/ns/* 命名空间文件）
     ///
     /// 这类符号链接的 readlink 返回不可解析的路径（如 ipc:[xxx]），
@@ -205,5 +209,9 @@ impl<S: SymOps + 'static> IndexNode for ProcSym<S> {
         }
 
         None
+    }
+
+    fn is_magic_link(&self) -> bool {
+        self.inner.is_magic_link()
     }
 }

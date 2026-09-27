@@ -302,14 +302,14 @@ TEST(FallocateSemantics, SuccessfulMode0ClearsSetidForUnprivilegedCaller) {
     EXPECT_EQ(static_cast<mode_t>(0), after.st_mode & (S_ISUID | S_ISGID));
 }
 
-TEST(FallocateSemantics, UnsupportedKeepSizeRemainsUnsupported) {
+TEST(FallocateSemantics, KeepSizePreservesLogicalSize) {
     TempFile file;
     ASSERT_TRUE(file.valid()) << "mkstemp failed: " << strerror(errno);
 
-    errno = 0;
-    EXPECT_EQ(-1, RawFallocate(file.fd(), FALLOC_FL_KEEP_SIZE, 0, 4096));
-    EXPECT_EQ(EOPNOTSUPP, errno) << "unexpected errno=" << errno << " (" << strerror(errno)
-                                 << ")";
+    ASSERT_EQ(0, RawFallocate(file.fd(), FALLOC_FL_KEEP_SIZE, 0, 4096)) << strerror(errno);
+    EXPECT_EQ(0, FileSize(file.fd()));
+    ASSERT_EQ(1, pwrite(file.fd(), "x", 1, 0));
+    EXPECT_EQ(1, FileSize(file.fd()));
 }
 
 TEST(FallocateSemantics, ReadonlyFdReturnsEbadf) {

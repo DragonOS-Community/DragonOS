@@ -305,6 +305,7 @@ pub const SYS_LANDLOCK_RESTRICT_SELF: usize = 446;
 pub const SYS_PROCESS_MRELEASE: usize = 448;
 pub const SYS_FUTEX_WAITV: usize = 449;
 pub const SYS_SET_MEMPOLICY_HOME_NODE: usize = 450;
+pub const SYS_FCHMODAT2: usize = 452;
 
 // ===以下是为了代码一致性，才定义的调用号===
 pub const SYS_GETDENTS: usize = SYS_GETDENTS64;
@@ -618,6 +619,7 @@ pub fn syscall_number_to_str(syscall_number: usize) -> &'static str {
         448 => "SYS_PROCESS_MRELEASE",
         449 => "SYS_FUTEX_WAITV",
         450 => "SYS_SET_MEMPOLICY_HOME_NODE",
+        452 => "SYS_FCHMODAT2",
         _ => "UNKNOWN",
     }
 }

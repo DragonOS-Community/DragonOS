@@ -307,7 +307,7 @@ impl ProcessManager {
             name,
             new_kstack,
             args.flags.contains(CloneFlags::CLONE_THREAD),
-        );
+        )?;
         let ptrace_fork_session = Self::copy_process(&current_pcb, &pcb, args, current_trapframe)
             .map_err(|e| {
             error!(
@@ -526,7 +526,7 @@ impl ProcessManager {
     /// 复制 prctl 相关的进程/线程状态。
     ///
     /// - no_new_privs：线程级语义，clone/fork 继承，execve 保持（execve 不走这里）。
-    /// - keepcaps：clone/fork 继承。
+    /// - keepcaps：作为 Cred 字段由 copy_creds 自然继承。
     /// - dumpable: inherited naturally via the shared or cloned AddressSpace.
     fn copy_prctl_state(
         _clone_flags: &CloneFlags,
@@ -537,9 +537,6 @@ impl ProcessManager {
         if current_pcb.no_new_privs() != 0 {
             new_pcb.set_no_new_privs(true);
         }
-
-        // KEEPCAPS
-        new_pcb.set_keepcaps(current_pcb.keepcaps());
 
         Ok(())
     }
@@ -682,6 +679,12 @@ impl ProcessManager {
             return Err(SystemError::EINVAL);
         }
 
+        // Match Linux copy_process(): the check is intentionally not a
+        // reservation. Concurrent forks may slightly exceed the limit.
+        if crate::process::nr_threads() as usize >= crate::process::max_threads() {
+            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+        }
+
         // TODO: 克隆前应该锁信号处理，等待克隆完成后再处理
 
         // 克隆架构相关
@@ -803,6 +806,16 @@ impl ProcessManager {
         };
         let clone_into_cgroup_target = Self::resolve_clone_into_cgroup_target(&clone_args)?;
 
+        // Linux copy_creds(): construct any child-only keyring while the PCB
+        // is still unpublished.  A failed allocation returns from clone
+        // without making a child visible or retaining partial keyring state.
+        if let Some(child_cred) = pcb
+            .cred()
+            .prepare_fork_keyrings(clone_flags.contains(CloneFlags::CLONE_THREAD))?
+        {
+            pcb.set_cred(child_cred)?;
+        }
+
         // The default CPU is selected by wake_up_new_task(). Preserve only an
         // explicit hint here, outside the fs publication barrier.
         pcb.sched_info().mark_new_task(clone_args.target_cpu);
@@ -823,12 +836,7 @@ impl ProcessManager {
 
         // 拷贝namespace。CLONE_NEWNS 的 fs 路径投影依赖刚复制的 fs_struct，
         // 因而这两步必须相邻且同处 publication barrier 内。
-        Self::copy_namespaces(&clone_flags, current_pcb, pcb, &fs_refs_copy).unwrap_or_else(|e| {
-            panic!(
-                "fork: Failed to copy namespaces from current process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
-                current_pcb.raw_pid(), pcb.raw_pid(), e
-            )
-        });
+        Self::copy_namespaces(&clone_flags, current_pcb, pcb, &fs_refs_copy)?;
 
         // Pre-create the parent's group while allocation failures are still
         // harmless. The extra child owner is acquired only at publication.

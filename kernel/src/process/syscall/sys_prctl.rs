@@ -5,7 +5,7 @@ use num_traits::FromPrimitive;
 use alloc::{borrow::ToOwned, string::String, vec::Vec};
 use system_error::SystemError;
 
-use crate::process::cred::{CAPFlags, Cred};
+use crate::process::cred::{CAPFlags, Cred, CAP_LAST_CAP};
 
 use crate::{
     arch::{interrupt::TrapFrame, ipc::signal::Signal, syscall::nr::SYS_PRCTL},
@@ -17,9 +17,6 @@ use crate::{
 };
 
 const TASK_COMM_LEN: usize = 16;
-
-/// Linux 定义了 41 个 capability (索引 0-40)
-const CAP_LAST_CAP: usize = 40;
 
 /// 将 capability 索引转换为 CAPFlags
 ///
@@ -110,11 +107,11 @@ impl Syscall for SysPrctl {
                 // Linux: PR_SET_KEEPCAPS 仅允许 0/1，其他值返回 EINVAL。
                 match arg2 {
                     0 => {
-                        current.set_keepcaps(false);
+                        current.set_keepcaps(false)?;
                         Ok(0)
                     }
                     1 => {
-                        current.set_keepcaps(true);
+                        current.set_keepcaps(true)?;
                         Ok(0)
                     }
                     _ => Err(SystemError::EINVAL),

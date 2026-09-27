@@ -12,7 +12,10 @@ use system_error::SystemError;
 
 use crate::{
     arch::MMArch,
-    filesystem::page_cache::{PageCache, PreparedRemotePageDirty},
+    filesystem::{
+        page_cache::{PageCache, PreparedRemotePageDirty},
+        vfs::IndexNode,
+    },
     mm::{
         fault::{FaultFlags, PageFaultHandler, PageFaultMessage},
         page::{page_manager_lock, Page, PageFlags},
@@ -47,10 +50,25 @@ impl RemoteAccess<'_> {
 
 type PageCacheEntry = (Arc<PageCache>, usize);
 
+struct RemoteVmaSnapshot {
+    flags: VmFlags,
+    cache_entry: Option<PageCacheEntry>,
+    writer_inode: Option<Arc<dyn IndexNode>>,
+}
+
 struct PinnedRemotePage {
     page: Arc<Page>,
     frame: PhysAddr,
     cache_entry: Option<PageCacheEntry>,
+    _writer: Option<RemoteWriteReservation>,
+}
+
+struct RemoteWriteReservation(Arc<dyn IndexNode>);
+
+impl Drop for RemoteWriteReservation {
+    fn drop(&mut self) {
+        self.0.end_remote_write();
+    }
 }
 
 enum PinRemoteError {
@@ -143,7 +161,8 @@ fn pin_remote_page(
         .mappings
         .contains(address)
         .ok_or(PinRemoteError::Fault)?;
-    let (vm_flags, cache_entry) = remote_vma_snapshot(&vma, address, write)?;
+    let snapshot = remote_vma_snapshot(&vma, address, write)?;
+    let vm_flags = snapshot.flags;
     if !vma_permits(vm_flags, write, force) {
         return Err(PinRemoteError::Denied);
     }
@@ -176,10 +195,19 @@ fn pin_remote_page(
         return Err(PinRemoteError::Fault);
     }
 
+    // The mm guard still protects the VMA here.  A writer reservation then
+    // covers the interval after this guard drops and before the copy ends.
+    let writer = snapshot.writer_inode.and_then(|inode| {
+        inode
+            .begin_remote_write()
+            .then_some(RemoteWriteReservation(inode))
+    });
+
     Ok(PinnedRemotePage {
         page,
         frame,
-        cache_entry,
+        cache_entry: snapshot.cache_entry,
+        _writer: writer,
     })
 }
 
@@ -187,14 +215,22 @@ fn remote_vma_snapshot(
     vma: &Arc<LockedVMA>,
     address: VirtAddr,
     write: bool,
-) -> Result<(VmFlags, Option<PageCacheEntry>), PinRemoteError> {
+) -> Result<RemoteVmaSnapshot, PinRemoteError> {
     let guard = vma.lock();
     let flags = *guard.vm_flags();
     if !write {
-        return Ok((flags, None));
+        return Ok(RemoteVmaSnapshot {
+            flags,
+            cache_entry: None,
+            writer_inode: None,
+        });
     }
     let Some(file) = guard.vm_file() else {
-        return Ok((flags, None));
+        return Ok(RemoteVmaSnapshot {
+            flags,
+            cache_entry: None,
+            writer_inode: None,
+        });
     };
     let Some(base_pgoff) = guard.backing_page_offset() else {
         return Err(PinRemoteError::Denied);
@@ -206,7 +242,15 @@ fn remote_vma_snapshot(
     let index = base_pgoff
         .checked_add(relative >> MMArch::PAGE_SHIFT)
         .ok_or(PinRemoteError::Denied)?;
-    Ok((flags, file.inode().page_cache().map(|cache| (cache, index))))
+    let inode = file.inode();
+    let writer_inode = flags
+        .contains(VmFlags::VM_SHARED | VmFlags::VM_WRITE)
+        .then(|| inode.clone());
+    Ok(RemoteVmaSnapshot {
+        flags,
+        cache_entry: inode.page_cache().map(|cache| (cache, index)),
+        writer_inode,
+    })
 }
 
 fn copy_pinned_page(
@@ -355,12 +399,18 @@ fn fault_in_remote_page(
                     .map(|(frame, _)| frame)
                     .ok_or(SystemError::EFAULT)?;
                 let page = page_manager_lock().get(&frame).ok_or(SystemError::EFAULT)?;
-                let (_, cache_entry) =
+                let snapshot =
                     remote_vma_snapshot(&vma, address, write).map_err(|_| SystemError::EFAULT)?;
+                let writer = snapshot.writer_inode.and_then(|inode| {
+                    inode
+                        .begin_remote_write()
+                        .then_some(RemoteWriteReservation(inode))
+                });
                 return Ok(PinnedRemotePage {
                     page,
                     frame,
-                    cache_entry,
+                    cache_entry: snapshot.cache_entry,
+                    _writer: writer,
                 });
             }
             if outcome.reason.contains(VmFaultReason::VM_FAULT_OOM) {

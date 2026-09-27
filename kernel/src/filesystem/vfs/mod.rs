@@ -7,6 +7,7 @@ pub mod flock;
 pub mod inode_lifecycle;
 pub mod iov;
 pub mod mount;
+pub mod mount_api;
 pub mod open;
 pub mod permission;
 pub mod posix_lock;
@@ -48,7 +49,9 @@ use crate::{
     time::PosixTimeSpec,
 };
 
-pub use self::inode_lifecycle::{EvictionEpoch, InodeRetentionKind, InodeRetentionState};
+pub use self::inode_lifecycle::{
+    EvictionEpoch, InodeRetentionKind, InodeRetentionState, UnlinkedFile,
+};
 pub use self::{
     file::{
         DelegatedWriteResult, FilePrivateData, OpenFileBehavior, PostWriteSyncPolicy,
@@ -425,6 +428,10 @@ bitflags! {
         const S_VERITY = (1 << 16);
         /// 内核正在使用的文件（如cachefiles）
         const S_KERNEL_FILE = (1 << 17);
+        /// Read-only proc sysctl: write access cannot be granted by DAC capabilities.
+        const S_SYSCTL_READONLY = (1 << 18);
+        /// Linux proc sysctl DAC uses global effective IDs, not fsuid/caps.
+        const S_PROC_SYSCTL = (1 << 19);
     }
 }
 
@@ -459,6 +466,9 @@ pub enum SpecialNodeData {
     BlockDevice(Arc<dyn BlockDevice>),
     /// 指向其他 inode 的引用（用于 /proc/self/fd/N 这种魔法链接）
     Reference(Arc<dyn IndexNode>),
+    /// A procfd magic link keeps the open file description alive until the
+    /// path walker has acquired its own inode operation ownership.
+    FileReference(Arc<File>),
     /// A magic-link target that belongs to the producer's inner filesystem
     /// and must retain that filesystem's mount projection.
     ///
@@ -736,6 +746,39 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         Ok(vm_flags)
     }
 
+    /// Reserve a writable shared mapping before MAP_FIXED can discard an old
+    /// VMA.  The bool requests a matching `finish_mmap_prepare` on every exit.
+    fn prepare_mmap_file(
+        &self,
+        _file: &Arc<File>,
+        vm_flags: VmFlags,
+    ) -> Result<(VmFlags, bool), SystemError> {
+        Ok((vm_flags, false))
+    }
+
+    fn finish_mmap_prepare(&self) {}
+
+    fn get_seals(&self) -> Result<u32, SystemError> {
+        Err(SystemError::EINVAL)
+    }
+
+    fn add_seals(&self, _seals: u32) -> Result<(), SystemError> {
+        Err(SystemError::EINVAL)
+    }
+
+    /// The raw target of an anonymous file's /proc/*/fd symlink, if any.
+    fn proc_fd_link_target(&self) -> Option<Vec<u8>> {
+        None
+    }
+
+    /// Pin an in-flight remote write after the VMA has been found but before
+    /// the address-space lock is dropped. `end_remote_write` balances true.
+    fn begin_remote_write(&self) -> bool {
+        false
+    }
+
+    fn end_remote_write(&self) {}
+
     /// Whether mappings retaining this inode produce anonymous pages rather
     /// than file-backed pages (Linux vma_set_anonymous). A replacement file's
     /// inode supplies the property after mmap_file returns.
@@ -986,6 +1029,24 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         return Err(SystemError::ENOSYS);
     }
 
+    /// Metadata already resident in memory for RESOLVE_CACHED path lookup.
+    /// Implementations must not start device/remote I/O; uncertainty is EAGAIN.
+    fn cached_metadata(&self) -> Result<Metadata, SystemError> {
+        Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
+    }
+
+    /// An already resident symlink target. Never fall back to read_at here.
+    fn cached_symlink_target(&self) -> Result<String, SystemError> {
+        Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
+    }
+
+    /// Mode exposed by stat(2). Most inodes store the permission bits and
+    /// file type separately; Linux anon_inode objects deliberately report
+    /// mode 0600 without a file type and override this default.
+    fn stat_mode(&self, metadata: &Metadata) -> InodeMode {
+        metadata.mode | metadata.file_type.into()
+    }
+
     /// Inode number exposed through stat and directory entries. Filesystems
     /// with fixed on-disk numbers may differ from the VFS's internal inode ID.
     fn reported_ino(&self, metadata: &Metadata) -> InodeId {
@@ -1158,6 +1219,14 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         Err(SystemError::ENOSYS)
     }
 
+    /// Create an unnamed regular file in this directory's filesystem.
+    ///
+    /// The inode starts with no directory entry and zero links. Filesystems
+    /// that do not implement O_TMPFILE report EOPNOTSUPP, as on Linux.
+    fn tmpfile(&self, _mode: InodeMode, _flags: &FileFlags) -> Result<UnlinkedFile, SystemError> {
+        Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
+    }
+
     /// @brief 在当前目录下创建一个新的inode，并传入一个简单的data字段，方便进行初始化。
     ///
     /// @param name 目录项的名字
@@ -1282,6 +1351,12 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     fn find(&self, _name: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
         // 若文件系统没有实现此方法，则返回"不支持"
         return Err(SystemError::ENOSYS);
+    }
+
+    /// Lookup from an authoritative in-memory name cache without backend I/O.
+    /// A cold/uncertain entry returns EAGAIN, not ENOENT.
+    fn cached_find(&self, _name: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
+        Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
     }
 
     /// Look up a child by its raw directory-entry name. Filesystems whose
@@ -1611,6 +1686,12 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         None
     }
 
+    /// Stable classification of a magic symlink, independent of whether its
+    /// target can still be resolved at the instant of lookup.
+    fn is_magic_link(&self) -> bool {
+        false
+    }
+
     /// # dname - 返回目录名
     ///
     /// 此函数用于返回一个目录名。
@@ -1735,6 +1816,33 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     }
 }
 
+/// Lifetime of a filesystem's pre-MAP_FIXED mmap reservation.  Dropping it
+/// releases the pending writer on success, error, or a retry of address lookup.
+pub struct MmapAdmission {
+    inode: Option<Arc<dyn IndexNode>>,
+}
+
+impl MmapAdmission {
+    pub fn prepare(file: &Arc<File>, flags: VmFlags) -> Result<(VmFlags, Self), SystemError> {
+        let inode = file.inode();
+        let (flags, reserved) = inode.prepare_mmap_file(file, flags)?;
+        Ok((
+            flags,
+            Self {
+                inode: reserved.then_some(inode),
+            },
+        ))
+    }
+}
+
+impl Drop for MmapAdmission {
+    fn drop(&mut self) {
+        if let Some(inode) = self.inode.take() {
+            inode.finish_mmap_prepare();
+        }
+    }
+}
+
 impl DowncastArc for dyn IndexNode {
     fn as_any_arc(self: Arc<Self>) -> Arc<dyn Any> {
         self
@@ -1811,6 +1919,7 @@ impl dyn IndexNode {
             follow_final_symlink,
             None,
             false,
+            None,
         )? {
             PathWalkOutcome::Found(inode, _) => Ok(inode),
             PathWalkOutcome::MissingFinal { .. } => Err(SystemError::ENOENT),
@@ -1832,6 +1941,7 @@ impl dyn IndexNode {
             follow_final_symlink,
             Some(start.derive()?),
             false,
+            None,
         )? {
             PathWalkOutcome::Found(_, ownership) => ownership.ok_or(SystemError::ESTALE),
             PathWalkOutcome::MissingFinal { .. } => Err(SystemError::ENOENT),
@@ -1853,6 +1963,42 @@ impl dyn IndexNode {
             follow_final_symlink,
             Some(start.derive()?),
             true,
+            None,
+        )? {
+            PathWalkOutcome::Found(_, ownership) => ownership
+                .map(utils::OwnedLookupOutcome::Found)
+                .ok_or(SystemError::ESTALE),
+            PathWalkOutcome::MissingFinal {
+                ownership,
+                name,
+                must_be_dir,
+                ..
+            } => ownership
+                .map(|parent| utils::OwnedLookupOutcome::MissingFinal {
+                    parent,
+                    name,
+                    must_be_dir,
+                })
+                .ok_or(SystemError::ESTALE),
+        }
+    }
+
+    /// Owned open lookup with openat2 restrictions applied during every step.
+    pub fn lookup_openat2_owned(
+        &self,
+        start: &utils::ResolvedPath,
+        path: &str,
+        max_follow_times: usize,
+        follow_final_symlink: bool,
+        options: &utils::PathWalkOptions,
+    ) -> Result<utils::OwnedLookupOutcome, SystemError> {
+        match self.do_lookup_follow_symlink_owned(
+            path,
+            max_follow_times,
+            follow_final_symlink,
+            Some(start.derive()?),
+            true,
+            Some(options),
         )? {
             PathWalkOutcome::Found(_, ownership) => ownership
                 .map(utils::OwnedLookupOutcome::Found)
@@ -1879,18 +2025,39 @@ impl dyn IndexNode {
         follow_final_symlink: bool,
         mut ownership: Option<utils::ResolvedPath>,
         return_missing_final: bool,
+        options: Option<&utils::PathWalkOptions>,
     ) -> Result<PathWalkOutcome, SystemError> {
-        if self.metadata()?.file_type != FileType::Dir {
+        let cache_only = options.is_some_and(|options| {
+            options
+                .resolve
+                .contains(utils::OpenHowResolve::RESOLVE_CACHED)
+        });
+        let lookup_metadata = |inode: &Arc<dyn IndexNode>| {
+            if cache_only {
+                inode.cached_metadata()
+            } else {
+                inode.metadata()
+            }
+        };
+        let start_metadata = if cache_only {
+            self.cached_metadata()?
+        } else {
+            self.metadata()?
+        };
+        if start_metadata.file_type != FileType::Dir {
             return Err(SystemError::ENOTDIR);
         }
 
         // Linux 语义：绝对路径应当以"进程 fs root"（可被 chroot 改变）为起点
         let fs_struct = ProcessManager::current_pcb().fs_struct();
-        let process_root_path = if ownership.is_some() {
-            Some(fs_struct.root_resolved()?)
-        } else {
-            None
-        };
+        let process_root_path =
+            if let Some(root) = options.and_then(|options| options.scope_root.as_ref()) {
+                Some(root.derive()?)
+            } else if ownership.is_some() {
+                Some(fs_struct.root_resolved()?)
+            } else {
+                None
+            };
         let process_root_inode = process_root_path
             .as_ref()
             .map(|path| path.inode())
@@ -1901,6 +2068,13 @@ impl dyn IndexNode {
         // result: 上一个被找到的inode
         // rest_path: 还没有查找的路径
         let (mut result, mut rest_path) = if let Some(rest) = path.strip_prefix('/') {
+            if options.is_some_and(|options| {
+                options
+                    .resolve
+                    .contains(utils::OpenHowResolve::RESOLVE_BENEATH)
+            }) {
+                return Err(SystemError::EXDEV);
+            }
             if ownership.is_some() {
                 ownership = Some(
                     process_root_path
@@ -1912,7 +2086,12 @@ impl dyn IndexNode {
             (process_root_inode.clone(), String::from(rest))
         } else {
             // 是相对路径
-            (self.find(".")?, String::from(path))
+            let start = if options.is_some() {
+                ownership.as_ref().ok_or(SystemError::ESTALE)?.inode()
+            } else {
+                self.find(".")?
+            };
+            (start, String::from(path))
         };
 
         let mut symlink_follows_remaining = max_follow_times;
@@ -1923,13 +2102,13 @@ impl dyn IndexNode {
         // 逐级查找文件
         while !rest_path.is_empty() {
             // 当前这一级不是文件夹
-            if result.metadata()?.file_type != FileType::Dir {
+            if lookup_metadata(&result)?.file_type != FileType::Dir {
                 return Err(SystemError::ENOTDIR);
             }
 
             // 检查当前目录的执行权限（搜索权限）
             // 这确保了进程有权限遍历到此目录（对 Remote 权限模型的 FS，该检查会被绕过）
-            let metadata = result.metadata()?;
+            let metadata = lookup_metadata(&result)?;
             permission::check_inode_permission(&result, &metadata, PermissionMask::MAY_EXEC)?;
 
             let name;
@@ -1953,10 +2132,26 @@ impl dyn IndexNode {
             // 进程 root 边界：当解析到进程 root 时，".." 不允许逃逸，应当停留在 root。
             // 这对应 Linux 的路径解析语义（参照 namei.c 中对 root 的处理）。
             if name == ".." {
-                let cur_md = result.metadata()?;
-                let root_md = process_root_inode.metadata()?;
-                if cur_md.dev_id == root_md.dev_id && cur_md.inode_id == root_md.inode_id {
-                    continue;
+                if let Some(options) = options {
+                    if options.scope_root.is_some() {
+                        options.validate_inode(&result)?;
+                        if options.is_scope_root(&result) {
+                            if options
+                                .resolve
+                                .contains(utils::OpenHowResolve::RESOLVE_BENEATH)
+                            {
+                                return Err(SystemError::EXDEV);
+                            }
+                            continue;
+                        }
+                    }
+                }
+                if options.is_none_or(|options| options.scope_root.is_none()) {
+                    let cur_md = lookup_metadata(&result)?;
+                    let root_md = lookup_metadata(&process_root_inode)?;
+                    if cur_md.dev_id == root_md.dev_id && cur_md.inode_id == root_md.inode_id {
+                        continue;
+                    }
                 }
             }
 
@@ -1966,7 +2161,31 @@ impl dyn IndexNode {
             // missing final component and the base restored for a relative
             // symlink target.
             let parent_ownership = ownership.take();
-            let inode = match result.find(&name) {
+            let no_xdev = options.is_some_and(|options| {
+                options
+                    .resolve
+                    .contains(utils::OpenHowResolve::RESOLVE_NO_XDEV)
+            });
+            let lookup = if no_xdev {
+                if let Some(mounted) = result.clone().downcast_arc::<mount::MountFSInode>() {
+                    if cache_only {
+                        mounted.cached_find_no_xdev(&name)
+                    } else {
+                        mounted.find_no_xdev(&name)
+                    }
+                } else {
+                    if cache_only {
+                        result.cached_find(&name)
+                    } else {
+                        result.find(&name)
+                    }
+                }
+            } else if cache_only {
+                result.cached_find(&name)
+            } else {
+                result.find(&name)
+            };
+            let inode = match lookup {
                 Ok(inode) => inode,
                 Err(error)
                     if return_missing_final
@@ -1984,7 +2203,7 @@ impl dyn IndexNode {
             if parent_ownership.is_some() {
                 ownership = Some(utils::ResolvedPath::new(inode.clone())?);
             }
-            let file_type = inode.metadata()?.file_type;
+            let file_type = lookup_metadata(&inode)?.file_type;
             // 如果已经是路径的最后一个部分，并且不希望跟随最后的符号链接
             if !has_more_components && !follow_final_symlink && file_type == FileType::SymLink {
                 // Linux 语义：若 pathname 以 '/' 结尾，则必须解析为目录，
@@ -2024,20 +2243,67 @@ impl dyn IndexNode {
                     continue;
                 }
 
+                if let Some(options) = options {
+                    if options
+                        .resolve
+                        .contains(utils::OpenHowResolve::RESOLVE_NO_SYMLINKS)
+                    {
+                        return Err(SystemError::ELOOP);
+                    }
+                    if inode.is_magic_link() {
+                        if options
+                            .resolve
+                            .contains(utils::OpenHowResolve::RESOLVE_NO_MAGICLINKS)
+                        {
+                            return Err(SystemError::ELOOP);
+                        }
+                        if options.scope_root.is_some() {
+                            return Err(SystemError::EXDEV);
+                        }
+                    }
+                }
+
                 symlink_follows_remaining -= 1;
+
+                // Magic links can project a live file or mount and need their
+                // own nonblocking snapshot protocol. Ordinary cached symlinks
+                // only need the cached target; do not call special_node(),
+                // whose backing inode lock can wait for filesystem I/O.
+                if cache_only && inode.is_magic_link() {
+                    return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+                }
 
                 // 首先检查是否是"魔法链接"（如 /proc/self/fd/N）
                 // 这些链接的 readlink 返回的路径可能不可解析（如 pipe:[xxx]），
                 // 但它们有一个 special_node 指向真实的 inode
-                let magic_target = match inode.special_node() {
+                let special_node = if cache_only {
+                    None
+                } else {
+                    inode.special_node()
+                };
+                let magic_target = match special_node.as_ref() {
                     Some(SpecialNodeData::Reference(target_inode))
                     | Some(SpecialNodeData::MountProjectedReference {
                         target: target_inode,
                         ..
-                    }) => Some(target_inode),
+                    }) => Some(target_inode.clone()),
+                    Some(SpecialNodeData::FileReference(file)) => Some(file.path_inode()),
                     _ => None,
                 };
                 if let Some(target_inode) = magic_target {
+                    if options.is_some_and(|options| {
+                        options
+                            .resolve
+                            .contains(utils::OpenHowResolve::RESOLVE_NO_XDEV)
+                    }) {
+                        let source_mount = inode.clone().downcast_arc::<mount::MountFSInode>();
+                        let target_mount =
+                            target_inode.clone().downcast_arc::<mount::MountFSInode>();
+                        if !matches!((source_mount, target_mount), (Some(source), Some(target)) if Arc::ptr_eq(&source.mount_fs(), &target.mount_fs()))
+                        {
+                            return Err(SystemError::EXDEV);
+                        }
+                    }
                     if ownership.is_some() {
                         ownership = Some(utils::ResolvedPath::new(target_inode.clone())?);
                     }
@@ -2055,31 +2321,35 @@ impl dyn IndexNode {
                 // read bound. Read once into a PATH_MAX-sized buffer: some of
                 // those implementations intentionally ignore the offset and
                 // therefore cannot be consumed in chunks.
-                if symlink_buffer.is_none() {
-                    let mut buffer = Vec::new();
-                    buffer
-                        .try_reserve_exact(MAX_PATHLEN)
-                        .map_err(|_| SystemError::ENOMEM)?;
-                    buffer.resize(MAX_PATHLEN, 0);
-                    symlink_buffer = Some(buffer);
-                }
-                let content = symlink_buffer.as_mut().expect("symlink buffer initialized");
-                // 读取符号链接
-                // TODO:We need to clarify which interfaces require private data and which do not
-                let len = inode.read_at(
-                    0,
-                    MAX_PATHLEN,
-                    content,
-                    Mutex::new(FilePrivateData::Unused).lock(),
-                )?;
-                if len >= MAX_PATHLEN {
+                let link_path = if cache_only {
+                    inode.cached_symlink_target()?
+                } else {
+                    if symlink_buffer.is_none() {
+                        let mut buffer = Vec::new();
+                        buffer
+                            .try_reserve_exact(MAX_PATHLEN)
+                            .map_err(|_| SystemError::ENOMEM)?;
+                        buffer.resize(MAX_PATHLEN, 0);
+                        symlink_buffer = Some(buffer);
+                    }
+                    let content = symlink_buffer.as_mut().expect("symlink buffer initialized");
+                    // TODO:We need to clarify which interfaces require private data and which do not
+                    let len = inode.read_at(
+                        0,
+                        MAX_PATHLEN,
+                        content,
+                        Mutex::new(FilePrivateData::Unused).lock(),
+                    )?;
+                    if len >= MAX_PATHLEN {
+                        return Err(SystemError::ENAMETOOLONG);
+                    }
+                    String::from(
+                        ::core::str::from_utf8(&content[..len]).map_err(|_| SystemError::EINVAL)?,
+                    )
+                };
+                if link_path.len() >= MAX_PATHLEN {
                     return Err(SystemError::ENAMETOOLONG);
                 }
-
-                // 将读到的数据转换为utf8字符串（先转为str，再转为String）
-                let link_path = String::from(
-                    ::core::str::from_utf8(&content[..len]).map_err(|_| SystemError::EINVAL)?,
-                );
 
                 // 拼接路径：将 symlink 目标 + 剩余路径组合
                 let new_path = if rest_path.is_empty() {
@@ -2096,6 +2366,27 @@ impl dyn IndexNode {
                 // 绝对路径：从进程 root 开始
                 // 相对路径：从当前 result（symlink 所在目录）开始
                 if let Some(rest) = new_path.strip_prefix('/') {
+                    if options.is_some_and(|options| {
+                        options
+                            .resolve
+                            .contains(utils::OpenHowResolve::RESOLVE_BENEATH)
+                    }) {
+                        return Err(SystemError::EXDEV);
+                    }
+                    if options.is_some_and(|options| {
+                        options
+                            .resolve
+                            .contains(utils::OpenHowResolve::RESOLVE_NO_XDEV)
+                    }) {
+                        let from = inode.clone().downcast_arc::<mount::MountFSInode>();
+                        let to = process_root_inode
+                            .clone()
+                            .downcast_arc::<mount::MountFSInode>();
+                        if !matches!((from, to), (Some(from), Some(to)) if Arc::ptr_eq(&from.mount_fs(), &to.mount_fs()))
+                        {
+                            return Err(SystemError::EXDEV);
+                        }
+                    }
                     result = process_root_inode.clone();
                     if ownership.is_some() {
                         ownership = Some(
@@ -2118,7 +2409,7 @@ impl dyn IndexNode {
             result = inode;
         }
 
-        if trailing_slash && result.metadata()?.file_type != FileType::Dir {
+        if trailing_slash && lookup_metadata(&result)?.file_type != FileType::Dir {
             return Err(SystemError::ENOTDIR);
         }
 
@@ -2277,6 +2568,7 @@ bitflags! {
         const EVENTFD_MAGIC = 0x45564446; // "EVDF" in ASCII
         const INOTIFY_MAGIC = 0x494E4F54; // "INOT" in ASCII
         const PIDFD_MAGIC = 0x50494446; // "PIDF" in ASCII
+        const ANON_INODEFS_MAGIC = 0x09041934;
         // Linux UAPI: SOCKFS_MAGIC.
         const SOCKFS_MAGIC = 0x534f434b;
         const OVERLAYFS_MAGIC = 0x794c7630;
@@ -2357,6 +2649,12 @@ pub trait FileSystem: Any + Sync + Send + Debug {
     /// @brief 获取当前文件系统的root inode的指针
     fn root_inode(&self) -> Arc<dyn IndexNode>;
 
+    /// Superblock flags intrinsic to this filesystem instance. Applied when a
+    /// new mount superblock state is created, independently of caller flags.
+    fn required_superblock_flags(&self) -> mount::MountFlags {
+        mount::MountFlags::empty()
+    }
+
     /// Optional canonical state for repeated mounts of this filesystem.
     /// A backend opting in must return the same state for its whole lifetime,
     /// with no I/O, and recreate the backend only after final shutdown. VFS
@@ -2384,6 +2682,16 @@ pub trait FileSystem: Any + Sync + Send + Debug {
         name: &str,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         inode.find(name)
+    }
+
+    /// Cache-only mount-view lookup. The default must not bypass view-specific
+    /// name resolution (for example sysfs network namespaces).
+    fn cached_find_in_view(
+        &self,
+        _inode: &Arc<dyn IndexNode>,
+        _name: &str,
+    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+        Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
     }
 
     fn find_bytes_in_view(
@@ -2611,6 +2919,21 @@ impl DowncastArc for dyn FileSystem {
 
 /// # 可以被挂载的文件系统应该实现的trait
 pub trait MountableFileSystem: FileSystem {
+    /// Only makers that reject unknown and malformed individual legacy
+    /// options may accept fsconfig's flag/string parameter stream.
+    const SUPPORTS_FSCONFIG_LEGACY_OPTIONS: bool = false;
+
+    /// Let a filesystem pin resources named by an fsconfig string parameter
+    /// when the parameter is supplied, not later at CREATE. The default
+    /// retains the previous state for filesystems without pathname options.
+    fn prepare_fsconfig_string(
+        _key: &str,
+        _value: &str,
+        previous: Option<&FsconfigPreparedData>,
+    ) -> Result<Option<FsconfigPreparedData>, SystemError> {
+        Ok(previous.cloned())
+    }
+
     fn make_mount_data(
         _raw_data: Option<&str>,
         _source: &str,
@@ -2632,6 +2955,25 @@ pub trait MountableFileSystem: FileSystem {
     ) -> Result<Arc<dyn FileSystem + 'static>, SystemError> {
         Self::make_fs(data)
     }
+
+    /// New mount API keeps the creator's identity and relevant namespace
+    /// references in the fs_context.  Existing mount(2) makers retain their
+    /// behavior through these default methods.
+    fn make_mount_data_in_context(
+        raw_data: Option<&str>,
+        source: &str,
+        _context: &FsCreationContext,
+    ) -> Result<Option<Arc<dyn FileSystemMakerData + 'static>>, SystemError> {
+        Self::make_mount_data(raw_data, source)
+    }
+
+    fn make_fs_in_context(
+        data: Option<&dyn FileSystemMakerData>,
+        mount_flags: MountFlags,
+        _context: &FsCreationContext,
+    ) -> Result<Arc<dyn FileSystem + 'static>, SystemError> {
+        Self::make_fs_with_flags(data, mount_flags)
+    }
 }
 
 /// # 注册一个可以被挂载文件系统
@@ -2646,18 +2988,42 @@ pub trait MountableFileSystem: FileSystem {
 macro_rules! register_mountable_fs {
     ($fs:ident, $maker_name:ident, $fs_name:literal) => {
         impl $fs {
-            fn make_fs_bridge(
+            fn prepare_fsconfig_string_bridge(
+                key: &str,
+                value: &str,
+                previous: Option<&$crate::filesystem::vfs::FsconfigPreparedData>,
+            ) -> Result<Option<$crate::filesystem::vfs::FsconfigPreparedData>, SystemError> {
+                <$fs as MountableFileSystem>::prepare_fsconfig_string(key, value, previous)
+            }
+
+            fn make_fs_legacy_bridge(
                 data: Option<&dyn FileSystemMakerData>,
                 mount_flags: $crate::filesystem::vfs::mount::MountFlags,
             ) -> Result<Arc<dyn FileSystem>, SystemError> {
                 <$fs as MountableFileSystem>::make_fs_with_flags(data, mount_flags)
             }
 
-            fn make_mount_data_bridge(
+            fn make_mount_data_legacy_bridge(
                 raw_data: Option<&str>,
                 source: &str,
             ) -> Result<Option<Arc<dyn FileSystemMakerData + 'static>>, SystemError> {
                 <$fs as MountableFileSystem>::make_mount_data(raw_data, source)
+            }
+
+            fn make_fs_bridge(
+                data: Option<&dyn FileSystemMakerData>,
+                mount_flags: $crate::filesystem::vfs::mount::MountFlags,
+                context: &$crate::filesystem::vfs::FsCreationContext,
+            ) -> Result<Arc<dyn FileSystem>, SystemError> {
+                <$fs as MountableFileSystem>::make_fs_in_context(data, mount_flags, context)
+            }
+
+            fn make_mount_data_bridge(
+                raw_data: Option<&str>,
+                source: &str,
+                context: &$crate::filesystem::vfs::FsCreationContext,
+            ) -> Result<Option<Arc<dyn FileSystemMakerData + 'static>>, SystemError> {
+                <$fs as MountableFileSystem>::make_mount_data_in_context(raw_data, source, context)
             }
         }
 
@@ -2669,13 +3035,36 @@ macro_rules! register_mountable_fs {
                     as fn(
                         Option<&dyn FileSystemMakerData>,
                         $crate::filesystem::vfs::mount::MountFlags,
+                        &$crate::filesystem::vfs::FsCreationContext,
                     ) -> Result<Arc<dyn FileSystem + 'static>, SystemError>),
                 &($fs::make_mount_data_bridge
                     as fn(
                         Option<&str>,
                         &str,
+                        &$crate::filesystem::vfs::FsCreationContext,
                     )
                         -> Result<Option<Arc<dyn FileSystemMakerData + 'static>>, SystemError>),
+                &($fs::make_fs_legacy_bridge
+                    as fn(
+                        Option<&dyn FileSystemMakerData>,
+                        $crate::filesystem::vfs::mount::MountFlags,
+                    ) -> Result<Arc<dyn FileSystem + 'static>, SystemError>),
+                &($fs::make_mount_data_legacy_bridge
+                    as fn(
+                        Option<&str>,
+                        &str,
+                    )
+                        -> Result<Option<Arc<dyn FileSystemMakerData + 'static>>, SystemError>),
+                &($fs::prepare_fsconfig_string_bridge
+                    as fn(
+                        &str,
+                        &str,
+                        Option<&$crate::filesystem::vfs::FsconfigPreparedData>,
+                    ) -> Result<
+                        Option<$crate::filesystem::vfs::FsconfigPreparedData>,
+                        SystemError,
+                    >),
+                <$fs as MountableFileSystem>::SUPPORTS_FSCONFIG_LEGACY_OPTIONS,
             );
     };
 }
@@ -2717,6 +3106,10 @@ pub struct FileSystemMaker {
     name: &'static str,
     /// 用于创建挂载数据的函数
     builder: &'static MountDataBuilder,
+    legacy_maker: &'static LegacyFSMakerFunction,
+    legacy_builder: &'static LegacyMountDataBuilder,
+    prepare_fsconfig_string: &'static FsconfigStringPreparer,
+    supports_fsconfig_legacy_options: bool,
 }
 
 impl FileSystemMaker {
@@ -2724,20 +3117,76 @@ impl FileSystemMaker {
         name: &'static str,
         maker: &'static FSMakerFunction,
         builder: &'static MountDataBuilder,
+        legacy_maker: &'static LegacyFSMakerFunction,
+        legacy_builder: &'static LegacyMountDataBuilder,
+        prepare_fsconfig_string: &'static FsconfigStringPreparer,
+        supports_fsconfig_legacy_options: bool,
     ) -> FileSystemMaker {
         FileSystemMaker {
             maker,
             name,
             builder,
+            legacy_maker,
+            legacy_builder,
+            prepare_fsconfig_string,
+            supports_fsconfig_legacy_options,
         }
+    }
+
+    pub fn supports_fsconfig_legacy_options(&self) -> bool {
+        self.supports_fsconfig_legacy_options
+    }
+
+    pub fn prepare_fsconfig_string(
+        &self,
+        key: &str,
+        value: &str,
+        previous: Option<&FsconfigPreparedData>,
+    ) -> Result<Option<FsconfigPreparedData>, SystemError> {
+        (self.prepare_fsconfig_string)(key, value, previous)
     }
 
     pub fn build(
         &self,
         data: Option<&dyn FileSystemMakerData>,
         mount_flags: MountFlags,
+        context: &FsCreationContext,
     ) -> Result<Arc<dyn FileSystem>, SystemError> {
-        (self.maker)(data, mount_flags)
+        (self.maker)(data, mount_flags, context)
+    }
+
+    fn build_legacy(
+        &self,
+        data: Option<&dyn FileSystemMakerData>,
+        mount_flags: MountFlags,
+    ) -> Result<Arc<dyn FileSystem>, SystemError> {
+        (self.legacy_maker)(data, mount_flags)
+    }
+}
+
+/// Creation identity retained by an fs-context fd. Legacy mount(2) uses its
+/// original maker path, which also works before process management is ready.
+#[derive(Clone)]
+pub struct FsCreationContext {
+    pub cred: Arc<crate::process::Cred>,
+    pub pid_ns: Arc<crate::process::namespace::pid_namespace::PidNamespace>,
+    pub net_ns: Arc<crate::process::namespace::net_namespace::NetNamespace>,
+    pub mnt_ns: Arc<crate::process::namespace::mnt::MntNamespace>,
+    pub cgroup_ns: Arc<crate::process::namespace::cgroup_namespace::CgroupNamespace>,
+    pub fsconfig_prepared: Option<FsconfigPreparedData>,
+}
+
+impl FsCreationContext {
+    pub fn current() -> Self {
+        let pcb = ProcessManager::current_pcb();
+        Self {
+            cred: pcb.cred(),
+            pid_ns: pcb.active_pid_ns(),
+            net_ns: ProcessManager::current_netns(),
+            mnt_ns: ProcessManager::current_mntns(),
+            cgroup_ns: pcb.nsproxy().cgroup_ns.clone(),
+            fsconfig_prepared: None,
+        }
     }
 }
 
@@ -2745,11 +3194,30 @@ pub trait FileSystemMakerData: Send + Sync {
     fn as_any(&self) -> &dyn Any;
 }
 
+/// Filesystem-owned, immutable state prepared at fsconfig parameter time.
+pub type FsconfigPreparedData = Arc<dyn Any + Send + Sync>;
+pub type FsconfigStringPreparer = fn(
+    key: &str,
+    value: &str,
+    previous: Option<&FsconfigPreparedData>,
+) -> Result<Option<FsconfigPreparedData>, SystemError>;
+
 pub type FSMakerFunction = fn(
     data: Option<&dyn FileSystemMakerData>,
     mount_flags: MountFlags,
+    context: &FsCreationContext,
 ) -> Result<Arc<dyn FileSystem>, SystemError>;
 pub type MountDataBuilder =
+    fn(
+        raw_data: Option<&str>,
+        source: &str,
+        context: &FsCreationContext,
+    ) -> Result<Option<Arc<dyn FileSystemMakerData + 'static>>, SystemError>;
+pub type LegacyFSMakerFunction = fn(
+    data: Option<&dyn FileSystemMakerData>,
+    mount_flags: MountFlags,
+) -> Result<Arc<dyn FileSystem>, SystemError>;
+pub type LegacyMountDataBuilder =
     fn(
         raw_data: Option<&str>,
         source: &str,
@@ -2784,17 +3252,41 @@ pub fn produce_fs(
     source: &str,
     mount_flags: MountFlags,
 ) -> Result<Arc<dyn FileSystem>, SystemError> {
+    match filesystem_maker(filesystem) {
+        Some(maker) => {
+            let mount_data = (maker.legacy_builder)(data, source)?;
+            let mount_data_ref = mount_data.as_ref().map(|arc| arc.as_ref());
+            maker.build_legacy(mount_data_ref, mount_flags)
+        }
+        None => {
+            log::error!("mismatch filesystem type : {}", filesystem);
+            Err(SystemError::ENODEV)
+        }
+    }
+}
+
+pub fn filesystem_maker(filesystem: &str) -> Option<&'static FileSystemMaker> {
     let canonical_filesystem = if filesystem.starts_with("fuse.") {
         "fuse"
     } else {
         filesystem
     };
 
-    match FSMAKER.iter().find(|&m| m.name == canonical_filesystem) {
+    FSMAKER.iter().find(|m| m.name == canonical_filesystem)
+}
+
+pub fn produce_fs_in_context(
+    filesystem: &str,
+    data: Option<&str>,
+    source: &str,
+    mount_flags: MountFlags,
+    context: &FsCreationContext,
+) -> Result<Arc<dyn FileSystem>, SystemError> {
+    match filesystem_maker(filesystem) {
         Some(maker) => {
-            let mount_data = (maker.builder)(data, source)?;
+            let mount_data = (maker.builder)(data, source, context)?;
             let mount_data_ref = mount_data.as_ref().map(|arc| arc.as_ref());
-            maker.build(mount_data_ref, mount_flags)
+            maker.build(mount_data_ref, mount_flags, context)
         }
         None => {
             log::error!("mismatch filesystem type : {}", filesystem);

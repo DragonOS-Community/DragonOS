@@ -119,7 +119,11 @@ fn render_arp_slice(
 }
 
 impl FileOps for ArpFileOps {
-    fn open(&self, data: &mut MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
+    fn open(
+        &self,
+        data: &mut MutexGuard<FilePrivateData>,
+        _flags: &crate::filesystem::vfs::file::FileFlags,
+    ) -> Result<(), SystemError> {
         // Linux `seq_open_net()` pins `get_proc_net(inode)` in the seq private
         // data when the file is opened, so a `setns()` afterwards cannot make
         // one fd report two tables.

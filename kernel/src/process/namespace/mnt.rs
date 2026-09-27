@@ -1,8 +1,8 @@
 use crate::{
     filesystem::vfs::{
         mount::{
-            lock_mount_lifecycle, MountFSInode, MountFlags, MountId, MountTopologyGuard,
-            MOUNT_LIFECYCLE_LOCK,
+            lock_mount_lifecycle, DetachedMountTree, MountFSInode, MountFlags, MountId,
+            MountTopologyGuard, MOUNT_LIFECYCLE_LOCK,
         },
         FileSystem, IndexNode, MountFS,
     },
@@ -133,6 +133,7 @@ pub struct MntNamespace {
     ns_common: NsCommon,
     self_ref: Weak<MntNamespace>,
     _user_ns: Arc<UserNamespace>,
+    anonymous: bool,
     inner: RwSem<InnerMntNamespace>,
 }
 
@@ -238,6 +239,7 @@ impl MntNamespace {
             ns_common: NsCommon::new(0, NamespaceType::Mount),
             self_ref: self_ref.clone(),
             _user_ns: super::user_namespace::INIT_USER_NAMESPACE.clone(),
+            anonymous: false,
             inner: RwSem::new(InnerMntNamespace {
                 root_mountfs: ramfs.clone(),
                 root_parent_mount_id: None,
@@ -257,8 +259,44 @@ impl MntNamespace {
         return result;
     }
 
+    /// The Linux new-mount API gives a detached tree a real anonymous mount
+    /// namespace. Its ownership and accounting remain explicit while mount
+    /// propagation skips the tree until it is attached to a visible namespace.
+    pub(crate) fn new_anonymous(
+        root: Arc<MountFS>,
+        members: Vec<Arc<MountFS>>,
+        user_ns: Arc<UserNamespace>,
+    ) -> Result<Arc<Self>, SystemError> {
+        let count = u32::try_from(members.len()).map_err(|_| SystemError::ENOSPC)?;
+        let namespace = Arc::new_cyclic(|self_ref| Self {
+            ns_common: NsCommon::new(0, NamespaceType::Mount),
+            self_ref: self_ref.clone(),
+            _user_ns: user_ns,
+            anonymous: true,
+            inner: RwSem::new(InnerMntNamespace {
+                root_mountfs: root,
+                root_parent_mount_id: None,
+                mount_count: MountCountState {
+                    mounts: count,
+                    pending_mounts: 0,
+                },
+                copy_sources: Vec::new(),
+                _dead: false,
+            }),
+        });
+        for mount in members {
+            mount.set_namespace(Arc::downgrade(&namespace));
+            mount.mark_namespace_accounted(&namespace);
+        }
+        Ok(namespace)
+    }
+
     pub fn user_ns(&self) -> &Arc<UserNamespace> {
         &self._user_ns
+    }
+
+    pub(crate) fn is_anonymous(&self) -> bool {
+        self.anonymous
     }
 
     /// Forcibly replace the root mount filesystem of this MountNamespace.
@@ -482,6 +520,14 @@ impl MntNamespace {
         target_mountpoint: &Arc<MountFSInode>,
     ) -> Result<(), SystemError> {
         let _topology = MOUNT_LIFECYCLE_LOCK.lock();
+        self.move_mount_locked(source_mfs, target_mountpoint)
+    }
+
+    fn move_mount_locked(
+        &self,
+        source_mfs: &Arc<MountFS>,
+        target_mountpoint: &Arc<MountFSInode>,
+    ) -> Result<(), SystemError> {
         let namespace = self.self_ref.upgrade().ok_or(SystemError::EINVAL)?;
         let target_parent = target_mountpoint.mount_fs();
         if !source_mfs.is_live()
@@ -585,6 +631,121 @@ impl MntNamespace {
         }
 
         Ok(())
+    }
+
+    /// Publish an anonymous tree into this namespace.  All fallible capacity,
+    /// propagation, and edge preparation happens before the ownership change.
+    /// If publication fails, the fd still owns the same usable detached tree.
+    pub fn attach_detached_tree(
+        &self,
+        tree: &Arc<DetachedMountTree>,
+        target_mountpoint: &Arc<MountFSInode>,
+    ) -> Result<(), SystemError> {
+        let _topology = MOUNT_LIFECYCLE_LOCK.lock();
+        let root = tree.root();
+        let Some(anonymous_ns) = tree.anonymous_namespace() else {
+            // An open_tree/fsmount fd remains a path handle after its first
+            // successful attachment. Linux permits moving that mount again.
+            return self.move_mount_locked(&root, target_mountpoint);
+        };
+        let namespace = self.self_ref.upgrade().ok_or(SystemError::EINVAL)?;
+        let target_parent = target_mountpoint.mount_fs();
+        if !root.is_live()
+            || root.self_mountpoint().is_some()
+            || !root.is_belongs_to_mntns(&anonymous_ns)
+            || !target_parent.is_live()
+            || !target_parent.is_belongs_to_mntns(&namespace)
+            || target_mountpoint.is_disconnected()
+            || root.is_locked()
+        {
+            return Err(SystemError::EINVAL);
+        }
+        if target_parent.propagation().is_shared() && tree_contains_unbindable(&root) {
+            return Err(SystemError::EINVAL);
+        }
+
+        let members = MountFS::collect_detached_tree(&root)?;
+        if members
+            .iter()
+            .any(|mount| !mount.is_live() || !mount.is_belongs_to_mntns(&anonymous_ns))
+        {
+            return Err(SystemError::EINVAL);
+        }
+        anonymous_ns.validate_anonymous_members(members.len())?;
+        let count_reservation = self.reserve_mounts(members.clone())?;
+        let prepared_propagation = if target_parent.propagation().is_shared() {
+            Some(prepare_moved_tree_propagation_locked(
+                &target_parent,
+                &root,
+                target_mountpoint,
+            )?)
+        } else {
+            None
+        };
+        let _target_reservation = if prepared_propagation.is_none() {
+            Some(target_parent.reserve_mount_edge(target_mountpoint, 1)?)
+        } else {
+            None
+        };
+
+        root.relocate_mountpoint(Some(target_mountpoint.clone()));
+        for mount in &members {
+            mount.transfer_anonymous_namespace(&anonymous_ns, &namespace);
+        }
+        if let Err(error) = target_parent.attach_new_top(target_mountpoint, root.clone()) {
+            for mount in members.iter().rev() {
+                mount.restore_anonymous_namespace(&anonymous_ns, &namespace);
+            }
+            root.relocate_mountpoint(None);
+            if let Some(prepared) = prepared_propagation {
+                abort_moved_tree_propagation_locked(prepared);
+            }
+            return Err(error);
+        }
+        if let Some(prepared) = prepared_propagation {
+            if let Err(error) = commit_moved_tree_propagation_locked(prepared) {
+                target_parent
+                    .detach_exact(&root)
+                    .expect("prepared detached-tree rollback must remove its exact edge");
+                for mount in members.iter().rev() {
+                    mount.restore_anonymous_namespace(&anonymous_ns, &namespace);
+                }
+                root.relocate_mountpoint(None);
+                return Err(error);
+            }
+        }
+        count_reservation.commit();
+        anonymous_ns.disarm_anonymous_members(members.len());
+        let owned_namespace = tree
+            .take_anonymous_namespace()
+            .expect("attached tree must own exactly its anonymous namespace");
+        debug_assert!(Arc::ptr_eq(&owned_namespace, &anonymous_ns));
+        drop(_topology);
+        drop(owned_namespace);
+        Ok(())
+    }
+
+    fn validate_anonymous_members(&self, count: usize) -> Result<(), SystemError> {
+        if !self.anonymous {
+            return Err(SystemError::EINVAL);
+        }
+        let inner = self.inner.read();
+        if inner._dead
+            || inner.mount_count.pending_mounts != 0
+            || inner.mount_count.mounts != u32::try_from(count).map_err(|_| SystemError::ENOSPC)?
+        {
+            return Err(SystemError::EBUSY);
+        }
+        Ok(())
+    }
+
+    fn disarm_anonymous_members(&self, count: usize) {
+        let mut inner = self.inner.write();
+        assert!(self.anonymous && !inner._dead);
+        assert_eq!(inner.mount_count.pending_mounts, 0);
+        assert_eq!(inner.mount_count.mounts as usize, count);
+        inner.mount_count.mounts = 0;
+        inner._dead = true;
     }
 
     /// Creates a copy of the mount namespace for process cloning.
@@ -715,6 +876,7 @@ impl MntNamespace {
             ns_common,
             self_ref: self_ref.clone(),
             _user_ns: user_ns,
+            anonymous: false,
             inner: RwSem::new(InnerMntNamespace {
                 _dead: false,
                 root_mountfs: new_root_mntfs,
@@ -1011,6 +1173,51 @@ mod tests {
         .unwrap()
     }
 
+    #[test]
+    fn anonymous_tree_failed_attach_preserves_owner_and_success_transfers_accounting() {
+        mnt_namespace_init();
+        let destination = MntNamespace::new_root();
+        let foreign = MntNamespace::new_root();
+        let tree = MountFS::create_detached_tree(
+            RamFS::new(),
+            MountFlags::empty(),
+            MountFlags::empty(),
+            None,
+            INIT_USER_NAMESPACE.clone(),
+        )
+        .unwrap();
+        let tree_root = tree.root();
+        let anonymous = tree.anonymous_namespace().unwrap();
+        assert!(anonymous.is_anonymous());
+        assert!(tree_root.is_belongs_to_mntns(&anonymous));
+        assert_eq!(anonymous.inner.read().mount_count.mounts, 1);
+        assert_eq!(destination.inner.read().mount_count.mounts, 1);
+
+        let foreign_target = foreign.root_mntfs().mountpoint_root_inode();
+        assert_eq!(
+            destination.attach_detached_tree(&tree, &foreign_target),
+            Err(SystemError::EINVAL)
+        );
+        assert!(tree_root.is_belongs_to_mntns(&anonymous));
+        assert_eq!(anonymous.inner.read().mount_count.mounts, 1);
+        assert_eq!(destination.inner.read().mount_count.mounts, 1);
+
+        let target = destination.root_mntfs().mountpoint_root_inode();
+        destination.attach_detached_tree(&tree, &target).unwrap();
+        assert!(tree.anonymous_namespace().is_none());
+        assert!(tree_root.is_belongs_to_mntns(&destination));
+        assert!(anonymous.inner.read()._dead);
+        assert_eq!(anonymous.inner.read().mount_count.mounts, 0);
+        assert_eq!(destination.inner.read().mount_count.mounts, 2);
+        drop(tree);
+        assert!(tree_root.is_live());
+        assert!(destination
+            .root_mntfs()
+            .children_at(&target)
+            .iter()
+            .any(|child| Arc::ptr_eq(child, &tree_root)));
+    }
+
     fn install_attached_root(namespace: &Arc<MntNamespace>) -> Arc<MountFS> {
         let root = MountFS::new(
             RamFS::new(),
@@ -1225,7 +1432,12 @@ impl Drop for MntNamespace {
         // superblock worker when the last mount/path reference is gone.
         let _topology = MOUNT_LIFECYCLE_LOCK.lock();
         let root = self.inner.read().root_mountfs.clone();
+        if self.anonymous && self.inner.read()._dead {
+            debug_assert_eq!(self.inner.read().mount_count.mounts, 0);
+            return;
+        }
         let mut pending = vec![root.clone()];
+        let mut members = Vec::new();
         let mut released = 0u32;
         while let Some(mount) = pending.pop() {
             pending.extend(mount.mount_children());
@@ -1233,6 +1445,9 @@ impl Drop for MntNamespace {
                 released = released
                     .checked_add(1)
                     .expect("namespace teardown mount count overflow");
+            }
+            if self.anonymous {
+                members.push(mount);
             }
         }
         {
@@ -1246,6 +1461,13 @@ impl Drop for MntNamespace {
                 "namespace teardown must consume every committed mount exactly once"
             );
             inner.mount_count.mounts = 0;
+        }
+        if self.anonymous {
+            for member in &members {
+                member.clear_namespace();
+            }
+            MountFS::release_anonymous_tree_locked(&root, &members);
+            return;
         }
         MountFS::deactivate_disconnected_subtree(&root);
     }

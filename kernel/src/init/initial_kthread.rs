@@ -113,6 +113,7 @@ fn kenrel_init_freeable() -> Result<(), SystemError> {
     #[cfg(not(target_arch = "x86_64"))]
     let _ = crate::text_patch::init_live();
     crate::exception::workqueue::workqueue_init();
+    crate::security::keys::object::init();
     crate::perf::release::init();
     return Ok(());
 }

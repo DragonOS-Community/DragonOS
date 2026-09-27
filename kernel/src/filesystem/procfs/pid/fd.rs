@@ -144,6 +144,10 @@ impl FdSymOps {
 }
 
 impl SymOps for FdSymOps {
+    fn is_magic_link(&self) -> bool {
+        true
+    }
+
     fn read_link(&self, buf: &mut [u8]) -> Result<usize, SystemError> {
         // `proc_fd_link()` walks `get_proc_task(inode)->files`, so the link is
         // resolved against the thread this node names, not the group leader.
@@ -174,6 +178,11 @@ impl SymOps for FdSymOps {
 
         // 现在安全地获取文件的路径
         let inode = file.path_inode();
+        if let Some(target) = inode.proc_fd_link_target() {
+            let copy_len = target.len().min(buf.len());
+            buf[..copy_len].copy_from_slice(&target[..copy_len]);
+            return Ok(copy_len);
+        }
         let path_result = if let Some(mount_inode) = inode
             .clone()
             .downcast_arc::<crate::filesystem::vfs::mount::MountFSInode>(
@@ -221,7 +230,9 @@ impl SymOps for FdSymOps {
             fd_table_guard.get_file_by_fd(self.fd)?
         };
 
-        // 返回文件的 inode 引用，使得 fstatat 等操作可以通过魔法链接工作
-        Some(SpecialNodeData::Reference(file.path_inode()))
+        // Keep the open file description alive until the path walker can
+        // retain the target inode. An inode Arc alone does not prevent a
+        // zero-link ext4 O_TMPFILE from entering final reclaim.
+        Some(SpecialNodeData::FileReference(file))
     }
 }

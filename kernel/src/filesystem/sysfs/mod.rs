@@ -4,8 +4,8 @@ use self::{dir::SysKernDirPriv, file::SysKernFilePriv};
 use super::{
     kernfs::{KernFS, KernFSInode, KernFSNamespaceTag},
     vfs::{
-        DirectoryEntry, FileSystem, FileSystemMakerData, IndexNode, InodeMode, MountableFileSystem,
-        SuperBlock,
+        DirectoryEntry, FileSystem, FileSystemMakerData, FsCreationContext, IndexNode, InodeMode,
+        MountableFileSystem, SuperBlock,
     },
 };
 use crate::{
@@ -13,7 +13,7 @@ use crate::{
     filesystem::vfs::{mount::MountFlags, FSMAKER},
     libs::{casting::DowncastArc, once::Once},
     process::{
-        cred::{ns_capable, CAPFlags},
+        cred::{cap_capable, CAPFlags},
         namespace::{
             net_namespace::INIT_NET_NAMESPACE, user_namespace::UserNamespace, NamespaceOps,
         },
@@ -334,11 +334,19 @@ impl MountableFileSystem for SysFS {
     ///
     /// sysfs 是一个虚拟文件系统，不需要任何挂载数据。
     fn make_mount_data(
+        raw_data: Option<&str>,
+        source: &str,
+    ) -> Result<Option<Arc<dyn FileSystemMakerData + 'static>>, SystemError> {
+        Self::make_mount_data_in_context(raw_data, source, &FsCreationContext::current())
+    }
+
+    fn make_mount_data_in_context(
         _raw_data: Option<&str>,
         _source: &str,
+        context: &FsCreationContext,
     ) -> Result<Option<Arc<dyn FileSystemMakerData + 'static>>, SystemError> {
-        let netns = ProcessManager::current_netns();
-        if !ns_capable(netns.user_ns(), CAPFlags::CAP_SYS_ADMIN) {
+        let netns = &context.net_ns;
+        if !cap_capable(&context.cred, netns.user_ns(), CAPFlags::CAP_SYS_ADMIN) {
             return Err(SystemError::EPERM);
         }
         Ok(Some(Arc::new(SysFSMountData {

@@ -5666,6 +5666,17 @@ impl MountFSInode {
     pub fn inode_id(&self) -> Result<InodeId, SystemError> {
         Ok(self.dentry.inode.metadata()?.inode_id)
     }
+
+    /// Identity of the canonical inode within this superblock, independent of
+    /// the pathname or mount view used to reach it. Holding this mounted inode
+    /// keeps the superblock allocation (and thus its address) alive.
+    pub(crate) fn inode_object_identity(&self) -> (usize, InodeId, u64) {
+        (
+            Arc::as_ptr(&self.mount_fs.super_block_state) as usize,
+            self.dentry.registry_child,
+            self.dentry.registry_generation,
+        )
+    }
 }
 
 impl IndexNode for MountFSInode {

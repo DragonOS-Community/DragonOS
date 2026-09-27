@@ -86,10 +86,6 @@ unsafe extern "C" fn riscv64_do_irq(trap_frame: &mut TrapFrame) {
     } else if trap_frame.cause.is_exception() {
         riscv64_do_exception(trap_frame);
     }
-
-    if from_user {
-        crate::rcu::user_enter();
-    }
 }
 
 /// 处理中断

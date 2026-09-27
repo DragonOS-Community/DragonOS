@@ -73,7 +73,6 @@ pub unsafe fn arch_switch_to_user(trap_frame: TrapFrame) -> ! {
     *(trap_frame_vaddr.data() as *mut TrapFrame) = trap_frame;
 
     compiler_fence(Ordering::SeqCst);
-    crate::rcu::user_enter();
     ready_to_switch_to_user(trap_frame_vaddr.data(), new_pc.data());
 }
 

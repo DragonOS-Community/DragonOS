@@ -28,4 +28,4 @@
 
 需求的权威入口是 [harness/product-specs/index.md](harness/product-specs/index.md)，设计意图和权衡的权威入口是 [harness/design-docs/index.md](harness/design-docs/index.md)，执行步骤位于 `harness/exec-plans/`。新增内容应进入对应职责的文档，避免在多个位置形成竞争定义。
 
-提交消息规则不在本文件重复定义。需要提交相关上下文时，先读 [harness/constraints/COMMIT.md](harness/constraints/COMMIT.md)，再进入其中链接的权威贡献规范。
+开始任何会修改仓库的任务前，必须阅读 [harness/constraints/WORKFLOW.md](harness/constraints/WORKFLOW.md)，并按其中的原子化提交条件在工作单元完成时直接本地提交，无需再次请求确认，避免变更积压。提交边界和例外以该工作流文档为准。提交消息格式由 [harness/constraints/COMMIT.md](harness/constraints/COMMIT.md) 路由至权威贡献规范。

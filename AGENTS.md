@@ -12,7 +12,7 @@ KEY_INFO_REMINDER.md                   ← 构建、Nix 环境与 QEMU 关键命
 harness/                               ← 深层 Harness 文档
 ├── constraints/                       ← 局部操作约束入口
 │   ├── COMMIT.md                      ← 提交上下文与权威规范入口
-│   └── WORKFLOW.md                    ← 开发工作流、原子化提交时机与授权边界
+│   └── WORKFLOW.md                    ← 开发工作流
 ├── product-specs/                     ← 产品需求文档
 │   └── index.md                       ← 问题、价值、范围与需求索引
 ├── design-docs/                       ← 设计意图文档

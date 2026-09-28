@@ -35,6 +35,8 @@ use super::{
     InetSocket, UNSPECIFIED_LOCAL_ENDPOINT_V4, UNSPECIFIED_LOCAL_ENDPOINT_V6,
 };
 
+mod ipv4_packet;
+mod ipv6_packet;
 mod option;
 mod output_flow;
 mod rx_queue;
@@ -46,6 +48,33 @@ pub(crate) mod udp_bindings;
 
 type EP = crate::filesystem::epoll::EPollEventType;
 const IFACE_POLL_BATCH_ROUNDS: usize = 128;
+
+/// Native IPv6 unicast is admitted by the prepared output queue; multicast
+/// and IPv4-mapped destinations still use the smoltcp send queue.
+fn uses_prepared_ipv6_output(endpoint: IpEndpoint) -> bool {
+    matches!(endpoint.addr, Ipv6(addr) if addr.to_ipv4_mapped().is_none() && !addr.is_multicast())
+}
+
+struct Ipv4SendSnapshot {
+    owner: Arc<dyn Iface>,
+    source: smoltcp::wire::Ipv4Address,
+    destination: smoltcp::wire::Ipv4Address,
+    source_port: u16,
+    destination_port: u16,
+    route: crate::net::route::OutputRouteDecision,
+    ttl: u8,
+    multicast_loop: bool,
+    checksum_enabled: bool,
+}
+
+struct Ipv6SendSnapshot {
+    owner: Arc<dyn Iface>,
+    route: crate::net::route::OutputRouteDecision,
+    source: smoltcp::wire::Ipv6Address,
+    destination: smoltcp::wire::Ipv6Address,
+    source_port: u16,
+    destination_port: u16,
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -103,6 +132,8 @@ pub struct UdpSocket {
     fasync_items: FAsyncItems,
     /// Custom send buffer size (SO_SNDBUF), 0 means use default
     send_buf_size: AtomicUsize,
+    /// Pending IPv4 UDP bytes remain charged across SocketSet replacement.
+    send_account: Arc<super::common::output_account::SocketOutputAccount<Self>>,
     /// Custom receive buffer size (SO_RCVBUF), 0 means use default
     recv_buf_size: AtomicUsize,
     /// SO_RCVLOWAT
@@ -189,6 +220,10 @@ impl UdpSocket {
             epoll_items: EPollItems::default(),
             fasync_items: FAsyncItems::default(),
             send_buf_size: AtomicUsize::new(0), // 0 means use default
+            send_account: Arc::new(super::common::output_account::SocketOutputAccount::new(
+                me.clone(),
+                inner::DEFAULT_TX_BUF_SIZE * 2,
+            )),
             recv_buf_size: AtomicUsize::new(0), // 0 means use default
             rcvlowat: AtomicI32::new(1),
             so_reuseaddr: AtomicBool::new(false),
@@ -863,6 +898,30 @@ impl UdpSocket {
         can_write || write_shutdown
     }
 
+    /// A blocking sender waits on the resource its selected path actually
+    /// charges. In particular, a full prepared-output account must not spin
+    /// merely because the legacy smoltcp queue still has room.
+    fn can_send_to(&self, to: Option<IpEndpoint>, payload_len: usize) -> bool {
+        let prepared_packet_len = if self.ip_version == IpVersion::Ipv4 {
+            ipv4_packet::packet_len(payload_len).ok()
+        } else {
+            let inner = self.inner.read();
+            let destination = to.or_else(|| match inner.as_ref() {
+                Some(UdpInner::Bound(bound)) => bound.remote_endpoint().ok(),
+                _ => None,
+            });
+            destination
+                .filter(|dest| uses_prepared_ipv6_output(*dest))
+                .and_then(|_| ipv6_packet::packet_len(payload_len).ok())
+        };
+        if let Some(packet_len) = prepared_packet_len {
+            self.send_account.can_charge(packet_len)
+                || self.shutdown.load(Ordering::Acquire) & 0x02 != 0
+        } else {
+            self.can_send()
+        }
+    }
+
     #[inline]
     fn recv_return_len(copy_len: usize, orig_len: usize, flags: PMSG) -> usize {
         if flags.contains(PMSG::TRUNC) {
@@ -972,6 +1031,22 @@ impl UdpSocket {
             }
         }
 
+        if self.ip_version == IpVersion::Ipv4 {
+            return self.try_send_ipv4_prepared(buf, to);
+        }
+
+        let native_ipv6 = {
+            let inner = self.inner.read();
+            let destination = to.or_else(|| match inner.as_ref() {
+                Some(UdpInner::Bound(bound)) => bound.remote_endpoint().ok(),
+                _ => None,
+            });
+            destination.is_some_and(uses_prepared_ipv6_output)
+        };
+        if native_ipv6 {
+            return self.try_send_ipv6_prepared(buf, to);
+        }
+
         let placement = self.iface_placement.read();
         let (is_multicast, is_unbound) = {
             let inner = self.inner.read();
@@ -991,6 +1066,268 @@ impl UdpSocket {
         }
 
         self.try_send_with_stable_iface(buf, to)
+    }
+
+    /// Snapshot only socket state under the placement lock. Both the nft
+    /// interpreter and local receive handoff run after that lock is released.
+    fn ipv4_send_snapshot(&self, to: Option<IpEndpoint>) -> Result<Ipv4SendSnapshot, SystemError> {
+        let (destination, local, connected_source, owner) = {
+            let inner = self.inner.read();
+            let bound = match inner.as_ref() {
+                Some(UdpInner::Bound(bound)) => bound,
+                Some(UdpInner::Unbound(_)) => return Err(SystemError::EDESTADDRREQ),
+                None => return Err(SystemError::EBADF),
+            };
+            (
+                Self::normalize_unspecified_dest(
+                    to.or_else(|| bound.remote_endpoint().ok())
+                        .ok_or(SystemError::EDESTADDRREQ)?,
+                ),
+                bound.endpoint(),
+                bound.connected_source(),
+                bound.inner().iface().clone(),
+            )
+        };
+        if destination.port == 0 {
+            return Err(SystemError::EINVAL);
+        }
+        let Ipv4(destination_addr) = destination.addr else {
+            return Err(SystemError::EAFNOSUPPORT);
+        };
+        let (required_oif, multicast_source) =
+            output_flow::socket_constraints(self, destination.addr)?;
+        let resolved = output_flow::resolve_ipv4_send_route(
+            &self.netns,
+            local,
+            destination.addr,
+            required_oif,
+            connected_source.or(multicast_source),
+        )?;
+        if resolved.decision.matched.kind == crate::net::route::RTN_BROADCAST
+            && !self.so_broadcast.load(Ordering::Relaxed)
+        {
+            return Err(SystemError::EACCES);
+        }
+        let Ipv4(source) = resolved.source else {
+            return Err(SystemError::EAFNOSUPPORT);
+        };
+        Ok(Ipv4SendSnapshot {
+            owner,
+            source,
+            destination: destination_addr,
+            source_port: local.port,
+            destination_port: destination.port,
+            route: resolved.output_decision(),
+            ttl: if destination_addr.is_multicast() {
+                self.ip_multicast_ttl.load(Ordering::Relaxed) as u8
+            } else {
+                64
+            },
+            multicast_loop: self.ip_multicast_loop.load(Ordering::Relaxed),
+            checksum_enabled: !self.no_check.load(Ordering::Acquire),
+        })
+    }
+
+    fn try_send_ipv4_prepared(
+        &self,
+        payload: &[u8],
+        to: Option<IpEndpoint>,
+    ) -> Result<usize, SystemError> {
+        let packet_len = ipv4_packet::packet_len(payload.len())?;
+        let placement = self.iface_placement.read();
+        let ordinary_bound_send = {
+            let inner = self.inner.read();
+            match inner.as_ref() {
+                Some(UdpInner::Bound(bound)) => to
+                    .or_else(|| bound.remote_endpoint().ok())
+                    .is_some_and(|dest| !dest.addr.is_multicast()),
+                _ => false,
+            }
+        };
+        let snapshot = if ordinary_bound_send {
+            let snapshot = self.ipv4_send_snapshot(to)?;
+            drop(placement);
+            snapshot
+        } else {
+            drop(placement);
+            let _placement = self.iface_placement.write();
+            let unbound = matches!(self.inner.read().as_ref(), Some(UdpInner::Unbound(_)));
+            if unbound {
+                let destination = to.ok_or(SystemError::EDESTADDRREQ)?;
+                if destination.port == 0 {
+                    return Err(SystemError::EINVAL);
+                }
+                let Ipv4(_) = destination.addr else {
+                    return Err(SystemError::EAFNOSUPPORT);
+                };
+                self.bind_ephemeral(Self::normalize_unspecified_dest(destination).addr)?;
+            }
+            self.ipv4_send_snapshot(to)?
+        };
+
+        let dont_fragment = packet_len <= snapshot.route.ip_mtu;
+        let identification = if dont_fragment {
+            0
+        } else {
+            self.netns.next_ipv4_identification()
+        };
+        // Admission and the per-socket charge both precede any rule or clone
+        // side effect. The charge follows the packet until output completion.
+        let charge = self.send_account.charge(packet_len)?;
+        let mut reservation = crate::driver::net::local_output::reserve_prepared_ip_output(
+            snapshot.owner.as_ref(),
+            packet_len,
+            IpVersion::Ipv4,
+        )?;
+        ipv4_packet::emit(
+            reservation.bytes_mut(),
+            payload,
+            snapshot.source,
+            snapshot.destination,
+            snapshot.source_port,
+            snapshot.destination_port,
+            snapshot.ttl,
+            0,
+            identification,
+            dont_fragment,
+            snapshot.checksum_enabled,
+        )?;
+        reservation.set_charge(charge);
+        crate::net::output::submit_prepared_ipv4(
+            &self.netns,
+            reservation,
+            snapshot.route,
+            snapshot.multicast_loop,
+            true,
+        )?;
+        Ok(payload.len())
+    }
+
+    /// Admit native IPv6 unicast using one route/source snapshot. The socket
+    /// placement lock protects endpoint/device state until that snapshot is
+    /// captured, but is never held while executing nft rules or local input.
+    fn try_send_ipv6_prepared(
+        &self,
+        payload: &[u8],
+        to: Option<IpEndpoint>,
+    ) -> Result<usize, SystemError> {
+        let packet_len = ipv6_packet::packet_len(payload.len())?;
+        let placement = self.iface_placement.read();
+        let is_unbound = matches!(self.inner.read().as_ref(), Some(UdpInner::Unbound(_)));
+        let snapshot = if is_unbound {
+            drop(placement);
+            let _placement = self.iface_placement.write();
+            let destination =
+                Self::normalize_unspecified_dest(to.ok_or(SystemError::EDESTADDRREQ)?);
+            let Ipv6(destination_addr) = destination.addr else {
+                return Err(SystemError::EAFNOSUPPORT);
+            };
+            if destination.port == 0 {
+                return Err(SystemError::EINVAL);
+            }
+            let required_oif = self
+                .device_binding
+                .resolve_iface(&self.netns)?
+                .map(|iface| iface.nic_id() as u32);
+            let resolved = crate::net::route::resolve_ipv6_send_route(
+                &self.netns,
+                destination.addr,
+                required_oif,
+                None,
+            )?;
+            let mut inner = self.inner.write();
+            let Some(UdpInner::Unbound(_)) = inner.as_ref() else {
+                return Err(SystemError::EBADF);
+            };
+            let rx_size = self.recv_buf_size.load(Ordering::Acquire);
+            let tx_size = self.send_buf_size.load(Ordering::Acquire);
+            let unbound = UnboundUdp::new_with_buf_size(self.ip_version, rx_size, tx_size);
+            let bound = unbound.bind_ephemeral_on_iface(
+                resolved.source_owner,
+                // Implicit port allocation does not pin the source address.
+                // A later send may select another IPv6 source after routing
+                // changes, just as an unbound Linux UDP socket does.
+                Ipv6(smoltcp::wire::Ipv6Address::UNSPECIFIED),
+                self.bind_context(),
+            )?;
+            let owner = bound.inner().iface().clone();
+            let source_port = bound.endpoint().port;
+            owner.common().bind_socket(self.self_ref.upgrade().unwrap());
+            *inner = Some(UdpInner::Bound(bound));
+            Ipv6SendSnapshot {
+                owner,
+                route: resolved.decision,
+                source: resolved.source,
+                destination: destination_addr,
+                source_port,
+                destination_port: destination.port,
+            }
+        } else {
+            let (destination, local, connected_source, owner) = {
+                let inner = self.inner.read();
+                let bound = match inner.as_ref() {
+                    Some(UdpInner::Bound(bound)) => bound,
+                    Some(UdpInner::Unbound(_)) => unreachable!(),
+                    None => return Err(SystemError::EBADF),
+                };
+                let destination = Self::normalize_unspecified_dest(
+                    to.or_else(|| bound.remote_endpoint().ok())
+                        .ok_or(SystemError::EDESTADDRREQ)?,
+                );
+                self.validate_bound_send_dest(bound, destination)?;
+                (
+                    destination,
+                    bound.endpoint(),
+                    bound.connected_source(),
+                    bound.inner().iface().clone(),
+                )
+            };
+            let Ipv6(destination_addr) = destination.addr else {
+                return Err(SystemError::EAFNOSUPPORT);
+            };
+            let required_oif = self
+                .device_binding
+                .resolve_iface(&self.netns)?
+                .map(|iface| iface.nic_id() as u32);
+            let fixed_source = local
+                .addr
+                .filter(|addr| !addr.is_unspecified())
+                .or(connected_source);
+            let resolved = crate::net::route::resolve_ipv6_send_route(
+                &self.netns,
+                destination.addr,
+                required_oif,
+                fixed_source,
+            )?;
+            drop(placement);
+            Ipv6SendSnapshot {
+                owner,
+                route: resolved.decision,
+                source: resolved.source,
+                destination: destination_addr,
+                source_port: local.port,
+                destination_port: destination.port,
+            }
+        };
+
+        let charge = self.send_account.charge(packet_len)?;
+        let mut reservation = crate::driver::net::local_output::reserve_prepared_ip_output(
+            snapshot.owner.as_ref(),
+            packet_len,
+            IpVersion::Ipv6,
+        )?;
+        ipv6_packet::emit(
+            reservation.bytes_mut(),
+            payload,
+            snapshot.source,
+            snapshot.destination,
+            snapshot.source_port,
+            snapshot.destination_port,
+            64,
+        )?;
+        reservation.set_charge(charge);
+        crate::net::output::submit_prepared_ipv6(&self.netns, reservation, snapshot.route)?;
+        Ok(payload.len())
     }
 
     fn try_send_with_stable_iface(
@@ -1205,7 +1542,12 @@ impl UdpSocket {
                         output_flow,
                         self.unspecified_addr(),
                     );
-                    if should_loopback_send {
+                    // Local unicast follows the ordinary IP output/receive
+                    // path so it traverses PRE_ROUTING before UDP/raw demux.
+                    // Multicast and broadcast still need their separate
+                    // loopback-clone semantics migrated before this feature
+                    // can be considered complete.
+                    if should_loopback_send && (is_multicast || is_broadcast) {
                         let max_payload =
                             bound.with_socket(|socket| socket.payload_send_capacity());
                         (

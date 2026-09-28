@@ -212,7 +212,11 @@ impl crate::net::socket::Socket for RawSocket {
 
         match self.inner.read().as_ref() {
             None | Some(RawInner::Unbound(_)) => {
-                event.insert(EP::EPOLLOUT | EP::EPOLLWRNORM | EP::EPOLLWRBAND);
+                if self.ip_version != smoltcp::wire::IpVersion::Ipv4
+                    || self.send_account.is_writable()
+                {
+                    event.insert(EP::EPOLLOUT | EP::EPOLLWRNORM | EP::EPOLLWRBAND);
+                }
             }
             Some(RawInner::Wildcard(bound)) => {
                 let (can_recv, can_send) =
@@ -222,7 +226,10 @@ impl crate::net::socket::Socket for RawSocket {
                     event.insert(EP::EPOLLIN | EP::EPOLLRDNORM);
                 }
 
-                if can_send {
+                if (self.ip_version == smoltcp::wire::IpVersion::Ipv4
+                    && self.send_account.is_writable())
+                    || (self.ip_version != smoltcp::wire::IpVersion::Ipv4 && can_send)
+                {
                     event.insert(EP::EPOLLOUT | EP::EPOLLWRNORM | EP::EPOLLWRBAND);
                 }
             }
@@ -234,7 +241,10 @@ impl crate::net::socket::Socket for RawSocket {
                     event.insert(EP::EPOLLIN | EP::EPOLLRDNORM);
                 }
 
-                if can_send {
+                if (self.ip_version == smoltcp::wire::IpVersion::Ipv4
+                    && self.send_account.is_writable())
+                    || (self.ip_version != smoltcp::wire::IpVersion::Ipv4 && can_send)
+                {
                     event.insert(EP::EPOLLOUT | EP::EPOLLWRNORM | EP::EPOLLWRBAND);
                 }
             }
@@ -288,6 +298,9 @@ impl crate::net::socket::Socket for RawSocket {
     }
 
     fn send_bytes_available(&self) -> Result<usize, SystemError> {
+        if self.ip_version == smoltcp::wire::IpVersion::Ipv4 {
+            return Ok(self.send_account.available());
+        }
         let guard = self.inner.read();
         Ok(match *guard {
             Some(RawInner::Wildcard(ref bound)) => {

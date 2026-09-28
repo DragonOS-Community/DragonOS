@@ -70,6 +70,10 @@ pub(super) struct LocalInputDevice<'a, D: SmolDevice + ?Sized> {
     pub(super) device: &'a mut D,
     pub(super) common: &'a IfaceCommon,
     pub(super) backend_policy: OutputBackendPolicy<'a>,
+    pub(super) stage_cell: Option<&'a Cell<IngressStage>>,
+    pub(super) ct_context_cell:
+        Option<&'a core::cell::RefCell<Option<crate::net::conntrack::CtPacketContext>>>,
+    pub(super) mark_cell: Option<&'a Cell<u32>>,
 }
 
 /// Delegates receive to the physical device while routing every response and
@@ -120,7 +124,10 @@ pub(super) enum OutputBackendDecision {
 
 #[derive(Clone, Copy)]
 pub(super) struct OutputBackendPolicy<'a> {
+    pub(super) netns: &'a NetNamespace,
     pub(super) routes: &'a crate::net::route::OutputRouteGuard<'a>,
+    pub(super) ruleset: Option<&'a crate::net::nftables::RulesetSnapshot>,
+    pub(super) device_names: &'a crate::net::nftables::NftDeviceNames,
     pub(super) configured_neighbors: Option<&'a crate::net::neighbor::NeighborReadGuard<'a>>,
     pub(super) owner_ifindex: u32,
     pub(super) owner_is_up: bool,
@@ -128,6 +135,43 @@ pub(super) struct OutputBackendPolicy<'a> {
 }
 
 impl OutputBackendPolicy<'_> {
+    pub(super) fn policy_current(self) -> bool {
+        self.ruleset
+            .is_some_and(|ruleset| ruleset.generation == self.netns.nftables().generation())
+    }
+
+    fn requires_output_admission(self, version: smoltcp::wire::IpVersion) -> bool {
+        self.ruleset.is_some_and(|ruleset| {
+            if ruleset.conntrack_registered(version) {
+                return true;
+            }
+            let has_hook = |hook| match version {
+                smoltcp::wire::IpVersion::Ipv4 => ruleset.has_ipv4_hook(hook),
+                smoltcp::wire::IpVersion::Ipv6 => ruleset.has_ipv6_hook(hook),
+            };
+            has_hook(crate::net::nftables::NftIpv4Hook::LocalOut)
+                || has_hook(crate::net::nftables::NftIpv4Hook::PostRouting)
+        })
+    }
+
+    pub(super) fn hook_oifname(
+        self,
+        hook: crate::net::nftables::NftIpv4Hook,
+        version: smoltcp::wire::IpVersion,
+        oif: u32,
+    ) -> Option<[u8; 16]> {
+        let ruleset = self.ruleset?;
+        let needed = match version {
+            smoltcp::wire::IpVersion::Ipv4 => ruleset.hook_requires_iface_names(hook),
+            smoltcp::wire::IpVersion::Ipv6 => ruleset.ipv6_hook_requires_iface_names(hook),
+        };
+        if needed {
+            self.device_names.get(oif)
+        } else {
+            Some([0; 16])
+        }
+    }
+
     pub(super) fn outbound_ip_mtu(
         self,
         destination: smoltcp::wire::IpAddress,
@@ -257,6 +301,709 @@ impl Drop for LocalInputScratch<'_> {
     }
 }
 
+/// Owns one complete IP datagram and the source interface's bounded TX
+/// capacity before any OUTPUT/POST_ROUTING side effect is run. Dropping it
+/// releases both resources without publishing a partial packet.
+pub(crate) struct PreparedIpOutputReservation<'a> {
+    common: &'a IfaceCommon,
+    reservation: LocalOutputReservation<'a>,
+    scratch: LocalInputScratch<'a>,
+    len: usize,
+    version: smoltcp::wire::IpVersion,
+    charge: Option<OutputCharge>,
+}
+
+pub(crate) fn reserve_prepared_ip_output(
+    source: &dyn Iface,
+    len: usize,
+    version: smoltcp::wire::IpVersion,
+) -> Result<PreparedIpOutputReservation<'_>, SystemError> {
+    PreparedIpOutputReservation::reserve(source.common(), len, version)
+}
+
+impl<'a> PreparedIpOutputReservation<'a> {
+    pub(super) fn reserve(
+        common: &'a IfaceCommon,
+        len: usize,
+        version: smoltcp::wire::IpVersion,
+    ) -> Result<Self, SystemError> {
+        let valid = match version {
+            smoltcp::wire::IpVersion::Ipv4 => (20..=u16::MAX as usize).contains(&len),
+            smoltcp::wire::IpVersion::Ipv6 => (40..=40 + u16::MAX as usize).contains(&len),
+        };
+        if !valid {
+            return Err(SystemError::EMSGSIZE);
+        }
+        let mut reservation = common
+            .local_input_queue
+            .reserve_output()
+            .ok_or(SystemError::ENOBUFS)?;
+        let mut scratch =
+            LocalInputScratch::checkout(&common.local_input_queue.response_scratch, len)
+                .ok_or(SystemError::ENOMEM)?;
+        if !reservation.try_resize(scratch.capacity()) {
+            return Err(SystemError::ENOBUFS);
+        }
+        scratch.resize(len);
+        Ok(Self {
+            common,
+            reservation,
+            scratch,
+            len,
+            version,
+            charge: None,
+        })
+    }
+
+    pub(crate) fn set_charge(&mut self, charge: OutputCharge) {
+        debug_assert!(self.charge.is_none());
+        self.charge = Some(charge);
+    }
+
+    pub(crate) fn bytes(&self) -> &[u8] {
+        self.scratch.buffer.as_ref().unwrap().as_slice()
+    }
+
+    pub(crate) fn bytes_mut(&mut self) -> &mut [u8] {
+        self.scratch.buffer.as_mut().unwrap().as_mut_slice()
+    }
+
+    /// Validate the complete datagram and the selected route before any
+    /// OUTPUT/POST_ROUTING hook or local multicast copy can observe it.
+    pub(crate) fn validate_for_route(
+        &self,
+        route: crate::net::route::OutputRouteDecision,
+        may_fragment: bool,
+    ) -> Result<(), SystemError> {
+        if self.version != smoltcp::wire::IpVersion::Ipv4 {
+            return Err(SystemError::EINVAL);
+        }
+        if !matches!(route.next_hop, smoltcp::wire::IpAddress::Ipv4(_)) {
+            return Err(SystemError::EINVAL);
+        }
+        // Loopback may advertise 64 KiB, larger than the maximum IPv4 packet.
+        if route.oif == 0 || route.ip_mtu < 68 {
+            return Err(SystemError::EINVAL);
+        }
+        if !matches!(
+            route.kind,
+            crate::net::route::RTN_LOCAL
+                | crate::net::route::RTN_UNICAST
+                | crate::net::route::RTN_BROADCAST
+                | crate::net::route::RTN_MULTICAST
+        ) {
+            return Err(SystemError::ENETUNREACH);
+        }
+        let parsed = ParsedIpv4Output::parse(self.bytes())?;
+        if self.len > route.ip_mtu
+            && (!may_fragment || parsed.df || route.ip_mtu < parsed.header_len + 8)
+        {
+            return Err(SystemError::EMSGSIZE);
+        }
+        Ok(())
+    }
+
+    /// Caller owns the policy decision to permit fragmentation. In particular
+    /// raw IP_HDRINCL supplies `false`; this layer never clears DF on its own.
+    pub(crate) fn commit(
+        mut self,
+        route: crate::net::route::OutputRouteDecision,
+        may_fragment: bool,
+        ct_context: OutputCtContext,
+        mark: u32,
+    ) -> Result<(), SystemError> {
+        self.validate_for_route(route, may_fragment)?;
+        let smoltcp::wire::IpAddress::Ipv4(next_hop) = route.next_hop else {
+            return Err(SystemError::EINVAL);
+        };
+        let disposition = if route.kind == crate::net::route::RTN_LOCAL {
+            LocalOutputDisposition::Local {
+                oif: route.oif,
+                ip_mtu: route.ip_mtu,
+            }
+        } else {
+            LocalOutputDisposition::Routed {
+                oif: route.oif,
+                next_hop: next_hop.into(),
+                ip_mtu: route.ip_mtu,
+            }
+        };
+        let frame = self.scratch.take().unwrap();
+        self.reservation.commit_prepared_ipv4(
+            frame,
+            PacketMeta::default(),
+            disposition,
+            may_fragment,
+            self.charge.take(),
+            ct_context,
+            mark,
+        );
+        self.common
+            .schedule_registered_local_output(crate::time::Instant::now().into());
+        Ok(())
+    }
+
+    pub(crate) fn validate_for_ipv6_route(
+        &self,
+        route: crate::net::route::OutputRouteDecision,
+    ) -> Result<(), SystemError> {
+        if self.version != smoltcp::wire::IpVersion::Ipv6
+            || !matches!(route.next_hop, smoltcp::wire::IpAddress::Ipv6(_))
+            || route.oif == 0
+        {
+            return Err(SystemError::EINVAL);
+        }
+        if !matches!(
+            route.kind,
+            crate::net::route::RTN_LOCAL
+                | crate::net::route::RTN_UNICAST
+                | crate::net::route::RTN_MULTICAST
+        ) {
+            return Err(SystemError::ENETUNREACH);
+        }
+        let packet = smoltcp::wire::Ipv6Packet::new_checked(self.bytes())
+            .map_err(|_| SystemError::EINVAL)?;
+        if packet.total_len() != self.len {
+            return Err(SystemError::EINVAL);
+        }
+        // The fragmenter inserts immediately after the fixed IPv6 header.
+        // Packets with extension headers can still be sent intact, but need
+        // a separate unfragmentable-header walk before source fragmentation.
+        if self.len > route.ip_mtu
+            && (route.ip_mtu < 56
+                || matches!(u8::from(packet.next_header()), 0 | 43 | 44 | 51 | 60))
+        {
+            return Err(SystemError::EMSGSIZE);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn commit_ipv6(
+        mut self,
+        route: crate::net::route::OutputRouteDecision,
+        identification: u32,
+        ct_context: OutputCtContext,
+        mark: u32,
+    ) -> Result<(), SystemError> {
+        self.validate_for_ipv6_route(route)?;
+        let disposition = if route.kind == crate::net::route::RTN_LOCAL {
+            LocalOutputDisposition::Local {
+                oif: route.oif,
+                ip_mtu: route.ip_mtu,
+            }
+        } else {
+            LocalOutputDisposition::Routed {
+                oif: route.oif,
+                next_hop: route.next_hop,
+                ip_mtu: route.ip_mtu,
+            }
+        };
+        self.reservation.commit_prepared_ipv6(
+            self.scratch.take().unwrap(),
+            PacketMeta::default(),
+            disposition,
+            identification,
+            self.charge.take(),
+            ct_context,
+            mark,
+        );
+        self.common
+            .schedule_registered_local_output(crate::time::Instant::now().into());
+        Ok(())
+    }
+}
+
+/// Parsed once at admission and again before each fragment so a changing MTU
+/// can be honored without altering the admitted datagram.
+struct ParsedIpv4Output {
+    header_len: usize,
+    payload_len: usize,
+    df: bool,
+    frag_offset_bytes: usize,
+    more_fragments: bool,
+}
+
+impl ParsedIpv4Output {
+    fn parse(bytes: &[u8]) -> Result<Self, SystemError> {
+        if bytes.len() < 20 || bytes[0] >> 4 != 4 {
+            return Err(SystemError::EINVAL);
+        }
+        let header_len = ((bytes[0] & 0x0f) as usize) * 4;
+        if !(20..=60).contains(&header_len)
+            || header_len > bytes.len()
+            || usize::from(u16::from_be_bytes([bytes[2], bytes[3]])) != bytes.len()
+        {
+            return Err(SystemError::EINVAL);
+        }
+        let flags = u16::from_be_bytes([bytes[6], bytes[7]]);
+        let frag_offset_bytes = ((flags & 0x1fff) as usize) * 8;
+        let payload_len = bytes.len() - header_len;
+        if frag_offset_bytes
+            .checked_add(payload_len)
+            .is_none_or(|len| len > u16::MAX as usize)
+            || flags & 0x2000 != 0 && !payload_len.is_multiple_of(8)
+        {
+            return Err(SystemError::EINVAL);
+        }
+        // Invalid option lengths cannot be deferred to a partially-sent
+        // fragmentation sequence. The copied bit is interpreted at emit.
+        let mut option = 20;
+        while option < header_len {
+            match bytes[option] {
+                0 => break,
+                1 => option += 1,
+                _ => {
+                    if option + 2 > header_len {
+                        return Err(SystemError::EINVAL);
+                    }
+                    let len = bytes[option + 1] as usize;
+                    if len < 2 || option + len > header_len {
+                        return Err(SystemError::EINVAL);
+                    }
+                    option += len;
+                }
+            }
+        }
+        Ok(Self {
+            header_len,
+            payload_len,
+            df: flags & 0x4000 != 0,
+            frag_offset_bytes,
+            more_fragments: flags & 0x2000 != 0,
+        })
+    }
+}
+
+/// smoltcp emits an unsplit IPv4 header with DF=1 and ID=0. Its native
+/// fragment path would replace both fields for an oversized generated packet;
+/// deferred output must make the same decision before queuing the datagram.
+fn prepare_deferred_ipv4_for_mtu(
+    bytes: &mut [u8],
+    ip_mtu: usize,
+    fragment_ident: Option<u16>,
+) -> Result<bool, smoltcp::phy::IpOutputError> {
+    use smoltcp::phy::IpOutputError;
+
+    let parsed = ParsedIpv4Output::parse(bytes).map_err(|_| IpOutputError::NoRoute)?;
+    if bytes.len() <= ip_mtu {
+        return Ok(!parsed.df);
+    }
+    if ip_mtu < parsed.header_len + 8 {
+        return Err(IpOutputError::MtuExceeded);
+    }
+    if parsed.df {
+        let ident = fragment_ident.ok_or(IpOutputError::MtuExceeded)?;
+        bytes[4..6].copy_from_slice(&ident.to_be_bytes());
+        bytes[6] &= !0x40;
+        bytes[10..12].fill(0);
+        smoltcp::wire::Ipv4Packet::new_unchecked(bytes).fill_checksum();
+    }
+    Ok(true)
+}
+
+fn prepared_ipv4_fragment(
+    packet: &LocalOutputPacket,
+    mtu: usize,
+) -> Result<(Vec<u8>, usize), SystemError> {
+    let parsed = ParsedIpv4Output::parse(&packet.frame)?;
+    let Some(PreparedIpProgress::Ipv4 { offset, .. }) = packet.prepared_ip else {
+        return Err(SystemError::EINVAL);
+    };
+    if offset >= parsed.payload_len || parsed.df || mtu < parsed.header_len + 8 {
+        return Err(SystemError::EMSGSIZE);
+    }
+    let remaining = parsed.payload_len - offset;
+    let available = mtu - parsed.header_len;
+    let chunk = if remaining > available {
+        available & !7
+    } else {
+        remaining
+    };
+    if chunk == 0 || (remaining > chunk && chunk % 8 != 0) {
+        return Err(SystemError::EMSGSIZE);
+    }
+    let start = parsed.frag_offset_bytes + offset;
+    if start / 8 > 0x1fff {
+        return Err(SystemError::EMSGSIZE);
+    }
+    let mut fragment = Vec::new();
+    fragment
+        .try_reserve_exact(parsed.header_len + chunk)
+        .map_err(|_| SystemError::ENOMEM)?;
+    fragment.extend_from_slice(&packet.frame[..parsed.header_len]);
+    fragment.extend_from_slice(
+        &packet.frame[parsed.header_len + offset..parsed.header_len + offset + chunk],
+    );
+    if offset != 0 {
+        let mut option = 20;
+        while option < parsed.header_len {
+            let kind = fragment[option];
+            if kind == 0 {
+                break;
+            }
+            if kind == 1 {
+                option += 1;
+                continue;
+            }
+            let len = fragment[option + 1] as usize;
+            if kind & 0x80 == 0 {
+                fragment[option..option + len].fill(1);
+            }
+            option += len;
+        }
+    }
+    fragment[2..4].copy_from_slice(&((parsed.header_len + chunk) as u16).to_be_bytes());
+    let mut flags = (start / 8) as u16;
+    if remaining > chunk || parsed.more_fragments {
+        flags |= 0x2000;
+    }
+    fragment[6..8].copy_from_slice(&flags.to_be_bytes());
+    fragment[10..12].fill(0);
+    smoltcp::wire::Ipv4Packet::new_unchecked(&mut fragment[..]).fill_checksum();
+    Ok((fragment, chunk))
+}
+
+fn next_output_fragment(
+    packet: &LocalOutputPacket,
+    mtu: usize,
+) -> Result<Option<(Vec<u8>, usize)>, SystemError> {
+    match packet.prepared_ip {
+        Some(PreparedIpProgress::Ipv4 {
+            offset,
+            may_fragment,
+        }) if offset != 0 || packet.frame.len() > mtu => {
+            if !may_fragment {
+                return Err(SystemError::EMSGSIZE);
+            }
+            prepared_ipv4_fragment(packet, mtu).map(Some)
+        }
+        Some(PreparedIpProgress::Ipv6 { offset, .. })
+            if offset != 0 || packet.frame.len() > mtu =>
+        {
+            prepared_ipv6_fragment(packet, mtu).map(Some)
+        }
+        None if packet.frame.len() > mtu => Err(SystemError::EMSGSIZE),
+        _ => Ok(None),
+    }
+}
+
+/// Source-fragment a plain IPv6 datagram only after its complete packet has
+/// passed OUTPUT and POST_ROUTING. The original transport checksum is retained.
+fn prepared_ipv6_fragment(
+    packet: &LocalOutputPacket,
+    mtu: usize,
+) -> Result<(Vec<u8>, usize), SystemError> {
+    let Some(PreparedIpProgress::Ipv6 {
+        offset,
+        identification,
+    }) = packet.prepared_ip
+    else {
+        return Err(SystemError::EINVAL);
+    };
+    let ipv6 = smoltcp::wire::Ipv6Packet::new_checked(packet.frame.as_slice())
+        .map_err(|_| SystemError::EINVAL)?;
+    if matches!(u8::from(ipv6.next_header()), 0 | 43 | 44 | 51 | 60)
+        || ipv6.total_len() != packet.frame.len()
+        || mtu < 56
+    {
+        return Err(SystemError::EMSGSIZE);
+    }
+    let payload_len = packet.frame.len() - 40;
+    if offset >= payload_len {
+        return Err(SystemError::EINVAL);
+    }
+    let remaining = payload_len - offset;
+    let available = mtu - 48;
+    let chunk = if remaining > available {
+        available & !7
+    } else {
+        remaining
+    };
+    if chunk == 0 {
+        return Err(SystemError::EMSGSIZE);
+    }
+    let mut fragment = Vec::new();
+    fragment
+        .try_reserve_exact(48 + chunk)
+        .map_err(|_| SystemError::ENOMEM)?;
+    fragment.extend_from_slice(&packet.frame[..40]);
+    fragment.extend_from_slice(&[0; 8]);
+    fragment.extend_from_slice(&packet.frame[40 + offset..40 + offset + chunk]);
+    fragment[4..6].copy_from_slice(&((8 + chunk) as u16).to_be_bytes());
+    fragment[6] = smoltcp::wire::IpProtocol::Ipv6Frag.into();
+    fragment[40] = ipv6.next_header().into();
+    let more = u16::from(remaining > chunk);
+    let offset_flags = ((offset / 8) as u16) << 3 | more;
+    fragment[42..44].copy_from_slice(&offset_flags.to_be_bytes());
+    fragment[44..48].copy_from_slice(&identification.to_be_bytes());
+    Ok((fragment, chunk))
+}
+
+fn fragment_transmit_error(
+    packet: LocalOutputPacket,
+    error: SystemError,
+) -> LocalOutputTransmitResult {
+    if error == SystemError::ENOMEM {
+        // A complete datagram was already admitted. Retry with the existing
+        // bounded TX-backoff rather than losing it to transient allocation
+        // pressure or spinning in the current poll round.
+        LocalOutputTransmitResult::RetrySoon(packet)
+    } else {
+        LocalOutputTransmitResult::Drop(packet, error)
+    }
+}
+
+fn fragment_transmit_complete(
+    packet: &mut LocalOutputPacket,
+    fragment: &Option<(Vec<u8>, usize)>,
+) -> bool {
+    let Some((_, payload_len)) = fragment else {
+        return true;
+    };
+    match packet.prepared_ip.as_mut() {
+        Some(PreparedIpProgress::Ipv4 { offset, .. }) => {
+            *offset += payload_len;
+            let header_len = ((packet.frame[0] & 0x0f) as usize) * 4;
+            *offset == packet.frame.len() - header_len
+        }
+        Some(PreparedIpProgress::Ipv6 { offset, .. }) => {
+            *offset += payload_len;
+            *offset == packet.frame.len() - 40
+        }
+        None => false,
+    }
+}
+
+#[cfg(test)]
+mod prepared_ipv4_tests {
+    use super::*;
+
+    fn datagram(options: &[u8], payload_len: usize) -> LocalOutputPacket {
+        let header_len = 20 + options.len();
+        let mut frame = alloc::vec![0; header_len + payload_len];
+        frame[0] = 0x40 | (header_len / 4) as u8;
+        let total_len = frame.len() as u16;
+        frame[2..4].copy_from_slice(&total_len.to_be_bytes());
+        frame[4..6].copy_from_slice(&0x55aau16.to_be_bytes());
+        frame[8] = 64;
+        frame[9] = 17;
+        frame[12..16].copy_from_slice(&[192, 0, 2, 1]);
+        frame[16..20].copy_from_slice(&[192, 0, 2, 2]);
+        frame[20..header_len].copy_from_slice(options);
+        for (index, byte) in frame[header_len..].iter_mut().enumerate() {
+            *byte = index as u8;
+        }
+        smoltcp::wire::Ipv4Packet::new_unchecked(&mut frame[..]).fill_checksum();
+        LocalOutputPacket {
+            medium: smoltcp::phy::Medium::Ip,
+            meta: PacketMeta::default(),
+            disposition: LocalOutputDisposition::Routed {
+                oif: 2,
+                next_hop: smoltcp::wire::Ipv4Address::new(192, 0, 2, 2).into(),
+                ip_mtu: 1500,
+            },
+            frame,
+            ct_context: OutputCtContext::Untracked,
+            mark: 0,
+            prepared_ip: Some(PreparedIpProgress::Ipv4 {
+                offset: 0,
+                may_fragment: true,
+            }),
+            _charge: None,
+        }
+    }
+
+    #[test]
+    fn deferred_generated_ipv4_uses_unique_fragment_id_only_when_needed() {
+        let mut small = datagram(&[], 24).frame;
+        small[6] |= 0x40;
+        small[4..6].fill(0);
+        assert_eq!(
+            Ok(false),
+            prepare_deferred_ipv4_for_mtu(&mut small, 1500, Some(7))
+        );
+        assert_eq!(&small[4..6], &[0, 0]);
+        assert_ne!(small[6] & 0x40, 0);
+
+        let mut large = small.clone();
+        assert_eq!(
+            Ok(true),
+            prepare_deferred_ipv4_for_mtu(&mut large, 28, Some(0x1234))
+        );
+        assert_eq!(&large[4..6], &0x1234u16.to_be_bytes());
+        assert_eq!(large[6] & 0x40, 0);
+        assert!(smoltcp::wire::Ipv4Packet::new_checked(&large[..])
+            .unwrap()
+            .verify_checksum());
+        assert_eq!(
+            Err(smoltcp::phy::IpOutputError::MtuExceeded),
+            prepare_deferred_ipv4_for_mtu(&mut small, 28, None)
+        );
+    }
+
+    #[test]
+    fn successive_fragments_keep_id_offset_payload_and_checksum() {
+        let mut packet = datagram(&[], 24);
+        for (offset, expected_mf) in [(0, true), (8, true), (16, false)] {
+            let (fragment, payload_len) = prepared_ipv4_fragment(&packet, 28).unwrap();
+            let header = smoltcp::wire::Ipv4Packet::new_checked(&fragment[..]).unwrap();
+            assert!(header.verify_checksum());
+            assert_eq!(header.ident(), 0x55aa);
+            assert_eq!(
+                u16::from_be_bytes([fragment[6], fragment[7]]) & 0x1fff,
+                (offset / 8) as u16
+            );
+            assert_eq!(fragment[6] & 0x20 != 0, expected_mf);
+            assert_eq!(&fragment[20..], &packet.frame[20 + offset..20 + offset + 8]);
+            assert_eq!(payload_len, 8);
+            // A rejected physical token must leave this cursor unchanged.
+            assert!(
+                matches!(packet.prepared_ip, Some(PreparedIpProgress::Ipv4 { offset: current, .. }) if current == offset)
+            );
+            assert_eq!(
+                fragment_transmit_complete(&mut packet, &Some((fragment, payload_len))),
+                offset == 16
+            );
+        }
+    }
+
+    #[test]
+    fn only_copied_ipv4_options_survive_later_fragments() {
+        let mut packet = datagram(&[0x94, 4, 0, 0, 0x44, 4, 5, 0], 24);
+        let (first, sent) = prepared_ipv4_fragment(&packet, 44).unwrap();
+        assert_eq!(&first[20..28], &[0x94, 4, 0, 0, 0x44, 4, 5, 0]);
+        assert!(!fragment_transmit_complete(
+            &mut packet,
+            &Some((first, sent))
+        ));
+        let (second, _) = prepared_ipv4_fragment(&packet, 44).unwrap();
+        assert_eq!(&second[20..28], &[0x94, 4, 0, 0, 1, 1, 1, 1]);
+        assert!(smoltcp::wire::Ipv4Packet::new_checked(&second[..])
+            .unwrap()
+            .verify_checksum());
+    }
+
+    #[test]
+    fn invalid_option_length_is_rejected_before_output() {
+        let mut packet = datagram(&[0x83, 1, 0, 0], 8);
+        assert!(matches!(
+            ParsedIpv4Output::parse(&packet.frame),
+            Err(SystemError::EINVAL)
+        ));
+        packet.frame[21] = 4;
+        assert!(ParsedIpv4Output::parse(&packet.frame).is_ok());
+    }
+
+    #[test]
+    fn fragment_allocation_failure_keeps_original_for_backoff() {
+        let packet = datagram(&[], 24);
+        let result = fragment_transmit_error(packet, SystemError::ENOMEM);
+        let LocalOutputTransmitResult::RetrySoon(packet) = result else {
+            panic!("an admitted packet must remain queued after ENOMEM");
+        };
+        assert!(matches!(
+            packet.prepared_ip,
+            Some(PreparedIpProgress::Ipv4 { offset: 0, .. })
+        ));
+    }
+}
+
+#[cfg(test)]
+mod prepared_ipv6_tests {
+    use super::*;
+
+    fn datagram(payload_len: usize) -> LocalOutputPacket {
+        let udp_len = payload_len + 8;
+        let mut frame = alloc::vec![0; 40 + udp_len];
+        frame[0] = 0x60;
+        frame[4..6].copy_from_slice(&(udp_len as u16).to_be_bytes());
+        frame[6] = smoltcp::wire::IpProtocol::Udp.into();
+        frame[7] = 64;
+        frame[23] = 1;
+        frame[39] = 1;
+        frame[40..42].copy_from_slice(&1234u16.to_be_bytes());
+        frame[42..44].copy_from_slice(&4321u16.to_be_bytes());
+        frame[44..46].copy_from_slice(&(udp_len as u16).to_be_bytes());
+        frame[46..48].copy_from_slice(&0x55aau16.to_be_bytes());
+        for (index, byte) in frame[48..].iter_mut().enumerate() {
+            *byte = index as u8;
+        }
+        LocalOutputPacket {
+            medium: smoltcp::phy::Medium::Ip,
+            meta: PacketMeta::default(),
+            disposition: LocalOutputDisposition::Routed {
+                oif: 2,
+                next_hop: smoltcp::wire::Ipv6Address::LOCALHOST.into(),
+                ip_mtu: 1280,
+            },
+            frame,
+            ct_context: OutputCtContext::Untracked,
+            mark: 0,
+            prepared_ip: Some(PreparedIpProgress::Ipv6 {
+                offset: 0,
+                identification: 0x1234_5678,
+            }),
+            _charge: None,
+        }
+    }
+
+    #[test]
+    fn fragments_preserve_one_id_checksum_and_contiguous_payload_across_mtu_change() {
+        let mut packet = datagram(40);
+        let mut reassembled = Vec::new();
+        for (mtu, expected_offset, expected_more) in
+            [(64, 0, true), (72, 16, true), (72, 40, false)]
+        {
+            let first = next_output_fragment(&packet, mtu).unwrap().unwrap();
+            let retry = next_output_fragment(&packet, mtu).unwrap().unwrap();
+            assert_eq!(first, retry, "a rejected token must not advance the cursor");
+            let (fragment, chunk) = first;
+            let ipv6 = smoltcp::wire::Ipv6Packet::new_checked(fragment.as_slice()).unwrap();
+            assert_eq!(ipv6.next_header(), smoltcp::wire::IpProtocol::Ipv6Frag);
+            assert_eq!(fragment[40], smoltcp::wire::IpProtocol::Udp.into());
+            assert_eq!(&fragment[44..48], &0x1234_5678u32.to_be_bytes());
+            let flags = u16::from_be_bytes([fragment[42], fragment[43]]);
+            assert_eq!((flags >> 3) as usize * 8, expected_offset);
+            assert_eq!(flags & 1 != 0, expected_more);
+            reassembled.extend_from_slice(&fragment[48..]);
+            assert_eq!(
+                fragment_transmit_complete(&mut packet, &Some((fragment, chunk))),
+                !expected_more
+            );
+        }
+        assert_eq!(reassembled, packet.frame[40..]);
+        assert_eq!(&reassembled[6..8], &0x55aau16.to_be_bytes());
+    }
+
+    #[test]
+    fn too_small_mtu_never_advances_or_emits_a_fragment() {
+        let packet = datagram(40);
+        assert!(matches!(
+            next_output_fragment(&packet, 55),
+            Err(SystemError::EMSGSIZE)
+        ));
+        assert!(matches!(
+            packet.prepared_ip,
+            Some(PreparedIpProgress::Ipv6 { offset: 0, .. })
+        ));
+    }
+
+    #[test]
+    fn raw_ipv6_fragment_preserves_original_next_header() {
+        let mut packet = datagram(40);
+        packet.frame[6] = smoltcp::wire::IpProtocol::Icmpv6.into();
+        let (fragment, chunk) = prepared_ipv6_fragment(&packet, 64).unwrap();
+        assert_eq!(chunk, 16);
+        assert_eq!(fragment[6], smoltcp::wire::IpProtocol::Ipv6Frag.into());
+        assert_eq!(fragment[40], smoltcp::wire::IpProtocol::Icmpv6.into());
+        assert_eq!(&fragment[48..], &packet.frame[40..56]);
+        assert!(matches!(
+            packet.prepared_ip,
+            Some(PreparedIpProgress::Ipv6 { offset: 0, .. })
+        ));
+    }
+}
+
 /// A response token paired with namespace-local ingress.
 ///
 /// A local-stack response is completed in memory and then sent through the
@@ -273,6 +1020,252 @@ pub(super) struct LocalInputTxToken<'a> {
 }
 
 impl SmolTxToken for LocalInputTxToken<'_> {
+    fn deferred_ip_output(&self, version: smoltcp::wire::IpVersion) -> bool {
+        self.backend_policy.requires_output_admission(version)
+    }
+
+    fn consume_full_ip<F>(
+        mut self,
+        len: usize,
+        meta: PacketMeta,
+        class: smoltcp::phy::IpOutputClass,
+        ipv4_fragment_ident: Option<u16>,
+        emit: F,
+    ) -> Result<(), smoltcp::phy::IpOutputError>
+    where
+        F: FnOnce(&mut [u8]),
+    {
+        use smoltcp::phy::IpOutputError;
+        use smoltcp::wire::{IpAddress, IpVersion, Ipv4Packet, Ipv6Address, Ipv6Packet};
+
+        if !self.scratch.try_ensure_capacity(len, &mut self.reservation) {
+            return Err(IpOutputError::Exhausted);
+        }
+        let bytes = self.scratch.resize(len);
+        emit(bytes);
+        let destination = match IpVersion::of_packet(bytes) {
+            Ok(IpVersion::Ipv4) => Ipv4Packet::new_checked(&bytes[..])
+                .map(|packet| IpAddress::Ipv4(packet.dst_addr()))
+                .map_err(|_| IpOutputError::NoRoute)?,
+            Ok(IpVersion::Ipv6) => Ipv6Packet::new_checked(&bytes[..])
+                .map(|packet| IpAddress::Ipv6(packet.dst_addr()))
+                .map_err(|_| IpOutputError::NoRoute)?,
+            Err(_) => return Err(IpOutputError::NoRoute),
+        };
+        let mut route = if class == smoltcp::phy::IpOutputClass::LinkLocalControl
+            || destination.version() == IpVersion::Ipv6
+                && destination.is_multicast()
+                && self.backend_policy.owner_ifindex != 0
+        {
+            if self.backend_policy.owner_ifindex == 0 || !self.backend_policy.owner_is_up {
+                return Err(IpOutputError::NoRoute);
+            }
+            let ip_mtu = self
+                .backend_policy
+                .routes
+                .device_mtu(self.backend_policy.owner_ifindex)
+                .ok_or(IpOutputError::NoRoute)?;
+            crate::net::route::OutputRouteDecision {
+                oif: self.backend_policy.owner_ifindex,
+                required_oif: Some(self.backend_policy.owner_ifindex),
+                next_hop: destination,
+                ip_mtu,
+                kind: crate::net::route::RTN_MULTICAST,
+                table: crate::net::route::RT_TABLE_LOCAL,
+            }
+        } else {
+            let required_oif = (meta.id != 0).then_some(meta.id);
+            self.backend_policy
+                .routes
+                .lookup(destination, required_oif)
+                .ok_or(IpOutputError::NoRoute)?
+        };
+        let version = destination.version();
+        let ipv4 = version == IpVersion::Ipv4;
+        let ruleset = self
+            .backend_policy
+            .ruleset
+            .ok_or(IpOutputError::PolicyDrop)?;
+        let ct =
+            crate::net::output::LocalOutputCt::new(self.backend_policy.netns, ruleset, version);
+        let output_hook_oif = if route.kind == crate::net::route::RTN_LOCAL {
+            crate::net::LOOPBACK_IFINDEX as u32
+        } else {
+            route.oif
+        };
+        let output_name = self
+            .backend_policy
+            .hook_oifname(
+                crate::net::nftables::NftIpv4Hook::LocalOut,
+                version,
+                output_hook_oif,
+            )
+            .ok_or(IpOutputError::PolicyDrop)?;
+        let lookup = |address| self.backend_policy.routes.ipv4_addr_type(address);
+        let routes = self.backend_policy.routes;
+        let ipv6_is_local = |address: Ipv6Address| {
+            routes
+                .lookup(IpAddress::Ipv6(address), None)
+                .is_some_and(|decision| decision.kind == crate::net::route::RTN_LOCAL)
+        };
+        let output_allowed = if ipv4 {
+            ct.evaluate_ipv4(
+                crate::net::nftables::NftIpv4Hook::LocalOut,
+                bytes,
+                output_name,
+                &lookup,
+                None,
+            )
+        } else {
+            ct.evaluate_ipv6(
+                crate::net::nftables::NftIpv4Hook::LocalOut,
+                bytes,
+                output_name,
+                Some(&ipv6_is_local),
+                None,
+            )
+        }
+        .map_err(|_| IpOutputError::PolicyDrop)?;
+        if !output_allowed {
+            return Err(IpOutputError::PolicyDrop);
+        }
+        let new_destination = match version {
+            IpVersion::Ipv4 => Ipv4Packet::new_checked(&bytes[..])
+                .map(|packet| IpAddress::Ipv4(packet.dst_addr()))
+                .map_err(|_| IpOutputError::PolicyDrop)?,
+            IpVersion::Ipv6 => Ipv6Packet::new_checked(&bytes[..])
+                .map(|packet| IpAddress::Ipv6(packet.dst_addr()))
+                .map_err(|_| IpOutputError::PolicyDrop)?,
+        };
+        if new_destination != destination {
+            route = self
+                .backend_policy
+                .routes
+                .lookup(new_destination, route.required_oif)
+                .ok_or(IpOutputError::NoRoute)?;
+            let egress = self
+                .backend_policy
+                .routes
+                .ingress_device(route.oif)
+                .ok_or(IpOutputError::NoRoute)?;
+            if route.kind != crate::net::route::RTN_LOCAL
+                && !egress.flags().contains(InterfaceFlags::UP)
+            {
+                return Err(IpOutputError::NoRoute);
+            }
+        }
+        let disposition = if route.kind == crate::net::route::RTN_LOCAL {
+            LocalOutputDisposition::Local {
+                oif: route.oif,
+                ip_mtu: route.ip_mtu,
+            }
+        } else if matches!(
+            route.kind,
+            crate::net::route::RTN_UNICAST
+                | crate::net::route::RTN_BROADCAST
+                | crate::net::route::RTN_MULTICAST
+        ) {
+            LocalOutputDisposition::Routed {
+                oif: route.oif,
+                next_hop: route.next_hop,
+                ip_mtu: route.ip_mtu,
+            }
+        } else {
+            return Err(IpOutputError::NoRoute);
+        };
+        let ip_mtu = route.ip_mtu;
+        let hook_oif = if route.kind == crate::net::route::RTN_LOCAL {
+            crate::net::LOOPBACK_IFINDEX as u32
+        } else {
+            route.oif
+        };
+        let may_fragment = if ipv4 {
+            prepare_deferred_ipv4_for_mtu(bytes, ip_mtu, ipv4_fragment_ident)?
+        } else {
+            if len > ip_mtu {
+                return Err(IpOutputError::MtuExceeded);
+            }
+            false
+        };
+        let post_name = self
+            .backend_policy
+            .hook_oifname(
+                crate::net::nftables::NftIpv4Hook::PostRouting,
+                version,
+                hook_oif,
+            )
+            .ok_or(IpOutputError::PolicyDrop)?;
+        let masquerade = if ruleset
+            .requires_masquerade(version, crate::net::nftables::NftIpv4Hook::PostRouting)
+        {
+            self.backend_policy
+                .routes
+                .masquerade_address(hook_oif, new_destination, route.next_hop)
+                .map(|address| {
+                    let address = match address {
+                        IpAddress::Ipv4(address) => {
+                            crate::net::conntrack::CtAddress::V4(address.octets())
+                        }
+                        IpAddress::Ipv6(address) => {
+                            crate::net::conntrack::CtAddress::V6(address.octets())
+                        }
+                    };
+                    (address, hook_oif)
+                })
+        } else {
+            None
+        };
+        let post_allowed = if ipv4 {
+            ct.evaluate_ipv4(
+                crate::net::nftables::NftIpv4Hook::PostRouting,
+                bytes,
+                post_name,
+                &lookup,
+                masquerade,
+            )
+        } else {
+            ct.evaluate_ipv6(
+                crate::net::nftables::NftIpv4Hook::PostRouting,
+                bytes,
+                post_name,
+                Some(&ipv6_is_local),
+                masquerade,
+            )
+        }
+        .map_err(|_| IpOutputError::PolicyDrop)?;
+        if !post_allowed {
+            return Err(IpOutputError::PolicyDrop);
+        }
+        let mark = ct.mark();
+        let ct_context = ct.confirm().map_err(|_| IpOutputError::PolicyDrop)?;
+        if ipv4 {
+            let frame = self.scratch.take().ok_or(IpOutputError::Exhausted)?;
+            self.reservation.commit_prepared_ipv4(
+                frame,
+                meta,
+                disposition,
+                may_fragment,
+                None,
+                ct_context,
+                mark,
+            );
+        } else {
+            let frame = self.scratch.take().ok_or(IpOutputError::Exhausted)?;
+            self.reservation.commit_prepared_ipv6(
+                frame,
+                meta,
+                disposition,
+                self.backend_policy
+                    .netns
+                    .next_ipv6_fragment_identification(),
+                None,
+                ct_context,
+                mark,
+            );
+        }
+        Ok(())
+    }
+
     fn egress_override(
         &mut self,
         version: smoltcp::wire::IpVersion,
@@ -399,6 +1392,26 @@ impl LocalInputTxToken<'_> {
 }
 
 impl<T: SmolTxToken> SmolTxToken for RoutedTxToken<'_, T> {
+    fn deferred_ip_output(&self, version: smoltcp::wire::IpVersion) -> bool {
+        self.backend_policy.requires_output_admission(version)
+    }
+
+    fn consume_full_ip<F>(
+        self,
+        len: usize,
+        meta: PacketMeta,
+        class: smoltcp::phy::IpOutputClass,
+        ipv4_fragment_ident: Option<u16>,
+        emit: F,
+    ) -> Result<(), smoltcp::phy::IpOutputError>
+    where
+        F: FnOnce(&mut [u8]),
+    {
+        let token = local_tx_token(self.queue, self.backend_policy, self.capabilities)
+            .ok_or(smoltcp::phy::IpOutputError::Exhausted)?;
+        token.consume_full_ip(len, meta, class, ipv4_fragment_ident, emit)
+    }
+
     fn egress_override(
         &mut self,
         version: smoltcp::wire::IpVersion,
@@ -474,11 +1487,19 @@ impl<'a, D: SmolDevice + ?Sized> LocalInputDevice<'a, D> {
         device: &'a mut D,
         common: &'a IfaceCommon,
         backend_policy: OutputBackendPolicy<'a>,
+        stage_cell: Option<&'a Cell<IngressStage>>,
+        ct_context_cell: Option<
+            &'a core::cell::RefCell<Option<crate::net::conntrack::CtPacketContext>>,
+        >,
+        mark_cell: Option<&'a Cell<u32>>,
     ) -> Self {
         Self {
             device,
             common,
             backend_policy,
+            stage_cell,
+            ct_context_cell,
+            mark_cell,
         }
     }
 
@@ -514,13 +1535,17 @@ pub(super) fn local_tx_token<'a>(
 }
 
 impl<D: SmolDevice + ?Sized> SmolDevice for LocalInputDevice<'_, D> {
+    fn policy_current(&self) -> bool {
+        self.backend_policy.policy_current()
+    }
+
     fn outbound_ip_mtu(&self, destination: smoltcp::wire::IpAddress, meta: PacketMeta) -> usize {
         self.backend_policy
             .outbound_ip_mtu(destination, meta, self.device.capabilities().ip_mtu())
     }
 
     type RxToken<'a>
-        = LocalInputRxToken
+        = LocalInputRxToken<'a>
     where
         Self: 'a;
     type TxToken<'a>
@@ -536,12 +1561,27 @@ impl<D: SmolDevice + ?Sized> SmolDevice for LocalInputDevice<'_, D> {
         // output queue is full, smoltcp observes device backpressure and the
         // input remains queued for a later poll.
         let tx_token = self.tx_token()?;
-        let packet = self.common.local_input_queue.pop()?;
+        let mut packet = self.common.local_input_queue.pop()?;
         let ingress_ifindex = packet.ingress_ifindex;
+        let ingress_stage = packet.ingress_stage;
+        let ct_context = packet.ct_context.take();
+        let mark = packet.mark;
         let frame = packet.into_frame(self.device.capabilities().medium).ok()?;
         let mut meta = PacketMeta::default();
         meta.id = ingress_ifindex;
-        Some((LocalInputRxToken { frame, meta }, tx_token))
+        Some((
+            LocalInputRxToken {
+                frame,
+                meta,
+                ingress_stage,
+                stage_cell: self.stage_cell,
+                ct_context,
+                ct_context_cell: self.ct_context_cell,
+                mark,
+                mark_cell: self.mark_cell,
+            },
+            tx_token,
+        ))
     }
 
     fn transmit(&mut self, _timestamp: smoltcp::time::Instant) -> Option<Self::TxToken<'_>> {
@@ -554,6 +1594,10 @@ impl<D: SmolDevice + ?Sized> SmolDevice for LocalInputDevice<'_, D> {
 }
 
 impl<D: SmolDevice + ?Sized> SmolDevice for RoutedTxDevice<'_, D> {
+    fn policy_current(&self) -> bool {
+        self.backend_policy.policy_current()
+    }
+
     fn outbound_ip_mtu(&self, destination: smoltcp::wire::IpAddress, meta: PacketMeta) -> usize {
         self.backend_policy
             .outbound_ip_mtu(destination, meta, self.device.capabilities().ip_mtu())
@@ -608,6 +1652,7 @@ impl<D: SmolDevice + ?Sized> SmolDevice for RoutedTxDevice<'_, D> {
 
 pub(super) enum LocalOutputTransmitResult {
     Sent(LocalOutputPacket),
+    Continue(LocalOutputPacket),
     RetrySoon(LocalOutputPacket),
     RetryAt {
         packet: LocalOutputPacket,
@@ -631,7 +1676,7 @@ pub(super) fn output_error(
 
 pub(super) fn transmit_routed_stack_output(
     iface: &dyn Iface,
-    packet: LocalOutputPacket,
+    mut packet: LocalOutputPacket,
 ) -> LocalOutputTransmitResult {
     let LocalOutputDisposition::Routed {
         next_hop, ip_mtu, ..
@@ -640,21 +1685,48 @@ pub(super) fn transmit_routed_stack_output(
         return LocalOutputTransmitResult::Drop(packet, SystemError::EINVAL);
     };
     if packet.medium != smoltcp::phy::Medium::Ip
-        || packet.frame.len() > ip_mtu
+        || (packet.prepared_ip.is_none() && packet.frame.len() > ip_mtu)
         || smoltcp::wire::IpVersion::of_packet(&packet.frame).ok() != Some(next_hop.version())
     {
         return LocalOutputTransmitResult::Drop(packet, SystemError::EINVAL);
     }
-    if !iface.flags().contains(InterfaceFlags::UP) || packet.frame.len() > iface.mtu() {
-        let error = if !iface.flags().contains(InterfaceFlags::UP) {
-            SystemError::ENETDOWN
-        } else {
-            SystemError::EMSGSIZE
-        };
-        return LocalOutputTransmitResult::Drop(packet, error);
+    if !iface.flags().contains(InterfaceFlags::UP) {
+        return LocalOutputTransmitResult::Drop(packet, SystemError::ENETDOWN);
     }
-    match iface.route_and_send(&next_hop, &packet.frame) {
-        Ok(()) => LocalOutputTransmitResult::Sent(packet),
+    let effective_mtu = ip_mtu.min(iface.mtu());
+    let fragment = match next_output_fragment(&packet, effective_mtu) {
+        Ok(fragment) => fragment,
+        Err(error) => return fragment_transmit_error(packet, error),
+    };
+    let wire_packet = fragment
+        .as_ref()
+        .map_or(packet.frame.as_slice(), |(frame, _)| frame.as_slice());
+    // Loopback's route_and_send creates a fresh local-input token without a
+    // sidecar. A tracked OUTPUT packet must carry its confirmed identity into
+    // PRE_ROUTING, including each multicast fragment. Preserve the same lo
+    // queue/backlog behavior while passing that packet-owned context.
+    let transmitted = if iface.flags().contains(InterfaceFlags::LOOPBACK) {
+        crate::driver::net::inject_local_ip_packet_with_context_and_mark(
+            iface,
+            crate::net::LOOPBACK_IFINDEX as u32,
+            iface.mac(),
+            wire_packet,
+            false,
+            LocalPacketOrigin::LocalOutput,
+            Some(packet.ct_context.for_ingress()),
+            packet.mark,
+        )
+        .map_err(RouteSendError::Failed)
+    } else {
+        iface.route_and_send(&next_hop, wire_packet)
+    };
+    match transmitted {
+        Ok(()) => {
+            if !fragment_transmit_complete(&mut packet, &fragment) {
+                return LocalOutputTransmitResult::Continue(packet);
+            }
+            LocalOutputTransmitResult::Sent(packet)
+        }
         Err(RouteSendError::RetryAt {
             retry_at,
             probe_sent,
@@ -682,6 +1754,10 @@ pub(super) fn transmit_admitted_routed_output(
     };
     let tx_generation = iface.common().tx_completion_generation();
     match transmit_routed_stack_output(iface, packet) {
+        LocalOutputTransmitResult::Continue(packet) => {
+            reservation.requeue_ready(packet);
+            AdmittedRoutedOutput::Queued(crate::time::Instant::now().into())
+        }
         LocalOutputTransmitResult::Sent(packet) => {
             iface.common().reset_local_output_tx_backoff();
             iface
@@ -741,7 +1817,7 @@ pub(super) fn transmit_local_stack_output<D>(
     netns: &Arc<NetNamespace>,
     owner_is_up: bool,
     device: &mut D,
-    packet: LocalOutputPacket,
+    mut packet: LocalOutputPacket,
 ) -> LocalOutputTransmitResult
 where
     D: SmolDevice + ?Sized,
@@ -755,7 +1831,7 @@ where
         }
         LocalOutputDisposition::Local { oif, ip_mtu } => {
             if packet.medium != smoltcp::phy::Medium::Ip
-                || packet.frame.len() > ip_mtu
+                || (packet.prepared_ip.is_none() && packet.frame.len() > ip_mtu)
                 || smoltcp::wire::IpVersion::of_packet(&packet.frame).is_err()
             {
                 return LocalOutputTransmitResult::Drop(packet, SystemError::EINVAL);
@@ -763,11 +1839,42 @@ where
             let Some(iface) = netns.device_list().get(&(oif as usize)).cloned() else {
                 return LocalOutputTransmitResult::Drop(packet, SystemError::ENODEV);
             };
-            if packet.frame.len() > iface.mtu() {
-                return LocalOutputTransmitResult::Drop(packet, SystemError::EMSGSIZE);
-            }
-            match iface.inject_local_ip_packet(oif, iface.mac(), &packet.frame, false) {
-                Ok(()) => LocalOutputTransmitResult::Sent(packet),
+            let effective_mtu = ip_mtu.min(iface.mtu());
+            let fragment = match next_output_fragment(&packet, effective_mtu) {
+                Ok(fragment) => fragment,
+                Err(error) => return fragment_transmit_error(packet, error),
+            };
+            // IPv6 local delivery uses the address-owning device as its
+            // logical input interface even though the packet traverses lo.
+            // Linux ip6_rcv_core stores the route's device in IP6CB(skb)->iif;
+            // SO_BINDTODEVICE must observe that scoped interface.
+            let ingress_ifindex = if matches!(
+                smoltcp::wire::IpVersion::of_packet(&packet.frame),
+                Ok(smoltcp::wire::IpVersion::Ipv6)
+            ) {
+                oif
+            } else {
+                crate::net::LOOPBACK_IFINDEX as u32
+            };
+            let wire_packet = fragment
+                .as_ref()
+                .map_or(packet.frame.as_slice(), |(frame, _)| frame.as_slice());
+            match crate::driver::net::inject_local_ip_packet_with_context_and_mark(
+                iface.as_ref(),
+                ingress_ifindex,
+                iface.mac(),
+                wire_packet,
+                false,
+                LocalPacketOrigin::LocalOutput,
+                Some(packet.ct_context.for_ingress()),
+                packet.mark,
+            ) {
+                Ok(()) => {
+                    if !fragment_transmit_complete(&mut packet, &fragment) {
+                        return LocalOutputTransmitResult::Continue(packet);
+                    }
+                    LocalOutputTransmitResult::Sent(packet)
+                }
                 // This is receive-backlog congestion, not physical TX
                 // backpressure. Linux may drop locally delivered packets when
                 // the receive backlog is full; a TX completion cannot make

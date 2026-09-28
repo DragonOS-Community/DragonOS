@@ -41,14 +41,26 @@ impl smoltcp::iface::UdpIngressHandler for NetnsUdpIngress {
         is_broadcast: bool,
         payload: &[u8],
     ) -> smoltcp::iface::UdpIngressResult {
-        let smoltcp::wire::IpRepr::Ipv4(ipv4) = ip_repr else {
-            return smoltcp::iface::UdpIngressResult::NotHandled;
+        let (src_addr, dest_addr) = match ip_repr {
+            smoltcp::wire::IpRepr::Ipv4(ipv4) => (
+                IpAddress::Ipv4(ipv4.src_addr),
+                IpAddress::Ipv4(ipv4.dst_addr),
+            ),
+            smoltcp::wire::IpRepr::Ipv6(ipv6) if !ipv6.dst_addr.is_multicast() => (
+                IpAddress::Ipv6(ipv6.src_addr),
+                IpAddress::Ipv6(ipv6.dst_addr),
+            ),
+            // IPv6 multicast still uses the existing socket delivery path
+            // until its membership table is shared with this ingress handler.
+            smoltcp::wire::IpRepr::Ipv6(_) => {
+                return smoltcp::iface::UdpIngressResult::NotHandled;
+            }
         };
         let Some(netns) = self.netns.upgrade() else {
             return smoltcp::iface::UdpIngressResult::NotHandled;
         };
-        let src = IpEndpoint::new(IpAddress::Ipv4(ipv4.src_addr), udp_repr.src_port);
-        let dest = IpEndpoint::new(IpAddress::Ipv4(ipv4.dst_addr), udp_repr.dst_port);
+        let src = IpEndpoint::new(src_addr, udp_repr.src_port);
+        let dest = IpEndpoint::new(dest_addr, udp_repr.dst_port);
         // Namespace-local handoff preserves Linux's skb_iif in PacketMeta.
         // Physical ingress uses the handler owner's ifindex as the fallback.
         // Socket device binding must match the original ingress device, not

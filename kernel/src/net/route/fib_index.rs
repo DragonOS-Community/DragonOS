@@ -6,8 +6,8 @@ use smoltcp::wire::{IpAddress, IpCidr};
 use system_error::SystemError;
 
 use super::{
-    canonical_cidr, RouteEntry, RTN_BROADCAST, RTN_LOCAL, RTN_UNICAST, RT_SCOPE_HOST,
-    RT_SCOPE_LINK, RT_TABLE_LOCAL,
+    canonical_cidr, RouteEntry, RTN_BROADCAST, RTN_LOCAL, RTN_MULTICAST, RTN_UNICAST,
+    RT_SCOPE_HOST, RT_SCOPE_LINK, RT_TABLE_LOCAL,
 };
 
 mod alias;
@@ -1126,7 +1126,8 @@ pub(super) fn projection_key(route: RouteEntry) -> Option<ProjectionKey> {
 fn indexable(route: RouteEntry) -> bool {
     route.source.is_none()
         && route.tos == 0
-        && matches!(route.kind, RTN_UNICAST | RTN_LOCAL | RTN_BROADCAST)
+        && (matches!(route.kind, RTN_UNICAST | RTN_LOCAL | RTN_BROADCAST)
+            || matches!(route.destination, IpCidr::Ipv6(_)) && route.kind == RTN_MULTICAST)
 }
 
 #[cfg(test)]

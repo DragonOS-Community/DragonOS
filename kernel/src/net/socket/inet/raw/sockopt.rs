@@ -51,6 +51,11 @@ impl RawSocket {
             Ok(PSO::SNDBUF) => Ok(write_u32_getsockopt(value, self.options.read().sock_sndbuf)),
             Ok(PSO::RCVBUF) => Ok(write_u32_getsockopt(value, self.options.read().sock_rcvbuf)),
             Ok(PSO::BINDTODEVICE) => self.device_binding.get(&self.netns, value),
+            Ok(PSO::BROADCAST) => Ok(write_i32_getsockopt(
+                value,
+                self.so_broadcast
+                    .load(core::sync::atomic::Ordering::Acquire) as i32,
+            )),
             Ok(PSO::LINGER) => {
                 let opts = self.options.read();
                 Ok(write_linger_getsockopt(
@@ -134,6 +139,16 @@ impl RawSocket {
                     .load(core::sync::atomic::Ordering::Relaxed);
                 Ok(write_u32_getsockopt(value, v))
             }
+            Ok(IpOption::MULTICAST_TTL) => Ok(write_i32_getsockopt_ipv4(
+                value,
+                self.ip_multicast_ttl
+                    .load(core::sync::atomic::Ordering::Acquire),
+            )),
+            Ok(IpOption::MULTICAST_LOOP) => Ok(write_i32_getsockopt_ipv4(
+                value,
+                self.ip_multicast_loop
+                    .load(core::sync::atomic::Ordering::Acquire) as i32,
+            )),
             _ => Err(SystemError::ENOPROTOOPT),
         }
     }
@@ -147,6 +162,10 @@ impl RawSocket {
             return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
         }
         match PIPV6::try_from(name as u32) {
+            Ok(PIPV6::HDRINCL) => Ok(write_i32_getsockopt(
+                value,
+                self.options.read().ip_hdrincl as i32,
+            )),
             Ok(PIPV6::CHECKSUM) => {
                 let v = if self.protocol == IpProtocol::Icmpv6 {
                     ICMPV6_CHECKSUM_OFFSET
@@ -221,6 +240,13 @@ impl RawSocket {
                 let v = sock_buf_u32_from_opt(val)?;
                 let newv = clamp_sock_buf(v, SYSCTL_WMEM_MAX, SOCK_MIN_SNDBUF);
                 self.options.write().sock_sndbuf = newv;
+                self.send_account.set_limit(newv as usize);
+                Ok(())
+            }
+            Ok(PSO::BROADCAST) => {
+                let enable = read_i32_opt(val).ok_or(SystemError::EINVAL)? != 0;
+                self.so_broadcast
+                    .store(enable, core::sync::atomic::Ordering::Release);
                 Ok(())
             }
             Ok(PSO::RCVBUF) => {
@@ -336,6 +362,31 @@ impl RawSocket {
                 &self.ip_multicast_ifindex,
                 &self.ip_multicast_addr,
             ),
+            Ok(IpOption::MULTICAST_TTL) => {
+                let value = if val.len() == 1 {
+                    i32::from(val[0])
+                } else {
+                    read_i32_opt(val).ok_or(SystemError::EINVAL)?
+                };
+                let ttl = match value {
+                    -1 => 1,
+                    0..=255 => value,
+                    _ => return Err(SystemError::EINVAL),
+                };
+                self.ip_multicast_ttl
+                    .store(ttl, core::sync::atomic::Ordering::Release);
+                Ok(())
+            }
+            Ok(IpOption::MULTICAST_LOOP) => {
+                let value = if val.len() == 1 {
+                    i32::from(val[0])
+                } else {
+                    read_i32_opt(val).ok_or(SystemError::EINVAL)?
+                };
+                self.ip_multicast_loop
+                    .store(value != 0, core::sync::atomic::Ordering::Release);
+                Ok(())
+            }
             Ok(IpOption::ADD_MEMBERSHIP) | Ok(IpOption::DROP_MEMBERSHIP) => {
                 let opt = IpOption::try_from(name as u32).map_err(|_| SystemError::ENOPROTOOPT)?;
                 apply_ipv4_membership(&self.netns, opt, val, &self.ip_multicast_groups)
@@ -349,6 +400,11 @@ impl RawSocket {
             return Err(SystemError::ENOPROTOOPT);
         }
         match PIPV6::try_from(name as u32) {
+            Ok(PIPV6::HDRINCL) => {
+                let enabled = read_i32_opt(val).ok_or(SystemError::EINVAL)? != 0;
+                self.options.write().ip_hdrincl = enabled;
+                Ok(())
+            }
             Ok(PIPV6::CHECKSUM) => {
                 if self.protocol == IpProtocol::Icmpv6 {
                     return Err(SystemError::EINVAL);

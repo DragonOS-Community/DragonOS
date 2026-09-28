@@ -1,3 +1,4 @@
+use core::sync::atomic::Ordering;
 use smoltcp::wire::{IpAddress, IpProtocol, IpVersion, Ipv4Packet};
 use system_error::SystemError;
 
@@ -10,15 +11,10 @@ use crate::net::socket::utils::IPV4_MIN_HEADER_LEN;
 use crate::net::socket::{IpOption, PIPV6, PMSG, PSOL};
 use crate::syscall::user_access::UserBufferReader;
 
-use super::inner::{self, RawInner};
-use super::loopback::{deliver_loopback_packet, is_loopback_addr, LoopbackDeliverContext};
-use super::packet::{build_ip_packet, IpPacketParams};
+use super::inner::RawInner;
+use super::loopback::is_loopback_addr;
+use super::packet::{build_ip_packet, emit_ipv4_packet, IpPacketParams};
 use super::RawSocket;
-
-struct HdrinclSendOutcome {
-    bytes_written: usize,
-    needs_iface_poll: bool,
-}
 
 fn validate_ipv4_hdrincl_packet(buf: &[u8]) -> Result<(), SystemError> {
     if buf.len() < IPV4_MIN_HEADER_LEN {
@@ -34,7 +30,267 @@ fn validate_ipv4_hdrincl_packet(buf: &[u8]) -> Result<(), SystemError> {
     Ok(())
 }
 
+/// Keep SO_SNDTIMEO scoped to one send call, even if another writer takes the
+/// queue space after this waiter is awakened.
+fn remaining_send_timeout(
+    started: crate::time::Instant,
+    timeout: Option<crate::time::Duration>,
+) -> Result<Option<crate::time::Duration>, SystemError> {
+    let Some(timeout) = timeout else {
+        return Ok(None);
+    };
+    let elapsed = crate::time::Instant::now().saturating_sub(started);
+    let remaining = timeout
+        .total_micros()
+        .saturating_sub(elapsed.total_micros());
+    if remaining == 0 {
+        return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+    }
+    Ok(Some(crate::time::Duration::from_micros(remaining)))
+}
+
 impl RawSocket {
+    /// Build one complete IPv6 raw datagram before the synchronous OUTPUT
+    /// verdict. HDRINCL keeps the caller's header verbatim; its sockaddr
+    /// destination is still the initial route key, as in rawv6_send_hdrinc.
+    fn try_send_ipv6_prepared(
+        &self,
+        buf: &[u8],
+        to: Option<IpAddress>,
+        options: &super::options::RawSocketOptions,
+    ) -> Result<usize, SystemError> {
+        if self.protocol == IpProtocol::Unknown(255) {
+            return Err(SystemError::EINVAL);
+        }
+        let destination = to
+            .or_else(|| match self.inner.read().as_ref() {
+                Some(RawInner::Bound(bound) | RawInner::Wildcard(bound)) => bound.remote_addr(),
+                _ => None,
+            })
+            .ok_or(SystemError::EDESTADDRREQ)?;
+        if !matches!(destination, IpAddress::Ipv6(_)) {
+            return Err(SystemError::EAFNOSUPPORT);
+        }
+        self.ensure_not_loopback_wildcard_for_send(destination)?;
+        if !self.is_bound() {
+            self.bind_ephemeral(destination)?;
+        }
+        let fixed_source = match self.inner.read().as_ref() {
+            Some(RawInner::Bound(bound) | RawInner::Wildcard(bound)) => bound
+                .local_addr()
+                .filter(|address| !address.is_unspecified()),
+            _ => return Err(SystemError::ENOTCONN),
+        };
+        let required_oif = self
+            .device_binding
+            .resolve_iface(&self.netns)?
+            .map(|iface| iface.nic_id() as u32);
+        let (route, owner, source) = if options.ip_hdrincl {
+            let route = crate::net::route::resolve_ipv6_output_route(
+                &self.netns,
+                destination,
+                required_oif,
+                None,
+            )?;
+            let owner = self
+                .netns
+                .device_list()
+                .get(&(route.oif as usize))
+                .cloned()
+                .ok_or(SystemError::ENETUNREACH)?;
+            (route, owner, None)
+        } else {
+            let resolved = crate::net::route::resolve_ipv6_send_route(
+                &self.netns,
+                destination,
+                required_oif,
+                fixed_source,
+            )?;
+            (
+                resolved.decision,
+                resolved.source_owner,
+                Some(resolved.source),
+            )
+        };
+        if options.ip_hdrincl {
+            if buf.len() < crate::net::socket::utils::IPV6_HEADER_LEN {
+                return Err(SystemError::EINVAL);
+            }
+            if buf.len() > route.ip_mtu {
+                return Err(SystemError::EMSGSIZE);
+            }
+        }
+        let built;
+        let packet = if options.ip_hdrincl {
+            buf
+        } else {
+            let params = IpPacketParams {
+                payload: buf,
+                src: source.expect("non-HDRINCL output selected a source").into(),
+                dst: destination,
+                protocol: self.protocol,
+                ttl: options.ip_ttl,
+                tos: options.ip_tos,
+                ipv6_checksum: options.ipv6_checksum,
+            };
+            built = build_ip_packet(IpVersion::Ipv6, &params)?;
+            built.as_slice()
+        };
+        let mut reservation = crate::driver::net::local_output::reserve_prepared_ip_output(
+            owner.as_ref(),
+            packet.len(),
+            IpVersion::Ipv6,
+        )?;
+        reservation.bytes_mut().copy_from_slice(packet);
+        crate::net::output::submit_prepared_ipv6(&self.netns, reservation, route)?;
+        Ok(buf.len())
+    }
+
+    /// One IPv4 send boundary for send, sendto, and sendmsg. The receive-side
+    /// smoltcp attachment is only consulted for the explicit local bind and
+    /// connected destination; it is never treated as the output route.
+    fn try_send_ipv4_prepared(
+        &self,
+        buf: &[u8],
+        to: Option<IpAddress>,
+        options: &super::options::RawSocketOptions,
+        ttl_override: Option<u8>,
+    ) -> Result<usize, SystemError> {
+        let multicast_loop = self.ip_multicast_loop.load(Ordering::Acquire);
+        let multicast_ttl = self.ip_multicast_ttl.load(Ordering::Acquire) as u8;
+        let (destination, bound_source) = {
+            let inner = self.inner.read();
+            let bound = match inner.as_ref() {
+                Some(RawInner::Bound(bound) | RawInner::Wildcard(bound)) => Some(bound),
+                Some(RawInner::Unbound(_)) => None,
+                None => return Err(SystemError::EBADF),
+            };
+            let destination = to
+                .or_else(|| bound.and_then(|bound| bound.remote_addr()))
+                .ok_or(SystemError::EDESTADDRREQ)?;
+            let bound_source = bound.and_then(|bound| bound.local_addr());
+            (destination, bound_source)
+        };
+        if !matches!(destination, IpAddress::Ipv4(_)) {
+            return Err(SystemError::EAFNOSUPPORT);
+        }
+
+        let mut required_oif = self
+            .device_binding
+            .resolve_iface(&self.netns)?
+            .map(|iface| iface.nic_id() as u32);
+        let mut fixed_source = bound_source.filter(|source| {
+            !source.is_unspecified()
+                && !source.is_multicast()
+                && !crate::net::address::netns_accepts_broadcast_address(&self.netns, *source)
+        });
+        if destination.is_multicast() {
+            let multicast_oif = self.ip_multicast_ifindex.load(Ordering::Acquire);
+            let multicast_addr = self.ip_multicast_addr.load(Ordering::Acquire);
+            required_oif = required_oif.or_else(|| {
+                u32::try_from(multicast_oif)
+                    .ok()
+                    .filter(|index| *index != 0)
+            });
+            if fixed_source.is_none() && multicast_addr != 0 {
+                let octets = multicast_addr.to_ne_bytes();
+                fixed_source = Some(IpAddress::v4(octets[0], octets[1], octets[2], octets[3]));
+            }
+        }
+        let resolved = crate::net::route::resolve_ipv4_route(
+            &self.netns,
+            destination,
+            required_oif,
+            fixed_source,
+        )?;
+        let route = resolved.output_decision();
+        if route.kind == crate::net::route::RTN_BROADCAST
+            && !self.so_broadcast.load(Ordering::Acquire)
+        {
+            return Err(SystemError::EACCES);
+        }
+
+        let packet_len = if options.ip_hdrincl {
+            validate_ipv4_hdrincl_packet(buf)?;
+            buf.len()
+        } else {
+            buf.len()
+                .checked_add(IPV4_MIN_HEADER_LEN)
+                .filter(|len| *len <= u16::MAX as usize)
+                .ok_or(SystemError::EMSGSIZE)?
+        };
+        // Linux raw_send_hdrinc rejects an oversized complete datagram even
+        // when its supplied header has DF clear.
+        if options.ip_hdrincl && packet_len > route.ip_mtu {
+            return Err(SystemError::EMSGSIZE);
+        }
+        let owner = self
+            .netns
+            .device_list()
+            .get(&(route.oif as usize))
+            .cloned()
+            .ok_or(SystemError::ENETUNREACH)?;
+        let charge = self.send_account.charge(packet_len)?;
+        let mut reservation = crate::driver::net::local_output::reserve_prepared_ip_output(
+            owner.as_ref(),
+            packet_len,
+            smoltcp::wire::IpVersion::Ipv4,
+        )?;
+
+        if options.ip_hdrincl {
+            let packet = reservation.bytes_mut();
+            packet.copy_from_slice(buf);
+            let total_len = packet_len as u16;
+            let mut ip = Ipv4Packet::new_unchecked(packet);
+            ip.set_total_len(total_len);
+            if ip.src_addr().is_unspecified() {
+                let IpAddress::Ipv4(source) = resolved.source else {
+                    return Err(SystemError::EAFNOSUPPORT);
+                };
+                ip.set_src_addr(source);
+            }
+            if ip.ident() == 0 {
+                ip.set_ident(self.netns.next_ipv4_identification());
+            }
+            ip.fill_checksum();
+        } else {
+            let ttl = ttl_override.unwrap_or(if destination.is_multicast() {
+                multicast_ttl
+            } else {
+                options.ip_ttl
+            });
+            let dont_fragment = packet_len <= route.ip_mtu;
+            let ident = if dont_fragment {
+                0
+            } else {
+                self.netns.next_ipv4_identification()
+            };
+            emit_ipv4_packet(
+                reservation.bytes_mut(),
+                &IpPacketParams {
+                    payload: buf,
+                    src: resolved.source,
+                    dst: destination,
+                    protocol: self.protocol,
+                    ttl,
+                    tos: options.ip_tos,
+                    ipv6_checksum: options.ipv6_checksum,
+                },
+                ident,
+                dont_fragment,
+            )?;
+        }
+        reservation.set_charge(charge);
+        crate::net::output::submit_prepared_ipv4(
+            &self.netns,
+            reservation,
+            route,
+            multicast_loop,
+            !options.ip_hdrincl,
+        )?;
+        Ok(buf.len())
+    }
+
     /// 发送前确保 socket 绑定在合适的 iface 上。
     ///
     /// 背景：raw socket 在创建时可能处于 Wildcard 状态并附着到 loopback 以便接收/唤醒。
@@ -67,61 +323,6 @@ impl RawSocket {
         Ok(())
     }
 
-    fn send_ipv4_hdrincl_on_bound(
-        &self,
-        bound: &inner::BoundRaw,
-        buf: &[u8],
-        dest: IpAddress,
-    ) -> Result<HdrinclSendOutcome, SystemError> {
-        validate_ipv4_hdrincl_packet(buf)?;
-
-        let pkt_proto = IpProtocol::from(buf[9]);
-
-        // Linux raw_send_hdrinc: if iph->saddr == 0, stack sets it.
-        let src_addr = self.get_src_addr_for_send(bound, dest)?;
-        let src_v4 = match src_addr {
-            IpAddress::Ipv4(v4) => v4,
-            _ => return Err(SystemError::EAFNOSUPPORT),
-        };
-
-        // Patch the IPv4 header similarly to Linux: tot_len is overwritten, checksum recomputed.
-        let mut packet = buf.to_vec();
-        if packet.len() <= u16::MAX as usize {
-            let total_len = packet.len() as u16;
-            let existing_saddr_is_zero = packet[12..16].iter().all(|b| *b == 0);
-
-            let mut pkt = Ipv4Packet::new_unchecked(&mut packet);
-            pkt.set_total_len(total_len);
-            if existing_saddr_is_zero {
-                pkt.set_src_addr(src_v4);
-            }
-            pkt.fill_checksum();
-        }
-
-        // loopback 快速路径：路由/投递目的由 sendto/connect 指定的 dest 决定，
-        // 而不是 IP header 里的 daddr（gVisor RawHDRINCL.SendAndReceiveDifferentAddress）。
-        if is_loopback_addr(dest) {
-            let ctx = LoopbackDeliverContext {
-                packet: &packet,
-                dest,
-                ip_version: self.ip_version,
-                protocol: pkt_proto,
-                netns: &self.netns,
-            };
-            deliver_loopback_packet(&ctx);
-            return Ok(HdrinclSendOutcome {
-                bytes_written: packet.len(),
-                needs_iface_poll: false,
-            });
-        }
-
-        bound.try_send(&packet, Some(dest))?;
-        Ok(HdrinclSendOutcome {
-            bytes_written: packet.len(),
-            needs_iface_poll: true,
-        })
-    }
-
     /// 尝试发送数据包
     pub fn try_send(
         &self,
@@ -140,133 +341,12 @@ impl RawSocket {
             }
         }
 
-        // 若当前处于 Wildcard(loopback)，对非 loopback 目的地址发送时需要切到正确出口。
-        if let Some(dest) = to {
-            self.ensure_not_loopback_wildcard_for_send(dest)?;
+        if self.ip_version == IpVersion::Ipv4 {
+            let options = self.options.read().clone();
+            return self.try_send_ipv4_prepared(buf, to, &options, None);
         }
 
-        // 确保已绑定
-        if !self.is_bound() {
-            if let Some(dest) = to {
-                self.bind_ephemeral(dest)?;
-            } else {
-                return Err(SystemError::EDESTADDRREQ);
-            }
-        }
-
-        let inner_guard = self.inner.read();
-        match inner_guard.as_ref() {
-            None => Err(SystemError::ENOTCONN),
-            Some(RawInner::Bound(bound)) => {
-                let sent = self.try_send_on_bound(bound, buf, to)?;
-                bound.inner().iface().poll();
-                Ok(sent)
-            }
-            Some(RawInner::Wildcard(bound)) => {
-                let sent = self.try_send_on_bound(bound, buf, to)?;
-                bound.inner().iface().poll();
-                Ok(sent)
-            }
-            Some(RawInner::Unbound(_)) => Err(SystemError::ENOTCONN),
-        }
-    }
-
-    fn try_send_on_bound(
-        &self,
-        bound: &inner::BoundRaw,
-        buf: &[u8],
-        to: Option<IpAddress>,
-    ) -> Result<usize, SystemError> {
-        let options = self.options.read().clone();
-
-        // 目标地址：sendto() 显式指定优先；否则使用 connect(2) 的远端。
-        let dest = to.or(bound.remote_addr());
-
-        if options.ip_hdrincl {
-            // Linux 语义：即便用户在 IP header 里提供了 daddr，send(2) 在未 connect
-            // 且未提供 msg_name/sockaddr 的情况下仍返回 EDESTADDRREQ。
-            let dest = dest.ok_or(SystemError::EDESTADDRREQ)?;
-
-            match self.ip_version {
-                IpVersion::Ipv4 => {
-                    let out = self.send_ipv4_hdrincl_on_bound(bound, buf, dest)?;
-                    return Ok(out.bytes_written);
-                }
-                IpVersion::Ipv6 => return Err(SystemError::EINVAL),
-            }
-        }
-
-        // 用户未提供 IP 头：按 Linux 语义内核自动构造。
-        // gVisor raw_socket_test: RawSocketTest.ReceiveIPPacketInfo 等
-        let dest = dest.ok_or(SystemError::EDESTADDRREQ)?;
-
-        // 获取源地址
-        let src = self.get_src_addr_for_send(bound, dest)?;
-
-        let params = IpPacketParams {
-            payload: buf,
-            src,
-            dst: dest,
-            protocol: self.protocol,
-            ttl: options.ip_ttl,
-            tos: options.ip_tos,
-            ipv6_checksum: options.ipv6_checksum,
-        };
-
-        let packet = build_ip_packet(self.ip_version, &params)?;
-
-        // loopback 快速路径：避免 smoltcp 重序列化导致 TOS/TCLASS 丢失，
-        // 并在此处实现 SO_RCVBUF 的投递/丢弃语义。
-        if is_loopback_addr(dest) {
-            let ctx = LoopbackDeliverContext {
-                packet: &packet,
-                dest,
-                ip_version: self.ip_version,
-                protocol: self.protocol,
-                netns: &self.netns,
-            };
-            deliver_loopback_packet(&ctx);
-            // Linux/Netstack：即便因 rcvbuf 满或过滤丢包，sendmsg/sendto 仍可成功。
-            return Ok(buf.len());
-        }
-
-        bound.try_send(&packet, Some(dest))?;
-        Ok(buf.len())
-    }
-
-    /// 获取发送时使用的源地址
-    fn get_src_addr_for_send(
-        &self,
-        bound: &inner::BoundRaw,
-        _dest: IpAddress,
-    ) -> Result<IpAddress, SystemError> {
-        match self.ip_version {
-            IpVersion::Ipv4 => match bound.local_addr() {
-                Some(addr @ IpAddress::Ipv4(_)) => Ok(addr),
-                _ => {
-                    let ip = bound
-                        .inner()
-                        .iface()
-                        .common()
-                        .ipv4_addr()
-                        .ok_or(SystemError::EADDRNOTAVAIL)?;
-                    let [a, b, c, d] = ip.octets();
-                    Ok(IpAddress::Ipv4(smoltcp::wire::Ipv4Address::new(a, b, c, d)))
-                }
-            },
-            IpVersion::Ipv6 => match bound.local_addr() {
-                Some(addr @ IpAddress::Ipv6(_)) => Ok(addr),
-                _ => {
-                    let iface = bound.inner().iface();
-                    let addr = iface
-                        .smol_iface()
-                        .lock()
-                        .ipv6_addr()
-                        .ok_or(SystemError::EADDRNOTAVAIL)?;
-                    Ok(IpAddress::Ipv6(addr))
-                }
-            },
-        }
+        self.try_send_ipv6_prepared(buf, to, &self.options.read().clone())
     }
 
     pub fn send(&self, buffer: &[u8], flags: PMSG) -> Result<usize, SystemError> {
@@ -274,12 +354,23 @@ impl RawSocket {
             return self.try_send(buffer, None);
         }
 
+        let started = crate::time::Instant::now();
+        let timeout = self.send_timeout();
+
         loop {
             match self.try_send(buffer, None) {
-                Err(SystemError::ENOBUFS) => {
+                Err(SystemError::EAGAIN_OR_EWOULDBLOCK) if self.ip_version == IpVersion::Ipv4 => {
+                    let packet_len =
+                        buffer
+                            .len()
+                            .saturating_add(if self.options.read().ip_hdrincl {
+                                0
+                            } else {
+                                IPV4_MIN_HEADER_LEN
+                            });
                     self.wait_queue.wait_event_io_interruptible_timeout(
-                        || self.can_send(),
-                        self.send_timeout(),
+                        || self.send_account.can_charge(packet_len),
+                        remaining_send_timeout(started, timeout)?,
                     )?;
                 }
                 result => return result,
@@ -298,12 +389,25 @@ impl RawSocket {
                 return self.try_send(buffer, Some(remote.addr));
             }
 
+            let started = crate::time::Instant::now();
+            let timeout = self.send_timeout();
+
             loop {
                 match self.try_send(buffer, Some(remote.addr)) {
-                    Err(SystemError::ENOBUFS) => {
+                    Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
+                        if self.ip_version == IpVersion::Ipv4 =>
+                    {
+                        let packet_len =
+                            buffer
+                                .len()
+                                .saturating_add(if self.options.read().ip_hdrincl {
+                                    0
+                                } else {
+                                    IPV4_MIN_HEADER_LEN
+                                });
                         self.wait_queue.wait_event_io_interruptible_timeout(
-                            || self.can_send(),
-                            self.send_timeout(),
+                            || self.send_account.can_charge(packet_len),
+                            remaining_send_timeout(started, timeout)?,
                         )?;
                     }
                     result => return result,
@@ -316,7 +420,7 @@ impl RawSocket {
     pub fn send_msg(
         &self,
         msg: &crate::net::posix::MsgHdr,
-        _flags: PMSG,
+        flags: PMSG,
     ) -> Result<usize, SystemError> {
         // Gather payload.
         let iovs = unsafe { IoVecs::from_user(msg.msg_iov, msg.msg_iovlen, false)? };
@@ -335,6 +439,7 @@ impl RawSocket {
 
         // Clone current options and apply per-send overrides from cmsgs.
         let mut options = self.options.read().clone();
+        let mut ipv4_ttl_override = None;
 
         if !msg.msg_control.is_null() && msg.msg_controllen != 0 {
             let reader =
@@ -373,7 +478,9 @@ impl RawSocket {
                 match (hdr.cmsg_level, hdr.cmsg_type) {
                     (level, t) if level == PSOL::IP as i32 && t == IpOption::TTL as i32 => {
                         if let Some(v) = read_i32(data) {
-                            options.ip_ttl = v.clamp(0, 255) as u8;
+                            let ttl = v.clamp(0, 255) as u8;
+                            options.ip_ttl = ttl;
+                            ipv4_ttl_override = Some(ttl);
                         }
                     }
                     (level, t) if level == PSOL::IP as i32 && t == IpOption::TOS as i32 => {
@@ -411,65 +518,36 @@ impl RawSocket {
         }
         let dest = to_ip.ok_or(SystemError::EDESTADDRREQ)?;
 
-        // 若当前处于 Wildcard(loopback)，对非 loopback 目的地址发送时需要切到正确出口。
-        self.ensure_not_loopback_wildcard_for_send(dest)?;
-
-        // Ensure bound.
-        if !self.is_bound() {
-            self.bind_ephemeral(dest)?;
-        }
-
-        let inner_guard = self.inner.read();
-        let bound = match inner_guard.as_ref() {
-            Some(RawInner::Bound(b)) => b,
-            Some(RawInner::Wildcard(b)) => b,
-            _ => return Err(SystemError::ENOTCONN),
-        };
-
-        if options.ip_hdrincl {
-            match self.ip_version {
-                IpVersion::Ipv4 => {
-                    let out = self.send_ipv4_hdrincl_on_bound(bound, &buf, dest)?;
-                    if out.needs_iface_poll {
-                        bound.inner().iface().poll();
+        if self.ip_version == IpVersion::Ipv4 {
+            if !self.addr_matches_ip_version(dest) {
+                return Err(SystemError::EAFNOSUPPORT);
+            }
+            if flags.contains(PMSG::DONTWAIT) || self.is_nonblock() {
+                return self.try_send_ipv4_prepared(&buf, Some(dest), &options, ipv4_ttl_override);
+            }
+            let started = crate::time::Instant::now();
+            let timeout = self.send_timeout();
+            loop {
+                match self.try_send_ipv4_prepared(&buf, Some(dest), &options, ipv4_ttl_override) {
+                    Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
+                        self.wait_queue.wait_event_io_interruptible_timeout(
+                            || {
+                                self.send_account.can_charge(buf.len().saturating_add(
+                                    if options.ip_hdrincl {
+                                        0
+                                    } else {
+                                        IPV4_MIN_HEADER_LEN
+                                    },
+                                ))
+                            },
+                            remaining_send_timeout(started, timeout)?,
+                        )?;
                     }
-                    return Ok(out.bytes_written);
+                    result => return result,
                 }
-                IpVersion::Ipv6 => return Err(SystemError::EINVAL),
             }
         }
 
-        // 获取源地址
-        let src = self.get_src_addr_for_send(bound, dest)?;
-
-        let params = IpPacketParams {
-            payload: &buf,
-            src,
-            dst: dest,
-            protocol: self.protocol,
-            ttl: options.ip_ttl,
-            tos: options.ip_tos,
-            ipv6_checksum: options.ipv6_checksum,
-        };
-
-        let packet = build_ip_packet(self.ip_version, &params)?;
-
-        // loopback 快速路径
-        if is_loopback_addr(dest) {
-            let ctx = LoopbackDeliverContext {
-                packet: &packet,
-                dest,
-                ip_version: self.ip_version,
-                protocol: self.protocol,
-                netns: &self.netns,
-            };
-            deliver_loopback_packet(&ctx);
-            // Linux/Netstack：即便因 rcvbuf 满或过滤丢包，sendmsg 仍可成功。
-            return Ok(buf.len());
-        }
-
-        bound.try_send(&packet, Some(dest))?;
-        bound.inner().iface().poll();
-        Ok(buf.len())
+        self.try_send_ipv6_prepared(&buf, Some(dest), &options)
     }
 }

@@ -46,6 +46,7 @@ impl UdpSocket {
                 let requested = byte_parser::read_u32(val)?;
                 let size = clamp_udp_buf(requested, SYSCTL_WMEM_MAX, SOCK_MIN_SNDBUF);
                 self.send_buf_size.store(size, Ordering::Release);
+                self.send_account.set_limit(size.saturating_mul(2));
 
                 // If socket is already bound, we need to recreate it with new buffer size
                 self.recreate_socket_if_bound()?;
@@ -91,6 +92,7 @@ impl UdpSocket {
                 let requested = byte_parser::read_i32(val)?;
                 let size = clamp_udp_buf_force(requested, SOCK_MIN_SNDBUF);
                 self.send_buf_size.store(size, Ordering::Release);
+                self.send_account.set_limit(size.saturating_mul(2));
                 self.recreate_socket_if_bound()?;
                 Ok(())
             }

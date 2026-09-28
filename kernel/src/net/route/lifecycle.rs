@@ -16,8 +16,8 @@ use crate::{
 use super::{
     canonical_cidr, is_ipv4, prepare_with_devices, projection_for_iface, transact_with_devices,
     validate_entry_on_iface, FibEditor, FibTable, PreparedTransaction, ProjectionPlan, RouteEntry,
-    RouteNotifications, RTN_BROADCAST, RTN_LOCAL, RTN_UNICAST, RTPROT_KERNEL, RT_SCOPE_HOST,
-    RT_SCOPE_LINK, RT_SCOPE_UNIVERSE, RT_TABLE_LOCAL, RT_TABLE_MAIN,
+    RouteNotifications, RTN_BROADCAST, RTN_LOCAL, RTN_MULTICAST, RTN_UNICAST, RTPROT_KERNEL,
+    RT_SCOPE_HOST, RT_SCOPE_LINK, RT_SCOPE_UNIVERSE, RT_TABLE_LOCAL, RT_TABLE_MAIN,
 };
 
 pub(crate) fn register_iface(
@@ -83,13 +83,16 @@ pub(crate) fn unregister_iface(
     transact_with_devices(rtnl, netns, devices, |candidate| {
         candidate.remove_where(|route| route.oif == ifindex)?;
         Ok(())
-    })
+    })?;
+    netns.conntrack().invalidate_masquerade_oif(ifindex);
+    Ok(())
 }
 
 /// Applies Linux's IPv4 device-state FIB lifecycle. Ordinary NETDEV_DOWN
 /// purges are intentionally silent at the rtnetlink notification boundary.
 pub(crate) struct PreparedLinkStateChange<'rtnl> {
     transaction: PreparedTransaction<'rtnl, RouteNotifications>,
+    ifindex: u32,
 }
 
 impl PreparedLinkStateChange<'_> {
@@ -101,13 +104,17 @@ impl PreparedLinkStateChange<'_> {
         is_up: bool,
         publish_link_state: impl FnOnce(),
     ) -> RouteNotifications {
-        if is_up {
+        let notifications = if is_up {
             self.transaction
                 .publish_around(netns, || {}, publish_link_state)
         } else {
             self.transaction
                 .publish_around(netns, publish_link_state, || {})
+        };
+        if !is_up {
+            netns.conntrack().invalidate_masquerade_oif(self.ifindex);
         }
+        notifications
     }
 }
 
@@ -161,7 +168,10 @@ pub(crate) fn prepare_link_state_change<'rtnl>(
             })
         }
     })?;
-    Ok(PreparedLinkStateChange { transaction })
+    Ok(PreparedLinkStateChange {
+        transaction,
+        ifindex,
+    })
 }
 
 /// A fully prepared address/FIB commit. Construction may fail; publication is
@@ -175,6 +185,8 @@ pub(crate) struct PreparedAddressRouteCommit {
     notifications: RouteNotifications,
     after_addresses: Vec<IpCidr>,
     metadata: Vec<AddressMetadata>,
+    deleted_addresses: Vec<IpAddress>,
+    invalidate_masquerade_oif: bool,
 }
 
 pub(crate) struct AddressLinkChange<'a> {
@@ -335,6 +347,8 @@ impl PreparedAddressRouteCommit {
             notifications,
             after_addresses: try_clone_slice(after_addresses)?,
             metadata,
+            deleted_addresses: try_clone_slice(deleted_addresses)?,
+            invalidate_masquerade_oif: was_up && !is_up,
         })
     }
 
@@ -359,6 +373,8 @@ impl PreparedAddressRouteCommit {
             notifications,
             after_addresses,
             metadata,
+            deleted_addresses,
+            invalidate_masquerade_oif,
         } = self;
         let router = netns.router();
         let mut current = router.fib_write();
@@ -398,6 +414,22 @@ impl PreparedAddressRouteCommit {
             publish_link_state
                 .take()
                 .expect("link state publisher runs once")();
+        }
+        drop(mirror);
+        drop(current);
+        let ifindex = iface.nic_id() as u32;
+        if invalidate_masquerade_oif {
+            netns.conntrack().invalidate_masquerade_oif(ifindex);
+        } else {
+            for address in deleted_addresses {
+                let address = match address {
+                    IpAddress::Ipv4(address) => address.octets().into(),
+                    IpAddress::Ipv6(address) => address.octets().into(),
+                };
+                netns
+                    .conntrack()
+                    .invalidate_masquerade_address(ifindex, address);
+            }
         }
         notifications
     }
@@ -449,6 +481,31 @@ fn derived_address_entries_for_link_state(
     is_up: bool,
 ) -> Result<Vec<RouteEntry>, SystemError> {
     let mut result = Vec::new();
+    // Linux addrconf_add_dev() installs this route when IPv6 is enabled on a
+    // non-loopback device, even before it has a unicast address. The regular
+    // device DOWN/UP transaction removes and restores it with other routes.
+    if is_up && !iface.flags().contains(InterfaceFlags::LOOPBACK) {
+        result.try_reserve(1).map_err(|_| SystemError::ENOMEM)?;
+        result.push(RouteEntry {
+            destination: IpCidr::Ipv6(Ipv6Cidr::new(
+                smoltcp::wire::Ipv6Address::from([
+                    0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                ]),
+                8,
+            )),
+            source: None,
+            preferred_source: None,
+            table: RT_TABLE_LOCAL,
+            priority: 256,
+            tos: 0,
+            protocol: RTPROT_KERNEL,
+            scope: RT_SCOPE_UNIVERSE,
+            kind: RTN_MULTICAST,
+            oif: iface.nic_id() as u32,
+            gateway: None,
+            nexthop_flags: 0,
+        });
+    }
     for cidr in addresses.iter().copied() {
         for entry in entries_for_address(iface, cidr, primary_for_prefix(addresses, cidr), is_up)? {
             if !result.contains(&entry) {

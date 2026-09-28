@@ -1,4 +1,81 @@
 use super::*;
+use crate::net::ingress::{NetIngressFilter, NetIngressFilterInit, RoutedIngressWork};
+use smoltcp::iface::{IpIngressFilter, PollIngressSingleResult, PollResult};
+
+fn poll_smol<D: SmolDevice + ?Sized>(
+    interface: &mut smoltcp::iface::Interface,
+    timestamp: smoltcp::time::Instant,
+    device: &mut D,
+    sockets: &mut smoltcp::iface::SocketSet<'_>,
+    filter: Option<&mut dyn IpIngressFilter>,
+) -> PollResult {
+    if let Some(filter) = filter {
+        interface.poll_filtered(timestamp, device, sockets, filter)
+    } else {
+        interface.poll(timestamp, device, sockets)
+    }
+}
+
+fn poll_smol_single<D: SmolDevice + ?Sized>(
+    interface: &mut smoltcp::iface::Interface,
+    timestamp: smoltcp::time::Instant,
+    device: &mut D,
+    sockets: &mut smoltcp::iface::SocketSet<'_>,
+    filter: Option<&mut dyn IpIngressFilter>,
+) -> PollIngressSingleResult {
+    if let Some(filter) = filter {
+        interface.poll_ingress_single_filtered(timestamp, device, sockets, filter)
+    } else {
+        interface.poll_ingress_single(timestamp, device, sockets)
+    }
+}
+
+/// Even an initially unfiltered poll must stop socket egress if a ruleset
+/// becomes active while smoltcp is iterating its sockets. The physical device
+/// has no namespace knowledge of its own.
+struct NftGenerationDevice<'a, D: SmolDevice + ?Sized> {
+    device: &'a mut D,
+    netns: Option<&'a NetNamespace>,
+    ruleset: Option<&'a crate::net::nftables::RulesetSnapshot>,
+}
+
+impl<D: SmolDevice + ?Sized> SmolDevice for NftGenerationDevice<'_, D> {
+    type RxToken<'a>
+        = D::RxToken<'a>
+    where
+        Self: 'a;
+    type TxToken<'a>
+        = D::TxToken<'a>
+    where
+        Self: 'a;
+
+    fn receive(
+        &mut self,
+        timestamp: smoltcp::time::Instant,
+    ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+        self.device.receive(timestamp)
+    }
+
+    fn transmit(&mut self, timestamp: smoltcp::time::Instant) -> Option<Self::TxToken<'_>> {
+        self.device.transmit(timestamp)
+    }
+
+    fn capabilities(&self) -> DeviceCapabilities {
+        self.device.capabilities()
+    }
+
+    fn outbound_ip_mtu(&self, destination: smoltcp::wire::IpAddress, meta: PacketMeta) -> usize {
+        self.device.outbound_ip_mtu(destination, meta)
+    }
+
+    fn policy_current(&self) -> bool {
+        match (self.netns, self.ruleset) {
+            (Some(netns), Some(ruleset)) => ruleset.generation == netns.nftables().generation(),
+            (None, None) => self.device.policy_current(),
+            _ => false,
+        }
+    }
+}
 
 pub struct IfaceCommon {
     pub(super) iface_id: usize,
@@ -213,6 +290,10 @@ impl IfaceCommon {
                     ip_mtu: self.mtu.load(Ordering::Acquire),
                 },
                 frame,
+                ct_context: OutputCtContext::Untracked,
+                mark: 0,
+                prepared_ip: None,
+                _charge: None,
             },
             reservation,
         ))
@@ -377,6 +458,7 @@ impl IfaceCommon {
         needs_routed_poll: bool,
         authoritative_output: bool,
         configured_output: bool,
+        ct_active: bool,
     ) -> PollModeRecheck {
         if !authoritative_output
             && netns.is_some_and(|netns| netns.router().requires_authoritative_output())
@@ -384,6 +466,7 @@ impl IfaceCommon {
             PollModeRecheck::Authoritative
         } else if (!needs_routed_poll && self.needs_namespace_routing())
             || (!configured_output && netns.is_some_and(crate::net::neighbor::has_ethernet_entries))
+            || (!ct_active && netns.is_some_and(|netns| netns.conntrack().is_active()))
         {
             PollModeRecheck::Routed
         } else {
@@ -450,6 +533,28 @@ impl IfaceCommon {
             }
 
             let netns = self.net_namespace();
+            let nft_ruleset = netns.as_ref().map(|netns| netns.nftables().snapshot());
+            let nft_ruleset_changed = || {
+                netns
+                    .as_ref()
+                    .zip(nft_ruleset.as_ref())
+                    .is_some_and(|(netns, pinned)| {
+                        pinned.generation != netns.nftables().generation()
+                    })
+            };
+            let nft_device_names = match (netns.as_ref(), nft_ruleset.as_ref()) {
+                (Some(netns), Some(ruleset)) if ruleset.requires_iface_names() => {
+                    match crate::net::nftables::NftDeviceNames::snapshot(netns) {
+                        Ok(names) => names,
+                        Err(_) => return false,
+                    }
+                }
+                _ => crate::net::nftables::NftDeviceNames::empty(),
+            };
+            let raw_listeners = netns
+                .as_ref()
+                .map(crate::net::socket::inet::raw::snapshot_raw_ingress_listeners)
+                .unwrap_or_default();
             let authoritative_output = force_authoritative
                 || netns
                     .as_ref()
@@ -457,20 +562,53 @@ impl IfaceCommon {
             let configured_output = netns
                 .as_ref()
                 .is_some_and(crate::net::neighbor::has_ethernet_entries);
+            let ipv6_forwarding = netns
+                .as_ref()
+                .is_some_and(|netns| netns.ipv6_forwarding_enabled());
+            let ct_active = netns
+                .as_ref()
+                .is_some_and(|netns| netns.conntrack().is_active());
+            let requires_nat_addresses = nft_ruleset.as_ref().is_some_and(|ruleset| {
+                [
+                    smoltcp::wire::IpVersion::Ipv4,
+                    smoltcp::wire::IpVersion::Ipv6,
+                ]
+                .into_iter()
+                .any(|version| {
+                    ruleset.requires_masquerade(
+                        version,
+                        crate::net::nftables::NftIpv4Hook::PostRouting,
+                    ) || ruleset
+                        .requires_redirect(version, crate::net::nftables::NftIpv4Hook::PreRouting)
+                })
+            });
             let needs_routed_poll = self.needs_namespace_routing()
                 || scope == IfacePollScope::LocalOnly
                 || authoritative_output
-                || configured_output;
+                || configured_output
+                || ipv6_forwarding
+                || ct_active
+                || requires_nat_addresses
+                || nft_ruleset.as_ref().is_some_and(|ruleset| {
+                    ruleset.requires_route_lookup() || ruleset.has_output_hook()
+                });
             let router = if needs_routed_poll {
                 netns.as_ref().map(|netns| netns.router())
             } else {
                 None
             };
-            let route_policy = router.as_ref().and_then(|router| {
+            let mut route_policy = router.as_ref().and_then(|router| {
                 netns
                     .as_ref()
                     .map(|netns| crate::net::route::lock_output_routes(router, netns.device_list()))
             });
+            if requires_nat_addresses
+                && route_policy
+                    .as_mut()
+                    .is_none_or(|routes| routes.prepare_masquerade_addresses().is_err())
+            {
+                return false;
+            }
             let routed_this_round = route_policy.is_some();
             let owner_is_up = scope == IfacePollScope::Full;
 
@@ -497,8 +635,9 @@ impl IfaceCommon {
                 needs_routed_poll,
                 authoritative_output,
                 configured_output,
+                ct_active,
             );
-            if restart != PollModeRecheck::Current {
+            if restart != PollModeRecheck::Current || nft_ruleset_changed() {
                 drop(configured_neighbors);
                 drop(interface);
                 drop(sockets);
@@ -508,20 +647,59 @@ impl IfaceCommon {
                 continue;
             }
             let backend_policy = route_policy.as_ref().map(|routes| OutputBackendPolicy {
+                netns: netns.as_deref().unwrap(),
                 routes,
+                ruleset: nft_ruleset.as_deref(),
+                device_names: &nft_device_names,
                 configured_neighbors: configured_neighbors.as_ref(),
                 owner_ifindex: self.iface_id as u32,
                 owner_is_up,
                 authoritative_output,
             });
 
+            let ingress_stage = Cell::new(IngressStage::Pending);
+            let mark = Cell::new(0);
+            let packet_context = core::cell::RefCell::new(None);
+            let mut ingress_work: Vec<RoutedIngressWork> = Vec::new();
+            let mut nft_filter = netns.as_ref().map(|netns| {
+                NetIngressFilter::new(NetIngressFilterInit {
+                    ruleset: nft_ruleset.as_ref().unwrap(),
+                    netns,
+                    raw_listeners: &raw_listeners,
+                    owner_ifindex: self.iface_id as u32,
+                    device_names: &nft_device_names,
+                    stage: &ingress_stage,
+                    mark: &mark,
+                    packet_context: &packet_context,
+                    routes: (ipv6_forwarding || ct_active)
+                        .then_some(route_policy.as_ref())
+                        .flatten(),
+                    fib_routes: route_policy.as_ref(),
+                    work: &mut ingress_work,
+                })
+            });
+
             let (has_events, poll_again, deadline_rearm) = {
                 let local_result = if routed_this_round
                     && (self.has_local_input() || scope == IfacePollScope::LocalOnly)
                 {
-                    let mut local_device =
-                        LocalInputDevice::new(device, self, backend_policy.unwrap());
-                    Some(interface.poll(timestamp, &mut local_device, &mut sockets))
+                    let mut local_device = LocalInputDevice::new(
+                        device,
+                        self,
+                        backend_policy.unwrap(),
+                        nft_filter.as_ref().map(|_| &ingress_stage),
+                        nft_filter.as_ref().map(|_| &packet_context),
+                        nft_filter.as_ref().map(|_| &mark),
+                    );
+                    Some(poll_smol(
+                        &mut interface,
+                        timestamp,
+                        &mut local_device,
+                        &mut sockets,
+                        nft_filter
+                            .as_mut()
+                            .map(|filter| filter as &mut dyn IpIngressFilter),
+                    ))
                 } else {
                     None
                 };
@@ -532,9 +710,30 @@ impl IfaceCommon {
                             queue: &self.local_input_queue,
                             backend_policy: backend_policy.unwrap(),
                         };
-                        Some(interface.poll(timestamp, &mut routed_device, &mut sockets))
+                        Some(poll_smol(
+                            &mut interface,
+                            timestamp,
+                            &mut routed_device,
+                            &mut sockets,
+                            nft_filter
+                                .as_mut()
+                                .map(|filter| filter as &mut dyn IpIngressFilter),
+                        ))
                     } else {
-                        Some(interface.poll(timestamp, device, &mut sockets))
+                        let mut guarded_device = NftGenerationDevice {
+                            device,
+                            netns: netns.as_deref(),
+                            ruleset: nft_ruleset.as_deref(),
+                        };
+                        Some(poll_smol(
+                            &mut interface,
+                            timestamp,
+                            &mut guarded_device,
+                            &mut sockets,
+                            nft_filter
+                                .as_mut()
+                                .map(|filter| filter as &mut dyn IpIngressFilter),
+                        ))
                     }
                 } else {
                     None
@@ -570,6 +769,9 @@ impl IfaceCommon {
             drop(sockets);
             drop(route_policy);
             drop(router);
+            for work in ingress_work.drain(..) {
+                work.execute();
+            }
             let output_drain = self.drain_local_outputs(device, Self::LOCAL_OUTPUT_POLL_BUDGET);
             self.clear_namespace_routing_if_idle();
             self.notify_deadline_rearm(deadline_rearm);
@@ -585,6 +787,13 @@ impl IfaceCommon {
             // can_send() 已经变为 true。如果只在 has_events 时唤醒，发送端会永远等待。
             // 唤醒后 socket 会重新检查条件，如果条件不满足会继续等待，所以不会造成忙等待。
             self.notify_all_bound_sockets();
+
+            if nft_ruleset_changed() {
+                // poll_filtered stopped before consuming the next RX token.
+                // Reacquire matching rule, FIB, interface-name, and MASQ views
+                // before resuming either ingress or socket egress.
+                continue;
+            }
 
             // TODO: remove closed sockets
             // let closed_sockets = self
@@ -611,7 +820,20 @@ impl IfaceCommon {
     where
         D: smoltcp::phy::Device + ?Sized,
     {
-        self.poll_napi_with_authoritative_mode(device, budget, false)
+        self.poll_napi_with_authoritative_mode(device, budget, false, false)
+    }
+
+    /// veth ingress needs an FIB view even when its output still uses the
+    /// ordinary per-interface route projection.
+    pub(super) fn poll_napi_routed_ingress<D>(
+        &self,
+        device: &mut D,
+        budget: usize,
+    ) -> napi::NapiPollResult
+    where
+        D: smoltcp::phy::Device + ?Sized,
+    {
+        self.poll_napi_with_authoritative_mode(device, budget, false, true)
     }
 
     pub(super) fn poll_napi_with_authoritative_mode<D>(
@@ -619,6 +841,7 @@ impl IfaceCommon {
         device: &mut D,
         budget: usize,
         force_authoritative: bool,
+        route_ingress: bool,
     ) -> napi::NapiPollResult
     where
         D: smoltcp::phy::Device + ?Sized,
@@ -632,6 +855,28 @@ impl IfaceCommon {
             }
 
             let netns = self.net_namespace();
+            let nft_ruleset = netns.as_ref().map(|netns| netns.nftables().snapshot());
+            let nft_ruleset_changed = || {
+                netns
+                    .as_ref()
+                    .zip(nft_ruleset.as_ref())
+                    .is_some_and(|(netns, pinned)| {
+                        pinned.generation != netns.nftables().generation()
+                    })
+            };
+            let nft_device_names = match (netns.as_ref(), nft_ruleset.as_ref()) {
+                (Some(netns), Some(ruleset)) if ruleset.requires_iface_names() => {
+                    match crate::net::nftables::NftDeviceNames::snapshot(netns) {
+                        Ok(names) => names,
+                        Err(_) => return napi::NapiPollResult::new(0, true),
+                    }
+                }
+                _ => crate::net::nftables::NftDeviceNames::empty(),
+            };
+            let raw_listeners = netns
+                .as_ref()
+                .map(crate::net::socket::inet::raw::snapshot_raw_ingress_listeners)
+                .unwrap_or_default();
             let authoritative_output = force_authoritative
                 || netns
                     .as_ref()
@@ -639,20 +884,54 @@ impl IfaceCommon {
             let configured_output = netns
                 .as_ref()
                 .is_some_and(crate::net::neighbor::has_ethernet_entries);
+            let ipv6_forwarding = netns
+                .as_ref()
+                .is_some_and(|netns| netns.ipv6_forwarding_enabled());
+            let ct_active = netns
+                .as_ref()
+                .is_some_and(|netns| netns.conntrack().is_active());
+            let requires_nat_addresses = nft_ruleset.as_ref().is_some_and(|ruleset| {
+                [
+                    smoltcp::wire::IpVersion::Ipv4,
+                    smoltcp::wire::IpVersion::Ipv6,
+                ]
+                .into_iter()
+                .any(|version| {
+                    ruleset.requires_masquerade(
+                        version,
+                        crate::net::nftables::NftIpv4Hook::PostRouting,
+                    ) || ruleset
+                        .requires_redirect(version, crate::net::nftables::NftIpv4Hook::PreRouting)
+                })
+            });
             let needs_routed_poll = self.needs_namespace_routing()
                 || scope == IfacePollScope::LocalOnly
                 || authoritative_output
-                || configured_output;
+                || configured_output
+                || route_ingress
+                || ipv6_forwarding
+                || ct_active
+                || requires_nat_addresses
+                || nft_ruleset.as_ref().is_some_and(|ruleset| {
+                    ruleset.requires_route_lookup() || ruleset.has_output_hook()
+                });
             let router = if needs_routed_poll {
                 netns.as_ref().map(|netns| netns.router())
             } else {
                 None
             };
-            let route_policy = router.as_ref().and_then(|router| {
+            let mut route_policy = router.as_ref().and_then(|router| {
                 netns
                     .as_ref()
                     .map(|netns| crate::net::route::lock_output_routes(router, netns.device_list()))
             });
+            if requires_nat_addresses
+                && route_policy
+                    .as_mut()
+                    .is_none_or(|routes| routes.prepare_masquerade_addresses().is_err())
+            {
+                return napi::NapiPollResult::new(0, true);
+            }
             let routed_this_round = route_policy.is_some();
             let owner_is_up = scope == IfacePollScope::Full;
 
@@ -676,8 +955,9 @@ impl IfaceCommon {
                 needs_routed_poll,
                 authoritative_output,
                 configured_output,
+                ct_active,
             );
-            if restart != PollModeRecheck::Current {
+            if restart != PollModeRecheck::Current || nft_ruleset_changed() {
                 drop(configured_neighbors);
                 drop(interface);
                 drop(sockets);
@@ -687,128 +967,221 @@ impl IfaceCommon {
                 continue;
             }
             let backend_policy = route_policy.as_ref().map(|routes| OutputBackendPolicy {
+                netns: netns.as_deref().unwrap(),
                 routes,
+                ruleset: nft_ruleset.as_deref(),
+                device_names: &nft_device_names,
                 configured_neighbors: configured_neighbors.as_ref(),
                 owner_ifindex: self.iface_id as u32,
                 owner_is_up,
                 authoritative_output,
             });
 
-            let mut processed = 0usize;
-            let mut had_packet = false;
+            let mut ingress_work: Vec<RoutedIngressWork> = Vec::new();
+            let (processed, had_packet, ingress_budget, poll_again, deadline_rearm) = {
+                let ingress_stage = Cell::new(IngressStage::Pending);
+                let mark = Cell::new(0);
+                let packet_context = core::cell::RefCell::new(None);
+                let mut nft_filter = netns.as_ref().map(|netns| {
+                    NetIngressFilter::new(NetIngressFilterInit {
+                        ruleset: nft_ruleset.as_ref().unwrap(),
+                        netns,
+                        raw_listeners: &raw_listeners,
+                        owner_ifindex: self.iface_id as u32,
+                        device_names: &nft_device_names,
+                        stage: &ingress_stage,
+                        mark: &mark,
+                        packet_context: &packet_context,
+                        routes: (route_ingress || ipv6_forwarding || ct_active)
+                            .then_some(route_policy.as_ref())
+                            .flatten(),
+                        fib_routes: route_policy.as_ref(),
+                        work: &mut ingress_work,
+                    })
+                });
 
-            // Local output is packet work too: it performs route/neighbor
-            // classification and transmission rather than merely reaping TX
-            // completions. Reserve half the shared NAPI budget when it is already
-            // backlogged, then let either side consume unused capacity.
-            let ingress_budget = if self.local_input_queue.has_ready_output(timestamp) {
-                budget.div_ceil(2)
-            } else {
-                budget
-            };
+                let mut processed = 0usize;
+                let mut had_packet = false;
 
-            // Reserve at most half of the first pass for namespace-local handoff,
-            // then poll the hardware/device queue. If the device has no work, use
-            // the remaining budget for local input. This keeps both sources
-            // progressing without reducing throughput when only one is active.
-            let local_first_budget = if scope == IfacePollScope::Full {
-                ingress_budget.div_ceil(2)
-            } else {
-                ingress_budget
-            };
-            if routed_this_round {
-                let mut local_device = LocalInputDevice::new(device, self, backend_policy.unwrap());
-                for _ in 0..local_first_budget {
-                    match interface.poll_ingress_single(timestamp, &mut local_device, &mut sockets)
-                    {
-                        smoltcp::iface::PollIngressSingleResult::None => break,
-                        smoltcp::iface::PollIngressSingleResult::PacketProcessed
-                        | smoltcp::iface::PollIngressSingleResult::SocketStateChanged => {
-                            had_packet = true;
-                            processed += 1;
-                        }
-                    }
-                }
-            }
-
-            let device_budget = if scope == IfacePollScope::Full {
-                ingress_budget - processed
-            } else {
-                0
-            };
-            let mut device_processed = 0usize;
-            if routed_this_round {
-                let mut routed_device = RoutedTxDevice {
-                    device,
-                    queue: &self.local_input_queue,
-                    backend_policy: backend_policy.unwrap(),
+                // Local output is packet work too: it performs route/neighbor
+                // classification and transmission rather than merely reaping TX
+                // completions. Reserve half the shared NAPI budget when it is already
+                // backlogged, then let either side consume unused capacity.
+                let ingress_budget = if self.local_input_queue.has_ready_output(timestamp) {
+                    budget.div_ceil(2)
+                } else {
+                    budget
                 };
-                for _ in 0..device_budget {
-                    match interface.poll_ingress_single(timestamp, &mut routed_device, &mut sockets)
-                    {
-                        smoltcp::iface::PollIngressSingleResult::None => break,
-                        smoltcp::iface::PollIngressSingleResult::PacketProcessed
-                        | smoltcp::iface::PollIngressSingleResult::SocketStateChanged => {
-                            had_packet = true;
-                            processed += 1;
-                            device_processed += 1;
-                        }
-                    }
-                }
-            } else {
-                for _ in 0..device_budget {
-                    match interface.poll_ingress_single(timestamp, device, &mut sockets) {
-                        smoltcp::iface::PollIngressSingleResult::None => break,
-                        smoltcp::iface::PollIngressSingleResult::PacketProcessed
-                        | smoltcp::iface::PollIngressSingleResult::SocketStateChanged => {
-                            had_packet = true;
-                            processed += 1;
-                            device_processed += 1;
-                        }
-                    }
-                }
-            }
 
-            let remaining = device_budget - device_processed;
-            if routed_this_round && remaining > 0 && self.has_local_input() {
-                let mut local_device = LocalInputDevice::new(device, self, backend_policy.unwrap());
-                for _ in 0..remaining {
-                    match interface.poll_ingress_single(timestamp, &mut local_device, &mut sockets)
-                    {
-                        smoltcp::iface::PollIngressSingleResult::None => break,
-                        smoltcp::iface::PollIngressSingleResult::PacketProcessed
-                        | smoltcp::iface::PollIngressSingleResult::SocketStateChanged => {
-                            had_packet = true;
-                            processed += 1;
-                        }
-                    }
-                }
-            }
-
-            // 推进发送路径（smoltcp 保证 bounded work）。
-            if routed_this_round && owner_is_up {
-                let mut routed_device = RoutedTxDevice {
-                    device,
-                    queue: &self.local_input_queue,
-                    backend_policy: backend_policy.unwrap(),
+                // Reserve at most half of the first pass for namespace-local handoff,
+                // then poll the hardware/device queue. If the device has no work, use
+                // the remaining budget for local input. This keeps both sources
+                // progressing without reducing throughput when only one is active.
+                let local_first_budget = if scope == IfacePollScope::Full {
+                    ingress_budget.div_ceil(2)
+                } else {
+                    ingress_budget
                 };
-                let _ = interface.poll_egress(timestamp, &mut routed_device, &mut sockets);
-            } else if routed_this_round {
-                let mut local_device = LocalInputDevice::new(device, self, backend_policy.unwrap());
-                let _ = interface.poll_egress(timestamp, &mut local_device, &mut sockets);
-            } else {
-                let _ = interface.poll_egress(timestamp, device, &mut sockets);
-            }
+                if routed_this_round {
+                    let mut local_device = LocalInputDevice::new(
+                        device,
+                        self,
+                        backend_policy.unwrap(),
+                        nft_filter.as_ref().map(|_| &ingress_stage),
+                        nft_filter.as_ref().map(|_| &packet_context),
+                        nft_filter.as_ref().map(|_| &mark),
+                    );
+                    for _ in 0..local_first_budget {
+                        match poll_smol_single(
+                            &mut interface,
+                            timestamp,
+                            &mut local_device,
+                            &mut sockets,
+                            nft_filter
+                                .as_mut()
+                                .map(|filter| filter as &mut dyn IpIngressFilter),
+                        ) {
+                            smoltcp::iface::PollIngressSingleResult::None => break,
+                            smoltcp::iface::PollIngressSingleResult::PacketProcessed
+                            | smoltcp::iface::PollIngressSingleResult::SocketStateChanged => {
+                                had_packet = true;
+                                processed += 1;
+                            }
+                        }
+                    }
+                }
 
-            self.release_resolved_routed_outputs(
-                &mut interface,
-                timestamp,
-                configured_neighbors.as_ref(),
-            );
-            self.retain_namespace_routing_for_pending_fragments(&interface);
+                let device_budget = if scope == IfacePollScope::Full {
+                    ingress_budget - processed
+                } else {
+                    0
+                };
+                let mut device_processed = 0usize;
+                if routed_this_round {
+                    let mut routed_device = RoutedTxDevice {
+                        device,
+                        queue: &self.local_input_queue,
+                        backend_policy: backend_policy.unwrap(),
+                    };
+                    for _ in 0..device_budget {
+                        match poll_smol_single(
+                            &mut interface,
+                            timestamp,
+                            &mut routed_device,
+                            &mut sockets,
+                            nft_filter
+                                .as_mut()
+                                .map(|filter| filter as &mut dyn IpIngressFilter),
+                        ) {
+                            smoltcp::iface::PollIngressSingleResult::None => break,
+                            smoltcp::iface::PollIngressSingleResult::PacketProcessed
+                            | smoltcp::iface::PollIngressSingleResult::SocketStateChanged => {
+                                had_packet = true;
+                                processed += 1;
+                                device_processed += 1;
+                            }
+                        }
+                    }
+                } else {
+                    for _ in 0..device_budget {
+                        match poll_smol_single(
+                            &mut interface,
+                            timestamp,
+                            device,
+                            &mut sockets,
+                            nft_filter
+                                .as_mut()
+                                .map(|filter| filter as &mut dyn IpIngressFilter),
+                        ) {
+                            smoltcp::iface::PollIngressSingleResult::None => break,
+                            smoltcp::iface::PollIngressSingleResult::PacketProcessed
+                            | smoltcp::iface::PollIngressSingleResult::SocketStateChanged => {
+                                had_packet = true;
+                                processed += 1;
+                                device_processed += 1;
+                            }
+                        }
+                    }
+                }
 
-            let poll_at = interface.poll_at(timestamp, &sockets);
-            let (poll_again, deadline_rearm) = self.publish_poll_deadline(timestamp, poll_at);
+                let remaining = device_budget - device_processed;
+                if routed_this_round && remaining > 0 && self.has_local_input() {
+                    let mut local_device = LocalInputDevice::new(
+                        device,
+                        self,
+                        backend_policy.unwrap(),
+                        nft_filter.as_ref().map(|_| &ingress_stage),
+                        nft_filter.as_ref().map(|_| &packet_context),
+                        nft_filter.as_ref().map(|_| &mark),
+                    );
+                    for _ in 0..remaining {
+                        match poll_smol_single(
+                            &mut interface,
+                            timestamp,
+                            &mut local_device,
+                            &mut sockets,
+                            nft_filter
+                                .as_mut()
+                                .map(|filter| filter as &mut dyn IpIngressFilter),
+                        ) {
+                            smoltcp::iface::PollIngressSingleResult::None => break,
+                            smoltcp::iface::PollIngressSingleResult::PacketProcessed
+                            | smoltcp::iface::PollIngressSingleResult::SocketStateChanged => {
+                                had_packet = true;
+                                processed += 1;
+                            }
+                        }
+                    }
+                }
+
+                // 推进发送路径（smoltcp 保证 bounded work）。
+                // A newly committed rule may need different FIB, device-name,
+                // or MASQUERADE snapshots. Resume with a fresh poll view.
+                if !nft_ruleset_changed() {
+                    if routed_this_round && owner_is_up {
+                        let mut routed_device = RoutedTxDevice {
+                            device,
+                            queue: &self.local_input_queue,
+                            backend_policy: backend_policy.unwrap(),
+                        };
+                        let _ = interface.poll_egress(timestamp, &mut routed_device, &mut sockets);
+                    } else if routed_this_round {
+                        let mut local_device = LocalInputDevice::new(
+                            device,
+                            self,
+                            backend_policy.unwrap(),
+                            None,
+                            None,
+                            None,
+                        );
+                        let _ = interface.poll_egress(timestamp, &mut local_device, &mut sockets);
+                    } else {
+                        let mut guarded_device = NftGenerationDevice {
+                            device,
+                            netns: netns.as_deref(),
+                            ruleset: nft_ruleset.as_deref(),
+                        };
+                        let _ = interface.poll_egress(timestamp, &mut guarded_device, &mut sockets);
+                    }
+                }
+
+                self.release_resolved_routed_outputs(
+                    &mut interface,
+                    timestamp,
+                    configured_neighbors.as_ref(),
+                );
+                self.retain_namespace_routing_for_pending_fragments(&interface);
+
+                let poll_at = interface.poll_at(timestamp, &sockets);
+                let (poll_again, deadline_rearm) = self.publish_poll_deadline(timestamp, poll_at);
+                (
+                    processed,
+                    had_packet,
+                    ingress_budget,
+                    poll_again,
+                    deadline_rearm,
+                )
+            };
 
             // 解锁后唤醒/通知 socket（沿用原 poll() 的 Linux-like 语义）。
             // Preserve the same smoltcp -> neighbor lock order as the direct poll
@@ -818,6 +1191,9 @@ impl IfaceCommon {
             drop(sockets);
             drop(route_policy);
             drop(router);
+            for work in ingress_work.drain(..) {
+                work.execute();
+            }
             let output_drain = self.drain_local_outputs(device, budget - processed);
             self.clear_namespace_routing_if_idle();
             self.notify_deadline_rearm(deadline_rearm);
@@ -837,7 +1213,8 @@ impl IfaceCommon {
                 (had_packet && processed == ingress_budget)
                     || poll_again
                     || self.has_local_input()
-                    || output_drain.needs_immediate_poll(),
+                    || output_drain.needs_immediate_poll()
+                    || nft_ruleset_changed(),
             );
         }
     }
@@ -891,7 +1268,7 @@ impl IfaceCommon {
             // Admission belongs to the actual egress interface. Atomically
             // join an existing neighbor bucket before attempting transmit so
             // neither same-owner nor cross-owner output can bypass it.
-            if deferred_probe.is_none() {
+            if deferred_probe.is_none() && output.prepared_ip.is_none() {
                 if let LocalOutputDisposition::Routed { oif, .. } = output.disposition {
                     if oif == self.iface_id as u32 {
                         match in_flight.commit_existing_deferred(output) {
@@ -966,6 +1343,11 @@ impl IfaceCommon {
                 device,
                 output,
             ) {
+                LocalOutputTransmitResult::Continue(output) => {
+                    debug_assert!(output.prepared_ip.is_some());
+                    in_flight.requeue_ready(output);
+                    continue;
+                }
                 LocalOutputTransmitResult::Sent(output) => {
                     self.reset_local_output_tx_backoff();
                     if let Some(key) = deferred_probe {
@@ -1014,6 +1396,16 @@ impl IfaceCommon {
                     else {
                         unreachable!("only routed output performs neighbor discovery");
                     };
+                    if packet.prepared_ip.is_some() {
+                        // An admitted complete datagram keeps its source-owner
+                        // capacity even when OUTPUT changed the egress. A
+                        // target-queue admission may now fail and would lose
+                        // a packet that the sender has already accepted.
+                        debug_assert!(deferred_probe.is_none());
+                        in_flight.requeue_backpressured(packet, retry_at);
+                        self.defer_local_output_retry_at(retry_at);
+                        continue;
+                    }
                     if let Some(key) = deferred_probe {
                         debug_assert_eq!(oif, self.iface_id as u32);
                         match in_flight.finish_deferred_probe(packet, key, retry_at, probe_sent) {

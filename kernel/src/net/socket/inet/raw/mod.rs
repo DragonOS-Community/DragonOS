@@ -42,6 +42,7 @@ pub use constants::{SOCK_MIN_RCVBUF, SOCK_MIN_SNDBUF, SYSCTL_RMEM_MAX, SYSCTL_WM
 pub use options::{Icmp6Filter, IcmpFilter, RawSocketOptions};
 
 pub(crate) use loopback::deliver_udp_loopback_packet;
+pub(crate) use loopback::{snapshot_raw_ingress_listeners, RawIngressListener, RawIngressWork};
 
 /// InetRawSocket - AF_INET/AF_INET6 SOCK_RAW 实现
 ///
@@ -72,6 +73,8 @@ pub struct RawSocket {
     netns: Arc<NetNamespace>,
     /// SO_BINDTODEVICE authoritative interface index.
     device_binding: SocketDeviceBinding,
+    /// Bytes of complete IPv4 datagrams retained by the output owner.
+    send_account: Arc<super::common::output_account::SocketOutputAccount<Self>>,
     /// epoll 项
     epoll_items: EPollItems,
     /// fasync 项
@@ -90,6 +93,9 @@ pub struct RawSocket {
     ip_multicast_addr: AtomicU32,
     /// IP_ADD_MEMBERSHIP/IP_DROP_MEMBERSHIP state (best-effort, no actual IGMP)
     ip_multicast_groups: Mutex<Vec<crate::net::socket::inet::common::Ipv4MulticastMembership>>,
+    ip_multicast_ttl: AtomicI32,
+    ip_multicast_loop: AtomicBool,
+    so_broadcast: AtomicBool,
 
     /// SO_SNDTIMEO (microseconds). u64::MAX means "no timeout".
     send_timeout_us: AtomicU64,

@@ -53,30 +53,41 @@ impl RawSocket {
         &self,
         buf: &mut [u8],
     ) -> Result<(usize, smoltcp::wire::IpAddress), SystemError> {
+        self.try_recv_with_ifindex(buf)
+            .map(|(size, source, _)| (size, source))
+    }
+
+    fn try_recv_with_ifindex(
+        &self,
+        buf: &mut [u8],
+    ) -> Result<(usize, smoltcp::wire::IpAddress, u32), SystemError> {
         // 先消费回环注入队列（保留原始头字段，并实现 SO_RCVBUF 语义）。
         if let Some(pkt) = {
             let mut q = self.loopback_rx.lock();
             let pkt = q.pkts.pop_front();
             if let Some(ref p) = pkt {
-                q.bytes = q.bytes.saturating_sub(loopback_rx_mem_cost(p.len()));
+                q.bytes = q.bytes.saturating_sub(loopback_rx_mem_cost(p.bytes.len()));
             }
             pkt
         } {
-            let len = pkt.len().min(buf.len());
-            buf[..len].copy_from_slice(&pkt[..len]);
+            let len = pkt.bytes.len().min(buf.len());
+            buf[..len].copy_from_slice(&pkt.bytes[..len]);
             let src_addr = match self.ip_version {
                 IpVersion::Ipv4 => {
-                    if pkt.len() >= 20 {
+                    if pkt.bytes.len() >= 20 {
                         IpAddress::Ipv4(smoltcp::wire::Ipv4Address::new(
-                            pkt[12], pkt[13], pkt[14], pkt[15],
+                            pkt.bytes[12],
+                            pkt.bytes[13],
+                            pkt.bytes[14],
+                            pkt.bytes[15],
                         ))
                     } else {
                         IpAddress::Ipv4(smoltcp::wire::Ipv4Address::UNSPECIFIED)
                     }
                 }
                 IpVersion::Ipv6 => {
-                    if pkt.len() >= 40 {
-                        let b: [u8; 16] = pkt[8..24].try_into().unwrap_or([0; 16]);
+                    if pkt.bytes.len() >= 40 {
+                        let b: [u8; 16] = pkt.bytes[8..24].try_into().unwrap_or([0; 16]);
                         IpAddress::Ipv6(smoltcp::wire::Ipv6Address::new(
                             u16::from_be_bytes([b[0], b[1]]),
                             u16::from_be_bytes([b[2], b[3]]),
@@ -92,7 +103,7 @@ impl RawSocket {
                     }
                 }
             };
-            return Ok((len, src_addr));
+            return Ok((len, src_addr, pkt.ingress_ifindex));
         }
 
         let inner_guard = self.inner.read();
@@ -172,18 +183,26 @@ impl RawSocket {
                             }
                         }
                     }
-                    // 触发 poll
-                    bound.inner().iface().poll();
-                    return Ok((*size, *src_addr));
+                    // Poll snapshots raw listeners and may read this socket's
+                    // inner state. Release the inner lock before re-entering
+                    // the interface, as on the send path.
+                    let iface = bound.inner().iface().clone();
+                    let ingress_ifindex = iface.nic_id() as u32;
+                    drop(inner_guard);
+                    iface.poll();
+                    return Ok((*size, *src_addr, ingress_ifindex));
                 }
-                result
+                result.map(|(size, source)| (size, source, bound.inner().iface().nic_id() as u32))
             }
             Some(RawInner::Wildcard(bound)) => {
                 let result = bound.try_recv(buf, self.ip_version);
+                let ingress_ifindex = bound.inner().iface().nic_id() as u32;
                 if let Ok((_size, _src_addr)) = &result {
-                    bound.inner().iface().poll();
+                    let iface = bound.inner().iface().clone();
+                    drop(inner_guard);
+                    iface.poll();
                 }
-                result
+                result.map(|(size, source)| (size, source, ingress_ifindex))
             }
             Some(RawInner::Unbound(_)) => Err(SystemError::ENOTCONN),
         }
@@ -277,6 +296,7 @@ impl RawSocket {
         packet: &[u8],
         recv_size: usize,
         options: &RawSocketOptions,
+        ingress_ifindex: u32,
     ) -> Result<(), SystemError> {
         if recv_size < IPV4_MIN_HEADER_LEN {
             return Ok(());
@@ -288,19 +308,8 @@ impl RawSocket {
 
         // IP_PKTINFO -> in_pktinfo
         if options.recv_pktinfo_v4 {
-            let ifindex = self
-                .inner
-                .read()
-                .as_ref()
-                .and_then(|inner| match inner {
-                    RawInner::Bound(b) | RawInner::Wildcard(b) => {
-                        Some(b.inner().iface().nic_id() as i32)
-                    }
-                    _ => None,
-                })
-                .unwrap_or(0);
             let pktinfo = InPktInfo {
-                ipi_ifindex: ifindex,
+                ipi_ifindex: ingress_ifindex as i32,
                 ipi_spec_dst: dst.to_be(),
                 ipi_addr: dst.to_be(),
             };
@@ -347,6 +356,7 @@ impl RawSocket {
         packet: &[u8],
         recv_size: usize,
         options: &RawSocketOptions,
+        ingress_ifindex: u32,
     ) -> Result<(), SystemError> {
         if recv_size < IPV6_HEADER_LEN {
             return Ok(());
@@ -358,20 +368,9 @@ impl RawSocket {
 
         // IPV6_RECVPKTINFO -> in6_pktinfo
         if options.recv_pktinfo_v6 {
-            let ifindex = self
-                .inner
-                .read()
-                .as_ref()
-                .and_then(|inner| match inner {
-                    RawInner::Bound(b) | RawInner::Wildcard(b) => {
-                        Some(b.inner().iface().nic_id() as u32)
-                    }
-                    _ => None,
-                })
-                .unwrap_or(0);
             let mut pktinfo = In6PktInfo::default();
             pktinfo.ipi6_addr.copy_from_slice(dst);
-            pktinfo.ipi6_ifindex = ifindex;
+            pktinfo.ipi6_ifindex = ingress_ifindex;
             let bytes = unsafe {
                 core::slice::from_raw_parts(
                     (&pktinfo as *const In6PktInfo) as *const u8,
@@ -422,6 +421,7 @@ impl RawSocket {
         msg: &mut crate::net::posix::MsgHdr,
         packet: &[u8],
         recv_size: usize,
+        ingress_ifindex: u32,
     ) -> Result<usize, SystemError> {
         let mut write_off = 0usize;
         let mut cmsg_buf = CmsgBuffer {
@@ -439,6 +439,7 @@ impl RawSocket {
                 packet,
                 recv_size,
                 &options,
+                ingress_ifindex,
             )?,
             IpVersion::Ipv6 => self.build_ipv6_cmsgs(
                 &mut cmsg_buf,
@@ -446,6 +447,7 @@ impl RawSocket {
                 packet,
                 recv_size,
                 &options,
+                ingress_ifindex,
             )?,
         }
 
@@ -470,11 +472,11 @@ impl RawSocket {
 
         let nonblock = self.is_nonblock() || flags.contains(crate::net::socket::PMSG::DONTWAIT);
 
-        let (recv_size, src_addr) = if nonblock {
-            self.try_recv(&mut tmp)
+        let (recv_size, src_addr, ingress_ifindex) = if nonblock {
+            self.try_recv_with_ifindex(&mut tmp)
         } else {
             loop {
-                match self.try_recv(&mut tmp) {
+                match self.try_recv_with_ifindex(&mut tmp) {
                     Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
                         self.wait_queue.wait_event_io_interruptible_timeout(
                             || self.can_recv(),
@@ -506,7 +508,7 @@ impl RawSocket {
         self.fill_peer_addr(msg, src_addr)?;
 
         // 构建控制消息
-        msg.msg_controllen = self.build_recv_cmsgs(msg, &tmp, recv_size)?;
+        msg.msg_controllen = self.build_recv_cmsgs(msg, &tmp, recv_size, ingress_ifindex)?;
 
         Ok(user_recv_size)
     }

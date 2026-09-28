@@ -13,6 +13,7 @@ use smoltcp::wire::IpRepr;
 
 use crate::driver::net::tcp_output::{new_transport_interface, TcpOutputQueue};
 use crate::libs::{mutex::Mutex, rwlock::RwLock, spinlock::SpinLock};
+use crate::net::nftables::{NftDeviceNames, RulesetSnapshot};
 use crate::net::socket::inet::{common::port::TcpBindDomain, InetSocket};
 use crate::net::tcp_close_defer::{DeferredTcpCloseRequest, TcpCloseDefer};
 use crate::net::tcp_listener::TcpListenerRegistry;
@@ -23,6 +24,17 @@ const POLL_BUDGET: usize = 64;
 const MAX_INPUT_PACKETS: usize = 256;
 const MAX_INPUT_BYTES: usize = 1024 * 1024;
 const NO_DEADLINE: u64 = u64::MAX;
+
+fn snapshot_required_device_names(
+    namespace: &NetNamespace,
+    ruleset: &RulesetSnapshot,
+) -> Result<NftDeviceNames, system_error::SystemError> {
+    if ruleset.requires_iface_names() {
+        NftDeviceNames::snapshot(namespace)
+    } else {
+        Ok(NftDeviceNames::empty())
+    }
+}
 
 #[derive(Debug)]
 struct InputPacket {
@@ -162,8 +174,25 @@ impl TcpStack {
             return false;
         };
         self.pending.store(false, Ordering::Release);
+        // One immutable policy/name view per bounded TCP poll. Snapshot names
+        // before FIB or protocol locks, and never substitute empty names if
+        // allocation fails while a rule requires them.
+        let ruleset = namespace.nftables().snapshot();
+        let device_names = snapshot_required_device_names(&namespace, &ruleset);
+        let mut snapshot_failed = device_names.is_err();
+        let needs_masquerade_addresses = [
+            smoltcp::wire::IpVersion::Ipv4,
+            smoltcp::wire::IpVersion::Ipv6,
+        ]
+        .into_iter()
+        .any(|version| {
+            ruleset.requires_masquerade(version, crate::net::nftables::NftIpv4Hook::PostRouting)
+        });
         let mut input_blocked = false;
         for _ in 0..POLL_BUDGET {
+            let Ok(device_names) = device_names.as_ref() else {
+                break;
+            };
             let packet = {
                 let mut input = self.input.lock();
                 let Some(packet) = input.packets.pop_front() else {
@@ -186,11 +215,23 @@ impl TcpStack {
                 }
             }
             let router = namespace.router();
-            let routes = crate::net::route::lock_output_routes(&router, namespace.device_list());
+            let mut routes =
+                crate::net::route::lock_output_routes(&router, namespace.device_list());
+            if needs_masquerade_addresses && routes.prepare_masquerade_addresses().is_err() {
+                drop(routes);
+                let mut input = self.input.lock();
+                input.in_flight -= 1;
+                input.packets.push_front(packet);
+                input_blocked = true;
+                snapshot_failed = true;
+                break;
+            }
             let mut sockets = self.sockets.lock();
             let mut context = self.context.lock();
             let now: smoltcp::time::Instant = crate::time::Instant::now().into();
-            let mut device = self.output.device(&routes);
+            let mut device = self
+                .output
+                .device(&namespace, &routes, &ruleset, device_names);
             if !context.process_tcp_ingress(
                 now,
                 &mut device,
@@ -209,43 +250,67 @@ impl TcpStack {
             input.in_flight -= 1;
             input.bytes -= packet.segment.capacity();
         }
-        let router = namespace.router();
-        let routes = crate::net::route::lock_output_routes(&router, namespace.device_list());
-        let mut sockets = self.sockets.lock();
-        let mut context = self.context.lock();
-        let now: smoltcp::time::Instant = crate::time::Instant::now().into();
-        let mut device = self.output.device(&routes);
-        context.poll_egress(now, &mut device, &mut sockets);
-        let close_deadline = self.close_defer.reap_closed(now, &mut sockets);
-        let mut poll_at = match (context.poll_at(now, &sockets), close_deadline) {
-            (Some(protocol), Some(close)) => Some(core::cmp::min(protocol, close)),
-            (protocol, close) => protocol.or(close),
+        let mut poll_at = match &device_names {
+            Ok(device_names) => {
+                let router = namespace.router();
+                let mut routes =
+                    crate::net::route::lock_output_routes(&router, namespace.device_list());
+                if needs_masquerade_addresses && routes.prepare_masquerade_addresses().is_err() {
+                    snapshot_failed = true;
+                    None
+                } else {
+                    let mut sockets = self.sockets.lock();
+                    let mut context = self.context.lock();
+                    let now: smoltcp::time::Instant = crate::time::Instant::now().into();
+                    let mut device =
+                        self.output
+                            .device(&namespace, &routes, &ruleset, device_names);
+                    context.poll_egress(now, &mut device, &mut sockets);
+                    let close_deadline = self.close_defer.reap_closed(now, &mut sockets);
+                    match (context.poll_at(now, &sockets), close_deadline) {
+                        (Some(protocol), Some(close)) => Some(core::cmp::min(protocol, close)),
+                        (protocol, close) => protocol.or(close),
+                    }
+                }
+            }
+            Err(_) => None,
         };
+        // A changed OUTPUT/POST ruleset may have stopped egress (or refused
+        // the token for an immediate ACK) before advancing socket state.
+        // All FIB and smoltcp guards above have been released; restart once
+        // with a fresh policy/name/MASQUERADE view instead of waiting for an
+        // unrelated TCP timer or another incoming segment.
+        let policy_changed = ruleset.generation != namespace.nftables().generation();
         // Output queue exhaustion is relieved by this round's drain. If no
         // output was admitted, allocation pressure needs a bounded retry, not
         // a busy loop over an unchanged input packet.
-        if input_blocked {
-            poll_at = Some(now + smoltcp::time::Duration::from_millis(1));
+        if input_blocked || snapshot_failed {
+            let retry_now: smoltcp::time::Instant = crate::time::Instant::now().into();
+            let retry_at = retry_now + smoltcp::time::Duration::from_millis(1);
+            poll_at = Some(poll_at.map_or(retry_at, |at| at.min(retry_at)));
         }
-        let immediate = !input_blocked
-            && (poll_at.is_some_and(|at| at <= now) || !self.input.lock().packets.is_empty());
+        let now: smoltcp::time::Instant = crate::time::Instant::now().into();
+        let mut immediate = policy_changed
+            || !input_blocked
+                && !snapshot_failed
+                && (poll_at.is_some_and(|at| at <= now) || !self.input.lock().packets.is_empty());
+        let output = self.output.drain(&namespace, POLL_BUDGET);
+        immediate |= output.immediate;
+        if let Some(retry_at) = output.retry_at {
+            poll_at = Some(poll_at.map_or(retry_at, |at| at.min(retry_at)));
+        }
         let deadline = poll_at.map_or(NO_DEADLINE, |at| at.total_micros().max(0) as u64);
         let previous_deadline = self.deadline.swap(deadline, Ordering::AcqRel);
-        drop(context);
-        drop(sockets);
-        drop(routes);
-        drop(router);
-        let output_pending = self.output.drain(&namespace, POLL_BUDGET);
         // Notification may flush a socket's TCP cork and call poll() again.
         // The protocol pass is complete, so release serialization first.
         drop(poll_guard);
         self.notify_all_bound_sockets();
-        if immediate || output_pending {
+        if immediate {
             self.request_poll();
         } else if previous_deadline != deadline {
             namespace.notify_deadline_changed();
         }
-        immediate || output_pending || self.pending.load(Ordering::Acquire)
+        immediate || self.pending.load(Ordering::Acquire)
     }
 }
 

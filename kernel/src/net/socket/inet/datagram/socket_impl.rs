@@ -185,8 +185,10 @@ impl Socket for UdpSocket {
                     Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
                         let timeout = deadline
                             .map(|d| d.duration_since(Instant::now()).unwrap_or(Duration::ZERO));
-                        self.wait_queue
-                            .wait_event_io_interruptible_timeout(|| self.can_send(), timeout)?;
+                        self.wait_queue.wait_event_io_interruptible_timeout(
+                            || self.can_send_to(None, buffer.len()),
+                            timeout,
+                        )?;
                     }
                     Err(e) => return Err(e),
                 }
@@ -223,8 +225,10 @@ impl Socket for UdpSocket {
                     Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
                         let timeout = deadline
                             .map(|d| d.duration_since(Instant::now()).unwrap_or(Duration::ZERO));
-                        self.wait_queue
-                            .wait_event_io_interruptible_timeout(|| self.can_send(), timeout)?;
+                        self.wait_queue.wait_event_io_interruptible_timeout(
+                            || self.can_send_to(Some(remote), buffer.len()),
+                            timeout,
+                        )?;
                     }
                     Err(e) => return Err(e),
                 }
@@ -708,7 +712,9 @@ impl Socket for UdpSocket {
         let queued_data = !self.receive_queue.is_empty();
         match self.inner.read().as_ref() {
             Some(UdpInner::Unbound(_)) => {
-                event.insert(EP::EPOLLOUT | EP::EPOLLWRNORM | EP::EPOLLWRBAND);
+                if self.send_account.is_writable() {
+                    event.insert(EP::EPOLLOUT | EP::EPOLLWRNORM | EP::EPOLLWRBAND);
+                }
                 if queued_data {
                     event.insert(EP::EPOLLIN | EP::EPOLLRDNORM);
                 }
@@ -716,12 +722,25 @@ impl Socket for UdpSocket {
             Some(UdpInner::Bound(bound)) => {
                 let (can_recv, can_send) =
                     bound.with_socket(|socket| (socket.can_recv(), socket.can_send()));
+                let remote = bound.remote_endpoint().ok();
+                let connected_native_ipv6 = self.ip_version == IpVersion::Ipv6
+                    && remote.is_some_and(uses_prepared_ipv6_output);
 
                 if can_recv || queued_data {
                     event.insert(EP::EPOLLIN | EP::EPOLLRDNORM);
                 }
 
-                if can_send {
+                let writable = if self.ip_version == IpVersion::Ipv4 || connected_native_ipv6 {
+                    self.send_account.is_writable()
+                } else if remote.is_none() {
+                    // An unconnected socket can choose the prepared IPv6
+                    // path on its next sendto(). Do not report writable just
+                    // because the unrelated legacy queue has spare space.
+                    self.send_account.is_writable()
+                } else {
+                    can_send
+                };
+                if writable {
                     event.insert(EP::EPOLLOUT | EP::EPOLLWRNORM | EP::EPOLLWRBAND);
                 }
             }
@@ -738,11 +757,23 @@ impl Socket for UdpSocket {
     }
 
     fn send_bytes_available(&self) -> Result<usize, SystemError> {
+        if self.ip_version == IpVersion::Ipv4 {
+            return Ok(self.send_account.available());
+        }
         Ok(match self.inner.read().as_ref() {
             Some(UdpInner::Bound(bound)) => {
-                bound.with_socket(|socket| socket.payload_send_capacity() - socket.send_queue())
+                if bound
+                    .remote_endpoint()
+                    .ok()
+                    .is_some_and(uses_prepared_ipv6_output)
+                {
+                    self.send_account.available()
+                } else {
+                    bound.with_socket(|socket| socket.payload_send_capacity() - socket.send_queue())
+                }
             }
-            _ => 0,
+            Some(UdpInner::Unbound(_)) => self.send_account.available(),
+            None => 0,
         })
     }
 }

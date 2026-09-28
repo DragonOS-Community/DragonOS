@@ -1,6 +1,6 @@
 use alloc::vec::Vec;
 
-use smoltcp::wire::IpAddress;
+use smoltcp::wire::{IpAddress, Ipv4Address};
 use system_error::SystemError;
 
 use super::{
@@ -583,6 +583,24 @@ impl FibTable {
         self.lookup_builtin_rules(destination, |table| {
             FibLookupKey::output(destination, table)
         })
+    }
+
+    /// Linux inet_addr_type() queries only the IPv4 local table, independent
+    /// of an output route through main/default. The special address classes
+    /// are determined before looking up that table.
+    pub(super) fn ipv4_addr_type(&self, address: Ipv4Address) -> u8 {
+        let octets = address.octets();
+        if octets == [0, 0, 0, 0] || octets == [255, 255, 255, 255] {
+            return super::RTN_BROADCAST;
+        }
+        if address.is_multicast() {
+            return super::RTN_MULTICAST;
+        }
+        self.lookup_key(FibLookupKey::output(
+            IpAddress::Ipv4(address),
+            RT_TABLE_LOCAL,
+        ))
+        .map_or(super::RTN_UNICAST, |route| route.matched.kind)
     }
 
     pub(super) fn lookup_on_iface(

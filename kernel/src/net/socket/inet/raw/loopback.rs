@@ -30,8 +30,16 @@ const SKB_OVERHEAD: usize = 576;
 
 #[derive(Debug, Default)]
 pub(super) struct LoopbackRxQueue {
-    pub(super) pkts: VecDeque<Vec<u8>>,
+    pub(super) pkts: VecDeque<RawRxPacket>,
     pub(super) bytes: usize,
+}
+
+/// The ingress interface is packet metadata, not a property of the raw
+/// socket's attached smoltcp interface (which can be lo for a wildcard bind).
+#[derive(Debug)]
+pub(super) struct RawRxPacket {
+    pub(super) bytes: Vec<u8>,
+    pub(super) ingress_ifindex: u32,
 }
 
 lazy_static! {
@@ -61,28 +69,81 @@ pub(super) fn unregister_raw_socket(sock: &Arc<RawSocket>) {
     }
 }
 
+/// Listener state captured before entering an interface's smoltcp locks.
+/// Matching an ingress packet must not acquire `RawSocket::inner`: bind and
+/// send paths can hold that lock while waiting for the interface lock.
+pub(crate) struct RawIngressListener {
+    socket: Arc<RawSocket>,
+    local_addr: Option<IpAddress>,
+    remote_addr: Option<IpAddress>,
+    bound_ifindex: usize,
+}
+
+impl RawIngressListener {
+    pub(crate) fn matches(
+        &self,
+        version: IpVersion,
+        protocol: IpProtocol,
+        source: IpAddress,
+        destination: IpAddress,
+        ingress_ifindex: u32,
+    ) -> bool {
+        self.socket.ip_version == version
+            && self.socket.protocol == protocol
+            && self.local_addr.is_none_or(|addr| addr == destination)
+            && self.remote_addr.is_none_or(|addr| addr == source)
+            && (self.bound_ifindex == 0 || self.bound_ifindex == ingress_ifindex as usize)
+    }
+
+    pub(crate) fn socket(&self) -> Arc<RawSocket> {
+        self.socket.clone()
+    }
+}
+
+pub(crate) fn snapshot_raw_ingress_listeners(netns: &Arc<NetNamespace>) -> Vec<RawIngressListener> {
+    let sockets = raw_sockets_in_netns(netns);
+    let mut listeners = Vec::new();
+    if listeners.try_reserve_exact(sockets.len()).is_err() {
+        return listeners;
+    }
+    for socket in sockets {
+        let (local_addr, remote_addr) = match socket.inner.read().as_ref() {
+            Some(RawInner::Bound(bound) | RawInner::Wildcard(bound)) => {
+                (bound.local_addr(), bound.remote_addr())
+            }
+            _ => (None, None),
+        };
+        let bound_ifindex = socket.device_binding.ifindex();
+        listeners.push(RawIngressListener {
+            socket,
+            local_addr,
+            remote_addr,
+            bound_ifindex,
+        });
+    }
+    listeners
+}
+
 fn raw_sockets_in_netns(netns: &Arc<NetNamespace>) -> Vec<Arc<RawSocket>> {
     let netns_id = netns.ns_common().nsid.data();
 
-    // 直接使用写锁，避免读-写锁升级的竞态
-    let mut reg = RAW_SOCKET_REGISTRY.write();
-    let entry = match reg.get_mut(&netns_id) {
+    // Polling is a read-mostly hot path. Dead weak references are removed by
+    // registration/unregistration rather than upgrading a global write lock
+    // on every interface poll.
+    let reg = RAW_SOCKET_REGISTRY.read();
+    let entry = match reg.get(&netns_id) {
         Some(v) => v,
         None => return Vec::new(),
     };
 
     let mut result = Vec::new();
-    entry.retain(|w| {
+    if result.try_reserve_exact(entry.len()).is_err() {
+        return result;
+    }
+    for w in entry {
         if let Some(s) = w.upgrade() {
             result.push(s);
-            true
-        } else {
-            false
         }
-    });
-
-    if entry.is_empty() {
-        reg.remove(&netns_id);
     }
 
     result
@@ -114,7 +175,11 @@ pub(super) struct LoopbackDeliverContext<'a> {
 /// 3. SO_BINDTODEVICE (loopback 视为 "lo")
 /// 4. bind(2) 目的地址过滤
 /// 5. IPV6_CHECKSUM 接收校验
-fn should_deliver_to_socket(s: &RawSocket, ctx: &LoopbackDeliverContext) -> bool {
+fn should_deliver_to_socket(
+    s: &RawSocket,
+    ctx: &LoopbackDeliverContext,
+    ingress_ifindex: u32,
+) -> bool {
     // 1. IP 版本和协议号必须匹配
     if s.ip_version != ctx.ip_version || s.protocol != ctx.protocol {
         return false;
@@ -143,22 +208,26 @@ fn should_deliver_to_socket(s: &RawSocket, ctx: &LoopbackDeliverContext) -> bool
         }
     }
 
-    // 4. SO_BINDTODEVICE：loopback 快速路径视为来自当前 netns 的 lo
-    if let Some(lo) = s.netns.loopback_iface() {
-        if !s.device_binding.allows(lo.nic_id()) {
-            return false;
-        }
-    } else if s.device_binding.ifindex() != 0 {
+    // 4. SO_BINDTODEVICE uses the trusted ingress device, not the raw
+    // socket's attached smoltcp interface.
+    if !s.device_binding.allows(ingress_ifindex as usize) {
         return false;
     }
 
     // 5. bind(2) 目的地址过滤
-    let local = match s.inner.read().as_ref() {
-        Some(RawInner::Bound(b) | RawInner::Wildcard(b)) => b.local_addr(),
-        _ => None,
+    let (local, remote) = match s.inner.read().as_ref() {
+        Some(RawInner::Bound(b) | RawInner::Wildcard(b)) => (b.local_addr(), b.remote_addr()),
+        _ => (None, None),
     };
     if let Some(local) = local {
         if local != ctx.dest {
+            return false;
+        }
+    }
+    if let Some(remote) = remote {
+        if crate::net::socket::utils::extract_src_addr_from_ip_header(ctx.packet, ctx.ip_version)
+            != Ok(remote)
+        {
             return false;
         }
     }
@@ -192,15 +261,36 @@ fn should_deliver_to_socket(s: &RawSocket, ctx: &LoopbackDeliverContext) -> bool
 /// 向同一 netns 下所有匹配的 raw socket 投递 loopback 数据包
 pub(super) fn deliver_loopback_packet(ctx: &LoopbackDeliverContext) {
     let sockets = raw_sockets_in_netns(ctx.netns);
+    let ingress_ifindex = ctx
+        .netns
+        .loopback_iface()
+        .map(|lo| lo.nic_id() as u32)
+        .unwrap_or(0);
+    deliver_raw_to_sockets(ctx, ingress_ifindex, &sockets);
+
+    // Linux 语义：本机收到 ICMP/ICMPv6 Echo Request 时自动回复 Echo Reply
+    handle_loopback_echo_request(ctx);
+}
+
+fn deliver_raw_to_sockets(
+    ctx: &LoopbackDeliverContext,
+    ingress_ifindex: u32,
+    sockets: &[Arc<RawSocket>],
+) {
     let pkt_cost = loopback_rx_mem_cost(ctx.packet.len());
 
     for s in sockets.iter() {
-        if !should_deliver_to_socket(s, ctx) {
+        if !should_deliver_to_socket(s, ctx, ingress_ifindex) {
             continue;
         }
 
         // SO_RCVBUF：投递/丢弃语义
         let rcvbuf = s.options.read().sock_rcvbuf as usize;
+        let mut packet = Vec::new();
+        if packet.try_reserve_exact(ctx.packet.len()).is_err() {
+            continue;
+        }
+        packet.extend_from_slice(ctx.packet);
         let enqueued = {
             let mut q = s.loopback_rx.lock();
             let can_enqueue = if q.bytes == 0 {
@@ -209,11 +299,16 @@ pub(super) fn deliver_loopback_packet(ctx: &LoopbackDeliverContext) {
             } else {
                 q.bytes.saturating_add(pkt_cost) <= rcvbuf
             };
-            if can_enqueue {
+            if can_enqueue && q.pkts.try_reserve(1).is_ok() {
+                q.pkts.push_back(RawRxPacket {
+                    bytes: packet,
+                    ingress_ifindex,
+                });
                 q.bytes = q.bytes.saturating_add(pkt_cost);
-                q.pkts.push_back(ctx.packet.to_vec());
+                true
+            } else {
+                false
             }
-            can_enqueue
         };
 
         if enqueued {
@@ -221,9 +316,31 @@ pub(super) fn deliver_loopback_packet(ctx: &LoopbackDeliverContext) {
             let _ = s.wait_queue.wakeup(Some(ProcessState::Blocked(true)));
         }
     }
+}
 
-    // Linux 语义：本机收到 ICMP/ICMPv6 Echo Request 时自动回复 Echo Reply
-    handle_loopback_echo_request(ctx);
+/// Delivery work leaves the receive callback with owned bytes and matching
+/// socket references. It is executed after smoltcp and routing locks drop.
+pub(crate) struct RawIngressWork {
+    pub(crate) sockets: Vec<Arc<RawSocket>>,
+    pub(crate) packet: Vec<u8>,
+    pub(crate) source: IpAddress,
+    pub(crate) destination: IpAddress,
+    pub(crate) protocol: IpProtocol,
+    pub(crate) ingress_ifindex: u32,
+    pub(crate) netns: Arc<NetNamespace>,
+}
+
+impl RawIngressWork {
+    pub(crate) fn execute(self) {
+        let ctx = LoopbackDeliverContext {
+            packet: &self.packet,
+            dest: self.destination,
+            ip_version: self.source.version(),
+            protocol: self.protocol,
+            netns: &self.netns,
+        };
+        deliver_raw_to_sockets(&ctx, self.ingress_ifindex, &self.sockets);
+    }
 }
 
 /// Echo Reply 构建参数

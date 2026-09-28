@@ -3,27 +3,27 @@ use crate::{
     net::socket::netlink::{
         addr::{multicast::GroupIdSet, NetlinkSocketAddr},
         receiver::MessageQueue,
-        table::BoundHandle,
+        table::{BoundHandle, SupportedNetlinkProtocol},
     },
     process::{cred::Cred, namespace::net_namespace::NetNamespace},
 };
-use alloc::fmt::Debug;
 use alloc::sync::Arc;
 use system_error::SystemError;
 
 #[derive(Debug)]
-pub struct BoundNetlink<Message: 'static + Debug> {
-    pub(in crate::net::socket::netlink) handle: BoundHandle<Message>,
+pub struct BoundNetlink<P: SupportedNetlinkProtocol> {
+    pub(in crate::net::socket::netlink) handle: BoundHandle<P::Message>,
     pub(in crate::net::socket::netlink) remote_addr: NetlinkSocketAddr,
-    pub(in crate::net::socket::netlink) receive_queue: MessageQueue<Message>,
+    pub(in crate::net::socket::netlink) receive_queue: MessageQueue<P::Message>,
+    pub(in crate::net::socket::netlink) protocol_state: P::SocketState,
     pub(in crate::net::socket::netlink) netns: Arc<NetNamespace>,
     pub(in crate::net::socket::netlink) opener_cred: Arc<Cred>,
 }
 
-impl<Message: 'static + Debug> BoundNetlink<Message> {
+impl<P: SupportedNetlinkProtocol> BoundNetlink<P> {
     pub(super) fn new(
-        handle: BoundHandle<Message>,
-        message_queue: MessageQueue<Message>,
+        handle: BoundHandle<P::Message>,
+        message_queue: MessageQueue<P::Message>,
         netns: Arc<NetNamespace>,
         opener_cred: Arc<Cred>,
     ) -> Self {
@@ -31,6 +31,7 @@ impl<Message: 'static + Debug> BoundNetlink<Message> {
             handle,
             remote_addr: NetlinkSocketAddr::new_unspecified(),
             receive_queue: message_queue,
+            protocol_state: P::SocketState::default(),
             netns,
             opener_cred,
         }

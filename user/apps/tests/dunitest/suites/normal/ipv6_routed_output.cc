@@ -79,6 +79,10 @@ class Ipv6RoutedOutput : public testing::Test {
     in6_addr source_{}, egress_address_{}, peer_{};
     std::array<unsigned char, 6> peer_mac_{}, egress_mac_{};
     bool source_added_ = false, egress_added_ = false, neighbor_added_ = false;
+    bool wrong_linklocal_added_ = false, right_linklocal_added_ = false;
+    in6_addr wrong_linklocal_{}, right_linklocal_{};
+    bool ingress_test_neighbor_ = false, owner_test_neighbor_ = false;
+    in6_addr ingress_test_target_{}, owner_test_target_{};
     bool dynamic_neighbor_ = false, source_neighbor_ = false;
     int original_mtu_ = 0;
     unsigned int solicitations_ = 0;
@@ -107,20 +111,22 @@ class Ipv6RoutedOutput : public testing::Test {
             }
         }
     }
-    int Address(unsigned int index, const in6_addr& address, bool add) {
+    int Address(unsigned int index, const in6_addr& address, bool add,
+                uint8_t scope = RT_SCOPE_UNIVERSE) {
         Request request(add ? RTM_NEWADDR : RTM_DELADDR, sizeof(ifaddrmsg),
                         add ? NLM_F_CREATE | NLM_F_EXCL : 0);
         auto* msg = reinterpret_cast<ifaddrmsg*>(NLMSG_DATA(&request.header));
         msg->ifa_family = AF_INET6; msg->ifa_prefixlen = 64;
         msg->ifa_flags = IFA_F_NODAD; msg->ifa_index = index;
+        msg->ifa_scope = scope;
         request.Attribute(IFA_ADDRESS, &address, sizeof(address));
         return Submit(request);
     }
-    int Neighbor(bool add, const in6_addr* target = nullptr) {
+    int Neighbor(bool add, const in6_addr* target = nullptr, unsigned int index = 0) {
         Request request(add ? RTM_NEWNEIGH : RTM_DELNEIGH, sizeof(ndmsg),
                         add ? NLM_F_CREATE | NLM_F_EXCL : 0);
         auto* msg = reinterpret_cast<ndmsg*>(NLMSG_DATA(&request.header));
-        msg->ndm_family = AF_INET6; msg->ndm_ifindex = egress_;
+        msg->ndm_family = AF_INET6; msg->ndm_ifindex = index ? index : egress_;
         msg->ndm_state = NUD_PERMANENT; msg->ndm_type = RTN_UNICAST;
         request.Attribute(NDA_DST, target ? target : &peer_, sizeof(peer_));
         if (add) request.Attribute(NDA_LLADDR, peer_mac_.data(), peer_mac_.size());
@@ -165,6 +171,14 @@ class Ipv6RoutedOutput : public testing::Test {
     }
     void TearDown() override {
         client_.reset(-1);
+        if (owner_test_neighbor_) {
+            int result = Neighbor(false, &owner_test_target_, owner_);
+            EXPECT_TRUE(result == 0 || errno == ENOENT) << strerror(errno);
+        }
+        if (ingress_test_neighbor_) {
+            int result = Neighbor(false, &ingress_test_target_);
+            EXPECT_TRUE(result == 0 || errno == ENOENT) << strerror(errno);
+        }
         if (neighbor_added_) { EXPECT_EQ(Neighbor(false), 0) << strerror(errno); }
         if (dynamic_neighbor_) {
             int result = Neighbor(false);
@@ -173,6 +187,14 @@ class Ipv6RoutedOutput : public testing::Test {
         if (source_neighbor_) {
             int result = Neighbor(false, &source_);
             EXPECT_TRUE(result == 0 || errno == ENOENT) << strerror(errno);
+        }
+        if (right_linklocal_added_) {
+            EXPECT_EQ(Address(egress_, right_linklocal_, false, RT_SCOPE_LINK), 0)
+                << strerror(errno);
+        }
+        if (wrong_linklocal_added_) {
+            EXPECT_EQ(Address(owner_, wrong_linklocal_, false, RT_SCOPE_LINK), 0)
+                << strerror(errno);
         }
         if (original_mtu_) { EXPECT_EQ(SetMtu(original_mtu_), 0) << strerror(errno); }
         if (egress_added_) { EXPECT_EQ(Address(egress_, egress_address_, false), 0) << strerror(errno); }
@@ -201,6 +223,27 @@ class Ipv6RoutedOutput : public testing::Test {
         icmp[24] = type == 136 ? 2 : 1; icmp[25] = 1;
         memcpy(icmp + 26, peer_mac_.data(), 6);
         Put16(icmp + 2, Checksum(ip, icmp, 32, IPPROTO_ICMPV6));
+        SendFrame(frame);
+    }
+    void SendUdpFrame(const in6_addr& source, const in6_addr& destination,
+                      uint16_t destination_port) {
+        std::vector<unsigned char> frame(14 + 40 + 8 + 1);
+        memcpy(frame.data(), egress_mac_.data(), 6);
+        memcpy(frame.data() + 6, peer_mac_.data(), 6);
+        Put16(frame.data() + 12, ETH_P_IPV6);
+        auto* ip = frame.data() + 14;
+        ip[0] = 0x60;
+        Put16(ip + 4, 9);
+        ip[6] = IPPROTO_UDP;
+        ip[7] = 64;
+        memcpy(ip + 8, &source, 16);
+        memcpy(ip + 24, &destination, 16);
+        auto* udp = ip + 40;
+        Put16(udp, 19037);
+        Put16(udp + 2, destination_port);
+        Put16(udp + 4, 9);
+        udp[8] = 0x35;
+        Put16(udp + 6, Checksum(ip, udp, 9, IPPROTO_UDP));
         SendFrame(frame);
     }
     void Segment(uint8_t flags, uint32_t sequence, uint32_t ack,
@@ -335,6 +378,34 @@ TEST_F(Ipv6RoutedOutput, BoundDeviceUsesEgressAndReceivesOnOwner) {
     ASSERT_NO_FATAL_FAILURE(Connect(true));
     ASSERT_NO_FATAL_FAILURE(Transfer(256, original_mtu_));
 }
+TEST_F(Ipv6RoutedOutput, LocalUdpToNonLoopbackAddressUsesScopedInputDevice) {
+    Fd receiver(socket(AF_INET6, SOCK_DGRAM, 0));
+    Fd sender(socket(AF_INET6, SOCK_DGRAM, 0));
+    ASSERT_GE(receiver.get(), 0);
+    ASSERT_GE(sender.get(), 0);
+    const char owner_name[] = "veth1";
+    ASSERT_EQ(setsockopt(receiver.get(), SOL_SOCKET, SO_BINDTODEVICE,
+                         owner_name, sizeof(owner_name)), 0) << strerror(errno);
+
+    sockaddr_in6 destination{};
+    destination.sin6_family = AF_INET6;
+    destination.sin6_addr = source_;
+    ASSERT_EQ(bind(receiver.get(), reinterpret_cast<sockaddr*>(&destination),
+                   sizeof(destination)), 0) << strerror(errno);
+    socklen_t length = sizeof(destination);
+    ASSERT_EQ(getsockname(receiver.get(), reinterpret_cast<sockaddr*>(&destination), &length), 0);
+
+    constexpr char payload[] = "ipv6-scoped-local";
+    ASSERT_EQ(sendto(sender.get(), payload, sizeof(payload), 0,
+                     reinterpret_cast<sockaddr*>(&destination), length),
+              static_cast<ssize_t>(sizeof(payload))) << strerror(errno);
+    pollfd event{receiver.get(), POLLIN, 0};
+    ASSERT_EQ(poll(&event, 1, 1000), 1) << strerror(errno);
+    char received[sizeof(payload)]{};
+    ASSERT_EQ(recv(receiver.get(), received, sizeof(received), 0),
+              static_cast<ssize_t>(sizeof(payload))) << strerror(errno);
+    EXPECT_EQ(memcmp(received, payload, sizeof(payload)), 0);
+}
 TEST_F(Ipv6RoutedOutput, LargeTcpTransferUsesSmallerEgressMtu) {
     ASSERT_EQ(SetMtu(1280), 0) << strerror(errno);
     ASSERT_NO_FATAL_FAILURE(Connect(true));
@@ -382,6 +453,66 @@ TEST_F(Ipv6RoutedOutput, UdpMtuSizedPayloadUsesPhysicalEgress) {
     }
     FAIL() << "MTU-sized UDP datagram did not arrive physically from veth2";
 }
+TEST_F(Ipv6RoutedOutput, OversizeUdpIsSourceFragmentedAfterOneSend) {
+    ASSERT_EQ(SetMtu(1280), 0) << strerror(errno);
+    client_.reset(socket(AF_INET6, SOCK_DGRAM, 0));
+    ASSERT_GE(client_.get(), 0);
+    sockaddr_in6 local{}; local.sin6_family = AF_INET6; local.sin6_addr = source_;
+    ASSERT_EQ(bind(client_.get(), reinterpret_cast<sockaddr*>(&local), sizeof(local)), 0);
+    const char device[] = "veth2";
+    ASSERT_EQ(setsockopt(client_.get(), SOL_SOCKET, SO_BINDTODEVICE, device, sizeof(device)), 0);
+    sockaddr_in6 remote{}; remote.sin6_family = AF_INET6;
+    remote.sin6_addr = peer_; remote.sin6_port = htons(kPeerPort);
+    std::vector<unsigned char> payload(2000);
+    for (size_t i = 0; i < payload.size(); ++i) payload[i] = (i * 17 + 9) % 251;
+    ASSERT_EQ(sendto(client_.get(), payload.data(), payload.size(), 0,
+                     reinterpret_cast<sockaddr*>(&remote), sizeof(remote)),
+              static_cast<ssize_t>(payload.size())) << strerror(errno);
+
+    std::vector<unsigned char> reassembled(payload.size() + 8);
+    std::vector<bool> received(reassembled.size(), false);
+    uint32_t fragment_id = 0;
+    bool have_id = false, saw_last = false;
+    size_t filled = 0;
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(4);
+    while (filled < reassembled.size() && std::chrono::steady_clock::now() < deadline) {
+        pollfd event{packet_.get(), POLLIN, 0};
+        ASSERT_GE(poll(&event, 1, 50), 0);
+        unsigned char frame[2048]; sockaddr_ll link{}; socklen_t size = sizeof(link);
+        ssize_t n = recvfrom(packet_.get(), frame, sizeof(frame), 0,
+                             reinterpret_cast<sockaddr*>(&link), &size);
+        if (n < 62 || Get16(frame + 12) != ETH_P_IPV6) continue;
+        const auto* ip = frame + 14;
+        if (ip[6] != IPPROTO_FRAGMENT || memcmp(ip + 8, &source_, 16) ||
+            memcmp(ip + 24, &peer_, 16) || ip[40] != IPPROTO_UDP) continue;
+        ASSERT_EQ(link.sll_pkttype, PACKET_HOST);
+        ASSERT_LE(n - 14, 1280);
+        ASSERT_GE(Get16(ip + 4), 8);
+        const size_t frag_len = Get16(ip + 4) - 8;
+        const uint16_t flags = Get16(ip + 42);
+        const size_t offset = size_t(flags >> 3) * 8;
+        ASSERT_EQ(n, static_cast<ssize_t>(14 + 40 + 8 + frag_len));
+        ASSERT_LE(offset + frag_len, reassembled.size());
+        if (flags & 1) EXPECT_EQ(frag_len % 8, 0u);
+        else saw_last = true;
+        if (!have_id) { fragment_id = Get32(ip + 44); have_id = true; }
+        EXPECT_EQ(Get32(ip + 44), fragment_id);
+        for (size_t i = 0; i < frag_len; ++i) {
+            if (!received[offset + i]) ++filled;
+            received[offset + i] = true;
+            reassembled[offset + i] = ip[48 + i];
+        }
+    }
+    ASSERT_TRUE(have_id && saw_last);
+    ASSERT_EQ(filled, reassembled.size());
+    EXPECT_EQ(Get16(reassembled.data() + 2), kPeerPort);
+    EXPECT_EQ(Get16(reassembled.data() + 4), reassembled.size());
+    EXPECT_EQ(memcmp(reassembled.data() + 8, payload.data(), payload.size()), 0);
+    unsigned char pseudo_ip[40]{};
+    memcpy(pseudo_ip + 8, &source_, 16);
+    memcpy(pseudo_ip + 24, &peer_, 16);
+    EXPECT_EQ(Checksum(pseudo_ip, reassembled.data(), reassembled.size(), IPPROTO_UDP), 0);
+}
 TEST_F(Ipv6RoutedOutput, MissingBoundDeviceRouteDoesNotConsumeSocket) {
     client_.reset(socket(AF_INET6, SOCK_STREAM | SOCK_NONBLOCK, 0));
     ASSERT_GE(client_.get(), 0);
@@ -421,6 +552,183 @@ TEST_F(Ipv6RoutedOutput, GlobalSourceNeighborAdvertisementStaysOnIngressInterfac
         return;
     }
     FAIL() << "NDP response was not emitted back through physical ingress veth2";
+}
+TEST_F(Ipv6RoutedOutput, CrossInterfaceNeighborAdvertisementCannotPoisonOwnerCache) {
+    // A unicast NA addressed to veth1 arrives on veth2. It may resolve a
+    // pending neighbor on that ingress link, but must not poison veth1.
+    in6_addr ingress_target{};
+    ASSERT_EQ(inet_pton(AF_INET6, "fd10:92::98", &ingress_target), 1);
+    ingress_test_target_ = ingress_target;
+    int result = Neighbor(false, &ingress_test_target_);
+    ASSERT_TRUE(result == 0 || errno == ENOENT) << strerror(errno);
+    ingress_test_neighbor_ = true;
+    Fd ingress_sender(socket(AF_INET6, SOCK_DGRAM, 0));
+    ASSERT_GE(ingress_sender.get(), 0);
+    sockaddr_in6 ingress_local{};
+    ingress_local.sin6_family = AF_INET6;
+    ingress_local.sin6_addr = egress_address_;
+    ASSERT_EQ(bind(ingress_sender.get(), reinterpret_cast<sockaddr*>(&ingress_local),
+                   sizeof(ingress_local)), 0);
+    sockaddr_in6 ingress_remote{};
+    ingress_remote.sin6_family = AF_INET6;
+    ingress_remote.sin6_addr = ingress_target;
+    ingress_remote.sin6_port = htons(19036);
+    const uint8_t probe = 0x35;
+    ASSERT_EQ(1, sendto(ingress_sender.get(), &probe, 1, 0,
+                        reinterpret_cast<sockaddr*>(&ingress_remote),
+                        sizeof(ingress_remote))) << strerror(errno);
+    bool saw_pending_solicit = false;
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(4);
+    while (std::chrono::steady_clock::now() < deadline) {
+        pollfd ready{packet_.get(), POLLIN, 0};
+        ASSERT_GE(poll(&ready, 1, 50), 0);
+        std::array<unsigned char, 2048> frame{};
+        sockaddr_ll link{};
+        socklen_t link_size = sizeof(link);
+        const ssize_t count = recvfrom(packet_.get(), frame.data(), frame.size(), 0,
+                                       reinterpret_cast<sockaddr*>(&link), &link_size);
+        if (count < 14 + 40 + 24 || Get16(frame.data() + 12) != ETH_P_IPV6 ||
+            link.sll_pkttype == PACKET_OUTGOING) continue;
+        const auto* ip = frame.data() + 14;
+        if (ip[6] == IPPROTO_ICMPV6 && ip[40] == 135 &&
+            !memcmp(ip + 48, &ingress_target, sizeof(ingress_target))) {
+            saw_pending_solicit = true;
+            break;
+        }
+    }
+    ASSERT_TRUE(saw_pending_solicit) << "veth2 must first have an unresolved neighbor";
+    Ndisc(136, ingress_target, source_, ingress_target);
+    bool saw_ingress_udp = false;
+    deadline = std::chrono::steady_clock::now() + std::chrono::seconds(4);
+    while (std::chrono::steady_clock::now() < deadline) {
+        pollfd ready{packet_.get(), POLLIN, 0};
+        ASSERT_GE(poll(&ready, 1, 50), 0);
+        std::array<unsigned char, 2048> frame{};
+        sockaddr_ll link{};
+        socklen_t link_size = sizeof(link);
+        const ssize_t count = recvfrom(packet_.get(), frame.data(), frame.size(), 0,
+                                       reinterpret_cast<sockaddr*>(&link), &link_size);
+        if (count < 14 + 40 + 8 || Get16(frame.data() + 12) != ETH_P_IPV6 ||
+            link.sll_pkttype == PACKET_OUTGOING) continue;
+        const auto* ip = frame.data() + 14;
+        if (ip[6] == IPPROTO_UDP &&
+            !memcmp(ip + 24, &ingress_target, sizeof(ingress_target))) {
+            saw_ingress_udp = true;
+            break;
+        }
+    }
+    ASSERT_TRUE(saw_ingress_udp) << "NA must resolve veth2's pending neighbor";
+
+    in6_addr target{};
+    ASSERT_EQ(inet_pton(AF_INET6, "fd10:91::99", &target), 1);
+    owner_test_target_ = target;
+    result = Neighbor(false, &owner_test_target_, owner_);
+    ASSERT_TRUE(result == 0 || errno == ENOENT) << strerror(errno);
+    owner_test_neighbor_ = true;
+    Fd observer(socket(AF_PACKET, SOCK_RAW | SOCK_NONBLOCK, htons(ETH_P_IPV6)));
+    ASSERT_GE(observer.get(), 0);
+    sockaddr_ll bind_address{};
+    bind_address.sll_family = AF_PACKET;
+    bind_address.sll_protocol = htons(ETH_P_IPV6);
+    bind_address.sll_ifindex = static_cast<int>(egress_);
+    ASSERT_EQ(bind(observer.get(), reinterpret_cast<sockaddr*>(&bind_address),
+                   sizeof(bind_address)), 0);
+
+    Ndisc(136, target, source_, target);
+
+    Fd sender(socket(AF_INET6, SOCK_DGRAM, 0));
+    ASSERT_GE(sender.get(), 0);
+    sockaddr_in6 local{};
+    local.sin6_family = AF_INET6;
+    local.sin6_addr = source_;
+    ASSERT_EQ(bind(sender.get(), reinterpret_cast<sockaddr*>(&local), sizeof(local)), 0);
+    sockaddr_in6 remote{};
+    remote.sin6_family = AF_INET6;
+    remote.sin6_addr = target;
+    remote.sin6_port = htons(19035);
+    ASSERT_EQ(1, sendto(sender.get(), &probe, 1, 0,
+                        reinterpret_cast<sockaddr*>(&remote), sizeof(remote))) << strerror(errno);
+
+    deadline = std::chrono::steady_clock::now() + std::chrono::seconds(4);
+    while (std::chrono::steady_clock::now() < deadline) {
+        pollfd ready{observer.get(), POLLIN, 0};
+        ASSERT_GE(poll(&ready, 1, 50), 0);
+        std::array<unsigned char, 2048> frame{};
+        sockaddr_ll link{};
+        socklen_t link_size = sizeof(link);
+        const ssize_t count = recvfrom(observer.get(), frame.data(), frame.size(), 0,
+                                       reinterpret_cast<sockaddr*>(&link), &link_size);
+        if (count < 14 + 40 + 24 || Get16(frame.data() + 12) != ETH_P_IPV6 ||
+            link.sll_pkttype == PACKET_OUTGOING) continue;
+        const auto* ip = frame.data() + 14;
+        if (ip[6] == IPPROTO_ICMPV6 && ip[40] == 135 &&
+            !memcmp(ip + 48, &target, sizeof(target))) {
+            EXPECT_EQ(ip[7], 255);
+            return;
+        }
+        if (ip[6] == IPPROTO_UDP && !memcmp(ip + 24, &target, sizeof(target))) {
+            FAIL() << "veth1 transmitted directly after an NA received only on veth2";
+            return;
+        }
+    }
+    FAIL() << "veth1 did not solicit the still-unknown neighbor";
+}
+TEST_F(Ipv6RoutedOutput, LinkLocalUdpDeliveryFollowsIngressScope) {
+    ASSERT_EQ(inet_pton(AF_INET6, "fe80::35:1", &wrong_linklocal_), 1);
+    ASSERT_EQ(inet_pton(AF_INET6, "fe80::35:2", &right_linklocal_), 1);
+    ASSERT_EQ(Address(owner_, wrong_linklocal_, true, RT_SCOPE_LINK), 0)
+        << strerror(errno);
+    wrong_linklocal_added_ = true;
+    ASSERT_EQ(Address(egress_, right_linklocal_, true, RT_SCOPE_LINK), 0)
+        << strerror(errno);
+    right_linklocal_added_ = true;
+    Fd wrong(socket(AF_INET6, SOCK_DGRAM | SOCK_NONBLOCK, 0));
+    Fd right(socket(AF_INET6, SOCK_DGRAM | SOCK_NONBLOCK, 0));
+    ASSERT_GE(wrong.get(), 0);
+    ASSERT_GE(right.get(), 0);
+    sockaddr_in6 bind_address{};
+    bind_address.sin6_family = AF_INET6;
+    bind_address.sin6_port = htons(19038);
+    bind_address.sin6_addr = wrong_linklocal_;
+    bind_address.sin6_scope_id = owner_;
+    ASSERT_EQ(bind(wrong.get(), reinterpret_cast<sockaddr*>(&bind_address),
+                   sizeof(bind_address)), 0) << strerror(errno);
+    bind_address.sin6_addr = right_linklocal_;
+    bind_address.sin6_scope_id = egress_;
+    ASSERT_EQ(bind(right.get(), reinterpret_cast<sockaddr*>(&bind_address),
+                   sizeof(bind_address)), 0) << strerror(errno);
+    in6_addr synthetic_source{};
+    ASSERT_EQ(inet_pton(AF_INET6, "fe80::35:3", &synthetic_source), 1);
+    SendUdpFrame(synthetic_source, wrong_linklocal_, 19038);
+    pollfd wrong_ready{wrong.get(), POLLIN, 0};
+    pollfd right_ready{right.get(), POLLIN, 0};
+    EXPECT_EQ(0, poll(&wrong_ready, 1, 150))
+        << "wrong-interface link-local UDP must not reach veth1's socket";
+    EXPECT_EQ(0, poll(&right_ready, 1, 0));
+    SendUdpFrame(synthetic_source, right_linklocal_, 19038);
+    EXPECT_EQ(1, poll(&right_ready, 1, 1000));
+    unsigned char received = 0;
+    EXPECT_EQ(1, recv(right.get(), &received, sizeof(received), 0));
+    EXPECT_EQ(0x35, received);
+}
+TEST_F(Ipv6RoutedOutput, LinkLocalUdpWildcardRejectsCrossInterfaceLocalAddress) {
+    ASSERT_EQ(inet_pton(AF_INET6, "fe80::35:1", &wrong_linklocal_), 1);
+    ASSERT_EQ(Address(owner_, wrong_linklocal_, true, RT_SCOPE_LINK), 0)
+        << strerror(errno);
+    wrong_linklocal_added_ = true;
+    Fd receiver(socket(AF_INET6, SOCK_DGRAM | SOCK_NONBLOCK, 0));
+    ASSERT_GE(receiver.get(), 0);
+    sockaddr_in6 local{};
+    local.sin6_family = AF_INET6;
+    local.sin6_port = htons(19039);
+    ASSERT_EQ(bind(receiver.get(), reinterpret_cast<sockaddr*>(&local), sizeof(local)), 0)
+        << strerror(errno);
+    in6_addr synthetic_source{};
+    ASSERT_EQ(inet_pton(AF_INET6, "fe80::35:3", &synthetic_source), 1);
+    SendUdpFrame(synthetic_source, wrong_linklocal_, 19039);
+    pollfd ready{receiver.get(), POLLIN, 0};
+    EXPECT_EQ(poll(&ready, 1, 150), 0)
+        << "link-local local address belongs to a different ingress link";
 }
 }  // namespace
 

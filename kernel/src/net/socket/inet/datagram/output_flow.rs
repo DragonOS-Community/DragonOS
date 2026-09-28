@@ -3,7 +3,10 @@ use alloc::sync::Arc;
 use smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint};
 use system_error::SystemError;
 
-use crate::{net::route::Ipv4OutputFlow, process::namespace::net_namespace::NetNamespace};
+use crate::{
+    net::route::{Ipv4OutputFlow, ResolvedIpv4Route},
+    process::namespace::net_namespace::NetNamespace,
+};
 
 use super::{EphemeralBindTarget, UdpSocket};
 
@@ -92,6 +95,20 @@ pub(super) fn resolve_ipv4_send_flow(
     let fixed_source = bound_source_constraint(netns, local).or(fixed_source);
     crate::net::route::resolve_ipv4_output_flow(netns, destination, required_oif, fixed_source)
         .map(Some)
+}
+
+/// Resolve the source address and the immutable output decision together for
+/// a complete IPv4 datagram. The existing flow-only API remains for connect
+/// and bind; a sender must not perform a second FIB lookup after OUTPUT.
+pub(super) fn resolve_ipv4_send_route(
+    netns: &Arc<NetNamespace>,
+    local: IpListenEndpoint,
+    destination: IpAddress,
+    required_oif: Option<u32>,
+    fixed_source: Option<IpAddress>,
+) -> Result<ResolvedIpv4Route, SystemError> {
+    let fixed_source = bound_source_constraint(netns, local).or(fixed_source);
+    crate::net::route::resolve_ipv4_route(netns, destination, required_oif, fixed_source)
 }
 
 pub(super) fn local_source_endpoint(

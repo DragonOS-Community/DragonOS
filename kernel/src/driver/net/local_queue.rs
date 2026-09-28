@@ -1,17 +1,121 @@
 pub(super) use super::deferred_queue::DeferredRouteKey;
 use super::deferred_queue::{DeferredRouteLimits, DeferredRouteQueue, JoinDeferredResult};
 use super::*;
+use crate::net::conntrack::CtPacketContext;
+use core::cell::RefCell;
 
-pub(super) struct LocalInputRxToken {
-    pub(super) frame: Vec<u8>,
-    pub(super) meta: PacketMeta,
+/// Optional accounting owner for a queued output datagram. The networking
+/// queue knows only that bytes were charged, not which socket/account owns
+/// them. Dropping the last packet or an uncommitted reservation releases the
+/// charge exactly once.
+pub(crate) trait OutputCompletion: Send + Sync {
+    fn output_complete(&self, charged_bytes: usize);
 }
 
-impl RxToken for LocalInputRxToken {
+pub(crate) struct OutputCharge {
+    owner: Arc<dyn OutputCompletion>,
+    charged_bytes: usize,
+}
+
+impl OutputCharge {
+    pub(crate) fn new(owner: Arc<dyn OutputCompletion>, charged_bytes: usize) -> Self {
+        Self {
+            owner,
+            charged_bytes,
+        }
+    }
+}
+
+impl fmt::Debug for OutputCharge {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OutputCharge")
+            .field("charged_bytes", &self.charged_bytes)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for OutputCharge {
+    fn drop(&mut self) {
+        self.owner.output_complete(self.charged_bytes);
+    }
+}
+
+#[cfg(test)]
+mod charge_tests {
+    use super::*;
+
+    struct Counter(AtomicUsize);
+
+    impl OutputCompletion for Counter {
+        fn output_complete(&self, charged_bytes: usize) {
+            self.0.fetch_add(charged_bytes, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn moving_a_charge_releases_it_only_once() {
+        let owner = Arc::new(Counter(AtomicUsize::new(0)));
+        let first = OutputCharge::new(owner.clone(), 42);
+        let moved = Some(first);
+        assert_eq!(owner.0.load(Ordering::Relaxed), 0);
+        drop(moved);
+        assert_eq!(owner.0.load(Ordering::Relaxed), 42);
+    }
+}
+
+pub(super) struct LocalInputRxToken<'a> {
+    pub(super) frame: Vec<u8>,
+    pub(super) meta: PacketMeta,
+    pub(super) ingress_stage: IngressStage,
+    pub(super) stage_cell: Option<&'a Cell<IngressStage>>,
+    pub(super) ct_context: Option<CtPacketContext>,
+    pub(super) ct_context_cell: Option<&'a RefCell<Option<CtPacketContext>>>,
+    pub(super) mark: u32,
+    pub(super) mark_cell: Option<&'a Cell<u32>>,
+}
+
+struct IngressStageScope<'a> {
+    cell: &'a Cell<IngressStage>,
+    previous: IngressStage,
+}
+
+impl Drop for IngressStageScope<'_> {
+    fn drop(&mut self) {
+        self.cell.set(self.previous);
+    }
+}
+
+struct CtContextScope<'a> {
+    cell: &'a RefCell<Option<CtPacketContext>>,
+}
+
+impl Drop for CtContextScope<'_> {
+    fn drop(&mut self) {
+        // smoltcp does not nest receive-token consumption. A context left by
+        // this packet must never become the next packet's identity.
+        self.cell.borrow_mut().take();
+    }
+}
+
+impl RxToken for LocalInputRxToken<'_> {
     fn consume<R, F>(self, f: F) -> R
     where
         F: FnOnce(&[u8]) -> R,
     {
+        let _ct_scope = self.ct_context_cell.map(|cell| {
+            // Discard any context left by an earlier physical token before
+            // installing this handoff's state. No prior packet is resumed.
+            cell.replace(self.ct_context);
+            CtContextScope { cell }
+        });
+        let _stage_scope = self.stage_cell.map(|cell| IngressStageScope {
+            cell,
+            previous: cell.replace(self.ingress_stage),
+        });
+        let _mark_scope = self.mark_cell.map(|cell| MarkScope {
+            cell,
+            previous: cell.replace(self.mark),
+        });
         f(&self.frame)
     }
 
@@ -20,12 +124,90 @@ impl RxToken for LocalInputRxToken {
     }
 }
 
+struct MarkScope<'a> {
+    cell: &'a Cell<u32>,
+    previous: u32,
+}
+
+impl Drop for MarkScope<'_> {
+    fn drop(&mut self) {
+        self.cell.set(self.previous);
+    }
+}
+
+#[cfg(test)]
+mod local_input_context_tests {
+    use super::*;
+
+    #[test]
+    fn prerouted_token_owns_context_only_during_consume() {
+        let stage = Cell::new(IngressStage::Pending);
+        let context = RefCell::new(Some(CtPacketContext::Invalid));
+        LocalInputRxToken {
+            frame: Vec::new(),
+            meta: PacketMeta::default(),
+            ingress_stage: IngressStage::PreRoutingDone,
+            stage_cell: Some(&stage),
+            ct_context: Some(CtPacketContext::Untracked),
+            ct_context_cell: Some(&context),
+            mark: 0,
+            mark_cell: None,
+        }
+        .consume(|_| {
+            assert_eq!(stage.get(), IngressStage::PreRoutingDone);
+            assert!(matches!(
+                context.borrow().as_ref(),
+                Some(CtPacketContext::Untracked)
+            ));
+        });
+        assert_eq!(stage.get(), IngressStage::Pending);
+        assert!(context.borrow().is_none());
+    }
+
+    #[test]
+    fn token_without_context_does_not_restore_previous_packet() {
+        let context = RefCell::new(Some(CtPacketContext::Invalid));
+        LocalInputRxToken {
+            frame: Vec::new(),
+            meta: PacketMeta::default(),
+            ingress_stage: IngressStage::LocalOutput,
+            stage_cell: None,
+            ct_context: None,
+            ct_context_cell: Some(&context),
+            mark: 0,
+            mark_cell: None,
+        }
+        .consume(|_| assert!(context.borrow().is_none()));
+        assert!(context.borrow().is_none());
+    }
+
+    #[test]
+    fn local_token_installs_mark_only_during_consume() {
+        let mark = Cell::new(0);
+        LocalInputRxToken {
+            frame: Vec::new(),
+            meta: PacketMeta::default(),
+            ingress_stage: IngressStage::LocalOutput,
+            stage_cell: None,
+            ct_context: None,
+            ct_context_cell: None,
+            mark: 0x1234_5678,
+            mark_cell: Some(&mark),
+        }
+        .consume(|_| assert_eq!(mark.get(), 0x1234_5678));
+        assert_eq!(mark.get(), 0);
+    }
+}
+
 #[derive(Debug)]
 pub(super) struct LocalInputPacket {
     pub(super) ingress_ifindex: u32,
+    pub(super) ingress_stage: IngressStage,
     pub(super) destination_mac: smoltcp::wire::EthernetAddress,
     pub(super) source_mac: smoltcp::wire::EthernetAddress,
     pub(super) ip_packet: Vec<u8>,
+    pub(super) ct_context: Option<CtPacketContext>,
+    pub(super) mark: u32,
 }
 
 impl LocalInputPacket {
@@ -70,6 +252,43 @@ pub(super) struct LocalOutputPacket {
     pub(super) meta: PacketMeta,
     pub(super) disposition: LocalOutputDisposition,
     pub(super) frame: Vec<u8>,
+    /// Only tracked packets allocate a sidecar. Keeping the large candidate
+    /// off the queue header preserves its normal no-CT footprint and avoids
+    /// inflating every output/deferred-queue enum variant.
+    pub(super) ct_context: OutputCtContext,
+    /// Packet metadata survives deferred routing, fragmentation and retry.
+    pub(super) mark: u32,
+    /// Present only for an admitted complete datagram. Fragment progress
+    /// advances after the device accepts a fragment, never on retry.
+    pub(super) prepared_ip: Option<PreparedIpProgress>,
+    pub(super) _charge: Option<OutputCharge>,
+}
+
+/// An in-flight output datagram must preserve the tracking decision made by
+/// the ruleset pinned at admission. `Untracked` has no heap cost; `Tracked`
+/// owns exactly this packet's identity across asynchronous TX retries.
+/// There is deliberately no `None`: a missing identity in a tracked packet
+/// would otherwise be indistinguishable from a packet admitted before CT was
+/// enabled and could be misclassified after a ruleset change.
+#[derive(Debug)]
+pub(crate) enum OutputCtContext {
+    Untracked,
+    Tracked(alloc::boxed::Box<CtPacketContext>),
+}
+
+impl OutputCtContext {
+    pub(crate) fn for_ingress(&self) -> CtPacketContext {
+        match self {
+            Self::Untracked => CtPacketContext::Untracked,
+            Self::Tracked(context) => (**context).clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) enum PreparedIpProgress {
+    Ipv4 { offset: usize, may_fragment: bool },
+    Ipv6 { offset: usize, identification: u32 },
 }
 
 #[derive(Debug)]
@@ -334,6 +553,68 @@ impl<'a> LocalOutputReservation<'a> {
             meta,
             disposition,
             frame,
+            ct_context: OutputCtContext::Untracked,
+            mark: 0,
+            prepared_ip: None,
+            _charge: None,
+        });
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "packet metadata is explicit at queue commit"
+    )]
+    pub(super) fn commit_prepared_ipv4(
+        self,
+        frame: Vec<u8>,
+        meta: PacketMeta,
+        disposition: LocalOutputDisposition,
+        may_fragment: bool,
+        charge: Option<OutputCharge>,
+        ct_context: OutputCtContext,
+        mark: u32,
+    ) {
+        self.commit_packet(LocalOutputPacket {
+            medium: smoltcp::phy::Medium::Ip,
+            meta,
+            disposition,
+            frame,
+            ct_context,
+            mark,
+            prepared_ip: Some(PreparedIpProgress::Ipv4 {
+                offset: 0,
+                may_fragment,
+            }),
+            _charge: charge,
+        });
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "packet metadata is explicit at queue commit"
+    )]
+    pub(super) fn commit_prepared_ipv6(
+        self,
+        frame: Vec<u8>,
+        meta: PacketMeta,
+        disposition: LocalOutputDisposition,
+        identification: u32,
+        charge: Option<OutputCharge>,
+        ct_context: OutputCtContext,
+        mark: u32,
+    ) {
+        self.commit_packet(LocalOutputPacket {
+            medium: smoltcp::phy::Medium::Ip,
+            meta,
+            disposition,
+            frame,
+            ct_context,
+            mark,
+            prepared_ip: Some(PreparedIpProgress::Ipv6 {
+                offset: 0,
+                identification,
+            }),
+            _charge: charge,
         });
     }
 
@@ -379,6 +660,10 @@ impl<'a> LocalOutputReservation<'a> {
                 meta,
                 disposition: LocalOutputDisposition::NativeOwner,
                 frame,
+                ct_context: OutputCtContext::Untracked,
+                mark: 0,
+                prepared_ip: None,
+                _charge: None,
             },
             retry_at,
         );
@@ -402,6 +687,12 @@ impl<'a> LocalOutputReservation<'a> {
         output.bytes += self.bytes;
         output.packets.push_back(packet);
         self.active = false;
+    }
+
+    /// Keep the same reservation across successive fragments. No second
+    /// allocation or target-interface queue admission is allowed here.
+    pub(super) fn requeue_ready(self, packet: LocalOutputPacket) {
+        self.commit_packet(packet);
     }
 
     pub(super) fn commit_deferred_packet(
@@ -777,5 +1068,109 @@ impl LocalInputQueue {
         }
         pooled.bytes += frame.capacity();
         pooled.buffers.push(frame);
+    }
+}
+
+#[cfg(test)]
+mod output_ct_context_tests {
+    use super::*;
+
+    #[test]
+    fn deferred_output_keeps_its_packet_context_across_retry() {
+        let queue = LocalInputQueue::new();
+        let mut reservation = queue.reserve_output().unwrap();
+        let mut frame = Vec::new();
+        frame.try_reserve_exact(20).unwrap();
+        frame.resize(20, 0);
+        assert!(reservation.try_resize(frame.capacity()));
+        reservation.commit_packet(LocalOutputPacket {
+            medium: smoltcp::phy::Medium::Ip,
+            meta: PacketMeta::default(),
+            disposition: LocalOutputDisposition::Local {
+                oif: 1,
+                ip_mtu: 1500,
+            },
+            frame,
+            ct_context: OutputCtContext::Tracked(alloc::boxed::Box::new(CtPacketContext::Invalid)),
+            mark: 0x1234_5678,
+            prepared_ip: None,
+            _charge: None,
+        });
+
+        let now = smoltcp::time::Instant::from_millis(0);
+        let LocalOutputPop::Ready(packet, reservation, _) = queue.pop_ready_output(now, false)
+        else {
+            panic!("committed packet must be ready")
+        };
+        assert!(matches!(
+            &packet.ct_context,
+            OutputCtContext::Tracked(context) if matches!(**context, CtPacketContext::Invalid)
+        ));
+        assert_eq!(packet.mark, 0x1234_5678);
+        let retry_at = now + smoltcp::time::Duration::from_millis(1);
+        reservation.requeue_backpressured(packet, retry_at);
+        assert!(matches!(
+            queue.pop_ready_output(now, false),
+            LocalOutputPop::DeferredUntil(_)
+        ));
+        let LocalOutputPop::Ready(packet, reservation, _) = queue.pop_ready_output(retry_at, false)
+        else {
+            panic!("retried packet must be ready")
+        };
+        assert!(matches!(
+            &packet.ct_context,
+            OutputCtContext::Tracked(context) if matches!(**context, CtPacketContext::Invalid)
+        ));
+        assert_eq!(packet.mark, 0x1234_5678);
+        drop(reservation);
+    }
+
+    #[test]
+    fn prepared_ipv6_keeps_tracking_context_across_retry() {
+        let queue = LocalInputQueue::new();
+        let mut reservation = queue.reserve_output().unwrap();
+        let frame = alloc::vec![0x60; 40];
+        assert!(reservation.try_resize(frame.capacity()));
+        reservation.commit_prepared_ipv6(
+            frame,
+            PacketMeta::default(),
+            LocalOutputDisposition::Local {
+                oif: 1,
+                ip_mtu: 1500,
+            },
+            42,
+            None,
+            OutputCtContext::Tracked(alloc::boxed::Box::new(CtPacketContext::Invalid)),
+            0x8765_4321,
+        );
+        let now = smoltcp::time::Instant::from_millis(0);
+        let LocalOutputPop::Ready(packet, reservation, _) = queue.pop_ready_output(now, false)
+        else {
+            panic!("prepared packet must be ready")
+        };
+        assert!(matches!(
+            &packet.ct_context,
+            OutputCtContext::Tracked(context) if matches!(**context, CtPacketContext::Invalid)
+        ));
+        assert_eq!(packet.mark, 0x8765_4321);
+        let retry_at = now + smoltcp::time::Duration::from_millis(1);
+        reservation.requeue_backpressured(packet, retry_at);
+        let LocalOutputPop::Ready(packet, reservation, _) = queue.pop_ready_output(retry_at, false)
+        else {
+            panic!("prepared packet must survive retry")
+        };
+        assert!(matches!(
+            &packet.ct_context,
+            OutputCtContext::Tracked(context) if matches!(**context, CtPacketContext::Invalid)
+        ));
+        assert!(matches!(
+            packet.prepared_ip,
+            Some(PreparedIpProgress::Ipv6 {
+                offset: 0,
+                identification: 42
+            })
+        ));
+        assert_eq!(packet.mark, 0x8765_4321);
+        drop(reservation);
     }
 }

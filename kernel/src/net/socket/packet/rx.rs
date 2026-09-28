@@ -944,6 +944,11 @@ impl PacketSocket {
         drop(queue);
         self.stats_packets.fetch_add(1, Ordering::Relaxed);
         self.wait_queue.wakeup(None);
+        let _ = EventPoll::wakeup_epoll(
+            self.epoll_items.as_ref(),
+            EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM,
+        );
+        self.fasync_items.send_sigio(FASYNC_POLL_IN);
     }
 
     /// Release packets detached from the legacy receive queue at a ring

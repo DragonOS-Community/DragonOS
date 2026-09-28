@@ -130,6 +130,50 @@ impl<Message: 'static + Debug> ProtocolSocketTable<Message> {
         }
         Ok(())
     }
+
+    /// Kernel notifications are best-effort per subscriber. A full queue has
+    /// already recorded ENOBUFS on that receiver and must not starve peers.
+    fn notify_group(&self, group_id: u32, excluded_port: u32, message: Message)
+    where
+        Message: MulticastMessage,
+    {
+        let Some(index) = group_id.checked_sub(1) else {
+            return;
+        };
+        let Some(group) = self.multicast_groups.get(index as usize) else {
+            return;
+        };
+        for port in group.members() {
+            if *port != excluded_port {
+                if let Some(receiver) = self.unicast_sockets.get(port) {
+                    let _ = receiver.enqueue_message(message.clone());
+                }
+            }
+        }
+    }
+
+    fn report_group_overrun(&self, group_id: u32, excluded_port: u32) {
+        let Some(index) = group_id.checked_sub(1) else {
+            return;
+        };
+        let Some(group) = self.multicast_groups.get(index as usize) else {
+            return;
+        };
+        for port in group.members() {
+            if *port != excluded_port {
+                if let Some(receiver) = self.unicast_sockets.get(port) {
+                    receiver.report_overrun();
+                }
+            }
+        }
+    }
+
+    fn has_group_listeners(&self, group_id: u32) -> bool {
+        group_id
+            .checked_sub(1)
+            .and_then(|index| self.multicast_groups.get(index as usize))
+            .is_some_and(|group| !group.members().is_empty())
+    }
 }
 
 #[derive(Debug)]
@@ -214,6 +258,7 @@ impl<Message: 'static + Debug> Drop for BoundHandle<Message> {
 
 pub trait SupportedNetlinkProtocol: Debug {
     type Message: 'static + Send + Debug;
+    type SocketState: Default + Debug + Send + Sync;
 
     fn multicast_group_count() -> u32;
 
@@ -275,6 +320,31 @@ pub trait SupportedNetlinkProtocol: Debug {
         }
     }
 
+    fn notify_group(
+        group_id: u32,
+        excluded_port: u32,
+        message: Self::Message,
+        netns: Arc<NetNamespace>,
+    ) where
+        Self::Message: MulticastMessage,
+    {
+        Self::socket_table(netns)
+            .read()
+            .notify_group(group_id, excluded_port, message);
+    }
+
+    fn report_group_overrun(group_id: u32, excluded_port: u32, netns: Arc<NetNamespace>) {
+        Self::socket_table(netns)
+            .read()
+            .report_group_overrun(group_id, excluded_port);
+    }
+
+    fn has_group_listeners(group_id: u32, netns: Arc<NetNamespace>) -> bool {
+        Self::socket_table(netns)
+            .read()
+            .has_group_listeners(group_id)
+    }
+
     //todo 多播消息用
     #[allow(unused)]
     fn multicast(
@@ -296,6 +366,7 @@ pub struct NetlinkRouteProtocol;
 
 impl SupportedNetlinkProtocol for NetlinkRouteProtocol {
     type Message = RouteNlMessage;
+    type SocketState = ();
 
     fn multicast_group_count() -> u32 {
         33
@@ -314,6 +385,7 @@ pub struct NetlinkNetfilterProtocol;
 
 impl SupportedNetlinkProtocol for NetlinkKobjectUeventProtocol {
     type Message = KobjectUeventMessage;
+    type SocketState = ();
 
     fn multicast_group_count() -> u32 {
         1

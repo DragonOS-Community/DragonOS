@@ -22,6 +22,7 @@ use system_error::SystemError;
 pub struct BoundInner {
     handle: smoltcp::iface::SocketHandle,
     iface: Arc<dyn Iface>,
+    socket_set: crate::driver::net::InterfaceSocketSet,
     netns: Arc<NetNamespace>,
     // inner: Vec<(smoltcp::iface::SocketHandle, Arc<dyn Iface>)>
     // address: smoltcp::wire::IpAddress,
@@ -76,10 +77,11 @@ impl BoundInner {
                 Ok(iface) => iface,
                 Err(err) => return Err((socket, err)),
             };
-            let handle = iface.sockets().lock().add(socket);
+            let (socket_set, handle) = iface.common().add_smol_socket_in_netns(socket, &netns)?;
             return Ok(Self {
                 handle,
                 iface,
+                socket_set,
                 netns,
             });
         } else {
@@ -92,10 +94,11 @@ impl BoundInner {
             //     iface.iface_name(),
             //     address
             // );
-            let handle = iface.sockets().lock().add(socket);
+            let (socket_set, handle) = iface.common().add_smol_socket_in_netns(socket, &netns)?;
             return Ok(Self {
                 handle,
                 iface,
+                socket_set,
                 netns,
             });
         }
@@ -114,10 +117,14 @@ impl BoundInner {
     where
         T: smoltcp::socket::AnySocket<'static>,
     {
-        let handle = iface.sockets().lock().add(socket);
+        let (socket_set, handle) = iface
+            .common()
+            .add_smol_socket_in_netns(socket, &netns)
+            .map_err(|(_, error)| error)?;
         Ok(Self {
             handle,
             iface,
+            socket_set,
             netns,
         })
     }
@@ -158,12 +165,16 @@ impl BoundInner {
             Ok(result) => result,
             Err(err) => return Err((socket, err)),
         };
-        let handle = target.stack_owner.sockets().lock().add(socket);
+        let (socket_set, handle) = target
+            .stack_owner
+            .common()
+            .add_smol_socket_in_netns(socket, &netns)?;
         // let endpoint = smoltcp::wire::IpEndpoint::new(local_addr, bound_port);
         Ok((
             Self {
                 handle,
                 iface: target.stack_owner,
+                socket_set,
                 netns,
             },
             target.local_addr,
@@ -174,11 +185,11 @@ impl BoundInner {
         &self,
         mut f: F,
     ) -> R {
-        f(self.iface.sockets().lock().get_mut::<T>(self.handle))
+        f(self.socket_set.lock().get_mut::<T>(self.handle))
     }
 
     pub fn with<T: smoltcp::socket::AnySocket<'static>, R, F: Fn(&T) -> R>(&self, f: F) -> R {
-        f(self.iface.sockets().lock().get::<T>(self.handle))
+        f(self.socket_set.lock().get::<T>(self.handle))
     }
 
     pub fn iface(&self) -> &Arc<dyn Iface> {
@@ -204,13 +215,15 @@ impl BoundInner {
             detached();
             return Ok(());
         }
-        let socket = self.iface.sockets().lock().remove(self.handle);
+        let socket_set = iface.common().socket_set_in_netns(&self.netns)?;
+        let socket = self.socket_set.lock().remove(self.handle);
         let smoltcp::socket::Socket::Udp(socket) = socket else {
             return Err(SystemError::EINVAL);
         };
         detached();
-        let handle = iface.sockets().lock().add(socket);
+        let handle = socket_set.lock().add(socket);
         self.iface = iface;
+        self.socket_set = socket_set;
         self.handle = handle;
         Ok(())
     }
@@ -221,11 +234,11 @@ impl BoundInner {
     }
 
     pub fn release(&self) {
-        self.iface.sockets().lock().remove(self.handle);
+        self.socket_set.lock().remove(self.handle);
     }
 
     pub fn into_socket(self) -> smoltcp::socket::Socket<'static> {
-        self.iface.sockets().lock().remove(self.handle)
+        self.socket_set.lock().remove(self.handle)
     }
 
     pub fn netns(&self) -> Arc<NetNamespace> {

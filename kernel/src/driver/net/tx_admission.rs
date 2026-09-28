@@ -42,8 +42,9 @@ impl TxAdmission {
     }
 
     pub(super) fn close_and_wait(&self) {
-        let previous = self.state.fetch_or(CLOSED, Ordering::AcqRel);
-        debug_assert_eq!(previous & CLOSED, 0);
+        // Namespace teardown can visit both ends of a veth after the pair was
+        // quiesced together. Closing an already closed gate must be harmless.
+        self.state.fetch_or(CLOSED, Ordering::AcqRel);
         while self.state.load(Ordering::Acquire) != CLOSED {
             crate::sched::sched_yield();
         }

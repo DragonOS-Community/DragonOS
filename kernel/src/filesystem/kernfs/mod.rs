@@ -117,16 +117,51 @@ impl KernFSChildren {
         old_key: &KernFSChildKeyRef<'_>,
         new_key: KernFSChildKey,
     ) -> Option<()> {
-        if old_key.namespace != new_key.namespace {
+        if !self.buckets.contains_key(&new_key.namespace) {
             return None;
         }
-        let bucket = self.buckets.get_mut(&old_key.namespace)?;
-        let inode = bucket.remove(old_key.name)?;
-        // Removing one entry before inserting its replacement guarantees that
-        // the existing bucket has enough capacity; commit must not allocate.
-        let replaced = bucket.insert(new_key.name, inode);
+        let inode = self
+            .buckets
+            .get_mut(&old_key.namespace)?
+            .remove(old_key.name)?;
+        // Same-bucket rename reuses the removed slot. Cross-bucket moves
+        // require reserve_rekey_destination under the mutation gate first.
+        let replaced = self
+            .buckets
+            .get_mut(&new_key.namespace)?
+            .insert(new_key.name, inode);
         debug_assert!(replaced.is_none());
         Some(())
+    }
+
+    /// Reserve the destination bucket before a cross-namespace inode move.
+    /// Returns whether a new, currently empty bucket was inserted.
+    pub(crate) fn reserve_rekey_destination(
+        &mut self,
+        namespace: Option<KernFSNamespaceTag>,
+        additions: usize,
+    ) -> Result<bool, SystemError> {
+        if let Some(bucket) = self.buckets.get_mut(&namespace) {
+            bucket
+                .try_reserve(additions)
+                .map_err(|_| SystemError::ENOMEM)?;
+            return Ok(false);
+        }
+        self.buckets
+            .try_reserve(1)
+            .map_err(|_| SystemError::ENOMEM)?;
+        let mut bucket = HashMap::new();
+        bucket
+            .try_reserve(additions)
+            .map_err(|_| SystemError::ENOMEM)?;
+        self.buckets.insert(namespace, bucket);
+        Ok(true)
+    }
+
+    pub(crate) fn discard_empty_bucket(&mut self, namespace: Option<KernFSNamespaceTag>) {
+        if self.buckets.get(&namespace).is_some_and(HashMap::is_empty) {
+            self.buckets.remove(&namespace);
+        }
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -240,6 +275,7 @@ impl KernFS {
         let root_inode = Arc::new_cyclic(|self_ref| KernFSInode {
             inner: RwSem::new(InnerKernFSInode {
                 name: String::from(""),
+                namespace: None,
                 parent: Weak::new(),
                 metadata,
                 symlink_target: None,
@@ -250,7 +286,6 @@ impl KernFS {
             private_data: Mutex::new(None),
             callback: None,
             children: Mutex::new(KernFSChildren::default()),
-            namespace: None,
             namespace_children: AtomicBool::new(false),
             child_mutation: Mutex::new(()),
             inode_type: KernInodeType::Dir,
@@ -275,8 +310,6 @@ pub struct KernFSInode {
     callback: Option<&'static dyn KernFSCallback>,
     /// 子Inode
     children: Mutex<KernFSChildren>,
-    /// Namespace identity of this inode in its parent's child map.
-    namespace: Option<KernFSNamespaceTag>,
     /// Whether direct children must carry a namespace tag.
     namespace_children: AtomicBool,
     /// Serializes every mutation of `children` and `lazy_list` for this
@@ -303,6 +336,8 @@ pub struct InnerKernFSInode {
     /// The name is changed together with its parent's map key by a prepared
     /// kernfs rename transaction.
     name: String,
+    /// Namespace identity in the parent's child map, updated with `name`.
+    namespace: Option<KernFSNamespaceTag>,
     parent: Weak<KernFSInode>,
 
     /// 当前inode的元数据
@@ -587,7 +622,7 @@ impl IndexNode for KernFSInode {
 
 impl KernFSInode {
     pub fn namespace(&self) -> Option<KernFSNamespaceTag> {
-        self.namespace
+        self.inner.read().namespace
     }
 
     pub fn namespace_children_enabled(&self) -> bool {
@@ -695,6 +730,7 @@ impl KernFSInode {
         let inode = Arc::new_cyclic(|self_ref| KernFSInode {
             inner: RwSem::new(InnerKernFSInode {
                 name,
+                namespace,
                 parent: parent.as_ref().map_or(Weak::new(), Arc::downgrade),
                 metadata,
                 symlink_target: None,
@@ -705,7 +741,6 @@ impl KernFSInode {
             private_data: Mutex::new(private_data),
             callback,
             children: Mutex::new(KernFSChildren::default()),
-            namespace,
             namespace_children: AtomicBool::new(false),
             child_mutation: Mutex::new(()),
             inode_type,
@@ -1139,7 +1174,7 @@ impl KernFSInode {
             parent
                 .children
                 .lock()
-                .remove(&KernFSChildKeyRef::new(&name, self.namespace));
+                .remove(&KernFSChildKeyRef::new(&name, self.namespace()));
         }
         self.remove_recursive();
     }

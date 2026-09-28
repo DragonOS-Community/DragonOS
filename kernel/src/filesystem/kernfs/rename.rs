@@ -5,7 +5,7 @@ use system_error::SystemError;
 
 use super::{
     KernFS, KernFSChildKey, KernFSChildKeyRef, KernFSChildren, KernFSInode, KernFSInodeArgs,
-    KernInodeType,
+    KernFSNamespaceTag, KernInodeType,
 };
 
 /// One inode re-key requested as part of a two-node kernfs rename.
@@ -14,6 +14,7 @@ use super::{
 pub struct KernFSRenameSpec {
     inode: Arc<KernFSInode>,
     new_name: String,
+    new_namespace: Option<KernFSNamespaceTag>,
     symlink_target_absolute_path: Option<String>,
 }
 
@@ -22,8 +23,14 @@ impl KernFSRenameSpec {
         Self {
             inode,
             new_name,
+            new_namespace: None,
             symlink_target_absolute_path: None,
         }
+    }
+
+    pub fn with_namespace(mut self, namespace: KernFSNamespaceTag) -> Self {
+        self.new_namespace = Some(namespace);
+        self
     }
 
     pub fn with_symlink_target_absolute_path(mut self, path: String) -> Self {
@@ -58,7 +65,7 @@ impl PreparedRenameEntry {
             parent,
             inode: spec.inode,
             old_key: KernFSChildKey::new(old_name, namespace),
-            new_key: KernFSChildKey::new(spec.new_name, namespace),
+            new_key: KernFSChildKey::new(spec.new_name, spec.new_namespace.or(namespace)),
             new_inode_name,
             symlink_target_absolute_path: spec.symlink_target_absolute_path,
         })
@@ -95,7 +102,19 @@ impl PreparedRenameEntry {
         Ok(())
     }
 
+    fn reserve_destination(
+        &self,
+        children: &mut KernFSChildren,
+        additions: usize,
+    ) -> Result<bool, SystemError> {
+        if self.old_key.namespace == self.new_key.namespace {
+            return Ok(false);
+        }
+        children.reserve_rekey_destination(self.new_key.namespace, additions)
+    }
+
     fn publish(self, children: &mut KernFSChildren) {
+        let new_namespace = self.new_key.namespace;
         children
             .rekey(
                 &KernFSChildKeyRef::new(&self.old_key.name, self.old_key.namespace),
@@ -105,6 +124,7 @@ impl PreparedRenameEntry {
 
         let mut inner = self.inode.inner.write();
         inner.name = self.new_inode_name;
+        inner.namespace = new_namespace;
         if let Some(path) = self.symlink_target_absolute_path {
             inner.symlink_target_absolute_path = Some(path);
         }
@@ -115,6 +135,8 @@ impl PreparedRenameEntry {
 /// replacing either inode object.
 pub struct PreparedKernFSRename {
     entries: [PreparedRenameEntry; 2],
+    #[cfg(test)]
+    fail_second_reservation: bool,
 }
 
 impl PreparedKernFSRename {
@@ -129,16 +151,38 @@ impl PreparedKernFSRename {
         if entries[1].parent_id() < entries[0].parent_id() {
             entries.swap(0, 1);
         }
-        Ok(Self { entries })
+        Ok(Self {
+            entries,
+            #[cfg(test)]
+            fail_second_reservation: false,
+        })
+    }
+
+    #[cfg(test)]
+    fn inject_second_reservation_failure(mut self) -> Self {
+        self.fail_second_reservation = true;
+        self
+    }
+
+    fn fail_second_reservation(&self) -> bool {
+        #[cfg(test)]
+        {
+            self.fail_second_reservation
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
     }
 
     /// Revalidates both parent maps before changing either one. Publication is
     /// allocation-free because each re-key removes and inserts one entry in the
     /// same existing namespace bucket.
     pub fn commit(self) -> Result<(), SystemError> {
+        let fail_second_reservation = self.fail_second_reservation();
         let [first, second] = self.entries;
         if Arc::ptr_eq(&first.parent, &second.parent) {
-            return commit_same_parent(first, second);
+            return commit_same_parent(first, second, fail_second_reservation);
         }
 
         let first_parent = first.parent.clone();
@@ -154,8 +198,24 @@ impl PreparedKernFSRename {
         second.validate(&second_children, &second_lazy)?;
         drop(first_lazy);
         drop(second_lazy);
+        let first_bucket_created = first.reserve_destination(&mut first_children, 1)?;
+        let second_reservation = if fail_second_reservation {
+            Err(SystemError::ENOMEM)
+        } else {
+            second.reserve_destination(&mut second_children, 1)
+        };
+        if let Err(error) = second_reservation {
+            if first_bucket_created {
+                first_children.discard_empty_bucket(first.new_key.namespace);
+            }
+            return Err(error);
+        }
+        let first_old_namespace = first.old_key.namespace;
+        let second_old_namespace = second.old_key.namespace;
         first.publish(&mut first_children);
         second.publish(&mut second_children);
+        first_children.discard_empty_bucket(first_old_namespace);
+        second_children.discard_empty_bucket(second_old_namespace);
         Ok(())
     }
 }
@@ -163,6 +223,7 @@ impl PreparedKernFSRename {
 fn commit_same_parent(
     first: PreparedRenameEntry,
     second: PreparedRenameEntry,
+    fail_second_reservation: bool,
 ) -> Result<(), SystemError> {
     if first.new_key == second.new_key {
         return Err(SystemError::EEXIST);
@@ -174,8 +235,35 @@ fn commit_same_parent(
     first.validate(&children, &lazy)?;
     second.validate(&children, &lazy)?;
     drop(lazy);
+    let first_crosses = first.old_key.namespace != first.new_key.namespace;
+    let second_crosses = second.old_key.namespace != second.new_key.namespace;
+    let first_bucket_created = if first_crosses {
+        children.reserve_rekey_destination(
+            first.new_key.namespace,
+            1 + usize::from(second_crosses && first.new_key.namespace == second.new_key.namespace),
+        )?
+    } else {
+        false
+    };
+    if second_crosses && (!first_crosses || first.new_key.namespace != second.new_key.namespace) {
+        let second_reservation = if fail_second_reservation {
+            Err(SystemError::ENOMEM)
+        } else {
+            second.reserve_destination(&mut children, 1)
+        };
+        if let Err(error) = second_reservation {
+            if first_bucket_created {
+                children.discard_empty_bucket(first.new_key.namespace);
+            }
+            return Err(error);
+        }
+    }
+    let first_old_namespace = first.old_key.namespace;
+    let second_old_namespace = second.old_key.namespace;
     first.publish(&mut children);
     second.publish(&mut children);
+    children.discard_empty_bucket(first_old_namespace);
+    children.discard_empty_bucket(second_old_namespace);
     Ok(())
 }
 
@@ -376,5 +464,119 @@ mod tests {
             class.list_ns(tag_b).unwrap(),
             vec![".".to_string(), "..".to_string(), "lo".to_string()]
         );
+    }
+
+    fn namespace_move_tree() -> (
+        Arc<KernFSInode>,
+        Arc<KernFSInode>,
+        Arc<KernFSInode>,
+        Arc<KernFSInode>,
+        KernFSNamespaceTag,
+        KernFSNamespaceTag,
+    ) {
+        let root = KernFS::create_root_inode();
+        let mode = InodeMode::from_bits_truncate(0o755);
+        let devices = root
+            .add_dir("devices".to_string(), mode, None, None)
+            .unwrap();
+        let class = root.add_dir("class".to_string(), mode, None, None).unwrap();
+        devices.enable_namespace_children().unwrap();
+        class.enable_namespace_children().unwrap();
+        let source = KernFSNamespaceTag::new(31);
+        let target = KernFSNamespaceTag::new(32);
+        let device = devices
+            .add_dir_ns("eth0".to_string(), mode, None, None, source)
+            .unwrap();
+        let link = class
+            .add_link("eth0".to_string(), &device, "/sys/devices/eth0".to_string())
+            .unwrap();
+        (devices, class, device, link, source, target)
+    }
+
+    fn namespace_move_plan(
+        device: &Arc<KernFSInode>,
+        link: &Arc<KernFSInode>,
+        target: KernFSNamespaceTag,
+    ) -> PreparedKernFSRename {
+        PreparedKernFSRename::prepare(
+            KernFSRenameSpec::new(device.clone(), "eth1".to_string()).with_namespace(target),
+            KernFSRenameSpec::new(link.clone(), "eth1".to_string())
+                .with_namespace(target)
+                .with_symlink_target_absolute_path("/sys/devices/eth1".to_string()),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn cross_namespace_move_rekeys_both_existing_inodes() {
+        let (devices, class, device, link, source, target) = namespace_move_tree();
+        namespace_move_plan(&device, &link, target)
+            .commit()
+            .unwrap();
+
+        assert!(devices.find_ns("eth0", source).is_err());
+        assert!(class.find_ns("eth0", source).is_err());
+        assert!(Arc::ptr_eq(
+            &devices
+                .find_ns("eth1", target)
+                .unwrap()
+                .downcast_arc::<KernFSInode>()
+                .unwrap(),
+            &device
+        ));
+        assert!(Arc::ptr_eq(
+            &class
+                .find_ns("eth1", target)
+                .unwrap()
+                .downcast_arc::<KernFSInode>()
+                .unwrap(),
+            &link
+        ));
+        assert_eq!(device.namespace(), Some(target));
+        assert_eq!(link.namespace(), Some(target));
+        assert_eq!(
+            link.inner.read().symlink_target_absolute_path.as_deref(),
+            Some("/sys/devices/eth1")
+        );
+    }
+
+    #[test]
+    fn cross_namespace_conflict_preserves_both_source_inodes() {
+        let (devices, class, device, link, source, target) = namespace_move_tree();
+        class
+            .add_dir_ns(
+                "eth1".to_string(),
+                InodeMode::from_bits_truncate(0o755),
+                None,
+                None,
+                target,
+            )
+            .unwrap();
+        assert_eq!(
+            namespace_move_plan(&device, &link, target).commit(),
+            Err(SystemError::EEXIST)
+        );
+        assert!(devices.find_ns("eth0", source).is_ok());
+        assert!(class.find_ns("eth0", source).is_ok());
+        assert!(devices.find_ns("eth1", target).is_err());
+        assert_eq!(device.namespace(), Some(source));
+        assert_eq!(link.namespace(), Some(source));
+        assert_eq!(
+            link.inner.read().symlink_target_absolute_path.as_deref(),
+            Some("/sys/devices/eth0")
+        );
+    }
+
+    #[test]
+    fn second_bucket_allocation_failure_preserves_both_source_inodes() {
+        let (devices, class, device, link, source, target) = namespace_move_tree();
+        let plan = namespace_move_plan(&device, &link, target).inject_second_reservation_failure();
+        assert_eq!(plan.commit(), Err(SystemError::ENOMEM));
+        assert!(devices.find_ns("eth0", source).is_ok());
+        assert!(class.find_ns("eth0", source).is_ok());
+        assert!(devices.find_ns("eth1", target).is_err());
+        assert!(class.find_ns("eth1", target).is_err());
+        assert_eq!(device.namespace(), Some(source));
+        assert_eq!(link.namespace(), Some(source));
     }
 }

@@ -5,7 +5,7 @@ use system_error::SystemError;
 use crate::{
     driver::base::kobject::{KObject, KObjectState},
     filesystem::{
-        kernfs::{KernFSInode, KernFSRenameSpec, PreparedKernFSRename},
+        kernfs::{KernFSInode, KernFSNamespaceTag, KernFSRenameSpec, PreparedKernFSRename},
         sysfs::sysfs_instance,
     },
     libs::casting::DowncastArc,
@@ -35,6 +35,22 @@ impl PreparedDeviceSysfsRename {
 pub(crate) fn prepare_class_device_sysfs_rename(
     device: &Arc<dyn Device>,
     new_name: String,
+) -> Result<PreparedDeviceSysfsRename, SystemError> {
+    prepare_class_device_sysfs_rekey(device, new_name, None)
+}
+
+pub(crate) fn prepare_class_device_sysfs_move(
+    device: &Arc<dyn Device>,
+    new_name: String,
+    namespace: KernFSNamespaceTag,
+) -> Result<PreparedDeviceSysfsRename, SystemError> {
+    prepare_class_device_sysfs_rekey(device, new_name, Some(namespace))
+}
+
+fn prepare_class_device_sysfs_rekey(
+    device: &Arc<dyn Device>,
+    new_name: String,
+    target_namespace: Option<KernFSNamespaceTag>,
 ) -> Result<PreparedDeviceSysfsRename, SystemError> {
     let registered = device.kobj_state().contains(KObjectState::IN_SYSFS);
     let device_inode = device.inode();
@@ -75,9 +91,13 @@ pub(crate) fn prepare_class_device_sysfs_rename(
     };
     let old_devpath = sysfs_instance().try_kernfs_path(&device_inode)?;
     let class_name = try_copy_string(&new_name)?;
-    let device_spec = KernFSRenameSpec::new(device_inode, new_name);
-    let class_spec = KernFSRenameSpec::new(class_link, class_name)
+    let mut device_spec = KernFSRenameSpec::new(device_inode, new_name);
+    let mut class_spec = KernFSRenameSpec::new(class_link, class_name)
         .with_symlink_target_absolute_path(target_path);
+    if let Some(namespace) = target_namespace {
+        device_spec = device_spec.with_namespace(namespace);
+        class_spec = class_spec.with_namespace(namespace);
+    }
     Ok(PreparedDeviceSysfsRename {
         rename: Some(PreparedKernFSRename::prepare(device_spec, class_spec)?),
         old_devpath: Some(old_devpath),

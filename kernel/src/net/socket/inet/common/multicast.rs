@@ -2,7 +2,6 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use core::sync::atomic::{AtomicI32, AtomicU32, Ordering};
-use smoltcp::iface::MulticastError;
 use smoltcp::wire::{IpAddress, Ipv4Address};
 use system_error::SystemError;
 
@@ -111,7 +110,7 @@ pub fn drop_ipv4_memberships(
         if let Some(iface) = find_iface_by_ifindex(netns, entry.ifindex) {
             let bytes = entry.multiaddr.to_ne_bytes();
             let multi = Ipv4Address::new(bytes[0], bytes[1], bytes[2], bytes[3]);
-            iface.common().ipv4_multicast_leave_ref(multi);
+            let _ = iface.common().ipv4_multicast_leave_ref(netns, multi);
         }
     }
 }
@@ -244,16 +243,13 @@ pub fn apply_ipv4_membership(
                 });
             }
 
-            let join_result = iface.common().ipv4_multicast_join_ref(multi_ipv4);
+            let join_result = iface.common().ipv4_multicast_join_ref(netns, multi_ipv4);
             if let Err(e) = join_result {
                 {
                     let mut groups = groups.lock();
                     groups.retain(|g| !(g.multiaddr == multi && g.ifindex == resolved_ifindex));
                 }
-                return Err(match e {
-                    MulticastError::GroupTableFull => SystemError::ENOBUFS,
-                    MulticastError::Unaddressable => SystemError::EINVAL,
-                });
+                return Err(e);
             }
 
             Ok((multi, resolved_ifindex))
@@ -276,7 +272,13 @@ pub fn apply_ipv4_membership(
                 return Err(SystemError::EADDRNOTAVAIL);
             }
 
-            iface.common().ipv4_multicast_leave_ref(multi_ipv4);
+            // A device moved away after the socket recorded this membership
+            // cannot retain the old namespace's group on its new stack. The
+            // socket-local membership is already removed, so DROP succeeds.
+            match iface.common().ipv4_multicast_leave_ref(netns, multi_ipv4) {
+                Ok(()) | Err(SystemError::ENODEV) => {}
+                Err(error) => return Err(error),
+            }
             Ok((multi, resolved_ifindex))
         }
         _ => Err(SystemError::ENOPROTOOPT),

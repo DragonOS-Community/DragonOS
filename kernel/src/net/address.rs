@@ -48,6 +48,12 @@ pub(in crate::net) struct PreparedMtuAddressChange {
     renamed_ipv4: Vec<IpCidr>,
 }
 
+impl PreparedMtuAddressChange {
+    pub(in crate::net) fn candidate(&self) -> &crate::net::route::FibTable {
+        self.routes.candidate()
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 enum CommitMutation {
     Plain(AddressMutation),
@@ -57,6 +63,18 @@ struct AddressCandidates {
     before: Vec<IpCidr>,
     after: Vec<IpCidr>,
     metadata: Vec<AddressMetadata>,
+}
+
+/// Linux drops interface addresses when a link changes network namespace.
+/// All fallible source/target preparation is complete before this point.
+pub(in crate::net) fn detach_for_netns_move(iface: &Arc<dyn Iface>) {
+    debug_assert!(iface.net_namespace().is_none());
+    iface
+        .smol_iface()
+        .lock()
+        .update_ip_addrs(|list| list.clear());
+    iface.router_common().ip_addrs.write().clear();
+    iface.common().address_metadata().lock().clear();
 }
 
 impl AddressCandidates {
@@ -226,14 +244,17 @@ fn prepare_renamed_metadata(
     Ok((metadata, renamed_ipv4))
 }
 
+/// The caller holds RTNL while preparing and publishing the adjacent link
+/// mutation; a staged FIB is used when another link update in this transaction
+/// has already prepared a route change.
 pub(in crate::net) fn prepare_mtu_address_change(
-    _rtnl: &RtnlGuard,
     netns: &Arc<crate::process::namespace::net_namespace::NetNamespace>,
     iface: &Arc<dyn Iface>,
     mtu: usize,
     renamed_to: Option<&str>,
     was_up: bool,
     is_up: bool,
+    staged_before: Option<&crate::net::route::FibTable>,
 ) -> Result<Option<PreparedMtuAddressChange>, SystemError> {
     let mirror = iface.router_common().ip_addrs.read();
     let before = try_clone_copy_slice(&mirror, 0)?;
@@ -293,18 +314,20 @@ pub(in crate::net) fn prepare_mtu_address_change(
     } else {
         (metadata, Vec::new())
     };
-    let routes = crate::net::route::prepare_address_link_change(
-        netns,
-        iface,
-        crate::net::route::AddressLinkChange {
-            before: &before,
-            after: &after,
-            metadata,
-            deleted_addresses: &deleted_addresses,
-            was_up,
-            is_up,
-        },
-    )?;
+    let change = crate::net::route::AddressLinkChange {
+        before: &before,
+        after: &after,
+        metadata,
+        deleted_addresses: &deleted_addresses,
+        was_up,
+        is_up,
+    };
+    let routes = match staged_before {
+        Some(staged) => {
+            crate::net::route::prepare_address_link_change_from(netns, iface, change, staged)?
+        }
+        None => crate::net::route::prepare_address_link_change(netns, iface, change)?,
+    };
     Ok(Some(PreparedMtuAddressChange {
         routes,
         removed,

@@ -14,10 +14,11 @@ use crate::{
 };
 
 use super::{
-    canonical_cidr, is_ipv4, prepare_with_devices, projection_for_iface, transact_with_devices,
-    validate_entry_on_iface, FibEditor, FibTable, PreparedTransaction, ProjectionPlan, RouteEntry,
-    RouteNotifications, RTN_BROADCAST, RTN_LOCAL, RTN_MULTICAST, RTN_UNICAST, RTPROT_KERNEL,
-    RT_SCOPE_HOST, RT_SCOPE_LINK, RT_SCOPE_UNIVERSE, RT_TABLE_LOCAL, RT_TABLE_MAIN,
+    canonical_cidr, is_ipv4, prepare_with_devices, prepare_with_devices_from, projection_for_iface,
+    transact_with_devices, validate_entry_on_iface, FibEditor, FibTable, PreparedTransaction,
+    ProjectionPlan, RouteEntry, RouteNotifications, RTN_BROADCAST, RTN_LOCAL, RTN_MULTICAST,
+    RTN_UNICAST, RTPROT_KERNEL, RT_SCOPE_HOST, RT_SCOPE_LINK, RT_SCOPE_UNIVERSE, RT_TABLE_LOCAL,
+    RT_TABLE_MAIN,
 };
 
 pub(crate) fn register_iface(
@@ -74,18 +75,48 @@ pub(crate) fn register_iface(
     Ok(())
 }
 
-pub(crate) fn unregister_iface(
-    rtnl: &RtnlGuard,
+pub(crate) struct PreparedIfaceUnregister<'rtnl> {
+    transaction: PreparedTransaction<'rtnl, ()>,
+}
+
+impl PreparedIfaceUnregister<'_> {
+    pub(crate) fn publish(self, netns: &Arc<NetNamespace>, remove_devices: impl FnOnce()) {
+        self.transaction
+            .publish_around(netns, || {}, remove_devices);
+    }
+}
+
+pub(crate) fn prepare_unregister_ifaces_from<'rtnl>(
+    rtnl: &'rtnl RtnlGuard,
     netns: &Arc<NetNamespace>,
-    ifindex: u32,
+    ifindices: &[u32],
     devices: &[Arc<dyn Iface>],
-) -> Result<(), SystemError> {
-    transact_with_devices(rtnl, netns, devices, |candidate| {
-        candidate.remove_where(|route| route.oif == ifindex)?;
-        Ok(())
-    })?;
-    netns.conntrack().invalidate_masquerade_oif(ifindex);
-    Ok(())
+    staged_before: Option<crate::net::link::StagedLinkFib<'_>>,
+) -> Result<PreparedIfaceUnregister<'rtnl>, SystemError> {
+    let transaction = prepare_with_devices_from(
+        rtnl,
+        netns,
+        devices,
+        staged_before.as_ref().map(|fib| fib.candidate()),
+        |candidate| {
+            candidate.remove_where(|route| ifindices.contains(&route.oif))?;
+            Ok(())
+        },
+    )?;
+    Ok(PreparedIfaceUnregister { transaction })
+}
+
+/// Final netns destruction has no userspace request to roll back. Its live
+/// peer must be removed even when an ordinary FIB snapshot cannot allocate.
+pub(crate) fn purge_iface_for_netns_teardown(netns: &Arc<NetNamespace>, iface: &Arc<dyn Iface>) {
+    let router = netns.router();
+    let mut fib = router.fib_write();
+    fib.purge_oif_for_netns_teardown(iface.nic_id() as u32);
+    iface
+        .smol_iface()
+        .lock()
+        .routes_mut()
+        .update(|routes| routes.clear());
 }
 
 /// Applies Linux's IPv4 device-state FIB lifecycle. Ordinary NETDEV_DOWN
@@ -96,6 +127,10 @@ pub(crate) struct PreparedLinkStateChange<'rtnl> {
 }
 
 impl PreparedLinkStateChange<'_> {
+    pub(in crate::net) fn candidate(&self) -> &FibTable {
+        self.transaction.candidate()
+    }
+
     /// Publishes only preallocated state. RTNL guarantees that the FIB and
     /// topology still match the snapshot captured during preparation.
     pub(crate) fn publish(
@@ -199,6 +234,10 @@ pub(crate) struct AddressLinkChange<'a> {
 }
 
 impl PreparedAddressRouteCommit {
+    pub(in crate::net) fn candidate(&self) -> &FibTable {
+        &self.candidate
+    }
+
     fn prepare(
         netns: &Arc<NetNamespace>,
         iface: &Arc<dyn Iface>,
@@ -219,6 +258,7 @@ impl PreparedAddressRouteCommit {
                 was_up: is_up,
                 is_up,
             },
+            None,
         )
     }
 
@@ -226,6 +266,7 @@ impl PreparedAddressRouteCommit {
         netns: &Arc<NetNamespace>,
         iface: &Arc<dyn Iface>,
         change: AddressLinkChange<'_>,
+        staged_before: Option<&FibTable>,
     ) -> Result<Self, SystemError> {
         let AddressLinkChange {
             before: before_addresses,
@@ -236,7 +277,10 @@ impl PreparedAddressRouteCommit {
             is_up,
         } = change;
         let ifindex = iface.nic_id() as u32;
-        let before = netns.router().fib.read().try_clone()?;
+        let before = match staged_before {
+            Some(staged) => staged.try_clone()?,
+            None => netns.router().fib.read().try_clone()?,
+        };
         let mut candidate = before.try_clone()?;
         let before_routes =
             derived_address_entries_for_link_state(iface, before_addresses, was_up)?;
@@ -320,8 +364,20 @@ impl PreparedAddressRouteCommit {
             .try_reserve_exact(affected_oifs.len())
             .map_err(|_| SystemError::ENOMEM)?;
         other_oifs.extend(affected_oifs.iter().copied().filter(|oif| *oif != ifindex));
-        let other_projections =
-            ProjectionPlan::prepare(&before, &candidate, &other_oifs, &devices)?;
+        // A staged follow-up starts from a prepared FIB candidate, but the
+        // live smoltcp projections remain at the original generation until
+        // both plans are committed. Reserve against that live projection.
+        let projection_before = if staged_before.is_some() {
+            Some(netns.router().fib.read().try_clone()?)
+        } else {
+            None
+        };
+        let other_projections = ProjectionPlan::prepare(
+            projection_before.as_ref().unwrap_or(&before),
+            &candidate,
+            &other_oifs,
+            &devices,
+        )?;
         let mut notifications = candidate.delta_from(&before)?.into_notifications();
         if was_up && !is_up {
             // NETDEV_DOWN silently flushes ordinary IPv4 routes. Routes
@@ -440,7 +496,16 @@ pub(crate) fn prepare_address_link_change(
     iface: &Arc<dyn Iface>,
     change: AddressLinkChange<'_>,
 ) -> Result<PreparedAddressRouteCommit, SystemError> {
-    PreparedAddressRouteCommit::prepare_for_link(netns, iface, change)
+    PreparedAddressRouteCommit::prepare_for_link(netns, iface, change, None)
+}
+
+pub(in crate::net) fn prepare_address_link_change_from(
+    netns: &Arc<NetNamespace>,
+    iface: &Arc<dyn Iface>,
+    change: AddressLinkChange<'_>,
+    staged_before: &FibTable,
+) -> Result<PreparedAddressRouteCommit, SystemError> {
+    PreparedAddressRouteCommit::prepare_for_link(netns, iface, change, Some(staged_before))
 }
 
 pub(crate) fn commit_addresses(

@@ -60,7 +60,7 @@ impl MountView {
         // snapshot cannot mix the namespace of one generation with the root of
         // the next.
         let state = task.namespace_state();
-        let ns = state.nsproxy.mnt_ns.clone();
+        let ns = state.nsproxy.ok_or(SystemError::ENOENT)?.mnt_ns.clone();
         let root = state
             .fs
             .ok_or(SystemError::ENOENT)?

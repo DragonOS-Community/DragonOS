@@ -165,6 +165,10 @@ pub(super) struct PreparedTransaction<'rtnl, T> {
 }
 
 impl<T> PreparedTransaction<'_, T> {
+    pub(super) fn candidate(&self) -> &FibTable {
+        &self.candidate
+    }
+
     pub(super) fn publish(self, netns: &Arc<NetNamespace>) -> T {
         self.publish_around(netns, || {}, || {})
     }
@@ -274,19 +278,36 @@ pub(super) fn prepare_with_devices<'rtnl, T>(
     devices: &[Arc<dyn Iface>],
     mutate: impl FnOnce(&mut FibEditor) -> Result<T, SystemError>,
 ) -> Result<PreparedTransaction<'rtnl, T>, SystemError> {
+    prepare_with_devices_from(rtnl, netns, devices, None, mutate)
+}
+
+pub(super) fn prepare_with_devices_from<'rtnl, T>(
+    rtnl: &'rtnl RtnlGuard,
+    netns: &Arc<NetNamespace>,
+    devices: &[Arc<dyn Iface>],
+    staged_before: Option<&FibTable>,
+    mutate: impl FnOnce(&mut FibEditor) -> Result<T, SystemError>,
+) -> Result<PreparedTransaction<'rtnl, T>, SystemError> {
     let router = netns.router();
     // RTNL keeps topology and writers stable. Candidate construction and
     // projection preparation stay outside the FIB write-side critical path.
     // Do not carry the FIB lock into mutation callbacks or interface locking:
     // RTNL already stabilizes writers, while an owned snapshot keeps the
     // cross-subsystem lock order acyclic.
-    let mut candidate = router.fib.read().try_clone()?;
+    let mut candidate = match staged_before {
+        Some(before) => before.try_clone()?,
+        None => router.fib.read().try_clone()?,
+    };
     let mut editor = FibEditor::new(&mut candidate);
     let outcome = mutate(&mut editor)?;
     let affected_oifs = editor.finish()?;
-    let before = router.fib.read();
-    let plan = ProjectionPlan::prepare(&before, &candidate, &affected_oifs, devices)?;
-    drop(before);
+    let plan = match staged_before {
+        Some(before) => ProjectionPlan::prepare(before, &candidate, &affected_oifs, devices)?,
+        None => {
+            let before = router.fib.read();
+            ProjectionPlan::prepare(&before, &candidate, &affected_oifs, devices)?
+        }
+    };
 
     Ok(PreparedTransaction {
         _rtnl: rtnl,

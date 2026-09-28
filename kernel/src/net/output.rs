@@ -569,6 +569,15 @@ pub(crate) fn submit_prepared_ipv4(
         .get(&(route.oif as usize))
         .cloned()
         .ok_or(SystemError::ENETUNREACH)?;
+    // An IPv4 multicast/broadcast local clone is delivered through the
+    // route's egress, which may differ from the socket's source owner. Pin
+    // that device's namespace epoch independently: a concurrent veth move
+    // must not deliver this old-namespace clone into the target namespace.
+    let egress_epoch = egress.common().namespace_epoch();
+    let egress_still_owned = egress_epoch & 1 == 0
+        && egress
+            .net_namespace()
+            .is_some_and(|owner| Arc::ptr_eq(&owner, netns));
     let is_physical_egress = !egress.flags().contains(InterfaceFlags::LOOPBACK);
     let post_oifname = hook_oifname(
         netns,
@@ -578,7 +587,8 @@ pub(crate) fn submit_prepared_ipv4(
         route,
     )?;
 
-    let clone_local = is_physical_egress
+    let clone_local = egress_still_owned
+        && is_physical_egress
         && ((route.kind == RTN_MULTICAST && multicast_loop) || route.kind == RTN_BROADCAST);
     let mut local_copy_queued = false;
     if clone_local {
@@ -601,18 +611,18 @@ pub(crate) fn submit_prepared_ipv4(
                 let copy_mark = copy_ct.mark();
                 if let Ok(context) = copy_ct.confirm() {
                     ct.adopt_confirmed(&context);
-                    local_copy_queued =
-                        crate::driver::net::inject_owned_local_ip_packet_with_context_and_mark(
-                            egress.as_ref(),
-                            route.oif,
-                            egress.mac(),
-                            clone,
-                            route.kind == RTN_BROADCAST,
-                            LocalPacketOrigin::LocalOutput,
-                            Some(context.for_ingress()),
-                            copy_mark,
-                        )
-                        .is_ok();
+                    local_copy_queued = crate::driver::net::inject_owned_local_ip_packet_if_epoch(
+                        egress.as_ref(),
+                        route.oif,
+                        egress.mac(),
+                        clone,
+                        route.kind == RTN_BROADCAST,
+                        LocalPacketOrigin::LocalOutput,
+                        Some(context.for_ingress()),
+                        copy_mark,
+                        Some(egress_epoch),
+                    )
+                    .is_ok();
                 }
             }
         }

@@ -1,6 +1,5 @@
 use crate::net::socket::netlink::message::attr::Attribute;
 use crate::net::socket::netlink::message::attr::CAttrHeader;
-use crate::net::socket::netlink::route::message::attr::convert_one_from_raw_buf;
 use crate::net::socket::netlink::route::message::attr::IFNAME_SIZE;
 use alloc::ffi::CString;
 use alloc::vec::Vec;
@@ -97,11 +96,20 @@ pub enum LinkAttr {
     Address(Vec<u8>),
     Name(CString),
     Mtu(u32),
+    Link(u32),
+    Master(u32),
+    LinkInfo(Vec<u8>),
+    NetNsPid(u32),
+    NetNsFd(u32),
+    LinkNetnsid(u32),
+    NewIfIndex(u32),
     Promiscuity(u32),
     Allmulti(u32),
     TxqLen(u32),
     LinkMode(u8),
     ExtMask(RtExtFilter),
+    /// Preserve unrecognized input so mutating requests cannot silently succeed.
+    Unsupported(u16, Vec<u8>),
 }
 
 impl LinkAttr {
@@ -110,13 +118,79 @@ impl LinkAttr {
             LinkAttr::Address(_) => LinkAttrClass::ADDRESS,
             LinkAttr::Name(_) => LinkAttrClass::IFNAME,
             LinkAttr::Mtu(_) => LinkAttrClass::MTU,
+            LinkAttr::Link(_) => LinkAttrClass::LINK,
+            LinkAttr::Master(_) => LinkAttrClass::MASTER,
+            LinkAttr::LinkInfo(_) => LinkAttrClass::LINKINFO,
+            LinkAttr::NetNsPid(_) => LinkAttrClass::NET_NS_PID,
+            LinkAttr::NetNsFd(_) => LinkAttrClass::NET_NS_FD,
+            LinkAttr::LinkNetnsid(_) => LinkAttrClass::LINK_NETNSID,
+            LinkAttr::NewIfIndex(_) => LinkAttrClass::NEW_IFINDEX,
             LinkAttr::Promiscuity(_) => LinkAttrClass::PROMISCUITY,
             LinkAttr::Allmulti(_) => LinkAttrClass::ALLMULTI,
             LinkAttr::TxqLen(_) => LinkAttrClass::TXQLEN,
             LinkAttr::LinkMode(_) => LinkAttrClass::LINKMODE,
             LinkAttr::ExtMask(_) => LinkAttrClass::EXT_MASK,
+            LinkAttr::Unsupported(_, _) => LinkAttrClass::UNSPEC,
         }
     }
+}
+
+/// One validated child NLA. Nested link attributes have a bounded, fixed
+/// depth (LINKINFO -> INFO_DATA -> VETH_INFO_PEER), so no recursive parser is
+/// needed.
+pub(crate) struct NestedLinkAttr<'a> {
+    pub kind: u16,
+    pub payload: &'a [u8],
+}
+
+pub(crate) fn parse_nested_link_attrs(data: &[u8]) -> Result<Vec<NestedLinkAttr<'_>>, SystemError> {
+    let mut attrs = Vec::new();
+    let mut offset = 0usize;
+    while offset < data.len() {
+        let rest = &data[offset..];
+        if rest.len() < 4 {
+            return Err(SystemError::EINVAL);
+        }
+        let len = u16::from_ne_bytes([rest[0], rest[1]]) as usize;
+        let kind = u16::from_ne_bytes([rest[2], rest[3]]) & 0x3fff;
+        if len < 4 || len > rest.len() {
+            return Err(SystemError::EINVAL);
+        }
+        attrs.try_reserve(1).map_err(|_| SystemError::ENOMEM)?;
+        attrs.push(NestedLinkAttr {
+            kind,
+            payload: &rest[4..len],
+        });
+        let aligned = len.checked_add(3).ok_or(SystemError::EINVAL)? & !3;
+        offset += if aligned <= rest.len() { aligned } else { len };
+    }
+    Ok(attrs)
+}
+
+pub(crate) fn append_nested_link_attr(
+    output: &mut Vec<u8>,
+    kind: u16,
+    payload: &[u8],
+) -> Result<(), SystemError> {
+    let len = payload.len().checked_add(4).ok_or(SystemError::EINVAL)?;
+    let len = u16::try_from(len).map_err(|_| SystemError::EINVAL)?;
+    let aligned = (len as usize + 3) & !3;
+    output
+        .try_reserve(aligned)
+        .map_err(|_| SystemError::ENOMEM)?;
+    output.extend_from_slice(&len.to_ne_bytes());
+    output.extend_from_slice(&kind.to_ne_bytes());
+    output.extend_from_slice(payload);
+    output.resize(output.len() + aligned - len as usize, 0);
+    Ok(())
+}
+
+fn copy_payload(buf: &[u8]) -> Result<Vec<u8>, SystemError> {
+    let mut data = Vec::new();
+    data.try_reserve_exact(buf.len())
+        .map_err(|_| SystemError::ENOMEM)?;
+    data.extend_from_slice(buf);
+    Ok(data)
 }
 
 // #[derive(Debug)]
@@ -133,7 +207,11 @@ impl LinkAttr {
 
 impl Attribute for LinkAttr {
     fn type_(&self) -> u16 {
-        self.class() as u16
+        match self {
+            Self::Unsupported(kind, _) => *kind,
+            Self::LinkInfo(_) => self.class() as u16 | (1 << 15),
+            _ => self.class() as u16,
+        }
     }
 
     fn payload_as_bytes(&self) -> &[u8] {
@@ -143,6 +221,15 @@ impl Attribute for LinkAttr {
             LinkAttr::Mtu(mtu) => unsafe {
                 core::slice::from_raw_parts(mtu as *const u32 as *const u8, 4)
             },
+            LinkAttr::Link(value)
+            | LinkAttr::Master(value)
+            | LinkAttr::NetNsPid(value)
+            | LinkAttr::NetNsFd(value)
+            | LinkAttr::LinkNetnsid(value)
+            | LinkAttr::NewIfIndex(value) => unsafe {
+                core::slice::from_raw_parts(value as *const u32 as *const u8, 4)
+            },
+            LinkAttr::LinkInfo(data) | LinkAttr::Unsupported(_, data) => data.as_slice(),
             LinkAttr::Promiscuity(count) | LinkAttr::Allmulti(count) => unsafe {
                 core::slice::from_raw_parts(count as *const u32 as *const u8, 4)
             },
@@ -153,8 +240,10 @@ impl Attribute for LinkAttr {
                 core::slice::from_raw_parts(link_mode as *const u8, 1)
             },
             LinkAttr::ExtMask(ext_filter) => {
-                let bits = ext_filter.bits();
-                unsafe { core::slice::from_raw_parts(&bits as *const u32 as *const u8, 4) }
+                const { assert!(size_of::<RtExtFilter>() == 4) };
+                unsafe {
+                    core::slice::from_raw_parts(ext_filter as *const RtExtFilter as *const u8, 4)
+                }
             }
         }
     }
@@ -167,8 +256,7 @@ impl Attribute for LinkAttr {
 
         // TODO: Currently, `IS_NET_BYTEORDER_MASK` and `IS_NESTED_MASK` are ignored.
         let Ok(class) = LinkAttrClass::try_from(header.type_()) else {
-            // reader.skip_some(payload_len);
-            return Ok(None);
+            return Ok(Some(Self::Unsupported(header.type_(), copy_payload(buf)?)));
         };
 
         let res = match (class, payload_len) {
@@ -177,34 +265,51 @@ impl Attribute for LinkAttr {
                 let cstr = CString::new(&buf[..nul_pos]).map_err(|_| SystemError::EINVAL)?;
                 Self::Name(cstr)
             }
-            (LinkAttrClass::MTU, 4) => {
-                let data = convert_one_from_raw_buf::<u32>(buf)?;
-                Self::Mtu(*data)
+            (LinkAttrClass::MTU, 4) => Self::Mtu(u32::from_ne_bytes(buf.try_into().unwrap())),
+            (LinkAttrClass::LINK, 4) => Self::Link(u32::from_ne_bytes(buf.try_into().unwrap())),
+            (LinkAttrClass::MASTER, 4) => Self::Master(u32::from_ne_bytes(buf.try_into().unwrap())),
+            (LinkAttrClass::LINKINFO, _) => {
+                parse_nested_link_attrs(buf)?;
+                Self::LinkInfo(copy_payload(buf)?)
             }
+            (LinkAttrClass::NET_NS_FD, 4) => {
+                Self::NetNsFd(u32::from_ne_bytes(buf.try_into().unwrap()))
+            }
+            (LinkAttrClass::NET_NS_PID, 4) => {
+                Self::NetNsPid(u32::from_ne_bytes(buf.try_into().unwrap()))
+            }
+            (LinkAttrClass::LINK_NETNSID, 4) => {
+                Self::LinkNetnsid(u32::from_ne_bytes(buf.try_into().unwrap()))
+            }
+            (LinkAttrClass::NEW_IFINDEX, 4) => {
+                Self::NewIfIndex(u32::from_ne_bytes(buf.try_into().unwrap()))
+            }
+            (LinkAttrClass::ADDRESS, 1..=32) => Self::Address(copy_payload(buf)?),
             (LinkAttrClass::PROMISCUITY, 4) => {
-                let data = convert_one_from_raw_buf::<u32>(buf)?;
-                Self::Promiscuity(*data)
+                Self::Promiscuity(u32::from_ne_bytes(buf.try_into().unwrap()))
             }
             (LinkAttrClass::ALLMULTI, 4) => {
-                let data = convert_one_from_raw_buf::<u32>(buf)?;
-                Self::Allmulti(*data)
+                Self::Allmulti(u32::from_ne_bytes(buf.try_into().unwrap()))
             }
-            (LinkAttrClass::TXQLEN, 4) => {
-                let data = convert_one_from_raw_buf::<u32>(buf)?;
-                Self::TxqLen(*data)
-            }
-            (LinkAttrClass::LINKMODE, 1) => {
-                let data = convert_one_from_raw_buf::<u8>(buf)?;
-                Self::LinkMode(*data)
-            }
+            (LinkAttrClass::TXQLEN, 4) => Self::TxqLen(u32::from_ne_bytes(buf.try_into().unwrap())),
+            (LinkAttrClass::LINKMODE, 1) => Self::LinkMode(buf[0]),
             (LinkAttrClass::EXT_MASK, 4) => {
                 const { assert!(size_of::<RtExtFilter>() == 4) };
-                Self::ExtMask(*convert_one_from_raw_buf::<RtExtFilter>(buf)?)
+                Self::ExtMask(RtExtFilter::from_bits_truncate(u32::from_ne_bytes(
+                    buf.try_into().unwrap(),
+                )))
             }
 
             (
                 LinkAttrClass::IFNAME
                 | LinkAttrClass::MTU
+                | LinkAttrClass::LINK
+                | LinkAttrClass::MASTER
+                | LinkAttrClass::NET_NS_FD
+                | LinkAttrClass::NET_NS_PID
+                | LinkAttrClass::LINK_NETNSID
+                | LinkAttrClass::NEW_IFINDEX
+                | LinkAttrClass::ADDRESS
                 | LinkAttrClass::PROMISCUITY
                 | LinkAttrClass::ALLMULTI
                 | LinkAttrClass::TXQLEN
@@ -217,9 +322,7 @@ impl Attribute for LinkAttr {
             }
 
             (_, _) => {
-                log::warn!("link attribute `{:?}` is not supported", class);
-                // reader.skip_some(payload_len);
-                return Ok(None);
+                return Ok(Some(Self::Unsupported(class as u16, copy_payload(buf)?)));
             }
         };
 

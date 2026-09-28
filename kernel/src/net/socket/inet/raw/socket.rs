@@ -12,7 +12,7 @@ use crate::process::namespace::net_namespace::NetNamespace;
 use crate::process::ProcessManager;
 
 use super::constants::ICMPV6_CHECKSUM_OFFSET;
-use super::inner::{RawInner, UnboundRaw};
+use super::inner::{BoundRaw, RawInner, UnboundRaw};
 use super::loopback::{register_raw_socket, unregister_raw_socket};
 use super::options::RawSocketOptions;
 use super::RawSocket;
@@ -208,11 +208,13 @@ impl RawSocket {
                 }
             },
             RawInner::Wildcard(wildcard) => {
-                // 从通配接收状态切换为用户显式绑定：先释放旧 handle，再按地址绑定。
-                wildcard.close();
+                // Keep the old attachment until the new one has been prepared.
+                // A failed bind must leave both the smoltcp handle and the
+                // interface's bound-socket registry unchanged.
                 let unbound = UnboundRaw::new(self.ip_version, self.protocol);
                 match unbound.bind(local_addr, self.netns.clone()) {
                     Ok(bound) => {
+                        self.release_wildcard(wildcard);
                         bound
                             .inner()
                             .iface()
@@ -222,9 +224,6 @@ impl RawSocket {
                         Ok(())
                     }
                     Err(e) => {
-                        // 失败则回到通配接收（Linux 语义下不应让 socket 进入不可用状态）
-                        let wildcard = UnboundRaw::new(self.ip_version, self.protocol)
-                            .bind_wildcard(self.netns.clone())?;
                         *inner = Some(RawInner::Wildcard(wildcard));
                         Err(if matches!(e, SystemError::ENODEV) {
                             SystemError::EADDRNOTAVAIL
@@ -256,10 +255,10 @@ impl RawSocket {
             RawInner::Wildcard(wildcard) => {
                 // Wildcard 仅表示已附着到某个 iface；为符合 Linux 语义（connect/getSockName），
                 // 这里需要真正选址并记录 local_addr。
-                wildcard.close();
                 let unbound = UnboundRaw::new(self.ip_version, self.protocol);
                 match unbound.bind_ephemeral(remote, self.netns.clone()) {
                     Ok(bound) => {
+                        self.release_wildcard(wildcard);
                         bound
                             .inner()
                             .iface()
@@ -269,9 +268,6 @@ impl RawSocket {
                         Ok(())
                     }
                     Err(e) => {
-                        // 失败则恢复为通配接收，避免 socket 进入不可用状态。
-                        let wildcard = UnboundRaw::new(self.ip_version, self.protocol)
-                            .bind_wildcard(self.netns.clone())?;
                         inner_guard.replace(RawInner::Wildcard(wildcard));
                         Err(e)
                     }
@@ -299,6 +295,18 @@ impl RawSocket {
                 }
             }
         }
+    }
+
+    /// A wildcard attachment is registered in both smoltcp and the owning
+    /// interface's notification list. Removing only the smoltcp handle leaves
+    /// an Arc<RawSocket> in the old interface and pins its network namespace.
+    fn release_wildcard(&self, wildcard: BoundRaw) {
+        wildcard
+            .inner()
+            .iface()
+            .common()
+            .unbind_socket(self.self_ref.upgrade().unwrap());
+        wildcard.close();
     }
 
     pub fn is_bound(&self) -> bool {

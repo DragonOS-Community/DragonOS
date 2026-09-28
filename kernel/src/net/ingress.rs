@@ -15,7 +15,7 @@ use super::{
     socket::inet::raw::{RawIngressListener, RawIngressWork},
 };
 use crate::driver::net::{
-    inject_owned_local_ip_packet_with_context_and_mark, types::InterfaceFlags, Iface,
+    inject_owned_local_ip_packet_if_epoch, types::InterfaceFlags, veth::VethInterface, Iface,
     LocalPacketOrigin,
 };
 use crate::process::namespace::net_namespace::{
@@ -89,6 +89,7 @@ pub(crate) enum RoutedIngressWork {
     },
     Local {
         target: Arc<dyn Iface>,
+        target_epoch: u64,
         ingress_ifindex: u32,
         source_mac: EthernetAddress,
         broadcast: bool,
@@ -98,6 +99,7 @@ pub(crate) enum RoutedIngressWork {
     },
     Forward {
         target: Arc<dyn Iface>,
+        target_epoch: u64,
         next_hop: IpAddress,
         packet: Vec<u8>,
     },
@@ -128,13 +130,14 @@ impl RoutedIngressWork {
             }
             Self::Local {
                 target,
+                target_epoch,
                 ingress_ifindex,
                 source_mac,
                 broadcast,
                 packet,
                 ct_context,
                 mark,
-            } => inject_owned_local_ip_packet_with_context_and_mark(
+            } => inject_owned_local_ip_packet_if_epoch(
                 target.as_ref(),
                 ingress_ifindex,
                 source_mac,
@@ -143,12 +146,28 @@ impl RoutedIngressWork {
                 LocalPacketOrigin::LinkIngressPreRouted,
                 Some(ct_context),
                 mark,
+                Some(target_epoch),
             ),
             Self::Forward {
                 target,
+                target_epoch,
                 next_hop,
                 packet,
             } => {
+                // A forward handoff runs after the source poll releases its
+                // locks. Pin veth TX admission until this handoff finishes so
+                // a netns move cannot retarget an already-routed packet.
+                let _move_guard = if target.as_any_ref().is::<VethInterface>() {
+                    let Some(guard) = target.common().try_acquire_tx() else {
+                        return;
+                    };
+                    Some(guard)
+                } else {
+                    None
+                };
+                if target.common().namespace_epoch() != target_epoch {
+                    return;
+                }
                 if !target.flags().contains(InterfaceFlags::UP) {
                     return;
                 }
@@ -617,6 +636,7 @@ impl<'a> NetIngressFilter<'a> {
                     return RouteInputVerdict::Drop;
                 };
                 self.work.push(RoutedIngressWork::Local {
+                    target_epoch: target.common().namespace_epoch(),
                     target,
                     ingress_ifindex,
                     source_mac,
@@ -682,6 +702,7 @@ impl<'a> NetIngressFilter<'a> {
                     return RouteInputVerdict::Drop;
                 }
                 self.work.push(RoutedIngressWork::Forward {
+                    target_epoch: target.common().namespace_epoch(),
                     target,
                     next_hop: route.next_hop,
                     packet,
@@ -1017,6 +1038,7 @@ impl IpIngressFilter for NetIngressFilter<'_> {
                     return RouteInputVerdict::Drop;
                 };
                 self.work.push(RoutedIngressWork::Local {
+                    target_epoch: target.common().namespace_epoch(),
                     target,
                     ingress_ifindex,
                     source_mac,
@@ -1077,6 +1099,7 @@ impl IpIngressFilter for NetIngressFilter<'_> {
                     return RouteInputVerdict::Drop;
                 }
                 self.work.push(RoutedIngressWork::Forward {
+                    target_epoch: target.common().namespace_epoch(),
                     target,
                     next_hop: route.next_hop,
                     packet,

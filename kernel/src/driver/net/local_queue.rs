@@ -452,6 +452,9 @@ pub(super) struct LocalInputQueue {
     pub(super) response_scratch: SpinLock<LocalOutputScratchPool>,
     pub(super) output: SpinLock<LocalOutputQueueState>,
     pub(super) output_draining: AtomicBool,
+    /// A netns move retires queued work before the device can be polled in
+    /// its new namespace. Admission stays closed throughout that transition.
+    accepting: AtomicBool,
 }
 
 pub(super) struct LocalOutputDrainGuard<'a> {
@@ -814,11 +817,19 @@ impl LocalInputQueue {
             response_scratch: SpinLock::new(LocalOutputScratchPool::default()),
             output: SpinLock::new(LocalOutputQueueState::default()),
             output_draining: AtomicBool::new(false),
+            accepting: AtomicBool::new(true),
         }
     }
 
-    pub(super) fn enqueue(&self, packet: LocalInputPacket) -> Result<(), SystemError> {
+    pub(super) fn enqueue(
+        &self,
+        packet: LocalInputPacket,
+        owner_still_current: impl FnOnce() -> bool,
+    ) -> Result<(), SystemError> {
         let mut state = self.state.lock();
+        if !self.accepting.load(Ordering::Acquire) || !owner_still_current() {
+            return Err(SystemError::ENODEV);
+        }
         if state.packets.len() >= Self::MAX_FRAMES
             || state.bytes.saturating_add(packet.len()) > Self::MAX_BYTES
         {
@@ -844,8 +855,42 @@ impl LocalInputQueue {
         self.state.lock().packets.is_empty()
     }
 
+    /// Quiesce an interface's namespace-local work before its ownership is
+    /// changed. A prepared output reservation may outlive NAPI quiescence,
+    /// so stop new admission and wait for every such reservation to finish
+    /// before discarding the old namespace's queued packets.
+    pub(super) fn retire_for_netns_move(&self) {
+        self.accepting.store(false, Ordering::Release);
+        // Serialize with readers that passed the admission check before the
+        // store; neither input nor output can enter after these locks pass.
+        drop(self.state.lock());
+        drop(self.output.lock());
+        while self.output.lock().reserved_frames != 0
+            || self.output_draining.load(Ordering::Acquire)
+        {
+            crate::sched::sched_yield();
+        }
+        let input = {
+            let mut state = self.state.lock();
+            state.bytes = 0;
+            core::mem::take(&mut state.packets)
+        };
+        let output = core::mem::take(&mut *self.output.lock());
+        // OutputCharge drops may wake socket writers; never do that under a
+        // queue spinlock or while holding any namespace routing lock.
+        drop(input);
+        drop(output);
+    }
+
+    pub(super) fn activate_after_netns_move(&self) {
+        self.accepting.store(true, Ordering::Release);
+    }
+
     pub(super) fn reserve_output(&self) -> Option<LocalOutputReservation<'_>> {
         let mut output = self.output.lock();
+        if !self.accepting.load(Ordering::Acquire) {
+            return None;
+        }
         if output.frames.saturating_add(output.reserved_frames) >= Self::MAX_FRAMES {
             return None;
         }
@@ -1040,9 +1085,16 @@ impl LocalInputQueue {
     }
 
     pub(super) fn try_begin_output_drain(&self) -> Option<LocalOutputDrainGuard<'_>> {
+        if !self.accepting.load(Ordering::Acquire) {
+            return None;
+        }
         self.output_draining
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
             .ok()?;
+        if !self.accepting.load(Ordering::Acquire) {
+            self.output_draining.store(false, Ordering::Release);
+            return None;
+        }
         Some(LocalOutputDrainGuard {
             draining: &self.output_draining,
             active: true,

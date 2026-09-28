@@ -2,6 +2,8 @@ use super::*;
 use crate::net::ingress::{NetIngressFilter, NetIngressFilterInit, RoutedIngressWork};
 use smoltcp::iface::{IpIngressFilter, PollIngressSingleResult, PollResult};
 
+pub(crate) type InterfaceSocketSet = Arc<Mutex<smoltcp::iface::SocketSet<'static>>>;
+
 fn poll_smol<D: SmolDevice + ?Sized>(
     interface: &mut smoltcp::iface::Interface,
     timestamp: smoltcp::time::Instant,
@@ -82,14 +84,17 @@ pub struct IfaceCommon {
     pub(super) name: RwLock<String>,
     pub(super) flags: AtomicU32,
     pub(super) mtu: AtomicUsize,
-    /// Linux-visible queue configuration, not a hardware descriptor count.
-    /// Immutable until transmit-queue reconfiguration is supported.
-    tx_queue_len: u32,
+    /// Linux-visible transmit queue length. The current devices do not have a
+    /// software qdisc queue, so this is distinct from hardware ring capacity.
+    tx_queue_len: AtomicU32,
     pub(super) type_: InterfaceType,
     tx_admission: tx_admission::TxAdmission,
     pub(super) smol_iface: Mutex<smoltcp::iface::Interface>,
     /// 存smoltcp网卡的套接字集
-    pub(super) sockets: Mutex<smoltcp::iface::SocketSet<'static>>,
+    /// SocketSet ownership follows a device's namespace epoch. On a netns
+    /// move the active set is replaced; old sockets retain the retired set
+    /// without exposing its receive queues to the destination namespace.
+    pub(super) sockets: RwLock<InterfaceSocketSet>,
     /// 存 kernel wrap smoltcp socket 的集合
     pub(super) bounds: RwLock<Arc<Vec<Arc<dyn InetSocket>>>>,
     /// Lock-free lifecycle summary for DOWN-owner protocol progress. The
@@ -110,6 +115,12 @@ pub struct IfaceCommon {
     pub(super) tx_completion_generation: AtomicU64,
     /// 网络命名空间
     pub(super) net_namespace: RwLock<Weak<NetNamespace>>,
+    /// Even: stable owner. Odd: netns move in progress. A poll snapshot must
+    /// match the active SocketSet selected for the same owner generation.
+    namespace_epoch: AtomicU64,
+    /// One atomic admission word closes and drains polls before a namespace
+    /// move, without holding a spinlock over SocketSet or packet processing.
+    poll_admission: tx_admission::TxAdmission,
     /// 路由相关数据
     pub(super) router_common_data: RouterEnableDeviceCommon,
     /// NAPI 结构体
@@ -128,6 +139,53 @@ pub struct IfaceCommon {
     pub(super) ipv4_multicast_refcnt: Mutex<Vec<(smoltcp::wire::Ipv4Address, usize)>>,
     /// Serializes configured receive-mode flags with AF_PACKET references.
     pub(super) receive_mode: Mutex<ReceiveModeState>,
+}
+
+/// The only allocation needed to associate an interface with a network
+/// namespace. A topology transaction can prepare this before unpublishing an
+/// interface from its old namespace.
+pub(crate) struct PreparedNetnsBinding {
+    netns: Arc<NetNamespace>,
+    ingress: Arc<crate::net::socket::inet::datagram::udp_bindings::NetnsUdpIngress>,
+}
+
+pub(crate) struct PreparedSocketSetMove {
+    sockets: InterfaceSocketSet,
+    bounds: Arc<Vec<Arc<dyn InetSocket>>>,
+}
+
+impl PreparedSocketSetMove {
+    /// Publish only after the source device has been quiesced and unregistered.
+    /// The retired SocketSet remains alive through each old BoundInner Arc.
+    pub(crate) fn publish(self, common: &IfaceCommon) {
+        *common.sockets.write() = self.sockets;
+        *common.bounds.write() = self.bounds;
+        common.bound_socket_count.store(0, Ordering::Release);
+        common
+            .namespace_routed_stack
+            .store(false, Ordering::Release);
+    }
+}
+
+impl PreparedNetnsBinding {
+    pub(crate) fn prepare(netns: &Arc<NetNamespace>, ifindex: usize) -> Result<Self, SystemError> {
+        let ingress = crate::net::socket::inet::datagram::udp_bindings::NetnsUdpIngress::try_new(
+            netns, ifindex,
+        )?;
+        Ok(Self {
+            netns: netns.clone(),
+            ingress,
+        })
+    }
+
+    pub(crate) fn publish(self, common: &IfaceCommon) {
+        let socket_set = common.sockets.read().clone();
+        let mut sockets = socket_set.lock();
+        let mut namespace = common.net_namespace.write();
+        *namespace = Arc::downgrade(&self.netns);
+        sockets.set_udp_ingress_handler(Some(self.ingress));
+        sockets.set_tcp_ingress_handler(Some(self.netns.tcp_stack().clone()));
+    }
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -177,7 +235,7 @@ impl IfaceCommon {
             iface_id,
             name: RwLock::new(name),
             smol_iface: Mutex::new(iface),
-            sockets: Mutex::new(sockets),
+            sockets: RwLock::new(Arc::new(Mutex::new(sockets))),
             bounds: RwLock::new(Arc::new(Vec::new())),
             bound_socket_count: AtomicUsize::new(0),
             namespace_routed_stack: AtomicBool::new(false),
@@ -185,10 +243,12 @@ impl IfaceCommon {
             local_output_tx_backoff_us: AtomicU64::new(Self::LOCAL_OUTPUT_TX_BACKOFF_MIN_US),
             tx_completion_generation: AtomicU64::new(0),
             net_namespace: RwLock::new(Weak::new()),
+            namespace_epoch: AtomicU64::new(0),
+            poll_admission: tx_admission::TxAdmission::new(true),
             router_common_data,
             flags: AtomicU32::new(flags.bits()),
             mtu: AtomicUsize::new(mtu),
-            tx_queue_len: 1000,
+            tx_queue_len: AtomicU32::new(1000),
             type_,
             tx_admission: tx_admission::TxAdmission::new(flags.contains(InterfaceFlags::UP)),
             napi_struct: RwLock::new(None),
@@ -206,38 +266,71 @@ impl IfaceCommon {
 
     pub fn ipv4_multicast_join_ref(
         &self,
+        netns: &Arc<NetNamespace>,
         group: smoltcp::wire::Ipv4Address,
-    ) -> Result<(), smoltcp::iface::MulticastError> {
+    ) -> Result<(), SystemError> {
         let mut guard = self.ipv4_multicast_refcnt.lock();
+        if !self
+            .net_namespace
+            .read()
+            .upgrade()
+            .is_some_and(|owner| Arc::ptr_eq(&owner, netns))
+        {
+            return Err(SystemError::ENODEV);
+        }
         if let Some((_, ref mut cnt)) = guard.iter_mut().find(|(g, _)| *g == group) {
             *cnt = cnt.saturating_add(1);
             return Ok(());
         }
         self.smol_iface
             .lock()
-            .join_multicast_group(smoltcp::wire::IpAddress::Ipv4(group))?;
+            .join_multicast_group(smoltcp::wire::IpAddress::Ipv4(group))
+            .map_err(|error| match error {
+                smoltcp::iface::MulticastError::GroupTableFull => SystemError::ENOBUFS,
+                smoltcp::iface::MulticastError::Unaddressable => SystemError::EINVAL,
+            })?;
         guard.push((group, 1));
         Ok(())
     }
 
-    pub fn ipv4_multicast_leave_ref(&self, group: smoltcp::wire::Ipv4Address) {
+    pub fn ipv4_multicast_leave_ref(
+        &self,
+        netns: &Arc<NetNamespace>,
+        group: smoltcp::wire::Ipv4Address,
+    ) -> Result<(), SystemError> {
         let mut guard = self.ipv4_multicast_refcnt.lock();
+        if !self
+            .net_namespace
+            .read()
+            .upgrade()
+            .is_some_and(|owner| Arc::ptr_eq(&owner, netns))
+        {
+            return Err(SystemError::ENODEV);
+        }
         let Some(pos) = guard.iter().position(|(g, _)| *g == group) else {
-            return;
+            return Ok(());
         };
         if guard[pos].1 > 1 {
             guard[pos].1 -= 1;
-            return;
+            return Ok(());
         }
         guard.swap_remove(pos);
         let _ = self
             .smol_iface
             .lock()
             .leave_multicast_group(smoltcp::wire::IpAddress::Ipv4(group));
+        Ok(())
     }
 
-    pub(super) fn enqueue_local_input(&self, packet: LocalInputPacket) -> Result<(), SystemError> {
-        self.local_input_queue.enqueue(packet)
+    pub(super) fn enqueue_local_input(
+        &self,
+        packet: LocalInputPacket,
+        expected_epoch: Option<u64>,
+    ) -> Result<(), SystemError> {
+        self.local_input_queue.enqueue(packet, || {
+            expected_epoch
+                .is_none_or(|expected| self.namespace_epoch.load(Ordering::Acquire) == expected)
+        })
     }
 
     pub(super) fn enqueue_routed_output(
@@ -526,6 +619,10 @@ impl IfaceCommon {
     {
         let mut force_authoritative = force_authoritative;
         loop {
+            let namespace_epoch = self.namespace_epoch.load(Ordering::Acquire);
+            if namespace_epoch & 1 != 0 {
+                return false;
+            }
             let scope = self.poll_scope();
             match scope {
                 IfacePollScope::None => return false,
@@ -612,7 +709,13 @@ impl IfaceCommon {
             let routed_this_round = route_policy.is_some();
             let owner_is_up = scope == IfacePollScope::Full;
 
-            let mut sockets = self.sockets.lock();
+            let Some(_poll_guard) = self.enter_poll_epoch(namespace_epoch) else {
+                drop(route_policy);
+                drop(router);
+                continue;
+            };
+            let socket_set = self.sockets.read().clone();
+            let mut sockets = socket_set.lock();
             let mut interface = self.smol_iface.lock();
             let timestamp = crate::time::Instant::now().into();
             if self.poll_scope() != scope {
@@ -855,6 +958,10 @@ impl IfaceCommon {
     {
         let mut force_authoritative = force_authoritative;
         loop {
+            let namespace_epoch = self.namespace_epoch.load(Ordering::Acquire);
+            if namespace_epoch & 1 != 0 {
+                return napi::NapiPollResult::idle();
+            }
             let scope = self.poll_scope();
             match scope {
                 IfacePollScope::None => return napi::NapiPollResult::idle(),
@@ -942,7 +1049,13 @@ impl IfaceCommon {
             let routed_this_round = route_policy.is_some();
             let owner_is_up = scope == IfacePollScope::Full;
 
-            let mut sockets = self.sockets.lock();
+            let Some(_poll_guard) = self.enter_poll_epoch(namespace_epoch) else {
+                drop(route_policy);
+                drop(router);
+                continue;
+            };
+            let socket_set = self.sockets.read().clone();
+            let mut sockets = socket_set.lock();
             let mut interface = self.smol_iface.lock();
             let timestamp = crate::time::Instant::now().into();
             if self.poll_scope() != scope {
@@ -1485,6 +1598,16 @@ impl IfaceCommon {
 
     // 需要bounds储存具体的Inet Socket信息，以提供不同种类inet socket的事件分发
     pub fn bind_socket(&self, socket: Arc<dyn InetSocket>) {
+        // A bind begun before a device move may register its wrapper after
+        // the set was retired. Its handle is safely held by the old set, but
+        // the moved interface must not retain or poll this foreign socket.
+        let owner = self.net_namespace.read();
+        if !owner
+            .upgrade()
+            .is_some_and(|netns| Arc::ptr_eq(&netns, &socket.netns()))
+        {
+            return;
+        }
         let mut bounds = self.bounds.write();
         let bounds = Arc::make_mut(&mut *bounds);
         if bounds.iter().any(|bound| Arc::ptr_eq(bound, &socket)) {
@@ -1547,28 +1670,110 @@ impl IfaceCommon {
     }
 
     pub fn set_net_namespace(&self, ns: Arc<NetNamespace>) -> Result<(), SystemError> {
-        // Prepare the only fallible publication input before changing either
-        // side of the interface's namespace association. Holding the namespace
-        // writer until the allocation-free SocketSet install completes means a
-        // poller that observes the namespace also observes its ingress handler.
-        let ingress = crate::net::socket::inet::datagram::udp_bindings::NetnsUdpIngress::try_new(
-            &ns,
-            self.iface_id,
-        )?;
-        let mut namespace = self.net_namespace.write();
-        let mut sockets = self.sockets.lock();
-        *namespace = Arc::downgrade(&ns);
-        sockets.set_udp_ingress_handler(Some(ingress));
-        sockets.set_tcp_ingress_handler(Some(ns.tcp_stack().clone()));
+        PreparedNetnsBinding::prepare(&ns, self.iface_id)?.publish(self);
         Ok(())
     }
 
     pub fn clear_net_namespace(&self) {
+        let socket_set = self.sockets.read().clone();
+        let mut sockets = socket_set.lock();
         let mut namespace = self.net_namespace.write();
-        let mut sockets = self.sockets.lock();
         *namespace = Weak::new();
         sockets.set_udp_ingress_handler(None);
         sockets.set_tcp_ingress_handler(None);
+    }
+
+    /// Capture the SocketSet belonging to this device's current namespace.
+    /// A concurrent netns move may retire the set after this returns, but
+    /// the caller's Arc keeps it alive and it will never receive destination
+    /// namespace ingress.
+    pub(crate) fn add_smol_socket_in_netns<T>(
+        &self,
+        socket: T,
+        netns: &Arc<NetNamespace>,
+    ) -> Result<(InterfaceSocketSet, smoltcp::iface::SocketHandle), (T, SystemError)>
+    where
+        T: smoltcp::socket::AnySocket<'static>,
+    {
+        let owner = self.net_namespace.read();
+        if !owner
+            .upgrade()
+            .is_some_and(|current| Arc::ptr_eq(&current, netns))
+        {
+            return Err((socket, SystemError::ENODEV));
+        }
+        let set = self.sockets.read().clone();
+        drop(owner);
+        let handle = set.lock().add(socket);
+        Ok((set, handle))
+    }
+
+    pub(crate) fn socket_set_in_netns(
+        &self,
+        netns: &Arc<NetNamespace>,
+    ) -> Result<InterfaceSocketSet, SystemError> {
+        let owner = self.net_namespace.read();
+        if !owner
+            .upgrade()
+            .is_some_and(|current| Arc::ptr_eq(&current, netns))
+        {
+            return Err(SystemError::ENODEV);
+        }
+        Ok(self.sockets.read().clone())
+    }
+
+    pub(crate) fn prepare_socket_set_move(&self) -> Result<PreparedSocketSetMove, SystemError> {
+        let sockets = Arc::try_new(Mutex::new(smoltcp::iface::SocketSet::new(Vec::new())))
+            .map_err(|_| SystemError::ENOMEM)?;
+        let bounds = Arc::try_new(Vec::new()).map_err(|_| SystemError::ENOMEM)?;
+        Ok(PreparedSocketSetMove { sockets, bounds })
+    }
+
+    pub(crate) fn begin_netns_move(&self) {
+        debug_assert_eq!(self.namespace_epoch.fetch_add(1, Ordering::AcqRel) & 1, 0);
+    }
+
+    fn enter_poll_epoch(&self, expected: u64) -> Option<tx_admission::TxAdmissionGuard<'_>> {
+        if expected & 1 != 0 {
+            return None;
+        }
+        let guard = self.poll_admission.try_enter()?;
+        if self.namespace_epoch.load(Ordering::Acquire) == expected {
+            Some(guard)
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn wait_for_poll_before_netns_move(&self) {
+        // The atomic CLOSED bit and active count form one admission word, so
+        // neither side can miss the other through store buffering.
+        self.poll_admission.close_and_wait();
+    }
+
+    pub(crate) fn namespace_epoch(&self) -> u64 {
+        self.namespace_epoch.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn end_netns_move(&self) {
+        debug_assert_eq!(self.namespace_epoch.fetch_add(1, Ordering::Release) & 1, 1);
+        self.poll_admission.open();
+    }
+
+    /// Permanent counterpart of a namespace move's temporary poll barrier.
+    /// The device is already quiesced and will never be published again.
+    pub(crate) fn retire_for_device_removal(&self) {
+        self.begin_netns_move();
+        self.wait_for_poll_before_netns_move();
+        self.retire_queued_work_for_netns_move();
+    }
+
+    pub(crate) fn retire_queued_work_for_netns_move(&self) {
+        self.local_input_queue.retire_for_netns_move();
+    }
+
+    pub(crate) fn activate_queued_work_after_netns_move(&self) {
+        self.local_input_queue.activate_after_netns_move();
     }
 
     /// Runs a construction-time mutation while preventing namespace
@@ -1688,7 +1893,12 @@ impl IfaceCommon {
     }
 
     pub fn tx_queue_len(&self) -> u32 {
-        self.tx_queue_len
+        self.tx_queue_len.load(Ordering::Acquire)
+    }
+
+    /// Called under RTNL after the link update has completed validation.
+    pub(crate) fn set_tx_queue_len(&self, len: u32) {
+        self.tx_queue_len.store(len, Ordering::Release);
     }
 
     pub fn mtu(&self) -> usize {

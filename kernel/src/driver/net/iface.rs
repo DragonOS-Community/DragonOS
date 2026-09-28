@@ -160,6 +160,34 @@ pub(crate) fn inject_owned_local_ip_packet_with_context_and_mark<I: Iface + ?Siz
     ct_context: Option<CtPacketContext>,
     mark: u32,
 ) -> Result<(), SystemError> {
+    inject_owned_local_ip_packet_if_epoch(
+        iface,
+        ingress_ifindex,
+        source_mac,
+        ip_packet,
+        broadcast,
+        origin,
+        ct_context,
+        mark,
+        None,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "explicit packet provenance and device ownership at local handoff"
+)]
+pub(crate) fn inject_owned_local_ip_packet_if_epoch<I: Iface + ?Sized>(
+    iface: &I,
+    ingress_ifindex: u32,
+    source_mac: smoltcp::wire::EthernetAddress,
+    ip_packet: Vec<u8>,
+    broadcast: bool,
+    origin: LocalPacketOrigin,
+    ct_context: Option<CtPacketContext>,
+    mark: u32,
+    expected_epoch: Option<u64>,
+) -> Result<(), SystemError> {
     if ct_context.is_some() && origin == LocalPacketOrigin::LinkIngressPending {
         return Err(SystemError::EINVAL);
     }
@@ -187,7 +215,7 @@ pub(crate) fn inject_owned_local_ip_packet_with_context_and_mark<I: Iface + ?Siz
     if napi.is_none() && netns.is_none() {
         return Err(SystemError::ENODEV);
     }
-    iface.common().enqueue_local_input(packet)?;
+    iface.common().enqueue_local_input(packet, expected_epoch)?;
     iface
         .common()
         .namespace_routed_stack
@@ -529,8 +557,8 @@ pub trait Iface: crate::driver::base::device::Device {
 
     /// # `sockets`
     /// 获取网卡的套接字集
-    fn sockets(&self) -> &Mutex<smoltcp::iface::SocketSet<'static>> {
-        &self.common().sockets
+    fn sockets(&self) -> Arc<Mutex<smoltcp::iface::SocketSet<'static>>> {
+        self.common().sockets.read().clone()
     }
 
     fn addr_assign_type(&self) -> u8;
@@ -693,6 +721,16 @@ pub(crate) fn register_netdevice(
     netns: &Arc<NetNamespace>,
     dev: Arc<dyn Iface>,
 ) -> Result<(), SystemError> {
+    let rtnl = crate::net::rtnl::lock();
+    register_netdevice_locked(&rtnl, netns, dev)
+}
+
+/// Register while RTNL is already held by a rtnetlink control operation.
+pub(crate) fn register_netdevice_locked(
+    rtnl: &crate::net::rtnl::RtnlGuard,
+    netns: &Arc<NetNamespace>,
+    dev: Arc<dyn Iface>,
+) -> Result<(), SystemError> {
     if !Arc::ptr_eq(
         netns,
         &crate::process::namespace::net_namespace::INIT_NET_NAMESPACE,
@@ -704,11 +742,15 @@ pub(crate) fn register_netdevice(
     // Register driver-core/sysfs first. Until PRESENT and the namespace/FIB
     // transaction both commit, the object is provisional and unannounced.
     netdev_register_kobject(netns, dev.clone())?;
-    if let Err(error) = register_netdevice_in_namespace(netns, dev.clone()) {
+    if let Err(error) = register_netdevice_in_namespace_locked(rtnl, netns, dev.clone()) {
         // No add uevent has been sent, so rollback is structural and must not
         // allocate notification state before removing the provisional object.
         netdev_unregister_kobject(dev);
         return Err(error);
+    }
+
+    if let Some(napi) = dev.napi_struct() {
+        napi::napi_enable(&napi);
     }
 
     netdev_emit_uevent(dev, "add");
@@ -724,12 +766,120 @@ pub(crate) fn register_netdevice_in_namespace(
     netns: &Arc<NetNamespace>,
     dev: Arc<dyn Iface>,
 ) -> Result<(), SystemError> {
+    let rtnl = crate::net::rtnl::lock();
+    register_netdevice_in_namespace_locked(&rtnl, netns, dev)
+}
+
+pub(crate) fn register_netdevice_in_namespace_locked(
+    rtnl: &crate::net::rtnl::RtnlGuard,
+    netns: &Arc<NetNamespace>,
+    dev: Arc<dyn Iface>,
+) -> Result<(), SystemError> {
     dev.set_net_state(NetDeivceState::__LINK_STATE_PRESENT);
-    if let Err(error) = netns.add_device(dev.clone()) {
+    if let Err(error) = netns.add_device_locked(rtnl, dev.clone()) {
         dev.clear_net_state(NetDeivceState::__LINK_STATE_PRESENT);
         return Err(error);
     }
     Ok(())
+}
+
+/// Remove a software netdevice from a live namespace. RTNL serializes the
+/// topology change; no NAPI owner or TX admission may survive publication.
+pub(crate) fn unregister_netdevice_locked(
+    rtnl: &crate::net::rtnl::RtnlGuard,
+    netns: &Arc<NetNamespace>,
+    dev: Arc<dyn Iface>,
+) -> Result<(), SystemError> {
+    let prepared = prepare_unregister_netdevices_locked(rtnl, netns, core::slice::from_ref(&dev))?;
+    prepared.quiesce();
+    prepared.publish_quiesced();
+    Ok(())
+}
+
+/// A removal whose FIB and namespace-map work is already prepared. RTNL must
+/// remain held until publication; no allocation may be needed after quiesce.
+pub(crate) struct PreparedNetdeviceRemoval<'rtnl> {
+    devices: Vec<Arc<dyn Iface>>,
+    namespace: crate::process::namespace::net_namespace::PreparedNetnsDeviceRemoval<'rtnl>,
+}
+
+impl PreparedNetdeviceRemoval<'_> {
+    pub(crate) fn quiesce(&self) {
+        for dev in &self.devices {
+            dev.common().close_tx_and_wait();
+            dev.begin_admin_down();
+        }
+        for dev in &self.devices {
+            if let Some(napi) = dev.napi_struct() {
+                napi::napi_pause_and_wait(&napi);
+            }
+            dev.quiesce_admin_down();
+        }
+    }
+
+    /// The caller has already stopped every device, for example by shutting
+    /// down both veth endpoints together before either is unpublished.
+    pub(crate) fn publish_quiesced(self) {
+        for dev in &self.devices {
+            if let Some(napi) = dev.napi_struct() {
+                if !napi::napi_is_disabled(&napi) {
+                    napi::napi_disable(&napi);
+                }
+            }
+            dev.common().retire_for_device_removal();
+        }
+        self.namespace.publish();
+        for dev in self.devices {
+            // Keep the old namespace and sysfs identity through the event.
+            netdev_emit_uevent(dev.clone(), "remove");
+            dev.clear_net_state(NetDeivceState::__LINK_STATE_PRESENT);
+            netdev_unregister_kobject(dev.clone());
+            dev.clear_net_namespace();
+        }
+    }
+
+    /// A namespace move preserves the netdevice and its sysfs inode. The
+    /// prepared target addition publishes the new owner after this step.
+    pub(crate) fn publish_moving(self) {
+        self.namespace.publish();
+        for dev in self.devices {
+            dev.clear_net_namespace();
+        }
+    }
+}
+
+pub(crate) fn prepare_unregister_netdevices_locked<'rtnl>(
+    rtnl: &'rtnl crate::net::rtnl::RtnlGuard,
+    netns: &Arc<NetNamespace>,
+    devices: &[Arc<dyn Iface>],
+) -> Result<PreparedNetdeviceRemoval<'rtnl>, SystemError> {
+    prepare_unregister_netdevices_from_locked(rtnl, netns, devices, None)
+}
+
+pub(crate) fn prepare_unregister_netdevices_from_locked<'rtnl>(
+    rtnl: &'rtnl crate::net::rtnl::RtnlGuard,
+    netns: &Arc<NetNamespace>,
+    devices: &[Arc<dyn Iface>],
+    staged_before: Option<crate::net::link::StagedLinkFib<'_>>,
+) -> Result<PreparedNetdeviceRemoval<'rtnl>, SystemError> {
+    let mut owned = Vec::new();
+    owned
+        .try_reserve_exact(devices.len())
+        .map_err(|_| SystemError::ENOMEM)?;
+    for dev in devices {
+        if !dev
+            .net_namespace()
+            .is_some_and(|owner| Arc::ptr_eq(&owner, netns))
+        {
+            return Err(SystemError::ENODEV);
+        }
+        owned.push(dev.clone());
+    }
+    let namespace = netns.prepare_remove_devices_from_locked(rtnl, &owned, staged_before)?;
+    Ok(PreparedNetdeviceRemoval {
+        devices: owned,
+        namespace,
+    })
 }
 
 #[derive(Debug)]

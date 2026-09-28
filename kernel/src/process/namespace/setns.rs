@@ -180,7 +180,7 @@ pub fn ksys_setns(fd: i32, nstype: i32) -> Result<(), SystemError> {
 
         // 基于当前任务的 NsProxy 构造新的代理，并按 flag 覆盖为目标的各命名空间
         let cur_nsproxy = current.nsproxy();
-        let target_nsproxy = target.nsproxy();
+        let target_nsproxy = target.try_nsproxy().ok_or(SystemError::ESRCH)?;
 
         let mut new_inner: NsProxy = cur_nsproxy.clone_inner();
 

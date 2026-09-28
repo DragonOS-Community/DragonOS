@@ -1819,6 +1819,48 @@ fn run_pr3_selftest() -> Result<(), &'static str> {
         return Err("RcuOptionArcSlot drop object was not released after final reader pin");
     }
 
+    // Task nsproxy uses a prepared replacement while live, then clears the
+    // optional slot at exit. Neither transition may release an RCU reader's
+    // pinned reference early.
+    let prepared_old_drops = Arc::new(AtomicUsize::new(0));
+    let prepared_new_drops = Arc::new(AtomicUsize::new(0));
+    let prepared_slot = RcuOptionArcSlot::new_some(Arc::new(RcuSelftestDropProbe {
+        id: 9,
+        drops: prepared_old_drops.clone(),
+    }));
+    let pinned_old = prepared_slot
+        .load()
+        .ok_or("prepared optional slot started empty")?;
+    let prepared_retire = PreparedRcuArcRetire::prepare()
+        .map_err(|_| "prepared optional RCU retirement reservation failed")?;
+    prepared_slot
+        .swap_prepared(
+            Arc::new(RcuSelftestDropProbe {
+                id: 10,
+                drops: prepared_new_drops.clone(),
+            }),
+            prepared_retire,
+        )
+        .enqueue();
+    rcu_barrier();
+    if prepared_old_drops.load(Ordering::SeqCst) != 0
+        || prepared_slot.load().map(|value| value.id) != Some(10)
+    {
+        return Err("prepared optional RCU replacement lost a live reader or new publication");
+    }
+    drop(pinned_old);
+    if prepared_old_drops.load(Ordering::SeqCst) != 1 {
+        return Err("prepared optional RCU replacement retained the old object");
+    }
+    // SAFETY: transfer the removed slot-owned reference to RCU immediately.
+    let removed = unsafe { prepared_slot.swap(None) }
+        .ok_or("prepared optional RCU slot unexpectedly empty at exit")?;
+    rcu_defer_drop(removed);
+    rcu_barrier();
+    if prepared_slot.load().is_some() || prepared_new_drops.load(Ordering::SeqCst) != 1 {
+        return Err("prepared optional RCU slot did not release its final owner at exit");
+    }
+
     run_option_slot_cross_thread_lifecycle_selftest()?;
 
     Ok(())

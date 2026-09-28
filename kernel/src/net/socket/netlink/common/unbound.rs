@@ -24,7 +24,7 @@ pub struct UnboundNetlink<P: SupportedNetlinkProtocol> {
     epoll_items: Arc<EPollItems>,
     fasync_items: Arc<FAsyncItems>,
     opener_cred: Arc<Cred>,
-    phantom: PhantomData<BoundNetlink<P::Message>>,
+    phantom: PhantomData<BoundNetlink<P>>,
 }
 
 impl<P: SupportedNetlinkProtocol> UnboundNetlink<P> {
@@ -57,14 +57,14 @@ impl<P: SupportedNetlinkProtocol> UnboundNetlink<P> {
 
 impl<P: SupportedNetlinkProtocol> datagram_common::Unbound for UnboundNetlink<P> {
     type Endpoint = NetlinkSocketAddr;
-    type Bound = BoundNetlink<P::Message>;
+    type Bound = BoundNetlink<P>;
 
     fn bind(
         &mut self,
         endpoint: &Self::Endpoint,
         wait_queue: Arc<WaitQueue>,
         netns: Arc<NetNamespace>,
-    ) -> Result<BoundNetlink<P::Message>, SystemError> {
+    ) -> Result<BoundNetlink<P>, SystemError> {
         let message_queue = P::new_message_queue();
         let bound_handle = {
             let endpoint = {
@@ -94,7 +94,7 @@ impl<P: SupportedNetlinkProtocol> datagram_common::Unbound for UnboundNetlink<P>
         _remote_endpoint: &Self::Endpoint,
         wait_queue: Arc<WaitQueue>,
         netns: Arc<NetNamespace>,
-    ) -> Result<BoundNetlink<P::Message>, SystemError> {
+    ) -> Result<BoundNetlink<P>, SystemError> {
         let message_queue = P::new_message_queue();
 
         let bound_handle = {

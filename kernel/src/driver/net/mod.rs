@@ -14,6 +14,7 @@ use crate::driver::net::napi::NapiStruct;
 use crate::driver::net::types::{InterfaceFlags, InterfaceType};
 use crate::libs::rwsem::RwSemReadGuard;
 use crate::libs::spinlock::SpinLock;
+use crate::net::ingress::IngressStage;
 use crate::net::routing::RouterEnableDeviceCommon;
 use crate::process::namespace::net_namespace::NetNamespace;
 use crate::{
@@ -42,8 +43,8 @@ mod deferred_queue;
 mod iface;
 mod iface_common;
 mod iface_deadline;
-mod local_output;
-mod local_queue;
+pub(crate) mod local_output;
+pub(crate) mod local_queue;
 pub(crate) mod tcp_output;
 mod tx_admission;
 

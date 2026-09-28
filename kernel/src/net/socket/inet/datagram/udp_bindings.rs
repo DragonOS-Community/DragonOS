@@ -12,8 +12,9 @@ use system_error::SystemError;
 
 use crate::arch::rand::rand;
 use crate::libs::mutex::Mutex;
+use crate::process::namespace::NamespaceOps;
 
-use super::UdpSocket;
+use super::{multicast_loopback::multicast_registry, UdpSocket};
 use crate::process::namespace::net_namespace::NetNamespace;
 
 #[derive(Debug)]
@@ -41,14 +42,26 @@ impl smoltcp::iface::UdpIngressHandler for NetnsUdpIngress {
         is_broadcast: bool,
         payload: &[u8],
     ) -> smoltcp::iface::UdpIngressResult {
-        let smoltcp::wire::IpRepr::Ipv4(ipv4) = ip_repr else {
-            return smoltcp::iface::UdpIngressResult::NotHandled;
+        let (src_addr, dest_addr) = match ip_repr {
+            smoltcp::wire::IpRepr::Ipv4(ipv4) => (
+                IpAddress::Ipv4(ipv4.src_addr),
+                IpAddress::Ipv4(ipv4.dst_addr),
+            ),
+            smoltcp::wire::IpRepr::Ipv6(ipv6) if !ipv6.dst_addr.is_multicast() => (
+                IpAddress::Ipv6(ipv6.src_addr),
+                IpAddress::Ipv6(ipv6.dst_addr),
+            ),
+            // IPv6 multicast still uses the existing socket delivery path
+            // until its membership table is shared with this ingress handler.
+            smoltcp::wire::IpRepr::Ipv6(_) => {
+                return smoltcp::iface::UdpIngressResult::NotHandled;
+            }
         };
         let Some(netns) = self.netns.upgrade() else {
             return smoltcp::iface::UdpIngressResult::NotHandled;
         };
-        let src = IpEndpoint::new(IpAddress::Ipv4(ipv4.src_addr), udp_repr.src_port);
-        let dest = IpEndpoint::new(IpAddress::Ipv4(ipv4.dst_addr), udp_repr.dst_port);
+        let src = IpEndpoint::new(src_addr, udp_repr.src_port);
+        let dest = IpEndpoint::new(dest_addr, udp_repr.dst_port);
         // Namespace-local handoff preserves Linux's skb_iif in PacketMeta.
         // Physical ingress uses the handler owner's ifindex as the fallback.
         // Socket device binding must match the original ingress device, not
@@ -57,6 +70,31 @@ impl smoltcp::iface::UdpIngressHandler for NetnsUdpIngress {
             .ok()
             .filter(|ifindex| *ifindex > 0)
             .unwrap_or(self.ifindex);
+        if let IpAddress::Ipv4(group) = dest.addr {
+            if group.is_multicast() {
+                // Linux checks interface group membership before UDP socket
+                // fanout. IP_MULTICAST_ALL only widens the set of sockets on
+                // an interface that has actually joined the group.
+                let group = u32::from_ne_bytes(group.octets());
+                if multicast_registry().has_membership(
+                    netns.ns_common().nsid.data(),
+                    group,
+                    ingress_ifindex,
+                ) {
+                    netns.udp_bindings().deliver_ingress(
+                        dest,
+                        src,
+                        ingress_ifindex,
+                        is_broadcast,
+                        meta,
+                        payload,
+                    );
+                }
+                // No multicast listener must not fall through to smoltcp's
+                // single-socket demux or generate ICMP port unreachable.
+                return smoltcp::iface::UdpIngressResult::Consumed;
+            }
+        }
         if netns.udp_bindings().deliver_ingress(
             dest,
             src,

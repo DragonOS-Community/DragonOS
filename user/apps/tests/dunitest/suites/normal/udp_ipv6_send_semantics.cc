@@ -9,6 +9,7 @@
 #include <netinet/in.h>
 #include <netdb.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <linux/errqueue.h>
 #include <sys/syscall.h>
 #include <sys/socket.h>
@@ -122,6 +123,80 @@ void CheckOversizeErrqueue(int fd, const sockaddr* destination, socklen_t length
 }
 
 }  // namespace
+
+TEST(UdpIpv6SendSemantics, LoopbackDatagramUsesIpv6IngressBinding) {
+    FdGuard receiver(socket(AF_INET6, SOCK_DGRAM, 0));
+    FdGuard sender(socket(AF_INET6, SOCK_DGRAM, 0));
+    ASSERT_GE(receiver.Get(), 0);
+    ASSERT_GE(sender.Get(), 0);
+
+    sockaddr_in6 destination = MakeIpv6Addr("::1", 0);
+    ASSERT_EQ(bind(receiver.Get(), reinterpret_cast<sockaddr*>(&destination),
+                   sizeof(destination)), 0)
+        << ErrnoString(errno);
+    socklen_t destination_length = sizeof(destination);
+    ASSERT_EQ(getsockname(receiver.Get(), reinterpret_cast<sockaddr*>(&destination),
+                          &destination_length), 0);
+
+    constexpr char kPayload[] = "ipv6-ingress";
+    ASSERT_EQ(sendto(sender.Get(), kPayload, sizeof(kPayload), 0,
+                     reinterpret_cast<sockaddr*>(&destination), sizeof(destination)),
+              static_cast<ssize_t>(sizeof(kPayload)))
+        << ErrnoString(errno);
+    pollfd ready {receiver.Get(), POLLIN, 0};
+    ASSERT_EQ(poll(&ready, 1, 1000), 1) << ErrnoString(errno);
+    char received[sizeof(kPayload)] {};
+    ASSERT_EQ(recv(receiver.Get(), received, sizeof(received), 0),
+              static_cast<ssize_t>(sizeof(kPayload)))
+        << ErrnoString(errno);
+    EXPECT_EQ(std::memcmp(received, kPayload, sizeof(kPayload)), 0);
+}
+
+TEST(UdpIpv6SendSemantics, LoopbackOversizeDatagramIsReassembled) {
+    FdGuard receiver(socket(AF_INET6, SOCK_DGRAM, 0));
+    FdGuard sender(socket(AF_INET6, SOCK_DGRAM, 0));
+    ASSERT_GE(receiver.Get(), 0);
+    ASSERT_GE(sender.Get(), 0);
+    sockaddr_in6 destination = MakeIpv6Addr("::1", 0);
+    ASSERT_EQ(bind(receiver.Get(), reinterpret_cast<sockaddr*>(&destination),
+                   sizeof(destination)), 0);
+    socklen_t length = sizeof(destination);
+    ASSERT_EQ(getsockname(receiver.Get(), reinterpret_cast<sockaddr*>(&destination), &length), 0);
+    std::vector<unsigned char> payload(65527);
+    for (size_t i = 0; i < payload.size(); ++i) payload[i] = (i * 17 + 9) % 251;
+    ASSERT_EQ(sendto(sender.Get(), payload.data(), payload.size(), 0,
+                     reinterpret_cast<sockaddr*>(&destination), sizeof(destination)),
+              static_cast<ssize_t>(payload.size())) << ErrnoString(errno);
+    pollfd ready {receiver.Get(), POLLIN, 0};
+    ASSERT_EQ(poll(&ready, 1, 1000), 1) << ErrnoString(errno);
+    std::vector<unsigned char> received(payload.size());
+    ASSERT_EQ(recv(receiver.Get(), received.data(), received.size(), 0),
+              static_cast<ssize_t>(payload.size())) << ErrnoString(errno);
+    EXPECT_EQ(received, payload);
+}
+
+TEST(UdpIpv6SendSemantics, ImplicitPortBindKeepsWildcardLocalAddress) {
+    FdGuard receiver(socket(AF_INET6, SOCK_DGRAM, 0));
+    FdGuard sender(socket(AF_INET6, SOCK_DGRAM, 0));
+    ASSERT_GE(receiver.Get(), 0);
+    ASSERT_GE(sender.Get(), 0);
+    sockaddr_in6 destination = MakeIpv6Addr("::1", 0);
+    ASSERT_EQ(bind(receiver.Get(), reinterpret_cast<sockaddr*>(&destination),
+                   sizeof(destination)), 0);
+    socklen_t length = sizeof(destination);
+    ASSERT_EQ(getsockname(receiver.Get(), reinterpret_cast<sockaddr*>(&destination),
+                          &length), 0);
+    const char probe = 'x';
+    ASSERT_EQ(sendto(sender.Get(), &probe, 1, 0,
+                     reinterpret_cast<sockaddr*>(&destination), sizeof(destination)), 1);
+
+    sockaddr_in6 local{};
+    length = sizeof(local);
+    ASSERT_EQ(getsockname(sender.Get(), reinterpret_cast<sockaddr*>(&local), &length), 0);
+    EXPECT_EQ(length, sizeof(local));
+    EXPECT_EQ(std::memcmp(&local.sin6_addr, &in6addr_any, sizeof(in6_addr)), 0);
+    EXPECT_NE(local.sin6_port, 0);
+}
 
 TEST(UdpIpv6SendSemantics, OversizeErrqueueUsesPacketFamily) {
     // IPv4 socket, IPv6 socket with IPv4 sockaddr, mapped IPv6, native IPv6.

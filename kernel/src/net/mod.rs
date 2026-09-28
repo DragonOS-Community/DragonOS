@@ -7,8 +7,14 @@ use core::sync::atomic::AtomicUsize;
 use crate::driver::net::Iface;
 
 pub(crate) mod address;
+pub(crate) mod conntrack;
+pub(crate) mod ingress;
+pub(crate) mod ipv4_defrag;
+pub(crate) mod ipv6_defrag;
 pub(crate) mod link;
 pub mod neighbor;
+pub(crate) mod nftables;
+pub(crate) mod output;
 pub mod posix;
 pub(crate) mod route;
 pub mod routing;

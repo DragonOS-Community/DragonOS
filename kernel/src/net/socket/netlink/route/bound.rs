@@ -28,7 +28,7 @@ use alloc::sync::Arc;
 use core::mem::size_of;
 use system_error::SystemError;
 
-impl datagram_common::Bound for BoundNetlink<RouteNlMessage> {
+impl datagram_common::Bound for BoundNetlink<NetlinkRouteProtocol> {
     type Endpoint = NetlinkSocketAddr;
 
     fn bind(&mut self, endpoint: &Self::Endpoint) -> Result<(), SystemError> {

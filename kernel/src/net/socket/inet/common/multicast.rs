@@ -188,7 +188,7 @@ pub fn apply_ipv4_membership(
     opt: IpOption,
     val: &[u8],
     groups: &Mutex<Vec<Ipv4MulticastMembership>>,
-) -> Result<(), SystemError> {
+) -> Result<(u32, i32), SystemError> {
     let (multi, ifaddr, ifindex) = parse_mreqn_for_membership(val)?;
     if !is_ipv4_multicast(multi) {
         return Err(SystemError::EINVAL);
@@ -256,23 +256,14 @@ pub fn apply_ipv4_membership(
                 });
             }
 
-            Ok(())
+            Ok((multi, resolved_ifindex))
         }
         IpOption::DROP_MEMBERSHIP => {
             let did_remove = {
                 let mut groups = groups.lock();
-                let pos = groups.iter().position(|g| {
-                    if g.multiaddr != multi {
-                        return false;
-                    }
-                    if ifindex != 0 {
-                        return g.ifindex == resolved_ifindex;
-                    }
-                    if ifaddr != 0 {
-                        return g.ifaddr == ifaddr;
-                    }
-                    true
-                });
+                let pos = groups
+                    .iter()
+                    .position(|g| g.multiaddr == multi && g.ifindex == resolved_ifindex);
                 if let Some(idx) = pos {
                     groups.swap_remove(idx);
                     true
@@ -286,7 +277,7 @@ pub fn apply_ipv4_membership(
             }
 
             iface.common().ipv4_multicast_leave_ref(multi_ipv4);
-            Ok(())
+            Ok((multi, resolved_ifindex))
         }
         _ => Err(SystemError::ENOPROTOOPT),
     }

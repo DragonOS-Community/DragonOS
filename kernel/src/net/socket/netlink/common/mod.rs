@@ -57,7 +57,7 @@ impl TryFrom<u32> for NetlinkSockOpt {
 
 #[derive(Debug)]
 pub struct NetlinkSocket<P: SupportedNetlinkProtocol> {
-    inner: RwSem<Inner<UnboundNetlink<P>, BoundNetlink<P::Message>>>,
+    inner: RwSem<Inner<UnboundNetlink<P>, BoundNetlink<P>>>,
 
     is_nonblocking: AtomicBool,
     wait_queue: Arc<WaitQueue>,
@@ -76,7 +76,7 @@ pub struct NetlinkSocket<P: SupportedNetlinkProtocol> {
 
 impl<P: SupportedNetlinkProtocol> NetlinkSocket<P>
 where
-    BoundNetlink<P::Message>: Bound<Endpoint = NetlinkSocketAddr>,
+    BoundNetlink<P>: Bound<Endpoint = NetlinkSocketAddr>,
 {
     pub fn new(is_nonblocking: bool, socket_type: PSOCK, protocol: u32) -> Arc<Self> {
         let wait_queue = Arc::new(WaitQueue::default());
@@ -393,7 +393,7 @@ where
 
 impl<P: SupportedNetlinkProtocol + 'static> Socket for NetlinkSocket<P>
 where
-    BoundNetlink<P::Message>: Bound<Endpoint = NetlinkSocketAddr>,
+    BoundNetlink<P>: Bound<Endpoint = NetlinkSocketAddr>,
 {
     fn netns(&self) -> Arc<NetNamespace> {
         NetlinkSocket::netns(self)
@@ -760,7 +760,7 @@ fn read_group_membership_sockopt<P: SupportedNetlinkProtocol>(
 }
 
 // 多播消息的时候会用到，比如uevent
-impl<P: SupportedNetlinkProtocol> Inner<UnboundNetlink<P>, BoundNetlink<P::Message>> {
+impl<P: SupportedNetlinkProtocol> Inner<UnboundNetlink<P>, BoundNetlink<P>> {
     #[allow(unused)]
     fn add_groups(&mut self, groups: GroupIdSet) {
         match self {

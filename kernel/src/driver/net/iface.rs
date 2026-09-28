@@ -1,4 +1,5 @@
 use super::*;
+use crate::net::conntrack::CtPacketContext;
 
 kernel_cmdline_param_arg!(
     NET_TEST_FIXTURES_PARAM,
@@ -106,6 +107,152 @@ impl From<SystemError> for RouteSendError {
     fn from(error: SystemError) -> Self {
         Self::Failed(error)
     }
+}
+
+/// Why an IP datagram enters another local protocol stack. Output-originated
+/// local delivery enters the receive path as loopback input and traverses
+/// PRE_ROUTING once. An inter-interface handoff preserves whether that hook
+/// has already executed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LocalPacketOrigin {
+    LinkIngressPending,
+    LinkIngressPreRouted,
+    LocalOutput,
+    LocalInputDone,
+}
+
+/// Internal handoff keeps an unconfirmed connection identity with its packet
+/// without exposing conntrack internals through the public `Iface` trait.
+/// Local output can carry that identity into loopback PRE_ROUTING; a fresh
+/// link-ingress packet must never inherit one.
+pub(crate) fn inject_owned_local_ip_packet_with_context<I: Iface + ?Sized>(
+    iface: &I,
+    ingress_ifindex: u32,
+    source_mac: smoltcp::wire::EthernetAddress,
+    ip_packet: Vec<u8>,
+    broadcast: bool,
+    origin: LocalPacketOrigin,
+    ct_context: Option<CtPacketContext>,
+) -> Result<(), SystemError> {
+    inject_owned_local_ip_packet_with_context_and_mark(
+        iface,
+        ingress_ifindex,
+        source_mac,
+        ip_packet,
+        broadcast,
+        origin,
+        ct_context,
+        0,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "explicit packet provenance at local handoff"
+)]
+pub(crate) fn inject_owned_local_ip_packet_with_context_and_mark<I: Iface + ?Sized>(
+    iface: &I,
+    ingress_ifindex: u32,
+    source_mac: smoltcp::wire::EthernetAddress,
+    ip_packet: Vec<u8>,
+    broadcast: bool,
+    origin: LocalPacketOrigin,
+    ct_context: Option<CtPacketContext>,
+    mark: u32,
+) -> Result<(), SystemError> {
+    if ct_context.is_some() && origin == LocalPacketOrigin::LinkIngressPending {
+        return Err(SystemError::EINVAL);
+    }
+    let packet = LocalInputPacket {
+        ingress_ifindex,
+        ingress_stage: match origin {
+            LocalPacketOrigin::LinkIngressPending => IngressStage::Pending,
+            LocalPacketOrigin::LinkIngressPreRouted => IngressStage::PreRoutingDone,
+            LocalPacketOrigin::LocalOutput => IngressStage::LocalOutput,
+            LocalPacketOrigin::LocalInputDone => IngressStage::LocalInputDone,
+        },
+        destination_mac: if broadcast {
+            smoltcp::wire::EthernetAddress::BROADCAST
+        } else {
+            iface.mac()
+        },
+        source_mac,
+        ip_packet,
+        ct_context,
+        mark,
+    };
+
+    let napi = iface.napi_struct();
+    let netns = napi.is_none().then(|| iface.net_namespace()).flatten();
+    if napi.is_none() && netns.is_none() {
+        return Err(SystemError::ENODEV);
+    }
+    iface.common().enqueue_local_input(packet)?;
+    iface
+        .common()
+        .namespace_routed_stack
+        .store(true, Ordering::Release);
+    if let Some(napi) = napi {
+        napi::napi_schedule(napi);
+    } else if let Some(netns) = netns {
+        netns.wakeup_poll_thread();
+    }
+    Ok(())
+}
+
+/// Copy only the wire bytes when the output queue must retain its original
+/// datagram (for example, a fragment that may be retried). The CT identity is
+/// cloned by the caller so this handoff cannot consume the original's state.
+pub(crate) fn inject_local_ip_packet_with_context<I: Iface + ?Sized>(
+    iface: &I,
+    ingress_ifindex: u32,
+    source_mac: smoltcp::wire::EthernetAddress,
+    ip_packet: &[u8],
+    broadcast: bool,
+    origin: LocalPacketOrigin,
+    ct_context: Option<CtPacketContext>,
+) -> Result<(), SystemError> {
+    inject_local_ip_packet_with_context_and_mark(
+        iface,
+        ingress_ifindex,
+        source_mac,
+        ip_packet,
+        broadcast,
+        origin,
+        ct_context,
+        0,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "explicit packet provenance at local handoff"
+)]
+pub(crate) fn inject_local_ip_packet_with_context_and_mark<I: Iface + ?Sized>(
+    iface: &I,
+    ingress_ifindex: u32,
+    source_mac: smoltcp::wire::EthernetAddress,
+    ip_packet: &[u8],
+    broadcast: bool,
+    origin: LocalPacketOrigin,
+    ct_context: Option<CtPacketContext>,
+    mark: u32,
+) -> Result<(), SystemError> {
+    let mut owned_packet = Vec::new();
+    owned_packet
+        .try_reserve_exact(ip_packet.len())
+        .map_err(|_| SystemError::ENOMEM)?;
+    owned_packet.extend_from_slice(ip_packet);
+    inject_owned_local_ip_packet_with_context_and_mark(
+        iface,
+        ingress_ifindex,
+        source_mac,
+        owned_packet,
+        broadcast,
+        origin,
+        ct_context,
+        mark,
+    )
 }
 
 #[allow(dead_code)]
@@ -246,7 +393,7 @@ pub trait Iface: crate::driver::base::device::Device {
         }
     }
 
-    /// Send an already-routed IPv4 packet, transferring ownership to this
+    /// Send an already-routed IP packet, transferring ownership to this
     /// interface's bounded output queue when immediate progress is impossible.
     /// The caller may consume the ingress packet after this returns `Ok(())`.
     fn route_and_send_or_queue(
@@ -337,38 +484,40 @@ pub trait Iface: crate::driver::base::device::Device {
         source_mac: smoltcp::wire::EthernetAddress,
         ip_packet: &[u8],
         broadcast: bool,
+        origin: LocalPacketOrigin,
     ) -> Result<(), SystemError> {
-        let mut owned_packet = Vec::new();
-        owned_packet
-            .try_reserve_exact(ip_packet.len())
-            .map_err(|_| SystemError::ENOMEM)?;
-        owned_packet.extend_from_slice(ip_packet);
-        let packet = LocalInputPacket {
+        inject_local_ip_packet_with_context(
+            self,
             ingress_ifindex,
-            destination_mac: if broadcast {
-                smoltcp::wire::EthernetAddress::BROADCAST
-            } else {
-                self.mac()
-            },
             source_mac,
-            ip_packet: owned_packet,
-        };
+            ip_packet,
+            broadcast,
+            origin,
+            None,
+        )
+    }
 
-        let napi = self.napi_struct();
-        let netns = napi.is_none().then(|| self.net_namespace()).flatten();
-        if napi.is_none() && netns.is_none() {
-            return Err(SystemError::ENODEV);
-        }
-        self.common().enqueue_local_input(packet)?;
-        self.common()
-            .namespace_routed_stack
-            .store(true, Ordering::Release);
-        if let Some(napi) = napi {
-            napi::napi_schedule(napi);
-        } else if let Some(netns) = netns {
-            netns.wakeup_poll_thread();
-        }
-        Ok(())
+    /// Move an IP datagram to its local socket owner without another copy.
+    /// The caller supplies the packet's trusted ingress provenance. A routed
+    /// packet marked PRE_ROUTING-complete keeps its original interface/MAC
+    /// and must not execute that hook again at the owner.
+    fn inject_owned_local_ip_packet(
+        &self,
+        ingress_ifindex: u32,
+        source_mac: smoltcp::wire::EthernetAddress,
+        ip_packet: Vec<u8>,
+        broadcast: bool,
+        origin: LocalPacketOrigin,
+    ) -> Result<(), SystemError> {
+        inject_owned_local_ip_packet_with_context(
+            self,
+            ingress_ifindex,
+            source_mac,
+            ip_packet,
+            broadcast,
+            origin,
+            None,
+        )
     }
 
     /// @brief 获取smoltcp的网卡接口类型

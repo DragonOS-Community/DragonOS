@@ -152,6 +152,35 @@ void ExpectCrossOwnerUdpReply(CrossOwnerBindMode mode, uint32_t egress, uint32_t
 
 }  // namespace
 
+TEST(RtnetlinkRouteSemantics, Ipv6MulticastRouteFollowsAdministrativeLinkState) {
+    FdGuard fd(OpenRouteSocket());
+    ASSERT_GE(fd.Get(), 0) << ErrnoString(errno);
+    const uint32_t iface = if_nametoindex("veth-host1");
+    ASSERT_NE(iface, 0u);
+    const uint32_t lo = if_nametoindex("lo");
+    ASSERT_NE(lo, 0u);
+    uint32_t seq = 8600;
+
+    const auto present = FindIpv6Route(fd.Get(), "ff00::", 8, iface, ++seq);
+    ASSERT_TRUE(present.has_value());
+    EXPECT_EQ(present->priority, 256u);
+    EXPECT_EQ(present->scope, RT_SCOPE_UNIVERSE);
+    EXPECT_FALSE(FindIpv6Route(fd.Get(), "ff00::", 8, lo, ++seq).has_value());
+
+    const int down = SetLinkUp(fd.Get(), iface, false, ++seq);
+    if (down != 0) {
+        ADD_FAILURE() << "cannot lower test interface: " << down;
+        return;
+    }
+    const bool removed = !FindIpv6Route(fd.Get(), "ff00::", 8, iface, ++seq).has_value();
+    const int up = SetLinkUp(fd.Get(), iface, true, ++seq);
+    EXPECT_EQ(up, 0);
+    EXPECT_TRUE(removed);
+    if (up == 0) {
+        EXPECT_TRUE(FindIpv6Route(fd.Get(), "ff00::", 8, iface, ++seq).has_value());
+    }
+}
+
 TEST(RtnetlinkRouteSemantics, OnLinkRouteAllowsUdpSendWithoutNoRoute) {
     FdGuard netlink_fd(OpenRouteSocket());
     ASSERT_GE(netlink_fd.Get(), 0) << "socket(AF_NETLINK, NETLINK_ROUTE) failed: "

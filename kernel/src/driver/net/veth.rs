@@ -219,6 +219,15 @@ impl VethDriver {
         let Ok(frame) = EthernetFrame::new_checked(data) else {
             return IngressDisposition::Local;
         };
+        // Non-bridge IP must pass through smoltcp's validated ingress path
+        // before PRE_ROUTING and the FIB decision. The old pre-smoltcp
+        // router would bypass nftables (and conntrack) for either family.
+        if matches!(
+            frame.ethertype(),
+            smoltcp::wire::EthernetProtocol::Ipv4 | smoltcp::wire::EthernetProtocol::Ipv6
+        ) {
+            return IngressDisposition::Local;
+        }
         match iface.handle_routable_packet(&frame) {
             Ok(()) => IngressDisposition::Consumed,
             Err(Some(error)) => {
@@ -631,8 +640,8 @@ impl Iface for VethInterface {
             IfacePollScope::None => false,
             IfacePollScope::LocalOnly => self.common.poll(&mut driver),
             IfacePollScope::Full => {
-                let prepared = driver.prepare_ingress(64);
-                self.common.poll(&mut driver) || prepared != 0 || driver.has_pending_ingress()
+                let result = self.poll_napi(64);
+                result.work_done != 0 || result.poll_again
             }
         }
     }
@@ -653,7 +662,9 @@ impl Iface for VethInterface {
         } else {
             budget
         };
-        let smoltcp = self.common.poll_napi(&mut driver, local_budget);
+        let smoltcp = self
+            .common
+            .poll_napi_routed_ingress(&mut driver, local_budget);
         // Classification is real receive work even when a frame is moved to
         // the local smoltcp queue for a later pass. Charge every scanned frame
         // to this NAPI instance so the global packet budget remains fair.

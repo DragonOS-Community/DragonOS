@@ -376,6 +376,21 @@ TEST(RtnetlinkRouteSemantics, LinkDownPurgesRoutesAndRejectsNewNexthops) {
     char payload = 0;
     ssize_t received = sent < 0 ? -1 : recv(receiver.Get(), &payload, sizeof(payload), 0);
     int receive_error = received < 0 ? errno : 0;
+    // Raw IPv4 output does not actively poll the local target. This proves
+    // that a DOWN interface still runs its LocalOnly NAPI work independently.
+    FdGuard raw_sender(socket(AF_INET, SOCK_RAW, IPPROTO_UDP));
+    const uint8_t raw_datagram[9] = {
+        0x9c, 0x40, static_cast<uint8_t>(ntohs(local_endpoint.sin_port) >> 8),
+        static_cast<uint8_t>(ntohs(local_endpoint.sin_port)), 0, 9, 0, 0, 'r'};
+    ssize_t raw_sent = raw_sender.Get() < 0
+                           ? -1
+                           : sendto(raw_sender.Get(), raw_datagram, sizeof(raw_datagram), 0,
+                                    reinterpret_cast<sockaddr*>(&local_endpoint),
+                                    sizeof(local_endpoint));
+    int raw_send_error = raw_sent < 0 ? errno : 0;
+    char raw_payload = 0;
+    ssize_t raw_received = raw_sent < 0 ? -1 : recv(receiver.Get(), &raw_payload, 1, 0);
+    int raw_receive_error = raw_received < 0 ? errno : 0;
     int restore_error = SetLinkUp(fd.Get(), veth, true, ++seq);
 
     EXPECT_EQ(add_error, ENETDOWN);
@@ -389,6 +404,10 @@ TEST(RtnetlinkRouteSemantics, LinkDownPurgesRoutesAndRejectsNewNexthops) {
     EXPECT_EQ(sent, 1) << ErrnoString(send_error);
     EXPECT_EQ(received, 1) << ErrnoString(receive_error);
     EXPECT_EQ(payload, 'x');
+    EXPECT_EQ(raw_sent, static_cast<ssize_t>(sizeof(raw_datagram)))
+        << ErrnoString(raw_send_error);
+    EXPECT_EQ(raw_received, 1) << ErrnoString(raw_receive_error);
+    EXPECT_EQ(raw_payload, 'r');
     ASSERT_EQ(restore_error, 0);
 }
 

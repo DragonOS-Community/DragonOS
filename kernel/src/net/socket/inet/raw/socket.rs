@@ -57,6 +57,7 @@ impl RawSocket {
         if ip_version == IpVersion::Ipv6 && protocol == IpProtocol::Icmpv6 {
             options.ipv6_checksum = ICMPV6_CHECKSUM_OFFSET;
         }
+        let initial_sndbuf = options.sock_sndbuf as usize;
 
         // Linux 语义：raw socket 创建时不要求必须存在网卡/路由。
         // 但为了让未 bind 的 raw socket 能接收数据包、且 poll/epoll 能正确唤醒，
@@ -80,6 +81,12 @@ impl RawSocket {
             self_ref: me.clone(),
             netns,
             device_binding: crate::net::socket::inet::common::SocketDeviceBinding::default(),
+            send_account: Arc::new(
+                crate::net::socket::inet::common::output_account::SocketOutputAccount::new(
+                    me.clone(),
+                    initial_sndbuf,
+                ),
+            ),
             epoll_items: crate::net::socket::common::EPollItems::default(),
             fasync_items: crate::filesystem::vfs::fasync::FAsyncItems::default(),
             ip_version,
@@ -88,6 +95,9 @@ impl RawSocket {
             ip_multicast_ifindex: core::sync::atomic::AtomicI32::new(0),
             ip_multicast_addr: core::sync::atomic::AtomicU32::new(0),
             ip_multicast_groups: crate::libs::mutex::Mutex::new(Vec::new()),
+            ip_multicast_ttl: core::sync::atomic::AtomicI32::new(1),
+            ip_multicast_loop: core::sync::atomic::AtomicBool::new(true),
+            so_broadcast: core::sync::atomic::AtomicBool::new(false),
             send_timeout_us: core::sync::atomic::AtomicU64::new(u64::MAX),
             recv_timeout_us: core::sync::atomic::AtomicU64::new(u64::MAX),
         });

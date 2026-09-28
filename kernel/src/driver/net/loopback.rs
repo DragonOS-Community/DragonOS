@@ -355,6 +355,7 @@ impl LoopbackInterface {
         let mut iface_config = smoltcp::iface::Config::new(hardware_addr);
 
         iface_config.random_seed = rand() as u64;
+        iface_config.is_loopback = true;
 
         let mut iface =
             smoltcp::iface::Interface::new(iface_config, &mut driver, Instant::now().into());
@@ -602,8 +603,14 @@ impl Iface for LoopbackInterface {
         if ip_packet.len() > self.mtu() {
             return Err(SystemError::EMSGSIZE.into());
         }
-        self.inject_local_ip_packet(self.nic_id() as u32, self.mac(), ip_packet, false)
-            .map_err(Into::into)
+        self.inject_local_ip_packet(
+            LOOPBACK_IFINDEX as u32,
+            self.mac(),
+            ip_packet,
+            false,
+            crate::driver::net::LocalPacketOrigin::LocalOutput,
+        )
+        .map_err(Into::into)
     }
 
     fn addr_assign_type(&self) -> u8 {

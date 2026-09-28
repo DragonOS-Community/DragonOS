@@ -46,6 +46,7 @@ impl UdpSocket {
                 let requested = byte_parser::read_u32(val)?;
                 let size = clamp_udp_buf(requested, SYSCTL_WMEM_MAX, SOCK_MIN_SNDBUF);
                 self.send_buf_size.store(size, Ordering::Release);
+                self.send_account.set_limit(size.saturating_mul(2));
 
                 // If socket is already bound, we need to recreate it with new buffer size
                 self.recreate_socket_if_bound()?;
@@ -91,6 +92,7 @@ impl UdpSocket {
                 let requested = byte_parser::read_i32(val)?;
                 let size = clamp_udp_buf_force(requested, SOCK_MIN_SNDBUF);
                 self.send_buf_size.store(size, Ordering::Release);
+                self.send_account.set_limit(size.saturating_mul(2));
                 self.recreate_socket_if_bound()?;
                 Ok(())
             }
@@ -378,43 +380,16 @@ impl UdpSocket {
             }
             IpOption::ADD_MEMBERSHIP | IpOption::DROP_MEMBERSHIP => {
                 // First, apply the membership at the interface level
-                apply_ipv4_membership(&self.netns, opt, val, &self.ip_multicast_groups)?;
+                let (multiaddr, ifindex) =
+                    apply_ipv4_membership(&self.netns, opt, val, &self.ip_multicast_groups)?;
 
                 // Then, register/unregister with multicast loopback registry
                 use super::multicast_loopback::multicast_registry;
-                use crate::net::socket::inet::common::multicast::parse_mreqn_for_membership;
-
-                let (multiaddr, ifaddr, ifindex) = parse_mreqn_for_membership(val)?;
-                // Determine the interface index
-                let resolved_ifindex = if ifindex != 0 {
-                    ifindex
-                } else if ifaddr != 0 {
-                    // Find interface by address
-                    use crate::net::socket::inet::common::multicast::find_iface_by_ipv4;
-                    find_iface_by_ipv4(&self.netns, ifaddr)
-                        .map(|iface| iface.nic_id() as i32)
-                        .unwrap_or(0)
-                } else {
-                    // Use default interface
-                    use crate::net::socket::inet::common::multicast::choose_default_ipv4_iface;
-                    choose_default_ipv4_iface(&self.netns)
-                        .map(|iface| iface.nic_id() as i32)
-                        .unwrap_or(0)
-                };
-
-                if resolved_ifindex != 0 {
+                if ifindex != 0 {
                     if opt == IpOption::ADD_MEMBERSHIP {
-                        multicast_registry().register(
-                            self.self_ref.clone(),
-                            multiaddr,
-                            resolved_ifindex,
-                        );
+                        multicast_registry().register(self.self_ref.clone(), multiaddr, ifindex);
                     } else {
-                        multicast_registry().unregister(
-                            &self.self_ref,
-                            multiaddr,
-                            resolved_ifindex,
-                        );
+                        multicast_registry().unregister(&self.self_ref, multiaddr, ifindex);
                     }
                 }
 

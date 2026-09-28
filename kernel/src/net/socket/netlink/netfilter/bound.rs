@@ -1,4 +1,4 @@
-use super::{NetfilterKernelSocket, NetfilterMessage};
+use super::NetfilterKernelSocket;
 use crate::{
     filesystem::epoll::EPollEventType,
     net::socket::{
@@ -13,7 +13,7 @@ use crate::{
 };
 use system_error::SystemError;
 
-impl Bound for BoundNetlink<NetfilterMessage> {
+impl Bound for BoundNetlink<NetlinkNetfilterProtocol> {
     type Endpoint = NetlinkSocketAddr;
     fn bind(&mut self, endpoint: &Self::Endpoint) -> Result<(), SystemError> {
         self.bind_common(endpoint)
@@ -56,6 +56,7 @@ impl Bound for BoundNetlink<NetfilterMessage> {
             self.netns(),
             &self.opener_cred(),
             explicit,
+            &self.protocol_state,
         )?;
         Ok(bytes.len())
     }
@@ -71,6 +72,16 @@ impl Bound for BoundNetlink<NetfilterMessage> {
         if let Some(error) = self.receive_queue.take_error() {
             return Err(error);
         }
+        if self.receive_queue.0.lock().is_empty() {
+            self.protocol_state.drive_if_queue_empty(
+                &self.receive_queue,
+                self.handle.port(),
+                &self.netns,
+            );
+            if let Some(error) = self.receive_queue.take_error() {
+                return Err(error);
+            }
+        }
         let mut queue = self.receive_queue.0.lock();
         let message = queue.front().ok_or(SystemError::EAGAIN_OR_EWOULDBLOCK)?;
         let original = message.0.len();
@@ -80,6 +91,13 @@ impl Bound for BoundNetlink<NetfilterMessage> {
             queue.pop_front();
             drop(queue);
             self.receive_queue.recover_if_empty();
+            if self.receive_queue.0.lock().is_empty() {
+                self.protocol_state.drive_if_queue_empty(
+                    &self.receive_queue,
+                    self.handle.port(),
+                    &self.netns,
+                );
+            }
         }
         Ok((copied, original, NetlinkSocketAddr::new_unspecified()))
     }

@@ -10,8 +10,8 @@ use crate::{
 };
 use alloc::string::ToString;
 use alloc::sync::Weak;
-use alloc::{collections::BTreeMap, string::String, sync::Arc};
-use core::sync::atomic::AtomicUsize;
+use alloc::{collections::BTreeMap, string::String, sync::Arc, vec::Vec};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use hashbrown::HashMap;
 use smoltcp::wire::{EthernetAddress, EthernetFrame, IpAddress, IpCidr};
 use system_error::SystemError;
@@ -56,6 +56,7 @@ pub struct BridgePort {
     pub id: BridgePortId,
     pub(super) bridge_enable: Arc<dyn BridgeEnableDevice>,
     pub(super) bridge_driver_ref: Weak<BridgeDriver>,
+    active: Arc<AtomicBool>,
     // 当前接口状态？forwarding, learning, blocking?
     // mac mtu信息
 }
@@ -70,6 +71,7 @@ impl BridgePort {
             id,
             bridge_enable: device.clone(),
             bridge_driver_ref: Arc::downgrade(bridge),
+            active: Arc::new(AtomicBool::new(true)),
         };
 
         device.set_common_bridge_data(&port);
@@ -89,6 +91,14 @@ pub struct Bridge {
     // bridge_mac: EthernetAddress,
 }
 
+/// Egress ports are snapshotted while holding the FDB lock. Device receive
+/// callbacks and NAPI scheduling run only after that lock is released.
+enum BridgeEgress {
+    None,
+    One(BridgePort),
+    Flood(Vec<BridgePort>),
+}
+
 impl Bridge {
     pub fn new(name: &str) -> Self {
         Self {
@@ -103,7 +113,9 @@ impl Bridge {
     }
 
     pub fn remove_port(&mut self, port_id: BridgePortId) {
-        self.ports.remove(&port_id);
+        if let Some(port) = self.ports.remove(&port_id) {
+            port.active.store(false, Ordering::Release);
+        }
         // 清理MAC地址表中与该端口相关的条目
         self.mac_table
             .retain(|_mac, entry| entry.port_id != port_id);
@@ -123,73 +135,88 @@ impl Bridge {
         }
     }
 
-    pub fn handle_frame(&mut self, ingress_port_id: BridgePortId, frame: &[u8]) {
+    fn select_egress(
+        &mut self,
+        ingress_port_id: BridgePortId,
+        frame: &[u8],
+    ) -> Result<BridgeEgress, SystemError> {
         if frame.len() < 14 {
             // 使用 smoltcp 提供的最小长度
             // log::warn!("Bridge {}: Received malformed Ethernet frame (too short).", self.name);
-            return;
+            return Ok(BridgeEgress::None);
         }
 
         let ether_frame = match EthernetFrame::new_checked(frame) {
             Ok(f) => f,
             Err(_) => {
                 // log::warn!("Bridge {}: Received malformed Ethernet frame.", self.name);
-                return;
+                return Ok(BridgeEgress::None);
             }
         };
+        if !self.ports.contains_key(&ingress_port_id) {
+            return Ok(BridgeEgress::None);
+        }
 
         let dst_mac = ether_frame.dst_addr();
         let src_mac = ether_frame.src_addr();
 
         self.insert_or_update_mac_entry(src_mac, ingress_port_id);
 
-        if dst_mac.is_broadcast() {
+        let egress = if dst_mac.is_broadcast() {
             // 广播 这里有可能是arp请求
-            self.flood(Some(ingress_port_id), frame);
+            self.flood_ports(Some(ingress_port_id))
         } else {
             // 单播
             if let Some(entry) = self.mac_table.get(&dst_mac) {
                 let target_port = entry.port_id;
                 // 避免发回自己
                 // if target_port != ingress_port_id {
-                self.transmit_to_port(target_port, frame);
+                Ok(self
+                    .ports
+                    .get(&target_port)
+                    .cloned()
+                    .map_or(BridgeEgress::None, BridgeEgress::One))
                 // }
             } else {
                 // 未知单播 → 广播
                 log::info!("unknown unicast, flooding frame");
-                self.flood(Some(ingress_port_id), frame);
+                self.flood_ports(Some(ingress_port_id))
             }
-        }
+        };
 
         self.sweep_mac_table();
+        egress
     }
 
-    fn flood(&self, except_port_id: Option<BridgePortId>, frame: &[u8]) {
-        match except_port_id {
-            Some(except_id) => {
-                for (&port_id, bridge_port) in &self.ports {
-                    if port_id != except_id {
-                        self.transmit_to_device(bridge_port, frame);
-                    }
-                }
-            }
-            None => {
-                for bridge_port in self.ports.values() {
-                    self.transmit_to_device(bridge_port, frame);
-                }
-            }
+    fn flood_ports(
+        &self,
+        except_port_id: Option<BridgePortId>,
+    ) -> Result<BridgeEgress, SystemError> {
+        let mut eligible = self
+            .ports
+            .iter()
+            .filter(|(id, _)| Some(**id) != except_port_id)
+            .map(|(_, port)| port);
+        let Some(first) = eligible.next() else {
+            return Ok(BridgeEgress::None);
+        };
+        let Some(second) = eligible.next() else {
+            return Ok(BridgeEgress::One(first.clone()));
+        };
+        let mut ports = Vec::new();
+        ports
+            .try_reserve(self.ports.len())
+            .map_err(|_| SystemError::ENOMEM)?;
+        ports.push(first.clone());
+        ports.push(second.clone());
+        ports.extend(eligible.cloned());
+        Ok(BridgeEgress::Flood(ports))
+    }
+
+    fn transmit_to_device(device: &BridgePort, frame: &[u8]) {
+        if !device.active.load(Ordering::Acquire) {
+            return;
         }
-    }
-
-    fn transmit_to_port(&self, target_port_id: BridgePortId, frame: &[u8]) {
-        if let Some(device_arc) = self.ports.get(&target_port_id) {
-            self.transmit_to_device(device_arc, frame);
-        } else {
-            // log::warn!("Bridge {}: Attempted to transmit to non-existent port ID {}", self.name, target_port_id);
-        }
-    }
-
-    fn transmit_to_device(&self, device: &BridgePort, frame: &[u8]) {
         device.bridge_enable.receive_from_bridge(frame);
         if let Some(napi) = device.bridge_enable.napi_struct() {
             napi_schedule(napi);
@@ -263,7 +290,17 @@ impl BridgeDriver {
     }
 
     pub fn handle_frame(&self, ingress_port_id: BridgePortId, frame: &[u8]) {
-        self.inner.lock().handle_frame(ingress_port_id, frame);
+        let egress = self.inner.lock().select_egress(ingress_port_id, frame);
+        match egress {
+            Ok(BridgeEgress::None) => {}
+            Ok(BridgeEgress::One(port)) => Bridge::transmit_to_device(&port, frame),
+            Ok(BridgeEgress::Flood(ports)) => {
+                for port in &ports {
+                    Bridge::transmit_to_device(port, frame);
+                }
+            }
+            Err(error) => log::warn!("bridge egress selection failed: {:?}", error),
+        }
     }
 
     pub fn name(&self) -> String {

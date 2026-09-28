@@ -39,7 +39,7 @@ fn send_kobject_message(
     Ok(sent_len)
 }
 
-impl datagram_common::Bound for BoundNetlink<KobjectUeventMessage> {
+impl datagram_common::Bound for BoundNetlink<NetlinkKobjectUeventProtocol> {
     type Endpoint = NetlinkSocketAddr;
 
     fn bind(&mut self, endpoint: &Self::Endpoint) -> Result<(), SystemError> {

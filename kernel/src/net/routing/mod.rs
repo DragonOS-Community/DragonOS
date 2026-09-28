@@ -217,6 +217,7 @@ pub trait RouterEnableDevice: Iface {
                                 ether_frame.src_addr(),
                                 ipv4_packet_mut.as_ref(),
                                 false,
+                                crate::driver::net::LocalPacketOrigin::LinkIngressPending,
                             )
                             .map_err(Some)?;
                         return Ok(());
@@ -231,6 +232,7 @@ pub trait RouterEnableDevice: Iface {
                                 ether_frame.src_addr(),
                                 ipv4_packet_mut.as_ref(),
                                 true,
+                                crate::driver::net::LocalPacketOrigin::LinkIngressPending,
                             )
                             .map_err(Some)?;
                         return Ok(());
@@ -316,6 +318,7 @@ pub trait RouterEnableDevice: Iface {
                         ether_frame.src_addr(),
                         &ether_frame.payload()[..40 + repr.payload_len],
                         false,
+                        crate::driver::net::LocalPacketOrigin::LinkIngressPending,
                     )
                     .map_err(Some)
             }

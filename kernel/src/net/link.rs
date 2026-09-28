@@ -573,9 +573,6 @@ fn publish_link_flags_and_state(
         iface.set_operstate(Operstate::IF_OPER_UP);
         iface.set_net_state(NetDeivceState::__LINK_STATE_START);
         iface.common().open_tx();
-        if let Some(napi) = iface.napi_struct() {
-            napi_resume(napi);
-        }
     } else {
         iface.publish_admin_state(false);
         if let Some(flags) = flags {
@@ -583,6 +580,12 @@ fn publish_link_flags_and_state(
         }
         iface.clear_net_state(NetDeivceState::__LINK_STATE_START);
         iface.set_operstate(Operstate::IF_OPER_DOWN);
+    }
+    // Pause protects the transition, not the entire DOWN lifetime. A DOWN
+    // interface still owns local routes and must poll namespace-local input.
+    // poll_scope() excludes physical ingress until the link is UP again.
+    if let Some(napi) = iface.napi_struct() {
+        napi_resume(napi);
     }
 }
 

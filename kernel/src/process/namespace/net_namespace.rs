@@ -8,7 +8,14 @@ use crate::libs::rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use crate::libs::rwsem::{RwSem, RwSemReadGuard, RwSemWriteGuard};
 use crate::libs::spinlock::SpinLock;
 use crate::libs::wait_queue::WaitQueue;
+use crate::net::conntrack::{CtCandidate, CtConfirm, CtError, CtPacketContext, CtState};
+use crate::net::ipv4_defrag::{DefragDomain, Ipv4Defragmenter, ReassembledIpv4, ReassemblyResult};
+use crate::net::ipv6_defrag::{
+    DefragDomain as Ipv6DefragDomain, Ipv6Defragmenter, ReassembledIpv6,
+    ReassemblyResult as Ipv6ReassemblyResult,
+};
 use crate::net::neighbor::NeighborTable;
+use crate::net::nftables::NftNamespaceState;
 use crate::net::routing::Router;
 use crate::net::socket::inet::datagram::udp_bindings::UdpBindingTable;
 use crate::net::socket::netlink::table::{
@@ -31,15 +38,16 @@ use crate::{
     process::namespace::{nsproxy::NsCommon, user_namespace::UserNamespace},
 };
 use alloc::boxed::Box;
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::{String, ToString};
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::sync::atomic::AtomicU32;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicI32, AtomicU16, AtomicU32};
 use hashbrown::HashMap;
 use ida::IdAllocator;
 use net_poll_state::DueResult;
+use smoltcp::wire::{EthernetAddress, HardwareAddress};
 use system_error::SystemError;
 use unified_init::macros::unified_init;
 
@@ -62,28 +70,37 @@ type NetnsDeviceMap = BTreeMap<usize, Arc<dyn Iface>>;
 
 #[derive(Debug)]
 struct NetnsTeardownWork {
-    devices: Arc<SpinLock<Option<NetnsDeviceMap>>>,
+    payload: Arc<SpinLock<Option<NetnsTeardownPayload>>>,
     work: Arc<Work>,
+}
+
+#[derive(Debug)]
+struct NetnsTeardownPayload {
+    devices: NetnsDeviceMap,
+    nftables: Box<NftNamespaceState>,
+    conntrack: CtState,
 }
 
 impl NetnsTeardownWork {
     fn new() -> Self {
-        let devices = Arc::new(SpinLock::new(None));
-        let worker_devices = devices.clone();
+        let payload = Arc::new(SpinLock::new(None::<NetnsTeardownPayload>));
+        let worker_payload = payload.clone();
         let work = Work::new(move || {
-            let devices = worker_devices
+            let payload = worker_payload
                 .lock()
                 .take()
-                .expect("queued netns teardown work must own its device payload");
-            teardown_netns_devices(devices);
+                .expect("queued netns teardown work must own its payload");
+            teardown_netns_devices(payload.devices);
+            drop(payload.nftables);
+            drop(payload.conntrack);
         });
-        Self { devices, work }
+        Self { payload, work }
     }
 
-    fn enqueue(&self, devices: NetnsDeviceMap) {
-        let mut slot = self.devices.lock();
+    fn enqueue(&self, payload: NetnsTeardownPayload) {
+        let mut slot = self.payload.lock();
         debug_assert!(slot.is_none());
-        *slot = Some(devices);
+        *slot = Some(payload);
         drop(slot);
         NETNS_TEARDOWN_WQ.enqueue(self.work.clone());
     }
@@ -173,6 +190,10 @@ pub struct NetNamespace {
     neighbor_table: NeighborTable,
     /// Per-netns UDP port reservation and local-delivery table.
     udp_bindings: UdpBindingTable,
+    /// Runtime connection/NAT mappings, separate from immutable nft rules.
+    conntrack: CtState,
+    ipv4_identification: AtomicU16,
+    ipv6_fragment_identification: AtomicU32,
     tcp_ports: Arc<crate::net::socket::inet::common::PortManager>,
     tcp_stack: Arc<crate::net::tcp_stack::TcpStack>,
     /// Lock-free read-side snapshot for AF_PACKET delivery from NAPI context.
@@ -187,6 +208,9 @@ pub struct NetNamespace {
     /// # 当前网络命名空间下的 Netlink 套接字表
     /// 负责绑定netlink套接字的接收队列，以便发送接收消息
     netlink_socket_table: NetlinkSocketTable,
+    /// Kept in a Box so final netns release can hand its RCU slot to the
+    /// preallocated teardown worker without allocating in a NAPI context.
+    nftables: Option<Box<NftNamespaceState>>,
     /// # 当前网络命名空间下的 Netlink 内核套接字
     /// 负责接收并处理 Netlink 消息
     netlink_kernel_socket: RwSem<HashMap<u32, Arc<dyn NetlinkKernelSocket>>>,
@@ -195,6 +219,10 @@ pub struct NetNamespace {
     unix_abstract_table: Arc<UnixAbstractTable>,
     /// Per-netns IPv4 ephemeral port range (ip_local_port_range)
     local_port_range: AtomicU32,
+    /// Linux /proc/sys/net/ipv4/ip_forward. Default is disabled in each netns.
+    ipv4_forwarding: AtomicI32,
+    /// Linux /proc/sys/net/ipv6/conf/all/forwarding. Never shares IPv4 state.
+    ipv6_forwarding: AtomicI32,
     /// 当前网络命名空间的 loopback 网卡。
     loopback_iface: RcuOptionArcSlot<LoopbackInterface>,
     /// 当前网络命名空间的默认网卡。
@@ -259,6 +287,303 @@ impl core::fmt::Debug for DefaultIfaceRef {
     }
 }
 
+const DEFRAG_PENDING_PACKETS: usize = 128;
+const DEFRAG_PENDING_BYTES: usize = 4 * 1024 * 1024;
+const DEFRAG_POLL_BATCH: usize = 32;
+
+/// Fragment queues at CT PRE_ROUTING, CT LOCAL_OUT, and stateless LOCAL_IN
+/// never merge even if their tuple and identification match.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DefragSource {
+    LinkIngress,
+    LocalOutput,
+    LocalInput,
+}
+
+impl DefragSource {
+    fn domain(self) -> DefragDomain {
+        match self {
+            Self::LinkIngress => DefragDomain::pre_routing(0, 0),
+            Self::LocalOutput => DefragDomain::local_out(0, 0),
+            Self::LocalInput => DefragDomain::local_input(0, 0),
+        }
+    }
+
+    fn packet_origin(self) -> crate::driver::net::LocalPacketOrigin {
+        match self {
+            Self::LinkIngress => crate::driver::net::LocalPacketOrigin::LinkIngressPending,
+            Self::LocalOutput => crate::driver::net::LocalPacketOrigin::LocalOutput,
+            Self::LocalInput => crate::driver::net::LocalPacketOrigin::LocalInputDone,
+        }
+    }
+
+    fn ipv6_domain(self, ingress_ifindex: u32) -> Ipv6DefragDomain {
+        match self {
+            Self::LinkIngress => Ipv6DefragDomain::pre_routing(0, ingress_ifindex),
+            Self::LocalOutput => Ipv6DefragDomain::local_out(0, ingress_ifindex),
+            Self::LocalInput => Ipv6DefragDomain::local_input(0, ingress_ifindex),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct FragmentOrigin {
+    ingress_ifindex: u32,
+    owner_ifindex: u32,
+    source_hardware_addr: HardwareAddress,
+    source: DefragSource,
+    ct_context: Option<Arc<CtPacketContext>>,
+    mark: u32,
+}
+
+/// Owned by the receive callback only until the source interface locks have
+/// been released. The namespace poller then becomes the sole reassembly owner.
+#[derive(Debug)]
+pub(crate) struct PendingIpv4Fragment {
+    pub(crate) packet: Vec<u8>,
+    pub(crate) ingress_ifindex: u32,
+    pub(crate) owner_ifindex: u32,
+    pub(crate) source_hardware_addr: HardwareAddress,
+    pub(crate) source: DefragSource,
+    pub(crate) ct_context: Option<Arc<CtPacketContext>>,
+    pub(crate) mark: u32,
+}
+
+impl PendingIpv4Fragment {
+    fn origin(&self) -> FragmentOrigin {
+        FragmentOrigin {
+            ingress_ifindex: self.ingress_ifindex,
+            owner_ifindex: self.owner_ifindex,
+            source_hardware_addr: self.source_hardware_addr,
+            source: self.source,
+            ct_context: self.ct_context.clone(),
+            mark: self.mark,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct PendingIpv6Fragment {
+    pub(crate) packet: Vec<u8>,
+    pub(crate) ingress_ifindex: u32,
+    pub(crate) owner_ifindex: u32,
+    pub(crate) source_hardware_addr: HardwareAddress,
+    pub(crate) source: DefragSource,
+    pub(crate) ct_context: Option<Arc<CtPacketContext>>,
+    pub(crate) mark: u32,
+}
+
+impl PendingIpv6Fragment {
+    fn origin(&self) -> FragmentOrigin {
+        FragmentOrigin {
+            ingress_ifindex: self.ingress_ifindex,
+            owner_ifindex: self.owner_ifindex,
+            source_hardware_addr: self.source_hardware_addr,
+            source: self.source,
+            ct_context: self.ct_context.clone(),
+            mark: self.mark,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum PendingIpFragment {
+    Ipv4(PendingIpv4Fragment),
+    Ipv6(PendingIpv6Fragment),
+}
+
+impl PendingIpFragment {
+    fn packet_capacity(&self) -> usize {
+        match self {
+            Self::Ipv4(fragment) => fragment.packet.capacity(),
+            Self::Ipv6(fragment) => fragment.packet.capacity(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct DefragPending {
+    packets: VecDeque<PendingIpFragment>,
+    bytes: usize,
+}
+
+impl DefragPending {
+    fn prepare() -> Result<Self, SystemError> {
+        let mut packets = VecDeque::new();
+        packets
+            .try_reserve(DEFRAG_PENDING_PACKETS)
+            .map_err(|_| SystemError::ENOMEM)?;
+        Ok(Self { packets, bytes: 0 })
+    }
+
+    /// The ring is reserved before publishing conntrack rules. The rejected
+    /// packet remains caller-owned, so even a full-queue drop runs unlocked.
+    fn push(&mut self, packet: PendingIpFragment) -> Result<(), PendingIpFragment> {
+        let capacity = packet.packet_capacity();
+        if self.packets.len() == DEFRAG_PENDING_PACKETS
+            || self.bytes.saturating_add(capacity) > DEFRAG_PENDING_BYTES
+        {
+            return Err(packet);
+        }
+        debug_assert!(self.packets.capacity() >= DEFRAG_PENDING_PACKETS);
+        self.bytes += capacity;
+        self.packets.push_back(packet);
+        Ok(())
+    }
+
+    fn pop(&mut self) -> Option<PendingIpFragment> {
+        let packet = self.packets.pop_front()?;
+        self.bytes -= packet.packet_capacity();
+        Some(packet)
+    }
+}
+
+#[cfg(test)]
+mod defrag_pending_tests {
+    use super::*;
+    use smoltcp::wire::Ipv4Packet;
+
+    fn packet(bytes: usize) -> PendingIpv4Fragment {
+        let mut packet = Vec::new();
+        packet.try_reserve_exact(bytes).unwrap();
+        PendingIpv4Fragment {
+            packet,
+            ingress_ifindex: 2,
+            owner_ifindex: 2,
+            source_hardware_addr: HardwareAddress::Ip,
+            source: DefragSource::LinkIngress,
+            ct_context: None,
+            mark: 0,
+        }
+    }
+
+    #[test]
+    fn preallocated_ring_rejects_full_without_losing_existing_fragments() {
+        let mut pending = DefragPending::prepare().unwrap();
+        assert!(pending.packets.capacity() >= DEFRAG_PENDING_PACKETS);
+        for _ in 0..DEFRAG_PENDING_PACKETS {
+            pending.push(PendingIpFragment::Ipv4(packet(0))).unwrap();
+        }
+        assert!(pending.push(PendingIpFragment::Ipv4(packet(0))).is_err());
+        assert_eq!(pending.packets.len(), DEFRAG_PENDING_PACKETS);
+        for _ in 0..DEFRAG_PENDING_PACKETS {
+            pending.pop().unwrap();
+        }
+        assert!(pending.pop().is_none());
+        assert_eq!(pending.bytes, 0);
+    }
+
+    #[test]
+    fn pending_byte_limit_charges_allocation_capacity() {
+        let mut pending = DefragPending::prepare().unwrap();
+        let large = packet(DEFRAG_PENDING_BYTES - 1024);
+        let charged = large.packet.capacity();
+        pending.push(PendingIpFragment::Ipv4(large)).unwrap();
+        assert_eq!(pending.bytes, charged);
+        assert!(pending.push(PendingIpFragment::Ipv4(packet(2048))).is_err());
+        assert_eq!(pending.bytes, charged);
+        pending.pop().unwrap();
+        assert_eq!(pending.bytes, 0);
+    }
+
+    #[test]
+    fn fragment_source_preserves_distinct_domain_and_reinjection_stage() {
+        let mut pending = DefragPending::prepare().unwrap();
+        let mut output = packet(0);
+        output.source = DefragSource::LocalOutput;
+        pending.push(PendingIpFragment::Ipv4(packet(0))).unwrap();
+        pending.push(PendingIpFragment::Ipv4(output)).unwrap();
+
+        let PendingIpFragment::Ipv4(link) = pending.pop().unwrap() else {
+            panic!("expected IPv4 fragment");
+        };
+        let PendingIpFragment::Ipv4(output) = pending.pop().unwrap() else {
+            panic!("expected IPv4 fragment");
+        };
+        let link = link.origin().source;
+        let output = output.origin().source;
+        assert_eq!(link, DefragSource::LinkIngress);
+        assert_eq!(output, DefragSource::LocalOutput);
+        assert_ne!(link.domain(), output.domain());
+        assert_eq!(
+            link.packet_origin(),
+            crate::driver::net::LocalPacketOrigin::LinkIngressPending
+        );
+        assert_eq!(
+            output.packet_origin(),
+            crate::driver::net::LocalPacketOrigin::LocalOutput
+        );
+    }
+
+    #[test]
+    fn identical_ipv4_ids_from_link_and_local_output_do_not_mix() {
+        fn fragment(first: bool) -> Vec<u8> {
+            let mut packet = alloc::vec![0; 28];
+            packet[0] = 0x45;
+            packet[2..4].copy_from_slice(&28u16.to_be_bytes());
+            packet[4..6].copy_from_slice(&7u16.to_be_bytes());
+            packet[6..8].copy_from_slice(&(if first { 0x2000u16 } else { 1u16 }).to_be_bytes());
+            packet[8] = 64;
+            packet[9] = 17;
+            packet[12..16].copy_from_slice(&[192, 0, 2, 1]);
+            packet[16..20].copy_from_slice(&[192, 0, 2, 2]);
+            packet[20..].copy_from_slice(if first { b"abcdefgh" } else { b"ijklmnop" });
+            Ipv4Packet::new_unchecked(packet.as_mut_slice()).fill_checksum();
+            packet
+        }
+
+        let mut assembler = Ipv4Defragmenter::new();
+        let link = packet(0).origin();
+        let mut output_packet = packet(0);
+        output_packet.source = DefragSource::LocalOutput;
+        output_packet.ct_context = Some(Arc::new(CtPacketContext::Invalid));
+        output_packet.mark = 0x1234;
+        let output = output_packet.origin();
+        let first = fragment(true);
+        let last = fragment(false);
+        let mut link_completion = link.clone();
+        link_completion.mark = 0x5678;
+        assert!(matches!(
+            assembler.submit(&first, link.source.domain(), link.clone(), 0),
+            ReassemblyResult::Pending
+        ));
+        assert!(matches!(
+            assembler.submit(&last, output.source.domain(), output.clone(), 1),
+            ReassemblyResult::Pending
+        ));
+        let ReassemblyResult::Complete(link_datagram) =
+            assembler.submit(&last, link.source.domain(), link_completion, 2)
+        else {
+            panic!("link fragments must reassemble independently");
+        };
+        assert_eq!(link_datagram.first_origin.source, DefragSource::LinkIngress);
+        assert_eq!(link_datagram.first_origin.mark, 0);
+        assert_eq!(link_datagram.completion_origin.mark, 0x5678);
+        assert_eq!(
+            link_datagram.completion_origin.source,
+            DefragSource::LinkIngress
+        );
+        let ReassemblyResult::Complete(output_datagram) =
+            assembler.submit(&first, output.source.domain(), output, 3)
+        else {
+            panic!("local-output fragments must reassemble independently");
+        };
+        assert_eq!(
+            output_datagram.first_origin.source,
+            DefragSource::LocalOutput
+        );
+        assert_eq!(
+            output_datagram.completion_origin.source,
+            DefragSource::LocalOutput
+        );
+        assert!(matches!(
+            output_datagram.first_origin.ct_context.as_deref(),
+            Some(CtPacketContext::Invalid)
+        ));
+        assert_eq!(output_datagram.first_origin.mark, 0x1234);
+    }
+}
+
 #[derive(Debug)]
 struct NetnsPoller {
     netns: Weak<NetNamespace>,
@@ -274,6 +599,11 @@ struct NetnsPoller {
     /// Monotonic notification sequence for future protocol deadline changes.
     /// Unlike `poll_pending`, this only requests a timeout rescan.
     deadline_generation: AtomicU64,
+    /// NAPI only moves owned fragments into this preallocated ring. Reassembly
+    /// and expiry run in the existing namespace polling thread, never here.
+    defrag_pending: SpinLock<Option<DefragPending>>,
+    defrag_enabled: AtomicBool,
+    ipv6_defrag_enabled: AtomicBool,
     /// # 轮询线程的 PCB（用于 stop）
     thread: RwSem<Option<Arc<ProcessControlBlock>>>,
 }
@@ -286,8 +616,147 @@ impl NetnsPoller {
             poll_pending: AtomicBool::new(false),
             cleanup_pending: AtomicBool::new(false),
             deadline_generation: AtomicU64::new(0),
+            defrag_pending: SpinLock::new(None),
+            defrag_enabled: AtomicBool::new(false),
+            ipv6_defrag_enabled: AtomicBool::new(false),
             thread: RwSem::new(None),
         })
+    }
+
+    fn prepare_ip_defrag(&self) -> Result<(), SystemError> {
+        if self.defrag_pending.lock().is_some() {
+            return Ok(());
+        }
+        // Fallible allocation is exclusively in the nft transaction's process
+        // context, before any rule can hand fragments to this ring.
+        let prepared = DefragPending::prepare()?;
+        let mut pending = self.defrag_pending.lock();
+        if pending.is_none() {
+            *pending = Some(prepared);
+        }
+        Ok(())
+    }
+
+    fn enable_ipv4_defrag(&self) -> Result<(), SystemError> {
+        if self.defrag_pending.lock().is_none() {
+            return Err(SystemError::EINVAL);
+        }
+        self.defrag_enabled.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    fn enable_ipv6_defrag(&self) -> Result<(), SystemError> {
+        if self.defrag_pending.lock().is_none() {
+            return Err(SystemError::EINVAL);
+        }
+        self.ipv6_defrag_enabled.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    fn queue_ip_fragment(&self, packet: PendingIpFragment) -> Result<(), PendingIpFragment> {
+        let enabled = match &packet {
+            PendingIpFragment::Ipv4(_) => self.defrag_enabled.load(Ordering::Acquire),
+            PendingIpFragment::Ipv6(_) => self.ipv6_defrag_enabled.load(Ordering::Acquire),
+        };
+        if !enabled {
+            return Err(packet);
+        }
+        let queued = {
+            let mut pending = self.defrag_pending.lock();
+            match pending.as_mut() {
+                Some(pending) => pending.push(packet),
+                None => Err(packet),
+            }
+        };
+        if queued.is_ok() {
+            self.notify_deadline_changed();
+        }
+        queued
+    }
+
+    fn pop_ip_fragment(&self) -> Option<PendingIpFragment> {
+        self.defrag_pending.lock().as_mut()?.pop()
+    }
+
+    fn has_pending_ip_fragments(&self) -> bool {
+        self.defrag_pending
+            .lock()
+            .as_ref()
+            .is_some_and(|queue| !queue.packets.is_empty())
+    }
+
+    fn reinject_ip(
+        netns: &NetNamespace,
+        packet: Vec<u8>,
+        first_origin: FragmentOrigin,
+        completion: FragmentOrigin,
+        broadcast: bool,
+    ) {
+        let source_mac = match first_origin.source_hardware_addr {
+            HardwareAddress::Ethernet(mac) => mac,
+            HardwareAddress::Ip
+                if completion.owner_ifindex == crate::net::LOOPBACK_IFINDEX as u32 =>
+            {
+                // A medium-IP local receive token has no Ethernet header.
+                EthernetAddress([0; 6])
+            }
+            _ => return,
+        };
+        // Interface identity is a trusted receive-token value, not inferred
+        // from the IP header. The completion fragment supplies the receive
+        // device; the offset-zero fragment supplies the source MAC.
+        let owner = {
+            let devices = netns.device_list.read();
+            devices.get(&(completion.owner_ifindex as usize)).cloned()
+        };
+        let Some(owner) = owner else {
+            return;
+        };
+        let ct_context = match completion.source {
+            DefragSource::LocalOutput => Some(
+                first_origin
+                    .ct_context
+                    .as_deref()
+                    .cloned()
+                    .unwrap_or(CtPacketContext::Untracked),
+            ),
+            // LOCAL_IN already accepted every fragment before assembly.
+            // A later ruleset must not classify the completed old packet as
+            // a new flow or discard an otherwise valid local datagram.
+            DefragSource::LocalInput => Some(CtPacketContext::Untracked),
+            DefragSource::LinkIngress => None,
+        };
+        if let Err(error) = crate::driver::net::inject_owned_local_ip_packet_with_context_and_mark(
+            owner.as_ref(),
+            completion.ingress_ifindex,
+            source_mac,
+            packet,
+            broadcast,
+            completion.source.packet_origin(),
+            ct_context,
+            first_origin.mark,
+        ) {
+            log::debug!("reassembled IP ingress discarded: {:?}", error);
+        }
+    }
+
+    fn reinject_ipv4(netns: &NetNamespace, datagram: ReassembledIpv4<FragmentOrigin>) {
+        let ReassembledIpv4 {
+            packet,
+            first_origin,
+            completion_origin,
+        } = datagram;
+        let broadcast = packet[16..20] == [255; 4];
+        Self::reinject_ip(netns, packet, first_origin, completion_origin, broadcast);
+    }
+
+    fn reinject_ipv6(netns: &NetNamespace, datagram: ReassembledIpv6<FragmentOrigin>) {
+        let ReassembledIpv6 {
+            packet,
+            first_origin,
+            completion_origin,
+        } = datagram;
+        Self::reinject_ip(netns, packet, first_origin, completion_origin, false);
     }
 
     fn start(self: &Arc<Self>, name: String) {
@@ -362,6 +831,10 @@ impl NetnsPoller {
     fn polling(&self) {
         let mut cleanup_retry_delay = PACKET_SOCKET_CLEANUP_RETRY_MIN;
         let mut cleanup_retry_at = None;
+        // The namespace poller owns reassembly exclusively. Neither NAPI nor
+        // the pending-ring spinlock performs fragment allocation or expiry.
+        let mut ipv4_defrag = Ipv4Defragmenter::new();
+        let mut ipv6_defrag = Ipv6Defragmenter::new();
         loop {
             if KernelThreadMechanism::should_stop(&ProcessManager::current_pcb()) {
                 break;
@@ -403,7 +876,47 @@ impl NetnsPoller {
             // sample so time spent there cannot postpone an already-due TCP
             // timer by one additional timeout interval.
             let mut observed_generation = self.deadline_generation.load(Ordering::Acquire);
-            let mut deadline_now_us = Instant::now().total_micros() as u64;
+            let deadline_now = Instant::now();
+            let mut deadline_now_us = deadline_now.total_micros() as u64;
+            netns.conntrack.expire_due(deadline_now);
+            if ipv4_defrag
+                .next_deadline_us()
+                .is_some_and(|deadline| deadline <= deadline_now_us)
+            {
+                ipv4_defrag.expire(deadline_now_us);
+            }
+            if ipv6_defrag
+                .next_deadline_us()
+                .is_some_and(|deadline| deadline <= deadline_now_us)
+            {
+                ipv6_defrag.expire(deadline_now_us);
+            }
+            for _ in 0..DEFRAG_POLL_BATCH {
+                let Some(fragment) = self.pop_ip_fragment() else {
+                    break;
+                };
+                let now_us = Instant::now().total_micros().max(0) as u64;
+                match fragment {
+                    PendingIpFragment::Ipv4(fragment) => {
+                        let origin = fragment.origin();
+                        let domain = fragment.source.domain();
+                        if let ReassemblyResult::Complete(datagram) =
+                            ipv4_defrag.submit(&fragment.packet, domain, origin, now_us)
+                        {
+                            Self::reinject_ipv4(&netns, datagram);
+                        }
+                    }
+                    PendingIpFragment::Ipv6(fragment) => {
+                        let origin = fragment.origin();
+                        let domain = fragment.source.ipv6_domain(fragment.ingress_ifindex);
+                        if let Ipv6ReassemblyResult::Complete(datagram) =
+                            ipv6_defrag.submit(&fragment.packet, domain, origin, now_us)
+                        {
+                            Self::reinject_ipv6(&netns, datagram);
+                        }
+                    }
+                }
+            }
 
             // TCP protocol ownership is namespace-wide, independent of netdev
             // UP/NAPI state. One batch per scheduler iteration prevents every
@@ -423,6 +936,21 @@ impl NetnsPoller {
                 (Some(cleanup), Some(tcp)) => Some(core::cmp::min(cleanup, tcp)),
                 (cleanup, tcp) => cleanup.or(tcp),
             };
+            if let Some(ct_deadline) = netns.conntrack.next_expiry() {
+                let ct_us = ct_deadline.total_micros().max(0) as u64;
+                next_us = Some(next_us.map_or(ct_us, |current| current.min(ct_us)));
+            }
+            if let Some(defrag_deadline) = ipv4_defrag.next_deadline_us() {
+                next_us =
+                    Some(next_us.map_or(defrag_deadline, |current| current.min(defrag_deadline)));
+            }
+            if let Some(defrag_deadline) = ipv6_defrag.next_deadline_us() {
+                next_us =
+                    Some(next_us.map_or(defrag_deadline, |current| current.min(defrag_deadline)));
+            }
+            if self.has_pending_ip_fragments() {
+                next_us = Some(deadline_now_us);
+            }
             let mut direct_due = Vec::new();
             {
                 let devices = netns.device_list.read();
@@ -579,6 +1107,9 @@ impl NetNamespace {
             teardown_work: NetnsTeardownWork::new(),
             neighbor_table: NeighborTable::new(),
             udp_bindings: UdpBindingTable::default(),
+            conntrack: CtState::new(),
+            ipv4_identification: AtomicU16::new(crate::arch::rand::rand() as u16),
+            ipv6_fragment_identification: AtomicU32::new(crate::arch::rand::rand() as u32),
             tcp_ports: Arc::new(crate::net::socket::inet::common::PortManager::default()),
             tcp_stack: Arc::new(crate::net::tcp_stack::TcpStack::new(self_ref.clone())),
             packet_sockets: RcuArcSlot::new(Arc::new(PacketSocketRegistrySnapshot::default())),
@@ -586,11 +1117,14 @@ impl NetNamespace {
             packet_sockets_need_cleanup: AtomicBool::new(false),
             bridge_list: RwSem::new(BTreeMap::new()),
             netlink_socket_table: NetlinkSocketTable::default(),
+            nftables: Some(Box::new(NftNamespaceState::new())),
             netlink_kernel_socket: RwSem::new(generate_supported_netlink_kernel_sockets()),
             unix_abstract_table: unix_abstract_table.clone(),
             local_port_range: AtomicU32::new(
                 crate::net::socket::inet::common::port::DEFAULT_LOCAL_PORT_RANGE,
             ),
+            ipv4_forwarding: AtomicI32::new(0),
+            ipv6_forwarding: AtomicI32::new(0),
             loopback_iface: RcuOptionArcSlot::new_none(),
             default_iface: RcuOptionArcSlot::new_none(),
         });
@@ -622,6 +1156,9 @@ impl NetNamespace {
             teardown_work: NetnsTeardownWork::new(),
             neighbor_table: NeighborTable::new(),
             udp_bindings: UdpBindingTable::default(),
+            conntrack: CtState::new(),
+            ipv4_identification: AtomicU16::new(crate::arch::rand::rand() as u16),
+            ipv6_fragment_identification: AtomicU32::new(crate::arch::rand::rand() as u32),
             tcp_ports: Arc::new(crate::net::socket::inet::common::PortManager::default()),
             tcp_stack: Arc::new(crate::net::tcp_stack::TcpStack::new(self_ref.clone())),
             packet_sockets: RcuArcSlot::new(Arc::new(PacketSocketRegistrySnapshot::default())),
@@ -629,11 +1166,14 @@ impl NetNamespace {
             packet_sockets_need_cleanup: AtomicBool::new(false),
             bridge_list: RwSem::new(BTreeMap::new()),
             netlink_socket_table: NetlinkSocketTable::default(),
+            nftables: Some(Box::new(NftNamespaceState::new())),
             netlink_kernel_socket: RwSem::new(generate_supported_netlink_kernel_sockets()),
             unix_abstract_table: unix_abstract_table.clone(),
             local_port_range: AtomicU32::new(
                 crate::net::socket::inet::common::port::DEFAULT_LOCAL_PORT_RANGE,
             ),
+            ipv4_forwarding: AtomicI32::new(0),
+            ipv6_forwarding: AtomicI32::new(0),
             loopback_iface: RcuOptionArcSlot::new_some(loopback.clone()),
             default_iface: RcuOptionArcSlot::new_none(),
         });
@@ -683,6 +1223,19 @@ impl NetNamespace {
 
     pub(crate) fn udp_bindings(&self) -> &UdpBindingTable {
         &self.udp_bindings
+    }
+
+    /// Allocate an IPv4 datagram ID before local fragmentation. A shared
+    /// per-netns sequence avoids collisions between different UDP sockets
+    /// that transmit fragments to the same destination concurrently.
+    pub(crate) fn next_ipv4_identification(&self) -> u16 {
+        self.ipv4_identification.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Fragment IDs are shared by all local IPv6 sockets in this namespace.
+    pub(crate) fn next_ipv6_fragment_identification(&self) -> u32 {
+        self.ipv6_fragment_identification
+            .fetch_add(1, Ordering::Relaxed)
     }
 
     pub(crate) fn tcp_ports(&self) -> &Arc<crate::net::socket::inet::common::PortManager> {
@@ -1096,6 +1649,30 @@ impl NetNamespace {
         }
     }
 
+    pub fn ipv4_forwarding_value(&self) -> i32 {
+        self.ipv4_forwarding.load(Ordering::Acquire)
+    }
+
+    pub fn ipv4_forwarding_enabled(&self) -> bool {
+        self.ipv4_forwarding_value() != 0
+    }
+
+    pub fn set_ipv4_forwarding(&self, value: i32) {
+        self.ipv4_forwarding.store(value, Ordering::Release);
+    }
+
+    pub fn ipv6_forwarding_value(&self) -> i32 {
+        self.ipv6_forwarding.load(Ordering::Acquire)
+    }
+
+    pub fn ipv6_forwarding_enabled(&self) -> bool {
+        self.ipv6_forwarding_value() != 0
+    }
+
+    pub fn set_ipv6_forwarding(&self, value: i32) {
+        self.ipv6_forwarding.store(value, Ordering::Release);
+    }
+
     pub fn inner(&self) -> RwLockReadGuard<'_, InnerNetNamespace> {
         self.inner.read()
     }
@@ -1129,6 +1706,69 @@ impl NetNamespace {
 
     pub fn netlink_socket_table(&self) -> &NetlinkSocketTable {
         &self.netlink_socket_table
+    }
+
+    pub(crate) fn nftables(&self) -> &NftNamespaceState {
+        self.nftables
+            .as_deref()
+            .expect("live network namespace must own nftables state")
+    }
+
+    pub(crate) fn conntrack(&self) -> &CtState {
+        &self.conntrack
+    }
+
+    /// Prepare the bounded IPv4 ingress and local-loopback fragment handoff
+    /// before publishing conntrack-dependent rules. This may allocate and
+    /// must be called in the nft transaction's process context. On failure no
+    /// rule may be published and ordinary fragment handling stays unchanged.
+    pub(crate) fn prepare_ipv4_defrag(&self) -> Result<(), SystemError> {
+        self.poller.prepare_ip_defrag()
+    }
+
+    /// Call only after successful preparation and conntrack activation, and
+    /// before publishing rules that require CT/NAT. Until then the packet path
+    /// retains its stateless-fragment behavior.
+    pub(crate) fn enable_ipv4_defrag(&self) -> Result<(), SystemError> {
+        self.poller.enable_ipv4_defrag()
+    }
+
+    pub(crate) fn prepare_ipv6_defrag(&self) -> Result<(), SystemError> {
+        // Both address families share one bounded, preallocated handoff ring.
+        self.poller.prepare_ip_defrag()
+    }
+
+    pub(crate) fn enable_ipv6_defrag(&self) -> Result<(), SystemError> {
+        self.poller.enable_ipv6_defrag()
+    }
+
+    pub(crate) fn ipv4_defrag_enabled(&self) -> bool {
+        self.poller.defrag_enabled.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn ipv6_defrag_enabled(&self) -> bool {
+        self.poller.ipv6_defrag_enabled.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn queue_ip_fragment(
+        &self,
+        fragment: PendingIpFragment,
+    ) -> Result<(), PendingIpFragment> {
+        self.poller.queue_ip_fragment(fragment)
+    }
+
+    /// Confirmation may establish a new GC deadline. Wake the namespace
+    /// scheduler after releasing the conntrack lock, never from inside it.
+    pub(crate) fn confirm_conntrack(
+        &self,
+        candidate: CtCandidate,
+        now: Instant,
+    ) -> Result<CtConfirm, CtError> {
+        let confirmed = self.conntrack.confirm(candidate, now)?;
+        if matches!(confirmed, CtConfirm::Inserted(_)) {
+            self.notify_deadline_changed();
+        }
+        Ok(confirmed)
     }
 
     pub fn unix_abstract_table(&self) -> &Arc<UnixAbstractTable> {
@@ -1290,9 +1930,18 @@ impl Drop for NetNamespace {
         // namespace-owned FIB and neighbor state disappear with this object, so
         // the worker only quiesces devices and removes driver-core projections.
         let devices = core::mem::take(self.device_list.get_mut());
-        if !devices.is_empty() {
-            self.teardown_work.enqueue(devices);
-        }
+        let nftables = self
+            .nftables
+            .take()
+            .expect("network namespace must own nftables state until final release");
+        // A live conntrack table may own thousands of flow allocations. Its
+        // final release must not run on the NAPI stack that drops this netns.
+        let conntrack = core::mem::replace(&mut self.conntrack, CtState::new());
+        self.teardown_work.enqueue(NetnsTeardownPayload {
+            devices,
+            nftables,
+            conntrack,
+        });
     }
 }
 

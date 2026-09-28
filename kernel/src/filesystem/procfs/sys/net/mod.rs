@@ -1,4 +1,5 @@
 mod ipv4;
+mod ipv6;
 
 use crate::filesystem::{
     procfs::template::{DirOps, ProcDir, ProcDirBuilder},
@@ -7,6 +8,7 @@ use crate::filesystem::{
 use alloc::string::ToString;
 use alloc::sync::{Arc, Weak};
 use ipv4::Ipv4DirOps;
+use ipv6::Ipv6DirOps;
 use system_error::SystemError;
 
 use crate::filesystem::procfs::Builder;
@@ -40,6 +42,17 @@ impl DirOps for NetDirOps {
             return Ok(inode);
         }
 
+        if name == "ipv6" {
+            let mut cached_children = dir.cached_children().write();
+            if let Some(child) = cached_children.get(name) {
+                return Ok(child.clone());
+            }
+
+            let inode = Ipv6DirOps::new_inode(dir.self_ref_weak().clone());
+            cached_children.insert(name.to_string(), inode.clone());
+            return Ok(inode);
+        }
+
         Err(SystemError::ENOENT)
     }
 
@@ -48,5 +61,8 @@ impl DirOps for NetDirOps {
         cached_children
             .entry("ipv4".to_string())
             .or_insert_with(|| Ipv4DirOps::new_inode(dir.self_ref_weak().clone()));
+        cached_children
+            .entry("ipv6".to_string())
+            .or_insert_with(|| Ipv6DirOps::new_inode(dir.self_ref_weak().clone()));
     }
 }

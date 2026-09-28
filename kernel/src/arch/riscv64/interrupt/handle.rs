@@ -9,9 +9,9 @@ use system_error::SystemError;
 use super::TrapFrame;
 use crate::exception::{ebreak::EBreak, extable::ExceptionTableManager};
 use crate::{
-    arch::syscall::syscall_handler,
+    arch::{syscall::syscall_handler, CurrentIrqArch, MMArch},
     driver::{clocksource::timer_riscv::RiscVSbiTimer, irqchip::riscv_intc::riscv_intc_irq},
-    exception::softirq::do_softirq,
+    exception::{softirq::do_softirq, InterruptArch},
     mm::VirtAddr,
     process::{utils::current_pcb_flags, ProcessFlags, ProcessManager},
     sched::{SchedMode, __schedule},
@@ -252,7 +252,14 @@ fn do_trap_load_page_fault(trap_frame: &mut TrapFrame) -> Result<(), SystemError
 
 /// 处理页存储错误异常 #15
 fn do_trap_store_page_fault(trap_frame: &mut TrapFrame) -> Result<(), SystemError> {
-    if try_fixup_kernel_user_access(trap_frame) {
+    if trap_frame.is_from_user() {
+        unsafe { CurrentIrqArch::interrupt_enable() };
+        let result = MMArch::handle_user_store_page_fault(VirtAddr::new(trap_frame.badaddr));
+        unsafe { CurrentIrqArch::interrupt_disable() };
+        if result.is_ok() {
+            return Ok(());
+        }
+    } else if try_fixup_kernel_user_access(trap_frame) {
         return Ok(());
     }
 

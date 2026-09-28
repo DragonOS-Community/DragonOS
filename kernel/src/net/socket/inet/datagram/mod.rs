@@ -48,6 +48,9 @@ pub(crate) mod udp_bindings;
 
 type EP = crate::filesystem::epoll::EPollEventType;
 const IFACE_POLL_BATCH_ROUNDS: usize = 128;
+// Match the syscall-return network softirq opportunity for local UDP output
+// without waiting for a particular receiver or draining unrelated traffic.
+const LOCAL_OUTPUT_POLL_ROUNDS: usize = 8;
 
 /// Native IPv6 unicast is admitted by the prepared output queue; multicast
 /// and IPv4-mapped destinations still use the smoltcp send queue.
@@ -410,6 +413,15 @@ impl UdpSocket {
                 crate::sched::sched_yield();
             } else {
                 return;
+            }
+        }
+    }
+
+    #[inline]
+    fn poll_local_output(iface: &dyn crate::net::Iface) {
+        for _ in 0..LOCAL_OUTPUT_POLL_ROUNDS {
+            if !iface.poll() {
+                break;
             }
         }
     }
@@ -1193,13 +1205,22 @@ impl UdpSocket {
             snapshot.checksum_enabled,
         )?;
         reservation.set_charge(charge);
-        crate::net::output::submit_prepared_ipv4(
+        let local_target = crate::net::output::submit_prepared_ipv4(
             &self.netns,
             reservation,
             snapshot.route,
             snapshot.multicast_loop,
             true,
         )?;
+        if let Some(target) = local_target {
+            // OUTPUT may reroute the packet. First advance the source owner's
+            // admitted output, then the actual local delivery interface.
+            // Neither the socket-placement nor FIB/ruleset locks are held.
+            Self::poll_local_output(snapshot.owner.as_ref());
+            if !Arc::ptr_eq(&snapshot.owner, &target) {
+                Self::poll_local_output(target.as_ref());
+            }
+        }
         Ok(payload.len())
     }
 

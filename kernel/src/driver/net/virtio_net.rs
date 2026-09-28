@@ -1291,6 +1291,16 @@ impl Iface for VirtioInterface {
                 napi_disable(&napi);
                 return;
             }
+            // The DOWN transition first takes this driver lock to mask IRQs.
+            // After it publishes DOWN, LocalOnly NAPI may run, but it must not
+            // re-enable physical callbacks. Checking under the same lock also
+            // orders this decision against begin_admin_down().
+            if !self.flags().contains(InterfaceFlags::UP) {
+                driver.inner.disable_interrupts();
+                drop(driver);
+                crate::driver::net::napi::napi_complete(napi);
+                return;
+            }
             driver.inner.enable_interrupts_prepare()
         };
 

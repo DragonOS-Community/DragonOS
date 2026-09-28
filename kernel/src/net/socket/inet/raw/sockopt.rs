@@ -389,7 +389,7 @@ impl RawSocket {
             }
             Ok(IpOption::ADD_MEMBERSHIP) | Ok(IpOption::DROP_MEMBERSHIP) => {
                 let opt = IpOption::try_from(name as u32).map_err(|_| SystemError::ENOPROTOOPT)?;
-                apply_ipv4_membership(&self.netns, opt, val, &self.ip_multicast_groups)
+                apply_ipv4_membership(&self.netns, opt, val, &self.ip_multicast_groups).map(|_| ())
             }
             _ => Err(SystemError::ENOPROTOOPT),
         }

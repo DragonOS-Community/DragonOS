@@ -12,8 +12,9 @@ use system_error::SystemError;
 
 use crate::arch::rand::rand;
 use crate::libs::mutex::Mutex;
+use crate::process::namespace::NamespaceOps;
 
-use super::UdpSocket;
+use super::{multicast_loopback::multicast_registry, UdpSocket};
 use crate::process::namespace::net_namespace::NetNamespace;
 
 #[derive(Debug)]
@@ -69,6 +70,31 @@ impl smoltcp::iface::UdpIngressHandler for NetnsUdpIngress {
             .ok()
             .filter(|ifindex| *ifindex > 0)
             .unwrap_or(self.ifindex);
+        if let IpAddress::Ipv4(group) = dest.addr {
+            if group.is_multicast() {
+                // Linux checks interface group membership before UDP socket
+                // fanout. IP_MULTICAST_ALL only widens the set of sockets on
+                // an interface that has actually joined the group.
+                let group = u32::from_ne_bytes(group.octets());
+                if multicast_registry().has_membership(
+                    netns.ns_common().nsid.data(),
+                    group,
+                    ingress_ifindex,
+                ) {
+                    netns.udp_bindings().deliver_ingress(
+                        dest,
+                        src,
+                        ingress_ifindex,
+                        is_broadcast,
+                        meta,
+                        payload,
+                    );
+                }
+                // No multicast listener must not fall through to smoltcp's
+                // single-socket demux or generate ICMP port unreachable.
+                return smoltcp::iface::UdpIngressResult::Consumed;
+            }
+        }
         if netns.udp_bindings().deliver_ingress(
             dest,
             src,

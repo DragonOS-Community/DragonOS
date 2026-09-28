@@ -281,7 +281,7 @@ impl RawSocket {
             )?;
         }
         reservation.set_charge(charge);
-        crate::net::output::submit_prepared_ipv4(
+        let _ = crate::net::output::submit_prepared_ipv4(
             &self.netns,
             reservation,
             route,

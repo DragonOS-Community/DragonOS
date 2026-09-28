@@ -13,7 +13,7 @@ use system_error::SystemError;
 use crate::{
     driver::net::{
         local_output::PreparedIpOutputReservation, local_queue::OutputCtContext,
-        types::InterfaceFlags, LocalPacketOrigin,
+        types::InterfaceFlags, Iface, LocalPacketOrigin,
     },
     process::namespace::net_namespace::NetNamespace,
 };
@@ -528,7 +528,7 @@ pub(crate) fn submit_prepared_ipv4(
     mut route: OutputRouteDecision,
     multicast_loop: bool,
     may_fragment: bool,
-) -> Result<(), SystemError> {
+) -> Result<Option<Arc<dyn Iface>>, SystemError> {
     reservation.validate_for_route(route, may_fragment)?;
     let packet = Ipv4Packet::new_checked(reservation.bytes()).map_err(|_| SystemError::EINVAL)?;
     let ttl = packet.hop_limit();
@@ -580,6 +580,7 @@ pub(crate) fn submit_prepared_ipv4(
 
     let clone_local = is_physical_egress
         && ((route.kind == RTN_MULTICAST && multicast_loop) || route.kind == RTN_BROADCAST);
+    let mut local_copy_queued = false;
     if clone_local {
         // A failed clone allocation/delivery must not cancel the original.
         // Copying precedes the clone's POST hook, matching skb_clone failure.
@@ -600,16 +601,18 @@ pub(crate) fn submit_prepared_ipv4(
                 let copy_mark = copy_ct.mark();
                 if let Ok(context) = copy_ct.confirm() {
                     ct.adopt_confirmed(&context);
-                    let _ = crate::driver::net::inject_owned_local_ip_packet_with_context_and_mark(
-                        egress.as_ref(),
-                        route.oif,
-                        egress.mac(),
-                        clone,
-                        route.kind == RTN_BROADCAST,
-                        LocalPacketOrigin::LocalOutput,
-                        Some(context.for_ingress()),
-                        copy_mark,
-                    );
+                    local_copy_queued =
+                        crate::driver::net::inject_owned_local_ip_packet_with_context_and_mark(
+                            egress.as_ref(),
+                            route.oif,
+                            egress.mac(),
+                            clone,
+                            route.kind == RTN_BROADCAST,
+                            LocalPacketOrigin::LocalOutput,
+                            Some(context.for_ingress()),
+                            copy_mark,
+                        )
+                        .is_ok();
                 }
             }
         }
@@ -618,7 +621,7 @@ pub(crate) fn submit_prepared_ipv4(
     // Multicast TTL zero may still have a local copy, but must not pass the
     // original through POST_ROUTING or emit it to the physical device.
     if route.kind == RTN_MULTICAST && ttl == 0 && is_physical_egress {
-        return Ok(());
+        return Ok(local_copy_queued.then_some(egress));
     }
     if !ct.evaluate_ipv4(
         NftIpv4Hook::PostRouting,
@@ -631,5 +634,7 @@ pub(crate) fn submit_prepared_ipv4(
     }
 
     let mark = ct.mark();
-    reservation.commit(route, may_fragment, ct.confirm()?, mark)
+    reservation.commit(route, may_fragment, ct.confirm()?, mark)?;
+    let local_delivery = route.kind == RTN_LOCAL || !is_physical_egress || local_copy_queued;
+    Ok(local_delivery.then_some(egress))
 }

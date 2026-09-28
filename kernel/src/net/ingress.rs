@@ -761,7 +761,10 @@ impl IpIngressFilter for NetIngressFilter<'_> {
                                 || self.ruleset.has_ipv4_hook(NftIpv4Hook::PreRouting)
                         }
                         IngressStage::LocalOutput => {
-                            self.ruleset.has_ipv4_hook(NftIpv4Hook::PreRouting)
+                            // The output route already selected a local socket owner.
+                            // Even with no rules, the filtered path must retain that
+                            // decision for addresses covered by a loopback subnet.
+                            true
                         }
                         IngressStage::PreRoutingDone | IngressStage::LocalInputDone => false,
                     }

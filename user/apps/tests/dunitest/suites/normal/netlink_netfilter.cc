@@ -5286,6 +5286,67 @@ TEST(NetlinkNetfilter, UdpUnconnectedSendBufferTracksPendingOutputReadiness) {
   EXPECT_NE(0, writable.revents & POLLOUT);
 }
 
+TEST(NetlinkNetfilter, Ipv4MulticastIngressRequiresInterfaceMembership) {
+  Fd receiver(socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0));
+  Fd sender(socket(AF_INET, SOCK_DGRAM, 0));
+  ASSERT_GE(receiver.get(), 0);
+  ASSERT_GE(sender.get(), 0);
+  const unsigned loopback = if_nametoindex("lo");
+  ASSERT_NE(0u, loopback);
+
+  sockaddr_in destination{};
+  destination.sin_family = AF_INET;
+  destination.sin_port = htons(38531);
+  ASSERT_EQ(1, inet_pton(AF_INET, "239.255.35.31", &destination.sin_addr));
+  sockaddr_in bind_address{};
+  bind_address.sin_family = AF_INET;
+  bind_address.sin_port = destination.sin_port;
+  bind_address.sin_addr.s_addr = htonl(INADDR_ANY);
+  ASSERT_EQ(0, bind(receiver.get(), reinterpret_cast<sockaddr*>(&bind_address),
+                    sizeof(bind_address)));
+  ip_mreqn membership{};
+  membership.imr_multiaddr = destination.sin_addr;
+  membership.imr_ifindex = static_cast<int>(loopback);
+  ASSERT_EQ(0, setsockopt(sender.get(), IPPROTO_IP, IP_MULTICAST_IF,
+                          &membership, sizeof(membership)));
+
+  const uint8_t payload = 0x35;
+  auto send = [&] {
+    ASSERT_EQ(1, sendto(sender.get(), &payload, 1, 0,
+                        reinterpret_cast<sockaddr*>(&destination), sizeof(destination)));
+  };
+  auto expect_no_packet = [&] {
+    pollfd ready{receiver.get(), POLLIN, 0};
+    EXPECT_EQ(0, poll(&ready, 1, 50));
+  };
+  send();
+  expect_no_packet();
+
+  ASSERT_EQ(0, setsockopt(receiver.get(), IPPROTO_IP, IP_ADD_MEMBERSHIP,
+                          &membership, sizeof(membership)));
+  send();
+  pollfd ready{receiver.get(), POLLIN, 0};
+  ASSERT_EQ(1, poll(&ready, 1, 2000));
+  uint8_t received = 0;
+  ASSERT_EQ(1, recv(receiver.get(), &received, 1, 0));
+  EXPECT_EQ(payload, received);
+
+  ip_mreqn default_interface{};
+  default_interface.imr_multiaddr = destination.sin_addr;
+  EXPECT_EQ(-1, setsockopt(receiver.get(), IPPROTO_IP, IP_DROP_MEMBERSHIP,
+                           &default_interface, sizeof(default_interface)));
+  EXPECT_EQ(EADDRNOTAVAIL, errno);
+  send();
+  ASSERT_EQ(1, poll(&ready, 1, 2000));
+  ASSERT_EQ(1, recv(receiver.get(), &received, 1, 0));
+  EXPECT_EQ(payload, received);
+
+  ASSERT_EQ(0, setsockopt(receiver.get(), IPPROTO_IP, IP_DROP_MEMBERSHIP,
+                          &membership, sizeof(membership)));
+  send();
+  expect_no_packet();
+}
+
 TEST(NetlinkNetfilter, NftPostroutingCountsMulticastCloneAndOriginalSeparately) {
   ASSERT_TRUE(NetAdmin()) << "requires CAP_NET_ADMIN";
   // A non-loopback output device is required: Linux routes multicast sent

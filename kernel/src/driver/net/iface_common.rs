@@ -809,7 +809,14 @@ impl IfaceCommon {
             // （例如 loopback 二次往返、ACK/window update、仅 egress 前进等）。
             // 如果这里只返回 `has_events`，快路径会过早停止，剩余工作只能等下一次外部事件，
             // 在 blocking TCP 大包场景就会表现为 send/recv 偶发永久卡住。
-            return has_events || poll_again || output_drain.needs_immediate_poll();
+            // Draining output can enqueue a new local input packet after the
+            // earlier poll_again snapshot. Do not report quiescence until that
+            // packet has had an ingress poll opportunity. NAPI uses the same
+            // post-drain check below.
+            return has_events
+                || poll_again
+                || self.has_local_input()
+                || output_drain.needs_immediate_poll();
         }
     }
 

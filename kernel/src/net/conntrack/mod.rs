@@ -14,15 +14,10 @@ use core::sync::atomic::{AtomicU8, Ordering};
 use hashbrown::HashMap;
 use smoltcp::wire::IpVersion;
 
-#[path = "conntrack/nat.rs"]
 mod nat;
-#[path = "conntrack/nat_v6.rs"]
 mod nat_v6;
-#[path = "conntrack/packet.rs"]
 mod packet;
-#[path = "conntrack/packet_v6.rs"]
 mod packet_v6;
-#[path = "conntrack/tcp.rs"]
 mod tcp;
 pub(crate) use nat::{
     rewrite_ipv4_related_icmp, rewrite_ipv4_tuple, NatManipSide, NatRewriteError,

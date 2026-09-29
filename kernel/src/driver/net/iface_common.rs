@@ -449,6 +449,47 @@ impl IfaceCommon {
         }
     }
 
+    /// Transfer an accepted datagram to the actual egress neighbor queue.
+    /// Failure returns ownership to the caller; its source reservation is
+    /// still live until that caller decides to drop the packet.
+    pub(super) fn enqueue_prepared_deferred_output(
+        &self,
+        expected_netns: &Arc<NetNamespace>,
+        packet: LocalOutputPacket,
+        retry_at: smoltcp::time::Instant,
+        probe_sent: bool,
+    ) -> Result<(), LocalOutputPacket> {
+        let epoch = self.namespace_epoch.load(Ordering::Acquire);
+        if epoch & 1 != 0
+            || !self
+                .net_namespace
+                .read()
+                .upgrade()
+                .is_some_and(|owner| Arc::ptr_eq(&owner, expected_netns))
+        {
+            return Err(packet);
+        }
+        let Some(mut reservation) = self.local_input_queue.reserve_output() else {
+            return Err(packet);
+        };
+        if !reservation.try_resize(packet.frame.capacity()) {
+            return Err(packet);
+        }
+        // A clone from an old device list may outlive a netns move. The
+        // reservation makes a move wait; recheck its identity before commit.
+        let owner = self.net_namespace.read();
+        if self.namespace_epoch.load(Ordering::Acquire) != epoch
+            || !owner
+                .upgrade()
+                .is_some_and(|current| Arc::ptr_eq(&current, expected_netns))
+        {
+            return Err(packet);
+        }
+        drop(owner);
+        // Joining an unresolved neighbor must not postpone an earlier probe.
+        reservation.commit_deferred_packet(packet, retry_at, probe_sent, false)
+    }
+
     pub(super) fn schedule_local_output(
         &self,
         retry_at: smoltcp::time::Instant,
@@ -530,6 +571,25 @@ impl IfaceCommon {
             configured.is_some_and(|neighbors| neighbors.lookup(ifindex, next_hop).is_some())
                 || interface.is_neighbor_resolved(timestamp, next_hop)
         });
+    }
+
+    /// Close the reply-before-enqueue race for an admitted routed packet.
+    /// The actual egress owns both the neighbor cache and the deferred queue.
+    pub(super) fn release_resolved_neighbor_after_enqueue(
+        &self,
+        oif: u32,
+        next_hop: smoltcp::wire::IpAddress,
+    ) -> bool {
+        let mut interface = self.smol_iface.lock();
+        let configured = self
+            .net_namespace()
+            .is_some_and(|netns| crate::net::neighbor::lookup(&netns, oif, next_hop).is_some());
+        let resolved = configured
+            || interface.is_neighbor_resolved(crate::time::Instant::now().into(), next_hop);
+        if !resolved {
+            return false;
+        }
+        self.local_input_queue.release_neighbor(oif, next_hop)
     }
 
     pub(super) fn has_local_work(&self) -> bool {
@@ -1466,6 +1526,12 @@ impl IfaceCommon {
                 LocalOutputTransmitResult::Continue(output) => {
                     debug_assert!(output.prepared_ip.is_some());
                     in_flight.requeue_ready(output);
+                    if let Some(key) = deferred_probe {
+                        // The first fragment succeeded. A remaining fragment
+                        // is ready, not a neighbor probe; release the bucket's
+                        // in-flight representative and its other packets.
+                        self.local_input_queue.complete_deferred_probe_success(key);
+                    }
                     continue;
                 }
                 LocalOutputTransmitResult::Sent(output) => {
@@ -1516,16 +1582,6 @@ impl IfaceCommon {
                     else {
                         unreachable!("only routed output performs neighbor discovery");
                     };
-                    if packet.prepared_ip.is_some() {
-                        // An admitted complete datagram keeps its source-owner
-                        // capacity even when OUTPUT changed the egress. A
-                        // target-queue admission may now fail and would lose
-                        // a packet that the sender has already accepted.
-                        debug_assert!(deferred_probe.is_none());
-                        in_flight.requeue_backpressured(packet, retry_at);
-                        self.defer_local_output_retry_at(retry_at);
-                        continue;
-                    }
                     if let Some(key) = deferred_probe {
                         debug_assert_eq!(oif, self.iface_id as u32);
                         match in_flight.finish_deferred_probe(packet, key, retry_at, probe_sent) {
@@ -1539,17 +1595,52 @@ impl IfaceCommon {
                                 self.local_input_queue.recycle_output(packet.frame);
                             }
                         }
-                    } else if oif == self.iface_id as u32 {
-                        match in_flight.requeue_deferred(packet, retry_at, probe_sent) {
+                    } else if packet.prepared_ip.is_some() && oif != self.iface_id as u32 {
+                        // OUTPUT can change the egress after the source queue
+                        // accepted this datagram. Keep its source reservation
+                        // until the actual egress has admitted the packet.
+                        let Some(egress) = netns.device_list().get(&(oif as usize)).cloned() else {
+                            log::debug!("dropping routed output: egress {} disappeared", oif);
+                            drop(in_flight);
+                            self.local_input_queue.recycle_output(packet.frame);
+                            continue;
+                        };
+                        match egress
+                            .common()
+                            .enqueue_prepared_deferred_output(&netns, packet, retry_at, probe_sent)
+                        {
                             Ok(()) => {
-                                let retry_at =
-                                    if crate::net::neighbor::release_deferred_after_enqueue(
-                                        &netns, self, oif, next_hop,
-                                    ) {
-                                        crate::time::Instant::now().into()
-                                    } else {
-                                        retry_at
-                                    };
+                                drop(in_flight);
+                                let retry_at = if egress
+                                    .common()
+                                    .release_resolved_neighbor_after_enqueue(oif, next_hop)
+                                {
+                                    crate::time::Instant::now().into()
+                                } else {
+                                    retry_at
+                                };
+                                egress.common().schedule_registered_local_output(retry_at);
+                            }
+                            Err(packet) => {
+                                log::debug!(
+                                    "dropping routed output on {}: egress neighbor queue full",
+                                    egress.name()
+                                );
+                                drop(in_flight);
+                                self.local_input_queue.recycle_output(packet.frame);
+                            }
+                        }
+                    } else if oif == self.iface_id as u32 {
+                        match in_flight.commit_deferred_packet(packet, retry_at, probe_sent, false)
+                        {
+                            Ok(()) => {
+                                let retry_at = if self
+                                    .release_resolved_neighbor_after_enqueue(oif, next_hop)
+                                {
+                                    crate::time::Instant::now().into()
+                                } else {
+                                    retry_at
+                                };
                                 self.defer_local_output_retry_at(retry_at);
                             }
                             Err(packet) => {

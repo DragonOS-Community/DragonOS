@@ -368,6 +368,7 @@ class Ipv6RoutedOutput : public testing::Test {
         EXPECT_EQ(memcmp(buffer, reply, sizeof(reply)), 0);
         ASSERT_NO_FATAL_FAILURE(Segment(0x14, kPeerSequence + 1 + sizeof(reply), client_next_));
     }
+    void VerifyOversizeUdp(bool cold_neighbor);
 };
 
 TEST_F(Ipv6RoutedOutput, ExplicitSourceUsesFibEgressAndReceivesOnOwner) {
@@ -419,6 +420,62 @@ TEST_F(Ipv6RoutedOutput, ColdNeighborDiscoveryReleasesQueuedTcp) {
     ASSERT_GT(solicitations_, 0u) << "must exercise NDP, not a warm cache";
     ASSERT_NO_FATAL_FAILURE(Transfer(256, original_mtu_));
 }
+TEST_F(Ipv6RoutedOutput, ColdNeighborDiscoveryReleasesPreparedUdpPromptly) {
+    ASSERT_EQ(Neighbor(false), 0) << strerror(errno);
+    neighbor_added_ = false;
+    dynamic_neighbor_ = true;
+    client_.reset(socket(AF_INET6, SOCK_DGRAM, 0));
+    ASSERT_GE(client_.get(), 0);
+    sockaddr_in6 local{};
+    local.sin6_family = AF_INET6;
+    local.sin6_addr = source_;
+    ASSERT_EQ(bind(client_.get(), reinterpret_cast<sockaddr*>(&local), sizeof(local)), 0);
+    const char device[] = "veth2";
+    ASSERT_EQ(setsockopt(client_.get(), SOL_SOCKET, SO_BINDTODEVICE, device, sizeof(device)), 0);
+    sockaddr_in6 remote{};
+    remote.sin6_family = AF_INET6;
+    remote.sin6_addr = peer_;
+    remote.sin6_port = htons(kPeerPort);
+    const unsigned char payload = 0x43;
+    ASSERT_EQ(sendto(client_.get(), &payload, 1, 0,
+                     reinterpret_cast<sockaddr*>(&remote), sizeof(remote)), 1);
+
+    bool answered = false;
+    std::chrono::steady_clock::time_point answered_at{};
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(4);
+    while (std::chrono::steady_clock::now() < deadline) {
+        pollfd event{packet_.get(), POLLIN, 0};
+        ASSERT_GE(poll(&event, 1, 50), 0);
+        std::array<unsigned char, 2048> frame{};
+        sockaddr_ll link{};
+        socklen_t size = sizeof(link);
+        const ssize_t count = recvfrom(packet_.get(), frame.data(), frame.size(), 0,
+                                       reinterpret_cast<sockaddr*>(&link), &size);
+        if (count < 14 + 40 + 8 || Get16(frame.data() + 12) != ETH_P_IPV6) continue;
+        const auto* ip = frame.data() + 14;
+        if (count >= 14 + 40 + 24 && ip[6] == IPPROTO_ICMPV6 && ip[40] == 135 &&
+            !memcmp(ip + 48, &peer_, sizeof(peer_)) && link.sll_pkttype != PACKET_OUTGOING) {
+            ASSERT_FALSE(answered) << "neighbor retried before the prepared packet was sent";
+            in6_addr soliciting_address{};
+            memcpy(&soliciting_address, ip + 8, sizeof(soliciting_address));
+            Ndisc(136, peer_, soliciting_address, peer_);
+            answered = true;
+            answered_at = std::chrono::steady_clock::now();
+            continue;
+        }
+        if (count < 14 + 40 + 8 + 1 || ip[6] != IPPROTO_UDP ||
+            memcmp(ip + 8, &source_, sizeof(source_)) ||
+            memcmp(ip + 24, &peer_, sizeof(peer_)) || Get16(ip + 42) != kPeerPort) continue;
+        ASSERT_TRUE(answered) << "packet bypassed the cold neighbor probe";
+        EXPECT_EQ(link.sll_pkttype, PACKET_HOST);
+        EXPECT_EQ(ip[48], payload);
+        EXPECT_LT(std::chrono::steady_clock::now() - answered_at,
+                  std::chrono::milliseconds(850))
+            << "prepared datagram waited for the NDP retry timer after the reply";
+        return;
+    }
+    FAIL() << "prepared datagram was not emitted after the neighbor reply";
+}
 TEST_F(Ipv6RoutedOutput, UdpMtuSizedPayloadUsesPhysicalEgress) {
     ASSERT_EQ(SetMtu(1280), 0) << strerror(errno);
     client_.reset(socket(AF_INET6, SOCK_DGRAM, 0));
@@ -453,8 +510,13 @@ TEST_F(Ipv6RoutedOutput, UdpMtuSizedPayloadUsesPhysicalEgress) {
     }
     FAIL() << "MTU-sized UDP datagram did not arrive physically from veth2";
 }
-TEST_F(Ipv6RoutedOutput, OversizeUdpIsSourceFragmentedAfterOneSend) {
+void Ipv6RoutedOutput::VerifyOversizeUdp(bool cold_neighbor) {
     ASSERT_EQ(SetMtu(1280), 0) << strerror(errno);
+    if (cold_neighbor) {
+        ASSERT_EQ(Neighbor(false), 0) << strerror(errno);
+        neighbor_added_ = false;
+        dynamic_neighbor_ = true;
+    }
     client_.reset(socket(AF_INET6, SOCK_DGRAM, 0));
     ASSERT_GE(client_.get(), 0);
     sockaddr_in6 local{}; local.sin6_family = AF_INET6; local.sin6_addr = source_;
@@ -473,6 +535,8 @@ TEST_F(Ipv6RoutedOutput, OversizeUdpIsSourceFragmentedAfterOneSend) {
     std::vector<bool> received(reassembled.size(), false);
     uint32_t fragment_id = 0;
     bool have_id = false, saw_last = false;
+    bool answered = false;
+    std::chrono::steady_clock::time_point answered_at{};
     size_t filled = 0;
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(4);
     while (filled < reassembled.size() && std::chrono::steady_clock::now() < deadline) {
@@ -483,8 +547,26 @@ TEST_F(Ipv6RoutedOutput, OversizeUdpIsSourceFragmentedAfterOneSend) {
                              reinterpret_cast<sockaddr*>(&link), &size);
         if (n < 62 || Get16(frame + 12) != ETH_P_IPV6) continue;
         const auto* ip = frame + 14;
+        if (n >= 78 && ip[6] == IPPROTO_ICMPV6 && ip[40] == 135 &&
+            !memcmp(ip + 48, &peer_, sizeof(peer_)) && link.sll_pkttype != PACKET_OUTGOING) {
+            ASSERT_TRUE(cold_neighbor) << "permanent neighbor unexpectedly needed solicitation";
+            ASSERT_FALSE(answered) << "neighbor retried before the fragments were emitted";
+            in6_addr soliciting_address{};
+            memcpy(&soliciting_address, ip + 8, sizeof(soliciting_address));
+            Ndisc(136, peer_, soliciting_address, peer_);
+            answered = true;
+            answered_at = std::chrono::steady_clock::now();
+            continue;
+        }
         if (ip[6] != IPPROTO_FRAGMENT || memcmp(ip + 8, &source_, 16) ||
             memcmp(ip + 24, &peer_, 16) || ip[40] != IPPROTO_UDP) continue;
+        if (cold_neighbor) {
+            ASSERT_TRUE(answered) << "fragments bypassed the cold neighbor probe";
+        }
+        if (cold_neighbor && !have_id) {
+            EXPECT_LT(std::chrono::steady_clock::now() - answered_at,
+                      std::chrono::milliseconds(850));
+        }
         ASSERT_EQ(link.sll_pkttype, PACKET_HOST);
         ASSERT_LE(n - 14, 1280);
         ASSERT_GE(Get16(ip + 4), 8);
@@ -512,6 +594,12 @@ TEST_F(Ipv6RoutedOutput, OversizeUdpIsSourceFragmentedAfterOneSend) {
     memcpy(pseudo_ip + 8, &source_, 16);
     memcpy(pseudo_ip + 24, &peer_, 16);
     EXPECT_EQ(Checksum(pseudo_ip, reassembled.data(), reassembled.size(), IPPROTO_UDP), 0);
+}
+TEST_F(Ipv6RoutedOutput, OversizeUdpIsSourceFragmentedAfterOneSend) {
+    ASSERT_NO_FATAL_FAILURE(VerifyOversizeUdp(false));
+}
+TEST_F(Ipv6RoutedOutput, ColdNeighborOversizeUdpIsSourceFragmentedAfterOneSend) {
+    ASSERT_NO_FATAL_FAILURE(VerifyOversizeUdp(true));
 }
 TEST_F(Ipv6RoutedOutput, MissingBoundDeviceRouteDoesNotConsumeSocket) {
     client_.reset(socket(AF_INET6, SOCK_STREAM | SOCK_NONBLOCK, 0));

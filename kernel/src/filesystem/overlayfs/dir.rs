@@ -241,6 +241,25 @@ pub(super) fn create(
     result
 }
 
+pub(super) fn symlink(
+    inode: &OvlInode,
+    name: &str,
+    target: &str,
+) -> Result<Arc<dyn IndexNode>, SystemError> {
+    let state = inode.dir_state()?;
+    let _mutation_guard = state.mutation_lock.lock();
+    create_over_whiteout(
+        inode,
+        name,
+        |dir, temp_name| dir.symlink(temp_name, target),
+        false,
+    )?;
+    state.modified(&[name]);
+    // The backing inode returned by create_over_whiteout may still be associated
+    // with the workdir. The VFS must receive an overlay inode for this name.
+    super::lookup::find_locked(inode, name, &state)
+}
+
 pub(super) fn mknod(
     inode: &OvlInode,
     filename: &str,

@@ -860,6 +860,14 @@ impl IndexNode for OvlInode {
         dir::create(self, name, file_type, mode)
     }
 
+    fn symlink(
+        &self,
+        name: &str,
+        target: &str,
+    ) -> Result<Arc<dyn IndexNode>, system_error::SystemError> {
+        dir::symlink(self, name, target)
+    }
+
     fn move_to(
         &self,
         old_name: &str,

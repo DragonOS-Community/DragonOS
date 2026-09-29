@@ -544,6 +544,99 @@ TEST(OverlayFsSemantics, CreateOverWhiteoutAfterLowerUnlink) {
     remove_tree(root);
 }
 
+TEST(OverlayFsSemantics, SymlinkCreatesRealUpperLink) {
+    ScopedOverlayEnv scoped("overlay_symlink_create");
+    const auto& env = scoped.env;
+    ASSERT_TRUE(setup_overlay_env(env)) << strerror(errno);
+
+    const std::string merged_link = join_path(env.merged, "link");
+    const std::string upper_link = join_path(env.upper, "link");
+    const std::string lower_link = join_path(env.lower, "link");
+    ASSERT_EQ(0, symlink("../relative-target", merged_link.c_str())) << strerror(errno);
+
+    struct stat merged_stat = {};
+    struct stat upper_stat = {};
+    ASSERT_EQ(0, lstat(merged_link.c_str(), &merged_stat)) << strerror(errno);
+    ASSERT_EQ(0, lstat(upper_link.c_str(), &upper_stat)) << strerror(errno);
+    EXPECT_TRUE(S_ISLNK(merged_stat.st_mode));
+    EXPECT_TRUE(S_ISLNK(upper_stat.st_mode));
+    EXPECT_EQ("../relative-target", read_symlink_target(merged_link));
+    EXPECT_EQ("../relative-target", read_symlink_target(upper_link));
+    expect_path_enoent(lower_link);
+
+    errno = 0;
+    EXPECT_EQ(-1, symlink("other", merged_link.c_str()));
+    EXPECT_EQ(EEXIST, errno);
+}
+
+TEST(OverlayFsSemantics, SymlinkReplacesWhiteoutWithoutChangingLower) {
+    ScopedOverlayEnv scoped("overlay_symlink_whiteout");
+    const auto& env = scoped.env;
+    const std::string lower_link = join_path(env.lower, "link");
+    const std::string merged_link = join_path(env.merged, "link");
+    const std::string upper_link = join_path(env.upper, "link");
+    ASSERT_EQ(0, ensure_dir("/tmp"));
+    prepare_overlay_env(env);
+    ASSERT_EQ(0, write_text(lower_link, "lower"));
+    ASSERT_TRUE(setup_overlay_env(env)) << strerror(errno);
+    ASSERT_EQ(0, unlink(merged_link.c_str())) << strerror(errno);
+    ASSERT_TRUE(is_whiteout(upper_link));
+
+    // The syscall rejects this before entering OverlayFS; a rejected request
+    // must not consume the existing whiteout or leave a workdir temp entry.
+    std::string oversized_target(5000, 'x');
+    errno = 0;
+    EXPECT_EQ(-1, symlink(oversized_target.c_str(), merged_link.c_str()));
+    EXPECT_EQ(ENAMETOOLONG, errno);
+    EXPECT_TRUE(is_whiteout(upper_link));
+    EXPECT_EQ(0, overlay_temp_entry_count(env.work));
+
+    ASSERT_EQ(0, symlink("/proc/mounts", merged_link.c_str())) << strerror(errno);
+    struct stat st = {};
+    ASSERT_EQ(0, lstat(merged_link.c_str(), &st)) << strerror(errno);
+    EXPECT_TRUE(S_ISLNK(st.st_mode));
+    EXPECT_EQ("/proc/mounts", read_symlink_target(merged_link));
+    EXPECT_EQ("lower", read_text(lower_link));
+    EXPECT_EQ(0, overlay_temp_entry_count(env.work));
+}
+
+TEST(OverlayFsSemantics, SymlinkCopiesUpLowerOnlyParent) {
+    ScopedOverlayEnv scoped("overlay_symlink_parent");
+    const auto& env = scoped.env;
+    prepare_overlay_env(env);
+    ASSERT_EQ(0, mkdir(join_path(env.lower, "nested").c_str(), 0755));
+    ASSERT_TRUE(setup_overlay_env(env)) << strerror(errno);
+    const std::string merged_link = join_path(join_path(env.merged, "nested"), "link");
+    const std::string upper_link = join_path(join_path(env.upper, "nested"), "link");
+    const std::string lower_link = join_path(join_path(env.lower, "nested"), "link");
+
+    ASSERT_EQ(0, symlink("target", merged_link.c_str())) << strerror(errno);
+    EXPECT_EQ("target", read_symlink_target(merged_link));
+    EXPECT_EQ("target", read_symlink_target(upper_link));
+    expect_path_enoent(lower_link);
+    ASSERT_EQ(0, umount(env.merged.c_str())) << strerror(errno);
+    ASSERT_TRUE(setup_overlay_env(env)) << strerror(errno);
+    EXPECT_EQ("target", read_symlink_target(merged_link));
+}
+
+TEST(OverlayFsSemantics, SymlinkRejectsReadOnlyLowerOnlyMount) {
+    ScopedOverlayEnv scoped("overlay_symlink_readonly");
+    const auto& env = scoped.env;
+    prepare_overlay_env(env);
+    const std::string lower_second = join_path(env.root, "lower2");
+    ASSERT_EQ(0, ensure_dir(lower_second.c_str()));
+    const std::string options = "lowerdir=" + env.lower + ":" + lower_second;
+    ASSERT_EQ(0, mount("overlay", env.merged.c_str(), "overlay", 0, options.c_str()))
+        << strerror(errno);
+
+    const std::string merged_link = join_path(env.merged, "link");
+    errno = 0;
+    EXPECT_EQ(-1, symlink("target", merged_link.c_str()));
+    EXPECT_EQ(EROFS, errno);
+    expect_path_enoent(join_path(env.lower, "link"));
+    expect_path_enoent(join_path(lower_second, "link"));
+}
+
 TEST(OverlayFsSemantics, MkdirOverWhiteoutAfterLowerUnlink) {
     char root[128] = {};
     char upper[160] = {};

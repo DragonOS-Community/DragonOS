@@ -1128,6 +1128,76 @@ mod output_ct_context_tests {
     use super::*;
 
     #[test]
+    fn prepared_fragment_completion_releases_other_neighbor_packets() {
+        let queue = LocalInputQueue::new();
+        let next_hop = smoltcp::wire::IpAddress::Ipv6(smoltcp::wire::Ipv6Address::from([
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+        ]));
+        let now = smoltcp::time::Instant::from_millis(0);
+        for (mark, retry_ms) in [(1, 1000), (2, 2000)] {
+            let frame = alloc::vec![0x60; 40];
+            let mut reservation = queue.reserve_output().unwrap();
+            assert!(reservation.try_resize(frame.capacity()));
+            reservation
+                .commit_deferred_packet(
+                    LocalOutputPacket {
+                        medium: smoltcp::phy::Medium::Ip,
+                        meta: PacketMeta::default(),
+                        disposition: LocalOutputDisposition::Routed {
+                            oif: 7,
+                            next_hop,
+                            ip_mtu: 1280,
+                        },
+                        frame,
+                        ct_context: OutputCtContext::Untracked,
+                        mark,
+                        prepared_ip: Some(PreparedIpProgress::Ipv6 {
+                            offset: 1200,
+                            identification: 42,
+                        }),
+                        _charge: None,
+                    },
+                    now + smoltcp::time::Duration::from_millis(retry_ms),
+                    mark == 1,
+                    false,
+                )
+                .unwrap();
+        }
+        // A later datagram must not move the existing probe deadline.
+        assert!(matches!(
+            queue.pop_ready_output(now, true),
+            LocalOutputPop::DeferredUntil(deadline)
+                if deadline == now + smoltcp::time::Duration::from_millis(1000)
+        ));
+        let due = now + smoltcp::time::Duration::from_millis(1000);
+        let LocalOutputPop::Ready(fragment, reservation, Some(key)) =
+            queue.pop_ready_output(due, true)
+        else {
+            panic!("the first prepared datagram must own the probe");
+        };
+        assert_eq!(fragment.mark, 1);
+        // This is the Continue branch after the first fragment was sent.
+        reservation.requeue_ready(fragment);
+        queue.complete_deferred_probe_success(key);
+        assert!(!queue.has_deferred_output());
+        for expected_mark in [1, 2] {
+            let LocalOutputPop::Ready(packet, reservation, None) =
+                queue.pop_ready_output(due, false)
+            else {
+                panic!("fragment continuation and its peer must both progress");
+            };
+            assert_eq!(packet.mark, expected_mark);
+            assert!(matches!(
+                packet.prepared_ip,
+                Some(PreparedIpProgress::Ipv6 { offset: 1200, .. })
+            ));
+            drop(packet);
+            drop(reservation);
+        }
+        assert!(!queue.has_output());
+    }
+
+    #[test]
     fn deferred_output_keeps_its_packet_context_across_retry() {
         let queue = LocalInputQueue::new();
         let mut reservation = queue.reserve_output().unwrap();

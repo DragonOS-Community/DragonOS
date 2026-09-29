@@ -2051,9 +2051,9 @@ impl Ext4 {
         }
         // Each iteration starts from the checkpointed inode-table entry.  The
         // on-disk extent root is therefore the restart cursor after any crash.
-        // Chain membership was fully validated once above. The metadata write
-        // barrier keeps the chain stable, avoiding O(extents * orphan_count)
-        // repeated walks; final orphan_del performs its own bounded walk.
+        // Membership comes from the validated, transaction-maintained index.
+        // The metadata write barrier keeps the chain stable throughout reclaim;
+        // final orphan_del rechecks the target and indexed predecessor images.
         loop {
             let mut inode = self.validate_reclaim_inode(inode_id, generation)?;
             if !inode.inode.uses_extents() {

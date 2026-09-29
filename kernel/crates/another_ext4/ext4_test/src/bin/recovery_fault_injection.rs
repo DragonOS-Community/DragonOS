@@ -3040,6 +3040,13 @@ fn main() {
     if let Ok(case) = std::env::var("DRAGONOS_EXT4_RECOVERY_CASE") {
         let persistence = PersistenceModel::WriteBack;
         match case.as_str() {
+            "orphan-index" => {
+                for model in [PersistenceModel::WriteBack, PersistenceModel::WriteThrough] {
+                    run_journal_reclaim_matrix(model);
+                    run_journal_linked_tail_final_unlink_matrix(model);
+                    run_journal_linked_tail_rename_matrix(model);
+                }
+            }
             "reserved-payload-retry" => run_reserved_delalloc_payload_retry_test(persistence),
             "production-append" => run_production_delalloc_append_block_test(persistence),
             "production-split" => run_production_delalloc_extent_split_test(persistence),

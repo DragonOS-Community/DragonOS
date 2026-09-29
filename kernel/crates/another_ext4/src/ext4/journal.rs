@@ -410,6 +410,8 @@ impl Ext4 {
             {
                 return Err(Ext4Error::new(ErrCode::EIO));
             }
+            self.orphan_index_valid
+                .store(false, core::sync::atomic::Ordering::Release);
             ext4_sb = recovered_sb;
             *self.cached_super_block.lock() = recovered_sb;
             self.cached_block_groups = recovered_groups;

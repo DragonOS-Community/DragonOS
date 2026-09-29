@@ -211,6 +211,11 @@ where
         address: Option<crate::net::socket::endpoint::Endpoint>,
     ) -> Result<(usize, usize, crate::net::socket::endpoint::Endpoint), system_error::SystemError>
     {
+        // Netlink does not support out-of-band data, even before bind. Reject
+        // it before the unbound state can report an empty receive queue.
+        if flags.contains(PMSG::OOB) {
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        }
         if let Some(addr) = address {
             let endpoint = addr.try_into()?;
             P::check_connect(&endpoint, &self.netns)?;

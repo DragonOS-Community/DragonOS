@@ -37,7 +37,7 @@ use crate::time::Duration;
 use crate::process::namespace::net_namespace::NetNamespace;
 use crate::{
     filesystem::vfs::file::File,
-    net::socket::unix::{current_ucred, nobody_ucred, UCred},
+    net::socket::unix::{current_ucred, nobody_ucred, write_peercred_option, PeerCred, UCred},
     process::ProcessManager,
     syscall::user_access::UserBufferReader,
 };
@@ -89,6 +89,7 @@ struct Inner {
     local_addr: Option<UnixBinding>,
     /// 连接的对端地址（用于 connect 后的 send）
     peer_addr: Option<UnixEndpointBound>,
+    peer_cred: Option<PeerCred>,
     closed: bool,
     /// 接收队列 - 保存接收到的数据报
     recv_queue: VecDeque<DatagramMessage>,
@@ -103,6 +104,7 @@ impl Inner {
         Self {
             local_addr: None,
             peer_addr: None,
+            peer_cred: None,
             closed: false,
             recv_queue: VecDeque::new(),
             recv_queue_capacity: Self::DEFAULT_RECV_QUEUE_CAPACITY,
@@ -275,6 +277,7 @@ impl UnixDatagramSocket {
     pub fn new_pair(is_nonblocking: bool) -> Result<(Arc<Self>, Arc<Self>), SystemError> {
         let socket_a = Self::new(is_nonblocking);
         let socket_b = Self::new(is_nonblocking);
+        let peer_cred = PeerCred::current();
 
         let netns = socket_a.netns.clone();
 
@@ -298,11 +301,13 @@ impl UnixDatagramSocket {
             let mut inner_a = socket_a.inner.lock();
             inner_a.local_addr = Some(addr_a);
             inner_a.peer_addr = Some(peer_b.clone());
+            inner_a.peer_cred = Some(peer_cred.clone());
         }
         {
             let mut inner_b = socket_b.inner.lock();
             inner_b.local_addr = Some(addr_b);
             inner_b.peer_addr = Some(peer_a.clone());
+            inner_b.peer_cred = Some(peer_cred);
         }
 
         // 注册到绑定表
@@ -1224,6 +1229,10 @@ impl Socket for UnixDatagramSocket {
             crate::net::socket::PSO::TYPE => {
                 let v = PSOCK::Datagram as i32;
                 Ok(write_i32_getsockopt(value, v))
+            }
+            crate::net::socket::PSO::PEERCRED => {
+                let peer_cred = self.inner.lock().peer_cred.clone();
+                Ok(write_peercred_option(value, peer_cred.as_ref()))
             }
             crate::net::socket::PSO::DOMAIN => {
                 let v = AddressFamily::Unix as i32;

@@ -10,7 +10,14 @@ use self::utils::*;
 use crate::libs::casting::DowncastArc;
 
 use super::{PSO, PSOCK};
-use crate::process::namespace::net_namespace::NetNamespace;
+use crate::process::{
+    cred::{Kgid, Kuid},
+    namespace::{
+        net_namespace::NetNamespace,
+        user_namespace::{from_kgid_munged, from_kuid_munged},
+    },
+    pid::{Pid, PidType},
+};
 use crate::{
     filesystem::vfs::{
         inode_lifecycle::{InodeRetentionGuard, InodeRetentionKind},
@@ -77,6 +84,62 @@ pub struct UCred {
     pub pid: i32,
     pub uid: u32,
     pub gid: u32,
+}
+
+/// Identity fixed when a Unix peer relationship is established. Holding the
+/// PID object, rather than the task, keeps namespace identity after exit.
+#[derive(Debug, Clone)]
+pub(super) struct PeerCred {
+    pid: Option<Arc<Pid>>,
+    euid: Kuid,
+    egid: Kgid,
+}
+
+impl PeerCred {
+    pub(super) fn current() -> Self {
+        let pcb = ProcessManager::current_pcb();
+        let cred = pcb.cred();
+        Self {
+            pid: pcb.task_pid_ptr(PidType::TGID),
+            euid: cred.euid,
+            egid: cred.egid,
+        }
+    }
+
+    fn visible(&self) -> UCred {
+        let pcb = ProcessManager::current_pcb();
+        let user_ns = pcb.cred().user_ns.clone();
+        let pid_ns = pcb.active_pid_ns();
+        UCred {
+            pid: self
+                .pid
+                .as_ref()
+                .map_or(0, |pid| pid.pid_nr_ns(&pid_ns).data() as i32),
+            uid: from_kuid_munged(&user_ns, self.euid),
+            gid: from_kgid_munged(&user_ns, self.egid),
+        }
+    }
+}
+
+pub(super) fn write_peercred_option(value: &mut [u8], peer: Option<&PeerCred>) -> usize {
+    let cred = peer.map_or(
+        UCred {
+            pid: 0,
+            uid: u32::MAX,
+            gid: u32::MAX,
+        },
+        PeerCred::visible,
+    );
+    let bytes = [
+        cred.pid.to_ne_bytes(),
+        cred.uid.to_ne_bytes(),
+        cred.gid.to_ne_bytes(),
+    ];
+    let len = value.len().min(core::mem::size_of::<UCred>());
+    for (dst, src) in value[..len].iter_mut().zip(bytes.into_iter().flatten()) {
+        *dst = src;
+    }
+    len
 }
 
 /// Return current task credentials used for unix-domain SCM_CREDENTIALS.

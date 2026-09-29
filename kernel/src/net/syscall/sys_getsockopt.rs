@@ -155,7 +155,8 @@ pub(super) fn do_getsockopt(
     let get_filter = level == PSOL::SOCKET as usize
         && matches!(PSO::try_from(optname as u32), Ok(PSO::ATTACH_FILTER));
     let packet_hdrlen = level == PSOL::PACKET as usize && optname == packet_option::PACKET_HDRLEN;
-    if user_len > MAX_OPTVAL_LEN && !get_filter && !packet_hdrlen {
+    let peercred = level == PSOL::SOCKET as usize && optname == PSO::PEERCRED as usize;
+    if user_len > MAX_OPTVAL_LEN && !get_filter && !packet_hdrlen && !peercred {
         return Err(SystemError::EINVAL);
     }
 
@@ -231,10 +232,20 @@ pub(super) fn do_getsockopt(
             _ => {
                 // 其它 SOL_SOCKET 选项交给具体 socket 实现。
                 // 这里采用"内核缓冲区 -> copy_to_user"的方式，避免假设 optval 是 u32。
-                let kbuf_len = user_len.min(MAX_OPTVAL_LEN);
+                let kbuf_len = if matches!(opt, PSO::PEERCRED) {
+                    user_len.min(core::mem::size_of::<crate::net::socket::unix::UCred>())
+                } else {
+                    user_len.min(MAX_OPTVAL_LEN)
+                };
                 let mut kbuf = vec![0u8; kbuf_len];
                 let written = socket.option(level, optname, &mut kbuf)?;
                 let out_len = calc_out_len(optval, user_len, written);
+
+                // Linux sk_getsockopt(SO_PEERCRED) copies even when optval is
+                // NULL; a nonzero copy must therefore fault, not succeed.
+                if matches!(opt, PSO::PEERCRED) && optval.is_null() && out_len != 0 {
+                    return Err(SystemError::EFAULT);
+                }
 
                 if !optval.is_null() && out_len != 0 {
                     let mut optval_writer = UserBufferWriter::new(optval, out_len, from_user)?;

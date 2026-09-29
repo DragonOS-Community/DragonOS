@@ -2,6 +2,7 @@
 //! 内核对于 Netlink 路由的处理模块
 
 use crate::{
+    filesystem::vfs::file::{FilePrivateData, NamespaceFilePrivateData},
     net::socket::netlink::{
         message::{
             segment::{ack::ErrorSegment, header::SegHdrCommonFlags, CSegmentType},
@@ -16,6 +17,7 @@ use crate::{
     process::{
         cred::{CAPFlags, Cred},
         namespace::net_namespace::NetNamespace,
+        ProcessManager, RawPid,
     },
 };
 use alloc::sync::Arc;
@@ -28,7 +30,10 @@ mod neigh;
 mod route;
 mod utils;
 
-pub(crate) use link::{notify_link_change, notify_link_commit};
+pub(crate) use link::{
+    notify_link_change, notify_link_commit, notify_link_delete, prepare_link_delete,
+    PreparedLinkDelete,
+};
 
 /// Per-send authorization and routing state for userspace rtnetlink requests.
 ///
@@ -61,7 +66,11 @@ impl RtnlRequestContext {
     }
 
     pub(super) fn require_net_admin(&self) -> Result<(), SystemError> {
-        let target_user_ns = self.netns.user_ns();
+        self.require_net_admin_in(&self.netns)
+    }
+
+    fn require_net_admin_in(&self, target: &NetNamespace) -> Result<(), SystemError> {
+        let target_user_ns = target.user_ns();
         if (!self.destination_is_explicit
             && !self
                 .opener_cred
@@ -77,6 +86,32 @@ impl RtnlRequestContext {
 
     pub(super) fn netns(&self) -> Arc<NetNamespace> {
         self.netns.clone()
+    }
+
+    pub(super) fn netns_from_fd(&self, fd: u32) -> Result<Arc<NetNamespace>, SystemError> {
+        let fd = i32::try_from(fd).map_err(|_| SystemError::EBADF)?;
+        let table = ProcessManager::current_pcb().fd_table();
+        let file = table.read().get_file_by_fd(fd).ok_or(SystemError::EBADF)?;
+        let target = {
+            let data = file.private_data.lock();
+            match &*data {
+                FilePrivateData::Namespace(NamespaceFilePrivateData::Net(ns)) => ns.clone(),
+                _ => return Err(SystemError::EINVAL),
+            }
+        };
+        self.require_net_admin_in(&target)?;
+        Ok(target)
+    }
+
+    pub(super) fn netns_from_pid(&self, pid: u32) -> Result<Arc<NetNamespace>, SystemError> {
+        if pid == 0 {
+            return Err(SystemError::ESRCH);
+        }
+        let task = ProcessManager::find_task_by_vpid(RawPid::new(pid as usize))
+            .ok_or(SystemError::ESRCH)?;
+        let target = task.try_nsproxy().ok_or(SystemError::ESRCH)?.net_ns.clone();
+        self.require_net_admin_in(&target)?;
+        Ok(target)
     }
 
     pub(super) fn port_id(&self) -> u32 {
@@ -126,7 +161,7 @@ impl NetlinkRouteKernelSocket {
                 // Keep response delivery outside this scope so ACKs cannot
                 // extend the global control-plane critical section.
                 let rtnl_guard = crate::net::rtnl::lock();
-                dispatch_request(&rtnl_guard, segment, seg_type, netns.clone())
+                dispatch_request(&rtnl_guard, segment, seg_type, context)
             };
 
             let response = match response_segments {
@@ -161,17 +196,17 @@ fn dispatch_request(
     rtnl: &crate::net::rtnl::RtnlGuard,
     segment: &RouteNlSegment,
     seg_type: CSegmentType,
-    netns: Arc<NetNamespace>,
+    context: &RtnlRequestContext,
 ) -> Result<alloc::vec::Vec<RouteNlSegment>, SystemError> {
+    let netns = context.netns();
     match segment {
         RouteNlSegment::GetAddr(request) => addr::do_get_addr(request, netns),
         RouteNlSegment::NewAddr(request) => addr::do_new_addr(rtnl, request, netns),
         RouteNlSegment::DelAddr(request) => addr::do_del_addr(rtnl, request, netns),
         RouteNlSegment::GetLink(request) => link::do_get_link(request, netns),
-        RouteNlSegment::SetLink(request) if seg_type == CSegmentType::DELLINK => {
-            link::do_del_link(request, netns)
-        }
-        RouteNlSegment::SetLink(request) => link::do_set_link(rtnl, request, netns),
+        RouteNlSegment::NewLink(request) => link::do_new_link(rtnl, request, context),
+        RouteNlSegment::DelLink(request) => link::do_del_link(rtnl, request, netns),
+        RouteNlSegment::SetLink(request) => link::do_set_link(rtnl, request, context),
         RouteNlSegment::GetRoute(request) if seg_type == CSegmentType::GETRULE => {
             route::do_get_rule(request, netns)
         }

@@ -138,6 +138,7 @@ impl RawSocket {
         };
         let mut reservation = crate::driver::net::local_output::reserve_prepared_ip_output(
             owner.as_ref(),
+            &self.netns,
             packet.len(),
             IpVersion::Ipv6,
         )?;
@@ -233,6 +234,7 @@ impl RawSocket {
         let charge = self.send_account.charge(packet_len)?;
         let mut reservation = crate::driver::net::local_output::reserve_prepared_ip_output(
             owner.as_ref(),
+            &self.netns,
             packet_len,
             smoltcp::wire::IpVersion::Ipv4,
         )?;

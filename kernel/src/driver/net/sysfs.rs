@@ -3,8 +3,8 @@ use crate::{
     driver::base::{
         class::Class,
         device::{device_manager, Device},
-        device_rename::prepare_class_device_sysfs_rename,
-        kobject::KObject,
+        device_rename::{prepare_class_device_sysfs_move, prepare_class_device_sysfs_rename},
+        kobject::{KObject, KObjectState},
     },
     filesystem::{
         kernfs::KernFSNamespaceTag,
@@ -76,6 +76,21 @@ pub(crate) fn prepare_netdev_sysfs_rename(
     new_name: String,
 ) -> Result<PreparedDeviceSysfsRename, SystemError> {
     prepare_class_device_sysfs_rename(&(dev.clone() as Arc<dyn Device>), new_name)
+}
+
+pub(crate) fn prepare_netdev_sysfs_move(
+    dev: &Arc<dyn Iface>,
+    new_name: String,
+    target: &Arc<NetNamespace>,
+) -> Result<PreparedDeviceSysfsRename, SystemError> {
+    if !dev.kobj_state().contains(KObjectState::IN_SYSFS) || dev.inode().is_none() {
+        return Err(SystemError::EIO);
+    }
+    prepare_class_device_sysfs_move(
+        &(dev.clone() as Arc<dyn Device>),
+        new_name,
+        KernFSNamespaceTag::new(target.ns_common().nsid.data()),
+    )
 }
 
 /// Emits the best-effort kobject move notification after the sysfs and logical

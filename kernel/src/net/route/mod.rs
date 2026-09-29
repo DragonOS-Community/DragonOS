@@ -25,17 +25,20 @@ use crate::{
 
 use fib::FibEditor;
 pub(in crate::net) use fib::FibTable;
+pub(in crate::net) use lifecycle::prepare_address_link_change_from;
 pub(crate) use lifecycle::{
-    commit_addresses, prepare_address_link_change, prepare_link_state_change, register_iface,
-    unregister_iface, AddressLinkChange, PreparedAddressRouteCommit, PreparedLinkStateChange,
+    commit_addresses, prepare_address_link_change, prepare_link_state_change,
+    prepare_unregister_ifaces_from, purge_iface_for_netns_teardown, register_iface,
+    AddressLinkChange, PreparedAddressRouteCommit, PreparedIfaceUnregister,
+    PreparedLinkStateChange,
 };
 pub(crate) use source::{
     resolve_ipv4_output_flow, resolve_ipv4_route, Ipv4OutputFlow, ResolvedIpv4Route,
 };
 pub(crate) use source::{resolve_ipv6_output_route, resolve_ipv6_send_route};
 use transaction::{
-    prepare_with_devices, projection_for_iface, transact_single, transact_with_devices,
-    PreparedTransaction, ProjectionPlan,
+    prepare_with_devices, prepare_with_devices_from, projection_for_iface, transact_single,
+    transact_with_devices, PreparedTransaction, ProjectionPlan,
 };
 pub(crate) use types::*;
 use validation::{validate_entry, validate_entry_on_iface, validate_gateway_iface};

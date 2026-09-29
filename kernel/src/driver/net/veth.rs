@@ -1,5 +1,5 @@
 use super::bridge::BridgeEnableDevice;
-use super::{BootstrapRoute, Iface, IfaceCommon, IfacePollScope, MtuBounds};
+use super::{BootstrapRoute, Iface, IfaceCommon, IfacePollScope, MtuBounds, ETHERNET_MAX_IP_MTU};
 use super::{NetDeivceState, NetDeviceCommonData, Operstate};
 use crate::arch::rand::rand;
 use crate::driver::base::class::Class;
@@ -10,7 +10,7 @@ use crate::driver::base::kobject::{
     KObjType, KObject, KObjectCommonData, KObjectState, LockedKObjectState,
 };
 use crate::driver::base::kset::KSet;
-use crate::driver::net::bridge::{BridgeCommonData, BridgePort};
+use crate::driver::net::bridge::{BridgeCommonData, BridgePort, BridgePortId};
 use crate::driver::net::napi::{napi_schedule, NapiStruct};
 use crate::driver::net::register_netdevice;
 use crate::driver::net::types::InterfaceFlags;
@@ -35,7 +35,8 @@ use system_error::SystemError;
 use unified_init::macros::unified_init;
 
 const VETH_IP_MTU: usize = 1500;
-const VETH_MAX_FRAME_SIZE: usize = VETH_IP_MTU + 14;
+const VETH_MAX_FRAME_SIZE: usize = ETHERNET_MAX_IP_MTU + 14;
+const VETH_MAX_PENDING_FRAMES: usize = 1024;
 
 pub struct Veth {
     name: String,
@@ -71,16 +72,19 @@ impl Veth {
         self.peer = Arc::downgrade(peer);
     }
 
-    pub(self) fn to_peer(peer: &Arc<VethInterface>, data: &[u8]) {
-        let _ = Self::to_peer_owned(peer, data.to_vec());
-    }
-
     fn to_peer_owned(peer: &Arc<VethInterface>, data: Vec<u8>) -> Result<(), SystemError> {
         let napi = peer.napi_struct().ok_or(SystemError::ENOBUFS)?;
         let mut peer_veth = peer.driver.inner.lock();
         if !peer_veth.peer_ingress_enabled {
-            return Ok(());
+            return Err(SystemError::ENETDOWN);
         }
+        if peer_veth.pending_rx_queue.len() >= VETH_MAX_PENDING_FRAMES {
+            return Err(SystemError::ENOBUFS);
+        }
+        peer_veth
+            .pending_rx_queue
+            .try_reserve(1)
+            .map_err(|_| SystemError::ENOMEM)?;
         let generation = peer_veth.ingress_generation;
         peer_veth
             .pending_rx_queue
@@ -192,7 +196,11 @@ impl VethDriver {
                 IngressDisposition::Consumed => {}
                 IngressDisposition::Local => {
                     let mut inner = self.inner.lock();
-                    if inner.peer_ingress_enabled && inner.ingress_generation == frame.generation {
+                    if inner.peer_ingress_enabled
+                        && inner.ingress_generation == frame.generation
+                        && inner.local_rx_queue.len() < VETH_MAX_PENDING_FRAMES
+                        && inner.local_rx_queue.try_reserve(1).is_ok()
+                    {
                         inner.local_rx_queue.push_back(frame.data);
                     }
                 }
@@ -246,16 +254,14 @@ impl VethDriver {
         !self.inner.lock().local_rx_queue.is_empty()
     }
 
-    const MAX_UNTAGGED_FRAME_LEN: usize = 1514;
-    const MAX_VLAN_FRAME_LEN: usize = Self::MAX_UNTAGGED_FRAME_LEN + 4;
-
-    fn validate_frame_len(frame: &[u8]) -> Result<(), SystemError> {
-        if frame.len() <= Self::MAX_UNTAGGED_FRAME_LEN {
+    fn validate_frame_len(&self, frame: &[u8]) -> Result<(), SystemError> {
+        let max_untagged = self.iface().map_or(VETH_IP_MTU, |iface| iface.mtu()) + 14;
+        if frame.len() <= max_untagged {
             return Ok(());
         }
         let vlan_tagged = frame.len() >= 14
             && matches!(u16::from_be_bytes([frame[12], frame[13]]), 0x8100 | 0x88a8);
-        if vlan_tagged && frame.len() <= Self::MAX_VLAN_FRAME_LEN {
+        if vlan_tagged && frame.len() <= max_untagged + 4 {
             Ok(())
         } else {
             Err(SystemError::EMSGSIZE)
@@ -303,7 +309,7 @@ impl VethDriver {
     }
 
     fn submit_frame(&self, frame: Vec<u8>) -> Result<(), SystemError> {
-        Self::validate_frame_len(&frame)?;
+        self.validate_frame_len(&frame)?;
         if let Some(iface) = self.iface() {
             crate::net::socket::packet::deliver_to_packet_sockets(
                 &iface,
@@ -321,7 +327,7 @@ impl VethDriver {
     }
 
     pub fn try_raw_transmit(&self, frame: &[u8]) -> Result<(), SystemError> {
-        Self::validate_frame_len(frame)?;
+        self.validate_frame_len(frame)?;
         self.submit_frame(frame.to_vec())
     }
 }
@@ -361,6 +367,7 @@ impl phy::Device for VethDriver {
 
     fn capabilities(&self) -> DeviceCapabilities {
         let mut caps = DeviceCapabilities::default();
+        // This is the stack's reconfiguration ceiling, not its current MTU.
         caps.max_transmission_unit = VETH_MAX_FRAME_SIZE;
         caps.medium = smoltcp::phy::Medium::Ethernet;
         caps
@@ -395,7 +402,7 @@ impl phy::Device for VethDriver {
 pub struct VethInterface {
     driver: VethDriver,
     common: IfaceCommon,
-    mac_address: EthernetAddress,
+    mac_address: SpinLock<EthernetAddress>,
     inner: SpinLock<VethCommonData>,
     locked_kobj_state: LockedKObjectState,
 }
@@ -411,17 +418,51 @@ pub struct VethCommonData {
 }
 
 impl VethInterface {
-    pub fn peer_veth(&self) -> Arc<VethInterface> {
-        self.inner.lock().peer_veth.upgrade().unwrap()
+    /// A netns move must not carry protocol reassembly, fragments, neighbors,
+    /// or multicast state across the namespace boundary. Prepare a fresh
+    /// smoltcp interface before the move's irreversible sysfs transaction.
+    pub(crate) fn prepare_stack_for_netns_move(
+        &self,
+    ) -> Result<smoltcp::iface::Interface, SystemError> {
+        let mut config = smoltcp::iface::Config::new(HardwareAddress::Ethernet(self.mac()));
+        config.random_seed = rand() as u64;
+        let mut stack = smoltcp::iface::Interface::new(
+            config,
+            &mut self.driver.clone(),
+            crate::time::Instant::now().into(),
+        );
+        stack.set_any_ip(true);
+        stack.set_route_table_includes_connected_prefixes(true);
+        stack
+            .set_ip_mtu(self.stack_mtu(self.mtu()))
+            .map_err(|_| SystemError::EINVAL)?;
+        Ok(stack)
+    }
+
+    pub(crate) fn publish_stack_after_netns_move(&self, stack: smoltcp::iface::Interface) {
+        // Memberships belonged to the source namespace. Keep the established
+        // refcount -> smoltcp lock order while replacing both pieces of state;
+        // a target namespace must join its groups on the fresh stack itself.
+        let mut groups = self.common.ipv4_multicast_refcnt.lock();
+        *self.smol_iface().lock() = stack;
+        groups.clear();
+    }
+
+    pub fn peer_veth_opt(&self) -> Option<Arc<VethInterface>> {
+        self.inner.lock().peer_veth.upgrade()
     }
 
     pub fn new(driver: VethDriver) -> Arc<Self> {
+        Self::new_with_initial_state(driver, true)
+    }
+
+    fn new_with_initial_state(driver: VethDriver, initially_up: bool) -> Arc<Self> {
         let iface_id = generate_iface_id();
         let mac = [
             0x02,
-            0x00,
-            0x00,
-            0x00,
+            (iface_id >> 32) as u8,
+            (iface_id >> 24) as u8,
+            (iface_id >> 16) as u8,
             (iface_id >> 8) as u8,
             iface_id as u8,
         ];
@@ -436,11 +477,10 @@ impl VethInterface {
         );
         iface.set_any_ip(true);
 
-        let flags = InterfaceFlags::BROADCAST
-            | InterfaceFlags::MULTICAST
-            | InterfaceFlags::UP
-            | InterfaceFlags::RUNNING
-            | InterfaceFlags::LOWER_UP;
+        let mut flags = InterfaceFlags::BROADCAST | InterfaceFlags::MULTICAST;
+        if initially_up {
+            flags |= InterfaceFlags::UP | InterfaceFlags::RUNNING | InterfaceFlags::LOWER_UP;
+        }
         let mtu = VETH_IP_MTU;
 
         let device = Arc::new(VethInterface {
@@ -453,10 +493,15 @@ impl VethInterface {
                 flags,
                 iface,
             ),
-            mac_address,
+            mac_address: SpinLock::new(mac_address),
             inner: SpinLock::new(VethCommonData::default()),
             locked_kobj_state: LockedKObjectState::default(),
         });
+        if !initially_up {
+            device.set_net_state(NetDeivceState::__LINK_STATE_NOCARRIER);
+            device.set_operstate(Operstate::IF_OPER_DOWN);
+            device.driver.inner.lock().peer_ingress_enabled = false;
+        }
         let napi_struct = NapiStruct::new(device.clone(), 10);
         *device.common.napi_struct.write() = Some(napi_struct);
 
@@ -478,14 +523,112 @@ impl VethInterface {
     }
 
     pub fn new_pair(name1: &str, name2: &str) -> (Arc<Self>, Arc<Self>) {
+        Self::new_pair_with_initial_state(name1, name2, true)
+    }
+
+    /// Runtime-created veth links start administratively down, like Linux.
+    pub fn new_pair_dynamic(name1: &str, name2: &str) -> (Arc<Self>, Arc<Self>) {
+        Self::new_pair_with_initial_state(name1, name2, false)
+    }
+
+    fn new_pair_with_initial_state(
+        name1: &str,
+        name2: &str,
+        initially_up: bool,
+    ) -> (Arc<Self>, Arc<Self>) {
         let (driver1, driver2) = VethDriver::new_pair(name1, name2);
-        let iface1 = VethInterface::new(driver1);
-        let iface2 = VethInterface::new(driver2);
+        let iface1 = VethInterface::new_with_initial_state(driver1, initially_up);
+        let iface2 = VethInterface::new_with_initial_state(driver2, initially_up);
 
         iface1.set_peer_iface(&iface2);
         iface2.set_peer_iface(&iface1);
 
         (iface1, iface2)
+    }
+
+    pub fn bridge_master(&self) -> Option<Arc<super::bridge::BridgeIface>> {
+        self.common_bridge_data()?
+            .bridge_driver_ref
+            .upgrade()?
+            .local_iface()
+    }
+
+    fn update_bridge_carrier(&self) {
+        if let Some(data) = self.common_bridge_data() {
+            if let Some(bridge) = data.bridge_driver_ref.upgrade() {
+                bridge.update_carrier_from_ports();
+            }
+        }
+    }
+
+    pub fn set_mac(&self, mac: EthernetAddress) -> Result<(), SystemError> {
+        let bytes = mac.as_bytes();
+        if bytes[0] & 1 != 0 || bytes.iter().all(|byte| *byte == 0) {
+            return Err(SystemError::EINVAL);
+        }
+        let napi = self.napi_struct();
+        if let Some(napi) = napi.as_ref() {
+            super::napi::napi_pause_and_wait(napi);
+        }
+        self.common
+            .smol_iface
+            .lock()
+            .set_hardware_addr(HardwareAddress::Ethernet(mac));
+        let old = core::mem::replace(&mut *self.mac_address.lock(), mac);
+        if let Some(data) = self.common_bridge_data() {
+            if let Some(bridge) = data.bridge_driver_ref.upgrade() {
+                bridge.port_mac_changed(data.id, old, mac);
+            }
+        }
+        if let Some(napi) = napi {
+            super::napi::napi_resume(napi);
+        }
+        Ok(())
+    }
+
+    fn update_carrier_with_peer(&self, self_up: bool) {
+        let peer = self.peer_veth_opt();
+        let peer_up = peer.as_ref().is_some_and(|other| {
+            other.flags().contains(InterfaceFlags::UP)
+                && other
+                    .net_state()
+                    .contains(NetDeivceState::__LINK_STATE_START)
+        });
+        let carrier = self_up && peer_up;
+        for endpoint in core::iter::once(self).chain(peer.as_deref()) {
+            if carrier {
+                endpoint.clear_net_state(NetDeivceState::__LINK_STATE_NOCARRIER);
+                endpoint.set_operstate(Operstate::IF_OPER_UP);
+            } else {
+                endpoint.set_net_state(NetDeivceState::__LINK_STATE_NOCARRIER);
+                endpoint.set_operstate(Operstate::IF_OPER_DOWN);
+            }
+        }
+    }
+
+    /// Stop both endpoints before either can be unpublished. The caller keeps
+    /// ownership of both Arc references and unregisters them after this returns.
+    pub fn shutdown_pair(&self) {
+        let peer = self.peer_veth_opt();
+        self.common.close_tx_and_wait();
+        self.begin_admin_down();
+        if let Some(other) = peer.as_ref() {
+            other.common.close_tx_and_wait();
+            other.begin_admin_down();
+        }
+        for endpoint in core::iter::once(self).chain(peer.as_deref()) {
+            if let Some(napi) = endpoint.napi_struct() {
+                super::napi::napi_pause_and_wait(&napi);
+                endpoint.quiesce_admin_down();
+                super::napi::napi_disable(&napi);
+            } else {
+                endpoint.quiesce_admin_down();
+            }
+            endpoint.inner.lock().peer_veth = Weak::new();
+            endpoint.driver.inner.lock().peer = Weak::new();
+            endpoint.set_net_state(NetDeivceState::__LINK_STATE_NOCARRIER);
+            endpoint.set_operstate(Operstate::IF_OPER_DOWN);
+        }
     }
 
     fn inner(&self) -> SpinLockGuard<'_, VethCommonData> {
@@ -631,7 +774,7 @@ impl Iface for VethInterface {
     }
 
     fn mac(&self) -> EthernetAddress {
-        self.mac_address
+        *self.mac_address.lock()
     }
 
     fn poll(&self) -> bool {
@@ -698,10 +841,20 @@ impl Iface for VethInterface {
 
     fn set_net_state(&self, state: NetDeivceState) {
         self.inner().netdevice_common.state |= state;
+        if state
+            .intersects(NetDeivceState::__LINK_STATE_START | NetDeivceState::__LINK_STATE_NOCARRIER)
+        {
+            self.update_bridge_carrier();
+        }
     }
 
     fn clear_net_state(&self, state: NetDeivceState) {
         self.inner().netdevice_common.state &= !state;
+        if state
+            .intersects(NetDeivceState::__LINK_STATE_START | NetDeivceState::__LINK_STATE_NOCARRIER)
+        {
+            self.update_bridge_carrier();
+        }
     }
 
     fn operstate(&self) -> Operstate {
@@ -719,7 +872,7 @@ impl Iface for VethInterface {
     fn mtu_bounds(&self) -> MtuBounds {
         MtuBounds {
             min: 68,
-            max: VETH_IP_MTU,
+            max: ETHERNET_MAX_IP_MTU,
         }
     }
 
@@ -747,28 +900,16 @@ impl Iface for VethInterface {
         if is_up {
             self.driver.inner.lock().peer_ingress_enabled = true;
         }
+        self.update_carrier_with_peer(is_up);
     }
 }
 
 impl BridgeEnableDevice for VethInterface {
     fn receive_from_bridge(&self, frame: &[u8]) {
-        // log::info!("VethInterface {} received from bridge", self.name);
-        let peer = self.peer_veth();
-
-        if self
-            .inner
-            .lock()
-            .bridge_common_data
-            .as_ref()
-            .unwrap()
-            .bridge_driver_ref
-            .upgrade()
-            .is_some()
-        {
-            // log::info!("VethInterface {} sending data to peer", self.name);
-
-            // let peer = self.peer_veth();
-            Veth::to_peer(&peer, frame);
+        if self.common_bridge_data().is_some() {
+            if let Some(_tx) = self.common.try_acquire_tx() {
+                let _ = self.driver.try_raw_transmit(frame);
+            }
         }
     }
 
@@ -784,6 +925,17 @@ impl BridgeEnableDevice for VethInterface {
 
     fn common_bridge_data(&self) -> Option<BridgeCommonData> {
         self.inner().bridge_common_data.clone()
+    }
+
+    fn clear_common_bridge_data(&self, bridge_id: BridgePortId) {
+        let mut inner = self.inner.lock();
+        if inner
+            .bridge_common_data
+            .as_ref()
+            .is_some_and(|data| data.id == bridge_id)
+        {
+            inner.bridge_common_data = None;
+        }
     }
 }
 

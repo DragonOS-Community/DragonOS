@@ -40,7 +40,7 @@ fn namespace_snapshot(
     ns_type: NsFileType,
 ) -> Result<NamespaceSnapshot, SystemError> {
     let pcb = target.task().ok_or(SystemError::ESRCH)?;
-    let nsproxy = pcb.nsproxy();
+    let nsproxy = pcb.try_nsproxy().ok_or(SystemError::ENOENT)?;
 
     let data = match ns_type {
         NsFileType::Ipc => NamespaceFilePrivateData::Ipc(nsproxy.ipc_ns.clone()),

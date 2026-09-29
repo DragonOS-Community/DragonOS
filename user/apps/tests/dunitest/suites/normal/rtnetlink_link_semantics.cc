@@ -1042,7 +1042,11 @@ TEST(RtnetlinkLinkSemantics, TxQueueLengthMatchesIoctlSysfsAndLinkDump) {
             ASSERT_GT(count, 0) << strerror(errno);
             EXPECT_EQ(std::string(text.data(), count), std::to_string(*dump_qlen) + "\n");
             if (IsDragonOS()) {
-                EXPECT_EQ(*dump_qlen, 1000u);
+                // The boot devices retain the default; dynamic links may
+                // legitimately configure a different qlen (Docker uses 0).
+                if (snapshot->name == "lo" || snapshot->name == "eth2") {
+                    EXPECT_EQ(*dump_qlen, 1000u);
+                }
                 struct stat metadata {};
                 ASSERT_EQ(fstat(attribute.Get(), &metadata), 0);
                 EXPECT_EQ(metadata.st_mode & 0222, 0u);

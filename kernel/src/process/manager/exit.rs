@@ -463,6 +463,11 @@ impl ProcessManager {
             pcb.exit_fs();
             pcb.exit_timers();
 
+            // Linux releases task namespaces before publishing Zombie, not
+            // when the parent eventually reaps the PCB. In particular, a
+            // dead container init must not pin its netns and veth peers.
+            pcb.exit_task_namespaces();
+
             if group_dead {
                 let (current_tty, is_session_leader, sid) = {
                     let siginfo = group_leader.sig_info_irqsave();

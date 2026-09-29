@@ -358,6 +358,28 @@ impl UdpSocket {
         }
     }
 
+    /// A netdevice move retires its old SocketSet. A live socket remains in
+    /// its source namespace, so any later operation that needs a polled
+    /// SocketSet chooses an interface still owned by that namespace.
+    fn active_owner_for_bound(&self, bound: &BoundUdp) -> Result<Arc<dyn Iface>, SystemError> {
+        let old = bound.inner().iface();
+        if old
+            .net_namespace()
+            .is_some_and(|owner| Arc::ptr_eq(&owner, &self.netns))
+        {
+            return Ok(old.clone());
+        }
+        let local = bound.endpoint().addr;
+        local
+            .filter(|addr| !addr.is_unspecified())
+            .and_then(|addr| {
+                crate::net::socket::inet::common::get_iface_for_local_bind(&addr, &self.netns)
+            })
+            .or_else(|| self.netns.default_iface())
+            .or_else(|| self.netns.loopback_iface().map(|lo| lo as Arc<dyn Iface>))
+            .ok_or(SystemError::ENODEV)
+    }
+
     /// Places an explicitly addressed UDP endpoint according to its transport
     /// owner. Device binding is an independent I/O constraint and selects the
     /// SocketSet only for wildcard, multicast, or broadcast endpoints.
@@ -647,6 +669,7 @@ impl UdpSocket {
         let connected_source = bound.connected_source();
         let explicitly_bound = !bound.should_unbind_on_disconnect();
         let old_iface = bound.inner().iface().clone();
+        let replacement_iface = self.active_owner_for_bound(bound)?;
         // log::debug!(
         //     "Recreating UDP socket: local={:?}, remote={:?}, explicit={}",
         //     local_ep,
@@ -681,14 +704,15 @@ impl UdpSocket {
         // Resizing is an implementation detail, not a new bind operation.
         // Preserve the already validated SocketSet owner even if address/FIB
         // state or SO_BINDTODEVICE changed after the original bind.
-        let bound = match unbound.bind_on_iface(old_iface, new_endpoint, self.bind_context()) {
-            Ok(b) => b,
-            Err(e) => {
-                // Restore unbound state on error
-                *inner_guard = Some(UdpInner::Unbound(UnboundUdp::new(self.ip_version)));
-                return Err(e);
-            }
-        };
+        let bound =
+            match unbound.bind_on_iface(replacement_iface, new_endpoint, self.bind_context()) {
+                Ok(b) => b,
+                Err(e) => {
+                    // Restore unbound state on error
+                    *inner_guard = Some(UdpInner::Unbound(UnboundUdp::new(self.ip_version)));
+                    return Err(e);
+                }
+            };
 
         // Restore connection if it existed
         let mut bound = bound;
@@ -1083,7 +1107,7 @@ impl UdpSocket {
     /// Snapshot only socket state under the placement lock. Both the nft
     /// interpreter and local receive handoff run after that lock is released.
     fn ipv4_send_snapshot(&self, to: Option<IpEndpoint>) -> Result<Ipv4SendSnapshot, SystemError> {
-        let (destination, local, connected_source, owner) = {
+        let (destination, local, connected_source) = {
             let inner = self.inner.read();
             let bound = match inner.as_ref() {
                 Some(UdpInner::Bound(bound)) => bound,
@@ -1097,7 +1121,6 @@ impl UdpSocket {
                 ),
                 bound.endpoint(),
                 bound.connected_source(),
-                bound.inner().iface().clone(),
             )
         };
         if destination.port == 0 {
@@ -1123,6 +1146,9 @@ impl UdpSocket {
         let Ipv4(source) = resolved.source else {
             return Err(SystemError::EAFNOSUPPORT);
         };
+        let owner =
+            crate::net::socket::inet::common::get_iface_for_local_bind(&Ipv4(source), &self.netns)
+                .ok_or(SystemError::ENETUNREACH)?;
         Ok(Ipv4SendSnapshot {
             owner,
             source,
@@ -1188,6 +1214,7 @@ impl UdpSocket {
         let charge = self.send_account.charge(packet_len)?;
         let mut reservation = crate::driver::net::local_output::reserve_prepared_ip_output(
             snapshot.owner.as_ref(),
+            &self.netns,
             packet_len,
             IpVersion::Ipv4,
         )?;
@@ -1284,7 +1311,7 @@ impl UdpSocket {
                 destination_port: destination.port,
             }
         } else {
-            let (destination, local, connected_source, owner) = {
+            let (destination, local, connected_source) = {
                 let inner = self.inner.read();
                 let bound = match inner.as_ref() {
                     Some(UdpInner::Bound(bound)) => bound,
@@ -1296,12 +1323,7 @@ impl UdpSocket {
                         .ok_or(SystemError::EDESTADDRREQ)?,
                 );
                 self.validate_bound_send_dest(bound, destination)?;
-                (
-                    destination,
-                    bound.endpoint(),
-                    bound.connected_source(),
-                    bound.inner().iface().clone(),
-                )
+                (destination, bound.endpoint(), bound.connected_source())
             };
             let Ipv6(destination_addr) = destination.addr else {
                 return Err(SystemError::EAFNOSUPPORT);
@@ -1322,7 +1344,7 @@ impl UdpSocket {
             )?;
             drop(placement);
             Ipv6SendSnapshot {
-                owner,
+                owner: resolved.source_owner,
                 route: resolved.decision,
                 source: resolved.source,
                 destination: destination_addr,
@@ -1334,6 +1356,7 @@ impl UdpSocket {
         let charge = self.send_account.charge(packet_len)?;
         let mut reservation = crate::driver::net::local_output::reserve_prepared_ip_output(
             snapshot.owner.as_ref(),
+            &self.netns,
             packet_len,
             IpVersion::Ipv6,
         )?;
@@ -1486,7 +1509,13 @@ impl UdpSocket {
                         .ok_or(SystemError::EDESTADDRREQ)?;
                     let dest = Self::normalize_unspecified_dest(dest);
                     self.validate_bound_send_dest(bound, dest)?;
-                    let bound_iface = bound.inner().iface().clone();
+                    let bound_iface = self.active_owner_for_bound(bound)?;
+                    if !Arc::ptr_eq(&bound_iface, bound.inner().iface()) {
+                        bound.inner_mut().move_udp_to_iface(bound_iface.clone())?;
+                        bound_iface
+                            .common()
+                            .bind_socket(self.self_ref.upgrade().unwrap());
+                    }
                     let is_multicast = dest.addr.is_multicast();
                     let device_ifindex = self.bound_device_ifindex() as i32;
                     let mcast_ifindex = if is_multicast && device_ifindex != 0 {

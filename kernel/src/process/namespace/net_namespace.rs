@@ -68,6 +68,51 @@ const PACKET_SOCKET_CLEANUP_RETRY_MAX: Duration = Duration::from_secs(5);
 
 type NetnsDeviceMap = BTreeMap<usize, Arc<dyn Iface>>;
 
+/// A candidate device map and ingress bindings for a route-free software
+/// device. Used when a new veth is published or a veth enters another netns.
+pub(crate) struct PreparedNetnsDeviceAddition {
+    netns: Arc<NetNamespace>,
+    candidate: NetnsDeviceMap,
+    bindings: Vec<(Arc<dyn Iface>, crate::driver::net::PreparedNetnsBinding)>,
+}
+
+impl PreparedNetnsDeviceAddition {
+    pub(crate) fn publish(self) {
+        let mut devices = self.netns.device_list_mut();
+        for (iface, binding) in self.bindings {
+            binding.publish(iface.common());
+        }
+        *devices = self.candidate;
+        drop(devices);
+        self.netns.notify_deadline_changed();
+    }
+}
+
+/// RTNL keeps the device map stable after preparation. The FIB candidate and
+/// all projection allocations are ready before a caller shuts down a device.
+pub(crate) struct PreparedNetnsDeviceRemoval<'rtnl> {
+    rtnl: &'rtnl crate::net::rtnl::RtnlGuard,
+    netns: Arc<NetNamespace>,
+    ifindices: Vec<usize>,
+    routes: crate::net::route::PreparedIfaceUnregister<'rtnl>,
+}
+
+impl PreparedNetnsDeviceRemoval<'_> {
+    pub(crate) fn publish(self) {
+        let mut devices = self.netns.device_list_mut();
+        self.routes.publish(&self.netns, || {
+            for ifindex in &self.ifindices {
+                devices
+                    .remove(ifindex)
+                    .expect("RTNL keeps prepared devices registered");
+            }
+        });
+        drop(devices);
+        self.netns
+            .finish_removed_devices_locked(self.rtnl, &self.ifindices);
+    }
+}
+
 #[derive(Debug)]
 struct NetnsTeardownWork {
     payload: Arc<SpinLock<Option<NetnsTeardownPayload>>>,
@@ -86,11 +131,11 @@ impl NetnsTeardownWork {
         let payload = Arc::new(SpinLock::new(None::<NetnsTeardownPayload>));
         let worker_payload = payload.clone();
         let work = Work::new(move || {
-            let payload = worker_payload
+            let mut payload = worker_payload
                 .lock()
                 .take()
                 .expect("queued netns teardown work must own its payload");
-            teardown_netns_devices(payload.devices);
+            teardown_netns_devices(&mut payload.devices);
             drop(payload.nftables);
             drop(payload.conntrack);
         });
@@ -106,12 +151,18 @@ impl NetnsTeardownWork {
     }
 }
 
-fn teardown_netns_devices(devices: NetnsDeviceMap) {
-    for iface in devices.values() {
+fn teardown_netns_devices(devices: &mut NetnsDeviceMap) {
+    // Drop can run on the last NAPI owner, so all blocking work stays here in
+    // process context. Sever bridge/veth edges first; a peer in another live
+    // namespace must be unregistered with its own FIB and sysfs projection.
+    while let Some((ifindex, iface)) = devices.first_key_value() {
+        let ifindex = *ifindex;
+        let iface = iface.clone();
+        let rtnl = crate::net::rtnl::lock();
+        crate::net::link::topology::teardown_detached_netns_device(&rtnl, iface.clone());
+        drop(rtnl);
         iface.common().close_tx_and_wait();
         iface.begin_admin_down();
-    }
-    for iface in devices.values() {
         if let Some(napi) = iface.napi_struct() {
             crate::driver::net::napi::napi_pause_and_wait(&napi);
             iface.quiesce_admin_down();
@@ -119,11 +170,11 @@ fn teardown_netns_devices(devices: NetnsDeviceMap) {
         } else {
             iface.quiesce_admin_down();
         }
-    }
-    for iface in devices.values() {
+        iface.common().retire_for_device_removal();
         iface.clear_net_state(crate::driver::net::NetDeivceState::__LINK_STATE_PRESENT);
         crate::driver::net::netdev_unregister_kobject(iface.clone());
         iface.clear_net_namespace();
+        devices.remove(&ifindex);
     }
 }
 
@@ -184,6 +235,9 @@ pub struct NetNamespace {
     /// 注意：该结构会在 bind/connect 等路径被访问，且这些路径可能会获取可睡眠的 Mutex，
     /// 因此这里使用可睡眠的 `RwSem`，避免自旋锁 + schedule 的组合导致崩溃。
     device_list: RwSem<NetnsDeviceMap>,
+    /// Namespace-relative IDs used when reporting links whose peer lives in
+    /// another netns. Weak entries do not prolong a peer namespace's life.
+    peer_netns_ids: Mutex<PeerNetnsIds>,
     /// Preallocated payload slot and work item for allocation-free final drop.
     teardown_work: NetnsTeardownWork,
     /// Configured, non-aging neighbors owned by this network namespace.
@@ -243,6 +297,15 @@ struct PacketSocketRegistryWriter {
     /// Group id allocator. Reserves both UNIQUEID-allocated ids and explicit
     /// ids so the two namespaces can never collide.
     id_alloc: IdAllocator,
+}
+
+#[derive(Debug, Default)]
+struct PeerNetnsIds {
+    /// Local ID -> peer. Dead slots are reused only when allocating a new ID.
+    slots: Vec<(usize, Weak<NetNamespace>)>,
+    /// Global namespace identity -> local ID. GETLINK must not linearly scan
+    /// every container peer while holding RTNL.
+    by_global: HashMap<usize, i32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -712,6 +775,14 @@ impl NetnsPoller {
         let Some(owner) = owner else {
             return;
         };
+        let owner_epoch = owner.common().namespace_epoch();
+        if owner_epoch & 1 != 0
+            || !owner
+                .net_namespace()
+                .is_some_and(|current| core::ptr::eq(current.as_ref(), netns))
+        {
+            return;
+        }
         let ct_context = match completion.source {
             DefragSource::LocalOutput => Some(
                 first_origin
@@ -726,7 +797,7 @@ impl NetnsPoller {
             DefragSource::LocalInput => Some(CtPacketContext::Untracked),
             DefragSource::LinkIngress => None,
         };
-        if let Err(error) = crate::driver::net::inject_owned_local_ip_packet_with_context_and_mark(
+        if let Err(error) = crate::driver::net::inject_owned_local_ip_packet_if_epoch(
             owner.as_ref(),
             completion.ingress_ifindex,
             source_mac,
@@ -735,6 +806,7 @@ impl NetnsPoller {
             completion.source.packet_origin(),
             ct_context,
             first_origin.mark,
+            Some(owner_epoch),
         ) {
             log::debug!("reassembled IP ingress discarded: {:?}", error);
         }
@@ -1104,6 +1176,7 @@ impl NetNamespace {
             inner: RwLock::new(inner),
             poller: NetnsPoller::new(self_ref.clone()),
             device_list: RwSem::new(BTreeMap::new()),
+            peer_netns_ids: Mutex::new(PeerNetnsIds::default()),
             teardown_work: NetnsTeardownWork::new(),
             neighbor_table: NeighborTable::new(),
             udp_bindings: UdpBindingTable::default(),
@@ -1153,6 +1226,7 @@ impl NetNamespace {
             inner: RwLock::new(inner),
             poller: NetnsPoller::new(self_ref.clone()),
             device_list: RwSem::new(BTreeMap::new()),
+            peer_netns_ids: Mutex::new(PeerNetnsIds::default()),
             teardown_work: NetnsTeardownWork::new(),
             neighbor_table: NeighborTable::new(),
             udp_bindings: UdpBindingTable::default(),
@@ -1195,6 +1269,39 @@ impl NetNamespace {
 
     pub fn user_ns(&self) -> &Arc<UserNamespace> {
         &self._user_ns
+    }
+
+    /// Allocate the ID of `peer` as seen from this namespace. The ID is
+    /// stable while the peer is alive and may be reused after its last owner
+    /// goes away, matching the lifetime of Linux's per-netns peer IDs.
+    pub(crate) fn peer_netnsid(&self, peer: &Arc<NetNamespace>) -> Result<i32, SystemError> {
+        let mut ids = self.peer_netns_ids.lock();
+        let global = peer.ns_common().nsid.data();
+        if let Some(id) = ids.by_global.get(&global) {
+            return Ok(*id);
+        }
+        let reusable = ids
+            .slots
+            .iter()
+            .position(|(_, candidate)| candidate.upgrade().is_none());
+        ids.by_global
+            .try_reserve(1)
+            .map_err(|_| SystemError::ENOMEM)?;
+        let id = if let Some(id) = reusable {
+            let old_global = ids.slots[id].0;
+            ids.by_global.remove(&old_global);
+            ids.slots[id] = (global, Arc::downgrade(peer));
+            id
+        } else {
+            let id = ids.slots.len();
+            i32::try_from(id).map_err(|_| SystemError::ENOSPC)?;
+            ids.slots.try_reserve(1).map_err(|_| SystemError::ENOMEM)?;
+            ids.slots.push((global, Arc::downgrade(peer)));
+            id
+        };
+        let id = i32::try_from(id).map_err(|_| SystemError::ENOSPC)?;
+        ids.by_global.insert(global, id);
+        Ok(id)
     }
 
     pub(super) fn copy_net_ns(
@@ -1784,6 +1891,17 @@ impl NetNamespace {
 
     pub fn add_device(&self, device: Arc<dyn Iface>) -> Result<(), SystemError> {
         let rtnl = crate::net::rtnl::lock();
+        self.add_device_locked(&rtnl, device)
+    }
+
+    /// Register a device while the caller already owns RTNL (rtnetlink doit).
+    /// Keeping the outer guard avoids recursively acquiring the non-reentrant
+    /// control-plane lock during dynamic netdevice creation.
+    pub(crate) fn add_device_locked(
+        &self,
+        rtnl: &crate::net::rtnl::RtnlGuard,
+        device: Arc<dyn Iface>,
+    ) -> Result<(), SystemError> {
         // Keep topology readers behind this write guard until both the map and
         // the authoritative FIB/projections contain the new interface.
         let mut devices = self.device_list_mut();
@@ -1793,6 +1911,14 @@ impl NetNamespace {
         if device.net_namespace().is_some() {
             return Err(SystemError::EBUSY);
         }
+        let requested_name = device.iface_name();
+        if devices.values().any(|existing| {
+            existing
+                .common()
+                .with_iface_name(|name| name == requested_name)
+        }) {
+            return Err(SystemError::EEXIST);
+        }
         // Build every fallible transaction input while the device is still
         // unpublished. The write guard keeps the topology stable, and the new
         // interface is appended explicitly for projection preparation.
@@ -1801,8 +1927,7 @@ impl NetNamespace {
         device.set_net_namespace(netns.clone())?;
         devices.insert(device.nic_id(), device.clone());
         let iface = device.clone();
-        if let Err(error) = crate::net::route::register_iface(&rtnl, &netns, &iface, &participants)
-        {
+        if let Err(error) = crate::net::route::register_iface(rtnl, &netns, &iface, &participants) {
             devices.remove(&device.nic_id());
             device.clear_net_namespace();
             return Err(error);
@@ -1817,51 +1942,172 @@ impl NetNamespace {
         Ok(())
     }
 
+    /// Prepare the topology half of publishing one or two route-free software
+    /// interfaces. RTNL stabilizes names and indices until the owned candidate
+    /// map is swapped in; all ingress allocations are done before that swap.
+    pub(crate) fn prepare_add_devices_locked(
+        &self,
+        _rtnl: &crate::net::rtnl::RtnlGuard,
+        additions: &[(Arc<dyn Iface>, &str)],
+    ) -> Result<PreparedNetnsDeviceAddition, SystemError> {
+        let devices = self.device_list();
+        let mut candidate = devices.clone();
+        let mut names = Vec::new();
+        let mut bindings = Vec::new();
+        names
+            .try_reserve_exact(additions.len())
+            .map_err(|_| SystemError::ENOMEM)?;
+        bindings
+            .try_reserve_exact(additions.len())
+            .map_err(|_| SystemError::ENOMEM)?;
+        let netns = self.self_ref.upgrade().ok_or(SystemError::ENODEV)?;
+        for (iface, name) in additions {
+            if candidate.contains_key(&iface.nic_id())
+                || names.contains(name)
+                || devices.values().any(|existing| {
+                    existing
+                        .common()
+                        .with_iface_name(|current| current == *name)
+                })
+            {
+                return Err(SystemError::EEXIST);
+            }
+            names.push(*name);
+            let binding =
+                crate::driver::net::PreparedNetnsBinding::prepare(&netns, iface.nic_id())?;
+            bindings.push((iface.clone(), binding));
+            candidate.insert(iface.nic_id(), iface.clone());
+        }
+        Ok(PreparedNetnsDeviceAddition {
+            netns,
+            candidate,
+            bindings,
+        })
+    }
+
     pub fn remove_device(&self, nic_id: &usize) {
         // Teardown helper only: the caller must quiesce IRQ, DMA, and NAPI
         // before removing an active device. Runtime hot-remove is not provided
         // by this API.
         let rtnl = crate::net::rtnl::lock();
-        // Readers cannot observe the interface after its FIB entries have
-        // disappeared but before topology removal completes.
-        let mut devices = self.device_list_mut();
-        if !devices.contains_key(nic_id) {
-            return;
+        match self.remove_device_locked(&rtnl, nic_id) {
+            Ok(device) => device.clear_net_namespace(),
+            Err(error) => log::error!("failed to remove interface {}: {:?}", nic_id, error),
         }
-        let netns = self.self_ref.upgrade().unwrap();
-        let participants = match try_snapshot_devices(&devices, None) {
-            Ok(participants) => participants,
-            Err(error) => {
-                log::error!(
-                    "failed to snapshot interfaces before removing {}: {:?}",
-                    nic_id,
-                    error
-                );
-                return;
+    }
+
+    /// Topology/FIB removal under the caller's RTNL guard. The caller must
+    /// quiesce ingress, NAPI and TX before invoking this operation.
+    pub(crate) fn remove_device_locked(
+        &self,
+        rtnl: &crate::net::rtnl::RtnlGuard,
+        nic_id: &usize,
+    ) -> Result<Arc<dyn Iface>, SystemError> {
+        let removed = self
+            .device_list()
+            .get(nic_id)
+            .cloned()
+            .ok_or(SystemError::ENODEV)?;
+        self.prepare_remove_devices_locked(rtnl, core::slice::from_ref(&removed))?
+            .publish();
+        Ok(removed)
+    }
+
+    pub(crate) fn prepare_remove_devices_locked<'rtnl>(
+        &self,
+        rtnl: &'rtnl crate::net::rtnl::RtnlGuard,
+        removed: &[Arc<dyn Iface>],
+    ) -> Result<PreparedNetnsDeviceRemoval<'rtnl>, SystemError> {
+        self.prepare_remove_devices_from_locked(rtnl, removed, None)
+    }
+
+    pub(crate) fn prepare_remove_devices_from_locked<'rtnl>(
+        &self,
+        rtnl: &'rtnl crate::net::rtnl::RtnlGuard,
+        removed: &[Arc<dyn Iface>],
+        staged_before: Option<crate::net::link::StagedLinkFib<'_>>,
+    ) -> Result<PreparedNetnsDeviceRemoval<'rtnl>, SystemError> {
+        let devices = self.device_list();
+        let mut ifindices = Vec::new();
+        let mut route_indices = Vec::new();
+        ifindices
+            .try_reserve_exact(removed.len())
+            .map_err(|_| SystemError::ENOMEM)?;
+        route_indices
+            .try_reserve_exact(removed.len())
+            .map_err(|_| SystemError::ENOMEM)?;
+        for iface in removed {
+            let ifindex = iface.nic_id();
+            if ifindices.contains(&ifindex)
+                || !devices
+                    .get(&ifindex)
+                    .is_some_and(|current| Arc::ptr_eq(current, iface))
+            {
+                return Err(SystemError::ENODEV);
             }
-        };
-        if let Err(error) =
-            crate::net::route::unregister_iface(&rtnl, &netns, *nic_id as u32, &participants)
-        {
-            log::error!(
-                "failed to purge routes for interface {}: {:?}",
-                nic_id,
-                error
-            );
-            return;
+            ifindices.push(ifindex);
+            route_indices.push(u32::try_from(ifindex).map_err(|_| SystemError::EINVAL)?);
         }
-        crate::net::neighbor::remove_iface(&rtnl, &netns, *nic_id as u32);
-        let Some(removed) = devices.remove(nic_id) else {
-            unreachable!("RTNL keeps the checked interface registered")
-        };
-
-        removed.clear_net_namespace();
+        let participants = try_snapshot_devices(&devices, None)?;
         drop(devices);
+        let netns = self.self_ref.upgrade().ok_or(SystemError::ENODEV)?;
+        let routes = crate::net::route::prepare_unregister_ifaces_from(
+            rtnl,
+            &netns,
+            &route_indices,
+            &participants,
+            staged_before,
+        )?;
+        Ok(PreparedNetnsDeviceRemoval {
+            rtnl,
+            netns,
+            ifindices,
+            routes,
+        })
+    }
 
-        self.default_iface
-            .clear_if_deferred(|current| current.iface.nic_id() == *nic_id);
-        self.loopback_iface
-            .clear_if_deferred(|current| current.nic_id() == *nic_id);
+    /// Roll back a newly created, unannounced software link after its caller
+    /// has verified that no authoritative route references it. This avoids a
+    /// second fallible FIB snapshot merely to undo a route-free registration.
+    pub(crate) fn remove_unrouted_devices_locked(
+        &self,
+        rtnl: &crate::net::rtnl::RtnlGuard,
+        removed: &[Arc<dyn Iface>],
+    ) {
+        let mut devices = self.device_list_mut();
+        for iface in removed {
+            let ifindex = iface.nic_id();
+            assert!(
+                devices
+                    .get(&ifindex)
+                    .is_some_and(|current| Arc::ptr_eq(current, iface)),
+                "RTNL must retain the just-created device until rollback"
+            );
+            devices.remove(&ifindex);
+        }
+        drop(devices);
+        for iface in removed {
+            self.finish_removed_devices_locked(rtnl, core::slice::from_ref(&iface.nic_id()));
+        }
+    }
+
+    fn finish_removed_devices_locked(
+        &self,
+        rtnl: &crate::net::rtnl::RtnlGuard,
+        ifindices: &[usize],
+    ) {
+        let netns = self
+            .self_ref
+            .upgrade()
+            .expect("registered netns remains live under RTNL");
+        for &ifindex in ifindices {
+            crate::net::neighbor::remove_iface(rtnl, &netns, ifindex as u32);
+            self.conntrack().invalidate_masquerade_oif(ifindex as u32);
+            self.default_iface
+                .clear_if_deferred(|current| current.iface.nic_id() == ifindex);
+            self.loopback_iface
+                .clear_if_deferred(|current| current.nic_id() == ifindex);
+        }
         self.notify_deadline_changed();
     }
 

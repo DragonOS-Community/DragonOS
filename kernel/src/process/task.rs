@@ -48,7 +48,7 @@ use crate::{
         ProcessFlags, ProcessItimers, ProcessManager, ProcessSchedulerInfo, ProcessSignalInfo,
         ProcessState, RawPid, ThreadInfo, PTRACE_RELATION_LOCK,
     },
-    rcu::{PreparedRcuArcRetire, RcuArcSlot},
+    rcu::{rcu_defer_drop, PreparedRcuArcRetire, RcuArcSlot, RcuOptionArcSlot},
 };
 
 use crate::process::{posix_timer, ptrace, rseq, seccomp};
@@ -141,7 +141,7 @@ pub struct ProcessControlBlock {
     pub(super) pid_links: [PidLink; PidType::PIDTYPE_MAX],
 
     /// Namespace proxy.
-    pub(super) nsproxy: RcuArcSlot<NsProxy>,
+    pub(super) nsproxy: RcuOptionArcSlot<NsProxy>,
     /// The cgroup (v2) this task belongs to.
     pub(super) task_cgroup: RwLock<TaskCgroupRef>,
 
@@ -343,7 +343,7 @@ pub struct ProcessControlBlock {
 /// (the daemon clones them with `CLONE_FS`, see `kthread.rs`).
 pub(crate) struct TaskNamespaceState {
     /// Namespace proxy the task had when the pair was taken.
-    pub nsproxy: Arc<NsProxy>,
+    pub nsproxy: Option<Arc<NsProxy>>,
     /// Filesystem context of the same instant; `None` after `exit_fs()`.
     pub fs: Option<Arc<FsStruct>>,
 }
@@ -546,7 +546,7 @@ impl ProcessControlBlock {
                 basic: basic_info,
                 exec_update_lock: RwSem::new(()),
                 pid_links: core::array::from_fn(|_| PidLink::default()),
-                nsproxy: RcuArcSlot::new(nsproxy),
+                nsproxy: RcuOptionArcSlot::new_some(nsproxy),
                 task_cgroup: RwLock::new(task_cgroup),
                 sem_undo: SpinLock::new(None),
                 preempt_count,
@@ -1103,7 +1103,7 @@ impl ProcessControlBlock {
     pub(crate) fn namespace_state(&self) -> TaskNamespaceState {
         let _task_guard = self.task_lock.lock_irqsave();
         TaskNamespaceState {
-            nsproxy: self.nsproxy(),
+            nsproxy: self.try_nsproxy(),
             fs: self.fs.read().clone(),
         }
     }
@@ -2069,6 +2069,13 @@ impl ProcessControlBlock {
 
     /// Returns the process's namespace proxy.
     pub fn nsproxy(&self) -> Arc<NsProxy> {
+        self.try_nsproxy()
+            .expect("only a live task may access its namespace proxy")
+    }
+
+    /// Returns None once do_exit has detached this task's namespaces. A
+    /// zombie may still be discoverable by PID until its parent reaps it.
+    pub fn try_nsproxy(&self) -> Option<Arc<NsProxy>> {
         self.nsproxy.load()
     }
 
@@ -2078,7 +2085,21 @@ impl ProcessControlBlock {
     /// - `nsproxy`: The new namespace proxy.
     pub fn set_nsproxy(&self, nsproxy: Arc<NsProxy>) {
         let _task_guard = self.task_lock.lock_irqsave();
-        self.nsproxy.store_deferred(nsproxy);
+        self.nsproxy.store_deferred(Some(nsproxy));
+    }
+
+    /// Linux exit_task_namespaces(): release namespace references before the
+    /// task becomes a zombie rather than waiting for its PCB to be reaped.
+    pub(crate) fn exit_task_namespaces(&self) {
+        let old = {
+            let _task_guard = self.task_lock.lock_irqsave();
+            // SAFETY: the slot-owned reference is transferred to an RCU
+            // deferred drop after releasing task_lock.
+            unsafe { self.nsproxy.swap(None) }
+        };
+        if let Some(old) = old {
+            rcu_defer_drop(old);
+        }
     }
 
     pub fn task_cgroup_ref(&self) -> TaskCgroupRef {

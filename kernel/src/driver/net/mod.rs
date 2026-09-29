@@ -50,6 +50,10 @@ mod tx_admission;
 
 pub use iface::*;
 pub use iface_common::IfaceCommon;
+pub(crate) use iface_common::InterfaceSocketSet;
+pub(crate) use iface_common::PreparedNetnsBinding;
 pub(crate) use local_output::IfacePollScope;
+/// Linux ETH_MAX_MTU for software Ethernet netdevices.
+pub(crate) const ETHERNET_MAX_IP_MTU: usize = 65_535;
 use local_output::*;
 use local_queue::*;

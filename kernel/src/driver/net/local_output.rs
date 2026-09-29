@@ -228,16 +228,32 @@ pub(super) struct LocalInputScratch<'a> {
 }
 
 impl<'a> LocalInputScratch<'a> {
+    fn take_pooled(
+        pool: &SpinLock<LocalOutputScratchPool>,
+        min_capacity: usize,
+        max_capacity: usize,
+    ) -> Vec<u8> {
+        let mut pooled = pool.lock();
+        // The pool is bounded to 64 buffers. Pick a compatible size so a
+        // jumbo route does not force small packets to reserve jumbo storage,
+        // while the next jumbo packet can reuse its own returned buffer.
+        let Some(index) = pooled
+            .buffers
+            .iter()
+            .rposition(|buffer| (min_capacity..=max_capacity).contains(&buffer.capacity()))
+        else {
+            return Vec::new();
+        };
+        let buffer = pooled.buffers.swap_remove(index);
+        pooled.bytes -= buffer.capacity();
+        buffer
+    }
+
     pub(super) fn checkout(
         pool: &'a SpinLock<LocalOutputScratchPool>,
         capacity: usize,
     ) -> Option<Self> {
-        let mut buffer = {
-            let mut pooled = pool.lock();
-            let buffer = pooled.buffers.pop().unwrap_or_default();
-            pooled.bytes -= buffer.capacity();
-            buffer
-        };
+        let mut buffer = Self::take_pooled(pool, 0, capacity);
         buffer.clear();
         if buffer.try_reserve_exact(capacity).is_err() {
             LocalInputQueue::recycle_scratch(pool, buffer);
@@ -272,10 +288,11 @@ impl<'a> LocalInputScratch<'a> {
             return true;
         }
         debug_assert!(buffer.is_empty());
-        let mut replacement = Vec::new();
+        let mut replacement = Self::take_pooled(self.pool, capacity, capacity + capacity / 4);
         if replacement.try_reserve_exact(capacity).is_err()
             || !reservation.try_resize(replacement.capacity())
         {
+            LocalInputQueue::recycle_scratch(self.pool, replacement);
             return false;
         }
         core::mem::swap(buffer, &mut replacement);
@@ -306,6 +323,8 @@ impl Drop for LocalInputScratch<'_> {
 /// releases both resources without publishing a partial packet.
 pub(crate) struct PreparedIpOutputReservation<'a> {
     common: &'a IfaceCommon,
+    expected_netns: Arc<crate::process::namespace::net_namespace::NetNamespace>,
+    owner_epoch: u64,
     reservation: LocalOutputReservation<'a>,
     scratch: LocalInputScratch<'a>,
     len: usize,
@@ -313,20 +332,32 @@ pub(crate) struct PreparedIpOutputReservation<'a> {
     charge: Option<OutputCharge>,
 }
 
-pub(crate) fn reserve_prepared_ip_output(
-    source: &dyn Iface,
+pub(crate) fn reserve_prepared_ip_output<'a>(
+    source: &'a dyn Iface,
+    netns: &Arc<crate::process::namespace::net_namespace::NetNamespace>,
     len: usize,
     version: smoltcp::wire::IpVersion,
-) -> Result<PreparedIpOutputReservation<'_>, SystemError> {
-    PreparedIpOutputReservation::reserve(source.common(), len, version)
+) -> Result<PreparedIpOutputReservation<'a>, SystemError> {
+    if !source
+        .net_namespace()
+        .is_some_and(|owner| Arc::ptr_eq(&owner, netns))
+    {
+        return Err(SystemError::ENODEV);
+    }
+    PreparedIpOutputReservation::reserve(source.common(), netns, len, version)
 }
 
 impl<'a> PreparedIpOutputReservation<'a> {
     pub(super) fn reserve(
         common: &'a IfaceCommon,
+        netns: &Arc<crate::process::namespace::net_namespace::NetNamespace>,
         len: usize,
         version: smoltcp::wire::IpVersion,
     ) -> Result<Self, SystemError> {
+        let owner_epoch = common.namespace_epoch();
+        if owner_epoch & 1 != 0 {
+            return Err(SystemError::ENODEV);
+        }
         let valid = match version {
             smoltcp::wire::IpVersion::Ipv4 => (20..=u16::MAX as usize).contains(&len),
             smoltcp::wire::IpVersion::Ipv6 => (40..=40 + u16::MAX as usize).contains(&len),
@@ -345,8 +376,17 @@ impl<'a> PreparedIpOutputReservation<'a> {
             return Err(SystemError::ENOBUFS);
         }
         scratch.resize(len);
+        if common.namespace_epoch() != owner_epoch
+            || !common
+                .net_namespace()
+                .is_some_and(|owner| Arc::ptr_eq(&owner, netns))
+        {
+            return Err(SystemError::ENODEV);
+        }
         Ok(Self {
             common,
+            expected_netns: netns.clone(),
+            owner_epoch,
             reservation,
             scratch,
             len,
@@ -412,6 +452,7 @@ impl<'a> PreparedIpOutputReservation<'a> {
         ct_context: OutputCtContext,
         mark: u32,
     ) -> Result<(), SystemError> {
+        self.check_owner()?;
         self.validate_for_route(route, may_fragment)?;
         let smoltcp::wire::IpAddress::Ipv4(next_hop) = route.next_hop else {
             return Err(SystemError::EINVAL);
@@ -485,6 +526,7 @@ impl<'a> PreparedIpOutputReservation<'a> {
         ct_context: OutputCtContext,
         mark: u32,
     ) -> Result<(), SystemError> {
+        self.check_owner()?;
         self.validate_for_ipv6_route(route)?;
         let disposition = if route.kind == crate::net::route::RTN_LOCAL {
             LocalOutputDisposition::Local {
@@ -509,6 +551,18 @@ impl<'a> PreparedIpOutputReservation<'a> {
         );
         self.common
             .schedule_registered_local_output(crate::time::Instant::now().into());
+        Ok(())
+    }
+
+    fn check_owner(&self) -> Result<(), SystemError> {
+        if self.common.namespace_epoch() != self.owner_epoch
+            || !self
+                .common
+                .net_namespace()
+                .is_some_and(|owner| Arc::ptr_eq(&owner, &self.expected_netns))
+        {
+            return Err(SystemError::ENODEV);
+        }
         Ok(())
     }
 }
@@ -1518,8 +1572,20 @@ pub(super) fn local_tx_token<'a>(
     capabilities: DeviceCapabilities,
 ) -> Option<LocalInputTxToken<'a>> {
     let mut reservation = queue.reserve_output()?;
-    let scratch =
-        LocalInputScratch::checkout(&queue.response_scratch, capabilities.max_transmission_unit)?;
+    // The device capability is the lifetime maximum accepted by smoltcp;
+    // a bridge/veth starts at 1500 and can later grow to jumbo MTU. Charge
+    // the current owner MTU, not that maximum, for every ordinary packet.
+    let owner_ip_mtu = backend_policy
+        .routes
+        .ingress_device(backend_policy.owner_ifindex)
+        .map_or(capabilities.ip_mtu(), |iface| iface.mtu());
+    let frame_capacity = owner_ip_mtu
+        + if capabilities.medium == smoltcp::phy::Medium::Ethernet {
+            14
+        } else {
+            0
+        };
+    let scratch = LocalInputScratch::checkout(&queue.response_scratch, frame_capacity)?;
     if !reservation.try_resize(scratch.capacity()) {
         return None;
     }
@@ -1528,7 +1594,7 @@ pub(super) fn local_tx_token<'a>(
         meta: PacketMeta::default(),
         disposition: LocalOutputDisposition::NativeOwner,
         backend_policy,
-        owner_ip_mtu: capabilities.ip_mtu(),
+        owner_ip_mtu,
         reservation,
         scratch,
     })

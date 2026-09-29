@@ -17,6 +17,23 @@ pub(in crate::net) struct FibTable {
     index: FibIndex,
 }
 
+impl FibTable {
+    /// Creation rollback may skip route preparation only for devices that
+    /// have never acquired an authoritative FIB entry.
+    pub(in crate::net) fn has_oif(&self, ifindex: u32) -> bool {
+        self.entries.iter().any(|route| route.oif == ifindex)
+    }
+
+    /// A netns is already dying, so no caller can abort its peer deletion.
+    /// Remove only this device's routes in place: deleting index entries does
+    /// not allocate, unlike building an ordinary rollback-capable snapshot.
+    pub(in crate::net) fn purge_oif_for_netns_teardown(&mut self, ifindex: u32) {
+        while let Some(index) = self.entries.iter().position(|route| route.oif == ifindex) {
+            self.remove_at(index);
+        }
+    }
+}
+
 pub(super) struct FibDelta {
     pub removed: Vec<RouteEntry>,
     pub added: Vec<RouteEntry>,

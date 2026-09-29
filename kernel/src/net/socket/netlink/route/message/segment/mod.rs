@@ -35,6 +35,7 @@ use system_error::SystemError;
 #[derive(Debug, Clone)]
 pub enum RouteNlSegment {
     NewLink(LinkSegment),
+    DelLink(LinkSegment),
     SetLink(LinkSegment),
     GetLink(LinkSegment),
     NewAddr(AddrSegment),
@@ -59,9 +60,9 @@ impl ProtocolSegment for RouteNlSegment {
             RouteNlSegment::NewAddr(addr_segment)
             | RouteNlSegment::DelAddr(addr_segment)
             | RouteNlSegment::GetAddr(addr_segment) => addr_segment.header(),
-            RouteNlSegment::NewLink(link_segment) | RouteNlSegment::GetLink(link_segment) => {
-                link_segment.header()
-            }
+            RouteNlSegment::NewLink(link_segment)
+            | RouteNlSegment::DelLink(link_segment)
+            | RouteNlSegment::GetLink(link_segment) => link_segment.header(),
             RouteNlSegment::SetLink(link_segment) => link_segment.header(),
             RouteNlSegment::NewNeigh(neigh_segment)
             | RouteNlSegment::DelNeigh(neigh_segment)
@@ -81,9 +82,9 @@ impl ProtocolSegment for RouteNlSegment {
             RouteNlSegment::NewAddr(addr_segment)
             | RouteNlSegment::DelAddr(addr_segment)
             | RouteNlSegment::GetAddr(addr_segment) => addr_segment.header_mut(),
-            RouteNlSegment::NewLink(link_segment) | RouteNlSegment::GetLink(link_segment) => {
-                link_segment.header_mut()
-            }
+            RouteNlSegment::NewLink(link_segment)
+            | RouteNlSegment::DelLink(link_segment)
+            | RouteNlSegment::GetLink(link_segment) => link_segment.header_mut(),
             RouteNlSegment::SetLink(link_segment) => link_segment.header_mut(),
             RouteNlSegment::NewNeigh(neigh_segment)
             | RouteNlSegment::DelNeigh(neigh_segment)
@@ -145,7 +146,13 @@ impl ProtocolSegment for RouteNlSegment {
                     RouteNlSegment::GetLink(LinkSegment::read_from_buf(header, payload_buf)?)
                 }
             }
-            CSegmentType::SETLINK | CSegmentType::NEWLINK | CSegmentType::DELLINK => {
+            CSegmentType::NEWLINK => {
+                RouteNlSegment::NewLink(LinkSegment::read_from_buf(header, payload_buf)?)
+            }
+            CSegmentType::DELLINK => {
+                RouteNlSegment::DelLink(LinkSegment::read_from_buf(header, payload_buf)?)
+            }
+            CSegmentType::SETLINK => {
                 RouteNlSegment::SetLink(LinkSegment::read_from_buf(header, payload_buf)?)
             }
             CSegmentType::GETRULE => {
@@ -183,7 +190,9 @@ impl ProtocolSegment for RouteNlSegment {
             RouteNlSegment::NewRoute(route_segment) | RouteNlSegment::DelRoute(route_segment) => {
                 route_segment.write_to_buf(buf)?
             }
-            RouteNlSegment::NewLink(link_segment) => link_segment.write_to_buf(buf)?,
+            RouteNlSegment::NewLink(link_segment) | RouteNlSegment::DelLink(link_segment) => {
+                link_segment.write_to_buf(buf)?
+            }
             RouteNlSegment::NewNeigh(neigh_segment)
             | RouteNlSegment::DelNeigh(neigh_segment)
             | RouteNlSegment::GetNeigh(neigh_segment) => neigh_segment.write_to_buf(buf)?,

@@ -4,7 +4,7 @@
 //! types. RTNL remains the outer writer lock; all fallible preparation is
 //! completed before authoritative interface state is published.
 
-use alloc::{string::String, sync::Arc, vec::Vec};
+use alloc::{boxed::Box, string::String, sync::Arc, vec::Vec};
 use core::fmt::Write;
 
 use system_error::SystemError;
@@ -14,9 +14,11 @@ use crate::{
     driver::{
         base::device_rename::PreparedDeviceSysfsRename,
         net::{
+            bridge::BridgeIface,
             napi::{napi_pause_and_wait, napi_resume, napi_schedule},
             sysfs::prepare_netdev_sysfs_rename,
             types::InterfaceFlags,
+            veth::VethInterface,
             Iface, NetDeivceState, Operstate, PreparedConfiguredFlags,
         },
     },
@@ -27,11 +29,13 @@ use crate::{
 use super::{
     address::{PreparedAddressLabelRename, PreparedMtuAddressChange, RemovedAddress},
     neighbor::{self, NeighborEntry, PreparedConfiguredNeighborPurge},
-    route::{self, PreparedLinkStateChange, RouteNotifications},
+    route::{self, FibTable, PreparedLinkStateChange, RouteNotifications},
     rtnl::RtnlGuard,
 };
 
 const IFNAMSIZ: usize = 16;
+
+pub(crate) mod topology;
 
 const USER_SETTABLE_FLAGS: InterfaceFlags = InterfaceFlags::from_bits_truncate(
     InterfaceFlags::UP.bits()
@@ -55,12 +59,15 @@ pub(crate) enum LinkTarget<'a> {
 pub(crate) struct LinkUpdate {
     pub new_name: Option<String>,
     pub mtu: Option<LinkMtuUpdate>,
+    pub tx_queue_len: Option<u32>,
     pub flags: Option<LinkFlagsUpdate>,
 }
 
+#[derive(Clone, Copy)]
 pub(crate) enum LinkMtuUpdate {
     Rtnetlink(u32),
     Ioctl(i32),
+    Auto(usize),
 }
 
 pub(crate) enum LinkFlagsUpdate {
@@ -76,6 +83,7 @@ bitflags! {
         const NAME = 1 << 0;
         const MTU = 1 << 1;
         const FLAGS = 1 << 2;
+        const TX_QUEUE_LEN = 1 << 3;
     }
 }
 
@@ -87,6 +95,34 @@ pub(crate) struct LinkMutationCommit {
     pub route_changes: Option<RouteNotifications>,
     pub removed_neighbors: Vec<NeighborEntry>,
     pub rename_old_devpath: Option<String>,
+    /// At most one master bridge can be affected by a veth MTU mutation.
+    pub related: Option<Box<LinkMutationCommit>>,
+}
+
+/// A bridge-only MTU update whose fallible address/FIB preparation has
+/// completed. Its commit cannot fail because it contains no sysfs rename.
+pub(crate) struct PreparedAutoMtu<'rtnl>(PreparedLinkMutation<'rtnl>);
+
+/// Opaque view of a preceding prepared link mutation's FIB candidate.
+#[derive(Clone, Copy)]
+pub(crate) struct StagedLinkFib<'a>(&'a FibTable);
+
+impl StagedLinkFib<'_> {
+    pub(in crate::net) fn candidate(&self) -> &FibTable {
+        self.0
+    }
+}
+
+impl PreparedAutoMtu<'_> {
+    pub(crate) fn staged_fib(&self) -> Option<StagedLinkFib<'_>> {
+        self.0.staged_fib()
+    }
+
+    pub(crate) fn commit(self) -> LinkMutationCommit {
+        self.0
+            .commit()
+            .expect("prepared automatic MTU change contains no fallible rename")
+    }
 }
 
 struct PreparedLinkRename {
@@ -100,6 +136,7 @@ struct PreparedLinkMutation<'rtnl> {
     iface: Arc<dyn Iface>,
     netns: Arc<NetNamespace>,
     mtu: Option<usize>,
+    tx_queue_len: Option<u32>,
     rename: Option<PreparedLinkRename>,
     flags: Option<PreparedConfiguredFlags>,
     routes: Option<PreparedLinkStateChange<'rtnl>>,
@@ -109,6 +146,27 @@ struct PreparedLinkMutation<'rtnl> {
     was_up: bool,
     is_up: bool,
     noarp_changed: bool,
+    explicit_mtu: bool,
+}
+
+pub(crate) fn prepare_auto_mtu<'rtnl>(
+    rtnl: &'rtnl RtnlGuard,
+    netns: &Arc<NetNamespace>,
+    iface: Arc<dyn Iface>,
+    mtu: usize,
+    staged_before: Option<StagedLinkFib<'_>>,
+) -> Result<PreparedAutoMtu<'rtnl>, SystemError> {
+    let plan = PreparedLinkMutation::prepare(
+        rtnl,
+        netns.clone(),
+        iface,
+        LinkUpdate {
+            mtu: Some(LinkMtuUpdate::Auto(mtu)),
+            ..Default::default()
+        },
+        staged_before.map(|staged| staged.0),
+    )?;
+    Ok(PreparedAutoMtu(plan))
 }
 
 pub(crate) fn mutate_link(
@@ -118,32 +176,79 @@ pub(crate) fn mutate_link(
     update: LinkUpdate,
 ) -> Result<LinkMutationCommit, SystemError> {
     let iface = resolve_iface(netns, target)?;
-    PreparedLinkMutation::prepare(rtnl, netns.clone(), iface, update)?.commit()
+    let prepared = PreparedLinkMutation::prepare(rtnl, netns.clone(), iface, update, None)?;
+    let bridge_update = if let Some(mtu) = prepared.mtu {
+        if let Some(veth) = prepared.iface.as_any_ref().downcast_ref::<VethInterface>() {
+            if let Some(bridge) = veth.bridge_master() {
+                bridge.prepare_port_mtu_change(rtnl, netns, veth, mtu, prepared.staged_fib())?
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    // Reserve storage for the one possible master-bridge notification before
+    // publishing either device. Allocation must not follow the first commit.
+    let related_slot = if bridge_update.is_some() {
+        Some(Box::<LinkMutationCommit>::try_new_uninit().map_err(|_| SystemError::ENOMEM)?)
+    } else {
+        None
+    };
+    let mut committed = prepared.commit()?;
+    if let (Some(bridge_update), Some(mut slot)) = (bridge_update, related_slot) {
+        slot.as_mut().write(bridge_update.commit());
+        // SAFETY: the prepared bridge commit was written into the boxed slot.
+        committed.related = Some(unsafe { slot.assume_init() });
+    }
+    Ok(committed)
 }
 
 impl<'rtnl> PreparedLinkMutation<'rtnl> {
+    fn staged_fib(&self) -> Option<StagedLinkFib<'_>> {
+        self.address_change
+            .as_ref()
+            .map(|change| StagedLinkFib(change.candidate()))
+            .or_else(|| {
+                self.routes
+                    .as_ref()
+                    .map(|routes| StagedLinkFib(routes.candidate()))
+            })
+    }
+
     fn prepare(
         rtnl: &'rtnl RtnlGuard,
         netns: Arc<NetNamespace>,
         iface: Arc<dyn Iface>,
         update: LinkUpdate,
+        staged_before: Option<&FibTable>,
     ) -> Result<Self, SystemError> {
         // Keep Linux do_setlink()'s externally observable validation order.
+        let explicit_mtu = matches!(
+            update.mtu,
+            Some(LinkMtuUpdate::Rtnetlink(_) | LinkMtuUpdate::Ioctl(_))
+        );
         let mtu = prepare_mtu(&iface, update.mtu)?;
+        let tx_queue_len = update
+            .tx_queue_len
+            .filter(|len| *len != iface.common().tx_queue_len());
         let rename = prepare_rename(rtnl, &netns, &iface, update.new_name)?;
 
         let (flags, was_up, is_up, noarp_changed) = prepare_flags(&iface, update.flags)?;
         let link_down = was_up && !is_up;
         let address_change = mtu
             .map(|mtu| {
+                let name = rename.as_ref().map(|rename| rename.name.as_str());
                 super::address::prepare_mtu_address_change(
-                    rtnl,
                     &netns,
                     &iface,
                     mtu,
-                    rename.as_ref().map(|rename| rename.name.as_str()),
+                    name,
                     was_up,
                     is_up,
+                    staged_before,
                 )
             })
             .transpose()?
@@ -155,6 +260,10 @@ impl<'rtnl> PreparedLinkMutation<'rtnl> {
             }
         }
         let routes = if address_change.is_none() && was_up != is_up {
+            assert!(
+                staged_before.is_none(),
+                "staged MTU update cannot change link state"
+            );
             Some(route::prepare_link_state_change(
                 rtnl, &netns, &iface, is_up,
             )?)
@@ -175,6 +284,9 @@ impl<'rtnl> PreparedLinkMutation<'rtnl> {
         if mtu.is_some() {
             changes.insert(LinkChanges::MTU);
         }
+        if tx_queue_len.is_some() {
+            changes.insert(LinkChanges::TX_QUEUE_LEN);
+        }
         if rename.is_some() {
             changes.insert(LinkChanges::NAME);
         }
@@ -187,6 +299,7 @@ impl<'rtnl> PreparedLinkMutation<'rtnl> {
             iface,
             netns,
             mtu,
+            tx_queue_len,
             rename,
             flags,
             routes,
@@ -196,6 +309,7 @@ impl<'rtnl> PreparedLinkMutation<'rtnl> {
             was_up,
             is_up,
             noarp_changed,
+            explicit_mtu,
         })
     }
 
@@ -205,6 +319,7 @@ impl<'rtnl> PreparedLinkMutation<'rtnl> {
             iface,
             netns,
             mtu,
+            tx_queue_len,
             rename,
             flags,
             routes,
@@ -214,6 +329,7 @@ impl<'rtnl> PreparedLinkMutation<'rtnl> {
             was_up,
             is_up,
             noarp_changed,
+            explicit_mtu,
         } = self;
 
         // The kernfs transaction performs its final conflict/generation check
@@ -224,6 +340,10 @@ impl<'rtnl> PreparedLinkMutation<'rtnl> {
         } else {
             (None, None)
         };
+
+        if let Some(tx_queue_len) = tx_queue_len {
+            iface.common().set_tx_queue_len(tx_queue_len);
+        }
 
         if let Some(mtu) = mtu.filter(|_| address_change.is_none()) {
             let stack_mtu = iface.stack_mtu(mtu);
@@ -344,6 +464,12 @@ impl<'rtnl> PreparedLinkMutation<'rtnl> {
             netns.notify_deadline_changed();
         }
 
+        if explicit_mtu && mtu.is_some() {
+            if let Some(bridge) = iface.as_any_ref().downcast_ref::<BridgeIface>() {
+                bridge.bridge_driver().mark_mtu_set_by_user();
+            }
+        }
+
         Ok(LinkMutationCommit {
             iface,
             changes,
@@ -352,6 +478,7 @@ impl<'rtnl> PreparedLinkMutation<'rtnl> {
             route_changes,
             removed_neighbors,
             rename_old_devpath,
+            related: None,
         })
     }
 }
@@ -393,6 +520,7 @@ fn prepare_mtu(
     let requested = match requested {
         LinkMtuUpdate::Rtnetlink(value) => usize::try_from(value),
         LinkMtuUpdate::Ioctl(value) => usize::try_from(value),
+        LinkMtuUpdate::Auto(value) => Ok(value),
     }
     .map_err(|_| SystemError::EINVAL)?;
     let bounds = iface.mtu_bounds();
@@ -570,7 +698,18 @@ fn publish_link_flags_and_state(
         if let Some(flags) = flags {
             iface.common().publish_configured_flags(flags);
         }
-        iface.set_operstate(Operstate::IF_OPER_UP);
+        // Administrative UP does not imply carrier. In particular, a veth
+        // whose peer is still DOWN must not report an operational UP link.
+        iface.set_operstate(
+            if iface
+                .net_state()
+                .contains(NetDeivceState::__LINK_STATE_NOCARRIER)
+            {
+                Operstate::IF_OPER_DOWN
+            } else {
+                Operstate::IF_OPER_UP
+            },
+        );
         iface.set_net_state(NetDeivceState::__LINK_STATE_START);
         iface.common().open_tx();
     } else {

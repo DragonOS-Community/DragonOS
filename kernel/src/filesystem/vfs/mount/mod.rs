@@ -588,6 +588,9 @@ pub struct MountFS {
 #[derive(Debug, Default)]
 struct MountNamespaceMembership {
     owner: Option<Weak<MntNamespace>>,
+    /// The count must remain reachable after the last strong owner reference
+    /// vanishes but before its Drop acquires the mount lifecycle lock.
+    committed_mounts: Option<Arc<AtomicU32>>,
     accounted: bool,
 }
 
@@ -2735,6 +2738,10 @@ impl MountFS {
     }
 
     pub fn set_namespace(&self, namespace: Weak<MntNamespace>) {
+        let owner = namespace
+            .upgrade()
+            .expect("mount ownership is assigned to a live namespace");
+        let committed_mounts = owner.committed_mounts();
         let mut membership = self.namespace.write();
         assert!(
             !membership.accounted,
@@ -2747,6 +2754,9 @@ impl MountFS {
             );
         }
         membership.owner = Some(namespace);
+        membership.committed_mounts = Some(committed_mounts);
+        drop(membership);
+        drop(owner);
     }
 
     pub fn namespace(&self) -> Option<Arc<MntNamespace>> {
@@ -2760,6 +2770,7 @@ impl MountFS {
             "namespace accounting must be released before clearing ownership"
         );
         membership.owner = None;
+        membership.committed_mounts = None;
     }
 
     /// Temporarily transfer an anonymous tree member while both namespaces
@@ -2780,6 +2791,7 @@ impl MountFS {
             "anonymous tree member must be accounted in its source namespace"
         );
         membership.owner = Some(Arc::downgrade(to));
+        membership.committed_mounts = Some(to.committed_mounts());
         membership.accounted = false;
     }
 
@@ -2798,6 +2810,7 @@ impl MountFS {
             "failed anonymous transfer must restore exactly its source owner"
         );
         membership.owner = Some(Arc::downgrade(from));
+        membership.committed_mounts = Some(from.committed_mounts());
         membership.accounted = true;
     }
 
@@ -2843,6 +2856,26 @@ impl MountFS {
         }
         membership.accounted = false;
         true
+    }
+
+    /// Release a committed mount without requiring the namespace's weak
+    /// reference to upgrade. Its Drop may already be waiting for the same
+    /// mount lifecycle lock held by the unmount transaction.
+    pub(crate) fn release_namespace_accounted(&self) {
+        let mut membership = self.namespace.write();
+        if !membership.accounted {
+            return;
+        }
+        let count = membership
+            .committed_mounts
+            .as_ref()
+            .expect("accounted mount retains its namespace count");
+        count
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                count.checked_sub(1)
+            })
+            .expect("mount teardown exceeds committed count");
+        membership.accounted = false;
     }
 
     /// check_mnt(): Check whether the current MountFS belongs to the specified mount namespace.
@@ -3241,9 +3274,7 @@ impl MountFS {
         }
 
         for mount in mounts.into_iter().rev() {
-            if let Some(namespace) = mount.namespace() {
-                namespace.remove_mount_exact(&mount);
-            }
+            mount.release_namespace_accounted();
             mount.set_self_mountpoint(None);
             mount.clear_namespace();
             mount.deactivate();
@@ -3298,9 +3329,7 @@ impl MountFS {
         // Every fallible topology decision is complete. Release namespace
         // capacity only after the detached graph can no longer be rolled back.
         for mount in &mounts {
-            if let Some(namespace) = mount.namespace() {
-                namespace.remove_mount_exact(mount);
-            }
+            mount.release_namespace_accounted();
             mount.clear_namespace();
             mount.detach_propagation_once();
         }

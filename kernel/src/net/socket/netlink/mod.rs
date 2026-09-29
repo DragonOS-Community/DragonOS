@@ -68,3 +68,18 @@ pub(crate) fn notify_link_commit(
 pub(crate) fn notify_link_change(iface: &Arc<dyn crate::driver::net::Iface>) {
     route::kern::notify_link_change(iface);
 }
+
+pub(crate) use route::kern::PreparedLinkDelete;
+
+pub(crate) fn prepare_link_delete(
+    iface: &Arc<dyn crate::driver::net::Iface>,
+) -> Result<PreparedLinkDelete, SystemError> {
+    route::kern::prepare_link_delete(iface)
+}
+
+pub(crate) fn notify_link_delete(
+    netns: Arc<crate::process::namespace::net_namespace::NetNamespace>,
+    message: PreparedLinkDelete,
+) {
+    route::kern::notify_link_delete(netns, message);
+}

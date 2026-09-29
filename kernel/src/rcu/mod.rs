@@ -340,6 +340,8 @@ where
     T: Send + Sync + 'static,
 {
     ptr: AtomicPtr<T>,
+    #[cfg(test)]
+    unprepared_stores: AtomicUsize,
 }
 
 impl<T> RcuOptionArcSlot<T>
@@ -349,12 +351,16 @@ where
     pub const fn new_none() -> Self {
         Self {
             ptr: AtomicPtr::new(ptr::null_mut()),
+            #[cfg(test)]
+            unprepared_stores: AtomicUsize::new(0),
         }
     }
 
     pub fn new_some(initial: Arc<T>) -> Self {
         Self {
             ptr: AtomicPtr::new(Arc::into_raw(initial) as *mut T),
+            #[cfg(test)]
+            unprepared_stores: AtomicUsize::new(0),
         }
     }
 
@@ -411,11 +417,33 @@ where
     }
 
     pub fn store_deferred(&self, new: Option<Arc<T>>) {
+        #[cfg(test)]
+        self.unprepared_stores.fetch_add(1, Ordering::Relaxed);
         // SAFETY: every removed slot reference is immediately transferred to
         // the RCU deferred-drop queue.
         if let Some(old) = unsafe { self.swap(new) } {
             rcu_defer_drop(old);
         }
+    }
+
+    /// Replace a populated optional slot using a preallocated retirement.
+    /// Namespace state publication holds task_lock, so it cannot allocate or
+    /// enqueue an RCU callback until after that lock has been released.
+    pub(crate) fn swap_prepared(
+        &self,
+        new: Arc<T>,
+        prepared: PreparedRcuArcRetire<T>,
+    ) -> RcuArcRetirement<T> {
+        // SAFETY: the removed slot reference is handed to the prepared RCU
+        // retirement, which retains it through the grace period.
+        let old = unsafe { self.swap(Some(new)) }
+            .expect("prepared replacement requires a populated optional slot");
+        prepared.bind_removed(old)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn unprepared_store_count_for_test(&self) -> usize {
+        self.unprepared_stores.load(Ordering::Relaxed)
     }
 
     pub fn clear_if_deferred<F>(&self, mut pred: F) -> bool

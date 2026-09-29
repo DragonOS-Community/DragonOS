@@ -6,7 +6,7 @@ use crate::libs::wait_queue::WaitQueue;
 use crate::net::socket::endpoint::Endpoint;
 use crate::net::socket::unix::ring_buffer::{RbConsumer, RbProducer, RingBuffer};
 use crate::net::socket::unix::stream::UnixStreamSocket;
-use crate::net::socket::unix::UCred;
+use crate::net::socket::unix::{PeerCred, UCred};
 use crate::net::socket::unix::{UnixBinding, UnixEndpoint, UnixEndpointBound, UnixSocketType};
 use crate::net::socket::Socket;
 use crate::process::namespace::net_namespace::NetNamespace;
@@ -651,8 +651,12 @@ impl Listener {
         self.addr.address().into()
     }
 
-    pub fn listen(&self, backlog: usize) {
-        self.backlog.set_backlog(backlog);
+    pub fn listen(&self, backlog: usize, peer_cred: PeerCred) {
+        self.backlog.set_backlog(backlog, peer_cred);
+    }
+
+    pub(super) fn peer_cred(&self) -> PeerCred {
+        self.backlog.peer_cred()
     }
 
     pub(super) fn set_sndbuf_effective(&self, effective: usize) {
@@ -755,6 +759,7 @@ pub(super) struct ListenerConfig {
     pub(super) sndbuf_effective: usize,
     pub(super) rcvbuf_effective: usize,
     pub(super) netns: Arc<NetNamespace>,
+    pub(super) peer_cred: PeerCred,
 }
 
 /// Parameters for creating a new backlog entry
@@ -771,6 +776,8 @@ pub(super) struct Backlog {
     sndbuf_effective: AtomicUsize,
     rcvbuf_effective: AtomicUsize,
     incoming_conns: Mutex<Option<VecDeque<Arc<UnixStreamSocket>>>>,
+    /// Updated under incoming_conns to serialize relisten with connect.
+    peer_cred: Mutex<PeerCred>,
     /// Connectors wait for queue capacity, independently of accept's readability waiters.
     connect_wait_queue: WaitQueue,
     listener: Weak<UnixStreamSocket>,
@@ -788,6 +795,7 @@ impl Backlog {
             sndbuf_effective,
             rcvbuf_effective,
             netns,
+            peer_cred,
         } = params.config;
 
         let incoming_sockets = if params.is_shutdown {
@@ -802,6 +810,7 @@ impl Backlog {
             sndbuf_effective: AtomicUsize::new(sndbuf_effective),
             rcvbuf_effective: AtomicUsize::new(rcvbuf_effective),
             incoming_conns: Mutex::new(incoming_sockets),
+            peer_cred: Mutex::new(peer_cred),
             connect_wait_queue: WaitQueue::default(),
             listener,
             is_seqpacket,
@@ -851,13 +860,20 @@ impl Backlog {
         conn.ok_or(SystemError::EAGAIN_OR_EWOULDBLOCK)
     }
 
-    fn set_backlog(&self, backlog: usize) {
+    fn set_backlog(&self, backlog: usize, peer_cred: PeerCred) {
+        let _queue = self.incoming_conns.lock();
+        *self.peer_cred.lock() = peer_cred;
         let old_backlog = self.backlog.swap(backlog, Ordering::Relaxed);
+        drop(_queue);
 
         if old_backlog < backlog {
             self.connect_wait_queue
                 .wakeup_all(Some(crate::process::ProcessState::Blocked(true)));
         }
+    }
+
+    fn peer_cred(&self) -> PeerCred {
+        self.peer_cred.lock().clone()
     }
 
     fn shutdown_pending(&self, pending: Option<VecDeque<Arc<UnixStreamSocket>>>) {
@@ -890,6 +906,7 @@ impl Backlog {
         &self,
         init: Init,
         client_socket: Arc<UnixStreamSocket>,
+        client_cred: PeerCred,
         is_seqpacket: bool,
         client_sndbuf_effective: usize,
         client_rcvbuf_effective: usize,
@@ -917,6 +934,7 @@ impl Backlog {
             return Err((init, SystemError::EAGAIN_OR_EWOULDBLOCK));
         }
 
+        let listener_cred = self.peer_cred();
         let (mut client_conn, server_conn) = init.into_connected(self.addr.clone());
 
         // Apply buffer sizes that may have been configured before connect.
@@ -969,6 +987,10 @@ impl Backlog {
 
         let server_socket =
             UnixStreamSocket::new_connected(server_conn, false, is_seqpacket, self.netns.clone());
+
+        // Publish both peer identities before making the accepted child visible.
+        *client_socket.peer_cred.lock() = Some(listener_cred);
+        *server_socket.peer_cred.lock() = Some(client_cred);
 
         // Listener-side buffer settings.
         server_socket

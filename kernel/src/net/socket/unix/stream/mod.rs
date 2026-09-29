@@ -34,7 +34,9 @@ use inner::{Connected, Init, Inner, ListenerConfig, StreamReadOutcome};
 use system_error::SystemError;
 
 use crate::filesystem::vfs::iov::IoVecs;
-use crate::net::socket::unix::{current_ucred, nobody_ucred, UCred};
+use crate::net::socket::unix::{
+    current_ucred, nobody_ucred, write_peercred_option, PeerCred, UCred,
+};
 use crate::process::namespace::net_namespace::NetNamespace;
 use crate::process::ProcessManager;
 use crate::syscall::user_access::UserBufferReader;
@@ -99,6 +101,8 @@ pub struct UnixStreamSocket {
     self_weak: Weak<UnixStreamSocket>,
     /// Peer socket for socket pairs (used for SIGIO notification)
     peer: Mutex<Option<Weak<UnixStreamSocket>>>,
+    /// Connection-time identity of the other Unix endpoint.
+    peer_cred: Mutex<Option<PeerCred>>,
 
     is_nonblocking: AtomicBool,
     is_seqpacket: bool,
@@ -159,6 +163,7 @@ impl UnixStreamSocket {
             epitems: EPollItems::default(),
             fasync_items: FAsyncItems::default(),
             peer: Mutex::new(None),
+            peer_cred: Mutex::new(None),
             passcred: AtomicBool::new(false),
             reuse_options: super::UnixReuseOptions::default(),
 
@@ -192,6 +197,7 @@ impl UnixStreamSocket {
             epitems: EPollItems::default(),
             fasync_items: FAsyncItems::default(),
             peer: Mutex::new(None),
+            peer_cred: Mutex::new(None),
             passcred: AtomicBool::new(false),
             reuse_options: super::UnixReuseOptions::default(),
 
@@ -303,9 +309,12 @@ impl UnixStreamSocket {
 
     pub fn new_pair(is_nonblocking: bool, is_seqpacket: bool) -> (Arc<Self>, Arc<Self>) {
         let (conn_a, conn_b) = Connected::new_pair(None, None);
+        let peer_cred = PeerCred::current();
         let netns = ProcessManager::current_netns();
         let socket_a = Self::new_connected(conn_a, is_nonblocking, is_seqpacket, netns.clone());
         let socket_b = Self::new_connected(conn_b, is_nonblocking, is_seqpacket, netns);
+        *socket_a.peer_cred.lock() = Some(peer_cred.clone());
+        *socket_b.peer_cred.lock() = Some(peer_cred);
 
         // Set up peer references for SIGIO notification
         *socket_a.peer.lock() = Some(Arc::downgrade(&socket_b));
@@ -368,7 +377,8 @@ impl UnixStreamSocket {
                     .expect("UnixStreamSocket self_weak upgrade failed");
                 let snd = self.sndbuf.load(Ordering::Relaxed);
                 let rcv = self.rcvbuf.load(Ordering::Relaxed);
-                match backlog.push_incoming(init, this, self.is_seqpacket, snd, rcv) {
+                let client_cred = PeerCred::current();
+                match backlog.push_incoming(init, this, client_cred, self.is_seqpacket, snd, rcv) {
                     Ok(connected) => (Inner::Connected(connected), Ok(())),
                     Err((init, err)) => (Inner::Init(init), Err(err)),
                 }
@@ -680,6 +690,7 @@ impl Socket for UnixStreamSocket {
     fn listen(&self, backlog: usize) -> Result<(), SystemError> {
         const SOMAXCONN: usize = 4096;
         let backlog = backlog.min(SOMAXCONN);
+        let peer_cred = PeerCred::current();
 
         let mut writer = self.inner.write();
 
@@ -692,6 +703,7 @@ impl Socket for UnixStreamSocket {
                     sndbuf_effective: self.sndbuf.load(Ordering::Relaxed),
                     rcvbuf_effective: self.rcvbuf.load(Ordering::Relaxed),
                     netns: self.netns.clone(),
+                    peer_cred: peer_cred.clone(),
                 };
                 match init.listen(config) {
                     Ok(listener) => (Inner::Listener(listener), None),
@@ -699,7 +711,7 @@ impl Socket for UnixStreamSocket {
                 }
             }
             Inner::Listener(listener) => {
-                listener.listen(backlog);
+                listener.listen(backlog, peer_cred);
                 (Inner::Listener(listener), None)
             }
             Inner::Connected(connected) => (Inner::Connected(connected), Some(SystemError::EINVAL)),
@@ -1526,6 +1538,14 @@ impl Socket for UnixStreamSocket {
                     PSOCK::Stream as i32
                 };
                 Ok(write_i32_getsockopt(value, v))
+            }
+            crate::net::socket::PSO::PEERCRED => {
+                let peer_cred = match self.inner.read().as_ref() {
+                    Some(Inner::Connected(_)) => self.peer_cred.lock().clone(),
+                    Some(Inner::Listener(listener)) => Some(listener.peer_cred()),
+                    _ => None,
+                };
+                Ok(write_peercred_option(value, peer_cred.as_ref()))
             }
             crate::net::socket::PSO::DOMAIN => {
                 let v = AddressFamily::Unix as i32;

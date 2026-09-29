@@ -86,12 +86,39 @@ impl OomScoreAdjFileOps {
     }
 
     fn parse_score(buf: &[u8]) -> Result<i16, SystemError> {
-        let len = buf.len().min(PROC_NUMBUF - 1);
-        let input = core::str::from_utf8(&buf[..len]).map_err(|_| SystemError::EINVAL)?;
-        let score = input
-            .trim()
-            .parse::<i32>()
-            .map_err(|_| SystemError::EINVAL)?;
+        // Linux first truncates the write to PROC_NUMBUF - 1, then parses the
+        // resulting NUL-terminated C string with kstrtoint(base = 0).
+        let bytes = &buf[..buf.len().min(PROC_NUMBUF - 1)];
+        let end = bytes
+            .iter()
+            .position(|&byte| byte == 0)
+            .unwrap_or(bytes.len());
+        let input = core::str::from_utf8(&bytes[..end])
+            .map_err(|_| SystemError::EINVAL)?
+            .trim_ascii();
+        let (negative, unsigned) = match input.as_bytes().first() {
+            Some(b'-') => (true, &input[1..]),
+            Some(b'+') => (false, &input[1..]),
+            _ => (false, input),
+        };
+        let (digits, radix) = if unsigned.starts_with("0x") || unsigned.starts_with("0X") {
+            (&unsigned[2..], 16)
+        } else if unsigned.starts_with('0') {
+            (unsigned, 8)
+        } else {
+            (unsigned, 10)
+        };
+        if digits.starts_with(['+', '-']) {
+            return Err(SystemError::EINVAL);
+        }
+        let magnitude = i64::from_str_radix(digits, radix).map_err(|err| match err.kind() {
+            core::num::IntErrorKind::PosOverflow | core::num::IntErrorKind::NegOverflow => {
+                SystemError::ERANGE
+            }
+            _ => SystemError::EINVAL,
+        })?;
+        let signed = if negative { -magnitude } else { magnitude };
+        let score = i32::try_from(signed).map_err(|_| SystemError::ERANGE)?;
 
         if !(OOM_SCORE_ADJ_MIN as i32..=OOM_SCORE_ADJ_MAX as i32).contains(&score) {
             return Err(SystemError::EINVAL);
@@ -183,15 +210,11 @@ impl FileOps for OomScoreAdjFileOps {
 
     fn write_at(
         &self,
-        offset: usize,
+        _offset: usize,
         _len: usize,
         buf: &[u8],
         _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        if offset != 0 {
-            return Err(SystemError::EINVAL);
-        }
-
         let score = Self::parse_score(buf)?;
         let pcb = self.target_process()?;
         let has_cap_sys_resource = capable(CAPFlags::CAP_SYS_RESOURCE);
@@ -202,6 +225,6 @@ impl FileOps for OomScoreAdjFileOps {
         }
         let min_update = has_cap_sys_resource.then_some(score);
         Self::set_score_for_shared_mm(&pcb, score, min_update);
-        Ok(buf.len())
+        Ok(buf.len().min(PROC_NUMBUF - 1))
     }
 }

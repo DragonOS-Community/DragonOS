@@ -465,6 +465,59 @@ TEST_F(MountObjectTopologyTest, ChrootTopMountExcludesCoveredSiblingFromMountinf
     EXPECT_EQ(0, WEXITSTATUS(status));
 }
 
+TEST_F(MountObjectTopologyTest, StackedMountProcFdKeepsVisibleMountpointName) {
+    const std::string stack = base_ + "/stack";
+    const std::string proc = stack + "/proc";
+    ASSERT_EQ(0, ensure_dir(stack)) << strerror(errno);
+    ASSERT_EQ(0, mount("none", stack.c_str(), "ramfs", 0, nullptr)) << strerror(errno);
+    ASSERT_EQ(0, mount("none", stack.c_str(), "ramfs", 0, nullptr)) << strerror(errno);
+    ASSERT_EQ(0, ensure_dir(proc)) << strerror(errno);
+
+    const int fd = open(proc.c_str(), O_PATH | O_DIRECTORY);
+    ASSERT_GE(fd, 0) << strerror(errno);
+    const std::string link = "/proc/self/fd/" + std::to_string(fd);
+    char target[4096];
+    ssize_t size = readlink(link.c_str(), target, sizeof(target));
+    ASSERT_GE(size, 0) << strerror(errno);
+    EXPECT_EQ(proc, std::string(target, size));
+
+    ASSERT_EQ(0, mount("proc", link.c_str(), "proc", 0, nullptr)) << strerror(errno);
+    size = readlink(link.c_str(), target, sizeof(target));
+    ASSERT_GE(size, 0) << strerror(errno);
+    EXPECT_EQ(proc, std::string(target, size));
+    ASSERT_EQ(0, close(fd));
+}
+
+TEST_F(MountObjectTopologyTest, MountOverNamespaceRootDoesNotAddEmptyPathComponent) {
+    const pid_t child = fork();
+    ASSERT_GE(child, 0) << strerror(errno);
+    if (child == 0) {
+        if (unshare(CLONE_NEWNS) != 0 ||
+            mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr) != 0) {
+            _exit(10);
+        }
+        const int proc_fd = open("/proc", O_PATH | O_DIRECTORY);
+        if (proc_fd < 0) {
+            _exit(11);
+        }
+        if (mount("none", "/", "ramfs", 0, nullptr) != 0) {
+            _exit(12);
+        }
+        const int root_fd = open("/", O_PATH | O_DIRECTORY);
+        if (root_fd < 0) {
+            _exit(14);
+        }
+        const std::string link = "self/fd/" + std::to_string(root_fd);
+        char target[128];
+        const ssize_t size = readlinkat(proc_fd, link.c_str(), target, sizeof(target));
+        _exit(size == 1 && target[0] == '/' ? 0 : 15);
+    }
+    int status = 0;
+    ASSERT_EQ(child, waitpid(child, &status, 0)) << strerror(errno);
+    ASSERT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(0, WEXITSTATUS(status));
+}
+
 
 TEST_F(MountObjectTopologyTest, ChrootOrdinaryDirectoryDoesNotSynthesizeRootMount) {
     const std::string outer = base_ + "/ordinary";

@@ -8,7 +8,7 @@ use crate::{
             segment::{ack::ErrorSegment, header::SegHdrCommonFlags, CSegmentType},
             ProtocolSegment,
         },
-        route::message::{segment::RouteNlSegment, RouteNlMessage},
+        route::message::{segment::RouteNlSegment, RouteNlMessage, RouteNlPacket},
         table::{
             NetlinkKernelSocket, NetlinkRouteProtocol, StandardNetlinkProtocol,
             SupportedNetlinkProtocol,
@@ -142,7 +142,11 @@ impl NetlinkRouteKernelSocket {
             let Ok(seg_type) = CSegmentType::try_from(header.type_) else {
                 let err_segment = ErrorSegment::new_from_request(header, Some(SystemError::EINVAL));
                 let err_msg = RouteNlMessage::new(vec![RouteNlSegment::Error(err_segment)]);
-                if let Err(e) = NetlinkRouteProtocol::unicast(dst_port, err_msg, netns.clone()) {
+                if let Err(e) = NetlinkRouteProtocol::unicast(
+                    dst_port,
+                    RouteNlPacket::kernel(err_msg),
+                    netns.clone(),
+                ) {
                     log::warn!(
                         "netlink route: failed to deliver EINVAL ack to port {}: {:?}",
                         dst_port,
@@ -181,7 +185,11 @@ impl NetlinkRouteKernelSocket {
                 }
             };
 
-            if let Err(e) = NetlinkRouteProtocol::unicast(dst_port, response, netns.clone()) {
+            if let Err(e) = NetlinkRouteProtocol::unicast(
+                dst_port,
+                RouteNlPacket::kernel(response),
+                netns.clone(),
+            ) {
                 log::warn!(
                     "netlink route: failed to deliver response to port {}: {:?}",
                     dst_port,

@@ -88,7 +88,7 @@ impl Bound for BoundNetlink<NetlinkNetfilterProtocol> {
         let copied = original.min(writer.len());
         writer[..copied].copy_from_slice(&message.0[..copied]);
         if !flags.contains(PMSG::PEEK) {
-            queue.pop_front();
+            self.receive_queue.pop_front_locked(&mut queue);
             drop(queue);
             self.receive_queue.recover_if_empty();
             if self.receive_queue.0.lock().is_empty() {

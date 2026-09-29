@@ -6,7 +6,7 @@ use crate::net::socket::common::EPollItems;
 use crate::process::ProcessState;
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use system_error::SystemError;
 
 /// Netlink Socket 的消息队列
@@ -21,6 +21,7 @@ struct QueueLimits<Message> {
     max_messages: usize,
     max_bytes: usize,
     charge: fn(&Message) -> usize,
+    queued_bytes: AtomicUsize,
     pending_error: AtomicBool,
     // Changes are serialized by the message queue lock.
     congested: AtomicBool,
@@ -38,8 +39,8 @@ impl<Message> MessageQueue<Message> {
     }
 
     /// Opt-in limits leave existing protocols' queue behavior unchanged.
-    /// Accounting is recomputed under the queue lock, so existing consumers
-    /// can continue to pop directly without a second accounting lock.
+    /// Charged consumers must pop through `pop_front_locked` to keep the
+    /// O(1) accounting synchronized with the queue.
     pub fn with_limits(
         max_messages: usize,
         max_bytes: usize,
@@ -51,6 +52,7 @@ impl<Message> MessageQueue<Message> {
                 max_messages,
                 max_bytes,
                 charge,
+                queued_bytes: AtomicUsize::new(0),
                 pending_error: AtomicBool::new(false),
                 congested: AtomicBool::new(false),
             })),
@@ -90,17 +92,27 @@ impl<Message> MessageQueue<Message> {
         }
     }
 
+    pub fn pop_front_locked(&self, queue: &mut VecDeque<Message>) {
+        if let Some(message) = queue.pop_front() {
+            if let Some(limits) = &self.1 {
+                limits
+                    .queued_bytes
+                    .fetch_sub((limits.charge)(&message), Ordering::Relaxed);
+            }
+        }
+    }
+
     // The boolean records whether this operation must report an error event.
     fn enqueue(&self, message: Message) -> Result<(), (SystemError, bool)> {
         let mut queue = self.0.lock();
-        if let Some(limits) = &self.1 {
+        let new_bytes = if let Some(limits) = &self.1 {
             if limits.congested.load(Ordering::Relaxed) {
                 return Err((SystemError::ENOBUFS, false));
             }
-            let charge = limits.charge;
-            let bytes = queue.iter().try_fold(charge(&message), |sum, entry| {
-                sum.checked_add(charge(entry))
-            });
+            let bytes = limits
+                .queued_bytes
+                .load(Ordering::Relaxed)
+                .checked_add((limits.charge)(&message));
             if queue.len() >= limits.max_messages
                 || bytes.is_none_or(|bytes| bytes > limits.max_bytes)
             {
@@ -108,7 +120,10 @@ impl<Message> MessageQueue<Message> {
                 limits.pending_error.store(true, Ordering::Release);
                 return Err((SystemError::ENOBUFS, true));
             }
-        }
+            bytes
+        } else {
+            None
+        };
         queue.try_reserve(1).map_err(|_| {
             if let Some(limits) = &self.1 {
                 limits.pending_error.store(true, Ordering::Release);
@@ -118,6 +133,9 @@ impl<Message> MessageQueue<Message> {
             }
         })?;
         queue.push_back(message);
+        if let (Some(limits), Some(bytes)) = (&self.1, new_bytes) {
+            limits.queued_bytes.store(bytes, Ordering::Relaxed);
+        }
         Ok(())
     }
 }

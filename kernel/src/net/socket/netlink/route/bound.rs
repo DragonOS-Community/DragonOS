@@ -3,7 +3,7 @@ use crate::{
     libs::align::align_up,
     net::socket::{
         netlink::{
-            addr::NetlinkSocketAddr,
+            addr::{multicast::GroupIdSet, NetlinkSocketAddr},
             common::bound::BoundNetlink,
             message::{
                 segment::{
@@ -15,7 +15,7 @@ use crate::{
             },
             route::{
                 kern::{NetlinkRouteKernelSocket, RtnlRequestContext},
-                message::RouteNlMessage,
+                message::{RouteNlMessage, RouteNlPacket},
             },
             table::{NetlinkRouteProtocol, SupportedNetlinkProtocol},
         },
@@ -24,7 +24,7 @@ use crate::{
     },
     process::{namespace::net_namespace::NetNamespace, ProcessManager},
 };
-use alloc::sync::Arc;
+use alloc::{sync::Arc, vec::Vec};
 use core::mem::size_of;
 use system_error::SystemError;
 
@@ -54,13 +54,39 @@ impl datagram_common::Bound for BoundNetlink<NetlinkRouteProtocol> {
         _flags: crate::net::socket::PMSG,
         destination_is_explicit: bool,
     ) -> Result<usize, SystemError> {
-        if *to != NetlinkSocketAddr::new_unspecified() {
+        let sum_lens = buf.len();
+        // User-to-user netlink delivery needs sender-side backpressure. Keep
+        // the pre-existing unsupported destination until that path is added.
+        if to.port() != 0 {
             return Err(SystemError::ENOTCONN);
         }
-
-        let sum_lens = buf.len();
         let local_port = self.handle.port();
         let netns = self.netns();
+        let user_bytes: Option<Arc<Vec<u8>>> = if !to.groups().is_empty() {
+            let mut bytes = Vec::new();
+            bytes
+                .try_reserve_exact(buf.len())
+                .map_err(|_| SystemError::ENOMEM)?;
+            bytes.extend_from_slice(buf);
+            Some(Arc::try_new(bytes).map_err(|_| SystemError::ENOMEM)?)
+        } else {
+            None
+        };
+        let group_mask: u32 = to
+            .groups()
+            .ids_iter()
+            .next()
+            .map_or(0, |group_index| 1 << group_index);
+        if group_mask != 0 {
+            let group_index = group_mask.trailing_zeros();
+            let group_id = group_index + 1;
+            let source = NetlinkSocketAddr::new(local_port, GroupIdSet::new(group_mask));
+            let packet = RouteNlPacket::user(user_bytes.as_ref().unwrap().clone(), source);
+            NetlinkRouteProtocol::socket_table(netns.clone())
+                .read()
+                .notify_group(group_id, local_port, packet);
+        }
+
         let context = RtnlRequestContext::new(
             ProcessManager::current_pcb().cred(),
             self.opener_cred(),
@@ -82,17 +108,24 @@ impl datagram_common::Bound for BoundNetlink<NetlinkRouteProtocol> {
             .ok_or(SystemError::EINVAL)?;
 
         let mut offset = 0usize;
+        // As in Linux's netlink_rcv_skb, ignore an incomplete trailing header
+        // or malformed nlmsg_len after delivering the datagram to netlink.
         while offset < buf.len() {
             let slice = &buf[offset..];
             if slice.len() < size_of::<CMsgSegHdr>() {
-                return Err(SystemError::EINVAL);
+                break;
             }
 
             // SAFETY: `slice` has at least `size_of::<CMsgSegHdr>()` bytes.
             let header = unsafe { core::ptr::read_unaligned(slice.as_ptr() as *const CMsgSegHdr) };
             let msg_len = header.len as usize;
-            if msg_len < size_of::<CMsgSegHdr>() || offset + msg_len > buf.len() {
-                return Err(SystemError::EINVAL);
+            if msg_len < size_of::<CMsgSegHdr>()
+                || offset
+                    .checked_add(msg_len)
+                    .filter(|end| *end <= buf.len())
+                    .is_none()
+            {
+                break;
             }
 
             let msg_buf = &buf[offset..offset + msg_len];
@@ -100,6 +133,18 @@ impl datagram_common::Bound for BoundNetlink<NetlinkRouteProtocol> {
 
             let flags = SegHdrCommonFlags::from_bits_truncate(header.flags);
             if !flags.contains(SegHdrCommonFlags::REQUEST) {
+                if flags.contains(SegHdrCommonFlags::ACK) {
+                    send_route_ack(&header, None, local_port, netns.clone());
+                }
+                continue;
+            }
+
+            // Linux netlink_rcv_skb acknowledges control messages without
+            // dispatching them to the rtnetlink RTM handler.
+            if header.type_ < 16 {
+                if flags.contains(SegHdrCommonFlags::ACK) {
+                    send_route_ack(&header, None, local_port, netns.clone());
+                }
                 continue;
             }
 
@@ -131,16 +176,19 @@ impl datagram_common::Bound for BoundNetlink<NetlinkRouteProtocol> {
             let segment = match RouteNlMessage::read_from(msg_buf) {
                 Ok(msg) => {
                     if msg.segments().len() != 1 {
-                        return Err(SystemError::EINVAL);
+                        send_route_ack(
+                            &header,
+                            Some(SystemError::EINVAL),
+                            local_port,
+                            netns.clone(),
+                        );
+                        continue;
                     }
                     msg.segments()[0].clone()
                 }
                 Err(e) => {
-                    log::warn!(
-                        "netlink_send: failed to read netlink message from buffer: {:?}",
-                        e
-                    );
-                    return Err(e);
+                    send_route_ack(&header, Some(e), local_port, netns.clone());
+                    continue;
                 }
             };
 
@@ -168,6 +216,10 @@ impl datagram_common::Bound for BoundNetlink<NetlinkRouteProtocol> {
         writer: &mut [u8],
         flags: crate::net::socket::PMSG,
     ) -> Result<(usize, usize, Self::Endpoint), SystemError> {
+        if let Some(error) = self.receive_queue.take_error() {
+            self.receive_queue.recover_if_empty();
+            return Err(error);
+        }
         let mut receive_queue = self.receive_queue.0.lock();
 
         let Some(res) = receive_queue.front() else {
@@ -187,11 +239,12 @@ impl datagram_common::Bound for BoundNetlink<NetlinkRouteProtocol> {
             copy_len
         };
 
+        let remote = res.source();
         if !flags.contains(PMSG::PEEK) {
-            receive_queue.pop_front();
+            self.receive_queue.pop_front_locked(&mut receive_queue);
+            drop(receive_queue);
+            self.receive_queue.recover_if_empty();
         }
-
-        let remote = NetlinkSocketAddr::new_unspecified();
 
         Ok((copied, orig_len, remote))
     }
@@ -228,7 +281,7 @@ fn send_route_ack(
 
     let err_segment = ErrorSegment::new_from_request(request_header, error);
     let err_msg = RouteNlMessage::new(vec![RouteNlSegment::Error(err_segment)]);
-    if let Err(e) = NetlinkRouteProtocol::unicast(dst_port, err_msg, netns) {
+    if let Err(e) = NetlinkRouteProtocol::unicast(dst_port, RouteNlPacket::kernel(err_msg), netns) {
         log::warn!(
             "netlink route: failed to deliver ack to port {}: {:?}",
             dst_port,

@@ -55,6 +55,11 @@ pub(crate) struct NetIngressFilter<'a> {
     owner_ifindex: u32,
     device_names: &'a NftDeviceNames,
     stage: &'a Cell<IngressStage>,
+    /// Packet-owned route classification installed only by a local RX token.
+    handoff_broadcast: &'a Cell<bool>,
+    /// Set only after this packet's ingress FIB selected this interface.
+    local_route_selected: Cell<bool>,
+    broadcast_route_selected: Cell<bool>,
     mark: &'a Cell<u32>,
     packet_context: &'a RefCell<Option<CtPacketContext>>,
     routes: Option<&'a OutputRouteGuard<'a>>,
@@ -71,6 +76,7 @@ pub(crate) struct NetIngressFilterInit<'a> {
     pub(crate) owner_ifindex: u32,
     pub(crate) device_names: &'a NftDeviceNames,
     pub(crate) stage: &'a Cell<IngressStage>,
+    pub(crate) handoff_broadcast: &'a Cell<bool>,
     pub(crate) mark: &'a Cell<u32>,
     pub(crate) packet_context: &'a RefCell<Option<CtPacketContext>>,
     pub(crate) routes: Option<&'a OutputRouteGuard<'a>>,
@@ -196,6 +202,7 @@ impl<'a> NetIngressFilter<'a> {
             owner_ifindex,
             device_names,
             stage,
+            handoff_broadcast,
             mark,
             packet_context,
             routes,
@@ -209,6 +216,9 @@ impl<'a> NetIngressFilter<'a> {
             owner_ifindex,
             device_names,
             stage,
+            handoff_broadcast,
+            local_route_selected: Cell::new(false),
+            broadcast_route_selected: Cell::new(false),
             mark,
             packet_context,
             routes,
@@ -753,6 +763,8 @@ impl IpIngressFilter for NetIngressFilter<'_> {
     }
 
     fn begin_packet(&mut self, _meta: PacketMeta) {
+        self.local_route_selected.set(false);
+        self.broadcast_route_selected.set(false);
         // A physical receive token starts a new packet. A local handoff token
         // has already installed its owned context before this callback runs.
         if self.stage.get() == IngressStage::Pending {
@@ -762,6 +774,13 @@ impl IpIngressFilter for NetIngressFilter<'_> {
 
     fn local_route_selected(&self) -> bool {
         self.stage.get() == IngressStage::LocalOutput
+            || (self.stage.get() == IngressStage::PreRoutingDone && self.handoff_broadcast.get())
+            || self.local_route_selected.get()
+    }
+
+    fn broadcast_route_selected(&self) -> bool {
+        self.broadcast_route_selected.get()
+            || (self.stage.get() != IngressStage::Pending && self.handoff_broadcast.get())
     }
 
     fn defragment_ipv4(&self) -> bool {
@@ -773,7 +792,8 @@ impl IpIngressFilter for NetIngressFilter<'_> {
     fn applies_to(&self, version: IpVersion) -> bool {
         match version {
             IpVersion::Ipv4 => {
-                self.ct_active_for(IpVersion::Ipv4)
+                self.handoff_broadcast.get()
+                    || self.ct_active_for(IpVersion::Ipv4)
                     || !self.raw_listeners.is_empty()
                     || self.ruleset.has_ipv4_hook(NftIpv4Hook::LocalIn)
                     || match self.stage.get() {
@@ -1011,6 +1031,16 @@ impl IpIngressFilter for NetIngressFilter<'_> {
         if source[0] == 0 && (source != [0; 4] || destination.octets() != [255; 4]) {
             return RouteInputVerdict::Drop;
         }
+        // An explicitly configured broadcast address is not part of
+        // smoltcp's CIDR-derived source classification. The local FIB is the
+        // authority for that address, so it cannot be accepted as a unicast
+        // source merely because its octets have an ordinary host shape.
+        if routes
+            .lookup_ingress(IpAddress::Ipv4(ipv4.src_addr()), ingress_ifindex)
+            .is_some_and(|route| route.matched.kind == RTN_BROADCAST)
+        {
+            return RouteInputVerdict::Drop;
+        }
         // Multicast routing is not configured by this FIB. A default unicast
         // route must never steal IGMP or joined-group UDP from the local stack.
         if destination.is_multicast() {
@@ -1020,7 +1050,12 @@ impl IpIngressFilter for NetIngressFilter<'_> {
             return RouteInputVerdict::Pass;
         };
         match route.matched.kind {
-            RTN_LOCAL | RTN_BROADCAST if route.oif == self.owner_ifindex => RouteInputVerdict::Pass,
+            RTN_LOCAL | RTN_BROADCAST if route.oif == self.owner_ifindex => {
+                self.local_route_selected.set(true);
+                self.broadcast_route_selected
+                    .set(route.matched.kind == RTN_BROADCAST);
+                RouteInputVerdict::Pass
+            }
             RTN_LOCAL | RTN_BROADCAST => {
                 let HardwareAddress::Ethernet(source_mac) = source_hardware_addr else {
                     return RouteInputVerdict::Drop;
@@ -1316,6 +1351,7 @@ impl IpIngressFilter for NetIngressFilter<'_> {
                     },
                     ct_context,
                     mark: self.mark.get(),
+                    broadcast: first_fragment && self.handoff_broadcast.get(),
                 }),
             });
             return RouteInputVerdict::Forward;

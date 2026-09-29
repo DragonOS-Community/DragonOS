@@ -87,6 +87,7 @@ pub(super) fn do_new_addr(
 ) -> Result<Vec<RouteNlSegment>, SystemError> {
     // Linux applies the IPv4 attribute policy before address, device, and
     // special-case validation. Preserve that errno priority here.
+    let broadcast = parse_request_broadcast(request_segment)?;
     let label = parse_request_label(request_segment)?;
     let cidr = parse_new_cidr(request_segment)?;
     let iface = lookup_iface_by_index(request_segment, &netns)?;
@@ -109,7 +110,8 @@ pub(super) fn do_new_addr(
         } else {
             AddressMutation::Add(cidr)
         };
-    let commit = crate::net::address::mutate_labeled_address(rtnl, &iface, mutation, label)?;
+    let commit =
+        crate::net::address::mutate_labeled_address(rtnl, &iface, mutation, label, broadcast)?;
     notify_address_outcome(netns.clone(), &iface, commit.outcome);
     notify_route_changes(&netns, commit.route_changes);
     Ok(Vec::new())
@@ -120,13 +122,23 @@ pub(super) fn do_del_addr(
     request_segment: &AddrSegment,
     netns: Arc<NetNamespace>,
 ) -> Result<Vec<RouteNlSegment>, SystemError> {
+    // Linux validates the IPv4 attribute policy even though IFA_BROADCAST
+    // does not participate in the delete selector.
+    let _ = parse_request_broadcast(request_segment)?;
     let label = parse_request_label(request_segment)?;
     let selector = parse_delete_selector(request_segment, label)?;
     let iface = lookup_iface_by_index(request_segment, &netns)?;
     let cidr = resolve_delete_cidr(&iface, selector)?;
     let deleted_label = crate::net::address::address_label(&iface, cidr)?;
+    let deleted_broadcast = crate::net::address::address_broadcast(&iface, cidr);
     let commit = crate::net::address::mutate_address(rtnl, &iface, AddressMutation::Delete(cidr))?;
-    notify_address_outcome_with_label(netns.clone(), &iface, commit.outcome, Some(&deleted_label));
+    notify_address_outcome_with_label(
+        netns.clone(),
+        &iface,
+        commit.outcome,
+        Some(&deleted_label),
+        deleted_broadcast,
+    );
     notify_route_changes(&netns, commit.route_changes);
     Ok(Vec::new())
 }
@@ -308,6 +320,27 @@ fn parse_request_label(request_segment: &AddrSegment) -> Result<Option<CString>,
     }
 }
 
+fn parse_request_broadcast(
+    request_segment: &AddrSegment,
+) -> Result<Option<Ipv4Address>, SystemError> {
+    if !matches!(
+        AddressFamily::try_from(request_segment.body().family as u16),
+        Ok(AddressFamily::INet)
+    ) {
+        return Ok(None);
+    }
+    let mut broadcast = None;
+    for attr in request_segment.attrs() {
+        if let AddrAttr::Broadcast(bytes) = attr {
+            if bytes.len() < 4 {
+                return Err(SystemError::ERANGE);
+            }
+            broadcast = Some(Ipv4Address::new(bytes[0], bytes[1], bytes[2], bytes[3]));
+        }
+    }
+    Ok(broadcast)
+}
+
 fn parse_ipv4_label(payload: &[u8]) -> Result<CString, SystemError> {
     if payload.is_empty() {
         return Err(SystemError::ERANGE);
@@ -366,13 +399,14 @@ fn iface_to_new_addr(request_header: &CMsgSegHdr, iface: &Arc<dyn Iface>) -> Vec
         return segments;
     };
 
-    for (cidr, label) in ip_addrs {
+    for (cidr, label, broadcast) in ip_addrs {
         if let Ok(segment) = addr_to_segment(
             request_header,
             iface,
             cidr,
             CSegmentType::NEWADDR,
             Some(&label),
+            broadcast,
         ) {
             segments.push(segment);
         }
@@ -387,6 +421,7 @@ fn addr_to_segment(
     cidr: IpCidr,
     msg_type: CSegmentType,
     label_override: Option<&CString>,
+    broadcast: Option<Ipv4Address>,
 ) -> Result<AddrSegment, SystemError> {
     let (family, octets): (i32, Vec<u8>) = match cidr.address() {
         IpAddress::Ipv4(addr) => (AddressFamily::INet as i32, addr.octets().to_vec()),
@@ -415,6 +450,9 @@ fn addr_to_segment(
 
     let mut attrs = vec![AddrAttr::Address(octets.clone())];
     if matches!(cidr.address(), IpAddress::Ipv4(_)) {
+        if let Some(broadcast) = broadcast.filter(|address| !address.is_unspecified()) {
+            attrs.push(AddrAttr::Broadcast(broadcast.octets().to_vec()));
+        }
         let label = match label_override {
             Some(label) => label.clone(),
             None => crate::net::address::address_label(iface, cidr)?,
@@ -435,7 +473,7 @@ pub(in crate::net::socket::netlink::route) fn notify_address_outcome(
     iface: &Arc<dyn Iface>,
     outcome: AddressMutationOutcome,
 ) {
-    notify_address_outcome_with_label(netns, iface, outcome, None)
+    notify_address_outcome_with_label(netns, iface, outcome, None, None)
 }
 
 pub(super) fn notify_address_change(
@@ -443,7 +481,7 @@ pub(super) fn notify_address_change(
     iface: &Arc<dyn Iface>,
     cidr: IpCidr,
 ) {
-    notify_one(netns, iface, cidr, CSegmentType::NEWADDR, None);
+    notify_one(netns, iface, cidr, CSegmentType::NEWADDR, None, None);
 }
 
 pub(super) fn notify_removed_address(
@@ -451,8 +489,16 @@ pub(super) fn notify_removed_address(
     iface: &Arc<dyn Iface>,
     cidr: IpCidr,
     label: &CString,
+    broadcast: Option<Ipv4Address>,
 ) {
-    notify_one(netns, iface, cidr, CSegmentType::DELADDR, Some(label));
+    notify_one(
+        netns,
+        iface,
+        cidr,
+        CSegmentType::DELADDR,
+        Some(label),
+        broadcast,
+    );
 }
 
 fn notify_address_outcome_with_label(
@@ -460,14 +506,20 @@ fn notify_address_outcome_with_label(
     iface: &Arc<dyn Iface>,
     outcome: AddressMutationOutcome,
     deleted_label: Option<&CString>,
+    deleted_broadcast: Option<Ipv4Address>,
 ) {
     match outcome {
         AddressMutationOutcome::Added(cidr) | AddressMutationOutcome::Replaced(cidr) => {
-            notify_one(netns, iface, cidr, CSegmentType::NEWADDR, None)
+            notify_one(netns, iface, cidr, CSegmentType::NEWADDR, None, None)
         }
-        AddressMutationOutcome::Deleted(cidr) => {
-            notify_one(netns, iface, cidr, CSegmentType::DELADDR, deleted_label)
-        }
+        AddressMutationOutcome::Deleted(cidr) => notify_one(
+            netns,
+            iface,
+            cidr,
+            CSegmentType::DELADDR,
+            deleted_label,
+            deleted_broadcast,
+        ),
     }
 }
 
@@ -477,9 +529,15 @@ fn notify_one(
     cidr: IpCidr,
     msg_type: CSegmentType,
     label_override: Option<&CString>,
+    broadcast_override: Option<Ipv4Address>,
 ) {
     let header = kernel_notify_header(msg_type);
-    let segment = match addr_to_segment(&header, iface, cidr, msg_type, label_override) {
+    let broadcast = if msg_type == CSegmentType::DELADDR {
+        broadcast_override
+    } else {
+        crate::net::address::address_broadcast(iface, cidr)
+    };
+    let segment = match addr_to_segment(&header, iface, cidr, msg_type, label_override, broadcast) {
         Ok(segment) => segment,
         Err(err) => {
             // Notification encoding is best effort after a successful commit;

@@ -470,7 +470,13 @@ pub(crate) fn notify_link_commit(netns: &Arc<NetNamespace>, committed: LinkMutat
         notify_link_change(&iface);
     }
     for removed in removed_addresses {
-        super::addr::notify_removed_address(netns.clone(), &iface, removed.cidr, &removed.label);
+        super::addr::notify_removed_address(
+            netns.clone(),
+            &iface,
+            removed.cidr,
+            &removed.label,
+            removed.broadcast,
+        );
     }
     for cidr in renamed_ipv4 {
         super::addr::notify_address_change(netns.clone(), &iface, cidr);

@@ -40,7 +40,8 @@ pub(crate) fn register_iface(
         .set_route_table_includes_connected_prefixes(true);
     let result = transact_with_devices(rtnl, netns, devices, |candidate| {
         if !defer_constructor_address_routes {
-            for route in derived_address_entries(iface, &addresses)? {
+            let metadata = iface.common().address_metadata().lock();
+            for route in derived_address_entries(iface, &addresses, &metadata)? {
                 candidate.insert_derived(route)?;
             }
         }
@@ -170,9 +171,13 @@ pub(crate) fn prepare_link_state_change<'rtnl>(
     let transaction = prepare_with_devices(rtnl, netns, &devices, |candidate| {
         if is_up {
             let mut added = Vec::new();
-            for entry in
-                derived_address_entries_for_link_state(iface, &iface.common().ip_addrs(), true)?
-            {
+            let metadata = iface.common().address_metadata().lock();
+            for entry in derived_address_entries_for_link_state(
+                iface,
+                &iface.common().ip_addrs(),
+                &metadata,
+                true,
+            )? {
                 // insert_derived() is the lifecycle authority here: the first
                 // UP publishes every deferred constructor address route,
                 // while later UP transitions only restore entries actually
@@ -282,10 +287,12 @@ impl PreparedAddressRouteCommit {
             None => netns.router().fib.read().try_clone()?,
         };
         let mut candidate = before.try_clone()?;
-        let before_routes =
-            derived_address_entries_for_link_state(iface, before_addresses, was_up)?;
+        let before_routes = {
+            let old_metadata = iface.common().address_metadata().lock();
+            derived_address_entries_for_link_state(iface, before_addresses, &old_metadata, was_up)?
+        };
         let after_address_routes =
-            derived_address_entries_for_link_state(iface, after_addresses, was_up)?;
+            derived_address_entries_for_link_state(iface, after_addresses, &metadata, was_up)?;
         let device_list = netns.device_list();
         let mut devices = Vec::new();
         devices
@@ -335,7 +342,9 @@ impl PreparedAddressRouteCommit {
             }
         } else if !was_up && is_up {
             let mut state_editor = FibEditor::new(&mut candidate);
-            for entry in derived_address_entries_for_link_state(iface, after_addresses, true)? {
+            for entry in
+                derived_address_entries_for_link_state(iface, after_addresses, &metadata, true)?
+            {
                 state_editor.insert_derived(entry)?;
             }
             for oif in state_editor.finish()? {
@@ -434,6 +443,8 @@ impl PreparedAddressRouteCommit {
         } = self;
         let router = netns.router();
         let mut current = router.fib_write();
+        let before_broadcasts = iface.common().configured_ipv4_broadcast_count();
+        let after_broadcasts = crate::net::address::configured_ipv4_broadcast_count(&metadata);
         publish_mtu();
         let mut publish_link_state = Some(publish_link_state);
         if !is_up {
@@ -466,6 +477,7 @@ impl PreparedAddressRouteCommit {
         let mut mirror = iface.router_common().ip_addrs.write();
         *mirror = after_addresses;
         *current = candidate;
+        netns.publish_ipv4_broadcast_count_change(before_broadcasts, after_broadcasts);
         if is_up {
             publish_link_state
                 .take()
@@ -532,10 +544,12 @@ pub(crate) fn commit_addresses(
 fn derived_address_entries(
     iface: &Arc<dyn Iface>,
     addresses: &[IpCidr],
+    metadata: &[AddressMetadata],
 ) -> Result<Vec<RouteEntry>, SystemError> {
     derived_address_entries_for_link_state(
         iface,
         addresses,
+        metadata,
         iface.flags().contains(InterfaceFlags::UP),
     )
 }
@@ -543,6 +557,7 @@ fn derived_address_entries(
 fn derived_address_entries_for_link_state(
     iface: &Arc<dyn Iface>,
     addresses: &[IpCidr],
+    metadata: &[AddressMetadata],
     is_up: bool,
 ) -> Result<Vec<RouteEntry>, SystemError> {
     let mut result = Vec::new();
@@ -572,7 +587,17 @@ fn derived_address_entries_for_link_state(
         });
     }
     for cidr in addresses.iter().copied() {
-        for entry in entries_for_address(iface, cidr, primary_for_prefix(addresses, cidr), is_up)? {
+        let broadcast = metadata
+            .iter()
+            .find(|entry| entry.cidr == cidr)
+            .and_then(|entry| entry.broadcast);
+        for entry in entries_for_address(
+            iface,
+            cidr,
+            primary_for_prefix(addresses, cidr),
+            broadcast,
+            is_up,
+        )? {
             if !result.contains(&entry) {
                 result.try_reserve(1).map_err(|_| SystemError::ENOMEM)?;
                 result.push(entry);
@@ -591,13 +616,14 @@ fn entries_for_address(
     iface: &Arc<dyn Iface>,
     cidr: IpCidr,
     primary: Option<IpAddress>,
+    broadcast: Option<smoltcp::wire::Ipv4Address>,
     is_up: bool,
 ) -> Result<Vec<RouteEntry>, SystemError> {
     let ipv4 = is_ipv4(cidr.address());
     let loopback = iface.flags().contains(InterfaceFlags::LOOPBACK);
     let mut result = Vec::new();
     result
-        .try_reserve_exact(3)
+        .try_reserve_exact(4)
         .map_err(|_| SystemError::ENOMEM)?;
     let connected = RouteEntry {
         destination: canonical_cidr(cidr),
@@ -663,8 +689,10 @@ fn entries_for_address(
         result.push(local);
     }
     if let IpCidr::Ipv4(cidr) = cidr {
-        if cidr.prefix_len() < 31 && !ipv4_prefix_is_zeronet(cidr) && is_up {
-            if let Some(broadcast) = cidr.broadcast() {
+        if is_up {
+            if let Some(broadcast) =
+                broadcast.filter(|address| !address.is_unspecified() && !address.is_broadcast())
+            {
                 result.push(RouteEntry {
                     destination: IpCidr::Ipv4(Ipv4Cidr::new(broadcast, 32)),
                     preferred_source: primary,
@@ -675,6 +703,23 @@ fn entries_for_address(
                     kind: RTN_BROADCAST,
                     ..connected
                 });
+            }
+        }
+        if cidr.prefix_len() < 31 && !ipv4_prefix_is_zeronet(cidr) && is_up {
+            if let Some(broadcast) = cidr.broadcast() {
+                let route = RouteEntry {
+                    destination: IpCidr::Ipv4(Ipv4Cidr::new(broadcast, 32)),
+                    preferred_source: primary,
+                    table: RT_TABLE_LOCAL,
+                    priority: 0,
+                    protocol: RTPROT_KERNEL,
+                    scope: RT_SCOPE_LINK,
+                    kind: RTN_BROADCAST,
+                    ..connected
+                };
+                if !result.contains(&route) {
+                    result.push(route);
+                }
             }
         }
     }

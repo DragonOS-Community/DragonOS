@@ -228,6 +228,7 @@ impl IfaceCommon {
             .map(|cidr| AddressMetadata {
                 cidr: *cidr,
                 label: None,
+                broadcast: None,
             })
             .collect();
         let sockets = smoltcp::iface::SocketSet::new(Vec::new());
@@ -617,7 +618,9 @@ impl IfaceCommon {
             && netns.is_some_and(|netns| netns.router().requires_authoritative_output())
         {
             PollModeRecheck::Authoritative
-        } else if (!needs_routed_poll && self.needs_namespace_routing())
+        } else if (!needs_routed_poll
+            && (self.needs_namespace_routing()
+                || netns.is_some_and(|netns| netns.has_explicit_ipv4_broadcast())))
             || (!configured_output && netns.is_some_and(crate::net::neighbor::has_ethernet_entries))
             || (!ct_active && netns.is_some_and(|netns| netns.conntrack().is_active()))
         {
@@ -722,6 +725,9 @@ impl IfaceCommon {
             let ipv6_forwarding = netns
                 .as_ref()
                 .is_some_and(|netns| netns.ipv6_forwarding_enabled());
+            let explicit_broadcast_ingress = netns
+                .as_ref()
+                .is_some_and(|netns| netns.has_explicit_ipv4_broadcast());
             let ct_active = netns
                 .as_ref()
                 .is_some_and(|netns| netns.conntrack().is_active());
@@ -744,6 +750,7 @@ impl IfaceCommon {
                 || authoritative_output
                 || configured_output
                 || ipv6_forwarding
+                || explicit_broadcast_ingress
                 || ct_active
                 || requires_nat_addresses
                 || nft_ruleset.as_ref().is_some_and(|ruleset| {
@@ -821,6 +828,7 @@ impl IfaceCommon {
             });
 
             let ingress_stage = Cell::new(IngressStage::Pending);
+            let handoff_broadcast = Cell::new(false);
             let mark = Cell::new(0);
             let packet_context = core::cell::RefCell::new(None);
             let mut ingress_work: Vec<RoutedIngressWork> = Vec::new();
@@ -832,9 +840,10 @@ impl IfaceCommon {
                     owner_ifindex: self.iface_id as u32,
                     device_names: &nft_device_names,
                     stage: &ingress_stage,
+                    handoff_broadcast: &handoff_broadcast,
                     mark: &mark,
                     packet_context: &packet_context,
-                    routes: (ipv6_forwarding || ct_active)
+                    routes: (ipv6_forwarding || explicit_broadcast_ingress || ct_active)
                         .then_some(route_policy.as_ref())
                         .flatten(),
                     fib_routes: route_policy.as_ref(),
@@ -851,6 +860,7 @@ impl IfaceCommon {
                         self,
                         backend_policy.unwrap(),
                         nft_filter.as_ref().map(|_| &ingress_stage),
+                        nft_filter.as_ref().map(|_| &handoff_broadcast),
                         nft_filter.as_ref().map(|_| &packet_context),
                         nft_filter.as_ref().map(|_| &mark),
                     );
@@ -1061,6 +1071,9 @@ impl IfaceCommon {
             let ipv6_forwarding = netns
                 .as_ref()
                 .is_some_and(|netns| netns.ipv6_forwarding_enabled());
+            let explicit_broadcast_ingress = netns
+                .as_ref()
+                .is_some_and(|netns| netns.has_explicit_ipv4_broadcast());
             let ct_active = netns
                 .as_ref()
                 .is_some_and(|netns| netns.conntrack().is_active());
@@ -1084,6 +1097,7 @@ impl IfaceCommon {
                 || configured_output
                 || route_ingress
                 || ipv6_forwarding
+                || explicit_broadcast_ingress
                 || ct_active
                 || requires_nat_addresses
                 || nft_ruleset.as_ref().is_some_and(|ruleset| {
@@ -1160,6 +1174,7 @@ impl IfaceCommon {
             let mut ingress_work: Vec<RoutedIngressWork> = Vec::new();
             let (processed, had_packet, ingress_budget, poll_again, deadline_rearm) = {
                 let ingress_stage = Cell::new(IngressStage::Pending);
+                let handoff_broadcast = Cell::new(false);
                 let mark = Cell::new(0);
                 let packet_context = core::cell::RefCell::new(None);
                 let mut nft_filter = netns.as_ref().map(|netns| {
@@ -1170,9 +1185,13 @@ impl IfaceCommon {
                         owner_ifindex: self.iface_id as u32,
                         device_names: &nft_device_names,
                         stage: &ingress_stage,
+                        handoff_broadcast: &handoff_broadcast,
                         mark: &mark,
                         packet_context: &packet_context,
-                        routes: (route_ingress || ipv6_forwarding || ct_active)
+                        routes: (route_ingress
+                            || ipv6_forwarding
+                            || explicit_broadcast_ingress
+                            || ct_active)
                             .then_some(route_policy.as_ref())
                             .flatten(),
                         fib_routes: route_policy.as_ref(),
@@ -1208,6 +1227,7 @@ impl IfaceCommon {
                         self,
                         backend_policy.unwrap(),
                         nft_filter.as_ref().map(|_| &ingress_stage),
+                        nft_filter.as_ref().map(|_| &handoff_broadcast),
                         nft_filter.as_ref().map(|_| &packet_context),
                         nft_filter.as_ref().map(|_| &mark),
                     );
@@ -1291,6 +1311,7 @@ impl IfaceCommon {
                         self,
                         backend_policy.unwrap(),
                         nft_filter.as_ref().map(|_| &ingress_stage),
+                        nft_filter.as_ref().map(|_| &handoff_broadcast),
                         nft_filter.as_ref().map(|_| &packet_context),
                         nft_filter.as_ref().map(|_| &mark),
                     );
@@ -1330,6 +1351,7 @@ impl IfaceCommon {
                             device,
                             self,
                             backend_policy.unwrap(),
+                            None,
                             None,
                             None,
                             None,
@@ -2014,6 +2036,17 @@ impl IfaceCommon {
 
     pub(crate) fn address_metadata(&self) -> &Mutex<Vec<AddressMetadata>> {
         &self.address_metadata
+    }
+
+    pub(crate) fn has_explicit_ipv4_broadcast(&self, address: smoltcp::wire::Ipv4Address) -> bool {
+        self.address_metadata
+            .lock()
+            .iter()
+            .any(|entry| entry.broadcast == Some(address))
+    }
+
+    pub(crate) fn configured_ipv4_broadcast_count(&self) -> usize {
+        crate::net::address::configured_ipv4_broadcast_count(&self.address_metadata.lock())
     }
 
     /// Stages a route before publication. Holding the namespace read guard

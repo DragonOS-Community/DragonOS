@@ -79,10 +79,17 @@ pub(crate) struct PreparedNetnsDeviceAddition {
 impl PreparedNetnsDeviceAddition {
     pub(crate) fn publish(self) {
         let mut devices = self.netns.device_list_mut();
+        let added_broadcasts: usize = self
+            .bindings
+            .iter()
+            .map(|(iface, _)| iface.common().configured_ipv4_broadcast_count())
+            .sum();
         for (iface, binding) in self.bindings {
             binding.publish(iface.common());
         }
         *devices = self.candidate;
+        self.netns
+            .publish_ipv4_broadcast_count_change(0, added_broadcasts);
         drop(devices);
         self.netns.notify_deadline_changed();
     }
@@ -100,6 +107,17 @@ pub(crate) struct PreparedNetnsDeviceRemoval<'rtnl> {
 impl PreparedNetnsDeviceRemoval<'_> {
     pub(crate) fn publish(self) {
         let mut devices = self.netns.device_list_mut();
+        let removed_broadcasts: usize = self
+            .ifindices
+            .iter()
+            .map(|ifindex| {
+                devices
+                    .get(ifindex)
+                    .expect("RTNL keeps prepared devices registered")
+                    .common()
+                    .configured_ipv4_broadcast_count()
+            })
+            .sum();
         self.routes.publish(&self.netns, || {
             for ifindex in &self.ifindices {
                 devices
@@ -107,6 +125,8 @@ impl PreparedNetnsDeviceRemoval<'_> {
                     .expect("RTNL keeps prepared devices registered");
             }
         });
+        self.netns
+            .publish_ipv4_broadcast_count_change(removed_broadcasts, 0);
         drop(devices);
         self.netns
             .finish_removed_devices_locked(self.rtnl, &self.ifindices);
@@ -235,6 +255,9 @@ pub struct NetNamespace {
     /// 注意：该结构会在 bind/connect 等路径被访问，且这些路径可能会获取可睡眠的 Mutex，
     /// 因此这里使用可睡眠的 `RwSem`，避免自旋锁 + schedule 的组合导致崩溃。
     device_list: RwSem<NetnsDeviceMap>,
+    /// Number of configured explicit IPv4 broadcast addresses. NAPI reads
+    /// this without taking topology/address locks under the protocol lock.
+    explicit_ipv4_broadcasts: AtomicUsize,
     /// Namespace-relative IDs used when reporting links whose peer lives in
     /// another netns. Weak entries do not prolong a peer namespace's life.
     peer_netns_ids: Mutex<PeerNetnsIds>,
@@ -397,6 +420,7 @@ struct FragmentOrigin {
     source: DefragSource,
     ct_context: Option<Arc<CtPacketContext>>,
     mark: u32,
+    broadcast: bool,
 }
 
 /// Owned by the receive callback only until the source interface locks have
@@ -410,6 +434,7 @@ pub(crate) struct PendingIpv4Fragment {
     pub(crate) source: DefragSource,
     pub(crate) ct_context: Option<Arc<CtPacketContext>>,
     pub(crate) mark: u32,
+    pub(crate) broadcast: bool,
 }
 
 impl PendingIpv4Fragment {
@@ -421,6 +446,7 @@ impl PendingIpv4Fragment {
             source: self.source,
             ct_context: self.ct_context.clone(),
             mark: self.mark,
+            broadcast: self.broadcast,
         }
     }
 }
@@ -445,6 +471,7 @@ impl PendingIpv6Fragment {
             source: self.source,
             ct_context: self.ct_context.clone(),
             mark: self.mark,
+            broadcast: false,
         }
     }
 }
@@ -517,6 +544,7 @@ mod defrag_pending_tests {
             source: DefragSource::LinkIngress,
             ct_context: None,
             mark: 0,
+            broadcast: false,
         }
     }
 
@@ -601,7 +629,10 @@ mod defrag_pending_tests {
         output_packet.source = DefragSource::LocalOutput;
         output_packet.ct_context = Some(Arc::new(CtPacketContext::Invalid));
         output_packet.mark = 0x1234;
+        output_packet.broadcast = true;
         let output = output_packet.origin();
+        let mut output_completion = output.clone();
+        output_completion.broadcast = false;
         let first = fragment(true);
         let last = fragment(false);
         let mut link_completion = link.clone();
@@ -611,7 +642,7 @@ mod defrag_pending_tests {
             ReassemblyResult::Pending
         ));
         assert!(matches!(
-            assembler.submit(&last, output.source.domain(), output.clone(), 1),
+            assembler.submit(&last, output.source.domain(), output_completion, 1),
             ReassemblyResult::Pending
         ));
         let ReassemblyResult::Complete(link_datagram) =
@@ -644,6 +675,8 @@ mod defrag_pending_tests {
             Some(CtPacketContext::Invalid)
         ));
         assert_eq!(output_datagram.first_origin.mark, 0x1234);
+        assert!(output_datagram.first_origin.broadcast);
+        assert!(!output_datagram.completion_origin.broadcast);
     }
 }
 
@@ -818,7 +851,10 @@ impl NetnsPoller {
             first_origin,
             completion_origin,
         } = datagram;
-        let broadcast = packet[16..20] == [255; 4];
+        // LOCAL_OUT has already selected its broadcast route. Keep that
+        // offset-zero decision through reassembly instead of trying to infer
+        // an explicit IFA_BROADCAST from the completed packet's address bits.
+        let broadcast = first_origin.broadcast || packet[16..20] == [255; 4];
         Self::reinject_ip(netns, packet, first_origin, completion_origin, broadcast);
     }
 
@@ -1161,6 +1197,24 @@ impl InnerNetNamespace {
 }
 
 impl NetNamespace {
+    pub(crate) fn has_explicit_ipv4_broadcast(&self) -> bool {
+        self.explicit_ipv4_broadcasts.load(Ordering::Acquire) != 0
+    }
+
+    /// RTNL serializes address and device publishers. Publish this before
+    /// releasing the FIB transaction so a poller cannot use an old backend.
+    pub(crate) fn publish_ipv4_broadcast_count_change(&self, before: usize, after: usize) {
+        if after > before {
+            self.explicit_ipv4_broadcasts
+                .fetch_add(after - before, Ordering::Release);
+        } else if before > after {
+            let old = self
+                .explicit_ipv4_broadcasts
+                .fetch_sub(before - after, Ordering::Release);
+            debug_assert!(old >= before - after);
+        }
+    }
+
     pub fn new_root() -> Arc<Self> {
         let inner = InnerNetNamespace {
             router: Router::new("root_netns_router".to_string()),
@@ -1176,6 +1230,7 @@ impl NetNamespace {
             inner: RwLock::new(inner),
             poller: NetnsPoller::new(self_ref.clone()),
             device_list: RwSem::new(BTreeMap::new()),
+            explicit_ipv4_broadcasts: AtomicUsize::new(0),
             peer_netns_ids: Mutex::new(PeerNetnsIds::default()),
             teardown_work: NetnsTeardownWork::new(),
             neighbor_table: NeighborTable::new(),
@@ -1226,6 +1281,7 @@ impl NetNamespace {
             inner: RwLock::new(inner),
             poller: NetnsPoller::new(self_ref.clone()),
             device_list: RwSem::new(BTreeMap::new()),
+            explicit_ipv4_broadcasts: AtomicUsize::new(0),
             peer_netns_ids: Mutex::new(PeerNetnsIds::default()),
             teardown_work: NetnsTeardownWork::new(),
             neighbor_table: NeighborTable::new(),
@@ -1925,10 +1981,13 @@ impl NetNamespace {
         let participants = try_snapshot_devices(&devices, Some(&device))?;
         let netns = self.self_ref.upgrade().unwrap();
         device.set_net_namespace(netns.clone())?;
+        let broadcast_count = device.common().configured_ipv4_broadcast_count();
+        self.publish_ipv4_broadcast_count_change(0, broadcast_count);
         devices.insert(device.nic_id(), device.clone());
         let iface = device.clone();
         if let Err(error) = crate::net::route::register_iface(rtnl, &netns, &iface, &participants) {
             devices.remove(&device.nic_id());
+            self.publish_ipv4_broadcast_count_change(broadcast_count, 0);
             device.clear_net_namespace();
             return Err(error);
         }
@@ -2075,6 +2134,10 @@ impl NetNamespace {
         removed: &[Arc<dyn Iface>],
     ) {
         let mut devices = self.device_list_mut();
+        let removed_broadcasts: usize = removed
+            .iter()
+            .map(|iface| iface.common().configured_ipv4_broadcast_count())
+            .sum();
         for iface in removed {
             let ifindex = iface.nic_id();
             assert!(
@@ -2085,6 +2148,7 @@ impl NetNamespace {
             );
             devices.remove(&ifindex);
         }
+        self.publish_ipv4_broadcast_count_change(removed_broadcasts, 0);
         drop(devices);
         for iface in removed {
             self.finish_removed_devices_locked(rtnl, core::slice::from_ref(&iface.nic_id()));

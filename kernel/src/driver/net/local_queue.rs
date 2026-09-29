@@ -68,6 +68,8 @@ pub(super) struct LocalInputRxToken<'a> {
     pub(super) meta: PacketMeta,
     pub(super) ingress_stage: IngressStage,
     pub(super) stage_cell: Option<&'a Cell<IngressStage>>,
+    pub(super) broadcast: bool,
+    pub(super) broadcast_cell: Option<&'a Cell<bool>>,
     pub(super) ct_context: Option<CtPacketContext>,
     pub(super) ct_context_cell: Option<&'a RefCell<Option<CtPacketContext>>>,
     pub(super) mark: u32,
@@ -77,6 +79,17 @@ pub(super) struct LocalInputRxToken<'a> {
 struct IngressStageScope<'a> {
     cell: &'a Cell<IngressStage>,
     previous: IngressStage,
+}
+
+struct BroadcastScope<'a> {
+    cell: &'a Cell<bool>,
+    previous: bool,
+}
+
+impl Drop for BroadcastScope<'_> {
+    fn drop(&mut self) {
+        self.cell.set(self.previous);
+    }
 }
 
 impl Drop for IngressStageScope<'_> {
@@ -112,6 +125,10 @@ impl RxToken for LocalInputRxToken<'_> {
             cell,
             previous: cell.replace(self.ingress_stage),
         });
+        let _broadcast_scope = self.broadcast_cell.map(|cell| BroadcastScope {
+            cell,
+            previous: cell.replace(self.broadcast),
+        });
         let _mark_scope = self.mark_cell.map(|cell| MarkScope {
             cell,
             previous: cell.replace(self.mark),
@@ -142,12 +159,15 @@ mod local_input_context_tests {
     #[test]
     fn prerouted_token_owns_context_only_during_consume() {
         let stage = Cell::new(IngressStage::Pending);
+        let broadcast = Cell::new(false);
         let context = RefCell::new(Some(CtPacketContext::Invalid));
         LocalInputRxToken {
             frame: Vec::new(),
             meta: PacketMeta::default(),
             ingress_stage: IngressStage::PreRoutingDone,
             stage_cell: Some(&stage),
+            broadcast: true,
+            broadcast_cell: Some(&broadcast),
             ct_context: Some(CtPacketContext::Untracked),
             ct_context_cell: Some(&context),
             mark: 0,
@@ -155,12 +175,14 @@ mod local_input_context_tests {
         }
         .consume(|_| {
             assert_eq!(stage.get(), IngressStage::PreRoutingDone);
+            assert!(broadcast.get());
             assert!(matches!(
                 context.borrow().as_ref(),
                 Some(CtPacketContext::Untracked)
             ));
         });
         assert_eq!(stage.get(), IngressStage::Pending);
+        assert!(!broadcast.get());
         assert!(context.borrow().is_none());
     }
 
@@ -172,6 +194,8 @@ mod local_input_context_tests {
             meta: PacketMeta::default(),
             ingress_stage: IngressStage::LocalOutput,
             stage_cell: None,
+            broadcast: false,
+            broadcast_cell: None,
             ct_context: None,
             ct_context_cell: Some(&context),
             mark: 0,
@@ -189,6 +213,8 @@ mod local_input_context_tests {
             meta: PacketMeta::default(),
             ingress_stage: IngressStage::LocalOutput,
             stage_cell: None,
+            broadcast: false,
+            broadcast_cell: None,
             ct_context: None,
             ct_context_cell: None,
             mark: 0x1234_5678,
@@ -203,6 +229,7 @@ mod local_input_context_tests {
 pub(super) struct LocalInputPacket {
     pub(super) ingress_ifindex: u32,
     pub(super) ingress_stage: IngressStage,
+    pub(super) broadcast: bool,
     pub(super) destination_mac: smoltcp::wire::EthernetAddress,
     pub(super) source_mac: smoltcp::wire::EthernetAddress,
     pub(super) ip_packet: Vec<u8>,

@@ -73,6 +73,76 @@ int read_oom_score_adj(int* out) {
     return 0;
 }
 
+int check_oom_score_adj_text_write(const char* text, size_t len, off_t offset,
+                                   ssize_t expected_written, int expected_errno,
+                                   int expected_score) {
+    int fd = open(kOomScoreAdjPath, O_RDWR);
+    if (fd < 0) {
+        return 1;
+    }
+    if (lseek(fd, offset, SEEK_SET) != offset) {
+        close(fd);
+        return 2;
+    }
+    errno = 0;
+    ssize_t written = write(fd, text, len);
+    int write_errno = errno;
+    close(fd);
+    if (written != expected_written || (written < 0 && write_errno != expected_errno)) {
+        fprintf(stderr, "oom_score_adj write: len=%zu offset=%lld got=%zd errno=%d, expected=%zd errno=%d\n",
+                len, static_cast<long long>(offset), written, write_errno, expected_written,
+                expected_errno);
+        return 3;
+    }
+    int score = 0;
+    if (read_oom_score_adj(&score) != 0 || score != expected_score) {
+        fprintf(stderr, "oom_score_adj readback: got=%d expected=%d\n", score, expected_score);
+        return 4;
+    }
+    return 0;
+}
+
+int child_oom_score_adj_text_parsing() {
+    if (write_oom_score_adj_errno(0) != 0) {
+        return 1;
+    }
+    const char nul_terminated[] = {'0', '\0'};
+    const char nul_with_tail[] = {'0', '\0', 'x', static_cast<char>(0xff)};
+    const char long_nul_with_tail[] = "0\0abcdefghijklm";
+    struct Case {
+        const char* text;
+        size_t len;
+        off_t offset;
+        ssize_t written;
+        int error;
+        int score;
+    };
+    const Case cases[] = {
+        {"0", 1, 0, 1, 0, 0},
+        {nul_terminated, sizeof(nul_terminated), 0, 2, 0, 0},
+        {nul_with_tail, sizeof(nul_with_tail), 0, 4, 0, 0},
+        {" \t0 \n", 5, 0, 5, 0, 0},
+        {"0xA", 3, 0, 3, 0, 10},
+        {"010", 3, 0, 3, 0, 8},
+        {"+0", 2, 0, 2, 0, 0},
+        {"0", 1, 1, 1, 0, 0},
+        {long_nul_with_tail, sizeof(long_nul_with_tail) - 1, 0, 12, 0, 0},
+        {"08", 2, 0, -1, EINVAL, 0},
+        {"0x", 2, 0, -1, EINVAL, 0},
+        {"1001", 4, 0, -1, EINVAL, 0},
+        {"2147483648", 10, 0, -1, ERANGE, 0},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        const Case& test = cases[i];
+        if (check_oom_score_adj_text_write(test.text, test.len, test.offset, test.written,
+                                           test.error, test.score) != 0) {
+            fprintf(stderr, "oom_score_adj text case %zu failed\n", i);
+            return 2;
+        }
+    }
+    return 0;
+}
+
 int drop_all_caps() {
     cap_user_data_t zeros[2];
     fill_caps_v3(0, 0, 0, zeros);
@@ -519,6 +589,10 @@ int child_clone_vm_process_receives_shared_mm_oom_score_adj_update() {
 TEST(OomScoreAdj, UnprivilegedCanRaiseNegativeOomScoreAdj) {
     expect_child_success(child_unprivileged_can_raise_negative_oom_score_adj,
                          "UnprivilegedCanRaiseNegativeOomScoreAdj");
+}
+
+TEST(OomScoreAdj, LinuxTextWriteParsing) {
+    expect_child_success(child_oom_score_adj_text_parsing, "LinuxTextWriteParsing");
 }
 
 TEST(OomScoreAdj, UnprivilegedCannotLowerBelowMin) {

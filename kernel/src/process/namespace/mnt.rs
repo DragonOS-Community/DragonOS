@@ -57,16 +57,27 @@ pub fn set_mount_max(value: u32) -> Result<(), SystemError> {
     Ok(())
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct MountCountState {
-    mounts: u32,
+    mounts: Arc<AtomicU32>,
     pending_mounts: u32,
 }
 
 impl MountCountState {
+    fn new(mounts: Arc<AtomicU32>) -> Self {
+        Self {
+            mounts,
+            pending_mounts: 0,
+        }
+    }
+
+    fn committed(&self) -> u32 {
+        self.mounts.load(Ordering::Acquire)
+    }
+
     fn ensure_capacity(&self, amount: u32, limit: u32) -> Result<(), SystemError> {
         let used = self
-            .mounts
+            .committed()
             .checked_add(self.pending_mounts)
             .ok_or(SystemError::ENOSPC)?;
         let remaining = limit.checked_sub(used).ok_or(SystemError::ENOSPC)?;
@@ -90,9 +101,10 @@ impl MountCountState {
             .pending_mounts
             .checked_sub(amount)
             .expect("mount reservation commit exceeds pending count");
-        self.mounts = self
-            .mounts
-            .checked_add(amount)
+        self.mounts
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                count.checked_add(amount)
+            })
             .expect("committed mount count overflow after validated reservation");
     }
 
@@ -103,10 +115,12 @@ impl MountCountState {
             .expect("mount reservation rollback exceeds pending count");
     }
 
+    #[cfg(test)]
     fn release(&mut self, amount: u32) {
-        self.mounts = self
-            .mounts
-            .checked_sub(amount)
+        self.mounts
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                count.checked_sub(amount)
+            })
             .expect("mount teardown exceeds committed count");
     }
 }
@@ -134,6 +148,9 @@ pub struct MntNamespace {
     self_ref: Weak<MntNamespace>,
     _user_ns: Arc<UserNamespace>,
     anonymous: bool,
+    /// Mount membership can outlive the last strong namespace reference while
+    /// Drop waits for MOUNT_LIFECYCLE_LOCK. Keep its committed count alive too.
+    committed_mounts: Arc<AtomicU32>,
     inner: RwSem<InnerMntNamespace>,
 }
 
@@ -235,15 +252,17 @@ impl MntNamespace {
         )
         .expect("a fresh mount namespace root has a unique superblock");
 
+        let committed_mounts = Arc::new(AtomicU32::new(0));
         let result = Arc::new_cyclic(|self_ref| Self {
             ns_common: NsCommon::new(0, NamespaceType::Mount),
             self_ref: self_ref.clone(),
             _user_ns: super::user_namespace::INIT_USER_NAMESPACE.clone(),
             anonymous: false,
+            committed_mounts: committed_mounts.clone(),
             inner: RwSem::new(InnerMntNamespace {
                 root_mountfs: ramfs.clone(),
                 root_parent_mount_id: None,
-                mount_count: MountCountState::default(),
+                mount_count: MountCountState::new(committed_mounts.clone()),
                 copy_sources: Vec::new(),
                 _dead: false,
             }),
@@ -268,18 +287,17 @@ impl MntNamespace {
         user_ns: Arc<UserNamespace>,
     ) -> Result<Arc<Self>, SystemError> {
         let count = u32::try_from(members.len()).map_err(|_| SystemError::ENOSPC)?;
+        let committed_mounts = Arc::new(AtomicU32::new(count));
         let namespace = Arc::new_cyclic(|self_ref| Self {
             ns_common: NsCommon::new(0, NamespaceType::Mount),
             self_ref: self_ref.clone(),
             _user_ns: user_ns,
             anonymous: true,
+            committed_mounts: committed_mounts.clone(),
             inner: RwSem::new(InnerMntNamespace {
                 root_mountfs: root,
                 root_parent_mount_id: None,
-                mount_count: MountCountState {
-                    mounts: count,
-                    pending_mounts: 0,
-                },
+                mount_count: MountCountState::new(committed_mounts.clone()),
                 copy_sources: Vec::new(),
                 _dead: false,
             }),
@@ -297,6 +315,10 @@ impl MntNamespace {
 
     pub(crate) fn is_anonymous(&self) -> bool {
         self.anonymous
+    }
+
+    pub(crate) fn committed_mounts(&self) -> Arc<AtomicU32> {
+        self.committed_mounts.clone()
     }
 
     /// Forcibly replace the root mount filesystem of this MountNamespace.
@@ -732,7 +754,8 @@ impl MntNamespace {
         let inner = self.inner.read();
         if inner._dead
             || inner.mount_count.pending_mounts != 0
-            || inner.mount_count.mounts != u32::try_from(count).map_err(|_| SystemError::ENOSPC)?
+            || inner.mount_count.committed()
+                != u32::try_from(count).map_err(|_| SystemError::ENOSPC)?
         {
             return Err(SystemError::EBUSY);
         }
@@ -743,8 +766,8 @@ impl MntNamespace {
         let mut inner = self.inner.write();
         assert!(self.anonymous && !inner._dead);
         assert_eq!(inner.mount_count.pending_mounts, 0);
-        assert_eq!(inner.mount_count.mounts as usize, count);
-        inner.mount_count.mounts = 0;
+        assert_eq!(inner.mount_count.committed() as usize, count);
+        inner.mount_count.mounts.store(0, Ordering::Release);
         inner._dead = true;
     }
 
@@ -833,7 +856,8 @@ impl MntNamespace {
             let copied_count =
                 u32::try_from(copied_mounts.len()).map_err(|_| SystemError::ENOSPC)?;
             assert_eq!(
-                copied_count, inner.mount_count.mounts,
+                copied_count,
+                inner.mount_count.committed(),
                 "namespace copy topology must match the source committed count"
             );
 
@@ -872,11 +896,13 @@ impl MntNamespace {
 
         let mut ns_common = self.ns_common.clone();
         ns_common.level += 1;
+        let committed_mounts = Arc::new(AtomicU32::new(copied_count));
         let new_mntns = Arc::new_cyclic(|self_ref| Self {
             ns_common,
             self_ref: self_ref.clone(),
             _user_ns: user_ns,
             anonymous: false,
+            committed_mounts: committed_mounts.clone(),
             inner: RwSem::new(InnerMntNamespace {
                 _dead: false,
                 root_mountfs: new_root_mntfs,
@@ -889,10 +915,7 @@ impl MntNamespace {
                 // Linux copy_mnt_ns() initializes the copied namespace's
                 // existing mount count directly. mount-max only admits new
                 // mount trees; it must not reject cloning existing topology.
-                mount_count: MountCountState {
-                    mounts: copied_count,
-                    pending_mounts: 0,
-                },
+                mount_count: MountCountState::new(committed_mounts.clone()),
                 copy_sources,
             }),
         });
@@ -1073,16 +1096,6 @@ impl MntNamespace {
         Ok(())
     }
 
-    pub fn remove_mount_exact(&self, mntfs: &Arc<MountFS>) -> Option<Arc<MountFS>> {
-        if !mntfs.is_belongs_to_mntns(&self.self_ref.upgrade()?) {
-            return None;
-        }
-        if mntfs.take_namespace_accounted(&self.self_ref) {
-            self.inner.write().mount_count.release(1);
-        }
-        Some(mntfs.clone())
-    }
-
     /// Fail early when a known lower bound cannot fit in this namespace.
     ///
     /// This is only a preflight optimization; the later reservation remains
@@ -1190,8 +1203,8 @@ mod tests {
         let anonymous = tree.anonymous_namespace().unwrap();
         assert!(anonymous.is_anonymous());
         assert!(tree_root.is_belongs_to_mntns(&anonymous));
-        assert_eq!(anonymous.inner.read().mount_count.mounts, 1);
-        assert_eq!(destination.inner.read().mount_count.mounts, 1);
+        assert_eq!(anonymous.inner.read().mount_count.committed(), 1);
+        assert_eq!(destination.inner.read().mount_count.committed(), 1);
 
         let foreign_target = foreign.root_mntfs().mountpoint_root_inode();
         assert_eq!(
@@ -1199,16 +1212,16 @@ mod tests {
             Err(SystemError::EINVAL)
         );
         assert!(tree_root.is_belongs_to_mntns(&anonymous));
-        assert_eq!(anonymous.inner.read().mount_count.mounts, 1);
-        assert_eq!(destination.inner.read().mount_count.mounts, 1);
+        assert_eq!(anonymous.inner.read().mount_count.committed(), 1);
+        assert_eq!(destination.inner.read().mount_count.committed(), 1);
 
         let target = destination.root_mntfs().mountpoint_root_inode();
         destination.attach_detached_tree(&tree, &target).unwrap();
         assert!(tree.anonymous_namespace().is_none());
         assert!(tree_root.is_belongs_to_mntns(&destination));
         assert!(anonymous.inner.read()._dead);
-        assert_eq!(anonymous.inner.read().mount_count.mounts, 0);
-        assert_eq!(destination.inner.read().mount_count.mounts, 2);
+        assert_eq!(anonymous.inner.read().mount_count.committed(), 0);
+        assert_eq!(destination.inner.read().mount_count.committed(), 2);
         drop(tree);
         assert!(tree_root.is_live());
         assert!(destination
@@ -1243,7 +1256,7 @@ mod tests {
         new_root_mountpoint: &Arc<MountFSInode>,
     ) {
         assert!(Arc::ptr_eq(&namespace.root_mntfs(), namespace_root));
-        assert_eq!(namespace.inner.read().mount_count.mounts, 3);
+        assert_eq!(namespace.inner.read().mount_count.committed(), 3);
         assert!(namespace_root
             .children_at(old_root_mountpoint)
             .iter()
@@ -1277,7 +1290,7 @@ mod tests {
         let peers_before = get_peers(group_id, &root).len();
         let slaves_before = root.propagation().slaves().len();
         let pins_before = root.superblock_external_pin_count();
-        let mount_count_before = namespace.inner.read().mount_count.mounts;
+        let mount_count_before = namespace.inner.read().mount_count.committed();
 
         FAIL_COPY_REGISTRATION_PREPARE.store(true, Ordering::Release);
         let result = namespace.copy_mnt_ns(&CloneFlags::CLONE_NEWNS, INIT_USER_NAMESPACE.clone());
@@ -1287,7 +1300,7 @@ mod tests {
         assert_eq!(get_peers(group_id, &root).len(), peers_before);
         assert_eq!(root.propagation().slaves().len(), slaves_before);
         assert_eq!(
-            namespace.inner.read().mount_count.mounts,
+            namespace.inner.read().mount_count.committed(),
             mount_count_before
         );
         assert!(root.is_live());
@@ -1433,7 +1446,7 @@ impl Drop for MntNamespace {
         let _topology = MOUNT_LIFECYCLE_LOCK.lock();
         let root = self.inner.read().root_mountfs.clone();
         if self.anonymous && self.inner.read()._dead {
-            debug_assert_eq!(self.inner.read().mount_count.mounts, 0);
+            debug_assert_eq!(self.inner.read().mount_count.committed(), 0);
             return;
         }
         let mut pending = vec![root.clone()];
@@ -1451,16 +1464,17 @@ impl Drop for MntNamespace {
             }
         }
         {
-            let mut inner = self.inner.write();
+            let inner = self.inner.write();
             assert_eq!(
                 inner.mount_count.pending_mounts, 0,
                 "a mount namespace cannot drop with pending reservations"
             );
             assert_eq!(
-                inner.mount_count.mounts, released,
+                inner.mount_count.committed(),
+                released,
                 "namespace teardown must consume every committed mount exactly once"
             );
-            inner.mount_count.mounts = 0;
+            inner.mount_count.mounts.store(0, Ordering::Release);
         }
         if self.anonymous {
             for member in &members {
@@ -1475,13 +1489,13 @@ impl Drop for MntNamespace {
 
 #[cfg(test)]
 mod mount_count_tests {
-    use super::MountCountState;
+    use super::{Arc, AtomicU32, MountCountState};
     use system_error::SystemError;
 
     #[test]
     fn exact_limit_succeeds_and_next_reservation_fails() {
         let mut state = MountCountState {
-            mounts: 3,
+            mounts: Arc::new(AtomicU32::new(3)),
             pending_mounts: 2,
         };
         state.reserve(5, 10).unwrap();
@@ -1492,38 +1506,32 @@ mod mount_count_tests {
 
     #[test]
     fn rollback_and_commit_transfer_only_their_own_pending_count() {
-        let mut state = MountCountState {
-            mounts: 4,
-            pending_mounts: 0,
-        };
+        let mut state = MountCountState::new(Arc::new(AtomicU32::new(4)));
         state.reserve(3, 10).unwrap();
         state.reserve(2, 10).unwrap();
         state.abort(3);
-        assert_eq!(state.mounts, 4);
+        assert_eq!(state.committed(), 4);
         assert_eq!(state.pending_mounts, 2);
         state.commit(2);
-        assert_eq!(state.mounts, 6);
+        assert_eq!(state.committed(), 6);
         assert_eq!(state.pending_mounts, 0);
         state.release(2);
-        assert_eq!(state.mounts, 4);
+        assert_eq!(state.committed(), 4);
     }
 
     #[test]
     fn arithmetic_overflow_and_lowered_limit_leave_state_unchanged() {
         let mut overflow = MountCountState {
-            mounts: u32::MAX,
+            mounts: Arc::new(AtomicU32::new(u32::MAX)),
             pending_mounts: 1,
         };
         assert_eq!(overflow.reserve(1, u32::MAX), Err(SystemError::ENOSPC));
-        assert_eq!(overflow.mounts, u32::MAX);
+        assert_eq!(overflow.committed(), u32::MAX);
         assert_eq!(overflow.pending_mounts, 1);
 
-        let mut lowered = MountCountState {
-            mounts: 20,
-            pending_mounts: 0,
-        };
+        let mut lowered = MountCountState::new(Arc::new(AtomicU32::new(20)));
         assert_eq!(lowered.reserve(1, 10), Err(SystemError::ENOSPC));
-        assert_eq!(lowered.mounts, 20);
+        assert_eq!(lowered.committed(), 20);
         assert_eq!(lowered.pending_mounts, 0);
     }
 }

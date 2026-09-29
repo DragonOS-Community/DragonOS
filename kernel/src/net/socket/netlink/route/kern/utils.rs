@@ -8,7 +8,7 @@ use crate::net::socket::netlink::{
         },
         Message, ProtocolSegment,
     },
-    route::message::segment::RouteNlSegment,
+    route::message::{segment::RouteNlSegment, RouteNlPacket},
     table::{NetlinkRouteProtocol, SupportedNetlinkProtocol},
 };
 use crate::process::namespace::net_namespace::NetNamespace;
@@ -74,11 +74,14 @@ pub fn kernel_notify_header(type_: CSegmentType) -> CMsgSegHdr {
 }
 
 pub fn multicast_notify(netns: Arc<NetNamespace>, group_mask: u32, segment: RouteNlSegment) {
-    if let Err(e) = NetlinkRouteProtocol::multicast(
-        GroupIdSet::new(group_mask),
-        Message::new(vec![segment]),
-        netns,
-    ) {
-        log::warn!("netlink route: multicast notify failed: {:?}", e);
+    let message = Message::new(vec![segment]);
+    for group_index in GroupIdSet::new(group_mask).ids_iter() {
+        let group_id = group_index + 1;
+        NetlinkRouteProtocol::notify_group(
+            group_id,
+            0,
+            RouteNlPacket::notification(message.clone(), 1 << group_index),
+            netns.clone(),
+        );
     }
 }

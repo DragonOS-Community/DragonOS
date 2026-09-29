@@ -5,7 +5,7 @@ use crate::net::socket::netlink::addr::multicast::GroupIdSet;
 use crate::net::socket::netlink::kobject::message::KobjectUeventMessage;
 use crate::net::socket::netlink::netfilter::{NetfilterKernelSocket, NetfilterMessage};
 use crate::net::socket::netlink::route::kern::NetlinkRouteKernelSocket;
-use crate::net::socket::netlink::route::message::RouteNlMessage;
+use crate::net::socket::netlink::route::message::RouteNlPacket;
 use crate::process::namespace::net_namespace::NetNamespace;
 use crate::process::ProcessManager;
 use crate::{libs::rand, net::socket::netlink::addr::NetlinkSocketAddr};
@@ -29,7 +29,7 @@ const MAX_GROUPS: u32 = 64;
 
 #[derive(Debug)]
 pub struct NetlinkSocketTable {
-    route: Arc<RwSem<ProtocolSocketTable<RouteNlMessage>>>,
+    route: Arc<RwSem<ProtocolSocketTable<RouteNlPacket>>>,
     kobject_uevent: Arc<RwSem<ProtocolSocketTable<KobjectUeventMessage>>>,
     netfilter: Arc<RwSem<ProtocolSocketTable<NetfilterMessage>>>,
 }
@@ -45,7 +45,7 @@ impl Default for NetlinkSocketTable {
 }
 
 impl NetlinkSocketTable {
-    pub fn route(&self) -> Arc<RwSem<ProtocolSocketTable<RouteNlMessage>>> {
+    pub fn route(&self) -> Arc<RwSem<ProtocolSocketTable<RouteNlPacket>>> {
         self.route.clone()
     }
 
@@ -133,7 +133,7 @@ impl<Message: 'static + Debug> ProtocolSocketTable<Message> {
 
     /// Kernel notifications are best-effort per subscriber. A full queue has
     /// already recorded ENOBUFS on that receiver and must not starve peers.
-    fn notify_group(&self, group_id: u32, excluded_port: u32, message: Message)
+    pub(super) fn notify_group(&self, group_id: u32, excluded_port: u32, message: Message)
     where
         Message: MulticastMessage,
     {
@@ -288,6 +288,13 @@ pub trait SupportedNetlinkProtocol: Debug {
         Ok(())
     }
 
+    fn check_explicit_send(
+        _addr: &NetlinkSocketAddr,
+        _netns: &Arc<NetNamespace>,
+    ) -> Result<(), SystemError> {
+        Ok(())
+    }
+
     fn check_membership(_netns: &Arc<NetNamespace>) -> Result<(), SystemError> {
         Ok(())
     }
@@ -365,15 +372,56 @@ pub trait SupportedNetlinkProtocol: Debug {
 pub struct NetlinkRouteProtocol;
 
 impl SupportedNetlinkProtocol for NetlinkRouteProtocol {
-    type Message = RouteNlMessage;
+    type Message = RouteNlPacket;
     type SocketState = ();
 
     fn multicast_group_count() -> u32 {
         33
     }
 
+    fn new_message_queue() -> MessageQueue<Self::Message> {
+        MessageQueue::with_limits(usize::MAX, 256 * 1024, RouteNlPacket::queue_charge)
+    }
+
+    fn max_send_len() -> Option<usize> {
+        Some(256 * 1024)
+    }
+
+    fn check_connect(
+        addr: &NetlinkSocketAddr,
+        netns: &Arc<NetNamespace>,
+    ) -> Result<(), SystemError> {
+        if addr.port() != 0 || !addr.groups().is_empty() {
+            Self::check_group_send_permission(netns)?;
+        }
+        Ok(())
+    }
+
+    fn check_explicit_send(
+        addr: &NetlinkSocketAddr,
+        netns: &Arc<NetNamespace>,
+    ) -> Result<(), SystemError> {
+        Self::check_connect(addr, netns)
+    }
+
     fn socket_table(netns: Arc<NetNamespace>) -> Arc<RwSem<ProtocolSocketTable<Self::Message>>> {
         netns.netlink_socket_table().route()
+    }
+}
+
+impl NetlinkRouteProtocol {
+    pub(super) fn check_group_send_permission(
+        netns: &Arc<NetNamespace>,
+    ) -> Result<(), SystemError> {
+        use crate::process::cred::CAPFlags;
+        if ProcessManager::current_pcb()
+            .cred()
+            .has_capability_in_ns(netns.user_ns(), CAPFlags::CAP_NET_ADMIN)
+        {
+            Ok(())
+        } else {
+            Err(SystemError::EPERM)
+        }
     }
 }
 

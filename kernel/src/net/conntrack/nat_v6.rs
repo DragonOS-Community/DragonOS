@@ -36,6 +36,11 @@ struct Ipv6AddressRewrite {
     new_dst: [u8; 16],
 }
 
+fn copy_available_prefix(destination: &mut [u8], replacement: &[u8]) {
+    let len = destination.len().min(replacement.len());
+    destination[..len].copy_from_slice(&replacement[..len]);
+}
+
 fn addresses(from: CtTuple, to: CtTuple) -> Result<Ipv6AddressRewrite, NatRewriteError> {
     match (from.src, from.dst, to.src, to.dst) {
         (
@@ -56,7 +61,13 @@ fn addresses(from: CtTuple, to: CtTuple) -> Result<Ipv6AddressRewrite, NatRewrit
 /// Produce a complete, non-failing write plan before touching packet bytes.
 /// Linux 6.6 `tcp_manip_pkt()` changes an eight-byte error quote's port but
 /// cannot update the TCP checksum unless the quoted checksum field exists.
-fn l4_plan(from: CtL4, to: CtL4, bytes: &[u8], quoted: bool) -> Result<L4Rewrite, NatRewriteError> {
+fn l4_plan(
+    from: CtL4,
+    to: CtL4,
+    bytes: &[u8],
+    quoted: bool,
+    generated: bool,
+) -> Result<L4Rewrite, NatRewriteError> {
     match (from, to) {
         (
             CtL4::Tcp {
@@ -67,7 +78,7 @@ fn l4_plan(from: CtL4, to: CtL4, bytes: &[u8], quoted: bool) -> Result<L4Rewrite
                 src_port: new_src,
                 dst_port: new_dst,
             },
-        ) if bytes.len() >= if quoted { 8 } else { 20 } => Ok(L4Rewrite::Tcp {
+        ) if generated || bytes.len() >= if quoted { 8 } else { 20 } => Ok(L4Rewrite::Tcp {
             old_ports: [old_src, old_dst],
             new_ports: [new_src, new_dst],
             checksum_present: bytes.len() >= 20,
@@ -81,10 +92,10 @@ fn l4_plan(from: CtL4, to: CtL4, bytes: &[u8], quoted: bool) -> Result<L4Rewrite
                 src_port: new_src,
                 dst_port: new_dst,
             },
-        ) if bytes.len() >= 8 => Ok(L4Rewrite::Udp {
+        ) if generated || bytes.len() >= 8 => Ok(L4Rewrite::Udp {
             old_ports: [old_src, old_dst],
             new_ports: [new_src, new_dst],
-            checksum_present: bytes[6] != 0 || bytes[7] != 0,
+            checksum_present: bytes.len() >= 8 && (bytes[6] != 0 || bytes[7] != 0),
         }),
         (
             CtL4::Icmpv6 {
@@ -97,7 +108,7 @@ fn l4_plan(from: CtL4, to: CtL4, bytes: &[u8], quoted: bool) -> Result<L4Rewrite
                 kind: new_kind,
                 code: new_code,
             },
-        ) if bytes.len() >= 8
+        ) if (generated || bytes.len() >= 8)
             && old_kind == new_kind
             && old_code == new_code
             && (matches!(old_kind, 128 | 129) || old_id == new_id) =>
@@ -169,8 +180,9 @@ fn apply_l4(
                 );
                 bytes[16..18].copy_from_slice(&next.to_be_bytes());
             }
-            bytes[0..2].copy_from_slice(&new_ports[0].to_be_bytes());
-            bytes[2..4].copy_from_slice(&new_ports[1].to_be_bytes());
+            let src = new_ports[0].to_be_bytes();
+            let dst = new_ports[1].to_be_bytes();
+            copy_available_prefix(bytes, &[src[0], src[1], dst[0], dst[1]]);
         }
         L4Rewrite::Udp {
             old_ports,
@@ -186,10 +198,14 @@ fn apply_l4(
             }
             // Linux 6.6 preserves an absent UDP checksum, even though normal
             // IPv6 UDP socket delivery subsequently rejects it.
-            bytes[0..2].copy_from_slice(&new_ports[0].to_be_bytes());
-            bytes[2..4].copy_from_slice(&new_ports[1].to_be_bytes());
+            let src = new_ports[0].to_be_bytes();
+            let dst = new_ports[1].to_be_bytes();
+            copy_available_prefix(bytes, &[src[0], src[1], dst[0], dst[1]]);
         }
         L4Rewrite::Icmpv6 { old_id, new_id } => {
+            if bytes.len() < 6 {
+                return;
+            }
             let prior = u16::from_be_bytes([bytes[2], bytes[3]]);
             let next = adjust_checksum(
                 prior,
@@ -255,7 +271,7 @@ pub(crate) fn rewrite_ipv6_tuple(
     let header = ipv6_header(packet, false).ok_or(NatRewriteError::InvalidPacket)?;
     let end = header.bytes.len();
     let offset = header.transport_offset;
-    let plan = l4_plan(from.l4, to.l4, &packet[offset..end], false)?;
+    let plan = l4_plan(from.l4, to.l4, &packet[offset..end], false, false)?;
     if from == to {
         return Ok(());
     }
@@ -281,6 +297,27 @@ pub(crate) fn rewrite_ipv6_related_icmp(
     quoted_to: CtTuple,
     side: NatManipSide,
     mode: CtChecksumMode,
+) -> Result<(), NatRewriteError> {
+    rewrite_ipv6_related_icmp_impl(packet, quoted_from, quoted_to, side, mode, false)
+}
+
+pub(crate) fn rewrite_ipv6_generated_related_icmp(
+    packet: &mut [u8],
+    quoted_from: CtTuple,
+    quoted_to: CtTuple,
+    side: NatManipSide,
+    mode: CtChecksumMode,
+) -> Result<(), NatRewriteError> {
+    rewrite_ipv6_related_icmp_impl(packet, quoted_from, quoted_to, side, mode, true)
+}
+
+fn rewrite_ipv6_related_icmp_impl(
+    packet: &mut [u8],
+    quoted_from: CtTuple,
+    quoted_to: CtTuple,
+    side: NatManipSide,
+    mode: CtChecksumMode,
+    generated: bool,
 ) -> Result<(), NatRewriteError> {
     let Ipv6AddressRewrite {
         old_src,
@@ -319,17 +356,19 @@ pub(crate) fn rewrite_ipv6_related_icmp(
             return Err(NatRewriteError::Unsupported);
         }
     }
-    let ParsedCtPacket::Related {
-        quoted,
-        outer_destination,
-    } = parse_ipv6_conntrack_with_mode(packet, mode)
-    else {
-        return Err(NatRewriteError::InvalidPacket);
-    };
-    if quoted != quoted_from
-        || (side == NatManipSide::Destination && outer_destination != quoted_from.src)
-    {
-        return Err(NatRewriteError::TupleMismatch);
+    if !generated {
+        let ParsedCtPacket::Related {
+            quoted,
+            outer_destination,
+        } = parse_ipv6_conntrack_with_mode(packet, mode)
+        else {
+            return Err(NatRewriteError::InvalidPacket);
+        };
+        if quoted != quoted_from
+            || (side == NatManipSide::Destination && outer_destination != quoted_from.src)
+        {
+            return Err(NatRewriteError::TupleMismatch);
+        }
     }
     let outer = ipv6_header(packet, false).ok_or(NatRewriteError::InvalidPacket)?;
     if outer.protocol != 58 {
@@ -337,20 +376,69 @@ pub(crate) fn rewrite_ipv6_related_icmp(
     }
     let outer_end = outer.bytes.len();
     let icmp_offset = outer.transport_offset;
+    if icmp_offset.checked_add(8).is_none_or(|end| end > outer_end) {
+        return Err(NatRewriteError::InvalidPacket);
+    }
     let quote_offset = icmp_offset + if packet[icmp_offset] == 137 { 48 } else { 8 };
     if packet[icmp_offset] == 137 && quoted_from != quoted_to {
         // Linux rejects a redirect whose quoted route advice needs NAT.
         return Err(NatRewriteError::Unsupported);
     }
-    let inner = ipv6_header(&packet[quote_offset..outer_end], true)
-        .ok_or(NatRewriteError::InvalidPacket)?;
-    let l4_offset = quote_offset + inner.transport_offset;
-    let l4_end = quote_offset + inner.bytes.len();
+    if quote_offset + 40 > outer_end {
+        return Err(NatRewriteError::InvalidPacket);
+    }
+    let inner = ipv6_header(&packet[quote_offset..outer_end], true);
+    if inner.is_none() && !generated {
+        return Err(NatRewriteError::InvalidPacket);
+    }
+    if generated
+        && (packet[quote_offset + 8..quote_offset + 24] != old_src
+            || packet[quote_offset + 24..quote_offset + 40] != old_dst
+            || (side == NatManipSide::Destination && packet[24..40] != old_src))
+    {
+        return Err(NatRewriteError::TupleMismatch);
+    }
+    let (l4_offset, l4_end) = inner.as_ref().map_or((outer_end, outer_end), |inner| {
+        (
+            quote_offset + inner.transport_offset,
+            quote_offset + inner.bytes.len(),
+        )
+    });
+    if generated {
+        if let Some(inner) = inner.as_ref() {
+            let expected_protocol = match quoted_from.l4 {
+                CtL4::Tcp { .. } => 6,
+                CtL4::Udp { .. } => 17,
+                CtL4::Icmpv6 { .. } => 58,
+                CtL4::Generic { protocol } => protocol,
+                CtL4::Icmp { .. } => return Err(NatRewriteError::Unsupported),
+            };
+            if inner.protocol != expected_protocol {
+                return Err(NatRewriteError::TupleMismatch);
+            }
+            let l4 = &packet[l4_offset..l4_end];
+            let (prefix, prefix_len) = match quoted_from.l4 {
+                CtL4::Tcp { src_port, dst_port } | CtL4::Udp { src_port, dst_port } => {
+                    let a = src_port.to_be_bytes();
+                    let b = dst_port.to_be_bytes();
+                    ([a[0], a[1], b[0], b[1]], 4)
+                }
+                CtL4::Icmpv6 { kind, code, .. } => ([kind, code, 0, 0], 2),
+                CtL4::Generic { .. } => ([0; 4], 0),
+                CtL4::Icmp { .. } => unreachable!(),
+            };
+            let available = l4.len().min(prefix_len);
+            if l4[..available] != prefix[..available] {
+                return Err(NatRewriteError::TupleMismatch);
+            }
+        }
+    }
     let plan = l4_plan(
         quoted_from.l4,
         quoted_to.l4,
         &packet[l4_offset..l4_end],
         true,
+        generated,
     )?;
     if quoted_from == quoted_to {
         return Ok(());
@@ -641,6 +729,49 @@ mod tests {
         let inner = &packet[48..];
         assert_eq!(&inner[8..24], &C);
         assert!(verified(inner, 17, 40));
+    }
+
+    #[test]
+    fn generated_related_keeps_header_only_ipv6_quote_valid() {
+        let from = tuple(
+            A,
+            B,
+            CtL4::Udp {
+                src_port: 1234,
+                dst_port: 80,
+            },
+        );
+        let to = tuple(
+            C,
+            B,
+            CtL4::Udp {
+                src_port: 4321,
+                dst_port: 80,
+            },
+        );
+        let quoted = ip(A, B, 17, &[]);
+        let mut packet = error(R, A, &quoted);
+        assert_eq!(
+            rewrite_ipv6_related_icmp(
+                &mut packet,
+                from,
+                to,
+                NatManipSide::Destination,
+                CtChecksumMode::Skip,
+            ),
+            Err(NatRewriteError::InvalidPacket)
+        );
+        rewrite_ipv6_generated_related_icmp(
+            &mut packet,
+            from,
+            to,
+            NatManipSide::Destination,
+            CtChecksumMode::Skip,
+        )
+        .unwrap();
+        assert_eq!(&packet[24..40], &C);
+        assert_eq!(&packet[56..72], &C);
+        assert!(verified(&packet, 58, 40));
     }
 
     #[test]

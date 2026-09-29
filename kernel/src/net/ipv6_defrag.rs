@@ -89,6 +89,7 @@ struct Queue<M> {
     largest_end: usize,
     received_bytes: usize,
     ecn_seen: u8,
+    largest_fragment: usize,
     charged_bytes: usize,
 }
 
@@ -96,6 +97,7 @@ pub(crate) struct ReassembledIpv6<M> {
     pub(crate) packet: Vec<u8>,
     pub(crate) first_origin: M,
     pub(crate) completion_origin: M,
+    pub(crate) max_original_fragment_len: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -358,6 +360,7 @@ impl<M: Clone> Ipv6Defragmenter<M> {
                     largest_end: 0,
                     received_bytes: 0,
                     ecn_seen: 0,
+                    largest_fragment: 0,
                     charged_bytes: charge,
                 });
                 self.charged_bytes += charge;
@@ -451,6 +454,9 @@ impl<M: Clone> Ipv6Defragmenter<M> {
         self.charged_bytes += charge;
         queue.received_bytes += payload.len();
         queue.largest_end = queue.largest_end.max(end);
+        queue.largest_fragment = queue.largest_fragment.max(
+            IPV6_HEADER_LEN + parsed.prefix.len() + FRAGMENT_HEADER_LEN + parsed.payload.len(),
+        );
         queue.ecn_seen |= 1 << parsed.ecn;
         if parsed.offset == 0 {
             queue.prefix = first_prefix.take();
@@ -537,6 +543,10 @@ fn assemble_atomic<M: Clone>(
         packet,
         first_origin: origin.clone(),
         completion_origin: origin,
+        max_original_fragment_len: IPV6_HEADER_LEN
+            + parsed.prefix.len()
+            + FRAGMENT_HEADER_LEN
+            + parsed.payload.len(),
     })
 }
 
@@ -588,6 +598,7 @@ fn assemble<M>(
         packet,
         first_origin,
         completion_origin,
+        max_original_fragment_len: queue.largest_fragment,
     })
 }
 

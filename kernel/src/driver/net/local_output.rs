@@ -75,6 +75,8 @@ pub(super) struct LocalInputDevice<'a, D: SmolDevice + ?Sized> {
     pub(super) ct_context_cell:
         Option<&'a core::cell::RefCell<Option<crate::net::conntrack::CtPacketContext>>>,
     pub(super) mark_cell: Option<&'a Cell<u32>>,
+    pub(super) forward_fragment_cell:
+        Option<&'a Cell<Option<crate::net::forward_mtu::ReassembledForwardInfo>>>,
 }
 
 /// Delegates receive to the physical device while routing every response and
@@ -629,6 +631,21 @@ impl ParsedIpv4Output {
     }
 }
 
+/// A forwarded IPv4 datagram has already passed FORWARD and POST_ROUTING.
+/// Preserve its fragmentability through the bounded output queue, including
+/// when the egress MTU changes after admission.
+pub(super) fn routed_ipv4_progress(
+    bytes: &[u8],
+    reassembled: Option<crate::net::forward_mtu::ReassembledForwardInfo>,
+) -> Result<PreparedIpProgress, SystemError> {
+    let parsed = ParsedIpv4Output::parse(bytes)?;
+    Ok(PreparedIpProgress::Ipv4 {
+        offset: 0,
+        may_fragment: !parsed.df || reassembled.is_some(),
+        max_fragment_len: reassembled.map(|info| info.max_original_fragment_len),
+    })
+}
+
 /// smoltcp emits an unsplit IPv4 header with DF=1 and ID=0. Its native
 /// fragment path would replace both fields for an oversized generated packet;
 /// deferred output must make the same decision before queuing the datagram.
@@ -664,7 +681,7 @@ fn prepared_ipv4_fragment(
     let Some(PreparedIpProgress::Ipv4 { offset, .. }) = packet.prepared_ip else {
         return Err(SystemError::EINVAL);
     };
-    if offset >= parsed.payload_len || parsed.df || mtu < parsed.header_len + 8 {
+    if offset >= parsed.payload_len || mtu < parsed.header_len + 8 {
         return Err(SystemError::EMSGSIZE);
     }
     let remaining = parsed.payload_len - offset;
@@ -722,20 +739,37 @@ fn next_output_fragment(
     packet: &LocalOutputPacket,
     mtu: usize,
 ) -> Result<Option<(Vec<u8>, usize)>, SystemError> {
+    if packet.frame.first().is_some_and(|byte| byte >> 4 == 6) && mtu < 1280 {
+        return Err(SystemError::ENETDOWN);
+    }
     match packet.prepared_ip {
         Some(PreparedIpProgress::Ipv4 {
             offset,
             may_fragment,
-        }) if offset != 0 || packet.frame.len() > mtu => {
+            max_fragment_len,
+        }) if offset != 0 || packet.frame.len() > mtu.min(max_fragment_len.unwrap_or(mtu)) => {
+            if max_fragment_len.is_some_and(|max| max > mtu)
+                && ParsedIpv4Output::parse(&packet.frame)?.df
+            {
+                return Err(SystemError::EMSGSIZE);
+            }
             if !may_fragment {
                 return Err(SystemError::EMSGSIZE);
             }
-            prepared_ipv4_fragment(packet, mtu).map(Some)
+            prepared_ipv4_fragment(packet, mtu.min(max_fragment_len.unwrap_or(mtu))).map(Some)
         }
-        Some(PreparedIpProgress::Ipv6 { offset, .. })
-            if offset != 0 || packet.frame.len() > mtu =>
+        Some(PreparedIpProgress::Ipv6 {
+            offset,
+            max_fragment_len,
+            ..
+        }) if offset != 0
+            || packet.frame.len() > mtu.min(max_fragment_len.unwrap_or(mtu).max(1280)) =>
         {
-            prepared_ipv6_fragment(packet, mtu).map(Some)
+            if max_fragment_len.is_some_and(|max| max > mtu) {
+                return Err(SystemError::EMSGSIZE);
+            }
+            prepared_ipv6_fragment(packet, mtu.min(max_fragment_len.unwrap_or(mtu).max(1280)))
+                .map(Some)
         }
         None if packet.frame.len() > mtu => Err(SystemError::EMSGSIZE),
         _ => Ok(None),
@@ -751,24 +785,26 @@ fn prepared_ipv6_fragment(
     let Some(PreparedIpProgress::Ipv6 {
         offset,
         identification,
+        ..
     }) = packet.prepared_ip
     else {
         return Err(SystemError::EINVAL);
     };
     let ipv6 = smoltcp::wire::Ipv6Packet::new_checked(packet.frame.as_slice())
         .map_err(|_| SystemError::EINVAL)?;
-    if matches!(u8::from(ipv6.next_header()), 0 | 43 | 44 | 51 | 60)
-        || ipv6.total_len() != packet.frame.len()
-        || mtu < 56
-    {
+    if ipv6.total_len() != packet.frame.len() {
         return Err(SystemError::EMSGSIZE);
     }
-    let payload_len = packet.frame.len() - 40;
+    let (split, previous_next_header) = ipv6_fragment_boundary(&packet.frame)?;
+    if mtu < split + 16 {
+        return Err(SystemError::EMSGSIZE);
+    }
+    let payload_len = packet.frame.len() - split;
     if offset >= payload_len {
         return Err(SystemError::EINVAL);
     }
     let remaining = payload_len - offset;
-    let available = mtu - 48;
+    let available = mtu - split - 8;
     let chunk = if remaining > available {
         available & !7
     } else {
@@ -779,19 +815,55 @@ fn prepared_ipv6_fragment(
     }
     let mut fragment = Vec::new();
     fragment
-        .try_reserve_exact(48 + chunk)
+        .try_reserve_exact(split + 8 + chunk)
         .map_err(|_| SystemError::ENOMEM)?;
-    fragment.extend_from_slice(&packet.frame[..40]);
+    fragment.extend_from_slice(&packet.frame[..split]);
     fragment.extend_from_slice(&[0; 8]);
-    fragment.extend_from_slice(&packet.frame[40 + offset..40 + offset + chunk]);
-    fragment[4..6].copy_from_slice(&((8 + chunk) as u16).to_be_bytes());
-    fragment[6] = smoltcp::wire::IpProtocol::Ipv6Frag.into();
-    fragment[40] = ipv6.next_header().into();
+    fragment.extend_from_slice(&packet.frame[split + offset..split + offset + chunk]);
+    fragment[4..6].copy_from_slice(&((split - 40 + 8 + chunk) as u16).to_be_bytes());
+    fragment[previous_next_header] = smoltcp::wire::IpProtocol::Ipv6Frag.into();
+    fragment[split] = packet.frame[previous_next_header];
     let more = u16::from(remaining > chunk);
     let offset_flags = ((offset / 8) as u16) << 3 | more;
-    fragment[42..44].copy_from_slice(&offset_flags.to_be_bytes());
-    fragment[44..48].copy_from_slice(&identification.to_be_bytes());
+    fragment[split + 2..split + 4].copy_from_slice(&offset_flags.to_be_bytes());
+    fragment[split + 4..split + 8].copy_from_slice(&identification.to_be_bytes());
     Ok((fragment, chunk))
+}
+
+/// The unfragmentable chain is the fixed header, HBH, Routing, and any
+/// Destination Options before Routing. Linux 6.6 `ip6_find_1stfragopt()`
+/// stops at the first post-Routing Destination Options or other header.
+fn ipv6_fragment_boundary(bytes: &[u8]) -> Result<(usize, usize), SystemError> {
+    if bytes.len() < 40 || bytes[0] >> 4 != 6 {
+        return Err(SystemError::EINVAL);
+    }
+    let mut next = bytes[6];
+    let mut previous_next_header = 6;
+    let mut offset = 40;
+    let mut found_routing = false;
+    loop {
+        match next {
+            0 | 43 => {
+                found_routing |= next == 43;
+            }
+            60 if !found_routing => {}
+            _ => break,
+        }
+        if offset + 2 > bytes.len() {
+            return Err(SystemError::EINVAL);
+        }
+        let length = (usize::from(bytes[offset + 1]) + 1) * 8;
+        if length < 8 || offset + length > bytes.len() {
+            return Err(SystemError::EINVAL);
+        }
+        previous_next_header = offset;
+        next = bytes[offset];
+        offset += length;
+    }
+    if offset >= bytes.len() || next == 44 {
+        return Err(SystemError::EMSGSIZE);
+    }
+    Ok((offset, previous_next_header))
 }
 
 fn fragment_transmit_error(
@@ -823,7 +895,8 @@ fn fragment_transmit_complete(
         }
         Some(PreparedIpProgress::Ipv6 { offset, .. }) => {
             *offset += payload_len;
-            *offset == packet.frame.len() - 40
+            ipv6_fragment_boundary(&packet.frame)
+                .is_ok_and(|(split, _)| *offset == packet.frame.len() - split)
         }
         None => false,
     }
@@ -863,7 +936,9 @@ mod prepared_ipv4_tests {
             prepared_ip: Some(PreparedIpProgress::Ipv4 {
                 offset: 0,
                 may_fragment: true,
+                max_fragment_len: None,
             }),
+            forward_mtu_feedback: None,
             _charge: None,
         }
     }
@@ -961,6 +1036,37 @@ mod prepared_ipv4_tests {
             Some(PreparedIpProgress::Ipv4 { offset: 0, .. })
         ));
     }
+
+    #[test]
+    fn reassembled_ipv4_keeps_original_fragment_limit_and_df_boundary() {
+        let mut packet = datagram(&[], 96);
+        packet.prepared_ip = Some(PreparedIpProgress::Ipv4 {
+            offset: 0,
+            may_fragment: true,
+            max_fragment_len: Some(60),
+        });
+        let mut lengths = Vec::new();
+        loop {
+            let (fragment, chunk) = next_output_fragment(&packet, 1500).unwrap().unwrap();
+            lengths.push(fragment.len());
+            if fragment_transmit_complete(&mut packet, &Some((fragment, chunk))) {
+                break;
+            }
+        }
+        assert_eq!(lengths, [60, 60, 36]);
+
+        let mut df = datagram(&[], 96);
+        df.frame[6] |= 0x40;
+        df.prepared_ip = Some(PreparedIpProgress::Ipv4 {
+            offset: 0,
+            may_fragment: true,
+            max_fragment_len: Some(60),
+        });
+        assert!(matches!(
+            next_output_fragment(&df, 52),
+            Err(SystemError::EMSGSIZE)
+        ));
+    }
 }
 
 #[cfg(test)]
@@ -997,7 +1103,9 @@ mod prepared_ipv6_tests {
             prepared_ip: Some(PreparedIpProgress::Ipv6 {
                 offset: 0,
                 identification: 0x1234_5678,
+                max_fragment_len: None,
             }),
+            forward_mtu_feedback: None,
             _charge: None,
         }
     }
@@ -1055,6 +1163,37 @@ mod prepared_ipv6_tests {
         assert!(matches!(
             packet.prepared_ip,
             Some(PreparedIpProgress::Ipv6 { offset: 0, .. })
+        ));
+    }
+
+    #[test]
+    fn reassembled_ipv6_keeps_original_limit_and_extension_boundary() {
+        let mut packet = datagram(2000);
+        // Hop-by-Hop is unfragmentable; the Fragment header follows it.
+        packet.frame.splice(40..40, [17, 0, 0, 0, 0, 0, 0, 0]);
+        packet.frame[6] = 0;
+        let payload_len = (packet.frame.len() - 40) as u16;
+        packet.frame[4..6].copy_from_slice(&payload_len.to_be_bytes());
+        packet.prepared_ip = Some(PreparedIpProgress::Ipv6 {
+            offset: 0,
+            identification: 42,
+            max_fragment_len: Some(1300),
+        });
+        let mut fragments = 0;
+        loop {
+            let (fragment, chunk) = next_output_fragment(&packet, 1500).unwrap().unwrap();
+            assert!(fragment.len() <= 1300);
+            assert_eq!(fragment[6], 0);
+            assert_eq!(fragment[40], 44);
+            fragments += 1;
+            if fragment_transmit_complete(&mut packet, &Some((fragment, chunk))) {
+                break;
+            }
+        }
+        assert_eq!(fragments, 2);
+        assert!(matches!(
+            next_output_fragment(&packet, 1200),
+            Err(SystemError::EMSGSIZE)
         ));
     }
 }
@@ -1538,6 +1677,10 @@ impl<T: SmolTxToken> SmolTxToken for RoutedTxToken<'_, T> {
 }
 
 impl<'a, D: SmolDevice + ?Sized> LocalInputDevice<'a, D> {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "poll-scoped packet cells must remain separately borrowed"
+    )]
     pub(super) fn new(
         device: &'a mut D,
         common: &'a IfaceCommon,
@@ -1548,6 +1691,9 @@ impl<'a, D: SmolDevice + ?Sized> LocalInputDevice<'a, D> {
             &'a core::cell::RefCell<Option<crate::net::conntrack::CtPacketContext>>,
         >,
         mark_cell: Option<&'a Cell<u32>>,
+        forward_fragment_cell: Option<
+            &'a Cell<Option<crate::net::forward_mtu::ReassembledForwardInfo>>,
+        >,
     ) -> Self {
         Self {
             device,
@@ -1557,6 +1703,7 @@ impl<'a, D: SmolDevice + ?Sized> LocalInputDevice<'a, D> {
             broadcast_cell,
             ct_context_cell,
             mark_cell,
+            forward_fragment_cell,
         }
     }
 
@@ -1636,6 +1783,7 @@ impl<D: SmolDevice + ?Sized> SmolDevice for LocalInputDevice<'_, D> {
         let broadcast = packet.broadcast;
         let ct_context = packet.ct_context.take();
         let mark = packet.mark;
+        let forward_fragment = packet.forward_fragment;
         let frame = packet.into_frame(self.device.capabilities().medium).ok()?;
         let mut meta = PacketMeta::default();
         meta.id = ingress_ifindex;
@@ -1651,6 +1799,8 @@ impl<D: SmolDevice + ?Sized> SmolDevice for LocalInputDevice<'_, D> {
                 ct_context_cell: self.ct_context_cell,
                 mark,
                 mark_cell: self.mark_cell,
+                forward_fragment,
+                forward_fragment_cell: self.forward_fragment_cell,
             },
             tx_token,
         ))

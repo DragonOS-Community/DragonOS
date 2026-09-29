@@ -109,6 +109,10 @@ impl DeferredRouteQueue {
         self.index.get(key.packed()).is_some()
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "failed admission returns the owned packet for bounded-queue recycling without another allocation"
+    )]
     pub(super) fn try_enqueue(
         &mut self,
         packet: LocalOutputPacket,
@@ -244,6 +248,10 @@ impl DeferredRouteQueue {
         Some((packet, Some(key)))
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "failed probe handoff must return the owned packet to its caller"
+    )]
     pub(super) fn finish_probe(
         &mut self,
         packet: LocalOutputPacket,

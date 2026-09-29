@@ -8,6 +8,7 @@ use crate::driver::net::Iface;
 
 pub(crate) mod address;
 pub(crate) mod conntrack;
+pub mod forward_mtu;
 pub(crate) mod ingress;
 pub(crate) mod ipv4_defrag;
 pub(crate) mod ipv6_defrag;

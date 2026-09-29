@@ -163,6 +163,13 @@ impl<'a> LocalOutputCt<'a> {
         }
     }
 
+    fn with_attached_related(mut self, context: Option<CtPacketContext>) -> Self {
+        if self.tracked {
+            self.context = RefCell::new(context);
+        }
+        self
+    }
+
     pub(crate) fn mark(&self) -> u32 {
         self.mark.get()
     }
@@ -426,8 +433,17 @@ impl<'a> LocalOutputCt<'a> {
 /// either hook.
 pub(crate) fn submit_prepared_ipv6(
     netns: &Arc<NetNamespace>,
+    reservation: PreparedIpOutputReservation<'_>,
+    route: OutputRouteDecision,
+) -> Result<(), SystemError> {
+    submit_prepared_ipv6_with_related(netns, reservation, route, None)
+}
+
+pub(crate) fn submit_prepared_ipv6_with_related(
+    netns: &Arc<NetNamespace>,
     mut reservation: PreparedIpOutputReservation<'_>,
     mut route: OutputRouteDecision,
+    related: Option<CtPacketContext>,
 ) -> Result<(), SystemError> {
     reservation.validate_for_ipv6_route(route)?;
     let initial_destination = destination(reservation.bytes(), IpVersion::Ipv6)?;
@@ -444,7 +460,7 @@ pub(crate) fn submit_prepared_ipv6(
         NftIpv4Hook::LocalOut,
         route,
     )?;
-    let ct = LocalOutputCt::new(netns, &ruleset, IpVersion::Ipv6);
+    let ct = LocalOutputCt::new(netns, &ruleset, IpVersion::Ipv6).with_attached_related(related);
     let router = netns.router();
     let output_routes = ruleset
         .ipv6_hook_requires_local_destination(NftIpv4Hook::LocalOut)
@@ -524,10 +540,28 @@ pub(crate) fn submit_prepared_ipv6(
 /// POST_ROUTING hook before the original, as in Linux's ip_mc_output().
 pub(crate) fn submit_prepared_ipv4(
     netns: &Arc<NetNamespace>,
+    reservation: PreparedIpOutputReservation<'_>,
+    route: OutputRouteDecision,
+    multicast_loop: bool,
+    may_fragment: bool,
+) -> Result<Option<Arc<dyn Iface>>, SystemError> {
+    submit_prepared_ipv4_with_related(
+        netns,
+        reservation,
+        route,
+        multicast_loop,
+        may_fragment,
+        None,
+    )
+}
+
+pub(crate) fn submit_prepared_ipv4_with_related(
+    netns: &Arc<NetNamespace>,
     mut reservation: PreparedIpOutputReservation<'_>,
     mut route: OutputRouteDecision,
     multicast_loop: bool,
     may_fragment: bool,
+    related: Option<CtPacketContext>,
 ) -> Result<Option<Arc<dyn Iface>>, SystemError> {
     reservation.validate_for_route(route, may_fragment)?;
     let packet = Ipv4Packet::new_checked(reservation.bytes()).map_err(|_| SystemError::EINVAL)?;
@@ -542,7 +576,7 @@ pub(crate) fn submit_prepared_ipv4(
         route,
     )?;
     let addr_type = |address| crate::net::route::ipv4_addr_type(netns, address);
-    let ct = LocalOutputCt::new(netns, &ruleset, IpVersion::Ipv4);
+    let ct = LocalOutputCt::new(netns, &ruleset, IpVersion::Ipv4).with_attached_related(related);
 
     if !ct.evaluate_ipv4(
         NftIpv4Hook::LocalOut,

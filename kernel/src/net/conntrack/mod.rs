@@ -680,6 +680,25 @@ impl CtCandidate {
     pub(crate) fn proposed_reply(&self) -> CtTuple {
         self.translated.reverse().expect("validated candidate")
     }
+
+    /// An ICMP error generated before POST_ROUTING still belongs to this
+    /// private first packet. Give the error a temporary RELATED identity
+    /// without publishing the rejected original flow in the conntrack table.
+    fn related_error_match(&self, now: Instant) -> Result<CtMatch, CtError> {
+        let flow = Arc::try_new(CtFlow {
+            original: self.original,
+            translated: self.translated,
+            reply: self.proposed_reply(),
+            masquerade_ifindex: self.masquerade_ifindex,
+            runtime: SpinLock::new(FlowRuntime::new(self.kind, now)),
+        })
+        .map_err(|_| CtError::NoMemory)?;
+        Ok(CtMatch {
+            flow,
+            direction: CtDirection::Reply,
+            state: CtPacketState::Related,
+        })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -720,6 +739,49 @@ impl CtMatch {
         (quoted_at_hook == from).then_some(CtNatRewrite { from, to })
     }
 
+    /// The trigger can be between PRE_ROUTING and POST_ROUTING. Its complete
+    /// tuple, captured before the ICMP quote is shortened, is authoritative
+    /// for this one kernel-generated error. Network-received ICMP errors keep
+    /// using `related_quote_rewrite` and strict tuple parsing.
+    fn generated_related_plan(
+        &self,
+        quote_start: CtTuple,
+        side: NatManipSide,
+    ) -> Result<CtNatRewrite, NatRewriteError> {
+        let target = match self.direction {
+            CtDirection::Reply => self.flow.original(),
+            CtDirection::Original => self
+                .flow
+                .translated()
+                .reverse()
+                .ok_or(NatRewriteError::Unsupported)?,
+        };
+        let middle = quote_start.source_from(target);
+        let (from, to) = match side {
+            NatManipSide::Destination => (quote_start, middle),
+            NatManipSide::Source => (middle, target),
+        };
+        Ok(CtNatRewrite { from, to })
+    }
+
+    fn rewrite_generated_related_icmp(
+        &self,
+        packet: &mut [u8],
+        quote_start: CtTuple,
+        side: NatManipSide,
+        mode: CtChecksumMode,
+    ) -> Result<(), NatRewriteError> {
+        let plan = self.generated_related_plan(quote_start, side)?;
+        match plan.from.src {
+            CtAddress::V4(_) => {
+                nat::rewrite_ipv4_generated_related_icmp(packet, plan.from, plan.to, side, mode)
+            }
+            CtAddress::V6(_) => {
+                nat_v6::rewrite_ipv6_generated_related_icmp(packet, plan.from, plan.to, side, mode)
+            }
+        }
+    }
+
     /// RELATED errors need quote and outer-header manipulation together.
     /// The existing family helpers validate the quote and fix all checksums.
     pub(crate) fn rewrite_related_icmp(
@@ -758,15 +820,63 @@ pub(crate) enum CtPacketContext {
     Untracked,
     Invalid,
     Matched(CtMatch),
+    /// Only locally generated ICMP errors carry the full triggering tuple.
+    /// Their bounded quote may be shorter than a transport header, so NAT
+    /// must not try to reconstruct this tuple from the shortened bytes.
+    GeneratedRelated {
+        found: CtMatch,
+        quote_start: CtTuple,
+    },
     Candidate(CtCandidate),
 }
 
 impl CtPacketContext {
+    /// Attach the triggering packet's identity to an internally generated
+    /// ICMP error. The error travels opposite to the triggering direction.
+    pub(crate) fn related_error_context(
+        &self,
+        now: Instant,
+        trigger: &[u8],
+    ) -> Result<Option<Self>, CtError> {
+        if matches!(self, Self::Untracked | Self::Invalid) {
+            return Ok(None);
+        }
+        let parsed = match IpVersion::of_packet(trigger) {
+            Ok(IpVersion::Ipv4) => parse_ipv4_conntrack_with_mode(trigger, CtChecksumMode::Skip),
+            Ok(IpVersion::Ipv6) => parse_ipv6_conntrack_with_mode(trigger, CtChecksumMode::Skip),
+            _ => return Err(CtError::Invalid),
+        };
+        let ParsedCtPacket::Flow {
+            tuple: quote_start, ..
+        } = parsed
+        else {
+            return Err(CtError::Invalid);
+        };
+        match self {
+            Self::Candidate(candidate) => candidate
+                .related_error_match(now)
+                .map(|found| Some(Self::GeneratedRelated { found, quote_start })),
+            Self::Matched(matched) => Ok(Some(Self::GeneratedRelated {
+                found: CtMatch {
+                    flow: matched.flow.clone(),
+                    direction: match matched.direction {
+                        CtDirection::Original => CtDirection::Reply,
+                        CtDirection::Reply => CtDirection::Original,
+                    },
+                    state: CtPacketState::Related,
+                },
+                quote_start,
+            })),
+            Self::GeneratedRelated { .. } => Err(CtError::Invalid),
+            Self::Untracked | Self::Invalid => Ok(None),
+        }
+    }
     pub(crate) fn state(&self) -> Option<CtPacketState> {
         match self {
             Self::Untracked => None,
             Self::Invalid => Some(CtPacketState::Invalid),
             Self::Matched(found) => Some(found.state),
+            Self::GeneratedRelated { .. } => Some(CtPacketState::Related),
             Self::Candidate(_) => Some(CtPacketState::New),
         }
     }
@@ -793,6 +903,10 @@ impl CtPacketContext {
     ) -> Result<bool, NatRewriteError> {
         match self {
             Self::Candidate(_) => Ok(false),
+            Self::GeneratedRelated { found, quote_start } => {
+                found.rewrite_generated_related_icmp(packet, *quote_start, side, mode)?;
+                Ok(true)
+            }
             Self::Matched(found) if found.state == CtPacketState::Related => {
                 let parsed = match IpVersion::of_packet(packet) {
                     Ok(IpVersion::Ipv4) => parse_ipv4_conntrack_with_mode(packet, mode),

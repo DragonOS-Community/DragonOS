@@ -680,6 +680,101 @@ mod hook_program_tests {
         assert!(table.validate_reachable_chains().is_ok());
     }
 
+    fn postrouting_nat_snapshot(expression: NftExpression, outer_hook: bool) -> RulesetSnapshot {
+        let mut table = table_with_chain(2, 1, 100, 1, NftVerdict::Accept, None);
+        Arc::get_mut(&mut table).unwrap().name = b"nat".to_vec();
+        let chain = Arc::get_mut(&mut Arc::get_mut(&mut table).unwrap().chains[0]).unwrap();
+        let base = chain.base.as_mut().unwrap();
+        base.chain_type = NftChainType::Nat;
+        base.hook = NftIpv4Hook::PostRouting;
+        chain.rules.push(Arc::new(NftRule {
+            handle: 2,
+            expressions: alloc::vec![expression],
+        }));
+        assert!(table.validate_reachable_chains().is_ok());
+        let mut ruleset = snapshot(alloc::vec![table]);
+        ruleset.nat_outer_hook_order[0] = outer_hook.then_some(1);
+        ruleset.compile_ipv4_hooks().unwrap();
+        ruleset
+    }
+
+    #[test]
+    fn xt_masquerade_requires_the_same_address_snapshot_as_native_masquerade() {
+        let mut xt_info = [0u8; 24];
+        xt_info[..4].copy_from_slice(&1u32.to_ne_bytes());
+        let xt_action = parse_xt_nat_target(2, b"MASQUERADE", 0, &xt_info).unwrap();
+        let xt = || NftExpression::XtNatTarget {
+            name: b"MASQUERADE",
+            revision: 0,
+            info: xt_info.to_vec(),
+            action: xt_action,
+        };
+        let xt_ruleset = postrouting_nat_snapshot(xt(), true);
+        assert!(xt_ruleset.requires_masquerade(IpVersion::Ipv4, NftIpv4Hook::PostRouting));
+        assert!(!xt_ruleset.requires_masquerade(IpVersion::Ipv6, NftIpv4Hook::PostRouting));
+        assert!(!xt_ruleset.requires_masquerade(IpVersion::Ipv4, NftIpv4Hook::PreRouting));
+
+        let native = postrouting_nat_snapshot(
+            NftExpression::Masquerade {
+                port_min: None,
+                port_max: None,
+            },
+            true,
+        );
+        assert!(native.requires_masquerade(IpVersion::Ipv4, NftIpv4Hook::PostRouting));
+        assert!(!postrouting_nat_snapshot(xt(), false)
+            .requires_masquerade(IpVersion::Ipv4, NftIpv4Hook::PostRouting));
+
+        let mut snat_info = [0u8; 24];
+        snat_info[..4].copy_from_slice(&1u32.to_ne_bytes());
+        snat_info[4..8].copy_from_slice(&1u32.to_ne_bytes());
+        snat_info[8..12].copy_from_slice(&[192, 0, 2, 1]);
+        snat_info[12..16].copy_from_slice(&[192, 0, 2, 1]);
+        let snat = NftExpression::XtNatTarget {
+            name: b"SNAT",
+            revision: 0,
+            info: snat_info.to_vec(),
+            action: parse_xt_nat_target(2, b"SNAT", 0, &snat_info).unwrap(),
+        };
+        assert!(!postrouting_nat_snapshot(snat, true)
+            .requires_masquerade(IpVersion::Ipv4, NftIpv4Hook::PostRouting));
+    }
+
+    #[test]
+    fn xt_masquerade_in_a_jumped_chain_still_requires_address_snapshot() {
+        let mut info = [0u8; 24];
+        info[..4].copy_from_slice(&1u32.to_ne_bytes());
+        let mut table = table_with_chain(2, 1, 100, 1, NftVerdict::Accept, None);
+        let inner = Arc::get_mut(&mut table).unwrap();
+        inner.name = b"nat".to_vec();
+        let base = Arc::get_mut(&mut inner.chains[0]).unwrap();
+        base.base.as_mut().unwrap().chain_type = NftChainType::Nat;
+        base.base.as_mut().unwrap().hook = NftIpv4Hook::PostRouting;
+        base.rules.push(Arc::new(NftRule {
+            handle: 2,
+            expressions: alloc::vec![NftExpression::Immediate(NftRuleVerdict::Jump(3))],
+        }));
+        inner.chains.push(Arc::new(NftChain {
+            name: b"masq".to_vec(),
+            handle: 3,
+            base: None,
+            rules: alloc::vec![Arc::new(NftRule {
+                handle: 4,
+                expressions: alloc::vec![NftExpression::XtNatTarget {
+                    name: b"MASQUERADE",
+                    revision: 0,
+                    info: info.to_vec(),
+                    action: parse_xt_nat_target(2, b"MASQUERADE", 0, &info).unwrap(),
+                }],
+            })],
+        }));
+        assert!(table.validate_reachable_chains().is_ok());
+        let mut ruleset = snapshot(alloc::vec![table]);
+        ruleset.nat_outer_hook_order[0] = Some(1);
+        ruleset.compile_ipv4_hooks().unwrap();
+        assert!(ruleset.requires_masquerade(IpVersion::Ipv4, NftIpv4Hook::PostRouting));
+    }
+
     #[test]
     fn tracking_registration_keeps_local_output_on_filtered_path() {
         let mut ruleset = snapshot(Vec::new());
@@ -986,7 +1081,14 @@ impl RulesetSnapshot {
                 table.chains.iter().any(|chain| {
                     chain.rules.iter().any(|rule| {
                         rule.expressions.iter().any(|expression| {
-                            matches!(expression, NftExpression::Masquerade { .. })
+                            matches!(
+                                expression,
+                                NftExpression::Masquerade { .. }
+                                    | NftExpression::XtNatTarget {
+                                        action: NftNatAction::Masquerade { .. },
+                                        ..
+                                    }
+                            )
                         })
                     })
                 })

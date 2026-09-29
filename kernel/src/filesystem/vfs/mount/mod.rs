@@ -5415,17 +5415,17 @@ impl MountFSInode {
         }
     }
 
-    pub(super) fn do_parent(&self) -> Result<Arc<MountFSInode>, SystemError> {
+    /// Find the dentry whose name is visible after crossing stacked mount roots.
+    ///
+    /// Path rendering and `..` must cross the same mount-root chain before
+    /// choosing a dentry name or parent. Keep this iterative because mount
+    /// propagation can build deep stacks.
+    fn visible_mountpoint(&self) -> Result<Arc<MountFSInode>, SystemError> {
         // A propagation transaction can construct a very deep stack of mounts.
-        // Resolve `..` iteratively so a userspace directory walk cannot consume
-        // one kernel stack frame per mount layer.
         let mut current = self.self_ref.upgrade().unwrap();
         let mut fast = Some(current.clone());
         loop {
             if current.is_mountpoint_root()? {
-                // Linux crosses from a mounted root to the parent of the mount
-                // point. The mount point may itself be another mounted root, so
-                // keep walking until a real dentry parent is reached.
                 let Some(mountpoint) = current.mount_fs.self_mountpoint() else {
                     return Ok(current);
                 };
@@ -5453,12 +5453,19 @@ impl MountFSInode {
                 }
                 continue;
             }
+            return Ok(current);
+        }
+    }
 
-            let parent = current.dentry.state.lock().parent.clone();
-            return match parent {
-                Some(parent) => current.mount_fs.wrapper_for_dentry(parent),
-                None => Ok(current),
-            };
+    pub(super) fn do_parent(&self) -> Result<Arc<MountFSInode>, SystemError> {
+        let current = self.visible_mountpoint()?;
+        if current.is_mountpoint_root()? {
+            return Ok(current);
+        }
+        let parent = current.dentry.state.lock().parent.clone();
+        match parent {
+            Some(parent) => current.mount_fs.wrapper_for_dentry(parent),
+            None => Ok(current),
         }
     }
 
@@ -5607,6 +5614,10 @@ impl MountFSInode {
         // Note: different filesystems may have independent inode_id spaces, so “global root inode_id” cannot be used as a termination condition.
         // The correct approach is to walk up the mount tree until reaching the “namespace root” (i.e., the rootfs mount where self_mountpoint is None).
         loop {
+            // Linux d_path crosses mount roots before emitting a dentry name.
+            // A mount stacked on the namespace root must stop at that root,
+            // not append its (empty) name as another path component.
+            current = current.visible_mountpoint()?;
             // Reached the current namespace root: stop.
             if current.is_mountpoint_root()?
                 && current.mount_fs.namespace().is_some_and(|ns| {
@@ -6470,18 +6481,11 @@ impl IndexNode for MountFSInode {
     /// DName should be introduced wherever possible;
     /// by default, performance is very poor!
     fn dname(&self) -> Result<DName, SystemError> {
-        if self.is_mountpoint_root()? {
-            if let Some(inode) = self.mount_fs.self_mountpoint() {
-                if let Some(name) = inode.dentry.state.lock().name.clone() {
-                    return Ok(name);
-                }
-                return inode.dentry.inode.dname();
-            }
-        }
-        if let Some(name) = self.dentry.state.lock().name.clone() {
+        let visible = self.visible_mountpoint()?;
+        if let Some(name) = visible.dentry.state.lock().name.clone() {
             return Ok(name);
         }
-        return self.dentry.inode.dname();
+        visible.dentry.inode.dname()
     }
 
     fn parent(&self) -> Result<Arc<dyn IndexNode>, SystemError> {

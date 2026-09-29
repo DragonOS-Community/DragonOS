@@ -23,7 +23,6 @@ pub(crate) fn do_get_link(
     let dump_all = matches!(filter_by, FilterBy::Dump);
 
     if !dump_all && responce.is_empty() {
-        log::error!("no such device");
         return Err(SystemError::ENODEV);
     }
 

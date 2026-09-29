@@ -13,7 +13,6 @@ use core::{
     fmt::{Debug, Formatter},
     ops::{Index, IndexMut},
 };
-use log::info;
 use system_error::SystemError;
 
 /// The array map type is a generic map type with no restrictions on the structure of the value.
@@ -150,7 +149,6 @@ impl BpfMapCommonOps for ArrayMap {
     }
 
     fn freeze(&self) -> Result<()> {
-        info!("fake freeze done for ArrayMap");
         Ok(())
     }
     fn first_value_ptr(&self) -> Result<*const u8> {

@@ -107,8 +107,6 @@ impl BridgeDriver {
             device.clone(),
             &self.self_ref.upgrade().unwrap(),
         );
-        log::info!("Adding port with id: {}", port.id);
-
         self.inner.lock().add_port(port.id, port.clone())?;
         device.set_common_bridge_data(&port);
         self.update_carrier_from_ports();

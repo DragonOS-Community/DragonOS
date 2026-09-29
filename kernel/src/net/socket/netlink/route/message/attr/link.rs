@@ -209,7 +209,6 @@ impl Attribute for LinkAttr {
     fn type_(&self) -> u16 {
         match self {
             Self::Unsupported(kind, _) => *kind,
-            Self::LinkInfo(_) => self.class() as u16 | (1 << 15),
             _ => self.class() as u16,
         }
     }

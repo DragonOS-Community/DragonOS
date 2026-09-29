@@ -110,6 +110,7 @@ struct LinkState {
     uint32_t mtu = 0;
     uint32_t tx_queue_len = 0;
     std::string kind;
+    uint16_t linkinfo_type = 0;
 };
 
 std::optional<LinkState> QueryLinkRequest(int fd, LinkRequest& request, uint32_t seq) {
@@ -142,6 +143,7 @@ std::optional<LinkState> QueryLinkRequest(int fd, LinkRequest& request, uint32_t
                            RTA_PAYLOAD(attr) == sizeof(uint32_t)) {
                     std::memcpy(&state.tx_queue_len, RTA_DATA(attr), sizeof(uint32_t));
                 } else if ((attr->rta_type & NLA_TYPE_MASK) == IFLA_LINKINFO) {
+                    state.linkinfo_type = attr->rta_type;
                     int info_bytes = RTA_PAYLOAD(attr);
                     for (auto* info = reinterpret_cast<rtattr*>(RTA_DATA(attr));
                          RTA_OK(info, info_bytes); info = RTA_NEXT(info, info_bytes)) {
@@ -177,11 +179,12 @@ std::string UniqueName(const char* suffix) {
 }
 
 void AddKind(LinkRequest& request, const char* kind,
-             const std::vector<uint8_t>& data = {}) {
+             const std::vector<uint8_t>& data = {},
+             uint16_t linkinfo_type = IFLA_LINKINFO) {
     std::vector<uint8_t> info;
     AppendAttr(info, IFLA_INFO_KIND, kind, std::strlen(kind) + 1);
     if (!data.empty()) AppendAttr(info, IFLA_INFO_DATA, data.data(), data.size());
-    ASSERT_TRUE(request.add(IFLA_LINKINFO, info.data(), info.size()));
+    ASSERT_TRUE(request.add(linkinfo_type, info.data(), info.size()));
 }
 
 int DeleteByName(int fd, const std::string& name, uint32_t seq) {
@@ -252,9 +255,13 @@ TEST(RtnetlinkBridgeVethSemantics, NestedPeerNameMasterAndPairedDeletion) {
     const std::string peer = UniqueName("b");
     CleanupLinks cleanup {route.fd, bridge, first};
 
+    LinkRequest missing_bridge(RTM_GETLINK, 0, 4100);
+    ASSERT_TRUE(missing_bridge.name(bridge));
+    EXPECT_EQ(SendAck(route.fd, missing_bridge), ENODEV);
+
     LinkRequest create_bridge(RTM_NEWLINK, NLM_F_CREATE | NLM_F_EXCL, 4101);
     ASSERT_TRUE(create_bridge.name(bridge));
-    AddKind(create_bridge, "bridge");
+    AddKind(create_bridge, "bridge", {}, IFLA_LINKINFO | NLA_F_NESTED);
     // Docker 29 constructs LinkAttrs directly (without NewLinkAttrs), so
     // vishvananda/netlink sends the zero-valued TxQLen explicitly.
     const uint32_t zero_qlen = 0;
@@ -293,8 +300,10 @@ TEST(RtnetlinkBridgeVethSemantics, NestedPeerNameMasterAndPairedDeletion) {
     ASSERT_TRUE(first_state.has_value());
     ASSERT_TRUE(peer_state.has_value());
     EXPECT_EQ(bridge_state->kind, "bridge");
+    EXPECT_EQ(bridge_state->linkinfo_type, IFLA_LINKINFO);
     EXPECT_EQ(bridge_state->tx_queue_len, 0u);
     EXPECT_EQ(first_state->kind, "veth");
+    EXPECT_EQ(first_state->linkinfo_type, IFLA_LINKINFO);
     EXPECT_EQ(first_state->link, peer_index);
     EXPECT_EQ(first_state->mtu, first_mtu);
     EXPECT_EQ(peer_state->mtu, peer_mtu);

@@ -26,7 +26,7 @@ use alloc::vec::Vec;
 use core::any::Any;
 use core::fmt::Debug;
 use intertrait::CastFromSync;
-use log::{error, info};
+use log::error;
 use system_error::SystemError;
 
 #[derive(Debug)]
@@ -197,7 +197,6 @@ impl IndexNode for BpfMap {
 /// See https://ebpf-docs.dylanreimerink.nl/linux/syscall/BPF_MAP_CREATE/
 pub fn bpf_map_create(attr: &bpf_attr) -> Result<usize> {
     let map_meta = BpfMapMeta::try_from(attr)?;
-    info!("The map attr is {:#?}", map_meta);
     let map: Box<dyn BpfMapCommonOps> = match map_meta.map_type {
         bpf_map_type::BPF_MAP_TYPE_ARRAY => {
             let array_map = ArrayMap::new(&map_meta)?;
@@ -254,7 +253,6 @@ pub fn bpf_map_create(attr: &bpf_attr) -> Result<usize> {
     let fd = fd_table
         .alloc_fd(file, true, current.nofile_soft_limit())
         .map(|x| x as usize)?;
-    info!("create map with fd: [{}]", fd);
     Ok(fd)
 }
 
@@ -263,7 +261,6 @@ pub fn bpf_map_create(attr: &bpf_attr) -> Result<usize> {
 /// See https://ebpf-docs.dylanreimerink.nl/linux/syscall/BPF_MAP_UPDATE_ELEM/
 pub fn bpf_map_update_elem(attr: &bpf_attr) -> Result<usize> {
     let arg = BpfMapUpdateArg::from(attr);
-    info!("<bpf_map_update_elem>: {:#x?}", arg);
     let map = get_map_file(arg.map_fd as i32)?;
     let meta = &map.meta;
     let key_size = meta.key_size as usize;
@@ -275,14 +272,12 @@ pub fn bpf_map_update_elem(attr: &bpf_attr) -> Result<usize> {
     let key = key_buf.read_from_user(0)?;
     let value = value_buf.read_from_user(0)?;
     map.inner_map.lock().update_elem(key, value, arg.flags)?;
-    info!("bpf_map_update_elem ok");
     Ok(0)
 }
 
 pub fn bpf_map_freeze(attr: &bpf_attr) -> Result<usize> {
     let arg = BpfMapUpdateArg::from(attr);
     let map_fd = arg.map_fd;
-    info!("<bpf_map_freeze>: map_fd: {:}", map_fd);
     let map = get_map_file(map_fd as i32)?;
     map.inner_map.lock().freeze()?;
     Ok(0)

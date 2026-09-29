@@ -69,6 +69,8 @@ pub struct MtuBounds {
 pub(crate) struct AddressMetadata {
     pub cidr: smoltcp::wire::IpCidr,
     pub label: Option<CString>,
+    /// The explicit IPv4 IFA_BROADCAST value, independent of the CIDR-derived broadcast.
+    pub broadcast: Option<smoltcp::wire::Ipv4Address>,
 }
 
 /// Lossless route state accumulated while an interface is being constructed.
@@ -199,6 +201,7 @@ pub(crate) fn inject_owned_local_ip_packet_if_epoch<I: Iface + ?Sized>(
             LocalPacketOrigin::LocalOutput => IngressStage::LocalOutput,
             LocalPacketOrigin::LocalInputDone => IngressStage::LocalInputDone,
         },
+        broadcast,
         destination_mac: if broadcast {
             smoltcp::wire::EthernetAddress::BROADCAST
         } else {
@@ -376,10 +379,21 @@ pub trait Iface: crate::driver::base::device::Device {
             .try_reserve_exact(frame_capacity)
             .map_err(|_| RouteSendError::Failed(SystemError::ENOMEM))?;
         let frame_prepared = Cell::new(false);
-        let permanent_neighbor = self
-            .net_namespace()
-            .and_then(|netns| crate::net::neighbor::lookup(&netns, self.nic_id() as u32, *next_hop))
-            .map(smoltcp::wire::HardwareAddress::Ethernet);
+        let permanent_neighbor = match next_hop {
+            smoltcp::wire::IpAddress::Ipv4(address)
+                if self.common().has_explicit_ipv4_broadcast(*address) =>
+            {
+                Some(smoltcp::wire::HardwareAddress::Ethernet(
+                    smoltcp::wire::EthernetAddress::BROADCAST,
+                ))
+            }
+            _ => self
+                .net_namespace()
+                .and_then(|netns| {
+                    crate::net::neighbor::lookup(&netns, self.nic_id() as u32, *next_hop)
+                })
+                .map(smoltcp::wire::HardwareAddress::Ethernet),
+        };
 
         let dispatch = {
             let mut interface = self.smol_iface().lock();

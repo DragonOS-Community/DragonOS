@@ -40,6 +40,7 @@ pub(in crate::net) struct AddressMutationCommit {
 pub(crate) struct RemovedAddress {
     pub cidr: IpCidr,
     pub label: CString,
+    pub broadcast: Option<Ipv4Address>,
 }
 
 pub(in crate::net) struct PreparedMtuAddressChange {
@@ -102,7 +103,7 @@ pub(in crate::net) fn mutate_address(
     iface: &Arc<dyn Iface>,
     mutation: AddressMutation,
 ) -> Result<AddressMutationCommit, SystemError> {
-    commit_published(rtnl, iface, CommitMutation::Plain(mutation), None)
+    commit_published(rtnl, iface, CommitMutation::Plain(mutation), None, None)
 }
 
 pub(in crate::net) fn mutate_labeled_address(
@@ -110,8 +111,28 @@ pub(in crate::net) fn mutate_labeled_address(
     iface: &Arc<dyn Iface>,
     mutation: AddressMutation,
     label: Option<CString>,
+    broadcast: Option<Ipv4Address>,
 ) -> Result<AddressMutationCommit, SystemError> {
-    commit_published(rtnl, iface, CommitMutation::Plain(mutation), label)
+    commit_published(
+        rtnl,
+        iface,
+        CommitMutation::Plain(mutation),
+        label,
+        broadcast,
+    )
+}
+
+pub(in crate::net) fn address_broadcast(
+    iface: &Arc<dyn Iface>,
+    cidr: IpCidr,
+) -> Option<Ipv4Address> {
+    iface
+        .common()
+        .address_metadata()
+        .lock()
+        .iter()
+        .find(|entry| entry.cidr == cidr)
+        .and_then(|entry| entry.broadcast)
 }
 
 pub(in crate::net) fn address_label(
@@ -132,7 +153,7 @@ pub(in crate::net) fn address_label(
 
 pub(in crate::net) fn address_snapshot(
     iface: &Arc<dyn Iface>,
-) -> Result<Vec<(IpCidr, CString)>, SystemError> {
+) -> Result<Vec<(IpCidr, CString, Option<Ipv4Address>)>, SystemError> {
     let smol_iface = iface.smol_iface().lock();
     let metadata = iface.common().address_metadata().lock();
     let default_label = CString::new(iface.iface_name()).map_err(|_| SystemError::EINVAL)?;
@@ -140,12 +161,11 @@ pub(in crate::net) fn address_snapshot(
         .ip_addrs()
         .iter()
         .map(|cidr| {
-            let label = metadata
-                .iter()
-                .find(|entry| entry.cidr == *cidr)
+            let entry = metadata.iter().find(|entry| entry.cidr == *cidr);
+            let label = entry
                 .and_then(|entry| entry.label.clone())
                 .unwrap_or_else(|| default_label.clone());
-            Ok((*cidr, label))
+            Ok((*cidr, label, entry.and_then(|entry| entry.broadcast)))
         })
         .collect()
 }
@@ -296,17 +316,22 @@ pub(in crate::net) fn prepare_mtu_address_change(
         }
         after.remove(index);
         deleted_addresses.push(cidr.address());
-        let label =
+        let (label, broadcast) =
             if let Some(metadata_index) = metadata.iter().position(|entry| entry.cidr == cidr) {
                 let entry = metadata.remove(metadata_index);
-                match entry.label {
+                let label = match entry.label {
                     Some(label) => label,
                     None => try_clone_cstring(&default_label)?,
-                }
+                };
+                (label, entry.broadcast)
             } else {
-                try_clone_cstring(&default_label)?
+                (try_clone_cstring(&default_label)?, None)
             };
-        removed.push(RemovedAddress { cidr, label });
+        removed.push(RemovedAddress {
+            cidr,
+            label,
+            broadcast,
+        });
     }
 
     let (metadata, renamed_ipv4) = if let Some(new_name) = renamed_to {
@@ -421,6 +446,7 @@ pub(crate) fn initialize_address(iface: &Arc<dyn Iface>, cidr: IpCidr) -> Result
             iface,
             CommitMutation::Plain(AddressMutation::Add(cidr)),
             None,
+            None,
         )
         .map(|_| ())
     })
@@ -430,6 +456,7 @@ fn commit_unpublished(
     iface: &Arc<dyn Iface>,
     mutation: CommitMutation,
     requested_label: Option<CString>,
+    requested_broadcast: Option<Ipv4Address>,
 ) -> Result<AddressMutationOutcome, SystemError> {
     validate_mutation(mutation)?;
 
@@ -460,6 +487,7 @@ fn commit_unpublished(
             metadata.push(AddressMetadata {
                 cidr,
                 label: requested_label,
+                broadcast: requested_broadcast,
             });
             outcome
         }
@@ -474,6 +502,7 @@ fn commit_unpublished(
                 metadata.push(AddressMetadata {
                     cidr,
                     label: requested_label,
+                    broadcast: requested_broadcast,
                 });
             }
             outcome
@@ -491,6 +520,7 @@ fn commit_published(
     iface: &Arc<dyn Iface>,
     mutation: CommitMutation,
     requested_label: Option<CString>,
+    requested_broadcast: Option<Ipv4Address>,
 ) -> Result<AddressMutationCommit, SystemError> {
     validate_mutation(mutation)?;
     let netns = iface.net_namespace().ok_or(SystemError::ENODEV)?;
@@ -510,6 +540,7 @@ fn commit_published(
             metadata.push(AddressMetadata {
                 cidr,
                 label: requested_label,
+                broadcast: requested_broadcast,
             });
             AddressMutationOutcome::Added(cidr)
         }
@@ -528,6 +559,7 @@ fn commit_published(
                 metadata.push(AddressMetadata {
                     cidr,
                     label: requested_label,
+                    broadcast: requested_broadcast,
                 });
                 AddressMutationOutcome::Added(cidr)
             }
@@ -602,6 +634,7 @@ fn try_clone_metadata(
         result.push(AddressMetadata {
             cidr: entry.cidr,
             label,
+            broadcast: entry.broadcast,
         });
     }
     Ok(result)
@@ -737,6 +770,7 @@ pub(crate) fn iface_accepts_broadcast_address(iface: &Arc<dyn Iface>, address: I
         return false;
     };
     address.is_broadcast()
+        || iface.common().has_explicit_ipv4_broadcast(address)
         || iface.common().ip_addrs().iter().any(|cidr| match cidr {
             IpCidr::Ipv4(cidr) => cidr
                 .broadcast()
@@ -754,6 +788,20 @@ pub(crate) fn netns_accepts_broadcast_address(
             .device_list()
             .values()
             .any(|iface| iface_accepts_broadcast_address(iface, address))
+}
+
+/// Whether any interface in this namespace needs the IPv4 FIB to classify
+/// explicit broadcasts on ingress. A frame may arrive on a different device
+/// from the broadcast route's owner (Linux weak-host local delivery).
+pub(crate) fn configured_ipv4_broadcast_count(metadata: &[AddressMetadata]) -> usize {
+    metadata
+        .iter()
+        .filter(|entry| {
+            entry
+                .broadcast
+                .is_some_and(|address| !address.is_unspecified() && !address.is_broadcast())
+        })
+        .count()
 }
 
 fn iface_accepts_local_address_from(

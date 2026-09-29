@@ -310,6 +310,20 @@ pub(crate) fn get_iface_for_local_bind(
             .or_else(|| device_list.values().next().cloned());
     }
 
+    // A configured IPv4 broadcast may have an ordinary host-shaped address.
+    // Its local-table route, not its octets, identifies the receiving stack.
+    if matches!(ip_addr, smoltcp::wire::IpAddress::Ipv4(_)) {
+        if let Some(route) = crate::net::route::lookup(netns, *ip_addr)
+            .filter(|route| route.matched.kind == crate::net::route::RTN_BROADCAST)
+        {
+            if let Some(iface) = netns.device_list().get(&(route.oif as usize)).cloned() {
+                if crate::net::address::iface_accepts_broadcast_address(&iface, *ip_addr) {
+                    return Some(iface);
+                }
+            }
+        }
+    }
+
     if let Some(iface) = crate::net::route::local_address_owner(netns, *ip_addr) {
         return Some(iface);
     }

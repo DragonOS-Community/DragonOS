@@ -71,6 +71,7 @@ pub(super) struct LocalInputDevice<'a, D: SmolDevice + ?Sized> {
     pub(super) common: &'a IfaceCommon,
     pub(super) backend_policy: OutputBackendPolicy<'a>,
     pub(super) stage_cell: Option<&'a Cell<IngressStage>>,
+    pub(super) broadcast_cell: Option<&'a Cell<bool>>,
     pub(super) ct_context_cell:
         Option<&'a core::cell::RefCell<Option<crate::net::conntrack::CtPacketContext>>>,
     pub(super) mark_cell: Option<&'a Cell<u32>>,
@@ -1542,6 +1543,7 @@ impl<'a, D: SmolDevice + ?Sized> LocalInputDevice<'a, D> {
         common: &'a IfaceCommon,
         backend_policy: OutputBackendPolicy<'a>,
         stage_cell: Option<&'a Cell<IngressStage>>,
+        broadcast_cell: Option<&'a Cell<bool>>,
         ct_context_cell: Option<
             &'a core::cell::RefCell<Option<crate::net::conntrack::CtPacketContext>>,
         >,
@@ -1552,6 +1554,7 @@ impl<'a, D: SmolDevice + ?Sized> LocalInputDevice<'a, D> {
             common,
             backend_policy,
             stage_cell,
+            broadcast_cell,
             ct_context_cell,
             mark_cell,
         }
@@ -1630,6 +1633,7 @@ impl<D: SmolDevice + ?Sized> SmolDevice for LocalInputDevice<'_, D> {
         let mut packet = self.common.local_input_queue.pop()?;
         let ingress_ifindex = packet.ingress_ifindex;
         let ingress_stage = packet.ingress_stage;
+        let broadcast = packet.broadcast;
         let ct_context = packet.ct_context.take();
         let mark = packet.mark;
         let frame = packet.into_frame(self.device.capabilities().medium).ok()?;
@@ -1641,6 +1645,8 @@ impl<D: SmolDevice + ?Sized> SmolDevice for LocalInputDevice<'_, D> {
                 meta,
                 ingress_stage,
                 stage_cell: self.stage_cell,
+                broadcast,
+                broadcast_cell: self.broadcast_cell,
                 ct_context,
                 ct_context_cell: self.ct_context_cell,
                 mark,

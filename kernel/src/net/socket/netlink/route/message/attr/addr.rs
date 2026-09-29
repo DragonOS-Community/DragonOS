@@ -48,6 +48,8 @@ pub enum AddrAttr {
     /// Raw IFA_LABEL payload. Validation is address-family specific: IPv4
     /// uses NLA_STRING(IFNAMSIZ - 1), while Linux ignores it for IPv6.
     Label(Vec<u8>),
+    /// Raw payload: IPv4 and IPv6 apply different policies to this attribute.
+    Broadcast(Vec<u8>),
 }
 
 impl AddrAttr {
@@ -56,6 +58,7 @@ impl AddrAttr {
             AddrAttr::Address(_) => AddrAttrClass::ADDRESS,
             AddrAttr::Local(_) => AddrAttrClass::LOCAL,
             AddrAttr::Label(_) => AddrAttrClass::LABEL,
+            AddrAttr::Broadcast(_) => AddrAttrClass::BROADCAST,
         }
     }
 }
@@ -70,6 +73,7 @@ impl Attribute for AddrAttr {
             AddrAttr::Address(addr) => addr.as_ref(),
             AddrAttr::Local(addr) => addr.as_ref(),
             AddrAttr::Label(label) => label.as_slice(),
+            AddrAttr::Broadcast(value) => value.as_slice(),
         }
     }
 
@@ -103,6 +107,7 @@ impl Attribute for AddrAttr {
                 AddrAttr::Local(addr)
             }
             (AddrAttrClass::LABEL, _) => AddrAttr::Label(buf.to_vec()),
+            (AddrAttrClass::BROADCAST, _) => AddrAttr::Broadcast(buf.to_vec()),
             (AddrAttrClass::ADDRESS | AddrAttrClass::LOCAL, _) => {
                 log::warn!(
                     "address attribute `{:?}` contains invalid payload",

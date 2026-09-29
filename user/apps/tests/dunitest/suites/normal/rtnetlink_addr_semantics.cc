@@ -70,6 +70,8 @@ struct DumpedAddress {
     uint32_t ifindex = 0;
     bool has_label = false;
     std::string label;
+    bool has_broadcast = false;
+    uint32_t broadcast = 0;
 };
 
 struct RouteSpec {
@@ -83,6 +85,8 @@ struct DumpedRoute {
     uint8_t prefix_len = 0;
     uint32_t ifindex = 0;
     bool has_gateway = false;
+    uint8_t kind = 0;
+    uint32_t table = 0;
 };
 
 struct ChildOutcome {
@@ -240,7 +244,8 @@ std::optional<bool> LinkIsUp(const char* name) {
 int ChangeAddress(int fd, uint16_t type, uint16_t flags, const AddressSpec& address,
                   bool include_local, bool include_address, uint32_t sequence,
                   const char* label = nullptr,
-                  std::optional<size_t> label_length = std::nullopt) {
+                  std::optional<size_t> label_length = std::nullopt,
+                  const std::vector<uint8_t>* broadcast = nullptr) {
     auto request = NewRequest<ifaddrmsg>(type, flags, sequence);
     auto* message = reinterpret_cast<ifaddrmsg*>(NLMSG_DATA(request.data()));
     message->ifa_family = address.family;
@@ -256,6 +261,9 @@ int ChangeAddress(int fd, uint16_t type, uint16_t flags, const AddressSpec& addr
     }
     if (label != nullptr) {
         AddAttr(&request, IFA_LABEL, label, label_length.value_or(std::strlen(label) + 1));
+    }
+    if (broadcast != nullptr) {
+        AddAttr(&request, IFA_BROADCAST, broadcast->data(), broadcast->size());
     }
     return SendAndReceiveAck(fd, request);
 }
@@ -317,6 +325,11 @@ int DumpAddresses(int fd, int family, uint32_t sequence, std::vector<DumpedAddre
                     }
                     continue;
                 }
+                if (attr->rta_type == IFA_BROADCAST && RTA_PAYLOAD(attr) >= 4) {
+                    address.has_broadcast = true;
+                    std::memcpy(&address.broadcast, RTA_DATA(attr), 4);
+                    continue;
+                }
                 if ((attr->rta_type != IFA_LOCAL && attr->rta_type != IFA_ADDRESS) ||
                     RTA_PAYLOAD(attr) < address.local.length) {
                     continue;
@@ -367,6 +380,8 @@ int DumpRoutes(int fd, uint32_t sequence, std::vector<DumpedRoute>* result) {
             if (message->rtm_family != AF_INET) continue;
             DumpedRoute route{};
             route.prefix_len = message->rtm_dst_len;
+            route.kind = message->rtm_type;
+            route.table = message->rtm_table;
             int attr_length = RTM_PAYLOAD(header);
             for (auto* attr = RTM_RTA(message); RTA_OK(attr, attr_length);
                  attr = RTA_NEXT(attr, attr_length)) {
@@ -436,6 +451,60 @@ int CountRoute(int fd, const RouteSpec& expected, uint32_t sequence) {
         }
     }
     return count;
+}
+
+bool NotificationMatchesAddress(const nlmsghdr* header, uint16_t type,
+                                const AddressSpec& expected, const char* label,
+                                bool require_label_absent);
+
+int CountExplicitBroadcast(int fd, const AddressSpec& expected, uint32_t broadcast,
+                           uint32_t sequence) {
+    std::vector<DumpedAddress> addresses;
+    if (const int error = DumpAddresses(fd, AF_INET, sequence, &addresses); error != 0) {
+        return -error;
+    }
+    return static_cast<int>(std::count_if(addresses.begin(), addresses.end(), [&](const auto& item) {
+        return item.family == AF_INET && item.ifindex == expected.ifindex &&
+               SameAddress(item.local, expected.local) && item.has_broadcast &&
+               item.broadcast == broadcast;
+    }));
+}
+
+int CountBroadcastRoute(int fd, uint32_t ifindex, uint32_t broadcast, uint32_t sequence) {
+    std::vector<DumpedRoute> routes;
+    if (const int error = DumpRoutes(fd, sequence, &routes); error != 0) return -error;
+    return static_cast<int>(std::count_if(routes.begin(), routes.end(), [&](const auto& item) {
+        return item.ifindex == ifindex && item.destination == broadcast &&
+               item.prefix_len == 32 && item.kind == RTN_BROADCAST &&
+               item.table == RT_TABLE_LOCAL;
+    }));
+}
+
+int CountBroadcastNotification(int fd, uint16_t type, const AddressSpec& expected,
+                               uint32_t broadcast) {
+    std::array<uint8_t, 16384> buffer{};
+    int count = 0;
+    for (;;) {
+        pollfd descriptor{fd, POLLIN, 0};
+        const int polled = poll(&descriptor, 1, 100);
+        if (polled <= 0) return polled < 0 ? -errno : count;
+        const ssize_t received = recv(fd, buffer.data(), buffer.size(), MSG_DONTWAIT);
+        if (received <= 0) return count;
+        int remaining = static_cast<int>(received);
+        for (auto* header = reinterpret_cast<nlmsghdr*>(buffer.data());
+             NLMSG_OK(header, remaining); header = NLMSG_NEXT(header, remaining)) {
+            if (!NotificationMatchesAddress(header, type, expected, nullptr, false)) continue;
+            const auto* message = reinterpret_cast<const ifaddrmsg*>(NLMSG_DATA(header));
+            int attr_length = IFA_PAYLOAD(header);
+            for (auto* attr = IFA_RTA(message); RTA_OK(attr, attr_length);
+                 attr = RTA_NEXT(attr, attr_length)) {
+                if (attr->rta_type == IFA_BROADCAST && RTA_PAYLOAD(attr) >= 4 &&
+                    std::memcmp(RTA_DATA(attr), &broadcast, 4) == 0) {
+                    ++count;
+                }
+            }
+        }
+    }
 }
 
 bool NotificationMatchesAddress(const nlmsghdr* header, uint16_t type,
@@ -1254,6 +1323,84 @@ int RunSharedAddressAndExplicitRouteProjection() {
     return 0;
 }
 
+int RunExplicitIpv4Broadcast() {
+    FdGuard fd;
+    uint32_t ifindex = 0;
+    uint32_t sequence = 15000;
+    if (const int error = PrepareNamespace(&fd, &ifindex, &sequence); error != 0) return error;
+    FdGuard notifications(OpenRouteSocket(RTMGRP_IPV4_IFADDR));
+    if (notifications.Get() < 0) return 100 + errno;
+
+    const auto address = MakeAddress(AF_INET, "198.51.100.10", 24, ifindex);
+    const auto other = MakeAddress(AF_INET, "203.0.113.10", 24, ifindex);
+    const auto ipv6 = MakeAddress(AF_INET6, "2001:db8:47::1", 64, ifindex);
+    const uint32_t explicit_broadcast = Ipv4("198.51.100.99");
+    const uint32_t natural_broadcast = Ipv4("198.51.100.255");
+    const uint32_t replacement = Ipv4("198.51.100.88");
+    const uint32_t other_broadcast = Ipv4("203.0.113.99");
+    std::vector<uint8_t> value(4);
+    std::memcpy(value.data(), &explicit_broadcast, 4);
+    const std::vector<uint8_t> too_short{1, 2, 3};
+    if (ChangeAddress(fd.Get(), RTM_NEWADDR, NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE,
+                      address, true, true, ++sequence, nullptr, std::nullopt, &too_short) !=
+            ERANGE ||
+        CountAddress(fd.Get(), address, ++sequence) != 0) {
+        return 200;
+    }
+    if (ChangeAddress(fd.Get(), RTM_NEWADDR, NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE,
+                      address, true, true, ++sequence, nullptr, std::nullopt, &value) != 0 ||
+        CountExplicitBroadcast(fd.Get(), address, explicit_broadcast, ++sequence) != 1 ||
+        CountBroadcastRoute(fd.Get(), ifindex, explicit_broadcast, ++sequence) != 1 ||
+        CountBroadcastRoute(fd.Get(), ifindex, natural_broadcast, ++sequence) != 1 ||
+        CountBroadcastNotification(notifications.Get(), RTM_NEWADDR, address,
+                                   explicit_broadcast) != 1) {
+        return 300;
+    }
+
+    std::memcpy(value.data(), &replacement, 4);
+    if (ChangeAddress(fd.Get(), RTM_NEWADDR, NLM_F_REQUEST | NLM_F_ACK | NLM_F_REPLACE,
+                      address, true, true, ++sequence, nullptr, std::nullopt, &value) != 0 ||
+        CountExplicitBroadcast(fd.Get(), address, explicit_broadcast, ++sequence) != 1 ||
+        CountBroadcastRoute(fd.Get(), ifindex, replacement, ++sequence) != 0) {
+        return 400;
+    }
+    DrainNotifications(notifications.Get());
+    if (ChangeAddress(fd.Get(), RTM_DELADDR, NLM_F_REQUEST | NLM_F_ACK,
+                      address, true, true, ++sequence, nullptr, std::nullopt, &too_short) !=
+            ERANGE ||
+        CountAddress(fd.Get(), address, ++sequence) != 1) {
+        return 500;
+    }
+    if (ChangeAddress(fd.Get(), RTM_DELADDR, NLM_F_REQUEST | NLM_F_ACK,
+                      address, true, true, ++sequence) != 0 ||
+        CountBroadcastNotification(notifications.Get(), RTM_DELADDR, address,
+                                   explicit_broadcast) != 1 ||
+        CountBroadcastRoute(fd.Get(), ifindex, explicit_broadcast, ++sequence) != 0) {
+        return 600;
+    }
+
+    std::vector<uint8_t> long_value(5);
+    std::memcpy(long_value.data(), &other_broadcast, 4);
+    long_value[4] = 0xa5;
+    if (ChangeAddress(fd.Get(), RTM_NEWADDR, NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE,
+                      other, true, true, ++sequence, nullptr, std::nullopt, &long_value) != 0 ||
+        CountExplicitBroadcast(fd.Get(), other, other_broadcast, ++sequence) != 1 ||
+        CountBroadcastRoute(fd.Get(), ifindex, other_broadcast, ++sequence) != 1 ||
+        ChangeAddress(fd.Get(), RTM_DELADDR, NLM_F_REQUEST | NLM_F_ACK,
+                      other, true, true, ++sequence, nullptr, std::nullopt, &long_value) != 0 ||
+        CountBroadcastRoute(fd.Get(), ifindex, other_broadcast, ++sequence) != 0) {
+        return 700;
+    }
+    if (ChangeAddress(fd.Get(), RTM_NEWADDR, NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE,
+                      ipv6, true, true, ++sequence, nullptr, std::nullopt, &too_short) != 0 ||
+        CountAddress(fd.Get(), ipv6, ++sequence) != 1 ||
+        ChangeAddress(fd.Get(), RTM_DELADDR, NLM_F_REQUEST | NLM_F_ACK,
+                      ipv6, true, true, ++sequence, nullptr, std::nullopt, &too_short) != 0) {
+        return 800;
+    }
+    return 0;
+}
+
 template <typename Function>
 ChildOutcome RunWithWatchdog(Function function) {
     int result_pipe[2];
@@ -1318,6 +1465,11 @@ void ExpectSuccessfulChild(const ChildOutcome& outcome, const char* timeout_mess
 TEST(RtnetlinkAddressSemantics, MultipleAddressesStayConsistentAcrossAddrRouteAndDataPlane) {
     ExpectSuccessfulChild(RunWithWatchdog(RunMultipleAddressConsistency),
                           "multi-address mutation or UDP data path deadlocked");
+}
+
+TEST(RtnetlinkAddressSemantics, ExplicitIpv4BroadcastMatchesLinuxAddressAndFibLifecycle) {
+    ExpectSuccessfulChild(RunWithWatchdog(RunExplicitIpv4Broadcast),
+                          "explicit IPv4 broadcast transaction deadlocked");
 }
 
 TEST(RtnetlinkAddressSemantics, DuplicateReplaceDeleteAndParserSemanticsMatchLinux) {

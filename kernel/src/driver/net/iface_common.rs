@@ -793,7 +793,11 @@ impl IfaceCommon {
                 || nft_ruleset.as_ref().is_some_and(|ruleset| {
                     ruleset.requires_route_lookup() || ruleset.has_output_hook()
                 });
-            let router = if needs_routed_poll {
+            // ARP ownership needs the namespace FIB even on an otherwise
+            // unfiltered Ethernet fast path. A read view alone must not
+            // switch IP output backends or local-input polling modes.
+            let needs_route_view = needs_routed_poll || self.type_ == InterfaceType::ETHER;
+            let router = if needs_route_view {
                 netns.as_ref().map(|netns| netns.router())
             } else {
                 None
@@ -810,7 +814,7 @@ impl IfaceCommon {
             {
                 return false;
             }
-            let routed_this_round = route_policy.is_some();
+            let routed_this_round = needs_routed_poll && route_policy.is_some();
             let owner_is_up = scope == IfacePollScope::Full;
 
             let Some(_poll_guard) = self.enter_poll_epoch(namespace_epoch) else {
@@ -853,16 +857,20 @@ impl IfaceCommon {
                 force_authoritative |= restart == PollModeRecheck::Authoritative;
                 continue;
             }
-            let backend_policy = route_policy.as_ref().map(|routes| OutputBackendPolicy {
-                netns: netns.as_deref().unwrap(),
-                routes,
-                ruleset: nft_ruleset.as_deref(),
-                device_names: &nft_device_names,
-                configured_neighbors: configured_neighbors.as_ref(),
-                owner_ifindex: self.iface_id as u32,
-                owner_is_up,
-                authoritative_output,
-            });
+            let backend_policy =
+                route_policy
+                    .as_ref()
+                    .filter(|_| routed_this_round)
+                    .map(|routes| OutputBackendPolicy {
+                        netns: netns.as_deref().unwrap(),
+                        routes,
+                        ruleset: nft_ruleset.as_deref(),
+                        device_names: &nft_device_names,
+                        configured_neighbors: configured_neighbors.as_ref(),
+                        owner_ifindex: self.iface_id as u32,
+                        owner_is_up,
+                        authoritative_output,
+                    });
 
             let ingress_stage = Cell::new(IngressStage::Pending);
             let handoff_broadcast = Cell::new(false);
@@ -1143,7 +1151,10 @@ impl IfaceCommon {
                 || nft_ruleset.as_ref().is_some_and(|ruleset| {
                     ruleset.requires_route_lookup() || ruleset.has_output_hook()
                 });
-            let router = if needs_routed_poll {
+            // Keep ARP address ownership independent of nft/conntrack and
+            // of the IP TX backend selected for this NAPI round.
+            let needs_route_view = needs_routed_poll || self.type_ == InterfaceType::ETHER;
+            let router = if needs_route_view {
                 netns.as_ref().map(|netns| netns.router())
             } else {
                 None
@@ -1160,7 +1171,7 @@ impl IfaceCommon {
             {
                 return napi::NapiPollResult::new(0, true);
             }
-            let routed_this_round = route_policy.is_some();
+            let routed_this_round = needs_routed_poll && route_policy.is_some();
             let owner_is_up = scope == IfacePollScope::Full;
 
             let Some(_poll_guard) = self.enter_poll_epoch(namespace_epoch) else {
@@ -1200,16 +1211,20 @@ impl IfaceCommon {
                 force_authoritative |= restart == PollModeRecheck::Authoritative;
                 continue;
             }
-            let backend_policy = route_policy.as_ref().map(|routes| OutputBackendPolicy {
-                netns: netns.as_deref().unwrap(),
-                routes,
-                ruleset: nft_ruleset.as_deref(),
-                device_names: &nft_device_names,
-                configured_neighbors: configured_neighbors.as_ref(),
-                owner_ifindex: self.iface_id as u32,
-                owner_is_up,
-                authoritative_output,
-            });
+            let backend_policy =
+                route_policy
+                    .as_ref()
+                    .filter(|_| routed_this_round)
+                    .map(|routes| OutputBackendPolicy {
+                        netns: netns.as_deref().unwrap(),
+                        routes,
+                        ruleset: nft_ruleset.as_deref(),
+                        device_names: &nft_device_names,
+                        configured_neighbors: configured_neighbors.as_ref(),
+                        owner_ifindex: self.iface_id as u32,
+                        owner_is_up,
+                        authoritative_output,
+                    });
 
             let mut ingress_work: Vec<RoutedIngressWork> = Vec::new();
             let (processed, had_packet, ingress_budget, poll_again, deadline_rearm) = {

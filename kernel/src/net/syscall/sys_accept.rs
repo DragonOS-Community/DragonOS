@@ -130,7 +130,7 @@ pub(crate) fn do_accept(
     let new_file = File::new_socket(new_socket, file_mode)?;
 
     if !addr.is_null() {
-        // 将对端地址写入用户空间。
+        // Copy the peer address into user space.
         //
         // Linux copies the peer address *before* installing the new descriptor
         // (`do_accept()` runs `move_addr_to_user()` before `fd_install()`).

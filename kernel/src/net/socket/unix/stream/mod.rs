@@ -424,16 +424,28 @@ impl UnixStreamSocket {
         result
     }
 
-    pub fn try_accept(&self) -> Result<(Arc<dyn Socket>, Endpoint), SystemError> {
-        match self.inner.write().as_mut().expect("inner is None") {
-            Inner::Listener(listener) => {
-                listener.try_accept(self.passcred.load(core::sync::atomic::Ordering::Relaxed)) as _
-            }
+    /// Attempt exactly one `accept(2)` without waiting.
+    ///
+    /// `nonblock` is the descriptor's non-blocking mode, sampled once by the
+    /// caller. It selects both whether [`Self::accept`] waits at all and the
+    /// error an empty queue reports (`EAGAIN` for `O_NONBLOCK`, `EINVAL` for a
+    /// latched receive shutdown, mirroring `__skb_recv_datagram()`), so it must
+    /// stay the same value across the whole call: re-reading it per attempt
+    /// could pair `EAGAIN` with a terminal `is_acceptable()` after another
+    /// thread flips the mode, and the retry loop would then spin without ever
+    /// sleeping.
+    fn try_accept_once(
+        &self,
+        passcred: bool,
+        nonblock: bool,
+    ) -> Result<(Arc<dyn Socket>, Endpoint), SystemError> {
+        self.map_inner_mut(Err(SystemError::EINVAL), |inner| match inner {
+            Inner::Listener(listener) => listener.try_accept(passcred, nonblock),
             _ => {
                 log::error!("the socket is not listening");
-                return Err(SystemError::EINVAL);
+                Err(SystemError::EINVAL)
             }
-        }
+        })
     }
 
     fn is_nonblocking(&self) -> bool {
@@ -455,6 +467,15 @@ impl UnixStreamSocket {
     fn map_inner<R>(&self, when_closed: R, f: impl FnOnce(&Inner) -> R) -> R {
         let guard = self.inner.read();
         match guard.as_ref() {
+            Some(inner) => f(inner),
+            None => when_closed,
+        }
+    }
+
+    /// `map_inner` for the read-modify-write state transitions.
+    fn map_inner_mut<R>(&self, when_closed: R, f: impl FnOnce(&mut Inner) -> R) -> R {
+        let mut guard = self.inner.write();
+        match guard.as_mut() {
             Some(inner) => f(inner),
             None => when_closed,
         }
@@ -767,17 +788,22 @@ impl Socket for UnixStreamSocket {
     }
 
     fn accept(&self) -> Result<(Arc<dyn Socket>, Endpoint), SystemError> {
-        // debug!("stream server begin accept");
-        if self.is_nonblocking() {
-            self.try_accept()
-        } else {
-            loop {
-                match self.try_accept() {
-                    Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
-                        wq_wait_event_interruptible!(self.wait_queue, self.is_acceptable(), {})?
-                    }
-                    result => break result,
+        // Sample the descriptor's non-blocking mode once and use that same
+        // value for every attempt, like Linux `__sys_accept4_file()` does with
+        // `sock->file->f_flags`; see `try_accept_once()`.
+        let passcred = self.passcred.load(core::sync::atomic::Ordering::Relaxed);
+        let nonblock = self.is_nonblocking();
+
+        if nonblock {
+            return self.try_accept_once(passcred, nonblock);
+        }
+
+        loop {
+            match self.try_accept_once(passcred, nonblock) {
+                Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
+                    wq_wait_event_interruptible!(self.wait_queue, self.is_acceptable(), {})?
                 }
+                result => break result,
             }
         }
     }
@@ -1707,23 +1733,46 @@ impl Socket for UnixStreamSocket {
         Ok(())
     }
 
-    fn shutdown(&self, _how: common::ShutdownBit) -> Result<(), SystemError> {
+    fn shutdown(&self, how: common::ShutdownBit) -> Result<(), SystemError> {
         let inner_guard = self.inner.read();
         let Some(inner) = inner_guard.as_ref() else {
             return Err(SystemError::EINVAL);
         };
 
+        if let Inner::Listener(listener) = inner {
+            // Linux `unix_shutdown()` (`net/unix/af_unix.c`) does not
+            // look at the connection state: it latches `sk_shutdown` and wakes
+            // the socket's own `sk_sleep`. That is precisely what makes
+            // `shutdown(listener, SHUT_RD)` the legal release for a blocked
+            // `accept()`; `close()` deliberately does not (see `do_close()` and
+            // `unix_release_sock()`), matching Linux.
+            listener.set_shutdown(how);
+            drop(inner_guard);
+
+            // Wake local accept/poll waiters with the inner lock released: a
+            // waiter re-reads `inner`, and a pending writer would otherwise keep
+            // this reader blocked (`rwsem.rs`).
+            self.wait_queue
+                .wakeup_all(Some(crate::process::ProcessState::Blocked(true)));
+            let _ = EventPoll::wakeup_epoll(self.epoll_items().as_ref(), self.check_io_event());
+            return Ok(());
+        }
+
         let Inner::Connected(connected) = inner else {
+            // Known deviation, kept deliberately: Linux returns 0 for any socket,
+            // but unconnected sockets retain DragonOS's historical ENOTCONN. Only
+            // the listener path is needed for the blocked-accept contract, and
+            // widening it would touch unrelated behaviour (see the PR notes).
             return Err(SystemError::ENOTCONN);
         };
 
         // For a connected unix socket, shutdown updates per-direction state:
         // - SHUT_RD: mark incoming direction as recv-shutdown (peer writes -> EPIPE)
         // - SHUT_WR: mark outgoing direction as send-shutdown (our writes -> EPIPE, peer reads -> EOF when drained)
-        if _how.is_recv_shutdown() {
+        if how.is_recv_shutdown() {
             connected.shutdown_recv();
         }
-        if _how.is_send_shutdown() {
+        if how.is_send_shutdown() {
             connected.shutdown_send();
         }
 
@@ -1746,9 +1795,9 @@ impl Socket for UnixStreamSocket {
             peer.wait_queue
                 .wakeup(Some(crate::process::ProcessState::Blocked(true)));
             let _ = EventPoll::wakeup_epoll(peer.epoll_items().as_ref(), peer.check_io_event());
-            if _how.is_both_shutdown() {
+            if how.is_both_shutdown() {
                 peer.fasync_items.send_sigio(FASYNC_POLL_HUP);
-            } else if _how.is_send_shutdown() {
+            } else if how.is_send_shutdown() {
                 peer.fasync_items.send_sigio(FASYNC_POLL_IN);
             }
         }

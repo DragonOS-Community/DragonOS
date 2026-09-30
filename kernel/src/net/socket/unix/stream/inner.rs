@@ -3,6 +3,7 @@ use crate::filesystem::vfs::file::File;
 use crate::libs::mutex::Mutex;
 use crate::libs::rwsem::RwSem;
 use crate::libs::wait_queue::WaitQueue;
+use crate::net::socket::common::ShutdownBit;
 use crate::net::socket::endpoint::Endpoint;
 use crate::net::socket::unix::ring_buffer::{RbConsumer, RbProducer, RingBuffer};
 use crate::net::socket::unix::stream::UnixStreamSocket;
@@ -17,7 +18,7 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::mem::size_of;
 use core::num::Wrapping;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use log::debug;
 use system_error::SystemError;
 
@@ -602,12 +603,10 @@ impl Connected {
         let mut events = EPollEventType::empty();
 
         let reader = self.reader.lock();
+        let has_data = !reader.is_empty();
         let recv_shutdown = reader.is_read_shutdown();
-        if !reader.is_empty() || recv_shutdown {
+        if has_data {
             events |= EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM;
-        }
-        if recv_shutdown {
-            events |= EPollEventType::EPOLLRDHUP;
         }
         drop(reader);
 
@@ -618,9 +617,10 @@ impl Connected {
                 | EPollEventType::EPOLLWRNORM
                 | EPollEventType::EPOLLWRBAND;
         }
-        if recv_shutdown && send_shutdown {
-            events |= EPollEventType::EPOLLHUP;
-        }
+
+        // RCV_SHUTDOWN/RDHUP and the full-mask HUP are shared with the listener
+        // path; see `ShutdownBit::poll_events()`.
+        events |= ShutdownBit::from_flags(recv_shutdown, send_shutdown).poll_events();
 
         events
     }
@@ -636,7 +636,6 @@ impl Listener {
     pub(super) fn new(addr: UnixBinding, config: ListenerConfig) -> Result<Self, UnixBinding> {
         let params = BacklogParams {
             addr: addr.address(),
-            is_shutdown: false,
             config,
         };
         let backlog = match BACKLOG_TABLE.add_backlog(params) {
@@ -670,11 +669,17 @@ impl Listener {
     pub(super) fn try_accept(
         &self,
         inherit_passcred: bool,
+        nonblock: bool,
     ) -> Result<(Arc<dyn Socket>, Endpoint), SystemError> {
-        let socket = self.backlog.pop_incoming()?;
+        let socket = self.backlog.pop_incoming(nonblock)?;
 
-        let peer_addr = match socket.inner.read().as_ref().expect("inner is None") {
-            Inner::Connected(connected) => connected.peer_endpoint().into(),
+        let peer_addr = match socket.inner.read().as_ref() {
+            Some(Inner::Connected(connected)) => connected.peer_endpoint().into(),
+            // Defensive only: an accepted child is dequeued and torn down under
+            // mutually exclusive states (the queue is drained under its lock, and
+            // the child has no descriptor yet), so `inner` cannot be `None` or
+            // `Init` here. Report an unnamed peer rather than panicking if a
+            // future state machine ever breaks that invariant.
             _ => Endpoint::Unix(UnixEndpoint::Unnamed),
         };
 
@@ -689,12 +694,18 @@ impl Listener {
         self.backlog.check_io_events()
     }
 
+    /// Whether a blocking `accept()` should stop waiting.
+    ///
+    /// A latched receive shutdown is terminal: it must wake the waiter even with
+    /// an empty queue, otherwise the predicate would send it straight back to
+    /// sleep and `shutdown(listener, SHUT_RD)` would never release it.
     pub(super) fn is_acceptable(&self) -> bool {
-        self.backlog
-            .incoming_conns
-            .lock()
-            .as_ref()
-            .is_some_and(|q| !q.is_empty())
+        self.backlog.has_pending() || self.backlog.is_recv_shutdown()
+    }
+
+    /// Latch a `shutdown(2)` direction on the backlog this listener owns.
+    pub(super) fn set_shutdown(&self, how: ShutdownBit) {
+        self.backlog.set_shutdown_bits(how);
     }
 }
 
@@ -765,10 +776,17 @@ pub(super) struct ListenerConfig {
 /// Parameters for creating a new backlog entry
 struct BacklogParams {
     addr: UnixEndpointBound,
-    is_shutdown: bool,
     config: ListenerConfig,
 }
 
+/// Shared state of one listening endpoint.
+///
+/// It is the listening socket's analogue of Linux `struct sock`: the accept
+/// queue, the buffer parameters inherited by accepted children, the wait queue
+/// connectors park on, and the sticky `sk_shutdown` bits. It is shared (not
+/// owned per-`UnixStreamSocket`) because `push_incoming()` runs on the
+/// *connecting* side, which only has the listener's `Weak` and must still
+/// observe the listener's shutdown state.
 #[derive(Debug)]
 pub(super) struct Backlog {
     addr: UnixEndpointBound,
@@ -783,7 +801,12 @@ pub(super) struct Backlog {
     listener: Weak<UnixStreamSocket>,
     is_seqpacket: bool,
     netns: Arc<NetNamespace>,
-    _is_shutdown: bool,
+    /// Sticky `sk_shutdown` bits latched by `shutdown(2)` on this listener.
+    ///
+    /// Monotonic, never cleared. The whole mask is kept (not just a "receive
+    /// shutdown" boolean) because `SHUT_RD` and `SHUT_RDWR` are observably
+    /// different: Linux `unix_poll()` adds `EPOLLHUP` only for the full mask.
+    sk_shutdown: AtomicU8,
 }
 
 /// Responsibility for retrying a capacity wait, not a reservation of a slot.
@@ -819,11 +842,10 @@ impl Backlog {
             peer_cred,
         } = params.config;
 
-        let incoming_sockets = if params.is_shutdown {
-            None
-        } else {
-            Some(VecDeque::with_capacity(backlog))
-        };
+        // `None` has exactly one meaning: `unregister_backlog()` consumed the
+        // queue because the listener is gone. A latched shutdown is expressed by
+        // `sk_shutdown` alone, so the two states cannot be confused.
+        let incoming_sockets = Some(VecDeque::with_capacity(backlog));
 
         Self {
             addr: params.addr,
@@ -836,8 +858,21 @@ impl Backlog {
             listener,
             is_seqpacket,
             netns,
-            _is_shutdown: params.is_shutdown,
+            sk_shutdown: AtomicU8::new(0),
         }
+    }
+
+    /// Sticky shutdown bits latched on this listener (`SHUT_RD`/`SHUT_WR`).
+    fn shutdown_bits(&self) -> ShutdownBit {
+        ShutdownBit::from_bits_truncate(self.sk_shutdown.load(Ordering::Acquire) as usize)
+    }
+
+    fn set_shutdown_bits(&self, bits: ShutdownBit) {
+        self.sk_shutdown.fetch_or(bits.bits(), Ordering::AcqRel);
+    }
+
+    fn is_recv_shutdown(&self) -> bool {
+        self.shutdown_bits().is_recv_shutdown()
     }
 
     fn sndbuf_effective(&self) -> usize {
@@ -864,21 +899,37 @@ impl Backlog {
         self.incoming_conns.lock().is_none()
     }
 
-    fn pop_incoming(&self) -> Result<Arc<UnixStreamSocket>, SystemError> {
+    /// Dequeue the oldest pending connection, if any.
+    ///
+    /// `nonblock` picks the Linux error for an empty queue. `unix_accept()`
+    /// (`net/unix/af_unix.c`) hands `MSG_DONTWAIT` to `skb_recv_datagram()` for an
+    /// `O_NONBLOCK` descriptor, and `__skb_wait_for_more_packets()`
+    /// (`net/core/datagram.c`) reports the empty queue as `EAGAIN` without ever
+    /// consulting `RCV_SHUTDOWN`. Only a blocking accept reaches the
+    /// receive-shutdown branch, which `unix_accept()` maps to `EINVAL`.
+    fn pop_incoming(&self, nonblock: bool) -> Result<Arc<UnixStreamSocket>, SystemError> {
         let mut guard = self.incoming_conns.lock();
 
         let Some(incoming_conns) = &mut *guard else {
+            // The backlog was unregistered: this listener is gone.
             return Err(SystemError::EINVAL);
         };
         let conn = incoming_conns.pop_front();
         drop(guard);
 
-        if conn.is_some() {
+        if let Some(conn) = conn {
             self.connect_wait_queue
                 .wakeup(Some(crate::process::ProcessState::Blocked(true)));
+            return Ok(conn);
         }
 
-        conn.ok_or(SystemError::EAGAIN_OR_EWOULDBLOCK)
+        // Data wins over shutdown: queued connections are always handed out
+        // first, and only an empty queue observes the terminal state.
+        if !nonblock && self.is_recv_shutdown() {
+            Err(SystemError::EINVAL)
+        } else {
+            Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
+        }
     }
 
     fn set_backlog(&self, backlog: usize, peer_cred: PeerCred) {
@@ -910,17 +961,26 @@ impl Backlog {
         }
     }
 
-    fn check_io_events(&self) -> EPollEventType {
-        if self
-            .incoming_conns
+    /// Whether a connection is waiting in the accept queue.
+    fn has_pending(&self) -> bool {
+        self.incoming_conns
             .lock()
             .as_ref()
             .is_some_and(|conns| !conns.is_empty())
-        {
+    }
+
+    fn check_io_events(&self) -> EPollEventType {
+        let mut events = if self.has_pending() {
             EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM
         } else {
             EPollEventType::empty()
-        }
+        };
+
+        // Same `unix_poll()` mapping the connected path uses; a receive shutdown
+        // additionally makes the (drained) listener readable, which is what lets
+        // an epoll-driven acceptor observe `shutdown(listener, SHUT_RD)`.
+        events |= self.shutdown_bits().poll_events();
+        events
     }
 
     pub(super) fn push_incoming(
@@ -947,6 +1007,16 @@ impl Backlog {
         let Some(incoming_conns) = &mut *guard else {
             return Err((init, SystemError::ECONNREFUSED));
         };
+
+        // Linux resolves the listener by name *and* socket type, so a type
+        // mismatch never reaches the state checks; `unix_stream_connect()` then
+        // tests `RCV_SHUTDOWN` before the accept-queue capacity
+        // (`net/unix/af_unix.c`). A shut-down listener therefore refuses new
+        // connections even when the queue still has room, and a type mismatch
+        // keeps reporting EPROTOTYPE.
+        if self.is_recv_shutdown() {
+            return Err((init, SystemError::ECONNREFUSED));
+        }
 
         // Linux uses sk_acceptq_is_full(): ack_backlog > max_ack_backlog.
         // This means backlog==0 still allows one pending connection.
@@ -1046,10 +1116,15 @@ impl Backlog {
         };
         let ready = || {
             let guard = self.incoming_conns.lock();
-            guard
+            let has_room = guard
                 .as_ref()
-                .is_none_or(|incoming| incoming.len() <= self.backlog.load(Ordering::Relaxed))
-                .then_some(())
+                .is_none_or(|incoming| incoming.len() <= self.backlog.load(Ordering::Relaxed));
+            drop(guard);
+            // Mirrors the `sched` condition of `unix_wait_for_peer()`
+            // (`net/unix/af_unix.c`), which includes `!(RCV_SHUTDOWN)`:
+            // a shut-down listener can no longer serve this connector, so stop
+            // waiting and let the retry surface ECONNREFUSED.
+            (has_room || self.is_recv_shutdown()).then_some(())
         };
 
         match timeout {

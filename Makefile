@@ -325,7 +325,7 @@ test-benchmark: prepare_rootfs_manifest
 		$(DADK) -f $(ROOT_PATH)/dadk-manifest.generated.toml user clean --level in-src -w $(ROOT_PATH); \
 	fi; \
 	SKIP_GRUB=1 $(MAKE) write_diskimage; \
-	$(MAKE) qemu-nographic AUTO_TEST=benchmark BENCHMARK_TEST_DIR=/opt/tests/benchmark/lmbench & \
+	$(MAKE) qemu-nographic DRAGONOS_QEMU_SNAPSHOT=1 AUTO_TEST=benchmark BENCHMARK_TEST_DIR=/opt/tests/benchmark/lmbench & \
 	sleep 5; \
 	status=0; \
 	bash user/apps/tests/benchmark/lmbench/orchestrator/monitor_test_results.sh || status=$$?; \

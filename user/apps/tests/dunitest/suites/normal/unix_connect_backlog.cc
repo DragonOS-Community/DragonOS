@@ -1,3 +1,18 @@
+// Notes for the two "wake hand-off" cases below (`AddressLookupFailure...` and
+// `ReboundConnectorsPassOldBacklogWakeToNextConnector`).
+//
+// They encode DragonOS's *intentional* extension of Linux: when a woken
+// connector cannot consume the freed slot (address lookup fails) or belongs to
+// a backlog that is no longer current, it passes the wake on so the freed slot
+// is never stranded.
+//
+// Linux does not do that. `unix_accept()` (`net/unix/af_unix.c`) calls
+// `wake_up_interruptible(&unix_sk(sk)->peer_wait)`, i.e.
+// `__wake_up(..., nr_exclusive = 1, ...)`, which releases **one** exclusive
+// waiter; if that waiter aborts on `-ENOENT`, the remaining connectors stay
+// parked on `peer_wait` until the listener is released (which uses
+// `wake_up_interruptible_all`). Running this suite on a Linux host therefore
+// fails exactly these cases; see the PR notes for the rationale.
 #include <gtest/gtest.h>
 
 #include <errno.h>
@@ -40,6 +55,34 @@ public:
 private:
     int fd_;
 };
+
+// Bounded wait until `pid` is confirmed off-CPU, instead of guessing with
+// `poll(timeout) == 0`. `/proc/<pid>/stat` reports `S` for an interruptible
+// sleep and `D` for an uninterruptible one (kernel `filesystem/procfs/pid/stat.rs`),
+// so a child observed in either state is provably parked in the backlog wait and
+// not merely slow to start.
+bool WaitSleeping(pid_t pid, int timeout_ms = 2000) {
+    char path[64] = {};
+    snprintf(path, sizeof(path), "/proc/%d/stat", pid);
+    constexpr int kStepUs = 1000;
+    for (int waited = 0; waited <= timeout_ms * 1000; waited += kStepUs) {
+        FILE* stat = fopen(path, "r");
+        if (stat != nullptr) {
+            char line[512] = {};
+            const bool read = fgets(line, sizeof(line), stat) != nullptr;
+            fclose(stat);
+            if (read) {
+                const char* comm_end = strrchr(line, ')');
+                if (comm_end != nullptr && comm_end[1] == ' ' &&
+                    (comm_end[2] == 'S' || comm_end[2] == 'D')) {
+                    return true;
+                }
+            }
+        }
+        usleep(kStepUs);
+    }
+    return false;
+}
 
 void RunFullBacklogConnect(Release release, int type) {
     sockaddr_un address{};
@@ -102,7 +145,7 @@ void RunFullBacklogConnect(Release release, int type) {
     EXPECT_EQ(1, read(ready_pipe[0], &ready, 1));
     close(ready_pipe[0]);
     pollfd poll_result{result_pipe[0], POLLIN, 0};
-    EXPECT_EQ(0, poll(&poll_result, 1, 50)) << "connect did not block on the full backlog";
+    EXPECT_TRUE(WaitSleeping(child)) << "connect did not block on the full backlog";
 
     if (release == Release::Accept || release == Release::LargeTimeout) {
         const int accepted = accept(listener, nullptr, nullptr);
@@ -266,8 +309,7 @@ void RunConnectorRace(int type, int iteration, RaceRelease release) {
         ASSERT_EQ(1, poll(&ready, 1, 1500));
         char byte;
         ASSERT_EQ(1, read(race.ready[i][0], &byte, 1));
-        pollfd result{race.result[i][0], POLLIN, 0};
-        ASSERT_EQ(0, poll(&result, 1, 50)) << "connector " << i << " did not block";
+        ASSERT_TRUE(WaitSleeping(race.children[i])) << "connector " << i << " did not block";
     }
 
     // Race cancellation with releasing exactly one slot. In particular, accept
@@ -314,7 +356,16 @@ void RunConnectorRace(int type, int iteration, RaceRelease release) {
                 EXPECT_EQ(0, WEXITSTATUS(status));
                 results[i].fd = -1;
             }
-            ASSERT_EQ(0, poll(results, count, 50)) << "one slot admitted multiple connectors";
+            // Freeing exactly one slot must admit exactly one connector. Every
+            // remaining child has to be parked again; if the same slot had let a
+            // second one through, that child would have exited (`Z`) instead of
+            // sleeping, and its result pipe would be readable.
+            for (int i = 0; i < count; ++i) {
+                if (results[i].fd < 0) continue;
+                ASSERT_TRUE(WaitSleeping(race.children[i]))
+                    << "connector " << i << " was admitted by the same slot";
+            }
+            ASSERT_EQ(0, poll(results, count, 0)) << "one slot admitted multiple connectors";
             if (completed + 1 < count) {
                 const int next = accept(listener, nullptr, nullptr);
                 ASSERT_GE(next, 0);

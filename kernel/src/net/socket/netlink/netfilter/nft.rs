@@ -251,6 +251,7 @@ struct SetElementDumpSession {
 
 #[derive(Debug)]
 enum DumpSession {
+    Conntrack(super::ctnetlink::CtDump),
     Tables(TableDumpSession),
     Chains(ChainDumpSession),
     Rules(RuleDumpSession),
@@ -1663,7 +1664,7 @@ pub(super) fn table_attrs<'a>(request: &'a Request<'_>) -> Result<TableAttrs<'a>
     Ok(attrs)
 }
 
-fn append_attr(bytes: &mut Vec<u8>, kind: u16, value: &[u8]) -> Result<(), SystemError> {
+pub(super) fn append_attr(bytes: &mut Vec<u8>, kind: u16, value: &[u8]) -> Result<(), SystemError> {
     let size = 4usize
         .checked_add(value.len())
         .ok_or(SystemError::EMSGSIZE)?;
@@ -2319,7 +2320,7 @@ fn uapi_register(offset: usize) -> u32 {
     }
 }
 
-fn done_message(
+pub(super) fn done_message(
     sequence: u32,
     port: u32,
     interrupted: bool,
@@ -2584,6 +2585,7 @@ impl DumpSession {
         port: u32,
     ) -> Result<(NetfilterMessage, usize, usize, usize, bool), SystemError> {
         match self {
+            Self::Conntrack(_) => Err(SystemError::EINVAL), // driven without an nft snapshot
             Self::Tables(session) => session
                 .next(snapshot, port)
                 .map(|(message, cursor, done)| (message, cursor, 0, 0, done)),
@@ -2633,7 +2635,7 @@ impl DumpSession {
                 session.cursor = rule_cursor;
                 session.generation = generation;
             }
-            Self::Empty { .. } => {}
+            Self::Empty { .. } | Self::Conntrack(_) => {}
         }
     }
 }
@@ -2693,6 +2695,23 @@ fn object_names<'a>(request: &'a Request<'_>) -> Result<ObjectNames<'a>, SystemE
 }
 
 impl NftSocketState {
+    pub(super) fn start_conntrack_dump(
+        &self,
+        session: super::ctnetlink::CtDump,
+        port: u32,
+        netns: &Arc<NetNamespace>,
+    ) -> Result<(), SystemError> {
+        let mut slot = self.dump.lock();
+        if slot.is_some() {
+            return Err(SystemError::EBUSY);
+        }
+        *slot = Some(DumpSession::Conntrack(session));
+        if let Err(error) = Self::drive_locked(&mut slot, port, netns) {
+            *slot = None;
+            return Err(error);
+        }
+        Ok(())
+    }
     pub(super) fn get_set(
         &self,
         request: &Request<'_>,
@@ -3081,6 +3100,12 @@ impl NftSocketState {
         let Some(session) = slot.as_mut() else {
             return Ok(());
         };
+        if let DumpSession::Conntrack(session) = session {
+            if session.drive(port, netns)? {
+                *slot = None;
+            }
+            return Ok(());
+        }
         let snapshot = netns.nftables().snapshot();
         let (message, table_cursor, chain_cursor, rule_cursor, done) =
             session.next(&snapshot, port)?;

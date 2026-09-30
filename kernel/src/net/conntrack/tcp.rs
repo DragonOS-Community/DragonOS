@@ -262,6 +262,11 @@ impl TcpTracker {
         self.seen_reply
     }
 
+    pub(super) fn control_state(&self) -> (u8, bool) {
+        // State's internal zero-based representation omits Linux NONE.
+        (self.state as u8 + 1, self.assured)
+    }
+
     pub(crate) fn observe(&mut self, segment: TcpSegment, direction: usize) -> TcpVerdict {
         if !segment.valid() || direction > 1 {
             return TcpVerdict::Invalid;

@@ -89,6 +89,28 @@ fn ring_cap_for_effective_sockbuf(effective: usize) -> usize {
 #[cast_to([sync] Socket)]
 #[derive(Debug)]
 pub struct UnixStreamSocket {
+    /// Current socket state.
+    ///
+    /// Two invariants govern every access:
+    ///
+    /// * **I1 — lifetime.** Any path that entered through a file descriptor
+    ///   (every `net/syscall/*` entry point, and the VFS read/write paths) must
+    ///   keep that descriptor's `Arc<File>` for as long as it uses the socket;
+    ///   `SocketFdRef` is the tool for that. Holding the file makes
+    ///   `File::drop -> IndexNode::close()` impossible, so `inner` cannot move to
+    ///   `None` while the operation is in flight.
+    /// * **I2 — terminal state.** `inner` only ever *persists* as `None` after
+    ///   `do_close()`, which runs from the final `IndexNode::close()` of an
+    ///   fd-backed socket (`open_file_counter` 1 -> 0) or directly for an
+    ///   embryonic, not-yet-accepted child. `try_connect()` and `listen()` do
+    ///   `take()` an `Inner` to rebuild it, but they hold the write lock across
+    ///   the whole `take()`/`replace()` window, so no concurrent observer can
+    ///   see the interim value, and they always put an `Inner` back before
+    ///   returning — including on their error paths.
+    ///
+    /// Predicates and wait conditions can still be re-evaluated after a
+    /// concurrent close, so they go through [`Self::map_inner`] and answer a
+    /// defined terminal value instead of panicking.
     inner: RwSem<Option<Inner>>,
     //todo options
     epitems: EPollItems,
@@ -353,21 +375,26 @@ impl UnixStreamSocket {
         cred: Option<UCred>,
         rights: &[Arc<crate::filesystem::vfs::file::File>],
     ) -> Result<(usize, Wrapping<usize>, usize), SystemError> {
-        match self.inner.read().as_ref().expect("inner is None") {
+        let is_seqpacket = self.is_seqpacket;
+        let sndbuf = self.sndbuf.load(Ordering::Relaxed);
+        self.map_inner(Err(SystemError::ENOTCONN), |inner| match inner {
             Inner::Connected(connected) => {
-                let sndbuf = self.sndbuf.load(Ordering::Relaxed);
-                connected.try_send(buffer, self.is_seqpacket, sndbuf, cred, rights)
+                connected.try_send(buffer, is_seqpacket, sndbuf, cred, rights)
             }
             _ => {
                 // log::error!("the socket is not connected");
-                return Err(SystemError::ENOTCONN);
+                Err(SystemError::ENOTCONN)
             }
-        }
+        })
     }
 
     fn try_connect(&self, backlog: &Arc<Backlog>) -> Result<(), SystemError> {
         let mut writer = self.inner.write();
-        let inner = writer.take().expect("inner is None");
+        // A concurrent close makes the socket terminal; report it instead of
+        // panicking. Unreachable for fd-backed callers, which hold the file.
+        let Some(inner) = writer.take() else {
+            return Err(SystemError::ENOTCONN);
+        };
 
         let (inner, result) = match inner {
             Inner::Init(init) => {
@@ -414,42 +441,46 @@ impl UnixStreamSocket {
             .load(core::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Run `f` against the current [`Inner`], or answer `when_closed` when the
+    /// socket has already reached its terminal state.
+    ///
+    /// `inner` is set to `None` exactly once, by `do_close()` when the last open
+    /// file description disappears (see the field comment above). System calls
+    /// keep that description alive for their whole duration, so a well-behaved
+    /// caller never observes `None` here; but queries and wait predicates can be
+    /// re-evaluated after a concurrent `close()`, and turning that into a panic
+    /// would take the whole kernel down. Funnelling every such query through
+    /// this helper keeps the "already closed" answer in one place instead of
+    /// repeating `expect()` at each call site.
+    fn map_inner<R>(&self, when_closed: R, f: impl FnOnce(&Inner) -> R) -> R {
+        let guard = self.inner.read();
+        match guard.as_ref() {
+            Some(inner) => f(inner),
+            None => when_closed,
+        }
+    }
+
     fn can_recv(&self) -> bool {
-        match self
-            .inner
-            .read()
-            .as_ref()
-            .expect("UnixStreamSocket inner is None")
-        {
+        self.map_inner(false, |inner| match inner {
             Inner::Connected(connected) => {
                 connected.recv_ready(self.is_seqpacket) || connected.recv_closed()
             }
             _ => false,
-        }
+        })
     }
 
     fn is_acceptable(&self) -> bool {
-        match self
-            .inner
-            .read()
-            .as_ref()
-            .expect("UnixStreamSocket inner is None")
-        {
+        self.map_inner(false, |inner| match inner {
             Inner::Listener(listener) => listener.is_acceptable(),
             _ => false,
-        }
+        })
     }
 
     fn take_connreset_from_peer(&self) -> bool {
-        match self
-            .inner
-            .read()
-            .as_ref()
-            .expect("UnixStreamSocket inner is None")
-        {
+        self.map_inner(false, |inner| match inner {
             Inner::Connected(connected) => connected.take_connreset_from_peer(),
             _ => false,
-        }
+        })
     }
 
     fn take_pending_reset(&self) -> bool {
@@ -534,26 +565,23 @@ impl UnixStreamSocket {
                     let timeout = deadline
                         .map(|d| d.duration_since(Instant::now()).unwrap_or(Duration::ZERO));
                     self.wait_queue.wait_event_interruptible_timeout(
-                        || match self
-                            .inner
-                            .read()
-                            .as_ref()
-                            .expect("UnixStreamSocket inner is None")
-                        {
-                            Inner::Connected(connected) => {
-                                let sndbuf = self.sndbuf.load(Ordering::Relaxed);
-                                let need = if self.is_seqpacket {
-                                    pending.len().saturating_add(core::mem::size_of::<u32>())
-                                } else {
-                                    1
-                                };
-                                let (writable, closed) = connected.send_state(need, sndbuf);
-                                if closed {
-                                    return true;
+                        || {
+                            self.map_inner(true, |inner| match inner {
+                                Inner::Connected(connected) => {
+                                    let sndbuf = self.sndbuf.load(Ordering::Relaxed);
+                                    let need = if self.is_seqpacket {
+                                        pending.len().saturating_add(core::mem::size_of::<u32>())
+                                    } else {
+                                        1
+                                    };
+                                    let (writable, closed) = connected.send_state(need, sndbuf);
+                                    if closed {
+                                        return true;
+                                    }
+                                    writable
                                 }
-                                writable
-                            }
-                            _ => true,
+                                _ => true,
+                            })
                         },
                         timeout,
                     )?;
@@ -700,7 +728,12 @@ impl Socket for UnixStreamSocket {
 
         let mut writer = self.inner.write();
 
-        let (inner, err) = match writer.take().expect("UnixStreamSocket inner is None") {
+        // A concurrent close makes the socket terminal; report it instead of
+        // panicking. Unreachable for fd-backed callers, which hold the file.
+        let Some(taken) = writer.take() else {
+            return Err(SystemError::EINVAL);
+        };
+        let (inner, err) = match taken {
             Inner::Init(init) => {
                 let config = ListenerConfig {
                     backlog,

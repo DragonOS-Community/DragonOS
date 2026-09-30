@@ -102,7 +102,6 @@ pub(crate) fn do_accept(
     // with `fdput()`): without it a concurrent `close(listener)` tears the
     // socket down mid-wait.
     let sock = SocketFdRef::from_fd(fd as i32)?;
-    let (new_socket, remote_endpoint) = sock.socket()?.accept()?;
 
     let mut file_mode = FileFlags::O_RDWR;
     if flags & FileFlags::O_NONBLOCK.bits() != 0 {
@@ -115,15 +114,36 @@ pub(crate) fn do_accept(
     let cloexec = flags & FileFlags::O_CLOEXEC.bits() != 0;
 
     let current = ProcessManager::current_pcb();
-    let new_fd = current.fd_table().alloc_fd(
-        File::new_socket(new_socket, file_mode)?,
-        cloexec,
-        current.nofile_soft_limit(),
-    )?;
+
+    // Reserve the descriptor number *before* waiting, exactly like
+    // `__sys_accept4_file()` (`net/socket.c`: `get_unused_fd_flags()` precedes
+    // `do_accept()`): a full descriptor table reports `EMFILE` without blocking
+    // and without consuming a queued connection. A reserved slot is invisible
+    // (`EBADF` to `close()`, `EBUSY` to `dup2()`), so it cannot be recycled
+    // while the peer address is copied below. `Drop` releases it on every error
+    // path; `install()` publishes the file once the syscall is ready to return.
+    let reservation = current
+        .fd_table()
+        .reserve::<1>(current.nofile_soft_limit(), 0, cloexec)?;
+
+    let (new_socket, remote_endpoint) = sock.socket()?.accept()?;
+    let new_file = File::new_socket(new_socket, file_mode)?;
 
     if !addr.is_null() {
-        // 将对端地址写入用户空间
+        // 将对端地址写入用户空间。
+        //
+        // Linux copies the peer address *before* installing the new descriptor
+        // (`do_accept()` runs `move_addr_to_user()` before `fd_install()`).
+        // Reproducing that order here makes a faulting user pointer close the
+        // accepted socket and report `EFAULT`, instead of leaking one
+        // descriptor plus one live connection per failed `accept()`. Moving the
+        // copy first also means `EMFILE` is reported before `EFAULT`, as in
+        // Linux.
         remote_endpoint.write_to_user(addr, addrlen)?;
     }
-    Ok(new_fd as usize)
+
+    // `install()` performs the one step that can still fail, allocating the
+    // `Arc<File>` (`ENOMEM`); on that path the reservation's `Drop` releases the
+    // reserved number, so the descriptor table is left untouched.
+    Ok(reservation.install(new_file)? as usize)
 }

@@ -1,0 +1,43 @@
+#!/bin/sh
+# Guest-only. Registry acceptance is opt-in and requires a pinned digest.
+set -eu
+export PATH=/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+case "$(uname -r)" in
+    *dragonos*) ;;
+    *) echo 'Run this helper inside DragonOS, not on the host.' >&2; exit 1 ;;
+esac
+# Authentication config remains usable, but acceptance always targets this guest.
+unset DOCKER_HOST DOCKER_CONTEXT DOCKER_TLS DOCKER_TLS_VERIFY DOCKER_CERT_PATH
+docker() {
+    command docker --host=unix:///var/run/docker.sock "$@"
+}
+if [ "$#" -gt 1 ]; then
+    echo "Usage: $0 [registry-image@sha256:digest]" >&2
+    exit 2
+fi
+if [ "$#" -eq 1 ]; then
+    case "$1" in
+        *@sha256:*) digest=${1##*@sha256:} ;;
+        *) echo 'Specify an immutable image digest.' >&2; exit 2 ;;
+    esac
+    case "$digest" in
+        *[!0-9a-f]*|'') echo 'Invalid digest.' >&2; exit 2 ;;
+    esac
+    [ "${#digest}" -eq 64 ] || { echo 'Invalid digest length.' >&2; exit 2; }
+fi
+test -s /etc/ssl/certs/ca-certificates.crt
+docker info --format '{{.ServerVersion}} {{.Driver}}'
+# Import separately so a tar failure cannot be hidden by a pipeline exit code.
+fixture=$(mktemp /tmp/dragon-docker-fixture.XXXXXX)
+trap 'rm -f "$fixture"' EXIT HUP INT TERM
+tar -C /opt/tests/docker/bundle/rootfs -cf "$fixture" .
+docker import "$fixture" dragonos-validation-busybox:local
+output=$(docker run --rm dragonos-validation-busybox:local /bin/busybox echo DRAGONOS_DOCKER_OK)
+[ "$output" = DRAGONOS_DOCKER_OK ] || { echo 'Unexpected container output.' >&2; exit 1; }
+echo "$output"
+if [ "$#" -eq 1 ]; then
+    docker pull "$1"
+    docker image inspect --format '{{json .RepoDigests}}' "$1"
+else
+    echo 'Local smoke passed; registry pull/run not tested.'
+fi

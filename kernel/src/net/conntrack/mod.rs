@@ -10,15 +10,17 @@ use crate::{
     time::{Duration, Instant},
 };
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicU8, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use hashbrown::HashMap;
 use smoltcp::wire::IpVersion;
 
+mod control;
 mod nat;
 mod nat_v6;
 mod packet;
 mod packet_v6;
 mod tcp;
+pub(crate) use control::{CtFilter, CtRecord, CtTupleFilter};
 pub(crate) use nat::{
     rewrite_ipv4_related_icmp, rewrite_ipv4_tuple, NatManipSide, NatRewriteError,
 };
@@ -470,6 +472,8 @@ enum FlowDecision {
 #[derive(Debug)]
 struct FlowRuntime {
     seen_reply: bool,
+    udp_stream_after: Instant,
+    udp_assured: bool,
     tcp: Option<TcpTracker>,
     expires_at: Instant,
 }
@@ -487,6 +491,8 @@ impl FlowRuntime {
         };
         Self {
             seen_reply: false,
+            udp_stream_after: now + Duration::from_secs(2),
+            udp_assured: false,
             tcp,
             expires_at: now + timeout,
         }
@@ -526,16 +532,19 @@ impl FlowRuntime {
                 TcpVerdict::Repeat => FlowDecision::Repeat,
             };
         }
-        if direction == CtDirection::Reply {
-            self.seen_reply = true;
-        }
         let timeout = match kind {
-            CtPacketKind::Udp if self.seen_reply => UDP_REPLIED,
+            CtPacketKind::Udp if self.seen_reply && now > self.udp_stream_after => {
+                self.udp_assured = true;
+                UDP_REPLIED
+            }
             CtPacketKind::Udp => UDP_UNREPLIED,
             CtPacketKind::IcmpQuery => ICMP_TIMEOUT,
             CtPacketKind::Generic => GENERIC_TIMEOUT,
             CtPacketKind::Tcp(_) => return FlowDecision::Invalid,
         };
+        if direction == CtDirection::Reply {
+            self.seen_reply = true;
+        }
         self.expires_at = now + timeout;
         FlowDecision::Matched {
             state: if self.seen_reply {
@@ -550,6 +559,10 @@ impl FlowRuntime {
 
 #[derive(Debug)]
 pub(crate) struct CtFlow {
+    /// Publication sequence, assigned under the table lock. Not a pointer or
+    /// a second tuple index. Its low 32 bits are the opaque ctnetlink ID.
+    serial: AtomicU64,
+    nat_done: u32,
     original: CtTuple,
     /// Tuple on the wire after both destination and source NAT.
     translated: CtTuple,
@@ -686,6 +699,8 @@ impl CtCandidate {
     /// without publishing the rejected original flow in the conntrack table.
     fn related_error_match(&self, now: Instant) -> Result<CtMatch, CtError> {
         let flow = Arc::try_new(CtFlow {
+            serial: AtomicU64::new(0),
+            nat_done: 0,
             original: self.original,
             translated: self.translated,
             reply: self.proposed_reply(),
@@ -939,6 +954,7 @@ pub(crate) enum CtConfirm {
 
 #[derive(Debug)]
 struct CtTable {
+    last_serial: u64,
     original: HashMap<CtTuple, Arc<CtFlow>>,
     reply: HashMap<CtTuple, Arc<CtFlow>>,
     max_flows: usize,
@@ -965,6 +981,9 @@ impl CtTable {
     fn remove_flow(&mut self, flow: Arc<CtFlow>) -> Arc<CtFlow> {
         self.original.remove(&flow.original);
         self.reply.remove(&flow.reply);
+        if self.original.is_empty() {
+            self.next_expiry = None;
+        }
         flow
     }
 
@@ -1118,6 +1137,7 @@ impl CtState {
             .try_reserve(max_flows)
             .map_err(|_| CtError::NoMemory)?;
         let prepared = CtTable {
+            last_serial: 0,
             original,
             reply,
             max_flows,
@@ -1354,6 +1374,9 @@ impl CtState {
         let runtime = FlowRuntime::new(candidate.kind, now);
         let expiry = runtime.expires_at;
         let flow = Arc::try_new(CtFlow {
+            serial: AtomicU64::new(0),
+            nat_done: (u32::from(candidate.source_initialized) << 7)
+                | (u32::from(candidate.destination_initialized) << 8),
             original: candidate.original,
             translated: candidate.translated,
             reply: reply_key,
@@ -1396,6 +1419,10 @@ impl CtState {
             if table.original.len() >= table.max_flows {
                 return Err(CtError::Full);
             }
+            // Keep dump traversal finite even while new flows are confirmed.
+            // Unlike a u32 ID allocator this does not stop after 2^32 flows.
+            table.last_serial = table.last_serial.checked_add(1).ok_or(CtError::Full)?;
+            flow.serial.store(table.last_serial, Ordering::Relaxed);
             // Both maps were reserved to max_flows at activation; no allocation
             // or failure occurs between publishing their two keys.
             debug_assert!(table.original.capacity() >= table.max_flows);

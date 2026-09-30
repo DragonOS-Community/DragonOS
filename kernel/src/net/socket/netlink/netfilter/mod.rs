@@ -4,6 +4,7 @@
 //! packet-path representation may be committed.
 
 mod bound;
+mod ctnetlink;
 mod nft;
 
 use super::{
@@ -313,7 +314,16 @@ impl NetfilterKernelSocket {
                 && request.kind() >= 16
                 && request.bytes.len() >= HEADER_LEN + NFGEN_LEN
             {
-                if request.kind() == NFT_MSG_GETGEN {
+                if request.kind() >> 8 == 1 {
+                    match ctnetlink::request(&request, port, &netns, socket_state) {
+                        Ok(GetTableResult::Replied) => None,
+                        Ok(GetTableResult::DumpStarted) => {
+                            dump_started = true;
+                            None
+                        }
+                        Err(error) => Some(error),
+                    }
+                } else if request.kind() == NFT_MSG_GETGEN {
                     Self::send_generation(&request, port, &netns).err()
                 } else if request.kind() == NFT_COMPAT_GET {
                     compat_match_reply(&request, port)

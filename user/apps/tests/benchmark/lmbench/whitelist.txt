@@ -2,22 +2,27 @@
 # 每行一个测例名(对应 runner/test_cases/<name>.sh,不带路径/后缀)
 # 以 # 开头为注释,空行忽略。runner 只跑此列表中的测例。
 #
-# 全量启用:48 个测例覆盖各类别。.meta 在 host 侧用 guest 同款 lmbench 二进制
+# 完整列表:48 个测例覆盖各类别，实际运行未注释的条目。
+# Blocked 注释来自 2026-09-30 的顺序运行（512 MiB、2 vCPU、1 次采样、120s 超时）。
+# .meta 在 host 侧用 guest 同款 lmbench 二进制
 # 提取(见 docs/superpowers/specs/2026-07-30-lmbench-fullsuite-meta-extraction-design.md);
 # 部分工具在 host 跑不通(lat_fifo/bw_unix/lat_sem/lat_syscall null/bw_tcp 等),
 # 其 .meta 基于 strings 提取的输出格式 + lmbench 标准格式推断,标注待 guest 校准。
 
 # memory
 mem_copy_bw
-mem_read_bw
-mem_write_bw
+# Blocked: 512 MiB guest, round 01: global_alloc_error in PageReclaimer::shrink_list; kernel halted.
+# mem_read_bw
+# Blocked: 512 MiB guest, round 02: global_alloc_error in PageReclaimer::shrink_list; kernel panicked.
+# mem_write_bw
 mem_mmap_bw
 mem_mmap_lat
 mem_pagefault_lat
 
 # process
 process_fork_lat
-process_exec_lat
+# Blocked: round 06: lat_proc exec returned 1 without a valid numeric result (previous rounds passed).
+# process_exec_lat
 process_ctx_lat
 process_getppid_lat
 process_shell_lat
@@ -42,15 +47,20 @@ vfs_read_lat
 vfs_write_lat
 vfs_fstat_lat
 vfs_stat_lat
-vfs_fcntl_lat
+# Blocked: round 04: lat_fcntl returned 1, lock of fd1 failed: Resource deadlock avoided.
+# vfs_fcntl_lat
 vfs_select_lat
 vfs_read_pagecache_bw
 
 # filesystem
-ext4_create_delete_files_0k_ops
-ext4_create_delete_files_10k_ops
-ramfs_create_delete_files_0k_ops
-ramfs_create_delete_files_10k_ops
+# Blocked: 512 MiB guest, round 03: global_alloc_error during lat_fs; kernel halted.
+# ext4_create_delete_files_0k_ops
+# Blocked: 512 MiB guest, round 04: global_alloc_error during lat_fs; kernel halted.
+# ext4_create_delete_files_10k_ops
+# Blocked: 512 MiB guest, round 06: global_alloc_error during lat_fs; kernel halted.
+# ramfs_create_delete_files_0k_ops
+# Blocked: 512 MiB guest, round 07: global_alloc_error during lat_fs; kernel halted.
+# ramfs_create_delete_files_10k_ops
 ext4_copy_files_bw
 ramfs_copy_files_bw
 

@@ -18,7 +18,7 @@ let
 
   baseConfig = {
     nographic = true;
-    memory = "512M";
+    memory = "2G";
     cores = "2";
     shmId = "dragonos-qemu-shm.ram";
   };

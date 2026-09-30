@@ -22,10 +22,11 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
-#include <cstdlib>
 #include <cstdint>
 #include <cstring>
 #include <vector>
+
+#include "forward_mtu_nft_support.h"
 
 namespace {
 
@@ -514,7 +515,7 @@ int Capture(int fd, bool expect_icmp, uint16_t ident, unsigned expected_mtu,
     return expect_icmp ? 1 : 2;
 }
 
-int Scenario() {
+int Scenario(bool nat_case) {
     if (unshare(CLONE_NEWUSER | CLONE_NEWNET) != 0) return -1;
     Fd netlink(socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE));
     if (netlink.Get() < 0) return 100 + errno;
@@ -542,27 +543,30 @@ int Scenario() {
     if (sysctl.Get() < 0 || write(sysctl.Get(), "1", 1) != 1) return 900 + errno;
     Fd incoming(PacketSocket(ap)), outgoing(PacketSocket(bp));
     if (incoming.Get() < 0 || outgoing.Get() < 0) return 1000 + errno;
-    if (int e = Inject(incoming.Get(), ap, router_mac, false)) return 1100 + e;
-    if (int e = Capture(outgoing.Get(), false, 0x3701, 576)) return 1200 + e;
-    if (int e = Inject(incoming.Get(), ap, router_mac, true)) return 1300 + e;
-    if (int e = Capture(incoming.Get(), true, 0x3702, 576)) return 1400 + e;
+    if (!nat_case) {
+        if (int e = Inject(incoming.Get(), ap, router_mac, false)) return 1100 + e;
+        if (int e = Capture(outgoing.Get(), false, 0x3701, 576)) return 1200 + e;
+        if (int e = Inject(incoming.Get(), ap, router_mac, true)) return 1300 + e;
+        if (int e = Capture(incoming.Get(), true, 0x3702, 576)) return 1400 + e;
+        return 0;
+    }
+    utsname name{};
+    const bool guest = uname(&name) == 0 && std::strstr(name.release, "dragonos");
     // The first DNAT packet is still an unconfirmed conntrack Candidate at
     // the early PMTU error. Its RELATED ICMP must reverse the inner quote and
     // outer source without publishing that rejected original flow.
-    if (std::system("iptables -t nat -A PREROUTING -d 203.0.113.1 -j DNAT --to-destination 198.51.100.2 2>/dev/null") != 0) {
-        utsname name{};
-        // Some host CI environments allow a user-netns veth but prohibit
-        // nf_tables in that userns. Keep the basic conformance assertions;
-        // DragonOS itself must execute the DNAT subcase.
-        if (uname(&name) == 0 && !std::strstr(name.release, "dragonos")) return 0;
-        return 1500;
+    if (int e = forward_mtu_nft::InstallDnat(NFPROTO_IPV4,
+                                              "203.0.113.1", "198.51.100.2")) {
+        // Host policy may deny nf_tables inside an unprivileged userns.
+        // DragonOS guest must exercise this subcase, not skip it.
+        if ((e == EPERM || e == EACCES) && !guest) return 0;
+        return 1500 + e;
     }
     if (int e = Inject(incoming.Get(), ap, router_mac, true, "203.0.113.1", 0x3703))
         return 1600 + e;
     if (int e = Capture(incoming.Get(), true, 0x3703, 576,
                         "203.0.113.1", "203.0.113.1")) return 1700 + e;
-    utsname name{};
-    if (uname(&name) == 0 && std::strstr(name.release, "dragonos")) {
+    if (guest) {
         // Minimum IPv4 return MTU leaves only a 40-byte IPv4-options quote.
         // Its RELATED NAT identity must not require eight UDP bytes to exist.
         if (SetLink(netlink.Get(), a, 25, 68)) return 1705;
@@ -646,10 +650,14 @@ int Scenario6() {
     if (incoming.Get() < 0) return 1000 + errno;
     if (int e = Inject6(incoming.Get(), ap, router_mac)) return 1100 + e;
     if (int e = Capture6(incoming.Get())) return 1200 + e;
-    if (std::system("ip6tables -t nat -A PREROUTING -d fdff::1 -j DNAT --to-destination fd37:2::2 2>/dev/null") != 0) {
-        utsname name{};
-        if (uname(&name) == 0 && !std::strstr(name.release, "dragonos")) return 0;
-        return 1300;
+    utsname name{};
+    // The simple PTB check runs on both kernels. The fragment provenance and
+    // low-MTU static-route cases below use DragonOS-specific namespace and
+    // defrag setup; their Linux reference is checked against Linux source.
+    if (uname(&name) == 0 && !std::strstr(name.release, "dragonos")) return 0;
+    if (int e = forward_mtu_nft::InstallDnat(NFPROTO_IPV6,
+                                              "fdff::1", "fd37:2::2")) {
+        return 1300 + e;
     }
     // A reassembled IPv6 packet may be fragmented again only when the largest
     // original fragment fits the egress path. Keep the latter above IPv6's
@@ -659,8 +667,7 @@ int Scenario6() {
     if (outgoing.Get() < 0) return 1400 + errno;
     if (int e = Inject6Fragments(incoming.Get(), ap, router_mac)) return 1500 + e;
     if (int e = Capture6Fragments(outgoing.Get())) return 1600 + e;
-    utsname name{};
-    if (uname(&name) == 0 && std::strstr(name.release, "dragonos")) {
+    {
         // An explicit route survives address removal on an MTU shrink.
         // Never answer an oversized datagram with PTB(1280) for a link
         // that can only transmit 576-byte frames.
@@ -686,16 +693,14 @@ int Scenario6() {
     return 0;
 }
 
-}  // namespace
-
-TEST(ForwardMtu, Ipv4FragmentsAndReturnsFragNeeded) {
+void RunIpv4Scenario(bool nat_case) {
     int pipe_fds[2];
     ASSERT_EQ(pipe(pipe_fds), 0);
     const pid_t child = fork();
     ASSERT_GE(child, 0);
     if (child == 0) {
         close(pipe_fds[0]);
-        const int result = Scenario();
+        const int result = Scenario(nat_case);
         const ssize_t written = write(pipe_fds[1], &result, sizeof(result));
         (void)written;
         _exit(result == 0 || result == -1 ? 0 : 1);
@@ -725,6 +730,18 @@ TEST(ForwardMtu, Ipv4FragmentsAndReturnsFragNeeded) {
     EXPECT_EQ(result, 0) << "stage/error=" << result;
     EXPECT_TRUE(WIFEXITED(status));
     EXPECT_EQ(WEXITSTATUS(status), 0);
+}
+
+}  // namespace
+
+TEST(ForwardMtu, Ipv4FragmentsAndReturnsFragNeeded) {
+    RunIpv4Scenario(false);
+}
+
+TEST(ForwardMtu, Ipv4DnatFragNeeded) {
+    // An ICMP generated by the basic case can remain in flight after its
+    // assertion. A separate netns keeps that traffic out of the NAT case.
+    RunIpv4Scenario(true);
 }
 
 TEST(ForwardMtu, Ipv6ReturnsPacketTooBig) {

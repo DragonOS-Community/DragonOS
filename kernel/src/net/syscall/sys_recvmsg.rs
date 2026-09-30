@@ -1,19 +1,14 @@
 use system_error::SystemError;
 
+use super::socket_fd::SocketFdRef;
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_RECVMSG;
-use crate::filesystem::vfs::{
-    file::{File, FileFlags},
-    iov::IoVecs,
-    FileType,
-};
+use crate::filesystem::vfs::iov::IoVecs;
 use crate::net::posix::MsgHdr;
-use crate::net::socket;
-use crate::process::ProcessManager;
+use crate::net::socket::PMSG;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
 use crate::syscall::user_access::{UserBufferReader, UserBufferWriter};
 use alloc::string::ToString;
-use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 /// System call handler for the `recvmsg` syscall
@@ -100,18 +95,17 @@ pub(super) fn do_recvmsg(
     flags: u32,
     from_user: bool,
 ) -> Result<usize, SystemError> {
-    let file = {
-        let binding = ProcessManager::current_pcb().fd_table();
-        let guard = binding.read();
-        guard.get_file_by_fd(fd as i32).ok_or(SystemError::EBADF)?
-    };
-    do_recvmsg_with_file(&file, msg, flags, from_user)
+    // Keep the open file description alive across the (possibly blocking) receive.
+    let sock = SocketFdRef::from_fd(fd as i32)?;
+    do_recvmsg_with_sock(&sock, msg, flags, from_user)
 }
 
-/// Keep the same open file alive across recvmsg/recvmmsg waits. In particular,
-/// do not look up the fd a second time after another thread can close/reuse it.
-pub(super) fn do_recvmsg_with_file(
-    file: &Arc<File>,
+/// Receive one message, with the caller owning the socket handle.
+///
+/// `recvmmsg` shares a single handle across its whole loop, so the descriptor is
+/// resolved exactly once even though several messages are received.
+pub(super) fn do_recvmsg_with_sock(
+    sock: &SocketFdRef,
     msg: *mut MsgHdr,
     flags: u32,
     from_user: bool,
@@ -136,18 +130,15 @@ pub(super) fn do_recvmsg_with_file(
     let iovs = unsafe { IoVecs::from_user(kmsg.msg_iov, kmsg.msg_iovlen, true)? };
 
     // Honor O_NONBLOCK set via fcntl(F_SETFL) by translating it to MSG_DONTWAIT.
-    if file.file_type() != FileType::Socket {
-        return Err(SystemError::ENOTSOCK);
-    }
-    let file_nonblock = file.flags().contains(FileFlags::O_NONBLOCK);
+    // `PMSG` is imported rather than spelled `socket::PMSG`, matching the other
+    // recv/send syscalls and keeping the flag type distinguishable from the
+    // local socket handle bound below.
+    let socket = sock.socket()?;
 
     let (buf, recv_size, used_recv_msg) = {
-        let socket_inode = file.inode();
-        let socket = socket_inode.as_socket().ok_or(SystemError::ENOTSOCK)?;
-
-        let mut pmsg_flags = socket::PMSG::from_bits_truncate(flags);
-        if file_nonblock {
-            pmsg_flags.insert(socket::PMSG::DONTWAIT);
+        let mut pmsg_flags = PMSG::from_bits_truncate(flags);
+        if sock.is_nonblocking() {
+            pmsg_flags.insert(PMSG::DONTWAIT);
         }
 
         // 优先使用 recv_msg 以便实现 msg_flags/msg_controllen 等语义。

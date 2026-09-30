@@ -1,9 +1,9 @@
 use system_error::SystemError;
 
+use super::socket_fd::SocketFdRef;
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_GETSOCKNAME;
 use crate::net::posix::SockAddr;
-use crate::process::ProcessManager;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
 use alloc::string::ToString;
 use alloc::vec::Vec;
@@ -94,10 +94,8 @@ pub(super) fn do_getsockname(
     if addr.is_null() {
         return Err(SystemError::EINVAL);
     }
-    ProcessManager::current_pcb()
-        .get_socket_inode(fd as i32)?
-        .as_socket()
-        .unwrap()
+    SocketFdRef::from_fd(fd as i32)?
+        .socket()?
         .local_endpoint()?
         .write_to_user(addr, addrlen)?;
     Ok(0)

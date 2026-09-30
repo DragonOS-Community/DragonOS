@@ -22,7 +22,7 @@ use crate::{
     exception::InterruptArch,
     filesystem::{
         fs::FsStruct,
-        vfs::{fdtable::FileDescriptorTable, FileType, IndexNode},
+        vfs::{fdtable::FileDescriptorTable, IndexNode},
     },
     ipc::{
         sem_undo::{SemUndoAttachment, SemUndoGroup, UnpublishedSemUndoAttachmentGuard},
@@ -1292,50 +1292,6 @@ impl ProcessControlBlock {
     /// Returns whether the current process is the global init process.
     pub fn is_global_init(&self) -> bool {
         self.task_tgid_vnr().unwrap() == RawPid(1)
-    }
-
-    /// Get the `Arc` pointer to the socket's `IndexNode` by file descriptor.
-    ///
-    /// This is a helper function.
-    ///
-    /// ## Parameters
-    ///
-    /// - `fd`: The file descriptor index.
-    ///
-    /// ## Returns
-    ///
-    /// The `Arc` pointer to the socket's `IndexNode` if the file descriptor
-    /// refers to a socket, otherwise an error code.
-    ///
-    /// # Note
-    /// Because the underlying `Socket` may contain generics, generic type
-    /// information is lost after type erasure to `Arc<dyn Socket>`. Therefore
-    /// this function returns `Arc<dyn IndexNode>`, which can be converted to
-    /// `Option<&dyn Socket>` via `as_socket()` at the call site. Since the
-    /// conversion has already been checked internally, the caller can directly
-    /// `unwrap` to obtain `&dyn Socket`.
-    pub fn get_socket_inode(&self, fd: i32) -> Result<Arc<dyn IndexNode>, SystemError> {
-        let f = ProcessManager::current_pcb()
-            .fd_table()
-            .read()
-            .get_file_by_fd(fd)
-            .ok_or({
-                // log::warn!("get_socket: fd {} not found", fd);
-                SystemError::EBADF
-            })?;
-
-        if f.file_type() != FileType::Socket {
-            return Err(SystemError::ENOTSOCK);
-        }
-
-        let inode = f.inode();
-        // log::info!("get_socket: fd {} is a socket", fd);
-        if let Some(_sock) = inode.as_socket() {
-            // log::info!("{:?}", sock);
-            return Ok(inode);
-        }
-
-        Err(SystemError::ENOTSOCK)
     }
 
     fn is_alive_reparent_target(pcb: &Arc<ProcessControlBlock>) -> bool {

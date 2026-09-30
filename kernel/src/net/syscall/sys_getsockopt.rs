@@ -1,5 +1,6 @@
 use system_error::SystemError;
 
+use super::socket_fd::SocketFdRef;
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_GETSOCKOPT;
 use crate::arch::MMArch;
@@ -8,7 +9,6 @@ use crate::mm::MemoryManagementArch;
 use crate::net::socket::inet::stream::TcpOption;
 use crate::net::socket::packet::packet_option;
 use crate::net::socket::{PSO, PSOL};
-use crate::process::ProcessManager;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
 use crate::syscall::user_access::{UserBufferReader, UserBufferWriter};
 use alloc::string::ToString;
@@ -134,8 +134,8 @@ pub(super) fn do_getsockopt(
 ) -> Result<usize, SystemError> {
     // Linux resolves the descriptor before reading optlen. This preserves
     // EBADF/ENOTSOCK precedence over length-pointer failures.
-    let socket_inode = ProcessManager::current_pcb().get_socket_inode(fd as i32)?;
-    let socket = socket_inode.as_socket().unwrap();
+    let sock = SocketFdRef::from_fd(fd as i32)?;
+    let socket = sock.socket()?;
 
     // 参数合法性检查
     if optlen.is_null() {

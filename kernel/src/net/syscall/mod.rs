@@ -1,4 +1,5 @@
 // System call handlers for network-related syscalls
+pub mod socket_fd;
 pub mod sys_accept;
 pub mod sys_accept4;
 pub mod sys_bind;

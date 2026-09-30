@@ -1,5 +1,6 @@
 use system_error::SystemError;
 
+use super::socket_fd::SocketFdRef;
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_ACCEPT;
 use crate::filesystem::vfs::file::{File, FileFlags};
@@ -96,13 +97,12 @@ pub(crate) fn do_accept(
     addrlen: *mut u32,
     flags: u32,
 ) -> Result<usize, SystemError> {
-    let (new_socket, remote_endpoint) = {
-        ProcessManager::current_pcb()
-            .get_socket_inode(fd as i32)?
-            .as_socket()
-            .unwrap()
-            .accept()?
-    };
+    // Hold the open file description across the (possibly blocking) accept,
+    // matching Linux `__sys_accept4()` (`net/socket.c`, which pairs `fdget()`
+    // with `fdput()`): without it a concurrent `close(listener)` tears the
+    // socket down mid-wait.
+    let sock = SocketFdRef::from_fd(fd as i32)?;
+    let (new_socket, remote_endpoint) = sock.socket()?.accept()?;
 
     let mut file_mode = FileFlags::O_RDWR;
     if flags & FileFlags::O_NONBLOCK.bits() != 0 {

@@ -1,11 +1,11 @@
 use system_error::SystemError;
 
+use super::socket_fd::SocketFdRef;
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_SETSOCKOPT;
 use crate::net::socket::inet::stream::TcpOption;
 use crate::net::socket::packet::packet_option;
 use crate::net::socket::{IpOption, IFNAMSIZ, PIPV6, PSO, PSOL};
-use crate::process::ProcessManager;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
 use crate::syscall::user_access::UserBufferReader;
 use alloc::string::ToString;
@@ -89,7 +89,7 @@ impl Syscall for SysSetsockoptHandle {
         // Linux resolves the descriptor before inspecting any option-specific
         // length or user pointer. Keep the inode alive through the copy so a
         // concurrent close cannot change which socket receives the option.
-        let socket_inode = ProcessManager::current_pcb().get_socket_inode(fd as i32)?;
+        let sock = SocketFdRef::from_fd(fd as i32)?;
 
         // The syscall ABI declares optlen as a 32-bit signed int. Scalar
         // register arguments are truncated to the low 32 bits; negative
@@ -137,11 +137,7 @@ impl Syscall for SysSetsockoptHandle {
         };
         let data = &storage[..copied];
 
-        socket_inode
-            .as_socket()
-            .unwrap()
-            .set_option(sol, optname, data)
-            .map(|_| 0)
+        sock.socket()?.set_option(sol, optname, data).map(|_| 0)
     }
 
     /// Formats the syscall parameters for display/debug purposes

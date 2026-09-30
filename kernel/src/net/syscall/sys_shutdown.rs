@@ -1,9 +1,9 @@
 use system_error::SystemError;
 
+use super::socket_fd::SocketFdRef;
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_SHUTDOWN;
 use crate::net::socket::common::ShutdownBit;
-use crate::process::ProcessManager;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
 use alloc::string::ToString;
 use alloc::vec::Vec;
@@ -78,10 +78,8 @@ syscall_table_macros::declare_syscall!(SYS_SHUTDOWN, SysShutdownHandle);
 /// * `Ok(usize)` - 0 on success
 /// * `Err(SystemError)` - Error code if operation fails
 pub(super) fn do_shutdown(fd: usize, how: usize) -> Result<usize, SystemError> {
-    ProcessManager::current_pcb()
-        .get_socket_inode(fd as i32)?
-        .as_socket()
-        .unwrap()
+    SocketFdRef::from_fd(fd as i32)?
+        .socket()?
         .shutdown(ShutdownBit::try_from(how)?)
         .map(|()| 0)
 }

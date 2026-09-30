@@ -1,0 +1,15 @@
+[metadata]
+name = "docker"
+arch = "x86_64"
+
+[rootfs]
+fs_type = "ext4"
+size = "4G"
+partition = "mbr"
+
+[base]
+image = "dragonos-docker:ubuntu2404-29.1.3"
+pull_policy = "if-not-present"
+
+[user]
+config_dir = "user/dadk/config/sets/ubuntu2404"

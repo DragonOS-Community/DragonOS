@@ -787,6 +787,7 @@ impl NetnsPoller {
         first_origin: FragmentOrigin,
         completion: FragmentOrigin,
         broadcast: bool,
+        max_original_fragment_len: usize,
     ) {
         let source_mac = match first_origin.source_hardware_addr {
             HardwareAddress::Ethernet(mac) => mac,
@@ -830,7 +831,7 @@ impl NetnsPoller {
             DefragSource::LocalInput => Some(CtPacketContext::Untracked),
             DefragSource::LinkIngress => None,
         };
-        if let Err(error) = crate::driver::net::inject_owned_local_ip_packet_if_epoch(
+        if let Err(error) = crate::driver::net::inject_owned_local_ip_packet_if_epoch_with_fragment(
             owner.as_ref(),
             completion.ingress_ifindex,
             source_mac,
@@ -840,6 +841,11 @@ impl NetnsPoller {
             ct_context,
             first_origin.mark,
             Some(owner_epoch),
+            (completion.source == DefragSource::LinkIngress).then_some(
+                crate::net::forward_mtu::ReassembledForwardInfo {
+                    max_original_fragment_len,
+                },
+            ),
         ) {
             log::debug!("reassembled IP ingress discarded: {:?}", error);
         }
@@ -850,12 +856,20 @@ impl NetnsPoller {
             packet,
             first_origin,
             completion_origin,
+            max_original_fragment_len,
         } = datagram;
         // LOCAL_OUT has already selected its broadcast route. Keep that
         // offset-zero decision through reassembly instead of trying to infer
         // an explicit IFA_BROADCAST from the completed packet's address bits.
         let broadcast = first_origin.broadcast || packet[16..20] == [255; 4];
-        Self::reinject_ip(netns, packet, first_origin, completion_origin, broadcast);
+        Self::reinject_ip(
+            netns,
+            packet,
+            first_origin,
+            completion_origin,
+            broadcast,
+            max_original_fragment_len,
+        );
     }
 
     fn reinject_ipv6(netns: &NetNamespace, datagram: ReassembledIpv6<FragmentOrigin>) {
@@ -863,8 +877,16 @@ impl NetnsPoller {
             packet,
             first_origin,
             completion_origin,
+            max_original_fragment_len,
         } = datagram;
-        Self::reinject_ip(netns, packet, first_origin, completion_origin, false);
+        Self::reinject_ip(
+            netns,
+            packet,
+            first_origin,
+            completion_origin,
+            false,
+            max_original_fragment_len,
+        );
     }
 
     fn start(self: &Arc<Self>, name: String) {

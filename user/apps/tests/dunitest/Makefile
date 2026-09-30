@@ -101,6 +101,8 @@ $(BIN_DIR)/%_test: suites/%.cc $(GTEST_OBJ)
 
 $(BIN_DIR)/normal/ext4_inode_identity_test $(BIN_DIR)/normal/utimensat_symlink_test: suites/normal/loop_ext4_test_support.h
 
+$(BIN_DIR)/normal/forward_mtu_test: suites/normal/forward_mtu_nft_support.h
+
 run: build
 	@$(RUNNER_BIN) --bin-dir $(BIN_DIR) --results-dir $(RESULTS_DIR)
 

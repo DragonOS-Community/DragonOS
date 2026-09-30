@@ -334,6 +334,10 @@ impl IfaceCommon {
         })
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "routed packet admission carries explicit retry and forward provenance"
+    )]
     pub(super) fn enqueue_routed_output(
         &self,
         oif: u32,
@@ -341,8 +345,11 @@ impl IfaceCommon {
         ip_packet: &[u8],
         retry_at: smoltcp::time::Instant,
         probe_sent: bool,
+        fragment_info: Option<crate::net::forward_mtu::ReassembledForwardInfo>,
+        feedback: Option<&crate::net::forward_mtu::ForwardMtuFeedback>,
     ) -> Result<(), SystemError> {
-        let (packet, reservation) = self.prepare_routed_output(oif, next_hop, ip_packet)?;
+        let (packet, reservation) =
+            self.prepare_routed_output(oif, next_hop, ip_packet, fragment_info, feedback)?;
         if let Err(packet) = reservation.commit_deferred_packet(packet, retry_at, probe_sent, false)
         {
             self.local_input_queue.recycle_output(packet.frame);
@@ -356,8 +363,30 @@ impl IfaceCommon {
         oif: u32,
         next_hop: smoltcp::wire::IpAddress,
         ip_packet: &[u8],
+        fragment_info: Option<crate::net::forward_mtu::ReassembledForwardInfo>,
+        feedback: Option<&crate::net::forward_mtu::ForwardMtuFeedback>,
     ) -> Result<(LocalOutputPacket, LocalOutputReservation<'_>), SystemError> {
-        if ip_packet.len() > self.mtu.load(Ordering::Acquire) {
+        let prepared_ip = if next_hop.version() == smoltcp::wire::IpVersion::Ipv4 {
+            Some(routed_ipv4_progress(ip_packet, fragment_info)?)
+        } else if let Some(info) = fragment_info {
+            let netns = self.net_namespace().ok_or(SystemError::ENODEV)?;
+            Some(PreparedIpProgress::Ipv6 {
+                offset: 0,
+                identification: netns.next_ipv6_fragment_identification(),
+                max_fragment_len: Some(info.max_original_fragment_len),
+            })
+        } else {
+            None
+        };
+        if ip_packet.len() > self.mtu.load(Ordering::Acquire)
+            && !matches!(
+                prepared_ip,
+                Some(PreparedIpProgress::Ipv4 {
+                    may_fragment: true,
+                    ..
+                }) | Some(PreparedIpProgress::Ipv6 { .. })
+            )
+        {
             return Err(SystemError::EMSGSIZE);
         }
         let mut reservation = self
@@ -386,7 +415,8 @@ impl IfaceCommon {
                 frame,
                 ct_context: OutputCtContext::Untracked,
                 mark: 0,
-                prepared_ip: None,
+                prepared_ip,
+                forward_mtu_feedback: feedback.map(|item| item.persist()).transpose()?,
                 _charge: None,
             },
             reservation,
@@ -402,6 +432,8 @@ impl IfaceCommon {
         oif: u32,
         next_hop: smoltcp::wire::IpAddress,
         ip_packet: &[u8],
+        fragment_info: Option<crate::net::forward_mtu::ReassembledForwardInfo>,
+        feedback: Option<&crate::net::forward_mtu::ForwardMtuFeedback>,
     ) -> Result<Option<smoltcp::time::Instant>, SystemError> {
         let pending = self
             .local_input_queue
@@ -412,7 +444,8 @@ impl IfaceCommon {
         if !pending {
             return Ok(None);
         }
-        let (packet, reservation) = self.prepare_routed_output(oif, next_hop, ip_packet)?;
+        let (packet, reservation) =
+            self.prepare_routed_output(oif, next_hop, ip_packet, fragment_info, feedback)?;
         match reservation.commit_existing_deferred(packet) {
             ExistingDeferredCommit::Queued(retry_at) => Ok(Some(retry_at)),
             ExistingDeferredCommit::Missing(packet, reservation) => {
@@ -453,6 +486,10 @@ impl IfaceCommon {
     /// Transfer an accepted datagram to the actual egress neighbor queue.
     /// Failure returns ownership to the caller; its source reservation is
     /// still live until that caller decides to drop the packet.
+    #[expect(
+        clippy::result_large_err,
+        reason = "failed deferred handoff returns packet ownership for exact queue accounting"
+    )]
     pub(super) fn enqueue_prepared_deferred_output(
         &self,
         expected_netns: &Arc<NetNamespace>,
@@ -830,6 +867,7 @@ impl IfaceCommon {
             let ingress_stage = Cell::new(IngressStage::Pending);
             let handoff_broadcast = Cell::new(false);
             let mark = Cell::new(0);
+            let forward_fragment = Cell::new(None);
             let packet_context = core::cell::RefCell::new(None);
             let mut ingress_work: Vec<RoutedIngressWork> = Vec::new();
             let mut nft_filter = netns.as_ref().map(|netns| {
@@ -842,6 +880,7 @@ impl IfaceCommon {
                     stage: &ingress_stage,
                     handoff_broadcast: &handoff_broadcast,
                     mark: &mark,
+                    forward_fragment: &forward_fragment,
                     packet_context: &packet_context,
                     routes: (ipv6_forwarding || explicit_broadcast_ingress || ct_active)
                         .then_some(route_policy.as_ref())
@@ -863,6 +902,7 @@ impl IfaceCommon {
                         nft_filter.as_ref().map(|_| &handoff_broadcast),
                         nft_filter.as_ref().map(|_| &packet_context),
                         nft_filter.as_ref().map(|_| &mark),
+                        nft_filter.as_ref().map(|_| &forward_fragment),
                     );
                     Some(poll_smol(
                         &mut interface,
@@ -1176,6 +1216,7 @@ impl IfaceCommon {
                 let ingress_stage = Cell::new(IngressStage::Pending);
                 let handoff_broadcast = Cell::new(false);
                 let mark = Cell::new(0);
+                let forward_fragment = Cell::new(None);
                 let packet_context = core::cell::RefCell::new(None);
                 let mut nft_filter = netns.as_ref().map(|netns| {
                     NetIngressFilter::new(NetIngressFilterInit {
@@ -1187,6 +1228,7 @@ impl IfaceCommon {
                         stage: &ingress_stage,
                         handoff_broadcast: &handoff_broadcast,
                         mark: &mark,
+                        forward_fragment: &forward_fragment,
                         packet_context: &packet_context,
                         routes: (route_ingress
                             || ipv6_forwarding
@@ -1230,6 +1272,7 @@ impl IfaceCommon {
                         nft_filter.as_ref().map(|_| &handoff_broadcast),
                         nft_filter.as_ref().map(|_| &packet_context),
                         nft_filter.as_ref().map(|_| &mark),
+                        nft_filter.as_ref().map(|_| &forward_fragment),
                     );
                     for _ in 0..local_first_budget {
                         match poll_smol_single(
@@ -1314,6 +1357,7 @@ impl IfaceCommon {
                         nft_filter.as_ref().map(|_| &handoff_broadcast),
                         nft_filter.as_ref().map(|_| &packet_context),
                         nft_filter.as_ref().map(|_| &mark),
+                        nft_filter.as_ref().map(|_| &forward_fragment),
                     );
                     for _ in 0..remaining {
                         match poll_smol_single(
@@ -1351,6 +1395,7 @@ impl IfaceCommon {
                             device,
                             self,
                             backend_policy.unwrap(),
+                            None,
                             None,
                             None,
                             None,
@@ -1418,6 +1463,31 @@ impl IfaceCommon {
                     || output_drain.needs_immediate_poll()
                     || nft_ruleset_changed(),
             );
+        }
+    }
+
+    fn report_forward_mtu_drop(
+        netns: &Arc<NetNamespace>,
+        packet: &LocalOutputPacket,
+        error: SystemError,
+    ) {
+        if error != SystemError::EMSGSIZE {
+            return;
+        }
+        let (Some(feedback), LocalOutputDisposition::Routed { oif, ip_mtu, .. }) =
+            (&packet.forward_mtu_feedback, packet.disposition)
+        else {
+            return;
+        };
+        let devices = netns.device_list();
+        let Some(egress) = devices.get(&(oif as usize)).cloned() else {
+            return;
+        };
+        drop(devices);
+        // The output reservation has been released by the caller before this
+        // enters the ordinary local OUTPUT/POST_ROUTING path.
+        if let Err(error) = feedback.send(&packet.frame, ip_mtu.min(egress.mtu())) {
+            log::debug!("late forward MTU feedback discarded: {:?}", error);
         }
     }
 
@@ -1520,6 +1590,7 @@ impl IfaceCommon {
                                             error
                                         );
                                         drop(in_flight);
+                                        Self::report_forward_mtu_drop(&netns, &packet, error);
                                         self.local_input_queue.recycle_output(packet.frame);
                                     }
                                 }
@@ -1575,6 +1646,7 @@ impl IfaceCommon {
                         self.local_input_queue.complete_deferred_packet_failure(key);
                     }
                     drop(in_flight);
+                    Self::report_forward_mtu_drop(&netns, &output, error);
                     self.local_input_queue.recycle_output(output.frame);
                 }
                 LocalOutputTransmitResult::RetrySoon(output) => {

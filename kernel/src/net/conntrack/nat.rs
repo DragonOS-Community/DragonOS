@@ -28,6 +28,11 @@ pub(crate) enum NatManipSide {
     Source,
 }
 
+fn copy_available_prefix(destination: &mut [u8], replacement: &[u8]) {
+    let len = destination.len().min(replacement.len());
+    destination[..len].copy_from_slice(&replacement[..len]);
+}
+
 /// A redirect contains next-hop advice in the pre-NAT address space. Linux
 /// drops it for a NATed flow even at a hook where this particular side is a
 /// null binding.
@@ -60,6 +65,27 @@ pub(crate) fn rewrite_ipv4_related_icmp(
     quoted_to: CtTuple,
     side: NatManipSide,
     checksum_mode: CtChecksumMode,
+) -> Result<(), NatRewriteError> {
+    rewrite_ipv4_related_icmp_impl(packet, quoted_from, quoted_to, side, checksum_mode, false)
+}
+
+pub(crate) fn rewrite_ipv4_generated_related_icmp(
+    packet: &mut [u8],
+    quoted_from: CtTuple,
+    quoted_to: CtTuple,
+    side: NatManipSide,
+    checksum_mode: CtChecksumMode,
+) -> Result<(), NatRewriteError> {
+    rewrite_ipv4_related_icmp_impl(packet, quoted_from, quoted_to, side, checksum_mode, true)
+}
+
+fn rewrite_ipv4_related_icmp_impl(
+    packet: &mut [u8],
+    quoted_from: CtTuple,
+    quoted_to: CtTuple,
+    side: NatManipSide,
+    checksum_mode: CtChecksumMode,
+    generated: bool,
 ) -> Result<(), NatRewriteError> {
     let (
         CtAddress::V4(old_src),
@@ -133,18 +159,19 @@ pub(crate) fn rewrite_ipv4_related_icmp(
         }
         _ => {}
     }
-    let ParsedCtPacket::Related {
-        quoted,
-        outer_destination,
-    } = parse_ipv4_conntrack_with_mode(packet, checksum_mode)
-    else {
-        return Err(NatRewriteError::InvalidPacket);
-    };
-    if quoted != quoted_from {
-        return Err(NatRewriteError::TupleMismatch);
-    }
-    if side == NatManipSide::Destination && outer_destination != quoted_from.src {
-        return Err(NatRewriteError::TupleMismatch);
+    if !generated {
+        let ParsedCtPacket::Related {
+            quoted,
+            outer_destination,
+        } = parse_ipv4_conntrack_with_mode(packet, checksum_mode)
+        else {
+            return Err(NatRewriteError::InvalidPacket);
+        };
+        if quoted != quoted_from
+            || (side == NatManipSide::Destination && outer_destination != quoted_from.src)
+        {
+            return Err(NatRewriteError::TupleMismatch);
+        }
     }
     let Ipv4Header {
         header_len: outer_header_len,
@@ -155,6 +182,9 @@ pub(crate) fn rewrite_ipv4_related_icmp(
     if protocol != 1 {
         return Err(NatRewriteError::InvalidPacket);
     }
+    if total_len < outer_header_len + 28 {
+        return Err(NatRewriteError::InvalidPacket);
+    }
     let icmp = &packet[outer_header_len..total_len];
     // Redirects that actually need NAT are invalid in Linux: a redirect's
     // next-hop advice would refer to an address outside the recipient's view.
@@ -162,7 +192,41 @@ pub(crate) fn rewrite_ipv4_related_icmp(
         return Err(NatRewriteError::Unsupported);
     }
     let inner_offset = outer_header_len + 8;
-    let inner_header_len = usize::from(packet[inner_offset] & 0x0f) * 4;
+    let quoted_bytes = &packet[inner_offset..total_len];
+    let inner = ipv4_header(quoted_bytes, false);
+    let (inner_header_len, inner_source, inner_destination, inner_protocol) =
+        if let Some(inner) = inner {
+            (
+                inner.header_len,
+                inner.source,
+                inner.destination,
+                inner.protocol,
+            )
+        } else if generated && quoted_bytes.len() >= 20 && quoted_bytes[0] >> 4 == 4 {
+            // A minimum return MTU can truncate IPv4 options. The trigger
+            // was validated before quoting; its first 20 bytes still carry
+            // addresses, protocol, IHL and the incremental header checksum.
+            let header_len = usize::from(quoted_bytes[0] & 0x0f) * 4;
+            let full_len = usize::from(u16::from_be_bytes([quoted_bytes[2], quoted_bytes[3]]));
+            if !(20..=60).contains(&header_len)
+                || header_len <= quoted_bytes.len()
+                || full_len < header_len
+            {
+                return Err(NatRewriteError::InvalidPacket);
+            }
+            (
+                header_len,
+                quoted_bytes[12..16]
+                    .try_into()
+                    .map_err(|_| NatRewriteError::InvalidPacket)?,
+                quoted_bytes[16..20]
+                    .try_into()
+                    .map_err(|_| NatRewriteError::InvalidPacket)?,
+                quoted_bytes[9],
+            )
+        } else {
+            return Err(NatRewriteError::InvalidPacket);
+        };
     let transport_offset = inner_offset + inner_header_len;
     // The parser checked IHL and each protocol's minimum quote length. Keep
     // a local bounds guard before indexing a quoted transport header.
@@ -173,9 +237,40 @@ pub(crate) fn rewrite_ipv4_related_icmp(
     };
     if transport_offset
         .checked_add(required_l4)
-        .is_none_or(|end| end > total_len)
+        .is_none_or(|end| end > total_len && !generated)
     {
         return Err(NatRewriteError::InvalidPacket);
+    }
+    if generated {
+        let expected_protocol = match quoted_from.l4 {
+            CtL4::Tcp { .. } => 6,
+            CtL4::Udp { .. } => 17,
+            CtL4::Icmp { .. } => 1,
+            CtL4::Generic { protocol } => protocol,
+            CtL4::Icmpv6 { .. } => return Err(NatRewriteError::Unsupported),
+        };
+        if inner_source != old_src
+            || inner_destination != old_dst
+            || inner_protocol != expected_protocol
+            || (side == NatManipSide::Destination && packet[16..20] != old_src)
+        {
+            return Err(NatRewriteError::TupleMismatch);
+        }
+        let actual = &packet[transport_offset.min(total_len)..total_len];
+        let (expected_prefix, prefix_len) = match quoted_from.l4 {
+            CtL4::Tcp { src_port, dst_port } | CtL4::Udp { src_port, dst_port } => {
+                let a = src_port.to_be_bytes();
+                let b = dst_port.to_be_bytes();
+                ([a[0], a[1], b[0], b[1]], 4)
+            }
+            CtL4::Icmp { kind, code, .. } => ([kind, code, 0, 0], 2),
+            CtL4::Generic { .. } => ([0; 4], 0),
+            CtL4::Icmpv6 { .. } => unreachable!(),
+        };
+        let available = actual.len().min(prefix_len);
+        if actual[..available] != expected_prefix[..available] {
+            return Err(NatRewriteError::TupleMismatch);
+        }
     }
     if quoted_from == quoted_to {
         return Ok(());
@@ -189,7 +284,7 @@ pub(crate) fn rewrite_ipv4_related_icmp(
         .get(outer_addr_offset..outer_addr_offset + 4)
         .and_then(|bytes| bytes.try_into().ok())
         .ok_or(NatRewriteError::InvalidPacket)?;
-    let l4 = &mut packet[transport_offset..total_len];
+    let l4 = &mut packet[transport_offset.min(total_len)..total_len];
     match (quoted_from.l4, quoted_to.l4) {
         (CtL4::Tcp { .. }, CtL4::Tcp { .. }) => {
             // The first eight quoted bytes carry ports, not the TCP checksum
@@ -197,24 +292,31 @@ pub(crate) fn rewrite_ipv4_related_icmp(
             if l4.len() >= 20 {
                 adjust_transport_checksum(l4, 16, quoted_from, quoted_to)?;
             }
-            l4[0..2].copy_from_slice(&new_src_port.to_be_bytes());
-            l4[2..4].copy_from_slice(&new_dst_port.to_be_bytes());
+            let src = new_src_port.to_be_bytes();
+            let dst = new_dst_port.to_be_bytes();
+            let replacement = [src[0], src[1], dst[0], dst[1]];
+            copy_available_prefix(l4, &replacement);
         }
         (CtL4::Udp { .. }, CtL4::Udp { .. }) => {
-            if l4[6] != 0 || l4[7] != 0 {
+            if l4.len() >= 8 && (l4[6] != 0 || l4[7] != 0) {
                 adjust_transport_checksum(l4, 6, quoted_from, quoted_to)?;
                 if l4[6] == 0 && l4[7] == 0 {
                     l4[6..8].copy_from_slice(&u16::MAX.to_be_bytes());
                 }
             }
-            l4[0..2].copy_from_slice(&new_src_port.to_be_bytes());
-            l4[2..4].copy_from_slice(&new_dst_port.to_be_bytes());
+            let src = new_src_port.to_be_bytes();
+            let dst = new_dst_port.to_be_bytes();
+            let replacement = [src[0], src[1], dst[0], dst[1]];
+            copy_available_prefix(l4, &replacement);
         }
         (CtL4::Icmp { .. }, CtL4::Icmp { .. }) => {
-            let prior = u16::from_be_bytes([l4[2], l4[3]]);
-            l4[2..4]
-                .copy_from_slice(&replace_word(prior, old_src_port, new_src_port).to_be_bytes());
-            l4[4..6].copy_from_slice(&new_src_port.to_be_bytes());
+            if l4.len() >= 6 {
+                let prior = u16::from_be_bytes([l4[2], l4[3]]);
+                l4[2..4].copy_from_slice(
+                    &replace_word(prior, old_src_port, new_src_port).to_be_bytes(),
+                );
+                l4[4..6].copy_from_slice(&new_src_port.to_be_bytes());
+            }
         }
         (CtL4::Generic { .. }, CtL4::Generic { .. }) => {}
         _ => unreachable!("validated quoted protocol"),
@@ -682,6 +784,45 @@ mod tests {
         assert_related_checksums(&packet, original);
         assert_eq!(&packet[12..20], &[198, 51, 100, 8, 10, 0, 0, 2]);
         assert_eq!(&packet[28..], udp_packet(original, true));
+    }
+
+    #[test]
+    fn generated_related_rewrites_header_only_quote_at_minimum_return_mtu() {
+        let from = tuple([10, 0, 0, 2], [192, 0, 2, 3], 1234, 8080);
+        let to = tuple([10, 0, 0, 2], [203, 0, 113, 1], 1234, 8080);
+        let complete = udp_packet(from, false);
+        let mut quote = Vec::from(&complete[..20]);
+        quote.extend_from_slice(&[0; 20]);
+        quote[0] = 0x4a; // 40-byte IPv4 header; no transport bytes fit.
+        quote[2..4].copy_from_slice(&48u16.to_be_bytes());
+        quote[10..12].fill(0);
+        let inner_checksum = !checksum(&quote, 0);
+        quote[10..12].copy_from_slice(&inner_checksum.to_be_bytes());
+        let mut error = icmp_error(&quote, [192, 0, 2, 1], [10, 0, 0, 2]);
+        assert_eq!(error.len(), 68);
+        assert_eq!(
+            rewrite_ipv4_related_icmp(
+                &mut error,
+                from,
+                to,
+                NatManipSide::Source,
+                CtChecksumMode::Skip,
+            ),
+            Err(NatRewriteError::InvalidPacket)
+        );
+        rewrite_ipv4_generated_related_icmp(
+            &mut error,
+            from,
+            to,
+            NatManipSide::Source,
+            CtChecksumMode::Skip,
+        )
+        .unwrap();
+        assert_eq!(&error[12..16], &[203, 0, 113, 1]);
+        assert_eq!(&error[44..48], &[203, 0, 113, 1]);
+        assert_eq!(checksum(&error[..20], 0), u16::MAX);
+        assert_eq!(checksum(&error[20..], 0), u16::MAX);
+        assert_eq!(checksum(&error[28..68], 0), u16::MAX);
     }
 
     #[test]

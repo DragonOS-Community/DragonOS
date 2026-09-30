@@ -336,6 +336,7 @@ mod tests {
                 ct_context: OutputCtContext::Untracked,
                 mark: 0,
                 prepared_ip: None,
+                forward_mtu_feedback: None,
                 _charge: None,
             },
             retry_at,

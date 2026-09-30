@@ -190,6 +190,38 @@ pub(crate) fn inject_owned_local_ip_packet_if_epoch<I: Iface + ?Sized>(
     mark: u32,
     expected_epoch: Option<u64>,
 ) -> Result<(), SystemError> {
+    inject_owned_local_ip_packet_if_epoch_with_fragment(
+        iface,
+        ingress_ifindex,
+        source_mac,
+        ip_packet,
+        broadcast,
+        origin,
+        ct_context,
+        mark,
+        expected_epoch,
+        None,
+    )
+}
+
+/// Only a completed defragmentation may supply `forward_fragment`; ordinary
+/// local handoffs retain their existing ingress provenance and behavior.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "explicit packet provenance and device ownership at local handoff"
+)]
+pub(crate) fn inject_owned_local_ip_packet_if_epoch_with_fragment<I: Iface + ?Sized>(
+    iface: &I,
+    ingress_ifindex: u32,
+    source_mac: smoltcp::wire::EthernetAddress,
+    ip_packet: Vec<u8>,
+    broadcast: bool,
+    origin: LocalPacketOrigin,
+    ct_context: Option<CtPacketContext>,
+    mark: u32,
+    expected_epoch: Option<u64>,
+    forward_fragment: Option<crate::net::forward_mtu::ReassembledForwardInfo>,
+) -> Result<(), SystemError> {
     if ct_context.is_some() && origin == LocalPacketOrigin::LinkIngressPending {
         return Err(SystemError::EINVAL);
     }
@@ -211,6 +243,7 @@ pub(crate) fn inject_owned_local_ip_packet_if_epoch<I: Iface + ?Sized>(
         ip_packet,
         ct_context,
         mark,
+        forward_fragment,
     };
 
     let napi = iface.napi_struct();
@@ -443,9 +476,23 @@ pub trait Iface: crate::driver::base::device::Device {
         next_hop: &smoltcp::wire::IpAddress,
         ip_packet: &[u8],
     ) -> Result<(), SystemError> {
+        self.route_and_send_or_queue_with_fragment(next_hop, ip_packet, None, None)
+    }
+
+    /// Keep reassembly provenance with a forwarded datagram through queue
+    /// admission; a plain packet must never gain the router-only exception.
+    fn route_and_send_or_queue_with_fragment(
+        &self,
+        next_hop: &smoltcp::wire::IpAddress,
+        ip_packet: &[u8],
+        fragment_info: Option<crate::net::forward_mtu::ReassembledForwardInfo>,
+        feedback: Option<&crate::net::forward_mtu::ForwardMtuFeedback>,
+    ) -> Result<(), SystemError> {
         let next_hop = *next_hop;
-        if ip_packet.len() > self.mtu() {
-            return Err(SystemError::EMSGSIZE);
+        if next_hop.version() == smoltcp::wire::IpVersion::Ipv6 && self.mtu() < 1280 {
+            // A static route can survive an MTU change which disabled IPv6
+            // addresses on this link. It must not forward over that link.
+            return Err(SystemError::ENETDOWN);
         }
         let napi = self.napi_struct();
         let owner_netns = self.net_namespace();
@@ -453,10 +500,40 @@ pub trait Iface: crate::driver::base::device::Device {
         if napi.is_none() && scheduler_netns.is_none() {
             return Err(SystemError::ENODEV);
         }
+        if ip_packet.len() > self.mtu()
+            || fragment_info.is_some_and(|info| {
+                ip_packet.len()
+                    > if next_hop.version() == smoltcp::wire::IpVersion::Ipv6 {
+                        info.max_original_fragment_len.max(1280)
+                    } else {
+                        info.max_original_fragment_len
+                    }
+            })
+        {
+            // A forwarded datagram has already passed the packet hooks. Admit
+            // it whole and let the existing bounded output queue emit its
+            // fragments after resolving the next hop.
+            let (packet, reservation) = self.common().prepare_routed_output(
+                self.nic_id() as u32,
+                next_hop,
+                ip_packet,
+                fragment_info,
+                feedback,
+            )?;
+            reservation.requeue_ready(packet);
+            self.common().schedule_local_output(
+                crate::time::Instant::now().into(),
+                napi,
+                scheduler_netns,
+            );
+            return Ok(());
+        }
         if let Some(retry_at) = self.common().enqueue_existing_routed_output(
             self.nic_id() as u32,
             next_hop,
             ip_packet,
+            fragment_info,
+            feedback,
         )? {
             self.common()
                 .schedule_local_output(retry_at, napi, scheduler_netns);
@@ -478,6 +555,8 @@ pub trait Iface: crate::driver::base::device::Device {
                     self.nic_id() as u32,
                     next_hop,
                     ip_packet,
+                    fragment_info,
+                    feedback,
                 )?;
                 reservation.requeue_backpressured(packet, retry_at);
                 let retry_at = if self.common().release_tx_backpressure_after(tx_generation) {
@@ -498,6 +577,8 @@ pub trait Iface: crate::driver::base::device::Device {
             ip_packet,
             retry_at,
             probe_sent,
+            fragment_info,
+            feedback,
         )?;
         let retry_at = if owner_netns.as_ref().is_some_and(|netns| {
             crate::net::neighbor::release_deferred_after_enqueue(

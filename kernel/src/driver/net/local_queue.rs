@@ -74,6 +74,9 @@ pub(super) struct LocalInputRxToken<'a> {
     pub(super) ct_context_cell: Option<&'a RefCell<Option<CtPacketContext>>>,
     pub(super) mark: u32,
     pub(super) mark_cell: Option<&'a Cell<u32>>,
+    pub(super) forward_fragment: Option<crate::net::forward_mtu::ReassembledForwardInfo>,
+    pub(super) forward_fragment_cell:
+        Option<&'a Cell<Option<crate::net::forward_mtu::ReassembledForwardInfo>>>,
 }
 
 struct IngressStageScope<'a> {
@@ -133,11 +136,26 @@ impl RxToken for LocalInputRxToken<'_> {
             cell,
             previous: cell.replace(self.mark),
         });
+        let _fragment_scope = self.forward_fragment_cell.map(|cell| ForwardFragmentScope {
+            cell,
+            previous: cell.replace(self.forward_fragment),
+        });
         f(&self.frame)
     }
 
     fn meta(&self) -> PacketMeta {
         self.meta
+    }
+}
+
+struct ForwardFragmentScope<'a> {
+    cell: &'a Cell<Option<crate::net::forward_mtu::ReassembledForwardInfo>>,
+    previous: Option<crate::net::forward_mtu::ReassembledForwardInfo>,
+}
+
+impl Drop for ForwardFragmentScope<'_> {
+    fn drop(&mut self) {
+        self.cell.set(self.previous);
     }
 }
 
@@ -172,6 +190,8 @@ mod local_input_context_tests {
             ct_context_cell: Some(&context),
             mark: 0,
             mark_cell: None,
+            forward_fragment: None,
+            forward_fragment_cell: None,
         }
         .consume(|_| {
             assert_eq!(stage.get(), IngressStage::PreRoutingDone);
@@ -200,6 +220,8 @@ mod local_input_context_tests {
             ct_context_cell: Some(&context),
             mark: 0,
             mark_cell: None,
+            forward_fragment: None,
+            forward_fragment_cell: None,
         }
         .consume(|_| assert!(context.borrow().is_none()));
         assert!(context.borrow().is_none());
@@ -219,6 +241,8 @@ mod local_input_context_tests {
             ct_context_cell: None,
             mark: 0x1234_5678,
             mark_cell: Some(&mark),
+            forward_fragment: None,
+            forward_fragment_cell: None,
         }
         .consume(|_| assert_eq!(mark.get(), 0x1234_5678));
         assert_eq!(mark.get(), 0);
@@ -235,6 +259,7 @@ pub(super) struct LocalInputPacket {
     pub(super) ip_packet: Vec<u8>,
     pub(super) ct_context: Option<CtPacketContext>,
     pub(super) mark: u32,
+    pub(super) forward_fragment: Option<crate::net::forward_mtu::ReassembledForwardInfo>,
 }
 
 impl LocalInputPacket {
@@ -288,6 +313,8 @@ pub(super) struct LocalOutputPacket {
     /// Present only for an admitted complete datagram. Fragment progress
     /// advances after the device accepts a fragment, never on retry.
     pub(super) prepared_ip: Option<PreparedIpProgress>,
+    /// Only transit packets with a non-fragmentable PMTU boundary own this.
+    pub(super) forward_mtu_feedback: Option<Arc<crate::net::forward_mtu::ForwardMtuFeedback>>,
     pub(super) _charge: Option<OutputCharge>,
 }
 
@@ -314,8 +341,16 @@ impl OutputCtContext {
 
 #[derive(Debug, Clone, Copy)]
 pub(super) enum PreparedIpProgress {
-    Ipv4 { offset: usize, may_fragment: bool },
-    Ipv6 { offset: usize, identification: u32 },
+    Ipv4 {
+        offset: usize,
+        may_fragment: bool,
+        max_fragment_len: Option<usize>,
+    },
+    Ipv6 {
+        offset: usize,
+        identification: u32,
+        max_fragment_len: Option<usize>,
+    },
 }
 
 #[derive(Debug)]
@@ -586,6 +621,7 @@ impl<'a> LocalOutputReservation<'a> {
             ct_context: OutputCtContext::Untracked,
             mark: 0,
             prepared_ip: None,
+            forward_mtu_feedback: None,
             _charge: None,
         });
     }
@@ -614,7 +650,9 @@ impl<'a> LocalOutputReservation<'a> {
             prepared_ip: Some(PreparedIpProgress::Ipv4 {
                 offset: 0,
                 may_fragment,
+                max_fragment_len: None,
             }),
+            forward_mtu_feedback: None,
             _charge: charge,
         });
     }
@@ -643,7 +681,9 @@ impl<'a> LocalOutputReservation<'a> {
             prepared_ip: Some(PreparedIpProgress::Ipv6 {
                 offset: 0,
                 identification,
+                max_fragment_len: None,
             }),
+            forward_mtu_feedback: None,
             _charge: charge,
         });
     }
@@ -693,12 +733,17 @@ impl<'a> LocalOutputReservation<'a> {
                 ct_context: OutputCtContext::Untracked,
                 mark: 0,
                 prepared_ip: None,
+                forward_mtu_feedback: None,
                 _charge: None,
             },
             retry_at,
         );
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "requeue failure must return the owned packet without a second allocation"
+    )]
     pub(super) fn requeue_deferred(
         self,
         packet: LocalOutputPacket,
@@ -725,6 +770,10 @@ impl<'a> LocalOutputReservation<'a> {
         self.commit_packet(packet);
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "deferred admission failure preserves packet ownership and queue accounting"
+    )]
     pub(super) fn commit_deferred_packet(
         mut self,
         packet: LocalOutputPacket,
@@ -786,6 +835,10 @@ impl<'a> LocalOutputReservation<'a> {
         ExistingDeferredCommit::Queued(retry_at)
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "probe completion failure must return the owned packet"
+    )]
     pub(super) fn finish_deferred_probe(
         mut self,
         packet: LocalOutputPacket,
@@ -1181,7 +1234,9 @@ mod output_ct_context_tests {
                         prepared_ip: Some(PreparedIpProgress::Ipv6 {
                             offset: 1200,
                             identification: 42,
+                            max_fragment_len: None,
                         }),
+                        forward_mtu_feedback: None,
                         _charge: None,
                     },
                     now + smoltcp::time::Duration::from_millis(retry_ms),
@@ -1243,6 +1298,7 @@ mod output_ct_context_tests {
             ct_context: OutputCtContext::Tracked(alloc::boxed::Box::new(CtPacketContext::Invalid)),
             mark: 0x1234_5678,
             prepared_ip: None,
+            forward_mtu_feedback: None,
             _charge: None,
         });
 
@@ -1316,7 +1372,8 @@ mod output_ct_context_tests {
             packet.prepared_ip,
             Some(PreparedIpProgress::Ipv6 {
                 offset: 0,
-                identification: 42
+                identification: 42,
+                ..
             })
         ));
         assert_eq!(packet.mark, 0x8765_4321);

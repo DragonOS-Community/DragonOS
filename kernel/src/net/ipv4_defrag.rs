@@ -97,6 +97,7 @@ pub(crate) struct ReassembledIpv4<M> {
     pub(crate) packet: Vec<u8>,
     pub(crate) first_origin: M,
     pub(crate) completion_origin: M,
+    pub(crate) max_original_fragment_len: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -487,6 +488,7 @@ fn assemble<M>(
         packet,
         first_origin,
         completion_origin,
+        max_original_fragment_len: queue.largest_fragment,
     })
 }
 

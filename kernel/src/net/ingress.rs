@@ -61,6 +61,7 @@ pub(crate) struct NetIngressFilter<'a> {
     local_route_selected: Cell<bool>,
     broadcast_route_selected: Cell<bool>,
     mark: &'a Cell<u32>,
+    forward_fragment: &'a Cell<Option<super::forward_mtu::ReassembledForwardInfo>>,
     packet_context: &'a RefCell<Option<CtPacketContext>>,
     routes: Option<&'a OutputRouteGuard<'a>>,
     fib_routes: Option<&'a OutputRouteGuard<'a>>,
@@ -78,6 +79,7 @@ pub(crate) struct NetIngressFilterInit<'a> {
     pub(crate) stage: &'a Cell<IngressStage>,
     pub(crate) handoff_broadcast: &'a Cell<bool>,
     pub(crate) mark: &'a Cell<u32>,
+    pub(crate) forward_fragment: &'a Cell<Option<super::forward_mtu::ReassembledForwardInfo>>,
     pub(crate) packet_context: &'a RefCell<Option<CtPacketContext>>,
     pub(crate) routes: Option<&'a OutputRouteGuard<'a>>,
     pub(crate) fib_routes: Option<&'a OutputRouteGuard<'a>>,
@@ -108,6 +110,21 @@ pub(crate) enum RoutedIngressWork {
         target_epoch: u64,
         next_hop: IpAddress,
         packet: Vec<u8>,
+        fragment_info: Option<super::forward_mtu::ReassembledForwardInfo>,
+        netns: Arc<NetNamespace>,
+        ct_context: CtPacketContext,
+    },
+    MtuErrorIpv4 {
+        netns: Arc<NetNamespace>,
+        packet: Vec<u8>,
+        mtu: usize,
+        ct_context: Option<CtPacketContext>,
+    },
+    MtuErrorIpv6 {
+        netns: Arc<NetNamespace>,
+        packet: Vec<u8>,
+        mtu: usize,
+        ct_context: Option<CtPacketContext>,
     },
 }
 
@@ -132,6 +149,38 @@ impl RoutedIngressWork {
                     return;
                 }
                 let _ = netns.queue_ip_fragment(fragment);
+                return;
+            }
+            Self::MtuErrorIpv4 {
+                netns,
+                packet,
+                mtu,
+                ct_context,
+            } => {
+                if let Err(error) = super::forward_mtu::send_ipv4_frag_needed(
+                    &netns,
+                    &packet,
+                    mtu,
+                    ct_context.as_ref(),
+                ) {
+                    log::debug!("forward MTU feedback discarded: {:?}", error);
+                }
+                return;
+            }
+            Self::MtuErrorIpv6 {
+                netns,
+                packet,
+                mtu,
+                ct_context,
+            } => {
+                if let Err(error) = super::forward_mtu::send_ipv6_packet_too_big(
+                    &netns,
+                    &packet,
+                    mtu,
+                    ct_context.as_ref(),
+                ) {
+                    log::debug!("forward MTU feedback discarded: {:?}", error);
+                }
                 return;
             }
             Self::Local {
@@ -159,6 +208,9 @@ impl RoutedIngressWork {
                 target_epoch,
                 next_hop,
                 packet,
+                fragment_info,
+                netns,
+                ct_context,
             } => {
                 // A forward handoff runs after the source poll releases its
                 // locks. Pin veth TX admission until this handoff finishes so
@@ -184,7 +236,23 @@ impl RoutedIngressWork {
                 ) {
                     return;
                 }
-                target.route_and_send_or_queue(&next_hop, packet.as_slice())
+                let feedback =
+                    match super::forward_mtu::ForwardMtuFeedback::new(netns, ct_context, &packet) {
+                        Ok(feedback) => feedback,
+                        Err(_) => return,
+                    };
+                let result = target.route_and_send_or_queue_with_fragment(
+                    &next_hop,
+                    packet.as_slice(),
+                    fragment_info,
+                    feedback.as_ref(),
+                );
+                if result == Err(SystemError::EMSGSIZE) {
+                    if let Some(feedback) = feedback {
+                        let _ = feedback.send(&packet, target.mtu());
+                    }
+                }
+                result
             }
         };
         if let Err(error) = result {
@@ -204,6 +272,7 @@ impl<'a> NetIngressFilter<'a> {
             stage,
             handoff_broadcast,
             mark,
+            forward_fragment,
             packet_context,
             routes,
             fib_routes,
@@ -220,6 +289,7 @@ impl<'a> NetIngressFilter<'a> {
             local_route_selected: Cell::new(false),
             broadcast_route_selected: Cell::new(false),
             mark,
+            forward_fragment,
             packet_context,
             routes,
             fib_routes,
@@ -274,23 +344,35 @@ impl<'a> NetIngressFilter<'a> {
     }
 
     /// A packet rejected by a later filter never publishes its private flow.
-    /// Only INPUT or POSTROUTING may confirm a new candidate.
-    fn confirm_accepted_packet(&self, version: IpVersion) -> bool {
+    /// Only INPUT or POSTROUTING may confirm a new candidate. Return the
+    /// confirmed identity so a deferred forwarding error stays RELATED.
+    fn confirm_accepted_packet_context(&self, version: IpVersion) -> Option<CtPacketContext> {
         if !self.ct_active_for(version) {
-            return true;
+            return Some(CtPacketContext::Untracked);
         }
-        let Some(context) = self.packet_context.borrow_mut().take() else {
-            return false;
-        };
+        let context = self.packet_context.borrow_mut().take()?;
         match context {
-            CtPacketContext::Candidate(candidate) => self
-                .netns
-                .confirm_conntrack(candidate, crate::time::Instant::now())
-                .is_ok(),
-            CtPacketContext::Untracked | CtPacketContext::Invalid | CtPacketContext::Matched(_) => {
-                true
+            CtPacketContext::Candidate(candidate) => {
+                let confirmed = self
+                    .netns
+                    .confirm_conntrack(candidate, crate::time::Instant::now())
+                    .ok()?;
+                let flow = match confirmed {
+                    super::conntrack::CtConfirm::Inserted(flow)
+                    | super::conntrack::CtConfirm::Reused(flow) => flow,
+                };
+                Some(CtPacketContext::Matched(super::conntrack::CtMatch {
+                    flow,
+                    direction: super::conntrack::CtDirection::Original,
+                    state: super::conntrack::CtPacketState::New,
+                }))
             }
+            other => Some(other),
         }
+    }
+
+    fn confirm_accepted_packet(&self, version: IpVersion) -> bool {
+        self.confirm_accepted_packet_context(version).is_some()
     }
 
     /// The fixed outer NAT event runs at -100/+100 inside the ruleset's
@@ -672,11 +754,34 @@ impl<'a> NetIngressFilter<'a> {
                 let Some(target) = routes.ingress_device(route.oif) else {
                     return RouteInputVerdict::Drop;
                 };
-                if !target.flags().contains(InterfaceFlags::UP)
-                    || packet.bytes().len() > target.mtu()
-                    || self.work.try_reserve(1).is_err()
+                if !target.flags().contains(InterfaceFlags::UP) || self.work.try_reserve(1).is_err()
                 {
                     return RouteInputVerdict::Drop;
+                }
+                let mtu = target.mtu();
+                // IPv6 cannot use an interface whose link MTU is below the
+                // protocol minimum.  An explicit route may outlive removal
+                // of the interface's IPv6 addresses when its MTU shrinks;
+                // do not advertise an undeliverable 1280-byte PMTU for it.
+                if mtu < 1280 {
+                    return RouteInputVerdict::Drop;
+                }
+                if packet.bytes().len() > mtu
+                    && !self
+                        .forward_fragment
+                        .get()
+                        .is_some_and(|info| info.may_refragment(mtu))
+                {
+                    let Ok(packet) = packet.take_owned() else {
+                        return RouteInputVerdict::Drop;
+                    };
+                    self.work.push(RoutedIngressWork::MtuErrorIpv6 {
+                        netns: self.netns.clone(),
+                        packet,
+                        mtu,
+                        ct_context: self.packet_context.borrow().clone(),
+                    });
+                    return RouteInputVerdict::Forward;
                 }
                 let Ok(mut packet) = packet.take_owned() else {
                     return RouteInputVerdict::Drop;
@@ -708,14 +813,20 @@ impl<'a> NetIngressFilter<'a> {
                 } else {
                     self.allows_ipv6(NftIpv4Hook::PostRouting, packet.as_slice(), 0, route.oif)
                 };
-                if !post_allowed || !self.confirm_accepted_packet(IpVersion::Ipv6) {
+                if !post_allowed {
                     return RouteInputVerdict::Drop;
                 }
+                let Some(ct_context) = self.confirm_accepted_packet_context(IpVersion::Ipv6) else {
+                    return RouteInputVerdict::Drop;
+                };
                 self.work.push(RoutedIngressWork::Forward {
                     target_epoch: target.common().namespace_epoch(),
                     target,
                     next_hop: route.next_hop,
                     packet,
+                    fragment_info: self.forward_fragment.get(),
+                    netns: self.netns.clone(),
+                    ct_context,
                 });
                 RouteInputVerdict::Forward
             }
@@ -750,6 +861,7 @@ impl IpIngressFilter for NetIngressFilter<'_> {
             // Do not clear in begin_packet: a defrag reinjection still uses
             // IngressStage::Pending and must retain offset zero's mark.
             self.mark.set(0);
+            self.forward_fragment.set(None);
         }
         current
     }
@@ -1093,11 +1205,28 @@ impl IpIngressFilter for NetIngressFilter<'_> {
                 let Some(target) = routes.ingress_device(route.oif) else {
                     return RouteInputVerdict::Drop;
                 };
-                if !target.flags().contains(InterfaceFlags::UP)
-                    || packet.bytes().len() > target.mtu()
-                    || self.work.try_reserve(1).is_err()
+                if !target.flags().contains(InterfaceFlags::UP) || self.work.try_reserve(1).is_err()
                 {
                     return RouteInputVerdict::Drop;
+                }
+                let mtu = target.mtu();
+                if packet.bytes().len() > mtu
+                    && ipv4.dont_frag()
+                    && !self
+                        .forward_fragment
+                        .get()
+                        .is_some_and(|info| info.may_refragment(mtu))
+                {
+                    let Ok(packet) = packet.take_owned() else {
+                        return RouteInputVerdict::Drop;
+                    };
+                    self.work.push(RoutedIngressWork::MtuErrorIpv4 {
+                        netns: self.netns.clone(),
+                        packet,
+                        mtu,
+                        ct_context: self.packet_context.borrow().clone(),
+                    });
+                    return RouteInputVerdict::Forward;
                 }
                 let Ok(mut packet) = packet.take_owned() else {
                     return RouteInputVerdict::Drop;
@@ -1130,14 +1259,20 @@ impl IpIngressFilter for NetIngressFilter<'_> {
                 } else {
                     self.allows_ipv4(NftIpv4Hook::PostRouting, packet.as_slice(), 0, route.oif)
                 };
-                if !post_allowed || !self.confirm_accepted_packet(IpVersion::Ipv4) {
+                if !post_allowed {
                     return RouteInputVerdict::Drop;
                 }
+                let Some(ct_context) = self.confirm_accepted_packet_context(IpVersion::Ipv4) else {
+                    return RouteInputVerdict::Drop;
+                };
                 self.work.push(RoutedIngressWork::Forward {
                     target_epoch: target.common().namespace_epoch(),
                     target,
                     next_hop: route.next_hop,
                     packet,
+                    fragment_info: self.forward_fragment.get(),
+                    netns: self.netns.clone(),
+                    ct_context,
                 });
                 RouteInputVerdict::Forward
             }

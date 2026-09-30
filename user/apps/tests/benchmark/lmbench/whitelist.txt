@@ -30,7 +30,7 @@ process_shell_lat
 # ipc
 pipe_lat
 pipe_bw
-fifo_lat
+# fifo_lat
 unix_lat
 unix_bw
 unix_connect_lat

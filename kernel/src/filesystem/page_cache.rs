@@ -5,7 +5,7 @@ use core::{
 
 use alloc::{
     boxed::Box,
-    collections::{BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     sync::{Arc, Weak},
     vec::Vec,
 };
@@ -614,42 +614,33 @@ pub(crate) fn schedule_pagecache_io(work: Arc<Work>) {
     PAGECACHE_IO_WQS[idx].enqueue(work);
 }
 
-// Weak references retain the Arc allocation even after the mapping is dead.
-// Reclaim a bounded number on every insertion, rather than accumulating dead
-// mappings until somebody explicitly writes to drop_caches.
+// Registry membership follows the mapping's lifetime, not future allocations
+// or an explicit drop_caches request. A tree releases retired storage without
+// retaining a vector/hash table sized for the historical peak mapping count.
 struct PageCacheRegistry {
-    entries: Vec<Weak<PageCache>>,
-    cursor: usize,
+    entries: BTreeMap<u64, Weak<PageCache>>,
 }
 
 impl PageCacheRegistry {
-    const SCAN_BUDGET: usize = 16;
-
     const fn new() -> Self {
         Self {
-            entries: Vec::new(),
-            cursor: 0,
+            entries: BTreeMap::new(),
         }
     }
 
     fn register(&mut self, cache: &Arc<PageCache>) {
-        for _ in 0..Self::SCAN_BUDGET {
-            if self.entries.is_empty() {
-                self.cursor = 0;
-                break;
-            }
-            if self.cursor >= self.entries.len() {
-                self.cursor = 0;
-            }
-            // Do not upgrade here: dropping a temporary last strong reference
-            // could run PageCache teardown while the registry spinlock is held.
-            if self.entries[self.cursor].strong_count() == 0 {
-                self.entries.swap_remove(self.cursor);
-            } else {
-                self.cursor += 1;
-            }
+        // Unlike the diagnostic id, instance_id cannot wrap or be reused.
+        self.entries
+            .insert(cache.instance_id, Arc::downgrade(cache));
+    }
+
+    fn unregister(&mut self, instance_id: u64) -> Option<Weak<PageCache>> {
+        let retired = self.entries.remove(&instance_id);
+        if self.entries.is_empty() {
+            // BTreeMap may keep an empty root after removing its last entry.
+            self.entries.clear();
         }
-        self.entries.push(Arc::downgrade(cache));
+        retired
     }
 }
 
@@ -657,18 +648,22 @@ fn register_page_cache(cache: &Arc<PageCache>) {
     PAGECACHE_REGISTRY.lock_irqsave().register(cache);
 }
 
+fn unregister_page_cache(cache: &PageCache) {
+    let retired = PAGECACHE_REGISTRY
+        .lock_irqsave()
+        .unregister(cache.instance_id);
+    // Keep weak-reference deallocation outside the registry lock. The Arc's
+    // implicit weak reference also protects the currently running destructor.
+    drop(retired);
+}
+
 pub fn list_page_caches() -> Vec<Arc<PageCache>> {
-    let mut guard = PAGECACHE_REGISTRY.lock_irqsave();
-    let mut caches = Vec::new();
-    guard.entries.retain(|weak| {
-        if let Some(cache) = weak.upgrade() {
-            caches.push(cache);
-            true
-        } else {
-            false
-        }
-    });
-    guard.cursor = 0;
+    let guard = PAGECACHE_REGISTRY.lock_irqsave();
+    // Snapshot references outlive the registry lock: their final release may
+    // enter PageCache::drop and acquire this same lock to unregister. A failed
+    // upgrade means that destructor is already responsible for retirement.
+    let caches = guard.entries.values().filter_map(Weak::upgrade).collect();
+    drop(guard);
     caches
 }
 

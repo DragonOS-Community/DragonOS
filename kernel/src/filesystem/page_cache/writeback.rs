@@ -1196,6 +1196,8 @@ pub(super) struct TaggedWritebackBudgetRetry {
 
 impl Drop for PageCache {
     fn drop(&mut self) {
+        // Detach before taking writeback locks, including the no-retry path.
+        super::unregister_page_cache(self);
         let tickets = {
             let mut pending = self.tagged_writeback_budget_retries.lock();
             pending

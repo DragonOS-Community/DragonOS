@@ -25,63 +25,166 @@ impl Drop for PageCacheAccountingSelftestGuard {
     }
 }
 
-fn run_registry_churn_selftest() -> bool {
-    let mut registry = PageCacheRegistry::new();
-    // Bound stale entries during churn behind a live prefix. This phase alone
-    // does not prove that the scan will revisit the prefix after it dies.
-    let mut live: Vec<_> = (0..64)
+fn registry_contains_instance(instance_id: u64) -> bool {
+    PAGECACHE_REGISTRY
+        .lock_irqsave()
+        .entries
+        .contains_key(&instance_id)
+}
+
+fn registry_contains_mapping(cache: &Arc<PageCache>) -> bool {
+    PAGECACHE_REGISTRY
+        .lock_irqsave()
+        .entries
+        .get(&cache.instance_id)
+        .is_some_and(|entry| Weak::ptr_eq(entry, &Arc::downgrade(cache)))
+}
+
+fn wait_for_registry_retirement(identities: &[u64]) -> bool {
+    let retired = || {
+        let registry = PAGECACHE_REGISTRY.lock_irqsave();
+        identities
+            .iter()
+            .all(|id| !registry.entries.contains_key(id))
+    };
+    if retired() {
+        return true;
+    }
+    // Concurrent drop_caches snapshots may legitimately hold these mappings
+    // beyond our owner's drop. Observe retirement without registering or
+    // enumerating anything, allowing those snapshot owners to finish first.
+    let deadline = crate::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        crate::sched::sched_yield();
+        if retired() {
+            return true;
+        }
+        if crate::time::Instant::now() >= deadline {
+            return false;
+        }
+    }
+}
+
+fn run_registry_batch_retire_selftest() -> bool {
+    let mut live: Vec<_> = (0..256)
         .map(|_| PageCache::new_unowned(None, None))
         .collect();
-    for cache in &live {
-        registry.register(cache);
-    }
-    for _ in 0..4096 {
-        let transient = PageCache::new_unowned(None, None);
-        registry.register(&transient);
-        drop(transient);
-        if registry.entries.len() > 2 * live.len() {
-            return false;
-        }
-    }
-    // Every still-live mapping must remain discoverable after cursor wrapping
-    // and swap-removing dead entries. Cleanup must never discard a live entry.
-    if !live.iter().all(|cache| {
-        registry
-            .entries
-            .iter()
-            .any(|weak| Weak::ptr_eq(weak, &Arc::downgrade(cache)))
-    }) {
-        return false;
-    }
-
-    // Retain some original mappings, retire the old prefix, and publish new
-    // live mappings before resuming churn. A scan stuck deleting only the
-    // newest transient can stay bounded yet leave this expired prefix behind.
-    let mut survivors = live.split_off(48);
-    let expired: Vec<_> = live.iter().map(Arc::downgrade).collect();
+    let identities: Vec<_> = live.iter().map(|cache| cache.instance_id).collect();
+    let published = live.iter().all(registry_contains_mapping);
+    let survivors = live.split_off(128);
     drop(live);
-    for _ in 0..16 {
-        let cache = PageCache::new_unowned(None, None);
-        registry.register(&cache);
-        survivors.push(cache);
-    }
+    let partial_retirement = wait_for_registry_retirement(&identities[..128])
+        && survivors.iter().all(registry_contains_mapping);
+
+    // Do not register another cache or enumerate the registry after retirement:
+    // neither operation may be required to release these dead registry entries.
+    drop(survivors);
+    let retired = wait_for_registry_retirement(&identities);
+    published && partial_retirement && retired
+}
+
+fn run_registry_churn_selftest() -> bool {
+    let live: Vec<_> = (0..64)
+        .map(|_| PageCache::new_unowned(None, None))
+        .collect();
     for _ in 0..4096 {
         let transient = PageCache::new_unowned(None, None);
-        registry.register(&transient);
+        let id = transient.instance_id;
+        if !registry_contains_mapping(&transient) {
+            return false;
+        }
         drop(transient);
-        if registry.entries.len() > 128 {
+        if !wait_for_registry_retirement(&[id]) {
             return false;
         }
     }
-    expired
-        .iter()
-        .all(|dead| !registry.entries.iter().any(|weak| Weak::ptr_eq(weak, dead)))
-        && survivors.iter().all(|cache| {
-            registry
-                .entries
-                .iter()
-                .any(|weak| Weak::ptr_eq(weak, &Arc::downgrade(cache)))
-        })
+    // Churn must preserve every live mapping, including a prefix larger than
+    // the old scan budget. Check production registration/destruction wiring.
+    let live_discoverable = live.iter().all(registry_contains_mapping);
+    let identities: Vec<_> = live.iter().map(|cache| cache.instance_id).collect();
+    drop(live);
+    live_discoverable && wait_for_registry_retirement(&identities)
+}
+
+fn run_registry_snapshot_lifetime_selftest() -> bool {
+    let cache = PageCache::new_unowned(None, None);
+    let id = cache.instance_id;
+    let identity = Arc::downgrade(&cache);
+    let snapshot = list_page_caches();
+    let found = snapshot.iter().any(|entry| Arc::ptr_eq(entry, &cache));
+    drop(cache);
+    let snapshot_pins_mapping = registry_contains_instance(id) && identity.strong_count() != 0;
+    drop(snapshot);
+    let retired = wait_for_registry_retirement(&[id]) && identity.strong_count() == 0;
+
+    // Exercise the last-entry removal too; this must not leave historical
+    // storage in a private registry after all its members retire.
+    let mut registry = PageCacheRegistry::new();
+    let cache = PageCache::new_unowned(None, None);
+    registry.register(&cache);
+    let removed = registry
+        .unregister(cache.instance_id)
+        .is_some_and(|entry| Weak::ptr_eq(&entry, &Arc::downgrade(&cache)));
+    found && snapshot_pins_mapping && retired && removed && registry.entries.is_empty()
+}
+
+fn run_registry_concurrent_snapshot_selftest() -> bool {
+    use crate::process::kthread::{KernelThreadClosure, KernelThreadMechanism};
+
+    let anchor = PageCache::new_unowned(None, None);
+    let anchor_id = anchor.instance_id;
+    let ready = Arc::new(Completion::new());
+    let release = Arc::new(Completion::new());
+    let worker_ready = ready.clone();
+    let worker_release = release.clone();
+    let closure = KernelThreadClosure::EmptyClosure((
+        Box::new(move || {
+            let snapshot = list_page_caches();
+            let found = snapshot.iter().any(|cache| cache.instance_id == anchor_id);
+            worker_ready.complete();
+            if worker_release.wait_for_completion().is_err() {
+                return 1;
+            }
+            drop(snapshot);
+            for _ in 0..128 {
+                let snapshot = list_page_caches();
+                crate::sched::sched_yield();
+                drop(snapshot);
+            }
+            if found {
+                0
+            } else {
+                1
+            }
+        }),
+        (),
+    ));
+    let Some(worker) =
+        KernelThreadMechanism::create_and_run(closure, "pagecache-registry-selftest".into())
+    else {
+        return false;
+    };
+    let ready_ok = ready.wait_for_completion().is_ok();
+    drop(anchor);
+    // The worker's real snapshot must pin the mapping across the owner's drop.
+    let snapshot_pins_mapping = registry_contains_instance(anchor_id);
+    release.complete_all();
+
+    let mut identities = Vec::new();
+    for _ in 0..256 {
+        let transient = PageCache::new_unowned(None, None);
+        identities.push(transient.instance_id);
+        crate::sched::sched_yield();
+        drop(transient);
+    }
+    // Wait for every snapshot to release its strong references before checking
+    // final retirement, including after a failed local assertion.
+    let worker_ok = matches!(KernelThreadMechanism::stop(&worker), Ok(0));
+    ready_ok
+        && snapshot_pins_mapping
+        && worker_ok
+        && wait_for_registry_retirement(&[anchor_id])
+        && wait_for_registry_retirement(&identities)
 }
 
 fn run_writeback_domain_lifecycle_selftest() -> bool {
@@ -2037,8 +2140,20 @@ pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, S
     }
     let _running = PageCacheAccountingSelftestGuard;
 
+    if !run_registry_batch_retire_selftest() {
+        return Ok("status=fail stage=registry_batch_retire\n".into());
+    }
+
     if !run_registry_churn_selftest() {
         return Ok("status=fail stage=registry_churn\n".into());
+    }
+
+    if !run_registry_snapshot_lifetime_selftest() {
+        return Ok("status=fail stage=registry_snapshot_lifetime\n".into());
+    }
+
+    if !run_registry_concurrent_snapshot_selftest() {
+        return Ok("status=fail stage=registry_concurrent_snapshot\n".into());
     }
 
     if !run_write_prepare_rollback_selftest()? {
@@ -3924,6 +4039,6 @@ pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, S
     }
 
     Ok(alloc::format!(
-        "status=ok\nregistry_churn=ok\nramfs_fallocate_range=ok\nwrite_prepare_rollback=ok\npreallocate_rollback=ok\nwriteback_domain_lifecycle=ok\ndetached_read_batch_completion=ok\npreallocated_batch_lifecycle=ok\nfile_membership=ok\nshmem_membership=ok\ndirty_membership=ok\ndirty_incarnation=ok\nremote_dirty_publish=ok\nwriteback_membership=ok\nwriteback_admission_order=ok\nwriteback_submission_token=ok\nwriteback_defer_progress=ok\nwriteback_budget_retry=ok\nsubmitted_writeback=ok\nfault_invalidate_retry_order=ok\ntag_scan_chunk_release=ok\nunevictable_membership=ok\ninflight_teardown=ok\nlate_completion=ok\nglobal_wiring=ok\nlayout=ok\nfile_drop_drift={file_drop_drift}\nshmem_drop_drift={shmem_drop_drift}\ndirty_drop_drift={dirty_drop_drift}\nwriteback_drop_drift={writeback_drop_drift}\nunevictable_drop_drift={unevictable_drop_drift}\nentry_size={entry_size}\nbaseline_size={baseline_size}\n"
+        "status=ok\nregistry_churn=ok\nregistry_batch_retire=ok\nregistry_snapshot_lifetime=ok\nregistry_concurrent_snapshot=ok\nramfs_fallocate_range=ok\nwrite_prepare_rollback=ok\npreallocate_rollback=ok\nwriteback_domain_lifecycle=ok\ndetached_read_batch_completion=ok\npreallocated_batch_lifecycle=ok\nfile_membership=ok\nshmem_membership=ok\ndirty_membership=ok\ndirty_incarnation=ok\nremote_dirty_publish=ok\nwriteback_membership=ok\nwriteback_admission_order=ok\nwriteback_submission_token=ok\nwriteback_defer_progress=ok\nwriteback_budget_retry=ok\nsubmitted_writeback=ok\nfault_invalidate_retry_order=ok\ntag_scan_chunk_release=ok\nunevictable_membership=ok\ninflight_teardown=ok\nlate_completion=ok\nglobal_wiring=ok\nlayout=ok\nfile_drop_drift={file_drop_drift}\nshmem_drop_drift={shmem_drop_drift}\ndirty_drop_drift={dirty_drop_drift}\nwriteback_drop_drift={writeback_drop_drift}\nunevictable_drop_drift={unevictable_drop_drift}\nentry_size={entry_size}\nbaseline_size={baseline_size}\n"
     ))
 }

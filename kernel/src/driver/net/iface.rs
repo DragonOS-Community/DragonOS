@@ -429,8 +429,22 @@ pub trait Iface: crate::driver::base::device::Device {
         };
 
         let dispatch = {
+            // Linux arp_announce=0 announces a namespace-local IP source,
+            // including an address owned by another interface. Forwarded
+            // remote sources must instead use the egress interface fallback.
+            let arp_source = smoltcp::wire::Ipv4Packet::new_checked(ip_packet)
+                .ok()
+                .filter(|packet| packet.version() == 4)
+                .map(|packet| packet.src_addr())
+                .filter(|source| {
+                    self.net_namespace().is_some_and(|netns| {
+                        crate::net::route::ipv4_addr_type(&netns, *source)
+                            == crate::net::route::RTN_LOCAL
+                    })
+                })
+                .map(smoltcp::wire::IpAddress::Ipv4);
             let mut interface = self.smol_iface().lock();
-            interface.dispatch_ip_packet(
+            interface.dispatch_ip_packet_with_arp_source(
                 crate::time::Instant::now().into(),
                 PreparedFrameTxToken {
                     frame: &mut frame,
@@ -439,6 +453,7 @@ pub trait Iface: crate::driver::base::device::Device {
                 *next_hop,
                 permanent_neighbor,
                 ip_packet,
+                arp_source,
             )
         };
 

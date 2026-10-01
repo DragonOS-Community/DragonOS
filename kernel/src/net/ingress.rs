@@ -921,54 +921,14 @@ impl IpIngressFilter for NetIngressFilter<'_> {
         false
     }
 
-    fn applies_to(&self, version: IpVersion) -> bool {
-        match version {
-            IpVersion::Ipv4 => {
-                self.handoff_broadcast.get()
-                    || self.ct_active_for(IpVersion::Ipv4)
-                    || !self.raw_listeners.is_empty()
-                    || self.ruleset.has_ipv4_hook(NftIpv4Hook::LocalIn)
-                    || match self.stage.get() {
-                        IngressStage::Pending => {
-                            self.routes.is_some()
-                                || self.ruleset.has_ipv4_hook(NftIpv4Hook::PreRouting)
-                        }
-                        IngressStage::LocalOutput => {
-                            // The output route already selected a local socket owner.
-                            // Even with no rules, the filtered path must retain that
-                            // decision for addresses covered by a loopback subnet.
-                            true
-                        }
-                        IngressStage::PreRoutingDone | IngressStage::LocalInputDone => false,
-                    }
-            }
-            IpVersion::Ipv6 => {
-                self.stage.get() == IngressStage::LocalInputDone
-                    || self.ct_active_for(IpVersion::Ipv6)
-                    || self.netns.ipv6_forwarding_enabled()
-                    || !self.raw_listeners.is_empty()
-                    || self.ruleset.has_ipv6_hook(NftIpv4Hook::LocalIn)
-                    || (self.stage.get() == IngressStage::Pending && self.routes.is_some())
-                    || (self.stage.get() != IngressStage::PreRoutingDone
-                        && self.ruleset.has_ipv6_hook(NftIpv4Hook::PreRouting))
-            }
-        }
-    }
-
-    fn applies_to_packet(&self, version: IpVersion, packet: &[u8]) -> bool {
-        if self.applies_to(version) {
-            return true;
-        }
-        // Fragmented IPv6 local delivery needs the filtered path even with
-        // no nft rules or conntrack. Avoid the slower path for ordinary IPv6.
-        version == IpVersion::Ipv6
-            && packet
-                .get(6)
-                .is_some_and(|next| matches!(next, 0 | 43 | 44 | 51 | 60))
-            && !matches!(
-                ipv6_fragment_offset(packet, Ipv6DefragDomain::local_input(0, 0)),
-                Ok(None)
-            )
+    fn applies_to(&self, _version: IpVersion) -> bool {
+        // DragonOS owns raw RX delivery, including socket filters, address
+        // matching and receive-memory accounting. An empty listener snapshot
+        // must not enable smoltcp's independent, unfiltered raw queue: a raw
+        // socket can be attached after the snapshot but before polling takes
+        // the socket-set lock. Keep one ingress owner even during publication.
+        // Empty rules and listener lists already avoid packet copies below.
+        true
     }
 
     fn pre_routing_ipv6_defrag(

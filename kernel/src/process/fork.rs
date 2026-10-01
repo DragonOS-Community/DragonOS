@@ -439,6 +439,9 @@ impl ProcessManager {
         new_pcb: &Arc<ProcessControlBlock>,
     ) -> Result<(), SystemError> {
         if clone_flags.contains(CloneFlags::CLONE_SIGHAND) {
+            if clone_flags.contains(CloneFlags::CLONE_THREAD) {
+                new_pcb.replace_process_signal(current_pcb.process_signal());
+            }
             new_pcb.replace_sighand(current_pcb.sighand());
             return Ok(());
         }
@@ -611,10 +614,10 @@ impl ProcessManager {
         // exec 去线程化期间不允许创建新线程
         if clone_flags.contains(CloneFlags::CLONE_THREAD)
             && (current_pcb
-                .sighand()
+                .process_signal()
                 .flags_contains(SignalFlags::GROUP_EXEC)
                 || current_pcb
-                    .sighand()
+                    .process_signal()
                     .flags_contains(SignalFlags::GROUP_EXIT))
         {
             return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
@@ -648,7 +651,7 @@ impl ProcessManager {
         // 需要阻止全局init和容器内init进程创建兄弟进程。
         if clone_flags.contains(CloneFlags::CLONE_PARENT)
             && current_pcb
-                .sighand()
+                .process_signal()
                 .flags_contains(SignalFlags::UNKILLABLE)
         {
             return Err(SystemError::EINVAL);
@@ -883,6 +886,8 @@ impl ProcessManager {
             unsafe {
                 let ptr = pcb.as_ref() as *const ProcessControlBlock as *mut ProcessControlBlock;
                 (*ptr).tgid = current_pcb.tgid;
+                // Unpublished CLONE_THREAD child shares process timers.
+                (*ptr).itimers = current_pcb.itimers.clone();
             }
         } else {
             pcb.thread.write_irqsave().group_leader = Arc::downgrade(pcb);
@@ -1043,7 +1048,7 @@ impl ProcessManager {
                 // thread publication have a single linearization order.
                 let inherited_tty = current_pcb.sig_info_irqsave().tty();
                 pcb.sig_info_mut().set_tty(inherited_tty);
-                if let Err(err) = current_pcb.sighand().with_group_exec_check(|| {
+                if let Err(err) = current_pcb.process_signal().with_group_exec_check(|| {
                     attach_sem_undo();
                     let live = pcb
                         .threads_read_irqsave()
@@ -1109,7 +1114,7 @@ impl ProcessManager {
 
                 if pid.is_child_reaper() {
                     pid.ns_of_pid().set_child_reaper(Arc::downgrade(pcb));
-                    pcb.sighand().flags_insert(SignalFlags::UNKILLABLE);
+                    pcb.process_signal().flags_insert(SignalFlags::UNKILLABLE);
                 }
 
                 let real_parent = pcb
@@ -1390,7 +1395,7 @@ impl ProcessControlBlock {
         if pid_type == PidType::PID {
             self.thread_pid.write().replace(pid);
         } else {
-            self.sighand().set_pid(pid_type, Some(pid));
+            self.process_signal().set_pid(pid_type, Some(pid));
         }
     }
 }

@@ -72,7 +72,7 @@ pub fn force_kernel_signal_to_current(sig: Signal) -> Result<(), SystemError> {
         }
 
         if action.is_default() {
-            pcb.sighand().flags_remove(SignalFlags::UNKILLABLE);
+            pcb.process_signal().flags_remove(SignalFlags::UNKILLABLE);
         }
     }
 
@@ -121,7 +121,7 @@ pub fn force_sig_fault_to_current(
         }
 
         if action.is_default() {
-            pcb.sighand().flags_remove(SignalFlags::UNKILLABLE);
+            pcb.process_signal().flags_remove(SignalFlags::UNKILLABLE);
         }
     }
 
@@ -157,7 +157,7 @@ pub fn force_kernel_default_signal_to_current(sig: Signal) -> Result<(), SystemE
         action.set_action(SigactionType::SaHandler(SaHandlerType::Default));
         pcb.sighand().set_handler(sig, action);
     }
-    pcb.sighand().flags_remove(SignalFlags::UNKILLABLE);
+    pcb.process_signal().flags_remove(SignalFlags::UNKILLABLE);
 
     {
         let mut siginfo = pcb.sig_info_mut();
@@ -225,18 +225,18 @@ impl Signal {
 
     /// Fatal SIGKILL check for the OOM path.
     ///
-    /// DragonOS currently stores process-level signals in `sighand.shared_pending`,
+    /// Process-level signals live in the thread group's pending queue,
     /// while the global `fatal_signal_pending()` only checks thread-level pending.
     /// The OOM killer needs to know whether the current task is already destined to
     /// exit, to avoid continuing to select and kill new victims. This helper is
     /// read-only and does not consume the signal.
     pub fn oom_fatal_signal_pending(pcb: &Arc<ProcessControlBlock>) -> bool {
-        if pcb.sighand().group_exit_code_if_set().is_some() {
+        if pcb.process_signal().group_exit_code_if_set().is_some() {
             return true;
         }
 
         if pcb
-            .sighand()
+            .process_signal()
             .shared_pending_signal()
             .contains(Signal::SIGKILL.into())
         {
@@ -370,7 +370,10 @@ impl Signal {
             pcb_info.sig_pending_mut().queue_mut().q.push(new_sig_info);
         } else {
             // Process-level signal: add to shared_pending
-            if !pcb.sighand().shared_pending_push_dedup(*self, new_sig_info) {
+            if !pcb
+                .process_signal()
+                .shared_pending_push_dedup(*self, new_sig_info)
+            {
                 return Ok(0);
             }
         }
@@ -411,7 +414,7 @@ impl Signal {
         } else {
             // 进程级信号：添加到 shared_pending（不需要 siginfo_guard）
             drop(siginfo_guard);
-            pcb.sighand().shared_pending_push(*self, info);
+            pcb.process_signal().shared_pending_push(*self, info);
         }
 
         // complete_signal 会统一：设置对应 pending 位图、更新 HAS_PENDING_SIGNAL，并按需唤醒
@@ -459,7 +462,7 @@ impl Signal {
         } else if !shared_bitmap_set {
             // Process-level signal: on the normal path the enqueue function has already set the
             // bitmap inside the sighand write critical section; only non-enqueueing fast paths such as SIGKILL / KTHREAD set it here.
-            pcb.sighand().shared_pending_signal_insert(*self);
+            pcb.process_signal().shared_pending_signal_insert(*self);
         }
 
         // 若目标进程存在 signalfd 监听该信号，需要唤醒其等待者/epoll。
@@ -487,7 +490,7 @@ impl Signal {
         }
 
         if !target
-            .sighand()
+            .process_signal()
             .start_group_exit_for_fatal_signal(*self as usize)
         {
             // Linux only performs the O(n) fatal broadcast for the first
@@ -571,7 +574,7 @@ impl Signal {
         let tasks = ProcessManager::thread_group_tasks_snapshot(leader.clone());
 
         let start = suggested
-            .sighand()
+            .process_signal()
             .curr_target()
             .unwrap_or_else(|| leader.clone());
         let start_index = tasks
@@ -583,7 +586,7 @@ impl Signal {
             let idx = (start_index + offset) % tasks.len();
             let task = tasks[idx].clone();
             if self.wants_signal(task.clone()) {
-                suggested.sighand().set_curr_target(&task);
+                suggested.process_signal().set_curr_target(&task);
                 return Some(task);
             }
         }
@@ -653,7 +656,7 @@ impl Signal {
         if let Some(sa) = sighand.handler(*self) {
             // 容器中的 init 进程 或者 被标记为 UNKILLABLE 的进程，如果Handler为默认且不是强制发送，永远不能忽略 SIGKILL 和 SIGSTOP
             let is_dfl = sa.is_default();
-            if unlikely(sighand.flags_contains(SignalFlags::UNKILLABLE))
+            if unlikely(pcb.process_signal().flags_contains(SignalFlags::UNKILLABLE))
                 && is_dfl
                 && !(force && SIG_KERNEL_ONLY_MASK.contains(self.into_sigset()))
             {
@@ -715,7 +718,7 @@ impl Signal {
         // exit has started. In particular, SIGCONT must not revive a group
         // whose job-control state was cleared by do_group_exit().
         if thread_group_leader
-            .sighand()
+            .process_signal()
             .flags_contains(SignalFlags::GROUP_EXIT)
         {
             return *self == Signal::SIGKILL;
@@ -726,7 +729,7 @@ impl Signal {
             flush = Signal::SIGCONT.into_sigset();
             // Stop 类信号：清理 SIGCONT（共享 + 各线程私有 pending）
             thread_group_leader
-                .sighand()
+                .process_signal()
                 .shared_pending_flush_by_mask(&flush);
             ProcessManager::for_each_thread_in_group(thread_group_leader.clone(), |t| {
                 t.sig_info_mut().sig_pending_mut().flush_by_mask(&flush);
@@ -744,20 +747,24 @@ impl Signal {
             // Not traced: transactional group-stop (atomically set STOP_STOPPED | CLD_STOPPED +
             // stop_signal while holding the sighand lock), matching Linux's sighand -> pi_lock
             // -> rq_lock ordering to prevent a concurrent SIGCONT from tearing the transition.
-            let fresh_stop = thread_group_leader
-                .sighand()
-                .transition_group_stop(*self, || {
-                    // stop_task only rejects an already Exited task. Publishing
-                    // the group event therefore requires at least one live
-                    // member; every live member in this stable snapshot is
-                    // transitioned to Stopped before the callback returns.
-                    let mut has_live_member = false;
-                    ProcessManager::for_each_thread_in_group(thread_group_leader.clone(), |t| {
-                        has_live_member |= ProcessManager::stop_task(&t).is_ok();
-                        true
+            let fresh_stop =
+                thread_group_leader
+                    .process_signal()
+                    .transition_group_stop(*self, || {
+                        // stop_task only rejects an already Exited task. Publishing
+                        // the group event therefore requires at least one live
+                        // member; every live member in this stable snapshot is
+                        // transitioned to Stopped before the callback returns.
+                        let mut has_live_member = false;
+                        ProcessManager::for_each_thread_in_group(
+                            thread_group_leader.clone(),
+                            |t| {
+                                has_live_member |= ProcessManager::stop_task(&t).is_ok();
+                                true
+                            },
+                        );
+                        has_live_member
                     });
-                    has_live_member
-                });
 
             if fresh_stop {
                 if let Some(parent) = pcb.parent_pcb() {
@@ -790,7 +797,7 @@ impl Signal {
             assert!(!flush.is_empty());
             // 清理 STOP 类挂起信号
             thread_group_leader
-                .sighand()
+                .process_signal()
                 .shared_pending_flush_by_mask(&flush);
             ProcessManager::for_each_thread_in_group(thread_group_leader.clone(), |t| {
                 t.sig_info_mut().sig_pending_mut().flush_by_mask(&flush);
@@ -911,9 +918,10 @@ fn has_pending_signals(sigset: &SigSet, blocked: &SigSet) -> bool {
 }
 
 impl ProcessControlBlock {
-    // Lock order rule: sighand -> sig_info. Never take sighand after sig_info.
+    // Lock order: sighand -> group_pending -> sig_info. Do not enter a
+    // process-wide signal lock while holding sig_info.
     /// 按“线程 pending -> 进程 shared pending”的顺序取出一个可见信号。
-    /// 该实现避免在持有 sig_info 锁时进入 sighand 锁，降低锁交叉风险。
+    /// Release the private queue before entering the process pending queue.
     pub fn dequeue_pending_signal(&self, sig_mask: &SigSet) -> (Signal, Option<SigInfo>) {
         let res = {
             let mut siginfo = self.sig_info_mut();
@@ -922,7 +930,14 @@ impl ProcessControlBlock {
                 res
             } else {
                 drop(siginfo);
-                self.sighand().shared_pending_dequeue(sig_mask)
+                // Timer -> signal lock order, also used by expiry submission.
+                // Keep dequeue and restart atomic against a newer expiry.
+                let mut itimers = self.itimers_irqsave();
+                let res = self.process_signal().shared_pending_dequeue(sig_mask);
+                if res.0 == Signal::SIGALRM {
+                    itimers.restart_real(self);
+                }
+                res
             }
         };
         self.recalc_sigpending();
@@ -938,16 +953,14 @@ impl ProcessControlBlock {
     }
 
     fn recalc_sigpending_tsk(&self) -> bool {
-        let sighand = self.sighand();
-        let sighand_guard = sighand.inner_read();
+        let pending = self.process_signal();
+        let pending_guard = pending.lock_irqsave();
         let siginfo_guard = self.sig_info_irqsave();
         if has_pending_signals(
             &siginfo_guard.sig_pending().signal(),
             siginfo_guard.sig_blocked(),
-        ) || has_pending_signals(
-            &sighand_guard.shared_pending.signal(),
-            siginfo_guard.sig_blocked(),
-        ) {
+        ) || has_pending_signals(&pending_guard.signal(), siginfo_guard.sig_blocked())
+        {
             self.flags().insert(ProcessFlags::HAS_PENDING_SIGNAL);
             return true;
         }
@@ -1040,7 +1053,10 @@ fn retarget_shared_pending(pcb: Arc<ProcessControlBlock>, which: SigSet) {
     // Linux 语义：当线程的 blocked 集发生变化（尤其是“新增屏蔽”）时，
     // 需要尝试把 shared_pending 中受影响的信号“重定向”给同一线程组内
     // 其他未屏蔽该信号的线程去处理。
-    let mut retarget = pcb.sighand().shared_pending_signal().intersection(which);
+    let mut retarget = pcb
+        .process_signal()
+        .shared_pending_signal()
+        .intersection(which);
     if retarget.is_empty() {
         return;
     }

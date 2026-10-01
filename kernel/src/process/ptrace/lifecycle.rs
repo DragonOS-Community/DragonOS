@@ -9,7 +9,7 @@ use super::{
 use crate::{
     arch::ipc::signal::{SigChildCode, SigFlags, Signal},
     ipc::{
-        sighand::{InnerSigHand, ReapTransition},
+        process_signal::{InnerProcessSignalState, ReapTransition},
         signal_types::{SigCode, SigInfo, SigType, SignalFlags},
     },
     process::{
@@ -66,7 +66,7 @@ pub(super) fn arm_ptrace_group_stop_siblings_locked(
     current: &Arc<ProcessControlBlock>,
     signal: Signal,
     generation: u64,
-    group: &mut InnerSigHand,
+    group: &mut InnerProcessSignalState,
 ) {
     let leader = if current.is_thread_group_leader() {
         current.clone()
@@ -120,7 +120,7 @@ pub(super) fn arm_ptrace_group_stop_siblings_locked(
 /// an inherited ptrace child must run only far enough to publish its own
 /// reportable stop, so it receives one counted pending ticket instead.
 pub(crate) fn join_new_thread_group_stop_locked(child: &Arc<ProcessControlBlock>) {
-    child.sighand().with_group_stop_state(|group| {
+    child.process_signal().with_group_stop_state(|group| {
         let Some(generation) = group.current_incomplete_group_stop() else {
             let Some((generation, signal)) = group.current_completed_group_stop() else {
                 return;
@@ -191,7 +191,7 @@ pub(crate) fn stop_mixed_ptrace_group(
         return None;
     }
 
-    Some(current.sighand().with_group_stop_state(|group| {
+    Some(current.process_signal().with_group_stop_state(|group| {
         let Some(generation) = group.begin_ptrace_group_stop(signal) else {
             return false;
         };
@@ -227,7 +227,7 @@ pub(crate) fn claim_and_unlink_wait_zombie(
         return PtraceZombieClaim::Lost;
     }
 
-    match tracee.sighand().try_claim_ptraced_child(tracee) {
+    match tracee.process_signal().try_claim_ptraced_child(tracee) {
         ReapTransition::Blocked => return PtraceZombieClaim::Blocked,
         ReapTransition::TraceClaimed => {}
         _ => return PtraceZombieClaim::Lost,
@@ -254,7 +254,7 @@ pub(crate) fn claim_and_unlink_wait_zombie(
             | ProcessFlags::PTRACE_EVENT_STOP
             | ProcessFlags::TRAPPING,
     );
-    let (reset, group_stop_completion) = tracee.sighand().with_group_stop_state(|group| {
+    let (reset, group_stop_completion) = tracee.process_signal().with_group_stop_state(|group| {
         let mut ps = tracee.ptrace.state.lock_irqsave();
         let reset = ps.reset_session_stop();
         tracee.flags().remove(ProcessFlags::PENDING_PTRACE_STOP);
@@ -296,7 +296,7 @@ pub fn unlink_tracee(tracee: &Arc<ProcessControlBlock>) {
     let (tracer, release, group_stop_completion) = {
         let _relation_guard = PTRACE_RELATION_LOCK.lock_irqsave();
         let tracer = unlink_relation_locked(tracee);
-        let (release, completion) = tracee.sighand().with_group_stop_state(|group| {
+        let (release, completion) = tracee.process_signal().with_group_stop_state(|group| {
             let mut state = tracee.ptrace.state.lock_irqsave();
             let reset = state.reset_session_stop();
             tracee.flags().remove(ProcessFlags::PENDING_PTRACE_STOP);
@@ -335,7 +335,7 @@ pub fn unlink_tracee(tracee: &Arc<ProcessControlBlock>) {
 pub(crate) fn settle_exiting_group_stop(tracee: &Arc<ProcessControlBlock>) {
     let completion = {
         let _relation_guard = PTRACE_RELATION_LOCK.lock_irqsave();
-        tracee.sighand().with_group_stop_state(|group| {
+        tracee.process_signal().with_group_stop_state(|group| {
             let pending = {
                 let mut state = tracee.ptrace.state.lock_irqsave();
                 let pending = state.take_pending_stop();
@@ -398,7 +398,7 @@ fn settle_reset_group_stop_locked(
     tracee: &Arc<ProcessControlBlock>,
     reset: &super::PtraceSessionResetOutcome,
     resumed_group_stop: Option<u64>,
-    group: &mut InnerSigHand,
+    group: &mut InnerProcessSignalState,
 ) -> (bool, Option<Signal>) {
     let active_group_stop = resumed_group_stop.or(reset.active_group_stop);
     let preserve_active = active_group_stop
@@ -480,7 +480,7 @@ pub fn exit_ptrace(tracer: &Arc<ProcessControlBlock>) {
             // Serialize the group-stop decision with SIGCONT.  Keep this guard
             // through ptrace-state reset and any scheduler wake so SIGCONT
             // cannot observe half of the teardown transaction.
-            let sighand = tracee.sighand();
+            let signal_state = tracee.process_signal();
             // Clear the ptrace-side state and settle its group-stop ticket in
             // the same shared-sighand transaction as SIGCONT.
             let (
@@ -489,7 +489,7 @@ pub fn exit_ptrace(tracer: &Arc<ProcessControlBlock>) {
                 group_stop_active,
                 freeze_release,
                 group_stop_completion,
-            ) = sighand.with_group_stop_state(|group| {
+            ) = signal_state.with_group_stop_state(|group| {
                 let mut ps = tracee.ptrace.state.lock_irqsave();
                 // Capture EXITKILL from the same state snapshot that is reset.
                 let exitkill = ps.options.contains(PtraceOptions::EXITKILL);
@@ -623,9 +623,9 @@ impl ProcessControlBlock {
         );
         // Keep SIGCONT excluded from the group-stop snapshot through active
         // stop reset and the possible scheduler wake.
-        let sighand = self.sighand();
-        let (had_ptrace_stop, group_stop_active, freeze_release, group_stop_completion) = sighand
-            .with_group_stop_state(|group| {
+        let signal_state = self.process_signal();
+        let (had_ptrace_stop, group_stop_active, freeze_release, group_stop_completion) =
+            signal_state.with_group_stop_state(|group| {
                 let mut ps = self.ptrace.state.lock_irqsave();
                 let reset = ps.reset_session_stop();
                 self.flags().remove(ProcessFlags::PENDING_PTRACE_STOP);
@@ -693,7 +693,7 @@ impl ProcessControlBlock {
         signal: Signal,
     ) -> Result<bool, SystemError> {
         let current_group_stop = self
-            .sighand()
+            .process_signal()
             .with_group_stop_state(|group| group.current_valid_group_stop());
         let (tracee, needs_activation) =
             self.ptrace_publish_seized_stop_relation_locked(tracer, signal, current_group_stop)?;
@@ -790,7 +790,7 @@ impl ProcessControlBlock {
         &self,
         tracer: &Arc<ProcessControlBlock>,
     ) -> Result<bool, SystemError> {
-        let stop_sig = self.sighand().stop_signal();
+        let stop_sig = self.process_signal().stop_signal();
 
         {
             let _relation_guard = PTRACE_RELATION_LOCK.lock_irqsave();
@@ -1006,7 +1006,7 @@ impl ProcessControlBlock {
 pub(crate) fn continue_group_with_ptrace(leader: &Arc<ProcessControlBlock>) -> (bool, bool) {
     let _relation_guard = PTRACE_RELATION_LOCK.lock_irqsave();
     let mut continue_committed = false;
-    let was_stopped = leader.sighand().transition_group_continue(|| {
+    let was_stopped = leader.process_signal().transition_group_continue(|| {
         continue_committed = true;
 
         let publish_retrap = |task: &Arc<ProcessControlBlock>| {

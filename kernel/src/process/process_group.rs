@@ -46,10 +46,10 @@ impl ProcessManager {
 
 impl ProcessControlBlock {
     pub fn task_pgrp(&self) -> Option<Arc<Pid>> {
-        self.sighand().pid(PidType::PGID)
+        self.process_signal().pid(PidType::PGID)
     }
 
     pub fn task_session(&self) -> Option<Arc<Pid>> {
-        self.sighand().pid(PidType::SID)
+        self.process_signal().pid(PidType::SID)
     }
 }

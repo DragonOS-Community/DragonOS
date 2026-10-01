@@ -768,7 +768,7 @@ unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
     // recalc_sigpending_tsk (sender context) sighand(read)→sig_info(read) lock order.
     // DragonOS RwLock is writer-preferring; with concurrent sighand writers
     // (sigaction) and sig_info writers (sigprocmask) this can form an AB-BA deadlock.
-    let shared_pending = pcb.sighand().shared_pending_signal().bits();
+    let shared_pending = pcb.process_signal().shared_pending_signal().bits();
 
     let siginfo = pcb.try_siginfo_irqsave(5);
 
@@ -881,7 +881,7 @@ unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
         let is_customized_action = sigaction
             .as_ref()
             .is_some_and(|action| action.action().is_customized());
-        let drop_for_unkillable = pcb.sighand().flags_contains(SignalFlags::UNKILLABLE)
+        let drop_for_unkillable = pcb.process_signal().flags_contains(SignalFlags::UNKILLABLE)
             && !sig_number.kernel_only()
             && !is_customized_action;
         if drop_for_unkillable {

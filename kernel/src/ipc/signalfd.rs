@@ -16,6 +16,7 @@ use crate::filesystem::vfs::{
     FilePrivateData, FileSystem, IndexNode, InodeMode, Metadata, PollableInode,
 };
 use crate::ipc::sighand::SigHand;
+use crate::ipc::signal_types::{SigFaultReason, SigInfo, SigType};
 use crate::libs::mutex::MutexGuard;
 use crate::libs::spinlock::{SpinLock, SpinLockGuard};
 use crate::process::ProcessManager;
@@ -30,7 +31,6 @@ bitflags! {
 }
 
 /// Linux signalfd_siginfo 为 128 字节。
-/// gVisor 测试仅检查 read 返回值为 sizeof(signalfd_siginfo)。
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct SignalFdSigInfo {
@@ -38,10 +38,74 @@ struct SignalFdSigInfo {
 }
 
 impl SignalFdSigInfo {
-    fn from_signal(sig: Signal) -> Self {
+    fn from_siginfo(info: &SigInfo) -> Self {
         let mut bytes = [0u8; 128];
-        // ssi_signo (u32)
-        bytes[0..4].copy_from_slice(&(sig as u32).to_ne_bytes());
+        let header = info.convert_to_posix_siginfo();
+        bytes[0..4].copy_from_slice(&header.si_signo.to_ne_bytes());
+        bytes[4..8].copy_from_slice(&header.si_errno.to_ne_bytes());
+        bytes[8..12].copy_from_slice(&header.si_code.to_ne_bytes());
+        // Fixed-width Linux signalfd ABI, not the siginfo_t union layout.
+        match info.sig_type() {
+            SigType::Kill { pid, uid } => {
+                bytes[12..16].copy_from_slice(&(pid.data() as u32).to_ne_bytes());
+                bytes[16..20].copy_from_slice(&uid.to_ne_bytes());
+            }
+            SigType::Rt { pid, uid, sigval } => {
+                bytes[12..16].copy_from_slice(&(pid.data() as u32).to_ne_bytes());
+                bytes[16..20].copy_from_slice(&uid.to_ne_bytes());
+                // Kernel constructors initialize all eight bytes; user values
+                // have already been copied in full into the kernel SigInfo.
+                let pointer = unsafe { sigval.sival_ptr };
+                bytes[44..48].copy_from_slice(&(pointer as i32).to_ne_bytes());
+                bytes[48..56].copy_from_slice(&pointer.to_ne_bytes());
+            }
+            SigType::PosixTimer {
+                timerid,
+                overrun,
+                sigval,
+            } => {
+                bytes[24..28].copy_from_slice(&timerid.to_ne_bytes());
+                bytes[32..36].copy_from_slice(&overrun.to_ne_bytes());
+                let pointer = unsafe { sigval.sival_ptr };
+                bytes[44..48].copy_from_slice(&(pointer as i32).to_ne_bytes());
+                bytes[48..56].copy_from_slice(&pointer.to_ne_bytes());
+            }
+            SigType::Alarm(pid) => {
+                bytes[24..28].copy_from_slice(&(pid.data() as u32).to_ne_bytes());
+            }
+            SigType::SigChild {
+                pid,
+                uid,
+                status,
+                utime,
+                stime,
+            } => {
+                bytes[12..16].copy_from_slice(&(pid.data() as u32).to_ne_bytes());
+                bytes[16..20].copy_from_slice(&uid.to_ne_bytes());
+                bytes[40..44].copy_from_slice(&status.to_ne_bytes());
+                bytes[56..64].copy_from_slice(&utime.to_ne_bytes());
+                bytes[64..72].copy_from_slice(&stime.to_ne_bytes());
+            }
+            SigType::SigPoll { fd, band } => {
+                bytes[20..24].copy_from_slice(&fd.to_ne_bytes());
+                bytes[28..32].copy_from_slice(&(*band as u32).to_ne_bytes());
+            }
+            SigType::Fault { addr, reason } => {
+                bytes[72..80].copy_from_slice(&addr.to_ne_bytes());
+                if let SigFaultReason::AddrLsb(value) = reason {
+                    bytes[80..82].copy_from_slice(&value.to_ne_bytes());
+                }
+            }
+            SigType::SigSys {
+                call_addr,
+                syscall,
+                arch,
+            } => {
+                bytes[84..88].copy_from_slice(&syscall.to_ne_bytes());
+                bytes[88..96].copy_from_slice(&call_addr.to_ne_bytes());
+                bytes[96..100].copy_from_slice(&arch.to_ne_bytes());
+            }
+        }
         Self { bytes }
     }
 }
@@ -83,7 +147,7 @@ impl SignalFdInode {
         let siginfo = pcb.sig_info_irqsave();
         let mut pending = siginfo.sig_pending().signal();
         drop(siginfo);
-        pending |= pcb.sighand().shared_pending_signal();
+        pending |= pcb.process_signal().shared_pending_signal();
         !(pending & *mask).is_empty()
     }
 
@@ -92,15 +156,15 @@ impl SignalFdInode {
         self.has_pending_for_mask(&mask)
     }
 
-    fn dequeue_one(&self) -> Option<Signal> {
+    fn dequeue_one(&self) -> Option<SigInfo> {
         let pcb = ProcessManager::current_pcb();
         let mask = self.state.lock_irqsave().mask;
         let ignore_mask = mask.complement();
-        let (sig, _info) = pcb.dequeue_pending_signal(&ignore_mask);
+        let (sig, info) = pcb.dequeue_pending_signal(&ignore_mask);
         if sig == Signal::INVALID {
             None
         } else {
-            Some(sig)
+            info
         }
     }
 
@@ -201,8 +265,8 @@ impl IndexNode for SignalFdInode {
         }
 
         loop {
-            if let Some(sig) = self.dequeue_one() {
-                let info = SignalFdSigInfo::from_signal(sig);
+            if let Some(siginfo) = self.dequeue_one() {
+                let info = SignalFdSigInfo::from_siginfo(&siginfo);
                 buf[0..size_of::<SignalFdSigInfo>()].copy_from_slice(&info.bytes);
                 return Ok(size_of::<SignalFdSigInfo>());
             }

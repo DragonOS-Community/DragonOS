@@ -493,7 +493,7 @@ fn force_current_seccomp_sigsys() {
             pcb.sighand().set_handler(sig, action);
         }
         if action.is_default() {
-            pcb.sighand().flags_remove(SignalFlags::UNKILLABLE);
+            pcb.process_signal().flags_remove(SignalFlags::UNKILLABLE);
         }
     }
 

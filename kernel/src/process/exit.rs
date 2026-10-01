@@ -7,7 +7,7 @@ use super::{
 use crate::{
     arch::ipc::signal::{SigChildCode, SigFlags, Signal},
     driver::tty::tty_core::TtyCore,
-    ipc::{sighand::ReapTransition, signal_types::SignalFlags},
+    ipc::{process_signal::ReapTransition, signal_types::SignalFlags},
     process::{
         cred::Kuid, namespace::user_namespace::from_kuid_munged, pid::PidType, ptrace,
         wait::WaitSelector, ProcessState,
@@ -111,7 +111,9 @@ fn complete_ptrace_claim_after_ack(child_pcb: &Arc<ProcessControlBlock>) {
 
 /// mt-exec: forbid early reaping while de_thread is waiting for the old leader to complete the PID/TID swap
 fn reap_blocked_by_group_exec(child_pcb: &Arc<ProcessControlBlock>) -> bool {
-    child_pcb.sighand().reap_blocked_by_group_exec(child_pcb)
+    child_pcb
+        .process_signal()
+        .reap_blocked_by_group_exec(child_pcb)
 }
 
 fn delay_group_leader(child_pcb: &Arc<ProcessControlBlock>) -> bool {
@@ -569,7 +571,7 @@ fn report_wait_event(
     let delayed_zombie = is_zombie
         && (delay_group_leader(child_pcb)
             || match relation {
-                WaitRelation::Natural => child_pcb.sighand().natural_reap_blocked(child_pcb),
+                WaitRelation::Natural => child_pcb.process_signal().natural_reap_blocked(child_pcb),
                 WaitRelation::Ptraced => reap_blocked_by_group_exec(child_pcb),
             });
     // Visibility gating: a ptraced zombie is invisible to the natural parent until
@@ -587,7 +589,7 @@ fn report_wait_event(
         // Linux wait_task_zombie() exposes signal->group_exit_code after
         // SIGNAL_GROUP_EXIT for both natural and ptrace zombie waits.
         let raw_wstatus = child_pcb
-            .sighand()
+            .process_signal()
             .group_exit_code_if_set()
             .map(|status| status as i32)
             .unwrap_or(task_wstatus);
@@ -637,7 +639,7 @@ fn report_wait_event(
         // transactional try_reap_natural_child (which internally handles autoreap /
         // group-exec arbitration / mark-dead).
         let transition = child_pcb
-            .sighand()
+            .process_signal()
             .try_reap_natural_child(child_pcb, consume);
         let expected = if consume {
             ReapTransition::Reaped
@@ -698,7 +700,7 @@ fn report_wait_event(
     if state.is_stopped() && stop_requested && relation != WaitRelation::Ptraced && !in_ptrace_stop
     {
         let consume = !kwo.options.contains(WaitOption::WNOWAIT);
-        if let Some(stop_signal) = child_pcb.sighand().group_stop_event(consume) {
+        if let Some(stop_signal) = child_pcb.process_signal().group_stop_event(consume) {
             let stopsig = stop_signal as i32;
             let cause = SigChildCode::Stopped.into();
             kwo.no_task_error = None;
@@ -710,7 +712,7 @@ fn report_wait_event(
     }
 
     if kwo.options.contains(WaitOption::WCONTINUED)
-        && child_pcb.sighand().flags_test_and_clear(
+        && child_pcb.process_signal().flags_test_and_clear(
             SignalFlags::CLD_CONTINUED,
             !kwo.options.contains(WaitOption::WNOWAIT),
         )
@@ -1005,12 +1007,12 @@ impl ProcessControlBlock {
         }
         self.flags().insert(ProcessFlags::PID_UNHASHED);
 
-        let sighand = self.sighand();
+        let signal_state = self.process_signal();
         if let Some(this) = self.self_ref.upgrade() {
             // Pending transactions may be canceled by their owner. A committed
             // old-leader handoff must never be cleared from an exit cleanup
             // path; de_thread completes it uninterruptibly.
-            let _ = sighand.try_cancel_group_exec(&this);
+            let _ = signal_state.try_cancel_group_exec(&this);
         }
 
         let group_dead = self.is_thread_group_leader();
@@ -1052,14 +1054,14 @@ impl ProcessControlBlock {
         let mut notify_leader = None;
         if let Some(leader) = thread_group_leader {
             if !group_dead {
-                let sighand = self.sighand();
+                let signal_state = self.process_signal();
                 // Match exit_notify's lock order. A ptrace attach/detach cannot
                 // race between the last-sibling observation and natural-parent
                 // notification ownership being claimed.
                 let _relation_guard = PTRACE_RELATION_LOCK.lock_irqsave();
                 let leader_is_ptraced = ptrace::ptracer_of_locked(&leader).is_some();
                 let (wake_pidfd, token) =
-                    sighand.try_claim_natural_parent_notify_with(&leader, || {
+                    signal_state.try_claim_natural_parent_notify_with(&leader, || {
                         let mut leader_threads = leader.threads_write_irqsave();
                         leader.add_exited_thread_group_cputime(self.thread_cputime_ns());
                         if let Some(rusage) = self.get_rusage(RUsageWho::RusageThread) {
@@ -1086,7 +1088,7 @@ impl ProcessControlBlock {
         self.mark_identity_unhash_complete();
         if !group_dead {
             if let Some(me) = self.self_ref.upgrade() {
-                self.sighand().complete_group_exec_task(&me);
+                self.process_signal().complete_group_exec_task(&me);
             }
         }
 

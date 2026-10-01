@@ -4,9 +4,8 @@ use core::{
 };
 
 use crate::{
-    arch::{ipc::signal::Signal, CurrentIrqArch},
+    arch::CurrentIrqArch,
     exception::InterruptArch,
-    ipc::kill::send_signal_to_pcb,
     libs::lazy_init::Lazy,
     mm::percpu::PerCpuVar,
     process::{ProcessControlBlock, ProcessState},
@@ -279,39 +278,7 @@ impl CpuTimeFunc {
             }
         }
 
-        // 检查并处理CPU时间定时器
-        let mut itimers = pcb.itimers_irqsave();
-        // 处理 ITIMER_VIRTUAL (仅在用户态tick时消耗时间)
-        if user_tick && itimers.virt.is_active {
-            if itimers.virt.value <= accounted_cputime {
-                send_signal_to_pcb(pcb.clone(), Signal::SIGVTALRM).ok();
-                if itimers.virt.interval > 0 {
-                    // 周期性定时器：在旧的剩余时间上增加间隔时间
-                    itimers.virt.value += itimers.virt.interval;
-                } else {
-                    // 一次性定时器：禁用
-                    itimers.virt.is_active = false;
-                    itimers.virt.value = 0;
-                }
-            } else {
-                itimers.virt.value -= accounted_cputime;
-            }
-        }
-
-        // 处理 ITIMER_PROF (在用户态和内核态tick时都消耗时间)
-        if itimers.prof.is_active {
-            if itimers.prof.value <= accounted_cputime {
-                send_signal_to_pcb(pcb.clone(), Signal::SIGPROF).ok();
-                if itimers.prof.interval > 0 {
-                    itimers.prof.value += itimers.prof.interval;
-                } else {
-                    itimers.prof.is_active = false;
-                    itimers.prof.value = 0;
-                }
-            } else {
-                itimers.prof.value -= accounted_cputime;
-            }
-        }
+        pcb.account_itimers(user_tick, accounted_cputime);
     }
 
     pub fn account_other_time(max: u64) -> u64 {

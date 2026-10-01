@@ -187,38 +187,12 @@ fn restore_sigtimedwait_mask() {
 
 /// 尝试从信号队列中取出信号
 fn try_dequeue_signal(awaited: &SigSet) -> Option<(Signal, SigInfo)> {
-    let pcb = ProcessManager::current_pcb();
-    let _current_pid = pcb.raw_pid();
-
-    let mut siginfo_guard = pcb.sig_info_mut();
-    let pending = siginfo_guard.sig_pending_mut();
-
-    // 检查 per-thread pending
-    // 仅允许从 awaited 集合中取信号：将"忽略掩码"设为 !awaited
-    let ignore_mask = !*awaited;
-    if let (sig, Some(info)) = pending.dequeue_signal(&ignore_mask) {
-        if sig != Signal::INVALID {
-            drop(siginfo_guard);
-            // 消费信号后及时刷新 HAS_PENDING_SIGNAL 状态，避免后续等待路径误判
-            pcb.recalc_sigpending();
-            return Some((sig, info));
-        }
+    let (sig, info) = ProcessManager::current_pcb().dequeue_pending_signal(&!*awaited);
+    if sig == Signal::INVALID {
+        None
+    } else {
+        info.map(|info| (sig, info))
     }
-
-    drop(siginfo_guard);
-
-    // 检查 shared pending
-    let (sig, info) = pcb.sighand().shared_pending_dequeue(&ignore_mask);
-
-    if sig != Signal::INVALID {
-        if let Some(info) = info {
-            // 同步刷新 pending 标志，确保后续可中断等待依据最新状态
-            pcb.recalc_sigpending();
-            return Some((sig, info));
-        }
-    }
-
-    None
 }
 
 /// 检查是否有未屏蔽的待处理信号
@@ -229,7 +203,7 @@ fn has_pending_awaited_signal(awaited: &SigSet) -> bool {
     let pending_set = siginfo_guard.sig_pending().signal();
     drop(siginfo_guard);
 
-    let shared_pending_set = pcb.sighand().shared_pending_signal();
+    let shared_pending_set = pcb.process_signal().shared_pending_signal();
     let result = pending_set.union(shared_pending_set);
     // 只看 awaited 与 pending 的交集
     let intersection = result.intersection(*awaited);

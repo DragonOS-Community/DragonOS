@@ -25,8 +25,9 @@ use crate::{
         vfs::{fdtable::FileDescriptorTable, IndexNode},
     },
     ipc::{
+        process_signal::NaturalParentNotifyPhase,
         sem_undo::{SemUndoAttachment, SemUndoGroup, UnpublishedSemUndoAttachmentGuard},
-        sighand::{NaturalParentNotifyPhase, SigHand},
+        sighand::SigHand,
         signal::RestartBlock,
     },
     libs::{
@@ -43,7 +44,6 @@ use crate::{
         namespace::{ipc_namespace::IpcNamespace, nsproxy::NsProxy},
         pid::{Pid, PidLink, PidType},
         resource::{RLimit64, RLimitID, RUsage},
-        timer::AlarmTimer,
         AtomicProcessFlags, AtomicRawPid, ExitState, KernelStack, ProcessBasicInfo, ProcessCpuTime,
         ProcessFlags, ProcessItimers, ProcessManager, ProcessSchedulerInfo, ProcessSignalInfo,
         ProcessState, RawPid, ThreadInfo, PTRACE_RELATION_LOCK,
@@ -183,6 +183,7 @@ pub struct ProcessControlBlock {
     /// Signal-handling related information (could potentially be lock-free).
     pub(super) sig_info: RwLock<ProcessSignalInfo>,
     pub(super) sighand: RcuArcSlot<SigHand>,
+    pub(super) process_signal: RcuArcSlot<crate::ipc::process_signal::ProcessSignalState>,
     /// Alternate signal stack.
     pub(super) sig_altstack: RwLock<SigStackArch>,
     /// Exit state (Running / Zombie / Dead).
@@ -272,8 +273,7 @@ pub struct ProcessControlBlock {
     fs_slot_update_lock: Mutex<()>,
 
     /// Alarm timer.
-    pub(super) alarm_timer: SpinLock<Option<AlarmTimer>>,
-    pub(super) itimers: SpinLock<ProcessItimers>,
+    pub(super) itimers: Arc<SpinLock<ProcessItimers>>,
     /// POSIX interval timers (timer_create / timer_settime / ...).
     pub(super) posix_timers: SpinLock<posix_timer::ProcessPosixTimers>,
 
@@ -565,6 +565,9 @@ impl ProcessControlBlock {
                 arch_info,
                 sig_info: RwLock::new(ProcessSignalInfo::default()),
                 sighand: RcuArcSlot::new(initial_sighand.clone()),
+                process_signal: RcuArcSlot::new(
+                    crate::ipc::process_signal::ProcessSignalState::new(),
+                ),
                 sig_altstack: RwLock::new(SigStackArch::new()),
                 exit_state: AtomicU8::new(ExitState::Running as u8),
                 exit_notify_complete: AtomicBool::new(false),
@@ -588,8 +591,7 @@ impl ProcessControlBlock {
                 thread: RwLock::new(ThreadInfo::new()),
                 fs: RwLock::new(Some(Arc::new(FsStruct::new()))),
                 fs_slot_update_lock: Mutex::new(()),
-                alarm_timer: SpinLock::new(None),
-                itimers: SpinLock::new(ProcessItimers::default()),
+                itimers: Arc::new(SpinLock::new(ProcessItimers::default())),
                 posix_timers: SpinLock::new(posix_timer::ProcessPosixTimers::default()),
                 cpu_time: Arc::new(ProcessCpuTime::default()),
                 min_flt: AtomicU64::new(0),
@@ -1667,8 +1669,8 @@ impl ProcessControlBlock {
         if has_pending_thread {
             return true;
         }
-        // also check shared-pending in sighand
-        let shared = self.sighand().shared_pending_signal();
+        // Also check the thread group's process-directed pending queue.
+        let shared = self.process_signal().shared_pending_signal();
         return !shared.is_empty();
     }
 
@@ -1688,7 +1690,7 @@ impl ProcessControlBlock {
         let mut pending: SigSet = sig_info.sig_pending().signal();
         drop(sig_info);
         // Also check shared_pending.
-        pending |= self.sighand().shared_pending_signal();
+        pending |= self.process_signal().shared_pending_signal();
         pending.remove(blocked);
         // log::debug!(
         //     "pending and not masked:{:?}, masked: {:?}",
@@ -1715,11 +1717,6 @@ impl ProcessControlBlock {
     }
 
     #[inline(always)]
-    pub fn alarm_timer_irqsave(&self) -> SpinLockGuard<'_, Option<AlarmTimer>> {
-        return self.alarm_timer.lock_irqsave();
-    }
-
-    #[inline(always)]
     pub fn itimers_irqsave(&self) -> SpinLockGuard<'_, ProcessItimers> {
         return self.itimers.lock_irqsave();
     }
@@ -1738,23 +1735,16 @@ impl ProcessControlBlock {
     /// }
     /// ```
     ///
-    /// In DragonOS, `alarm_timer` is per-PCB, so each exiting thread must cancel
-    /// its own alarm timer. `itimers` and `posix_timers` are only cleaned up when
-    /// the thread-group leader exits (`group_dead`).
-    pub(super) fn exit_timers(&self) {
-        // 1. Cancel the current thread's alarm timer.
-        if let Some(alarm) = self.alarm_timer.lock_irqsave().take() {
-            alarm.cancel();
+    /// Traditional interval timers survive until the last live group member.
+    pub(super) fn exit_timers(&self, group_dead: bool) {
+        if group_dead {
+            self.itimers.lock_irqsave().exit();
         }
 
-        let group_dead = self.is_thread_group_leader();
-        if group_dead {
-            // 2. Cancel ITIMER_REAL.
-            if let Some(real_itimer) = self.itimers.lock_irqsave().real.take() {
-                real_itimer.timer.cancel();
-            }
-
-            // 3. Delete all POSIX interval timers.
+        // POSIX timer_create storage has not been migrated to group ownership
+        // in this traditional-itimer change. Preserve its existing cleanup
+        // owner instead of accidentally cleaning a last worker's empty table.
+        if self.is_thread_group_leader() {
             let mut posix_timers = self.posix_timers.lock_irqsave();
             let timer_ids: alloc::vec::Vec<i32> = posix_timers.timer_ids().collect();
             let self_arc = self.self_ref.upgrade();

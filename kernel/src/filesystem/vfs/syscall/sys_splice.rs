@@ -271,13 +271,42 @@ fn splice_file_to_pipe(
     len: usize,
     flags: SpliceFlags,
 ) -> Result<usize, SystemError> {
+    if offset.is_some()
+        && (file.mode().contains(FileMode::FMODE_STREAM)
+            || !file.mode().contains(FileMode::FMODE_PREAD))
+    {
+        return Err(SystemError::ESPIPE);
+    }
+    let mut position = offset.unwrap_or_else(|| file.pos());
+    let written = splice_read_to_pipe(file, &mut position, pipe, len, flags)?;
+    if offset.is_none() && written > 0 {
+        file.commit_transfer_position(position);
+    }
+    Ok(written)
+}
+
+/// Reserve pipe capacity before consuming input, while leaving f_pos and
+/// notifications to the caller. sendfile and splice share this transaction.
+pub(super) fn splice_read_to_pipe(
+    file: &File,
+    position: &mut usize,
+    pipe: &File,
+    len: usize,
+    flags: SpliceFlags,
+) -> Result<usize, SystemError> {
     let pipe_inode = get_pipe_inode(pipe)?;
 
     let limit = len.min(4096);
-    let trusted_read_limit = splice_trusted_file_read_limit(file, offset, limit);
+    let trusted_read_limit = splice_trusted_file_read_limit(file, Some(*position), limit);
     let mut transaction = pipe_inode.begin_writer_transaction();
     pipe_inode.ensure_splice_readers(&transaction)?;
+    // Linux checks pipe readiness even for a zero-count sendfile.
     if trusted_read_limit == Some(0) {
+        if flags.contains(SpliceFlags::SPLICE_F_NONBLOCK) {
+            pipe_inode.writable_for_splice_nonblock(&transaction, None)?;
+        } else {
+            pipe_inode.wait_writable_any_for_splice(&mut transaction)?;
+        }
         return Ok(0);
     }
     let wanted = trusted_read_limit.unwrap_or(limit);
@@ -295,13 +324,16 @@ fn splice_file_to_pipe(
     } else {
         wanted.min(space)
     };
+    // A pipe has no splice_read operation. Zero count above needs no reader.
+    if file.file_type() == FileType::Pipe {
+        return Err(SystemError::EINVAL);
+    }
     let mut buffer = vec![0u8; buf_size];
 
     // 从文件读取
     // 为了满足 Linux 语义：若后续写入 pipe 被信号中断且未写入任何字节，
     // 则不应推进输入文件的 file position。
-    let advance_file_pos = offset.is_none();
-    let read_len = file.read_for_transfer(offset, buf_size, &mut buffer)?;
+    let read_len = file.read_at_for_transfer(*position, buf_size, &mut buffer)?;
 
     if read_len == 0 {
         return Ok(0);
@@ -314,9 +346,7 @@ fn splice_file_to_pipe(
 
     match written {
         Ok(write_len) => {
-            if advance_file_pos {
-                file.advance_pos(write_len);
-            }
+            *position += write_len;
             Ok(write_len)
         }
         Err(e) => Err(e),

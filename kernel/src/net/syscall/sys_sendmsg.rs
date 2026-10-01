@@ -1,14 +1,14 @@
 use system_error::SystemError;
 
+use super::socket_fd::SocketFdRef;
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_SENDMSG;
-use crate::filesystem::vfs::{iov::IoVecs, IndexNode};
+use crate::filesystem::vfs::iov::IoVecs;
 use crate::net::posix::{MsgHdr, SockAddr};
 use crate::net::socket;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
 use crate::syscall::user_access::UserBufferReader;
 use alloc::string::ToString;
-use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 /// System call handler for the `sendmsg` syscall
@@ -85,7 +85,7 @@ pub(super) fn do_sendmsg_user(
     flags: u32,
     from_user: bool,
 ) -> Result<usize, SystemError> {
-    let (socket_inode, pmsg) = super::sys_sendto::prepare_send_socket(fd, flags)?;
+    let (sock, pmsg) = super::sys_sendto::prepare_send_socket(fd, flags)?;
 
     // Read MsgHdr from user space only after fd/socket validation, matching
     // Linux error ordering for bad fd plus bad user pointer.
@@ -95,15 +95,15 @@ pub(super) fn do_sendmsg_user(
         user_buffer_reader.read_one_from_user::<MsgHdr>(0)?
     };
 
-    do_sendmsg_prepared(&socket_inode, pmsg, &msg_hdr)
+    do_sendmsg_prepared(&sock, pmsg, &msg_hdr)
 }
 
 pub(super) fn do_sendmsg_prepared(
-    socket_inode: &Arc<dyn IndexNode>,
+    sock: &SocketFdRef,
     pmsg: socket::PMSG,
     msg: &MsgHdr,
 ) -> Result<usize, SystemError> {
-    let socket = socket_inode.as_socket().ok_or(SystemError::ENOTSOCK)?;
+    let socket = sock.socket()?;
 
     let endpoint = if msg.msg_name.is_null() {
         None

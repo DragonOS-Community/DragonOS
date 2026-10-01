@@ -1,3 +1,18 @@
+// Notes for the two "wake hand-off" cases below (`AddressLookupFailure...` and
+// `ReboundConnectorsPassOldBacklogWakeToNextConnector`).
+//
+// They encode DragonOS's *intentional* extension of Linux: when a woken
+// connector cannot consume the freed slot (address lookup fails) or belongs to
+// a backlog that is no longer current, it passes the wake on so the freed slot
+// is never stranded.
+//
+// Linux does not do that. `unix_accept()` (`net/unix/af_unix.c`) calls
+// `wake_up_interruptible(&unix_sk(sk)->peer_wait)`, i.e.
+// `__wake_up(..., nr_exclusive = 1, ...)`, which releases **one** exclusive
+// waiter; if that waiter aborts on `-ENOENT`, the remaining connectors stay
+// parked on `peer_wait` until the listener is released (which uses
+// `wake_up_interruptible_all`). Running this suite on a Linux host therefore
+// fails exactly these cases; see the PR notes for the rationale.
 #include <gtest/gtest.h>
 
 #include <errno.h>
@@ -19,6 +34,55 @@ struct ConnectResult {
     int status;
     int error;
 };
+
+class ScopedFd {
+public:
+    explicit ScopedFd(int fd = -1) : fd_(fd) {}
+    ~ScopedFd() {
+        if (fd_ >= 0) close(fd_);
+    }
+
+    ScopedFd(const ScopedFd&) = delete;
+    ScopedFd& operator=(const ScopedFd&) = delete;
+
+    int get() const { return fd_; }
+
+    void reset(int fd = -1) {
+        if (fd_ >= 0) close(fd_);
+        fd_ = fd;
+    }
+
+private:
+    int fd_;
+};
+
+// Bounded wait until `pid` is confirmed off-CPU, instead of guessing with
+// `poll(timeout) == 0`. `/proc/<pid>/stat` reports `S` for an interruptible
+// sleep and `D` for an uninterruptible one (kernel `filesystem/procfs/pid/stat.rs`),
+// so a child observed in either state is provably parked in the backlog wait and
+// not merely slow to start.
+bool WaitSleeping(pid_t pid, int timeout_ms = 2000) {
+    char path[64] = {};
+    snprintf(path, sizeof(path), "/proc/%d/stat", pid);
+    constexpr int kStepUs = 1000;
+    for (int waited = 0; waited <= timeout_ms * 1000; waited += kStepUs) {
+        FILE* stat = fopen(path, "r");
+        if (stat != nullptr) {
+            char line[512] = {};
+            const bool read = fgets(line, sizeof(line), stat) != nullptr;
+            fclose(stat);
+            if (read) {
+                const char* comm_end = strrchr(line, ')');
+                if (comm_end != nullptr && comm_end[1] == ' ' &&
+                    (comm_end[2] == 'S' || comm_end[2] == 'D')) {
+                    return true;
+                }
+            }
+        }
+        usleep(kStepUs);
+    }
+    return false;
+}
 
 void RunFullBacklogConnect(Release release, int type) {
     sockaddr_un address{};
@@ -81,7 +145,7 @@ void RunFullBacklogConnect(Release release, int type) {
     EXPECT_EQ(1, read(ready_pipe[0], &ready, 1));
     close(ready_pipe[0]);
     pollfd poll_result{result_pipe[0], POLLIN, 0};
-    EXPECT_EQ(0, poll(&poll_result, 1, 50)) << "connect did not block on the full backlog";
+    EXPECT_TRUE(WaitSleeping(child)) << "connect did not block on the full backlog";
 
     if (release == Release::Accept || release == Release::LargeTimeout) {
         const int accepted = accept(listener, nullptr, nullptr);
@@ -116,6 +180,23 @@ void RunFullBacklogConnect(Release release, int type) {
         if (release == Release::Accept || release == Release::Grow ||
             release == Release::LargeTimeout) {
             EXPECT_EQ(0, result.status);
+            if (result.status == 0) {
+                // Each successful connect must have its own accept-ready entry.
+                const int count = release == Release::Grow ? 2 : 1;
+                for (int i = 0; i < count; ++i) {
+                    pollfd ready{listener, POLLIN, 0};
+                    const int ready_status = poll(&ready, 1, 5000);
+                    EXPECT_EQ(1, ready_status) << "successful connect was not accept-ready";
+                    if (ready_status != 1) break;
+                    EXPECT_NE(0, ready.revents & POLLIN);
+                    if (!(ready.revents & POLLIN)) break;
+                    ScopedFd accepted(accept(listener, nullptr, nullptr));
+                    EXPECT_GE(accepted.get(), 0) << strerror(errno);
+                    if (accepted.get() < 0) break;
+                }
+                pollfd drained{listener, POLLIN, 0};
+                EXPECT_EQ(0, poll(&drained, 1, 0)) << "unexpected extra accepted connection";
+            }
         } else {
             EXPECT_EQ(-1, result.status);
             const int expected = release == Release::Close ? ECONNREFUSED
@@ -138,6 +219,209 @@ void RunFullBacklogConnect(Release release, int type) {
 }
 
 class UnixConnectBacklog : public testing::TestWithParam<int> {};
+
+enum class RaceRelease { Signal, SignalChain, Accept, Unlink, Rebind };
+
+// Keep cleanup active even when an assertion aborts a race iteration.
+struct ConnectRace {
+    static constexpr int kMaxConnectors = 4;
+    char path[sizeof(sockaddr_un::sun_path)]{};
+    int listener = -1;
+    int replacement = -1;
+    int first = -1;
+    int ready[kMaxConnectors][2]{{-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}};
+    int result[kMaxConnectors][2]{{-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}};
+    pid_t children[kMaxConnectors]{-1, -1, -1, -1};
+
+    ~ConnectRace() {
+        for (int i = 0; i < kMaxConnectors; ++i) {
+            if (children[i] > 0) {
+                kill(children[i], SIGKILL);
+                while (waitpid(children[i], nullptr, 0) < 0 && errno == EINTR) {}
+            }
+            for (int j = 0; j < 2; ++j) {
+                if (ready[i][j] >= 0) close(ready[i][j]);
+                if (result[i][j] >= 0) close(result[i][j]);
+            }
+        }
+        if (first >= 0) close(first);
+        if (listener >= 0) close(listener);
+        if (replacement >= 0) close(replacement);
+        if (path[0]) unlink(path);
+    }
+};
+
+void RunConnectorRace(int type, int iteration, RaceRelease release) {
+    ConnectRace race;
+    const int count = release == RaceRelease::Signal ? 2 : ConnectRace::kMaxConnectors;
+    const int cancelled = release == RaceRelease::Signal ? 1
+                          : release == RaceRelease::SignalChain ? count - 1 : 0;
+    sockaddr_un address{};
+    address.sun_family = AF_UNIX;
+    const int name_len = snprintf(address.sun_path + 1, sizeof(address.sun_path) - 1,
+                                  "backlog-race-%d-%d-%d", getpid(), type, iteration);
+    ASSERT_GT(name_len, 0);
+    socklen_t addr_len = offsetof(sockaddr_un, sun_path) + 1 + name_len;
+    if (release == RaceRelease::Unlink || release == RaceRelease::Rebind) {
+        snprintf(race.path, sizeof(race.path), "/tmp/backlog-race-%d-%d-%d",
+                 getpid(), type, iteration);
+        strcpy(address.sun_path, race.path);
+        addr_len = offsetof(sockaddr_un, sun_path) + strlen(race.path) + 1;
+    }
+    race.listener = socket(AF_UNIX, type, 0);
+    ASSERT_GE(race.listener, 0);
+    ASSERT_EQ(0, bind(race.listener, reinterpret_cast<sockaddr*>(&address), addr_len));
+    ASSERT_EQ(0, listen(race.listener, 0));
+    race.first = socket(AF_UNIX, type, 0);
+    ASSERT_GE(race.first, 0);
+    ASSERT_EQ(0, connect(race.first, reinterpret_cast<sockaddr*>(&address), addr_len));
+
+    for (int i = 0; i < count; ++i) {
+        ASSERT_EQ(0, pipe(race.ready[i]));
+        ASSERT_EQ(0, pipe(race.result[i]));
+        race.children[i] = fork();
+        ASSERT_GE(race.children[i], 0);
+        if (race.children[i] == 0) {
+            close(race.listener);
+            close(race.first);
+            close(race.ready[i][0]);
+            close(race.result[i][0]);
+            const int client = socket(AF_UNIX, type, 0);
+            if (client < 0) _exit(2);
+            struct sigaction action{};
+            action.sa_handler = +[](int) {};
+            sigemptyset(&action.sa_mask);
+            // No SA_RESTART: signalled connectors must abandon their attempts.
+            if (sigaction(SIGUSR1, &action, nullptr) != 0) _exit(3);
+            const char ready = 'r';
+            if (write(race.ready[i][1], &ready, 1) != 1) _exit(4);
+            const int status = connect(client, reinterpret_cast<sockaddr*>(&address), addr_len);
+            const ConnectResult result{status, status == 0 ? 0 : errno};
+            if (write(race.result[i][1], &result, sizeof(result)) != sizeof(result)) _exit(5);
+            close(client);
+            _exit(0);
+        }
+        close(race.ready[i][1]);
+        race.ready[i][1] = -1;
+        close(race.result[i][1]);
+        race.result[i][1] = -1;
+        pollfd ready{race.ready[i][0], POLLIN, 0};
+        ASSERT_EQ(1, poll(&ready, 1, 1500));
+        char byte;
+        ASSERT_EQ(1, read(race.ready[i][0], &byte, 1));
+        ASSERT_TRUE(WaitSleeping(race.children[i])) << "connector " << i << " did not block";
+    }
+
+    // Race cancellation with releasing exactly one slot. In particular, accept
+    // may select the first waiter before it processes the pending signal.
+    for (int i = 0; i < cancelled; ++i) {
+        ASSERT_EQ(0, kill(race.children[i], SIGUSR1));
+    }
+    if (release == RaceRelease::Unlink || release == RaceRelease::Rebind) {
+        // A selected connector either fails re-resolution or moves to another
+        // backlog. Both must pass the old listener's still-free capacity on.
+        ASSERT_EQ(0, unlink(race.path));
+        if (release == RaceRelease::Rebind) {
+            race.replacement = socket(AF_UNIX, type | SOCK_NONBLOCK, 0);
+            ASSERT_GE(race.replacement, 0);
+            ASSERT_EQ(0, bind(race.replacement, reinterpret_cast<sockaddr*>(&address), addr_len));
+            ASSERT_EQ(0, listen(race.replacement, 0));
+        }
+    }
+    const int accepted = accept(race.listener, nullptr, nullptr);
+    ASSERT_GE(accepted, 0);
+    close(accepted);
+
+    if (release == RaceRelease::Accept || release == RaceRelease::Rebind) {
+        const int listener = release == RaceRelease::Rebind ? race.replacement : race.listener;
+        // After each accept exactly one healthy connector can finish. Do not
+        // require FIFO scheduling; poll all unfinished children together.
+        for (int completed = 0; completed < count; ++completed) {
+            pollfd results[ConnectRace::kMaxConnectors];
+            for (int i = 0; i < count; ++i) {
+                results[i] = {race.children[i] > 0 ? race.result[i][0] : -1, POLLIN, 0};
+            }
+            ASSERT_EQ(1, poll(results, count, 1500));
+            for (int i = 0; i < count; ++i) {
+                if (!(results[i].revents & POLLIN)) continue;
+                ConnectResult result{};
+                ASSERT_EQ(static_cast<ssize_t>(sizeof(result)),
+                          read(results[i].fd, &result, sizeof(result)));
+                EXPECT_EQ(0, result.status);
+                EXPECT_EQ(0, result.error);
+                int status;
+                ASSERT_EQ(race.children[i], waitpid(race.children[i], &status, 0));
+                race.children[i] = -1;
+                EXPECT_TRUE(WIFEXITED(status));
+                EXPECT_EQ(0, WEXITSTATUS(status));
+                results[i].fd = -1;
+            }
+            // Freeing exactly one slot must admit exactly one connector. Every
+            // remaining child has to be parked again; if the same slot had let a
+            // second one through, that child would have exited (`Z`) instead of
+            // sleeping, and its result pipe would be readable.
+            for (int i = 0; i < count; ++i) {
+                if (results[i].fd < 0) continue;
+                ASSERT_TRUE(WaitSleeping(race.children[i]))
+                    << "connector " << i << " was admitted by the same slot";
+            }
+            ASSERT_EQ(0, poll(results, count, 0)) << "one slot admitted multiple connectors";
+            if (completed + 1 < count) {
+                const int next = accept(listener, nullptr, nullptr);
+                ASSERT_GE(next, 0);
+                close(next);
+            }
+        }
+        return;
+    }
+
+    for (int i = 0; i < count; ++i) {
+        pollfd ready{race.result[i][0], POLLIN, 0};
+        ASSERT_EQ(1, poll(&ready, 1, 1500))
+            << "connector " << i << " stalled after the only accept";
+        ASSERT_NE(0, ready.revents & POLLIN);
+        ConnectResult result{};
+        ASSERT_EQ(static_cast<ssize_t>(sizeof(result)),
+                  read(race.result[i][0], &result, sizeof(result)));
+        const int expected = release == RaceRelease::Unlink ? ENOENT
+                             : i < cancelled ? EINTR : 0;
+        EXPECT_EQ(expected ? -1 : 0, result.status);
+        EXPECT_EQ(expected, result.error);
+        int status;
+        ASSERT_EQ(race.children[i], waitpid(race.children[i], &status, 0));
+        race.children[i] = -1;
+        EXPECT_TRUE(WIFEXITED(status));
+        EXPECT_EQ(0, WEXITSTATUS(status));
+    }
+}
+
+TEST_P(UnixConnectBacklog, InterruptedConnectorDoesNotStrandNextConnector) {
+    for (int iteration = 0; iteration < 32; ++iteration) {
+        SCOPED_TRACE(iteration);
+        RunConnectorRace(GetParam(), iteration, RaceRelease::Signal);
+        if (HasFatalFailure()) return;
+    }
+}
+
+TEST_P(UnixConnectBacklog, CancelledConnectorChainDoesNotStrandNextConnector) {
+    for (int iteration = 0; iteration < 32; ++iteration) {
+        SCOPED_TRACE(iteration);
+        RunConnectorRace(GetParam(), iteration, RaceRelease::SignalChain);
+        if (HasFatalFailure()) return;
+    }
+}
+
+TEST_P(UnixConnectBacklog, OneAcceptAdmitsOneOfMultipleConnectors) {
+    RunConnectorRace(GetParam(), 0, RaceRelease::Accept);
+}
+
+TEST_P(UnixConnectBacklog, AddressLookupFailurePassesWakeToNextConnector) {
+    RunConnectorRace(GetParam(), 0, RaceRelease::Unlink);
+}
+
+TEST_P(UnixConnectBacklog, ReboundConnectorsPassOldBacklogWakeToNextConnector) {
+    RunConnectorRace(GetParam(), 0, RaceRelease::Rebind);
+}
 
 TEST_P(UnixConnectBacklog, AcceptWakesBlockedConnector) {
     RunFullBacklogConnect(Release::Accept, GetParam());
@@ -189,6 +473,67 @@ TEST_P(UnixConnectBacklog, NonblockingFullBacklogReturnsEagain) {
     close(second);
     close(first);
     close(listener);
+}
+
+TEST_P(UnixConnectBacklog, RepeatedConnectAcceptTransfersDataAndEof) {
+    sockaddr_un address{};
+    address.sun_family = AF_UNIX;
+    const int name_len = snprintf(address.sun_path + 1, sizeof(address.sun_path) - 1,
+                                  "dkc033-cycles-%d-%d", getpid(), GetParam());
+    ASSERT_GT(name_len, 0);
+    const socklen_t addr_len = offsetof(sockaddr_un, sun_path) + 1 + name_len;
+
+    ScopedFd listener(socket(AF_UNIX, GetParam() | SOCK_NONBLOCK, 0));
+    ASSERT_GE(listener.get(), 0) << strerror(errno);
+    ASSERT_EQ(0, bind(listener.get(), reinterpret_cast<sockaddr*>(&address), addr_len))
+        << strerror(errno);
+    ASSERT_EQ(0, listen(listener.get(), 0)) << strerror(errno);
+
+    for (int iteration = 0; iteration < 1024; ++iteration) {
+        SCOPED_TRACE(iteration);
+        ScopedFd client(socket(AF_UNIX, GetParam(), 0));
+        ASSERT_GE(client.get(), 0) << strerror(errno);
+        ASSERT_EQ(0, connect(client.get(), reinterpret_cast<sockaddr*>(&address), addr_len))
+            << strerror(errno);
+
+        pollfd ready{listener.get(), POLLIN, 0};
+        ASSERT_EQ(1, poll(&ready, 1, 5000)) << "listener did not become accept-ready";
+        ASSERT_NE(0, ready.revents & POLLIN);
+        ScopedFd peer(accept(listener.get(), nullptr, nullptr));
+        ASSERT_GE(peer.get(), 0) << strerror(errno);
+
+        ASSERT_EQ(1, write(client.get(), "x", 1));
+        char byte = 0;
+        ASSERT_EQ(1, read(peer.get(), &byte, 1));
+        EXPECT_EQ('x', byte);
+        client.reset();
+        ASSERT_EQ(0, read(peer.get(), &byte, 1));
+    }
+}
+
+TEST_P(UnixConnectBacklog, ConnectedSocketReconnectReturnsEisconn) {
+    sockaddr_un address{};
+    address.sun_family = AF_UNIX;
+    const int name_len = snprintf(address.sun_path + 1, sizeof(address.sun_path) - 1,
+                                  "dkc033-eisconn-%d-%d", getpid(), GetParam());
+    ASSERT_GT(name_len, 0);
+    const socklen_t addr_len = offsetof(sockaddr_un, sun_path) + 1 + name_len;
+
+    ScopedFd listener(socket(AF_UNIX, GetParam(), 0));
+    ASSERT_GE(listener.get(), 0) << strerror(errno);
+    ASSERT_EQ(0, bind(listener.get(), reinterpret_cast<sockaddr*>(&address), addr_len))
+        << strerror(errno);
+    ASSERT_EQ(0, listen(listener.get(), 0)) << strerror(errno);
+    ScopedFd client(socket(AF_UNIX, GetParam(), 0));
+    ASSERT_GE(client.get(), 0) << strerror(errno);
+    ASSERT_EQ(0, connect(client.get(), reinterpret_cast<sockaddr*>(&address), addr_len))
+        << strerror(errno);
+    ScopedFd peer(accept(listener.get(), nullptr, nullptr));
+    ASSERT_GE(peer.get(), 0) << strerror(errno);
+
+    errno = 0;
+    EXPECT_EQ(-1, connect(client.get(), reinterpret_cast<sockaddr*>(&address), addr_len));
+    EXPECT_EQ(EISCONN, errno);
 }
 
 INSTANTIATE_TEST_SUITE_P(StreamAndSeqpacket, UnixConnectBacklog,

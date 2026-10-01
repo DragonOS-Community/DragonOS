@@ -89,6 +89,28 @@ fn ring_cap_for_effective_sockbuf(effective: usize) -> usize {
 #[cast_to([sync] Socket)]
 #[derive(Debug)]
 pub struct UnixStreamSocket {
+    /// Current socket state.
+    ///
+    /// Two invariants govern every access:
+    ///
+    /// * **I1 — lifetime.** Any path that entered through a file descriptor
+    ///   (every `net/syscall/*` entry point, and the VFS read/write paths) must
+    ///   keep that descriptor's `Arc<File>` for as long as it uses the socket;
+    ///   `SocketFdRef` is the tool for that. Holding the file makes
+    ///   `File::drop -> IndexNode::close()` impossible, so `inner` cannot move to
+    ///   `None` while the operation is in flight.
+    /// * **I2 — terminal state.** `inner` only ever *persists* as `None` after
+    ///   `do_close()`, which runs from the final `IndexNode::close()` of an
+    ///   fd-backed socket (`open_file_counter` 1 -> 0) or directly for an
+    ///   embryonic, not-yet-accepted child. `try_connect()` and `listen()` do
+    ///   `take()` an `Inner` to rebuild it, but they hold the write lock across
+    ///   the whole `take()`/`replace()` window, so no concurrent observer can
+    ///   see the interim value, and they always put an `Inner` back before
+    ///   returning — including on their error paths.
+    ///
+    /// Predicates and wait conditions can still be re-evaluated after a
+    /// concurrent close, so they go through [`Self::map_inner`] and answer a
+    /// defined terminal value instead of panicking.
     inner: RwSem<Option<Inner>>,
     //todo options
     epitems: EPollItems,
@@ -353,21 +375,26 @@ impl UnixStreamSocket {
         cred: Option<UCred>,
         rights: &[Arc<crate::filesystem::vfs::file::File>],
     ) -> Result<(usize, Wrapping<usize>, usize), SystemError> {
-        match self.inner.read().as_ref().expect("inner is None") {
+        let is_seqpacket = self.is_seqpacket;
+        let sndbuf = self.sndbuf.load(Ordering::Relaxed);
+        self.map_inner(Err(SystemError::ENOTCONN), |inner| match inner {
             Inner::Connected(connected) => {
-                let sndbuf = self.sndbuf.load(Ordering::Relaxed);
-                connected.try_send(buffer, self.is_seqpacket, sndbuf, cred, rights)
+                connected.try_send(buffer, is_seqpacket, sndbuf, cred, rights)
             }
             _ => {
                 // log::error!("the socket is not connected");
-                return Err(SystemError::ENOTCONN);
+                Err(SystemError::ENOTCONN)
             }
-        }
+        })
     }
 
     fn try_connect(&self, backlog: &Arc<Backlog>) -> Result<(), SystemError> {
         let mut writer = self.inner.write();
-        let inner = writer.take().expect("inner is None");
+        // A concurrent close makes the socket terminal; report it instead of
+        // panicking. Unreachable for fd-backed callers, which hold the file.
+        let Some(inner) = writer.take() else {
+            return Err(SystemError::ENOTCONN);
+        };
 
         let (inner, result) = match inner {
             Inner::Init(init) => {
@@ -397,16 +424,28 @@ impl UnixStreamSocket {
         result
     }
 
-    pub fn try_accept(&self) -> Result<(Arc<dyn Socket>, Endpoint), SystemError> {
-        match self.inner.write().as_mut().expect("inner is None") {
-            Inner::Listener(listener) => {
-                listener.try_accept(self.passcred.load(core::sync::atomic::Ordering::Relaxed)) as _
-            }
+    /// Attempt exactly one `accept(2)` without waiting.
+    ///
+    /// `nonblock` is the descriptor's non-blocking mode, sampled once by the
+    /// caller. It selects both whether [`Self::accept`] waits at all and the
+    /// error an empty queue reports (`EAGAIN` for `O_NONBLOCK`, `EINVAL` for a
+    /// latched receive shutdown, mirroring `__skb_recv_datagram()`), so it must
+    /// stay the same value across the whole call: re-reading it per attempt
+    /// could pair `EAGAIN` with a terminal `is_acceptable()` after another
+    /// thread flips the mode, and the retry loop would then spin without ever
+    /// sleeping.
+    fn try_accept_once(
+        &self,
+        passcred: bool,
+        nonblock: bool,
+    ) -> Result<(Arc<dyn Socket>, Endpoint), SystemError> {
+        self.map_inner_mut(Err(SystemError::EINVAL), |inner| match inner {
+            Inner::Listener(listener) => listener.try_accept(passcred, nonblock),
             _ => {
                 log::error!("the socket is not listening");
-                return Err(SystemError::EINVAL);
+                Err(SystemError::EINVAL)
             }
-        }
+        })
     }
 
     fn is_nonblocking(&self) -> bool {
@@ -414,42 +453,55 @@ impl UnixStreamSocket {
             .load(core::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Run `f` against the current [`Inner`], or answer `when_closed` when the
+    /// socket has already reached its terminal state.
+    ///
+    /// `inner` is set to `None` exactly once, by `do_close()` when the last open
+    /// file description disappears (see the field comment above). System calls
+    /// keep that description alive for their whole duration, so a well-behaved
+    /// caller never observes `None` here; but queries and wait predicates can be
+    /// re-evaluated after a concurrent `close()`, and turning that into a panic
+    /// would take the whole kernel down. Funnelling every such query through
+    /// this helper keeps the "already closed" answer in one place instead of
+    /// repeating `expect()` at each call site.
+    fn map_inner<R>(&self, when_closed: R, f: impl FnOnce(&Inner) -> R) -> R {
+        let guard = self.inner.read();
+        match guard.as_ref() {
+            Some(inner) => f(inner),
+            None => when_closed,
+        }
+    }
+
+    /// `map_inner` for the read-modify-write state transitions.
+    fn map_inner_mut<R>(&self, when_closed: R, f: impl FnOnce(&mut Inner) -> R) -> R {
+        let mut guard = self.inner.write();
+        match guard.as_mut() {
+            Some(inner) => f(inner),
+            None => when_closed,
+        }
+    }
+
     fn can_recv(&self) -> bool {
-        match self
-            .inner
-            .read()
-            .as_ref()
-            .expect("UnixStreamSocket inner is None")
-        {
+        self.map_inner(false, |inner| match inner {
             Inner::Connected(connected) => {
                 connected.recv_ready(self.is_seqpacket) || connected.recv_closed()
             }
             _ => false,
-        }
+        })
     }
 
     fn is_acceptable(&self) -> bool {
-        match self
-            .inner
-            .read()
-            .as_ref()
-            .expect("UnixStreamSocket inner is None")
-        {
+        self.map_inner(false, |inner| match inner {
             Inner::Listener(listener) => listener.is_acceptable(),
             _ => false,
-        }
+        })
     }
 
     fn take_connreset_from_peer(&self) -> bool {
-        match self
-            .inner
-            .read()
-            .as_ref()
-            .expect("UnixStreamSocket inner is None")
-        {
+        self.map_inner(false, |inner| match inner {
             Inner::Connected(connected) => connected.take_connreset_from_peer(),
             _ => false,
-        }
+        })
     }
 
     fn take_pending_reset(&self) -> bool {
@@ -534,26 +586,23 @@ impl UnixStreamSocket {
                     let timeout = deadline
                         .map(|d| d.duration_since(Instant::now()).unwrap_or(Duration::ZERO));
                     self.wait_queue.wait_event_interruptible_timeout(
-                        || match self
-                            .inner
-                            .read()
-                            .as_ref()
-                            .expect("UnixStreamSocket inner is None")
-                        {
-                            Inner::Connected(connected) => {
-                                let sndbuf = self.sndbuf.load(Ordering::Relaxed);
-                                let need = if self.is_seqpacket {
-                                    pending.len().saturating_add(core::mem::size_of::<u32>())
-                                } else {
-                                    1
-                                };
-                                let (writable, closed) = connected.send_state(need, sndbuf);
-                                if closed {
-                                    return true;
+                        || {
+                            self.map_inner(true, |inner| match inner {
+                                Inner::Connected(connected) => {
+                                    let sndbuf = self.sndbuf.load(Ordering::Relaxed);
+                                    let need = if self.is_seqpacket {
+                                        pending.len().saturating_add(core::mem::size_of::<u32>())
+                                    } else {
+                                        1
+                                    };
+                                    let (writable, closed) = connected.send_state(need, sndbuf);
+                                    if closed {
+                                        return true;
+                                    }
+                                    writable
                                 }
-                                writable
-                            }
-                            _ => true,
+                                _ => true,
+                            })
                         },
                         timeout,
                     )?;
@@ -589,6 +638,21 @@ impl UnixStreamSocket {
             total_written_len,
         ))
     }
+
+    /// Wake everything waiting on this descriptor after `shutdown(2)` changed
+    /// its state, whether that call landed on this socket or on its peer.
+    ///
+    /// Mirrors the `sk_state_change()` calls of `unix_shutdown()` — one on the
+    /// socket itself and, when it has a peer, the mirrored one on `other`. Both
+    /// end up in `sock_def_wakeup()`, which wakes *every* `sk_sleep` waiter.
+    /// The caller must have released the inner lock first: a waiter re-reads
+    /// `inner`, and a pending writer would otherwise keep this reader blocked
+    /// (`rwsem.rs`).
+    fn wake_shutdown_waiters(&self) {
+        self.wait_queue
+            .wakeup_all(Some(crate::process::ProcessState::Blocked(true)));
+        let _ = EventPoll::wakeup_epoll(self.epoll_items().as_ref(), self.check_io_event());
+    }
 }
 
 impl Socket for UnixStreamSocket {
@@ -622,6 +686,7 @@ impl Socket for UnixStreamSocket {
 
         let timeout = self.send_timeout();
         let started = Instant::now();
+        let mut retry = None;
         loop {
             let remote_addr = endpoint.connect_in(&self.netns, self.unix_socket_type())?;
             let backlog = match get_backlog(&remote_addr) {
@@ -637,7 +702,12 @@ impl Socket for UnixStreamSocket {
                     get_backlog(&current)?
                 }
             };
-            match self.try_connect(&backlog) {
+            let result = self.try_connect(&backlog);
+            // Release the previous wait's responsibility after the enqueue
+            // attempt, before registering another wait. Its original backlog
+            // may differ from the freshly resolved one after a rebind.
+            drop(retry.take());
+            match result {
                 Err(SystemError::ECONNREFUSED) if backlog.is_closed() => continue,
                 Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
                     if self.is_nonblocking() {
@@ -653,7 +723,7 @@ impl Socket for UnixStreamSocket {
 
                     // A wakeup can make the predicate true even if a signal is
                     // pending. Preserve Linux's signal priority before retrying.
-                    if result == Err(SystemError::ERESTARTSYS)
+                    if matches!(result, Err(SystemError::ERESTARTSYS))
                         || crate::arch::ipc::signal::Signal::signal_pending_state(
                             true,
                             false,
@@ -667,7 +737,7 @@ impl Socket for UnixStreamSocket {
                         });
                     }
 
-                    result?;
+                    retry = Some(result?);
                 }
                 result => return result,
             }
@@ -694,7 +764,12 @@ impl Socket for UnixStreamSocket {
 
         let mut writer = self.inner.write();
 
-        let (inner, err) = match writer.take().expect("UnixStreamSocket inner is None") {
+        // A concurrent close makes the socket terminal; report it instead of
+        // panicking. Unreachable for fd-backed callers, which hold the file.
+        let Some(taken) = writer.take() else {
+            return Err(SystemError::EINVAL);
+        };
+        let (inner, err) = match taken {
             Inner::Init(init) => {
                 let config = ListenerConfig {
                     backlog,
@@ -728,17 +803,22 @@ impl Socket for UnixStreamSocket {
     }
 
     fn accept(&self) -> Result<(Arc<dyn Socket>, Endpoint), SystemError> {
-        // debug!("stream server begin accept");
-        if self.is_nonblocking() {
-            self.try_accept()
-        } else {
-            loop {
-                match self.try_accept() {
-                    Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
-                        wq_wait_event_interruptible!(self.wait_queue, self.is_acceptable(), {})?
-                    }
-                    result => break result,
+        // Sample the descriptor's non-blocking mode once and use that same
+        // value for every attempt, like Linux `__sys_accept4_file()` does with
+        // `sock->file->f_flags`; see `try_accept_once()`.
+        let passcred = self.passcred.load(core::sync::atomic::Ordering::Relaxed);
+        let nonblock = self.is_nonblocking();
+
+        if nonblock {
+            return self.try_accept_once(passcred, nonblock);
+        }
+
+        loop {
+            match self.try_accept_once(passcred, nonblock) {
+                Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
+                    wq_wait_event_interruptible!(self.wait_queue, self.is_acceptable(), {})?
                 }
+                result => break result,
             }
         }
     }
@@ -1668,53 +1748,79 @@ impl Socket for UnixStreamSocket {
         Ok(())
     }
 
-    fn shutdown(&self, _how: common::ShutdownBit) -> Result<(), SystemError> {
+    fn shutdown(&self, how: common::ShutdownBit) -> Result<(), SystemError> {
         let inner_guard = self.inner.read();
         let Some(inner) = inner_guard.as_ref() else {
+            // Unreachable for fd-backed callers: they hold the file description
+            // for the whole syscall, so a concurrent `close()` cannot take the
+            // inner state away. `EINVAL` is the defensive answer every
+            // stale-handle path here gives; it is not a Linux-defined outcome.
             return Err(SystemError::EINVAL);
         };
 
-        let Inner::Connected(connected) = inner else {
-            return Err(SystemError::ENOTCONN);
-        };
+        match inner {
+            Inner::Listener(listener) => {
+                // Linux `unix_shutdown()` (`net/unix/af_unix.c`) does not
+                // look at the connection state: it latches `sk_shutdown` and wakes
+                // the socket's own `sk_sleep`. That is precisely what makes
+                // `shutdown(listener, SHUT_RD)` the legal release for a blocked
+                // `accept()`; `close()` deliberately does not (see `do_close()` and
+                // `unix_release_sock()`), matching Linux.
+                listener.set_shutdown(how);
+                drop(inner_guard);
 
-        // For a connected unix socket, shutdown updates per-direction state:
-        // - SHUT_RD: mark incoming direction as recv-shutdown (peer writes -> EPIPE)
-        // - SHUT_WR: mark outgoing direction as send-shutdown (our writes -> EPIPE, peer reads -> EOF when drained)
-        if _how.is_recv_shutdown() {
-            connected.shutdown_recv();
-        }
-        if _how.is_send_shutdown() {
-            connected.shutdown_send();
-        }
+                self.wake_shutdown_waiters();
+                Ok(())
+            }
+            Inner::Init(init) => {
+                // Same rule as for a listener: `unix_shutdown()` latches
+                // `sk_shutdown` and returns 0 for a socket that is not connected
+                // yet, so a descriptor that never reached `connect(2)`/
+                // `listen(2)` must answer `0` too.
+                //
+                // The latch is not decoration: `listen()` and `into_connected()`
+                // hand the bits over to the form the socket turns into, so a
+                // `SHUT_RD` latched here still refuses connectors with
+                // `ECONNREFUSED`, still fails `accept(2)` with `EINVAL`, and a
+                // latched direction still becomes EOF/EPIPE on the connection
+                // that is established later.
+                init.set_shutdown_bits(how);
+                drop(inner_guard);
 
-        // Do not retain our inner lock while waking the peer. The peer can be
-        // shutting down the opposite endpoint concurrently and epoll wakeup
-        // may query its socket state.
-        drop(inner_guard);
+                self.wake_shutdown_waiters();
+                Ok(())
+            }
+            Inner::Connected(connected) => {
+                // For a connected unix socket, shutdown updates per-direction state:
+                // - SHUT_RD: mark incoming direction as recv-shutdown (peer writes -> EPIPE)
+                // - SHUT_WR: mark outgoing direction as send-shutdown (our writes -> EPIPE, peer reads -> EOF when drained)
+                connected.apply_shutdown(how);
 
-        // Local waiters may also need to observe a newly disabled direction.
-        self.wait_queue
-            .wakeup(Some(crate::process::ProcessState::Blocked(true)));
-        let _ = EventPoll::wakeup_epoll(self.epoll_items().as_ref(), self.check_io_event());
+                // Do not retain our inner lock while waking the peer. The peer can be
+                // shutting down the opposite endpoint concurrently and epoll wakeup
+                // may query its socket state.
+                drop(inner_guard);
 
-        // The shutdown bits live in the rings shared with the peer, but a
-        // blocked peer sleeps on its own socket wait queue. Waking only this
-        // endpoint leaves a peer read/write asleep after the condition has
-        // become final (notably SOCK_SEQPACKET read after SHUT_WR).
-        let peer = self.peer.lock().as_ref().and_then(Weak::upgrade);
-        if let Some(peer) = peer {
-            peer.wait_queue
-                .wakeup(Some(crate::process::ProcessState::Blocked(true)));
-            let _ = EventPoll::wakeup_epoll(peer.epoll_items().as_ref(), peer.check_io_event());
-            if _how.is_both_shutdown() {
-                peer.fasync_items.send_sigio(FASYNC_POLL_HUP);
-            } else if _how.is_send_shutdown() {
-                peer.fasync_items.send_sigio(FASYNC_POLL_IN);
+                // Local waiters may also need to observe a newly disabled direction.
+                self.wake_shutdown_waiters();
+
+                // The shutdown bits live in the rings shared with the peer, but a
+                // blocked peer sleeps on its own socket wait queue. Waking only this
+                // endpoint leaves a peer read/write asleep after the condition has
+                // become final (notably SOCK_SEQPACKET read after SHUT_WR).
+                let peer = self.peer.lock().as_ref().and_then(Weak::upgrade);
+                if let Some(peer) = peer {
+                    peer.wake_shutdown_waiters();
+                    if how.is_both_shutdown() {
+                        peer.fasync_items.send_sigio(FASYNC_POLL_HUP);
+                    } else if how.is_send_shutdown() {
+                        peer.fasync_items.send_sigio(FASYNC_POLL_IN);
+                    }
+                }
+
+                Ok(())
             }
         }
-
-        Ok(())
     }
 
     fn check_io_event(&self) -> crate::filesystem::epoll::EPollEventType {

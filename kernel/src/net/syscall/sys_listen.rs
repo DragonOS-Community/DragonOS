@@ -1,8 +1,8 @@
 use system_error::SystemError;
 
+use super::socket_fd::SocketFdRef;
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_LISTEN;
-use crate::process::ProcessManager;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
 use alloc::string::ToString;
 use alloc::vec::Vec;
@@ -80,10 +80,8 @@ pub(super) fn do_listen(fd: usize, backlog: usize) -> Result<usize, SystemError>
     // Linux takes an int and compares it as unsigned against somaxconn.
     // Negative values therefore select the limit rather than failing listen.
     let backlog = (backlog as u32 as usize).min(4096);
-    ProcessManager::current_pcb()
-        .get_socket_inode(fd as i32)?
-        .as_socket()
-        .unwrap()
+    SocketFdRef::from_fd(fd as i32)?
+        .socket()?
         .listen(backlog)
         .map(|_| 0)
 }

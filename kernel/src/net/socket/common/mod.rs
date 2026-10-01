@@ -8,7 +8,7 @@ pub use epoll_items::EPollItems;
 pub use getsockopt::{
     write_i32_getsockopt, write_i32_getsockopt_ipv4, write_linger_getsockopt, write_u32_getsockopt,
 };
-pub use shutdown::ShutdownBit;
+pub use shutdown::{ShutdownBit, ShutdownState};
 pub use sockbuf::{
     parse_socket_buffer_size, SOCK_MIN_RCVBUF, SOCK_MIN_SNDBUF, SYSCTL_RMEM_MAX, SYSCTL_WMEM_MAX,
 };

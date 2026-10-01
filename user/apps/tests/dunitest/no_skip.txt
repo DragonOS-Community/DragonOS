@@ -46,3 +46,5 @@ normal/tcp_connect_confirmation
 normal/netlink_netfilter
 normal/tcp_pending_error
 normal/unix_reuse_options
+normal/unix_connect_backlog
+normal/unix_accept_close

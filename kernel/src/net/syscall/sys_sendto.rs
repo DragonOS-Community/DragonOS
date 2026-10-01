@@ -1,17 +1,15 @@
 use system_error::SystemError;
 
+use super::socket_fd::SocketFdRef;
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_SENDTO;
-use crate::filesystem::vfs::{file::FileFlags, FileType, IndexNode};
 use crate::mm::VirtAddr;
 use crate::net::posix::SockAddr;
 use crate::net::socket;
 use crate::net::socket::endpoint::Endpoint;
-use crate::process::ProcessManager;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
 use crate::syscall::user_access::UserBufferReader;
 use alloc::string::ToString;
-use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 /// System call handler for the `sendto` syscall
@@ -123,7 +121,8 @@ impl SysSendtoHandle {
 syscall_table_macros::declare_syscall!(SYS_SENDTO, SysSendtoHandle);
 
 pub(super) struct PreparedSend {
-    pub(super) socket_inode: Arc<dyn IndexNode>,
+    /// Keeps the socket alive for the whole (possibly blocking) send.
+    pub(super) sock: SocketFdRef,
     pub(super) pmsg_flags: socket::PMSG,
     endpoint: Option<Endpoint>,
 }
@@ -134,9 +133,9 @@ pub(super) fn prepare_send_common(
     addr: *const SockAddr,
     addrlen: u32,
 ) -> Result<PreparedSend, SystemError> {
-    let (socket_inode, pmsg_flags) = prepare_send_socket(fd, flags)?;
+    let (sock, pmsg_flags) = prepare_send_socket(fd, flags)?;
 
-    let socket = socket_inode.as_socket().ok_or(SystemError::ENOTSOCK)?;
+    let socket = sock.socket()?;
     let endpoint = if addr.is_null() {
         None
     } else {
@@ -145,7 +144,7 @@ pub(super) fn prepare_send_common(
     };
 
     Ok(PreparedSend {
-        socket_inode,
+        sock,
         pmsg_flags,
         endpoint,
     })
@@ -154,25 +153,19 @@ pub(super) fn prepare_send_common(
 pub(super) fn prepare_send_socket(
     fd: usize,
     flags: u32,
-) -> Result<(Arc<dyn IndexNode>, socket::PMSG), SystemError> {
-    let (socket_inode, file_nonblock) = {
-        let binding = ProcessManager::current_pcb().fd_table();
-        let guard = binding.read();
-        let file = guard.get_file_by_fd(fd as i32).ok_or(SystemError::EBADF)?;
-        if file.file_type() != FileType::Socket {
-            return Err(SystemError::ENOTSOCK);
-        }
-        (file.inode(), file.flags().contains(FileFlags::O_NONBLOCK))
-    };
-
-    socket_inode.as_socket().ok_or(SystemError::ENOTSOCK)?;
+) -> Result<(SocketFdRef, socket::PMSG), SystemError> {
+    // `sendto`/`sendmsg`/`sendmmsg` may block on a full socket buffer. The open
+    // file description must therefore outlive the whole send: if it were dropped
+    // here, another thread's `close()` would run `do_close()`, consume `inner`
+    // and wake a predicate that still assumes the socket is alive.
+    let sock = SocketFdRef::from_fd(fd as i32)?;
 
     let mut pmsg_flags = socket::PMSG::from_bits_truncate(flags);
-    if file_nonblock {
+    if sock.is_nonblocking() {
         pmsg_flags.insert(socket::PMSG::DONTWAIT);
     }
 
-    Ok((socket_inode, pmsg_flags))
+    Ok((sock, pmsg_flags))
 }
 
 pub(super) fn do_sendto_user_prepared(
@@ -180,6 +173,6 @@ pub(super) fn do_sendto_user_prepared(
     reader: &UserBufferReader<'_>,
     len: usize,
 ) -> Result<usize, SystemError> {
-    let socket = prepared.socket_inode.as_socket().unwrap();
+    let socket = prepared.sock.socket()?;
     socket.send_user_buffer(reader, len, prepared.pmsg_flags, prepared.endpoint.clone())
 }

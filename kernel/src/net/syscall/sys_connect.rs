@@ -1,10 +1,10 @@
 use system_error::SystemError;
 
+use super::socket_fd::SocketFdRef;
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_CONNECT;
 use crate::mm::VirtAddr;
 use crate::net::posix::SockAddr;
-use crate::process::ProcessManager;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
 use alloc::string::ToString;
 use alloc::vec::Vec;
@@ -100,8 +100,10 @@ pub(super) fn do_connect(
     addr: *const SockAddr,
     addrlen: u32,
 ) -> Result<usize, SystemError> {
-    let inode = ProcessManager::current_pcb().get_socket_inode(fd as i32)?;
-    let socket = inode.as_socket().unwrap();
+    // `connect()` may sleep on a full backlog, so the socket must stay alive for
+    // the whole call (Linux keeps the open file description via `fdget()`).
+    let sock = SocketFdRef::from_fd(fd as i32)?;
+    let socket = sock.socket()?;
     let endpoint = socket.endpoint_from_user(addr, addrlen)?;
     socket.connect(endpoint)?;
     Ok(0)

@@ -78,6 +78,8 @@ normal/unix_socket_shutdown
 normal/unix_seqpacket_zero_recv
 normal/unix_reuse_options
 normal/unix_scm_rights
+normal/unix_connect_backlog
+normal/unix_accept_close
 fuse/fuse_core
 fuse/fuse_extended
 normal/test_procfs_link

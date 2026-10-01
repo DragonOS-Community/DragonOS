@@ -1,13 +1,12 @@
 use system_error::SystemError;
 
+use super::socket_fd::SocketFdRef;
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_RECVFROM;
-use crate::filesystem::vfs::{file::FileFlags, FileType};
 use crate::mm::VirtAddr;
 use crate::net::posix::SockAddr;
-use crate::net::socket;
 use crate::net::socket::RecvFromAddrBehavior;
-use crate::process::ProcessManager;
+use crate::net::socket::PMSG;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
 use crate::syscall::user_access::UserBufferWriter;
 use alloc::string::ToString;
@@ -153,24 +152,15 @@ pub(super) fn do_recvfrom(
     addr: *mut SockAddr,
     addr_len: *mut u32,
 ) -> Result<usize, SystemError> {
+    // Retain the open file description while recv may block, even if another
+    // thread closes or reuses the descriptor.
+    let sock = SocketFdRef::from_fd(fd as i32)?;
+    let socket = sock.socket()?;
+
     // Honor O_NONBLOCK set via fcntl(F_SETFL) by translating it to MSG_DONTWAIT.
-    let file = {
-        let binding = ProcessManager::current_pcb().fd_table();
-        let guard = binding.read();
-        guard.get_file_by_fd(fd as i32).ok_or(SystemError::EBADF)?
-    };
-    if file.file_type() != FileType::Socket {
-        return Err(SystemError::ENOTSOCK);
-    }
-    let file_nonblock = file.flags().contains(FileFlags::O_NONBLOCK);
-
-    // Retain the file while recv may block, even if another thread closes/reuses fd.
-    let socket_inode = file.inode();
-    let socket = socket_inode.as_socket().ok_or(SystemError::ENOTSOCK)?;
-
-    let mut pmsg_flags = socket::PMSG::from_bits_truncate(flags);
-    if file_nonblock {
-        pmsg_flags.insert(socket::PMSG::DONTWAIT);
+    let mut pmsg_flags = PMSG::from_bits_truncate(flags);
+    if sock.is_nonblocking() {
+        pmsg_flags.insert(PMSG::DONTWAIT);
     }
 
     // Linux 语义：recvfrom 的 addr/addrlen 是纯输出参数，内核不得读取 addr 缓冲区内容。

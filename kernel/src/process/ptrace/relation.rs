@@ -563,8 +563,8 @@ impl ProcessControlBlock {
             // Linux ptrace_init_task() places SIGSTOP directly in the new
             // task's private pending bitmap. The child is still scheduler-New,
             // so no signal delivery, allocation, or wakeup is needed here.
-            let sighand = self.sighand();
-            let _sighand_guard = sighand.inner_read();
+            let signal_state = self.process_signal();
+            let _signal_state_guard = signal_state.inner_read();
             self.sig_info_mut()
                 .sig_pending_mut()
                 .signal_mut()

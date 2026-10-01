@@ -462,7 +462,9 @@ pub union PosixSigval {
 impl PosixSigval {
     #[inline(always)]
     pub const fn from_int(v: i32) -> Self {
-        Self { sival_int: v }
+        let mut value = Self::zero();
+        value.sival_int = v;
+        value
     }
 
     #[inline(always)]
@@ -727,6 +729,10 @@ pub(crate) fn sig_type_from_user_siginfo(
 impl SigInfo {
     pub fn sig_code(&self) -> SigCode {
         self.sig_code
+    }
+
+    pub(crate) fn sig_type(&self) -> &SigType {
+        &self.sig_type
     }
 
     /// Fully convert a user-mode PosixSigInfo into a SigInfo.

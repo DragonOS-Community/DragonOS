@@ -7,6 +7,7 @@ pub mod exit;
 pub mod fork;
 pub mod geteuid;
 pub mod idle;
+pub mod itimer;
 pub mod kthread;
 pub mod namespace;
 pub mod pid;
@@ -23,7 +24,6 @@ pub mod shebang;
 pub mod signal;
 pub mod stdio;
 pub mod syscall;
-pub mod timer;
 pub mod trace;
 #[cfg(target_arch = "x86_64")]
 pub mod uprobe;
@@ -45,9 +45,8 @@ int_like!(RawPid, AtomicRawPid, usize, AtomicUsize);
 pub use cputime::ProcessCpuTime;
 pub(crate) use cred::Cred;
 #[allow(unused_imports)]
-pub use info::{
-    CpuItimer, ProcessBasicInfo, ProcessItimer, ProcessItimers, ProcessSignalInfo, ThreadInfo,
-};
+pub use info::{ProcessBasicInfo, ProcessSignalInfo, ThreadInfo};
+pub use itimer::ProcessItimers;
 #[allow(unused_imports)]
 pub use kstack::{KernelStack, KernelStackType};
 #[allow(unused_imports)]

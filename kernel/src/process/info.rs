@@ -16,26 +16,6 @@ use crate::{
     sched::completion::Completion,
 };
 
-#[derive(Debug, Default)]
-pub struct CpuItimer {
-    pub value: u64,    // remaining time in ns
-    pub interval: u64, // interval in ns
-    pub is_active: bool,
-}
-
-#[derive(Debug, Clone)]
-pub struct ProcessItimer {
-    pub timer: Arc<crate::time::timer::Timer>,
-    pub config: crate::time::syscall::Itimerval,
-}
-
-#[derive(Debug, Default)]
-pub struct ProcessItimers {
-    pub real: Option<ProcessItimer>, // for ITIMER_REAL
-    pub virt: CpuItimer,             // for ITIMER_VIRT
-    pub prof: CpuItimer,             // for ITIMER_PROF
-}
-
 #[derive(Debug)]
 pub struct ThreadInfo {
     // Address from userspace to record the thread ID. When this thread exits,

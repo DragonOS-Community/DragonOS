@@ -1,70 +1,38 @@
-use crate::arch::interrupt::TrapFrame;
-use crate::arch::syscall::nr::SYS_ALARM;
-use crate::process::{timer::AlarmTimer, ProcessManager};
-use crate::syscall::table::{FormattedSyscallParam, Syscall};
+use crate::{
+    arch::{interrupt::TrapFrame, syscall::nr::SYS_ALARM},
+    process::ProcessManager,
+    syscall::table::{FormattedSyscallParam, Syscall},
+    time::syscall::{ItimerType, Itimerval, PosixTimeval},
+};
 use alloc::vec::Vec;
-use core::time::Duration;
 use system_error::SystemError;
-
 pub struct SysAlarm;
-
-impl SysAlarm {
-    fn expired_second(args: &[usize]) -> u32 {
-        args[0] as u32
-    }
-}
-
 impl Syscall for SysAlarm {
     fn num_args(&self) -> usize {
         1
     }
-
     fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
-        let expired_second = Self::expired_second(args);
-
-        //初始化second
-        let second = Duration::from_secs(expired_second as u64);
-        let pcb = ProcessManager::current_pcb();
-        let mut pcb_alarm = pcb.alarm_timer_irqsave();
-        let alarm = pcb_alarm.as_ref();
-        //alarm第一次调用
-        if alarm.is_none() {
-            // alarm(0) disarms the timer, even when no alarm was previously set.
-            // Do not turn cancellation into an immediately expiring SIGALRM.
-            if second.is_zero() {
-                return Ok(0);
-            }
-            //注册alarm定时器
-            let new_alarm = Some(AlarmTimer::alarm_timer_init(pcb.clone(), second.as_secs()));
-            *pcb_alarm = new_alarm;
-            drop(pcb_alarm);
-            return Ok(0);
-        }
-        //查询上一个alarm的剩余时间和重新注册alarm
-        let alarmtimer = alarm.unwrap();
-        let remain = alarmtimer.remain();
-        if second.is_zero() {
-            alarmtimer.cancel();
-            *pcb_alarm = None; // 清空alarm
-            drop(pcb_alarm);
-            return Ok(remain.as_secs() as usize);
-        }
-        if !alarmtimer.timeout() {
-            alarmtimer.cancel();
-        }
-        let new_alarm = Some(AlarmTimer::alarm_timer_init(pcb.clone(), second.as_secs()));
-        *pcb_alarm = new_alarm;
-        drop(pcb_alarm);
-        return Ok(remain.as_secs() as usize);
+        let old = ProcessManager::current_pcb()
+            .set_itimer(
+                ItimerType::Real,
+                Itimerval {
+                    it_value: PosixTimeval {
+                        tv_sec: args[0] as u32 as i64,
+                        tv_usec: 0,
+                    },
+                    it_interval: PosixTimeval::default(),
+                },
+            )
+            .it_value;
+        let round_up = (old.tv_sec == 0 && old.tv_usec != 0) || old.tv_usec >= 500_000;
+        Ok(old.tv_sec as usize + usize::from(round_up))
     }
-
     fn entry_format(&self, args: &[usize]) -> Vec<FormattedSyscallParam> {
         vec![FormattedSyscallParam::new(
-            "expired_second",
-            format!("{}", Self::expired_second(args)),
+            "seconds",
+            format!("{}", args[0] as u32),
         )]
     }
 }
-
 #[cfg(target_arch = "x86_64")]
 syscall_table_macros::declare_syscall!(SYS_ALARM, SysAlarm);

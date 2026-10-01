@@ -390,7 +390,7 @@ bitflags! {
 /// Signal default handler — terminate process
 fn sig_terminate(sig: Signal) {
     let code = ProcessManager::current_pcb()
-        .sighand()
+        .process_signal()
         .group_exit_code_if_set();
     compiler_fence(core::sync::atomic::Ordering::SeqCst);
     // If a thread group exit is already in progress, all subsequent fatal signals
@@ -404,9 +404,9 @@ fn sig_terminate(sig: Signal) {
 
     if sig == Signal::SIGKILL {
         let current = ProcessManager::current_pcb();
-        let sighand = current.sighand();
-        if sighand.flags_contains(SignalFlags::GROUP_EXEC) {
-            if let Some(exec_task) = sighand.group_exec_task() {
+        let signal_state = current.process_signal();
+        if signal_state.flags_contains(SignalFlags::GROUP_EXEC) {
+            if let Some(exec_task) = signal_state.group_exec_task() {
                 if !Arc::ptr_eq(&exec_task, &current) {
                     // de_thread() privately injects SIGKILL into the siblings
                     // that the exec owner is replacing. They exit with code 0,
@@ -429,7 +429,7 @@ fn sig_terminate(sig: Signal) {
 /// Signal default handler — terminate process and generate core dump
 fn sig_terminate_dump(sig: Signal) {
     let code = ProcessManager::current_pcb()
-        .sighand()
+        .process_signal()
         .group_exit_code_if_set();
     compiler_fence(core::sync::atomic::Ordering::SeqCst);
     if let Some(code) = code {
@@ -446,7 +446,7 @@ fn sig_stop(sig: Signal) {
     // 在接收者上下文设置停止标志，并让当前任务进入 Stopped
     let guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
     let pcb = ProcessManager::current_pcb();
-    if pcb.sighand().flags_contains(SignalFlags::GROUP_EXIT) {
+    if pcb.process_signal().flags_contains(SignalFlags::GROUP_EXIT) {
         drop(guard);
         return;
     }
@@ -468,7 +468,7 @@ fn sig_stop(sig: Signal) {
     // STOP_STOPPED | CLD_STOPPED + stop_signal under the sighand lock) and report to real_parent.
     let fresh_stop =
         crate::process::ptrace::stop_mixed_ptrace_group(&pcb, sig).unwrap_or_else(|| {
-            pcb.sighand()
+            pcb.process_signal()
                 .transition_group_stop(sig, || ProcessManager::mark_stop().is_ok())
         });
     drop(guard);

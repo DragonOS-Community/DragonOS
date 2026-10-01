@@ -441,11 +441,10 @@ impl TimerFunction for PosixTimerHelper {
                     // Process-directed: all operations complete on the sighand side, avoiding
                     // any nesting with sig_info.
                     let bump = 1i32.saturating_add(t.pending_overrun_acc);
-                    if target.sighand().shared_pending_posix_timer_bump_overrun(
-                        signo,
-                        self.timerid,
-                        bump,
-                    ) {
+                    if target
+                        .process_signal()
+                        .shared_pending_posix_timer_bump_overrun(signo, self.timerid, bump)
+                    {
                         // Reset only after the bump succeeds; keep the value on failure.
                         t.pending_overrun_acc = 0;
                     } else if ignored_and_unblocked {
@@ -472,7 +471,7 @@ impl TimerFunction for PosixTimerHelper {
                         // source (e.g. a concurrent kill), false is returned and this is counted
                         // as an overrun, avoiding duplicate enqueue.
                         if target
-                            .sighand()
+                            .process_signal()
                             .shared_pending_push_posix_timer(signo, info)
                         {
                             t.pending_overrun_acc = 0;

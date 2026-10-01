@@ -195,17 +195,16 @@ impl PtraceRequestGuard {
             }
             let session_generation = tracee.ptrace_session_generation();
 
-            let sighand = tracee.sighand();
-            let sighand_guard = sighand.inner_read();
+            let signal_state = tracee.process_signal();
+            let _signal_state_guard = signal_state.inner_read();
+            let pending = tracee.process_signal();
+            let pending_guard = pending.lock_irqsave();
             let siginfo_guard = tracee.sig_info_irqsave();
             let fatal = siginfo_guard
                 .sig_pending()
                 .signal()
                 .contains(Signal::SIGKILL.into())
-                || sighand_guard
-                    .shared_pending
-                    .signal()
-                    .contains(Signal::SIGKILL.into());
+                || pending_guard.signal().contains(Signal::SIGKILL.into());
             if fatal {
                 return Err(SystemError::ESRCH);
             }

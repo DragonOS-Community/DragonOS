@@ -31,7 +31,7 @@ pub(super) fn do_kernel_rt_sigpending(
     let pending_set = siginfo_guard.sig_pending().signal();
     let blocked_set = *siginfo_guard.sig_blocked();
     drop(siginfo_guard);
-    let shared_pending_set = pcb.sighand().shared_pending_signal();
+    let shared_pending_set = pcb.process_signal().shared_pending_signal();
 
     let mut result = pending_set.union(shared_pending_set);
     // sigpending reports pending signals that are blocked by this thread.

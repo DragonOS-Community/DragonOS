@@ -13,7 +13,7 @@ use crate::{
         open::do_open_execat,
         permission::{check_inode_permission, PermissionMask},
     },
-    ipc::sighand::{GroupExecCancelResult, SigHand},
+    ipc::{process_signal::GroupExecCancelResult, sighand::SigHand},
     libs::elf::ELF_LOADER,
     mm::{
         ucontext::{AddressSpace, UserStack},
@@ -367,7 +367,6 @@ impl ExecParam {
             let old_sighand = me.sighand();
             let new_sighand = SigHand::try_new().map_err(ExecError::SystemError)?;
             new_sighand.copy_handlers_from(&old_sighand);
-            new_sighand.copy_process_state_from(&old_sighand);
             me.replace_sighand(new_sighand);
         }
 
@@ -416,7 +415,7 @@ fn de_thread(
         return Err(SystemError::EINVAL);
     }
 
-    let sighand = current.sighand();
+    let signal_state = current.process_signal();
     let leader = {
         let ti = current.threads_read_irqsave();
         ti.group_leader().unwrap_or_else(|| current.clone())
@@ -427,7 +426,7 @@ fn de_thread(
     // unhash-tail completion path. An already exiting/ptraced zombie sibling
     // remains pending until it has stopped touching identity-bearing lists.
     let (kill_list, invalid_old_leader) =
-        sighand.start_group_exec_transaction(&current, old_leader.as_ref(), |generation| {
+        signal_state.start_group_exec_transaction(&current, old_leader.as_ref(), |generation| {
             let invalid_old_leader = old_leader
                 .as_ref()
                 .map(|old| old.is_dead())
@@ -474,7 +473,7 @@ fn de_thread(
         })?;
 
     if invalid_old_leader {
-        match sighand.try_cancel_group_exec(&current) {
+        match signal_state.try_cancel_group_exec(&current) {
             GroupExecCancelResult::Canceled => {
                 return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
             }
@@ -498,19 +497,22 @@ fn de_thread(
         Signal::queue_private_sigkill_to_thread(&task);
     }
 
-    let pending_wait = sighand.wait_group_exec_event_killable(
-        || Signal::fatal_signal_pending(&current) || sighand.group_exec_pending_complete(&current),
+    let pending_wait = signal_state.wait_group_exec_event_killable(
+        || {
+            Signal::fatal_signal_pending(&current)
+                || signal_state.group_exec_pending_complete(&current)
+        },
         None::<fn()>,
     );
     if pending_wait.is_err() || Signal::fatal_signal_pending(&current) {
-        match sighand.try_cancel_group_exec(&current) {
+        match signal_state.try_cancel_group_exec(&current) {
             GroupExecCancelResult::Canceled | GroupExecCancelResult::NotOwner => {
                 return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
             }
             GroupExecCancelResult::Committed => {
-                sighand
+                signal_state
                     .wait_group_exec_event_uninterruptible(
-                        || sighand.group_exec_handoff_ready(&current),
+                        || signal_state.group_exec_handoff_ready(&current),
                         None::<fn()>,
                     )
                     .expect("uninterruptible group-exec wait failed");
@@ -519,23 +521,23 @@ fn de_thread(
     }
 
     if let Some(leader) = old_leader.as_ref() {
-        if !sighand.group_exec_handoff_ready(&current) {
-            let leader_wait = sighand.wait_group_exec_event_killable(
+        if !signal_state.group_exec_handoff_ready(&current) {
+            let leader_wait = signal_state.wait_group_exec_event_killable(
                 || {
                     Signal::fatal_signal_pending(&current)
-                        || sighand.group_exec_handoff_ready(&current)
+                        || signal_state.group_exec_handoff_ready(&current)
                 },
                 None::<fn()>,
             );
             if leader_wait.is_err() || Signal::fatal_signal_pending(&current) {
-                match sighand.try_cancel_group_exec(&current) {
+                match signal_state.try_cancel_group_exec(&current) {
                     GroupExecCancelResult::Canceled | GroupExecCancelResult::NotOwner => {
                         return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
                     }
                     GroupExecCancelResult::Committed => {
-                        sighand
+                        signal_state
                             .wait_group_exec_event_uninterruptible(
-                                || sighand.group_exec_handoff_ready(&current),
+                                || signal_state.group_exec_handoff_ready(&current),
                                 None::<fn()>,
                             )
                             .expect("uninterruptible group-exec wait failed");
@@ -545,7 +547,7 @@ fn de_thread(
         }
 
         assert!(
-            sighand.group_exec_handoff_ready(&current),
+            signal_state.group_exec_handoff_ready(&current),
             "committed group-exec handoff is not ready"
         );
         assert!(leader.is_zombie(), "old exec leader must be zombie");
@@ -683,7 +685,7 @@ fn de_thread(
     }
 
     assert!(
-        sighand.finish_group_exec_owned(&current),
+        signal_state.finish_group_exec_owned(&current),
         "group-exec owner could not finish a completed transaction"
     );
     Ok(())

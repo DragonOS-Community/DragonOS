@@ -15,8 +15,8 @@ use crate::{
     driver::tty::tty_job_control::TtyJobCtrlManager,
     exception::InterruptArch,
     ipc::{
+        process_signal::{NaturalParentNotifyToken, ReapTransition},
         sem_undo::detach_sem_undo,
-        sighand::{NaturalParentNotifyToken, ReapTransition},
         signal_types::{SigCode, SigInfo, SigType},
     },
     libs::futex::{
@@ -66,8 +66,8 @@ impl ProcessManager {
     /// Notify the parent process after a child process exits.
     #[inline(never)]
     fn exit_notify(current: &Arc<ProcessControlBlock>) {
-        let sighand = current.sighand();
-        let claimed_exec_leader = sighand.claim_group_exec_leader_exit(current);
+        let signal_state = current.process_signal();
+        let claimed_exec_leader = signal_state.claim_group_exec_leader_exit(current);
 
         // A claimed old leader must retain all hashed identity until the exec
         // owner swaps it. In particular it is never autoreaped here.
@@ -90,7 +90,7 @@ impl ProcessManager {
             Self::wake_pidfd_pollers_for_task_exit(current);
             Self::notify_ptrace_parent(ptrace_notification);
             current.mark_exit_notify_complete();
-            let completed = sighand.complete_group_exec_leader_exit(current);
+            let completed = signal_state.complete_group_exec_leader_exit(current);
             debug_assert!(completed);
             return;
         }
@@ -124,7 +124,7 @@ impl ProcessManager {
                     // Whichever side observes the group become empty therefore
                     // owns the one natural-parent notification transaction.
                     let (empty, token) =
-                        sighand.try_claim_natural_parent_notify_with(current, || {
+                        signal_state.try_claim_natural_parent_notify_with(current, || {
                             current.set_exit_state_zombie();
                             let empty = !current
                                 .threads_read_irqsave()
@@ -177,7 +177,7 @@ impl ProcessManager {
         }
 
         current.mark_exit_notify_complete();
-        sighand.complete_group_exec_leader_exit(current);
+        signal_state.complete_group_exec_leader_exit(current);
     }
 
     fn notify_ptrace_parent(
@@ -215,7 +215,7 @@ impl ProcessManager {
         // stores the last task's local do_exit() argument separately (for
         // example, de_thread() may return EAGAIN after SIGKILL committed).
         let raw_status = child
-            .sighand()
+            .process_signal()
             .group_exit_code_if_set()
             .map(|status| status as i32)
             .unwrap_or(raw_status);
@@ -249,7 +249,7 @@ impl ProcessManager {
         token: NaturalParentNotifyToken,
     ) {
         let Some(parent) = child.real_parent_pcb() else {
-            child.sighand().complete_natural_parent_notify(token);
+            child.process_signal().complete_natural_parent_notify(token);
             return;
         };
         let exit_signal = child.exit_signal.load(Ordering::SeqCst);
@@ -277,7 +277,7 @@ impl ProcessManager {
 
         if autoreap {
             let transition = child
-                .sighand()
+                .process_signal()
                 .try_reap_natural_child_as_notify_owner(child, &token);
             assert_eq!(
                 transition,
@@ -288,7 +288,7 @@ impl ProcessManager {
         }
 
         assert!(
-            child.sighand().complete_natural_parent_notify(token),
+            child.process_signal().complete_natural_parent_notify(token),
             "natural-parent notification ownership changed"
         );
         // Reparenting is serialized by PTRACE_RELATION_LOCK. If it completed
@@ -461,7 +461,7 @@ impl ProcessManager {
             // cwd/root path references alive, otherwise an already-reaped
             // chrooted child can make an unrelated umount report EBUSY.
             pcb.exit_fs();
-            pcb.exit_timers();
+            pcb.exit_timers(group_dead);
 
             // Linux releases task namespaces before publishing Zombie, not
             // when the parent eventually reaps the PCB. In particular, a
@@ -560,10 +560,10 @@ impl ProcessManager {
             }
 
             // 1. Atomically set the GROUP_EXIT flag and group_exit_code on the
-            //    shared sighand. If another thread has already set it, reuse
+            //    shared signal_state. If another thread has already set it, reuse
             //    the existing exit code.
-            let sighand = current_pcb.sighand();
-            final_exit_code = sighand.start_group_exit(exit_code);
+            let signal_state = current_pcb.process_signal();
+            final_exit_code = signal_state.start_group_exit(exit_code);
 
             // 2. Send SIGKILL to other threads in the same thread group,
             //    waking and forcefully terminating them. Mirroring Linux

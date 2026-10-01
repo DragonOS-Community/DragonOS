@@ -337,8 +337,8 @@ fn send_oom_sigkill(
             return Err(SystemError::ESRCH);
         }
 
-        let sighand = victim.sighand();
-        sighand.record_oom_victim_mm(victim_tgid, &candidate.mm);
+        let signal_state = victim.process_signal();
+        signal_state.record_oom_victim_mm(victim_tgid, &candidate.mm);
         let mut state = OOM_STATE.lock_irqsave();
         state.selecting = false;
         state.inflight = Some(OomVictimState {
@@ -350,7 +350,7 @@ fn send_oom_sigkill(
         match send_sigkill(victim.clone()) {
             Ok(_) => Ok(Some(victim_tgid)),
             Err(err) => {
-                sighand.clear_oom_mm_if(victim_tgid, victim_mm_id);
+                signal_state.clear_oom_mm_if(victim_tgid, victim_mm_id);
                 if rollback_inflight(generation, victim_tgid, victim_mm_id) {
                     wake_oom_waiters();
                 }
@@ -381,7 +381,10 @@ pub fn current_is_oom_victim() -> bool {
         return false;
     }
     let current = ProcessManager::current_pcb();
-    current.sighand().oom_victim_mm_matches(current.raw_tgid()) && current_is_killed_or_exiting()
+    current
+        .process_signal()
+        .oom_victim_mm_matches(current.raw_tgid())
+        && current_is_killed_or_exiting()
 }
 
 fn wait_for_oom_slot() -> Result<(), SystemError> {

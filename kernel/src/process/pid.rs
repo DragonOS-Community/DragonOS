@@ -73,6 +73,8 @@ pub struct Pid {
     /// 使用此PID的任务列表，按PID类型分组
     /// tasks[PidType::PID as usize] = 使用该PID作为进程ID的任务
     /// tasks[PidType::TGID as usize] = 使用该PID作为线程组ID的任务
+    /// Timer callbacks resolve their saved TGID here. All readers and writers
+    /// must disable local IRQs so a callback cannot interrupt a lock owner.
     tasks: [SpinLock<Vec<Weak<ProcessControlBlock>>>; PidType::PIDTYPE_MAX],
     /// PID numbers in each namespace. These remain as identity until final drop.
     numbers: SpinLock<Vec<Option<UPid>>>,
@@ -160,7 +162,7 @@ impl Pid {
     }
 
     pub fn tasks_iter(&self, pid_type: PidType) -> PidTaskIterator<'_> {
-        let guard = self.tasks[pid_type as usize].lock();
+        let guard = self.tasks[pid_type as usize].lock_irqsave();
         PidTaskIterator { guard, index: 0 }
     }
 
@@ -179,12 +181,12 @@ impl Pid {
     }
 
     pub fn has_task(&self, pid_type: PidType) -> bool {
-        let tasks = self.tasks[pid_type as usize].lock();
+        let tasks = self.tasks[pid_type as usize].lock_irqsave();
         !tasks.is_empty()
     }
 
     pub fn pid_task(&self, pid_type: PidType) -> Option<Arc<ProcessControlBlock>> {
-        let tasks = self.tasks[pid_type as usize].lock();
+        let tasks = self.tasks[pid_type as usize].lock_irqsave();
         if tasks.is_empty() {
             None
         } else {
@@ -331,12 +333,12 @@ impl ProcessControlBlock {
             .nr;
         self.pid.store(raw_pid, Ordering::Release);
         self.thread_pid.write().replace(pid.clone());
-        self.sighand().set_pid(PidType::TGID, Some(pid));
+        self.process_signal().set_pid(PidType::TGID, Some(pid));
     }
 
     #[cfg(test)]
     pub(crate) fn clear_pid_identity_for_test(&self) {
-        self.sighand().set_pid(PidType::TGID, None);
+        self.process_signal().set_pid(PidType::TGID, None);
         self.thread_pid.write().take();
         self.pid.store(RawPid::new(0), Ordering::Release);
     }
@@ -392,8 +394,8 @@ impl ProcessControlBlock {
         );
 
         let (first_pid_lock, second_pid_lock) = order_pids(&first_pid, &second_pid);
-        let mut first_tasks = first_pid_lock.tasks[PidType::PID as usize].lock();
-        let mut second_tasks = second_pid_lock.tasks[PidType::PID as usize].lock();
+        let mut first_tasks = first_pid_lock.tasks[PidType::PID as usize].lock_irqsave();
+        let mut second_tasks = second_pid_lock.tasks[PidType::PID as usize].lock_irqsave();
 
         let (first_task_for_pid, second_task_for_pid) = if Arc::ptr_eq(first_pid_lock, &first_pid) {
             (first_task, second_task)
@@ -600,7 +602,7 @@ impl ProcessControlBlock {
         if let Some(pid) = pid {
             self.pid_links[pid_type as usize].link_pid(pid.clone());
             pid.tasks[pid_type as usize]
-                .lock()
+                .lock_irqsave()
                 .push(self.self_ref.clone());
         }
     }
@@ -644,7 +646,7 @@ impl ProcessControlBlock {
             "target task already owns the transferred PID link"
         );
 
-        let mut tasks = pid.tasks[pid_type as usize].lock();
+        let mut tasks = pid.tasks[pid_type as usize].lock_irqsave();
         let source_index = find_task_in_pid_tasks(&tasks, self)
             .expect("source task is missing from the struct Pid task list");
         assert!(
@@ -660,7 +662,7 @@ impl ProcessControlBlock {
             return self.thread_pid.read().clone();
         }
 
-        self.sighand().pid(pid_type)
+        self.process_signal().pid(pid_type)
     }
 
     pub fn task_pid_vnr(&self) -> RawPid {
@@ -764,7 +766,7 @@ impl ProcessControlBlock {
 
         if let Some(pid) = pid {
             pid.tasks[pid_type as usize]
-                .lock()
+                .lock_irqsave()
                 .retain(|task| !Weak::ptr_eq(task, &self.self_ref));
             for x in PidType::ALL.iter().rev() {
                 if pid.has_task(*x) {

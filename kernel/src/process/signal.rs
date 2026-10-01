@@ -22,6 +22,25 @@ impl ProcessManager {
 }
 
 impl ProcessControlBlock {
+    pub fn process_signal(&self) -> Arc<crate::ipc::process_signal::ProcessSignalState> {
+        self.process_signal.load()
+    }
+
+    pub(super) fn replace_process_signal(
+        &self,
+        new: Arc<crate::ipc::process_signal::ProcessSignalState>,
+    ) {
+        let old = self.with_task_lock_irqsave(|| {
+            // SAFETY: task_lock serializes slot writers; `old` owns the
+            // removed slot reference until all RCU readers have finished.
+            unsafe { self.process_signal.swap(new) }
+        });
+        if let Err(old) = crate::rcu::try_rcu_defer_drop_arc(old) {
+            crate::rcu::synchronize_rcu_noalloc();
+            drop(old);
+        }
+    }
+
     pub fn with_task_lock_irqsave<R>(&self, f: impl FnOnce() -> R) -> R {
         let _task_guard = self.task_lock.lock_irqsave();
         f()

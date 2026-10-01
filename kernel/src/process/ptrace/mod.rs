@@ -210,7 +210,7 @@ impl ProcessControlBlock {
             let mut completed_group_stop = false;
             if let Some((group_generation, counted)) = expected_group_stop {
                 let still_ptraced = is_ptraced_locked(self);
-                self.sighand().with_group_stop_state(|group| {
+                self.process_signal().with_group_stop_state(|group| {
                     let current = if counted {
                         group.ptrace_group_stop_in_progress(group_generation)
                     } else {
@@ -280,17 +280,16 @@ impl ProcessControlBlock {
         // 4. Fatal check + commit TRACED state.
         let mut completed_group_stop = None;
         let generation = {
-            let sighand = self.sighand();
-            sighand.with_group_stop_state(|group| {
+            let signal_state = self.process_signal();
+            signal_state.with_group_stop_state(|group| {
+                let pending = self.process_signal();
+                let pending_guard = pending.lock_irqsave();
                 let siginfo_g = self.sig_info_irqsave();
                 let fatal = siginfo_g
                     .sig_pending()
                     .signal()
                     .contains(Signal::SIGKILL.into())
-                    || group
-                        .shared_pending
-                        .signal()
-                        .contains(Signal::SIGKILL.into());
+                    || pending_guard.signal().contains(Signal::SIGKILL.into());
                 if fatal {
                     if expected_group_stop.is_some() {
                         group.cancel_group_stop();

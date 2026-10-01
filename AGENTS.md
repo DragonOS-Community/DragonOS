@@ -25,6 +25,7 @@ harness/                               ← 深层 Harness 文档
 ├── references/                        ← 可复用参考资料
 │   └── index.md                       ← 参考资料索引
 └── generated/                         ← 生成型文档预留目录
+tests/benchmark/lmbench/harness/        ← LMbench 专属 Harness 文档
 ```
 
 以上路径均相对仓库根目录，按任务读取对应权威文档。

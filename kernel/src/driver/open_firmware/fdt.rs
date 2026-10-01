@@ -307,7 +307,6 @@ impl OpenFirmwareFdtDriver {
         }
 
         let fdt = fdt.unwrap();
-        self.early_reserve_fdt_itself(&fdt);
 
         let reserved_mem_nodes = fdt.memory_reservations();
 
@@ -320,8 +319,12 @@ impl OpenFirmwareFdtDriver {
             }
         }
 
+        // Reserve firmware regions before the FDT itself to avoid EBUSY on overlap.
+        // Otherwise firmware memory may reach the allocator and cause PMP faults.
         self.fdt_scan_reserved_mem(&fdt)
             .expect("Failed to scan reserved memory");
+
+        self.early_reserve_fdt_itself(&fdt);
     }
 
     /// 保留fdt自身的内存空间

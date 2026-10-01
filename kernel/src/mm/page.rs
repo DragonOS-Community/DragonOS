@@ -1806,7 +1806,10 @@ impl<Arch: MemoryManagementArch> PageEntry<Arch> {
 
     #[inline(always)]
     pub fn write(&self) -> bool {
-        return self.data & Arch::ENTRY_FLAG_READWRITE != 0;
+        // `ENTRY_FLAG_READWRITE` is not a single "writable" bit on every
+        // architecture (riscv64 encodes R and W as separate bits), so defer to
+        // `has_write`, which knows the per-arch encoding.
+        return self.flags().has_write();
     }
 }
 

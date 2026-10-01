@@ -62,7 +62,7 @@ impl ArchBootParams {
     }
 }
 
-static mut BOOT_HARTID: u32 = 0;
+pub(super) static mut BOOT_HARTID: u32 = 0;
 static mut BOOT_FDT_PADDR: PhysAddr = PhysAddr::new(0);
 
 #[no_mangle]
@@ -73,6 +73,7 @@ unsafe extern "C" fn kernel_main(hartid: usize, fdt_paddr: usize) -> ! {
         BOOT_HARTID = hartid as u32;
         BOOT_FDT_PADDR = fdt_paddr;
     }
+    unsafe { super::cpu::init_boot_local_context(ProcessorId::new(BOOT_HARTID)) };
     setup_trap_vector();
     start_kernel();
 }

@@ -1701,6 +1701,18 @@ impl File {
         }
     }
 
+    /// Read a transfer's already validated local position without committing
+    /// f_pos or emitting a per-chunk notification. The syscall owns capability
+    /// checks and commits only the bytes accepted by its output.
+    pub(crate) fn read_at_for_transfer(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &mut [u8],
+    ) -> Result<usize, SystemError> {
+        self.do_read_with_fsnotify(offset, len, buf, false, false)
+    }
+
     /// ## 从buf向文件中指定的偏移处写入指定的字节数的数据
     ///
     /// ### 参数
@@ -2634,6 +2646,14 @@ impl File {
     #[inline]
     pub fn pos(&self) -> usize {
         self.offset.load(Ordering::SeqCst)
+    }
+
+    /// Commit a syscall-owned transfer cursor. Stream objects have no file
+    /// position; this does not promise serialization against other I/O.
+    pub(crate) fn commit_transfer_position(&self, position: usize) {
+        if !self.mode().contains(FileMode::FMODE_STREAM) {
+            self.offset.store(position, Ordering::SeqCst);
+        }
     }
 
     /// 推进当前文件偏移。

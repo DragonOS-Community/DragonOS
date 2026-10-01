@@ -1,10 +1,12 @@
 use crate::filesystem::epoll::EPollEventType;
+use core::sync::atomic::{AtomicU8, Ordering};
 
 /// Shutdown bit for socket operations.
 ///
 /// Mirrors Linux `struct sock::sk_shutdown`: the bits are sticky (a later
-/// `shutdown(2)` only adds to them) and both the connected and the listening
-/// form of an AF_UNIX socket derive their poll state from them.
+/// `shutdown(2)` only adds to them) and every form of an AF_UNIX socket (not
+/// connected yet, connected, listening) derives its poll state from them.
+#[derive(Clone, Copy)]
 pub struct ShutdownBit {
     bit: u8,
 }
@@ -30,7 +32,7 @@ impl ShutdownBit {
 
     /// The raw internal bit mask.
     #[inline]
-    pub fn bits(&self) -> u8 {
+    pub const fn bits(&self) -> u8 {
         self.bit
     }
 
@@ -120,5 +122,43 @@ impl TryFrom<usize> for ShutdownBit {
             }),
             _ => Err(Self::Error::EINVAL),
         }
+    }
+}
+
+/// Sticky `sk_shutdown` latch of one socket.
+///
+/// Mirrors Linux `struct sock::sk_shutdown`: [`Self::latch()`] only ever adds
+/// bits (`unix_shutdown()` ors `mode` in) and readers see the accumulated mask.
+/// Every form an AF_UNIX socket can take holds one of these, so the latching
+/// rule and its memory ordering are written down once instead of once per form.
+#[derive(Debug)]
+pub struct ShutdownState {
+    bits: AtomicU8,
+}
+
+impl ShutdownState {
+    pub const fn new(bits: ShutdownBit) -> Self {
+        Self {
+            bits: AtomicU8::new(bits.bits()),
+        }
+    }
+
+    /// The bits latched so far.
+    pub fn bits(&self) -> ShutdownBit {
+        ShutdownBit::from_bits_truncate(self.bits.load(Ordering::Acquire) as usize)
+    }
+
+    /// Latch `how`; the mask only accumulates, so repeating a direction is a
+    /// no-op rather than an error.
+    pub fn latch(&self, how: ShutdownBit) {
+        self.bits.fetch_or(how.bits(), Ordering::AcqRel);
+    }
+
+    /// Take the bits out when the socket changes form.
+    ///
+    /// Exclusive ownership makes the load ordering-free, exactly like
+    /// `AtomicU8::into_inner()`.
+    pub fn into_bits(self) -> ShutdownBit {
+        ShutdownBit::from_bits_truncate(self.bits.into_inner() as usize)
     }
 }

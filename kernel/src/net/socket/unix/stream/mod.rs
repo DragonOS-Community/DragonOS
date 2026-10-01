@@ -638,6 +638,21 @@ impl UnixStreamSocket {
             total_written_len,
         ))
     }
+
+    /// Wake everything waiting on this descriptor after `shutdown(2)` changed
+    /// its state, whether that call landed on this socket or on its peer.
+    ///
+    /// Mirrors the `sk_state_change()` calls of `unix_shutdown()` — one on the
+    /// socket itself and, when it has a peer, the mirrored one on `other`. Both
+    /// end up in `sock_def_wakeup()`, which wakes *every* `sk_sleep` waiter.
+    /// The caller must have released the inner lock first: a waiter re-reads
+    /// `inner`, and a pending writer would otherwise keep this reader blocked
+    /// (`rwsem.rs`).
+    fn wake_shutdown_waiters(&self) {
+        self.wait_queue
+            .wakeup_all(Some(crate::process::ProcessState::Blocked(true)));
+        let _ = EventPoll::wakeup_epoll(self.epoll_items().as_ref(), self.check_io_event());
+    }
 }
 
 impl Socket for UnixStreamSocket {
@@ -1736,73 +1751,76 @@ impl Socket for UnixStreamSocket {
     fn shutdown(&self, how: common::ShutdownBit) -> Result<(), SystemError> {
         let inner_guard = self.inner.read();
         let Some(inner) = inner_guard.as_ref() else {
+            // Unreachable for fd-backed callers: they hold the file description
+            // for the whole syscall, so a concurrent `close()` cannot take the
+            // inner state away. `EINVAL` is the defensive answer every
+            // stale-handle path here gives; it is not a Linux-defined outcome.
             return Err(SystemError::EINVAL);
         };
 
-        if let Inner::Listener(listener) = inner {
-            // Linux `unix_shutdown()` (`net/unix/af_unix.c`) does not
-            // look at the connection state: it latches `sk_shutdown` and wakes
-            // the socket's own `sk_sleep`. That is precisely what makes
-            // `shutdown(listener, SHUT_RD)` the legal release for a blocked
-            // `accept()`; `close()` deliberately does not (see `do_close()` and
-            // `unix_release_sock()`), matching Linux.
-            listener.set_shutdown(how);
-            drop(inner_guard);
+        match inner {
+            Inner::Listener(listener) => {
+                // Linux `unix_shutdown()` (`net/unix/af_unix.c`) does not
+                // look at the connection state: it latches `sk_shutdown` and wakes
+                // the socket's own `sk_sleep`. That is precisely what makes
+                // `shutdown(listener, SHUT_RD)` the legal release for a blocked
+                // `accept()`; `close()` deliberately does not (see `do_close()` and
+                // `unix_release_sock()`), matching Linux.
+                listener.set_shutdown(how);
+                drop(inner_guard);
 
-            // Wake local accept/poll waiters with the inner lock released: a
-            // waiter re-reads `inner`, and a pending writer would otherwise keep
-            // this reader blocked (`rwsem.rs`).
-            self.wait_queue
-                .wakeup_all(Some(crate::process::ProcessState::Blocked(true)));
-            let _ = EventPoll::wakeup_epoll(self.epoll_items().as_ref(), self.check_io_event());
-            return Ok(());
-        }
+                self.wake_shutdown_waiters();
+                Ok(())
+            }
+            Inner::Init(init) => {
+                // Same rule as for a listener: `unix_shutdown()` latches
+                // `sk_shutdown` and returns 0 for a socket that is not connected
+                // yet, so a descriptor that never reached `connect(2)`/
+                // `listen(2)` must answer `0` too.
+                //
+                // The latch is not decoration: `listen()` and `into_connected()`
+                // hand the bits over to the form the socket turns into, so a
+                // `SHUT_RD` latched here still refuses connectors with
+                // `ECONNREFUSED`, still fails `accept(2)` with `EINVAL`, and a
+                // latched direction still becomes EOF/EPIPE on the connection
+                // that is established later.
+                init.set_shutdown_bits(how);
+                drop(inner_guard);
 
-        let Inner::Connected(connected) = inner else {
-            // Known deviation, kept deliberately: Linux returns 0 for any socket,
-            // but unconnected sockets retain DragonOS's historical ENOTCONN. Only
-            // the listener path is needed for the blocked-accept contract, and
-            // widening it would touch unrelated behaviour (see the PR notes).
-            return Err(SystemError::ENOTCONN);
-        };
+                self.wake_shutdown_waiters();
+                Ok(())
+            }
+            Inner::Connected(connected) => {
+                // For a connected unix socket, shutdown updates per-direction state:
+                // - SHUT_RD: mark incoming direction as recv-shutdown (peer writes -> EPIPE)
+                // - SHUT_WR: mark outgoing direction as send-shutdown (our writes -> EPIPE, peer reads -> EOF when drained)
+                connected.apply_shutdown(how);
 
-        // For a connected unix socket, shutdown updates per-direction state:
-        // - SHUT_RD: mark incoming direction as recv-shutdown (peer writes -> EPIPE)
-        // - SHUT_WR: mark outgoing direction as send-shutdown (our writes -> EPIPE, peer reads -> EOF when drained)
-        if how.is_recv_shutdown() {
-            connected.shutdown_recv();
-        }
-        if how.is_send_shutdown() {
-            connected.shutdown_send();
-        }
+                // Do not retain our inner lock while waking the peer. The peer can be
+                // shutting down the opposite endpoint concurrently and epoll wakeup
+                // may query its socket state.
+                drop(inner_guard);
 
-        // Do not retain our inner lock while waking the peer. The peer can be
-        // shutting down the opposite endpoint concurrently and epoll wakeup
-        // may query its socket state.
-        drop(inner_guard);
+                // Local waiters may also need to observe a newly disabled direction.
+                self.wake_shutdown_waiters();
 
-        // Local waiters may also need to observe a newly disabled direction.
-        self.wait_queue
-            .wakeup(Some(crate::process::ProcessState::Blocked(true)));
-        let _ = EventPoll::wakeup_epoll(self.epoll_items().as_ref(), self.check_io_event());
+                // The shutdown bits live in the rings shared with the peer, but a
+                // blocked peer sleeps on its own socket wait queue. Waking only this
+                // endpoint leaves a peer read/write asleep after the condition has
+                // become final (notably SOCK_SEQPACKET read after SHUT_WR).
+                let peer = self.peer.lock().as_ref().and_then(Weak::upgrade);
+                if let Some(peer) = peer {
+                    peer.wake_shutdown_waiters();
+                    if how.is_both_shutdown() {
+                        peer.fasync_items.send_sigio(FASYNC_POLL_HUP);
+                    } else if how.is_send_shutdown() {
+                        peer.fasync_items.send_sigio(FASYNC_POLL_IN);
+                    }
+                }
 
-        // The shutdown bits live in the rings shared with the peer, but a
-        // blocked peer sleeps on its own socket wait queue. Waking only this
-        // endpoint leaves a peer read/write asleep after the condition has
-        // become final (notably SOCK_SEQPACKET read after SHUT_WR).
-        let peer = self.peer.lock().as_ref().and_then(Weak::upgrade);
-        if let Some(peer) = peer {
-            peer.wait_queue
-                .wakeup(Some(crate::process::ProcessState::Blocked(true)));
-            let _ = EventPoll::wakeup_epoll(peer.epoll_items().as_ref(), peer.check_io_event());
-            if how.is_both_shutdown() {
-                peer.fasync_items.send_sigio(FASYNC_POLL_HUP);
-            } else if how.is_send_shutdown() {
-                peer.fasync_items.send_sigio(FASYNC_POLL_IN);
+                Ok(())
             }
         }
-
-        Ok(())
     }
 
     fn check_io_event(&self) -> crate::filesystem::epoll::EPollEventType {

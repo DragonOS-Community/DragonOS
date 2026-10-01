@@ -31,7 +31,7 @@ use smoltcp::{
     phy::PacketMeta,
     wire::{
         ipv6::AddressExt, EthernetAddress, HardwareAddress, Icmpv6Message, IpAddress, IpProtocol,
-        IpVersion, Ipv4Packet, Ipv6ExtHeader, Ipv6Packet,
+        IpVersion, Ipv4Address, Ipv4Packet, Ipv6ExtHeader, Ipv6Packet,
     },
 };
 use system_error::SystemError;
@@ -853,6 +853,26 @@ fn is_ipv6_ndisc(packet: &Ipv6Packet<&[u8]>) -> bool {
 }
 
 impl IpIngressFilter for NetIngressFilter<'_> {
+    fn arp_reply_allowed(&self, source: Ipv4Address, target: Ipv4Address) -> Option<bool> {
+        // Linux's default Ethernet ARP policy does not expose loopback or
+        // multicast targets. IP AnyIP admission is not proxy-ARP permission.
+        let sender_allowed =
+            source.is_unspecified() || (!source.is_loopback() && source.octets()[0] != 0);
+        let allowed = sender_allowed
+            && !target.is_unspecified()
+            && !target.is_loopback()
+            && !target.is_multicast()
+            && target != Ipv4Address::BROADCAST
+            && self.fib_routes.is_some_and(|routes| {
+                routes
+                    .lookup_ingress(target.into(), self.owner_ifindex)
+                    .is_some_and(|route| route.matched.kind == RTN_LOCAL)
+            });
+        // Never fall back to smoltcp's AnyIP ARP replies when this integration
+        // cannot establish ownership from its pre-acquired namespace view.
+        Some(allowed)
+    }
+
     fn continue_ingress_poll(&self) -> bool {
         let current = self.ruleset.generation == self.netns.nftables().generation();
         if current {

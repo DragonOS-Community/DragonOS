@@ -1,0 +1,45 @@
+## bubblewrap 功能测试白名单
+
+## 基本启动/帮助
+bwrap_help_test
+bwrap_error_prefix_test
+
+## 命令行参数
+bwrap_args_fd_test
+# bwrap_argv0_test # busybox sh 不支持
+bwrap_double_dash_test
+
+## 挂载/文件系统
+# bwrap_bind_tmp_test          # cat: can't open '/tmp/bwrap-test-XXgjPHni': No such file or directory (估计是 MountList ino2mp 冲突)
+bwrap_bogus_tmpfs_test
+bwrap_devices_test
+bwrap_mount_permissions_test
+bwrap_mount_visibility_test
+# bwrap_symlink_bind_test      # bwrap: Can't bind mount /oldroot/ on /newroot/: Unable to find "//" in mount table
+bwrap_symlink_test
+# bwrap_tmpfs_permissions_test # cat: can't open '/proc/self/mountinfo': No such file or directory
+bwrap_tmpfs_size_test
+bwrap_overlay_test
+bwrap_fuse_test
+bwrap_socket_bind_test
+## 目录/文件权限
+# bwrap_dir_permissions_test   # File 'new-dir-permissions' doesn't match regexp '^1741$'
+bwrap_dir_parent_permissions_test
+bwrap_file_permissions_test
+bwrap_perms_size_once_test
+
+## 进程管理
+bwrap_as_pid_1_test
+# bwrap_die_with_parent_test   # bwrap: Can't bind mount /oldroot/ on /newroot/: Unable to find "//" in mount table
+
+## 命名空间
+# bwrap_userns_test            # bwrap: cannot open /proc/sys/user/max_user_namespaces: No such file or directory
+# bwrap_basic_loop_test        # loopback: Failed RTM_NEWADDR: No child process
+# bwrap_recursive_ns_test      # loopback: Failed RTM_NEWADDR: No child process
+
+## 环境变量/工作目录
+# bwrap_env_test               # bwrap: execvp /usr/bin/env: No such file or directory
+bwrap_chdir_test
+
+## 需要外部依赖/已知限制
+# bwrap_caps_test              # 缺少 capsh

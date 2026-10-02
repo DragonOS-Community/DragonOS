@@ -56,6 +56,9 @@ use ida::IdAllocator;
 use lazy_static::lazy_static;
 use system_error::SystemError;
 
+mod selftest;
+pub(crate) use selftest::run_mount_wrapper_cache_debug_selftest;
+
 /// Serializes mount pin admission against multi-mount busy preflight and
 /// detach, including propagation peers in other namespaces.
 ///
@@ -1718,6 +1721,21 @@ pub struct MountFSInode {
     mount_fs: Arc<MountFS>,
     /// Weak reference to self
     self_ref: Weak<MountFSInode>,
+}
+
+impl Drop for MountFSInode {
+    fn drop(&mut self) {
+        let mut cache = self.mount_fs.wrapper_cache.lock();
+        // Another lookup can replace this dead weak entry before its final
+        // strong owner's destructor obtains the lock. Remove only our own
+        // projection, never the concurrently created replacement.
+        if cache
+            .get(&self.dentry.id)
+            .is_some_and(|entry| Weak::ptr_eq(entry, &self.self_ref))
+        {
+            cache.remove(&self.dentry.id);
+        }
+    }
 }
 
 impl MountFS {

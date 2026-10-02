@@ -3,6 +3,7 @@
 ARCH ?= x86_64
 dropbear_version := 2025.88
 dropbear_tarball := dropbear-$(dropbear_version).tar.bz2
+dropbear_sha256 := 783f50ea27b17c16da89578fafdb6decfa44bb8f6590e5698a4e4d3672dc53d4
 dropbear_tarball_path := $(dropbear_tarball)
 build_dir := build/$(ARCH)
 dropbear_dir := $(build_dir)/dropbear-$(dropbear_version)
@@ -13,8 +14,10 @@ cc := $(prefix)cc
 strip := $(prefix)strip
 
 # 下载源码
+.DELETE_ON_ERROR:
 $(dropbear_tarball_path):
-	wget https://mirrors.dragonos.org.cn/pub/third_party/dropbear/$(dropbear_tarball)
+	wget -O "$@" https://matt.ucc.asn.au/dropbear/releases/$(dropbear_tarball)
+	printf '%s  %s\n' '$(dropbear_sha256)' "$@" | sha256sum -c -
 # 解压源码包
 $(dropbear_dir): $(dropbear_tarball_path)
 	mkdir -p $(build_dir)

@@ -1,0 +1,11 @@
+# Extraction/metadata for unix_lat
+CATEGORY=ipc
+BINARY=lat_unix
+METRIC_TYPE=latency
+UNIT=microseconds
+BIGGER_IS_BETTER=0
+# lat_unix prints "AF_UNIX sock stream latency: <N> microseconds".
+SEARCH_PATTERN=AF_UNIX
+RESULT_INDEX=NF-1
+NTH_OCCURRENCE=1
+DESCRIPTION=AF_UNIX stream socket latency via lat_unix

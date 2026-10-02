@@ -1,0 +1,11 @@
+# Extraction/metadata for pipe_bw (KEY=VALUE; parsed by run.sh)
+CATEGORY=ipc
+BINARY=bw_pipe
+METRIC_TYPE=bandwidth
+UNIT=MB/s
+BIGGER_IS_BETTER=1
+# bw_pipe prints "Pipe bandwidth: <N> MB/sec"; value is the field before MB/sec.
+SEARCH_PATTERN=Pipe bandwidth
+RESULT_INDEX=NF-1
+NTH_OCCURRENCE=1
+DESCRIPTION=Pipe bandwidth via bw_pipe

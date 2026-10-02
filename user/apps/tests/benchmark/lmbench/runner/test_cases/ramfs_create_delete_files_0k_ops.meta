@@ -1,0 +1,11 @@
+# Extraction/metadata for ramfs_create_delete_files_0k_ops (KEY=VALUE; parsed by run.sh)
+CATEGORY=filesystem
+BINARY=lat_fs
+METRIC_TYPE=ops
+UNIT=ops/sec
+BIGGER_IS_BETTER=1
+# lat_fs prints a per-size row "<size>\t<N1>\t<N2>\t<N3>"; take column 3.
+SEARCH_PATTERN=^0k
+RESULT_INDEX=3
+NTH_OCCURRENCE=1
+DESCRIPTION=ramfs create+delete file ops/sec for 0k-byte files via lat_fs

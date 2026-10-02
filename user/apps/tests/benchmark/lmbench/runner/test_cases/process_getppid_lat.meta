@@ -1,0 +1,13 @@
+# Extraction/metadata for process_getppid_lat (KEY=VALUE; parsed by run.sh)
+# Note: the .sh invokes `lat_syscall null` (null syscall), not getppid directly.
+CATEGORY=process
+BINARY=lat_syscall
+METRIC_TYPE=latency
+UNIT=microseconds
+BIGGER_IS_BETTER=0
+# lat_syscall null prints "Simple syscall: <N> microseconds" (confirmed in 24.04
+# container; null mode timed out on host with archive-glibc LD hack).
+SEARCH_PATTERN=Simple syscall
+RESULT_INDEX=NF-1
+NTH_OCCURRENCE=1
+DESCRIPTION=Null syscall latency via lat_syscall null (named getppid_lat)

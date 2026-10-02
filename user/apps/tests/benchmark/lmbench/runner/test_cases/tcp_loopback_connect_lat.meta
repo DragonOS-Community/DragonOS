@@ -1,0 +1,11 @@
+# Extraction/metadata for tcp_loopback_connect_lat (KEY=VALUE; parsed by run.sh)
+CATEGORY=network
+BINARY=lat_connect
+METRIC_TYPE=latency
+UNIT=microseconds
+BIGGER_IS_BETTER=0
+# lat_connect prints "TCP/IP connection cost to <host>: <N> microseconds".
+SEARCH_PATTERN=TCP/IP connection cost
+RESULT_INDEX=NF-1
+NTH_OCCURRENCE=1
+DESCRIPTION=TCP loopback connect latency via lat_connect (127.0.0.1)

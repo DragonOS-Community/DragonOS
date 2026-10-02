@@ -1,0 +1,7 @@
+# Runtime artifacts (kept out of git; results are archived as CI artifacts instead)
+/results/
+/install/
+/result
+ext4.img
+*.out
+__pycache__/

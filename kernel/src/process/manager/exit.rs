@@ -691,27 +691,10 @@ impl ProcessManager {
 
     /// Wake waiters that can observe child state changes through `parent`.
     ///
-    /// Linux uses the thread-group shared `signal->wait_chldexit` queue.
-    /// DragonOS currently has one `wait_queue` per task, while `do_wait()`
-    /// sleeps on the caller's thread-group leader. Any path that publishes a
-    /// wait-visible transition through a parent relation must therefore wake
-    /// both the concrete parent task and its thread-group leader.
+    /// Match Linux's shared signal->wait_chldexit. A single thread's exit or
+    /// an exec leader exchange must not retire another member's child wait.
     pub(crate) fn wake_wait_parent(parent: &Arc<ProcessControlBlock>) {
-        parent
-            .wait_queue
-            .wakeup_all(Some(ProcessState::Blocked(true)));
-
-        let parent_group_leader = {
-            let ti = parent.thread.read_irqsave();
-            ti.group_leader()
-        };
-        if let Some(leader) = parent_group_leader {
-            if !Arc::ptr_eq(&leader, parent) {
-                leader
-                    .wait_queue
-                    .wakeup_all(Some(ProcessState::Blocked(true)));
-            }
-        }
+        parent.process_signal().child_wait_queue().wake_all();
     }
 
     /// Release the current task's user futex registrations on exit or exec.

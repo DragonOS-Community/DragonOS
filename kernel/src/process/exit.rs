@@ -10,7 +10,7 @@ use crate::{
     ipc::{process_signal::ReapTransition, signal_types::SignalFlags},
     process::{
         cred::Kuid, namespace::user_namespace::from_kuid_munged, pid::PidType, ptrace,
-        wait::WaitSelector, ProcessState,
+        wait::WaitSelector,
     },
     syscall::user_access::UserBufferWriter,
 };
@@ -95,18 +95,7 @@ fn complete_ptrace_claim_after_ack(child_pcb: &Arc<ProcessControlBlock>) {
         }
     }
 
-    real_parent
-        .wait_queue
-        .wakeup_all(Some(ProcessState::Blocked(true)));
-    // The thread group leader's wait_queue must also be woken (symmetric with __WNOTHREAD semantics).
-    let parent_leader = real_parent.thread.read_irqsave().group_leader();
-    if let Some(leader) = parent_leader {
-        if !Arc::ptr_eq(&leader, &real_parent) {
-            leader
-                .wait_queue
-                .wakeup_all(Some(ProcessState::Blocked(true)));
-        }
-    }
+    ProcessManager::wake_wait_parent(&real_parent);
 }
 
 /// mt-exec: forbid early reaping while de_thread is waiting for the old leader to complete the PID/TID swap
@@ -804,13 +793,11 @@ fn scan_result_or_wait(scan: ScanDecision) -> Result<Option<usize>, SystemError>
 
 /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/kernel/exit.c#1573
 fn do_wait(kwo: &mut KernelWaitOption, uninterruptible_pid: bool) -> Result<usize, SystemError> {
-    // todo: 在signal struct里面增加等待队列，并在这里初始化子进程退出的回调，使得子进程退出时，能唤醒当前进程。
-
     kwo.no_task_error = Some(SystemError::ECHILD);
     let retval = match kwo.selector.clone() {
         WaitSelector::Pid(pid) => {
             let current = ProcessManager::current_pcb();
-            let wait_queue_owner = get_thread_group_leader(&current);
+            let wait_queue_owner = current.process_signal();
             let check_child = |kwo: &mut KernelWaitOption| -> Result<Option<usize>, SystemError> {
                 let natural_child = pid.thread_group_leader_task();
                 let ptrace_child = pid.pid_task(PidType::PID);
@@ -860,11 +847,11 @@ fn do_wait(kwo: &mut KernelWaitOption, uninterruptible_pid: bool) -> Result<usiz
                 };
                 let wait_res = if uninterruptible_pid {
                     wait_queue_owner
-                        .wait_queue
+                        .child_wait_queue()
                         .wait_event_uninterruptible(&mut child_ready, None::<fn()>)
                 } else {
                     wait_queue_owner
-                        .wait_queue
+                        .child_wait_queue()
                         .wait_event_interruptible(&mut child_ready, None::<fn()>)
                 };
 
@@ -887,7 +874,7 @@ fn do_wait(kwo: &mut KernelWaitOption, uninterruptible_pid: bool) -> Result<usiz
         }
         WaitSelector::Any => {
             let current = ProcessManager::current_pcb();
-            let wait_queue_owner = get_thread_group_leader(&current);
+            let wait_queue_owner = current.process_signal();
             loop {
                 if kwo.options.contains(WaitOption::WNOHANG) {
                     let candidates = wait_candidate_children(kwo.options);
@@ -897,24 +884,26 @@ fn do_wait(kwo: &mut KernelWaitOption, uninterruptible_pid: bool) -> Result<usiz
 
                 let mut ready: Option<Result<Option<usize>, SystemError>> = None;
 
-                let wait_res = wait_queue_owner.wait_queue.wait_event_interruptible(
-                    || {
-                        let candidates = wait_candidate_children(kwo.options);
-                        let scan = scan_wait_candidates(kwo, &candidates, |_| true);
-                        match scan_result_or_wait(scan) {
-                            Ok(Some(pid)) => {
-                                ready = Some(Ok(Some(pid)));
-                                true
+                let wait_res = wait_queue_owner
+                    .child_wait_queue()
+                    .wait_event_interruptible(
+                        || {
+                            let candidates = wait_candidate_children(kwo.options);
+                            let scan = scan_wait_candidates(kwo, &candidates, |_| true);
+                            match scan_result_or_wait(scan) {
+                                Ok(Some(pid)) => {
+                                    ready = Some(Ok(Some(pid)));
+                                    true
+                                }
+                                Ok(None) => false,
+                                Err(err) => {
+                                    ready = Some(Err(err));
+                                    true
+                                }
                             }
-                            Ok(None) => false,
-                            Err(err) => {
-                                ready = Some(Err(err));
-                                true
-                            }
-                        }
-                    },
-                    None::<fn()>,
-                );
+                        },
+                        None::<fn()>,
+                    );
 
                 match wait_res {
                     Ok(()) => {
@@ -932,7 +921,7 @@ fn do_wait(kwo: &mut KernelWaitOption, uninterruptible_pid: bool) -> Result<usiz
         }
         WaitSelector::Pgid(Some(pgid)) => {
             let current = ProcessManager::current_pcb();
-            let wait_queue_owner = get_thread_group_leader(&current);
+            let wait_queue_owner = current.process_signal();
             loop {
                 if kwo.options.contains(WaitOption::WNOHANG) {
                     let candidates = wait_candidate_children(kwo.options);
@@ -947,30 +936,32 @@ fn do_wait(kwo: &mut KernelWaitOption, uninterruptible_pid: bool) -> Result<usiz
                 }
 
                 let mut ready: Option<Result<Option<usize>, SystemError>> = None;
-                let wait_res = wait_queue_owner.wait_queue.wait_event_interruptible(
-                    || {
-                        let candidates = wait_candidate_children(kwo.options);
-                        let scan = scan_wait_candidates(kwo, &candidates, |pcb| {
-                            let child_pgrp = pcb.task_pgrp();
-                            match &child_pgrp {
-                                Some(cp) => Arc::ptr_eq(cp, &pgid),
-                                None => false,
+                let wait_res = wait_queue_owner
+                    .child_wait_queue()
+                    .wait_event_interruptible(
+                        || {
+                            let candidates = wait_candidate_children(kwo.options);
+                            let scan = scan_wait_candidates(kwo, &candidates, |pcb| {
+                                let child_pgrp = pcb.task_pgrp();
+                                match &child_pgrp {
+                                    Some(cp) => Arc::ptr_eq(cp, &pgid),
+                                    None => false,
+                                }
+                            });
+                            match scan_result_or_wait(scan) {
+                                Ok(Some(pid)) => {
+                                    ready = Some(Ok(Some(pid)));
+                                    true
+                                }
+                                Ok(None) => false,
+                                Err(err) => {
+                                    ready = Some(Err(err));
+                                    true
+                                }
                             }
-                        });
-                        match scan_result_or_wait(scan) {
-                            Ok(Some(pid)) => {
-                                ready = Some(Ok(Some(pid)));
-                                true
-                            }
-                            Ok(None) => false,
-                            Err(err) => {
-                                ready = Some(Err(err));
-                                true
-                            }
-                        }
-                    },
-                    None::<fn()>,
-                );
+                        },
+                        None::<fn()>,
+                    );
 
                 match wait_res {
                     Ok(()) => {

@@ -256,7 +256,7 @@ pub struct ProcessControlBlock {
     /// The header preserves the existing inner locks and field order.
     pub(super) ptrace: ptrace::PtraceTask,
 
-    /// Wait queue.
+    /// Task-local ptrace trapping queue. Child waits belong to ProcessSignalState.
     pub(super) wait_queue: WaitQueue,
 
     /// CPU-time wait queue: used for clock_nanosleep with
@@ -2128,10 +2128,13 @@ impl ProcessControlBlock {
             .any(|task| task.is_live_thread_group_member())
     }
 
-    /// Wake all waiters sleeping on this process's `wait_queue`.
+    /// Wake task-level observers and thread-group child-state observers.
+    /// Job-control and ptrace publishers use this compatibility entry point;
+    /// the trapping queue remains task-owned, unlike wait(2)'s group queue.
     pub fn wake_all_waiters(&self) {
         self.wait_queue
-            .wakeup_all(Some(ProcessState::Blocked(true)))
+            .wakeup_all(Some(ProcessState::Blocked(true)));
+        self.process_signal().child_wait_queue().wake_all();
     }
 }
 

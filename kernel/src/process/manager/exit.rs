@@ -25,11 +25,9 @@ use crate::{
     },
     mm::{ucontext::AddressSpace, IDLE_PROCESS_ADDRESS_SPACE},
     process::{
-        exit::wstatus_to_waitid_exit_info,
-        kthread::KernelThreadMechanism,
-        namespace::user_namespace::from_kuid_munged,
-        pid::{Pid, PidType},
-        ptrace, ProcessControlBlock, ProcessFlags, ProcessManager, ProcessState, RawPid,
+        exit::wstatus_to_waitid_exit_info, kthread::KernelThreadMechanism,
+        namespace::user_namespace::from_kuid_munged, pid::PidType, ptrace, ProcessControlBlock,
+        ProcessFlags, ProcessManager, ProcessState, RawPid,
     },
     sched::{cputime::ns_to_clock_t, SchedMode, __schedule_with_current},
     smp::core::smp_get_processor_id,
@@ -382,8 +380,8 @@ impl ProcessManager {
         #[cfg(target_arch = "x86_64")]
         crate::exception::uprobe::cleanup_task_active_xol(&current_pcb);
 
-        let pid: Arc<Pid>;
         let raw_pid = current_pcb.raw_pid();
+        let _final_irq_guard;
         // log::debug!("[exit: {}]", raw_pid.data());
         {
             let pcb = current_pcb.clone();
@@ -408,7 +406,7 @@ impl ProcessManager {
             // are still available. The perf fd retains its final count.
             #[cfg(target_arch = "x86_64")]
             crate::mm::ucontext::uprobe::uprobe_registry_task_exit(&pcb);
-            pid = pcb.pid();
+            let pid = pcb.pid();
             if pid.is_child_reaper() {
                 pid.ns_of_pid().disable_pid_allocation();
             }
@@ -513,7 +511,7 @@ impl ProcessManager {
             // the Exited state and perform the single deactivate_task, avoiding
             // a double dequeue that would underflow nr_running.
 
-            let _final_irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+            _final_irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
             // Set the scheduling state to Exited before calling exit_notify at the
             // very end.
             // Mirrors Linux do_task_dead()'s set_special_state(TASK_DEAD):
@@ -524,13 +522,15 @@ impl ProcessManager {
                 pcb.sched_info.set_state(ProcessState::Exited(exit_code));
             }
             ProcessManager::exit_notify(&pcb);
+        }
 
-            __schedule_with_current(SchedMode::SM_NONE, current_pcb);
-            error!("raw_pid {raw_pid:?} exited but sched again!");
-            #[allow(clippy::empty_loop)]
-            loop {
-                spin_loop();
-            }
+        // The terminal switch never returns to run this stack's destructors.
+        // Retain only the running-task owner, released by the new stack's tail.
+        __schedule_with_current(SchedMode::SM_NONE, current_pcb);
+        error!("raw_pid {raw_pid:?} exited but sched again!");
+        #[allow(clippy::empty_loop)]
+        loop {
+            spin_loop();
         }
     }
 

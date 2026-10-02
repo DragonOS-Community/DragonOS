@@ -23,9 +23,30 @@ use alloc::{ffi::CString, string::String, sync::Arc, vec::Vec};
 use core::sync::atomic::Ordering;
 use system_error::SystemError;
 
-struct ExecFailure {
+pub(crate) struct ExecFailure {
     error: SystemError,
     post_point_of_no_return: bool,
+}
+
+impl ExecFailure {
+    pub(crate) fn error(&self) -> SystemError {
+        self.error.clone()
+    }
+
+    /// May terminate the task. Call only after the caller's resource owners
+    /// have been dropped: the terminal switch does not unwind their stack.
+    pub(crate) fn finish(self) -> SystemError {
+        if self.post_point_of_no_return {
+            let fatal_pending = {
+                let current = ProcessManager::current_pcb();
+                Signal::fatal_signal_pending(&current)
+            };
+            if !fatal_pending {
+                ProcessManager::exit(Signal::SIGSEGV as usize);
+            }
+        }
+        self.error
+    }
 }
 
 impl From<SystemError> for ExecFailure {
@@ -46,27 +67,27 @@ impl From<SystemError> for ExecFailure {
 /// - `regs`: 陷入帧
 ///
 /// ## 返回值
-/// 成功时不返回（跳转到新程序），失败时返回错误
-pub fn do_execve(
+/// 成功时准备好新的用户帧，失败时由调用者释放资源后处理 ExecFailure。
+pub(crate) fn do_execve(
     path: &str,
     argv: Vec<CString>,
     envp: Vec<CString>,
     regs: &mut TrapFrame,
-) -> Result<(), SystemError> {
+) -> Result<(), ExecFailure> {
     let file = do_open_execat(AtFlags::AT_FDCWD.bits(), path)?;
     let start = ExecStartInfo::new(file, path.into(), path.into(), ExecInterpFlags::empty());
 
     do_execve_with_info(start, argv, envp, regs)
 }
 
-pub fn do_execveat(
+pub(crate) fn do_execveat(
     dirfd: i32,
     path: &str,
     argv: Vec<CString>,
     envp: Vec<CString>,
     flags: AtFlags,
     regs: &mut TrapFrame,
-) -> Result<(), SystemError> {
+) -> Result<(), ExecFailure> {
     let file = do_open_execat_with_flags(dirfd, path, flags)?;
     let start = ExecStartInfo::new(
         file,
@@ -78,28 +99,13 @@ pub fn do_execveat(
     do_execve_with_info(start, argv, envp, regs)
 }
 
-pub fn do_execve_with_info(
+pub(crate) fn do_execve_with_info(
     start: ExecStartInfo,
     argv: Vec<CString>,
     envp: Vec<CString>,
     regs: &mut TrapFrame,
-) -> Result<(), SystemError> {
-    match do_execve_internal(start, argv, envp, regs, ExecContext::new()) {
-        Ok(()) => Ok(()),
-        Err(failure) => {
-            if failure.post_point_of_no_return {
-                // The recursive loader stack has returned, so its ExecParam,
-                // File, address-space and argv/envp owners are gone before any
-                // divergent exit. Recheck here rather than caching the signal
-                // state before unwind, so a concurrent SIGKILL keeps priority.
-                let current = ProcessManager::current_pcb();
-                if !Signal::fatal_signal_pending(&current) {
-                    ProcessManager::exit(Signal::SIGSEGV as usize);
-                }
-            }
-            Err(failure.error)
-        }
-    }
+) -> Result<(), ExecFailure> {
+    do_execve_internal(start, argv, envp, regs, ExecContext::new())
 }
 
 pub fn exec_visible_name(dirfd: i32, path: &str) -> String {

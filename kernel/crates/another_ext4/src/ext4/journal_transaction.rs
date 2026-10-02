@@ -681,7 +681,15 @@ impl Transaction<'_> {
         let TransactionCoreRef::Journal(core) = self.core else {
             unreachable!()
         };
-        let images = self.staged.values().collect::<Vec<_>>();
+        let mut images = Vec::new();
+        images
+            .try_reserve_exact(self.staged.len())
+            .map_err(|_| CommitError {
+                error: Ext4Error::new(ErrCode::ENOMEM),
+                failure: CommitFailure::BeforeCommit,
+                poisoned: false,
+            })?;
+        images.extend(self.staged.values());
         let result = core.commit_images(device, &images, || {
             publisher.publish_home_current(&self.staged, &self.retired)
         });
@@ -806,7 +814,11 @@ impl JournalTransactionCore {
                 *context.superblock_image,
             )
         };
-        let sb_image = Box::new(sb_image);
+        let sb_image = Box::try_new(sb_image).map_err(|_| CommitError {
+            error: Ext4Error::new(ErrCode::ENOMEM),
+            failure: CommitFailure::BeforeCommit,
+            poisoned: false,
+        })?;
         let needed =
             required_log_blocks(images.len(), sb.features).map_err(|error| CommitError {
                 error,
@@ -844,9 +856,9 @@ impl JournalTransactionCore {
                 false,
             );
         }
-        // Finish every fallible format operation before the first write.  Once
-        // the active tail reaches disk, all remaining failures are I/O failures
-        // which must poison the mount.
+        // Prepare journal-owned buffers and finish format validation before
+        // the first write. Once the active tail reaches disk, every device
+        // error (including a resource failure in its backend) poisons the mount.
         let encoded = encode_log_images(&sb, sequence, images).map_err(|error| CommitError {
             error,
             failure: CommitFailure::BeforeCommit,
@@ -857,7 +869,11 @@ impl JournalTransactionCore {
             failure: CommitFailure::BeforeCommit,
             poisoned: false,
         })?;
-        let mut active_sb_image = sb_image.clone();
+        let mut active_sb_image = Box::try_new(*sb_image).map_err(|_| CommitError {
+            error: Ext4Error::new(ErrCode::ENOMEM),
+            failure: CommitFailure::BeforeCommit,
+            poisoned: false,
+        })?;
         update_superblock(&mut active_sb_image, sequence, head, &sb).map_err(|error| {
             CommitError {
                 error,
@@ -895,9 +911,37 @@ impl JournalTransactionCore {
                 poisoned: false,
             })?;
 
+        // Preserve bytes outside the 1024-byte superblock once, before the
+        // first write. Neither active nor clean tail updates may allocate a
+        // block by calling read_block after the journal becomes active.
+        let mut active_sb_block = Box::try_new([0; BLOCK_SIZE]).map_err(|_| CommitError {
+            error: Ext4Error::new(ErrCode::ENOMEM),
+            failure: CommitFailure::BeforeCommit,
+            poisoned: false,
+        })?;
+        device
+            .read_blocks(mapping[0], &mut active_sb_block[..])
+            .map_err(|error| CommitError {
+                error,
+                failure: CommitFailure::BeforeCommit,
+                poisoned: false,
+            })?;
+        let mut clean_sb_block = Box::try_new(*active_sb_block).map_err(|_| CommitError {
+            error: Ext4Error::new(ErrCode::ENOMEM),
+            failure: CommitFailure::BeforeCommit,
+            poisoned: false,
+        })?;
+        active_sb_block[..1024].copy_from_slice(&active_sb_image[..]);
+        clean_sb_block[..1024].copy_from_slice(&clean_sb_image[..]);
+        let active_sb_block = Block::new(mapping[0], active_sb_block);
+        let clean_sb_block = Block::new(mapping[0], clean_sb_block);
+        let commit_logical = *positions.last().unwrap();
+        let commit_block = Block::new(mapping[commit_logical as usize], commit);
+
         // Publish an active tail before log payload.  Recovery may safely scan
         // an empty/uncommitted transaction after a crash at this point.
-        if let Err(error) = write_journal_superblock(device, &mapping, &active_sb_image)
+        if let Err(error) = device
+            .write_block(&active_sb_block)
             .and_then(|_| device.flush())
         {
             return core.commit_error(error, CommitFailure::BeforeCommit, true);
@@ -917,12 +961,7 @@ impl JournalTransactionCore {
             let blocks = positions[segment_start..segment_end]
                 .iter()
                 .zip(encoded[segment_start..segment_end].iter())
-                .map(|(logical, bytes)| {
-                    (
-                        mapping[*logical as usize],
-                        bytes.as_ref() as &[u8; BLOCK_SIZE],
-                    )
-                });
+                .map(|(logical, bytes)| (mapping[*logical as usize], bytes.bytes()));
             if let Err(error) =
                 write_contiguous_blocks(device, blocks, &mut write_scratch, scratch_blocks)
             {
@@ -934,8 +973,7 @@ impl JournalTransactionCore {
             return core.commit_error(error, CommitFailure::BeforeCommit, true);
         }
 
-        let commit_logical = *positions.last().unwrap();
-        if let Err(error) = write_bytes(device, mapping[commit_logical as usize], &commit) {
+        if let Err(error) = device.write_block(&commit_block) {
             return core.commit_error(error, CommitFailure::CommitUncertain, true);
         }
         if let Err(error) = device.flush() {
@@ -956,8 +994,9 @@ impl JournalTransactionCore {
         }
         publish();
 
-        if let Err(error) =
-            write_journal_superblock(device, &mapping, &clean_sb_image).and_then(|_| device.flush())
+        if let Err(error) = device
+            .write_block(&clean_sb_block)
+            .and_then(|_| device.flush())
         {
             return core.commit_error(error, CommitFailure::TailUpdateFailed, true);
         }
@@ -1041,7 +1080,10 @@ fn ring_positions(sb: &Superblock, head: u32, count: usize) -> Result<Vec<u32>> 
     if count > ring_len(sb)? || head < sb.first || head >= sb.max_len {
         return Err(Ext4Error::new(ErrCode::E2BIG));
     }
-    let mut result = Vec::with_capacity(count);
+    let mut result = Vec::new();
+    result
+        .try_reserve_exact(count)
+        .map_err(|_| Ext4Error::new(ErrCode::ENOMEM))?;
     let mut current = head;
     for _ in 0..count {
         result.push(current);
@@ -1050,42 +1092,59 @@ fn ring_positions(sb: &Superblock, head: u32, count: usize) -> Result<Vec<u32>> 
     Ok(result)
 }
 
-fn encode_log(
-    sb: &Superblock,
-    sequence: u32,
-    staged: &BTreeMap<PBlockId, StagedBlock>,
-) -> Result<Vec<Box<[u8; BLOCK_SIZE]>>> {
-    let all = staged.values().collect::<Vec<_>>();
-    encode_log_images(sb, sequence, &all)
+/// Only control records and escaped payloads need a private copy. Frozen
+/// ordinary payloads stay immutable and are borrowed until checkpoint ends.
+enum EncodedBlock<'a> {
+    Borrowed(&'a [u8; BLOCK_SIZE]),
+    Owned(Box<[u8; BLOCK_SIZE]>),
 }
 
-fn encode_log_images(
+impl EncodedBlock<'_> {
+    fn bytes(&self) -> &[u8; BLOCK_SIZE] {
+        match self {
+            Self::Borrowed(bytes) => bytes,
+            Self::Owned(bytes) => bytes,
+        }
+    }
+}
+
+fn encode_log_images<'a>(
     sb: &Superblock,
     sequence: u32,
-    all: &[&StagedBlock],
-) -> Result<Vec<Box<[u8; BLOCK_SIZE]>>> {
+    all: &[&'a StagedBlock],
+) -> Result<Vec<EncodedBlock<'a>>> {
     let seed = checksum_seed(&sb.uuid);
     let per_descriptor = tags_per_descriptor(sb.features)?;
     let mut output = Vec::new();
+    output
+        .try_reserve_exact(required_log_blocks(all.len(), sb.features)? - 1)
+        .map_err(|_| Ext4Error::new(ErrCode::ENOMEM))?;
     for group in all.chunks(per_descriptor) {
-        let mut descriptor = Box::new([0; BLOCK_SIZE]);
+        let mut descriptor =
+            Box::try_new([0; BLOCK_SIZE]).map_err(|_| Ext4Error::new(ErrCode::ENOMEM))?;
         Header {
             block_type: BlockType::Descriptor,
             sequence,
         }
         .encode_into(&mut descriptor[..])?;
-        let mut journal_data = Vec::with_capacity(group.len());
+        let mut journal_data = Vec::new();
+        journal_data
+            .try_reserve_exact(group.len())
+            .map_err(|_| Ext4Error::new(ErrCode::ENOMEM))?;
         let mut offset = HEADER_BYTES;
         for (index, staged) in group.iter().enumerate() {
-            let mut image = staged.image.clone();
+            let mut image = EncodedBlock::Borrowed(staged.bytes());
             let mut flags = if index != 0 { FLAG_SAME_UUID } else { 0 };
             if u32::from_be_bytes(
-                image[..4]
+                image.bytes()[..4]
                     .try_into()
                     .map_err(|_| Ext4Error::new(ErrCode::EIO))?,
             ) == MAGIC
             {
-                image[..4].fill(0);
+                let mut escaped =
+                    Box::try_new(*staged.bytes()).map_err(|_| Ext4Error::new(ErrCode::ENOMEM))?;
+                escaped[..4].fill(0);
+                image = EncodedBlock::Owned(escaped);
                 flags |= FLAG_ESCAPE;
             }
             if index + 1 == group.len() {
@@ -1100,8 +1159,9 @@ fn encode_log_images(
                     descriptor[offset + 4..offset + 8].copy_from_slice(&flags.to_be_bytes());
                     descriptor[offset + 8..offset + 12]
                         .copy_from_slice(&((staged.home >> 32) as u32).to_be_bytes());
-                    descriptor[offset + 12..offset + 16]
-                        .copy_from_slice(&tag_checksum(seed, sequence, &image[..]).to_be_bytes());
+                    descriptor[offset + 12..offset + 16].copy_from_slice(
+                        &tag_checksum(seed, sequence, &image.bytes()[..]).to_be_bytes(),
+                    );
                 }
                 ChecksumMode::None => {
                     if staged.home > u32::MAX as u64 {
@@ -1122,14 +1182,14 @@ fn encode_log_images(
             let checksum = block_checksum(seed, &descriptor[..])?;
             descriptor[BLOCK_SIZE - 4..].copy_from_slice(&checksum.to_be_bytes());
         }
-        output.push(descriptor);
+        output.push(EncodedBlock::Owned(descriptor));
         output.extend(journal_data);
     }
     Ok(output)
 }
 
 fn encode_commit(sb: &Superblock, sequence: u32) -> Result<Box<[u8; BLOCK_SIZE]>> {
-    let mut block = Box::new([0; BLOCK_SIZE]);
+    let mut block = Box::try_new([0; BLOCK_SIZE]).map_err(|_| Ext4Error::new(ErrCode::ENOMEM))?;
     Header {
         block_type: BlockType::Commit,
         sequence,
@@ -1158,18 +1218,9 @@ fn update_superblock(
     Ok(())
 }
 
-fn write_journal_superblock(
-    device: &dyn BlockDevice,
-    mapping: &[PBlockId],
-    image: &[u8; 1024],
-) -> Result<()> {
-    let mut block = device.read_block(mapping[0])?;
-    block.data[..1024].copy_from_slice(image);
-    device.write_block(&block)
-}
-
 fn write_bytes(device: &dyn BlockDevice, id: PBlockId, bytes: &[u8; BLOCK_SIZE]) -> Result<()> {
-    device.write_block(&Block::new(id, Box::new(*bytes)))
+    let image = Box::try_new(*bytes).map_err(|_| Ext4Error::new(ErrCode::ENOMEM))?;
+    device.write_block(&Block::new(id, image))
 }
 
 fn write_contiguous_blocks<'a>(
@@ -1922,6 +1973,247 @@ mod tests {
         }
     }
 
+    /// A device spy with no heap allocation, including after the first write.
+    /// Real allocation injection must not measure the MemoryDevice's maps.
+    struct AllocationDevice {
+        writes: AtomicUsize,
+        flushes: AtomicUsize,
+        reject_after_write: bool,
+        fail_read: bool,
+        corrupt_superblock_tail: AtomicBool,
+    }
+
+    impl AllocationDevice {
+        fn new(reject_after_write: bool) -> Self {
+            Self {
+                writes: AtomicUsize::new(0),
+                flushes: AtomicUsize::new(0),
+                reject_after_write,
+                fail_read: false,
+                corrupt_superblock_tail: AtomicBool::new(false),
+            }
+        }
+    }
+
+    impl BlockDevice for AllocationDevice {
+        fn read_block(&self, id: PBlockId) -> Result<Block> {
+            let data =
+                Box::try_new([0; BLOCK_SIZE]).map_err(|_| Ext4Error::new(ErrCode::ENOMEM))?;
+            Ok(Block::new(id, data))
+        }
+
+        fn read_blocks(&self, _start: PBlockId, data: &mut [u8]) -> Result<()> {
+            if self.fail_read {
+                return Err(Ext4Error::new(ErrCode::EIO));
+            }
+            data.fill(0xa5);
+            Ok(())
+        }
+
+        fn write_block(&self, block: &Block) -> Result<()> {
+            self.write_blocks(block.id, &block.data[..])
+        }
+
+        fn write_blocks(&self, start: PBlockId, data: &[u8]) -> Result<()> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            if start == 100 && data[1024..].iter().any(|byte| *byte != 0xa5) {
+                self.corrupt_superblock_tail.store(true, Ordering::SeqCst);
+            }
+            if self.reject_after_write {
+                crate::test_allocator::reject_following_allocations();
+            }
+            Ok(())
+        }
+
+        fn flush(&self) -> Result<()> {
+            self.flushes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn supports_reliable_flush(&self) -> bool {
+            true
+        }
+    }
+
+    fn allocation_test_transaction(core: &JournalTransactionCore) -> Transaction<'_> {
+        let mut transaction = core.start(2).unwrap();
+        transaction.stage(2, Box::new([7; BLOCK_SIZE])).unwrap();
+        let mut escaped = Box::new([3; BLOCK_SIZE]);
+        escaped[..4].copy_from_slice(&MAGIC.to_be_bytes());
+        transaction.stage(5, escaped).unwrap();
+        transaction
+    }
+
+    #[test]
+    fn journal_every_preparation_allocation_failure_is_recoverable() {
+        let publisher = Publisher(AtomicUsize::new(0));
+        let device = AllocationDevice::new(false);
+        let core = JournalTransactionCore::new(context()).unwrap();
+        let transaction = allocation_test_transaction(&core);
+        let scope = crate::test_allocator::FailureScope::new(usize::MAX);
+        let result = transaction.commit(&device, &publisher);
+        let allocations = scope.attempts();
+        drop(scope);
+        result.unwrap();
+        assert!(allocations > 0);
+
+        for fail_at in 0..allocations {
+            let device = AllocationDevice::new(false);
+            let core = JournalTransactionCore::new(context()).unwrap();
+            let transaction = allocation_test_transaction(&core);
+            let scope = crate::test_allocator::FailureScope::new(fail_at);
+            let result = transaction.commit(&device, &publisher);
+            drop(scope);
+            let error = result.unwrap_err();
+            assert_eq!(error.error.code(), ErrCode::ENOMEM, "allocation {fail_at}");
+            assert_eq!(error.failure, CommitFailure::BeforeCommit);
+            assert!(!error.poisoned);
+            assert!(!core.is_poisoned());
+            assert_eq!(device.writes.load(Ordering::SeqCst), 0);
+            assert_eq!(device.flushes.load(Ordering::SeqCst), 0);
+            allocation_test_transaction(&core)
+                .commit(&device, &publisher)
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn journal_uses_only_prepared_buffers_after_first_write() {
+        let device = AllocationDevice::new(true);
+        let publisher = Publisher(AtomicUsize::new(0));
+        let core = JournalTransactionCore::new(context()).unwrap();
+        let transaction = allocation_test_transaction(&core);
+        let scope = crate::test_allocator::FailureScope::new(usize::MAX);
+        let result = transaction.commit(&device, &publisher);
+        drop(scope);
+        result.unwrap();
+        assert_eq!(device.flushes.load(Ordering::SeqCst), 5);
+        assert!(!device.corrupt_superblock_tail.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn journal_superblock_preparation_read_failure_does_not_poison() {
+        let mut device = AllocationDevice::new(false);
+        device.fail_read = true;
+        let publisher = Publisher(AtomicUsize::new(0));
+        let core = JournalTransactionCore::new(context()).unwrap();
+        let error = allocation_test_transaction(&core)
+            .commit(&device, &publisher)
+            .unwrap_err();
+        assert_eq!(error.error.code(), ErrCode::EIO);
+        assert_eq!(error.failure, CommitFailure::BeforeCommit);
+        assert!(!error.poisoned);
+        assert_eq!(device.writes.load(Ordering::SeqCst), 0);
+        assert_eq!(device.flushes.load(Ordering::SeqCst), 0);
+        device.fail_read = false;
+        allocation_test_transaction(&core)
+            .commit(&device, &publisher)
+            .unwrap();
+    }
+
+    #[test]
+    fn journal_payload_borrows_frozen_images_except_escape() {
+        let core = JournalTransactionCore::new(context()).unwrap();
+        let transaction = allocation_test_transaction(&core);
+        let images = transaction.staged.values().collect::<Vec<_>>();
+        let sb = core.context.lock().superblock;
+        let encoded = encode_log_images(&sb, sb.sequence, &images).unwrap();
+        assert!(matches!(encoded[1], EncodedBlock::Borrowed(_)));
+        assert!(core::ptr::eq(encoded[1].bytes(), images[0].bytes()));
+        assert!(matches!(encoded[2], EncodedBlock::Owned(_)));
+        assert_eq!(&encoded[2].bytes()[..4], &[0; 4]);
+        assert_eq!(&images[1].bytes()[..4], &MAGIC.to_be_bytes());
+    }
+
+    #[test]
+    fn journal_multiple_descriptors_keep_payloads_borrowed_and_escape_private() {
+        let context = context_with_ring(1024, 1);
+        let per_descriptor = tags_per_descriptor(context.superblock.features).unwrap();
+        let mut blocks = Vec::new();
+        for index in 0..per_descriptor + 1 {
+            let mut image = Box::new([index as u8; BLOCK_SIZE]);
+            if index == per_descriptor {
+                image[..4].copy_from_slice(&MAGIC.to_be_bytes());
+            }
+            blocks.push(StagedBlock {
+                home: 2000 + index as PBlockId,
+                original: None,
+                image,
+            });
+        }
+        let references = blocks.iter().collect::<Vec<_>>();
+        let encoded = encode_log_images(&context.superblock, 7, &references).unwrap();
+        assert_eq!(encoded.len(), blocks.len() + 2);
+        assert!(matches!(encoded[0], EncodedBlock::Owned(_)));
+        assert!(matches!(
+            encoded[per_descriptor + 1],
+            EncodedBlock::Owned(_)
+        ));
+        for index in 0..per_descriptor {
+            assert!(matches!(encoded[index + 1], EncodedBlock::Borrowed(_)));
+            assert!(core::ptr::eq(
+                encoded[index + 1].bytes(),
+                blocks[index].bytes()
+            ));
+        }
+        let descriptor = encoded[per_descriptor + 1].bytes();
+        let flags = u32::from_be_bytes(
+            descriptor[HEADER_BYTES + 4..HEADER_BYTES + 8]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(flags, FLAG_ESCAPE | FLAG_LAST_TAG);
+        let escaped = encoded.last().unwrap().bytes();
+        assert_eq!(&escaped[..4], &[0; 4]);
+        assert_eq!(&blocks.last().unwrap().bytes()[..4], &MAGIC.to_be_bytes());
+        let checksum = u32::from_be_bytes(
+            descriptor[HEADER_BYTES + 12..HEADER_BYTES + 16]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(
+            checksum,
+            tag_checksum(checksum_seed(&context.superblock.uuid), 7, escaped)
+        );
+    }
+
+    #[test]
+    fn batch_allocation_failure_preserves_accepted_overlay_and_fails_stop() {
+        let publisher = Publisher(AtomicUsize::new(0));
+        for fail_at in 0..32 {
+            let device = AllocationDevice::new(false);
+            let core = JournalBatchCore::new(context(), 4).unwrap();
+            let mut operation = core.start(1).unwrap();
+            operation.stage(2, Box::new([9; BLOCK_SIZE])).unwrap();
+            operation.retire_blocks(20, 10).unwrap();
+            operation.publish(&publisher).unwrap();
+            core.request_seal();
+            let scope = crate::test_allocator::FailureScope::new(fail_at);
+            let result = core.commit_pending(&device);
+            drop(scope);
+            match result {
+                Err(error) => {
+                    assert_eq!(error.error.code(), ErrCode::ENOMEM);
+                    assert_eq!(error.failure, CommitFailure::BeforeCommit);
+                    assert!(error.poisoned);
+                    assert!(core.progress().failed);
+                    assert_eq!(core.progress().accepted, 1);
+                    assert_eq!(core.progress().durable, 0);
+                    assert_eq!(device.writes.load(Ordering::SeqCst), 0);
+                    assert_eq!(device.flushes.load(Ordering::SeqCst), 0);
+                    assert_eq!(core.read_metadata(&device, 2).unwrap().data[0], 9);
+                    assert!(!core.block_range_reusable(20, 10).unwrap());
+                    assert_eq!(core.start(1).err().unwrap().code(), ErrCode::EROFS);
+                }
+                Ok(_) => {
+                    assert_eq!(core.progress().durable, 1);
+                    return;
+                }
+            }
+        }
+        panic!("allocation failure sweep did not reach a successful commit");
+    }
+
     fn context_with_ring(max_len: u32, head: u32) -> JournalContext {
         let features = Features::validate(
             0,
@@ -2014,14 +2306,16 @@ mod tests {
 
     #[test]
     fn journal_commit_four_homes_has_expected_fixed_io_shape() {
-        assert_counted_commit_shape(4, 6, 12, &[(163, 1), (101, 4), (42, 4)]);
+        // The complete superblock is read once during preparation, not again
+        // after checkpoint while the journal is active.
+        assert_counted_commit_shape(4, 5, 12, &[(163, 1), (101, 4), (42, 4)]);
     }
 
     #[test]
     fn journal_commit_max_fast_metadata_images_has_expected_fixed_io_shape() {
         assert_counted_commit_shape(
             TEST_MAX_FAST_METADATA_IMAGES,
-            18,
+            17,
             36,
             &[(163, 1), (101, 16), (42, 16)],
         );

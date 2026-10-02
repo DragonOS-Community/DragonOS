@@ -1104,6 +1104,7 @@ where
         if should_reclaim_old && old_was_lru {
             page_reclaimer_lock().insert_page(old_paddr, &old_page);
         }
+        crate::mm::page::retire_unmapped_normal_page(&old_page);
         Ok(())
     })();
 

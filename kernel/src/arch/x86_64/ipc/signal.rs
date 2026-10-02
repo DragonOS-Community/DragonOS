@@ -1040,6 +1040,9 @@ impl SignalArch for X86_64SignalArch {
         // PTRACE_EVENT_STOP ptrace_stop.
         while pcb.ptrace_handle_pending_stop() {}
 
+        // A fatal default action does not return to this signal-entry frame.
+        drop(pcb);
+
         let mut got_signal = false;
         do_signal(frame, &mut got_signal);
 

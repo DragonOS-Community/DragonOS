@@ -763,14 +763,15 @@ pub(crate) fn fork_restore_inherited_uprobes_locked(
         }
         let vm_locked = vma.lock().vm_flags().contains(VmFlags::VM_LOCKED);
         new_page.write().insert_vma(vma.clone(), vm_locked);
-        old_page.write().remove_vma(vma.as_ref());
-        InnerAddressSpace::remove_page_unevictable_if_unneeded(&old_page);
         child_mm.flush_tlb_range(
             address,
             VirtAddr::new(page_base + MMArch::PAGE_SIZE),
             MMArch::PAGE_SHIFT as u8,
             false,
         );
+        old_page.write().remove_vma(vma.as_ref());
+        InnerAddressSpace::remove_page_unevictable_if_unneeded(&old_page);
+        crate::mm::page::retire_unmapped_normal_page(&old_page);
     }
     Ok(())
 }

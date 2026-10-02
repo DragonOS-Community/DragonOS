@@ -448,6 +448,10 @@ impl PageFaultHandler {
         page_guard.remove_vma(vma.as_ref());
         drop(page_guard);
         InnerAddressSpace::remove_page_unevictable_if_unneeded(page);
+        // All callers have either replaced the PTE and completed shootdown,
+        // or failed to publish a mapping. A last private COW mapping must also
+        // release PageManager ownership; no future VMA unmap can find this page.
+        super::page::retire_unmapped_normal_page(page);
     }
 
     fn file_page_cache(
@@ -1019,7 +1023,8 @@ impl PageFaultHandler {
             } else {
                 let new_page = {
                     let mut page_manager_guard = page_manager_lock();
-                    match page_manager_guard.copy_page(&old_paddr, mapper.allocator_mut()) {
+                    match page_manager_guard.copy_page_as_normal(&old_paddr, mapper.allocator_mut())
+                    {
                         Ok(page) => page,
                         Err(_) => return VmFaultReason::VM_FAULT_OOM,
                     }

@@ -1,9 +1,13 @@
 //! The Ext4 filesystem implementation in Rust.
 #![no_std]
+#![feature(allocator_api)]
 #![deny(clippy::all)]
 
 #[cfg(test)]
 extern crate std;
+
+#[cfg(test)]
+mod test_allocator;
 
 mod constants;
 mod error;

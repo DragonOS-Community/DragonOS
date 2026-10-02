@@ -116,10 +116,8 @@ impl another_ext4::BlockDevice for GenDisk {
         &self,
         block_id: u64,
     ) -> core::result::Result<another_ext4::Block, another_ext4::Ext4Error> {
-        let mut buf: Box<[u8; 4096]> = vec![0u8; another_ext4::BLOCK_SIZE]
-            .into_boxed_slice()
-            .try_into()
-            .expect("Failed to convert boxed slice to boxed array");
+        let mut buf = Box::try_new([0u8; another_ext4::BLOCK_SIZE])
+            .map_err(|_| another_ext4::Ext4Error::new(another_ext4::ErrCode::ENOMEM))?;
 
         let (_, lba_id_start, block_count) = self.convert_from_ext4_blkid(block_id);
         self.block_device()

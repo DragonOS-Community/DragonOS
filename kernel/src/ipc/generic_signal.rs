@@ -403,18 +403,18 @@ fn sig_terminate(sig: Signal) {
     }
 
     if sig == Signal::SIGKILL {
-        let current = ProcessManager::current_pcb();
-        let signal_state = current.process_signal();
-        if signal_state.flags_contains(SignalFlags::GROUP_EXEC) {
-            if let Some(exec_task) = signal_state.group_exec_task() {
-                if !Arc::ptr_eq(&exec_task, &current) {
-                    // de_thread() privately injects SIGKILL into the siblings
-                    // that the exec owner is replacing. They exit with code 0,
-                    // mirroring Linux do_group_exit() group_exec_task override
-                    // so PTRACE_EVENT_EXIT reports WIFEXITED(0).
-                    ProcessManager::exit(0);
-                }
-            }
+        let exec_sibling = {
+            let current = ProcessManager::current_pcb();
+            let signal_state = current.process_signal();
+            signal_state.flags_contains(SignalFlags::GROUP_EXEC)
+                && signal_state
+                    .group_exec_task()
+                    .is_some_and(|exec_task| !Arc::ptr_eq(&exec_task, &current))
+        };
+        if exec_sibling {
+            // de_thread() privately kills the siblings replaced by the exec
+            // owner. End the lookup owners before the non-returning exit.
+            ProcessManager::exit(0);
         }
     }
     // Not yet in group-exit: per Linux semantics,

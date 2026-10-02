@@ -130,6 +130,78 @@ TEST(MmapTruncateCow, PartialPageTruncateKeepsContainingPageAndInvalidatesFollow
     g_mapping = nullptr;
 }
 
+TEST(MmapTruncateCow, LastPrivateFileCowMappingSurvivesParentUnmap) {
+    // The child inherits an anonymous COW page in a file-backed VMA. After
+    // parent unmap, its write replaces the last mapping of that old page.
+    const size_t ps = PageSize();
+    const size_t length = ps * 256;
+    TempFile file;
+    ASSERT_TRUE(file.valid());
+    ASSERT_EQ(0, ftruncate(file.fd(), length));
+    auto* bytes = static_cast<volatile char*>(
+        mmap(nullptr, length, PROT_READ | PROT_WRITE, MAP_PRIVATE, file.fd(), 0));
+    ASSERT_NE(MAP_FAILED, const_cast<char*>(bytes));
+    for (size_t offset = 0; offset < length; offset += ps) {
+        bytes[offset] = 'a';
+    }
+    int ready[2];
+    ASSERT_EQ(0, pipe(ready));
+    const pid_t child = fork();
+    ASSERT_GE(child, 0);
+    if (child == 0) {
+        close(ready[1]);
+        char token;
+        if (read(ready[0], &token, 1) != 1) _exit(91);
+        close(ready[0]);
+        for (size_t offset = 0; offset < length; offset += ps) {
+            if (bytes[offset] != 'a') _exit(92);
+            bytes[offset] = 'b';
+            if (bytes[offset] != 'b') _exit(93);
+        }
+        if (munmap(const_cast<char*>(bytes), length) != 0) _exit(94);
+        _exit(0);
+    }
+    close(ready[0]);
+    EXPECT_EQ(0, munmap(const_cast<char*>(bytes), length));
+    EXPECT_EQ(1, write(ready[1], "x", 1));
+    close(ready[1]);
+    int status = 0;
+    ASSERT_EQ(child, waitpid(child, &status, 0));
+    ASSERT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(0, WEXITSTATUS(status));
+    char byte = 1;
+    ASSERT_EQ(1, pread(file.fd(), &byte, 1, 0));
+    EXPECT_EQ(0, byte);  // Neither private write may change the backing file.
+}
+
+TEST(MmapTruncateCow, AnonymousChildCowDoesNotInheritParentMlock) {
+    const size_t length = PageSize() * 4;
+    auto* bytes = static_cast<volatile char*>(
+        mmap(nullptr, length, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    ASSERT_NE(MAP_FAILED, const_cast<char*>(bytes));
+    ASSERT_EQ(0, mlock(const_cast<char*>(bytes), length));
+    bytes[0] = 'p';
+    const pid_t child = fork();
+    ASSERT_GE(child, 0);
+    if (child == 0) {
+        // Linux does not inherit VM_LOCKED across fork. This COW page must
+        // acquire the child's policy, not the locked source page's policy.
+        if (bytes[0] != 'p') _exit(95);
+        for (size_t offset = 0; offset < length; offset += PageSize()) {
+            bytes[offset] = 'c';
+        }
+        if (munmap(const_cast<char*>(bytes), length) != 0) _exit(96);
+        _exit(0);
+    }
+    int status = 0;
+    ASSERT_EQ(child, waitpid(child, &status, 0));
+    ASSERT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(0, WEXITSTATUS(status));
+    EXPECT_EQ('p', bytes[0]);
+    EXPECT_EQ(0, munlock(const_cast<char*>(bytes), length));
+    EXPECT_EQ(0, munmap(const_cast<char*>(bytes), length));
+}
+
 int main(int argc, char** argv) {
     ::testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();

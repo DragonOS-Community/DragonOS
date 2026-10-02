@@ -386,6 +386,42 @@ TEST(ExecAbi, PostPonrFailureDoesNotChangeSharedSiblingHandler) {
     EXPECT_EQ(0, unlink_result);
 }
 
+TEST(ExecAbi, PostPonrFailureCannotBeCaughtOrBlocked) {
+    ensure_tmp_dir();
+    char path[128] = {};
+    snprintf(path, sizeof(path), "/tmp/exec_abi_bad_signal_%d", getpid());
+    unsigned char malformed[sizeof(kCheckRdxElf)] = {};
+    memcpy(malformed, kCheckRdxElf, sizeof(malformed));
+    malformed[96] += 1;
+    write_executable(path, malformed, sizeof(malformed));
+
+    for (int mode = 0; mode < 3; ++mode) {
+        pid_t child = fork();
+        ASSERT_GE(child, 0);
+        if (child == 0) {
+            struct sigaction action = {};
+            sigemptyset(&action.sa_mask);
+            action.sa_handler = mode == 1 ? SIG_IGN : shared_sighand_handler;
+            if (sigaction(SIGSEGV, &action, nullptr) != 0) _exit(94);
+            if (mode == 2) {
+                sigset_t blocked;
+                sigemptyset(&blocked);
+                sigaddset(&blocked, SIGSEGV);
+                if (sigprocmask(SIG_BLOCK, &blocked, nullptr) != 0) _exit(95);
+            }
+            char* const argv[] = {path, nullptr};
+            char* const envp[] = {nullptr};
+            execve(path, argv, envp);
+            _exit(96);
+        }
+        int status = 0;
+        ASSERT_EQ(child, waitpid(child, &status, 0));
+        ASSERT_TRUE(WIFSIGNALED(status)) << "mode=" << mode;
+        EXPECT_EQ(SIGSEGV, WTERMSIG(status));
+    }
+    EXPECT_EQ(0, unlink(path));
+}
+
 TEST(ExecAbi, SuccessfulExecDoesNotChangeSharedSiblingHandler) {
     ASSERT_NE('\0', g_self_path[0]) << "self executable path was not initialized";
 

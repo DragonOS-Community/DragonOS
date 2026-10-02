@@ -1064,13 +1064,8 @@ fn run_pr1_selftest() -> Result<(), &'static str> {
     }
 
     rcu_barrier();
-    let (_, completed_gp_before, completed_cb_before, queued_before, ready_before) =
-        debug_snapshot();
-    if queued_before != 0 || ready_before {
-        return Err("rcu callback queues were not empty before blocked-reader selftest");
-    }
-
     let blocked_hits = Arc::new(AtomicUsize::new(0));
+    let companion_hits = Arc::new(AtomicUsize::new(0));
     let blocked_result = {
         let _guard = rcu_read_lock();
         rcu_defer({
@@ -1079,21 +1074,25 @@ fn run_pr1_selftest() -> Result<(), &'static str> {
                 blocked_hits.fetch_add(1, Ordering::SeqCst);
             }
         });
+        // RCU queues are shared with ordinary object retirement. A barrier
+        // waits for its captured prefix; it does not exclude later producers.
+        // Queue an independent callback to exercise this without depending on
+        // background activity, and check only the callbacks owned by this test.
+        rcu_defer({
+            let companion_hits = companion_hits.clone();
+            move || {
+                companion_hits.fetch_add(1, Ordering::SeqCst);
+            }
+        });
 
-        if blocked_hits.load(Ordering::SeqCst) != 0 {
+        if blocked_hits.load(Ordering::SeqCst) != 0 || companion_hits.load(Ordering::SeqCst) != 0 {
             Err("rcu_defer callback ran before leaving the read-side critical section")
         } else {
             note_context_switch(&ProcessManager::current_pcb());
-            let (_, completed_gp_mid, completed_cb_mid, queued_mid, ready_mid) = debug_snapshot();
-
-            if blocked_hits.load(Ordering::SeqCst) != 0 {
+            if blocked_hits.load(Ordering::SeqCst) != 0
+                || companion_hits.load(Ordering::SeqCst) != 0
+            {
                 Err("context switch inside rcu_read_lock executed callback early")
-            } else if completed_gp_mid != completed_gp_before {
-                Err("context switch inside rcu_read_lock incorrectly completed a grace period")
-            } else if completed_cb_mid != completed_cb_before {
-                Err("context switch inside rcu_read_lock incorrectly completed a callback")
-            } else if queued_mid != 1 || ready_mid {
-                Err("context switch inside rcu_read_lock corrupted callback queue state")
             } else {
                 Ok(())
             }
@@ -1104,7 +1103,7 @@ fn run_pr1_selftest() -> Result<(), &'static str> {
     rcu_barrier();
     blocked_result?;
 
-    if blocked_hits.load(Ordering::SeqCst) != 1 {
+    if blocked_hits.load(Ordering::SeqCst) != 1 || companion_hits.load(Ordering::SeqCst) != 1 {
         return Err("callback did not execute after the blocked reader left its critical section");
     }
 

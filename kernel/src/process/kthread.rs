@@ -684,10 +684,20 @@ pub(crate) fn run_debug_selftests() -> Result<String, SystemError> {
     let mut report = String::new();
     let mut failures = 0usize;
 
-    let (destroyed, reaped, remaining_owners) = selftest_task_destruction();
+    let (destroyed, reaped, remaining_owners, entity_destroyed, entity_owners) =
+        selftest_task_destruction();
     append_kthread_selftest_case(&mut report, "task_destruction", destroyed, &mut failures);
     report.push_str(&alloc::format!(
         "task_reaped={reaped} remaining_owners={remaining_owners}\n"
+    ));
+    append_kthread_selftest_case(
+        &mut report,
+        "sched_entity_destruction",
+        entity_destroyed,
+        &mut failures,
+    );
+    report.push_str(&alloc::format!(
+        "sched_entity_remaining_owners={entity_owners}\n"
     ));
 
     append_kthread_selftest_case(
@@ -749,7 +759,7 @@ fn selftest_create_stopped_stop() -> bool {
 
 /// Stopping joins the worker, but does not join the scheduler's switch tail or
 /// kthreadd's reaper. Observe both without retaining a strong task reference.
-fn selftest_task_destruction() -> (bool, bool, usize) {
+fn selftest_task_destruction() -> (bool, bool, usize, bool, usize) {
     let entered = Arc::new(Completion::new());
     let worker_entered = entered.clone();
     let closure = KernelThreadClosure::EmptyClosure((
@@ -762,17 +772,20 @@ fn selftest_task_destruction() -> (bool, bool, usize) {
     let Some(pcb) =
         KernelThreadMechanism::create_and_run(closure, "kthread-selftest-destruction".to_string())
     else {
-        return (false, false, 0);
+        return (false, false, 0, false, 0);
     };
     let pid = pcb.raw_pid();
     let task = Arc::downgrade(&pcb);
+    // A scheduler-owned entity can keep the PCB allocation alive through a
+    // Weak even after the PCB payload has been destroyed. Observe both owners.
+    let entity = Arc::downgrade(&pcb.sched_info().sched_entity());
     let _ = entered.wait_for_completion();
     let stopped = KernelThreadMechanism::stop(&pcb) == Ok(91);
     drop(pcb);
 
     for _ in 0..200 {
-        if task.strong_count() == 0 {
-            return (stopped, true, 0);
+        if task.strong_count() == 0 && entity.strong_count() == 0 {
+            return (stopped, true, 0, true, 0);
         }
         let _ = crate::time::sleep::nanosleep(crate::time::PosixTimeSpec {
             tv_sec: 0,
@@ -780,7 +793,15 @@ fn selftest_task_destruction() -> (bool, bool, usize) {
         });
     }
     let reaped = ProcessManager::find_task_by_vpid(pid).is_none();
-    (false, reaped, task.strong_count())
+    let task_owners = task.strong_count();
+    let entity_owners = entity.strong_count();
+    (
+        stopped && task_owners == 0,
+        reaped,
+        task_owners,
+        entity_owners == 0,
+        entity_owners,
+    )
 }
 
 fn selftest_create_and_run_stop() -> bool {

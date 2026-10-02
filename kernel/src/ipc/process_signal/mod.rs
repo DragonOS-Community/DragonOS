@@ -64,6 +64,9 @@ pub enum ReapTransition {
 pub struct ProcessSignalState {
     inner: RwLock<InnerProcessSignalState>,
     group_exec_wait_queue: WaitQueue,
+    /// Child state changes belong to the thread group, not its current leader.
+    /// Unlike the per-task trapping queue, this survives a leader's exit.
+    child_wait_queue: WaitQueue,
     pending: SpinLock<SigPending>,
 }
 
@@ -121,6 +124,7 @@ impl ProcessSignalState {
         Arc::try_new(Self {
             inner: RwLock::new(inner),
             group_exec_wait_queue: WaitQueue::default(),
+            child_wait_queue: WaitQueue::default(),
             pending: SpinLock::new(SigPending::default()),
         })
         .map_err(|_| SystemError::ENOMEM)
@@ -128,6 +132,10 @@ impl ProcessSignalState {
 
     fn inner(&self) -> RwLockReadGuard<'_, InnerProcessSignalState> {
         self.inner.read_irqsave()
+    }
+
+    pub(crate) fn child_wait_queue(&self) -> &WaitQueue {
+        &self.child_wait_queue
     }
 
     fn inner_mut(&self) -> RwLockWriteGuard<'_, InnerProcessSignalState> {

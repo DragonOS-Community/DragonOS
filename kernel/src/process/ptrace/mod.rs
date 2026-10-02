@@ -497,19 +497,10 @@ impl ProcessControlBlock {
                 PidType::TGID,
             );
         }
-        // Unconditionally wake the ptracer's wait_queue.
+        // Unconditionally notify the tracer's shared child-state queue.
         // gdb/strace do not install a SIGCHLD handler by default and block on waitpid(2); this wakeup is
         // their only reliable path to observe a ptrace-stop (the SIGCHLD above only serves signal-driven tracers).
         tracer.wake_all_waiters();
-        // Also wake the group leader when it differs from the ptracer
-        let leader = tracer
-            .thread
-            .read_irqsave()
-            .group_leader()
-            .unwrap_or_else(|| tracer.clone());
-        if !Arc::ptr_eq(&leader, tracer) {
-            leader.wake_all_waiters();
-        }
     }
 
     /// ptrace event notification (FORK/CLONE/VFORK/EXEC/EXIT/SECCOMP).

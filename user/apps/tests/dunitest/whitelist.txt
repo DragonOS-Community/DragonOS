@@ -165,6 +165,7 @@ normal/procfs_task_semantics
 normal/timeval_abi
 normal/posix_timer_relative
 normal/alarm_zero
+normal/child_wait_lifecycle
 normal/tcp_port_lifetime
 normal/tcp_address_migration
 normal/tcp_connect_completion

@@ -10,7 +10,7 @@ use crate::libs::lazy_init::Lazy;
 use crate::smp::core::smp_get_processor_id;
 use crate::syscall::user_access::check_and_clone_cstr;
 use crate::time::Instant;
-use alloc::{collections::BTreeMap, sync::Arc};
+use alloc::collections::BTreeMap;
 use core::ffi::c_void;
 use system_error::SystemError;
 
@@ -24,20 +24,16 @@ macro_rules! define_func {
 
 /// See https://ebpf-docs.dylanreimerink.nl/linux/helper-function/bpf_map_lookup_elem/
 unsafe fn raw_map_lookup_elem(map: *mut c_void, key: *const c_void) -> *const c_void {
-    let map = Arc::from_raw(map as *const BpfMap);
-    let key_size = map.key_size();
-    let key = core::slice::from_raw_parts(key as *const u8, key_size);
-    let value = map_lookup_elem(&map, key);
-    // log::info!("<raw_map_lookup_elem>: {:x?}", value);
-    // warning: We need to keep the map alive, so we don't drop it here.
-    let _ = Arc::into_raw(map);
-    match value {
+    // The program holds the map alive; the helper only borrows it.
+    let map = unsafe { &*(map as *const BpfMap) };
+    let key = unsafe { core::slice::from_raw_parts(key as *const u8, map.key_size()) };
+    match map_lookup_elem(map, key) {
         Ok(Some(value)) => value as *const c_void,
         _ => core::ptr::null_mut(),
     }
 }
 
-pub fn map_lookup_elem(map: &Arc<BpfMap>, key: &[u8]) -> Result<Option<*const u8>> {
+pub fn map_lookup_elem(map: &BpfMap, key: &[u8]) -> Result<Option<*const u8>> {
     let mut binding = map.inner_map().lock();
     let value = binding.lookup_elem(key);
     match value {
@@ -56,24 +52,15 @@ unsafe fn raw_perf_event_output(
     data: *mut c_void,
     size: u64,
 ) -> i64 {
-    // log::info!("<raw_perf_event_output>: {:x?}", data);
-    let map = Arc::from_raw(map as *const BpfMap);
-    let data = core::slice::from_raw_parts(data as *const u8, size as usize);
-    let res = perf_event_output(ctx, &map, flags, data);
-    // warning: We need to keep the map alive, so we don't drop it here.
-    let _ = Arc::into_raw(map);
-    match res {
+    let map = unsafe { &*(map as *const BpfMap) };
+    let data = unsafe { core::slice::from_raw_parts(data as *const u8, size as usize) };
+    match perf_event_output(ctx, map, flags, data) {
         Ok(_) => 0,
         Err(e) => e as i64,
     }
 }
 
-pub fn perf_event_output(
-    ctx: *mut c_void,
-    map: &Arc<BpfMap>,
-    flags: u64,
-    data: &[u8],
-) -> Result<()> {
+pub fn perf_event_output(ctx: *mut c_void, map: &BpfMap, flags: u64, data: &[u8]) -> Result<()> {
     let mut binding = map.inner_map().lock();
     let index = flags as u32;
     let flags = (flags >> 32) as u32;
@@ -125,21 +112,19 @@ unsafe fn raw_map_update_elem(
     value: *const c_void,
     flags: u64,
 ) -> i64 {
-    let map = Arc::from_raw(map as *const BpfMap);
+    let map = unsafe { &*(map as *const BpfMap) };
     let key_size = map.key_size();
     let value_size = map.value_size();
     // log::info!("<raw_map_update_elem>: flags: {:x?}", flags);
-    let key = core::slice::from_raw_parts(key as *const u8, key_size);
-    let value = core::slice::from_raw_parts(value as *const u8, value_size);
-    let res = map_update_elem(&map, key, value, flags);
-    let _ = Arc::into_raw(map);
-    match res {
+    let key = unsafe { core::slice::from_raw_parts(key as *const u8, key_size) };
+    let value = unsafe { core::slice::from_raw_parts(value as *const u8, value_size) };
+    match map_update_elem(map, key, value, flags) {
         Ok(_) => 0,
         Err(e) => e as _,
     }
 }
 
-pub fn map_update_elem(map: &Arc<BpfMap>, key: &[u8], value: &[u8], flags: u64) -> Result<()> {
+pub fn map_update_elem(map: &BpfMap, key: &[u8], value: &[u8], flags: u64) -> Result<()> {
     let mut binding = map.inner_map().lock();
     let value = binding.update_elem(key, value, flags);
     value
@@ -149,18 +134,15 @@ pub fn map_update_elem(map: &Arc<BpfMap>, key: &[u8], value: &[u8], flags: u64) 
 ///
 /// The delete map element helper call is used to delete values from maps.
 unsafe fn raw_map_delete_elem(map: *mut c_void, key: *const c_void) -> i64 {
-    let map = Arc::from_raw(map as *const BpfMap);
-    let key_size = map.key_size();
-    let key = core::slice::from_raw_parts(key as *const u8, key_size);
-    let res = map_delete_elem(&map, key);
-    let _ = Arc::into_raw(map);
-    match res {
+    let map = unsafe { &*(map as *const BpfMap) };
+    let key = unsafe { core::slice::from_raw_parts(key as *const u8, map.key_size()) };
+    match map_delete_elem(map, key) {
         Ok(_) => 0,
         Err(e) => e as i64,
     }
 }
 
-pub fn map_delete_elem(map: &Arc<BpfMap>, key: &[u8]) -> Result<()> {
+pub fn map_delete_elem(map: &BpfMap, key: &[u8]) -> Result<()> {
     let mut binding = map.inner_map().lock();
     let value = binding.delete_elem(key);
     value
@@ -188,18 +170,16 @@ unsafe fn raw_map_for_each_elem(
     ctx: *const c_void,
     flags: u64,
 ) -> i64 {
-    let map = Arc::from_raw(map as *const BpfMap);
-    let cb = *core::mem::transmute::<*const c_void, *const BpfCallBackFn>(cb);
-    let res = map_for_each_elem(&map, cb, ctx as _, flags);
-    let _ = Arc::into_raw(map);
-    match res {
+    let map = unsafe { &*(map as *const BpfMap) };
+    let cb = unsafe { *core::mem::transmute::<*const c_void, *const BpfCallBackFn>(cb) };
+    match map_for_each_elem(map, cb, ctx as _, flags) {
         Ok(v) => v as i64,
         Err(e) => e as i64,
     }
 }
 
 pub fn map_for_each_elem(
-    map: &Arc<BpfMap>,
+    map: &BpfMap,
     cb: BpfCallBackFn,
     ctx: *const u8,
     flags: u64,
@@ -217,23 +197,15 @@ unsafe fn raw_map_lookup_percpu_elem(
     key: *const c_void,
     cpu: u32,
 ) -> *const c_void {
-    let map = Arc::from_raw(map as *const BpfMap);
-    let key_size = map.key_size();
-    let key = core::slice::from_raw_parts(key as *const u8, key_size);
-    let value = map_lookup_percpu_elem(&map, key, cpu);
-    // warning: We need to keep the map alive, so we don't drop it here.
-    let _ = Arc::into_raw(map);
-    match value {
+    let map = unsafe { &*(map as *const BpfMap) };
+    let key = unsafe { core::slice::from_raw_parts(key as *const u8, map.key_size()) };
+    match map_lookup_percpu_elem(map, key, cpu) {
         Ok(Some(value)) => value as *const c_void,
         _ => core::ptr::null_mut(),
     }
 }
 
-pub fn map_lookup_percpu_elem(
-    map: &Arc<BpfMap>,
-    key: &[u8],
-    cpu: u32,
-) -> Result<Option<*const u8>> {
+pub fn map_lookup_percpu_elem(map: &BpfMap, key: &[u8], cpu: u32) -> Result<Option<*const u8>> {
     let mut binding = map.inner_map().lock();
     let value = binding.lookup_percpu_elem(key, cpu);
     match value {
@@ -245,18 +217,15 @@ pub fn map_lookup_percpu_elem(
 ///
 /// See https://ebpf-docs.dylanreimerink.nl/linux/helper-function/bpf_map_push_elem/
 unsafe fn raw_map_push_elem(map: *mut c_void, value: *const c_void, flags: u64) -> i64 {
-    let map = Arc::from_raw(map as *const BpfMap);
-    let value_size = map.value_size();
-    let value = core::slice::from_raw_parts(value as *const u8, value_size);
-    let res = map_push_elem(&map, value, flags);
-    let _ = Arc::into_raw(map);
-    match res {
+    let map = unsafe { &*(map as *const BpfMap) };
+    let value = unsafe { core::slice::from_raw_parts(value as *const u8, map.value_size()) };
+    match map_push_elem(map, value, flags) {
         Ok(_) => 0,
         Err(e) => e as i64,
     }
 }
 
-pub fn map_push_elem(map: &Arc<BpfMap>, value: &[u8], flags: u64) -> Result<()> {
+pub fn map_push_elem(map: &BpfMap, value: &[u8], flags: u64) -> Result<()> {
     let mut binding = map.inner_map().lock();
     let value = binding.push_elem(value, flags);
     value
@@ -266,18 +235,15 @@ pub fn map_push_elem(map: &Arc<BpfMap>, value: &[u8], flags: u64) -> Result<()> 
 ///
 /// See https://ebpf-docs.dylanreimerink.nl/linux/helper-function/bpf_map_pop_elem/
 unsafe fn raw_map_pop_elem(map: *mut c_void, value: *mut c_void) -> i64 {
-    let map = Arc::from_raw(map as *const BpfMap);
-    let value_size = map.value_size();
-    let value = core::slice::from_raw_parts_mut(value as *mut u8, value_size);
-    let res = map_pop_elem(&map, value);
-    let _ = Arc::into_raw(map);
-    match res {
+    let map = unsafe { &*(map as *const BpfMap) };
+    let value = unsafe { core::slice::from_raw_parts_mut(value as *mut u8, map.value_size()) };
+    match map_pop_elem(map, value) {
         Ok(_) => 0,
         Err(e) => e as i64,
     }
 }
 
-pub fn map_pop_elem(map: &Arc<BpfMap>, value: &mut [u8]) -> Result<()> {
+pub fn map_pop_elem(map: &BpfMap, value: &mut [u8]) -> Result<()> {
     let mut binding = map.inner_map().lock();
     let value = binding.pop_elem(value);
     value
@@ -287,18 +253,15 @@ pub fn map_pop_elem(map: &Arc<BpfMap>, value: &mut [u8]) -> Result<()> {
 ///
 /// See https://ebpf-docs.dylanreimerink.nl/linux/helper-function/bpf_map_peek_elem/
 unsafe fn raw_map_peek_elem(map: *mut c_void, value: *mut c_void) -> i64 {
-    let map = Arc::from_raw(map as *const BpfMap);
-    let value_size = map.value_size();
-    let value = core::slice::from_raw_parts_mut(value as *mut u8, value_size);
-    let res = map_peek_elem(&map, value);
-    let _ = Arc::into_raw(map);
-    match res {
+    let map = unsafe { &*(map as *const BpfMap) };
+    let value = unsafe { core::slice::from_raw_parts_mut(value as *mut u8, map.value_size()) };
+    match map_peek_elem(map, value) {
         Ok(_) => 0,
         Err(e) => e as i64,
     }
 }
 
-pub fn map_peek_elem(map: &Arc<BpfMap>, value: &mut [u8]) -> Result<()> {
+pub fn map_peek_elem(map: &BpfMap, value: &mut [u8]) -> Result<()> {
     let binding = map.inner_map().lock();
     let value = binding.peek_elem(value);
     value

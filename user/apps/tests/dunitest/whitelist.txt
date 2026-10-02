@@ -132,6 +132,7 @@ normal/virtiofs_dax
 normal/af_packet_sockopt
 normal/af_packet_ring
 normal/perf_bpf_mmap
+normal/bpf_prog_load
 normal/af_packet_e2e
 normal/af_packet_mcast
 normal/rtnetlink_link_semantics

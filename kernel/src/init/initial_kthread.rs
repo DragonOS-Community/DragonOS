@@ -257,7 +257,8 @@ fn run_init_process(
         proc_init_info.args.clone(),
         proc_init_info.envs.clone(),
         trap_frame,
-    )?;
+    )
+    .map_err(crate::process::execve::ExecFailure::finish)?;
     // 初始化阶段直接调用 do_execve（绕过 sys_execve），因此这里补齐 cmdline 存储
     ProcessManager::current_pcb().set_cmdline_from_argv(&proc_init_info.args);
     Ok(())

@@ -14,7 +14,7 @@ use crate::{
     exception::{extable::ExceptionTableManager, InterruptArch},
     ipc::{
         signal::force_sig_fault_to_current,
-        signal_types::{SignalArch, BUS_ADRERR, SEGV_ACCERR, SEGV_MAPERR},
+        signal_types::{BUS_ADRERR, SEGV_ACCERR, SEGV_MAPERR},
     },
     mm::{
         fault::{FaultFlags, PageFaultHandler, PageFaultMessage},
@@ -575,11 +575,11 @@ impl X86_64MMArch {
                         match wait.wait() {
                             Ok(()) => {}
                             Err(SystemError::EINTR | SystemError::ERESTARTSYS) => {
-                                if regs.is_from_user() {
-                                    <crate::arch::ipc::signal::X86_64SignalArch as SignalArch>::do_signal_or_restart(regs);
-                                } else {
+                                if !regs.is_from_user() {
                                     handle_kernel_access_failed(regs);
                                 }
+                                // Let irqentry_exit deliver user signals after the
+                                // fault handler's address-space/VMA owners drop.
                                 return;
                             }
                             Err(SystemError::ENOMEM) => {
@@ -658,7 +658,8 @@ impl X86_64MMArch {
                             continue;
                         }
                         OomOutcome::CurrentTaskKilled => {
-                            <crate::arch::ipc::signal::X86_64SignalArch as SignalArch>::do_signal_or_restart(regs);
+                            // Release fault-handler owners before irqentry_exit
+                            // delivers the fatal signal.
                             return;
                         }
                         OomOutcome::NoVictim => {

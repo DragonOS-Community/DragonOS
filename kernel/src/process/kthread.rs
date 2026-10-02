@@ -684,6 +684,12 @@ pub(crate) fn run_debug_selftests() -> Result<String, SystemError> {
     let mut report = String::new();
     let mut failures = 0usize;
 
+    let (destroyed, reaped, remaining_owners) = selftest_task_destruction();
+    append_kthread_selftest_case(&mut report, "task_destruction", destroyed, &mut failures);
+    report.push_str(&alloc::format!(
+        "task_reaped={reaped} remaining_owners={remaining_owners}\n"
+    ));
+
     append_kthread_selftest_case(
         &mut report,
         "create_stopped_stop",
@@ -738,7 +744,43 @@ fn selftest_create_stopped_stop() -> bool {
         && worker_private_ready;
     let stop_ok = KernelThreadMechanism::stop(&pcb).is_ok();
 
-    ready_ok && stop_ok && entered.load(Ordering::Acquire) == 0
+    ready_ok && stop_ok && entered.load(Ordering::Acquire) == 0 && Arc::strong_count(&entered) == 1
+}
+
+/// Stopping joins the worker, but does not join the scheduler's switch tail or
+/// kthreadd's reaper. Observe both without retaining a strong task reference.
+fn selftest_task_destruction() -> (bool, bool, usize) {
+    let entered = Arc::new(Completion::new());
+    let worker_entered = entered.clone();
+    let closure = KernelThreadClosure::EmptyClosure((
+        Box::new(move || {
+            worker_entered.complete();
+            91
+        }),
+        (),
+    ));
+    let Some(pcb) =
+        KernelThreadMechanism::create_and_run(closure, "kthread-selftest-destruction".to_string())
+    else {
+        return (false, false, 0);
+    };
+    let pid = pcb.raw_pid();
+    let task = Arc::downgrade(&pcb);
+    let _ = entered.wait_for_completion();
+    let stopped = KernelThreadMechanism::stop(&pcb) == Ok(91);
+    drop(pcb);
+
+    for _ in 0..200 {
+        if task.strong_count() == 0 {
+            return (stopped, true, 0);
+        }
+        let _ = crate::time::sleep::nanosleep(crate::time::PosixTimeSpec {
+            tv_sec: 0,
+            tv_nsec: 10_000_000,
+        });
+    }
+    let reaped = ProcessManager::find_task_by_vpid(pid).is_none();
+    (false, reaped, task.strong_count())
 }
 
 fn selftest_create_and_run_stop() -> bool {
@@ -870,6 +912,10 @@ pub unsafe extern "C" fn kernel_thread_bootstrap_stage2(ptr: *const KernelThread
             },
             other => other.run(),
         };
+    } else {
+        // A stopped-before-run worker must release its unconsumed captures
+        // before entering the non-returning exit path.
+        drop(closure);
     }
 
     let current = ProcessManager::current_pcb();

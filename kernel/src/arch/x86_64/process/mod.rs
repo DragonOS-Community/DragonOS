@@ -778,6 +778,10 @@ impl ProcessManager {
             // Update per-CPU TlbState: hardware-loaded mm and generation
             crate::mm::tlb::tlb_state_set_loaded_mm(next_mm.clone());
         }
+        // Hardware/per-CPU ownership is established. A terminal switch cannot
+        // leave temporary mm owners awaiting destruction on the abandoned stack.
+        drop(prev_user_vm);
+        drop(prev_active_mm);
         compiler_fence(Ordering::SeqCst);
         // 切换内核栈
 

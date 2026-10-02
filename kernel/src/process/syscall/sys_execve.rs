@@ -6,11 +6,11 @@ use crate::arch::syscall::nr::SYS_EXECVE;
 use crate::filesystem::vfs::{MAX_PATHLEN, VFS_MAX_FOLLOW_SYMLINK_TIMES};
 use crate::mm::page::PAGE_4K_SIZE;
 use crate::mm::{access_ok, VirtAddr};
-use crate::process::execve::do_execve;
+use crate::process::execve::{do_execve, ExecFailure};
 use crate::process::ProcessManager;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
 use crate::syscall::user_access::{check_and_clone_cstr_array, vfs_check_and_clone_cstr};
-use alloc::{ffi::CString, vec::Vec};
+use alloc::{ffi::CString, string::String, vec::Vec};
 use log::error;
 use system_error::SystemError;
 
@@ -88,13 +88,14 @@ impl SysExecve {
     }
 
     pub fn execve(
-        path: &str,
+        path: String,
         argv: Vec<CString>,
         envp: Vec<CString>,
         frame: &mut TrapFrame,
     ) -> Result<(), SystemError> {
-        do_execve(path, argv, envp, frame)?;
-        Ok(())
+        let result = do_execve(&path, argv, envp, frame);
+        drop(path);
+        result.map_err(ExecFailure::finish)
     }
 }
 
@@ -126,7 +127,7 @@ impl Syscall for SysExecve {
             return Err(SystemError::ENOENT);
         }
 
-        Self::execve(&path, argv, envp, frame)?;
+        Self::execve(path, argv, envp, frame)?;
         return Ok(0);
     }
 

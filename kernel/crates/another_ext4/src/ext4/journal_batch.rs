@@ -417,7 +417,8 @@ impl JournalBatchCore {
         home: PBlockId,
     ) -> Result<Block> {
         self.validate_home(home)?;
-        let mut image = Box::new([0; BLOCK_SIZE]);
+        let mut image =
+            Box::try_new([0; BLOCK_SIZE]).map_err(|_| Ext4Error::new(ErrCode::ENOMEM))?;
         loop {
             let generation = {
                 let state = self.state.lock();

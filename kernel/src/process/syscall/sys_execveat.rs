@@ -4,7 +4,10 @@ use system_error::SystemError;
 use crate::{
     arch::{interrupt::TrapFrame, syscall::nr::SYS_EXECVEAT},
     filesystem::vfs::fcntl::AtFlags,
-    process::{execve::do_execveat, syscall::sys_execve::SysExecve},
+    process::{
+        execve::{do_execveat, ExecFailure},
+        syscall::sys_execve::SysExecve,
+    },
     syscall::table::{FormattedSyscallParam, Syscall},
 };
 
@@ -49,7 +52,9 @@ impl Syscall for SysExecveAt {
         }
 
         let at_flags = AtFlags::from_bits(flags.bits() as i32).ok_or(SystemError::EINVAL)?;
-        do_execveat(dirfd as i32, &path, argv, envp, at_flags, frame)?;
+        let result = do_execveat(dirfd as i32, &path, argv, envp, at_flags, frame);
+        drop(path);
+        result.map_err(ExecFailure::finish)?;
 
         Ok(0)
     }

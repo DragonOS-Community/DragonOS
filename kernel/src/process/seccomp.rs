@@ -323,6 +323,7 @@ pub fn secure_computing(
 
         SeccompMode::Dead => {
             // Surviving SECCOMP_RET_KILL_* must be proactively impossible.
+            drop(pcb);
             ProcessManager::exit(Signal::SIGKILL as usize);
         }
 
@@ -331,11 +332,12 @@ pub fn secure_computing(
             if SECCOMP_STRICT_WHITELIST.contains(&(syscall_num as i32)) {
                 Ok(SeccompDecision::Allow)
             } else {
+                drop(pcb);
                 kill_current_strict();
             }
         }
 
-        SeccompMode::Filter => filter_decision(pcb.clone(), syscall_num, args, frame, false),
+        SeccompMode::Filter => filter_decision(pcb, syscall_num, args, frame, false),
     }
 }
 
@@ -370,6 +372,7 @@ fn filter_decision(
 
     match action {
         SECCOMP_RET_KILL_PROCESS | SECCOMP_RET_KILL_THREAD => {
+            drop(pcb);
             kill_current(action);
         }
         SECCOMP_RET_TRAP => {
@@ -441,6 +444,7 @@ fn filter_decision(
 
         _ => {
             // Unknown action, default to KILL
+            drop(pcb);
             kill_current(SECCOMP_RET_KILL_PROCESS);
         }
     }
@@ -512,24 +516,25 @@ fn kill_current(action: u32) -> ! {
     }
 }
 
-fn kill_current_thread() -> ! {
+// Finish the task-state update before transferring to a terminal exit frame.
+fn mark_current_seccomp_dead() {
     let pcb = ProcessManager::current_pcb();
     pcb.seccomp_mode
         .store(SeccompMode::Dead as u8, Ordering::SeqCst);
+}
+
+fn kill_current_thread() -> ! {
+    mark_current_seccomp_dead();
     ProcessManager::exit(Signal::SIGSYS as usize);
 }
 
 fn kill_current_strict() -> ! {
-    let pcb = ProcessManager::current_pcb();
-    pcb.seccomp_mode
-        .store(SeccompMode::Dead as u8, Ordering::SeqCst);
+    mark_current_seccomp_dead();
     ProcessManager::exit(Signal::SIGKILL as usize);
 }
 
 fn kill_current_process() -> ! {
-    let pcb = ProcessManager::current_pcb();
-    pcb.seccomp_mode
-        .store(SeccompMode::Dead as u8, Ordering::SeqCst);
+    mark_current_seccomp_dead();
     ProcessManager::group_exit(Signal::SIGSYS as usize);
 }
 

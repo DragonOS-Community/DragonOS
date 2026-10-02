@@ -105,7 +105,8 @@ pub trait BlockDevice: Send + Sync + Any {
             let block_id = start
                 .checked_add(index as PBlockId)
                 .ok_or_else(|| Ext4Error::new(ErrCode::EFBIG))?;
-            let mut image = Box::new([0; BLOCK_SIZE]);
+            let mut image =
+                Box::try_new([0; BLOCK_SIZE]).map_err(|_| Ext4Error::new(ErrCode::ENOMEM))?;
             image.copy_from_slice(chunk);
             self.write_block(&Block::new(block_id, image))?;
         }
@@ -190,6 +191,22 @@ mod block_device_tests {
 
         fn supports_reliable_flush(&self) -> bool {
             true
+        }
+    }
+
+    #[test]
+    fn default_bulk_write_returns_allocation_failure_with_completed_prefix() {
+        let data = [7; BLOCK_SIZE * 3];
+        for completed in 0..3 {
+            let device = CountingDevice {
+                reads: AtomicUsize::new(0),
+                writes: AtomicUsize::new(0),
+            };
+            let scope = crate::test_allocator::FailureScope::new(completed);
+            let result = device.write_blocks(7, &data);
+            drop(scope);
+            assert_eq!(result.unwrap_err().code(), ErrCode::ENOMEM);
+            assert_eq!(device.writes.load(Ordering::Relaxed), completed);
         }
     }
 

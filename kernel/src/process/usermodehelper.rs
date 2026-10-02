@@ -191,14 +191,18 @@ fn run_child_prepare(
     let mut frame = TrapFrame::new();
     child.flags().remove(ProcessFlags::KTHREAD);
     drop(child);
-    match do_execve(&path, argv, envp, &mut frame) {
+    let result = do_execve(&path, argv, envp, &mut frame);
+    drop(path);
+    match result {
         Ok(()) => Ok(frame),
-        Err(error) => {
+        Err(failure) => {
+            *exec_error.lock() = Some(failure.error());
+            drop(exec_error);
+            let error = failure.finish();
             // The kthread bootstrap still owns the closure's return path.
             ProcessManager::current_pcb()
                 .flags()
                 .insert(ProcessFlags::KTHREAD);
-            *exec_error.lock() = Some(error.clone());
             Err(error)
         }
     }

@@ -1155,12 +1155,8 @@ impl CfsRunQueue {
     fn account_entity_enqueue(&mut self, se: &Arc<FairSchedEntity>) {
         self.load.update_load_add(se.load.weight);
 
-        if se.is_task() {
-            let rq = self.rq();
-            let rq = rq.force_mut_locked();
-            // TODO:numa
-            rq.cfs_tasks.push_back(se.clone());
-        }
+        // FairTimeline owns queued entities. Do not add a second owning task
+        // list here: unlike Linux's SMP/NUMA list, it has no consumer in DragonOS.
         self.nr_running += 1;
         if se.is_idle() {
             self.idle_nr_running += 1;
@@ -1169,14 +1165,6 @@ impl CfsRunQueue {
 
     fn account_entity_dequeue(&mut self, se: &Arc<FairSchedEntity>) {
         self.load.update_load_sub(se.load.weight);
-
-        if se.is_task() {
-            let rq = self.rq();
-            let rq = rq.force_mut_locked();
-
-            // TODO:numa
-            let _ = rq.cfs_tasks.extract_if(|x| Arc::ptr_eq(x, se));
-        }
 
         self.nr_running -= 1;
         debug_assert!(

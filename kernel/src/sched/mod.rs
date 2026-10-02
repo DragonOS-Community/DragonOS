@@ -21,7 +21,6 @@ use core::{
 
 use alloc::{
     boxed::Box,
-    collections::LinkedList,
     sync::{Arc, Weak},
     vec::Vec,
 };
@@ -518,8 +517,6 @@ pub struct CpuRunQueue {
     lost_idle_time: u64,
     clock_idle: u64,
 
-    cfs_tasks: LinkedList<Arc<FairSchedEntity>>,
-
     /// 最近一次的调度信息
     sched_info: SchedInfo,
 
@@ -555,7 +552,6 @@ impl CpuRunQueue {
             clock_pelt: 0,
             lost_idle_time: 0,
             clock_idle: 0,
-            cfs_tasks: LinkedList::new(),
             sched_info: SchedInfo::default(),
             current: Weak::new(),
             idle: Weak::new(),

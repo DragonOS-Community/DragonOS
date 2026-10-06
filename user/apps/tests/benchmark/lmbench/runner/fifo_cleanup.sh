@@ -1,12 +1,12 @@
 #!/bin/sh
-# Linux driver for the unmodified packaged lat_fifo (-P 1).
+# Driver for the unmodified packaged lat_fifo (-P 1).
 # Its writer inherits a SIGTERM handler and loops on EOF during cleanup.
 # Only reap that writer AFTER both FIFO paths are unlinked. The benchmark
 # has already sent its measured samples to its controller at that point.
 # The caller supervises this entire process group (runner/result.sh).
 set -eu
-# Private Linux tmpfs, not persistent raw results: namespace teardown also
-# reclaims this pipe if the supervisor must escalate to SIGKILL.
+# This invocation owns its output pipe. Normal exits remove it below; the
+# Linux entry additionally contains it in a private tmpfs namespace.
 work=$(mktemp -d "${LMBENCH_TMP_DIR:-/tmp}/fifo-cleanup.XXXXXXXX")
 trap 'rm -rf "$work"' 0
 trap 'exit 129' HUP

@@ -316,6 +316,8 @@ run_main() {
 
     . "$SCRIPT_DIR/env.sh"
     export LMBENCH_RUN_TMP="$WORK_TMP"
+    # Keep the packaged lat_fifo unchanged; its writer needs supervised cleanup.
+    export LMBENCH_FIFO_CLEANUP=1
     command -v "$LMBENCH_TIMEOUT" >/dev/null 2>&1 || {
         log "ERROR: timeout command not found: $LMBENCH_TIMEOUT"; return 1;
     }

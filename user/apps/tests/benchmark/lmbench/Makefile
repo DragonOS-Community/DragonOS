@@ -11,7 +11,7 @@ endif
 # Files needed inside the guest at runtime. Sources live under runner/;
 # `install` flattens them into INSTALL_DIR (guest runtime layout is flat).
 RUNNER_DIR    = runner
-GUEST_SCRIPTS = $(RUNNER_DIR)/run.sh $(RUNNER_DIR)/init.sh $(RUNNER_DIR)/env.sh $(RUNNER_DIR)/clean_up.sh $(RUNNER_DIR)/result.sh
+GUEST_SCRIPTS = $(RUNNER_DIR)/run.sh $(RUNNER_DIR)/init.sh $(RUNNER_DIR)/env.sh $(RUNNER_DIR)/clean_up.sh $(RUNNER_DIR)/result.sh $(RUNNER_DIR)/fifo_cleanup.sh
 GUEST_DATA    = whitelist.txt config
 
 .PHONY: all build install clean help

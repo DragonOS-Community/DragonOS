@@ -73,12 +73,14 @@ GNU `timeout` 默认使用 `/usr/bin/timeout`，可用 `LMBENCH_TIMEOUT` 指定�
 所有用例都使用 `LMBENCH_BIN_DIR` 下同一套预编译二进制，运行时不下载源码、打补丁或编译。
 DADK 与 Nix 的包来源保持一致，输入哈希随结果保存。
 
-Linux 入口为原版 `lat_fifo` 启用 `runner/fifo_cleanup.sh`：收到 writer 的 EOF 诊断后，
+套件 `runner/run.sh` 为原版 `lat_fifo` 显式启用 `runner/fifo_cleanup.sh`：收到 writer 的 EOF 诊断后，
 通过 `/proc` 确认它属于本次 benchmark 的子进程，且其两条 FIFO 都已被 unlink，才终止
 无法响应 SIGTERM 的 writer。该阶段测量数据已交回 controller；驱动不介入计时循环，
 由原 controller 正常输出结果并退出。已确认清理后的重复 EOF 诊断会合并计数；其他输出保留。
 仍要求真实退出码为 0 且 latency 有效，超时、测量中失败不会算成功。
-该辅助仅由 Linux 入口启用，依赖 Linux `/proc` 和 `readlink`。
+该辅助依赖 Linux 兼容的 `/proc/<pid>/task/<tid>/children` 及 FD `readlink` 语义；
+Make 与 Nix 安装均携带该脚本。直接调用 wrapper 时可设置 `LMBENCH_FIFO_CLEANUP=0`
+保留无辅助清理的故障对照；套件 runner 始终启用辅助清理。
 
 原版 `lat_fs` 的零大小用例使用默认大小扫描，并由 metadata 只抽取 `0k` 行；
 10k 用例使用 `-s 10k`。四个 wrapper 均设置 `TMPDIR`，确保测量落在指定文件系统。

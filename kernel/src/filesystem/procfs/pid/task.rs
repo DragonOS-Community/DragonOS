@@ -3,8 +3,8 @@
 //! 列出进程的所有线程，每个线程对应一个子目录 /proc/[pid]/task/[tid]
 
 use super::{
-    cgroup::CgroupFileOps, fd::FdDirOps, fdinfo::FdInfoDirOps, mem::MemFileOps,
-    oom_score_adj::OomScoreAdjFileOps, status::StatusFileOps,
+    cgroup::CgroupFileOps, children::ChildrenFileOps, fd::FdDirOps, fdinfo::FdInfoDirOps,
+    mem::MemFileOps, oom_score_adj::OomScoreAdjFileOps, status::StatusFileOps,
 };
 use crate::{
     filesystem::{
@@ -215,6 +215,9 @@ impl TidDirOps {
         // defaulting to one of them.
         ("cgroup", |ops, parent| {
             CgroupFileOps::new_inode(ops.target.clone(), parent)
+        }),
+        ("children", |ops, parent| {
+            ChildrenFileOps::new_inode(ops.target.clone(), parent)
         }),
         ("stat", |ops, parent| {
             StatFileOps::new_inode(ops.target.clone(), super::stat::StatScope::Thread, parent)

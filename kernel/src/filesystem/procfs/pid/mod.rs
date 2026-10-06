@@ -21,6 +21,7 @@ use alloc::sync::{Arc, Weak};
 use system_error::SystemError;
 
 mod cgroup;
+mod children;
 mod cmdline;
 mod exe;
 mod fd;

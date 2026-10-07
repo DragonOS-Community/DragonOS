@@ -15,6 +15,8 @@
 #include <signal.h>
 #include <poll.h>
 #include <sys/socket.h>
+#include <sys/mount.h>
+#include <sys/utsname.h>
 #include <sys/time.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -23,6 +25,7 @@
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
+#include <cstdlib>
 #include <string>
 #include <optional>
 #include <vector>
@@ -431,6 +434,177 @@ TEST(RtnetlinkBridgeVethSemantics, BridgeAutoMtuAndExplicitOverride) {
     ASSERT_EQ(SetLinkMtu(route.fd, bridge_index, 9000, 4527), 0);
     ASSERT_EQ(bridge_mtu(4528), 9000u);
     EXPECT_EQ(SetLinkMtu(route.fd, bridge_index, 65536, 4529), EINVAL);
+}
+
+struct PrivateMtuSysfs {
+    char path[64] = "/tmp/dunit-port-mtu-XXXXXX";
+    bool mounted = false;
+    int attribute = -1;
+    int moved_attribute = -1;
+    int target_netns = -1;
+    int packet_socket = -1;
+    ~PrivateMtuSysfs() {
+        if (attribute >= 0) close(attribute);
+        if (moved_attribute >= 0) close(moved_attribute);
+        if (target_netns >= 0) close(target_netns);
+        if (packet_socket >= 0) close(packet_socket);
+        if (mounted) umount2(path, MNT_DETACH);
+        rmdir(path);
+    }
+};
+
+// Read both related commits from a subscriber opened immediately before the
+// write. Matching index and MTU avoids confusing unrelated lifecycle events.
+bool SawMtuEvents(int fd, uint32_t port, uint32_t bridge, uint32_t mtu) {
+    bool saw_port = false, saw_bridge = false;
+    for (int attempt = 0; attempt < 16; ++attempt) {
+        pollfd ready {fd, POLLIN, 0};
+        if (poll(&ready, 1, 200) <= 0) return false;
+        std::array<uint8_t, 4096> bytes {};
+        const ssize_t count = recv(fd, bytes.data(), bytes.size(), 0);
+        if (count <= 0) return false;
+        int remaining = static_cast<int>(count);
+        for (auto* message = reinterpret_cast<nlmsghdr*>(bytes.data());
+             NLMSG_OK(message, remaining); message = NLMSG_NEXT(message, remaining)) {
+            if (message->nlmsg_type != RTM_NEWLINK ||
+                message->nlmsg_len < NLMSG_LENGTH(sizeof(ifinfomsg))) continue;
+            const auto* body = reinterpret_cast<const ifinfomsg*>(NLMSG_DATA(message));
+            int length = IFLA_PAYLOAD(message);
+            for (auto* attr = IFLA_RTA(body); RTA_OK(attr, length);
+                 attr = RTA_NEXT(attr, length)) {
+                if (attr->rta_type != IFLA_MTU || RTA_PAYLOAD(attr) != sizeof(uint32_t)) continue;
+                uint32_t reported;
+                std::memcpy(&reported, RTA_DATA(attr), sizeof(reported));
+                if (reported != mtu) continue;
+                saw_port |= body->ifi_index == static_cast<int>(port);
+                saw_bridge |= body->ifi_index == static_cast<int>(bridge);
+            }
+        }
+        if (saw_port && saw_bridge) return true;
+    }
+    return false;
+}
+
+void CheckSysfsPortMtuAndDeletedFd(PrivateMtuSysfs& view) {
+    RouteFd route;
+    ASSERT_GE(route.fd, 0);
+    const std::string bridge = UniqueName("sb");
+    const std::string port = UniqueName("sp");
+    CleanupLinks cleanup {route.fd, bridge, port, {}};
+    LinkRequest create_bridge(RTM_NEWLINK, NLM_F_CREATE | NLM_F_EXCL, 4601);
+    ASSERT_TRUE(create_bridge.name(bridge));
+    AddKind(create_bridge, "bridge");
+    ASSERT_EQ(SendAck(route.fd, create_bridge), 0);
+    const auto create_port = [&](uint32_t seq) {
+        LinkRequest request(RTM_NEWLINK, NLM_F_CREATE | NLM_F_EXCL, seq);
+        if (!request.name(port)) return EMSGSIZE;
+        AddKind(request, "veth");
+        return SendAck(route.fd, request);
+    };
+    ASSERT_EQ(create_port(4602), 0);
+    const uint32_t bridge_index = if_nametoindex(bridge.c_str());
+    const uint32_t port_index = if_nametoindex(port.c_str());
+    ASSERT_NE(bridge_index, 0u);
+    ASSERT_NE(port_index, 0u);
+    ASSERT_EQ(SetLinkMaster(route.fd, port_index, bridge_index, 4603), 0);
+    const std::string path = std::string(view.path) + "/class/net/" + port + "/mtu";
+    view.attribute = open(path.c_str(), O_RDWR);
+    ASSERT_GE(view.attribute, 0);
+    RouteFd events(RTMGRP_LINK);
+    ASSERT_GE(events.fd, 0);
+    ASSERT_EQ(write(view.attribute, "1300\n", 5), 5);
+    const auto port_state = QueryLink(route.fd, port, 4604);
+    const auto bridge_state = QueryLink(route.fd, bridge, 4605);
+    ASSERT_TRUE(port_state.has_value());
+    ASSERT_TRUE(bridge_state.has_value());
+    EXPECT_EQ(port_state->mtu, 1300u);
+    EXPECT_EQ(bridge_state->mtu, 1300u);
+    EXPECT_TRUE(SawMtuEvents(events.fd, port_index, bridge_index, 1300));
+    // A real Ethernet bound, rather than a loopback-specific bound.
+    errno = 0;
+    EXPECT_EQ(write(view.attribute, "65536", 5), -1);
+    EXPECT_EQ(errno, EINVAL);
+    const auto unchanged = QueryLink(route.fd, port, 4606);
+    ASSERT_TRUE(unchanged.has_value());
+    EXPECT_EQ(unchanged->mtu, 1300u);
+    // Keep the retired device alive independently of its sysfs registration.
+    // The old attribute must reject I/O even while this socket holds an Arc.
+    view.packet_socket = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
+    ASSERT_GE(view.packet_socket, 0);
+    sockaddr_ll packet_address {};
+    packet_address.sll_family = AF_PACKET;
+    packet_address.sll_protocol = htons(ETH_P_ALL);
+    packet_address.sll_ifindex = static_cast<int>(port_index);
+    ASSERT_EQ(bind(view.packet_socket, reinterpret_cast<sockaddr*>(&packet_address),
+                   sizeof(packet_address)), 0);
+    ASSERT_EQ(DeleteByName(route.fd, port, 4607), 0);
+    ASSERT_EQ(create_port(4608), 0);
+    const auto replacement = QueryLink(route.fd, port, 4609);
+    ASSERT_TRUE(replacement.has_value());
+    char byte;
+    errno = 0;
+    EXPECT_EQ(pread(view.attribute, &byte, 1, 0), -1);
+    EXPECT_EQ(errno, ENODEV);
+    errno = 0;
+    EXPECT_EQ(write(view.attribute, "1400", 4), -1);
+    EXPECT_EQ(errno, ENODEV);
+    errno = 0;
+    EXPECT_EQ(write(view.attribute, "", 0), -1);
+    EXPECT_EQ(errno, ENODEV);
+    const auto after = QueryLink(route.fd, port, 4610);
+    ASSERT_TRUE(after.has_value());
+    EXPECT_EQ(after->mtu, replacement->mtu);
+    // The source route socket retains its original netns. Moving the same
+    // kobject must preserve an open attribute's identity and use its new owner.
+    view.moved_attribute = open(path.c_str(), O_RDWR);
+    ASSERT_GE(view.moved_attribute, 0);
+    ASSERT_EQ(unshare(CLONE_NEWNET), 0);
+    view.target_netns = open("/proc/self/ns/net", O_RDONLY);
+    ASSERT_GE(view.target_netns, 0);
+    LinkRequest move(RTM_SETLINK, 0, 4611);
+    move.body()->ifi_index = replacement->index;
+    ASSERT_TRUE(move.add(IFLA_NET_NS_FD, &view.target_netns, sizeof(view.target_netns)));
+    ASSERT_EQ(SendAck(route.fd, move), 0);
+    RouteFd target;
+    ASSERT_GE(target.fd, 0);
+    ASSERT_EQ(write(view.moved_attribute, "1400", 4), 4);
+    const auto moved = QueryLink(target.fd, port, 4612);
+    ASSERT_TRUE(moved.has_value());
+    EXPECT_EQ(moved->mtu, 1400u);
+    char text[16] = {};
+    const ssize_t length = pread(view.moved_attribute, text, sizeof(text), 0);
+    ASSERT_EQ(length, 5);
+    EXPECT_EQ(std::string(text, length), "1400\n");
+}
+
+TEST(RtnetlinkBridgeVethSemantics, SysfsPortMtuNotifiesBridgeAndTracksDeletedOrMovedDevice) {
+    const pid_t child = fork();
+    ASSERT_GE(child, 0);
+    if (child == 0) {
+        if (unshare(CLONE_NEWUSER | CLONE_NEWNET | CLONE_NEWNS) != 0 ||
+            mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr) != 0) _exit(77);
+        int result = 0;
+        {
+            PrivateMtuSysfs view;
+            if (mkdtemp(view.path) == nullptr) _exit(1);
+            if (mount("sysfs", view.path, "sysfs", MS_NOSUID | MS_NODEV | MS_NOEXEC,
+                      nullptr) != 0) {
+                result = errno == EPERM ? 77 : 1;
+            } else {
+                view.mounted = true;
+                CheckSysfsPortMtuAndDeletedFd(view);
+                result = ::testing::Test::HasFailure() ? 1 : 0;
+            }
+        }
+        _exit(result);
+    }
+    int status = 0;
+    ASSERT_EQ(waitpid(child, &status, 0), child);
+    ASSERT_TRUE(WIFEXITED(status));
+    struct utsname uts {};
+    const bool dragonos = uname(&uts) == 0 && std::strstr(uts.release, "dragonos") != nullptr;
+    if (WEXITSTATUS(status) == 77 && !dragonos) GTEST_SKIP() << "host cannot mount private netns sysfs";
+    EXPECT_EQ(WEXITSTATUS(status), 0);
 }
 
 TEST(RtnetlinkBridgeVethSemantics, BridgeCarrierChangesNotifyLinkSubscribers) {

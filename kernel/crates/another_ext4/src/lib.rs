@@ -18,11 +18,12 @@ mod prelude;
 
 pub use constants::{BLOCK_SIZE, EXT4_ROOT_INO, INODE_BLOCK_SIZE};
 pub use error::{ErrCode, Ext4Error};
+pub use ext4::StartedSizeChange;
 pub use ext4::{
     BatchProgress, DelallocAppendBlockPublication, DelallocAppendBlockReservation,
     DelallocAppendBlockSubmitOutcome, DelallocAppendMapperAuthority, DelallocExtentNodePool,
-    DelallocLease, Ext4, InodeOwner, MetadataMutationWaker, MetadataWriterWait, ReadPlan,
-    ReadSegment, SetAttr,
+    DelallocLease, ExistingBlockImageOutcome, Ext4, InodeOwner, MetadataMutationWaker,
+    MetadataWriterWait, PreallocationProgress, ReadPlan, ReadSegment, SetAttr,
 };
 // The bounded append mapper implementation is compiled in normal builds, but
 // its raw facade remains test-only until the DragonOS VFS can supply the

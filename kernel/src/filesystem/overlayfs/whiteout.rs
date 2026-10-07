@@ -51,7 +51,7 @@ impl OvlInode {
             Some(context) => self.writable_upper_inode_locked_with_context(context)?,
             None => self.writable_upper_inode_locked()?,
         };
-        let upper_entry = upper_dir.find(name)?;
+        let upper_entry = super::lookup::lookup_backing(&upper_dir, name)?;
         let internal_whiteouts = if is_dir {
             Some(Self::validated_whiteout_entries(&upper_entry)?)
         } else {
@@ -103,7 +103,7 @@ impl OvlInode {
             if name == "." || name == ".." {
                 continue;
             }
-            let entry = dir.find(&name)?;
+            let entry = super::lookup::lookup_backing(dir, &name)?;
             if !Self::is_whiteout_inode_checked(&entry)? {
                 return Err(SystemError::ENOTEMPTY);
             }
@@ -118,7 +118,7 @@ impl OvlInode {
         entries: &[String],
         context: Option<&DentryMutationContext<'_>>,
     ) {
-        let detached = match workdir.find(temp_name) {
+        let detached = match super::lookup::lookup_backing(workdir, temp_name) {
             Ok(detached) => detached,
             Err(err) => {
                 log::error!(
@@ -129,8 +129,7 @@ impl OvlInode {
         };
 
         for name in entries {
-            let still_whiteout = detached
-                .find(name)
+            let still_whiteout = super::lookup::lookup_backing(&detached, name)
                 .and_then(|entry| Self::is_whiteout_inode_checked(&entry));
             match still_whiteout {
                 Ok(true) => {
@@ -176,7 +175,7 @@ impl OvlInode {
     pub(super) fn has_whiteout(&self, name: &str) -> bool {
         let upper_inode = self.upper_inode.lock();
         if let Some(ref upper_inode) = *upper_inode {
-            if let Ok(inode) = upper_inode.find(name) {
+            if let Ok(inode) = super::lookup::lookup_backing(upper_inode, name) {
                 return Self::is_whiteout_inode(&inode);
             }
         }
@@ -186,7 +185,7 @@ impl OvlInode {
     #[allow(dead_code)]
     pub(super) fn remove_whiteout_if_present(&self, name: &str) -> Result<bool, SystemError> {
         let upper_inode = self.upper_inode.lock().clone().ok_or(SystemError::EROFS)?;
-        match upper_inode.find(name) {
+        match super::lookup::lookup_backing(&upper_inode, name) {
             Ok(inode) => {
                 if Self::is_whiteout_inode(&inode) {
                     upper_inode.unlink(name)?;

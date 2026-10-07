@@ -775,6 +775,10 @@ impl IndexNode for OvlInode {
         super::metadata::removexattr(self, name)
     }
 
+    fn remove_security_privileges(&self) -> Result<(), SystemError> {
+        super::metadata::remove_security_privileges(self)
+    }
+
     fn as_any_ref(&self) -> &dyn core::any::Any {
         self
     }

@@ -522,6 +522,19 @@ impl Transaction<'_> {
         self.release_writer();
     }
 
+    /// Detach an explicitly identified private tree/inode image when splitting
+    /// a Direct COW operation into ownership, node-image and root phases. Never
+    /// use on journal transactions: their images form one indivisible commit.
+    pub(super) fn take_direct_image(
+        &mut self,
+        home: PBlockId,
+    ) -> Result<Option<Box<[u8; BLOCK_SIZE]>>> {
+        if !matches!(self.core, TransactionCoreRef::Direct(_)) {
+            return Err(Ext4Error::new(ErrCode::EINVAL));
+        }
+        Ok(self.staged.remove(&home).map(|block| block.image))
+    }
+
     pub(super) fn commit(
         mut self,
         device: &dyn BlockDevice,
@@ -639,6 +652,56 @@ impl Transaction<'_> {
         if !completed_homes.is_empty() && device.supports_reliable_flush() {
             device.flush()?;
         }
+        Ok(())
+    }
+
+    /// Ordered Direct phase: publish no cache image until every home and the
+    /// device flush have succeeded. An attempted write makes failure uncertain;
+    /// callers must retain all potentially referenced allocations after error.
+    pub(super) fn commit_direct_flush_before_publish(
+        mut self,
+        device: &dyn BlockDevice,
+        publisher: &dyn CachePublisher,
+    ) -> core::result::Result<(), CommitError> {
+        let TransactionCoreRef::Direct(core) = self.core else {
+            return self.fail(
+                Ext4Error::new(ErrCode::EINVAL),
+                CommitFailure::BeforeCommit,
+                false,
+            );
+        };
+        if self.staged.is_empty() {
+            self.release_writer();
+            return Ok(());
+        }
+        if !device.supports_reliable_flush() {
+            return self.fail(
+                Ext4Error::new(ErrCode::ENOTSUP),
+                CommitFailure::BeforeCommit,
+                false,
+            );
+        }
+        if self
+            .staged
+            .values()
+            .any(|block| block.home >= core.target_blocks)
+        {
+            return self.fail(
+                Ext4Error::new(ErrCode::EINVAL),
+                CommitFailure::BeforeCommit,
+                false,
+            );
+        }
+        for staged in self.staged.values() {
+            if let Err(error) = write_bytes(device, staged.home, staged.bytes()) {
+                return self.fail(error, CommitFailure::CommitUncertain, true);
+            }
+        }
+        if let Err(error) = device.flush() {
+            return self.fail(error, CommitFailure::CommitUncertain, true);
+        }
+        publisher.publish_home_current(&self.staged, &self.retired);
+        self.release_writer();
         Ok(())
     }
 
@@ -1396,6 +1459,52 @@ mod tests {
     impl CachePublisher for Publisher {
         fn publish(&self, blocks: &BTreeMap<PBlockId, StagedBlock>) {
             self.0.fetch_add(blocks.len(), Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn ordered_direct_phase_is_durable_before_publication() {
+        struct DurablePublisher<'a>(&'a MemoryDevice, AtomicUsize);
+        impl CachePublisher for DurablePublisher<'_> {
+            fn publish(&self, blocks: &BTreeMap<PBlockId, StagedBlock>) {
+                for (home, staged) in blocks {
+                    assert_eq!(self.0.stable_block(*home).unwrap().as_ref(), staged.bytes());
+                }
+                self.1.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let device = MemoryDevice::new();
+        let publisher = DurablePublisher(&device, AtomicUsize::new(0));
+        let core = DirectTransactionCore::new(128).unwrap();
+        let mut transaction = core.start(2).unwrap();
+        transaction.stage(5, Box::new([5; BLOCK_SIZE])).unwrap();
+        transaction.stage(2, Box::new([2; BLOCK_SIZE])).unwrap();
+        transaction
+            .commit_direct_flush_before_publish(&device, &publisher)
+            .unwrap();
+        assert_eq!(publisher.1.load(Ordering::SeqCst), 1);
+        assert_eq!(device.flushes.load(Ordering::SeqCst), 1);
+        assert!(core.start(1).is_ok());
+    }
+
+    #[test]
+    fn ordered_direct_phase_write_or_flush_error_never_publishes() {
+        for failed_operation in 0..=2 {
+            let device = MemoryDevice::new();
+            device.fail_at.store(failed_operation, Ordering::SeqCst);
+            let publisher = Publisher(AtomicUsize::new(0));
+            let core = DirectTransactionCore::new(128).unwrap();
+            let mut transaction = core.start(2).unwrap();
+            transaction.stage(2, Box::new([2; BLOCK_SIZE])).unwrap();
+            transaction.stage(5, Box::new([5; BLOCK_SIZE])).unwrap();
+            let error = transaction
+                .commit_direct_flush_before_publish(&device, &publisher)
+                .unwrap_err();
+            assert_eq!(error.failure, CommitFailure::CommitUncertain);
+            assert!(error.poisoned);
+            assert_eq!(publisher.0.load(Ordering::SeqCst), 0);
+            assert!(core.is_poisoned());
+            assert_eq!(core.start(1).err().unwrap().code(), ErrCode::EROFS);
         }
     }
 

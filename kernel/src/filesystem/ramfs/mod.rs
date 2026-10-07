@@ -543,16 +543,35 @@ impl IndexNode for LockedRamFSInode {
     }
 
     fn metadata(&self) -> Result<Metadata, SystemError> {
-        Ok(self.0.lock().metadata.clone())
+        let (mut metadata, cache) = {
+            let inode = self.0.lock();
+            (inode.metadata.clone(), inode.page_cache.clone())
+        };
+        if let Some(cache) = cache {
+            metadata.blocks = cache
+                .manager()
+                .pages_count()?
+                .checked_mul(MMArch::PAGE_SIZE / 512)
+                .ok_or(SystemError::EOVERFLOW)?;
+        }
+        Ok(metadata)
     }
 
     fn cached_metadata(&self) -> Result<Metadata, SystemError> {
-        Ok(self
-            .0
-            .try_lock()
-            .map_err(|_| SystemError::EAGAIN_OR_EWOULDBLOCK)?
-            .metadata
-            .clone())
+        let (mut metadata, cache) = {
+            let inode = self
+                .0
+                .try_lock()
+                .map_err(|_| SystemError::EAGAIN_OR_EWOULDBLOCK)?;
+            (inode.metadata.clone(), inode.page_cache.clone())
+        };
+        if let Some(cache) = cache {
+            metadata.blocks = cache
+                .try_pages_count()?
+                .checked_mul(MMArch::PAGE_SIZE / 512)
+                .ok_or(SystemError::EOVERFLOW)?;
+        }
+        Ok(metadata)
     }
 
     fn page_cache(&self) -> Option<Arc<PageCache>> {

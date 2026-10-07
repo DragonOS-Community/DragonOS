@@ -387,6 +387,10 @@ impl FileSystem for Ext4FileSystem {
         "ext4"
     }
 
+    fn supports_idmapped_mounts(&self) -> bool {
+        true
+    }
+
     fn super_block(&self) -> vfs::SuperBlock {
         vfs::SuperBlock::new(Magic::EXT4_MAGIC, another_ext4::BLOCK_SIZE as u64, 255)
     }
@@ -1449,6 +1453,7 @@ impl Ext4FileSystem {
                 lifecycle: Ext4InodeLifecycle::new(),
                 retention: vfs::InodeRetentionState::new(),
                 pending_reclaim: SpinLock::new(None),
+                pending_removal_token: SpinLock::new(None),
                 tmpfile_linkable: AtomicBool::new(false),
                 eviction_scheduled: SpinLock::new(false),
                 retention_callback_self: self_ref.clone(),

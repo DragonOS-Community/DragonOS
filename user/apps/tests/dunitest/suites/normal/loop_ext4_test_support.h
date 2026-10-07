@@ -124,8 +124,8 @@ class LoopExt4 {
         ASSERT_EQ(0, ioctl(loop_fd_, kLoopSetFd, backing_fd_)) << strerror(errno);
     }
 
-    void Mount(unsigned long flags = 0) {
-        ASSERT_EQ(0, mount(loop_path_.c_str(), mount_point_.c_str(), "ext4", flags, nullptr))
+    void Mount(unsigned long flags = 0, const char* filesystem = "ext4") {
+        ASSERT_EQ(0, mount(loop_path_.c_str(), mount_point_.c_str(), filesystem, flags, nullptr))
             << strerror(errno);
         mounted_ = true;
     }
@@ -231,4 +231,3 @@ class LoopExt4 {
 };
 
 }  // namespace dunitest
-

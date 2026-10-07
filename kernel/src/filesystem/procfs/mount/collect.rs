@@ -4,7 +4,7 @@ use system_error::SystemError;
 
 use crate::{
     filesystem::vfs::{
-        mount::{append_comma_options, MountFSInode, MountSnapshotGuard},
+        mount::{append_comma_options, MountFSInode, MountFlags, MountSnapshotGuard},
         FileSystem, MountFS,
     },
     libs::casting::DowncastArc,
@@ -41,6 +41,7 @@ pub(crate) struct ProcMountEntry {
     pub mount_id: usize,
     pub fstype: String,
     pub per_mount_options: String,
+    pub mounts_options: String,
     pub super_block_options: String,
     pub mountinfo_tags: String,
 }
@@ -58,6 +59,7 @@ pub(crate) struct VisibleMount {
     pub mountinfo_root: String,
     pub mount_id: usize,
     pub per_mount_options: String,
+    pub mounts_options: String,
     pub super_block_options: String,
     pub mountinfo_tags: String,
     /// Keeps the superblock backend alive while the rest of the record is
@@ -76,6 +78,7 @@ impl ProcMountEntry {
             mountinfo_root,
             mount_id,
             per_mount_options,
+            mounts_options,
             super_block_options,
             mountinfo_tags,
             pin,
@@ -85,6 +88,7 @@ impl ProcMountEntry {
             fstype: mount.fs_type().to_string(),
             mountinfo_tags,
             per_mount_options,
+            mounts_options,
             super_block_options,
             mount,
             mountpoint_display,
@@ -196,10 +200,21 @@ impl VisibleMount {
             &mut super_block_options,
             super_block_flags.proc_super_block_options(),
         );
+        // /proc/mounts combines entry and SB attributes, whereas mountinfo
+        // keeps them separate. Capture both from this same flags snapshot.
+        let mut mounts_options = (mount_flags | super_block_flags.intersection(MountFlags::RDONLY))
+            .proc_rw_token()
+            .to_string();
+        append_comma_options(
+            &mut mounts_options,
+            super_block_flags.proc_super_block_options(),
+        );
+        append_comma_options(&mut mounts_options, mount_flags.proc_per_mount_options());
         Ok(Self {
             mount_id: mount.mount_id().into(),
             mountinfo_tags: mount.propagation().proc_mountinfo_tags(),
             per_mount_options,
+            mounts_options,
             super_block_options,
             mount,
             mountpoint_display,

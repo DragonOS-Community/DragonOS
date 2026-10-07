@@ -8,7 +8,7 @@ use crate::{
     filesystem::vfs::{mount::MountFS, FileType, InodeMode},
     libs::casting::DowncastArc,
     process::cred::{CAPFlags, Cred},
-    process::namespace::user_namespace::map_id_up,
+    process::namespace::user_namespace::{map_id_up, UserNamespace, INIT_USER_NAMESPACE},
     process::ProcessManager,
 };
 use alloc::sync::Arc;
@@ -43,17 +43,448 @@ pub struct ChildInodeInit {
     pub mode: InodeMode,
 }
 
-/// Compute owner and directory-SGID inheritance before publishing a child.
-pub fn child_inode_init(
+/// Explicit identity for a backing-inode operation. No mount/inode lock is
+/// retained here; namespace maps may be written after this snapshot is taken.
+#[derive(Clone)]
+pub struct InodeOpContext {
+    pub cred: Option<Arc<Cred>>,
+    pub idmap: Option<Arc<super::mount::idmap::MountIdmap>>,
+    pub fs_userns: Arc<UserNamespace>,
+}
+
+impl InodeOpContext {
+    pub fn legacy() -> Self {
+        Self {
+            cred: ProcessManager::initialized().then(|| ProcessManager::current_pcb().cred()),
+            idmap: None,
+            fs_userns: INIT_USER_NAMESPACE.clone(),
+        }
+    }
+
+    pub fn is_idmapped(&self) -> bool {
+        self.idmap.as_ref().is_some_and(|idmap| {
+            !Arc::ptr_eq(idmap.owner(), &INIT_USER_NAMESPACE)
+                && !Arc::ptr_eq(idmap.owner(), &self.fs_userns)
+        })
+    }
+
+    pub fn view_metadata(&self, raw: &Metadata) -> Metadata {
+        let mut view = raw.clone();
+        if let Some(idmap) = &self.idmap {
+            view.uid = idmap
+                .uid_into_view(&self.fs_userns, raw.uid)
+                .unwrap_or(u32::MAX as usize);
+            view.gid = idmap
+                .gid_into_view(&self.fs_userns, raw.gid)
+                .unwrap_or(u32::MAX as usize);
+        }
+        view
+    }
+
+    fn raw_uid(&self, uid: usize) -> Option<usize> {
+        match &self.idmap {
+            Some(idmap) => idmap.uid_from_view(&self.fs_userns, uid),
+            None => super::mount::idmap::identity_id(uid),
+        }
+    }
+
+    fn raw_gid(&self, gid: usize) -> Option<usize> {
+        match &self.idmap {
+            Some(idmap) => idmap.gid_from_view(&self.fs_userns, gid),
+            None => super::mount::idmap::identity_id(gid),
+        }
+    }
+
+    /// Linux notify_change validates new IDs before unrepaired old IDs.
+    pub fn validate_setattr_mapping(
+        &self,
+        current: &Metadata,
+        requested: &Metadata,
+        mask: super::SetMetadataMask,
+    ) -> Result<(), SystemError> {
+        if mask.is_empty() {
+            return Ok(());
+        }
+        if mask.contains(super::SetMetadataMask::UID) {
+            self.raw_uid(requested.uid).ok_or(SystemError::EOVERFLOW)?;
+        }
+        if mask.contains(super::SetMetadataMask::GID) {
+            self.raw_gid(requested.gid).ok_or(SystemError::EOVERFLOW)?;
+        }
+        if !mask.contains(super::SetMetadataMask::UID) && current.uid == u32::MAX as usize {
+            return Err(SystemError::EOVERFLOW);
+        }
+        if !mask.contains(super::SetMetadataMask::GID) && current.gid == u32::MAX as usize {
+            return Err(SystemError::EOVERFLOW);
+        }
+        Ok(())
+    }
+}
+
+impl InodeOpContext {
+    pub fn validate_size_mapping(&self, current: &Metadata) -> Result<(), SystemError> {
+        if current.uid == u32::MAX as usize || current.gid == u32::MAX as usize {
+            return Err(SystemError::EOVERFLOW);
+        }
+        Ok(())
+    }
+
+    pub fn backing_metadata_request(
+        &self,
+        raw: &Metadata,
+        requested: &Metadata,
+        mask: super::SetMetadataMask,
+    ) -> Result<Metadata, SystemError> {
+        self.validate_setattr_mapping(&self.view_metadata(raw), requested, mask)?;
+        let mut translated = requested.clone();
+        if mask.contains(super::SetMetadataMask::UID) {
+            translated.uid = self.raw_uid(requested.uid).ok_or(SystemError::EOVERFLOW)?;
+        }
+        if mask.contains(super::SetMetadataMask::GID) {
+            translated.gid = self.raw_gid(requested.gid).ok_or(SystemError::EOVERFLOW)?;
+        }
+        let mut result = raw.clone();
+        super::merge_metadata_masked(&mut result, &translated, mask);
+        Ok(result)
+    }
+}
+
+/// Called under the backend's parent mutation lock, before removing a child.
+pub fn check_inode_delete(
+    parent: &Metadata,
+    victim: &Metadata,
+    directory: bool,
+    context: &InodeOpContext,
+) -> Result<(), SystemError> {
+    let victim = context.view_metadata(victim);
+    let parent = context.view_metadata(parent);
+    if victim.uid == u32::MAX as usize || victim.gid == u32::MAX as usize {
+        return Err(SystemError::EOVERFLOW);
+    }
+    if parent.flags.contains(super::InodeFlags::S_IMMUTABLE) {
+        return Err(SystemError::EPERM);
+    }
+    if let Some(cred) = &context.cred {
+        cred.inode_permission(
+            &parent,
+            (PermissionMask::MAY_WRITE | PermissionMask::MAY_EXEC).bits(),
+        )?;
+        if parent.flags.contains(super::InodeFlags::S_APPEND) {
+            return Err(SystemError::EPERM);
+        }
+        if parent.mode.contains(InodeMode::S_ISVTX)
+            && cred.fsuid.data() != victim.uid
+            && cred.fsuid.data() != parent.uid
+            && !cred.has_capability_wrt_inode_uidgid(&victim, CAPFlags::CAP_FOWNER)
+        {
+            return Err(SystemError::EPERM);
+        }
+    } else if context.is_idmapped() {
+        return Err(SystemError::EINVAL);
+    }
+    if victim
+        .flags
+        .intersects(super::InodeFlags::S_APPEND | super::InodeFlags::S_IMMUTABLE)
+    {
+        return Err(SystemError::EPERM);
+    }
+    if directory && victim.file_type != FileType::Dir {
+        return Err(SystemError::ENOTDIR);
+    }
+    if !directory && victim.file_type == FileType::Dir {
+        return Err(SystemError::EISDIR);
+    }
+    if parent.nlinks == 0 {
+        return Err(SystemError::ENOENT);
+    }
+    Ok(())
+}
+
+pub fn check_inode_link_source(
+    raw: &Metadata,
+    context: &InodeOpContext,
+) -> Result<(), SystemError> {
+    let view = context.view_metadata(raw);
+    if view.uid == u32::MAX as usize
+        || view.gid == u32::MAX as usize
+        || view
+            .flags
+            .intersects(super::InodeFlags::S_IMMUTABLE | super::InodeFlags::S_APPEND)
+    {
+        return Err(SystemError::EPERM);
+    }
+    Ok(())
+}
+
+/// Called under the backend's parent mutation lock, before publishing a child.
+pub fn check_parent_create(
+    parent: &Metadata,
+    context: &InodeOpContext,
+    allow_unlinked_parent: bool,
+) -> Result<(), SystemError> {
+    if parent.file_type != FileType::Dir {
+        return Err(SystemError::ENOTDIR);
+    }
+    if !allow_unlinked_parent && parent.nlinks == 0 {
+        return Err(SystemError::ENOENT);
+    }
+    let Some(cred) = &context.cred else {
+        return if context.is_idmapped() {
+            Err(SystemError::EINVAL)
+        } else {
+            Ok(())
+        };
+    };
+    // Linux may_create checks both caller IDs even when SGID will inherit GID.
+    context
+        .raw_uid(cred.fsuid.data())
+        .ok_or(SystemError::EOVERFLOW)?;
+    context
+        .raw_gid(cred.fsgid.data())
+        .ok_or(SystemError::EOVERFLOW)?;
+    if parent.flags.contains(super::InodeFlags::S_IMMUTABLE) {
+        return Err(SystemError::EPERM);
+    }
+    cred.inode_permission(
+        &context.view_metadata(parent),
+        (PermissionMask::MAY_WRITE | PermissionMask::MAY_EXEC).bits(),
+    )
+}
+
+#[cfg(test)]
+mod idmap_tests {
+    use super::*;
+    use crate::process::{
+        cred::{Kgid, Kuid, INIT_CRED},
+        namespace::user_namespace::{UidGidExtent, UidGidMap},
+    };
+    use core::sync::atomic::Ordering;
+
+    fn context() -> InodeOpContext {
+        let owner = UserNamespace::create_user_ns(&INIT_CRED).unwrap();
+        let extent = |lower_first| {
+            let mut map = UidGidMap::default();
+            map.extent[0] = UidGidExtent {
+                first: 0,
+                lower_first,
+                count: 100,
+            };
+            map.nr_extents.store(1, Ordering::Release);
+            map
+        };
+        {
+            let mut inner = owner.inner.lock();
+            inner.uid_map = extent(1000);
+            inner.gid_map = extent(2000);
+        }
+        let mut cred = (**INIT_CRED).clone();
+        cred.fsuid = Kuid::new(1003);
+        cred.fsgid = Kgid::new(2004);
+        cred.groups.clear();
+        cred.cap_effective = CAPFlags::CAP_EMPTY_SET;
+        InodeOpContext {
+            cred: Some(Arc::new(cred)),
+            idmap: Some(Arc::new(super::super::mount::idmap::MountIdmap::new(owner))),
+            fs_userns: INIT_USER_NAMESPACE.clone(),
+        }
+    }
+
+    fn parent() -> Metadata {
+        Metadata {
+            file_type: FileType::Dir,
+            mode: InodeMode::S_IRWXU,
+            uid: 3,
+            gid: 7,
+            nlinks: 2,
+            ..Metadata::default()
+        }
+    }
+
+    #[test]
+    fn setattr_mapping_repairs_only_explicitly_selected_owner_fields() {
+        let context = context();
+        let mut raw = parent();
+        raw.uid = 999;
+        raw.gid = 999;
+        let view = context.view_metadata(&raw);
+        let mut requested = view.clone();
+        requested.uid = 1003;
+        requested.gid = 2004;
+        assert_eq!(
+            context.validate_setattr_mapping(&view, &requested, super::super::SetMetadataMask::UID),
+            Err(SystemError::EOVERFLOW)
+        );
+        assert!(context
+            .validate_setattr_mapping(
+                &view,
+                &requested,
+                super::super::SetMetadataMask::UID | super::super::SetMetadataMask::GID
+            )
+            .is_ok());
+        assert_eq!(
+            context.validate_setattr_mapping(
+                &view,
+                &requested,
+                super::super::SetMetadataMask::MODE
+            ),
+            Err(SystemError::EOVERFLOW)
+        );
+        assert!(context
+            .validate_setattr_mapping(&view, &requested, super::super::SetMetadataMask::empty())
+            .is_ok());
+    }
+
+    #[test]
+    fn masked_translation_does_not_store_unselected_view_owners() {
+        let context = context();
+        let raw = parent();
+        let mut requested = context.view_metadata(&raw);
+        requested.uid = 9000;
+        requested.gid = 9001;
+        requested.mode = InodeMode::S_IRUSR;
+        let backing = context
+            .backing_metadata_request(&raw, &requested, super::super::SetMetadataMask::MODE)
+            .unwrap();
+        assert_eq!((backing.uid, backing.gid), (raw.uid, raw.gid));
+        assert_eq!(backing.mode, requested.mode);
+    }
+
+    #[test]
+    fn resize_returns_mode_changes_derived_from_current_not_prepared_snapshot() {
+        let context = context();
+        let mut current = parent();
+        current.file_type = FileType::File;
+        current.mode = InodeMode::S_IRUSR | InodeMode::S_ISUID;
+        let mut stale = context.view_metadata(&current);
+        stale.mode = InodeMode::S_IWUSR;
+        let intent =
+            super::super::SetMetadataMask::WRITE_SIDE_EFFECT | super::super::SetMetadataMask::CTIME;
+        let (backing, actual) = super::super::vcore::prepare_backing_resize_metadata(
+            &context, &current, &stale, intent, 32,
+        )
+        .unwrap();
+        assert!(actual.contains(super::super::SetMetadataMask::MODE));
+        assert_eq!(backing.mode, InodeMode::S_IRUSR);
+        assert_eq!((backing.uid, backing.gid), (current.uid, current.gid));
+        current.mode = InodeMode::S_IRUSR;
+        let (_, actual) = super::super::vcore::prepare_backing_resize_metadata(
+            &context,
+            &current,
+            &stale,
+            intent | super::super::SetMetadataMask::MODE,
+            32,
+        )
+        .unwrap();
+        assert!(!actual.contains(super::super::SetMetadataMask::MODE));
+    }
+
+    #[test]
+    fn sticky_delete_uses_view_owner_and_rejects_holes_before_parent_flags() {
+        let context = context();
+        let mut parent = parent();
+        parent.uid = 8;
+        parent.mode = InodeMode::S_IRWXUGO | InodeMode::S_ISVTX;
+        let mut victim = Metadata {
+            file_type: FileType::File,
+            uid: 3,
+            gid: 4,
+            ..Metadata::default()
+        };
+        assert!(check_inode_delete(&parent, &victim, false, &context).is_ok());
+        victim.uid = 9;
+        assert_eq!(
+            check_inode_delete(&parent, &victim, false, &context),
+            Err(SystemError::EPERM)
+        );
+        parent.flags.insert(super::super::InodeFlags::S_IMMUTABLE);
+        victim.uid = 999;
+        assert_eq!(
+            check_inode_delete(&parent, &victim, false, &context),
+            Err(SystemError::EOVERFLOW)
+        );
+        victim.uid = 3;
+        assert_eq!(
+            check_inode_delete(&parent, &victim, false, &context),
+            Err(SystemError::EPERM)
+        );
+    }
+
+    #[test]
+    fn mapped_parent_dac_and_child_ownership_use_different_id_spaces() {
+        let context = context();
+        let parent = parent();
+        assert!(context
+            .cred
+            .as_ref()
+            .unwrap()
+            .inode_permission(
+                &parent,
+                (PermissionMask::MAY_WRITE | PermissionMask::MAY_EXEC).bits()
+            )
+            .is_err());
+        assert!(check_parent_create(&parent, &context, false).is_ok());
+        let child =
+            child_inode_init_with_context(&parent, FileType::File, InodeMode::S_IRUSR, &context)
+                .unwrap();
+        assert_eq!((child.uid, child.gid), (3, 4));
+    }
+
+    #[test]
+    fn sgid_inherits_raw_group_but_validates_callers_group_mapping() {
+        let mut context = context();
+        let mut parent = parent();
+        parent.mode.insert(InodeMode::S_ISGID);
+        let child =
+            child_inode_init_with_context(&parent, FileType::Dir, InodeMode::S_IRWXU, &context)
+                .unwrap();
+        assert_eq!(child.gid, 7);
+        assert!(child.mode.contains(InodeMode::S_ISGID));
+        let executable = child_inode_init_with_context(
+            &parent,
+            FileType::File,
+            InodeMode::S_ISGID | InodeMode::S_IXGRP,
+            &context,
+        )
+        .unwrap();
+        assert!(!executable.mode.contains(InodeMode::S_ISGID));
+        let mut cred = (**context.cred.as_ref().unwrap()).clone();
+        cred.fsgid = Kgid::new(9000);
+        context.cred = Some(Arc::new(cred));
+        assert_eq!(
+            check_parent_create(&parent, &context, false),
+            Err(SystemError::EOVERFLOW)
+        );
+    }
+
+    #[test]
+    fn unlinked_parent_is_only_allowed_for_tmpfile_and_unmapped_view_cannot_write() {
+        let context = context();
+        let mut parent = parent();
+        parent.nlinks = 0;
+        assert_eq!(
+            check_parent_create(&parent, &context, false),
+            Err(SystemError::ENOENT)
+        );
+        assert!(check_parent_create(&parent, &context, true).is_ok());
+        parent.nlinks = 2;
+        parent.uid = 500;
+        assert_eq!(
+            check_parent_create(&parent, &context, false),
+            Err(SystemError::EACCES)
+        );
+    }
+}
+
+pub fn child_inode_init_with_context(
     parent: &Metadata,
     file_type: FileType,
     mut mode: InodeMode,
-) -> ChildInodeInit {
-    // Filesystems such as procfs create backing ramfs nodes before the process
-    // manager has installed an idle task. Those kernel-owned bootstrap
-    // creations run with the initial root credential rather than a current
-    // task credential.
-    if !ProcessManager::initialized() {
+    context: &InodeOpContext,
+) -> Result<ChildInodeInit, SystemError> {
+    let Some(cred) = &context.cred else {
+        if context.is_idmapped() {
+            return Err(SystemError::EINVAL);
+        }
         let gid = if parent.mode.contains(InodeMode::S_ISGID) {
             if file_type == FileType::Dir {
                 mode.insert(InodeMode::S_ISGID);
@@ -62,33 +493,42 @@ pub fn child_inode_init(
         } else {
             0
         };
-        return ChildInodeInit { uid: 0, gid, mode };
-    }
-
-    let cred = ProcessManager::current_pcb().cred();
-    let gid = if parent.mode.contains(InodeMode::S_ISGID) {
+        return Ok(ChildInodeInit { uid: 0, gid, mode });
+    };
+    let uid = context
+        .raw_uid(cred.fsuid.data())
+        .ok_or(SystemError::EOVERFLOW)?;
+    let caller_gid = context
+        .raw_gid(cred.fsgid.data())
+        .ok_or(SystemError::EOVERFLOW)?;
+    let parent_sgid = parent.mode.contains(InodeMode::S_ISGID);
+    let gid = if parent_sgid {
         if file_type == FileType::Dir {
             mode.insert(InodeMode::S_ISGID);
         }
         parent.gid
     } else {
-        cred.fsgid.data()
+        caller_gid
     };
-    // Linux vfs_prepare_mode()/mode_strip_sgid(): a caller must not create an
-    // executable setgid non-directory for a group it does not belong to.
-    let in_group = cred.fsgid.data() == gid || cred.groups.iter().any(|group| group.data() == gid);
+    let view = context.view_metadata(parent);
+    let in_group =
+        cred.fsgid.data() == view.gid || cred.groups.iter().any(|group| group.data() == view.gid);
+    // Linux mode_strip_sgid uses the parent directory's mapped IDs.
     if file_type != FileType::Dir
+        && parent_sgid
         && mode.contains(InodeMode::S_ISGID | InodeMode::S_IXGRP)
         && !in_group
-        && !cred.has_capability(CAPFlags::CAP_FSETID)
+        && !cred.has_capability_wrt_inode_uidgid(&view, CAPFlags::CAP_FSETID)
     {
         mode.remove(InodeMode::S_ISGID);
     }
-    ChildInodeInit {
-        uid: cred.fsuid.data(),
-        gid,
-        mode,
-    }
+    Ok(ChildInodeInit { uid, gid, mode })
+}
+
+/// Compute owner and directory-SGID inheritance before publishing a child.
+pub fn child_inode_init(parent: &Metadata, file_type: FileType, mode: InodeMode) -> ChildInodeInit {
+    child_inode_init_with_context(parent, file_type, mode, &InodeOpContext::legacy())
+        .expect("identity credentials must contain valid filesystem IDs")
 }
 
 /// VFS permission check wrapper that respects per-filesystem policy.
@@ -152,7 +592,7 @@ pub fn check_inode_permission(
         return check_device_inode_permission(metadata, mask);
     }
     match inode.try_fs().map(|fs| fs.permission_policy()) {
-        None | Some(FsPermissionPolicy::Dac) => cred.inode_permission(metadata, mask.bits()),
+        None | Some(FsPermissionPolicy::Dac) => inode.check_dac_permission(metadata, mask),
         Some(FsPermissionPolicy::Remote) => {
             if mask.contains(PermissionMask::MAY_EXEC)
                 && metadata.file_type == FileType::File
@@ -198,7 +638,7 @@ pub(crate) fn check_device_inode_permission(
 /// its timestamp metadata.
 pub fn check_noatime_permission(metadata: &Metadata) -> Result<(), SystemError> {
     let cred = ProcessManager::current_pcb().cred();
-    if cred.fsuid.data() == metadata.uid || cred.has_capability(CAPFlags::CAP_FOWNER) {
+    if cred.is_owner_or_capable(metadata) {
         Ok(())
     } else {
         Err(SystemError::EPERM)
@@ -237,6 +677,11 @@ impl Cred {
     /// inode_permission(&metadata, &cred, MAY_EXEC)?;
     /// ```
     pub fn inode_permission(&self, metadata: &Metadata, mask: u32) -> Result<(), SystemError> {
+        if mask & PermissionMask::MAY_WRITE.bits() != 0
+            && (metadata.uid == u32::MAX as usize || metadata.gid == u32::MAX as usize)
+        {
+            return Err(SystemError::EACCES);
+        }
         // 从 mode 中提取权限位
         let file_mode = metadata.mode.bits();
 
@@ -322,7 +767,7 @@ impl Cred {
     #[inline(never)]
     fn try_capability_override(&self, metadata: &Metadata, mask: u32) -> bool {
         // CAP_DAC_OVERRIDE: 绕过所有文件读、写和执行权限检查
-        if self.has_capability(CAPFlags::CAP_DAC_OVERRIDE) {
+        if self.has_capability_wrt_inode_uidgid(metadata, CAPFlags::CAP_DAC_OVERRIDE) {
             // Linux: CAP_DAC_OVERRIDE does not bypass execute checks for regular files
             // when no execute bit is set.
             if mask & PermissionMask::MAY_EXEC.bits() != 0
@@ -335,7 +780,7 @@ impl Cred {
         }
 
         // CAP_DAC_READ_SEARCH: 绕过读和搜索（目录上的执行）检查
-        if self.has_capability(CAPFlags::CAP_DAC_READ_SEARCH) {
+        if self.has_capability_wrt_inode_uidgid(metadata, CAPFlags::CAP_DAC_READ_SEARCH) {
             // 目录：只要不请求写权限，就允许 (即允许 Read 和 Exec/Search)
             if metadata.file_type == FileType::Dir {
                 if (mask & PermissionMask::MAY_WRITE.bits()) == 0 {

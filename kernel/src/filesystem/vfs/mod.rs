@@ -169,6 +169,87 @@ pub struct AttribStageObserver<'a> {
     committed: bool,
 }
 
+/// One primary write's privilege stage. `handled` prevents a second, racy
+/// post-data chmod; the observer reports an attribute commit even when the
+/// subsequent data operation fails.
+pub struct WritePrivilegeStage<'a> {
+    handled: bool,
+    attrib: AttribStageObserver<'a>,
+}
+
+/// Input retained only for the duration of one primary write. Native local
+/// filesystems materialize user input after privilege removal, while holding
+/// their canonical content guard but no metadata or namespace spin locks.
+pub enum PrimaryWriteSource<'a, 'b> {
+    Kernel(&'a [u8]),
+    User(&'a UserBufferReader<'b>),
+}
+
+impl PrimaryWriteSource<'_, '_> {
+    pub fn with_buffer<T>(
+        self,
+        len: usize,
+        publish: impl FnOnce(&[u8]) -> Result<T, SystemError>,
+    ) -> Result<T, SystemError> {
+        match self {
+            Self::Kernel(buffer) => publish(buffer),
+            Self::User(reader) => {
+                let mut buffer = Vec::new();
+                // A scratch batch bounds speculative allocation; it is not a
+                // write limit. Grow the legacy contiguous staging buffer only
+                // for bytes actually copied from userspace.
+                const COPY_BATCH: usize = 64 * 1024;
+                let mut scratch = Vec::new();
+                let scratch_len = len.min(COPY_BATCH);
+                scratch
+                    .try_reserve_exact(scratch_len)
+                    .map_err(|_| SystemError::ENOMEM)?;
+                scratch.resize(scratch_len, 0);
+                while buffer.len() < len {
+                    let want = scratch.len().min(len - buffer.len());
+                    let copied =
+                        match reader.copy_from_user_prefix(&mut scratch[..want], buffer.len()) {
+                            Ok(copied) => copied,
+                            Err(SystemError::EFAULT) if !buffer.is_empty() => break,
+                            Err(error) => return Err(error),
+                        };
+                    // No data has been published yet. Allocation failure must
+                    // propagate, not masquerade as a committed short write.
+                    buffer
+                        .try_reserve(copied)
+                        .map_err(|_| SystemError::ENOMEM)?;
+                    buffer.extend_from_slice(&scratch[..copied]);
+                    if copied < want {
+                        break;
+                    }
+                }
+                publish(&buffer)
+            }
+        }
+    }
+}
+
+impl<'a> WritePrivilegeStage<'a> {
+    pub fn new(publish: &'a mut dyn FnMut()) -> Self {
+        Self {
+            handled: false,
+            attrib: AttribStageObserver::new(publish),
+        }
+    }
+
+    pub fn handled(&self) -> bool {
+        self.handled
+    }
+
+    pub fn complete(&mut self) {
+        self.handled = true;
+    }
+
+    pub fn commit_attrib(&mut self) {
+        self.attrib.commit();
+    }
+}
+
 /// Authoritative result of removing one namespace link. Filesystems produce
 /// this while holding the lock that commits their link-count mutation; VFS
 /// consumers must not reconstruct it with a later metadata read.
@@ -452,6 +533,8 @@ bitflags! {
         const TIMES_BY_WRITE = 1 << 6;
         /// 已授权的数据写/size change 引发的 metadata 副作用。
         const WRITE_SIDE_EFFECT = 1 << 7;
+        /// Internal ATTR_KILL_PRIV request, independent of CAP_FSETID.
+        const KILL_PRIV = 1 << 8;
     }
 }
 
@@ -726,6 +809,32 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         self.resize_file_with_metadata(len, lock_owner, data, &context.requested, context.mask)
     }
 
+    fn resize_open_truncate_with_inode_context(
+        &self,
+        len: usize,
+        lock_owner: u64,
+        data: MutexGuard<FilePrivateData>,
+        truncate: &OpenTruncateContext,
+        context: &permission::InodeOpContext,
+    ) -> Result<SetMetadataMask, SystemError> {
+        if context.is_idmapped() {
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        }
+        self.resize_open_truncate(len, lock_owner, data, truncate)
+            .map(|_| truncate.mask)
+    }
+
+    fn resize_open_truncate_result(
+        &self,
+        len: usize,
+        lock_owner: u64,
+        data: MutexGuard<FilePrivateData>,
+        context: &OpenTruncateContext,
+    ) -> Result<SetMetadataMask, SystemError> {
+        self.resize_open_truncate(len, lock_owner, data, context)?;
+        Ok(context.mask)
+    }
+
     fn mmap(&self, _start: usize, _len: usize, _offset: usize) -> Result<(), SystemError> {
         return Err(SystemError::ENOSYS);
     }
@@ -960,6 +1069,38 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
     }
 
+    // Identity and attribute publication are independent of the established
+    // fallocate arguments and fd-private state; keep those contracts explicit.
+    #[allow(clippy::too_many_arguments)]
+    fn fallocate_file_with_inode_context(
+        &self,
+        mode: i32,
+        offset: usize,
+        len: usize,
+        lock_owner: u64,
+        attrib: &mut AttribStageObserver<'_>,
+        data: MutexGuard<FilePrivateData>,
+        context: &permission::InodeOpContext,
+    ) -> Result<(), SystemError> {
+        if context.is_idmapped() {
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        }
+        self.fallocate_file(mode, offset, len, lock_owner, attrib, data)
+    }
+
+    fn fallocate_resize_atomic_with_inode_context(
+        &self,
+        offset: usize,
+        requested_end: usize,
+        lock_owner: u64,
+        context: &permission::InodeOpContext,
+    ) -> Result<SetMetadataMask, SystemError> {
+        if context.is_idmapped() {
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        }
+        self.fallocate_resize_atomic(offset, requested_end, lock_owner)
+    }
+
     /// # 在inode的指定偏移量开始，读取指定大小的数据，忽略PageCache
     ///
     /// ## 参数
@@ -995,6 +1136,118 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         _data: MutexGuard<FilePrivateData>,
     ) -> Result<DelegatedWriteResult, SystemError> {
         Err(SystemError::ENOSYS)
+    }
+
+    /// Primary content write with the identity of the selected mount.
+    fn write_at_with_inode_context(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &[u8],
+        data: MutexGuard<FilePrivateData>,
+        context: &permission::InodeOpContext,
+        stage: &mut WritePrivilegeStage<'_>,
+    ) -> Result<usize, SystemError> {
+        if context.is_idmapped() {
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        }
+        self.write_at_with_privilege_stage(offset, len, buf, data, stage)
+    }
+
+    fn write_direct_with_inode_context(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &[u8],
+        data: MutexGuard<FilePrivateData>,
+        context: &permission::InodeOpContext,
+        stage: &mut WritePrivilegeStage<'_>,
+    ) -> Result<usize, SystemError> {
+        if context.is_idmapped() {
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        }
+        self.write_direct_with_privilege_stage(offset, len, buf, data, stage)
+    }
+
+    fn write_at_with_privilege_stage(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &[u8],
+        data: MutexGuard<FilePrivateData>,
+        _stage: &mut WritePrivilegeStage<'_>,
+    ) -> Result<usize, SystemError> {
+        self.write_at(offset, len, buf, data)
+    }
+
+    fn write_primary_with_privilege_stage(
+        &self,
+        offset: usize,
+        len: usize,
+        source: PrimaryWriteSource<'_, '_>,
+        data: MutexGuard<FilePrivateData>,
+        stage: &mut WritePrivilegeStage<'_>,
+    ) -> Result<usize, SystemError> {
+        source.with_buffer(len, |buffer| {
+            self.write_at_with_privilege_stage(offset, len.min(buffer.len()), buffer, data, stage)
+        })
+    }
+
+    fn write_primary_with_inode_context(
+        &self,
+        offset: usize,
+        len: usize,
+        source: PrimaryWriteSource<'_, '_>,
+        data: MutexGuard<FilePrivateData>,
+        context: &permission::InodeOpContext,
+        stage: &mut WritePrivilegeStage<'_>,
+    ) -> Result<usize, SystemError> {
+        if context.is_idmapped() {
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        }
+        self.write_primary_with_privilege_stage(offset, len, source, data, stage)
+    }
+
+    fn write_direct_with_privilege_stage(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &[u8],
+        data: MutexGuard<FilePrivateData>,
+        _stage: &mut WritePrivilegeStage<'_>,
+    ) -> Result<usize, SystemError> {
+        self.write_direct(offset, len, buf, data)
+    }
+
+    fn write_at_with_sync_with_privilege_stage(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &[u8],
+        sync: WriteSyncIntent,
+        data: MutexGuard<FilePrivateData>,
+        _stage: &mut WritePrivilegeStage<'_>,
+    ) -> Result<DelegatedWriteResult, SystemError> {
+        self.write_at_with_sync(offset, len, buf, sync, data)
+    }
+
+    // Preserve the delegated-write contract while carrying mount identity and
+    // the separately owned notification stage.
+    #[allow(clippy::too_many_arguments)]
+    fn write_at_with_sync_with_inode_context(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &[u8],
+        sync: WriteSyncIntent,
+        data: MutexGuard<FilePrivateData>,
+        context: &permission::InodeOpContext,
+        stage: &mut WritePrivilegeStage<'_>,
+    ) -> Result<DelegatedWriteResult, SystemError> {
+        if context.is_idmapped() {
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        }
+        self.write_at_with_sync_with_privilege_stage(offset, len, buf, sync, data, stage)
     }
 
     /// # 在inode的指定偏移量开始，写入指定大小的数据，忽略PageCache
@@ -1189,6 +1442,60 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         self.set_metadata_masked(&current, mask)
     }
 
+    fn resize_with_metadata_context(
+        &self,
+        len: usize,
+        lock_owner: u64,
+        metadata: &Metadata,
+        mask: SetMetadataMask,
+        context: &permission::InodeOpContext,
+    ) -> Result<SetMetadataMask, SystemError> {
+        if context.is_idmapped() {
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        }
+        self.resize_with_metadata(len, lock_owner, metadata, mask)
+            .map(|_| mask)
+    }
+
+    fn resize_with_metadata_result(
+        &self,
+        len: usize,
+        lock_owner: u64,
+        metadata: &Metadata,
+        mask: SetMetadataMask,
+    ) -> Result<SetMetadataMask, SystemError> {
+        self.resize_with_metadata(len, lock_owner, metadata, mask)?;
+        Ok(mask)
+    }
+
+    fn resize_file_with_metadata_context(
+        &self,
+        len: usize,
+        lock_owner: u64,
+        data: MutexGuard<FilePrivateData>,
+        metadata: &Metadata,
+        mask: SetMetadataMask,
+        context: &permission::InodeOpContext,
+    ) -> Result<SetMetadataMask, SystemError> {
+        if context.is_idmapped() {
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        }
+        self.resize_file_with_metadata(len, lock_owner, data, metadata, mask)
+            .map(|_| mask)
+    }
+
+    fn resize_file_with_metadata_result(
+        &self,
+        len: usize,
+        lock_owner: u64,
+        data: MutexGuard<FilePrivateData>,
+        metadata: &Metadata,
+        mask: SetMetadataMask,
+    ) -> Result<SetMetadataMask, SystemError> {
+        self.resize_file_with_metadata(len, lock_owner, data, metadata, mask)?;
+        Ok(mask)
+    }
+
     /// @brief 在当前目录下创建一个新的inode
     ///
     /// @param name 目录项的名字
@@ -1256,6 +1563,97 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         Ok(inode)
     }
 
+    /// Explicit backing creation identity. Unsupported backends must never
+    /// silently drop a nonidentity mapping; old kernel callers retain their API.
+    fn create_with_context(
+        &self,
+        name: &str,
+        file_type: FileType,
+        mode: InodeMode,
+        context: &permission::InodeOpContext,
+    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+        if context.is_idmapped() {
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        }
+        self.create(name, file_type, mode)
+    }
+
+    fn create_with_data_context(
+        &self,
+        name: &str,
+        file_type: FileType,
+        mode: InodeMode,
+        data: usize,
+        context: &permission::InodeOpContext,
+    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+        if context.is_idmapped() {
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        }
+        self.create_with_data(name, file_type, mode, data)
+    }
+
+    fn mkdir_with_context(
+        &self,
+        name: &str,
+        mode: InodeMode,
+        context: &permission::InodeOpContext,
+    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+        if context.is_idmapped() {
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        }
+        self.mkdir(name, mode)
+    }
+
+    fn symlink_with_context(
+        &self,
+        name: &str,
+        target: &str,
+        context: &permission::InodeOpContext,
+    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+        if context.is_idmapped() {
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        }
+        self.symlink(name, target)
+    }
+
+    fn mknod_with_context(
+        &self,
+        name: &str,
+        mode: InodeMode,
+        dev: DeviceNumber,
+        context: &permission::InodeOpContext,
+    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+        if context.is_idmapped() {
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        }
+        self.mknod(name, mode, dev)
+    }
+
+    fn tmpfile_with_context(
+        &self,
+        mode: InodeMode,
+        flags: &FileFlags,
+        context: &permission::InodeOpContext,
+    ) -> Result<UnlinkedFile, SystemError> {
+        if context.is_idmapped() {
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        }
+        self.tmpfile(mode, flags)
+    }
+
+    fn create_and_open_with_context(
+        &self,
+        name: &str,
+        mode: InodeMode,
+        flags: &FileFlags,
+        context: &permission::InodeOpContext,
+    ) -> Result<PreopenedFile, SystemError> {
+        if context.is_idmapped() {
+            return Err(SystemError::ENOSYS);
+        }
+        self.create_and_open(name, mode, flags)
+    }
+
     /// @brief 在当前目录下，创建一个名为Name的硬链接，指向另一个IndexNode
     ///
     /// @param name 硬链接的名称
@@ -1310,6 +1708,42 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         self.rmdir(name)
     }
 
+    fn unlink_with_inode_context(
+        &self,
+        name: &str,
+        mutation: &mount::DentryMutationContext<'_>,
+        context: &permission::InodeOpContext,
+    ) -> Result<LinkRemovalOutcome, SystemError> {
+        if context.is_idmapped() {
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        }
+        self.unlink_with_context(name, mutation)
+    }
+
+    fn link_with_inode_context(
+        &self,
+        name: &str,
+        other: &Arc<dyn IndexNode>,
+        context: &permission::InodeOpContext,
+    ) -> Result<(), SystemError> {
+        if context.is_idmapped() {
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        }
+        self.link(name, other)
+    }
+
+    fn rmdir_with_inode_context(
+        &self,
+        name: &str,
+        mutation: &mount::DentryMutationContext<'_>,
+        context: &permission::InodeOpContext,
+    ) -> Result<(), SystemError> {
+        if context.is_idmapped() {
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        }
+        self.rmdir_with_context(name, mutation)
+    }
+
     /// 将指定的`old_name`子目录项移动到target目录下, 并予以`new_name`。
     ///
     /// # Behavior
@@ -1337,6 +1771,23 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         self.move_to(old_name, target, new_name, flag)
     }
 
+    /// A backend receives the mapping selected by its immediate mount wrapper,
+    /// independently of the topology mutation context shared by stacked views.
+    fn move_to_with_inode_context(
+        &self,
+        old_name: &str,
+        target: &Arc<dyn IndexNode>,
+        new_name: &str,
+        flag: RenameFlags,
+        mutation: &mount::DentryMutationContext<'_>,
+        context: &permission::InodeOpContext,
+    ) -> Result<RenameOutcome, SystemError> {
+        if context.is_idmapped() {
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        }
+        self.move_to_with_context(old_name, target, new_name, flag, mutation)
+    }
+
     /// @brief 专用于 remote 权限模型下 access(2) 的检查
     fn check_access(&self, _mask: PermissionMask) -> Result<(), SystemError> {
         Err(SystemError::ENOSYS)
@@ -1351,6 +1802,12 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     fn find(&self, _name: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
         // 若文件系统没有实现此方法，则返回"不支持"
         return Err(SystemError::ENOSYS);
+    }
+
+    /// Follow existing mount projections without triggering a new automount.
+    /// Raw backends have no mount traversal to suppress.
+    fn find_no_automount(&self, name: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
+        self.find(name)
     }
 
     /// Lookup from an authoritative in-memory name cache without backend I/O.
@@ -1686,6 +2143,23 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         None
     }
 
+    /// Filesystem-specific DAC policy. Mount and immutable checks remain in
+    /// check_inode_permission(), outside this narrowly scoped override.
+    fn check_dac_permission(
+        &self,
+        metadata: &Metadata,
+        mask: PermissionMask,
+    ) -> Result<(), SystemError> {
+        ProcessManager::current_pcb()
+            .cred()
+            .inode_permission(metadata, mask.bits())
+    }
+
+    /// Authorize following a dynamic symlink without changing O_PATH|NOFOLLOW.
+    fn check_symlink_access(&self) -> Result<(), SystemError> {
+        Ok(())
+    }
+
     /// Stable classification of a magic symlink, independent of whether its
     /// target can still be resolved at the instant of lookup.
     fn is_magic_link(&self) -> bool {
@@ -1790,6 +2264,19 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
             crate::libs::name::get_type_name(&self)
         );
         return Err(SystemError::ENOSYS);
+    }
+
+    /// Internal privilege removal after a content/ownership mutation has been
+    /// authorized. This must not require the user's CAP_SETFCAP: it only
+    /// removes privileges, never grants them. Mount and stacked filesystems
+    /// must forward this operation without entering their user xattr API.
+    fn remove_security_privileges(&self) -> Result<(), SystemError> {
+        match self.removexattr("security.capability") {
+            Ok(_)
+            | Err(SystemError::ENODATA | SystemError::ENOSYS)
+            | Err(SystemError::EOPNOTSUPP_OR_ENOTSUP) => Ok(()),
+            Err(error) => Err(error),
+        }
     }
 
     /// # 将当前Inode转换为 Socket 引用
@@ -1942,6 +2429,29 @@ impl dyn IndexNode {
             Some(start.derive()?),
             false,
             None,
+        )? {
+            PathWalkOutcome::Found(_, ownership) => ownership.ok_or(SystemError::ESTALE),
+            PathWalkOutcome::MissingFinal { .. } => Err(SystemError::ENOENT),
+        }
+    }
+
+    /// Owned non-creating lookup with explicit walk constraints. Keep the
+    /// same mount/operation pin transfers as the ordinary owned walk.
+    pub fn lookup_follow_symlink_with_options_owned(
+        &self,
+        start: &utils::ResolvedPath,
+        path: &str,
+        max_follow_times: usize,
+        follow_final_symlink: bool,
+        options: &utils::PathWalkOptions,
+    ) -> Result<utils::ResolvedPath, SystemError> {
+        match self.do_lookup_follow_symlink_owned(
+            path,
+            max_follow_times,
+            follow_final_symlink,
+            Some(start.derive()?),
+            false,
+            Some(options),
         )? {
             PathWalkOutcome::Found(_, ownership) => ownership.ok_or(SystemError::ESTALE),
             PathWalkOutcome::MissingFinal { .. } => Err(SystemError::ENOENT),
@@ -2182,6 +2692,11 @@ impl dyn IndexNode {
                 }
             } else if cache_only {
                 result.cached_find(&name)
+            } else if !has_more_components
+                && !trailing_slash
+                && options.is_some_and(|options| options.no_automount)
+            {
+                result.find_no_automount(&name)
             } else {
                 result.find(&name)
             };
@@ -2272,6 +2787,8 @@ impl dyn IndexNode {
                 if cache_only && inode.is_magic_link() {
                     return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
                 }
+
+                inode.check_symlink_access()?;
 
                 // 首先检查是否是"魔法链接"（如 /proc/self/fd/N）
                 // 这些链接的 readlink 返回的路径可能不可解析（如 pipe:[xxx]），
@@ -2438,7 +2955,8 @@ pub struct Metadata {
     /// Inode所在的文件系统中，每个块的大小
     pub blk_size: usize,
 
-    /// Inode所占的块的数目
+    /// 实际分配的512字节扇区数，与blk_size这个I/O提示无关。
+    /// 零是合法的稀疏/inline/伪文件值，不能从size推算替代。
     pub blocks: usize,
 
     /// inode最后一次被访问的时间
@@ -2629,6 +3147,12 @@ pub trait FileSystemSyncGuard: Send {}
 
 /// @brief 所有文件系统都应该实现的trait
 pub trait FileSystem: Any + Sync + Send + Debug {
+    /// Admit the writable backing layers before VFS enters dentry or backend
+    /// locks. The returned tokens cover the complete outer mutation, including
+    /// cleanup after a layered namespace commit.
+    fn prepare_write(&self) -> Result<Vec<mount::writer::MountWriteGuard>, SystemError> {
+        Ok(Vec::new())
+    }
     /// Called before a synchronous PageCache wait, not after it. Backends
     /// with accepted asynchronous metadata use this to push the relevant
     /// batches; the PageCache range still defines the finite completion target.
@@ -2754,6 +3278,23 @@ pub trait FileSystem: Any + Sync + Send + Debug {
             return Err(SystemError::EINVAL);
         }
         Ok(request.sb_flags & request.sb_flags_mask)
+    }
+
+    /// Opt in only when all ownership-sensitive operations honor the mount's
+    /// explicit identity context; projecting stat results alone is insufficient.
+    fn supports_idmapped_mounts(&self) -> bool {
+        false
+    }
+
+    /// Native parameter parsers validate before the context stores a value.
+    /// Legacy filesystems keep deferring private-option parsing to reconfigure.
+    /// This hook must not mutate the live filesystem or acquire resources.
+    fn validate_reconfigure_parameter(
+        &self,
+        _key: &str,
+        _value: Option<&str>,
+    ) -> Result<(), SystemError> {
+        Ok(())
     }
 
     /// Stop admitting new external inode lifetimes during final superblock
@@ -2923,6 +3464,12 @@ pub trait MountableFileSystem: FileSystem {
     /// options may accept fsconfig's flag/string parameter stream.
     const SUPPORTS_FSCONFIG_LEGACY_OPTIONS: bool = false;
 
+    /// Validate one creation parameter without retaining resources or changing
+    /// filesystem state. Makers without incremental parsers validate at CREATE.
+    fn validate_fsconfig_parameter(_key: &str, _value: Option<&str>) -> Result<(), SystemError> {
+        Ok(())
+    }
+
     /// Let a filesystem pin resources named by an fsconfig string parameter
     /// when the parameter is supplied, not later at CREATE. The default
     /// retains the previous state for filesystems without pathname options.
@@ -2988,6 +3535,13 @@ pub trait MountableFileSystem: FileSystem {
 macro_rules! register_mountable_fs {
     ($fs:ident, $maker_name:ident, $fs_name:literal) => {
         impl $fs {
+            fn validate_fsconfig_parameter_bridge(
+                key: &str,
+                value: Option<&str>,
+            ) -> Result<(), SystemError> {
+                <$fs as MountableFileSystem>::validate_fsconfig_parameter(key, value)
+            }
+
             fn prepare_fsconfig_string_bridge(
                 key: &str,
                 value: &str,
@@ -3055,15 +3609,18 @@ macro_rules! register_mountable_fs {
                         &str,
                     )
                         -> Result<Option<Arc<dyn FileSystemMakerData + 'static>>, SystemError>),
-                &($fs::prepare_fsconfig_string_bridge
-                    as fn(
-                        &str,
-                        &str,
-                        Option<&$crate::filesystem::vfs::FsconfigPreparedData>,
-                    ) -> Result<
-                        Option<$crate::filesystem::vfs::FsconfigPreparedData>,
-                        SystemError,
-                    >),
+                $crate::filesystem::vfs::FsconfigParameterOps {
+                    prepare_string: &($fs::prepare_fsconfig_string_bridge
+                        as fn(
+                            &str,
+                            &str,
+                            Option<&$crate::filesystem::vfs::FsconfigPreparedData>,
+                        ) -> Result<
+                            Option<$crate::filesystem::vfs::FsconfigPreparedData>,
+                            SystemError,
+                        >),
+                    validate: $fs::validate_fsconfig_parameter_bridge,
+                },
                 <$fs as MountableFileSystem>::SUPPORTS_FSCONFIG_LEGACY_OPTIONS,
             );
     };
@@ -3099,6 +3656,13 @@ impl Metadata {
         }
     }
 }
+/// Incremental parameter handling has two distinct stages: pure validation
+/// first, then optional resource retention for string parameters.
+pub struct FsconfigParameterOps {
+    pub prepare_string: &'static FsconfigStringPreparer,
+    pub validate: fn(&str, Option<&str>) -> Result<(), SystemError>,
+}
+
 pub struct FileSystemMaker {
     /// 文件系统的创建函数
     maker: &'static FSMakerFunction,
@@ -3108,7 +3672,7 @@ pub struct FileSystemMaker {
     builder: &'static MountDataBuilder,
     legacy_maker: &'static LegacyFSMakerFunction,
     legacy_builder: &'static LegacyMountDataBuilder,
-    prepare_fsconfig_string: &'static FsconfigStringPreparer,
+    fsconfig: FsconfigParameterOps,
     supports_fsconfig_legacy_options: bool,
 }
 
@@ -3119,7 +3683,7 @@ impl FileSystemMaker {
         builder: &'static MountDataBuilder,
         legacy_maker: &'static LegacyFSMakerFunction,
         legacy_builder: &'static LegacyMountDataBuilder,
-        prepare_fsconfig_string: &'static FsconfigStringPreparer,
+        fsconfig: FsconfigParameterOps,
         supports_fsconfig_legacy_options: bool,
     ) -> FileSystemMaker {
         FileSystemMaker {
@@ -3128,7 +3692,7 @@ impl FileSystemMaker {
             builder,
             legacy_maker,
             legacy_builder,
-            prepare_fsconfig_string,
+            fsconfig,
             supports_fsconfig_legacy_options,
         }
     }
@@ -3137,13 +3701,21 @@ impl FileSystemMaker {
         self.supports_fsconfig_legacy_options
     }
 
+    pub fn validate_fsconfig_parameter(
+        &self,
+        key: &str,
+        value: Option<&str>,
+    ) -> Result<(), SystemError> {
+        (self.fsconfig.validate)(key, value)
+    }
+
     pub fn prepare_fsconfig_string(
         &self,
         key: &str,
         value: &str,
         previous: Option<&FsconfigPreparedData>,
     ) -> Result<Option<FsconfigPreparedData>, SystemError> {
-        (self.prepare_fsconfig_string)(key, value, previous)
+        (self.fsconfig.prepare_string)(key, value, previous)
     }
 
     pub fn build(

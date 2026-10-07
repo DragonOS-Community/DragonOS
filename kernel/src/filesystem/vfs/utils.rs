@@ -53,12 +53,15 @@ pub enum OwnedLookupOutcome {
     },
 }
 
-/// Constraints for one openat2 path walk. Ordinary VFS lookups do not create
-/// this object and retain their existing fast path.
+/// Optional pathname-walk constraints. Ordinary VFS lookups retain their
+/// existing fast path when no constraints are requested.
 #[derive(Debug)]
 pub struct PathWalkOptions {
     pub resolve: OpenHowResolve,
     pub scope_root: Option<ResolvedPath>,
+    /// Suppress a new automount at the final component, not existing mounts
+    /// or traversal needed for an intermediate component/trailing slash.
+    pub(crate) no_automount: bool,
     epoch: usize,
 }
 
@@ -72,6 +75,7 @@ impl PathWalkOptions {
         Self {
             resolve,
             scope_root,
+            no_automount: false,
             epoch,
         }
     }

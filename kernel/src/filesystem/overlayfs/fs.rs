@@ -417,6 +417,9 @@ pub(super) struct OverlayFS {
     pub(super) numdatalayer: usize,
     pub(super) layers: Vec<OvlLayer>, // index 0 is upper when present; lowers have index >= 1
     pub(super) workdir: Option<Arc<dyn IndexNode>>,
+    // Immutable backing identity: admission must not take upper_inode or
+    // copy-up locks merely to find the mount on which it is about to write.
+    write_mount: Option<vfs::mount::MountExternalGuard>,
     pub(super) root_inode: Arc<OvlInode>,
     pub(super) super_block: SuperBlock,
     pub(super) mutation_lock: Mutex<()>,
@@ -434,6 +437,14 @@ pub(super) struct OverlayFS {
 }
 
 impl FileSystem for OverlayFS {
+    fn prepare_write(&self) -> Result<Vec<vfs::mount::writer::MountWriteGuard>, SystemError> {
+        let mut writers = Vec::new();
+        if let Some(mount) = &self.write_mount {
+            writers.try_reserve(1).map_err(|_| SystemError::ENOMEM)?;
+            writers.push(mount.mount().want_write_from(mount)?);
+        }
+        Ok(writers)
+    }
     fn required_superblock_flags(&self) -> crate::filesystem::vfs::mount::MountFlags {
         if self.ovl_upper_mnt().is_none() {
             crate::filesystem::vfs::mount::MountFlags::RDONLY
@@ -1136,6 +1147,11 @@ impl MountableFileSystem for OverlayFS {
         let samefs = lower_roots.iter().all(|(_, lower)| {
             Arc::ptr_eq(&reference_backing_fs, &Self::canonical_backing_fs(lower))
         });
+        let write_mount = upper_inode
+            .as_ref()
+            .and_then(|upper| upper.fs().downcast_arc::<MountFS>())
+            .map(|mount| mount.try_pin_external())
+            .transpose()?;
         let root_inode = Arc::new(OvlInode::new(
             String::new(),
             FileType::Dir,
@@ -1162,6 +1178,7 @@ impl MountableFileSystem for OverlayFS {
                 numdatalayer: lower_roots.len(),
                 layers,
                 workdir: workdir_inode,
+                write_mount,
                 root_inode,
                 super_block: super_block.clone(),
                 mutation_lock: Mutex::new(()),

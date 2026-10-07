@@ -30,7 +30,7 @@ impl MountProcFields {
         let devname = render_devname(&mount)?;
         let mountinfo_root = entry.mountinfo_root.clone();
         let per_mount_options = entry.per_mount_options.clone();
-        let mut mounts_options = per_mount_options.clone();
+        let mut mounts_options = entry.mounts_options.clone();
         append_fs_mount_options(&mount, &mut mounts_options)?;
         let mut super_block_options = entry.super_block_options.clone();
         append_fs_mount_options(&mount, &mut super_block_options)?;

@@ -2,3 +2,4 @@
 //! syscalls. Topology changes remain owned by the mount and namespace layers.
 
 pub mod context;
+pub(crate) mod reconfigure;

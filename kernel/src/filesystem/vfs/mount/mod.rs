@@ -1,5 +1,5 @@
 use super::{
-    file::{File, FileFlags, PreopenedFile},
+    file::{CreatedFile, File, FileFlags, PreopenedFile},
     utils::DName,
     DelegatedWriteResult, DirectoryEntry, FilePrivateData, FileSystem, FileType, IndexNode,
     InodeId, InodeMode, InodeRetentionKind, LinkRemovalOutcome, PollableInode, RenameOutcome,
@@ -56,7 +56,12 @@ use ida::IdAllocator;
 use lazy_static::lazy_static;
 use system_error::SystemError;
 
+pub mod attributes;
+mod filecaps;
+pub mod idmap;
+mod operations;
 mod selftest;
+pub mod writer;
 pub(crate) use selftest::run_mount_wrapper_cache_debug_selftest;
 
 /// Serializes mount pin admission against multi-mount busy preflight and
@@ -234,6 +239,7 @@ fn with_dentry_mount_gate_set<T>(
 /// inversion and holding a system-wide lock across file-data I/O.
 pub struct DentryMutationContext<'a> {
     guard: RefCell<Option<RwSemWriteGuard<'a, ()>>>,
+    writers: RefCell<Vec<writer::MountWriteGuard>>,
 }
 
 type RenamePreCommit<'a> =
@@ -263,11 +269,37 @@ impl DentryMutationContext<'static> {
     fn new() -> Self {
         Self {
             guard: RefCell::new(None),
+            writers: RefCell::new(Vec::new()),
         }
     }
 }
 
 impl DentryMutationContext<'_> {
+    fn admit_mount(&self, mount: &Arc<MountFS>) -> Result<(), SystemError> {
+        if self
+            .writers
+            .borrow()
+            .iter()
+            .any(|writer| writer.covers(mount))
+        {
+            // An existing token prevents a successful mount hold. Recheck
+            // readonly for emergency/forced superblock transitions.
+            return if mount.is_readonly() {
+                Err(SystemError::EROFS)
+            } else {
+                Ok(())
+            };
+        }
+        assert!(
+            self.guard.borrow().is_none(),
+            "new mount writer after topology commit"
+        );
+        let writer = mount.want_write()?;
+        let mut writers = self.writers.borrow_mut();
+        writers.try_reserve(1).map_err(|_| SystemError::ENOMEM)?;
+        writers.push(writer);
+        Ok(())
+    }
     /// Enter the namespace commit phase.  The guard remains owned by this
     /// context until the outermost mount wrapper has updated every alias.
     pub(crate) fn ensure_locked(&self) {
@@ -581,6 +613,11 @@ pub struct MountFS {
     mount_id: MountId,
 
     mount_flags: RwSem<MountFlags>,
+    /// Ownership projection belongs to a mount view, never its shared inode.
+    mount_idmap: RwSem<Option<Arc<idmap::MountIdmap>>>,
+    // Accessed only under super_block_state.writer_gate.
+    writer_count: AtomicUsize,
+    writer_hold: AtomicBool,
     super_block_state: Arc<SuperBlockState>,
     mount_source: RwSem<Option<String>>,
     /// Internal `MNT_LOCK_*` state; never exposed as userspace `MS_*` bits.
@@ -798,7 +835,9 @@ pub struct SuperBlockState {
     owner_user_ns: Arc<UserNamespace>,
     flags: RwSem<MountFlags>,
     synchronous: AtomicBool,
-    write_count: AtomicUsize,
+    writer_gate: Mutex<writer::WriterAdmissionState>,
+    writer_wait: WaitQueue,
+    pending_removals: AtomicUsize,
     wb_error: ErrSeq,
     umount_lock: RwSem<()>,
     unnamed_dev_minor: Mutex<Option<u32>>,
@@ -1098,7 +1137,9 @@ impl SuperBlockState {
             owner_user_ns,
             flags: RwSem::new(flags),
             synchronous: AtomicBool::new(flags.contains(MountFlags::SYNCHRONOUS)),
-            write_count: AtomicUsize::new(0),
+            writer_gate: Mutex::new(writer::WriterAdmissionState::default()),
+            writer_wait: WaitQueue::default(),
+            pending_removals: AtomicUsize::new(0),
             wb_error: ErrSeq::new(),
             umount_lock: RwSem::new(()),
             unnamed_dev_minor: Mutex::new(None),
@@ -1615,6 +1656,11 @@ impl SuperBlockState {
     }
 
     pub fn set_flags(&self, flags: MountFlags) {
+        let _gate = self.writer_gate.lock();
+        self.set_flags_under_writer_gate(flags);
+    }
+
+    fn set_flags_under_writer_gate(&self, flags: MountFlags) {
         let flags = flags & MountFlags::SB_SETTABLE_MASK;
         let mut current = self.flags.write();
         *current = flags;
@@ -1624,18 +1670,6 @@ impl SuperBlockState {
 
     pub fn is_synchronous(&self) -> bool {
         self.synchronous.load(Ordering::Acquire)
-    }
-
-    pub fn inc_write_count(&self) {
-        self.write_count.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn dec_write_count(&self) {
-        self.write_count.fetch_sub(1, Ordering::Relaxed);
-    }
-
-    pub fn has_writers(&self) -> bool {
-        self.write_count.load(Ordering::Acquire) != 0
     }
 
     pub fn sample_wb_error(&self) -> ErrSeqValue {
@@ -1709,6 +1743,14 @@ impl Hash for MountFS {
 }
 
 impl Eq for MountFS {}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MountLookupPolicy {
+    Follow,
+    FollowNoAutomount,
+    Reject,
+    Backing,
+}
 
 /// @brief The Index Node of MountFS. Note that this IndexNode is merely an intermediary layer.
 /// Its purpose is to connect the concrete filesystem's Inode with the mount mechanism.
@@ -1839,6 +1881,9 @@ impl MountFS {
             propagation,
             mount_id: MountId::alloc(),
             mount_flags: RwSem::new(mount_flags),
+            mount_idmap: RwSem::new(None),
+            writer_count: AtomicUsize::new(0),
+            writer_hold: AtomicBool::new(false),
             super_block_state: state_init.super_block_state,
             mount_source: RwSem::new(state_init.mount_source),
             mount_locks: AtomicU32::new(0),
@@ -1900,6 +1945,9 @@ impl MountFS {
             propagation: new_propagation,
             mount_id: MountId::alloc(),
             mount_flags: RwSem::new(self.mount_flags()),
+            mount_idmap: RwSem::new(self.idmap()),
+            writer_count: AtomicUsize::new(0),
+            writer_hold: AtomicBool::new(false),
             super_block_state: self.super_block_state.clone(),
             mount_source: RwSem::new(mount_source),
             mount_locks: AtomicU32::new(self.mount_locks.load(Ordering::Acquire)),
@@ -2150,23 +2198,29 @@ impl MountFS {
         self.super_block_state.has_writers()
     }
 
-    pub fn inc_write_count(&self) {
-        self.super_block_state.inc_write_count();
-    }
-
-    pub fn dec_write_count(&self) {
-        self.super_block_state.dec_write_count();
-    }
-
     pub fn super_block_state(&self) -> Arc<SuperBlockState> {
         self.super_block_state.clone()
     }
 
     pub fn set_mount_flags(&self, mount_flags: MountFlags) {
+        let _gate = self.super_block_state.writer_gate.lock();
         *self.mount_flags.write() = mount_flags;
     }
 
+    pub fn idmap(&self) -> Option<Arc<idmap::MountIdmap>> {
+        self.mount_idmap.read().clone()
+    }
+
+    /// Called only by the prepared attribute transaction with writer admission
+    /// held. A mount's ownership projection can be installed once, not replaced.
+    pub(crate) fn install_idmap_under_writer_gate(&self, idmap: Arc<idmap::MountIdmap>) {
+        let mut installed = self.mount_idmap.write();
+        assert!(installed.is_none());
+        *installed = Some(idmap);
+    }
+
     pub fn update_mount_flags(&self, update: impl FnOnce(&mut MountFlags)) {
+        let _gate = self.super_block_state.writer_gate.lock();
         let mut mount_flags = self.mount_flags.write();
         update(&mut mount_flags);
     }
@@ -3406,6 +3460,27 @@ impl MountFS {
 
     fn derive_external_pin(&self) -> Result<MountExternalGuard, SystemError> {
         let mut lifecycle = self.lifecycle.lock();
+        self.derive_external_pin_locked(&mut lifecycle)
+    }
+
+    /// Clone a counted owner under the same short lifecycle lock used by its
+    /// final release. Existing ownership prevents ordinary umount from passing
+    /// busy preflight, so nested backing operations need no topology lock.
+    /// The ownerless fallback is only for the outermost operation, before any
+    /// dentry, topology or filesystem lock has been acquired.
+    pub(crate) fn pin_operation_owner(&self) -> Result<MountExternalGuard, SystemError> {
+        let mut lifecycle = self.lifecycle.lock();
+        if lifecycle.external_pins != 0 {
+            return self.derive_external_pin_locked(&mut lifecycle);
+        }
+        drop(lifecycle);
+        self.try_pin_external()
+    }
+
+    fn derive_external_pin_locked(
+        &self,
+        lifecycle: &mut MountLifecycle,
+    ) -> Result<MountExternalGuard, SystemError> {
         let component = match lifecycle.state {
             MountLifecycleState::Constructing => {
                 return Err(SystemError::EBUSY);
@@ -3962,9 +4037,12 @@ impl MountFSInode {
         dev_t: DeviceNumber,
         post_commit: impl FnOnce(),
     ) -> Result<(), SystemError> {
-        self.ensure_mount_writable()?;
+        let _writer = self.ensure_mount_writable()?;
         let _children_guard = self.dentry.children_gate.lock();
-        self.dentry.inode.mknod(filename, mode, dev_t)?;
+        let operation = self.op_context();
+        self.dentry
+            .inode
+            .mknod_with_context(filename, mode, dev_t, &operation)?;
         post_commit();
         Ok(())
     }
@@ -3978,17 +4056,24 @@ impl MountFSInode {
         mode: InodeMode,
         flags: &FileFlags,
         post_commit: impl FnOnce(),
-    ) -> Result<(Arc<dyn IndexNode>, Option<PreopenedFile>), SystemError> {
-        self.ensure_mount_writable()?;
+    ) -> Result<CreatedFile, SystemError> {
+        let _writer = self.ensure_mount_writable()?;
         let _children_guard = self.dentry.children_gate.lock();
-        let (inner_inode, mut preopened) =
-            match self.dentry.inode.create_and_open(name, mode, flags) {
-                Ok(opened) => (opened.inode(), Some(opened)),
-                Err(SystemError::ENOSYS) => {
-                    (self.dentry.inode.create(name, FileType::File, mode)?, None)
-                }
-                Err(err) => return Err(err),
-            };
+        let operation = self.op_context();
+        let (inner_inode, preopened) = match self
+            .dentry
+            .inode
+            .create_and_open_with_context(name, mode, flags, &operation)
+        {
+            Ok(opened) => (opened.inode(), Some(opened)),
+            Err(SystemError::ENOSYS) => (
+                self.dentry
+                    .inode
+                    .create_with_context(name, FileType::File, mode, &operation)?,
+                None,
+            ),
+            Err(err) => return Err(err),
+        };
         // The backing namespace mutation is now committed.  Publish CREATE
         // before Mount wrapper construction, which may still fail just as a
         // later file-open step may fail on Linux after successful creation.
@@ -4007,11 +4092,7 @@ impl MountFSInode {
                 DName::from(name),
             )?
         };
-        if let Some(opened) = preopened.as_mut() {
-            opened.replace_inode(wrapped.clone());
-        }
-        let inode: Arc<dyn IndexNode> = wrapped;
-        Ok((inode, preopened))
+        Ok(CreatedFile::new(wrapped, preopened, _writer))
     }
 
     /// Create a directory and publish its namespace event while the parent
@@ -4022,14 +4103,18 @@ impl MountFSInode {
         mode: InodeMode,
         post_commit: impl FnOnce(),
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
-        self.ensure_mount_writable()?;
+        let _writer = self.ensure_mount_writable()?;
         let _children_guard = self.dentry.children_gate.lock();
         match self.dentry.inode.find(name) {
             Ok(_) => return Err(SystemError::EEXIST),
             Err(SystemError::ENOENT) => {}
             Err(error) => return Err(error),
         }
-        let inner_inode = self.dentry.inode.mkdir(name, mode)?;
+        let operation = self.op_context();
+        let inner_inode = self
+            .dentry
+            .inode
+            .mkdir_with_context(name, mode, &operation)?;
         post_commit();
         let _namespace_guard = self
             .mount_fs
@@ -4053,9 +4138,13 @@ impl MountFSInode {
         target: &str,
         post_commit: impl FnOnce(),
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
-        self.ensure_mount_writable()?;
+        let _writer = self.ensure_mount_writable()?;
         let _children_guard = self.dentry.children_gate.lock();
-        let inner_inode = self.dentry.inode.symlink(name, target)?;
+        let operation = self.op_context();
+        let inner_inode = self
+            .dentry
+            .inode
+            .symlink_with_context(name, target, &operation)?;
         post_commit();
         let _namespace_guard = self
             .mount_fs
@@ -4112,7 +4201,7 @@ impl MountFSInode {
         context: &DentryMutationContext<'_>,
         post_commit: Option<&mut dyn FnMut()>,
     ) -> Result<LinkRemovalOutcome, SystemError> {
-        self.ensure_mount_writable()?;
+        context.admit_mount(&self.mount_fs)?;
         let _children_guard = self.dentry.children_gate.lock();
         let namespace_guard = self
             .mount_fs
@@ -4149,7 +4238,10 @@ impl MountFSInode {
         };
         let coordinator = inner.link_mutation_coordinator();
         let _link_mutation = coordinator.map(|coordinator| coordinator.lock());
-        let outcome = self.dentry.inode.unlink_with_context(name, context)?;
+        let outcome =
+            self.dentry
+                .inode
+                .unlink_with_inode_context(name, context, &self.op_context())?;
         debug_assert!(
             coordinator.is_some() || outcome == LinkRemovalOutcome::LastLink,
             "multi-link filesystem must expose a canonical link coordinator"
@@ -4225,7 +4317,7 @@ impl MountFSInode {
         context: &DentryMutationContext<'_>,
         post_commit: Option<&mut dyn FnMut()>,
     ) -> Result<(), SystemError> {
-        self.ensure_mount_writable()?;
+        context.admit_mount(&self.mount_fs)?;
         let _children_guard = self.dentry.children_gate.lock();
         let namespace_guard = self
             .mount_fs
@@ -4262,7 +4354,9 @@ impl MountFSInode {
         };
         let coordinator = inner.link_mutation_coordinator();
         let _link_mutation = coordinator.map(|coordinator| coordinator.lock());
-        self.dentry.inode.rmdir_with_context(name, context)?;
+        self.dentry
+            .inode
+            .rmdir_with_inode_context(name, context, &self.op_context())?;
         let link_epoch = coordinator.map_or_else(
             || {
                 self.mount_fs
@@ -4336,7 +4430,7 @@ impl MountFSInode {
         other: &Arc<dyn IndexNode>,
         post_commit: impl FnOnce(),
     ) -> Result<(), SystemError> {
-        self.ensure_mount_writable()?;
+        let _writer = self.ensure_mount_writable()?;
         let _children_guard = self.dentry.children_gate.lock();
         // Backing filesystems expect their own inode type rather than the
         // mount projection used by syscall paths.
@@ -4354,7 +4448,13 @@ impl MountFSInode {
         });
         let coordinator = other_inner.link_mutation_coordinator();
         let _link_mutation = coordinator.map(|coordinator| coordinator.lock());
-        self.dentry.inode.link(name, &other_inner)?;
+        let source_metadata = other.metadata()?;
+        if source_metadata.uid == u32::MAX as usize || source_metadata.gid == u32::MAX as usize {
+            return Err(SystemError::EPERM);
+        }
+        self.dentry
+            .inode
+            .link_with_inode_context(name, &other_inner, &self.op_context())?;
         debug_assert!(
             other_mount.is_none() || coordinator.is_some(),
             "link-capable mounted filesystem must expose a canonical link coordinator"
@@ -4402,7 +4502,7 @@ impl MountFSInode {
             pre_commit,
             post_commit,
         } = hooks;
-        self.ensure_mount_writable()?;
+        context.admit_mount(&self.mount_fs)?;
         // Filesystem implementations generally expect `target` to be an inode
         // of the same concrete FS (e.g. tmpfs' LockedTmpfsInode). When VFS
         // mount wrapping is enabled, unwrap it before delegating.
@@ -4483,6 +4583,40 @@ impl MountFSInode {
                         return Ok(RenameOutcome::NoOp);
                     }
                 }
+                // Preserve Linux may_delete(source) -> may_delete(target)
+                // error order before syscall-specific hooks. Backends repeat
+                // these checks under their parent metadata locks at commit.
+                let operation = self.op_context();
+                let source_metadata = source_inode
+                    .as_ref()
+                    .ok_or(SystemError::ENOENT)?
+                    .metadata()?;
+                super::permission::check_inode_delete(
+                    &self.dentry.inode.metadata()?,
+                    &source_metadata,
+                    source_metadata.file_type == FileType::Dir,
+                    &operation,
+                )?;
+                if let Some(target) = target_child_inode.as_ref() {
+                    let metadata = target.metadata()?;
+                    let directory = if flags.contains(RenameFlags::EXCHANGE) {
+                        metadata.file_type == FileType::Dir
+                    } else {
+                        source_metadata.file_type == FileType::Dir
+                    };
+                    super::permission::check_inode_delete(
+                        &target_inner.metadata()?,
+                        &metadata,
+                        directory,
+                        &operation,
+                    )?;
+                } else {
+                    super::permission::check_parent_create(
+                        &target_inner.metadata()?,
+                        &operation,
+                        false,
+                    )?;
+                }
                 if let Some(pre_commit) = pre_commit {
                     pre_commit(
                         source_inode
@@ -4529,12 +4663,14 @@ impl MountFSInode {
                     .as_ref()
                     .and_then(|inode| inode.link_mutation_coordinator());
                 let _link_mutation = coordinator.map(|coordinator| coordinator.lock());
-                let outcome = self.dentry.inode.move_to_with_context(
+                let operation = self.op_context();
+                let outcome = self.dentry.inode.move_to_with_inode_context(
                     old_name,
                     &target_inner,
                     new_name,
                     flags,
                     context,
+                    &operation,
                 )?;
                 // The destination may have become a hard-link alias of the
                 // source after the syscall's optimistic lookup but before the
@@ -4884,11 +5020,15 @@ impl MountFSInode {
     }
 
     #[inline]
-    fn ensure_mount_writable(&self) -> Result<(), SystemError> {
-        if self.mount_fs.is_readonly() {
-            return Err(SystemError::EROFS);
+    fn ensure_mount_writable(&self) -> Result<writer::MountWriteGuard, SystemError> {
+        self.mount_fs.want_write()
+    }
+
+    fn ensure_io_writable(&self) -> Result<Option<writer::MountWriteGuard>, SystemError> {
+        if writer::is_special_file_type(self.dentry.file_type) {
+            return Ok(None);
         }
-        Ok(())
+        self.ensure_mount_writable().map(Some)
     }
 
     pub(crate) fn mount_subtree(
@@ -5364,10 +5504,45 @@ impl MountFSInode {
         no_xdev: bool,
         cache_only: bool,
     ) -> Result<Arc<MountFSInode>, SystemError> {
-        let base = if no_xdev {
-            self.self_ref.upgrade().ok_or(SystemError::ENOENT)?
-        } else {
+        self.do_find_with_policy(
+            name,
+            if no_xdev {
+                MountLookupPolicy::Reject
+            } else {
+                MountLookupPolicy::Follow
+            },
+            cache_only,
+        )
+    }
+
+    /// Filesystem backing lookup, like Linux lookup_one_unlocked: obtain a
+    /// dentry on this mount without traversing overmounts or triggering autofs.
+    pub(crate) fn lookup_backing(&self, name: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
+        if name.is_empty()
+            || name == "."
+            || name == ".."
+            || name.bytes().any(|c| c == b'/' || c == 0)
+        {
+            return Err(SystemError::EACCES);
+        }
+        self.do_find_with_policy(name, MountLookupPolicy::Backing, false)
+            .map(|inode| inode as Arc<dyn IndexNode>)
+    }
+
+    fn do_find_with_policy(
+        &self,
+        name: &str,
+        policy: MountLookupPolicy,
+        cache_only: bool,
+    ) -> Result<Arc<MountFSInode>, SystemError> {
+        let no_xdev = policy == MountLookupPolicy::Reject;
+        let base = if matches!(
+            policy,
+            MountLookupPolicy::Follow | MountLookupPolicy::FollowNoAutomount
+        ) {
             self.overlaid_inode()
+        } else {
+            self.self_ref.upgrade().ok_or(SystemError::ENOENT)?
         };
         let (inner_inode, mount_inode) = {
             let _children_guard = if cache_only {
@@ -5411,10 +5586,14 @@ impl MountFSInode {
             };
             (inner_inode, mount_inode)
         };
+        if policy == MountLookupPolicy::Backing {
+            return Ok(mount_inode);
+        }
         // FUSE automount may acquire the global mount topology lock; never hold
         // the dentry namespace read lock across that operation.
-        if let Some(fuse_node) =
-            inner_inode.downcast_arc::<crate::filesystem::fuse::inode::FuseNode>()
+        if let Some(fuse_node) = inner_inode
+            .downcast_arc::<crate::filesystem::fuse::inode::FuseNode>()
+            .filter(|_| policy != MountLookupPolicy::FollowNoAutomount)
         {
             if cache_only {
                 return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
@@ -5752,9 +5931,11 @@ impl IndexNode for MountFSInode {
         flags: &FileFlags,
     ) -> Result<(), SystemError> {
         let access = flags.access_flags();
-        if (access == FileFlags::O_WRONLY
-            || access == FileFlags::O_RDWR
-            || flags.contains(FileFlags::O_TRUNC))
+        let special = writer::is_special_file_type(self.dentry.file_type);
+        if !special
+            && (access == FileFlags::O_WRONLY
+                || access == FileFlags::O_RDWR
+                || flags.contains(FileFlags::O_TRUNC))
             && self.mount_fs.is_readonly()
         {
             return Err(SystemError::EROFS);
@@ -5849,10 +6030,22 @@ impl IndexNode for MountFSInode {
         data: MutexGuard<FilePrivateData>,
         context: &super::OpenTruncateContext,
     ) -> Result<(), SystemError> {
-        self.ensure_mount_writable()?;
+        self.resize_open_truncate_result(len, lock_owner, data, context)
+            .map(|_| ())
+    }
+
+    fn resize_open_truncate_result(
+        &self,
+        len: usize,
+        lock_owner: u64,
+        data: MutexGuard<FilePrivateData>,
+        context: &super::OpenTruncateContext,
+    ) -> Result<SetMetadataMask, SystemError> {
+        let _writer = self.ensure_mount_writable()?;
+        let operation = self.op_context();
         self.dentry
             .inode
-            .resize_open_truncate(len, lock_owner, data, context)
+            .resize_open_truncate_with_inode_context(len, lock_owner, data, context, &operation)
     }
 
     fn sync(&self) -> Result<(), SystemError> {
@@ -5912,12 +6105,15 @@ impl IndexNode for MountFSInode {
         mode: InodeMode,
         data: usize,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
-        self.ensure_mount_writable()?;
+        let _writer = self.ensure_mount_writable()?;
         let _children_guard = self.dentry.children_gate.lock();
-        let inner_inode = self
-            .dentry
-            .inode
-            .create_with_data(name, file_type, mode, data)?;
+        let inner_inode = self.dentry.inode.create_with_data_context(
+            name,
+            file_type,
+            mode,
+            data,
+            &self.op_context(),
+        )?;
         let _namespace_guard = self
             .mount_fs
             .super_block_state
@@ -5933,7 +6129,21 @@ impl IndexNode for MountFSInode {
     }
 
     fn truncate(&self, len: usize) -> Result<(), SystemError> {
-        self.ensure_mount_writable()?;
+        let _writer = self.ensure_mount_writable()?;
+        let operation = self.op_context();
+        if operation.is_idmapped() {
+            return self
+                .dentry
+                .inode
+                .resize_with_metadata_context(
+                    len,
+                    0,
+                    &super::Metadata::default(),
+                    SetMetadataMask::empty(),
+                    &operation,
+                )
+                .map(|_| ());
+        }
         return self.dentry.inode.truncate(len);
     }
 
@@ -5954,8 +6164,45 @@ impl IndexNode for MountFSInode {
         buf: &[u8],
         data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        self.ensure_mount_writable()?;
-        return self.dentry.inode.write_at(offset, len, buf, data);
+        let mut publish = || {};
+        let mut stage = super::WritePrivilegeStage::new(&mut publish);
+        self.write_at_with_privilege_stage(offset, len, buf, data, &mut stage)
+    }
+
+    fn write_at_with_privilege_stage(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &[u8],
+        data: MutexGuard<FilePrivateData>,
+        stage: &mut super::WritePrivilegeStage<'_>,
+    ) -> Result<usize, SystemError> {
+        self.write_primary_with_privilege_stage(
+            offset,
+            len,
+            super::PrimaryWriteSource::Kernel(buf),
+            data,
+            stage,
+        )
+    }
+
+    fn write_primary_with_privilege_stage(
+        &self,
+        offset: usize,
+        len: usize,
+        source: super::PrimaryWriteSource<'_, '_>,
+        data: MutexGuard<FilePrivateData>,
+        stage: &mut super::WritePrivilegeStage<'_>,
+    ) -> Result<usize, SystemError> {
+        let _writer = self.ensure_io_writable()?;
+        self.dentry.inode.write_primary_with_inode_context(
+            offset,
+            len,
+            source,
+            data,
+            &self.op_context(),
+            stage,
+        )
     }
 
     fn write_at_with_sync(
@@ -5966,10 +6213,37 @@ impl IndexNode for MountFSInode {
         sync_intent: WriteSyncIntent,
         data: MutexGuard<FilePrivateData>,
     ) -> Result<DelegatedWriteResult, SystemError> {
-        self.ensure_mount_writable()?;
-        self.dentry
-            .inode
-            .write_at_with_sync(offset, len, buf, sync_intent, data)
+        let mut publish = || {};
+        let mut stage = super::WritePrivilegeStage::new(&mut publish);
+        self.write_at_with_sync_with_privilege_stage(
+            offset,
+            len,
+            buf,
+            sync_intent,
+            data,
+            &mut stage,
+        )
+    }
+
+    fn write_at_with_sync_with_privilege_stage(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &[u8],
+        sync_intent: WriteSyncIntent,
+        data: MutexGuard<FilePrivateData>,
+        stage: &mut super::WritePrivilegeStage<'_>,
+    ) -> Result<DelegatedWriteResult, SystemError> {
+        let _writer = self.ensure_io_writable()?;
+        self.dentry.inode.write_at_with_sync_with_inode_context(
+            offset,
+            len,
+            buf,
+            sync_intent,
+            data,
+            &self.op_context(),
+            stage,
+        )
     }
 
     fn read_direct(
@@ -5989,8 +6263,28 @@ impl IndexNode for MountFSInode {
         buf: &[u8],
         data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        self.ensure_mount_writable()?;
-        self.dentry.inode.write_direct(offset, len, buf, data)
+        let mut publish = || {};
+        let mut stage = super::WritePrivilegeStage::new(&mut publish);
+        self.write_direct_with_privilege_stage(offset, len, buf, data, &mut stage)
+    }
+
+    fn write_direct_with_privilege_stage(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &[u8],
+        data: MutexGuard<FilePrivateData>,
+        stage: &mut super::WritePrivilegeStage<'_>,
+    ) -> Result<usize, SystemError> {
+        let _writer = self.ensure_io_writable()?;
+        self.dentry.inode.write_direct_with_inode_context(
+            offset,
+            len,
+            buf,
+            data,
+            &self.op_context(),
+            stage,
+        )
     }
 
     #[inline]
@@ -6022,7 +6316,7 @@ impl IndexNode for MountFSInode {
             md.dev_id = self.mount_fs.super_block_state.unnamed_dev()?.data() as usize;
         }
 
-        Ok(md)
+        Ok(self.op_context().view_metadata(&md))
     }
 
     fn cached_metadata(&self) -> Result<super::Metadata, SystemError> {
@@ -6030,7 +6324,7 @@ impl IndexNode for MountFSInode {
         if md.dev_id == 0 {
             md.dev_id = self.mount_fs.super_block_state.unnamed_dev()?.data() as usize;
         }
-        Ok(md)
+        Ok(self.op_context().view_metadata(&md))
     }
 
     fn cached_symlink_target(&self) -> Result<String, SystemError> {
@@ -6047,8 +6341,19 @@ impl IndexNode for MountFSInode {
 
     #[inline]
     fn set_metadata(&self, metadata: &super::Metadata) -> Result<(), SystemError> {
-        self.ensure_mount_writable()?;
-        return self.dentry.inode.set_metadata(metadata);
+        let _writer = self.ensure_mount_writable()?;
+        let raw = self.dentry.inode.metadata()?;
+        let mask = SetMetadataMask::MODE
+            | SetMetadataMask::UID
+            | SetMetadataMask::GID
+            | SetMetadataMask::ATIME
+            | SetMetadataMask::MTIME
+            | SetMetadataMask::CTIME;
+        let mut requested =
+            operations::raw_metadata_request(&self.op_context(), &raw, metadata, mask)?;
+        requested.size = metadata.size;
+        requested.btime = metadata.btime;
+        self.dentry.inode.set_metadata(&requested)
     }
 
     #[inline]
@@ -6057,8 +6362,23 @@ impl IndexNode for MountFSInode {
         metadata: &super::Metadata,
         mask: SetMetadataMask,
     ) -> Result<(), SystemError> {
-        self.ensure_mount_writable()?;
-        self.dentry.inode.set_metadata_masked(metadata, mask)
+        self.update_metadata_masked(&mut |_| Ok((metadata.clone(), mask)))?;
+        Ok(())
+    }
+
+    fn update_metadata_masked(
+        &self,
+        update: &mut super::MetadataUpdate<'_>,
+    ) -> Result<SetMetadataMask, SystemError> {
+        let _writer = self.ensure_mount_writable()?;
+        let operation = self.op_context();
+        self.dentry.inode.update_metadata_masked(&mut |raw| {
+            let (requested, mask) = update(&operation.view_metadata(raw))?;
+            Ok((
+                operations::raw_metadata_request(&operation, raw, &requested, mask)?,
+                mask,
+            ))
+        })
     }
 
     #[inline]
@@ -6067,19 +6387,57 @@ impl IndexNode for MountFSInode {
         now: crate::time::PosixTimeSpec,
         relatime: bool,
     ) -> Result<(), SystemError> {
-        self.ensure_mount_writable()?;
+        if operations::require_mapped_owner(
+            &self.op_context(),
+            &self.dentry.inode.metadata()?,
+            SystemError::EOVERFLOW,
+        )
+        .is_err()
+        {
+            // Linux atime_needs_update skips ownership that has no mapping.
+            return Ok(());
+        }
+        let _writer = self.ensure_mount_writable()?;
         self.dentry.inode.update_atime(now, relatime)
     }
 
     #[inline]
     fn resize(&self, len: usize) -> Result<(), SystemError> {
-        self.ensure_mount_writable()?;
+        let _writer = self.ensure_mount_writable()?;
+        let operation = self.op_context();
+        if operation.is_idmapped() {
+            return self
+                .dentry
+                .inode
+                .resize_with_metadata_context(
+                    len,
+                    0,
+                    &super::Metadata::default(),
+                    SetMetadataMask::empty(),
+                    &operation,
+                )
+                .map(|_| ());
+        }
         return self.dentry.inode.resize(len);
     }
 
     #[inline]
     fn resize_with_lock_owner(&self, len: usize, lock_owner: u64) -> Result<(), SystemError> {
-        self.ensure_mount_writable()?;
+        let _writer = self.ensure_mount_writable()?;
+        let operation = self.op_context();
+        if operation.is_idmapped() {
+            return self
+                .dentry
+                .inode
+                .resize_with_metadata_context(
+                    len,
+                    lock_owner,
+                    &super::Metadata::default(),
+                    SetMetadataMask::empty(),
+                    &operation,
+                )
+                .map(|_| ());
+        }
         return self.dentry.inode.resize_with_lock_owner(len, lock_owner);
     }
 
@@ -6090,7 +6448,22 @@ impl IndexNode for MountFSInode {
         lock_owner: u64,
         data: MutexGuard<FilePrivateData>,
     ) -> Result<(), SystemError> {
-        self.ensure_mount_writable()?;
+        let _writer = self.ensure_mount_writable()?;
+        let operation = self.op_context();
+        if operation.is_idmapped() {
+            return self
+                .dentry
+                .inode
+                .resize_file_with_metadata_context(
+                    len,
+                    lock_owner,
+                    data,
+                    &super::Metadata::default(),
+                    SetMetadataMask::empty(),
+                    &operation,
+                )
+                .map(|_| ());
+        }
         return self.dentry.inode.resize_file(len, lock_owner, data);
     }
 
@@ -6102,10 +6475,25 @@ impl IndexNode for MountFSInode {
         metadata: &super::Metadata,
         mask: SetMetadataMask,
     ) -> Result<(), SystemError> {
-        self.ensure_mount_writable()?;
-        self.dentry
-            .inode
-            .resize_with_metadata(len, lock_owner, metadata, mask)
+        self.resize_with_metadata_result(len, lock_owner, metadata, mask)
+            .map(|_| ())
+    }
+
+    fn resize_with_metadata_result(
+        &self,
+        len: usize,
+        lock_owner: u64,
+        metadata: &super::Metadata,
+        mask: SetMetadataMask,
+    ) -> Result<SetMetadataMask, SystemError> {
+        let _writer = self.ensure_mount_writable()?;
+        self.dentry.inode.resize_with_metadata_context(
+            len,
+            lock_owner,
+            metadata,
+            mask,
+            &self.op_context(),
+        )
     }
 
     #[inline]
@@ -6117,10 +6505,27 @@ impl IndexNode for MountFSInode {
         metadata: &super::Metadata,
         mask: SetMetadataMask,
     ) -> Result<(), SystemError> {
-        self.ensure_mount_writable()?;
-        self.dentry
-            .inode
-            .resize_file_with_metadata(len, lock_owner, data, metadata, mask)
+        self.resize_file_with_metadata_result(len, lock_owner, data, metadata, mask)
+            .map(|_| ())
+    }
+
+    fn resize_file_with_metadata_result(
+        &self,
+        len: usize,
+        lock_owner: u64,
+        data: MutexGuard<FilePrivateData>,
+        metadata: &super::Metadata,
+        mask: SetMetadataMask,
+    ) -> Result<SetMetadataMask, SystemError> {
+        let _writer = self.ensure_mount_writable()?;
+        self.dentry.inode.resize_file_with_metadata_context(
+            len,
+            lock_owner,
+            data,
+            metadata,
+            mask,
+            &self.op_context(),
+        )
     }
 
     #[inline]
@@ -6133,11 +6538,16 @@ impl IndexNode for MountFSInode {
         attrib: &mut super::AttribStageObserver<'_>,
         data: MutexGuard<FilePrivateData>,
     ) -> Result<(), SystemError> {
-        self.ensure_mount_writable()?;
-        return self
-            .dentry
-            .inode
-            .fallocate_file(mode, offset, len, lock_owner, attrib, data);
+        let _writer = self.ensure_mount_writable()?;
+        return self.dentry.inode.fallocate_file_with_inode_context(
+            mode,
+            offset,
+            len,
+            lock_owner,
+            attrib,
+            data,
+            &self.op_context(),
+        );
     }
 
     #[inline]
@@ -6147,9 +6557,12 @@ impl IndexNode for MountFSInode {
         file_type: FileType,
         mode: InodeMode,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
-        self.ensure_mount_writable()?;
+        let _writer = self.ensure_mount_writable()?;
         let _children_guard = self.dentry.children_gate.lock();
-        let inner_inode = self.dentry.inode.create(name, file_type, mode)?;
+        let inner_inode =
+            self.dentry
+                .inode
+                .create_with_context(name, file_type, mode, &self.op_context())?;
         let _namespace_guard = self
             .mount_fs
             .super_block_state
@@ -6170,9 +6583,14 @@ impl IndexNode for MountFSInode {
         mode: InodeMode,
         flags: &FileFlags,
     ) -> Result<PreopenedFile, SystemError> {
-        self.ensure_mount_writable()?;
+        let _writer = self.ensure_mount_writable()?;
         let children_guard = self.dentry.children_gate.lock();
-        let mut preopened = self.dentry.inode.create_and_open(name, mode, flags)?;
+        let mut preopened = self.dentry.inode.create_and_open_with_context(
+            name,
+            mode,
+            flags,
+            &self.op_context(),
+        )?;
         let wrapped = {
             let _namespace_guard = self
                 .mount_fs
@@ -6193,6 +6611,7 @@ impl IndexNode for MountFSInode {
         };
         drop(children_guard);
         preopened.replace_inode(wrapped?);
+        preopened.set_writer(_writer);
         Ok(preopened)
     }
 
@@ -6201,11 +6620,15 @@ impl IndexNode for MountFSInode {
         mode: InodeMode,
         flags: &FileFlags,
     ) -> Result<super::UnlinkedFile, SystemError> {
-        self.ensure_mount_writable()?;
+        let _writer = self.ensure_mount_writable()?;
         let parent = self.self_ref.upgrade().ok_or(SystemError::ENOENT)?;
-        let mut unlinked = self.dentry.inode.tmpfile(mode, flags)?;
+        let mut unlinked =
+            self.dentry
+                .inode
+                .tmpfile_with_context(mode, flags, &self.op_context())?;
         let wrapped = Self::new_tmpfile(unlinked.inode(), &parent)?;
         unlinked.replace_inode(wrapped);
+        unlinked.set_mount_writer(_writer);
         Ok(unlinked)
     }
 
@@ -6321,6 +6744,15 @@ impl IndexNode for MountFSInode {
         }
     }
 
+    fn find_no_automount(&self, name: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
+        match name {
+            "" | "." | ".." => self.find(name),
+            _ => self
+                .do_find_with_policy(name, MountLookupPolicy::FollowNoAutomount, false)
+                .map(|inode| inode as Arc<dyn IndexNode>),
+        }
+    }
+
     fn find_bytes(&self, name: &[u8]) -> Result<Arc<dyn IndexNode>, SystemError> {
         if let Ok(name) = core::str::from_utf8(name) {
             return self.find(name);
@@ -6343,7 +6775,8 @@ impl IndexNode for MountFSInode {
         &self,
         ino: InodeId,
     ) -> Result<(alloc::string::String, super::Metadata), SystemError> {
-        return self.dentry.inode.get_entry_name_and_metadata(ino);
+        let (name, raw) = self.dentry.inode.get_entry_name_and_metadata(ino)?;
+        Ok((name, self.op_context().view_metadata(&raw)))
     }
 
     #[inline]
@@ -6435,7 +6868,7 @@ impl IndexNode for MountFSInode {
         mode: InodeMode,
         dev_t: DeviceNumber,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
-        self.ensure_mount_writable()?;
+        let _writer = self.ensure_mount_writable()?;
         let _children_guard = self.dentry.children_gate.lock();
         let inner_inode = self.dentry.inode.mknod(filename, mode, dev_t)?;
         let _namespace_guard = self
@@ -6455,6 +6888,18 @@ impl IndexNode for MountFSInode {
     #[inline]
     fn is_magic_link(&self) -> bool {
         self.dentry.inode.is_magic_link()
+    }
+
+    fn check_dac_permission(
+        &self,
+        metadata: &super::Metadata,
+        mask: super::permission::PermissionMask,
+    ) -> Result<(), SystemError> {
+        self.dentry.inode.check_dac_permission(metadata, mask)
+    }
+
+    fn check_symlink_access(&self) -> Result<(), SystemError> {
+        self.dentry.inode.check_symlink_access()
     }
 
     #[inline]
@@ -6523,16 +6968,31 @@ impl IndexNode for MountFSInode {
     }
 
     fn write_sync(&self, offset: usize, buf: &[u8]) -> Result<usize, SystemError> {
-        self.ensure_mount_writable()?;
+        let _writer = self.ensure_io_writable()?;
         self.dentry.inode.write_sync(offset, buf)
     }
 
     fn getxattr(&self, name: &str, buf: &mut [u8]) -> Result<usize, SystemError> {
+        let context = self.op_context();
+        if context.is_idmapped() && filecaps::is_acl(name) {
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        }
+        if name == filecaps::NAME {
+            return filecaps::get(self.dentry.inode.as_ref(), &context, buf);
+        }
         self.dentry.inode.getxattr(name, buf)
     }
 
     fn setxattr(&self, name: &str, value: &[u8], flags: XattrFlags) -> Result<usize, SystemError> {
-        self.ensure_mount_writable()?;
+        let _writer = self.ensure_mount_writable()?;
+        let context = self.op_context();
+        if context.is_idmapped() && filecaps::is_acl(name) {
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        }
+        if name == filecaps::NAME {
+            let value = filecaps::for_storage(&context, &self.dentry.inode.metadata()?, value)?;
+            return self.dentry.inode.setxattr(name, value.bytes(), flags);
+        }
         self.dentry.inode.setxattr(name, value, flags)
     }
 
@@ -6541,8 +7001,20 @@ impl IndexNode for MountFSInode {
     }
 
     fn removexattr(&self, name: &str) -> Result<usize, SystemError> {
-        self.ensure_mount_writable()?;
+        let _writer = self.ensure_mount_writable()?;
+        let context = self.op_context();
+        if context.is_idmapped() && filecaps::is_acl(name) {
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        }
+        if name == filecaps::NAME {
+            filecaps::check_setfcap(&context, &self.dentry.inode.metadata()?)?;
+        }
         self.dentry.inode.removexattr(name)
+    }
+
+    fn remove_security_privileges(&self) -> Result<(), SystemError> {
+        let _writer = self.ensure_mount_writable()?;
+        self.dentry.inode.remove_security_privileges()
     }
 }
 
@@ -6613,6 +7085,9 @@ impl FileSystem for MountFS {
     }
 
     unsafe fn page_mkwrite(&self, pfm: &mut PageFaultMessage) -> VmFaultReason {
+        if self.is_readonly() {
+            return VmFaultReason::VM_FAULT_SIGBUS;
+        }
         self.inner_filesystem.page_mkwrite(pfm)
     }
 

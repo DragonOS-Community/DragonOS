@@ -258,7 +258,7 @@ pub enum DelallocAppendBlockSubmitOutcome {
 }
 
 /// Attributes that can be set on an inode via `setattr`.
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 pub struct SetAttr {
     /// File mode and permissions
     pub mode: Option<InodeMode>,
@@ -485,14 +485,14 @@ impl Ext4 {
             self.delalloc_projected_append_block_plan(&inode, offset, expected_durable_eof_before)?;
         let mut lease =
             self.reserve_delalloc_lease_in_direct_mutation_domain(1, metadata_blocks)?;
-        lease
-            .bind_append_block_certificate(
-                id,
-                inode.inode.generation(),
-                offset,
-                expected_durable_eof_before,
-            )
-            .expect("fresh delayed-allocation append lease must accept one certificate");
+        self.bind_delalloc_append_certificate(
+            &mut lease,
+            id,
+            inode.inode.generation(),
+            offset,
+            expected_durable_eof_before,
+        )
+        .expect("fresh delayed-allocation append lease must accept one certificate");
         Ok(DelallocAppendBlockReservation::new(lease))
     }
 
@@ -646,7 +646,8 @@ impl Ext4 {
         let new_nodes = projection.append_nonmerge_at(expected_lblock, 1)?;
 
         let mut data_lease = self.reserve_delalloc_lease_in_direct_mutation_domain(1, 0)?;
-        if let Err(error) = data_lease.bind_append_block_certificate(
+        if let Err(error) = self.bind_delalloc_append_certificate(
+            &mut data_lease,
             id,
             inode_generation,
             offset,
@@ -2343,6 +2344,7 @@ impl Ext4 {
                 start_lblock: plan.start_lblock,
                 start_pblock: allocation.first,
                 count: 1,
+                unwritten: false,
             },
         ) {
             self.abort_delalloc_mapping_transaction(transaction, consumption)
@@ -2565,10 +2567,9 @@ impl Ext4 {
         // remaining append can still use one range transaction instead of
         // falling back to one allocation transaction per 4 KiB block.
         while start_lblock <= end_lblock {
-            match self.extent_query(inode, start_lblock) {
-                Ok(_) => start_lblock += 1,
-                Err(error) if error.code() == ErrCode::ENOENT => break,
-                Err(error) => return Err(error),
+            match self.allocated_extent_at_or_after(inode, start_lblock, None)? {
+                Some(extent) if extent.start_lblock() <= start_lblock => start_lblock += 1,
+                _ => break,
             }
         }
         if start_lblock > end_lblock {
@@ -2588,7 +2589,8 @@ impl Ext4 {
         if (start_lblock as u64) < persistent_blocks {
             return Ok(None);
         }
-        let Some(shape) = self.direct_append_shape(inode, start_lblock, count)? else {
+        let Some(shape) = self.direct_append_shape_with_state(inode, start_lblock, count, true)?
+        else {
             return Ok(None);
         };
         Ok(Some(TransactionalRangePlan {
@@ -2727,10 +2729,17 @@ impl Ext4 {
                     start_lblock: plan.start_lblock,
                     start_pblock: allocation.first,
                     count: plan.count,
+                    unwritten: true,
                 },
             )
         } else {
-            self.stage_direct_append_extent(inode, plan.start_lblock, allocation.first, plan.count)
+            self.stage_direct_append_extent_with_state(
+                inode,
+                plan.start_lblock,
+                allocation.first,
+                plan.count,
+                true,
+            )
         };
         if let Err(error) = stage_result {
             self.prepare_stats.record_failure();
@@ -2828,6 +2837,60 @@ impl Ext4 {
         Ok(Some(Self::file_attr(&inode)))
     }
 
+    /// Linux ext4_file_getattr includes still-unmaterialised data reservations
+    /// in stat, without changing the on-disk i_blocks or exposing metadata
+    /// reservations. Publication and its exact lease debit share this view.
+    pub fn getattr_for_stat(&self, id: InodeId) -> Result<FileAttr> {
+        let _view = self.metadata_mutation_barrier.try_read_view()?;
+        let inode = self.read_inode(id)?;
+        if inode.inode.mode().bits() == 0 {
+            return Err(Ext4Error::new(ErrCode::EINVAL));
+        }
+        // read_inode has released its cache lock and all device I/O before
+        // taking the allocation ledger; never invert allocation/cache locks.
+        let allocation = self.alloc_lock.lock();
+        self.stat_file_attr(&inode, &allocation)
+    }
+
+    /// Cache-only counterpart: every gate/lock is try-only and misses never
+    /// fill an inode or reach the block device.
+    pub fn getattr_for_stat_cached(&self, id: InodeId) -> Result<Option<FileAttr>> {
+        let _view = self.metadata_mutation_barrier.try_read_view()?;
+        let inode = {
+            let cache = self
+                .inode_cache
+                .try_lock()
+                .ok_or_else(|| Ext4Error::new(ErrCode::EAGAIN))?;
+            cache.get(id)
+        };
+        let Some(inode) = inode else {
+            return Ok(None);
+        };
+        if inode.inode.mode().bits() == 0 {
+            return Err(Ext4Error::new(ErrCode::EINVAL));
+        }
+        let allocation = self
+            .alloc_lock
+            .try_lock()
+            .ok_or_else(|| Ext4Error::new(ErrCode::EAGAIN))?;
+        self.stat_file_attr(&inode, &allocation).map(Some)
+    }
+
+    fn stat_file_attr(
+        &self,
+        inode: &InodeRef,
+        allocation: &super::AllocationState,
+    ) -> Result<FileAttr> {
+        let mut attr = Self::file_attr(inode);
+        let data_blocks =
+            allocation.inode_reserved_data_blocks(inode.id, inode.inode.generation())?;
+        attr.blocks = data_blocks
+            .checked_mul((BLOCK_SIZE / INODE_BLOCK_SIZE) as u64)
+            .and_then(|sectors| attr.blocks.checked_add(sectors))
+            .ok_or_else(|| Ext4Error::new(ErrCode::ERANGE))?;
+        Ok(attr)
+    }
+
     fn file_attr(inode: &InodeRef) -> FileAttr {
         // Get device number for device nodes
         let rdev = if inode.inode.is_device() {
@@ -2865,6 +2928,14 @@ impl Ext4 {
     /// `EINVAL` if the inode is invalid (mode == 0).
     pub fn setattr(&self, id: InodeId, attr: SetAttr) -> Result<()> {
         self.ensure_mutable()?;
+        if attr.size.is_some() {
+            let _metadata = self.lock_transactional_metadata_mutation()?;
+            let _mutation = self.inode_mutation_locks[self.inode_mutation_lock_index(id)].lock();
+            let inode = self.read_inode_uncached(id)?;
+            self.reject_external_linked_tail_mutation(&inode)?;
+            let mut receipt = self.begin_size_change_locked(id, inode.inode.size(), &attr)?;
+            return self.finish_size_change_locked(&mut receipt, None);
+        }
         let _metadata_guard = self.lock_transactional_metadata_mutation()?;
         let _mutation_guard = self.inode_mutation_locks[self.inode_mutation_lock_index(id)].lock();
         let mut inode = self.read_inode(id)?;
@@ -2906,17 +2977,6 @@ impl Ext4 {
         Ok(())
     }
 
-    fn recompute_inode_block_count(&self, inode: &mut InodeRef) -> Result<()> {
-        let data_blocks = self.extent_all_data_blocks(inode)?.len() as u64;
-        let tree_blocks = self.extent_all_tree_blocks(inode)?.len() as u64;
-        let xattr_blocks = u64::from(inode.inode.xattr_block() != 0);
-        let sectors_per_block = (BLOCK_SIZE / INODE_BLOCK_SIZE) as u64;
-        inode
-            .inode
-            .set_block_count((data_blocks + tree_blocks + xattr_blocks) * sectors_per_block);
-        Ok(())
-    }
-
     fn ensure_blocks_for_write_range_locked(
         &self,
         inode: &mut InodeRef,
@@ -2942,49 +3002,27 @@ impl Ext4 {
                 .and_then(|blocks| usize::try_from(blocks).ok())
                 .ok_or_else(|| Ext4Error::new(ErrCode::EFBIG))?;
             self.prepare_stats.record_requested(requested_blocks);
-            let mut changed = false;
             for iblock in start_iblock..=end_iblock {
-                match self.extent_query(inode, iblock) {
-                    Ok(_) => {
-                        self.prepare_stats.record_mapped();
-                    }
-                    Err(err) if err.code() == ErrCode::ENOENT => {
-                        self.prepare_stats.record_missing();
-                        if self.uses_journal() {
-                            // One missing mapping is a restartable allocation
-                            // boundary; do not accumulate an unbounded range
-                            // under one finite journal reservation.
-                            let credits =
-                                5 * usize::from(inode.inode.extent_root().header().depth()) + 16;
-                            let mut transaction = self.transaction_start(credits)?;
-                            self.transaction_extent_query_or_create(
-                                &mut transaction,
-                                inode,
-                                iblock,
-                            )?;
-                            self.commit_metadata_operation(transaction)
-                                .map(|_| ())
-                                .map_err(|error| error.error)?;
-                        } else {
-                            self.extent_query_or_create(inode, iblock, 1)?;
-                        }
-                        self.extent_query(inode, iblock).map_err(|err| {
-                            format_error!(
-                                ErrCode::EIO,
-                                "extent allocation invariant failed: inode {} iblock {} missing after create: {:?}",
-                                inode.id,
-                                iblock,
-                                err
-                            )
-                        })?;
-                        changed = true;
-                    }
-                    Err(err) => return Err(err),
+                if self
+                    .allocated_extent_at_or_after(inode, iblock, None)?
+                    .is_some_and(|extent| extent.start_lblock() <= iblock)
+                {
+                    self.prepare_stats.record_mapped();
+                    continue;
                 }
-            }
-            if changed && !self.uses_journal() {
-                self.recompute_inode_block_count(inode)?;
-                self.write_inode_with_csum(inode)?;
+                self.prepare_stats.record_missing();
+                if self.uses_journal() {
+                    let mut transaction =
+                        self.transaction_start(self.range_transaction_credits(inode, false)?)?;
+                    self.transaction_extent_query_or_create(&mut transaction, inode, iblock)?;
+                    self.finish_range_transaction(transaction)?;
+                } else {
+                    self.direct_preallocate_range_batch_locked(
+                        inode,
+                        iblock as usize * BLOCK_SIZE,
+                        BLOCK_SIZE,
+                    )?;
+                }
             }
             Ok(())
         })();
@@ -3052,16 +3090,13 @@ impl Ext4 {
                 let _metadata_guard = self.lock_direct_metadata_mutation()?;
                 let _mutation_guard =
                     self.inode_mutation_locks[self.inode_mutation_lock_index(id)].lock();
-                let mut inode = self.read_inode(id)?;
+                let inode = self.read_inode(id)?;
                 if inode.inode.mode().bits() == 0 {
                     return_error!(ErrCode::EINVAL, "Invalid inode {}", id);
                 }
                 self.reject_external_linked_tail_mutation(&inode)?;
-                if self
-                    .transactional_range_plan(&inode, offset, len)?
-                    .is_none()
-                {
-                    return self.ensure_blocks_for_write_range_locked(&mut inode, offset, len);
+                if self.write_range_is_allocated(&inode, offset, len, false)? {
+                    return Ok(());
                 }
             }
             let outcome = {
@@ -3079,7 +3114,7 @@ impl Ext4 {
                 return Ok(());
             }
         }
-        let _metadata_guard = self.lock_direct_metadata_mutation()?;
+        let _metadata_guard = self.lock_transactional_metadata_mutation()?;
         let _mutation_guard = self.inode_mutation_locks[self.inode_mutation_lock_index(id)].lock();
         let mut inode = self.read_inode(id)?;
         if inode.inode.mode().bits() == 0 {
@@ -3539,59 +3574,14 @@ impl Ext4 {
     /// * `EISDIR` - `file` is not a regular file
     /// * `ENOSPC` - no space left on device
     pub fn write(&self, file: InodeId, offset: usize, data: &[u8]) -> Result<usize> {
-        self.ensure_mutable()?;
-        let _metadata_guard = self.lock_transactional_metadata_mutation()?;
-        let write_size = data.len();
-        if write_size == 0 {
-            return Ok(0);
-        }
-        // Get the inode of the file
-        let _mutation_guard =
-            self.inode_mutation_locks[self.inode_mutation_lock_index(file)].lock();
-        let mut file = self.read_inode(file)?;
-        if !file.inode.is_file() {
-            return_error!(ErrCode::EISDIR, "Inode {} is not a file", file.id);
-        }
-        self.reject_external_linked_tail_mutation(&file)?;
-
-        self.ensure_blocks_for_write_range_locked(&mut file, offset, write_size)?;
-
-        // Write data
-        let mut cursor = 0;
-        let mut iblock = (offset / BLOCK_SIZE) as LBlockId;
-        while cursor < write_size {
-            let block_offset = (offset + cursor) % BLOCK_SIZE;
-            let write_len = min(BLOCK_SIZE - block_offset, write_size - cursor);
-            let fblock = self.extent_query(&file, iblock)?;
-            let mut block = self.block_device.read_block(fblock)?;
-            block.write_offset(block_offset, &data[cursor..cursor + write_len]);
-            self.block_device.write_block(&block)?;
-            cursor += write_len;
-            iblock += 1;
-        }
-        let new_end = offset.checked_add(cursor).ok_or(format_error!(
-            ErrCode::EFBIG,
-            "write end overflow: offset={} len={}",
-            offset,
-            cursor
-        ))?;
-        if new_end > file.inode.size() as usize {
-            file.inode.set_size(new_end as u64);
-        }
-        if self.uses_journal() {
-            let mut transaction = self.transaction_start(1)?;
-            self.transaction_stage_inode_with_csum(&mut transaction, &mut file)?;
-            self.commit_metadata_operation(transaction)
-                .map(|_| ())
-                .map_err(|error| error.error)?;
-        } else {
-            self.write_inode_with_csum(&mut file)?;
-        }
-
-        Ok(cursor)
+        let end = offset
+            .checked_add(data.len())
+            .ok_or_else(|| Ext4Error::new(ErrCode::EFBIG))?;
+        self.write_closed(file, offset, data, Some(end as u64), true)
     }
 
-    /// Write data to pre-allocated blocks without modifying inode metadata.
+    /// Write preallocated blocks inside durable EOF. Unwritten mappings may
+    /// be converted after durable payload; inode SIZE is never changed.
     ///
     /// This is used by page cache writeback: blocks are already allocated by
     /// `prepare_buffered_write` in the foreground `write_at` path; the writeback
@@ -3606,25 +3596,24 @@ impl Ext4 {
     /// This eliminates the race between foreground `setattr` block-allocation
     /// and background writeback, which can corrupt the extent tree when both
     /// operate on cloned `InodeRef` snapshots from the inode cache.
-    fn write_data_only_checked(&self, file: InodeId, offset: usize, data: &[u8]) -> Result<usize> {
-        self.ensure_mutable()?;
-        let _metadata_guard = self.lock_direct_metadata_mutation()?;
+    fn write_mapped_overwrite_locked(
+        &self,
+        file: &InodeRef,
+        offset: usize,
+        data: &[u8],
+    ) -> Result<usize> {
         let write_size = data.len();
         let mut chunks = Vec::new();
-        let _mutation_guard =
-            self.inode_mutation_locks[self.inode_mutation_lock_index(file)].lock();
-        let file = self.read_inode(file)?;
-        if !file.inode.is_file() {
-            return_error!(ErrCode::EISDIR, "Inode {} is not a file", file.id);
-        }
-        self.reject_external_linked_tail_mutation(&file)?;
+        chunks
+            .try_reserve(data.len().div_ceil(BLOCK_SIZE).saturating_add(1))
+            .map_err(|_| Ext4Error::new(ErrCode::ENOMEM))?;
 
         let mut cursor = 0;
         let mut iblock = (offset / BLOCK_SIZE) as LBlockId;
         while cursor < write_size {
             let block_offset = (offset + cursor) % BLOCK_SIZE;
             let write_len = min(BLOCK_SIZE - block_offset, write_size - cursor);
-            match self.extent_query(&file, iblock) {
+            match self.extent_query(file, iblock) {
                 Ok(fblock) => {
                     chunks.push((fblock, block_offset, cursor, write_len));
                 }
@@ -3660,7 +3649,194 @@ impl Ext4 {
 
     /// Write data to pre-allocated blocks without modifying inode metadata.
     pub fn write_data_only(&self, file: InodeId, offset: usize, data: &[u8]) -> Result<usize> {
-        self.write_data_only_checked(file, offset, data)
+        self.write_closed(file, offset, data, None, false)
+    }
+
+    /// Publish frozen eager-writeback bytes, not a later cached/page-rounded EOF.
+    pub fn write_data_only_with_completed_end(
+        &self,
+        file: InodeId,
+        offset: usize,
+        data: &[u8],
+        completed_end: u64,
+    ) -> Result<usize> {
+        let end = offset
+            .checked_add(data.len())
+            .ok_or_else(|| Ext4Error::new(ErrCode::EFBIG))?;
+        if completed_end != end as u64 {
+            return Err(Ext4Error::new(ErrCode::EINVAL));
+        }
+        self.write_closed(file, offset, data, Some(completed_end), false)
+    }
+
+    /// Physical coverage is deliberately different from read classification:
+    /// unwritten blocks are allocated, but remain logical zero until I/O finishes.
+    fn write_range_is_allocated(
+        &self,
+        inode: &InodeRef,
+        offset: usize,
+        len: usize,
+        initialized: bool,
+    ) -> Result<bool> {
+        let end = offset
+            .checked_add(len)
+            .ok_or_else(|| Ext4Error::new(ErrCode::EFBIG))?;
+        if len == 0 {
+            return Ok(true);
+        }
+        if (end - 1) / BLOCK_SIZE >= MAX_BLOCKS as usize {
+            return Err(Ext4Error::new(ErrCode::EFBIG));
+        }
+        let mut logical = (offset / BLOCK_SIZE) as LBlockId;
+        let last = ((end - 1) / BLOCK_SIZE) as LBlockId;
+        while logical <= last {
+            let Some(extent) = self.allocated_extent_at_or_after(inode, logical, None)? else {
+                return Ok(false);
+            };
+            if extent.start_lblock() > logical || (initialized && extent.is_unwritten()) {
+                return Ok(false);
+            }
+            self.validate_data_blocks(extent.start_pblock(), u64::from(extent.block_count()))?;
+            let next = extent
+                .start_lblock()
+                .checked_add(extent.block_count())
+                .ok_or_else(|| Ext4Error::new(ErrCode::EIO))?;
+            if next > last {
+                return Ok(true);
+            }
+            logical = next;
+        }
+        Ok(true)
+    }
+
+    fn write_closed(
+        &self,
+        id: InodeId,
+        offset: usize,
+        data: &[u8],
+        completed_end: Option<u64>,
+        allocate: bool,
+    ) -> Result<usize> {
+        self.ensure_mutable()?;
+        let end = offset
+            .checked_add(data.len())
+            .ok_or_else(|| Ext4Error::new(ErrCode::EFBIG))?;
+        if data.is_empty() {
+            return Ok(0);
+        }
+        if (end - 1) / BLOCK_SIZE >= MAX_BLOCKS as usize {
+            return Err(Ext4Error::new(ErrCode::EFBIG));
+        }
+        // Keep parallel, bulk, already-initialized in-EOF overwrites. Never
+        // upgrade this compatible guard: release it before exclusive recheck.
+        {
+            let _metadata = self.lock_direct_metadata_mutation()?;
+            let _mutation = self.inode_mutation_locks[self.inode_mutation_lock_index(id)].lock();
+            let inode = self.read_inode(id)?;
+            if !inode.inode.is_file() {
+                return Err(Ext4Error::new(ErrCode::EISDIR));
+            }
+            self.reject_external_linked_tail_mutation(&inode)?;
+            if end as u64 <= inode.inode.size()
+                && self.write_range_is_allocated(&inode, offset, data.len(), true)?
+            {
+                return self.write_mapped_overwrite_locked(&inode, offset, data);
+            }
+        }
+        let _metadata = self.lock_transactional_metadata_mutation()?;
+        let _mutation = self.inode_mutation_locks[self.inode_mutation_lock_index(id)].lock();
+        let mut inode = self.read_inode_uncached(id)?;
+        if !inode.inode.is_file() {
+            return Err(Ext4Error::new(ErrCode::EISDIR));
+        }
+        self.reject_external_linked_tail_mutation(&inode)?;
+        if completed_end.is_none() && end as u64 > inode.inode.size() {
+            return Err(Ext4Error::new(ErrCode::EINVAL));
+        }
+        if !self.block_device.supports_reliable_flush() {
+            return Err(Ext4Error::new(ErrCode::ENOTSUP));
+        }
+        let mut cursor = 0;
+        while cursor < data.len() {
+            let logical = ((offset + cursor) / BLOCK_SIZE) as LBlockId;
+            let within = (offset + cursor) % BLOCK_SIZE;
+            let count = min(BLOCK_SIZE - within, data.len() - cursor);
+            let result = (|| {
+                if allocate {
+                    self.ensure_blocks_for_write_range_locked(&mut inode, offset + cursor, count)?;
+                }
+                let extent = self
+                    .allocated_extent_at_or_after(&inode, logical, None)?
+                    .filter(|extent| extent.start_lblock() <= logical)
+                    .ok_or_else(|| Ext4Error::new(ErrCode::ENOENT))?;
+                let home = extent
+                    .start_pblock()
+                    .checked_add(u64::from(logical - extent.start_lblock()))
+                    .ok_or_else(|| Ext4Error::new(ErrCode::EIO))?;
+                self.validate_data_blocks(home, 1)?;
+                let actual_end = if completed_end.is_some() {
+                    (offset + cursor + count) as u64
+                } else {
+                    min((offset + cursor + count) as u64, inode.inode.size())
+                };
+                let changes_metadata = extent.is_unwritten() || actual_end > inode.inode.size();
+                // Budget finite credits before payload. Direct's private COW
+                // claims may still fail after payload; never retry/undo that I/O.
+                let credits = if changes_metadata && self.uses_journal() {
+                    Some(self.range_transaction_credits(&inode, extent.is_unwritten())?)
+                } else {
+                    None
+                };
+                let mut transaction = credits
+                    .map(|credits| self.transaction_start(credits))
+                    .transpose()?;
+                let mut block = if extent.is_unwritten() {
+                    let image = Box::<[u8; BLOCK_SIZE]>::try_new_zeroed()
+                        .map_err(|_| Ext4Error::new(ErrCode::ENOMEM))?;
+                    // All bytes were zero-initialized on the heap, without a
+                    // block-sized stack image or an infallible allocation.
+                    Block::new(home, unsafe { image.assume_init() })
+                } else {
+                    self.block_device.read_block(home)?
+                };
+                block.write_offset(within, &data[cursor..cursor + count]);
+                if let Some(transaction) = transaction.as_mut() {
+                    // Prepare all fallible tree edits/claims in private images
+                    // before I/O; retirement EAGAIN must not retry written data.
+                    if extent.is_unwritten() {
+                        let detached = self.transaction_splice_allocated_extent(
+                            transaction,
+                            &mut inode,
+                            logical,
+                            logical + 1,
+                            true,
+                        )?;
+                        if !detached.is_empty() {
+                            return Err(Ext4Error::new(ErrCode::EIO));
+                        }
+                    }
+                    inode
+                        .inode
+                        .set_size(core::cmp::max(inode.inode.size(), actual_end));
+                    self.transaction_stage_inode_with_csum(transaction, &mut inode)?;
+                }
+                self.block_device.write_block(&block)?;
+                if changes_metadata {
+                    self.block_device.flush()?;
+                    if let Some(transaction) = transaction.take() {
+                        self.finish_range_transaction(transaction)?;
+                    } else {
+                        self.direct_publish_written_block_locked(&mut inode, logical, actual_end)?;
+                    }
+                }
+                Ok(())
+            })();
+            if let Err(error) = result {
+                return if cursor == 0 { Err(error) } else { Ok(cursor) };
+            }
+            cursor += count;
+        }
+        Ok(cursor)
     }
 
     /// Verify the mapped receipt while the direct metadata gate and inode
@@ -4556,6 +4732,60 @@ mod tests {
 
         fs.inode_cache.lock().invalidate(42);
         assert!(fs.getattr_cached(42).unwrap().is_none());
+    }
+
+    #[test]
+    fn stat_cached_misses_and_contention_never_read_the_device() {
+        struct CountingDevice {
+            inner: StubBlockDevice,
+            reads: AtomicUsize,
+        }
+        impl BlockDevice for CountingDevice {
+            fn read_block(&self, id: PBlockId) -> Result<Block> {
+                self.reads.fetch_add(1, Ordering::SeqCst);
+                self.inner.read_block(id)
+            }
+            fn write_block(&self, block: &Block) -> Result<()> {
+                self.inner.write_block(block)
+            }
+            fn flush(&self) -> Result<()> {
+                self.inner.flush()
+            }
+            fn supports_reliable_flush(&self) -> bool {
+                true
+            }
+        }
+        let device = Arc::new(CountingDevice {
+            inner: StubBlockDevice::with_block_count(16),
+            reads: AtomicUsize::new(0),
+        });
+        let fs = make_test_fs_with_device(16, device.clone());
+        device.reads.store(0, Ordering::SeqCst);
+        assert!(fs.getattr_for_stat_cached(42).unwrap().is_none());
+        let mut inode = Box::new(Inode::default());
+        inode.set_mode(InodeMode::FILE | InodeMode::from_bits_retain(0o600));
+        inode.set_block_count(17);
+        fs.inode_cache.lock().insert(InodeRef::new(42, inode));
+        assert_eq!(fs.getattr_for_stat_cached(42).unwrap().unwrap().blocks, 17);
+        let allocation = fs.alloc_lock.lock();
+        assert_eq!(
+            fs.getattr_for_stat_cached(42).unwrap_err().code(),
+            ErrCode::EAGAIN
+        );
+        drop(allocation);
+        let cache = fs.inode_cache.lock();
+        assert_eq!(
+            fs.getattr_for_stat_cached(42).unwrap_err().code(),
+            ErrCode::EAGAIN
+        );
+        drop(cache);
+        let mutation = fs.lock_transactional_metadata_mutation().unwrap();
+        assert_eq!(
+            fs.getattr_for_stat_cached(42).unwrap_err().code(),
+            ErrCode::EAGAIN
+        );
+        drop(mutation);
+        assert_eq!(device.reads.load(Ordering::SeqCst), 0);
     }
 
     struct StubBlockDevice {

@@ -128,6 +128,7 @@ fn tmpfs_move_entry_between_dirs(
     old_key: &DName,
     new_key: &DName,
     flags: RenameFlags,
+    context: &crate::filesystem::vfs::permission::InodeOpContext,
 ) -> Result<RenameOutcome, SystemError> {
     tmpfs_require_live_dir(src_dir)?;
     tmpfs_require_live_dir(dst_dir)?;
@@ -151,6 +152,14 @@ fn tmpfs_move_entry_between_dirs(
         if Arc::ptr_eq(&inode_to_move, &existing) {
             return Ok(RenameOutcome::NoOp);
         }
+        tmpfs_check_rename(
+            &src_dir.metadata,
+            &dst_dir.metadata,
+            &inode_to_move,
+            Some(&existing),
+            true,
+            context,
+        )?;
         let now = PosixTimeSpec::now();
         let existing_type = existing.0.lock().metadata.file_type;
 
@@ -184,6 +193,7 @@ fn tmpfs_move_entry_between_dirs(
         return Ok(RenameOutcome::Exchange);
     }
 
+    let mut whiteout = None;
     let mut replaced = None;
     if let Some(existing) = dst_dir.children.get(new_key).cloned() {
         if flags.contains(RenameFlags::NOREPLACE) {
@@ -213,6 +223,15 @@ fn tmpfs_move_entry_between_dirs(
             return Ok(RenameOutcome::NoOp);
         }
 
+        tmpfs_check_rename(
+            &src_dir.metadata,
+            &dst_dir.metadata,
+            &inode_to_move,
+            Some(&existing),
+            false,
+            context,
+        )?;
+
         if old_type == FileType::Dir && existing_type != FileType::Dir {
             return Err(SystemError::ENOTDIR);
         }
@@ -223,6 +242,10 @@ fn tmpfs_move_entry_between_dirs(
             return Err(SystemError::ENOTEMPTY);
         }
 
+        // Complete fallible whiteout preparation before touching either name.
+        if flags.contains(RenameFlags::WHITEOUT) {
+            whiteout = Some(tmpfs_prepare_whiteout(src_dir, old_key, context)?);
+        }
         // Remove existing destination entry (replacement).
         dst_dir.children.remove(new_key);
         let mut existing_guard = existing.0.lock();
@@ -239,12 +262,26 @@ fn tmpfs_move_entry_between_dirs(
             });
         }
         existing_guard.metadata.ctime = PosixTimeSpec::now();
+    } else {
+        tmpfs_check_rename(
+            &src_dir.metadata,
+            &dst_dir.metadata,
+            &inode_to_move,
+            None,
+            false,
+            context,
+        )?;
     }
 
-    // Remove from source directory.
-    src_dir.children.remove(old_key);
     if flags.contains(RenameFlags::WHITEOUT) {
-        tmpfs_insert_whiteout(src_dir, old_key)?;
+        let whiteout = match whiteout {
+            Some(inode) => inode,
+            None => tmpfs_prepare_whiteout(src_dir, old_key, context)?,
+        };
+        // Replace the existing key, retaining the map node for this commit.
+        src_dir.children.insert(old_key.clone(), whiteout);
+    } else {
+        src_dir.children.remove(old_key);
     }
     if old_type == FileType::Dir {
         src_dir.metadata.nlinks = src_dir.metadata.nlinks.saturating_sub(1);
@@ -266,6 +303,61 @@ fn tmpfs_move_entry_between_dirs(
     Ok(RenameOutcome::Moved { replaced })
 }
 
+fn tmpfs_check_rename(
+    source_parent: &Metadata,
+    target_parent: &Metadata,
+    source: &Arc<LockedTmpfsInode>,
+    target: Option<&Arc<LockedTmpfsInode>>,
+    exchange: bool,
+    context: &crate::filesystem::vfs::permission::InodeOpContext,
+) -> Result<(), SystemError> {
+    let source = source.0.lock().metadata.clone();
+    crate::filesystem::vfs::permission::check_inode_delete(
+        source_parent,
+        &source,
+        source.file_type == FileType::Dir,
+        context,
+    )?;
+    if let Some(target) = target {
+        let target = target.0.lock().metadata.clone();
+        let directory = if exchange {
+            target.file_type == FileType::Dir
+        } else {
+            source.file_type == FileType::Dir
+        };
+        crate::filesystem::vfs::permission::check_inode_delete(
+            target_parent,
+            &target,
+            directory,
+            context,
+        )
+    } else {
+        crate::filesystem::vfs::permission::check_parent_create(target_parent, context, false)
+    }
+}
+
+/// Linux shmem_fallocate commits allocation/size first and deliberately
+/// ignores file_modified's result. Only this attribute stage is best-effort;
+/// callers must propagate allocation, seal, quota and hole-punch errors.
+fn tmpfs_fallocate_modified(
+    inode: &mut TmpfsInode,
+    context: &crate::filesystem::vfs::permission::InodeOpContext,
+) -> bool {
+    let size = inode.metadata.size.max(0) as usize;
+    match crate::filesystem::vfs::vcore::prepare_backing_fallocate_metadata(
+        context,
+        &inode.metadata,
+        size,
+        false,
+    ) {
+        Ok((metadata, mask)) => {
+            crate::filesystem::vfs::merge_metadata_masked(&mut inode.metadata, &metadata, mask);
+            mask.contains(SetMetadataMask::MODE)
+        }
+        Err(_) => false,
+    }
+}
+
 fn tmpfs_touch_dir(dir: &mut TmpfsInode, now: PosixTimeSpec) {
     dir.metadata.mtime = now;
     dir.metadata.ctime = now;
@@ -281,13 +373,20 @@ fn tmpfs_require_live_dir(dir: &TmpfsInode) -> Result<(), SystemError> {
     Ok(())
 }
 
-fn tmpfs_insert_whiteout(dir: &mut TmpfsInode, name: &DName) -> Result<(), SystemError> {
-    if dir.children.contains_key(name) {
-        return Err(SystemError::EEXIST);
-    }
-
+fn tmpfs_prepare_whiteout(
+    dir: &TmpfsInode,
+    name: &DName,
+    context: &crate::filesystem::vfs::permission::InodeOpContext,
+) -> Result<Arc<LockedTmpfsInode>, SystemError> {
+    crate::filesystem::vfs::permission::check_parent_create(&dir.metadata, context, false)?;
+    let init = crate::filesystem::vfs::permission::child_inode_init_with_context(
+        &dir.metadata,
+        FileType::CharDevice,
+        InodeMode::S_IFCHR | InodeMode::from_bits_truncate(0o600),
+        context,
+    )?;
     let now = PosixTimeSpec::now();
-    let whiteout = Arc::new(LockedTmpfsInode::new(TmpfsInode {
+    let whiteout = Arc::try_new(LockedTmpfsInode::new(TmpfsInode {
         parent: dir.self_ref.clone(),
         self_ref: Weak::default(),
         children: BTreeMap::new(),
@@ -303,10 +402,10 @@ fn tmpfs_insert_whiteout(dir: &mut TmpfsInode, name: &DName) -> Result<(), Syste
             ctime: now,
             btime: now,
             file_type: FileType::CharDevice,
-            mode: InodeMode::S_IFCHR | InodeMode::from_bits_truncate(0o600),
+            mode: init.mode,
             nlinks: 1,
-            uid: 0,
-            gid: 0,
+            uid: init.uid,
+            gid: init.gid,
             raw_dev: WHITEOUT_DEV,
             flags: InodeFlags::empty(),
         },
@@ -315,10 +414,10 @@ fn tmpfs_insert_whiteout(dir: &mut TmpfsInode, name: &DName) -> Result<(), Syste
         inline_symlink: None,
         name: name.clone(),
         tmpfile_linkable: false,
-    }));
+    }))
+    .map_err(|_| SystemError::ENOMEM)?;
     whiteout.0.lock().self_ref = Arc::downgrade(&whiteout);
-    dir.children.insert(name.clone(), whiteout);
-    Ok(())
+    Ok(whiteout)
 }
 
 #[derive(Debug)]
@@ -331,6 +430,302 @@ pub struct LockedTmpfsInode(
 );
 
 impl LockedTmpfsInode {
+    fn prepare_primary_write_locked(
+        &self,
+        offset: usize,
+        len: usize,
+        context: &super::vfs::permission::InodeOpContext,
+        stage: &mut super::vfs::WritePrivilegeStage<'_>,
+    ) -> Result<(Arc<PageCache>, usize), SystemError> {
+        let mut inode = self.0.lock();
+        if inode.metadata.file_type == FileType::Dir {
+            return Err(SystemError::EISDIR);
+        }
+        let page_cache = inode.page_cache.clone().ok_or(SystemError::EIO)?;
+        offset.checked_add(len).ok_or(SystemError::EFBIG)?;
+        let permitted_len = if let Some(state) = self.3.as_ref() {
+            state
+                .lock()
+                .permitted_write_len(offset, len, inode.metadata.size as usize)?
+        } else {
+            len
+        };
+        let mut mode_changed = false;
+        if inode.metadata.file_type == FileType::File {
+            if let Some(cred) = &context.cred {
+                let view = context.view_metadata(&inode.metadata);
+                let (requested, derived_mask) =
+                    super::vfs::vcore::prepare_write_side_effect_metadata_with_cred(
+                        view,
+                        inode.metadata.size.max(0) as usize,
+                        cred,
+                    );
+                if derived_mask.contains(SetMetadataMask::MODE) {
+                    let mask = SetMetadataMask::MODE
+                        | SetMetadataMask::CTIME
+                        | SetMetadataMask::WRITE_SIDE_EFFECT;
+                    let backing =
+                        context.backing_metadata_request(&inode.metadata, &requested, mask)?;
+                    super::vfs::merge_metadata_masked(&mut inode.metadata, &backing, mask);
+                    mode_changed = true;
+                }
+            }
+        }
+        drop(inode);
+        stage.complete();
+        if mode_changed {
+            stage.commit_attrib();
+        }
+        Ok((page_cache, permitted_len))
+    }
+
+    /// The primary caller retains this content guard across privilege removal,
+    /// user-buffer faults and data publication; never reenter public write_at.
+    fn write_data_locked(
+        &self,
+        offset: usize,
+        permitted_len: usize,
+        buf: &[u8],
+        page_cache: &Arc<PageCache>,
+        _content: &crate::libs::rwsem::RwSemReadGuard<'_, ()>,
+    ) -> Result<usize, SystemError> {
+        let write_end = offset + permitted_len;
+        let start_page_index = offset >> MMArch::PAGE_SHIFT;
+        let end_page_index = (write_end - 1) >> MMArch::PAGE_SHIFT;
+        let mut written = 0usize;
+        for page_index in start_page_index..=end_page_index {
+            let page_start = page_index * MMArch::PAGE_SIZE;
+            let page_end = page_start + MMArch::PAGE_SIZE;
+
+            let write_start = core::cmp::max(offset, page_start);
+            let page_write_end = core::cmp::min(write_end, page_end);
+            let page_write_len = page_write_end.saturating_sub(write_start);
+            if page_write_len == 0 {
+                continue;
+            }
+
+            let pin = match page_cache.manager().commit_overwrite_pinned(page_index) {
+                Ok(pin) => pin,
+                Err(err) => {
+                    if written == 0 {
+                        return Err(err);
+                    }
+                    break;
+                }
+            };
+
+            // prefault 用户缓冲区，避免后续在持页锁时缺页
+            volatile_read!(buf[written]);
+            volatile_read!(buf[written + page_write_len - 1]);
+
+            let page = pin.page();
+            let mut page_guard = page.write();
+            unsafe {
+                let page_offset = write_start - page_start;
+                page_guard.as_slice_mut()[page_offset..page_offset + page_write_len]
+                    .copy_from_slice(&buf[written..written + page_write_len]);
+            }
+            page_guard.add_flags(crate::mm::page::PageFlags::PG_DIRTY);
+            if let Err(err) = page_cache.mark_page_dirty_page_locked(page_index, &page_guard) {
+                page_guard.remove_flags(crate::mm::page::PageFlags::PG_DIRTY);
+                if written == 0 {
+                    return Err(err);
+                }
+                break;
+            }
+            written += page_write_len;
+        }
+
+        // Quota is charged by page-cache membership. Logical size advances
+        // only through the prefix which was actually copied.
+        let mut inode = self.0.lock();
+        let committed_end = offset + written;
+        if committed_end > inode.metadata.size as usize {
+            inode.metadata.size = committed_end as i64;
+        }
+        Ok(written)
+    }
+
+    fn move_with_inode_context(
+        &self,
+        old_name: &str,
+        target: &Arc<dyn IndexNode>,
+        new_name: &str,
+        flags: RenameFlags,
+        context: &crate::filesystem::vfs::permission::InodeOpContext,
+    ) -> Result<RenameOutcome, SystemError> {
+        // tmpfs rename should move a directory entry (dentry move), not create
+        // a hardlink+unlink pair. The latter breaks directory moves (unlink()
+        // rejects directories) and can also lead to incorrect link/size accounting.
+
+        let old_key = DName::from(old_name);
+        let new_key = DName::from(new_name);
+
+        // Target must be a directory in tmpfs.
+        let target_locked = target
+            .clone()
+            .downcast_arc::<LockedTmpfsInode>()
+            .ok_or(SystemError::EINVAL)?;
+
+        // Lock ordering: lock by inode_id to avoid deadlocks.
+        let self_id = self.0.lock().metadata.inode_id;
+        let target_id = target_locked.0.lock().metadata.inode_id;
+
+        if self_id == target_id {
+            // Same directory rename.
+            let mut dir = self.0.lock();
+            tmpfs_require_live_dir(&dir)?;
+            let inode_to_move = dir
+                .children
+                .get(&old_key)
+                .cloned()
+                .ok_or(SystemError::ENOENT)?;
+            let old_type = inode_to_move.0.lock().metadata.file_type;
+
+            if flags.contains(RenameFlags::EXCHANGE) {
+                let existing = dir
+                    .children
+                    .get(&new_key)
+                    .cloned()
+                    .ok_or(SystemError::ENOENT)?;
+                let to_move_id = inode_to_move.0.lock().metadata.inode_id;
+                let existing_id = existing.0.lock().metadata.inode_id;
+                if existing_id == to_move_id {
+                    return Ok(RenameOutcome::NoOp);
+                }
+
+                tmpfs_check_rename(
+                    &dir.metadata,
+                    &dir.metadata,
+                    &inode_to_move,
+                    Some(&existing),
+                    true,
+                    context,
+                )?;
+
+                let now = PosixTimeSpec::now();
+                dir.children.insert(old_key.clone(), existing.clone());
+                dir.children.insert(new_key.clone(), inode_to_move.clone());
+                let mut existing = existing.0.lock();
+                existing.name = old_key;
+                existing.metadata.ctime = now;
+                let mut moved = inode_to_move.0.lock();
+                moved.name = new_key;
+                moved.metadata.ctime = now;
+                tmpfs_touch_dir(&mut dir, now);
+                return Ok(RenameOutcome::Exchange);
+            }
+
+            let mut whiteout = None;
+            let mut replaced = None;
+            if let Some(existing) = dir.children.get(&new_key).cloned() {
+                if flags.contains(RenameFlags::NOREPLACE) {
+                    return Err(SystemError::EEXIST);
+                }
+
+                // If destination already refers to the same inode, it's a no-op.
+                let existing_id = existing.0.lock().metadata.inode_id;
+                let to_move_id = inode_to_move.0.lock().metadata.inode_id;
+                if existing_id == to_move_id {
+                    return Ok(RenameOutcome::NoOp);
+                }
+
+                tmpfs_check_rename(
+                    &dir.metadata,
+                    &dir.metadata,
+                    &inode_to_move,
+                    Some(&existing),
+                    false,
+                    context,
+                )?;
+
+                let existing_type = existing.0.lock().metadata.file_type;
+                if old_type == FileType::Dir && existing_type != FileType::Dir {
+                    return Err(SystemError::ENOTDIR);
+                }
+                if old_type != FileType::Dir && existing_type == FileType::Dir {
+                    return Err(SystemError::EISDIR);
+                }
+
+                if old_type == FileType::Dir && !existing.0.lock().children.is_empty() {
+                    return Err(SystemError::ENOTEMPTY);
+                }
+
+                if flags.contains(RenameFlags::WHITEOUT) {
+                    whiteout = Some(tmpfs_prepare_whiteout(&dir, &old_key, context)?);
+                }
+                // Remove existing destination entry (replacement).
+                dir.children.remove(&new_key);
+                let mut existing_guard = existing.0.lock();
+                if existing_type == FileType::Dir {
+                    dir.metadata.nlinks = dir.metadata.nlinks.saturating_sub(1);
+                    existing_guard.metadata.nlinks = 0;
+                    replaced = Some(LinkRemovalOutcome::LastLink);
+                } else {
+                    existing_guard.metadata.nlinks =
+                        existing_guard.metadata.nlinks.saturating_sub(1);
+                    replaced = Some(if existing_guard.metadata.nlinks == 0 {
+                        LinkRemovalOutcome::LastLink
+                    } else {
+                        LinkRemovalOutcome::StillLinked
+                    });
+                }
+                existing_guard.metadata.ctime = PosixTimeSpec::now();
+            } else {
+                tmpfs_check_rename(
+                    &dir.metadata,
+                    &dir.metadata,
+                    &inode_to_move,
+                    None,
+                    false,
+                    context,
+                )?;
+            }
+
+            if flags.contains(RenameFlags::WHITEOUT) {
+                let whiteout = match whiteout {
+                    Some(inode) => inode,
+                    None => tmpfs_prepare_whiteout(&dir, &old_key, context)?,
+                };
+                dir.children.insert(old_key.clone(), whiteout);
+            } else {
+                dir.children.remove(&old_key);
+            }
+            dir.children.insert(new_key.clone(), inode_to_move.clone());
+            let now = PosixTimeSpec::now();
+            let mut moved = inode_to_move.0.lock();
+            moved.name = new_key;
+            moved.metadata.ctime = now;
+            tmpfs_touch_dir(&mut dir, now);
+            return Ok(RenameOutcome::Moved { replaced });
+        }
+
+        // Cross-directory move.
+        // Lock both directories in a stable order.
+        if self_id < target_id {
+            let mut src_dir = self.0.lock();
+            let mut dst_dir = target_locked.0.lock();
+            return tmpfs_move_entry_between_dirs(
+                &mut src_dir,
+                &mut dst_dir,
+                &old_key,
+                &new_key,
+                flags,
+                context,
+            );
+        } else {
+            let mut dst_dir = target_locked.0.lock();
+            let mut src_dir = self.0.lock();
+            return tmpfs_move_entry_between_dirs(
+                &mut src_dir,
+                &mut dst_dir,
+                &old_key,
+                &new_key,
+                flags,
+                context,
+            );
+        }
+    }
     fn new(inode: TmpfsInode) -> Self {
         Self::new_with_memfd(inode, None)
     }
@@ -540,42 +935,56 @@ pub struct TmpfsMountData {
 }
 
 impl TmpfsMountData {
+    /// Shared, side-effect-free parsing for initial mount and reconfiguration.
+    fn parse_parameter(&mut self, key: &str, value: Option<&str>) -> Result<(), SystemError> {
+        let value = value.ok_or(SystemError::EINVAL)?.trim();
+        match key {
+            "mode" => {
+                let mode = u32::from_str_radix(value, 8).map_err(|_| SystemError::EINVAL)?;
+                self.mode = Some(InodeMode::from_bits_truncate(mode));
+            }
+            "size" => {
+                let lower = value.to_lowercase();
+                let (number, multiplier) = if let Some(s) = lower.strip_suffix('g') {
+                    (s, 1u64 << 30)
+                } else if let Some(s) = lower.strip_suffix('m') {
+                    (s, 1u64 << 20)
+                } else if let Some(s) = lower.strip_suffix('k') {
+                    (s, 1u64 << 10)
+                } else {
+                    (lower.as_str(), 1u64)
+                };
+                let bytes = number
+                    .parse::<u64>()
+                    .map_err(|_| SystemError::EINVAL)?
+                    .checked_mul(multiplier)
+                    .ok_or(SystemError::EINVAL)?;
+                self.size_bytes = Some(
+                    bytes
+                        .checked_add(MMArch::PAGE_SIZE as u64 - 1)
+                        .ok_or(SystemError::EINVAL)?
+                        & !(MMArch::PAGE_SIZE as u64 - 1),
+                );
+            }
+            _ => return Err(SystemError::EINVAL),
+        }
+        Ok(())
+    }
+
     fn parse(raw: Option<&str>) -> Result<Self, SystemError> {
-        let mut mode = None;
-        let mut size_bytes = None;
+        let mut parsed = Self {
+            mode: None,
+            size_bytes: None,
+        };
 
         if let Some(raw) = raw {
             for opt in raw.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
-                if let Some(v) = opt.strip_prefix("mode=").map(|s| s.trim()) {
-                    // mode 参数按八进制解析（mount 的习惯用法，如 755 = rwxr-xr-x）
-                    let parsed = u32::from_str_radix(v, 8).map_err(|_| SystemError::EINVAL)?;
-                    mode = Some(InodeMode::from_bits_truncate(parsed));
-                } else if let Some(v) = opt.strip_prefix("size=").map(|s| s.trim()) {
-                    // 支持大小写后缀：g/G, m/M, k/K
-                    let v_lower = v.to_lowercase();
-                    let (num_str, mul) = if let Some(s) = v_lower.strip_suffix('g') {
-                        (s, 1u64 << 30)
-                    } else if let Some(s) = v_lower.strip_suffix('m') {
-                        (s, 1u64 << 20)
-                    } else if let Some(s) = v_lower.strip_suffix('k') {
-                        (s, 1u64 << 10)
-                    } else {
-                        (&v_lower[..], 1u64)
-                    };
-                    let base = num_str.parse::<u64>().map_err(|_| SystemError::EINVAL)?;
-                    let bytes = base.checked_mul(mul).ok_or(SystemError::EINVAL)?;
-                    let rounded = bytes
-                        .checked_add(MMArch::PAGE_SIZE as u64 - 1)
-                        .ok_or(SystemError::EINVAL)?
-                        & !(MMArch::PAGE_SIZE as u64 - 1);
-                    size_bytes = Some(rounded);
-                } else {
-                    return Err(SystemError::EINVAL);
-                }
+                let (key, value) = opt.split_once('=').ok_or(SystemError::EINVAL)?;
+                parsed.parse_parameter(key, Some(value))?;
             }
         }
 
-        Ok(Self { mode, size_bytes })
+        Ok(parsed)
     }
 }
 
@@ -676,6 +1085,10 @@ impl FileSystem for Tmpfs {
         "tmpfs"
     }
 
+    fn supports_idmapped_mounts(&self) -> bool {
+        true
+    }
+
     fn proc_show_mount_options(
         &self,
         _mount: &super::vfs::mount::MountFS,
@@ -728,6 +1141,18 @@ impl FileSystem for Tmpfs {
         }
 
         Ok(request.sb_flags & request.sb_flags_mask)
+    }
+
+    fn validate_reconfigure_parameter(
+        &self,
+        key: &str,
+        value: Option<&str>,
+    ) -> Result<(), SystemError> {
+        TmpfsMountData {
+            mode: None,
+            size_bytes: None,
+        }
+        .parse_parameter(key, value)
     }
 }
 
@@ -981,6 +1406,14 @@ pub fn create_memfd_file(
 impl MountableFileSystem for Tmpfs {
     const SUPPORTS_FSCONFIG_LEGACY_OPTIONS: bool = true;
 
+    fn validate_fsconfig_parameter(key: &str, value: Option<&str>) -> Result<(), SystemError> {
+        TmpfsMountData {
+            mode: None,
+            size_bytes: None,
+        }
+        .parse_parameter(key, value)
+    }
+
     fn make_mount_data(
         raw_data: Option<&str>,
         _source: &str,
@@ -1002,6 +1435,158 @@ impl MountableFileSystem for Tmpfs {
 }
 
 register_mountable_fs!(Tmpfs, TMPFSMAKER, "tmpfs");
+
+impl LockedTmpfsInode {
+    fn unlink_with_operation_context(
+        &self,
+        name: &str,
+        context: &crate::filesystem::vfs::permission::InodeOpContext,
+    ) -> Result<LinkRemovalOutcome, SystemError> {
+        let mut inode: MutexGuard<TmpfsInode> = self.0.lock();
+        tmpfs_require_live_dir(&inode)?;
+        if name == "." || name == ".." {
+            return Err(SystemError::ENOTEMPTY);
+        }
+
+        let name = DName::from(name);
+        let to_delete = inode.children.get(&name).ok_or(SystemError::ENOENT)?;
+        let deleted_inode = to_delete.0.lock();
+        crate::filesystem::vfs::permission::check_inode_delete(
+            &inode.metadata,
+            &deleted_inode.metadata,
+            false,
+            context,
+        )?;
+
+        drop(deleted_inode);
+
+        let mut deleted_guard = to_delete.0.lock();
+        deleted_guard.metadata.nlinks = deleted_guard
+            .metadata
+            .nlinks
+            .checked_sub(1)
+            .expect("tempfs nlinks underflow: filesystem corruption detected");
+        let outcome = if deleted_guard.metadata.nlinks == 0 {
+            LinkRemovalOutcome::LastLink
+        } else {
+            LinkRemovalOutcome::StillLinked
+        };
+
+        let now = PosixTimeSpec::now();
+        deleted_guard.metadata.ctime = now;
+        drop(deleted_guard);
+
+        inode.children.remove(&name);
+        tmpfs_touch_dir(&mut inode, now);
+
+        Ok(outcome)
+    }
+}
+
+impl LockedTmpfsInode {
+    fn rmdir_with_operation_context(
+        &self,
+        name: &str,
+        context: &crate::filesystem::vfs::permission::InodeOpContext,
+    ) -> Result<(), SystemError> {
+        // 检查是否为 "." 或 ".."
+        if name == "." {
+            return Err(SystemError::EINVAL);
+        }
+        if name == ".." {
+            return Err(SystemError::ENOTEMPTY);
+        }
+
+        let name = DName::from(name);
+        let mut inode: MutexGuard<TmpfsInode> = self.0.lock();
+        tmpfs_require_live_dir(&inode)?;
+        let to_delete = inode.children.get(&name).ok_or(SystemError::ENOENT)?;
+        let deleted_inode = to_delete.0.lock();
+        crate::filesystem::vfs::permission::check_inode_delete(
+            &inode.metadata,
+            &deleted_inode.metadata,
+            true,
+            context,
+        )?;
+
+        // 检查目录是否为空（排除 "." 和 ".."）
+        if !deleted_inode.children.is_empty() {
+            return Err(SystemError::ENOTEMPTY);
+        }
+
+        drop(deleted_inode);
+        let now = PosixTimeSpec::now();
+        let mut deleted_inode = to_delete.0.lock();
+        deleted_inode.metadata.nlinks = 0;
+        deleted_inode.metadata.ctime = now;
+        drop(deleted_inode);
+        inode.children.remove(&name);
+        inode.metadata.nlinks -= 1;
+        tmpfs_touch_dir(&mut inode, now);
+
+        Ok(())
+    }
+}
+
+impl LockedTmpfsInode {
+    fn resize_with_operation(
+        &self,
+        len: usize,
+        request: Option<(
+            &Metadata,
+            SetMetadataMask,
+            &crate::filesystem::vfs::permission::InodeOpContext,
+        )>,
+    ) -> Result<SetMetadataMask, SystemError> {
+        let _size_guard = self.1.write();
+        let mut applied = SetMetadataMask::empty();
+        let (old_size, new_size, page_cache) = {
+            let mut inode = self.0.lock();
+            if inode.metadata.file_type != FileType::File {
+                return Err(SystemError::EINVAL);
+            }
+
+            let old_size = inode.metadata.size as usize;
+            let new_size = len;
+            let prepared = request
+                .map(|(requested, mask, context)| {
+                    crate::filesystem::vfs::vcore::prepare_backing_resize_metadata(
+                        context,
+                        &inode.metadata,
+                        requested,
+                        mask,
+                        len,
+                    )
+                })
+                .transpose()?;
+            if let Some(state) = self.3.as_ref() {
+                state.lock().check_resize(old_size, new_size)?;
+            }
+
+            if let Some((metadata, mask)) = prepared {
+                if mask.contains(SetMetadataMask::MODE) {
+                    self.check_exec_mode_change(inode.metadata.mode, metadata.mode)?;
+                }
+                crate::filesystem::vfs::merge_metadata_masked(&mut inode.metadata, &metadata, mask);
+                applied = mask;
+            }
+
+            // Linux truncate_setsize() writes the new i_size before truncating page cache.
+            // Drop the inode lock before page-cache unmap/truncate so page faults do not
+            // form an inode-lock/MM-lock ABBA with the truncate path.
+            inode.metadata.size = len as i64;
+            (old_size, new_size, inode.page_cache.clone())
+        };
+
+        if new_size < old_size {
+            if let Some(pc) = page_cache {
+                pc.manager().resize(len)?;
+            }
+        }
+
+        Ok(applied)
+    }
+}
 
 impl IndexNode for LockedTmpfsInode {
     fn link_mutation_coordinator(&self) -> Option<&LinkMutationCoordinator> {
@@ -1240,88 +1825,97 @@ impl IndexNode for LockedTmpfsInode {
         offset: usize,
         len: usize,
         buf: &[u8],
-        _data: MutexGuard<FilePrivateData>,
+        data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        if buf.len() < len {
-            return Err(SystemError::EINVAL);
-        }
+        let mut publish = || {};
+        let mut stage = super::vfs::WritePrivilegeStage::new(&mut publish);
+        self.write_at_with_privilege_stage(offset, len, buf, data, &mut stage)
+    }
 
-        // Linux 语义：写入 0 字节应当成功返回 0，且不改变文件偏移/大小。
-        // 同时避免后续 (offset + len - 1) 的下溢导致超大页范围遍历。
+    fn write_at_with_privilege_stage(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &[u8],
+        data: MutexGuard<FilePrivateData>,
+        stage: &mut super::vfs::WritePrivilegeStage<'_>,
+    ) -> Result<usize, SystemError> {
+        self.write_at_with_inode_context(
+            offset,
+            len,
+            buf,
+            data,
+            &super::vfs::permission::InodeOpContext::legacy(),
+            stage,
+        )
+    }
+
+    fn write_at_with_inode_context(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &[u8],
+        data: MutexGuard<FilePrivateData>,
+        context: &super::vfs::permission::InodeOpContext,
+        stage: &mut super::vfs::WritePrivilegeStage<'_>,
+    ) -> Result<usize, SystemError> {
+        self.write_primary_with_inode_context(
+            offset,
+            len,
+            super::vfs::PrimaryWriteSource::Kernel(buf),
+            data,
+            context,
+            stage,
+        )
+    }
+
+    fn write_primary_with_privilege_stage(
+        &self,
+        offset: usize,
+        len: usize,
+        source: super::vfs::PrimaryWriteSource<'_, '_>,
+        data: MutexGuard<FilePrivateData>,
+        stage: &mut super::vfs::WritePrivilegeStage<'_>,
+    ) -> Result<usize, SystemError> {
+        self.write_primary_with_inode_context(
+            offset,
+            len,
+            source,
+            data,
+            &super::vfs::permission::InodeOpContext::legacy(),
+            stage,
+        )
+    }
+
+    fn write_primary_with_inode_context(
+        &self,
+        offset: usize,
+        len: usize,
+        source: super::vfs::PrimaryWriteSource<'_, '_>,
+        _data: MutexGuard<FilePrivateData>,
+        context: &super::vfs::permission::InodeOpContext,
+        stage: &mut super::vfs::WritePrivilegeStage<'_>,
+    ) -> Result<usize, SystemError> {
+        if let super::vfs::PrimaryWriteSource::Kernel(buffer) = &source {
+            if buffer.len() < len {
+                return Err(SystemError::EINVAL);
+            }
+        }
         if len == 0 {
             return Ok(0);
         }
-        let _size_guard = self.1.read();
-        let inode = self.0.lock();
-        if inode.metadata.file_type == FileType::Dir {
-            return Err(SystemError::EISDIR);
-        }
-        let page_cache = inode.page_cache.clone().ok_or(SystemError::EIO)?;
-        offset.checked_add(len).ok_or(SystemError::EFBIG)?;
-        let permitted_len = if let Some(state) = self.3.as_ref() {
-            state
-                .lock()
-                .permitted_write_len(offset, len, inode.metadata.size as usize)?
-        } else {
-            len
-        };
-        let write_end = offset + permitted_len;
-        drop(inode);
-
-        let start_page_index = offset >> MMArch::PAGE_SHIFT;
-        let end_page_index = (write_end - 1) >> MMArch::PAGE_SHIFT;
-        let mut written = 0usize;
-        for page_index in start_page_index..=end_page_index {
-            let page_start = page_index * MMArch::PAGE_SIZE;
-            let page_end = page_start + MMArch::PAGE_SIZE;
-
-            let write_start = core::cmp::max(offset, page_start);
-            let page_write_end = core::cmp::min(write_end, page_end);
-            let page_write_len = page_write_end.saturating_sub(write_start);
-            if page_write_len == 0 {
-                continue;
-            }
-
-            let pin = match page_cache.manager().commit_overwrite_pinned(page_index) {
-                Ok(pin) => pin,
-                Err(err) => {
-                    if written == 0 {
-                        return Err(err);
-                    }
-                    break;
-                }
-            };
-
-            // prefault 用户缓冲区，避免后续在持页锁时缺页
-            volatile_read!(buf[written]);
-            volatile_read!(buf[written + page_write_len - 1]);
-
-            let page = pin.page();
-            let mut page_guard = page.write();
-            unsafe {
-                let page_offset = write_start - page_start;
-                page_guard.as_slice_mut()[page_offset..page_offset + page_write_len]
-                    .copy_from_slice(&buf[written..written + page_write_len]);
-            }
-            page_guard.add_flags(crate::mm::page::PageFlags::PG_DIRTY);
-            if let Err(err) = page_cache.mark_page_dirty_page_locked(page_index, &page_guard) {
-                page_guard.remove_flags(crate::mm::page::PageFlags::PG_DIRTY);
-                if written == 0 {
-                    return Err(err);
-                }
-                break;
-            }
-            written += page_write_len;
-        }
-
-        // Quota is charged by page-cache membership. Logical size advances
-        // only through the prefix which was actually copied.
-        let mut inode = self.0.lock();
-        let committed_end = offset + written;
-        if committed_end > inode.metadata.size as usize {
-            inode.metadata.size = committed_end as i64;
-        }
-        Ok(written)
+        let content = self.1.read();
+        let (page_cache, permitted_len) =
+            self.prepare_primary_write_locked(offset, len, context, stage)?;
+        source.with_buffer(permitted_len, |buffer| {
+            self.write_data_locked(
+                offset,
+                permitted_len.min(buffer.len()),
+                buffer,
+                &page_cache,
+                &content,
+            )
+        })
     }
 
     fn fs(&self) -> Arc<dyn FileSystem> {
@@ -1333,17 +1927,35 @@ impl IndexNode for LockedTmpfsInode {
     }
 
     fn metadata(&self) -> Result<Metadata, SystemError> {
-        let inode = self.0.lock();
-        Ok(inode.metadata.clone())
+        let (mut metadata, cache) = {
+            let inode = self.0.lock();
+            (inode.metadata.clone(), inode.page_cache.clone())
+        };
+        if let Some(cache) = cache {
+            metadata.blocks = cache
+                .manager()
+                .pages_count()?
+                .checked_mul(MMArch::PAGE_SIZE / 512)
+                .ok_or(SystemError::EOVERFLOW)?;
+        }
+        Ok(metadata)
     }
 
     fn cached_metadata(&self) -> Result<Metadata, SystemError> {
-        Ok(self
-            .0
-            .try_lock()
-            .map_err(|_| SystemError::EAGAIN_OR_EWOULDBLOCK)?
-            .metadata
-            .clone())
+        let (mut metadata, cache) = {
+            let inode = self
+                .0
+                .try_lock()
+                .map_err(|_| SystemError::EAGAIN_OR_EWOULDBLOCK)?;
+            (inode.metadata.clone(), inode.page_cache.clone())
+        };
+        if let Some(cache) = cache {
+            metadata.blocks = cache
+                .try_pages_count()?
+                .checked_mul(MMArch::PAGE_SIZE / 512)
+                .ok_or(SystemError::EOVERFLOW)?;
+        }
+        Ok(metadata)
     }
 
     fn cached_symlink_target(&self) -> Result<String, SystemError> {
@@ -1405,33 +2017,135 @@ impl IndexNode for LockedTmpfsInode {
     }
 
     fn resize(&self, len: usize) -> Result<(), SystemError> {
-        let _size_guard = self.1.write();
-        let (old_size, new_size, page_cache) = {
-            let mut inode = self.0.lock();
-            if inode.metadata.file_type != FileType::File {
-                return Err(SystemError::EINVAL);
-            }
+        self.resize_with_operation(len, None).map(|_| ())
+    }
 
-            let old_size = inode.metadata.size as usize;
-            let new_size = len;
-            if let Some(state) = self.3.as_ref() {
-                state.lock().check_resize(old_size, new_size)?;
-            }
+    fn resize_with_metadata(
+        &self,
+        len: usize,
+        lock_owner: u64,
+        metadata: &Metadata,
+        mask: SetMetadataMask,
+    ) -> Result<(), SystemError> {
+        self.resize_with_metadata_context(
+            len,
+            lock_owner,
+            metadata,
+            mask,
+            &crate::filesystem::vfs::permission::InodeOpContext::legacy(),
+        )
+        .map(|_| ())
+    }
 
-            // Linux truncate_setsize() writes the new i_size before truncating page cache.
-            // Drop the inode lock before page-cache unmap/truncate so page faults do not
-            // form an inode-lock/MM-lock ABBA with the truncate path.
-            inode.metadata.size = len as i64;
-            (old_size, new_size, inode.page_cache.clone())
-        };
+    fn resize_with_metadata_context(
+        &self,
+        len: usize,
+        _lock_owner: u64,
+        metadata: &Metadata,
+        mask: SetMetadataMask,
+        context: &crate::filesystem::vfs::permission::InodeOpContext,
+    ) -> Result<SetMetadataMask, SystemError> {
+        self.resize_with_operation(len, Some((metadata, mask, context)))
+    }
 
-        if new_size < old_size {
-            if let Some(pc) = page_cache {
-                pc.manager().resize(len)?;
-            }
-        }
+    fn resize_file_with_metadata(
+        &self,
+        len: usize,
+        lock_owner: u64,
+        data: MutexGuard<FilePrivateData>,
+        metadata: &Metadata,
+        mask: SetMetadataMask,
+    ) -> Result<(), SystemError> {
+        self.resize_file_with_metadata_context(
+            len,
+            lock_owner,
+            data,
+            metadata,
+            mask,
+            &crate::filesystem::vfs::permission::InodeOpContext::legacy(),
+        )
+        .map(|_| ())
+    }
 
-        Ok(())
+    fn resize_file_with_metadata_context(
+        &self,
+        len: usize,
+        lock_owner: u64,
+        data: MutexGuard<FilePrivateData>,
+        metadata: &Metadata,
+        mask: SetMetadataMask,
+        context: &crate::filesystem::vfs::permission::InodeOpContext,
+    ) -> Result<SetMetadataMask, SystemError> {
+        drop(data);
+        self.resize_with_metadata_context(len, lock_owner, metadata, mask, context)
+    }
+
+    fn resize_open_truncate_with_inode_context(
+        &self,
+        len: usize,
+        lock_owner: u64,
+        data: MutexGuard<FilePrivateData>,
+        truncate: &crate::filesystem::vfs::OpenTruncateContext,
+        context: &crate::filesystem::vfs::permission::InodeOpContext,
+    ) -> Result<SetMetadataMask, SystemError> {
+        self.resize_file_with_metadata_context(
+            len,
+            lock_owner,
+            data,
+            &truncate.requested,
+            truncate.mask,
+            context,
+        )
+    }
+
+    fn resize_with_metadata_result(
+        &self,
+        len: usize,
+        lock_owner: u64,
+        metadata: &Metadata,
+        mask: SetMetadataMask,
+    ) -> Result<SetMetadataMask, SystemError> {
+        self.resize_with_metadata_context(
+            len,
+            lock_owner,
+            metadata,
+            mask,
+            &crate::filesystem::vfs::permission::InodeOpContext::legacy(),
+        )
+    }
+
+    fn resize_file_with_metadata_result(
+        &self,
+        len: usize,
+        lock_owner: u64,
+        data: MutexGuard<FilePrivateData>,
+        metadata: &Metadata,
+        mask: SetMetadataMask,
+    ) -> Result<SetMetadataMask, SystemError> {
+        self.resize_file_with_metadata_context(
+            len,
+            lock_owner,
+            data,
+            metadata,
+            mask,
+            &crate::filesystem::vfs::permission::InodeOpContext::legacy(),
+        )
+    }
+
+    fn resize_open_truncate_result(
+        &self,
+        len: usize,
+        lock_owner: u64,
+        data: MutexGuard<FilePrivateData>,
+        truncate: &crate::filesystem::vfs::OpenTruncateContext,
+    ) -> Result<SetMetadataMask, SystemError> {
+        self.resize_open_truncate_with_inode_context(
+            len,
+            lock_owner,
+            data,
+            truncate,
+            &crate::filesystem::vfs::permission::InodeOpContext::legacy(),
+        )
     }
 
     fn fallocate_file(
@@ -1442,6 +2156,27 @@ impl IndexNode for LockedTmpfsInode {
         lock_owner: u64,
         attrib: &mut crate::filesystem::vfs::AttribStageObserver<'_>,
         data: MutexGuard<FilePrivateData>,
+    ) -> Result<(), SystemError> {
+        self.fallocate_file_with_inode_context(
+            mode,
+            offset,
+            len,
+            lock_owner,
+            attrib,
+            data,
+            &crate::filesystem::vfs::permission::InodeOpContext::legacy(),
+        )
+    }
+
+    fn fallocate_file_with_inode_context(
+        &self,
+        mode: i32,
+        offset: usize,
+        len: usize,
+        lock_owner: u64,
+        attrib: &mut crate::filesystem::vfs::AttribStageObserver<'_>,
+        data: MutexGuard<FilePrivateData>,
+        context: &crate::filesystem::vfs::permission::InodeOpContext,
     ) -> Result<(), SystemError> {
         drop(data);
         const KEEP_SIZE: i32 = 0x01;
@@ -1459,7 +2194,6 @@ impl IndexNode for LockedTmpfsInode {
         crate::filesystem::vfs::vcore::check_file_size_limit(end)?;
 
         let _size_guard = self.1.write();
-        let cred = ProcessManager::current_pcb().cred();
         if mode & PUNCH_HOLE != 0 {
             let (page_cache, size) = {
                 let inode = self.0.lock();
@@ -1475,24 +2209,9 @@ impl IndexNode for LockedTmpfsInode {
             };
             if offset < size {
                 page_cache.punch_hole(offset, end.min(size))?;
-                let mode_changed = {
-                    let mut inode = self.0.lock();
-                    let (metadata, mask) =
-                        crate::filesystem::vfs::vcore::prepare_write_side_effect_metadata_with_cred(
-                            inode.metadata.clone(),
-                            size,
-                            &cred,
-                        );
-                    crate::filesystem::vfs::merge_metadata_masked(
-                        &mut inode.metadata,
-                        &metadata,
-                        mask,
-                    );
-                    mask.contains(SetMetadataMask::MODE)
-                };
-                if mode_changed {
-                    attrib.commit();
-                }
+            }
+            if tmpfs_fallocate_modified(&mut self.0.lock(), context) {
+                attrib.commit();
             }
             let _ = lock_owner;
             return Ok(());
@@ -1530,15 +2249,8 @@ impl IndexNode for LockedTmpfsInode {
             } else {
                 core::cmp::max(inode.metadata.size.max(0) as usize, end)
             };
-            let (metadata, mask) =
-                crate::filesystem::vfs::vcore::prepare_write_side_effect_metadata_with_cred(
-                    inode.metadata.clone(),
-                    effective_size,
-                    &cred,
-                );
-            crate::filesystem::vfs::merge_metadata_masked(&mut inode.metadata, &metadata, mask);
-            inode.metadata.size = metadata.size;
-            mask.contains(SetMetadataMask::MODE)
+            inode.metadata.size = effective_size as i64;
+            tmpfs_fallocate_modified(&mut inode, context)
         };
         if mode_changed {
             attrib.commit();
@@ -1548,6 +2260,19 @@ impl IndexNode for LockedTmpfsInode {
     }
 
     fn symlink(&self, name: &str, target: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
+        self.symlink_with_context(
+            name,
+            target,
+            &crate::filesystem::vfs::permission::InodeOpContext::legacy(),
+        )
+    }
+
+    fn symlink_with_context(
+        &self,
+        name: &str,
+        target: &str,
+        context: &crate::filesystem::vfs::permission::InodeOpContext,
+    ) -> Result<Arc<dyn IndexNode>, SystemError> {
         const SHORT_SYMLINK_LEN: usize = 128;
 
         if target
@@ -1565,26 +2290,13 @@ impl IndexNode for LockedTmpfsInode {
         if parent.children.contains_key(&name) {
             return Err(SystemError::EEXIST);
         }
-        // Revalidate local DAC while holding the same lock that protects the
-        // parent metadata and publishes the child. This is the tmpfs analogue
-        // of Linux holding the parent inode lock across may_create()+symlink.
-        if parent.metadata.flags.contains(InodeFlags::S_IMMUTABLE) {
-            return Err(SystemError::EPERM);
-        }
-        if ProcessManager::initialized() {
-            let cred = ProcessManager::current_pcb().cred();
-            cred.inode_permission(
-                &parent.metadata,
-                (crate::filesystem::vfs::permission::PermissionMask::MAY_WRITE
-                    | crate::filesystem::vfs::permission::PermissionMask::MAY_EXEC)
-                    .bits(),
-            )?;
-        }
-        let init = crate::filesystem::vfs::permission::child_inode_init(
+        crate::filesystem::vfs::permission::check_parent_create(&parent.metadata, context, false)?;
+        let init = crate::filesystem::vfs::permission::child_inode_init_with_context(
             &parent.metadata,
             FileType::SymLink,
             InodeMode::S_IRWXUGO,
-        );
+            context,
+        )?;
 
         let now = PosixTimeSpec::now();
         let inline = target.len() < SHORT_SYMLINK_LEN;
@@ -1598,7 +2310,7 @@ impl IndexNode for LockedTmpfsInode {
                 inode_id: generate_inode_id(),
                 size: target.len() as i64,
                 blk_size: TMPFS_BLOCK_SIZE as usize,
-                blocks: if inline { 0 } else { 1 },
+                blocks: 0, // Project the actual long-symlink cache allocation in metadata().
                 atime: now,
                 mtime: now,
                 ctime: now,
@@ -1651,14 +2363,55 @@ impl IndexNode for LockedTmpfsInode {
         mode: InodeMode,
         data: usize,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
+        self.create_with_data_context(
+            name,
+            file_type,
+            mode,
+            data,
+            &crate::filesystem::vfs::permission::InodeOpContext::legacy(),
+        )
+    }
+
+    fn create_with_context(
+        &self,
+        name: &str,
+        file_type: FileType,
+        mode: InodeMode,
+        context: &crate::filesystem::vfs::permission::InodeOpContext,
+    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+        self.create_with_data_context(name, file_type, mode, 0, context)
+    }
+
+    fn mkdir_with_context(
+        &self,
+        name: &str,
+        mode: InodeMode,
+        context: &crate::filesystem::vfs::permission::InodeOpContext,
+    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+        self.create_with_context(name, FileType::Dir, mode, context)
+    }
+
+    fn create_with_data_context(
+        &self,
+        name: &str,
+        file_type: FileType,
+        mode: InodeMode,
+        data: usize,
+        context: &crate::filesystem::vfs::permission::InodeOpContext,
+    ) -> Result<Arc<dyn IndexNode>, SystemError> {
         let name = DName::from(name);
         let mut inode = self.0.lock();
         tmpfs_require_live_dir(&inode)?;
         if inode.children.contains_key(&name) {
             return Err(SystemError::EEXIST);
         }
-        let init =
-            crate::filesystem::vfs::permission::child_inode_init(&inode.metadata, file_type, mode);
+        crate::filesystem::vfs::permission::check_parent_create(&inode.metadata, context, false)?;
+        let init = crate::filesystem::vfs::permission::child_inode_init_with_context(
+            &inode.metadata,
+            file_type,
+            mode,
+            context,
+        )?;
 
         let now = PosixTimeSpec::now();
         let result: Arc<LockedTmpfsInode> = Arc::new(LockedTmpfsInode::new(TmpfsInode {
@@ -1722,27 +2475,29 @@ impl IndexNode for LockedTmpfsInode {
         mode: InodeMode,
         flags: &FileFlags,
     ) -> Result<super::vfs::UnlinkedFile, SystemError> {
+        self.tmpfile_with_context(
+            mode,
+            flags,
+            &crate::filesystem::vfs::permission::InodeOpContext::legacy(),
+        )
+    }
+
+    fn tmpfile_with_context(
+        &self,
+        mode: InodeMode,
+        flags: &FileFlags,
+        context: &crate::filesystem::vfs::permission::InodeOpContext,
+    ) -> Result<super::vfs::UnlinkedFile, SystemError> {
         let parent = self.0.lock();
         // O_TMPFILE creates no child name. Linux permits it through a dirfd
         // whose directory was removed after the fd was opened.
-        if parent.metadata.file_type != FileType::Dir {
-            return Err(SystemError::ENOTDIR);
-        }
-        if parent.metadata.flags.contains(InodeFlags::S_IMMUTABLE) {
-            return Err(SystemError::EPERM);
-        }
-        let cred = ProcessManager::current_pcb().cred();
-        cred.inode_permission(
-            &parent.metadata,
-            (crate::filesystem::vfs::permission::PermissionMask::MAY_WRITE
-                | crate::filesystem::vfs::permission::PermissionMask::MAY_EXEC)
-                .bits(),
-        )?;
-        let init = crate::filesystem::vfs::permission::child_inode_init(
+        crate::filesystem::vfs::permission::check_parent_create(&parent.metadata, context, true)?;
+        let init = crate::filesystem::vfs::permission::child_inode_init_with_context(
             &parent.metadata,
             FileType::File,
             mode,
-        );
+            context,
+        )?;
         let now = PosixTimeSpec::now();
         let inode_id = generate_inode_id();
         let fs = parent.fs.clone();
@@ -1787,6 +2542,19 @@ impl IndexNode for LockedTmpfsInode {
     }
 
     fn link(&self, name: &str, other: &Arc<dyn IndexNode>) -> Result<(), SystemError> {
+        self.link_with_inode_context(
+            name,
+            other,
+            &crate::filesystem::vfs::permission::InodeOpContext::legacy(),
+        )
+    }
+
+    fn link_with_inode_context(
+        &self,
+        name: &str,
+        other: &Arc<dyn IndexNode>,
+        context: &crate::filesystem::vfs::permission::InodeOpContext,
+    ) -> Result<(), SystemError> {
         // downcast 用于获取类型特定功能（跨文件系统检查已在 VFS 层完成）
         let other: &LockedTmpfsInode = other
             .downcast_ref::<LockedTmpfsInode>()
@@ -1802,6 +2570,12 @@ impl IndexNode for LockedTmpfsInode {
         if inode.children.contains_key(&name) {
             return Err(SystemError::EEXIST);
         }
+
+        crate::filesystem::vfs::permission::check_parent_create(&inode.metadata, context, false)?;
+        crate::filesystem::vfs::permission::check_inode_link_source(
+            &other_locked.metadata,
+            context,
+        )?;
 
         if other_locked.metadata.nlinks == 0 && !other_locked.tmpfile_linkable {
             return Err(SystemError::ENOENT);
@@ -1819,77 +2593,37 @@ impl IndexNode for LockedTmpfsInode {
     }
 
     fn unlink(&self, name: &str) -> Result<LinkRemovalOutcome, SystemError> {
-        let mut inode: MutexGuard<TmpfsInode> = self.0.lock();
-        tmpfs_require_live_dir(&inode)?;
-        if name == "." || name == ".." {
-            return Err(SystemError::ENOTEMPTY);
-        }
+        self.unlink_with_operation_context(
+            name,
+            &crate::filesystem::vfs::permission::InodeOpContext::legacy(),
+        )
+    }
 
-        let name = DName::from(name);
-        let to_delete = inode.children.get(&name).ok_or(SystemError::ENOENT)?;
-        let deleted_inode = to_delete.0.lock();
-        if deleted_inode.metadata.file_type == FileType::Dir {
-            return Err(SystemError::EPERM);
-        }
-
-        drop(deleted_inode);
-
-        let mut deleted_guard = to_delete.0.lock();
-        deleted_guard.metadata.nlinks = deleted_guard
-            .metadata
-            .nlinks
-            .checked_sub(1)
-            .expect("tempfs nlinks underflow: filesystem corruption detected");
-        let outcome = if deleted_guard.metadata.nlinks == 0 {
-            LinkRemovalOutcome::LastLink
-        } else {
-            LinkRemovalOutcome::StillLinked
-        };
-
-        let now = PosixTimeSpec::now();
-        deleted_guard.metadata.ctime = now;
-        drop(deleted_guard);
-
-        inode.children.remove(&name);
-        tmpfs_touch_dir(&mut inode, now);
-
-        Ok(outcome)
+    fn unlink_with_inode_context(
+        &self,
+        name: &str,
+        mutation: &crate::filesystem::vfs::mount::DentryMutationContext<'_>,
+        context: &crate::filesystem::vfs::permission::InodeOpContext,
+    ) -> Result<LinkRemovalOutcome, SystemError> {
+        mutation.ensure_locked();
+        self.unlink_with_operation_context(name, context)
     }
 
     fn rmdir(&self, name: &str) -> Result<(), SystemError> {
-        // 检查是否为 "." 或 ".."
-        if name == "." {
-            return Err(SystemError::EINVAL);
-        }
-        if name == ".." {
-            return Err(SystemError::ENOTEMPTY);
-        }
+        self.rmdir_with_operation_context(
+            name,
+            &crate::filesystem::vfs::permission::InodeOpContext::legacy(),
+        )
+    }
 
-        let name = DName::from(name);
-        let mut inode: MutexGuard<TmpfsInode> = self.0.lock();
-        tmpfs_require_live_dir(&inode)?;
-        let to_delete = inode.children.get(&name).ok_or(SystemError::ENOENT)?;
-        let deleted_inode = to_delete.0.lock();
-        if deleted_inode.metadata.file_type != FileType::Dir {
-            return Err(SystemError::ENOTDIR);
-        }
-
-        // 检查目录是否为空（排除 "." 和 ".."）
-        if !deleted_inode.children.is_empty() {
-            return Err(SystemError::ENOTEMPTY);
-        }
-
-        drop(deleted_inode);
-        let now = PosixTimeSpec::now();
-        let mut deleted_inode = to_delete.0.lock();
-        deleted_inode.metadata.nlinks = 0;
-        deleted_inode.metadata.ctime = now;
-        drop(deleted_inode);
-        inode.children.remove(&name);
-        inode.metadata.nlinks -= 1;
-        tmpfs_touch_dir(&mut inode, now);
-
-        Ok(())
+    fn rmdir_with_inode_context(
+        &self,
+        name: &str,
+        mutation: &crate::filesystem::vfs::mount::DentryMutationContext<'_>,
+        context: &crate::filesystem::vfs::permission::InodeOpContext,
+    ) -> Result<(), SystemError> {
+        mutation.ensure_locked();
+        self.rmdir_with_operation_context(name, context)
     }
 
     fn move_to(
@@ -1899,140 +2633,26 @@ impl IndexNode for LockedTmpfsInode {
         new_name: &str,
         flags: RenameFlags,
     ) -> Result<RenameOutcome, SystemError> {
-        // tmpfs rename should move a directory entry (dentry move), not create
-        // a hardlink+unlink pair. The latter breaks directory moves (unlink()
-        // rejects directories) and can also lead to incorrect link/size accounting.
+        self.move_with_inode_context(
+            old_name,
+            target,
+            new_name,
+            flags,
+            &crate::filesystem::vfs::permission::InodeOpContext::legacy(),
+        )
+    }
 
-        let old_key = DName::from(old_name);
-        let new_key = DName::from(new_name);
-
-        // Target must be a directory in tmpfs.
-        let target_locked = target
-            .clone()
-            .downcast_arc::<LockedTmpfsInode>()
-            .ok_or(SystemError::EINVAL)?;
-
-        // Lock ordering: lock by inode_id to avoid deadlocks.
-        let self_id = self.0.lock().metadata.inode_id;
-        let target_id = target_locked.0.lock().metadata.inode_id;
-
-        if self_id == target_id {
-            // Same directory rename.
-            let mut dir = self.0.lock();
-            tmpfs_require_live_dir(&dir)?;
-            let inode_to_move = dir
-                .children
-                .get(&old_key)
-                .cloned()
-                .ok_or(SystemError::ENOENT)?;
-            let old_type = inode_to_move.0.lock().metadata.file_type;
-
-            if flags.contains(RenameFlags::EXCHANGE) {
-                let existing = dir
-                    .children
-                    .get(&new_key)
-                    .cloned()
-                    .ok_or(SystemError::ENOENT)?;
-                let to_move_id = inode_to_move.0.lock().metadata.inode_id;
-                let existing_id = existing.0.lock().metadata.inode_id;
-                if existing_id == to_move_id {
-                    return Ok(RenameOutcome::NoOp);
-                }
-
-                let now = PosixTimeSpec::now();
-                dir.children.insert(old_key.clone(), existing.clone());
-                dir.children.insert(new_key.clone(), inode_to_move.clone());
-                let mut existing = existing.0.lock();
-                existing.name = old_key;
-                existing.metadata.ctime = now;
-                let mut moved = inode_to_move.0.lock();
-                moved.name = new_key;
-                moved.metadata.ctime = now;
-                tmpfs_touch_dir(&mut dir, now);
-                return Ok(RenameOutcome::Exchange);
-            }
-
-            let mut replaced = None;
-            if let Some(existing) = dir.children.get(&new_key).cloned() {
-                if flags.contains(RenameFlags::NOREPLACE) {
-                    return Err(SystemError::EEXIST);
-                }
-
-                // If destination already refers to the same inode, it's a no-op.
-                let existing_id = existing.0.lock().metadata.inode_id;
-                let to_move_id = inode_to_move.0.lock().metadata.inode_id;
-                if existing_id == to_move_id {
-                    return Ok(RenameOutcome::NoOp);
-                }
-
-                let existing_type = existing.0.lock().metadata.file_type;
-                if old_type == FileType::Dir && existing_type != FileType::Dir {
-                    return Err(SystemError::ENOTDIR);
-                }
-                if old_type != FileType::Dir && existing_type == FileType::Dir {
-                    return Err(SystemError::EISDIR);
-                }
-
-                if old_type == FileType::Dir && !existing.0.lock().children.is_empty() {
-                    return Err(SystemError::ENOTEMPTY);
-                }
-
-                // Remove existing destination entry (replacement).
-                dir.children.remove(&new_key);
-                let mut existing_guard = existing.0.lock();
-                if existing_type == FileType::Dir {
-                    dir.metadata.nlinks = dir.metadata.nlinks.saturating_sub(1);
-                    existing_guard.metadata.nlinks = 0;
-                    replaced = Some(LinkRemovalOutcome::LastLink);
-                } else {
-                    existing_guard.metadata.nlinks =
-                        existing_guard.metadata.nlinks.saturating_sub(1);
-                    replaced = Some(if existing_guard.metadata.nlinks == 0 {
-                        LinkRemovalOutcome::LastLink
-                    } else {
-                        LinkRemovalOutcome::StillLinked
-                    });
-                }
-                existing_guard.metadata.ctime = PosixTimeSpec::now();
-            }
-
-            // Move entry within the same directory.
-            dir.children.remove(&old_key);
-            if flags.contains(RenameFlags::WHITEOUT) {
-                tmpfs_insert_whiteout(&mut dir, &old_key)?;
-            }
-            dir.children.insert(new_key.clone(), inode_to_move.clone());
-            let now = PosixTimeSpec::now();
-            let mut moved = inode_to_move.0.lock();
-            moved.name = new_key;
-            moved.metadata.ctime = now;
-            tmpfs_touch_dir(&mut dir, now);
-            return Ok(RenameOutcome::Moved { replaced });
-        }
-
-        // Cross-directory move.
-        // Lock both directories in a stable order.
-        if self_id < target_id {
-            let mut src_dir = self.0.lock();
-            let mut dst_dir = target_locked.0.lock();
-            return tmpfs_move_entry_between_dirs(
-                &mut src_dir,
-                &mut dst_dir,
-                &old_key,
-                &new_key,
-                flags,
-            );
-        } else {
-            let mut dst_dir = target_locked.0.lock();
-            let mut src_dir = self.0.lock();
-            return tmpfs_move_entry_between_dirs(
-                &mut src_dir,
-                &mut dst_dir,
-                &old_key,
-                &new_key,
-                flags,
-            );
-        }
+    fn move_to_with_inode_context(
+        &self,
+        old_name: &str,
+        target: &Arc<dyn IndexNode>,
+        new_name: &str,
+        flags: RenameFlags,
+        mutation: &crate::filesystem::vfs::mount::DentryMutationContext<'_>,
+        context: &crate::filesystem::vfs::permission::InodeOpContext,
+    ) -> Result<RenameOutcome, SystemError> {
+        mutation.ensure_locked();
+        self.move_with_inode_context(old_name, target, new_name, flags, context)
     }
 
     fn find(&self, name: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
@@ -2143,6 +2763,21 @@ impl IndexNode for LockedTmpfsInode {
         mode: InodeMode,
         dev_t: DeviceNumber,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
+        self.mknod_with_context(
+            filename,
+            mode,
+            dev_t,
+            &crate::filesystem::vfs::permission::InodeOpContext::legacy(),
+        )
+    }
+
+    fn mknod_with_context(
+        &self,
+        filename: &str,
+        mode: InodeMode,
+        dev_t: DeviceNumber,
+        context: &crate::filesystem::vfs::permission::InodeOpContext,
+    ) -> Result<Arc<dyn IndexNode>, SystemError> {
         let mut inode = self.0.lock();
         tmpfs_require_live_dir(&inode)?;
 
@@ -2151,10 +2786,13 @@ impl IndexNode for LockedTmpfsInode {
             // Regular file creation must not recurse while holding the directory lock,
             // otherwise self.create() will try to lock the same Mutex and deadlock.
             drop(inode);
-            return self.create(filename, FileType::File, mode);
+            return self.create_with_context(filename, FileType::File, mode, context);
         }
 
         let filename = DName::from(filename);
+        if inode.children.contains_key(&filename) {
+            return Err(SystemError::EEXIST);
+        }
 
         // 确定文件类型
         let file_type = match file_type {
@@ -2164,8 +2802,13 @@ impl IndexNode for LockedTmpfsInode {
             FileType::Socket => FileType::Socket,
             _ => return Err(SystemError::EINVAL),
         };
-        let init =
-            crate::filesystem::vfs::permission::child_inode_init(&inode.metadata, file_type, mode);
+        crate::filesystem::vfs::permission::check_parent_create(&inode.metadata, context, false)?;
+        let init = crate::filesystem::vfs::permission::child_inode_init_with_context(
+            &inode.metadata,
+            file_type,
+            mode,
+            context,
+        )?;
 
         let now = PosixTimeSpec::now();
         let nod = Arc::new(LockedTmpfsInode::new(TmpfsInode {

@@ -116,6 +116,14 @@ impl<Ops: DirOps + 'static> IndexNode for ProcDir<Ops> {
         self.inner.reported_ino(metadata)
     }
 
+    fn check_dac_permission(
+        &self,
+        metadata: &Metadata,
+        mask: crate::filesystem::vfs::permission::PermissionMask,
+    ) -> Result<(), SystemError> {
+        self.inner.check_dac_permission(metadata, mask)
+    }
+
     fn read_at(
         &self,
         _offset: usize,
@@ -246,6 +254,16 @@ impl<Ops: DirOps + 'static> IndexNode for ProcDir<Ops> {
 }
 
 pub trait DirOps: Sync + Send + Sized + Debug {
+    fn check_dac_permission(
+        &self,
+        metadata: &Metadata,
+        mask: crate::filesystem::vfs::permission::PermissionMask,
+    ) -> Result<(), SystemError> {
+        crate::process::ProcessManager::current_pcb()
+            .cred()
+            .inode_permission(metadata, mask.bits())
+    }
+
     fn reported_ino(&self, metadata: &Metadata) -> InodeId {
         metadata.inode_id
     }

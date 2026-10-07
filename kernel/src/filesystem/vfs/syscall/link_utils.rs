@@ -183,6 +183,9 @@ pub fn do_linkat(
 fn may_linkat(old_inode: &Arc<dyn IndexNode>) -> Result<(), SystemError> {
     let metadata = old_inode.metadata()?;
     let cred = ProcessManager::current_pcb().cred();
+    if metadata.uid == u32::MAX as usize || metadata.gid == u32::MAX as usize {
+        return Err(SystemError::EOVERFLOW);
+    }
 
     // TODO: 检查sysctl_protected_hardlinks是否启用
     // 目前假设始终启用（更安全的默认值）
@@ -192,12 +195,7 @@ fn may_linkat(old_inode: &Arc<dyn IndexNode>) -> Result<(), SystemError> {
     // }
 
     // 文件所有者可以创建硬链接
-    if cred.is_owner(&metadata) {
-        return Ok(());
-    }
-
-    // 拥有CAP_FOWNER能力可以创建硬链接
-    if cred.has_capability(CAPFlags::CAP_FOWNER) {
+    if cred.is_owner_or_capable(&metadata) {
         return Ok(());
     }
 

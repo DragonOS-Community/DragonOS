@@ -98,7 +98,7 @@ fn remove(
 
     let upper_dir = inode.upper_inode.lock().clone();
     let backing_outcome = if let Some(upper_dir) = upper_dir {
-        match upper_dir.find(name) {
+        match super::lookup::lookup_backing(&upper_dir, name) {
             Ok(_) if lower_positive => {
                 inode.replace_upper_with_whiteout_locked(name, is_dir, context)?
             }
@@ -300,7 +300,7 @@ where
     F: Fn(&Arc<dyn IndexNode>, &str) -> Result<Arc<dyn IndexNode>, SystemError>,
 {
     let upper_inode = inode.writable_upper_inode_locked()?;
-    match upper_inode.find(name) {
+    match super::lookup::lookup_backing(&upper_inode, name) {
         Ok(found) => {
             if !OvlInode::is_whiteout_inode_checked(&found)? {
                 return Err(SystemError::EEXIST);
@@ -344,7 +344,7 @@ where
         }
     }
 
-    upper_inode.find(name)
+    super::lookup::lookup_backing(&upper_inode, name)
 }
 
 fn is_dot_entry(name: &str) -> bool {

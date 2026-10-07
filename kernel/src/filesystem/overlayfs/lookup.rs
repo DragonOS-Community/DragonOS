@@ -1,13 +1,39 @@
 use super::inode::OvlInode;
 use crate::filesystem::vfs::{FileType, IndexNode};
+use crate::libs::casting::DowncastArc;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use system_error::SystemError;
 
+/// Backing layers use a dentry lookup, never a pathname walk through mounts.
+pub(super) fn lookup_backing(
+    parent: &Arc<dyn IndexNode>,
+    name: &str,
+) -> Result<Arc<dyn IndexNode>, SystemError> {
+    match parent
+        .clone()
+        .downcast_arc::<crate::filesystem::vfs::mount::MountFSInode>()
+    {
+        Some(mounted) => mounted.lookup_backing(name),
+        None => parent.find(name),
+    }
+}
+
+pub(super) fn lookup_backing_path(
+    root: &Arc<dyn IndexNode>,
+    path: &str,
+) -> Result<Arc<dyn IndexNode>, SystemError> {
+    let mut current = root.clone();
+    for component in path.split('/').filter(|component| !component.is_empty()) {
+        current = lookup_backing(&current, component)?;
+    }
+    Ok(current)
+}
+
 impl OvlInode {
     pub(super) fn lower_positive(&self, name: &str) -> bool {
         for lower in &self.lower_inodes {
-            match lower.find(name) {
+            match lookup_backing(lower, name) {
                 Ok(found) => {
                     // A metadata failure must not turn a possibly positive lower entry into a
                     // pure-upper decision. Linux makes the same conservative choice for lower
@@ -57,7 +83,7 @@ fn find_locked_revalidated(
     let mut lower_visible_file_type = None;
     let mut visible_nlinks = None;
     if let Some(ref upper) = *inode.upper_inode.lock() {
-        match upper.find(name) {
+        match lookup_backing(upper, name) {
             Ok(found) => {
                 if OvlInode::is_whiteout_inode(&found) {
                     return Err(SystemError::ENOENT);
@@ -80,7 +106,7 @@ fn find_locked_revalidated(
     if matches!(upper_file_type, None | Some(FileType::Dir)) {
         let mut merge_dirs = upper_file_type == Some(FileType::Dir);
         for lower in &inode.lower_inodes {
-            match lower.find(name) {
+            match lookup_backing(lower, name) {
                 Ok(found) => {
                     if OvlInode::is_whiteout_inode(&found) {
                         if upper_inode.is_none() {

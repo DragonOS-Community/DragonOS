@@ -531,7 +531,7 @@ fn recover_and_retry(work: &str, inode: u32, kind: ImageKind, persistence: Persi
     ext4.prepare_buffered_write(inode, 0, WRITE_LEN, WRITE_LEN as u64, None)
         .expect("retry after recovery could not prepare the original range");
     assert_eq!(
-        ext4.write_data_only(inode, 0, PAYLOAD)
+        ext4.write_data_only_with_completed_end(inode, 0, PAYLOAD, PAYLOAD.len() as u64)
             .expect("retry data write failed"),
         WRITE_LEN
     );
@@ -918,8 +918,13 @@ fn recover_and_retry_external_leaf(
         panic!("external-leaf crash point {crash_point}: retry prepare failed: {error:?}")
     });
     assert_eq!(
-        ext4.write_data_only(inode, old_size, PAYLOAD)
-            .expect("external-leaf retry data write failed"),
+        ext4.write_data_only_with_completed_end(
+            inode,
+            old_size,
+            PAYLOAD,
+            (old_size + PAYLOAD.len()) as u64
+        )
+        .expect("external-leaf retry data write failed"),
         WRITE_LEN
     );
     ext4.commit_inode_size(inode, (old_size + WRITE_LEN) as u64, None)
@@ -1003,8 +1008,13 @@ fn create_existing_external_leaf_seed(path: &str) -> u32 {
     ext4.prepare_buffered_write(inode, offset, WRITE_LEN, (offset + WRITE_LEN) as u64, None)
         .expect("existing-leaf seed root split prepare failed");
     assert_eq!(
-        ext4.write_data_only(inode, offset, PAYLOAD)
-            .expect("existing-leaf seed data write failed"),
+        ext4.write_data_only_with_completed_end(
+            inode,
+            offset,
+            PAYLOAD,
+            (offset + PAYLOAD.len()) as u64
+        )
+        .expect("existing-leaf seed data write failed"),
         WRITE_LEN
     );
     ext4.commit_inode_size(inode, (offset + WRITE_LEN) as u64, None)
@@ -1083,7 +1093,7 @@ fn recover_and_retry_existing_leaf(
         });
     let tail = [0x5d; WRITE_LEN];
     assert_eq!(
-        ext4.write_data_only(inode, offset, &tail)
+        ext4.write_data_only_with_completed_end(inode, offset, &tail, (offset + tail.len()) as u64)
             .expect("existing-leaf retry data write failed"),
         WRITE_LEN
     );
@@ -1255,7 +1265,7 @@ fn recover_and_retry_full_leaf_split(
         });
     let tail = [0x4c; WRITE_LEN];
     assert_eq!(
-        ext4.write_data_only(inode, offset, &tail)
+        ext4.write_data_only_with_completed_end(inode, offset, &tail, (offset + tail.len()) as u64)
             .expect("full leaf split retry data write failed"),
         WRITE_LEN
     );

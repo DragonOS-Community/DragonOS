@@ -65,6 +65,20 @@ const TRANSACTION_RANGE_MAX_GROUP_PROBES: u32 = 4;
 
 #[cfg_attr(not(test), allow(dead_code))]
 impl AllocationState {
+    pub(super) fn inode_reserved_data_blocks(
+        &self,
+        inode: InodeId,
+        generation: u32,
+    ) -> Result<u64> {
+        self.delalloc_claims
+            .values()
+            .filter(|claim| claim.inode_owner == Some((inode, generation)))
+            .try_fold(0u64, |total, claim| {
+                total
+                    .checked_add(claim.data_blocks)
+                    .ok_or_else(|| Ext4Error::new(ErrCode::ERANGE))
+            })
+    }
     fn total_reserved_blocks(&self) -> Result<u64> {
         self.reserved_data_blocks
             .checked_add(self.reserved_metadata_blocks)
@@ -146,6 +160,7 @@ impl AllocationState {
             .insert(
                 id,
                 DelallocClaim {
+                    inode_owner: None,
                     data_blocks,
                     metadata_blocks,
                     inflight_consumptions: 0,
@@ -751,6 +766,39 @@ fn linked_orphan_tail_remove_limit(
 }
 
 impl Ext4 {
+    /// Bind both immutable lease and ledger provenance under the same lock.
+    /// Both head and projected follower admission use this path.
+    pub(super) fn bind_delalloc_append_certificate(
+        &self,
+        lease: &mut DelallocLease,
+        inode_id: InodeId,
+        inode_generation: u32,
+        offset: usize,
+        expected_durable_eof_before: u64,
+    ) -> Result<()> {
+        let mut allocation = self.alloc_lock.lock();
+        if !lease.active || lease.id.mount_generation != allocation.mount_generation {
+            return_error!(
+                ErrCode::EINVAL,
+                "Invalid delayed allocation lease provenance"
+            );
+        }
+        let claim = allocation
+            .delalloc_claims
+            .get_mut(&lease.id)
+            .ok_or_else(|| Ext4Error::new(ErrCode::EINVAL))?;
+        if claim.inode_owner.is_some() {
+            return_error!(ErrCode::EINVAL, "Delayed allocation claim already bound");
+        }
+        lease.bind_append_block_certificate(
+            inode_id,
+            inode_generation,
+            offset,
+            expected_durable_eof_before,
+        )?;
+        claim.inode_owner = Some((inode_id, inode_generation));
+        Ok(())
+    }
     /// Apply one clean delayed-allocation capacity mutation.
     ///
     /// The final poison check and the ledger update share the short
@@ -1960,83 +2008,27 @@ impl Ext4 {
         if !self.legacy_orphan_contains(inode_id)? {
             return_error!(ErrCode::EINVAL, "Inode {} is not orphaned", inode_id);
         }
-        loop {
-            let mut inode = self.read_inode_uncached(inode_id)?;
-            let sb = self.read_super_block_cached();
-            if !self.inode_is_allocated(inode_id)?
-                || inode.inode.mode().bits() == 0
-                || inode.inode.link_count() == 0
-                || !super::orphan::inode_checksum_valid(&sb, &inode)
-                || !inode.inode.is_file()
-                || !inode.inode.uses_extents()
-            {
-                return_error!(ErrCode::EIO, "Invalid linked truncate orphan {}", inode_id);
-            }
-            let keep_blocks = inode.inode.size().div_ceil(BLOCK_SIZE as u64);
-            let mut transaction = self.transaction_start(32)?;
-            let Some(tail) = self.extent_tail(&transaction, &inode)? else {
-                transaction.abort();
-                break;
-            };
-            let extent_end = tail
-                .start_pblock
-                .checked_add(tail.block_count as PBlockId)
-                .ok_or_else(|| format_error!(ErrCode::EIO, "Invalid extent physical range"))?;
-            if tail.start_pblock == 0
-                || extent_end > sb.block_count()
-                || self.journal_owns_block_range(tail.start_pblock, extent_end)
-            {
-                return_error!(ErrCode::EIO, "Invalid linked orphan extent");
-            }
-            let group_limit = extent_tail_batch_limit(
-                sb.first_data_block() as PBlockId,
-                sb.blocks_per_group() as PBlockId,
-                tail.start_pblock,
-                tail.block_count,
-            )
-            .ok_or_else(|| format_error!(ErrCode::EIO, "Invalid extent tail"))?;
-            let Some(remove_limit) = linked_orphan_tail_remove_limit(
-                keep_blocks,
-                tail.start_lblock,
-                tail.block_count,
-                group_limit,
-            ) else {
-                transaction.abort();
-                break;
-            };
-            let removed = self
-                .extent_remove_tail_in_transaction(&mut transaction, &mut inode, remove_limit)?
-                .ok_or_else(|| format_error!(ErrCode::EIO, "Extent tail disappeared"))?;
-            self.transaction_dealloc_block_range(
-                &mut transaction,
-                removed.start_pblock,
-                removed.block_count,
-            )?;
-            for metadata in removed.metadata_blocks.iter().copied() {
-                self.transaction_dealloc_block_range(&mut transaction, metadata, 1)?;
-            }
-            let released = removed.block_count as u64 + removed.metadata_blocks.len() as u64;
-            inode.inode.set_fs_block_count(
-                inode
-                    .inode
-                    .fs_block_count()
-                    .checked_sub(released)
-                    .ok_or_else(|| format_error!(ErrCode::EIO, "Invalid inode block count"))?,
-            );
-            self.transaction_stage_inode_with_csum(&mut transaction, &mut inode)?;
-            self.commit_reclaim_transaction(transaction)?;
-        }
-
         let mut inode = self.read_inode_uncached(inode_id)?;
-        if inode.inode.link_count() == 0 {
-            return_error!(ErrCode::EIO, "Linked truncate orphan lost all links");
+        let sb = self.read_super_block_cached();
+        if !self.inode_is_allocated(inode_id)?
+            || inode.inode.mode().bits() == 0
+            || inode.inode.link_count() == 0
+            || !super::orphan::inode_checksum_valid(&sb, &inode)
+            || !inode.inode.is_file()
+            || !inode.inode.uses_extents()
+        {
+            return_error!(ErrCode::EIO, "Invalid linked truncate orphan {}", inode_id);
         }
-        let mut transaction = self.transaction_start(8)?;
-        let mut sb = self.transaction_read_super_block(&transaction)?;
-        self.transaction_orphan_del(&mut transaction, &inode, &mut sb)?;
-        inode.inode.set_next_orphan(0);
-        self.transaction_stage_inode_with_csum(&mut transaction, &mut inode)?;
-        self.commit_reclaim_transaction(transaction)
+        // Recovery uses the same root-before-free operation as live truncate.
+        // The durable inode SIZE remains the authority throughout restart.
+        self.zero_truncate_tail_locked(&inode, None)?;
+        self.punch_block_range_locked(
+            inode_id,
+            inode.inode.size().div_ceil(BLOCK_SIZE as u64) as LBlockId,
+            MAX_BLOCKS,
+        )?;
+        inode = self.read_inode_uncached(inode_id)?;
+        self.finish_linked_truncate_orphan_locked(&mut inode)
     }
 
     fn reclaim_inode_lifetime(
@@ -2701,6 +2693,48 @@ mod allocation_tests {
             state.release_delalloc(&mut reservation).unwrap_err().code(),
             ErrCode::EINVAL
         );
+    }
+
+    #[test]
+    fn stat_reservations_count_remaining_data_and_exact_inode_generation() {
+        let mut state = AllocationState::new().unwrap();
+        let mut first = state.reserve_delalloc(100, 3, 7).unwrap();
+        let mut second = state.reserve_delalloc(100, 2, 5).unwrap();
+        let mut other = state.reserve_delalloc(100, 4, 0).unwrap();
+        state
+            .delalloc_claims
+            .get_mut(&first.id)
+            .unwrap()
+            .inode_owner = Some((12, 4));
+        state
+            .delalloc_claims
+            .get_mut(&second.id)
+            .unwrap()
+            .inode_owner = Some((12, 4));
+        state
+            .delalloc_claims
+            .get_mut(&other.id)
+            .unwrap()
+            .inode_owner = Some((12, 3));
+        assert_eq!(state.inode_reserved_data_blocks(12, 4).unwrap(), 5);
+        assert_eq!(state.inode_reserved_data_blocks(13, 4).unwrap(), 0);
+        assert_eq!(state.inode_reserved_data_blocks(12, 3).unwrap(), 4);
+        let debit = state
+            .consume_delalloc(
+                AllocationClass::Delalloc(first.id),
+                DelallocReservationUse::Data,
+                1,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.inode_reserved_data_blocks(12, 4).unwrap(), 4);
+        state.rollback_delalloc_consumption(debit).unwrap();
+        assert_eq!(state.inode_reserved_data_blocks(12, 4).unwrap(), 5);
+        state.release_delalloc(&mut first).unwrap();
+        assert_eq!(state.inode_reserved_data_blocks(12, 4).unwrap(), 2);
+        state.release_delalloc(&mut second).unwrap();
+        state.release_delalloc(&mut other).unwrap();
+        assert_eq!(state.inode_reserved_data_blocks(12, 4).unwrap(), 0);
     }
 
     #[test]

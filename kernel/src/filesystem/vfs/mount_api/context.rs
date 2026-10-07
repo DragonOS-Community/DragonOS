@@ -12,7 +12,8 @@ use crate::{
     filesystem::vfs::{
         file::{File, FileFlags, FilePrivateData},
         filesystem_maker,
-        mount::{DetachedMountTree, MountFlags},
+        inode_lifecycle::{InodeRetentionGuard, InodeRetentionKind},
+        mount::{DetachedMountTree, MountFS, MountFlags, MountSnapshotGuard},
         produce_fs_in_context, FileSystem, FsCreationContext, FsconfigPreparedData, IndexNode,
         InodeMode, Metadata,
     },
@@ -45,6 +46,8 @@ enum Phase {
     Creating,
     AwaitingMount,
     AwaitingReconf,
+    ReconfParams,
+    Reconfiguring,
     Failed,
 }
 
@@ -59,8 +62,57 @@ struct FsContextState {
     options: Vec<LegacyOption>,
     data_len: usize,
     sb_flags: MountFlags,
+    sb_flags_mask: MountFlags,
     fs: Option<Arc<dyn FileSystem>>,
     prepared: Option<FsconfigPreparedData>,
+    target: Option<ReconfigureTarget>,
+}
+
+/// Retain the selected backing root and active SB, but not a mount busy pin.
+/// This deliberately permits ordinary umount while an fspick fd stays open.
+struct ReconfigureTarget {
+    _root: InodeRetentionGuard,
+    _superblock: MountSnapshotGuard,
+    mount: Arc<MountFS>,
+}
+
+impl ReconfigureTarget {
+    fn new(mount: Arc<MountFS>) -> Result<Self, SystemError> {
+        let superblock = mount.try_pin_snapshot()?;
+        let root =
+            InodeRetentionGuard::new(mount.root_inner_inode(), InodeRetentionKind::Operation)?;
+        Ok(Self {
+            _root: root,
+            _superblock: superblock,
+            mount,
+        })
+    }
+}
+
+impl FsContextState {
+    fn new(phase: Phase) -> Self {
+        Self {
+            phase,
+            source: None,
+            options: Vec::new(),
+            data_len: 0,
+            sb_flags: MountFlags::empty(),
+            sb_flags_mask: MountFlags::empty(),
+            fs: None,
+            prepared: None,
+            target: None,
+        }
+    }
+
+    /// Linux vfs_clean_context: infallible cleanup with cumulative mask kept.
+    fn clean_parameters(&mut self) {
+        self.source = None;
+        self.options.clear();
+        self.data_len = 0;
+        self.sb_flags = MountFlags::empty();
+        self.prepared = None;
+        self.phase = Phase::AwaitingReconf;
+    }
 }
 
 /// Only an Arc to this object is placed in FilePrivateData. The short-lived
@@ -107,18 +159,29 @@ pub fn open_fs_context(fs_name: &str, cloexec: bool) -> Result<i32, SystemError>
     let context = Arc::try_new(FsContext {
         fs_type: String::from(fs_name),
         creation: FsCreationContext::current(),
-        state: Mutex::new(FsContextState {
-            phase: Phase::CreateParams,
-            source: None,
-            options: Vec::new(),
-            data_len: 0,
-            sb_flags: MountFlags::empty(),
-            fs: None,
-            prepared: None,
-        }),
+        state: Mutex::new(FsContextState::new(Phase::CreateParams)),
     })
     .map_err(|_| SystemError::ENOMEM)?;
 
+    install_context_fd(context, cloexec)
+}
+
+/// The caller keeps the resolved mount alive until the SB-only pin is taken.
+pub fn pick_fs_context(mount: Arc<MountFS>, cloexec: bool) -> Result<i32, SystemError> {
+    let target = ReconfigureTarget::new(mount)?;
+    let mut state = FsContextState::new(Phase::ReconfParams);
+    let fs_type = String::from(target.mount.inner_filesystem().name());
+    state.target = Some(target);
+    let context = Arc::try_new(FsContext {
+        fs_type,
+        creation: FsCreationContext::current(),
+        state: Mutex::new(state),
+    })
+    .map_err(|_| SystemError::ENOMEM)?;
+    install_context_fd(context, cloexec)
+}
+
+fn install_context_fd(context: Arc<FsContext>, cloexec: bool) -> Result<i32, SystemError> {
     let inode: Arc<dyn IndexNode> = Arc::new(FsContextInode::new());
     let file = File::new_with_private_data(
         inode,
@@ -131,7 +194,7 @@ pub fn open_fs_context(fs_name: &str, cloexec: bool) -> Result<i32, SystemError>
         .alloc_fd(file, cloexec, current.nofile_soft_limit())
 }
 
-fn common_superblock_option(key: &str, flags: &mut MountFlags) -> bool {
+fn common_superblock_option(key: &str, state: &mut FsContextState) -> bool {
     let (flag, set) = match key {
         "dirsync" => (MountFlags::DIRSYNC, true),
         "lazytime" => (MountFlags::LAZYTIME, true),
@@ -145,10 +208,11 @@ fn common_superblock_option(key: &str, flags: &mut MountFlags) -> bool {
         _ => return false,
     };
     if set {
-        flags.insert(flag);
+        state.sb_flags.insert(flag);
     } else {
-        flags.remove(flag);
+        state.sb_flags.remove(flag);
     }
+    state.sb_flags_mask.insert(flag);
     true
 }
 
@@ -219,21 +283,39 @@ pub fn configure_fs_context(fd: i32, cmd: FsConfigCommand) -> Result<(), SystemE
         return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
     }
     let mut state = context.state.lock();
+    if state.phase == Phase::AwaitingReconf {
+        // Registered makers use fresh legacy parameter storage. There is no
+        // fallible allocation to perform until a parameter is actually added.
+        state.phase = Phase::ReconfParams;
+    }
     match cmd {
         FsConfigCommand::SetFlag(key) => {
-            if state.phase != Phase::CreateParams {
+            if !matches!(state.phase, Phase::CreateParams | Phase::ReconfParams) {
                 return Err(SystemError::EBUSY);
             }
             if key == "source" {
                 return Err(SystemError::EINVAL);
             }
-            if common_superblock_option(&key, &mut state.sb_flags) {
+            if common_superblock_option(&key, &mut state) {
                 return Ok(());
+            }
+            if state.phase == Phase::ReconfParams {
+                state
+                    .target
+                    .as_ref()
+                    .ok_or(SystemError::EINVAL)?
+                    .mount
+                    .inner_filesystem()
+                    .validate_reconfigure_parameter(&key, None)?;
+            } else {
+                filesystem_maker(&context.fs_type)
+                    .ok_or(SystemError::ENODEV)?
+                    .validate_fsconfig_parameter(&key, None)?;
             }
             append_legacy_option(&mut state, key, None)
         }
         FsConfigCommand::SetString(key, value) => {
-            if state.phase != Phase::CreateParams {
+            if !matches!(state.phase, Phase::CreateParams | Phase::ReconfParams) {
                 return Err(SystemError::EBUSY);
             }
             if key == "source" {
@@ -243,12 +325,26 @@ pub fn configure_fs_context(fd: i32, cmd: FsConfigCommand) -> Result<(), SystemE
                 state.source = Some(value);
                 return Ok(());
             }
-            if common_superblock_option(&key, &mut state.sb_flags) {
+            if common_superblock_option(&key, &mut state) {
                 return Ok(());
             }
-            let prepared = filesystem_maker(&context.fs_type)
-                .ok_or(SystemError::ENODEV)?
-                .prepare_fsconfig_string(&key, &value, state.prepared.as_ref())?;
+            // Creation preparers can retain lower paths or other resources for
+            // a new filesystem. Reconfiguration belongs to the existing
+            // backend and must not run a new-filesystem preparer.
+            let prepared = if state.phase == Phase::CreateParams {
+                let maker = filesystem_maker(&context.fs_type).ok_or(SystemError::ENODEV)?;
+                maker.validate_fsconfig_parameter(&key, Some(&value))?;
+                maker.prepare_fsconfig_string(&key, &value, state.prepared.as_ref())?
+            } else {
+                state
+                    .target
+                    .as_ref()
+                    .ok_or(SystemError::EINVAL)?
+                    .mount
+                    .inner_filesystem()
+                    .validate_reconfigure_parameter(&key, Some(&value))?;
+                None
+            };
             append_legacy_option(&mut state, key, Some(value))?;
             state.prepared = prepared;
             Ok(())
@@ -311,7 +407,43 @@ pub fn configure_fs_context(fd: i32, cmd: FsConfigCommand) -> Result<(), SystemE
                 Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
             }
         }
-        FsConfigCommand::Reconfigure => Err(SystemError::EOPNOTSUPP_OR_ENOTSUP),
+        FsConfigCommand::Reconfigure => {
+            if state.phase != Phase::ReconfParams {
+                return Err(SystemError::EBUSY);
+            }
+            state.phase = Phase::Reconfiguring;
+            let result = (|| {
+                let target = state.target.as_ref().ok_or(SystemError::EINVAL)?;
+                let superblock = target.mount.super_block_state();
+                // Execute with the caller's capability, not creation.cred.
+                if !ns_capable(superblock.owner_user_ns(), CAPFlags::CAP_SYS_ADMIN) {
+                    return Err(SystemError::EPERM);
+                }
+                let raw_data = encode_legacy_options(&state)?;
+                let _umount = superblock.umount_write();
+                let prepared = super::reconfigure::prepare_reconfigure_locked(
+                    &target.mount,
+                    crate::filesystem::vfs::FsReconfigureRequest {
+                        sb_flags: state.sb_flags,
+                        sb_flags_mask: state.sb_flags_mask,
+                        raw_data: raw_data.as_deref(),
+                        oldapi: false,
+                    },
+                )?;
+                prepared.commit();
+                Ok(())
+            })();
+            match result {
+                Ok(()) => {
+                    state.clean_parameters();
+                    Ok(())
+                }
+                Err(error) => {
+                    state.phase = Phase::Failed;
+                    Err(error)
+                }
+            }
+        }
         FsConfigCommand::UnsupportedTyped => unreachable!(),
     }
 }
@@ -329,10 +461,11 @@ pub fn create_mount_from_fs_context(
 ) -> Result<Arc<DetachedMountTree>, SystemError> {
     let context = context_from_fd(fd)?;
     let mut state = context.state.lock();
-    match state.phase {
-        Phase::AwaitingMount => {}
-        Phase::AwaitingReconf => return Err(SystemError::EBUSY),
-        Phase::CreateParams | Phase::Creating | Phase::Failed => return Err(SystemError::EINVAL),
+    if state.fs.is_none() && state.target.is_none() {
+        return Err(SystemError::EINVAL);
+    }
+    if state.phase != Phase::AwaitingMount {
+        return Err(SystemError::EBUSY);
     }
     let fs = state.fs.as_ref().ok_or(SystemError::EINVAL)?.clone();
     let result = create(
@@ -341,8 +474,11 @@ pub fn create_mount_from_fs_context(
         state.sb_flags,
         context.creation.cred.user_ns.clone(),
     )?;
+    // Acquire these while the newly created tree still owns its live mount.
+    // No fallible operation may follow cleanup of the successfully used fd.
+    state.target = Some(ReconfigureTarget::new(result.root())?);
     state.fs = None;
-    state.phase = Phase::AwaitingReconf;
+    state.clean_parameters();
     Ok(result)
 }
 

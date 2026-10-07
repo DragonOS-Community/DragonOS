@@ -11,11 +11,14 @@ use system_error::SystemError;
 use super::{
     append_lock::{with_inode_append_lock, AppendLockKey},
     inode_lifecycle::{InodeRetentionGuard, InodeRetentionKind},
-    mount::{MountExternalGuard, MountFSInode, MountFlags},
+    mount::{
+        writer::{is_special_file_type, MountWriteGuard},
+        MountExternalGuard, MountFSInode, MountFlags,
+    },
     utils::should_remove_sgid,
     write_access::InodeWriteGuard,
-    DirectoryEntry, FileSystem, FileType, IndexNode, InodeId, Metadata, SetMetadataMask,
-    SpecialNodeData,
+    DirectoryEntry, FileSystem, FileType, IndexNode, InodeId, Metadata, PrimaryWriteSource,
+    SetMetadataMask, SpecialNodeData, WritePrivilegeStage,
 };
 use crate::{arch::ipc::signal::Signal, filesystem::vfs::InodeFlags, process::pid::PidPrivateData};
 use crate::{
@@ -365,6 +368,41 @@ impl Default for FilePrivateData {
 pub struct PreopenedFile {
     inode: Arc<dyn IndexNode>,
     private_data: Option<FilePrivateData>,
+    writer: Option<MountWriteGuard>,
+}
+
+/// Continuous create/open ownership, including backends without atomic open.
+/// The preopened handle owns the writer when present; the fallback keeps it
+/// here until the File performs the separate backend open.
+pub(crate) struct CreatedFile {
+    inode: Arc<dyn IndexNode>,
+    preopened: Option<PreopenedFile>,
+    writer: Option<MountWriteGuard>,
+}
+
+impl CreatedFile {
+    pub(crate) fn new(
+        inode: Arc<dyn IndexNode>,
+        mut preopened: Option<PreopenedFile>,
+        writer: MountWriteGuard,
+    ) -> Self {
+        let writer = if let Some(opened) = preopened.as_mut() {
+            opened.replace_inode(inode.clone());
+            opened.set_writer(writer);
+            None
+        } else {
+            Some(writer)
+        };
+        Self {
+            inode,
+            preopened,
+            writer,
+        }
+    }
+
+    pub(crate) fn inode(&self) -> Arc<dyn IndexNode> {
+        self.inode.clone()
+    }
 }
 
 impl PreopenedFile {
@@ -372,6 +410,7 @@ impl PreopenedFile {
         Self {
             inode,
             private_data: Some(private_data),
+            writer: None,
         }
     }
 
@@ -381,6 +420,10 @@ impl PreopenedFile {
 
     pub fn replace_inode(&mut self, inode: Arc<dyn IndexNode>) {
         self.inode = inode;
+    }
+
+    pub(crate) fn set_writer(&mut self, writer: MountWriteGuard) {
+        self.writer = Some(writer);
     }
 
     fn take_private_data(&mut self) -> FilePrivateData {
@@ -703,6 +746,7 @@ pub struct File {
     /// Writer admission lasts through close and all shared descriptor/VMA owners.
     /// Field destruction follows declaration order, after the explicit Drop body.
     _write_access: Option<Arc<InodeWriteGuard>>,
+    _mount_writer: Option<MountWriteGuard>,
     /// One semantic inode pin per open file description. Duplicated file
     /// descriptors and VMAs share this `File`, while `O_PATH` still owns it.
     _inode_retention: InodeRetentionGuard,
@@ -788,7 +832,7 @@ mod readdir_tests {
 /// Only kernel-created pseudo-file descriptions bypass pathname writer
 /// accounting. A fresh VFS open of the same inode is always regular.
 enum FileOpenOrigin {
-    Regular(Option<Metadata>),
+    Regular(Option<Metadata>, Option<MountWriteGuard>),
     InternalPseudo,
 }
 
@@ -1006,25 +1050,38 @@ impl File {
         buf: &[u8],
         config: WriteConfig,
     ) -> Result<DelegatedWriteResult, SystemError> {
+        let mut publish = || {
+            if !self.mode.read().contains(FileMode::FMODE_NONOTIFY) {
+                self.notify_dentry_event(FsEvent::ATTRIB);
+            }
+        };
+        let mut stage = WritePrivilegeStage::new(&mut publish);
         let (written_len, sync_result) = match self.post_write_sync {
             PostWriteSyncPolicy::Delegated => {
-                let result = self.inode.write_at_with_sync(
+                let result = self.inode.write_at_with_sync_with_privilege_stage(
                     actual_offset,
                     actual_len,
                     buf,
                     config.sync_intent,
                     self.private_data.lock(),
+                    &mut stage,
                 )?;
                 (result.written_len, Some(result.sync_result))
             }
             PostWriteSyncPolicy::Generic | PostWriteSyncPolicy::NotApplicable => (
-                self.inode
-                    .write_at(actual_offset, actual_len, buf, self.private_data.lock())?,
+                self.inode.write_primary_with_privilege_stage(
+                    actual_offset,
+                    actual_len,
+                    PrimaryWriteSource::Kernel(buf),
+                    self.private_data.lock(),
+                    &mut stage,
+                )?,
                 None,
             ),
         };
 
-        let written_len = self.finalize_write(actual_offset, written_len, config)?;
+        let written_len =
+            self.finalize_write(actual_offset, written_len, config, stage.handled())?;
         Ok(DelegatedWriteResult {
             written_len,
             sync_result: sync_result.unwrap_or(Ok(())),
@@ -1038,19 +1095,23 @@ impl File {
         reader: &UserBufferReader<'_>,
         config: WriteConfig,
     ) -> Result<usize, SystemError> {
+        let mut publish = || {
+            if !self.mode.read().contains(FileMode::FMODE_NONOTIFY) {
+                self.notify_dentry_event(FsEvent::ATTRIB);
+            }
+        };
+        let mut stage = WritePrivilegeStage::new(&mut publish);
         let (written_len, sync_result) = if self.post_write_sync == PostWriteSyncPolicy::Delegated {
-            let mut buf = Vec::new();
-            buf.try_reserve(actual_len)
-                .map_err(|_| SystemError::ENOMEM)?;
-            buf.resize(actual_len, 0);
-            reader.copy_from_user(&mut buf, 0)?;
-            let result = self.inode.write_at_with_sync(
-                actual_offset,
-                actual_len,
-                &buf,
-                config.sync_intent,
-                self.private_data.lock(),
-            )?;
+            let result = PrimaryWriteSource::User(reader).with_buffer(actual_len, |buf| {
+                self.inode.write_at_with_sync_with_privilege_stage(
+                    actual_offset,
+                    actual_len.min(buf.len()),
+                    buf,
+                    config.sync_intent,
+                    self.private_data.lock(),
+                    &mut stage,
+                )
+            })?;
             (result.written_len, Some(result.sync_result))
         } else {
             let written_len = match self.inode.write_user_at(
@@ -1060,24 +1121,19 @@ impl File {
                 self.private_data.lock(),
             )? {
                 Some(written_len) => written_len,
-                None => {
-                    let mut buf = Vec::new();
-                    buf.try_reserve(actual_len)
-                        .map_err(|_| SystemError::ENOMEM)?;
-                    buf.resize(actual_len, 0);
-                    reader.copy_from_user(&mut buf, 0)?;
-                    self.inode.write_at(
-                        actual_offset,
-                        actual_len,
-                        &buf,
-                        self.private_data.lock(),
-                    )?
-                }
+                None => self.inode.write_primary_with_privilege_stage(
+                    actual_offset,
+                    actual_len,
+                    PrimaryWriteSource::User(reader),
+                    self.private_data.lock(),
+                    &mut stage,
+                )?,
             };
             (written_len, None)
         };
 
-        let written_len = self.finalize_write(actual_offset, written_len, config)?;
+        let written_len =
+            self.finalize_write(actual_offset, written_len, config, stage.handled())?;
         if let Some(sync_result) = sync_result {
             sync_result?;
         }
@@ -1089,8 +1145,10 @@ impl File {
         actual_offset: usize,
         written_len: usize,
         config: WriteConfig,
+        privileges_handled: bool,
     ) -> Result<usize, SystemError> {
-        let mode_changed = written_len > 0 && self.maybe_kill_suid_sgid_after_write()?;
+        let mode_changed =
+            !privileges_handled && written_len > 0 && self.maybe_kill_suid_sgid_after_write()?;
 
         if config.update_offset {
             match config.offset_update {
@@ -1164,7 +1222,7 @@ impl File {
         let mount_guard = inode
             .clone()
             .downcast_arc::<MountFSInode>()
-            .map(|inode| inode.mount_fs().try_pin_external())
+            .map(|inode| inode.mount_fs().pin_operation_owner())
             .transpose()?;
         Self::new_with_private_data_and_mount_guard(
             inode,
@@ -1173,7 +1231,7 @@ impl File {
             mount_guard,
             None,
             None,
-            FileOpenOrigin::Regular(None),
+            FileOpenOrigin::Regular(None, None),
         )
     }
 
@@ -1193,7 +1251,7 @@ impl File {
             mount_guard,
             Some(operation_guard),
             None,
-            FileOpenOrigin::Regular(cached_path_metadata),
+            FileOpenOrigin::Regular(cached_path_metadata, None),
         )
     }
 
@@ -1212,7 +1270,43 @@ impl File {
             mount_guard,
             Some(operation_guard),
             Some(preopened),
-            FileOpenOrigin::Regular(None),
+            FileOpenOrigin::Regular(None, None),
+        )
+    }
+
+    pub(crate) fn new_unlinked_with_mount_guard(
+        mut unlinked: super::UnlinkedFile,
+        flags: FileFlags,
+        mount_guard: Option<MountExternalGuard>,
+        operation_guard: InodeRetentionGuard,
+    ) -> Result<Self, SystemError> {
+        let writer = unlinked.take_mount_writer();
+        Self::new_with_private_data_and_mount_guard(
+            unlinked.inode(),
+            flags,
+            FilePrivateData::default(),
+            mount_guard,
+            Some(operation_guard),
+            None,
+            FileOpenOrigin::Regular(None, writer),
+        )
+    }
+
+    pub(crate) fn new_created_with_mount_guard(
+        created: CreatedFile,
+        flags: FileFlags,
+        mount_guard: Option<MountExternalGuard>,
+        operation_guard: InodeRetentionGuard,
+        cached_path_metadata: Option<Metadata>,
+    ) -> Result<Self, SystemError> {
+        Self::new_with_private_data_and_mount_guard(
+            created.inode,
+            flags,
+            FilePrivateData::default(),
+            mount_guard,
+            Some(operation_guard),
+            created.preopened,
+            FileOpenOrigin::Regular(cached_path_metadata, created.writer),
         )
     }
 
@@ -1227,9 +1321,9 @@ impl File {
         mut preopened: Option<PreopenedFile>,
         origin: FileOpenOrigin,
     ) -> Result<Self, SystemError> {
-        let (cached_path_metadata, account_write_access) = match origin {
-            FileOpenOrigin::Regular(metadata) => (metadata, true),
-            FileOpenOrigin::InternalPseudo => (None, false),
+        let (cached_path_metadata, account_write_access, inherited_mount_writer) = match origin {
+            FileOpenOrigin::Regular(metadata, writer) => (metadata, true, writer),
+            FileOpenOrigin::InternalPseudo => (None, false, None),
         };
         let mut inode = inode;
         let path_inode = inode.clone();
@@ -1314,6 +1408,46 @@ impl File {
             return Err(SystemError::EINVAL);
         }
         let already_open = preopened.is_some();
+        // Preserve a preopen's token until a successful File takes ownership.
+        // It also covers read-only creates; only writable regular OFDs retain it.
+        let needs_mount_writer = account_write_access
+            && !is_special_file_type(file_type)
+            && !is_path
+            && mode.contains(FileMode::FMODE_WRITE);
+        let mut mount_writer = if needs_mount_writer
+            && inherited_mount_writer.is_none()
+            && preopened
+                .as_ref()
+                .is_none_or(|opened| opened.writer.is_none())
+        {
+            path_inode
+                .clone()
+                .downcast_arc::<MountFSInode>()
+                .map(|mounted| match mount_guard.as_ref() {
+                    Some(pin) => mounted.mount_fs().want_write_from(pin),
+                    None => mounted.mount_fs().want_write(),
+                })
+                .transpose()?
+        } else {
+            inherited_mount_writer
+        };
+        let _open_truncate_writer = if !needs_mount_writer
+            && file_type == FileType::File
+            && !is_path
+            && flags.contains(FileFlags::O_TRUNC)
+            && mount_writer.is_none()
+        {
+            path_inode
+                .clone()
+                .downcast_arc::<MountFSInode>()
+                .map(|mounted| match mount_guard.as_ref() {
+                    Some(pin) => mounted.mount_fs().want_write_from(pin),
+                    None => mounted.mount_fs().want_write(),
+                })
+                .transpose()?
+        } else {
+            None
+        };
         let write_access = if account_write_access
             && file_type == FileType::File
             && !is_path
@@ -1354,9 +1488,13 @@ impl File {
             mode.insert(FileMode::FMODE_OPENED);
         }
 
-        if mode.contains(FileMode::FMODE_WRITE) {
-            if let Some(mnt_inode) = inode.clone().downcast_arc::<MountFSInode>() {
-                mnt_inode.mount_fs().inc_write_count();
+        if needs_mount_writer {
+            if let Some(opened) = preopened.as_mut() {
+                if opened.writer.is_some() {
+                    mount_writer = opened.writer.take();
+                }
+            }
+            if mount_writer.is_some() {
                 mode.insert(FileMode::FMODE_WRITER);
             }
         }
@@ -1397,6 +1535,7 @@ impl File {
             sb_error_seq: Mutex::new(sb_error_seq),
             epitems: Arc::new(EPollItemList::default()),
             _write_access: write_access,
+            _mount_writer: mount_writer.filter(|_| needs_mount_writer),
             _inode_retention: inode_retention,
             _path_inode_retention: path_inode_retention,
             _mount_guard: mount_guard,
@@ -2560,6 +2699,12 @@ impl File {
             .map(|retention| retention.derive_existing(InodeRetentionKind::OpenFileDescription));
         let flags = self.flags();
         let mut mode = self.mode();
+        let mount_writer = self
+            ._mount_writer
+            .as_ref()
+            .map(MountWriteGuard::derive)
+            .transpose()
+            .ok()?;
         let private_data = Mutex::new(self.private_data.lock().clone());
         let mount_guard = self
             ._mount_guard
@@ -2591,12 +2736,6 @@ impl File {
             behavior.post_write_sync
         };
 
-        if mode.contains(FileMode::FMODE_WRITER) {
-            if let Some(mnt_inode) = self.inode.clone().downcast_arc::<MountFSInode>() {
-                mnt_inode.mount_fs().inc_write_count();
-            }
-        }
-
         let res = Self {
             open_file_id: alloc_open_file_id(),
             inode: self.inode.clone(),
@@ -2619,6 +2758,7 @@ impl File {
             sb_error_seq: Mutex::new(*self.sb_error_seq.lock()),
             epitems: Arc::new(EPollItemList::default()),
             _write_access: self._write_access.clone(),
+            _mount_writer: mount_writer,
             _inode_retention: inode_retention,
             _path_inode_retention: path_inode_retention,
             _mount_guard: mount_guard,
@@ -2951,11 +3091,6 @@ impl Drop for File {
         }
 
         super::flock::release_all_for_file(self);
-        if self.mode.read().contains(FileMode::FMODE_WRITER) {
-            if let Some(mnt_inode) = self.inode.clone().downcast_arc::<MountFSInode>() {
-                mnt_inode.mount_fs().dec_write_count();
-            }
-        }
         if !self.mode.read().contains(FileMode::FMODE_PATH) {
             let r: Result<(), SystemError> = self.inode.close(self.private_data.lock());
             // 打印错误信息

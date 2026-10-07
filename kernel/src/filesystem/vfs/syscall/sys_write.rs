@@ -2,12 +2,13 @@ use system_error::SystemError;
 
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_WRITE;
+use crate::arch::MMArch;
 use crate::filesystem::vfs::file::File;
-use crate::mm::VirtAddr;
+use crate::mm::MemoryManagementArch;
 use crate::process::ProcessManager;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
-use crate::syscall::user_access::{user_accessible_len, UserBufferReader};
+use crate::syscall::user_access::UserBufferReader;
 use alloc::string::ToString;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -41,38 +42,32 @@ impl Syscall for SysWriteHandle {
         let fd = Self::fd(args);
         let buf_vaddr = Self::buf(args);
         let len = Self::len(args);
+        // Retain the selected OFD across range validation and the write, rather
+        // than looking up a possibly reused fd a second time.
+        let file = get_file_by_fd(fd)?;
+        file.writeable()?;
 
         // Linux/POSIX: count==0 must not touch the user buffer, but it still must validate
         // the fd and perform the file/socket write semantics.
         // In particular, datagram sockets must deliver a zero-length datagram (gVisor tests).
         if len == 0 {
-            return do_write(fd, &[]);
+            return file.write(0, &[]);
         }
 
-        // 用户态：先检查可访问长度，避免直接触碰无效页；内核态直接使用
-        let user_buffer_reader = if frame.is_from_user() {
-            let accessible = user_accessible_len(
-                VirtAddr::new(buf_vaddr as usize),
-                len,
-                false, /*write?*/
-            );
-            if accessible == 0 {
-                return Err(SystemError::EFAULT);
-            }
-            let user_buffer_reader = UserBufferReader::new(buf_vaddr, accessible, true)?;
-            return do_write_user(fd, &user_buffer_reader, accessible);
+        // Linux access_ok checks the numerical range, not VMA residency. Actual
+        // faults must occur in the backend's protected payload-copy stage, after
+        // required privilege removal. Reader's pre-existing nonempty NULL
+        // rejection is intentionally unchanged; do not construct a NULL slice.
+        let reader = UserBufferReader::new(buf_vaddr, len, frame.is_from_user())?;
+        if frame.is_from_user() {
+            // Validate the original numerical range before Linux's MAX_RW_COUNT
+            // clamp. This bounds the accepted count, not native staging memory.
+            let count = len.min((i32::MAX as usize) & !(MMArch::PAGE_SIZE - 1));
+            file.write_user(count, &reader)
         } else {
-            UserBufferReader::new(buf_vaddr, len, false)?
-        };
-
-        let kernel_buf = if frame.is_from_user() {
-            let protected_buf = user_buffer_reader.buffer_protected(0)?;
-            protected_buf.read_all()?
-        } else {
-            user_buffer_reader.read_from_user(0)?.to_vec()
-        };
-        // 可访问长度小于请求长度时，按可访问部分写入（短写），与 Linux 行为接近
-        do_write(fd, &kernel_buf)
+            let kernel_buf = reader.read_from_user(0)?.to_vec();
+            file.write(kernel_buf.len(), &kernel_buf)
+        }
     }
 
     /// Formats the syscall parameters for display/debug purposes
@@ -122,11 +117,6 @@ syscall_table_macros::declare_syscall!(SYS_WRITE, SysWriteHandle);
 pub(super) fn do_write(fd: i32, buf: &[u8]) -> Result<usize, SystemError> {
     let file = get_file_by_fd(fd)?;
     file.write(buf.len(), buf)
-}
-
-fn do_write_user(fd: i32, reader: &UserBufferReader<'_>, len: usize) -> Result<usize, SystemError> {
-    let file = get_file_by_fd(fd)?;
-    file.write_user(len, reader)
 }
 
 fn get_file_by_fd(fd: i32) -> Result<Arc<File>, SystemError> {

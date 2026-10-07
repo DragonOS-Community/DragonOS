@@ -15,6 +15,7 @@ mod tests;
 pub use change::{
     change_mnt_propagation_recursive, flags_to_propagation_type, is_propagation_change,
 };
+pub(crate) use change::{collect_change_targets, PreparedPropagationChange};
 pub(crate) use event::propagate_umount_sources;
 pub use event::propagation_umount_busy;
 #[allow(unused_imports)]

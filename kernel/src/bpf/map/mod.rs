@@ -1,8 +1,8 @@
-mod array_map;
+pub(super) mod array_map;
 mod hash_map;
 mod lru;
 mod queue;
-mod util;
+pub(super) mod util;
 
 use super::Result;
 use crate::bpf::map::array_map::{ArrayMap, PerCpuArrayMap, PerfEventArrayMap};

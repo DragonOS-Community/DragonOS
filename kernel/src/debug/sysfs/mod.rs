@@ -24,6 +24,7 @@ fn debugfs_init() -> Result<(), SystemError> {
     super::rcu::init_debugfs_rcu()?;
     super::errseq::init_debugfs_errseq()?;
     super::block::init_debugfs_block()?;
+    super::bpf::init_debugfs_bpf()?;
     super::ext4::init_debugfs_ext4()?;
     super::fuse::init_debugfs_fuse()?;
     super::kthread::init_debugfs_kthread()?;

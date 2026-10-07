@@ -16,6 +16,7 @@
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
+#include <string>
 #include <vector>
 
 namespace {
@@ -328,28 +329,35 @@ TEST_F(BpfProgLoadTest, ArrayMapAllocationBounds) {
   EXPECT_EQ(fd, -1);
   EXPECT_EQ(err, E2BIG);
 
-  // A size that overflows the address space fails as an allocation failure
-  // rather than producing an undersized map.
-  errno = 0;
-  fd = CreateArrayMap(8, 0xffffffffu);
-  err = errno;
-  EXPECT_EQ(fd, -1);
-  EXPECT_EQ(err, ENOMEM);
+  // A request for 8 * UINT_MAX bytes is about 32 GiB, not a 64-bit
+  // address-space overflow. Do not assert ENOMEM here: allocation failure
+  // depends on the machine's available memory and accounting limits.
 }
 
-TEST_F(BpfProgLoadTest, ProgramOutlivesMapDescriptor) {
-  // A published program owns one reference per referenced map, so the order in
-  // which the two descriptors are closed must not matter: dropping the map
-  // descriptor first has to leave the program (and the map it points at) alive.
-  ScopedFd map(CreateArrayMap(8, 1));
-  ASSERT_GE(map.get(), 0) << "errno=" << errno;
-
-  LoadedProgram program(
-      {LdDwImm(BPF_PSEUDO_MAP_VALUE, map.get()), LdDwImmHigh(0), MovR0(0), Exit()});
-  ASSERT_TRUE(program.ok()) << "errno=" << program.err();
-
-  map.Reset();
-  EXPECT_NE(fcntl(program.fd(), F_GETFD), -1) << "errno=" << errno;
+TEST_F(BpfProgLoadTest, MapOwnershipAndVerifierRollback) {
+  // F_GETFD on the program cannot observe map ownership. The kernel selftest
+  // uses Weak references and an isolated descriptor table to check the real
+  // relocation path, deduplication, descriptor close and verifier rollback.
+  ScopedFd report_fd(open("/sys/kernel/debug/bpf/map_lifetime_selftest", O_RDONLY | O_CLOEXEC));
+  if (report_fd.get() < 0 && errno == ENOENT) {
+    GTEST_SKIP() << "DragonOS map ownership diagnostic is not available";
+  }
+  ASSERT_GE(report_fd.get(), 0) << "errno=" << errno;
+  std::string report;
+  char buffer[64];
+  for (;;) {
+    ssize_t count = read(report_fd.get(), buffer, sizeof(buffer));
+    if (count < 0 && errno == EINTR) continue;
+    ASSERT_GE(count, 0) << "errno=" << errno;
+    if (count == 0) break;
+    report.append(buffer, static_cast<size_t>(count));
+    ASSERT_LE(report.size(), 4096u);
+  }
+  EXPECT_NE(report.find("status=ok failures=0\n"), std::string::npos) << report;
+  for (const char* name : {"map_fd_ownership", "map_value_ownership",
+                           "map_fd_rollback", "map_value_rollback"}) {
+    EXPECT_NE(report.find(std::string(name) + "=ok\n"), std::string::npos) << report;
+  }
 }
 
 }  // namespace

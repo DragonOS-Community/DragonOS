@@ -1,6 +1,7 @@
 pub mod device;
 mod info;
 mod instructions;
+mod selftest;
 mod tag;
 mod util;
 mod verifier;
@@ -219,3 +220,5 @@ pub fn program_by_id(id: u32) -> Option<Arc<BpfProg>> {
 }
 
 pub(in crate::bpf) use info::{get_fd_by_id, get_info_by_fd};
+
+pub(crate) use selftest::run_map_lifetime_selftests;

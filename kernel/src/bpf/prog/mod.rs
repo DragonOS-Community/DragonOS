@@ -1,5 +1,7 @@
 pub mod device;
 mod info;
+mod instructions;
+mod selftest;
 mod tag;
 mod util;
 mod verifier;
@@ -31,8 +33,16 @@ pub struct BpfProg {
     tag: [u8; 8],
     meta: BpfProgMeta,
     device: Option<DeviceProgram>,
-    raw_file_ptr: Vec<usize>,
+    /// Maps referenced by the program's instructions.
+    ///
+    /// Relocated instructions hold a map's address, so the program owns one
+    /// reference per distinct map (Linux `used_maps`) and removes the need for
+    /// manual `Arc::into_raw`/`from_raw` bookkeeping.
+    maps: Vec<Arc<BpfMap>>,
 }
+
+/// Linux `MAX_USED_MAPS`: maps one program may reference.
+const MAX_USED_MAPS: usize = 64;
 
 static NEXT_PROG_ID: AtomicU32 = AtomicU32::new(1);
 lazy_static! {
@@ -47,7 +57,7 @@ impl BpfProg {
             tag: [0; 8],
             meta,
             device,
-            raw_file_ptr: Vec::new(),
+            maps: Vec::new(),
         }
     }
 
@@ -89,8 +99,20 @@ impl BpfProg {
         self.meta.prog_flags & BPF_F_SLEEPABLE != 0
     }
 
-    pub fn insert_map(&mut self, map_ptr: usize) {
-        self.raw_file_ptr.push(map_ptr);
+    /// Keep `map` alive for as long as this program exists.
+    ///
+    /// Repeated references to the same map are folded into a single held
+    /// reference, exactly like the `used_maps` scan in Linux
+    /// `resolve_pseudo_ldimm64()`.
+    pub fn hold_map(&mut self, map: Arc<BpfMap>) -> Result<()> {
+        if self.maps.iter().any(|held| Arc::ptr_eq(held, &map)) {
+            return Ok(());
+        }
+        if self.maps.len() >= MAX_USED_MAPS {
+            return Err(SystemError::E2BIG);
+        }
+        self.maps.push(map);
+        Ok(())
     }
 }
 
@@ -153,12 +175,6 @@ impl IndexNode for BpfProg {
 impl Drop for BpfProg {
     fn drop(&mut self) {
         PROGRAMS_BY_ID.lock().remove(&self.id);
-        unsafe {
-            for ptr in self.raw_file_ptr.iter() {
-                let file = Arc::from_raw(*ptr as *const u8 as *const BpfMap);
-                drop(file)
-            }
-        }
     }
 }
 /// Load a BPF program into the kernel.
@@ -178,15 +194,18 @@ pub fn bpf_prog_load(attr: &bpf_attr) -> Result<usize> {
     let id = NEXT_PROG_ID
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
         .map_err(|_| SystemError::ENOSPC)?;
-    let prog = BpfProg::new(args, id, device);
+    // The tag covers the program as submitted: relocation overwrites map
+    // immediates, so hashing before it matches Linux `bpf_prog_calc_tag()`
+    // ordering (and keeps the tag independent of `write_imm64`).
+    let mut prog = BpfProg::new(args, id, device);
+    prog.tag = tag::tag(prog.insns());
     let current = ProcessManager::current_pcb();
     let fd_table = current.fd_table();
-    let mut prog = if prog.device.is_some() {
+    let prog = if prog.device.is_some() {
         prog
     } else {
         BpfProgVerifier::new(prog, log_info.log_level, &mut []).verify(&fd_table)?
     };
-    prog.tag = tag::tag(prog.insns());
     let prog = Arc::new(prog);
     let file = File::new(prog.clone(), FileFlags::O_RDWR)?;
     let fd = fd_table
@@ -201,3 +220,5 @@ pub fn program_by_id(id: u32) -> Option<Arc<BpfProg>> {
 }
 
 pub(in crate::bpf) use info::{get_fd_by_id, get_info_by_fd};
+
+pub(crate) use selftest::run_map_lifetime_selftests;

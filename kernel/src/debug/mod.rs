@@ -1,4 +1,5 @@
 pub mod block;
+pub mod bpf;
 pub mod errseq;
 pub mod ext4;
 pub mod fuse;

@@ -1,15 +1,15 @@
 use super::super::Result;
-use crate::bpf::map::BpfMap;
+use crate::bpf::map::map_by_fd;
+use crate::bpf::prog::instructions::{self, LdDwImm};
 use crate::bpf::prog::util::VerifierLogLevel;
 use crate::bpf::prog::BpfProg;
 use crate::filesystem::vfs::fdtable::FileDescriptorTable;
-use crate::include::bindings::linux_bpf::*;
-use crate::libs::casting::DowncastArc;
-use alloc::{sync::Arc, vec::Vec};
-use log::{error, info};
-use rbpf::ebpf;
-use rbpf::ebpf::to_insn_vec;
+use alloc::sync::Arc;
 use system_error::SystemError;
+
+/// Linux rejects a direct value offset that cannot be encoded in the immediate
+/// pair (`BPF_MAX_VAR_OFF`).
+const BPF_MAX_VAR_OFF: u32 = 1 << 29;
 
 /// The BPF program verifier.
 ///
@@ -29,96 +29,44 @@ impl<'a> BpfProgVerifier<'a> {
             _log_buf: log_buf,
         }
     }
-    /// Relocate the program.
+
+    /// Resolve the immediate of every `LD_DW_IMM` into the address the
+    /// interpreter uses, mirroring Linux `resolve_pseudo_ldimm64()`.
     ///
-    /// This function will relocate the program, and update the program's instructions.
+    /// A single pass both validates the instruction layout and relocates map
+    /// references: the slot width is only known here, and every map the
+    /// program points at is kept alive by `hold_map` for as long as the
+    /// program exists.
     fn relocation(&mut self, fd_table: &Arc<FileDescriptorTable>) -> Result<()> {
-        let instructions = self.prog.insns_mut();
-        let mut fmt_insn = to_insn_vec(instructions);
+        let count = self.prog.insns().len() / instructions::INSN_SIZE;
         let mut index = 0;
-        let mut raw_file_ptr = vec![];
-        loop {
-            if index >= fmt_insn.len() {
-                break;
-            }
-            let mut insn = fmt_insn[index].clone();
-            if insn.opc == ebpf::LD_DW_IMM {
-                // relocate the instruction
-                let mut next_insn = fmt_insn[index + 1].clone();
-                // the imm is the map_fd because user lib has already done the relocation
-                let map_fd = insn.imm as usize;
-                let src_reg = insn.src;
-                // See https://www.kernel.org/doc/html/latest/bpf/standardization/instruction-set.html#id23
-                let ptr = match src_reg as u32 {
-                    BPF_PSEUDO_MAP_VALUE => {
-                        // dst = map_val(map_by_fd(imm)) + next_imm
-                        // map_val(map) gets the address of the first value in a given map
-                        let file = fd_table
-                            .read()
-                            .get_file_by_fd(map_fd as i32)
-                            .ok_or(SystemError::EBADF)?;
-                        let bpf_map = file
-                            .inode()
-                            .downcast_arc::<BpfMap>()
-                            .ok_or(SystemError::EINVAL)?;
-                        let first_value_ptr =
-                            bpf_map.inner_map().lock().first_value_ptr()? as usize;
-                        let offset = next_insn.imm as usize;
-                        info!(
-                            "Relocate for BPF_PSEUDO_MAP_VALUE, instruction index: {}, map_fd: {}",
-                            index, map_fd
-                        );
-                        Some(first_value_ptr + offset)
-                    }
-                    BPF_PSEUDO_MAP_FD => {
-                        // dst = map_by_fd(imm)
-                        // map_by_fd(imm) means to convert a 32-bit file descriptor into an address of a map
-                        let bpf_map = fd_table
-                            .read()
-                            .get_file_by_fd(map_fd as i32)
-                            .ok_or(SystemError::EBADF)?
-                            .inode()
-                            .downcast_arc::<BpfMap>()
-                            .ok_or(SystemError::EINVAL)?;
-                        // todo!(warning: We need release after prog unload)
-                        let map_ptr = Arc::into_raw(bpf_map) as usize;
-                        info!(
-                            "Relocate for BPF_PSEUDO_MAP_FD, instruction index: {}, map_fd: {}, ptr: {:#x}",
-                            index, map_fd, map_ptr
-                        );
-                        raw_file_ptr.push(map_ptr);
-                        Some(map_ptr)
-                    }
-                    ty => {
-                        error!(
-                            "relocation for ty: {} not implemented, instruction index: {}",
-                            ty, index
-                        );
-                        None
-                    }
-                };
-                if let Some(ptr) = ptr {
-                    // The current ins store the map_data_ptr low 32 bits,
-                    // the next ins store the map_data_ptr high 32 bits
-                    insn.imm = ptr as i32;
-                    next_insn.imm = (ptr >> 32) as i32;
-                    fmt_insn[index] = insn;
-                    fmt_insn[index + 1] = next_insn;
-                    index += 2;
-                } else {
-                    index += 1;
-                }
-            } else {
+        while index < count {
+            if !instructions::check_slot(self.prog.insns(), index)? {
                 index += 1;
+                continue;
             }
-        }
-        let fmt_insn = fmt_insn
-            .iter()
-            .flat_map(|ins| ins.to_vec())
-            .collect::<Vec<u8>>();
-        instructions.copy_from_slice(&fmt_insn);
-        for ptr in raw_file_ptr {
-            self.prog.insert_map(ptr);
+
+            match instructions::decode_ld_dw_imm(self.prog.insns(), index)? {
+                LdDwImm::Imm64 => {}
+                LdDwImm::MapFd { fd } => {
+                    let map = map_by_fd(fd_table, fd as i32)?;
+                    let addr = Arc::as_ptr(&map) as u64;
+                    self.prog.hold_map(map)?;
+                    instructions::write_imm64(self.prog.insns_mut(), index, addr);
+                }
+                LdDwImm::MapValue { fd, offset } => {
+                    // Linux resolves the descriptor before it bounds the
+                    // direct value offset, so a bad fd wins over a bad offset.
+                    let map = map_by_fd(fd_table, fd as i32)?;
+                    if offset >= BPF_MAX_VAR_OFF {
+                        return Err(SystemError::EINVAL);
+                    }
+                    let addr = map.direct_value_ptr(offset)? as u64;
+                    self.prog.hold_map(map)?;
+                    instructions::write_imm64(self.prog.insns_mut(), index, addr);
+                }
+            }
+            index += 2;
         }
         Ok(())
     }

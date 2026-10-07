@@ -1,14 +1,15 @@
-mod array_map;
+pub(super) mod array_map;
 mod hash_map;
 mod lru;
 mod queue;
-mod util;
+pub(super) mod util;
 
 use super::Result;
 use crate::bpf::map::array_map::{ArrayMap, PerCpuArrayMap, PerfEventArrayMap};
 use crate::bpf::map::hash_map::PerCpuHashMap;
 use crate::bpf::map::util::{BpfMapGetNextKeyArg, BpfMapMeta, BpfMapUpdateArg};
 use crate::filesystem::anon_inode::{anon_inode_metadata, anon_inode_path, AnonInodeFs};
+use crate::filesystem::vfs::fdtable::FileDescriptorTable;
 use crate::filesystem::vfs::file::{File, FileFlags};
 use crate::filesystem::vfs::InodeMode;
 use crate::filesystem::vfs::{FilePrivateData, FileSystem, IndexNode, Metadata};
@@ -102,9 +103,13 @@ pub trait BpfMapCommonOps: Send + Sync + Debug + CastFromSync {
         Err(SystemError::ENOSYS)
     }
 
-    /// Get the first value pointer.
-    fn first_value_ptr(&self) -> Result<*const u8> {
-        Err(SystemError::ENOSYS)
+    /// Address of the map value at `offset`, for map types that expose a
+    /// stable direct value address (Linux `map_direct_value_addr`).
+    ///
+    /// Only single-entry array maps can implement this; every other map type
+    /// keeps the default and the loader reports `EINVAL`, matching Linux.
+    fn direct_value_ptr(&self, _offset: u32) -> Result<*const u8> {
+        Err(SystemError::EINVAL)
     }
 }
 impl DowncastArc for dyn BpfMapCommonOps {
@@ -131,6 +136,14 @@ impl BpfMap {
 
     pub fn value_size(&self) -> usize {
         self.meta.value_size as usize
+    }
+
+    /// Address of the directly addressable value at `offset`.
+    ///
+    /// The per-map-type rules (which map types support direct value access,
+    /// and how far `offset` may go) live in the map implementations.
+    pub fn direct_value_ptr(&self, offset: u32) -> Result<*const u8> {
+        self.inner_map.lock().direct_value_ptr(offset)
     }
 }
 
@@ -401,11 +414,15 @@ pub fn bpf_map_lookup_and_delete_elem(attr: &bpf_attr) -> Result<usize> {
 }
 
 fn get_map_file(fd: i32) -> Result<Arc<BpfMap>> {
-    let fd_table = ProcessManager::current_pcb().fd_table();
-    let map = fd_table
-        .read()
-        .get_file_by_fd(fd)
-        .ok_or(SystemError::EBADF)?;
+    map_by_fd(&ProcessManager::current_pcb().fd_table(), fd)
+}
+
+/// Look up the map referred to by `fd` in `fd_table`.
+///
+/// Callers that resolve a descriptor on behalf of a `BPF_PROG_LOAD` request
+/// pass the loader's table; syscall handlers pass the current process's.
+pub(crate) fn map_by_fd(fd_table: &Arc<FileDescriptorTable>, fd: i32) -> Result<Arc<BpfMap>> {
+    let map = fd_table.get_file_by_fd(fd).ok_or(SystemError::EBADF)?;
     let map = map
         .inode()
         .downcast_arc::<BpfMap>()

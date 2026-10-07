@@ -8,7 +8,7 @@ use crate::bpf::map::util::round_up;
 use crate::bpf::map::{BpfCallBackFn, BpfMapCommonOps, BpfMapMeta};
 use crate::mm::percpu::{PerCpu, PerCpuVar};
 use crate::smp::cpu::{smp_cpu_manager, ProcessorId};
-use alloc::{vec, vec::Vec};
+use alloc::vec::Vec;
 use core::{
     fmt::{Debug, Formatter},
     ops::{Index, IndexMut},
@@ -22,11 +22,14 @@ use system_error::SystemError;
 #[derive(Debug)]
 pub struct ArrayMap {
     max_entries: u32,
+    /// Size requested by the user, before rounding up to `elem_size`. Linux
+    /// bounds direct value offsets by `value_size`, not by the rounded size.
+    value_size: u32,
     data: ArrayMapData,
 }
 
 struct ArrayMapData {
-    elem_size: u32,
+    elem_size: usize,
     /// The data is stored in a Vec<u8> with the size of elem_size * max_entries.
     data: Vec<u8>,
 }
@@ -41,26 +44,36 @@ impl Debug for ArrayMapData {
 }
 
 impl ArrayMapData {
-    pub fn new(elem_size: u32, max_entries: u32) -> Self {
-        debug_assert!(elem_size.is_multiple_of(8));
-        let total_size = elem_size * max_entries;
-        let data = vec![0; total_size as usize];
-        ArrayMapData { elem_size, data }
+    fn new(elem_size: usize, max_entries: u32) -> Result<Self> {
+        // `elem_size` is not required to be 8-aligned: `BPF_MAP_TYPE_PERF_EVENT_ARRAY`
+        // stores one 4-byte fd per CPU. Only `ArrayMap` rounds its element size up.
+        // Size the buffer in `usize` so the multiplication cannot wrap; Linux
+        // computes `array_size` in `u64` for the same reason.
+        let total_size = elem_size
+            .checked_mul(max_entries as usize)
+            .ok_or(SystemError::E2BIG)?;
+        // `total_size` is user controlled, so it must be a fallible
+        // allocation: Linux reports `ENOMEM` instead of crashing.
+        let mut data = Vec::new();
+        data.try_reserve_exact(total_size)
+            .map_err(|_| SystemError::ENOMEM)?;
+        data.resize(total_size, 0);
+        Ok(ArrayMapData { elem_size, data })
     }
 }
 
 impl Index<u32> for ArrayMapData {
     type Output = [u8];
     fn index(&self, index: u32) -> &Self::Output {
-        let start = index * self.elem_size;
-        &self.data[start as usize..(start + self.elem_size) as usize]
+        let start = index as usize * self.elem_size;
+        &self.data[start..start + self.elem_size]
     }
 }
 
 impl IndexMut<u32> for ArrayMapData {
     fn index_mut(&mut self, index: u32) -> &mut Self::Output {
-        let start = index * self.elem_size;
-        &mut self.data[start as usize..(start + self.elem_size) as usize]
+        let start = index as usize * self.elem_size;
+        &mut self.data[start..start + self.elem_size]
     }
 }
 
@@ -69,10 +82,17 @@ impl ArrayMap {
         if attr.value_size == 0 || attr.max_entries == 0 || attr.key_size != 4 {
             return Err(SystemError::EINVAL);
         }
+        // Linux `array_map_alloc_check()` rejects a `value_size` that does
+        // not fit an `s32` with `E2BIG`. Without this bound the oversized
+        // request would surface as the `ENOMEM` of a failed allocation.
+        if attr.value_size > i32::MAX as u32 {
+            return Err(SystemError::E2BIG);
+        }
         let elem_size = round_up(attr.value_size as usize, 8);
-        let data = ArrayMapData::new(elem_size as u32, attr.max_entries);
+        let data = ArrayMapData::new(elem_size, attr.max_entries)?;
         Ok(ArrayMap {
             max_entries: attr.max_entries,
+            value_size: attr.value_size,
             data,
         })
     }
@@ -98,7 +118,7 @@ impl BpfMapCommonOps for ArrayMap {
         if index >= self.max_entries {
             return Err(SystemError::EINVAL);
         }
-        if value.len() > self.data.elem_size as usize {
+        if value.len() > self.data.elem_size {
             return Err(SystemError::EINVAL);
         }
         let old_value = self.data.index_mut(index);
@@ -151,8 +171,17 @@ impl BpfMapCommonOps for ArrayMap {
     fn freeze(&self) -> Result<()> {
         Ok(())
     }
-    fn first_value_ptr(&self) -> Result<*const u8> {
-        Ok(self.data.data.as_ptr())
+    /// Linux `array_map_direct_value_addr`: only a single-entry array exposes
+    /// a stable direct value address, and the offset must stay inside the
+    /// requested `value_size`.
+    fn direct_value_ptr(&self, offset: u32) -> Result<*const u8> {
+        if self.max_entries != 1 {
+            return Err(SystemError::ENOTSUPP);
+        }
+        if offset >= self.value_size {
+            return Err(SystemError::EINVAL);
+        }
+        Ok(unsafe { self.data.data.as_ptr().add(offset as usize) })
     }
 }
 
@@ -210,9 +239,6 @@ impl BpfMapCommonOps for PerCpuArrayMap {
     fn get_next_key(&self, key: Option<&[u8]>, next_key: &mut [u8]) -> Result<()> {
         self.per_cpu_data.get_mut().get_next_key(key, next_key)
     }
-    fn first_value_ptr(&self) -> Result<*const u8> {
-        self.per_cpu_data.get_mut().first_value_ptr()
-    }
 }
 
 /// See https://ebpf-docs.dylanreimerink.nl/linux/map-type/BPF_MAP_TYPE_PERF_EVENT_ARRAY/
@@ -235,7 +261,7 @@ impl PerfEventArrayMap {
         if attr.key_size != 4 || attr.value_size != 4 || attr.max_entries != num_cpus {
             return Err(SystemError::EINVAL);
         }
-        let fds = ArrayMapData::new(4, num_cpus);
+        let fds = ArrayMapData::new(4, num_cpus)?;
         Ok(PerfEventArrayMap { fds })
     }
 }
@@ -274,8 +300,5 @@ impl BpfMapCommonOps for PerfEventArrayMap {
     }
     fn lookup_and_delete_elem(&mut self, _key: &[u8], _value: &mut [u8]) -> Result<()> {
         Err(SystemError::EINVAL)
-    }
-    fn first_value_ptr(&self) -> Result<*const u8> {
-        Ok(self.fds.data.as_ptr())
     }
 }

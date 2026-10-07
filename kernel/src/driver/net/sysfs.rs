@@ -650,25 +650,109 @@ impl Attribute for AttrOperstate {
 #[derive(Debug)]
 struct AttrMtu;
 
+/// Linux kstrtoul(base=0), including its overflow-before-suffix precedence.
+/// sysfs text is NUL terminated; embedded NUL also ends the parsed string.
+fn parse_mtu(buf: &[u8]) -> Result<i32, SystemError> {
+    let end = buf.iter().position(|byte| *byte == 0).unwrap_or(buf.len());
+    let mut text = &buf[..end];
+    if text.first() == Some(&b'+') {
+        text = &text[1..];
+    }
+    let radix = if text.starts_with(b"0x") || text.starts_with(b"0X") {
+        text = &text[2..];
+        16u64
+    } else if text.first() == Some(&b'0') {
+        8
+    } else {
+        10
+    };
+    let mut value = 0u64;
+    let mut digits = 0;
+    let mut overflow = false;
+    for byte in text {
+        let digit = match byte {
+            b'0'..=b'9' => (byte - b'0') as u64,
+            b'a'..=b'f' => (byte - b'a' + 10) as u64,
+            b'A'..=b'F' => (byte - b'A' + 10) as u64,
+            _ => break,
+        };
+        if digit >= radix {
+            break;
+        }
+        digits += 1;
+        match value.checked_mul(radix).and_then(|n| n.checked_add(digit)) {
+            Some(next) => value = next,
+            None => overflow = true,
+        }
+    }
+    if overflow {
+        return Err(SystemError::ERANGE);
+    }
+    if digits == 0 || !matches!(&text[digits..], [] | [b'\n']) {
+        return Err(SystemError::EINVAL);
+    }
+    // Linux change_mtu converts unsigned long to int before dev_set_mtu.
+    Ok(value as i32)
+}
+
 impl Attribute for AttrMtu {
     fn name(&self) -> &str {
         "mtu"
     }
 
     fn mode(&self) -> InodeMode {
-        SYSFS_ATTR_MODE_RO
+        SYSFS_ATTR_MODE_RW
     }
 
     fn support(&self) -> SysFSOpsSupport {
-        SysFSOpsSupport::ATTR_SHOW
+        SysFSOpsSupport::ATTR_SHOW | SysFSOpsSupport::ATTR_STORE
     }
 
-    fn show(&self, _kobj: Arc<dyn KObject>, _buf: &mut [u8]) -> Result<usize, SystemError> {
-        todo!("AttrMtu::show")
+    fn show(&self, kobj: Arc<dyn KObject>, buf: &mut [u8]) -> Result<usize, SystemError> {
+        let iface = kobj.cast::<dyn Iface>().map_err(|_| SystemError::EINVAL)?;
+        if !iface
+            .net_state()
+            .contains(NetDeivceState::__LINK_STATE_PRESENT)
+        {
+            return Err(SystemError::ENODEV);
+        }
+        sysfs_emit_str(buf, &format!("{}\n", iface.mtu()))
     }
 
-    fn store(&self, _kobj: Arc<dyn KObject>, _buf: &[u8]) -> Result<usize, SystemError> {
-        todo!("AttrMtu::store")
+    fn store(&self, kobj: Arc<dyn KObject>, buf: &[u8]) -> Result<usize, SystemError> {
+        use crate::net::link::{LinkMtuUpdate, LinkTarget, LinkUpdate};
+        use crate::process::cred::{ns_capable, CAPFlags};
+
+        let iface = kobj.cast::<dyn Iface>().map_err(|_| SystemError::EINVAL)?;
+        // A sysfs fd pins identity, not a name or namespace. Serialize with
+        // removal/movement and authorize against the device's current owner.
+        let rtnl = crate::net::rtnl::lock();
+        let netns = iface.net_namespace().ok_or(SystemError::ENODEV)?;
+        if !ns_capable(netns.user_ns(), CAPFlags::CAP_NET_ADMIN) {
+            return Err(SystemError::EPERM);
+        }
+        let mtu = parse_mtu(buf)?;
+        if !iface
+            .net_state()
+            .contains(NetDeivceState::__LINK_STATE_PRESENT)
+            || !netns
+                .device_list()
+                .get(&iface.nic_id())
+                .is_some_and(|registered| Arc::ptr_eq(registered, &iface))
+        {
+            return Err(SystemError::ENODEV);
+        }
+        let committed = crate::net::link::mutate_link(
+            &rtnl,
+            &netns,
+            LinkTarget::Index(iface.nic_id() as u32),
+            LinkUpdate {
+                mtu: Some(LinkMtuUpdate::Ioctl(mtu)),
+                ..Default::default()
+            },
+        )?;
+        crate::net::socket::netlink::notify_link_commit(&netns, committed);
+        Ok(buf.len())
     }
 }
 

@@ -1,6 +1,7 @@
 use core::{intrinsics::unlikely, ops::BitAnd};
 
 use alloc::{
+    boxed::Box,
     string::ToString,
     sync::{Arc, Weak},
 };
@@ -8,6 +9,7 @@ use log::warn;
 use system_error::SystemError;
 
 use crate::{
+    arch::MMArch,
     driver::base::kobject::KObject,
     filesystem::{
         kernfs::{
@@ -17,6 +19,7 @@ use crate::{
         sysfs::{SysFSOps, SysFSOpsSupport},
         vfs::{InodeMode, PollStatus},
     },
+    mm::MemoryManagementArch,
 };
 
 use super::{Attribute, BinAttribute, SysFS, SysFSKernPrivateData};
@@ -59,18 +62,25 @@ impl SysKernFilePriv {
 
     pub fn callback_read(&self, buf: &mut [u8], offset: usize) -> Result<usize, SystemError> {
         if let Some(attribute) = self.attribute {
-            // 当前文件所指向的kobject已经被释放
+            // Even a zero-byte operation must not bypass a dead kobject.
             let kobj = self.kobj.upgrade().ok_or(SystemError::ENODEV)?;
-            let len = attribute.show(kobj, buf)?;
-            if offset > 0 {
-                if len <= offset {
-                    return Ok(0);
-                }
-                let len = len - offset;
-                buf.copy_within(offset..offset + len, 0);
-                buf[len] = 0;
+            if buf.is_empty() {
+                return Ok(0);
             }
-            return Ok(len);
+            // show generates a complete text value, independent of the
+            // user's read size/offset (Linux sysfs_kf_read contract).
+            let mut text =
+                Box::try_new([0u8; MMArch::PAGE_SIZE]).map_err(|_| SystemError::ENOMEM)?;
+            let len = attribute.show(kobj, text.as_mut_slice())?;
+            if len > text.len() {
+                return Err(SystemError::EIO);
+            }
+            if offset >= len {
+                return Ok(0);
+            }
+            let count = buf.len().min(len - offset);
+            buf[..count].copy_from_slice(&text[offset..offset + count]);
+            return Ok(count);
         } else if let Some(bin_attribute) = self.bin_attribute.as_ref() {
             // 当前文件所指向的kobject已经被释放
             let kobj = self.kobj.upgrade().ok_or(SystemError::ENODEV)?;
@@ -82,9 +92,13 @@ impl SysKernFilePriv {
 
     pub fn callback_write(&self, buf: &[u8], offset: usize) -> Result<usize, SystemError> {
         if let Some(attribute) = self.attribute {
-            // 当前文件所指向的kobject已经被释放
             let kobj = self.kobj.upgrade().ok_or(SystemError::ENODEV)?;
-            return attribute.store(kobj, buf);
+            if buf.is_empty() {
+                return Ok(0);
+            }
+            // Ordinary Linux sysfs attributes accept at most one page per
+            // write. Binary attributes retain their independent contract.
+            return attribute.store(kobj, &buf[..buf.len().min(MMArch::PAGE_SIZE)]);
         } else if let Some(bin_attribute) = self.bin_attribute.as_ref() {
             // 当前文件所指向的kobject已经被释放
             let kobj = self.kobj.upgrade().ok_or(SystemError::ENODEV)?;
@@ -412,6 +426,9 @@ impl KernFSCallback for PreallocKFOpsEmpty {
 }
 
 pub fn sysfs_emit_str(buf: &mut [u8], s: &str) -> Result<usize, SystemError> {
+    if buf.is_empty() {
+        return Ok(0);
+    }
     let len = if buf.len() > s.len() {
         s.len()
     } else {

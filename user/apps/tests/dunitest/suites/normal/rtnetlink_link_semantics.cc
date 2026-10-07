@@ -23,6 +23,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <cstdlib>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -865,6 +866,164 @@ int RunChild(int (*test_case)()) {
     return WEXITSTATUS(status);
 }
 
+// Each child mounts a view owned by its fresh netns. Never modify host links.
+struct MtuSysfsView {
+    char path[64] = "/tmp/dunit-mtu-XXXXXX";
+    bool mounted = false;
+    int Initialize() {
+        if (unshare(CLONE_NEWUSER | CLONE_NEWNET | CLONE_NEWNS) != 0) return 77;
+        if (mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr) != 0) return 77;
+        if (mkdtemp(path) == nullptr) return 10;
+        if (mount("sysfs", path, "sysfs", MS_NOSUID | MS_NODEV | MS_NOEXEC,
+                  nullptr) != 0) return errno == EPERM ? 77 : 11;
+        mounted = true;
+        return 0;
+    }
+    std::string Attribute(const char* name) const {
+        return std::string(path) + "/class/net/" + name + "/mtu";
+    }
+    ~MtuSysfsView() {
+        if (mounted) umount2(path, MNT_DETACH);
+        rmdir(path);
+    }
+};
+
+bool MtuTextEquals(int fd, uint32_t mtu) {
+    char bytes[32] = {};
+    const ssize_t count = pread(fd, bytes, sizeof(bytes), 0);
+    return count >= 0 && std::string(bytes, count) == std::to_string(mtu) + "\n";
+}
+
+int RunSysfsMtuReadCase() {
+    MtuSysfsView view;
+    const int setup = view.Initialize();
+    if (setup != 0) return setup;
+    FdGuard fd(open(view.Attribute("lo").c_str(), O_RDONLY));
+    FdGuard route(OpenRouteSocket());
+    const auto index = FindIfindex("lo");
+    if (fd.Get() < 0 || route.Get() < 0 || !index) return 12;
+    const auto link = QueryLink(route.Get(), *index, 1);
+    if (!link || !MtuTextEquals(fd.Get(), link->mtu)) return 13;
+    struct stat metadata {};
+    if (fstat(fd.Get(), &metadata) != 0 || (metadata.st_mode & 0777) != 0644) return 14;
+    const std::string expected = std::to_string(link->mtu) + "\n";
+    std::string actual;
+    char byte = 'X';
+    for (size_t i = 0; i < expected.size(); ++i) {
+        if (read(fd.Get(), &byte, 1) != 1) return 15;
+        actual += byte;
+    }
+    if (actual != expected || read(fd.Get(), &byte, 1) != 0) return 16;
+    if (pread(fd.Get(), &byte, 1, 1) != 1 || byte != expected[1]) return 17;
+    if (lseek(fd.Get(), 1, SEEK_SET) != 1 || read(fd.Get(), &byte, 1) != 1 ||
+        byte != expected[1]) return 18;
+    byte = 'X';
+    if (read(fd.Get(), &byte, 0) != 0 || byte != 'X' ||
+        lseek(fd.Get(), 0, SEEK_CUR) != 2) return 19;
+    if (pread(fd.Get(), &byte, 1, expected.size()) != 0) return 20;
+    return 0;
+}
+
+int RunSysfsMtuWriteCase() {
+    MtuSysfsView view;
+    const int setup = view.Initialize();
+    if (setup != 0) return setup;
+    FdGuard fd(open(view.Attribute("lo").c_str(), O_RDWR | O_TRUNC));
+    FdGuard route(OpenRouteSocket());
+    FdGuard inet(socket(AF_INET, SOCK_DGRAM, 0));
+    const auto index = FindIfindex("lo");
+    if (fd.Get() < 0 || route.Get() < 0 || inet.Get() < 0 || !index) return 12;
+    uint32_t seq = 1;
+    const auto matches = [&](uint32_t mtu) {
+        ifreq request {};
+        std::strcpy(request.ifr_name, "lo");
+        const auto link = QueryLink(route.Get(), *index, seq++);
+        return link && link->mtu == mtu && MtuTextEquals(fd.Get(), mtu) &&
+               ioctl(inet.Get(), SIOCGIFMTU, &request) == 0 &&
+               request.ifr_mtu == static_cast<int>(mtu);
+    };
+    const auto initial = QueryLink(route.Get(), *index, seq++);
+    if (!initial || ftruncate(fd.Get(), 0) != 0 || !matches(initial->mtu) ||
+        ftruncate(fd.Get(), 7) != 0 || !matches(initial->mtu)) return 19;
+    struct Valid { std::string text; uint32_t mtu; };
+    const Valid valid[] = {{"1500", 1500}, {"+1400\n", 1400}, {"02734", 1500},
+                           {"0X578\n", 1400}, {std::string("1500\0junk", 9), 1500},
+                           {"4294968696", 1400}};
+    for (const auto& value : valid) {
+        if (write(fd.Get(), value.text.data(), value.text.size()) !=
+                static_cast<ssize_t>(value.text.size()) || !matches(value.mtu)) return 13;
+    }
+    struct Invalid { const char* text; int error; };
+    const Invalid invalid[] = {{"-1", EINVAL}, {" 1500", EINVAL}, {"1500 ", EINVAL},
+        {"1500\n\n", EINVAL}, {"+", EINVAL}, {"0x", EINVAL}, {"08", EINVAL},
+        {"2147483648", EINVAL}, {"18446744073709551615", EINVAL},
+        {"18446744073709551616", ERANGE}, {"18446744073709551616junk", ERANGE}};
+    for (const auto& value : invalid) {
+        errno = 0;
+        if (write(fd.Get(), value.text, std::strlen(value.text)) != -1 ||
+            errno != value.error || !matches(1400)) return 14;
+    }
+    if (write(fd.Get(), "", 0) != 0 || !matches(1400)) return 15;
+    // Prefix NUL ends parsing; the full accepted PAGE_SIZE is reported.
+    std::string oversized = "1500";
+    oversized.resize(4097, '\0');
+    if (write(fd.Get(), oversized.data(), oversized.size()) != 4096 ||
+        !matches(1500)) return 16;
+    ifreq request {};
+    std::strcpy(request.ifr_name, "lo");
+    request.ifr_mtu = 1600;
+    if (ioctl(inet.Get(), SIOCSIFMTU, &request) != 0 || !matches(1600)) return 17;
+    if (SetLink(route.Get(), *index, 0, 0, 1700, std::nullopt, seq++) != 0 ||
+        !matches(1700)) return 18;
+    return 0;
+}
+
+int RunSysfsMtuRenameAndPermissionCase() {
+    const uid_t parent_uid = getuid();
+    const gid_t parent_gid = getgid();
+    MtuSysfsView view;
+    const int setup = view.Initialize();
+    if (setup != 0) return setup;
+    FdGuard fd(open(view.Attribute("lo").c_str(), O_RDWR));
+    FdGuard route(OpenRouteSocket());
+    const auto index = FindIfindex("lo");
+    if (fd.Get() < 0 || route.Get() < 0 || !index) return 12;
+    struct stat before {}, after {};
+    if (fstat(fd.Get(), &before) != 0 ||
+        SetLink(route.Get(), *index, 0, 0, std::nullopt, "mtulo", 1) != 0 ||
+        stat(view.Attribute("mtulo").c_str(), &after) != 0 ||
+        before.st_ino != after.st_ino) return 13;
+    if (write(fd.Get(), "1500", 4) != 4 || !MtuTextEquals(fd.Get(), 1500)) return 14;
+    // Capabilities in a child userns do not authorize its parent's netns.
+    // Map the current credentials first: Linux cannot create a nested userns
+    // when the creator's UID/GID have no mapping in its current userns.
+    const auto write_map = [](const char* path, const std::string& value) {
+        FdGuard map(open(path, O_WRONLY));
+        return map.Get() >= 0 && write(map.Get(), value.data(), value.size()) ==
+                                     static_cast<ssize_t>(value.size());
+    };
+    if (!write_map("/proc/self/uid_map", "0 " + std::to_string(parent_uid) + " 1\n") ||
+        !write_map("/proc/self/setgroups", "deny\n") ||
+        !write_map("/proc/self/gid_map", "0 " + std::to_string(parent_gid) + " 1\n")) return 20;
+    const pid_t child = fork();
+    if (child < 0) return 15;
+    if (child == 0) {
+        if (unshare(CLONE_NEWUSER) != 0) _exit(77);
+        errno = 0;
+        if (write(fd.Get(), "1400", 4) != -1 || errno != EPERM ||
+            !MtuTextEquals(fd.Get(), 1500)) _exit(16);
+        // Permission precedes parsing, even for an invalid textual value.
+        errno = 0;
+        if (write(fd.Get(), "bad", 3) != -1 || errno != EPERM) _exit(17);
+        _exit(0);
+    }
+    int status = 0;
+    if (waitpid(child, &status, 0) != child || !WIFEXITED(status)) return 18;
+    if (WEXITSTATUS(status) != 0) return WEXITSTATUS(status);
+    if (!MtuTextEquals(fd.Get(), 1500)) return 19;
+    return 0;
+}
+
 std::optional<short> QueryIoctlFlags(int fd, const char* name) {
     ifreq request {};
     std::strncpy(request.ifr_name, name, IFNAMSIZ - 1);
@@ -1251,6 +1410,24 @@ TEST(RtnetlinkLinkSemantics, FreshNetworkNamespaceHasMountedSysfsProjection) {
     if (result == 77 && !IsDragonOS()) {
         GTEST_SKIP() << "host cannot create and mount a network-namespace sysfs view";
     }
+    EXPECT_EQ(result, 0);
+}
+
+TEST(RtnetlinkLinkSemantics, SysfsMtuSupportsModeShortReadsAndSeek) {
+    const int result = RunChild(RunSysfsMtuReadCase);
+    if (result == 77 && !IsDragonOS()) GTEST_SKIP() << "host cannot mount private netns sysfs";
+    EXPECT_EQ(result, 0);
+}
+
+TEST(RtnetlinkLinkSemantics, SysfsMtuTextAbiAndControlPlanesAgree) {
+    const int result = RunChild(RunSysfsMtuWriteCase);
+    if (result == 77 && !IsDragonOS()) GTEST_SKIP() << "host cannot mount private netns sysfs";
+    EXPECT_EQ(result, 0);
+}
+
+TEST(RtnetlinkLinkSemantics, SysfsMtuOldFdSurvivesRenameAndChecksOwnerUserns) {
+    const int result = RunChild(RunSysfsMtuRenameAndPermissionCase);
+    if (result == 77 && !IsDragonOS()) GTEST_SKIP() << "host cannot create private user/net namespaces";
     EXPECT_EQ(result, 0);
 }
 

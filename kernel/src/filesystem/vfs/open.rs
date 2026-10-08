@@ -589,7 +589,13 @@ pub(crate) fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usi
 
         if !how.o_flags.contains(FileFlags::O_PATH)
             && (file_type == FileType::CharDevice || file_type == FileType::BlockDevice)
-            && inode.mount_flags().contains(MountFlags::NODEV)
+            && (inode.mount_flags().contains(MountFlags::NODEV)
+                // Linux SB_I_NODEV is intrinsic to a non-initial owner:
+                // clearing mount NODEV cannot make this filesystem a source
+                // of usable device nodes. O_PATH still bypasses device open.
+                || inode.try_fs().and_then(|fs| fs.mount_owner_user_ns()).is_some_and(|owner| {
+                    !alloc::sync::Arc::ptr_eq(&owner, &crate::process::namespace::user_namespace::INIT_USER_NAMESPACE)
+                }))
         {
             return Err(SystemError::EACCES);
         }

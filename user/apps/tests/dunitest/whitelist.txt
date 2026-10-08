@@ -176,6 +176,7 @@ normal/tcp_connect_confirmation
 normal/netlink_netfilter
 normal/tcp_pending_error
 normal/mount_control
+normal/tmpfs_mount_identity
 normal/mount_attributes
 normal/mount_idmap
 normal/write_user_fault

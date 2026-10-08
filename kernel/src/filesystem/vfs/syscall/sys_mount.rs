@@ -4,14 +4,15 @@ use crate::{
     arch::{interrupt::TrapFrame, syscall::nr::SYS_MOUNT},
     filesystem::vfs::{
         fcntl::AtFlags,
+        filesystem_maker,
         mount::{
             is_mountpoint_root, with_topology_snapshot, MountFSInode, MountFlags,
             MOUNT_LIFECYCLE_LOCK,
         },
         mount_api::reconfigure::prepare_reconfigure_locked,
-        produce_fs,
+        produce_fs_in_context,
         utils::user_path_at,
-        FileType, FsReconfigureRequest, IndexNode, MountFS, MAX_PATHLEN,
+        FileType, FsCreationContext, FsReconfigureRequest, IndexNode, MountFS, MAX_PATHLEN,
         VFS_MAX_FOLLOW_SYMLINK_TIMES,
     },
     libs::casting::DowncastArc,
@@ -496,14 +497,22 @@ fn do_new_mount(
 ) -> Result<Arc<MountFS>, SystemError> {
     let fs_type_str = filesystemtype.ok_or(SystemError::EINVAL)?;
     let creation_flags = superblock_flags | mount_flags;
+    let creation = FsCreationContext::current();
+    if !filesystem_maker(&fs_type_str)
+        .ok_or(SystemError::ENODEV)?
+        .mount_capable(&creation.cred.user_ns)
+    {
+        return Err(SystemError::EPERM);
+    }
     loop {
         // Linux accepts a NULL source for nodev filesystems. Keep an
         // explicitly supplied empty string distinct from the display name.
-        let fs = produce_fs(
+        let fs = produce_fs_in_context(
             &fs_type_str,
             data.as_deref(),
             source.as_deref().unwrap_or(""),
             creation_flags,
+            &creation,
         )
         .inspect_err(|e| {
             log::warn!("Failed to produce filesystem: {:?}", e);

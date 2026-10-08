@@ -13,6 +13,9 @@ use crate::libs::rwsem::RwSem;
 use crate::mm::allocator::page_frame::FrameAllocator;
 use crate::mm::fault::PageFaultHandler;
 use crate::mm::page::Page;
+use crate::process::namespace::user_namespace::{
+    make_kgid, make_kuid, map_id_up, UserNamespace, INIT_USER_NAMESPACE,
+};
 use crate::register_mountable_fs;
 use crate::{
     arch::mm::LockedFrameAllocator,
@@ -40,9 +43,10 @@ use super::vfs::{
     file::{File, FileFlags, FilePrivateData},
     mount::MountFlags,
     utils::DName,
-    FileSystem, FsInfo, FsReconfigureRequest, IndexNode, InodeFlags, InodeId, InodeMode,
-    LinkMutationCoordinator, LinkRemovalOutcome, Metadata, MetadataUpdate, OpenFileBehavior,
-    PostWriteSyncPolicy, RenameOutcome, SetMetadataMask, SpecialNodeData,
+    FileSystem, FsCreationContext, FsInfo, FsReconfigureRequest, FsconfigPreparedData, IndexNode,
+    InodeFlags, InodeId, InodeMode, LinkMutationCoordinator, LinkRemovalOutcome, Metadata,
+    MetadataUpdate, OpenFileBehavior, PostWriteSyncPolicy, RenameOutcome, SetMetadataMask,
+    SpecialNodeData,
 };
 
 use linkme::distributed_slice;
@@ -842,6 +846,9 @@ pub struct Tmpfs {
     size_limit: RwSem<Option<u64>>,
     current_size: AtomicU64,
     mount_mode: RwSem<InodeMode>,
+    root_uid: usize,
+    root_gid: usize,
+    owner_user_ns: Arc<UserNamespace>,
 }
 
 #[derive(Debug)]
@@ -928,20 +935,58 @@ impl TmpfsInode {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Default)]
 pub struct TmpfsMountData {
     mode: Option<InodeMode>,
     size_bytes: Option<u64>,
+    uid: Option<usize>,
+    gid: Option<usize>,
 }
 
 impl TmpfsMountData {
     /// Shared, side-effect-free parsing for initial mount and reconfiguration.
-    fn parse_parameter(&mut self, key: &str, value: Option<&str>) -> Result<(), SystemError> {
-        let value = value.ok_or(SystemError::EINVAL)?.trim();
+    fn parse_parameter(
+        &mut self,
+        key: &str,
+        value: Option<&str>,
+        owner: Option<&UserNamespace>,
+    ) -> Result<(), SystemError> {
+        let value = value.ok_or(SystemError::EINVAL)?;
+        let value = if matches!(key, "uid" | "gid") {
+            // kstrtouint permits one final newline, not surrounding spaces.
+            value.strip_suffix('\n').unwrap_or(value)
+        } else {
+            value.trim()
+        };
         match key {
             "mode" => {
                 let mode = u32::from_str_radix(value, 8).map_err(|_| SystemError::EINVAL)?;
-                self.mode = Some(InodeMode::from_bits_truncate(mode));
+                self.mode = Some(InodeMode::from_bits_truncate(mode & 0o7777));
+            }
+            "uid" | "gid" => {
+                let id = Self::parse_id(value)?;
+                if let Some(owner) = owner {
+                    let caller = ProcessManager::current_user_ns();
+                    let global = if key == "uid" {
+                        make_kuid(&caller, id)?.data()
+                    } else {
+                        make_kgid(&caller, id)?.data()
+                    };
+                    let inner = owner.inner.lock();
+                    let map = if key == "uid" {
+                        &inner.uid_map
+                    } else {
+                        &inner.gid_map
+                    };
+                    if map_id_up(map, global as u32).is_none() {
+                        return Err(SystemError::EINVAL);
+                    }
+                    if key == "uid" {
+                        self.uid = Some(global);
+                    } else {
+                        self.gid = Some(global);
+                    }
+                }
             }
             "size" => {
                 let lower = value.to_lowercase();
@@ -971,16 +1016,36 @@ impl TmpfsMountData {
         Ok(())
     }
 
-    fn parse(raw: Option<&str>) -> Result<Self, SystemError> {
-        let mut parsed = Self {
-            mode: None,
-            size_bytes: None,
+    /// Linux fsparam_u32 uses base 0, unlike Rust's decimal parse().
+    fn parse_id(value: &str) -> Result<u32, SystemError> {
+        let value = value.strip_prefix('+').unwrap_or(value);
+        let (digits, radix) = if let Some(hex) = value
+            .strip_prefix("0x")
+            .or_else(|| value.strip_prefix("0X"))
+        {
+            (hex, 16)
+        } else if value.starts_with('0') {
+            (value, 8)
+        } else {
+            (value, 10)
         };
+        if !digits.chars().all(|c| c.is_digit(radix)) {
+            return Err(SystemError::EINVAL);
+        }
+        let id = u32::from_str_radix(digits, radix).map_err(|_| SystemError::EINVAL)?;
+        if id == u32::MAX {
+            return Err(SystemError::EINVAL);
+        }
+        Ok(id)
+    }
+
+    fn parse(raw: Option<&str>, owner: Option<&UserNamespace>) -> Result<Self, SystemError> {
+        let mut parsed = Self::default();
 
         if let Some(raw) = raw {
-            for opt in raw.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            for opt in raw.split(',').filter(|s| !s.is_empty()) {
                 let (key, value) = opt.split_once('=').ok_or(SystemError::EINVAL)?;
-                parsed.parse_parameter(key, Some(value))?;
+                parsed.parse_parameter(key, Some(value), owner)?;
             }
         }
 
@@ -1089,14 +1154,27 @@ impl FileSystem for Tmpfs {
         true
     }
 
+    fn mount_owner_user_ns(&self) -> Option<Arc<UserNamespace>> {
+        Some(self.owner_user_ns.clone())
+    }
+
     fn proc_show_mount_options(
         &self,
         _mount: &super::vfs::mount::MountFS,
         out: &mut dyn Write,
     ) -> Result<(), SystemError> {
         let mode = *self.mount_mode.read();
-        if mode != InodeMode::S_IRWXUGO {
+        let mut separator = "";
+        if mode != Self::default_root_mode() {
             write!(out, "mode={:03o}", mode.bits() & 0o7777).map_err(|_| SystemError::EINVAL)?;
+            separator = ",";
+        }
+        if self.root_uid != 0 {
+            write!(out, "{}uid={}", separator, self.root_uid).map_err(|_| SystemError::EINVAL)?;
+            separator = ",";
+        }
+        if self.root_gid != 0 {
+            write!(out, "{}gid={}", separator, self.root_gid).map_err(|_| SystemError::EINVAL)?;
         }
         Ok(())
     }
@@ -1123,7 +1201,10 @@ impl FileSystem for Tmpfs {
     }
 
     fn reconfigure(&self, request: FsReconfigureRequest<'_>) -> Result<MountFlags, SystemError> {
-        let parsed = TmpfsMountData::parse(request.raw_data)?;
+        // fsconfig validated identity options at SET time. They are not
+        // reapplied on remount, nor reinterpreted under the commit caller.
+        let owner = request.oldapi.then_some(self.owner_user_ns.as_ref());
+        let parsed = TmpfsMountData::parse(request.raw_data, owner)?;
 
         if let Some(new_limit) = parsed.size_bytes {
             let mut limit = self.size_limit.write();
@@ -1134,12 +1215,6 @@ impl FileSystem for Tmpfs {
             *limit = Some(new_limit);
         }
 
-        if let Some(mode) = parsed.mode {
-            let mut root = self.root_inode.0.lock();
-            root.metadata.mode = mode;
-            *self.mount_mode.write() = mode;
-        }
-
         Ok(request.sb_flags & request.sb_flags_mask)
     }
 
@@ -1148,15 +1223,14 @@ impl FileSystem for Tmpfs {
         key: &str,
         value: Option<&str>,
     ) -> Result<(), SystemError> {
-        TmpfsMountData {
-            mode: None,
-            size_bytes: None,
-        }
-        .parse_parameter(key, value)
+        TmpfsMountData::default().parse_parameter(key, value, Some(&self.owner_user_ns))
     }
 }
 
 impl Tmpfs {
+    fn default_root_mode() -> InodeMode {
+        InodeMode::S_IRWXUGO | InodeMode::S_ISVTX
+    }
     #[inline]
     fn default_size_bytes() -> usize {
         // 与 /proc/meminfo 一致：从帧分配器获取物理内存总量。
@@ -1171,22 +1245,37 @@ impl Tmpfs {
     }
 
     pub fn new(mount_data: &TmpfsMountData) -> Arc<Self> {
+        Self::new_in_context(mount_data, 0, 0, INIT_USER_NAMESPACE.clone())
+    }
+
+    fn new_in_context(
+        mount_data: &TmpfsMountData,
+        uid: usize,
+        gid: usize,
+        owner: Arc<UserNamespace>,
+    ) -> Arc<Self> {
         // 若未指定 size=，使用默认容量策略（通常为物理内存的一半）。
         // 这样 busybox df -h（默认过滤 f_blocks==0）就能显示 /tmp。
         let size_limit = mount_data
             .size_bytes
             .or_else(|| Some(Self::default_size_bytes() as u64));
         Self::new_with_size_limit(
-            mount_data.mode,
+            mount_data.mode.unwrap_or_else(Self::default_root_mode),
             size_limit,
             Some(PageCacheWritebackDomain::new()),
+            mount_data.uid.unwrap_or(uid),
+            mount_data.gid.unwrap_or(gid),
+            owner,
         )
     }
 
     fn new_with_size_limit(
-        mode: Option<InodeMode>,
+        mode: InodeMode,
         size_limit: Option<u64>,
         writeback_domain: Option<Arc<PageCacheWritebackDomain>>,
+        uid: usize,
+        gid: usize,
+        owner: Arc<UserNamespace>,
     ) -> Arc<Self> {
         let mut sb = SuperBlock::new(
             Magic::TMPFS_MAGIC,
@@ -1209,21 +1298,33 @@ impl Tmpfs {
             super_block: RwSem::new(sb),
             size_limit: RwSem::new(size_limit),
             current_size: AtomicU64::new(0),
-            mount_mode: RwSem::new(mode.unwrap_or(InodeMode::S_IRWXUGO)),
+            mount_mode: RwSem::new(mode),
+            root_uid: uid,
+            root_gid: gid,
+            owner_user_ns: owner,
         });
 
         let mut root_guard: MutexGuard<TmpfsInode> = result.root_inode.0.lock();
         root_guard.parent = Arc::downgrade(&result.root_inode);
         root_guard.self_ref = Arc::downgrade(&result.root_inode);
         root_guard.fs = Arc::downgrade(&result);
-        root_guard.metadata.mode = mode.unwrap_or(InodeMode::S_IRWXUGO);
+        root_guard.metadata.mode = mode;
+        root_guard.metadata.uid = uid;
+        root_guard.metadata.gid = gid;
         drop(root_guard);
 
         result
     }
 
     fn new_internal_shmem(mode: Option<InodeMode>) -> Arc<Self> {
-        Self::new_with_size_limit(mode, None, None)
+        Self::new_with_size_limit(
+            mode.unwrap_or(InodeMode::S_IRWXUGO),
+            None,
+            None,
+            0,
+            0,
+            INIT_USER_NAMESPACE.clone(),
+        )
     }
 
     /// 原子地增加文件系统使用的大小
@@ -1404,21 +1505,68 @@ pub fn create_memfd_file(
 }
 
 impl MountableFileSystem for Tmpfs {
+    const SUPPORTS_USERNS_MOUNT: bool = true;
     const SUPPORTS_FSCONFIG_LEGACY_OPTIONS: bool = true;
 
     fn validate_fsconfig_parameter(key: &str, value: Option<&str>) -> Result<(), SystemError> {
-        TmpfsMountData {
-            mode: None,
-            size_bytes: None,
-        }
-        .parse_parameter(key, value)
+        TmpfsMountData::default().parse_parameter(key, value, None)
+    }
+
+    fn prepare_fsconfig_string(
+        key: &str,
+        value: &str,
+        previous: Option<&FsconfigPreparedData>,
+        owner: &UserNamespace,
+    ) -> Result<Option<FsconfigPreparedData>, SystemError> {
+        let mut parsed = match previous {
+            Some(data) => data
+                .downcast_ref::<TmpfsMountData>()
+                .ok_or(SystemError::EINVAL)?
+                .clone(),
+            None => TmpfsMountData::default(),
+        };
+        parsed.parse_parameter(key, Some(value), Some(owner))?;
+        Ok(Some(Arc::new(parsed)))
+    }
+
+    fn make_mount_data_in_context(
+        raw_data: Option<&str>,
+        _source: &str,
+        context: &FsCreationContext,
+    ) -> Result<Option<Arc<dyn FileSystemMakerData>>, SystemError> {
+        let parsed = match &context.fsconfig_prepared {
+            Some(data) => data
+                .downcast_ref::<TmpfsMountData>()
+                .ok_or(SystemError::EINVAL)?
+                .clone(),
+            None => TmpfsMountData::parse(raw_data, Some(&context.cred.user_ns))?,
+        };
+        Ok(Some(Arc::new(parsed)))
+    }
+
+    fn make_fs_in_context(
+        data: Option<&dyn FileSystemMakerData>,
+        _flags: MountFlags,
+        context: &FsCreationContext,
+    ) -> Result<Arc<dyn FileSystem>, SystemError> {
+        let data = data
+            .ok_or(SystemError::EINVAL)?
+            .as_any()
+            .downcast_ref::<TmpfsMountData>()
+            .ok_or(SystemError::EINVAL)?;
+        Ok(Self::new_in_context(
+            data,
+            context.cred.fsuid.data(),
+            context.cred.fsgid.data(),
+            context.cred.user_ns.clone(),
+        ))
     }
 
     fn make_mount_data(
         raw_data: Option<&str>,
         _source: &str,
     ) -> Result<Option<Arc<dyn FileSystemMakerData + 'static>>, SystemError> {
-        let parsed = TmpfsMountData::parse(raw_data)?;
+        let parsed = TmpfsMountData::parse(raw_data, Some(&INIT_USER_NAMESPACE))?;
         Ok(Some(Arc::new(parsed)))
     }
 

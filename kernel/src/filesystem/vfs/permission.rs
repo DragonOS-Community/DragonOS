@@ -95,6 +95,25 @@ impl InodeOpContext {
         }
     }
 
+    /// Linux fsuidgid_has_mapping: creation needs both caller IDs in the
+    /// filesystem's namespace even on a non-idmapped mount. This is stricter
+    /// than from_vfsuid/notify_change and must not change generic conversion.
+    fn check_creator_mapping(&self, cred: &Cred) -> Result<(), SystemError> {
+        let uid = self
+            .raw_uid(cred.fsuid.data())
+            .ok_or(SystemError::EOVERFLOW)?;
+        let gid = self
+            .raw_gid(cred.fsgid.data())
+            .ok_or(SystemError::EOVERFLOW)?;
+        let maps = self.fs_userns.inner.lock();
+        if map_id_up(&maps.uid_map, uid as u32).is_none()
+            || map_id_up(&maps.gid_map, gid as u32).is_none()
+        {
+            return Err(SystemError::EOVERFLOW);
+        }
+        Ok(())
+    }
+
     /// Linux notify_change validates new IDs before unrepaired old IDs.
     pub fn validate_setattr_mapping(
         &self,
@@ -220,12 +239,12 @@ pub fn check_inode_link_source(
 pub fn check_parent_create(
     parent: &Metadata,
     context: &InodeOpContext,
-    allow_unlinked_parent: bool,
+    anonymous: bool,
 ) -> Result<(), SystemError> {
     if parent.file_type != FileType::Dir {
         return Err(SystemError::ENOTDIR);
     }
-    if !allow_unlinked_parent && parent.nlinks == 0 {
+    if !anonymous && parent.nlinks == 0 {
         return Err(SystemError::ENOENT);
     }
     let Some(cred) = &context.cred else {
@@ -236,12 +255,19 @@ pub fn check_parent_create(
         };
     };
     // Linux may_create checks both caller IDs even when SGID will inherit GID.
-    context
-        .raw_uid(cred.fsuid.data())
-        .ok_or(SystemError::EOVERFLOW)?;
-    context
-        .raw_gid(cred.fsgid.data())
-        .ok_or(SystemError::EOVERFLOW)?;
+    // vfs_tmpfile does not call may_create: it permits an unlinked parent
+    // and uses the normal mapped_fsuid/gid conversion without this extra
+    // owner-map constraint.
+    if anonymous {
+        context
+            .raw_uid(cred.fsuid.data())
+            .ok_or(SystemError::EOVERFLOW)?;
+        context
+            .raw_gid(cred.fsgid.data())
+            .ok_or(SystemError::EOVERFLOW)?;
+    } else {
+        context.check_creator_mapping(cred)?;
+    }
     if parent.flags.contains(super::InodeFlags::S_IMMUTABLE) {
         return Err(SystemError::EPERM);
     }

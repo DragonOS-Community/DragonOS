@@ -48,6 +48,12 @@ impl RawSocket {
         value: &mut [u8],
     ) -> Result<usize, SystemError> {
         match PSO::try_from(name as u32) {
+            Ok(PSO::ERROR) => {
+                let mut errors = self.errors.lock();
+                let errno = errors.0;
+                errors.0 = 0;
+                Ok(write_i32_getsockopt(value, errno))
+            }
             Ok(PSO::SNDBUF) => Ok(write_u32_getsockopt(value, self.options.read().sock_sndbuf)),
             Ok(PSO::RCVBUF) => Ok(write_u32_getsockopt(value, self.options.read().sock_rcvbuf)),
             Ok(PSO::BINDTODEVICE) => self.device_binding.get(&self.netns, value),
@@ -109,6 +115,18 @@ impl RawSocket {
         value: &mut [u8],
     ) -> Result<usize, SystemError> {
         match IpOption::try_from(name as u32) {
+            Ok(IpOption::MTU_DISCOVER) => Ok(write_i32_getsockopt(
+                value,
+                self.options.read().ip_pmtu.as_i32(),
+            )),
+            Ok(IpOption::MTU) => Ok(write_i32_getsockopt(
+                value,
+                self.connected_path_mtu()? as i32,
+            )),
+            Ok(IpOption::RECVERR) => Ok(write_i32_getsockopt_ipv4(
+                value,
+                self.options.read().recv_err_v4 as i32,
+            )),
             Ok(IpOption::HDRINCL) => Ok(write_i32_getsockopt_ipv4(
                 value,
                 self.options.read().ip_hdrincl as i32,
@@ -162,6 +180,22 @@ impl RawSocket {
             return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
         }
         match PIPV6::try_from(name as u32) {
+            Ok(PIPV6::MULTICAST_LOOP) => Ok(write_i32_getsockopt(
+                value,
+                self.options.read().ipv6_multicast_loop as i32,
+            )),
+            Ok(PIPV6::MTU_DISCOVER) => Ok(write_i32_getsockopt(
+                value,
+                self.options.read().ipv6_pmtu.as_i32(),
+            )),
+            Ok(PIPV6::MTU) => Ok(write_i32_getsockopt(
+                value,
+                self.connected_path_mtu()? as i32,
+            )),
+            Ok(PIPV6::RECVERR) => Ok(write_i32_getsockopt(
+                value,
+                self.options.read().recv_err_v6 as i32,
+            )),
             Ok(PIPV6::HDRINCL) => Ok(write_i32_getsockopt(
                 value,
                 self.options.read().ip_hdrincl as i32,
@@ -319,6 +353,27 @@ impl RawSocket {
 
     pub(super) fn set_option_ip_level(&self, name: usize, val: &[u8]) -> Result<(), SystemError> {
         match IpOption::try_from(name as u32) {
+            Ok(IpOption::MTU_DISCOVER) => {
+                self.options.write().ip_pmtu = super::super::common::pmtu::PmtuPolicy::from_i32(
+                    read_i32_opt(val)
+                        .or_else(|| val.first().map(|value| *value as i32))
+                        .ok_or(SystemError::EINVAL)?,
+                )?;
+                Ok(())
+            }
+            Ok(IpOption::RECVERR) => {
+                let enabled = read_i32_opt(val)
+                    .unwrap_or_else(|| val.first().copied().unwrap_or(0) as i32)
+                    != 0;
+                if val.is_empty() {
+                    return Err(SystemError::EINVAL);
+                }
+                self.options.write().recv_err_v4 = enabled;
+                if !enabled {
+                    self.errors.lock().1.clear();
+                }
+                Ok(())
+            }
             Ok(IpOption::HDRINCL) => {
                 let enable = val.first().copied().unwrap_or(0) != 0;
                 self.options.write().ip_hdrincl = enable;
@@ -400,6 +455,36 @@ impl RawSocket {
             return Err(SystemError::ENOPROTOOPT);
         }
         match PIPV6::try_from(name as u32) {
+            Ok(PIPV6::MULTICAST_LOOP) => {
+                let enabled = read_i32_opt(val).ok_or(SystemError::EINVAL)?;
+                if !(0..=1).contains(&enabled) {
+                    return Err(SystemError::EINVAL);
+                }
+                self.options.write().ipv6_multicast_loop = enabled != 0;
+                Ok(())
+            }
+            Ok(PIPV6::MTU) => {
+                let mtu = read_i32_opt(val).ok_or(SystemError::EINVAL)?;
+                if mtu != 0 && mtu < 1280 {
+                    return Err(SystemError::EINVAL);
+                }
+                self.options.write().ipv6_frag_size = mtu as usize;
+                Ok(())
+            }
+            Ok(PIPV6::MTU_DISCOVER) => {
+                self.options.write().ipv6_pmtu = super::super::common::pmtu::PmtuPolicy::from_i32(
+                    read_i32_opt(val).ok_or(SystemError::EINVAL)?,
+                )?;
+                Ok(())
+            }
+            Ok(PIPV6::RECVERR) => {
+                let enabled = read_i32_opt(val).ok_or(SystemError::EINVAL)? != 0;
+                self.options.write().recv_err_v6 = enabled;
+                if !enabled {
+                    self.errors.lock().1.clear();
+                }
+                Ok(())
+            }
             Ok(PIPV6::HDRINCL) => {
                 let enabled = read_i32_opt(val).ok_or(SystemError::EINVAL)? != 0;
                 self.options.write().ip_hdrincl = enabled;

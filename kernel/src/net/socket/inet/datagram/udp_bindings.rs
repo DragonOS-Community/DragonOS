@@ -141,6 +141,7 @@ struct UdpBindingMatch {
 struct UdpLookupScore {
     local_exact: bool,
     connected: bool,
+    native_family: bool,
     device_bound: bool,
 }
 
@@ -167,6 +168,29 @@ impl Default for UdpBindingTable {
 }
 
 impl UdpBindingTable {
+    /// ICMP quotes describe the transmitted packet, so reverse it into the
+    /// existing namespace receive lookup rather than retaining datagram history.
+    pub(crate) fn handle_pmtu_feedback(&self, feedback: &crate::net::pmtu::PmtuFeedback) {
+        if feedback.protocol != smoltcp::wire::IpProtocol::Udp {
+            return;
+        }
+        let local = IpEndpoint::new(feedback.source, feedback.src_port);
+        let remote = IpEndpoint::new(feedback.destination, feedback.dst_port);
+        let Ok(candidates) = self.match_bindings(
+            local.addr,
+            local.port,
+            remote,
+            feedback.ingress_ifindex as i32,
+        ) else {
+            return;
+        };
+        if let Some(candidate) = choose_unicast_socket(&candidates, local, remote) {
+            candidate
+                .socket
+                .handle_pmtu_feedback(candidate.generation, feedback);
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn bind(
         &self,
@@ -503,6 +527,7 @@ impl UdpBindingTable {
                 score: UdpLookupScore {
                     local_exact: !binding.addr.is_unspecified(),
                     connected,
+                    native_family: binding.addr.version() == dest_addr.version(),
                     device_bound: bound_ifindex != 0,
                 },
             });
@@ -517,15 +542,48 @@ impl UdpBindingTable {
 
 #[inline]
 fn udp_addrs_conflict(a: IpAddress, b: IpAddress) -> bool {
-    a.version() == b.version() && (a.is_unspecified() || b.is_unspecified() || a == b)
+    if a.version() == b.version() {
+        return a.is_unspecified() || b.is_unspecified() || a == b;
+    }
+    // The same dual-stack wildcard used by receive/ICMP lookup also reserves
+    // IPv4 bindings, so an unrelated non-reuse socket cannot steal its port.
+    matches!((a, b), (IpAddress::Ipv6(address), IpAddress::Ipv4(_))
+        | (IpAddress::Ipv4(_), IpAddress::Ipv6(address)) if address.is_unspecified())
 }
 
 #[inline]
 fn udp_addr_match(bound_addr: IpAddress, dest_addr: IpAddress) -> bool {
     if bound_addr.version() != dest_addr.version() {
-        return false;
+        // DragonOS's AF_INET6 UDP wildcard is dual stack. In particular an
+        // ICMP quote for a mapped send carries real IPv4 addresses, never
+        // ::ffff addresses. A concrete native IPv6 bind still cannot match.
+        return matches!((bound_addr, dest_addr),
+            (IpAddress::Ipv6(address), IpAddress::Ipv4(_)) if address.is_unspecified());
     }
     bound_addr.is_unspecified() || bound_addr == dest_addr
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{udp_addr_match, udp_addrs_conflict};
+    use smoltcp::wire::IpAddress;
+
+    #[test]
+    fn mapped_ipv4_quote_matches_only_dual_stack_wildcard() {
+        let ipv4 = IpAddress::v4(198, 51, 100, 1);
+        assert!(udp_addr_match(IpAddress::v6(0, 0, 0, 0, 0, 0, 0, 0), ipv4));
+        assert!(!udp_addr_match(
+            IpAddress::v6(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1),
+            ipv4
+        ));
+        let wildcard = IpAddress::v6(0, 0, 0, 0, 0, 0, 0, 0);
+        assert!(udp_addrs_conflict(wildcard, ipv4));
+        assert!(udp_addrs_conflict(ipv4, wildcard));
+        assert!(!udp_addr_match(
+            IpAddress::v4(0, 0, 0, 0),
+            IpAddress::v6(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)
+        ));
+    }
 }
 
 fn choose_unicast_socket(

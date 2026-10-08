@@ -29,6 +29,7 @@ mod loopback;
 mod ops;
 mod options;
 mod packet;
+mod pmtu;
 mod recv;
 mod send;
 mod socket;
@@ -43,6 +44,7 @@ pub use options::{Icmp6Filter, IcmpFilter, RawSocketOptions};
 
 pub(crate) use loopback::deliver_udp_loopback_packet;
 pub(crate) use loopback::{snapshot_raw_ingress_listeners, RawIngressListener, RawIngressWork};
+pub(crate) use pmtu::handle_pmtu_feedback;
 
 /// InetRawSocket - AF_INET/AF_INET6 SOCK_RAW 实现
 ///
@@ -83,9 +85,15 @@ pub struct RawSocket {
     ip_version: IpVersion,
     /// 协议号
     protocol: IpProtocol,
+    /// IPv4 inet_dport is retained for LOCAL error queue msg_name only.
+    connected_port: AtomicU32,
 
     /// 回环快速路径：用于保留 TOS/TCLASS 等字段且实现 SO_RCVBUF 行为。
     loopback_rx: Mutex<LoopbackRxQueue>,
+    /// Socket error and extended-error queue share one lock so consuming a
+    /// queue entry cannot overwrite an error arriving concurrently.
+    errors: Mutex<(i32, super::common::error_queue::ErrorQueue)>,
+    output_path: Mutex<Option<pmtu::RawOutputPath>>,
 
     /// IP_MULTICAST_IF: interface index
     ip_multicast_ifindex: AtomicI32,

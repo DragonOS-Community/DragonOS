@@ -82,6 +82,7 @@ fn new_listen_smoltcp_socket<T>(
     ip_version: Option<smoltcp::wire::IpVersion>,
     device: Option<NonZeroU32>,
     reservation: &TcpPortReservation,
+    pmtu_discover: u8,
 ) -> Result<smoltcp::socket::tcp::Socket<'static>, SystemError>
 where
     T: Into<smoltcp::wire::IpListenEndpoint>,
@@ -95,6 +96,9 @@ where
     rx.resize(DEFAULT_RX_BUF_SIZE, 0);
     tx.resize(DEFAULT_TX_BUF_SIZE, 0);
     let mut socket = socket_with_buffers(tcp::SocketBuffer::new(rx), tcp::SocketBuffer::new(tx));
+    socket
+        .set_pmtu_discover(pmtu_discover)
+        .expect("validated PMTU policy");
     socket.set_listen_ip_version(ip_version);
     socket.set_listen_bound_device(device);
     socket.set_lifecycle_observer(Some(reservation.prepare_child(Arc::new(
@@ -163,6 +167,9 @@ impl Init {
                 new_sock.set_hop_limit(socket.hop_limit());
                 new_sock.set_listen_ip_version(socket.listen_ip_version());
                 new_sock.set_bound_device(socket.bound_device());
+                new_sock
+                    .set_pmtu_discover(socket.pmtu_discover())
+                    .expect("validated PMTU policy");
 
                 **socket = new_sock;
                 Ok(())
@@ -430,6 +437,7 @@ impl Init {
         v6_only: bool,
         device_binding: Arc<SocketDeviceBinding>,
         owner: &TcpPortOwner,
+        pmtu_policies: [u8; 2],
     ) -> Result<Listening, (Self, SystemError)> {
         // If unbound, auto-bind to INADDR_ANY:ephemeral (Linux compat).
         let bound_self = if matches!(self, Init::Unbound(_)) {
@@ -496,6 +504,7 @@ impl Init {
             domain,
             &device_binding,
             &reservation,
+            pmtu_policies[usize::from(local.addr.version() == smoltcp::wire::IpVersion::Ipv6)],
         ) {
             let inner = inners.remove(primary_index);
             for bound in inners {
@@ -506,6 +515,12 @@ impl Init {
 
         if let Err(err) =
             inners[primary_index].with_mut::<smoltcp::socket::tcp::Socket, _, _>(|socket| {
+                socket
+                    .set_pmtu_discover(
+                        pmtu_policies
+                            [usize::from(local.addr.version() == smoltcp::wire::IpVersion::Ipv6)],
+                    )
+                    .expect("validated PMTU policy");
                 socket.set_listen_ip_version(domain.ip_version);
                 socket.set_listen_bound_device(NonZeroU32::new(device_binding.ifindex() as u32));
                 socket.set_lifecycle_observer(Some(reservation.prepare_child(Arc::new(
@@ -534,6 +549,8 @@ impl Init {
             domain,
             reservation: Some(reservation),
             device_binding,
+            pmtu_policies,
+            prepared_family: local.addr.version(),
         });
     }
 
@@ -814,9 +831,57 @@ pub struct Listening {
     pub domain: TcpBindDomain,
     pub reservation: Option<TcpPortReservation>,
     device_binding: Arc<SocketDeviceBinding>,
+    /// Future passive opens inherit the family-specific listener setting.
+    /// Already-created children retain their own snapshot until accepted.
+    pmtu_policies: [u8; 2],
+    /// Do not overwrite a prepared IPv4 SYN's policy from an IPv6 setter
+    /// while ingress is waiting to acquire SocketSet (and vice versa).
+    prepared_family: smoltcp::wire::IpVersion,
 }
 
 impl Listening {
+    fn pmtu_policy(&self, version: smoltcp::wire::IpVersion) -> u8 {
+        self.pmtu_policies[usize::from(version == smoltcp::wire::IpVersion::Ipv6)]
+    }
+
+    pub(super) fn set_pmtu_discover(&mut self, version: smoltcp::wire::IpVersion, value: u8) {
+        self.pmtu_policies[usize::from(version == smoltcp::wire::IpVersion::Ipv6)] = value;
+        let selected_family = self.domain.ip_version.unwrap_or(self.prepared_family);
+        let Some(stack) = self.inners.first().map(|bound| bound.stack().clone()) else {
+            return;
+        };
+        let mut sockets = stack.sockets().lock();
+        for bound in &mut self.inners {
+            let socket = sockets.get_mut::<tcp::Socket>(bound.handle());
+            let idle = matches!(socket.state(), tcp::State::Listen | tcp::State::Closed);
+            if idle && selected_family == version {
+                socket
+                    .set_pmtu_discover(value)
+                    .expect("validated PMTU policy");
+            }
+            if idle {
+                bound.pmtu_policies = self.pmtu_policies;
+            }
+        }
+    }
+
+    fn prepare_idle_pmtu(&mut self) {
+        let policy = self.pmtu_policy(self.prepared_family);
+        let Some(stack) = self.inners.first().map(|bound| bound.stack().clone()) else {
+            return;
+        };
+        let mut sockets = stack.sockets().lock();
+        for bound in &mut self.inners {
+            let socket = sockets.get_mut::<tcp::Socket>(bound.handle());
+            if socket.state() != tcp::State::Listen {
+                continue;
+            }
+            socket
+                .set_pmtu_discover(policy)
+                .expect("validated PMTU policy");
+            bound.pmtu_policies = self.pmtu_policies;
+        }
+    }
     /// Update idle slots and the overflow lookup under the same SocketSet lock.
     /// Handshake/accepted snapshots remain owned by each TCP socket.
     pub(super) fn set_bound_device(&mut self, device: Option<NonZeroU32>) {
@@ -874,6 +939,11 @@ impl Listening {
         } else {
             self.rearm_closed_slots();
         }
+        // SYN admission follows immediately after this preparation in the
+        // namespace TCP poll. Pick the actual family before the SYN-ACK.
+        let pmtu_discover = self.pmtu_policy(local.addr.version());
+        self.prepared_family = local.addr.version();
+        self.prepare_idle_pmtu();
         if self.inners.len() >= self.target_slots
             || self.inners.iter().any(|bound| {
                 bound.with::<tcp::Socket, _, _>(|socket| socket.state() == tcp::State::Listen)
@@ -893,7 +963,9 @@ impl Listening {
             self.reservation
                 .as_ref()
                 .expect("open listener reservation"),
+            pmtu_discover,
         );
+        self.prepare_idle_pmtu();
     }
 
     pub(super) fn has_excess_slots(&self) -> bool {
@@ -939,6 +1011,9 @@ impl Listening {
         for bound in &self.inners {
             bound.with_mut::<tcp::Socket, _, _>(|socket| {
                 if socket.state() == tcp::State::Closed {
+                    socket
+                        .set_pmtu_discover(self.pmtu_policy(self.prepared_family))
+                        .expect("validated PMTU policy");
                     socket.set_listen_bound_device(NonZeroU32::new(
                         self.device_binding.ifindex() as u32
                     ));
@@ -957,6 +1032,7 @@ impl Listening {
         domain: TcpBindDomain,
         device_binding: &SocketDeviceBinding,
         reservation: &TcpPortReservation,
+        pmtu_discover: u8,
     ) -> Result<(), SystemError> {
         // Prepare sockets before publishing any new handles; keep existing
         // connections and the previous capacity on a recoverable failure.
@@ -974,6 +1050,7 @@ impl Listening {
                     domain.ip_version,
                     NonZeroU32::new(device_binding.ifindex() as u32),
                     reservation,
+                    pmtu_discover,
                 )?);
             }
             let netns = bound.netns();
@@ -1006,6 +1083,7 @@ impl Listening {
             .ok_or(SystemError::EAGAIN_OR_EWOULDBLOCK)?;
 
         let retire = self.can_remove_slot(index);
+        let replacement_policy = self.pmtu_policy(self.prepared_family);
         let connected = &mut self.inners[index];
 
         if retire {
@@ -1032,6 +1110,7 @@ impl Listening {
                 self.reservation
                     .as_ref()
                     .expect("open listener reservation"),
+                replacement_policy,
             )?,
             connected.netns(),
         );
@@ -1148,6 +1227,9 @@ pub struct Established {
 }
 
 impl Established {
+    pub(super) fn pmtu_policies(&self) -> [u8; 2] {
+        self.inner.pmtu_policies
+    }
     pub fn port_owner(&self) -> TcpPortOwner {
         self.reservation
             .as_ref()

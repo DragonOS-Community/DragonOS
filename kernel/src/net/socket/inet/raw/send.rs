@@ -59,6 +59,7 @@ impl RawSocket {
         to: Option<IpAddress>,
         options: &super::options::RawSocketOptions,
     ) -> Result<usize, SystemError> {
+        self.take_pending_error()?;
         if self.protocol == IpProtocol::Unknown(255) {
             return Err(SystemError::EINVAL);
         }
@@ -117,6 +118,7 @@ impl RawSocket {
                 return Err(SystemError::EINVAL);
             }
             if buf.len() > route.ip_mtu {
+                self.local_mtu_error(destination, route.ip_mtu);
                 return Err(SystemError::EMSGSIZE);
             }
         }
@@ -136,6 +138,22 @@ impl RawSocket {
             built = build_ip_packet(IpVersion::Ipv6, &params)?;
             built.as_slice()
         };
+        if !options.ip_hdrincl {
+            let mtu = crate::net::route::pmtu::path_mtu(
+                &self.netns,
+                route,
+                source.expect("selected IPv6 source").into(),
+                destination,
+            );
+            let mut effective = options.ipv6_pmtu.effective_mtu(mtu.interface, mtu.path);
+            if options.ipv6_frag_size != 0 {
+                effective = effective.min(options.ipv6_frag_size);
+            }
+            if !options.ipv6_pmtu.allows_fragmentation() && packet.len() > effective {
+                self.local_mtu_error(destination, effective);
+                return Err(SystemError::EMSGSIZE);
+            }
+        }
         let mut reservation = crate::driver::net::local_output::reserve_prepared_ip_output(
             owner.as_ref(),
             &self.netns,
@@ -143,7 +161,43 @@ impl RawSocket {
             IpVersion::Ipv6,
         )?;
         reservation.bytes_mut().copy_from_slice(packet);
-        crate::net::output::submit_prepared_ipv6(&self.netns, reservation, route)?;
+        let header_destination = IpAddress::Ipv6(
+            smoltcp::wire::Ipv6Packet::new_checked(packet)
+                .map_err(|_| SystemError::EINVAL)?
+                .dst_addr(),
+        );
+        let mut hint = None;
+        let result = crate::net::output::submit_prepared_ipv6_raw(
+            &self.netns,
+            reservation,
+            route,
+            crate::net::output::RawOutputPolicy {
+                multicast_loop: options.ipv6_multicast_loop,
+                hdrincl: options.ip_hdrincl,
+                discovery: options.ipv6_pmtu,
+                ceiling: (options.ipv6_frag_size != 0).then_some(options.ipv6_frag_size),
+            },
+            &mut hint,
+        );
+        if options.ip_hdrincl {
+            self.remember_hdrincl_output_path(
+                destination,
+                header_destination,
+                fixed_source,
+                required_oif,
+                hint,
+            );
+        } else {
+            self.remember_output_path(destination, fixed_source, required_oif, hint);
+        }
+        if let Err(failure) = result {
+            if failure.error == SystemError::EMSGSIZE {
+                if let Some(mtu) = failure.mtu {
+                    self.local_mtu_error(destination, mtu);
+                }
+            }
+            return Err(failure.error);
+        }
         Ok(buf.len())
     }
 
@@ -157,6 +211,7 @@ impl RawSocket {
         options: &super::options::RawSocketOptions,
         ttl_override: Option<u8>,
     ) -> Result<usize, SystemError> {
+        self.take_pending_error()?;
         let multicast_loop = self.ip_multicast_loop.load(Ordering::Acquire);
         let multicast_ttl = self.ip_multicast_ttl.load(Ordering::Acquire) as u8;
         let (destination, bound_source) = {
@@ -223,6 +278,17 @@ impl RawSocket {
         // Linux raw_send_hdrinc rejects an oversized complete datagram even
         // when its supplied header has DF clear.
         if options.ip_hdrincl && packet_len > route.ip_mtu {
+            self.local_mtu_error(destination, route.ip_mtu);
+            return Err(SystemError::EMSGSIZE);
+        }
+        let mtu =
+            crate::net::route::pmtu::path_mtu(&self.netns, route, resolved.source, destination);
+        let effective_mtu = options.ip_pmtu.effective_mtu(mtu.interface, mtu.path);
+        if !options.ip_hdrincl
+            && !options.ip_pmtu.allows_fragmentation()
+            && packet_len > effective_mtu
+        {
+            self.local_mtu_error(destination, effective_mtu);
             return Err(SystemError::EMSGSIZE);
         }
         let owner = self
@@ -261,7 +327,9 @@ impl RawSocket {
             } else {
                 options.ip_ttl
             });
-            let dont_fragment = packet_len <= route.ip_mtu;
+            let dont_fragment = options
+                .ip_pmtu
+                .ipv4_df(packet_len, effective_mtu, mtu.locked);
             let ident = if dont_fragment {
                 0
             } else {
@@ -283,13 +351,43 @@ impl RawSocket {
             )?;
         }
         reservation.set_charge(charge);
-        let _ = crate::net::output::submit_prepared_ipv4(
+        let header_destination = IpAddress::Ipv4(
+            Ipv4Packet::new_checked(reservation.bytes())
+                .map_err(|_| SystemError::EINVAL)?
+                .dst_addr(),
+        );
+        let mut hint = None;
+        let result = crate::net::output::submit_prepared_ipv4_raw(
             &self.netns,
             reservation,
             route,
-            multicast_loop,
-            !options.ip_hdrincl,
-        )?;
+            crate::net::output::RawOutputPolicy {
+                multicast_loop,
+                hdrincl: options.ip_hdrincl,
+                discovery: options.ip_pmtu,
+                ceiling: None,
+            },
+            &mut hint,
+        );
+        if options.ip_hdrincl {
+            self.remember_hdrincl_output_path(
+                destination,
+                header_destination,
+                bound_source,
+                required_oif,
+                hint,
+            );
+        } else {
+            self.remember_output_path(destination, bound_source, required_oif, hint);
+        }
+        if let Err(failure) = result {
+            if failure.error == SystemError::EMSGSIZE {
+                if let Some(mtu) = failure.mtu {
+                    self.local_mtu_error(destination, mtu);
+                }
+            }
+            return Err(failure.error);
+        }
         Ok(buf.len())
     }
 
@@ -348,7 +446,13 @@ impl RawSocket {
             return self.try_send_ipv4_prepared(buf, to, &options, None);
         }
 
-        self.try_send_ipv6_prepared(buf, to, &self.options.read().clone())
+        let options = self.options.read().clone();
+        self.try_send_ipv6_prepared(buf, to, &options)
+    }
+
+    fn can_retry_ipv4_send(&self, packet_len: usize) -> bool {
+        let pending_error = self.errors.lock().0 != 0;
+        pending_error || self.send_account.can_charge(packet_len)
     }
 
     pub fn send(&self, buffer: &[u8], flags: PMSG) -> Result<usize, SystemError> {
@@ -371,7 +475,7 @@ impl RawSocket {
                                 IPV4_MIN_HEADER_LEN
                             });
                     self.wait_queue.wait_event_io_interruptible_timeout(
-                        || self.send_account.can_charge(packet_len),
+                        || self.can_retry_ipv4_send(packet_len),
                         remaining_send_timeout(started, timeout)?,
                     )?;
                 }
@@ -408,7 +512,7 @@ impl RawSocket {
                                     IPV4_MIN_HEADER_LEN
                                 });
                         self.wait_queue.wait_event_io_interruptible_timeout(
-                            || self.send_account.can_charge(packet_len),
+                            || self.can_retry_ipv4_send(packet_len),
                             remaining_send_timeout(started, timeout)?,
                         )?;
                     }
@@ -534,7 +638,7 @@ impl RawSocket {
                     Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
                         self.wait_queue.wait_event_io_interruptible_timeout(
                             || {
-                                self.send_account.can_charge(buf.len().saturating_add(
+                                self.can_retry_ipv4_send(buf.len().saturating_add(
                                     if options.ip_hdrincl {
                                         0
                                     } else {

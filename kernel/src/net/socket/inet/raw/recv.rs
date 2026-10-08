@@ -61,6 +61,7 @@ impl RawSocket {
         &self,
         buf: &mut [u8],
     ) -> Result<(usize, smoltcp::wire::IpAddress, u32), SystemError> {
+        self.take_pending_error()?;
         // 先消费回环注入队列（保留原始头字段，并实现 SO_RCVBUF 语义）。
         if let Some(pkt) = {
             let mut q = self.loopback_rx.lock();
@@ -459,6 +460,36 @@ impl RawSocket {
         msg: &mut crate::net::posix::MsgHdr,
         flags: crate::net::socket::PMSG,
     ) -> Result<usize, SystemError> {
+        if flags.contains(crate::net::socket::PMSG::ERRQUEUE) {
+            let entry = {
+                let mut errors = self.errors.lock();
+                let entry = errors.1.pop().ok_or(SystemError::EAGAIN_OR_EWOULDBLOCK)?;
+                errors.0 = errors.1.pending_after_pop(&entry, errors.0);
+                entry
+            };
+            let options = self.options.read().clone();
+            let ipv6 = self.ip_version == IpVersion::Ipv6;
+            return entry.recv_msg_with_options(
+                msg,
+                super::super::common::error_queue::ErrorCmsgOptions {
+                    pktinfo: if ipv6 {
+                        options.recv_pktinfo_v6
+                    } else {
+                        options.recv_pktinfo_v4
+                    },
+                    ttl: if ipv6 {
+                        options.recv_hoplimit
+                    } else {
+                        options.recv_ttl
+                    },
+                    tos: if ipv6 {
+                        options.recv_tclass
+                    } else {
+                        options.recv_tos
+                    },
+                },
+            );
+        }
         let iovs = unsafe { IoVecs::from_user(msg.msg_iov, msg.msg_iovlen, true)? };
 
         // Linux 语义：IPv6 raw socket 接收时默认不向用户返回 IPv6 头；

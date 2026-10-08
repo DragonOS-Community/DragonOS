@@ -16,6 +16,7 @@ pub(crate) mod link;
 pub mod neighbor;
 pub(crate) mod nftables;
 pub(crate) mod output;
+pub(crate) mod pmtu;
 pub mod posix;
 pub(crate) mod route;
 pub mod routing;

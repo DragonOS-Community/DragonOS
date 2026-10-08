@@ -178,9 +178,7 @@ impl Socket for TcpSocket {
 
     fn option(&self, level: PSOL, name: usize, value: &mut [u8]) -> Result<usize, SystemError> {
         match level {
-            PSOL::IPV6 if name == crate::net::socket::PIPV6::V6ONLY as usize => {
-                self.get_ipv6_only(value)
-            }
+            PSOL::IPV6 => self.get_ipv6_option(name, value),
             PSOL::IP => {
                 let optname =
                     IpOption::try_from(name as u32).map_err(|_| SystemError::ENOPROTOOPT)?;
@@ -409,9 +407,7 @@ impl Socket for TcpSocket {
 
     fn set_option(&self, level: PSOL, name: usize, val: &[u8]) -> Result<(), SystemError> {
         match level {
-            PSOL::IPV6 if name == crate::net::socket::PIPV6::V6ONLY as usize => {
-                self.set_ipv6_only(val)
-            }
+            PSOL::IPV6 => self.set_ipv6_option(name, val),
             PSOL::IP => {
                 let opt = crate::net::socket::IpOption::try_from(name as u32)
                     .map_err(|_| SystemError::ENOPROTOOPT)?;

@@ -90,7 +90,9 @@ impl RawIngressListener {
     ) -> bool {
         self.socket.ip_version == version
             && self.socket.protocol == protocol
-            && self.local_addr.is_none_or(|addr| addr == destination)
+            && self
+                .local_addr
+                .is_none_or(|addr| addr.is_unspecified() || addr == destination)
             && self.remote_addr.is_none_or(|addr| addr == source)
             && (self.bound_ifindex == 0 || self.bound_ifindex == ingress_ifindex as usize)
     }

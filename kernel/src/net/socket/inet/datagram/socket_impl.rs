@@ -238,7 +238,7 @@ impl Socket for UdpSocket {
 
     fn validate_send_buffer_len(
         &self,
-        len: usize,
+        _len: usize,
         address: Option<&Endpoint>,
     ) -> Result<(), SystemError> {
         if self.ip_version == IpVersion::Ipv6
@@ -247,11 +247,6 @@ impl Socket for UdpSocket {
             return Err(SystemError::EINVAL);
         }
 
-        if len > u16::MAX as usize {
-            let offender = self.connected_or_explicit_send_dest(address);
-            self.enqueue_ipv6_emsgsize_errqueue(len, offender);
-            return Err(SystemError::EMSGSIZE);
-        }
         Ok(())
     }
 
@@ -531,46 +526,19 @@ impl Socket for UdpSocket {
                 .pop_errqueue()
                 .ok_or(SystemError::EAGAIN_OR_EWOULDBLOCK)?;
 
-            // Write offender address if requested
-            let offender_ep = Endpoint::Ip(entry.offender);
-            msg.msg_namelen = offender_ep.write_to_user_msghdr(msg.msg_name, msg.msg_namelen)?;
-
-            // Prepare control message: sock_extended_err + offender sockaddr
-            let err_bytes = unsafe {
-                core::slice::from_raw_parts(
-                    (&entry.err as *const SockExtendedErr) as *const u8,
-                    core::mem::size_of::<SockExtendedErr>(),
-                )
+            let ipv6_packet = entry
+                .packet
+                .is_some_and(|packet| packet.local_address.version() == IpVersion::Ipv6);
+            let options = super::super::common::error_queue::ErrorCmsgOptions {
+                pktinfo: !ipv6_packet && self.recv_pktinfo_v4.load(Ordering::Acquire),
+                ttl: false,
+                tos: if ipv6_packet {
+                    self.recv_tclass.load(Ordering::Acquire)
+                } else {
+                    self.recv_tos.load(Ordering::Acquire)
+                },
             };
-            let sockaddr = SockAddr::from(offender_ep);
-            let sockaddr_bytes = unsafe {
-                core::slice::from_raw_parts(
-                    (&sockaddr as *const SockAddr) as *const u8,
-                    entry.addr_len,
-                )
-            };
-
-            let mut data = alloc::vec::Vec::with_capacity(err_bytes.len() + sockaddr_bytes.len());
-            data.extend_from_slice(err_bytes);
-            data.extend_from_slice(sockaddr_bytes);
-
-            msg.msg_flags = PMSG::ERRQUEUE.bits() as i32;
-            let mut write_off = 0usize;
-            let mut cmsg_buf = CmsgBuffer {
-                ptr: msg.msg_control,
-                len: msg.msg_controllen,
-                write_off: &mut write_off,
-            };
-            cmsg_buf.put(
-                &mut msg.msg_flags,
-                entry.cmsg_level,
-                entry.cmsg_type,
-                data.len(),
-                &data,
-            )?;
-            msg.msg_controllen = write_off;
-
-            return Ok(0);
+            return entry.recv_msg_with_options(msg, options);
         }
 
         // Validate and create iovecs
@@ -709,6 +677,13 @@ impl Socket for UdpSocket {
 
     fn check_io_event(&self) -> EPollEventType {
         let mut event = EPollEventType::empty();
+        let has_error = {
+            let state = self.errqueue.lock();
+            state.0 != 0 || !state.1.is_empty()
+        };
+        if has_error {
+            event.insert(EP::EPOLLERR);
+        }
         let queued_data = !self.receive_queue.is_empty();
         match self.inner.read().as_ref() {
             Some(UdpInner::Unbound(_)) => {

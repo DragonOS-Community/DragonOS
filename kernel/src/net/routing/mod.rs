@@ -45,6 +45,7 @@ pub struct Router {
     /// smoltcp projections, making the complete control-plane transaction the
     /// only observable generation.
     authoritative_output: AtomicBool,
+    pub(crate) pmtu: crate::libs::spinlock::SpinLock<crate::net::route::pmtu::PmtuCache>,
 }
 
 /// Write access to the namespace FIB.
@@ -56,6 +57,7 @@ pub struct Router {
 pub(in crate::net) struct RouterFibWriteGuard<'a> {
     fib: RwSemWriteGuard<'a, crate::net::route::FibTable>,
     authoritative_output: &'a AtomicBool,
+    pmtu: &'a crate::libs::spinlock::SpinLock<crate::net::route::pmtu::PmtuCache>,
 }
 
 impl core::ops::Deref for RouterFibWriteGuard<'_> {
@@ -74,6 +76,9 @@ impl core::ops::DerefMut for RouterFibWriteGuard<'_> {
 
 impl Drop for RouterFibWriteGuard<'_> {
     fn drop(&mut self) {
+        // Publication invalidates route exceptions, including device/address
+        // changes which retain the same prefix or reuse an interface index.
+        self.pmtu.lock().invalidate();
         self.authoritative_output
             .store(self.fib.requires_authoritative_output(), Ordering::Release);
     }
@@ -86,6 +91,9 @@ impl Router {
             nat_tracker: Arc::new(ConnTracker::default()),
             ns: RwSem::new(Weak::default()),
             authoritative_output: AtomicBool::new(false),
+            pmtu: crate::libs::spinlock::SpinLock::new(
+                crate::net::route::pmtu::PmtuCache::default(),
+            ),
         })
     }
 
@@ -97,6 +105,9 @@ impl Router {
             ns: RwSem::new(Weak::default()),
             nat_tracker: Arc::new(ConnTracker::default()),
             authoritative_output: AtomicBool::new(false),
+            pmtu: crate::libs::spinlock::SpinLock::new(
+                crate::net::route::pmtu::PmtuCache::default(),
+            ),
         })
     }
 
@@ -112,6 +123,7 @@ impl Router {
         RouterFibWriteGuard {
             fib,
             authoritative_output: &self.authoritative_output,
+            pmtu: &self.pmtu,
         }
     }
 

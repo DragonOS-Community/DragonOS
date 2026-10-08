@@ -5,6 +5,8 @@ use crate::{
 };
 use alloc::sync::Arc;
 
+pub(crate) mod error_queue;
+pub(crate) mod pmtu;
 pub mod port;
 pub use port::PortManager;
 mod device_binding;

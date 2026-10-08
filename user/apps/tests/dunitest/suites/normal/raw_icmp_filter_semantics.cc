@@ -2,7 +2,10 @@
 
 #include <errno.h>
 #include <netinet/icmp6.h>
+#include <net/if.h>
 #include <poll.h>
+#include <sched.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -46,6 +49,20 @@ int WaitReadable(int fd) {
     return result > 0 && (descriptor.revents & POLLIN) ? 1 : result;
 }
 
+void IsolateLoopback() {
+    // Send only admits asynchronous output; closing its socket does not cancel
+    // committed packets. Isolate every iteration, including the creation-to-
+    // setsockopt default-pass window, rather than draining or delaying input.
+    ASSERT_EQ(0, unshare(CLONE_NEWNET)) << errno;
+    RawIcmp6Socket control;
+    ASSERT_GE(control.fd(), 0) << errno;
+    ifreq request{};
+    request.ifr_name[0] = 'l'; request.ifr_name[1] = 'o';
+    ASSERT_EQ(0, ioctl(control.fd(), SIOCGIFFLAGS, &request)) << errno;
+    request.ifr_flags |= IFF_UP;
+    ASSERT_EQ(0, ioctl(control.fd(), SIOCSIFFLAGS, &request)) << errno;
+}
+
 class RawIcmp6Filter : public ::testing::TestWithParam<uint8_t> {};
 
 TEST_P(RawIcmp6Filter, PublicationAndIngressNeverBypassTypeMask) {
@@ -54,6 +71,7 @@ TEST_P(RawIcmp6Filter, PublicationAndIngressNeverBypassTypeMask) {
     // cover the public filter contract rather than assuming it always races.
     for (int iteration = 0; iteration < 32; ++iteration) {
         SCOPED_TRACE(iteration);
+        ASSERT_NO_FATAL_FAILURE(IsolateLoopback());
         RawIcmp6Socket socket;
         ASSERT_GE(socket.fd(), 0) << errno;
         icmp6_filter filter;

@@ -266,7 +266,10 @@ impl UdpSocket {
                 Ok(write_linger_getsockopt(value, on, linger))
             }
             PSO::ACCEPTCONN => Ok(write_i32_getsockopt(value, 0)),
-            PSO::ERROR => Ok(write_i32_getsockopt(value, 0)),
+            PSO::ERROR => Ok(write_i32_getsockopt(
+                value,
+                core::mem::take(&mut self.errqueue.lock().0),
+            )),
             PSO::NO_CHECK => Ok(write_i32_getsockopt(
                 value,
                 self.no_check.load(Ordering::Acquire) as i32,
@@ -278,6 +281,17 @@ impl UdpSocket {
     /// 处理 SOL_IP 级别的 setsockopt。
     pub(super) fn set_ip_option(&self, opt: IpOption, val: &[u8]) -> Result<(), SystemError> {
         match opt {
+            IpOption::MTU_DISCOVER => {
+                // SOL_IP accepts either an int or a one-byte option value.
+                let value = if val.len() >= core::mem::size_of::<i32>() {
+                    byte_parser::read_i32(val)?
+                } else {
+                    *val.first().ok_or(SystemError::EINVAL)? as i32
+                };
+                let policy = super::PmtuPolicy::from_i32(value)?;
+                self.pmtu_v4.store(policy.as_i32(), Ordering::Release);
+                Ok(())
+            }
             IpOption::RECVTOS => {
                 if val.len() < core::mem::size_of::<i32>() {
                     return Err(SystemError::EINVAL);
@@ -292,6 +306,9 @@ impl UdpSocket {
                 }
                 let v = i32::from_ne_bytes([val[0], val[1], val[2], val[3]]) != 0;
                 self.recv_err_v4.store(v, Ordering::Relaxed);
+                if !v {
+                    self.errqueue.lock().1.clear();
+                }
                 Ok(())
             }
             IpOption::MULTICAST_TTL => {
@@ -406,6 +423,8 @@ impl UdpSocket {
         value: &mut [u8],
     ) -> Result<usize, SystemError> {
         let v = match opt {
+            IpOption::MTU_DISCOVER => self.pmtu_v4.load(Ordering::Acquire),
+            IpOption::MTU => self.connected_path_mtu(smoltcp::wire::IpVersion::Ipv4)? as i32,
             IpOption::RECVTOS => {
                 if self.recv_tos.load(Ordering::Relaxed) {
                     1i32
@@ -467,12 +486,45 @@ impl UdpSocket {
         let v = i32::from_ne_bytes([val[0], val[1], val[2], val[3]]) != 0;
 
         match opt {
+            PIPV6::MULTICAST_LOOP => {
+                let value = byte_parser::read_i32(val)?;
+                if !(0..=1).contains(&value) {
+                    return Err(SystemError::EINVAL);
+                }
+                self.ipv6_multicast_loop.store(v, Ordering::Release);
+                Ok(())
+            }
+            PIPV6::MULTICAST_HOPS => {
+                let hops = byte_parser::read_i32(val)?;
+                if !(-1..=255).contains(&hops) {
+                    return Err(SystemError::EINVAL);
+                }
+                self.ipv6_multicast_hops
+                    .store(if hops == -1 { 1 } else { hops }, Ordering::Release);
+                Ok(())
+            }
+            PIPV6::MTU => {
+                let mtu = byte_parser::read_i32(val)?;
+                if mtu != 0 && mtu < 1280 {
+                    return Err(SystemError::EINVAL);
+                }
+                self.ipv6_mtu.store(mtu as usize, Ordering::Release);
+                Ok(())
+            }
+            PIPV6::MTU_DISCOVER => {
+                let policy = super::PmtuPolicy::from_i32(byte_parser::read_i32(val)?)?;
+                self.pmtu_v6.store(policy.as_i32(), Ordering::Release);
+                Ok(())
+            }
             PIPV6::RECVTCLASS => {
                 self.recv_tclass.store(v, Ordering::Relaxed);
                 Ok(())
             }
             PIPV6::RECVERR | PIPV6::RECVERR_RFC4884 => {
                 self.recv_err_v6.store(v, Ordering::Relaxed);
+                if !v {
+                    self.errqueue.lock().1.clear();
+                }
                 Ok(())
             }
             PIPV6::ORIGDSTADDR => {
@@ -490,6 +542,10 @@ impl UdpSocket {
         value: &mut [u8],
     ) -> Result<usize, SystemError> {
         let v = match opt {
+            PIPV6::MULTICAST_LOOP => self.ipv6_multicast_loop.load(Ordering::Acquire) as i32,
+            PIPV6::MULTICAST_HOPS => self.ipv6_multicast_hops.load(Ordering::Acquire),
+            PIPV6::MTU_DISCOVER => self.pmtu_v6.load(Ordering::Acquire),
+            PIPV6::MTU => self.connected_path_mtu(smoltcp::wire::IpVersion::Ipv6)? as i32,
             PIPV6::RECVTCLASS => {
                 if self.recv_tclass.load(Ordering::Relaxed) {
                     1i32

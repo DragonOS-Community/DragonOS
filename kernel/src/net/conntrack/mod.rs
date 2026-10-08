@@ -1189,6 +1189,26 @@ impl CtState {
         }
     }
 
+    /// Read a confirmed wire tuple without observing a fictitious TCP packet,
+    /// changing protocol state, or extending connection expiry.
+    pub(crate) fn output_tuple(&self, tuple: CtTuple, now: Instant) -> Option<CtTuple> {
+        let guard = self.table.lock();
+        let table = guard.as_ref()?;
+        let (flow, reply) = if let Some(flow) = table.reply.get(&tuple) {
+            (flow, true)
+        } else {
+            (table.original.get(&tuple)?, false)
+        };
+        if flow.runtime.lock().expires_at <= now {
+            return None;
+        }
+        if reply {
+            flow.original.reverse()
+        } else {
+            Some(flow.translated)
+        }
+    }
+
     pub(crate) fn lookup(
         &self,
         tuple: CtTuple,

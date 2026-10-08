@@ -284,6 +284,19 @@ impl SmolDevice for TcpOutputDevice<'_> {
         transport_capabilities()
     }
 
+    fn outbound_tcp_mtu(
+        &self,
+        local: smoltcp::wire::IpEndpoint,
+        remote: smoltcp::wire::IpEndpoint,
+        meta: PacketMeta,
+    ) -> usize {
+        self.policy.outbound_tcp_mtu(local, remote, meta)
+    }
+
+    fn outbound_tcp_mtu_generation(&self) -> u64 {
+        self.policy.outbound_tcp_mtu_generation()
+    }
+
     fn outbound_ip_mtu(&self, destination: smoltcp::wire::IpAddress, meta: PacketMeta) -> usize {
         self.policy
             .outbound_ip_mtu(destination, meta, u16::MAX as usize)

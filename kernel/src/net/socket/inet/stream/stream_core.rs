@@ -34,6 +34,8 @@ pub struct TcpSocketOptions {
     pub(crate) so_timestamp_enabled: AtomicBool,
     /// IP_MTU_DISCOVER: PMTU discovery strategy.
     pub(crate) ip_mtu_discover: core::sync::atomic::AtomicI32,
+    /// IPV6_MTU_DISCOVER is independent of the IPv4 option on dual-stack sockets.
+    pub(crate) ipv6_mtu_discover: AtomicI32,
 
     pub(crate) send_buf_size: AtomicUsize,
     pub(crate) recv_buf_size: AtomicUsize,
@@ -99,6 +101,7 @@ impl TcpSocketOptions {
             so_timestamp_enabled: AtomicBool::new(false),
             // Default: IP_PMTUDISC_WANT (1)
             ip_mtu_discover: core::sync::atomic::AtomicI32::new(1),
+            ipv6_mtu_discover: AtomicI32::new(1),
             send_buf_size: AtomicUsize::new(inner::DEFAULT_TX_BUF_SIZE),
             recv_buf_size: AtomicUsize::new(inner::DEFAULT_RX_BUF_SIZE),
             rcvlowat: AtomicI32::new(1),
@@ -179,6 +182,29 @@ impl TcpSocket {
                 .new_owner(Arc::new(SocketDeviceBinding::from_ifindex(0))),
         };
         let device_binding = port_owner.device_binding();
+        let options = TcpSocketOptions::new();
+        if let inner::Inner::Established(established) = &inner {
+            let policies = established.pmtu_policies();
+            options
+                .ip_mtu_discover
+                .store(policies[0] as i32, core::sync::atomic::Ordering::Relaxed);
+            options
+                .ipv6_mtu_discover
+                .store(policies[1] as i32, core::sync::atomic::Ordering::Relaxed);
+            let (version, policy) = established.with(|socket| {
+                (
+                    socket
+                        .local_endpoint()
+                        .map_or(ip_version, |local| local.addr.version()),
+                    socket.pmtu_discover(),
+                )
+            });
+            let atomic = match version {
+                smoltcp::wire::IpVersion::Ipv4 => &options.ip_mtu_discover,
+                smoltcp::wire::IpVersion::Ipv6 => &options.ipv6_mtu_discover,
+            };
+            atomic.store(policy as i32, core::sync::atomic::Ordering::Relaxed);
+        }
         Self {
             inner: RwSem::new(Some(inner)),
             shutdown: AtomicUsize::new(0),
@@ -195,7 +221,7 @@ impl TcpSocket {
             port_owner,
             epoll_items: EPollItems::default(),
             fasync_items: FAsyncItems::default(),
-            options: TcpSocketOptions::new(),
+            options,
             cork_buf: Mutex::new(Vec::new()),
             recv_lock: Mutex::new(()),
             cork_flush_in_progress: AtomicBool::new(false),

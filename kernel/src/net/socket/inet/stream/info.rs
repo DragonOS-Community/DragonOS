@@ -341,6 +341,11 @@ impl<'a> TcpInfoCollector<'a> {
 
         // Receive space
         info.tcpi_rcv_space = self.socket.recv_capacity() as u32;
+        info.tcpi_pmtu = self
+            .socket
+            .output_ip_mtu()
+            .unwrap_or(0)
+            .min(u32::MAX as usize) as u32;
 
         // Total retransmits (same as current for smoltcp)
         info.tcpi_total_retrans = info.tcpi_retransmits as u32;
@@ -348,7 +353,7 @@ impl<'a> TcpInfoCollector<'a> {
         // Unsupported fields remain 0
         // tcpi_probes, tcpi_backoff, tcpi_sacked, tcpi_lost, tcpi_fackets
         // tcpi_last_data_sent, tcpi_last_ack_sent, tcpi_last_data_recv, tcpi_last_ack_recv
-        // tcpi_pmtu, tcpi_rcv_ssthresh, tcpi_rcv_rtt
+        // tcpi_rcv_ssthresh, tcpi_rcv_rtt
         // tcpi_pacing_rate, tcpi_max_pacing_rate, tcpi_delivery_rate
         // tcpi_bytes_acked, tcpi_bytes_received
         // tcpi_segs_out, tcpi_segs_in, tcpi_data_segs_in, tcpi_data_segs_out

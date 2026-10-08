@@ -227,6 +227,16 @@ impl TcpSocket {
                         .load(core::sync::atomic::Ordering::Relaxed),
                     self.device_binding.clone(),
                     &self.port_owner,
+                    [
+                        self.options
+                            .ip_mtu_discover
+                            .load(core::sync::atomic::Ordering::Relaxed)
+                            as u8,
+                        self.options
+                            .ipv6_mtu_discover
+                            .load(core::sync::atomic::Ordering::Relaxed)
+                            as u8,
+                    ],
                 );
                 match listen_result {
                     Ok(listening) => {
@@ -344,6 +354,19 @@ impl TcpSocket {
         }
         let inner = writer.take().expect("Tcp inner::Inner is None");
         let old_iface = inner.stack().cloned();
+        let mut inner = inner;
+        let policy = match remote_endpoint.addr.version() {
+            smoltcp::wire::IpVersion::Ipv4 => &self.options.ip_mtu_discover,
+            smoltcp::wire::IpVersion::Ipv6 => &self.options.ipv6_mtu_discover,
+        }
+        .load(core::sync::atomic::Ordering::Relaxed) as u8;
+        if matches!(inner, inner::Inner::Init(_)) {
+            inner.for_each_socket_mut(|socket| {
+                socket
+                    .set_pmtu_discover(policy)
+                    .expect("validated PMTU policy");
+            });
+        }
         let (init, result) = match inner {
             inner::Inner::Init(init) => {
                 match init.connect(

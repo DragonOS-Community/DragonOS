@@ -120,6 +120,15 @@ fn migrate_virtual_filesystem(
         old_mntfs.mount_source(),
     )?;
 
+    // Normal inode mutations require a live mount to retain their writer pin.
+    // Activate the initialized replacement before creating missing mountpoints;
+    // this does not publish it as the namespace root. Do not retain the topology
+    // lock across mkdir/mount_from, which acquire their own lifecycle guards.
+    {
+        let _topology = MOUNT_LIFECYCLE_LOCK.lock();
+        new_fs.activate()?;
+    }
+
     // 获取新的根文件系统的根节点的引用
     let new_root_inode = new_fs.root_inode();
     // ==== 在这里获取要被迁移的文件系统的inode并迁移 ===
@@ -143,9 +152,6 @@ fn migrate_virtual_filesystem(
 
     {
         let _topology = MOUNT_LIFECYCLE_LOCK.lock();
-        new_fs
-            .activate()
-            .expect("the replacement root mount is published exactly once");
         current_mntns.force_change_root_mountfs(new_fs, root_attachment);
     }
 

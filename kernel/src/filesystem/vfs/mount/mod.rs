@@ -3180,7 +3180,9 @@ impl MountFS {
         self.self_ref.upgrade().unwrap()
     }
 
-    /// Publish a fully attached mount into the shared-superblock lifecycle.
+    /// Activate an initialized mount in the shared-superblock lifecycle.
+    /// Namespace/topology publication is separate; detached mounts and a boot
+    /// replacement root may need normal inode operations before attachment.
     /// Construction failures before this point require no counter rollback.
     pub(crate) fn activate(&self) -> Result<(), SystemError> {
         let mut lifecycle = self.lifecycle.lock();

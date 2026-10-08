@@ -7021,6 +7021,9 @@ impl IndexNode for MountFSInode {
 }
 
 impl FileSystem for MountFS {
+    fn mount_owner_user_ns(&self) -> Option<Arc<UserNamespace>> {
+        Some(self.super_block_state.owner_user_ns().clone())
+    }
     fn begin_sync_writeback(&self) -> Option<alloc::boxed::Box<dyn super::FileSystemSyncGuard>> {
         self.inner_filesystem.begin_sync_writeback()
     }

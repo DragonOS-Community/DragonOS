@@ -21,7 +21,7 @@ use crate::{
     mm::MemoryManagementArch,
     process::{
         cred::{capable, ns_capable, CAPFlags},
-        namespace::user_namespace::{UserNamespace, INIT_USER_NAMESPACE},
+        namespace::user_namespace::UserNamespace,
         ProcessManager,
     },
 };
@@ -334,7 +334,12 @@ pub fn configure_fs_context(fd: i32, cmd: FsConfigCommand) -> Result<(), SystemE
             let prepared = if state.phase == Phase::CreateParams {
                 let maker = filesystem_maker(&context.fs_type).ok_or(SystemError::ENODEV)?;
                 maker.validate_fsconfig_parameter(&key, Some(&value))?;
-                maker.prepare_fsconfig_string(&key, &value, state.prepared.as_ref())?
+                maker.prepare_fsconfig_string(
+                    &key,
+                    &value,
+                    state.prepared.as_ref(),
+                    &context.creation.cred.user_ns,
+                )?
             } else {
                 state
                     .target
@@ -353,20 +358,14 @@ pub fn configure_fs_context(fd: i32, cmd: FsConfigCommand) -> Result<(), SystemE
             if state.phase != Phase::CreateParams {
                 return Err(SystemError::EBUSY);
             }
-            // None of the existing DragonOS makers promises the security
-            // properties of Linux FS_USERNS_MOUNT yet. Require capability in
-            // the initial user namespace until individual makers are audited.
-            if !capable(CAPFlags::CAP_SYS_ADMIN) {
+            if !filesystem_maker(&context.fs_type)
+                .ok_or(SystemError::ENODEV)?
+                .mount_capable(&context.creation.cred.user_ns)
+            {
                 return Err(SystemError::EPERM);
             }
             state.phase = Phase::Creating;
             let result = (|| {
-                // Until a maker is explicitly audited for FS_USERNS_MOUNT,
-                // do not let an fsfd opened in another user namespace create
-                // a superblock owned by the caller of fsconfig(2).
-                if !Arc::ptr_eq(&context.creation.cred.user_ns, &INIT_USER_NAMESPACE) {
-                    return Err(SystemError::EPERM);
-                }
                 if !state.options.is_empty()
                     && !filesystem_maker(&context.fs_type)
                         .ok_or(SystemError::ENODEV)?

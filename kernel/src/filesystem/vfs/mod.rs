@@ -3460,6 +3460,9 @@ impl DowncastArc for dyn FileSystem {
 
 /// # 可以被挂载的文件系统应该实现的trait
 pub trait MountableFileSystem: FileSystem {
+    /// Equivalent to Linux FS_USERNS_MOUNT; opt in only after auditing the
+    /// filesystem's superblock ownership and user-namespace invariants.
+    const SUPPORTS_USERNS_MOUNT: bool = false;
     /// Only makers that reject unknown and malformed individual legacy
     /// options may accept fsconfig's flag/string parameter stream.
     const SUPPORTS_FSCONFIG_LEGACY_OPTIONS: bool = false;
@@ -3477,6 +3480,7 @@ pub trait MountableFileSystem: FileSystem {
         _key: &str,
         _value: &str,
         previous: Option<&FsconfigPreparedData>,
+        _owner: &crate::process::namespace::user_namespace::UserNamespace,
     ) -> Result<Option<FsconfigPreparedData>, SystemError> {
         Ok(previous.cloned())
     }
@@ -3546,8 +3550,9 @@ macro_rules! register_mountable_fs {
                 key: &str,
                 value: &str,
                 previous: Option<&$crate::filesystem::vfs::FsconfigPreparedData>,
+                owner: &$crate::process::namespace::user_namespace::UserNamespace,
             ) -> Result<Option<$crate::filesystem::vfs::FsconfigPreparedData>, SystemError> {
-                <$fs as MountableFileSystem>::prepare_fsconfig_string(key, value, previous)
+                <$fs as MountableFileSystem>::prepare_fsconfig_string(key, value, previous, owner)
             }
 
             fn make_fs_legacy_bridge(
@@ -3615,13 +3620,18 @@ macro_rules! register_mountable_fs {
                             &str,
                             &str,
                             Option<&$crate::filesystem::vfs::FsconfigPreparedData>,
+                            &$crate::process::namespace::user_namespace::UserNamespace,
                         ) -> Result<
                             Option<$crate::filesystem::vfs::FsconfigPreparedData>,
                             SystemError,
                         >),
                     validate: $fs::validate_fsconfig_parameter_bridge,
                 },
-                <$fs as MountableFileSystem>::SUPPORTS_FSCONFIG_LEGACY_OPTIONS,
+                $crate::filesystem::vfs::FileSystemMakerCapabilities {
+                    fsconfig_legacy_options:
+                        <$fs as MountableFileSystem>::SUPPORTS_FSCONFIG_LEGACY_OPTIONS,
+                    userns_mount: <$fs as MountableFileSystem>::SUPPORTS_USERNS_MOUNT,
+                },
             );
     };
 }
@@ -3663,6 +3673,12 @@ pub struct FsconfigParameterOps {
     pub validate: fn(&str, Option<&str>) -> Result<(), SystemError>,
 }
 
+/// Independent, audited capabilities of a registered filesystem maker.
+pub struct FileSystemMakerCapabilities {
+    pub fsconfig_legacy_options: bool,
+    pub userns_mount: bool,
+}
+
 pub struct FileSystemMaker {
     /// 文件系统的创建函数
     maker: &'static FSMakerFunction,
@@ -3673,7 +3689,7 @@ pub struct FileSystemMaker {
     legacy_maker: &'static LegacyFSMakerFunction,
     legacy_builder: &'static LegacyMountDataBuilder,
     fsconfig: FsconfigParameterOps,
-    supports_fsconfig_legacy_options: bool,
+    capabilities: FileSystemMakerCapabilities,
 }
 
 impl FileSystemMaker {
@@ -3684,7 +3700,7 @@ impl FileSystemMaker {
         legacy_maker: &'static LegacyFSMakerFunction,
         legacy_builder: &'static LegacyMountDataBuilder,
         fsconfig: FsconfigParameterOps,
-        supports_fsconfig_legacy_options: bool,
+        capabilities: FileSystemMakerCapabilities,
     ) -> FileSystemMaker {
         FileSystemMaker {
             maker,
@@ -3693,12 +3709,25 @@ impl FileSystemMaker {
             legacy_maker,
             legacy_builder,
             fsconfig,
-            supports_fsconfig_legacy_options,
+            capabilities,
         }
     }
 
     pub fn supports_fsconfig_legacy_options(&self) -> bool {
-        self.supports_fsconfig_legacy_options
+        self.capabilities.fsconfig_legacy_options
+    }
+
+    /// Check current caller capabilities, never the fs-context's saved caps.
+    pub fn mount_capable(
+        &self,
+        owner: &Arc<crate::process::namespace::user_namespace::UserNamespace>,
+    ) -> bool {
+        use crate::process::cred::{capable, ns_capable, CAPFlags};
+        if self.capabilities.userns_mount {
+            ns_capable(owner, CAPFlags::CAP_SYS_ADMIN)
+        } else {
+            capable(CAPFlags::CAP_SYS_ADMIN)
+        }
     }
 
     pub fn validate_fsconfig_parameter(
@@ -3714,8 +3743,9 @@ impl FileSystemMaker {
         key: &str,
         value: &str,
         previous: Option<&FsconfigPreparedData>,
+        owner: &crate::process::namespace::user_namespace::UserNamespace,
     ) -> Result<Option<FsconfigPreparedData>, SystemError> {
-        (self.fsconfig.prepare_string)(key, value, previous)
+        (self.fsconfig.prepare_string)(key, value, previous, owner)
     }
 
     pub fn build(
@@ -3736,8 +3766,8 @@ impl FileSystemMaker {
     }
 }
 
-/// Creation identity retained by an fs-context fd. Legacy mount(2) uses its
-/// original maker path, which also works before process management is ready.
+/// Creation identity for user mounts. The separate legacy factory remains
+/// usable by boot/internal callers before process management is ready.
 #[derive(Clone)]
 pub struct FsCreationContext {
     pub cred: Arc<crate::process::Cred>,
@@ -3772,6 +3802,7 @@ pub type FsconfigStringPreparer = fn(
     key: &str,
     value: &str,
     previous: Option<&FsconfigPreparedData>,
+    owner: &crate::process::namespace::user_namespace::UserNamespace,
 ) -> Result<Option<FsconfigPreparedData>, SystemError>;
 
 pub type FSMakerFunction = fn(
@@ -3856,6 +3887,16 @@ pub fn produce_fs_in_context(
 ) -> Result<Arc<dyn FileSystem>, SystemError> {
     match filesystem_maker(filesystem) {
         Some(maker) => {
+            // Linux sget_fc's owner invariant is a construction failure,
+            // distinct from mount_capable's retryable permission rejection.
+            if !maker.capabilities.userns_mount
+                && !Arc::ptr_eq(
+                    &context.cred.user_ns,
+                    &crate::process::namespace::user_namespace::INIT_USER_NAMESPACE,
+                )
+            {
+                return Err(SystemError::EPERM);
+            }
             let mount_data = (maker.builder)(data, source, context)?;
             let mount_data_ref = mount_data.as_ref().map(|arc| arc.as_ref());
             maker.build(mount_data_ref, mount_flags, context)

@@ -960,6 +960,7 @@ impl MountableFileSystem for OverlayFS {
         key: &str,
         value: &str,
         previous: Option<&FsconfigPreparedData>,
+        _owner: &crate::process::namespace::user_namespace::UserNamespace,
     ) -> Result<Option<FsconfigPreparedData>, SystemError> {
         let mut paths = match previous {
             Some(previous) => previous

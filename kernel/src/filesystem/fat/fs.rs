@@ -1380,6 +1380,13 @@ impl FATFileSystem {
             Err(e) => return Err(e),
         };
 
+        // A FAT entry's FREE value is not its address. Never allow a reserved
+        // cluster to reach FAT publication or cluster zeroing (volume header).
+        if free_cluster.cluster_num < RESERVED_CLUSTERS as u64
+            || free_cluster.cluster_num > end_cluster.cluster_num
+        {
+            return Err(SystemError::EIO);
+        }
         if let Err(error) = self.set_entry(free_cluster, FATEntry::EndOfChain) {
             if self.set_entry(free_cluster, FATEntry::Unused).is_err() {
                 // A mirrored FAT write may have reached only some copies. Do
@@ -1955,7 +1962,7 @@ impl FATFileSystem {
                     let val = cursor.read_u16()?;
                     // 找到空闲簇
                     if val == 0 {
-                        return Ok(Cluster::new(val as u64));
+                        return Ok(Cluster::new(cluster));
                     }
                     cluster += 1;
                 }
@@ -2790,6 +2797,7 @@ impl IndexNode for LockedFATInode {
                 let mut ret: Vec<String> = Vec::new();
                 let dir_iter: FATDirIter = dir.to_iter(guard.fs.upgrade().unwrap());
                 for ent in dir_iter {
+                    let ent = ent?;
                     ret.push(ent.name());
 
                     // ====== 生成inode缓存

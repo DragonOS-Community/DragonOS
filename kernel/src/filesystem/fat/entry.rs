@@ -10,8 +10,8 @@ use alloc::{
     sync::Arc,
     vec::Vec,
 };
-use core::{cmp::min, intrinsics::unlikely};
-use log::debug;
+use core::cmp::min;
+use log::{debug, warn};
 use system_error::SystemError;
 
 use super::{
@@ -502,7 +502,8 @@ impl FATDir {
         return FATDirIter {
             current_cluster: self.first_cluster,
             offset: self.root_offset.unwrap_or(0),
-            is_root: self.is_root(),
+            remaining_slots: directory_slot_budget(&fs),
+            finished: false,
             fs,
         };
     }
@@ -535,24 +536,17 @@ impl FATDir {
         let mut offset = self.root_offset.unwrap_or(0);
         // 第一个符合条件的空闲目录项
         let mut first_free: Option<(Cluster, u64)> = None;
+        let mut remaining_slots = directory_slot_budget(&fs);
 
         loop {
             // 如果当前簇没有空间了，并且当前不是FAT12和FAT16的根目录，那么就读取下一个簇。
-            if offset >= fs.bytes_per_cluster() && !self.is_root() {
-                // 成功读取下一个簇
-                if let Ok(FATEntry::Next(c)) = fs.get_fat_entry(current_cluster) {
-                    current_cluster = c;
-                    // 计算簇内偏移量
-                    offset %= fs.bytes_per_cluster();
-                } else {
-                    // 读取失败，当前已经是最后一个簇，退出循环
-                    break;
+            if !normalize_directory_slot(&fs, &mut current_cluster, &mut offset)? {
+                if self.is_root() {
+                    return Ok(None);
                 }
+                break;
             }
-            // 如果当前目录是FAT12和FAT16的根目录，且已经读取完，就直接返回。
-            if self.is_root() && offset > fs.root_dir_end_bytes_offset().unwrap() {
-                return Ok(None);
-            }
+            remaining_slots = remaining_slots.checked_sub(1).ok_or(SystemError::EIO)?;
 
             let e_offset = fs.cluster_bytes_offset(current_cluster) + offset;
             let entry: FATRawDirEntry = get_raw_dir_entry(&fs, e_offset)?;
@@ -627,6 +621,7 @@ impl FATDir {
         LongDirEntry::validate_long_name(name)?;
         // 迭代当前目录下的文件/文件夹
         for e in self.to_iter(fs) {
+            let e = e?;
             if e.eq_name(name) {
                 if expect_dir.is_some() && Some(e.is_dir()) != expect_dir {
                     if e.is_dir() {
@@ -723,6 +718,10 @@ impl FATDir {
                 // 目标目录项
                 let mut short_entry = ShortDirEntry::default();
 
+                // Reserve the complete parent range before owning a child cluster.
+                // A full fixed root must fail without consuming data clusters.
+                let offsets = self.allocate_dir_entries(name.trim(), fs.clone())?;
+
                 let first_cluster: Cluster = fs.allocate_cluster(None)?;
                 short_entry.set_first_cluster(first_cluster);
 
@@ -737,7 +736,12 @@ impl FATDir {
                 dot_entry.set_first_cluster(first_cluster);
 
                 // todo: 设置创建、访问时间
-                dot_entry.flush(fs, fs.cluster_bytes_offset(first_cluster) + offset)?;
+                if let Err(error) =
+                    dot_entry.flush(fs, fs.cluster_bytes_offset(first_cluster) + offset)
+                {
+                    fs.deallocate_cluster_chain(first_cluster)?;
+                    return Err(error);
+                }
 
                 // 偏移量加上一个目录项的长度
                 offset += FATRawDirEntry::DIR_ENTRY_LEN;
@@ -751,12 +755,17 @@ impl FATDir {
                 dot_dot_entry.set_first_cluster(self.first_cluster);
                 // todo: 设置创建、访问时间
 
-                dot_dot_entry.flush(fs, fs.cluster_bytes_offset(first_cluster) + offset)?;
+                if let Err(error) =
+                    dot_dot_entry.flush(fs, fs.cluster_bytes_offset(first_cluster) + offset)
+                {
+                    fs.deallocate_cluster_chain(first_cluster)?;
+                    return Err(error);
+                }
 
                 // debug!("to create dentries");
                 // 在当前目录下创建目标目录项
                 let res = self
-                    .create_dir_entries(
+                    .write_dir_entries(
                         name.trim(),
                         &short_name,
                         Some(short_entry),
@@ -764,6 +773,7 @@ impl FATDir {
                             value: FileAttributes::DIRECTORY,
                         },
                         fs.clone(),
+                        offsets,
                     )
                     .map(|e| e.to_dir())?;
                 // debug!("create dentries ok");
@@ -836,6 +846,36 @@ impl FATDir {
         attrs: FileAttributes,
         fs: Arc<FATFileSystem>,
     ) -> Result<FATDirEntry, SystemError> {
+        let offsets = self.allocate_dir_entries(long_name, fs.clone())?;
+        self.write_dir_entries(long_name, short_name, short_dentry, attrs, fs, offsets)
+    }
+
+    fn allocate_dir_entries(
+        &self,
+        long_name: &str,
+        fs: Arc<FATFileSystem>,
+    ) -> Result<Vec<(Cluster, u64)>, SystemError> {
+        let count = LongNameEntryGenerator::new(long_name, 0).num_entries() as u64;
+        let start = self
+            .find_free_entries(count, fs.clone())?
+            .ok_or(SystemError::ENOSPC)?;
+        let offsets: Vec<_> =
+            FATDirEntryOffsetIter::new(fs, start, count, None).collect::<Result<_, _>>()?;
+        if offsets.len() as u64 != count {
+            return Err(SystemError::EIO);
+        }
+        Ok(offsets)
+    }
+
+    fn write_dir_entries(
+        &self,
+        long_name: &str,
+        short_name: &[u8; 11],
+        short_dentry: Option<ShortDirEntry>,
+        attrs: FileAttributes,
+        fs: Arc<FATFileSystem>,
+        offsets: Vec<(Cluster, u64)>,
+    ) -> Result<FATDirEntry, SystemError> {
         let mut short_dentry: ShortDirEntry = short_dentry.unwrap_or_default();
         short_dentry.name = *short_name;
         short_dentry.attributes = attrs;
@@ -844,18 +884,9 @@ impl FATDir {
 
         let mut long_name_gen: LongNameEntryGenerator =
             LongNameEntryGenerator::new(long_name, short_dentry.checksum());
-        let num_entries = long_name_gen.num_entries() as u64;
-
-        // debug!("to find free entries");
-        let free_entries: Option<(Cluster, u64)> =
-            self.find_free_entries(num_entries, fs.clone())?;
-        // 目录项开始位置
-        let start_loc: (Cluster, u64) = match free_entries {
-            Some(c) => c,
-            None => return Err(SystemError::ENOSPC),
-        };
-        let offsets: Vec<(Cluster, u64)> =
-            FATDirEntryOffsetIter::new(fs.clone(), start_loc, num_entries, None).collect();
+        if offsets.len() != long_name_gen.num_entries() as usize {
+            return Err(SystemError::EIO);
+        }
 
         // 迭代长目录项
         for off in &offsets.as_slice()[..offsets.len() - 1] {
@@ -881,16 +912,17 @@ impl FATDir {
     ///
     /// @return true 当前目录为空
     /// @return false 当前目录不为空
-    pub fn is_empty(&self, fs: Arc<FATFileSystem>) -> bool {
+    pub fn is_empty(&self, fs: Arc<FATFileSystem>) -> Result<bool, SystemError> {
         for e in self.to_iter(fs) {
+            let e = e?;
             let s = e.short_name();
             if s == "." || s == ".." {
                 continue;
             } else {
-                return false;
+                return Ok(false);
             }
         }
-        return true;
+        return Ok(true);
     }
 
     /// @brief 从当前文件夹中删除文件或者文件夹。如果目标文件夹不为空，则不能删除，返回-ENOTEMPTY.
@@ -911,17 +943,17 @@ impl FATDir {
 
         // 判断文件夹是否为空，如果空，则不删除，报错。
         //  remove_clusters 为 false 时（即重命名/移动操作），不再检查目录是否为空，从而允许非空目录被“搬运”到新位置。
-        if e.is_dir() && remove_clusters && !(e.to_dir().unwrap().is_empty(fs.clone())) {
+        if e.is_dir() && remove_clusters && !(e.to_dir().unwrap().is_empty(fs.clone())?) {
             return Err(SystemError::ENOTEMPTY);
         }
 
-        if e.first_cluster().cluster_num >= 2 && remove_clusters {
-            // 删除与指定的目录项相关联的数据簇
-            fs.deallocate_cluster_chain(e.first_cluster())?;
+        if e.get_dir_range().is_some() {
+            self.remove_dir_entries(fs.clone(), e.get_dir_range().unwrap())?;
         }
 
-        if e.get_dir_range().is_some() {
-            self.remove_dir_entries(fs, e.get_dir_range().unwrap())?;
+        if e.first_cluster().cluster_num >= 2 && remove_clusters {
+            // Never free data while its short directory entry remains visible.
+            fs.deallocate_cluster_chain(e.first_cluster())?;
         }
 
         return Ok(());
@@ -938,14 +970,25 @@ impl FATDir {
     ) -> Result<(), SystemError> {
         // 收集所有的要移除的目录项
         let offsets: Vec<(Cluster, u64)> =
-            FATDirEntryOffsetIter::new(fs.clone(), cluster_range.0, 15, Some(cluster_range.1))
-                .collect();
+            FATDirEntryOffsetIter::new(fs.clone(), cluster_range.0, 21, Some(cluster_range.1))
+                .collect::<Result<_, _>>()?;
+        if offsets.last() != Some(&cluster_range.1) {
+            return Err(SystemError::EIO);
+        }
         // 逐个设置这些目录项为“空闲”状态
-        for off in offsets {
+        // Invalidate the publishing SFN first, then its LFN slots (Linux order).
+        for (index, off) in offsets.into_iter().rev().enumerate() {
             let gendisk_bytes_offset = fs.cluster_bytes_offset(off.0) + off.1;
             let mut short_entry = ShortDirEntry::default();
             short_entry.name[0] = 0xe5;
-            short_entry.flush(&fs, gendisk_bytes_offset)?;
+            if let Err(error) = short_entry.flush(&fs, gendisk_bytes_offset) {
+                if index == 0 {
+                    return Err(error);
+                }
+                // The SFN deletion has committed. As in Linux fat_remove_entries,
+                // orphaned LFN cleanup must not prevent inode/data reclamation.
+                warn!("FAT: failed to clean deleted long-name slot: {:?}", error);
+            }
         }
         return Ok(());
     }
@@ -1617,8 +1660,9 @@ pub struct FATDirIter {
     current_cluster: Cluster,
     /// 当前正在迭代的簇的簇内偏移量
     offset: u64,
-    /// True for the root directories of FAT12 and FAT16
-    is_root: bool,
+    /// Bound traversal even when a corrupt FAT chain loops.
+    remaining_slots: u64,
+    finished: bool,
     /// 指向当前文件系统的指针
     fs: Arc<FATFileSystem>,
 }
@@ -1633,31 +1677,13 @@ impl FATDirIter {
     /// @return Err(错误码) 可能出现了内部错误，或者是磁盘错误等。具体原因看错误码。
     fn get_dir_entry(&mut self) -> Result<(Cluster, u64, Option<FATDirEntry>), SystemError> {
         loop {
-            if unlikely(self.current_cluster.cluster_num < 2) {
+            if !normalize_directory_slot(&self.fs, &mut self.current_cluster, &mut self.offset)? {
                 return Ok((self.current_cluster, self.offset, None));
             }
-
-            // 如果当前簇已经被读完，那么尝试获取下一个簇
-            if self.offset >= self.fs.bytes_per_cluster() && !self.is_root {
-                match self.fs.get_fat_entry(self.current_cluster)? {
-                    FATEntry::Next(c) => {
-                        // 获得下一个簇的信息
-                        self.current_cluster = c;
-                        self.offset %= self.fs.bytes_per_cluster();
-                    }
-
-                    _ => {
-                        // 没有下一个簇了，返回None
-                        return Ok((self.current_cluster, self.offset, None));
-                    }
-                }
-            }
-
-            // 如果当前是FAT12/FAT16文件系统，并且当前inode是根目录项。
-            // 如果offset大于根目录项的最大大小（已经遍历完根目录），那么就返回None
-            if self.is_root && self.offset > self.fs.root_dir_end_bytes_offset().unwrap() {
-                return Ok((self.current_cluster, self.offset, None));
-            }
+            self.remaining_slots = self
+                .remaining_slots
+                .checked_sub(1)
+                .ok_or(SystemError::EIO)?;
 
             // 获取簇在分区内的字节偏移量
             let offset: u64 = self.fs.cluster_bytes_offset(self.current_cluster) + self.offset;
@@ -1695,28 +1721,17 @@ impl FATDirIter {
                     // 由于上面已经塞了1个长目录项，因此接下来最多需要迭代20次
                     // 循环查找目录项，直到遇到1个短目录项，或者是空闲目录项
                     for _ in 0..20 {
-                        // 如果当前簇已经被读完，那么尝试获取下一个簇
-                        if self.offset >= self.fs.bytes_per_cluster() && !self.is_root {
-                            match self.fs.get_fat_entry(self.current_cluster)? {
-                                FATEntry::Next(c) => {
-                                    // 获得下一个簇的信息
-                                    self.current_cluster = c;
-                                    self.offset %= self.fs.bytes_per_cluster();
-                                }
-
-                                _ => {
-                                    // 没有下一个簇了，退出迭代
-                                    break;
-                                }
-                            }
+                        if !normalize_directory_slot(
+                            &self.fs,
+                            &mut self.current_cluster,
+                            &mut self.offset,
+                        )? {
+                            return Ok((self.current_cluster, self.offset, None));
                         }
-                        // 如果当前是FAT12/FAT16文件系统，并且当前inode是根目录项。
-                        // 如果offset大于根目录项的最大大小（已经遍历完根目录），那么就退出迭代
-                        if self.is_root
-                            && self.offset > self.fs.root_dir_end_bytes_offset().unwrap()
-                        {
-                            break;
-                        }
+                        self.remaining_slots = self
+                            .remaining_slots
+                            .checked_sub(1)
+                            .ok_or(SystemError::EIO)?;
 
                         // 获取簇在分区内的字节偏移量
                         let offset: u64 =
@@ -1779,17 +1794,23 @@ impl FATDirIter {
 
 /// 为DirIter实现迭代器trait
 impl Iterator for FATDirIter {
-    type Item = FATDirEntry;
+    type Item = Result<FATDirEntry, SystemError>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        if self.finished {
+            return None;
+        }
         match self.get_dir_entry() {
             Ok((cluster, offset, result)) => {
                 self.current_cluster = cluster;
                 self.offset = offset;
-                return result;
+                self.finished = result.is_none();
+                return result.map(Ok);
             }
-            Err(_) => {
-                return None;
+            Err(error) => {
+                // Terminal error: repeated next() must not retry a broken chain.
+                self.finished = true;
+                return Some(Err(error));
             }
         }
     }
@@ -2483,7 +2504,48 @@ pub enum FATDirEntryOrShortName {
     ShortName([u8; 11]),
 }
 
-/// @brief 对FAT目录项的迭代器(基于簇和簇内偏移量)
+/// Normalize a directory slot without mixing fixed-root and cluster coordinates.
+/// Cluster zero denotes only the FAT12/16 fixed root; its offset is partition-relative.
+/// The exclusive end is EOF, but an out-of-range location or bad chain is EIO.
+fn normalize_directory_slot(
+    fs: &FATFileSystem,
+    cluster: &mut Cluster,
+    offset: &mut u64,
+) -> Result<bool, SystemError> {
+    if !(*offset).is_multiple_of(FATRawDirEntry::DIR_ENTRY_LEN) {
+        return Err(SystemError::EIO);
+    }
+    if cluster.cluster_num == 0 {
+        let end = fs.root_dir_end_bytes_offset().ok_or(SystemError::EIO)?;
+        if *offset < fs.root_dir_bytes_offset() || *offset > end {
+            return Err(SystemError::EIO);
+        }
+        return Ok(*offset < end);
+    }
+    let max = fs.max_cluster_number().cluster_num;
+    if cluster.cluster_num < 2 || cluster.cluster_num > max || *offset > fs.bytes_per_cluster() {
+        return Err(SystemError::EIO);
+    }
+    if *offset == fs.bytes_per_cluster() {
+        match fs.get_fat_entry(*cluster)? {
+            FATEntry::Next(next) if next.cluster_num >= 2 && next.cluster_num <= max => {
+                *cluster = next;
+                *offset = 0;
+            }
+            FATEntry::EndOfChain => return Ok(false),
+            _ => return Err(SystemError::EIO),
+        }
+    }
+    Ok(true)
+}
+
+fn directory_slot_budget(fs: &FATFileSystem) -> u64 {
+    // Includes fixed-root slots as well as all possible data-cluster slots.
+    fs.max_cluster_number().cluster_num * (fs.bytes_per_cluster() / FATRawDirEntry::DIR_ENTRY_LEN)
+        + fs.bpb.root_entries_cnt as u64
+}
+
+/// Directory slot ranges. Errors are not silently converted into short ranges.
 #[derive(Debug)]
 struct FATDirEntryOffsetIter {
     /// 当前迭代的偏移量(下一次迭代要返回的值)
@@ -2527,41 +2589,38 @@ impl FATDirEntryOffsetIter {
 }
 
 impl Iterator for FATDirEntryOffsetIter {
-    type Item = (Cluster, u64);
+    type Item = Result<(Cluster, u64), SystemError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.index == self.len || self.fin {
             return None;
         }
 
-        let r: (Cluster, u64) = self.current_offset;
-        // 计算新的字节偏移量
-        let mut new_offset = r.1 + FATRawDirEntry::DIR_ENTRY_LEN;
-        let mut new_cluster: Cluster = r.0;
-        // 越过了当前簇,则获取下一个簇
-        if new_offset >= self.fs.bytes_per_cluster() {
-            new_offset %= self.fs.bytes_per_cluster();
-
-            match self.fs.get_fat_entry(new_cluster) {
-                Ok(FATEntry::Next(c)) => {
-                    new_cluster = c;
-                }
-                // 没有下一个簇了
-                _ => {
-                    self.fin = true;
-                }
+        match normalize_directory_slot(
+            &self.fs,
+            &mut self.current_offset.0,
+            &mut self.current_offset.1,
+        ) {
+            Ok(true) => {}
+            Ok(false) => {
+                self.fin = true;
+                return None;
+            }
+            Err(error) => {
+                self.fin = true;
+                return Some(Err(error));
             }
         }
-
+        let r = self.current_offset;
         if let Some(off) = self.end_offset {
             // 判断当前簇是否是要求停止搜索的最后一个位置
             self.fin = off == self.current_offset;
         }
         // 更新当前迭代的偏移量
-        self.current_offset = (new_cluster, new_offset);
+        self.current_offset.1 += FATRawDirEntry::DIR_ENTRY_LEN;
         self.index += 1;
 
-        return Some(r);
+        return Some(Ok(r));
     }
 }
 
@@ -2653,7 +2712,7 @@ pub fn validate_rename_target(
         return Err(SystemError::EISDIR);
     }
     // new_entry是目录，直接unwrap
-    if new_entry.is_dir() && !(new_entry.to_dir().unwrap().is_empty(fs)) {
+    if new_entry.is_dir() && !(new_entry.to_dir().unwrap().is_empty(fs)?) {
         return Err(SystemError::ENOTEMPTY);
     }
     Ok(())

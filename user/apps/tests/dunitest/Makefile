@@ -23,6 +23,8 @@ EXT4_FIXTURE = $(BUILD_DIR)/fixtures/ext4_inode_identity.img
 EXT4_UNINIT_FIXTURE = $(BUILD_DIR)/fixtures/ext4_uninit_bitmap.img
 FAT_STAT_FIXTURE = $(BUILD_DIR)/fixtures/fat_stat_blocks.img
 FAT32_STAT_FIXTURE = $(BUILD_DIR)/fixtures/fat32_stat_blocks.img
+FAT12_DIRECTORY_FIXTURE = $(BUILD_DIR)/fixtures/fat12_directory.img
+FAT16_DIRECTORY_FIXTURE = $(BUILD_DIR)/fixtures/fat16_directory.img
 
 # 要编译的测试套件目录列表（suites/ 下的子目录名）
 SUITES = demo normal fuse
@@ -61,7 +63,17 @@ $(GTEST_SRC):
 	@mv "$(GTEST_TMP_ROOT)" "$(GTEST_ROOT)"
 	@test -f "$(GTEST_SRC)"
 
-build-suites: $(TEST_BINS) $(EXT4_FIXTURE) $(EXT4_UNINIT_FIXTURE) $(FAT_STAT_FIXTURE) $(FAT32_STAT_FIXTURE)
+build-suites: $(TEST_BINS) $(EXT4_FIXTURE) $(EXT4_UNINIT_FIXTURE) $(FAT_STAT_FIXTURE) $(FAT32_STAT_FIXTURE) $(FAT12_DIRECTORY_FIXTURE) $(FAT16_DIRECTORY_FIXTURE)
+
+$(FAT12_DIRECTORY_FIXTURE):
+	@mkdir -p "$(dir $@)"
+	@truncate -s 1M "$@"
+	@mkfs.fat -F 12 -S 512 -s 1 -r 32 "$@"
+
+$(FAT16_DIRECTORY_FIXTURE):
+	@mkdir -p "$(dir $@)"
+	@truncate -s 16M "$@"
+	@mkfs.fat -F 16 -S 512 -s 4 -r 64 "$@"
 
 # Fixed FAT16 geometry permits exact sector assertions and covers its
 # non-cluster root directory. Tests always mutate their own disposable copy.
@@ -139,7 +151,7 @@ install: build
 	@chmod +x $(INSTALL_DIR)/dunitest-runner
 	@cp -rf $(BIN_DIR) $(INSTALL_DIR)/
 	@mkdir -p $(INSTALL_DIR)/fixtures
-	@cp --sparse=always -f $(EXT4_FIXTURE) $(EXT4_UNINIT_FIXTURE) $(FAT_STAT_FIXTURE) $(FAT32_STAT_FIXTURE) $(INSTALL_DIR)/fixtures/
+	@cp --sparse=always -f $(EXT4_FIXTURE) $(EXT4_UNINIT_FIXTURE) $(FAT_STAT_FIXTURE) $(FAT32_STAT_FIXTURE) $(FAT12_DIRECTORY_FIXTURE) $(FAT16_DIRECTORY_FIXTURE) $(INSTALL_DIR)/fixtures/
 	@cp -f whitelist.txt $(INSTALL_DIR)/whitelist.txt
 	@cp -f no_skip.txt $(INSTALL_DIR)/no_skip.txt
 	@cp -f scripts/run_tests.sh $(INSTALL_DIR)/run_tests.sh

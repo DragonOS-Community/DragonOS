@@ -427,6 +427,10 @@ mod extent_validation_tests {
 }
 
 impl FileOps for IdMapFileOps {
+    fn owner(&self) -> Option<(usize, usize)> {
+        self.target.owner_uid_gid()
+    }
+
     fn open(
         &self,
         data: &mut MutexGuard<FilePrivateData>,
@@ -545,6 +549,10 @@ impl SetgroupsFileOps {
 }
 
 impl FileOps for SetgroupsFileOps {
+    fn owner(&self) -> Option<(usize, usize)> {
+        self.target.owner_uid_gid()
+    }
+
     fn open(
         &self,
         data: &mut MutexGuard<FilePrivateData>,

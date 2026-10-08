@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include "user_namespace_test_support.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -977,8 +978,13 @@ void case_old_root_lock_transferred() {
     }
     // The copied old_root is locked, while mounts created after this point
     // are owned by the new user namespace and remain movable.
+    const uid_t parent_uid = getuid();
+    const gid_t parent_gid = getgid();
     if (unshare(CLONE_NEWUSER | CLONE_NEWNS) != 0) {
         child_fail("unshare user+mount namespace failed");
+    }
+    if (!dunitest::install_self_user_namespace_maps(parent_uid, parent_gid)) {
+        child_fail("install user namespace maps failed");
     }
     if (mount("", new_root, "ramfs", 0, nullptr) != 0 ||
         (mkdir(put_old, 0755) != 0 && errno != EEXIST) ||

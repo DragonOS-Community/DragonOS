@@ -426,7 +426,8 @@ int run_first_level_userns(void* opaque, std::string* detail) {
 
     int err = write_text_file("/proc/self/uid_map", "4294967294 1000 2\n");
     if (err != EINVAL) {
-        *detail = "uid_map accepted extent covering invalid UID";
+        *detail = "invalid uid_map extent returned " + std::to_string(err) +
+                  ", expected EINVAL";
         return 1;
     }
     err = write_text_file("/proc/self/uid_map", first_uid_map);
@@ -460,6 +461,19 @@ int run_first_level_userns(void* opaque, std::string* detail) {
     if (getuid() != 0 || geteuid() != 0 || getgid() != 0 || getegid() != 0) {
         *detail = "first namespace IDs were not translated to local zero";
         return 1;
+    }
+    for (const char* map_path : {"/proc/self/uid_map", "/proc/self/gid_map",
+                                 "/proc/self/setgroups"}) {
+        struct stat ownership {};
+        if (stat(map_path, &ownership) != 0) {
+            *detail = errno_detail("stat user namespace control", errno);
+            return 1;
+        }
+        if (ownership.st_uid != geteuid() || ownership.st_gid != getegid() ||
+            (ownership.st_mode & 0777) != 0644) {
+            *detail = std::string(map_path) + " does not follow target credentials with mode 0644";
+            return 1;
+        }
     }
     uid_t ruid = 1, euid = 1, suid = 1;
     gid_t rgid = 1, egid = 1, sgid = 1;
@@ -542,6 +556,14 @@ int run_rootless_nested_id_map_flow(std::string* detail) {
         }
         uid = static_cast<unsigned>(geteuid());
         gid = static_cast<unsigned>(getegid());
+    }
+
+    // Dropping IDs makes the task non-dumpable. Linux then makes its proc
+    // control files root-owned; opt back into self-owned proc files before
+    // testing unprivileged self-mapping, without bypassing their DAC checks.
+    if (prctl(PR_SET_DUMPABLE, 1) != 0) {
+        *detail = errno_detail("PR_SET_DUMPABLE before rootless mapping", errno);
+        return 1;
     }
 
     FirstLevelArgs args = {
@@ -1038,6 +1060,56 @@ TEST(UserNamespaceIdMap, InitialNamespaceMapsAreReadable) {
 
 TEST(UserNamespaceIdMap, RootlessSingleAndNestedSelfMaps) {
     expect_child_success("rootless_nested_id_map_flow", run_rootless_nested_id_map_flow);
+}
+
+int check_proc_control_dumpability(std::string* detail) {
+    if (geteuid() == 0 && (setgid(1000) != 0 || setuid(1000) != 0)) {
+        *detail = errno_detail("drop proc ownership test credentials", errno);
+        return 1;
+    }
+    const uid_t owner_uid = geteuid();
+    const gid_t owner_gid = getegid();
+    for (int dumpable : {0, 1}) {
+        if (prctl(PR_SET_DUMPABLE, dumpable) != 0) {
+            *detail = errno_detail("set proc control dumpability", errno);
+            return 1;
+        }
+        for (const char* path : {"/proc/self/uid_map", "/proc/self/gid_map",
+                                 "/proc/self/setgroups"}) {
+            struct stat ownership {};
+            if (stat(path, &ownership) != 0) {
+                *detail = errno_detail("stat proc control dumpability", errno);
+                return 1;
+            }
+            if (ownership.st_uid != (dumpable ? owner_uid : 0) ||
+                ownership.st_gid != (dumpable ? owner_gid : 0) ||
+                (ownership.st_mode & 0777) != 0644) {
+                *detail = std::string(path) + " has incorrect dumpability ownership/mode";
+                return 1;
+            }
+            if (!dumpable) {
+                errno = 0;
+                int fd = open(path, O_WRONLY);
+                const int open_errno = errno;
+                if (fd >= 0) close(fd);
+                if (fd >= 0 || open_errno != EACCES) {
+                    *detail = std::string(path) + " bypassed non-dumpable DAC protection";
+                    return 1;
+                }
+            }
+        }
+        struct stat directory {};
+        if (stat("/proc/self", &directory) != 0 || directory.st_uid != owner_uid ||
+            directory.st_gid != owner_gid) {
+            *detail = "world-readable PID directory must retain task ownership";
+            return 1;
+        }
+    }
+    return 0;
+}
+
+TEST(UserNamespaceIdMap, ProcControlsFollowDumpabilityWithoutChangingModes) {
+    expect_child_success("proc_control_dumpability", check_proc_control_dumpability);
 }
 
 TEST(UserNamespaceIdMap, ChildCannotBridgeDiscontinuousParentMap) {

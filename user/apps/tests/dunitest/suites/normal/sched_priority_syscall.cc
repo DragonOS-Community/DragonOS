@@ -29,6 +29,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <sys/resource.h>
+#include <sys/prctl.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -808,6 +809,7 @@ TEST(Setpriority, PrioUserPreservesUnsignedUidBits) {
 
 struct MappedUidObservation {
     int setresuid_errno;
+    int dumpable_errno;
     int unshare_errno;
     int uid_map_errno;
     int set_errno;
@@ -821,6 +823,12 @@ MappedUidObservation ObserveMappedUidSelector() {
     errno = 0;
     if (setresuid(kUnusedUid, kUnusedUid, 0) != 0) {
         observation.setresuid_errno = errno;
+        return observation;
+    }
+    // Linux resets dumpability on the credential drop. Self-written uid_map
+    // requires self-owned proc entries, not CAP_DAC_OVERRIDE in the parent ns.
+    if (prctl(PR_SET_DUMPABLE, 1) != 0) {
+        observation.dumpable_errno = errno;
         return observation;
     }
     if (unshare(CLONE_NEWUSER) != 0) {
@@ -848,6 +856,8 @@ TEST(Setpriority, PrioUserMapsUidThroughCallerNamespace) {
 
     ASSERT_EQ(0, observation.setresuid_errno)
         << "setresuid(" << kUnusedUid << "): " << strerror(observation.setresuid_errno);
+    ASSERT_EQ(0, observation.dumpable_errno)
+        << "PR_SET_DUMPABLE: " << strerror(observation.dumpable_errno);
     ASSERT_EQ(0, observation.unshare_errno)
         << "unshare(CLONE_NEWUSER): " << strerror(observation.unshare_errno);
     ASSERT_EQ(0, observation.uid_map_errno)

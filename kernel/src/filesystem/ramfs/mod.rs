@@ -3,10 +3,11 @@ use core::intrinsics::unlikely;
 
 use crate::filesystem::page_cache::{PageCache, PageCacheBackend};
 use crate::filesystem::vfs::syscall::RenameFlags;
-use crate::filesystem::vfs::{FileSystemMakerData, FSMAKER};
+use crate::filesystem::vfs::{FileSystemMakerData, FsCreationContext, FSMAKER};
 use crate::libs::rwsem::RwSem;
 use crate::mm::fault::{PageFaultHandler, PageFaultMessage};
 use crate::mm::VmFaultReason;
+use crate::process::namespace::user_namespace::{UserNamespace, INIT_USER_NAMESPACE};
 use crate::register_mountable_fs;
 use crate::{
     arch::MMArch,
@@ -212,6 +213,36 @@ pub struct RamFS {
     /// RamFS的root inode
     root_inode: Arc<LockedRamFSInode>,
     super_block: RwSem<SuperBlock>,
+    owner_user_ns: Arc<UserNamespace>,
+}
+
+#[derive(Debug)]
+struct RamFSMountData {
+    mode: InodeMode,
+}
+
+impl FileSystemMakerData for RamFSMountData {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+impl RamFSMountData {
+    fn parse(raw: Option<&str>) -> Result<Self, SystemError> {
+        let mut mode = InodeMode::S_IRWXU
+            | InodeMode::S_IRGRP
+            | InodeMode::S_IXGRP
+            | InodeMode::S_IROTH
+            | InodeMode::S_IXOTH;
+        for option in raw.unwrap_or("").split(',') {
+            // Linux ramfs ignores unknown options; mode is the only parameter.
+            if let Some(value) = option.strip_prefix("mode=") {
+                let bits = u32::from_str_radix(value, 8).map_err(|_| SystemError::EINVAL)?;
+                mode = InodeMode::from_bits_truncate(bits & 0o7777);
+            }
+        }
+        Ok(Self { mode })
+    }
 }
 
 /// @brief 内存文件系统的Inode结构体(不包含锁)
@@ -350,6 +381,10 @@ impl FileSystem for RamFS {
         self.super_block.read().clone()
     }
 
+    fn mount_owner_user_ns(&self) -> Option<Arc<UserNamespace>> {
+        Some(self.owner_user_ns.clone())
+    }
+
     fn reconfigure(
         &self,
         request: FsReconfigureRequest<'_>,
@@ -367,6 +402,16 @@ impl FileSystem for RamFS {
 
 impl RamFS {
     pub fn new() -> Arc<Self> {
+        // Kernel users retain the historical root identity and permissions.
+        Self::new_in_context(InodeMode::S_IRWXUGO, 0, 0, INIT_USER_NAMESPACE.clone())
+    }
+
+    fn new_in_context(
+        mode: InodeMode,
+        uid: usize,
+        gid: usize,
+        owner: Arc<UserNamespace>,
+    ) -> Arc<Self> {
         let super_block = SuperBlock::new(
             Magic::RAMFS_MAGIC,
             RAMFS_BLOCK_SIZE,
@@ -382,6 +427,7 @@ impl RamFS {
         let result: Arc<RamFS> = Arc::new(RamFS {
             root_inode: root,
             super_block: RwSem::new(super_block),
+            owner_user_ns: owner,
         });
 
         // 对root inode加锁，并继续完成初始化工作
@@ -389,6 +435,9 @@ impl RamFS {
         root_guard.parent = Arc::downgrade(&result.root_inode);
         root_guard.self_ref = Arc::downgrade(&result.root_inode);
         root_guard.fs = Arc::downgrade(&result);
+        root_guard.metadata.mode = mode;
+        root_guard.metadata.uid = uid;
+        root_guard.metadata.gid = gid;
         // 释放锁
         drop(root_guard);
 
@@ -397,18 +446,46 @@ impl RamFS {
 }
 
 impl MountableFileSystem for RamFS {
+    const SUPPORTS_USERNS_MOUNT: bool = true;
+
     fn make_mount_data(
-        _raw_data: Option<&str>,
+        raw_data: Option<&str>,
         _source: &str,
     ) -> Result<Option<Arc<dyn FileSystemMakerData + 'static>>, SystemError> {
-        // 目前ramfs不需要任何额外的mount数据
-        Ok(None)
+        Ok(Some(Arc::new(RamFSMountData::parse(raw_data)?)))
     }
     fn make_fs(
-        _data: Option<&dyn FileSystemMakerData>,
+        data: Option<&dyn FileSystemMakerData>,
     ) -> Result<Arc<dyn FileSystem + 'static>, SystemError> {
-        let fs = RamFS::new();
-        return Ok(fs);
+        let mode = data
+            .and_then(|data| data.as_any().downcast_ref::<RamFSMountData>())
+            .map(|data| data.mode)
+            .unwrap_or(RamFSMountData::parse(None)?.mode);
+        Ok(Self::new_in_context(
+            mode,
+            0,
+            0,
+            INIT_USER_NAMESPACE.clone(),
+        ))
+    }
+
+    fn make_fs_in_context(
+        data: Option<&dyn FileSystemMakerData>,
+        _flags: super::vfs::mount::MountFlags,
+        context: &FsCreationContext,
+    ) -> Result<Arc<dyn FileSystem>, SystemError> {
+        let data = data
+            .and_then(|data| data.as_any().downcast_ref::<RamFSMountData>())
+            .ok_or(SystemError::EINVAL)?;
+        // Linux ramfs_get_inode uses inode_init_owner/current_fsuid at
+        // get_tree, unlike tmpfs which explicitly uses fc->cred's saved IDs.
+        let cred = crate::process::ProcessManager::current_pcb().cred();
+        Ok(Self::new_in_context(
+            data.mode,
+            cred.fsuid.data(),
+            cred.fsgid.data(),
+            context.cred.user_ns.clone(),
+        ))
     }
 }
 
@@ -685,6 +762,58 @@ impl IndexNode for LockedRamFSInode {
         mode: InodeMode,
         data: usize,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
+        let mut context = super::vfs::permission::InodeOpContext::legacy();
+        context.fs_userns = self.fs().mount_owner_user_ns().ok_or(SystemError::EIO)?;
+        self.create_with_data_context(name, file_type, mode, data, &context)
+    }
+
+    fn create_with_context(
+        &self,
+        name: &str,
+        file_type: FileType,
+        mode: InodeMode,
+        context: &super::vfs::permission::InodeOpContext,
+    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+        self.create_with_data_context(name, file_type, mode, 0, context)
+    }
+
+    fn mkdir_with_context(
+        &self,
+        name: &str,
+        mode: InodeMode,
+        context: &super::vfs::permission::InodeOpContext,
+    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+        self.create_with_context(name, FileType::Dir, mode, context)
+    }
+
+    fn symlink_with_context(
+        &self,
+        name: &str,
+        target: &str,
+        context: &super::vfs::permission::InodeOpContext,
+    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+        let inode =
+            self.create_with_context(name, FileType::SymLink, InodeMode::S_IRWXUGO, context)?;
+        inode.write_at(
+            0,
+            target.len(),
+            target.as_bytes(),
+            Mutex::new(FilePrivateData::Unused).lock(),
+        )?;
+        Ok(inode)
+    }
+
+    fn create_with_data_context(
+        &self,
+        name: &str,
+        file_type: FileType,
+        mode: InodeMode,
+        data: usize,
+        context: &super::vfs::permission::InodeOpContext,
+    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+        if context.is_idmapped() {
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        }
         let name = DName::from(name);
         // 获取当前inode
         let mut inode = self.0.lock();
@@ -696,8 +825,13 @@ impl IndexNode for LockedRamFSInode {
         if inode.children.contains_key(&name) {
             return Err(SystemError::EEXIST);
         }
-        let init =
-            crate::filesystem::vfs::permission::child_inode_init(&inode.metadata, file_type, mode);
+        super::vfs::permission::check_parent_create(&inode.metadata, context, false)?;
+        let init = super::vfs::permission::child_inode_init_with_context(
+            &inode.metadata,
+            file_type,
+            mode,
+            context,
+        )?;
 
         // 创建inode
         let result: Arc<LockedRamFSInode> = Arc::new(LockedRamFSInode(
@@ -1076,6 +1210,21 @@ impl IndexNode for LockedRamFSInode {
         mode: InodeMode,
         dev_t: DeviceNumber,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
+        let mut context = super::vfs::permission::InodeOpContext::legacy();
+        context.fs_userns = self.fs().mount_owner_user_ns().ok_or(SystemError::EIO)?;
+        self.mknod_with_context(filename, mode, dev_t, &context)
+    }
+
+    fn mknod_with_context(
+        &self,
+        filename: &str,
+        mode: InodeMode,
+        dev_t: DeviceNumber,
+        context: &super::vfs::permission::InodeOpContext,
+    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+        if context.is_idmapped() {
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        }
         let mut inode = self.0.lock();
         if inode.metadata.file_type != FileType::Dir {
             return Err(SystemError::ENOTDIR);
@@ -1085,10 +1234,13 @@ impl IndexNode for LockedRamFSInode {
         let file_type = FileType::from(mode);
         if unlikely(file_type == FileType::File) {
             drop(inode);
-            return self.create(filename, FileType::File, mode);
+            return self.create_with_context(filename, FileType::File, mode, context);
         }
 
         let filename = DName::from(filename);
+        if inode.children.contains_key(&filename) {
+            return Err(SystemError::EEXIST);
+        }
 
         // Determine file type from mode
         let file_type = match file_type {
@@ -1098,8 +1250,13 @@ impl IndexNode for LockedRamFSInode {
             FileType::Socket => FileType::Socket,
             _ => return Err(SystemError::EINVAL),
         };
-        let init =
-            crate::filesystem::vfs::permission::child_inode_init(&inode.metadata, file_type, mode);
+        super::vfs::permission::check_parent_create(&inode.metadata, context, false)?;
+        let init = super::vfs::permission::child_inode_init_with_context(
+            &inode.metadata,
+            file_type,
+            mode,
+            context,
+        )?;
 
         let nod = Arc::new(LockedRamFSInode(
             Mutex::new(RamFSInode {

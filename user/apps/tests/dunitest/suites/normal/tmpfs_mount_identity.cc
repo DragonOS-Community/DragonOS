@@ -199,11 +199,12 @@ TEST_F(TmpfsIdentityTest, ChildNamespaceLegacyAndNewApiAgree) {
     });
 }
 
-TEST_F(TmpfsIdentityTest, ChildOwnerDeviceAccessCannotBeEnabledByRemount) {
+TEST_F(TmpfsIdentityTest, ChildOwnedMemoryFsDeviceAccessCannotBeEnabledByRemount) {
     in_mapped_namespace([&] {
+      for (const char* filesystem : {"tmpfs", "ramfs"}) {
       for (bool modern : {false, true}) {
         if (modern) {
-            int fd = syscall(SYS_fsopen, "tmpfs", 0);
+            int fd = syscall(SYS_fsopen, filesystem, 0);
             WORKER_CHECK(fd >= 0);
             WORKER_CHECK(syscall(SYS_fsconfig, fd, 6, nullptr, nullptr, 0) == 0);
             int tree = syscall(SYS_fsmount, fd, 0, 0);
@@ -213,7 +214,7 @@ TEST_F(TmpfsIdentityTest, ChildOwnerDeviceAccessCannotBeEnabledByRemount) {
             close(tree);
             WORKER_CHECK(result == 0);
         } else {
-            WORKER_CHECK(mount("tmpfs", path_.c_str(), "tmpfs", 0, nullptr) == 0);
+            WORKER_CHECK(mount(filesystem, path_.c_str(), filesystem, 0, nullptr) == 0);
         }
         const std::string node = path_ + "/null";
         // Linux permits the 0:0 whiteout node without initial CAP_MKNOD;
@@ -236,8 +237,62 @@ TEST_F(TmpfsIdentityTest, ChildOwnerDeviceAccessCannotBeEnabledByRemount) {
         WORKER_CHECK(unlink(node.c_str()) == 0);
         WORKER_CHECK(umount(path_.c_str()) == 0);
       }
+      }
         return WorkerResult{};
     });
+}
+
+TEST_F(TmpfsIdentityTest, RamfsRootModeAndCurrentGetTreeFsIds) {
+    ASSERT_EQ(0, mount("ramfs", path_.c_str(), "ramfs", 0, nullptr));
+    struct stat st {};
+    ASSERT_EQ(0, stat(path_.c_str(), &st));
+    EXPECT_EQ(0755u, st.st_mode & 07777);
+    ASSERT_EQ(0, umount(path_.c_str()));
+    ASSERT_EQ(0, mount("ramfs", path_.c_str(), "ramfs", 0, "mode=0700,unknown=ignored"));
+    ASSERT_EQ(0, stat(path_.c_str(), &st));
+    EXPECT_EQ(0700u, st.st_mode & 07777);
+    ASSERT_EQ(0, umount(path_.c_str()));
+
+    setfsuid(1234);
+    setfsgid(2345);
+    int fd = syscall(SYS_fsopen, "ramfs", 0);
+    setfsuid(0);
+    setfsgid(0);
+    ASSERT_GE(fd, 0);
+    int result = syscall(SYS_fsconfig, fd, 6, nullptr, nullptr, 0);
+    if (result != 0) { close(fd); FAIL() << "CREATE errno=" << errno; }
+    int tree = syscall(SYS_fsmount, fd, 0, 0);
+    close(fd);
+    ASSERT_GE(tree, 0);
+    result = fstat(tree, &st);
+    close(tree);
+    ASSERT_EQ(0, result);
+    // ramfs inode_init_owner uses get_tree's current IDs, not fsopen's IDs.
+    EXPECT_EQ(0u, st.st_uid);
+    EXPECT_EQ(0u, st.st_gid);
+    EXPECT_EQ(0755u, st.st_mode & 07777);
+}
+
+TEST_F(TmpfsIdentityTest, RamfsOwnerChecksNamedCreatorMapping) {
+    in_mapped_namespace([&] {
+        WORKER_CHECK(mount("ramfs", path_.c_str(), "ramfs", 0, "mode=0777") == 0);
+        // The caller's global ID zero has no mapping in this filesystem owner.
+        const std::string name = path_ + "/child";
+        errno = 0;
+        const int mkdir_result = mkdir(name.c_str(), 0700);
+        if (mkdir_result != -1 || errno != EOVERFLOW) {
+            // Report zero for successful publication, not a stale errno from
+            // namespace setup. A failing syscall reports its actual errno.
+            return WorkerResult{__LINE__, mkdir_result == 0 ? 0 : errno};
+        }
+        WORKER_CHECK(open(name.c_str(), O_CREAT | O_RDWR, 0600) == -1 && errno == EOVERFLOW);
+        WORKER_CHECK(symlink("target", name.c_str()) == -1 && errno == EOVERFLOW);
+        WORKER_CHECK(mkfifo(name.c_str(), 0600) == -1 && errno == EOVERFLOW);
+        struct stat st {};
+        WORKER_CHECK(lstat(name.c_str(), &st) == -1 && errno == ENOENT);
+        WORKER_CHECK(umount(path_.c_str()) == 0);
+        return WorkerResult{};
+    }, "42 1234 1\n", "43 2345 1\n");
 }
 
 TEST_F(TmpfsIdentityTest, ChildOwnerRejectsUnmappedChownIds) {

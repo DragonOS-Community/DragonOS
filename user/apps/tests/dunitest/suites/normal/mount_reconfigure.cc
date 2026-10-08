@@ -904,7 +904,7 @@ TEST(MountReconfigure, BindRemountReadonlyDoesNotChangeSourceSuperblock) {
     cleanup_mount(source);
 }
 
-TEST(MountReconfigure, TmpfsRemountModeCanReturnToDefaultPermissions) {
+TEST(MountReconfigure, TmpfsRemountModeDoesNotReplaceRootPermissions) {
     const char *target = "/tmp/test_tmpfs_remount_mode";
     struct stat st;
 
@@ -923,11 +923,14 @@ TEST(MountReconfigure, TmpfsRemountModeCanReturnToDefaultPermissions) {
 
     ASSERT_EQ(mount("tmpfs", target, "tmpfs", MS_REMOUNT, "mode=755"), 0) << strerror(errno);
     ASSERT_EQ(stat(target, &st), 0) << strerror(errno);
-    EXPECT_EQ(st.st_mode & 0777, 0755U);
+    // Linux shmem_reconfigure accepts mode but does not mutate the root inode.
+    EXPECT_EQ(st.st_mode & 0777, 0777U);
+
+    ASSERT_EQ(chmod(target, 0700), 0) << strerror(errno);
 
     ASSERT_EQ(mount("tmpfs", target, "tmpfs", MS_REMOUNT, "mode=777"), 0) << strerror(errno);
     ASSERT_EQ(stat(target, &st), 0) << strerror(errno);
-    EXPECT_EQ(st.st_mode & 0777, 0777U);
+    EXPECT_EQ(st.st_mode & 0777, 0700U);
 
     cleanup_mount(target);
 }

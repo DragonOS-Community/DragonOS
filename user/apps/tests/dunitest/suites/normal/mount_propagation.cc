@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include "user_namespace_test_support.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -636,9 +637,12 @@ TEST_F(MountPropagationTest, CrossUserCopyIsOneWayAndKeepsAttributeLocksAcrossCo
         report.initial_tags = {};
         report.nested_tags = {};
 
+        const uid_t parent_uid = getuid();
+        const gid_t parent_gid = getgid();
         if (unshare(CLONE_NEWUSER | CLONE_NEWNS) != 0) {
             _exit(1);
         }
+        if (!dunitest::install_self_user_namespace_maps(parent_uid, parent_gid)) _exit(7);
         const char* points[] = {base};
         if (!read_propagation_snapshot(points, 1, &report.initial_tags)) {
             _exit(2);

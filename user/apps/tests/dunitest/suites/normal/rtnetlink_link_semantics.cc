@@ -683,6 +683,21 @@ int RunDragonOsSysfsRenameCase() {
     return result;
 }
 
+int RunSysfsMountRejectsInheritedNetnsOwnerCase() {
+    // A new user namespace alone does not confer authority over the inherited
+    // network namespace. Enabling userns mounts must preserve this owner check.
+    if (unshare(CLONE_NEWUSER | CLONE_NEWNS) != 0) return 77;
+    if (mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr) != 0) return 77;
+    const char* mountpoint = "/tmp/dunit-inherited-netns-sysfs";
+    if (mkdir(mountpoint, 0755) != 0 && errno != EEXIST) return 10;
+    const int result = mount("sysfs", mountpoint, "sysfs",
+                             MS_NOSUID | MS_NODEV | MS_NOEXEC, nullptr);
+    const int error = errno;
+    if (result == 0) umount(mountpoint);
+    rmdir(mountpoint);
+    return result == -1 && error == EPERM ? 0 : 11;
+}
+
 int RunFreshNetnsSysfsProjectionCase() {
     if (unshare(CLONE_NEWUSER | CLONE_NEWNET | CLONE_NEWNS) != 0) return 77;
     if (mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr) != 0) return 77;
@@ -1409,6 +1424,14 @@ TEST(RtnetlinkLinkSemantics, FreshNetworkNamespaceHasMountedSysfsProjection) {
     const int result = RunChild(RunFreshNetnsSysfsProjectionCase);
     if (result == 77 && !IsDragonOS()) {
         GTEST_SKIP() << "host cannot create and mount a network-namespace sysfs view";
+    }
+    EXPECT_EQ(result, 0);
+}
+
+TEST(RtnetlinkLinkSemantics, SysfsMountRequiresNetworkNamespaceOwnerCapability) {
+    const int result = RunChild(RunSysfsMountRejectsInheritedNetnsOwnerCase);
+    if (result == 77 && !IsDragonOS()) {
+        GTEST_SKIP() << "host cannot create private user/mount namespaces";
     }
     EXPECT_EQ(result, 0);
 }

@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include "loop_ext4_test_support.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <stdint.h>
@@ -29,12 +30,13 @@ uint32_t word(const uint8_t* value) {
 class MountFilecapsTest : public ::testing::Test {
 protected:
     void SetUp() override {
-        // Like ext4_xattr, use the persistent root filesystem: DragonOS /tmp
-        // is tmpfs, whose optional security-xattr handler is not implemented.
-        char pattern[] = "/root/dunitest_mount_filecaps_XXXXXX";
-        fd_ = mkstemp(pattern);
+        // File capabilities require a security-xattr capable filesystem.
+        // Use the ext4 fixture, independently of the guest's rootfs profile.
+        ASSERT_NO_FATAL_FAILURE(filesystem_.SetUp());
+        ASSERT_NO_FATAL_FAILURE(filesystem_.Mount());
+        path_ = filesystem_.mount_point() + "/capabilities";
+        fd_ = open(path_.c_str(), O_CREAT | O_EXCL | O_RDWR, 0600);
         ASSERT_GE(fd_, 0) << strerror(errno);
-        path_ = pattern;
     }
     void TearDown() override {
         if (fd_ >= 0) close(fd_);
@@ -52,6 +54,7 @@ protected:
     }
     int fd_ = -1;
     std::string path_;
+    dunitest::LoopExt4 filesystem_;
 };
 
 TEST_F(MountFilecapsTest, RevisionTwoAndRootZeroRevisionThreeReadAsTwo) {

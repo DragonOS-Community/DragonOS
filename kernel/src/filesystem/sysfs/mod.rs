@@ -330,6 +330,10 @@ impl FileSystem for SysFS {
 }
 
 impl MountableFileSystem for SysFS {
+    // Linux sysfs advertises FS_USERNS_MOUNT. The maker below still requires
+    // CAP_SYS_ADMIN in the captured network namespace's owning user namespace.
+    const SUPPORTS_USERNS_MOUNT: bool = true;
+
     /// 创建 sysfs 挂载数据
     ///
     /// sysfs 是一个虚拟文件系统，不需要任何挂载数据。

@@ -138,11 +138,43 @@ impl ProcPidTarget {
     }
 
     pub(super) fn owner_uid_gid(&self) -> Option<(usize, usize)> {
+        self.task_owner_uid_gid(true)
+    }
+
+    // Linux keeps world-readable/executable PID directories task-owned even
+    // when ordinary files are root-owned for a non-dumpable task.
+    fn directory_owner_uid_gid(&self) -> Option<(usize, usize)> {
+        self.task_owner_uid_gid(false)
+    }
+
+    fn task_owner_uid_gid(&self, check_dumpable: bool) -> Option<(usize, usize)> {
         let pcb = self.thread_group_leader()?;
         if pcb.is_kthread() {
             return Some((0, 0));
         }
+        // Keep owned snapshots, not exec_update_lock: exec holds its write
+        // side while resolving paths such as /proc/self/fd/N.
         let cred = pcb.cred();
+        // Credential commits publish the dumpability downgrade first. Pair
+        // with that publication before reading mm state, as ptrace does.
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        if check_dumpable {
+            let mm = pcb.basic().user_vm();
+            let Some(mm) = mm else {
+                return Some((0, 0));
+            };
+            if mm.dumpable() != crate::process::cred::SUID_DUMP_USER as u8 {
+                let ns = mm.user_ns();
+                return Some((
+                    crate::process::namespace::user_namespace::make_kuid(&ns, 0)
+                        .map(|id| id.data())
+                        .unwrap_or(0),
+                    crate::process::namespace::user_namespace::make_kgid(&ns, 0)
+                        .map(|id| id.data())
+                        .unwrap_or(0),
+                ));
+            }
+        }
         Some((cred.euid.data(), cred.egid.data()))
     }
 
@@ -314,7 +346,7 @@ impl PidDirOps {
 
 impl DirOps for PidDirOps {
     fn owner(&self) -> Option<(usize, usize)> {
-        self.target.owner_uid_gid()
+        self.target.directory_owner_uid_gid()
     }
 
     fn lookup_child(

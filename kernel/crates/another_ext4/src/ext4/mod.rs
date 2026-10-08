@@ -11,7 +11,9 @@ use core::{
 mod alloc;
 mod dir;
 mod extent;
+mod fallocate;
 pub use extent::{ReadPlan, ReadSegment};
+pub use fallocate::{ExistingBlockImageOutcome, PreallocationProgress};
 mod high_level;
 mod metadata_cache;
 use metadata_cache::{MetadataBlockCache, PublicationPoint};
@@ -28,6 +30,8 @@ mod journal_transaction;
 mod link;
 mod low_level;
 mod orphan;
+mod truncate;
+pub use truncate::StartedSizeChange;
 mod rw;
 mod xattr;
 mod xattr_reclaim;
@@ -277,6 +281,9 @@ impl DelallocReservation {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DelallocClaim {
+    /// Immutable append provenance, shared with the lease certificate. This
+    /// annotates the existing claim; it is not another reservation counter.
+    inode_owner: Option<(InodeId, u32)>,
     data_blocks: u64,
     metadata_blocks: u64,
     // Number of one-shot debit records which have changed this claim but have

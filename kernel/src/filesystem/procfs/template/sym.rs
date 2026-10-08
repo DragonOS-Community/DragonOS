@@ -92,6 +92,10 @@ pub trait SymOps: Sync + Send + Sized + Debug {
         None
     }
 
+    fn check_symlink_access(&self) -> Result<(), SystemError> {
+        Ok(())
+    }
+
     fn is_magic_link(&self) -> bool {
         false
     }
@@ -213,5 +217,9 @@ impl<S: SymOps + 'static> IndexNode for ProcSym<S> {
 
     fn is_magic_link(&self) -> bool {
         self.inner.is_magic_link()
+    }
+
+    fn check_symlink_access(&self) -> Result<(), SystemError> {
+        self.inner.check_symlink_access()
     }
 }

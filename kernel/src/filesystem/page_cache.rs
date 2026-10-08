@@ -53,6 +53,7 @@ mod selftest;
 mod writeback;
 use mapping::FileVmaIndex;
 pub(crate) use mapping::PageCacheFaultInvalidateRead;
+pub(crate) use mapping::PageCacheRangeResult;
 pub use mapping::UnmapMappingMode;
 pub use read_batch::{PageCacheReadBatchCompletion, PageCacheReadBatchRequest};
 pub use read_dma::PageCacheReadDmaReservation;
@@ -438,6 +439,17 @@ impl PageCacheWritebackDomain {
             }
             _ => Err(SystemError::EINVAL),
         }
+    }
+
+    /// Reuse the existing domain/SB identity for canonical orphan accounting.
+    /// The short domain lock is released before callers touch inode state.
+    pub(crate) fn bound_superblock(&self) -> Option<Arc<SuperBlockState>> {
+        self.state
+            .lock_irqsave()
+            .binding
+            .as_ref()?
+            .superblock
+            .upgrade()
     }
 
     fn finish_registration(&self) {
@@ -2221,6 +2233,16 @@ impl PageCache {
         self.inner.lock()
     }
 
+    /// Cache-only metadata may inspect membership, but must not wait, fill
+    /// pages or call the backing filesystem while doing so.
+    pub(crate) fn try_pages_count(&self) -> Result<usize, SystemError> {
+        Ok(self
+            .inner
+            .try_lock()
+            .map_err(|_| SystemError::EAGAIN_OR_EWOULDBLOCK)?
+            .pages_count())
+    }
+
     pub fn manager(&self) -> &PageCacheManager {
         &self.manager
     }
@@ -3585,6 +3607,10 @@ impl PageCache {
 
     /// 两阶段读取：持锁收集拷贝项，解锁后拷贝到目标缓冲区，避免用户缺页导致自锁
     pub fn read(&self, offset: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
+        // Serialize cache lookup/fill with mapping removal, but release this
+        // guard before touching a user destination: its fault may need this
+        // same mapping while an invalidator is waiting for our entry pins.
+        let invalidate = self.invalidate_read();
         let inode = self
             .inode()
             .and_then(|inode| inode.upgrade())
@@ -3630,6 +3656,7 @@ impl PageCache {
             ret += page_read_len;
         }
 
+        drop(invalidate);
         let mut dst_offset = 0;
         for item in copies {
             // 先prefault，避免在持锁后触发缺页

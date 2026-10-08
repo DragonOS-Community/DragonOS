@@ -192,11 +192,32 @@ fn must_copy_xattr(name: &str) -> bool {
 }
 
 pub(super) fn remove_security_capability(inode: &Arc<dyn IndexNode>) -> Result<(), SystemError> {
-    match inode.removexattr(XATTR_SECURITY_CAPABILITY) {
-        Ok(_) | Err(SystemError::ENODATA) => Ok(()),
-        Err(err) if is_unsupported(&err) => Ok(()),
-        Err(err) => Err(err),
+    inode.remove_security_privileges()
+}
+
+/// Internal killpriv for a stacked overlay backing. Keep copy-up and backing
+/// credentials, but do not turn privilege removal into a CAP_SETFCAP request.
+pub(super) fn remove_security_privileges(inode: &OvlInode) -> Result<(), SystemError> {
+    let fs = inode.overlay_fs()?;
+    let _privilege_guard = inode.content_privilege_lock.lock();
+    if !inode.has_upper() {
+        let _cred_guard = CredOverrideGuard::new(fs.backing_cred.clone())?;
+        match inode
+            .current_realdata_inode()?
+            .0
+            .getxattr(XATTR_SECURITY_CAPABILITY, &mut [])
+        {
+            Err(SystemError::ENODATA) => return Ok(()),
+            Err(error) if is_unsupported(&error) => return Ok(()),
+            Err(error) => return Err(error),
+            Ok(_) => {}
+        }
     }
+    inode.copy_up_locked()?;
+    let upper = inode.upper_inode.lock().clone().ok_or(SystemError::EIO)?;
+    let _content_guard = fs.content_lock(&upper)?.lock();
+    let _cred_guard = CredOverrideGuard::new(fs.backing_cred.clone())?;
+    upper.remove_security_privileges()
 }
 
 fn metadata_change_kills_capability(mask: SetMetadataMask) -> bool {

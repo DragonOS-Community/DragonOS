@@ -8,6 +8,7 @@ use crate::{
             is_mountpoint_root, with_topology_snapshot, MountFSInode, MountFlags,
             MOUNT_LIFECYCLE_LOCK,
         },
+        mount_api::reconfigure::prepare_reconfigure_locked,
         produce_fs,
         utils::user_path_at,
         FileType, FsReconfigureRequest, IndexNode, MountFS, MAX_PATHLEN,
@@ -292,14 +293,22 @@ fn path_mount(
     }
 
     // Create a new mount
-    return do_new_mount(source, target_inode, filesystemtype, data, mnt_flags).map(|_| ());
+    return do_new_mount(
+        source,
+        target_inode,
+        filesystemtype,
+        data,
+        sb_flags,
+        mnt_flags,
+    )
+    .map(|_| ());
 }
 
 /// Modify the mount flags of an existing mount.
 ///
 /// Linux has two independent paths:
 /// - do_reconfigure_mnt(): MS_REMOUNT|MS_BIND, down_read(sb), only changes mount flags ← this function
-/// - do_remount(): MS_REMOUNT alone, down_write(sb) + reconfigure_super() + set_mount_attributes() ← TODO
+/// - do_remount(): MS_REMOUNT alone, down_write(sb) + reconfigure_super() + set_mount_attributes()
 fn do_reconfigure_bind_mount(
     target_inode: Arc<dyn IndexNode>,
     requested_flags: MountFlags,
@@ -319,6 +328,8 @@ fn do_reconfigure_bind_mount(
         return Err(SystemError::EINVAL);
     }
 
+    let superblock = target_mfs.super_block_state();
+    let _umount = superblock.umount_read();
     // Preserve unmodifiable flags, only overwrite SETTABLE bits.
     let _topology = MOUNT_LIFECYCLE_LOCK.lock();
     if !target_mfs.is_live() || !target_mfs.is_belongs_to_mntns(&current_mntns) {
@@ -327,11 +338,15 @@ fn do_reconfigure_bind_mount(
     if !target_mfs.can_reconfigure_mount_flags(requested_flags) {
         return Err(SystemError::EPERM);
     }
-    target_mfs.update_mount_flags(|mount_flags| {
-        let preserved = *mount_flags & !MountFlags::MNT_USER_SETTABLE_MASK;
-        let new_settable = requested_flags & MountFlags::MNT_USER_SETTABLE_MASK;
-        *mount_flags = preserved | new_settable;
-    });
+    let new_flags = (target_mfs.mount_flags() & !MountFlags::MNT_USER_SETTABLE_MASK)
+        | (requested_flags & MountFlags::MNT_USER_SETTABLE_MASK);
+    if new_flags.contains(MountFlags::RDONLY) && !target_mfs.is_readonly() {
+        // Check this mount, not the SB total: a writable sibling bind remains
+        // legal when this particular entry becomes read-only.
+        target_mfs.try_hold_writers()?.commit_mount_flags(new_flags);
+    } else {
+        target_mfs.set_mount_flags(new_flags);
+    }
 
     Ok(())
 }
@@ -384,28 +399,22 @@ fn do_remount(
     let requested_sb_flags = (requested_sb_flags & !data_sb_flags_mask) | data_sb_flags;
     let new_sb_flags = (old_sb_flags & !sb_flags_mask) | (requested_sb_flags & sb_flags_mask);
 
-    if new_sb_flags.contains(MountFlags::RDONLY)
-        && !old_sb_flags.contains(MountFlags::RDONLY)
-        && target_mfs.has_writers()
-    {
-        return Err(SystemError::EBUSY);
-    }
-
-    let effective_sb_flags = target_mfs
-        .inner_filesystem()
-        .reconfigure(FsReconfigureRequest {
+    let prepared = prepare_reconfigure_locked(
+        &target_mfs,
+        FsReconfigureRequest {
             sb_flags: new_sb_flags,
             sb_flags_mask,
             raw_data: fs_private_data.as_deref(),
             oldapi: true,
-        })?;
+        },
+    )?;
 
     let _topology = MOUNT_LIFECYCLE_LOCK.lock();
     // reconfigure() may already have committed filesystem-private state. A
     // concurrent lazy detach must not turn that successful operation into a
     // partial-commit error; the SB write guard keeps final shutdown out until
     // the paired flag publication completes.
-    target_mfs.set_super_block_flags(effective_sb_flags);
+    prepared.commit();
     target_mfs.update_mount_flags(|mount_flags| {
         let preserved = *mount_flags & !MountFlags::MNT_USER_SETTABLE_MASK;
         let new_settable = requested_mnt_flags & MountFlags::MNT_USER_SETTABLE_MASK;
@@ -482,9 +491,11 @@ fn do_new_mount(
     target_inode: Arc<dyn IndexNode>,
     filesystemtype: Option<String>,
     data: Option<String>,
+    superblock_flags: MountFlags,
     mount_flags: MountFlags,
 ) -> Result<Arc<MountFS>, SystemError> {
     let fs_type_str = filesystemtype.ok_or(SystemError::EINVAL)?;
+    let creation_flags = superblock_flags | mount_flags;
     loop {
         // Linux accepts a NULL source for nodev filesystems. Keep an
         // explicitly supplied empty string distinct from the display name.
@@ -492,7 +503,7 @@ fn do_new_mount(
             &fs_type_str,
             data.as_deref(),
             source.as_deref().unwrap_or(""),
-            mount_flags,
+            creation_flags,
         )
         .inspect_err(|e| {
             log::warn!("Failed to produce filesystem: {:?}", e);
@@ -514,14 +525,14 @@ fn do_new_mount(
             to_mount_fs.clone(),
             root_inner_inode,
             None,
-            mount_flags,
+            creation_flags,
             None,
             None,
         ) {
             Ok(prepared) => prepared,
             Err(SystemError::ESTALE)
                 if to_mount_fs
-                    .shared_mount_superblock_state(mount_flags)
+                    .shared_mount_superblock_state(creation_flags)
                     .is_some_and(|state| state.shutdown_started()) =>
             {
                 // The last unmount beat this construction reservation. No
@@ -531,6 +542,9 @@ fn do_new_mount(
             }
             Err(error) => return Err(error),
         };
+        // This construction has not been published: the SB has consumed its
+        // own flags, and the mount entry must retain only entry attributes.
+        prepared.set_mount_flags(mount_flags);
         prepared.set_mount_source(Some(source.clone().unwrap_or_else(|| String::from("none"))));
         if let Err(error) = mnt_inode.publish_prepared_subtree(&prepared) {
             MountFS::deactivate_disconnected_subtree(&prepared);

@@ -13,7 +13,7 @@ use alloc::{
 use core::cmp::Ordering;
 use core::intrinsics::unlikely;
 use core::num::NonZeroUsize;
-use core::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 
 #[derive(Debug, Default)]
 struct FATReclaimQueue {
@@ -150,6 +150,9 @@ pub struct FATFileSystem {
     /// because writeback for different files can run concurrently and select
     /// the same free entry.  This mirrors Linux's `msdos_sb_info::fat_lock`.
     fat_lock: Mutex<()>,
+    /// Invalidates allocation statistics when any FAT chain edge changes.
+    /// Saturation disables memoization rather than allowing stamp reuse.
+    fat_chain_generation: AtomicU64,
     /// 目录项扇区读-改-写串行化锁。
     ///
     /// FAT 的 `ShortDirEntry`/`LongDirEntry` 只占 32 字节，而底层 gendisk 的写入粒度是
@@ -207,6 +210,8 @@ pub struct FATInode {
     negative_children: LruCache<String, ()>,
     /// 当前inode的元数据
     metadata: Metadata,
+    /// Successful allocation scan: (chain generation, first cluster, sectors).
+    allocated_blocks_cache: Option<(u64, ClusterID, usize)>,
     /// 指向inode所在的文件系统对象的指针
     fs: Weak<FATFileSystem>,
 
@@ -232,6 +237,70 @@ impl Debug for FATInode {
 }
 
 impl FATInode {
+    fn metadata_with_allocated_blocks(&mut self) -> Result<Metadata, SystemError> {
+        let mut metadata = self.metadata.clone();
+        if !matches!(metadata.file_type, FileType::File | FileType::Dir) {
+            metadata.blocks = 0;
+            return Ok(metadata);
+        }
+        let fs = self.fs.upgrade().ok_or(SystemError::EIO)?;
+        metadata.blocks = match &self.inode_type {
+            FATDirEntry::File(file) | FATDirEntry::VolId(file) => {
+                // Cached logical EOF may grow before buffered writeback has
+                // allocated a chain. Only a nonempty disk dirent with no
+                // first cluster proves corruption.
+                if file.first_cluster.cluster_num == 0 && file.size() != 0 {
+                    return Err(SystemError::EIO);
+                }
+                let head = file.first_cluster;
+                self.cached_chain_sectors(&fs, head)?
+            }
+            FATDirEntry::Dir(dir) if dir.root_offset.is_some() => {
+                let bytes = (fs.bpb.root_entries_cnt as u64)
+                    .checked_mul(32)
+                    .ok_or(SystemError::EOVERFLOW)?;
+                // Linux fat_read_root reports its fixed root area rounded to
+                // cluster size, even though FAT12/16 has no root chain.
+                let cluster_bytes = fs.bytes_per_cluster();
+                let allocated_bytes = bytes
+                    .div_ceil(cluster_bytes)
+                    .checked_mul(cluster_bytes)
+                    .ok_or(SystemError::EOVERFLOW)?;
+                usize::try_from(allocated_bytes / 512).map_err(|_| SystemError::EOVERFLOW)?
+            }
+            FATDirEntry::Dir(dir) => {
+                if dir.first_cluster.cluster_num == 0 {
+                    return Err(SystemError::EIO);
+                }
+                let head = dir.first_cluster;
+                self.cached_chain_sectors(&fs, head)?
+            }
+            FATDirEntry::UnInit => return Err(SystemError::EIO),
+        };
+        Ok(metadata)
+    }
+
+    fn cached_chain_sectors(
+        &mut self,
+        fs: &FATFileSystem,
+        head: Cluster,
+    ) -> Result<usize, SystemError> {
+        if head.cluster_num == 0 {
+            return Ok(0);
+        }
+        let generation = fs.fat_chain_generation.load(AtomicOrdering::Acquire);
+        if generation != u64::MAX {
+            if let Some((stamp, first, sectors)) = self.allocated_blocks_cache {
+                if stamp == generation && first == head.cluster_num {
+                    return Ok(sectors);
+                }
+            }
+        }
+        let (generation, sectors) = fs.allocated_chain_sectors(head)?;
+        self.allocated_blocks_cache =
+            (generation != u64::MAX).then_some((generation, head.cluster_num, sectors));
+        Ok(sectors)
+    }
     /// 将inode的元数据与磁盘同步
     pub fn synchronize_metadata(&mut self) {
         match &self.inode_type {
@@ -355,11 +424,7 @@ impl LockedFATInode {
                     inode_id: generate_inode_id(),
                     size: 0,
                     blk_size: fs.bpb.bytes_per_sector as usize,
-                    blocks: if let FATType::FAT32(_) = fs.bpb.fat_type {
-                        fs.bpb.total_sectors_32 as usize
-                    } else {
-                        fs.bpb.total_sectors_16 as usize
-                    },
+                    blocks: 0,
                     atime: PosixTimeSpec::default(),
                     mtime: PosixTimeSpec::default(),
                     ctime: PosixTimeSpec::default(),
@@ -372,6 +437,7 @@ impl LockedFATInode {
                     gid: 0,
                     raw_dev: DeviceNumber::default(),
                 },
+                allocated_blocks_cache: None,
                 special_node: None,
                 dname,
                 page_cache: None,
@@ -959,11 +1025,7 @@ impl FATFileSystem {
                     inode_id: generate_inode_id(),
                     size: 0,
                     blk_size: bpb.bytes_per_sector as usize,
-                    blocks: if let FATType::FAT32(_) = bpb.fat_type {
-                        bpb.total_sectors_32 as usize
-                    } else {
-                        bpb.total_sectors_16 as usize
-                    },
+                    blocks: 0,
                     atime: PosixTimeSpec::default(),
                     mtime: PosixTimeSpec::default(),
                     ctime: PosixTimeSpec::default(),
@@ -976,6 +1038,7 @@ impl FATFileSystem {
                     gid: 0,
                     raw_dev: DeviceNumber::default(),
                 },
+                allocated_blocks_cache: None,
                 special_node: None,
                 dname: DName::default(),
                 page_cache: None,
@@ -1000,6 +1063,7 @@ impl FATFileSystem {
                 NonZeroUsize::new(FAT_LRU_CACHE_SIZE).unwrap(),
             )),
             fat_lock: Mutex::new(()),
+            fat_chain_generation: AtomicU64::new(0),
             dirent_io_lock: Mutex::new(()),
         });
 
@@ -1619,6 +1683,32 @@ impl FATFileSystem {
             .fold(0, |size, _cluster| size + 1);
     }
 
+    /// Ordinary metadata may read the device. Keep inode -> FAT lock order
+    /// and reject malformed chains instead of swallowing iterator I/O errors.
+    fn allocated_chain_sectors(&self, mut cluster: Cluster) -> Result<(u64, usize), SystemError> {
+        let _fat = self.fat_lock.lock();
+        let generation = self.fat_chain_generation.load(AtomicOrdering::Acquire);
+        let max = self.max_cluster_number().cluster_num;
+        let limit = max.checked_sub(1).ok_or(SystemError::EIO)?;
+        let mut count = 0u64;
+        loop {
+            if cluster.cluster_num < 2 || cluster.cluster_num > max || count >= limit {
+                return Err(SystemError::EIO);
+            }
+            count = count.checked_add(1).ok_or(SystemError::EOVERFLOW)?;
+            match self.get_fat_entry(cluster)? {
+                FATEntry::EndOfChain => break,
+                FATEntry::Next(next) => cluster = next,
+                FATEntry::Unused | FATEntry::Bad => return Err(SystemError::EIO),
+            }
+        }
+        let bytes = count
+            .checked_mul(self.bytes_per_cluster())
+            .ok_or(SystemError::EOVERFLOW)?;
+        let sectors = usize::try_from(bytes / 512).map_err(|_| SystemError::EOVERFLOW)?;
+        Ok((generation, sectors))
+    }
+
     /// Return the number of clusters and the tail in one FAT traversal.
     pub fn chain_len_and_tail(&self, start_cluster: Cluster) -> Option<(u64, Cluster)> {
         let mut count = 0;
@@ -1909,7 +1999,17 @@ impl FATFileSystem {
     ///
     /// @param cluster 目标簇
     /// @param fat_entry 这个簇在FAT表中，存储的信息（下一个簇的簇号）
-    pub fn set_entry(&self, cluster: Cluster, fat_entry: FATEntry) -> Result<(), SystemError> {
+    /// Data-chain callers (cluster >= 2) must hold `fat_lock`; reserved
+    /// volume-status entries do not participate in allocation statistics.
+    fn set_entry(&self, cluster: Cluster, fat_entry: FATEntry) -> Result<(), SystemError> {
+        if cluster.cluster_num >= RESERVED_CLUSTERS as u64 {
+            // Chain callers hold fat_lock. Invalidate before any device write:
+            // an error can leave a changed primary or only some mirror copies.
+            let generation = self.fat_chain_generation.load(AtomicOrdering::Relaxed);
+            self.fat_chain_generation
+                .store(generation.saturating_add(1), AtomicOrdering::Release);
+            self.fat_cache.lock().pop(&cluster.cluster_num);
+        }
         let cache_val = Self::fat_cache_encode(&fat_entry);
         // fat表项在分区上的字节偏移量
         let fat_part_bytes_offset: u64 = self.bpb.fat_type.get_fat_bytes_offset(
@@ -2497,7 +2597,7 @@ impl IndexNode for LockedFATInode {
     }
 
     fn metadata(&self) -> Result<Metadata, SystemError> {
-        return Ok(self.0.lock().metadata.clone());
+        self.0.lock().metadata_with_allocated_blocks()
     }
     fn set_metadata(&self, metadata: &Metadata) -> Result<(), SystemError> {
         let inode = &mut self.0.lock();

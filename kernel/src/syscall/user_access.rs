@@ -501,6 +501,21 @@ impl UserBufferReader<'_> {
         Ok(dst.len())
     }
 
+    /// Copy a write payload, preserving the prefix actually copied before a
+    /// user fault. Existing all-or-error copy APIs keep their original contract.
+    pub fn copy_from_user_prefix(
+        &self,
+        dst: &mut [u8],
+        offset: usize,
+    ) -> Result<usize, SystemError> {
+        checked_user_range(self.buffer.len(), offset, dst.len())?;
+        if dst.is_empty() {
+            return Ok(0);
+        }
+        let src = VirtAddr::new(self.buffer.as_ptr() as usize + offset);
+        unsafe { copy_from_user_prefix_protected(dst, src) }
+    }
+
     /// Copy data from user space with page mapping and permission verification
     ///
     /// This function verifies that the pages are mapped AND have the required permissions,
@@ -1065,6 +1080,34 @@ pub unsafe fn copy_from_user_protected(
     match result {
         0 => Ok(len),
         _ => Err(SystemError::EFAULT),
+    }
+}
+
+/// A write-stage-only variant of protected copying. Never infer successfully
+/// copied bytes from a VMA snapshot on architectures with faulting user access.
+unsafe fn copy_from_user_prefix_protected(
+    dst: &mut [u8],
+    src: VirtAddr,
+) -> Result<usize, SystemError> {
+    access_ok(src, dst.len()).map_err(|_| SystemError::EFAULT)?;
+    let len = if MMArch::PAGE_FAULT_ENABLED {
+        dst.len()
+    } else {
+        // Non-faulting architectures still need mapping/prefault admission,
+        // but only at the actual copy stage, after file privilege removal.
+        user_accessible_len(src, dst.len(), false)
+    };
+    if len == 0 {
+        return Err(SystemError::EFAULT);
+    }
+    prefault_user_range(src, len, false)?;
+    let remaining =
+        MMArch::copy_with_exception_table(dst.as_mut_ptr(), src.data() as *const u8, len);
+    let copied = len.saturating_sub(remaining);
+    if copied == 0 {
+        Err(SystemError::EFAULT)
+    } else {
+        Ok(copied)
     }
 }
 

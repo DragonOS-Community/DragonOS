@@ -249,19 +249,24 @@ impl Extent {
 
     /// Check whether the `ex2` extent can be appended to the `ex1` extent
     pub fn can_append(ex1: &Extent, ex2: &Extent) -> bool {
-        if ex1.start_pblock() + ex1.block_count() as u64 != ex2.start_pblock() {
+        if ex1.is_unwritten() != ex2.is_unwritten()
+            || ex1.block_count() == 0
+            || ex2.block_count() == 0
+        {
             return false;
         }
-        if ex1.is_unwritten() && ex1.block_count() + ex2.block_count() > 65535 as LBlockId {
+        let Some(count) = ex1.block_count().checked_add(ex2.block_count()) else {
             return false;
-        }
-        if ex1.block_count() + ex2.block_count() > Self::INIT_MAX_LEN as LBlockId {
-            return false;
-        }
-        if ex1.first_block + ex1.block_count() != ex2.first_block {
-            return false;
-        }
-        true
+        };
+        let max = Self::INIT_MAX_LEN as LBlockId - u32::from(ex1.is_unwritten());
+        count <= max
+            && ex1.start_lblock().checked_add(ex1.block_count()) == Some(ex2.start_lblock())
+            && ex1.start_lblock().checked_add(count).is_some()
+            && ex1.start_pblock().checked_add(ex1.block_count() as u64) == Some(ex2.start_pblock())
+            && ex1
+                .start_pblock()
+                .checked_add(count as u64)
+                .is_some_and(|end| end <= 1 << 48)
     }
 }
 
@@ -347,6 +352,22 @@ impl<'a> ExtentNode<'a> {
 
         // debug!("Search res: {:?}", res);
         Err(i)
+    }
+
+    /// Find physical coverage, including unwritten extents. Unlike read lookup,
+    /// an unwritten extent owns blocks and must not be treated as an empty slot.
+    /// The caller validates the node's ordering and extent lengths first.
+    pub fn search_allocated_extent(&self, lblock: LBlockId) -> core::result::Result<usize, usize> {
+        for index in 0..self.header().entries_count() as usize {
+            let extent = self.extent_at(index);
+            let Some(offset) = lblock.checked_sub(extent.start_lblock()) else {
+                return Err(index);
+            };
+            if offset < extent.block_count() {
+                return Ok(index);
+            }
+        }
+        Err(self.header().entries_count() as usize)
     }
 
     /// Find the extent index that covers the given logical block number. The extent index
@@ -512,16 +533,7 @@ impl<'a> ExtentNodeMut<'a> {
         }
         // The position has a valid extent or is at the end
         if self.header().entries_count() < self.header().max_entries_count() {
-            // The extent node is not full
-            // Insert the extent and move the following extents
-            let mut i = self.header().entries_count() as usize;
-            while i > pos {
-                *self.extent_mut_at(i) = *self.extent_at(i - 1);
-                i -= 1;
-            }
-            *self.extent_mut_at(pos) = *extent;
-            self.header_mut().entries_count += 1;
-            return Ok(());
+            return self.insert_extent_preserving(extent, pos);
         }
         // The extent node is full
         // There may be some unwritten extents, we could find the first
@@ -553,7 +565,28 @@ impl<'a> ExtentNodeMut<'a> {
             *self.extent_mut_at(pos) = *extent;
             return Ok(());
         }
-        // The extent node is full and all extents are valid
+        self.insert_extent_preserving(extent, pos)
+    }
+
+    /// Insert at a validated, non-overlapping leaf position without replacing
+    /// any allocation (including unwritten extents). A full node returns its
+    /// right half using the same split contract as `insert_extent`.
+    pub fn insert_extent_preserving(
+        &mut self,
+        extent: &Extent,
+        pos: usize,
+    ) -> core::result::Result<(), Vec<FakeExtent>> {
+        if self.header().entries_count() < self.header().max_entries_count() {
+            let mut index = self.header().entries_count() as usize;
+            while index > pos {
+                *self.extent_mut_at(index) = *self.extent_at(index - 1);
+                index -= 1;
+            }
+            *self.extent_mut_at(pos) = *extent;
+            self.header_mut().entries_count += 1;
+            return Ok(());
+        }
+        // All physical mappings remain valid, even when they read as zeros.
         // Split the node, return the extents in the right half
         let mut split = Vec::new();
         let mid = self.header().entries_count() as usize * 2 / 3;
@@ -571,7 +604,8 @@ impl<'a> ExtentNodeMut<'a> {
         self.header_mut().entries_count = mid as u16;
         // If `pos` is on the left side, insert it
         if pos < mid {
-            self.insert_extent(extent, pos).expect("Must Succeed");
+            self.insert_extent_preserving(extent, pos)
+                .expect("Must Succeed");
         }
         // Return the right half
         Err(split)
@@ -630,6 +664,164 @@ impl<'a> ExtentNodeMut<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn unwritten(start: u32, physical: u64, count: u16) -> Extent {
+        let mut extent = Extent::new(start, physical, count);
+        extent.mark_unwritten();
+        extent
+    }
+
+    #[test]
+    fn allocated_lookup_preserves_unwritten_coverage_and_read_classification() {
+        let mut raw = [0u8; 60];
+        let mut node = ExtentNodeMut::from_bytes(&mut raw);
+        node.init(0, 0);
+        node.insert_extent_preserving(&unwritten(10, 100, 3), 0)
+            .unwrap();
+        node.insert_extent_preserving(&Extent::new(15, 200, 2), 1)
+            .unwrap();
+        let node = ExtentNode::from_bytes(&raw);
+        for block in 10..13 {
+            assert_eq!(node.search_allocated_extent(block), Ok(0));
+            assert_eq!(node.search_extent(block), Err(0));
+        }
+        assert_eq!(node.search_allocated_extent(9), Err(0));
+        assert_eq!(node.search_allocated_extent(13), Err(1));
+        assert_eq!(node.search_allocated_extent(14), Err(1));
+        assert_eq!(node.search_allocated_extent(15), Ok(1));
+        assert_eq!(node.search_allocated_extent(16), Ok(1));
+        assert_eq!(node.search_allocated_extent(17), Err(2));
+    }
+
+    #[test]
+    fn preserving_insert_keeps_unwritten_entries_before_and_after_position() {
+        for position in 0..=2 {
+            let mut raw = [0u8; 60];
+            let mut node = ExtentNodeMut::from_bytes(&mut raw);
+            node.init(0, 0);
+            node.insert_extent_preserving(&unwritten(2, 100, 1), 0)
+                .unwrap();
+            node.insert_extent_preserving(&unwritten(6, 200, 1), 1)
+                .unwrap();
+            let logical = [0, 4, 8][position];
+            node.insert_extent_preserving(&Extent::new(logical, 300, 1), position)
+                .unwrap();
+            assert_eq!(node.header().entries_count(), 3);
+            let entries: Vec<_> = (0..3).map(|i| *node.extent_at(i)).collect();
+            assert!(entries
+                .windows(2)
+                .all(|pair| pair[0].start_lblock() < pair[1].start_lblock()));
+            assert_eq!(
+                entries
+                    .iter()
+                    .filter(|extent| extent.is_unwritten())
+                    .count(),
+                2
+            );
+            assert!(entries.iter().any(|extent| extent.start_pblock() == 100));
+            assert!(entries.iter().any(|extent| extent.start_pblock() == 200));
+        }
+    }
+
+    #[test]
+    fn full_preserving_insert_splits_without_discarding_unwritten_allocations() {
+        for position in 0..=4 {
+            let mut raw = [0u8; 60];
+            let mut node = ExtentNodeMut::from_bytes(&mut raw);
+            node.init(0, 0);
+            for index in 0..4 {
+                node.insert_extent_preserving(
+                    &unwritten(2 + index as u32 * 4, 100 + index as u64, 1),
+                    index,
+                )
+                .unwrap();
+            }
+            let logical = position as u32 * 4;
+            let split = node
+                .insert_extent_preserving(&Extent::new(logical, 300, 1), position)
+                .unwrap_err();
+            let mut entries: Vec<Extent> = (0..node.header().entries_count() as usize)
+                .map(|index| *node.extent_at(index))
+                .collect();
+            entries.extend(
+                split
+                    .into_iter()
+                    .map(|entry| unsafe { mem::transmute::<FakeExtent, Extent>(entry) }),
+            );
+            assert_eq!(entries.len(), 5);
+            assert!(entries
+                .windows(2)
+                .all(|pair| pair[0].start_lblock() < pair[1].start_lblock()));
+            assert_eq!(
+                entries
+                    .iter()
+                    .filter(|extent| extent.is_unwritten())
+                    .count(),
+                4
+            );
+            for physical in 100..104 {
+                assert_eq!(
+                    entries
+                        .iter()
+                        .filter(|extent| extent.start_pblock() == physical)
+                        .count(),
+                    1
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn merge_requires_same_state_checked_adjacency_and_state_length_limit() {
+        assert!(Extent::can_append(
+            &Extent::new(0, 100, 32767),
+            &Extent::new(32767, 32867, 1)
+        ));
+        assert!(!Extent::can_append(
+            &Extent::new(0, 100, 32768),
+            &Extent::new(32768, 32868, 1)
+        ));
+        assert!(Extent::can_append(
+            &unwritten(0, 100, 32766),
+            &unwritten(32766, 32866, 1)
+        ));
+        assert!(!Extent::can_append(
+            &unwritten(0, 100, 32767),
+            &unwritten(32767, 32867, 1)
+        ));
+        assert!(!Extent::can_append(
+            &Extent::new(0, 100, 1),
+            &unwritten(1, 101, 1)
+        ));
+        assert!(!Extent::can_append(
+            &unwritten(0, 100, 1),
+            &Extent::new(1, 101, 1)
+        ));
+        assert!(!Extent::can_append(
+            &Extent::new(0, 100, 1),
+            &Extent::new(2, 101, 1)
+        ));
+        assert!(!Extent::can_append(
+            &Extent::new(0, 100, 1),
+            &Extent::new(1, 102, 1)
+        ));
+        assert!(!Extent::can_append(
+            &Extent::new(u32::MAX, 100, 1),
+            &Extent::new(0, 101, 1)
+        ));
+        assert!(!Extent::can_append(
+            &Extent::new(u32::MAX - 1, 100, 1),
+            &Extent::new(u32::MAX, 101, 1)
+        ));
+        assert!(!Extent::can_append(
+            &Extent::new(0, (1 << 48) - 2, 1),
+            &Extent::new(1, (1 << 48) - 1, 2)
+        ));
+        assert!(!Extent::can_append(
+            &Extent::new(0, 100, 0),
+            &Extent::new(0, 100, 1)
+        ));
+    }
 
     #[test]
     fn extent_header_magic_check_works() {

@@ -120,6 +120,15 @@ fn migrate_virtual_filesystem(
         old_mntfs.mount_source(),
     )?;
 
+    // Normal inode mutations require a live mount to retain their writer pin.
+    // Activate the initialized replacement before creating missing mountpoints;
+    // this does not publish it as the namespace root. Do not retain the topology
+    // lock across mkdir/mount_from, which acquire their own lifecycle guards.
+    {
+        let _topology = MOUNT_LIFECYCLE_LOCK.lock();
+        new_fs.activate()?;
+    }
+
     // 获取新的根文件系统的根节点的引用
     let new_root_inode = new_fs.root_inode();
     // ==== 在这里获取要被迁移的文件系统的inode并迁移 ===
@@ -143,9 +152,6 @@ fn migrate_virtual_filesystem(
 
     {
         let _topology = MOUNT_LIFECYCLE_LOCK.lock();
-        new_fs
-            .activate()
-            .expect("the replacement root mount is published exactly once");
         current_mntns.force_change_root_mountfs(new_fs, root_attachment);
     }
 
@@ -782,23 +788,25 @@ fn vfs_truncate_inner<F>(
     do_resize: F,
 ) -> Result<(), SystemError>
 where
-    F: FnOnce(&Arc<dyn IndexNode>, &Metadata, SetMetadataMask) -> Result<(), SystemError>,
+    F: FnOnce(
+        &Arc<dyn IndexNode>,
+        &Metadata,
+        SetMetadataMask,
+    ) -> Result<SetMetadataMask, SystemError>,
 {
     let md = inode.metadata()?;
 
     validate_truncate(&inode, &md, len)?;
     let _write_access = super::write_access::InodeWriteGuard::writer(inode.clone())?;
     let (md, mask) = prepare_write_side_effect_metadata(md, len);
-    let r = do_resize(&inode, &md, mask);
-    if r.is_ok() {
-        let mut event = FsEvent::MODIFY;
-        if mask.contains(SetMetadataMask::MODE) {
-            // notify_change emits one combined event for ATTR_SIZE|ATTR_MODE.
-            event |= FsEvent::ATTRIB;
-        }
-        fsnotify::fsnotify_inode(event, &inode);
+    let applied = do_resize(&inode, &md, mask)?;
+    let mut event = FsEvent::MODIFY;
+    if applied.contains(SetMetadataMask::MODE) {
+        // notify_change emits one combined event for ATTR_SIZE|ATTR_MODE.
+        event |= FsEvent::ATTRIB;
     }
-    r
+    fsnotify::fsnotify_inode(event, &inode);
+    Ok(())
 }
 
 fn validate_truncate(
@@ -867,18 +875,79 @@ pub(crate) fn vfs_open_truncate(
 ) -> Result<(), SystemError> {
     let inode = file.inode();
     validate_truncate(&inode, &context.requested, 0)?;
-    inode.resize_open_truncate(
+    let applied = inode.resize_open_truncate_result(
         0,
         current_file_lock_owner_id(),
         file.private_data.lock(),
         context,
     )?;
     let mut event = FsEvent::MODIFY;
-    if context.mask.contains(SetMetadataMask::MODE) {
+    if applied.contains(SetMetadataMask::MODE) {
         event |= FsEvent::ATTRIB;
     }
     file.notify_dentry_event(event);
     Ok(())
+}
+
+/// Derive write-side mode changes from the commit-stage snapshot, not an old
+/// pathname snapshot which could restore bits changed by concurrent chmod.
+pub(crate) fn prepare_backing_resize_metadata(
+    context: &super::permission::InodeOpContext,
+    raw: &Metadata,
+    requested: &Metadata,
+    mut mask: SetMetadataMask,
+    len: usize,
+) -> Result<(Metadata, SetMetadataMask), SystemError> {
+    let view = context.view_metadata(raw);
+    context.validate_size_mapping(&view)?;
+    let mut requested = requested.clone();
+    if mask.contains(SetMetadataMask::WRITE_SIDE_EFFECT) {
+        if let Some(cred) = &context.cred {
+            let (derived, derived_mask) =
+                prepare_write_side_effect_metadata_with_cred(view, len, cred);
+            requested.mode = derived.mode;
+            if mask.contains(SetMetadataMask::MTIME) {
+                requested.mtime = derived.mtime;
+            }
+            if mask.contains(SetMetadataMask::CTIME) {
+                requested.ctime = derived.ctime;
+            }
+            mask.remove(SetMetadataMask::MODE);
+            mask |= derived_mask & SetMetadataMask::MODE;
+        }
+        mask.insert(SetMetadataMask::KILL_PRIV);
+    }
+    let mut backing = context.backing_metadata_request(raw, &requested, mask)?;
+    backing.size = len as i64;
+    Ok((backing, mask))
+}
+
+/// Fallocate's internal size update is not a user ATTR_SIZE request. Only
+/// actual mode/capability removal goes through notify_change mapping checks.
+pub(crate) fn prepare_backing_fallocate_metadata(
+    context: &super::permission::InodeOpContext,
+    raw: &Metadata,
+    size: usize,
+    kill_capability: bool,
+) -> Result<(Metadata, SetMetadataMask), SystemError> {
+    let view = context.view_metadata(raw);
+    let cred = context.cred.as_ref().ok_or(SystemError::EINVAL)?;
+    let (requested, mut mask) =
+        prepare_write_side_effect_metadata_with_cred(view.clone(), size, cred);
+    if kill_capability {
+        mask.insert(SetMetadataMask::KILL_PRIV);
+    }
+    if mask.intersects(SetMetadataMask::MODE | SetMetadataMask::KILL_PRIV) {
+        context.validate_setattr_mapping(
+            &view,
+            &view,
+            mask & (SetMetadataMask::MODE | SetMetadataMask::KILL_PRIV),
+        )?;
+    }
+    let mut backing = raw.clone();
+    super::merge_metadata_masked(&mut backing, &requested, mask);
+    backing.size = size as i64;
+    Ok((backing, mask))
 }
 
 pub(crate) fn prepare_write_side_effect_metadata_with_cred(
@@ -893,14 +962,19 @@ pub(crate) fn prepare_write_side_effect_metadata_with_cred(
     let mut mask =
         SetMetadataMask::MTIME | SetMetadataMask::CTIME | SetMetadataMask::WRITE_SIDE_EFFECT;
 
-    if !cred.has_capability(CAPFlags::CAP_FSETID)
-        && md.file_type == FileType::File
+    if !cred.has_capability_in_ns(
+        &crate::process::namespace::user_namespace::INIT_USER_NAMESPACE,
+        CAPFlags::CAP_FSETID,
+    ) && md.file_type == FileType::File
         && md.mode.intersects(InodeMode::S_ISUID | InodeMode::S_ISGID)
     {
         let original_mode = md.mode;
         md.mode.remove(InodeMode::S_ISUID);
 
-        if should_remove_sgid(md.mode, md.gid, cred) {
+        if md.mode.contains(InodeMode::S_IXGRP)
+            || (should_remove_sgid(md.mode, md.gid, cred)
+                && !cred.has_capability_wrt_inode_uidgid(&md, CAPFlags::CAP_FSETID))
+        {
             md.mode.remove(InodeMode::S_ISGID);
         }
 
@@ -919,7 +993,7 @@ pub(crate) fn prepare_write_side_effect_metadata_with_cred(
 pub fn vfs_truncate(inode: Arc<dyn IndexNode>, len: usize) -> Result<(), SystemError> {
     let lock_owner = current_file_lock_owner_id();
     vfs_truncate_inner(inode, len, |inode, metadata, mask| {
-        inode.resize_with_metadata(len, lock_owner, metadata, mask)
+        inode.resize_with_metadata_result(len, lock_owner, metadata, mask)
     })
 }
 
@@ -932,7 +1006,7 @@ pub fn vfs_truncate_file<'a>(
     data: impl FnOnce() -> MutexGuard<'a, FilePrivateData>,
 ) -> Result<(), SystemError> {
     vfs_truncate_inner(inode, len, |inode, metadata, mask| {
-        inode.resize_file_with_metadata(len, lock_owner, data(), metadata, mask)
+        inode.resize_file_with_metadata_result(len, lock_owner, data(), metadata, mask)
     })
 }
 
@@ -960,6 +1034,26 @@ pub fn resize_based_fallocate(
     lock_owner: u64,
     attrib: &mut super::AttribStageObserver<'_>,
 ) -> Result<(), SystemError> {
+    resize_based_fallocate_with_context(
+        inode,
+        mode,
+        offset,
+        len,
+        lock_owner,
+        attrib,
+        &super::permission::InodeOpContext::legacy(),
+    )
+}
+
+pub fn resize_based_fallocate_with_context(
+    inode: &dyn IndexNode,
+    mode: i32,
+    offset: usize,
+    len: usize,
+    lock_owner: u64,
+    attrib: &mut super::AttribStageObserver<'_>,
+    context: &super::permission::InodeOpContext,
+) -> Result<(), SystemError> {
     if mode != 0 {
         return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
     }
@@ -981,7 +1075,8 @@ pub fn resize_based_fallocate(
     // The filesystem re-reads size and metadata inside its native mutation
     // lock. A VFS snapshot cannot safely decide whether a concurrent grow has
     // already satisfied the request or which privilege bits remain to clear.
-    let mask = inode.fallocate_resize_atomic(offset, new_size, lock_owner)?;
+    let mask =
+        inode.fallocate_resize_atomic_with_inode_context(offset, new_size, lock_owner, context)?;
     if mask.contains(SetMetadataMask::MODE) {
         attrib.commit();
     }

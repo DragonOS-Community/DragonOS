@@ -97,6 +97,12 @@ pub(super) struct PreparedPropagationRemoval {
 
 pub(super) struct PropagationChangeTransaction {
     _topology_guard: MutexGuard<'static, ()>,
+    prepared: PreparedPropagationChange,
+}
+
+/// Allocation-complete propagation update. The caller must keep the mount
+/// lifecycle lock held from selection through commit (or abort).
+pub(crate) struct PreparedPropagationChange {
     mount_states: HashMap<GraphMountId, PreparedMountStateUpdate>,
     peer_groups: Vec<PreparedPeerGroupState>,
 }
@@ -578,7 +584,7 @@ impl PreparedPropagationRemoval {
     }
 }
 
-pub(super) fn collect_change_targets<R>(
+pub(crate) fn collect_change_targets<R>(
     root: &Arc<MountFS>,
     recursive: bool,
     before_reserve: &mut R,
@@ -625,20 +631,65 @@ impl PropagationChangeTransaction {
     {
         let topology_guard = MOUNT_LIFECYCLE_LOCK.lock();
         let targets = collect_change_targets(root, recursive, &mut before_reserve)?;
-        for target in &targets {
+        let prepared = PreparedPropagationChange::prepare_selected_with_resources_locked(
+            &targets,
+            prop_type,
+            &mut alloc_group,
+            &mut before_reserve,
+        )?;
+        Ok(Self {
+            _topology_guard: topology_guard,
+            prepared,
+        })
+    }
+
+    fn commit(self) {
+        let Self {
+            _topology_guard,
+            prepared,
+        } = self;
+        prepared.commit_locked();
+        drop(_topology_guard);
+    }
+}
+
+impl PreparedPropagationChange {
+    pub(crate) fn prepare_selected_locked(
+        targets: &[Arc<MountFS>],
+        prop_type: PropagationType,
+    ) -> Result<Self, SystemError> {
+        Self::prepare_selected_with_resources_locked(
+            targets,
+            prop_type,
+            PropagationGroup::alloc,
+            || Ok(()),
+        )
+    }
+
+    fn prepare_selected_with_resources_locked<A, R>(
+        targets: &[Arc<MountFS>],
+        prop_type: PropagationType,
+        mut alloc_group: A,
+        mut before_reserve: R,
+    ) -> Result<Self, SystemError>
+    where
+        A: FnMut() -> Result<Arc<PropagationGroup>, SystemError>,
+        R: FnMut() -> Result<(), SystemError>,
+    {
+        for target in targets {
             if !target.is_live() {
                 return Err(SystemError::EINVAL);
             }
         }
 
         let mut graph = PropagationGraph::new(targets.len(), &mut before_reserve)?;
-        for target in &targets {
+        for target in targets {
             graph.capture_component(target.clone(), &mut before_reserve)?;
         }
 
         // Snapshot every initially touched group before simulation changes any
         // graph node; registry filtering must observe the real pre-transaction state.
-        for target in &targets {
+        for target in targets {
             let propagation = target.propagation();
             if propagation.is_shared() {
                 graph.capture_group(propagation.peer_group_id(), target, &mut before_reserve)?;
@@ -702,23 +753,20 @@ impl PropagationChangeTransaction {
         let new_group_keys = count_new_peer_group_keys(&peer_groups);
         try_reserve_peer_group_keys(new_group_keys, &mut before_reserve)?;
 
-        // Drop every snapshot-only owner while the topology guard is still
-        // held. The returned transaction owns only final state and resources.
+        // Drop every snapshot-only owner while the caller's topology guard
+        // is still held. Own only final state and resources after preparation.
         drop(graph.nodes);
         drop(graph.order);
         drop(target_ids);
-        drop(targets);
 
         Ok(Self {
-            _topology_guard: topology_guard,
             mount_states,
             peer_groups,
         })
     }
 
-    fn commit(self) {
+    pub(crate) fn commit_locked(self) {
         let Self {
-            _topology_guard,
             mount_states,
             peer_groups,
         } = self;
@@ -729,7 +777,6 @@ impl PropagationChangeTransaction {
             // removal and the lowest-free cursor update never allocate.
             drop(old_state);
         }
-        drop(_topology_guard);
     }
 }
 

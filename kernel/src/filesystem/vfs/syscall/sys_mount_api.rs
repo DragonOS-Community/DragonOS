@@ -6,16 +6,19 @@ use system_error::SystemError;
 use crate::{
     arch::{
         interrupt::TrapFrame,
-        syscall::nr::{SYS_FSCONFIG, SYS_FSMOUNT, SYS_FSOPEN, SYS_MOVE_MOUNT, SYS_OPEN_TREE},
+        syscall::nr::{
+            SYS_FSCONFIG, SYS_FSMOUNT, SYS_FSOPEN, SYS_FSPICK, SYS_MOVE_MOUNT, SYS_OPEN_TREE,
+        },
     },
     filesystem::vfs::{
         fcntl::AtFlags,
         file::{File, FileFlags, FilePrivateData},
         mount::{is_mountpoint_root, DetachedMountTree, MountFS, MountFSInode, MountFlags},
         mount_api::context::{
-            configure_fs_context, create_mount_from_fs_context, open_fs_context, FsConfigCommand,
+            configure_fs_context, create_mount_from_fs_context, open_fs_context, pick_fs_context,
+            FsConfigCommand,
         },
-        utils::{user_resolved_path_at, ResolvedPath},
+        utils::{user_resolved_path_at, OpenHowResolve, PathWalkOptions, ResolvedPath},
         FileType, IndexNode, MAX_PATHLEN, VFS_MAX_FOLLOW_SYMLINK_TIMES,
     },
     libs::casting::DowncastArc,
@@ -46,6 +49,10 @@ const MOVE_MOUNT_BENEATH: u32 = 0x200;
 const MOVE_MOUNT_MASK: u32 = 0x377;
 
 const FSOPEN_CLOEXEC: u32 = 1;
+const FSPICK_CLOEXEC: u32 = 0x1;
+const FSPICK_SYMLINK_NOFOLLOW: u32 = 0x2;
+const FSPICK_NO_AUTOMOUNT: u32 = 0x4;
+const FSPICK_EMPTY_PATH: u32 = 0x8;
 const FSMOUNT_CLOEXEC: u32 = 1;
 const MOUNT_ATTR_RDONLY: u32 = 0x1;
 const MOUNT_ATTR_NOSUID: u32 = 0x2;
@@ -79,11 +86,12 @@ fn fsconfig_string(ptr: usize) -> Result<alloc::string::String, SystemError> {
 /// Resolve empty paths from the supplied fd, not from cwd as the legacy
 /// user_path_at helper does. The returned owner pins the selected mount until
 /// the file or topology operation has acquired its own reference.
-fn resolve_mount_path(
+pub(super) fn resolve_mount_path(
     dfd: i32,
     pathname: &str,
     allow_empty: bool,
     follow_final: bool,
+    no_automount: bool,
 ) -> Result<ResolvedPath, SystemError> {
     let current = ProcessManager::current_pcb();
     if pathname.is_empty() {
@@ -100,6 +108,17 @@ fn resolve_mount_path(
             .resolved_path();
     }
     let (start, rest) = user_resolved_path_at(&current, dfd, pathname)?;
+    if no_automount {
+        let mut options = PathWalkOptions::new(OpenHowResolve::empty(), None);
+        options.no_automount = true;
+        return start.inode().lookup_follow_symlink_with_options_owned(
+            &start,
+            &rest,
+            VFS_MAX_FOLLOW_SYMLINK_TIMES,
+            follow_final,
+            &options,
+        );
+    }
     start.inode().lookup_follow_symlink_owned(
         &start,
         &rest,
@@ -161,6 +180,7 @@ impl Syscall for SysOpenTree {
             &pathname,
             flags & AT_EMPTY_PATH != 0,
             flags & AT_SYMLINK_NOFOLLOW == 0,
+            flags & AT_NO_AUTOMOUNT != 0,
         )?;
         if !clone {
             return install_path_fd(&path, flags & OPEN_TREE_CLOEXEC != 0);
@@ -209,6 +229,54 @@ impl Syscall for SysFsopen {
     }
 }
 syscall_table_macros::declare_syscall!(SYS_FSOPEN, SysFsopen);
+
+pub struct SysFspick;
+impl Syscall for SysFspick {
+    fn num_args(&self) -> usize {
+        3
+    }
+
+    fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
+        if !may_mount() {
+            return Err(SystemError::EPERM);
+        }
+        let flags = args[2] as u32;
+        if flags
+            & !(FSPICK_CLOEXEC | FSPICK_SYMLINK_NOFOLLOW | FSPICK_NO_AUTOMOUNT | FSPICK_EMPTY_PATH)
+            != 0
+        {
+            return Err(SystemError::EINVAL);
+        }
+        let pathname = user_path(args[1])?;
+        let path = resolve_mount_path(
+            args[0] as i32,
+            &pathname,
+            flags & FSPICK_EMPTY_PATH != 0,
+            flags & FSPICK_SYMLINK_NOFOLLOW == 0,
+            flags & FSPICK_NO_AUTOMOUNT != 0,
+        )?;
+        let inode = path.inode();
+        if !is_mountpoint_root(&inode) {
+            return Err(SystemError::EINVAL);
+        }
+        let mount = inode
+            .fs()
+            .downcast_arc::<MountFS>()
+            .ok_or(SystemError::EINVAL)?;
+        // Unlike mount_setattr, fspick does not require current namespace
+        // ownership. CMD_RECONFIGURE checks the selected SB's owner instead.
+        Ok(pick_fs_context(mount, flags & FSPICK_CLOEXEC != 0)? as usize)
+    }
+
+    fn entry_format(&self, args: &[usize]) -> Vec<FormattedSyscallParam> {
+        vec![
+            FormattedSyscallParam::new("dfd", (args[0] as i32).to_string()),
+            FormattedSyscallParam::new("path", format!("{:#x}", args[1])),
+            FormattedSyscallParam::new("flags", format!("{:#x}", args[2])),
+        ]
+    }
+}
+syscall_table_macros::declare_syscall!(SYS_FSPICK, SysFspick);
 
 pub struct SysFsconfig;
 impl Syscall for SysFsconfig {
@@ -342,9 +410,6 @@ impl Syscall for SysMoveMount {
         if flags & (MOVE_MOUNT_SET_GROUP | MOVE_MOUNT_BENEATH) != 0 {
             return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
         }
-        // Automount is not a DragonOS VFS feature, so these lookup controls
-        // have no additional effect. Symlink and empty-path flags do.
-        let _ = flags & (MOVE_MOUNT_F_AUTOMOUNTS | MOVE_MOUNT_T_AUTOMOUNTS);
         let from_path = user_path(args[1])?;
         let to_path = user_path(args[3])?;
         let source = resolve_mount_path(
@@ -352,12 +417,14 @@ impl Syscall for SysMoveMount {
             &from_path,
             flags & MOVE_MOUNT_F_EMPTY_PATH != 0,
             flags & MOVE_MOUNT_F_SYMLINKS != 0,
+            flags & MOVE_MOUNT_F_AUTOMOUNTS == 0,
         )?;
         let target = resolve_mount_path(
             args[2] as i32,
             &to_path,
             flags & MOVE_MOUNT_T_EMPTY_PATH != 0,
             flags & MOVE_MOUNT_T_SYMLINKS != 0,
+            flags & MOVE_MOUNT_T_AUTOMOUNTS == 0,
         )?;
         let source_inode = source.inode();
         let target_inode = target.inode();

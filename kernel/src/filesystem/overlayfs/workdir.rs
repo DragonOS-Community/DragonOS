@@ -40,7 +40,7 @@ impl OvlInode {
         name: &str,
         context: Option<&DentryMutationContext<'_>>,
     ) -> Result<(), SystemError> {
-        let inode = match workdir.find(name) {
+        let inode = match super::lookup::lookup_backing(workdir, name) {
             Ok(inode) => inode,
             Err(SystemError::ENOENT) => return Ok(()),
             Err(err) => return Err(err),

@@ -157,16 +157,15 @@ pub fn do_fchmodat(
 /// fchmod：对已解析的 inode 进行 chmod（供 `sys_fchmod` 复用）。
 pub fn do_fchmod(inode: Arc<dyn IndexNode>, mode: InodeMode) -> Result<usize, SystemError> {
     let cred = ProcessManager::current_pcb().cred();
+    let operation = inode
+        .clone()
+        .downcast_arc::<MountFSInode>()
+        .map(|inode| inode.op_context());
     inode.update_metadata_masked(&mut |current| {
         if current
             .flags
             .intersects(InodeFlags::S_IMMUTABLE | InodeFlags::S_APPEND)
         {
-            return Err(SystemError::EPERM);
-        }
-        // A pipe may change owners concurrently; evaluate permission from the
-        // same metadata snapshot that its inode commits under the inner lock.
-        if !cred.is_owner_or_capable(current) {
             return Err(SystemError::EPERM);
         }
         // Linux 6.6 notify_change(ATTR_MODE) rejects chmod on a symlink.
@@ -175,6 +174,17 @@ pub fn do_fchmod(inode: Arc<dyn IndexNode>, mode: InodeMode) -> Result<usize, Sy
         }
         let mut metadata = current.clone();
         metadata.mode = chmod_preserve_type(current.mode, mode);
+        if let Some(operation) = &operation {
+            operation.validate_setattr_mapping(
+                current,
+                &metadata,
+                SetMetadataMask::MODE | SetMetadataMask::CTIME,
+            )?;
+        }
+        // Permission is evaluated from the snapshot committed under the lock.
+        if !cred.is_owner_or_capable(current) {
+            return Err(SystemError::EPERM);
+        }
         let gid = Kgid::from(current.gid);
         let has_fsetid = cred.has_capability_wrt_inode_uidgid(current, CAPFlags::CAP_FSETID);
         if !has_fsetid && cred.fsgid.data() != current.gid && !cred.getgroups().contains(&gid) {
@@ -221,6 +231,10 @@ fn chown_common(inode: Arc<dyn IndexNode>, uid: usize, gid: usize) -> Result<usi
     let cred = ProcessManager::current_pcb().cred();
     let fsuid = cred.fsuid.data();
     let fsgid = cred.fsgid.data();
+    let operation = inode
+        .clone()
+        .downcast_arc::<MountFSInode>()
+        .map(|inode| inode.op_context());
 
     // Linux semantics: uid/gid passed in as (uid_t)-1/(gid_t)-1 mean "do not change".
     let is_no_change = |id: usize| id == u32::MAX as usize;
@@ -244,17 +258,44 @@ fn chown_common(inode: Arc<dyn IndexNode>, uid: usize, gid: usize) -> Result<usi
     };
     let mask = inode.update_metadata_masked(&mut |current| {
         let mut meta = current.clone();
+        let mut id_mask = SetMetadataMask::CTIME;
+        if change_uid {
+            meta.uid = uid;
+            id_mask.insert(SetMetadataMask::UID);
+        }
+        if change_gid {
+            meta.gid = gid;
+            id_mask.insert(SetMetadataMask::GID);
+        }
+        if (change_uid || change_gid)
+            && current
+                .flags
+                .intersects(InodeFlags::S_IMMUTABLE | InodeFlags::S_APPEND)
+        {
+            return Err(SystemError::EPERM);
+        }
+        if let Some(operation) = &operation {
+            operation.validate_setattr_mapping(current, &meta, id_mask)?;
+        }
         let old_mode = current.mode;
         let has_chown = cred.has_capability_wrt_inode_uidgid(current, CAPFlags::CAP_CHOWN);
+        let owner_chown = operation.as_ref().is_some_and(|operation| {
+            cred.has_capability_in_ns(&operation.fs_userns, CAPFlags::CAP_CHOWN)
+        });
         let has_fsetid = cred.has_capability_wrt_inode_uidgid(current, CAPFlags::CAP_FSETID);
 
         // Linux chown_ok/chgrp_ok: retaining one's own uid, or choosing an
         // owned file's group, is allowed; arbitrary changes require CAP_CHOWN.
-        if change_uid && !has_chown && (fsuid != current.uid || uid != current.uid) {
+        if change_uid
+            && !has_chown
+            && !(current.uid == u32::MAX as usize && owner_chown)
+            && (fsuid != current.uid || uid != current.uid)
+        {
             return Err(SystemError::EPERM);
         }
         if change_gid
             && !has_chown
+            && !(current.gid == u32::MAX as usize && owner_chown)
             && (fsuid != current.uid
                 || (gid != current.gid
                     && gid != fsgid
@@ -272,6 +313,7 @@ fn chown_common(inode: Arc<dyn IndexNode>, uid: usize, gid: usize) -> Result<usi
         // Linux clears setid bits on chown of non-directories. A resulting
         // MODE update still requires owner/CAP_FOWNER, even for (-1, -1).
         if meta.file_type != FileType::Dir {
+            id_mask.insert(SetMetadataMask::KILL_PRIV);
             meta.mode.remove(InodeMode::S_ISUID);
             if should_remove_sgid_on_chown(meta.mode, current.gid, &cred, has_fsetid) {
                 meta.mode.remove(InodeMode::S_ISGID);
@@ -290,7 +332,7 @@ fn chown_common(inode: Arc<dyn IndexNode>, uid: usize, gid: usize) -> Result<usi
         if meta.mode != old_mode && !cred.is_owner_or_capable(current) {
             return Err(SystemError::EPERM);
         }
-        let mut mask = SetMetadataMask::CTIME;
+        let mut mask = id_mask;
         if change_uid {
             mask.insert(SetMetadataMask::UID);
         }
@@ -404,6 +446,7 @@ pub(crate) fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usi
         };
         let mut created = false;
         let mut preopened: Option<PreopenedFile> = None;
+        let mut created_open = None;
         let resolved = match resolved {
             Ok(OwnedLookupOutcome::Found(resolved)) => resolved,
             Ok(OwnedLookupOutcome::MissingFinal {
@@ -462,13 +505,14 @@ pub(crate) fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usi
                     let inode: Arc<dyn IndexNode> = if let Some(mounted) =
                         parent_inode.clone().downcast_arc::<MountFSInode>()
                     {
-                        let (inode, opened) = mounted.create_file_with_post_commit(
+                        let opened = mounted.create_file_with_post_commit(
                             &filename,
                             create_mode,
                             &create_flags,
                             notify,
                         )?;
-                        preopened = opened;
+                        let inode = opened.inode();
+                        created_open = Some(opened);
                         inode
                     } else {
                         let inode = match parent_inode.create_and_open(
@@ -532,16 +576,14 @@ pub(crate) fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usi
             let tmpfile = inode.tmpfile(create_mode, &how.o_flags)?;
             let (_, mount_guard, _directory_operation) = resolved.into_parts();
             let tmp_path = ResolvedPath::from_existing_mount(tmpfile.inode(), mount_guard)?;
-            let (tmp_inode, mount_guard, operation_guard) = tmp_path.into_parts();
-            let file = File::new_with_mount_guard(
-                tmp_inode,
+            let (_, mount_guard, operation_guard) = tmp_path.into_parts();
+            let file = File::new_unlinked_with_mount_guard(
+                tmpfile,
                 how.o_flags,
                 mount_guard,
                 operation_guard,
-                None,
             )?;
             file.notify_open_event();
-            drop(tmpfile);
             return Ok(file);
         }
 
@@ -645,6 +687,15 @@ pub(crate) fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usi
         // This owner outlives the temporary writer even when constructing the
         // File or truncating it fails and releases the File's mount pin.
         let _truncate_path = do_truncate.then(|| resolved.derive_existing_owner());
+        let _truncate_mount_writer = if do_truncate {
+            inode
+                .clone()
+                .downcast_arc::<MountFSInode>()
+                .map(|mounted| mounted.mount_fs().want_write())
+                .transpose()?
+        } else {
+            None
+        };
         let _truncate_write_access = if do_truncate {
             Some(super::write_access::InodeWriteGuard::writer(inode.clone())?)
         } else {
@@ -657,22 +708,34 @@ pub(crate) fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usi
             }
         }
         let (inode, mount_guard, operation_guard) = resolved.into_parts();
-        let file: File = match preopened {
-            Some(opened) => File::new_preopened_with_mount_guard(
-                opened,
-                how.o_flags,
-                mount_guard,
-                operation_guard,
-            )?,
-            None => File::new_with_mount_guard(
-                inode,
+        let file: File = if let Some(created) = created_open {
+            File::new_created_with_mount_guard(
+                created,
                 how.o_flags,
                 mount_guard,
                 operation_guard,
                 how.resolve
                     .contains(OpenHowResolve::RESOLVE_CACHED)
                     .then_some(metadata),
-            )?,
+            )?
+        } else {
+            match preopened {
+                Some(opened) => File::new_preopened_with_mount_guard(
+                    opened,
+                    how.o_flags,
+                    mount_guard,
+                    operation_guard,
+                )?,
+                None => File::new_with_mount_guard(
+                    inode,
+                    how.o_flags,
+                    mount_guard,
+                    operation_guard,
+                    how.resolve
+                        .contains(OpenHowResolve::RESOLVE_CACHED)
+                        .then_some(metadata),
+                )?,
+            }
         };
 
         // Linux emits OPEN from do_dentry_open() before handle_truncate().

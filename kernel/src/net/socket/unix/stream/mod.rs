@@ -1574,13 +1574,17 @@ impl Socket for UnixStreamSocket {
         }
 
         const STREAM_SEND_CHUNK: usize = crate::arch::MMArch::PAGE_SIZE;
+        // Like unix_stream_sendmsg, publish only complete copy units bounded
+        // by half SO_SNDBUF minus its overhead. Retain our bounded scratch cap;
+        // it does not reproduce Linux's allocator-specific large skb layout.
+        let copy_chunk = STREAM_SEND_CHUNK.min(
+            self.send_buffer_size()
+                .saturating_div(2)
+                .saturating_sub(64)
+                .max(1),
+        );
         crate::net::socket::base::send_user_buffer_via_kernel_buf(
-            self,
-            reader,
-            len,
-            flags,
-            address,
-            STREAM_SEND_CHUNK,
+            self, reader, len, flags, address, copy_chunk,
         )
     }
 

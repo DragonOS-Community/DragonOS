@@ -5,7 +5,7 @@ use crate::{
     filesystem::{
         page_cache::{
             AsyncPageCacheBackend, PageCache, PageCacheBackend, PageCacheDirtyCertificate,
-            PageCacheExpectedDirtyTransition, PageCacheReadBatchCompletion,
+            PageCacheExpectedDirtyTransition, PageCacheRangeResult, PageCacheReadBatchCompletion,
             PageCacheReadBatchRequest, PageCacheWritebackAdmissionOrder,
             PageCacheWritebackBindResult, PageCacheWritebackCancellationContext,
             PageCacheWritebackCompletion, PageCacheWritebackDescriptor,
@@ -816,6 +816,7 @@ pub struct LockedExt4Inode {
     pub(super) lifecycle: Arc<Ext4InodeLifecycle>,
     pub(super) retention: InodeRetentionState,
     pub(super) pending_reclaim: SpinLock<Option<another_ext4::InodeReclaimHandle>>,
+    pub(super) pending_removal_token: SpinLock<Option<vfs::mount::writer::PendingRemovalGuard>>,
     /// Equivalent to Linux I_LINKABLE for a never-published O_TMPFILE inode.
     pub(super) tmpfile_linkable: AtomicBool,
     pub(super) eviction_scheduled: SpinLock<bool>,
@@ -1200,7 +1201,15 @@ impl PageCacheWritebackSubmission for Ext4EagerSubmission {
             .first_index()
             .checked_mul(MMArch::PAGE_SIZE)
             .ok_or(SystemError::EOVERFLOW)?;
-        let written = self.inode.write_sync(offset, data)?;
+        if data.len() != descriptor.valid_bytes() {
+            return Err(SystemError::EIO);
+        }
+        let completed_end = offset
+            .checked_add(data.len())
+            .ok_or(SystemError::EOVERFLOW)?;
+        let written =
+            self.inode
+                .write_eager_data_with_completed_end(offset, data, completed_end)?;
         if written != data.len() {
             return Err(SystemError::EIO);
         }
@@ -1941,6 +1950,190 @@ impl PageCacheBackend for Ext4PageCacheBackend {
     }
 }
 
+impl LockedExt4Inode {
+    fn unlink_with_operation_context(
+        &self,
+        name: &str,
+        context: &vfs::permission::InodeOpContext,
+    ) -> Result<vfs::LinkRemovalOutcome, SystemError> {
+        let _operation = self.begin_operation()?;
+        let _io = self.io_lock.lock();
+        let _namespace = self.namespace_lock.lock();
+        let mut guard = self.inner.lock();
+        let fs = guard.concret_fs();
+        let ext4 = &fs.fs;
+        let inode_num = guard.inner_inode_num;
+        let attr = fs.retry_metadata_read_contention(|| ext4.getattr(inode_num))?;
+        if attr.ftype != another_ext4::FileType::Directory {
+            return Err(SystemError::ENOTDIR);
+        }
+        let target_num = fs.retry_metadata_read_contention(|| ext4.lookup(inode_num, name))?;
+        let target_attr = fs.retry_metadata_read_contention(|| ext4.getattr(target_num))?;
+        let parent = Self::metadata_from_attr(
+            &fs,
+            guard.vfs_inode_id,
+            guard.cached_file_size,
+            guard.cached_times,
+            attr,
+        );
+        let victim = Self::metadata_from_attr(
+            &fs,
+            guard.vfs_inode_id,
+            None,
+            guard.cached_times,
+            target_attr,
+        );
+        vfs::permission::check_inode_delete(&parent, &victim, false, context)?;
+        let self_arc = guard.self_ref.upgrade().ok_or(SystemError::ENOENT)?;
+        let target = fs.get_or_create_inode(
+            target_num,
+            DName::from(name),
+            Some(Arc::downgrade(&self_arc)),
+        )?;
+        let target_lifecycle = target.lifecycle().clone();
+        let _link_mutation = target_lifecycle.lock_link_mutation();
+        let _target_operation = target.begin_operation()?;
+        match fs.retry_metadata_read_contention(|| ext4.lookup(inode_num, name)) {
+            Ok(current) if current == target_num => {}
+            Ok(_) => return Err(SystemError::EAGAIN_OR_EWOULDBLOCK),
+            Err(error) => return Err(error),
+        }
+        let reclaim = fs.retry_metadata_contention(|| ext4.unlink(inode_num, name))?;
+        let outcome = if reclaim.is_some() {
+            vfs::LinkRemovalOutcome::LastLink
+        } else {
+            vfs::LinkRemovalOutcome::StillLinked
+        };
+        target.handoff_namespace_reclaim(reclaim)?;
+        // 清理 children 缓存
+        let _ = guard.children.remove(&DName::from(name));
+        Ok(outcome)
+    }
+}
+
+impl LockedExt4Inode {
+    fn rmdir_with_operation_context(
+        &self,
+        name: &str,
+        context: &vfs::permission::InodeOpContext,
+    ) -> Result<(), SystemError> {
+        let _operation = self.begin_operation()?;
+        let _io = self.io_lock.lock();
+        let _namespace = self.namespace_lock.lock();
+        let mut guard = self.inner.lock();
+        let fs = guard.concret_fs();
+        let concret_fs = &fs.fs;
+        let inode_num = guard.inner_inode_num;
+        let attr = fs.retry_metadata_read_contention(|| concret_fs.getattr(inode_num))?;
+        if attr.ftype != FileType::Directory {
+            return Err(SystemError::ENOTDIR);
+        }
+        let target_num =
+            fs.retry_metadata_read_contention(|| concret_fs.lookup(inode_num, name))?;
+        if target_num == inode_num {
+            return Err(if name == "." {
+                SystemError::EINVAL
+            } else {
+                SystemError::ENOTEMPTY
+            });
+        }
+        let target_attr = fs.retry_metadata_read_contention(|| concret_fs.getattr(target_num))?;
+        let parent = Self::metadata_from_attr(
+            &fs,
+            guard.vfs_inode_id,
+            guard.cached_file_size,
+            guard.cached_times,
+            attr,
+        );
+        let victim = Self::metadata_from_attr(
+            &fs,
+            guard.vfs_inode_id,
+            None,
+            guard.cached_times,
+            target_attr,
+        );
+        vfs::permission::check_inode_delete(&parent, &victim, true, context)?;
+        if fs
+            .retry_metadata_read_contention(|| concret_fs.listdir(target_num))?
+            .len()
+            > 2
+        {
+            return Err(SystemError::ENOTEMPTY);
+        }
+        let self_arc = guard.self_ref.upgrade().ok_or(SystemError::ENOENT)?;
+        let target = fs.get_or_create_inode(
+            target_num,
+            DName::from(name),
+            Some(Arc::downgrade(&self_arc)),
+        )?;
+        let target_lifecycle = target.lifecycle().clone();
+        let _link_mutation = target_lifecycle.lock_link_mutation();
+        match fs.retry_metadata_read_contention(|| concret_fs.lookup(inode_num, name)) {
+            Ok(current) if current == target_num => {}
+            Ok(_) => return Err(SystemError::EAGAIN_OR_EWOULDBLOCK),
+            Err(error) => return Err(error),
+        }
+        let target_attr = fs.retry_metadata_read_contention(|| concret_fs.getattr(target_num))?;
+        if target_attr.ftype != FileType::Directory {
+            return Err(SystemError::ENOTDIR);
+        }
+        match fs.retry_metadata_read_contention(|| concret_fs.listdir(target_num)) {
+            Ok(entries) if entries.len() <= 2 => {}
+            Ok(_) => return Err(SystemError::ENOTEMPTY),
+            Err(error) => return Err(error),
+        }
+        let reclaim = fs.retry_metadata_contention(|| concret_fs.rmdir(inode_num, name))?;
+        target.handoff_namespace_reclaim(reclaim)?;
+        // 清理 children 缓存
+        let _ = guard.children.remove(&DName::from(name));
+
+        Ok(())
+    }
+}
+
+impl LockedExt4Inode {
+    fn resize_with_operation(
+        &self,
+        len: usize,
+        request: Option<(
+            &vfs::Metadata,
+            SetMetadataMask,
+            &vfs::permission::InodeOpContext,
+        )>,
+    ) -> Result<SetMetadataMask, SystemError> {
+        let _operation = self.begin_operation()?;
+        let lifecycle = self.lifecycle().clone();
+        let _link_mutation = lifecycle.lock_link_mutation();
+        let size_change = self.size_change_lock.write();
+        let _delalloc_admission = self.close_production_delalloc_admission()?;
+        self.drain_delalloc_before_eager()?;
+        let (fs, inode_num) = {
+            let guard = self.inner.lock();
+            (guard.concret_fs(), guard.inner_inode_num)
+        };
+        let mut applied = SetMetadataMask::empty();
+        self.commit_size_mutation(&size_change, &fs, inode_num, len, |previous_size| {
+            let _metadata_commit = self.metadata_commit_lock.lock();
+            let current = self.metadata()?;
+            let (requested, mask) = match request {
+                Some((requested, mask, context)) => vfs::vcore::prepare_backing_resize_metadata(
+                    context, &current, requested, mask, len,
+                )?,
+                None => (current, SetMetadataMask::empty()),
+            };
+            let receipt =
+                self.set_masked_metadata_using(&requested, mask, Some(len), |_, id, attr| {
+                    fs.retry_metadata_contention(|| {
+                        fs.fs.begin_size_change(id, previous_size, attr)
+                    })
+                })?;
+            applied = mask;
+            Ok(receipt)
+        })?;
+        Ok(applied)
+    }
+}
+
 impl IndexNode for LockedExt4Inode {
     fn link_mutation_coordinator(&self) -> Option<&LinkMutationCoordinator> {
         Some(&self.link_mutation_coordinator)
@@ -1979,11 +2172,42 @@ impl IndexNode for LockedExt4Inode {
         file_type: vfs::FileType,
         mode: vfs::InodeMode,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
+        self.create_with_context(
+            name,
+            file_type,
+            mode,
+            &vfs::permission::InodeOpContext::legacy(),
+        )
+    }
+
+    fn mkdir_with_context(
+        &self,
+        name: &str,
+        mode: InodeMode,
+        context: &vfs::permission::InodeOpContext,
+    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+        self.create_with_context(name, vfs::FileType::Dir, mode, context)
+    }
+
+    fn create_with_context(
+        &self,
+        name: &str,
+        file_type: vfs::FileType,
+        mode: InodeMode,
+        context: &vfs::permission::InodeOpContext,
+    ) -> Result<Arc<dyn IndexNode>, SystemError> {
         let _operation = self.begin_operation()?;
         let _io = self.io_lock.lock();
         let _namespace = self.namespace_lock.lock();
         let parent_metadata = self.metadata()?;
-        let init = vfs::permission::child_inode_init(&parent_metadata, file_type, mode);
+        self.check_new_name_locked(name)?;
+        vfs::permission::check_parent_create(&parent_metadata, context, false)?;
+        let init = vfs::permission::child_inode_init_with_context(
+            &parent_metadata,
+            file_type,
+            mode,
+            context,
+        )?;
         let mut guard = self.inner.lock();
         // another_ext4的高4位是文件类型，低12位是权限
         let file_mode = InodeMode::from(file_type).union(init.mode);
@@ -2039,11 +2263,26 @@ impl IndexNode for LockedExt4Inode {
         mode: InodeMode,
         flags: &vfs::file::FileFlags,
     ) -> Result<vfs::UnlinkedFile, SystemError> {
+        self.tmpfile_with_context(mode, flags, &vfs::permission::InodeOpContext::legacy())
+    }
+
+    fn tmpfile_with_context(
+        &self,
+        mode: InodeMode,
+        flags: &vfs::file::FileFlags,
+        context: &vfs::permission::InodeOpContext,
+    ) -> Result<vfs::UnlinkedFile, SystemError> {
         let _operation = self.begin_operation()?;
         let _io = self.io_lock.lock();
         let _namespace = self.namespace_lock.lock();
         let parent_metadata = self.metadata()?;
-        let init = vfs::permission::child_inode_init(&parent_metadata, vfs::FileType::File, mode);
+        vfs::permission::check_parent_create(&parent_metadata, context, true)?;
+        let init = vfs::permission::child_inode_init_with_context(
+            &parent_metadata,
+            vfs::FileType::File,
+            mode,
+            context,
+        )?;
         let guard = self.inner.lock();
         let fs = guard.concret_fs();
         let _reuse = fs.begin_allocation()?;
@@ -2095,23 +2334,52 @@ impl IndexNode for LockedExt4Inode {
         mode: InodeMode,
         data: usize,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
+        self.create_with_data_context(
+            name,
+            file_type,
+            mode,
+            data,
+            &vfs::permission::InodeOpContext::legacy(),
+        )
+    }
+
+    fn create_with_data_context(
+        &self,
+        name: &str,
+        file_type: vfs::FileType,
+        mode: InodeMode,
+        data: usize,
+        context: &vfs::permission::InodeOpContext,
+    ) -> Result<Arc<dyn IndexNode>, SystemError> {
         if data == 0 {
-            return self.create(name, file_type, mode);
+            return self.create_with_context(name, file_type, mode, context);
         }
 
         Err(SystemError::ENOSYS)
     }
 
     fn symlink(&self, name: &str, target: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
+        self.symlink_with_context(name, target, &vfs::permission::InodeOpContext::legacy())
+    }
+
+    fn symlink_with_context(
+        &self,
+        name: &str,
+        target: &str,
+        context: &vfs::permission::InodeOpContext,
+    ) -> Result<Arc<dyn IndexNode>, SystemError> {
         let _operation = self.begin_operation()?;
         let _io = self.io_lock.lock();
         let _namespace = self.namespace_lock.lock();
         let parent_metadata = self.metadata()?;
-        let init = vfs::permission::child_inode_init(
+        self.check_new_name_locked(name)?;
+        vfs::permission::check_parent_create(&parent_metadata, context, false)?;
+        let init = vfs::permission::child_inode_init_with_context(
             &parent_metadata,
             vfs::FileType::SymLink,
             InodeMode::S_IRWXUGO,
-        );
+            context,
+        )?;
         let mut guard = self.inner.lock();
         let fs = guard.concret_fs();
         let _reuse = fs.begin_allocation()?;
@@ -2214,199 +2482,94 @@ impl IndexNode for LockedExt4Inode {
         buf: &[u8],
         data: PrivateData,
     ) -> Result<usize, SystemError> {
+        let mut publish = || {};
+        let mut stage = vfs::WritePrivilegeStage::new(&mut publish);
+        self.write_at_with_privilege_stage(offset, len, buf, data, &mut stage)
+    }
+
+    fn write_at_with_privilege_stage(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &[u8],
+        data: PrivateData,
+        stage: &mut vfs::WritePrivilegeStage<'_>,
+    ) -> Result<usize, SystemError> {
+        self.write_at_with_inode_context(
+            offset,
+            len,
+            buf,
+            data,
+            &vfs::permission::InodeOpContext::legacy(),
+            stage,
+        )
+    }
+
+    fn write_at_with_inode_context(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &[u8],
+        data: PrivateData,
+        context: &vfs::permission::InodeOpContext,
+        stage: &mut vfs::WritePrivilegeStage<'_>,
+    ) -> Result<usize, SystemError> {
+        self.write_primary_with_inode_context(
+            offset,
+            len,
+            vfs::PrimaryWriteSource::Kernel(buf),
+            data,
+            context,
+            stage,
+        )
+    }
+
+    fn write_primary_with_privilege_stage(
+        &self,
+        offset: usize,
+        len: usize,
+        source: vfs::PrimaryWriteSource<'_, '_>,
+        data: PrivateData,
+        stage: &mut vfs::WritePrivilegeStage<'_>,
+    ) -> Result<usize, SystemError> {
+        self.write_primary_with_inode_context(
+            offset,
+            len,
+            source,
+            data,
+            &vfs::permission::InodeOpContext::legacy(),
+            stage,
+        )
+    }
+
+    fn write_primary_with_inode_context(
+        &self,
+        offset: usize,
+        len: usize,
+        source: vfs::PrimaryWriteSource<'_, '_>,
+        data: PrivateData,
+        context: &vfs::permission::InodeOpContext,
+        stage: &mut vfs::WritePrivilegeStage<'_>,
+    ) -> Result<usize, SystemError> {
         let _operation = self.begin_operation()?;
-        let _size_change = self.size_change_lock.read();
-        let len = core::cmp::min(len, buf.len());
+        let size_change = self.size_change_lock.read();
+        let len = match &source {
+            vfs::PrimaryWriteSource::Kernel(buffer) => len.min(buffer.len()),
+            vfs::PrimaryWriteSource::User(_) => len,
+        };
         if len == 0 {
             return Ok(0);
         }
-        let buf = &buf[0..len];
-
-        let (fs, inode_num, page_cache) = {
-            let guard = self.inner.lock();
-            (
-                guard.concret_fs(),
-                guard.inner_inode_num,
-                guard.page_cache.clone(),
-            )
-        };
-
-        if let Some(page_cache) = page_cache {
-            let mut delayed_written = 0usize;
-            while delayed_written < buf.len() {
-                let segment_offset = offset
-                    .checked_add(delayed_written)
-                    .ok_or(SystemError::EFBIG)?;
-                let page_remaining = MMArch::PAGE_SIZE - (segment_offset & (MMArch::PAGE_SIZE - 1));
-                let segment_len = core::cmp::min(page_remaining, buf.len() - delayed_written);
-                let merged = match self.try_merge_delalloc_tail_segment(
-                    &page_cache,
-                    segment_offset,
-                    &buf[delayed_written..delayed_written + segment_len],
-                ) {
-                    Ok(result) => result,
-                    Err(_) if delayed_written != 0 => return Ok(delayed_written),
-                    Err(error) => return Err(error),
-                };
-                if let Some(written) = merged {
-                    delayed_written = delayed_written
-                        .checked_add(written)
-                        .ok_or(SystemError::EOVERFLOW)?;
-                    continue;
-                }
-                let admitted = match self.try_write_delalloc_new_page_segment(
-                    &page_cache,
-                    segment_offset,
-                    &buf[delayed_written..delayed_written + segment_len],
-                ) {
-                    Ok(result) => result,
-                    Err(_) if delayed_written != 0 => return Ok(delayed_written),
-                    Err(error) => return Err(error),
-                };
-                if let Some(written) = admitted {
-                    delayed_written = delayed_written
-                        .checked_add(written)
-                        .ok_or(SystemError::EOVERFLOW)?;
-                    continue;
-                }
-                if delayed_written != 0 {
-                    return Ok(delayed_written);
-                }
-                let has_head = !self.inner.lock().delalloc.production.entries.is_empty();
-                if !has_head {
-                    break;
-                }
-                self.drain_delalloc_before_eager()?;
-                break;
-            }
-            if delayed_written != 0 {
-                return Ok(delayed_written);
-            }
-            let _invalidate = page_cache.invalidate_write();
-            let _size_guard = self.size_lock.read();
-            let _io_guard = self.io_lock.lock();
-
-            // 使用缓存的文件大小，避免 getattr 磁盘 I/O
-            let old_file_size = {
-                let cached_size = self.inner.lock().cached_file_size;
-                match cached_size {
-                    Some(size) => size,
-                    None => {
-                        let size = fs
-                            .retry_metadata_read_contention(|| fs.fs.getattr(inode_num))?
-                            .size;
-                        self.inner.lock().cached_file_size = Some(size);
-                        size
-                    }
-                }
-            };
-
-            let new_end = offset.checked_add(len).ok_or(SystemError::EFBIG)?;
-            let alloc_start = (offset >> MMArch::PAGE_SHIFT) << MMArch::PAGE_SHIFT;
-            let alloc_end = new_end
-                .checked_add(MMArch::PAGE_SIZE - 1)
-                .ok_or(SystemError::EFBIG)?
-                & !(MMArch::PAGE_SIZE - 1);
-            let alloc_len = alloc_end
-                .checked_sub(alloc_start)
-                .ok_or(SystemError::EFBIG)?;
-
-            let time = PosixTimeSpec::now().tv_sec.to_u32().unwrap_or_else(|| {
-                log::warn!("Failed to get current time, using 0");
-                0
-            });
-            // `io_lock` serializes every mtime/ctime publisher in this inode.
-            // Exhaustion must be rejected before lower metadata or PageCache
-            // data becomes visible; a post-publication EOVERFLOW cannot be
-            // rolled back as a normal buffered-write error.
-            let (mtime_version, ctime_version) = {
-                let guard = self.inner.lock();
-                (
-                    guard
-                        .cached_mtime_version
-                        .checked_add(1)
-                        .ok_or(SystemError::EOVERFLOW)?,
-                    guard
-                        .cached_ctime_version
-                        .checked_add(1)
-                        .ok_or(SystemError::EOVERFLOW)?,
-                )
-            };
-            let stats_start = fs
-                .fs
-                .prepare_stats_enabled()
-                .then(CurrentTimeArch::get_cycles);
-            let prepare_result = fs.retry_metadata_contention(|| {
-                fs.fs.prepare_buffered_write(
-                    inode_num,
-                    alloc_start,
-                    alloc_len,
-                    new_end as u64,
-                    Some(time),
-                )
-            });
-            if let Some(start) = stats_start {
-                fs.fs.record_prepare_elapsed_cycles(
-                    CurrentTimeArch::get_cycles().wrapping_sub(start),
-                );
-            }
-            prepare_result?;
-
-            // 写入范围的磁盘块已就绪，现在安全写入 page cache。
-            let write_len = PageCache::write(&page_cache, offset, buf)?;
-            if write_len > 0 {
-                let written_end = offset.checked_add(write_len).ok_or(SystemError::EFBIG)?;
-                let current_file_size = core::cmp::max(old_file_size, written_end as u64);
-                let self_arc = {
-                    let mut guard = self.inner.lock();
-                    guard.cached_file_size = Some(current_file_size);
-                    guard.cached_times.mtime = time;
-                    guard.cached_times.ctime = time;
-                    guard.cached_mtime_version = mtime_version;
-                    guard.cached_ctime_version = ctime_version;
-                    guard.self_ref.upgrade().ok_or(SystemError::ENOENT)?
-                };
-                Ext4FileSystem::mark_inode_dirty(
-                    &self_arc,
-                    InodeDirtyState::SIZE_DIRTY
-                        | InodeDirtyState::MTIME_DIRTY
-                        | InodeDirtyState::CTIME_DIRTY,
-                )?;
-            }
-
-            Ok(write_len)
-        } else {
-            let _size_guard = self.size_lock.read();
-            self.write_direct(offset, len, buf, data)
-        }
+        self.remove_write_privileges_locked(context, stage)?;
+        source.with_buffer(len, |buffer| {
+            self.write_data_locked(offset, len.min(buffer.len()), buffer, data, &size_change)
+        })
     }
 
     fn write_sync(&self, offset: usize, buf: &[u8]) -> Result<usize, SystemError> {
-        let _operation = self.begin_operation()?;
-        let _delalloc_admission = self.close_production_delalloc_admission()?;
-        self.drain_delalloc_before_eager()?;
-        let _io_guard = self.io_lock.lock();
-        let _metadata_commit = self.metadata_commit_lock.lock();
-        let (fs, inode_num) = {
-            let guard = self.inner.lock();
-            (guard.concret_fs(), guard.inner_inode_num)
-        };
-        let file_type = fs
-            .retry_metadata_read_contention(|| fs.fs.getattr(inode_num))?
-            .ftype;
-        match file_type {
-            FileType::Directory => Err(SystemError::EISDIR),
-            FileType::Unknown => Err(SystemError::EROFS),
-            // Use write_data_only: blocks are pre-allocated by prepare_buffered_write() in write_at().
-            // Using Ext4::write() here would cause it to call write_inode_with_csum()
-            // which overwrites the inode's block_count/extent tree with a stale
-            // snapshot, causing setattr to re-allocate blocks endlessly until
-            // the extent tree overflows (entries > max_entries → EIO).
-            FileType::RegularFile => {
-                fs.retry_metadata_contention(|| fs.fs.write_data_only(inode_num, offset, buf))
-            }
-            _ => Err(SystemError::EINVAL),
-        }
+        // Writeback is replaying already-authorized data. It must neither
+        // reacquire size_change_lock nor clear newly installed capabilities.
+        self.write_eager_data(offset, buf)
     }
 
     fn write_direct(
@@ -2414,10 +2577,48 @@ impl IndexNode for LockedExt4Inode {
         offset: usize,
         len: usize,
         buf: &[u8],
-        _data: MutexGuard<FilePrivateData>,
+        data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
+        let mut publish = || {};
+        let mut stage = vfs::WritePrivilegeStage::new(&mut publish);
+        self.write_direct_with_privilege_stage(offset, len, buf, data, &mut stage)
+    }
+
+    fn write_direct_with_privilege_stage(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &[u8],
+        data: PrivateData,
+        stage: &mut vfs::WritePrivilegeStage<'_>,
+    ) -> Result<usize, SystemError> {
+        self.write_direct_with_inode_context(
+            offset,
+            len,
+            buf,
+            data,
+            &vfs::permission::InodeOpContext::legacy(),
+            stage,
+        )
+    }
+
+    fn write_direct_with_inode_context(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &[u8],
+        _data: MutexGuard<FilePrivateData>,
+        context: &vfs::permission::InodeOpContext,
+        stage: &mut vfs::WritePrivilegeStage<'_>,
+    ) -> Result<usize, SystemError> {
+        let _operation = self.begin_operation()?;
+        let _size_change = self.size_change_lock.read();
         let len = core::cmp::min(len, buf.len());
-        self.write_sync(offset, &buf[0..len])
+        if len == 0 {
+            return Ok(0);
+        }
+        self.remove_write_privileges_locked(context, stage)?;
+        self.write_eager_data(offset, &buf[0..len])
     }
 
     fn fs(&self) -> Arc<dyn vfs::FileSystem> {
@@ -2499,7 +2700,17 @@ impl IndexNode for LockedExt4Inode {
     }
 
     fn link(&self, name: &str, other: &Arc<dyn IndexNode>) -> Result<(), SystemError> {
+        self.link_with_inode_context(name, other, &vfs::permission::InodeOpContext::legacy())
+    }
+
+    fn link_with_inode_context(
+        &self,
+        name: &str,
+        other: &Arc<dyn IndexNode>,
+        context: &vfs::permission::InodeOpContext,
+    ) -> Result<(), SystemError> {
         let _operation = self.begin_operation()?;
+        let _io = self.io_lock.lock();
         let _namespace = self.namespace_lock.lock();
         let mut guard = self.inner.lock();
         let fs = guard.concret_fs();
@@ -2541,9 +2752,26 @@ impl IndexNode for LockedExt4Inode {
             return Err(SystemError::EEXIST);
         }
 
+        let parent = Self::metadata_from_attr(
+            &fs,
+            guard.vfs_inode_id,
+            guard.cached_file_size,
+            guard.cached_times,
+            my_attr,
+        );
+        let source = Self::metadata_from_attr(
+            &fs,
+            guard.vfs_inode_id,
+            None,
+            guard.cached_times,
+            other_attr,
+        );
+        vfs::permission::check_parent_create(&parent, context, false)?;
+        vfs::permission::check_inode_link_source(&source, context)?;
+
         fs.retry_metadata_contention(|| ext4.link(other_inode_num, inode_num, name))?;
         other_arc.tmpfile_linkable.store(false, Ordering::Release);
-        if other_attr.links == 0 {
+        if source.nlinks == 0 {
             // The orphan-del transaction made this inode live again. Discard
             // the one-shot capability published by its previous final unlink
             // before the fd retention that enabled AT_EMPTY_PATH can vanish.
@@ -2557,48 +2785,20 @@ impl IndexNode for LockedExt4Inode {
     }
 
     fn unlink(&self, name: &str) -> Result<vfs::LinkRemovalOutcome, SystemError> {
-        let _operation = self.begin_operation()?;
-        let _namespace = self.namespace_lock.lock();
-        let mut guard = self.inner.lock();
-        let fs = guard.concret_fs();
-        let ext4 = &fs.fs;
-        let inode_num = guard.inner_inode_num;
-        let attr = fs.retry_metadata_read_contention(|| ext4.getattr(inode_num))?;
-        if attr.ftype != another_ext4::FileType::Directory {
-            return Err(SystemError::ENOTDIR);
-        }
-        let target_num = fs.retry_metadata_read_contention(|| ext4.lookup(inode_num, name))?;
-        if fs
-            .retry_metadata_read_contention(|| ext4.getattr(target_num))?
-            .ftype
-            == FileType::Directory
-        {
-            return Err(SystemError::EISDIR);
-        }
-        let self_arc = guard.self_ref.upgrade().ok_or(SystemError::ENOENT)?;
-        let target = fs.get_or_create_inode(
-            target_num,
-            DName::from(name),
-            Some(Arc::downgrade(&self_arc)),
-        )?;
-        let target_lifecycle = target.lifecycle().clone();
-        let _link_mutation = target_lifecycle.lock_link_mutation();
-        let _target_operation = target.begin_operation()?;
-        match fs.retry_metadata_read_contention(|| ext4.lookup(inode_num, name)) {
-            Ok(current) if current == target_num => {}
-            Ok(_) => return Err(SystemError::EAGAIN_OR_EWOULDBLOCK),
-            Err(error) => return Err(error),
-        }
-        let reclaim = fs.retry_metadata_contention(|| ext4.unlink(inode_num, name))?;
-        let outcome = if reclaim.is_some() {
-            vfs::LinkRemovalOutcome::LastLink
-        } else {
-            vfs::LinkRemovalOutcome::StillLinked
-        };
-        target.handoff_namespace_reclaim(reclaim)?;
-        // 清理 children 缓存
-        let _ = guard.children.remove(&DName::from(name));
-        Ok(outcome)
+        self.unlink_with_operation_context(
+            name,
+            &crate::filesystem::vfs::permission::InodeOpContext::legacy(),
+        )
+    }
+
+    fn unlink_with_inode_context(
+        &self,
+        name: &str,
+        mutation: &crate::filesystem::vfs::mount::DentryMutationContext<'_>,
+        context: &crate::filesystem::vfs::permission::InodeOpContext,
+    ) -> Result<vfs::LinkRemovalOutcome, SystemError> {
+        mutation.ensure_locked();
+        self.unlink_with_operation_context(name, context)
     }
 
     fn metadata(&self) -> Result<vfs::Metadata, SystemError> {
@@ -2612,7 +2812,15 @@ impl IndexNode for LockedExt4Inode {
                 guard.cached_file_size,
             )
         };
-        let attr = fs.retry_metadata_read_contention(|| fs.fs.getattr(inode_num))?;
+        let attr = fs
+            .retry_metadata_read_contention(|| fs.fs.getattr_for_stat(inode_num))
+            .map_err(|error| {
+                if error == SystemError::ERANGE {
+                    SystemError::EOVERFLOW
+                } else {
+                    error
+                }
+            })?;
         // Read authoritative in-memory timestamps after the lower snapshot.
         let cached_times = self.inner.lock().cached_times;
         Ok(Self::metadata_from_attr(
@@ -2640,7 +2848,14 @@ impl IndexNode for LockedExt4Inode {
         };
         let attr = fs
             .fs
-            .getattr_cached(inode_num)?
+            .getattr_for_stat_cached(inode_num)
+            .map_err(|error| {
+                if error.code() == another_ext4::ErrCode::ERANGE {
+                    SystemError::EOVERFLOW
+                } else {
+                    error.into()
+                }
+            })?
             .ok_or(SystemError::EAGAIN_OR_EWOULDBLOCK)?;
         let cached_times = self
             .inner
@@ -2749,6 +2964,19 @@ impl IndexNode for LockedExt4Inode {
     fn set_metadata(&self, metadata: &vfs::Metadata) -> Result<(), SystemError> {
         let requested_size = metadata.size.max(0) as usize;
         let _operation = self.begin_operation()?;
+        let (type_fs, type_inode_num) = {
+            let guard = self.inner.lock();
+            (guard.concret_fs(), guard.inner_inode_num)
+        };
+        let actual_type = type_fs
+            .retry_metadata_read_contention(|| type_fs.fs.getattr(type_inode_num))?
+            .ftype;
+        let lifecycle = self.lifecycle().clone();
+        // Only real size changes need to preserve the orphan/link role across
+        // begin/finish. Directory attribute restoration must not take its
+        // lifecycle lock before io_lock: rename takes parent io locks first.
+        let _link_mutation =
+            (actual_type == FileType::RegularFile).then(|| lifecycle.lock_link_mutation());
         let size_change = self.size_change_lock.write();
         let _delalloc_admission = self.close_production_delalloc_admission()?;
         self.drain_delalloc_before_eager()?;
@@ -2767,6 +2995,42 @@ impl IndexNode for LockedExt4Inode {
                 guard.cached_ctime_version,
             )
         };
+        {
+            let _io = self.io_lock.lock();
+            let _metadata_commit = self.metadata_commit_lock.lock();
+            let actual_type = fs
+                .retry_metadata_read_contention(|| fs.fs.getattr(inode_num))?
+                .ftype;
+            if actual_type != FileType::RegularFile {
+                // Full snapshots used by overlay copy-up carry an inode size,
+                // but restoring attributes of a directory/symlink/device is
+                // not a truncate request (Linux ovl_set_attr has no ATTR_SIZE).
+                let mut attributes = metadata.clone();
+                attributes.file_type = Self::file_type(actual_type);
+                attributes.mode.remove(InodeMode::S_IFMT);
+                return self.set_masked_metadata_using(
+                    &attributes,
+                    SetMetadataMask::MODE
+                        | SetMetadataMask::UID
+                        | SetMetadataMask::GID
+                        | SetMetadataMask::ATIME
+                        | SetMetadataMask::MTIME
+                        | SetMetadataMask::CTIME,
+                    None,
+                    |_, id, prepared| {
+                        fs.retry_metadata_contention(|| {
+                            fs.fs.setattr(
+                                id,
+                                another_ext4::SetAttr {
+                                    crtime: Some(to_ext4_time(&metadata.btime)),
+                                    ..*prepared
+                                },
+                            )
+                        })
+                    },
+                );
+            }
+        }
         let next_atime_version = before_atime_version
             .checked_add(1)
             .ok_or(SystemError::EOVERFLOW)?;
@@ -2776,51 +3040,58 @@ impl IndexNode for LockedExt4Inode {
         let next_ctime_version = before_ctime_version
             .checked_add(1)
             .ok_or(SystemError::EOVERFLOW)?;
-        self.commit_size_mutation(&size_change, &fs, inode_num, requested_size, || {
-            let _metadata_commit = self.metadata_commit_lock.lock();
-            let ext4 = &fs.fs;
-            fs.retry_metadata_contention(|| {
-                ext4.setattr(
-                    inode_num,
-                    another_ext4::SetAttr {
-                        mode: Some(another_ext4::InodeMode::from_bits_truncate(
-                            mode.bits() as u16
-                        )),
-                        uid: Some(metadata.uid as u32),
-                        gid: Some(metadata.gid as u32),
-                        size: Some(requested_size as u64),
-                        atime: Some(to_ext4_time(&metadata.atime)),
-                        mtime: Some(to_ext4_time(&metadata.mtime)),
-                        ctime: Some(to_ext4_time(&metadata.ctime)),
-                        crtime: Some(to_ext4_time(&metadata.btime)),
-                    },
-                )
-            })?;
-            {
-                let mut guard = self.inner.lock();
-                guard.cached_file_size = Some(requested_size as u64);
-                guard.dirty_state.remove(InodeDirtyState::SIZE_DIRTY);
-                if guard.cached_atime_version == before_atime_version {
-                    guard.cached_times.atime = to_ext4_time(&metadata.atime);
-                    guard.cached_atime_version = next_atime_version;
-                    guard.durable_atime_version = guard.cached_atime_version;
-                    guard.dirty_state.remove(InodeDirtyState::ATIME_DIRTY);
+        self.commit_size_mutation(
+            &size_change,
+            &fs,
+            inode_num,
+            requested_size,
+            |previous_size| {
+                let _metadata_commit = self.metadata_commit_lock.lock();
+                let ext4 = &fs.fs;
+                let receipt = fs.retry_metadata_contention(|| {
+                    ext4.begin_size_change(
+                        inode_num,
+                        previous_size,
+                        &another_ext4::SetAttr {
+                            mode: Some(another_ext4::InodeMode::from_bits_truncate(
+                                mode.bits() as u16
+                            )),
+                            uid: Some(metadata.uid as u32),
+                            gid: Some(metadata.gid as u32),
+                            size: Some(requested_size as u64),
+                            atime: Some(to_ext4_time(&metadata.atime)),
+                            mtime: Some(to_ext4_time(&metadata.mtime)),
+                            ctime: Some(to_ext4_time(&metadata.ctime)),
+                            crtime: Some(to_ext4_time(&metadata.btime)),
+                        },
+                    )
+                })?;
+                {
+                    let mut guard = self.inner.lock();
+                    guard.cached_file_size = Some(requested_size as u64);
+                    guard.dirty_state.remove(InodeDirtyState::SIZE_DIRTY);
+                    if guard.cached_atime_version == before_atime_version {
+                        guard.cached_times.atime = to_ext4_time(&metadata.atime);
+                        guard.cached_atime_version = next_atime_version;
+                        guard.durable_atime_version = guard.cached_atime_version;
+                        guard.dirty_state.remove(InodeDirtyState::ATIME_DIRTY);
+                    }
+                    if guard.cached_mtime_version == before_mtime_version {
+                        guard.cached_times.mtime = to_ext4_time(&metadata.mtime);
+                        guard.cached_mtime_version = next_mtime_version;
+                        guard.durable_mtime_version = guard.cached_mtime_version;
+                        guard.dirty_state.remove(InodeDirtyState::MTIME_DIRTY);
+                    }
+                    if guard.cached_ctime_version == before_ctime_version {
+                        guard.cached_times.ctime = to_ext4_time(&metadata.ctime);
+                        guard.cached_ctime_version = next_ctime_version;
+                        guard.durable_ctime_version = guard.cached_ctime_version;
+                        guard.dirty_state.remove(InodeDirtyState::CTIME_DIRTY);
+                    }
                 }
-                if guard.cached_mtime_version == before_mtime_version {
-                    guard.cached_times.mtime = to_ext4_time(&metadata.mtime);
-                    guard.cached_mtime_version = next_mtime_version;
-                    guard.durable_mtime_version = guard.cached_mtime_version;
-                    guard.dirty_state.remove(InodeDirtyState::MTIME_DIRTY);
-                }
-                if guard.cached_ctime_version == before_ctime_version {
-                    guard.cached_times.ctime = to_ext4_time(&metadata.ctime);
-                    guard.cached_ctime_version = next_ctime_version;
-                    guard.durable_ctime_version = guard.cached_ctime_version;
-                    guard.dirty_state.remove(InodeDirtyState::CTIME_DIRTY);
-                }
-            }
-            Ok(())
-        })?;
+                Ok(receipt)
+            },
+        )?;
         self.release_clean_metadata_queue_owner(&fs);
 
         Ok(())
@@ -2834,109 +3105,33 @@ impl IndexNode for LockedExt4Inode {
         if mask.is_empty() {
             return Ok(());
         }
-
         let _operation = self.begin_operation()?;
+        let _size_change = self.size_change_lock.write();
         let _delalloc_admission = self.close_production_delalloc_admission()?;
         self.drain_delalloc_before_eager()?;
         let _io_guard = self.io_lock.lock();
         let _metadata_commit = self.metadata_commit_lock.lock();
-        let to_ext4_time =
-            |time: &PosixTimeSpec| -> u32 { time.tv_sec.max(0).min(u32::MAX as i64) as u32 };
-        let (fs, inode_num, before_atime_version, before_mtime_version, before_ctime_version) = {
-            let guard = self.inner.lock();
-            (
-                guard.concret_fs(),
-                guard.inner_inode_num,
-                guard.cached_atime_version,
-                guard.cached_mtime_version,
-                guard.cached_ctime_version,
-            )
-        };
-        let mode = metadata.mode.union(InodeMode::from(metadata.file_type));
-        let atime = mask
-            .contains(SetMetadataMask::ATIME)
-            .then(|| to_ext4_time(&metadata.atime));
-        let mtime = mask
-            .contains(SetMetadataMask::MTIME)
-            .then(|| to_ext4_time(&metadata.mtime));
-        let ctime = mask
-            .contains(SetMetadataMask::CTIME)
-            .then(|| to_ext4_time(&metadata.ctime));
-        let next_atime_version = atime
-            .map(|_| {
-                before_atime_version
-                    .checked_add(1)
-                    .ok_or(SystemError::EOVERFLOW)
-            })
-            .transpose()?;
-        let next_mtime_version = mtime
-            .map(|_| {
-                before_mtime_version
-                    .checked_add(1)
-                    .ok_or(SystemError::EOVERFLOW)
-            })
-            .transpose()?;
-        let next_ctime_version = ctime
-            .map(|_| {
-                before_ctime_version
-                    .checked_add(1)
-                    .ok_or(SystemError::EOVERFLOW)
-            })
-            .transpose()?;
+        self.set_masked_metadata_locked(metadata, mask, None)
+    }
 
-        fs.retry_metadata_contention(|| {
-            fs.fs.setattr(
-                inode_num,
-                another_ext4::SetAttr {
-                    mode: mask
-                        .contains(SetMetadataMask::MODE)
-                        .then(|| another_ext4::InodeMode::from_bits_truncate(mode.bits() as u16)),
-                    uid: mask
-                        .contains(SetMetadataMask::UID)
-                        .then_some(metadata.uid as u32),
-                    gid: mask
-                        .contains(SetMetadataMask::GID)
-                        .then_some(metadata.gid as u32),
-                    atime,
-                    mtime,
-                    ctime,
-                    ..Default::default()
-                },
-            )
-        })?;
-
-        {
-            let mut guard = self.inner.lock();
-            // Buffered reads/writes can update cached times without io_lock.
-            // Preserve and leave dirty any value that changed while setattr
-            // was in flight; writeback will then persist the newer value.
-            if let (Some(atime), Some(next_atime_version)) = (atime, next_atime_version) {
-                if guard.cached_atime_version == before_atime_version {
-                    guard.cached_times.atime = atime;
-                    guard.cached_atime_version = next_atime_version;
-                    guard.durable_atime_version = guard.cached_atime_version;
-                    guard.dirty_state.remove(InodeDirtyState::ATIME_DIRTY);
-                }
-            }
-            if let (Some(mtime), Some(next_mtime_version)) = (mtime, next_mtime_version) {
-                if guard.cached_mtime_version == before_mtime_version {
-                    guard.cached_times.mtime = mtime;
-                    guard.cached_mtime_version = next_mtime_version;
-                    guard.durable_mtime_version = guard.cached_mtime_version;
-                    guard.dirty_state.remove(InodeDirtyState::MTIME_DIRTY);
-                }
-            }
-            if let (Some(ctime), Some(next_ctime_version)) = (ctime, next_ctime_version) {
-                if guard.cached_ctime_version == before_ctime_version {
-                    guard.cached_times.ctime = ctime;
-                    guard.cached_ctime_version = next_ctime_version;
-                    guard.durable_ctime_version = guard.cached_ctime_version;
-                    guard.dirty_state.remove(InodeDirtyState::CTIME_DIRTY);
-                }
-            }
+    fn update_metadata_masked(
+        &self,
+        update: &mut vfs::MetadataUpdate<'_>,
+    ) -> Result<SetMetadataMask, SystemError> {
+        let _operation = self.begin_operation()?;
+        let _size_change = self.size_change_lock.write();
+        let _delalloc_admission = self.close_production_delalloc_admission()?;
+        self.drain_delalloc_before_eager()?;
+        let _io_guard = self.io_lock.lock();
+        let _metadata_commit = self.metadata_commit_lock.lock();
+        // metadata() does not acquire either mutation lock. Mode/owner setters
+        // cannot intervene between this raw snapshot and the masked commit.
+        let current = self.metadata()?;
+        let (requested, mask) = update(&current)?;
+        if !mask.is_empty() {
+            self.set_masked_metadata_locked(&requested, mask, None)?;
         }
-        self.release_clean_metadata_queue_owner(&fs);
-        Ok(())
+        Ok(mask)
     }
 
     fn update_atime(&self, now: PosixTimeSpec, relatime: bool) -> Result<(), SystemError> {
@@ -2960,139 +3155,164 @@ impl IndexNode for LockedExt4Inode {
     }
 
     fn resize(&self, len: usize) -> Result<(), SystemError> {
-        let _operation = self.begin_operation()?;
-        let size_change = self.size_change_lock.write();
-        let _delalloc_admission = self.close_production_delalloc_admission()?;
-        self.drain_delalloc_before_eager()?;
-        let (fs, inode_num) = {
-            let guard = self.inner.lock();
-            (guard.concret_fs(), guard.inner_inode_num)
-        };
-        self.commit_size_mutation(&size_change, &fs, inode_num, len, || {
-            let ext4 = &fs.fs;
-            fs.retry_metadata_contention(|| {
-                ext4.setattr(
-                    inode_num,
-                    another_ext4::SetAttr {
-                        mode: None,
-                        uid: None,
-                        gid: None,
-                        size: Some(len as u64),
-                        atime: None,
-                        mtime: None,
-                        ctime: None,
-                        crtime: None,
-                    },
-                )
-            })?;
-            // 更新缓存的文件大小
-            {
-                let mut guard = self.inner.lock();
-                guard.cached_file_size = Some(len as u64);
-                guard.dirty_state.remove(InodeDirtyState::SIZE_DIRTY);
-            }
-            self.release_clean_metadata_queue_owner(&fs);
-            Ok(())
-        })
+        self.resize_with_operation(len, None).map(|_| ())
+    }
+
+    fn resize_with_metadata(
+        &self,
+        len: usize,
+        lock_owner: u64,
+        metadata: &vfs::Metadata,
+        mask: SetMetadataMask,
+    ) -> Result<(), SystemError> {
+        self.resize_with_metadata_context(
+            len,
+            lock_owner,
+            metadata,
+            mask,
+            &vfs::permission::InodeOpContext::legacy(),
+        )
+        .map(|_| ())
+    }
+
+    fn resize_with_metadata_context(
+        &self,
+        len: usize,
+        _lock_owner: u64,
+        metadata: &vfs::Metadata,
+        mask: SetMetadataMask,
+        context: &vfs::permission::InodeOpContext,
+    ) -> Result<SetMetadataMask, SystemError> {
+        self.resize_with_operation(len, Some((metadata, mask, context)))
+    }
+
+    fn resize_file_with_metadata(
+        &self,
+        len: usize,
+        lock_owner: u64,
+        data: MutexGuard<FilePrivateData>,
+        metadata: &vfs::Metadata,
+        mask: SetMetadataMask,
+    ) -> Result<(), SystemError> {
+        self.resize_file_with_metadata_context(
+            len,
+            lock_owner,
+            data,
+            metadata,
+            mask,
+            &vfs::permission::InodeOpContext::legacy(),
+        )
+        .map(|_| ())
+    }
+
+    fn resize_file_with_metadata_context(
+        &self,
+        len: usize,
+        lock_owner: u64,
+        data: MutexGuard<FilePrivateData>,
+        metadata: &vfs::Metadata,
+        mask: SetMetadataMask,
+        context: &vfs::permission::InodeOpContext,
+    ) -> Result<SetMetadataMask, SystemError> {
+        drop(data);
+        self.resize_with_metadata_context(len, lock_owner, metadata, mask, context)
+    }
+
+    fn resize_open_truncate_with_inode_context(
+        &self,
+        len: usize,
+        lock_owner: u64,
+        data: MutexGuard<FilePrivateData>,
+        truncate: &vfs::OpenTruncateContext,
+        context: &vfs::permission::InodeOpContext,
+    ) -> Result<SetMetadataMask, SystemError> {
+        self.resize_file_with_metadata_context(
+            len,
+            lock_owner,
+            data,
+            &truncate.requested,
+            truncate.mask,
+            context,
+        )
     }
 
     fn fallocate_resize_atomic(
         &self,
-        _offset: usize,
+        offset: usize,
+        requested_end: usize,
+        lock_owner: u64,
+    ) -> Result<SetMetadataMask, SystemError> {
+        self.fallocate_resize_atomic_with_inode_context(
+            offset,
+            requested_end,
+            lock_owner,
+            &vfs::permission::InodeOpContext::legacy(),
+        )
+    }
+
+    fn fallocate_resize_atomic_with_inode_context(
+        &self,
+        offset: usize,
         requested_end: usize,
         _lock_owner: u64,
+        context: &vfs::permission::InodeOpContext,
     ) -> Result<SetMetadataMask, SystemError> {
-        let _operation = self.begin_operation()?;
-        let _size_change = self.size_change_lock.write();
-        let _delalloc_admission = self.close_production_delalloc_admission()?;
-        self.drain_delalloc_before_eager()?;
-        let page_cache = self.page_cache();
-        let _invalidate = page_cache.as_ref().map(|cache| cache.invalidate_write());
-        let _size_guard = self.size_lock.write();
-        let _io_guard = self.io_lock.lock();
-        let _metadata_commit = self.metadata_commit_lock.lock();
-        let to_ext4_time =
-            |time: &PosixTimeSpec| -> u32 { time.tv_sec.max(0).min(u32::MAX as i64) as u32 };
-        let (fs, inode_num, before_mtime_version, before_ctime_version) = {
-            let guard = self.inner.lock();
-            (
-                guard.concret_fs(),
-                guard.inner_inode_num,
-                guard.cached_mtime_version,
-                guard.cached_ctime_version,
-            )
-        };
-        // Re-read after taking ext4's mutation locks. A VFS snapshot can be
-        // stale after a concurrent grow or chmod and must never shrink data or
-        // restore privilege bits.
-        let current_metadata = self.metadata()?;
-        let current_size = current_metadata.size.max(0) as usize;
-        if requested_end > current_size {
-            vfs::vcore::check_file_size_limit(requested_end)?;
-        }
-        let effective_size = current_size.max(requested_end);
-        let (metadata, mask) =
-            vfs::vcore::prepare_write_side_effect_metadata(current_metadata, effective_size);
-        let mtime = mask
-            .contains(SetMetadataMask::MTIME)
-            .then(|| to_ext4_time(&metadata.mtime));
-        let ctime = mask
-            .contains(SetMetadataMask::CTIME)
-            .then(|| to_ext4_time(&metadata.ctime));
-        let next_mtime_version = mtime
-            .map(|_| {
-                before_mtime_version
-                    .checked_add(1)
-                    .ok_or(SystemError::EOVERFLOW)
-            })
-            .transpose()?;
-        let next_ctime_version = ctime
-            .map(|_| {
-                before_ctime_version
-                    .checked_add(1)
-                    .ok_or(SystemError::EOVERFLOW)
-            })
-            .transpose()?;
-        let mode = metadata.mode.union(InodeMode::from(metadata.file_type));
-        fs.retry_metadata_contention(|| {
-            fs.fs.setattr(
-                inode_num,
-                another_ext4::SetAttr {
-                    mode: mask
-                        .contains(SetMetadataMask::MODE)
-                        .then(|| another_ext4::InodeMode::from_bits_truncate(mode.bits() as u16)),
-                    size: (requested_end > current_size).then_some(requested_end as u64),
-                    mtime,
-                    ctime,
-                    ..Default::default()
-                },
-            )
-        })?;
-        {
-            let mut guard = self.inner.lock();
-            if requested_end > current_size {
-                guard.cached_file_size = Some(requested_end as u64);
-                guard.dirty_state.remove(InodeDirtyState::SIZE_DIRTY);
-            }
-            if let (Some(mtime), Some(version)) = (mtime, next_mtime_version) {
-                if guard.cached_mtime_version == before_mtime_version {
-                    guard.cached_times.mtime = mtime;
-                    guard.cached_mtime_version = version;
-                    guard.durable_mtime_version = version;
-                    guard.dirty_state.remove(InodeDirtyState::MTIME_DIRTY);
-                }
-            }
-            if let (Some(ctime), Some(version)) = (ctime, next_ctime_version) {
-                if guard.cached_ctime_version == before_ctime_version {
-                    guard.cached_times.ctime = ctime;
-                    guard.cached_ctime_version = version;
-                    guard.durable_ctime_version = version;
-                    guard.dirty_state.remove(InodeDirtyState::CTIME_DIRTY);
-                }
-            }
-        }
-        self.release_clean_metadata_queue_owner(&fs);
-        Ok(mask)
+        let len = requested_end
+            .checked_sub(offset)
+            .ok_or(SystemError::EINVAL)?;
+        let mut publish = || {};
+        let mut attrib = vfs::AttribStageObserver::new(&mut publish);
+        self.fallocate_with_context(0, offset, len, &mut attrib, context)
+    }
+
+    fn resize_with_metadata_result(
+        &self,
+        len: usize,
+        lock_owner: u64,
+        metadata: &vfs::Metadata,
+        mask: SetMetadataMask,
+    ) -> Result<SetMetadataMask, SystemError> {
+        self.resize_with_metadata_context(
+            len,
+            lock_owner,
+            metadata,
+            mask,
+            &vfs::permission::InodeOpContext::legacy(),
+        )
+    }
+
+    fn resize_file_with_metadata_result(
+        &self,
+        len: usize,
+        lock_owner: u64,
+        data: MutexGuard<FilePrivateData>,
+        metadata: &vfs::Metadata,
+        mask: SetMetadataMask,
+    ) -> Result<SetMetadataMask, SystemError> {
+        self.resize_file_with_metadata_context(
+            len,
+            lock_owner,
+            data,
+            metadata,
+            mask,
+            &vfs::permission::InodeOpContext::legacy(),
+        )
+    }
+
+    fn resize_open_truncate_result(
+        &self,
+        len: usize,
+        lock_owner: u64,
+        data: MutexGuard<FilePrivateData>,
+        truncate: &vfs::OpenTruncateContext,
+    ) -> Result<SetMetadataMask, SystemError> {
+        self.resize_open_truncate_with_inode_context(
+            len,
+            lock_owner,
+            data,
+            truncate,
+            &vfs::permission::InodeOpContext::legacy(),
+        )
     }
 
     fn fallocate_file(
@@ -3104,8 +3324,30 @@ impl IndexNode for LockedExt4Inode {
         attrib: &mut crate::filesystem::vfs::AttribStageObserver<'_>,
         data: MutexGuard<FilePrivateData>,
     ) -> Result<(), SystemError> {
+        self.fallocate_file_with_inode_context(
+            mode,
+            offset,
+            len,
+            lock_owner,
+            attrib,
+            data,
+            &vfs::permission::InodeOpContext::legacy(),
+        )
+    }
+
+    fn fallocate_file_with_inode_context(
+        &self,
+        mode: i32,
+        offset: usize,
+        len: usize,
+        _lock_owner: u64,
+        attrib: &mut crate::filesystem::vfs::AttribStageObserver<'_>,
+        data: MutexGuard<FilePrivateData>,
+        context: &vfs::permission::InodeOpContext,
+    ) -> Result<(), SystemError> {
         drop(data);
-        vfs::vcore::resize_based_fallocate(self, mode, offset, len, lock_owner, attrib)
+        self.fallocate_with_context(mode, offset, len, attrib, context)
+            .map(|_| ())
     }
 
     fn truncate(&self, len: usize) -> Result<(), SystemError> {
@@ -3114,70 +3356,20 @@ impl IndexNode for LockedExt4Inode {
     }
 
     fn rmdir(&self, name: &str) -> Result<(), SystemError> {
-        let _operation = self.begin_operation()?;
-        let _namespace = self.namespace_lock.lock();
-        let mut guard = self.inner.lock();
-        let fs = guard.concret_fs();
-        let concret_fs = &fs.fs;
-        let inode_num = guard.inner_inode_num;
-        if fs
-            .retry_metadata_read_contention(|| concret_fs.getattr(inode_num))?
-            .ftype
-            != FileType::Directory
-        {
-            return Err(SystemError::ENOTDIR);
-        }
-        let target_num =
-            fs.retry_metadata_read_contention(|| concret_fs.lookup(inode_num, name))?;
-        if target_num == inode_num {
-            return Err(if name == "." {
-                SystemError::EINVAL
-            } else {
-                SystemError::ENOTEMPTY
-            });
-        }
-        if fs
-            .retry_metadata_read_contention(|| concret_fs.getattr(target_num))?
-            .ftype
-            != FileType::Directory
-        {
-            return Err(SystemError::ENOTDIR);
-        }
-        if fs
-            .retry_metadata_read_contention(|| concret_fs.listdir(target_num))?
-            .len()
-            > 2
-        {
-            return Err(SystemError::ENOTEMPTY);
-        }
-        let self_arc = guard.self_ref.upgrade().ok_or(SystemError::ENOENT)?;
-        let target = fs.get_or_create_inode(
-            target_num,
-            DName::from(name),
-            Some(Arc::downgrade(&self_arc)),
-        )?;
-        let target_lifecycle = target.lifecycle().clone();
-        let _link_mutation = target_lifecycle.lock_link_mutation();
-        match fs.retry_metadata_read_contention(|| concret_fs.lookup(inode_num, name)) {
-            Ok(current) if current == target_num => {}
-            Ok(_) => return Err(SystemError::EAGAIN_OR_EWOULDBLOCK),
-            Err(error) => return Err(error),
-        }
-        let target_attr = fs.retry_metadata_read_contention(|| concret_fs.getattr(target_num))?;
-        if target_attr.ftype != FileType::Directory {
-            return Err(SystemError::ENOTDIR);
-        }
-        match fs.retry_metadata_read_contention(|| concret_fs.listdir(target_num)) {
-            Ok(entries) if entries.len() <= 2 => {}
-            Ok(_) => return Err(SystemError::ENOTEMPTY),
-            Err(error) => return Err(error),
-        }
-        let reclaim = fs.retry_metadata_contention(|| concret_fs.rmdir(inode_num, name))?;
-        target.handoff_namespace_reclaim(reclaim)?;
-        // 清理 children 缓存
-        let _ = guard.children.remove(&DName::from(name));
+        self.rmdir_with_operation_context(
+            name,
+            &crate::filesystem::vfs::permission::InodeOpContext::legacy(),
+        )
+    }
 
-        Ok(())
+    fn rmdir_with_inode_context(
+        &self,
+        name: &str,
+        mutation: &crate::filesystem::vfs::mount::DentryMutationContext<'_>,
+        context: &crate::filesystem::vfs::permission::InodeOpContext,
+    ) -> Result<(), SystemError> {
+        mutation.ensure_locked();
+        self.rmdir_with_operation_context(name, context)
     }
 
     fn dname(&self) -> Result<DName, SystemError> {
@@ -3221,6 +3413,7 @@ impl IndexNode for LockedExt4Inode {
 
     fn setxattr(&self, name: &str, value: &[u8], flags: XattrFlags) -> Result<usize, SystemError> {
         let _operation = self.begin_operation()?;
+        let _size_change = self.size_change_lock.write();
         let guard = self.inner.lock();
         let fs = guard.concret_fs();
         let ext4 = &fs.fs;
@@ -3282,6 +3475,7 @@ impl IndexNode for LockedExt4Inode {
 
     fn removexattr(&self, name: &str) -> Result<usize, SystemError> {
         let _operation = self.begin_operation()?;
+        let _size_change = self.size_change_lock.write();
         let guard = self.inner.lock();
         let fs = guard.concret_fs();
         let ext4 = &fs.fs;
@@ -3299,21 +3493,49 @@ impl IndexNode for LockedExt4Inode {
         Ok(0)
     }
 
+    fn remove_security_privileges(&self) -> Result<(), SystemError> {
+        let _operation = self.begin_operation()?;
+        let _size_change = self.size_change_lock.write();
+        self.kill_security_privileges_locked()
+    }
+
     fn mknod(
         &self,
         filename: &str,
         mode: InodeMode,
         dev_t: DeviceNumber,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
+        self.mknod_with_context(
+            filename,
+            mode,
+            dev_t,
+            &vfs::permission::InodeOpContext::legacy(),
+        )
+    }
+
+    fn mknod_with_context(
+        &self,
+        filename: &str,
+        mode: InodeMode,
+        dev_t: DeviceNumber,
+        context: &vfs::permission::InodeOpContext,
+    ) -> Result<Arc<dyn IndexNode>, SystemError> {
         let file_type = vfs::FileType::from(mode);
         if file_type == vfs::FileType::File {
-            return self.create(filename, vfs::FileType::File, mode);
+            return self.create_with_context(filename, vfs::FileType::File, mode, context);
         }
         let _operation = self.begin_operation()?;
         let _io = self.io_lock.lock();
         let _namespace = self.namespace_lock.lock();
         let parent_metadata = self.metadata()?;
-        let init = vfs::permission::child_inode_init(&parent_metadata, file_type, mode);
+        self.check_new_name_locked(filename)?;
+        vfs::permission::check_parent_create(&parent_metadata, context, false)?;
+        let init = vfs::permission::child_inode_init_with_context(
+            &parent_metadata,
+            file_type,
+            mode,
+            context,
+        )?;
 
         let mut guard = self.inner.lock();
         let fs = guard.concret_fs();
@@ -3393,17 +3615,301 @@ impl IndexNode for LockedExt4Inode {
         new_name: &str,
         flags: RenameFlags,
     ) -> Result<vfs::RenameOutcome, SystemError> {
+        self.move_with_inode_context(
+            old_name,
+            target,
+            new_name,
+            flags,
+            &crate::filesystem::vfs::permission::InodeOpContext::legacy(),
+        )
+    }
+
+    fn move_to_with_inode_context(
+        &self,
+        old_name: &str,
+        target: &Arc<dyn IndexNode>,
+        new_name: &str,
+        flags: RenameFlags,
+        mutation: &crate::filesystem::vfs::mount::DentryMutationContext<'_>,
+        context: &crate::filesystem::vfs::permission::InodeOpContext,
+    ) -> Result<vfs::RenameOutcome, SystemError> {
+        mutation.ensure_locked();
+        self.move_with_inode_context(old_name, target, new_name, flags, context)
+    }
+}
+
+impl LockedExt4Inode {
+    /// Native allocation and hole punching share one canonical privilege
+    /// stage. This stage can commit even when a later allocation fails.
+    fn fallocate_with_context(
+        &self,
+        mode: i32,
+        offset: usize,
+        len: usize,
+        attrib: &mut vfs::AttribStageObserver<'_>,
+        context: &vfs::permission::InodeOpContext,
+    ) -> Result<SetMetadataMask, SystemError> {
+        const KEEP_SIZE: i32 = 0x01;
+        const PUNCH_HOLE: i32 = 0x02;
+        if mode != 0 && mode != KEEP_SIZE && mode != (KEEP_SIZE | PUNCH_HOLE) {
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        }
+        if len == 0 {
+            return Err(SystemError::EINVAL);
+        }
+        let end = offset
+            .checked_add(len)
+            .filter(|end| *end <= isize::MAX as usize)
+            .ok_or(SystemError::EFBIG)?;
+        if mode & PUNCH_HOLE == 0 && (end - 1) / another_ext4::BLOCK_SIZE >= u32::MAX as usize {
+            return Err(SystemError::EFBIG);
+        }
+        // This backend maps one filesystem block per cache page.
+        if MMArch::PAGE_SIZE != another_ext4::BLOCK_SIZE {
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        }
         let _operation = self.begin_operation()?;
-        let _source_io = self.io_lock.lock();
-        let whiteout_init = if flags.contains(RenameFlags::WHITEOUT) {
-            Some(vfs::permission::child_inode_init(
-                &self.metadata()?,
-                vfs::FileType::CharDevice,
-                InodeMode::S_IFCHR | InodeMode::from_bits_truncate(0o600),
-            ))
-        } else {
-            None
+        let _size_change = self.size_change_lock.write();
+        let _admission = self.close_production_delalloc_admission()?;
+        self.drain_delalloc_before_eager()?;
+        let (fs, inode_num) = {
+            let inner = self.inner.lock();
+            (inner.concret_fs(), inner.inner_inode_num)
         };
+        let cache = self.page_cache().ok_or(SystemError::EIO)?;
+        let (size, mask) = {
+            let _size = self.size_lock.write();
+            let _io = self.io_lock.lock();
+            let _metadata = self.metadata_commit_lock.lock();
+            let current = self.metadata()?;
+            if current.file_type != vfs::FileType::File {
+                return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+            }
+            let size = current.size.max(0) as usize;
+            if mode & PUNCH_HOLE != 0 && offset >= size {
+                return Ok(SetMetadataMask::empty());
+            }
+            if mode == 0 && end > size {
+                vfs::vcore::check_file_size_limit(end)?;
+            }
+            let (requested, mask) = vfs::vcore::prepare_backing_fallocate_metadata(
+                context,
+                &current,
+                size,
+                self.needs_security_privilege_removal_locked(),
+            )?;
+            self.set_masked_metadata_locked(&requested, mask, None)?;
+            (size, mask)
+        };
+        if mask.contains(SetMetadataMask::MODE) {
+            attrib.commit();
+        }
+        if mode & PUNCH_HOLE != 0 {
+            // Linux includes the remainder of the EOF page, but never changes
+            // i_size. No old disk-size clamp is permitted after cache removal.
+            let eof_page_end = size
+                .checked_add(MMArch::PAGE_SIZE - size % MMArch::PAGE_SIZE)
+                .ok_or(SystemError::EFBIG)?;
+            self.punch_fallocate_range(&fs, inode_num, &cache, offset, end.min(eof_page_end))?;
+        } else {
+            self.preallocate_fallocate_range(&fs, inode_num, &cache, offset..end, size, mode == 0)?;
+        }
+        Ok(mask)
+    }
+
+    fn preallocate_fallocate_range(
+        &self,
+        fs: &Arc<Ext4FileSystem>,
+        inode_num: u32,
+        cache: &Arc<PageCache>,
+        range: core::ops::Range<usize>,
+        mut size: usize,
+        grow: bool,
+    ) -> Result<(), SystemError> {
+        let mut offset = range.start;
+        let end = range.end;
+        let mut image =
+            Box::try_new([0u8; another_ext4::BLOCK_SIZE]).map_err(|_| SystemError::ENOMEM)?;
+        while offset < end {
+            // MM locks and entry waits never nest inside size/io/mapping gates.
+            let tail = (grow && size < end && !size.is_multiple_of(MMArch::PAGE_SIZE))
+                .then_some(size >> MMArch::PAGE_SHIFT);
+            if let Some(index) = tail {
+                cache.unmap_mapping_pages(index, Some(index + 1))?;
+            }
+            let invalidate = cache.invalidate_write();
+            let pin = if let Some(index) = tail {
+                match cache.try_prepare_range_page_locked(index)? {
+                    PageCacheRangeResult::Ready(pin) => Some(pin),
+                    PageCacheRangeResult::Retry(retry) => {
+                        drop(invalidate);
+                        retry.wait()?;
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
+            let page = pin.as_ref().map(|pin| pin.page());
+            // Existing MAP_SHARED writes have been unmapped. Remote writes
+            // that already hold a pin are serialized by this exact Page lock.
+            let mut page_guard = page.as_ref().map(|page| page.write());
+            let _size = self.size_lock.write();
+            let _io = self.io_lock.lock();
+            let _mapping = self.mapping_io.close_for_mutation();
+            let _metadata = self.metadata_commit_lock.lock();
+            if let Some(page) = page_guard.as_mut() {
+                unsafe {
+                    image.copy_from_slice(page.as_slice());
+                }
+                image[size % MMArch::PAGE_SIZE..].fill(0);
+                fs.retry_metadata_contention(|| {
+                    fs.fs
+                        .write_existing_block_image(inode_num, tail.unwrap() as u32, &image)
+                })?;
+                // Only after the existing initialized block is durably zeroed
+                // may the cache tail and the subsequently enlarged EOF appear.
+                unsafe {
+                    page.as_slice_mut()[size % MMArch::PAGE_SIZE..].fill(0);
+                }
+            }
+            let progress = fs.retry_metadata_contention(|| {
+                fs.fs
+                    .preallocate_range_batch(inode_num, offset, end - offset)
+            })?;
+            if progress.next_offset <= offset || progress.next_offset > end {
+                return Err(SystemError::EIO);
+            }
+            if grow && progress.next_offset > size {
+                let current = self.metadata()?;
+                self.set_masked_metadata_locked(
+                    &current,
+                    SetMetadataMask::empty(),
+                    Some(progress.next_offset),
+                )?;
+                size = progress.next_offset;
+            }
+            offset = progress.next_offset;
+            // invalidate_write remains live until payload, mapping and SIZE
+            // publication are complete; a reader cannot refill an old view.
+        }
+        Ok(())
+    }
+
+    fn punch_fallocate_range(
+        &self,
+        fs: &Arc<Ext4FileSystem>,
+        inode_num: u32,
+        cache: &Arc<PageCache>,
+        start: usize,
+        end: usize,
+    ) -> Result<(), SystemError> {
+        let first = start >> MMArch::PAGE_SHIFT;
+        let limit = end.div_ceil(MMArch::PAGE_SIZE);
+        let full_first = start.div_ceil(MMArch::PAGE_SIZE);
+        let full_end = end >> MMArch::PAGE_SHIFT;
+        let first_block = u32::try_from(full_first).map_err(|_| SystemError::EFBIG)?;
+        let end_block = u32::try_from(full_end).map_err(|_| SystemError::EFBIG)?;
+        let mut image =
+            Box::try_new([0u8; another_ext4::BLOCK_SIZE]).map_err(|_| SystemError::ENOMEM)?;
+        loop {
+            cache.unmap_mapping_pages(first, Some(limit))?;
+            let invalidate = cache.invalidate_write();
+            let mut edges = Vec::new();
+            edges
+                .try_reserve_exact(2)
+                .map_err(|_| SystemError::ENOMEM)?;
+            let mut retry = None;
+            for (position, index) in [first, limit - 1].into_iter().enumerate() {
+                if position != 0 && index == first {
+                    continue;
+                }
+                if index >= full_first && index < full_end {
+                    continue;
+                }
+                match cache.try_prepare_range_page_locked(index)? {
+                    PageCacheRangeResult::Ready(pin) => {
+                        // Reserve backing ownership before changing any byte.
+                        let reservation = cache.prepare_page_dirty()?;
+                        edges.push((index, pin, reservation));
+                    }
+                    PageCacheRangeResult::Retry(wait) => {
+                        retry = Some(wait);
+                        break;
+                    }
+                }
+            }
+            if retry.is_none() && full_first < full_end {
+                if let PageCacheRangeResult::Retry(wait) =
+                    cache.try_discard_range_locked(full_first, full_end)?
+                {
+                    retry = Some(wait);
+                }
+            }
+            if let Some(retry) = retry {
+                drop(edges);
+                drop(invalidate);
+                retry.wait()?;
+                continue;
+            }
+            // Every fallible cache preparation is complete before fine inode
+            // locks. Each boundary is unique and processed in ascending order.
+            for (index, pin, mut reservation) in edges {
+                let page = pin.page();
+                let mut page_guard = page.write();
+                let begin = start.saturating_sub(index * MMArch::PAGE_SIZE);
+                let finish = (end - index * MMArch::PAGE_SIZE).min(MMArch::PAGE_SIZE);
+                unsafe {
+                    image.copy_from_slice(page_guard.as_slice());
+                }
+                image[begin..finish].fill(0);
+                let _size = self.size_lock.write();
+                let _io = self.io_lock.lock();
+                let _mapping = self.mapping_io.close_for_mutation();
+                let outcome = fs.retry_metadata_contention(|| {
+                    fs.fs
+                        .write_existing_block_image(inode_num, index as u32, &image)
+                })?;
+                // A clean hole/unwritten boundary needs no cache dirtiness or
+                // allocation. Keep dirty outside bytes owned by their existing
+                // writeback lifetime, even though this payload was flushed.
+                let dirty = page_guard
+                    .flags()
+                    .contains(crate::mm::page::PageFlags::PG_DIRTY);
+                if dirty {
+                    cache.mark_page_dirty_prepared_page_locked(
+                        index,
+                        &mut reservation,
+                        &page_guard,
+                    )?;
+                }
+                if dirty || matches!(outcome, another_ext4::ExistingBlockImageOutcome::Written) {
+                    unsafe {
+                        page_guard.as_slice_mut()[begin..finish].fill(0);
+                    }
+                }
+            }
+            let _size = self.size_lock.write();
+            let _io = self.io_lock.lock();
+            let _mapping = self.mapping_io.close_for_mutation();
+            if full_first < full_end {
+                fs.retry_metadata_contention(|| {
+                    fs.fs.punch_block_range(inode_num, first_block, end_block)
+                })?;
+            }
+            return Ok(());
+        }
+    }
+
+    fn move_with_inode_context(
+        &self,
+        old_name: &str,
+        target: &Arc<dyn IndexNode>,
+        new_name: &str,
+        flags: RenameFlags,
+        context: &crate::filesystem::vfs::permission::InodeOpContext,
+    ) -> Result<vfs::RenameOutcome, SystemError> {
+        let _operation = self.begin_operation()?;
         let target_locked = target
             .clone()
             .downcast_arc::<LockedExt4Inode>()
@@ -3419,6 +3925,16 @@ impl IndexNode for LockedExt4Inode {
         if !Arc::ptr_eq(&ext4_fs, &target_locked.inner.lock().concret_fs()) {
             return Err(SystemError::EXDEV);
         }
+
+        // Take both metadata/mutation locks in canonical inode order before
+        // namespace locks; opposite-direction renames must not form ABBA.
+        let (_first_io, _second_io) = if src_inode_num == target_inode_num {
+            (self.io_lock.lock(), None)
+        } else if src_inode_num < target_inode_num {
+            (self.io_lock.lock(), Some(target_locked.io_lock.lock()))
+        } else {
+            (target_locked.io_lock.lock(), Some(self.io_lock.lock()))
+        };
 
         let (_first_namespace, _second_namespace) = if src_inode_num == target_inode_num {
             (self.namespace_lock.lock(), None)
@@ -3449,6 +3965,46 @@ impl IndexNode for LockedExt4Inode {
         // Same directory, same name -> no-op
         if src_inode_num == target_inode_num && old_dname == new_dname {
             return Ok(vfs::RenameOutcome::NoOp);
+        }
+
+        let src_child_num =
+            ext4_fs.retry_metadata_read_contention(|| ext4.lookup(src_inode_num, old_name))?;
+        let dst_inode_num = match ext4_fs
+            .retry_metadata_read_contention(|| ext4.lookup(target_inode_num, new_name))
+        {
+            Ok(inode) => Some(inode),
+            Err(SystemError::ENOENT) => None,
+            Err(error) => return Err(error),
+        };
+        if dst_inode_num == Some(src_child_num) {
+            return Ok(vfs::RenameOutcome::NoOp);
+        }
+        let source = ext4_fs
+            .get_or_create_inode(src_child_num, old_dname.clone(), None)?
+            .metadata()?;
+        vfs::permission::check_inode_delete(
+            &self.metadata()?,
+            &source,
+            source.file_type == vfs::FileType::Dir,
+            context,
+        )?;
+        if let Some(number) = dst_inode_num {
+            let victim = ext4_fs
+                .get_or_create_inode(number, new_dname.clone(), None)?
+                .metadata()?;
+            let directory = if flags.contains(RenameFlags::EXCHANGE) {
+                victim.file_type == vfs::FileType::Dir
+            } else {
+                source.file_type == vfs::FileType::Dir
+            };
+            vfs::permission::check_inode_delete(
+                &target_locked.metadata()?,
+                &victim,
+                directory,
+                context,
+            )?;
+        } else {
+            vfs::permission::check_parent_create(&target_locked.metadata()?, context, false)?;
         }
 
         // RENAME_EXCHANGE: 原子交换两个文件/目录
@@ -3482,6 +4038,21 @@ impl IndexNode for LockedExt4Inode {
         if dst_inode_num == Some(src_child_num) {
             return Ok(vfs::RenameOutcome::NoOp);
         }
+
+        // Parent namespace and ownership locks are held. Prepare identity
+        // before allocating a whiteout or modifying source/destination names.
+        let whiteout_init = if flags.contains(RenameFlags::WHITEOUT) {
+            let parent_metadata = self.metadata()?;
+            vfs::permission::check_parent_create(&parent_metadata, context, false)?;
+            Some(vfs::permission::child_inode_init_with_context(
+                &parent_metadata,
+                vfs::FileType::CharDevice,
+                InodeMode::S_IFCHR | InodeMode::from_bits_truncate(0o600),
+                context,
+            )?)
+        } else {
+            None
+        };
         let had_dst = dst_inode_num.is_some();
         let dst_inode = if let Some(dst_inode_num) = dst_inode_num {
             let target_parent = target_locked
@@ -3683,63 +4254,657 @@ impl IndexNode for LockedExt4Inode {
         }
         Ok(vfs::RenameOutcome::Moved { replaced })
     }
-}
+    /// Primary writes hold size_change_lock for read; capability setters and
+    /// ownership/size mutations hold it for write. Writeback deliberately does
+    /// not enter this privilege-removal stage.
+    fn remove_write_privileges_locked(
+        &self,
+        context: &vfs::permission::InodeOpContext,
+        stage: &mut vfs::WritePrivilegeStage<'_>,
+    ) -> Result<(), SystemError> {
+        let raw = self.metadata()?;
+        if raw.file_type != vfs::FileType::File {
+            stage.complete();
+            return Ok(());
+        }
+        let derive = |raw: &vfs::Metadata| {
+            let view = context.view_metadata(raw);
+            let mut requested = view.clone();
+            let mut mask = SetMetadataMask::empty();
+            if let Some(cred) = &context.cred {
+                let (derived, derived_mask) =
+                    vfs::vcore::prepare_write_side_effect_metadata_with_cred(
+                        view,
+                        raw.size.max(0) as usize,
+                        cred,
+                    );
+                if derived_mask.contains(SetMetadataMask::MODE) {
+                    requested.mode = derived.mode;
+                    requested.ctime = derived.ctime;
+                    mask |= SetMetadataMask::MODE
+                        | SetMetadataMask::CTIME
+                        | SetMetadataMask::WRITE_SIDE_EFFECT;
+                }
+            }
+            if self.needs_security_privilege_removal_locked() {
+                mask.insert(SetMetadataMask::KILL_PRIV);
+            }
+            (requested, mask)
+        };
+        if derive(&raw).1.is_empty() {
+            stage.complete();
+            return Ok(());
+        }
+        // Match the existing metadata mutation order. Primary writers share
+        // the size-change read side, so re-read under io_lock rather than
+        // restoring a mode snapshot another primary writer already cleared.
+        let _delalloc_admission = self.close_production_delalloc_admission()?;
+        self.drain_delalloc_before_eager()?;
+        let io = self.io_lock.lock();
+        let metadata_commit = self.metadata_commit_lock.lock();
+        let current = self.metadata()?;
+        let (requested, mask) = derive(&current);
+        if !mask.is_empty() {
+            let backing = context.backing_metadata_request(&current, &requested, mask)?;
+            self.set_masked_metadata_locked(&backing, mask, None)?;
+        }
+        drop(metadata_commit);
+        drop(io);
+        stage.complete();
+        // Linux __vfs_removexattr used by killpriv does not notify; only an
+        // actual ATTR_MODE change contributes ATTRIB in fsnotify_change.
+        if mask.contains(SetMetadataMask::MODE) {
+            stage.commit_attrib();
+        }
+        Ok(())
+    }
 
-impl LockedExt4Inode {
+    /// Publish data under the primary caller's existing canonical content guard.
+    /// User materialization must finish before entering any page-cache/io locks.
+    fn write_data_locked(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &[u8],
+        data: PrivateData,
+        _content: &RwSemReadGuard<'_, ()>,
+    ) -> Result<usize, SystemError> {
+        let buf = &buf[..len];
+        let (fs, inode_num, page_cache) = {
+            let guard = self.inner.lock();
+            (
+                guard.concret_fs(),
+                guard.inner_inode_num,
+                guard.page_cache.clone(),
+            )
+        };
+
+        if let Some(page_cache) = page_cache {
+            let mut delayed_written = 0usize;
+            while delayed_written < buf.len() {
+                let segment_offset = offset
+                    .checked_add(delayed_written)
+                    .ok_or(SystemError::EFBIG)?;
+                let page_remaining = MMArch::PAGE_SIZE - (segment_offset & (MMArch::PAGE_SIZE - 1));
+                let segment_len = core::cmp::min(page_remaining, buf.len() - delayed_written);
+                let merged = match self.try_merge_delalloc_tail_segment(
+                    &page_cache,
+                    segment_offset,
+                    &buf[delayed_written..delayed_written + segment_len],
+                ) {
+                    Ok(result) => result,
+                    Err(_) if delayed_written != 0 => return Ok(delayed_written),
+                    Err(error) => return Err(error),
+                };
+                if let Some(written) = merged {
+                    delayed_written = delayed_written
+                        .checked_add(written)
+                        .ok_or(SystemError::EOVERFLOW)?;
+                    continue;
+                }
+                let admitted = match self.try_write_delalloc_new_page_segment(
+                    &page_cache,
+                    segment_offset,
+                    &buf[delayed_written..delayed_written + segment_len],
+                ) {
+                    Ok(result) => result,
+                    Err(_) if delayed_written != 0 => return Ok(delayed_written),
+                    Err(error) => return Err(error),
+                };
+                if let Some(written) = admitted {
+                    delayed_written = delayed_written
+                        .checked_add(written)
+                        .ok_or(SystemError::EOVERFLOW)?;
+                    continue;
+                }
+                if delayed_written != 0 {
+                    return Ok(delayed_written);
+                }
+                let has_head = !self.inner.lock().delalloc.production.entries.is_empty();
+                if !has_head {
+                    break;
+                }
+                self.drain_delalloc_before_eager()?;
+                break;
+            }
+            if delayed_written != 0 {
+                return Ok(delayed_written);
+            }
+            let _invalidate = page_cache.invalidate_write();
+            let _size_guard = self.size_lock.read();
+            let _io_guard = self.io_lock.lock();
+
+            // 使用缓存的文件大小，避免 getattr 磁盘 I/O
+            let old_file_size = {
+                let cached_size = self.inner.lock().cached_file_size;
+                match cached_size {
+                    Some(size) => size,
+                    None => {
+                        let size = fs
+                            .retry_metadata_read_contention(|| fs.fs.getattr(inode_num))?
+                            .size;
+                        self.inner.lock().cached_file_size = Some(size);
+                        size
+                    }
+                }
+            };
+
+            let new_end = offset.checked_add(len).ok_or(SystemError::EFBIG)?;
+            let alloc_start = (offset >> MMArch::PAGE_SHIFT) << MMArch::PAGE_SHIFT;
+            let alloc_end = new_end
+                .checked_add(MMArch::PAGE_SIZE - 1)
+                .ok_or(SystemError::EFBIG)?
+                & !(MMArch::PAGE_SIZE - 1);
+            let alloc_len = alloc_end
+                .checked_sub(alloc_start)
+                .ok_or(SystemError::EFBIG)?;
+
+            let time = PosixTimeSpec::now().tv_sec.to_u32().unwrap_or_else(|| {
+                log::warn!("Failed to get current time, using 0");
+                0
+            });
+            // `io_lock` serializes every mtime/ctime publisher in this inode.
+            // Exhaustion must be rejected before lower metadata or PageCache
+            // data becomes visible; a post-publication EOVERFLOW cannot be
+            // rolled back as a normal buffered-write error.
+            let (mtime_version, ctime_version) = {
+                let guard = self.inner.lock();
+                (
+                    guard
+                        .cached_mtime_version
+                        .checked_add(1)
+                        .ok_or(SystemError::EOVERFLOW)?,
+                    guard
+                        .cached_ctime_version
+                        .checked_add(1)
+                        .ok_or(SystemError::EOVERFLOW)?,
+                )
+            };
+            let stats_start = fs
+                .fs
+                .prepare_stats_enabled()
+                .then(CurrentTimeArch::get_cycles);
+            let prepare_result = fs.retry_metadata_contention(|| {
+                fs.fs.prepare_buffered_write(
+                    inode_num,
+                    alloc_start,
+                    alloc_len,
+                    new_end as u64,
+                    Some(time),
+                )
+            });
+            if let Some(start) = stats_start {
+                fs.fs.record_prepare_elapsed_cycles(
+                    CurrentTimeArch::get_cycles().wrapping_sub(start),
+                );
+            }
+            prepare_result?;
+
+            // 写入范围的磁盘块已就绪，现在安全写入 page cache。
+            let write_len = PageCache::write(&page_cache, offset, buf)?;
+            if write_len > 0 {
+                let written_end = offset.checked_add(write_len).ok_or(SystemError::EFBIG)?;
+                let current_file_size = core::cmp::max(old_file_size, written_end as u64);
+                let self_arc = {
+                    let mut guard = self.inner.lock();
+                    guard.cached_file_size = Some(current_file_size);
+                    guard.cached_times.mtime = time;
+                    guard.cached_times.ctime = time;
+                    guard.cached_mtime_version = mtime_version;
+                    guard.cached_ctime_version = ctime_version;
+                    guard.self_ref.upgrade().ok_or(SystemError::ENOENT)?
+                };
+                Ext4FileSystem::mark_inode_dirty(
+                    &self_arc,
+                    InodeDirtyState::SIZE_DIRTY
+                        | InodeDirtyState::MTIME_DIRTY
+                        | InodeDirtyState::CTIME_DIRTY,
+                )?;
+            }
+
+            Ok(write_len)
+        } else {
+            let _size_guard = self.size_lock.read();
+            drop(data);
+            self.write_eager_data(offset, buf)
+        }
+    }
+
+    fn needs_security_privilege_removal_locked(&self) -> bool {
+        let (fs, inode_num) = {
+            let guard = self.inner.lock();
+            (guard.concret_fs(), guard.inner_inode_num)
+        };
+        // Linux cap_inode_need_killpriv treats only a positive raw xattr size
+        // as a removal request, including malformed but nonempty values.
+        fs.retry_metadata_read_contention(|| fs.fs.getxattr(inode_num, "security.capability"))
+            .is_ok_and(|value| !value.is_empty())
+    }
+
+    /// Caller holds size_change_lock (read or write) and has completed any
+    /// notify_change mapping/authorization checks. Never reenter public xattr
+    /// or MountFS APIs here: those acquire the write side and CAP_SETFCAP.
+    pub(super) fn kill_security_privileges_locked(&self) -> Result<(), SystemError> {
+        if !self.needs_security_privilege_removal_locked() {
+            return Ok(());
+        }
+        let (fs, inode_num) = {
+            let guard = self.inner.lock();
+            (guard.concret_fs(), guard.inner_inode_num)
+        };
+        match fs.retry_metadata_contention(|| fs.fs.removexattr(inode_num, "security.capability")) {
+            Ok(()) | Err(SystemError::ENODATA) | Err(SystemError::EOPNOTSUPP_OR_ENOTSUP) => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Eager data publication shared by primary writes and background
+    /// writeback. Privilege admission belongs to the primary caller only.
+    fn write_eager_data(&self, offset: usize, buf: &[u8]) -> Result<usize, SystemError> {
+        let completed_end = offset
+            .checked_add(buf.len())
+            .ok_or(SystemError::EOVERFLOW)?;
+        self.write_eager_data_with_completed_end(offset, buf, completed_end)
+    }
+
+    fn write_eager_data_with_completed_end(
+        &self,
+        offset: usize,
+        buf: &[u8],
+        completed_end: usize,
+    ) -> Result<usize, SystemError> {
+        let _operation = self.begin_operation()?;
+        let _delalloc_admission = self.close_production_delalloc_admission()?;
+        self.drain_delalloc_before_eager()?;
+        let _io_guard = self.io_lock.lock();
+        let _metadata_commit = self.metadata_commit_lock.lock();
+        let (fs, inode_num) = {
+            let guard = self.inner.lock();
+            (guard.concret_fs(), guard.inner_inode_num)
+        };
+        let file_type = fs
+            .retry_metadata_read_contention(|| fs.fs.getattr(inode_num))?
+            .ftype;
+        match file_type {
+            FileType::Directory => Err(SystemError::EISDIR),
+            FileType::Unknown => Err(SystemError::EROFS),
+            // Replay data without rewriting a stale extent-tree inode snapshot.
+            FileType::RegularFile => {
+                let written = fs.retry_metadata_contention(|| {
+                    fs.fs.write_data_only_with_completed_end(
+                        inode_num,
+                        offset,
+                        buf,
+                        completed_end as u64,
+                    )
+                })?;
+                if written > buf.len() {
+                    return Err(SystemError::EIO);
+                }
+                if written != 0 {
+                    let actual_end = offset.checked_add(written).ok_or(SystemError::EOVERFLOW)?;
+                    let mut guard = self.inner.lock();
+                    if let Some(size) = guard.cached_file_size.as_mut() {
+                        *size = (*size).max(actual_end as u64);
+                    }
+                }
+                Ok(written)
+            }
+            _ => Err(SystemError::EINVAL),
+        }
+    }
+
+    /// Caller holds size_change_lock, io_lock and metadata_commit_lock after
+    /// delalloc drain and has completed mapping/authorization checks.
+    fn set_masked_metadata_locked(
+        &self,
+        metadata: &vfs::Metadata,
+        mask: SetMetadataMask,
+        size: Option<usize>,
+    ) -> Result<(), SystemError> {
+        self.set_masked_metadata_using(metadata, mask, size, |fs, inode_num, attr| {
+            fs.retry_metadata_contention(|| fs.fs.setattr(inode_num, *attr))
+        })
+    }
+
+    /// Keep authorization/killpriv and cached-time reconciliation identical
+    /// for ordinary metadata updates and the truncate begin publication.
+    fn set_masked_metadata_using<T>(
+        &self,
+        metadata: &vfs::Metadata,
+        mask: SetMetadataMask,
+        size: Option<usize>,
+        commit: impl FnOnce(&Arc<Ext4FileSystem>, u32, &another_ext4::SetAttr) -> Result<T, SystemError>,
+    ) -> Result<T, SystemError> {
+        if mask.contains(SetMetadataMask::KILL_PRIV) {
+            self.kill_security_privileges_locked()?;
+        }
+        let to_ext4_time =
+            |time: &PosixTimeSpec| -> u32 { time.tv_sec.max(0).min(u32::MAX as i64) as u32 };
+        let (fs, inode_num, before_atime_version, before_mtime_version, before_ctime_version) = {
+            let guard = self.inner.lock();
+            (
+                guard.concret_fs(),
+                guard.inner_inode_num,
+                guard.cached_atime_version,
+                guard.cached_mtime_version,
+                guard.cached_ctime_version,
+            )
+        };
+        let mode = metadata.mode.union(InodeMode::from(metadata.file_type));
+        let atime = mask
+            .contains(SetMetadataMask::ATIME)
+            .then(|| to_ext4_time(&metadata.atime));
+        let mtime = mask
+            .contains(SetMetadataMask::MTIME)
+            .then(|| to_ext4_time(&metadata.mtime));
+        let ctime = mask
+            .contains(SetMetadataMask::CTIME)
+            .then(|| to_ext4_time(&metadata.ctime));
+        let next_atime_version = atime
+            .map(|_| {
+                before_atime_version
+                    .checked_add(1)
+                    .ok_or(SystemError::EOVERFLOW)
+            })
+            .transpose()?;
+        let next_mtime_version = mtime
+            .map(|_| {
+                before_mtime_version
+                    .checked_add(1)
+                    .ok_or(SystemError::EOVERFLOW)
+            })
+            .transpose()?;
+        let next_ctime_version = ctime
+            .map(|_| {
+                before_ctime_version
+                    .checked_add(1)
+                    .ok_or(SystemError::EOVERFLOW)
+            })
+            .transpose()?;
+
+        let result = commit(
+            &fs,
+            inode_num,
+            &another_ext4::SetAttr {
+                mode: mask
+                    .contains(SetMetadataMask::MODE)
+                    .then(|| another_ext4::InodeMode::from_bits_truncate(mode.bits() as u16)),
+                uid: mask
+                    .contains(SetMetadataMask::UID)
+                    .then_some(metadata.uid as u32),
+                gid: mask
+                    .contains(SetMetadataMask::GID)
+                    .then_some(metadata.gid as u32),
+                size: size.map(|size| size as u64),
+                atime,
+                mtime,
+                ctime,
+                ..Default::default()
+            },
+        )?;
+
+        {
+            let mut guard = self.inner.lock();
+            if let Some(size) = size {
+                guard.cached_file_size = Some(size as u64);
+                guard.dirty_state.remove(InodeDirtyState::SIZE_DIRTY);
+            }
+            // Buffered reads/writes can update cached times without io_lock.
+            // Preserve and leave dirty any value that changed while setattr
+            // was in flight; writeback will then persist the newer value.
+            if let (Some(atime), Some(next_atime_version)) = (atime, next_atime_version) {
+                if guard.cached_atime_version == before_atime_version {
+                    guard.cached_times.atime = atime;
+                    guard.cached_atime_version = next_atime_version;
+                    guard.durable_atime_version = guard.cached_atime_version;
+                    guard.dirty_state.remove(InodeDirtyState::ATIME_DIRTY);
+                }
+            }
+            if let (Some(mtime), Some(next_mtime_version)) = (mtime, next_mtime_version) {
+                if guard.cached_mtime_version == before_mtime_version {
+                    guard.cached_times.mtime = mtime;
+                    guard.cached_mtime_version = next_mtime_version;
+                    guard.durable_mtime_version = guard.cached_mtime_version;
+                    guard.dirty_state.remove(InodeDirtyState::MTIME_DIRTY);
+                }
+            }
+            if let (Some(ctime), Some(next_ctime_version)) = (ctime, next_ctime_version) {
+                if guard.cached_ctime_version == before_ctime_version {
+                    guard.cached_times.ctime = ctime;
+                    guard.cached_ctime_version = next_ctime_version;
+                    guard.durable_ctime_version = guard.cached_ctime_version;
+                    guard.dirty_state.remove(InodeDirtyState::CTIME_DIRTY);
+                }
+            }
+        }
+        self.release_clean_metadata_queue_owner(&fs);
+        Ok(result)
+    }
+
+    /// Caller holds the parent namespace and I/O mutation locks.
+    fn check_new_name_locked(&self, name: &str) -> Result<(), SystemError> {
+        let (fs, ino) = {
+            let inner = self.inner.lock();
+            (inner.concret_fs(), inner.inner_inode_num)
+        };
+        match fs.retry_metadata_read_contention(|| fs.fs.lookup(ino, name)) {
+            Ok(_) => Err(SystemError::EEXIST),
+            Err(SystemError::ENOENT) => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
     /// Run one lower-filesystem size mutation under the single lock order used
     /// by truncate, full setattr and readahead mapping pins.
-    fn commit_size_mutation<F>(
+    fn commit_size_mutation<'fs, F>(
         &self,
         _size_change: &RwSemWriteGuard<'_, ()>,
-        fs: &Arc<Ext4FileSystem>,
+        fs: &'fs Arc<Ext4FileSystem>,
         inode_num: u32,
         len: usize,
         mut commit: F,
     ) -> Result<(), SystemError>
     where
-        F: FnMut() -> Result<(), SystemError>,
+        F: FnMut(u64) -> Result<another_ext4::StartedSizeChange<'fs>, SystemError>,
     {
-        let Some(page_cache) = self.page_cache() else {
+        let Some(cache) = self.page_cache() else {
             let _size = self.size_lock.write();
             let _io = self.io_lock.lock();
             let _mapping = self.mapping_io.close_for_mutation();
-            return commit();
-        };
-        let hole_start_page = len
-            .checked_add(MMArch::PAGE_SIZE - 1)
-            .ok_or(SystemError::EFBIG)?
-            >> MMArch::PAGE_SHIFT;
-        let mut shrinking = None;
-        let mut lower_committed = false;
-        loop {
-            page_cache.unmap_mapping_pages_even_cow(hole_start_page, None)?;
-            let (shrinking, committed) = {
-                let _invalidate = page_cache.invalidate_write();
-                let _size = self.size_lock.write();
-                let cached_size = self.inner.lock().cached_file_size;
-                let current_size = match cached_size {
-                    Some(size) => size,
-                    None => {
-                        fs.retry_metadata_read_contention(|| fs.fs.getattr(inode_num))?
-                            .size
-                    }
-                };
-                let shrinking = *shrinking.get_or_insert(len < current_size as usize);
-                if !lower_committed {
-                    let _io = self.io_lock.lock();
-                    let _mapping = self.mapping_io.close_for_mutation();
-                    commit()?;
-                    lower_committed = true;
+            let previous = self.inner.lock().cached_file_size;
+            let previous = match previous {
+                Some(size) => size,
+                None => {
+                    fs.retry_metadata_read_contention(|| fs.fs.getattr(inode_num))?
+                        .size
                 }
-                let committed = !shrinking || page_cache.truncate_locked(len)?;
-                (shrinking, committed)
             };
-            if committed {
-                if shrinking {
-                    page_cache.unmap_mapping_pages_even_cow(hole_start_page, None)?;
-                }
-                return Ok(());
+            let mut receipt = commit(previous)?;
+            return fs.retry_metadata_contention(|| fs.fs.finish_size_change(&mut receipt, None));
+        };
+        let first_full = len.div_ceil(MMArch::PAGE_SIZE);
+        // Allocate the sole scratch image before any SIZE publication.
+        let image = Box::<[u8; another_ext4::BLOCK_SIZE]>::try_new_zeroed()
+            .map_err(|_| SystemError::ENOMEM)?;
+        let mut image = unsafe { image.assume_init() };
+        let previous_size = || -> Result<u64, SystemError> {
+            let cached = self.inner.lock().cached_file_size;
+            match cached {
+                Some(size) => Ok(size),
+                None => Ok(fs
+                    .retry_metadata_read_contention(|| fs.fs.getattr(inode_num))?
+                    .size),
             }
+        };
+        let mut receipt = loop {
+            let previous = previous_size()?;
+            let old_edge = (len as u64 > previous
+                && !previous.is_multiple_of(MMArch::PAGE_SIZE as u64))
+            .then_some(previous as usize >> MMArch::PAGE_SHIFT);
+            cache.unmap_mapping_pages_even_cow(first_full, None)?;
+            if let Some(index) = old_edge {
+                // A growth edge precedes first_full. Unmap shared PTEs before
+                // taking cache/size locks so range preparation can progress;
+                // private COW pages are unrelated to the backing zero-tail.
+                cache.unmap_mapping_pages(index, Some(index + 1))?;
+            }
+            let invalidate = cache.invalidate_write();
+            let size = self.size_lock.write();
+            if previous_size()? != previous {
+                drop(size);
+                drop(invalidate);
+                continue;
+            }
+            let pin = if let Some(index) = old_edge {
+                match cache.try_prepare_range_page_locked(index)? {
+                    PageCacheRangeResult::Ready(pin) => Some(pin),
+                    PageCacheRangeResult::Retry(retry) => {
+                        drop(size);
+                        drop(invalidate);
+                        retry.wait()?;
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
+            let page = pin.as_ref().map(|pin| pin.page());
+            let mut grow_reservation = if pin.is_some() {
+                Some(cache.prepare_page_dirty()?)
+            } else {
+                None
+            };
+            let mut page_guard = page.as_ref().map(|page| page.write());
+            let _io = self.io_lock.lock();
+            let _mapping = self.mapping_io.close_for_mutation();
+            if let Some(page_guard) = page_guard.as_mut() {
+                unsafe {
+                    image.copy_from_slice(page_guard.as_slice());
+                }
+                image[previous as usize % MMArch::PAGE_SIZE..].fill(0);
+                fs.retry_metadata_contention(|| {
+                    fs.fs
+                        .write_existing_block_image(inode_num, old_edge.unwrap() as u32, &image)
+                })?;
+                if page_guard
+                    .flags()
+                    .contains(crate::mm::page::PageFlags::PG_DIRTY)
+                {
+                    cache.mark_page_dirty_prepared_page_locked(
+                        old_edge.unwrap(),
+                        grow_reservation.as_mut().unwrap(),
+                        page_guard,
+                    )?;
+                }
+                // Only invisible old-EOF suffix changes before publication.
+                unsafe {
+                    page_guard.as_slice_mut()[previous as usize % MMArch::PAGE_SIZE..].fill(0);
+                }
+            }
+            // No cache pages are discarded before this returns Started.
+            let receipt = commit(previous)?;
+            break receipt;
+        };
+        if receipt.needs_cleanup() {
+            loop {
+                cache.unmap_mapping_pages_even_cow(first_full, None)?;
+                let invalidate = cache.invalidate_write();
+                match cache.try_discard_range_locked(first_full, usize::MAX)? {
+                    PageCacheRangeResult::Ready(()) => {
+                        drop(invalidate);
+                        break;
+                    }
+                    PageCacheRangeResult::Retry(retry) => {
+                        drop(invalidate);
+                        retry.wait()?;
+                    }
+                }
+            }
+        }
+        // Obtain the latest edge only after full-range retries. Never hold our
+        // own edge Page.write while waiting on full-page active users.
+        loop {
+            let edge = (receipt.needs_cleanup() && !len.is_multiple_of(MMArch::PAGE_SIZE))
+                .then_some(len >> MMArch::PAGE_SHIFT);
+            if let Some(index) = edge {
+                cache.unmap_mapping_pages(index, Some(index + 1))?;
+            }
+            let invalidate = cache.invalidate_write();
+            let pin = if let Some(index) = edge {
+                match cache.try_prepare_range_page_locked(index)? {
+                    PageCacheRangeResult::Ready(pin) => Some(pin),
+                    PageCacheRangeResult::Retry(retry) => {
+                        drop(invalidate);
+                        retry.wait()?;
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
+            let mut reservation = if pin.is_some() {
+                Some(cache.prepare_page_dirty()?)
+            } else {
+                None
+            };
+            let page = pin.as_ref().map(|pin| pin.page());
+            let mut page_guard = page.as_ref().map(|page| page.write());
+            if let Some(page_guard) = page_guard.as_mut() {
+                unsafe {
+                    image.copy_from_slice(page_guard.as_slice());
+                }
+                image[len % MMArch::PAGE_SIZE..].fill(0);
+                if page_guard
+                    .flags()
+                    .contains(crate::mm::page::PageFlags::PG_DIRTY)
+                {
+                    cache.mark_page_dirty_prepared_page_locked(
+                        edge.unwrap(),
+                        reservation.as_mut().unwrap(),
+                        page_guard,
+                    )?;
+                }
+                unsafe {
+                    page_guard.as_slice_mut()[len % MMArch::PAGE_SIZE..].fill(0);
+                }
+            }
+            let _size = self.size_lock.write();
+            let _io = self.io_lock.lock();
+            let _mapping = self.mapping_io.close_for_mutation();
+            let _metadata = self.metadata_commit_lock.lock();
+            fs.retry_metadata_contention(|| {
+                fs.fs
+                    .finish_size_change(&mut receipt, edge.map(|_| &*image))
+            })?;
+            drop(_metadata);
+            drop(_mapping);
+            drop(_io);
+            drop(_size);
+            drop(page_guard);
+            drop(pin);
+            drop(invalidate);
+            cache.unmap_mapping_pages_even_cow(first_full, None)?;
+            return Ok(());
         }
     }
 
@@ -4891,13 +6056,16 @@ impl LockedExt4Inode {
                 }
             }
         };
+        inode.register_pending_removal();
         if let Err((error, handle)) = Self::reclaim_with_metadata_contention_retry(fs, handle) {
             *inode.pending_reclaim.lock() = Some(handle);
             let error = SystemError::from(error);
             let _ = fs.poison_freeing(tombstone, error.clone());
             return Err(error);
         }
-        fs.complete_freeing(tombstone)
+        fs.complete_freeing(tombstone)?;
+        inode.pending_removal_token.lock().take();
+        Ok(())
     }
 
     #[inline]
@@ -5060,6 +6228,7 @@ impl LockedExt4Inode {
             lifecycle,
             retention: InodeRetentionState::new(),
             pending_reclaim: SpinLock::new(None),
+            pending_removal_token: SpinLock::new(None),
             tmpfile_linkable: AtomicBool::new(false),
             eviction_scheduled: SpinLock::new(false),
             retention_callback_self: self_ref.clone(),
@@ -5251,6 +6420,7 @@ impl LockedExt4Inode {
         if pending.is_some() {
             return Err(SystemError::EIO);
         }
+        self.register_pending_removal();
         *pending = Some(handle);
         drop(pending);
         self.try_schedule_deferred_eviction()
@@ -5260,7 +6430,22 @@ impl LockedExt4Inode {
         // Dropping the capability is the in-memory counterpart of the durable
         // orphan-del transaction. A queued eviction, if any, observes None and
         // cleanly aborts instead of treating cancellation as corruption.
-        let _ = self.pending_reclaim.lock().take();
+        let cancelled = self.pending_reclaim.lock().take().is_some();
+        if cancelled {
+            self.pending_removal_token.lock().take();
+        }
+    }
+
+    fn register_pending_removal(&self) {
+        let mut token = self.pending_removal_token.lock();
+        if token.is_none() {
+            if let Some(fs) = self.eviction_filesystem.lock().upgrade() {
+                *token = fs
+                    .writeback_domain
+                    .bound_superblock()
+                    .map(|sb| sb.pending_removal());
+            }
+        }
     }
 
     fn try_schedule_deferred_eviction(self: &Arc<Self>) -> Result<(), SystemError> {
@@ -5331,6 +6516,7 @@ impl LockedExt4Inode {
         match Self::reclaim_with_metadata_contention_retry(&fs, handle) {
             Ok(()) => {
                 fs.complete_freeing(tombstone)?;
+                self.pending_removal_token.lock().take();
                 Ok(())
             }
             Err((error, handle)) => {

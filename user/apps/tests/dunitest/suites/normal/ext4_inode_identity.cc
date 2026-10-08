@@ -2224,6 +2224,53 @@ TEST(Ext4InodeIdentity, BlockUninitCrossGroupWriteChmodFsyncAndRemount) {
     ASSERT_NO_FATAL_FAILURE(fs.Unmount());
 }
 
+TEST(Ext4InodeIdentity, OverlayCopyUpRestoresNonRegularMetadataWithoutTruncation) {
+    LoopExt4 fs;
+    ASSERT_NO_FATAL_FAILURE(fs.SetUp());
+    ASSERT_NO_FATAL_FAILURE(fs.Mount());
+    const std::string root = fs.mount_point();
+    const std::string lower = root + "/lower", upper = root + "/upper";
+    const std::string work = root + "/work", merged = root + "/merged";
+    for (const auto& path : {lower, upper, work, merged}) {
+        ASSERT_EQ(0, mkdir(path.c_str(), 0755)) << strerror(errno);
+    }
+    ASSERT_EQ(0, mkdir((lower + "/nested").c_str(), 0711));
+    ASSERT_EQ(0, symlink("../value", (lower + "/nested/link").c_str()));
+    ASSERT_EQ(0, mkfifo((lower + "/fifo").c_str(), 0600));
+    const std::string options = "lowerdir=" + lower + ",upperdir=" + upper + ",workdir=" + work;
+    ASSERT_EQ(0, mount("overlay", merged.c_str(), "overlay", 0, options.c_str())) << strerror(errno);
+    struct MountedOverlay {
+        std::string path;
+        ~MountedOverlay() { EXPECT_EQ(0, umount(path.c_str())) << strerror(errno); }
+    } overlay{merged};
+
+    // Copying up the symlink also restores metadata on its lower-only parent.
+    ASSERT_EQ(0, linkat(AT_FDCWD, (merged + "/nested/link").c_str(), AT_FDCWD,
+                       (merged + "/nested/alias").c_str(), 0)) << strerror(errno);
+    struct stat original {}, copied {}, alias {}, parent {};
+    ASSERT_EQ(0, lstat((lower + "/nested/link").c_str(), &original));
+    ASSERT_EQ(0, lstat((upper + "/nested/link").c_str(), &copied));
+    ASSERT_EQ(0, lstat((upper + "/nested/alias").c_str(), &alias));
+    EXPECT_TRUE(S_ISLNK(copied.st_mode));
+    EXPECT_EQ(8, copied.st_size);
+    EXPECT_EQ(copied.st_ino, alias.st_ino);
+    EXPECT_EQ(static_cast<nlink_t>(2), copied.st_nlink);
+    EXPECT_EQ(static_cast<nlink_t>(1), original.st_nlink);
+    ASSERT_EQ(0, stat((upper + "/nested").c_str(), &parent));
+    EXPECT_TRUE(S_ISDIR(parent.st_mode));
+    EXPECT_EQ(static_cast<mode_t>(0711), parent.st_mode & 0777);
+    char target[32] {};
+    ASSERT_EQ(8, readlink((upper + "/nested/link").c_str(), target, sizeof(target)));
+    EXPECT_EQ(0, memcmp(target, "../value", 8));
+
+    ASSERT_EQ(0, chmod((merged + "/fifo").c_str(), 0640)) << strerror(errno);
+    ASSERT_EQ(0, lstat((upper + "/fifo").c_str(), &copied));
+    ASSERT_EQ(0, lstat((lower + "/fifo").c_str(), &original));
+    EXPECT_TRUE(S_ISFIFO(copied.st_mode));
+    EXPECT_EQ(static_cast<mode_t>(0640), copied.st_mode & 0777);
+    EXPECT_EQ(static_cast<mode_t>(0600), original.st_mode & 0777);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {

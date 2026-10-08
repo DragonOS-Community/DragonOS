@@ -133,6 +133,7 @@ pub struct InodeRetentionGuard {
 pub struct UnlinkedFile {
     inode: Arc<dyn IndexNode>,
     _operation: InodeRetentionGuard,
+    mount_writer: Option<super::mount::writer::MountWriteGuard>,
 }
 
 impl UnlinkedFile {
@@ -141,6 +142,7 @@ impl UnlinkedFile {
         Ok(Self {
             inode,
             _operation: operation,
+            mount_writer: None,
         })
     }
 
@@ -150,6 +152,14 @@ impl UnlinkedFile {
 
     pub fn replace_inode(&mut self, inode: Arc<dyn IndexNode>) {
         self.inode = inode;
+    }
+
+    pub(crate) fn set_mount_writer(&mut self, writer: super::mount::writer::MountWriteGuard) {
+        self.mount_writer = Some(writer);
+    }
+
+    pub(crate) fn take_mount_writer(&mut self) -> Option<super::mount::writer::MountWriteGuard> {
+        self.mount_writer.take()
     }
 }
 

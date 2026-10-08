@@ -1,9 +1,47 @@
 use super::{
     page_align_up, page_manager_lock, page_reclaimer_lock, AddressSpace, Arc, FaultRetryWait,
     HashMap, LockedVMA, MMArch, MemoryManagementArch, MmuGather, Ordering, PageCache,
-    PageCacheManager, PageState, RwSemReadGuard, RwSemWriteGuard, SystemError, Vec, Weak,
+    PageCacheManager, PageCachePagePin, PageEntry, PageState, RwSemReadGuard, RwSemWriteGuard,
+    SystemError, Vec, Weak,
 };
 use crate::mm::page::PageFlags;
+
+/// Carries no entry pin or inode lock. Wait only after releasing invalidate_write.
+pub(crate) struct PageCacheRangeRetry {
+    cache: Weak<PageCache>,
+    reason: RangeRetryReason,
+}
+
+enum RangeRetryReason {
+    Entry(Arc<PageEntry>),
+    Load(usize),
+    Unmap,
+}
+
+pub(crate) enum PageCacheRangeResult<T> {
+    Ready(T),
+    Retry(PageCacheRangeRetry),
+}
+
+impl PageCacheRangeRetry {
+    pub(crate) fn wait(self) -> Result<(), SystemError> {
+        match self.reason {
+            RangeRetryReason::Entry(entry) => entry.wait_queue.wait_until(|| match entry.state() {
+                PageState::Loading | PageState::Writeback => None,
+                PageState::Error => Some(Err(SystemError::EIO)),
+                _ if entry.active_users() != 0 => None,
+                _ => Some(Ok(())),
+            }),
+            RangeRetryReason::Load(index) => {
+                let cache = self.cache.upgrade().ok_or(SystemError::EIO)?;
+                let _invalidate = cache.invalidate_read();
+                drop(cache.get_or_create_page_for_read_pinned(index)?);
+                Ok(())
+            }
+            RangeRetryReason::Unmap => Ok(()),
+        }
+    }
+}
 
 #[derive(Debug, Default)]
 pub(super) struct FileVmaIndex {
@@ -191,6 +229,82 @@ impl PageCacheManager {
 }
 
 impl PageCache {
+    fn range_retry(&self, reason: RangeRetryReason) -> PageCacheRangeRetry {
+        PageCacheRangeRetry {
+            cache: self.manager.owner.clone(),
+            reason,
+        }
+    }
+
+    /// Caller owns invalidate_write and has unmapped this ordinary file page.
+    /// No blocking entry wait is allowed under that guard.
+    pub(crate) fn try_prepare_range_page_locked(
+        &self,
+        index: usize,
+    ) -> Result<PageCacheRangeResult<PageCachePagePin>, SystemError> {
+        let entry = self.inner.lock().get_entry(index);
+        let Some(entry) = entry else {
+            return Ok(PageCacheRangeResult::Retry(
+                self.range_retry(RangeRetryReason::Load(index)),
+            ));
+        };
+        if entry.state() == PageState::Error {
+            return Err(SystemError::EIO);
+        }
+        if matches!(entry.state(), PageState::Loading | PageState::Writeback)
+            || entry.active_users() != 0
+        {
+            return Ok(PageCacheRangeResult::Retry(
+                self.range_retry(RangeRetryReason::Entry(entry)),
+            ));
+        }
+        let page = entry.page.read();
+        if page.map_count() != 0 {
+            return Ok(PageCacheRangeResult::Retry(
+                self.range_retry(RangeRetryReason::Unmap),
+            ));
+        }
+        let inner = self.inner.lock();
+        if !inner
+            .get_entry(index)
+            .is_some_and(|current| Arc::ptr_eq(&current, &entry))
+        {
+            return Ok(PageCacheRangeResult::Retry(
+                self.range_retry(RangeRetryReason::Unmap),
+            ));
+        }
+        if matches!(entry.state(), PageState::Loading | PageState::Writeback)
+            || entry.active_users() != 0
+        {
+            drop(inner);
+            drop(page);
+            return Ok(PageCacheRangeResult::Retry(
+                self.range_retry(RangeRetryReason::Entry(entry)),
+            ));
+        }
+        let pin = entry.pin();
+        Ok(PageCacheRangeResult::Ready(PageCachePagePin::new(
+            entry.page.clone(),
+            pin,
+        )))
+    }
+
+    /// Removes only full pages. Boundary pages are pinned/prepared by the
+    /// caller first. Retain invalidate_write through lower mapping removal.
+    pub(crate) fn try_discard_range_locked(
+        &self,
+        first: usize,
+        end: usize,
+    ) -> Result<PageCacheRangeResult<()>, SystemError> {
+        let mut retry = None;
+        if self.remove_page_range_with_retry_locked(first, Some(end), None, Some(&mut retry))? {
+            Ok(PageCacheRangeResult::Ready(()))
+        } else {
+            Ok(PageCacheRangeResult::Retry(retry.unwrap_or_else(|| {
+                self.range_retry(RangeRetryReason::Unmap)
+            })))
+        }
+    }
     pub fn i_mmap_read(&self) -> RwSemReadGuard<'_, ()> {
         self.i_mmap_rwsem.read()
     }
@@ -555,6 +669,16 @@ impl PageCache {
         end_page: Option<usize>,
         truncate_tail_at: Option<usize>,
     ) -> Result<bool, SystemError> {
+        self.remove_page_range_with_retry_locked(first_page, end_page, truncate_tail_at, None)
+    }
+
+    fn remove_page_range_with_retry_locked(
+        &self,
+        first_page: usize,
+        end_page: Option<usize>,
+        truncate_tail_at: Option<usize>,
+        mut retry: Option<&mut Option<PageCacheRangeRetry>>,
+    ) -> Result<bool, SystemError> {
         let mut removed_tagged_page = false;
         let truncate_indices: Vec<usize> = {
             let guard = self.inner.lock();
@@ -585,10 +709,20 @@ impl PageCache {
                 };
                 match entry.state() {
                     PageState::Loading => {
+                        if let Some(retry) = retry.as_deref_mut() {
+                            *retry = Some(self.range_retry(RangeRetryReason::Entry(entry)));
+                            self.finish_removed_range_tags(removed_tagged_page);
+                            return Ok(false);
+                        }
                         let _ = entry.wait_ready();
                         continue;
                     }
                     PageState::Writeback => {
+                        if let Some(retry) = retry.as_deref_mut() {
+                            *retry = Some(self.range_retry(RangeRetryReason::Entry(entry)));
+                            self.finish_removed_range_tags(removed_tagged_page);
+                            return Ok(false);
+                        }
                         let _ = entry.wait_queue.wait_until(|| match entry.state() {
                             PageState::Writeback => None,
                             PageState::Error => Some(Err(SystemError::EIO)),
@@ -600,6 +734,11 @@ impl PageCache {
                 }
 
                 if entry.active_users() != 0 {
+                    if let Some(retry) = retry.as_deref_mut() {
+                        *retry = Some(self.range_retry(RangeRetryReason::Entry(entry)));
+                        self.finish_removed_range_tags(removed_tagged_page);
+                        return Ok(false);
+                    }
                     entry.wait_inactive();
                     continue;
                 }
@@ -631,6 +770,11 @@ impl PageCache {
                         if current.active_users() != 0 {
                             drop(guard);
                             drop(_tagged_writeback_transition);
+                            if let Some(retry) = retry.as_deref_mut() {
+                                *retry = Some(self.range_retry(RangeRetryReason::Entry(current)));
+                                self.finish_removed_range_tags(removed_tagged_page);
+                                return Ok(false);
+                            }
                             current.wait_inactive();
                             continue;
                         }
@@ -638,12 +782,24 @@ impl PageCache {
                             PageState::Loading => {
                                 drop(guard);
                                 drop(_tagged_writeback_transition);
+                                if let Some(retry) = retry.as_deref_mut() {
+                                    *retry =
+                                        Some(self.range_retry(RangeRetryReason::Entry(current)));
+                                    self.finish_removed_range_tags(removed_tagged_page);
+                                    return Ok(false);
+                                }
                                 let _ = current.wait_ready();
                                 continue;
                             }
                             PageState::Writeback => {
                                 drop(guard);
                                 drop(_tagged_writeback_transition);
+                                if let Some(retry) = retry.as_deref_mut() {
+                                    *retry =
+                                        Some(self.range_retry(RangeRetryReason::Entry(current)));
+                                    self.finish_removed_range_tags(removed_tagged_page);
+                                    return Ok(false);
+                                }
                                 let _ = current.wait_queue.wait_until(|| match current.state() {
                                     PageState::Writeback => None,
                                     PageState::Error => Some(Err(SystemError::EIO)),
@@ -660,6 +816,7 @@ impl PageCache {
                 };
 
                 if retry_after_unmap {
+                    self.finish_removed_range_tags(removed_tagged_page);
                     return Ok(false);
                 }
 
@@ -672,14 +829,7 @@ impl PageCache {
             }
         }
 
-        if removed_tagged_page {
-            self.cancel_truncated_tagged_writeback_budget_retries();
-            // `WAIT_AFTER` may be sleeping on a tag whose page truncate just
-            // removed.  The ticket revalidation below and the waiter share
-            // the tagged-state lock; publish after both predicates are
-            // coherent rather than relying on an unrelated writeback wake.
-            PageCacheManager::notify_tagged_writeback_progress(self);
-        }
+        self.finish_removed_range_tags(removed_tagged_page);
 
         if let Some(new_size) =
             truncate_tail_at.filter(|size| *size > 0 && !size.is_multiple_of(MMArch::PAGE_SIZE))
@@ -729,6 +879,13 @@ impl PageCache {
         }
 
         Ok(true)
+    }
+
+    fn finish_removed_range_tags(&self, removed: bool) {
+        if removed {
+            self.cancel_truncated_tagged_writeback_budget_retries();
+            PageCacheManager::notify_tagged_writeback_progress(self);
+        }
     }
 
     pub fn mkclean_page(

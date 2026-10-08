@@ -299,12 +299,10 @@ pub fn vfs_getattr(
         kstat.size = metadata.size as usize;
     }
     if request_mask.contains(PosixStatxMask::STATX_BLOCKS) {
-        let size_bytes = if metadata.size < 0 {
-            0
-        } else {
-            metadata.size as u64
-        };
-        kstat.blocks = size_bytes.div_ceil(blk_size as u64);
+        // Allocation is reported in 512-byte sectors, independently of the
+        // I/O hint above. Sparse files and preallocation cannot be inferred
+        // from logical EOF; zero is a meaningful allocation value.
+        kstat.blocks = metadata.blocks as u64;
     }
 
     if request_mask.contains(PosixStatxMask::STATX_BTIME) {

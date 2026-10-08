@@ -138,6 +138,55 @@ pub(super) struct ExtentTailRemoval {
     pub metadata_blocks: Vec<PBlockId>,
 }
 
+/// Explicit, bounded tree identity for Direct affected-path relocation. No
+/// bitmap or generic staged image is interpreted as an extent node.
+pub(in crate::ext4) struct ExtentEditTrace {
+    pub touched_tree_homes: Vec<PBlockId>,
+    pub new_tree_homes: Vec<PBlockId>,
+}
+
+impl ExtentEditTrace {
+    const LIMIT: usize = 128;
+
+    pub(in crate::ext4) fn new() -> Result<Self> {
+        let mut touched_tree_homes = Vec::new();
+        let mut new_tree_homes = Vec::new();
+        touched_tree_homes
+            .try_reserve_exact(Self::LIMIT)
+            .map_err(|_| Ext4Error::new(ErrCode::ENOMEM))?;
+        new_tree_homes
+            .try_reserve_exact(Self::LIMIT)
+            .map_err(|_| Ext4Error::new(ErrCode::ENOMEM))?;
+        Ok(Self {
+            touched_tree_homes,
+            new_tree_homes,
+        })
+    }
+
+    fn record(homes: &mut Vec<PBlockId>, home: PBlockId) -> Result<()> {
+        if home == 0 || homes.contains(&home) {
+            return Ok(());
+        }
+        if homes.len() == Self::LIMIT {
+            return Err(Ext4Error::new(ErrCode::ENOSPC));
+        }
+        homes.push(home);
+        Ok(())
+    }
+
+    fn record_new(&mut self, home: PBlockId) -> Result<()> {
+        Self::record(&mut self.new_tree_homes, home)?;
+        Self::record(&mut self.touched_tree_homes, home)
+    }
+
+    fn record_path(&mut self, path: &[ExtentSearchStep]) -> Result<()> {
+        for step in path {
+            Self::record(&mut self.touched_tree_homes, step.pblock)?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct ExtentTail {
     pub start_lblock: LBlockId,
@@ -203,6 +252,7 @@ pub(super) struct JournaledAppendExtent {
     pub start_lblock: LBlockId,
     pub start_pblock: PBlockId,
     pub count: u32,
+    pub unwritten: bool,
 }
 
 impl RightSpineAppendPlan {
@@ -724,7 +774,20 @@ impl Ext4 {
         start_lblock: LBlockId,
         count: u32,
     ) -> Result<Option<DirectAppendShape>> {
-        if count == 0 || count > u16::MAX as u32 || !inode.inode.uses_extents() {
+        self.direct_append_shape_with_state(inode, start_lblock, count, false)
+    }
+
+    pub(super) fn direct_append_shape_with_state(
+        &self,
+        inode: &InodeRef,
+        start_lblock: LBlockId,
+        count: u32,
+        unwritten: bool,
+    ) -> Result<Option<DirectAppendShape>> {
+        if count == 0
+            || count > if unwritten { 32767 } else { 32768 }
+            || !inode.inode.uses_extents()
+        {
             return Ok(None);
         }
         let root = inode.inode.extent_root();
@@ -795,12 +858,12 @@ impl Ext4 {
             .map(|block| ExtentNode::from_bytes(&block.data[..]));
         let node = leaf.as_ref().unwrap_or(&root);
         let last = node.extent_at(entries - 1);
-        if last.is_unwritten() {
-            return Ok(None);
-        }
         for index in 0..entries {
             let extent = node.extent_at(index);
             self.validate_data_blocks(extent.start_pblock(), extent.block_count() as u64)?;
+        }
+        if !unwritten && last.is_unwritten() {
+            return Ok(None);
         }
         let next_lblock = last
             .start_lblock()
@@ -813,7 +876,10 @@ impl Ext4 {
             .start_pblock()
             .checked_add(last.block_count() as PBlockId)
             .ok_or_else(|| Ext4Error::new(ErrCode::EFBIG))?;
-        let candidate = Extent::new(start_lblock, preferred_first, count as u16);
+        let mut candidate = Extent::new(start_lblock, preferred_first, count as u16);
+        if unwritten {
+            candidate.mark_unwritten();
+        }
         let can_merge = Extent::can_append(last, &candidate);
         let leaf_full = entries == node.header().max_entries_count() as usize;
         if leaf_full && header.depth() == 0 && self.uses_journal() {
@@ -870,7 +936,21 @@ impl Ext4 {
         start_pblock: PBlockId,
         count: u32,
     ) -> Result<()> {
-        let new_extent = Extent::new(start_lblock, start_pblock, count as u16);
+        self.stage_direct_append_extent_with_state(inode, start_lblock, start_pblock, count, false)
+    }
+
+    pub(super) fn stage_direct_append_extent_with_state(
+        &self,
+        inode: &mut InodeRef,
+        start_lblock: LBlockId,
+        start_pblock: PBlockId,
+        count: u32,
+        unwritten: bool,
+    ) -> Result<()> {
+        let mut new_extent = Extent::new(start_lblock, start_pblock, count as u16);
+        if unwritten {
+            new_extent.mark_unwritten();
+        }
         let mut root = inode.inode.extent_root_mut();
         let entries = root.header().entries_count() as usize;
         if entries > 0 {
@@ -878,13 +958,13 @@ impl Ext4 {
             if Extent::can_append(&last, &new_extent) {
                 root.extent_mut_at(entries - 1)
                     .set_block_count(last.block_count() + count);
-            } else if root.insert_extent(&new_extent, entries).is_err() {
+            } else if root.insert_extent_preserving(&new_extent, entries).is_err() {
                 return Err(format_error!(
                     ErrCode::ENOTSUP,
                     "Inline extent root requires a split"
                 ));
             }
-        } else if root.insert_extent(&new_extent, 0).is_err() {
+        } else if root.insert_extent_preserving(&new_extent, 0).is_err() {
             return Err(format_error!(
                 ErrCode::ENOTSUP,
                 "Inline extent root requires a split"
@@ -920,7 +1000,12 @@ impl Ext4 {
             start_lblock,
             start_pblock,
             count,
+            unwritten,
         } = append;
+        let mut new_extent = Extent::new(start_lblock, start_pblock, count as u16);
+        if unwritten {
+            new_extent.mark_unwritten();
+        }
         if root_split_leaf_home.is_some() && leaf_split_new_home.is_some() {
             return Err(Ext4Error::new(ErrCode::EINVAL));
         }
@@ -928,7 +1013,6 @@ impl Ext4 {
             if leaf_home.is_some() {
                 return Err(Ext4Error::new(ErrCode::EINVAL));
             }
-            let new_extent = Extent::new(start_lblock, start_pblock, count as u16);
             let (old_entries, generation, first_lblock, old_extents) = {
                 let root = inode.inode.extent_root();
                 self.validate_extent_node(inode.id, &root)?;
@@ -1003,7 +1087,6 @@ impl Ext4 {
                 leaf.header().generation()
             };
 
-            let new_extent = Extent::new(start_lblock, start_pblock, count as u16);
             let image = self.transaction_block_for_update(transaction, new_leaf_home)?;
             let mut leaf = ExtentNodeMut::from_bytes(image);
             leaf.init(0, generation);
@@ -1044,7 +1127,6 @@ impl Ext4 {
             }
             let seed = self.read_super_block_cached().metadata_checksum_seed();
             let image = self.transaction_block_for_update(transaction, home)?;
-            let new_extent = Extent::new(start_lblock, start_pblock, count as u16);
             {
                 let mut node = ExtentNodeMut::from_bytes(image);
                 let entries = node.header().entries_count() as usize;
@@ -1052,7 +1134,7 @@ impl Ext4 {
                 if Extent::can_append(&last, &new_extent) {
                     node.extent_mut_at(entries - 1)
                         .set_block_count(last.block_count() + count);
-                } else if node.insert_extent(&new_extent, entries).is_err() {
+                } else if node.insert_extent_preserving(&new_extent, entries).is_err() {
                     return Err(format_error!(
                         ErrCode::ENOTSUP,
                         "External extent leaf requires a split"
@@ -1068,7 +1150,13 @@ impl Ext4 {
             inode.inode.set_fs_block_count(blocks);
             Ok(())
         } else {
-            self.stage_direct_append_extent(inode, start_lblock, start_pblock, count)
+            self.stage_direct_append_extent_with_state(
+                inode,
+                start_lblock,
+                start_pblock,
+                count,
+                unwritten,
+            )
         }
     }
 
@@ -1380,7 +1468,7 @@ impl Ext4 {
         Ok(())
     }
 
-    fn set_extent_block_checksum(
+    pub(super) fn set_extent_block_checksum(
         seed: MetadataChecksumSeed,
         inode_ref: &InodeRef,
         image: &mut [u8; BLOCK_SIZE],
@@ -1735,10 +1823,26 @@ impl Ext4 {
         inode_ref: &mut InodeRef,
         iblock: LBlockId,
     ) -> Result<PBlockId> {
-        let mut metadata = super::rw::MetadataIo::transaction(self, transaction);
-        let home =
-            self.extent_query_or_create_with_metadata(&mut metadata, inode_ref, iblock, 1, None)?;
-        metadata.write_inode_with_csum(inode_ref)?;
+        if iblock == MAX_BLOCKS {
+            return Err(Ext4Error::new(ErrCode::EFBIG));
+        }
+        if let Some(extent) =
+            self.allocated_extent_at_or_after(inode_ref, iblock, Some(transaction))?
+        {
+            if extent.start_lblock() <= iblock {
+                let home = extent
+                    .start_pblock()
+                    .checked_add(u64::from(iblock - extent.start_lblock()))
+                    .ok_or_else(|| Ext4Error::new(ErrCode::EIO))?;
+                return Ok(home);
+            }
+        }
+        let home = super::rw::MetadataIo::transaction(self, transaction)
+            .allocate_initialized_data(inode_ref, Box::new([0; BLOCK_SIZE]))?;
+        let mut extent = Extent::new(iblock, home, 1);
+        extent.mark_unwritten();
+        self.transaction_insert_allocated_extent(transaction, inode_ref, &extent)?;
+        self.transaction_stage_inode_with_csum(transaction, inode_ref)?;
         Ok(home)
     }
 
@@ -2027,6 +2131,18 @@ impl Ext4 {
         path: &[ExtentSearchStep],
         new_ext: &Extent,
     ) -> Result<()> {
+        self.insert_extent_with_policy(metadata, inode_ref, path, new_ext, false, None)
+    }
+
+    fn insert_extent_with_policy(
+        &self,
+        metadata: &mut super::rw::MetadataIo<'_, '_, '_>,
+        inode_ref: &mut InodeRef,
+        path: &[ExtentSearchStep],
+        new_ext: &Extent,
+        preserving: bool,
+        mut trace: Option<&mut ExtentEditTrace>,
+    ) -> Result<()> {
         let leaf = path.last().ok_or(format_error!(
             ErrCode::EIO,
             "insert_extent: empty extent search path on inode {}",
@@ -2036,11 +2152,15 @@ impl Ext4 {
         if leaf.pblock == 0 {
             let mut leaf_node = inode_ref.inode.extent_root_mut();
             // Insert the extent
-            let res = leaf_node.insert_extent(new_ext, leaf.index.unwrap_err());
+            let res = if preserving {
+                leaf_node.insert_extent_preserving(new_ext, leaf.index.unwrap_err())
+            } else {
+                leaf_node.insert_extent(new_ext, leaf.index.unwrap_err())
+            };
             metadata.write_inode_with_csum(inode_ref)?;
             // Handle split
             return if let Err(split) = res {
-                self.split_root(metadata, inode_ref, &split)
+                self.split_root_traced(metadata, inode_ref, &split, trace)
             } else {
                 Ok(())
             };
@@ -2050,7 +2170,11 @@ impl Ext4 {
             self.read_extent_block_from_view(inode_ref, leaf.pblock, metadata.transaction_ref())?;
         let mut leaf_node = ExtentNodeMut::from_bytes(&mut *leaf_block.data);
         // Insert the extent
-        let res = leaf_node.insert_extent(new_ext, leaf.index.unwrap_err());
+        let res = if preserving {
+            leaf_node.insert_extent_preserving(new_ext, leaf.index.unwrap_err())
+        } else {
+            leaf_node.insert_extent(new_ext, leaf.index.unwrap_err())
+        };
         self.write_extent_block_with_metadata(metadata, &mut leaf_block, inode_ref)?;
         // Handle split
         if let Err(mut split) = res {
@@ -2065,7 +2189,14 @@ impl Ext4 {
                         inode_ref.id
                     )
                 })?;
-                let res = self.split(metadata, inode_ref, parent.pblock, parent_index, &split)?;
+                let res = self.split_traced(
+                    metadata,
+                    inode_ref,
+                    parent.pblock,
+                    parent_index,
+                    &split,
+                    trace.as_deref_mut(),
+                )?;
                 // Handle split again
                 if let Err(split_again) = res {
                     // Insertion to parent also causes split, continue to solve
@@ -2075,7 +2206,7 @@ impl Ext4 {
                 }
             }
             // Root node needs to be split
-            self.split_root(metadata, inode_ref, &split)
+            self.split_root_traced(metadata, inode_ref, &split, trace)
         } else {
             Ok(())
         }
@@ -2088,15 +2219,19 @@ impl Ext4 {
     /// The child node has already been split by calling `insert_extent` or
     /// `insert_extent_index`, and the split part is stored in `split`.
     /// This function will create a new leaf node to store the split part.
-    fn split(
+    fn split_traced(
         &self,
         metadata: &mut super::rw::MetadataIo<'_, '_, '_>,
         inode_ref: &mut InodeRef,
         parent_pblock: PBlockId,
         child_pos: usize,
         split: &[FakeExtent],
+        trace: Option<&mut ExtentEditTrace>,
     ) -> Result<core::result::Result<(), Vec<FakeExtent>>> {
         let right_bid = metadata.allocate_block(inode_ref)?;
+        if let Some(trace) = trace {
+            trace.record_new(right_bid)?;
+        }
         let mut right_block = metadata.read_block(right_bid)?;
         let mut right_node = ExtentNodeMut::from_bytes(&mut *right_block.data);
 
@@ -2146,15 +2281,20 @@ impl Ext4 {
     /// The root node has already been split by calling `insert_extent` or
     /// `insert_extent_index`, and the split part is stored in `split`.
     /// This function will create a new leaf node to store the split part.
-    fn split_root(
+    fn split_root_traced(
         &self,
         metadata: &mut super::rw::MetadataIo<'_, '_, '_>,
         inode_ref: &mut InodeRef,
         split: &[FakeExtent],
+        trace: Option<&mut ExtentEditTrace>,
     ) -> Result<()> {
         // Create left and right blocks
         let l_bid = metadata.allocate_block(inode_ref)?;
         let r_bid = metadata.allocate_block(inode_ref)?;
+        if let Some(trace) = trace {
+            trace.record_new(l_bid)?;
+            trace.record_new(r_bid)?;
+        }
         let mut l_block = metadata.read_block(l_bid)?;
         let mut r_block = metadata.read_block(r_bid)?;
 
@@ -2307,9 +2447,438 @@ impl Ext4 {
     }
 }
 
+impl Ext4 {
+    fn find_allocated_path(
+        &self,
+        inode: &InodeRef,
+        logical: LBlockId,
+        transaction: Option<&super::journal_transaction::Transaction<'_>>,
+    ) -> Result<Vec<ExtentSearchStep>> {
+        let mut path = Vec::new();
+        let mut home = 0;
+        let mut image;
+        let mut node = inode.inode.extent_root();
+        self.validate_extent_node(inode.id, &node)?;
+        while node.header().depth() > 0 {
+            if node.header().entries_count() == 0 {
+                return Err(Ext4Error::new(ErrCode::EIO));
+            }
+            // Insertion before the first key belongs to the first subtree.
+            let index = node.search_extent_index(logical).unwrap_or(0);
+            let depth = node.header().depth();
+            let child = node.extent_index_at(index).leaf();
+            path.push(ExtentSearchStep::new(home, Ok(index)));
+            self.ensure_valid_pblock(inode.id, child, "physical extent child")?;
+            image = self.read_extent_block_from_view(inode, child, transaction)?;
+            node = ExtentNode::from_bytes(&*image.data);
+            self.validate_extent_node(inode.id, &node)?;
+            if node.header().depth() + 1 != depth || node.header().entries_count() == 0 {
+                return Err(Ext4Error::new(ErrCode::EIO));
+            }
+            home = child;
+        }
+        path.push(ExtentSearchStep::new(
+            home,
+            node.search_allocated_extent(logical),
+        ));
+        Ok(path)
+    }
+
+    /// Physical coverage or the next allocation, without classifying unwritten
+    /// mappings as holes. Reads retain their separate zero-producing lookup.
+    pub(super) fn allocated_extent_at_or_after(
+        &self,
+        inode: &InodeRef,
+        logical: LBlockId,
+        transaction: Option<&super::journal_transaction::Transaction<'_>>,
+    ) -> Result<Option<Extent>> {
+        let path = self.find_allocated_path(inode, logical, transaction)?;
+        let leaf = path.last().ok_or_else(|| Ext4Error::new(ErrCode::EIO))?;
+        let image = if leaf.pblock == 0 {
+            None
+        } else {
+            Some(self.read_extent_block_from_view(inode, leaf.pblock, transaction)?)
+        };
+        let node = image
+            .as_ref()
+            .map(|image| ExtentNode::from_bytes(&*image.data))
+            .unwrap_or_else(|| inode.inode.extent_root());
+        let index = leaf.index.unwrap_or_else(|index| index);
+        if index < usize::from(node.header().entries_count()) {
+            return Ok(Some(*node.extent_at(index)));
+        }
+        for parent in path.iter().rev().skip(1) {
+            let image = if parent.pblock == 0 {
+                None
+            } else {
+                Some(self.read_extent_block_from_view(inode, parent.pblock, transaction)?)
+            };
+            let node = image
+                .as_ref()
+                .map(|image| ExtentNode::from_bytes(&*image.data))
+                .unwrap_or_else(|| inode.inode.extent_root());
+            let next = parent.index.map_err(|_| Ext4Error::new(ErrCode::EIO))? + 1;
+            if next >= usize::from(node.header().entries_count()) {
+                continue;
+            }
+            let mut home = node.extent_index_at(next).leaf();
+            let mut expected_depth = node.header().depth() - 1;
+            loop {
+                self.ensure_valid_pblock(inode.id, home, "next physical extent")?;
+                let image = self.read_extent_block_from_view(inode, home, transaction)?;
+                let node = ExtentNode::from_bytes(&*image.data);
+                self.validate_extent_node(inode.id, &node)?;
+                if node.header().depth() != expected_depth || node.header().entries_count() == 0 {
+                    return Err(Ext4Error::new(ErrCode::EIO));
+                }
+                if expected_depth == 0 {
+                    return Ok(Some(*node.extent_at(0)));
+                }
+                home = node.extent_index_at(0).leaf();
+                expected_depth -= 1;
+            }
+        }
+        Ok(None)
+    }
+
+    fn edit_extent_node<T>(
+        &self,
+        metadata: &mut super::rw::MetadataIo<'_, '_, '_>,
+        inode: &mut InodeRef,
+        home: PBlockId,
+        edit: impl FnOnce(&mut ExtentNodeMut<'_>) -> Result<T>,
+    ) -> Result<T> {
+        if home == 0 {
+            let result = edit(&mut inode.inode.extent_root_mut())?;
+            metadata.write_inode_with_csum(inode)?;
+            Ok(result)
+        } else {
+            let mut image =
+                self.read_extent_block_from_view(inode, home, metadata.transaction_ref())?;
+            let result = edit(&mut ExtentNodeMut::from_bytes(&mut *image.data))?;
+            self.write_extent_block_with_metadata(metadata, &mut image, inode)?;
+            Ok(result)
+        }
+    }
+
+    fn update_extent_path_minimum(
+        &self,
+        metadata: &mut super::rw::MetadataIo<'_, '_, '_>,
+        inode: &mut InodeRef,
+        path: &[ExtentSearchStep],
+        key: LBlockId,
+    ) -> Result<()> {
+        for parent in path.iter().rev().skip(1) {
+            let index = parent.index.map_err(|_| Ext4Error::new(ErrCode::EIO))?;
+            self.edit_extent_node(metadata, inode, parent.pblock, |node| {
+                node.extent_index_mut_at(index).first_block = key;
+                Ok(())
+            })?;
+            if index != 0 {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn transaction_insert_allocated_extent(
+        &self,
+        transaction: &mut super::journal_transaction::Transaction<'_>,
+        inode: &mut InodeRef,
+        extent: &Extent,
+    ) -> Result<()> {
+        self.transaction_insert_allocated_extent_traced(transaction, inode, extent, None)
+    }
+
+    pub(in crate::ext4) fn transaction_insert_allocated_extent_traced(
+        &self,
+        transaction: &mut super::journal_transaction::Transaction<'_>,
+        inode: &mut InodeRef,
+        extent: &Extent,
+        mut trace: Option<&mut ExtentEditTrace>,
+    ) -> Result<()> {
+        let end = extent
+            .start_lblock()
+            .checked_add(extent.block_count())
+            .ok_or_else(|| Ext4Error::new(ErrCode::EFBIG))?;
+        if extent.block_count() == 0 {
+            return Err(Ext4Error::new(ErrCode::EINVAL));
+        }
+        if let Some(next) =
+            self.allocated_extent_at_or_after(inode, extent.start_lblock(), Some(transaction))?
+        {
+            if next.start_lblock() < end {
+                return Err(Ext4Error::new(ErrCode::EEXIST));
+            }
+        }
+        if extent.start_lblock() != 0 {
+            if let Some(previous) = self.allocated_extent_at_or_after(
+                inode,
+                extent.start_lblock() - 1,
+                Some(transaction),
+            )? {
+                if Extent::can_append(&previous, extent) {
+                    let previous_path = self.find_allocated_path(
+                        inode,
+                        previous.start_lblock(),
+                        Some(transaction),
+                    )?;
+                    if let Some(trace) = trace.as_deref_mut() {
+                        trace.record_path(&previous_path)?;
+                    }
+                    let previous_leaf = previous_path
+                        .last()
+                        .ok_or_else(|| Ext4Error::new(ErrCode::EIO))?;
+                    let index = previous_leaf
+                        .index
+                        .map_err(|_| Ext4Error::new(ErrCode::EIO))?;
+                    let mut metadata = super::rw::MetadataIo::transaction(self, transaction);
+                    self.edit_extent_node(&mut metadata, inode, previous_leaf.pblock, |node| {
+                        node.extent_mut_at(index)
+                            .set_block_count(previous.block_count() + extent.block_count());
+                        Ok(())
+                    })?;
+                    return Ok(());
+                }
+            }
+        }
+        let path = self.find_allocated_path(inode, extent.start_lblock(), Some(transaction))?;
+        if let Some(trace) = trace.as_deref_mut() {
+            trace.record_path(&path)?;
+        }
+        if path
+            .last()
+            .ok_or_else(|| Ext4Error::new(ErrCode::EIO))?
+            .index
+            .is_ok()
+        {
+            return Err(Ext4Error::new(ErrCode::EEXIST));
+        }
+        let first = path.last().unwrap().index == Err(0);
+        let mut metadata = super::rw::MetadataIo::transaction(self, transaction);
+        if first {
+            self.update_extent_path_minimum(&mut metadata, inode, &path, extent.start_lblock())?;
+        }
+        self.insert_extent_with_policy(&mut metadata, inode, &path, extent, true, trace)
+    }
+
+    /// Replace a subrange of ONE allocated extent. At most three replacement
+    /// entries and depth-bounded detached nodes exist in one private image.
+    /// The caller frees detached tree/data blocks in the same transaction.
+    pub(super) fn transaction_splice_allocated_extent(
+        &self,
+        transaction: &mut super::journal_transaction::Transaction<'_>,
+        inode: &mut InodeRef,
+        first: LBlockId,
+        end: LBlockId,
+        initialized: bool,
+    ) -> Result<Vec<PBlockId>> {
+        self.transaction_splice_allocated_extent_traced(
+            transaction,
+            inode,
+            first,
+            end,
+            initialized,
+            None,
+        )
+    }
+
+    pub(in crate::ext4) fn transaction_splice_allocated_extent_traced(
+        &self,
+        transaction: &mut super::journal_transaction::Transaction<'_>,
+        inode: &mut InodeRef,
+        first: LBlockId,
+        end: LBlockId,
+        initialized: bool,
+        mut trace: Option<&mut ExtentEditTrace>,
+    ) -> Result<Vec<PBlockId>> {
+        let path = self.find_allocated_path(inode, first, Some(transaction))?;
+        if let Some(trace) = trace.as_deref_mut() {
+            trace.record_path(&path)?;
+        }
+        let leaf = path.last().ok_or_else(|| Ext4Error::new(ErrCode::EIO))?;
+        let index = leaf.index.map_err(|_| Ext4Error::new(ErrCode::ENOENT))?;
+        let original = self
+            .allocated_extent_at_or_after(inode, first, Some(transaction))?
+            .ok_or_else(|| Ext4Error::new(ErrCode::ENOENT))?;
+        let original_end = original
+            .start_lblock()
+            .checked_add(original.block_count())
+            .ok_or_else(|| Ext4Error::new(ErrCode::EIO))?;
+        if first >= end || end > original_end {
+            return Err(Ext4Error::new(ErrCode::EINVAL));
+        }
+        let mut replacements = Vec::new();
+        let segment = |start: u32, stop: u32, unwritten: bool| {
+            let mut extent = Extent::new(
+                start,
+                original.start_pblock() + u64::from(start - original.start_lblock()),
+                (stop - start) as u16,
+            );
+            if unwritten {
+                extent.mark_unwritten();
+            }
+            extent
+        };
+        if original.start_lblock() < first {
+            replacements.push(segment(
+                original.start_lblock(),
+                first,
+                original.is_unwritten(),
+            ));
+        }
+        if initialized {
+            replacements.push(segment(first, end, false));
+        }
+        if end < original_end {
+            replacements.push(segment(end, original_end, original.is_unwritten()));
+        }
+        let mut removed = Vec::new();
+        {
+            let mut metadata = super::rw::MetadataIo::transaction(self, transaction);
+            if let Some(replacement) = replacements.first() {
+                self.edit_extent_node(&mut metadata, inode, leaf.pblock, |node| {
+                    if index > 0 && Extent::can_append(node.extent_at(index - 1), replacement) {
+                        let previous = *node.extent_at(index - 1);
+                        node.extent_mut_at(index - 1)
+                            .set_block_count(previous.block_count() + replacement.block_count());
+                        let count = usize::from(node.header().entries_count());
+                        for slot in index..count - 1 {
+                            *node.fake_extent_mut_at(slot) = *node.fake_extent_at(slot + 1);
+                        }
+                        node.header_mut().set_entries_count((count - 1) as u16);
+                    } else {
+                        *node.extent_mut_at(index) = *replacement;
+                    }
+                    Ok(())
+                })?;
+                if index == 0 {
+                    self.update_extent_path_minimum(
+                        &mut metadata,
+                        inode,
+                        &path,
+                        replacement.start_lblock(),
+                    )?;
+                }
+            } else {
+                let mut position = index;
+                for level in (0..path.len()).rev() {
+                    let home = path[level].pblock;
+                    let (count, key) =
+                        self.edit_extent_node(&mut metadata, inode, home, |node| {
+                            let count = usize::from(node.header().entries_count());
+                            if position >= count {
+                                return Err(Ext4Error::new(ErrCode::EIO));
+                            }
+                            for index in position..count - 1 {
+                                *node.fake_extent_mut_at(index) = *node.fake_extent_at(index + 1);
+                            }
+                            node.header_mut().set_entries_count((count - 1) as u16);
+                            if count == 1 && home == 0 {
+                                node.init(0, 0);
+                            }
+                            Ok((
+                                count - 1,
+                                if count > 1 {
+                                    Some(node.extent_at(0).start_lblock())
+                                } else {
+                                    None
+                                },
+                            ))
+                        })?;
+                    if count != 0 {
+                        if position == 0 {
+                            self.update_extent_path_minimum(
+                                &mut metadata,
+                                inode,
+                                &path[..=level],
+                                key.unwrap(),
+                            )?;
+                        }
+                        break;
+                    }
+                    if home == 0 {
+                        break;
+                    }
+                    removed.push(home);
+                    position = path[level - 1]
+                        .index
+                        .map_err(|_| Ext4Error::new(ErrCode::EIO))?;
+                }
+            }
+        }
+        for extent in replacements.iter().skip(1) {
+            self.transaction_insert_allocated_extent_traced(
+                transaction,
+                inode,
+                extent,
+                trace.as_deref_mut(),
+            )?;
+        }
+        Ok(removed)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn range_edit_trace_is_explicit_bounded_and_deduplicated() {
+        let mut trace = ExtentEditTrace::new().unwrap();
+        trace
+            .record_path(&[
+                ExtentSearchStep::new(0, Ok(0)),
+                ExtentSearchStep::new(9, Ok(0)),
+            ])
+            .unwrap();
+        trace.record_new(10).unwrap();
+        trace.record_new(10).unwrap();
+        assert_eq!(trace.touched_tree_homes, vec![9, 10]);
+        assert_eq!(trace.new_tree_homes, vec![10]);
+        for home in 11..137 {
+            ExtentEditTrace::record(&mut trace.touched_tree_homes, home).unwrap();
+        }
+        assert_eq!(trace.touched_tree_homes.len(), ExtentEditTrace::LIMIT);
+        assert_eq!(
+            ExtentEditTrace::record(&mut trace.touched_tree_homes, 137)
+                .unwrap_err()
+                .code(),
+            ErrCode::ENOSPC
+        );
+        ExtentEditTrace::record(&mut trace.touched_tree_homes, 9).unwrap();
+    }
+
+    #[test]
+    fn preallocation_range_errors_precede_any_device_mutation() {
+        let fs = make_test_fs(100);
+        assert_eq!(
+            fs.preallocate_range_batch(2, 0, 0).unwrap_err().code(),
+            ErrCode::EINVAL
+        );
+        assert_eq!(
+            fs.preallocate_range_batch(2, usize::MAX, 2)
+                .unwrap_err()
+                .code(),
+            ErrCode::EFBIG
+        );
+        assert_eq!(
+            fs.preallocate_range_batch(2, MAX_BLOCKS as usize * BLOCK_SIZE, 1)
+                .unwrap_err()
+                .code(),
+            ErrCode::EFBIG
+        );
+        assert_eq!(
+            fs.punch_block_range(2, 2, 1).unwrap_err().code(),
+            ErrCode::EINVAL
+        );
+        assert_eq!(
+            fs.write_existing_block_image(2, MAX_BLOCKS, &[0; BLOCK_SIZE])
+                .unwrap_err()
+                .code(),
+            ErrCode::EFBIG
+        );
+    }
 
     struct StubBlockDevice {
         sb_block: Block,

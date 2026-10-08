@@ -121,7 +121,7 @@ impl OvlInode {
         // guards have already been released by ensure_upper_dir_path().
         let _ancestor_publish_guard = (metadata.file_type == FileType::Dir)
             .then(|| fs.ancestor_copy_up_lock(&self.redirect).lock());
-        match parent_inode.find(name) {
+        match super::lookup::lookup_backing(&parent_inode, name) {
             Ok(existing)
                 if metadata.file_type == FileType::Dir
                     && fs.matches_ancestor_publication(
@@ -283,7 +283,7 @@ impl OvlInode {
             // after each component, so ancestor locks are never nested.
             let fs = self.overlay_fs()?;
             let _ancestor_guard = fs.ancestor_copy_up_lock(&current_path).lock();
-            match current.find(component) {
+            match super::lookup::lookup_backing(&current, component) {
                 Ok(next) => {
                     if Self::is_whiteout_inode_checked(&next)?
                         || next.metadata()?.file_type != FileType::Dir
@@ -308,7 +308,7 @@ impl OvlInode {
         let mut lowers = Vec::new();
         for layer in fs.layers.iter().filter(|layer| layer.index != 0) {
             if let Some(lower_root) = layer.mnt.lower_inodes.first() {
-                match lower_root.lookup(path) {
+                match super::lookup::lookup_backing_path(lower_root, path) {
                     Ok(inode) if inode.metadata()?.file_type == FileType::Dir => lowers.push(inode),
                     Ok(_) if lowers.is_empty() => return Err(SystemError::ENOTDIR),
                     Ok(_) => break,
@@ -337,7 +337,7 @@ impl OvlInode {
             .iter()
             .map(|inode| inode.upper_inode.lock())
             .collect::<Vec<_>>();
-        match upper_parent.find(name) {
+        match super::lookup::lookup_backing(upper_parent, name) {
             Ok(existing) => {
                 if Self::is_whiteout_inode_checked(&existing)?
                     || existing.metadata()?.file_type != FileType::Dir

@@ -48,3 +48,12 @@ normal/tcp_pending_error
 normal/unix_reuse_options
 normal/unix_connect_backlog
 normal/unix_accept_close
+normal/mount_control
+normal/mount_attributes
+normal/mount_idmap
+normal/write_user_fault
+normal/proc_fd_permission
+normal/ext4_fallocate
+normal/mount_filecaps
+normal/stat_blocks
+fuse/stat_blocks

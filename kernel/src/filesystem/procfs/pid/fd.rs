@@ -7,7 +7,7 @@ use crate::filesystem::{
         pid::ProcPidTarget,
         template::{Builder, DirOps, ProcDir, ProcDirBuilder, ProcSymBuilder, SymOps},
     },
-    vfs::{IndexNode, InodeMode, SpecialNodeData},
+    vfs::{permission::PermissionMask, IndexNode, InodeMode, Metadata, SpecialNodeData},
 };
 use crate::libs::casting::DowncastArc;
 use alloc::{
@@ -44,6 +44,27 @@ impl FdDirOps {
 }
 
 impl DirOps for FdDirOps {
+    fn check_dac_permission(
+        &self,
+        metadata: &Metadata,
+        mask: PermissionMask,
+    ) -> Result<(), SystemError> {
+        let current = crate::process::ProcessManager::current_pcb();
+        let generic = current.cred().inode_permission(metadata, mask.bits());
+        if generic.is_ok() {
+            return generic;
+        }
+        // Linux proc_fd_permission(): introspection remains possible after
+        // setuid(), without granting another thread group a DAC bypass.
+        if self
+            .get_process()
+            .is_some_and(|target| target.raw_tgid() == current.raw_tgid())
+        {
+            return Ok(());
+        }
+        generic
+    }
+
     fn lookup_child(
         &self,
         dir: &ProcDir<Self>,
@@ -130,6 +151,18 @@ pub struct FdSymOps {
 }
 
 impl FdSymOps {
+    fn checked_process(&self) -> Result<Arc<crate::process::ProcessControlBlock>, SystemError> {
+        // Linux proc_fd_access_allowed() returns false for a vanished task;
+        // get_link/readlink report EACCES before attempting to resolve its fd.
+        let target = self.target.task().ok_or(SystemError::EACCES)?;
+        if !crate::process::ProcessManager::current_pcb()
+            .has_permission_to_trace(&target, crate::process::ptrace::PtraceAccessCreds::FsCreds)
+        {
+            return Err(SystemError::EACCES);
+        }
+        Ok(target)
+    }
+
     pub fn new_inode(
         target: ProcPidTarget,
         fd: i32,
@@ -144,6 +177,10 @@ impl FdSymOps {
 }
 
 impl SymOps for FdSymOps {
+    fn check_symlink_access(&self) -> Result<(), SystemError> {
+        self.checked_process().map(|_| ())
+    }
+
     fn is_magic_link(&self) -> bool {
         true
     }
@@ -151,7 +188,7 @@ impl SymOps for FdSymOps {
     fn read_link(&self, buf: &mut [u8]) -> Result<usize, SystemError> {
         // `proc_fd_link()` walks `get_proc_task(inode)->files`, so the link is
         // resolved against the thread this node names, not the group leader.
-        let process = self.target.task().ok_or(SystemError::ENOENT)?;
+        let process = self.checked_process()?;
 
         // 先获取文件对象的 clone，然后立即释放 fd_table 锁
         // 避免在持有锁时调用可能获取其他锁的方法（如 absolute_path）

@@ -21,6 +21,8 @@ BIN_DIR = bin
 BUILD_DIR = build
 EXT4_FIXTURE = $(BUILD_DIR)/fixtures/ext4_inode_identity.img
 EXT4_UNINIT_FIXTURE = $(BUILD_DIR)/fixtures/ext4_uninit_bitmap.img
+FAT_STAT_FIXTURE = $(BUILD_DIR)/fixtures/fat_stat_blocks.img
+FAT32_STAT_FIXTURE = $(BUILD_DIR)/fixtures/fat32_stat_blocks.img
 
 # 要编译的测试套件目录列表（suites/ 下的子目录名）
 SUITES = demo normal fuse
@@ -59,7 +61,21 @@ $(GTEST_SRC):
 	@mv "$(GTEST_TMP_ROOT)" "$(GTEST_ROOT)"
 	@test -f "$(GTEST_SRC)"
 
-build-suites: $(TEST_BINS) $(EXT4_FIXTURE) $(EXT4_UNINIT_FIXTURE)
+build-suites: $(TEST_BINS) $(EXT4_FIXTURE) $(EXT4_UNINIT_FIXTURE) $(FAT_STAT_FIXTURE) $(FAT32_STAT_FIXTURE)
+
+# Fixed FAT16 geometry permits exact sector assertions and covers its
+# non-cluster root directory. Tests always mutate their own disposable copy.
+$(FAT_STAT_FIXTURE):
+	@mkdir -p "$(dir $@)"
+	@truncate -s 16M "$@"
+	@mkfs.fat -F 16 -S 512 -s 4 -r 16 "$@"
+
+# More than 65525 data clusters: a legal FAT32 image, not forced FAT32 on
+# an undersized volume. One 512-byte sector per cluster gives exact units.
+$(FAT32_STAT_FIXTURE):
+	@mkdir -p "$(dir $@)"
+	@truncate -s 40M "$@"
+	@mkfs.fat -F 32 -S 512 -s 1 "$@"
 
 $(EXT4_FIXTURE):
 	@mkdir -p "$(dir $@)"
@@ -99,7 +115,11 @@ $(BIN_DIR)/%_test: suites/%.cc $(GTEST_OBJ)
 	@echo "编译测例: $< -> $@"
 	@$(CXX) $(CXXFLAGS) $(GTEST_INCLUDES) "$<" $(GTEST_OBJ) -o "$@"
 
-$(BIN_DIR)/normal/ext4_inode_identity_test $(BIN_DIR)/normal/utimensat_symlink_test: suites/normal/loop_ext4_test_support.h
+$(BIN_DIR)/normal/ext4_inode_identity_test $(BIN_DIR)/normal/utimensat_symlink_test $(BIN_DIR)/normal/mount_idmap_test $(BIN_DIR)/normal/ext4_fallocate_test $(BIN_DIR)/normal/stat_blocks_test: suites/normal/loop_ext4_test_support.h
+
+$(BIN_DIR)/normal/mount_idmap_test $(BIN_DIR)/normal/proc_fd_permission_test: suites/normal/cap_common.h
+
+$(BIN_DIR)/fuse/stat_blocks_test: suites/fuse/fuse_gtest_common.h suites/fuse/fuse_test_simplefs_local.h
 
 $(BIN_DIR)/normal/forward_mtu_test: suites/normal/forward_mtu_nft_support.h
 
@@ -119,7 +139,7 @@ install: build
 	@chmod +x $(INSTALL_DIR)/dunitest-runner
 	@cp -rf $(BIN_DIR) $(INSTALL_DIR)/
 	@mkdir -p $(INSTALL_DIR)/fixtures
-	@cp --sparse=always -f $(EXT4_FIXTURE) $(EXT4_UNINIT_FIXTURE) $(INSTALL_DIR)/fixtures/
+	@cp --sparse=always -f $(EXT4_FIXTURE) $(EXT4_UNINIT_FIXTURE) $(FAT_STAT_FIXTURE) $(FAT32_STAT_FIXTURE) $(INSTALL_DIR)/fixtures/
 	@cp -f whitelist.txt $(INSTALL_DIR)/whitelist.txt
 	@cp -f no_skip.txt $(INSTALL_DIR)/no_skip.txt
 	@cp -f scripts/run_tests.sh $(INSTALL_DIR)/run_tests.sh

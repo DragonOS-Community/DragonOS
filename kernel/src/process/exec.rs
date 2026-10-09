@@ -672,11 +672,6 @@ fn de_thread(
             // concurrent fork can reuse that number and a late release would
             // remove the newly published child under the same map key.
             unsafe { ProcessManager::release(leader.raw_pid()) };
-
-            // DragonOS still indexes TGID by every thread. The generic release
-            // path sees the migrated old leader as a nonleader and only
-            // detaches PID, so remove its remaining TGID link explicitly.
-            leader.detach_pid(PidType::TGID);
         }
     } else {
         current

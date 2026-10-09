@@ -15,6 +15,10 @@ use system_error::SystemError;
 use super::namespace::pid_namespace::PidNamespace;
 use super::{ProcessControlBlock, RawPid};
 
+#[path = "pid_selftest.rs"]
+mod selftest;
+pub(crate) use selftest::selftest_membership_lifetime;
+
 /// Serializes logical and physical PGID/SID membership transactions.
 ///
 /// This is the DragonOS equivalent of the Linux tasklist lock coverage used by
@@ -474,8 +478,8 @@ impl PidLink {
     }
 
     /// 取消PID链接
-    pub(super) fn unlink_pid(&self) {
-        self.pid.write().take();
+    pub(super) fn unlink_pid(&self) -> Option<Arc<Pid>> {
+        self.pid.write().take()
     }
 
     /// 获取链接的PID
@@ -746,8 +750,15 @@ impl ProcessControlBlock {
         // );
         // log::debug!("current name: {}", self.basic().name());
 
-        let pid = self.task_pid_ptr(pid_type);
-        self.pid_links[pid_type as usize].unlink_pid();
+        // Shared TGID/PGID/SID identities do not imply physical membership
+        // (failed publication or exec identity transfer). PID is different:
+        // the task owns its private allocation even before fork publishes it,
+        // and Drop must roll that allocation back on publication failure.
+        let pid = self.pid_links[pid_type as usize].unlink_pid().or_else(|| {
+            (pid_type == PidType::PID)
+                .then(|| self.thread_pid.read().clone())
+                .flatten()
+        });
         // log::debug!(
         //     "Unlinked PID type={:?}, pid={}",
         //     pid_type,

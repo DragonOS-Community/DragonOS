@@ -65,7 +65,7 @@ impl PidNamespace {
     pub const MAX_PID_NS_LEVEL: u32 = 32;
 
     /// 创建root PID namespace
-    fn new_root() -> Arc<Self> {
+    pub(in crate::process) fn new_root() -> Arc<Self> {
         Arc::new_cyclic(|self_ref| Self {
             self_ref: self_ref.clone(),
             ns_common: NsCommon::new(0, NamespaceType::Pid),

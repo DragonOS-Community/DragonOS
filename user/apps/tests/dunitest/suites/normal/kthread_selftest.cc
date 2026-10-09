@@ -46,6 +46,7 @@ TEST(KthreadSelftest, CreateRunStopAndReapHandshakes) {
     const std::string report = ReadAll(kKthreadSelftestPath);
     ASSERT_FALSE(report.empty());
     EXPECT_NE(std::string::npos, report.find("status=ok\n")) << report;
+    EXPECT_NE(std::string::npos, report.find("pid_membership_lifetime=ok\n")) << report;
     EXPECT_NE(std::string::npos, report.find("task_destruction=ok\n")) << report;
     EXPECT_NE(std::string::npos, report.find("task_reaped=true remaining_owners=0\n")) << report;
     EXPECT_NE(std::string::npos, report.find("sched_entity_destruction=ok\n")) << report;

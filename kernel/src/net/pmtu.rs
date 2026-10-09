@@ -101,7 +101,8 @@ fn transport(
 }
 
 pub(crate) fn parse(packet: &[u8], ingress_ifindex: u32) -> Option<PmtuFeedback> {
-    let version = IpVersion::of_packet(packet).ok()?;
+    // of_packet reads the first byte without checking the slice length.
+    let version = IpVersion::of_packet(packet.get(..1)?).ok()?;
     let (offender, outer_destination, protocol, offset) = transport(packet, version)?;
     let total = match version {
         IpVersion::Ipv4 => usize::from(word(packet, 2)),
@@ -139,10 +140,8 @@ pub(crate) fn parse(packet: &[u8], ingress_ifindex: u32) -> Option<PmtuFeedback>
         }
     };
     let quote = &error[8..];
-    let quoted_version = IpVersion::of_packet(quote).ok()?;
-    if quoted_version != version {
-        return None;
-    }
+    // A checksummed ICMP error may contain no quote at all. transport checks
+    // both the fixed header length and the expected IP version before access.
     let (source, destination, protocol, transport_offset) = transport(quote, version)?;
     if transport_offset + 8 > quote.len() || source != outer_destination {
         return None;

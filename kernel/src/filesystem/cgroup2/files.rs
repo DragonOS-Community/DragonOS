@@ -19,6 +19,7 @@ use super::{AVAILABLE_CONTROLLERS, DOMAIN_CONTROLLERS};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum CgroupCoreFile {
     Procs,
+    Threads,
     Controllers,
     SubtreeControl,
     Events,
@@ -70,10 +71,17 @@ impl CgroupFileSpec {
     }
 }
 
-const BASE_FILE_SPECS: [CgroupFileSpec; 4] = [
+const BASE_FILE_SPECS: [CgroupFileSpec; 5] = [
     CgroupFileSpec {
         name: "cgroup.procs",
         ty: CgroupCoreFile::Procs,
+        init: b"",
+        mode: 0o644,
+        visibility: CgroupFileVisibility::All,
+    },
+    CgroupFileSpec {
+        name: "cgroup.threads",
+        ty: CgroupCoreFile::Threads,
         init: b"",
         mode: 0o644,
         visibility: CgroupFileVisibility::All,
@@ -113,7 +121,7 @@ const NON_ROOT_CORE_FILE_SPECS: [CgroupFileSpec; 3] = [
         name: "cgroup.type",
         ty: CgroupCoreFile::Type,
         init: b"domain\n",
-        mode: 0o444,
+        mode: 0o644,
         visibility: CgroupFileVisibility::NotOnRoot,
     },
     CgroupFileSpec {
@@ -334,7 +342,10 @@ fn available_controllers_for(cgroup: &Arc<CgroupNode>) -> Vec<&'static str> {
     AVAILABLE_CONTROLLERS
         .iter()
         .copied()
-        .filter(|name| parent_enabled.contains(*name))
+        .filter(|name| {
+            parent_enabled.contains(*name)
+                && (!cgroup.is_threaded() || crate::cgroup::threaded::is_threaded_controller(name))
+        })
         .collect()
 }
 
@@ -346,16 +357,17 @@ pub(super) fn read_file(
     cgroup: &Arc<CgroupNode>,
     ty: CgroupCoreFile,
     generation: u64,
+    file_generation: u64,
 ) -> Result<Vec<u8>, SystemError> {
+    if let CgroupCoreFile::Cpuset(file) = ty {
+        return cpuset::read(cgroup, generation, file);
+    }
+    let _guard = crate::cgroup::lock();
+    check_live_file(cgroup, ty, file_generation)?;
     Ok(match ty {
-        CgroupCoreFile::Cpuset(file) => return cpuset::read(cgroup, generation, file),
-        CgroupCoreFile::Procs => {
-            let mut lines = String::new();
-            for pid in cgroup.tasks() {
-                lines.push_str(&format!("{}\n", pid.data()));
-            }
-            lines.into_bytes()
-        }
+        CgroupCoreFile::Cpuset(_) => unreachable!(),
+        CgroupCoreFile::Procs => membership_list(cgroup, true)?,
+        CgroupCoreFile::Threads => membership_list(cgroup, false)?,
         CgroupCoreFile::Controllers => {
             let items: Vec<String> = available_controllers_for(cgroup)
                 .into_iter()
@@ -371,15 +383,7 @@ pub(super) fn read_file(
             let populated = if is_populated(cgroup) { 1 } else { 0 };
             format!("populated {}\nfrozen 0\n", populated).into_bytes()
         }
-        CgroupCoreFile::Type => {
-            if !cgroup.is_valid_domain() {
-                b"domain invalid\n".to_vec()
-            } else if cgroup.is_thread_root() {
-                b"domain threaded\n".to_vec()
-            } else {
-                b"domain\n".to_vec()
-            }
-        }
+        CgroupCoreFile::Type => format!("{}\n", cgroup.type_name()).into_bytes(),
         CgroupCoreFile::Freeze => {
             format!("{}\n", if cgroup.freeze_requested() { 1 } else { 0 }).into_bytes()
         }
@@ -410,14 +414,32 @@ pub(super) fn write_controller_file(
     cgroup: &Arc<CgroupNode>,
     ty: CgroupCoreFile,
     generation: u64,
+    file_generation: u64,
     input: &str,
 ) -> Result<Vec<u8>, SystemError> {
-    match ty {
-        CgroupCoreFile::Cpuset(file) => {
-            cpuset::write(cgroup, generation, file, input)?;
-            // Cpuset content is generated from controller state on each read.
-            Ok(Vec::new())
+    if let CgroupCoreFile::Cpuset(file) = ty {
+        cpuset::write(cgroup, generation, file, input)?;
+        return Ok(Vec::new());
+    }
+    let _guard = crate::cgroup::lock();
+    if ty == CgroupCoreFile::Type {
+        if input.trim() != "threaded" {
+            return Err(SystemError::EINVAL);
         }
+        let _accounting = crate::cgroup::cgroup_accounting_lock().lock();
+        let had_memory =
+            !cgroup.is_threaded() && available_controllers_for(cgroup).contains(&"memory");
+        crate::cgroup::threaded::enable_threaded(cgroup)?;
+        if had_memory {
+            for spec in MEMORY_FILE_SPECS {
+                cgroup.reset_file_permissions(spec.name, spec.mode as u32);
+            }
+        }
+        return Ok(Vec::new());
+    }
+    check_live_file(cgroup, ty, file_generation)?;
+    match ty {
+        CgroupCoreFile::Cpuset(_) | CgroupCoreFile::Type => unreachable!(),
         CgroupCoreFile::Freeze => {
             let value = input
                 .trim()
@@ -471,7 +493,6 @@ pub(super) fn write_controller_file(
         }
         CgroupCoreFile::Controllers
         | CgroupCoreFile::Events
-        | CgroupCoreFile::Type
         | CgroupCoreFile::CpuStat
         | CgroupCoreFile::MemoryCurrent
         | CgroupCoreFile::MemoryPeak
@@ -482,8 +503,74 @@ pub(super) fn write_controller_file(
         | CgroupCoreFile::MemorySwapEvents
         | CgroupCoreFile::PidsCurrent
         | CgroupCoreFile::PidsEvents => Err(SystemError::EPERM),
-        CgroupCoreFile::Procs | CgroupCoreFile::SubtreeControl => Err(SystemError::EINVAL),
+        CgroupCoreFile::Procs | CgroupCoreFile::Threads | CgroupCoreFile::SubtreeControl => {
+            Err(SystemError::EINVAL)
+        }
     }
+}
+
+fn check_live_file(
+    cgroup: &Arc<CgroupNode>,
+    ty: CgroupCoreFile,
+    generation: u64,
+) -> Result<(), SystemError> {
+    if !crate::cgroup::cgroup_root().is_online(cgroup) {
+        return Err(SystemError::ENODEV);
+    }
+    let spec = desired_file_specs(cgroup)
+        .into_iter()
+        .find(|spec| spec.ty == ty)
+        .ok_or(SystemError::ENODEV)?;
+    if cgroup.file_generation(spec.name) != generation {
+        return Err(SystemError::ENODEV);
+    }
+    Ok(())
+}
+
+/// Membership and PID identities share the accounting transaction with exec.
+/// Aggregate threaded descendants in this resource domain. Invalid ordinary
+/// nodes can separate them after an ancestor is converted to threaded mode.
+fn membership_list(cgroup: &Arc<CgroupNode>, processes: bool) -> Result<Vec<u8>, SystemError> {
+    if processes && cgroup.is_threaded() {
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+    }
+    let _accounting = crate::cgroup::cgroup_accounting_lock().lock();
+    let mut nodes = alloc::vec![cgroup.clone()];
+    let mut ids = alloc::collections::BTreeMap::new();
+    while let Some(node) = nodes.pop() {
+        let in_domain = !processes
+            || Arc::ptr_eq(&node, cgroup)
+            || (node.is_threaded() && Arc::ptr_eq(&node.resource_domain(), cgroup));
+        for pid in node.tasks().into_iter().filter(|_| in_domain) {
+            let Some(task) = crate::process::ProcessManager::find(pid) else {
+                continue;
+            };
+            if task.is_exited() {
+                continue;
+            }
+            if processes {
+                if let Some(pid) = task.task_pid_ptr(crate::process::pid::PidType::TGID) {
+                    if let Some(raw) = pid.first_upid() {
+                        ids.insert(raw.nr.data(), pid.pid_vnr().data());
+                    }
+                }
+            } else {
+                ids.insert(task.raw_pid().data(), task.task_pid_vnr().data());
+            }
+        }
+        if processes {
+            nodes.extend(
+                node.children()
+                    .into_iter()
+                    .filter(|child| !child.is_valid_domain()),
+            );
+        }
+    }
+    let mut lines = String::new();
+    for id in ids.into_values() {
+        lines.push_str(&format!("{}\n", id));
+    }
+    Ok(lines.into_bytes())
 }
 
 pub(super) fn apply_subtree_control(
@@ -500,14 +587,11 @@ pub(super) fn apply_subtree_control(
                 continue;
             }
             validate_enable_controller(cgroup, &name)?;
-            if DOMAIN_CONTROLLERS.contains(&name.as_str())
-                && cgroup.parent().is_some()
-                && cgroup.is_thread_root()
-            {
-                return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
-            }
             enabled.insert(name);
         } else {
+            if !enabled.contains(&name) {
+                continue;
+            }
             for child in cgroup.children() {
                 if child.subtree_control().iter().any(|ctrl| ctrl == &name) {
                     return Err(SystemError::EBUSY);
@@ -517,17 +601,40 @@ pub(super) fn apply_subtree_control(
         }
     }
 
-    if enabled.difference(&old_enabled).next().is_some() && cgroup.parent().is_some() {
-        if !cgroup.is_valid_domain() {
+    let newly_enabled: Vec<_> = enabled.difference(&old_enabled).collect();
+    if !newly_enabled.is_empty() {
+        if !cgroup.resource_domain().is_valid_domain() {
             return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
         }
-        if cgroup.has_tasks()
-            && (cgroup.has_populated_domain_children()
-                || enabled
-                    .iter()
-                    .any(|name| DOMAIN_CONTROLLERS.contains(&name.as_str())))
-        {
-            return Err(SystemError::EBUSY);
+        if cgroup.parent().is_some() {
+            let domain_enable = newly_enabled
+                .iter()
+                .any(|name| DOMAIN_CONTROLLERS.contains(&name.as_str()));
+            if domain_enable && (cgroup.is_thread_root() || cgroup.is_threaded()) {
+                return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+            }
+            if (domain_enable || (!cgroup.can_be_thread_root() && !cgroup.is_threaded()))
+                && cgroup.has_tasks()
+            {
+                return Err(SystemError::EBUSY);
+            }
+        }
+    }
+    // Controller instances have independent lifetimes. Reset their state and
+    // inode identity at the topology transaction, not at a mount's lazy lookup.
+    for name in old_enabled.symmetric_difference(&enabled) {
+        for child in cgroup.children() {
+            child.reset_controller(name);
+            for spec in controller_specs(name) {
+                child.reset_file_permissions(spec.name, spec.mode as u32);
+                if enabled.contains(name) {
+                    let cred = crate::process::ProcessManager::current_pcb().cred();
+                    let mut attrs = child.file_permissions(spec.name, spec.mode as u32);
+                    attrs.uid = cred.fsuid.data() as u32;
+                    attrs.gid = cred.fsgid.data() as u32;
+                    child.set_file_permissions(spec.name, attrs);
+                }
+            }
         }
     }
     cgroup.set_subtree_control(enabled.clone());

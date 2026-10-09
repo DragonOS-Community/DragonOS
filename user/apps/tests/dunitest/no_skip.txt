@@ -57,5 +57,6 @@ normal/ext4_fallocate
 normal/mount_filecaps
 normal/stat_blocks
 normal/cgroup_cpuset
+normal/cgroup_threaded
 normal/udp_source_route
 fuse/stat_blocks

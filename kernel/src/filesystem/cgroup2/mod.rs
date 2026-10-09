@@ -18,7 +18,42 @@ use self::{inode::Cgroup2Inode, mount::Cgroup2Fs};
 
 mod files;
 mod inode;
+mod migration;
 mod mount;
+mod permissions;
+
+/// Security identity attached to an open cgroup file description.
+#[derive(Clone)]
+pub struct CgroupOpenState {
+    pub(crate) cred: Arc<crate::process::cred::Cred>,
+    pub(crate) namespace: Arc<crate::process::namespace::cgroup_namespace::CgroupNamespace>,
+}
+
+impl core::fmt::Debug for CgroupOpenState {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("CgroupOpenState")
+            .field("cred", &self.cred)
+            .field("namespace_root", &self.namespace.root_cgroup().id())
+            .finish()
+    }
+}
+
+pub fn cgroup2_check_attach_namespace(
+    fs: &dyn FileSystem,
+    src: &Arc<CgroupNode>,
+    dst: &Arc<CgroupNode>,
+    ns: &crate::process::namespace::cgroup_namespace::CgroupNamespace,
+) -> Result<(), SystemError> {
+    if fs
+        .as_any_ref()
+        .downcast_ref::<Cgroup2Fs>()
+        .is_some_and(|fs| fs.nsdelegate())
+        && (!ns.root_cgroup().is_ancestor_of(src) || !ns.root_cgroup().is_ancestor_of(dst))
+    {
+        return Err(SystemError::ENOENT);
+    }
+    Ok(())
+}
 
 pub(super) const CGROUP2_MAX_NAMELEN: usize = 255;
 pub(super) const CGROUP2_BLOCK_SIZE: u64 = 512;
@@ -40,7 +75,7 @@ pub fn cgroup2_init() -> Result<(), SystemError> {
             let fs_dir = sys.find("fs")?;
             let cgroup_dir = fs_dir.find("cgroup")?;
 
-            let cgroup_fs = Cgroup2Fs::new(cgroup_root().root(), false);
+            let cgroup_fs = Cgroup2Fs::new(cgroup_root().root());
             cgroup_dir.mount(cgroup_fs, MountFlags::empty())?;
 
             ::log::info!("Cgroup2 mounted at /sys/fs/cgroup");

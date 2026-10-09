@@ -4,10 +4,7 @@ mod mask;
 
 use crate::{
     cgroup::{cgroup_root, CgroupNode},
-    libs::{
-        cpumask::CpuMask,
-        mutex::{Mutex, MutexGuard},
-    },
+    libs::{cpumask::CpuMask, mutex::MutexGuard},
     process::{kthread::KernelThreadFlags, ProcessControlBlock, ProcessFlags, ProcessManager},
     smp::cpu::{smp_cpu_manager, ProcessorId},
 };
@@ -15,11 +12,9 @@ use alloc::{collections::BTreeSet, string::String, sync::Arc, vec::Vec};
 use mask::{list, parse, IndexSet};
 use system_error::SystemError;
 
-static UPDATE_LOCK: Mutex<()> = Mutex::new(());
-
 /// Lock before hierarchy/accounting/pi/rq locks, never from interrupt context.
 pub(crate) fn lock() -> MutexGuard<'static, ()> {
-    UPDATE_LOCK.lock()
+    super::lock()
 }
 
 #[derive(Debug, Default, Clone)]

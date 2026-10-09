@@ -2,6 +2,11 @@ use inner::{BoundUdp, UdpBindContext, UdpInner, UnboundUdp};
 use smoltcp;
 use system_error::SystemError;
 
+use super::common::error_queue::{
+    ErrorQueue, ErrorQueueEntry, SockExtendedErr, SO_EE_ORIGIN_ICMP, SO_EE_ORIGIN_ICMP6,
+    SO_EE_ORIGIN_LOCAL,
+};
+use super::common::pmtu::PmtuPolicy;
 use crate::driver::net::Iface;
 use crate::filesystem::epoll::event_poll::EventPoll;
 use crate::filesystem::epoll::EPollEventType;
@@ -19,7 +24,6 @@ use crate::process::namespace::NamespaceOps;
 use crate::process::ProcessManager;
 use crate::time::{Duration, Instant};
 use crate::{libs::rwsem::RwSem, net::socket::endpoint::Endpoint};
-use alloc::collections::VecDeque;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::sync::atomic::{
@@ -52,10 +56,9 @@ const IFACE_POLL_BATCH_ROUNDS: usize = 128;
 // without waiting for a particular receiver or draining unrelated traffic.
 const LOCAL_OUTPUT_POLL_ROUNDS: usize = 8;
 
-/// Native IPv6 unicast is admitted by the prepared output queue; multicast
-/// and IPv4-mapped destinations still use the smoltcp send queue.
+/// Native IPv6 datagrams use the prepared source-fragmentation output owner.
 fn uses_prepared_ipv6_output(endpoint: IpEndpoint) -> bool {
-    matches!(endpoint.addr, Ipv6(addr) if addr.to_ipv4_mapped().is_none() && !addr.is_multicast())
+    matches!(endpoint.addr, Ipv6(addr) if addr.to_ipv4_mapped().is_none())
 }
 
 struct Ipv4SendSnapshot {
@@ -81,35 +84,10 @@ struct Ipv6SendSnapshot {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
-struct SockExtendedErr {
-    ee_errno: u32,
-    ee_origin: u8,
-    ee_type: u8,
-    ee_code: u8,
-    ee_pad: u8,
-    ee_info: u32,
-    ee_data: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
 struct InPktInfo {
     ipi_ifindex: i32,
     ipi_spec_dst: u32,
     ipi_addr: u32,
-}
-
-const SO_EE_ORIGIN_LOCAL: u8 = 1;
-const ICMP_ECHOREPLY: u8 = 0;
-const ICMP_NET_UNREACH: u8 = 0;
-
-#[derive(Clone, Debug)]
-struct UdpErrQueueEntry {
-    err: SockExtendedErr,
-    offender: IpEndpoint,
-    cmsg_level: i32,
-    cmsg_type: i32,
-    addr_len: usize,
 }
 
 // Udp Socket 负责提供状态切换接口、执行状态切换
@@ -178,7 +156,12 @@ pub struct UdpSocket {
     /// IPV6_RECVORIGDSTADDR
     recv_origdstaddr_v6: AtomicBool,
     /// Error queue for MSG_ERRQUEUE
-    errqueue: Mutex<VecDeque<UdpErrQueueEntry>>,
+    errqueue: Mutex<(i32, ErrorQueue)>,
+    pmtu_v4: AtomicI32,
+    pmtu_v6: AtomicI32,
+    ipv6_mtu: AtomicUsize,
+    ipv6_multicast_loop: AtomicBool,
+    ipv6_multicast_hops: AtomicI32,
     /// SO_LINGER
     linger_onoff: AtomicI32,
     linger_linger: AtomicI32,
@@ -247,7 +230,12 @@ impl UdpSocket {
             recv_pktinfo_v4: AtomicBool::new(false),
             recv_origdstaddr_v4: AtomicBool::new(false),
             recv_origdstaddr_v6: AtomicBool::new(false),
-            errqueue: Mutex::new(VecDeque::new()),
+            errqueue: Mutex::new((0, ErrorQueue::default())),
+            pmtu_v4: AtomicI32::new(PmtuPolicy::Want.as_i32()),
+            pmtu_v6: AtomicI32::new(PmtuPolicy::Want.as_i32()),
+            ipv6_mtu: AtomicUsize::new(0),
+            ipv6_multicast_loop: AtomicBool::new(true),
+            ipv6_multicast_hops: AtomicI32::new(1),
             linger_onoff: AtomicI32::new(0),
             linger_linger: AtomicI32::new(0),
             send_timeout_us: AtomicU64::new(u64::MAX),
@@ -400,6 +388,11 @@ impl UdpSocket {
 
     #[inline]
     fn normalize_unspecified_dest(dest: IpEndpoint) -> IpEndpoint {
+        if let Ipv6(address) = dest.addr {
+            if let Some(address) = address.to_ipv4_mapped() {
+                return IpEndpoint::new(Ipv4(address), dest.port);
+            }
+        }
         if !dest.addr.is_unspecified() {
             return dest;
         }
@@ -735,6 +728,11 @@ impl UdpSocket {
     pub fn close(&self) {
         let _placement = self.iface_placement.write();
         self.receive_queue.close();
+        {
+            let mut errors = self.errqueue.lock();
+            errors.0 = 0;
+            errors.1.clear();
+        }
         let mut inner = self.inner.write();
         if let Some(UdpInner::Bound(bound)) = &mut *inner {
             self.netns
@@ -812,6 +810,7 @@ impl UdpSocket {
         ),
         SystemError,
     > {
+        self.take_socket_error()?;
         if let Some((copy_len, endpoint, orig_len, dst_addr, ifindex)) =
             self.try_recv_queued(buf, peek)
         {
@@ -917,6 +916,9 @@ impl UdpSocket {
         if !self.receive_queue.is_empty() {
             return true;
         }
+        if self.errqueue.lock().0 != 0 {
+            return true;
+        }
         let has_data = self.check_io_event().contains(EP::EPOLLIN);
         let shutdown_bits = self.shutdown.load(Ordering::Acquire);
         let read_shutdown = (shutdown_bits & 0x01) != 0;
@@ -928,6 +930,9 @@ impl UdpSocket {
     pub fn can_send(&self) -> bool {
         // Can send if socket is ready OR if write is shutdown
         // (shutdown should wake up send() to return EPIPE)
+        if self.errqueue.lock().0 != 0 {
+            return true;
+        }
         let can_write = self.check_io_event().contains(EP::EPOLLOUT);
         let shutdown_bits = self.shutdown.load(Ordering::Acquire);
         let write_shutdown = (shutdown_bits & 0x02) != 0;
@@ -938,6 +943,9 @@ impl UdpSocket {
     /// charges. In particular, a full prepared-output account must not spin
     /// merely because the legacy smoltcp queue still has room.
     fn can_send_to(&self, to: Option<IpEndpoint>, payload_len: usize) -> bool {
+        if self.errqueue.lock().0 != 0 {
+            return true;
+        }
         let prepared_packet_len = if self.ip_version == IpVersion::Ipv4 {
             ipv4_packet::packet_len(payload_len).ok()
         } else {
@@ -982,77 +990,242 @@ impl UdpSocket {
         Ok(Some(target))
     }
 
-    fn enqueue_errqueue(
-        &self,
-        err: SockExtendedErr,
-        offender: IpEndpoint,
-        cmsg_level: i32,
-        cmsg_type: i32,
-        addr_len: usize,
-    ) {
-        let mut q = self.errqueue.lock();
-        q.push_back(UdpErrQueueEntry {
-            err,
-            offender,
-            cmsg_level,
-            cmsg_type,
-            addr_len,
+    fn pmtu_policy(&self, version: IpVersion) -> PmtuPolicy {
+        let value = match version {
+            IpVersion::Ipv4 => &self.pmtu_v4,
+            IpVersion::Ipv6 => &self.pmtu_v6,
+        }
+        .load(Ordering::Acquire);
+        PmtuPolicy::from_i32(value).unwrap_or_default()
+    }
+
+    fn take_socket_error(&self) -> Result<(), SystemError> {
+        let errno = core::mem::take(&mut self.errqueue.lock().0);
+        match SystemError::from_posix_errno(-errno) {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    fn recv_error_enabled(&self, version: IpVersion) -> bool {
+        match version {
+            IpVersion::Ipv4 => self.recv_err_v4.load(Ordering::Acquire),
+            IpVersion::Ipv6 => self.recv_err_v6.load(Ordering::Acquire),
+        }
+    }
+
+    fn error_abi_address(&self, address: smoltcp::wire::IpAddress) -> smoltcp::wire::IpAddress {
+        if self.ip_version == IpVersion::Ipv6 {
+            if let Ipv4(address) = address {
+                return Ipv6(address.to_ipv6_mapped());
+            }
+        }
+        address
+    }
+
+    fn notify_error(&self) {
+        self.wait_queue.wakeup_all(None);
+        let _ = EventPoll::wakeup_epoll(self.epoll_items().as_ref(), EP::EPOLLERR);
+    }
+
+    fn enqueue_errqueue(&self, entry: ErrorQueueEntry) -> bool {
+        let capacity = self.recv_buffer_size();
+        let pushed = {
+            let mut state = self.errqueue.lock();
+            // LOCAL errors have already been returned synchronously. Queue
+            // readiness is independent of the asynchronous socket error.
+            state.1.push(entry, capacity)
+        };
+        if pushed {
+            self.notify_error();
+        }
+        pushed
+    }
+
+    fn pop_errqueue(&self) -> Option<ErrorQueueEntry> {
+        let mut queue = self.errqueue.lock();
+        let entry = queue.1.pop()?;
+        queue.0 = queue.1.pending_after_pop(&entry, queue.0);
+        Some(entry)
+    }
+
+    fn enqueue_local_mtu_error(&self, mtu: usize, destination: IpEndpoint) {
+        if !self.recv_error_enabled(destination.addr.version()) {
+            return;
+        }
+        self.enqueue_errqueue(ErrorQueueEntry {
+            error: SockExtendedErr {
+                ee_errno: SystemError::EMSGSIZE.to_posix_errno().unsigned_abs(),
+                ee_origin: SO_EE_ORIGIN_LOCAL,
+                ee_info: mtu as u32,
+                ..SockExtendedErr::default()
+            },
+            offender: None,
+            destination: IpEndpoint::new(
+                self.error_abi_address(destination.addr),
+                destination.port,
+            ),
+            payload: Vec::new(),
+            ipv6: self.ip_version == IpVersion::Ipv6,
+            ingress_ifindex: 0,
+            packet: None,
         });
     }
 
-    fn pop_errqueue(&self) -> Option<UdpErrQueueEntry> {
-        self.errqueue.lock().pop_front()
-    }
-
-    fn enqueue_ipv6_emsgsize_errqueue(&self, payload_len: usize, offender: Option<IpEndpoint>) {
-        if self.ip_version != IpVersion::Ipv6 || !self.recv_err_v6.load(Ordering::Acquire) {
-            return;
-        }
-
-        let Some(mut off) = offender else {
+    /// Invoked after the binding table selects the reverse quoted tuple.
+    /// No binding-table or device/protocol-stack lock is held here.
+    fn handle_pmtu_feedback(&self, generation: u64, feedback: &crate::net::pmtu::PmtuFeedback) {
+        let remote = IpEndpoint::new(feedback.destination, feedback.dst_port);
+        let Some(connected) = self.ingress_match(generation, remote, feedback.source) else {
             return;
         };
-        // A dual-stack socket may send IPv4 packets. Linux handles their
-        // oversize errors on the IPv4 path, without an IPv6 error queue entry.
-        if !matches!(off.addr, Ipv6(addr) if addr.to_ipv4_mapped().is_none()) {
+        let version = feedback.source.version();
+        let policy = self.pmtu_policy(version);
+        // Unlike IPv4 UDP, IPv6 UDP suppresses the entire error handler
+        // when the socket opts out of PMTU updates.
+        if version == IpVersion::Ipv6 && !policy.accepts_updates() {
             return;
         }
-        if off.addr.is_unspecified() {
-            off.addr = smoltcp::wire::IpAddress::v6(0, 0, 0, 0, 0, 0, 0, 1);
+        if policy.accepts_updates() {
+            let oif = self.bound_device_ifindex();
+            let _ = crate::net::route::pmtu::learn(
+                &self.netns,
+                feedback,
+                (oif != 0).then_some(oif as u32),
+            );
         }
-
-        let mut ee = SystemError::EMSGSIZE.to_posix_errno();
-        if ee < 0 {
-            ee = -ee;
+        if version == IpVersion::Ipv4 && policy == PmtuPolicy::Dont {
+            return;
         }
-        let err = SockExtendedErr {
-            ee_errno: ee as u32,
-            ee_origin: SO_EE_ORIGIN_LOCAL,
-            ee_type: ICMP_ECHOREPLY,
-            ee_code: ICMP_NET_UNREACH,
-            ee_pad: 0,
-            ee_info: payload_len as u32,
-            ee_data: 0,
-        };
-        let addr_len = SockAddr::from(Endpoint::Ip(off)).len().unwrap_or(0) as usize;
-        if addr_len != 0 {
-            self.enqueue_errqueue(err, off, PSOL::IPV6 as i32, PIPV6::RECVERR as i32, addr_len);
+        let recverr = self.recv_error_enabled(version);
+        let hard = policy != PmtuPolicy::Dont;
+        if !recverr && (!connected || !hard) {
+            return;
         }
+        let errno = SystemError::EMSGSIZE.to_posix_errno().unsigned_abs();
+        let mut error_entry = None;
+        if recverr {
+            let start = feedback.transport_offset.saturating_add(8);
+            let quoted_payload = feedback.quote.get(start..).unwrap_or(&[]);
+            let mut payload = Vec::new();
+            if payload.try_reserve_exact(quoted_payload.len()).is_ok() {
+                payload.extend_from_slice(quoted_payload);
+                error_entry = Some(ErrorQueueEntry {
+                    error: SockExtendedErr {
+                        ee_errno: errno,
+                        ee_origin: if version == IpVersion::Ipv6 {
+                            SO_EE_ORIGIN_ICMP6
+                        } else {
+                            SO_EE_ORIGIN_ICMP
+                        },
+                        ee_type: if version == IpVersion::Ipv6 { 2 } else { 3 },
+                        ee_code: if version == IpVersion::Ipv6 { 0 } else { 4 },
+                        ee_info: feedback.mtu,
+                        ..SockExtendedErr::default()
+                    },
+                    offender: Some(self.error_abi_address(feedback.offender)),
+                    destination: IpEndpoint::new(self.error_abi_address(remote.addr), remote.port),
+                    payload,
+                    ipv6: self.ip_version == IpVersion::Ipv6,
+                    ingress_ifindex: feedback.ingress_ifindex,
+                    packet: Some(super::common::error_queue::ErrorPacketMetadata {
+                        ttl: feedback.outer_ttl,
+                        tos: feedback.outer_tos,
+                        local_address: feedback.source,
+                    }),
+                });
+            }
+        }
+        let capacity = self.recv_buffer_size();
+        {
+            let mut state = self.errqueue.lock();
+            if let Some(entry) = error_entry {
+                state.1.push(entry, capacity);
+            }
+            // Linux reports the socket error even when allocating or queuing
+            // the extended error failed. Serialize it with ERRQUEUE consume.
+            state.0 = errno as i32;
+        }
+        self.notify_error();
     }
 
-    fn connected_or_explicit_send_dest(&self, address: Option<&Endpoint>) -> Option<IpEndpoint> {
-        if let Some(Endpoint::Ip(dest)) = address {
-            return Some(Self::normalize_unspecified_dest(*dest));
+    fn connected_path_mtu(&self, version: IpVersion) -> Result<usize, SystemError> {
+        if version == IpVersion::Ipv4 {
+            let snapshot = self.ipv4_send_snapshot(None).map_err(|error| {
+                if error == SystemError::EDESTADDRREQ {
+                    SystemError::ENOTCONN
+                } else {
+                    error
+                }
+            })?;
+            return Ok(self
+                .output_path_mtu(
+                    snapshot.route,
+                    IpEndpoint::new(Ipv4(snapshot.source), snapshot.source_port),
+                    IpEndpoint::new(Ipv4(snapshot.destination), snapshot.destination_port),
+                )?
+                .path);
         }
+        let (remote, local, connected_source) = {
+            let inner = self.inner.read();
+            let Some(UdpInner::Bound(bound)) = inner.as_ref() else {
+                return Err(SystemError::ENOTCONN);
+            };
+            (
+                bound.remote_endpoint()?,
+                bound.endpoint(),
+                bound.connected_source(),
+            )
+        };
+        if remote.addr.version() == IpVersion::Ipv4 {
+            // An IPv6 socket connected to a mapped peer has an IPv4 dst;
+            // Linux IPV6_MTU reports that connected route's MTU as well.
+            return self.connected_path_mtu(IpVersion::Ipv4);
+        }
+        let oif = self.bound_device_ifindex();
+        let resolved = crate::net::route::resolve_ipv6_send_route(
+            &self.netns,
+            remote.addr,
+            (oif != 0).then_some(oif as u32),
+            local
+                .addr
+                .filter(|addr| !addr.is_unspecified())
+                .or(connected_source),
+        )?;
+        Ok(self
+            .output_path_mtu(
+                resolved.decision,
+                IpEndpoint::new(Ipv6(resolved.source), local.port),
+                remote,
+            )?
+            .path)
+    }
 
-        self.inner
-            .read()
-            .as_ref()
-            .and_then(|inner| match inner {
-                UdpInner::Bound(bound) => bound.remote_endpoint().ok(),
-                _ => None,
-            })
-            .map(Self::normalize_unspecified_dest)
+    /// Query the confirmed NAT path without executing rules or refreshing
+    /// conntrack expiry. The socket's original tuple remains its ABI identity.
+    fn output_path_mtu(
+        &self,
+        route: crate::net::route::OutputRouteDecision,
+        local: IpEndpoint,
+        remote: IpEndpoint,
+    ) -> Result<crate::net::route::pmtu::PathMtu, SystemError> {
+        let (source, destination) = crate::net::pmtu::routed_output_flow(
+            &self.netns,
+            local,
+            remote,
+            smoltcp::wire::IpProtocol::Udp,
+        );
+        let router = self.netns.router();
+        let routes = crate::net::route::lock_output_routes(&router, self.netns.device_list());
+        let route = routes
+            .lookup(destination, route.required_oif)
+            .ok_or(SystemError::ENETUNREACH)?;
+        Ok(crate::net::route::pmtu::path_mtu(
+            &self.netns,
+            route,
+            source,
+            destination,
+        ))
     }
 
     pub fn try_send(
@@ -1060,6 +1233,7 @@ impl UdpSocket {
         buf: &[u8],
         to: Option<smoltcp::wire::IpEndpoint>,
     ) -> Result<usize, SystemError> {
+        self.take_socket_error()?;
         // sendto(2) 目标端口为 0 应返回 EINVAL。
         if let Some(dest) = to {
             if dest.port == 0 {
@@ -1067,7 +1241,16 @@ impl UdpSocket {
             }
         }
 
-        if self.ip_version == IpVersion::Ipv4 {
+        let to = to.map(Self::normalize_unspecified_dest);
+        let destination = to.or_else(|| {
+            self.inner.read().as_ref().and_then(|inner| match inner {
+                UdpInner::Bound(bound) => bound.remote_endpoint().ok(),
+                _ => None,
+            })
+        });
+        if self.ip_version == IpVersion::Ipv4
+            || destination.is_some_and(|dest| matches!(dest.addr, Ipv4(_)))
+        {
             return self.try_send_ipv4_prepared(buf, to);
         }
 
@@ -1171,7 +1354,10 @@ impl UdpSocket {
         payload: &[u8],
         to: Option<IpEndpoint>,
     ) -> Result<usize, SystemError> {
-        let packet_len = ipv4_packet::packet_len(payload.len())?;
+        if payload.len() > u16::MAX as usize {
+            return Err(SystemError::EMSGSIZE);
+        }
+        let packet_len = ipv4_packet::packet_len(payload.len());
         let placement = self.iface_placement.read();
         let ordinary_bound_send = {
             let inner = self.inner.read();
@@ -1203,7 +1389,20 @@ impl UdpSocket {
             self.ipv4_send_snapshot(to)?
         };
 
-        let dont_fragment = packet_len <= snapshot.route.ip_mtu;
+        let policy = self.pmtu_policy(IpVersion::Ipv4);
+        let path = self.output_path_mtu(
+            snapshot.route,
+            IpEndpoint::new(Ipv4(snapshot.source), snapshot.source_port),
+            IpEndpoint::new(Ipv4(snapshot.destination), snapshot.destination_port),
+        )?;
+        let mtu = policy.effective_mtu(path.interface, path.path);
+        let packet_len = packet_len.inspect_err(|_error| {
+            self.enqueue_local_mtu_error(
+                mtu,
+                IpEndpoint::new(Ipv4(snapshot.destination), snapshot.destination_port),
+            );
+        })?;
+        let dont_fragment = policy.ipv4_df(packet_len, mtu, path.locked);
         let identification = if dont_fragment {
             0
         } else {
@@ -1232,13 +1431,25 @@ impl UdpSocket {
             snapshot.checksum_enabled,
         )?;
         reservation.set_charge(charge);
-        let local_target = crate::net::output::submit_prepared_ipv4(
+        let result = crate::net::output::submit_prepared_ipv4_with_pmtu(
             &self.netns,
             reservation,
             snapshot.route,
             snapshot.multicast_loop,
-            true,
-        )?;
+            policy.allows_fragmentation(),
+            policy,
+        );
+        let local_target = result.map_err(|error| {
+            if error.error == SystemError::EMSGSIZE {
+                if let Some(mtu) = error.mtu {
+                    self.enqueue_local_mtu_error(
+                        mtu,
+                        IpEndpoint::new(Ipv4(snapshot.destination), snapshot.destination_port),
+                    );
+                }
+            }
+            error.error
+        })?;
         if let Some(target) = local_target {
             // OUTPUT may reroute the packet. First advance the source owner's
             // admitted output, then the actual local delivery interface.
@@ -1259,7 +1470,7 @@ impl UdpSocket {
         payload: &[u8],
         to: Option<IpEndpoint>,
     ) -> Result<usize, SystemError> {
-        let packet_len = ipv6_packet::packet_len(payload.len())?;
+        let packet_len = ipv6_packet::packet_len(payload.len());
         let placement = self.iface_placement.read();
         let is_unbound = matches!(self.inner.read().as_ref(), Some(UdpInner::Unbound(_)));
         let snapshot = if is_unbound {
@@ -1353,6 +1564,27 @@ impl UdpSocket {
             }
         };
 
+        let packet_len = packet_len.map_err(|error| {
+            let policy = self.pmtu_policy(IpVersion::Ipv6);
+            let path = match self.output_path_mtu(
+                snapshot.route,
+                IpEndpoint::new(Ipv6(snapshot.source), snapshot.source_port),
+                IpEndpoint::new(Ipv6(snapshot.destination), snapshot.destination_port),
+            ) {
+                Ok(path) => path,
+                Err(route_error) => return route_error,
+            };
+            let mut mtu = policy.effective_mtu(path.interface, path.path);
+            let ceiling = self.ipv6_mtu.load(Ordering::Acquire);
+            if ceiling != 0 {
+                mtu = mtu.min(ceiling);
+            }
+            self.enqueue_local_mtu_error(
+                mtu,
+                IpEndpoint::new(Ipv6(snapshot.destination), snapshot.destination_port),
+            );
+            error
+        })?;
         let charge = self.send_account.charge(packet_len)?;
         let mut reservation = crate::driver::net::local_output::reserve_prepared_ip_output(
             snapshot.owner.as_ref(),
@@ -1367,10 +1599,34 @@ impl UdpSocket {
             snapshot.destination,
             snapshot.source_port,
             snapshot.destination_port,
-            64,
+            if snapshot.destination.is_multicast() {
+                self.ipv6_multicast_hops.load(Ordering::Acquire) as u8
+            } else {
+                64
+            },
         )?;
         reservation.set_charge(charge);
-        crate::net::output::submit_prepared_ipv6(&self.netns, reservation, snapshot.route)?;
+        let policy = self.pmtu_policy(IpVersion::Ipv6);
+        let ceiling = self.ipv6_mtu.load(Ordering::Acquire);
+        let result = crate::net::output::submit_prepared_ipv6_with_pmtu(
+            &self.netns,
+            reservation,
+            snapshot.route,
+            policy,
+            (ceiling != 0).then_some(ceiling),
+            self.ipv6_multicast_loop.load(Ordering::Acquire),
+        );
+        result.map_err(|error| {
+            if error.error == SystemError::EMSGSIZE {
+                if let Some(mtu) = error.mtu {
+                    self.enqueue_local_mtu_error(
+                        mtu,
+                        IpEndpoint::new(Ipv6(snapshot.destination), snapshot.destination_port),
+                    );
+                }
+            }
+            error.error
+        })?;
         Ok(payload.len())
     }
 
@@ -1407,28 +1663,6 @@ impl UdpSocket {
             Some((local, dest, connected_source)) => {
                 let (required_oif, multicast_source) =
                     output_flow::socket_constraints(self, dest.addr)?;
-                if matches!(dest.addr, smoltcp::wire::IpAddress::Ipv6(_))
-                    && !dest.addr.is_multicast()
-                {
-                    let source = local
-                        .addr
-                        .filter(|source| !source.is_unspecified())
-                        .or(connected_source);
-                    let route = crate::net::route::resolve_ipv6_output_route(
-                        &self.netns,
-                        dest.addr,
-                        required_oif,
-                        source,
-                    )?;
-                    // Native IPv6 source fragmentation is not implemented.
-                    // Report the limit before enqueueing, rather than losing
-                    // an accepted datagram at the physical egress.
-                    if route.kind != crate::net::route::RTN_LOCAL
-                        && buf.len() > route.ip_mtu.saturating_sub(40 + 8)
-                    {
-                        return Err(SystemError::EMSGSIZE);
-                    }
-                }
                 output_flow::resolve_ipv4_send_flow(
                     &self.netns,
                     local,
@@ -1702,9 +1936,6 @@ impl UdpSocket {
                     buf,
                 );
             }
-            if let Err(SystemError::EMSGSIZE) = result {
-                self.enqueue_ipv6_emsgsize_errqueue(buf.len(), dest);
-            }
             return result;
         }
 
@@ -1748,10 +1979,6 @@ impl UdpSocket {
                     }
                 }
             }
-        }
-
-        if let Err(SystemError::EMSGSIZE) = result {
-            self.enqueue_ipv6_emsgsize_errqueue(buf.len(), dest);
         }
 
         result

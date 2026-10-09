@@ -91,7 +91,10 @@ impl RawSocket {
             fasync_items: crate::filesystem::vfs::fasync::FAsyncItems::default(),
             ip_version,
             protocol,
+            connected_port: core::sync::atomic::AtomicU32::new(0),
             loopback_rx: crate::libs::mutex::Mutex::new(super::loopback::LoopbackRxQueue::default()),
+            errors: crate::libs::mutex::Mutex::new((0, Default::default())),
+            output_path: crate::libs::mutex::Mutex::new(None),
             ip_multicast_ifindex: core::sync::atomic::AtomicI32::new(0),
             ip_multicast_addr: core::sync::atomic::AtomicU32::new(0),
             ip_multicast_groups: crate::libs::mutex::Mutex::new(Vec::new()),
@@ -367,8 +370,11 @@ impl RawSocket {
 
     #[inline]
     pub fn can_recv(&self) -> bool {
-        self.check_io_event()
-            .contains(crate::filesystem::epoll::EPollEventType::EPOLLIN)
+        let pending_error = self.errors.lock().0 != 0;
+        pending_error
+            || self
+                .check_io_event()
+                .contains(crate::filesystem::epoll::EPollEventType::EPOLLIN)
     }
 
     #[inline]

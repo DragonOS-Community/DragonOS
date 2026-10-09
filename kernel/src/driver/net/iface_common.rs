@@ -9,13 +9,45 @@ fn poll_smol<D: SmolDevice + ?Sized>(
     timestamp: smoltcp::time::Instant,
     device: &mut D,
     sockets: &mut smoltcp::iface::SocketSet<'_>,
-    filter: Option<&mut dyn IpIngressFilter>,
-) -> PollResult {
-    if let Some(filter) = filter {
-        interface.poll_filtered(timestamp, device, sockets, filter)
-    } else {
-        interface.poll(timestamp, device, sockets)
+    mut filter: Option<&mut dyn IpIngressFilter>,
+) -> (PollResult, bool) {
+    // Release the poll serialization/FIB locks between bounded RX batches so
+    // deferred work (including PMTU feedback) runs even under continuous RX.
+    let mut state_changed = false;
+    let mut exhausted = true;
+    for _ in 0..64 {
+        let result = match filter.as_mut() {
+            Some(filter) => {
+                interface.poll_ingress_single_filtered(timestamp, device, sockets, *filter)
+            }
+            None => interface.poll_ingress_single(timestamp, device, sockets),
+        };
+        match result {
+            PollIngressSingleResult::None => {
+                exhausted = false;
+                break;
+            }
+            PollIngressSingleResult::SocketStateChanged => state_changed = true,
+            PollIngressSingleResult::PacketProcessed => {}
+        }
     }
+    if filter
+        .as_ref()
+        .is_none_or(|filter| filter.continue_ingress_poll())
+    {
+        state_changed |= matches!(
+            interface.poll_egress(timestamp, device, sockets),
+            PollResult::SocketStateChanged
+        );
+    }
+    (
+        if state_changed {
+            PollResult::SocketStateChanged
+        } else {
+            PollResult::None
+        },
+        exhausted,
+    )
 }
 
 fn poll_smol_single<D: SmolDevice + ?Sized>(
@@ -971,11 +1003,14 @@ impl IfaceCommon {
                 let (poll_again, deadline_rearm) = self.publish_poll_deadline(timestamp, poll_at);
                 (
                     local_result.is_some_and(|result| {
-                        matches!(result, smoltcp::iface::PollResult::SocketStateChanged)
+                        matches!(result.0, smoltcp::iface::PollResult::SocketStateChanged)
                     }) || poll_result.is_some_and(|result| {
-                        matches!(result, smoltcp::iface::PollResult::SocketStateChanged)
+                        matches!(result.0, smoltcp::iface::PollResult::SocketStateChanged)
                     }),
-                    poll_again || self.has_local_input(),
+                    poll_again
+                        || self.has_local_input()
+                        || local_result.is_some_and(|result| result.1)
+                        || poll_result.is_some_and(|result| result.1),
                     deadline_rearm,
                 )
             };
@@ -2119,6 +2154,9 @@ impl IfaceCommon {
 
     pub fn set_mtu(&self, mtu: usize) {
         self.mtu.store(mtu, Ordering::Release);
+        if let Some(netns) = self.net_namespace() {
+            netns.router().pmtu.lock().invalidate();
+        }
     }
 
     pub(crate) fn address_metadata(&self) -> &Mutex<Vec<AddressMetadata>> {

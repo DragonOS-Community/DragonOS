@@ -69,6 +69,13 @@ impl IcmpFilter {
 pub struct RawSocketOptions {
     /// IP_HDRINCL: 用户是否提供完整 IP 头
     pub ip_hdrincl: bool,
+    pub ip_pmtu: super::super::common::pmtu::PmtuPolicy,
+    pub ipv6_pmtu: super::super::common::pmtu::PmtuPolicy,
+    pub recv_err_v4: bool,
+    pub recv_err_v6: bool,
+    /// IPV6_MTU source fragmentation ceiling; zero means use route MTU.
+    pub ipv6_frag_size: usize,
+    pub ipv6_multicast_loop: bool,
     /// IP_TOS: Type of Service
     pub ip_tos: u8,
     /// IP_TTL: Time to Live
@@ -117,6 +124,12 @@ impl Default for RawSocketOptions {
     fn default() -> Self {
         Self {
             ip_hdrincl: false,
+            ip_pmtu: Default::default(),
+            ipv6_pmtu: Default::default(),
+            recv_err_v4: false,
+            recv_err_v6: false,
+            ipv6_frag_size: 0,
+            ipv6_multicast_loop: true,
             ip_tos: 0,
             ip_ttl: DEFAULT_IP_TTL,
             recv_pktinfo_v4: false,

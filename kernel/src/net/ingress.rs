@@ -66,6 +66,8 @@ pub(crate) struct NetIngressFilter<'a> {
     routes: Option<&'a OutputRouteGuard<'a>>,
     fib_routes: Option<&'a OutputRouteGuard<'a>>,
     work: &'a mut Vec<RoutedIngressWork>,
+    pmtu_items: usize,
+    pmtu_bytes: usize,
 }
 
 /// Named poll inputs keep the two direct/NAPI call sites in sync as receive
@@ -91,6 +93,10 @@ pub(crate) struct NetIngressFilterInit<'a> {
 /// smoltcp, socket-set, or FIB locks are held.
 pub(crate) enum RoutedIngressWork {
     Raw(RawIngressWork),
+    Pmtu {
+        netns: Arc<NetNamespace>,
+        feedback: super::pmtu::PmtuFeedback,
+    },
     Defrag {
         netns: Arc<NetNamespace>,
         fragment: PendingIpFragment,
@@ -131,6 +137,10 @@ pub(crate) enum RoutedIngressWork {
 impl RoutedIngressWork {
     pub(crate) fn execute(self) {
         let result = match self {
+            Self::Pmtu { netns, feedback } => {
+                super::pmtu::execute(&netns, feedback);
+                return;
+            }
             Self::Raw(work) => {
                 work.execute();
                 return;
@@ -294,6 +304,8 @@ impl<'a> NetIngressFilter<'a> {
             routes,
             fib_routes,
             work,
+            pmtu_items: 0,
+            pmtu_bytes: 0,
         }
     }
 
@@ -1340,6 +1352,22 @@ impl IpIngressFilter for NetIngressFilter<'_> {
         }
 
         let packet = packet.bytes();
+        // Control admission precedes allocation. Ordinary raw delivery below
+        // remains independent when the PMTU control budget is exhausted.
+        if matches!(protocol, IpProtocol::Icmp | IpProtocol::Icmpv6)
+            && self.pmtu_items < 64
+            && packet.len() <= (64 * 1024usize).saturating_sub(self.pmtu_bytes)
+            && self.work.try_reserve(1).is_ok()
+        {
+            if let Some(feedback) = super::pmtu::parse(packet, ingress_ifindex) {
+                self.pmtu_items += 1;
+                self.pmtu_bytes += feedback.quote.capacity();
+                self.work.push(RoutedIngressWork::Pmtu {
+                    netns: self.netns.clone(),
+                    feedback,
+                });
+            }
+        }
         let (source, destination) = match version {
             IpVersion::Ipv4 => {
                 let Ok(ipv4) = Ipv4Packet::new_checked(packet) else {

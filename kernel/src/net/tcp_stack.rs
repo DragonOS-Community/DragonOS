@@ -46,6 +46,7 @@ struct InputPacket {
 #[derive(Debug, Default)]
 struct InputQueue {
     packets: VecDeque<InputPacket>,
+    feedback: VecDeque<crate::net::pmtu::PmtuFeedback>,
     in_flight: usize,
     bytes: usize,
 }
@@ -74,6 +75,85 @@ impl core::fmt::Debug for TcpStack {
 }
 
 impl TcpStack {
+    pub(crate) fn queue_pmtu_feedback(&self, feedback: crate::net::pmtu::PmtuFeedback) {
+        let mut input = self.input.lock();
+        let bytes = feedback.quote.capacity();
+        if input.packets.len() + input.feedback.len() + input.in_flight >= MAX_INPUT_PACKETS
+            || bytes > MAX_INPUT_BYTES.saturating_sub(input.bytes)
+            || input.feedback.try_reserve(1).is_err()
+        {
+            return;
+        }
+        input.bytes += bytes;
+        input.feedback.push_back(feedback);
+        drop(input);
+        self.request_poll();
+    }
+
+    fn process_pmtu_feedback(&self, namespace: &Arc<NetNamespace>) {
+        // Do not let a stream of control packets starve ordinary TCP data.
+        for _ in 0..POLL_BUDGET / 2 {
+            let feedback = {
+                let mut input = self.input.lock();
+                let Some(feedback) = input.feedback.pop_front() else {
+                    break;
+                };
+                input.bytes -= feedback.quote.capacity();
+                feedback
+            };
+            let Some(seq) = feedback.seq else {
+                continue;
+            };
+            let (source, destination) = crate::net::pmtu::routed_quote_flow(namespace, &feedback);
+            let router = namespace.router();
+            let routes = crate::net::route::lock_output_routes(&router, namespace.device_list());
+            let mut sockets = self.sockets.lock();
+            for (_, socket) in sockets.iter_mut() {
+                let smoltcp::socket::Socket::Tcp(socket) = socket else {
+                    continue;
+                };
+                let local = smoltcp::wire::IpEndpoint::new(feedback.source, feedback.src_port);
+                let remote =
+                    smoltcp::wire::IpEndpoint::new(feedback.destination, feedback.dst_port);
+                if !socket.accepts_pmtu_quote(
+                    local,
+                    remote,
+                    smoltcp::wire::TcpSeqNumber(seq),
+                    feedback.ingress_ifindex,
+                ) {
+                    continue;
+                }
+                if socket.pmtu_discover() >= 4 {
+                    continue;
+                }
+                if matches!(feedback.destination, smoltcp::wire::IpAddress::Ipv6(_))
+                    && (feedback.mtu < 1280
+                        || socket
+                            .output_ip_mtu()
+                            .is_some_and(|old| feedback.mtu as usize >= old))
+                {
+                    continue;
+                }
+                let required_oif = socket.bound_device();
+                let Some(route) = routes.lookup(destination, required_oif.map(|index| index.get()))
+                else {
+                    continue;
+                };
+                let learned = crate::net::route::pmtu::learn_on_route(
+                    &router,
+                    route,
+                    source,
+                    destination,
+                    feedback.mtu,
+                );
+                // Cache sharing and this socket's PMTU cookie are separate:
+                // an unchanged exception can still require this TCP to shrink.
+                socket.schedule_pmtu_retransmit(learned.path);
+                break;
+            }
+        }
+    }
+
     pub(crate) fn new(namespace: Weak<NetNamespace>) -> Self {
         let listeners = Arc::new(TcpListenerRegistry::new());
         let mut sockets = SocketSet::new(Vec::new());
@@ -188,6 +268,7 @@ impl TcpStack {
         .any(|version| {
             ruleset.requires_masquerade(version, crate::net::nftables::NftIpv4Hook::PostRouting)
         });
+        self.process_pmtu_feedback(&namespace);
         let mut input_blocked = false;
         for _ in 0..POLL_BUDGET {
             let Ok(device_names) = device_names.as_ref() else {
@@ -293,7 +374,10 @@ impl TcpStack {
         let mut immediate = policy_changed
             || !input_blocked
                 && !snapshot_failed
-                && (poll_at.is_some_and(|at| at <= now) || !self.input.lock().packets.is_empty());
+                && (poll_at.is_some_and(|at| at <= now) || {
+                    let input = self.input.lock();
+                    !input.packets.is_empty() || !input.feedback.is_empty()
+                });
         let output = self.output.drain(&namespace, POLL_BUDGET);
         immediate |= output.immediate;
         if let Some(retry_at) = output.retry_at {
@@ -331,7 +415,7 @@ impl TcpIngressHandler for TcpStack {
         owned.extend_from_slice(segment);
         {
             let mut input = self.input.lock();
-            if input.packets.len() + input.in_flight >= MAX_INPUT_PACKETS
+            if input.packets.len() + input.feedback.len() + input.in_flight >= MAX_INPUT_PACKETS
                 || input.bytes.saturating_add(owned.capacity()) > MAX_INPUT_BYTES
                 || input.packets.try_reserve(1).is_err()
             {

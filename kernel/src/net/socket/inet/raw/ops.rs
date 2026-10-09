@@ -75,10 +75,14 @@ impl crate::net::socket::Socket for RawSocket {
             return match guard.as_ref() {
                 Some(RawInner::Bound(inner)) => {
                     inner.connect(remote.addr);
+                    self.connected_port
+                        .store(remote.port as u32, core::sync::atomic::Ordering::Release);
                     Ok(())
                 }
                 Some(RawInner::Wildcard(inner)) => {
                     inner.connect(remote.addr);
+                    self.connected_port
+                        .store(remote.port as u32, core::sync::atomic::Ordering::Release);
                     Ok(())
                 }
                 _ => Err(SystemError::EINVAL),
@@ -205,6 +209,12 @@ impl crate::net::socket::Socket for RawSocket {
 
     fn check_io_event(&self) -> EPollEventType {
         let mut event = EPollEventType::empty();
+        {
+            let errors = self.errors.lock();
+            if errors.0 != 0 || !errors.1.is_empty() {
+                event.insert(EP::EPOLLERR);
+            }
+        }
 
         if !self.loopback_rx.lock().pkts.is_empty() {
             event.insert(EP::EPOLLIN | EP::EPOLLRDNORM);

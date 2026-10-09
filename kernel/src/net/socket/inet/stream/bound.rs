@@ -11,6 +11,8 @@ use crate::process::namespace::net_namespace::NetNamespace;
 pub(crate) struct TcpBound {
     handle: SocketHandle,
     netns: Arc<NetNamespace>,
+    /// Passive-open option snapshot, transferred with the accepted handle.
+    pub(super) pmtu_policies: [u8; 2],
 }
 
 impl Drop for TcpBound {
@@ -26,7 +28,11 @@ impl TcpBound {
     /// Used for already validated endpoints and replacement listener slots.
     pub fn new(socket: tcp::Socket<'static>, netns: Arc<NetNamespace>) -> Self {
         let handle = netns.tcp_stack().sockets().lock().add(socket);
-        Self { handle, netns }
+        Self {
+            handle,
+            netns,
+            pmtu_policies: [1; 2],
+        }
     }
 
     pub fn bind_recoverable(

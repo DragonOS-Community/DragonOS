@@ -107,6 +107,114 @@ impl From<Options> for i32 {
 
 /// TCP socket option setters.
 impl super::TcpSocket {
+    fn set_pmtu_discover_option(
+        &self,
+        version: smoltcp::wire::IpVersion,
+        val: &[u8],
+    ) -> Result<(), SystemError> {
+        let value = byte_parser::read_i32(val)?;
+        if !(0..=5).contains(&value) {
+            return Err(SystemError::EINVAL);
+        }
+        // Same inner -> SocketSet order as bind/connect/passive-open setup.
+        let mut guard = self.inner.write();
+        let atomic = match version {
+            smoltcp::wire::IpVersion::Ipv4 => &self.options.ip_mtu_discover,
+            smoltcp::wire::IpVersion::Ipv6 => &self.options.ipv6_mtu_discover,
+        };
+        if let Some(state) = guard.as_mut() {
+            match state {
+                inner::Inner::Listening(listener) => {
+                    listener.set_pmtu_discover(version, value as u8)
+                }
+                state => state.for_each_socket_mut(|socket| {
+                    let family = socket
+                        .local_endpoint()
+                        .map_or(self.ip_version, |local| local.addr.version());
+                    if family == version {
+                        socket
+                            .set_pmtu_discover(value as u8)
+                            .expect("validated PMTU policy");
+                    }
+                }),
+            }
+        }
+        atomic.store(value, core::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Snapshot transport identity first, then resolve the current path after
+    /// dropping protocol locks. Route lookup must never follow SocketSet locks.
+    fn socket_path_mtu(&self) -> Result<usize, SystemError> {
+        let (local, remote) = {
+            let guard = self.inner.read();
+            let state = guard.as_ref().ok_or(SystemError::ENOTCONN)?;
+            if !matches!(
+                state,
+                inner::Inner::Connecting(_) | inner::Inner::Established(_)
+            ) {
+                return Err(SystemError::ENOTCONN);
+            }
+            (
+                state.local_endpoint(),
+                state.remote_endpoint().ok_or(SystemError::ENOTCONN)?,
+            )
+        };
+        let netns = self.netns();
+        let (source, destination) = crate::net::pmtu::routed_output_flow(
+            &netns,
+            local,
+            remote,
+            smoltcp::wire::IpProtocol::Tcp,
+        );
+        let router = netns.router();
+        let routes = crate::net::route::lock_output_routes(&router, netns.device_list());
+        let required_oif =
+            u32::try_from(self.device_binding.ifindex()).map_err(|_| SystemError::ENODEV)?;
+        let route = routes
+            .lookup(destination, (required_oif != 0).then_some(required_oif))
+            .ok_or(SystemError::ENOTCONN)?;
+        Ok(crate::net::route::pmtu::path_mtu(&netns, route, source, destination).path)
+    }
+
+    pub(super) fn set_ipv6_option(&self, name: usize, val: &[u8]) -> Result<(), SystemError> {
+        use crate::net::socket::PIPV6;
+        if self.ip_version != smoltcp::wire::IpVersion::Ipv6 {
+            return Err(SystemError::ENOPROTOOPT);
+        }
+        match name {
+            name if name == PIPV6::V6ONLY as usize => self.set_ipv6_only(val),
+            name if name == PIPV6::MTU_DISCOVER as usize => {
+                self.set_pmtu_discover_option(smoltcp::wire::IpVersion::Ipv6, val)
+            }
+            _ => Err(SystemError::ENOPROTOOPT),
+        }
+    }
+
+    pub(super) fn get_ipv6_option(
+        &self,
+        name: usize,
+        value: &mut [u8],
+    ) -> Result<usize, SystemError> {
+        use crate::net::socket::PIPV6;
+        if self.ip_version != smoltcp::wire::IpVersion::Ipv6 {
+            // IPv4 TCP delegates non-TCP getsockopt levels to ip_getsockopt,
+            // which rejects non-SOL_IP levels with EOPNOTSUPP (Linux 6.6).
+            // setsockopt deliberately retains its distinct ENOPROTOOPT errno.
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        }
+        match name {
+            name if name == PIPV6::V6ONLY as usize => self.get_ipv6_only(value),
+            name if name == PIPV6::MTU_DISCOVER as usize => {
+                Self::write_atomic_i32(value, &self.options.ipv6_mtu_discover)
+            }
+            name if name == PIPV6::MTU as usize => {
+                Self::write_i32_opt(value, self.socket_path_mtu()?.min(i32::MAX as usize) as i32)
+            }
+            _ => Err(SystemError::ENOPROTOOPT),
+        }
+    }
+
     pub(super) fn set_ipv6_only(&self, val: &[u8]) -> Result<(), SystemError> {
         if self.ip_version != smoltcp::wire::IpVersion::Ipv6 {
             return Err(SystemError::ENOPROTOOPT);
@@ -393,10 +501,7 @@ impl super::TcpSocket {
     pub(super) fn set_ip_option(&self, opt: IpOption, val: &[u8]) -> Result<(), SystemError> {
         match opt {
             IpOption::MTU_DISCOVER => {
-                let v = byte_parser::read_i32(val)?;
-                self.ip_mtu_discover()
-                    .store(v, core::sync::atomic::Ordering::Relaxed);
-                Ok(())
+                self.set_pmtu_discover_option(smoltcp::wire::IpVersion::Ipv4, val)
             }
             IpOption::MULTICAST_TTL => {
                 let v = byte_parser::read_i32(val)?;
@@ -644,6 +749,9 @@ impl super::TcpSocket {
     ) -> Result<usize, SystemError> {
         match opt {
             IpOption::MTU_DISCOVER => Self::write_atomic_i32(value, self.ip_mtu_discover()),
+            IpOption::MTU => {
+                Self::write_i32_opt(value, self.socket_path_mtu()?.min(i32::MAX as usize) as i32)
+            }
             IpOption::MULTICAST_TTL => Self::write_atomic_i32(value, self.ip_multicast_ttl()),
             IpOption::MULTICAST_LOOP => Self::write_bool_opt_i32(value, self.ip_multicast_loop()),
             _ => Err(SystemError::ENOPROTOOPT),

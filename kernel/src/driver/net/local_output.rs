@@ -138,6 +138,31 @@ pub(super) struct OutputBackendPolicy<'a> {
 }
 
 impl OutputBackendPolicy<'_> {
+    pub(super) fn outbound_tcp_mtu(
+        self,
+        local: smoltcp::wire::IpEndpoint,
+        remote: smoltcp::wire::IpEndpoint,
+        meta: PacketMeta,
+    ) -> usize {
+        let (source, destination) = crate::net::pmtu::routed_output_flow(
+            self.netns,
+            local,
+            remote,
+            smoltcp::wire::IpProtocol::Tcp,
+        );
+        self.routes
+            .lookup(destination, (meta.id != 0).then_some(meta.id))
+            .map_or(u16::MAX as usize, |route| {
+                crate::net::route::pmtu::path_mtu(self.netns, route, source, destination).path
+            })
+    }
+
+    pub(super) fn outbound_tcp_mtu_generation(self) -> u64 {
+        self.netns.router().pmtu.lock().generation().wrapping_add(
+            self.ruleset
+                .map_or(0, |ruleset| u64::from(ruleset.generation)),
+        )
+    }
     pub(super) fn policy_current(self) -> bool {
         self.ruleset
             .is_some_and(|ruleset| ruleset.generation == self.netns.nftables().generation())
@@ -790,16 +815,24 @@ fn prepared_ipv6_fragment(
     else {
         return Err(SystemError::EINVAL);
     };
-    let ipv6 = smoltcp::wire::Ipv6Packet::new_checked(packet.frame.as_slice())
-        .map_err(|_| SystemError::EINVAL)?;
-    if ipv6.total_len() != packet.frame.len() {
+    ipv6_fragment(&packet.frame, mtu, offset, identification)
+}
+
+pub(crate) fn ipv6_fragment(
+    frame: &[u8],
+    mtu: usize,
+    offset: usize,
+    identification: u32,
+) -> Result<(Vec<u8>, usize), SystemError> {
+    let ipv6 = smoltcp::wire::Ipv6Packet::new_checked(frame).map_err(|_| SystemError::EINVAL)?;
+    if ipv6.total_len() != frame.len() {
         return Err(SystemError::EMSGSIZE);
     }
-    let (split, previous_next_header) = ipv6_fragment_boundary(&packet.frame)?;
+    let (split, previous_next_header) = ipv6_fragment_boundary(frame)?;
     if mtu < split + 16 {
         return Err(SystemError::EMSGSIZE);
     }
-    let payload_len = packet.frame.len() - split;
+    let payload_len = frame.len() - split;
     if offset >= payload_len {
         return Err(SystemError::EINVAL);
     }
@@ -817,12 +850,12 @@ fn prepared_ipv6_fragment(
     fragment
         .try_reserve_exact(split + 8 + chunk)
         .map_err(|_| SystemError::ENOMEM)?;
-    fragment.extend_from_slice(&packet.frame[..split]);
+    fragment.extend_from_slice(&frame[..split]);
     fragment.extend_from_slice(&[0; 8]);
-    fragment.extend_from_slice(&packet.frame[split + offset..split + offset + chunk]);
+    fragment.extend_from_slice(&frame[split + offset..split + offset + chunk]);
     fragment[4..6].copy_from_slice(&((split - 40 + 8 + chunk) as u16).to_be_bytes());
     fragment[previous_next_header] = smoltcp::wire::IpProtocol::Ipv6Frag.into();
-    fragment[split] = packet.frame[previous_next_header];
+    fragment[split] = frame[previous_next_header];
     let more = u16::from(remaining > chunk);
     let offset_flags = ((offset / 8) as u16) << 3 | more;
     fragment[split + 2..split + 4].copy_from_slice(&offset_flags.to_be_bytes());
@@ -833,7 +866,7 @@ fn prepared_ipv6_fragment(
 /// The unfragmentable chain is the fixed header, HBH, Routing, and any
 /// Destination Options before Routing. Linux 6.6 `ip6_find_1stfragopt()`
 /// stops at the first post-Routing Destination Options or other header.
-fn ipv6_fragment_boundary(bytes: &[u8]) -> Result<(usize, usize), SystemError> {
+pub(crate) fn ipv6_fragment_boundary(bytes: &[u8]) -> Result<(usize, usize), SystemError> {
     if bytes.len() < 40 || bytes[0] >> 4 != 6 {
         return Err(SystemError::EINVAL);
     }
@@ -1373,14 +1406,6 @@ impl SmolTxToken for LocalInputTxToken<'_> {
         } else {
             route.oif
         };
-        let may_fragment = if ipv4 {
-            prepare_deferred_ipv4_for_mtu(bytes, ip_mtu, ipv4_fragment_ident)?
-        } else {
-            if len > ip_mtu {
-                return Err(IpOutputError::MtuExceeded);
-            }
-            false
-        };
         let post_name = self
             .backend_policy
             .hook_oifname(
@@ -1432,6 +1457,42 @@ impl SmolTxToken for LocalInputTxToken<'_> {
         }
         let mark = ct.mark();
         let ct_context = ct.confirm().map_err(|_| IpOutputError::PolicyDrop)?;
+        let tcp_packet = if ipv4 { bytes[9] == 6 } else { bytes[6] == 6 };
+        if tcp_packet {
+            let (source, destination) = if ipv4 {
+                let ip =
+                    Ipv4Packet::new_checked(&bytes[..]).map_err(|_| IpOutputError::MtuExceeded)?;
+                (
+                    IpAddress::Ipv4(ip.src_addr()),
+                    IpAddress::Ipv4(ip.dst_addr()),
+                )
+            } else {
+                let ip = smoltcp::wire::Ipv6Packet::new_checked(&bytes[..])
+                    .map_err(|_| IpOutputError::MtuExceeded)?;
+                (
+                    IpAddress::Ipv6(ip.src_addr()),
+                    IpAddress::Ipv6(ip.dst_addr()),
+                )
+            };
+            let effective = crate::net::route::pmtu::path_mtu(
+                self.backend_policy.netns,
+                route,
+                source,
+                destination,
+            )
+            .path;
+            if len > effective {
+                return Err(IpOutputError::MtuRetry(effective));
+            }
+        }
+        let may_fragment = if ipv4 {
+            prepare_deferred_ipv4_for_mtu(bytes, ip_mtu, ipv4_fragment_ident)?
+        } else {
+            if len > ip_mtu {
+                return Err(IpOutputError::MtuExceeded);
+            }
+            false
+        };
         if ipv4 {
             let frame = self.scratch.take().ok_or(IpOutputError::Exhausted)?;
             self.reservation.commit_prepared_ipv4(

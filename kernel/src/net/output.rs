@@ -30,6 +30,14 @@ use super::{
     route::{OutputRouteDecision, RTN_BROADCAST, RTN_LOCAL, RTN_MULTICAST},
 };
 
+mod multicast;
+mod pmtu;
+use pmtu::{apply_socket_mtu, save_route_hint, SocketOutput};
+pub(crate) use pmtu::{
+    submit_prepared_ipv4_raw, submit_prepared_ipv4_with_pmtu, submit_prepared_ipv6_raw,
+    submit_prepared_ipv6_with_pmtu, PmtuOutputError, RawOutputPolicy, SocketRouteHint,
+};
+
 fn hook_oifname(
     netns: &NetNamespace,
     ruleset: &RulesetSnapshot,
@@ -427,10 +435,6 @@ impl<'a> LocalOutputCt<'a> {
     }
 }
 
-/// Admit a fully serialized IPv6 UDP datagram before sendto(2) returns.
-/// OUTPUT and the original POST_ROUTING run on the exact bytes that the
-/// bounded output owner will later transmit; its retry path does not rerun
-/// either hook.
 pub(crate) fn submit_prepared_ipv6(
     netns: &Arc<NetNamespace>,
     reservation: PreparedIpOutputReservation<'_>,
@@ -441,11 +445,44 @@ pub(crate) fn submit_prepared_ipv6(
 
 pub(crate) fn submit_prepared_ipv6_with_related(
     netns: &Arc<NetNamespace>,
+    reservation: PreparedIpOutputReservation<'_>,
+    route: OutputRouteDecision,
+    related: Option<CtPacketContext>,
+) -> Result<(), SystemError> {
+    submit_ipv6(
+        netns,
+        reservation,
+        route,
+        related,
+        SocketOutput {
+            policy: None,
+            multicast_loop: false,
+            may_fragment: true,
+            hint: None,
+        },
+    )
+    .map_err(|error| error.error)
+}
+
+fn submit_ipv6(
+    netns: &Arc<NetNamespace>,
     mut reservation: PreparedIpOutputReservation<'_>,
     mut route: OutputRouteDecision,
     related: Option<CtPacketContext>,
-) -> Result<(), SystemError> {
-    reservation.validate_for_ipv6_route(route)?;
+    options: SocketOutput<'_>,
+) -> Result<(), PmtuOutputError> {
+    let SocketOutput {
+        policy,
+        multicast_loop,
+        may_fragment,
+        hint,
+    } = options;
+    reservation
+        .validate_for_ipv6_route(route)
+        .map_err(|error| PmtuOutputError {
+            error,
+            mtu: Some(route.ip_mtu),
+        })?;
     let initial_destination = destination(reservation.bytes(), IpVersion::Ipv6)?;
     let _egress = netns
         .device_list()
@@ -482,7 +519,7 @@ pub(crate) fn submit_prepared_ipv6_with_related(
         output_lookup,
         None,
     )? {
-        return Err(SystemError::EPERM);
+        return Err(SystemError::EPERM.into());
     }
     drop(output_routes);
     let (selected, masquerade) = route_after_output(
@@ -494,7 +531,25 @@ pub(crate) fn submit_prepared_ipv6_with_related(
         route,
     )?;
     route = selected;
-    reservation.validate_for_ipv6_route(route)?;
+    let egress = netns
+        .device_list()
+        .get(&(route.oif as usize))
+        .cloned()
+        .ok_or(SystemError::ENETUNREACH)?;
+    let egress_epoch = egress.common().namespace_epoch();
+    let physical_egress = !egress.flags().contains(InterfaceFlags::LOOPBACK);
+    let multicast_destination = match destination(reservation.bytes(), IpVersion::Ipv6)? {
+        IpAddress::Ipv6(address) if address.is_multicast() => Some(address),
+        _ => None,
+    };
+    let clone_local = physical_egress
+        && multicast_loop
+        && egress_epoch & 1 == 0
+        && egress
+            .net_namespace()
+            .is_some_and(|owner| Arc::ptr_eq(&owner, netns))
+        && multicast_destination
+            .is_some_and(|address| egress.smol_iface().lock().has_multicast_group(address));
     let post_oifname = hook_oifname(
         netns,
         &ruleset,
@@ -522,17 +577,62 @@ pub(crate) fn submit_prepared_ipv6_with_related(
         post_lookup,
         masquerade,
     )? {
-        return Err(SystemError::EPERM);
+        return Err(SystemError::EPERM.into());
     }
     drop(post_routes);
     let mark = ct.mark();
+    // Linux IPv6 clones in finish_output2, after the original POST hook.
+    // Preserve tracking before confirm consumes the original policy owner.
+    let copy_ct = clone_local.then(|| ct.fork());
     let ct_context = ct.confirm()?;
-    reservation.commit_ipv6(
-        route,
-        netns.next_ipv6_fragment_identification(),
-        ct_context,
-        mark,
-    )
+    save_route_hint(
+        reservation.bytes(),
+        IpVersion::Ipv6,
+        ruleset.generation,
+        hint,
+    )?;
+    if !may_fragment && reservation.bytes().len() > route.ip_mtu {
+        return Err(PmtuOutputError {
+            error: SystemError::EMSGSIZE,
+            mtu: Some(route.ip_mtu),
+        });
+    }
+    if let Some(policy) = policy {
+        route = apply_socket_mtu(netns, &mut reservation, route, policy, IpVersion::Ipv6)?;
+    }
+    reservation
+        .validate_for_ipv6_route(route)
+        .map_err(|error| PmtuOutputError {
+            error,
+            mtu: Some(route.ip_mtu),
+        })?;
+    let identification = netns.next_ipv6_fragment_identification();
+    if let Some(copy_ct) = copy_ct {
+        copy_ct.adopt_confirmed(&ct_context);
+        multicast::ipv6_loopback(
+            &copy_ct,
+            &egress,
+            egress_epoch,
+            route,
+            reservation.bytes(),
+            identification,
+            post_oifname,
+        );
+    }
+    if physical_egress
+        && multicast_destination.is_some_and(|address| {
+            let node_local = address.octets()[1] & 0x0f <= 1;
+            node_local || clone_local && reservation.bytes()[7] == 0
+        })
+    {
+        return Ok(());
+    }
+    reservation
+        .commit_ipv6(route, identification, ct_context, mark)
+        .map_err(|error| PmtuOutputError {
+            error,
+            mtu: Some(route.ip_mtu),
+        })
 }
 
 /// Submit an IPv4 datagram after its complete buffer and source-owner queue
@@ -557,13 +657,46 @@ pub(crate) fn submit_prepared_ipv4(
 
 pub(crate) fn submit_prepared_ipv4_with_related(
     netns: &Arc<NetNamespace>,
-    mut reservation: PreparedIpOutputReservation<'_>,
-    mut route: OutputRouteDecision,
+    reservation: PreparedIpOutputReservation<'_>,
+    route: OutputRouteDecision,
     multicast_loop: bool,
     may_fragment: bool,
     related: Option<CtPacketContext>,
 ) -> Result<Option<Arc<dyn Iface>>, SystemError> {
-    reservation.validate_for_route(route, may_fragment)?;
+    submit_ipv4(
+        netns,
+        reservation,
+        route,
+        related,
+        SocketOutput {
+            multicast_loop,
+            may_fragment,
+            policy: None,
+            hint: None,
+        },
+    )
+    .map_err(|error| error.error)
+}
+
+fn submit_ipv4(
+    netns: &Arc<NetNamespace>,
+    mut reservation: PreparedIpOutputReservation<'_>,
+    mut route: OutputRouteDecision,
+    related: Option<CtPacketContext>,
+    options: SocketOutput<'_>,
+) -> Result<Option<Arc<dyn Iface>>, PmtuOutputError> {
+    let SocketOutput {
+        policy,
+        multicast_loop,
+        may_fragment,
+        hint,
+    } = options;
+    reservation
+        .validate_for_route(route, may_fragment)
+        .map_err(|error| PmtuOutputError {
+            error,
+            mtu: Some(route.ip_mtu),
+        })?;
     let packet = Ipv4Packet::new_checked(reservation.bytes()).map_err(|_| SystemError::EINVAL)?;
     let ttl = packet.hop_limit();
     let initial_destination = IpAddress::Ipv4(packet.dst_addr());
@@ -585,7 +718,7 @@ pub(crate) fn submit_prepared_ipv4_with_related(
         &addr_type,
         None,
     )? {
-        return Err(SystemError::EPERM);
+        return Err(SystemError::EPERM.into());
     }
 
     let (selected, masquerade) = route_after_output(
@@ -597,7 +730,6 @@ pub(crate) fn submit_prepared_ipv4_with_related(
         route,
     )?;
     route = selected;
-    reservation.validate_for_route(route, may_fragment)?;
     let egress = netns
         .device_list()
         .get(&(route.oif as usize))
@@ -674,11 +806,26 @@ pub(crate) fn submit_prepared_ipv4_with_related(
         &addr_type,
         masquerade,
     )? {
-        return Err(SystemError::EPERM);
+        return Err(SystemError::EPERM.into());
     }
 
     let mark = ct.mark();
-    reservation.commit(route, may_fragment, ct.confirm()?, mark)?;
+    let context = ct.confirm()?;
+    save_route_hint(
+        reservation.bytes(),
+        IpVersion::Ipv4,
+        ruleset.generation,
+        hint,
+    )?;
+    if let Some(policy) = policy {
+        route = apply_socket_mtu(netns, &mut reservation, route, policy, IpVersion::Ipv4)?;
+    }
+    reservation
+        .commit(route, may_fragment, context, mark)
+        .map_err(|error| PmtuOutputError {
+            error,
+            mtu: Some(route.ip_mtu),
+        })?;
     let local_delivery = route.kind == RTN_LOCAL || !is_physical_egress || local_copy_queued;
     Ok(local_delivery.then_some(egress))
 }

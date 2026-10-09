@@ -15,7 +15,7 @@ use crate::{
         bpf_prog_type, BPF_F_ALLOW_MULTI, BPF_F_ALLOW_OVERRIDE, BPF_F_REPLACE,
     },
     libs::{mutex::Mutex, rwlock::RwLock, spinlock::SpinLock},
-    process::RawPid,
+    process::{ProcessManager, RawPid},
 };
 
 /// `BPF_F_PREORDER` is not generated in the current Linux BPF bindings.
@@ -54,6 +54,31 @@ pub(crate) struct CgroupFilePermissions {
     pub gid: u32,
     pub mode: u32,
     pub generation: u64,
+}
+
+impl CgroupFilePermissions {
+    /// Match Linux 6.6 kernfs_new_node followed by cgroup_kn_set_ugid.
+    /// Nonzero creator credentials override inherited ownership; (0, 0)
+    /// leaves kernfs's initial ownership, including SGID group inheritance.
+    pub(crate) fn for_creation(
+        parent: Self,
+        uid: u32,
+        gid: u32,
+        mode: u32,
+        directory: bool,
+    ) -> Self {
+        let sgid = parent.mode & 0o2000 != 0;
+        Self {
+            uid,
+            gid: if uid == 0 && gid == 0 && sgid {
+                parent.gid
+            } else {
+                gid
+            },
+            mode: mode | if directory && sgid { 0o2000 } else { 0 },
+            generation: 0,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -174,6 +199,8 @@ impl CgroupNode {
     }
 
     pub(crate) fn reset_file_permissions(&self, name: &str, default_mode: u32) {
+        let cred = ProcessManager::current_pcb().cred();
+        let parent = self.file_permissions("", 0o755);
         let mut attrs = self.file_permissions.write();
         let generation = attrs
             .get(name)
@@ -183,10 +210,14 @@ impl CgroupNode {
         attrs.insert(
             name.to_string(),
             Arc::new(RwLock::new(CgroupFilePermissions {
-                uid: 0,
-                gid: 0,
-                mode: default_mode,
                 generation,
+                ..CgroupFilePermissions::for_creation(
+                    parent,
+                    cred.fsuid.data() as u32,
+                    cred.fsgid.data() as u32,
+                    default_mode,
+                    false,
+                )
             })),
         );
     }

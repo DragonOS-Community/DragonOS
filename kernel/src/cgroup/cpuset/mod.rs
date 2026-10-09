@@ -161,13 +161,13 @@ fn refresh(root: &Arc<CgroupNode>, tasks: Vec<Arc<ProcessControlBlock>>) {
     }
 }
 
-pub(crate) fn write(
+/// Caller holds UPDATE_LOCK through admission and placement updates.
+pub(crate) fn write_locked(
     node: &Arc<CgroupNode>,
     gen: u64,
     file: CpusetFile,
     input: &str,
 ) -> Result<(), SystemError> {
-    let _guard = lock();
     check_file(node, gen)?;
     if node.parent().is_none() {
         return Err(SystemError::EACCES);

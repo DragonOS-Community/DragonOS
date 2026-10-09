@@ -410,7 +410,8 @@ pub(super) fn read_file(
     })
 }
 
-pub(super) fn write_controller_file(
+/// Caller holds the cgroup update lock through admission and mutation.
+pub(super) fn write_controller_file_locked(
     cgroup: &Arc<CgroupNode>,
     ty: CgroupCoreFile,
     generation: u64,
@@ -418,10 +419,9 @@ pub(super) fn write_controller_file(
     input: &str,
 ) -> Result<Vec<u8>, SystemError> {
     if let CgroupCoreFile::Cpuset(file) = ty {
-        cpuset::write(cgroup, generation, file, input)?;
+        cpuset::write_locked(cgroup, generation, file, input)?;
         return Ok(Vec::new());
     }
-    let _guard = crate::cgroup::lock();
     if ty == CgroupCoreFile::Type {
         if input.trim() != "threaded" {
             return Err(SystemError::EINVAL);
@@ -627,13 +627,6 @@ pub(super) fn apply_subtree_control(
             child.reset_controller(name);
             for spec in controller_specs(name) {
                 child.reset_file_permissions(spec.name, spec.mode as u32);
-                if enabled.contains(name) {
-                    let cred = crate::process::ProcessManager::current_pcb().cred();
-                    let mut attrs = child.file_permissions(spec.name, spec.mode as u32);
-                    attrs.uid = cred.fsuid.data() as u32;
-                    attrs.gid = cred.fsgid.data() as u32;
-                    child.set_file_permissions(spec.name, attrs);
-                }
             }
         }
     }

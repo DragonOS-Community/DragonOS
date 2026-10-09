@@ -425,26 +425,12 @@ impl Cgroup2Inode {
         if buf.is_empty() {
             return Ok(0);
         }
-        let nsdelegate = this
-            .fs()
-            .as_any_ref()
-            .downcast_ref::<Cgroup2Fs>()
-            .is_some_and(|fs| fs.nsdelegate());
-        if nsdelegate
-            && !Arc::ptr_eq(
-                &open.namespace,
-                &crate::process::namespace::cgroup_namespace::INIT_CGROUP_NAMESPACE,
-            )
-            && Arc::ptr_eq(open.namespace.root_cgroup(), &cgroup)
-            && !matches!(
+        if offset != 0
+            && matches!(
                 ty,
                 CgroupCoreFile::Procs | CgroupCoreFile::Threads | CgroupCoreFile::SubtreeControl
             )
         {
-            return Err(SystemError::EPERM);
-        }
-
-        if offset != 0 {
             return Err(SystemError::EINVAL);
         }
 
@@ -454,9 +440,29 @@ impl Cgroup2Inode {
             }
             CgroupCoreFile::SubtreeControl => Self::write_subtree_control(this, &cgroup, buf),
             _ => {
+                // Serialize delegation admission with the controller update
+                // and init-namespace remounts which change hierarchy policy.
+                let _update = crate::cgroup::lock();
+                if cgroup_root().nsdelegate()
+                    && !Arc::ptr_eq(
+                        &open.namespace,
+                        &crate::process::namespace::cgroup_namespace::INIT_CGROUP_NAMESPACE,
+                    )
+                    && Arc::ptr_eq(open.namespace.root_cgroup(), &cgroup)
+                {
+                    return Err(SystemError::EPERM);
+                }
+                if offset != 0 {
+                    return Err(SystemError::EINVAL);
+                }
                 let input = core::str::from_utf8(buf).map_err(|_| SystemError::EINVAL)?;
-                let new_data =
-                    files::write_controller_file(&cgroup, ty, generation, file_generation, input)?;
+                let new_data = files::write_controller_file_locked(
+                    &cgroup,
+                    ty,
+                    generation,
+                    file_generation,
+                    input,
+                )?;
                 Self::replace_file_data(this, &new_data)?;
                 Ok(buf.len())
             }
@@ -661,22 +667,27 @@ impl IndexNode for Cgroup2Inode {
         };
 
         let cred = ProcessManager::current_pcb().cred();
-        let owner = crate::cgroup::core::CgroupFilePermissions {
-            uid: cred.fsuid.data() as u32,
-            gid: cred.fsgid.data() as u32,
-            mode: mode.bits(),
-            generation: 0,
-        };
         let child_cgroup =
             cgroup_root().create_child_exclusive_with_init(&cgroup, name, |node| {
+                // Parent metadata and child publication share UPDATE_LOCK.
+                let owner = crate::cgroup::core::CgroupFilePermissions::for_creation(
+                    cgroup.file_permissions("", 0o755),
+                    cred.fsuid.data() as u32,
+                    cred.fsgid.data() as u32,
+                    mode.bits(),
+                    true,
+                );
                 node.set_file_permissions("", owner);
                 for spec in files::desired_file_specs(node) {
                     node.set_file_permissions(
                         spec.name,
-                        crate::cgroup::core::CgroupFilePermissions {
-                            mode: spec.mode as u32,
-                            ..owner
-                        },
+                        crate::cgroup::core::CgroupFilePermissions::for_creation(
+                            owner,
+                            cred.fsuid.data() as u32,
+                            cred.fsgid.data() as u32,
+                            spec.mode as u32,
+                            false,
+                        ),
                     );
                 }
             })?;

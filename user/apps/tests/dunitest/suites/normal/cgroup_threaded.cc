@@ -752,6 +752,7 @@ unsigned long MountRestoreFlags(const std::string& path) {
 TEST_F(ThreadedCgroup, NsdelegateRootWriteProtectionUsesOpenerNamespace) {
   Enable("cpu");
   Enable("pids");
+  Enable("cpuset");
   char location[] = "/tmp/dunitest-threaded-delegation-XXXXXX";
   ASSERT_NE(nullptr, mkdtemp(location));
   scratch_dirs_.push_back(location);
@@ -782,11 +783,14 @@ TEST_F(ThreadedCgroup, NsdelegateRootWriteProtectionUsesOpenerNamespace) {
           !MountUsesNsdelegate(child_view) ||
           Write(std::string(child_view) + "/cpu.max", "max 100000") != EPERM ||
           umount(child_view)) _exit(13);
-      for (const auto& file : {"cgroup.type", "cpu.max", "pids.max", "cgroup.freeze"}) {
+      for (const auto& file : {"cgroup.type", "cpu.max", "pids.max", "cgroup.freeze",
+                               "cpuset.cpus", "cpuset.mems"}) {
         const char* value = !std::strcmp(file, "cgroup.type") ? "threaded" :
                             !std::strcmp(file, "cpu.max") ? "max 100000" :
                             !std::strcmp(file, "pids.max") ? "max" : "0";
         if (Write(mirror + "/" + file, value) != EPERM) _exit(5);
+        // Delegation denial precedes input parsing, including cpuset writes.
+        if (Write(mirror + "/" + file, std::string(1, '\xff')) != EPERM) _exit(16);
       }
       // Both a different mount and a fd passed between namespaces must
       // retain the hierarchy policy and the namespace recorded at open.
@@ -836,6 +840,16 @@ TEST_F(ThreadedCgroup, NsdelegateRootWriteProtectionUsesOpenerNamespace) {
   if (restricted_fd >= 0) {
     EXPECT_EQ(EPERM, WriteFd(restricted_fd, "max 100000"));
     EXPECT_EQ(0, WriteFd(restricted_fd, ""));
+    // The opener namespace stays pinned, but hierarchy policy is evaluated
+    // anew for each write, rather than cached at open or by a mount view.
+    for (int i = 0; i < 8; ++i) {
+      EXPECT_EQ(0, mount(nullptr, "/sys/fs/cgroup", "cgroup2", restore_flags, nullptr));
+      EXPECT_EQ(0, lseek(restricted_fd, 0, SEEK_SET));
+      EXPECT_EQ(0, WriteFd(restricted_fd, "max 100000"));
+      EXPECT_EQ(0, mount(nullptr, "/sys/fs/cgroup", "cgroup2", restore_flags, "nsdelegate"));
+      EXPECT_EQ(0, lseek(restricted_fd, 0, SEEK_SET));
+      EXPECT_EQ(EPERM, WriteFd(restricted_fd, "max 100000"));
+    }
     close(restricted_fd);
   }
   char done = 'D';
@@ -1115,6 +1129,65 @@ TEST_F(ThreadedCgroup, DelegatedMkdirSetsCreatorOwnershipAndRemainsVisible) {
   ASSERT_EQ(helper, waitpid(helper, &status, 0));
   EXPECT_EQ(0, status);
   EXPECT_EQ("threaded", Read(child_path + "/cgroup.type"));
+}
+
+TEST_F(ThreadedCgroup, SgidRootCreatorInheritsGroupForDirectoryAndFiles) {
+  Enable("pids");
+  ASSERT_EQ(0, chown(root_.c_str(), 0, 23456));
+  ASSERT_EQ(0, chmod(root_.c_str(), 02755));
+  std::string child = Make(root_, "sgid-child");
+  ASSERT_FALSE(HasFailure());
+  std::string grandchild = Make(child, "sgid-grandchild");
+  ASSERT_FALSE(HasFailure());
+  for (const auto& path : {child, grandchild}) {
+    struct stat st{};
+    ASSERT_EQ(0, stat(path.c_str(), &st));
+    EXPECT_EQ(0u, st.st_uid);
+    EXPECT_EQ(23456u, st.st_gid);
+    EXPECT_NE(0u, st.st_mode & S_ISGID);
+    ASSERT_EQ(0, stat((path + "/cgroup.procs").c_str(), &st));
+    EXPECT_EQ(0u, st.st_uid);
+    EXPECT_EQ(23456u, st.st_gid);
+    EXPECT_EQ(0u, st.st_mode & S_ISGID);
+  }
+  ASSERT_EQ(0, Write(root_ + "/cgroup.subtree_control", "+pids"));
+  int old = open((child + "/pids.max").c_str(), O_RDONLY | O_CLOEXEC);
+  ASSERT_GE(old, 0);
+  EXPECT_EQ(0, Write(root_ + "/cgroup.subtree_control", "-pids"));
+  EXPECT_EQ(0, Write(root_ + "/cgroup.subtree_control", "+pids"));
+  // Recreated controller files inherit from their own containing cgroup.
+  struct stat st{};
+  EXPECT_EQ(0, stat((child + "/pids.max").c_str(), &st));
+  EXPECT_EQ(23456u, st.st_gid);
+  EXPECT_EQ(0u, st.st_mode & S_ISGID);
+  EXPECT_EQ(0, fchown(old, 0, 34567));
+  EXPECT_EQ(0, stat((child + "/pids.max").c_str(), &st));
+  EXPECT_EQ(23456u, st.st_gid);
+  close(old);
+}
+
+TEST_F(ThreadedCgroup, SgidNonzeroCreatorUsesLinux66OwnershipOverride) {
+  // Linux 6.6 cgroup_kn_set_ugid overrides kernfs group inheritance for a
+  // nonzero creator; later Linux versions may intentionally differ.
+  ASSERT_EQ(0, chown(root_.c_str(), 65534, 23456));
+  ASSERT_EQ(0, chmod(root_.c_str(), 02777));
+  std::string child = root_ + "/sgid-delegate";
+  dirs_.push_back(child);
+  pid_t helper = fork();
+  ASSERT_GE(helper, 0);
+  if (helper == 0) {
+    alarm(10);
+    if (setgid(65534) || setuid(65534) || mkdir(child.c_str(), 0755)) _exit(1);
+    struct stat st{};
+    if (stat(child.c_str(), &st) || st.st_uid != 65534 || st.st_gid != 65534 ||
+        !(st.st_mode & S_ISGID)) _exit(2);
+    if (stat((child + "/cgroup.procs").c_str(), &st) || st.st_uid != 65534 ||
+        st.st_gid != 65534 || (st.st_mode & S_ISGID)) _exit(3);
+    _exit(0);
+  }
+  int status;
+  ASSERT_EQ(helper, waitpid(helper, &status, 0));
+  EXPECT_EQ(0, status);
 }
 
 TEST_F(ThreadedCgroup, DisabledControllerOldFdCannotChangeRecreatedPermissions) {

@@ -9,7 +9,10 @@ use core::sync::atomic::Ordering;
 use hashbrown::{HashMap, HashSet};
 use system_error::SystemError;
 
-use crate::cgroup::CgroupNode;
+use crate::cgroup::{
+    cpuset::{self, CpusetFile},
+    CgroupNode,
+};
 
 use super::{AVAILABLE_CONTROLLERS, DOMAIN_CONTROLLERS};
 
@@ -24,6 +27,7 @@ pub(super) enum CgroupCoreFile {
     CpuStat,
     CpuWeight,
     CpuMax,
+    Cpuset(CpusetFile),
     MemoryCurrent,
     MemoryPeak,
     MemoryMin,
@@ -135,6 +139,37 @@ const CPU_FILE_SPECS: [CgroupFileSpec; 2] = [
         init: b"max 100000\n",
         mode: 0o644,
         visibility: CgroupFileVisibility::NotOnRoot,
+    },
+];
+
+const CPUSET_FILE_SPECS: [CgroupFileSpec; 4] = [
+    CgroupFileSpec {
+        name: "cpuset.cpus",
+        ty: CgroupCoreFile::Cpuset(CpusetFile::Cpus),
+        init: b"\n",
+        mode: 0o644,
+        visibility: CgroupFileVisibility::NotOnRoot,
+    },
+    CgroupFileSpec {
+        name: "cpuset.mems",
+        ty: CgroupCoreFile::Cpuset(CpusetFile::Mems),
+        init: b"\n",
+        mode: 0o644,
+        visibility: CgroupFileVisibility::NotOnRoot,
+    },
+    CgroupFileSpec {
+        name: "cpuset.cpus.effective",
+        ty: CgroupCoreFile::Cpuset(CpusetFile::EffectiveCpus),
+        init: b"\n",
+        mode: 0o444,
+        visibility: CgroupFileVisibility::All,
+    },
+    CgroupFileSpec {
+        name: "cpuset.mems.effective",
+        ty: CgroupCoreFile::Cpuset(CpusetFile::EffectiveMems),
+        init: b"\n",
+        mode: 0o444,
+        visibility: CgroupFileVisibility::All,
     },
 ];
 
@@ -284,6 +319,7 @@ fn push_visible_specs(
 fn controller_specs(name: &str) -> &'static [CgroupFileSpec] {
     match name {
         "cpu" => &CPU_FILE_SPECS,
+        "cpuset" => &CPUSET_FILE_SPECS,
         "memory" => &MEMORY_FILE_SPECS,
         "pids" => &PIDS_FILE_SPECS,
         _ => &[],
@@ -306,8 +342,13 @@ fn is_known_controller(name: &str) -> bool {
     AVAILABLE_CONTROLLERS.contains(&name)
 }
 
-pub(super) fn read_file(cgroup: &Arc<CgroupNode>, ty: CgroupCoreFile) -> Vec<u8> {
-    match ty {
+pub(super) fn read_file(
+    cgroup: &Arc<CgroupNode>,
+    ty: CgroupCoreFile,
+    generation: u64,
+) -> Result<Vec<u8>, SystemError> {
+    Ok(match ty {
+        CgroupCoreFile::Cpuset(file) => return cpuset::read(cgroup, generation, file),
         CgroupCoreFile::Procs => {
             let mut lines = String::new();
             for pid in cgroup.tasks() {
@@ -330,7 +371,15 @@ pub(super) fn read_file(cgroup: &Arc<CgroupNode>, ty: CgroupCoreFile) -> Vec<u8>
             let populated = if is_populated(cgroup) { 1 } else { 0 };
             format!("populated {}\nfrozen 0\n", populated).into_bytes()
         }
-        CgroupCoreFile::Type => b"domain\n".to_vec(),
+        CgroupCoreFile::Type => {
+            if !cgroup.is_valid_domain() {
+                b"domain invalid\n".to_vec()
+            } else if cgroup.is_thread_root() {
+                b"domain threaded\n".to_vec()
+            } else {
+                b"domain\n".to_vec()
+            }
+        }
         CgroupCoreFile::Freeze => {
             format!("{}\n", if cgroup.freeze_requested() { 1 } else { 0 }).into_bytes()
         }
@@ -354,15 +403,21 @@ pub(super) fn read_file(cgroup: &Arc<CgroupNode>, ty: CgroupCoreFile) -> Vec<u8>
         CgroupCoreFile::PidsCurrent => format!("{}\n", cgroup.pids_current_count()).into_bytes(),
         CgroupCoreFile::PidsMax => encode_pids_max(cgroup.pids_max()),
         CgroupCoreFile::PidsEvents => format!("max {}\n", cgroup.pids_events_max()).into_bytes(),
-    }
+    })
 }
 
 pub(super) fn write_controller_file(
     cgroup: &Arc<CgroupNode>,
     ty: CgroupCoreFile,
+    generation: u64,
     input: &str,
 ) -> Result<Vec<u8>, SystemError> {
     match ty {
+        CgroupCoreFile::Cpuset(file) => {
+            cpuset::write(cgroup, generation, file, input)?;
+            // Cpuset content is generated from controller state on each read.
+            Ok(Vec::new())
+        }
         CgroupCoreFile::Freeze => {
             let value = input
                 .trim()
@@ -437,6 +492,7 @@ pub(super) fn apply_subtree_control(
 ) -> Result<Vec<u8>, SystemError> {
     let ops = fold_subtree_control_ops(input)?;
     let mut enabled: HashSet<String> = cgroup.subtree_control().into_iter().collect();
+    let old_enabled = enabled.clone();
 
     for (name, is_enable) in ops {
         if is_enable {
@@ -444,6 +500,12 @@ pub(super) fn apply_subtree_control(
                 continue;
             }
             validate_enable_controller(cgroup, &name)?;
+            if DOMAIN_CONTROLLERS.contains(&name.as_str())
+                && cgroup.parent().is_some()
+                && cgroup.is_thread_root()
+            {
+                return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+            }
             enabled.insert(name);
         } else {
             for child in cgroup.children() {
@@ -455,6 +517,19 @@ pub(super) fn apply_subtree_control(
         }
     }
 
+    if enabled.difference(&old_enabled).next().is_some() && cgroup.parent().is_some() {
+        if !cgroup.is_valid_domain() {
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        }
+        if cgroup.has_tasks()
+            && (cgroup.has_populated_domain_children()
+                || enabled
+                    .iter()
+                    .any(|name| DOMAIN_CONTROLLERS.contains(&name.as_str())))
+        {
+            return Err(SystemError::EBUSY);
+        }
+    }
     cgroup.set_subtree_control(enabled.clone());
     let mut out: Vec<String> = enabled.into_iter().collect();
     out.sort();
@@ -467,9 +542,6 @@ fn validate_enable_controller(cgroup: &Arc<CgroupNode>, name: &str) -> Result<()
         return Err(SystemError::ENOENT);
     }
 
-    if DOMAIN_CONTROLLERS.contains(&name) && cgroup.parent().is_some() && cgroup.has_tasks() {
-        return Err(SystemError::EBUSY);
-    }
     Ok(())
 }
 

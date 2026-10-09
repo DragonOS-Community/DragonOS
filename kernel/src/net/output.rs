@@ -90,6 +90,7 @@ fn route_after_output(
     version: IpVersion,
     initial_destination: IpAddress,
     new_destination: IpAddress,
+    source: Option<IpAddress>,
     mut route: OutputRouteDecision,
 ) -> Result<(OutputRouteDecision, Option<(CtAddress, u32)>), SystemError> {
     let may_masquerade = ruleset.requires_masquerade(version, NftIpv4Hook::PostRouting);
@@ -100,7 +101,7 @@ fn route_after_output(
     let mut routes = super::route::lock_output_routes(&router, netns.device_list());
     if initial_destination != new_destination {
         route = routes
-            .lookup(new_destination, route.required_oif)
+            .lookup_with_source(new_destination, route.required_oif, source)
             .ok_or(SystemError::ENETUNREACH)?;
         let egress = routes
             .ingress_device(route.oif)
@@ -528,6 +529,7 @@ fn submit_ipv6(
         IpVersion::Ipv6,
         initial_destination,
         destination(reservation.bytes(), IpVersion::Ipv6)?,
+        None,
         route,
     )?;
     route = selected;
@@ -721,12 +723,16 @@ fn submit_ipv4(
         return Err(SystemError::EPERM.into());
     }
 
+    // OUTPUT may rewrite packet addresses. Like ip_route_me_harder(), use
+    // the current IPv4 source when re-resolving the new destination.
+    let packet = Ipv4Packet::new_checked(reservation.bytes()).map_err(|_| SystemError::EINVAL)?;
     let (selected, masquerade) = route_after_output(
         netns,
         &ruleset,
         IpVersion::Ipv4,
         initial_destination,
-        destination(reservation.bytes(), IpVersion::Ipv4)?,
+        IpAddress::Ipv4(packet.dst_addr()),
+        Some(IpAddress::Ipv4(packet.src_addr())),
         route,
     )?;
     route = selected;

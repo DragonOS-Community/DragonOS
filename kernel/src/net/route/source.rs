@@ -13,9 +13,7 @@ use crate::{
     process::namespace::net_namespace::NetNamespace,
 };
 
-use super::{
-    is_limited_broadcast, lookup_output_fib, RouteLookupResult, RouteSourcePolicy, RTN_LOCAL,
-};
+use super::{lookup_output_fib_with_source, RouteLookupResult, RouteSourcePolicy, RTN_LOCAL};
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ResolvedIpv4Route {
@@ -72,27 +70,9 @@ pub(crate) fn resolve_ipv4_route(
     let devices = netns.device_list();
     let router = netns.router();
     let fib = router.fib.read();
-    // Linux derives an output device from a fixed local source only for
-    // multicast and limited broadcast when no caller supplied an OIF. This is
-    // the ip_route_output_key_hash_rcu() compatibility path that lets an
-    // address-bound socket send on-link without installing a multicast route.
-    // Keep explicit OIF and ordinary weak-host routing independent of source.
-    let source_oif = if required_oif.is_none()
-        && (destination.is_multicast() || is_limited_broadcast(destination))
-    {
-        fixed_source.and_then(|source| {
-            (!source.is_unspecified()).then_some(())?;
-            devices.iter().find_map(|(ifindex, candidate)| {
-                crate::net::address::iface_accepts_local_address(candidate, source)
-                    .then(|| u32::try_from(*ifindex).ok())
-                    .flatten()
-            })
-        })
-    } else {
-        None
-    };
-    let decision = lookup_output_fib(&fib, destination, required_oif.or(source_oif))
-        .ok_or(SystemError::ENETUNREACH)?;
+    let decision =
+        lookup_output_fib_with_source(&fib, &devices, destination, required_oif, fixed_source)
+            .ok_or(SystemError::ENETUNREACH)?;
     let iface = devices
         .get(&(decision.oif as usize))
         .ok_or(SystemError::ENETUNREACH)?;

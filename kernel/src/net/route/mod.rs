@@ -182,7 +182,20 @@ impl OutputRouteGuard<'_> {
         destination: IpAddress,
         oif: Option<u32>,
     ) -> Option<OutputRouteDecision> {
-        let route = lookup_output_fib(&self.fib, destination, oif)?;
+        self.lookup_with_source(destination, oif, None)
+    }
+
+    /// Re-resolve an output flow without losing IPv4's source-selected
+    /// multicast/broadcast device. The original explicit OIF stays separate
+    /// from this destination-dependent choice for subsequent OUTPUT reroutes.
+    pub(crate) fn lookup_with_source(
+        &self,
+        destination: IpAddress,
+        oif: Option<u32>,
+        source: Option<IpAddress>,
+    ) -> Option<OutputRouteDecision> {
+        let route =
+            lookup_output_fib_with_source(&self.fib, &self.devices, destination, oif, source)?;
         let iface = self.devices.get(&(route.oif as usize))?;
         Some(OutputRouteDecision {
             oif: route.oif,
@@ -481,6 +494,35 @@ pub(crate) fn local_address_owner(
     }
     let iface = netns.device_list().get(&(decision.oif as usize)).cloned()?;
     crate::net::address::iface_has_address(&iface, address).then_some(iface)
+}
+
+/// Keep source-dependent IPv4 device selection shared between initial
+/// socket resolution and later queries over an already acquired route view.
+fn lookup_output_fib_with_source(
+    fib: &FibTable,
+    devices: &BTreeMap<usize, Arc<dyn Iface>>,
+    destination: IpAddress,
+    oif: Option<u32>,
+    source: Option<IpAddress>,
+) -> Option<RouteLookupResult> {
+    // Linux ip_route_output_key_hash_rcu() uses a fixed local source to
+    // select multicast/lbcast output only when there is no explicit OIF.
+    // Ordinary unicast keeps weak-host routing independent of source owner.
+    let oif = if oif.is_none()
+        && matches!(destination, IpAddress::Ipv4(address) if address.is_multicast() || address.is_broadcast())
+    {
+        match source.filter(|address| !address.is_unspecified()) {
+            Some(source) => Some(devices.iter().find_map(|(&ifindex, iface)| {
+                crate::net::address::iface_accepts_local_address(iface, source)
+                    .then(|| u32::try_from(ifindex).ok())
+                    .flatten()
+            })?),
+            None => None,
+        }
+    } else {
+        oif
+    };
+    lookup_output_fib(fib, destination, oif)
 }
 
 /// Applies the destination-specific output classification shared by immediate

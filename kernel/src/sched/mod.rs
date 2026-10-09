@@ -1591,6 +1591,50 @@ pub fn request_task_migration(
     Ok(())
 }
 
+static CPU_PLACEMENT_WAIT: crate::libs::wait_queue::WaitQueue =
+    crate::libs::wait_queue::WaitQueue::default();
+
+/// Sleep until an affinity change cannot leave the task executing on an
+/// excluded CPU. No accounting, pi or rq lock may be held by this caller.
+pub(crate) fn wait_cpu_placement(pcb: &Arc<ProcessControlBlock>) {
+    // An unpublished fork child has no executing CPU to drain. First wakeup
+    // consumes the already-published mask under the scheduler's placement locks.
+    if pcb.sched_info().is_new_task() {
+        return;
+    }
+    // The caller pins the target Arc until completion, so its address is a
+    // stable class even if PID identity changes. Unrelated switches must not
+    // wake this waiter and turn a placement wait into scheduler polling.
+    CPU_PLACEMENT_WAIT.wait_until_tagged(Arc::as_ptr(pcb) as usize, || {
+        // Pairs with the producer fence before its advisory queue-empty test.
+        fence(Ordering::SeqCst);
+        let pi = pcb.sched_info().pi_lock_irqsave();
+        let on_rq = *pcb.sched_info().on_rq.lock_irqsave();
+        if on_rq == OnRq::Migrating {
+            return None;
+        }
+        let legal = pcb
+            .sched_info()
+            .on_cpu()
+            .is_none_or(|cpu| pi.cpus_allowed.get(cpu).unwrap_or(false));
+        if legal || (!pcb.sched_info().is_running() && on_rq == OnRq::None) {
+            pcb.sched_info().set_migrate_to(None);
+            pcb.flags().remove(ProcessFlags::NEED_MIGRATE);
+            Some(())
+        } else {
+            None
+        }
+    });
+}
+
+/// Called after the switch tail publishes placement and releases pi/rq locks.
+pub(crate) fn notify_cpu_placement(pcb: &Arc<ProcessControlBlock>) {
+    fence(Ordering::SeqCst);
+    if !CPU_PLACEMENT_WAIT.is_empty() {
+        while CPU_PLACEMENT_WAIT.wake_one_tagged(Arc::as_ptr(pcb) as usize) {}
+    }
+}
+
 pub fn take_current_migration_target(current: &Arc<ProcessControlBlock>) -> Option<ProcessorId> {
     if !current.flags().contains(ProcessFlags::NEED_MIGRATE) {
         return None;

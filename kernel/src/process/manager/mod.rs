@@ -537,6 +537,7 @@ impl ProcessManager {
             drop(pi_guard);
         }
 
+        crate::sched::notify_cpu_placement(&prev_pcb);
         let set_child_tid = next_pcb.thread.write_irqsave().set_child_tid.take();
         if let Some(addr) = set_child_tid {
             // Align with Linux schedule_tail semantics: best-effort write of tid

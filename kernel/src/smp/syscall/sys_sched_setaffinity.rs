@@ -9,7 +9,6 @@ use crate::libs::cpumask::CpuMask;
 use crate::mm::VirtAddr;
 use crate::process::{kthread::KernelThreadFlags, ProcessFlags, ProcessManager, RawPid};
 use crate::sched::syscall::util::has_sched_setaffinity_permission;
-use crate::smp::cpu::smp_cpu_manager;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
 use crate::syscall::user_access::copy_from_user_protected;
 
@@ -36,7 +35,7 @@ impl Syscall for SysSchedSetaffinity {
                 copy_from_user_protected(&mut user_set[..copy_len], VirtAddr::new(set_vaddr))?
             };
         }
-        let mut mask = Self::parse_user_mask(&user_set);
+        let mask = Self::parse_user_mask(&user_set);
 
         let target_pcb = if pid == 0 {
             ProcessManager::current_pcb()
@@ -61,15 +60,9 @@ impl Syscall for SysSchedSetaffinity {
             return Err(SystemError::EPERM);
         }
 
-        mask.bitand_assign(&smp_cpu_manager().online_cpus());
-
-        if mask.is_empty() {
-            return Err(SystemError::EINVAL);
-        }
-
         // Keep affinity publication and the corresponding placement decision
         // in one pi_lock critical section inside the process manager.
-        ProcessManager::set_cpus_allowed(&target_pcb, mask)?;
+        crate::cgroup::cpuset::set_user_affinity(&target_pcb, mask)?;
 
         Ok(0)
     }

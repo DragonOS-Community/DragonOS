@@ -1,5 +1,6 @@
 pub mod controllers;
 pub mod core;
+pub(crate) mod cpuset;
 
 #[allow(unused_imports)]
 pub use controllers::{CgroupCpuState, CgroupFreezerState, CgroupMemoryState};

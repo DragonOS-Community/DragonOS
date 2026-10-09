@@ -161,6 +161,25 @@ impl WaitQueue {
         .unwrap()
     }
 
+    /// Wait uninterruptibly for a caller-defined class. Reuses the same
+    /// register-before-check protocol as wait_until; wake_one_tagged selects
+    /// this class without waking waiters for unrelated completion sources.
+    pub(crate) fn wait_until_tagged<F, R>(&self, tag: usize, cond: F) -> R
+    where
+        F: FnMut() -> Option<R>,
+    {
+        assert_ne!(tag, DEFAULT_WAIT_TAG);
+        self.wait_until_impl_tagged(
+            cond,
+            WaitSignalMode::Uninterruptible,
+            None,
+            None,
+            None::<fn()>,
+            (false, tag),
+        )
+        .unwrap()
+    }
+
     /// 等待 IO 操作完成（不可中断）
     ///
     /// 与 wait_until 类似，但会正确标记进程在等待 IO，用于 iowait 统计

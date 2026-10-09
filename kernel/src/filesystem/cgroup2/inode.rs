@@ -11,7 +11,7 @@ use system_error::SystemError;
 use crate::{
     cgroup::{
         cgroup_accounting_lock, cgroup_common_ancestor, cgroup_migrate_vet_dst_with_src,
-        cgroup_root, CgroupNode,
+        cgroup_root, cpuset, CgroupNode,
     },
     filesystem::vfs::{
         file::{FileFlags, FilePrivateData},
@@ -21,7 +21,7 @@ use crate::{
         PostWriteSyncPolicy,
     },
     libs::{mutex::MutexGuard, rwsem::RwSem, spinlock::SpinLock},
-    process::ProcessManager,
+    process::{ProcessFlags, ProcessManager},
     time::PosixTimeSpec,
 };
 
@@ -55,6 +55,7 @@ enum Cgroup2InodeKind {
     File {
         cgroup: Arc<CgroupNode>,
         ty: CgroupCoreFile,
+        cpuset_generation: u64,
         data: Vec<u8>,
     },
 }
@@ -217,6 +218,7 @@ impl Cgroup2Inode {
         init: &[u8],
         mode: u16,
     ) -> Arc<Self> {
+        let cpuset_generation = cpuset::generation(&cgroup);
         Arc::new_cyclic(|weak| Self {
             self_ref: weak.clone(),
             fs: RwSem::new(Weak::new()),
@@ -244,6 +246,7 @@ impl Cgroup2Inode {
                 kind: Cgroup2InodeKind::File {
                     cgroup,
                     ty,
+                    cpuset_generation,
                     data: init.to_vec(),
                 },
             }),
@@ -298,8 +301,15 @@ impl Cgroup2Inode {
                 children.retain(|_, child| {
                     let child_inner = child.inner.lock();
                     match &child_inner.kind {
-                        Cgroup2InodeKind::File { .. } => {
+                        Cgroup2InodeKind::File {
+                            cgroup,
+                            ty,
+                            cpuset_generation,
+                            ..
+                        } => {
                             desired_names.contains(child_inner.name.as_str())
+                                && (!matches!(ty, CgroupCoreFile::Cpuset(_))
+                                    || *cpuset_generation == cpuset::generation(cgroup))
                         }
                         Cgroup2InodeKind::Dir { .. } => true,
                     }
@@ -405,15 +415,14 @@ impl Cgroup2Inode {
     }
 
     fn read_file(
-        inner: &Cgroup2InodeInner,
+        cgroup: &Arc<CgroupNode>,
+        ty: CgroupCoreFile,
+        generation: u64,
         offset: usize,
         len: usize,
         buf: &mut [u8],
     ) -> Result<usize, SystemError> {
-        let bytes = match &inner.kind {
-            Cgroup2InodeKind::File { cgroup, ty, .. } => files::read_file(cgroup, *ty),
-            _ => return Err(SystemError::EISDIR),
-        };
+        let bytes = files::read_file(cgroup, ty, generation)?;
 
         let start = core::cmp::min(offset, bytes.len());
         let end = core::cmp::min(offset + len, bytes.len());
@@ -443,10 +452,15 @@ impl Cgroup2Inode {
         offset: usize,
         buf: &[u8],
     ) -> Result<usize, SystemError> {
-        let (cgroup, ty) = {
+        let (cgroup, ty, generation) = {
             let inner = this.inner.lock();
             match &inner.kind {
-                Cgroup2InodeKind::File { cgroup, ty, .. } => (cgroup.clone(), *ty),
+                Cgroup2InodeKind::File {
+                    cgroup,
+                    ty,
+                    cpuset_generation,
+                    ..
+                } => (cgroup.clone(), *ty, *cpuset_generation),
                 _ => return Err(SystemError::EISDIR),
             }
         };
@@ -460,7 +474,7 @@ impl Cgroup2Inode {
             CgroupCoreFile::SubtreeControl => Self::write_subtree_control(this, &cgroup, buf),
             _ => {
                 let input = core::str::from_utf8(buf).map_err(|_| SystemError::EINVAL)?;
-                let new_data = files::write_controller_file(&cgroup, ty, input)?;
+                let new_data = files::write_controller_file(&cgroup, ty, generation, input)?;
                 Self::replace_file_data(this, &new_data)?;
                 Ok(buf.len())
             }
@@ -474,6 +488,9 @@ impl Cgroup2Inode {
     ) -> Result<usize, SystemError> {
         let input = core::str::from_utf8(buf).map_err(|_| SystemError::EINVAL)?;
         let pid_str = input.trim();
+        // Fork publication and controller changes share this transaction.
+        // Permission/source checks and thread-group collection must be inside it.
+        let _cpuset_guard = cpuset::lock();
         let current = ProcessManager::current_pcb();
         let task = if pid_str == "0" {
             current.clone()
@@ -526,13 +543,38 @@ impl Cgroup2Inode {
         if to_move.is_empty() {
             return Err(SystemError::ESRCH);
         }
-        let moved_tasks = to_move.len();
-
-        let _cgroup_guard = cgroup_accounting_lock().lock();
-        cgroup_migrate_vet_dst_with_src(&src, cgroup, moved_tasks)?;
-
-        for t in to_move {
-            t.set_task_cgroup_node(cgroup.clone());
+        {
+            // Serializes with mark_exiting and exec's identity handoff. No
+            // controller call or placement wait is permitted under this lock.
+            let _membership_guard = crate::process::pid::pid_membership_lock();
+            let _cgroup_guard = cgroup_accounting_lock().lock();
+            to_move
+                .retain(|task| !task.is_exited() && !task.flags().contains(ProcessFlags::EXITING));
+            if to_move.is_empty() {
+                return Err(SystemError::ESRCH);
+            }
+            for task in &to_move {
+                if cpuset::per_cpu_task(task) {
+                    return Err(SystemError::EINVAL);
+                }
+            }
+            // Recheck the source while membership and charging are stable.
+            let src = task.task_cgroup_node();
+            // Domain cgroups keep a thread group together. Clone admission
+            // enforces the same invariant for CLONE_THREAD.
+            if to_move
+                .iter()
+                .any(|task| !Arc::ptr_eq(&task.task_cgroup_node(), &src))
+            {
+                return Err(SystemError::EINVAL);
+            }
+            cgroup_migrate_vet_dst_with_src(&src, cgroup, to_move.len())?;
+            for task in &to_move {
+                task.set_task_cgroup_node(cgroup.clone());
+            }
+        }
+        for task in &to_move {
+            cpuset::attach_locked(task);
         }
         Ok(buf.len())
     }
@@ -552,8 +594,32 @@ impl Cgroup2Inode {
             .parent
             .upgrade()
             .ok_or(SystemError::ENOENT)?;
-        let _cgroup_guard = cgroup_accounting_lock().lock();
-        let new_data = files::apply_subtree_control(cgroup, input)?;
+        let _cpuset_guard = cpuset::lock();
+        let was_enabled = cgroup.subtree_control().iter().any(|name| name == "cpuset");
+        // The only fallible process snapshot is prepared before committing the
+        // controller mask. Allocation failure cannot leave a partial update.
+        let tasks = if input
+            .split_whitespace()
+            .any(|op| op == "+cpuset" || op == "-cpuset")
+        {
+            Some(crate::process::snapshot_all_processes()?)
+        } else {
+            None
+        };
+        let new_data = {
+            let _cgroup_guard = cgroup_accounting_lock().lock();
+            if !cgroup_root().is_online(cgroup) {
+                return Err(SystemError::ENODEV);
+            }
+            files::apply_subtree_control(cgroup, input)?
+        };
+        let is_enabled = cgroup.subtree_control().iter().any(|name| name == "cpuset");
+        if was_enabled != is_enabled {
+            cpuset::controller_changed_locked(
+                cgroup,
+                tasks.expect("cpuset update has a prepared snapshot"),
+            );
+        }
         Self::replace_file_data(this, &new_data)?;
         Self::sync_cached_child_controller_files(&dir)?;
         Ok(buf.len())
@@ -584,8 +650,21 @@ impl IndexNode for Cgroup2Inode {
         buf: &mut [u8],
         _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        let inner = self.inner.lock();
-        Cgroup2Inode::read_file(&inner, offset, len, buf)
+        // Controller reads may acquire a sleeping mutex. Never retain the
+        // inode spinlock across controller calls (writes use the reverse order).
+        let (cgroup, ty, generation) = {
+            let inner = self.inner.lock();
+            match &inner.kind {
+                Cgroup2InodeKind::File {
+                    cgroup,
+                    ty,
+                    cpuset_generation,
+                    ..
+                } => (cgroup.clone(), *ty, *cpuset_generation),
+                _ => return Err(SystemError::EISDIR),
+            }
+        };
+        Cgroup2Inode::read_file(&cgroup, ty, generation, offset, len, buf)
     }
 
     fn write_at(

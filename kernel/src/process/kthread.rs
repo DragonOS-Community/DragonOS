@@ -684,6 +684,13 @@ pub(crate) fn run_debug_selftests() -> Result<String, SystemError> {
     let mut report = String::new();
     let mut failures = 0usize;
 
+    append_kthread_selftest_case(
+        &mut report,
+        "pid_membership_lifetime",
+        super::pid::selftest_membership_lifetime().unwrap_or(false),
+        &mut failures,
+    );
+
     let (destroyed, reaped, remaining_owners, entity_destroyed, entity_owners) =
         selftest_task_destruction();
     append_kthread_selftest_case(&mut report, "task_destruction", destroyed, &mut failures);

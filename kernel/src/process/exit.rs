@@ -1034,8 +1034,10 @@ impl ProcessControlBlock {
     fn __unhash_process(&self, group_dead: bool) {
         self.dec_visible_thread_count_if_accounted();
         self.detach_pid(PidType::PID);
+        // Unlike Linux's leader-only TGID index, DragonOS registers every
+        // thread here. Each published member must release its own link.
+        self.detach_pid(PidType::TGID);
         if group_dead {
-            self.detach_pid(PidType::TGID);
             self.detach_pid(PidType::PGID);
             self.detach_pid(PidType::SID);
         }

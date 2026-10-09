@@ -174,6 +174,12 @@ pub unsafe extern "C" fn ret_from_exception() -> ! {
             
             bnez s0, 3f
 
+            // All user returns pass here.
+			// Remove SIE
+            csrci {csr_status}, 2
+            mv a0, sp
+            call irqentry_exit
+
             // Save unwound kernel stack pointer in thread_info
             addi s0, sp, {trap_frame_size_on_stack}
             sd s0, {lc_off_kernel_sp}(tp)

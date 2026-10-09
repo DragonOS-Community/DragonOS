@@ -73,7 +73,6 @@ pub unsafe fn arch_switch_to_user(trap_frame: TrapFrame) -> ! {
     *(trap_frame_vaddr.data() as *mut TrapFrame) = trap_frame;
 
     compiler_fence(Ordering::SeqCst);
-    crate::rcu::user_enter();
     ready_to_switch_to_user(trap_frame_vaddr.data(), new_pc.data());
 }
 
@@ -436,9 +435,35 @@ impl ArchPCBInfo {
         *self = from.clone();
     }
 
-    /// Synchronize hardware-backed current-thread state before common fork code
-    /// clones `ArchPCBInfo`.
-    pub fn sync_current_state_before_fork(&mut self) {}
+    /// 公共 fork 路径克隆 ArchPCBInfo 前，先将当前硬件浮点状态同步到 PCB。
+    pub fn sync_current_state_before_fork(&mut self) {
+        let current = ProcessManager::current_pcb();
+        let frame = unsafe { ProcessManager::task_trapframe(&current) };
+        self.save_fp_state(frame);
+    }
+
+    /// 保存当前线程的浮点状态；调用者必须持有架构锁并关闭本地中断。
+    pub(super) fn save_fp_state(&mut self, frame: &mut TrapFrame) {
+        self.fp_state.save(frame);
+    }
+
+    /// 恢复当前线程的浮点状态；调用者必须持有架构锁并关闭本地中断。
+    pub(super) fn restore_fp_state(&mut self, frame: &mut TrapFrame) {
+        // 底层 restore 在 FS=Off 时跳过装载，先标记为可恢复，完成后转为 Clean。
+        frame
+            .status
+            .update_fs(riscv::register::sstatus::FS::Initial);
+        self.fp_state.restore(frame);
+    }
+
+    /// 获取 PCB 中的内核浮点格式；用户信号帧格式转换由信号模块负责。
+    pub(super) fn fp_state(&self) -> &FpDExtState {
+        &self.fp_state
+    }
+
+    pub(super) fn fp_state_mut(&mut self) -> &mut FpDExtState {
+        &mut self.fp_state
+    }
 
     pub fn set_stack(&mut self, stack: VirtAddr) {
         self.ksp = stack.data();
@@ -447,9 +472,9 @@ impl ArchPCBInfo {
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
-struct FpDExtState {
-    f: [u64; 32],
-    fcsr: u32,
+pub(super) struct FpDExtState {
+    pub(super) f: [u64; 32],
+    pub(super) fcsr: u32,
 }
 
 impl FpDExtState {

@@ -56,4 +56,5 @@ normal/proc_fd_permission
 normal/ext4_fallocate
 normal/mount_filecaps
 normal/stat_blocks
+normal/cgroup_cpuset
 fuse/stat_blocks

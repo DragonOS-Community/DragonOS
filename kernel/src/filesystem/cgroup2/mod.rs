@@ -22,7 +22,7 @@ mod mount;
 
 pub(super) const CGROUP2_MAX_NAMELEN: usize = 255;
 pub(super) const CGROUP2_BLOCK_SIZE: u64 = 512;
-pub(super) const AVAILABLE_CONTROLLERS: [&str; 3] = ["cpu", "memory", "pids"];
+pub(super) const AVAILABLE_CONTROLLERS: [&str; 4] = ["cpu", "cpuset", "memory", "pids"];
 pub(super) const DOMAIN_CONTROLLERS: [&str; 1] = ["memory"];
 
 pub fn cgroup2_init() -> Result<(), SystemError> {

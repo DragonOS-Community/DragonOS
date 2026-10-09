@@ -752,6 +752,21 @@ TEST(SchedSetScheduler, OtherTidAndNestedCloneReset) {
     ASSERT_EQ(0, pthread_join(worker, nullptr));
     EXPECT_EQ(0, state.result);
 
+    // Linux clears/wakes clear_child_tid before exit_notify detaches the PID.
+    // pthread_join therefore does not guarantee scheduler lookup already fails.
+    // Observe that boundary rather than racing the exiting thread on another CPU.
+    bool pid_detached = false;
+    for (int attempt = 0; attempt < 5000; ++attempt) {
+        RawSchedParam current {};
+        errno = 0;
+        if (RawGetParam(tid, &current) < 0) {
+            ASSERT_EQ(ESRCH, errno);
+            pid_detached = true;
+            break;
+        }
+        usleep(1000);
+    }
+    ASSERT_TRUE(pid_detached) << "joined thread's PID remained visible for 5 seconds";
     errno = 0;
     EXPECT_EQ(-1, RawSetScheduler(tid, SCHED_OTHER | SCHED_RESET_ON_FORK, &zero));
     EXPECT_EQ(ESRCH, errno);

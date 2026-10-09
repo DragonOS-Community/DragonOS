@@ -206,6 +206,8 @@ impl StatusFileOps {
                 .to_owned(),
         );
 
+        pdata.extend_from_slice(crate::cgroup::cpuset::status(&pcb).as_bytes());
+
         // 去除多余的 \0 并在结尾添加 \0
         trim_string(&mut pdata);
 

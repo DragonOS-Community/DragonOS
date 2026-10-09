@@ -39,6 +39,13 @@ use system_error::SystemError;
 
 pub const MAX_PID_NS_LEVEL: usize = 32;
 
+/// Pin both the destination and its original cgroupfs identity until final
+/// admission. A concurrently closed/reused fd must not redirect the clone.
+struct CloneCgroupTarget {
+    node: Arc<crate::cgroup::CgroupNode>,
+    file: Arc<File>,
+}
+
 bitflags! {
     /// 进程克隆标志
     pub struct CloneFlags: u64 {
@@ -899,17 +906,45 @@ impl ProcessManager {
             }
         }
 
+        // Serialize final membership/affinity inheritance with cpuset updates
+        // and thread-group migration, through ALL_PROCESS and cgroup publication.
+        let cpuset_guard = crate::cgroup::cpuset::lock();
+        if current_pcb.raw_pid() != RawPid(0) {
+            pcb.set_task_cgroup_node_for_fork(current_pcb.task_cgroup_node());
+            let parent_pi = current_pcb.sched_info().pi_lock_irqsave();
+            let mut child_pi = pcb.sched_info().pi_lock_irqsave();
+            child_pi.user_cpus_allowed = parent_pi.user_cpus_allowed.clone();
+            if !clone_args.kthread {
+                child_pi.set_cpus_allowed(parent_pi.cpus_allowed.clone());
+            }
+        }
         let reserved_cgroup = if pcb.raw_pid() > RawPid(0) {
+            if let Some(target) = clone_into_cgroup_target.as_ref() {
+                let src = pcb.task_cgroup_node();
+                let ns_root = current_pcb.nsproxy().cgroup_ns.root_cgroup().clone();
+                if !ns_root.is_ancestor_of(&target.node) || !ns_root.is_ancestor_of(&src) {
+                    return Err(SystemError::ENOENT);
+                }
+                if !Arc::ptr_eq(&src, &target.node)
+                    && clone_flags.contains(CloneFlags::CLONE_THREAD)
+                {
+                    return Err(SystemError::EINVAL);
+                }
+                target.file.with_io_fs(|fs| {
+                    cgroup2_check_attach_permissions(fs.root_inode(), &src, &target.node)
+                })?;
+            }
             let charge_node = clone_into_cgroup_target
                 .as_ref()
+                .map(|target| &target.node)
                 .unwrap_or(&pcb.task_cgroup_node())
                 .clone();
             let src_node = pcb.task_cgroup_node();
             let guard = cgroup_accounting_lock().lock();
             cgroup_can_fork_in(&charge_node, 1)?;
-            if let Some(target_node) = clone_into_cgroup_target {
-                cgroup_migrate_vet_dst_with_src(&src_node, &target_node, 1)?;
-                pcb.set_task_cgroup_node_for_fork(target_node);
+            if let Some(target) = clone_into_cgroup_target.as_ref() {
+                cgroup_migrate_vet_dst_with_src(&src_node, &target.node, 1)?;
+                pcb.set_task_cgroup_node_for_fork(target.node.clone());
             }
             let cgroup = pcb.task_cgroup_node();
             cgroup.charge_pids(1);
@@ -949,6 +984,9 @@ impl ProcessManager {
             pidfd_file = Some(prepared.file);
         }
 
+        if !clone_args.kthread {
+            crate::cgroup::cpuset::attach_locked(pcb);
+        }
         sched_cgroup_fork(pcb);
 
         // 处理 rseq 状态。按 Linux copy_process() 顺序，应在任务对外可见前完成。
@@ -1222,6 +1260,7 @@ impl ProcessManager {
             inc_visible_thread_count();
             account_successful_fork();
         }
+        drop(cpuset_guard);
 
         // 设置child_tid，意味着子线程能够知道自己的id。
         // 按 Linux schedule_tail 语义，在子任务首次运行时再 best-effort 写入。
@@ -1323,7 +1362,7 @@ impl ProcessManager {
 
     fn resolve_clone_into_cgroup_target(
         clone_args: &KernelCloneArgs,
-    ) -> Result<Option<Arc<crate::cgroup::CgroupNode>>, SystemError> {
+    ) -> Result<Option<CloneCgroupTarget>, SystemError> {
         if !clone_args.flags.contains(CloneFlags::CLONE_INTO_CGROUP) {
             return Ok(None);
         }
@@ -1357,16 +1396,13 @@ impl ProcessManager {
         if !ns_root.is_ancestor_of(&src) {
             return Err(SystemError::ENOENT);
         }
-        if Arc::ptr_eq(&src, &node) {
-            return Ok(None);
-        }
-        if clone_args.flags.contains(CloneFlags::CLONE_THREAD) {
+        if !Arc::ptr_eq(&src, &node) && clone_args.flags.contains(CloneFlags::CLONE_THREAD) {
             return Err(SystemError::EINVAL);
         }
         file.with_io_fs(|fs| cgroup2_check_attach_permissions(fs.root_inode(), &src, &node))?;
         cgroup_migrate_vet_dst_with_src(&src, &node, 1)?;
 
-        Ok(Some(node))
+        Ok(Some(CloneCgroupTarget { node, file }))
     }
 }
 

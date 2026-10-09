@@ -90,6 +90,8 @@ pub struct SchedInfo {
 pub struct PiProtected {
     pub cpus_allowed: CpuMask,
     pub nr_cpus_allowed: usize,
+    /// Original userspace affinity request, separate from cpuset placement.
+    pub(crate) user_cpus_allowed: Option<CpuMask>,
     sched_reset_on_fork: bool,
 }
 
@@ -99,6 +101,7 @@ impl PiProtected {
         Self {
             cpus_allowed,
             nr_cpus_allowed,
+            user_cpus_allowed: None,
             sched_reset_on_fork: false,
         }
     }

@@ -56,6 +56,7 @@ pub struct CgroupNode {
     tasks: RwLock<HashSet<RawPid>>,
     subtree_control: RwLock<HashSet<String>>,
     cpu: RwLock<CgroupCpuState>,
+    cpuset: RwLock<super::cpuset::CpusetState>,
     memory: RwLock<CgroupMemoryState>,
     freezer: RwLock<CgroupFreezerState>,
     pids_max: RwLock<Option<usize>>,
@@ -76,6 +77,7 @@ impl CgroupNode {
             tasks: RwLock::new(HashSet::new()),
             subtree_control: RwLock::new(HashSet::new()),
             cpu: RwLock::new(CgroupCpuState::default()),
+            cpuset: RwLock::new(super::cpuset::CpusetState::default()),
             memory: RwLock::new(CgroupMemoryState::default()),
             freezer: RwLock::new(CgroupFreezerState::default()),
             pids_max: RwLock::new(None),
@@ -96,6 +98,7 @@ impl CgroupNode {
             tasks: RwLock::new(HashSet::new()),
             subtree_control: RwLock::new(HashSet::new()),
             cpu: RwLock::new(CgroupCpuState::default()),
+            cpuset: RwLock::new(super::cpuset::CpusetState::default()),
             memory: RwLock::new(CgroupMemoryState::default()),
             freezer: RwLock::new(CgroupFreezerState::default()),
             pids_max: RwLock::new(None),
@@ -191,6 +194,47 @@ impl CgroupNode {
 
     pub fn cpu_state(&self) -> CgroupCpuState {
         *self.cpu.read()
+    }
+
+    /// Implicit thread roots can host internal competition for threaded
+    /// controllers. Explicit cgroup.type=threaded is not implemented yet.
+    pub(crate) fn is_thread_root(&self) -> bool {
+        self.has_tasks()
+            && self
+                .subtree_control()
+                .iter()
+                .any(|name| matches!(name.as_str(), "cpu" | "cpuset" | "pids"))
+    }
+
+    pub(crate) fn is_valid_domain(&self) -> bool {
+        let mut parent = self.parent();
+        while let Some(node) = parent {
+            if node.parent().is_some() && node.is_thread_root() {
+                return false;
+            }
+            parent = node.parent();
+        }
+        true
+    }
+
+    pub(crate) fn has_populated_domain_children(&self) -> bool {
+        self.children()
+            .iter()
+            .any(|child| child.subtree_task_count() != 0)
+    }
+
+    pub(crate) fn can_be_thread_root(&self) -> bool {
+        self.parent().is_none()
+            || (!self.has_populated_domain_children()
+                && !self.subtree_control().iter().any(|name| name == "memory"))
+    }
+
+    pub(crate) fn cpuset_state(&self) -> super::cpuset::CpusetState {
+        self.cpuset.read().clone()
+    }
+
+    pub(crate) fn set_cpuset_state(&self, state: super::cpuset::CpusetState) {
+        *self.cpuset.write() = state;
     }
 
     pub fn set_cpu_weight(&self, weight: u64) {
@@ -398,6 +442,7 @@ impl CgroupRoot {
         if name.is_empty() || name == "." || name == ".." || name.contains('/') {
             return Err(SystemError::EINVAL);
         }
+        let _cpuset_guard = super::cpuset::lock();
         let _structure_guard = self.structure_lock.lock();
         if !self.is_online(parent) {
             return Err(SystemError::ENOENT);
@@ -424,6 +469,7 @@ impl CgroupRoot {
         name: &str,
         expected: &Arc<CgroupNode>,
     ) -> Result<(), SystemError> {
+        let _cpuset_guard = super::cpuset::lock();
         let _structure_guard = self.structure_lock.lock();
         if !self.is_online(parent) {
             return Err(SystemError::ENOENT);
@@ -901,7 +947,10 @@ pub fn cgroup_migrate_vet_dst(dst: &Arc<CgroupNode>) -> Result<(), SystemError> 
     if !cgroup_root().is_online(dst) {
         return Err(SystemError::ENOENT);
     }
-    if dst.parent().is_some() && dst.subtree_control().iter().any(|ctrl| ctrl == "memory") {
+    if !dst.is_valid_domain() {
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+    }
+    if !dst.subtree_control().is_empty() && !dst.can_be_thread_root() {
         return Err(SystemError::EBUSY);
     }
     Ok(())

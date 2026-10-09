@@ -136,7 +136,7 @@ $(BIN_DIR)/normal/mount_idmap_test $(BIN_DIR)/normal/proc_fd_permission_test: su
 $(BIN_DIR)/fuse/stat_blocks_test: suites/fuse/fuse_gtest_common.h suites/fuse/fuse_test_simplefs_local.h
 
 $(BIN_DIR)/normal/forward_mtu_test: suites/normal/forward_mtu_nft_support.h
-$(BIN_DIR)/normal/endpoint_pmtu_test: suites/normal/rtnetlink_route_test_support.h
+$(BIN_DIR)/normal/endpoint_pmtu_test $(BIN_DIR)/normal/udp_source_route_test: suites/normal/rtnetlink_route_test_support.h
 
 run: build
 	@$(RUNNER_BIN) --bin-dir $(BIN_DIR) --results-dir $(RESULTS_DIR)

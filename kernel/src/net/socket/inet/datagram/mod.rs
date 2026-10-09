@@ -1218,7 +1218,7 @@ impl UdpSocket {
         let router = self.netns.router();
         let routes = crate::net::route::lock_output_routes(&router, self.netns.device_list());
         let route = routes
-            .lookup(destination, route.required_oif)
+            .lookup_with_source(destination, route.required_oif, Some(source))
             .ok_or(SystemError::ENETUNREACH)?;
         Ok(crate::net::route::pmtu::path_mtu(
             &self.netns,

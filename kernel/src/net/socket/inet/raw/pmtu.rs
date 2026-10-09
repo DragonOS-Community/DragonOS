@@ -288,7 +288,11 @@ impl RawSocket {
                 let routes =
                     crate::net::route::lock_output_routes(&router, self.netns.device_list());
                 routes
-                    .lookup(hint.actual.destination, required_oif)
+                    .lookup_with_source(
+                        hint.actual.destination,
+                        required_oif,
+                        Some(hint.actual.source),
+                    )
                     .ok_or(SystemError::ENETUNREACH)?
             };
             return Ok(crate::net::route::pmtu::path_mtu(

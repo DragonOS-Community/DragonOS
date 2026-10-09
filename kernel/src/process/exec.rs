@@ -648,8 +648,11 @@ fn de_thread(
             let leader_parent = leader.real_parent_pcb.read_irqsave().clone();
             *current.parent_pcb.write_irqsave() = leader_parent.clone();
             *current.real_parent_pcb.write_irqsave() = leader_parent.clone();
-            *current.wait_parent_pcb.write_irqsave() = leader_parent.clone();
-            *current.fork_parent_pcb.write_irqsave() = leader_parent;
+            // Keep the exact parent thread across the leader identity handoff.
+            *current.wait_parent_pcb.write_irqsave() =
+                leader.wait_parent_pcb.read_irqsave().clone();
+            *current.fork_parent_pcb.write_irqsave() =
+                leader.fork_parent_pcb.read_irqsave().clone();
         }
         drop(_relation_guard);
 

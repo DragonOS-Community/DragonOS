@@ -1283,6 +1283,50 @@ impl ProcessControlBlock {
         ptrace::tracees_of(&this)
     }
 
+    /// Enumerate a bounded slice of this thread's natural child processes.
+    ///
+    /// The per-group `children` lists are indexes, not thread ownership. The
+    /// thread-level natural parent is `fork_parent_pcb`, which also follows
+    /// reparent/de_thread and is independent of the ptrace wait relationship.
+    /// Pin PID objects while holding the same relationship lock used to publish
+    /// fork, reparent and release, so PID reuse cannot change an emitted ID.
+    pub(crate) fn child_pids_range(
+        self: &Arc<Self>,
+        skip: usize,
+        limit: usize,
+    ) -> Result<Vec<Arc<Pid>>, SystemError> {
+        let owners = ProcessManager::thread_group_tasks_snapshot(self.clone());
+        let mut result = Vec::new();
+        result.try_reserve(limit).map_err(|_| SystemError::ENOMEM)?;
+        let _relations = PTRACE_RELATION_LOCK.lock_irqsave();
+        let mut position = 0;
+        for owner in owners {
+            let ns = owner.active_pid_ns();
+            for nr in owner.children.read().iter().copied() {
+                let Some(child) = ProcessManager::find_task_by_pid_ns(nr, &ns) else {
+                    continue;
+                };
+                if !child
+                    .fork_parent_pcb()
+                    .is_some_and(|parent| Arc::ptr_eq(&parent, self))
+                {
+                    continue;
+                }
+                let Some(pid) = child.task_pid_ptr(PidType::PID) else {
+                    continue;
+                };
+                if position >= skip {
+                    if result.len() == limit {
+                        return Ok(result);
+                    }
+                    result.push(pid);
+                }
+                position += 1;
+            }
+        }
+        Ok(result)
+    }
+
     pub fn fork_parent_pcb(&self) -> Option<Arc<ProcessControlBlock>> {
         self.fork_parent_pcb.read_irqsave().upgrade()
     }

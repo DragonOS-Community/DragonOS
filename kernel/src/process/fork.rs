@@ -1036,8 +1036,10 @@ impl ProcessManager {
                 let inherited_real_parent = current_pcb.real_parent_pcb.read_irqsave().clone();
                 *pcb.parent_pcb.write_irqsave() = inherited_parent;
                 *pcb.real_parent_pcb.write_irqsave() = inherited_real_parent.clone();
-                *pcb.wait_parent_pcb.write_irqsave() = inherited_real_parent.clone();
-                *pcb.fork_parent_pcb.write_irqsave() = inherited_real_parent;
+                *pcb.wait_parent_pcb.write_irqsave() =
+                    current_pcb.wait_parent_pcb.read_irqsave().clone();
+                *pcb.fork_parent_pcb.write_irqsave() =
+                    current_pcb.fork_parent_pcb.read_irqsave().clone();
                 pcb.exit_signal.store(-1, Ordering::SeqCst);
 
                 let group_leader = thread_group_leader
@@ -1075,8 +1077,10 @@ impl ProcessManager {
                     let inherited_real_parent = current_pcb.real_parent_pcb.read_irqsave().clone();
                     *pcb.parent_pcb.write_irqsave() = inherited_parent;
                     *pcb.real_parent_pcb.write_irqsave() = inherited_real_parent.clone();
-                    *pcb.wait_parent_pcb.write_irqsave() = inherited_real_parent.clone();
-                    *pcb.fork_parent_pcb.write_irqsave() = inherited_real_parent;
+                    *pcb.wait_parent_pcb.write_irqsave() =
+                        current_pcb.wait_parent_pcb.read_irqsave().clone();
+                    *pcb.fork_parent_pcb.write_irqsave() =
+                        current_pcb.fork_parent_pcb.read_irqsave().clone();
                     pcb.exit_signal.store(
                         current_leader.exit_signal.load(Ordering::SeqCst),
                         Ordering::SeqCst,

@@ -198,7 +198,10 @@ impl super::TcpSocket {
     ) -> Result<usize, SystemError> {
         use crate::net::socket::PIPV6;
         if self.ip_version != smoltcp::wire::IpVersion::Ipv6 {
-            return Err(SystemError::ENOPROTOOPT);
+            // IPv4 TCP delegates non-TCP getsockopt levels to ip_getsockopt,
+            // which rejects non-SOL_IP levels with EOPNOTSUPP (Linux 6.6).
+            // setsockopt deliberately retains its distinct ENOPROTOOPT errno.
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
         }
         match name {
             name if name == PIPV6::V6ONLY as usize => self.get_ipv6_only(value),

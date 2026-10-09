@@ -269,8 +269,13 @@ TEST(TcpDualStack, Ipv4RejectsIpv6OnlyOption) {
     socklen_t len = sizeof(value);
     EXPECT_EQ(setsockopt(v4.Get(), IPPROTO_IPV6, IPV6_V6ONLY, &value, len), -1);
     EXPECT_EQ(errno, ENOPROTOOPT);
-    EXPECT_EQ(getsockopt(v4.Get(), IPPROTO_IPV6, IPV6_V6ONLY, &value, &len), -1);
-    EXPECT_EQ(errno, EOPNOTSUPP);
+    // Linux rejects the IPv6 level before decoding the option on IPv4 TCP.
+    // PMTU option dispatch must not change the existing V6ONLY errno.
+    for (int option : {IPV6_V6ONLY, IPV6_MTU_DISCOVER, IPV6_MTU}) {
+        len = sizeof(value);
+        EXPECT_EQ(getsockopt(v4.Get(), IPPROTO_IPV6, option, &value, &len), -1);
+        EXPECT_EQ(errno, EOPNOTSUPP) << "option=" << option;
+    }
 }
 
 TEST(TcpDualStack, MappedBindSharesIpv4DomainAndPreservesSockaddr) {

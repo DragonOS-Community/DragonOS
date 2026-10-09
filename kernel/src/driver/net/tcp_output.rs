@@ -290,7 +290,13 @@ impl SmolDevice for TcpOutputDevice<'_> {
         remote: smoltcp::wire::IpEndpoint,
         meta: PacketMeta,
     ) -> usize {
-        self.policy.outbound_tcp_mtu(local, remote, meta)
+        // Route MTU (notably lo's 65536) may exceed this transport device's
+        // representable IP packet size. PMTU selects a smaller path limit;
+        // it must never bypass the device capability and emit an oversized
+        // IPv4 packet that dispatch_ip rejects before admission.
+        self.policy
+            .outbound_tcp_mtu(local, remote, meta)
+            .min(self.capabilities().max_transmission_unit)
     }
 
     fn outbound_tcp_mtu_generation(&self) -> u64 {

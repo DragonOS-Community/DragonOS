@@ -274,9 +274,10 @@ public:
         }
         return {};
     }
-    int InjectError(const std::vector<uint8_t>& original, bool bad_checksum = false) {
+    int InjectError(const std::vector<uint8_t>& original, bool bad_checksum = false,
+                    size_t quote_limit = 256) {
         const size_t header = family_ == AF_INET ? 20 : 40;
-        const size_t quote = std::min<size_t>(original.size(), 256);
+        const size_t quote = std::min(original.size(), quote_limit);
         std::vector<uint8_t> bytes(header + 8 + quote, 0);
         memcpy(bytes.data() + header + 8, original.data(), quote);
         uint8_t* icmp = bytes.data() + header;
@@ -542,6 +543,14 @@ void MalformedFeedbackScenario(int family) {
     const auto original = path.Capture(IPPROTO_UDP);
     const size_t header = family == AF_INET ? 20 : 40;
     ASSERT_GT(original.size(), header + 8);
+    // The outer ICMP header/checksum is valid even when its quoted packet
+    // is absent or incomplete. Such feedback must not update socket state.
+    for (size_t length : {size_t{0}, size_t{1}, header - 1, header, header + 7}) {
+        ASSERT_EQ(path.InjectError(original, false, length), 0);
+    }
+    auto wrong_version = original;
+    wrong_version[0] = family == AF_INET ? 0x65 : 0x45;
+    ASSERT_EQ(path.InjectError(wrong_version), 0);
     auto short_quote = original;
     short_quote.resize(header + 7);
     ASSERT_EQ(path.InjectError(short_quote), 0);

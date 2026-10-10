@@ -1,0 +1,11 @@
+# Extraction/metadata for signal_install_lat (KEY=VALUE; parsed by run.sh)
+CATEGORY=signal
+BINARY=lat_sig
+METRIC_TYPE=latency
+UNIT=microseconds
+BIGGER_IS_BETTER=0
+# lat_sig install prints "Signal handler installation: <N> microseconds".
+SEARCH_PATTERN=Signal handler installation
+RESULT_INDEX=NF-1
+NTH_OCCURRENCE=1
+DESCRIPTION=Signal handler installation latency via lat_sig install

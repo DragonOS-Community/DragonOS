@@ -1,0 +1,12 @@
+# Extraction/metadata for unix_bw (KEY=VALUE; parsed by run.sh)
+CATEGORY=ipc
+BINARY=bw_unix
+METRIC_TYPE=bandwidth
+UNIT=MB/s
+BIGGER_IS_BETTER=1
+# bw_unix prints "AF_UNIX sock stream bandwidth: <N> MB/sec" (prefix confirmed via
+# strings; bw_unix hung on host, to be confirmed in guest).
+SEARCH_PATTERN=AF_UNIX sock stream bandwidth
+RESULT_INDEX=NF-1
+NTH_OCCURRENCE=1
+DESCRIPTION=AF_UNIX socket bandwidth via bw_unix

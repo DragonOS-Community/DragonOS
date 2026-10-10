@@ -18,7 +18,7 @@ let
 
   baseConfig = {
     nographic = true;
-    memory = "512M";
+    memory = "2G";
     cores = "2";
     shmId = "dragonos-qemu-shm.ram";
   };
@@ -123,7 +123,7 @@ let
 
       kernelPath = if arch == "x86_64" then kernel else "${riscv-uboot}/u-boot.bin";
 
-      diskArgs =
+      diskDeviceArgs =
         if arch == "x86_64" then
           [
             "-device"
@@ -132,15 +132,11 @@ let
             "pci-bridge,chassis_nr=1,id=pci.1"
             "-device"
             "pcie-root-port"
-            "-drive"
-            "id=disk,file=${diskPath},if=none"
           ]
         else
           [
             "-device"
             "virtio-blk-device,drive=disk"
-            "-drive"
-            "id=disk,file=${diskPath},if=none"
           ];
 
       # Generate bash code for dynamic parts
@@ -171,6 +167,12 @@ let
       #!${pkgs.runtimeShell}
 
       if [ ! -d "bin" ]; then echo "Error: Please run from project root (bin/ missing)."; exit 1; fi
+
+      # Match tools/run-qemu.sh: guest writes are temporary only when enabled.
+      case "''${DRAGONOS_QEMU_SNAPSHOT:-0}" in
+        0|1) ;;
+        *) echo "Error: DRAGONOS_QEMU_SNAPSHOT must be 0 or 1"; exit 1 ;;
+      esac
 
       if [ "${preferSystemQemuStr}" = "true" ]; then
         if ! command -v "${qemuBin}" >/dev/null 2>&1; then
@@ -375,7 +377,11 @@ let
 
       BOOT_ARGS=( "-kernel" "${kernelPath}" "-append" "$FINAL_CMDLINE" )
 
-      DISK_ARGS=( ${lib.escapeShellArgs diskArgs} )
+      QEMU_DRIVE=${lib.escapeShellArg "id=disk,file=${diskPath},if=none"}
+      if [ "''${DRAGONOS_QEMU_SNAPSHOT:-0}" = "1" ]; then
+        QEMU_DRIVE+=",snapshot=on"
+      fi
+      DISK_ARGS=( ${lib.escapeShellArgs diskDeviceArgs} "-drive" "$QEMU_DRIVE" )
 
       # 动态网络配置（使用动态分配的端口）
       NET_ARGS=( "-netdev" "user,id=hostnet0,hostfwd=tcp::$HOST_PORT-:12580" "-device" "virtio-net-pci,vectors=5,netdev=hostnet0,id=net0" )

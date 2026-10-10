@@ -62,6 +62,8 @@ let
       installDir = testOpt.dunitest.testDir;
     }
   );
+
+  lmbench-benchmark-tests = (pkgs.callPackage ./tests/benchmark/lmbench { });
 in
 [
 	  (static.busybox.override {
@@ -84,6 +86,8 @@ in
 ++ lib.optionals (target == "x86_64" && testOpt.syscall.enable) [
   # gvisor test case only included on x86_64
   gvisor-syscall-tests
+  # TODO(lmbench): move under a dedicated testOpt.benchmark.enable toggle (Phase 3)
+  lmbench-benchmark-tests
   # TODO: Add debian libcxx deps or FHS
 ]
 ++ lib.optionals (target == "x86_64" && testOpt.dunitest.enable) [

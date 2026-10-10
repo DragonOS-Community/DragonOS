@@ -1,0 +1,11 @@
+# Extraction/metadata for vfs_stat_lat (KEY=VALUE; parsed by run.sh)
+CATEGORY=vfs
+BINARY=lat_syscall
+METRIC_TYPE=latency
+UNIT=microseconds
+BIGGER_IS_BETTER=0
+# lat_syscall stat prints "Simple stat: <N> microseconds".
+SEARCH_PATTERN=Simple stat
+RESULT_INDEX=NF-1
+NTH_OCCURRENCE=1
+DESCRIPTION=stat syscall latency via lat_syscall stat

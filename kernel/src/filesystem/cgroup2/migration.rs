@@ -4,9 +4,7 @@ use system_error::SystemError;
 
 use super::CgroupOpenState;
 use crate::{
-    cgroup::{
-        self, cgroup_accounting_lock, cgroup_migrate_vet_dst, cgroup_root, cpuset, CgroupNode,
-    },
+    cgroup::{cgroup_accounting_lock, cgroup_migrate_vet_dst, cgroup_root, cpuset, CgroupNode},
     process::{ProcessFlags, ProcessManager, RawPid},
 };
 
@@ -40,17 +38,14 @@ fn parse_pid(buf: &[u8]) -> Result<usize, SystemError> {
     Ok(pid as usize)
 }
 
-pub(super) fn write(
+/// Caller holds the update lock and has validated target file liveness.
+pub(super) fn write_locked(
     dst: &Arc<CgroupNode>,
     buf: &[u8],
     group: bool,
     open: &CgroupOpenState,
 ) -> Result<usize, SystemError> {
     let pid = parse_pid(buf)?;
-    let _update = cgroup::lock();
-    if !cgroup_root().is_online(dst) {
-        return Err(SystemError::ENODEV);
-    }
     let current = ProcessManager::current_pcb();
     let selected = if pid == 0 {
         current

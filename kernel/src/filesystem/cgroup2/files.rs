@@ -410,15 +410,14 @@ pub(super) fn read_file(
     })
 }
 
-/// Caller holds the cgroup update lock through admission and mutation.
+/// Caller validates file liveness and holds the cgroup update lock through
+/// delegation admission and mutation.
 pub(super) fn write_controller_file_locked(
     cgroup: &Arc<CgroupNode>,
     ty: CgroupCoreFile,
     generation: u64,
-    file_generation: u64,
     input: &[u8],
 ) -> Result<Vec<u8>, SystemError> {
-    check_live_file(cgroup, ty, file_generation)?;
     let input = core::str::from_utf8(input).map_err(|_| SystemError::EINVAL)?;
     if let CgroupCoreFile::Cpuset(file) = ty {
         cpuset::write_locked(cgroup, generation, file, input)?;
@@ -510,7 +509,7 @@ pub(super) fn write_controller_file_locked(
     }
 }
 
-fn check_live_file(
+pub(super) fn check_live_file(
     cgroup: &Arc<CgroupNode>,
     ty: CgroupCoreFile,
     generation: u64,

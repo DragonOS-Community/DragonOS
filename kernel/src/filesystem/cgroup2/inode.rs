@@ -462,6 +462,10 @@ impl Cgroup2Inode {
         if buf.is_empty() {
             return Ok(0);
         }
+        // One admission transaction for all nonempty writes. Like kernfs's
+        // active reference, liveness precedes authorization and parsing.
+        let _update = crate::cgroup::lock();
+        files::check_live_file(&cgroup, ty, file_generation)?;
         if offset != 0
             && matches!(
                 ty,
@@ -473,13 +477,14 @@ impl Cgroup2Inode {
 
         match ty {
             CgroupCoreFile::Procs | CgroupCoreFile::Threads => {
-                super::migration::write(&cgroup, buf, ty == CgroupCoreFile::Procs, open)
+                super::migration::write_locked(&cgroup, buf, ty == CgroupCoreFile::Procs, open)
             }
-            CgroupCoreFile::SubtreeControl => Self::write_subtree_control(this, &cgroup, buf),
+            CgroupCoreFile::SubtreeControl => {
+                Self::write_subtree_control_locked(this, &cgroup, buf)
+            }
             _ => {
-                // Serialize delegation admission with the controller update
-                // and init-namespace remounts which change hierarchy policy.
-                let _update = crate::cgroup::lock();
+                // Delegation admission shares the update transaction with
+                // init-namespace remounts which change hierarchy policy.
                 if cgroup_root().nsdelegate()
                     && !Arc::ptr_eq(
                         &open.namespace,
@@ -492,20 +497,15 @@ impl Cgroup2Inode {
                 if offset != 0 {
                     return Err(SystemError::EINVAL);
                 }
-                let new_data = files::write_controller_file_locked(
-                    &cgroup,
-                    ty,
-                    generation,
-                    file_generation,
-                    buf,
-                )?;
+                let new_data = files::write_controller_file_locked(&cgroup, ty, generation, buf)?;
                 Self::replace_file_data(this, &new_data)?;
                 Ok(buf.len())
             }
         }
     }
 
-    fn write_subtree_control(
+    /// Caller holds the update lock and has validated file liveness.
+    fn write_subtree_control_locked(
         this: &Arc<Cgroup2Inode>,
         cgroup: &Arc<CgroupNode>,
         buf: &[u8],
@@ -519,7 +519,6 @@ impl Cgroup2Inode {
             .parent
             .upgrade()
             .ok_or(SystemError::ENOENT)?;
-        let _cpuset_guard = cpuset::lock();
         let was_enabled = cgroup.subtree_control().iter().any(|name| name == "cpuset");
         // The only fallible process snapshot is prepared before committing the
         // controller mask. Allocation failure cannot leave a partial update.
@@ -533,9 +532,6 @@ impl Cgroup2Inode {
         };
         let new_data = {
             let _cgroup_guard = cgroup_accounting_lock().lock();
-            if !cgroup_root().is_online(cgroup) {
-                return Err(SystemError::ENODEV);
-            }
             files::apply_subtree_control(cgroup, input)?
         };
         let is_enabled = cgroup.subtree_control().iter().any(|name| name == "cpuset");

@@ -572,8 +572,18 @@ TEST_F(ThreadedCgroup, RemovedNodeOldFileCannotBeRevived) {
   ASSERT_GE(fd, 0);
   int type_fd = open((a_ + "/cgroup.type").c_str(), O_RDWR | O_CLOEXEC);
   ASSERT_GE(type_fd, 0);
+  int procs_fd = open((a_ + "/cgroup.procs").c_str(), O_WRONLY | O_CLOEXEC);
+  ASSERT_GE(procs_fd, 0);
+  int subtree_fd = open((a_ + "/cgroup.subtree_control").c_str(), O_WRONLY | O_CLOEXEC);
+  ASSERT_GE(subtree_fd, 0);
   ASSERT_EQ(0, rmdir(a_.c_str()));
   EXPECT_EQ(ENODEV, WriteFd(fd, "0"));
+  for (int stale : {fd, procs_fd, subtree_fd}) {
+    EXPECT_EQ(ENODEV, WriteFd(stale, "invalid"));
+    EXPECT_EQ(ENODEV, WriteFd(stale, std::string(1, '\xff')));
+    EXPECT_EQ(-1, pwrite(stale, "0", 1, 1));
+    EXPECT_EQ(ENODEV, errno);
+  }
   EXPECT_EQ(ENODEV, WriteFd(type_fd, "threaded"));
   EXPECT_EQ(ENODEV, WriteFd(type_fd, "invalid"));
   EXPECT_EQ(ENODEV, WriteFd(type_fd, std::string(1, '\xff')));
@@ -585,6 +595,8 @@ TEST_F(ThreadedCgroup, RemovedNodeOldFileCannotBeRevived) {
   EXPECT_EQ(0, fchmod(type_fd, 0600));
   EXPECT_EQ(0, fchown(type_fd, 65534, 65534));
   close(fd);
+  close(procs_fd);
+  close(subtree_fd);
   ASSERT_EQ(0, mkdir(a_.c_str(), 0755));
   EXPECT_EQ("domain invalid", Read(a_ + "/cgroup.type"));
   struct stat st{};
@@ -850,11 +862,16 @@ TEST_F(ThreadedCgroup, NsdelegateRootWriteProtectionUsesOpenerNamespace) {
           Write(mirror + "/cgroup.threads", "0")) _exit(7);
       if (WriteFd(initial_fd, "max 100000")) _exit(8);
       close(initial_fd);
-      int restricted_fd = open((mirror + "/cpu.max").c_str(), O_WRONLY | O_CLOEXEC);
-      if (restricted_fd < 0 || WriteFd(restricted_fd, "") || !PassFd(pair[1], restricted_fd)) _exit(9);
+      int restricted_fd = open((mirror + "/cpu.max").c_str(), O_RDWR | O_CLOEXEC);
+      int type_fd = open((mirror + "/cgroup.type").c_str(), O_RDWR | O_CLOEXEC);
+      pid_t identity = getpid();
+      if (restricted_fd < 0 || type_fd < 0 || WriteFd(restricted_fd, "") ||
+          !PassFd(pair[1], restricted_fd) || !PassFd(pair[1], type_fd) ||
+          !Transfer(pair[1], &identity, sizeof(identity), true)) _exit(9);
       char done;
       bool ok = Transfer(pair[1], &done, 1, false);
       close(restricted_fd);
+      close(type_fd);
       _exit(ok ? 0 : 10);
     }
     close(initial_fd);
@@ -888,6 +905,11 @@ TEST_F(ThreadedCgroup, NsdelegateRootWriteProtectionUsesOpenerNamespace) {
   int restricted_fd = ReceiveFd(pair[0]);
   EXPECT_GE(restricted_fd, 0);
   if (restricted_fd >= 0) {
+    int type_fd = ReceiveFd(pair[0]);
+    EXPECT_GE(type_fd, 0);
+    pid_t identity = -1;
+    bool identified = Transfer(pair[0], &identity, sizeof(identity), false);
+    EXPECT_TRUE(identified);
     EXPECT_EQ(EPERM, WriteFd(restricted_fd, "max 100000"));
     EXPECT_EQ(0, WriteFd(restricted_fd, ""));
     // The opener namespace stays pinned, but hierarchy policy is evaluated
@@ -900,6 +922,31 @@ TEST_F(ThreadedCgroup, NsdelegateRootWriteProtectionUsesOpenerNamespace) {
       EXPECT_EQ(0, lseek(restricted_fd, 0, SEEK_SET));
       EXPECT_EQ(EPERM, WriteFd(restricted_fd, "max 100000"));
     }
+    // Initial-namespace administration can empty and remove the pinned
+    // namespace root. Inactive I/O precedes namespace-root write denial.
+    if (identified && identity > 0 && type_fd >= 0) {
+      int moved = Write(parent_ + "/cgroup.procs", std::to_string(identity));
+      EXPECT_EQ(0, moved);
+      if (moved == 0) {
+        int removed = rmdir(root_.c_str());
+        EXPECT_EQ(0, removed);
+        if (removed == 0) {
+          for (int fd : {restricted_fd, type_fd}) {
+            EXPECT_EQ(ENODEV, WriteFd(fd, "0"));
+            EXPECT_EQ(ENODEV, WriteFd(fd, std::string(1, '\xff')));
+            char byte;
+            EXPECT_EQ(-1, read(fd, &byte, sizeof(byte)));
+            EXPECT_EQ(ENODEV, errno);
+          }
+          // Restore the path for the helper's later namespace request;
+          // the old fds must never refer to this replacement node.
+          EXPECT_EQ(0, mkdir(root_.c_str(), 0755));
+          EXPECT_EQ(ENODEV, WriteFd(restricted_fd, "max 100000"));
+          EXPECT_EQ(ENODEV, WriteFd(type_fd, "threaded"));
+        }
+      }
+    }
+    if (type_fd >= 0) close(type_fd);
     close(restricted_fd);
   }
   char done = 'D';

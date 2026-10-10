@@ -62,6 +62,13 @@ let
       installDir = testOpt.dunitest.testDir;
     }
   );
+
+  bwrap-tests = (
+    pkgs.callPackage ./tests/bwrap {
+      installDir = testOpt.bwrap.testDir;
+      version = testOpt.bwrap.version;
+    }
+  );
 in
 [
 	  (static.busybox.override {
@@ -88,4 +95,7 @@ in
 ]
 ++ lib.optionals (target == "x86_64" && testOpt.dunitest.enable) [
   dunitest
+]
+++ lib.optionals (target == "x86_64" && testOpt.bwrap.enable) [
+  bwrap-tests
 ]

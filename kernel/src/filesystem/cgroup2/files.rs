@@ -26,8 +26,12 @@ pub(super) enum CgroupCoreFile {
     Type,
     Freeze,
     CpuStat,
+    CpuStatLocal,
     CpuWeight,
+    CpuWeightNice,
+    CpuIdle,
     CpuMax,
+    CpuMaxBurst,
     Cpuset(CpusetFile),
     MemoryCurrent,
     MemoryPeak,
@@ -71,7 +75,7 @@ impl CgroupFileSpec {
     }
 }
 
-const BASE_FILE_SPECS: [CgroupFileSpec; 5] = [
+const BASE_FILE_SPECS: [CgroupFileSpec; 6] = [
     CgroupFileSpec {
         name: "cgroup.procs",
         ty: CgroupCoreFile::Procs,
@@ -107,6 +111,13 @@ const BASE_FILE_SPECS: [CgroupFileSpec; 5] = [
         mode: 0o444,
         visibility: CgroupFileVisibility::All,
     },
+    CgroupFileSpec {
+        name: "cpu.stat.local",
+        ty: CgroupCoreFile::CpuStatLocal,
+        init: b"",
+        mode: 0o444,
+        visibility: CgroupFileVisibility::All,
+    },
 ];
 
 const NON_ROOT_CORE_FILE_SPECS: [CgroupFileSpec; 3] = [
@@ -133,7 +144,7 @@ const NON_ROOT_CORE_FILE_SPECS: [CgroupFileSpec; 3] = [
     },
 ];
 
-const CPU_FILE_SPECS: [CgroupFileSpec; 2] = [
+const CPU_FILE_SPECS: [CgroupFileSpec; 5] = [
     CgroupFileSpec {
         name: "cpu.weight",
         ty: CgroupCoreFile::CpuWeight,
@@ -145,6 +156,27 @@ const CPU_FILE_SPECS: [CgroupFileSpec; 2] = [
         name: "cpu.max",
         ty: CgroupCoreFile::CpuMax,
         init: b"max 100000\n",
+        mode: 0o644,
+        visibility: CgroupFileVisibility::NotOnRoot,
+    },
+    CgroupFileSpec {
+        name: "cpu.weight.nice",
+        ty: CgroupCoreFile::CpuWeightNice,
+        init: b"0\n",
+        mode: 0o644,
+        visibility: CgroupFileVisibility::NotOnRoot,
+    },
+    CgroupFileSpec {
+        name: "cpu.idle",
+        ty: CgroupCoreFile::CpuIdle,
+        init: b"0\n",
+        mode: 0o644,
+        visibility: CgroupFileVisibility::NotOnRoot,
+    },
+    CgroupFileSpec {
+        name: "cpu.max.burst",
+        ty: CgroupCoreFile::CpuMaxBurst,
+        init: b"0\n",
         mode: 0o644,
         visibility: CgroupFileVisibility::NotOnRoot,
     },
@@ -387,8 +419,14 @@ pub(super) fn read_file(
         CgroupCoreFile::Freeze => {
             format!("{}\n", if cgroup.freeze_requested() { 1 } else { 0 }).into_bytes()
         }
-        CgroupCoreFile::CpuStat => cpu_stat(),
+        CgroupCoreFile::CpuStat => cpu_stat(cgroup),
+        CgroupCoreFile::CpuStatLocal => cpu_stat_local(cgroup),
         CgroupCoreFile::CpuWeight => format!("{}\n", cgroup.cpu_state().weight()).into_bytes(),
+        CgroupCoreFile::CpuWeightNice => format!("{}\n", cgroup.cpu_state().nice()).into_bytes(),
+        CgroupCoreFile::CpuIdle => {
+            format!("{}\n", u8::from(cgroup.cpu_state().idle())).into_bytes()
+        }
+        CgroupCoreFile::CpuMaxBurst => format!("{}\n", cgroup.cpu_state().burst()).into_bytes(),
         CgroupCoreFile::CpuMax => {
             let (quota, period) = cgroup.cpu_state().max();
             encode_cpu_max(quota, period)
@@ -452,20 +490,33 @@ pub(super) fn write_controller_file_locked(
             Ok(format!("{}\n", value).into_bytes())
         }
         CgroupCoreFile::CpuWeight => {
-            let weight = input
-                .trim()
-                .parse::<u64>()
-                .map_err(|_| SystemError::EINVAL)?;
-            if !(1..=10_000).contains(&weight) {
-                return Err(SystemError::ERANGE);
-            }
-            cgroup.set_cpu_weight(weight);
-            Ok(format!("{}\n", weight).into_bytes())
+            let weight = parse_cpu_unsigned(input)?;
+            crate::cgroup::cpu::set_weight_locked(cgroup, weight)?;
+            Ok(format!("{}\n", cgroup.cpu_state().weight()).into_bytes())
+        }
+        CgroupCoreFile::CpuWeightNice => {
+            let nice = parse_cpu_signed(input)?;
+            crate::cgroup::cpu::set_nice_locked(cgroup, nice)?;
+            Ok(format!("{}\n", cgroup.cpu_state().nice()).into_bytes())
+        }
+        CgroupCoreFile::CpuIdle => {
+            let idle = parse_cpu_signed(input)?;
+            crate::cgroup::cpu::set_idle_locked(cgroup, idle)?;
+            Ok(format!("{}\n", idle).into_bytes())
+        }
+        CgroupCoreFile::CpuMaxBurst => {
+            let burst = parse_cpu_unsigned(input)?;
+            let mut state = cgroup.cpu_state();
+            state.set_burst(burst);
+            crate::cgroup::cpu::set_bandwidth_locked(cgroup, state)?;
+            Ok(format!("{}\n", burst).into_bytes())
         }
         CgroupCoreFile::CpuMax => {
             let (_, current_period) = cgroup.cpu_state().max();
             let (quota, period) = parse_cpu_max(input, current_period)?;
-            cgroup.set_cpu_max(quota, period);
+            let mut state = cgroup.cpu_state();
+            state.set_max(quota, period);
+            crate::cgroup::cpu::set_bandwidth_locked(cgroup, state)?;
             Ok(encode_cpu_max(quota, period))
         }
         CgroupCoreFile::MemoryMin
@@ -494,6 +545,7 @@ pub(super) fn write_controller_file_locked(
         CgroupCoreFile::Controllers
         | CgroupCoreFile::Events
         | CgroupCoreFile::CpuStat
+        | CgroupCoreFile::CpuStatLocal
         | CgroupCoreFile::MemoryCurrent
         | CgroupCoreFile::MemoryPeak
         | CgroupCoreFile::MemoryEvents
@@ -731,6 +783,49 @@ fn encode_cpu_max(quota: Option<u64>, period_us: u64) -> Vec<u8> {
     }
 }
 
+/// Scalar cftypes use Linux kstrtoull/kstrtoll(base=0), unlike cpu.max's
+/// decimal two-field parser. Keep overflow distinct from malformed input.
+fn parse_cpu_unsigned(input: &str) -> Result<u64, SystemError> {
+    let input = input.trim().strip_prefix('+').unwrap_or(input.trim());
+    let (digits, radix) = if let Some(hex) = input
+        .strip_prefix("0x")
+        .or_else(|| input.strip_prefix("0X"))
+    {
+        (hex, 16)
+    } else if input.len() > 1 && input.starts_with('0') {
+        (&input[1..], 8)
+    } else {
+        (input, 10)
+    };
+    if digits.starts_with('+') || digits.starts_with('-') {
+        return Err(SystemError::EINVAL);
+    }
+    u64::from_str_radix(digits, radix).map_err(|error| match error.kind() {
+        core::num::IntErrorKind::PosOverflow | core::num::IntErrorKind::NegOverflow => {
+            SystemError::ERANGE
+        }
+        _ => SystemError::EINVAL,
+    })
+}
+
+fn parse_cpu_signed(input: &str) -> Result<i64, SystemError> {
+    let input = input.trim();
+    let negative = input.starts_with('-');
+    let digits = input.strip_prefix('-').unwrap_or(input);
+    if negative && (digits.starts_with('+') || digits.starts_with('-')) {
+        return Err(SystemError::EINVAL);
+    }
+    let magnitude = parse_cpu_unsigned(digits)?;
+    if negative {
+        if magnitude > i64::MAX as u64 + 1 {
+            return Err(SystemError::ERANGE);
+        }
+        Ok((0u64.wrapping_sub(magnitude)) as i64)
+    } else {
+        i64::try_from(magnitude).map_err(|_| SystemError::ERANGE)
+    }
+}
+
 fn parse_cpu_max(input: &str, current_period_us: u64) -> Result<(Option<u64>, u64), SystemError> {
     let mut parts = input.split_whitespace();
     let quota_raw = parts.next().ok_or(SystemError::EINVAL)?;
@@ -749,11 +844,45 @@ fn parse_cpu_max(input: &str, current_period_us: u64) -> Result<(Option<u64>, u6
     Ok((quota, period))
 }
 
-fn cpu_stat() -> Vec<u8> {
-    // P1 exposes Linux-compatible cgroup v2 files, but CPU accounting
-    // and bandwidth enforcement are not wired to the scheduler yet.
-    b"usage_usec 0\nuser_usec 0\nsystem_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\n"
-        .to_vec()
+fn cpu_stat(cgroup: &Arc<CgroupNode>) -> Vec<u8> {
+    let time = cgroup.cpu_accounting().snapshot();
+    let mut output = format!(
+        "usage_usec {}\nuser_usec {}\nsystem_usec {}\n",
+        time.usage_ns / 1_000,
+        time.user_ns / 1_000,
+        time.system_ns / 1_000,
+    );
+    if let Some(group) = cgroup.cpu_group() {
+        let stat = group.bandwidth_snapshot();
+        output.push_str(&format!(
+            "nr_periods {}\nnr_throttled {}\nthrottled_usec {}\nnr_bursts {}\nburst_usec {}\n",
+            stat.nr_periods,
+            stat.nr_throttled,
+            stat.throttled_ns / 1_000,
+            stat.nr_bursts,
+            stat.burst_ns / 1_000,
+        ));
+    } else if cgroup.parent().is_none() {
+        // The implicit root CPU css has no bandwidth limiter by definition.
+        output.push_str(
+            "nr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n",
+        );
+    }
+    output.into_bytes()
+}
+
+fn cpu_stat_local(cgroup: &Arc<CgroupNode>) -> Vec<u8> {
+    if let Some(group) = cgroup.cpu_group() {
+        format!(
+            "throttled_usec {}\n",
+            group.bandwidth_snapshot().local_throttled_ns / 1_000
+        )
+        .into_bytes()
+    } else if cgroup.parent().is_none() {
+        b"throttled_usec 0\n".to_vec()
+    } else {
+        Vec::new()
+    }
 }
 
 fn memory_events() -> Vec<u8> {
@@ -773,4 +902,28 @@ fn memory_swap_events() -> Vec<u8> {
 
 fn is_populated(cgroup: &Arc<CgroupNode>) -> bool {
     cgroup.has_tasks() || cgroup.subtree_task_counter().load(Ordering::Acquire) > 0
+}
+
+#[cfg(test)]
+mod cpu_parse_tests {
+    use super::*;
+
+    #[test]
+    fn scalar_base_zero_and_overflow_errno() {
+        assert_eq!(parse_cpu_unsigned("+0x64\n"), Ok(100));
+        assert_eq!(parse_cpu_unsigned("0144"), Ok(100));
+        assert_eq!(parse_cpu_unsigned("-1"), Err(SystemError::EINVAL));
+        assert_eq!(parse_cpu_unsigned("09"), Err(SystemError::EINVAL));
+        assert_eq!(
+            parse_cpu_unsigned("18446744073709551616"),
+            Err(SystemError::ERANGE)
+        );
+        assert_eq!(parse_cpu_signed("-0x14"), Ok(-20));
+        assert_eq!(parse_cpu_signed("-+1"), Err(SystemError::EINVAL));
+        assert_eq!(parse_cpu_signed("-9223372036854775808"), Ok(i64::MIN));
+        assert_eq!(
+            parse_cpu_signed("9223372036854775808"),
+            Err(SystemError::ERANGE)
+        );
+    }
 }

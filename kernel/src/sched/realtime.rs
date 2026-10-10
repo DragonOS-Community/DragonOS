@@ -66,14 +66,15 @@ impl RealtimeRunQueue {
     ///
     /// This order preserves runtime debt when a non-preemptible kernel path
     /// crosses one or more period boundaries before reaching the scheduler.
-    fn update_current(&mut self, clock_task: u64, clock: u64) {
+    fn update_current(&mut self, clock_task: u64, clock: u64) -> u64 {
+        let mut delta = 0;
         if let Some(exec_start) = self.exec_start {
-            self.runtime_used = self
-                .runtime_used
-                .saturating_add(clock_task.saturating_sub(exec_start));
+            delta = clock_task.saturating_sub(exec_start);
+            self.runtime_used = self.runtime_used.saturating_add(delta);
             self.exec_start = Some(clock_task);
         }
         self.update_period(clock);
+        delta
     }
 
     fn update_period(&mut self, clock: u64) {
@@ -291,7 +292,10 @@ impl RealtimeScheduler {
     pub fn update_bandwidth(rq: &mut CpuRunQueue, current_class: SchedClass) {
         let was_throttled = rq.rt.is_throttled();
         if current_class == SchedClass::Realtime {
-            rq.rt.update_current(rq.clock_task, rq.clock);
+            let delta = rq.rt.update_current(rq.clock_task, rq.clock);
+            let task = rq.current();
+            task.add_sum_exec_runtime(delta);
+            task.account_cgroup_runtime(delta);
         } else {
             rq.rt.update_period(rq.clock);
         }

@@ -69,21 +69,12 @@ impl SysClockNanosleep {
                 };
 
                 let deadline_ns = Self::to_ns(deadline);
-                leader.cputime_wait_queue().wait_event_interruptible(
-                    || leader.process_cputime_ns() >= deadline_ns,
-                    None::<fn()>,
-                )?;
+                leader
+                    .process_signal()
+                    .wait_cpu_time(deadline_ns, || leader.process_cputime_ns() >= deadline_ns)?;
                 Ok(())
             }
-            ThreadCPUTimeID => {
-                let pcb = ProcessManager::current_pcb();
-                let deadline_ns = Self::to_ns(deadline);
-                pcb.cputime_wait_queue().wait_event_interruptible(
-                    || pcb.thread_cputime_ns() >= deadline_ns,
-                    None::<fn()>,
-                )?;
-                Ok(())
-            }
+            ThreadCPUTimeID => Err(SystemError::EOPNOTSUPP_OR_ENOTSUP),
             _ => {
                 let now = Self::ktime_now(clockid);
                 let remain = Self::calc_remaining(deadline, &now);
@@ -114,7 +105,11 @@ impl Syscall for SysClockNanosleep {
 
     fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         // 解析/校验参数
-        let clockid = PosixClockID::try_from(Self::which_clock(args))?;
+        let clockid = PosixClockID::try_from(Self::which_clock(args))?.canonical_process_cpu_clock(
+            ProcessManager::current_pcb()
+                .task_tgid_vnr()
+                .map_or(0, |pid| pid.data()),
+        );
         match clockid {
             Realtime | Monotonic | Boottime | ProcessCPUTimeID => {}
             // CLOCK_THREAD_CPUTIME_ID is a valid POSIX clock but Linux has no

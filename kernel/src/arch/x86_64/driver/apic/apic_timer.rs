@@ -21,7 +21,6 @@ use crate::mm::percpu::PerCpu;
 use crate::smp::core::smp_get_processor_id;
 use crate::smp::cpu::ProcessorId;
 use crate::time::clocksource::HZ;
-use crate::time::tick_common::tick_handle_periodic;
 use alloc::string::ToString;
 use alloc::sync::Arc;
 pub use drop;
@@ -94,6 +93,7 @@ pub fn apic_timer_init() {
 
     LocalApicTimerIntrController.install();
     LocalApicTimerIntrController.enable();
+    crate::time::deadline::init_local();
 }
 
 /// 初始化本地APIC定时器的中断描述符
@@ -115,9 +115,9 @@ fn init_bsp_apic_timer() {
     debug!("init_bsp_apic_timer");
     assert!(smp_get_processor_id().data() == 0);
     let mut local_apic_timer = local_apic_timer_instance_mut(ProcessorId::new(0));
-    let initial_count = local_apic_timer
-        .calibrate_initial_count()
-        .unwrap_or_else(LocalApicTimer::periodic_default_initial_count);
+    let calibrated = local_apic_timer.calibrate_initial_count();
+    local_apic_timer.hres_calibrated = calibrated.is_some();
+    let initial_count = calibrated.unwrap_or_else(LocalApicTimer::periodic_default_initial_count);
     local_apic_timer.init(
         LocalApicTimerMode::Periodic,
         initial_count,
@@ -132,9 +132,9 @@ fn init_ap_apic_timer() {
     assert!(cpu_id.data() != 0);
 
     let mut local_apic_timer = local_apic_timer_instance_mut(cpu_id);
-    let initial_count = local_apic_timer
-        .calibrate_initial_count()
-        .unwrap_or_else(LocalApicTimer::periodic_default_initial_count);
+    let calibrated = local_apic_timer.calibrate_initial_count();
+    local_apic_timer.hres_calibrated = calibrated.is_some();
+    let initial_count = calibrated.unwrap_or_else(LocalApicTimer::periodic_default_initial_count);
     local_apic_timer.init(
         LocalApicTimerMode::Periodic,
         initial_count,
@@ -182,12 +182,14 @@ pub struct LocalApicTimer {
     mode: LocalApicTimerMode,
     /// IntialCount
     initial_count: u64,
+    periodic_count: u64,
+    hres_calibrated: bool,
     divisor: u32,
     /// 是否已经触发（oneshot模式）
     triggered: bool,
 }
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 #[repr(u32)]
 pub enum LocalApicTimerMode {
     Oneshot = 0,
@@ -205,6 +207,8 @@ impl LocalApicTimer {
         LocalApicTimer {
             mode: LocalApicTimerMode::Periodic,
             initial_count: 0,
+            periodic_count: 0,
+            hres_calibrated: false,
             divisor: 0,
             triggered: false,
         }
@@ -280,7 +284,16 @@ impl LocalApicTimer {
         self.triggered = false;
         match mode {
             LocalApicTimerMode::Periodic => self.install_periodic_mode(initial_count, divisor),
-            LocalApicTimerMode::Oneshot => todo!(),
+            LocalApicTimerMode::Oneshot => {
+                self.mode = mode;
+                self.set_divisor(divisor);
+                // The counter starts as soon as initial_count is written.
+                // A tiny count can expire before a later LVT unmask, losing
+                // the only one-shot interrupt and stopping the ordinary tick.
+                // Caller holds local IRQs disabled; program LVTT first.
+                self.setup_lvt(APIC_TIMER_IRQ_NUM.data() as u8, false, mode);
+                self.set_initial_cnt(initial_count);
+            }
             LocalApicTimerMode::Deadline => todo!(),
         }
     }
@@ -291,6 +304,7 @@ impl LocalApicTimer {
             initial_count, divisor
         );
         self.mode = LocalApicTimerMode::Periodic;
+        self.periodic_count = initial_count;
         self.set_divisor(divisor);
         self.setup_lvt(
             APIC_TIMER_IRQ_NUM.data() as u8,
@@ -346,9 +360,36 @@ impl LocalApicTimer {
 
     pub(super) fn handle_irq(trap_frame: &TrapFrame) -> Result<IrqReturn, SystemError> {
         // sched_update_jiffies();
-        tick_handle_periodic(trap_frame);
+        crate::time::deadline::handle_irq(trap_frame);
         return Ok(IrqReturn::Handled);
     }
+}
+
+/// Caller holds the local deadline queue with local IRQs disabled. Never keep
+/// this RefCell borrow alive while dispatching a deadline callback.
+pub(crate) fn program_deadline_delta(delta_ns: u64) {
+    let mut timer = local_apic_timer_instance_mut(smp_get_processor_id());
+    let count = ((delta_ns as u128 * timer.periodic_count as u128)
+        .div_ceil(LocalApicTimer::INTERVAL_MS as u128 * 1_000_000))
+    .clamp(1, u32::MAX as u128) as u64;
+    let divisor = timer.divisor;
+    timer.init(LocalApicTimerMode::Oneshot, count, divisor);
+    timer.start_current();
+}
+
+pub(crate) fn restore_periodic() {
+    let mut timer = local_apic_timer_instance_mut(smp_get_processor_id());
+    if timer.mode != LocalApicTimerMode::Periodic {
+        let count = timer.periodic_count;
+        let divisor = timer.divisor;
+        timer.init(LocalApicTimerMode::Periodic, count, divisor);
+        timer.start_current();
+    }
+}
+
+pub(crate) fn deadline_capable() -> bool {
+    let timer = local_apic_timer_instance(smp_get_processor_id());
+    timer.hres_calibrated && timer.periodic_count > 0
 }
 
 impl TryFrom<u8> for LocalApicTimerMode {

@@ -15,7 +15,7 @@ use crate::{
         cpu_is_online,
         fair::FairSchedEntity,
         prio::{PrioUtil, DEFAULT_PRIO},
-        LinuxSchedPolicy, OnRq, SchedClass,
+        LinuxSchedPolicy, OnRq, SchedClass, TaskGroup,
     },
     smp::cpu::{AtomicProcessorId, ProcessorId},
 };
@@ -59,6 +59,9 @@ pub struct ProcessSchedulerInfo {
     pub sched_entity: Arc<FairSchedEntity>,
     pub on_rq: SpinLock<OnRq>,
     placement: SpinLock<NewTaskPlacement>,
+    /// Effective CPU controller css. None uses the boot-safe root CFS rq.
+    /// Semantic changes are serialized by pi_lock and the task's owner rq.
+    cpu_group: SpinLock<Option<Arc<TaskGroup>>>,
 
     /// Protected by rq_lock.
     prio: AtomicI32,
@@ -154,6 +157,7 @@ impl ProcessSchedulerInfo {
             sched_entity: FairSchedEntity::new(),
             on_rq: SpinLock::new(OnRq::None),
             placement: SpinLock::new(NewTaskPlacement::default()),
+            cpu_group: SpinLock::new(None),
             // A task starts at the Linux default priority (nice 0). `sched_fork`
             // then overwrites all three according to the parent's values and the
             // reset-on-fork flag; this is only the pre-fork initial state.
@@ -165,6 +169,14 @@ impl ProcessSchedulerInfo {
 
     pub fn sched_entity(&self) -> Arc<FairSchedEntity> {
         return self.sched_entity.clone();
+    }
+
+    pub(crate) fn cpu_group(&self) -> Option<Arc<TaskGroup>> {
+        self.cpu_group.lock_irqsave().clone()
+    }
+
+    pub(crate) fn set_cpu_group_locked(&self, group: Option<Arc<TaskGroup>>) {
+        *self.cpu_group.lock_irqsave() = group;
     }
 
     pub fn on_cpu(&self) -> Option<ProcessorId> {

@@ -520,21 +520,36 @@ impl Cgroup2Inode {
             .upgrade()
             .ok_or(SystemError::ENOENT)?;
         let was_enabled = cgroup.subtree_control().iter().any(|name| name == "cpuset");
+        let cpu_was_enabled = cgroup.subtree_control().iter().any(|name| name == "cpu");
         // The only fallible process snapshot is prepared before committing the
         // controller mask. Allocation failure cannot leave a partial update.
         let tasks = if input
             .split_whitespace()
-            .any(|op| op == "+cpuset" || op == "-cpuset")
+            .any(|op| matches!(op, "+cpuset" | "-cpuset" | "+cpu" | "-cpu"))
         {
             Some(crate::process::snapshot_all_processes()?)
         } else {
             None
+        };
+        let cpu_prepared = if !cpu_was_enabled && input.split_whitespace().any(|op| op == "+cpu") {
+            crate::cgroup::cpu::prepare_enable_locked(cgroup)
+        } else {
+            Vec::new()
         };
         let new_data = {
             let _cgroup_guard = cgroup_accounting_lock().lock();
             files::apply_subtree_control(cgroup, input)?
         };
         let is_enabled = cgroup.subtree_control().iter().any(|name| name == "cpuset");
+        let cpu_is_enabled = cgroup.subtree_control().iter().any(|name| name == "cpu");
+        if cpu_was_enabled != cpu_is_enabled {
+            crate::cgroup::cpu::controller_changed_locked(
+                cgroup,
+                tasks.as_ref().expect("CPU update has a prepared snapshot"),
+                cpu_prepared,
+                cpu_is_enabled,
+            );
+        }
         if was_enabled != is_enabled {
             cpuset::controller_changed_locked(
                 cgroup,

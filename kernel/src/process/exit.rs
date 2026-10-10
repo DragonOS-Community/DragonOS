@@ -1044,6 +1044,9 @@ impl ProcessControlBlock {
 
         // 从线程组中移除。非组长线程离开 group_tasks 后，线程组 rusage 仍需保留其 CPU 时间。
         let thread_group_leader = self.threads_read_irqsave().group_leader();
+        // Settle before acquiring relation/membership locks. Their inner
+        // aggregation below must not acquire pi/rq locks in reverse order.
+        self.thread_cputime_ns();
         let mut notify_leader = None;
         if let Some(leader) = thread_group_leader {
             if !group_dead {
@@ -1056,7 +1059,7 @@ impl ProcessControlBlock {
                 let (wake_pidfd, token) =
                     signal_state.try_claim_natural_parent_notify_with(&leader, || {
                         let mut leader_threads = leader.threads_write_irqsave();
-                        leader.add_exited_thread_group_cputime(self.thread_cputime_ns());
+                        leader.add_exited_thread_group_cputime(self.settled_cputime());
                         if let Some(rusage) = self.get_rusage(RUsageWho::RusageThread) {
                             leader.add_exited_thread_group_rusage(&rusage);
                         }

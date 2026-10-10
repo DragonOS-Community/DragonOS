@@ -4,8 +4,6 @@ use alloc::sync::Arc;
 
 use log::warn;
 
-use crate::libs::wait_queue::WaitQueue;
-
 use super::{ProcessControlBlock, ProcessManager};
 
 #[derive(Debug, Default)]
@@ -15,32 +13,64 @@ pub struct ProcessCpuTime {
     pub sum_exec_runtime: AtomicU64,
 }
 
-impl ProcessControlBlock {
-    #[inline(always)]
-    pub fn cputime_wait_queue(&self) -> &WaitQueue {
-        &self.cputime_wait_queue
-    }
+/// Settled values: safe to aggregate while holding thread membership locks.
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct CpuTimeSnapshot {
+    pub user: u64,
+    pub system: u64,
+}
 
+impl CpuTimeSnapshot {
+    fn add(&mut self, other: Self) {
+        self.user = self.user.saturating_add(other.user);
+        self.system = self.system.saturating_add(other.system);
+    }
+}
+
+impl ProcessControlBlock {
     #[inline(always)]
     pub fn cputime(&self) -> Arc<ProcessCpuTime> {
         self.cpu_time.clone()
     }
 
-    /// 当前线程（PCB）的 CPU 时间（ns），语义对齐 Linux 的 CLOCK_THREAD_CPUTIME_ID：user+system。
+    /// Linux CPUCLOCK_SCHED: settle actual runtime, never project wall time.
     #[inline]
     pub fn thread_cputime_ns(&self) -> u64 {
-        // 这里使用 Ordering::Relaxed：
-        // - 只需要读取两个独立计数器的“某个一致快照”（不要求与其它内存状态建立 happens-before）。
-        // - 对单个 AtomicU64 保证按地址一致性（coherence），满足 CPU-time 统计的近似/观测语义。
-        // 如未来需要与其它状态强一致（例如结合序列号/结构体快照），再引入更强的同步原语。
-        let ct = self.cputime();
-        ct.utime.load(Ordering::Relaxed) + ct.stime.load(Ordering::Relaxed)
+        crate::sched::cputime::task_sched_runtime(self)
+    }
+
+    pub(super) fn settled_cputime(&self) -> CpuTimeSnapshot {
+        CpuTimeSnapshot {
+            user: self.cpu_time.utime.load(Ordering::Relaxed),
+            system: self.cpu_time.stime.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Keep the existing dynamic PROF-like clock separate from SCHED time.
+    pub(crate) fn thread_tick_cputime_ns(&self) -> u64 {
+        let sample = self.settled_cputime();
+        sample.user.saturating_add(sample.system)
     }
 
     /// 当前进程（线程组）的 CPU 时间（ns），语义对齐 Linux 的 CLOCK_PROCESS_CPUTIME_ID。
     ///
-    /// 说明：目前通过遍历线程组成员并累加每线程的 user+system 得到。
+    /// SCHED runtime belongs to the shared signal state, including exited tasks.
     pub fn process_cputime_ns(&self) -> u64 {
+        // Linux only settles the calling member; remote members contribute
+        // their latest scheduler snapshots. Never acquire rq under membership.
+        let current = ProcessManager::current_pcb();
+        if Arc::ptr_eq(&current.process_signal(), &self.process_signal()) {
+            current.thread_cputime_ns();
+        }
+        self.process_signal().cpu_runtime()
+    }
+
+    pub(crate) fn process_tick_cputime_ns(&self) -> u64 {
+        let sample = self.process_cputime_snapshot();
+        sample.user.saturating_add(sample.system)
+    }
+
+    fn process_cputime_snapshot(&self) -> CpuTimeSnapshot {
         static BAD_TGROUP_LOGGED: AtomicBool = AtomicBool::new(false);
 
         // 尽量选择线程组组长作为“进程”视角。
@@ -69,7 +99,7 @@ impl ProcessControlBlock {
                     leader.tgid,
                 );
             }
-            return self.thread_cputime_ns();
+            return self.settled_cputime();
         }
 
         let ti = leader.threads_read_irqsave();
@@ -77,18 +107,18 @@ impl ProcessControlBlock {
         // removing it from group_tasks.  A reader therefore observes the
         // thread either here or in the exited total, never in both/neither.
         let mut total = *leader.exited_thread_group_cputime_ns.lock();
-        total = total.saturating_add(leader.thread_cputime_ns());
+        total.add(leader.settled_cputime());
         for t in &ti.group_tasks {
             if let Some(p) = t.upgrade() {
-                total = total.saturating_add(p.thread_cputime_ns());
+                total.add(p.settled_cputime());
             }
         }
         total
     }
 
-    pub(crate) fn add_exited_thread_group_cputime(&self, ns: u64) {
+    pub(super) fn add_exited_thread_group_cputime(&self, sample: CpuTimeSnapshot) {
         let mut total = self.exited_thread_group_cputime_ns.lock();
-        *total = total.saturating_add(ns);
+        total.add(sample);
     }
 
     /// Preserve signal_struct-like CPU history when non-leader exec promotes
@@ -121,8 +151,12 @@ impl ProcessControlBlock {
 
     #[inline(always)]
     pub fn add_sum_exec_runtime(&self, ns: u64) {
+        if ns == 0 {
+            return;
+        }
         self.cpu_time
             .sum_exec_runtime
             .fetch_add(ns, Ordering::Relaxed);
+        self.process_signal().account_cpu_runtime(ns);
     }
 }

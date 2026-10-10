@@ -1,0 +1,23 @@
+--- a/library/entropy_poll.c
++++ b/library/entropy_poll.c
+@@ -109,6 +109,20 @@
+ #endif /* SYS_getrandom */
+ #endif /* __linux__ || __midipix__ */
+ 
++/*
++ * musl and other non-glibc libcs expose getrandom() via <sys/random.h>.
++ * Use it when available so Linux targets do not hard depend on /dev/urandom.
++ */
++#if defined(__linux__) && !defined(HAVE_GETRANDOM)
++#include <errno.h>
++#include <sys/random.h>
++static int getrandom_wrapper( void *buf, size_t buflen, unsigned int flags )
++{
++    return getrandom( buf, buflen, flags );
++}
++#define HAVE_GETRANDOM
++#endif /* __linux__ && !defined(HAVE_GETRANDOM) */
++
+ #if defined(__FreeBSD__) || defined(__DragonFly__)
+ #include <sys/param.h>
+ #if (defined(__FreeBSD__) && __FreeBSD_version >= 1200000) || \

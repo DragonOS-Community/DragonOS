@@ -16,6 +16,37 @@ use alloc::sync::Arc;
 
 use super::{clock::SchedClock, cpu_irq_time, cpu_rq, prio::PrioUtil, SchedClass};
 
+/// Linux cputime_adjust: retain tick classification while scaling to actual
+/// scheduler runtime. The owner serializes calls with its previous-value lock.
+#[derive(Debug, Default)]
+pub(crate) struct AdjustedCpuTime {
+    user_ns: u64,
+    system_ns: u64,
+}
+
+impl AdjustedCpuTime {
+    pub(crate) fn adjust(&mut self, runtime: u64, user: u64, system: u64) -> (u64, u64) {
+        if self.user_ns.saturating_add(self.system_ns) < runtime {
+            let system = if system == 0 {
+                0
+            } else if user == 0 {
+                runtime
+            } else {
+                ((system as u128 * runtime as u128) / (system as u128 + user as u128)) as u64
+            };
+            let mut system = system.max(self.system_ns);
+            let mut user = runtime - system;
+            if user < self.user_ns {
+                user = self.user_ns;
+                system = runtime - user;
+            }
+            self.user_ns = user;
+            self.system_ns = system;
+        }
+        (self.user_ns, self.system_ns)
+    }
+}
+
 /// CPU 时间类型枚举（对齐 Linux kernel_stat.h 的 cpu_usage_stat）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]

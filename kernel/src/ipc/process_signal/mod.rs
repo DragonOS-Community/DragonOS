@@ -70,6 +70,7 @@ pub struct ProcessSignalState {
     child_wait_queue: WaitQueue,
     pending: SpinLock<SigPending>,
     cpu_time_wait: Arc<cpu_time::CpuTimeWait>,
+    pub(crate) cpu_time_adjustment: SpinLock<crate::sched::cputime::AdjustedCpuTime>,
 }
 
 impl Debug for ProcessSignalState {
@@ -129,6 +130,7 @@ impl ProcessSignalState {
             child_wait_queue: WaitQueue::default(),
             pending: SpinLock::new(SigPending::default()),
             cpu_time_wait: cpu_time::CpuTimeWait::new(),
+            cpu_time_adjustment: SpinLock::new(crate::sched::cputime::AdjustedCpuTime::default()),
         })
         .map_err(|_| SystemError::ENOMEM)
     }

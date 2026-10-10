@@ -1047,6 +1047,7 @@ impl ProcessControlBlock {
         // Settle before acquiring relation/membership locks. Their inner
         // aggregation below must not acquire pi/rq locks in reverse order.
         self.thread_cputime_ns();
+        let exit_rusage = self.exit_resource_snapshot();
         let mut notify_leader = None;
         if let Some(leader) = thread_group_leader {
             if !group_dead {
@@ -1060,9 +1061,7 @@ impl ProcessControlBlock {
                     signal_state.try_claim_natural_parent_notify_with(&leader, || {
                         let mut leader_threads = leader.threads_write_irqsave();
                         leader.add_exited_thread_group_cputime(self.settled_cputime());
-                        if let Some(rusage) = self.get_rusage(RUsageWho::RusageThread) {
-                            leader.add_exited_thread_group_rusage(&rusage);
-                        }
+                        leader.add_exited_thread_group_rusage(&exit_rusage);
                         leader_threads.group_tasks.retain(|pcb| {
                             pcb.upgrade().is_some() && !Weak::ptr_eq(pcb, &self.self_ref)
                         });

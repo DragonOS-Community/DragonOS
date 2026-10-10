@@ -2,15 +2,28 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use alloc::sync::Arc;
 
+use crate::{libs::spinlock::SpinLock, sched::cputime::AdjustedCpuTime};
 use log::warn;
 
 use super::{ProcessControlBlock, ProcessManager};
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ProcessCpuTime {
     pub utime: AtomicU64,
     pub stime: AtomicU64,
     pub sum_exec_runtime: AtomicU64,
+    adjusted: SpinLock<AdjustedCpuTime>,
+}
+
+impl Default for ProcessCpuTime {
+    fn default() -> Self {
+        Self {
+            utime: AtomicU64::new(0),
+            stime: AtomicU64::new(0),
+            sum_exec_runtime: AtomicU64::new(0),
+            adjusted: SpinLock::new(AdjustedCpuTime::default()),
+        }
+    }
 }
 
 /// Settled values: safe to aggregate while holding thread membership locks.
@@ -37,6 +50,27 @@ impl ProcessControlBlock {
     #[inline]
     pub fn thread_cputime_ns(&self) -> u64 {
         crate::sched::cputime::task_sched_runtime(self)
+    }
+
+    pub(super) fn adjusted_thread_cputime(&self) -> (u64, u64) {
+        // Settle before taking the previous-value lock (pi -> rq first).
+        let runtime = self.thread_cputime_ns();
+        let mut previous = self.cpu_time.adjusted.lock_irqsave();
+        previous.adjust(
+            runtime,
+            self.cpu_time.utime.load(Ordering::Relaxed),
+            self.cpu_time.stime.load(Ordering::Relaxed),
+        )
+    }
+
+    pub(super) fn adjusted_process_cputime(&self) -> (u64, u64) {
+        // Never acquire rq while holding the thread membership lock.
+        let runtime = self.process_cputime_ns();
+        let sample = self.process_cputime_snapshot();
+        self.process_signal()
+            .cpu_time_adjustment
+            .lock_irqsave()
+            .adjust(runtime, sample.user, sample.system)
     }
 
     pub(super) fn settled_cputime(&self) -> CpuTimeSnapshot {

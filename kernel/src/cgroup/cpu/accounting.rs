@@ -10,7 +10,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::{
     libs::spinlock::SpinLock,
-    sched::cputime::{kcpustat_cpu, CpuUsageStat},
+    sched::cputime::{kcpustat_cpu, AdjustedCpuTime, CpuUsageStat},
     smp::cpu::smp_cpu_manager,
 };
 
@@ -19,12 +19,6 @@ pub(crate) struct CpuTimeSnapshot {
     pub usage_ns: u64,
     pub user_ns: u64,
     pub system_ns: u64,
-}
-
-#[derive(Debug, Default)]
-struct AdjustedCpuTime {
-    user_ns: u64,
-    system_ns: u64,
 }
 
 #[derive(Debug)]
@@ -79,27 +73,11 @@ impl CpuAccounting {
         let runtime = self.runtime_ns.load(Ordering::Relaxed);
         let user = self.user_ns.load(Ordering::Relaxed);
         let system = self.system_ns.load(Ordering::Relaxed);
-        if previous.user_ns.saturating_add(previous.system_ns) < runtime {
-            let system = if system == 0 {
-                0
-            } else if user == 0 {
-                runtime
-            } else {
-                ((system as u128 * runtime as u128) / (system as u128 + user as u128)) as u64
-            };
-            let mut system = system.max(previous.system_ns);
-            let mut user = runtime - system;
-            if user < previous.user_ns {
-                user = previous.user_ns;
-                system = runtime - user;
-            }
-            previous.user_ns = user;
-            previous.system_ns = system;
-        }
+        let (user_ns, system_ns) = previous.adjust(runtime, user, system);
         CpuTimeSnapshot {
             usage_ns: runtime,
-            user_ns: previous.user_ns,
-            system_ns: previous.system_ns,
+            user_ns,
+            system_ns,
         }
     }
 

@@ -538,11 +538,29 @@ TEST_F(ThreadedCgroup, RemovedNodeOldFileCannotBeRevived) {
   Topology();
   int fd = open((a_ + "/cgroup.threads").c_str(), O_WRONLY | O_CLOEXEC);
   ASSERT_GE(fd, 0);
+  int type_fd = open((a_ + "/cgroup.type").c_str(), O_RDWR | O_CLOEXEC);
+  ASSERT_GE(type_fd, 0);
   ASSERT_EQ(0, rmdir(a_.c_str()));
   EXPECT_EQ(ENODEV, WriteFd(fd, "0"));
+  EXPECT_EQ(ENODEV, WriteFd(type_fd, "threaded"));
+  EXPECT_EQ(ENODEV, WriteFd(type_fd, "invalid"));
+  EXPECT_EQ(ENODEV, WriteFd(type_fd, std::string(1, '\xff')));
+  char bytes[32];
+  EXPECT_EQ(-1, read(type_fd, bytes, sizeof(bytes)));
+  EXPECT_EQ(ENODEV, errno);
+  // Kernfs permits descriptor metadata operations after removal, but these
+  // cannot reactivate I/O or alter a later node with the same path.
+  EXPECT_EQ(0, fchmod(type_fd, 0600));
+  EXPECT_EQ(0, fchown(type_fd, 65534, 65534));
   close(fd);
   ASSERT_EQ(0, mkdir(a_.c_str(), 0755));
   EXPECT_EQ("domain invalid", Read(a_ + "/cgroup.type"));
+  struct stat st{};
+  EXPECT_EQ(0, stat((a_ + "/cgroup.type").c_str(), &st));
+  EXPECT_EQ(0u, st.st_uid);
+  EXPECT_EQ(0u, st.st_gid);
+  EXPECT_EQ(0644u, st.st_mode & 0777);
+  close(type_fd);
 }
 
 TEST_F(ThreadedCgroup, NonLeaderExecRetainsExecutingLeafAndReleasesOtherThreads) {
@@ -1072,6 +1090,77 @@ TEST_F(ThreadedCgroup, CloneThreadIntoSameDomainLeafAndRejectCrossDomain) {
   EXPECT_EQ(0, status);
 }
 #endif  // x86_64 raw clone3 trampoline coverage
+
+struct AttributeWriter {
+  pthread_barrier_t* barrier;
+  int fd;
+  mode_t mode;
+  bool chmod_writer;
+  int error = 0;
+};
+
+void* WriteAttributes(void* pointer) {
+  auto* writer = static_cast<AttributeWriter*>(pointer);
+  for (int i = 0; i < 200; ++i) {
+    pthread_barrier_wait(writer->barrier);
+    int result = writer->chmod_writer ? fchmod(writer->fd, writer->mode)
+                                     : fchown(writer->fd, -1, 23456);
+    writer->error = result ? errno : 0;
+    pthread_barrier_wait(writer->barrier);
+  }
+  return nullptr;
+}
+
+TEST_F(ThreadedCgroup, ConcurrentModeAndGroupUpdatesPreserveBothAcrossMountViews) {
+  a_ = Make(root_, "attributes");
+  char location[] = "/tmp/dunitest-threaded-attributes-XXXXXX";
+  ASSERT_NE(nullptr, mkdtemp(location));
+  scratch_dirs_.push_back(location);
+  bool delegated_before = MountUsesNsdelegate("/sys/fs/cgroup");
+  pid_t helper = fork();
+  ASSERT_GE(helper, 0);
+  if (helper == 0) {
+    alarm(30);
+    if (unshare(CLONE_NEWNS) || mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr) ||
+        mount("cgroup2", location, "cgroup2", 0,
+              delegated_before ? "nsdelegate" : nullptr)) _exit(1);
+    std::string mirror = std::string(location) + a_.substr(std::strlen("/sys/fs/cgroup"));
+    for (const auto& suffix : {"", "/cgroup.procs"}) {
+      int first = open((a_ + suffix).c_str(), O_RDONLY | O_CLOEXEC);
+      int second = open((mirror + suffix).c_str(), O_RDONLY | O_CLOEXEC);
+      if (first < 0 || second < 0) _exit(2);
+      pthread_barrier_t barrier;
+      if (pthread_barrier_init(&barrier, nullptr, 3)) _exit(3);
+      mode_t mode = suffix[0] ? 0660 : 0770;
+      AttributeWriter writers[] = {{&barrier, first, mode, true},
+                                   {&barrier, second, mode, false}};
+      pthread_t threads[2];
+      if (pthread_create(&threads[0], nullptr, WriteAttributes, &writers[0]) ||
+          pthread_create(&threads[1], nullptr, WriteAttributes, &writers[1])) _exit(4);
+      for (int i = 0; i < 200; ++i) {
+        if (fchown(first, 0, 0) || fchmod(first, 0644)) _exit(5);
+        pthread_barrier_wait(&barrier);
+        pthread_barrier_wait(&barrier);
+        if (writers[0].error || writers[1].error) _exit(6);
+        for (int fd : {first, second}) {
+          struct stat st{};
+          if (fstat(fd, &st) || st.st_uid != 0 || st.st_gid != 23456 ||
+              (st.st_mode & 0777) != mode) _exit(7);
+        }
+      }
+      pthread_join(threads[0], nullptr);
+      pthread_join(threads[1], nullptr);
+      pthread_barrier_destroy(&barrier);
+      close(first);
+      close(second);
+    }
+    _exit(umount(location) ? 8 : 0);
+  }
+  int status;
+  ASSERT_EQ(helper, waitpid(helper, &status, 0));
+  EXPECT_EQ(0, status);
+  EXPECT_EQ(delegated_before, MountUsesNsdelegate("/sys/fs/cgroup"));
+}
 
 TEST_F(ThreadedCgroup, DirectoryAndFileOwnershipSharedAcrossMountViews) {
   a_ = Make(root_, "a");

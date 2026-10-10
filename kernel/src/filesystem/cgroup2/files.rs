@@ -416,8 +416,10 @@ pub(super) fn write_controller_file_locked(
     ty: CgroupCoreFile,
     generation: u64,
     file_generation: u64,
-    input: &str,
+    input: &[u8],
 ) -> Result<Vec<u8>, SystemError> {
+    check_live_file(cgroup, ty, file_generation)?;
+    let input = core::str::from_utf8(input).map_err(|_| SystemError::EINVAL)?;
     if let CgroupCoreFile::Cpuset(file) = ty {
         cpuset::write_locked(cgroup, generation, file, input)?;
         return Ok(Vec::new());
@@ -437,7 +439,6 @@ pub(super) fn write_controller_file_locked(
         }
         return Ok(Vec::new());
     }
-    check_live_file(cgroup, ty, file_generation)?;
     match ty {
         CgroupCoreFile::Cpuset(_) | CgroupCoreFile::Type => unreachable!(),
         CgroupCoreFile::Freeze => {

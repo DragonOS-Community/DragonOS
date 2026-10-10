@@ -14,7 +14,7 @@ use crate::{
         file::{FileFlags, FilePrivateData},
         vcore::generate_inode_id,
         FileSystem, FileType, IndexNode, InodeFlags, InodeMode, Metadata, OpenFileBehavior,
-        PostWriteSyncPolicy,
+        PostWriteSyncPolicy, SetMetadataMask,
     },
     libs::{mutex::MutexGuard, rwlock::RwLock, rwsem::RwSem, spinlock::SpinLock},
     process::ProcessManager,
@@ -402,6 +402,43 @@ impl Cgroup2Inode {
         }
     }
 
+    /// Caller holds UPDATE_LOCK. Merge only requested attributes into this
+    /// inode's pinned instance, including descriptors of removed files.
+    fn apply_metadata_locked(
+        &self,
+        requested: &Metadata,
+        mask: SetMetadataMask,
+    ) -> Result<(), SystemError> {
+        // Validate before touching either canonical permissions or timestamps.
+        let uid = if mask.contains(SetMetadataMask::UID) {
+            Some(u32::try_from(requested.uid).map_err(|_| SystemError::EINVAL)?)
+        } else {
+            None
+        };
+        let gid = if mask.contains(SetMetadataMask::GID) {
+            Some(u32::try_from(requested.gid).map_err(|_| SystemError::EINVAL)?)
+        } else {
+            None
+        };
+        let mut inner = self.inner.lock();
+        {
+            let mut attrs = inner.permissions.write();
+            if let Some(uid) = uid {
+                attrs.uid = uid;
+            }
+            if let Some(gid) = gid {
+                attrs.gid = gid;
+            }
+            if mask.contains(SetMetadataMask::MODE) {
+                attrs.mode = requested.mode.bits();
+            }
+        }
+        // Identity, size and generation are not setattr fields. Preserve any
+        // timestamp not requested, including a concurrent atime-only update.
+        crate::filesystem::vfs::merge_metadata_masked(&mut inner.metadata, requested, mask);
+        Ok(())
+    }
+
     fn write_file(
         this: &Arc<Cgroup2Inode>,
         offset: usize,
@@ -455,13 +492,12 @@ impl Cgroup2Inode {
                 if offset != 0 {
                     return Err(SystemError::EINVAL);
                 }
-                let input = core::str::from_utf8(buf).map_err(|_| SystemError::EINVAL)?;
                 let new_data = files::write_controller_file_locked(
                     &cgroup,
                     ty,
                     generation,
                     file_generation,
-                    input,
+                    buf,
                 )?;
                 Self::replace_file_data(this, &new_data)?;
                 Ok(buf.len())
@@ -601,28 +637,38 @@ impl IndexNode for Cgroup2Inode {
     }
 
     fn set_metadata(&self, metadata: &Metadata) -> Result<(), SystemError> {
+        self.set_metadata_masked(
+            metadata,
+            SetMetadataMask::MODE
+                | SetMetadataMask::UID
+                | SetMetadataMask::GID
+                | SetMetadataMask::ATIME
+                | SetMetadataMask::MTIME
+                | SetMetadataMask::CTIME,
+        )
+    }
+
+    fn set_metadata_masked(
+        &self,
+        metadata: &Metadata,
+        mask: SetMetadataMask,
+    ) -> Result<(), SystemError> {
         let _update = crate::cgroup::lock();
-        let mut permissions = crate::cgroup::core::CgroupFilePermissions {
-            uid: u32::try_from(metadata.uid).map_err(|_| SystemError::EINVAL)?,
-            gid: u32::try_from(metadata.gid).map_err(|_| SystemError::EINVAL)?,
-            mode: metadata.mode.bits(),
-            generation: 0,
-        };
-        let mut inner = self.inner.lock();
-        // Like kernfs, an unlinked but referenced inode remains a valid target
-        // for chmod/chown. Only its pinned instance changes, never a later file
-        // which happens to reuse the same name.
-        let mut attrs = inner.permissions.write();
-        permissions.generation = attrs.generation;
-        *attrs = permissions;
-        drop(attrs);
-        // Size, timestamps and inode identity still belong to this inode.
-        let (uid, gid, mode) = (inner.metadata.uid, inner.metadata.gid, inner.metadata.mode);
-        inner.metadata = metadata.clone();
-        inner.metadata.uid = uid;
-        inner.metadata.gid = gid;
-        inner.metadata.mode = mode;
-        Ok(())
+        self.apply_metadata_locked(metadata, mask)
+    }
+
+    fn update_metadata_masked(
+        &self,
+        update: &mut crate::filesystem::vfs::MetadataUpdate<'_>,
+    ) -> Result<SetMetadataMask, SystemError> {
+        let _update = crate::cgroup::lock();
+        // The VFS callback authorizes and computes changes from the same
+        // canonical state that will be committed, across all mount views.
+        // Do not hold the inode spinlock while invoking that callback.
+        let current = self.metadata()?;
+        let (requested, mask) = update(&current)?;
+        self.apply_metadata_locked(&requested, mask)?;
+        Ok(mask)
     }
 
     fn update_atime(&self, now: PosixTimeSpec, relatime: bool) -> Result<(), SystemError> {

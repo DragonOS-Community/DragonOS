@@ -8,9 +8,11 @@ use super::{
 };
 use crate::{
     arch::{interrupt::TrapFrame, ipc::signal::Signal, MMArch},
-    cgroup::{cgroup_accounting_lock, cgroup_can_fork_in, cgroup_migrate_vet_dst_with_src},
+    cgroup::{cgroup_accounting_lock, cgroup_can_fork_in, cgroup_migrate_vet_dst},
     filesystem::{
-        cgroup2::{cgroup2_check_attach_permissions, cgroup2_inode_to_node},
+        cgroup2::{
+            cgroup2_check_attach_namespace, cgroup2_check_attach_permissions, cgroup2_inode_to_node,
+        },
         vfs::{
             fdtable::{FdReservation, FileDescriptorTable},
             file::{File, FileFlags},
@@ -921,14 +923,12 @@ impl ProcessManager {
         let reserved_cgroup = if pcb.raw_pid() > RawPid(0) {
             if let Some(target) = clone_into_cgroup_target.as_ref() {
                 let src = pcb.task_cgroup_node();
-                let ns_root = current_pcb.nsproxy().cgroup_ns.root_cgroup().clone();
-                if !ns_root.is_ancestor_of(&target.node) || !ns_root.is_ancestor_of(&src) {
-                    return Err(SystemError::ENOENT);
-                }
-                if !Arc::ptr_eq(&src, &target.node)
-                    && clone_flags.contains(CloneFlags::CLONE_THREAD)
-                {
-                    return Err(SystemError::EINVAL);
+                let namespace = current_pcb.nsproxy().cgroup_ns.clone();
+                target.file.with_io_fs(|fs| {
+                    cgroup2_check_attach_namespace(fs, &src, &target.node, &namespace)
+                })?;
+                if clone_flags.contains(CloneFlags::CLONE_THREAD) {
+                    crate::cgroup::threaded::validate_thread_domain(&src, &target.node)?;
                 }
                 target.file.with_io_fs(|fs| {
                     cgroup2_check_attach_permissions(fs.root_inode(), &src, &target.node)
@@ -939,11 +939,10 @@ impl ProcessManager {
                 .map(|target| &target.node)
                 .unwrap_or(&pcb.task_cgroup_node())
                 .clone();
-            let src_node = pcb.task_cgroup_node();
             let guard = cgroup_accounting_lock().lock();
             cgroup_can_fork_in(&charge_node, 1)?;
             if let Some(target) = clone_into_cgroup_target.as_ref() {
-                cgroup_migrate_vet_dst_with_src(&src_node, &target.node, 1)?;
+                cgroup_migrate_vet_dst(&target.node)?;
                 pcb.set_task_cgroup_node_for_fork(target.node.clone());
             }
             let cgroup = pcb.task_cgroup_node();
@@ -1387,20 +1386,16 @@ impl ProcessManager {
             return Err(SystemError::ENOTDIR);
         }
 
+        let _update_guard = crate::cgroup::lock();
         let node = cgroup2_inode_to_node(&file.inode())?;
-        let ns_root = current.nsproxy().cgroup_ns.root_cgroup().clone();
-        if !ns_root.is_ancestor_of(&node) {
-            return Err(SystemError::ENOENT);
-        }
         let src = current.task_cgroup_node();
-        if !ns_root.is_ancestor_of(&src) {
-            return Err(SystemError::ENOENT);
-        }
-        if !Arc::ptr_eq(&src, &node) && clone_args.flags.contains(CloneFlags::CLONE_THREAD) {
-            return Err(SystemError::EINVAL);
+        let namespace = current.nsproxy().cgroup_ns.clone();
+        file.with_io_fs(|fs| cgroup2_check_attach_namespace(fs, &src, &node, &namespace))?;
+        if clone_args.flags.contains(CloneFlags::CLONE_THREAD) {
+            crate::cgroup::threaded::validate_thread_domain(&src, &node)?;
         }
         file.with_io_fs(|fs| cgroup2_check_attach_permissions(fs.root_inode(), &src, &node))?;
-        cgroup_migrate_vet_dst_with_src(&src, &node, 1)?;
+        cgroup_migrate_vet_dst(&node)?;
 
         Ok(Some(CloneCgroupTarget { node, file }))
     }

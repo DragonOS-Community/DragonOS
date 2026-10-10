@@ -4,7 +4,7 @@ use alloc::{
     vec::Vec,
 };
 use core::cmp::Reverse;
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use hashbrown::{HashMap, HashSet};
 use system_error::SystemError;
 
@@ -15,7 +15,7 @@ use crate::{
         bpf_prog_type, BPF_F_ALLOW_MULTI, BPF_F_ALLOW_OVERRIDE, BPF_F_REPLACE,
     },
     libs::{mutex::Mutex, rwlock::RwLock, spinlock::SpinLock},
-    process::RawPid,
+    process::{ProcessManager, RawPid},
 };
 
 /// `BPF_F_PREORDER` is not generated in the current Linux BPF bindings.
@@ -47,12 +47,48 @@ impl DeviceBpfState {
     }
 }
 
+/// Canonical DAC identity, shared by all mount views of a cgroup file.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CgroupFilePermissions {
+    pub uid: u32,
+    pub gid: u32,
+    pub mode: u32,
+    pub generation: u64,
+}
+
+impl CgroupFilePermissions {
+    /// Match Linux 6.6 kernfs_new_node followed by cgroup_kn_set_ugid.
+    /// Nonzero creator credentials override inherited ownership; (0, 0)
+    /// leaves kernfs's initial ownership, including SGID group inheritance.
+    pub(crate) fn for_creation(
+        parent: Self,
+        uid: u32,
+        gid: u32,
+        mode: u32,
+        directory: bool,
+    ) -> Self {
+        let sgid = parent.mode & 0o2000 != 0;
+        Self {
+            uid,
+            gid: if uid == 0 && gid == 0 && sgid {
+                parent.gid
+            } else {
+                gid
+            },
+            mode: mode | if directory && sgid { 0o2000 } else { 0 },
+            generation: 0,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct CgroupNode {
     id: usize,
     name: String,
     parent: Option<Weak<CgroupNode>>,
     children: RwLock<HashMap<String, Arc<CgroupNode>>>,
+    pub(super) threaded: AtomicBool,
+    file_permissions: RwLock<HashMap<String, Arc<RwLock<CgroupFilePermissions>>>>,
     tasks: RwLock<HashSet<RawPid>>,
     subtree_control: RwLock<HashSet<String>>,
     cpu: RwLock<CgroupCpuState>,
@@ -74,6 +110,8 @@ impl CgroupNode {
             name: String::new(),
             parent: None,
             children: RwLock::new(HashMap::new()),
+            threaded: AtomicBool::new(false),
+            file_permissions: RwLock::new(HashMap::new()),
             tasks: RwLock::new(HashSet::new()),
             subtree_control: RwLock::new(HashSet::new()),
             cpu: RwLock::new(CgroupCpuState::default()),
@@ -95,6 +133,8 @@ impl CgroupNode {
             name,
             parent: Some(Arc::downgrade(parent)),
             children: RwLock::new(HashMap::new()),
+            threaded: AtomicBool::new(false),
+            file_permissions: RwLock::new(HashMap::new()),
             tasks: RwLock::new(HashSet::new()),
             subtree_control: RwLock::new(HashSet::new()),
             cpu: RwLock::new(CgroupCpuState::default()),
@@ -112,6 +152,74 @@ impl CgroupNode {
 
     pub fn id(&self) -> usize {
         self.id
+    }
+
+    pub(crate) fn file_permissions(&self, name: &str, default_mode: u32) -> CgroupFilePermissions {
+        *self.file_permissions_instance(name, default_mode).read()
+    }
+
+    /// An inode pins this instance, not the name. Recreated controller files
+    /// receive a new instance while existing references retain their old DAC.
+    pub(crate) fn file_permissions_instance(
+        &self,
+        name: &str,
+        default_mode: u32,
+    ) -> Arc<RwLock<CgroupFilePermissions>> {
+        if let Some(attrs) = self.file_permissions.read().get(name).cloned() {
+            return attrs;
+        }
+        self.file_permissions
+            .write()
+            .entry(name.to_string())
+            .or_insert_with(|| {
+                Arc::new(RwLock::new(CgroupFilePermissions {
+                    uid: 0,
+                    gid: 0,
+                    mode: default_mode,
+                    generation: 0,
+                }))
+            })
+            .clone()
+    }
+
+    pub(crate) fn set_file_permissions(&self, name: &str, permissions: CgroupFilePermissions) {
+        let instance = self.file_permissions_instance(name, permissions.mode);
+        let mut attrs = instance.write();
+        *attrs = CgroupFilePermissions {
+            generation: attrs.generation,
+            ..permissions
+        };
+    }
+
+    pub(crate) fn file_generation(&self, name: &str) -> u64 {
+        self.file_permissions
+            .read()
+            .get(name)
+            .map_or(0, |entry| entry.read().generation)
+    }
+
+    pub(crate) fn reset_file_permissions(&self, name: &str, default_mode: u32) {
+        let cred = ProcessManager::current_pcb().cred();
+        let parent = self.file_permissions("", 0o755);
+        let mut attrs = self.file_permissions.write();
+        let generation = attrs
+            .get(name)
+            .map_or(0, |entry| entry.read().generation)
+            .checked_add(1)
+            .expect("cgroup file generation exhausted");
+        attrs.insert(
+            name.to_string(),
+            Arc::new(RwLock::new(CgroupFilePermissions {
+                generation,
+                ..CgroupFilePermissions::for_creation(
+                    parent,
+                    cred.fsuid.data() as u32,
+                    cred.fsgid.data() as u32,
+                    default_mode,
+                    false,
+                )
+            })),
+        );
     }
 
     pub fn name(&self) -> &str {
@@ -196,37 +304,18 @@ impl CgroupNode {
         *self.cpu.read()
     }
 
-    /// Implicit thread roots can host internal competition for threaded
-    /// controllers. Explicit cgroup.type=threaded is not implemented yet.
-    pub(crate) fn is_thread_root(&self) -> bool {
-        self.has_tasks()
-            && self
-                .subtree_control()
-                .iter()
-                .any(|name| matches!(name.as_str(), "cpu" | "cpuset" | "pids"))
-    }
-
-    pub(crate) fn is_valid_domain(&self) -> bool {
-        let mut parent = self.parent();
-        while let Some(node) = parent {
-            if node.parent().is_some() && node.is_thread_root() {
-                return false;
+    pub(crate) fn reset_controller(&self, name: &str) {
+        match name {
+            "cpu" => *self.cpu.write() = CgroupCpuState::default(),
+            "memory" => *self.memory.write() = CgroupMemoryState::default(),
+            "pids" => {
+                *self.pids_max.write() = None;
+                self.pids_events_max.store(0, Ordering::Release);
             }
-            parent = node.parent();
+            // Cpuset resets both configured masks and placement outside the
+            // accounting spinlock, in controller_changed_locked().
+            _ => {}
         }
-        true
-    }
-
-    pub(crate) fn has_populated_domain_children(&self) -> bool {
-        self.children()
-            .iter()
-            .any(|child| child.subtree_task_count() != 0)
-    }
-
-    pub(crate) fn can_be_thread_root(&self) -> bool {
-        self.parent().is_none()
-            || (!self.has_populated_domain_children()
-                && !self.subtree_control().iter().any(|name| name == "memory"))
     }
 
     pub(crate) fn cpuset_state(&self) -> super::cpuset::CpusetState {
@@ -397,6 +486,8 @@ impl CgroupNode {
 #[derive(Debug)]
 pub struct CgroupRoot {
     root: Arc<CgroupNode>,
+    /// Delegation is a hierarchy-wide policy, not a property of a mount view.
+    nsdelegate: AtomicBool,
     next_id: AtomicUsize,
     all_nodes: SpinLock<HashMap<usize, Arc<CgroupNode>>>,
     /// Serializes hierarchy changes and device-program state transitions. An
@@ -412,6 +503,7 @@ impl CgroupRoot {
 
         Arc::new(Self {
             root,
+            nsdelegate: AtomicBool::new(false),
             next_id: AtomicUsize::new(2),
             all_nodes: SpinLock::new(all_nodes),
             structure_lock: Mutex::new(()),
@@ -420,6 +512,16 @@ impl CgroupRoot {
 
     pub fn root(&self) -> Arc<CgroupNode> {
         self.root.clone()
+    }
+
+    pub(crate) fn nsdelegate(&self) -> bool {
+        self.nsdelegate.load(Ordering::Acquire)
+    }
+
+    /// The mount control plane checks the initial cgroup namespace and holds
+    /// cgroup::lock() before changing this shared policy.
+    pub(crate) fn set_nsdelegate(&self, enabled: bool) {
+        self.nsdelegate.store(enabled, Ordering::Release);
     }
 
     #[allow(dead_code)]
@@ -439,6 +541,25 @@ impl CgroupRoot {
         parent: &Arc<CgroupNode>,
         name: &str,
     ) -> Result<Arc<CgroupNode>, SystemError> {
+        self.create_child_inner(parent, name, false, |_| {})
+    }
+
+    pub(crate) fn create_child_exclusive_with_init(
+        &self,
+        parent: &Arc<CgroupNode>,
+        name: &str,
+        init: impl FnOnce(&Arc<CgroupNode>),
+    ) -> Result<Arc<CgroupNode>, SystemError> {
+        self.create_child_inner(parent, name, true, init)
+    }
+
+    fn create_child_inner(
+        &self,
+        parent: &Arc<CgroupNode>,
+        name: &str,
+        exclusive: bool,
+        init: impl FnOnce(&Arc<CgroupNode>),
+    ) -> Result<Arc<CgroupNode>, SystemError> {
         if name.is_empty() || name == "." || name == ".." || name.contains('/') {
             return Err(SystemError::EINVAL);
         }
@@ -448,12 +569,16 @@ impl CgroupRoot {
             return Err(SystemError::ENOENT);
         }
         if let Some(existing) = parent.children.read().get(name) {
+            if exclusive {
+                return Err(SystemError::EEXIST);
+            }
             return Ok(existing.clone());
         }
 
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let child = CgroupNode::new_child(id, name.to_string(), parent);
         child.device_bpf.write().effective = parent.device_bpf.read().effective.clone();
+        init(&child);
         parent
             .children
             .write()
@@ -886,23 +1011,6 @@ pub fn cgroup_accounting_lock() -> &'static SpinLock<()> {
     &CGROUP_ACCOUNTING_LOCK
 }
 
-pub fn cgroup_path_relative_to_node(node: &Arc<CgroupNode>, view_root: &Arc<CgroupNode>) -> String {
-    if !view_root.is_ancestor_of(node) {
-        return "/".to_string();
-    }
-
-    let node_path = cgroup_path_components(node);
-    let root_path = cgroup_path_components(view_root);
-
-    let down = &node_path[root_path.len()..];
-
-    if down.is_empty() {
-        return "/".to_string();
-    }
-
-    format!("/{}", down.join("/"))
-}
-
 fn cgroup_path_projected_from_view(node: &Arc<CgroupNode>, view_root: &Arc<CgroupNode>) -> String {
     let node_path = cgroup_path_components(node);
     let root_path = cgroup_path_components(view_root);
@@ -941,16 +1049,18 @@ pub fn cgroup_common_ancestor(left: &Arc<CgroupNode>, right: &Arc<CgroupNode>) -
 }
 //一个已经作为管理节点的node不能同时作为迁移目的地承载普通节点
 pub fn cgroup_migrate_vet_dst(dst: &Arc<CgroupNode>) -> Result<(), SystemError> {
+    // Linux pids_can_attach() transfers charges without applying pids.max;
+    // only creating a new task uses quota admission in cgroup_can_fork_in().
     // Callers hold CGROUP_ACCOUNTING_LOCK. rmdir takes the same lock before
     // removing the node from the online registry, so a successful migration
     // cannot attach a task to a directory which has already been removed.
     if !cgroup_root().is_online(dst) {
         return Err(SystemError::ENOENT);
     }
-    if !dst.is_valid_domain() {
+    if !dst.resource_domain().is_valid_domain() {
         return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
     }
-    if !dst.subtree_control().is_empty() && !dst.can_be_thread_root() {
+    if !dst.subtree_control().is_empty() && !dst.is_threaded() && !dst.can_be_thread_root() {
         return Err(SystemError::EBUSY);
     }
     Ok(())
@@ -971,33 +1081,6 @@ pub fn cgroup_can_fork_in(node: &Arc<CgroupNode>, new_tasks: usize) -> Result<()
         }
         cur = cg.parent();
     }
-    Ok(())
-}
-
-pub fn cgroup_migrate_vet_dst_with_src(
-    src: &Arc<CgroupNode>,
-    dst: &Arc<CgroupNode>,
-    moved_tasks: usize,
-) -> Result<(), SystemError> {
-    cgroup_migrate_vet_dst(dst)?;
-
-    let mut cur = Some(dst.clone());
-    while let Some(cg) = cur {
-        if let Some(max) = cg.pids_max() {
-            let used = cg.pids_current_count();
-            let delta = if cg.is_ancestor_of(src) {
-                0
-            } else {
-                moved_tasks
-            };
-            if used.saturating_add(delta) > max {
-                cg.inc_pids_events_max();
-                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-            }
-        }
-        cur = cg.parent();
-    }
-
     Ok(())
 }
 

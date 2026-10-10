@@ -320,6 +320,8 @@ impl fmt::Debug for NamespaceFilePrivateData {
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub enum FilePrivateData {
+    /// Cgroup migration uses the opener's credentials and cgroup namespace.
+    Cgroup(crate::filesystem::cgroup2::CgroupOpenState),
     /// 管道文件私有信息
     Pipefs(PipeFsPrivateData),
     /// procfs文件私有信息

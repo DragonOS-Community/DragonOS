@@ -8,13 +8,44 @@ use crate::{
     exception::InterruptArch,
     libs::lazy_init::Lazy,
     mm::percpu::PerCpuVar,
-    process::{ProcessControlBlock, ProcessState},
+    process::ProcessControlBlock,
     smp::{core::smp_get_processor_id, cpu::ProcessorId},
     time::jiffies::TICK_NESC,
 };
 use alloc::sync::Arc;
 
 use super::{clock::SchedClock, cpu_irq_time, cpu_rq, prio::PrioUtil, SchedClass};
+
+/// Linux cputime_adjust: retain tick classification while scaling to actual
+/// scheduler runtime. The owner serializes calls with its previous-value lock.
+#[derive(Debug, Default)]
+pub(crate) struct AdjustedCpuTime {
+    user_ns: u64,
+    system_ns: u64,
+}
+
+impl AdjustedCpuTime {
+    pub(crate) fn adjust(&mut self, runtime: u64, user: u64, system: u64) -> (u64, u64) {
+        if self.user_ns.saturating_add(self.system_ns) < runtime {
+            let system = if system == 0 {
+                0
+            } else if user == 0 {
+                runtime
+            } else {
+                ((system as u128 * runtime as u128) / (system as u128 + user as u128)) as u64
+            };
+            let mut system = system.max(self.system_ns);
+            let mut user = runtime - system;
+            if user < self.user_ns {
+                user = self.user_ns;
+                system = runtime - user;
+            }
+            self.user_ns = user;
+            self.system_ns = system;
+        }
+        (self.user_ns, self.system_ns)
+    }
+}
 
 /// CPU 时间类型枚举（对齐 Linux kernel_stat.h 的 cpu_usage_stat）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,6 +68,40 @@ pub const NR_CPU_STATS: usize = 10;
 
 /// Linux 用户空间时间单位（ticks per second）
 pub const USER_HZ: u64 = 100;
+
+/// Linux task_sched_runtime(): only settle an entity still owned by this rq.
+/// Membership/exit aggregation must instead read its settled atomic snapshot.
+pub(crate) fn task_sched_runtime(task: &ProcessControlBlock) -> u64 {
+    loop {
+        let _pi = task.sched_info().pi_lock_irqsave();
+        let Some(cpu) = task.sched_info().on_cpu() else {
+            return task.cputime().sum_exec_runtime.load(Ordering::Relaxed);
+        };
+        if *task.sched_info().on_rq.lock_irqsave() != super::OnRq::Queued {
+            return task.cputime().sum_exec_runtime.load(Ordering::Relaxed);
+        }
+        let binding = cpu_rq(cpu.data() as usize);
+        let (rq, _guard) = binding.self_lock();
+        if task.sched_info().on_cpu() != Some(cpu) {
+            continue;
+        }
+        if core::ptr::eq(Arc::as_ptr(&rq.current()), task)
+            && *task.sched_info().on_rq.lock_irqsave() == super::OnRq::Queued
+        {
+            rq.update_rq_clock();
+            match task.sched_info().sched_class() {
+                SchedClass::Fair => {
+                    super::fair::CompletelyFairScheduler::update_current_chain(&rq.current())
+                }
+                SchedClass::Realtime => {
+                    super::realtime::RealtimeScheduler::update_bandwidth(rq, SchedClass::Realtime)
+                }
+                SchedClass::Idle => {}
+            }
+        }
+        return task.cputime().sum_exec_runtime.load(Ordering::Relaxed);
+    }
+}
 
 /// 将纳秒转换为 USER_HZ 单位的 ticks
 #[inline]
@@ -247,35 +312,13 @@ impl CpuTimeFunc {
                 kcpustat.account(CpuUsageStat::User, accounted_cputime);
             }
             pcb.account_utime(accounted_cputime);
+            pcb.account_cgroup_cputime(true, accounted_cputime);
         } else {
             // 系统态时间：记入 SYSTEM
             // IRQ 和 SOFTIRQ 通过 account_other_time() 在 tick 中单独记账
             kcpustat.account(CpuUsageStat::System, accounted_cputime);
             pcb.account_stime(accounted_cputime);
-        }
-
-        // 只有非 idle 进程才累加 sum_exec_runtime
-        if sched_class != SchedClass::Idle {
-            pcb.add_sum_exec_runtime(accounted_cputime);
-        }
-
-        // 唤醒可能在等待 CPU-time 时钟的线程（clock_nanosleep: PROCESS/THREAD_CPUTIME）。
-        // 线程 CPU-time：仅在该线程运行时推进，因此唤醒该 PCB 的等待队列即可。
-        if !pcb.cputime_wait_queue().is_empty() {
-            pcb.cputime_wait_queue()
-                .wakeup_all(Some(ProcessState::Blocked(true)));
-        }
-
-        // 进程 CPU-time：需要在任一线程推进时唤醒线程组组长上的等待队列。
-        // 这样“主线程 sleep + 子线程 busy loop”的场景才能正确返回。
-        if !pcb.is_thread_group_leader() {
-            if let Some(leader) = pcb.threads_read_irqsave().group_leader() {
-                if !leader.cputime_wait_queue().is_empty() {
-                    leader
-                        .cputime_wait_queue()
-                        .wakeup_all(Some(ProcessState::Blocked(true)));
-                }
-            }
+            pcb.account_cgroup_cputime(false, accounted_cputime);
         }
 
         pcb.account_itimers(user_tick, accounted_cputime);

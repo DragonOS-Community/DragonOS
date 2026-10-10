@@ -212,6 +212,7 @@ impl Timekeeper {
         tk.mono = Some(mono);
         tk.raw = Some(raw);
         tk.clocksource_generation = tk.clocksource_generation.wrapping_add(1);
+        drop(tk);
         Ok(())
     }
 
@@ -304,6 +305,18 @@ fn ns_to_timespec(ns: i128) -> PosixTimeSpec {
 #[inline(always)]
 pub fn timekeeper() -> &'static Timekeeper {
     unsafe { __TIMEKEEPER.as_ref().unwrap() }
+}
+
+/// Only installing the global source may change hardware clockevent mode.
+/// Independent Timekeeper instances (including selftests) have no such effect.
+pub(crate) fn install_clocksource(clock: Arc<dyn Clocksource>) -> Result<(), SystemError> {
+    timekeeper().timekeeper_setup_internals(clock.clone())?;
+    let flags = clock.clocksource_data().flags;
+    super::deadline::clocksource_changed(
+        flags.contains(super::clocksource::ClocksourceFlags::CLOCK_SOURCE_IS_CONTINUOUS)
+            && !flags.contains(super::clocksource::ClocksourceFlags::CLOCK_SOURCE_UNSTABLE),
+    );
+    Ok(())
 }
 
 pub fn boottime_seconds() -> i64 {
@@ -446,9 +459,7 @@ pub fn timekeeping_init() {
     clock
         .enable()
         .expect("clocksource_default_clock enable failed");
-    timekeeper()
-        .timekeeper_setup_internals(clock)
-        .expect("default clocksource has invalid conversion data");
+    install_clocksource(clock).expect("default clocksource has invalid conversion data");
 
     let initial_realtime = ktime_get_real_ns();
     if initial_realtime > 0 {

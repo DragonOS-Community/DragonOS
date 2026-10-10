@@ -1,4 +1,5 @@
 //! Thread-group signal identity and lifecycle, shared only by CLONE_THREAD.
+mod cpu_time;
 mod exec;
 mod job_control;
 mod pending;
@@ -68,6 +69,8 @@ pub struct ProcessSignalState {
     /// Unlike the per-task trapping queue, this survives a leader's exit.
     child_wait_queue: WaitQueue,
     pending: SpinLock<SigPending>,
+    cpu_time_wait: Arc<cpu_time::CpuTimeWait>,
+    pub(crate) cpu_time_adjustment: SpinLock<crate::sched::cputime::AdjustedCpuTime>,
 }
 
 impl Debug for ProcessSignalState {
@@ -126,6 +129,8 @@ impl ProcessSignalState {
             group_exec_wait_queue: WaitQueue::default(),
             child_wait_queue: WaitQueue::default(),
             pending: SpinLock::new(SigPending::default()),
+            cpu_time_wait: cpu_time::CpuTimeWait::new(),
+            cpu_time_adjustment: SpinLock::new(crate::sched::cputime::AdjustedCpuTime::default()),
         })
         .map_err(|_| SystemError::ENOMEM)
     }

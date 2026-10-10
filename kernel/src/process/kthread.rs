@@ -684,6 +684,22 @@ pub(crate) fn run_debug_selftests() -> Result<String, SystemError> {
     let mut report = String::new();
     let mut failures = 0usize;
 
+    if crate::time::deadline::supported() {
+        crate::time::deadline::run_selftests();
+        append_kthread_selftest_case(&mut report, "deadline_generation", true, &mut failures);
+        append_kthread_selftest_case(
+            &mut report,
+            "deadline_fallback",
+            crate::time::deadline::run_fallback_selftest(),
+            &mut failures,
+        );
+    } else {
+        report
+            .push_str("deadline_generation=skip_unavailable\ndeadline_fallback=skip_unavailable\n");
+    }
+    crate::sched::pelt::run_selftests();
+    append_kthread_selftest_case(&mut report, "pelt_arithmetic", true, &mut failures);
+
     append_kthread_selftest_case(
         &mut report,
         "pid_membership_lifetime",

@@ -1,7 +1,9 @@
+pub(crate) mod cfs_bandwidth;
 pub mod clock;
 pub mod completion;
 pub mod cputime;
 pub mod fair;
+pub mod fair_group;
 pub mod fair_tree;
 #[cfg(feature = "fifo_demo")]
 pub mod fifo_demo;
@@ -288,16 +290,21 @@ pub trait Scheduler {
     fn put_prev_task(rq: &mut CpuRunQueue, prev: Arc<ProcessControlBlock>);
 }
 
-#[allow(dead_code)]
+#[derive(Debug)]
 pub struct TaskGroup {
     /// CFS管理的调度实体，percpu的
-    entitys: Vec<Arc<FairSchedEntity>>,
+    pub(crate) entities: Vec<Arc<FairSchedEntity>>,
     /// 每个CPU的CFS运行队列
-    cfs: Vec<Arc<CfsRunQueue>>,
+    pub(crate) cfs: Vec<Arc<CfsRunQueue>>,
     /// 父节点
-    parent: Option<Arc<TaskGroup>>,
+    pub(crate) parent: Option<Arc<TaskGroup>>,
 
-    shares: u64,
+    pub(crate) shares: core::sync::atomic::AtomicU64,
+    pub(crate) load_avg: core::sync::atomic::AtomicU64,
+    pub(crate) idle: core::sync::atomic::AtomicBool,
+    pub(crate) children: [SpinLock<Vec<Weak<TaskGroup>>>; PerCpu::MAX_CPU_NUM as usize],
+    pub(crate) bandwidth: Arc<cfs_bandwidth::CfsBandwidth>,
+    pub(crate) retired: core::sync::atomic::AtomicBool,
 }
 
 #[derive(Debug, Default)]
@@ -510,6 +517,9 @@ pub struct CpuRunQueue {
 
     /// CFS调度器
     cfs: Arc<CfsRunQueue>,
+    /// CPU-local active/blocked CFS queues in child-before-parent order.
+    /// Weak entries do not pin deleted CPU controller instances.
+    cfs_pelt_queues: Vec<Weak<CfsRunQueue>>,
 
     rt: realtime::RealtimeRunQueue,
 
@@ -548,6 +558,7 @@ impl CpuRunQueue {
             calc_load_update: clock() + (5 * HZ + 1),
             calc_load_active: 0,
             cfs: Arc::new(CfsRunQueue::new()),
+            cfs_pelt_queues: Vec::new(),
             rt: realtime::RealtimeRunQueue::new(),
             clock_pelt: 0,
             lost_idle_time: 0,
@@ -735,7 +746,10 @@ impl CpuRunQueue {
         // `rq->cfs.nr_running == 1` means the task is the only runnable fair
         // task, so a reschedule could only re-elect it; Linux skips the
         // request entirely and so does this.
-        if new_class == SchedClass::Fair && new_prio > old_prio && self.cfs.nr_running() > 1 {
+        if new_class == SchedClass::Fair
+            && new_prio > old_prio
+            && pcb.sched_info().sched_entity().cfs_rq().nr_running() > 1
+        {
             self.resched_current();
         }
     }
@@ -909,7 +923,10 @@ impl CpuRunQueue {
         compiler_fence(Ordering::SeqCst);
         self.clock_task += delta;
         compiler_fence(Ordering::SeqCst);
-        // todo: pelt?
+        // This platform currently models CPU and frequency capacity as 1024.
+        // Linux's scaled PELT delta is therefore exactly task-clock delta,
+        // including idle time. No capacity-induced lost idle time exists.
+        self.clock_pelt = self.clock_task;
     }
 
     pub fn calculate_global_load_tick(&mut self) {
@@ -1013,6 +1030,8 @@ impl CpuRunQueue {
             && prev.sched_info().state().is_runnable()
             && *prev.sched_info().on_rq.lock_irqsave() == OnRq::Queued
             && !(prev.sched_info().sched_class() == SchedClass::Realtime && self.rt.is_throttled())
+            && !(prev.sched_info().sched_class() == SchedClass::Fair
+                && CompletelyFairScheduler::task_throttled(&prev))
         {
             next = Some(prev.clone());
         }
@@ -1033,6 +1052,7 @@ impl CpuRunQueue {
             }
         }
 
+        cfs_bandwidth::refresh_runtime_event(self, &next);
         next
     }
 }
@@ -1170,6 +1190,7 @@ pub fn scheduler_tick() {
         SchedClass::Fair => CompletelyFairScheduler::tick(rq, current, false),
         SchedClass::Idle => IdleScheduler::tick(rq, current, false),
     }
+    CompletelyFairScheduler::update_blocked_averages(rq);
 
     rq.calculate_global_load_tick();
 
@@ -1496,10 +1517,7 @@ fn __set_task_cpu(pcb: &Arc<ProcessControlBlock>, cpu: ProcessorId) {
         CompletelyFairScheduler::prepare_task_rq_migration(pcb);
     }
 
-    // TODO: Fixme There is not implement group sched;
-    let se = pcb.sched_info().sched_entity();
-    let rq = cpu_rq(cpu.data() as usize);
-    se.force_mut().set_cfs(Arc::downgrade(&rq.cfs));
+    fair_group::bind_task_group_cpu(pcb, cpu);
 }
 
 /// 对标 Linux ttwu_queue + ttwu_do_activate

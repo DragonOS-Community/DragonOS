@@ -1304,10 +1304,9 @@ impl RestartFn for RestartFnNanosleep {
                     if leader.process_cputime_ns() >= deadline_ns {
                         Ok(())
                     } else {
-                        leader.cputime_wait_queue().wait_event_interruptible(
-                            || leader.process_cputime_ns() >= deadline_ns,
-                            None::<fn()>,
-                        )
+                        leader.process_signal().wait_cpu_time(deadline_ns, || {
+                            leader.process_cputime_ns() >= deadline_ns
+                        })
                     }
                 }
                 PosixClockID::ThreadCPUTimeID => return Err(SystemError::EINVAL),

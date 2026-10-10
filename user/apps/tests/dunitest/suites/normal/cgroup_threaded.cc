@@ -334,6 +334,38 @@ TEST_F(ThreadedCgroup, AncestorConversionRebindsThreadedDescendantAcrossInvalidD
   EXPECT_EQ(3u, Members(c + "/cgroup.threads").size());
 }
 
+TEST_F(ThreadedCgroup, ImplicitThreadRootDoesNotRebindNestedThreadedDomain) {
+  Enable("pids");
+  ASSERT_EQ(0, Write(root_ + "/cgroup.subtree_control", "+pids"));
+  a_ = Make(root_, "a");
+  b_ = Make(a_, "b");
+  ASSERT_EQ(0, Write(b_ + "/cgroup.type", "threaded"));
+  EXPECT_EQ("domain", Read(root_ + "/cgroup.type"));
+  EXPECT_EQ("domain threaded", Read(a_ + "/cgroup.type"));
+  Start(root_);
+  ASSERT_FALSE(HasFatalFailure());
+  EXPECT_EQ("domain threaded", Read(root_ + "/cgroup.type"));
+  EXPECT_EQ("domain invalid", Read(a_ + "/cgroup.type"));
+  EXPECT_EQ("threaded", Read(b_ + "/cgroup.type"));
+  // Unlike explicit cgroup.type conversion, an implicit thread root does
+  // not reassign descendants' resource domains. The old domain is invalid.
+  EXPECT_EQ(EOPNOTSUPP, Write(b_ + "/cgroup.procs", std::to_string(worker_)));
+  EXPECT_EQ(EOPNOTSUPP, Write(b_ + "/cgroup.threads", std::to_string(tids_[1])));
+  EXPECT_EQ((std::set<pid_t>{worker_}), Members(root_ + "/cgroup.procs"));
+  EXPECT_TRUE(Members(a_ + "/cgroup.procs").empty());
+  EXPECT_EQ(0, Command(1, 'F').error);
+  // Removing the implicit root restores the original resource domain;
+  // migration, aggregation and fork into that domain become valid again.
+  ASSERT_EQ(0, Write(root_ + "/cgroup.subtree_control", "-pids"));
+  EXPECT_EQ("domain", Read(root_ + "/cgroup.type"));
+  EXPECT_EQ("domain threaded", Read(a_ + "/cgroup.type"));
+  ASSERT_EQ(0, Write(b_ + "/cgroup.procs", std::to_string(worker_)));
+  EXPECT_TRUE(Members(root_ + "/cgroup.procs").empty());
+  EXPECT_EQ((std::set<pid_t>{worker_}), Members(a_ + "/cgroup.procs"));
+  EXPECT_EQ(0, Command(1, 'F').error);
+  EXPECT_EQ(3u, Members(b_ + "/cgroup.threads").size());
+}
+
 TEST_F(ThreadedCgroup, DelegatedThreadedControllerMigrationAndForkWithoutPrivilege) {
   Enable("cpu");
   Enable("pids");

@@ -157,6 +157,19 @@ pub enum PosixClockID {
 }
 
 impl PosixClockID {
+    /// libc represents CLOCK_PROCESS_CPUTIME_ID sleeps using a dynamic SCHED
+    /// clock. PID zero and the caller's TGID designate the same process.
+    pub(crate) fn canonical_process_cpu_clock(self, current_tgid: usize) -> Self {
+        if let Self::DynamicCpuClock(raw) = self {
+            let pid = (!(raw as i32 >> 3)) as usize;
+            if raw & (CPUCLOCK_PERTHREAD_MASK | CPUCLOCK_CLOCK_MASK) == CPUCLOCK_SCHED
+                && (pid == 0 || pid == current_tgid)
+            {
+                return Self::ProcessCPUTimeID;
+            }
+        }
+        self
+    }
     /// Returns true if this is a per-thread CPU clock (vs per-process)
     pub fn is_per_thread_cpu_clock(&self) -> bool {
         match self {

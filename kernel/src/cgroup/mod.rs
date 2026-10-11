@@ -1,5 +1,6 @@
 pub mod controllers;
 pub mod core;
+pub(crate) mod cpu;
 pub(crate) mod cpuset;
 pub(crate) mod threaded;
 

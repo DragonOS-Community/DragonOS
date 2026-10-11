@@ -47,8 +47,8 @@ impl SchedulerAvg {
     pub fn update_load_sum(
         &mut self,
         now: u64,
-        load: u32,
-        mut runnable: u32,
+        load: u64,
+        mut runnable: u64,
         mut running: u32,
     ) -> bool {
         if now < self.last_update_time {
@@ -76,8 +76,8 @@ impl SchedulerAvg {
     pub fn accumulate_sum(
         &mut self,
         mut delta: u64,
-        load: u32,
-        runnable: u32,
+        load: u64,
+        runnable: u64,
         running: u32,
     ) -> u64 {
         let mut contrib = delta as u32;
@@ -104,10 +104,10 @@ impl SchedulerAvg {
         self.period_contrib = delta as u32;
 
         if load > 0 {
-            self.load_sum += (contrib * load) as u64;
+            self.load_sum += contrib as u64 * load;
         }
         if runnable > 0 {
-            self.runnable_sum += (runnable & contrib << SCHED_CAPACITY_SHIFT) as u64;
+            self.runnable_sum += (runnable * contrib as u64) << SCHED_CAPACITY_SHIFT;
         }
 
         if running > 0 {
@@ -118,7 +118,9 @@ impl SchedulerAvg {
     }
 
     fn decay_load(mut val: u64, n: u64) -> u64 {
-        if unlikely(n > LOAD_AVG_PERIOD) {
+        // y^32 ~= 1/2. Only discard history beyond 63 half-lives;
+        // stopping after the first half-life erases still-significant load.
+        if unlikely(n > LOAD_AVG_PERIOD * 63) {
             return 0;
         }
 
@@ -218,8 +220,8 @@ impl FairSchedEntity {
     pub fn update_load_avg(&mut self, cfs_rq: &mut CfsRunQueue, now: u64) -> bool {
         if self.avg.update_load_sum(
             now,
-            self.on_rq as u32,
-            self.runnable() as u32,
+            self.on_rq() as u64,
+            self.runnable(),
             cfs_rq.is_curr(&self.self_arc()) as u32,
         ) {
             self.avg
@@ -257,4 +259,57 @@ pub fn sub_positive(x: &mut usize, y: usize) {
     } else {
         *x = 0;
     }
+}
+
+/// Exercise the production PELT arithmetic without touching a live runqueue.
+pub(crate) fn run_selftests() {
+    let entity = FairSchedEntity::new();
+    let mut queue = CfsRunQueue::new();
+    let se = entity.force_mut();
+    se.on_rq = super::OnRq::Queued;
+    assert!(se.on_rq());
+    assert_eq!(se.runnable(), 1);
+    assert!(se.update_load_avg(&mut queue, 64 * 1024 * 1024));
+    let load = se.avg.load_sum;
+    let runnable = se.avg.runnable_sum;
+    assert!(load != 0 && runnable != 0);
+    se.on_rq = super::OnRq::None;
+    assert!(!se.on_rq());
+    assert_eq!(se.runnable(), 0);
+    assert!(se.update_load_avg(&mut queue, 128 * 1024 * 1024));
+    assert!(se.avg.load_sum < load && se.avg.runnable_sum < runnable);
+
+    let mut heavy = SchedulerAvg::default();
+    let mut unit = SchedulerAvg::default();
+    heavy.accumulate_sum(65536, 262144, 1, 0);
+    unit.accumulate_sum(65536, 1, 1, 0);
+    assert_eq!(heavy.load_sum, unit.load_sum * 262144);
+    assert!(heavy.load_sum > u32::MAX as u64);
+    for delta in [511, 2048] {
+        let mut one = SchedulerAvg::default();
+        let mut three = SchedulerAvg::default();
+        one.accumulate_sum(delta, 1, 1, 1);
+        three.accumulate_sum(delta, 1, 3, 1);
+        assert!(
+            one.runnable_sum != 0,
+            "PELT must accumulate runnable history"
+        );
+        assert_eq!(three.runnable_sum, one.runnable_sum * 3);
+        assert_eq!(one.runnable_sum, one.load_sum << SCHED_CAPACITY_SHIFT);
+    }
+
+    let value = 1u64 << 40;
+    let half = SchedulerAvg::decay_load(value, 32);
+    let next = SchedulerAvg::decay_load(value, 33);
+    let quarter = SchedulerAvg::decay_load(value, 64);
+    assert!((value / 2 - 1024..=value / 2).contains(&half));
+    assert!(
+        next < half && next > value / 3,
+        "PELT must retain history after 32 periods"
+    );
+    assert!((value / 4 - 1024..=value / 4).contains(&quarter));
+    assert_eq!(
+        SchedulerAvg::decay_load(u64::MAX, LOAD_AVG_PERIOD * 63 + 1),
+        0
+    );
 }

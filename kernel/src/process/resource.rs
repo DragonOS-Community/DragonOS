@@ -226,7 +226,7 @@ impl ProcessControlBlock {
             .unwrap_or_else(ProcessManager::current_pcb)
     }
 
-    fn task_rusage(&self) -> RUsage {
+    fn task_raw_rusage(&self) -> RUsage {
         let ct = self.cputime();
         RUsage {
             ru_utime: RUsageTimeval::from_ns(ct.utime.load(Ordering::Relaxed)),
@@ -237,16 +237,37 @@ impl ProcessControlBlock {
         }
     }
 
+    fn task_rusage(&self) -> RUsage {
+        let (user, system) = self.adjusted_thread_cputime();
+        let mut usage = self.task_raw_rusage();
+        usage.ru_utime = RUsageTimeval::from_ns(user);
+        usage.ru_stime = RUsageTimeval::from_ns(system);
+        usage
+    }
+
+    /// Released-sibling history also feeds SIGCHLD's raw classified times.
+    /// Group getrusage overwrites these CPU fields with its adjusted total.
+    pub(super) fn exit_resource_snapshot(&self) -> RUsage {
+        let mut usage = self.task_raw_rusage();
+        usage.ru_maxrss = self.maxrss_kib();
+        usage
+    }
+
     fn thread_group_rusage(&self) -> RUsage {
+        let (user, system) = self.adjusted_process_cputime();
         let leader = self.leader_for_rusage();
         let ti = leader.threads_read_irqsave();
         let mut usage = *leader.exited_thread_group_rusage.lock();
-        usage.add_assign_saturating(&leader.task_rusage());
+        usage.add_assign_saturating(&leader.task_raw_rusage());
         for task in &ti.group_tasks {
             if let Some(task) = task.upgrade() {
-                usage.add_assign_saturating(&task.task_rusage());
+                usage.add_assign_saturating(&task.task_raw_rusage());
             }
         }
+        // Aggregate CPU time once at group scope; do not sum per-task
+        // adjusted/timeval-rounded values or charge exited members twice.
+        usage.ru_utime = RUsageTimeval::from_ns(user);
+        usage.ru_stime = RUsageTimeval::from_ns(system);
         usage
     }
 
@@ -260,7 +281,7 @@ impl ProcessControlBlock {
     pub(crate) fn exit_notification_rusage(&self) -> RUsage {
         let leader = self.leader_for_rusage();
         let mut usage = *leader.exited_thread_group_rusage.lock();
-        usage.add_assign_saturating(&self.task_rusage());
+        usage.add_assign_saturating(&self.task_raw_rusage());
         usage
     }
 

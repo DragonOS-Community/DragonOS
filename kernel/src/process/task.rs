@@ -144,6 +144,9 @@ pub struct ProcessControlBlock {
     pub(super) nsproxy: RcuOptionArcSlot<NsProxy>,
     /// The cgroup (v2) this task belongs to.
     pub(super) task_cgroup: RwLock<TaskCgroupRef>,
+    /// Stable charging target, replaced with runtime settlement under owner rq.
+    /// Interrupt accounting must never read the sleeping membership RwLock.
+    cpu_accounting: SpinLock<Arc<crate::cgroup::cpu::accounting::CpuAccounting>>,
 
     pub(super) sem_undo: SpinLock<Option<SemUndoAttachment>>,
 
@@ -261,7 +264,6 @@ pub struct ProcessControlBlock {
 
     /// CPU-time wait queue: used for clock_nanosleep with
     /// CLOCK_{PROCESS,THREAD}_CPUTIME_ID.
-    pub(super) cputime_wait_queue: WaitQueue,
 
     /// Thread information.
     pub(super) thread: RwLock<ThreadInfo>,
@@ -287,7 +289,7 @@ pub struct ProcessControlBlock {
     ///
     /// This remains in nanoseconds for CLOCK_PROCESS_CPUTIME_ID.  The separate
     /// rusage accumulator uses timeval precision for the userspace ABI.
-    pub(super) exited_thread_group_cputime_ns: SpinLock<u64>,
+    pub(super) exited_thread_group_cputime_ns: SpinLock<super::cputime::CpuTimeSnapshot>,
     /// Thread-group-level resource accumulation for exited threads. Aligns with
     /// Linux signal_struct's exited thread statistics.
     pub(super) exited_thread_group_rusage: SpinLock<RUsage>,
@@ -492,6 +494,7 @@ impl ProcessControlBlock {
         } else {
             ProcessManager::current_pcb().task_cgroup_ref()
         };
+        let cpu_accounting = task_cgroup.node().cpu_accounting();
 
         let (raw_pid, ppid, cwd, cred, tty): (
             RawPid,
@@ -548,6 +551,7 @@ impl ProcessControlBlock {
                 pid_links: core::array::from_fn(|_| PidLink::default()),
                 nsproxy: RcuOptionArcSlot::new_some(nsproxy),
                 task_cgroup: RwLock::new(task_cgroup),
+                cpu_accounting: SpinLock::new(cpu_accounting),
                 sem_undo: SpinLock::new(None),
                 preempt_count,
                 pagefault_disabled,
@@ -587,7 +591,6 @@ impl ProcessControlBlock {
                 children: RwLock::new(Vec::new()),
                 ptrace: ptrace::PtraceTask::new(),
                 wait_queue: WaitQueue::default(),
-                cputime_wait_queue: WaitQueue::default(),
                 thread: RwLock::new(ThreadInfo::new()),
                 fs: RwLock::new(Some(Arc::new(FsStruct::new()))),
                 fs_slot_update_lock: Mutex::new(()),
@@ -596,7 +599,7 @@ impl ProcessControlBlock {
                 cpu_time: Arc::new(ProcessCpuTime::default()),
                 min_flt: AtomicU64::new(0),
                 maj_flt: AtomicU64::new(0),
-                exited_thread_group_cputime_ns: SpinLock::new(0),
+                exited_thread_group_cputime_ns: SpinLock::new(Default::default()),
                 exited_thread_group_rusage: SpinLock::new(RUsage::default()),
                 historical_maxrss_pages: AtomicUsize::new(0),
                 children_rusage: SpinLock::new(RUsage::default()),
@@ -2056,6 +2059,26 @@ impl ProcessControlBlock {
         self.task_cgroup.read().node()
     }
 
+    pub(crate) fn account_cgroup_runtime(&self, delta_ns: u64) {
+        self.cpu_accounting.lock_irqsave().account_runtime(delta_ns);
+    }
+
+    pub(crate) fn account_cgroup_cputime(&self, user: bool, delta_ns: u64) {
+        self.cpu_accounting
+            .lock_irqsave()
+            .account_cputime(user, delta_ns);
+    }
+
+    /// The caller holds owner rq and has settled execution on the old target.
+    /// Resolve the new target before taking rq; this method never reads the
+    /// sleeping membership lock from a scheduler or interrupt critical section.
+    pub(crate) fn replace_cpu_accounting_locked(
+        &self,
+        accounting: Arc<crate::cgroup::cpu::accounting::CpuAccounting>,
+    ) {
+        *self.cpu_accounting.lock_irqsave() = accounting;
+    }
+
     /// Set the cgroup node that this task belongs to.
     ///
     /// # Safety
@@ -2098,6 +2121,7 @@ impl ProcessControlBlock {
     /// `add_task()`. `add_task()` will be called subsequently in
     /// `ProcessManager::add_pcb()`.
     pub fn set_task_cgroup_node_for_fork(&self, node: Arc<CgroupNode>) {
+        *self.cpu_accounting.lock_irqsave() = node.cpu_accounting();
         *self.task_cgroup.write() = TaskCgroupRef::new(node);
     }
 

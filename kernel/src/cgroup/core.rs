@@ -92,6 +92,10 @@ pub struct CgroupNode {
     tasks: RwLock<HashSet<RawPid>>,
     subtree_control: RwLock<HashSet<String>>,
     cpu: RwLock<CgroupCpuState>,
+    cpu_accounting: Arc<super::cpu::accounting::CpuAccounting>,
+    /// Optional online CPU css. Scheduler paths use the PCB's stable cache,
+    /// never this sleeping configuration lock. Root uses the existing root rq.
+    cpu_group: RwLock<Option<Arc<crate::sched::TaskGroup>>>,
     cpuset: RwLock<super::cpuset::CpusetState>,
     memory: RwLock<CgroupMemoryState>,
     freezer: RwLock<CgroupFreezerState>,
@@ -115,6 +119,8 @@ impl CgroupNode {
             tasks: RwLock::new(HashSet::new()),
             subtree_control: RwLock::new(HashSet::new()),
             cpu: RwLock::new(CgroupCpuState::default()),
+            cpu_accounting: super::cpu::accounting::CpuAccounting::new(None),
+            cpu_group: RwLock::new(None),
             cpuset: RwLock::new(super::cpuset::CpusetState::default()),
             memory: RwLock::new(CgroupMemoryState::default()),
             freezer: RwLock::new(CgroupFreezerState::default()),
@@ -138,6 +144,10 @@ impl CgroupNode {
             tasks: RwLock::new(HashSet::new()),
             subtree_control: RwLock::new(HashSet::new()),
             cpu: RwLock::new(CgroupCpuState::default()),
+            cpu_accounting: super::cpu::accounting::CpuAccounting::new(Some(
+                parent.cpu_accounting.clone(),
+            )),
+            cpu_group: RwLock::new(None),
             cpuset: RwLock::new(super::cpuset::CpusetState::default()),
             memory: RwLock::new(CgroupMemoryState::default()),
             freezer: RwLock::new(CgroupFreezerState::default()),
@@ -152,6 +162,10 @@ impl CgroupNode {
 
     pub fn id(&self) -> usize {
         self.id
+    }
+
+    pub(crate) fn cpu_accounting(&self) -> Arc<super::cpu::accounting::CpuAccounting> {
+        self.cpu_accounting.clone()
     }
 
     pub(crate) fn file_permissions(&self, name: &str, default_mode: u32) -> CgroupFilePermissions {
@@ -304,6 +318,27 @@ impl CgroupNode {
         *self.cpu.read()
     }
 
+    /// Publish a validated CPU configuration under cgroup::UPDATE_LOCK.
+    pub(crate) fn set_cpu_state(&self, state: CgroupCpuState) {
+        *self.cpu.write() = state;
+    }
+
+    pub(crate) fn cpu_group(&self) -> Option<Arc<crate::sched::TaskGroup>> {
+        self.cpu_group.read().clone()
+    }
+
+    /// Topology/configuration callers hold cgroup::UPDATE_LOCK. Retire the old
+    /// css only after its tasks have migrated; publication alone must not tear
+    /// down queues still pinned by scheduler/task references.
+    pub(crate) fn set_cpu_group(&self, group: Option<Arc<crate::sched::TaskGroup>>) {
+        let old = {
+            let mut current = self.cpu_group.write();
+            core::mem::replace(&mut *current, group)
+        };
+        // A last reference can run cleanup: do not drop it under a node lock.
+        drop(old);
+    }
+
     pub(crate) fn reset_controller(&self, name: &str) {
         match name {
             "cpu" => *self.cpu.write() = CgroupCpuState::default(),
@@ -324,14 +359,6 @@ impl CgroupNode {
 
     pub(crate) fn set_cpuset_state(&self, state: super::cpuset::CpusetState) {
         *self.cpuset.write() = state;
-    }
-
-    pub fn set_cpu_weight(&self, weight: u64) {
-        self.cpu.write().set_weight(weight);
-    }
-
-    pub fn set_cpu_max(&self, quota: Option<u64>, period_us: u64) {
-        self.cpu.write().set_max(quota, period_us);
     }
 
     pub fn memory_state(&self) -> CgroupMemoryState {
@@ -578,6 +605,7 @@ impl CgroupRoot {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let child = CgroupNode::new_child(id, name.to_string(), parent);
         child.device_bpf.write().effective = parent.device_bpf.read().effective.clone();
+        super::cpu::initialize_node_locked(&child);
         init(&child);
         parent
             .children
@@ -628,6 +656,7 @@ impl CgroupRoot {
         let empty_state = DeviceBpfState::empty();
         let old_state = core::mem::replace(&mut *child.device_bpf.write(), empty_state);
         drop(_structure_guard);
+        super::cpu::retire_node_locked(&child);
         drop(old_state);
         drop(removed);
         drop(removed_child);

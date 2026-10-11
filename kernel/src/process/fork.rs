@@ -986,6 +986,7 @@ impl ProcessManager {
         if !clone_args.kthread {
             crate::cgroup::cpuset::attach_locked(pcb);
         }
+        crate::cgroup::cpu::fork_locked(pcb);
         sched_cgroup_fork(pcb);
 
         // 处理 rseq 状态。按 Linux copy_process() 顺序，应在任务对外可见前完成。

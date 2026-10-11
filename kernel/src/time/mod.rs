@@ -10,6 +10,7 @@ use crate::time::syscall::PosixTimeval;
 use self::timekeeping::{getnstimeofday, monotonic_now};
 
 pub mod clocksource;
+pub mod deadline;
 pub mod jiffies;
 pub mod sleep;
 pub mod syscall;

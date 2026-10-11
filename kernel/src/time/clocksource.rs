@@ -862,7 +862,7 @@ impl dyn Clocksource {
                 .ok_or(SystemError::EBUSY)?;
             // Switch while the old source is still registered and owned.  A
             // failed validation leaves both registry and timekeeper intact.
-            timekeeping::timekeeper().timekeeper_setup_internals(alternative)?;
+            timekeeping::install_clocksource(alternative)?;
         }
         // 将时钟源从监视链表中弹出
         self.clocksource_dequeue_watchdog(watchdog_replacement)?;
@@ -1252,7 +1252,7 @@ fn clocksource_select_locked() -> Result<(), SystemError> {
             "Switching to the clocksource {:?}\n",
             best.clocksource_data().name
         );
-        timekeeping::timekeeper().timekeeper_setup_internals(best.clone())?;
+        timekeeping::install_clocksource(best.clone())?;
     }
     debug!("clocksource_select finish, current = {best:?}");
     Ok(())

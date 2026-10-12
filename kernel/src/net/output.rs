@@ -462,6 +462,7 @@ pub(crate) fn submit_prepared_ipv6_with_related(
             hint: None,
         },
     )
+    .map(|_| ())
     .map_err(|error| error.error)
 }
 
@@ -471,7 +472,7 @@ fn submit_ipv6(
     mut route: OutputRouteDecision,
     related: Option<CtPacketContext>,
     options: SocketOutput<'_>,
-) -> Result<(), PmtuOutputError> {
+) -> Result<Option<Arc<dyn Iface>>, PmtuOutputError> {
     let SocketOutput {
         policy,
         multicast_loop,
@@ -627,14 +628,16 @@ fn submit_ipv6(
             node_local || clone_local && reservation.bytes()[7] == 0
         })
     {
-        return Ok(());
+        return Ok(clone_local.then_some(egress));
     }
     reservation
         .commit_ipv6(route, identification, ct_context, mark)
         .map_err(|error| PmtuOutputError {
             error,
             mtu: Some(route.ip_mtu),
-        })
+        })?;
+    let local_delivery = route.kind == RTN_LOCAL || !physical_egress || clone_local;
+    Ok(local_delivery.then_some(egress))
 }
 
 /// Submit an IPv4 datagram after its complete buffer and source-owner queue

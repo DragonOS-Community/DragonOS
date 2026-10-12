@@ -225,19 +225,61 @@ TEST(SocketReadvSemantics, TcpWrappedRxFaultReturnsCommittedPrefix) {
     ASSERT_GE(sockets[0], 0);
     ASSERT_GE(sockets[1], 0);
 
-    // DragonOS doubles SO_RCVBUF and clamps it to the Linux minimum of 2304 bytes.
-    // Draining 2300 bytes leaves the smoltcp ring cursor four bytes before its end,
-    // so the next eight-byte payload occupies two contiguous receive regions.
-    int requested_recv_buffer = 1152;
+    // A fresh TCP receive ring starts at its reported buffer size. Force an
+    // actual growth: SO_RCVBUF doubles this request, and the prepared replacement
+    // has exactly the resulting capacity. A later logical shrink retains that
+    // physical ring, so use the grown capacity, not the minimum, for its cursor.
+    int initial_recv_buffer = 0;
+    socklen_t recv_buffer_len = sizeof(initial_recv_buffer);
+    ASSERT_EQ(0, getsockopt(sockets[1], SOL_SOCKET, SO_RCVBUF,
+                           &initial_recv_buffer, &recv_buffer_len)) << strerror(errno);
+    ASSERT_EQ(sizeof(initial_recv_buffer), recv_buffer_len);
+    ASSERT_GT(initial_recv_buffer, 0);
+    ASSERT_EQ(0, setsockopt(sockets[1], SOL_SOCKET, SO_RCVBUF,
+                           &initial_recv_buffer, sizeof(initial_recv_buffer)))
+        << strerror(errno);
+    int physical_recv_capacity = 0;
+    recv_buffer_len = sizeof(physical_recv_capacity);
+    ASSERT_EQ(0, getsockopt(sockets[1], SOL_SOCKET, SO_RCVBUF,
+                           &physical_recv_capacity, &recv_buffer_len)) << strerror(errno);
+    ASSERT_EQ(sizeof(physical_recv_capacity), recv_buffer_len);
+    ASSERT_GT(physical_recv_capacity, initial_recv_buffer);
+
+    int requested_recv_buffer = 0;
     ASSERT_EQ(0, setsockopt(sockets[1], SOL_SOCKET, SO_RCVBUF,
                            &requested_recv_buffer, sizeof(requested_recv_buffer)))
         << strerror(errno);
-    std::array<char, 2300> cursor_advance = {};
-    ASSERT_EQ(static_cast<ssize_t>(cursor_advance.size()),
-              write(sockets[0], cursor_advance.data(), cursor_advance.size()));
-    std::array<char, 2300> drained = {};
-    ASSERT_EQ(static_cast<ssize_t>(drained.size()),
-              read(sockets[1], drained.data(), drained.size()));
+    int logical_recv_limit = 0;
+    recv_buffer_len = sizeof(logical_recv_limit);
+    ASSERT_EQ(0, getsockopt(sockets[1], SOL_SOCKET, SO_RCVBUF,
+                           &logical_recv_limit, &recv_buffer_len)) << strerror(errno);
+    ASSERT_GT(logical_recv_limit, 8);
+    ASSERT_LT(logical_recv_limit, physical_recv_capacity);
+
+    std::array<char, 1024> cursor_advance = {};
+    cursor_advance.fill('x');
+    std::array<char, 1024> drained = {};
+    size_t left = static_cast<size_t>(physical_recv_capacity) - 4;
+    while (left != 0) {
+        const size_t chunk = std::min({left, cursor_advance.size(),
+                                      static_cast<size_t>(logical_recv_limit) / 2});
+        size_t written = 0;
+        while (written != chunk) {
+            const ssize_t size = write(sockets[0], cursor_advance.data() + written,
+                                       chunk - written);
+            ASSERT_GT(size, 0) << strerror(errno);
+            written += static_cast<size_t>(size);
+        }
+        size_t received = 0;
+        while (received != chunk) {
+            const ssize_t size = read(sockets[1], drained.data() + received,
+                                      chunk - received);
+            ASSERT_GT(size, 0) << strerror(errno);
+            received += static_cast<size_t>(size);
+        }
+        ASSERT_EQ(0, std::memcmp(drained.data(), cursor_advance.data(), chunk));
+        left -= chunk;
+    }
 
     ASSERT_EQ(8, write(sockets[0], "abcdefgh", 8));
 

@@ -17,6 +17,34 @@ pub(crate) mod output_account;
 pub(crate) mod registration;
 use system_error::SystemError;
 
+/// Match the syscall-return network service opportunity for local datagrams.
+/// Advance already-admitted local output without retaining socket or routing
+/// guards. OUTPUT may select a different local input device from the source
+/// owner. This bounded service opportunity is not a remote-delivery guarantee;
+/// remaining work continues through the namespace poller.
+pub(crate) fn poll_local_output(
+    netns: &Arc<NetNamespace>,
+    source: &Arc<dyn Iface>,
+    target: &Arc<dyn Iface>,
+) {
+    const LOCAL_OUTPUT_POLL_ROUNDS: usize = 8;
+    let poll = |iface: &Arc<dyn Iface>| {
+        for _ in 0..LOCAL_OUTPUT_POLL_ROUNDS {
+            if !iface
+                .net_namespace()
+                .is_some_and(|owner| Arc::ptr_eq(&owner, netns))
+                || !iface.poll()
+            {
+                break;
+            }
+        }
+    };
+    poll(source);
+    if !Arc::ptr_eq(source, target) {
+        poll(target);
+    }
+}
+
 /**
  * 目前，以下设计仍然没有考虑多网卡的listen问题，仅只解决了socket在绑定单网卡下的问题。
  */

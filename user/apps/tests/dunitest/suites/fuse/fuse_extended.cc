@@ -11038,8 +11038,26 @@ static int ext_test_rename_replace_clears_old_target_path() {
         goto fail;
     }
     errno = 0;
-    if (fchdir(victim_fd) == 0) {
-        printf("[FAIL] replaced target fd still resolved to a path\n");
+    if (fchdir(victim_fd) != 0) {
+        printf("[FAIL] fchdir replaced target: %s (errno=%d)\n", strerror(errno), errno);
+        goto fail_chdir_root;
+    }
+    // Linux retains the directory path owned by an open fd after replacement.
+    // Entering it is valid, but it is disconnected: getcwd must not resolve it
+    // to the source directory now occupying the old target's pathname.
+    errno = 0;
+    if (getcwd(cwd, sizeof(cwd)) != NULL || errno != ENOENT) {
+        printf("[FAIL] replaced target cwd must be disconnected: errno=%d (%s)\n", errno,
+               strerror(errno));
+        goto fail_chdir_root;
+    }
+    if (fchdir(old_fd) != 0 || !getcwd(cwd, sizeof(cwd)) || strcmp(cwd, victim_path) != 0) {
+        printf("[FAIL] source fd alias after entering victim: cwd='%s' errno=%d (%s)\n", cwd,
+               errno, strerror(errno));
+        goto fail_chdir_root;
+    }
+    if (chdir("/") != 0) {
+        printf("[FAIL] chdir(/): %s (errno=%d)\n", strerror(errno), errno);
         goto fail_chdir_root;
     }
     close(old_fd);

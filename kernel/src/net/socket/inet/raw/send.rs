@@ -190,13 +190,16 @@ impl RawSocket {
         } else {
             self.remember_output_path(destination, fixed_source, required_oif, hint);
         }
-        if let Err(failure) = result {
+        let local_target = result.map_err(|failure| {
             if failure.error == SystemError::EMSGSIZE {
                 if let Some(mtu) = failure.mtu {
                     self.local_mtu_error(destination, mtu);
                 }
             }
-            return Err(failure.error);
+            failure.error
+        })?;
+        if let Some(target) = local_target {
+            super::super::common::poll_local_output(&self.netns, &owner, &target);
         }
         Ok(buf.len())
     }
@@ -380,13 +383,16 @@ impl RawSocket {
         } else {
             self.remember_output_path(destination, bound_source, required_oif, hint);
         }
-        if let Err(failure) = result {
+        let local_target = result.map_err(|failure| {
             if failure.error == SystemError::EMSGSIZE {
                 if let Some(mtu) = failure.mtu {
                     self.local_mtu_error(destination, mtu);
                 }
             }
-            return Err(failure.error);
+            failure.error
+        })?;
+        if let Some(target) = local_target {
+            super::super::common::poll_local_output(&self.netns, &owner, &target);
         }
         Ok(buf.len())
     }

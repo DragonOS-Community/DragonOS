@@ -1058,13 +1058,13 @@ impl Listening {
         backlog.saturating_add(1)
     }
 
-    pub(super) fn prepare_syn(&mut self, local: smoltcp::wire::IpEndpoint, device: u32) {
+    pub(super) fn prepare_syn(&mut self, local: smoltcp::wire::IpEndpoint, device: u32) -> bool {
         if local.port != self.local.port
             || !self.domain.matches(local.addr)
             || (self.device_binding.ifindex() != 0
                 && self.device_binding.ifindex() != device as usize)
         {
-            return;
+            return false;
         }
         if self.shrink_pending {
             self.trim_excess();
@@ -1072,15 +1072,16 @@ impl Listening {
             self.rearm_closed_slots();
         }
         // Actual SYN matching selects its family policy inside smoltcp. This
-        // hook only rearms existing stock and requests task-context refill.
+        // hook rearms existing stock and requests preparation outside inner.
         if self.inners.len() >= self.target_slots
             || self.inners.iter().any(|bound| {
                 bound.with::<tcp::Socket, _, _>(|socket| socket.state() == tcp::State::Listen)
             })
         {
-            return;
+            return false;
         }
         self.request_refill();
+        self.refill_requested
     }
 
     pub(super) fn has_excess_slots(&self) -> bool {

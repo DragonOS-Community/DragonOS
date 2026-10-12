@@ -51,6 +51,9 @@ fn ownership_case(src: u32, fail: bool) -> Result<bool, SystemError> {
             &crate::cgroup::memory::object_for_task(&task),
         )
     })?;
+    // The descriptor must be the only File owner for the close/rollback
+    // checks below; alloc_fd_arc clones rather than consumes this handle.
+    drop(file);
     let mut insns = Vec::new();
     append_load(&mut insns, src, fd);
     // A duplicate must not acquire a second persistent map reference.

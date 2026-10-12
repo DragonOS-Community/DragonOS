@@ -346,7 +346,7 @@ impl TcpStack {
     /// for an idle stack: the next poll pass must run after that owner exits.
     /// No upper-layer notification runs under TCP locks.
     pub fn poll(&self) -> bool {
-        let mut poll_guard = self.poll_lock.lock();
+        let poll_guard = self.poll_lock.lock();
         let Some(namespace) = self.namespace.upgrade() else {
             return false;
         };
@@ -386,10 +386,11 @@ impl TcpStack {
                 if tcp.syn() && !tcp.ack() && !tcp.rst() {
                     let local =
                         smoltcp::wire::IpEndpoint::new(packet.ip.dst_addr(), tcp.dst_port());
-                    // The packet is held uniquely and remains in-flight. Pins
-                    // may own the last wrapper, so even their physical Drop
-                    // must occur outside poll serialization and protocol locks.
-                    drop(poll_guard);
+                    // Keep admission and dispatch serialized: another poller
+                    // must not consume the last Listen slot after preparation
+                    // but before this SYN is matched. Refill is task-context
+                    // TryOnly and takes no reclaim/OOM path; all preparation
+                    // and retirement remain outside inner/SocketSet/FIB locks.
                     let end = self.bounds.end();
                     for start in (0..end).step_by(crate::net::tcp_bounds::BOUND_BATCH) {
                         let pins = self.bounds.snapshot(start, end);
@@ -397,7 +398,6 @@ impl TcpStack {
                             socket.prepare_tcp_syn(local, packet.meta.id);
                         }
                     }
-                    poll_guard = self.poll_lock.lock();
                 }
             }
             let router = namespace.router();

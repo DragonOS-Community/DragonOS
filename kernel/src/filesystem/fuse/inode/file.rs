@@ -1539,17 +1539,8 @@ impl FuseNode {
             }
 
             let run_start = idx;
-            // Required pages and optional readahead must have separate
-            // admission transactions. Otherwise an optional page exhausting
-            // the quota would fail the foreground fault and invoke its OOM
-            // recovery even when the demanded pages fit.
-            let run_limit = if run_start < demand_end_page {
-                core::cmp::min(end_page, demand_end_page)
-            } else {
-                end_page
-            };
             let mut run_end = run_start + 1;
-            while run_end < run_limit
+            while run_end < end_page
                 && run_end - run_start < max_pages
                 && !page_cache.is_page_ready(run_end)
             {
@@ -1563,36 +1554,36 @@ impl FuseNode {
                 break;
             }
 
-            let read_pages_len = (run_end - run_start)
-                .checked_mul(MMArch::PAGE_SIZE)
-                .ok_or(SystemError::EOVERFLOW)?;
-            let read_len = core::cmp::min(
-                core::cmp::min(read_pages_len, max_read),
-                file_ctx.file_size - read_offset,
-            );
-            if read_len == 0 {
-                break;
-            }
-
             let speculative = run_start >= demand_end_page;
             let domain_io = page_cache.try_acquire_domain_io()?;
             let track_direct_read_stats = super::super::stats::optional_read_stats_enabled();
-            let target = match page_cache.manager().try_reserve_read_dma(
-                run_start,
-                run_end - run_start,
-                track_direct_read_stats,
-                owner,
-                creator,
-            ) {
-                Ok(target) => match Arc::try_new(target) {
-                    Ok(target) => target,
-                    // Failed wrapping drops the unpublished reservation and
-                    // rolls its markers back. Optional metadata allocation
-                    // must not cancel required requests already in flight;
-                    // the normal tail below still drains their completions.
-                    Err(_) if speculative => break,
-                    Err(_) => return Err(SystemError::ENOMEM.into()),
-                },
+            let prepare_target = |end: usize| {
+                let target = page_cache.manager().try_reserve_read_dma(
+                    run_start,
+                    end - run_start,
+                    track_direct_read_stats,
+                    owner,
+                    creator,
+                )?;
+                // Failed wrapping drops the unpublished reservation and
+                // rolls back its exact Loading markers and page receipts.
+                Arc::try_new(target).map_err(|_| MemoryAllocationError::from(SystemError::ENOMEM))
+            };
+            let candidate = match prepare_target(run_end) {
+                Err(_) if !speculative && run_end > demand_end_page => {
+                    // Preserve a single batched READ when its advisory pages
+                    // fit. TryOnly failure (including metadata or an advisory
+                    // conflict) has already retired the entire candidate;
+                    // retry only demand before exposing a foreground failure.
+                    // Optional admission must never send an otherwise fitting
+                    // fault into quota recovery/OOM.
+                    run_end = demand_end_page;
+                    prepare_target(run_end)
+                }
+                candidate => candidate,
+            };
+            let target = match candidate {
+                Ok(target) => target,
                 Err(MemoryAllocationError::System(SystemError::EEXIST)) => {
                     super::super::stats::on_readahead_reservation_conflict();
                     if speculative {
@@ -1611,6 +1602,16 @@ impl FuseNode {
                 Err(_) if speculative => break,
                 Err(error) => return Err(error),
             };
+            // A fallback can shrink the reservation. Derive every transport
+            // length from the successfully prepared range, never the rejected
+            // full window, so the daemon cannot overwrite its DMA destination.
+            let read_pages_len = (run_end - run_start)
+                .checked_mul(MMArch::PAGE_SIZE)
+                .ok_or(SystemError::EOVERFLOW)?;
+            let read_len = core::cmp::min(
+                core::cmp::min(read_pages_len, max_read),
+                file_ctx.file_size - read_offset,
+            );
             let read_in = FuseReadIn {
                 fh: file_ctx.fh,
                 offset: read_offset as u64,

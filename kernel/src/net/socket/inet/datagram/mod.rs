@@ -52,9 +52,6 @@ pub(crate) mod udp_bindings;
 
 type EP = crate::filesystem::epoll::EPollEventType;
 const IFACE_POLL_BATCH_ROUNDS: usize = 128;
-// Match the syscall-return network softirq opportunity for local UDP output
-// without waiting for a particular receiver or draining unrelated traffic.
-const LOCAL_OUTPUT_POLL_ROUNDS: usize = 8;
 
 /// Native IPv6 datagrams use the prepared source-fragmentation output owner.
 fn uses_prepared_ipv6_output(endpoint: IpEndpoint) -> bool {
@@ -499,15 +496,6 @@ impl UdpSocket {
                 crate::sched::sched_yield();
             } else {
                 return;
-            }
-        }
-    }
-
-    #[inline]
-    fn poll_local_output(iface: &dyn crate::net::Iface) {
-        for _ in 0..LOCAL_OUTPUT_POLL_ROUNDS {
-            if !iface.poll() {
-                break;
             }
         }
     }
@@ -1615,10 +1603,7 @@ impl UdpSocket {
             // OUTPUT may reroute the packet. First advance the source owner's
             // admitted output, then the actual local delivery interface.
             // Neither the socket-placement nor FIB/ruleset locks are held.
-            Self::poll_local_output(snapshot.owner.as_ref());
-            if !Arc::ptr_eq(&snapshot.owner, &target) {
-                Self::poll_local_output(target.as_ref());
-            }
+            super::common::poll_local_output(&self.netns, &snapshot.owner, &target);
         }
         Ok(payload.len())
     }

@@ -74,7 +74,9 @@ pub(super) fn do_faccessat(
     let (inode, path) = user_path_at(&ProcessManager::current_pcb(), dirfd, path)?;
 
     // 如果找不到文件，则返回错误码ENOENT
-    let inode = inode.lookup_follow_symlink(path.as_str(), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
+    let inode = File::recover_io(|| {
+        inode.lookup_follow_symlink(path.as_str(), VFS_MAX_FOLLOW_SYMLINK_TIMES)
+    })?;
     // Linux still checks device-cgroup policy for access(F_OK), with no
     // READ/WRITE bits in the device access type.
 
@@ -143,12 +145,14 @@ pub fn do_fchmodat(
         }
     } else {
         let (start, rest) = user_resolved_path_at(&current, dirfd, path)?;
-        start.inode().lookup_follow_symlink_owned(
-            &start,
-            &rest,
-            VFS_MAX_FOLLOW_SYMLINK_TIMES,
-            flags & AtFlags::AT_SYMLINK_NOFOLLOW.bits() as u32 == 0,
-        )?
+        File::recover_io(|| {
+            start.inode().lookup_follow_symlink_owned(
+                &start,
+                &rest,
+                VFS_MAX_FOLLOW_SYMLINK_TIMES,
+                flags & AtFlags::AT_SYMLINK_NOFOLLOW.bits() as u32 == 0,
+            )
+        })?
     };
 
     do_fchmod(resolved.inode(), chmod_mode_from_user(mode))
@@ -161,37 +165,39 @@ pub fn do_fchmod(inode: Arc<dyn IndexNode>, mode: InodeMode) -> Result<usize, Sy
         .clone()
         .downcast_arc::<MountFSInode>()
         .map(|inode| inode.op_context());
-    inode.update_metadata_masked(&mut |current| {
-        if current
-            .flags
-            .intersects(InodeFlags::S_IMMUTABLE | InodeFlags::S_APPEND)
-        {
-            return Err(SystemError::EPERM);
-        }
-        // Linux 6.6 notify_change(ATTR_MODE) rejects chmod on a symlink.
-        if current.file_type == FileType::SymLink {
-            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
-        }
-        let mut metadata = current.clone();
-        metadata.mode = chmod_preserve_type(current.mode, mode);
-        if let Some(operation) = &operation {
-            operation.validate_setattr_mapping(
-                current,
-                &metadata,
-                SetMetadataMask::MODE | SetMetadataMask::CTIME,
-            )?;
-        }
-        // Permission is evaluated from the snapshot committed under the lock.
-        if !cred.is_owner_or_capable(current) {
-            return Err(SystemError::EPERM);
-        }
-        let gid = Kgid::from(current.gid);
-        let has_fsetid = cred.has_capability_wrt_inode_uidgid(current, CAPFlags::CAP_FSETID);
-        if !has_fsetid && cred.fsgid.data() != current.gid && !cred.getgroups().contains(&gid) {
-            metadata.mode.remove(InodeMode::S_ISGID);
-        }
-        metadata.ctime = PosixTimeSpec::now();
-        Ok((metadata, SetMetadataMask::MODE | SetMetadataMask::CTIME))
+    File::recover_io(|| {
+        inode.update_metadata_masked(&mut |current| {
+            if current
+                .flags
+                .intersects(InodeFlags::S_IMMUTABLE | InodeFlags::S_APPEND)
+            {
+                return Err(SystemError::EPERM);
+            }
+            // Linux 6.6 notify_change(ATTR_MODE) rejects chmod on a symlink.
+            if current.file_type == FileType::SymLink {
+                return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+            }
+            let mut metadata = current.clone();
+            metadata.mode = chmod_preserve_type(current.mode, mode);
+            if let Some(operation) = &operation {
+                operation.validate_setattr_mapping(
+                    current,
+                    &metadata,
+                    SetMetadataMask::MODE | SetMetadataMask::CTIME,
+                )?;
+            }
+            // Permission is evaluated from the snapshot committed under the lock.
+            if !cred.is_owner_or_capable(current) {
+                return Err(SystemError::EPERM);
+            }
+            let gid = Kgid::from(current.gid);
+            let has_fsetid = cred.has_capability_wrt_inode_uidgid(current, CAPFlags::CAP_FSETID);
+            if !has_fsetid && cred.fsgid.data() != current.gid && !cred.getgroups().contains(&gid) {
+                metadata.mode.remove(InodeMode::S_ISGID);
+            }
+            metadata.ctime = PosixTimeSpec::now();
+            Ok((metadata, SetMetadataMask::MODE | SetMetadataMask::CTIME))
+        })
     })?;
     // fsnotify: attribute change → IN_ATTRIB.
     fsnotify::fsnotify_inode(FsEvent::ATTRIB, &inode);
@@ -214,11 +220,13 @@ pub fn do_fchownat(
     let follow_symlink = !flag.contains(AtFlags::AT_SYMLINK_NOFOLLOW);
     let (inode, path) = user_path_at(&ProcessManager::current_pcb(), dirfd, path)?;
 
-    let inode = if follow_symlink {
-        inode.lookup_follow_symlink(path.as_str(), VFS_MAX_FOLLOW_SYMLINK_TIMES)
-    } else {
-        inode.lookup_follow_symlink2(path.as_str(), VFS_MAX_FOLLOW_SYMLINK_TIMES, false)
-    }?;
+    let inode = File::recover_io(|| {
+        if follow_symlink {
+            inode.lookup_follow_symlink(path.as_str(), VFS_MAX_FOLLOW_SYMLINK_TIMES)
+        } else {
+            inode.lookup_follow_symlink2(path.as_str(), VFS_MAX_FOLLOW_SYMLINK_TIMES, false)
+        }
+    })?;
 
     return chown_common(inode, uid, gid);
 }
@@ -256,94 +264,96 @@ fn chown_common(inode: Arc<dyn IndexNode>, uid: usize, gid: usize) -> Result<usi
         };
         (uid, gid)
     };
-    let mask = inode.update_metadata_masked(&mut |current| {
-        let mut meta = current.clone();
-        let mut id_mask = SetMetadataMask::CTIME;
-        if change_uid {
-            meta.uid = uid;
-            id_mask.insert(SetMetadataMask::UID);
-        }
-        if change_gid {
-            meta.gid = gid;
-            id_mask.insert(SetMetadataMask::GID);
-        }
-        if (change_uid || change_gid)
-            && current
-                .flags
-                .intersects(InodeFlags::S_IMMUTABLE | InodeFlags::S_APPEND)
-        {
-            return Err(SystemError::EPERM);
-        }
-        if let Some(operation) = &operation {
-            operation.validate_setattr_mapping(current, &meta, id_mask)?;
-        }
-        let old_mode = current.mode;
-        let has_chown = cred.has_capability_wrt_inode_uidgid(current, CAPFlags::CAP_CHOWN);
-        let owner_chown = operation.as_ref().is_some_and(|operation| {
-            cred.has_capability_in_ns(&operation.fs_userns, CAPFlags::CAP_CHOWN)
-        });
-        let has_fsetid = cred.has_capability_wrt_inode_uidgid(current, CAPFlags::CAP_FSETID);
+    let mask = File::recover_io(|| {
+        inode.update_metadata_masked(&mut |current| {
+            let mut meta = current.clone();
+            let mut id_mask = SetMetadataMask::CTIME;
+            if change_uid {
+                meta.uid = uid;
+                id_mask.insert(SetMetadataMask::UID);
+            }
+            if change_gid {
+                meta.gid = gid;
+                id_mask.insert(SetMetadataMask::GID);
+            }
+            if (change_uid || change_gid)
+                && current
+                    .flags
+                    .intersects(InodeFlags::S_IMMUTABLE | InodeFlags::S_APPEND)
+            {
+                return Err(SystemError::EPERM);
+            }
+            if let Some(operation) = &operation {
+                operation.validate_setattr_mapping(current, &meta, id_mask)?;
+            }
+            let old_mode = current.mode;
+            let has_chown = cred.has_capability_wrt_inode_uidgid(current, CAPFlags::CAP_CHOWN);
+            let owner_chown = operation.as_ref().is_some_and(|operation| {
+                cred.has_capability_in_ns(&operation.fs_userns, CAPFlags::CAP_CHOWN)
+            });
+            let has_fsetid = cred.has_capability_wrt_inode_uidgid(current, CAPFlags::CAP_FSETID);
 
-        // Linux chown_ok/chgrp_ok: retaining one's own uid, or choosing an
-        // owned file's group, is allowed; arbitrary changes require CAP_CHOWN.
-        if change_uid
-            && !has_chown
-            && !(current.uid == u32::MAX as usize && owner_chown)
-            && (fsuid != current.uid || uid != current.uid)
-        {
-            return Err(SystemError::EPERM);
-        }
-        if change_gid
-            && !has_chown
-            && !(current.gid == u32::MAX as usize && owner_chown)
-            && (fsuid != current.uid
-                || (gid != current.gid
-                    && gid != fsgid
-                    && !cred.getgroups().contains(&Kgid::from(gid))))
-        {
-            return Err(SystemError::EPERM);
-        }
-        if change_uid {
-            meta.uid = uid;
-        }
-        if change_gid {
-            meta.gid = gid;
-        }
+            // Linux chown_ok/chgrp_ok: retaining one's own uid, or choosing an
+            // owned file's group, is allowed; arbitrary changes require CAP_CHOWN.
+            if change_uid
+                && !has_chown
+                && !(current.uid == u32::MAX as usize && owner_chown)
+                && (fsuid != current.uid || uid != current.uid)
+            {
+                return Err(SystemError::EPERM);
+            }
+            if change_gid
+                && !has_chown
+                && !(current.gid == u32::MAX as usize && owner_chown)
+                && (fsuid != current.uid
+                    || (gid != current.gid
+                        && gid != fsgid
+                        && !cred.getgroups().contains(&Kgid::from(gid))))
+            {
+                return Err(SystemError::EPERM);
+            }
+            if change_uid {
+                meta.uid = uid;
+            }
+            if change_gid {
+                meta.gid = gid;
+            }
 
-        // Linux clears setid bits on chown of non-directories. A resulting
-        // MODE update still requires owner/CAP_FOWNER, even for (-1, -1).
-        if meta.file_type != FileType::Dir {
-            id_mask.insert(SetMetadataMask::KILL_PRIV);
-            meta.mode.remove(InodeMode::S_ISUID);
-            if should_remove_sgid_on_chown(meta.mode, current.gid, &cred, has_fsetid) {
+            // Linux clears setid bits on chown of non-directories. A resulting
+            // MODE update still requires owner/CAP_FOWNER, even for (-1, -1).
+            if meta.file_type != FileType::Dir {
+                id_mask.insert(SetMetadataMask::KILL_PRIV);
+                meta.mode.remove(InodeMode::S_ISUID);
+                if should_remove_sgid_on_chown(meta.mode, current.gid, &cred, has_fsetid) {
+                    meta.mode.remove(InodeMode::S_ISGID);
+                }
+            }
+            // When clearing SUID turns chown into a MODE update, Linux
+            // setattr_prepare checks SGID against the requested *new* GID.
+            if meta.mode != old_mode
+                && meta.mode.contains(InodeMode::S_ISGID)
+                && !has_fsetid
+                && fsgid != meta.gid
+                && !cred.getgroups().contains(&Kgid::from(meta.gid))
+            {
                 meta.mode.remove(InodeMode::S_ISGID);
             }
-        }
-        // When clearing SUID turns chown into a MODE update, Linux
-        // setattr_prepare checks SGID against the requested *new* GID.
-        if meta.mode != old_mode
-            && meta.mode.contains(InodeMode::S_ISGID)
-            && !has_fsetid
-            && fsgid != meta.gid
-            && !cred.getgroups().contains(&Kgid::from(meta.gid))
-        {
-            meta.mode.remove(InodeMode::S_ISGID);
-        }
-        if meta.mode != old_mode && !cred.is_owner_or_capable(current) {
-            return Err(SystemError::EPERM);
-        }
-        let mut mask = id_mask;
-        if change_uid {
-            mask.insert(SetMetadataMask::UID);
-        }
-        if change_gid {
-            mask.insert(SetMetadataMask::GID);
-        }
-        if meta.mode != old_mode {
-            mask.insert(SetMetadataMask::MODE);
-        }
-        meta.ctime = PosixTimeSpec::now();
-        Ok((meta, mask))
+            if meta.mode != old_mode && !cred.is_owner_or_capable(current) {
+                return Err(SystemError::EPERM);
+            }
+            let mut mask = id_mask;
+            if change_uid {
+                mask.insert(SetMetadataMask::UID);
+            }
+            if change_gid {
+                mask.insert(SetMetadataMask::GID);
+            }
+            if meta.mode != old_mode {
+                mask.insert(SetMetadataMask::MODE);
+            }
+            meta.ctime = PosixTimeSpec::now();
+            Ok((meta, mask))
+        })
     })?;
     if mask.intersects(SetMetadataMask::UID | SetMetadataMask::GID | SetMetadataMask::MODE) {
         fsnotify::fsnotify_inode(FsEvent::ATTRIB, &inode);
@@ -398,7 +408,27 @@ pub(crate) fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usi
     let cloexec = how.o_flags.contains(FileFlags::O_CLOEXEC);
     let current = ProcessManager::current_pcb();
     let fd_table = current.fd_table();
-    let reservation = fd_table.reserve::<1>(current.nofile_soft_limit(), 0, cloexec)?;
+    let reservation = File::recover_io(|| {
+        fd_table.reserve::<1>(
+            current.nofile_soft_limit(),
+            0,
+            cloexec,
+            &crate::cgroup::memory::object_for_task(&current),
+        )
+    })?;
+    if path.is_empty() {
+        return Err(SystemError::ENOENT);
+    }
+    // File storage is admitted before create/preopen. Its immutable receipt
+    // then follows this exact pathname result; an open retry never redoes
+    // lookup or O_EXCL creation.
+    let mut recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::default();
+    let storage = loop {
+        match super::file::PreparedFile::try_new() {
+            Ok(storage) => break storage,
+            Err(error) => error.recover(&mut recovery)?,
+        }
+    };
     let open_result = (|| -> Result<File, SystemError> {
         // Linux makes O_CREAT|O_EXCL imply O_NOFOLLOW for the final component.
         let follow_symlink = !(how.o_flags.contains(FileFlags::O_NOFOLLOW)
@@ -428,22 +458,24 @@ pub(crate) fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usi
         let walk_options = (!how.resolve.is_empty())
             .then(|| super::utils::PathWalkOptions::new(how.resolve, scope_root));
         let inode_begin = start_path.inode();
-        let resolved = if let Some(options) = &walk_options {
-            inode_begin.lookup_openat2_owned(
-                &start_path,
-                &path,
-                VFS_MAX_FOLLOW_SYMLINK_TIMES,
-                follow_symlink,
-                options,
-            )
-        } else {
-            inode_begin.lookup_follow_symlink_or_missing_owned(
-                &start_path,
-                &path,
-                VFS_MAX_FOLLOW_SYMLINK_TIMES,
-                follow_symlink,
-            )
-        };
+        let resolved = File::recover_io(|| {
+            if let Some(options) = &walk_options {
+                inode_begin.lookup_openat2_owned(
+                    &start_path,
+                    &path,
+                    VFS_MAX_FOLLOW_SYMLINK_TIMES,
+                    follow_symlink,
+                    options,
+                )
+            } else {
+                inode_begin.lookup_follow_symlink_or_missing_owned(
+                    &start_path,
+                    &path,
+                    VFS_MAX_FOLLOW_SYMLINK_TIMES,
+                    follow_symlink,
+                )
+            }
+        });
         let mut created = false;
         let mut preopened: Option<PreopenedFile> = None;
         let mut created_open = None;
@@ -505,29 +537,29 @@ pub(crate) fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usi
                     let inode: Arc<dyn IndexNode> = if let Some(mounted) =
                         parent_inode.clone().downcast_arc::<MountFSInode>()
                     {
-                        let opened = mounted.create_file_with_post_commit(
-                            &filename,
-                            create_mode,
-                            &create_flags,
-                            notify,
-                        )?;
+                        let opened = File::recover_io(|| {
+                            mounted.create_file_with_post_commit(
+                                &filename,
+                                create_mode,
+                                &create_flags,
+                                notify,
+                            )
+                        })?;
                         let inode = opened.inode();
                         created_open = Some(opened);
                         inode
                     } else {
-                        let inode = match parent_inode.create_and_open(
-                            &filename,
-                            create_mode,
-                            &create_flags,
-                        ) {
+                        let inode = match File::recover_io(|| {
+                            parent_inode.create_and_open(&filename, create_mode, &create_flags)
+                        }) {
                             Ok(opened) => {
                                 let inode = opened.inode();
                                 preopened = Some(opened);
                                 inode
                             }
-                            Err(SystemError::ENOSYS) => {
-                                parent_inode.create(&filename, FileType::File, create_mode)?
-                            }
+                            Err(SystemError::ENOSYS) => File::recover_io(|| {
+                                parent_inode.create(&filename, FileType::File, create_mode)
+                            })?,
                             Err(err) => return Err(err),
                         };
                         fsnotify::fsnotify(
@@ -577,12 +609,16 @@ pub(crate) fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usi
             let (_, mount_guard, _directory_operation) = resolved.into_parts();
             let tmp_path = ResolvedPath::from_existing_mount(tmpfile.inode(), mount_guard)?;
             let (_, mount_guard, operation_guard) = tmp_path.into_parts();
-            let file = File::new_unlinked_with_mount_guard(
+            let mut file = File::new_unlinked_with_mount_guard(
+                storage,
                 tmpfile,
                 how.o_flags,
                 mount_guard,
                 operation_guard,
             )?;
+            while let Err(error) = file.complete_open() {
+                error.recover(&mut recovery)?;
+            }
             file.notify_open_event();
             return Ok(file);
         }
@@ -714,8 +750,9 @@ pub(crate) fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usi
             }
         }
         let (inode, mount_guard, operation_guard) = resolved.into_parts();
-        let file: File = if let Some(created) = created_open {
+        let mut file: File = if let Some(created) = created_open {
             File::new_created_with_mount_guard(
+                storage,
                 created,
                 how.o_flags,
                 mount_guard,
@@ -727,12 +764,14 @@ pub(crate) fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usi
         } else {
             match preopened {
                 Some(opened) => File::new_preopened_with_mount_guard(
+                    storage,
                     opened,
                     how.o_flags,
                     mount_guard,
                     operation_guard,
                 )?,
                 None => File::new_with_mount_guard(
+                    storage,
                     inode,
                     how.o_flags,
                     mount_guard,
@@ -743,12 +782,17 @@ pub(crate) fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usi
                 )?,
             }
         };
+        while let Err(error) = file.complete_open() {
+            error.recover(&mut recovery)?;
+        }
 
         // Linux emits OPEN from do_dentry_open() before handle_truncate().
         file.notify_open_event();
         if let Some(metadata_before_open) = truncate_metadata {
             let context = prepare_open_truncate(metadata_before_open);
-            vfs_open_truncate(&file, &context)?;
+            while let Err(error) = vfs_open_truncate(&file, &context) {
+                error.recover(&mut recovery)?;
+            }
         }
         Ok(file)
     })();
@@ -797,14 +841,17 @@ pub fn do_open_execat_with_flags(
     } else {
         let (inode_begin, path) = user_path_at(&ProcessManager::current_pcb(), dirfd, path)?;
         if flags.contains(AtFlags::AT_SYMLINK_NOFOLLOW) {
-            let inode =
-                inode_begin.lookup_follow_symlink2(&path, VFS_MAX_FOLLOW_SYMLINK_TIMES, false)?;
+            let inode = File::recover_io(|| {
+                inode_begin.lookup_follow_symlink2(&path, VFS_MAX_FOLLOW_SYMLINK_TIMES, false)
+            })?;
             if inode.metadata()?.file_type == FileType::SymLink {
                 return Err(SystemError::ELOOP);
             }
             inode
         } else {
-            inode_begin.lookup_follow_symlink(&path, VFS_MAX_FOLLOW_SYMLINK_TIMES)?
+            File::recover_io(|| {
+                inode_begin.lookup_follow_symlink(&path, VFS_MAX_FOLLOW_SYMLINK_TIMES)
+            })?
         }
     };
 
@@ -823,7 +870,13 @@ pub fn do_open_execat_with_flags(
     super::permission::check_inode_permission(&inode, &metadata, PermissionMask::MAY_EXEC)?;
 
     // 创建File对象，使用O_RDONLY | O_CLOEXEC
-    let file = File::new(inode, FileFlags::O_RDONLY | FileFlags::O_CLOEXEC)?;
+    let mut recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::default();
+    let file = loop {
+        match File::new(inode.clone(), FileFlags::O_RDONLY | FileFlags::O_CLOEXEC) {
+            Ok(file) => break file,
+            Err(error) => error.recover(&mut recovery)?,
+        }
+    };
     file.notify_open_event();
 
     Ok(Arc::new(file))
@@ -859,11 +912,13 @@ pub fn do_utimensat(
                 user_path_at(&ProcessManager::current_pcb(), dirfd, path.as_str())?;
             // AT_SYMLINK_NOFOLLOW applies only to the final component;
             // intermediate directory symlinks must still be followed.
-            inode_begin.lookup_follow_symlink2(
-                path.as_str(),
-                VFS_MAX_FOLLOW_SYMLINK_TIMES,
-                !flags.contains(UtimensFlags::AT_SYMLINK_NOFOLLOW),
-            )?
+            File::recover_io(|| {
+                inode_begin.lookup_follow_symlink2(
+                    path.as_str(),
+                    VFS_MAX_FOLLOW_SYMLINK_TIMES,
+                    !flags.contains(UtimensFlags::AT_SYMLINK_NOFOLLOW),
+                )
+            })?
         }
         None => {
             // Linux-specific extension: pathname == NULL means operate on the
@@ -892,41 +947,43 @@ pub fn do_utimensat(
     };
     let both_now =
         times.is_none_or(|times| times[0].tv_nsec == UTIME_NOW && times[1].tv_nsec == UTIME_NOW);
-    inode.update_metadata_masked(&mut |current| {
-        check_timestamp_update_permission(&inode, current, both_now)?;
-        let mut meta = current.clone();
-        let now = PosixTimeSpec::now();
-        let mut mask = SetMetadataMask::empty();
-        if let Some([atime, mtime]) = times {
-            if atime.tv_nsec == UTIME_NOW {
+    File::recover_io(|| {
+        inode.update_metadata_masked(&mut |current| {
+            check_timestamp_update_permission(&inode, current, both_now)?;
+            let mut meta = current.clone();
+            let now = PosixTimeSpec::now();
+            let mut mask = SetMetadataMask::empty();
+            if let Some([atime, mtime]) = times {
+                if atime.tv_nsec == UTIME_NOW {
+                    meta.atime = now;
+                    mask.insert(SetMetadataMask::ATIME);
+                } else if atime.tv_nsec != UTIME_OMIT {
+                    meta.atime = atime;
+                    mask.insert(SetMetadataMask::ATIME);
+                }
+                if mtime.tv_nsec == UTIME_NOW {
+                    meta.mtime = now;
+                    mask.insert(SetMetadataMask::MTIME);
+                } else if mtime.tv_nsec != UTIME_OMIT {
+                    meta.mtime = mtime;
+                    mask.insert(SetMetadataMask::MTIME);
+                }
+                meta.ctime = now;
+                mask.insert(SetMetadataMask::CTIME);
+                if both_now {
+                    mask.insert(SetMetadataMask::TIMES_BY_WRITE);
+                }
+            } else {
                 meta.atime = now;
-                mask.insert(SetMetadataMask::ATIME);
-            } else if atime.tv_nsec != UTIME_OMIT {
-                meta.atime = atime;
-                mask.insert(SetMetadataMask::ATIME);
-            }
-            if mtime.tv_nsec == UTIME_NOW {
                 meta.mtime = now;
-                mask.insert(SetMetadataMask::MTIME);
-            } else if mtime.tv_nsec != UTIME_OMIT {
-                meta.mtime = mtime;
-                mask.insert(SetMetadataMask::MTIME);
+                meta.ctime = now;
+                mask = SetMetadataMask::ATIME
+                    | SetMetadataMask::MTIME
+                    | SetMetadataMask::CTIME
+                    | SetMetadataMask::TIMES_BY_WRITE;
             }
-            meta.ctime = now;
-            mask.insert(SetMetadataMask::CTIME);
-            if both_now {
-                mask.insert(SetMetadataMask::TIMES_BY_WRITE);
-            }
-        } else {
-            meta.atime = now;
-            meta.mtime = now;
-            meta.ctime = now;
-            mask = SetMetadataMask::ATIME
-                | SetMetadataMask::MTIME
-                | SetMetadataMask::CTIME
-                | SetMetadataMask::TIMES_BY_WRITE;
-        }
-        Ok((meta, mask))
+            Ok((meta, mask))
+        })
     })?;
     // fsnotify: timestamp change → IN_ATTRIB.
     fsnotify::fsnotify_inode(FsEvent::ATTRIB, &inode);
@@ -950,22 +1007,26 @@ pub fn do_utimes(path: &str, times: Option<[PosixTimeval; 2]>) -> Result<usize, 
         AtFlags::AT_FDCWD.bits(),
         path,
     )?;
-    let inode = inode_begin.lookup_follow_symlink(path.as_str(), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
-    inode.update_metadata_masked(&mut |current| {
-        check_timestamp_update_permission(&inode, current, times.is_none())?;
-        let mut meta = current.clone();
-        let now = PosixTimeSpec::now();
-        let mut mask = SetMetadataMask::ATIME | SetMetadataMask::MTIME | SetMetadataMask::CTIME;
-        if let Some([atime, mtime]) = times {
-            meta.atime = PosixTimeSpec::from(atime);
-            meta.mtime = PosixTimeSpec::from(mtime);
-        } else {
-            meta.atime = now;
-            meta.mtime = now;
-            mask.insert(SetMetadataMask::TIMES_BY_WRITE);
-        }
-        meta.ctime = now;
-        Ok((meta, mask))
+    let inode = File::recover_io(|| {
+        inode_begin.lookup_follow_symlink(path.as_str(), VFS_MAX_FOLLOW_SYMLINK_TIMES)
+    })?;
+    File::recover_io(|| {
+        inode.update_metadata_masked(&mut |current| {
+            check_timestamp_update_permission(&inode, current, times.is_none())?;
+            let mut meta = current.clone();
+            let now = PosixTimeSpec::now();
+            let mut mask = SetMetadataMask::ATIME | SetMetadataMask::MTIME | SetMetadataMask::CTIME;
+            if let Some([atime, mtime]) = times {
+                meta.atime = PosixTimeSpec::from(atime);
+                meta.mtime = PosixTimeSpec::from(mtime);
+            } else {
+                meta.atime = now;
+                meta.mtime = now;
+                mask.insert(SetMetadataMask::TIMES_BY_WRITE);
+            }
+            meta.ctime = now;
+            Ok((meta, mask))
+        })
     })?;
     // fsnotify: a successful utimes(2) timestamp update → IN_ATTRIB.
     fsnotify::fsnotify_inode(FsEvent::ATTRIB, &inode);

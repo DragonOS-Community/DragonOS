@@ -18,6 +18,7 @@ use super::{inode::Cgroup2Inode, CGROUP2_BLOCK_SIZE, CGROUP2_MAX_NAMELEN};
 #[derive(Debug)]
 pub(super) struct Cgroup2Fs {
     root_inode: Arc<Cgroup2Inode>,
+    superblock: Arc<crate::filesystem::vfs::mount::SuperBlockState>,
 }
 
 #[derive(Debug)]
@@ -33,21 +34,41 @@ impl FileSystemMakerData for Cgroup2MountData {
 }
 
 impl Cgroup2Fs {
-    pub(super) fn new(root_cg: Arc<CgroupNode>) -> Arc<Self> {
+    pub(super) fn new(
+        root_cg: Arc<CgroupNode>,
+        flags: MountFlags,
+        owner: Arc<crate::process::namespace::user_namespace::UserNamespace>,
+    ) -> Result<Arc<Self>, SystemError> {
         let root_inode = Cgroup2Inode::new_dir(String::new(), root_cg);
+        let superblock = Arc::try_new(
+            crate::filesystem::vfs::mount::SuperBlockState::new_with_owner(flags, owner),
+        )
+        .map_err(|_| SystemError::ENOMEM)?;
 
         let fs = Arc::new(Self {
             root_inode: root_inode.clone(),
+            superblock,
         });
         root_inode.set_fs(Arc::downgrade(&fs));
 
-        Cgroup2Inode::populate_core_files(&root_inode)
-            .expect("cgroup2: populate root files failed");
-        fs
+        Cgroup2Inode::populate_core_files(&root_inode)?;
+        Ok(fs)
     }
 
     pub(super) fn nsdelegate(&self) -> bool {
         cgroup_root().nsdelegate()
+    }
+
+    pub(super) fn event_target(
+        &self,
+        inode: &Arc<dyn crate::filesystem::vfs::IndexNode>,
+    ) -> Result<crate::filesystem::fsnotify::FsNotifyTarget, SystemError> {
+        let metadata = inode.metadata()?;
+        Ok(self.superblock.fsnotify_existing_inode_target(
+            metadata.inode_id,
+            inode.inode_generation(),
+            metadata.file_type,
+        ))
     }
 }
 
@@ -74,6 +95,18 @@ fn apply_options(nsdelegate: bool) {
 }
 
 impl FileSystem for Cgroup2Fs {
+    fn shared_mount_superblock_state(
+        &self,
+        _flags: MountFlags,
+    ) -> Option<Arc<crate::filesystem::vfs::mount::SuperBlockState>> {
+        Some(self.superblock.clone())
+    }
+
+    fn mount_owner_user_ns(
+        &self,
+    ) -> Option<Arc<crate::process::namespace::user_namespace::UserNamespace>> {
+        Some(self.superblock.owner_user_ns().clone())
+    }
     fn page_cache_writeback_domain(
         &self,
     ) -> Option<&Arc<crate::filesystem::page_cache::PageCacheWritebackDomain>> {
@@ -144,7 +177,10 @@ impl MountableFileSystem for Cgroup2Fs {
     fn make_mount_data(
         raw_data: Option<&str>,
         source: &str,
-    ) -> Result<Option<Arc<dyn FileSystemMakerData + 'static>>, SystemError> {
+    ) -> Result<
+        Option<Arc<dyn FileSystemMakerData + 'static>>,
+        crate::mm::allocation::MemoryAllocationError,
+    > {
         Self::make_mount_data_in_context(raw_data, source, &FsCreationContext::current())
     }
 
@@ -152,7 +188,10 @@ impl MountableFileSystem for Cgroup2Fs {
         raw_data: Option<&str>,
         _source: &str,
         context: &FsCreationContext,
-    ) -> Result<Option<Arc<dyn FileSystemMakerData + 'static>>, SystemError> {
+    ) -> Result<
+        Option<Arc<dyn FileSystemMakerData + 'static>>,
+        crate::mm::allocation::MemoryAllocationError,
+    > {
         let nsdelegate = parse_options(raw_data)?;
 
         let root_cgroup = context.cgroup_ns.root_cgroup().clone();
@@ -165,12 +204,37 @@ impl MountableFileSystem for Cgroup2Fs {
     fn make_fs(
         data: Option<&dyn FileSystemMakerData>,
     ) -> Result<Arc<dyn FileSystem + 'static>, SystemError> {
+        Self::make_fs_with_flags(data, MountFlags::empty())
+    }
+
+    fn make_fs_with_flags(
+        data: Option<&dyn FileSystemMakerData>,
+        flags: MountFlags,
+    ) -> Result<Arc<dyn FileSystem>, SystemError> {
+        Self::make_fs_in_owner(data, flags, ProcessManager::current_user_ns())
+    }
+
+    fn make_fs_in_context(
+        data: Option<&dyn FileSystemMakerData>,
+        flags: MountFlags,
+        context: &FsCreationContext,
+    ) -> Result<Arc<dyn FileSystem>, SystemError> {
+        Self::make_fs_in_owner(data, flags, context.cred.user_ns.clone())
+    }
+}
+
+impl Cgroup2Fs {
+    fn make_fs_in_owner(
+        data: Option<&dyn FileSystemMakerData>,
+        flags: MountFlags,
+        owner: Arc<crate::process::namespace::user_namespace::UserNamespace>,
+    ) -> Result<Arc<dyn FileSystem>, SystemError> {
         let mount_data = data.and_then(|d| d.as_any().downcast_ref::<Cgroup2MountData>());
         let root_cgroup = mount_data
             .map(|d| d.root_cgroup.clone())
             .unwrap_or_else(|| cgroup_root().root());
         let nsdelegate = mount_data.map(|d| d.nsdelegate).unwrap_or(false);
-        let fs = Cgroup2Fs::new(root_cgroup);
+        let fs = Cgroup2Fs::new(root_cgroup, flags, owner)?;
         apply_options(nsdelegate);
         Ok(fs)
     }

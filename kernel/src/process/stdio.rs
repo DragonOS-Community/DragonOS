@@ -39,24 +39,25 @@ pub fn stdio_init() -> Result<(), SystemError> {
     */
     let current = ProcessManager::current_pcb();
     let nofile_limit = current.nofile_soft_limit();
+    let creator = crate::cgroup::memory::object_for_task(&current);
     assert_eq!(
         current
             .fd_table()
-            .alloc_fd(stdin, false, nofile_limit)
+            .alloc_fd(stdin, false, nofile_limit, &creator)
             .unwrap(),
         0
     );
     assert_eq!(
         current
             .fd_table()
-            .alloc_fd(stdout, false, nofile_limit)
+            .alloc_fd(stdout, false, nofile_limit, &creator)
             .unwrap(),
         1
     );
     assert_eq!(
         current
             .fd_table()
-            .alloc_fd(stderr, false, nofile_limit)
+            .alloc_fd(stderr, false, nofile_limit, &creator)
             .unwrap(),
         2
     );

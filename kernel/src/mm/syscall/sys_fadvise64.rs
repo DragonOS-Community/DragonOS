@@ -142,9 +142,28 @@ pub fn do_fadvise(fd: i32, offset: i64, len: i64, advise: i32) -> Result<usize, 
             let end_page = endbyte >> MMArch::PAGE_SHIFT;
             let page_num = end_page.saturating_sub(start_page).saturating_add(1);
 
+            let task = crate::process::ProcessManager::current_pcb();
+            let owner = crate::cgroup::memory::account_for_task(&task);
+            let creator = crate::cgroup::memory::object_for_task(&task);
+            drop(task);
             let mut ra_state = file.get_ra_state();
-            force_page_cache_readahead(&page_cache, &inode, &mut ra_state, start_page, page_num)?;
-            file.set_ra_state(ra_state)?;
+            match force_page_cache_readahead(
+                &page_cache,
+                &inode,
+                &mut ra_state,
+                start_page,
+                page_num,
+                &owner,
+                &creator,
+            ) {
+                Ok(_) => file.set_ra_state(ra_state)?,
+                // Linux WILLNEED is advisory: failure to prefetch does not
+                // force OOM or make the subsequent required read succeed.
+                Err(crate::mm::allocation::MemoryAllocationError::Charge(_)) => {}
+                Err(crate::mm::allocation::MemoryAllocationError::System(error)) => {
+                    return Err(error)
+                }
+            }
         }
         PosixFadviseFlag::NoReuse => {
             file.set_mode_flags(FileMode::FMODE_NOREUSE);

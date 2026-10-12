@@ -54,6 +54,7 @@ pub(super) fn do_kernel_shmget(
     }
 
     let ipcns = ProcessManager::current_ipcns();
+    let mut recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
 
     match key {
         IPC_PRIVATE => {
@@ -61,7 +62,12 @@ pub(super) fn do_kernel_shmget(
                 let shm_manager_guard = ipcns.shm.lock();
                 shm_manager_guard.validate_new_segment_size(size)?
             };
-            let backing = ShmManager::create_default_backing(key, size)?;
+            let backing = loop {
+                match ShmManager::create_default_backing(key, size) {
+                    Ok(backing) => break backing,
+                    Err(error) => error.recover(&mut recovery)?,
+                }
+            };
             let mut shm_manager_guard = ipcns.shm.lock();
             shm_manager_guard.add_prepared(key, size, shmflg, backing, numpages)
         }
@@ -82,7 +88,12 @@ pub(super) fn do_kernel_shmget(
                 shm_manager_guard.validate_new_segment_size(size)?
             };
 
-            let backing = ShmManager::create_default_backing(key, size)?;
+            let backing = loop {
+                match ShmManager::create_default_backing(key, size) {
+                    Ok(backing) => break backing,
+                    Err(error) => error.recover(&mut recovery)?,
+                }
+            };
             let mut shm_manager_guard = ipcns.shm.lock();
             if let Some(id) = shm_manager_guard.contains_key(&key).copied() {
                 return existing_segment_result(&mut shm_manager_guard, id, size, shmflg);

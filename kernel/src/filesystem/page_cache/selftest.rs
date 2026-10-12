@@ -1,4 +1,5 @@
 use super::*;
+use crate::arch::mm::LockedFrameAllocator;
 
 static PAGECACHE_COMPLETION_SELFTEST_RUNNING: AtomicBool = AtomicBool::new(false);
 static PAGECACHE_ACCOUNTING_SELFTEST_RUNNING: AtomicBool = AtomicBool::new(false);
@@ -252,6 +253,201 @@ fn run_detached_read_batch_completion_selftest() -> Result<bool, SystemError> {
     drop(page);
     drop(cache);
     Ok(completed)
+}
+
+/// Real backend admission runs before publication, including the failure at a
+/// later slot and a backend callback which installs a competing cache entry.
+/// No global allocator fault injection or production test hook is involved.
+struct BatchAdmissionBackend {
+    cache: SpinLock<Weak<PageCache>>,
+    calls: AtomicUsize,
+    live: AtomicUsize,
+    leaked_prefix: AtomicBool,
+    conflict_ok: AtomicBool,
+    conflict: bool,
+}
+
+impl core::fmt::Debug for BatchAdmissionBackend {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("BatchAdmissionBackend")
+    }
+}
+
+impl PageCacheBackend for BatchAdmissionBackend {
+    fn read_page(&self, _: usize, _: &mut [u8]) -> Result<usize, SystemError> {
+        Ok(0)
+    }
+    fn write_page(&self, _: usize, buf: &[u8]) -> Result<usize, SystemError> {
+        Ok(buf.len())
+    }
+    fn npages(&self) -> usize {
+        0
+    }
+    fn reserve_page(&self) -> Result<(), SystemError> {
+        let call = self.calls.fetch_add(1, Ordering::AcqRel) + 1;
+        let cache = self.cache.lock().upgrade().ok_or(SystemError::EIO)?;
+        if call <= 2 && cache.inner.lock().get_entry(0).is_some() {
+            self.leaked_prefix.store(true, Ordering::Release);
+        }
+        if call == 2 {
+            if !self.conflict {
+                return Err(SystemError::ENOSPC);
+            }
+            // The recursive admission is call 3 and does not inject again.
+            self.conflict_ok
+                .store(cache.manager.commit_overwrite(1).is_ok(), Ordering::Release);
+        }
+        self.live.fetch_add(1, Ordering::AcqRel);
+        Ok(())
+    }
+    fn release_page(&self) {
+        self.live.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn run_batch_admission_atomicity_selftest() -> Result<bool, SystemError> {
+    for conflict in [false, true] {
+        let backend = Arc::new(BatchAdmissionBackend {
+            cache: SpinLock::new(Weak::new()),
+            calls: AtomicUsize::new(0),
+            live: AtomicUsize::new(0),
+            leaked_prefix: AtomicBool::new(false),
+            conflict_ok: AtomicBool::new(false),
+            conflict,
+        });
+        let cache = PageCache::new_shmem(None, Some(backend.clone()));
+        *backend.cache.lock() = Arc::downgrade(&cache);
+        let expected = if conflict {
+            SystemError::EEXIST
+        } else {
+            SystemError::ENOSPC
+        };
+        let error_matches = matches!(PageCacheReadBatchCompletion::reserve(&cache, 0, 3, None), Err(error) if error == expected);
+        let (prefix_missing, winner_present, suffix_missing) = {
+            let inner = cache.inner.lock();
+            (
+                inner.get_entry(0).is_none(),
+                inner.get_entry(1).is_some(),
+                inner.get_entry(2).is_none(),
+            )
+        };
+        let live_correct = backend.live.load(Ordering::Acquire) == usize::from(conflict);
+        let conflict_correct = !conflict || backend.conflict_ok.load(Ordering::Acquire);
+        if conflict {
+            let page = cache.manager.remove_page(1)?;
+            if let Some(page) = page {
+                cache.discard_unlinked_page(&page);
+            }
+        }
+        let refunded = backend.live.load(Ordering::Acquire) == 0;
+        if !(error_matches
+            && prefix_missing
+            && winner_present == conflict
+            && suffix_missing
+            && live_correct
+            && conflict_correct
+            && refunded
+            && !backend.leaked_prefix.load(Ordering::Acquire))
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Exercise the real DMA reservation/fallback producer with distinct required
+/// and advisory ranges. This proves admission rollback, not physical virtio
+/// DMA or the FUSE run planner; the latter still needs its actual mmap test.
+fn run_required_optional_dma_quota_selftest() -> Result<bool, SystemError> {
+    use crate::cgroup::memory::{
+        object::ObjectAccount, ChargeFailureReason, MemoryAccount, MemoryEvent, MemoryPolicy,
+    };
+    let root = MemoryAccount::new(0, None)?;
+    let owner = MemoryAccount::new(0, Some(root.clone()))?;
+    owner.set_policy(MemoryPolicy {
+        max: Some(2),
+        ..Default::default()
+    });
+    // Separate metadata accounting from the constrained data leaf, so the
+    // second data candidate (rather than entry metadata) hits its two-page max.
+    let creator = ObjectAccount::new(&root)?;
+    let backend = Arc::new(PageCacheQuotaSelftestBackend::default());
+    let cache = PageCache::new_shmem(None, Some(backend.clone()));
+    let baseline_dma = pc_stats::snapshot().read_dma_reservations;
+    let required = cache
+        .manager
+        .try_reserve_read_dma(0, 1, false, &owner, &creator)
+        .map_err(PageCache::legacy_allocation_error)?;
+    let loading = cache.fault_page_state(0).cached && !cache.fault_page_state(0).ready;
+    let payload = [0x5au8; MMArch::PAGE_SIZE];
+    let pages = required.publish_contiguous(&payload)?;
+    drop(pages);
+    drop(required);
+    let ready = cache.fault_page_state(0).ready;
+    let held = owner.current_pages();
+    let reserved = backend.reserved.load(Ordering::Acquire);
+    let released = backend.released.load(Ordering::Acquire);
+    let metadata_held = root.snapshot().kernel_bytes;
+
+    // The first optional candidate fits and the second genuinely hits max.
+    // Failure must roll it back without a Loading prefix, backend receipt or
+    // admission stock leak. No runtime/OOM is appropriate for advisory work.
+    let optional = cache
+        .manager
+        .try_reserve_read_dma(1, 15, false, &owner, &creator);
+    let optional_rejected = matches!(&optional,
+        Err(MemoryAllocationError::Charge(failure))
+        if failure.reason == ChargeFailureReason::Max && Arc::ptr_eq(&failure.account, &owner));
+    drop(optional);
+    let holes = (1..16).all(|index| !cache.fault_page_state(index).cached);
+    let unchanged = owner.current_pages() == held
+        && root.snapshot().kernel_bytes == metadata_held
+        && backend.reserved.load(Ordering::Acquire) == reserved
+        && backend.released.load(Ordering::Acquire) == released
+        && pc_stats::snapshot().read_dma_reservations == baseline_dma;
+    let contents_ok = cache.get_ready_page(0).is_some_and(|page| {
+        let guard = page.read();
+        unsafe { guard.as_slice().iter().all(|byte| *byte == 0x5a) }
+    });
+    let events = owner.snapshot();
+    let no_oom = [
+        MemoryEvent::Oom,
+        MemoryEvent::OomKill,
+        MemoryEvent::OomGroupKill,
+    ]
+    .iter()
+    .all(|event| events.events[*event as usize] == 0);
+
+    // A required miss is not allowed to turn its same quota error into an
+    // advisory success. Keep exact typed provenance for the real outer.
+    owner.set_policy(MemoryPolicy {
+        max: Some(held),
+        ..Default::default()
+    });
+    let mandatory = cache
+        .manager
+        .try_reserve_read_dma(1, 1, false, &owner, &creator);
+    let mandatory_rejected = matches!(&mandatory,
+        Err(MemoryAllocationError::Charge(failure)) if failure.reason == ChargeFailureReason::Max);
+    drop(mandatory);
+    drop(cache);
+    let cleaned = owner.current_pages() == 0
+        && root.current_pages() == 0
+        && root.snapshot().kernel_bytes.iter().all(|bytes| *bytes == 0)
+        && backend.reserved.load(Ordering::Acquire) == backend.released.load(Ordering::Acquire)
+        && pc_stats::snapshot().read_dma_reservations == baseline_dma;
+    Ok(loading
+        && ready
+        && held == 1
+        && reserved == 1
+        && released == 0
+        && optional_rejected
+        && holes
+        && unchanged
+        && contents_ok
+        && no_oom
+        && mandatory_rejected
+        && cleaned)
 }
 
 #[inline(never)]
@@ -1244,7 +1440,7 @@ fn run_tag_scan_chunk_release_selftest() -> Result<bool, SystemError> {
         let entry = inner.get_entry(index).ok_or(SystemError::EIO)?;
         entry.account_state_transition(PageState::UpToDate, PageState::Dirty);
         entry.set_state(PageState::Dirty);
-        inner.dirty_pages.insert(index);
+        inner.set_index(index, 1, true);
         drop(inner);
         pages.push(page);
     }
@@ -1727,7 +1923,7 @@ fn run_remote_dirty_publish_selftest() -> Result<bool, SystemError> {
 }
 
 /// Exercise domain start separately from its completion/error boundary.
-fn run_domain_writeback_start_selftest() -> Result<bool, SystemError> {
+fn run_domain_writeback_start_selftest() -> Result<bool, MemoryAllocationError> {
     use crate::filesystem::vfs::{FileType, InodeMode};
 
     // Reuse the token fixture, but supply a real inode for domain retention
@@ -1947,7 +2143,7 @@ impl PageCacheBackend for PreallocateFailureBackend {
     }
 }
 
-fn run_ramfs_fallocate_range_selftest() -> Result<bool, SystemError> {
+fn run_ramfs_fallocate_range_selftest() -> Result<bool, MemoryAllocationError> {
     use crate::filesystem::vfs::{AttribStageObserver, FileType, InodeMode};
 
     let fs = crate::filesystem::ramfs::RamFS::new();
@@ -2005,6 +2201,115 @@ fn run_ramfs_fallocate_range_selftest() -> Result<bool, SystemError> {
     Ok(cache.manager().pages_count()? == 3
         && cache.manager().peek_page(17).is_some()
         && inode.metadata()?.size == (18 * page_size) as i64)
+}
+
+/// Exercise both clean-unlink entry points with each independent liveness
+/// source. This checks their contracts, not a deterministic reproduction of
+/// the old unlocked flag-check/commit race.
+fn run_clean_unlink_liveness_selftest() -> Result<bool, SystemError> {
+    let mut ok = true;
+    for reclaim in [true, false] {
+        let cache = PageCache::new_unowned(None, None);
+        let page = cache.get_or_create_page_zero(0)?;
+        let entry = cache.inner.lock().get_entry(0).ok_or(SystemError::EIO)?;
+        let paddr = page.phys_address();
+        let page_identity = Arc::downgrade(&page);
+        let attempt = || -> Result<bool, SystemError> {
+            if reclaim {
+                Ok(cache
+                    .manager
+                    .remove_clean_page_for_reclaim(0, &page)?
+                    .is_some())
+            } else {
+                Ok(cache.manager.invalidate_all_clean()? == 1)
+            }
+        };
+        let still_linked = || {
+            cache.inner.lock().get_entry(0).is_some_and(|current| {
+                Arc::ptr_eq(&current, &entry) && current.accounting() == PageEntryAccounting::File
+            }) && page_manager_lock().get(&paddr).is_some()
+                && page_reclaimer_lock().get(&paddr).is_some()
+        };
+
+        let pin = cache.manager.peek_page_pinned(0).ok_or(SystemError::EIO)?;
+        ok &= !attempt()? && still_linked();
+        drop(pin);
+
+        for flag in [
+            PageFlags::PG_DIRTY,
+            PageFlags::PG_WRITEBACK,
+            PageFlags::PG_UNEVICTABLE,
+        ] {
+            page.write().add_flags(flag);
+            // Never call clean removal with a self-held page write guard:
+            // production removal deliberately acquires the page read lock.
+            let removed = attempt();
+            page.write().remove_flags(flag);
+            ok &= !removed? && still_linked();
+        }
+        for state in [PageState::Dirty, PageState::Writeback] {
+            {
+                let _inner = cache.inner.lock();
+                entry.account_state_transition(PageState::UpToDate, state);
+                entry.set_state(state);
+            }
+            let removed = attempt();
+            {
+                let _inner = cache.inner.lock();
+                entry.account_state_transition(state, PageState::UpToDate);
+                entry.set_state(PageState::UpToDate);
+            }
+            ok &= !removed? && still_linked();
+        }
+        for writeback in [false, true] {
+            {
+                let mut inner = cache.inner.lock();
+                if writeback {
+                    inner.set_index(0, 2, true);
+                } else {
+                    inner.set_index(0, 1, true);
+                }
+            }
+            let removed = attempt();
+            {
+                let mut inner = cache.inner.lock();
+                if writeback {
+                    inner.set_index(0, 2, false);
+                } else {
+                    inner.set_index(0, 1, false);
+                }
+            }
+            ok &= !removed? && still_linked();
+        }
+        cache.set_unevictable(true);
+        let removed = attempt();
+        cache.set_unevictable(false);
+        ok &= !removed? && still_linked();
+
+        ok &= attempt()?
+            && cache.manager.peek_page(0).is_none()
+            && entry.accounting() == PageEntryAccounting::Unaccounted;
+        if reclaim {
+            // Low-level reclaim unlinks membership only. Its caller must
+            // retire the physical page from the manager and LRU afterwards.
+            ok &= page_manager_lock().get(&paddr).is_some()
+                && page_reclaimer_lock().get(&paddr).is_some();
+            page_manager_lock().remove_page(&paddr);
+            let _ = page_reclaimer_lock().remove_page(&paddr);
+        }
+        // Invalidation already performs the same physical retirement.
+        ok &= page_manager_lock().get(&paddr).is_none()
+            && page_reclaimer_lock().get(&paddr).is_none();
+        // Preserve cleanup even when a lifecycle assertion failed, so a
+        // regression does not leak this fixture into later selftest stages.
+        page_manager_lock().remove_page(&paddr);
+        let _ = page_reclaimer_lock().remove_page(&paddr);
+        drop(entry);
+        drop(page);
+        drop(cache);
+        ok &= page_identity.upgrade().is_none();
+    }
+    Ok(ok)
 }
 
 fn run_preallocate_rollback_selftest() -> Result<bool, SystemError> {
@@ -2131,6 +2436,561 @@ fn run_write_prepare_rollback_selftest() -> Result<bool, SystemError> {
     Ok(backend.live.load(Ordering::Relaxed) == 0)
 }
 
+/// Verify production Page flag hooks against isolated original-owner counters,
+/// including failed/shared state transitions and actual final frame release.
+fn run_memcg_page_state_selftest() -> Result<bool, SystemError> {
+    use crate::cgroup::memory::{MemoryAccount, MemoryKind, MemoryStat};
+    let root = MemoryAccount::new(0, None)?;
+    let leaf = MemoryAccount::new(0, Some(root.clone()))?;
+    let cache = PageCache::new_unowned(None, None);
+    let mut ok = true;
+    // Exercise the real terminal accounting edge without fabricating a
+    // successful reclaim or OOM victim. RETRY was already left uncounted.
+    let before = leaf.snapshot();
+    let pcb = crate::process::ProcessManager::current_pcb();
+    let usage_before = pcb
+        .get_rusage(crate::process::resource::RUsageWho::RusageThread)
+        .ok_or(SystemError::EINVAL)?;
+    for error in [SystemError::EINTR, SystemError::ERESTARTSYS] {
+        crate::mm::fault::account_fault_recovery_failure(
+            &leaf,
+            crate::mm::fault::FaultFlags::FAULT_FLAG_TRIED,
+            error,
+        );
+    }
+    ok &= leaf.snapshot().stats == before.stats;
+    crate::mm::fault::account_fault_recovery_failure(
+        &leaf,
+        crate::mm::fault::FaultFlags::FAULT_FLAG_TRIED,
+        SystemError::ENOMEM,
+    );
+    let after = leaf.snapshot();
+    let usage_after = pcb
+        .get_rusage(crate::process::resource::RUsageWho::RusageThread)
+        .ok_or(SystemError::EINVAL)?;
+    ok &= after.stats[MemoryStat::PgFault as usize]
+        == before.stats[MemoryStat::PgFault as usize] + 1
+        && after.stats[MemoryStat::PgMajFault as usize]
+            == before.stats[MemoryStat::PgMajFault as usize]
+        && usage_after.ru_minflt == usage_before.ru_minflt
+        && usage_after.ru_majflt == usage_before.ru_majflt;
+    // Rejected reservations never reach the physical allocator or either
+    // registry; consuming the rejected token must still roll its budget back.
+    for (kind, pages) in [(MemoryKind::Anon, 2), (MemoryKind::PageTables, 1)] {
+        let charge = leaf
+            .try_charge(kind, pages)
+            .map_err(|_| SystemError::ENOMEM)?;
+        ok &= matches!(
+            crate::mm::page::allocate_registered_data_page(
+                PageType::Normal,
+                PageFlags::PG_LRU,
+                Some(charge),
+            ),
+            Err(SystemError::EINVAL)
+        );
+        ok &= root.current_pages() == 0;
+    }
+    for kind in [MemoryKind::File, MemoryKind::Shmem, MemoryKind::Anon] {
+        let page_type = if kind == MemoryKind::File {
+            PageType::File(FileMapInfo {
+                page_cache: Arc::downgrade(&cache),
+                index: 0,
+            })
+        } else {
+            PageType::Normal
+        };
+        let charge = leaf.try_charge(kind, 1).map_err(|_| SystemError::ENOMEM)?;
+        let page = crate::mm::page::allocate_registered_data_page(
+            page_type,
+            PageFlags::PG_LRU,
+            Some(charge),
+        )?;
+        let manager_owner = page_manager_lock().get(&page.phys_address());
+        let lru_owner = page_reclaimer_lock().get(&page.phys_address());
+        ok &= manager_owner
+            .as_ref()
+            .is_some_and(|registered| Arc::ptr_eq(registered, &page))
+            && lru_owner
+                .as_ref()
+                .is_some_and(|registered| Arc::ptr_eq(registered, &page));
+        drop(manager_owner);
+        drop(lru_owner);
+        let (inactive, active) = if kind == MemoryKind::File {
+            (MemoryStat::InactiveFile, MemoryStat::ActiveFile)
+        } else {
+            (MemoryStat::InactiveAnon, MemoryStat::ActiveAnon)
+        };
+        let before = root.snapshot();
+        ok &= before.stats[inactive as usize] == 1 && before.stats[active as usize] == 0;
+        {
+            let mut inner = page.write();
+            inner.add_flags(PageFlags::PG_ACTIVE);
+            inner.add_flags(PageFlags::PG_ACTIVE);
+        }
+        let activated = root.snapshot();
+        ok &= activated.stats[inactive as usize] == 0
+            && activated.stats[active as usize] == 1
+            && activated.stats[MemoryStat::PgActivate as usize]
+                == before.stats[MemoryStat::PgActivate as usize] + 1;
+        {
+            let mut inner = page.write();
+            inner.remove_flags(PageFlags::PG_ACTIVE);
+            inner.remove_flags(PageFlags::PG_ACTIVE);
+        }
+        let deactivated = root.snapshot();
+        ok &= deactivated.stats[inactive as usize] == 1
+            && deactivated.stats[active as usize] == 0
+            && deactivated.stats[MemoryStat::PgDeactivate as usize]
+                == before.stats[MemoryStat::PgDeactivate as usize] + 1;
+        let flags = PageFlags::PG_DIRTY | PageFlags::PG_WRITEBACK | PageFlags::PG_UNEVICTABLE;
+        {
+            let mut inner = page.write();
+            inner.add_flags(flags);
+            inner.add_flags(flags); // repeated publication must not double count
+        }
+        let snapshot = root.snapshot();
+        let file = u64::from(kind == MemoryKind::File);
+        ok &= snapshot.current == 1
+            && snapshot.stats[MemoryStat::FileDirty as usize] == file
+            && snapshot.stats[MemoryStat::FileWriteback as usize] == file
+            && snapshot.stats[MemoryStat::Unevictable as usize] == 1
+            && snapshot.stats[inactive as usize] == 0;
+        {
+            let mut inner = page.write();
+            inner.remove_flags(flags);
+            inner.remove_flags(flags);
+        }
+        ok &= root.snapshot().stats[inactive as usize] == 1;
+        page.write().set_flags(PageFlags::PG_LRU | flags);
+        crate::mm::page::detach_pages_from_reclaimer_batched(core::iter::once(&page));
+        let removed = page_manager_lock().remove_page_if_same(&page);
+        drop(removed);
+        drop(page);
+        let snapshot = root.snapshot();
+        ok &= snapshot.current == 0
+            && snapshot.stats[MemoryStat::FileDirty as usize] == 0
+            && snapshot.stats[MemoryStat::FileWriteback as usize] == 0
+            && snapshot.stats[MemoryStat::Unevictable as usize] == 0
+            && snapshot.stats[inactive as usize] == 0
+            && snapshot.stats[active as usize] == 0;
+    }
+    Ok(ok)
+}
+
+/// Real independent frames, not a charge-only model. Keep only addresses in
+/// the fixture so the reclaimer's final Arc::try_unwrap can actually succeed.
+struct MemcgReclaimFixture {
+    cache: Arc<PageCache>,
+    addresses: Vec<crate::mm::PhysAddr>,
+    identities: Vec<Weak<Page>>,
+}
+
+impl MemcgReclaimFixture {
+    fn new() -> Self {
+        Self {
+            cache: PageCache::new_unowned(None, None),
+            addresses: Vec::new(),
+            identities: Vec::new(),
+        }
+    }
+
+    fn install(
+        &mut self,
+        account: &Arc<crate::cgroup::memory::MemoryAccount>,
+    ) -> Result<usize, SystemError> {
+        self.install_with_state(account, PageState::UpToDate)
+    }
+
+    fn install_with_state(
+        &mut self,
+        account: &Arc<crate::cgroup::memory::MemoryAccount>,
+        state: PageState,
+    ) -> Result<usize, SystemError> {
+        use crate::cgroup::memory::MemoryKind;
+        self.addresses
+            .try_reserve(1)
+            .map_err(|_| SystemError::ENOMEM)?;
+        self.identities
+            .try_reserve(1)
+            .map_err(|_| SystemError::ENOMEM)?;
+        let index = self.addresses.len();
+        let charge = account
+            .try_charge(MemoryKind::File, 1)
+            .map_err(|_| SystemError::ENOMEM)?;
+        let mut flags = self.cache.page_flags();
+        if state.is_ready() {
+            flags |= PageFlags::PG_UPTODATE;
+        }
+        if state == PageState::Dirty {
+            flags |= PageFlags::PG_DIRTY;
+        } else if state == PageState::Writeback {
+            flags |= PageFlags::PG_WRITEBACK;
+        }
+        let page = crate::mm::page::allocate_registered_data_page(
+            PageType::File(FileMapInfo {
+                page_cache: Arc::downgrade(&self.cache),
+                index,
+            }),
+            flags,
+            Some(charge),
+        )?;
+        // Record before descriptor/cache installation: even a failed fixture
+        // publication must retire its actual registered frame.
+        self.addresses.push(page.phys_address());
+        self.identities.push(Arc::downgrade(&page));
+        // Publication accounts membership, not dirty/writeback transitions.
+        // Model the real Loading admission before changing the owned state.
+        let entry = Arc::try_new(PageEntry::new(page.clone(), PageState::Loading))
+            .map_err(|_| SystemError::ENOMEM)?;
+        let creator =
+            crate::cgroup::memory::object_for_task(&crate::process::ProcessManager::current_pcb());
+        self.cache
+            .publish_prepared_range(core::iter::once((index, &entry)), 1, &creator)
+            .map_err(PageCache::legacy_allocation_error)?;
+        let mut inner = self.cache.inner.lock();
+        entry.account_state_transition(PageState::Loading, state);
+        entry.set_state(state);
+        if state == PageState::Dirty {
+            inner.set_index(index, 1, true);
+        } else if state == PageState::Writeback {
+            inner.set_index(index, 2, true);
+        }
+        Ok(index)
+    }
+
+    fn linked(&self, index: usize) -> bool {
+        self.cache.manager().peek_page(index).is_some()
+            && page_reclaimer_lock().get(&self.addresses[index]).is_some()
+            && page_manager_lock().contains(&self.addresses[index])
+    }
+}
+
+impl Drop for MemcgReclaimFixture {
+    fn drop(&mut self) {
+        for index in 0..self.addresses.len() {
+            // Freed addresses may already have been recycled by another
+            // subsystem. Cleanup is by original Page identity, never PFN alone.
+            let expected = self.identities[index].upgrade();
+            let cache_owner = self.cache.inner.lock().remove_entry(index);
+            drop(cache_owner);
+            let Some(expected) = expected else {
+                continue;
+            };
+            crate::mm::page::detach_pages_from_reclaimer_batched(core::iter::once(&expected));
+            let manager_owner = page_manager_lock().remove_page_if_same(&expected);
+            drop(manager_owner);
+            drop(expected);
+        }
+    }
+}
+
+fn run_page_fault_cache_snapshot_selftest() -> Result<bool, SystemError> {
+    let root = crate::cgroup::memory::MemoryAccount::new(0, None)?;
+    let mut ok = true;
+    for state in [
+        PageState::Loading,
+        PageState::Error,
+        PageState::UpToDate,
+        PageState::Dirty,
+        PageState::Writeback,
+    ] {
+        let mut fixture = MemcgReclaimFixture::new();
+        ok &= fixture.cache.fault_page_state(0)
+            == PageCacheFaultState {
+                cached: false,
+                ready: false,
+            };
+        let index = fixture.install_with_state(&root, state)?;
+        ok &= fixture.cache.fault_page_state(index)
+            == PageCacheFaultState {
+                cached: true,
+                ready: state.is_ready(),
+            };
+        // Loading/Error are intentionally present but not ready, so the
+        // ready-only manager peek API must not be used to retire this fixture.
+        // Release the cache lock before acquiring Page.write below.
+        let page = fixture
+            .cache
+            .inner
+            .lock()
+            .get_entry(index)
+            .ok_or(SystemError::EIO)?
+            .page
+            .clone();
+        let mut page_guard = page.write();
+        let mut inner = fixture.cache.inner.lock();
+        let entry = inner.get_entry(index).ok_or(SystemError::EIO)?;
+        // This private state fixture has no actual I/O in flight. Balance
+        // the production transition before terminally detaching its content.
+        entry.account_state_transition(state, PageState::UpToDate);
+        entry.set_state(PageState::UpToDate);
+        inner.set_index(index, 1, false);
+        inner.set_index(index, 2, false);
+        page_guard.remove_flags(PageFlags::PG_DIRTY | PageFlags::PG_WRITEBACK);
+        let removed = inner.remove_entry(index);
+        drop(inner);
+        drop(page_guard);
+        drop(page);
+        drop(removed);
+        drop(entry);
+        ok &= fixture.cache.fault_page_state(index)
+            == PageCacheFaultState {
+                cached: false,
+                ready: false,
+            };
+        drop(fixture);
+        ok &= root.current_pages() == 0;
+    }
+    Ok(ok)
+}
+
+fn run_memcg_reclaim_scan_budget_selftest() -> Result<bool, SystemError> {
+    use crate::cgroup::memory::{protection::ProtectionSnapshot, MemoryAccount, MemoryStat};
+    use crate::mm::{allocator::page_frame::PageFrameCount, page::PageReclaimer};
+
+    let root = MemoryAccount::new(0, None)?;
+    let owner = MemoryAccount::new(0, Some(root.clone()))?;
+    let mut fixture = MemcgReclaimFixture::new();
+    for _ in 0..4 {
+        fixture.install(&owner)?;
+    }
+    // The fixture's real cache-entry/index metadata is charged to the actual
+    // runner ObjectAccount, while this isolated data leaf owns only four file
+    // frames. This checks data-LRU accounting, not metadata attribution.
+    let before = owner.snapshot();
+    let result = PageReclaimer::shrink_account(&owner, PageFrameCount::ONE)?;
+    let after = owner.snapshot();
+    let survivors = (0..4).filter(|index| fixture.linked(*index)).count();
+    let mut ok = result.reclaimed == 1
+        && result.detached == 1
+        && survivors == 3
+        && before.file == 4
+        && after.file == 3
+        && before.current == 4
+        && after.current == 3
+        && after.stats[MemoryStat::InactiveFile as usize] == 3
+        && after.stats[MemoryStat::PgSteal as usize]
+            == before.stats[MemoryStat::PgSteal as usize] + 1;
+
+    // Consume the real pass's inventory once: repeated candidates must not
+    // create a new budget. This component proof does not pretend those calls
+    // scan or release physical frames.
+    let mut snapshot = ProtectionSnapshot::new(&owner)?;
+    snapshot.prepare_scan(0, false, 0);
+    for _ in 0..3 {
+        ok &= snapshot.take_scan(Some(&owner), false);
+    }
+    ok &= !snapshot.take_scan(Some(&owner), false);
+
+    // A genuinely new owner/page after capture is absent from that snapshot.
+    // Its real cache/LRU/manager membership must survive conservative rejection;
+    // subsequent production passes can capture it normally.
+    let mut older_snapshot = ProtectionSnapshot::new(&root)?;
+    let newcomer = MemoryAccount::new(0, Some(root.clone()))?;
+    let mut new_fixture = MemcgReclaimFixture::new();
+    let index = new_fixture.install(&newcomer)?;
+    older_snapshot.prepare_scan(0, false, 0);
+    ok &= !older_snapshot.permits(&newcomer, false)
+        && !older_snapshot.take_scan(Some(&newcomer), false)
+        && new_fixture.linked(index)
+        && newcomer.current_pages() == 1;
+    drop(new_fixture);
+    drop(fixture);
+    ok &= owner.current_pages() == 0 && newcomer.current_pages() == 0;
+    Ok(ok)
+}
+
+fn run_memcg_reclaim_selftest() -> Result<bool, SystemError> {
+    use crate::cgroup::memory::{MemoryAccount, MemoryEvent, MemoryPolicy, MemoryStat};
+    use crate::mm::{allocator::page_frame::PageFrameCount, page::PageReclaimer};
+    // These accounts never become the runner's membership/root cgroup.
+    let root = MemoryAccount::new(0, None)?;
+    let a = MemoryAccount::new(0, Some(root.clone()))?;
+    let b = MemoryAccount::new(0, Some(root.clone()))?;
+    let mut af = MemcgReclaimFixture::new();
+    let mut bf = MemcgReclaimFixture::new();
+    af.install(&a)?;
+    af.install(&a)?;
+    let sibling = bf.install(&b)?;
+    let mut ok = true;
+
+    let progress = PageReclaimer::shrink_account(&a, PageFrameCount::ONE)?;
+    ok &= progress.reclaimed == 1
+        && a.current_pages() == 1
+        && b.current_pages() == 1
+        && bf.linked(sibling);
+    a.set_policy(MemoryPolicy {
+        min: 1,
+        ..Default::default()
+    });
+    b.set_policy(MemoryPolicy {
+        min: 1,
+        ..Default::default()
+    });
+    let progress = PageReclaimer::shrink_account(&root, PageFrameCount::ONE)?;
+    ok &= progress.reclaimed == 0 && root.current_pages() == 2 && bf.linked(sibling);
+
+    a.set_policy(MemoryPolicy {
+        low: 1,
+        ..Default::default()
+    });
+    let low_before = a.snapshot().events_local[MemoryEvent::Low as usize];
+    let progress = PageReclaimer::shrink_account(&root, PageFrameCount::ONE)?;
+    ok &= progress.reclaimed == 1
+        && a.current_pages() == 0
+        && b.current_pages() == 1
+        && bf.linked(sibling)
+        && a.snapshot().events_local[MemoryEvent::Low as usize] == low_before + 1;
+
+    // Reclaim root's own declared protection must not protect itself.
+    a.set_policy(MemoryPolicy {
+        min: 100,
+        low: 100,
+        ..Default::default()
+    });
+    af.install(&a)?;
+    let progress = PageReclaimer::shrink_account(&a, PageFrameCount::ONE)?;
+    ok &= progress.reclaimed == 1 && a.current_pages() == 0;
+
+    let index = af.install(&a)?;
+    let pin = af
+        .cache
+        .manager()
+        .peek_page_pinned(index)
+        .ok_or(SystemError::EIO)?;
+    let progress = PageReclaimer::shrink_account(&a, PageFrameCount::ONE)?;
+    ok &= progress.reclaimed == 0 && af.linked(index) && a.current_pages() == 1;
+    drop(pin);
+    ok &= PageReclaimer::shrink_account(&a, PageFrameCount::ONE)?.reclaimed == 1;
+
+    let index = af.install(&a)?;
+    {
+        let page = af
+            .cache
+            .manager()
+            .peek_page(index)
+            .ok_or(SystemError::EIO)?;
+        let mut guard = page.write();
+        guard.add_flags(PageFlags::PG_DIRTY);
+        // This isolated cache has no inode/retention owner. Construct its
+        // tracked dirty membership with the same production counter/state
+        // primitives; do not bypass normal file dirty admission elsewhere.
+        let mut inner = af.cache.inner.lock();
+        let entry = inner.get_entry(index).ok_or(SystemError::EIO)?;
+        entry.account_state_transition(PageState::UpToDate, PageState::Dirty);
+        entry.set_state(PageState::Dirty);
+        inner.set_index(index, 1, true);
+    }
+    let progress = PageReclaimer::shrink_account(&a, PageFrameCount::ONE)?;
+    ok &= progress.reclaimed == 0
+        && progress.dirty_seen == 1
+        && af.linked(index)
+        && a.current_pages() == 1;
+    // Only fixture content is discarded; this is not a production dirty
+    // reclaim strategy. Use the actual membership/state accounting hooks.
+    {
+        let page = af
+            .cache
+            .manager()
+            .peek_page(index)
+            .ok_or(SystemError::EIO)?;
+        page.write().remove_flags(PageFlags::PG_DIRTY);
+    }
+    af.cache.mark_page_uptodate(index);
+    ok &= PageReclaimer::shrink_account(&a, PageFrameCount::ONE)?.reclaimed == 1;
+
+    let index = af.install(&a)?;
+    {
+        let page = af
+            .cache
+            .manager()
+            .peek_page(index)
+            .ok_or(SystemError::EIO)?;
+        page.write().add_flags(PageFlags::PG_UNEVICTABLE);
+    }
+    let progress = PageReclaimer::shrink_account(&a, PageFrameCount::ONE)?;
+    ok &= progress.reclaimed == 0 && af.linked(index) && a.current_pages() == 1;
+    {
+        let page = af
+            .cache
+            .manager()
+            .peek_page(index)
+            .ok_or(SystemError::EIO)?;
+        page.write().remove_flags(PageFlags::PG_UNEVICTABLE);
+    }
+    ok &= PageReclaimer::shrink_account(&a, PageFrameCount::ONE)?.reclaimed == 1;
+
+    // Initial mapping-UNE pages already own their sole LRU node. Classification
+    // changes cannot unregister it or allocate a replacement node.
+    af.cache.set_unevictable(true);
+    let index = af.install(&a)?;
+    let retained = af
+        .cache
+        .manager()
+        .peek_page(index)
+        .ok_or(SystemError::EIO)?;
+    ok &= af.linked(index)
+        && retained
+            .read()
+            .flags()
+            .contains(PageFlags::PG_LRU | PageFlags::PG_UNEVICTABLE)
+        && a.snapshot().stats[MemoryStat::InactiveFile as usize] == 0;
+    for _ in 0..3 {
+        af.cache.set_unevictable(false);
+        af.cache.reclassify_unevictable_pages(true);
+        ok &= af.linked(index) && !retained.read().flags().contains(PageFlags::PG_UNEVICTABLE);
+        af.cache.set_unevictable(true);
+        af.cache.reclassify_unevictable_pages(false);
+        ok &= af.linked(index) && retained.read().flags().contains(PageFlags::PG_UNEVICTABLE);
+    }
+    af.cache.set_unevictable(false);
+    af.cache.reclassify_unevictable_pages(true);
+    // Normal COW has no ownership in the original file cache/LRU. Exercise
+    // the production copy path, then identity-retire its actual new frame.
+    retained
+        .write()
+        .add_flags(PageFlags::PG_UNEVICTABLE | PageFlags::PG_DIRTY);
+    let copied = page_manager_lock()
+        .copy_page_as_normal(&retained.phys_address(), &mut LockedFrameAllocator)?;
+    ok &= matches!(copied.read().page_type(), PageType::Normal)
+        && !copied.read().flags().intersects(
+            PageFlags::PG_LRU
+                | PageFlags::PG_UNEVICTABLE
+                | PageFlags::PG_DIRTY
+                | PageFlags::PG_WRITEBACK,
+        )
+        && page_reclaimer_lock().get(&copied.phys_address()).is_none();
+    crate::mm::page::retire_unmapped_normal_page(&copied);
+    drop(copied);
+    retained
+        .write()
+        .remove_flags(PageFlags::PG_UNEVICTABLE | PageFlags::PG_DIRTY);
+    ok &= a.snapshot().stats[MemoryStat::InactiveFile as usize] == 1;
+    let progress = PageReclaimer::shrink_account(&a, PageFrameCount::ONE)?;
+    ok &= progress.detached == 1
+        && progress.reclaimed == 0
+        && a.current_pages() == 1
+        && a.snapshot().stats[MemoryStat::InactiveFile as usize] == 0
+        && !af.linked(index)
+        && !page_manager_lock().contains(&af.addresses[index])
+        && page_reclaimer_lock().get(&af.addresses[index]).is_none();
+    // Repeated munlock-style classification after terminal unlink must never
+    // resurrect the externally pinned old Page in the global registry.
+    for _ in 0..3 {
+        retained.write().add_flags(PageFlags::PG_UNEVICTABLE);
+        crate::mm::ucontext::InnerAddressSpace::remove_page_unevictable_if_unneeded(&retained);
+        ok &= !retained.read().flags().contains(PageFlags::PG_LRU)
+            && page_reclaimer_lock()
+                .get(&retained.phys_address())
+                .is_none();
+    }
+    drop(retained);
+    ok &= a.current_pages() == 0;
+    drop(af);
+    drop(bf);
+    Ok(ok && root.current_pages() == 0)
+}
+
 pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, SystemError> {
     if PAGECACHE_ACCOUNTING_SELFTEST_RUNNING
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -2139,6 +2999,90 @@ pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, S
         return Err(SystemError::EBUSY);
     }
     let _running = PageCacheAccountingSelftestGuard;
+
+    if !run_memcg_page_state_selftest()? {
+        return Ok("status=fail stage=memcg_page_state\n".into());
+    }
+
+    if !crate::mm::ucontext::AddressSpace::debug_accounted_body_lifetime()? {
+        return Ok("status=fail stage=memcg_as_body_lifetime\n".into());
+    }
+
+    match crate::mm::ucontext::LockedVMA::debug_accounted_body_lifetime() {
+        Ok(true) => {}
+        Ok(false) => return Ok("status=fail stage=memcg_vma_body_lifetime\n".into()),
+        Err(error) => {
+            return Ok(alloc::format!(
+                "status=fail stage=memcg_vma_body_lifetime error={error:?}\n"
+            ))
+        }
+    }
+
+    match crate::filesystem::vfs::file::selftest::run_body_lifetime() {
+        Ok(true) => {}
+        Ok(false) => return Ok("status=fail stage=memcg_file_body_lifetime\n".into()),
+        Err(error) => {
+            return Ok(alloc::format!(
+                "status=fail stage=memcg_file_body_lifetime error={error:?}\n"
+            ))
+        }
+    }
+
+    match crate::filesystem::fs::run_accounting_selftest() {
+        Ok(true) => {}
+        Ok(false) => return Ok("status=fail stage=memcg_fs_context\n".into()),
+        Err(error) => {
+            return Ok(alloc::format!(
+                "status=fail stage=memcg_fs_context error={error:?}\n"
+            ))
+        }
+    }
+
+    match crate::process::run_resource_birth_selftest() {
+        Ok(true) => {}
+        Ok(false) => return Ok("status=fail stage=memcg_task_resources\n".into()),
+        Err(error) => {
+            return Ok(alloc::format!(
+                "status=fail stage=memcg_task_resources error={error:?}\n"
+            ))
+        }
+    }
+
+    match crate::ipc::pipe::PipeRuntime::run_accounting_selftest() {
+        Ok(true) => {}
+        Ok(false) => return Ok("status=fail stage=memcg_pipe_storage\n".into()),
+        Err(error) => {
+            return Ok(alloc::format!(
+                "status=fail stage=memcg_pipe_storage error={error:?}\n"
+            ))
+        }
+    }
+
+    let (fdtable_body_size, fdtable_body_class) =
+        match crate::filesystem::vfs::fdtable::run_body_layout_selftest() {
+            Ok((true, bytes, class)) => (bytes, class),
+            Ok((false, _, _)) => return Ok("status=fail stage=memcg_fdtable_body_layout\n".into()),
+            Err(error) => {
+                return Ok(alloc::format!(
+                    "status=fail stage=memcg_fdtable_body_layout error={error:?}\n"
+                ))
+            }
+        };
+    let fdtable_layout_report = alloc::format!(
+        "memcg_fs_context=ok\nmemcg_task_resources=ok\nmemcg_pipe_storage=ok\nmemcg_fdtable_body_layout=ok\nfdtable_body_size={fdtable_body_size}\nfdtable_body_class={fdtable_body_class}\n"
+    );
+
+    if !run_memcg_reclaim_selftest()? {
+        return Ok("status=fail stage=memcg_reclaim\n".into());
+    }
+
+    if !run_memcg_reclaim_scan_budget_selftest()? {
+        return Ok("status=fail stage=memcg_reclaim_scan_budget\n".into());
+    }
+
+    if !run_page_fault_cache_snapshot_selftest()? {
+        return Ok("status=fail stage=fault_cache_snapshot\n".into());
+    }
 
     if !run_registry_batch_retire_selftest() {
         return Ok("status=fail stage=registry_batch_retire\n".into());
@@ -2160,12 +3104,22 @@ pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, S
         return Ok("status=fail stage=write_prepare_rollback\n".into());
     }
 
-    if !run_ramfs_fallocate_range_selftest()? {
-        return Ok("status=fail stage=ramfs_fallocate_range\n".into());
+    match run_ramfs_fallocate_range_selftest() {
+        Ok(true) => {}
+        Ok(false) => return Ok("status=fail stage=ramfs_fallocate_range\n".into()),
+        Err(error) => {
+            return Ok(alloc::format!(
+                "status=fail stage=ramfs_fallocate_range error={error:?}\n"
+            ))
+        }
     }
 
     if !run_preallocate_rollback_selftest()? {
         return Ok("status=fail stage=preallocate_rollback\n".into());
+    }
+
+    if !run_clean_unlink_liveness_selftest()? {
+        return Ok("status=fail stage=clean_unlink_liveness\n".into());
     }
 
     if !run_writeback_domain_lifecycle_selftest() {
@@ -2174,6 +3128,13 @@ pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, S
 
     if !run_detached_read_batch_completion_selftest()? {
         return Ok("status=fail stage=detached_read_batch_completion\n".into());
+    }
+
+    if !run_batch_admission_atomicity_selftest()? {
+        return Ok("status=fail stage=batch_admission_atomicity\n".into());
+    }
+    if !run_required_optional_dma_quota_selftest()? {
+        return Ok("status=fail stage=required_optional_dma_quota\n".into());
     }
 
     if !run_preallocated_batch_lifecycle_selftest()? {
@@ -2257,8 +3218,14 @@ pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, S
         return Ok("status=fail stage=writeback_budget_retry\n".into());
     }
 
-    if !run_domain_writeback_start_selftest()? {
-        return Ok("status=fail stage=domain_writeback_start\n".into());
+    match run_domain_writeback_start_selftest() {
+        Ok(true) => {}
+        Ok(false) => return Ok("status=fail stage=domain_writeback_start\n".into()),
+        Err(error) => {
+            return Ok(alloc::format!(
+                "status=fail stage=domain_writeback_start error={error:?}\n"
+            ))
+        }
     }
 
     // All pre-existing fixture paths expect an immediate claim.  Keep their
@@ -2292,7 +3259,7 @@ pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, S
         if old_state == PageState::Writeback {
             return Err(SystemError::EBUSY);
         }
-        inner.dirty_pages.insert(0);
+        inner.set_index(0, 1, true);
         entry.account_state_transition(old_state, PageState::Dirty);
         entry.set_state(PageState::Dirty);
         Ok(())
@@ -2469,7 +3436,7 @@ pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, S
             return Err(SystemError::EIO);
         }
         let old_state = legacy_entry.state();
-        inner.dirty_pages.insert(0);
+        inner.set_index(0, 1, true);
         legacy_entry.account_state_transition(old_state, PageState::Dirty);
         legacy_entry.set_state(PageState::Dirty);
     }
@@ -3075,7 +4042,7 @@ pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, S
             return Err(SystemError::EIO);
         }
         let old_state = overflow_entry.state();
-        inner.dirty_pages.insert(0);
+        inner.set_index(0, 1, true);
         overflow_entry.account_state_transition(old_state, PageState::Dirty);
         overflow_entry.set_state(PageState::Dirty);
         inner.next_writeback_generation = u64::MAX;
@@ -3724,11 +4691,14 @@ pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, S
     let state_cache = PageCache::new_unowned(None, None);
     let loading_page = state_cache.allocate_page(Arc::downgrade(&state_cache), 0)?;
     let loading_entry = Arc::new(PageEntry::new(loading_page.clone(), PageState::Loading));
+    let creator =
+        crate::cgroup::memory::object_for_task(&crate::process::ProcessManager::current_pcb());
     state_cache
-        .inner
-        .lock()
-        .insert_entry(0, loading_entry.clone())?;
-    let loading_removed = state_cache.inner.lock().remove_page(0).is_some();
+        .publish_prepared_range(core::iter::once((0, &loading_entry)), 1, &creator)
+        .map_err(PageCache::legacy_allocation_error)?;
+    let loading_removed_entry = state_cache.inner.lock().remove_entry(0);
+    let loading_removed = loading_removed_entry.is_some();
+    drop(loading_removed_entry);
     loading_entry.account_state_transition(PageState::Loading, PageState::UpToDate);
     loading_entry.set_state(PageState::UpToDate);
     let loading_ok =
@@ -3756,7 +4726,7 @@ pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, S
         let mut inner = writeback_cache.inner.lock();
         writeback_entry.account_state_transition(PageState::UpToDate, PageState::Dirty);
         writeback_entry.set_state(PageState::Dirty);
-        inner.dirty_pages.insert(0);
+        inner.set_index(0, 1, true);
     }
     let invalidate_ordinary_claim_rejected = {
         let _invalidate = writeback_cache.invalidate_write();
@@ -3861,7 +4831,7 @@ pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, S
         {
             return Ok("status=fail stage=writeback_complete_error\n".into());
         }
-        inner.remove_page(0).is_some()
+        inner.remove_entry(0).is_some()
     };
     let writeback_ok =
         writeback_removed && writeback_entry.accounting() == PageEntryAccounting::Unaccounted;
@@ -3904,9 +4874,8 @@ pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, S
     let drop_paddr = drop_page.phys_address();
     let drop_entry = Arc::new(PageEntry::new(drop_page, PageState::Loading));
     drop_cache
-        .inner
-        .lock()
-        .insert_entry(0, drop_entry.clone())?;
+        .publish_prepared_range(core::iter::once((0, &drop_entry)), 1, &creator)
+        .map_err(PageCache::legacy_allocation_error)?;
     drop(drop_cache);
     drop_entry.account_state_transition(PageState::Loading, PageState::UpToDate);
     drop_entry.set_state(PageState::UpToDate);
@@ -3931,7 +4900,7 @@ pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, S
         }
         entry.account_state_transition(PageState::UpToDate, PageState::Dirty);
         entry.set_state(PageState::Dirty);
-        inner.dirty_pages.insert(index);
+        inner.set_index(index, 1, true);
         if !inner.dirty_pages.contains(&index) {
             return Ok("status=fail stage=dirty_set\n".into());
         }
@@ -3949,11 +4918,33 @@ pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, S
         && wiring_pages[0]
             .read()
             .flags()
-            .contains(PageFlags::PG_UNEVICTABLE)
+            .contains(PageFlags::PG_LRU | PageFlags::PG_UNEVICTABLE)
         && page_manager_lock().contains(&first_wiring_paddr)
-        && page_reclaimer_lock().get(&first_wiring_paddr).is_none();
+        && page_reclaimer_lock()
+            .get(&first_wiring_paddr)
+            .is_some_and(|page| Arc::ptr_eq(&page, &wiring_pages[0]));
     if !unevictable_local_ok {
         return Ok("status=fail stage=unevictable_fixture\n".into());
+    }
+    // UNE pages retain registry nodes, but a real global bounded scan must
+    // not detach any of these pages from cache/manager/LRU membership.
+    crate::mm::page::PageReclaimer::shrink_list(
+        crate::mm::allocator::page_frame::PageFrameCount::ONE,
+    );
+    for (index, expected) in wiring_pages.iter().enumerate() {
+        if !wiring_cache
+            .manager
+            .peek_page(index)
+            .is_some_and(|page| Arc::ptr_eq(&page, expected))
+            || !page_manager_lock()
+                .get(&expected.phys_address())
+                .is_some_and(|page| Arc::ptr_eq(&page, expected))
+            || !page_reclaimer_lock()
+                .get(&expected.phys_address())
+                .is_some_and(|page| Arc::ptr_eq(&page, expected))
+        {
+            return Ok("status=fail stage=unevictable_scan\n".into());
+        }
     }
     let dirty_populated = pc_stats::snapshot();
     for (index, page) in wiring_pages.iter().enumerate() {
@@ -4038,7 +5029,7 @@ pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, S
         ));
     }
 
-    Ok(alloc::format!(
-        "status=ok\nregistry_churn=ok\nregistry_batch_retire=ok\nregistry_snapshot_lifetime=ok\nregistry_concurrent_snapshot=ok\nramfs_fallocate_range=ok\nwrite_prepare_rollback=ok\npreallocate_rollback=ok\nwriteback_domain_lifecycle=ok\ndetached_read_batch_completion=ok\npreallocated_batch_lifecycle=ok\nfile_membership=ok\nshmem_membership=ok\ndirty_membership=ok\ndirty_incarnation=ok\nremote_dirty_publish=ok\nwriteback_membership=ok\nwriteback_admission_order=ok\nwriteback_submission_token=ok\nwriteback_defer_progress=ok\nwriteback_budget_retry=ok\nsubmitted_writeback=ok\nfault_invalidate_retry_order=ok\ntag_scan_chunk_release=ok\nunevictable_membership=ok\ninflight_teardown=ok\nlate_completion=ok\nglobal_wiring=ok\nlayout=ok\nfile_drop_drift={file_drop_drift}\nshmem_drop_drift={shmem_drop_drift}\ndirty_drop_drift={dirty_drop_drift}\nwriteback_drop_drift={writeback_drop_drift}\nunevictable_drop_drift={unevictable_drop_drift}\nentry_size={entry_size}\nbaseline_size={baseline_size}\n"
+    Ok(fdtable_layout_report + &alloc::format!(
+        "status=ok\nmemcg_as_body_lifetime=ok\nmemcg_vma_body_lifetime=ok\nmemcg_file_body_lifetime=ok\nfault_cache_snapshot=ok\nmemcg_page_state=ok\nmemcg_reclaim=ok\nmemcg_reclaim_scan_budget=ok\nregistry_churn=ok\nregistry_batch_retire=ok\nregistry_snapshot_lifetime=ok\nregistry_concurrent_snapshot=ok\nramfs_fallocate_range=ok\nwrite_prepare_rollback=ok\npreallocate_rollback=ok\nclean_unlink_liveness=ok\nwriteback_domain_lifecycle=ok\ndetached_read_batch_completion=ok\npreallocated_batch_lifecycle=ok\nfile_membership=ok\nshmem_membership=ok\ndirty_membership=ok\ndirty_incarnation=ok\nremote_dirty_publish=ok\nwriteback_membership=ok\nwriteback_admission_order=ok\nwriteback_submission_token=ok\nwriteback_defer_progress=ok\nwriteback_budget_retry=ok\nsubmitted_writeback=ok\nfault_invalidate_retry_order=ok\ntag_scan_chunk_release=ok\nunevictable_membership=ok\ninflight_teardown=ok\nlate_completion=ok\nglobal_wiring=ok\nlayout=ok\nfile_drop_drift={file_drop_drift}\nshmem_drop_drift={shmem_drop_drift}\ndirty_drop_drift={dirty_drop_drift}\nwriteback_drop_drift={writeback_drop_drift}\nunevictable_drop_drift={unevictable_drop_drift}\nentry_size={entry_size}\nbaseline_size={baseline_size}\n"
     ))
 }

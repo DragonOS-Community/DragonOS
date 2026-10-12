@@ -667,7 +667,7 @@ pub trait Iface: crate::driver::base::device::Device {
 
     /// # `sockets`
     /// 获取网卡的套接字集
-    fn sockets(&self) -> Arc<Mutex<smoltcp::iface::SocketSet<'static>>> {
+    fn sockets(&self) -> Arc<Mutex<smoltcp::iface::SocketSet<'static, 'static>>> {
         self.common().sockets.read().clone()
     }
 

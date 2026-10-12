@@ -2,7 +2,7 @@
 
 use system_error::SystemError;
 
-use alloc::{string::String, vec::Vec};
+use alloc::vec::Vec;
 
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_CHDIR;
@@ -66,8 +66,9 @@ impl Syscall for SysChdirHandle {
 
         // 解析目标 inode：绝对路径以进程 fs root 为起点；相对路径以 cwd inode 为起点
         let (inode_begin, remain_path) = user_path_at(&proc, AtFlags::AT_FDCWD.bits(), path)?;
-        let inode =
-            inode_begin.lookup_follow_symlink(&remain_path, VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
+        let inode = crate::filesystem::vfs::file::File::recover_io(|| {
+            inode_begin.lookup_follow_symlink(&remain_path, VFS_MAX_FOLLOW_SYMLINK_TIMES)
+        })?;
         let resolved = ResolvedPath::new(inode)?;
         let inode = resolved.inode();
         let metadata = inode.metadata()?;
@@ -81,33 +82,6 @@ impl Syscall for SysChdirHandle {
             PermissionMask::MAY_EXEC | PermissionMask::MAY_CHDIR,
         )?;
 
-        // 维护一个“用户可见”的 cwd 字符串（用于 getcwd 的快速路径）
-        // 注意：路径解析不再依赖该字符串，避免 chroot 后出现语义偏差。
-        let mut new_path = String::from("");
-        let cwd = match path.as_bytes()[0] {
-            b'/' => String::from("/"),
-            _ => proc.basic().cwd(),
-        };
-        let mut cwd_vec: Vec<_> = cwd.split('/').filter(|&x| !x.is_empty()).collect();
-        let path_split = path.split('/').filter(|&x| !x.is_empty());
-        for seg in path_split {
-            if seg == ".." {
-                cwd_vec.pop();
-            } else if seg == "." {
-                // 当前目录
-            } else {
-                cwd_vec.push(seg);
-            }
-        }
-        for seg in cwd_vec {
-            new_path.push('/');
-            new_path.push_str(seg);
-        }
-        if new_path.is_empty() {
-            new_path = String::from("/");
-        }
-
-        proc.basic_mut().set_cwd(new_path);
         proc.fs_struct().set_pwd_resolved(resolved);
         Ok(0)
     }

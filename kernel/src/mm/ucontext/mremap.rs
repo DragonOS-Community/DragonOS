@@ -251,9 +251,14 @@ impl InnerAddressSpace {
     /// # Errors
     ///
     /// - `EINVAL`: invalid argument
+    #[expect(
+        clippy::result_large_err,
+        reason = "Failure returns deferred cleanup obligations without allocating under the MM lock"
+    )]
     pub(super) fn mremap<F>(
         &mut self,
         request: MremapRequest,
+        creator: &Arc<ObjectAccount>,
         mut before_mutation: F,
     ) -> Result<MremapOutcome, MremapFailure>
     where
@@ -271,7 +276,7 @@ impl InnerAddressSpace {
         macro_rules! mremap_fail {
             ($err:expr) => {
                 return Err(MremapFailure {
-                    err: $err,
+                    err: ($err).into(),
                     notifications,
                     exec_publication,
                 })
@@ -365,10 +370,32 @@ impl InnerAddressSpace {
             });
         }
 
+        // Reserve every merged close/retirement collection before the first
+        // mutation. The validated fixed target and old range are disjoint, so
+        // target splitting cannot increase the tail's original conflict count.
+        // Each unmap failure has at most two fragments/closes per original;
+        // success retains one original. Source splitting plus target rollback
+        // need at most three further slots (four leave an explicit spare).
+        let tail =
+            (old_len > new_len).then(|| VirtRegion::new(old_vaddr + new_len, old_len - new_len));
+        let unmap_originals = self.mappings.iter_vmas().try_fold(0usize, |count, vma| {
+            let guard = vma.lock();
+            let target =
+                fixed_new_region.is_some_and(|region| guard.region().intersect(&region).is_some());
+            let tail = tail.is_some_and(|region| guard.region().intersect(&region).is_some());
+            count.checked_add(usize::from(target) + usize::from(tail))
+        });
+        let slots = mremap_try!(unmap_originals
+            .and_then(|count| count.checked_mul(2))
+            .and_then(|count| count.checked_add(4))
+            .ok_or(SystemError::ENOMEM));
+        mremap_try!(notifications.prepare_retirement_slots(slots));
+
         if old_len > new_len && !mremap_flags.contains(MremapFlags::MREMAP_FIXED) {
             let prepared = match self.prepare_munmap(
                 VirtPageFrame::new(old_vaddr + new_len),
                 PageFrameCount::from_bytes(old_len - new_len).unwrap(),
+                creator,
             ) {
                 Ok(prepared) => prepared,
                 Err(failure) => {
@@ -392,7 +419,7 @@ impl InnerAddressSpace {
         if mremap_flags.contains(MremapFlags::MREMAP_FIXED) {
             let start_page = VirtPageFrame::new(new_vaddr);
             let page_count = PageFrameCount::from_bytes(new_len).unwrap();
-            let prepared = match self.prepare_munmap(start_page, page_count) {
+            let prepared = match self.prepare_munmap(start_page, page_count, creator) {
                 Ok(prepared) => prepared,
                 Err(failure) => {
                     notifications.extend(failure.notifications);
@@ -409,6 +436,7 @@ impl InnerAddressSpace {
             let prepared = match self.prepare_munmap(
                 VirtPageFrame::new(old_vaddr + new_len),
                 PageFrameCount::from_bytes(old_len - new_len).unwrap(),
+                creator,
             ) {
                 Ok(prepared) => prepared,
                 Err(failure) => {
@@ -622,14 +650,19 @@ impl InnerAddressSpace {
         let new_region: VirtRegion = if let Some(new_region) = fixed_new_region {
             new_region
         } else if dontunmap_flag {
-            let (region, close_notifications) =
-                match self.find_free_at_collect(self.mmap_min, new_vaddr, new_len, map_flags) {
-                    Ok(outcome) => outcome,
-                    Err(failure) => {
-                        notifications.extend(failure.notifications);
-                        mremap_fail!(failure.err);
-                    }
-                };
+            let (region, close_notifications) = match self.find_free_at_collect(
+                self.mmap_min,
+                new_vaddr,
+                new_len,
+                map_flags,
+                creator,
+            ) {
+                Ok(outcome) => outcome,
+                Err(failure) => {
+                    notifications.extend(failure.notifications);
+                    mremap_fail!(failure.err);
+                }
+            };
             notifications.extend(close_notifications);
             region
         } else {
@@ -707,8 +740,10 @@ impl InnerAddressSpace {
         } else {
             None
         };
+        // The initial checked bound already includes these source fragments
+        // and target rollback; no collection growth follows committed unmaps.
         let mut source_split_lifecycle = if split_source_on_commit {
-            match old_vma.prepare_split_lifecycle(source_region) {
+            match old_vma.prepare_split_lifecycle(source_region, creator) {
                 Ok(lifecycle) => Some(lifecycle),
                 Err(failure) => {
                     let err = failure.rollback_into(&mut notifications);
@@ -738,6 +773,7 @@ impl InnerAddressSpace {
                     publication.publish(self, &mm);
                 }
                 if let Some(sysv_shm) = sysv_shm.as_ref() {
+                    assert!(notifications.sysv.len() < notifications.sysv.capacity());
                     notifications.sysv.push(sysv_shm.clone());
                 }
                 if let Some(lifecycle) = source_split_lifecycle.take() {
@@ -750,18 +786,33 @@ impl InnerAddressSpace {
         // Create the target VMA (initially without mapping physical pages; existing PTEs will be
         // moved/copied below).
         let new_vma: Arc<LockedVMA> = {
-            let vma = LockedVMA::new(VMA::new(
-                new_region,
-                vm_flags,
-                entry_flags,
-                vm_file.clone(),
-                if vm_file.is_some() {
-                    Some(base_pgoff)
-                } else {
-                    None
-                },
-                false,
-            ));
+            let vma = match LockedVMA::try_new(
+                VMA::new(
+                    new_region,
+                    vm_flags,
+                    entry_flags,
+                    vm_file.clone(),
+                    if vm_file.is_some() {
+                        Some(base_pgoff)
+                    } else {
+                        None
+                    },
+                    false,
+                ),
+                creator,
+            ) {
+                Ok(vma) => vma,
+                Err(error) => {
+                    if let Some(sysv_shm) = sysv_shm.as_ref() {
+                        assert!(notifications.sysv.len() < notifications.sysv.capacity());
+                        notifications.sysv.push(sysv_shm.clone());
+                    }
+                    if let Some(lifecycle) = source_split_lifecycle.take() {
+                        lifecycle.rollback_into(&mut notifications);
+                    }
+                    mremap_fail!(error);
+                }
+            };
             if let Some(sysv_shm) = sysv_shm.clone() {
                 vma.lock().set_sysv_shm(Some(sysv_shm));
             }
@@ -797,14 +848,19 @@ impl InnerAddressSpace {
         let mut installed_target_pte = false;
         let mut installed_target_present_pages = 0usize;
         let mut removed_source_present_pages = 0usize;
+        // Admission may now fail at any intermediate table. Reserve rollback
+        // records before acquiring PageManager and before publishing any leaf.
+        let mut migrated = Vec::new();
+        let mut err = migrated
+            .try_reserve_exact(move_len.div_ceil(MMArch::PAGE_SIZE))
+            .err()
+            .map(|_| MemoryAllocationError::System(SystemError::ENOMEM));
 
         {
             let _pt_edit = mm.page_table_edit();
             let mut page_manager_guard = page_manager_lock();
-            let mut migrated = Vec::new();
-            let mut err = None;
             let mut off = 0usize;
-            while off < move_len {
+            while err.is_none() && off < move_len {
                 let src = old_vaddr + off;
                 let dst = new_region.start() + off;
                 if let Some((paddr, src_flags)) = mapper.translate(src) {
@@ -813,9 +869,18 @@ impl InnerAddressSpace {
                     } else {
                         src_flags
                     };
-                    let Some(flush) = (unsafe { mapper.map_phys(dst, paddr, target_flags) }) else {
-                        err = Some(SystemError::ENOMEM);
-                        break;
+                    let flush = match unsafe {
+                        mapper.try_map_phys(dst, paddr, target_flags, Some(creator))
+                    } {
+                        Ok(Some(flush)) => flush,
+                        Ok(None) => {
+                            err = Some(SystemError::ENOMEM.into());
+                            break;
+                        }
+                        Err(error) => {
+                            err = Some(MemoryAllocationError::Charge(error));
+                            break;
+                        }
                     };
                     unsafe { flush.ignore() };
                     tlb.accumulate_range(dst);
@@ -852,6 +917,7 @@ impl InnerAddressSpace {
                 if let (Some(file), Some(VmaOpenRollback::Close)) =
                     (vm_file.as_ref(), target_vma_open_rollback)
                 {
+                    assert!(notifications.vma.len() < notifications.vma.capacity());
                     notifications.vma.push(VmaCloseNotification {
                         file: file.clone(),
                         region: new_region,
@@ -859,11 +925,13 @@ impl InnerAddressSpace {
                     });
                 }
                 if let Some(sysv_shm) = sysv_shm.as_ref() {
+                    assert!(notifications.sysv.len() < notifications.sysv.capacity());
                     notifications.sysv.push(sysv_shm.clone());
                 }
                 if let Some(lifecycle) = source_split_lifecycle.take() {
                     lifecycle.rollback_into(&mut notifications);
                 }
+                notifications.retire_vma(new_vma);
                 mremap_fail!(err);
             }
 
@@ -911,7 +979,13 @@ impl InnerAddressSpace {
                     .expect("validated mremap source VMA must exist");
                 debug_assert!(Arc::ptr_eq(&removed, &old_vma));
                 let split_result = removed
-                    .extract(source_region, &self.user_mapper.utable)
+                    .extract(
+                        source_region,
+                        &self.user_mapper.utable,
+                        source_split_lifecycle
+                            .as_mut()
+                            .expect("prepared source split lifecycle"),
+                    )
                     .expect("validated mremap source region must split");
                 source_vma = split_result.middle;
                 split_before = split_result.prev;
@@ -952,9 +1026,11 @@ impl InnerAddressSpace {
                     source_vma.lock().set_mapped(false);
                     if let Some(notification) = Self::collect_vma_close(&source_vma, source_region)
                     {
+                        assert!(notifications.vma.len() < notifications.vma.capacity());
                         notifications.vma.push(notification);
                     }
                     if let Some(notification) = Self::collect_sysv_shm_close(&source_vma) {
+                        assert!(notifications.sysv.len() < notifications.sysv.capacity());
                         notifications.sysv.push(notification);
                     }
                 } else {
@@ -965,12 +1041,17 @@ impl InnerAddressSpace {
                     removed.unmap(&mut self.user_mapper.utable, &mut tlb);
                     removed.lock().set_mapped(false);
                     if let Some(notification) = Self::collect_vma_close(&removed, old_region) {
+                        assert!(notifications.vma.len() < notifications.vma.capacity());
                         notifications.vma.push(notification);
                     }
                     if let Some(notification) = Self::collect_sysv_shm_close(&removed) {
+                        assert!(notifications.sysv.len() < notifications.sysv.capacity());
                         notifications.sysv.push(notification);
                     }
                 }
+                // The source body can own the last File/shared-anon backing.
+                // Retain it after TLB completion until the outer drops MM.
+                notifications.retire_vma(source_vma.clone());
             }
             if split_source_on_commit && !remove_source_vma_on_commit {
                 self.mappings.insert_vma(source_vma);

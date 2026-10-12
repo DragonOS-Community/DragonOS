@@ -117,8 +117,13 @@ impl BpfProg {
 }
 
 impl IndexNode for BpfProg {
-    fn open(&self, _data: MutexGuard<FilePrivateData>, _flags: &FileFlags) -> Result<()> {
-        Ok(())
+    fn open(
+        &self,
+        _data: MutexGuard<FilePrivateData>,
+        _flags: &FileFlags,
+    ) -> core::result::Result<(), crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = Ok(());
+        result.map_err(Into::into)
     }
     fn close(&self, _data: MutexGuard<FilePrivateData>) -> Result<()> {
         Ok(())
@@ -129,8 +134,9 @@ impl IndexNode for BpfProg {
         _len: usize,
         _buf: &mut [u8],
         _data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize> {
-        Err(SystemError::ENOSYS)
+    ) -> core::result::Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = Err(SystemError::ENOSYS);
+        result.map_err(Into::into)
     }
 
     fn write_at(
@@ -139,8 +145,9 @@ impl IndexNode for BpfProg {
         _len: usize,
         _buf: &[u8],
         _data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize> {
-        Err(SystemError::ENOSYS)
+    ) -> core::result::Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = Err(SystemError::ENOSYS);
+        result.map_err(Into::into)
     }
 
     fn metadata(&self) -> Result<Metadata> {
@@ -151,8 +158,12 @@ impl IndexNode for BpfProg {
         metadata.mode
     }
 
-    fn resize(&self, _len: usize) -> Result<()> {
-        Ok(())
+    fn resize(
+        &self,
+        _len: usize,
+    ) -> core::result::Result<(), crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = Ok(());
+        result.map_err(Into::into)
     }
 
     fn fs(&self) -> Arc<dyn FileSystem> {
@@ -206,11 +217,19 @@ pub fn bpf_prog_load(attr: &bpf_attr) -> Result<usize> {
     } else {
         BpfProgVerifier::new(prog, log_info.log_level, &mut []).verify(&fd_table)?
     };
+    let storage = crate::filesystem::vfs::file::PreparedFile::new_recovering()?;
     let prog = Arc::new(prog);
-    let file = File::new(prog.clone(), FileFlags::O_RDWR)?;
-    let fd = fd_table
-        .alloc_fd(file, false, current.nofile_soft_limit())
-        .map(|x| x as usize)?;
+    let file = File::new_prepared_recovering(prog.clone(), FileFlags::O_RDWR, storage)?;
+    let file = Arc::try_new(file).map_err(|_| SystemError::ENOMEM)?;
+    let fd = File::recover_io(|| {
+        fd_table.alloc_fd_arc(
+            file.clone(),
+            false,
+            current.nofile_soft_limit(),
+            &crate::cgroup::memory::object_for_task(&current),
+        )
+    })
+    .map(|x| x as usize)?;
     PROGRAMS_BY_ID.lock().insert(id, Arc::downgrade(&prog));
     Ok(fd)
 }

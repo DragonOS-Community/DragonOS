@@ -83,8 +83,9 @@ impl IndexNode for LockedRandomInode {
         &self,
         _data: MutexGuard<FilePrivateData>,
         _flags: &FileFlags,
-    ) -> Result<(), SystemError> {
-        Ok(())
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = Ok(());
+        result.map_err(Into::into)
     }
 
     fn close(&self, _data: MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
@@ -103,16 +104,22 @@ impl IndexNode for LockedRandomInode {
         Err(SystemError::ENOSYS)
     }
 
-    fn set_metadata(&self, metadata: &Metadata) -> Result<(), SystemError> {
-        let mut inode = self.0.lock();
-        inode.metadata.atime = metadata.atime;
-        inode.metadata.mtime = metadata.mtime;
-        inode.metadata.ctime = metadata.ctime;
-        inode.metadata.btime = metadata.btime;
-        inode.metadata.mode = metadata.mode;
-        inode.metadata.uid = metadata.uid;
-        inode.metadata.gid = metadata.gid;
-        Ok(())
+    fn set_metadata(
+        &self,
+        metadata: &Metadata,
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = {
+            let mut inode = self.0.lock();
+            inode.metadata.atime = metadata.atime;
+            inode.metadata.mtime = metadata.mtime;
+            inode.metadata.ctime = metadata.ctime;
+            inode.metadata.btime = metadata.btime;
+            inode.metadata.mode = metadata.mode;
+            inode.metadata.uid = metadata.uid;
+            inode.metadata.gid = metadata.gid;
+            Ok(())
+        };
+        result.map_err(Into::into)
     }
 
     fn update_atime(&self, now: PosixTimeSpec, relatime: bool) -> Result<(), SystemError> {
@@ -131,20 +138,23 @@ impl IndexNode for LockedRandomInode {
         len: usize,
         buf: &mut [u8],
         _data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError> {
-        if buf.len() < len {
-            return Err(SystemError::EINVAL);
-        }
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = (|| {
+            if buf.len() < len {
+                return Err(SystemError::EINVAL);
+            }
 
-        let mut copied = 0;
-        while copied < len {
-            let chunk = rand_bytes::<{ size_of::<usize>() }>();
-            let copy_len = min(len - copied, chunk.len());
-            buf[copied..copied + copy_len].copy_from_slice(&chunk[..copy_len]);
-            copied += copy_len;
-        }
+            let mut copied = 0;
+            while copied < len {
+                let chunk = rand_bytes::<{ size_of::<usize>() }>();
+                let copy_len = min(len - copied, chunk.len());
+                buf[copied..copied + copy_len].copy_from_slice(&chunk[..copy_len]);
+                copied += copy_len;
+            }
 
-        Ok(len)
+            Ok(len)
+        })();
+        result.map_err(Into::into)
     }
 
     fn write_at(
@@ -153,11 +163,14 @@ impl IndexNode for LockedRandomInode {
         len: usize,
         buf: &[u8],
         _data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError> {
-        if buf.len() < len {
-            return Err(SystemError::EINVAL);
-        }
-        Ok(len)
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = (|| {
+            if buf.len() < len {
+                return Err(SystemError::EINVAL);
+            }
+            Ok(len)
+        })();
+        result.map_err(Into::into)
     }
 
     fn parent(&self) -> Result<Arc<dyn IndexNode>, SystemError> {

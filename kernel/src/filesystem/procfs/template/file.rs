@@ -142,7 +142,10 @@ impl<F: FileOps + 'static> IndexNode for ProcFile<F> {
 
     fn fs(&self) -> Arc<dyn FileSystem>;
     fn as_any_ref(&self) -> &dyn core::any::Any;
-    fn set_metadata(&self, metadata: &Metadata) -> Result<(), SystemError> {
+    fn set_metadata(
+        &self,
+        metadata: &Metadata,
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         let current = self.common.metadata()?;
         if current
             .flags
@@ -151,16 +154,16 @@ impl<F: FileOps + 'static> IndexNode for ProcFile<F> {
                 || current.uid != metadata.uid
                 || current.gid != metadata.gid)
         {
-            return Err(SystemError::EPERM);
+            return Err(SystemError::EPERM.into());
         }
-        self.common.set_metadata(metadata)
+        self.common.set_metadata(metadata).map_err(Into::into)
     }
 
     fn set_metadata_masked(
         &self,
         metadata: &Metadata,
         mask: SetMetadataMask,
-    ) -> Result<(), SystemError> {
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         if mask.is_empty() {
             return Ok(());
         }
@@ -171,9 +174,9 @@ impl<F: FileOps + 'static> IndexNode for ProcFile<F> {
             .intersects(InodeFlags::S_SYSCTL_READONLY | InodeFlags::S_PROC_SYSCTL)
             && mask.intersects(SetMetadataMask::MODE | SetMetadataMask::UID | SetMetadataMask::GID)
         {
-            return Err(SystemError::EPERM);
+            return Err(SystemError::EPERM.into());
         }
-        self.common.set_metadata(metadata)
+        self.common.set_metadata(metadata).map_err(Into::into)
     }
 
     fn metadata(&self) -> Result<Metadata, SystemError> {
@@ -194,8 +197,10 @@ impl<F: FileOps + 'static> IndexNode for ProcFile<F> {
         len: usize,
         buf: &mut [u8],
         data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError> {
-        self.inner.read_at(offset, len, buf, data)
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        self.inner
+            .read_at(offset, len, buf, data)
+            .map_err(Into::into)
     }
 
     fn write_at(
@@ -204,8 +209,10 @@ impl<F: FileOps + 'static> IndexNode for ProcFile<F> {
         len: usize,
         buf: &[u8],
         data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError> {
-        self.inner.write_at(offset, len, buf, data)
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        self.inner
+            .write_at(offset, len, buf, data)
+            .map_err(Into::into)
     }
 
     fn list(&self) -> Result<Vec<String>, SystemError> {
@@ -220,17 +227,17 @@ impl<F: FileOps + 'static> IndexNode for ProcFile<F> {
         &self,
         mut data: MutexGuard<FilePrivateData>,
         flags: &FileFlags,
-    ) -> Result<(), SystemError> {
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         // 设置 procfs 私有数据，使得 lseek(SEEK_END) 返回 EINVAL
         *data = FilePrivateData::Procfs(ProcfsFilePrivateData::new());
-        self.inner.open(&mut data, flags)
+        self.inner.open(&mut data, flags).map_err(Into::into)
     }
 
     fn close(&self, _data: MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
         return Ok(());
     }
 
-    fn resize(&self, _len: usize) -> Result<(), SystemError> {
+    fn resize(&self, _len: usize) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         // Linux procfs allows O_TRUNC; treat it as a no-op for pseudo files.
         Ok(())
     }

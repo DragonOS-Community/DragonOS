@@ -7,6 +7,7 @@ use core::sync::atomic::{AtomicU8, Ordering};
 use system_error::SystemError;
 
 use crate::{
+    cgroup::memory::{object::ObjectAccount, MemoryAccount},
     filesystem::page_cache::PageCacheWritebackDomain,
     filesystem::vfs::{
         file::File, FilePrivateData, FileSystem, FileSystemMakerData, FileType, FsInfo, IndexNode,
@@ -44,24 +45,37 @@ struct FuseMmapRetryWait {
     file_flags: u32,
     lifetime: Arc<FuseOpenLifetime>,
     readahead: bool,
+    data_account: Arc<MemoryAccount>,
+    creator_object: Arc<ObjectAccount>,
 }
 
 impl FaultRetryWait for FuseMmapRetryWait {
-    fn wait(&self) -> Result<(), SystemError> {
+    fn wait(&self) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        // One attempt with this fault's captured target. Quota/offline returns
+        // to the resource-lock-free outer, which recaptures the MM owner and
+        // revalidates its VMA. Never retry forever against a retired CSS here.
         if self.readahead {
             let mut ra_state = self.file.get_ra_state();
-            self.node.mmap_readahead_with_open(
+            self.node.try_mmap_readahead_with_open(
                 self.page_index,
                 1,
                 &mut ra_state,
                 self.fh,
                 self.file_flags,
                 self.lifetime.clone(),
+                &self.data_account,
+                &self.creator_object,
             )?;
-            self.file.set_ra_state(ra_state)
+            self.file.set_ra_state(ra_state).map_err(Into::into)
         } else {
             self.node
-                .fault_page_with_open(self.page_index, self.fh, self.file_flags)
+                .try_fault_page_with_open(
+                    self.page_index,
+                    self.fh,
+                    self.file_flags,
+                    &self.data_account,
+                    &self.creator_object,
+                )
                 .map(|_| ())
         }
     }
@@ -586,7 +600,10 @@ impl MountableFileSystem for FuseFS {
     fn make_mount_data(
         raw_data: Option<&str>,
         _source: &str,
-    ) -> Result<Option<Arc<dyn FileSystemMakerData + 'static>>, SystemError> {
+    ) -> Result<
+        Option<Arc<dyn FileSystemMakerData + 'static>>,
+        crate::mm::allocation::MemoryAllocationError,
+    > {
         let opts = Self::parse_mount_options(raw_data)?;
 
         let file = ProcessManager::current_pcb()
@@ -601,7 +618,7 @@ impl MountableFileSystem for FuseFS {
                 crate::filesystem::vfs::FilePrivateData::Fuse(FuseFilePrivateData::Dev(p)) => {
                     p.conn_ref()?
                 }
-                _ => return Err(SystemError::EINVAL),
+                _ => return Err(SystemError::EINVAL.into()),
             }
         };
 
@@ -800,13 +817,26 @@ impl FileSystem for FuseFS {
         let Some(page_index) = pfm.backing_pgoff() else {
             return VmFaultReason::VM_FAULT_SIGBUS;
         };
-        let major = node
+        let (major, needs_io) = node
             .page_cache()
-            .map(|cache| !cache.is_page_ready(page_index))
-            .unwrap_or(true);
+            .map(|cache| {
+                let state = cache.fault_page_state(page_index);
+                (!state.cached, !state.ready)
+            })
+            .unwrap_or((true, true));
+        let major_reason = if major {
+            VmFaultReason::VM_FAULT_MAJOR
+        } else {
+            VmFaultReason::empty()
+        };
 
         if major {
-            crate::mm::fault::account_major_fault_event();
+            crate::mm::fault::account_major_fault_event(pfm.data_account());
+        }
+        // An existing Loading/Error entry is not a cache miss, but its wait
+        // must still run after the MM guard is dropped. Do not use `major` as
+        // the I/O/retry predicate.
+        if needs_io {
             let can_retry = pfm.flags().contains(FaultFlags::FAULT_FLAG_ALLOW_RETRY)
                 && !pfm.flags().contains(FaultFlags::FAULT_FLAG_RETRY_NOWAIT);
             if can_retry {
@@ -818,31 +848,39 @@ impl FileSystem for FuseFS {
                     file_flags,
                     lifetime,
                     readahead: !pfm.flags().contains(FaultFlags::FAULT_FLAG_TRIED),
+                    data_account: pfm.data_account().clone(),
+                    creator_object: pfm.creator_object().clone(),
                 }));
-                return VmFaultReason::VM_FAULT_MAJOR | VmFaultReason::VM_FAULT_RETRY;
+                return major_reason | VmFaultReason::VM_FAULT_RETRY;
             }
             let mut ra_state = file.get_ra_state();
-            let _ = node.mmap_readahead_with_open(
+            if let Err(error) = node.try_mmap_readahead_with_open(
                 page_index,
                 1,
                 &mut ra_state,
                 fh,
                 file_flags,
                 lifetime,
-            );
+                pfm.data_account(),
+                pfm.creator_object(),
+            ) {
+                return major_reason | pfm.allocation_failure(error);
+            }
             let _ = file.set_ra_state(ra_state);
         }
 
-        match node.fault_page_with_open(page_index, fh, file_flags) {
+        match node.try_fault_page_with_open(
+            page_index,
+            fh,
+            file_flags,
+            pfm.data_account(),
+            pfm.creator_object(),
+        ) {
             Ok(page) => {
                 pfm.set_page(page);
-                if major {
-                    VmFaultReason::VM_FAULT_MAJOR
-                } else {
-                    VmFaultReason::empty()
-                }
+                major_reason
             }
-            Err(_) => VmFaultReason::VM_FAULT_SIGBUS,
+            Err(error) => major_reason | pfm.allocation_failure(error),
         }
     }
 

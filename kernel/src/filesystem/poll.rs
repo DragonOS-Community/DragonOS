@@ -186,7 +186,12 @@ impl<'a> PollAdapter<'a> {
                 false,
             );
 
-            if result.is_err() {
+            if let Err(error) = result {
+                // Registration storage/admission failure is not an invalid
+                // descriptor. Preserve resource and fatal-interruption errors.
+                if matches!(error, SystemError::ENOMEM | SystemError::EINTR) {
+                    return Err(error);
+                }
                 // 对于无法加入 epoll 的情况，按“无效/不可监听”处理：设置 POLLNVAL。
                 // “总是就绪”文件已经在上面特判并被移除。
                 self.added_fds.remove(&fd);

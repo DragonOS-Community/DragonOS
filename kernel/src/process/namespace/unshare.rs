@@ -21,32 +21,56 @@ pub fn ksys_unshare(flags: CloneFlags) -> Result<(), SystemError> {
     check_unshare_flags(flags)?;
 
     let current_pcb = ProcessManager::current_pcb();
-    let new_cred = unshare_user_cred(flags, &current_pcb)?.map(Cred::new_arc);
-    let fs_refs = lock_fs_refs_copy();
-    let new_fs = unshare_fs_struct(flags, &current_pcb, &fs_refs)?;
-    let new_nsproxy =
-        unshare_nsproxy_namespaces(flags, &current_pcb, new_cred.as_deref(), new_fs.as_ref())?;
-    if let Some(prepared) =
-        prepare_unshare_install(&current_pcb, flags, new_fs, new_nsproxy, new_cred, &fs_refs)?
-    {
-        prepared.commit(&current_pcb, fs_refs)?;
+    let mut recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
+    loop {
+        let new_cred = unshare_user_cred(flags, &current_pcb)?.map(Cred::new_arc);
+        // Retain completed candidates outside the topology barrier, even if
+        // a later preparation step fails. No committed install is retried.
+        let mut new_fs = None;
+        let mut new_nsproxy = None;
+        let fs_refs = lock_fs_refs_copy();
+        let attempt = (|| {
+            new_fs = unshare_fs_struct(flags, &current_pcb, &fs_refs)?;
+            new_nsproxy = unshare_nsproxy_namespaces(
+                flags,
+                &current_pcb,
+                new_cred.as_deref(),
+                new_fs.as_ref(),
+            )?;
+            prepare_unshare_install(
+                &current_pcb,
+                flags,
+                &mut new_fs,
+                new_nsproxy.clone(),
+                new_cred.clone(),
+                &fs_refs,
+            )
+        })();
+        match attempt {
+            Ok(Some(prepared)) => return prepared.commit(&current_pcb, fs_refs),
+            Ok(None) => {
+                drop(fs_refs);
+                return Ok(());
+            }
+            Err(error) => {
+                drop(fs_refs);
+                drop(new_fs);
+                drop(new_nsproxy);
+                drop(new_cred);
+                error.recover(&mut recovery)?;
+            }
+        }
     }
-
-    // TODO: 处理其他命名空间的 unshare 操作
-    // CLONE_FS, CLONE_FILES, CLONE_SIGHAND, CLONE_VM, CLONE_THREAD, CLONE_SYSVSEM,
-    // CLONE_NEWUTS, CLONE_NEWIPC, CLONE_NEWUSER, CLONE_NEWNET, CLONE_NEWCGROUP, CLONE_NEWTIME
-
-    Ok(())
 }
 
 fn prepare_unshare_install(
     current: &Arc<ProcessControlBlock>,
     flags: CloneFlags,
-    new_fs: Option<Arc<FsStruct>>,
+    new_fs: &mut Option<Arc<FsStruct>>,
     new_nsproxy: Option<Arc<NsProxy>>,
     new_cred: Option<Arc<Cred>>,
     fs_refs: &FsRefsReadGuard,
-) -> Result<Option<PreparedNamespaceInstall>, SystemError> {
+) -> Result<Option<PreparedNamespaceInstall>, crate::mm::allocation::MemoryAllocationError> {
     let detach_sysvsem = flags.intersects(CloneFlags::CLONE_SYSVSEM | CloneFlags::CLONE_NEWIPC);
     // Match Linux's conditional install: a no-op must not allocate RCU retire
     // storage or republish the same nsproxy. SYSVSEM detachment is itself work.
@@ -103,7 +127,7 @@ fn unshare_fs_struct(
     unshare_flags: CloneFlags,
     current_pcb: &Arc<crate::process::ProcessControlBlock>,
     _fs_refs: &crate::process::FsRefsReadGuard,
-) -> Result<Option<Arc<FsStruct>>, SystemError> {
+) -> Result<Option<Arc<FsStruct>>, crate::mm::allocation::MemoryAllocationError> {
     if !unshare_flags.contains(CloneFlags::CLONE_FS) {
         return Ok(None);
     }
@@ -113,7 +137,10 @@ fn unshare_fs_struct(
     }
 
     let current_fs = current_pcb.fs_struct();
-    Ok(Some(Arc::new((*current_fs).clone())))
+    Ok(Some(FsStruct::try_clone_for(
+        &current_fs,
+        &crate::cgroup::memory::object_for_task(current_pcb),
+    )?))
 }
 
 #[inline(never)]
@@ -217,7 +244,7 @@ mod tests {
         let fs_refs = lock_fs_refs_copy();
         for flags in [CloneFlags::empty(), CloneFlags::CLONE_FS] {
             assert!(
-                prepare_unshare_install(&pcb, flags, None, None, None, &fs_refs)
+                prepare_unshare_install(&pcb, flags, &mut None, None, None, &fs_refs)
                     .unwrap()
                     .is_none()
             );
@@ -231,10 +258,16 @@ mod tests {
         let old_group = pcb.ensure_sem_undo_group(&ipc_ns).unwrap();
         let fs_refs = lock_fs_refs_copy();
 
-        let prepared =
-            prepare_unshare_install(&pcb, CloneFlags::CLONE_SYSVSEM, None, None, None, &fs_refs)
-                .unwrap()
-                .unwrap();
+        let prepared = prepare_unshare_install(
+            &pcb,
+            CloneFlags::CLONE_SYSVSEM,
+            &mut None,
+            None,
+            None,
+            &fs_refs,
+        )
+        .unwrap()
+        .unwrap();
         prepared.commit(&pcb, fs_refs).unwrap();
 
         assert!(pcb.sem_undo_group().is_none());
@@ -260,7 +293,7 @@ mod tests {
         let prepared = prepare_unshare_install(
             &pcb,
             CloneFlags::CLONE_NEWIPC | CloneFlags::CLONE_SYSVSEM,
-            None,
+            &mut None,
             Some(Arc::new(new_inner)),
             None,
             &fs_refs,

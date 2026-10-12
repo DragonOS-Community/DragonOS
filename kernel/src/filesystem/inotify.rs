@@ -888,11 +888,13 @@ impl IndexNode for InotifyInode {
         &self,
         _data: MutexGuard<FilePrivateData>,
         _flags: &FileFlags,
-    ) -> Result<(), SystemError> {
-        self.opened
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = self
+            .opened
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .map(|_| ())
-            .map_err(|_| SystemError::ENXIO)
+            .map_err(|_| SystemError::ENXIO);
+        result.map_err(Into::into)
     }
 
     fn close(&self, _data: MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
@@ -908,20 +910,23 @@ impl IndexNode for InotifyInode {
         cmd: u32,
         data: usize,
         _private_data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError> {
-        if cmd != FIONREAD {
-            return Err(SystemError::ENOIOCTLCMD);
-        }
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = (|| {
+            if cmd != FIONREAD {
+                return Err(SystemError::ENOIOCTLCMD);
+            }
 
-        // Snapshot under the queue lock, then release it before touching user
-        // memory: a page fault must not block event producers or consumers.
-        let queued_bytes = self.queued_bytes();
-        debug_assert!(queued_bytes <= i32::MAX as usize);
-        let queued_bytes = queued_bytes as i32;
-        let mut writer =
-            UserBufferWriter::new(data as *mut i32, core::mem::size_of::<i32>(), true)?;
-        writer.buffer_protected(0)?.write_one(0, &queued_bytes)?;
-        Ok(0)
+            // Snapshot under the queue lock, then release it before touching user
+            // memory: a page fault must not block event producers or consumers.
+            let queued_bytes = self.queued_bytes();
+            debug_assert!(queued_bytes <= i32::MAX as usize);
+            let queued_bytes = queued_bytes as i32;
+            let mut writer =
+                UserBufferWriter::new(data as *mut i32, core::mem::size_of::<i32>(), true)?;
+            writer.buffer_protected(0)?.write_one(0, &queued_bytes)?;
+            Ok(0)
+        })();
+        result.map_err(Into::into)
     }
 
     /// read semantics: see design doc §4.3.
@@ -931,13 +936,16 @@ impl IndexNode for InotifyInode {
         len: usize,
         buf: &mut [u8],
         data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError> {
-        drop(data);
-        self.read_events_with(len, |written, ev| {
-            let record_len = Self::record_len(ev.name.as_deref());
-            Self::serialize(ev, &mut buf[written..written + record_len]);
-            Ok(())
-        })
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = {
+            drop(data);
+            self.read_events_with(len, |written, ev| {
+                let record_len = Self::record_len(ev.name.as_deref());
+                Self::serialize(ev, &mut buf[written..written + record_len]);
+                Ok(())
+            })
+        };
+        result.map_err(Into::into)
     }
 
     fn supports_read_user(&self) -> bool {
@@ -969,8 +977,9 @@ impl IndexNode for InotifyInode {
         _len: usize,
         _buf: &[u8],
         _data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError> {
-        Err(SystemError::EBADF)
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = Err(SystemError::EBADF);
+        result.map_err(Into::into)
     }
 
     fn metadata(&self) -> Result<Metadata, SystemError> {
@@ -981,8 +990,9 @@ impl IndexNode for InotifyInode {
         metadata.mode
     }
 
-    fn resize(&self, _len: usize) -> Result<(), SystemError> {
-        Ok(())
+    fn resize(&self, _len: usize) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = Ok(());
+        result.map_err(Into::into)
     }
 
     fn fs(&self) -> Arc<dyn FileSystem> {
@@ -1015,6 +1025,7 @@ pub fn do_inotify_init1(flags: u32) -> Result<usize, SystemError> {
     let flags = InotifyInitFlags::from_bits(flags).ok_or(SystemError::EINVAL)?;
 
     let quota_keys = current_quota_keys()?;
+    let storage = crate::filesystem::vfs::file::PreparedFile::new_recovering()?;
     reserve_instance(&quota_keys)?;
 
     let nonblock = flags.contains(InotifyInitFlags::IN_NONBLOCK);
@@ -1026,7 +1037,7 @@ pub fn do_inotify_init1(flags: u32) -> Result<usize, SystemError> {
         } else {
             FileFlags::empty()
         });
-    let file = File::new(inode, file_flags).inspect_err(|_| {
+    let file = File::new_prepared_recovering(inode, file_flags, storage).inspect_err(|_| {
         // File::new failure: the file was not created, so there is no drop→shutdown; roll back the instance count manually.
         release_quota(&quota_state.quota_keys, 1, 0);
     })?;
@@ -1038,9 +1049,16 @@ pub fn do_inotify_init1(flags: u32) -> Result<usize, SystemError> {
     let binding = current.fd_table();
     // On alloc_fd failure the file is dropped → File::drop → close → shutdown → roll
     // back the instance count, so there is no need to roll back manually here.
-    binding
-        .alloc_fd(file, cloexec, current.nofile_soft_limit())
-        .map(|fd| fd as usize)
+    let file = Arc::try_new(file).map_err(|_| SystemError::ENOMEM)?;
+    File::recover_io(|| {
+        binding.alloc_fd_arc(
+            file.clone(),
+            cloexec,
+            current.nofile_soft_limit(),
+            &crate::cgroup::memory::object_for_task(&current),
+        )
+    })
+    .map(|fd| fd as usize)
 }
 
 /// `inotify_init` (no arguments, equivalent to `inotify_init1(0)`).
@@ -1139,9 +1157,17 @@ impl Syscall for SysInotifyAddWatchHandle {
         let pcb = ProcessManager::current_pcb();
         let (inode_begin, remain_path) = user_path_at(&pcb, AtFlags::AT_FDCWD.bits(), &path)?;
         let target = if (mask & user_mask::IN_DONT_FOLLOW) != 0 {
-            inode_begin.lookup_follow_symlink2(&remain_path, VFS_MAX_FOLLOW_SYMLINK_TIMES, false)?
+            crate::filesystem::vfs::file::File::recover_io(|| {
+                inode_begin.lookup_follow_symlink2(
+                    &remain_path,
+                    VFS_MAX_FOLLOW_SYMLINK_TIMES,
+                    false,
+                )
+            })?
         } else {
-            inode_begin.lookup_follow_symlink(&remain_path, VFS_MAX_FOLLOW_SYMLINK_TIMES)?
+            crate::filesystem::vfs::file::File::recover_io(|| {
+                inode_begin.lookup_follow_symlink(&remain_path, VFS_MAX_FOLLOW_SYMLINK_TIMES)
+            })?
         };
 
         inotify_inode.add_watch(target, mask).map(|wd| wd as usize)

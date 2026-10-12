@@ -1,7 +1,4 @@
-use core::{
-    fmt::Debug,
-    sync::atomic::{AtomicUsize, Ordering},
-};
+use core::fmt::Debug;
 
 use alloc::{
     boxed::Box,
@@ -46,14 +43,16 @@ pub struct LockedVm {
     inner: SpinLock<Vm>,
 }
 
-static KVM_USAGE_COUNT: AtomicUsize = AtomicUsize::new(0);
+static KVM_USAGE_COUNT: SpinLock<usize> = SpinLock::new(0);
 
 impl LockedVm {
     pub fn lock(&self) -> SpinLockGuard<'_, Vm> {
         self.inner.lock()
     }
 
-    pub fn create(vm_type: usize) -> Result<Arc<Self>, SystemError> {
+    pub fn create(
+        vm_type: usize,
+    ) -> Result<Arc<Self>, crate::mm::allocation::MemoryAllocationError> {
         let mut memslots_set = vec![];
         let mut memslots = vec![];
         for i in 0..KVM_ADDRESS_SPACE_NUM {
@@ -69,12 +68,15 @@ impl LockedVm {
             memslots.push(memslots_set[i][0].clone());
         }
 
+        // Drop the PCB basic guard before clone's allocation recovery waits.
+        let source_mm = {
+            let task = ProcessManager::current_pcb();
+            let basic = task.basic();
+            basic.user_vm().unwrap()
+        };
+        let cloned_mm = source_mm.try_clone_for_task(&ProcessManager::current_pcb())?;
         let kvm = Vm {
-            mm: ProcessManager::current_pcb()
-                .basic()
-                .user_vm()
-                .unwrap()
-                .try_clone_wait()?,
+            mm: cloned_mm,
             max_vcpus: CurrentKvmManager::KVM_MAX_VCPUS,
             memslots_set,
             memslots,
@@ -96,22 +98,25 @@ impl LockedVm {
             inner: SpinLock::new(kvm),
         });
 
-        Self::hardware_enable_all()?;
-
         ret.lock().lock_vm_ref = Arc::downgrade(&ret);
         return Ok(ret);
     }
 
-    fn hardware_enable_all() -> Result<(), SystemError> {
-        KVM_USAGE_COUNT.fetch_add(1, Ordering::SeqCst);
-
-        // 如果是第一个启动的，则需要对所有cpu都初始化硬件
-        if KVM_USAGE_COUNT.load(Ordering::SeqCst) == 1 {
+    pub(super) fn hardware_enable_all() -> Result<(), SystemError> {
+        // Serialize first enable with successful reference publication. Do not
+        // let another create observe a reference to a failed enable. The
+        // existing arch hook is local-CPU only; IRQ save also prevents moving
+        // the initializing task between selecting and enabling that CPU.
+        let mut count = KVM_USAGE_COUNT.lock_irqsave();
+        let next = count.checked_add(1).ok_or(SystemError::EOVERFLOW)?;
+        if *count == 0 {
             // FIXME!!!!
             // 这里是要对每个cpu都进行初始化，目前这里只对当前cpu调用了初始化流程
             x86_kvm_manager().arch_hardware_enable()?;
         }
-
+        *count = next;
+        // Existing VM teardown does not release this hardware reference; full
+        // per-CPU enable/disable lifecycle remains a separate KVM capability.
         Ok(())
     }
 }
@@ -148,7 +153,7 @@ pub struct Vm {
 
 impl Vm {
     #[inline(never)]
-    pub fn create_vcpu(&mut self, id: usize) -> Result<usize, SystemError> {
+    pub(crate) fn validate_vcpu_id(&self, id: usize) -> Result<(), SystemError> {
         if id >= self.max_vcpus {
             return Err(SystemError::EINVAL);
         }
@@ -157,7 +162,16 @@ impl Vm {
             return Err(SystemError::EINVAL);
         }
 
-        self.created_vcpus += 1;
+        Ok(())
+    }
+
+    pub fn create_vcpu(
+        &mut self,
+        id: usize,
+        storage: crate::filesystem::vfs::file::PreparedFile,
+        reservation: crate::filesystem::vfs::fdtable::FdReservation<1>,
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        self.validate_vcpu_id(id)?;
 
         let vcpu = self._create_vcpu(id)?;
         if self.dirty_ring_size != 0 {
@@ -166,18 +180,13 @@ impl Vm {
 
         vcpu.lock().vcpu_id = self.online_vcpus;
 
-        self.vcpus.insert(self.online_vcpus, vcpu.clone());
-
+        let vcpu_inode = KvmVcpuDev::new(vcpu.clone());
+        let file = File::new_prepared(vcpu_inode, FileFlags::from_bits_truncate(0x777), storage)?;
+        let file = Arc::try_new(file).map_err(|_| SystemError::ENOMEM)?;
+        self.vcpus.insert(self.online_vcpus, vcpu);
+        self.created_vcpus += 1;
         self.online_vcpus += 1;
-
-        let vcpu_inode = KvmVcpuDev::new(vcpu);
-
-        let file = File::new(vcpu_inode, FileFlags::from_bits_truncate(0x777))?;
-
-        let current = ProcessManager::current_pcb();
-        let fd = current
-            .fd_table()
-            .alloc_fd(file, false, current.nofile_soft_limit())?;
+        let fd = reservation.commit_arc(file);
 
         Ok(fd as usize)
     }

@@ -450,6 +450,7 @@ impl ProcessManager {
                 // live-- precedes faultable exit cleanup, so every exiting
                 // task preserves the peak, not just the last entrant.
                 group_leader.preserve_maxrss(old_vm);
+                old_vm.replace_departing_memory_owner(&pcb);
             }
             Self::release_old_user_vm_if_last(old_user_vm.as_ref());
             drop(old_user_vm);

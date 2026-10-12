@@ -86,20 +86,24 @@ pub fn do_linkat(
     } else {
         let (old_begin_inode, old_remain_path) = user_path_at(&pcb, oldfd, old)?;
         let start = ResolvedPath::new(old_begin_inode.clone())?;
-        let resolved = old_begin_inode.lookup_follow_symlink_owned(
-            &start,
-            &old_remain_path,
-            VFS_MAX_FOLLOW_SYMLINK_TIMES,
-            follow_last_symlink,
-        )?;
+        let resolved = crate::filesystem::vfs::file::File::recover_io(|| {
+            old_begin_inode.lookup_follow_symlink_owned(
+                &start,
+                &old_remain_path,
+                VFS_MAX_FOLLOW_SYMLINK_TIMES,
+                follow_last_symlink,
+            )
+        })?;
         (resolved.inode(), Some(resolved))
     };
 
     // 得到新创建节点的父节点
     let (new_begin_inode, new_remain_path) = user_path_at(&pcb, newfd, new)?;
     let (new_name, new_parent_path) = rsplit_path(&new_remain_path);
-    let new_parent = new_begin_inode
-        .lookup_follow_symlink(new_parent_path.unwrap_or("."), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
+    let new_parent = crate::filesystem::vfs::file::File::recover_io(|| {
+        new_begin_inode
+            .lookup_follow_symlink(new_parent_path.unwrap_or("."), VFS_MAX_FOLLOW_SYMLINK_TIMES)
+    })?;
 
     let new_parent_metadata = new_parent.metadata()?;
     if new_parent_metadata.file_type != FileType::Dir {
@@ -162,9 +166,11 @@ pub fn do_linkat(
         );
     };
     if let Some(mounted) = new_parent.clone().downcast_arc::<MountFSInode>() {
-        mounted.link_with_post_commit(new_name, &old_inode, notify)?;
+        super::super::file::File::recover_io(|| {
+            mounted.link_with_post_commit(new_name, &old_inode, notify)
+        })?;
     } else {
-        new_parent.link(new_name, &old_inode)?;
+        super::super::file::File::recover_io(|| new_parent.link(new_name, &old_inode))?;
         notify();
     }
     drop(old_file);

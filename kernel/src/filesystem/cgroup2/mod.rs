@@ -16,8 +16,11 @@ use crate::{
 
 use self::{inode::Cgroup2Inode, mount::Cgroup2Fs};
 
+pub(crate) mod event_notify;
 mod files;
 mod inode;
+mod memory;
+pub(crate) mod memory_events;
 mod migration;
 mod mount;
 mod permissions;
@@ -27,6 +30,7 @@ mod permissions;
 pub struct CgroupOpenState {
     pub(crate) cred: Arc<crate::process::cred::Cred>,
     pub(crate) namespace: Arc<crate::process::namespace::cgroup_namespace::CgroupNamespace>,
+    pub(crate) memory_events: Option<Arc<memory_events::MemoryEventOpen>>,
 }
 
 impl core::fmt::Debug for CgroupOpenState {
@@ -75,7 +79,11 @@ pub fn cgroup2_init() -> Result<(), SystemError> {
             let fs_dir = sys.find("fs")?;
             let cgroup_dir = fs_dir.find("cgroup")?;
 
-            let cgroup_fs = Cgroup2Fs::new(cgroup_root().root());
+            let cgroup_fs = Cgroup2Fs::new(
+                cgroup_root().root(),
+                MountFlags::empty(),
+                ProcessManager::current_user_ns(),
+            )?;
             cgroup_dir.mount(cgroup_fs, MountFlags::empty())?;
 
             ::log::info!("Cgroup2 mounted at /sys/fs/cgroup");

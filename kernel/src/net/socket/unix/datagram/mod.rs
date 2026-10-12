@@ -115,9 +115,9 @@ impl Inner {
         &mut self,
         endpoint: UnixEndpoint,
         netns: &Arc<NetNamespace>,
-    ) -> Result<(), SystemError> {
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         if self.local_addr.is_some() {
-            return endpoint.bind_unnamed();
+            return endpoint.bind_unnamed().map_err(Into::into);
         }
         let bound_addr = endpoint.bind_in(netns, UnixSocketType::Datagram)?;
         self.local_addr = Some(bound_addr);
@@ -629,18 +629,29 @@ impl Socket for UnixDatagramSocket {
 
     fn bind(&self, endpoint: Endpoint) -> Result<(), SystemError> {
         let unix_endpoint = UnixEndpoint::try_from(endpoint)?;
-
-        let mut inner = self.inner.lock();
-        if inner.closed {
-            return Err(SystemError::EBADF);
-        }
-        let was_unbound = inner.local_addr.is_none();
-        inner.bind(unix_endpoint, &self.netns)?;
+        let mut recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
+        let (mut inner, was_unbound) = loop {
+            let candidate = unix_endpoint.clone();
+            let mut inner = self.inner.lock();
+            if inner.closed {
+                return Err(SystemError::EBADF);
+            }
+            let was_unbound = inner.local_addr.is_none();
+            match inner.bind(candidate, &self.netns) {
+                Ok(()) => break (inner, was_unbound),
+                Err(error) => {
+                    drop(inner);
+                    error.recover(&mut recovery)?;
+                }
+            }
+        };
         if was_unbound {
             let addr = inner.local_endpoint().ok_or(SystemError::EINVAL)?;
             let this = self.self_weak.upgrade().ok_or(SystemError::EBADF)?;
             if let Err(error) = BIND_TABLE.register(&addr, &this) {
-                inner.local_addr.take();
+                let retired = inner.local_addr.take();
+                drop(inner);
+                drop(retired);
                 return Err(error);
             }
         }

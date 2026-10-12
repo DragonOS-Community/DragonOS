@@ -8,7 +8,7 @@ use core::sync::atomic::AtomicUsize;
 use crate::{
     arch::ipc::signal::{SigSet, Signal},
     driver::tty::tty_core::TtyCore,
-    filesystem::vfs::fdtable::{FdTableState, FileDescriptorTable},
+    filesystem::vfs::fdtable::FileDescriptorTable,
     ipc::signal_types::{SigInfo, SigPending},
     libs::rwlock::RwLock,
     mm::{ucontext::AddressSpace, VirtAddr},
@@ -117,9 +117,6 @@ pub struct ProcessBasicInfo {
     /// Process name.
     name: String,
 
-    /// Current working directory of the process.
-    cwd: String,
-
     /// User address space.
     user_vm: Option<Arc<AddressSpace>>,
 
@@ -189,14 +186,12 @@ impl ProcessBasicInfo {
     pub fn new(
         ppid: RawPid,
         name: String,
-        cwd: String,
         user_vm: Option<Arc<AddressSpace>>,
+        fd_table: Arc<FileDescriptorTable>,
     ) -> RwLock<Self> {
-        let fd_table = Arc::new(FileDescriptorTable::new(FdTableState::new()));
         return RwLock::new(Self {
             ppid,
             name,
-            cwd,
             user_vm,
             fd_table: Some(FdTableAttachment::new(fd_table)),
             personality: 0,
@@ -213,13 +208,6 @@ impl ProcessBasicInfo {
 
     pub fn set_name(&mut self, name: String) {
         self.name = name;
-    }
-
-    pub fn cwd(&self) -> String {
-        return self.cwd.clone();
-    }
-    pub fn set_cwd(&mut self, path: String) {
-        return self.cwd = path;
     }
 
     pub fn user_vm(&self) -> Option<Arc<AddressSpace>> {
@@ -294,7 +282,9 @@ mod fd_table_attachment_tests {
 
     #[test]
     fn observer_arcs_do_not_count_as_task_sharing() {
-        let table = Arc::new(FileDescriptorTable::new(FdTableState::new()));
+        let account = crate::cgroup::memory::MemoryAccount::new(1, None).unwrap();
+        let creator = crate::cgroup::memory::object::ObjectAccount::new(&account).unwrap();
+        let table = Arc::new(FileDescriptorTable::try_new(FdTableState::new(), &creator).unwrap());
         let owner = FdTableAttachment::new(table);
         let observer = owner.observer();
         let another_observer = observer.clone();

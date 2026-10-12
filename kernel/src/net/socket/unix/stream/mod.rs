@@ -746,14 +746,23 @@ impl Socket for UnixStreamSocket {
 
     fn bind(&self, endpoint: Endpoint) -> Result<(), SystemError> {
         let addr = UnixEndpoint::try_from(endpoint)?;
-
-        let mut writer = self.inner.write();
-        match writer.as_mut().expect("UnixStreamSocket inner is None") {
-            Inner::Init(init) => init.bind(addr, &self.netns, self.unix_socket_type()),
-            Inner::Connected(connected) => {
-                connected.bind(addr, &self.netns, self.unix_socket_type())
+        let mut recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
+        loop {
+            let candidate = addr.clone();
+            let result = {
+                let mut writer = self.inner.write();
+                match writer.as_mut().expect("UnixStreamSocket inner is None") {
+                    Inner::Init(init) => init.bind(candidate, &self.netns, self.unix_socket_type()),
+                    Inner::Connected(connected) => {
+                        connected.bind(candidate, &self.netns, self.unix_socket_type())
+                    }
+                    Inner::Listener(_) => candidate.bind_unnamed().map_err(Into::into),
+                }
+            };
+            match result {
+                Ok(()) => return Ok(()),
+                Err(error) => error.recover(&mut recovery)?,
             }
-            Inner::Listener(_listener) => addr.bind_unnamed(),
         }
     }
 

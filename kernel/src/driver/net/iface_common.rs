@@ -2,13 +2,13 @@ use super::*;
 use crate::net::ingress::{NetIngressFilter, NetIngressFilterInit, RoutedIngressWork};
 use smoltcp::iface::{IpIngressFilter, PollIngressSingleResult, PollResult};
 
-pub(crate) type InterfaceSocketSet = Arc<Mutex<smoltcp::iface::SocketSet<'static>>>;
+pub(crate) type InterfaceSocketSet = Arc<Mutex<smoltcp::iface::SocketSet<'static, 'static>>>;
 
 fn poll_smol<D: SmolDevice + ?Sized>(
     interface: &mut smoltcp::iface::Interface,
     timestamp: smoltcp::time::Instant,
     device: &mut D,
-    sockets: &mut smoltcp::iface::SocketSet<'_>,
+    sockets: &mut smoltcp::iface::SocketSet<'_, '_>,
     mut filter: Option<&mut dyn IpIngressFilter>,
 ) -> (PollResult, bool) {
     // Release the poll serialization/FIB locks between bounded RX batches so
@@ -54,7 +54,7 @@ fn poll_smol_single<D: SmolDevice + ?Sized>(
     interface: &mut smoltcp::iface::Interface,
     timestamp: smoltcp::time::Instant,
     device: &mut D,
-    sockets: &mut smoltcp::iface::SocketSet<'_>,
+    sockets: &mut smoltcp::iface::SocketSet<'_, '_>,
     filter: Option<&mut dyn IpIngressFilter>,
 ) -> PollIngressSingleResult {
     if let Some(filter) = filter {
@@ -128,10 +128,7 @@ pub struct IfaceCommon {
     /// without exposing its receive queues to the destination namespace.
     pub(super) sockets: RwLock<InterfaceSocketSet>,
     /// 存 kernel wrap smoltcp socket 的集合
-    pub(super) bounds: RwLock<Arc<Vec<Arc<dyn InetSocket>>>>,
-    /// Lock-free lifecycle summary for DOWN-owner protocol progress. The
-    /// vector remains authoritative; this count only decides poll eligibility.
-    pub(super) bound_socket_count: AtomicUsize,
+    pub(super) bounds: RwLock<Arc<crate::net::tcp_bounds::BoundRegistry>>,
     /// The stack has accepted namespace-local ingress and must keep applying
     /// authoritative output routing until its socket/deferred work quiesces.
     pub(super) namespace_routed_stack: AtomicBool,
@@ -183,19 +180,27 @@ pub(crate) struct PreparedNetnsBinding {
 
 pub(crate) struct PreparedSocketSetMove {
     sockets: InterfaceSocketSet,
-    bounds: Arc<Vec<Arc<dyn InetSocket>>>,
+    bounds: Arc<crate::net::tcp_bounds::BoundRegistry>,
+}
+
+pub(crate) struct RetiredSocketSetMove {
+    _sockets: InterfaceSocketSet,
+    _bounds: Arc<crate::net::tcp_bounds::BoundRegistry>,
 }
 
 impl PreparedSocketSetMove {
     /// Publish only after the source device has been quiesced and unregistered.
     /// The retired SocketSet remains alive through each old BoundInner Arc.
-    pub(crate) fn publish(self, common: &IfaceCommon) {
-        *common.sockets.write() = self.sockets;
-        *common.bounds.write() = self.bounds;
-        common.bound_socket_count.store(0, Ordering::Release);
+    pub(crate) fn publish(self, common: &IfaceCommon) -> RetiredSocketSetMove {
+        let sockets = core::mem::replace(&mut *common.sockets.write(), self.sockets);
+        let bounds = core::mem::replace(&mut *common.bounds.write(), self.bounds);
         common
             .namespace_routed_stack
             .store(false, Ordering::Release);
+        RetiredSocketSetMove {
+            _sockets: sockets,
+            _bounds: bounds,
+        }
     }
 }
 
@@ -269,8 +274,7 @@ impl IfaceCommon {
             name: RwLock::new(name),
             smol_iface: Mutex::new(iface),
             sockets: RwLock::new(Arc::new(Mutex::new(sockets))),
-            bounds: RwLock::new(Arc::new(Vec::new())),
-            bound_socket_count: AtomicUsize::new(0),
+            bounds: RwLock::new(Arc::new(crate::net::tcp_bounds::BoundRegistry::new())),
             namespace_routed_stack: AtomicBool::new(false),
             poll_deadlines: PollDeadlines::new(),
             local_output_tx_backoff_us: AtomicU64::new(Self::LOCAL_OUTPUT_TX_BACKOFF_MIN_US),
@@ -669,7 +673,7 @@ impl IfaceCommon {
     pub(super) fn needs_namespace_routing(&self) -> bool {
         self.has_local_work()
             || self.namespace_routed_stack.load(Ordering::Acquire)
-            || self.bound_socket_count.load(Ordering::Acquire) != 0
+            || self.bounds.read().count() != 0
     }
 
     /// Revalidates the lock-free routing-mode snapshot after both protocol
@@ -705,9 +709,10 @@ impl IfaceCommon {
         // between consuming local ingress and publishing routed output.
         let interface = self.smol_iface.lock();
         let routed_fragments_pending = interface.has_pending_egress_override();
+        let bounds = self.bounds.read();
         self.local_input_queue.clear_routed_if_idle(
             &self.namespace_routed_stack,
-            &self.bound_socket_count,
+            bounds.count_atomic(),
             routed_fragments_pending,
         );
     }
@@ -1031,6 +1036,10 @@ impl IfaceCommon {
             let output_drain = self.drain_local_outputs(device, Self::LOCAL_OUTPUT_POLL_BUDGET);
             self.clear_namespace_routing_if_idle();
             self.notify_deadline_rearm(deadline_rearm);
+
+            // A last notification pin must not reenter namespace/device
+            // retirement while this poll contributes to close_and_wait.
+            drop(_poll_guard);
 
             // 注意：不要在持有 bounds 读锁(且 irqsave)期间调用 socket.notify()。
             // 否则会形成典型锁顺序反转死锁：
@@ -1494,6 +1503,7 @@ impl IfaceCommon {
             let output_drain = self.drain_local_outputs(device, budget - processed);
             self.clear_namespace_routing_if_idle();
             self.notify_deadline_rearm(deadline_rearm);
+            drop(_poll_guard);
             self.notify_all_bound_sockets();
 
             // NAPI 语义：只要“还有立即可推进的工作”，就应继续留在 poll_list。
@@ -1831,36 +1841,15 @@ impl IfaceCommon {
             .store(Self::LOCAL_OUTPUT_TX_BACKOFF_MIN_US, Ordering::Release);
     }
 
-    // 需要bounds储存具体的Inet Socket信息，以提供不同种类inet socket的事件分发
-    pub fn bind_socket(&self, socket: Arc<dyn InetSocket>) {
-        // A bind begun before a device move may register its wrapper after
-        // the set was retired. Its handle is safely held by the old set, but
-        // the moved interface must not retain or poll this foreign socket.
-        let owner = self.net_namespace.read();
-        if !owner
-            .upgrade()
-            .is_some_and(|netns| Arc::ptr_eq(&netns, &socket.netns()))
-        {
-            return;
-        }
-        let mut bounds = self.bounds.write();
-        let bounds = Arc::make_mut(&mut *bounds);
-        if bounds.iter().any(|bound| Arc::ptr_eq(bound, &socket)) {
-            return;
-        }
-        bounds.push(socket);
-        self.bound_socket_count
-            .store(bounds.len(), Ordering::Release);
-    }
-
-    pub fn unbind_socket(&self, socket: Arc<dyn InetSocket>) {
-        let mut bounds = self.bounds.write();
-        let bounds = Arc::make_mut(&mut *bounds);
-        if let Some(index) = bounds.iter().position(|s| Arc::ptr_eq(s, &socket)) {
-            bounds.remove(index);
-            self.bound_socket_count
-                .store(bounds.len(), Ordering::Release);
-            // log::debug!("unbind socket success");
+    pub(crate) fn unbind_socket(
+        &self,
+        socket: Arc<dyn InetSocket>,
+    ) -> crate::net::socket::inet::common::registration::RetiredIfaceBinding {
+        let registry = self.bounds.read().clone();
+        let retired = registry.take_bound(&socket);
+        crate::net::socket::inet::common::registration::RetiredIfaceBinding {
+            socket: retired,
+            registry: Some(registry),
         }
     }
 
@@ -1868,19 +1857,16 @@ impl IfaceCommon {
     /// This is used after listener shutdown to ensure all client sockets
     /// are woken up even if the interface poll didn't detect any events.
     pub fn notify_all_bound_sockets(&self) {
-        // Take one coherent snapshot before dropping the lock. Iterating by index while
-        // repeatedly releasing the lock can skip sockets when a concurrent close removes
-        // an earlier element and shifts the Vec to the left.
-        // Use a single read-side critical section. A size pass followed by a copy pass
-        // can be forced behind the stream of close-side writers between acquisitions,
-        // delaying network progress long enough for poll waiters to time out.
-        // Clone only the outer Arc while IRQs are disabled.  Mutations use
-        // Arc::make_mut(), so this remains a coherent snapshot without an
-        // O(n) allocation in the polling hot path.
-        let sockets = self.bounds.read_irqsave().clone();
-        for sock in sockets.iter() {
-            sock.notify();
-            let _woke = sock.wait_queue().wakeup(Some(ProcessState::Blocked(true)));
+        let registry = self.bounds.read_irqsave().clone();
+        let end = registry.end();
+        for start in (0..end).step_by(crate::net::tcp_bounds::BOUND_BATCH) {
+            let pins = registry.snapshot(start, end);
+            for socket in pins.iter().flatten() {
+                socket.notify();
+                socket
+                    .wait_queue()
+                    .wakeup(Some(ProcessState::Blocked(true)));
+            }
         }
     }
 
@@ -1957,10 +1943,60 @@ impl IfaceCommon {
         Ok(self.sockets.read().clone())
     }
 
+    pub(crate) fn socket_registration_snapshot(
+        &self,
+        netns: &Arc<NetNamespace>,
+    ) -> Result<
+        (
+            InterfaceSocketSet,
+            Arc<crate::net::tcp_bounds::BoundRegistry>,
+            u64,
+        ),
+        SystemError,
+    > {
+        let epoch = self.namespace_epoch.load(Ordering::Acquire);
+        if epoch & 1 != 0 || !self.namespace_owner_matches(netns) {
+            return Err(SystemError::ENODEV);
+        }
+        let set = self.sockets.read().clone();
+        let registry = self.bounds.read().clone();
+        if self.namespace_epoch.load(Ordering::Acquire) != epoch {
+            return Err(SystemError::ENODEV);
+        }
+        Ok((set, registry, epoch))
+    }
+
+    fn namespace_owner_matches(&self, netns: &Arc<NetNamespace>) -> bool {
+        // The caller already pins this exact namespace. Do not upgrade an
+        // unrelated owner under resource locks and risk its final destructor.
+        self.net_namespace.read().as_ptr() == Arc::as_ptr(netns)
+    }
+
+    pub(crate) fn socket_registration_is_current(
+        &self,
+        netns: &Arc<NetNamespace>,
+        set: &InterfaceSocketSet,
+        registry: &Arc<crate::net::tcp_bounds::BoundRegistry>,
+        epoch: u64,
+    ) -> bool {
+        self.namespace_epoch.load(Ordering::Acquire) == epoch
+            && self.namespace_owner_matches(netns)
+            && Arc::ptr_eq(&self.sockets.read(), set)
+            && Arc::ptr_eq(&self.bounds.read(), registry)
+    }
+
+    pub(crate) fn enter_socket_publication(
+        &self,
+        epoch: u64,
+    ) -> Option<tx_admission::TxAdmissionGuard<'_>> {
+        self.enter_poll_epoch(epoch)
+    }
+
     pub(crate) fn prepare_socket_set_move(&self) -> Result<PreparedSocketSetMove, SystemError> {
         let sockets = Arc::try_new(Mutex::new(smoltcp::iface::SocketSet::new(Vec::new())))
             .map_err(|_| SystemError::ENOMEM)?;
-        let bounds = Arc::try_new(Vec::new()).map_err(|_| SystemError::ENOMEM)?;
+        let bounds = Arc::try_new(crate::net::tcp_bounds::BoundRegistry::new())
+            .map_err(|_| SystemError::ENOMEM)?;
         Ok(PreparedSocketSetMove { sockets, bounds })
     }
 

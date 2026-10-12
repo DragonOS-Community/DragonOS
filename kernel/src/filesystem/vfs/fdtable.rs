@@ -7,16 +7,21 @@
 //! fixed-depth page index. Slot storage uses independently allocated 4 KiB
 //! blocks, which are order-0 pages on the currently runnable architectures.
 
-use alloc::{boxed::Box, sync::Arc, vec::Vec};
+use alloc::{sync::Arc, vec::Vec};
 use bitmap::{static_bitmap, StaticBitmap};
 use core::{
     mem::size_of,
+    ops::{Deref, Index, IndexMut},
     sync::atomic::{AtomicUsize, Ordering},
 };
 
 use system_error::SystemError;
 
-use crate::libs::rwsem::{RwSem, RwSemReadGuard};
+use crate::{
+    cgroup::memory::{accounting::KernelByteKind, object::ObjectAccount, owned::OwnedBox},
+    libs::rwsem::{RwSem, RwSemReadGuard},
+    mm::allocation::MemoryAllocationError,
+};
 
 use super::file::{File, FileMode};
 
@@ -30,10 +35,12 @@ const BITS_PER_WORD: usize = usize::BITS as usize;
 const SLOT_BLOCK_BYTES: usize = 4096;
 const CHUNK_SHIFT: usize = 9;
 const CHUNK_FDS: usize = 1 << CHUNK_SHIFT;
-const INDEX_SHIFT: usize = 8;
+const INDEX_SHIFT: usize = 6;
 const INDEX_FANOUT: usize = 1 << INDEX_SHIFT;
 const GROUP_SPAN: usize = CHUNK_FDS * INDEX_FANOUT * INDEX_FANOUT;
-const ROOT_ENTRIES_MAX: usize = 64;
+const ROOT_ENTRIES_MAX: usize = 1024;
+const ROOT_BLOCK_ENTRIES: usize = 128;
+const ROOT_BLOCKS: usize = ROOT_ENTRIES_MAX / ROOT_BLOCK_ENTRIES;
 const DEFAULT_NR_OPEN: usize = 1024 * 1024;
 
 static NR_OPEN: AtomicUsize = AtomicUsize::new(DEFAULT_NR_OPEN);
@@ -158,33 +165,26 @@ fn find_set_in_words(words: &[usize], start: usize, end: usize) -> Option<usize>
 
 #[derive(Debug)]
 struct FdChunk {
-    slots: Box<[Option<Arc<File>>; CHUNK_FDS]>,
+    slots: OwnedBox<[Option<Arc<File>>; CHUNK_FDS]>,
     open_fds: static_bitmap!(CHUNK_FDS),
     close_on_exec: static_bitmap!(CHUNK_FDS),
 }
 
 impl FdChunk {
-    fn try_new() -> Result<Box<Self>, SystemError> {
-        // Initialize directly in the destination page so a 4 KiB temporary
-        // never lands on the 32 KiB kernel stack.  Do not assume an all-zero
-        // representation for Option<Arc<_>>: unlike Option<Box<_>>, that is
-        // not a Rust language guarantee.
-        let mut slots = Box::<[Option<Arc<File>>; CHUNK_FDS]>::try_new_uninit()
-            .map_err(|_| SystemError::ENOMEM)?;
-        let first = slots.as_mut().as_mut_ptr().cast::<Option<Arc<File>>>();
-        for index in 0..CHUNK_FDS {
-            // SAFETY: every element is written exactly once within the boxed
-            // array, and `None` is a valid Option<Arc<File>> value.
-            unsafe { first.add(index).write(None) };
-        }
-        // SAFETY: the loop above initialized every array element.
-        let slots = unsafe { slots.assume_init() };
-        Box::try_new(Self {
-            slots,
-            open_fds: StaticBitmap::new(),
-            close_on_exec: StaticBitmap::new(),
-        })
-        .map_err(|_| SystemError::ENOMEM)
+    fn try_new(creator: &Arc<ObjectAccount>) -> Result<OwnedBox<Self>, MemoryAllocationError> {
+        let slots = OwnedBox::prepare(creator, KernelByteKind::SlabUnreclaimable)?
+            .try_allocate()
+            .map_err(|_| SystemError::ENOMEM)?
+            .init_array(|_| None);
+        Ok(
+            OwnedBox::prepare(creator, KernelByteKind::SlabUnreclaimable)?
+                .try_init(Self {
+                    slots,
+                    open_fds: StaticBitmap::new(),
+                    close_on_exec: StaticBitmap::new(),
+                })
+                .map_err(|_| SystemError::ENOMEM)?,
+        )
     }
 
     fn is_full(&self, valid_slots: usize) -> bool {
@@ -194,29 +194,28 @@ impl FdChunk {
 
 #[derive(Debug)]
 struct FdDirectory {
-    chunks: [Option<Box<FdChunk>>; INDEX_FANOUT],
+    chunks: [Option<OwnedBox<FdChunk>>; INDEX_FANOUT],
     present_chunks: static_bitmap!(INDEX_FANOUT),
     full_chunks: static_bitmap!(INDEX_FANOUT),
 }
 
 impl FdDirectory {
-    fn try_new() -> Result<Box<Self>, SystemError> {
-        // All-zero is valid here: Rust guarantees the null representation for
-        // Option<Box<_>>, and StaticBitmap is backed by integer words. The
-        // 2112-byte layout remains within one fd-table allocation block.
-        // SAFETY: every field's all-zero representation is valid as described
-        // above, so the complete value is initialized.
-        unsafe {
-            Box::<Self>::try_new_zeroed()
-                .map_err(|_| SystemError::ENOMEM)
-                .map(|value| value.assume_init())
-        }
+    fn try_new(creator: &Arc<ObjectAccount>) -> Result<OwnedBox<Self>, MemoryAllocationError> {
+        Ok(
+            OwnedBox::prepare(creator, KernelByteKind::SlabUnreclaimable)?
+                .try_init(Self {
+                    chunks: core::array::from_fn(|_| None),
+                    present_chunks: StaticBitmap::new(),
+                    full_chunks: StaticBitmap::new(),
+                })
+                .map_err(|_| SystemError::ENOMEM)?,
+        )
     }
 }
 
 #[derive(Debug)]
 struct FdGroup {
-    directories: [Option<Box<FdDirectory>>; INDEX_FANOUT],
+    directories: [Option<OwnedBox<FdDirectory>>; INDEX_FANOUT],
     present_directories: static_bitmap!(INDEX_FANOUT),
     full_directories: static_bitmap!(INDEX_FANOUT),
 }
@@ -229,35 +228,81 @@ const _: () = {
 };
 
 impl FdGroup {
-    fn try_new() -> Result<Box<Self>, SystemError> {
-        // SAFETY: Option<Box<_>> has the guaranteed null representation and
-        // StaticBitmap contains only integer words, as for FdDirectory.
-        unsafe {
-            Box::<Self>::try_new_zeroed()
-                .map_err(|_| SystemError::ENOMEM)
-                .map(|value| value.assume_init())
+    fn try_new(creator: &Arc<ObjectAccount>) -> Result<OwnedBox<Self>, MemoryAllocationError> {
+        Ok(
+            OwnedBox::prepare(creator, KernelByteKind::SlabUnreclaimable)?
+                .try_init(Self {
+                    directories: core::array::from_fn(|_| None),
+                    present_directories: StaticBitmap::new(),
+                    full_directories: StaticBitmap::new(),
+                })
+                .map_err(|_| SystemError::ENOMEM)?,
+        )
+    }
+}
+
+type RootBlock = [Option<OwnedBox<FdGroup>>; ROOT_BLOCK_ENTRIES];
+
+#[derive(Debug)]
+struct PagedRoots {
+    blocks: [Option<OwnedBox<RootBlock>>; ROOT_BLOCKS],
+    len: usize,
+}
+
+impl Default for PagedRoots {
+    fn default() -> Self {
+        Self {
+            blocks: core::array::from_fn(|_| None),
+            len: 0,
         }
     }
 }
 
+impl PagedRoots {
+    fn len(&self) -> usize {
+        self.len
+    }
+    fn get(&self, index: usize) -> Option<&Option<OwnedBox<FdGroup>>> {
+        if index >= self.len {
+            return None;
+        }
+        Some(&self.blocks[index / ROOT_BLOCK_ENTRIES].as_ref()?[index % ROOT_BLOCK_ENTRIES])
+    }
+    fn get_mut(&mut self, index: usize) -> Option<&mut Option<OwnedBox<FdGroup>>> {
+        if index >= self.len {
+            return None;
+        }
+        Some(&mut self.blocks[index / ROOT_BLOCK_ENTRIES].as_mut()?[index % ROOT_BLOCK_ENTRIES])
+    }
+}
+impl Index<usize> for PagedRoots {
+    type Output = Option<OwnedBox<FdGroup>>;
+    fn index(&self, index: usize) -> &Self::Output {
+        self.get(index).expect("materialized root block")
+    }
+}
+impl IndexMut<usize> for PagedRoots {
+    fn index_mut(&mut self, index: usize) -> &mut Self::Output {
+        self.get_mut(index).expect("materialized root block")
+    }
+}
+
+const _: () = {
+    assert!(size_of::<RootBlock>() == SLOT_BLOCK_BYTES);
+    assert!(ROOT_BLOCKS == 8);
+};
+
 #[derive(Debug, Default)]
 struct PagedFdStorage {
-    groups: Vec<Option<Box<FdGroup>>>,
+    groups: PagedRoots,
     present_groups: static_bitmap!(ROOT_ENTRIES_MAX),
     full_groups: static_bitmap!(ROOT_ENTRIES_MAX),
 }
 
 impl PagedFdStorage {
-    fn ensure_root_len(&mut self, required: usize) -> Result<(), SystemError> {
-        debug_assert!(required <= ROOT_ENTRIES_MAX);
-        if required <= self.groups.len() {
-            return Ok(());
-        }
-        self.groups
-            .try_reserve_exact(required - self.groups.len())
-            .map_err(|_| SystemError::ENOMEM)?;
-        self.groups.resize_with(required, || None);
-        Ok(())
+    fn ensure_root_len(&mut self, required: usize) {
+        assert!(required <= ROOT_ENTRIES_MAX);
+        self.groups.len = self.groups.len.max(required);
     }
 }
 
@@ -266,9 +311,54 @@ struct PreparedPath {
     group_index: usize,
     directory_index: usize,
     chunk_index: usize,
-    group: Option<Box<FdGroup>>,
-    directory: Option<Box<FdDirectory>>,
-    chunk: Option<Box<FdChunk>>,
+    root: Option<OwnedBox<RootBlock>>,
+    group: Option<OwnedBox<FdGroup>>,
+    directory: Option<OwnedBox<FdDirectory>>,
+    chunk: Option<OwnedBox<FdChunk>>,
+}
+
+#[derive(Clone, Copy)]
+struct PathNeed {
+    group_index: usize,
+    directory_index: usize,
+    chunk_index: usize,
+    root: bool,
+    group: bool,
+    directory: bool,
+}
+
+impl PreparedPath {
+    fn try_new(
+        need: PathNeed,
+        creator: &Arc<ObjectAccount>,
+    ) -> Result<Self, MemoryAllocationError> {
+        Ok(Self {
+            group_index: need.group_index,
+            directory_index: need.directory_index,
+            chunk_index: need.chunk_index,
+            root: if need.root {
+                Some(
+                    OwnedBox::<RootBlock>::prepare(creator, KernelByteKind::SlabUnreclaimable)?
+                        .try_allocate()
+                        .map_err(|_| SystemError::ENOMEM)?
+                        .init_array(|_| None),
+                )
+            } else {
+                None
+            },
+            group: if need.group {
+                Some(FdGroup::try_new(creator)?)
+            } else {
+                None
+            },
+            directory: if need.directory {
+                Some(FdDirectory::try_new(creator)?)
+            } else {
+                None
+            },
+            chunk: Some(FdChunk::try_new(creator)?),
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -536,7 +626,11 @@ impl FdTableState {
         paged.present_groups = StaticBitmap::new();
         paged.full_groups = StaticBitmap::new();
         for group_index in 0..paged.groups.len() {
-            let Some(group) = paged.groups[group_index].as_deref_mut() else {
+            let Some(group) = paged
+                .groups
+                .get_mut(group_index)
+                .and_then(Option::as_deref_mut)
+            else {
                 continue;
             };
             set_bit(&mut paged.present_groups.data, group_index, true);
@@ -581,12 +675,13 @@ impl FdTableState {
         self.paged = Some(paged);
     }
 
-    fn prepare_path(
+    fn path_need(
         &self,
         fd: usize,
         group_already_prepared: bool,
         directory_already_prepared: bool,
-    ) -> Result<PreparedPath, SystemError> {
+        root_already_prepared: bool,
+    ) -> PathNeed {
         let (group_index, directory_index, chunk_index, _) = Self::indexes(fd);
         let group_exists = group_already_prepared
             || self
@@ -603,48 +698,46 @@ impl FdTableState {
                 .and_then(Option::as_deref)
                 .and_then(|group| group.directories[directory_index].as_deref())
                 .is_some();
-        Ok(PreparedPath {
+        PathNeed {
             group_index,
             directory_index,
             chunk_index,
-            group: if group_exists {
-                None
-            } else {
-                Some(FdGroup::try_new()?)
-            },
-            directory: if directory_exists {
-                None
-            } else {
-                Some(FdDirectory::try_new()?)
-            },
-            chunk: Some(FdChunk::try_new()?),
-        })
+            root: !root_already_prepared
+                && self.paged.as_ref().is_none_or(|paged| {
+                    paged.groups.blocks[group_index / ROOT_BLOCK_ENTRIES].is_none()
+                }),
+            group: !group_exists,
+            directory: !directory_exists,
+        }
     }
 
-    fn commit_paths(&mut self, mut paths: Vec<PreparedPath>) -> Result<(), SystemError> {
+    fn commit_paths(&mut self, paths: &mut [Option<PreparedPath>]) {
         let required_root = paths
             .iter()
+            .filter_map(Option::as_ref)
             .map(|path| path.group_index + 1)
             .max()
             .unwrap_or(0);
         if required_root == 0 {
-            return Ok(());
+            return;
         }
 
-        // This is the last fallible step. Once it succeeds, every child node
-        // is already prepared and the commit below cannot fail.
         let paged = match &mut self.paged {
             Some(paged) => {
-                paged.ensure_root_len(required_root)?;
+                paged.ensure_root_len(required_root);
                 paged
             }
             slot @ None => {
                 let mut paged = PagedFdStorage::default();
-                paged.ensure_root_len(required_root)?;
+                paged.ensure_root_len(required_root);
                 slot.insert(paged)
             }
         };
-        for path in paths.iter_mut() {
+        for path in paths.iter_mut().filter_map(Option::as_mut) {
+            let block = &mut paged.groups.blocks[path.group_index / ROOT_BLOCK_ENTRIES];
+            if block.is_none() {
+                *block = Some(path.root.take().expect("prepared root block"));
+            }
             if paged.groups[path.group_index].is_none() {
                 paged.groups[path.group_index] = path.group.take();
             }
@@ -666,7 +759,6 @@ impl FdTableState {
             }
             set_bit(&mut directory.present_chunks.data, path.chunk_index, true);
         }
-        Ok(())
     }
 
     fn planned_capacity(&self, required: usize) -> Result<usize, SystemError> {
@@ -693,7 +785,43 @@ impl FdTableState {
         Ok(target)
     }
 
-    fn ensure_fds_materialized(&mut self, fds: &[usize]) -> Result<(), SystemError> {
+    fn collect_path_needs(&self, fds: &[usize], paths: &mut [Option<PathNeed>]) {
+        let mut length = 0;
+        for &fd in fds {
+            if fd < INLINE_FDS || self.chunk(fd).is_some() {
+                continue;
+            }
+            let (group, directory, chunk, _) = Self::indexes(fd);
+            if paths.iter().flatten().any(|path| {
+                path.group_index == group
+                    && path.directory_index == directory
+                    && path.chunk_index == chunk
+            }) {
+                continue;
+            }
+            let group_prepared = paths.iter().flatten().any(|path| path.group_index == group);
+            let directory_prepared = paths
+                .iter()
+                .flatten()
+                .any(|path| path.group_index == group && path.directory_index == directory);
+            let root_prepared = paths
+                .iter()
+                .flatten()
+                .any(|path| path.group_index / ROOT_BLOCK_ENTRIES == group / ROOT_BLOCK_ENTRIES);
+            assert!(length < paths.len());
+            paths[length] =
+                Some(self.path_need(fd, group_prepared, directory_prepared, root_prepared));
+            length += 1;
+        }
+    }
+
+    /// Only used for a private, unpublished clone. Public mutations prepare
+    /// these allocations outside the table guard and revalidate generation.
+    fn ensure_fds_materialized(
+        &mut self,
+        fds: &[usize],
+        creator: &Arc<ObjectAccount>,
+    ) -> Result<(), MemoryAllocationError> {
         let required = fds
             .iter()
             .copied()
@@ -701,33 +829,20 @@ impl FdTableState {
             .and_then(|fd| fd.checked_add(1))
             .unwrap_or(INLINE_FDS);
         let target_capacity = self.planned_capacity(required)?;
+        let mut needs = Vec::new();
+        needs
+            .try_reserve_exact(fds.len())
+            .map_err(|_| SystemError::ENOMEM)?;
+        needs.resize(fds.len(), None);
+        self.collect_path_needs(fds, &mut needs);
         let mut paths = Vec::new();
         paths
             .try_reserve_exact(fds.len())
             .map_err(|_| SystemError::ENOMEM)?;
-        for &fd in fds {
-            if fd < INLINE_FDS || self.chunk(fd).is_some() {
-                continue;
-            }
-            let (group_index, directory_index, chunk_index, _) = Self::indexes(fd);
-            if paths.iter().any(|path: &PreparedPath| {
-                path.group_index == group_index
-                    && path.directory_index == directory_index
-                    && path.chunk_index == chunk_index
-            }) {
-                continue;
-            }
-            let group_already_prepared = paths.iter().any(|path| path.group_index == group_index);
-            let directory_already_prepared = paths.iter().any(|path| {
-                path.group_index == group_index && path.directory_index == directory_index
-            });
-            paths.push(self.prepare_path(
-                fd,
-                group_already_prepared,
-                directory_already_prepared,
-            )?);
+        for need in needs.into_iter().flatten() {
+            paths.push(Some(PreparedPath::try_new(need, creator)?));
         }
-        self.commit_paths(paths)?;
+        self.commit_paths(&mut paths);
         if target_capacity != self.logical_capacity {
             self.logical_capacity = target_capacity;
             self.rebuild_summaries();
@@ -895,11 +1010,11 @@ impl FdTableState {
             .unwrap_or(self.logical_capacity);
     }
 
-    fn reserve_n<const N: usize>(
-        &mut self,
+    fn select_reservation<const N: usize>(
+        &self,
         soft_limit: usize,
         min_fd: usize,
-        cloexec: bool,
+        _cloexec: bool,
     ) -> Result<[i32; N], SystemError> {
         let end = soft_limit.min(nr_open_max().saturating_add(1));
         let mut result = [0i32; N];
@@ -911,14 +1026,16 @@ impl FdTableState {
             *slot = i32::try_from(fd).map_err(|_| SystemError::EMFILE)?;
             cursor = fd.checked_add(1).ok_or(SystemError::EMFILE)?;
         }
+        Ok(result)
+    }
+
+    fn commit_reservation<const N: usize>(&mut self, result: [i32; N], cloexec: bool) {
         let fds = result.map(|fd| fd as usize);
-        self.ensure_fds_materialized(&fds)?;
         for fd in fds {
             self.set_slot(fd, None, true, cloexec);
             self.update_next_fd_after_open(fd);
         }
         self.bump_generation();
-        Ok(result)
     }
 
     fn release_reserved(&mut self, fd: usize) {
@@ -951,7 +1068,6 @@ impl FdTableState {
             return Err(SystemError::EMFILE);
         }
         let index = fd as usize;
-        self.ensure_fds_materialized(&[index])?;
         if self.is_open(index) && self.file_ref(index).is_none() {
             return Err(SystemError::EBUSY);
         }
@@ -1151,8 +1267,29 @@ impl FdTableState {
         None
     }
 
-    fn clone_plan(&self, punch_hole: Option<(u32, u32)>) -> Result<FdClonePlan, SystemError> {
-        let mut chunk_numbers = Vec::new();
+    fn clone_chunk_count(&self, punch_hole: Option<(u32, u32)>) -> usize {
+        let mut count = 0;
+        let mut last = None;
+        let mut cursor = INLINE_FDS;
+        while let Some(fd) = self.find_next_installed(cursor, self.logical_capacity) {
+            cursor = fd + 1;
+            if punch_hole.is_some_and(|(first, end)| fd >= first as usize && fd <= end as usize) {
+                continue;
+            }
+            let chunk = Self::chunk_number(fd);
+            if last != Some(chunk) {
+                count += 1;
+                last = Some(chunk);
+            }
+        }
+        count
+    }
+
+    fn collect_clone_chunks(
+        &self,
+        punch_hole: Option<(u32, u32)>,
+        chunk_numbers: &mut Vec<usize>,
+    ) -> usize {
         let mut highest = None;
         let mut cursor = 0;
         while let Some(fd) = self.find_next_installed(cursor, self.logical_capacity) {
@@ -1164,30 +1301,26 @@ impl FdTableState {
             if fd >= INLINE_FDS {
                 let chunk_number = Self::chunk_number(fd);
                 if chunk_numbers.last().copied() != Some(chunk_number) {
-                    chunk_numbers
-                        .try_reserve(1)
-                        .map_err(|_| SystemError::ENOMEM)?;
+                    assert!(chunk_numbers.len() < chunk_numbers.capacity());
                     chunk_numbers.push(chunk_number);
                 }
             }
         }
-        let required = highest.map_or(INLINE_FDS, |fd| fd + 1);
-        let logical_capacity = Self::planned_capacity_from_inline(required)?;
-        Ok(FdClonePlan {
-            generation: self.content_generation,
-            logical_capacity,
-            chunk_numbers,
-        })
+        highest.map_or(INLINE_FDS, |fd| fd + 1)
     }
 
-    fn prepare_clone_layout(&mut self, plan: &FdClonePlan) -> Result<(), SystemError> {
+    fn prepare_clone_layout(
+        &mut self,
+        plan: &FdClonePlan,
+        creator: &Arc<ObjectAccount>,
+    ) -> Result<(), MemoryAllocationError> {
         let mut fds = Vec::new();
         fds.try_reserve_exact(plan.chunk_numbers.len())
             .map_err(|_| SystemError::ENOMEM)?;
         for &chunk_number in &plan.chunk_numbers {
             fds.push(Self::chunk_base(chunk_number));
         }
-        self.ensure_fds_materialized(&fds)?;
+        self.ensure_fds_materialized(&fds, creator)?;
         self.logical_capacity = plan.logical_capacity;
         self.rebuild_summaries();
         Ok(())
@@ -1238,15 +1371,85 @@ struct FdClonePlan {
 
 #[derive(Debug)]
 pub struct FileDescriptorTable {
+    body: OwnedBox<FdTableData>,
+}
+
+#[derive(Debug)]
+pub struct FdTableData {
     inner: RwSem<FdTableState>,
     task_users: AtomicUsize,
 }
 
+const _: () = {
+    assert!(size_of::<FdTableData>() <= SLOT_BLOCK_BYTES);
+};
+
+impl Deref for FileDescriptorTable {
+    type Target = FdTableData;
+    fn deref(&self) -> &FdTableData {
+        &self.body
+    }
+}
+
 impl FileDescriptorTable {
-    pub fn new(inner: FdTableState) -> Self {
-        Self {
-            inner: RwSem::new(inner),
-            task_users: AtomicUsize::new(0),
+    pub(crate) fn try_new(
+        inner: FdTableState,
+        creator: &Arc<ObjectAccount>,
+    ) -> Result<Self, MemoryAllocationError> {
+        Ok(Self {
+            body: OwnedBox::prepare(creator, KernelByteKind::SlabUnreclaimable)?
+                .try_init(FdTableData {
+                    inner: RwSem::new(inner),
+                    task_users: AtomicUsize::new(0),
+                })
+                .map_err(|_| SystemError::ENOMEM)?,
+        })
+    }
+
+    fn mutate_prepared<const N: usize, R>(
+        &self,
+        creator: &Arc<ObjectAccount>,
+        select: impl Fn(&FdTableState) -> Result<[usize; N], SystemError>,
+        commit: impl FnOnce(&mut FdTableState, [usize; N]) -> Result<R, SystemError>,
+    ) -> Result<R, MemoryAllocationError> {
+        loop {
+            let mut needs = [None; N];
+            let snapshot = {
+                let state = self.inner.read();
+                select(&state).and_then(|fds| {
+                    let required = fds
+                        .iter()
+                        .copied()
+                        .max()
+                        .and_then(|fd| fd.checked_add(1))
+                        .unwrap_or(INLINE_FDS);
+                    let capacity = state.planned_capacity(required)?;
+                    state.collect_path_needs(&fds, &mut needs);
+                    Ok((state.content_generation, fds, capacity))
+                })
+            };
+            let (generation, fds, capacity) = snapshot?;
+            let mut paths: [Option<PreparedPath>; N] = core::array::from_fn(|_| None);
+            for (slot, need) in paths.iter_mut().zip(needs) {
+                if let Some(need) = need {
+                    *slot = Some(PreparedPath::try_new(need, creator)?);
+                }
+            }
+            let mut state = self.inner.write();
+            if state.content_generation != generation {
+                drop(state);
+                drop(paths);
+                continue;
+            }
+            state.commit_paths(&mut paths);
+            if state.logical_capacity != capacity {
+                state.logical_capacity = capacity;
+                state.rebuild_summaries();
+            }
+            let result = commit(&mut state, fds);
+            drop(state);
+            drop(paths); // canceled candidates never retire under the table guard.
+            return result.map_err(Into::into);
         }
     }
 
@@ -1273,7 +1476,11 @@ impl FileDescriptorTable {
     }
 
     pub(crate) fn is_shared_by_tasks(&self) -> bool {
-        self.task_users.load(Ordering::Acquire) > 1
+        self.task_user_count() > 1
+    }
+
+    pub(crate) fn task_user_count(&self) -> usize {
+        self.task_users.load(Ordering::Acquire)
     }
 
     pub fn get_file_by_fd(&self, fd: i32) -> Option<Arc<File>> {
@@ -1290,9 +1497,10 @@ impl FileDescriptorTable {
         file: File,
         cloexec: bool,
         soft_limit: usize,
-    ) -> Result<i32, SystemError> {
+        creator: &Arc<ObjectAccount>,
+    ) -> Result<i32, MemoryAllocationError> {
         let file = Arc::try_new(file).map_err(|_| SystemError::ENOMEM)?;
-        self.alloc_fd_arc(file, cloexec, soft_limit)
+        self.alloc_fd_arc(file, cloexec, soft_limit, creator)
     }
 
     pub fn alloc_fd_arc(
@@ -1300,20 +1508,22 @@ impl FileDescriptorTable {
         file: Arc<File>,
         cloexec: bool,
         soft_limit: usize,
-    ) -> Result<i32, SystemError> {
-        let mut state = self.inner.write();
-        let fd = match state.reserve_n::<1>(soft_limit, 0, cloexec) {
-            Ok([fd]) => fd,
-            Err(error) => {
-                // The incoming Arc may be the final File reference. Never run
-                // File::drop/inode.close while holding the fd-table write lock.
-                drop(state);
-                drop(file);
-                return Err(error);
-            }
-        };
-        state.install_reserved(fd as usize, file)?;
-        Ok(fd)
+        creator: &Arc<ObjectAccount>,
+    ) -> Result<i32, MemoryAllocationError> {
+        // Keep an outer pin even when validation/commit returns an error.
+        self.mutate_prepared(
+            creator,
+            |state| {
+                state
+                    .select_reservation::<1>(soft_limit, 0, cloexec)
+                    .map(|fds| fds.map(|fd| fd as usize))
+            },
+            |state, [fd]| {
+                state.commit_reservation([fd as i32], cloexec);
+                state.install_reserved(fd, file.clone())?;
+                Ok(fd as i32)
+            },
+        )
     }
 
     /// Duplicate `oldfd` into the lowest free slot.
@@ -1322,12 +1532,27 @@ impl FileDescriptorTable {
         oldfd: i32,
         cloexec: bool,
         soft_limit: usize,
-    ) -> Result<i32, SystemError> {
-        let mut state = self.inner.write();
-        let file = state.get_file_by_fd(oldfd).ok_or(SystemError::EBADF)?;
-        let [fd] = state.reserve_n::<1>(soft_limit, 0, cloexec)?;
-        state.install_reserved(fd as usize, file)?;
-        Ok(fd)
+        creator: &Arc<ObjectAccount>,
+    ) -> Result<i32, MemoryAllocationError> {
+        self.mutate_prepared(
+            creator,
+            |state| {
+                if oldfd < 0 || state.file_ref(oldfd as usize).is_none() {
+                    return Err(SystemError::EBADF);
+                }
+                state
+                    .select_reservation::<1>(soft_limit, 0, cloexec)
+                    .map(|fds| fds.map(|fd| fd as usize))
+            },
+            |state, [fd]| {
+                let file = state
+                    .get_file_by_fd(oldfd)
+                    .expect("generation-validated source");
+                state.commit_reservation([fd as i32], cloexec);
+                state.install_reserved(fd, file)?;
+                Ok(fd as i32)
+            },
+        )
     }
 
     /// Duplicate `oldfd` into the first free slot at or above `min_fd`.
@@ -1341,15 +1566,30 @@ impl FileDescriptorTable {
         min_fd: i32,
         cloexec: bool,
         soft_limit: usize,
-    ) -> Result<i32, SystemError> {
-        let mut state = self.inner.write();
-        let file = state.get_file_by_fd(oldfd).ok_or(SystemError::EBADF)?;
-        if min_fd < 0 || min_fd as usize >= soft_limit {
-            return Err(SystemError::EINVAL);
-        }
-        let [fd] = state.reserve_n::<1>(soft_limit, min_fd as usize, cloexec)?;
-        state.install_reserved(fd as usize, file)?;
-        Ok(fd)
+        creator: &Arc<ObjectAccount>,
+    ) -> Result<i32, MemoryAllocationError> {
+        self.mutate_prepared(
+            creator,
+            |state| {
+                if state.file_ref(oldfd as usize).is_none() || oldfd < 0 {
+                    return Err(SystemError::EBADF);
+                }
+                if min_fd < 0 || min_fd as usize >= soft_limit {
+                    return Err(SystemError::EINVAL);
+                }
+                state
+                    .select_reservation::<1>(soft_limit, min_fd as usize, cloexec)
+                    .map(|fds| fds.map(|fd| fd as usize))
+            },
+            |state, [fd]| {
+                let file = state
+                    .get_file_by_fd(oldfd)
+                    .expect("generation-validated source");
+                state.commit_reservation([fd as i32], cloexec);
+                state.install_reserved(fd, file)?;
+                Ok(fd as i32)
+            },
+        )
     }
 
     pub fn reserve<const N: usize>(
@@ -1357,11 +1597,21 @@ impl FileDescriptorTable {
         soft_limit: usize,
         min_fd: usize,
         cloexec: bool,
-    ) -> Result<FdReservation<N>, SystemError> {
-        let fds = self
-            .inner
-            .write()
-            .reserve_n::<N>(soft_limit, min_fd, cloexec)?;
+        creator: &Arc<ObjectAccount>,
+    ) -> Result<FdReservation<N>, MemoryAllocationError> {
+        let fds = self.mutate_prepared(
+            creator,
+            |state| {
+                state
+                    .select_reservation::<N>(soft_limit, min_fd, cloexec)
+                    .map(|fds| fds.map(|fd| fd as usize))
+            },
+            |state, fds| {
+                let fds = fds.map(|fd| fd as i32);
+                state.commit_reservation(fds, cloexec);
+                Ok(fds)
+            },
+        )?;
         Ok(FdReservation {
             table: self.clone(),
             fds,
@@ -1379,18 +1629,30 @@ impl FileDescriptorTable {
         newfd: i32,
         cloexec: bool,
         soft_limit: usize,
-    ) -> Result<(i32, Option<DroppedFd>), SystemError> {
-        let mut state = self.inner.write();
-        let file = state.get_file_by_fd(oldfd).ok_or(SystemError::EBADF)?;
-        state
-            .replace_arc(file, newfd, cloexec, soft_limit)
-            .map_err(|error| {
-                if error == SystemError::EMFILE {
-                    SystemError::EBADF
-                } else {
-                    error
+        creator: &Arc<ObjectAccount>,
+    ) -> Result<(i32, Option<DroppedFd>), MemoryAllocationError> {
+        let result = self.mutate_prepared(
+            creator,
+            |state| {
+                if oldfd < 0 || state.file_ref(oldfd as usize).is_none() {
+                    return Err(SystemError::EBADF);
                 }
-            })
+                if newfd < 0 || newfd as usize >= soft_limit {
+                    return Err(SystemError::EBADF);
+                }
+                Ok([newfd as usize])
+            },
+            |state, [_]| {
+                let file = state
+                    .get_file_by_fd(oldfd)
+                    .expect("generation-validated source");
+                state.replace_arc(file, newfd, cloexec, soft_limit)
+            },
+        );
+        result.map_err(|error| match error {
+            MemoryAllocationError::System(SystemError::EMFILE) => SystemError::EBADF.into(),
+            error => error,
+        })
     }
 
     pub(crate) fn close_range_end(&self, last: u32) -> Option<usize> {
@@ -1423,12 +1685,38 @@ impl FileDescriptorTable {
     pub(crate) fn try_clone(
         source: &Arc<Self>,
         punch_hole: Option<(u32, u32)>,
-    ) -> Result<Arc<Self>, SystemError> {
+        creator: &Arc<ObjectAccount>,
+    ) -> Result<Arc<Self>, MemoryAllocationError> {
         loop {
-            let plan = source.inner.read().clone_plan(punch_hole)?;
+            let (generation, chunk_count) = {
+                let guard = source.inner.read();
+                (
+                    guard.content_generation,
+                    guard.clone_chunk_count(punch_hole),
+                )
+            };
+            let mut chunks = Vec::new();
+            chunks
+                .try_reserve_exact(chunk_count)
+                .map_err(|_| SystemError::ENOMEM)?;
+            let required = {
+                let guard = source.inner.read();
+                if guard.content_generation != generation {
+                    drop(guard);
+                    drop(chunks);
+                    continue;
+                }
+                guard.collect_clone_chunks(punch_hole, &mut chunks)
+            };
+            let plan = FdClonePlan {
+                generation,
+                logical_capacity: FdTableState::planned_capacity_from_inline(required)?,
+                chunk_numbers: chunks,
+            };
             let mut target_state = FdTableState::new();
-            target_state.prepare_clone_layout(&plan)?;
-            let target = Arc::try_new(Self::new(target_state)).map_err(|_| SystemError::ENOMEM)?;
+            target_state.prepare_clone_layout(&plan, creator)?;
+            let target = Arc::try_new(Self::try_new(target_state, creator)?)
+                .map_err(|_| SystemError::ENOMEM)?;
 
             let source_guard = source.inner.read();
             if source_guard.content_generation != plan.generation {
@@ -1447,6 +1735,57 @@ impl Drop for FileDescriptorTable {
     fn drop(&mut self) {
         debug_assert_eq!(self.task_users.load(Ordering::Relaxed), 0);
     }
+}
+
+/// Exercise the actual kernel RwSem/body layout, not the host fixture's lock.
+/// Reserved inline slots require no File endpoints or paged storage.
+pub(crate) fn run_body_layout_selftest() -> Result<(bool, usize, u64), MemoryAllocationError> {
+    use crate::cgroup::memory::{object::ObjectAccount, MemoryAccount};
+    use crate::mm::allocator::kernel_allocator::allocation_footprint;
+
+    let account = MemoryAccount::new(0x776610, None)?;
+    let creator = ObjectAccount::new(&account)?;
+    let bytes = size_of::<FdTableData>();
+    let footprint = allocation_footprint(core::alloc::Layout::new::<FdTableData>());
+    let body_kind = KernelByteKind::SlabUnreclaimable
+        .for_allocation(core::alloc::Layout::new::<FdTableData>()) as usize;
+    // Production callers use N=1/2; avoid a 64-entry PreparedPath temporary
+    // on the kernel stack just to retain all inline reservations in this test.
+    let mut reservations = Vec::new();
+    reservations
+        .try_reserve_exact(INLINE_FDS)
+        .map_err(|_| SystemError::ENOMEM)?;
+    let table = Arc::try_new(FileDescriptorTable::try_new(FdTableState::new(), &creator)?)
+        .map_err(|_| SystemError::ENOMEM)?;
+    let weak = Arc::downgrade(&table);
+    let baseline = account.snapshot();
+    for _ in 0..INLINE_FDS {
+        reservations.push(table.reserve::<1>(INLINE_FDS, 0, false, &creator)?);
+    }
+    let mut ok = bytes <= SLOT_BLOCK_BYTES
+        && footprint <= SLOT_BLOCK_BYTES as u64
+        && baseline.kernel_bytes[body_kind] == footprint;
+    {
+        let state = table.read();
+        ok &= state.paged.is_none()
+            && state.logical_capacity == INLINE_FDS
+            && state.inline_open == usize::MAX
+            && reservations[0].fd(0) == 0
+            && reservations[INLINE_FDS - 1].fd(0) == INLINE_FDS as i32 - 1;
+    }
+    ok &= account.snapshot().kernel_bytes == baseline.kernel_bytes;
+    drop(reservations);
+    {
+        let state = table.read();
+        ok &= state.inline_open == 0 && state.paged.is_none();
+    }
+    drop(table);
+    ok &= weak.upgrade().is_none()
+        && account.current_pages() == 0
+        && account.snapshot().kernel_bytes
+            == [0; crate::cgroup::memory::accounting::KERNEL_BYTE_KIND_COUNT];
+    drop(weak);
+    Ok((ok, bytes, footprint))
 }
 
 #[derive(Debug)]
@@ -1541,7 +1880,173 @@ impl Iterator for FileDescriptorIterator<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::{FdTableState, CHUNK_FDS, INLINE_FDS};
+    use super::*;
+
+    fn table() -> (
+        Arc<FileDescriptorTable>,
+        Arc<crate::cgroup::memory::MemoryAccount>,
+        Arc<ObjectAccount>,
+    ) {
+        let root = crate::cgroup::memory::MemoryAccount::new(700, None).unwrap();
+        let owner = crate::cgroup::memory::MemoryAccount::new(701, Some(root)).unwrap();
+        let creator = ObjectAccount::new(&owner).unwrap();
+        let table = Arc::new(FileDescriptorTable::try_new(FdTableState::new(), &creator).unwrap());
+        (table, owner, creator)
+    }
+
+    #[test]
+    fn actual_table_body_and_weak_header_release_budget() {
+        let (table, owner, creator) = table();
+        let weak = Arc::downgrade(&table);
+        assert!(owner.snapshot().current > 0);
+        let before = owner.snapshot();
+        let reservation = table.reserve::<1>(1024, 0, true, &creator).unwrap();
+        assert_eq!(owner.snapshot().current, before.current); // common inline path adds no backing.
+        drop(reservation);
+        drop(table);
+        assert!(weak.upgrade().is_none());
+        assert_eq!(owner.snapshot().current, 0);
+        assert_eq!(
+            owner.snapshot().kernel_bytes,
+            [0; crate::cgroup::memory::accounting::KERNEL_BYTE_KIND_COUNT]
+        );
+        drop(weak);
+    }
+
+    #[test]
+    fn growth_quota_refusal_preserves_reservation_state() {
+        let (table, owner, creator) = table();
+        let before = owner.snapshot();
+        let original = {
+            let state = table.read();
+            (
+                state.logical_capacity,
+                state.next_fd,
+                state.content_generation,
+            )
+        };
+        owner.set_policy(crate::cgroup::memory::MemoryPolicy {
+            max: Some(before.current),
+            ..Default::default()
+        });
+        assert!(matches!(
+            table.reserve::<2>(4096, 3000, true, &creator),
+            Err(MemoryAllocationError::Charge(_))
+        ));
+        let after = owner.snapshot();
+        assert_eq!(after.current, before.current);
+        assert_eq!(after.kernel_bytes, before.kernel_bytes);
+        {
+            let state = table.read();
+            assert_eq!(
+                (
+                    state.logical_capacity,
+                    state.next_fd,
+                    state.content_generation
+                ),
+                original
+            );
+            assert!(state.paged.is_none());
+            assert_eq!(state.fd_open_count(), 0);
+        }
+        owner.set_policy(Default::default());
+        let reservation = table.reserve::<2>(4096, 3000, true, &creator).unwrap();
+        assert_eq!(reservation.fd(0), 3000);
+        assert_eq!(reservation.fd(1), 3001);
+        assert!(owner.snapshot().current > before.current);
+        drop(reservation);
+        drop(table);
+        assert_eq!(owner.snapshot().current, 0);
+    }
+
+    #[test]
+    fn highest_integer_descriptor_and_root_block_boundaries_fit() {
+        let (group, directory, chunk, slot) = FdTableState::indexes(i32::MAX as usize);
+        assert!(group < ROOT_ENTRIES_MAX);
+        assert!(directory < INDEX_FANOUT && chunk < INDEX_FANOUT && slot < CHUNK_FDS);
+        assert_eq!(size_of::<RootBlock>(), SLOT_BLOCK_BYTES);
+        assert!(size_of::<FdDirectory>() <= SLOT_BLOCK_BYTES);
+        assert!(size_of::<FdGroup>() <= SLOT_BLOCK_BYTES);
+    }
+
+    #[test]
+    fn sparse_root_blocks_materialize_only_requested_extremes() {
+        struct RestoreNrOpen(usize);
+        impl Drop for RestoreNrOpen {
+            fn drop(&mut self) {
+                NR_OPEN.store(self.0, Ordering::Release);
+            }
+        }
+        let _restore = RestoreNrOpen(NR_OPEN.swap(nr_open_max(), Ordering::AcqRel));
+        let (table, owner, creator) = table();
+        let last = nr_open_max() - 1;
+        let high = table
+            .reserve::<1>(nr_open_max(), last, true, &creator)
+            .unwrap();
+        assert_eq!(high.fd(0) as usize, last);
+        let low = table
+            .reserve::<1>(nr_open_max(), INLINE_FDS, false, &creator)
+            .unwrap();
+        {
+            let state = table.read();
+            let roots = &state.paged.as_ref().unwrap().groups;
+            assert!(roots.blocks[0].is_some());
+            assert!(roots.blocks[ROOT_BLOCKS - 1].is_some());
+            assert!(roots.blocks[1..ROOT_BLOCKS - 1].iter().all(Option::is_none));
+            assert!(state.chunk(last).is_some());
+            assert!(state.chunk(INLINE_FDS).is_some());
+        }
+        drop(high);
+        drop(low);
+        drop(table);
+        assert_eq!(owner.snapshot().current, 0);
+    }
+
+    #[test]
+    fn later_growth_uses_actor_and_offline_reparents_only_old_stock() {
+        let root = crate::cgroup::memory::MemoryAccount::new(730, None).unwrap();
+        let old = crate::cgroup::memory::MemoryAccount::new(731, Some(root.clone())).unwrap();
+        let new = crate::cgroup::memory::MemoryAccount::new(732, Some(root.clone())).unwrap();
+        let old_creator = ObjectAccount::new(&old).unwrap();
+        let new_creator = ObjectAccount::new(&new).unwrap();
+        let table =
+            Arc::new(FileDescriptorTable::try_new(FdTableState::new(), &old_creator).unwrap());
+        let old_bytes = old.snapshot().kernel_bytes;
+        let reservation = table.reserve::<1>(4096, 3000, true, &new_creator).unwrap();
+        assert_eq!(old.snapshot().kernel_bytes, old_bytes);
+        assert!(new.snapshot().current > 0);
+        let new_bytes = new.snapshot().kernel_bytes;
+        crate::cgroup::memory::object::offline_memory_account(&old).unwrap();
+        assert_eq!(old.snapshot().current, 0);
+        assert_eq!(new.snapshot().kernel_bytes, new_bytes);
+        assert!(root.snapshot().current > new.snapshot().current);
+        drop(reservation);
+        drop(table);
+        assert_eq!(root.snapshot().current, 0);
+        assert_eq!(new.snapshot().current, 0);
+        assert_eq!(
+            root.snapshot().kernel_bytes,
+            [0; crate::cgroup::memory::accounting::KERNEL_BYTE_KIND_COUNT]
+        );
+    }
+
+    // The historical state-only cases exercise the same private materialize
+    // and reservation primitives, without holding a table/resource guard.
+    fn reserve<const N: usize>(
+        state: &mut FdTableState,
+        limit: usize,
+        min: usize,
+        cloexec: bool,
+    ) -> [i32; N] {
+        let owner = crate::cgroup::memory::MemoryAccount::new(1, None).unwrap();
+        let creator = ObjectAccount::new(&owner).unwrap();
+        let fds = state.select_reservation::<N>(limit, min, cloexec).unwrap();
+        state
+            .ensure_fds_materialized(&fds.map(|fd| fd as usize), &creator)
+            .unwrap();
+        state.commit_reservation(fds, cloexec);
+        fds
+    }
 
     #[test]
     fn sparse_layout_keeps_inline_capacity() {
@@ -1560,7 +2065,7 @@ mod tests {
     #[test]
     fn reservation_is_atomic_and_reusable() {
         let mut state = FdTableState::new();
-        let fds = state.reserve_n::<2>(1024, 0, true).unwrap();
+        let fds = reserve::<2>(&mut state, 1024, 0, true);
         assert_eq!(fds, [0, 1]);
         for fd in fds {
             assert!(state.is_open(fd as usize));
@@ -1570,13 +2075,13 @@ mod tests {
 
         state.release_reserved(0);
         state.release_reserved(1);
-        assert_eq!(state.reserve_n::<1>(1024, 0, false).unwrap(), [0]);
+        assert_eq!(reserve::<1>(&mut state, 1024, 0, false), [0]);
     }
 
     #[test]
     fn sparse_minimum_materializes_only_its_chunk() {
         let mut state = FdTableState::new();
-        let [fd] = state.reserve_n::<1>(4096, 3000, false).unwrap();
+        let [fd] = reserve::<1>(&mut state, 4096, 3000, false);
         assert_eq!(fd, 3000);
         assert_eq!(state.logical_capacity, 4096);
         assert!(state.chunk(3000).is_some());
@@ -1588,7 +2093,7 @@ mod tests {
     fn full_inline_summary_advances_to_first_chunk() {
         let mut state = FdTableState::new();
         for expected in 0..INLINE_FDS {
-            let [fd] = state.reserve_n::<1>(1024, 0, false).unwrap();
+            let [fd] = reserve::<1>(&mut state, 1024, 0, false);
             assert_eq!(fd as usize, expected);
         }
         assert_eq!(state.find_next_free(0, 1024), Some(INLINE_FDS));
@@ -1599,7 +2104,7 @@ mod tests {
     #[test]
     fn cloexec_range_reaches_sparse_present_chunk() {
         let mut state = FdTableState::new();
-        let [fd] = state.reserve_n::<1>(600_000, 500_000, false).unwrap();
+        let [fd] = reserve::<1>(&mut state, 600_000, 500_000, false);
         assert!(!state.get_cloexec(fd));
         state.set_cloexec_range(0, u32::MAX);
         assert!(state.get_cloexec(fd));

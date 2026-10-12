@@ -3,7 +3,7 @@ use super::*;
 
 impl ProcessSignalState {
     fn group_exec_wait_queue(&self) -> &WaitQueue {
-        &self.group_exec_wait_queue
+        &self.body.group_exec_wait_queue
     }
 
     pub fn wait_group_exec_event_interruptible<F, B>(

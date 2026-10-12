@@ -7,7 +7,6 @@ use system_error::SystemError;
 use crate::{
     libs::mutex::Mutex,
     net::socket::{inet::common::BoundInner, utils::extract_src_addr_from_ip_header},
-    process::namespace::net_namespace::NetNamespace,
 };
 
 // 重新导出供 mod.rs 使用
@@ -27,80 +26,59 @@ pub struct UnboundRaw {
 }
 
 impl UnboundRaw {
-    pub fn new(ip_version: IpVersion, protocol: IpProtocol) -> Self {
-        let rx_buffer = smoltcp::socket::raw::PacketBuffer::new(
-            vec![smoltcp::socket::raw::PacketMetadata::EMPTY; DEFAULT_METADATA_BUF_SIZE],
-            vec![0; DEFAULT_RX_BUF_SIZE],
-        );
-        let tx_buffer = smoltcp::socket::raw::PacketBuffer::new(
-            vec![smoltcp::socket::raw::PacketMetadata::EMPTY; DEFAULT_METADATA_BUF_SIZE],
-            vec![0; DEFAULT_TX_BUF_SIZE],
-        );
-        let socket = SmolRawSocket::new(ip_version, protocol, rx_buffer, tx_buffer);
-
-        Self {
-            socket,
-            ip_version,
-            protocol,
+    #[expect(
+        clippy::result_large_err,
+        reason = "Failure must return the unchanged protocol owner without locked allocation"
+    )]
+    pub(crate) fn bind_prepared(
+        self,
+        local_addr: Option<IpAddress>,
+        prepared: &mut super::super::common::registration::PreparedIfaceSocket,
+        wrapper: Arc<super::RawSocket>,
+    ) -> Result<BoundRaw, (Self, SystemError)> {
+        let mut original = Some(self);
+        match prepared.with_commit(|prepared| {
+            let original = original.take().expect("one raw bind attempt");
+            let inner = prepared.attach(original.socket);
+            let bound = BoundRaw {
+                inner,
+                local_addr,
+                remote_addr: Mutex::new(None),
+                ip_version: original.ip_version,
+                protocol: original.protocol,
+            };
+            prepared.publish(wrapper);
+            bound
+        }) {
+            Ok(bound) => Ok(bound),
+            Err(error) => Err((
+                original
+                    .take()
+                    .expect("admission precedes protocol consumption"),
+                error,
+            )),
         }
     }
 
-    /// 绑定到指定的本地地址
-    pub fn bind(
-        self,
-        local_addr: IpAddress,
-        netns: Arc<NetNamespace>,
-    ) -> Result<BoundRaw, SystemError> {
-        let inner = BoundInner::bind(self.socket, &local_addr, netns)?;
-        Ok(BoundRaw {
-            inner,
-            local_addr: Some(local_addr),
-            remote_addr: Mutex::new(None),
-            ip_version: self.ip_version,
-            protocol: self.protocol,
-        })
-    }
-
-    /// Attach the raw socket to an iface for receiving packets, without binding
-    /// to a specific local address (wildcard).
-    pub fn bind_wildcard(self, netns: Arc<NetNamespace>) -> Result<BoundRaw, SystemError> {
-        // Prefer loopback for localhost-focused workloads/tests; fall back to default iface.
-        let iface: Arc<dyn crate::net::Iface> = if let Some(lo) = netns.loopback_iface() {
-            lo
-        } else if let Some(iface) = netns.default_iface() {
-            iface
-        } else {
-            netns
-                .device_list()
-                .values()
-                .next()
-                .cloned()
-                .ok_or(SystemError::ENODEV)?
-        };
-
-        let inner = BoundInner::bind_on_iface(self.socket, iface, netns.clone())?;
-        Ok(BoundRaw {
-            inner,
-            local_addr: None,
-            remote_addr: Mutex::new(None),
-            ip_version: self.ip_version,
-            protocol: self.protocol,
-        })
-    }
-
-    /// 绑定到临时地址（根据远程地址选择合适的本地地址）
-    pub fn bind_ephemeral(
-        self,
-        remote: IpAddress,
-        netns: Arc<NetNamespace>,
-    ) -> Result<BoundRaw, SystemError> {
-        let (inner, address) = BoundInner::bind_ephemeral(self.socket, remote, netns)?;
-        Ok(BoundRaw {
-            inner,
-            local_addr: Some(address),
-            remote_addr: Mutex::new(None),
-            ip_version: self.ip_version,
-            protocol: self.protocol,
+    pub(crate) fn try_new(
+        ip_version: IpVersion,
+        protocol: IpProtocol,
+        memory: &crate::net::socket::buffer::SocketMemory,
+    ) -> Result<Self, crate::mm::allocation::MemoryAllocationError> {
+        let rx = crate::net::socket::buffer::try_owned_packet_buffer(
+            memory,
+            DEFAULT_METADATA_BUF_SIZE,
+            DEFAULT_RX_BUF_SIZE,
+        )?;
+        let tx = crate::net::socket::buffer::try_owned_packet_buffer(
+            memory,
+            DEFAULT_METADATA_BUF_SIZE,
+            DEFAULT_TX_BUF_SIZE,
+        )?;
+        Ok(Self {
+            socket: SmolRawSocket::new(ip_version, protocol, rx, tx),
+            ip_version,
+            protocol,
         })
     }
 
@@ -214,6 +192,14 @@ impl BoundRaw {
 
     pub fn inner(&self) -> &BoundInner {
         &self.inner
+    }
+
+    pub(crate) fn inner_mut(&mut self) -> &mut BoundInner {
+        &mut self.inner
+    }
+
+    pub(crate) fn set_local_addr(&mut self, address: IpAddress) {
+        self.local_addr = Some(address);
     }
 
     pub fn close(&self) {

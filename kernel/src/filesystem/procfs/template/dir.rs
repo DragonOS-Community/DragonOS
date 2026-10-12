@@ -97,7 +97,12 @@ impl<Ops: DirOps> ProcDir<Ops> {
 #[inherit_methods(from = "self.common")]
 impl<Ops: DirOps + 'static> IndexNode for ProcDir<Ops> {
     fn fs(&self) -> Arc<dyn FileSystem>;
-    fn set_metadata(&self, metadata: &Metadata) -> Result<(), SystemError>;
+    fn set_metadata(
+        &self,
+        metadata: &Metadata,
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        self.common.set_metadata(metadata).map_err(Into::into)
+    }
 
     fn as_any_ref(&self) -> &dyn core::any::Any {
         self
@@ -130,8 +135,8 @@ impl<Ops: DirOps + 'static> IndexNode for ProcDir<Ops> {
         _len: usize,
         _buf: &mut [u8],
         _data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError> {
-        Err(SystemError::EISDIR)
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        Err(SystemError::EISDIR.into())
     }
 
     fn write_at(
@@ -140,8 +145,8 @@ impl<Ops: DirOps + 'static> IndexNode for ProcDir<Ops> {
         _len: usize,
         _buf: &[u8],
         _data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError> {
-        Err(SystemError::EISDIR)
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        Err(SystemError::EISDIR.into())
     }
 
     fn list(&self) -> Result<Vec<String>, SystemError> {
@@ -240,7 +245,7 @@ impl<Ops: DirOps + 'static> IndexNode for ProcDir<Ops> {
         &self,
         _data: MutexGuard<FilePrivateData>,
         _flags: &FileFlags,
-    ) -> Result<(), SystemError> {
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         return Ok(());
     }
 
@@ -248,8 +253,12 @@ impl<Ops: DirOps + 'static> IndexNode for ProcDir<Ops> {
         return Ok(());
     }
 
-    fn link(&self, _name: &str, _other: &Arc<dyn IndexNode>) -> Result<(), SystemError> {
-        Err(SystemError::EPERM)
+    fn link(
+        &self,
+        _name: &str,
+        _other: &Arc<dyn IndexNode>,
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        Err(SystemError::EPERM.into())
     }
 }
 

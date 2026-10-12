@@ -1,7 +1,7 @@
 use super::{
-    schedule_work, Arc, AtomicUsize, MMArch, MemoryManagementArch, Ordering, Page, PageCache,
-    PageCacheBackend, PageCacheDomainIoPermit, PageEntry, PageFlags, PageState, SystemError, Vec,
-    Work,
+    schedule_work, Arc, AtomicUsize, MMArch, MemoryAccount, MemoryAllocationError,
+    MemoryManagementArch, ObjectAccount, Ordering, Page, PageCache, PageCacheBackend,
+    PageCacheDomainIoPermit, PageEntry, PageFlags, PageState, SystemError, Vec, Work,
 };
 
 /// Stable bounds passed to one backend submission. `valid_bytes` is relative
@@ -41,13 +41,28 @@ impl PageCacheReadBatchCompletion {
         page_count: usize,
         domain_io: Option<PageCacheDomainIoPermit>,
     ) -> Result<Self, SystemError> {
+        let task = crate::process::ProcessManager::current_pcb();
+        let owner = crate::cgroup::memory::account_for_task(&task);
+        let creator = crate::cgroup::memory::object_for_task(&task);
+        Self::try_reserve(cache, start_index, page_count, domain_io, &owner, &creator)
+            .map_err(PageCache::legacy_allocation_error)
+    }
+
+    pub(super) fn try_reserve(
+        cache: &Arc<PageCache>,
+        start_index: usize,
+        page_count: usize,
+        domain_io: Option<PageCacheDomainIoPermit>,
+        owner: &Arc<MemoryAccount>,
+        creator: &Arc<ObjectAccount>,
+    ) -> Result<Self, MemoryAllocationError> {
         if page_count == 0 || start_index.checked_add(page_count - 1).is_none() {
-            return Err(SystemError::EINVAL);
+            return Err(SystemError::EINVAL.into());
         }
         let page_cache_ref = {
             let inner = cache.inner.lock();
             if (0..page_count).any(|offset| inner.get_entry(start_index + offset).is_some()) {
-                return Err(SystemError::EEXIST);
+                return Err(SystemError::EEXIST.into());
             }
             inner.page_cache_ref.clone()
         };
@@ -58,14 +73,21 @@ impl PageCacheReadBatchCompletion {
             .map_err(|_| SystemError::ENOMEM)?;
         for offset in 0..page_count {
             let page_index = start_index + offset;
-            let page = match cache.allocate_page(page_cache_ref.clone(), page_index) {
-                Ok(page) => page,
+            let page =
+                match cache.allocate_page_with_owner(page_cache_ref.clone(), page_index, owner) {
+                    Ok(page) => page,
+                    Err(error) => {
+                        Self::discard_unsubmitted(cache, &slots);
+                        return Err(error);
+                    }
+                };
+            let entry = match cache.prepare_entry(&page, PageState::Loading, creator) {
+                Ok(entry) => entry,
                 Err(error) => {
                     Self::discard_unsubmitted(cache, &slots);
                     return Err(error);
                 }
             };
-            let entry = Arc::new(PageEntry::new(page.clone(), PageState::Loading));
             slots.push(LoadingSlot {
                 page_index,
                 entry,
@@ -74,38 +96,27 @@ impl PageCacheReadBatchCompletion {
             });
         }
 
-        // Publish the whole empty subrange atomically. A concurrent reader
-        // must never attach to a prefix which is later rolled back because a
-        // later page conflicted.
-        let mut inner = cache.inner.lock();
-        if slots
-            .iter()
-            .any(|slot| inner.get_entry(slot.page_index).is_some())
-        {
-            drop(inner);
-            Self::discard_unsubmitted(cache, &slots);
-            return Err(SystemError::EEXIST);
-        }
-        for slot in &slots {
-            if let Err(error) = inner.insert_entry(slot.page_index, slot.entry.clone()) {
-                drop(inner);
-                Self::discard_unsubmitted(cache, &slots);
-                return Err(error);
-            }
-        }
-        drop(inner);
-        for slot in &slots {
+        // Prepare the completion authority too, before the indivisible cache
+        // commit. Its Drop owns unpublished frame cleanup on every failure.
+        let inner = Arc::try_new(LoadingBatch {
+            cache: cache.clone(),
+            unfinished: AtomicUsize::new(page_count),
+            slots,
+            _domain_io: domain_io,
+        })
+        .map_err(|_| SystemError::ENOMEM)?;
+        cache.publish_prepared_range(
+            inner
+                .slots
+                .iter()
+                .map(|slot| (slot.page_index, &slot.entry)),
+            page_count,
+            creator,
+        )?;
+        for slot in &inner.slots {
             cache.reconcile_entry_unevictable_for_insert(&slot.entry);
         }
-
-        Ok(Self {
-            inner: Arc::new(LoadingBatch {
-                cache: cache.clone(),
-                unfinished: AtomicUsize::new(page_count),
-                slots,
-                _domain_io: domain_io,
-            }),
-        })
+        Ok(Self { inner })
     }
 
     pub fn page_count(&self) -> usize {
@@ -257,7 +268,7 @@ impl PageCacheReadBatchCompletion {
                 .get_entry(slot.page_index)
                 .is_some_and(|current| Arc::ptr_eq(&current, &slot.entry))
             {
-                inner.remove_page(slot.page_index);
+                inner.remove_entry(slot.page_index);
                 true
             } else {
                 false
@@ -293,7 +304,7 @@ impl PageCacheReadBatchCompletion {
                     .get_entry(slot.page_index)
                     .is_some_and(|current| Arc::ptr_eq(&current, &slot.entry))
                 {
-                    inner.remove_page(slot.page_index);
+                    inner.remove_entry(slot.page_index);
                     true
                 } else {
                     false
@@ -323,15 +334,15 @@ impl Drop for LoadingBatch {
                     .get_entry(slot.page_index)
                     .is_some_and(|current| Arc::ptr_eq(&current, &slot.entry))
                 {
-                    inner.remove_page(slot.page_index);
-                    true
+                    inner.remove_entry(slot.page_index)
                 } else {
-                    false
+                    None
                 }
             };
-            if removed {
-                self.cache.discard_unlinked_page(&slot.page);
-            }
+            drop(removed);
+            // Both published and not-yet-published slots own registered frames.
+            // A racing winner has a different identity and is never removed.
+            self.cache.discard_unlinked_page(&slot.page);
         }
     }
 }

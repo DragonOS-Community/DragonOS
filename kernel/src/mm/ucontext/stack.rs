@@ -26,7 +26,9 @@ impl UserStack {
         vm: &mut InnerAddressSpace,
         stack_bottom: Option<VirtAddr>,
         stack_size: usize,
-    ) -> Result<Self, SystemError> {
+        creator: Option<&Arc<ObjectAccount>>,
+        data_account: &Arc<crate::cgroup::memory::MemoryAccount>,
+    ) -> Result<Self, MemoryAllocationError> {
         let stack_bottom = stack_bottom.unwrap_or(Self::DEFAULT_USER_STACK_BOTTOM);
         assert!(stack_bottom.check_aligned(MMArch::PAGE_SIZE));
 
@@ -55,6 +57,8 @@ impl UserStack {
             map_flags,
             false,
             false,
+            creator,
+            data_account,
         )?;
 
         let max_limit = core::cmp::max(Self::DEFAULT_USER_STACK_SIZE, stack_size);

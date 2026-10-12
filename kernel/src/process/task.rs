@@ -21,7 +21,7 @@ use crate::{
     driver::tty::tty_core::TtyCore,
     exception::InterruptArch,
     filesystem::{
-        fs::FsStruct,
+        fs::{FsAttachment, FsStruct},
         vfs::{fdtable::FileDescriptorTable, IndexNode},
     },
     ipc::{
@@ -51,7 +51,11 @@ use crate::{
     rcu::{rcu_defer_drop, PreparedRcuArcRetire, RcuArcSlot, RcuOptionArcSlot},
 };
 
+use crate::cgroup::memory::owned::OwnedBox;
+use crate::process::itimer::ItimerState;
 use crate::process::{posix_timer, ptrace, rseq, seccomp};
+
+type TaskResourceLimits = RwLock<OwnedBox<[RLimit64; RLimitID::Nlimits as usize]>>;
 
 const SRCU_TASK_SLOTS: usize = 8;
 
@@ -130,6 +134,30 @@ impl SrcuTaskState {
 
 #[derive(Debug)]
 pub struct ProcessControlBlock {
+    data: crate::libs::lazy_init::Lazy<
+        crate::cgroup::memory::owned::OwnedBox<ProcessControlBlockData>,
+    >,
+}
+
+impl core::ops::Deref for ProcessControlBlock {
+    type Target = ProcessControlBlockData;
+    fn deref(&self) -> &Self::Target {
+        &self.data
+    }
+}
+
+impl core::ops::DerefMut for ProcessControlBlock {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.data
+    }
+}
+
+/// The uniquely owned task body is freed at the last strong PCB reference,
+/// before its objcg receipt; weak PID/stack links only retain the thin header.
+#[derive(Debug)]
+pub struct ProcessControlBlockData {
+    pub(crate) memory_high_debt: AtomicU64,
+    pub(crate) memory_high_wait: SpinLock<Option<Arc<crate::cgroup::memory::high::HighWait>>>,
     /// The PID of the current process.
     pub(super) pid: AtomicRawPid,
     /// The thread group ID of the current process (this value never changes
@@ -269,18 +297,18 @@ pub struct ProcessControlBlock {
     pub(super) thread: RwLock<ThreadInfo>,
 
     /// Process filesystem state.
-    pub(super) fs: RwLock<Option<Arc<FsStruct>>>,
+    pub(super) fs: RwLock<Option<FsAttachment>>,
     /// Serializes replacement/removal of `fs` with pivot_root's exact-path
     /// migration. Ordinary readers intentionally stay off this cold-path lock.
     fs_slot_update_lock: Mutex<()>,
 
     /// Alarm timer.
-    pub(super) itimers: Arc<SpinLock<ProcessItimers>>,
+    pub(super) itimers: Arc<ItimerState>,
     /// POSIX interval timers (timer_create / timer_settime / ...).
     pub(super) posix_timers: SpinLock<posix_timer::ProcessPosixTimers>,
 
     /// CPU time accounting.
-    pub(super) cpu_time: Arc<ProcessCpuTime>,
+    pub(super) cpu_time: ProcessCpuTime,
     /// Minor page faults completed by this task.
     pub(super) min_flt: AtomicU64,
     /// Major page faults completed by this task.
@@ -321,7 +349,7 @@ pub struct ProcessControlBlock {
     pub(super) cmdline: RwLock<Vec<u8>>,
     /// Resource limits are shared by a thread group, like Linux's
     /// `signal_struct::rlim`. A process fork receives a copied Arc.
-    pub(super) rlimits: Arc<RwLock<[RLimit64; RLimitID::Nlimits as usize]>>,
+    pub(super) rlimits: Arc<TaskResourceLimits>,
 }
 
 /// The namespace state of a task, taken as one pair.
@@ -350,38 +378,305 @@ pub(crate) struct TaskNamespaceState {
     pub fs: Option<Arc<FsStruct>>,
 }
 
+/// Final task resources, prepared without creating throwaway private copies
+/// for a sharing fork. Observation Arcs do not count as task attachments.
+pub(crate) struct PreparedTaskResources {
+    files: Arc<FileDescriptorTable>,
+    sighand: Arc<SigHand>,
+    process_signal: Arc<crate::ipc::process_signal::ProcessSignalState>,
+    rlimits: Arc<TaskResourceLimits>,
+    itimers: Arc<ItimerState>,
+}
+
+impl PreparedTaskResources {
+    fn try_limits(
+        value: [RLimit64; RLimitID::Nlimits as usize],
+        creator: &Arc<crate::cgroup::memory::object::ObjectAccount>,
+    ) -> Result<Arc<TaskResourceLimits>, crate::mm::allocation::MemoryAllocationError> {
+        let body = OwnedBox::prepare(
+            creator,
+            crate::cgroup::memory::accounting::KernelByteKind::SlabUnreclaimable,
+        )?
+        .try_init(value)
+        .map_err(|_| SystemError::ENOMEM)?;
+        Ok(Arc::try_new(RwLock::new(body)).map_err(|_| SystemError::ENOMEM)?)
+    }
+
+    fn try_itimers(
+        creator: &Arc<crate::cgroup::memory::object::ObjectAccount>,
+    ) -> Result<Arc<ItimerState>, crate::mm::allocation::MemoryAllocationError> {
+        let body = OwnedBox::prepare(
+            creator,
+            crate::cgroup::memory::accounting::KernelByteKind::SlabUnreclaimable,
+        )?
+        .try_init(ProcessItimers::default())
+        .map_err(|_| SystemError::ENOMEM)?;
+        Ok(Arc::try_new(SpinLock::new(body)).map_err(|_| SystemError::ENOMEM)?)
+    }
+
+    pub(super) fn try_private(
+        creator: &Arc<crate::cgroup::memory::object::ObjectAccount>,
+    ) -> Result<Self, crate::mm::allocation::MemoryAllocationError> {
+        Ok(Self {
+            files: Arc::try_new(FileDescriptorTable::try_new(
+                crate::filesystem::vfs::fdtable::FdTableState::new(),
+                creator,
+            )?)
+            .map_err(|_| SystemError::ENOMEM)?,
+            sighand: SigHand::try_new_for(creator)?,
+            process_signal: crate::ipc::process_signal::ProcessSignalState::try_new_for(creator)?,
+            rlimits: Self::try_limits(ProcessControlBlock::default_rlimits(), creator)?,
+            itimers: Self::try_itimers(creator)?,
+        })
+    }
+
+    pub(super) fn try_for_fork(
+        parent: &Arc<ProcessControlBlock>,
+        flags: crate::process::fork::CloneFlags,
+        creator: &Arc<crate::cgroup::memory::object::ObjectAccount>,
+    ) -> Result<Self, crate::mm::allocation::MemoryAllocationError> {
+        use crate::process::fork::CloneFlags;
+        let (source_sighand, source_signal) =
+            parent.with_task_lock_irqsave(|| (parent.sighand(), parent.process_signal()));
+        let source_files = parent
+            .basic()
+            .try_fd_table()
+            .expect("fork parent has no fd table");
+        let files = if flags.contains(CloneFlags::CLONE_FILES) {
+            source_files
+        } else {
+            FileDescriptorTable::try_clone(&source_files, None, creator)?
+        };
+        let sighand = if flags.contains(CloneFlags::CLONE_SIGHAND) {
+            source_sighand
+        } else {
+            let private = SigHand::try_new_for(creator)?;
+            private.copy_handlers_from(&source_sighand);
+            if flags.contains(CloneFlags::CLONE_CLEAR_SIGHAND) {
+                private.flush_handlers(false);
+            }
+            private
+        };
+        let process_signal = if flags.contains(CloneFlags::CLONE_THREAD) {
+            source_signal
+        } else {
+            crate::ipc::process_signal::ProcessSignalState::try_new_for(creator)?
+        };
+        let (rlimits, itimers) = if flags.contains(CloneFlags::CLONE_THREAD) {
+            (parent.rlimits.clone(), parent.itimers.clone())
+        } else {
+            let snapshot = { **parent.rlimits.read() };
+            (
+                Self::try_limits(snapshot, creator)?,
+                Self::try_itimers(creator)?,
+            )
+        };
+        Ok(Self {
+            files,
+            sighand,
+            process_signal,
+            rlimits,
+            itimers,
+        })
+    }
+}
+
+/// Exercise real final-resource births without publishing a synthetic task.
+/// This does not substitute for fork/exec concurrency or user quota tests.
+pub(crate) fn run_resource_birth_selftest(
+) -> Result<bool, crate::mm::allocation::MemoryAllocationError> {
+    use crate::cgroup::memory::{
+        accounting::{MemoryAccount, MemoryPolicy, KERNEL_BYTE_KIND_COUNT},
+        object::ObjectAccount,
+    };
+    use crate::process::fork::CloneFlags;
+    // Arc::try_new drops its input if header allocation fails. Exercise that
+    // same uninitialized value's destructor without reading task state or
+    // fabricating a published PCB. This is not allocator fault injection.
+    let identity = Arc::try_new(ProcessControlBlock {
+        data: crate::libs::lazy_init::Lazy::new(),
+    })
+    .map_err(|_| SystemError::ENOMEM)?;
+    let identity_weak = Arc::downgrade(&identity);
+    drop(identity);
+    if identity_weak.upgrade().is_some() {
+        return Ok(false);
+    }
+    drop(identity_weak);
+    let root = MemoryAccount::new(0x776631, None)?;
+    let leaf = MemoryAccount::new(0x776632, Some(root.clone()))?;
+    let creator = ObjectAccount::new(&leaf)?;
+    let parent = ProcessManager::current_pcb();
+    let files = parent.fd_table();
+    let sighand = parent.sighand();
+    let signal = parent.process_signal();
+    let limits = parent.rlimits.clone();
+    let timers = parent.itimers.clone();
+    let users = files.task_user_count();
+    let refs = sighand.load_count();
+    leaf.set_policy(MemoryPolicy {
+        max: Some(0),
+        ..MemoryPolicy::default()
+    });
+    let shared = PreparedTaskResources::try_for_fork(
+        &parent,
+        CloneFlags::CLONE_FILES
+            | CloneFlags::CLONE_SIGHAND
+            | CloneFlags::CLONE_THREAD
+            | CloneFlags::CLONE_VM,
+        &creator,
+    )?;
+    if !Arc::ptr_eq(&shared.files, &files)
+        || !Arc::ptr_eq(&shared.sighand, &sighand)
+        || !Arc::ptr_eq(&shared.process_signal, &signal)
+        || !Arc::ptr_eq(&shared.rlimits, &limits)
+        || !Arc::ptr_eq(&shared.itimers, &timers)
+        || files.task_user_count() != users
+        || sighand.load_count() != refs
+        || leaf.snapshot().current != 0
+    {
+        return Ok(false);
+    }
+    drop(shared);
+    if !matches!(
+        PreparedTaskResources::try_for_fork(&parent, CloneFlags::empty(), &creator),
+        Err(crate::mm::allocation::MemoryAllocationError::Charge(_))
+    ) || files.task_user_count() != users
+        || sighand.load_count() != refs
+        || leaf.snapshot().current != 0
+    {
+        return Ok(false);
+    }
+    leaf.set_policy(MemoryPolicy::default());
+    let private =
+        PreparedTaskResources::try_for_fork(&parent, CloneFlags::CLONE_CLEAR_SIGHAND, &creator)?;
+    if Arc::ptr_eq(&private.files, &files)
+        || Arc::ptr_eq(&private.sighand, &sighand)
+        || Arc::ptr_eq(&private.process_signal, &signal)
+        || Arc::ptr_eq(&private.rlimits, &limits)
+        || Arc::ptr_eq(&private.itimers, &timers)
+        || private.files.task_user_count() != 0
+        || private.sighand.load_count() != 0
+        || leaf.snapshot().current == 0
+    {
+        return Ok(false);
+    }
+    for raw in 1..=crate::arch::ipc::signal::MAX_SIG_NUM {
+        let sig = Signal::from(raw as i32);
+        let old = sighand.handler(sig).expect("valid signal index");
+        let new = private.sighand.handler(sig).expect("valid signal index");
+        if new.is_ignore() != old.is_ignore()
+            || (!old.is_ignore()
+                && !matches!(
+                    new.action(),
+                    crate::ipc::signal_types::SigactionType::SaHandler(
+                        crate::ipc::signal_types::SaHandlerType::Default
+                    )
+                ))
+            || !new.flags().is_empty()
+            || new.mask() != SigSet::empty()
+            || new.restorer().is_some()
+        {
+            return Ok(false);
+        }
+    }
+    drop(private);
+    if leaf.snapshot().current != 0
+        || files.task_user_count() != users
+        || sighand.load_count() != refs
+    {
+        return Ok(false);
+    }
+    // Test each actual auxiliary allocation rather than letting another
+    // private resource's early admission failure stand in for these bodies.
+    leaf.set_policy(MemoryPolicy {
+        max: Some(0),
+        ..MemoryPolicy::default()
+    });
+    if !matches!(
+        PreparedTaskResources::try_limits(ProcessControlBlock::default_rlimits(), &creator),
+        Err(crate::mm::allocation::MemoryAllocationError::Charge(_))
+    ) || !matches!(
+        PreparedTaskResources::try_itimers(&creator),
+        Err(crate::mm::allocation::MemoryAllocationError::Charge(_))
+    ) || leaf.snapshot().current != 0
+    {
+        return Ok(false);
+    }
+    leaf.set_policy(MemoryPolicy::default());
+    let limits =
+        PreparedTaskResources::try_limits(ProcessControlBlock::default_rlimits(), &creator)?;
+    let timers = PreparedTaskResources::try_itimers(&creator)?;
+    let limits_weak = Arc::downgrade(&limits);
+    let timers_weak = Arc::downgrade(&timers);
+    if leaf.snapshot().current == 0 {
+        return Ok(false);
+    }
+    drop(limits);
+    drop(timers);
+    if leaf.snapshot().current != 0
+        || limits_weak.upgrade().is_some()
+        || timers_weak.upgrade().is_some()
+        || leaf.snapshot().kernel_bytes != [0; KERNEL_BYTE_KIND_COUNT]
+    {
+        return Ok(false);
+    }
+    drop(limits_weak);
+    drop(timers_weak);
+    let private_signal = crate::ipc::process_signal::ProcessSignalState::try_new_for(&creator)?;
+    let weak = Arc::downgrade(&private_signal);
+    if leaf.snapshot().current == 0 {
+        return Ok(false);
+    }
+    drop(private_signal);
+    let result = weak.upgrade().is_none()
+        && leaf.snapshot().current == 0
+        && root.snapshot().current == 0
+        && leaf.snapshot().kernel_bytes == [0; KERNEL_BYTE_KIND_COUNT];
+    drop(weak);
+    Ok(result)
+}
+
 impl ProcessControlBlock {
+    /// Complete the legacy fork-only immutable group fields before any PID,
+    /// task-list, scheduler or stack-user publication can expose this task.
+    ///
+    /// # Safety
+    /// The caller owns this unborn task and has released every entity borrow,
+    /// including the child thread guard. No simultaneous body access may exist;
+    /// unpublished alone is not sufficient. This never borrows the entire PCB
+    /// or Data mutably, nor stores a raw pointer past this initialization.
+    pub(super) unsafe fn initialize_unpublished_group(pcb: &Arc<Self>, tgid: RawPid) {
+        let header = Arc::as_ptr(pcb).cast_mut();
+        let body = unsafe {
+            let slot = &mut *core::ptr::addr_of_mut!((*header).data);
+            crate::cgroup::memory::owned::OwnedBox::unpublished_value_ptr(slot.get_mut())
+        };
+        unsafe { core::ptr::addr_of_mut!((*body).tgid).write(tgid) };
+    }
+
     /// Create a new PCB.
     ///
     /// ## Parameters
     ///
     /// - `name`: The process name.
     /// - `kstack`: The kernel stack for the process.
-    /// - `share_resource_limits`: share the current thread group's limits for
-    ///   `CLONE_THREAD`; otherwise snapshot them for a new process.
+    /// - `resources`: the final shared or private resources prepared for this
+    ///   birth; no temporary replacement resource is created here.
     ///
     /// ## Returns
     ///
     /// A new PCB.
-    pub fn new(
+    pub(crate) fn new(
         name: String,
         kstack: KernelStack,
-        share_resource_limits: bool,
-    ) -> Result<Arc<Self>, SystemError> {
+        is_kthread: bool,
+        resources: PreparedTaskResources,
+    ) -> Result<Arc<Self>, crate::mm::allocation::MemoryAllocationError> {
         let current = ProcessManager::current_pcb();
-        let rlimits = if share_resource_limits {
-            current.rlimits.clone()
-        } else {
-            Arc::new(RwLock::new(*current.rlimits.read()))
-        };
-        let syscall_stack = KernelStack::new()?;
-        Ok(Self::do_create_pcb(
-            name,
-            kstack,
-            syscall_stack,
-            false,
-            Some(rlimits),
-        ))
+        let stack_account = crate::cgroup::memory::object_for_task(&current);
+        let syscall_stack = KernelStack::new_accounted(&stack_account)?;
+        Self::do_create_pcb(name, kstack, syscall_stack, false, is_kthread, resources)
     }
 
     /// Create a new idle process.
@@ -391,7 +686,13 @@ impl ProcessControlBlock {
     pub fn new_idle(cpu_id: u32, kstack: KernelStack) -> Arc<Self> {
         let name = format!("idle-{}", cpu_id);
         let syscall_stack = KernelStack::new().expect("idle syscall stack allocation failed");
-        return Self::do_create_pcb(name, kstack, syscall_stack, true, None);
+        let creator = cgroup_root_node()
+            .effective_memory_generation()
+            .object_account;
+        let resources =
+            PreparedTaskResources::try_private(&creator).expect("idle resource preparation failed");
+        return Self::do_create_pcb(name, kstack, syscall_stack, true, true, resources)
+            .expect("idle scheduler preparation failed");
     }
 
     /// Returns whether the process is a kernel thread.
@@ -479,8 +780,9 @@ impl ProcessControlBlock {
         kstack: KernelStack,
         syscall_stack: KernelStack,
         is_idle: bool,
-        rlimits: Option<Arc<RwLock<[RLimit64; RLimitID::Nlimits as usize]>>>,
-    ) -> Arc<Self> {
+        is_kthread: bool,
+        resources: PreparedTaskResources,
+    ) -> Result<Arc<Self>, crate::mm::allocation::MemoryAllocationError> {
         // Initialize the namespace proxy.
         let nsproxy = if is_idle {
             // The idle process uses the root namespace.
@@ -495,54 +797,86 @@ impl ProcessControlBlock {
             ProcessManager::current_pcb().task_cgroup_ref()
         };
         let cpu_accounting = task_cgroup.node().cpu_accounting();
-
-        let (raw_pid, ppid, cwd, cred, tty): (
-            RawPid,
-            RawPid,
-            String,
-            Arc<Cred>,
-            Option<Arc<TtyCore>>,
-        ) = if is_idle {
-            let cred = INIT_CRED.clone();
-            (RawPid(0), RawPid(0), "/".to_string(), cred, None)
+        let creator = task_cgroup
+            .node()
+            .effective_memory_generation()
+            .object_account;
+        let initial_fs = if is_idle {
+            Some(FsAttachment::new(FsStruct::try_new_for(
+                nsproxy.mnt_namespace().root_inode(),
+                &creator,
+            )?))
         } else {
-            let ppid = ProcessManager::current_pcb().task_pid_vnr();
-            let cred = ProcessManager::current_pcb().cred();
-
-            let cwd = ProcessManager::current_pcb().basic().cwd();
-            let tty = ProcessManager::current_pcb().sig_info_irqsave().tty();
-
-            // Here, UNASSIGNED is used to represent an unallocated pid,
-            // which will be allocated later in `copy_process`.
-            let raw_pid = RawPid::UNASSIGNED;
-
-            (raw_pid, ppid, cwd, cred, tty)
+            // An unborn fork gets its one final fs under FsRefsReadGuard.
+            None
         };
+        let prepared_body =
+            crate::cgroup::memory::owned::OwnedBox::<ProcessControlBlockData>::prepare(
+                &creator,
+                crate::cgroup::memory::accounting::KernelByteKind::SlabUnreclaimable,
+            )?
+            .try_allocate()
+            .map_err(|_| SystemError::ENOMEM)?;
 
-        let basic_info = ProcessBasicInfo::new(ppid, name.clone(), cwd, None);
+        let (raw_pid, ppid, cred, tty): (RawPid, RawPid, Arc<Cred>, Option<Arc<TtyCore>>) =
+            if is_idle {
+                let cred = INIT_CRED.clone();
+                (RawPid(0), RawPid(0), cred, None)
+            } else {
+                let ppid = ProcessManager::current_pcb().task_pid_vnr();
+                let cred = ProcessManager::current_pcb().cred();
+
+                let tty = ProcessManager::current_pcb().sig_info_irqsave().tty();
+
+                // Here, UNASSIGNED is used to represent an unallocated pid,
+                // which will be allocated later in `copy_process`.
+                let raw_pid = RawPid::UNASSIGNED;
+
+                (raw_pid, ppid, cred, tty)
+            };
+
+        // The actual fd-table body is admitted before any task/sighand or
+        // registry publication. Failure drops the private body and stacks;
+        // the fork/creation owner decides whether recovery is permitted.
+        let PreparedTaskResources {
+            files: fd_table,
+            sighand: initial_sighand,
+            process_signal,
+            rlimits,
+            itimers,
+        } = resources;
+        let basic_info = ProcessBasicInfo::new(ppid, name.clone(), None, fd_table);
         let preempt_count = AtomicUsize::new(0);
         let pagefault_disabled = AtomicUsize::new(0);
         let rcu_read_depth = AtomicUsize::new(0);
         let flags = AtomicProcessFlags::new();
-        let initial_sighand = SigHand::new();
-        initial_sighand.attach_task_ref();
-
         let initial_sched_class = if is_idle {
             crate::sched::SchedClass::Idle
         } else {
             crate::sched::SchedClass::Fair
         };
-        let sched_info = ProcessSchedulerInfo::new(None, initial_sched_class);
+        // All newly fallible scheduler preparation precedes the task's
+        // logical sighand reference. No error may leak an attached task ref.
+        let sched_info = ProcessSchedulerInfo::try_new(None, initial_sched_class)?;
 
         let ppcb: Weak<ProcessControlBlock> = ProcessManager::find_task_by_vpid(ppid)
             .map(|p| Arc::downgrade(&p))
             .unwrap_or_default();
 
-        // Use Arc::new_cyclic to avoid constructing a large struct on the stack.
-        let pcb = Arc::new_cyclic(|weak| {
+        let cpu_time = ProcessCpuTime::default();
+        // No weak identity may escape or be upgraded before init. A failed
+        // thin-header allocation drops an uninitialized PCB without entering
+        // task cleanup; its still-private resources remain local RAII owners.
+        let pcb = Arc::try_new(Self {
+            data: crate::libs::lazy_init::Lazy::new(),
+        })
+        .map_err(|_| SystemError::ENOMEM)?;
+        let weak = Arc::downgrade(&pcb);
+        initial_sighand.attach_task_ref();
+        {
             let arch_info = SpinLock::new(ArchPCBInfo::new(&kstack));
 
-            let pcb = Self {
+            let data = ProcessControlBlockData {
                 pid: AtomicRawPid::new(raw_pid),
                 tgid: raw_pid,
                 thread_pid: RwLock::new(None),
@@ -552,6 +886,8 @@ impl ProcessControlBlock {
                 nsproxy: RcuOptionArcSlot::new_some(nsproxy),
                 task_cgroup: RwLock::new(task_cgroup),
                 cpu_accounting: SpinLock::new(cpu_accounting),
+                memory_high_debt: AtomicU64::new(0),
+                memory_high_wait: SpinLock::new(None),
                 sem_undo: SpinLock::new(None),
                 preempt_count,
                 pagefault_disabled,
@@ -569,9 +905,7 @@ impl ProcessControlBlock {
                 arch_info,
                 sig_info: RwLock::new(ProcessSignalInfo::default()),
                 sighand: RcuArcSlot::new(initial_sighand.clone()),
-                process_signal: RcuArcSlot::new(
-                    crate::ipc::process_signal::ProcessSignalState::new(),
-                ),
+                process_signal: RcuArcSlot::new(process_signal),
                 sig_altstack: RwLock::new(SigStackArch::new()),
                 exit_state: AtomicU8::new(ExitState::Running as u8),
                 exit_notify_complete: AtomicBool::new(false),
@@ -592,11 +926,11 @@ impl ProcessControlBlock {
                 ptrace: ptrace::PtraceTask::new(),
                 wait_queue: WaitQueue::default(),
                 thread: RwLock::new(ThreadInfo::new()),
-                fs: RwLock::new(Some(Arc::new(FsStruct::new()))),
+                fs: RwLock::new(initial_fs),
                 fs_slot_update_lock: Mutex::new(()),
-                itimers: Arc::new(SpinLock::new(ProcessItimers::default())),
+                itimers,
                 posix_timers: SpinLock::new(posix_timer::ProcessPosixTimers::default()),
-                cpu_time: Arc::new(ProcessCpuTime::default()),
+                cpu_time,
                 min_flt: AtomicU64::new(0),
                 maj_flt: AtomicU64::new(0),
                 exited_thread_group_cputime_ns: SpinLock::new(Default::default()),
@@ -611,13 +945,12 @@ impl ProcessControlBlock {
                 restart_block: SpinLock::new(None),
                 executable_path: RwLock::new(name),
                 cmdline: RwLock::new(Vec::new()),
-                rlimits: rlimits
-                    .clone()
-                    .unwrap_or_else(|| Arc::new(RwLock::new(Self::default_rlimits()))),
+                rlimits,
                 #[cfg(target_arch = "x86_64")]
                 uprobe: super::uprobe::TaskXolState::new(),
             };
 
+            pcb.data.init(prepared_body.init(data));
             pcb.sig_info.write().set_tty(tty);
 
             // Initialize the system call stack.
@@ -625,10 +958,20 @@ impl ProcessControlBlock {
             pcb.arch_info
                 .lock()
                 .init_syscall_stack(&pcb.syscall_stack.read());
+        }
 
-            pcb
-        });
-
+        // A user task cannot start charging and then discover it has no
+        // memory.high waiter under pressure. Birth is fallible while this PCB
+        // is still unpublished, before PID relations or stack weak links.
+        if !is_idle && !is_kthread {
+            if let Err(error) = crate::cgroup::memory::high::prepare_for_task(&pcb) {
+                // No PID or thread-group membership has been published. Do
+                // not run exit identity cleanup against shared group state.
+                // PCB Drop still retires its own sighand/files attachments.
+                pcb.flags().insert(ProcessFlags::PID_UNHASHED);
+                return Err(error.into());
+            }
+        }
         pcb.sched_info()
             .sched_entity()
             .force_mut()
@@ -647,7 +990,7 @@ impl ProcessControlBlock {
                 .unwrap()
         };
 
-        return pcb;
+        return Ok(pcb);
     }
 
     fn default_rlimits() -> [crate::process::resource::RLimit64; RLimitID::Nlimits as usize] {
@@ -1008,24 +1351,19 @@ impl ProcessControlBlock {
 
     /// Return the filesystem context when the task has not passed exit_fs().
     pub fn try_fs_struct(&self) -> Option<Arc<FsStruct>> {
-        self.fs.read().clone()
+        self.fs.read().as_ref().map(FsAttachment::observer)
     }
 
     #[inline(always)]
     pub fn fs_struct_is_shared(&self) -> bool {
-        Arc::strong_count(
-            self.fs
-                .read()
-                .as_ref()
-                .expect("live task must have an fs_struct"),
-        ) > 1
+        self.fs_struct().task_users() > 1
     }
 
     pub(crate) fn set_fs_struct(
         &self,
         fs: Arc<FsStruct>,
         _fs_refs: &super::FsRefsReadGuard,
-    ) -> Arc<FsStruct> {
+    ) -> Option<Arc<FsStruct>> {
         let _slot_update = self.fs_slot_update_lock.lock();
         self.swap_fs_slot_locked(fs)
     }
@@ -1040,9 +1378,11 @@ impl ProcessControlBlock {
     ///
     /// The previous owner is returned rather than dropped here, because its
     /// path-pin destructors may enqueue deferred cleanup work.
-    fn swap_fs_slot_locked(&self, fs: Arc<FsStruct>) -> Arc<FsStruct> {
+    fn swap_fs_slot_locked(&self, fs: Arc<FsStruct>) -> Option<Arc<FsStruct>> {
         let mut guard = self.fs.write();
-        guard.replace(fs).expect("live task must have an fs_struct")
+        let retired = guard.replace(FsAttachment::new(fs));
+        drop(guard);
+        retired.map(FsAttachment::retire)
     }
 
     /// Drop this task's reference to its filesystem context during exit.
@@ -1109,7 +1449,7 @@ impl ProcessControlBlock {
         let _task_guard = self.task_lock.lock_irqsave();
         TaskNamespaceState {
             nsproxy: self.try_nsproxy(),
-            fs: self.fs.read().clone(),
+            fs: self.fs.read().as_ref().map(FsAttachment::observer),
         }
     }
 
@@ -1147,7 +1487,7 @@ impl ProcessControlBlock {
         }
         let (retired_fs, nsproxy_retirement, cred_retirement) = {
             let _task_guard = self.task_lock.lock_irqsave();
-            let retired_fs = new_fs.map(|fs| self.swap_fs_slot_locked(fs));
+            let retired_fs = new_fs.and_then(|fs| self.swap_fs_slot_locked(fs));
             let nsproxy_retirement = self.nsproxy.swap_prepared(new_nsproxy, nsproxy_retire);
             let cred_retirement = new_cred.map(|(cred, retire)| {
                 self.commit_cred_side_effects(&self.cred(), &cred, active_mm.as_ref());
@@ -1720,7 +2060,7 @@ impl ProcessControlBlock {
     }
 
     #[inline(always)]
-    pub fn itimers_irqsave(&self) -> SpinLockGuard<'_, ProcessItimers> {
+    pub(crate) fn itimers_irqsave(&self) -> SpinLockGuard<'_, OwnedBox<ProcessItimers>> {
         return self.itimers.lock_irqsave();
     }
 
@@ -2100,8 +2440,8 @@ impl ProcessControlBlock {
         // must hold cgroup_accounting_lock to guarantee that visible membership
         // and pids charging switch together.
         let pid = self.raw_pid();
-        old.remove_task(pid);
         node.add_task(pid);
+        old.remove_task(pid);
         CgroupNode::transfer_pids_charge(&old, &node, 1);
 
         // Use a write lock to update task_cgroup.
@@ -2118,8 +2458,8 @@ impl ProcessControlBlock {
     /// # Note
     ///
     /// This function only updates the task_cgroup reference and does not call
-    /// `add_task()`. `add_task()` will be called subsequently in
-    /// `ProcessManager::add_pcb()`.
+    /// `add_task()`. The final fork publication transaction installs population
+    /// before releasing PID membership and publishing the ALL_PROCESS entry.
     pub fn set_task_cgroup_node_for_fork(&self, node: Arc<CgroupNode>) {
         *self.cpu_accounting.lock_irqsave() = node.cpu_accounting();
         *self.task_cgroup.write() = TaskCgroupRef::new(node);
@@ -2164,6 +2504,9 @@ impl ProcessControlBlock {
 
 impl Drop for ProcessControlBlock {
     fn drop(&mut self) {
+        if !self.data.initialized() {
+            return;
+        }
         let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         // log::debug!("Drop ProcessControlBlock: pid: {}", self.raw_pid(),);
         self.__exit_signal();

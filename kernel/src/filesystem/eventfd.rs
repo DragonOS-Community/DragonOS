@@ -129,8 +129,9 @@ impl IndexNode for EventFdInode {
         &self,
         _data: MutexGuard<FilePrivateData>,
         _flags: &FileFlags,
-    ) -> Result<(), SystemError> {
-        Ok(())
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = Ok(());
+        result.map_err(Into::into)
     }
 
     fn close(&self, _data: MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
@@ -151,47 +152,51 @@ impl IndexNode for EventFdInode {
         len: usize,
         buf: &mut [u8],
         data_guard: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError> {
-        let data = data_guard.clone();
-        drop(data_guard);
-        if len < 8 {
-            return Err(SystemError::EINVAL);
-        }
-        let mut lock_efd = self.eventfd.lock();
-        while lock_efd.count == 0 {
-            if lock_efd.flags.contains(EventFdFlags::EFD_NONBLOCK) {
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = (|| {
+            let data = data_guard.clone();
+            drop(data_guard);
+            if len < 8 {
+                return Err(SystemError::EINVAL);
+            }
+            let mut lock_efd = self.eventfd.lock();
+            while lock_efd.count == 0 {
+                if lock_efd.flags.contains(EventFdFlags::EFD_NONBLOCK) {
+                    drop(lock_efd);
+                    return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+                }
+
                 drop(lock_efd);
-                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+
+                if ProcessManager::current_pcb().has_pending_signal_fast() {
+                    return Err(SystemError::ERESTARTSYS);
+                }
+
+                wq_wait_event_interruptible!(self.wait_queue, self.readable(), {})?;
+
+                lock_efd = self.eventfd.lock();
             }
+            let mut val = lock_efd.count;
 
-            drop(lock_efd);
-
-            if ProcessManager::current_pcb().has_pending_signal_fast() {
-                return Err(SystemError::ERESTARTSYS);
+            let mut eventfd = lock_efd;
+            if eventfd.flags.contains(EventFdFlags::EFD_SEMAPHORE) {
+                eventfd.count -= 1;
+                val = 1;
+            } else {
+                eventfd.count = 0;
             }
+            let val_bytes = val.to_ne_bytes();
+            buf[..8].copy_from_slice(&val_bytes);
+            let pollflag =
+                EPollEventType::from_bits_truncate(self.do_poll(&data, &eventfd)? as u32);
+            drop(eventfd);
 
-            wq_wait_event_interruptible!(self.wait_queue, self.readable(), {})?;
+            // 唤醒epoll中等待的进程
+            EventPoll::wakeup_epoll(&self.epitems, pollflag)?;
 
-            lock_efd = self.eventfd.lock();
-        }
-        let mut val = lock_efd.count;
-
-        let mut eventfd = lock_efd;
-        if eventfd.flags.contains(EventFdFlags::EFD_SEMAPHORE) {
-            eventfd.count -= 1;
-            val = 1;
-        } else {
-            eventfd.count = 0;
-        }
-        let val_bytes = val.to_ne_bytes();
-        buf[..8].copy_from_slice(&val_bytes);
-        let pollflag = EPollEventType::from_bits_truncate(self.do_poll(&data, &eventfd)? as u32);
-        drop(eventfd);
-
-        // 唤醒epoll中等待的进程
-        EventPoll::wakeup_epoll(&self.epitems, pollflag)?;
-
-        return Ok(8);
+            return Ok(8);
+        })();
+        result.map_err(Into::into)
     }
 
     /// # 把一个 8 字节的int值写入到 counter 里
@@ -208,45 +213,48 @@ impl IndexNode for EventFdInode {
         len: usize,
         buf: &[u8],
         data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError> {
-        if len < 8 {
-            return Err(SystemError::EINVAL);
-        }
-        let val = u64::from_ne_bytes(buf[..8].try_into().unwrap());
-        if val == u64::MAX {
-            return Err(SystemError::EINVAL);
-        }
-        let pollflag;
-        loop {
-            let mut eventfd = self.eventfd.lock();
-            // Allow write when count + val <= EVENTFD_MAX.
-            if EVENTFD_MAX.saturating_sub(eventfd.count) >= val {
-                eventfd.count += val;
-                pollflag =
-                    EPollEventType::from_bits_truncate(self.do_poll(&data, &eventfd)? as u32);
-                break;
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = (|| {
+            if len < 8 {
+                return Err(SystemError::EINVAL);
             }
-            if eventfd.flags.contains(EventFdFlags::EFD_NONBLOCK) {
-                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+            let val = u64::from_ne_bytes(buf[..8].try_into().unwrap());
+            if val == u64::MAX {
+                return Err(SystemError::EINVAL);
             }
-            drop(eventfd);
-            if ProcessManager::current_pcb().has_pending_signal() {
-                return Err(SystemError::ERESTARTSYS);
+            let pollflag;
+            loop {
+                let mut eventfd = self.eventfd.lock();
+                // Allow write when count + val <= EVENTFD_MAX.
+                if EVENTFD_MAX.saturating_sub(eventfd.count) >= val {
+                    eventfd.count += val;
+                    pollflag =
+                        EPollEventType::from_bits_truncate(self.do_poll(&data, &eventfd)? as u32);
+                    break;
+                }
+                if eventfd.flags.contains(EventFdFlags::EFD_NONBLOCK) {
+                    return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+                }
+                drop(eventfd);
+                if ProcessManager::current_pcb().has_pending_signal() {
+                    return Err(SystemError::ERESTARTSYS);
+                }
+                // 等待计数下降（被 read 消费）
+                self.wait_queue.wait_event_interruptible(
+                    || {
+                        let ev = self.eventfd.lock();
+                        EVENTFD_MAX.saturating_sub(ev.count) >= val
+                    },
+                    None::<fn()>,
+                )?;
             }
-            // 等待计数下降（被 read 消费）
-            self.wait_queue.wait_event_interruptible(
-                || {
-                    let ev = self.eventfd.lock();
-                    EVENTFD_MAX.saturating_sub(ev.count) >= val
-                },
-                None::<fn()>,
-            )?;
-        }
-        self.wait_queue.wakeup_all(None);
+            self.wait_queue.wakeup_all(None);
 
-        // 唤醒epoll中等待的进程
-        EventPoll::wakeup_epoll(&self.epitems, pollflag)?;
-        return Ok(8);
+            // 唤醒epoll中等待的进程
+            EventPoll::wakeup_epoll(&self.epitems, pollflag)?;
+            return Ok(8);
+        })();
+        result.map_err(Into::into)
     }
 
     fn metadata(&self) -> Result<Metadata, SystemError> {
@@ -257,8 +265,9 @@ impl IndexNode for EventFdInode {
         metadata.mode
     }
 
-    fn resize(&self, _len: usize) -> Result<(), SystemError> {
-        Ok(())
+    fn resize(&self, _len: usize) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = Ok(());
+        result.map_err(Into::into)
     }
 
     fn fs(&self) -> Arc<dyn FileSystem> {

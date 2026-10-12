@@ -110,6 +110,16 @@ pub extern "sysv64" fn syscall_handler(frame: &mut TrapFrame) {
     };
     let _ = syscall_handle();
 
+    if ProcessManager::current_pcb()
+        .flags()
+        .contains(crate::process::ProcessFlags::NEED_MEMORY_HIGH)
+    {
+        unsafe {
+            CurrentIrqArch::interrupt_enable();
+        }
+        crate::cgroup::memory::high::handle_user_return();
+    }
+
     // Handle signals/ptrace-stop before returning to user mode
     unsafe {
         <X86_64SignalArch as SignalArch>::do_signal_or_restart(frame);

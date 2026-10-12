@@ -19,6 +19,7 @@
 #include <sys/utsname.h>
 #include <sys/time.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <array>
@@ -107,6 +108,7 @@ int SendAck(int fd, LinkRequest& request) {
 
 struct LinkState {
     uint32_t index = 0;
+    uint32_t flags = 0;
     uint32_t link = 0;
     int32_t link_netnsid = -1;
     uint32_t master = 0;
@@ -129,6 +131,7 @@ std::optional<LinkState> QueryLinkRequest(int fd, LinkRequest& request, uint32_t
             const auto* body = reinterpret_cast<const ifinfomsg*>(NLMSG_DATA(message));
             LinkState state;
             state.index = body->ifi_index;
+            state.flags = body->ifi_flags;
             int bytes = IFLA_PAYLOAD(message);
             for (auto* attr = IFLA_RTA(body); RTA_OK(attr, bytes); attr = RTA_NEXT(attr, bytes)) {
                 if (attr->rta_type == IFLA_LINK && RTA_PAYLOAD(attr) == sizeof(uint32_t)) {
@@ -249,6 +252,131 @@ struct CleanupLinks {
         if (!bridge.empty()) DeleteByName(fd, bridge, 4199);
     }
 };
+
+TEST(RtnetlinkBridgeVethSemantics, CreateAndUpBridgeWithNonemptyFibInSingleRequest) {
+    const auto now_ms = []() -> int64_t {
+        timespec now{};
+        if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return -1;
+        return int64_t(now.tv_sec) * 1000 + now.tv_nsec / 1000000;
+    };
+    const int64_t start = now_ms();
+    ASSERT_GE(start, 0);
+    const pid_t child = fork();
+    ASSERT_GE(child, 0);
+    if (child == 0) {
+        auto run = [&]() {
+            ASSERT_EQ(unshare(CLONE_NEWNET), 0) << std::strerror(errno);
+            RouteFd route;
+            ASSERT_GE(route.fd, 0);
+            const uint32_t loopback = if_nametoindex("lo");
+            ASSERT_NE(loopback, 0u);
+            ASSERT_EQ(SetLinkUp(route.fd, loopback, true, 4980), 0);
+
+            in_addr local{};
+            ASSERT_EQ(inet_pton(AF_INET, "198.18.0.17", &local), 1);
+            LinkRequest address(RTM_NEWADDR, NLM_F_CREATE | NLM_F_EXCL, 4981);
+            address.header()->nlmsg_len = NLMSG_LENGTH(sizeof(ifaddrmsg));
+            auto* addr = reinterpret_cast<ifaddrmsg*>(NLMSG_DATA(address.header()));
+            std::memset(addr, 0, sizeof(*addr));
+            addr->ifa_family = AF_INET;
+            addr->ifa_prefixlen = 32;
+            addr->ifa_scope = RT_SCOPE_HOST;
+            addr->ifa_index = loopback;
+            ASSERT_TRUE(address.add(IFA_LOCAL, &local, sizeof(local)));
+            ASSERT_TRUE(address.add(IFA_ADDRESS, &local, sizeof(local)));
+            ASSERT_EQ(SendAck(route.fd, address), 0);
+
+            const auto query_local_route = [&](uint32_t seq) {
+                LinkRequest request(RTM_GETROUTE, 0, seq);
+                request.header()->nlmsg_flags = NLM_F_REQUEST;
+                request.header()->nlmsg_len = NLMSG_LENGTH(sizeof(rtmsg));
+                auto* body = reinterpret_cast<rtmsg*>(NLMSG_DATA(request.header()));
+                std::memset(body, 0, sizeof(*body));
+                body->rtm_family = AF_INET;
+                body->rtm_dst_len = 32;
+                if (!request.add(RTA_DST, &local, sizeof(local)) ||
+                    send(route.fd, request.bytes.data(), request.header()->nlmsg_len, 0) < 0)
+                    return false;
+                std::array<uint8_t, 4096> reply{};
+                for (int tries = 0; tries < 32; ++tries) {
+                    const ssize_t count = recv(route.fd, reply.data(), reply.size(), 0);
+                    if (count < 0) return false;
+                    int remaining = static_cast<int>(count);
+                    for (auto* message = reinterpret_cast<nlmsghdr*>(reply.data());
+                         NLMSG_OK(message, remaining); message = NLMSG_NEXT(message, remaining)) {
+                        if (message->nlmsg_seq != seq) continue;
+                        if (message->nlmsg_type == NLMSG_ERROR) return false;
+                        if (message->nlmsg_type != RTM_NEWROUTE ||
+                            message->nlmsg_len < NLMSG_LENGTH(sizeof(rtmsg))) continue;
+                        const auto* info = reinterpret_cast<const rtmsg*>(NLMSG_DATA(message));
+                        if (info->rtm_family != AF_INET || info->rtm_type != RTN_LOCAL)
+                            return false;
+                        int bytes = RTM_PAYLOAD(message);
+                        for (auto* attr = RTM_RTA(info); RTA_OK(attr, bytes);
+                             attr = RTA_NEXT(attr, bytes)) {
+                            if ((attr->rta_type & NLA_TYPE_MASK) == RTA_OIF &&
+                                RTA_PAYLOAD(attr) == sizeof(uint32_t)) {
+                                uint32_t oif;
+                                std::memcpy(&oif, RTA_DATA(attr), sizeof(oif));
+                                return oif == loopback;
+                            }
+                        }
+                        return false;
+                    }
+                }
+                return false;
+            };
+            // Explicitly prove that FIB cloning cannot take an empty-table
+            // fast path before the nested create-and-UP transaction begins.
+            ASSERT_TRUE(query_local_route(4982));
+            const std::string bridge = UniqueName("sb");
+            CleanupLinks cleanup{route.fd, bridge, "", ""};
+            LinkRequest create(RTM_NEWLINK, NLM_F_CREATE | NLM_F_EXCL, 4983);
+            ASSERT_TRUE(create.name(bridge));
+            create.body()->ifi_flags = IFF_UP;
+            create.body()->ifi_change = IFF_UP;
+            AddKind(create, "bridge");
+            ASSERT_EQ(SendAck(route.fd, create), 0);
+            const uint32_t index = if_nametoindex(bridge.c_str());
+            ASSERT_NE(index, 0u);
+            const auto state = QueryLinkByIndex(route.fd, index, 4984);
+            ASSERT_TRUE(state.has_value());
+            EXPECT_EQ(state->index, index);
+            EXPECT_EQ(state->kind, "bridge");
+            EXPECT_NE(state->flags & IFF_UP, 0u);
+            ASSERT_TRUE(query_local_route(4985));
+            ASSERT_EQ(DeleteByName(route.fd, bridge, 4986), 0);
+            cleanup.bridge.clear();
+            EXPECT_EQ(if_nametoindex(bridge.c_str()), 0u);
+            EXPECT_TRUE(query_local_route(4987));
+        };
+        run();
+        _exit(testing::Test::HasFailure() ? 1 : 0);
+    }
+    int status = 0;
+    // A pre-fix kernel can stall inside this transaction. Never turn that
+    // regression into an unbounded parent wait; EINTR shares one deadline.
+    const auto reap_until = [&](int64_t deadline) {
+        for (;;) {
+            const int64_t now = now_ms();
+            if (now < 0 || now >= deadline) return false;
+            const pid_t result = waitpid(child, &status, WNOHANG);
+            if (result == child) return true;
+            if (result < 0 && errno != EINTR) return false;
+            timespec pause{0, 10000000};
+            nanosleep(&pause, nullptr);
+        }
+    };
+    if (!reap_until(start + 10000)) {
+        kill(child, SIGKILL);
+        const int64_t cleanup_start = now_ms();
+        const bool reaped = cleanup_start >= 0 && reap_until(cleanup_start + 2000);
+        if (!reaped) ADD_FAILURE() << "stack regression child " << child << " was not reaped";
+        FAIL() << "stack regression child did not complete within its 10-second deadline";
+    }
+    ASSERT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(WEXITSTATUS(status), 0);
+}
 
 TEST(RtnetlinkBridgeVethSemantics, NestedPeerNameMasterAndPairedDeletion) {
     RouteFd route;

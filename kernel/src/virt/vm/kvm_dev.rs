@@ -81,17 +81,27 @@ impl LockedKvmInode {
         return result;
     }
 
-    fn create_vm(&self, vm_type: usize) -> Result<usize, SystemError> {
+    fn create_vm(
+        &self,
+        vm_type: usize,
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        let storage = crate::filesystem::vfs::file::PreparedFile::try_new()?;
+        let current = ProcessManager::current_pcb();
+        let reservation = current.fd_table().reserve::<1>(
+            current.nofile_soft_limit(),
+            0,
+            false,
+            &crate::cgroup::memory::object_for_task(&current),
+        )?;
         let kvm = LockedVm::create(vm_type)?;
 
         let instance = KvmInstance::new(kvm);
 
-        let current = ProcessManager::current_pcb();
-
-        let file = File::new(instance, FileFlags::O_RDWR)?;
-        let fd = current
-            .fd_table()
-            .alloc_fd(file, false, current.nofile_soft_limit())?;
+        let file = File::new_prepared(instance, FileFlags::O_RDWR, storage)?;
+        let file = Arc::try_new(file).map_err(|_| SystemError::ENOMEM)?;
+        // No remaining File/body/fd allocation can fail after enabling VMX.
+        LockedVm::hardware_enable_all()?;
+        let fd = reservation.commit_arc(file);
         return Ok(fd as usize);
     }
 }
@@ -111,7 +121,7 @@ impl IndexNode for LockedKvmInode {
         &self,
         _data: crate::libs::mutex::MutexGuard<crate::filesystem::vfs::FilePrivateData>,
         _flags: &FileFlags,
-    ) -> Result<(), SystemError> {
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         Ok(())
     }
     fn read_at(
@@ -120,8 +130,8 @@ impl IndexNode for LockedKvmInode {
         _len: usize,
         _buf: &mut [u8],
         _data: crate::libs::mutex::MutexGuard<crate::filesystem::vfs::FilePrivateData>,
-    ) -> Result<usize, system_error::SystemError> {
-        Err(SystemError::ENOSYS)
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        Err(SystemError::ENOSYS.into())
     }
 
     fn write_at(
@@ -130,8 +140,8 @@ impl IndexNode for LockedKvmInode {
         _len: usize,
         _buf: &[u8],
         _data: crate::libs::mutex::MutexGuard<crate::filesystem::vfs::FilePrivateData>,
-    ) -> Result<usize, system_error::SystemError> {
-        Err(SystemError::ENOSYS)
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        Err(SystemError::ENOSYS.into())
     }
 
     fn fs(&self) -> Arc<dyn crate::filesystem::vfs::FileSystem> {
@@ -155,7 +165,8 @@ impl IndexNode for LockedKvmInode {
         cmd: u32,
         arg: usize,
         _private_data: MutexGuard<crate::filesystem::vfs::FilePrivateData>,
-    ) -> Result<usize, SystemError> {
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        drop(_private_data);
         match cmd {
             Self::KVM_CREATE_VM => {
                 let ret = self.create_vm(arg);
@@ -166,7 +177,7 @@ impl IndexNode for LockedKvmInode {
 
             Self::KVM_GET_VCPU_MMAP_SIZE => {
                 if arg != 0 {
-                    return Err(SystemError::EINVAL);
+                    return Err(SystemError::EINVAL.into());
                 }
                 debug!("[KVM] KVM_GET_VCPU_MMAP_SIZE");
                 return Ok(MMArch::PAGE_SIZE);
@@ -237,7 +248,7 @@ impl IndexNode for KvmInstance {
         &self,
         _data: MutexGuard<crate::filesystem::vfs::FilePrivateData>,
         _mode: &crate::filesystem::vfs::file::FileFlags,
-    ) -> Result<(), SystemError> {
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         Ok(())
     }
 
@@ -247,11 +258,23 @@ impl IndexNode for KvmInstance {
         cmd: u32,
         arg: usize,
         _private_data: MutexGuard<crate::filesystem::vfs::FilePrivateData>,
-    ) -> Result<usize, SystemError> {
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        drop(_private_data);
         debug!("kvm instance ioctl cmd {cmd:x}");
         match cmd {
             Self::KVM_CREATE_VCPU => {
-                let ret = self.kvm.lock().create_vcpu(arg);
+                // Preserve native validation precedence before memory admission;
+                // recheck it under the commit guard after preparation.
+                self.kvm.lock().validate_vcpu_id(arg)?;
+                let storage = crate::filesystem::vfs::file::PreparedFile::try_new()?;
+                let current = ProcessManager::current_pcb();
+                let reservation = current.fd_table().reserve::<1>(
+                    current.nofile_soft_limit(),
+                    0,
+                    false,
+                    &crate::cgroup::memory::object_for_task(&current),
+                )?;
+                let ret = self.kvm.lock().create_vcpu(arg, storage, reservation);
                 debug!("[KVM] create vcpu fd {ret:?}");
                 return ret;
             }
@@ -287,7 +310,7 @@ impl IndexNode for KvmInstance {
         _len: usize,
         _buf: &mut [u8],
         _data: MutexGuard<crate::filesystem::vfs::FilePrivateData>,
-    ) -> Result<usize, SystemError> {
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
         todo!()
     }
 
@@ -297,7 +320,7 @@ impl IndexNode for KvmInstance {
         _len: usize,
         _buf: &[u8],
         _data: MutexGuard<crate::filesystem::vfs::FilePrivateData>,
-    ) -> Result<usize, SystemError> {
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
         todo!()
     }
 
@@ -369,7 +392,7 @@ impl IndexNode for KvmVcpuDev {
         &self,
         _data: MutexGuard<crate::filesystem::vfs::FilePrivateData>,
         _flags: &FileFlags,
-    ) -> Result<(), SystemError> {
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         Ok(())
     }
 
@@ -385,11 +408,11 @@ impl IndexNode for KvmVcpuDev {
         cmd: u32,
         arg: usize,
         _private_data: MutexGuard<crate::filesystem::vfs::FilePrivateData>,
-    ) -> Result<usize, SystemError> {
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
         match cmd {
             Self::KVM_RUN => {
                 if arg != 0 {
-                    return Err(SystemError::EINVAL);
+                    return Err(SystemError::EINVAL.into());
                 }
                 let mut vcpu = self.vcpu.lock();
                 let oldpid = vcpu.pid;
@@ -397,7 +420,7 @@ impl IndexNode for KvmVcpuDev {
                     vcpu.pid = Some(ProcessManager::current_pid());
                 }
 
-                return vcpu.run();
+                return vcpu.run().map_err(Into::into);
             }
             Self::KVM_GET_REGS => {
                 let kvm_regs = self.vcpu.lock().get_regs();
@@ -453,7 +476,7 @@ impl IndexNode for KvmVcpuDev {
                     return Ok(0);
                 } else {
                     debug!("set segment regs failed");
-                    return Err(SystemError::EINVAL);
+                    return Err(SystemError::EINVAL.into());
                 }
             }
 
@@ -476,7 +499,7 @@ impl IndexNode for KvmVcpuDev {
         _len: usize,
         _buf: &mut [u8],
         _data: crate::libs::mutex::MutexGuard<crate::filesystem::vfs::FilePrivateData>,
-    ) -> Result<usize, SystemError> {
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
         todo!()
     }
 
@@ -486,7 +509,7 @@ impl IndexNode for KvmVcpuDev {
         _len: usize,
         _buf: &[u8],
         _data: crate::libs::mutex::MutexGuard<crate::filesystem::vfs::FilePrivateData>,
-    ) -> Result<usize, SystemError> {
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
         todo!()
     }
 

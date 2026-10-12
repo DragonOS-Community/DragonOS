@@ -56,7 +56,7 @@ pub(super) fn open(
     inode: &OvlInode,
     mut data: crate::libs::mutex::MutexGuard<FilePrivateData>,
     flags: &FileFlags,
-) -> Result<(), SystemError> {
+) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
     let overlay_data = open_backing_file(inode, *flags)?;
     *data = FilePrivateData::Overlayfs(overlay_data);
     Ok(())
@@ -68,7 +68,7 @@ pub(super) fn read_at(
     len: usize,
     buf: &mut [u8],
     data: crate::libs::mutex::MutexGuard<vfs::FilePrivateData>,
-) -> Result<usize, system_error::SystemError> {
+) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
     if inode.file_type == FileType::SymLink {
         drop(data);
         let (backing_inode, _) = inode.current_realdata_inode()?;
@@ -80,7 +80,7 @@ pub(super) fn read_at(
         );
     }
     let (backing_file, _) = backing_file_for_io(inode, data)?;
-    backing_file.pread(offset, len, buf)
+    backing_file.try_pread(offset, len, buf)
 }
 
 pub(super) fn write_at(
@@ -89,7 +89,7 @@ pub(super) fn write_at(
     len: usize,
     buf: &[u8],
     data: crate::libs::mutex::MutexGuard<vfs::FilePrivateData>,
-) -> Result<usize, SystemError> {
+) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
     let result = write_at_with_sync(inode, offset, len, buf, vfs::WriteSyncIntent::None, data)?;
     result.sync_result?;
     Ok(result.written_len)
@@ -102,7 +102,7 @@ pub(super) fn write_at_with_sync(
     buf: &[u8],
     sync_intent: vfs::WriteSyncIntent,
     data: crate::libs::mutex::MutexGuard<vfs::FilePrivateData>,
-) -> Result<vfs::DelegatedWriteResult, SystemError> {
+) -> Result<vfs::DelegatedWriteResult, crate::mm::allocation::MemoryAllocationError> {
     inode.overlay_fs()?.require_upper()?;
     if len == 0 {
         let (backing_file, _) = backing_file_for_io(inode, data)?;
@@ -122,10 +122,10 @@ pub(super) fn sync_file(
     inode: &OvlInode,
     datasync: bool,
     data: crate::libs::mutex::MutexGuard<vfs::FilePrivateData>,
-) -> Result<(), SystemError> {
+) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
     let (backing_file, backing_is_upper) = backing_file_for_io(inode, data)?;
     if backing_is_upper {
-        backing_file.sync_range_and_check_wb_error(0, usize::MAX, datasync)
+        backing_file.try_sync_range_and_check_wb_error(0, usize::MAX, datasync)
     } else {
         Ok(())
     }
@@ -137,10 +137,10 @@ pub(super) fn sync_file_range(
     end: usize,
     datasync: bool,
     data: crate::libs::mutex::MutexGuard<vfs::FilePrivateData>,
-) -> Result<(), SystemError> {
+) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
     let (backing_file, backing_is_upper) = backing_file_for_io(inode, data)?;
     if backing_is_upper {
-        backing_file.sync_range_and_check_wb_error(start, end, datasync)
+        backing_file.try_sync_range_and_check_wb_error(start, end, datasync)
     } else {
         Ok(())
     }
@@ -150,9 +150,9 @@ pub(super) fn flush_file(
     inode: &OvlInode,
     data: crate::libs::mutex::MutexGuard<FilePrivateData>,
     lock_owner: u64,
-) -> Result<(), SystemError> {
+) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
     let (backing_file, _) = backing_file_for_io(inode, data)?;
-    backing_file.flush_for_close(lock_owner)
+    backing_file.try_flush_for_close(lock_owner)
 }
 
 pub(super) fn resize_file_with_metadata(
@@ -162,10 +162,10 @@ pub(super) fn resize_file_with_metadata(
     lock_owner: u64,
     metadata: &Metadata,
     mask: SetMetadataMask,
-) -> Result<(), SystemError> {
+) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
     let (backing_file, backing_is_upper) = backing_file_for_io(inode, data)?;
     if !backing_is_upper {
-        return Err(SystemError::EIO);
+        return Err(SystemError::EIO.into());
     }
     backing_file.inode().resize_file_with_metadata(
         len,
@@ -193,7 +193,7 @@ pub(super) fn check_mmap_file(
     len: usize,
     offset: usize,
     vm_flags: VmFlags,
-) -> Result<(), SystemError> {
+) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
     let (backing_file, _) = backing_file_for_io(inode, file.private_data.lock())?;
     backing_file
         .inode()
@@ -203,7 +203,7 @@ pub(super) fn check_mmap_file(
 pub(super) fn mmap_effective_file(
     inode: &OvlInode,
     file: &Arc<File>,
-) -> Result<Arc<File>, SystemError> {
+) -> Result<Arc<File>, crate::mm::allocation::MemoryAllocationError> {
     let (backing_file, _) = backing_file_for_io(inode, file.private_data.lock())?;
     Ok(backing_file)
 }
@@ -215,7 +215,7 @@ pub(super) fn mmap_file(
     len: usize,
     offset: usize,
     vm_flags: VmFlags,
-) -> Result<Arc<File>, SystemError> {
+) -> Result<Arc<File>, crate::mm::allocation::MemoryAllocationError> {
     let (backing_file, _) = backing_file_for_io(inode, file.private_data.lock())?;
     backing_file
         .inode()
@@ -248,7 +248,7 @@ fn backing_open_flags(mut flags: FileFlags) -> FileFlags {
 fn open_backing_file(
     inode: &OvlInode,
     flags: FileFlags,
-) -> Result<OverlayFilePrivateData, SystemError> {
+) -> Result<OverlayFilePrivateData, crate::mm::allocation::MemoryAllocationError> {
     if open_flags_need_copy_up(inode.file_type, &flags) {
         inode.copy_up_for_open(&flags)?;
     }
@@ -273,7 +273,7 @@ fn open_real_file_with_cred(
     inode: Arc<dyn vfs::IndexNode>,
     flags: FileFlags,
     cred: Arc<Cred>,
-) -> Result<Arc<File>, SystemError> {
+) -> Result<Arc<File>, crate::mm::allocation::MemoryAllocationError> {
     let _cred_guard = CredOverrideGuard::new(cred)?;
     Ok(Arc::new(File::new(inode, flags)?))
 }
@@ -281,26 +281,50 @@ fn open_real_file_with_cred(
 fn backing_file_for_io(
     inode: &OvlInode,
     data: crate::libs::mutex::MutexGuard<FilePrivateData>,
-) -> Result<(Arc<File>, bool), SystemError> {
+) -> Result<(Arc<File>, bool), crate::mm::allocation::MemoryAllocationError> {
     let FilePrivateData::Overlayfs(overlay_data) = &*data else {
-        return Err(SystemError::EBADF);
+        return Err(SystemError::EBADF.into());
     };
     let overlay_data = overlay_data.clone();
     drop(data);
 
-    let mut inner = overlay_data.inner.lock();
-    let (current_real_inode, current_is_upper) = inode.current_realdata_inode()?;
-    if inner.backing_is_upper != current_is_upper
-        || !Arc::ptr_eq(&inner.active_real_inode, &current_real_inode)
-    {
-        let backing_file = open_real_file_with_cred(
-            current_real_inode.clone(),
-            backing_open_flags(inner.flags),
-            inner.backing_cred.clone(),
-        )?;
+    loop {
+        let (current_real_inode, current_is_upper) = inode.current_realdata_inode()?;
+        let (flags, cred) = {
+            let inner = overlay_data.inner.lock();
+            if inner.backing_is_upper == current_is_upper
+                && Arc::ptr_eq(&inner.active_real_inode, &current_real_inode)
+            {
+                return Ok((inner.backing_file.clone(), inner.backing_is_upper));
+            }
+            (inner.flags, inner.backing_cred.clone())
+        };
+        let candidate =
+            open_real_file_with_cred(current_real_inode.clone(), backing_open_flags(flags), cred)?;
+        let (real_now, upper_now) = inode.current_realdata_inode()?;
+        let mut inner = overlay_data.inner.lock();
+        if inner.flags != flags
+            || upper_now != current_is_upper
+            || !Arc::ptr_eq(&real_now, &current_real_inode)
+        {
+            drop(inner);
+            drop(candidate);
+            continue;
+        }
+        if inner.backing_is_upper == current_is_upper
+            && Arc::ptr_eq(&inner.active_real_inode, &current_real_inode)
+        {
+            let result = (inner.backing_file.clone(), inner.backing_is_upper);
+            drop(inner);
+            drop(candidate);
+            return Ok(result);
+        }
         inner.active_real_inode = current_real_inode;
-        inner.backing_file = backing_file;
         inner.backing_is_upper = current_is_upper;
+        let retired = mem::replace(&mut inner.backing_file, candidate);
+        let result = (inner.backing_file.clone(), current_is_upper);
+        drop(inner);
+        drop(retired);
+        return Ok(result);
     }
-    Ok((inner.backing_file.clone(), inner.backing_is_upper))
 }

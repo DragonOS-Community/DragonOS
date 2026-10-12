@@ -81,6 +81,24 @@ pub(crate) fn snapshot_all_processes() -> Result<Vec<Arc<ProcessControlBlock>>, 
     }
 }
 
+/// Fill caller-prepared storage while PID membership is serialized. No
+/// allocation, task action or last-reference retirement under the registry
+/// lock. A short capacity failure leaves the empty destination unchanged.
+pub(crate) fn snapshot_all_processes_into(
+    tasks: &mut Vec<Arc<ProcessControlBlock>>,
+) -> Result<(), ()> {
+    assert!(tasks.is_empty());
+    let all = all_process().lock_irqsave();
+    let required = all.as_ref().map_or(0, |map| map.len());
+    if required > tasks.capacity() {
+        return Err(());
+    }
+    if let Some(map) = all.as_ref() {
+        tasks.extend(map.values().cloned());
+    }
+    Ok(())
+}
+
 #[inline]
 pub(crate) fn inc_visible_thread_count() {
     NR_VISIBLE_THREADS.fetch_add(1, Ordering::Relaxed);
@@ -289,6 +307,31 @@ impl ProcessManager {
         tasks
     }
 
+    /// Fill a preallocated group snapshot without allocating under task locks.
+    /// The caller serializes publication with pid_membership_lock().
+    pub(crate) fn fill_thread_group_snapshot(
+        pcb: &Arc<ProcessControlBlock>,
+        tasks: &mut Vec<Arc<ProcessControlBlock>>,
+    ) -> Result<usize, usize> {
+        let leader = Self::thread_group_leader_of(pcb);
+        let threads = leader.threads_read_irqsave();
+        let required = threads.group_tasks().len().saturating_add(1);
+        if tasks.capacity() < required {
+            return Err(required);
+        }
+        // Drop previous references outside the caller's publication lock.
+        debug_assert!(tasks.is_empty());
+        tasks.push(leader.clone());
+        for weak in threads.group_tasks() {
+            if let Some(task) = weak.upgrade() {
+                if !Arc::ptr_eq(&task, &leader) {
+                    tasks.push(task);
+                }
+            }
+        }
+        Ok(required)
+    }
+
     #[inline(never)]
     pub(super) fn init() {
         static INIT_FLAG: AtomicBool = AtomicBool::new(false);
@@ -380,12 +423,70 @@ impl ProcessManager {
     /// ## Parameters
     ///
     /// - `pcb`: The PCB of the process.
+    ///
+    /// Reserve global publication capacity without allocating/freeing under
+    /// the registry's IRQ lock. Capacity may remain after a cancelled fork.
+    pub(crate) fn reserve_process_slot() -> Result<(), SystemError> {
+        loop {
+            let (len, capacity) = {
+                let all = ALL_PROCESS.lock_irqsave();
+                let map = all.as_ref().expect("process registry initialized");
+                (map.len(), map.capacity())
+            };
+            let needed = len.checked_add(1).ok_or(SystemError::ENOMEM)?;
+            if capacity >= needed {
+                return Ok(());
+            }
+            let reserve = len.checked_mul(2).unwrap_or(needed).max(needed);
+            let mut prepared = HashMap::new();
+            let allocation = prepared.try_reserve(reserve);
+            let mut all = ALL_PROCESS.lock_irqsave();
+            let map = all.as_mut().expect("process registry initialized");
+            let current_needed = map.len().checked_add(1).ok_or(SystemError::ENOMEM)?;
+            if map.capacity() >= current_needed {
+                drop(all);
+                drop(prepared);
+                return Ok(());
+            }
+            if allocation.is_err() {
+                drop(all);
+                drop(prepared);
+                return Err(SystemError::ENOMEM);
+            }
+            if prepared.capacity() < current_needed {
+                drop(all);
+                drop(prepared);
+                continue;
+            }
+            for (pid, task) in map.drain() {
+                prepared.insert(pid, task);
+            }
+            core::mem::swap(map, &mut prepared);
+            drop(all);
+            drop(prepared); // old empty backing, not published task owners
+            return Ok(());
+        }
+    }
+
+    /// Rechecked inside final PID publication before any irreversible attach.
+    pub(crate) fn has_process_slot() -> bool {
+        let all = ALL_PROCESS.lock_irqsave();
+        all.as_ref().is_some_and(|map| map.len() < map.capacity())
+    }
+
+    /// Caller owns final PID membership and checked prepared capacity.
     pub(crate) fn add_pcb(pcb: Arc<ProcessControlBlock>, _fs_refs: &FsRefsReadGuard) {
-        ALL_PROCESS
-            .lock_irqsave()
-            .as_mut()
-            .unwrap()
-            .insert(pcb.raw_pid(), pcb.clone());
+        let mut all = ALL_PROCESS.lock_irqsave();
+        let map = all.as_mut().unwrap();
+        assert!(
+            map.len() < map.capacity(),
+            "process publication has prepared capacity"
+        );
+        assert!(
+            !map.contains_key(&pcb.raw_pid()),
+            "raw PID is published only once"
+        );
+        map.insert(pcb.raw_pid(), pcb.clone());
     }
 
     pub(crate) fn exchange_tid_and_raw_pids(
@@ -449,6 +550,36 @@ impl ProcessManager {
             pids.push(*pid);
         }
         pids
+    }
+
+    /// Allocation-free candidate lookup for mm owner handoff, including OOM
+    /// teardown. Never wait for a task lock while holding the registry: basic
+    /// writers can acquire the registry in the opposite order.
+    ///
+    /// A candidate is only a hint. The caller must release the registry, take
+    /// its task lock and revalidate the installed mm before publishing it.
+    /// `contended` prevents an unsuccessful try-read being mistaken for absence.
+    pub(crate) fn find_mm_owner_candidate(
+        mm: &Arc<AddressSpace>,
+        departing: &Arc<ProcessControlBlock>,
+    ) -> (Option<Arc<ProcessControlBlock>>, bool) {
+        let registry = ALL_PROCESS.lock_irqsave();
+        let mut contended = false;
+        if let Some(tasks) = registry.as_ref() {
+            for task in tasks.values() {
+                if Arc::ptr_eq(task, departing) {
+                    continue;
+                }
+                let Some(basic) = task.try_basic() else {
+                    contended = true;
+                    continue;
+                };
+                if basic.user_vm().is_some_and(|vm| Arc::ptr_eq(&vm, mm)) {
+                    return (Some(task.clone()), contended);
+                }
+            }
+        }
+        (None, contended)
     }
 
     /// Hook function called after a context switch has completed.

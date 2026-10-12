@@ -21,6 +21,7 @@ use self::{
     ucontext::{AddressSpace, LockedVMA, UserMapper},
 };
 
+pub(crate) mod allocation;
 pub mod allocator;
 pub mod device_linear;
 pub mod dma;
@@ -31,13 +32,18 @@ pub mod init;
 pub mod kernel_mapper;
 pub mod madvise;
 pub mod memblock;
+pub(crate) mod memory_notify;
 pub mod mincore;
 pub mod mmio_buddy;
 pub mod mmu_gather;
 pub mod no_init;
 pub mod oom;
+pub(crate) mod oom_reaper;
+pub(crate) mod oom_wait;
 pub mod page;
 pub mod page_cache_stats;
+pub(crate) mod page_lru;
+pub(crate) mod page_rmap;
 pub mod percpu;
 pub mod readahead;
 pub mod remote_access;
@@ -686,7 +692,9 @@ pub trait MemoryManagementArch: Clone + Copy + Debug {
     fn initial_page_table() -> PhysAddr;
 
     /// 初始化新的usermapper，为用户进程创建页表
-    fn setup_new_usermapper() -> Result<UserMapper, SystemError>;
+    fn setup_new_usermapper(
+        account: Option<&alloc::sync::Arc<crate::cgroup::memory::object::ObjectAccount>>,
+    ) -> Result<UserMapper, allocation::MemoryAllocationError>;
 
     /// 创建页表项
     ///

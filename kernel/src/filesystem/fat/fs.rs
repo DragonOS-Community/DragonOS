@@ -2403,7 +2403,7 @@ impl IndexNode for LockedFATInode {
         &self,
         datasync: bool,
         data: MutexGuard<FilePrivateData>,
-    ) -> Result<(), SystemError> {
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         self.sync_file_range(0, usize::MAX, datasync, data)
     }
 
@@ -2413,39 +2413,42 @@ impl IndexNode for LockedFATInode {
         end: usize,
         _datasync: bool,
         _data: MutexGuard<FilePrivateData>,
-    ) -> Result<(), SystemError> {
-        let (file_type, page_cache, fs) = {
-            let inode = self.0.lock();
-            (
-                inode.metadata.file_type,
-                inode.page_cache.clone(),
-                inode.fs.upgrade().ok_or(SystemError::EIO)?,
-            )
-        };
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = (|| {
+            let (file_type, page_cache, fs) = {
+                let inode = self.0.lock();
+                (
+                    inode.metadata.file_type,
+                    inode.page_cache.clone(),
+                    inode.fs.upgrade().ok_or(SystemError::EIO)?,
+                )
+            };
 
-        if !matches!(file_type, FileType::File | FileType::Dir) {
-            return Err(SystemError::EINVAL);
-        }
+            if !matches!(file_type, FileType::File | FileType::Dir) {
+                return Err(SystemError::EINVAL);
+            }
 
-        if let Some(page_cache) = page_cache {
-            let start_index = start >> MMArch::PAGE_SHIFT;
-            let end_index = end >> MMArch::PAGE_SHIFT;
-            // writeback_range() is synchronous: it submits and waits for the
-            // selected dirty pages, propagating submission/writeback errors.
-            // FATFile::write()/ensure_len() also submits the FAT chain and
-            // short direntry updates needed to make an extended file
-            // reachable before this call returns.
-            page_cache
-                .manager()
-                .writeback_range(start_index, end_index)?;
-        }
+            if let Some(page_cache) = page_cache {
+                let start_index = start >> MMArch::PAGE_SHIFT;
+                let end_index = end >> MMArch::PAGE_SHIFT;
+                // writeback_range() is synchronous: it submits and waits for the
+                // selected dirty pages, propagating submission/writeback errors.
+                // FATFile::write()/ensure_len() also submits the FAT chain and
+                // short direntry updates needed to make an extended file
+                // reachable before this call returns.
+                page_cache
+                    .manager()
+                    .writeback_range(start_index, end_index)?;
+            }
 
-        // FAT cannot safely omit size/cluster metadata for fdatasync, so both
-        // fsync and fdatasync share this final power-loss durability boundary.
-        // Do not move this barrier into page writeback: a single file-level
-        // sync must cover the related data, FAT chain, and directory entry,
-        // and the device flush error must be visible to the caller.
-        fs.gendisk.sync()
+            // FAT cannot safely omit size/cluster metadata for fdatasync, so both
+            // fsync and fdatasync share this final power-loss durability boundary.
+            // Do not move this barrier into page writeback: a single file-level
+            // sync must cover the related data, FAT chain, and directory entry,
+            // and the device flush error must be visible to the caller.
+            fs.gendisk.sync()
+        })();
+        result.map_err(Into::into)
     }
 
     fn read_sync(&self, offset: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
@@ -2494,10 +2497,13 @@ impl IndexNode for LockedFATInode {
         len: usize,
         buf: &mut [u8],
         _data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError> {
-        let len = core::cmp::min(len, buf.len());
-        let buf = &mut buf[0..len];
-        self.try_read_pagecache(offset, buf)
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = {
+            let len = core::cmp::min(len, buf.len());
+            let buf = &mut buf[0..len];
+            self.try_read_pagecache(offset, buf)
+        };
+        result.map_err(Into::into)
     }
 
     fn write_at(
@@ -2506,10 +2512,13 @@ impl IndexNode for LockedFATInode {
         len: usize,
         buf: &[u8],
         _data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError> {
-        let len = core::cmp::min(len, buf.len());
-        let buf = &buf[0..len];
-        self.try_write_pagecache(offset, buf)
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = {
+            let len = core::cmp::min(len, buf.len());
+            let buf = &buf[0..len];
+            self.try_write_pagecache(offset, buf)
+        };
+        result.map_err(Into::into)
     }
 
     fn read_direct(
@@ -2543,14 +2552,14 @@ impl IndexNode for LockedFATInode {
         name: &str,
         file_type: FileType,
         _mode: InodeMode,
-    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+    ) -> Result<Arc<dyn IndexNode>, crate::mm::allocation::MemoryAllocationError> {
         // 由于FAT32不支持文件权限的功能，因此忽略mode参数
         let mut guard: MutexGuard<FATInode> = self.0.lock();
         let fs: &Arc<FATFileSystem> = &guard.fs.upgrade().unwrap();
 
         match &mut guard.inode_type {
             FATDirEntry::File(_) | FATDirEntry::VolId(_) => {
-                return Err(SystemError::ENOTDIR);
+                return Err(SystemError::ENOTDIR.into());
             }
             FATDirEntry::Dir(d) => match file_type {
                 FileType::File => {
@@ -2573,7 +2582,7 @@ impl IndexNode for LockedFATInode {
                     return Ok(child);
                 }
 
-                FileType::SymLink => return Err(SystemError::ENOSYS),
+                FileType::SymLink => return Err(SystemError::ENOSYS.into()),
 
                 FileType::Socket => {
                     d.create_file(name, fs)?;
@@ -2581,18 +2590,24 @@ impl IndexNode for LockedFATInode {
                     return Ok(guard.find(name)?);
                 }
 
-                _ => return Err(SystemError::EINVAL),
+                _ => return Err(SystemError::EINVAL.into()),
             },
             FATDirEntry::UnInit => {
                 error!("FATFS: param: Inode_type uninitialized.");
-                return Err(SystemError::EROFS);
+                return Err(SystemError::EROFS.into());
             }
         }
     }
 
     // fat32 does not support hard link
-    fn link(&self, _name: &str, _other: &Arc<dyn IndexNode>) -> Result<(), SystemError> {
-        Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
+    fn link(
+        &self,
+        _name: &str,
+        _other: &Arc<dyn IndexNode>,
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> =
+            Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        result.map_err(Into::into)
     }
 
     fn fs(&self) -> Arc<dyn FileSystem> {
@@ -2606,21 +2621,27 @@ impl IndexNode for LockedFATInode {
     fn metadata(&self) -> Result<Metadata, SystemError> {
         self.0.lock().metadata_with_allocated_blocks()
     }
-    fn set_metadata(&self, metadata: &Metadata) -> Result<(), SystemError> {
-        let inode = &mut self.0.lock();
-        inode.metadata.atime = metadata.atime;
-        inode.metadata.mtime = metadata.mtime;
-        inode.metadata.ctime = metadata.ctime;
-        inode.metadata.mode = metadata.mode;
-        inode.metadata.uid = metadata.uid;
-        inode.metadata.gid = metadata.gid;
-        Ok(())
+    fn set_metadata(
+        &self,
+        metadata: &Metadata,
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = {
+            let inode = &mut self.0.lock();
+            inode.metadata.atime = metadata.atime;
+            inode.metadata.mtime = metadata.mtime;
+            inode.metadata.ctime = metadata.ctime;
+            inode.metadata.mode = metadata.mode;
+            inode.metadata.uid = metadata.uid;
+            inode.metadata.gid = metadata.gid;
+            Ok(())
+        };
+        result.map_err(Into::into)
     }
     fn set_metadata_masked(
         &self,
         metadata: &Metadata,
         mask: SetMetadataMask,
-    ) -> Result<(), SystemError> {
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         let inode = &mut self.0.lock();
         crate::filesystem::vfs::merge_metadata_masked(&mut inode.metadata, metadata, mask);
         Ok(())
@@ -2630,82 +2651,85 @@ impl IndexNode for LockedFATInode {
         crate::filesystem::vfs::update_atime_locked(&mut inode.metadata, now, relatime);
         Ok(())
     }
-    fn resize(&self, len: usize) -> Result<(), SystemError> {
-        let _size_guard = self.1.write();
-        //检查是否超过fat支持的最大容量
-        if (len as u64) > MAX_FILE_SIZE {
-            return Err(SystemError::EFBIG);
-        }
-        let mut guard: MutexGuard<FATInode> = self.0.lock();
-        let fs: &Arc<FATFileSystem> = &guard.fs.upgrade().unwrap();
-        let old_size = guard.metadata.size as usize;
-        let page_cache = guard.page_cache.clone();
+    fn resize(&self, len: usize) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = (|| {
+            let _size_guard = self.1.write();
+            //检查是否超过fat支持的最大容量
+            if (len as u64) > MAX_FILE_SIZE {
+                return Err(SystemError::EFBIG);
+            }
+            let mut guard: MutexGuard<FATInode> = self.0.lock();
+            let fs: &Arc<FATFileSystem> = &guard.fs.upgrade().unwrap();
+            let old_size = guard.metadata.size as usize;
+            let page_cache = guard.page_cache.clone();
 
-        match &mut guard.inode_type {
-            FATDirEntry::File(file) | FATDirEntry::VolId(file) => {
-                // 如果新的长度和旧的长度相同，那么就直接返回
-                match len.cmp(&old_size) {
-                    Ordering::Equal => {
-                        return Ok(());
-                    }
-                    Ordering::Greater => {
-                        // 如果新的长度比旧的长度大，那么就在文件末尾添加空白
-                        let buf: Vec<u8> = vec![0u8; ZERO_BUF_SIZE];
+            match &mut guard.inode_type {
+                FATDirEntry::File(file) | FATDirEntry::VolId(file) => {
+                    // 如果新的长度和旧的长度相同，那么就直接返回
+                    match len.cmp(&old_size) {
+                        Ordering::Equal => {
+                            return Ok(());
+                        }
+                        Ordering::Greater => {
+                            // 如果新的长度比旧的长度大，那么就在文件末尾添加空白
+                            let buf: Vec<u8> = vec![0u8; ZERO_BUF_SIZE];
 
-                        let mut remain_size = len - old_size;
-                        let mut offset = old_size;
-                        while remain_size > 0 {
-                            let write_size = core::cmp::min(remain_size, ZERO_BUF_SIZE);
-                            file.write(fs, &buf[..write_size], offset as u64)?;
-                            remain_size -= write_size;
-                            offset += write_size;
-                        }
-                        // Unlike ordinary/O_SYNC writes, resize and mode-0
-                        // fallocate do not pass through File post-write sync.
-                        // Match Linux fat_cont_expand() only for IS_SYNC.
-                        guard.synchronize_metadata();
-                        guard.metadata.size = len as i64;
-                        let inode_sync = guard.metadata.flags.contains(InodeFlags::S_SYNC);
-                        let fs = fs.clone();
-                        drop(guard);
-                        let mounted_fs: Arc<dyn FileSystem> = fs.clone();
-                        if inode_sync || filesystem_is_synchronous(&mounted_fs) {
-                            fs.gendisk.sync()?;
-                        }
-                        return Ok(());
-                    }
-                    Ordering::Less => {
-                        guard.metadata.size = len as i64;
-                        drop(guard);
-                        if let Some(page_cache) = page_cache {
-                            if let Err(error) = page_cache.manager().resize(len) {
-                                self.0.lock().synchronize_metadata();
-                                return Err(error);
+                            let mut remain_size = len - old_size;
+                            let mut offset = old_size;
+                            while remain_size > 0 {
+                                let write_size = core::cmp::min(remain_size, ZERO_BUF_SIZE);
+                                file.write(fs, &buf[..write_size], offset as u64)?;
+                                remain_size -= write_size;
+                                offset += write_size;
                             }
-                        }
-                        let mut guard: MutexGuard<FATInode> = self.0.lock();
-                        let fs: &Arc<FATFileSystem> = &guard.fs.upgrade().unwrap();
-                        match &mut guard.inode_type {
-                            FATDirEntry::File(file) | FATDirEntry::VolId(file) => {
-                                let result = file.truncate(fs, len as u64);
-                                guard.synchronize_metadata();
-                                return result;
+                            // Unlike ordinary/O_SYNC writes, resize and mode-0
+                            // fallocate do not pass through File post-write sync.
+                            // Match Linux fat_cont_expand() only for IS_SYNC.
+                            guard.synchronize_metadata();
+                            guard.metadata.size = len as i64;
+                            let inode_sync = guard.metadata.flags.contains(InodeFlags::S_SYNC);
+                            let fs = fs.clone();
+                            drop(guard);
+                            let mounted_fs: Arc<dyn FileSystem> = fs.clone();
+                            if inode_sync || filesystem_is_synchronous(&mounted_fs) {
+                                fs.gendisk.sync()?;
                             }
-                            FATDirEntry::Dir(_) => return Err(SystemError::ENOSYS),
-                            FATDirEntry::UnInit => {
-                                error!("FATFS: param: Inode_type uninitialized.");
-                                return Err(SystemError::EROFS);
+                            return Ok(());
+                        }
+                        Ordering::Less => {
+                            guard.metadata.size = len as i64;
+                            drop(guard);
+                            if let Some(page_cache) = page_cache {
+                                if let Err(error) = page_cache.manager().resize(len) {
+                                    self.0.lock().synchronize_metadata();
+                                    return Err(error);
+                                }
+                            }
+                            let mut guard: MutexGuard<FATInode> = self.0.lock();
+                            let fs: &Arc<FATFileSystem> = &guard.fs.upgrade().unwrap();
+                            match &mut guard.inode_type {
+                                FATDirEntry::File(file) | FATDirEntry::VolId(file) => {
+                                    let result = file.truncate(fs, len as u64);
+                                    guard.synchronize_metadata();
+                                    return result;
+                                }
+                                FATDirEntry::Dir(_) => return Err(SystemError::ENOSYS),
+                                FATDirEntry::UnInit => {
+                                    error!("FATFS: param: Inode_type uninitialized.");
+                                    return Err(SystemError::EROFS);
+                                }
                             }
                         }
                     }
                 }
+                FATDirEntry::Dir(_) => return Err(SystemError::ENOSYS),
+                FATDirEntry::UnInit => {
+                    error!("FATFS: param: Inode_type uninitialized.");
+                    return Err(SystemError::EROFS);
+                }
             }
-            FATDirEntry::Dir(_) => return Err(SystemError::ENOSYS),
-            FATDirEntry::UnInit => {
-                error!("FATFS: param: Inode_type uninitialized.");
-                return Err(SystemError::EROFS);
-            }
-        }
+        })();
+        result.map_err(Into::into)
     }
 
     fn fallocate_resize_atomic(
@@ -2713,10 +2737,10 @@ impl IndexNode for LockedFATInode {
         _offset: usize,
         requested_end: usize,
         _lock_owner: u64,
-    ) -> Result<SetMetadataMask, SystemError> {
+    ) -> Result<SetMetadataMask, crate::mm::allocation::MemoryAllocationError> {
         let _size_guard = self.1.write();
         if requested_end as u64 > MAX_FILE_SIZE {
-            return Err(SystemError::EFBIG);
+            return Err(SystemError::EFBIG.into());
         }
         let mut guard = self.0.lock();
         let old_size = guard.metadata.size.max(0) as usize;
@@ -2736,8 +2760,8 @@ impl IndexNode for LockedFATInode {
                 // partially advanced i_size for a failed fallocate.
                 file.extend_zeroed(&fs, requested_end as u64, requested_end as u64)?;
             }
-            FATDirEntry::Dir(_) => return Err(SystemError::ENOSYS),
-            FATDirEntry::UnInit => return Err(SystemError::EROFS),
+            FATDirEntry::Dir(_) => return Err(SystemError::ENOSYS.into()),
+            FATDirEntry::UnInit => return Err(SystemError::EROFS.into()),
         }
         let (metadata, mut mask) =
             crate::filesystem::vfs::vcore::prepare_write_side_effect_metadata(
@@ -2767,14 +2791,14 @@ impl IndexNode for LockedFATInode {
         lock_owner: u64,
         attrib: &mut crate::filesystem::vfs::AttribStageObserver<'_>,
         data: MutexGuard<FilePrivateData>,
-    ) -> Result<(), SystemError> {
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         drop(data);
         crate::filesystem::vfs::vcore::resize_based_fallocate(
             self, mode, offset, len, lock_owner, attrib,
         )
     }
 
-    fn truncate(&self, len: usize) -> Result<(), SystemError> {
+    fn truncate(&self, len: usize) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         let guard: MutexGuard<FATInode> = self.0.lock();
         let old_size = guard.metadata.size as usize;
         if len < old_size {
@@ -2840,15 +2864,21 @@ impl IndexNode for LockedFATInode {
         &self,
         _data: MutexGuard<FilePrivateData>,
         _flags: &FileFlags,
-    ) -> Result<(), SystemError> {
-        return Ok(());
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = (|| {
+            return Ok(());
+        })();
+        result.map_err(Into::into)
     }
 
     fn close(&self, _data: MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
         return Ok(());
     }
 
-    fn unlink(&self, name: &str) -> Result<LinkRemovalOutcome, SystemError> {
+    fn unlink(
+        &self,
+        name: &str,
+    ) -> Result<LinkRemovalOutcome, crate::mm::allocation::MemoryAllocationError> {
         let mut guard = self.0.lock();
         let target = guard.find(name)?;
         let file_type = target.0.lock().metadata.file_type;
@@ -2859,7 +2889,7 @@ impl IndexNode for LockedFATInode {
         let fs = guard.fs.upgrade().ok_or(SystemError::EIO)?;
         let dir = match &guard.inode_type {
             FATDirEntry::Dir(dir) => dir,
-            _ => return Err(SystemError::ENOTDIR),
+            _ => return Err(SystemError::ENOTDIR.into()),
         };
         dir.check_existence(name, Some(false), fs.clone())?;
         target.remove_file_name(dir, fs, name)?;
@@ -2867,7 +2897,7 @@ impl IndexNode for LockedFATInode {
         Ok(LinkRemovalOutcome::LastLink)
     }
 
-    fn rmdir(&self, name: &str) -> Result<(), SystemError> {
+    fn rmdir(&self, name: &str) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         let mut guard: MutexGuard<FATInode> = self.0.lock();
         let target: Arc<LockedFATInode> = guard.find(name)?;
         // 对目标inode上锁，以防更改
@@ -2877,12 +2907,12 @@ impl IndexNode for LockedFATInode {
 
         let dir = match &guard.inode_type {
             FATDirEntry::File(_) | FATDirEntry::VolId(_) => {
-                return Err(SystemError::ENOTDIR);
+                return Err(SystemError::ENOTDIR.into());
             }
             FATDirEntry::Dir(d) => d,
             FATDirEntry::UnInit => {
                 error!("FATFS: param: Inode_type uninitialized.");
-                return Err(SystemError::EROFS);
+                return Err(SystemError::EROFS.into());
             }
         };
         // 检查文件夹是否存在
@@ -2906,7 +2936,7 @@ impl IndexNode for LockedFATInode {
                     guard.children.insert(to_search_name(name), target.clone());
                     drop(target_guard);
                 }
-                Err(r)
+                Err(r.into())
             }
         }
     }
@@ -2917,14 +2947,16 @@ impl IndexNode for LockedFATInode {
         target: &Arc<dyn IndexNode>,
         new_name: &str,
         flags: RenameFlags,
-    ) -> Result<RenameOutcome, SystemError> {
+    ) -> Result<RenameOutcome, crate::mm::allocation::MemoryAllocationError> {
         let old_id = self.metadata().unwrap().inode_id;
         let new_id = target.metadata().unwrap().inode_id;
         // 若在同一父目录下
         if old_id == new_id {
             self.rename_file_in_current_dir(old_name, new_name, flags)
+                .map_err(Into::into)
         } else {
             self.move_to_another_dir(old_name, new_name, target, flags)
+                .map_err(Into::into)
         }
     }
 
@@ -2978,10 +3010,10 @@ impl IndexNode for LockedFATInode {
         filename: &str,
         mode: InodeMode,
         _dev_t: DeviceNumber,
-    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+    ) -> Result<Arc<dyn IndexNode>, crate::mm::allocation::MemoryAllocationError> {
         let mut inode = self.0.lock();
         if inode.metadata.file_type != FileType::Dir {
-            return Err(SystemError::ENOTDIR);
+            return Err(SystemError::ENOTDIR.into());
         }
 
         let mode = if (mode.bits() & InodeMode::S_IFMT.bits()) == 0 {
@@ -3013,7 +3045,7 @@ impl IndexNode for LockedFATInode {
         if file_type == FileType::Pipe {
             nod.0.lock().metadata.file_type = FileType::Pipe;
             // 创建pipe文件
-            let pipe_inode = LockedPipeInode::new();
+            let pipe_inode = LockedPipeInode::new_fifo_shell();
             // 标记为命名管道（FIFO），这样 open 时才会应用 FIFO 阻塞语义
             pipe_inode.set_fifo();
             // 设置special_node
@@ -3027,7 +3059,7 @@ impl IndexNode for LockedFATInode {
             nod.0.lock().metadata.file_type = FileType::CharDevice;
             unimplemented!()
         } else {
-            return Err(SystemError::EINVAL);
+            return Err(SystemError::EINVAL.into());
         }
 
         let search_name = to_search_name(filename);

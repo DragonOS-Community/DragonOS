@@ -18,40 +18,114 @@ use super::{
 
 impl TaskGroup {
     /// Allocate an unpublished non-root group. Parent None denotes root.
-    pub(crate) fn new(parent: Option<Arc<TaskGroup>>) -> Arc<Self> {
-        let group = Arc::new_cyclic(|weak| {
-            let mut entities = Vec::with_capacity(PerCpu::MAX_CPU_NUM as usize);
-            let mut cfs = Vec::with_capacity(PerCpu::MAX_CPU_NUM as usize);
-            for cpu in 0..PerCpu::MAX_CPU_NUM as usize {
-                let rq = cpu_rq(cpu);
-                let leaf = Arc::new(CfsRunQueue::new());
-                leaf.force_mut().set_rq(Arc::downgrade(&rq));
-                leaf.force_mut().set_task_group(weak.clone());
-                let entity = FairSchedEntity::new();
-                let parent_entity = parent.as_ref().map(|tg| tg.entities[cpu].clone());
-                let parent_cfs = parent
-                    .as_ref()
-                    .map_or_else(|| rq.cfs_rq(), |tg| tg.cfs[cpu].clone());
-                entity
-                    .force_mut()
-                    .init_group(leaf.clone(), &parent_cfs, parent_entity.as_ref());
-                entities.push(entity);
-                cfs.push(leaf);
+    pub(crate) fn try_new(parent: Option<Arc<TaskGroup>>) -> Result<Arc<Self>, SystemError> {
+        let cpus = PerCpu::MAX_CPU_NUM as usize;
+        let mut entities = Vec::new();
+        let mut cfs = Vec::new();
+        entities
+            .try_reserve_exact(cpus)
+            .map_err(|_| SystemError::ENOMEM)?;
+        cfs.try_reserve_exact(cpus)
+            .map_err(|_| SystemError::ENOMEM)?;
+        for cpu in 0..cpus {
+            let rq = cpu_rq(cpu);
+            let leaf = Arc::try_new(CfsRunQueue::try_new().map_err(|_| SystemError::ENOMEM)?)
+                .map_err(|_| SystemError::ENOMEM)?;
+            // All entities/queues are still unpublished. No callback, rq list
+            // or registry can observe these initialization-only mutations.
+            leaf.force_mut().set_rq(Arc::downgrade(&rq));
+            let entity = FairSchedEntity::try_new().map_err(|_| SystemError::ENOMEM)?;
+            let parent_entity = parent.as_ref().map(|tg| tg.entities[cpu].clone());
+            let parent_cfs = parent
+                .as_ref()
+                .map_or_else(|| rq.cfs_rq(), |tg| tg.cfs[cpu].clone());
+            entity
+                .force_mut()
+                .init_group(leaf.clone(), &parent_cfs, parent_entity.as_ref());
+            entities.push(entity);
+            cfs.push(leaf);
+        }
+        let group = Arc::try_new(Self {
+            entities,
+            cfs,
+            parent,
+            shares: AtomicU64::new(LoadWeight::NICE_0_LOAD),
+            load_avg: AtomicU64::new(0),
+            idle: AtomicBool::new(false),
+            children: core::array::from_fn(|_| crate::libs::spinlock::SpinLock::new(Vec::new())),
+            bandwidth: crate::libs::lazy_init::Lazy::new(),
+            retired: AtomicBool::new(false),
+        })
+        .map_err(|_| SystemError::ENOMEM)?;
+        let weak = Arc::downgrade(&group);
+        let bandwidth = super::cfs_bandwidth::CfsBandwidth::try_new(weak.clone())
+            .map_err(|_| SystemError::ENOMEM)?;
+        group.bandwidth.init(bandwidth);
+        for leaf in &group.cfs {
+            leaf.force_mut().set_task_group(weak.clone());
+        }
+        // Parent registries are deliberately untouched until the entire
+        // controller transaction has prepared all groups and reserved capacity.
+        Ok(group)
+    }
+
+    pub(crate) fn reserve_parent_children(
+        parent: &Option<Arc<Self>>,
+        additional: usize,
+    ) -> Result<(), SystemError> {
+        if let Some(parent) = parent {
+            for children in &parent.children {
+                let proposed_capacity = {
+                    let children = children.lock_irqsave();
+                    let needed = children
+                        .len()
+                        .checked_add(additional)
+                        .ok_or(SystemError::ENOMEM)?;
+                    if needed <= children.capacity() {
+                        continue;
+                    }
+                    needed.max(children.len().checked_mul(2).ok_or(SystemError::ENOMEM)?)
+                };
+                // Kernel allocation may wake the reclaimer/scheduler. Never
+                // refill the registry while holding its IRQ lock (rq readers
+                // take rq -> children). UPDATE is the sole publisher; Drop
+                // only removes entries and never shrinks the backing storage.
+                let mut prepared = Vec::new();
+                if prepared.try_reserve_exact(proposed_capacity).is_err() {
+                    let children = children.lock_irqsave();
+                    if children
+                        .len()
+                        .checked_add(additional)
+                        .is_some_and(|needed| needed <= children.capacity())
+                    {
+                        continue;
+                    }
+                    return Err(SystemError::ENOMEM);
+                }
+                {
+                    let mut children = children.lock_irqsave();
+                    if children.len() + additional > children.capacity() {
+                        // No concurrent growth is possible under UPDATE, so
+                        // the proposal still fits even if Drop removed a child.
+                        for child in children.drain(..) {
+                            prepared.push(child);
+                        }
+                        core::mem::swap(&mut *children, &mut prepared);
+                    }
+                }
+                // The old empty backing (or unused proposal) is freed only
+                // after releasing the registry lock.
+                drop(prepared);
             }
-            Self {
-                entities,
-                cfs,
-                parent,
-                shares: AtomicU64::new(LoadWeight::NICE_0_LOAD),
-                load_avg: AtomicU64::new(0),
-                idle: AtomicBool::new(false),
-                children: core::array::from_fn(
-                    |_| crate::libs::spinlock::SpinLock::new(Vec::new()),
-                ),
-                bandwidth: super::cfs_bandwidth::CfsBandwidth::new(weak.clone()),
-                retired: AtomicBool::new(false),
-            }
-        });
+        }
+        Ok(())
+    }
+
+    /// UPDATE is the only registry growth owner. Prior batch reservation is
+    /// retained across remove/Drop (neither shrinks capacity), so publication
+    /// only moves preallocated references and cannot fail or allocate.
+    pub(crate) fn publish_parent(self: &Arc<Self>) {
+        let group = self;
         if let Some(parent) = &group.parent {
             for cpu in 0..PerCpu::MAX_CPU_NUM as usize {
                 let binding = cpu_rq(cpu);
@@ -63,10 +137,9 @@ impl TaskGroup {
                 }
                 parent.children[cpu]
                     .lock_irqsave()
-                    .push(Arc::downgrade(&group));
+                    .push(Arc::downgrade(group));
             }
         }
-        group
     }
 
     pub(crate) fn cfs_rq(&self, cpu: ProcessorId) -> Arc<CfsRunQueue> {

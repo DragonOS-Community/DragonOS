@@ -97,11 +97,13 @@ pub fn do_umount2(dirfd: i32, target: &str, flag: UmountFlag) -> Result<Arc<Moun
     }
 
     let (work, rest) = user_path_at(&ProcessManager::current_pcb(), dirfd, target)?;
-    let target_inode = work.lookup_follow_symlink2(
-        &rest,
-        VFS_MAX_FOLLOW_SYMLINK_TIMES,
-        !flag.contains(UmountFlag::UMOUNT_NOFOLLOW),
-    )?;
+    let target_inode = crate::filesystem::vfs::file::File::recover_io(|| {
+        work.lookup_follow_symlink2(
+            &rest,
+            VFS_MAX_FOLLOW_SYMLINK_TIMES,
+            !flag.contains(UmountFlag::UMOUNT_NOFOLLOW),
+        )
+    })?;
     if !may_mount() {
         return Err(SystemError::EPERM);
     }

@@ -191,13 +191,17 @@ fn must_copy_xattr(name: &str) -> bool {
         || name.starts_with(XATTR_SECURITY_PREFIX)
 }
 
-pub(super) fn remove_security_capability(inode: &Arc<dyn IndexNode>) -> Result<(), SystemError> {
+pub(super) fn remove_security_capability(
+    inode: &Arc<dyn IndexNode>,
+) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
     inode.remove_security_privileges()
 }
 
 /// Internal killpriv for a stacked overlay backing. Keep copy-up and backing
 /// credentials, but do not turn privilege removal into a CAP_SETFCAP request.
-pub(super) fn remove_security_privileges(inode: &OvlInode) -> Result<(), SystemError> {
+pub(super) fn remove_security_privileges(
+    inode: &OvlInode,
+) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
     let fs = inode.overlay_fs()?;
     let _privilege_guard = inode.content_privilege_lock.lock();
     if !inode.has_upper() {
@@ -209,7 +213,7 @@ pub(super) fn remove_security_privileges(inode: &OvlInode) -> Result<(), SystemE
         {
             Err(SystemError::ENODATA) => return Ok(()),
             Err(error) if is_unsupported(&error) => return Ok(()),
-            Err(error) => return Err(error),
+            Err(error) => return Err(error.into()),
             Ok(_) => {}
         }
     }
@@ -278,10 +282,10 @@ fn read_xattr_value(inode: &Arc<dyn IndexNode>, name: &str) -> Result<Vec<u8>, S
     Err(SystemError::ERANGE)
 }
 
-fn for_each_xattr_name(
+fn for_each_xattr_name<E: From<SystemError>>(
     list: &[u8],
-    mut visit: impl FnMut(&str) -> Result<(), SystemError>,
-) -> Result<(), SystemError> {
+    mut visit: impl FnMut(&str) -> Result<(), E>,
+) -> Result<(), E> {
     let mut offset = 0usize;
     while offset < list.len() {
         let relative_end = list[offset..]
@@ -289,7 +293,7 @@ fn for_each_xattr_name(
             .position(|byte| *byte == 0)
             .ok_or(SystemError::EIO)?;
         if relative_end == 0 {
-            return Err(SystemError::EIO);
+            return Err(SystemError::EIO.into());
         }
         let end = offset.checked_add(relative_end).ok_or(SystemError::E2BIG)?;
         let name = core::str::from_utf8(&list[offset..end]).map_err(|_| SystemError::EIO)?;
@@ -302,21 +306,25 @@ fn for_each_xattr_name(
 pub(super) fn copy_xattrs(
     lower: &Arc<dyn IndexNode>,
     upper: &Arc<dyn IndexNode>,
-) -> Result<(), SystemError> {
+) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
     let list = match read_xattr_list(lower) {
         Ok(list) => list,
         Err(err) if is_unsupported(&err) => return Ok(()),
-        Err(err) => return Err(err),
+        Err(err) => return Err(err.into()),
     };
 
-    for_each_xattr_name(&list, |name| {
+    for_each_xattr_name::<crate::mm::allocation::MemoryAllocationError>(&list, |name| {
         if is_private_xattr(name) {
             return Ok(());
         }
         let value = read_xattr_value(lower, name)?;
         match upper.setxattr(name, &value, XattrFlags::empty()) {
             Ok(_) => Ok(()),
-            Err(err) if is_unsupported(&err) && !must_copy_xattr(name) => Ok(()),
+            Err(crate::mm::allocation::MemoryAllocationError::System(err))
+                if is_unsupported(&err) && !must_copy_xattr(name) =>
+            {
+                Ok(())
+            }
             Err(err) => Err(err),
         }
     })
@@ -327,7 +335,7 @@ pub(super) fn prepare_origin(
     lower: &Arc<dyn IndexNode>,
     upper: &Arc<dyn IndexNode>,
     lower_metadata: &Metadata,
-) -> Result<Option<OvlOrigin>, SystemError> {
+) -> Result<Option<OvlOrigin>, crate::mm::allocation::MemoryAllocationError> {
     if lower_metadata.file_type != FileType::Dir && lower_metadata.nlinks > 1 {
         return Ok(None);
     }
@@ -349,7 +357,11 @@ pub(super) fn prepare_origin(
         // Some backings (notably the current ext4 symlink path) cannot store
         // xattrs. Fall back consistently to the upper identity rather than
         // claiming provenance that a later lookup cannot recover.
-        Err(err) if is_origin_xattr_unavailable(&err) => Ok(None),
+        Err(crate::mm::allocation::MemoryAllocationError::System(err))
+            if is_origin_xattr_unavailable(&err) =>
+        {
+            Ok(None)
+        }
         Err(err) => Err(err),
     }
 }
@@ -433,7 +445,7 @@ pub(super) fn resize_with_lock_owner(
     inode: &OvlInode,
     len: usize,
     lock_owner: u64,
-) -> Result<(), SystemError> {
+) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
     let fs = inode.overlay_fs()?;
     let _privilege_guard = inode.content_privilege_lock.lock();
     inode.copy_up_locked_for_truncate(len)?;
@@ -448,7 +460,7 @@ pub(super) fn set_metadata_masked(
     inode: &OvlInode,
     requested: &Metadata,
     mask: SetMetadataMask,
-) -> Result<(), SystemError> {
+) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
     if mask.is_empty() {
         return Ok(());
     }
@@ -472,7 +484,7 @@ fn prepare_upper_metadata(
     upper: &Arc<dyn IndexNode>,
     requested: &Metadata,
     mask: SetMetadataMask,
-) -> Result<Metadata, SystemError> {
+) -> Result<Metadata, crate::mm::allocation::MemoryAllocationError> {
     let mut upper_metadata = upper.metadata()?;
     merge_metadata_masked(&mut upper_metadata, requested, mask);
     Ok(upper_metadata)
@@ -484,7 +496,7 @@ pub(super) fn resize_with_metadata(
     lock_owner: u64,
     requested: &Metadata,
     mask: SetMetadataMask,
-) -> Result<(), SystemError> {
+) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
     let fs = inode.overlay_fs()?;
     let _privilege_guard = inode.content_privilege_lock.lock();
     check_metadata_mutation_permission(inode, requested, mask)?;
@@ -555,7 +567,7 @@ pub(super) fn resize_file(
     len: usize,
     lock_owner: u64,
     data: MutexGuard<FilePrivateData>,
-) -> Result<(), SystemError> {
+) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
     drop(data);
     resize_with_lock_owner(inode, len, lock_owner)
 }
@@ -567,7 +579,7 @@ pub(super) fn resize_file_with_metadata(
     data: MutexGuard<FilePrivateData>,
     requested: &Metadata,
     mask: SetMetadataMask,
-) -> Result<(), SystemError> {
+) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
     let fs = inode.overlay_fs()?;
     let _privilege_guard = inode.content_privilege_lock.lock();
     check_metadata_mutation_permission(inode, requested, mask)?;
@@ -600,12 +612,12 @@ pub(super) fn setxattr(
     name: &str,
     value: &[u8],
     flags: XattrFlags,
-) -> Result<usize, SystemError> {
+) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
     if is_private_xattr(name) {
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP.into());
     }
     if !caller_may_access_xattr(name) {
-        return Err(SystemError::EPERM);
+        return Err(SystemError::EPERM.into());
     }
     let fs = inode.overlay_fs()?;
     let _privilege_guard = inode.content_privilege_lock.lock();
@@ -627,7 +639,7 @@ pub(super) fn listxattr(inode: &OvlInode, buf: &mut [u8]) -> Result<usize, Syste
     let real = inode.current_realdata_inode()?.0;
     let list = read_xattr_list(&real)?;
     let mut filtered = Vec::with_capacity(list.len());
-    for_each_xattr_name(&list, |name| {
+    for_each_xattr_name::<SystemError>(&list, |name| {
         if is_private_xattr(name) || (!may_list_trusted && name.starts_with(XATTR_TRUSTED_PREFIX)) {
             return Ok(());
         }
@@ -646,12 +658,15 @@ pub(super) fn listxattr(inode: &OvlInode, buf: &mut [u8]) -> Result<usize, Syste
     Ok(filtered.len())
 }
 
-pub(super) fn removexattr(inode: &OvlInode, name: &str) -> Result<usize, SystemError> {
+pub(super) fn removexattr(
+    inode: &OvlInode,
+    name: &str,
+) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
     if is_private_xattr(name) {
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP.into());
     }
     if !caller_may_access_xattr(name) {
-        return Err(SystemError::EPERM);
+        return Err(SystemError::EPERM.into());
     }
     let fs = inode.overlay_fs()?;
     let _privilege_guard = inode.content_privilege_lock.lock();
@@ -669,7 +684,7 @@ pub(super) fn removexattr(inode: &OvlInode, name: &str) -> Result<usize, SystemE
     let _cred_guard = CredOverrideGuard::new(fs.backing_cred.clone())?;
     match upper.removexattr(name) {
         Ok(size) => Ok(size),
-        Err(err)
+        Err(crate::mm::allocation::MemoryAllocationError::System(err))
             if copied_up_for_remove && (err == SystemError::ENODATA || is_unsupported(&err)) =>
         {
             // Optional lower xattrs may be intentionally discarded when the
@@ -680,8 +695,8 @@ pub(super) fn removexattr(inode: &OvlInode, name: &str) -> Result<usize, SystemE
             match upper.getxattr(name, &mut []) {
                 Err(SystemError::ENODATA) => Ok(0),
                 Err(probe_err) if is_unsupported(&probe_err) => Ok(0),
-                Ok(_) => Err(err),
-                Err(probe_err) => Err(probe_err),
+                Ok(_) => Err(err.into()),
+                Err(probe_err) => Err(probe_err.into()),
             }
         }
         Err(err) => Err(err),

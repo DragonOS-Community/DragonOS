@@ -87,8 +87,11 @@ impl IndexNode for LockedZeroInode {
         &self,
         _data: MutexGuard<FilePrivateData>,
         _flags: &FileFlags,
-    ) -> Result<(), SystemError> {
-        return Ok(());
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = (|| {
+            return Ok(());
+        })();
+        result.map_err(Into::into)
     }
 
     fn close(&self, _data: MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
@@ -107,17 +110,23 @@ impl IndexNode for LockedZeroInode {
         Err(SystemError::ENOSYS)
     }
 
-    fn set_metadata(&self, metadata: &Metadata) -> Result<(), SystemError> {
-        let mut inode = self.0.lock();
-        inode.metadata.atime = metadata.atime;
-        inode.metadata.mtime = metadata.mtime;
-        inode.metadata.ctime = metadata.ctime;
-        inode.metadata.btime = metadata.btime;
-        inode.metadata.mode = metadata.mode;
-        inode.metadata.uid = metadata.uid;
-        inode.metadata.gid = metadata.gid;
+    fn set_metadata(
+        &self,
+        metadata: &Metadata,
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = (|| {
+            let mut inode = self.0.lock();
+            inode.metadata.atime = metadata.atime;
+            inode.metadata.mtime = metadata.mtime;
+            inode.metadata.ctime = metadata.ctime;
+            inode.metadata.btime = metadata.btime;
+            inode.metadata.mode = metadata.mode;
+            inode.metadata.uid = metadata.uid;
+            inode.metadata.gid = metadata.gid;
 
-        return Ok(());
+            return Ok(());
+        })();
+        result.map_err(Into::into)
     }
 
     fn update_atime(&self, now: PosixTimeSpec, relatime: bool) -> Result<(), SystemError> {
@@ -133,16 +142,19 @@ impl IndexNode for LockedZeroInode {
         len: usize,
         buf: &mut [u8],
         _data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError> {
-        if buf.len() < len {
-            return Err(SystemError::EINVAL);
-        }
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = (|| {
+            if buf.len() < len {
+                return Err(SystemError::EINVAL);
+            }
 
-        for itr in buf.iter_mut().take(len) {
-            *itr = 0;
-        }
+            for itr in buf.iter_mut().take(len) {
+                *itr = 0;
+            }
 
-        return Ok(len);
+            return Ok(len);
+        })();
+        result.map_err(Into::into)
     }
 
     /// 写设备 - 应该调用设备的函数读写，而不是通过文件系统读写
@@ -152,12 +164,15 @@ impl IndexNode for LockedZeroInode {
         len: usize,
         buf: &[u8],
         _data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError> {
-        if buf.len() < len {
-            return Err(SystemError::EINVAL);
-        }
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = (|| {
+            if buf.len() < len {
+                return Err(SystemError::EINVAL);
+            }
 
-        Ok(len)
+            Ok(len)
+        })();
+        result.map_err(Into::into)
     }
 
     fn mmap(&self, _start: usize, _len: usize, _offset: usize) -> Result<(), SystemError> {
@@ -176,7 +191,7 @@ impl IndexNode for LockedZeroInode {
         len: usize,
         _offset: usize,
         vm_flags: VmFlags,
-    ) -> Result<Arc<File>, SystemError> {
+    ) -> Result<Arc<File>, crate::mm::allocation::MemoryAllocationError> {
         if vm_flags.contains(VmFlags::VM_SHARED) {
             Ok(crate::filesystem::tmpfs::create_unlinked_shmem_file("dev/zero", len)?.file())
         } else {

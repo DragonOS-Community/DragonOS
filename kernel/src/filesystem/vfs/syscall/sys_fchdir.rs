@@ -39,8 +39,7 @@ impl Syscall for SysFchdirHandle {
             .read()
             .get_file_by_fd(fd)
             .ok_or(SystemError::EBADF)?;
-        let inode = file.inode();
-        let resolved = crate::filesystem::vfs::utils::ResolvedPath::new(inode)?;
+        let resolved = file.resolved_path()?;
         let inode = resolved.inode();
         let metadata = inode.metadata()?;
 
@@ -53,8 +52,6 @@ impl Syscall for SysFchdirHandle {
             PermissionMask::MAY_EXEC | PermissionMask::MAY_CHDIR,
         )?;
 
-        let path = inode.absolute_path()?;
-        pcb.basic_mut().set_cwd(path);
         pcb.fs_struct().set_pwd_resolved(resolved);
         return Ok(0);
     }

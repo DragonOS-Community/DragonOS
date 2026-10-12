@@ -74,12 +74,16 @@ pub fn do_renameat2(
     let (old_filename, old_parent_path) = rsplit_path(&old_remain_path);
     let old_parent_inode = match old_parent_path {
         None => old_inode_begin,
-        Some(p) => old_inode_begin.lookup_follow_symlink(p, VFS_MAX_FOLLOW_SYMLINK_TIMES)?,
+        Some(p) => crate::filesystem::vfs::file::File::recover_io(|| {
+            old_inode_begin.lookup_follow_symlink(p, VFS_MAX_FOLLOW_SYMLINK_TIMES)
+        })?,
     };
     let (new_filename, new_parent_path) = rsplit_path(&new_remain_path);
     let new_parent_inode = match new_parent_path {
         None => new_inode_begin,
-        Some(p) => new_inode_begin.lookup_follow_symlink(p, VFS_MAX_FOLLOW_SYMLINK_TIMES)?,
+        Some(p) => crate::filesystem::vfs::file::File::recover_io(|| {
+            new_inode_begin.lookup_follow_symlink(p, VFS_MAX_FOLLOW_SYMLINK_TIMES)
+        })?,
     };
 
     // Linux rejects rename across mount objects even when two bind mounts
@@ -160,14 +164,16 @@ pub fn do_renameat2(
             };
             notification.send();
         };
-        mounted.move_to_with_post_commit(
-            old_filename,
-            &new_parent_inode,
-            new_filename,
-            flags,
-            pre_commit,
-            notify,
-        )?;
+        super::super::file::File::recover_io(|| {
+            mounted.move_to_with_post_commit(
+                old_filename,
+                &new_parent_inode,
+                new_filename,
+                flags,
+                pre_commit,
+                notify,
+            )
+        })?;
     } else {
         let target = if flags.contains(RenameFlags::EXCHANGE) {
             exchange_new_inode.as_ref()
@@ -181,8 +187,9 @@ pub fn do_renameat2(
             &old_inode,
             target,
         )?;
-        let outcome =
-            old_parent_inode.move_to(old_filename, &new_parent_inode, new_filename, flags)?;
+        let outcome = super::super::file::File::recover_io(|| {
+            old_parent_inode.move_to(old_filename, &new_parent_inode, new_filename, flags)
+        })?;
         if outcome != crate::filesystem::vfs::RenameOutcome::NoOp {
             let target = if flags.contains(RenameFlags::EXCHANGE) {
                 exchange_new_inode.as_ref()

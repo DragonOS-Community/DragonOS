@@ -1,4 +1,5 @@
 use super::*;
+use crate::process::ProcessControlBlock;
 use core::sync::atomic::{AtomicBool, AtomicU8};
 
 #[cfg(target_arch = "x86_64")]
@@ -30,10 +31,26 @@ pub struct FileMappingWithFileArgs {
 }
 
 #[derive(Debug)]
+struct MemoryOwnerState {
+    task: Weak<ProcessControlBlock>,
+    /// Detect shared-task publication between candidate lookup and owner clear.
+    publication_sequence: u64,
+}
+
+#[derive(Debug)]
 pub struct AddressSpace {
+    data: crate::cgroup::memory::owned::OwnedBox<AddressSpaceData>,
+}
+
+/// Uniquely owned MM storage. Weak MM identities retain only the thin header;
+/// the actual allocation is freed before its objcg receipt at last strong drop.
+/// Dynamic trees and buffers have their own allocation lifetimes, not this one.
+#[derive(Debug)]
+pub struct AddressSpaceData {
     /// Globally unique address space ID, used to identify different address spaces
     /// This ID remains unchanged throughout the address space's lifecycle and is never reused
     id: u64,
+    oom_reap_slot: crate::mm::oom_reaper::OomReapSlot,
     /// Page table physical address (unchanged after creation, lock-free access)
     /// Used for fast page table switching in scheduler context without acquiring the RwSem lock
     table_paddr: PhysAddr,
@@ -72,6 +89,8 @@ pub struct AddressSpace {
     /// OOM waiters must not treat the earlier resident-page accounting decrement
     /// as reclaim progress.
     oom_reclaim_generation: AtomicU64,
+    /// Reaped private contents must never be recreated by a later fault.
+    pub(super) oom_unstable: AtomicBool,
     /// Explicit tear-down flag
     /// After the last active user exits/execs away, the mappings are already
     /// gone even if external references (e.g. a /proc/[pid]/mem fd) remain.
@@ -79,6 +98,10 @@ pub struct AddressSpace {
     torn_down: AtomicBool,
     /// Tasks that still have this address space installed and have not released it.
     user_count: AtomicUsize,
+    /// Allocation identity, not a fixed cgroup. Weak ownership avoids pinning
+    /// a task through its own mm; resolving it observes later task migration.
+    /// A prospective exec/fork mm can have an owner before task->mm installs it.
+    memory_owner: SpinLock<MemoryOwnerState>,
     /// Dumpability is an address-space property, matching Linux `mm_struct`.
     /// Threads sharing an mm must never observe different ptrace access state.
     dumpable: AtomicU8,
@@ -119,10 +142,19 @@ impl AddressSpace {
         self: &Arc<Self>,
         guard: &mut RwSemWriteGuard<'_, InnerAddressSpace>,
         publication: super::mremap::MremapExecPublication,
+        creator: &Arc<ObjectAccount>,
+        data_account: &Arc<crate::cgroup::memory::MemoryAccount>,
     ) -> MremapExecFallbacks {
         let mut fallbacks = MremapExecFallbacks { regions: [None; 2] };
         for (index, (vma, region)) in publication.ranges().enumerate() {
-            if super::uprobe::uprobe_apply_vma_range_locked(self, guard, vma, region) {
+            if super::uprobe::uprobe_apply_vma_range_locked(
+                self,
+                guard,
+                vma,
+                region,
+                creator,
+                data_account,
+            ) {
                 fallbacks.regions[index] = Some(region);
             }
         }
@@ -189,8 +221,11 @@ impl AddressSpace {
 
         let mut addr = start;
         let mut retried = false;
+        let mut charge_recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
         while addr.data() < end {
-            let (retry_wait, retry_flags) = {
+            let creator = crate::cgroup::memory::object_for_task(&ProcessManager::current_pcb());
+            let data_account = self.memory_account();
+            let (retry_wait, retry_flags, charge_failure) = {
                 let mut guard = self.write();
                 let Some(vma) = guard.mappings.contains(addr) else {
                     addr = VirtAddr::new(addr.data() + MMArch::PAGE_SIZE);
@@ -250,6 +285,8 @@ impl AddressSpace {
                         fault_flags,
                         &mut guard.user_mapper.utable,
                         self.clone(),
+                        creator.clone(),
+                        data_account.clone(),
                     );
                     PageFaultHandler::handle_mm_fault(message)
                 };
@@ -260,7 +297,7 @@ impl AddressSpace {
                     continue;
                 }
                 if outcome.reason.contains(VmFaultReason::VM_FAULT_RETRY) {
-                    (outcome.retry_wait, fault_flags)
+                    (outcome.retry_wait, fault_flags, outcome.charge_failure)
                 } else if outcome.reason.contains(VmFaultReason::VM_FAULT_OOM) {
                     return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
                 } else {
@@ -268,14 +305,39 @@ impl AddressSpace {
                 }
             };
 
+            if let Some(failure) = charge_failure {
+                crate::mm::fault::recover_fault_charge(
+                    failure,
+                    &mut charge_recovery,
+                    &data_account,
+                    retry_flags,
+                )?;
+                continue;
+            }
+
             // The write guard above is out of scope here.  This is the
             // required fault-retry boundary: a writeback snapshot holding a
             // PageCache invalidation read guard may now acquire the mm read
             // side and complete before this population retry blocks.
             if let Some(wait) = retry_wait {
-                if let Err(error) = wait.wait() {
+                let result = match wait.wait() {
+                    Err(crate::mm::allocation::MemoryAllocationError::Charge(failure)) => {
+                        crate::mm::fault::recover_fault_charge(
+                            failure,
+                            &mut charge_recovery,
+                            &data_account,
+                            retry_flags,
+                        )?;
+                        retried = true;
+                        continue;
+                    }
+                    Err(crate::mm::allocation::MemoryAllocationError::System(error)) => Err(error),
+                    Ok(()) => Ok(()),
+                };
+                if let Err(error) = result {
                     if !matches!(error, SystemError::EINTR | SystemError::ERESTARTSYS) {
                         crate::mm::fault::account_fault_result(
+                            &data_account,
                             retry_flags,
                             VmFaultReason::VM_FAULT_SIGBUS,
                         );
@@ -349,49 +411,279 @@ impl AddressSpace {
         create_stack: bool,
         user_ns: Arc<UserNamespace>,
         dumpable: u8,
+    ) -> Result<Arc<Self>, crate::mm::allocation::MemoryAllocationError> {
+        let creator = if ProcessManager::initialized() {
+            crate::cgroup::memory::object_for_task(&ProcessManager::current_pcb())
+        } else {
+            crate::cgroup::cgroup_root_node()
+                .effective_memory_generation()
+                .object_account
+        };
+        let prepared = crate::mm::oom_reaper::PreparedOomReapSlot::try_new(&creator)?;
+        Self::new_with_memory_owner(
+            create_stack,
+            user_ns,
+            dumpable,
+            Weak::new(),
+            &creator,
+            prepared,
+        )
+    }
+
+    pub(crate) fn new_for_task(
+        owner: &Arc<ProcessControlBlock>,
+        create_stack: bool,
+        user_ns: Arc<UserNamespace>,
+        dumpable: u8,
     ) -> Result<Arc<Self>, SystemError> {
-        let inner = InnerAddressSpace::new(false)?;
+        let mut recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
+        loop {
+            let creator = crate::cgroup::memory::object_for_task(&ProcessManager::current_pcb());
+            match Self::new_for_task_with_creator(
+                owner,
+                create_stack,
+                user_ns.clone(),
+                dumpable,
+                &creator,
+            ) {
+                Ok(mm) => return Ok(mm),
+                Err(error) => error.recover(&mut recovery)?,
+            }
+        }
+    }
+
+    pub(crate) fn new_for_task_with_creator(
+        owner: &Arc<ProcessControlBlock>,
+        create_stack: bool,
+        user_ns: Arc<UserNamespace>,
+        dumpable: u8,
+        creator: &Arc<crate::cgroup::memory::object::ObjectAccount>,
+    ) -> Result<Arc<Self>, crate::mm::allocation::MemoryAllocationError> {
+        let prepared = crate::mm::oom_reaper::PreparedOomReapSlot::try_new(creator)?;
+        Self::new_with_memory_owner(
+            create_stack,
+            user_ns,
+            dumpable,
+            Arc::downgrade(owner),
+            creator,
+            prepared,
+        )
+    }
+
+    fn new_with_memory_owner(
+        create_stack: bool,
+        user_ns: Arc<UserNamespace>,
+        dumpable: u8,
+        memory_owner: Weak<ProcessControlBlock>,
+        creator: &Arc<crate::cgroup::memory::object::ObjectAccount>,
+        prepared: crate::mm::oom_reaper::PreparedOomReapSlot,
+    ) -> Result<Arc<Self>, crate::mm::allocation::MemoryAllocationError> {
+        // Prepare actual body storage before PGD/resource creation or taking
+        // an MM lock. All rejection paths preserve admission provenance.
+        let body = crate::cgroup::memory::owned::OwnedBox::<AddressSpaceData>::prepare(
+            creator,
+            crate::cgroup::memory::accounting::KernelByteKind::SlabUnreclaimable,
+        )?
+        .try_allocate()
+        .map_err(|_| SystemError::ENOMEM)?;
+        let active_cpus = CpuMask::try_new().map_err(|_| SystemError::ENOMEM)?;
+        #[cfg(target_arch = "riscv64")]
+        let icache_stale_cpus = CpuMask::try_new().map_err(|_| SystemError::ENOMEM)?;
+        #[cfg(target_arch = "x86_64")]
+        let uprobe_list = UprobeSiteTable::try_new().map_err(|_| SystemError::ENOMEM)?;
+        let inner = InnerAddressSpace::new(false, Some(creator))?;
         let table_paddr = inner.user_mapper.utable.table().phys();
         let id = ADDRESS_SPACE_ID_ALLOCATOR.fetch_add(1, Ordering::Relaxed);
-        let result = Arc::new(Self {
+        let data = AddressSpaceData {
             id,
+            oom_reap_slot: prepared.bind(id),
             table_paddr,
-            active_cpus: SpinLock::new(CpuMask::new()),
+            active_cpus: SpinLock::new(active_cpus),
             #[cfg(target_arch = "riscv64")]
-            icache_stale_cpus: SpinLock::new(CpuMask::new()),
+            icache_stale_cpus: SpinLock::new(icache_stale_cpus),
             tlb_gen: AtomicU64::new(0),
             page_table_edit_lock: Mutex::new(()),
             resident_user_pages: AtomicUsize::new(0),
             peak_resident_user_pages: AtomicUsize::new(0),
             oom_reclaim_generation: AtomicU64::new(0),
+            oom_unstable: AtomicBool::new(false),
             torn_down: AtomicBool::new(false),
             // Baseline 1 stands for the first task installing this space (exec'd table or deep-copied child).
             // The IDLE space's baseline 1 has no task; it is a deliberate floor preventing tear-down.
             user_count: AtomicUsize::new(1),
+            memory_owner: SpinLock::new(MemoryOwnerState {
+                task: memory_owner,
+                publication_sequence: 0,
+            }),
             dumpable: AtomicU8::new(dumpable),
             user_ns: SpinLock::new(user_ns),
             exec_enforce_nondump: AtomicBool::new(false),
             inner: RwSem::new(inner),
             reservation_wait: WaitQueue::default(),
             #[cfg(target_arch = "x86_64")]
-            uprobe_list: UprobeSiteTable::new(),
+            uprobe_list,
             #[cfg(target_arch = "x86_64")]
             xol_pool: XolPool::new(),
             #[cfg(target_arch = "x86_64")]
             uprobe_page_state: SpinLock::new(BTreeMap::new()),
-        });
+        };
+        let result = Arc::try_new(Self {
+            data: body.init(data),
+        })
+        .map_err(|_| SystemError::ENOMEM)?;
         // Back-fill the Weak<AddressSpace> so that InnerAddressSpace methods can obtain
         // the outer Arc to construct MmuGather / initiate TLB shootdown.
         {
+            let data_account = result.memory_account();
             let mut g = result.inner.write();
             g.mm_id = id;
             g.outer = Arc::downgrade(&result);
             g.mappings.set_owner(Arc::downgrade(&result));
             if create_stack {
-                g.new_user_stack(UserStack::DEFAULT_USER_STACK_SIZE)?;
+                g.new_user_stack(
+                    UserStack::DEFAULT_USER_STACK_SIZE,
+                    Some(creator),
+                    &data_account,
+                )?;
             }
         }
         return Ok(result);
+    }
+
+    pub(crate) fn oom_reap_slot(&self) -> &crate::mm::oom_reaper::OomReapSlot {
+        &self.oom_reap_slot
+    }
+
+    /// Existing accounting debug fixture: allocate a real, never-installed MM
+    /// and keep only its Weak identity after last strong storage retirement.
+    pub(crate) fn debug_accounted_body_lifetime() -> Result<bool, SystemError> {
+        let account = crate::cgroup::memory::MemoryAccount::new(0, None)?;
+        let creator = crate::cgroup::memory::object::ObjectAccount::new(&account)?;
+        let current = ProcessManager::current_pcb();
+        let user_ns = current.cred().user_ns.clone();
+        let mm = match Self::new_for_task_with_creator(
+            &current,
+            false,
+            user_ns,
+            crate::process::cred::SUID_DUMP_DISABLE as u8,
+            &creator,
+        ) {
+            Ok(mm) => mm,
+            Err(MemoryAllocationError::System(error)) => return Err(error),
+            // An unlimited private fixture must not reject admission. This is
+            // a failed assertion, not production scope-to-errno conversion.
+            Err(MemoryAllocationError::Charge(_)) => return Ok(false),
+        };
+        let weak = Arc::downgrade(&mm);
+        let before = account.snapshot();
+        let body_bytes = crate::mm::allocator::kernel_allocator::allocation_footprint(
+            core::alloc::Layout::new::<AddressSpaceData>(),
+        );
+        let table_pages = mm.page_table_pages();
+        let mut ok = mm.active_cpus.lock().is_empty()
+            && table_pages > 0
+            && before.current > 0
+            && before.kernel_bytes
+                [crate::cgroup::memory::accounting::KernelByteKind::PageTables as usize]
+                == (table_pages * MMArch::PAGE_SIZE) as u64
+            && before.kernel_bytes
+                [crate::cgroup::memory::accounting::KernelByteKind::SlabUnreclaimable as usize]
+                >= body_bytes;
+        drop(mm);
+        let after = account.snapshot();
+        ok &= weak.upgrade().is_none()
+            && after.current == 0
+            && after.pagetables == 0
+            && after.kernel_object == 0
+            && after.kernel_bytes.iter().all(|bytes| *bytes == 0);
+        drop(weak);
+        ok &= account.snapshot().current == 0;
+        Ok(ok)
+    }
+
+    /// Resolve before entering charge admission. In particular do not require
+    /// owner.user_vm == self: Linux mm_alloc assigns the prospective exec mm's
+    /// owner while the same task still has its old image installed.
+    pub(crate) fn memory_account(&self) -> Arc<crate::cgroup::memory::MemoryAccount> {
+        let owner = self.memory_owner.lock_irqsave().task.clone();
+        match owner.upgrade() {
+            Some(owner) => crate::cgroup::memory::account_for_task(&owner),
+            None => crate::cgroup::cgroup_root_node().memory_account(),
+        }
+    }
+
+    /// Called after a task detaches this mm on exit or committed exec, outside
+    /// its task/basic/mm/page-table locks. Candidate task locking validates its
+    /// installed mm before publishing a new weak owner, like mm_update_next_owner.
+    pub(crate) fn replace_departing_memory_owner(
+        self: &Arc<Self>,
+        departing: &Arc<ProcessControlBlock>,
+    ) {
+        let departing_owner = Arc::downgrade(departing);
+        loop {
+            let sequence = {
+                let owner = self.memory_owner.lock_irqsave();
+                if !owner.task.ptr_eq(&departing_owner) {
+                    return;
+                }
+                owner.publication_sequence
+            };
+
+            // Like Linux mm_update_next_owner, avoid a registry walk for the
+            // last installed user. Publication racing this check either changes
+            // the sequence or adopts the cleared owner below.
+            let (candidate, contended) = if self.user_count() <= 1 {
+                (None, false)
+            } else {
+                ProcessManager::find_mm_owner_candidate(self, departing)
+            };
+            if let Some(candidate) = candidate {
+                let done = candidate.with_task_lock_irqsave(|| {
+                    if !candidate
+                        .basic()
+                        .user_vm()
+                        .is_some_and(|mm| Arc::ptr_eq(&mm, self))
+                    {
+                        return false;
+                    }
+                    let mut owner = self.memory_owner.lock_irqsave();
+                    if !owner.task.ptr_eq(&departing_owner) {
+                        return true;
+                    }
+                    if owner.publication_sequence != sequence {
+                        return false;
+                    }
+                    owner.task = Arc::downgrade(&candidate);
+                    true
+                });
+                if done {
+                    return;
+                }
+            } else if !contended {
+                let mut owner = self.memory_owner.lock_irqsave();
+                if !owner.task.ptr_eq(&departing_owner) {
+                    return;
+                }
+                if owner.publication_sequence == sequence {
+                    owner.task = Weak::new();
+                    return;
+                }
+            }
+            // A busy basic-info lock is not evidence that no task owns the mm.
+            // Retry with all registry, task and owner locks released.
+            crate::sched::sched_yield();
+        }
+    }
+
+    /// Complete CLONE_VM publication after the task is visible in the registry.
+    /// Only the owner lock is acquired: do not inspect task->mm here, since an
+    /// exec owner may temporarily switch to a prospective mm and roll back.
+    pub(crate) fn note_shared_task_published(&self, task: &Arc<ProcessControlBlock>) {
+        let mut owner = self.memory_owner.lock_irqsave();
+        owner.publication_sequence = owner.publication_sequence.wrapping_add(1);
+        if owner.task.strong_count() == 0 {
+            owner.task = Arc::downgrade(task);
+        }
     }
 
     #[inline]
@@ -688,9 +980,22 @@ impl AddressSpace {
         self.page_table_edit_lock.lock()
     }
 
+    pub(super) fn try_page_table_edit(&self) -> Option<MutexGuard<'_, ()>> {
+        self.page_table_edit_lock.try_lock().ok()
+    }
+
+    pub(crate) fn is_oom_unstable(&self) -> bool {
+        self.oom_unstable.load(Ordering::Acquire)
+    }
+
     #[inline(always)]
     pub fn resident_pages(&self) -> usize {
         self.resident_user_pages.load(Ordering::Relaxed)
+    }
+
+    /// Actual owned user page-table frames, including retained empty tables.
+    pub(crate) fn page_table_pages(&self) -> usize {
+        self.read().user_mapper.utable.owned_user_table_pages()
     }
 
     /// Like Linux get_mm_hiwater_rss(), include the current count while an
@@ -900,13 +1205,18 @@ impl AddressSpace {
         round_to_min: bool,
         allocate_at_once: bool,
     ) -> Result<VirtPageFrame, SystemError> {
+        let mut charge_recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
         let len = page_align_up(len);
         if map_flags.contains(MapFlags::MAP_SHARED) {
             if len == 0 {
                 return Err(SystemError::EINVAL);
             }
-            let file =
-                crate::filesystem::tmpfs::create_unlinked_shmem_file("dev/zero", len)?.file();
+            let file = loop {
+                match crate::filesystem::tmpfs::create_unlinked_shmem_file("dev/zero", len) {
+                    Ok(backing) => break backing.file(),
+                    Err(error) => error.recover(&mut charge_recovery)?,
+                }
+            };
             return self.file_mapping_with_file(
                 file,
                 start_vaddr,
@@ -919,6 +1229,8 @@ impl AddressSpace {
             );
         }
         loop {
+            let creator = crate::cgroup::memory::object_for_task(&ProcessManager::current_pcb());
+            let data_account = self.memory_account();
             let mut guard = self.write();
             let fixed_hint =
                 map_flags.intersects(MapFlags::MAP_FIXED | MapFlags::MAP_FIXED_NOREPLACE);
@@ -942,6 +1254,8 @@ impl AddressSpace {
                 map_flags,
                 round_to_min,
                 allocate_at_once,
+                Some(&creator),
+                &data_account,
                 |inner, ranges| {
                     #[cfg(target_arch = "x86_64")]
                     uprobe_changes.push(super::uprobe::PreparedUprobeChange::prepare(
@@ -960,7 +1274,8 @@ impl AddressSpace {
                         change.finish(self);
                     }
                     InnerAddressSpace::notify_close_notifications(failure.notifications);
-                    return Err(failure.err);
+                    failure.err.recover(&mut charge_recovery)?;
+                    continue;
                 }
             };
             // A normal lazy anonymous mmap has no post-commit work. Do not
@@ -1085,6 +1400,7 @@ impl AddressSpace {
         self: &Arc<Self>,
         args: FileMappingWithFileArgs,
     ) -> Result<VirtPageFrame, SystemError> {
+        let mut charge_recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
         let FileMappingWithFileArgs {
             file,
             start_vaddr,
@@ -1140,9 +1456,15 @@ impl AddressSpace {
         let page_count = PageFrameCount::from_bytes(len).unwrap();
         let may_write =
             !map_flags.contains(MapFlags::MAP_SHARED) || file_mode.contains(FileMode::FMODE_WRITE);
-        let vma_file = file.inode().mmap_effective_file(&file)?;
+        let vma_file = loop {
+            match file.inode().mmap_effective_file(&file) {
+                Ok(file) => break file,
+                Err(error) => error.recover(&mut charge_recovery)?,
+            }
+        };
 
         loop {
+            let creator = crate::cgroup::memory::object_for_task(&ProcessManager::current_pcb());
             let mut guard = self.write();
             let fixed_hint =
                 map_flags.intersects(MapFlags::MAP_FIXED | MapFlags::MAP_FIXED_NOREPLACE);
@@ -1157,7 +1479,9 @@ impl AddressSpace {
                         uprobe_change.finish(self);
                     }
                     InnerAddressSpace::notify_close_notifications(close_notifications);
-                    return Err($err);
+                    let error: MemoryAllocationError = ($err).into();
+                    error.recover(&mut charge_recovery)?;
+                    continue;
                 }};
             }
             if let Some(conflict_error) = fixed_noreplace_conflict_error_before_mmap_min.as_ref() {
@@ -1189,15 +1513,19 @@ impl AddressSpace {
             let page = match Self::round_mmap_hint(start_vaddr, round_to_min, fixed_hint) {
                 Some(vaddr) => {
                     let mmap_min = guard.mmap_min;
-                    match guard.find_free_at_prepare(mmap_min, vaddr, len, map_flags) {
+                    match guard.find_free_at_prepare(mmap_min, vaddr, len, map_flags, &creator) {
                         Ok(region) => VirtPageFrame::new(region.start()),
-                        Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
+                        Err(MemoryAllocationError::System(SystemError::EAGAIN_OR_EWOULDBLOCK)) => {
                             let region = VirtRegion::new(vaddr, len);
                             drop(guard);
                             self.wait_for_no_reservation_conflict(region);
                             continue;
                         }
-                        Err(err) => return Err(err),
+                        Err(err) => {
+                            drop(guard);
+                            err.recover(&mut charge_recovery)?;
+                            continue;
+                        }
                     }
                 }
                 None => {
@@ -1271,6 +1599,7 @@ impl AddressSpace {
                 let prepared = match guard.prepare_munmap(
                     VirtPageFrame::new(region.start()),
                     PageFrameCount::from_bytes(region.size()).unwrap(),
+                    &creator,
                 ) {
                     Ok(prepared) => prepared,
                     Err(failure) => {
@@ -1342,9 +1671,10 @@ impl AddressSpace {
             let file_mmap_opened = hook_result.is_ok();
             let (vma_file, hook_error) = match hook_result {
                 Ok(backing) => (backing, None),
-                Err(SystemError::ENOSYS) => (vma_file.clone(), None),
+                Err(MemoryAllocationError::System(SystemError::ENOSYS)) => (vma_file.clone(), None),
                 Err(err) => (vma_file.clone(), Some(err)),
             };
+            let data_account = self.memory_account();
             let mut guard = self.write();
             macro_rules! close_file_mmap_if_opened {
                 () => {
@@ -1388,7 +1718,8 @@ impl AddressSpace {
 
             if let Some(err) = hook_error {
                 cancel_reservation_and_unlock_pages!();
-                return Err(err);
+                err.recover(&mut charge_recovery)?;
+                continue;
             }
 
             let eager_cache =
@@ -1416,14 +1747,26 @@ impl AddressSpace {
             };
 
             let new_vma = if MMArch::PAGE_FAULT_ENABLED {
-                let vma = LockedVMA::new(VMA::new(
-                    region,
-                    vm_flags,
-                    entry_flags,
-                    Some(vma_file.clone()),
-                    Some(pgoff),
-                    false,
-                ));
+                let vma = match LockedVMA::try_new(
+                    VMA::new(
+                        region,
+                        vm_flags,
+                        entry_flags,
+                        Some(vma_file.clone()),
+                        Some(pgoff),
+                        false,
+                    ),
+                    &creator,
+                ) {
+                    Ok(vma) => vma,
+                    Err(error) => {
+                        drop(eager_invalidate);
+                        cancel_reservation_and_unlock_pages!();
+                        close_file_mmap_if_opened!();
+                        error.recover(&mut charge_recovery)?;
+                        continue;
+                    }
+                };
                 if let Some(sysv_shm) = sysv_shm.clone() {
                     vma.lock().set_sysv_shm(Some(sysv_shm));
                 }
@@ -1443,6 +1786,9 @@ impl AddressSpace {
                             vma_file.clone(),
                             cache,
                             pgoff,
+                            self,
+                            Some(&creator),
+                            &data_account,
                         )
                     } else {
                         VMA::zeroed(
@@ -1454,6 +1800,9 @@ impl AddressSpace {
                             &mut flusher,
                             Some(vma_file.clone()),
                             Some(pgoff),
+                            self,
+                            Some(&creator),
+                            &data_account,
                         )
                     }
                 };
@@ -1474,7 +1823,8 @@ impl AddressSpace {
                         drop(eager_invalidate);
                         cancel_reservation_and_unlock_pages!();
                         close_file_mmap_if_opened!();
-                        return Err(err);
+                        err.recover(&mut charge_recovery)?;
+                        continue;
                     }
                 }
             };
@@ -1537,8 +1887,13 @@ impl AddressSpace {
             // expose the mapping to userspace execution. Installation remains
             // best-effort and must not change a successful mmap result.
             #[cfg(target_arch = "x86_64")]
-            let uprobe_needs_fallback =
-                super::uprobe::uprobe_apply_new_vma_locked(self, &mut guard, &new_vma);
+            let uprobe_needs_fallback = super::uprobe::uprobe_apply_new_vma_locked(
+                self,
+                &mut guard,
+                &new_vma,
+                &creator,
+                &data_account,
+            );
 
             self.account_present_pages_add(new_present_pages);
             reservation.disarm();
@@ -1567,19 +1922,22 @@ impl AddressSpace {
         page_count: PageFrameCount,
     ) -> Result<(), SystemError> {
         let region = VirtRegion::new(start_page.virt_address(), page_count.bytes());
+        let mut charge_recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
         loop {
+            let creator = crate::cgroup::memory::object_for_task(&ProcessManager::current_pcb());
             let mut guard = self.write();
             if guard.mappings.first_reservation_conflict(region).is_some() {
                 drop(guard);
                 self.wait_for_no_reservation_conflict(region);
                 continue;
             }
-            let prepared = match guard.prepare_munmap(start_page, page_count) {
+            let prepared = match guard.prepare_munmap(start_page, page_count, &creator) {
                 Ok(prepared) => prepared,
                 Err(failure) => {
                     drop(guard);
                     InnerAddressSpace::notify_close_notifications(failure.notifications);
-                    return Err(failure.err);
+                    failure.err.recover(&mut charge_recovery)?;
+                    continue;
                 }
             };
             #[cfg(target_arch = "x86_64")]
@@ -1621,21 +1979,26 @@ impl AddressSpace {
         prot_flags: ProtFlags,
     ) -> Result<(), SystemError> {
         let region = VirtRegion::new(start_page.virt_address(), page_count.bytes());
+        let mut charge_recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
         loop {
+            let creator = crate::cgroup::memory::object_for_task(&ProcessManager::current_pcb());
+            let data_account = self.memory_account();
             let mut guard = self.write();
             if guard.mappings.first_reservation_conflict(region).is_some() {
                 drop(guard);
                 self.wait_for_no_reservation_conflict(region);
                 continue;
             }
-            let prepared = match guard.prepare_mprotect(start_page, page_count, prot_flags) {
-                Ok(prepared) => prepared,
-                Err(failure) => {
-                    drop(guard);
-                    InnerAddressSpace::notify_close_notifications(failure.notifications);
-                    return Err(failure.err);
-                }
-            };
+            let prepared =
+                match guard.prepare_mprotect(start_page, page_count, prot_flags, &creator) {
+                    Ok(prepared) => prepared,
+                    Err(failure) => {
+                        drop(guard);
+                        InnerAddressSpace::notify_close_notifications(failure.notifications);
+                        failure.err.recover(&mut charge_recovery)?;
+                        continue;
+                    }
+                };
             #[cfg(target_arch = "x86_64")]
             let validation_ranges = prepared.validation_ranges();
             #[cfg(target_arch = "x86_64")]
@@ -1659,7 +2022,8 @@ impl AddressSpace {
                 &uprobe_ranges,
             );
             #[cfg(target_arch = "x86_64")]
-            let uprobe_change = uprobe_change.finish_locked(self, &mut guard);
+            let uprobe_change =
+                uprobe_change.finish_locked(self, &mut guard, &creator, &data_account);
             #[cfg(target_arch = "x86_64")]
             guard.publish_mprotect_permissions(self, deferred_execute);
             drop(guard);
@@ -1678,7 +2042,10 @@ impl AddressSpace {
         behavior: MadvFlags,
     ) -> Result<(), SystemError> {
         let region = VirtRegion::new(start_page.virt_address(), page_count.bytes());
+        let mut charge_recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
         loop {
+            let creator = crate::cgroup::memory::object_for_task(&ProcessManager::current_pcb());
+            let data_account = self.memory_account();
             let mut guard = self.write();
             if guard.mappings.first_reservation_conflict(region).is_some() {
                 drop(guard);
@@ -1701,7 +2068,8 @@ impl AddressSpace {
                     &uprobe_ranges,
                 );
                 #[cfg(target_arch = "x86_64")]
-                let uprobe_change = uprobe_change.finish_locked(self, &mut guard);
+                let uprobe_change =
+                    uprobe_change.finish_locked(self, &mut guard, &creator, &data_account);
                 #[cfg(target_arch = "x86_64")]
                 uprobe_publication.publish(&mut guard, self);
                 drop(guard);
@@ -1709,9 +2077,15 @@ impl AddressSpace {
                 if let Some(uprobe_change) = uprobe_change {
                     uprobe_change.finish(self);
                 }
-                return result.map_err(|failure| failure.err);
+                match result {
+                    Ok(()) => return Ok(()),
+                    Err(failure) => {
+                        failure.err.recover(&mut charge_recovery)?;
+                        continue;
+                    }
+                }
             }
-            match guard.madvise_collect(start_page, page_count, behavior) {
+            match guard.madvise_collect(start_page, page_count, behavior, &creator) {
                 Ok(()) => {
                     drop(guard);
                     return Ok(());
@@ -1719,7 +2093,8 @@ impl AddressSpace {
                 Err(err) => {
                     drop(guard);
                     InnerAddressSpace::notify_close_notifications(err.notifications);
-                    return Err(err.err);
+                    err.err.recover(&mut charge_recovery)?;
+                    continue;
                 }
             }
         }
@@ -1751,7 +2126,10 @@ impl AddressSpace {
         mremap_flags: MremapFlags,
         new_vaddr: VirtAddr,
     ) -> Result<VirtAddr, SystemError> {
+        let mut charge_recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
         loop {
+            let creator = crate::cgroup::memory::object_for_task(&ProcessManager::current_pcb());
+            let data_account = self.memory_account();
             let mut guard = self.write();
             let mut wait_region = None;
             // A reservation cannot overlap a published source VMA. If the
@@ -1839,6 +2217,7 @@ impl AddressSpace {
                     flags: mremap_flags,
                     new_vaddr,
                 },
+                &creator,
                 |inner, ranges| {
                     #[cfg(target_arch = "x86_64")]
                     uprobe_changes.push(super::uprobe::PreparedUprobeChange::prepare(
@@ -1855,6 +2234,8 @@ impl AddressSpace {
                     let exec_fallbacks = self.finalize_mremap_exec_publication_locked(
                         &mut guard,
                         outcome.exec_publication,
+                        &creator,
+                        &data_account,
                     );
                     drop(guard);
                     #[cfg(target_arch = "x86_64")]
@@ -1876,11 +2257,18 @@ impl AddressSpace {
                     }
                     return Ok(outcome.addr);
                 }
-                Err(failure) if failure.err == SystemError::EAGAIN_OR_EWOULDBLOCK => {
+                Err(failure)
+                    if matches!(
+                        &failure.err,
+                        MemoryAllocationError::System(SystemError::EAGAIN_OR_EWOULDBLOCK)
+                    ) =>
+                {
                     #[cfg(target_arch = "x86_64")]
                     let exec_fallbacks = self.finalize_mremap_exec_publication_locked(
                         &mut guard,
                         failure.exec_publication,
+                        &creator,
+                        &data_account,
                     );
                     let retry_region = if mremap_flags.contains(MremapFlags::MREMAP_FIXED)
                         || (mremap_flags.contains(MremapFlags::MREMAP_DONTUNMAP)
@@ -1927,6 +2315,8 @@ impl AddressSpace {
                     let exec_fallbacks = self.finalize_mremap_exec_publication_locked(
                         &mut guard,
                         failure.exec_publication,
+                        &creator,
+                        &data_account,
                     );
                     drop(guard);
                     #[cfg(target_arch = "x86_64")]
@@ -1936,14 +2326,18 @@ impl AddressSpace {
                     #[cfg(target_arch = "x86_64")]
                     exec_fallbacks.finish(self);
                     InnerAddressSpace::notify_close_notifications(failure.notifications);
-                    return Err(failure.err);
+                    failure.err.recover(&mut charge_recovery)?;
+                    continue;
                 }
             }
         }
     }
 
     pub fn set_brk_wait(self: &Arc<Self>, new_addr: VirtAddr) -> Result<usize, SystemError> {
+        let mut charge_recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
         loop {
+            let creator = crate::cgroup::memory::object_for_task(&ProcessManager::current_pcb());
+            let data_account = self.memory_account();
             let mut guard = self.write();
 
             if new_addr < guard.brk_start || new_addr >= MMArch::USER_END_VADDR {
@@ -1970,11 +2364,12 @@ impl AddressSpace {
             }
 
             unsafe {
-                match guard.set_brk(new_brk) {
+                match guard.set_brk(new_brk, Some(&creator), &data_account) {
                     Ok(outcome) => {
                         let current_brk = guard.brk.data();
                         let post_commit_population = outcome.post_commit_population;
                         drop(guard);
+                        InnerAddressSpace::notify_close_notifications(outcome.notifications);
                         if let Some((region, expected_vma)) = post_commit_population {
                             let _ = self.populate_range_post_commit(
                                 region.start(),
@@ -1988,14 +2383,29 @@ impl AddressSpace {
                     }
                     // Linux brk(2) reports the current break, rather than an
                     // errno, when its requested growth cannot be committed.
-                    Err(_) => return Ok(guard.brk.data()),
+                    Err(failure) => {
+                        let old_brk = guard.brk.data();
+                        drop(guard);
+                        InnerAddressSpace::notify_close_notifications(failure.notifications);
+                        if matches!(&failure.err, MemoryAllocationError::System(_)) {
+                            return Ok(old_brk);
+                        }
+                        match failure.err.recover(&mut charge_recovery) {
+                            Ok(()) => continue,
+                            Err(SystemError::ENOMEM) => return Ok(old_brk),
+                            Err(error) => return Err(error),
+                        }
+                    }
                 }
             }
         }
     }
 
     pub fn sbrk_wait(self: &Arc<Self>, incr: isize) -> Result<VirtAddr, SystemError> {
+        let mut charge_recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
         loop {
+            let creator = crate::cgroup::memory::object_for_task(&ProcessManager::current_pcb());
+            let data_account = self.memory_account();
             let mut guard = self.write();
             if incr == 0 {
                 return Ok(guard.brk);
@@ -2023,10 +2433,19 @@ impl AddressSpace {
                 }
             }
 
-            let outcome = unsafe { guard.sbrk(incr) }?;
+            let outcome = match unsafe { guard.sbrk(incr, Some(&creator), &data_account) } {
+                Ok(outcome) => outcome,
+                Err(failure) => {
+                    drop(guard);
+                    InnerAddressSpace::notify_close_notifications(failure.notifications);
+                    failure.err.recover(&mut charge_recovery)?;
+                    continue;
+                }
+            };
             let post_commit_population = outcome.post_commit_population;
             let old_brk = outcome.old_brk;
             drop(guard);
+            InnerAddressSpace::notify_close_notifications(outcome.notifications);
             if let Some((region, expected_vma)) = post_commit_population {
                 let _ = self.populate_range_post_commit(
                     region.start(),
@@ -2041,14 +2460,61 @@ impl AddressSpace {
     }
 
     pub fn try_clone_wait(self: &Arc<Self>) -> Result<Arc<AddressSpace>, SystemError> {
+        self.try_clone_wait_for_task(&ProcessManager::current_pcb())
+    }
+
+    pub(crate) fn try_clone_wait_for_task(
+        self: &Arc<Self>,
+        owner: &Arc<ProcessControlBlock>,
+    ) -> Result<Arc<AddressSpace>, SystemError> {
+        let mut recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
         loop {
+            match self.try_clone_for_task(owner) {
+                Ok(child) => return Ok(child),
+                Err(error) => error.recover(&mut recovery)?,
+            }
+        }
+    }
+
+    /// One allocation attempt for callers retaining an outer transaction
+    /// (e.g. KVM ioctl). Never reclaim, invoke OOM or wait for memcg progress
+    /// here; the failed child and mapping guard retire before returning scope.
+    pub(crate) fn try_clone_for_task(
+        self: &Arc<Self>,
+        owner: &Arc<ProcessControlBlock>,
+    ) -> Result<Arc<AddressSpace>, MemoryAllocationError> {
+        loop {
+            let creator = crate::cgroup::memory::object_for_task(&ProcessManager::current_pcb());
+            // Like Linux dup_mm/mm_init, birth precedes taking the parent's
+            // mapping lock. This owner also pins rollback until after unlock.
+            let child = Self::new_for_task_with_creator(
+                owner,
+                false,
+                self.user_ns(),
+                self.dumpable(),
+                &creator,
+            )?;
+            let child_data_account = child.memory_account();
             let mut guard = self.write();
             if let Some(region) = guard.mappings.first_reservation_region() {
                 drop(guard);
+                drop(child);
                 self.wait_for_no_reservation_conflict(region);
                 continue;
             }
-            return guard.try_clone();
+            let result = guard.clone_into(&child, &creator, &child_data_account);
+            drop(guard);
+            match result {
+                Ok(()) => {
+                    #[cfg(target_arch = "x86_64")]
+                    super::uprobe::fork_inherit_uprobes(&child);
+                    return Ok(child);
+                }
+                Err(error) => {
+                    drop(child);
+                    return Err(error);
+                }
+            }
         }
     }
 }
@@ -2073,6 +2539,20 @@ impl Drop for AddressSpace {
 }
 
 impl core::ops::Deref for AddressSpace {
+    type Target = AddressSpaceData;
+
+    fn deref(&self) -> &Self::Target {
+        &self.data
+    }
+}
+
+impl core::ops::DerefMut for AddressSpace {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.data
+    }
+}
+
+impl core::ops::Deref for AddressSpaceData {
     type Target = RwSem<InnerAddressSpace>;
 
     fn deref(&self) -> &Self::Target {
@@ -2080,7 +2560,7 @@ impl core::ops::Deref for AddressSpace {
     }
 }
 
-impl core::ops::DerefMut for AddressSpace {
+impl core::ops::DerefMut for AddressSpaceData {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.inner
     }

@@ -372,19 +372,11 @@ impl Socket for TcpSocket {
     }
 
     fn send_buffer_size(&self) -> usize {
-        self.inner
-            .read()
-            .as_ref()
-            .expect("Tcp inner::Inner is None")
-            .send_buffer_size()
+        self.send_buf_size_loaded()
     }
 
     fn recv_buffer_size(&self) -> usize {
-        self.inner
-            .read()
-            .as_ref()
-            .expect("Tcp inner::Inner is None")
-            .recv_buffer_size()
+        self.recv_buf_size_loaded()
     }
 
     fn recv_bytes_available(&self) -> usize {
@@ -603,6 +595,9 @@ impl Socket for TcpSocket {
 }
 
 impl InetSocket for TcpSocket {
+    fn refill_tcp_listener(&self) {
+        self.refill_listener_once();
+    }
     fn prepare_tcp_syn(&self, local: smoltcp::wire::IpEndpoint, device: u32) {
         let mut inner = self.inner.write();
         if let Some(inner::Inner::Listening(listener)) = inner.as_mut() {

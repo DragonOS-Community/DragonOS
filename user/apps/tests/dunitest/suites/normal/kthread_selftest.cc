@@ -46,6 +46,17 @@ TEST(KthreadSelftest, CreateRunStopAndReapHandshakes) {
     const std::string report = ReadAll(kKthreadSelftestPath);
     ASSERT_FALSE(report.empty());
     EXPECT_NE(std::string::npos, report.find("status=ok\n")) << report;
+    // Unsupported clockevent platforms report explicit unavailability. On
+    // capable platforms these invoke the real queue generation/node-reuse and
+    // hardware fallback checks, rather than merely creating a userspace timer.
+    const bool deadline_unavailable =
+        report.find("deadline_generation=skip_unavailable\n") != std::string::npos;
+    if (deadline_unavailable) {
+        EXPECT_NE(std::string::npos, report.find("deadline_fallback=skip_unavailable\n")) << report;
+    } else {
+        EXPECT_NE(std::string::npos, report.find("deadline_generation=ok\n")) << report;
+        EXPECT_NE(std::string::npos, report.find("deadline_fallback=ok\n")) << report;
+    }
     EXPECT_NE(std::string::npos, report.find("pid_membership_lifetime=ok\n")) << report;
     EXPECT_NE(std::string::npos, report.find("task_destruction=ok\n")) << report;
     EXPECT_NE(std::string::npos, report.find("task_reaped=true remaining_owners=0\n")) << report;

@@ -263,8 +263,10 @@ impl IndexNode for UprobePerfEvent {
         _len: usize,
         _buf: &mut [u8],
         _data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize> {
-        Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
+    ) -> core::result::Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> =
+            Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        result.map_err(Into::into)
     }
 
     fn write_at(
@@ -273,8 +275,9 @@ impl IndexNode for UprobePerfEvent {
         _len: usize,
         _buf: &[u8],
         _data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize> {
-        Err(SystemError::EINVAL)
+    ) -> core::result::Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = Err(SystemError::EINVAL);
+        result.map_err(Into::into)
     }
 
     fn fs(&self) -> Arc<dyn FileSystem> {
@@ -411,13 +414,18 @@ pub fn perf_event_open_uprobe(args: PerfProbeArgs) -> Result<UprobePerfEvent> {
     // path → inode → page_cache (the inode rmap entry point)
     let caller = ProcessManager::current_pcb();
     let (start, remaining) = user_resolved_path_at(&caller, AtFlags::AT_FDCWD.bits(), &path)?;
-    let resolved = start
-        .inode()
-        .lookup_follow_symlink_owned(&start, &remaining, VFS_MAX_FOLLOW_SYMLINK_TIMES, true)
-        .map_err(|e| {
-            log::warn!("uprobe: failed to look up path {path}: {:?}", e);
-            e
-        })?;
+    let resolved = crate::filesystem::vfs::file::File::recover_io(|| {
+        start.inode().lookup_follow_symlink_owned(
+            &start,
+            &remaining,
+            VFS_MAX_FOLLOW_SYMLINK_TIMES,
+            true,
+        )
+    })
+    .map_err(|e| {
+        log::warn!("uprobe: failed to look up path {path}: {:?}", e);
+        e
+    })?;
     let inode = resolved.inode();
     inode.page_cache().ok_or_else(|| {
         log::warn!("uprobe: target {path} has no page cache (not a regular mapped file)");

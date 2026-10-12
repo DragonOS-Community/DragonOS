@@ -30,6 +30,7 @@ use crate::{
     time::PosixTimeSpec,
 };
 
+use crate::mm::allocation::MemoryAllocationError;
 use alloc::string::ToString;
 use alloc::{
     collections::BTreeMap,
@@ -485,6 +486,10 @@ impl LockedTmpfsInode {
 
     /// The primary caller retains this content guard across privilege removal,
     /// user-buffer faults and data publication; never reenter public write_at.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Preserve explicit write bounds, privilege stage and allocation provenance"
+    )]
     fn write_data_locked(
         &self,
         offset: usize,
@@ -492,7 +497,9 @@ impl LockedTmpfsInode {
         buf: &[u8],
         page_cache: &Arc<PageCache>,
         _content: &crate::libs::rwsem::RwSemReadGuard<'_, ()>,
-    ) -> Result<usize, SystemError> {
+        owner: &Arc<crate::cgroup::memory::MemoryAccount>,
+        creator: &Arc<crate::cgroup::memory::object::ObjectAccount>,
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
         let write_end = offset + permitted_len;
         let start_page_index = offset >> MMArch::PAGE_SHIFT;
         let end_page_index = (write_end - 1) >> MMArch::PAGE_SHIFT;
@@ -508,7 +515,10 @@ impl LockedTmpfsInode {
                 continue;
             }
 
-            let pin = match page_cache.manager().commit_overwrite_pinned(page_index) {
+            let pin = match page_cache
+                .manager()
+                .try_commit_overwrite_pinned(page_index, owner, creator)
+            {
                 Ok(pin) => pin,
                 Err(err) => {
                     if written == 0 {
@@ -533,7 +543,7 @@ impl LockedTmpfsInode {
             if let Err(err) = page_cache.mark_page_dirty_page_locked(page_index, &page_guard) {
                 page_guard.remove_flags(crate::mm::page::PageFlags::PG_DIRTY);
                 if written == 0 {
-                    return Err(err);
+                    return Err(err.into());
                 }
                 break;
             }
@@ -1328,7 +1338,7 @@ impl Tmpfs {
     }
 
     /// 原子地增加文件系统使用的大小
-    /// 返回Ok(())如果更新成功，Err(SystemError::ENOSPC)如果超过限制
+    /// 返回Ok(())如果更新成功，Err(SystemError::ENOSPC.into())如果超过限制
     /// 使用compare_exchange_weak循环确保并发安全
     fn increase_size(&self, size_diff: u64) -> Result<(), SystemError> {
         let size_limit = self.size_limit.read();
@@ -1391,9 +1401,9 @@ impl Tmpfs {
         mode: InodeMode,
         size: usize,
         memfd: Option<(Vec<u8>, u32)>,
-    ) -> Result<Arc<TmpfsShmemFile>, SystemError> {
+    ) -> Result<Arc<TmpfsShmemFile>, MemoryAllocationError> {
         if size > i64::MAX as usize {
-            return Err(SystemError::EOVERFLOW);
+            return Err(SystemError::EOVERFLOW.into());
         }
         // Logical size is not resident tmpfs quota. PageCache membership
         // reserves/releases actual pages, including creation failure rollback.
@@ -1441,11 +1451,12 @@ impl Tmpfs {
         let pc = new_tmpfs_page_cache(Arc::downgrade(&inode_dyn), backend, &Arc::downgrade(self))?;
         result.0.lock().page_cache = Some(pc.clone());
 
-        let file = Arc::new(File::new_pseudo(
+        let file = Arc::try_new(File::new_pseudo(
             inode_dyn,
             FileFlags::O_RDWR | FileFlags::O_LARGEFILE,
-        )?);
-        Ok(Arc::new(TmpfsShmemFile { file }))
+        )?)
+        .map_err(|_| SystemError::ENOMEM)?;
+        Ok(Arc::try_new(TmpfsShmemFile { file }).map_err(|_| SystemError::ENOMEM)?)
     }
 }
 
@@ -1461,7 +1472,7 @@ lazy_static! {
 pub fn create_unlinked_shmem_file(
     name: &str,
     size: usize,
-) -> Result<Arc<TmpfsShmemFile>, SystemError> {
+) -> Result<Arc<TmpfsShmemFile>, MemoryAllocationError> {
     INTERNAL_SHMEM_TMPFS.create_unlinked_shmem_inode(
         DName::from(name),
         InodeMode::S_IFREG | InodeMode::S_IRWXUGO,
@@ -1476,7 +1487,7 @@ pub fn create_memfd_file(
     user_name: Vec<u8>,
     allow_sealing: bool,
     noexec_seal: bool,
-) -> Result<Arc<File>, SystemError> {
+) -> Result<Arc<File>, MemoryAllocationError> {
     let initial_seals = if noexec_seal {
         F_SEAL_EXEC
     } else if allow_sealing {
@@ -1517,7 +1528,7 @@ impl MountableFileSystem for Tmpfs {
         value: &str,
         previous: Option<&FsconfigPreparedData>,
         owner: &UserNamespace,
-    ) -> Result<Option<FsconfigPreparedData>, SystemError> {
+    ) -> Result<Option<FsconfigPreparedData>, crate::mm::allocation::MemoryAllocationError> {
         let mut parsed = match previous {
             Some(data) => data
                 .downcast_ref::<TmpfsMountData>()
@@ -1533,7 +1544,8 @@ impl MountableFileSystem for Tmpfs {
         raw_data: Option<&str>,
         _source: &str,
         context: &FsCreationContext,
-    ) -> Result<Option<Arc<dyn FileSystemMakerData>>, SystemError> {
+    ) -> Result<Option<Arc<dyn FileSystemMakerData>>, crate::mm::allocation::MemoryAllocationError>
+    {
         let parsed = match &context.fsconfig_prepared {
             Some(data) => data
                 .downcast_ref::<TmpfsMountData>()
@@ -1565,7 +1577,10 @@ impl MountableFileSystem for Tmpfs {
     fn make_mount_data(
         raw_data: Option<&str>,
         _source: &str,
-    ) -> Result<Option<Arc<dyn FileSystemMakerData + 'static>>, SystemError> {
+    ) -> Result<
+        Option<Arc<dyn FileSystemMakerData + 'static>>,
+        crate::mm::allocation::MemoryAllocationError,
+    > {
         let parsed = TmpfsMountData::parse(raw_data, Some(&INIT_USER_NAMESPACE))?;
         Ok(Some(Arc::new(parsed)))
     }
@@ -1772,7 +1787,7 @@ impl IndexNode for LockedTmpfsInode {
         len: usize,
         offset: usize,
         vm_flags: crate::mm::VmFlags,
-    ) -> Result<Arc<File>, SystemError> {
+    ) -> Result<Arc<File>, crate::mm::allocation::MemoryAllocationError> {
         self.mmap(start, len, offset)?;
         self.memfd_map_open(vm_flags);
         Ok(file.clone())
@@ -1804,10 +1819,10 @@ impl IndexNode for LockedTmpfsInode {
         self.unpin_memfd_remote_write()
     }
 
-    fn truncate(&self, len: usize) -> Result<(), SystemError> {
+    fn truncate(&self, len: usize) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         let inode = self.0.lock();
         if inode.metadata.file_type == FileType::Dir {
-            return Err(SystemError::EINVAL);
+            return Err(SystemError::EINVAL.into());
         }
         drop(inode);
         // 复用 resize，保证扩展/收缩两侧逻辑一致
@@ -1822,16 +1837,16 @@ impl IndexNode for LockedTmpfsInode {
         &self,
         datasync: bool,
         _data: MutexGuard<FilePrivateData>,
-    ) -> Result<(), SystemError> {
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         match self.metadata()?.file_type {
             FileType::File | FileType::Dir => {
                 if datasync {
-                    self.datasync()
+                    self.datasync().map_err(Into::into)
                 } else {
-                    self.sync()
+                    self.sync().map_err(Into::into)
                 }
             }
-            _ => Err(SystemError::EINVAL),
+            _ => Err(SystemError::EINVAL.into()),
         }
     }
 
@@ -1841,7 +1856,7 @@ impl IndexNode for LockedTmpfsInode {
         end: usize,
         _datasync: bool,
         _data: MutexGuard<FilePrivateData>,
-    ) -> Result<(), SystemError> {
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         match self.metadata()?.file_type {
             FileType::File | FileType::Dir => {
                 if let Some(page_cache) = self.page_cache() {
@@ -1853,7 +1868,7 @@ impl IndexNode for LockedTmpfsInode {
                 }
                 Ok(())
             }
-            _ => Err(SystemError::EINVAL),
+            _ => Err(SystemError::EINVAL.into()),
         }
     }
 
@@ -1861,7 +1876,7 @@ impl IndexNode for LockedTmpfsInode {
         &self,
         _data: MutexGuard<FilePrivateData>,
         _mode: &super::vfs::file::FileFlags,
-    ) -> Result<(), SystemError> {
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         Ok(())
     }
 
@@ -1871,13 +1886,13 @@ impl IndexNode for LockedTmpfsInode {
         len: usize,
         buf: &mut [u8],
         _data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError> {
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
         if buf.len() < len {
-            return Err(SystemError::EINVAL);
+            return Err(SystemError::EINVAL.into());
         }
         let inode = self.0.lock();
         if inode.metadata.file_type == FileType::Dir {
-            return Err(SystemError::EISDIR);
+            return Err(SystemError::EISDIR.into());
         }
         let file_size = inode.metadata.size as usize;
         if let Some(target) = inode.inline_symlink.clone() {
@@ -1918,6 +1933,9 @@ impl IndexNode for LockedTmpfsInode {
         }
 
         let mut items: Vec<ReadItem> = Vec::new();
+        items
+            .try_reserve_exact(end_page_index - start_page_index + 1)
+            .map_err(|_| SystemError::ENOMEM)?;
         for page_index in start_page_index..=end_page_index {
             let page_start = page_index * MMArch::PAGE_SIZE;
             let page_end = page_start + MMArch::PAGE_SIZE;
@@ -1974,7 +1992,7 @@ impl IndexNode for LockedTmpfsInode {
         len: usize,
         buf: &[u8],
         data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError> {
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
         let mut publish = || {};
         let mut stage = super::vfs::WritePrivilegeStage::new(&mut publish);
         self.write_at_with_privilege_stage(offset, len, buf, data, &mut stage)
@@ -1987,7 +2005,7 @@ impl IndexNode for LockedTmpfsInode {
         buf: &[u8],
         data: MutexGuard<FilePrivateData>,
         stage: &mut super::vfs::WritePrivilegeStage<'_>,
-    ) -> Result<usize, SystemError> {
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
         self.write_at_with_inode_context(
             offset,
             len,
@@ -2006,7 +2024,7 @@ impl IndexNode for LockedTmpfsInode {
         data: MutexGuard<FilePrivateData>,
         context: &super::vfs::permission::InodeOpContext,
         stage: &mut super::vfs::WritePrivilegeStage<'_>,
-    ) -> Result<usize, SystemError> {
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
         self.write_primary_with_inode_context(
             offset,
             len,
@@ -2024,7 +2042,7 @@ impl IndexNode for LockedTmpfsInode {
         source: super::vfs::PrimaryWriteSource<'_, '_>,
         data: MutexGuard<FilePrivateData>,
         stage: &mut super::vfs::WritePrivilegeStage<'_>,
-    ) -> Result<usize, SystemError> {
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
         self.write_primary_with_inode_context(
             offset,
             len,
@@ -2043,25 +2061,33 @@ impl IndexNode for LockedTmpfsInode {
         _data: MutexGuard<FilePrivateData>,
         context: &super::vfs::permission::InodeOpContext,
         stage: &mut super::vfs::WritePrivilegeStage<'_>,
-    ) -> Result<usize, SystemError> {
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
         if let super::vfs::PrimaryWriteSource::Kernel(buffer) = &source {
             if buffer.len() < len {
-                return Err(SystemError::EINVAL);
+                return Err(SystemError::EINVAL.into());
             }
         }
         if len == 0 {
             return Ok(0);
         }
+        drop(_data);
+        let task = crate::process::ProcessManager::current_pcb();
+        let owner = crate::cgroup::memory::account_for_task(&task);
+        let creator = crate::cgroup::memory::object_for_task(&task);
         let content = self.1.read();
         let (page_cache, permitted_len) =
             self.prepare_primary_write_locked(offset, len, context, stage)?;
-        source.with_buffer(permitted_len, |buffer| {
+        // Returning the typed inner result also unwinds content and any outer
+        // append/copy-up guards before the caller may reclaim or wait.
+        source.write_chunks(permitted_len, |relative, buffer| {
             self.write_data_locked(
-                offset,
-                permitted_len.min(buffer.len()),
+                offset.checked_add(relative).ok_or(SystemError::EFBIG)?,
+                buffer.len(),
                 buffer,
                 &page_cache,
                 &content,
+                &owner,
+                &creator,
             )
         })
     }
@@ -2115,7 +2141,10 @@ impl IndexNode for LockedTmpfsInode {
             .ok_or(SystemError::EAGAIN_OR_EWOULDBLOCK)
     }
 
-    fn set_metadata(&self, metadata: &Metadata) -> Result<(), SystemError> {
+    fn set_metadata(
+        &self,
+        metadata: &Metadata,
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         let _guard = self.1.write();
         let mut inode = self.0.lock();
         self.check_exec_mode_change(inode.metadata.mode, metadata.mode)?;
@@ -2133,7 +2162,7 @@ impl IndexNode for LockedTmpfsInode {
         &self,
         metadata: &Metadata,
         mask: SetMetadataMask,
-    ) -> Result<(), SystemError> {
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         let _guard = self.1.write();
         let mut inode = self.0.lock();
         if mask.contains(SetMetadataMask::MODE) {
@@ -2146,7 +2175,7 @@ impl IndexNode for LockedTmpfsInode {
     fn update_metadata_masked(
         &self,
         update: &mut MetadataUpdate<'_>,
-    ) -> Result<SetMetadataMask, SystemError> {
+    ) -> Result<SetMetadataMask, crate::mm::allocation::MemoryAllocationError> {
         let _guard = self.1.write();
         let current = self.0.lock().metadata.clone();
         let (requested, mask) = update(&current)?;
@@ -2164,8 +2193,10 @@ impl IndexNode for LockedTmpfsInode {
         Ok(())
     }
 
-    fn resize(&self, len: usize) -> Result<(), SystemError> {
-        self.resize_with_operation(len, None).map(|_| ())
+    fn resize(&self, len: usize) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        self.resize_with_operation(len, None)
+            .map(|_| ())
+            .map_err(Into::into)
     }
 
     fn resize_with_metadata(
@@ -2174,7 +2205,7 @@ impl IndexNode for LockedTmpfsInode {
         lock_owner: u64,
         metadata: &Metadata,
         mask: SetMetadataMask,
-    ) -> Result<(), SystemError> {
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         self.resize_with_metadata_context(
             len,
             lock_owner,
@@ -2192,8 +2223,9 @@ impl IndexNode for LockedTmpfsInode {
         metadata: &Metadata,
         mask: SetMetadataMask,
         context: &crate::filesystem::vfs::permission::InodeOpContext,
-    ) -> Result<SetMetadataMask, SystemError> {
+    ) -> Result<SetMetadataMask, crate::mm::allocation::MemoryAllocationError> {
         self.resize_with_operation(len, Some((metadata, mask, context)))
+            .map_err(Into::into)
     }
 
     fn resize_file_with_metadata(
@@ -2203,7 +2235,7 @@ impl IndexNode for LockedTmpfsInode {
         data: MutexGuard<FilePrivateData>,
         metadata: &Metadata,
         mask: SetMetadataMask,
-    ) -> Result<(), SystemError> {
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         self.resize_file_with_metadata_context(
             len,
             lock_owner,
@@ -2223,7 +2255,7 @@ impl IndexNode for LockedTmpfsInode {
         metadata: &Metadata,
         mask: SetMetadataMask,
         context: &crate::filesystem::vfs::permission::InodeOpContext,
-    ) -> Result<SetMetadataMask, SystemError> {
+    ) -> Result<SetMetadataMask, crate::mm::allocation::MemoryAllocationError> {
         drop(data);
         self.resize_with_metadata_context(len, lock_owner, metadata, mask, context)
     }
@@ -2235,7 +2267,7 @@ impl IndexNode for LockedTmpfsInode {
         data: MutexGuard<FilePrivateData>,
         truncate: &crate::filesystem::vfs::OpenTruncateContext,
         context: &crate::filesystem::vfs::permission::InodeOpContext,
-    ) -> Result<SetMetadataMask, SystemError> {
+    ) -> Result<SetMetadataMask, crate::mm::allocation::MemoryAllocationError> {
         self.resize_file_with_metadata_context(
             len,
             lock_owner,
@@ -2252,7 +2284,7 @@ impl IndexNode for LockedTmpfsInode {
         lock_owner: u64,
         metadata: &Metadata,
         mask: SetMetadataMask,
-    ) -> Result<SetMetadataMask, SystemError> {
+    ) -> Result<SetMetadataMask, crate::mm::allocation::MemoryAllocationError> {
         self.resize_with_metadata_context(
             len,
             lock_owner,
@@ -2269,7 +2301,7 @@ impl IndexNode for LockedTmpfsInode {
         data: MutexGuard<FilePrivateData>,
         metadata: &Metadata,
         mask: SetMetadataMask,
-    ) -> Result<SetMetadataMask, SystemError> {
+    ) -> Result<SetMetadataMask, crate::mm::allocation::MemoryAllocationError> {
         self.resize_file_with_metadata_context(
             len,
             lock_owner,
@@ -2286,7 +2318,7 @@ impl IndexNode for LockedTmpfsInode {
         lock_owner: u64,
         data: MutexGuard<FilePrivateData>,
         truncate: &crate::filesystem::vfs::OpenTruncateContext,
-    ) -> Result<SetMetadataMask, SystemError> {
+    ) -> Result<SetMetadataMask, crate::mm::allocation::MemoryAllocationError> {
         self.resize_open_truncate_with_inode_context(
             len,
             lock_owner,
@@ -2304,7 +2336,7 @@ impl IndexNode for LockedTmpfsInode {
         lock_owner: u64,
         attrib: &mut crate::filesystem::vfs::AttribStageObserver<'_>,
         data: MutexGuard<FilePrivateData>,
-    ) -> Result<(), SystemError> {
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         self.fallocate_file_with_inode_context(
             mode,
             offset,
@@ -2325,29 +2357,29 @@ impl IndexNode for LockedTmpfsInode {
         attrib: &mut crate::filesystem::vfs::AttribStageObserver<'_>,
         data: MutexGuard<FilePrivateData>,
         context: &crate::filesystem::vfs::permission::InodeOpContext,
-    ) -> Result<(), SystemError> {
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         drop(data);
         const KEEP_SIZE: i32 = 0x01;
         const PUNCH_HOLE: i32 = 0x02;
         if mode != 0 && mode != KEEP_SIZE && mode != (KEEP_SIZE | PUNCH_HOLE) {
-            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP.into());
         }
         if len == 0 {
-            return Err(SystemError::EINVAL);
+            return Err(SystemError::EINVAL.into());
         }
         let end = offset.checked_add(len).ok_or(SystemError::EFBIG)?;
         if end > isize::MAX as usize {
-            return Err(SystemError::EFBIG);
+            return Err(SystemError::EFBIG.into());
         }
         crate::filesystem::vfs::vcore::check_file_size_limit(end)?;
 
-        let _size_guard = self.1.write();
         if mode & PUNCH_HOLE != 0 {
+            let _size_guard = self.1.write();
             let (page_cache, size) = {
                 let inode = self.0.lock();
                 if let Some(state) = self.3.as_ref() {
                     if state.lock().bits & (seals::F_SEAL_WRITE | seals::F_SEAL_FUTURE_WRITE) != 0 {
-                        return Err(SystemError::EPERM);
+                        return Err(SystemError::EPERM.into());
                     }
                 }
                 (
@@ -2364,50 +2396,64 @@ impl IndexNode for LockedTmpfsInode {
             let _ = lock_owner;
             return Ok(());
         }
-        let (page_cache, fs) = {
-            let inode = self.0.lock();
-            if let Some(state) = self.3.as_ref() {
-                if end > inode.metadata.size as usize && state.lock().bits & seals::F_SEAL_GROW != 0
-                {
-                    return Err(SystemError::EPERM);
+        let task = crate::process::ProcessManager::current_pcb();
+        let owner = crate::cgroup::memory::account_for_task(&task);
+        let creator = crate::cgroup::memory::object_for_task(&task);
+        let result = (|| -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+            let _size_guard = self.1.write();
+            let (page_cache, fs) = {
+                let inode = self.0.lock();
+                if let Some(state) = self.3.as_ref() {
+                    if end > inode.metadata.size as usize
+                        && state.lock().bits & seals::F_SEAL_GROW != 0
+                    {
+                        return Err(SystemError::EPERM.into());
+                    }
                 }
-            }
-            let page_cache = inode.page_cache.clone().ok_or(SystemError::EIO)?;
-            let fs = inode.fs.upgrade().ok_or(SystemError::EIO)?;
-            (page_cache, fs)
-        };
-        let first = offset >> MMArch::PAGE_SHIFT;
-        let last = (end - 1) >> MMArch::PAGE_SHIFT;
-        let missing_pages = page_cache.manager().missing_pages_in_range(first, last)?;
-        if fs
-            .available_pages()
-            .is_some_and(|available| missing_pages > available)
-        {
-            return Err(SystemError::ENOSPC);
-        }
-        page_cache.manager().preallocate_range(first, last)?;
-
-        // Linux shmem commits file_modified() only after allocation succeeds.
-        // Compute from the current metadata while holding the inode lock so a
-        // concurrent chmod cannot be overwritten by a pre-allocation snapshot.
-        let mode_changed = {
-            let mut inode = self.0.lock();
-            let effective_size = if mode & KEEP_SIZE != 0 {
-                inode.metadata.size.max(0) as usize
-            } else {
-                core::cmp::max(inode.metadata.size.max(0) as usize, end)
+                let page_cache = inode.page_cache.clone().ok_or(SystemError::EIO)?;
+                let fs = inode.fs.upgrade().ok_or(SystemError::EIO)?;
+                (page_cache, fs)
             };
-            inode.metadata.size = effective_size as i64;
-            tmpfs_fallocate_modified(&mut inode, context)
-        };
-        if mode_changed {
-            attrib.commit();
-        }
-        let _ = lock_owner;
-        Ok(())
+            let first = offset >> MMArch::PAGE_SHIFT;
+            let last = (end - 1) >> MMArch::PAGE_SHIFT;
+            let missing_pages = page_cache.manager().missing_pages_in_range(first, last)?;
+            if fs
+                .available_pages()
+                .is_some_and(|available| missing_pages > available)
+            {
+                return Err(SystemError::ENOSPC.into());
+            }
+            page_cache
+                .manager()
+                .try_preallocate_range(first, last, &owner, &creator)?;
+
+            // Linux shmem commits file_modified() only after allocation succeeds.
+            // Compute from the current metadata while holding the inode lock so a
+            // concurrent chmod cannot be overwritten by a pre-allocation snapshot.
+            let mode_changed = {
+                let mut inode = self.0.lock();
+                let effective_size = if mode & KEEP_SIZE != 0 {
+                    inode.metadata.size.max(0) as usize
+                } else {
+                    core::cmp::max(inode.metadata.size.max(0) as usize, end)
+                };
+                inode.metadata.size = effective_size as i64;
+                tmpfs_fallocate_modified(&mut inode, context)
+            };
+            if mode_changed {
+                attrib.commit();
+            }
+            let _ = lock_owner;
+            Ok(())
+        })();
+        result
     }
 
-    fn symlink(&self, name: &str, target: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
+    fn symlink(
+        &self,
+        name: &str,
+        target: &str,
+    ) -> Result<Arc<dyn IndexNode>, crate::mm::allocation::MemoryAllocationError> {
         self.symlink_with_context(
             name,
             target,
@@ -2420,7 +2466,7 @@ impl IndexNode for LockedTmpfsInode {
         name: &str,
         target: &str,
         context: &crate::filesystem::vfs::permission::InodeOpContext,
-    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+    ) -> Result<Arc<dyn IndexNode>, crate::mm::allocation::MemoryAllocationError> {
         const SHORT_SYMLINK_LEN: usize = 128;
 
         if target
@@ -2429,14 +2475,17 @@ impl IndexNode for LockedTmpfsInode {
             .ok_or(SystemError::ENAMETOOLONG)?
             > MMArch::PAGE_SIZE
         {
-            return Err(SystemError::ENAMETOOLONG);
+            return Err(SystemError::ENAMETOOLONG.into());
         }
 
+        let task = crate::process::ProcessManager::current_pcb();
+        let owner = crate::cgroup::memory::account_for_task(&task);
+        let creator = crate::cgroup::memory::object_for_task(&task);
         let name = DName::from(name);
         let mut parent = self.0.lock();
         tmpfs_require_live_dir(&parent)?;
         if parent.children.contains_key(&name) {
-            return Err(SystemError::EEXIST);
+            return Err(SystemError::EEXIST.into());
         }
         crate::filesystem::vfs::permission::check_parent_create(&parent.metadata, context, false)?;
         let init = crate::filesystem::vfs::permission::child_inode_init_with_context(
@@ -2487,7 +2536,13 @@ impl IndexNode for LockedTmpfsInode {
             ));
             let page_cache = new_tmpfs_page_cache(Arc::downgrade(&inode_dyn), backend, &parent.fs)?;
             result.0.lock().page_cache = Some(page_cache.clone());
-            let page = page_cache.manager().commit_overwrite(0)?;
+            // This private child is not visible until its target exists.
+            // Admission is fast-only here; a typed failure unwinds the parent
+            // transaction before the syscall's outer recovery can run.
+            let pin = page_cache
+                .manager()
+                .try_commit_overwrite_pinned(0, &owner, &creator)?;
+            let page = pin.page();
             let mut page_guard = page.write();
             unsafe {
                 page_guard.as_slice_mut()[..target.len()].copy_from_slice(target.as_bytes());
@@ -2495,7 +2550,7 @@ impl IndexNode for LockedTmpfsInode {
             page_guard.add_flags(crate::mm::page::PageFlags::PG_DIRTY);
             if let Err(error) = page_cache.mark_page_dirty_page_locked(0, &page_guard) {
                 page_guard.remove_flags(crate::mm::page::PageFlags::PG_DIRTY);
-                return Err(error);
+                return Err(error.into());
             }
         }
 
@@ -2510,7 +2565,7 @@ impl IndexNode for LockedTmpfsInode {
         file_type: FileType,
         mode: InodeMode,
         data: usize,
-    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+    ) -> Result<Arc<dyn IndexNode>, crate::mm::allocation::MemoryAllocationError> {
         self.create_with_data_context(
             name,
             file_type,
@@ -2526,7 +2581,7 @@ impl IndexNode for LockedTmpfsInode {
         file_type: FileType,
         mode: InodeMode,
         context: &crate::filesystem::vfs::permission::InodeOpContext,
-    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+    ) -> Result<Arc<dyn IndexNode>, crate::mm::allocation::MemoryAllocationError> {
         self.create_with_data_context(name, file_type, mode, 0, context)
     }
 
@@ -2535,7 +2590,7 @@ impl IndexNode for LockedTmpfsInode {
         name: &str,
         mode: InodeMode,
         context: &crate::filesystem::vfs::permission::InodeOpContext,
-    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+    ) -> Result<Arc<dyn IndexNode>, crate::mm::allocation::MemoryAllocationError> {
         self.create_with_context(name, FileType::Dir, mode, context)
     }
 
@@ -2546,12 +2601,12 @@ impl IndexNode for LockedTmpfsInode {
         mode: InodeMode,
         data: usize,
         context: &crate::filesystem::vfs::permission::InodeOpContext,
-    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+    ) -> Result<Arc<dyn IndexNode>, crate::mm::allocation::MemoryAllocationError> {
         let name = DName::from(name);
         let mut inode = self.0.lock();
         tmpfs_require_live_dir(&inode)?;
         if inode.children.contains_key(&name) {
-            return Err(SystemError::EEXIST);
+            return Err(SystemError::EEXIST.into());
         }
         crate::filesystem::vfs::permission::check_parent_create(&inode.metadata, context, false)?;
         let init = crate::filesystem::vfs::permission::child_inode_init_with_context(
@@ -2689,7 +2744,11 @@ impl IndexNode for LockedTmpfsInode {
         super::vfs::UnlinkedFile::new(inode_dyn)
     }
 
-    fn link(&self, name: &str, other: &Arc<dyn IndexNode>) -> Result<(), SystemError> {
+    fn link(
+        &self,
+        name: &str,
+        other: &Arc<dyn IndexNode>,
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         self.link_with_inode_context(
             name,
             other,
@@ -2702,7 +2761,7 @@ impl IndexNode for LockedTmpfsInode {
         name: &str,
         other: &Arc<dyn IndexNode>,
         context: &crate::filesystem::vfs::permission::InodeOpContext,
-    ) -> Result<(), SystemError> {
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         // downcast 用于获取类型特定功能（跨文件系统检查已在 VFS 层完成）
         let other: &LockedTmpfsInode = other
             .downcast_ref::<LockedTmpfsInode>()
@@ -2713,10 +2772,10 @@ impl IndexNode for LockedTmpfsInode {
 
         tmpfs_require_live_dir(&inode)?;
         if other_locked.metadata.file_type == FileType::Dir {
-            return Err(SystemError::EISDIR);
+            return Err(SystemError::EISDIR.into());
         }
         if inode.children.contains_key(&name) {
-            return Err(SystemError::EEXIST);
+            return Err(SystemError::EEXIST.into());
         }
 
         crate::filesystem::vfs::permission::check_parent_create(&inode.metadata, context, false)?;
@@ -2726,7 +2785,7 @@ impl IndexNode for LockedTmpfsInode {
         )?;
 
         if other_locked.metadata.nlinks == 0 && !other_locked.tmpfile_linkable {
-            return Err(SystemError::ENOENT);
+            return Err(SystemError::ENOENT.into());
         }
 
         inode
@@ -2740,11 +2799,15 @@ impl IndexNode for LockedTmpfsInode {
         Ok(())
     }
 
-    fn unlink(&self, name: &str) -> Result<LinkRemovalOutcome, SystemError> {
+    fn unlink(
+        &self,
+        name: &str,
+    ) -> Result<LinkRemovalOutcome, crate::mm::allocation::MemoryAllocationError> {
         self.unlink_with_operation_context(
             name,
             &crate::filesystem::vfs::permission::InodeOpContext::legacy(),
         )
+        .map_err(Into::into)
     }
 
     fn unlink_with_inode_context(
@@ -2752,16 +2815,18 @@ impl IndexNode for LockedTmpfsInode {
         name: &str,
         mutation: &crate::filesystem::vfs::mount::DentryMutationContext<'_>,
         context: &crate::filesystem::vfs::permission::InodeOpContext,
-    ) -> Result<LinkRemovalOutcome, SystemError> {
+    ) -> Result<LinkRemovalOutcome, crate::mm::allocation::MemoryAllocationError> {
         mutation.ensure_locked();
         self.unlink_with_operation_context(name, context)
+            .map_err(Into::into)
     }
 
-    fn rmdir(&self, name: &str) -> Result<(), SystemError> {
+    fn rmdir(&self, name: &str) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         self.rmdir_with_operation_context(
             name,
             &crate::filesystem::vfs::permission::InodeOpContext::legacy(),
         )
+        .map_err(Into::into)
     }
 
     fn rmdir_with_inode_context(
@@ -2769,9 +2834,10 @@ impl IndexNode for LockedTmpfsInode {
         name: &str,
         mutation: &crate::filesystem::vfs::mount::DentryMutationContext<'_>,
         context: &crate::filesystem::vfs::permission::InodeOpContext,
-    ) -> Result<(), SystemError> {
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         mutation.ensure_locked();
         self.rmdir_with_operation_context(name, context)
+            .map_err(Into::into)
     }
 
     fn move_to(
@@ -2780,7 +2846,7 @@ impl IndexNode for LockedTmpfsInode {
         target: &Arc<dyn IndexNode>,
         new_name: &str,
         flags: RenameFlags,
-    ) -> Result<RenameOutcome, SystemError> {
+    ) -> Result<RenameOutcome, crate::mm::allocation::MemoryAllocationError> {
         self.move_with_inode_context(
             old_name,
             target,
@@ -2788,6 +2854,7 @@ impl IndexNode for LockedTmpfsInode {
             flags,
             &crate::filesystem::vfs::permission::InodeOpContext::legacy(),
         )
+        .map_err(Into::into)
     }
 
     fn move_to_with_inode_context(
@@ -2798,9 +2865,10 @@ impl IndexNode for LockedTmpfsInode {
         flags: RenameFlags,
         mutation: &crate::filesystem::vfs::mount::DentryMutationContext<'_>,
         context: &crate::filesystem::vfs::permission::InodeOpContext,
-    ) -> Result<RenameOutcome, SystemError> {
+    ) -> Result<RenameOutcome, crate::mm::allocation::MemoryAllocationError> {
         mutation.ensure_locked();
         self.move_with_inode_context(old_name, target, new_name, flags, context)
+            .map_err(Into::into)
     }
 
     fn find(&self, name: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
@@ -2910,7 +2978,7 @@ impl IndexNode for LockedTmpfsInode {
         filename: &str,
         mode: InodeMode,
         dev_t: DeviceNumber,
-    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+    ) -> Result<Arc<dyn IndexNode>, crate::mm::allocation::MemoryAllocationError> {
         self.mknod_with_context(
             filename,
             mode,
@@ -2925,7 +2993,7 @@ impl IndexNode for LockedTmpfsInode {
         mode: InodeMode,
         dev_t: DeviceNumber,
         context: &crate::filesystem::vfs::permission::InodeOpContext,
-    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+    ) -> Result<Arc<dyn IndexNode>, crate::mm::allocation::MemoryAllocationError> {
         let mut inode = self.0.lock();
         tmpfs_require_live_dir(&inode)?;
 
@@ -2939,7 +3007,7 @@ impl IndexNode for LockedTmpfsInode {
 
         let filename = DName::from(filename);
         if inode.children.contains_key(&filename) {
-            return Err(SystemError::EEXIST);
+            return Err(SystemError::EEXIST.into());
         }
 
         // 确定文件类型
@@ -2948,7 +3016,7 @@ impl IndexNode for LockedTmpfsInode {
             FileType::CharDevice => FileType::CharDevice,
             FileType::BlockDevice => FileType::BlockDevice,
             FileType::Socket => FileType::Socket,
-            _ => return Err(SystemError::EINVAL),
+            _ => return Err(SystemError::EINVAL.into()),
         };
         crate::filesystem::vfs::permission::check_parent_create(&inode.metadata, context, false)?;
         let init = crate::filesystem::vfs::permission::child_inode_init_with_context(
@@ -2993,7 +3061,7 @@ impl IndexNode for LockedTmpfsInode {
 
         // 对于 FIFO，需要创建实际的 pipe inode
         if mode.contains(InodeMode::S_IFIFO) {
-            let pipe_inode = LockedPipeInode::new();
+            let pipe_inode = LockedPipeInode::new_fifo_shell();
             pipe_inode.set_fifo();
             nod.0.lock().special_node = Some(SpecialNodeData::Pipe(pipe_inode));
         }

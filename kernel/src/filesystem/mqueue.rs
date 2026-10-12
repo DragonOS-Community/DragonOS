@@ -104,7 +104,10 @@ impl MountableFileSystem for MqueueFs {
     fn make_mount_data(
         _raw_data: Option<&str>,
         _source: &str,
-    ) -> Result<Option<Arc<dyn FileSystemMakerData + 'static>>, SystemError> {
+    ) -> Result<
+        Option<Arc<dyn FileSystemMakerData + 'static>>,
+        crate::mm::allocation::MemoryAllocationError,
+    > {
         Ok(None)
     }
 
@@ -124,8 +127,9 @@ impl IndexNode for MqueueRootInode {
         _len: usize,
         _buf: &mut [u8],
         _data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError> {
-        Err(SystemError::EISDIR)
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = Err(SystemError::EISDIR);
+        result.map_err(Into::into)
     }
 
     fn write_at(
@@ -134,8 +138,9 @@ impl IndexNode for MqueueRootInode {
         _len: usize,
         _buf: &[u8],
         _data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError> {
-        Err(SystemError::EISDIR)
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = Err(SystemError::EISDIR);
+        result.map_err(Into::into)
     }
 
     fn find(&self, name: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
@@ -177,7 +182,8 @@ impl IndexNode for MqueueRootInode {
         _name: &str,
         _file_type: FileType,
         _mode: InodeMode,
-    ) -> Result<Arc<dyn IndexNode>, SystemError> {
-        Err(SystemError::ENOSYS)
+    ) -> Result<Arc<dyn IndexNode>, crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = Err(SystemError::ENOSYS);
+        result.map_err(Into::into)
     }
 }

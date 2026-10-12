@@ -55,10 +55,13 @@ impl InnerAddressSpace {
         vma_bytes.saturating_add(self.mappings.reservation_usage_bytes())
     }
 
-    pub fn new(_create_stack: bool) -> Result<Self, SystemError> {
+    pub(crate) fn new(
+        _create_stack: bool,
+        creator: Option<&Arc<crate::cgroup::memory::object::ObjectAccount>>,
+    ) -> Result<Self, crate::mm::allocation::MemoryAllocationError> {
         let result = Self {
             mm_id: 0,
-            user_mapper: MMArch::setup_new_usermapper()?,
+            user_mapper: MMArch::setup_new_usermapper(creator)?,
             mappings: UserMappings::new(),
             locked_vm: 0,
             mlock_future: VmFlags::VM_NONE,
@@ -85,16 +88,20 @@ impl InnerAddressSpace {
     ///
     /// Returns an Arc pointer to the new cloned address space
     #[inline(never)]
-    pub fn try_clone(&mut self) -> Result<Arc<AddressSpace>, SystemError> {
+    pub(crate) fn clone_into(
+        &mut self,
+        new_addr_space: &Arc<AddressSpace>,
+        creator: &Arc<crate::cgroup::memory::object::ObjectAccount>,
+        data_account: &Arc<crate::cgroup::memory::MemoryAccount>,
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         if self.mappings.first_reservation_region().is_some() {
-            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK.into());
         }
 
         let parent_mm = self
             .outer
             .upgrade()
             .expect("InnerAddressSpace::try_clone called before AddressSpace::new finished");
-        let new_addr_space = AddressSpace::new(false, parent_mm.user_ns(), parent_mm.dumpable())?;
         let mut new_guard = new_addr_space.write();
 
         // The parent mm may be shared by multiple threads (CLONE_VM / CLONE_THREAD), meaning threads running on other CPUs
@@ -127,7 +134,7 @@ impl InnerAddressSpace {
         let mut parent_cow_remaps: Vec<(VirtAddr, EntryFlags<MMArch>)> = Vec::new();
         let mut child_present_pages = 0usize;
 
-        let clone_result: Result<(), SystemError> = (|| {
+        let clone_result = (|| -> Result<(), crate::mm::allocation::MemoryAllocationError> {
             // Iterate over each VMA of the parent process and perform appropriate copying based on VMA attributes
             // Reference Linux: https://code.dragonos.org.cn/xref/linux-6.6.21/mm/memory.c#copy_page_range
             for vma in self.mappings.vmas.iter() {
@@ -150,7 +157,7 @@ impl InnerAddressSpace {
                 // Create new VMA
                 let mut child_vma = vma_guard.clone_info_only();
                 child_vma.vm_flags &= VmFlags::VM_LOCKED_CLEAR_MASK;
-                let new_vma = LockedVMA::new(child_vma);
+                let new_vma = LockedVMA::try_new(child_vma, creator)?;
                 new_guard.mappings.insert_vma(new_vma.clone());
                 drop(vma_guard);
 
@@ -159,7 +166,7 @@ impl InnerAddressSpace {
                         if let Some(removed) = new_guard.mappings.remove_vma(&region) {
                             removed.lock().set_mapped(false);
                         }
-                        return Err(err);
+                        return Err(err.into());
                     }
                 }
 
@@ -202,10 +209,15 @@ impl InnerAddressSpace {
                                             page_flags
                                         };
                                     if new_mapper
-                                        .map_phys(current_page, phys_addr, child_flags)
+                                        .try_map_phys(
+                                            current_page,
+                                            phys_addr,
+                                            child_flags,
+                                            Some(creator),
+                                        )?
                                         .is_none()
                                     {
-                                        return Err(SystemError::ENOMEM);
+                                        return Err(SystemError::ENOMEM.into());
                                     }
                                 } else {
                                     let cow_flags = page_flags.set_write(false);
@@ -221,10 +233,15 @@ impl InnerAddressSpace {
                                     }
 
                                     if new_mapper
-                                        .map_phys(current_page, phys_addr, cow_flags)
+                                        .try_map_phys(
+                                            current_page,
+                                            phys_addr,
+                                            cow_flags,
+                                            Some(creator),
+                                        )?
                                         .is_none()
                                     {
-                                        return Err(SystemError::ENOMEM);
+                                        return Err(SystemError::ENOMEM.into());
                                     }
                                 }
                                 if let Some(page) = page_manager_guard.get(&phys_addr) {
@@ -249,8 +266,9 @@ impl InnerAddressSpace {
             #[cfg(target_arch = "x86_64")]
             super::uprobe::fork_restore_inherited_uprobes_locked(
                 &parent_mm,
-                &new_addr_space,
+                new_addr_space,
                 &mut new_guard,
+                data_account,
             )?;
             Ok(())
         })();
@@ -283,10 +301,7 @@ impl InnerAddressSpace {
         // child mm above. Replay currently enabled, permitted consumers after
         // releasing the child lock; concurrent registry scans are idempotent
         // under the same mm.write() serialization domain.
-        #[cfg(target_arch = "x86_64")]
-        super::uprobe::fork_inherit_uprobes(&new_addr_space);
-
-        return Ok(new_addr_space);
+        return Ok(());
     }
 
     /// Check if the stack can be extended
@@ -310,7 +325,9 @@ impl InnerAddressSpace {
     pub(crate) fn extend_stack(
         &mut self,
         mut bytes: usize,
-    ) -> Result<Option<LockedPopulationRequest>, SystemError> {
+        creator: Option<&Arc<ObjectAccount>>,
+        data_account: &Arc<crate::cgroup::memory::MemoryAccount>,
+    ) -> Result<Option<LockedPopulationRequest>, MemoryAllocationError> {
         // log::debug!("extend user stack");
 
         // Layout
@@ -345,6 +362,8 @@ impl InnerAddressSpace {
             map_flags,
             false,
             false,
+            creator,
+            data_account,
         )?;
         self.user_stack.as_mut().unwrap().mapped_size = new_mapped_size;
         let post_commit_population = self.mappings.contains(extend_stack_start).and_then(|vma| {

@@ -1,4 +1,5 @@
 use super::*;
+use crate::cgroup::memory::{accounting::KernelByteKind, owned::OwnedBox};
 use crate::filesystem::vfs::VmaOpenRollback;
 
 /// Classification of a present user PTE in a VMA.
@@ -22,7 +23,7 @@ pub struct LockedVMA {
     /// Stable identity of the logical mapping across VMA splits.
     lineage_id: u64,
     state_seq: AtomicU64,
-    vma: Mutex<VMA>,
+    vma: OwnedBox<Mutex<VMA>>,
 }
 
 impl core::hash::Hash for LockedVMA {
@@ -41,6 +42,41 @@ impl Eq for LockedVMA {}
 
 #[allow(dead_code)]
 impl LockedVMA {
+    /// Existing page-cache selftest entry uses an unpublished, truly allocated
+    /// VMA body. No PTE/rmap state is fabricated by this lifetime assertion.
+    pub(crate) fn debug_accounted_body_lifetime() -> Result<bool, MemoryAllocationError> {
+        let account = crate::cgroup::memory::MemoryAccount::new(0, None)?;
+        let creator = ObjectAccount::new(&account)?;
+        let vma = Self::try_new(
+            VMA::new(
+                VirtRegion::new(VirtAddr::new(MMArch::PAGE_SIZE), MMArch::PAGE_SIZE),
+                VmFlags::VM_NONE,
+                EntryFlags::new(),
+                None,
+                None,
+                false,
+            ),
+            &creator,
+        )?;
+        let weak = Arc::downgrade(&vma);
+        let before = account.snapshot();
+        let bytes = crate::mm::allocator::kernel_allocator::allocation_footprint(
+            core::alloc::Layout::new::<Mutex<VMA>>(),
+        );
+        let mut ok = before.current == bytes.div_ceil(MMArch::PAGE_SIZE as u64)
+            && before.kernel_object == before.current
+            && before.kernel_bytes[KernelByteKind::SlabUnreclaimable as usize] == bytes;
+        drop(vma);
+        let after = account.snapshot();
+        ok &= weak.upgrade().is_none()
+            && after.current == 0
+            && after.kernel_object == 0
+            && after.kernel_bytes.iter().all(|bytes| *bytes == 0);
+        drop(weak);
+        ok &= account.snapshot().current == 0;
+        Ok(ok)
+    }
+
     pub(crate) fn classify_present_pfn(
         page_manager: &mut PageManager,
         paddr: PhysAddr,
@@ -56,21 +92,43 @@ impl LockedVMA {
         PresentPfn::External
     }
 
-    pub fn new(vma: VMA) -> Arc<Self> {
-        let lineage_id = LOCKEDVMA_LINEAGE_ID_ALLOCATOR.fetch_add(1, Ordering::Relaxed);
-        assert_ne!(lineage_id, 0, "LockedVMA lineage ID overflow");
-        Self::new_with_lineage(vma, lineage_id)
+    pub(crate) fn try_new(
+        mut vma: VMA,
+        creator: &Arc<ObjectAccount>,
+    ) -> Result<Arc<Self>, MemoryAllocationError> {
+        // This value is not published yet. Failed admission must not make its
+        // destructor mistake inherited source state for a live new mapping.
+        let mapped = vma.mapped;
+        vma.mapped = false;
+        let lineage_id = LOCKEDVMA_LINEAGE_ID_ALLOCATOR
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .map_err(|_| SystemError::EOVERFLOW)?;
+        let result = Self::try_new_with_lineage(vma, lineage_id, creator)?;
+        result.lock().mapped = mapped;
+        Ok(result)
     }
 
-    fn new_with_lineage(vma: VMA, lineage_id: u64) -> Arc<Self> {
-        let r = Arc::new(Self {
-            id: LOCKEDVMA_ID_ALLOCATOR.lock().alloc().unwrap(),
+    fn try_new_with_lineage(
+        vma: VMA,
+        lineage_id: u64,
+        creator: &Arc<ObjectAccount>,
+    ) -> Result<Arc<Self>, MemoryAllocationError> {
+        let id = LOCKEDVMA_ID_ALLOCATOR
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .map_err(|_| SystemError::EOVERFLOW)?;
+        let vma = OwnedBox::prepare(creator, KernelByteKind::SlabUnreclaimable)
+            .map_err(MemoryAllocationError::Charge)?
+            .try_init(Mutex::new(vma))
+            .map_err(|_| SystemError::ENOMEM)?;
+        let r = Arc::try_new(Self {
+            id,
             lineage_id,
             state_seq: AtomicU64::new(0),
-            vma: Mutex::new(vma),
-        });
+            vma,
+        })
+        .map_err(|_| SystemError::ENOMEM)?;
         r.vma.lock().self_ref = Arc::downgrade(&r);
-        r
+        Ok(r)
     }
 
     pub fn id(&self) -> usize {
@@ -93,20 +151,48 @@ impl LockedVMA {
         return self.vma.lock();
     }
 
+    pub(super) fn try_lock(&self) -> Option<MutexGuard<'_, VMA>> {
+        self.vma.try_lock().ok()
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "Failed preparation returns the actual retirement obligations without a new allocation"
+    )]
     pub(super) fn prepare_split_lifecycle(
         &self,
         intersection: VirtRegion,
+        creator: &Arc<ObjectAccount>,
     ) -> Result<VmaSplitLifecycle, VmaSplitFailure> {
-        let (original_region, sysv_shm, file, vm_flags) = {
+        let (original_region, sysv_shm, file, vm_flags, before_vma, after_vma) = {
             let guard = self.lock();
             if intersection == *guard.region() {
                 return Ok(VmaSplitLifecycle::none());
             }
+            let before = guard.region.before(&intersection).map(|region| {
+                let mut vma = unsafe { guard.clone() };
+                vma.region = region;
+                vma.mapped = false;
+                vma
+            });
+            let after = guard.region.after(&intersection).map(|region| {
+                let mut vma = unsafe { guard.clone() };
+                vma.region = region;
+                vma.mapped = false;
+                if let Some(pgoff) = vma.backing_pgoff {
+                    vma.backing_pgoff = Some(
+                        pgoff + ((region.start() - guard.region.start()) >> MMArch::PAGE_SHIFT),
+                    );
+                }
+                vma
+            });
             (
                 *guard.region(),
                 guard.sysv_shm(),
                 guard.vm_file(),
                 *guard.vm_flags(),
+                before,
+                after,
             )
         };
 
@@ -119,6 +205,23 @@ impl LockedVMA {
             open_count: 0,
             file_opens: Vec::new(),
             committed: false,
+            prepared_sides: (None, None),
+            split_source: Some((self.id, original_region)),
+        };
+
+        lifecycle.prepared_sides.0 = match before_vma
+            .map(|vma| Self::try_new_with_lineage(vma, self.lineage_id, creator))
+            .transpose()
+        {
+            Ok(vma) => vma,
+            Err(err) => return Err(lifecycle.failure(err)),
+        };
+        lifecycle.prepared_sides.1 = match after_vma
+            .map(|vma| Self::try_new_with_lineage(vma, self.lineage_id, creator))
+            .transpose()
+        {
+            Ok(vma) => vma,
+            Err(err) => return Err(lifecycle.failure(err)),
         };
 
         if file.is_some()
@@ -127,13 +230,13 @@ impl LockedVMA {
                 .try_reserve_exact(new_vma_count)
                 .is_err()
         {
-            return Err(lifecycle.failure(SystemError::ENOMEM));
+            return Err(lifecycle.failure(SystemError::ENOMEM.into()));
         }
 
         for region in [before, after].into_iter().flatten() {
             if let Some(sysv_shm) = sysv_shm.as_ref() {
                 if let Err(err) = sysv_shm.open_vma() {
-                    return Err(lifecycle.failure(err));
+                    return Err(lifecycle.failure(err.into()));
                 }
                 lifecycle.open_count += 1;
             }
@@ -218,8 +321,8 @@ impl LockedVMA {
                 if mapper.translate(page.virt_address()).is_none() {
                     continue;
                 }
-                let (paddr, _, flush, freed_tables) =
-                    unsafe { mapper.unmap_phys_with_freed_tables(page.virt_address(), true) }
+                let (paddr, _, flush) =
+                    unsafe { mapper.unmap_phys_gather(page.virt_address(), true, tlb) }
                         .expect("Failed to unmap, beacuse of some page is not mapped");
 
                 // Remove the current VMA from anon_vma
@@ -228,9 +331,6 @@ impl LockedVMA {
                 else {
                     unsafe { flush.ignore() };
                     tlb.accumulate_range(page.virt_address());
-                    if freed_tables {
-                        tlb.note_pt_table_freed();
-                    }
                     continue;
                 };
                 {
@@ -243,9 +343,6 @@ impl LockedVMA {
                 unsafe { flush.ignore() };
                 tlb.accumulate_range(page.virt_address());
                 unmapped_present_pages += 1;
-                if freed_tables {
-                    tlb.note_pt_table_freed();
-                }
             }
         }
 
@@ -417,7 +514,12 @@ impl LockedVMA {
     /// - Reason for reverse mapping updates:
     ///   After a VMA split, physical pages should belong to the new VMA (`before`/`after`), otherwise page reclamation/sharing decisions will be wrong.
     /// - When `region` exactly matches the VMA, the current VMA is returned directly to avoid an unnecessary split.
-    pub fn extract(&self, region: VirtRegion, utable: &PageMapper) -> Option<VMASplitResult> {
+    pub(super) fn extract(
+        &self,
+        region: VirtRegion,
+        utable: &PageMapper,
+        prepared: &mut VmaSplitLifecycle,
+    ) -> Option<VMASplitResult> {
         assert!(region.start().check_aligned(MMArch::PAGE_SIZE));
         assert!(region.end().check_aligned(MMArch::PAGE_SIZE));
 
@@ -457,31 +559,18 @@ impl LockedVMA {
             }
         }
 
-        let before: Option<Arc<LockedVMA>> = guard.region.before(&region).map(|virt_region| {
-            let mut vma: VMA = unsafe { guard.clone() };
-            vma.region = virt_region;
-            vma.mapped = false;
-            // backing_pgoff stays unchanged; before VMA uses the original offset
-            let vma: Arc<LockedVMA> = LockedVMA::new_with_lineage(vma, self.lineage_id);
-            vma
-        });
+        assert_eq!(prepared.split_source, Some((self.id, guard.region)));
+        let (before, after) = core::mem::take(&mut prepared.prepared_sides);
+        assert_eq!(before.is_some(), guard.region.before(&region).is_some());
+        assert_eq!(after.is_some(), guard.region.after(&region).is_some());
+        // Phase-one allocation predates executable-publication barriers. Keep
+        // the old extract-at-commit permission semantics without allocating.
+        for fragment in [&before, &after].into_iter().flatten() {
+            let mut fragment_guard = fragment.lock();
+            fragment_guard.flags = guard.flags;
+            fragment_guard.vm_flags = guard.vm_flags;
+        }
 
-        let after: Option<Arc<LockedVMA>> = guard.region.after(&region).map(|virt_region| {
-            let mut vma: VMA = unsafe { guard.clone() };
-            vma.region = virt_region;
-            vma.mapped = false;
-            // after VMA needs its backing_pgoff adjusted
-            // offset of the after region's start address relative to the original VMA's start address (in pages)
-            if let Some(original_pgoff) = vma.backing_pgoff {
-                let offset_pages =
-                    (virt_region.start() - guard.region.start()) >> MMArch::PAGE_SHIFT;
-                vma.backing_pgoff = Some(original_pgoff + offset_pages);
-            }
-            let vma: Arc<LockedVMA> = LockedVMA::new_with_lineage(vma, self.lineage_id);
-            vma
-        });
-
-        let vma_mlocked = guard.vm_flags().contains(VmFlags::VM_LOCKED);
         // Reassign the anon_vma of the physical pages in the before and after VMAs
         let mut page_manager_guard = page_manager_lock();
         if let Some(before) = before.clone() {
@@ -490,8 +579,7 @@ impl LockedVMA {
                 if let Some((paddr, _)) = utable.translate(frame.virt_address()) {
                     if let Some(page) = page_manager_guard.get(&paddr) {
                         let mut page_guard = page.write();
-                        page_guard.insert_vma(before.clone(), vma_mlocked);
-                        page_guard.remove_vma(self);
+                        page_guard.replace_vma_for_split(self, before.clone());
                     } else {
                         assert!(guard.vm_flags().contains(VmFlags::VM_MIXEDMAP));
                     }
@@ -505,8 +593,7 @@ impl LockedVMA {
                 if let Some((paddr, _)) = utable.translate(frame.virt_address()) {
                     if let Some(page) = page_manager_guard.get(&paddr) {
                         let mut page_guard = page.write();
-                        page_guard.insert_vma(after.clone(), vma_mlocked);
-                        page_guard.remove_vma(self);
+                        page_guard.replace_vma_for_split(self, after.clone());
                     } else {
                         assert!(guard.vm_flags().contains(VmFlags::VM_MIXEDMAP));
                     }
@@ -590,12 +677,6 @@ impl LockedVMA {
     }
 }
 
-impl Drop for LockedVMA {
-    fn drop(&mut self) {
-        LOCKEDVMA_ID_ALLOCATOR.lock().free(self.id);
-    }
-}
-
 /// Result of a VMA split
 #[allow(dead_code)]
 pub struct VMASplitResult {
@@ -618,16 +699,6 @@ impl VMASplitResult {
             after: post,
         }
     }
-}
-
-/// Parameters for physmap operation
-#[derive(Debug)]
-pub struct PhysmapParams {
-    pub phys: PhysPageFrame,
-    pub destination: VirtPageFrame,
-    pub count: PageFrameCount,
-    pub vm_flags: VmFlags,
-    pub flags: EntryFlags<MMArch>,
 }
 
 /// Virtual Memory Area
@@ -883,66 +954,6 @@ impl VMA {
         }
     }
 
-    /// Map a physical address to a virtual address
-    ///
-    /// @param params physical mapping parameters
-    /// @param mapper the page table mapper
-    /// @param flusher the PTE flusher
-    ///
-    /// @return the virtual memory region after mapping
-    pub fn physmap(
-        params: PhysmapParams,
-        mapper: &mut PageMapper,
-        mut flusher: impl Flusher<MMArch>,
-    ) -> Result<Arc<LockedVMA>, SystemError> {
-        let mut cur_phy = params.phys;
-        let mut cur_dest = params.destination;
-
-        for _ in 0..params.count.data() {
-            // Map the physical page frame to the virtual page frame
-            let r = unsafe {
-                mapper.map_phys(
-                    cur_dest.virt_address(),
-                    cur_phy.phys_address(),
-                    params.flags,
-                )
-            }
-            .expect("Failed to map phys, may be OOM error");
-
-            // todo: add OOM handling
-
-            // Flush TLB
-            flusher.consume(r);
-
-            cur_phy = cur_phy.next();
-            cur_dest = cur_dest.next();
-        }
-
-        let r: Arc<LockedVMA> = LockedVMA::new(VMA::new(
-            VirtRegion::new(
-                params.destination.virt_address(),
-                params.count.data() * MMArch::PAGE_SIZE,
-            ),
-            params.vm_flags,
-            params.flags,
-            None,
-            None,
-            true,
-        ));
-        // Add the VMA to anon_vma
-        let mut page_manager_guard = page_manager_lock();
-        cur_phy = params.phys;
-        let vma_mlocked = params.vm_flags.contains(VmFlags::VM_LOCKED);
-        for _ in 0..params.count.data() {
-            let paddr = cur_phy.phys_address();
-            let page = page_manager_guard.get_unwrap(&paddr);
-            page.write().insert_vma(r.clone(), vma_mlocked);
-            cur_phy = cur_phy.next();
-        }
-
-        return Ok(r);
-    }
-
     /// Eagerly map shared shmem pages on architectures without demand faults.
     /// The caller owns an empty reserved range and the MM/page-table edit locks.
     /// Mutable backings also require invalidation exclusion through VMA commit.
@@ -958,7 +969,10 @@ impl VMA {
         file: Arc<File>,
         page_cache: &Arc<crate::filesystem::page_cache::PageCache>,
         pgoff: usize,
-    ) -> Result<Arc<LockedVMA>, SystemError> {
+        mm: &Arc<AddressSpace>,
+        creator: Option<&Arc<ObjectAccount>>,
+        data_account: &Arc<crate::cgroup::memory::MemoryAccount>,
+    ) -> Result<Arc<LockedVMA>, MemoryAllocationError> {
         debug_assert!(page_cache.is_shmem() && vm_flags.contains(VmFlags::VM_MAYSHARE));
         let size = file.inode().metadata()?.size.max(0) as usize;
         let file_pages = size.div_ceil(MMArch::PAGE_SIZE);
@@ -966,7 +980,7 @@ impl VMA {
             .checked_add(page_count.data())
             .ok_or(SystemError::EOVERFLOW)?;
         if end > file_pages {
-            return Err(SystemError::ENXIO);
+            return Err(SystemError::ENXIO.into());
         }
 
         // Pins keep the exact cache entries alive through mapping or rollback.
@@ -974,42 +988,53 @@ impl VMA {
         mapped
             .try_reserve_exact(page_count.data())
             .map_err(|_| SystemError::ENOMEM)?;
-        let vma = LockedVMA::new(VMA::new(
-            VirtRegion::new(destination.virt_address(), page_count.bytes()),
-            vm_flags,
-            flags,
-            Some(file),
-            Some(pgoff),
-            false,
-        ));
+        let vma = LockedVMA::try_new(
+            VMA::new(
+                VirtRegion::new(destination.virt_address(), page_count.bytes()),
+                vm_flags,
+                flags,
+                Some(file),
+                Some(pgoff),
+                false,
+            ),
+            creator.ok_or(SystemError::EINVAL)?,
+        )?;
         let mlocked = vm_flags.contains(VmFlags::VM_LOCKED);
         let result = (|| {
             for index in pgoff..end {
-                let pin = page_cache.manager().commit_overwrite_pinned(index)?;
+                let pin = page_cache.manager().try_commit_overwrite_pinned(
+                    index,
+                    data_account,
+                    creator.ok_or(SystemError::EINVAL)?,
+                )?;
                 let page = pin.page();
                 if vm_flags.contains(VmFlags::VM_WRITE) {
                     page_cache.manager().prepare_page_mkwrite(index, &page)?;
                 }
                 let address = destination.next_by(index - pgoff).virt_address();
-                let flush = unsafe { mapper.map_phys(address, page.phys_address(), flags) }
-                    .ok_or(SystemError::ENOMEM)?;
+                let flush =
+                    unsafe { mapper.try_map_phys(address, page.phys_address(), flags, creator) }?
+                        .ok_or(SystemError::ENOMEM)?;
                 flush.flush();
                 page.write().insert_vma(vma.clone(), mlocked);
                 mapped.push((address, pin));
             }
-            Ok::<(), SystemError>(())
+            Ok::<(), MemoryAllocationError>(())
         })();
         if let Err(error) = result {
-            for (address, pin) in mapped.into_iter().rev() {
-                let (_, _, flush, _) =
-                    unsafe { mapper.unmap_phys_with_freed_tables(address, true) }
-                        .expect("new shmem PTE disappeared under page-table edit lock");
-                flush.flush();
+            let mut tlb = MmuGather::gather(mm);
+            for (address, pin) in mapped.iter().rev() {
+                let (_, _, flush) = unsafe { mapper.unmap_phys_preserve_tables(*address) }
+                    .expect("new shmem PTE disappeared under page-table edit lock");
+                unsafe { flush.ignore() };
+                tlb.accumulate_range(*address);
                 let page = pin.page();
                 page.write().remove_vma(&vma);
                 InnerAddressSpace::remove_page_unevictable_if_unneeded(&page);
                 // Cache membership owns the physical page, including on error.
             }
+            tlb.finish();
+            drop(mapped);
             return Err(error);
         }
         vma.lock().set_mapped(true);
@@ -1040,9 +1065,31 @@ impl VMA {
         mut flusher: impl Flusher<MMArch>,
         file: Option<Arc<File>>,
         pgoff: Option<usize>,
-    ) -> Result<Arc<LockedVMA>, SystemError> {
+        mm: &Arc<AddressSpace>,
+        creator: Option<&Arc<ObjectAccount>>,
+        data_account: &Arc<crate::cgroup::memory::MemoryAccount>,
+    ) -> Result<Arc<LockedVMA>, MemoryAllocationError> {
+        // The caller retains mm.write() throughout the eager transaction.
+        if mm.is_oom_unstable() && super::oom_reap::is_reapable_vma(file.is_none(), vm_flags) {
+            return Err(SystemError::EFAULT.into());
+        }
         let mut cur_dest: VirtPageFrame = destination;
-        let mut mapped_pages = Vec::new();
+        let mut mapped_pages: Vec<(VirtAddr, Arc<crate::mm::page::Page>)> = Vec::new();
+        mapped_pages
+            .try_reserve_exact(page_count.data())
+            .map_err(|_| SystemError::ENOMEM)?;
+        // Prepare the fallible VMA body before installing the first PTE.
+        let r = LockedVMA::try_new(
+            VMA::new(
+                VirtRegion::new(destination.virt_address(), page_count.bytes()),
+                vm_flags,
+                flags,
+                file,
+                pgoff,
+                false,
+            ),
+            creator.ok_or(SystemError::EINVAL)?,
+        )?;
         // debug!(
         //     "VMA::zeroed: page_count = {:?}, destination={destination:?}",
         //     page_count
@@ -1052,35 +1099,48 @@ impl VMA {
             //     "VMA::zeroed: cur_dest={cur_dest:?}, vaddr = {:?}",
             //     cur_dest.virt_address()
             // );
-            let Some(r) = (unsafe { mapper.map(cur_dest.virt_address(), flags) }) else {
-                let mut page_manager_guard = page_manager_lock();
-                for mapped in mapped_pages.into_iter().rev() {
-                    if let Some((paddr, _flags, flush, _freed_tables)) =
-                        unsafe { mapper.unmap_phys_with_freed_tables(mapped, true) }
-                    {
-                        flusher.consume(flush);
-                        let _ = page_manager_guard.remove_page(&paddr);
+            let result = data_account
+                .try_charge(crate::cgroup::memory::MemoryKind::Anon, 1)
+                .map_err(MemoryAllocationError::Charge)
+                .and_then(|charge| unsafe {
+                    mapper.try_map_new_charged_page(
+                        cur_dest.virt_address(),
+                        flags,
+                        creator,
+                        Some(charge),
+                    )
+                });
+            let (page, r) = match result {
+                Ok(Some(mapped)) => mapped,
+                failure => {
+                    let mut tlb = MmuGather::gather(mm);
+                    let mut page_manager_guard = page_manager_lock();
+                    for (mapped, page) in mapped_pages.iter().rev() {
+                        if let Some((paddr, _flags, flush)) =
+                            unsafe { mapper.unmap_phys_preserve_tables(*mapped) }
+                        {
+                            unsafe { flush.ignore() };
+                            tlb.accumulate_range(*mapped);
+                            debug_assert_eq!(paddr, page.phys_address());
+                            let _ = page_manager_guard.remove_page_if_same(page);
+                        }
                     }
+                    drop(page_manager_guard);
+                    tlb.finish();
+                    drop(mapped_pages);
+                    return Err(match failure {
+                        Err(error) => error,
+                        _ => SystemError::ENOMEM.into(),
+                    });
                 }
-                return Err(SystemError::ENOMEM);
             };
 
             // Defer TLB flush; cancel the flush here
             flusher.consume(r);
-            mapped_pages.push(cur_dest.virt_address());
+            mapped_pages.push((cur_dest.virt_address(), page));
             cur_dest = cur_dest.next();
         }
-        let r = LockedVMA::new(VMA::new(
-            VirtRegion::new(
-                destination.virt_address(),
-                page_count.data() * MMArch::PAGE_SIZE,
-            ),
-            vm_flags,
-            flags,
-            file,
-            pgoff,
-            true,
-        ));
+        r.lock().set_mapped(true);
         drop(flusher);
         // debug!("VMA::zeroed: flusher dropped");
 

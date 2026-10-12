@@ -31,7 +31,7 @@ impl<T: Socket + 'static> IndexNode for T {
         &self,
         data: MutexGuard<FilePrivateData>,
         flags: &crate::filesystem::vfs::file::FileFlags,
-    ) -> Result<(), SystemError> {
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         match &*data {
             FilePrivateData::SocketCreate => {
                 // The new open file description owns the mode. In particular,
@@ -42,7 +42,7 @@ impl<T: Socket + 'static> IndexNode for T {
                 self.open_file_counter().fetch_add(1, Ordering::Release);
                 Ok(())
             }
-            _ => Err(SystemError::ENXIO),
+            _ => Err(SystemError::ENXIO.into()),
         }
     }
 
@@ -61,12 +61,12 @@ impl<T: Socket + 'static> IndexNode for T {
         _: usize,
         buf: &mut [u8],
         data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError> {
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
         // Drop the lock guard before calling self.read() to avoid holding the lock
         // across a potentially blocking or reentrant operation. This prevents deadlocks
         // and preemption issues.
         drop(data);
-        self.read(buf)
+        self.read(buf).map_err(Into::into)
     }
 
     fn write_at(
@@ -75,7 +75,7 @@ impl<T: Socket + 'static> IndexNode for T {
         _len: usize,
         buf: &[u8],
         data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError> {
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
         // if buf.is_empty() {
         //     log::debug!(
         //         "Socket write_at: ZERO-LENGTH write, buf.len()={}, _len={}",
@@ -84,7 +84,7 @@ impl<T: Socket + 'static> IndexNode for T {
         //     );
         // }
         drop(data);
-        self.write(buf)
+        self.write(buf).map_err(Into::into)
     }
 
     fn write_user_at(
@@ -99,7 +99,7 @@ impl<T: Socket + 'static> IndexNode for T {
             .map(Some)
     }
 
-    fn resize(&self, _len: usize) -> Result<(), SystemError> {
+    fn resize(&self, _len: usize) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         Ok(())
     }
     fn page_cache(&self) -> Option<Arc<crate::filesystem::page_cache::PageCache>> {
@@ -156,13 +156,13 @@ impl<T: Socket + 'static> IndexNode for T {
         cmd: u32,
         data: usize,
         private_data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError> {
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
         match cmd {
-            SIOCGIFCONF => handle_siocgifconf(self.netns(), data),
+            SIOCGIFCONF => handle_siocgifconf(self.netns(), data).map_err(Into::into),
             SIOCGIFINDEX | SIOCGIFFLAGS | SIOCGIFMTU | SIOCGIFHWADDR | SIOCGIFTXQLEN => {
-                handle_netdev_query(self.netns(), cmd, data)
+                handle_netdev_query(self.netns(), cmd, data).map_err(Into::into)
             }
-            SIOCSIFFLAGS | SIOCSIFMTU => handle_netdev_mutation(self.netns(), cmd, data),
+            SIOCSIFFLAGS | SIOCSIFMTU => handle_netdev_mutation(self.netns(), cmd, data).map_err(Into::into),
             FIONREAD /* TIOCINQ */ => {
                 // Get number of bytes available to read
                 let bytes_available = self.recv_bytes_available();
@@ -183,7 +183,7 @@ impl<T: Socket + 'static> IndexNode for T {
             }
             _ => {
                 // 透穿调用子协议栈的ioctl
-                Socket::ioctl(self, cmd, data, &private_data)
+                Socket::ioctl(self, cmd, data, &private_data).map_err(Into::into)
             }
         }
     }

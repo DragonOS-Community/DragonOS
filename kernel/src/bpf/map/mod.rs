@@ -148,8 +148,13 @@ impl BpfMap {
 }
 
 impl IndexNode for BpfMap {
-    fn open(&self, _data: MutexGuard<FilePrivateData>, _flags: &FileFlags) -> Result<()> {
-        Ok(())
+    fn open(
+        &self,
+        _data: MutexGuard<FilePrivateData>,
+        _flags: &FileFlags,
+    ) -> core::result::Result<(), crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = Ok(());
+        result.map_err(Into::into)
     }
     fn close(&self, _data: MutexGuard<FilePrivateData>) -> Result<()> {
         Ok(())
@@ -160,8 +165,9 @@ impl IndexNode for BpfMap {
         _len: usize,
         _buf: &mut [u8],
         _data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize> {
-        Err(SystemError::ENOSYS)
+    ) -> core::result::Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = Err(SystemError::ENOSYS);
+        result.map_err(Into::into)
     }
 
     fn write_at(
@@ -170,8 +176,9 @@ impl IndexNode for BpfMap {
         _len: usize,
         _buf: &[u8],
         _data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize> {
-        Err(SystemError::ENOSYS)
+    ) -> core::result::Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = Err(SystemError::ENOSYS);
+        result.map_err(Into::into)
     }
 
     fn metadata(&self) -> Result<Metadata> {
@@ -182,8 +189,12 @@ impl IndexNode for BpfMap {
         metadata.mode
     }
 
-    fn resize(&self, _len: usize) -> Result<()> {
-        Ok(())
+    fn resize(
+        &self,
+        _len: usize,
+    ) -> core::result::Result<(), crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = Ok(());
+        result.map_err(Into::into)
     }
 
     fn fs(&self) -> Arc<dyn FileSystem> {
@@ -259,13 +270,25 @@ pub fn bpf_map_create(attr: &bpf_attr) -> Result<usize> {
             return Err(SystemError::EINVAL);
         }
     };
+    let storage = crate::filesystem::vfs::file::PreparedFile::new_recovering()?;
     let bpf_map = BpfMap::new(map, map_meta);
     let current = ProcessManager::current_pcb();
     let fd_table = current.fd_table();
-    let file = File::new(Arc::new(bpf_map), FileFlags::O_RDWR | FileFlags::O_CLOEXEC)?;
-    let fd = fd_table
-        .alloc_fd(file, true, current.nofile_soft_limit())
-        .map(|x| x as usize)?;
+    let file = File::new_prepared_recovering(
+        Arc::new(bpf_map),
+        FileFlags::O_RDWR | FileFlags::O_CLOEXEC,
+        storage,
+    )?;
+    let file = Arc::try_new(file).map_err(|_| SystemError::ENOMEM)?;
+    let fd = File::recover_io(|| {
+        fd_table.alloc_fd_arc(
+            file.clone(),
+            true,
+            current.nofile_soft_limit(),
+            &crate::cgroup::memory::object_for_task(&current),
+        )
+    })
+    .map(|x| x as usize)?;
     Ok(fd)
 }
 

@@ -60,6 +60,8 @@ fn do_mlockall(flags: usize) -> Result<usize, SystemError> {
 
     let vm = AddressSpace::current()?;
     loop {
+        let creator =
+            crate::cgroup::memory::object_for_task(&crate::process::ProcessManager::current_pcb());
         let mut guard = vm.write_interruptible()?;
         if guard.mappings.first_reservation_region().is_some() {
             drop(guard);
@@ -74,7 +76,7 @@ fn do_mlockall(flags: usize) -> Result<usize, SystemError> {
         guard.set_mlock_future(VmFlags::VM_NONE);
 
         let notifications = if flags & MCL_CURRENT != 0 {
-            Some(guard.apply_mlockall_current_collect(lock_flags))
+            Some(guard.apply_mlockall_current_collect(lock_flags, &creator))
         } else {
             None
         };

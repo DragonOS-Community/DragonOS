@@ -2,6 +2,7 @@
 #define _GNU_SOURCE
 #endif
 #include <sys/ioctl.h>
+#include <poll.h>
 #include "rtnetlink_route_test_support.h"
 
 namespace {
@@ -9,6 +10,66 @@ namespace {
 // Each case runs in a loopback-only namespace: a physical default route must
 // not hide loss of the source-selected output device during PMTU lookup.
 class UdpSourceRoute : public testing::TestWithParam<bool> {};
+
+// Exercise the first automatic-bind transaction, not an already-bound sender.
+// The outer guest timeout catches a kernel lock stall; socket nonblocking mode
+// must not allow a connect/sendto call to sleep in a recursive placement lock.
+void ExerciseUnboundDatagram(int family, bool connected) {
+    FdGuard receiver(socket(family, SOCK_DGRAM | SOCK_NONBLOCK, 0));
+    FdGuard sender(socket(family, SOCK_DGRAM | SOCK_NONBLOCK, 0));
+    ASSERT_GE(receiver.Get(), 0) << ErrnoString(errno);
+    ASSERT_GE(sender.Get(), 0) << ErrnoString(errno);
+    sockaddr_storage address{}, local{};
+    socklen_t length;
+    if (family == AF_INET) {
+        auto* ip = reinterpret_cast<sockaddr_in*>(&address);
+        ip->sin_family = AF_INET;
+        ip->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        length = sizeof(*ip);
+    } else {
+        auto* ip = reinterpret_cast<sockaddr_in6*>(&address);
+        ip->sin6_family = AF_INET6;
+        ip->sin6_addr = in6addr_loopback;
+        length = sizeof(*ip);
+    }
+    ASSERT_EQ(bind(receiver.Get(), reinterpret_cast<sockaddr*>(&address), length), 0)
+        << ErrnoString(errno);
+    ASSERT_EQ(getsockname(receiver.Get(), reinterpret_cast<sockaddr*>(&address), &length), 0);
+    socklen_t local_length = sizeof(local);
+    ASSERT_EQ(getsockname(sender.Get(), reinterpret_cast<sockaddr*>(&local), &local_length), 0);
+    auto port = [family](const sockaddr_storage& value) {
+        return family == AF_INET
+            ? reinterpret_cast<const sockaddr_in*>(&value)->sin_port
+            : reinterpret_cast<const sockaddr_in6*>(&value)->sin6_port;
+    };
+    ASSERT_EQ(port(local), 0);
+    const char payload[] = "udp-autobind-transaction";
+    ssize_t sent;
+    if (connected) {
+        ASSERT_EQ(connect(sender.Get(), reinterpret_cast<sockaddr*>(&address), length), 0)
+            << ErrnoString(errno);
+        sent = send(sender.Get(), payload, sizeof(payload), 0);
+    } else {
+        sent = sendto(sender.Get(), payload, sizeof(payload), 0,
+                      reinterpret_cast<sockaddr*>(&address), length);
+    }
+    ASSERT_EQ(sent, static_cast<ssize_t>(sizeof(payload))) << ErrnoString(errno);
+    local_length = sizeof(local);
+    ASSERT_EQ(getsockname(sender.Get(), reinterpret_cast<sockaddr*>(&local), &local_length), 0);
+    EXPECT_NE(port(local), 0);
+    pollfd ready{receiver.Get(), POLLIN, 0};
+    ASSERT_EQ(poll(&ready, 1, 5000), 1) << ErrnoString(errno);
+    ASSERT_NE(ready.revents & POLLIN, 0);
+    char received[sizeof(payload)];
+    ASSERT_EQ(recv(receiver.Get(), received, sizeof(received), 0),
+              static_cast<ssize_t>(sizeof(payload))) << ErrnoString(errno);
+    EXPECT_EQ(memcmp(received, payload, sizeof(payload)), 0);
+}
+
+TEST(UdpAutobind, Ipv4UnboundConnect) { ExerciseUnboundDatagram(AF_INET, true); }
+TEST(UdpAutobind, Ipv4UnboundSendto) { ExerciseUnboundDatagram(AF_INET, false); }
+TEST(UdpAutobind, Ipv6UnboundConnect) { ExerciseUnboundDatagram(AF_INET6, true); }
+TEST(UdpAutobind, Ipv6UnboundSendto) { ExerciseUnboundDatagram(AF_INET6, false); }
 
 TEST_P(UdpSourceRoute, BoundSourceSurvivesSendAndConnectedMtuLookup) {
     pid_t child = fork();

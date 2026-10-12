@@ -88,6 +88,9 @@ pub(super) fn write_locked(
             }
         }
     }
+    // UPDATE excludes competing growth; exit only removes tasks. Keep all
+    // backing preparation outside the IRQ membership/accounting transaction.
+    dst.reserve_task_slots(tasks.len())?;
     {
         let _membership = crate::process::pid::pid_membership_lock();
         let _accounting = cgroup_accounting_lock().lock();

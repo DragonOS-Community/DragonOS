@@ -21,11 +21,11 @@ pub struct UprobeSiteTable {
 }
 
 impl UprobeSiteTable {
-    pub fn new() -> Self {
-        Self {
+    pub fn try_new() -> Result<Self, core::alloc::AllocError> {
+        Ok(Self {
             control: Mutex::new(UprobeSiteControl::default()),
-            hit_snapshot: crate::rcu::RcuArcSlot::new(Arc::new(UprobeHitIndex::default())),
-        }
+            hit_snapshot: crate::rcu::RcuArcSlot::new(Arc::try_new(UprobeHitIndex::default())?),
+        })
     }
 
     /// Execute a bounded lookup while RCU pins the immutable map and site.
@@ -479,12 +479,27 @@ pub(super) fn uprobe_register(
     consumer: &Arc<UprobeConsumer>,
     expected_mapping: &ExpectedProbeMapping,
 ) -> Result<Option<UprobeHandle>, SystemError> {
+    let mut charge_recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
     let result = loop {
+        let creator =
+            crate::cgroup::memory::object_for_task(&crate::process::ProcessManager::current_pcb());
+        let data_account = mm.memory_account();
         let result = {
             let mut inner = mm.write();
-            uprobe_register_locked(mm, &mut inner, probe_vaddr, consumer, expected_mapping)
+            uprobe_register_locked(
+                mm,
+                &mut inner,
+                probe_vaddr,
+                consumer,
+                expected_mapping,
+                &creator,
+                &data_account,
+            )
         };
         match result {
+            Err(LockedRegisterError::Allocation(error)) => {
+                error.recover(&mut charge_recovery)?;
+            }
             Err(LockedRegisterError::PageContended(page)) => {
                 // Wait for the exact conflicting Page only after releasing
                 // mm.write, then retry with full mapping/epoch revalidation.
@@ -492,10 +507,11 @@ pub(super) fn uprobe_register(
                 // contention without speculative map/unmap retry storms.
                 drop(page.write());
             }
-            other => break other,
+            Err(LockedRegisterError::System(error)) => break Err(error),
+            Ok(handle) => break Ok(handle),
         }
     };
-    let handle = match result.map_err(LockedRegisterError::into_system_error) {
+    let handle = match result {
         Ok(Some(handle)) => handle,
         other => return other,
     };
@@ -512,15 +528,13 @@ pub(super) fn uprobe_register(
 
 pub(super) enum LockedRegisterError {
     System(SystemError),
+    Allocation(crate::mm::allocation::MemoryAllocationError),
     PageContended(Arc<Page>),
 }
 
-impl LockedRegisterError {
-    fn into_system_error(self) -> SystemError {
-        match self {
-            Self::System(error) => error,
-            Self::PageContended(_) => SystemError::EAGAIN_OR_EWOULDBLOCK,
-        }
+impl From<crate::mm::allocation::MemoryAllocationError> for LockedRegisterError {
+    fn from(error: crate::mm::allocation::MemoryAllocationError) -> Self {
+        Self::Allocation(error)
     }
 }
 
@@ -539,7 +553,14 @@ pub(super) fn uprobe_register_locked(
     probe_vaddr: usize,
     consumer: &Arc<UprobeConsumer>,
     expected_mapping: &ExpectedProbeMapping,
+    creator: &Arc<crate::cgroup::memory::object::ObjectAccount>,
+    data_account: &Arc<crate::cgroup::memory::MemoryAccount>,
 ) -> Result<Option<UprobeHandle>, LockedRegisterError> {
+    // Do not publish a consumer/site before discovering that its private
+    // replacement is forbidden. The caller retains mm.write() through commit.
+    if mm.is_oom_unstable() {
+        return Err(SystemError::EFAULT.into());
+    }
     let install = consumer.begin_install(mm).ok_or(SystemError::ENOENT)?;
     let consumer_id = consumer.id;
 
@@ -584,7 +605,7 @@ pub(super) fn uprobe_register_locked(
         (site.xol_lease.clone(), None)
     } else {
         let reachable = ::uprobe::xol_slot_vaddr_range(&analysis, probe_vaddr);
-        ensure_xol_and_alloc_slot(mm, inner, &reachable)?
+        ensure_xol_and_alloc_slot(mm, inner, &reachable, creator, data_account)?
     };
     let xol_slot_offset = xol_lease.offset();
 
@@ -673,6 +694,7 @@ pub(super) fn uprobe_register_locked(
             page_offset,
             &old_instruction,
             analysis.insn_len,
+            data_account,
             publish_site,
         )
     } else {
@@ -749,7 +771,10 @@ fn ensure_xol_and_alloc_slot(
     mm: &Arc<AddressSpace>,
     inner: &mut RwSemWriteGuard<'_, InnerAddressSpace>,
     reachable: &core::ops::RangeInclusive<usize>,
-) -> Result<(Arc<XolSlotLease>, Option<Arc<XolPage>>), SystemError> {
+    creator: &Arc<crate::cgroup::memory::object::ObjectAccount>,
+    data_account: &Arc<crate::cgroup::memory::MemoryAccount>,
+) -> Result<(Arc<XolSlotLease>, Option<Arc<XolPage>>), crate::mm::allocation::MemoryAllocationError>
+{
     if let Some(lease) = mm.xol_pool.alloc_slot_in(reachable) {
         return Ok((lease, None));
     }
@@ -774,7 +799,7 @@ fn ensure_xol_and_alloc_slot(
             .ok_or(SystemError::ENOMEM)?,
     ) & !page_mask;
     if first > last {
-        return Err(SystemError::ENOMEM);
+        return Err(SystemError::ENOMEM.into());
     }
     let bounded_size = last
         .checked_sub(first)
@@ -797,6 +822,8 @@ fn ensure_xol_and_alloc_slot(
         map_flags,
         true, // round_to_min
         true, // allocate_at_once (allocate zero pages immediately)
+        Some(creator),
+        data_account,
     )?;
 
     // XOL is kernel-owned execution state, not an ordinary anonymous mapping.
@@ -869,6 +896,7 @@ fn install_breakpoint_page<F>(
     page_offset: usize,
     old_instruction: &[u8; UPROBE_INSN_COPY_SIZE],
     insn_len: usize,
+    data_account: &Arc<crate::cgroup::memory::MemoryAccount>,
     publish_site: F,
 ) -> Result<(), LockedRegisterError>
 where
@@ -975,10 +1003,26 @@ where
 
     // Allocate an unpublished destination before taking source Page locks, so
     // PageManager -> Page remains the only blocking lock order.
-    let new_page = {
-        let mut pm = page_manager_lock();
-        pm.create_one_page(PageType::Normal, PageFlags::empty(), mapper.allocator_mut())?
-    };
+    let charge = data_account
+        .try_charge(crate::cgroup::memory::MemoryKind::Anon, 1)
+        .map_err(crate::mm::allocation::MemoryAllocationError::Charge)?;
+    let source_guard = old_page
+        .try_read()
+        .ok_or_else(|| LockedRegisterError::PageContended(old_page.clone()))?;
+    let new_page = crate::mm::page::allocate_registered_data_page_initialized(
+        PageType::Normal,
+        PageFlags::empty(),
+        Some(charge),
+        |paddr| {
+            let destination = unsafe { MMArch::phys_2_virt(paddr) }.ok_or(SystemError::EFAULT)?;
+            unsafe {
+                (destination.data() as *mut u8)
+                    .copy_from_nonoverlapping(source_guard.as_slice().as_ptr(), MMArch::PAGE_SIZE);
+            }
+            drop(source_guard);
+            Ok(())
+        },
+    )?;
     let install_result = (|| -> Result<(), LockedRegisterError> {
         let instruction_end = probe_vaddr
             .checked_add(insn_len)
@@ -1032,7 +1076,6 @@ where
 
         let old_guard = first_guard.as_mut().expect("first source page guard");
         unsafe { new_guard.copy_from_slice(old_guard.as_slice()) };
-        new_guard.set_flags(*old_guard.flags());
         new_guard.clear_mapping_unevictable_source_for_cow();
 
         let mut mapped = [0u8; UPROBE_INSN_COPY_SIZE];
@@ -1097,13 +1140,9 @@ where
         if should_reclaim_old {
             old_guard.remove_flags(PageFlags::PG_UNEVICTABLE);
         }
-        let old_was_lru = old_guard.flags().contains(PageFlags::PG_LRU);
         drop(second_guard.take());
         drop(first_guard.take());
         drop(new_guard);
-        if should_reclaim_old && old_was_lru {
-            page_reclaimer_lock().insert_page(old_paddr, &old_page);
-        }
         crate::mm::page::retire_unmapped_normal_page(&old_page);
         Ok(())
     })();

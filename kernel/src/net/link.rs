@@ -101,7 +101,7 @@ pub(crate) struct LinkMutationCommit {
 
 /// A bridge-only MTU update whose fallible address/FIB preparation has
 /// completed. Its commit cannot fail because it contains no sysfs rename.
-pub(crate) struct PreparedAutoMtu<'rtnl>(PreparedLinkMutation<'rtnl>);
+pub(crate) struct PreparedAutoMtu<'rtnl>(Box<PreparedLinkMutation<'rtnl>>);
 
 /// Opaque view of a preceding prepared link mutation's FIB candidate.
 #[derive(Clone, Copy)]
@@ -224,7 +224,7 @@ impl<'rtnl> PreparedLinkMutation<'rtnl> {
         iface: Arc<dyn Iface>,
         update: LinkUpdate,
         staged_before: Option<&FibTable>,
-    ) -> Result<Self, SystemError> {
+    ) -> Result<Box<Self>, SystemError> {
         // Keep Linux do_setlink()'s externally observable validation order.
         let explicit_mtu = matches!(
             update.mtu,
@@ -294,7 +294,11 @@ impl<'rtnl> PreparedLinkMutation<'rtnl> {
             changes.insert(LinkChanges::FLAGS);
         }
 
-        Ok(Self {
+        // The full candidate spans several independently prepared subsystems.
+        // Keep one owner across prepare/commit instead of returning this body
+        // through every rtnetlink and automatic-MTU caller's kernel stack.
+        // Allocation failure still precedes any authoritative publication.
+        Box::try_new(Self {
             _rtnl: rtnl,
             iface,
             netns,
@@ -311,9 +315,10 @@ impl<'rtnl> PreparedLinkMutation<'rtnl> {
             noarp_changed,
             explicit_mtu,
         })
+        .map_err(|_| SystemError::ENOMEM)
     }
 
-    fn commit(self) -> Result<LinkMutationCommit, SystemError> {
+    fn commit(self: Box<Self>) -> Result<LinkMutationCommit, SystemError> {
         let Self {
             _rtnl: _,
             iface,
@@ -330,7 +335,7 @@ impl<'rtnl> PreparedLinkMutation<'rtnl> {
             is_up,
             noarp_changed,
             explicit_mtu,
-        } = self;
+        } = *self;
 
         // The kernfs transaction performs its final conflict/generation check
         // before any logical link state is changed.

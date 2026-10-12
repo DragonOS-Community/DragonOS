@@ -11,16 +11,59 @@ pub(crate) struct VmaCloseNotification {
 pub(crate) struct VmaCloseNotifications {
     pub(crate) vma: Vec<VmaCloseNotification>,
     pub(crate) sysv: Vec<Arc<SysVShmAttach>>,
+    /// Removed originals and unpublished split bodies retire outside MM.
+    retired_vmas: Vec<Arc<LockedVMA>>,
 }
 
 impl VmaCloseNotifications {
     pub(super) fn is_empty(&self) -> bool {
-        self.vma.is_empty() && self.sysv.is_empty()
+        self.vma.is_empty() && self.sysv.is_empty() && self.retired_vmas.is_empty()
     }
 
     pub(super) fn extend(&mut self, mut other: VmaCloseNotifications) {
-        self.vma.append(&mut other.vma);
-        self.sysv.append(&mut other.sysv);
+        Self::append_prepared(&mut self.vma, &mut other.vma);
+        Self::append_prepared(&mut self.sysv, &mut other.sysv);
+        Self::append_prepared(&mut self.retired_vmas, &mut other.retired_vmas);
+    }
+
+    fn append_prepared<T>(destination: &mut Vec<T>, source: &mut Vec<T>) {
+        if destination.is_empty() && destination.capacity() < source.len() {
+            core::mem::swap(destination, source);
+        } else {
+            assert!(destination.capacity() - destination.len() >= source.len());
+            destination.append(source);
+        }
+    }
+
+    pub(super) fn prepare_split_retirement(&mut self, count: usize) -> Result<(), SystemError> {
+        let additional = count.checked_mul(2).ok_or(SystemError::ENOMEM)?;
+        self.prepare_retirement_slots(additional)
+    }
+
+    pub(super) fn prepare_retirement_slots(
+        &mut self,
+        additional: usize,
+    ) -> Result<(), SystemError> {
+        self.retired_vmas
+            .try_reserve_exact(additional)
+            .map_err(|_| SystemError::ENOMEM)?;
+        self.vma
+            .try_reserve_exact(additional)
+            .map_err(|_| SystemError::ENOMEM)?;
+        self.sysv
+            .try_reserve_exact(additional)
+            .map_err(|_| SystemError::ENOMEM)
+    }
+
+    pub(super) fn retire_vma(&mut self, vma: Arc<LockedVMA>) {
+        assert!(self.retired_vmas.len() < self.retired_vmas.capacity());
+        self.retired_vmas.push(vma);
+    }
+
+    fn retire_split(&mut self, sides: VmaSplitSides) {
+        for vma in [sides.0, sides.1].into_iter().flatten() {
+            self.retire_vma(vma);
+        }
     }
 }
 
@@ -46,6 +89,7 @@ pub(super) struct MremapOutcome {
 pub(super) struct BrkOutcome {
     pub(super) old_brk: VirtAddr,
     pub(super) post_commit_population: Option<(VirtRegion, Weak<LockedVMA>)>,
+    pub(super) notifications: VmaCloseNotifications,
 }
 
 /// A committed locked VMA that must be populated after its owner drops
@@ -60,7 +104,7 @@ pub(crate) struct LockedPopulationRequest {
 }
 
 pub(super) struct MremapFailure {
-    pub(super) err: SystemError,
+    pub(super) err: MemoryAllocationError,
     pub(super) notifications: VmaCloseNotifications,
     /// A source barrier can survive phase-A rollback. The outer owner must
     /// reapply source sites and publish this plan before dropping mm.write().
@@ -70,6 +114,16 @@ pub(super) struct MremapFailure {
 impl From<SystemError> for MremapFailure {
     fn from(err: SystemError) -> Self {
         Self {
+            err: err.into(),
+            notifications: VmaCloseNotifications::default(),
+            exec_publication: super::mremap::MremapExecPublication::default(),
+        }
+    }
+}
+
+impl From<MemoryAllocationError> for MremapFailure {
+    fn from(err: MemoryAllocationError) -> Self {
+        Self {
             err,
             notifications: VmaCloseNotifications::default(),
             exec_publication: super::mremap::MremapExecPublication::default(),
@@ -78,12 +132,21 @@ impl From<SystemError> for MremapFailure {
 }
 
 pub(super) struct MmapFailure {
-    pub(super) err: SystemError,
+    pub(super) err: MemoryAllocationError,
     pub(super) notifications: VmaCloseNotifications,
 }
 
 impl From<SystemError> for MmapFailure {
     fn from(err: SystemError) -> Self {
+        Self {
+            err: err.into(),
+            notifications: VmaCloseNotifications::default(),
+        }
+    }
+}
+
+impl From<MemoryAllocationError> for MmapFailure {
+    fn from(err: MemoryAllocationError) -> Self {
         Self {
             err,
             notifications: VmaCloseNotifications::default(),
@@ -91,13 +154,31 @@ impl From<SystemError> for MmapFailure {
     }
 }
 
+impl From<VmaOpFailure> for MmapFailure {
+    fn from(failure: VmaOpFailure) -> Self {
+        Self {
+            err: failure.err,
+            notifications: failure.notifications,
+        }
+    }
+}
+
 pub(crate) struct VmaOpFailure {
-    pub(crate) err: SystemError,
+    pub(crate) err: MemoryAllocationError,
     pub(crate) notifications: VmaCloseNotifications,
 }
 
 impl From<SystemError> for VmaOpFailure {
     fn from(err: SystemError) -> Self {
+        Self {
+            err: err.into(),
+            notifications: VmaCloseNotifications::default(),
+        }
+    }
+}
+
+impl From<MemoryAllocationError> for VmaOpFailure {
+    fn from(err: MemoryAllocationError) -> Self {
         Self {
             err,
             notifications: VmaCloseNotifications::default(),
@@ -106,12 +187,15 @@ impl From<SystemError> for VmaOpFailure {
 }
 
 pub(super) struct VmaSplitFailure {
-    pub(super) err: SystemError,
+    pub(super) err: MemoryAllocationError,
     pub(super) lifecycle: VmaSplitLifecycle,
 }
 
 impl VmaSplitFailure {
-    pub(super) fn rollback_into(self, notifications: &mut VmaCloseNotifications) -> SystemError {
+    pub(super) fn rollback_into(
+        self,
+        notifications: &mut VmaCloseNotifications,
+    ) -> MemoryAllocationError {
         self.lifecycle.rollback_into(notifications);
         self.err
     }
@@ -147,6 +231,8 @@ pub(super) struct VmaSplitLifecycle {
     pub(super) open_count: usize,
     pub(super) file_opens: Vec<VmaCloseNotification>,
     pub(super) committed: bool,
+    pub(super) prepared_sides: VmaSplitSides,
+    pub(super) split_source: Option<(usize, VirtRegion)>,
 }
 
 impl VmaSplitLifecycle {
@@ -156,6 +242,8 @@ impl VmaSplitLifecycle {
             open_count: 0,
             file_opens: Vec::new(),
             committed: false,
+            prepared_sides: (None, None),
+            split_source: None,
         }
     }
 
@@ -167,17 +255,20 @@ impl VmaSplitLifecycle {
         if self.committed {
             return;
         }
+        notifications.retire_split(core::mem::take(&mut self.prepared_sides));
         if let Some(sysv_shm) = self.sysv_shm.take() {
             for _ in 0..self.open_count {
+                assert!(notifications.sysv.len() < notifications.sysv.capacity());
                 notifications.sysv.push(sysv_shm.clone());
             }
         }
+        assert!(notifications.vma.capacity() - notifications.vma.len() >= self.file_opens.len());
         notifications.vma.append(&mut self.file_opens);
         self.open_count = 0;
         self.committed = true;
     }
 
-    pub(super) fn failure(self, err: SystemError) -> VmaSplitFailure {
+    pub(super) fn failure(self, err: MemoryAllocationError) -> VmaSplitFailure {
         VmaSplitFailure {
             err,
             lifecycle: self,
@@ -193,5 +284,37 @@ impl Drop for VmaSplitLifecycle {
         error!(
             "VmaSplitLifecycle dropped without explicit commit/rollback; VMA closes must be routed through VmaCloseNotifications"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::VmaCloseNotifications;
+    use alloc::vec::Vec;
+
+    #[test]
+    fn default_destination_transfers_large_collection() {
+        let mut destination = Vec::new();
+        let mut source: Vec<usize> = (0..128).collect();
+        let allocation = source.as_ptr();
+        VmaCloseNotifications::append_prepared(&mut destination, &mut source);
+        assert_eq!(destination.as_ptr(), allocation);
+        assert_eq!(destination.len(), 128);
+        assert!(source.is_empty());
+    }
+
+    #[test]
+    fn large_fixed_target_tail_and_source_fit_prepared_storage() {
+        let (target, tail) = (32usize, 17usize);
+        let capacity = 2 * (target + tail) + 4;
+        let mut destination = Vec::with_capacity(capacity);
+        let allocation = destination.as_ptr();
+        for count in [target, 2 * tail, 3] {
+            let mut source: Vec<usize> = (0..count).collect();
+            VmaCloseNotifications::append_prepared(&mut destination, &mut source);
+            assert_eq!(destination.as_ptr(), allocation);
+            assert!(source.is_empty());
+        }
+        assert_eq!(destination.len(), target + 2 * tail + 3);
     }
 }

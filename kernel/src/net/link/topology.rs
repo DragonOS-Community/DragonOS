@@ -470,13 +470,14 @@ pub(crate) fn move_veth(
     iface.common().wait_for_poll_before_netns_move();
     iface.common().retire_queued_work_for_netns_move();
     source_removal.publish_moving();
-    sockets_move.publish(iface.common());
+    let retired_sockets = sockets_move.publish(iface.common());
     detach_for_netns_move(&iface);
     veth.publish_stack_after_netns_move(stack_move);
     iface.common().set_name(destination_name_owned);
     target_addition.publish();
     iface.common().end_netns_move();
     iface.common().activate_queued_work_after_netns_move();
+    drop(retired_sockets);
     reactivate_moved_device(&iface, down_flags);
     crate::driver::net::sysfs::netdev_emit_move_uevent(iface, old_devpath);
     Ok(())

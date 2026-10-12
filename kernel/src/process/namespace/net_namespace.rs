@@ -1052,6 +1052,7 @@ impl NetnsPoller {
             // UP/NAPI state. One batch per scheduler iteration prevents every
             // interface from scanning the same TCP socket collection.
             if netns.tcp_stack.poll_due(deadline_now_us) {
+                netns.tcp_stack.refill_listeners();
                 netns.tcp_stack.poll();
                 // Still service physical work during sustained TCP input.
                 // Resnapshot after the batch before calculating our timeout.
@@ -1238,6 +1239,7 @@ impl NetNamespace {
     }
 
     pub fn new_root() -> Arc<Self> {
+        let bounds = Arc::new(crate::net::tcp_bounds::BoundRegistry::new());
         let inner = InnerNetNamespace {
             router: Router::new("root_netns_router".to_string()),
         };
@@ -1261,7 +1263,10 @@ impl NetNamespace {
             ipv4_identification: AtomicU16::new(crate::arch::rand::rand() as u16),
             ipv6_fragment_identification: AtomicU32::new(crate::arch::rand::rand() as u32),
             tcp_ports: Arc::new(crate::net::socket::inet::common::PortManager::default()),
-            tcp_stack: Arc::new(crate::net::tcp_stack::TcpStack::new(self_ref.clone())),
+            tcp_stack: Arc::new(crate::net::tcp_stack::TcpStack::new(
+                self_ref.clone(),
+                bounds,
+            )),
             packet_sockets: RcuArcSlot::new(Arc::new(PacketSocketRegistrySnapshot::default())),
             packet_sockets_writer: Mutex::new(PacketSocketRegistryWriter::new()),
             packet_sockets_need_cleanup: AtomicBool::new(false),
@@ -1284,6 +1289,8 @@ impl NetNamespace {
     }
 
     pub fn new_empty(user_ns: Arc<UserNamespace>) -> Result<Arc<Self>, SystemError> {
+        let bounds = Arc::try_new(crate::net::tcp_bounds::BoundRegistry::new())
+            .map_err(|_| SystemError::ENOMEM)?;
         let counter = get_next_netns_counter();
         let loopback = crate::driver::net::loopback::LoopbackInterface::new_with_ifindex(
             crate::driver::net::loopback::LoopbackDriver::default(),
@@ -1312,7 +1319,10 @@ impl NetNamespace {
             ipv4_identification: AtomicU16::new(crate::arch::rand::rand() as u16),
             ipv6_fragment_identification: AtomicU32::new(crate::arch::rand::rand() as u32),
             tcp_ports: Arc::new(crate::net::socket::inet::common::PortManager::default()),
-            tcp_stack: Arc::new(crate::net::tcp_stack::TcpStack::new(self_ref.clone())),
+            tcp_stack: Arc::new(crate::net::tcp_stack::TcpStack::new(
+                self_ref.clone(),
+                bounds,
+            )),
             packet_sockets: RcuArcSlot::new(Arc::new(PacketSocketRegistrySnapshot::default())),
             packet_sockets_writer: Mutex::new(PacketSocketRegistryWriter::new()),
             packet_sockets_need_cleanup: AtomicBool::new(false),

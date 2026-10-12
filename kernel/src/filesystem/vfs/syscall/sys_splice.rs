@@ -1,15 +1,15 @@
+use crate::arch::ipc::signal::Signal;
 use crate::arch::syscall::nr::SYS_SPLICE;
 use crate::filesystem::fsnotify::FsEvent;
 use crate::filesystem::vfs::file::FileMode;
 use crate::filesystem::vfs::FileFlags;
 use crate::filesystem::vfs::{file::File, syscall::SpliceFlags, FileType};
 use crate::ipc::kill::send_signal_to_pid;
-use crate::ipc::pipe::LockedPipeInode;
+use crate::ipc::pipe::PipeRuntime;
 use crate::process::resource::RLimitID;
 use crate::process::ProcessManager;
 use crate::syscall::table::Syscall;
 use crate::syscall::user_access::{UserBufferReader, UserBufferWriter};
-use crate::{arch::ipc::signal::Signal, libs::casting::DowncastArc};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use system_error::SystemError;
@@ -214,8 +214,8 @@ fn do_splice(
                 file_in.notify_io_event(FsEvent::ACCESS);
             }
             (true, false) => {
-                // File::write already published MODIFY for the regular output.
-                file_in.notify_io_event(FsEvent::ACCESS);
+                // The held-pipe path publishes its actual prefix before sync,
+                // including sync failure; do not duplicate those notifications.
             }
             (false, false) => unreachable!(),
         }
@@ -224,11 +224,8 @@ fn do_splice(
     Ok(transferred)
 }
 
-fn get_pipe_inode(file: &File) -> Result<Arc<LockedPipeInode>, SystemError> {
-    let inode = file.inode();
-    inode
-        .downcast_arc::<LockedPipeInode>()
-        .ok_or(SystemError::EBADF)
+fn get_pipe_inode(file: &File) -> Result<Arc<PipeRuntime>, SystemError> {
+    file.pipe_runtime()
 }
 
 /// Linux 语义（fs/splice.c: ipipe_prep）：
@@ -260,7 +257,7 @@ fn splice_pipe_to_pipe(
 ) -> Result<usize, SystemError> {
     let in_pipe = get_pipe_inode(pipe_in)?;
     let out_pipe = get_pipe_inode(pipe_out)?;
-    in_pipe.splice_to_pipe(&out_pipe, len, flags)
+    File::recover_io(|| in_pipe.splice_to_pipe(&out_pipe, len, flags))
 }
 
 /// file 到 pipe 的数据传输
@@ -294,7 +291,18 @@ pub(super) fn splice_read_to_pipe(
     len: usize,
     flags: SpliceFlags,
 ) -> Result<usize, SystemError> {
+    File::recover_io(|| try_splice_read_to_pipe(file, position, pipe, len, flags))
+}
+
+fn try_splice_read_to_pipe(
+    file: &File,
+    position: &mut usize,
+    pipe: &File,
+    len: usize,
+    flags: SpliceFlags,
+) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
     let pipe_inode = get_pipe_inode(pipe)?;
+    let actor = crate::cgroup::memory::object_for_task(&ProcessManager::current_pcb());
 
     let limit = len.min(4096);
     let trusted_read_limit = splice_trusted_file_read_limit(file, Some(*position), limit);
@@ -326,30 +334,30 @@ pub(super) fn splice_read_to_pipe(
     };
     // A pipe has no splice_read operation. Zero count above needs no reader.
     if file.file_type() == FileType::Pipe {
-        return Err(SystemError::EINVAL);
+        return Err(SystemError::EINVAL.into());
     }
-    let mut buffer = vec![0u8; buf_size];
+    // All output inventory and the scratch are born before consuming input.
+    pipe_inode.prepare_output_storage(&transaction, &actor)?;
+    let mut buffer = crate::ipc::pipe::buffer::PipeBuffer::try_new(buf_size, &actor)?;
 
     // 从文件读取
     // 为了满足 Linux 语义：若后续写入 pipe 被信号中断且未写入任何字节，
     // 则不应推进输入文件的 file position。
-    let read_len = file.read_at_for_transfer(*position, buf_size, &mut buffer)?;
+    let read_len = file.try_read_at_for_transfer(*position, buf_size, &mut buffer)?;
 
     if read_len == 0 {
         return Ok(0);
     }
 
-    buffer.truncate(read_len);
-
     // 写入 pipe
-    let written = pipe_inode.write_from_splice_locked(&mut transaction, &buffer);
+    let written = pipe_inode.write_from_splice_locked(&mut transaction, &buffer[..read_len]);
 
     match written {
         Ok(write_len) => {
             *position += write_len;
             Ok(write_len)
         }
-        Err(e) => Err(e),
+        Err(e) => Err(e.into()),
     }
 }
 
@@ -417,27 +425,40 @@ fn splice_pipe_to_file(
     }
 
     let buf_size = allowed_len.min(4096);
-    let mut buffer = vec![0u8; buf_size];
-
-    let read = pipe_inode.splice_peek_hold_from_blocking(buf_size, &mut buffer, nonblock)?;
-    if read == 0 {
-        return Ok(0);
-    }
-
-    let written = match (offset, file.file_type()) {
-        (Some(off), _) => file.pwrite(off, read, &buffer[..read]),
-        (None, _) => file.write(read, &buffer[..read]),
-    };
-
-    match written {
-        Ok(written) => {
-            pipe_inode.splice_finish_hold(written);
-            Ok(written)
+    let mut buffer = File::recover_io(|| {
+        let actor = crate::cgroup::memory::object_for_task(&ProcessManager::current_pcb());
+        crate::ipc::pipe::buffer::PipeBuffer::try_new(buf_size, &actor)
+    })?;
+    let result = File::recover_io(|| {
+        let read = pipe_inode.splice_peek_hold_from_blocking(buf_size, &mut buffer, nonblock)?;
+        if read == 0 {
+            return Ok(None);
         }
-        Err(e) => {
-            pipe_inode.splice_finish_hold(0);
-            Err(e)
+        match file.try_write_for_transfer(
+            offset.unwrap_or_else(|| file.pos()),
+            read,
+            &buffer[..read],
+            offset.is_none(),
+        ) {
+            Ok(result) => {
+                pipe_inode.splice_finish_hold(result.written_len);
+                Ok(Some(result))
+            }
+            Err(error) => {
+                pipe_inode.splice_finish_hold(0);
+                Err(error)
+            }
         }
+    })?;
+    match result {
+        Some(result) => {
+            if result.written_len > 0 {
+                file.notify_io_event(FsEvent::MODIFY);
+                pipe.notify_io_event(FsEvent::ACCESS);
+            }
+            file.finish_write(result)
+        }
+        None => Ok(0),
     }
 }
 

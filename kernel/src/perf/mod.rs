@@ -290,8 +290,13 @@ impl IndexNode for PerfEventInode {
     fn mmap(&self, start: usize, len: usize, offset: usize) -> Result<()> {
         self.core.event.mmap(start, len, offset)
     }
-    fn open(&self, _data: MutexGuard<FilePrivateData>, _flags: &FileFlags) -> Result<()> {
-        Ok(())
+    fn open(
+        &self,
+        _data: MutexGuard<FilePrivateData>,
+        _flags: &FileFlags,
+    ) -> core::result::Result<(), crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = Ok(());
+        result.map_err(Into::into)
     }
     fn close(&self, _data: MutexGuard<FilePrivateData>) -> Result<()> {
         let node = { self.release_node.lock_irqsave().take() };
@@ -307,8 +312,10 @@ impl IndexNode for PerfEventInode {
         len: usize,
         buf: &mut [u8],
         _data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize> {
-        self.core.event.read_event(len, buf)
+    ) -> core::result::Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> =
+            self.core.event.read_event(len, buf);
+        result.map_err(Into::into)
     }
 
     fn write_at(
@@ -317,8 +324,9 @@ impl IndexNode for PerfEventInode {
         _len: usize,
         _buf: &[u8],
         _data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize> {
-        Err(SystemError::EINVAL)
+    ) -> core::result::Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = Err(SystemError::EINVAL);
+        result.map_err(Into::into)
     }
 
     fn metadata(&self) -> Result<Metadata> {
@@ -329,8 +337,12 @@ impl IndexNode for PerfEventInode {
         metadata.mode
     }
 
-    fn resize(&self, _len: usize) -> Result<()> {
-        Ok(())
+    fn resize(
+        &self,
+        _len: usize,
+    ) -> core::result::Result<(), crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = Ok(());
+        result.map_err(Into::into)
     }
 
     fn ioctl(
@@ -338,34 +350,37 @@ impl IndexNode for PerfEventInode {
         cmd: u32,
         data: usize,
         _private_data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize> {
-        let req = PerfEventIoc::from_u32(cmd).ok_or(SystemError::EINVAL)?;
-        info!("perf_event_ioctl: request: {:?}, arg: {}", req, data);
-        match req {
-            PerfEventIoc::Enable => {
-                self.core.event.enable()?;
-                Ok(0)
+    ) -> core::result::Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = (|| {
+            let req = PerfEventIoc::from_u32(cmd).ok_or(SystemError::EINVAL)?;
+            info!("perf_event_ioctl: request: {:?}, arg: {}", req, data);
+            match req {
+                PerfEventIoc::Enable => {
+                    self.core.event.enable()?;
+                    Ok(0)
+                }
+                PerfEventIoc::Disable => {
+                    self.core.event.disable()?;
+                    Ok(0)
+                }
+                PerfEventIoc::Reset => {
+                    self.core.event.reset()?;
+                    Ok(0)
+                }
+                PerfEventIoc::SetBpf => {
+                    info!("perf_event_ioctl: PERF_EVENT_IOC_SET_BPF, arg: {}", data);
+                    let bpf_prog_fd = data;
+                    let fd_table = ProcessManager::current_pcb().fd_table();
+                    let file = fd_table
+                        .read()
+                        .get_file_by_fd(bpf_prog_fd as _)
+                        .ok_or(SystemError::EBADF)?;
+                    self.core.event.set_bpf_prog(file)?;
+                    Ok(0)
+                }
             }
-            PerfEventIoc::Disable => {
-                self.core.event.disable()?;
-                Ok(0)
-            }
-            PerfEventIoc::Reset => {
-                self.core.event.reset()?;
-                Ok(0)
-            }
-            PerfEventIoc::SetBpf => {
-                info!("perf_event_ioctl: PERF_EVENT_IOC_SET_BPF, arg: {}", data);
-                let bpf_prog_fd = data;
-                let fd_table = ProcessManager::current_pcb().fd_table();
-                let file = fd_table
-                    .read()
-                    .get_file_by_fd(bpf_prog_fd as _)
-                    .ok_or(SystemError::EBADF)?;
-                self.core.event.set_bpf_prog(file)?;
-                Ok(0)
-            }
-        }
+        })();
+        result.map_err(Into::into)
     }
 
     fn fs(&self) -> Arc<dyn FileSystem> {
@@ -513,6 +528,7 @@ pub fn perf_event_open(
         FileFlags::O_RDWR
     };
     let cloexec = file_mode.contains(FileFlags::O_CLOEXEC);
+    let storage = crate::filesystem::vfs::file::PreparedFile::new_recovering()?;
 
     let event: Box<dyn PerfEventOps> = match args.type_ {
         // Dynamic software PMUs are routed solely by their sysfs-advertised
@@ -557,12 +573,19 @@ pub fn perf_event_open(
     if let Some(cache) = page_cache {
         cache.set_inode(Arc::downgrade(&(perf_event.clone() as _)))?;
     }
-    let file = File::new(perf_event, file_mode)?;
+    let file = File::new_prepared_recovering(perf_event, file_mode, storage)?;
     let current = ProcessManager::current_pcb();
     let fd_table = current.fd_table();
-    let fd = fd_table
-        .alloc_fd(file, cloexec, current.nofile_soft_limit())
-        .map(|x| x as usize)?;
+    let file = Arc::try_new(file).map_err(|_| SystemError::ENOMEM)?;
+    let fd = File::recover_io(|| {
+        fd_table.alloc_fd_arc(
+            file.clone(),
+            cloexec,
+            current.nofile_soft_limit(),
+            &crate::cgroup::memory::object_for_task(&current),
+        )
+    })
+    .map(|x| x as usize)?;
     Ok(fd)
 }
 

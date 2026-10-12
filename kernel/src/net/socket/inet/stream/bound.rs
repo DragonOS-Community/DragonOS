@@ -1,6 +1,6 @@
 //! TCP protocol handles belong to a namespace, not an address-owning device.
 
-use alloc::{boxed::Box, sync::Arc};
+use alloc::sync::Arc;
 use smoltcp::{iface::SocketHandle, socket::tcp, wire::IpAddress};
 use system_error::SystemError;
 
@@ -26,39 +26,62 @@ impl Drop for TcpBound {
 
 impl TcpBound {
     /// Used for already validated endpoints and replacement listener slots.
-    pub fn new(socket: tcp::Socket<'static>, netns: Arc<NetNamespace>) -> Self {
-        let handle = netns.tcp_stack().sockets().lock().add(socket);
-        Self {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Return the original TCP owner on failed attachment without allocation"
+    )]
+    pub fn new(
+        socket: tcp::Socket<'static>,
+        netns: Arc<NetNamespace>,
+    ) -> Result<Self, (tcp::Socket<'static>, SystemError)> {
+        let mut sockets = netns.tcp_stack().sockets().lock();
+        let handle = match sockets.try_add_no_grow(socket) {
+            Ok(handle) => handle,
+            Err(socket) => {
+                drop(sockets);
+                return Err((socket, SystemError::ENOBUFS));
+            }
+        };
+        drop(sockets);
+        Ok(Self {
             handle,
             netns,
             pmtu_policies: [1; 2],
-        }
+        })
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Recoverable bind retains the original socket inventory on failure"
+    )]
     pub fn bind_recoverable(
-        socket: Box<tcp::Socket<'static>>,
+        socket: tcp::Socket<'static>,
         address: &IpAddress,
         netns: Arc<NetNamespace>,
-    ) -> Result<Self, (Box<tcp::Socket<'static>>, SystemError)> {
+    ) -> Result<Self, (tcp::Socket<'static>, SystemError)> {
         if !address.is_unspecified() && common::get_iface_for_local_bind(address, &netns).is_none()
         {
             let error = common::bind_addr_not_found_error(address, &netns);
             return Err((socket, error));
         }
-        Ok(Self::new(*socket, netns))
+        Self::new(socket, netns)
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Failed ephemeral bind returns the original socket without locked allocation"
+    )]
     pub fn bind_ephemeral_recoverable_on_device(
-        socket: Box<tcp::Socket<'static>>,
+        socket: tcp::Socket<'static>,
         remote: IpAddress,
         netns: Arc<NetNamespace>,
         device: Option<Arc<dyn Iface>>,
-    ) -> Result<(Self, IpAddress), (Box<tcp::Socket<'static>>, SystemError)> {
+    ) -> Result<(Self, IpAddress), (tcp::Socket<'static>, SystemError)> {
         let target = match common::tcp_connect_target(&remote, &netns, device) {
             Ok(target) => target,
             Err(error) => return Err((socket, error)),
         };
-        Ok((Self::new(*socket, netns), target.local_addr))
+        Self::new(socket, netns).map(|bound| (bound, target.local_addr))
     }
 
     pub fn with_mut<T: smoltcp::socket::AnySocket<'static>, R, F: FnMut(&mut T) -> R>(

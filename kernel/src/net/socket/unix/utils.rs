@@ -56,9 +56,15 @@ impl<'a> CmsgBuffer<'a> {
         };
         let current = ProcessManager::current_pcb();
         let table = current.fd_table();
+        // SCM_RIGHTS delivery is a successful prefix, not an allocation that
+        // may kill the receiver after publishing some descriptors. Capture
+        // its creator before descriptor-table guards; admission failure is
+        // reported by the existing MSG_CTRUNC contract below.
+        let creator = crate::cgroup::memory::object_for_task(&current);
         let mut delivered = 0;
         for file in rights.iter().take(fit) {
-            let Ok(reservation) = table.reserve::<1>(current.nofile_soft_limit(), 0, cloexec)
+            let Ok(reservation) =
+                table.reserve::<1>(current.nofile_soft_limit(), 0, cloexec, &creator)
             else {
                 break;
             };

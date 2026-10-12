@@ -36,12 +36,8 @@ impl CgroupNode {
 
     pub(crate) fn is_thread_root(&self) -> bool {
         !self.is_threaded()
-            && (self.children().iter().any(|child| child.is_threaded())
-                || (self.has_tasks()
-                    && self
-                        .subtree_control()
-                        .iter()
-                        .any(|name| is_threaded_controller(name))))
+            && (self.any_child(|child| child.is_threaded())
+                || (self.has_tasks() && self.any_subtree_controller(is_threaded_controller)))
     }
 
     pub(crate) fn is_valid_domain(&self) -> bool {
@@ -59,19 +55,14 @@ impl CgroupNode {
     }
 
     pub(crate) fn has_populated_domain_children(&self) -> bool {
-        self.children()
-            .iter()
-            .any(|child| !child.is_threaded() && child.subtree_task_count() != 0)
+        self.any_child(|child| !child.is_threaded() && child.subtree_task_count() != 0)
     }
 
     pub(crate) fn can_be_thread_root(&self) -> bool {
         self.parent().is_none()
             || (!self.is_threaded()
                 && !self.has_populated_domain_children()
-                && !self
-                    .subtree_control()
-                    .iter()
-                    .any(|name| !is_threaded_controller(name)))
+                && !self.any_subtree_controller(|name| !is_threaded_controller(name)))
     }
 
     pub(crate) fn type_name(&self) -> &'static str {
@@ -98,10 +89,7 @@ pub(crate) fn enable_threaded(node: &Arc<CgroupNode>) -> Result<(), SystemError>
     }
     let domain = parent.resource_domain();
     if node.subtree_task_count() != 0
-        || node
-            .subtree_control()
-            .iter()
-            .any(|name| !is_threaded_controller(name))
+        || node.any_subtree_controller(|name| !is_threaded_controller(name))
         || !domain.is_valid_domain()
         || !domain.can_be_thread_root()
     {

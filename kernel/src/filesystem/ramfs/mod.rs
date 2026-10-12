@@ -451,7 +451,10 @@ impl MountableFileSystem for RamFS {
     fn make_mount_data(
         raw_data: Option<&str>,
         _source: &str,
-    ) -> Result<Option<Arc<dyn FileSystemMakerData + 'static>>, SystemError> {
+    ) -> Result<
+        Option<Arc<dyn FileSystemMakerData + 'static>>,
+        crate::mm::allocation::MemoryAllocationError,
+    > {
         Ok(Some(Arc::new(RamFSMountData::parse(raw_data)?)))
     }
     fn make_fs(
@@ -491,6 +494,113 @@ impl MountableFileSystem for RamFS {
 
 register_mountable_fs!(RamFS, RAMFSMAKER, "ramfs");
 
+impl LockedRamFSInode {
+    /// Prepare private contents before publishing a child in the namespace.
+    /// Ordinary create has no initializer; a symlink must finish its page
+    /// admission and target write before another lookup can observe it.
+    fn create_child_with_init<E: From<SystemError>>(
+        &self,
+        name: &str,
+        file_type: FileType,
+        mode: InodeMode,
+        data: usize,
+        context: &super::vfs::permission::InodeOpContext,
+        initialize: impl FnOnce(&Arc<LockedRamFSInode>) -> Result<(), E>,
+    ) -> Result<Arc<dyn IndexNode>, E> {
+        if context.is_idmapped() {
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP.into());
+        }
+        let name = DName::from(name);
+        let inode = self.0.lock();
+        if inode.metadata.file_type != FileType::Dir {
+            return Err(SystemError::ENOTDIR.into());
+        }
+        if inode.children.contains_key(&name) {
+            return Err(SystemError::EEXIST.into());
+        }
+        super::vfs::permission::check_parent_create(&inode.metadata, context, false)?;
+        let init = super::vfs::permission::child_inode_init_with_context(
+            &inode.metadata,
+            file_type,
+            mode,
+            context,
+        )?;
+        let parent = inode.self_ref.clone();
+        let fs = inode.fs.clone();
+        drop(inode);
+
+        let result = Arc::try_new(LockedRamFSInode(
+            Mutex::new(RamFSInode {
+                parent,
+                self_ref: Weak::default(),
+                children: BTreeMap::new(),
+                page_cache: None,
+                metadata: Metadata {
+                    dev_id: 0,
+                    inode_id: generate_inode_id(),
+                    size: 0,
+                    blk_size: 0,
+                    blocks: 0,
+                    atime: PosixTimeSpec::default(),
+                    mtime: PosixTimeSpec::default(),
+                    ctime: PosixTimeSpec::default(),
+                    btime: PosixTimeSpec::default(),
+                    file_type,
+                    mode: init.mode,
+                    flags: InodeFlags::empty(),
+                    nlinks: if file_type == FileType::Dir { 2 } else { 1 },
+                    uid: init.uid,
+                    gid: init.gid,
+                    raw_dev: DeviceNumber::from(data as u32),
+                },
+                fs,
+                special_node: None,
+                name: name.clone(),
+            }),
+            LinkMutationCoordinator::new(),
+            RwSem::new(()),
+        ))
+        .map_err(|_| SystemError::ENOMEM)?;
+        result.0.lock().self_ref = Arc::downgrade(&result);
+        if matches!(file_type, FileType::File | FileType::SymLink) {
+            let inode_weak = Arc::downgrade(&result) as Weak<dyn IndexNode>;
+            let backend = Arc::new(RamFSPageCacheBackend(inode_weak.clone()));
+            let cache = PageCache::new_shmem(Some(inode_weak), Some(backend));
+            cache.set_unevictable(true);
+            result.0.lock().page_cache = Some(cache);
+        }
+        initialize(&result)?;
+
+        // The initializer was lock-free with respect to the parent. Validate
+        // the current namespace and inheritance state at the actual commit.
+        let mut inode = self.0.lock();
+        if inode.metadata.file_type != FileType::Dir {
+            return Err(SystemError::ENOTDIR.into());
+        }
+        if inode.children.contains_key(&name) {
+            return Err(SystemError::EEXIST.into());
+        }
+        super::vfs::permission::check_parent_create(&inode.metadata, context, false)?;
+        let init = super::vfs::permission::child_inode_init_with_context(
+            &inode.metadata,
+            file_type,
+            mode,
+            context,
+        )?;
+        {
+            let mut child = result.0.lock();
+            child.metadata.mode = init.mode;
+            child.metadata.uid = init.uid;
+            child.metadata.gid = init.gid;
+        }
+        inode.children.insert(name, result.clone());
+        if file_type == FileType::Dir {
+            inode.metadata.nlinks += 1;
+        }
+        Ok(result)
+    }
+}
+
 impl IndexNode for LockedRamFSInode {
     fn link_mutation_coordinator(&self) -> Option<&LinkMutationCoordinator> {
         Some(&self.1)
@@ -504,7 +614,7 @@ impl IndexNode for LockedRamFSInode {
         Ok(())
     }
 
-    fn truncate(&self, len: usize) -> Result<(), SystemError> {
+    fn truncate(&self, len: usize) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         self.resize(len)
     }
 
@@ -516,16 +626,16 @@ impl IndexNode for LockedRamFSInode {
         &self,
         datasync: bool,
         _data: MutexGuard<FilePrivateData>,
-    ) -> Result<(), SystemError> {
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         match self.metadata()?.file_type {
             FileType::File | FileType::Dir => {
                 if datasync {
-                    self.datasync()
+                    self.datasync().map_err(Into::into)
                 } else {
-                    self.sync()
+                    self.sync().map_err(Into::into)
                 }
             }
-            _ => Err(SystemError::EINVAL),
+            _ => Err(SystemError::EINVAL.into()),
         }
     }
 
@@ -535,7 +645,7 @@ impl IndexNode for LockedRamFSInode {
         end: usize,
         _datasync: bool,
         _data: MutexGuard<FilePrivateData>,
-    ) -> Result<(), SystemError> {
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         match self.metadata()?.file_type {
             FileType::File | FileType::Dir => {
                 if let Some(page_cache) = self.page_cache() {
@@ -547,7 +657,7 @@ impl IndexNode for LockedRamFSInode {
                 }
                 Ok(())
             }
-            _ => Err(SystemError::EINVAL),
+            _ => Err(SystemError::EINVAL.into()),
         }
     }
 
@@ -555,7 +665,7 @@ impl IndexNode for LockedRamFSInode {
         &self,
         _data: MutexGuard<FilePrivateData>,
         _mode: &super::vfs::file::FileFlags,
-    ) -> Result<(), SystemError> {
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         return Ok(());
     }
 
@@ -565,19 +675,25 @@ impl IndexNode for LockedRamFSInode {
         len: usize,
         buf: &mut [u8],
         _data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError> {
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
         if buf.len() < len {
-            return Err(SystemError::EINVAL);
+            return Err(SystemError::EINVAL.into());
         }
         offset.checked_add(len).ok_or(SystemError::EOVERFLOW)?;
+        drop(_data);
         let cache = {
             let inode = self.0.lock();
             if inode.metadata.file_type == FileType::Dir {
-                return Err(SystemError::EISDIR);
+                return Err(SystemError::EISDIR.into());
             }
             inode.page_cache.clone().ok_or(SystemError::EINVAL)?
         };
-        cache.read(offset, &mut buf[..len])
+        let task = crate::process::ProcessManager::current_pcb();
+        let owner = crate::cgroup::memory::account_for_task(&task);
+        let creator = crate::cgroup::memory::object_for_task(&task);
+        // The caller may still hold an append or stacked-filesystem guard.
+        // Keep admission typed until that outer transaction has unwound.
+        cache.try_read(offset, &mut buf[..len], &owner, &creator)
     }
 
     fn write_at(
@@ -586,28 +702,59 @@ impl IndexNode for LockedRamFSInode {
         len: usize,
         buf: &[u8],
         _data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError> {
-        if buf.len() < len {
-            return Err(SystemError::EINVAL);
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        let mut publish = || {};
+        let mut stage = super::vfs::WritePrivilegeStage::new(&mut publish);
+        self.write_primary_with_privilege_stage(
+            offset,
+            len,
+            super::vfs::PrimaryWriteSource::Kernel(buf),
+            _data,
+            &mut stage,
+        )
+    }
+
+    fn write_primary_with_privilege_stage(
+        &self,
+        offset: usize,
+        len: usize,
+        source: super::vfs::PrimaryWriteSource<'_, '_>,
+        data: MutexGuard<FilePrivateData>,
+        _stage: &mut super::vfs::WritePrivilegeStage<'_>,
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        if let super::vfs::PrimaryWriteSource::Kernel(buffer) = &source {
+            if buffer.len() < len {
+                return Err(SystemError::EINVAL.into());
+            }
         }
-        let end = offset
+        offset
             .checked_add(len)
             .filter(|end| *end <= isize::MAX as usize)
             .ok_or(SystemError::EFBIG)?;
-        let _size_guard = self.2.read();
+        drop(data);
         let cache = {
             let inode = self.0.lock();
             if inode.metadata.file_type == FileType::Dir {
-                return Err(SystemError::EISDIR);
+                return Err(SystemError::EISDIR.into());
             }
             inode.page_cache.clone().ok_or(SystemError::EINVAL)?
         };
-        // PageCache prepares every page before publishing EOF. No inode lock
-        // spans page allocation or user-buffer access.
-        cache.write_with_before_dirty(offset, &buf[..len], |_| {
-            let mut inode = self.0.lock();
-            inode.metadata.size = inode.metadata.size.max(end as i64);
-            Ok(())
+        let task = crate::process::ProcessManager::current_pcb();
+        let owner = crate::cgroup::memory::account_for_task(&task);
+        let creator = crate::cgroup::memory::object_for_task(&task);
+        // Retain the canonical size transaction across all bounded user-copy
+        // batches. A kernel symlink initializer still executes one callback.
+        let _size_guard = self.2.read();
+        source.write_chunks(len, |relative, bytes| {
+            let position = offset.checked_add(relative).ok_or(SystemError::EFBIG)?;
+            let end = position
+                .checked_add(bytes.len())
+                .ok_or(SystemError::EFBIG)?;
+            cache.try_write_with_before_dirty(position, bytes, &owner, &creator, |_| {
+                let mut inode = self.0.lock();
+                inode.metadata.size = inode.metadata.size.max(end as i64);
+                Ok(())
+            })
         })
     }
 
@@ -655,7 +802,10 @@ impl IndexNode for LockedRamFSInode {
         self.0.lock().page_cache.clone()
     }
 
-    fn set_metadata(&self, metadata: &Metadata) -> Result<(), SystemError> {
+    fn set_metadata(
+        &self,
+        metadata: &Metadata,
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         let mut inode = self.0.lock();
         inode.metadata.atime = metadata.atime;
         inode.metadata.mtime = metadata.mtime;
@@ -672,7 +822,7 @@ impl IndexNode for LockedRamFSInode {
         &self,
         metadata: &Metadata,
         mask: SetMetadataMask,
-    ) -> Result<(), SystemError> {
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         let mut inode = self.0.lock();
         super::vfs::merge_metadata_masked(&mut inode.metadata, metadata, mask);
         Ok(())
@@ -684,15 +834,15 @@ impl IndexNode for LockedRamFSInode {
         Ok(())
     }
 
-    fn resize(&self, len: usize) -> Result<(), SystemError> {
+    fn resize(&self, len: usize) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         if len > isize::MAX as usize {
-            return Err(SystemError::EFBIG);
+            return Err(SystemError::EFBIG.into());
         }
         let _size_guard = self.2.write();
         let cache = {
             let mut inode = self.0.lock();
             if inode.metadata.file_type != FileType::File {
-                return Err(SystemError::EINVAL);
+                return Err(SystemError::EINVAL.into());
             }
             let cache = inode.page_cache.clone().ok_or(SystemError::EIO)?;
             inode.metadata.size = len as i64;
@@ -702,7 +852,7 @@ impl IndexNode for LockedRamFSInode {
         // inode mutex while acquiring MM locks through truncate.
         // Linux truncate_setsize() also truncates the page cache when size is
         // unchanged or grows, clearing mmap writes past the new partial EOF.
-        cache.manager().resize(len)
+        cache.manager().resize(len).map_err(Into::into)
     }
 
     fn fallocate_resize_atomic(
@@ -710,36 +860,45 @@ impl IndexNode for LockedRamFSInode {
         offset: usize,
         requested_end: usize,
         _lock_owner: u64,
-    ) -> Result<SetMetadataMask, SystemError> {
+    ) -> Result<SetMetadataMask, crate::mm::allocation::MemoryAllocationError> {
         if requested_end > isize::MAX as usize {
-            return Err(SystemError::EFBIG);
+            return Err(SystemError::EFBIG.into());
         }
-        let _size_guard = self.2.write();
-        let cache = {
-            let inode = self.0.lock();
-            if inode.metadata.file_type != FileType::File {
-                return Err(SystemError::EINVAL);
-            }
-            if requested_end > inode.metadata.size as usize {
-                super::vfs::vcore::check_file_size_limit(requested_end)?;
-            }
-            inode.page_cache.clone().ok_or(SystemError::EIO)?
-        };
-        // Allocate only pages intersecting the request. Sparse holes before
-        // offset must remain holes even when EOF already exceeds requested_end.
-        cache.manager().preallocate_range(
-            offset >> MMArch::PAGE_SHIFT,
-            (requested_end - 1) >> MMArch::PAGE_SHIFT,
-        )?;
-        let mut inode = self.0.lock();
-        let effective_size = (inode.metadata.size as usize).max(requested_end);
-        let (metadata, mask) = super::vfs::vcore::prepare_write_side_effect_metadata(
-            inode.metadata.clone(),
-            effective_size,
-        );
-        crate::filesystem::vfs::merge_metadata_masked(&mut inode.metadata, &metadata, mask);
-        inode.metadata.size = effective_size as i64;
-        Ok(mask)
+        let task = crate::process::ProcessManager::current_pcb();
+        let owner = crate::cgroup::memory::account_for_task(&task);
+        let creator = crate::cgroup::memory::object_for_task(&task);
+        let result =
+            (|| -> Result<SetMetadataMask, crate::mm::allocation::MemoryAllocationError> {
+                let _size_guard = self.2.write();
+                let cache = {
+                    let inode = self.0.lock();
+                    if inode.metadata.file_type != FileType::File {
+                        return Err(SystemError::EINVAL.into());
+                    }
+                    if requested_end > inode.metadata.size as usize {
+                        super::vfs::vcore::check_file_size_limit(requested_end)?;
+                    }
+                    inode.page_cache.clone().ok_or(SystemError::EIO)?
+                };
+                // Allocate only pages intersecting the request. Sparse holes before
+                // offset must remain holes even when EOF already exceeds requested_end.
+                cache.manager().try_preallocate_range(
+                    offset >> MMArch::PAGE_SHIFT,
+                    (requested_end - 1) >> MMArch::PAGE_SHIFT,
+                    &owner,
+                    &creator,
+                )?;
+                let mut inode = self.0.lock();
+                let effective_size = (inode.metadata.size as usize).max(requested_end);
+                let (metadata, mask) = super::vfs::vcore::prepare_write_side_effect_metadata(
+                    inode.metadata.clone(),
+                    effective_size,
+                );
+                crate::filesystem::vfs::merge_metadata_masked(&mut inode.metadata, &metadata, mask);
+                inode.metadata.size = effective_size as i64;
+                Ok(mask)
+            })();
+        result
     }
 
     fn fallocate_file(
@@ -750,7 +909,7 @@ impl IndexNode for LockedRamFSInode {
         lock_owner: u64,
         attrib: &mut super::vfs::AttribStageObserver<'_>,
         data: MutexGuard<FilePrivateData>,
-    ) -> Result<(), SystemError> {
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         drop(data);
         super::vfs::vcore::resize_based_fallocate(self, mode, offset, len, lock_owner, attrib)
     }
@@ -761,7 +920,7 @@ impl IndexNode for LockedRamFSInode {
         file_type: FileType,
         mode: InodeMode,
         data: usize,
-    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+    ) -> Result<Arc<dyn IndexNode>, crate::mm::allocation::MemoryAllocationError> {
         let mut context = super::vfs::permission::InodeOpContext::legacy();
         context.fs_userns = self.fs().mount_owner_user_ns().ok_or(SystemError::EIO)?;
         self.create_with_data_context(name, file_type, mode, data, &context)
@@ -773,7 +932,7 @@ impl IndexNode for LockedRamFSInode {
         file_type: FileType,
         mode: InodeMode,
         context: &super::vfs::permission::InodeOpContext,
-    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+    ) -> Result<Arc<dyn IndexNode>, crate::mm::allocation::MemoryAllocationError> {
         self.create_with_data_context(name, file_type, mode, 0, context)
     }
 
@@ -782,7 +941,7 @@ impl IndexNode for LockedRamFSInode {
         name: &str,
         mode: InodeMode,
         context: &super::vfs::permission::InodeOpContext,
-    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+    ) -> Result<Arc<dyn IndexNode>, crate::mm::allocation::MemoryAllocationError> {
         self.create_with_context(name, FileType::Dir, mode, context)
     }
 
@@ -791,16 +950,26 @@ impl IndexNode for LockedRamFSInode {
         name: &str,
         target: &str,
         context: &super::vfs::permission::InodeOpContext,
-    ) -> Result<Arc<dyn IndexNode>, SystemError> {
-        let inode =
-            self.create_with_context(name, FileType::SymLink, InodeMode::S_IRWXUGO, context)?;
-        inode.write_at(
+    ) -> Result<Arc<dyn IndexNode>, crate::mm::allocation::MemoryAllocationError> {
+        self.create_child_with_init(
+            name,
+            FileType::SymLink,
+            InodeMode::S_IRWXUGO,
             0,
-            target.len(),
-            target.as_bytes(),
-            Mutex::new(FilePrivateData::Unused).lock(),
-        )?;
-        Ok(inode)
+            context,
+            |inode| {
+                let written = inode.write_at(
+                    0,
+                    target.len(),
+                    target.as_bytes(),
+                    Mutex::new(FilePrivateData::Unused).lock(),
+                )?;
+                if written != target.len() {
+                    return Err(SystemError::EIO.into());
+                }
+                Ok(())
+            },
+        )
     }
 
     fn create_with_data_context(
@@ -810,85 +979,15 @@ impl IndexNode for LockedRamFSInode {
         mode: InodeMode,
         data: usize,
         context: &super::vfs::permission::InodeOpContext,
-    ) -> Result<Arc<dyn IndexNode>, SystemError> {
-        if context.is_idmapped() {
-            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
-        }
-        let name = DName::from(name);
-        // 获取当前inode
-        let mut inode = self.0.lock();
-        // 如果当前inode不是文件夹，则返回
-        if inode.metadata.file_type != FileType::Dir {
-            return Err(SystemError::ENOTDIR);
-        }
-        // 如果有重名的，则返回
-        if inode.children.contains_key(&name) {
-            return Err(SystemError::EEXIST);
-        }
-        super::vfs::permission::check_parent_create(&inode.metadata, context, false)?;
-        let init = super::vfs::permission::child_inode_init_with_context(
-            &inode.metadata,
-            file_type,
-            mode,
-            context,
-        )?;
-
-        // 创建inode
-        let result: Arc<LockedRamFSInode> = Arc::new(LockedRamFSInode(
-            Mutex::new(RamFSInode {
-                parent: inode.self_ref.clone(),
-                self_ref: Weak::default(),
-                children: BTreeMap::new(),
-                page_cache: None,
-                metadata: Metadata {
-                    dev_id: 0,
-                    inode_id: generate_inode_id(),
-                    size: 0,
-                    blk_size: 0,
-                    blocks: 0,
-                    atime: PosixTimeSpec::default(),
-                    mtime: PosixTimeSpec::default(),
-                    ctime: PosixTimeSpec::default(),
-                    btime: PosixTimeSpec::default(),
-                    file_type,
-                    mode: init.mode,
-                    flags: InodeFlags::empty(),
-                    // A directory needs to contain the "." self-reference, hence the initial count of 2
-                    nlinks: if file_type == FileType::Dir { 2 } else { 1 },
-                    uid: init.uid,
-                    gid: init.gid,
-                    raw_dev: DeviceNumber::from(data as u32),
-                },
-                fs: inode.fs.clone(),
-                special_node: None,
-                name: name.clone(),
-            }),
-            LinkMutationCoordinator::new(),
-            RwSem::new(()),
-        ));
-
-        // 初始化inode的自引用的weak指针
-        result.0.lock().self_ref = Arc::downgrade(&result);
-        if matches!(file_type, FileType::File | FileType::SymLink) {
-            let inode_weak = Arc::downgrade(&result) as Weak<dyn IndexNode>;
-            let backend = Arc::new(RamFSPageCacheBackend(inode_weak.clone()));
-            let cache = PageCache::new_shmem(Some(inode_weak), Some(backend));
-            // Ramfs has neither disk backing nor swap: data must stay resident.
-            cache.set_unevictable(true);
-            result.0.lock().page_cache = Some(cache);
-        }
-
-        // 将子inode插入父inode的B树中
-        inode.children.insert(name, result.clone());
-        // 如果新建的是目录，父目录的 nlink 需要增加
-        if file_type == FileType::Dir {
-            inode.metadata.nlinks += 1;
-        }
-
-        return Ok(result);
+    ) -> Result<Arc<dyn IndexNode>, crate::mm::allocation::MemoryAllocationError> {
+        self.create_child_with_init(name, file_type, mode, data, context, |_| Ok(()))
     }
 
-    fn link(&self, name: &str, other: &Arc<dyn IndexNode>) -> Result<(), SystemError> {
+    fn link(
+        &self,
+        name: &str,
+        other: &Arc<dyn IndexNode>,
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         let other: &LockedRamFSInode = other
             .downcast_ref::<LockedRamFSInode>()
             .ok_or(SystemError::EINVAL)?;
@@ -898,17 +997,17 @@ impl IndexNode for LockedRamFSInode {
 
         // 如果当前inode不是文件夹，那么报错
         if inode.metadata.file_type != FileType::Dir {
-            return Err(SystemError::ENOTDIR);
+            return Err(SystemError::ENOTDIR.into());
         }
 
         // 如果另一个inode是文件夹，那么也报错
         if other_locked.metadata.file_type == FileType::Dir {
-            return Err(SystemError::EISDIR);
+            return Err(SystemError::EISDIR.into());
         }
 
         // 如果当前文件夹下已经有同名文件，也报错。
         if inode.children.contains_key(&name) {
-            return Err(SystemError::EEXIST);
+            return Err(SystemError::EEXIST.into());
         }
 
         inode
@@ -920,22 +1019,25 @@ impl IndexNode for LockedRamFSInode {
         return Ok(());
     }
 
-    fn unlink(&self, name: &str) -> Result<LinkRemovalOutcome, SystemError> {
+    fn unlink(
+        &self,
+        name: &str,
+    ) -> Result<LinkRemovalOutcome, crate::mm::allocation::MemoryAllocationError> {
         let mut inode: MutexGuard<RamFSInode> = self.0.lock();
         // 如果当前inode不是目录，那么也没有子目录/文件的概念了，因此要求当前inode的类型是目录
         if inode.metadata.file_type != FileType::Dir {
-            return Err(SystemError::ENOTDIR);
+            return Err(SystemError::ENOTDIR.into());
         }
         // 不允许删除当前文件夹，也不允许删除上一个目录
         if name == "." || name == ".." {
-            return Err(SystemError::ENOTEMPTY);
+            return Err(SystemError::ENOTEMPTY.into());
         }
 
         let name = DName::from(name);
         // 获得要删除的文件的inode
         let to_delete = inode.children.get(&name).ok_or(SystemError::ENOENT)?;
         if to_delete.0.lock().metadata.file_type == FileType::Dir {
-            return Err(SystemError::EPERM);
+            return Err(SystemError::EPERM.into());
         }
         // 减少硬链接计数
         let mut deleted = to_delete.0.lock();
@@ -955,17 +1057,17 @@ impl IndexNode for LockedRamFSInode {
         return Ok(outcome);
     }
 
-    fn rmdir(&self, name: &str) -> Result<(), SystemError> {
+    fn rmdir(&self, name: &str) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         let name = DName::from(name);
         let mut inode: MutexGuard<RamFSInode> = self.0.lock();
         // 如果当前inode不是目录，那么也没有子目录/文件的概念了，因此要求当前inode的类型是目录
         if inode.metadata.file_type != FileType::Dir {
-            return Err(SystemError::ENOTDIR);
+            return Err(SystemError::ENOTDIR.into());
         }
         // 获得要删除的文件夹的inode
         let to_delete = inode.children.get(&name).ok_or(SystemError::ENOENT)?;
         if to_delete.0.lock().metadata.file_type != FileType::Dir {
-            return Err(SystemError::ENOTDIR);
+            return Err(SystemError::ENOTDIR.into());
         }
 
         to_delete.0.lock().metadata.nlinks -= 1;
@@ -982,7 +1084,7 @@ impl IndexNode for LockedRamFSInode {
         target: &Arc<dyn IndexNode>,
         new_name: &str,
         flags: RenameFlags,
-    ) -> Result<RenameOutcome, SystemError> {
+    ) -> Result<RenameOutcome, crate::mm::allocation::MemoryAllocationError> {
         let old_key = DName::from(old_name);
         let new_name = DName::from(new_name);
         let target_locked = target
@@ -1024,7 +1126,7 @@ impl IndexNode for LockedRamFSInode {
             let mut replaced = None;
             if let Some(existing) = dir.children.get(&new_name).cloned() {
                 if flags.contains(RenameFlags::NOREPLACE) {
-                    return Err(SystemError::EEXIST);
+                    return Err(SystemError::EEXIST.into());
                 }
 
                 let existing_id = existing.0.lock().metadata.inode_id;
@@ -1035,13 +1137,13 @@ impl IndexNode for LockedRamFSInode {
 
                 let existing_type = existing.0.lock().metadata.file_type;
                 if old_type == FileType::Dir && existing_type != FileType::Dir {
-                    return Err(SystemError::ENOTDIR);
+                    return Err(SystemError::ENOTDIR.into());
                 }
                 if old_type != FileType::Dir && existing_type == FileType::Dir {
-                    return Err(SystemError::EISDIR);
+                    return Err(SystemError::EISDIR.into());
                 }
                 if old_type == FileType::Dir && !existing.0.lock().children.is_empty() {
-                    return Err(SystemError::ENOTEMPTY);
+                    return Err(SystemError::ENOTEMPTY.into());
                 }
 
                 dir.children.remove(&new_name);
@@ -1074,10 +1176,12 @@ impl IndexNode for LockedRamFSInode {
             let mut src_dir = self.0.lock();
             let mut dst_dir = target_locked.0.lock();
             ramfs_move_entry_between_dirs(&mut src_dir, &mut dst_dir, &old_key, &new_name, flags)
+                .map_err(Into::into)
         } else {
             let mut dst_dir = target_locked.0.lock();
             let mut src_dir = self.0.lock();
             ramfs_move_entry_between_dirs(&mut src_dir, &mut dst_dir, &old_key, &new_name, flags)
+                .map_err(Into::into)
         }
     }
 
@@ -1209,7 +1313,7 @@ impl IndexNode for LockedRamFSInode {
         filename: &str,
         mode: InodeMode,
         dev_t: DeviceNumber,
-    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+    ) -> Result<Arc<dyn IndexNode>, crate::mm::allocation::MemoryAllocationError> {
         let mut context = super::vfs::permission::InodeOpContext::legacy();
         context.fs_userns = self.fs().mount_owner_user_ns().ok_or(SystemError::EIO)?;
         self.mknod_with_context(filename, mode, dev_t, &context)
@@ -1221,13 +1325,13 @@ impl IndexNode for LockedRamFSInode {
         mode: InodeMode,
         dev_t: DeviceNumber,
         context: &super::vfs::permission::InodeOpContext,
-    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+    ) -> Result<Arc<dyn IndexNode>, crate::mm::allocation::MemoryAllocationError> {
         if context.is_idmapped() {
-            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP.into());
         }
         let mut inode = self.0.lock();
         if inode.metadata.file_type != FileType::Dir {
-            return Err(SystemError::ENOTDIR);
+            return Err(SystemError::ENOTDIR.into());
         }
 
         // Regular file: delegate to create(), must drop lock first to avoid deadlock
@@ -1239,7 +1343,7 @@ impl IndexNode for LockedRamFSInode {
 
         let filename = DName::from(filename);
         if inode.children.contains_key(&filename) {
-            return Err(SystemError::EEXIST);
+            return Err(SystemError::EEXIST.into());
         }
 
         // Determine file type from mode
@@ -1248,7 +1352,7 @@ impl IndexNode for LockedRamFSInode {
             FileType::CharDevice => FileType::CharDevice,
             FileType::BlockDevice => FileType::BlockDevice,
             FileType::Socket => FileType::Socket,
-            _ => return Err(SystemError::EINVAL),
+            _ => return Err(SystemError::EINVAL.into()),
         };
         super::vfs::permission::check_parent_create(&inode.metadata, context, false)?;
         let init = super::vfs::permission::child_inode_init_with_context(
@@ -1294,7 +1398,7 @@ impl IndexNode for LockedRamFSInode {
 
         // FIFO requires creating an actual pipe inode
         if mode.contains(InodeMode::S_IFIFO) {
-            let pipe_inode = LockedPipeInode::new();
+            let pipe_inode = LockedPipeInode::new_fifo_shell();
             // 标记为命名管道（FIFO），这样 open 时才会应用 FIFO 阻塞语义
             pipe_inode.set_fifo();
             // 设置special_node

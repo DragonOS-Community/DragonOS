@@ -28,30 +28,38 @@ enum CopyUpOutcome {
 }
 
 impl OvlInode {
-    pub(super) fn writable_upper_inode_locked(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
+    pub(super) fn writable_upper_inode_locked(
+        &self,
+    ) -> Result<Arc<dyn IndexNode>, crate::mm::allocation::MemoryAllocationError> {
         self.writable_upper_inode_locked_impl(None)
     }
 
     pub(super) fn writable_upper_inode_locked_with_context(
         &self,
         context: &DentryMutationContext<'_>,
-    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+    ) -> Result<Arc<dyn IndexNode>, crate::mm::allocation::MemoryAllocationError> {
         self.writable_upper_inode_locked_impl(Some(context))
     }
 
     fn writable_upper_inode_locked_impl(
         &self,
         context: Option<&DentryMutationContext<'_>>,
-    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+    ) -> Result<Arc<dyn IndexNode>, crate::mm::allocation::MemoryAllocationError> {
         if let Some(inode) = self.upper_inode.lock().clone() {
             return Ok(inode);
         }
 
         self.copy_up_locked_impl(context)?;
-        self.upper_inode.lock().clone().ok_or(SystemError::EROFS)
+        self.upper_inode
+            .lock()
+            .clone()
+            .ok_or(SystemError::EROFS.into())
     }
 
-    pub(super) fn copy_up_for_open(&self, flags: &FileFlags) -> Result<(), SystemError> {
+    pub(super) fn copy_up_for_open(
+        &self,
+        flags: &FileFlags,
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         let copy_size = if flags.contains(FileFlags::O_TRUNC) {
             Some(0)
         } else {
@@ -64,27 +72,32 @@ impl OvlInode {
         Ok(())
     }
 
-    pub(super) fn copy_up_locked(&self) -> Result<(), SystemError> {
+    pub(super) fn copy_up_locked(
+        &self,
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         self.copy_up_locked_impl(None)
     }
 
     pub(super) fn copy_up_locked_with_context(
         &self,
         context: &DentryMutationContext<'_>,
-    ) -> Result<(), SystemError> {
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         self.copy_up_locked_impl(Some(context))
     }
 
     fn copy_up_locked_impl(
         &self,
         context: Option<&DentryMutationContext<'_>>,
-    ) -> Result<(), SystemError> {
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         let fs = self.overlay_fs()?;
         let _copy_up_guard = fs.copy_up_lock(&self.redirect).lock();
         self.copy_up_locked_with_size(None, context).map(|_| ())
     }
 
-    pub(super) fn copy_up_locked_for_truncate(&self, len: usize) -> Result<(), SystemError> {
+    pub(super) fn copy_up_locked_for_truncate(
+        &self,
+        len: usize,
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         let fs = self.overlay_fs()?;
         let _copy_up_guard = fs.copy_up_lock(&self.redirect).lock();
         self.copy_up_locked_with_size(Some(len), None).map(|_| ())
@@ -94,7 +107,7 @@ impl OvlInode {
         &self,
         copy_size: Option<usize>,
         context: Option<&DentryMutationContext<'_>>,
-    ) -> Result<CopyUpOutcome, SystemError> {
+    ) -> Result<CopyUpOutcome, crate::mm::allocation::MemoryAllocationError> {
         let fs = self.overlay_fs()?;
         fs.require_upper()?;
         let caller_cred = ProcessManager::current_pcb().cred();
@@ -140,9 +153,9 @@ impl OvlInode {
             // unexpected upper therefore belongs to a newer namespace
             // object; adopting it would let a stale lower inode modify that
             // replacement.
-            Ok(_) => return Err(SystemError::ESTALE),
+            Ok(_) => return Err(SystemError::ESTALE.into()),
             Err(SystemError::ENOENT) => {}
-            Err(err) => return Err(err),
+            Err(err) => return Err(err.into()),
         }
 
         let symlink_target = if metadata.file_type == FileType::SymLink {
@@ -211,7 +224,7 @@ impl OvlInode {
             Ok(publication) => publication,
             Err(err) => {
                 let _ = Self::cleanup_workdir_temp_with_context(&workdir, &temp_name, context);
-                return Err(err);
+                return Err(err.into());
             }
         };
 
@@ -219,7 +232,7 @@ impl OvlInode {
             Ok(metadata) => metadata,
             Err(err) => {
                 let _ = Self::cleanup_workdir_temp_with_context(&workdir, &temp_name, context);
-                return Err(err);
+                return Err(err.into());
             }
         };
         match Self::move_backing(
@@ -240,12 +253,12 @@ impl OvlInode {
                 self.install_upper_inode(&mut upper_inode, inode)?;
                 return Ok(publish_outcome);
             }
-            Err(SystemError::EEXIST) => {
+            Err(crate::mm::allocation::MemoryAllocationError::System(SystemError::EEXIST)) => {
                 let _ = Self::cleanup_workdir_temp_with_context(&workdir, &temp_name, context);
                 // NOREPLACE can fail here only if the parent namespace changed
                 // after the absence check above.  Never bind this stale lower
                 // inode to the replacement that won the race.
-                return Err(SystemError::ESTALE);
+                return Err(SystemError::ESTALE.into());
             }
             Err(err) => {
                 let _ = Self::cleanup_workdir_temp_with_context(&workdir, &temp_name, context);
@@ -265,7 +278,7 @@ impl OvlInode {
         &self,
         path: &str,
         context: Option<&DentryMutationContext<'_>>,
-    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+    ) -> Result<Arc<dyn IndexNode>, crate::mm::allocation::MemoryAllocationError> {
         let mut current = self.upper_root_inode()?;
         if path.is_empty() {
             return Ok(current);
@@ -288,7 +301,7 @@ impl OvlInode {
                     if Self::is_whiteout_inode_checked(&next)?
                         || next.metadata()?.file_type != FileType::Dir
                     {
-                        return Err(SystemError::ENOTDIR);
+                        return Err(SystemError::ENOTDIR.into());
                     }
                     current = next;
                 }
@@ -296,7 +309,7 @@ impl OvlInode {
                     current =
                         self.copy_up_dir_component(&current, component, &current_path, context)?;
                 }
-                Err(err) => return Err(err),
+                Err(err) => return Err(err.into()),
             }
         }
 
@@ -328,7 +341,7 @@ impl OvlInode {
         name: &str,
         lower_path: &str,
         context: Option<&DentryMutationContext<'_>>,
-    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+    ) -> Result<Arc<dyn IndexNode>, crate::mm::allocation::MemoryAllocationError> {
         let fs = self.overlay_fs()?;
         let lowers = self.lower_dir_inodes(lower_path)?;
         let lower = &lowers[0];
@@ -342,7 +355,7 @@ impl OvlInode {
                 if Self::is_whiteout_inode_checked(&existing)?
                     || existing.metadata()?.file_type != FileType::Dir
                 {
-                    return Err(SystemError::ENOTDIR);
+                    return Err(SystemError::ENOTDIR.into());
                 }
                 for upper in cached_upper_guards
                     .iter()
@@ -355,10 +368,10 @@ impl OvlInode {
                 if fs.matches_ancestor_publication(lower_path, &lowers, &existing)? {
                     return Ok(existing);
                 }
-                return Err(SystemError::ESTALE);
+                return Err(SystemError::ESTALE.into());
             }
             Err(SystemError::ENOENT) => {}
-            Err(err) => return Err(err),
+            Err(err) => return Err(err.into()),
         }
         let lower_metadata = lower.metadata()?;
         let parent_metadata = upper_parent.metadata()?;
@@ -366,7 +379,7 @@ impl OvlInode {
             workdir.mkdir(temp_name, lower_metadata.mode)
         })?;
 
-        let prepared = (|| {
+        let prepared: Result<_, crate::mm::allocation::MemoryAllocationError> = (|| {
             metadata::copy_xattrs(lower, &temp)?;
             let origin = metadata::prepare_origin(self, lower, &temp, &lower_metadata)?;
             Self::restore_copy_up_metadata(&temp, &lower_metadata)?;
@@ -383,7 +396,7 @@ impl OvlInode {
             Ok(publication) => publication,
             Err(err) => {
                 let _ = Self::cleanup_workdir_temp_with_context(&workdir, &temp_name, context);
-                return Err(err);
+                return Err(err.into());
             }
         };
 
@@ -406,9 +419,9 @@ impl OvlInode {
                 fs.remember_ancestor_publication(lower_path, publication);
                 Ok(temp)
             }
-            Err(SystemError::EEXIST) => {
+            Err(crate::mm::allocation::MemoryAllocationError::System(SystemError::EEXIST)) => {
                 let _ = Self::cleanup_workdir_temp_with_context(&workdir, &temp_name, context);
-                Err(SystemError::ESTALE)
+                Err(SystemError::ESTALE.into())
             }
             Err(err) => {
                 let _ = Self::cleanup_workdir_temp_with_context(&workdir, &temp_name, context);
@@ -420,22 +433,22 @@ impl OvlInode {
     fn validate_existing_upper(
         inode: Arc<dyn IndexNode>,
         lower_metadata: &Metadata,
-    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+    ) -> Result<Arc<dyn IndexNode>, crate::mm::allocation::MemoryAllocationError> {
         if Self::is_whiteout_inode(&inode) {
-            return Err(SystemError::ENOENT);
+            return Err(SystemError::ENOENT.into());
         }
 
         let upper_metadata = inode.metadata()?;
         if Self::copy_up_file_type(upper_metadata.file_type)
             != Self::copy_up_file_type(lower_metadata.file_type)
         {
-            return Err(SystemError::EIO);
+            return Err(SystemError::EIO.into());
         }
 
         if Self::is_device_node_file_type(lower_metadata.file_type)
             && upper_metadata.raw_dev != lower_metadata.raw_dev
         {
-            return Err(SystemError::EIO);
+            return Err(SystemError::EIO.into());
         }
 
         Ok(inode)
@@ -477,7 +490,7 @@ impl OvlInode {
         temp_name: &str,
         metadata: &Metadata,
         symlink_target: Option<&str>,
-    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+    ) -> Result<Arc<dyn IndexNode>, crate::mm::allocation::MemoryAllocationError> {
         match metadata.file_type {
             FileType::SymLink => {
                 workdir.symlink(temp_name, symlink_target.ok_or(SystemError::EIO)?)
@@ -494,7 +507,7 @@ impl OvlInode {
     fn restore_copy_up_metadata(
         upper_inode: &Arc<dyn IndexNode>,
         lower_metadata: &Metadata,
-    ) -> Result<(), SystemError> {
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         let mut upper_metadata = upper_inode.metadata()?;
         if lower_metadata.file_type != FileType::SymLink {
             upper_metadata.mode = lower_metadata.mode;
@@ -545,7 +558,7 @@ impl OvlInode {
         upper_inode: Arc<dyn IndexNode>,
         metadata: &Metadata,
         copy_size: Option<usize>,
-    ) -> Result<(), SystemError> {
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         if metadata.file_type != FileType::File {
             return Ok(());
         }
@@ -563,22 +576,27 @@ impl OvlInode {
 
         while offset < size {
             let chunk_len = (size - offset).min(buffer.len());
-            let read_len =
-                lower_file.read_for_transfer(Some(offset), chunk_len, &mut buffer[..chunk_len])?;
+            let read_len = lower_file.try_read_for_transfer(
+                Some(offset),
+                chunk_len,
+                &mut buffer[..chunk_len],
+            )?;
             if read_len == 0 {
-                return Err(SystemError::EIO);
+                return Err(SystemError::EIO.into());
             }
 
             let mut written = 0usize;
             while written < read_len {
-                let n = upper_file.write_for_transfer(
+                let completed = upper_file.try_write_for_transfer(
                     offset + written,
                     read_len - written,
                     &buffer[written..read_len],
                     false,
                 )?;
+                completed.sync_result?;
+                let n = completed.written_len;
                 if n == 0 {
-                    return Err(SystemError::EIO);
+                    return Err(SystemError::EIO.into());
                 }
                 written += n;
             }
@@ -595,7 +613,7 @@ impl OvlInode {
         new_name: &str,
         flags: RenameFlags,
         context: Option<&DentryMutationContext<'_>>,
-    ) -> Result<(), SystemError> {
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         match context {
             Some(context) => {
                 source.move_to_with_context(old_name, target, new_name, flags, context)
@@ -605,7 +623,9 @@ impl OvlInode {
         .map(|_| ())
     }
 
-    fn read_symlink_target(lower_inode: Arc<dyn IndexNode>) -> Result<String, SystemError> {
+    fn read_symlink_target(
+        lower_inode: Arc<dyn IndexNode>,
+    ) -> Result<String, crate::mm::allocation::MemoryAllocationError> {
         let mut buffer = vec![0u8; MAX_PATHLEN];
         let len = lower_inode.read_at(
             0,
@@ -615,13 +635,13 @@ impl OvlInode {
         )?;
 
         if len == 0 {
-            return Err(SystemError::EIO);
+            return Err(SystemError::EIO.into());
         }
         if len >= MAX_PATHLEN {
-            return Err(SystemError::ENAMETOOLONG);
+            return Err(SystemError::ENAMETOOLONG.into());
         }
 
         buffer.truncate(len);
-        String::from_utf8(buffer).map_err(|_| SystemError::EINVAL)
+        String::from_utf8(buffer).map_err(|_| SystemError::EINVAL.into())
     }
 }

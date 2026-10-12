@@ -664,8 +664,9 @@ impl IndexNode for TimerFdInode {
         &self,
         _data: MutexGuard<FilePrivateData>,
         _flags: &FileFlags,
-    ) -> Result<(), SystemError> {
-        Ok(())
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = Ok(());
+        result.map_err(Into::into)
     }
 
     fn close(&self, _data: MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
@@ -694,21 +695,24 @@ impl IndexNode for TimerFdInode {
         len: usize,
         buf: &mut [u8],
         data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError> {
-        if len < core::mem::size_of::<u64>() {
-            return Err(SystemError::EINVAL);
-        }
-        let nonblock = matches!(
-            &*data,
-            FilePrivateData::TimerFd(flags) if flags.contains(FileFlags::O_NONBLOCK)
-        );
-        drop(data);
-        let ticks = self.read_ticks(nonblock)?;
-        if ticks == 0 {
-            return Ok(0);
-        }
-        buf[..8].copy_from_slice(&ticks.to_ne_bytes());
-        Ok(8)
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = (|| {
+            if len < core::mem::size_of::<u64>() {
+                return Err(SystemError::EINVAL);
+            }
+            let nonblock = matches!(
+                &*data,
+                FilePrivateData::TimerFd(flags) if flags.contains(FileFlags::O_NONBLOCK)
+            );
+            drop(data);
+            let ticks = self.read_ticks(nonblock)?;
+            if ticks == 0 {
+                return Ok(0);
+            }
+            buf[..8].copy_from_slice(&ticks.to_ne_bytes());
+            Ok(8)
+        })();
+        result.map_err(Into::into)
     }
 
     fn supports_read_user(&self) -> bool {
@@ -744,8 +748,9 @@ impl IndexNode for TimerFdInode {
         _len: usize,
         _buf: &[u8],
         _data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError> {
-        Err(SystemError::EINVAL)
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = Err(SystemError::EINVAL);
+        result.map_err(Into::into)
     }
 
     fn metadata(&self) -> Result<Metadata, SystemError> {

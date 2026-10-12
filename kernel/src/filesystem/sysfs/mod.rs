@@ -340,7 +340,10 @@ impl MountableFileSystem for SysFS {
     fn make_mount_data(
         raw_data: Option<&str>,
         source: &str,
-    ) -> Result<Option<Arc<dyn FileSystemMakerData + 'static>>, SystemError> {
+    ) -> Result<
+        Option<Arc<dyn FileSystemMakerData + 'static>>,
+        crate::mm::allocation::MemoryAllocationError,
+    > {
         Self::make_mount_data_in_context(raw_data, source, &FsCreationContext::current())
     }
 
@@ -348,10 +351,13 @@ impl MountableFileSystem for SysFS {
         _raw_data: Option<&str>,
         _source: &str,
         context: &FsCreationContext,
-    ) -> Result<Option<Arc<dyn FileSystemMakerData + 'static>>, SystemError> {
+    ) -> Result<
+        Option<Arc<dyn FileSystemMakerData + 'static>>,
+        crate::mm::allocation::MemoryAllocationError,
+    > {
         let netns = &context.net_ns;
         if !cap_capable(&context.cred, netns.user_ns(), CAPFlags::CAP_SYS_ADMIN) {
-            return Err(SystemError::EPERM);
+            return Err(SystemError::EPERM.into());
         }
         Ok(Some(Arc::new(SysFSMountData {
             netns_tag: KernFSNamespaceTag::new(netns.ns_common().nsid.data()),

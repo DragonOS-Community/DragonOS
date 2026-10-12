@@ -76,6 +76,7 @@ pub enum SoftirqNumber {
     TASKLET = 2,
     RCU = 3,
     SRCU = 4,
+    MEMORY_NOTIFY = 5,
 }
 
 impl From<u64> for SoftirqNumber {
@@ -92,6 +93,7 @@ bitflags! {
         const TASKLET = 1 << 2;
         const RCU = 1 << 3;
         const SRCU = 1 << 4;
+        const MEMORY_NOTIFY = 1 << 5;
     }
 }
 

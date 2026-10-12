@@ -1,16 +1,17 @@
 use crate::net::socket::inet::common::SocketDeviceBinding;
-use alloc::sync::{Arc, Weak};
+use alloc::sync::Arc;
 use core::num::NonZeroU32;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::filesystem::epoll::EPollEventType;
 use crate::libs::rwsem::RwSem;
+use crate::mm::allocation::MemoryAllocationError;
+use crate::net::socket::buffer::{try_owned_buffer, SocketMemory};
 use crate::net::socket::{
     self,
     inet::common::port::{TcpBindDomain, TcpPortOwner, TcpPortReservation},
 };
 use crate::process::namespace::net_namespace::NetNamespace;
-use alloc::boxed::Box;
 use alloc::vec::Vec;
 use smoltcp;
 use smoltcp::socket::tcp;
@@ -23,6 +24,126 @@ use super::registration::{
 // pub const DEFAULT_METADATA_BUF_SIZE: usize = 1024;
 pub const DEFAULT_RX_BUF_SIZE: usize = 128 * 1024;
 pub const DEFAULT_TX_BUF_SIZE: usize = 128 * 1024;
+
+/// Actual listener handle-array storage. The protocol values themselves live
+/// in SocketSet; this receipt covers only this retained allocation, not handles.
+#[derive(Debug)]
+pub(super) struct ListenerSlots {
+    entries: Vec<super::bound::TcpBound>,
+    _charge: crate::cgroup::memory::object::ObjectCharge,
+}
+
+impl ListenerSlots {
+    pub(super) fn prepare(
+        creator: &Arc<crate::cgroup::memory::object::ObjectAccount>,
+        capacity: usize,
+    ) -> Result<Self, MemoryAllocationError> {
+        let layout = core::alloc::Layout::array::<super::bound::TcpBound>(capacity)
+            .map_err(|_| SystemError::EOVERFLOW)?;
+        let charge = creator.try_charge_allocation(
+            crate::cgroup::memory::accounting::KernelByteKind::SlabUnreclaimable,
+            layout,
+        )?;
+        let mut entries = Vec::new();
+        entries
+            .try_reserve_exact(capacity)
+            .map_err(|_| SystemError::ENOMEM)?;
+        Ok(Self {
+            entries,
+            _charge: charge,
+        })
+    }
+}
+
+impl core::ops::Deref for ListenerSlots {
+    type Target = Vec<super::bound::TcpBound>;
+    fn deref(&self) -> &Self::Target {
+        &self.entries
+    }
+}
+impl core::ops::DerefMut for ListenerSlots {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.entries
+    }
+}
+impl<'a> IntoIterator for &'a ListenerSlots {
+    type Item = &'a super::bound::TcpBound;
+    type IntoIter = core::slice::Iter<'a, super::bound::TcpBound>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.entries.iter()
+    }
+}
+impl<'a> IntoIterator for &'a mut ListenerSlots {
+    type Item = &'a mut super::bound::TcpBound;
+    type IntoIter = core::slice::IterMut<'a, super::bound::TcpBound>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.entries.iter_mut()
+    }
+}
+
+pub(super) struct PreparedListenerStart {
+    pub parent_id: u64,
+    pub device: usize,
+    pub observer: Arc<dyn tcp::LifecycleObserver>,
+    pub slots: Option<ListenerSlots>,
+}
+
+pub(super) struct ListenerRefillSnapshot {
+    pub parent_id: u64,
+    pub owner: TcpPortOwner,
+    pub port: u16,
+    pub device: usize,
+    pub domain: TcpBindDomain,
+    pub listen_addr: smoltcp::wire::IpListenEndpoint,
+    pub memory: SocketMemory,
+    pub stack: Arc<crate::net::tcp_stack::TcpStack>,
+    pub array_capacity: usize,
+    pub pmtu_policies: [u8; 2],
+}
+
+pub(super) struct PreparedListenerRefill {
+    pub snapshot: ListenerRefillSnapshot,
+    pub socket: Option<tcp::Socket<'static>>,
+    pub slots: Option<ListenerSlots>,
+}
+
+impl PreparedListenerRefill {
+    pub(super) fn prepare(
+        snapshot: ListenerRefillSnapshot,
+        rx: usize,
+        tx: usize,
+    ) -> Result<Self, MemoryAllocationError> {
+        snapshot
+            .stack
+            .prepare_socket_capacity(&snapshot.memory.creator)?;
+        let slots = if snapshot.array_capacity != 0 {
+            Some(ListenerSlots::prepare(
+                &snapshot.memory.creator,
+                snapshot.array_capacity,
+            )?)
+        } else {
+            None
+        };
+        let device = Arc::try_new(SocketDeviceBinding::from_ifindex(snapshot.device))
+            .map_err(|_| SystemError::ENOMEM)?;
+        let observer = snapshot.owner.prepare_child(snapshot.port, device)?;
+        let mut socket = new_smoltcp_socket_with_size(rx, tx, &snapshot.memory)?;
+        socket
+            .set_listen_pmtu_policies(snapshot.pmtu_policies)
+            .expect("validated listener policy");
+        socket.set_listen_ip_version(snapshot.domain.ip_version);
+        socket.set_listen_bound_device(NonZeroU32::new(snapshot.device as u32));
+        socket.set_lifecycle_observer(Some(observer));
+        socket
+            .listen(snapshot.listen_addr)
+            .map_err(|_| SystemError::EINVAL)?;
+        Ok(Self {
+            snapshot,
+            socket: Some(socket),
+            slots,
+        })
+    }
+}
 
 /// Translate an accepted reset using the transport state before the RST.
 pub(super) fn reset_error(state: tcp::State) -> SystemError {
@@ -54,10 +175,24 @@ impl Closed {
 fn new_smoltcp_socket_with_size(
     rx_size: usize,
     tx_size: usize,
-) -> smoltcp::socket::tcp::Socket<'static> {
-    let rx_buffer = smoltcp::socket::tcp::SocketBuffer::new(vec![0; rx_size]);
-    let tx_buffer = smoltcp::socket::tcp::SocketBuffer::new(vec![0; tx_size]);
-    socket_with_buffers(rx_buffer, tx_buffer)
+    memory: &SocketMemory,
+) -> Result<smoltcp::socket::tcp::Socket<'static>, MemoryAllocationError> {
+    let rx_buffer = tcp::SocketBuffer::from_owned(try_owned_buffer(
+        &memory.sock,
+        &memory.creator,
+        rx_size,
+        0u8,
+    )?);
+    let tx_buffer = tcp::SocketBuffer::from_owned(try_owned_buffer(
+        &memory.sock,
+        &memory.creator,
+        tx_size,
+        0u8,
+    )?);
+    let mut socket = socket_with_buffers(rx_buffer, tx_buffer);
+    assert!(socket.set_send_buffer_limit(tx_size));
+    assert!(socket.set_receive_buffer_limit(rx_size));
+    Ok(socket)
 }
 
 fn socket_with_buffers(
@@ -73,49 +208,21 @@ fn socket_with_buffers(
     socket
 }
 
-fn new_smoltcp_socket() -> smoltcp::socket::tcp::Socket<'static> {
-    new_smoltcp_socket_with_size(DEFAULT_RX_BUF_SIZE, DEFAULT_TX_BUF_SIZE)
-}
-
-fn new_listen_smoltcp_socket<T>(
-    local_endpoint: T,
-    ip_version: Option<smoltcp::wire::IpVersion>,
-    device: Option<NonZeroU32>,
-    reservation: &TcpPortReservation,
-    pmtu_discover: u8,
-) -> Result<smoltcp::socket::tcp::Socket<'static>, SystemError>
-where
-    T: Into<smoltcp::wire::IpListenEndpoint>,
-{
-    let mut rx = Vec::new();
-    let mut tx = Vec::new();
-    rx.try_reserve_exact(DEFAULT_RX_BUF_SIZE)
-        .map_err(|_| SystemError::ENOMEM)?;
-    tx.try_reserve_exact(DEFAULT_TX_BUF_SIZE)
-        .map_err(|_| SystemError::ENOMEM)?;
-    rx.resize(DEFAULT_RX_BUF_SIZE, 0);
-    tx.resize(DEFAULT_TX_BUF_SIZE, 0);
-    let mut socket = socket_with_buffers(tcp::SocketBuffer::new(rx), tcp::SocketBuffer::new(tx));
-    socket
-        .set_pmtu_discover(pmtu_discover)
-        .expect("validated PMTU policy");
-    socket.set_listen_ip_version(ip_version);
-    socket.set_listen_bound_device(device);
-    socket.set_lifecycle_observer(Some(reservation.prepare_child(Arc::new(
-        SocketDeviceBinding::from_ifindex(device.map_or(0, NonZeroU32::get) as usize),
-    ))?));
-    socket.listen(local_endpoint).map_err(|e| match e {
-        tcp::ListenError::InvalidState => SystemError::EINVAL, // TODO: Check is right impl
-        tcp::ListenError::Unaddressable => SystemError::EADDRINUSE,
-    })?;
-    Ok(socket)
+fn new_smoltcp_socket(
+    memory: &SocketMemory,
+) -> Result<smoltcp::socket::tcp::Socket<'static>, MemoryAllocationError> {
+    new_smoltcp_socket_with_size(DEFAULT_RX_BUF_SIZE, DEFAULT_TX_BUF_SIZE, memory)
 }
 
 #[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Unbound state owns the actual protocol socket; transitions must not introduce locked allocation"
+)]
 pub enum Init {
     Unbound(
         (
-            Box<smoltcp::socket::tcp::Socket<'static>>,
+            smoltcp::socket::tcp::Socket<'static>,
             smoltcp::wire::IpVersion,
         ),
     ),
@@ -143,47 +250,20 @@ impl Init {
         let smoltcp::socket::Socket::Tcp(socket) = inner.into_socket() else {
             unreachable!("TCP binding contains TCP");
         };
-        Self::Unbound((Box::new(socket), ver))
+        Self::Unbound((socket, ver))
     }
 
-    pub(super) fn new(ver: smoltcp::wire::IpVersion) -> Self {
-        Init::Unbound((Box::new(new_smoltcp_socket()), ver))
+    pub(super) fn new(
+        ver: smoltcp::wire::IpVersion,
+        memory: &SocketMemory,
+    ) -> Result<Self, MemoryAllocationError> {
+        Ok(Init::Unbound((new_smoltcp_socket(memory)?, ver)))
     }
 
-    pub(super) fn resize_buffers(
-        &mut self,
-        rx_size: usize,
-        tx_size: usize,
-    ) -> Result<(), SystemError> {
-        match self {
-            Init::Unbound((socket, _)) => {
-                let mut new_sock = new_smoltcp_socket_with_size(rx_size, tx_size);
-
-                // Copy options
-                new_sock.set_nagle_enabled(socket.nagle_enabled());
-                new_sock.set_ack_delay(socket.ack_delay());
-                new_sock.set_keep_alive(socket.keep_alive());
-                new_sock.set_timeout(socket.timeout());
-                new_sock.set_hop_limit(socket.hop_limit());
-                new_sock.set_listen_ip_version(socket.listen_ip_version());
-                new_sock.set_bound_device(socket.bound_device());
-                new_sock
-                    .set_pmtu_discover(socket.pmtu_discover())
-                    .expect("validated PMTU policy");
-
-                **socket = new_sock;
-                Ok(())
-            }
-            Init::Bound((inner, _, _)) => {
-                inner.with_mut::<smoltcp::socket::tcp::Socket, _, _>(|socket| {
-                    socket.set_send_buffer_size(tx_size);
-                    socket.set_recv_buffer_size(rx_size);
-                });
-                Ok(())
-            }
-        }
-    }
-
+    #[expect(
+        clippy::result_large_err,
+        reason = "Failed bind restores the exact original protocol state without allocation"
+    )]
     pub(super) fn bind(
         self,
         local_endpoint: smoltcp::wire::IpEndpoint,
@@ -214,7 +294,7 @@ impl Init {
                         let smoltcp::socket::Socket::Tcp(socket) = bound.into_socket() else {
                             unreachable!("TCP BoundInner should contain a TCP socket");
                         };
-                        return Err((Init::Unbound((Box::new(socket), ver)), err));
+                        return Err((Init::Unbound((socket, ver)), err));
                     }
                 };
 
@@ -230,6 +310,10 @@ impl Init {
         }
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Failed automatic bind returns the original protocol inventory"
+    )]
     pub(super) fn bind_to_ephemeral(
         self,
         remote_endpoint: smoltcp::wire::IpEndpoint,
@@ -271,7 +355,7 @@ impl Init {
                         let smoltcp::socket::Socket::Tcp(socket) = bound.into_socket() else {
                             unreachable!("TCP BoundInner should contain a TCP socket");
                         };
-                        return Err((Self::Unbound((Box::new(socket), ver)), err));
+                        return Err((Self::Unbound((socket, ver)), err));
                     }
                 };
                 let endpoint = smoltcp::wire::IpEndpoint::new(address, reservation.port);
@@ -281,11 +365,15 @@ impl Init {
         }
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Retry owns the original socket; failure cannot allocate a replacement owner"
+    )]
     pub(super) fn connect(
         self,
         remote_endpoint: smoltcp::wire::IpEndpoint,
         netns: Arc<NetNamespace>,
-        wrapper: Weak<dyn socket::inet::InetSocket>,
+        registration: &mut Option<ConnectingRegistration>,
         ver: smoltcp::wire::IpVersion,
         owner: &TcpPortOwner,
     ) -> Result<Connecting, (Self, SystemError)> {
@@ -301,7 +389,7 @@ impl Init {
             match pending.connect_once(
                 remote_endpoint,
                 netns.clone(),
-                wrapper.clone(),
+                registration,
                 ver,
                 owner,
                 automatic,
@@ -317,7 +405,7 @@ impl Init {
                     };
                     socket.set_lifecycle_observer(None);
                     drop(reservation);
-                    pending = Init::Unbound((Box::new(socket), ver));
+                    pending = Init::Unbound((socket, ver));
                 }
                 result => return result,
             }
@@ -325,11 +413,15 @@ impl Init {
         Err((pending, SystemError::EADDRNOTAVAIL))
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Failed connection attempt returns original state without a failure-path allocation"
+    )]
     fn connect_once(
         self,
         remote_endpoint: smoltcp::wire::IpEndpoint,
         netns: Arc<NetNamespace>,
-        wrapper: Weak<dyn socket::inet::InetSocket>,
+        prepared_registration: &mut Option<ConnectingRegistration>,
         ver: smoltcp::wire::IpVersion,
         owner: &TcpPortOwner,
         automatic: bool,
@@ -365,12 +457,6 @@ impl Init {
         // visible to poll. The RAII reservation survives until Connecting is
         // replaced, while normal `bounds` registration covers the rest of the
         // socket lifetime.
-        let registration = match ConnectingRegistration::try_new(inner.stack().clone(), wrapper) {
-            Ok(registration) => registration,
-            Err(err) => {
-                return Err((Init::Bound((inner, original_local, reservation)), err));
-            }
-        };
         let result = {
             let mut sockets = inner.stack().sockets().lock();
             let socket = sockets.get_mut::<tcp::Socket>(inner.handle());
@@ -414,7 +500,9 @@ impl Init {
                 }
                 Ok(Connecting::new(
                     inner,
-                    registration,
+                    prepared_registration
+                        .take()
+                        .expect("task prepared connection registration"),
                     local,
                     remote_endpoint,
                     reservation,
@@ -430,47 +518,29 @@ impl Init {
     /// Linux semantics: calling `listen()` on an unbound TCP socket auto-binds
     /// to `INADDR_ANY` (or `::`) with an ephemeral port, just like an implicit
     /// `bind(0.0.0.0:0)` before `listen()`.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Failed listen restores the exact unpublished protocol state"
+    )]
     pub(super) fn listen(
         self,
         backlog: usize,
-        netns: Arc<NetNamespace>,
-        v6_only: bool,
         device_binding: Arc<SocketDeviceBinding>,
-        owner: &TcpPortOwner,
         pmtu_policies: [u8; 2],
+        prepared: &mut PreparedListenerStart,
+        memory: SocketMemory,
     ) -> Result<Listening, (Self, SystemError)> {
-        // If unbound, auto-bind to INADDR_ANY:ephemeral (Linux compat).
-        let bound_self = if matches!(self, Init::Unbound(_)) {
-            let ver = match &self {
-                Init::Unbound((_, v)) => *v,
-                _ => unreachable!(),
-            };
-            let unspec_addr = match ver {
-                smoltcp::wire::IpVersion::Ipv4 => {
-                    smoltcp::wire::IpAddress::from(smoltcp::wire::Ipv4Address::UNSPECIFIED)
-                }
-                smoltcp::wire::IpVersion::Ipv6 => {
-                    smoltcp::wire::IpAddress::from(smoltcp::wire::Ipv6Address::UNSPECIFIED)
-                }
-            };
-            let auto_bind_ep = smoltcp::wire::IpEndpoint::new(unspec_addr, 0);
-            match self.bind(
-                auto_bind_ep,
-                netns.clone(),
-                v6_only,
-                device_binding.clone(),
-                owner,
-            ) {
-                Ok(bound) => bound,
-                Err((init, err)) => return Err((init, err)),
-            }
-        } else {
-            self
-        };
-        let (inner, local, reservation) = match bound_self {
+        // Auto-bind and physical preparation are complete in the task outer.
+        let (inner, local, reservation) = match self {
             Init::Bound(inner) => inner,
-            Init::Unbound(_) => unreachable!(),
+            unbound @ Init::Unbound(_) => return Err((unbound, SystemError::EINVAL)),
         };
+        if reservation.id != prepared.parent_id || device_binding.ifindex() != prepared.device {
+            return Err((
+                Init::Bound((inner, local, reservation)),
+                SystemError::EAGAIN_OR_EWOULDBLOCK,
+            ));
+        }
         let domain = reservation.domain;
         let listen_addr = domain.listen_endpoint(local.port);
         if listen_addr.port == 0 {
@@ -494,24 +564,16 @@ impl Init {
         // Keep logical capacity separate from allocated transport slots.
         let backlog = Listening::slot_capacity(backlog);
 
-        let mut inners = Vec::new();
+        let stack = inner.stack().clone();
+        let mut inner = inner;
+        inner.pmtu_policies = pmtu_policies;
+        let mut inners = prepared
+            .slots
+            .take()
+            .expect("prepared initial listener array");
         let primary_index = inners.len();
+        assert!(inners.len() < inners.capacity());
         inners.push(inner);
-        if let Err(err) = Listening::grow_slots(
-            &mut inners,
-            1,
-            listen_addr,
-            domain,
-            &device_binding,
-            &reservation,
-            pmtu_policies[usize::from(local.addr.version() == smoltcp::wire::IpVersion::Ipv6)],
-        ) {
-            let inner = inners.remove(primary_index);
-            for bound in inners {
-                bound.release();
-            }
-            return Err((Init::Bound((inner, local, reservation)), err));
-        }
 
         if let Err(err) =
             inners[primary_index].with_mut::<smoltcp::socket::tcp::Socket, _, _>(|socket| {
@@ -522,10 +584,11 @@ impl Init {
                     )
                     .expect("validated PMTU policy");
                 socket.set_listen_ip_version(domain.ip_version);
+                socket
+                    .set_listen_pmtu_policies(pmtu_policies)
+                    .expect("validated listener policies");
                 socket.set_listen_bound_device(NonZeroU32::new(device_binding.ifindex() as u32));
-                socket.set_lifecycle_observer(Some(reservation.prepare_child(Arc::new(
-                    SocketDeviceBinding::from_ifindex(device_binding.ifindex()),
-                ))?));
+                socket.set_lifecycle_observer(Some(prepared.observer.clone()));
                 socket.listen(listen_addr).map_err(|err| match err {
                     tcp::ListenError::InvalidState => SystemError::EINVAL,
                     tcp::ListenError::Unaddressable => SystemError::EINVAL,
@@ -533,15 +596,17 @@ impl Init {
             })
         {
             let inner = inners.remove(primary_index);
-            for bound in &inners {
-                bound.release();
-            }
+            prepared.slots = Some(inners);
             return Err((Init::Bound((inner, local, reservation)), err));
         }
 
         promotion.commit();
         return Ok(Listening {
             inners,
+            stack,
+            memory,
+            refill_requested: false,
+            refill_retry_at: 0,
             target_slots: backlog,
             shrink_pending: false,
             listen_addr,
@@ -550,7 +615,6 @@ impl Init {
             reservation: Some(reservation),
             device_binding,
             pmtu_policies,
-            prepared_family: local.addr.version(),
         });
     }
 
@@ -822,7 +886,11 @@ impl Connecting {
 
 #[derive(Debug)]
 pub struct Listening {
-    pub inners: Vec<super::bound::TcpBound>,
+    pub(super) inners: ListenerSlots,
+    pub(super) stack: Arc<crate::net::tcp_stack::TcpStack>,
+    memory: SocketMemory,
+    refill_requested: bool,
+    refill_retry_at: u64,
     // Pending connections may temporarily keep the vector above this target.
     target_slots: usize,
     shrink_pending: bool,
@@ -834,19 +902,100 @@ pub struct Listening {
     /// Future passive opens inherit the family-specific listener setting.
     /// Already-created children retain their own snapshot until accepted.
     pmtu_policies: [u8; 2],
-    /// Do not overwrite a prepared IPv4 SYN's policy from an IPv6 setter
-    /// while ingress is waiting to acquire SocketSet (and vice versa).
-    prepared_family: smoltcp::wire::IpVersion,
 }
 
 impl Listening {
-    fn pmtu_policy(&self, version: smoltcp::wire::IpVersion) -> u8 {
-        self.pmtu_policies[usize::from(version == smoltcp::wire::IpVersion::Ipv6)]
+    pub(super) fn defer_refill_retry(&mut self) {
+        self.refill_requested = false;
+        self.refill_retry_at =
+            (crate::time::Instant::now().total_micros() as u64).saturating_add(1_000);
+    }
+    pub(super) fn take_refill_snapshot(&mut self) -> Option<ListenerRefillSnapshot> {
+        if !self.refill_requested {
+            return None;
+        }
+        self.refill_requested = false;
+        if !self.needs_refill() {
+            return None;
+        }
+        let reservation = self.reservation.as_ref()?;
+        let array_capacity = if self.inners.len() == self.inners.capacity() {
+            self.inners
+                .capacity()
+                .checked_mul(2)
+                .filter(|n| *n > self.inners.len())?
+        } else {
+            0
+        };
+        Some(ListenerRefillSnapshot {
+            parent_id: reservation.id,
+            owner: reservation.owner(),
+            port: self.local.port,
+            device: self.device_binding.ifindex(),
+            domain: self.domain,
+            listen_addr: self.listen_addr,
+            memory: self.memory.clone(),
+            stack: self.stack.clone(),
+            array_capacity,
+            pmtu_policies: self.pmtu_policies,
+        })
+    }
+
+    /// All physical storage is already born. Leave losers in `prepared` so
+    /// their last storage/observer references retire after the caller's guard.
+    pub(super) fn commit_refill(&mut self, prepared: &mut PreparedListenerRefill) -> bool {
+        if !self.needs_refill()
+            || self.reservation.as_ref().map(|r| r.id) != Some(prepared.snapshot.parent_id)
+            || !Arc::ptr_eq(&self.stack, &prepared.snapshot.stack)
+            || self.device_binding.ifindex() != prepared.snapshot.device
+        {
+            return false;
+        }
+        if self.inners.len() == self.inners.capacity()
+            && prepared
+                .slots
+                .as_ref()
+                .is_none_or(|slots| slots.capacity() <= self.inners.len())
+        {
+            return false;
+        }
+        prepared
+            .socket
+            .as_mut()
+            .expect("prepared refill protocol")
+            .set_listen_pmtu_policies(self.pmtu_policies)
+            .expect("validated listener policies");
+        let socket = prepared.socket.take().expect("one pre-born refill socket");
+        let mut bound = match super::bound::TcpBound::new(
+            socket,
+            self.stack
+                .net_namespace()
+                .expect("listener holds namespace"),
+        ) {
+            Ok(bound) => bound,
+            Err((socket, _)) => {
+                prepared.socket = Some(socket);
+                return false;
+            }
+        };
+        bound.pmtu_policies = self.pmtu_policies;
+        if self.inners.len() == self.inners.capacity() {
+            let mut slots = prepared
+                .slots
+                .take()
+                .expect("prepared listener array covers live handles");
+            slots.entries.append(&mut self.inners.entries);
+            let retired = core::mem::replace(&mut self.inners, slots);
+            prepared.slots = Some(retired);
+        }
+        assert!(self.inners.len() < self.inners.capacity());
+        self.inners.push(bound);
+        self.refill_retry_at = 0;
+        true
     }
 
     pub(super) fn set_pmtu_discover(&mut self, version: smoltcp::wire::IpVersion, value: u8) {
         self.pmtu_policies[usize::from(version == smoltcp::wire::IpVersion::Ipv6)] = value;
-        let selected_family = self.domain.ip_version.unwrap_or(self.prepared_family);
         let Some(stack) = self.inners.first().map(|bound| bound.stack().clone()) else {
             return;
         };
@@ -854,10 +1003,10 @@ impl Listening {
         for bound in &mut self.inners {
             let socket = sockets.get_mut::<tcp::Socket>(bound.handle());
             let idle = matches!(socket.state(), tcp::State::Listen | tcp::State::Closed);
-            if idle && selected_family == version {
+            if idle {
                 socket
-                    .set_pmtu_discover(value)
-                    .expect("validated PMTU policy");
+                    .set_listen_pmtu_policies(self.pmtu_policies)
+                    .expect("validated listener policies");
             }
             if idle {
                 bound.pmtu_policies = self.pmtu_policies;
@@ -865,35 +1014,18 @@ impl Listening {
         }
     }
 
-    fn prepare_idle_pmtu(&mut self) {
-        let policy = self.pmtu_policy(self.prepared_family);
-        let Some(stack) = self.inners.first().map(|bound| bound.stack().clone()) else {
-            return;
-        };
-        let mut sockets = stack.sockets().lock();
-        for bound in &mut self.inners {
-            let socket = sockets.get_mut::<tcp::Socket>(bound.handle());
-            if socket.state() != tcp::State::Listen {
-                continue;
-            }
-            socket
-                .set_pmtu_discover(policy)
-                .expect("validated PMTU policy");
-            bound.pmtu_policies = self.pmtu_policies;
-        }
-    }
     /// Update idle slots and the overflow lookup under the same SocketSet lock.
     /// Handshake/accepted snapshots remain owned by each TCP socket.
     pub(super) fn set_bound_device(&mut self, device: Option<NonZeroU32>) {
-        if let Some(bound) = self.inners.first() {
-            let mut sockets = bound.stack().sockets().lock();
+        {
+            let mut sockets = self.stack.sockets().lock();
             for slot in &self.inners {
                 sockets
                     .get_mut::<tcp::Socket>(slot.handle())
                     .set_listen_bound_device(device);
             }
             if let Some(reservation) = &self.reservation {
-                bound.stack().register_tcp_listener(
+                self.stack.register_tcp_listener(
                     reservation.id,
                     self.domain,
                     self.local.port,
@@ -939,11 +1071,8 @@ impl Listening {
         } else {
             self.rearm_closed_slots();
         }
-        // SYN admission follows immediately after this preparation in the
-        // namespace TCP poll. Pick the actual family before the SYN-ACK.
-        let pmtu_discover = self.pmtu_policy(local.addr.version());
-        self.prepared_family = local.addr.version();
-        self.prepare_idle_pmtu();
+        // Actual SYN matching selects its family policy inside smoltcp. This
+        // hook only rearms existing stock and requests task-context refill.
         if self.inners.len() >= self.target_slots
             || self.inners.iter().any(|bound| {
                 bound.with::<tcp::Socket, _, _>(|socket| socket.state() == tcp::State::Listen)
@@ -951,21 +1080,7 @@ impl Listening {
         {
             return;
         }
-        let target = self.inners.len() + 1;
-        // Allocation pressure leaves the logical listener registered, so the
-        // normal overflow path drops SYN for retransmission rather than RST.
-        let _ = Self::grow_slots(
-            &mut self.inners,
-            target,
-            self.listen_addr,
-            self.domain,
-            &self.device_binding,
-            self.reservation
-                .as_ref()
-                .expect("open listener reservation"),
-            pmtu_discover,
-        );
-        self.prepare_idle_pmtu();
+        self.request_refill();
     }
 
     pub(super) fn has_excess_slots(&self) -> bool {
@@ -1004,15 +1119,17 @@ impl Listening {
         self.rearm_closed_slots();
     }
 
-    fn rearm_closed_slots(&self) {
+    fn rearm_closed_slots(&mut self) {
         // A retained child may have reset while other slots were removed.
         // Rearm it under the same lock as the state check. The nonzero local
         // endpoint was validated when the listener was created.
-        for bound in &self.inners {
+        let policies = self.pmtu_policies;
+        for bound in &mut self.inners {
+            let mut rearmed = false;
             bound.with_mut::<tcp::Socket, _, _>(|socket| {
                 if socket.state() == tcp::State::Closed {
                     socket
-                        .set_pmtu_discover(self.pmtu_policy(self.prepared_family))
+                        .set_listen_pmtu_policies(policies)
                         .expect("validated PMTU policy");
                     socket.set_listen_bound_device(NonZeroU32::new(
                         self.device_binding.ifindex() as u32
@@ -1020,45 +1137,31 @@ impl Listening {
                     socket
                         .listen(self.listen_addr)
                         .expect("valid listener endpoint");
+                    rearmed = true;
                 }
             });
+            if rearmed {
+                bound.pmtu_policies = policies;
+            }
         }
     }
 
-    fn grow_slots(
-        inners: &mut Vec<super::bound::TcpBound>,
-        target: usize,
-        listen_addr: smoltcp::wire::IpListenEndpoint,
-        domain: TcpBindDomain,
-        device_binding: &SocketDeviceBinding,
-        reservation: &TcpPortReservation,
-        pmtu_discover: u8,
-    ) -> Result<(), SystemError> {
-        // Prepare sockets before publishing any new handles; keep existing
-        // connections and the previous capacity on a recoverable failure.
-        let mut sockets = Vec::new();
-        sockets
-            .try_reserve(target.saturating_sub(inners.len()))
-            .map_err(|_| SystemError::ENOMEM)?;
-        inners
-            .try_reserve(target.saturating_sub(inners.len()))
-            .map_err(|_| SystemError::ENOMEM)?;
-        if let Some(bound) = inners.first() {
-            for _ in inners.len()..target {
-                sockets.push(new_listen_smoltcp_socket(
-                    listen_addr,
-                    domain.ip_version,
-                    NonZeroU32::new(device_binding.ifindex() as u32),
-                    reservation,
-                    pmtu_discover,
-                )?);
-            }
-            let netns = bound.netns();
-            for socket in sockets {
-                inners.push(super::bound::TcpBound::new(socket, netns.clone()));
-            }
+    fn needs_refill(&self) -> bool {
+        self.reservation.is_some()
+            && self.inners.len() < self.target_slots
+            && !self.inners.iter().any(|bound| {
+                bound.with::<tcp::Socket, _, _>(|socket| socket.state() == tcp::State::Listen)
+            })
+    }
+
+    fn request_refill(&mut self) {
+        if self.needs_refill()
+            && !self.refill_requested
+            && crate::time::Instant::now().total_micros() as u64 >= self.refill_retry_at
+        {
+            self.refill_requested = true;
+            self.stack.request_listener_refill();
         }
-        Ok(())
     }
 
     pub(super) fn set_backlog(&mut self, backlog: usize) -> Result<(), SystemError> {
@@ -1068,99 +1171,84 @@ impl Listening {
         Ok(())
     }
 
-    pub fn accept(&mut self) -> Result<(Established, smoltcp::wire::IpEndpoint), SystemError> {
-        // Resizing can invalidate vector indices. Select the current live slot
-        // under the caller's inner write lock instead of caching a poll index.
-        let index = self
-            .inners
-            .iter()
-            .enumerate()
-            .find_map(|(index, bound)| {
-                bound.with::<tcp::Socket, _, _>(|socket| {
-                    Self::accept_endpoints(socket).map(|_| index)
-                })
+    pub(super) fn peek_accept(&self) -> Option<(smoltcp::iface::SocketHandle, u64)> {
+        self.inners.iter().find_map(|bound| {
+            bound.with::<tcp::Socket, _, _>(|socket| {
+                Self::accept_endpoints(socket)?;
+                Some((bound.handle(), socket.lifecycle_observer()?.identity()))
             })
-            .ok_or(SystemError::EAGAIN_OR_EWOULDBLOCK)?;
-
-        let retire = self.can_remove_slot(index);
-        let replacement_policy = self.pmtu_policy(self.prepared_family);
-        let connected = &mut self.inners[index];
-
-        if retire {
-            let (reservation, local_endpoint, remote_endpoint) = Self::claim_child(connected)?;
-            let connected = self.inners.remove(index);
-            return Ok((
-                Established::with_endpoints(
-                    connected,
-                    Some(reservation),
-                    local_endpoint,
-                    remote_endpoint,
-                ),
-                remote_endpoint,
-            ));
-        }
-
-        // The listener keeps its bind identity across address changes. A
-        // replacement slot must not re-run bind's current-address validation.
-        let mut new_listen = super::bound::TcpBound::new(
-            new_listen_smoltcp_socket(
-                self.listen_addr,
-                self.domain.ip_version,
-                NonZeroU32::new(self.device_binding.ifindex() as u32),
-                self.reservation
-                    .as_ref()
-                    .expect("open listener reservation"),
-                replacement_policy,
-            )?,
-            connected.netns(),
-        );
-
-        let (reservation, local_endpoint, remote_endpoint) = match Self::claim_child(connected) {
-            Ok(child) => child,
-            Err(err) => {
-                new_listen.release();
-                return Err(err);
-            }
-        };
-
-        // swap the connected socket with the new_listen socket
-        // TODO is smoltcp socket swappable?
-        core::mem::swap(&mut new_listen, connected);
-
-        return Ok((
-            Established::with_endpoints(
-                new_listen,
-                Some(reservation),
-                local_endpoint,
-                remote_endpoint,
-            ),
-            remote_endpoint,
-        ));
-    }
-
-    fn claim_child(
-        bound: &super::bound::TcpBound,
-    ) -> Result<
-        (
-            TcpPortReservation,
-            smoltcp::wire::IpEndpoint,
-            smoltcp::wire::IpEndpoint,
-        ),
-        SystemError,
-    > {
-        bound.with::<tcp::Socket, _, _>(|socket| {
-            let (local, remote) =
-                Self::accept_endpoints(socket).ok_or(SystemError::EAGAIN_OR_EWOULDBLOCK)?;
-            let observer = socket.lifecycle_observer().ok_or(SystemError::EINVAL)?;
-            let reservation = bound.netns().tcp_ports().claim_fd(observer.identity())?;
-            Ok((reservation, local, remote))
         })
     }
 
-    pub fn update_io_events(&self, pollee: &AtomicUsize) {
+    pub(super) fn accept_prepared(
+        &mut self,
+        handle: smoltcp::iface::SocketHandle,
+        binding: &crate::net::socket::inet::common::port::PreparedTcpAcceptBinding,
+        target: &Arc<crate::cgroup::memory::socket::SockAccount>,
+    ) -> Result<
+        (
+            Established,
+            smoltcp::wire::IpEndpoint,
+            Arc<SocketDeviceBinding>,
+        ),
+        MemoryAllocationError,
+    > {
+        let index = self
+            .inners
+            .iter()
+            .position(|bound| bound.handle() == handle)
+            .ok_or(SystemError::EAGAIN_OR_EWOULDBLOCK)?;
+        let bound = &self.inners[index];
+        let (reservation, local, remote, retired_device) = {
+            let mut sockets = self.stack.sockets().lock();
+            let socket = sockets.get_mut::<tcp::Socket>(handle);
+            let (local, remote) =
+                Self::accept_endpoints(socket).ok_or(SystemError::EAGAIN_OR_EWOULDBLOCK)?;
+            if socket
+                .lifecycle_observer()
+                .map(|observer| observer.identity())
+                != Some(binding.id)
+            {
+                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK.into());
+            }
+            let (rx, tx) = socket.owned_buffer_storage_mut();
+            let rx = rx
+                .and_then(|storage| {
+                    storage
+                        .as_any_mut()
+                        .downcast_mut::<crate::net::socket::buffer::SockBuffer<u8>>()
+                })
+                .ok_or(SystemError::EINVAL)?;
+            let tx = tx
+                .and_then(|storage| {
+                    storage
+                        .as_any_mut()
+                        .downcast_mut::<crate::net::socket::buffer::SockBuffer<u8>>()
+                })
+                .ok_or(SystemError::EINVAL)?;
+            let (reservation, retired) =
+                bound.netns().tcp_ports().claim_fd_prepared(binding, || {
+                    crate::cgroup::memory::socket::SockAccount::transfer_birth_receipts(
+                        &mut [rx.charge_mut(), tx.charge_mut()],
+                        target,
+                    )
+                })?;
+            (reservation, local, remote, retired)
+        };
+        let connected = self.inners.remove(index);
+        self.request_refill();
+        Ok((
+            Established::with_endpoints(connected, Some(reservation), local, remote),
+            remote,
+            retired_device,
+        ))
+    }
+
+    pub fn update_io_events(&mut self, pollee: &AtomicUsize) {
         // A retained pending child can reset after shrink has completed. It
         // must become a listen slot again, not permanently consume capacity.
         self.rearm_closed_slots();
+        self.request_refill();
         // Linux 6.6: tcp_poll() 对 TCP_LISTEN 直接早返回 inet_csk_listen_poll()，其返回值
         // 只可能是 EPOLLIN | EPOLLRDNORM（accept 队列非空）或 0 —— LISTEN 套接字的就绪掩码
         // 每次都是重算的，永远不会出现 EPOLLHUP / EPOLLRDHUP / EPOLLERR。
@@ -1429,6 +1517,10 @@ impl Established {
 }
 
 #[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Keep the protocol owner inline within the already allocated socket body"
+)]
 pub enum Inner {
     Init(Init),
     Connecting(Connecting),
@@ -1438,23 +1530,34 @@ pub enum Inner {
 }
 
 impl Inner {
-    pub fn with_socket<R, F>(&self, f: F) -> R
+    /// A listener's accepted children have independent storage and limits.
+    /// Changes to listener options apply to future slots, not existing children.
+    pub(super) fn with_data_socket_mut<R>(
+        &mut self,
+        mut f: impl FnMut(&mut tcp::Socket<'static>) -> R,
+    ) -> Option<R> {
+        match self {
+            Inner::Init(Init::Unbound((socket, _))) => Some(f(socket)),
+            Inner::Init(Init::Bound((bound, _, _))) => Some(bound.with_mut(&mut f)),
+            Inner::Connecting(connecting) => Some(connecting.with_mut(&mut f)),
+            Inner::Established(established) => Some(established.with_mut(&mut f)),
+            Inner::Listening(_) | Inner::Closed(_) => None,
+        }
+    }
+
+    pub fn with_socket<R, F>(&self, f: F) -> Option<R>
     where
         F: Fn(&smoltcp::socket::tcp::Socket<'static>) -> R,
     {
         match self {
             Inner::Init(init) => match init {
-                Init::Unbound((socket, _)) => f(socket),
-                Init::Bound((inner, _, _)) => inner.with(f),
+                Init::Unbound((socket, _)) => Some(f(socket)),
+                Init::Bound((inner, _, _)) => Some(inner.with(f)),
             },
-            Inner::Connecting(conn) => conn.with(f),
-            Inner::Listening(listen) => listen.inners[0].with(f),
-            Inner::Established(est) => est.with(f),
-            Inner::Closed(_) => {
-                // Closed 状态不应再触达任何 smoltcp socket。
-                // 调用者应当在更上层对 Closed 做分支处理。
-                panic!("Inner::with_socket called on Closed socket")
-            }
+            Inner::Connecting(conn) => Some(conn.with(f)),
+            Inner::Listening(listen) => listen.inners.first().map(|bound| bound.with(f)),
+            Inner::Established(est) => Some(est.with(f)),
+            Inner::Closed(_) => None,
         }
     }
 
@@ -1478,26 +1581,12 @@ impl Inner {
         }
     }
 
-    pub fn send_buffer_size(&self) -> usize {
-        match self {
-            Inner::Closed(_) => 0,
-            _ => self.with_socket(|socket| socket.send_capacity()),
-        }
-    }
-
-    pub fn recv_buffer_size(&self) -> usize {
-        match self {
-            Inner::Closed(_) => 0,
-            _ => self.with_socket(|socket| socket.recv_capacity()),
-        }
-    }
-
     pub fn stack(&self) -> Option<&alloc::sync::Arc<crate::net::tcp_stack::TcpStack>> {
         match self {
             Inner::Init(Init::Bound((inner, _, _))) => Some(inner.stack()),
             Inner::Init(Init::Unbound(_)) => None,
             Inner::Connecting(conn) => Some(conn.inner.stack()),
-            Inner::Listening(listen) => Some(listen.inners[0].stack()),
+            Inner::Listening(listen) => Some(&listen.stack),
             Inner::Established(est) => Some(est.inner.stack()),
             Inner::Closed(_) => None,
         }

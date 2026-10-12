@@ -45,17 +45,49 @@ fn validate_namespace_fd_flags(
 fn prepare_setns_install(
     current: &Arc<ProcessControlBlock>,
     new_nsproxy: Arc<NsProxy>,
+    new_fs: &mut Option<Arc<crate::filesystem::fs::FsStruct>>,
     new_cred: Option<Arc<Cred>>,
     installation_flags: CloneFlags,
     fs_refs: &FsRefsReadGuard,
-) -> Result<PreparedNamespaceInstall, SystemError> {
+) -> Result<PreparedNamespaceInstall, crate::mm::allocation::MemoryAllocationError> {
     PreparedNamespaceInstall::prepare_for_setns(
         current,
         new_nsproxy,
+        new_fs,
         new_cred,
         installation_flags.contains(CloneFlags::CLONE_NEWIPC),
         fs_refs,
     )
+}
+
+/// The exact namespace target is already pinned. Only its uncommitted fs
+/// preparation may retry, after releasing every topology/resource guard.
+fn install_setns(
+    current: &Arc<ProcessControlBlock>,
+    new_nsproxy: Arc<NsProxy>,
+    new_cred: Option<Arc<Cred>>,
+    flags: CloneFlags,
+) -> Result<(), SystemError> {
+    let mut recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
+    loop {
+        let mut new_fs = None;
+        let fs_refs = lock_fs_refs_copy();
+        match prepare_setns_install(
+            current,
+            new_nsproxy.clone(),
+            &mut new_fs,
+            new_cred.clone(),
+            flags,
+            &fs_refs,
+        ) {
+            Ok(prepared) => return prepared.commit(current, fs_refs),
+            Err(error) => {
+                drop(fs_refs);
+                drop(new_fs);
+                error.recover(&mut recovery)?;
+            }
+        }
+    }
 }
 
 fn can_setns_target_userns(
@@ -212,10 +244,7 @@ pub fn ksys_setns(fd: i32, nstype: i32) -> Result<(), SystemError> {
         }
 
         let new_nsproxy = Arc::new(new_inner);
-        let fs_refs = lock_fs_refs_copy();
-        let prepared = prepare_setns_install(&current, new_nsproxy, None, flags, &fs_refs)?;
-        prepared.commit(&current, fs_refs)?;
-        return Ok(());
+        return install_setns(&current, new_nsproxy, None, flags);
     }
 
     // namespace fd 路径：fd 指向 /proc/thread-self/ns/* 打开的命名空间
@@ -295,17 +324,7 @@ pub fn ksys_setns(fd: i32, nstype: i32) -> Result<(), SystemError> {
     let new_nsproxy = Arc::new(new_inner);
 
     // 5. 原子切换当前任务的 namespace 代理
-    let fs_refs = lock_fs_refs_copy();
-    let prepared = prepare_setns_install(
-        &current,
-        new_nsproxy,
-        new_cred,
-        installation_flags,
-        &fs_refs,
-    )?;
-    prepared.commit(&current, fs_refs)?;
-
-    Ok(())
+    install_setns(&current, new_nsproxy, new_cred, installation_flags)
 }
 
 /// 安装（切换）user namespace（对应 Linux userns_install）
@@ -354,6 +373,7 @@ mod tests {
         let prepared = prepare_setns_install(
             &pcb,
             old_nsproxy.clone(),
+            &mut None,
             None,
             CloneFlags::CLONE_NEWIPC,
             &fs_refs,

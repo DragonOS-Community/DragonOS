@@ -28,8 +28,29 @@ fn ownership_case(src: u32, fail: bool) -> Result<bool, SystemError> {
     };
     let map = Arc::new(BpfMap::new(Box::new(ArrayMap::new(&meta)?), meta));
     let weak = Arc::downgrade(&map);
-    let table = Arc::new(FileDescriptorTable::new(FdTableState::new()));
-    let fd = table.alloc_fd(File::new(map, FileFlags::O_RDWR)?, false, 16)?;
+    let task = crate::process::ProcessManager::current_pcb();
+    let table = File::recover_io(|| {
+        FileDescriptorTable::try_new(
+            FdTableState::new(),
+            &crate::cgroup::memory::object_for_task(&task),
+        )
+    })?;
+    let table = Arc::try_new(table).map_err(|_| SystemError::ENOMEM)?;
+    let storage = crate::filesystem::vfs::file::PreparedFile::new_recovering()?;
+    let file = Arc::try_new(File::new_prepared_recovering(
+        map,
+        FileFlags::O_RDWR,
+        storage,
+    )?)
+    .map_err(|_| SystemError::ENOMEM)?;
+    let fd = File::recover_io(|| {
+        table.alloc_fd_arc(
+            file.clone(),
+            false,
+            16,
+            &crate::cgroup::memory::object_for_task(&task),
+        )
+    })?;
     let mut insns = Vec::new();
     append_load(&mut insns, src, fd);
     // A duplicate must not acquire a second persistent map reference.

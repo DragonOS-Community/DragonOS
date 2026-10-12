@@ -49,9 +49,11 @@ pub(super) fn mknod_and_notify(
 
     let notify = || fsnotify::fsnotify(FsEvent::CREATE, Some((parent, name)), None, 0);
     if let Some(mounted) = parent.clone().downcast_arc::<MountFSInode>() {
-        mounted.mknod_with_post_commit(name, mode, dev, notify)
+        super::super::file::File::recover_io(|| {
+            mounted.mknod_with_post_commit(name, mode, dev, notify)
+        })
     } else {
-        parent.mknod(name, mode, dev)?;
+        super::super::file::File::recover_io(|| parent.mknod(name, mode, dev))?;
         notify();
         Ok(())
     }

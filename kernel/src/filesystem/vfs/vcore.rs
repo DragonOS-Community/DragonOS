@@ -562,8 +562,9 @@ pub fn do_mkdir_at(
         return Err(SystemError::ENAMETOOLONG);
     }
     if let Some(parent) = parent {
-        current_inode =
-            current_inode.lookup_follow_symlink(parent, VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
+        current_inode = crate::filesystem::vfs::file::File::recover_io(|| {
+            current_inode.lookup_follow_symlink(parent, VFS_MAX_FOLLOW_SYMLINK_TIMES)
+        })?;
     }
     let parent_md = current_inode.metadata()?;
     // 确保父节点是目录
@@ -608,9 +609,9 @@ pub fn do_mkdir_at(
         );
     };
     if let Some(mounted) = current_inode.clone().downcast_arc::<MountFSInode>() {
-        mounted.mkdir_with_post_commit(name, final_mode, notify)
+        super::file::File::recover_io(|| mounted.mkdir_with_post_commit(name, final_mode, notify))
     } else {
-        let inode = current_inode.mkdir(name, final_mode)?;
+        let inode = super::file::File::recover_io(|| current_inode.mkdir(name, final_mode))?;
         notify();
         Ok(inode)
     }
@@ -635,7 +636,9 @@ pub(super) fn resolve_parent_inode(
 ) -> Result<Arc<dyn IndexNode>, SystemError> {
     match parent_path {
         None => Ok(inode_begin),
-        Some(path) => inode_begin.lookup_follow_symlink(path, VFS_MAX_FOLLOW_SYMLINK_TIMES),
+        Some(path) => crate::filesystem::vfs::file::File::recover_io(|| {
+            inode_begin.lookup_follow_symlink(path, VFS_MAX_FOLLOW_SYMLINK_TIMES)
+        }),
     }
 }
 
@@ -700,9 +703,9 @@ pub fn do_remove_dir(dirfd: i32, path: &str) -> Result<u64, SystemError> {
         );
     };
     if let Some(mounted) = parent_inode.clone().downcast_arc::<MountFSInode>() {
-        mounted.rmdir_with_post_commit(filename, notify)?;
+        super::file::File::recover_io(|| mounted.rmdir_with_post_commit(filename, notify))?;
     } else {
-        parent_inode.rmdir(filename)?;
+        super::file::File::recover_io(|| parent_inode.rmdir(filename))?;
         notify();
     }
 
@@ -756,9 +759,9 @@ pub fn do_unlink_at(dirfd: i32, path: &str) -> Result<u64, SystemError> {
         );
     };
     if let Some(mounted) = parent_inode.clone().downcast_arc::<MountFSInode>() {
-        mounted.unlink_with_post_commit(filename, notify)?;
+        super::file::File::recover_io(|| mounted.unlink_with_post_commit(filename, notify))?;
     } else {
-        parent_inode.unlink(filename)?;
+        super::file::File::recover_io(|| parent_inode.unlink(filename))?;
         notify();
     }
     return Ok(0);
@@ -771,7 +774,9 @@ pub(super) fn do_file_lookup_at(
 ) -> Result<Arc<dyn IndexNode>, SystemError> {
     let (inode, path) = user_path_at(&ProcessManager::current_pcb(), dfd, path)?;
     let follow_final = lookup_flags.contains(LookUpFlags::FOLLOW);
-    return inode.lookup_follow_symlink2(&path, VFS_MAX_FOLLOW_SYMLINK_TIMES, follow_final);
+    return crate::filesystem::vfs::file::File::recover_io(|| {
+        inode.lookup_follow_symlink2(&path, VFS_MAX_FOLLOW_SYMLINK_TIMES, follow_final)
+    });
 }
 
 #[inline]
@@ -786,13 +791,13 @@ fn vfs_truncate_inner<F>(
     inode: Arc<dyn IndexNode>,
     len: usize,
     do_resize: F,
-) -> Result<(), SystemError>
+) -> Result<(), crate::mm::allocation::MemoryAllocationError>
 where
     F: FnOnce(
         &Arc<dyn IndexNode>,
         &Metadata,
         SetMetadataMask,
-    ) -> Result<SetMetadataMask, SystemError>,
+    ) -> Result<SetMetadataMask, crate::mm::allocation::MemoryAllocationError>,
 {
     let md = inode.metadata()?;
 
@@ -872,7 +877,7 @@ pub(crate) fn prepare_open_truncate(metadata_before_open: Metadata) -> OpenTrunc
 pub(crate) fn vfs_open_truncate(
     file: &File,
     context: &OpenTruncateContext,
-) -> Result<(), SystemError> {
+) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
     let inode = file.inode();
     validate_truncate(&inode, &context.requested, 0)?;
     let applied = inode.resize_open_truncate_result(
@@ -990,7 +995,10 @@ pub(crate) fn prepare_write_side_effect_metadata_with_cred(
 /// - 非普通文件返回 EINVAL
 /// - 只读挂载返回 EROFS
 #[inline(never)]
-pub fn vfs_truncate(inode: Arc<dyn IndexNode>, len: usize) -> Result<(), SystemError> {
+pub fn vfs_truncate(
+    inode: Arc<dyn IndexNode>,
+    len: usize,
+) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
     let lock_owner = current_file_lock_owner_id();
     vfs_truncate_inner(inode, len, |inode, metadata, mask| {
         inode.resize_with_metadata_result(len, lock_owner, metadata, mask)
@@ -1004,7 +1012,7 @@ pub fn vfs_truncate_file<'a>(
     len: usize,
     lock_owner: u64,
     data: impl FnOnce() -> MutexGuard<'a, FilePrivateData>,
-) -> Result<(), SystemError> {
+) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
     vfs_truncate_inner(inode, len, |inode, metadata, mask| {
         inode.resize_file_with_metadata_result(len, lock_owner, data(), metadata, mask)
     })
@@ -1033,7 +1041,7 @@ pub fn resize_based_fallocate(
     len: usize,
     lock_owner: u64,
     attrib: &mut super::AttribStageObserver<'_>,
-) -> Result<(), SystemError> {
+) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
     resize_based_fallocate_with_context(
         inode,
         mode,
@@ -1053,23 +1061,23 @@ pub fn resize_based_fallocate_with_context(
     lock_owner: u64,
     attrib: &mut super::AttribStageObserver<'_>,
     context: &super::permission::InodeOpContext,
-) -> Result<(), SystemError> {
+) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
     if mode != 0 {
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP.into());
     }
 
     if len == 0 {
-        return Err(SystemError::EINVAL);
+        return Err(SystemError::EINVAL.into());
     }
 
     let new_size = offset.checked_add(len).ok_or(SystemError::EFBIG)?;
     if new_size > isize::MAX as usize {
-        return Err(SystemError::EFBIG);
+        return Err(SystemError::EFBIG.into());
     }
 
     let md = inode.metadata()?;
     if md.file_type != FileType::File {
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP.into());
     }
 
     // The filesystem re-reads size and metadata inside its native mutation
@@ -1090,7 +1098,7 @@ pub fn vfs_fallocate_file(
     mode: i32,
     offset: usize,
     len: usize,
-) -> Result<(), SystemError> {
+) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
     const FALLOC_FL_KEEP_SIZE: u32 = 0x01;
     const FALLOC_FL_PUNCH_HOLE: u32 = 0x02;
     const FALLOC_FL_COLLAPSE_RANGE: u32 = 0x08;
@@ -1105,57 +1113,57 @@ pub fn vfs_fallocate_file(
         | FALLOC_FL_UNSHARE_RANGE;
 
     if len == 0 || offset > isize::MAX as usize || len > isize::MAX as usize {
-        return Err(SystemError::EINVAL);
+        return Err(SystemError::EINVAL.into());
     }
     // VFS-layer s_maxbytes upper-bound guard (aligned with Linux do_fallocate): offset+len must not overflow or exceed isize::MAX.
     // Each filesystem implementation re-validates on its own, but the VFS layer should not leave a gap.
     let new_size = offset.checked_add(len).ok_or(SystemError::EFBIG)?;
     if new_size > isize::MAX as usize {
-        return Err(SystemError::EFBIG);
+        return Err(SystemError::EFBIG.into());
     }
 
     let mode_bits = mode as u32;
     if mode < 0 || (mode_bits & !FALLOC_FL_SUPPORTED_MASK) != 0 {
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP.into());
     }
     if (mode_bits & (FALLOC_FL_PUNCH_HOLE | FALLOC_FL_ZERO_RANGE))
         == (FALLOC_FL_PUNCH_HOLE | FALLOC_FL_ZERO_RANGE)
     {
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP.into());
     }
     if (mode_bits & FALLOC_FL_PUNCH_HOLE) != 0 && (mode_bits & FALLOC_FL_KEEP_SIZE) == 0 {
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP.into());
     }
     if (mode_bits & FALLOC_FL_COLLAPSE_RANGE) != 0 && (mode_bits & !FALLOC_FL_COLLAPSE_RANGE) != 0 {
-        return Err(SystemError::EINVAL);
+        return Err(SystemError::EINVAL.into());
     }
     if (mode_bits & FALLOC_FL_INSERT_RANGE) != 0 && (mode_bits & !FALLOC_FL_INSERT_RANGE) != 0 {
-        return Err(SystemError::EINVAL);
+        return Err(SystemError::EINVAL.into());
     }
     if (mode_bits & FALLOC_FL_UNSHARE_RANGE) != 0
         && (mode_bits & !(FALLOC_FL_UNSHARE_RANGE | FALLOC_FL_KEEP_SIZE)) != 0
     {
-        return Err(SystemError::EINVAL);
+        return Err(SystemError::EINVAL.into());
     }
 
     let mode_flags = file.mode();
     if mode_flags.contains(FileMode::FMODE_PATH) {
-        return Err(SystemError::EBADF);
+        return Err(SystemError::EBADF.into());
     }
     if !mode_flags.contains(FileMode::FMODE_WRITE) || !mode_flags.can_write() {
-        return Err(SystemError::EBADF);
+        return Err(SystemError::EBADF.into());
     }
 
     let inode = file.inode();
     let md = inode.metadata()?;
     if md.flags.contains(InodeFlags::S_APPEND) && (mode_bits & !FALLOC_FL_KEEP_SIZE) != 0 {
-        return Err(SystemError::EPERM);
+        return Err(SystemError::EPERM.into());
     }
     if md.flags.contains(InodeFlags::S_IMMUTABLE) {
-        return Err(SystemError::EPERM);
+        return Err(SystemError::EPERM.into());
     }
     if md.flags.contains(InodeFlags::S_SWAPFILE) {
-        return Err(SystemError::ETXTBSY);
+        return Err(SystemError::ETXTBSY.into());
     }
 
     let fs = inode.fs();
@@ -1164,15 +1172,15 @@ pub fn vfs_fallocate_file(
             .mount_flags()
             .contains(crate::filesystem::vfs::mount::MountFlags::RDONLY)
         {
-            return Err(SystemError::EROFS);
+            return Err(SystemError::EROFS.into());
         }
     }
 
     match md.file_type {
         FileType::File | FileType::BlockDevice => {}
-        FileType::Dir => return Err(SystemError::EISDIR),
-        FileType::Pipe => return Err(SystemError::ESPIPE),
-        _ => return Err(SystemError::ENODEV),
+        FileType::Dir => return Err(SystemError::EISDIR.into()),
+        FileType::Pipe => return Err(SystemError::ESPIPE.into()),
+        _ => return Err(SystemError::ENODEV.into()),
     }
 
     let mut publish_attrib = || file.notify_dentry_event(FsEvent::ATTRIB);

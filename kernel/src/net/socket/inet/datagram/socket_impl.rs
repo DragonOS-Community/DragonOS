@@ -118,36 +118,39 @@ impl Socket for UdpSocket {
                     return self.disconnect_udp();
                 }
 
-                // The connected peer participates in send-side interface
-                // selection, so keep it stable while readers classify a send.
-                let _placement = self.iface_placement.write();
                 let remote = Self::normalize_unspecified_dest(remote);
-                if !self.is_bound() {
+                loop {
+                    // Like inet_autobind before prot->connect, this stage owns
+                    // its own placement transaction. Preparation/recovery must
+                    // not run under the subsequent peer-publication lock.
                     self.bind_ephemeral(remote.addr)?;
-                }
-                let local = match self.inner.read().as_ref() {
-                    Some(UdpInner::Bound(inner)) => inner.endpoint(),
-                    Some(_) => return Err(SystemError::ENOTCONN),
-                    None => return Err(SystemError::EBADF),
-                };
-                let (required_oif, multicast_source) =
-                    output_flow::socket_constraints(self, remote.addr)?;
-                let connected_source = output_flow::resolve_ipv4_send_flow(
-                    &self.netns,
-                    local,
-                    remote.addr,
-                    required_oif,
-                    multicast_source,
-                )?
-                .map(|flow| flow.source);
-                match self.inner.read().as_ref() {
-                    Some(UdpInner::Bound(inner)) => {
-                        inner.connect(remote, connected_source);
-                        self.receive_queue.connect(remote, connected_source);
-                        Ok(())
-                    }
-                    Some(_) => Err(SystemError::ENOTCONN),
-                    None => Err(SystemError::EBADF),
+                    let _placement = self.iface_placement.write();
+                    let local = match self.inner.read().as_ref() {
+                        Some(UdpInner::Bound(inner)) => inner.endpoint(),
+                        // A concurrent disconnect may remove the implicit bind
+                        // before we acquire placement. No peer was published yet.
+                        Some(_) => continue,
+                        None => return Err(SystemError::EBADF),
+                    };
+                    let (required_oif, multicast_source) =
+                        output_flow::socket_constraints(self, remote.addr)?;
+                    let connected_source = output_flow::resolve_ipv4_send_flow(
+                        &self.netns,
+                        local,
+                        remote.addr,
+                        required_oif,
+                        multicast_source,
+                    )?
+                    .map(|flow| flow.source);
+                    return match self.inner.read().as_ref() {
+                        Some(UdpInner::Bound(inner)) => {
+                            inner.connect(remote, connected_source);
+                            self.receive_queue.connect(remote, connected_source);
+                            Ok(())
+                        }
+                        Some(_) => Err(SystemError::ENOTCONN),
+                        None => Err(SystemError::EBADF),
+                    };
                 }
             }
             Endpoint::Unspecified => {

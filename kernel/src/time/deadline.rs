@@ -1,10 +1,15 @@
 //! Fixed-owner monotonic deadline events, sharing the architecture clockevent
 //! with the ordinary scheduler tick. This is not a userspace hrtimer API.
-use alloc::{collections::BTreeMap, sync::Arc};
+use alloc::{boxed::Box, sync::Arc};
 use core::{
+    alloc::AllocError,
     fmt::Debug,
     sync::atomic::{AtomicBool, Ordering},
 };
+
+#[path = "deadline_queue.rs"]
+mod queue;
+use queue::{DeadlineQueue, Node};
 use system_error::SystemError;
 
 use super::{clocksource::HZ, tick_common::tick_handle_periodic, timekeeping};
@@ -25,6 +30,7 @@ static QUEUES: [SpinLock<Queue>; PerCpu::MAX_CPU_NUM as usize] =
     [const { SpinLock::new(Queue::new()) }; PerCpu::MAX_CPU_NUM as usize];
 
 type Key = (u64, usize);
+#[derive(Debug)]
 struct Pending {
     event: Arc<DeadlineEvent>,
     generation: u64,
@@ -32,14 +38,14 @@ struct Pending {
 struct Queue {
     ready: bool,
     next_tick: u64,
-    pending: BTreeMap<Key, Pending>,
+    pending: DeadlineQueue,
 }
 impl Queue {
     const fn new() -> Self {
         Self {
             ready: false,
             next_tick: 0,
-            pending: BTreeMap::new(),
+            pending: DeadlineQueue::new(),
         }
     }
 }
@@ -55,6 +61,7 @@ pub trait DeadlineCallback: Debug + Send + Sync {
 struct State {
     generation: u64,
     queued: Option<Key>,
+    spare: Option<Box<Node>>,
 }
 #[derive(Debug)]
 pub struct DeadlineEvent {
@@ -65,12 +72,21 @@ pub struct DeadlineEvent {
 
 impl DeadlineEvent {
     pub fn new(owner: ProcessorId, callback: Arc<dyn DeadlineCallback>) -> Arc<Self> {
-        Arc::new(Self {
+        Self::try_new(owner, callback).expect("deadline event allocation failed")
+    }
+
+    pub fn try_new(
+        owner: ProcessorId,
+        callback: Arc<dyn DeadlineCallback>,
+    ) -> Result<Arc<Self>, AllocError> {
+        let spare = Node::try_new()?;
+        Arc::try_new(Self {
             owner,
             callback,
             state: SpinLock::new(State {
                 generation: 0,
                 queued: None,
+                spare: Some(spare),
             }),
         })
     }
@@ -87,47 +103,66 @@ impl DeadlineEvent {
         if self.owner != smp_get_processor_id() && !remote_supported() {
             return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
         }
-        let mut state = self.state.lock_irqsave();
         let mut queue = QUEUES[self.owner.data() as usize].lock_irqsave();
         if !queue.ready {
             return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
         }
-        if let Some(key) = state.queued.take() {
-            queue.pending.remove(&key);
-        }
+        let mut state = self.state.lock_irqsave();
+        let mut node = if let Some(key) = state.queued.take() {
+            queue
+                .pending
+                .remove(&key)
+                .expect("queued deadline node missing")
+        } else {
+            state.spare.take().expect("idle deadline spare missing")
+        };
         state.generation = state.generation.wrapping_add(1);
         let key = (deadline_ns, Arc::as_ptr(self) as usize);
-        queue.pending.insert(
-            key,
-            Pending {
+        node.key = key;
+        if let Some(pending) = node.pending.as_mut() {
+            pending.generation = state.generation;
+        } else {
+            node.pending = Some(Pending {
                 event: self.clone(),
                 generation: state.generation,
-            },
-        );
+            });
+        }
+        queue.pending.insert(node);
         state.queued = Some(key);
         if self.owner == smp_get_processor_id() {
             program_locked(&queue);
         }
-        drop(queue);
         drop(state);
+        drop(queue);
         kick_owner(self.owner);
         Ok(())
     }
 
     /// Cancels queued/rearm work; a callback already entered may finish.
     pub fn cancel(&self) {
+        let Some(owner_queue) = QUEUES.get(self.owner.data() as usize) else {
+            // Such an event can never arm; cancellation remains a safe no-op.
+            return;
+        };
+        let mut queue = owner_queue.lock_irqsave();
         let mut state = self.state.lock_irqsave();
         state.generation = state.generation.wrapping_add(1);
         let Some(key) = state.queued.take() else {
             return;
         };
-        let mut queue = QUEUES[self.owner.data() as usize].lock_irqsave();
-        queue.pending.remove(&key);
+        let mut node = queue
+            .pending
+            .remove(&key)
+            .expect("queued deadline node missing");
+        let retired = node.pending.take();
+        assert!(state.spare.is_none());
+        state.spare = Some(node);
         if self.owner == smp_get_processor_id() {
             program_locked(&queue);
         }
-        drop(queue);
         drop(state);
+        drop(queue);
+        drop(retired);
         kick_owner(self.owner);
     }
 }
@@ -213,8 +248,8 @@ fn program_locked(queue: &Queue) {
     }
     let next = queue
         .pending
-        .first_key_value()
-        .map_or(queue.next_tick, |(key, _)| key.0.min(queue.next_tick));
+        .first_key()
+        .map_or(queue.next_tick, |key| key.0.min(queue.next_tick));
     let delta = next.saturating_sub(now_ns()).max(1);
     #[cfg(target_arch = "x86_64")]
     crate::arch::driver::apic::apic_timer::program_deadline_delta(delta);
@@ -263,14 +298,11 @@ pub fn handle_irq(frame: &TrapFrame) {
         let now = now_ns();
         let pending = {
             let mut queue = QUEUES[cpu.data() as usize].lock_irqsave();
-            if queue
-                .pending
-                .first_key_value()
-                .is_none_or(|(key, _)| key.0 > now)
-            {
+            if queue.pending.first_key().is_none_or(|key| key.0 > now) {
                 None
             } else {
-                queue.pending.pop_first()
+                let node = queue.pending.pop_first().unwrap();
+                Some(restore_spare(node))
             }
         };
         let Some((key, pending)) = pending else {
@@ -281,33 +313,51 @@ pub fn handle_irq(frame: &TrapFrame) {
     reprogram_local();
 }
 
-fn dispatch_pending(key: Key, pending: Pending, now: u64) {
+/// Caller holds the owner queue. Restore the single spare before releasing it,
+/// so a remote arm can immediately reuse the node even while dispatch is pending.
+fn restore_spare(mut node: Box<Node>) -> (Key, Pending) {
+    let key = node.key;
+    let pending = node
+        .pending
+        .take()
+        .expect("queued deadline payload missing");
+    {
+        let mut state = pending.event.state.lock_irqsave();
+        assert_eq!(state.queued, Some(key));
+        assert_eq!(state.generation, pending.generation);
+        assert!(state.spare.is_none());
+        state.queued = None;
+        state.spare = Some(node);
+    }
+    (key, pending)
+}
+
+fn dispatch_pending(_key: Key, pending: Pending, now: u64) {
     let event = pending.event;
     {
-        let mut state = event.state.lock_irqsave();
-        if state.generation != pending.generation || state.queued != Some(key) {
+        let state = event.state.lock_irqsave();
+        if state.generation != pending.generation {
             return;
         }
-        state.queued = None;
     }
     finish_callback(&event, pending.generation, now);
 }
 
 fn finish_callback(event: &Arc<DeadlineEvent>, generation: u64, now: u64) {
     if let Some(deadline) = event.callback.expire(now) {
+        let mut queue = QUEUES[event.owner.data() as usize].lock_irqsave();
         let mut state = event.state.lock_irqsave();
-        if state.generation != generation {
+        if state.generation != generation || state.queued.is_some() {
             return;
         }
         let key = (deadline, Arc::as_ptr(event) as usize);
-        let mut queue = QUEUES[event.owner.data() as usize].lock_irqsave();
-        queue.pending.insert(
-            key,
-            Pending {
-                event: event.clone(),
-                generation,
-            },
-        );
+        let mut node = state.spare.take().expect("idle deadline spare missing");
+        node.key = key;
+        node.pending = Some(Pending {
+            event: event.clone(),
+            generation,
+        });
+        queue.pending.insert(node);
         state.queued = Some(key);
     }
 }
@@ -321,6 +371,7 @@ pub fn run_selftests() {
     struct Probe {
         calls: AtomicU64,
         cancel: AtomicBool,
+        arm: AtomicBool,
         event: SpinLock<Weak<DeadlineEvent>>,
     }
     impl DeadlineCallback for Probe {
@@ -330,18 +381,25 @@ pub fn run_selftests() {
                 let event = self.event.lock_irqsave().upgrade();
                 event.unwrap().cancel();
             }
+            if self.arm.load(Ordering::Relaxed) {
+                let event = self.event.lock_irqsave().upgrade();
+                event.unwrap().arm(now.saturating_add(2 * TICK_NS)).unwrap();
+            }
             Some(now.saturating_add(TICK_NS))
         }
     }
-    let irq = unsafe { CurrentIrqArch::save_and_disable_irq() };
+    let _preempt = crate::process::preempt::PreemptGuard::new();
     if supported() {
         let probe = Arc::new(Probe {
             calls: AtomicU64::new(0),
             cancel: AtomicBool::new(false),
+            arm: AtomicBool::new(false),
             event: SpinLock::new(Weak::new()),
         });
         let event = DeadlineEvent::new(smp_get_processor_id(), probe.clone());
         *probe.event.lock_irqsave() = Arc::downgrade(&event);
+        let irq = unsafe { CurrentIrqArch::save_and_disable_irq() };
+        let node_identity = state_spare_identity(&event);
         let now = now_ns();
         let deadline = now.saturating_add(TICK_NS);
         event
@@ -352,8 +410,10 @@ pub fn run_selftests() {
             .lock_irqsave()
             .pending
             .remove(&key)
+            .map(|node| restore_spare(node).1)
             .unwrap();
         event.cancel();
+
         dispatch_pending(key, popped, deadline);
         assert_eq!(
             probe.calls.load(Ordering::Relaxed),
@@ -367,6 +427,7 @@ pub fn run_selftests() {
             .lock_irqsave()
             .pending
             .remove(&key)
+            .map(|node| restore_spare(node).1)
             .unwrap();
         dispatch_pending(key, popped, deadline);
         assert_eq!(probe.calls.load(Ordering::Relaxed), 1);
@@ -376,6 +437,40 @@ pub fn run_selftests() {
         );
         event.cancel();
 
+        // Pop atomically returns the spare. A new explicit arm can reuse it
+        // before dispatch; the old popped generation must not call/rearm.
+        event.arm(deadline).unwrap();
+        let key = event.state.lock_irqsave().queued.unwrap();
+        let popped = QUEUES[event.owner.data() as usize]
+            .lock_irqsave()
+            .pending
+            .remove(&key)
+            .map(|node| restore_spare(node).1)
+            .unwrap();
+        event.arm(deadline.saturating_add(TICK_NS)).unwrap();
+        dispatch_pending(key, popped, deadline);
+        assert_eq!(probe.calls.load(Ordering::Relaxed), 1);
+        event.cancel();
+
+        probe.arm.store(true, Ordering::Relaxed);
+        event.arm(deadline).unwrap();
+        let key = event.state.lock_irqsave().queued.unwrap();
+        let popped = QUEUES[event.owner.data() as usize]
+            .lock_irqsave()
+            .pending
+            .remove(&key)
+            .map(|node| restore_spare(node).1)
+            .unwrap();
+        dispatch_pending(key, popped, deadline);
+        assert_eq!(probe.calls.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            event.state.lock_irqsave().queued.unwrap().0,
+            deadline.saturating_add(2 * TICK_NS),
+            "explicit callback arm must defeat automatic old rearm"
+        );
+        event.cancel();
+        probe.arm.store(false, Ordering::Relaxed);
+
         probe.cancel.store(true, Ordering::Relaxed);
         event.arm(deadline).unwrap();
         let key = event.state.lock_irqsave().queued.unwrap();
@@ -383,9 +478,10 @@ pub fn run_selftests() {
             .lock_irqsave()
             .pending
             .remove(&key)
+            .map(|node| restore_spare(node).1)
             .unwrap();
         dispatch_pending(key, popped, deadline);
-        assert_eq!(probe.calls.load(Ordering::Relaxed), 2);
+        assert_eq!(probe.calls.load(Ordering::Relaxed), 3);
         assert!(
             event.state.lock_irqsave().queued.is_none(),
             "callback cancel must prevent old rearm"
@@ -393,11 +489,20 @@ pub fn run_selftests() {
         assert!(!QUEUES[event.owner.data() as usize]
             .lock_irqsave()
             .pending
-            .values()
-            .any(|p| Arc::ptr_eq(&p.event, &event)));
+            .contains_key(&key));
+        assert_eq!(state_spare_identity(&event), node_identity);
         reprogram_local();
+        drop(irq);
     }
-    drop(irq);
+}
+
+fn state_spare_identity(event: &DeadlineEvent) -> usize {
+    event
+        .state
+        .lock_irqsave()
+        .spare
+        .as_deref()
+        .map_or(0, |node| node as *const Node as usize)
 }
 
 /// Exercise real interrupt delivery after a local clockevent downgrade. This

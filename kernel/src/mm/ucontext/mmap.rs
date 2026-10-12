@@ -16,6 +16,10 @@ impl InnerAddressSpace {
     /// ## Returns
     ///
     /// Returns the starting virtual page frame of the mapping
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Mapping policy, table creator and data account are independent owners"
+    )]
     pub fn map_anonymous(
         &mut self,
         start_vaddr: VirtAddr,
@@ -24,7 +28,9 @@ impl InnerAddressSpace {
         map_flags: MapFlags,
         round_to_min: bool,
         allocate_at_once: bool,
-    ) -> Result<VirtPageFrame, SystemError> {
+        creator: Option<&Arc<ObjectAccount>>,
+        data_account: &Arc<crate::cgroup::memory::MemoryAccount>,
+    ) -> Result<VirtPageFrame, MemoryAllocationError> {
         let (page, notifications) = match self.map_anonymous_collect(
             start_vaddr,
             len,
@@ -32,6 +38,8 @@ impl InnerAddressSpace {
             map_flags,
             round_to_min,
             allocate_at_once,
+            creator,
+            data_account,
             |_, _| Ok(()),
         ) {
             Ok(outcome) => outcome,
@@ -42,7 +50,7 @@ impl InnerAddressSpace {
                 );
                 if !failure.notifications.is_empty() {
                     error!("locked map_anonymous failed after replacing existing VMAs");
-                    return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+                    return Err(SystemError::EAGAIN_OR_EWOULDBLOCK.into());
                 }
                 return Err(failure.err);
             }
@@ -52,7 +60,7 @@ impl InnerAddressSpace {
             "locked map_anonymous caller must not replace existing VMAs"
         );
         if !notifications.is_empty() {
-            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK.into());
         }
         Ok(page)
     }
@@ -66,6 +74,8 @@ impl InnerAddressSpace {
         map_flags: MapFlags,
         round_to_min: bool,
         allocate_at_once: bool,
+        creator: Option<&Arc<ObjectAccount>>,
+        data_account: &Arc<crate::cgroup::memory::MemoryAccount>,
         before_replace: F,
     ) -> Result<(VirtPageFrame, VmaCloseNotifications), MmapFailure>
     where
@@ -89,6 +99,7 @@ impl InnerAddressSpace {
         // debug!("map_anonymous: len = {}", len);
 
         let fixed_hint = map_flags.intersects(MapFlags::MAP_FIXED | MapFlags::MAP_FIXED_NOREPLACE);
+        let mm = self.outer_addr_space().ok_or(SystemError::EFAULT)?;
         let (start_page, notifications) = self.mmap_collect(
             AddressSpace::round_mmap_hint(start_vaddr, round_to_min, fixed_hint),
             PageFrameCount::from_bytes(len).unwrap(),
@@ -96,22 +107,37 @@ impl InnerAddressSpace {
             map_flags,
             move |page, count, vm_flags, flags, mapper, flusher| {
                 if allocate_at_once {
-                    let vma =
-                        VMA::zeroed(page, count, vm_flags, flags, mapper, flusher, None, None)?;
-                    Ok(vma)
-                } else {
-                    let vma = LockedVMA::new(VMA::new(
-                        VirtRegion::new(page.virt_address(), count.data() * MMArch::PAGE_SIZE),
+                    let vma = VMA::zeroed(
+                        page,
+                        count,
                         vm_flags,
                         flags,
+                        mapper,
+                        flusher,
                         None,
                         None,
-                        false,
-                    ));
+                        &mm,
+                        creator,
+                        data_account,
+                    )?;
+                    Ok(vma)
+                } else {
+                    let vma = LockedVMA::try_new(
+                        VMA::new(
+                            VirtRegion::new(page.virt_address(), count.data() * MMArch::PAGE_SIZE),
+                            vm_flags,
+                            flags,
+                            None,
+                            None,
+                            false,
+                        ),
+                        creator.ok_or(SystemError::EINVAL)?,
+                    )?;
                     Ok(vma)
                 }
             },
             before_replace,
+            creator.ok_or(SystemError::EINVAL)?,
         )?;
 
         return Ok((start_page, notifications));
@@ -134,6 +160,10 @@ impl InnerAddressSpace {
     /// # Errors
     ///
     /// - `EINVAL`: Invalid argument
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Preserve mapping inputs, mutation callback and explicit creator"
+    )]
     fn mmap_collect<
         F: FnOnce(
             VirtPageFrame,
@@ -142,7 +172,7 @@ impl InnerAddressSpace {
             EntryFlags<MMArch>,
             &mut PageMapper,
             &mut dyn Flusher<MMArch>,
-        ) -> Result<Arc<LockedVMA>, SystemError>,
+        ) -> Result<Arc<LockedVMA>, MemoryAllocationError>,
         B: FnMut(&mut Self, &[VirtRegion]) -> Result<(), SystemError>,
     >(
         &mut self,
@@ -152,6 +182,7 @@ impl InnerAddressSpace {
         map_flags: MapFlags,
         map_func: F,
         mut before_replace: B,
+        creator: &Arc<ObjectAccount>,
     ) -> Result<(VirtPageFrame, VmaCloseNotifications), MmapFailure> {
         if page_count == PageFrameCount::new(0) {
             return Err(SystemError::EINVAL.into());
@@ -181,7 +212,7 @@ impl InnerAddressSpace {
         macro_rules! mmap_fail {
             ($err:expr) => {
                 return Err(MmapFailure {
-                    err: $err,
+                    err: ($err).into(),
                     notifications,
                 })
             };
@@ -203,6 +234,7 @@ impl InnerAddressSpace {
                     vaddr,
                     page_count.bytes(),
                     map_flags,
+                    creator
                 ))
             }
             None => self
@@ -227,6 +259,7 @@ impl InnerAddressSpace {
             let prepared = match self.prepare_munmap(
                 VirtPageFrame::new(region.start()),
                 PageFrameCount::from_bytes(region.size()).unwrap(),
+                creator,
             ) {
                 Ok(prepared) => prepared,
                 Err(failure) => {

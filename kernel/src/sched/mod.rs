@@ -10,6 +10,7 @@ pub mod fifo_demo;
 pub mod idle;
 pub mod loadavg;
 pub mod pelt;
+mod pelt_list;
 pub mod policy;
 pub mod prio;
 pub mod realtime;
@@ -303,7 +304,8 @@ pub struct TaskGroup {
     pub(crate) load_avg: core::sync::atomic::AtomicU64,
     pub(crate) idle: core::sync::atomic::AtomicBool,
     pub(crate) children: [SpinLock<Vec<Weak<TaskGroup>>>; PerCpu::MAX_CPU_NUM as usize],
-    pub(crate) bandwidth: Arc<cfs_bandwidth::CfsBandwidth>,
+    /// Initialized exactly once before this group is registered or published.
+    pub(crate) bandwidth: Lazy<Arc<cfs_bandwidth::CfsBandwidth>>,
     pub(crate) retired: core::sync::atomic::AtomicBool,
 }
 
@@ -518,8 +520,9 @@ pub struct CpuRunQueue {
     /// CFS调度器
     cfs: Arc<CfsRunQueue>,
     /// CPU-local active/blocked CFS queues in child-before-parent order.
-    /// Weak entries do not pin deleted CPU controller instances.
-    cfs_pelt_queues: Vec<Weak<CfsRunQueue>>,
+    /// Weak payloads do not pin deleted CPU controller instances. Unique nodes
+    /// are prepared by each CFS queue, not allocated during wakeup or tick.
+    cfs_pelt_queues: pelt_list::PeltList,
 
     rt: realtime::RealtimeRunQueue,
 
@@ -558,7 +561,7 @@ impl CpuRunQueue {
             calc_load_update: clock() + (5 * HZ + 1),
             calc_load_active: 0,
             cfs: Arc::new(CfsRunQueue::new()),
-            cfs_pelt_queues: Vec::new(),
+            cfs_pelt_queues: pelt_list::PeltList::default(),
             rt: realtime::RealtimeRunQueue::new(),
             clock_pelt: 0,
             lost_idle_time: 0,
@@ -1190,11 +1193,14 @@ pub fn scheduler_tick() {
         SchedClass::Fair => CompletelyFairScheduler::tick(rq, current, false),
         SchedClass::Idle => IdleScheduler::tick(rq, current, false),
     }
-    CompletelyFairScheduler::update_blocked_averages(rq);
+    let retired_pelt = CompletelyFairScheduler::update_blocked_averages(rq);
 
     rq.calculate_global_load_tick();
 
     drop(guard);
+    // Expired Weak payloads can free their control block; never do this under
+    // the runqueue lock. PeltNode Drop iteratively destroys the owned chain.
+    drop(retired_pelt);
     // TODO:处理负载均衡
 }
 
@@ -1686,6 +1692,7 @@ pub fn sched_init() {
 
     // 初始化 per-CPU CPU 时间统计
     cputime::init_kernel_cpu_stat();
+    cfs_bandwidth::init_runtime_events();
 }
 
 #[inline]

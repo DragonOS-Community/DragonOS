@@ -64,8 +64,8 @@ impl IndexNode for TracepointPerfEvent {
         _len: usize,
         _buf: &mut [u8],
         _data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize> {
-        panic!("read_at not implemented for TracepointPerfEvent");
+    ) -> core::result::Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        panic!("read_at not implemented for TracepointPerfEvent")
     }
 
     fn write_at(
@@ -74,8 +74,8 @@ impl IndexNode for TracepointPerfEvent {
         _len: usize,
         _buf: &[u8],
         _data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize> {
-        panic!("write_at not implemented for TracepointPerfEvent");
+    ) -> core::result::Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        panic!("write_at not implemented for TracepointPerfEvent")
     }
 
     fn fs(&self) -> Arc<dyn FileSystem> {

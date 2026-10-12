@@ -41,7 +41,9 @@ pub fn do_readlink_at(
     } else {
         let (start, path) = user_path_at(&ProcessManager::current_pcb(), dirfd, &path)?;
         (
-            start.lookup_follow_symlink2(&path, VFS_MAX_FOLLOW_SYMLINK_TIMES, false)?,
+            crate::filesystem::vfs::file::File::recover_io(|| {
+                start.lookup_follow_symlink2(&path, VFS_MAX_FOLLOW_SYMLINK_TIMES, false)
+            })?,
             None,
         )
     };
@@ -64,7 +66,9 @@ pub fn do_readlink_at(
     buffer.resize(capacity, 0);
     let private_data = Mutex::new(FilePrivateData::Unused);
     loop {
-        let len = inode.read_at(0, capacity, &mut buffer, private_data.lock())?;
+        let len = super::super::file::File::recover_io(|| {
+            inode.read_at(0, capacity, &mut buffer, private_data.lock())
+        })?;
         if len > capacity {
             return Err(SystemError::EIO);
         }

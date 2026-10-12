@@ -1,3 +1,5 @@
+use crate::cgroup::memory::{object::ObjectAccount, MemoryAccount};
+use crate::mm::allocation::MemoryAllocationError;
 use crate::{
     arch::{CurrentTimeArch, MMArch},
     driver::base::device::device_number::{DeviceNumber, Major},
@@ -300,8 +302,10 @@ struct Ext4MmapWriteRetryWait {
 }
 
 impl FaultRetryWait for Ext4MmapWriteRetryWait {
-    fn wait(&self) -> Result<(), SystemError> {
-        self.inode.wait_for_mmap_write()
+    fn wait(&self) -> Result<(), MemoryAllocationError> {
+        self.inode
+            .wait_for_mmap_write()
+            .map_err(MemoryAllocationError::System)
     }
 }
 
@@ -2162,7 +2166,7 @@ impl IndexNode for LockedExt4Inode {
         &self,
         _data: crate::libs::mutex::MutexGuard<vfs::FilePrivateData>,
         _mode: &vfs::file::FileFlags,
-    ) -> Result<(), SystemError> {
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         Ok(())
     }
 
@@ -2171,7 +2175,7 @@ impl IndexNode for LockedExt4Inode {
         name: &str,
         file_type: vfs::FileType,
         mode: vfs::InodeMode,
-    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+    ) -> Result<Arc<dyn IndexNode>, crate::mm::allocation::MemoryAllocationError> {
         self.create_with_context(
             name,
             file_type,
@@ -2185,7 +2189,7 @@ impl IndexNode for LockedExt4Inode {
         name: &str,
         mode: InodeMode,
         context: &vfs::permission::InodeOpContext,
-    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+    ) -> Result<Arc<dyn IndexNode>, crate::mm::allocation::MemoryAllocationError> {
         self.create_with_context(name, vfs::FileType::Dir, mode, context)
     }
 
@@ -2195,7 +2199,7 @@ impl IndexNode for LockedExt4Inode {
         file_type: vfs::FileType,
         mode: InodeMode,
         context: &vfs::permission::InodeOpContext,
-    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+    ) -> Result<Arc<dyn IndexNode>, crate::mm::allocation::MemoryAllocationError> {
         let _operation = self.begin_operation()?;
         let _io = self.io_lock.lock();
         let _namespace = self.namespace_lock.lock();
@@ -2333,7 +2337,7 @@ impl IndexNode for LockedExt4Inode {
         file_type: vfs::FileType,
         mode: InodeMode,
         data: usize,
-    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+    ) -> Result<Arc<dyn IndexNode>, crate::mm::allocation::MemoryAllocationError> {
         self.create_with_data_context(
             name,
             file_type,
@@ -2350,15 +2354,19 @@ impl IndexNode for LockedExt4Inode {
         mode: InodeMode,
         data: usize,
         context: &vfs::permission::InodeOpContext,
-    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+    ) -> Result<Arc<dyn IndexNode>, crate::mm::allocation::MemoryAllocationError> {
         if data == 0 {
             return self.create_with_context(name, file_type, mode, context);
         }
 
-        Err(SystemError::ENOSYS)
+        Err(SystemError::ENOSYS.into())
     }
 
-    fn symlink(&self, name: &str, target: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
+    fn symlink(
+        &self,
+        name: &str,
+        target: &str,
+    ) -> Result<Arc<dyn IndexNode>, crate::mm::allocation::MemoryAllocationError> {
         self.symlink_with_context(name, target, &vfs::permission::InodeOpContext::legacy())
     }
 
@@ -2367,7 +2375,7 @@ impl IndexNode for LockedExt4Inode {
         name: &str,
         target: &str,
         context: &vfs::permission::InodeOpContext,
-    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+    ) -> Result<Arc<dyn IndexNode>, crate::mm::allocation::MemoryAllocationError> {
         let _operation = self.begin_operation()?;
         let _io = self.io_lock.lock();
         let _namespace = self.namespace_lock.lock();
@@ -2416,7 +2424,7 @@ impl IndexNode for LockedExt4Inode {
         len: usize,
         buf: &mut [u8],
         data: PrivateData,
-    ) -> Result<usize, SystemError> {
+    ) -> Result<usize, MemoryAllocationError> {
         let _operation = self.begin_operation()?;
         let len = core::cmp::min(len, buf.len());
         let buf = &mut buf[0..len];
@@ -2434,9 +2442,13 @@ impl IndexNode for LockedExt4Inode {
             // 性能优化：不再每次 read 都同步更新 atime 到磁盘。
             // 这等同于 Linux 的 noatime 挂载选项，避免每次读取引发
             // read_inode + write_inode 的额外磁盘 I/O。
-            page_cache.read(offset, buf)
+            drop(data);
+            let task = crate::process::ProcessManager::current_pcb();
+            let owner = crate::cgroup::memory::account_for_task(&task);
+            let creator = crate::cgroup::memory::object_for_task(&task);
+            page_cache.try_read(offset, buf, &owner, &creator)
         } else {
-            self.read_direct(offset, len, buf, data)
+            self.read_direct(offset, len, buf, data).map_err(Into::into)
         }
     }
 
@@ -2481,7 +2493,7 @@ impl IndexNode for LockedExt4Inode {
         len: usize,
         buf: &[u8],
         data: PrivateData,
-    ) -> Result<usize, SystemError> {
+    ) -> Result<usize, MemoryAllocationError> {
         let mut publish = || {};
         let mut stage = vfs::WritePrivilegeStage::new(&mut publish);
         self.write_at_with_privilege_stage(offset, len, buf, data, &mut stage)
@@ -2494,7 +2506,7 @@ impl IndexNode for LockedExt4Inode {
         buf: &[u8],
         data: PrivateData,
         stage: &mut vfs::WritePrivilegeStage<'_>,
-    ) -> Result<usize, SystemError> {
+    ) -> Result<usize, MemoryAllocationError> {
         self.write_at_with_inode_context(
             offset,
             len,
@@ -2513,7 +2525,7 @@ impl IndexNode for LockedExt4Inode {
         data: PrivateData,
         context: &vfs::permission::InodeOpContext,
         stage: &mut vfs::WritePrivilegeStage<'_>,
-    ) -> Result<usize, SystemError> {
+    ) -> Result<usize, MemoryAllocationError> {
         self.write_primary_with_inode_context(
             offset,
             len,
@@ -2531,7 +2543,7 @@ impl IndexNode for LockedExt4Inode {
         source: vfs::PrimaryWriteSource<'_, '_>,
         data: PrivateData,
         stage: &mut vfs::WritePrivilegeStage<'_>,
-    ) -> Result<usize, SystemError> {
+    ) -> Result<usize, MemoryAllocationError> {
         self.write_primary_with_inode_context(
             offset,
             len,
@@ -2550,19 +2562,30 @@ impl IndexNode for LockedExt4Inode {
         data: PrivateData,
         context: &vfs::permission::InodeOpContext,
         stage: &mut vfs::WritePrivilegeStage<'_>,
-    ) -> Result<usize, SystemError> {
-        let _operation = self.begin_operation()?;
-        let size_change = self.size_change_lock.read();
+    ) -> Result<usize, MemoryAllocationError> {
         let len = match &source {
             vfs::PrimaryWriteSource::Kernel(buffer) => len.min(buffer.len()),
-            vfs::PrimaryWriteSource::User(_) => len,
+            vfs::PrimaryWriteSource::User(..) => len,
         };
         if len == 0 {
             return Ok(0);
         }
+        drop(data);
+        let task = crate::process::ProcessManager::current_pcb();
+        let owner = crate::cgroup::memory::account_for_task(&task);
+        let creator = crate::cgroup::memory::object_for_task(&task);
+        let _operation = self.begin_operation()?;
+        let size_change = self.size_change_lock.read();
         self.remove_write_privileges_locked(context, stage)?;
-        source.with_buffer(len, |buffer| {
-            self.write_data_locked(offset, len.min(buffer.len()), buffer, data, &size_change)
+        source.write_chunks(len, |relative, buffer| {
+            self.write_data_locked(
+                offset.checked_add(relative).ok_or(SystemError::EFBIG)?,
+                buffer.len(),
+                buffer,
+                &size_change,
+                &owner,
+                &creator,
+            )
         })
     }
 
@@ -2699,7 +2722,11 @@ impl IndexNode for LockedExt4Inode {
         Ok(list)
     }
 
-    fn link(&self, name: &str, other: &Arc<dyn IndexNode>) -> Result<(), SystemError> {
+    fn link(
+        &self,
+        name: &str,
+        other: &Arc<dyn IndexNode>,
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         self.link_with_inode_context(name, other, &vfs::permission::InodeOpContext::legacy())
     }
 
@@ -2708,7 +2735,7 @@ impl IndexNode for LockedExt4Inode {
         name: &str,
         other: &Arc<dyn IndexNode>,
         context: &vfs::permission::InodeOpContext,
-    ) -> Result<(), SystemError> {
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         let _operation = self.begin_operation()?;
         let _io = self.io_lock.lock();
         let _namespace = self.namespace_lock.lock();
@@ -2723,7 +2750,7 @@ impl IndexNode for LockedExt4Inode {
             .ok_or(SystemError::EINVAL)?;
         let other_fs = other_arc.inner.lock().concret_fs();
         if !Arc::ptr_eq(&fs, &other_fs) {
-            return Err(SystemError::EXDEV);
+            return Err(SystemError::EXDEV.into());
         }
         let other_lifecycle = other_arc.lifecycle().clone();
         let _link_mutation = other_lifecycle.lock_link_mutation();
@@ -2734,22 +2761,22 @@ impl IndexNode for LockedExt4Inode {
         let other_attr = fs.retry_metadata_read_contention(|| ext4.getattr(other_inode_num))?;
 
         if my_attr.ftype != another_ext4::FileType::Directory {
-            return Err(SystemError::ENOTDIR);
+            return Err(SystemError::ENOTDIR.into());
         }
 
         if other_attr.ftype == another_ext4::FileType::Directory {
-            return Err(SystemError::EISDIR);
+            return Err(SystemError::EISDIR.into());
         }
 
         if other_attr.links == 0 && !other_arc.tmpfile_linkable.load(Ordering::Acquire) {
-            return Err(SystemError::ENOENT);
+            return Err(SystemError::ENOENT.into());
         }
 
         if fs
             .retry_metadata_read_contention(|| ext4.lookup(inode_num, name))
             .is_ok()
         {
-            return Err(SystemError::EEXIST);
+            return Err(SystemError::EEXIST.into());
         }
 
         let parent = Self::metadata_from_attr(
@@ -2784,11 +2811,15 @@ impl IndexNode for LockedExt4Inode {
         Ok(())
     }
 
-    fn unlink(&self, name: &str) -> Result<vfs::LinkRemovalOutcome, SystemError> {
+    fn unlink(
+        &self,
+        name: &str,
+    ) -> Result<vfs::LinkRemovalOutcome, crate::mm::allocation::MemoryAllocationError> {
         self.unlink_with_operation_context(
             name,
             &crate::filesystem::vfs::permission::InodeOpContext::legacy(),
         )
+        .map_err(Into::into)
     }
 
     fn unlink_with_inode_context(
@@ -2796,9 +2827,10 @@ impl IndexNode for LockedExt4Inode {
         name: &str,
         mutation: &crate::filesystem::vfs::mount::DentryMutationContext<'_>,
         context: &crate::filesystem::vfs::permission::InodeOpContext,
-    ) -> Result<vfs::LinkRemovalOutcome, SystemError> {
+    ) -> Result<vfs::LinkRemovalOutcome, crate::mm::allocation::MemoryAllocationError> {
         mutation.ensure_locked();
         self.unlink_with_operation_context(name, context)
+            .map_err(Into::into)
     }
 
     fn metadata(&self) -> Result<vfs::Metadata, SystemError> {
@@ -2917,11 +2949,15 @@ impl IndexNode for LockedExt4Inode {
         fs.finish_sync_durability_boundary()
     }
 
-    fn sync_file(&self, datasync: bool, _data: PrivateData) -> Result<(), SystemError> {
+    fn sync_file(
+        &self,
+        datasync: bool,
+        _data: PrivateData,
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         if datasync {
-            self.datasync()
+            self.datasync().map_err(Into::into)
         } else {
-            self.sync()
+            self.sync().map_err(Into::into)
         }
     }
 
@@ -2931,7 +2967,7 @@ impl IndexNode for LockedExt4Inode {
         end: usize,
         datasync: bool,
         _data: PrivateData,
-    ) -> Result<(), SystemError> {
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         let _operation = self.begin_operation()?;
         let fs = self.inner.lock().concret_fs();
         let _journal_sync = fs.begin_journal_sync();
@@ -2950,7 +2986,7 @@ impl IndexNode for LockedExt4Inode {
         };
         self.flush_frozen_metadata(snapshot)?;
         let fs = self.inner.lock().concret_fs();
-        fs.finish_sync_durability_boundary()
+        fs.finish_sync_durability_boundary().map_err(Into::into)
     }
 
     fn write_inode(&self, _wbc: &vfs::WritebackControl) -> Result<(), SystemError> {
@@ -2961,7 +2997,10 @@ impl IndexNode for LockedExt4Inode {
         self.inner.lock().page_cache.clone()
     }
 
-    fn set_metadata(&self, metadata: &vfs::Metadata) -> Result<(), SystemError> {
+    fn set_metadata(
+        &self,
+        metadata: &vfs::Metadata,
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         let requested_size = metadata.size.max(0) as usize;
         let _operation = self.begin_operation()?;
         let (type_fs, type_inode_num) = {
@@ -3008,27 +3047,29 @@ impl IndexNode for LockedExt4Inode {
                 let mut attributes = metadata.clone();
                 attributes.file_type = Self::file_type(actual_type);
                 attributes.mode.remove(InodeMode::S_IFMT);
-                return self.set_masked_metadata_using(
-                    &attributes,
-                    SetMetadataMask::MODE
-                        | SetMetadataMask::UID
-                        | SetMetadataMask::GID
-                        | SetMetadataMask::ATIME
-                        | SetMetadataMask::MTIME
-                        | SetMetadataMask::CTIME,
-                    None,
-                    |_, id, prepared| {
-                        fs.retry_metadata_contention(|| {
-                            fs.fs.setattr(
-                                id,
-                                another_ext4::SetAttr {
-                                    crtime: Some(to_ext4_time(&metadata.btime)),
-                                    ..*prepared
-                                },
-                            )
-                        })
-                    },
-                );
+                return self
+                    .set_masked_metadata_using(
+                        &attributes,
+                        SetMetadataMask::MODE
+                            | SetMetadataMask::UID
+                            | SetMetadataMask::GID
+                            | SetMetadataMask::ATIME
+                            | SetMetadataMask::MTIME
+                            | SetMetadataMask::CTIME,
+                        None,
+                        |_, id, prepared| {
+                            fs.retry_metadata_contention(|| {
+                                fs.fs.setattr(
+                                    id,
+                                    another_ext4::SetAttr {
+                                        crtime: Some(to_ext4_time(&metadata.btime)),
+                                        ..*prepared
+                                    },
+                                )
+                            })
+                        },
+                    )
+                    .map_err(Into::into);
             }
         }
         let next_atime_version = before_atime_version
@@ -3101,7 +3142,7 @@ impl IndexNode for LockedExt4Inode {
         &self,
         metadata: &vfs::Metadata,
         mask: SetMetadataMask,
-    ) -> Result<(), SystemError> {
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         if mask.is_empty() {
             return Ok(());
         }
@@ -3112,12 +3153,13 @@ impl IndexNode for LockedExt4Inode {
         let _io_guard = self.io_lock.lock();
         let _metadata_commit = self.metadata_commit_lock.lock();
         self.set_masked_metadata_locked(metadata, mask, None)
+            .map_err(Into::into)
     }
 
     fn update_metadata_masked(
         &self,
         update: &mut vfs::MetadataUpdate<'_>,
-    ) -> Result<SetMetadataMask, SystemError> {
+    ) -> Result<SetMetadataMask, crate::mm::allocation::MemoryAllocationError> {
         let _operation = self.begin_operation()?;
         let _size_change = self.size_change_lock.write();
         let _delalloc_admission = self.close_production_delalloc_admission()?;
@@ -3154,8 +3196,10 @@ impl IndexNode for LockedExt4Inode {
         Ext4FileSystem::mark_inode_atime_dirty(&self_arc, atime, relatime)
     }
 
-    fn resize(&self, len: usize) -> Result<(), SystemError> {
-        self.resize_with_operation(len, None).map(|_| ())
+    fn resize(&self, len: usize) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        self.resize_with_operation(len, None)
+            .map(|_| ())
+            .map_err(Into::into)
     }
 
     fn resize_with_metadata(
@@ -3164,7 +3208,7 @@ impl IndexNode for LockedExt4Inode {
         lock_owner: u64,
         metadata: &vfs::Metadata,
         mask: SetMetadataMask,
-    ) -> Result<(), SystemError> {
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         self.resize_with_metadata_context(
             len,
             lock_owner,
@@ -3182,8 +3226,9 @@ impl IndexNode for LockedExt4Inode {
         metadata: &vfs::Metadata,
         mask: SetMetadataMask,
         context: &vfs::permission::InodeOpContext,
-    ) -> Result<SetMetadataMask, SystemError> {
+    ) -> Result<SetMetadataMask, crate::mm::allocation::MemoryAllocationError> {
         self.resize_with_operation(len, Some((metadata, mask, context)))
+            .map_err(Into::into)
     }
 
     fn resize_file_with_metadata(
@@ -3193,7 +3238,7 @@ impl IndexNode for LockedExt4Inode {
         data: MutexGuard<FilePrivateData>,
         metadata: &vfs::Metadata,
         mask: SetMetadataMask,
-    ) -> Result<(), SystemError> {
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         self.resize_file_with_metadata_context(
             len,
             lock_owner,
@@ -3213,7 +3258,7 @@ impl IndexNode for LockedExt4Inode {
         metadata: &vfs::Metadata,
         mask: SetMetadataMask,
         context: &vfs::permission::InodeOpContext,
-    ) -> Result<SetMetadataMask, SystemError> {
+    ) -> Result<SetMetadataMask, crate::mm::allocation::MemoryAllocationError> {
         drop(data);
         self.resize_with_metadata_context(len, lock_owner, metadata, mask, context)
     }
@@ -3225,7 +3270,7 @@ impl IndexNode for LockedExt4Inode {
         data: MutexGuard<FilePrivateData>,
         truncate: &vfs::OpenTruncateContext,
         context: &vfs::permission::InodeOpContext,
-    ) -> Result<SetMetadataMask, SystemError> {
+    ) -> Result<SetMetadataMask, crate::mm::allocation::MemoryAllocationError> {
         self.resize_file_with_metadata_context(
             len,
             lock_owner,
@@ -3241,7 +3286,7 @@ impl IndexNode for LockedExt4Inode {
         offset: usize,
         requested_end: usize,
         lock_owner: u64,
-    ) -> Result<SetMetadataMask, SystemError> {
+    ) -> Result<SetMetadataMask, crate::mm::allocation::MemoryAllocationError> {
         self.fallocate_resize_atomic_with_inode_context(
             offset,
             requested_end,
@@ -3256,13 +3301,14 @@ impl IndexNode for LockedExt4Inode {
         requested_end: usize,
         _lock_owner: u64,
         context: &vfs::permission::InodeOpContext,
-    ) -> Result<SetMetadataMask, SystemError> {
+    ) -> Result<SetMetadataMask, crate::mm::allocation::MemoryAllocationError> {
         let len = requested_end
             .checked_sub(offset)
             .ok_or(SystemError::EINVAL)?;
         let mut publish = || {};
         let mut attrib = vfs::AttribStageObserver::new(&mut publish);
         self.fallocate_with_context(0, offset, len, &mut attrib, context)
+            .map_err(Into::into)
     }
 
     fn resize_with_metadata_result(
@@ -3271,7 +3317,7 @@ impl IndexNode for LockedExt4Inode {
         lock_owner: u64,
         metadata: &vfs::Metadata,
         mask: SetMetadataMask,
-    ) -> Result<SetMetadataMask, SystemError> {
+    ) -> Result<SetMetadataMask, crate::mm::allocation::MemoryAllocationError> {
         self.resize_with_metadata_context(
             len,
             lock_owner,
@@ -3288,7 +3334,7 @@ impl IndexNode for LockedExt4Inode {
         data: MutexGuard<FilePrivateData>,
         metadata: &vfs::Metadata,
         mask: SetMetadataMask,
-    ) -> Result<SetMetadataMask, SystemError> {
+    ) -> Result<SetMetadataMask, crate::mm::allocation::MemoryAllocationError> {
         self.resize_file_with_metadata_context(
             len,
             lock_owner,
@@ -3305,7 +3351,7 @@ impl IndexNode for LockedExt4Inode {
         lock_owner: u64,
         data: MutexGuard<FilePrivateData>,
         truncate: &vfs::OpenTruncateContext,
-    ) -> Result<SetMetadataMask, SystemError> {
+    ) -> Result<SetMetadataMask, crate::mm::allocation::MemoryAllocationError> {
         self.resize_open_truncate_with_inode_context(
             len,
             lock_owner,
@@ -3323,7 +3369,7 @@ impl IndexNode for LockedExt4Inode {
         lock_owner: u64,
         attrib: &mut crate::filesystem::vfs::AttribStageObserver<'_>,
         data: MutexGuard<FilePrivateData>,
-    ) -> Result<(), SystemError> {
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         self.fallocate_file_with_inode_context(
             mode,
             offset,
@@ -3344,22 +3390,24 @@ impl IndexNode for LockedExt4Inode {
         attrib: &mut crate::filesystem::vfs::AttribStageObserver<'_>,
         data: MutexGuard<FilePrivateData>,
         context: &vfs::permission::InodeOpContext,
-    ) -> Result<(), SystemError> {
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         drop(data);
         self.fallocate_with_context(mode, offset, len, attrib, context)
             .map(|_| ())
+            .map_err(Into::into)
     }
 
-    fn truncate(&self, len: usize) -> Result<(), SystemError> {
+    fn truncate(&self, len: usize) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         // 复用 resize 的实现
         self.resize(len)
     }
 
-    fn rmdir(&self, name: &str) -> Result<(), SystemError> {
+    fn rmdir(&self, name: &str) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         self.rmdir_with_operation_context(
             name,
             &crate::filesystem::vfs::permission::InodeOpContext::legacy(),
         )
+        .map_err(Into::into)
     }
 
     fn rmdir_with_inode_context(
@@ -3367,9 +3415,10 @@ impl IndexNode for LockedExt4Inode {
         name: &str,
         mutation: &crate::filesystem::vfs::mount::DentryMutationContext<'_>,
         context: &crate::filesystem::vfs::permission::InodeOpContext,
-    ) -> Result<(), SystemError> {
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         mutation.ensure_locked();
         self.rmdir_with_operation_context(name, context)
+            .map_err(Into::into)
     }
 
     fn dname(&self) -> Result<DName, SystemError> {
@@ -3411,7 +3460,12 @@ impl IndexNode for LockedExt4Inode {
         Ok(copy_len)
     }
 
-    fn setxattr(&self, name: &str, value: &[u8], flags: XattrFlags) -> Result<usize, SystemError> {
+    fn setxattr(
+        &self,
+        name: &str,
+        value: &[u8],
+        flags: XattrFlags,
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
         let _operation = self.begin_operation()?;
         let _size_change = self.size_change_lock.write();
         let guard = self.inner.lock();
@@ -3424,7 +3478,7 @@ impl IndexNode for LockedExt4Inode {
             .ftype
             == FileType::SymLink
         {
-            return Err(SystemError::EPERM);
+            return Err(SystemError::EPERM.into());
         }
 
         fs.retry_metadata_contention(|| {
@@ -3473,7 +3527,10 @@ impl IndexNode for LockedExt4Inode {
         Ok(total_len)
     }
 
-    fn removexattr(&self, name: &str) -> Result<usize, SystemError> {
+    fn removexattr(
+        &self,
+        name: &str,
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
         let _operation = self.begin_operation()?;
         let _size_change = self.size_change_lock.write();
         let guard = self.inner.lock();
@@ -3486,17 +3543,19 @@ impl IndexNode for LockedExt4Inode {
             .ftype
             == FileType::SymLink
         {
-            return Err(SystemError::EPERM);
+            return Err(SystemError::EPERM.into());
         }
 
         fs.retry_metadata_contention(|| ext4.removexattr(inode_num, name))?;
         Ok(0)
     }
 
-    fn remove_security_privileges(&self) -> Result<(), SystemError> {
+    fn remove_security_privileges(
+        &self,
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         let _operation = self.begin_operation()?;
         let _size_change = self.size_change_lock.write();
-        self.kill_security_privileges_locked()
+        self.kill_security_privileges_locked().map_err(Into::into)
     }
 
     fn mknod(
@@ -3504,7 +3563,7 @@ impl IndexNode for LockedExt4Inode {
         filename: &str,
         mode: InodeMode,
         dev_t: DeviceNumber,
-    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+    ) -> Result<Arc<dyn IndexNode>, crate::mm::allocation::MemoryAllocationError> {
         self.mknod_with_context(
             filename,
             mode,
@@ -3519,7 +3578,7 @@ impl IndexNode for LockedExt4Inode {
         mode: InodeMode,
         dev_t: DeviceNumber,
         context: &vfs::permission::InodeOpContext,
-    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+    ) -> Result<Arc<dyn IndexNode>, crate::mm::allocation::MemoryAllocationError> {
         let file_type = vfs::FileType::from(mode);
         if file_type == vfs::FileType::File {
             return self.create_with_context(filename, vfs::FileType::File, mode, context);
@@ -3551,7 +3610,7 @@ impl IndexNode for LockedExt4Inode {
             .ftype
             != FileType::Directory
         {
-            return Err(SystemError::ENOTDIR);
+            return Err(SystemError::ENOTDIR.into());
         }
 
         // VFS InodeMode(u32) → another_ext4 InodeMode(u16)
@@ -3614,7 +3673,7 @@ impl IndexNode for LockedExt4Inode {
         target: &Arc<dyn IndexNode>,
         new_name: &str,
         flags: RenameFlags,
-    ) -> Result<vfs::RenameOutcome, SystemError> {
+    ) -> Result<vfs::RenameOutcome, crate::mm::allocation::MemoryAllocationError> {
         self.move_with_inode_context(
             old_name,
             target,
@@ -3622,6 +3681,7 @@ impl IndexNode for LockedExt4Inode {
             flags,
             &crate::filesystem::vfs::permission::InodeOpContext::legacy(),
         )
+        .map_err(Into::into)
     }
 
     fn move_to_with_inode_context(
@@ -3632,9 +3692,10 @@ impl IndexNode for LockedExt4Inode {
         flags: RenameFlags,
         mutation: &crate::filesystem::vfs::mount::DentryMutationContext<'_>,
         context: &crate::filesystem::vfs::permission::InodeOpContext,
-    ) -> Result<vfs::RenameOutcome, SystemError> {
+    ) -> Result<vfs::RenameOutcome, crate::mm::allocation::MemoryAllocationError> {
         mutation.ensure_locked();
         self.move_with_inode_context(old_name, target, new_name, flags, context)
+            .map_err(Into::into)
     }
 }
 
@@ -4326,9 +4387,10 @@ impl LockedExt4Inode {
         offset: usize,
         len: usize,
         buf: &[u8],
-        data: PrivateData,
         _content: &RwSemReadGuard<'_, ()>,
-    ) -> Result<usize, SystemError> {
+        owner: &Arc<MemoryAccount>,
+        creator: &Arc<ObjectAccount>,
+    ) -> Result<usize, MemoryAllocationError> {
         let buf = &buf[..len];
         let (fs, inode_num, page_cache) = {
             let guard = self.inner.lock();
@@ -4351,6 +4413,8 @@ impl LockedExt4Inode {
                     &page_cache,
                     segment_offset,
                     &buf[delayed_written..delayed_written + segment_len],
+                    owner,
+                    creator,
                 ) {
                     Ok(result) => result,
                     Err(_) if delayed_written != 0 => return Ok(delayed_written),
@@ -4366,6 +4430,8 @@ impl LockedExt4Inode {
                     &page_cache,
                     segment_offset,
                     &buf[delayed_written..delayed_written + segment_len],
+                    owner,
+                    creator,
                 ) {
                     Ok(result) => result,
                     Err(_) if delayed_written != 0 => return Ok(delayed_written),
@@ -4461,7 +4527,7 @@ impl LockedExt4Inode {
             prepare_result?;
 
             // 写入范围的磁盘块已就绪，现在安全写入 page cache。
-            let write_len = PageCache::write(&page_cache, offset, buf)?;
+            let write_len = page_cache.try_write(offset, buf, owner, creator)?;
             if write_len > 0 {
                 let written_end = offset.checked_add(write_len).ok_or(SystemError::EFBIG)?;
                 let current_file_size = core::cmp::max(old_file_size, written_end as u64);
@@ -4485,8 +4551,8 @@ impl LockedExt4Inode {
             Ok(write_len)
         } else {
             let _size_guard = self.size_lock.read();
-            drop(data);
             self.write_eager_data(offset, buf)
+                .map_err(MemoryAllocationError::System)
         }
     }
 
@@ -5024,7 +5090,9 @@ impl LockedExt4Inode {
         page_cache: &Arc<PageCache>,
         offset: usize,
         buf: &[u8],
-    ) -> Result<Option<usize>, SystemError> {
+        owner: &Arc<MemoryAccount>,
+        creator: &Arc<ObjectAccount>,
+    ) -> Result<Option<usize>, MemoryAllocationError> {
         if buf.is_empty()
             || (offset & (MMArch::PAGE_SIZE - 1))
                 .checked_add(buf.len())
@@ -5056,7 +5124,7 @@ impl LockedExt4Inode {
                 return Ok(None);
             };
             let Some(certificate) = pending.certificate else {
-                return Err(SystemError::EIO);
+                return Err(SystemError::EIO.into());
             };
             // Refuse exhaustion before PageCache publishes the merged bytes.
             guard
@@ -5073,10 +5141,12 @@ impl LockedExt4Inode {
         drop(_size);
 
         let mut merged = false;
-        let publication = page_cache.write_single_page_segment_with_transition(
+        let publication = page_cache.try_write_single_page_segment_with_transition(
             offset,
             buf,
             PageCacheExpectedDirtyTransition::Merge(certificate),
+            owner,
+            creator,
             |transition| {
                 merged = transition.kind()
                     == crate::filesystem::page_cache::PageCacheDirtyTransitionKind::MergedIntoDirty
@@ -5099,14 +5169,14 @@ impl LockedExt4Inode {
                     fs.fail_stop_lifecycle();
                     self.delalloc_progress
                         .publish(PageCacheWritebackProgressOutcome::Failed(SystemError::EIO));
-                    return Err(SystemError::EIO);
+                    return Err(SystemError::EIO.into());
                 };
                 let Some(ctime_version) = guard.cached_ctime_version.checked_add(1) else {
                     drop(guard);
                     fs.fail_stop_lifecycle();
                     self.delalloc_progress
                         .publish(PageCacheWritebackProgressOutcome::Failed(SystemError::EIO));
-                    return Err(SystemError::EIO);
+                    return Err(SystemError::EIO.into());
                 };
                 let entry = guard
                     .delalloc
@@ -5125,7 +5195,7 @@ impl LockedExt4Inode {
                         fs.fail_stop_lifecycle();
                         self.delalloc_progress
                             .publish(PageCacheWritebackProgressOutcome::Failed(SystemError::EIO));
-                        return Err(SystemError::EIO);
+                        return Err(SystemError::EIO.into());
                     }
                 };
                 pending.durable_eof = new_eof;
@@ -5151,9 +5221,9 @@ impl LockedExt4Inode {
                 fs.fail_stop_lifecycle();
                 self.delalloc_progress
                     .publish(PageCacheWritebackProgressOutcome::Failed(SystemError::EIO));
-                Err(SystemError::EIO)
+                Err(SystemError::EIO.into())
             }
-            Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => Ok(None),
+            Err(MemoryAllocationError::System(SystemError::EAGAIN_OR_EWOULDBLOCK)) => Ok(None),
             Err(error) => Err(error),
         }
     }
@@ -5163,7 +5233,9 @@ impl LockedExt4Inode {
         page_cache: &Arc<PageCache>,
         offset: usize,
         buf: &[u8],
-    ) -> Result<Option<usize>, SystemError> {
+        owner: &Arc<MemoryAccount>,
+        creator: &Arc<ObjectAccount>,
+    ) -> Result<Option<usize>, MemoryAllocationError> {
         let page_offset = offset & (MMArch::PAGE_SIZE - 1);
         if buf.is_empty()
             || page_offset
@@ -5228,14 +5300,16 @@ impl LockedExt4Inode {
                     drop(_invalidate);
                     let wait_outcome = progress.wait_for_progress_interruptible();
                     match wait_outcome? {
-                        PageCacheWritebackProgressOutcome::Failed(error) => return Err(error),
+                        PageCacheWritebackProgressOutcome::Failed(error) => {
+                            return Err(error.into())
+                        }
                         PageCacheWritebackProgressOutcome::Progress
                         | PageCacheWritebackProgressOutcome::Cancelled => {
                             let current = ProcessManager::current_pcb();
                             if current.has_pending_signal_fast()
                                 && current.has_pending_not_masked_signal()
                             {
-                                return Err(SystemError::ERESTARTSYS);
+                                return Err(SystemError::ERESTARTSYS.into());
                             }
                             continue 'admission;
                         }
@@ -5309,7 +5383,7 @@ impl LockedExt4Inode {
                         fs.wait_metadata_mutation_progress(observed)?;
                         continue 'admission;
                     }
-                    Err(error) => return Err(error.into()),
+                    Err(error) => return Err(SystemError::from(error).into()),
                 }
             }
             let observed = fs.fs.metadata_mutation_generation();
@@ -5368,7 +5442,7 @@ impl LockedExt4Inode {
                         self.release_empty_delalloc_pool(&fs, authority)?;
                         drop(admission);
                     }
-                    return Err(error.into());
+                    return Err(SystemError::from(error).into());
                 }
             };
             let sequence = {
@@ -5441,7 +5515,7 @@ impl LockedExt4Inode {
                     };
                     cleanup_result?;
                     return if operation_missing {
-                        Err(SystemError::EIO)
+                        Err(SystemError::EIO.into())
                     } else {
                         Ok(None)
                     };
@@ -5534,7 +5608,7 @@ impl LockedExt4Inode {
                         fs.fail_stop_lifecycle();
                         self.terminalize_idle_delalloc_after_fail_stop_inner(&fs, false);
                         fs.terminalize_idle_delalloc_after_fail_stop();
-                        return Err(SystemError::EIO);
+                        return Err(SystemError::EIO.into());
                     };
                     let duplicate_owner = error == SystemError::EIO;
                     if duplicate_owner {
@@ -5553,17 +5627,19 @@ impl LockedExt4Inode {
                     );
                     drop(pending);
                     cleanup_result?;
-                    return Err(error);
+                    return Err(error.into());
                 }
             }
 
             drop(_io);
             drop(_size);
             let mut published = None;
-            let publication = page_cache.write_single_page_segment_with_transition(
+            let publication = page_cache.try_write_single_page_segment_with_transition(
                 offset,
                 buf,
                 PageCacheExpectedDirtyTransition::Start,
+                owner,
+                creator,
                 |transition| published = transition.certificate(),
             );
             let _size = self.size_lock.read();
@@ -5576,7 +5652,7 @@ impl LockedExt4Inode {
                         drop(_invalidate);
                         fs.fail_stop_lifecycle();
                         fs.terminalize_idle_delalloc_after_fail_stop();
-                        return Err(SystemError::EIO);
+                        return Err(SystemError::EIO.into());
                     };
                     let mut guard = self.inner.lock();
                     let matches_generation = guard
@@ -5598,7 +5674,7 @@ impl LockedExt4Inode {
                         drop(_invalidate);
                         fs.fail_stop_lifecycle();
                         fs.terminalize_idle_delalloc_after_fail_stop();
-                        return Err(SystemError::EIO);
+                        return Err(SystemError::EIO.into());
                     }
                     let entry = guard
                         .delalloc
@@ -5693,7 +5769,7 @@ impl LockedExt4Inode {
                     let Some((mut pending, empty_cleanup, admission)) = detached else {
                         fs.fail_stop_lifecycle();
                         fs.terminalize_idle_delalloc_after_fail_stop();
-                        return Err(SystemError::EIO);
+                        return Err(SystemError::EIO.into());
                     };
                     let cleanup_result = if let Some(cleanup) = empty_cleanup {
                         self.finish_empty_delalloc_cleanup(
@@ -5717,7 +5793,10 @@ impl LockedExt4Inode {
                     };
                     drop(pending);
                     cleanup_result?;
-                    if error == SystemError::EAGAIN_OR_EWOULDBLOCK {
+                    if matches!(
+                        error,
+                        MemoryAllocationError::System(SystemError::EAGAIN_OR_EWOULDBLOCK)
+                    ) {
                         Ok(None)
                     } else {
                         Err(error)
@@ -6268,7 +6347,7 @@ impl LockedExt4Inode {
 
         // 对于 FIFO，创建 pipe inode
         if attr.ftype == FileType::Fifo {
-            let pipe_inode = LockedPipeInode::new();
+            let pipe_inode = LockedPipeInode::new_fifo_shell();
             pipe_inode.set_fifo();
             guard.special_node = Some(SpecialNodeData::Pipe(pipe_inode));
         }

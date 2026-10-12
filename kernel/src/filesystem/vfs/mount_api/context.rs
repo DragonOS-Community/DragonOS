@@ -182,16 +182,24 @@ pub fn pick_fs_context(mount: Arc<MountFS>, cloexec: bool) -> Result<i32, System
 }
 
 fn install_context_fd(context: Arc<FsContext>, cloexec: bool) -> Result<i32, SystemError> {
+    let storage = crate::filesystem::vfs::file::PreparedFile::new_recovering()?;
     let inode: Arc<dyn IndexNode> = Arc::new(FsContextInode::new());
-    let file = File::new_with_private_data(
+    let file = File::new_with_private_data_prepared_recovering(
         inode,
         FileFlags::O_RDWR,
         FilePrivateData::FsContext(context),
+        storage,
     )?;
     let current = ProcessManager::current_pcb();
-    current
-        .fd_table()
-        .alloc_fd(file, cloexec, current.nofile_soft_limit())
+    let file = Arc::try_new(file).map_err(|_| SystemError::ENOMEM)?;
+    File::recover_io(|| {
+        current.fd_table().alloc_fd_arc(
+            file.clone(),
+            cloexec,
+            current.nofile_soft_limit(),
+            &crate::cgroup::memory::object_for_task(&current),
+        )
+    })
 }
 
 fn common_superblock_option(key: &str, state: &mut FsContextState) -> bool {
@@ -277,10 +285,25 @@ fn encode_legacy_options(state: &FsContextState) -> Result<Option<String>, Syste
 
 pub fn configure_fs_context(fd: i32, cmd: FsConfigCommand) -> Result<(), SystemError> {
     let context = context_from_fd(fd)?;
+    File::recover_io(|| try_configure_fs_context(&context, &cmd))
+}
+
+fn copy_parameter(value: &str) -> Result<String, SystemError> {
+    let mut copy = String::new();
+    copy.try_reserve_exact(value.len())
+        .map_err(|_| SystemError::ENOMEM)?;
+    copy.push_str(value);
+    Ok(copy)
+}
+
+fn try_configure_fs_context(
+    context: &Arc<FsContext>,
+    cmd: &FsConfigCommand,
+) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
     // Linux's legacy_fs_context_ops has no handler for these types. This
     // decision is independent of the configuration phase.
     if matches!(cmd, FsConfigCommand::UnsupportedTyped) {
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP.into());
     }
     let mut state = context.state.lock();
     if state.phase == Phase::AwaitingReconf {
@@ -291,12 +314,12 @@ pub fn configure_fs_context(fd: i32, cmd: FsConfigCommand) -> Result<(), SystemE
     match cmd {
         FsConfigCommand::SetFlag(key) => {
             if !matches!(state.phase, Phase::CreateParams | Phase::ReconfParams) {
-                return Err(SystemError::EBUSY);
+                return Err(SystemError::EBUSY.into());
             }
             if key == "source" {
-                return Err(SystemError::EINVAL);
+                return Err(SystemError::EINVAL.into());
             }
-            if common_superblock_option(&key, &mut state) {
+            if common_superblock_option(key, &mut state) {
                 return Ok(());
             }
             if state.phase == Phase::ReconfParams {
@@ -306,26 +329,26 @@ pub fn configure_fs_context(fd: i32, cmd: FsConfigCommand) -> Result<(), SystemE
                     .ok_or(SystemError::EINVAL)?
                     .mount
                     .inner_filesystem()
-                    .validate_reconfigure_parameter(&key, None)?;
+                    .validate_reconfigure_parameter(key, None)?;
             } else {
                 filesystem_maker(&context.fs_type)
                     .ok_or(SystemError::ENODEV)?
-                    .validate_fsconfig_parameter(&key, None)?;
+                    .validate_fsconfig_parameter(key, None)?;
             }
-            append_legacy_option(&mut state, key, None)
+            append_legacy_option(&mut state, copy_parameter(key)?, None).map_err(Into::into)
         }
         FsConfigCommand::SetString(key, value) => {
             if !matches!(state.phase, Phase::CreateParams | Phase::ReconfParams) {
-                return Err(SystemError::EBUSY);
+                return Err(SystemError::EBUSY.into());
             }
             if key == "source" {
                 if state.source.is_some() {
-                    return Err(SystemError::EINVAL);
+                    return Err(SystemError::EINVAL.into());
                 }
-                state.source = Some(value);
+                state.source = Some(copy_parameter(value)?);
                 return Ok(());
             }
-            if common_superblock_option(&key, &mut state) {
+            if common_superblock_option(key, &mut state) {
                 return Ok(());
             }
             // Creation preparers can retain lower paths or other resources for
@@ -333,10 +356,10 @@ pub fn configure_fs_context(fd: i32, cmd: FsConfigCommand) -> Result<(), SystemE
             // backend and must not run a new-filesystem preparer.
             let prepared = if state.phase == Phase::CreateParams {
                 let maker = filesystem_maker(&context.fs_type).ok_or(SystemError::ENODEV)?;
-                maker.validate_fsconfig_parameter(&key, Some(&value))?;
+                maker.validate_fsconfig_parameter(key, Some(value))?;
                 maker.prepare_fsconfig_string(
-                    &key,
-                    &value,
+                    key,
+                    value,
                     state.prepared.as_ref(),
                     &context.creation.cred.user_ns,
                 )?
@@ -347,22 +370,26 @@ pub fn configure_fs_context(fd: i32, cmd: FsConfigCommand) -> Result<(), SystemE
                     .ok_or(SystemError::EINVAL)?
                     .mount
                     .inner_filesystem()
-                    .validate_reconfigure_parameter(&key, Some(&value))?;
+                    .validate_reconfigure_parameter(key, Some(value))?;
                 None
             };
-            append_legacy_option(&mut state, key, Some(value))?;
+            append_legacy_option(
+                &mut state,
+                copy_parameter(key)?,
+                Some(copy_parameter(value)?),
+            )?;
             state.prepared = prepared;
             Ok(())
         }
         FsConfigCommand::Create => {
             if state.phase != Phase::CreateParams {
-                return Err(SystemError::EBUSY);
+                return Err(SystemError::EBUSY.into());
             }
             if !filesystem_maker(&context.fs_type)
                 .ok_or(SystemError::ENODEV)?
                 .mount_capable(&context.creation.cred.user_ns)
             {
-                return Err(SystemError::EPERM);
+                return Err(SystemError::EPERM.into());
             }
             state.phase = Phase::Creating;
             let result = (|| {
@@ -371,7 +398,7 @@ pub fn configure_fs_context(fd: i32, cmd: FsConfigCommand) -> Result<(), SystemE
                         .ok_or(SystemError::ENODEV)?
                         .supports_fsconfig_legacy_options()
                 {
-                    return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+                    return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP.into());
                 }
                 let raw_data = encode_legacy_options(&state)?;
                 let mut creation = context.creation.clone();
@@ -391,27 +418,37 @@ pub fn configure_fs_context(fd: i32, cmd: FsConfigCommand) -> Result<(), SystemE
                     Ok(())
                 }
                 Err(error) => {
-                    state.phase = Phase::Failed;
+                    // A charge failure comes only from private mount-data
+                    // preparation, before the System-only backend builder.
+                    // Let the outer recover after this state guard unwinds.
+                    state.phase = if matches!(
+                        &error,
+                        crate::mm::allocation::MemoryAllocationError::Charge(_)
+                    ) {
+                        Phase::CreateParams
+                    } else {
+                        Phase::Failed
+                    };
                     Err(error)
                 }
             }
         }
         FsConfigCommand::CreateExcl => {
             if state.phase != Phase::CreateParams {
-                Err(SystemError::EBUSY)
+                Err(SystemError::EBUSY.into())
             } else if !capable(CAPFlags::CAP_SYS_ADMIN) {
-                Err(SystemError::EPERM)
+                Err(SystemError::EPERM.into())
             } else {
                 // Registered DragonOS makers use legacy create/reuse paths.
-                Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
+                Err(SystemError::EOPNOTSUPP_OR_ENOTSUP.into())
             }
         }
         FsConfigCommand::Reconfigure => {
             if state.phase != Phase::ReconfParams {
-                return Err(SystemError::EBUSY);
+                return Err(SystemError::EBUSY.into());
             }
             state.phase = Phase::Reconfiguring;
-            let result = (|| {
+            let result: Result<(), SystemError> = (|| {
                 let target = state.target.as_ref().ok_or(SystemError::EINVAL)?;
                 let superblock = target.mount.super_block_state();
                 // Execute with the caller's capability, not creation.cred.
@@ -439,7 +476,7 @@ pub fn configure_fs_context(fd: i32, cmd: FsConfigCommand) -> Result<(), SystemE
                 }
                 Err(error) => {
                     state.phase = Phase::Failed;
-                    Err(error)
+                    Err(error.into())
                 }
             }
         }
@@ -502,7 +539,7 @@ impl IndexNode for FsContextInode {
         &self,
         _data: MutexGuard<FilePrivateData>,
         _flags: &FileFlags,
-    ) -> Result<(), SystemError> {
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         Ok(())
     }
 
@@ -516,10 +553,10 @@ impl IndexNode for FsContextInode {
         _len: usize,
         _buf: &mut [u8],
         _data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError> {
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
         // Linux fscontext_read returns ENODATA when its diagnostic queue is
         // empty. DragonOS makers do not currently emit fs-context messages.
-        Err(SystemError::ENODATA)
+        Err(SystemError::ENODATA.into())
     }
 
     fn write_at(
@@ -528,8 +565,8 @@ impl IndexNode for FsContextInode {
         _len: usize,
         _buf: &[u8],
         _data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError> {
-        Err(SystemError::EINVAL)
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        Err(SystemError::EINVAL.into())
     }
 
     fn fs(&self) -> Arc<dyn FileSystem> {

@@ -7,13 +7,17 @@ use crate::libs::spinlock::SpinLock;
 use crate::process::ProcessControlBlock;
 use crate::process::ProcessFlags;
 use crate::sched::clock::ClockUpdataFlag;
-use crate::sched::fair_tree::FairTimeline;
+use crate::sched::fair_tree::{FairTimeline, FairTreeNode};
 use crate::sched::{SchedFeature, SCHED_FEATURES};
 use crate::time::jiffies::TICK_NESC;
 use crate::time::timer::clock;
-use alloc::sync::{Arc, Weak};
+use alloc::{
+    boxed::Box,
+    sync::{Arc, Weak},
+};
 
 use super::pelt::{sub_positive, SchedulerAvg, UpdateAvgFlags, PELT_MIN_DIVIDER};
+use super::pelt_list::{PeltDisposition, PeltNode};
 use super::{
     CpuRunQueue, DequeueFlag, EnqueueFlag, LoadWeight, OnRq, Scheduler, TaskGroup, WakeupFlags,
     SCHED_CAPACITY_SHIFT,
@@ -84,11 +88,27 @@ pub struct FairSchedEntity {
     runnable_weight: u64,
 
     pcb: Weak<ProcessControlBlock>,
+
+    /// Unique preallocated timeline node. Current and sleeping entities own
+    /// the empty node here; a queued timeline owns it instead. The spare never
+    /// holds an Arc back to this entity.
+    pub(crate) timeline_node: Option<Box<FairTreeNode>>,
 }
 
 impl FairSchedEntity {
+    /// Legacy/bootstrap wrapper. Normal unpublished task/group construction
+    /// will propagate try_new's error in its separately reviewed birth batch.
     pub fn new() -> Arc<Self> {
-        let ret = Arc::new(Self {
+        Self::try_new().unwrap_or_else(|_| {
+            alloc::alloc::handle_alloc_error(core::alloc::Layout::new::<Self>())
+        })
+    }
+
+    /// Prepare both allocations before publishing the entity or attaching it
+    /// to a runqueue. Failure drops any already prepared node normally.
+    pub fn try_new() -> Result<Arc<Self>, core::alloc::AllocError> {
+        let timeline_node = FairTreeNode::try_new()?;
+        let ret = Arc::try_new(Self {
             parent: Weak::new(),
             self_ref: Weak::new(),
             pcb: Weak::new(),
@@ -110,11 +130,12 @@ impl FairSchedEntity {
             avg: Default::default(),
             depth: Default::default(),
             runnable_weight: Default::default(),
-        });
+            timeline_node: Some(timeline_node),
+        })?;
 
         ret.force_mut().self_ref = Arc::downgrade(&ret);
 
-        ret
+        Ok(ret)
     }
 }
 
@@ -384,6 +405,8 @@ pub struct CfsRunQueue {
     task_group: Weak<TaskGroup>,
     tg_load_avg_contrib: u64,
     on_pelt_list: bool,
+    /// Empty while this queue's unique prepared node is owned by its rq list.
+    pelt_node: Option<Box<PeltNode>>,
 
     pub throttled_clock: u64,
     pub throttled_clock_pelt: u64,
@@ -409,7 +432,12 @@ pub struct CfsRemoved {
 
 impl CfsRunQueue {
     pub fn new() -> Self {
-        Self {
+        Self::try_new().expect("bootstrap CFS PELT preparation failed")
+    }
+
+    pub fn try_new() -> Result<Self, core::alloc::AllocError> {
+        let pelt_node = PeltNode::try_new()?;
+        Ok(Self {
             load: LoadWeight::default(),
             nr_running: 0,
             h_nr_running: 0,
@@ -431,6 +459,7 @@ impl CfsRunQueue {
             task_group: Weak::new(),
             tg_load_avg_contrib: 0,
             on_pelt_list: false,
+            pelt_node: Some(pelt_node),
             throttled_clock: 0,
             throttled_clock_pelt: 0,
             throttled_clock_pelt_time: 0,
@@ -442,7 +471,23 @@ impl CfsRunQueue {
             prop_runnable_sum: 0,
             runtime_remaining: 0,
             runtime_enabled: false,
-        }
+        })
+    }
+
+    fn take_pelt_node(&mut self) -> Box<PeltNode> {
+        self.pelt_node
+            .take()
+            .expect("listed CFS queue has no spare PELT node")
+    }
+
+    pub(super) fn return_pelt_node(&mut self, mut node: Box<PeltNode>) {
+        assert!(self.pelt_node.is_none(), "duplicate CFS PELT spare node");
+        debug_assert!(node.next.is_none());
+        // The caller pins this live queue; clearing its Weak cannot free the
+        // queue's Arc control block under rq. A detached spare has no payload.
+        node.queue = Weak::new();
+        self.on_pelt_list = false;
+        self.pelt_node = Some(node);
     }
 
     #[inline]
@@ -585,11 +630,14 @@ impl CfsRunQueue {
         }
         self.tg_load_avg_contrib = 0;
         let binding = self.rq();
-        binding
-            .force_mut_locked()
-            .cfs_pelt_queues
-            .retain(|entry| !core::ptr::eq(entry.as_ptr(), self));
-        self.on_pelt_list = false;
+        if self.on_pelt_list {
+            let node = binding
+                .force_mut_locked()
+                .cfs_pelt_queues
+                .remove(self)
+                .expect("listed CFS queue missing PELT node");
+            self.return_pelt_node(node);
+        }
     }
 
     #[inline]
@@ -1770,32 +1818,32 @@ impl CpuRunQueue {
         if leaf.on_pelt_list {
             return;
         }
-        let mut branch = alloc::vec::Vec::new();
+        let mut branch = None;
         let mut cursor = leaf;
         loop {
             if cursor.on_pelt_list {
                 break;
             }
-            branch.push(cursor.clone());
+            let mut node = cursor.force_mut().take_pelt_node();
+            node.queue = Arc::downgrade(&cursor);
+            // Ancestors become the head of this temporary owned chain. Their
+            // nodes were all prepared at CFS birth, before any rq mutation.
+            node.next = branch;
+            branch = Some(node);
             let Some(group) = cursor.task_group_optional() else {
                 break;
             };
             cursor = group.entity(self.cpu()).cfs_rq();
         }
-        for queue in branch.into_iter().rev() {
+        while let Some(mut node) = branch {
+            branch = node.next.take();
+            let queue = node.queue.upgrade().expect("registering live CFS branch");
             let parent = queue
                 .task_group_optional()
                 .map(|group| group.entity(self.cpu()).cfs_rq());
-            let index = parent
-                .as_ref()
-                .and_then(|parent| {
-                    self.cfs_pelt_queues
-                        .iter()
-                        .position(|entry| entry.as_ptr() == Arc::as_ptr(parent))
-                })
-                .unwrap_or(self.cfs_pelt_queues.len());
             queue.force_mut().on_pelt_list = true;
-            self.cfs_pelt_queues.insert(index, Arc::downgrade(&queue));
+            self.cfs_pelt_queues
+                .insert_before(node, parent.as_ref().map(Arc::as_ptr));
         }
     }
 }
@@ -1805,13 +1853,14 @@ pub struct CompletelyFairScheduler;
 impl CompletelyFairScheduler {
     /// Ordinary tick service, including idle CPUs. Only the owner rq is
     /// touched: blocked history must keep decaying after tasks leave a CPU.
-    pub(crate) fn update_blocked_averages(rq: &mut CpuRunQueue) {
-        let mut index = 0;
+    pub(super) fn update_blocked_averages(rq: &mut CpuRunQueue) -> Option<Box<PeltNode>> {
+        let cpu = rq.cpu();
         let mut previous: Option<Arc<CfsRunQueue>> = None;
-        while index < rq.cfs_pelt_queues.len() {
-            let Some(binding) = rq.cfs_pelt_queues[index].upgrade() else {
-                rq.cfs_pelt_queues.remove(index);
-                continue;
+        // These calls use UPDATE_TG only, never DO_ATTACH/DO_DETACH; the load
+        // visitor therefore cannot reenter PELT registration/list mutation.
+        rq.cfs_pelt_queues.sweep(|entry| {
+            let Some(binding) = entry.upgrade() else {
+                return PeltDisposition::Retire;
             };
             let leaf = binding.force_mut();
             if leaf.throttled_count == 0 {
@@ -1821,7 +1870,7 @@ impl CompletelyFairScheduler {
                     leaf.update_idle_clock_pelt();
                 }
                 if let Some(group) = leaf.task_group_optional() {
-                    let entity = group.entity(rq.cpu());
+                    let entity = group.entity(cpu);
                     entity
                         .cfs_rq()
                         .force_mut()
@@ -1833,16 +1882,14 @@ impl CompletelyFairScheduler {
             let child_is_listed = previous.as_ref().is_some_and(|child| {
                 child
                     .task_group_optional()
-                    .is_some_and(|group| Arc::ptr_eq(&group.entity(rq.cpu()).cfs_rq(), &binding))
+                    .is_some_and(|group| Arc::ptr_eq(&group.entity(cpu).cfs_rq(), &binding))
             });
             if leaf.throttled_count == 0 && leaf.pelt_is_decayed() && !child_is_listed {
-                leaf.on_pelt_list = false;
-                rq.cfs_pelt_queues.remove(index);
-                continue;
+                return PeltDisposition::Recycle(binding);
             }
             previous = Some(binding);
-            index += 1;
-        }
+            PeltDisposition::Keep
+        })
     }
 
     pub(crate) fn update_current_chain(task: &Arc<ProcessControlBlock>) {

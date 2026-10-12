@@ -26,12 +26,12 @@ impl FileSystemMakerData for FatMountData {
 }
 
 impl FatMountData {
-    fn from_source(path: &str) -> Result<Self, SystemError> {
+    fn from_source(path: &str) -> Result<Self, crate::mm::allocation::MemoryAllocationError> {
         let pcb = ProcessManager::current_pcb();
         let (current_node, rest_path) = user_path_at(&pcb, AtFlags::AT_FDCWD.bits(), path)?;
         let inode = current_node.lookup_follow_symlink(&rest_path, VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
         if !inode.metadata()?.file_type.eq(&vfs::FileType::BlockDevice) {
-            return Err(SystemError::ENOTBLK);
+            return Err(SystemError::ENOTBLK.into());
         }
 
         let disk = inode.dname()?;
@@ -39,7 +39,7 @@ impl FatMountData {
         if let Some(gendisk) = try_find_gendisk(disk.0.as_str()) {
             return Ok(Self { gendisk });
         }
-        Err(SystemError::ENOENT)
+        Err(SystemError::ENOENT.into())
     }
 }
 
@@ -57,7 +57,10 @@ impl MountableFileSystem for FATFileSystem {
     fn make_mount_data(
         _raw_data: Option<&str>,
         source: &str,
-    ) -> Result<Option<Arc<dyn FileSystemMakerData + 'static>>, SystemError> {
+    ) -> Result<
+        Option<Arc<dyn FileSystemMakerData + 'static>>,
+        crate::mm::allocation::MemoryAllocationError,
+    > {
         let mount_data = FatMountData::from_source(source).map_err(|e| {
             log::error!(
                 "Failed to create FAT mount data from source '{}': {:?}",

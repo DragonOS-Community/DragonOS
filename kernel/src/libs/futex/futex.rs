@@ -271,8 +271,11 @@ impl Futex {
         );
         let current_address_space = AddressSpace::current()?;
         let mut flags = FaultFlags::FAULT_FLAG_WRITE;
+        let mut charge_recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
 
         loop {
+            let creator = crate::cgroup::memory::object_for_task(&ProcessManager::current_pcb());
+            let data_account = current_address_space.memory_account();
             let mut space_guard =
                 current_address_space.write_guard_no_reservation_conflict(fault_region);
             let vma = space_guard
@@ -291,10 +294,28 @@ impl Futex {
 
             let mapper = &mut space_guard.user_mapper.utable;
             let fault = unsafe {
-                let message =
-                    PageFaultMessage::new(vma, uaddr, flags, mapper, current_address_space.clone());
+                let message = PageFaultMessage::new(
+                    vma,
+                    uaddr,
+                    flags,
+                    mapper,
+                    current_address_space.clone(),
+                    creator.clone(),
+                    data_account.clone(),
+                );
                 PageFaultHandler::handle_mm_fault(message)
             };
+
+            if let Some(failure) = fault.charge_failure {
+                drop(space_guard);
+                crate::mm::fault::recover_fault_charge(
+                    failure,
+                    &mut charge_recovery,
+                    &data_account,
+                    flags,
+                )?;
+                continue;
+            }
 
             if fault.reason.contains(VmFaultReason::VM_FAULT_COMPLETED) {
                 return Ok(());
@@ -304,9 +325,25 @@ impl Futex {
                 let wait = fault.retry_wait;
                 drop(space_guard);
                 if let Some(wait) = wait {
-                    if let Err(error) = wait.wait() {
+                    let result = match wait.wait() {
+                        Err(crate::mm::allocation::MemoryAllocationError::Charge(failure)) => {
+                            crate::mm::fault::recover_fault_charge(
+                                failure,
+                                &mut charge_recovery,
+                                &data_account,
+                                flags,
+                            )?;
+                            continue;
+                        }
+                        Err(crate::mm::allocation::MemoryAllocationError::System(error)) => {
+                            Err(error)
+                        }
+                        Ok(()) => Ok(()),
+                    };
+                    if let Err(error) = result {
                         if !matches!(error, SystemError::EINTR | SystemError::ERESTARTSYS) {
                             crate::mm::fault::account_fault_result(
+                                &data_account,
                                 flags,
                                 VmFaultReason::VM_FAULT_SIGBUS,
                             );

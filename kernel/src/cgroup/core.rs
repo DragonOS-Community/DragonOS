@@ -98,17 +98,54 @@ pub struct CgroupNode {
     cpu_group: RwLock<Option<Arc<crate::sched::TaskGroup>>>,
     cpuset: RwLock<super::cpuset::CpusetState>,
     memory: RwLock<CgroupMemoryState>,
+    /// Physical resource ownership outlives directory and task membership.
+    memory_current: RwLock<Option<MemoryGeneration>>,
     freezer: RwLock<CgroupFreezerState>,
     pids_max: RwLock<Option<usize>>,
     pids_events_max: AtomicU64,
-    local_pids_counter: AtomicUsize,
-    subtree_pids_counter: AtomicUsize,
-    subtree_task_counter: AtomicUsize,
+    pids_account: Arc<super::pids_account::PidsAccount>,
+    /// Inclusive live population, serialized by cgroup_accounting_lock.
+    populated_tasks: AtomicUsize,
+    population_sequence: AtomicU64,
     device_bpf: RwLock<DeviceBpfState>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct MemoryGeneration {
+    pub account: Arc<super::memory::MemoryAccount>,
+    pub object_account: Arc<super::memory::object::ObjectAccount>,
+}
+
+impl MemoryGeneration {
+    pub(crate) fn prepare(
+        id: usize,
+        parent: Option<Arc<super::memory::MemoryAccount>>,
+    ) -> Result<(Self, super::memory::object::PreparedObjectAccount), SystemError> {
+        let account = super::memory::MemoryAccount::new(id as u64, parent)?;
+        let prepared = super::memory::object::ObjectAccount::prepare(&account)?;
+        let generation = Self {
+            account,
+            object_account: prepared.object_account().clone(),
+        };
+        Ok((generation, prepared))
+    }
+
+    pub(crate) fn retire(&self) {
+        super::memory::object::offline_memory_account(&self.account)
+            .expect("only non-root memory generations retire");
+    }
+}
+
+pub(crate) struct PreparedFilePermission {
+    name: &'static str,
+    attributes: Arc<RwLock<CgroupFilePermissions>>,
 }
 
 impl CgroupNode {
     fn new_root() -> Arc<Self> {
+        let (memory, prepared) =
+            MemoryGeneration::prepare(1, None).expect("initial memory account allocation failed");
+        prepared.publish();
         Arc::new(Self {
             id: 1,
             name: String::new(),
@@ -123,18 +160,37 @@ impl CgroupNode {
             cpu_group: RwLock::new(None),
             cpuset: RwLock::new(super::cpuset::CpusetState::default()),
             memory: RwLock::new(CgroupMemoryState::default()),
+            memory_current: RwLock::new(Some(memory)),
             freezer: RwLock::new(CgroupFreezerState::default()),
             pids_max: RwLock::new(None),
             pids_events_max: AtomicU64::new(0),
-            local_pids_counter: AtomicUsize::new(0),
-            subtree_pids_counter: AtomicUsize::new(0),
-            subtree_task_counter: AtomicUsize::new(0),
+            pids_account: super::pids_account::PidsAccount::try_new(None)
+                .expect("initial pids account allocation failed"),
+            populated_tasks: AtomicUsize::new(0),
+            population_sequence: AtomicU64::new(0),
             device_bpf: RwLock::new(DeviceBpfState::empty()),
         })
     }
 
-    fn new_child(id: usize, name: String, parent: &Arc<CgroupNode>) -> Arc<Self> {
-        Arc::new(Self {
+    fn new_child(
+        id: usize,
+        name: String,
+        parent: &Arc<CgroupNode>,
+    ) -> Result<
+        (
+            Arc<Self>,
+            Option<super::memory::object::PreparedObjectAccount>,
+        ),
+        SystemError,
+    > {
+        let (memory, prepared) = if parent.subtree_controller_enabled("memory") {
+            let (generation, prepared) =
+                MemoryGeneration::prepare(id, Some(parent.memory_account()))?;
+            (Some(generation), Some(prepared))
+        } else {
+            (None, None)
+        };
+        let node = Arc::try_new(Self {
             id,
             name,
             parent: Some(Arc::downgrade(parent)),
@@ -150,14 +206,19 @@ impl CgroupNode {
             cpu_group: RwLock::new(None),
             cpuset: RwLock::new(super::cpuset::CpusetState::default()),
             memory: RwLock::new(CgroupMemoryState::default()),
+            memory_current: RwLock::new(memory),
             freezer: RwLock::new(CgroupFreezerState::default()),
             pids_max: RwLock::new(None),
             pids_events_max: AtomicU64::new(0),
-            local_pids_counter: AtomicUsize::new(0),
-            subtree_pids_counter: AtomicUsize::new(0),
-            subtree_task_counter: AtomicUsize::new(0),
+            pids_account: super::pids_account::PidsAccount::try_new(Some(
+                parent.pids_account.clone(),
+            ))?,
+            populated_tasks: AtomicUsize::new(0),
+            population_sequence: AtomicU64::new(0),
             device_bpf: RwLock::new(DeviceBpfState::empty()),
         })
+        .map_err(|_| SystemError::ENOMEM)?;
+        Ok((node, prepared))
     }
 
     pub fn id(&self) -> usize {
@@ -236,6 +297,61 @@ impl CgroupNode {
         );
     }
 
+    pub(crate) fn prepare_file_permission_reset(
+        &self,
+        name: &'static str,
+        default_mode: u32,
+    ) -> Result<PreparedFilePermission, SystemError> {
+        let cred = ProcessManager::current_pcb().cred();
+        let parent = self.file_permissions.read().get("").map_or(
+            CgroupFilePermissions {
+                uid: 0,
+                gid: 0,
+                mode: 0o755,
+                generation: 0,
+            },
+            |entry| *entry.read(),
+        );
+        let original = super::file_permissions::canonical_instance(
+            &self.file_permissions,
+            name,
+            default_mode,
+        )?;
+        let generation = original
+            .read()
+            .generation
+            .checked_add(1)
+            .ok_or(SystemError::EOVERFLOW)?;
+        // UPDATE is the sole epoch-reset owner; chmod preserves the epoch.
+        // The replacement allocation must not retain map or attributes locks.
+        let attributes = Arc::try_new(RwLock::new(CgroupFilePermissions {
+            generation,
+            ..CgroupFilePermissions::for_creation(
+                parent,
+                cred.fsuid.data() as u32,
+                cred.fsgid.data() as u32,
+                default_mode,
+                false,
+            )
+        }))
+        .map_err(|_| SystemError::ENOMEM)?;
+        Ok(PreparedFilePermission { name, attributes })
+    }
+
+    pub(crate) fn commit_file_permission_reset(
+        &self,
+        mut prepared: PreparedFilePermission,
+    ) -> PreparedFilePermission {
+        let mut map = self.file_permissions.write();
+        let old = core::mem::replace(
+            map.get_mut(prepared.name)
+                .expect("prepared permission has a canonical entry"),
+            prepared.attributes,
+        );
+        prepared.attributes = old;
+        prepared
+    }
+
     pub fn name(&self) -> &str {
         &self.name
     }
@@ -244,14 +360,59 @@ impl CgroupNode {
         self.parent.as_ref().and_then(|p| p.upgrade())
     }
 
+    /// UPDATE excludes all population growth; exit only removes entries.
+    /// Prepare backing outside tasks/accounting/PID locks before publication.
+    pub(crate) fn reserve_task_slots(&self, additional: usize) -> Result<(), SystemError> {
+        let (len, capacity) = {
+            let tasks = self.tasks.read();
+            (tasks.len(), tasks.capacity())
+        };
+        let needed = len.checked_add(additional).ok_or(SystemError::ENOMEM)?;
+        if capacity >= needed {
+            return Ok(());
+        }
+        let mut prepared = HashSet::new();
+        if prepared.try_reserve(needed).is_err() {
+            let tasks = self.tasks.read();
+            return if tasks.capacity()
+                >= tasks
+                    .len()
+                    .checked_add(additional)
+                    .ok_or(SystemError::ENOMEM)?
+            {
+                Ok(())
+            } else {
+                Err(SystemError::ENOMEM)
+            };
+        }
+        {
+            let mut tasks = self.tasks.write();
+            if tasks.capacity()
+                < tasks
+                    .len()
+                    .checked_add(additional)
+                    .ok_or(SystemError::ENOMEM)?
+            {
+                prepared.extend(tasks.drain());
+                core::mem::swap(&mut *tasks, &mut prepared);
+            }
+        }
+        drop(prepared);
+        Ok(())
+    }
+
     pub fn add_task(&self, pid: RawPid) {
-        if !self.tasks.write().insert(pid) {
+        let mut tasks = self.tasks.write();
+        debug_assert!(tasks.len() < tasks.capacity());
+        if !tasks.insert(pid) {
             debug_assert!(false, "cgroup task {:?} already exists", pid);
             return;
         }
+        drop(tasks);
+        self.adjust_population(true);
         let mut cur = self.parent();
         while let Some(node) = cur {
-            node.subtree_task_counter.fetch_add(1, Ordering::Release);
+            node.adjust_population(true);
             cur = node.parent();
         }
     }
@@ -261,11 +422,34 @@ impl CgroupNode {
             debug_assert!(false, "cgroup task {:?} does not exist", pid);
             return;
         }
+        self.adjust_population(false);
         let mut cur = self.parent();
         while let Some(node) = cur {
-            node.subtree_task_counter.fetch_sub(1, Ordering::Release);
+            node.adjust_population(false);
             cur = node.parent();
         }
+    }
+
+    fn adjust_population(&self, add: bool) {
+        let edge = if add {
+            self.populated_tasks.fetch_add(1, Ordering::AcqRel) == 0
+        } else {
+            let old = self.populated_tasks.fetch_sub(1, Ordering::AcqRel);
+            debug_assert_ne!(old, 0, "population underflow");
+            old == 1
+        };
+        if edge {
+            self.population_sequence.fetch_add(1, Ordering::Release);
+            crate::mm::memory_notify::request_file_events();
+        }
+    }
+
+    pub(crate) fn population_sequence(&self) -> u64 {
+        self.population_sequence.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn is_populated(&self) -> bool {
+        self.populated_tasks.load(Ordering::Acquire) != 0
     }
 
     pub fn rename_task(&self, old_pid: RawPid, new_pid: RawPid) {
@@ -294,6 +478,44 @@ impl CgroupNode {
         self.children.read().values().cloned().collect()
     }
 
+    pub(crate) fn children_snapshot(&self) -> Result<Vec<Arc<CgroupNode>>, SystemError> {
+        let children = self.children.read();
+        let mut snapshot = Vec::new();
+        snapshot
+            .try_reserve_exact(children.len())
+            .map_err(|_| SystemError::ENOMEM)?;
+        snapshot.extend(children.values().cloned());
+        Ok(snapshot)
+    }
+
+    pub(crate) fn any_child(&self, predicate: impl FnMut(&Arc<CgroupNode>) -> bool) -> bool {
+        self.children.read().values().any(predicate)
+    }
+
+    pub(crate) fn any_subtree_controller(&self, predicate: impl FnMut(&str) -> bool) -> bool {
+        self.subtree_control
+            .read()
+            .iter()
+            .map(String::as_str)
+            .any(predicate)
+    }
+
+    pub(crate) fn subtree_control_snapshot(&self) -> Result<HashSet<String>, SystemError> {
+        let controls = self.subtree_control.read();
+        let mut snapshot = HashSet::new();
+        snapshot
+            .try_reserve(controls.len())
+            .map_err(|_| SystemError::ENOMEM)?;
+        for name in controls.iter() {
+            let mut copy = String::new();
+            copy.try_reserve_exact(name.len())
+                .map_err(|_| SystemError::ENOMEM)?;
+            copy.push_str(name);
+            snapshot.insert(copy);
+        }
+        Ok(snapshot)
+    }
+
     pub fn child(&self, name: &str) -> Option<Arc<CgroupNode>> {
         self.children.read().get(name).cloned()
     }
@@ -310,8 +532,18 @@ impl CgroupNode {
         self.subtree_control.read().iter().cloned().collect()
     }
 
+    /// Query a controller without allocating a copy of its configured names.
+    /// Resource-owner lookup must not allocate while deciding where to charge.
+    pub(crate) fn subtree_controller_enabled(&self, name: &str) -> bool {
+        self.subtree_control.read().contains(name)
+    }
+
     pub fn set_subtree_control(&self, controllers: HashSet<String>) {
         *self.subtree_control.write() = controllers;
+    }
+
+    pub(crate) fn replace_subtree_control(&self, controllers: HashSet<String>) -> HashSet<String> {
+        core::mem::replace(&mut *self.subtree_control.write(), controllers)
     }
 
     pub fn cpu_state(&self) -> CgroupCpuState {
@@ -365,20 +597,39 @@ impl CgroupNode {
         *self.memory.read()
     }
 
-    pub fn set_memory_min(&self, value: Option<u64>) {
-        self.memory.write().set_min(value);
+    pub(crate) fn memory_account(&self) -> Arc<super::memory::MemoryAccount> {
+        self.effective_memory_generation().account
     }
 
-    pub fn set_memory_low(&self, value: Option<u64>) {
-        self.memory.write().set_low(value);
+    pub(crate) fn effective_memory_generation(&self) -> MemoryGeneration {
+        if let Some(generation) = self.local_memory_generation() {
+            if generation.account.is_online() {
+                return generation;
+            }
+        }
+        let mut cursor = self.parent();
+        while let Some(node) = cursor {
+            if let Some(generation) = node.local_memory_generation() {
+                if generation.account.is_online() {
+                    return generation;
+                }
+            }
+            cursor = node.parent();
+        }
+        super::cgroup_root_node()
+            .local_memory_generation()
+            .expect("root memory generation is permanent")
     }
 
-    pub fn set_memory_high(&self, value: Option<u64>) {
-        self.memory.write().set_high(value);
+    pub(crate) fn local_memory_generation(&self) -> Option<MemoryGeneration> {
+        self.memory_current.read().clone()
     }
 
-    pub fn set_memory_max(&self, value: Option<u64>) {
-        self.memory.write().set_max(value);
+    pub(crate) fn replace_memory_generation(
+        &self,
+        generation: Option<MemoryGeneration>,
+    ) -> Option<MemoryGeneration> {
+        core::mem::replace(&mut *self.memory_current.write(), generation)
     }
 
     pub fn set_memory_swap_high(&self, value: Option<u64>) {
@@ -413,15 +664,8 @@ impl CgroupNode {
         self.pids_events_max.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub fn subtree_task_counter(&self) -> &AtomicUsize {
-        &self.subtree_task_counter
-    }
-
     pub fn subtree_task_count(&self) -> usize {
-        self.tasks
-            .read()
-            .len()
-            .saturating_add(self.subtree_task_counter.load(Ordering::Acquire))
+        self.populated_tasks.load(Ordering::Acquire)
     }
 
     pub fn charge_pids(&self, count: usize) {
@@ -429,13 +673,7 @@ impl CgroupNode {
             return;
         }
 
-        self.local_pids_counter.fetch_add(count, Ordering::Release);
-        let mut cur = self.parent();
-        while let Some(node) = cur {
-            node.subtree_pids_counter
-                .fetch_add(count, Ordering::Release);
-            cur = node.parent();
-        }
+        self.pids_account.charge(count);
     }
 
     pub fn uncharge_pids(&self, count: usize) {
@@ -443,26 +681,7 @@ impl CgroupNode {
             return;
         }
 
-        let old = self.local_pids_counter.fetch_sub(count, Ordering::Release);
-        debug_assert!(
-            old >= count,
-            "cgroup pids counter underflow: old={}, count={}",
-            old,
-            count
-        );
-        let mut cur = self.parent();
-        while let Some(node) = cur {
-            let old = node
-                .subtree_pids_counter
-                .fetch_sub(count, Ordering::Release);
-            debug_assert!(
-                old >= count,
-                "cgroup subtree pids counter underflow: old={}, count={}",
-                old,
-                count
-            );
-            cur = node.parent();
-        }
+        self.pids_account.uncharge(count);
     }
 
     pub fn transfer_pids_charge(src: &Arc<Self>, dst: &Arc<Self>, count: usize) {
@@ -475,9 +694,7 @@ impl CgroupNode {
     }
 
     pub fn pids_current_count(&self) -> usize {
-        self.local_pids_counter
-            .load(Ordering::Acquire)
-            .saturating_add(self.subtree_pids_counter.load(Ordering::Acquire))
+        self.pids_account.current()
     }
 
     pub fn is_ancestor_of(self: &Arc<Self>, other: &Arc<Self>) -> bool {
@@ -568,14 +785,14 @@ impl CgroupRoot {
         parent: &Arc<CgroupNode>,
         name: &str,
     ) -> Result<Arc<CgroupNode>, SystemError> {
-        self.create_child_inner(parent, name, false, |_| {})
+        self.create_child_inner(parent, name, false, |_| Ok(()))
     }
 
     pub(crate) fn create_child_exclusive_with_init(
         &self,
         parent: &Arc<CgroupNode>,
         name: &str,
-        init: impl FnOnce(&Arc<CgroupNode>),
+        init: impl FnOnce(&Arc<CgroupNode>) -> Result<(), SystemError>,
     ) -> Result<Arc<CgroupNode>, SystemError> {
         self.create_child_inner(parent, name, true, init)
     }
@@ -585,7 +802,7 @@ impl CgroupRoot {
         parent: &Arc<CgroupNode>,
         name: &str,
         exclusive: bool,
-        init: impl FnOnce(&Arc<CgroupNode>),
+        init: impl FnOnce(&Arc<CgroupNode>) -> Result<(), SystemError>,
     ) -> Result<Arc<CgroupNode>, SystemError> {
         if name.is_empty() || name == "." || name == ".." || name.contains('/') {
             return Err(SystemError::EINVAL);
@@ -602,17 +819,65 @@ impl CgroupRoot {
             return Ok(existing.clone());
         }
 
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let child = CgroupNode::new_child(id, name.to_string(), parent);
-        child.device_bpf.write().effective = parent.device_bpf.read().effective.clone();
-        super::cpu::initialize_node_locked(&child);
-        init(&child);
-        parent
+        // Both authority maps and their owned key are prepared before the
+        // fallible inode initializer. UPDATE/structure exclude other inserts.
+        let mut key = String::new();
+        key.try_reserve_exact(name.len())
+            .map_err(|_| SystemError::ENOMEM)?;
+        key.push_str(name);
+        let mut child_name = String::new();
+        child_name
+            .try_reserve_exact(name.len())
+            .map_err(|_| SystemError::ENOMEM)?;
+        child_name.push_str(name);
+        let parent_needed = parent
             .children
-            .write()
-            .insert(name.to_string(), child.clone());
+            .read()
+            .len()
+            .checked_add(1)
+            .ok_or(SystemError::ENOMEM)?;
+        if parent.children.read().capacity() < parent_needed {
+            let mut prepared = HashMap::new();
+            prepared
+                .try_reserve(parent_needed)
+                .map_err(|_| SystemError::ENOMEM)?;
+            {
+                let mut children = parent.children.write();
+                prepared.extend(children.drain());
+                core::mem::swap(&mut *children, &mut prepared);
+            }
+            drop(prepared);
+        }
+        let all_needed = self
+            .all_nodes
+            .lock()
+            .len()
+            .checked_add(1)
+            .ok_or(SystemError::ENOMEM)?;
+        if self.all_nodes.lock().capacity() < all_needed {
+            let mut prepared = HashMap::new();
+            prepared
+                .try_reserve(all_needed)
+                .map_err(|_| SystemError::ENOMEM)?;
+            {
+                let mut all = self.all_nodes.lock();
+                prepared.extend(all.drain());
+                core::mem::swap(&mut *all, &mut prepared);
+            }
+            drop(prepared);
+        }
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (child, memory_prepared) = CgroupNode::new_child(id, child_name, parent)?;
+        child.device_bpf.write().effective = parent.device_bpf.read().effective.clone();
+        super::cpu::initialize_node_locked(&child)?;
+        init(&child)?;
+        parent.children.write().insert(key, child.clone());
 
         self.all_nodes.lock().insert(id, child.clone());
+        drop(_structure_guard);
+        if let Some(prepared) = memory_prepared {
+            prepared.publish();
+        }
         Ok(child)
     }
 
@@ -637,14 +902,15 @@ impl CgroupRoot {
             return Err(SystemError::ENOENT);
         }
 
-        // A fork reserves a pids charge before publishing task membership.
-        // Keep the accounting lock through both the emptiness check and the
-        // online-registry removal so migration/fork cannot target a dying node.
+        // UPDATE (also the cpuset lock) covers fork reservation through task
+        // publication. Accounting serializes exit/migration with this check.
+        // Zombies no longer populate the directory, although their pids CSS
+        // charge survives until pids_release() at final reap.
         let accounting_guard = cgroup_accounting_lock().lock();
         if child.has_children() {
             return Err(SystemError::ENOTEMPTY);
         }
-        if child.has_tasks() || child.pids_current_count() != 0 {
+        if child.has_tasks() {
             return Err(SystemError::EBUSY);
         }
         let removed_child = parent.children.write().remove_entry(name);
@@ -657,6 +923,9 @@ impl CgroupRoot {
         let old_state = core::mem::replace(&mut *child.device_bpf.write(), empty_state);
         drop(_structure_guard);
         super::cpu::retire_node_locked(&child);
+        if let Some(generation) = child.replace_memory_generation(None) {
+            generation.retire();
+        }
         drop(old_state);
         drop(removed);
         drop(removed_child);

@@ -149,62 +149,15 @@ mod cpu_tests {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct CgroupMemoryState {
-    min: Option<u64>,
-    low: Option<u64>,
-    high: Option<u64>,
-    max: Option<u64>,
+    // Swap configuration remains separate until the swap controller exists.
+    // Memory-core policy lives only in the admitted MemoryAccount generation.
     swap_high: Option<u64>,
     swap_max: Option<u64>,
 }
 
-impl Default for CgroupMemoryState {
-    fn default() -> Self {
-        Self {
-            min: Some(0),
-            low: Some(0),
-            high: None,
-            max: None,
-            swap_high: None,
-            swap_max: None,
-        }
-    }
-}
-
 impl CgroupMemoryState {
-    pub fn min(&self) -> Option<u64> {
-        self.min
-    }
-
-    pub fn set_min(&mut self, value: Option<u64>) {
-        self.min = value;
-    }
-
-    pub fn low(&self) -> Option<u64> {
-        self.low
-    }
-
-    pub fn set_low(&mut self, value: Option<u64>) {
-        self.low = value;
-    }
-
-    pub fn high(&self) -> Option<u64> {
-        self.high
-    }
-
-    pub fn set_high(&mut self, value: Option<u64>) {
-        self.high = value;
-    }
-
-    pub fn max(&self) -> Option<u64> {
-        self.max
-    }
-
-    pub fn set_max(&mut self, value: Option<u64>) {
-        self.max = value;
-    }
-
     pub fn swap_high(&self) -> Option<u64> {
         self.swap_high
     }

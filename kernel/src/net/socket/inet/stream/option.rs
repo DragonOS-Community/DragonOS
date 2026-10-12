@@ -399,9 +399,7 @@ impl super::TcpSocket {
                         constants::MAX_SOCKET_BUFFER,
                     )
                 };
-                self.send_buf_size()
-                    .store(size, core::sync::atomic::Ordering::Relaxed);
-                self.update_inner_buffers(size, self.recv_buf_size_loaded());
+                self.update_send_buffer(size)?;
                 crate::net::socket::base::Socket::wait_queue(self).wakeup(None);
                 Ok(())
             }
@@ -423,9 +421,7 @@ impl super::TcpSocket {
                         constants::MAX_SOCKET_BUFFER,
                     )
                 };
-                self.recv_buf_size()
-                    .store(size, core::sync::atomic::Ordering::Relaxed);
-                self.update_inner_buffers(self.send_buf_size_loaded(), size);
+                self.update_receive_buffer(size)?;
                 crate::net::socket::base::Socket::wait_queue(self).wakeup(None);
                 Ok(())
             }
@@ -525,6 +521,9 @@ impl super::TcpSocket {
             Options::NoDelay => {
                 let nagle_enabled = !byte_parser::read_bool_flag(val)?;
                 let mut inner = self.inner.write();
+                self.options
+                    .nagle_enabled
+                    .store(nagle_enabled, core::sync::atomic::Ordering::Relaxed);
                 if let Some(inner) = inner.as_mut() {
                     inner.for_each_socket_mut(|s| s.set_nagle_enabled(nagle_enabled));
                 }
@@ -767,7 +766,9 @@ impl super::TcpSocket {
         match opt {
             Options::NoDelay => {
                 let nagle_enabled = self
-                    .with_socket_property(true, |inner| inner.with_socket(|s| s.nagle_enabled()));
+                    .options
+                    .nagle_enabled
+                    .load(core::sync::atomic::Ordering::Relaxed);
                 let nodelay: u32 = if nagle_enabled { 0 } else { 1 };
                 Self::write_u32_opt(value, nodelay)
             }
@@ -775,10 +776,7 @@ impl super::TcpSocket {
             Options::QuickAck => Self::write_bool_opt_u32(value, self.tcp_quickack_enabled()),
             Options::Cork => Self::write_bool_opt_i32(value, &self.options.tcp_cork),
             Options::Congestion => {
-                let cc_name = self
-                    .with_socket_property(smoltcp::socket::tcp::CongestionControl::Reno, |inner| {
-                        inner.with_socket(|s| s.congestion_control())
-                    });
+                let cc_name = *self.options.congestion_control.lock_irqsave();
 
                 let name = match cc_name {
                     smoltcp::socket::tcp::CongestionControl::Reno => "reno",
@@ -831,7 +829,15 @@ impl super::TcpSocket {
 
         // For closed/unconnected sockets, return default info
         let info = self.with_socket_property(info::PosixTcpInfo::default(), |inner| {
-            inner.with_socket(|socket| TcpInfoCollector::new(socket).collect())
+            inner
+                .with_socket(|socket| TcpInfoCollector::new(socket).collect())
+                .unwrap_or_else(|| {
+                    let mut info = info::PosixTcpInfo::default();
+                    if matches!(inner, super::inner::Inner::Listening(_)) {
+                        info.tcpi_state = info::TcpState::Listen as u8;
+                    }
+                    info
+                })
         });
 
         // Copy the info struct to the output buffer

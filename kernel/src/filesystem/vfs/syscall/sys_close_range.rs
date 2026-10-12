@@ -103,7 +103,13 @@ fn do_close_range(first: u32, last: u32, flags: u32) -> Result<usize, SystemErro
         } else {
             Some((first, last))
         };
-        let new_table = FileDescriptorTable::try_clone(&old_table, punch_hole)?;
+        let new_table = crate::filesystem::vfs::file::File::recover_io(|| {
+            FileDescriptorTable::try_clone(
+                &old_table,
+                punch_hole,
+                &crate::cgroup::memory::object_for_task(&current),
+            )
+        })?;
 
         if flags.contains(CloseRangeFlags::CLOEXEC) {
             set_cloexec_in_table(&new_table, first, last);

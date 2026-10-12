@@ -94,6 +94,21 @@ struct InPktInfo {
 #[cast_to([sync] Socket)]
 #[derive(Debug)]
 pub struct UdpSocket {
+    data: crate::libs::lazy_init::Lazy<crate::cgroup::memory::owned::OwnedBox<UdpSocketData>>,
+}
+
+impl core::ops::Deref for UdpSocket {
+    type Target = UdpSocketData;
+    fn deref(&self) -> &Self::Target {
+        self.data.get()
+    }
+}
+
+#[derive(Debug)]
+pub struct UdpSocketData {
+    memory: crate::net::socket::buffer::SocketMemory,
+    /// Preparation may allocate, but never while holding inner/SocketSet.
+    resize_lock: Mutex<()>,
     inner: RwSem<Option<UdpInner>>,
     /// Stabilizes the smoltcp socket's interface placement across send-side
     /// polling. Ordinary unicast sends share the read side; temporary interface
@@ -114,7 +129,7 @@ pub struct UdpSocket {
     /// Custom send buffer size (SO_SNDBUF), 0 means use default
     send_buf_size: AtomicUsize,
     /// Pending IPv4 UDP bytes remain charged across SocketSet replacement.
-    send_account: Arc<super::common::output_account::SocketOutputAccount<Self>>,
+    send_account: Arc<super::common::output_account::SocketOutputAccount<UdpSocket>>,
     /// Custom receive buffer size (SO_RCVBUF), 0 means use default
     recv_buf_size: AtomicUsize,
     /// SO_RCVLOWAT
@@ -189,61 +204,105 @@ pub struct UdpSocket {
 }
 
 impl UdpSocket {
-    pub fn new(nonblock: bool, version: IpVersion) -> Arc<Self> {
+    pub fn new(nonblock: bool, version: IpVersion) -> Result<Arc<Self>, SystemError> {
         let netns = ProcessManager::current_netns();
-        Arc::new_cyclic(|me| Self {
-            inner: RwSem::new(Some(UdpInner::Unbound(UnboundUdp::new(version)))),
-            iface_placement: RwSem::new(()),
-            nonblock: AtomicBool::new(nonblock),
-            shutdown: AtomicU8::new(0),
-            wait_queue: WaitQueue::default(),
-            inode_id: generate_inode_id(),
-            open_files: AtomicUsize::new(0),
-            fsnotify_watches: AtomicUsize::new(0),
-            self_ref: me.clone(),
-            netns,
-            device_binding: SocketDeviceBinding::default(),
-            epoll_items: EPollItems::default(),
-            fasync_items: FAsyncItems::default(),
-            send_buf_size: AtomicUsize::new(0), // 0 means use default
-            send_account: Arc::new(super::common::output_account::SocketOutputAccount::new(
-                me.clone(),
-                inner::DEFAULT_TX_BUF_SIZE * 2,
-            )),
-            recv_buf_size: AtomicUsize::new(0), // 0 means use default
-            rcvlowat: AtomicI32::new(1),
-            so_reuseaddr: AtomicBool::new(false),
-            so_reuseport: AtomicBool::new(false),
-            so_keepalive: AtomicBool::new(false),
-            so_broadcast: AtomicBool::new(false),
-            so_passcred: AtomicBool::new(false),
-            recv_tos: AtomicBool::new(false),
-            recv_tclass: AtomicBool::new(false),
-            recv_err_v4: AtomicBool::new(false),
-            recv_err_v6: AtomicBool::new(false),
-            ip_multicast_ttl: AtomicI32::new(1),
-            ip_multicast_loop: AtomicBool::new(true),
-            ip_multicast_all: AtomicBool::new(true),
-            ip_multicast_ifindex: AtomicI32::new(0),
-            ip_multicast_addr: AtomicU32::new(0),
-            ip_multicast_groups: Mutex::new(Vec::new()),
-            recv_pktinfo_v4: AtomicBool::new(false),
-            recv_origdstaddr_v4: AtomicBool::new(false),
-            recv_origdstaddr_v6: AtomicBool::new(false),
-            errqueue: Mutex::new((0, ErrorQueue::default())),
-            pmtu_v4: AtomicI32::new(PmtuPolicy::Want.as_i32()),
-            pmtu_v6: AtomicI32::new(PmtuPolicy::Want.as_i32()),
-            ipv6_mtu: AtomicUsize::new(0),
-            ipv6_multicast_loop: AtomicBool::new(true),
-            ipv6_multicast_hops: AtomicI32::new(1),
-            linger_onoff: AtomicI32::new(0),
-            linger_linger: AtomicI32::new(0),
-            send_timeout_us: AtomicU64::new(u64::MAX),
-            recv_timeout_us: AtomicU64::new(u64::MAX),
-            no_check: AtomicBool::new(false), // checksums enabled by default
-            ip_version: version,
-            receive_queue: rx_queue::UdpReceiveQueue::new(inner::DEFAULT_RX_BUF_SIZE),
-        })
+        let mut recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
+        loop {
+            let task = ProcessManager::current_pcb();
+            let account = crate::cgroup::memory::account_for_task(&task);
+            let creator = crate::cgroup::memory::object_for_task(&task);
+            let prepared = (|| {
+                let memory = crate::net::socket::buffer::SocketMemory::prepare(&account, creator)?;
+                let body = crate::cgroup::memory::owned::OwnedBox::<UdpSocketData>::prepare(
+                    &memory.creator,
+                    crate::cgroup::memory::accounting::KernelByteKind::SlabUnreclaimable,
+                )?
+                .try_allocate()
+                .map_err(|_| SystemError::ENOMEM)?;
+                let unbound = UnboundUdp::try_new_with_buf_size(version, 0, 0, &memory)?;
+                let socket = Arc::try_new(Self {
+                    data: crate::libs::lazy_init::Lazy::new(),
+                })
+                .map_err(|_| SystemError::ENOMEM)?;
+                let me = Arc::downgrade(&socket);
+                let send_account =
+                    Arc::try_new(super::common::output_account::SocketOutputAccount::new(
+                        me.clone(),
+                        inner::DEFAULT_TX_BUF_SIZE * 2,
+                    ))
+                    .map_err(|_| SystemError::ENOMEM)?;
+                Ok::<_, crate::mm::allocation::MemoryAllocationError>((
+                    memory,
+                    body,
+                    unbound,
+                    socket,
+                    me,
+                    send_account,
+                ))
+            })();
+            let (memory, body, unbound, socket, me, send_account) = match prepared {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    error.recover(&mut recovery)?;
+                    continue;
+                }
+            };
+            // Weak is only saved into private owners; no registration or
+            // upgrade may observe the thin identity before body initialization.
+            socket.data.init(body.init(UdpSocketData {
+                memory,
+                resize_lock: Mutex::new(()),
+                inner: RwSem::new(Some(UdpInner::Unbound(unbound))),
+                iface_placement: RwSem::new(()),
+                nonblock: AtomicBool::new(nonblock),
+                shutdown: AtomicU8::new(0),
+                wait_queue: WaitQueue::default(),
+                inode_id: generate_inode_id(),
+                open_files: AtomicUsize::new(0),
+                fsnotify_watches: AtomicUsize::new(0),
+                self_ref: me.clone(),
+                netns,
+                device_binding: SocketDeviceBinding::default(),
+                epoll_items: EPollItems::default(),
+                fasync_items: FAsyncItems::default(),
+                send_buf_size: AtomicUsize::new(0), // 0 means use default
+                send_account,
+                recv_buf_size: AtomicUsize::new(0), // 0 means use default
+                rcvlowat: AtomicI32::new(1),
+                so_reuseaddr: AtomicBool::new(false),
+                so_reuseport: AtomicBool::new(false),
+                so_keepalive: AtomicBool::new(false),
+                so_broadcast: AtomicBool::new(false),
+                so_passcred: AtomicBool::new(false),
+                recv_tos: AtomicBool::new(false),
+                recv_tclass: AtomicBool::new(false),
+                recv_err_v4: AtomicBool::new(false),
+                recv_err_v6: AtomicBool::new(false),
+                ip_multicast_ttl: AtomicI32::new(1),
+                ip_multicast_loop: AtomicBool::new(true),
+                ip_multicast_all: AtomicBool::new(true),
+                ip_multicast_ifindex: AtomicI32::new(0),
+                ip_multicast_addr: AtomicU32::new(0),
+                ip_multicast_groups: Mutex::new(Vec::new()),
+                recv_pktinfo_v4: AtomicBool::new(false),
+                recv_origdstaddr_v4: AtomicBool::new(false),
+                recv_origdstaddr_v6: AtomicBool::new(false),
+                errqueue: Mutex::new((0, ErrorQueue::default())),
+                pmtu_v4: AtomicI32::new(PmtuPolicy::Want.as_i32()),
+                pmtu_v6: AtomicI32::new(PmtuPolicy::Want.as_i32()),
+                ipv6_mtu: AtomicUsize::new(0),
+                ipv6_multicast_loop: AtomicBool::new(true),
+                ipv6_multicast_hops: AtomicI32::new(1),
+                linger_onoff: AtomicI32::new(0),
+                linger_linger: AtomicI32::new(0),
+                send_timeout_us: AtomicU64::new(u64::MAX),
+                recv_timeout_us: AtomicU64::new(u64::MAX),
+                no_check: AtomicBool::new(false), // checksums enabled by default
+                ip_version: version,
+                receive_queue: rx_queue::UdpReceiveQueue::new(inner::DEFAULT_RX_BUF_SIZE),
+            }));
+            return Ok(socket);
+        }
     }
 
     #[inline]
@@ -276,18 +335,48 @@ impl UdpSocket {
         )
     }
 
-    fn apply_device_binding(
+    fn set_device_binding(&self, value: &[u8]) -> Result<(), SystemError> {
+        loop {
+            let target = {
+                let update = self.device_binding.prepare_update(&self.netns, value)?;
+                self.device_placement_target(&update)?
+            };
+            let mut prepared = match target.as_ref() {
+                Some(target) => Some(self.prepare_iface_socket(target.clone())?),
+                None => None,
+            };
+            let mut retired = None;
+            let mut update = self.device_binding.prepare_update(&self.netns, value)?;
+            let _placement = self.iface_placement.write();
+            let current = self.device_placement_target(&update)?;
+            if !match (&target, &current) {
+                (None, None) => true,
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                _ => false,
+            } {
+                continue;
+            }
+            let mut inner = self.inner.write();
+            if let Some(UdpInner::Bound(bound)) = inner.as_mut() {
+                if let Some(prepared) = prepared.as_mut() {
+                    retired =
+                        prepared.move_bound(bound.inner_mut(), self.self_ref.upgrade().unwrap())?;
+                }
+            } else if inner.is_none() {
+                return Err(SystemError::EBADF);
+            }
+            update.commit();
+            return Ok(());
+        }
+    }
+
+    fn device_placement_target(
         &self,
-        update: &mut DeviceBindingUpdate<'_>,
-    ) -> Result<(), SystemError> {
-        // `prepare_update()` already holds the device-binding writer lock.
-        // Keep this ordering consistent with send: binding writer -> placement
-        // writer -> inner. This prevents a multicast send from restoring an
-        // interface after a newer SO_BINDTODEVICE update has committed.
-        let _placement = self.iface_placement.write();
-        let mut inner = self.inner.write();
-        match inner.as_mut().ok_or(SystemError::EBADF)? {
-            UdpInner::Unbound(_) => update.commit(),
+        update: &DeviceBindingUpdate<'_>,
+    ) -> Result<Option<Arc<dyn Iface>>, SystemError> {
+        let inner = self.inner.read();
+        match inner.as_ref().ok_or(SystemError::EBADF)? {
+            UdpInner::Unbound(_) => Ok(None),
             UdpInner::Bound(bound) => {
                 let target_iface = update.target_iface();
                 let old_iface = bound.inner().iface().clone();
@@ -315,27 +404,9 @@ impl UdpSocket {
                         .ok()
                     }),
                 };
-                let Some(placement_iface) = placement_iface else {
-                    // Clearing sk_bound_dev_if must not depend on route
-                    // selection or on an interface being available.
-                    update.commit();
-                    return Ok(());
-                };
-                if old_iface.nic_id() == placement_iface.nic_id() {
-                    update.commit();
-                    return Ok(());
-                }
-
-                bound
-                    .inner_mut()
-                    .move_udp_to_iface_with(placement_iface.clone(), || update.commit())?;
-                if let Some(socket) = self.self_ref.upgrade() {
-                    old_iface.common().unbind_socket(socket.clone());
-                    placement_iface.common().bind_socket(socket);
-                }
+                Ok(placement_iface.filter(|target| !Arc::ptr_eq(target, &old_iface)))
             }
         }
-        Ok(())
     }
 
     #[inline]
@@ -368,21 +439,21 @@ impl UdpSocket {
             .ok_or(SystemError::ENODEV)
     }
 
-    /// Places an explicitly addressed UDP endpoint according to its transport
-    /// owner. Device binding is an independent I/O constraint and selects the
-    /// SocketSet only for wildcard, multicast, or broadcast endpoints.
-    fn bind_endpoint_on_owner(
+    fn prepare_iface_socket(
         &self,
-        unbound: UnboundUdp,
-        endpoint: smoltcp::wire::IpEndpoint,
-        device_iface: Option<Arc<dyn Iface>>,
-    ) -> Result<BoundUdp, SystemError> {
-        if bind_address_uses_local_owner(endpoint.addr) {
-            unbound.bind(endpoint, self.bind_context())
-        } else if let Some(iface) = device_iface {
-            unbound.bind_on_iface(iface, endpoint, self.bind_context())
-        } else {
-            unbound.bind(endpoint, self.bind_context())
+        iface: Arc<dyn Iface>,
+    ) -> Result<super::common::registration::PreparedIfaceSocket, SystemError> {
+        let mut recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
+        loop {
+            let creator = crate::cgroup::memory::object_for_task(&ProcessManager::current_pcb());
+            match super::common::registration::PreparedIfaceSocket::try_new(
+                iface.clone(),
+                self.netns.clone(),
+                &creator,
+            ) {
+                Ok(prepared) => return Ok(prepared),
+                Err(error) => error.recover(&mut recovery)?,
+            }
         }
     }
 
@@ -504,136 +575,109 @@ impl UdpSocket {
         )
     }
 
-    pub fn do_bind(&self, local_endpoint: smoltcp::wire::IpEndpoint) -> Result<(), SystemError> {
-        let _placement = self.iface_placement.write();
-        let mut inner = self.inner.write();
-
-        // Check socket state first without taking
-        match inner.as_ref() {
-            None => return Err(SystemError::EBADF),
-            Some(UdpInner::Bound(_)) => return Err(SystemError::EINVAL), // Already bound
-            Some(UdpInner::Unbound(_)) => {}
-        }
-        let bound_iface = self.device_binding.resolve_iface(&self.netns)?;
-        if bound_iface.is_some()
-            && !local_endpoint.addr.is_unspecified()
-            && crate::net::socket::inet::common::get_iface_for_local_bind(
-                &local_endpoint.addr,
-                &self.netns,
-            )
-            .is_none()
-        {
-            return Err(SystemError::EADDRNOTAVAIL);
-        }
-
-        // Now safe to take - we know it's Unbound
-        let _old_unbound = match inner.take() {
-            Some(UdpInner::Unbound(unbound)) => unbound,
-            _ => unreachable!(),
-        };
-
-        // Check if custom buffer sizes have been set via setsockopt
-        let rx_size = self.recv_buf_size.load(Ordering::Acquire);
-        let tx_size = self.send_buf_size.load(Ordering::Acquire);
-
-        // log::debug!(
-        //     "do_bind: rx_size={}, tx_size={}, will use custom buffers={}",
-        //     rx_size,
-        //     tx_size,
-        //     rx_size > 0 || tx_size > 0
-        // );
-
-        // Create new UnboundUdp with custom buffer sizes if they've been set
-        let unbound = if rx_size > 0 || tx_size > 0 {
-            // log::debug!(
-            //     "do_bind: creating socket with custom buffer sizes rx={}, tx={}",
-            //     rx_size,
-            //     tx_size
-            // );
-            UnboundUdp::new_with_buf_size(self.ip_version, rx_size, tx_size)
-        } else {
-            // log::debug!("do_bind: creating socket with default buffer sizes");
-            UnboundUdp::new(self.ip_version)
-        };
-
-        let result = self.bind_endpoint_on_owner(unbound, local_endpoint, bound_iface);
-        match result {
-            Ok(bound) => {
-                bound
-                    .inner()
-                    .iface()
-                    .common()
-                    .bind_socket(self.self_ref.upgrade().unwrap());
-                *inner = Some(UdpInner::Bound(bound));
-                Ok(())
+    pub fn do_bind(&self, endpoint: smoltcp::wire::IpEndpoint) -> Result<(), SystemError> {
+        loop {
+            {
+                let inner = self.inner.read();
+                match inner.as_ref() {
+                    None => return Err(SystemError::EBADF),
+                    Some(UdpInner::Bound(_)) => return Err(SystemError::EINVAL),
+                    Some(UdpInner::Unbound(_)) => {}
+                }
             }
-            Err(e) => {
-                // Restore unbound state on error
-                *inner = Some(UdpInner::Unbound(UnboundUdp::new(self.ip_version)));
-                Err(e)
+            let device = self.device_binding.resolve_iface(&self.netns)?;
+            if device.is_some()
+                && !endpoint.addr.is_unspecified()
+                && super::common::get_iface_for_local_bind(&endpoint.addr, &self.netns).is_none()
+            {
+                return Err(SystemError::EADDRNOTAVAIL);
+            }
+            let iface = super::common::explicit_bind_iface(endpoint.addr, &self.netns, device)?;
+            let mut prepared = self.prepare_iface_socket(iface.clone())?;
+            let placement = self.iface_placement.write();
+            let mut inner = self.inner.write();
+            match inner.as_ref() {
+                None => return Err(SystemError::EBADF),
+                Some(UdpInner::Bound(_)) => return Err(SystemError::EINVAL),
+                Some(UdpInner::Unbound(_)) => {}
+            }
+            let current = super::common::explicit_bind_iface(
+                endpoint.addr,
+                &self.netns,
+                self.device_binding.resolve_iface(&self.netns)?,
+            )?;
+            if !Arc::ptr_eq(&iface, &current) {
+                drop(inner);
+                drop(placement);
+                drop(prepared);
+                continue;
+            }
+            let Some(UdpInner::Unbound(unbound)) = inner.take() else {
+                unreachable!();
+            };
+            match unbound.bind_prepared(endpoint, self.bind_context(), true, &mut prepared) {
+                Ok(bound) => {
+                    *inner = Some(UdpInner::Bound(bound));
+                    return Ok(());
+                }
+                Err((unbound, error)) => {
+                    *inner = Some(UdpInner::Unbound(unbound));
+                    return Err(error);
+                }
             }
         }
     }
 
     pub fn bind_ephemeral(&self, remote: smoltcp::wire::IpAddress) -> Result<(), SystemError> {
+        {
+            let inner = self.inner.read();
+            match inner.as_ref() {
+                Some(UdpInner::Bound(_)) => return Ok(()),
+                None => return Err(SystemError::EBADF),
+                _ => {}
+            }
+        }
         let (required_oif, multicast_source) = output_flow::socket_constraints(self, remote)?;
-        let output_flow = output_flow::resolve_ipv4_send_flow(
+        let flow = output_flow::resolve_ipv4_send_flow(
             &self.netns,
             IpListenEndpoint::from(0),
             remote,
             required_oif,
             multicast_source,
         )?;
-        let flow_target = output_flow
+        let flow_target = flow
             .map(|flow| output_flow::ephemeral_target(self, flow))
             .transpose()?;
-        let device_target = self.device_ephemeral_bind_target(remote)?;
-        let mut inner_guard = self.inner.write();
-        let inner = inner_guard.take().ok_or(SystemError::EBADF)?;
-        let mut newly_bound_iface = None;
-        let bound = match inner {
-            UdpInner::Bound(inner) => inner,
-            UdpInner::Unbound(_old_inner) => {
-                // Check if custom buffer sizes have been set via setsockopt
-                let rx_size = self.recv_buf_size.load(Ordering::Acquire);
-                let tx_size = self.send_buf_size.load(Ordering::Acquire);
-
-                // Create new UnboundUdp with custom buffer sizes if they've been set
-                let inner = if rx_size > 0 || tx_size > 0 {
-                    UnboundUdp::new_with_buf_size(self.ip_version, rx_size, tx_size)
-                } else {
-                    UnboundUdp::new(self.ip_version)
-                };
-
-                let bound_result = if let Some(target) = flow_target.or(device_target) {
-                    inner.bind_ephemeral_on_iface(
-                        target.stack_owner,
-                        target.local_addr,
-                        self.bind_context(),
-                    )
-                } else {
-                    inner.bind_ephemeral(remote, self.bind_context())
-                };
-                match bound_result {
-                    Ok(bound) => {
-                        newly_bound_iface = Some(bound.inner().iface().clone());
-                        bound
-                    }
-                    Err(e) => {
-                        inner_guard.replace(UdpInner::Unbound(UnboundUdp::new(self.ip_version)));
-                        return Err(e);
-                    }
-                }
-            }
+        let target = match flow_target.or(self.device_ephemeral_bind_target(remote)?) {
+            Some(target) => target,
+            None => super::common::ephemeral_bind_target(remote, &self.netns, None)?,
         };
-        // IMPORTANT: register this socket for iface notifications when it becomes bound implicitly.
-        // Without this, incoming packets may not wake recv()/poll waiters, causing hangs in
-        // gVisor tests such as UdpSocketTest.ReceiveAfterDisconnect.
-        if let Some(iface) = newly_bound_iface {
-            iface.common().bind_socket(self.self_ref.upgrade().unwrap());
+        let mut prepared = self.prepare_iface_socket(target.stack_owner)?;
+        let _placement = self.iface_placement.write();
+        let mut inner = self.inner.write();
+        match inner.as_ref() {
+            Some(UdpInner::Bound(_)) => return Ok(()),
+            None => return Err(SystemError::EBADF),
+            _ => {}
         }
-        inner_guard.replace(UdpInner::Bound(bound));
-        Ok(())
+        let Some(UdpInner::Unbound(unbound)) = inner.take() else {
+            unreachable!();
+        };
+        match unbound.bind_prepared(
+            smoltcp::wire::IpEndpoint::new(target.local_addr, 0),
+            self.bind_context(),
+            false,
+            &mut prepared,
+        ) {
+            Ok(bound) => {
+                *inner = Some(UdpInner::Bound(bound));
+                Ok(())
+            }
+            Err((unbound, error)) => {
+                *inner = Some(UdpInner::Unbound(unbound));
+                Err(error)
+            }
+        }
     }
 
     pub fn is_bound(&self) -> bool {
@@ -644,88 +688,119 @@ impl UdpSocket {
         return false;
     }
 
-    /// Recreates the socket with new buffer sizes if it's already bound.
-    /// This is needed because smoltcp doesn't support resizing socket buffers dynamically.
-    fn recreate_socket_if_bound(&self) -> Result<(), SystemError> {
-        let _placement = self.iface_placement.write();
-        let mut inner_guard = self.inner.write();
-
-        // Check if socket is bound
-        let bound = match inner_guard.as_ref() {
-            Some(UdpInner::Bound(b)) => b,
-            _ => return Ok(()), // Not bound, nothing to do
-        };
-
-        // Save current state before recreating
-        let local_ep = bound.endpoint();
-        let remote_ep = bound.remote_endpoint().ok(); // May be None if not connected
-        let connected_source = bound.connected_source();
-        let explicitly_bound = !bound.should_unbind_on_disconnect();
-        let old_iface = bound.inner().iface().clone();
-        let replacement_iface = self.active_owner_for_bound(bound)?;
-        // log::debug!(
-        //     "Recreating UDP socket: local={:?}, remote={:?}, explicit={}",
-        //     local_ep,
-        //     remote_ep,
-        //     explicitly_bound
-        // );
-
-        // Get the local address and port
-        let IpListenEndpoint { addr, port } = local_ep;
-        let local_addr = addr.unwrap_or_else(|| smoltcp::wire::IpAddress::v4(0, 0, 0, 0));
-
-        // Unbind the old socket and drop it
-        if let Some(UdpInner::Bound(b)) = inner_guard.take() {
-            old_iface
-                .common()
-                .unbind_socket(self.self_ref.upgrade().unwrap());
-            self.netns.udp_bindings().unbind(port, self.bind_id());
-            b.close();
+    /// Replace only the selected physical ring. Binding, peer and queued
+    /// datagrams stay on the same protocol instance throughout the operation.
+    fn resize_buffer(&self, receive: bool, size: usize) -> Result<(), SystemError> {
+        let limit = size.checked_mul(2).ok_or(SystemError::ENOBUFS)?;
+        // Match the supported socket inventory bound used by TCP. Permissions
+        // and option parsing are checked by the caller before admission.
+        if limit > 1 << 30 {
+            return Err(SystemError::ENOBUFS);
         }
-
-        // Create new UnboundUdp with new buffer sizes
-        let rx_size = self.recv_buf_size.load(Ordering::Acquire);
-        let tx_size = self.send_buf_size.load(Ordering::Acquire);
-        let unbound = if rx_size > 0 || tx_size > 0 {
-            UnboundUdp::new_with_buf_size(self.ip_version, rx_size, tx_size)
-        } else {
-            UnboundUdp::new(self.ip_version)
-        };
-
-        // Rebind to the same endpoint
-        let new_endpoint = smoltcp::wire::IpEndpoint::new(local_addr, port);
-        // Resizing is an implementation detail, not a new bind operation.
-        // Preserve the already validated SocketSet owner even if address/FIB
-        // state or SO_BINDTODEVICE changed after the original bind.
-        let bound =
-            match unbound.bind_on_iface(replacement_iface, new_endpoint, self.bind_context()) {
-                Ok(b) => b,
-                Err(e) => {
-                    // Restore unbound state on error
-                    *inner_guard = Some(UdpInner::Unbound(UnboundUdp::new(self.ip_version)));
-                    return Err(e);
+        let mut recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
+        loop {
+            let operation = self.resize_lock.lock();
+            // IPv4 RX belongs to receive_queue, not the TX-only smoltcp entry.
+            let protocol_rx = receive && self.ip_version == IpVersion::Ipv6;
+            let capacity = {
+                let mut inner = self.inner.write();
+                let get = |socket: &mut inner::SmolUdpSocket| {
+                    if receive {
+                        socket.payload_recv_capacity()
+                    } else {
+                        socket.payload_send_capacity()
+                    }
+                };
+                match inner.as_mut().ok_or(SystemError::EBADF)? {
+                    UdpInner::Unbound(socket) => socket.with_mut_socket(get),
+                    UdpInner::Bound(socket) => socket.with_mut_socket(get),
                 }
             };
-
-        // Restore connection if it existed
-        let mut bound = bound;
-        bound.set_explicitly_bound(explicitly_bound);
-        if let Some(remote) = remote_ep {
-            bound.connect(remote, connected_source);
+            let prepared = if (!receive || protocol_rx) && limit > capacity {
+                crate::net::socket::buffer::try_owned_packet_buffer(
+                    &self.memory,
+                    inner::DEFAULT_METADATA_BUF_SIZE,
+                    limit,
+                )
+                .map(Some)
+            } else {
+                Ok(None)
+            };
+            let mut candidate = match prepared {
+                Ok(candidate) => candidate,
+                Err(error) => {
+                    drop(operation);
+                    error.recover(&mut recovery)?;
+                    continue;
+                }
+            };
+            let mut became_writable = false;
+            let committed = {
+                let mut inner = self.inner.write();
+                let commit = |socket: &mut inner::SmolUdpSocket| {
+                    if receive && !protocol_rx {
+                        return true;
+                    }
+                    let cap = if receive {
+                        socket.payload_recv_capacity()
+                    } else {
+                        socket.payload_send_capacity()
+                    };
+                    if limit > cap {
+                        let Some(candidate) = candidate.as_mut() else {
+                            return false;
+                        };
+                        let swapped = if receive {
+                            socket.swap_prepared_receive_buffer(candidate)
+                        } else {
+                            socket.swap_prepared_send_buffer(candidate)
+                        };
+                        if !swapped {
+                            return false;
+                        }
+                    }
+                    if receive {
+                        socket.set_receive_buffer_limit(limit)
+                    } else {
+                        socket.set_send_buffer_limit(limit)
+                    }
+                };
+                let committed = match inner.as_mut() {
+                    Some(UdpInner::Unbound(socket)) => socket.with_mut_socket(commit),
+                    Some(UdpInner::Bound(socket)) => socket.with_mut_socket(commit),
+                    None => {
+                        drop(inner);
+                        drop(candidate);
+                        drop(operation);
+                        return Err(SystemError::EBADF);
+                    }
+                };
+                if committed {
+                    if receive {
+                        self.recv_buf_size.store(size, Ordering::Release);
+                        self.receive_queue.set_capacity(limit);
+                    } else {
+                        self.send_buf_size.store(size, Ordering::Release);
+                        became_writable = self.send_account.set_limit_quiet(limit);
+                    }
+                }
+                committed
+            };
+            // Both rejected candidates and successfully retired backing are
+            // destroyed after inner/SocketSet guards, before quota recovery.
+            drop(candidate);
+            drop(operation);
+            if committed {
+                if !receive {
+                    self.send_account.notify_limit_changed(became_writable);
+                }
+                return Ok(());
+            }
         }
-
-        // Restore the binding in the interface
-        bound
-            .inner()
-            .iface()
-            .common()
-            .bind_socket(self.self_ref.upgrade().unwrap());
-        *inner_guard = Some(UdpInner::Bound(bound));
-
-        Ok(())
     }
 
     pub fn close(&self) {
+        let mut retired_binding = None;
         let _placement = self.iface_placement.write();
         self.receive_queue.close();
         {
@@ -743,11 +818,11 @@ impl UdpSocket {
                 &self.netns,
                 &self.ip_multicast_groups,
             );
-            bound
-                .inner()
-                .iface()
-                .common()
-                .unbind_socket(self.self_ref.upgrade().unwrap());
+            retired_binding = Some(
+                bound
+                    .inner()
+                    .retire_notification(self.self_ref.upgrade().unwrap()),
+            );
             bound.close();
             inner.take();
         }
@@ -755,6 +830,7 @@ impl UdpSocket {
     }
 
     fn disconnect_udp(&self) -> Result<(), SystemError> {
+        let mut retired_binding = None;
         let _placement = self.iface_placement.write();
         let mut inner_guard = self.inner.write();
         let should_unbind = match inner_guard.as_ref() {
@@ -775,13 +851,12 @@ impl UdpSocket {
                 .udp_bindings()
                 .unbind(bound.endpoint().port, self.bind_id());
             multicast_loopback::multicast_registry().unregister_all(&self.self_ref);
-            bound
-                .inner()
-                .iface()
-                .common()
-                .unbind_socket(self.self_ref.upgrade().unwrap());
-            bound.close();
-            inner_guard.replace(UdpInner::Unbound(UnboundUdp::new(self.ip_version)));
+            retired_binding = Some(
+                bound
+                    .inner()
+                    .retire_notification(self.self_ref.upgrade().unwrap()),
+            );
+            inner_guard.replace(UdpInner::Unbound(bound.into_unbound_after_disconnect()));
             self.receive_queue.invalidate_binding();
         }
         Ok(())
@@ -1266,25 +1341,102 @@ impl UdpSocket {
             return self.try_send_ipv6_prepared(buf, to);
         }
 
-        let placement = self.iface_placement.read();
-        let (is_multicast, is_unbound) = {
-            let inner = self.inner.read();
-            let destination = to.or_else(|| match inner.as_ref() {
-                Some(UdpInner::Bound(bound)) => bound.remote_endpoint().ok(),
-                _ => None,
-            });
-            (
-                destination.is_some_and(|dest| dest.addr.is_multicast()),
-                matches!(inner.as_ref(), Some(UdpInner::Unbound(_))),
-            )
-        };
-        if is_multicast || is_unbound {
-            drop(placement);
-            let _placement = self.iface_placement.write();
-            return self.try_send_with_stable_iface(buf, to);
+        if matches!(self.inner.read().as_ref(), Some(UdpInner::Unbound(_))) {
+            self.bind_ephemeral(destination.ok_or(SystemError::EDESTADDRREQ)?.addr)?;
         }
 
-        self.try_send_with_stable_iface(buf, to)
+        loop {
+            let (active, temporary) = self.send_placement_targets(to)?;
+            let need_active = {
+                let inner = self.inner.read();
+                let Some(UdpInner::Bound(bound)) = inner.as_ref() else {
+                    return Err(SystemError::ENOTCONN);
+                };
+                !Arc::ptr_eq(&active, bound.inner().iface())
+            };
+            let mut prepared_active = if need_active {
+                Some(self.prepare_iface_socket(active.clone())?)
+            } else {
+                None
+            };
+            let mut prepared_temporary = match temporary.as_ref() {
+                Some(target) => Some(self.prepare_iface_socket(target.clone())?),
+                None => None,
+            };
+            // Strong pins, cancelled source vacancies and returned candidates
+            // all retire after placement/inner and after actual poll admission.
+            let mut retired_active = None;
+            let mut temporary_return = None;
+            let mut retired_target = None;
+            let _placement = self.iface_placement.write();
+            let (current_active, current_temporary) = self.send_placement_targets(to)?;
+            let same_temporary = match (&temporary, &current_temporary) {
+                (None, None) => true,
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                _ => false,
+            };
+            if !Arc::ptr_eq(&active, &current_active) || !same_temporary {
+                continue;
+            }
+            {
+                let mut inner = self.inner.write();
+                let Some(UdpInner::Bound(bound)) = inner.as_mut() else {
+                    return Err(SystemError::ENOTCONN);
+                };
+                if !Arc::ptr_eq(bound.inner().iface(), &active) {
+                    let Some(prepared) = prepared_active.as_mut() else {
+                        continue;
+                    };
+                    retired_active =
+                        prepared.move_bound(bound.inner_mut(), self.self_ref.upgrade().unwrap())?;
+                }
+                if let Some(prepared) = prepared_temporary.as_mut() {
+                    temporary_return =
+                        prepared.move_bound(bound.inner_mut(), self.self_ref.upgrade().unwrap())?;
+                }
+            }
+            let result = self.try_send_with_stable_iface(buf, to);
+            if let Some(ticket) = temporary_return.as_mut() {
+                let mut inner = self.inner.write();
+                let Some(UdpInner::Bound(bound)) = inner.as_mut() else {
+                    unreachable!("placement excludes close during return");
+                };
+                retired_target = Some(ticket.restore(bound.inner_mut()));
+            }
+            return result;
+        }
+    }
+
+    #[expect(
+        clippy::type_complexity,
+        reason = "Return primary and optional fallback interface identities without a new wrapper"
+    )]
+    fn send_placement_targets(
+        &self,
+        to: Option<IpEndpoint>,
+    ) -> Result<(Arc<dyn Iface>, Option<Arc<dyn Iface>>), SystemError> {
+        let inner = self.inner.read();
+        let Some(UdpInner::Bound(bound)) = inner.as_ref() else {
+            return Err(SystemError::ENOTCONN);
+        };
+        let active = self.active_owner_for_bound(bound)?;
+        let destination = to
+            .or_else(|| bound.remote_endpoint().ok())
+            .ok_or(SystemError::EDESTADDRREQ)?;
+        let mut temporary = None;
+        if destination.addr.is_multicast() && !matches!(destination.addr, Ipv4(_)) {
+            let device = self.bound_device_ifindex();
+            let selected = if device != 0 {
+                device as i32
+            } else {
+                self.ip_multicast_ifindex.load(Ordering::Relaxed)
+            };
+            if selected != 0 {
+                temporary = super::common::multicast::find_iface_by_ifindex(&self.netns, selected)
+                    .filter(|iface| !Arc::ptr_eq(iface, &active));
+            }
+        }
+        Ok((active, temporary))
     }
 
     /// Snapshot only socket state under the placement lock. Both the nft
@@ -1374,19 +1526,28 @@ impl UdpSocket {
             snapshot
         } else {
             drop(placement);
-            let _placement = self.iface_placement.write();
-            let unbound = matches!(self.inner.read().as_ref(), Some(UdpInner::Unbound(_)));
-            if unbound {
-                let destination = to.ok_or(SystemError::EDESTADDRREQ)?;
-                if destination.port == 0 {
-                    return Err(SystemError::EINVAL);
+            loop {
+                let unbound = matches!(self.inner.read().as_ref(), Some(UdpInner::Unbound(_)));
+                if unbound {
+                    let destination = to.ok_or(SystemError::EDESTADDRREQ)?;
+                    if destination.port == 0 {
+                        return Err(SystemError::EINVAL);
+                    }
+                    let Ipv4(_) = destination.addr else {
+                        return Err(SystemError::EAFNOSUPPORT);
+                    };
+                    self.bind_ephemeral(Self::normalize_unspecified_dest(destination).addr)?;
                 }
-                let Ipv4(_) = destination.addr else {
-                    return Err(SystemError::EAFNOSUPPORT);
-                };
-                self.bind_ephemeral(Self::normalize_unspecified_dest(destination).addr)?;
+                // Binding performs its own pre-born transaction. Acquire the
+                // send classification guard only after that operation returns.
+                let _placement = self.iface_placement.write();
+                if matches!(self.inner.read().as_ref(), Some(UdpInner::Unbound(_))) {
+                    // Disconnect raced the lock-free preparation. No datagram
+                    // or output reservation was published, so retry just bind.
+                    continue;
+                }
+                break self.ipv4_send_snapshot(to)?;
             }
-            self.ipv4_send_snapshot(to)?
         };
 
         let policy = self.pmtu_policy(IpVersion::Ipv4);
@@ -1475,7 +1636,6 @@ impl UdpSocket {
         let is_unbound = matches!(self.inner.read().as_ref(), Some(UdpInner::Unbound(_)));
         let snapshot = if is_unbound {
             drop(placement);
-            let _placement = self.iface_placement.write();
             let destination =
                 Self::normalize_unspecified_dest(to.ok_or(SystemError::EDESTADDRREQ)?);
             let Ipv6(destination_addr) = destination.addr else {
@@ -1494,24 +1654,32 @@ impl UdpSocket {
                 required_oif,
                 None,
             )?;
+            let mut prepared = self.prepare_iface_socket(resolved.source_owner.clone())?;
+            let _placement = self.iface_placement.write();
             let mut inner = self.inner.write();
-            let Some(UdpInner::Unbound(_)) = inner.as_ref() else {
+            if !matches!(inner.as_ref(), Some(UdpInner::Unbound(_))) {
                 return Err(SystemError::EBADF);
+            }
+            let Some(UdpInner::Unbound(unbound)) = inner.take() else {
+                unreachable!();
             };
-            let rx_size = self.recv_buf_size.load(Ordering::Acquire);
-            let tx_size = self.send_buf_size.load(Ordering::Acquire);
-            let unbound = UnboundUdp::new_with_buf_size(self.ip_version, rx_size, tx_size);
-            let bound = unbound.bind_ephemeral_on_iface(
-                resolved.source_owner,
+            let bound = match unbound.bind_prepared(
                 // Implicit port allocation does not pin the source address.
                 // A later send may select another IPv6 source after routing
                 // changes, just as an unbound Linux UDP socket does.
-                Ipv6(smoltcp::wire::Ipv6Address::UNSPECIFIED),
+                IpEndpoint::new(Ipv6(smoltcp::wire::Ipv6Address::UNSPECIFIED), 0),
                 self.bind_context(),
-            )?;
+                false,
+                &mut prepared,
+            ) {
+                Ok(bound) => bound,
+                Err((unbound, error)) => {
+                    *inner = Some(UdpInner::Unbound(unbound));
+                    return Err(error);
+                }
+            };
             let owner = bound.inner().iface().clone();
             let source_port = bound.endpoint().port;
-            owner.common().bind_socket(self.self_ref.upgrade().unwrap());
             *inner = Some(UdpInner::Bound(bound));
             Ipv6SendSnapshot {
                 owner,
@@ -1642,7 +1810,7 @@ impl UdpSocket {
         // Resolve IPv4 flow state before taking the send-side
         // inner lock. The placement guard keeps endpoint/device state stable
         // across this lookup and the later enqueue.
-        let (output_flow_request, needs_ephemeral_bind) = {
+        let output_flow_request = {
             let inner = self.inner.read();
             let request = match inner.as_ref() {
                 Some(UdpInner::Bound(bound)) => to
@@ -1654,10 +1822,7 @@ impl UdpSocket {
                     .map(|dest| (IpListenEndpoint::from(0), dest, None)),
                 None => None,
             };
-            (
-                request,
-                matches!(inner.as_ref(), Some(UdpInner::Unbound(_))),
-            )
+            request
         };
         let mut resolved_output_flow = match output_flow_request {
             Some((local, dest, connected_source)) => {
@@ -1672,13 +1837,6 @@ impl UdpSocket {
                 )?
             }
             None => None,
-        };
-        let flow_target = if needs_ephemeral_bind {
-            resolved_output_flow
-                .map(|flow| output_flow::ephemeral_target(self, flow))
-                .transpose()?
-        } else {
-            None
         };
 
         // Send data and snapshot the delivery metadata before releasing inner.
@@ -1696,43 +1854,10 @@ impl UdpSocket {
             let mut inner_guard = self.inner.write();
 
             // Check if socket is closed
-            let inner = inner_guard.as_ref().ok_or(SystemError::EBADF)?;
+            let _inner = inner_guard.as_ref().ok_or(SystemError::EBADF)?;
 
-            // If unbound, bind to ephemeral port
-            if let UdpInner::Unbound(_) = inner {
-                let to_addr =
-                    Self::normalize_unspecified_dest(to.ok_or(SystemError::EDESTADDRREQ)?).addr;
-                let device_target = self.device_ephemeral_bind_target(to_addr)?;
-                let unbound = match inner_guard.take().unwrap() {
-                    UdpInner::Unbound(unbound) => unbound,
-                    _ => unreachable!(),
-                };
-                let bound_result = if let Some(target) = flow_target.or(device_target) {
-                    unbound.bind_ephemeral_on_iface(
-                        target.stack_owner,
-                        target.local_addr,
-                        self.bind_context(),
-                    )
-                } else {
-                    unbound.bind_ephemeral(to_addr, self.bind_context())
-                };
-                match bound_result {
-                    Ok(bound) => {
-                        // Register for iface notifications on implicit bind via sendto().
-                        bound
-                            .inner()
-                            .iface()
-                            .common()
-                            .bind_socket(self.self_ref.upgrade().unwrap());
-                        inner_guard.replace(UdpInner::Bound(bound));
-                    }
-                    Err(e) => {
-                        // Restore unbound state on error
-                        inner_guard.replace(UdpInner::Unbound(UnboundUdp::new(self.ip_version)));
-                        return Err(e);
-                    }
-                }
-            }
+            // The guardless send entry completed implicit binding before
+            // acquiring placement. Never allocate after message admission.
 
             // Send data and get iface Arc before releasing lock
             match inner_guard.as_mut().ok_or(SystemError::EBADF)? {
@@ -1744,12 +1869,7 @@ impl UdpSocket {
                     let dest = Self::normalize_unspecified_dest(dest);
                     self.validate_bound_send_dest(bound, dest)?;
                     let bound_iface = self.active_owner_for_bound(bound)?;
-                    if !Arc::ptr_eq(&bound_iface, bound.inner().iface()) {
-                        bound.inner_mut().move_udp_to_iface(bound_iface.clone())?;
-                        bound_iface
-                            .common()
-                            .bind_socket(self.self_ref.upgrade().unwrap());
-                    }
+                    debug_assert!(Arc::ptr_eq(&bound_iface, bound.inner().iface()));
                     let is_multicast = dest.addr.is_multicast();
                     let device_ifindex = self.bound_device_ifindex() as i32;
                     let mcast_ifindex = if is_multicast && device_ifindex != 0 {
@@ -1846,22 +1966,8 @@ impl UdpSocket {
                             None,
                         )
                     } else {
-                        let mut send_iface = bound_iface.clone();
-                        let mut restore_iface = None;
-                        if is_multicast && !matches!(dest.addr, Ipv4(_)) && mcast_ifindex != 0 {
-                            if let Some(target_iface) =
-                                crate::net::socket::inet::common::multicast::find_iface_by_ifindex(
-                                    &self.netns,
-                                    mcast_ifindex,
-                                )
-                            {
-                                if !Arc::ptr_eq(&target_iface, &bound_iface) {
-                                    restore_iface = Some(bound_iface.clone());
-                                    bound.inner_mut().move_udp_to_iface(target_iface.clone())?;
-                                    send_iface = target_iface;
-                                }
-                            }
-                        }
+                        let send_iface = bound_iface.clone();
+                        let restore_iface: Option<Arc<dyn Iface>> = None;
 
                         let egress_ifindex = if let Some(flow) = output_flow {
                             flow.oif
@@ -1943,12 +2049,10 @@ impl UdpSocket {
         // sockets on the interface and may re-enter this socket's event checks.
         Self::poll_iface_until_quiescent(send_iface.as_ref());
 
-        if let Some(orig_iface) = restore_iface {
-            let mut inner_guard = self.inner.write();
-            if let Some(UdpInner::Bound(bound)) = inner_guard.as_mut() {
-                let _ = bound.inner_mut().move_udp_to_iface(orig_iface);
-            }
-        }
+        debug_assert!(
+            restore_iface.is_none(),
+            "guardless send stage owns exact return ticket"
+        );
 
         // Multicast loopback: if sending to a multicast address and loopback is enabled,
         // deliver the packet to all local sockets that have joined the group

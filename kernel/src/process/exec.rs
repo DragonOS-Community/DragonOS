@@ -365,7 +365,16 @@ impl ExecParam {
 
         if me.sighand().is_shared() {
             let old_sighand = me.sighand();
-            let new_sighand = SigHand::try_new().map_err(ExecError::SystemError)?;
+            let mut recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
+            let new_sighand = loop {
+                let creator = crate::cgroup::memory::object_for_task(&me);
+                match SigHand::try_new_for(&creator) {
+                    Ok(sighand) => break sighand,
+                    Err(error) => error
+                        .recover(&mut recovery)
+                        .map_err(ExecError::SystemError)?,
+                }
+            };
             new_sighand.copy_handlers_from(&old_sighand);
             me.replace_sighand(new_sighand);
         }
@@ -375,8 +384,16 @@ impl ExecParam {
             .fd_table_snapshot()
             .expect("exec task has no fd table");
         if shared {
-            let private =
-                FileDescriptorTable::try_clone(&fd_table, None).map_err(ExecError::SystemError)?;
+            let mut recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
+            let private = loop {
+                let creator = crate::cgroup::memory::object_for_task(&me);
+                match FileDescriptorTable::try_clone(&fd_table, None, &creator) {
+                    Ok(table) => break table,
+                    Err(error) => error
+                        .recover(&mut recovery)
+                        .map_err(ExecError::SystemError)?,
+                }
+            };
             let replaced = me.basic_mut().set_fd_table(Some(private));
             // Dropping a final table reference can flush files. Never do that
             // while holding the PCB basic-info or an fd-table guard.

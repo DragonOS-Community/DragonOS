@@ -6,10 +6,10 @@ use crate::arch::MMArch;
 use crate::mm::{MemoryManagementArch, VirtAddr};
 use crate::process::fork::{CloneFlags, KernelCloneArgs, MAX_PID_NS_LEVEL};
 use crate::process::pid::PidType;
-use crate::process::{KernelStack, ProcessControlBlock, ProcessManager};
+use crate::process::ProcessManager;
 use crate::sched::completion::Completion;
 use crate::syscall::user_access::{write_one_to_user_protected, UserBufferReader};
-use alloc::{string::ToString, sync::Arc};
+use alloc::sync::Arc;
 use system_error::SystemError;
 
 #[repr(C)]
@@ -73,12 +73,8 @@ pub fn do_clone(
     }
 
     let current_pcb = ProcessManager::current_pcb();
-    let new_kstack = KernelStack::new()?;
-    let name = current_pcb.basic().name().to_string();
-
-    let pcb = ProcessControlBlock::new(name, new_kstack, flags.contains(CloneFlags::CLONE_THREAD))?;
-    // 克隆pcb
-    let ptrace_fork_session = ProcessManager::copy_process(&current_pcb, &pcb, clone_args, frame)?;
+    let (pcb, ptrace_fork_session) =
+        ProcessManager::prepare_unpublished_child(&current_pcb, &clone_args, frame)?;
 
     let child_vpid = pcb
         .task_pid_nr_ns(PidType::PID, Some(current_pcb.active_pid_ns()))

@@ -32,32 +32,30 @@ impl SlabAllocator {
         }
     }
 
-    /// 为对象（2K以内）分配内存空间
-    pub(crate) unsafe fn allocate(&mut self, layout: Layout) -> *mut u8 {
-        match self.zone.allocate(layout) {
-            Ok(nptr) => nptr.as_ptr(),
-            Err(AllocationError::OutOfMemory) => {
-                let Ok(boxed_page) = ObjectPage::try_new() else {
-                    // Propagate backing-page OOM to fallible allocation callers.
-                    return core::ptr::null_mut();
-                };
-                assert_eq!(
-                    (boxed_page.as_ref() as *const ObjectPage as usize) & (MMArch::PAGE_SIZE - 1),
-                    0
-                );
-                let leaked_page = Box::leak(boxed_page);
-                self.zone
-                    .refill(layout, leaked_page)
-                    .expect("Could not refill?");
-                // ObjectPage was allocated through the large-object buddy path.
-                // Refill has now transferred ownership to the size-class lists.
+    /// Attempts only the existing size-class storage; never allocates backing pages.
+    pub(crate) fn try_allocate(&mut self, layout: Layout) -> Result<NonNull<u8>, AllocationError> {
+        self.zone.allocate(layout)
+    }
+
+    /// Transfers a prepared buddy page to the size-class lists exactly once.
+    /// On rejection, ownership returns to the caller for destruction outside the slab lock.
+    unsafe fn refill(
+        &mut self,
+        layout: Layout,
+        page: Box<ObjectPage<'static>>,
+    ) -> Result<(), (AllocationError, Box<ObjectPage<'static>>)> {
+        assert_eq!(
+            (page.as_ref() as *const ObjectPage as usize) & (MMArch::PAGE_SIZE - 1),
+            0
+        );
+        let raw = Box::into_raw(page);
+        match self.zone.refill(layout, &mut *raw) {
+            Ok(()) => {
                 KERNEL_ALLOCATOR.transfer_large_allocation_to_slab(Layout::new::<ObjectPage>());
-                self.zone
-                    .allocate(layout)
-                    .expect("Should succeed after refill")
-                    .as_ptr()
+                Ok(())
             }
-            Err(AllocationError::InvalidLayout) => panic!("Can't allocate this size"),
+            // ZoneAllocator rejects unsupported layouts before linking the page.
+            Err(error) => Err((error, Box::from_raw(raw))),
         }
     }
 
@@ -75,6 +73,52 @@ impl SlabAllocator {
         } else {
             return Ok(());
         }
+    }
+}
+
+/// Allocates backing storage without holding SLABALLOCATOR: buddy OOM retry can
+/// wake the reclaim task, whose scheduling must not recursively take this lock.
+pub(super) unsafe fn allocate(layout: Layout) -> *mut u8 {
+    let first = {
+        let mut guard = SLABALLOCATOR.lock_irqsave();
+        let Some(slab) = guard.as_mut() else {
+            return core::ptr::null_mut();
+        };
+        slab.try_allocate(layout)
+    };
+    match first {
+        Ok(pointer) => return pointer.as_ptr(),
+        Err(AllocationError::InvalidLayout) => panic!("Can't allocate this size"),
+        Err(AllocationError::OutOfMemory) => {}
+    }
+
+    let mut spare = ObjectPage::try_new().ok();
+    let result = {
+        let mut guard = SLABALLOCATOR.lock_irqsave();
+        match guard.as_mut() {
+            None => Err(AllocationError::OutOfMemory),
+            Some(slab) => match slab.try_allocate(layout) {
+                // Retry even if preparation failed: another CPU may have supplied a slot.
+                Err(AllocationError::OutOfMemory) => match spare.take() {
+                    None => Err(AllocationError::OutOfMemory),
+                    Some(page) => match slab.refill(layout, page) {
+                        Ok(()) => slab.try_allocate(layout),
+                        Err((error, page)) => {
+                            spare = Some(page);
+                            Err(error)
+                        }
+                    },
+                },
+                result => result,
+            },
+        }
+    };
+    // Unused or rejected pages still belong to the buddy/large allocation domain.
+    drop(spare);
+    match result {
+        Ok(pointer) => pointer.as_ptr(),
+        Err(AllocationError::OutOfMemory) => core::ptr::null_mut(),
+        Err(AllocationError::InvalidLayout) => panic!("Can't allocate this size"),
     }
 }
 

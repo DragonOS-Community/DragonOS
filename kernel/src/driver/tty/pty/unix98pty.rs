@@ -1152,7 +1152,7 @@ pub fn ptmx_open(
     this: &TtyDevice,
     mut data: MutexGuard<FilePrivateData>,
     flags: &FileFlags,
-) -> Result<(), SystemError> {
+) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
     if let FilePrivateData::Tty(data) = &*data {
         let tty = data.tty();
         // log::debug!("ptmx_open: already opened :{:p}, tty core: {:?}", tty, tty.core().name());
@@ -1173,7 +1173,7 @@ pub fn ptmx_open(
         Ok(tty) => tty,
         Err(err) => {
             fsinfo.free_index(index);
-            return Err(err);
+            return Err(err.into());
         }
     };
 
@@ -1222,7 +1222,7 @@ pub fn ptmx_open(
         let _ = pts_root_inode.unlink(&index.to_string());
         fsinfo.free_index(index);
         *data = FilePrivateData::Unused;
-        return Err(err);
+        return Err(err.into());
     }
 
     Ok(())

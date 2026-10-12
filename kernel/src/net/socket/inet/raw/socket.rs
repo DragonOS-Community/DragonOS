@@ -12,10 +12,10 @@ use crate::process::namespace::net_namespace::NetNamespace;
 use crate::process::ProcessManager;
 
 use super::constants::ICMPV6_CHECKSUM_OFFSET;
-use super::inner::{BoundRaw, RawInner, UnboundRaw};
+use super::inner::{RawInner, UnboundRaw};
 use super::loopback::{register_raw_socket, unregister_raw_socket};
 use super::options::RawSocketOptions;
-use super::RawSocket;
+use super::{RawSocket, RawSocketData};
 
 impl RawSocket {
     /// 根据 IP 版本返回 UNSPECIFIED 地址的端点
@@ -63,58 +63,137 @@ impl RawSocket {
         // 但为了让未 bind 的 raw socket 能接收数据包、且 poll/epoll 能正确唤醒，
         // 在存在 iface 时优先以“通配接收”方式附着到 loopback/默认 iface。
         // 若当前 netns 尚无可用 iface，则退化为 Unbound，允许后续 bind/connect/sendto 再完成选址与附着。
-        let initial_inner = match UnboundRaw::new(ip_version, protocol).bind_wildcard(netns.clone())
-        {
-            Ok(wildcard) => RawInner::Wildcard(wildcard),
-            Err(SystemError::ENODEV) => RawInner::Unbound(UnboundRaw::new(ip_version, protocol)),
-            Err(e) => return Err(e),
-        };
-
-        let sock = Arc::new_cyclic(|me| Self {
-            inner: crate::libs::rwsem::RwSem::new(Some(initial_inner)),
-            options: crate::libs::rwsem::RwSem::new(options),
-            nonblock: core::sync::atomic::AtomicBool::new(nonblock),
-            wait_queue: crate::libs::wait_queue::WaitQueue::default(),
-            inode_id: generate_inode_id(),
-            open_files: core::sync::atomic::AtomicUsize::new(0),
-            fsnotify_watches: core::sync::atomic::AtomicUsize::new(0),
-            self_ref: me.clone(),
-            netns,
-            device_binding: crate::net::socket::inet::common::SocketDeviceBinding::default(),
-            send_account: Arc::new(
-                crate::net::socket::inet::common::output_account::SocketOutputAccount::new(
-                    me.clone(),
-                    initial_sndbuf,
+        let mut recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
+        let (memory, body, unbound, sock, me, send_account) =
+            loop {
+                let task = ProcessManager::current_pcb();
+                let account = crate::cgroup::memory::account_for_task(&task);
+                let creator = crate::cgroup::memory::object_for_task(&task);
+                let prepared =
+                    (|| {
+                        let memory =
+                            crate::net::socket::buffer::SocketMemory::prepare(&account, creator)?;
+                        let body = crate::cgroup::memory::owned::OwnedBox::<RawSocketData>::prepare(
+                    &memory.creator,
+                    crate::cgroup::memory::accounting::KernelByteKind::SlabUnreclaimable,
+                )?.try_allocate().map_err(|_| SystemError::ENOMEM)?;
+                        let unbound = UnboundRaw::try_new(ip_version, protocol, &memory)?;
+                        let sock = Arc::try_new(Self {
+                            data: crate::libs::lazy_init::Lazy::new(),
+                        })
+                        .map_err(|_| SystemError::ENOMEM)?;
+                        let me = Arc::downgrade(&sock);
+                        let send_account = Arc::try_new(
+                    crate::net::socket::inet::common::output_account::SocketOutputAccount::new(
+                        me.clone(), initial_sndbuf,
+                    ),
+                ).map_err(|_| SystemError::ENOMEM)?;
+                        Ok::<_, crate::mm::allocation::MemoryAllocationError>((
+                            memory,
+                            body,
+                            unbound,
+                            sock,
+                            me,
+                            send_account,
+                        ))
+                    })();
+                match prepared {
+                    Ok(prepared) => break prepared,
+                    Err(error) => error.recover(&mut recovery)?,
+                }
+            };
+        sock.data.init(
+            body.init(RawSocketData {
+                memory,
+                inner: crate::libs::rwsem::RwSem::new(Some(RawInner::Unbound(unbound))),
+                options: crate::libs::rwsem::RwSem::new(options),
+                nonblock: core::sync::atomic::AtomicBool::new(nonblock),
+                wait_queue: crate::libs::wait_queue::WaitQueue::default(),
+                inode_id: generate_inode_id(),
+                open_files: core::sync::atomic::AtomicUsize::new(0),
+                fsnotify_watches: core::sync::atomic::AtomicUsize::new(0),
+                self_ref: me.clone(),
+                netns,
+                device_binding: crate::net::socket::inet::common::SocketDeviceBinding::default(),
+                send_account,
+                epoll_items: crate::net::socket::common::EPollItems::default(),
+                fasync_items: crate::filesystem::vfs::fasync::FAsyncItems::default(),
+                ip_version,
+                protocol,
+                connected_port: core::sync::atomic::AtomicU32::new(0),
+                loopback_rx: crate::libs::mutex::Mutex::new(
+                    super::loopback::LoopbackRxQueue::default(),
                 ),
-            ),
-            epoll_items: crate::net::socket::common::EPollItems::default(),
-            fasync_items: crate::filesystem::vfs::fasync::FAsyncItems::default(),
-            ip_version,
-            protocol,
-            connected_port: core::sync::atomic::AtomicU32::new(0),
-            loopback_rx: crate::libs::mutex::Mutex::new(super::loopback::LoopbackRxQueue::default()),
-            errors: crate::libs::mutex::Mutex::new((0, Default::default())),
-            output_path: crate::libs::mutex::Mutex::new(None),
-            ip_multicast_ifindex: core::sync::atomic::AtomicI32::new(0),
-            ip_multicast_addr: core::sync::atomic::AtomicU32::new(0),
-            ip_multicast_groups: crate::libs::mutex::Mutex::new(Vec::new()),
-            ip_multicast_ttl: core::sync::atomic::AtomicI32::new(1),
-            ip_multicast_loop: core::sync::atomic::AtomicBool::new(true),
-            so_broadcast: core::sync::atomic::AtomicBool::new(false),
-            send_timeout_us: core::sync::atomic::AtomicU64::new(u64::MAX),
-            recv_timeout_us: core::sync::atomic::AtomicU64::new(u64::MAX),
-        });
+                errors: crate::libs::mutex::Mutex::new((0, Default::default())),
+                output_path: crate::libs::mutex::Mutex::new(None),
+                ip_multicast_ifindex: core::sync::atomic::AtomicI32::new(0),
+                ip_multicast_addr: core::sync::atomic::AtomicU32::new(0),
+                ip_multicast_groups: crate::libs::mutex::Mutex::new(Vec::new()),
+                ip_multicast_ttl: core::sync::atomic::AtomicI32::new(1),
+                ip_multicast_loop: core::sync::atomic::AtomicBool::new(true),
+                so_broadcast: core::sync::atomic::AtomicBool::new(false),
+                send_timeout_us: core::sync::atomic::AtomicU64::new(u64::MAX),
+                recv_timeout_us: core::sync::atomic::AtomicU64::new(u64::MAX),
+            }),
+        );
 
         // Linux 语义：raw socket 未 bind 也应能被 poll/epoll 正确唤醒。
         // IfaceCommon::poll() 只会对注册在 bounds 列表里的 inet sockets 做 notify/wakeup，
         // 因此 wildcard 状态下需要注册到对应 iface。
-        if let Some(RawInner::Wildcard(bound)) = sock.inner.read().as_ref() {
-            bound.inner().iface().common().bind_socket(sock.clone());
+        let iface = sock
+            .netns
+            .loopback_iface()
+            .map(|iface| iface as Arc<dyn crate::net::Iface>)
+            .or_else(|| sock.netns.default_iface())
+            .or_else(|| sock.netns.device_list().values().next().cloned());
+        if let Some(iface) = iface {
+            // A disappearing device is the same unattached state as having no
+            // device at birth. Quota and real storage failures still propagate.
+            match sock.prepare_iface_socket(iface) {
+                Ok(mut prepared) => {
+                    let mut inner = sock.inner.write();
+                    let Some(RawInner::Unbound(unbound)) = inner.take() else {
+                        unreachable!();
+                    };
+                    match unbound.bind_prepared(None, &mut prepared, sock.clone()) {
+                        Ok(bound) => {
+                            *inner = Some(RawInner::Wildcard(bound));
+                        }
+                        Err((unbound, SystemError::ENODEV)) => {
+                            *inner = Some(RawInner::Unbound(unbound));
+                        }
+                        Err((unbound, error)) => {
+                            *inner = Some(RawInner::Unbound(unbound));
+                            return Err(error);
+                        }
+                    }
+                }
+                Err(SystemError::ENODEV) => {}
+                Err(error) => return Err(error),
+            }
         }
 
         register_raw_socket(&sock);
 
         Ok(sock)
+    }
+
+    fn prepare_iface_socket(
+        &self,
+        iface: Arc<dyn crate::net::Iface>,
+    ) -> Result<super::super::common::registration::PreparedIfaceSocket, SystemError> {
+        let mut recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
+        loop {
+            let creator = crate::cgroup::memory::object_for_task(&ProcessManager::current_pcb());
+            match super::super::common::registration::PreparedIfaceSocket::try_new(
+                iface.clone(),
+                self.netns.clone(),
+                &creator,
+            ) {
+                Ok(prepared) => return Ok(prepared),
+                Err(error) => error.recover(&mut recovery)?,
+            }
+        }
     }
 
     pub fn is_nonblock(&self) -> bool {
@@ -182,65 +261,14 @@ impl RawSocket {
         if !self.addr_matches_ip_version(local_addr) {
             return Err(SystemError::EAFNOSUPPORT);
         }
-        let mut inner = self.inner.write();
-        let prev = inner.take().ok_or(SystemError::EINVAL)?;
-        match prev {
-            RawInner::Unbound(unbound) => match unbound.bind(local_addr, self.netns.clone()) {
-                Ok(bound) => {
-                    bound
-                        .inner()
-                        .iface()
-                        .common()
-                        .bind_socket(self.self_ref.upgrade().unwrap());
-                    *inner = Some(RawInner::Bound(bound));
-                    Ok(())
-                }
-                Err(e) => {
-                    // bind 消费了 unbound（move）。失败时恢复为新的 Unbound 状态，
-                    // 避免 inner=None 导致后续 unwrap panic。
-                    *inner = Some(RawInner::Unbound(UnboundRaw::new(
-                        self.ip_version,
-                        self.protocol,
-                    )));
-                    // Linux 语义：绑定到不存在的本地地址应返回 EADDRNOTAVAIL。
-                    Err(if matches!(e, SystemError::ENODEV) {
-                        SystemError::EADDRNOTAVAIL
-                    } else {
-                        e
-                    })
-                }
-            },
-            RawInner::Wildcard(wildcard) => {
-                // Keep the old attachment until the new one has been prepared.
-                // A failed bind must leave both the smoltcp handle and the
-                // interface's bound-socket registry unchanged.
-                let unbound = UnboundRaw::new(self.ip_version, self.protocol);
-                match unbound.bind(local_addr, self.netns.clone()) {
-                    Ok(bound) => {
-                        self.release_wildcard(wildcard);
-                        bound
-                            .inner()
-                            .iface()
-                            .common()
-                            .bind_socket(self.self_ref.upgrade().unwrap());
-                        *inner = Some(RawInner::Bound(bound));
-                        Ok(())
-                    }
-                    Err(e) => {
-                        *inner = Some(RawInner::Wildcard(wildcard));
-                        Err(if matches!(e, SystemError::ENODEV) {
-                            SystemError::EADDRNOTAVAIL
-                        } else {
-                            e
-                        })
-                    }
-                }
-            }
-            other => {
-                *inner = Some(other);
-                Err(SystemError::EINVAL)
-            }
+        if !matches!(
+            self.inner.read().as_ref(),
+            Some(RawInner::Unbound(_) | RawInner::Wildcard(_))
+        ) {
+            return Err(SystemError::EINVAL);
         }
+        let target = super::super::common::explicit_bind_iface(local_addr, &self.netns, None)?;
+        self.bind_attachment(target, local_addr, false)
     }
 
     /// 绑定到临时地址（根据远程地址选择合适的本地地址）
@@ -248,68 +276,61 @@ impl RawSocket {
         if !self.addr_matches_ip_version(remote) {
             return Err(SystemError::EAFNOSUPPORT);
         }
-        let mut inner_guard = self.inner.write();
-        let prev = inner_guard.take().ok_or(SystemError::EINVAL)?;
-        match prev {
-            RawInner::Bound(bound) => {
-                inner_guard.replace(RawInner::Bound(bound));
-                Ok(())
-            }
-            RawInner::Wildcard(wildcard) => {
-                // Wildcard 仅表示已附着到某个 iface；为符合 Linux 语义（connect/getSockName），
-                // 这里需要真正选址并记录 local_addr。
-                let unbound = UnboundRaw::new(self.ip_version, self.protocol);
-                match unbound.bind_ephemeral(remote, self.netns.clone()) {
-                    Ok(bound) => {
-                        self.release_wildcard(wildcard);
-                        bound
-                            .inner()
-                            .iface()
-                            .common()
-                            .bind_socket(self.self_ref.upgrade().unwrap());
-                        inner_guard.replace(RawInner::Bound(bound));
-                        Ok(())
-                    }
-                    Err(e) => {
-                        inner_guard.replace(RawInner::Wildcard(wildcard));
-                        Err(e)
-                    }
+        if matches!(self.inner.read().as_ref(), Some(RawInner::Bound(_))) {
+            return Ok(());
+        }
+        let target = super::super::common::ephemeral_bind_target(remote, &self.netns, None)?;
+        self.bind_attachment(target.stack_owner, target.local_addr, true)
+    }
+
+    fn bind_attachment(
+        &self,
+        iface: Arc<dyn crate::net::Iface>,
+        local: IpAddress,
+        allow_bound: bool,
+    ) -> Result<(), SystemError> {
+        let mut prepared = self.prepare_iface_socket(iface)?;
+        // The original vacant slots and Strong pin die after the inner guard.
+        let mut retired = None;
+        let mut inner = self.inner.write();
+        match inner.as_mut().ok_or(SystemError::EINVAL)? {
+            RawInner::Bound(_) => {
+                if allow_bound {
+                    Ok(())
+                } else {
+                    Err(SystemError::EINVAL)
                 }
             }
-            RawInner::Unbound(unbound) => {
-                match unbound.bind_ephemeral(remote, self.netns.clone()) {
+            RawInner::Wildcard(bound) => {
+                retired =
+                    prepared.move_bound(bound.inner_mut(), self.self_ref.upgrade().unwrap())?;
+                bound.set_local_addr(local);
+                let Some(RawInner::Wildcard(bound)) = inner.take() else {
+                    unreachable!()
+                };
+                *inner = Some(RawInner::Bound(bound));
+                Ok(())
+            }
+            RawInner::Unbound(_) => {
+                let Some(RawInner::Unbound(unbound)) = inner.take() else {
+                    unreachable!()
+                };
+                match unbound.bind_prepared(
+                    Some(local),
+                    &mut prepared,
+                    self.self_ref.upgrade().unwrap(),
+                ) {
                     Ok(bound) => {
-                        bound
-                            .inner()
-                            .iface()
-                            .common()
-                            .bind_socket(self.self_ref.upgrade().unwrap());
-                        inner_guard.replace(RawInner::Bound(bound));
+                        *inner = Some(RawInner::Bound(bound));
                         Ok(())
                     }
-                    Err(e) => {
-                        // bind_ephemeral 消费了 unbound（move），失败恢复为 Unbound。
-                        inner_guard.replace(RawInner::Unbound(UnboundRaw::new(
-                            self.ip_version,
-                            self.protocol,
-                        )));
-                        Err(e)
+                    Err((unbound, error)) => {
+                        *inner = Some(RawInner::Unbound(unbound));
+                        Err(error)
                     }
                 }
             }
         }
-    }
-
-    /// A wildcard attachment is registered in both smoltcp and the owning
-    /// interface's notification list. Removing only the smoltcp handle leaves
-    /// an Arc<RawSocket> in the old interface and pins its network namespace.
-    fn release_wildcard(&self, wildcard: BoundRaw) {
-        wildcard
-            .inner()
-            .iface()
-            .common()
-            .unbind_socket(self.self_ref.upgrade().unwrap());
-        wildcard.close();
     }
 
     pub fn is_bound(&self) -> bool {
@@ -321,23 +342,24 @@ impl RawSocket {
         if let Some(me) = self.self_ref.upgrade() {
             unregister_raw_socket(&me);
         }
+        let mut retired = None;
         let mut inner = self.inner.write();
         match &mut *inner {
             Some(RawInner::Bound(bound)) => {
-                bound
-                    .inner()
-                    .iface()
-                    .common()
-                    .unbind_socket(self.self_ref.upgrade().unwrap());
+                retired = Some(
+                    bound
+                        .inner()
+                        .retire_notification(self.self_ref.upgrade().unwrap()),
+                );
                 bound.close();
                 inner.take();
             }
             Some(RawInner::Wildcard(bound)) => {
-                bound
-                    .inner()
-                    .iface()
-                    .common()
-                    .unbind_socket(self.self_ref.upgrade().unwrap());
+                retired = Some(
+                    bound
+                        .inner()
+                        .retire_notification(self.self_ref.upgrade().unwrap()),
+                );
                 bound.close();
                 inner.take();
             }

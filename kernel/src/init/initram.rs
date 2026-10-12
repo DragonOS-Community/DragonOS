@@ -95,6 +95,15 @@ struct CpioEntryInfo {
 #[unified_init(INITCALL_ROOTFS)]
 #[inline(never)]
 pub fn initramfs_init() -> Result<(), SystemError> {
+    // The initcall ABI is a terminal bootstrap boundary, not a task-context
+    // reclaim/retry site. Keep admission errors typed throughout extraction.
+    initramfs_init_typed().map_err(|error| match error {
+        crate::mm::allocation::MemoryAllocationError::System(error) => error,
+        crate::mm::allocation::MemoryAllocationError::Charge(_) => SystemError::ENOMEM,
+    })
+}
+
+fn initramfs_init_typed() -> Result<(), crate::mm::allocation::MemoryAllocationError> {
     log::info!("initramfs_init start");
 
     let ramfs = RamFS::new();
@@ -128,7 +137,7 @@ pub fn initramfs_init() -> Result<(), SystemError> {
 
     if get_initramfs_size() == 0 {
         log::error!("Initramfs error: Not found initram, the size is 0!");
-        return Err(SystemError::ENOENT);
+        return Err(SystemError::ENOENT.into());
     }
 
     let cpio_data = xz_decompress(get_initram())?;

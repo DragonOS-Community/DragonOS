@@ -221,8 +221,9 @@ impl MemoryManagementArch for LoongArch64MMArch {
         todo!()
     }
 
-    fn setup_new_usermapper() -> Result<crate::mm::ucontext::UserMapper, system_error::SystemError>
-    {
+    fn setup_new_usermapper(
+        _account: Option<&alloc::sync::Arc<crate::cgroup::memory::object::ObjectAccount>>,
+    ) -> Result<crate::mm::ucontext::UserMapper, crate::mm::allocation::MemoryAllocationError> {
         todo!()
     }
 

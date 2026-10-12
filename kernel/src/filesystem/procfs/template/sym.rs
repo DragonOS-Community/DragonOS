@@ -139,7 +139,12 @@ pub trait SymOps: Sync + Send + Sized + Debug {
 impl<S: SymOps + 'static> IndexNode for ProcSym<S> {
     fn fs(&self) -> Arc<dyn FileSystem>;
     fn as_any_ref(&self) -> &dyn core::any::Any;
-    fn set_metadata(&self, metadata: &Metadata) -> Result<(), SystemError>;
+    fn set_metadata(
+        &self,
+        metadata: &Metadata,
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        self.common.set_metadata(metadata).map_err(Into::into)
+    }
 
     fn metadata(&self) -> Result<Metadata, SystemError> {
         let mut metadata = self.common.metadata()?;
@@ -163,11 +168,11 @@ impl<S: SymOps + 'static> IndexNode for ProcSym<S> {
         _len: usize,
         buf: &mut [u8],
         _data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError> {
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
         //todo 符号链接不能直接读取，但是由于目前系统中对于 readlink 的支持有限
         //暂时通过 read_at 来模拟 readlink 的行为
         // log::info!("ProcSym read_at called, redirecting to read_link");
-        self.inner.read_link(buf)
+        self.inner.read_link(buf).map_err(Into::into)
     }
 
     fn write_at(
@@ -176,9 +181,9 @@ impl<S: SymOps + 'static> IndexNode for ProcSym<S> {
         _len: usize,
         _buf: &[u8],
         _data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError> {
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
         // 符号链接不能写入
-        Err(SystemError::EINVAL)
+        Err(SystemError::EINVAL.into())
     }
 
     fn list(&self) -> Result<Vec<String>, SystemError> {
@@ -193,8 +198,8 @@ impl<S: SymOps + 'static> IndexNode for ProcSym<S> {
         &self,
         mut data: MutexGuard<FilePrivateData>,
         _flags: &FileFlags,
-    ) -> Result<(), SystemError> {
-        self.inner.open(&mut data)
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        self.inner.open(&mut data).map_err(Into::into)
     }
 
     fn close(&self, _data: MutexGuard<FilePrivateData>) -> Result<(), SystemError> {

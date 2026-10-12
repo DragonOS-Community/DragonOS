@@ -975,8 +975,21 @@ class CgroupMemory : public ::testing::Test {
   std::string Scratch() {
     if (scratch_dir_.empty()) {
       const char* supplied = getenv("DUNITEST_MEMORY_FILE_DIR");
-      std::string pattern = std::string(supplied ? supplied : "/tmp") +
-                            "/dunitest-memory-XXXXXX";
+      // File-cache protection must use ordinary reclaimable pages, not
+      // unswappable shmem from a tmpfs /tmp. /var/tmp is the persistent
+      // temporary directory; an explicit override must satisfy the same rule.
+      const char* directory = supplied ? supplied : "/var/tmp";
+      struct statfs fs{};
+      if (statfs(directory, &fs)) {
+        ADD_FAILURE() << directory << ": " << strerror(errno);
+        return {};
+      }
+      if (fs.f_type == 0x01021994 || fs.f_type == 0x858458f6) {
+        ADD_FAILURE() << directory
+                      << ": set DUNITEST_MEMORY_FILE_DIR to a disk-backed filesystem";
+        return {};
+      }
+      std::string pattern = std::string(directory) + "/dunitest-memory-XXXXXX";
       std::vector<char> path(pattern.begin(), pattern.end());
       path.push_back('\0');
       char* created = mkdtemp(path.data());

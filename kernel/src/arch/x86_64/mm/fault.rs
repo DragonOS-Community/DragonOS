@@ -295,6 +295,9 @@ impl X86_64MMArch {
 
         if regs.is_from_user() {
             unsafe { CurrentIrqArch::interrupt_enable() };
+            // User PCB birth and kernel-to-user exec preprepare this storage.
+            // The trap must not introduce lazy allocation before VMA checks.
+            debug_assert!(crate::cgroup::memory::high::current_prepared());
             flags |= FaultFlags::FAULT_FLAG_USER;
         } else if rflags.contains(RFlags::FLAGS_IF) {
             unsafe { CurrentIrqArch::interrupt_enable() };
@@ -366,8 +369,11 @@ impl X86_64MMArch {
         let current_address_space: Arc<AddressSpace> = AddressSpace::current().unwrap();
 
         let mut tried_direct_reclaim = false;
+        let mut charge_recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
 
         'fault_retry: loop {
+            let creator = crate::cgroup::memory::object_for_task(&ProcessManager::current_pcb());
+            let data_account = current_address_space.memory_account();
             let mut space_guard = current_address_space.write();
             let mut fault;
             loop {
@@ -472,10 +478,36 @@ impl X86_64MMArch {
                             send_segv_maperr();
                             return;
                         }
-                        let post_commit_population = match space_guard.extend_stack(extension_size)
-                        {
+                        let post_commit_population = match space_guard.extend_stack(
+                            extension_size,
+                            Some(&creator),
+                            &data_account,
+                        ) {
                             Ok(request) => request,
                             Err(err) => {
+                                if let crate::mm::allocation::MemoryAllocationError::Charge(
+                                    failure,
+                                ) = err
+                                {
+                                    drop(space_guard);
+                                    match crate::mm::allocation::MemoryAllocationError::Charge(
+                                        failure,
+                                    )
+                                    .recover(&mut charge_recovery)
+                                    {
+                                        Ok(()) => continue 'fault_retry,
+                                        Err(SystemError::EINTR | SystemError::ERESTARTSYS) => {
+                                            if !regs.is_from_user() {
+                                                handle_kernel_access_failed(regs);
+                                            }
+                                            return;
+                                        }
+                                        Err(_) => {
+                                            crate::sched::sched_yield();
+                                            return;
+                                        }
+                                    }
+                                }
                                 log::warn!(
                                     "pid {} user stack extend failed: {:?}, error_code: {:?}, address: {:#x}",
                                     ProcessManager::current_pid().data(),
@@ -558,10 +590,44 @@ impl X86_64MMArch {
                     flags,
                     mapper,
                     current_address_space.clone(),
+                    creator.clone(),
+                    data_account.clone(),
                 );
 
                 let outcome = PageFaultHandler::handle_mm_fault(message);
                 fault = outcome.reason;
+
+                if let Some(failure) = outcome.charge_failure {
+                    drop(space_guard);
+                    match crate::mm::allocation::MemoryAllocationError::Charge(failure)
+                        .recover(&mut charge_recovery)
+                    {
+                        Ok(()) => continue 'fault_retry,
+                        Err(SystemError::EINTR | SystemError::ERESTARTSYS) => {
+                            if !regs.is_from_user() {
+                                handle_kernel_access_failed(regs);
+                            }
+                            return;
+                        }
+                        Err(_) => {
+                            // Linux pagefault_out_of_memory does not invent
+                            // SIGBUS for a protected/no-victim memcg domain.
+                            // Leave recovery, deliver any pending signals and
+                            // permit a real later fault; never fall through to
+                            // the global killer or busy-loop inside the kernel.
+                            crate::mm::fault::account_fault_result(
+                                &data_account,
+                                flags,
+                                VmFaultReason::VM_FAULT_OOM,
+                            );
+                            if !regs.is_from_user() && handle_kernel_access_failed(regs) {
+                                return;
+                            }
+                            crate::sched::sched_yield();
+                            return;
+                        }
+                    }
+                }
 
                 if fault.contains(VmFaultReason::VM_FAULT_COMPLETED) {
                     return;
@@ -574,7 +640,33 @@ impl X86_64MMArch {
                     if let Some(wait) = wait {
                         match wait.wait() {
                             Ok(()) => {}
-                            Err(SystemError::EINTR | SystemError::ERESTARTSYS) => {
+                            Err(crate::mm::allocation::MemoryAllocationError::Charge(failure)) => {
+                                match crate::mm::allocation::MemoryAllocationError::Charge(failure)
+                                    .recover(&mut charge_recovery)
+                                {
+                                    Ok(()) => continue 'fault_retry,
+                                    Err(error) => {
+                                        if !matches!(
+                                            error,
+                                            SystemError::EINTR | SystemError::ERESTARTSYS
+                                        ) {
+                                            crate::mm::fault::account_fault_result(
+                                                &data_account,
+                                                flags,
+                                                VmFaultReason::VM_FAULT_OOM,
+                                            );
+                                            crate::sched::sched_yield();
+                                        }
+                                        if !regs.is_from_user() {
+                                            handle_kernel_access_failed(regs);
+                                        }
+                                        return;
+                                    }
+                                }
+                            }
+                            Err(crate::mm::allocation::MemoryAllocationError::System(
+                                SystemError::EINTR | SystemError::ERESTARTSYS,
+                            )) => {
                                 if !regs.is_from_user() {
                                     handle_kernel_access_failed(regs);
                                 }
@@ -582,15 +674,17 @@ impl X86_64MMArch {
                                 // fault handler's address-space/VMA owners drop.
                                 return;
                             }
-                            Err(SystemError::ENOMEM) => {
+                            Err(crate::mm::allocation::MemoryAllocationError::System(
+                                SystemError::ENOMEM,
+                            )) => {
                                 fault = VmFaultReason::VM_FAULT_OOM;
-                                crate::mm::fault::account_fault_result(flags, fault);
+                                crate::mm::fault::account_fault_result(&data_account, flags, fault);
                                 space_guard = current_address_space.write();
                                 break;
                             }
-                            Err(_) => {
+                            Err(crate::mm::allocation::MemoryAllocationError::System(_)) => {
                                 fault = VmFaultReason::VM_FAULT_SIGBUS;
-                                crate::mm::fault::account_fault_result(flags, fault);
+                                crate::mm::fault::account_fault_result(&data_account, flags, fault);
                                 space_guard = current_address_space.write();
                                 break;
                             }

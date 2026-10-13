@@ -225,6 +225,8 @@ bitflags! {
         /// x86 #DB work is recorded and must be committed/restored at the
         /// return-to-user boundary, never in exception context.
         const PENDING_DEBUG = 1 << 25;
+        /// Deferred memory.high reclaim/backpressure at a lock-free user boundary.
+        const NEED_MEMORY_HIGH = 1 << 26;
     }
 }
 
@@ -243,6 +245,7 @@ impl ProcessFlags {
             | Self::NEED_RSEQ.bits
             | Self::PENDING_PTRACE_STOP.bits
             | Self::PENDING_DEBUG.bits
+            | Self::NEED_MEMORY_HIGH.bits
     }
 
     /// Test and clear flags.

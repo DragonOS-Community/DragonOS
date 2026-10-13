@@ -602,10 +602,13 @@ impl IndexNode for Ps2MouseDevice {
         &self,
         _data: MutexGuard<FilePrivateData>,
         _mode: &crate::filesystem::vfs::file::FileFlags,
-    ) -> Result<(), SystemError> {
-        let mut guard = self.inner.lock_irqsave();
-        guard.buf.clear();
-        Ok(())
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = {
+            let mut guard = self.inner.lock_irqsave();
+            guard.buf.clear();
+            Ok(())
+        };
+        result.map_err(Into::into)
     }
 
     fn close(&self, _data: MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
@@ -620,17 +623,20 @@ impl IndexNode for Ps2MouseDevice {
         _len: usize,
         buf: &mut [u8],
         _data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError> {
-        let mut guard = self.inner.lock_irqsave();
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = (|| {
+            let mut guard = self.inner.lock_irqsave();
 
-        if guard.buf.len() >= 3 {
-            for item in buf.iter_mut().take(3) {
-                *item = guard.buf.dequeue().unwrap();
+            if guard.buf.len() >= 3 {
+                for item in buf.iter_mut().take(3) {
+                    *item = guard.buf.dequeue().unwrap();
+                }
+                return Ok(3);
+            } else {
+                return Ok(0);
             }
-            return Ok(3);
-        } else {
-            return Ok(0);
-        }
+        })();
+        result.map_err(Into::into)
     }
 
     fn write_at(
@@ -639,8 +645,11 @@ impl IndexNode for Ps2MouseDevice {
         _len: usize,
         _buf: &[u8],
         _data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError> {
-        return Err(SystemError::ENOSYS);
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = (|| {
+            return Err(SystemError::ENOSYS);
+        })();
+        result.map_err(Into::into)
     }
 
     fn fs(&self) -> Arc<dyn FileSystem> {
@@ -665,8 +674,9 @@ impl IndexNode for Ps2MouseDevice {
         Ok(self.inner.lock_irqsave().devfs_metadata.clone())
     }
 
-    fn resize(&self, _len: usize) -> Result<(), SystemError> {
-        Ok(())
+    fn resize(&self, _len: usize) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = Ok(());
+        result.map_err(Into::into)
     }
 
     fn dname(&self) -> Result<DName, SystemError> {

@@ -273,8 +273,12 @@ impl IndexNode for GenDisk {
         &self,
         _datasync: bool,
         _data: MutexGuard<FilePrivateData>,
-    ) -> Result<(), SystemError> {
-        self.sync()
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        let device = self.block_device()?;
+        if let Some(loop_device) = BlockDevice::as_any_ref(&*device).downcast_ref::<LoopDevice>() {
+            return loop_device.try_sync();
+        }
+        device.sync().map_err(Into::into)
     }
 
     fn read_at(
@@ -283,14 +287,24 @@ impl IndexNode for GenDisk {
         len: usize,
         buf: &mut [u8],
         _data: MutexGuard<crate::filesystem::vfs::FilePrivateData>,
-    ) -> Result<usize, SystemError> {
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
         if len == 0 {
             return Ok(0);
         }
         if len > buf.len() {
-            return Err(SystemError::ENOBUFS);
+            return Err(SystemError::ENOBUFS.into());
         }
-        self.read_at_bytes(&mut buf[..len], offset)
+        let disk_offset = self
+            .disk_blkid_2_bytes(self.range().lba_start)
+            .checked_add(offset)
+            .ok_or(SystemError::EOVERFLOW)?;
+        let device = self.block_device()?;
+        if let Some(loop_device) = BlockDevice::as_any_ref(&*device).downcast_ref::<LoopDevice>() {
+            return loop_device.try_read_bytes_operation(disk_offset, len, &mut buf[..len]);
+        }
+        device
+            .read_at_bytes(disk_offset, len, &mut buf[..len])
+            .map_err(Into::into)
     }
 
     fn write_at(
@@ -299,14 +313,26 @@ impl IndexNode for GenDisk {
         len: usize,
         buf: &[u8],
         _data: MutexGuard<crate::filesystem::vfs::FilePrivateData>,
-    ) -> Result<usize, SystemError> {
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
         if len == 0 {
             return Ok(0);
         }
         if len > buf.len() {
-            return Err(SystemError::E2BIG);
+            return Err(SystemError::E2BIG.into());
         }
-        self.write_at_bytes(&buf[..len], offset)
+        let disk_offset = self
+            .disk_blkid_2_bytes(self.range().lba_start)
+            .checked_add(offset)
+            .ok_or(SystemError::EOVERFLOW)?;
+        let device = self.block_device()?;
+        if let Some(loop_device) = BlockDevice::as_any_ref(&*device).downcast_ref::<LoopDevice>() {
+            return loop_device
+                .try_write_bytes_operation(disk_offset, len, &buf[..len], WriteSyncIntent::None)
+                .map(|result| result.written_len);
+        }
+        device
+            .write_at_bytes(disk_offset, len, &buf[..len])
+            .map_err(Into::into)
     }
 
     fn write_at_with_sync(
@@ -316,16 +342,26 @@ impl IndexNode for GenDisk {
         buf: &[u8],
         sync_intent: WriteSyncIntent,
         _data: MutexGuard<FilePrivateData>,
-    ) -> Result<DelegatedWriteResult, SystemError> {
+    ) -> Result<DelegatedWriteResult, crate::mm::allocation::MemoryAllocationError> {
         if len > buf.len() {
-            return Err(SystemError::E2BIG);
+            return Err(SystemError::E2BIG.into());
         }
         let disk_offset = self
             .disk_blkid_2_bytes(self.range().lba_start)
             .checked_add(offset)
             .ok_or(SystemError::EOVERFLOW)?;
-        self.block_device()?
+        let device = self.block_device()?;
+        if let Some(loop_device) = BlockDevice::as_any_ref(&*device).downcast_ref::<LoopDevice>() {
+            return loop_device.try_write_bytes_operation(
+                disk_offset,
+                len,
+                &buf[..len],
+                sync_intent,
+            );
+        }
+        device
             .write_at_bytes_with_sync(disk_offset, len, &buf[..len], sync_intent)
+            .map_err(Into::into)
     }
 
     fn list(&self) -> Result<alloc::vec::Vec<alloc::string::String>, system_error::SystemError> {
@@ -368,8 +404,10 @@ impl IndexNode for GenDisk {
         &self,
         data: MutexGuard<crate::filesystem::vfs::FilePrivateData>,
         mode: &crate::filesystem::vfs::file::FileFlags,
-    ) -> Result<(), SystemError> {
-        self.block_device()?.file_open(data, mode)
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> =
+            (|| self.block_device()?.file_open(data, mode))();
+        result.map_err(Into::into)
     }
 
     fn ioctl(
@@ -377,12 +415,12 @@ impl IndexNode for GenDisk {
         cmd: u32,
         data: usize,
         private_data: MutexGuard<crate::filesystem::vfs::FilePrivateData>,
-    ) -> Result<usize, SystemError> {
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
         let bdev = self.block_device()?;
         if let Some(loop_dev) = BlockDevice::as_any_ref(&*bdev).downcast_ref::<LoopDevice>() {
             loop_dev.ioctl(cmd, data, private_data)
         } else {
-            Err(SystemError::ENOSYS)
+            Err(SystemError::ENOSYS.into())
         }
     }
 }

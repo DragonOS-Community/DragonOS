@@ -61,9 +61,10 @@ impl Syscall for SysMknodHandle {
 
         let (inode_begin, remain_path) = user_path_at(&pcb, AtFlags::AT_FDCWD.bits(), path)?;
 
-        if inode_begin
-            .lookup_follow_symlink(&remain_path, VFS_MAX_FOLLOW_SYMLINK_TIMES)
-            .is_ok()
+        if crate::filesystem::vfs::file::File::recover_io(|| {
+            inode_begin.lookup_follow_symlink(&remain_path, VFS_MAX_FOLLOW_SYMLINK_TIMES)
+        })
+        .is_ok()
         {
             return Err(SystemError::EEXIST);
         }

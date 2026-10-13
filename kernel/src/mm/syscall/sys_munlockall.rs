@@ -19,13 +19,16 @@ impl Syscall for SysMunlockallHandle {
     fn handle(&self, _args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let vm = AddressSpace::current()?;
         loop {
+            let creator = crate::cgroup::memory::object_for_task(
+                &crate::process::ProcessManager::current_pcb(),
+            );
             let mut guard = vm.write_interruptible()?;
             if guard.mappings.first_reservation_region().is_some() {
                 drop(guard);
                 vm.wait_for_no_reservations_interruptible()?;
                 continue;
             }
-            let notifications = guard.clear_all_vma_lock_flags_collect();
+            let notifications = guard.clear_all_vma_lock_flags_collect(&creator);
             drop(guard);
             crate::mm::ucontext::InnerAddressSpace::notify_close_notifications(notifications);
             return Ok(0);

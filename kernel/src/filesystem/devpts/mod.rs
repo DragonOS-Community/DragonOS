@@ -180,7 +180,10 @@ impl MountableFileSystem for DevPtsFs {
     fn make_mount_data(
         raw_data: Option<&str>,
         _source: &str,
-    ) -> Result<Option<Arc<dyn FileSystemMakerData + 'static>>, SystemError> {
+    ) -> Result<
+        Option<Arc<dyn FileSystemMakerData + 'static>>,
+        crate::mm::allocation::MemoryAllocationError,
+    > {
         // 对于 devpts，挂载数据只是解析选项，将结果以 Box<DevPtsOptions> 形式传递
         let opts = parse_devpts_options(raw_data);
         Ok(Some(Arc::new(opts)))
@@ -263,8 +266,9 @@ impl IndexNode for LockedDevPtsFSInode {
         &self,
         _data: MutexGuard<FilePrivateData>,
         _mode: &super::vfs::file::FileFlags,
-    ) -> Result<(), SystemError> {
-        Ok(())
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = Ok(());
+        result.map_err(Into::into)
     }
 
     fn metadata(&self) -> Result<super::vfs::Metadata, SystemError> {
@@ -285,8 +289,9 @@ impl IndexNode for LockedDevPtsFSInode {
         _len: usize,
         _buf: &mut [u8],
         _data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, system_error::SystemError> {
-        Err(SystemError::EISDIR)
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = Err(SystemError::EISDIR);
+        result.map_err(Into::into)
     }
 
     fn write_at(
@@ -295,8 +300,9 @@ impl IndexNode for LockedDevPtsFSInode {
         _len: usize,
         _buf: &[u8],
         _data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, system_error::SystemError> {
-        Err(SystemError::EISDIR)
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = Err(SystemError::EISDIR);
+        result.map_err(Into::into)
     }
 
     fn fs(&self) -> alloc::sync::Arc<dyn super::vfs::FileSystem> {
@@ -335,15 +341,15 @@ impl IndexNode for LockedDevPtsFSInode {
         file_type: FileType,
         _mode: super::vfs::InodeMode,
         _data: usize,
-    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+    ) -> Result<Arc<dyn IndexNode>, crate::mm::allocation::MemoryAllocationError> {
         if file_type != FileType::CharDevice {
-            return Err(SystemError::ENOSYS);
+            return Err(SystemError::ENOSYS.into());
         }
 
         let mut guard = self.inner.lock();
 
         if guard.children_unchecked_mut().contains_key(name) {
-            return Err(SystemError::EEXIST);
+            return Err(SystemError::EEXIST.into());
         }
 
         let fs = guard.fs.upgrade().unwrap();
@@ -388,18 +394,24 @@ impl IndexNode for LockedDevPtsFSInode {
     fn unlink(
         &self,
         name: &str,
-    ) -> Result<crate::filesystem::vfs::LinkRemovalOutcome, SystemError> {
-        let mut guard = self.inner.lock();
-        let removed = guard
-            .children_unchecked_mut()
-            .remove(name)
-            .ok_or(SystemError::ENOENT)?;
-        if name.as_bytes().iter().all(u8::is_ascii_digit) {
-            let fs = guard.fs.upgrade().unwrap();
-            fs.pts_count.fetch_sub(1, Ordering::SeqCst);
-        }
-        drop(removed);
-        Ok(crate::filesystem::vfs::LinkRemovalOutcome::LastLink)
+    ) -> Result<
+        crate::filesystem::vfs::LinkRemovalOutcome,
+        crate::mm::allocation::MemoryAllocationError,
+    > {
+        let result: core::result::Result<_, system_error::SystemError> = (|| {
+            let mut guard = self.inner.lock();
+            let removed = guard
+                .children_unchecked_mut()
+                .remove(name)
+                .ok_or(SystemError::ENOENT)?;
+            if name.as_bytes().iter().all(u8::is_ascii_digit) {
+                let fs = guard.fs.upgrade().unwrap();
+                fs.pts_count.fetch_sub(1, Ordering::SeqCst);
+            }
+            drop(removed);
+            Ok(crate::filesystem::vfs::LinkRemovalOutcome::LastLink)
+        })();
+        result.map_err(Into::into)
     }
 }
 

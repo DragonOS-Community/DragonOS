@@ -56,8 +56,9 @@ impl Syscall for SysChrootHandle {
             crate::filesystem::vfs::fcntl::AtFlags::AT_FDCWD.bits(),
             path,
         )?;
-        let target =
-            inode_begin.lookup_follow_symlink(&resolved_path, VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
+        let target = crate::filesystem::vfs::file::File::recover_io(|| {
+            inode_begin.lookup_follow_symlink(&resolved_path, VFS_MAX_FOLLOW_SYMLINK_TIMES)
+        })?;
 
         let resolved = ResolvedPath::new(target)?;
         let target = resolved.inode();

@@ -293,8 +293,14 @@ pub fn exec_task_namespaces() -> Result<(), SystemError> {
     let new_nsproxy = create_new_namespaces(&CloneFlags::empty(), &tsk, user_ns)?;
     // todo: time_ns的逻辑
     let fs_refs = crate::process::lock_fs_refs_copy();
-    let prepared =
-        PreparedNamespaceInstall::prepare_for_setns(&tsk, new_nsproxy, None, false, &fs_refs)?;
+    // Empty clone flags preserve the mount namespace. Exec only republishes
+    // namespace identity here; it must not acquire a private fs or recover
+    // while its exec transaction is live.
+    assert!(Arc::ptr_eq(
+        tsk.nsproxy().mnt_namespace(),
+        new_nsproxy.mnt_namespace()
+    ));
+    let prepared = PreparedNamespaceInstall::prepare_publication(new_nsproxy, None, None, false)?;
     prepared.commit(&tsk, fs_refs)?;
 
     return Ok(());
@@ -319,11 +325,11 @@ impl PreparedNamespaceInstall {
     pub(crate) fn prepare_for_unshare(
         tsk: &Arc<ProcessControlBlock>,
         new_nsproxy: Arc<NsProxy>,
-        new_fs: Option<Arc<FsStruct>>,
+        new_fs: &mut Option<Arc<FsStruct>>,
         new_cred: Option<Arc<Cred>>,
         detach_sysvsem: bool,
         fs_refs: &FsRefsReadGuard,
-    ) -> Result<Self, SystemError> {
+    ) -> Result<Self, crate::mm::allocation::MemoryAllocationError> {
         Self::prepare(
             tsk,
             new_nsproxy,
@@ -338,14 +344,15 @@ impl PreparedNamespaceInstall {
     pub(crate) fn prepare_for_setns(
         tsk: &Arc<ProcessControlBlock>,
         new_nsproxy: Arc<NsProxy>,
+        new_fs: &mut Option<Arc<FsStruct>>,
         new_cred: Option<Arc<Cred>>,
         detach_sysvsem: bool,
         fs_refs: &FsRefsReadGuard,
-    ) -> Result<Self, SystemError> {
+    ) -> Result<Self, crate::mm::allocation::MemoryAllocationError> {
         Self::prepare(
             tsk,
             new_nsproxy,
-            None,
+            new_fs,
             new_cred,
             detach_sysvsem,
             MountPathPreparation::UseNamespaceRoot,
@@ -356,21 +363,23 @@ impl PreparedNamespaceInstall {
     fn prepare(
         tsk: &Arc<ProcessControlBlock>,
         new_nsproxy: Arc<NsProxy>,
-        mut new_fs: Option<Arc<FsStruct>>,
+        new_fs: &mut Option<Arc<FsStruct>>,
         new_cred: Option<Arc<Cred>>,
         detach_sysvsem: bool,
         mount_paths: MountPathPreparation,
         _fs_refs: &FsRefsReadGuard,
-    ) -> Result<Self, SystemError> {
+    ) -> Result<Self, crate::mm::allocation::MemoryAllocationError> {
         if !Arc::ptr_eq(tsk.nsproxy().mnt_namespace(), &new_nsproxy.mnt_ns) {
             if new_fs.is_none() {
                 // Check sharing before taking the temporary fs Arc below.
                 if tsk.fs_struct_is_shared() {
-                    return Err(SystemError::EINVAL);
+                    return Err(SystemError::EINVAL.into());
                 }
                 let current_fs = tsk.fs_struct();
-                new_fs =
-                    Some(Arc::try_new((*current_fs).clone()).map_err(|_| SystemError::ENOMEM)?);
+                *new_fs = Some(FsStruct::try_clone_for(
+                    &current_fs,
+                    &crate::cgroup::memory::object_for_task(tsk),
+                )?);
             }
 
             let prepared_fs = new_fs
@@ -389,6 +398,20 @@ impl PreparedNamespaceInstall {
             prepared_fs.set_pwd(new_pwd);
         }
 
+        Ok(Self::prepare_publication(
+            new_nsproxy,
+            new_fs.clone(),
+            new_cred,
+            detach_sysvsem,
+        )?)
+    }
+
+    fn prepare_publication(
+        new_nsproxy: Arc<NsProxy>,
+        new_fs: Option<Arc<FsStruct>>,
+        new_cred: Option<Arc<Cred>>,
+        detach_sysvsem: bool,
+    ) -> Result<Self, SystemError> {
         let nsproxy_retire = PreparedRcuArcRetire::prepare().map_err(|_| SystemError::ENOMEM)?;
         let cred_retire = if new_cred.is_some() {
             Some(PreparedRcuArcRetire::prepare().map_err(|_| SystemError::ENOMEM)?)
@@ -495,6 +518,7 @@ mod tests {
         let prepared = PreparedNamespaceInstall::prepare_for_setns(
             &pcb,
             new_nsproxy.clone(),
+            &mut None,
             None,
             false,
             &fs_refs,
@@ -511,6 +535,8 @@ mod tests {
         let pcb = test_pcb();
         let old_nsproxy = pcb.nsproxy();
         let old_fs = pcb.fs_struct();
+        // An observation Arc is not a second task. Model a real shared slot.
+        let _shared_user = crate::filesystem::fs::FsAttachment::new(old_fs.clone());
         let old_cred = pcb.cred();
         let old_group = pcb.ensure_sem_undo_group(&old_nsproxy.ipc_ns).unwrap();
 
@@ -525,12 +551,18 @@ mod tests {
         let result = PreparedNamespaceInstall::prepare_for_setns(
             &pcb,
             Arc::new(target),
+            &mut None,
             Some(prepared_cred),
             true,
             &fs_refs,
         );
 
-        assert_eq!(result.err(), Some(SystemError::EINVAL));
+        assert!(matches!(
+            result,
+            Err(crate::mm::allocation::MemoryAllocationError::System(
+                SystemError::EINVAL
+            ))
+        ));
         assert!(Arc::ptr_eq(&pcb.nsproxy(), &old_nsproxy));
         assert!(Arc::ptr_eq(&pcb.fs_struct(), &old_fs));
         assert!(Arc::ptr_eq(&pcb.cred(), &old_cred));
@@ -553,12 +585,18 @@ mod tests {
         let result = PreparedNamespaceInstall::prepare_for_setns(
             &pcb,
             old_nsproxy.clone(),
+            &mut None,
             Some(prepared_cred),
             true,
             &fs_refs,
         );
 
-        assert_eq!(result.err(), Some(SystemError::ENOMEM));
+        assert!(matches!(
+            result,
+            Err(crate::mm::allocation::MemoryAllocationError::System(
+                SystemError::ENOMEM
+            ))
+        ));
         assert!(Arc::ptr_eq(&pcb.nsproxy(), &old_nsproxy));
         assert!(Arc::ptr_eq(&pcb.fs_struct(), &old_fs));
         assert!(Arc::ptr_eq(&pcb.cred(), &old_cred));
@@ -577,6 +615,7 @@ mod tests {
         let prepared = PreparedNamespaceInstall::prepare_for_setns(
             &pcb,
             old_nsproxy,
+            &mut None,
             Some(prepared_cred),
             true,
             &fs_refs,

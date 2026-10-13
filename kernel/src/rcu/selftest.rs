@@ -1666,7 +1666,31 @@ fn run_pr2_selftest() -> Result<(), &'static str> {
         return Err("RcuArcSlot::with_read replacement snapshot was not dropped after slot drop");
     }
 
-    let sighand = SigHand::new();
+    let sighand_root = crate::cgroup::memory::MemoryAccount::new(0x776611, None)
+        .map_err(|_| "failed to prepare sighand root account")?;
+    let sighand_account = crate::cgroup::memory::MemoryAccount::new(0x776612, Some(sighand_root))
+        .map_err(|_| "failed to prepare sighand memory account")?;
+    let sighand_creator = crate::cgroup::memory::object::ObjectAccount::new(&sighand_account)
+        .map_err(|_| "failed to prepare sighand object account")?;
+    sighand_account.set_policy(crate::cgroup::memory::MemoryPolicy {
+        max: Some(0),
+        ..Default::default()
+    });
+    if !matches!(
+        SigHand::try_new_for(&sighand_creator),
+        Err(crate::mm::allocation::MemoryAllocationError::Charge(_))
+    ) || sighand_account.current_pages() != 0
+        || sighand_account
+            .snapshot()
+            .kernel_bytes
+            .iter()
+            .any(|bytes| *bytes != 0)
+    {
+        return Err("sighand quota rejection changed its unpublished account");
+    }
+    sighand_account.set_policy(Default::default());
+    let sighand = SigHand::try_new_for(&sighand_creator)
+        .map_err(|_| "failed to prepare accounted sighand")?;
     if sighand.is_shared() {
         return Err("fresh sighand unexpectedly reported shared");
     }
@@ -1696,6 +1720,42 @@ fn run_pr2_selftest() -> Result<(), &'static str> {
     if sighand.load_count() != 0 {
         return Err("sighand task reference count did not return to zero");
     }
+
+    let body_bytes: u64 = sighand_account.snapshot().kernel_bytes.iter().sum();
+    if body_bytes == 0 {
+        return Err("sighand body has no actual kernel charge");
+    }
+    let old_weak = Arc::downgrade(&sighand);
+    let sighand_slot = RcuArcSlot::new(sighand);
+    let replacement = SigHand::try_new_for(&sighand_creator)
+        .map_err(|_| "failed to prepare replacement sighand")?;
+    let survived_reader = sighand_slot.with_read(|old| {
+        sighand_slot.store_deferred(replacement);
+        old.load_count() == 0
+            && old_weak.upgrade().is_some()
+            && sighand_account.snapshot().kernel_bytes.iter().sum::<u64>() == body_bytes * 2
+    });
+    if !survived_reader {
+        return Err("retired sighand body did not survive its RCU reader");
+    }
+    rcu_barrier();
+    if old_weak.upgrade().is_some()
+        || sighand_account.snapshot().kernel_bytes.iter().sum::<u64>() != body_bytes
+    {
+        return Err("retired sighand body was not refunded after its grace period");
+    }
+    drop(sighand_slot);
+    rcu_barrier();
+    if sighand_account.current_pages() != 0
+        || sighand_account
+            .snapshot()
+            .kernel_bytes
+            .iter()
+            .any(|bytes| *bytes != 0)
+    {
+        return Err("last sighand body was not refunded with its Weak header alive");
+    }
+    drop(old_weak);
 
     Ok(())
 }

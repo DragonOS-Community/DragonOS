@@ -45,22 +45,12 @@ impl UdpSocket {
             PSO::SNDBUF => {
                 let requested = byte_parser::read_u32(val)?;
                 let size = clamp_udp_buf(requested, SYSCTL_WMEM_MAX, SOCK_MIN_SNDBUF);
-                self.send_buf_size.store(size, Ordering::Release);
-                self.send_account.set_limit(size.saturating_mul(2));
-
-                // If socket is already bound, we need to recreate it with new buffer size
-                self.recreate_socket_if_bound()?;
-                Ok(())
+                self.resize_buffer(false, size)
             }
             PSO::RCVBUF => {
                 let requested = byte_parser::read_u32(val)?;
                 let size = clamp_udp_buf(requested, SYSCTL_RMEM_MAX, SOCK_MIN_RCVBUF);
-                self.recv_buf_size.store(size, Ordering::Release);
-                self.receive_queue.set_capacity(size.saturating_mul(2));
-                if self.ip_version == smoltcp::wire::IpVersion::Ipv6 {
-                    self.recreate_socket_if_bound()?;
-                }
-                Ok(())
+                self.resize_buffer(true, size)
             }
             PSO::RCVLOWAT => {
                 let mut v = byte_parser::read_i32(val)?;
@@ -91,10 +81,7 @@ impl UdpSocket {
                 }
                 let requested = byte_parser::read_i32(val)?;
                 let size = clamp_udp_buf_force(requested, SOCK_MIN_SNDBUF);
-                self.send_buf_size.store(size, Ordering::Release);
-                self.send_account.set_limit(size.saturating_mul(2));
-                self.recreate_socket_if_bound()?;
-                Ok(())
+                self.resize_buffer(false, size)
             }
             PSO::RCVBUFFORCE => {
                 let cred = ProcessManager::current_pcb().cred();
@@ -103,12 +90,7 @@ impl UdpSocket {
                 }
                 let requested = byte_parser::read_i32(val)?;
                 let size = clamp_udp_buf_force(requested, SOCK_MIN_RCVBUF);
-                self.recv_buf_size.store(size, Ordering::Release);
-                self.receive_queue.set_capacity(size.saturating_mul(2));
-                if self.ip_version == smoltcp::wire::IpVersion::Ipv6 {
-                    self.recreate_socket_if_bound()?;
-                }
-                Ok(())
+                self.resize_buffer(true, size)
             }
             PSO::REUSEADDR => {
                 if val.len() < core::mem::size_of::<i32>() {
@@ -118,10 +100,7 @@ impl UdpSocket {
                 self.so_reuseaddr.store(v != 0, Ordering::Relaxed);
                 Ok(())
             }
-            PSO::BINDTODEVICE => {
-                let mut update = self.device_binding.prepare_update(&self.netns, val)?;
-                self.apply_device_binding(&mut update)
-            }
+            PSO::BINDTODEVICE => self.set_device_binding(val),
             PSO::BROADCAST => {
                 if val.len() < core::mem::size_of::<i32>() {
                     return Err(SystemError::EINVAL);

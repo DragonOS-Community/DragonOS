@@ -35,7 +35,9 @@ struct OverlayFsconfigPaths {
     lowers: Option<Vec<Arc<ResolvedPath>>>,
 }
 
-fn resolve_fsconfig_layer(name: &str) -> Result<Arc<ResolvedPath>, SystemError> {
+fn resolve_fsconfig_layer(
+    name: &str,
+) -> Result<Arc<ResolvedPath>, crate::mm::allocation::MemoryAllocationError> {
     let pcb = ProcessManager::current_pcb();
     let (start, rest) = user_resolved_path_at(&pcb, AtFlags::AT_FDCWD.bits(), name)?;
     let path = start.inode().lookup_follow_symlink_owned(
@@ -45,9 +47,9 @@ fn resolve_fsconfig_layer(name: &str) -> Result<Arc<ResolvedPath>, SystemError> 
         true,
     )?;
     if path.inode().metadata()?.file_type != FileType::Dir {
-        return Err(SystemError::EINVAL);
+        return Err(SystemError::EINVAL.into());
     }
-    Arc::try_new(path).map_err(|_| SystemError::ENOMEM)
+    Arc::try_new(path).map_err(|_| SystemError::ENOMEM.into())
 }
 
 fn validate_workdir(inode: &Arc<dyn IndexNode>) -> Result<(), SystemError> {
@@ -961,7 +963,7 @@ impl MountableFileSystem for OverlayFS {
         value: &str,
         previous: Option<&FsconfigPreparedData>,
         _owner: &crate::process::namespace::user_namespace::UserNamespace,
-    ) -> Result<Option<FsconfigPreparedData>, SystemError> {
+    ) -> Result<Option<FsconfigPreparedData>, crate::mm::allocation::MemoryAllocationError> {
         let mut paths = match previous {
             Some(previous) => previous
                 .downcast_ref::<OverlayFsconfigPaths>()
@@ -987,7 +989,7 @@ impl MountableFileSystem for OverlayFS {
                 }
                 paths.lowers = Some(lowers);
             }
-            _ => return Err(SystemError::EINVAL),
+            _ => return Err(SystemError::EINVAL.into()),
         }
         Ok(Some(Arc::try_new(paths).map_err(|_| SystemError::ENOMEM)?))
     }
@@ -1203,7 +1205,10 @@ impl MountableFileSystem for OverlayFS {
     fn make_mount_data(
         raw_data: Option<&str>,
         _source: &str,
-    ) -> Result<Option<Arc<dyn FileSystemMakerData + 'static>>, SystemError> {
+    ) -> Result<
+        Option<Arc<dyn FileSystemMakerData + 'static>>,
+        crate::mm::allocation::MemoryAllocationError,
+    > {
         let mount_data = OverlayMountData::from_raw(raw_data).map_err(|e| {
             log::error!("Failed to create overlay mount data: {:?}", e);
             e

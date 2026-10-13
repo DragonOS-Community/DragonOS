@@ -48,8 +48,9 @@ impl Syscall for SysTruncateHandle {
         )?;
 
         // 跟随符号链接解析最终目标 inode
-        let target: Arc<dyn IndexNode> = begin_inode
-            .lookup_follow_symlink(remain_path.as_str(), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
+        let target: Arc<dyn IndexNode> = crate::filesystem::vfs::file::File::recover_io(|| {
+            begin_inode.lookup_follow_symlink(remain_path.as_str(), VFS_MAX_FOLLOW_SYMLINK_TIMES)
+        })?;
 
         let md = target.metadata()?;
         crate::filesystem::vfs::permission::check_inode_permission(
@@ -68,7 +69,10 @@ impl Syscall for SysTruncateHandle {
             }
         }
 
-        vfs_truncate(target, length)?;
+        let mut recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::default();
+        while let Err(error) = vfs_truncate(target.clone(), length) {
+            error.recover(&mut recovery)?;
+        }
         Ok(0)
     }
 

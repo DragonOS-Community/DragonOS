@@ -49,7 +49,7 @@ driver_base_macros = { "path" = "crates/driver_base_macros" }
 elf = { version = "=0.7.2", default-features = false }
 fdt = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/fdt", rev = "9862813020" }
 # 一个no_std的hashmap、hashset
-hashbrown = "=0.13.2"
+hashbrown = { version = "=0.13.2", features = ["raw"] }
 ida = { path = "crates/ida" }
 jhash = { path = "crates/rust-jhash" }
 intertrait = { path = "crates/intertrait" }
@@ -62,7 +62,7 @@ linkme = "=0.3.27"
 num = { version = "=0.4.0", default-features = false }
 num-derive = "=0.3"
 num-traits = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/num-traits.git", rev = "1597c1c", default-features = false }
-smoltcp = { version = "=0.12.0", git = "https://github.com/DragonOS-Community/smoltcp.git", rev = "d3f1aa2e6975729598221639b991fbd996dcc8f8", default-features = false, features = [
+smoltcp = { version = "=0.12.0", git = "https://github.com/DragonOS-Community/smoltcp.git", rev = "bf8c91e3112dce8b698f0c66a0597b798228a0d5", default-features = false, features = [
     "alloc",
     "medium-ethernet",
     "socket-raw",

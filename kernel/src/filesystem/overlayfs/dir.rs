@@ -9,7 +9,7 @@ pub(super) fn mkdir(
     inode: &OvlInode,
     name: &str,
     mode: vfs::InodeMode,
-) -> Result<Arc<dyn IndexNode>, system_error::SystemError> {
+) -> Result<Arc<dyn IndexNode>, crate::mm::allocation::MemoryAllocationError> {
     let state = inode.dir_state()?;
     let _mutation_guard = state.mutation_lock.lock();
     let result = create_over_whiteout(
@@ -24,7 +24,10 @@ pub(super) fn mkdir(
     result
 }
 
-pub(super) fn rmdir(inode: &OvlInode, name: &str) -> Result<(), SystemError> {
+pub(super) fn rmdir(
+    inode: &OvlInode,
+    name: &str,
+) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
     remove(inode, name, true, None).map(|_| ())
 }
 
@@ -32,11 +35,14 @@ pub(super) fn rmdir_with_context(
     inode: &OvlInode,
     name: &str,
     context: &DentryMutationContext<'_>,
-) -> Result<(), SystemError> {
+) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
     remove(inode, name, true, Some(context)).map(|_| ())
 }
 
-pub(super) fn unlink(inode: &OvlInode, name: &str) -> Result<vfs::LinkRemovalOutcome, SystemError> {
+pub(super) fn unlink(
+    inode: &OvlInode,
+    name: &str,
+) -> Result<vfs::LinkRemovalOutcome, crate::mm::allocation::MemoryAllocationError> {
     remove(inode, name, false, None)
 }
 
@@ -44,7 +50,7 @@ pub(super) fn unlink_with_context(
     inode: &OvlInode,
     name: &str,
     context: &DentryMutationContext<'_>,
-) -> Result<vfs::LinkRemovalOutcome, SystemError> {
+) -> Result<vfs::LinkRemovalOutcome, crate::mm::allocation::MemoryAllocationError> {
     remove(inode, name, false, Some(context))
 }
 
@@ -53,7 +59,7 @@ fn remove(
     name: &str,
     is_dir: bool,
     context: Option<&DentryMutationContext<'_>>,
-) -> Result<vfs::LinkRemovalOutcome, SystemError> {
+) -> Result<vfs::LinkRemovalOutcome, crate::mm::allocation::MemoryAllocationError> {
     let fs = inode.overlay_fs()?;
     fs.require_upper()?;
     // rmdir keeps the mount-wide commit lock because it nests a child directory
@@ -64,10 +70,10 @@ fn remove(
 
     let child = inode.lookup_overlay_child_locked(name, &state)?;
     if is_dir && !child.is_dir() {
-        return Err(SystemError::ENOTDIR);
+        return Err(SystemError::ENOTDIR.into());
     }
     if !is_dir && child.is_dir() {
-        return Err(SystemError::EISDIR);
+        return Err(SystemError::EISDIR.into());
     }
     let child_link_state = if is_dir {
         None
@@ -79,7 +85,7 @@ fn remove(
         .map(|state| child.begin_link_mutation(state))
         .transpose()?;
     if child_link_mutation.as_deref() == Some(&0) {
-        return Err(SystemError::EIO);
+        return Err(SystemError::EIO.into());
     }
 
     // Serialize the emptiness check and namespace commit with mutations made
@@ -93,7 +99,7 @@ fn remove(
         && (lower_positive || child.has_lower())
         && !is_dir_empty_locked(&child, child_state.as_ref().ok_or(SystemError::EIO)?)?
     {
-        return Err(SystemError::ENOTEMPTY);
+        return Err(SystemError::ENOTEMPTY.into());
     }
 
     let upper_dir = inode.upper_inode.lock().clone();
@@ -111,14 +117,14 @@ fn remove(
                 inode.create_whiteout_locked(name, context)?;
                 None
             }
-            Err(SystemError::ENOENT) => return Err(SystemError::ENOENT),
-            Err(err) => return Err(err),
+            Err(SystemError::ENOENT) => return Err(SystemError::ENOENT.into()),
+            Err(err) => return Err(err.into()),
         }
     } else if lower_positive {
         inode.create_whiteout_locked(name, context)?;
         None
     } else {
-        return Err(SystemError::ENOENT);
+        return Err(SystemError::ENOENT.into());
     };
     state.modified(&[name]);
     if is_dir {
@@ -133,7 +139,7 @@ fn remove(
         mutation.commit();
         Ok(outcome)
     } else {
-        backing_outcome.ok_or(SystemError::EIO)
+        backing_outcome.ok_or(SystemError::EIO.into())
     }
 }
 
@@ -141,7 +147,7 @@ fn unlink_backing(
     inode: &Arc<dyn IndexNode>,
     name: &str,
     context: Option<&DentryMutationContext<'_>>,
-) -> Result<vfs::LinkRemovalOutcome, SystemError> {
+) -> Result<vfs::LinkRemovalOutcome, crate::mm::allocation::MemoryAllocationError> {
     match context {
         Some(context) => inode.unlink_with_context(name, context),
         None => inode.unlink(name),
@@ -152,7 +158,7 @@ fn rmdir_backing(
     inode: &Arc<dyn IndexNode>,
     name: &str,
     context: Option<&DentryMutationContext<'_>>,
-) -> Result<(), SystemError> {
+) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
     match context {
         Some(context) => inode.rmdir_with_context(name, context),
         None => inode.rmdir(name),
@@ -163,26 +169,26 @@ pub(super) fn link(
     inode: &OvlInode,
     name: &str,
     other: &Arc<dyn IndexNode>,
-) -> Result<(), system_error::SystemError> {
+) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
     let fs = inode.overlay_fs()?;
     fs.require_upper()?;
     let state = inode.dir_state()?;
     let _mutation_guard = state.mutation_lock.lock();
 
     match super::lookup::find_locked(inode, name, &state) {
-        Ok(_) => return Err(SystemError::EEXIST),
+        Ok(_) => return Err(SystemError::EEXIST.into()),
         Err(SystemError::ENOENT) => {}
-        Err(err) => return Err(err),
+        Err(err) => return Err(err.into()),
     }
 
     let source = OvlInode::downcast_overlay_inode(other.clone())?;
     let source_fs = source.overlay_fs()?;
     if !Arc::ptr_eq(&fs, &source_fs) {
-        return Err(SystemError::EXDEV);
+        return Err(SystemError::EXDEV.into());
     }
     let source_link_state = source.logical_link_state()?;
     if source.has_lower_link_origin() && source_link_state.is_none() {
-        return Err(SystemError::EIO);
+        return Err(SystemError::EIO.into());
     }
     let source_link_mutation = source_link_state
         .as_ref()
@@ -192,7 +198,7 @@ pub(super) fn link(
         .as_deref()
         .is_some_and(|nlinks| *nlinks == usize::MAX)
     {
-        return Err(SystemError::EMLINK);
+        return Err(SystemError::EMLINK.into());
     }
 
     source.copy_up_locked()?;
@@ -226,7 +232,7 @@ pub(super) fn create(
     name: &str,
     file_type: vfs::FileType,
     mode: vfs::InodeMode,
-) -> Result<Arc<dyn IndexNode>, system_error::SystemError> {
+) -> Result<Arc<dyn IndexNode>, crate::mm::allocation::MemoryAllocationError> {
     let state = inode.dir_state()?;
     let _mutation_guard = state.mutation_lock.lock();
     let result = create_over_whiteout(
@@ -245,7 +251,7 @@ pub(super) fn symlink(
     inode: &OvlInode,
     name: &str,
     target: &str,
-) -> Result<Arc<dyn IndexNode>, SystemError> {
+) -> Result<Arc<dyn IndexNode>, crate::mm::allocation::MemoryAllocationError> {
     let state = inode.dir_state()?;
     let _mutation_guard = state.mutation_lock.lock();
     create_over_whiteout(
@@ -257,7 +263,7 @@ pub(super) fn symlink(
     state.modified(&[name]);
     // The backing inode returned by create_over_whiteout may still be associated
     // with the workdir. The VFS must receive an overlay inode for this name.
-    super::lookup::find_locked(inode, name, &state)
+    super::lookup::find_locked(inode, name, &state).map_err(Into::into)
 }
 
 pub(super) fn mknod(
@@ -265,11 +271,11 @@ pub(super) fn mknod(
     filename: &str,
     mode: vfs::InodeMode,
     dev_t: DeviceNumber,
-) -> Result<Arc<dyn IndexNode>, system_error::SystemError> {
+) -> Result<Arc<dyn IndexNode>, crate::mm::allocation::MemoryAllocationError> {
     let state = inode.dir_state()?;
     let _mutation_guard = state.mutation_lock.lock();
     if FileType::from(mode) == FileType::CharDevice && dev_t == WHITEOUT_DEV {
-        return Err(SystemError::EPERM);
+        return Err(SystemError::EPERM.into());
     }
 
     let result = create_over_whiteout(
@@ -295,19 +301,22 @@ fn create_over_whiteout<F>(
     name: &str,
     create_temp: F,
     is_dir: bool,
-) -> Result<Arc<dyn IndexNode>, SystemError>
+) -> Result<Arc<dyn IndexNode>, crate::mm::allocation::MemoryAllocationError>
 where
-    F: Fn(&Arc<dyn IndexNode>, &str) -> Result<Arc<dyn IndexNode>, SystemError>,
+    F: Fn(
+        &Arc<dyn IndexNode>,
+        &str,
+    ) -> Result<Arc<dyn IndexNode>, crate::mm::allocation::MemoryAllocationError>,
 {
     let upper_inode = inode.writable_upper_inode_locked()?;
     match super::lookup::lookup_backing(&upper_inode, name) {
         Ok(found) => {
             if !OvlInode::is_whiteout_inode_checked(&found)? {
-                return Err(SystemError::EEXIST);
+                return Err(SystemError::EEXIST.into());
             }
         }
         Err(SystemError::ENOENT) => return create_temp(&upper_inode, name),
-        Err(err) => return Err(err),
+        Err(err) => return Err(err.into()),
     }
 
     let (workdir, _temp_inode, temp_name) = inode.create_workdir_temp(create_temp)?;
@@ -344,7 +353,7 @@ where
         }
     }
 
-    super::lookup::lookup_backing(&upper_inode, name)
+    super::lookup::lookup_backing(&upper_inode, name).map_err(Into::into)
 }
 
 fn is_dot_entry(name: &str) -> bool {

@@ -121,10 +121,10 @@ impl Init {
         endpoint_to_bind: UnixEndpoint,
         netns: &Arc<NetNamespace>,
         socket_type: UnixSocketType,
-    ) -> Result<(), SystemError> {
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         if self.addr.is_some() {
             log::error!("the socket is already bound");
-            return endpoint_to_bind.bind_unnamed();
+            return endpoint_to_bind.bind_unnamed().map_err(Into::into);
         }
 
         let bound_addr = endpoint_to_bind.bind_in(netns, socket_type)?;
@@ -249,9 +249,9 @@ impl Connected {
         addr_to_bind: UnixEndpoint,
         netns: &Arc<NetNamespace>,
         socket_type: UnixSocketType,
-    ) -> Result<(), SystemError> {
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         if self.addr.is_some() {
-            return addr_to_bind.bind_unnamed();
+            return addr_to_bind.bind_unnamed().map_err(Into::into);
         }
 
         let bound_addr = addr_to_bind.bind_in(netns, socket_type)?;

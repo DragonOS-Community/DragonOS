@@ -15,12 +15,13 @@ use alloc::{
 };
 use defer::defer;
 use hashbrown::HashSet;
-use ida::IdAllocator;
 use log::{error, warn};
 use system_error::SystemError;
 
+use crate::mm::allocation::MemoryAllocationError;
 use crate::{
     arch::{mm::PageMapper, CurrentIrqArch, MMArch},
+    cgroup::memory::object::ObjectAccount,
     exception::InterruptArch,
     filesystem::{
         page_cache::UnmapMappingMode,
@@ -40,7 +41,7 @@ use crate::{
     },
     mm::{
         mmu_gather::MmuGather,
-        page::{page_manager_lock, page_reclaimer_lock, PageManager},
+        page::{page_manager_lock, PageManager},
         PhysAddr,
     },
     process::{
@@ -87,8 +88,7 @@ pub fn check_mmap_min_addr(vaddr: VirtAddr, min_vaddr: VirtAddr) -> Result<(), S
 }
 
 /// ID allocator for LockedVMA
-static LOCKEDVMA_ID_ALLOCATOR: SpinLock<IdAllocator> =
-    SpinLock::new(IdAllocator::new(0, usize::MAX).unwrap());
+static LOCKEDVMA_ID_ALLOCATOR: AtomicUsize = AtomicUsize::new(1);
 
 /// Monotonic identity for one logical mapping incarnation.
 ///
@@ -111,6 +111,7 @@ mod mappings;
 mod mmap;
 mod mremap;
 mod notifications;
+pub(crate) mod oom_reap;
 mod stack;
 #[cfg(target_arch = "x86_64")]
 pub(crate) mod uprobe;
@@ -140,4 +141,4 @@ pub use uprobe::{
     UprobeTaskScope, XolPool, XolSlotLease,
 };
 #[allow(unused_imports)]
-pub use vma::{LockedVMA, PhysmapParams, PresentPfn, Provider, VMASplitResult, VMA};
+pub use vma::{LockedVMA, PresentPfn, Provider, VMASplitResult, VMA};

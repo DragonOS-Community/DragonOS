@@ -111,42 +111,61 @@ pub(super) fn resolve_mount_path(
     if no_automount {
         let mut options = PathWalkOptions::new(OpenHowResolve::empty(), None);
         options.no_automount = true;
-        return start.inode().lookup_follow_symlink_with_options_owned(
+        return crate::filesystem::vfs::file::File::recover_io(|| {
+            start.inode().lookup_follow_symlink_with_options_owned(
+                &start,
+                &rest,
+                VFS_MAX_FOLLOW_SYMLINK_TIMES,
+                follow_final,
+                &options,
+            )
+        });
+    }
+    crate::filesystem::vfs::file::File::recover_io(|| {
+        start.inode().lookup_follow_symlink_owned(
             &start,
             &rest,
             VFS_MAX_FOLLOW_SYMLINK_TIMES,
             follow_final,
-            &options,
-        );
-    }
-    start.inode().lookup_follow_symlink_owned(
-        &start,
-        &rest,
-        VFS_MAX_FOLLOW_SYMLINK_TIMES,
-        follow_final,
-    )
+        )
+    })
 }
 
 fn install_tree_fd(tree: Arc<DetachedMountTree>, cloexec: bool) -> Result<usize, SystemError> {
+    let storage = crate::filesystem::vfs::file::PreparedFile::new_recovering()?;
     let inode: Arc<dyn IndexNode> = tree.root_inode();
-    let file = File::new_with_private_data(
+    let file = File::new_with_private_data_prepared_recovering(
         inode,
         FileFlags::O_PATH,
         FilePrivateData::DetachedMount(tree),
+        storage,
     )?;
     let current = ProcessManager::current_pcb();
-    let fd = current
-        .fd_table()
-        .alloc_fd(file, cloexec, current.nofile_soft_limit())?;
+    let file = Arc::try_new(file).map_err(|_| SystemError::ENOMEM)?;
+    let fd = File::recover_io(|| {
+        current.fd_table().alloc_fd_arc(
+            file.clone(),
+            cloexec,
+            current.nofile_soft_limit(),
+            &crate::cgroup::memory::object_for_task(&current),
+        )
+    })?;
     Ok(fd as usize)
 }
 
 fn install_path_fd(path: &ResolvedPath, cloexec: bool) -> Result<usize, SystemError> {
-    let file = File::new(path.inode(), FileFlags::O_PATH)?;
+    let storage = crate::filesystem::vfs::file::PreparedFile::new_recovering()?;
+    let file = File::new_prepared_recovering(path.inode(), FileFlags::O_PATH, storage)?;
     let current = ProcessManager::current_pcb();
-    let fd = current
-        .fd_table()
-        .alloc_fd(file, cloexec, current.nofile_soft_limit())?;
+    let file = Arc::try_new(file).map_err(|_| SystemError::ENOMEM)?;
+    let fd = File::recover_io(|| {
+        current.fd_table().alloc_fd_arc(
+            file.clone(),
+            cloexec,
+            current.nofile_soft_limit(),
+            &crate::cgroup::memory::object_for_task(&current),
+        )
+    })?;
     Ok(fd as usize)
 }
 

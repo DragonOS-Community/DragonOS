@@ -1,7 +1,6 @@
 //! System call handler for pivot_root(2).
 
 use alloc::{sync::Arc, vec::Vec};
-use hashbrown::HashMap;
 use system_error::SystemError;
 
 use crate::{
@@ -47,27 +46,12 @@ impl Syscall for SysPivotRootHandle {
         // published-task snapshot and the exact-reference migration.
         let fs_refs_pivot = lock_fs_refs_pivot();
         let tasks = snapshot_all_processes()?;
-        let mut changed_fs = HashMap::new();
-        changed_fs
-            .try_reserve(tasks.len())
-            .map_err(|_| SystemError::ENOMEM)?;
-        let mut refresh_tasks = Vec::new();
-        refresh_tasks
-            .try_reserve(tasks.len())
-            .map_err(|_| SystemError::ENOMEM)?;
         let topology = targets
             .current_mntns
             .pivot_root(old_root, new_root, put_old)?;
-        repair_fs_refs(
-            &tasks,
-            &targets.current_root,
-            &targets.new_root,
-            &mut changed_fs,
-            &mut refresh_tasks,
-        );
+        repair_fs_refs(&tasks, &targets.current_root, &targets.new_root);
         drop(topology);
         drop(fs_refs_pivot);
-        refresh_cwd_caches(&refresh_tasks);
 
         Ok(0)
     }
@@ -122,24 +106,28 @@ fn resolve_pivot_root_targets(
         crate::filesystem::vfs::fcntl::AtFlags::AT_FDCWD.bits(),
         &new_root_path,
     )?;
-    let new_root = new_root_begin.inode().lookup_follow_symlink_owned(
-        &new_root_begin,
-        &new_root_rest,
-        VFS_MAX_FOLLOW_SYMLINK_TIMES,
-        true,
-    )?;
+    let new_root = crate::filesystem::vfs::file::File::recover_io(|| {
+        new_root_begin.inode().lookup_follow_symlink_owned(
+            &new_root_begin,
+            &new_root_rest,
+            VFS_MAX_FOLLOW_SYMLINK_TIMES,
+            true,
+        )
+    })?;
 
     let (put_old_begin, put_old_rest) = user_resolved_path_at(
         &current_pcb,
         crate::filesystem::vfs::fcntl::AtFlags::AT_FDCWD.bits(),
         &put_old_path,
     )?;
-    let put_old = put_old_begin.inode().lookup_follow_symlink_owned(
-        &put_old_begin,
-        &put_old_rest,
-        VFS_MAX_FOLLOW_SYMLINK_TIMES,
-        true,
-    )?;
+    let put_old = crate::filesystem::vfs::file::File::recover_io(|| {
+        put_old_begin.inode().lookup_follow_symlink_owned(
+            &put_old_begin,
+            &put_old_rest,
+            VFS_MAX_FOLLOW_SYMLINK_TIMES,
+            true,
+        )
+    })?;
     // Match Linux get_fs_root(): one pinned caller-root snapshot is used for
     // every check, topology mutation, and chroot_fs_refs-style replacement.
     let current_root = current_pcb.fs_struct().root_resolved()?;
@@ -179,54 +167,12 @@ fn repair_fs_refs(
     tasks: &[Arc<ProcessControlBlock>],
     old_root: &ResolvedPath,
     new_root: &ResolvedPath,
-    changed_fs: &mut HashMap<usize, Arc<crate::filesystem::fs::FsStruct>>,
-    refresh_tasks: &mut Vec<Arc<ProcessControlBlock>>,
 ) {
     for task in tasks {
         let _slot_update = task.lock_fs_slot_update();
         let Some(fs) = task.try_fs_struct() else {
             continue;
         };
-        let fs_id = Arc::as_ptr(&fs) as usize;
-        if fs.replace_root_pwd(old_root, new_root) {
-            // Retain the owner as well as indexing by address. This prevents
-            // allocator address reuse from turning the grouping key into an
-            // ABA match while another task concurrently replaces its slot.
-            changed_fs.insert(fs_id, fs.clone());
-        }
-        // Every PCB sharing a changed FsStruct owns an independent display
-        // cache, even though only the first exact replacement reports a hit.
-        if changed_fs.contains_key(&fs_id) {
-            refresh_tasks.push(task.clone());
-        }
+        fs.replace_root_pwd(old_root, new_root);
     }
-}
-
-fn refresh_cwd_caches(tasks: &[Arc<ProcessControlBlock>]) {
-    for task in tasks {
-        let Some(fs) = task.try_fs_struct() else {
-            continue;
-        };
-        // basic.cwd is only a display cache. An unlinked cwd can make path
-        // rendering fail after commit; cache refresh must not change success.
-        if let Ok(cwd) = visible_pwd(&fs) {
-            task.basic_mut().set_cwd(cwd);
-        }
-    }
-}
-
-fn visible_pwd(
-    fs: &Arc<crate::filesystem::fs::FsStruct>,
-) -> Result<alloc::string::String, SystemError> {
-    let root = fs.root().absolute_path()?;
-    let pwd = fs.pwd().absolute_path()?;
-    if pwd == root {
-        return Ok("/".into());
-    }
-    if root == "/" {
-        return Ok(pwd);
-    }
-    let prefix = format!("{}/", root.trim_end_matches('/'));
-    let relative = pwd.strip_prefix(&prefix).ok_or(SystemError::ENOENT)?;
-    Ok(format!("/{relative}"))
 }

@@ -128,6 +128,9 @@ impl Syscall {
         });
 
         // Execute the real syscall when seccomp did not intercept it; skip execution when it did.
+        // User-task birth/exec prepares high wait storage, not individual
+        // syscalls: even exit and sigreturn need no new metadata admission.
+        debug_assert!(!frame.is_from_user() || crate::cgroup::memory::high::current_prepared());
         if !seccomp_skipped {
             // First try to obtain the handler from the syscall_table
             if let Some(handler) = syscall_table().get(dispatch_nr) {

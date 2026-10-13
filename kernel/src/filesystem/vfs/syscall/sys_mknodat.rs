@@ -59,16 +59,18 @@ impl Syscall for SysMknodatHandle {
         let (mut current_inode, ret_path) = user_path_at(&pcb, dirfd, &path)?;
         let (name, parent) = rsplit_path(&ret_path);
         if let Some(parent) = parent {
-            current_inode =
-                current_inode.lookup_follow_symlink(parent, VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
+            current_inode = crate::filesystem::vfs::file::File::recover_io(|| {
+                current_inode.lookup_follow_symlink(parent, VFS_MAX_FOLLOW_SYMLINK_TIMES)
+            })?;
         }
         if name.is_empty() && dirfd != AtFlags::AT_FDCWD.bits() {
             return Err(SystemError::ENOENT);
         }
 
-        if current_inode
-            .lookup_follow_symlink(name, VFS_MAX_FOLLOW_SYMLINK_TIMES)
-            .is_ok()
+        if crate::filesystem::vfs::file::File::recover_io(|| {
+            current_inode.lookup_follow_symlink(name, VFS_MAX_FOLLOW_SYMLINK_TIMES)
+        })
+        .is_ok()
         {
             return Err(SystemError::EEXIST);
         }

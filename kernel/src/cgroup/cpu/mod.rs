@@ -25,41 +25,65 @@ pub(crate) fn effective_group(node: &Arc<CgroupNode>) -> Option<Arc<TaskGroup>> 
     None
 }
 
-pub(crate) fn initialize_node_locked(node: &Arc<CgroupNode>) {
-    let Some(parent) = node.parent() else { return };
-    if parent.subtree_control().iter().any(|name| name == "cpu") {
-        node.set_cpu_group(Some(TaskGroup::new(effective_group(&parent))));
+pub(crate) fn initialize_node_locked(node: &Arc<CgroupNode>) -> Result<(), SystemError> {
+    let Some(parent) = node.parent() else {
+        return Ok(());
+    };
+    if parent.subtree_controller_enabled("cpu") {
+        let parent_group = effective_group(&parent);
+        let group = TaskGroup::try_new(parent_group.clone())?;
+        TaskGroup::reserve_parent_children(&parent_group, 1)?;
+        group.publish_parent();
+        node.set_cpu_group(Some(group));
     }
+    Ok(())
+}
+
+pub(crate) struct PreparedCpuControl {
+    enabled: bool,
+    groups: Vec<(Arc<CgroupNode>, Option<Arc<TaskGroup>>)>,
 }
 
 /// Preallocate unpublished css instances before changing the controller mask.
 /// A folded no-op may discard them, but cannot publish partial topology.
-pub(crate) fn prepare_enable_locked(
+pub(crate) fn prepare_control_locked(
     node: &Arc<CgroupNode>,
-) -> Vec<(Arc<CgroupNode>, Arc<TaskGroup>)> {
+    enabled: bool,
+) -> Result<PreparedCpuControl, SystemError> {
     let parent = effective_group(node);
-    node.children()
-        .into_iter()
-        .map(|child| (child, TaskGroup::new(parent.clone())))
-        .collect()
+    let children = node.children_snapshot()?;
+    let mut groups = Vec::new();
+    groups
+        .try_reserve_exact(children.len())
+        .map_err(|_| SystemError::ENOMEM)?;
+    for child in children {
+        let group = if enabled {
+            Some(TaskGroup::try_new(parent.clone())?)
+        } else {
+            child.cpu_group()
+        };
+        groups.push((child, group));
+    }
+    if enabled {
+        TaskGroup::reserve_parent_children(&parent, groups.len())?;
+    }
+    Ok(PreparedCpuControl { enabled, groups })
 }
 
 pub(crate) fn controller_changed_locked(
     node: &Arc<CgroupNode>,
     tasks: &[Arc<ProcessControlBlock>],
-    prepared: Vec<(Arc<CgroupNode>, Arc<TaskGroup>)>,
-    enabled: bool,
+    prepared: PreparedCpuControl,
 ) {
-    let mut retired = Vec::new();
-    if enabled {
-        for (child, group) in prepared {
-            child.set_cpu_group(Some(group));
+    if prepared.enabled {
+        for (child, group) in &prepared.groups {
+            let group = group.as_ref().expect("enabled CPU css was prepared");
+            group.publish_parent();
+            child.set_cpu_group(Some(group.clone()));
         }
     } else {
-        for child in node.children() {
-            if let Some(group) = child.cpu_group() {
-                retired.push(group);
-            }
+        // The prepared vector pins every old css through detach and retire.
+        for (child, _) in &prepared.groups {
             child.set_cpu_group(None);
         }
     }
@@ -69,8 +93,12 @@ pub(crate) fn controller_changed_locked(
             attach_locked(task);
         }
     }
-    for group in retired {
-        group.retire();
+    if !prepared.enabled {
+        for (_, group) in &prepared.groups {
+            if let Some(group) = group {
+                group.retire();
+            }
+        }
     }
 }
 

@@ -69,6 +69,17 @@ pub struct Waiter {
 /// 可跨 CPU/线程共享的唤醒器
 #[derive(Debug)]
 pub struct Waker {
+    body: WakerStorage,
+}
+#[derive(Debug)]
+enum WakerStorage {
+    // Keep ordinary waiters' original single-Arc allocation. The accounted
+    // identity shell has enum padding, not another copy of these fields.
+    Bootstrap(WakerData),
+    Accounted(crate::cgroup::memory::owned::OwnedBox<WakerData>),
+}
+#[derive(Debug)]
+struct WakerData {
     state: AtomicU8,
     tag: usize,
     target: Weak<ProcessControlBlock>,
@@ -88,35 +99,40 @@ impl WaitQueue {
         if guard.dead {
             return Err(SystemError::ECHILD);
         }
-        if waker.tag != DEFAULT_WAIT_TAG
+        if waker.data().tag != DEFAULT_WAIT_TAG
             && guard
                 .waiters
-                .get(&waker.tag)
+                .get(&waker.data().tag)
                 .is_some_and(VecDeque::is_empty)
         {
             guard.empty_tag_count -= 1;
         }
-        guard.waiters.entry(waker.tag).or_default().push_back(waker);
+        guard
+            .waiters
+            .entry(waker.data().tag)
+            .or_default()
+            .push_back(waker);
         self.num_waiters.fetch_add(1, Ordering::Release);
         Ok(())
     }
 
     pub fn remove_waker(&self, target: &Arc<Waker>) {
         let mut guard = self.inner.lock_irqsave();
-        let (removed, became_empty) = if let Some(waiters) = guard.waiters.get_mut(&target.tag) {
-            let before = waiters.len();
-            waiters.retain(|w| !Arc::ptr_eq(w, target));
-            let removed = before - waiters.len();
-            (removed, removed > 0 && waiters.is_empty())
-        } else {
-            (0, false)
-        };
+        let (removed, became_empty) =
+            if let Some(waiters) = guard.waiters.get_mut(&target.data().tag) {
+                let before = waiters.len();
+                waiters.retain(|w| !Arc::ptr_eq(w, target));
+                let removed = before - waiters.len();
+                (removed, removed > 0 && waiters.is_empty())
+            } else {
+                (0, false)
+            };
         if removed > 0 {
             self.num_waiters
                 .fetch_sub(removed as u32, Ordering::Release);
         }
         let evicted = became_empty
-            .then(|| guard.cache_or_evict_empty_tag(target.tag))
+            .then(|| guard.cache_or_evict_empty_tag(target.data().tag))
             .flatten();
         drop(guard);
         drop(evicted);
@@ -844,15 +860,56 @@ impl InnerWaitQueue {
 }
 
 impl Waiter {
+    /// Prepare a waiter for allocation-constrained recovery paths. Queue
+    /// registration, if needed, is a separate operation owned by the caller.
+    pub(crate) fn try_new_pair() -> Result<(Self, Arc<Waker>), SystemError> {
+        let waker = Waker::try_new_current()?;
+        Ok((
+            Self {
+                waker: waker.clone(),
+                _nosend: PhantomData,
+            },
+            waker,
+        ))
+    }
+
+    /// CPU-clock wait metadata: prepare before queue/rq/resource guards.
+    pub(crate) fn try_new_pair_for(
+        creator: &Arc<crate::cgroup::memory::object::ObjectAccount>,
+    ) -> Result<(Self, Arc<Waker>), crate::mm::allocation::MemoryAllocationError> {
+        use crate::cgroup::memory::{accounting::KernelByteKind, owned::OwnedBox};
+        let task = ProcessManager::current_pcb();
+        let body = OwnedBox::prepare(creator, KernelByteKind::SlabUnreclaimable)?
+            .try_init(WakerData {
+                state: AtomicU8::new(Waker::STATE_IDLE),
+                tag: DEFAULT_WAIT_TAG,
+                target: Arc::downgrade(&task),
+            })
+            .map_err(|_| SystemError::ENOMEM)?;
+        let waker = Arc::try_new(Waker {
+            body: WakerStorage::Accounted(body),
+        })
+        .map_err(|_| SystemError::ENOMEM)?;
+        Ok((
+            Self {
+                waker: waker.clone(),
+                _nosend: PhantomData,
+            },
+            waker,
+        ))
+    }
+
     pub fn new_pair() -> (Self, Arc<Waker>) {
         Self::new_pair_tagged(DEFAULT_WAIT_TAG)
     }
 
     fn new_pair_tagged(tag: usize) -> (Self, Arc<Waker>) {
         let waker = Arc::new(Waker {
-            state: AtomicU8::new(Waker::STATE_IDLE),
-            tag,
-            target: Arc::downgrade(&ProcessManager::current_pcb()),
+            body: WakerStorage::Bootstrap(WakerData {
+                state: AtomicU8::new(Waker::STATE_IDLE),
+                tag,
+                target: Arc::downgrade(&ProcessManager::current_pcb()),
+            }),
         });
         let waiter = Waiter {
             waker: waker.clone(),
@@ -885,6 +942,39 @@ impl Drop for Waiter {
 }
 
 impl Waker {
+    fn data(&self) -> &WakerData {
+        match &self.body {
+            WakerStorage::Bootstrap(data) => data,
+            WakerStorage::Accounted(data) => data,
+        }
+    }
+    pub(crate) fn try_new_current() -> Result<Arc<Self>, SystemError> {
+        Self::try_new_for(&ProcessManager::current_pcb())
+    }
+
+    /// Bind prepared storage to an unpublished task without retaining it.
+    pub(crate) fn try_new_for(task: &Arc<ProcessControlBlock>) -> Result<Arc<Self>, SystemError> {
+        Arc::try_new(Self {
+            body: WakerStorage::Bootstrap(WakerData {
+                state: AtomicU8::new(Self::STATE_IDLE),
+                tag: DEFAULT_WAIT_TAG,
+                target: Arc::downgrade(task),
+            }),
+        })
+        .map_err(|_| SystemError::ENOMEM)
+    }
+
+    /// Reusable task-bound waiting without moving the !Send Waiter into a PCB.
+    /// A different logical task cannot borrow this waker to block itself.
+    pub(crate) fn wait_current_killable(&self) -> Result<(), SystemError> {
+        let current = ProcessManager::current_pcb();
+        if self.data().target.as_ptr() != Arc::as_ptr(&current) {
+            return Err(SystemError::EINVAL);
+        }
+        drop(current);
+        block_current_waker_killable(self)
+    }
+
     const STATE_IDLE: u8 = 0;
     const STATE_SLEEPING: u8 = 1;
     const STATE_NOTIFIED: u8 = 2;
@@ -892,11 +982,12 @@ impl Waker {
 
     pub fn wake(&self) -> bool {
         loop {
-            let state = self.state.load(Ordering::Acquire);
+            let state = self.data().state.load(Ordering::Acquire);
             match state {
                 Self::STATE_CLOSED | Self::STATE_NOTIFIED => return false,
                 Self::STATE_IDLE => {
                     if self
+                        .data()
                         .state
                         .compare_exchange(
                             Self::STATE_IDLE,
@@ -906,7 +997,7 @@ impl Waker {
                         )
                         .is_ok()
                     {
-                        if let Some(pcb) = self.target.upgrade() {
+                        if let Some(pcb) = self.data().target.upgrade() {
                             let _ = ProcessManager::wakeup(&pcb);
                         }
                         return true;
@@ -914,6 +1005,7 @@ impl Waker {
                 }
                 Self::STATE_SLEEPING => {
                     if self
+                        .data()
                         .state
                         .compare_exchange(
                             Self::STATE_SLEEPING,
@@ -923,7 +1015,7 @@ impl Waker {
                         )
                         .is_ok()
                     {
-                        if let Some(pcb) = self.target.upgrade() {
+                        if let Some(pcb) = self.data().target.upgrade() {
                             let _ = ProcessManager::wakeup(&pcb);
                         }
                         return true;
@@ -936,20 +1028,23 @@ impl Waker {
 
     #[inline]
     pub fn close(&self) {
-        self.state.store(Self::STATE_CLOSED, Ordering::Release);
+        self.data()
+            .state
+            .store(Self::STATE_CLOSED, Ordering::Release);
     }
 
     #[inline]
     pub fn is_closed(&self) -> bool {
-        self.state.load(Ordering::Acquire) == Self::STATE_CLOSED
+        self.data().state.load(Ordering::Acquire) == Self::STATE_CLOSED
     }
 
     fn consume_notification(&self) -> bool {
         loop {
-            let state = self.state.load(Ordering::Acquire);
+            let state = self.data().state.load(Ordering::Acquire);
             match state {
                 Self::STATE_NOTIFIED => {
                     if self
+                        .data()
                         .state
                         .compare_exchange(
                             Self::STATE_NOTIFIED,
@@ -970,10 +1065,11 @@ impl Waker {
 
     fn prepare_sleep(&self) -> WakerSleepState {
         loop {
-            let state = self.state.load(Ordering::Acquire);
+            let state = self.data().state.load(Ordering::Acquire);
             match state {
                 Self::STATE_IDLE => {
                     if self
+                        .data()
                         .state
                         .compare_exchange(
                             Self::STATE_IDLE,
@@ -1070,14 +1166,21 @@ fn block_current_impl(
 }
 
 fn block_current_killable(waiter: &Waiter) -> Result<(), SystemError> {
+    block_current_waker_killable(&waiter.waker)
+}
+
+fn block_current_waker_killable(waker: &Waker) -> Result<(), SystemError> {
     loop {
-        if waiter.waker.consume_notification() {
+        if Signal::oom_fatal_signal_pending(&ProcessManager::current_pcb()) {
+            return Err(SystemError::ERESTARTSYS);
+        }
+        if waker.consume_notification() {
             return Ok(());
         }
 
         let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
 
-        match waiter.waker.prepare_sleep() {
+        match waker.prepare_sleep() {
             WakerSleepState::Notified | WakerSleepState::Closed => {
                 drop(irq_guard);
                 return Ok(());
@@ -1087,7 +1190,16 @@ fn block_current_killable(waiter: &Waiter) -> Result<(), SystemError> {
 
         ProcessManager::mark_sleep(true)?;
 
-        if waiter.waker.consume_notification() {
+        // A sender can queue SIGKILL and observe Runnable just before the
+        // blocked-state publication. Rechecking after mark_sleep pairs with
+        // its wakeup and prevents sleeping past an already committed kill.
+        if Signal::oom_fatal_signal_pending(&ProcessManager::current_pcb()) {
+            ProcessManager::undo_mark_sleep();
+            drop(irq_guard);
+            return Err(SystemError::ERESTARTSYS);
+        }
+
+        if waker.consume_notification() {
             ProcessManager::undo_mark_sleep();
             drop(irq_guard);
             return Ok(());
@@ -1096,7 +1208,7 @@ fn block_current_killable(waiter: &Waiter) -> Result<(), SystemError> {
 
         schedule(SchedMode::SM_NONE);
 
-        if Signal::signal_pending_state(false, true, &ProcessManager::current_pcb()) {
+        if Signal::oom_fatal_signal_pending(&ProcessManager::current_pcb()) {
             return Err(SystemError::ERESTARTSYS);
         }
     }

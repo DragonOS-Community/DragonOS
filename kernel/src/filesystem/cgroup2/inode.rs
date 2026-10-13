@@ -4,6 +4,7 @@ use alloc::{
     vec::Vec,
 };
 use core::any::Any;
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use hashbrown::HashMap;
 use system_error::SystemError;
@@ -14,7 +15,7 @@ use crate::{
         file::{FileFlags, FilePrivateData},
         vcore::generate_inode_id,
         FileSystem, FileType, IndexNode, InodeFlags, InodeMode, Metadata, OpenFileBehavior,
-        PostWriteSyncPolicy, SetMetadataMask,
+        PollableInode, PostWriteSyncPolicy, SetMetadataMask,
     },
     libs::{mutex::MutexGuard, rwlock::RwLock, rwsem::RwSem, spinlock::SpinLock},
     process::ProcessManager,
@@ -32,6 +33,10 @@ pub(super) struct Cgroup2Inode {
     self_ref: Weak<Cgroup2Inode>,
     fs: RwSem<Weak<Cgroup2Fs>>,
     inner: SpinLock<Cgroup2InodeInner>,
+    pub(super) event_source: Option<super::event_notify::EventSource>,
+    pub(super) event_seen: AtomicU64,
+    pub(super) event_registration: AtomicUsize,
+    event_admitted: AtomicBool,
 }
 
 #[derive(Debug)]
@@ -64,6 +69,10 @@ impl Cgroup2Inode {
         Arc::new_cyclic(|weak| Self {
             self_ref: weak.clone(),
             fs: RwSem::new(Weak::new()),
+            event_source: None,
+            event_seen: AtomicU64::new(0),
+            event_registration: AtomicUsize::new(0),
+            event_admitted: AtomicBool::new(false),
             inner: SpinLock::new(Cgroup2InodeInner {
                 parent: Weak::new(),
                 permissions,
@@ -136,15 +145,24 @@ impl Cgroup2Inode {
             return Ok(());
         }
 
-        let mut inner = parent.inner.lock();
-        if let Cgroup2InodeKind::Dir { children, .. } = &mut inner.kind {
-            for name in stale {
-                children.remove(&name);
+        let mut retired = Vec::new();
+        retired
+            .try_reserve(stale.len())
+            .map_err(|_| SystemError::ENOMEM)?;
+        {
+            let mut inner = parent.inner.lock();
+            if let Cgroup2InodeKind::Dir { children, .. } = &mut inner.kind {
+                for name in &stale {
+                    if let Some(entry) = children.remove_entry(name) {
+                        retired.push(entry);
+                    }
+                }
+            } else {
+                return Err(SystemError::ENOTDIR);
             }
-            return Ok(());
         }
-
-        Err(SystemError::ENOTDIR)
+        drop(retired);
+        Ok(())
     }
 
     pub(super) fn check_attach_permissions(
@@ -165,13 +183,33 @@ impl Cgroup2Inode {
         ty: CgroupCoreFile,
         init: &[u8],
         mode: u16,
-    ) -> Arc<Self> {
+    ) -> Result<Arc<Self>, SystemError> {
         let cpuset_generation = cpuset::generation(&cgroup);
         let permissions = cgroup.file_permissions_instance(&name, mode as u32);
         let file_generation = permissions.read().generation;
-        Arc::new_cyclic(|weak| Self {
+        let source = match ty {
+            CgroupCoreFile::MemoryEvents | CgroupCoreFile::MemoryEventsLocal => {
+                Some(super::event_notify::EventSource::Memory {
+                    account: cgroup
+                        .local_memory_generation()
+                        .ok_or(SystemError::ENODEV)?
+                        .account,
+                    local: ty == CgroupCoreFile::MemoryEventsLocal,
+                })
+            }
+            CgroupCoreFile::Events => {
+                Some(super::event_notify::EventSource::Population(cgroup.clone()))
+            }
+            _ => None,
+        };
+        let seen = source.as_ref().map_or(0, |source| source.sequence());
+        let inode = Arc::new_cyclic(|weak| Self {
             self_ref: weak.clone(),
             fs: RwSem::new(Weak::new()),
+            event_source: source,
+            event_seen: AtomicU64::new(seen),
+            event_registration: AtomicUsize::new(0),
+            event_admitted: AtomicBool::new(false),
             inner: SpinLock::new(Cgroup2InodeInner {
                 parent: Weak::new(),
                 permissions,
@@ -202,7 +240,64 @@ impl Cgroup2Inode {
                     data: init.to_vec(),
                 },
             }),
-        })
+        });
+        if inode.event_source.is_some() {
+            super::event_notify::INODES.register(&inode, |id| {
+                inode.event_registration.store(id, Ordering::Release)
+            })?;
+        }
+        Ok(inode)
+    }
+
+    pub(super) fn event_delivery(&self) -> Option<(u64, Arc<Self>, Option<Arc<Self>>)> {
+        let _update = crate::cgroup::lock();
+        if !self.event_admitted.load(Ordering::Acquire) {
+            return None;
+        }
+        let sequence = self.event_source.as_ref()?.sequence();
+        if sequence == self.event_seen.load(Ordering::Acquire) {
+            return None;
+        }
+        let inner = self.inner.lock();
+        Some((sequence, self.self_ref.upgrade()?, inner.parent.upgrade()))
+    }
+
+    /// A notifier can outlive unmount's mark retirement. Pin the actual
+    /// backend if it is still alive, rather than calling fs()'s path invariant
+    /// unwrap on a temporarily upgraded, retired canonical inode.
+    pub(super) fn event_filesystem(&self) -> Option<Arc<Cgroup2Fs>> {
+        self.fs.read().upgrade()
+    }
+
+    fn admit_files(dir: &Arc<Self>) {
+        let inner = dir.inner.lock();
+        if let Cgroup2InodeKind::Dir { children, .. } = &inner.kind {
+            for inode in children.values() {
+                inode.event_admitted.store(true, Ordering::Release);
+            }
+        }
+    }
+
+    /// Explicit cancellation is necessary even if the notifier temporarily
+    /// upgraded a private inode and is waiting for the birth UPDATE guard.
+    fn cancel_private_files(dir: &Arc<Self>) {
+        let children = {
+            let mut inner = dir.inner.lock();
+            match &mut inner.kind {
+                Cgroup2InodeKind::Dir { children, .. } => core::mem::take(children),
+                _ => return,
+            }
+        };
+        for inode in children.values() {
+            inode.cancel_event_registration();
+        }
+        drop(children);
+    }
+
+    fn cancel_event_registration(&self) {
+        self.event_admitted.store(false, Ordering::Release);
+        let id = self.event_registration.swap(0, Ordering::AcqRel);
+        super::event_notify::INODES.unregister(id);
     }
 
     fn add_child(
@@ -210,18 +305,63 @@ impl Cgroup2Inode {
         name: &str,
         child: Arc<Cgroup2Inode>,
     ) -> Result<(), SystemError> {
+        let key = Self::prepare_child_slot(parent, name)?;
+        Self::insert_prepared_child(parent, key, child);
+        Ok(())
+    }
+
+    /// UPDATE excludes cache growth. All backing/key preparation is outside
+    /// inode spin locks; final insertion cannot introduce a new failure.
+    fn prepare_child_slot(parent: &Arc<Self>, name: &str) -> Result<String, SystemError> {
+        let mut key = String::new();
+        key.try_reserve_exact(name.len())
+            .map_err(|_| SystemError::ENOMEM)?;
+        key.push_str(name);
+        let (len, capacity) = {
+            let inner = parent.inner.lock();
+            match &inner.kind {
+                Cgroup2InodeKind::Dir { children, .. } => (children.len(), children.capacity()),
+                _ => return Err(SystemError::ENOTDIR),
+            }
+        };
+        let needed = len.checked_add(1).ok_or(SystemError::ENOMEM)?;
+        if capacity < needed {
+            let mut prepared = HashMap::new();
+            prepared
+                .try_reserve(needed)
+                .map_err(|_| SystemError::ENOMEM)?;
+            {
+                let mut inner = parent.inner.lock();
+                let Cgroup2InodeKind::Dir { children, .. } = &mut inner.kind else {
+                    unreachable!();
+                };
+                prepared.extend(children.drain());
+                core::mem::swap(children, &mut prepared);
+            }
+            drop(prepared);
+        }
+        Ok(key)
+    }
+
+    fn insert_prepared_child(parent: &Arc<Self>, key: String, child: Arc<Self>) {
+        Self::bind_private_child(parent, &child);
+        let retired = {
+            let mut inner = parent.inner.lock();
+            let Cgroup2InodeKind::Dir { children, .. } = &mut inner.kind else {
+                unreachable!();
+            };
+            debug_assert!(children.len() < children.capacity());
+            children.insert(key, child)
+        };
+        drop(retired);
+    }
+
+    /// Bind identity before populating children, without publishing/admitting
+    /// this inode. New files inherit the actual mounted filesystem identity.
+    fn bind_private_child(parent: &Arc<Self>, child: &Arc<Self>) {
         let fs_weak = parent.fs.read().clone();
         child.set_fs(fs_weak);
         child.inner.lock().parent = Arc::downgrade(parent);
-
-        let mut inner = parent.inner.lock();
-        match &mut inner.kind {
-            Cgroup2InodeKind::Dir { children, .. } => {
-                children.insert(name.to_string(), child);
-                Ok(())
-            }
-            _ => Err(SystemError::ENOTDIR),
-        }
     }
 
     fn add_file_from_spec(
@@ -230,27 +370,43 @@ impl Cgroup2Inode {
         spec: CgroupFileSpec,
     ) -> Result<(), SystemError> {
         let file =
-            Cgroup2Inode::new_file(spec.name.to_string(), cgroup, spec.ty, spec.init, spec.mode);
-        Self::add_child(dir, spec.name, file)
+            Cgroup2Inode::new_file(spec.name.to_string(), cgroup, spec.ty, spec.init, spec.mode)?;
+        if let Err(error) = Self::add_child(dir, spec.name, file.clone()) {
+            file.cancel_event_registration();
+            return Err(error);
+        }
+        file.event_admitted.store(
+            dir.event_admitted.load(Ordering::Acquire),
+            Ordering::Release,
+        );
+        Ok(())
     }
 
-    fn sync_managed_files(dir: &Arc<Cgroup2Inode>) -> Result<(), SystemError> {
-        let (cgroup, desired, desired_names) = {
+    fn sync_managed_files_locked(dir: &Arc<Cgroup2Inode>) -> Result<(), SystemError> {
+        let cgroup = {
             let inner = dir.inner.lock();
             match &inner.kind {
-                Cgroup2InodeKind::Dir { cgroup, .. } => (
-                    cgroup.clone(),
-                    files::desired_file_specs(cgroup),
-                    files::desired_file_names(cgroup),
-                ),
+                Cgroup2InodeKind::Dir { cgroup, .. } => cgroup.clone(),
                 _ => return Err(SystemError::ENOTDIR),
             }
         };
-
+        let desired = files::desired_file_specs(&cgroup);
+        let desired_names = files::desired_file_names(&cgroup);
+        let count = {
+            let inner = dir.inner.lock();
+            let Cgroup2InodeKind::Dir { children, .. } = &inner.kind else {
+                unreachable!();
+            };
+            children.len()
+        };
+        let mut retired = Vec::new();
+        retired
+            .try_reserve(count)
+            .map_err(|_| SystemError::ENOMEM)?;
         {
             let mut inner = dir.inner.lock();
             if let Cgroup2InodeKind::Dir { children, .. } = &mut inner.kind {
-                children.retain(|_, child| {
+                for entry in children.drain_filter(|_, child| {
                     let child_inner = child.inner.lock();
                     match &child_inner.kind {
                         Cgroup2InodeKind::File {
@@ -260,18 +416,21 @@ impl Cgroup2Inode {
                             file_generation,
                             ..
                         } => {
-                            desired_names.contains(child_inner.name.as_str())
+                            !(desired_names.contains(child_inner.name.as_str())
                                 && *file_generation == cgroup.file_generation(&child_inner.name)
                                 && (!matches!(ty, CgroupCoreFile::Cpuset(_))
-                                    || *cpuset_generation == cpuset::generation(cgroup))
+                                    || *cpuset_generation == cpuset::generation(cgroup)))
                         }
-                        Cgroup2InodeKind::Dir { .. } => true,
+                        Cgroup2InodeKind::Dir { .. } => false,
                     }
-                });
+                }) {
+                    retired.push(entry);
+                }
             } else {
                 return Err(SystemError::ENOTDIR);
             }
         }
+        drop(retired);
 
         for spec in desired {
             let exists = {
@@ -289,32 +448,15 @@ impl Cgroup2Inode {
         Ok(())
     }
 
-    fn sync_cached_child_controller_files(dir: &Arc<Cgroup2Inode>) -> Result<(), SystemError> {
-        let cached_dirs = {
-            let inner = dir.inner.lock();
-            match &inner.kind {
-                Cgroup2InodeKind::Dir { children, .. } => children
-                    .values()
-                    .filter(|child| {
-                        let child_inner = child.inner.lock();
-                        matches!(&child_inner.kind, Cgroup2InodeKind::Dir { .. })
-                    })
-                    .cloned()
-                    .collect::<Vec<_>>(),
-                _ => return Err(SystemError::ENOTDIR),
-            }
-        };
-
-        for child in cached_dirs {
-            Self::sync_managed_files(&child)?;
-        }
-        Ok(())
-    }
-
     fn lookup_child(
         parent: &Arc<Cgroup2Inode>,
         name: &str,
     ) -> Result<Arc<Cgroup2Inode>, SystemError> {
+        let _update = crate::cgroup::lock();
+        Self::lookup_child_locked(parent, name)
+    }
+
+    fn lookup_child_locked(parent: &Arc<Self>, name: &str) -> Result<Arc<Self>, SystemError> {
         if name == "." {
             return Ok(parent.clone());
         }
@@ -328,7 +470,7 @@ impl Cgroup2Inode {
         }
 
         Self::prune_stale_dir_cache(parent)?;
-        Self::sync_managed_files(parent)?;
+        Self::sync_managed_files_locked(parent)?;
 
         {
             let inner = parent.inner.lock();
@@ -352,8 +494,19 @@ impl Cgroup2Inode {
 
         let child_cgroup = parent_cgroup.child(name).ok_or(SystemError::ENOENT)?;
         let child = Cgroup2Inode::new_dir(name.to_string(), child_cgroup);
-        Cgroup2Inode::add_child(parent, name, child.clone())?;
-        Cgroup2Inode::populate_core_files(&child)?;
+        Self::bind_private_child(parent, &child);
+        let prepared = (|| {
+            Self::sync_managed_files_locked(&child)?;
+            let key = Self::prepare_child_slot(parent, name)?;
+            Self::insert_prepared_child(parent, key, child.clone());
+            child.event_admitted.store(true, Ordering::Release);
+            Self::admit_files(&child);
+            Ok::<(), SystemError>(())
+        })();
+        if let Err(error) = prepared {
+            Self::cancel_private_files(&child);
+            return Err(error);
+        }
 
         let inner = parent.inner.lock();
         match &inner.kind {
@@ -365,7 +518,14 @@ impl Cgroup2Inode {
     }
 
     pub(super) fn populate_core_files(dir: &Arc<Cgroup2Inode>) -> Result<(), SystemError> {
-        Self::sync_managed_files(dir)
+        let _update = crate::cgroup::lock();
+        if let Err(error) = Self::sync_managed_files_locked(dir) {
+            Self::cancel_private_files(dir);
+            return Err(error);
+        }
+        dir.event_admitted.store(true, Ordering::Release);
+        Self::admit_files(dir);
+        Ok(())
     }
 
     fn read_file(
@@ -486,6 +646,10 @@ impl Cgroup2Inode {
                 // Delegation admission shares the update transaction with
                 // init-namespace remounts which change hierarchy policy.
                 if cgroup_root().nsdelegate()
+                    && !matches!(
+                        ty,
+                        CgroupCoreFile::MemoryOomGroup | CgroupCoreFile::MemoryReclaim
+                    )
                     && !Arc::ptr_eq(
                         &open.namespace,
                         &crate::process::namespace::cgroup_namespace::INIT_CGROUP_NAMESPACE,
@@ -497,6 +661,12 @@ impl Cgroup2Inode {
                 if offset != 0 {
                     return Err(SystemError::EINVAL);
                 }
+                if super::memory::is_memory_write(ty) {
+                    let action = super::memory::prepare_write_locked(&cgroup, ty, buf)?;
+                    drop(_update);
+                    action.execute()?;
+                    return Ok(buf.len());
+                }
                 let new_data = files::write_controller_file_locked(&cgroup, ty, generation, buf)?;
                 Self::replace_file_data(this, &new_data)?;
                 Ok(buf.len())
@@ -506,21 +676,14 @@ impl Cgroup2Inode {
 
     /// Caller holds the update lock and has validated file liveness.
     fn write_subtree_control_locked(
-        this: &Arc<Cgroup2Inode>,
+        _this: &Arc<Cgroup2Inode>,
         cgroup: &Arc<CgroupNode>,
         buf: &[u8],
     ) -> Result<usize, SystemError> {
         let input = core::str::from_utf8(buf).map_err(|_| SystemError::EINVAL)?;
         // Like other cgroup files, delegation is authorized by the opener's
         // VFS write permission, not a second global CAP_SYS_ADMIN requirement.
-        let dir = this
-            .inner
-            .lock()
-            .parent
-            .upgrade()
-            .ok_or(SystemError::ENOENT)?;
-        let was_enabled = cgroup.subtree_control().iter().any(|name| name == "cpuset");
-        let cpu_was_enabled = cgroup.subtree_control().iter().any(|name| name == "cpu");
+        let was_enabled = cgroup.subtree_controller_enabled("cpuset");
         // The only fallible process snapshot is prepared before committing the
         // controller mask. Allocation failure cannot leave a partial update.
         let tasks = if input
@@ -531,34 +694,69 @@ impl Cgroup2Inode {
         } else {
             None
         };
-        let cpu_prepared = if !cpu_was_enabled && input.split_whitespace().any(|op| op == "+cpu") {
-            crate::cgroup::cpu::prepare_enable_locked(cgroup)
+        let control_prepared = files::prepare_subtree_control(cgroup, input)?;
+        let _new_data = if let Some(mut prepared) = control_prepared {
+            {
+                let _cgroup_guard = cgroup_accounting_lock().lock();
+                prepared.commit(cgroup);
+            }
+            prepared.finish(cgroup, tasks.as_deref().unwrap_or(&[]))
         } else {
-            Vec::new()
-        };
-        let new_data = {
             let _cgroup_guard = cgroup_accounting_lock().lock();
             files::apply_subtree_control(cgroup, input)?
         };
-        let is_enabled = cgroup.subtree_control().iter().any(|name| name == "cpuset");
-        let cpu_is_enabled = cgroup.subtree_control().iter().any(|name| name == "cpu");
-        if cpu_was_enabled != cpu_is_enabled {
-            crate::cgroup::cpu::controller_changed_locked(
-                cgroup,
-                tasks.as_ref().expect("CPU update has a prepared snapshot"),
-                cpu_prepared,
-                cpu_is_enabled,
-            );
-        }
+        let is_enabled = cgroup.subtree_controller_enabled("cpuset");
         if was_enabled != is_enabled {
             cpuset::controller_changed_locked(
                 cgroup,
                 tasks.expect("cpuset update has a prepared snapshot"),
             );
         }
-        Self::replace_file_data(this, &new_data)?;
-        Self::sync_cached_child_controller_files(&dir)?;
+        // Prepared CPU/memory commits are already complete. Epoch-aware lookup refreshes
+        // cached files lazily on every mount; do not report a cache allocation
+        // error as a failed controller transaction after changing resources.
         Ok(buf.len())
+    }
+}
+
+impl PollableInode for Cgroup2Inode {
+    fn poll(&self, data: &FilePrivateData) -> Result<usize, SystemError> {
+        let flags = match data {
+            FilePrivateData::Cgroup(open) => open
+                .memory_events
+                .as_ref()
+                .map_or_else(super::memory_events::default_mask, |events| events.poll()),
+            _ => return Err(SystemError::EINVAL),
+        };
+        Ok(flags.bits() as usize)
+    }
+
+    fn add_epitem(
+        &self,
+        item: Arc<crate::filesystem::epoll::EPollItem>,
+        data: &FilePrivateData,
+    ) -> Result<(), SystemError> {
+        if let FilePrivateData::Cgroup(open) = data {
+            if let Some(events) = &open.memory_events {
+                events.add(item);
+            }
+            return Ok(());
+        }
+        Err(SystemError::EINVAL)
+    }
+
+    fn remove_epitem(
+        &self,
+        item: &Arc<crate::filesystem::epoll::EPollItem>,
+        data: &FilePrivateData,
+    ) -> Result<(), SystemError> {
+        if let FilePrivateData::Cgroup(open) = data {
+            if let Some(events) = &open.memory_events {
+                return events.remove(item);
+            }
+            return Ok(());
+        }
+        Err(SystemError::EINVAL)
     }
 }
 
@@ -571,17 +769,66 @@ impl IndexNode for Cgroup2Inode {
         &self,
         mut data: MutexGuard<FilePrivateData>,
         _flags: &FileFlags,
-    ) -> Result<(), SystemError> {
-        let current = ProcessManager::current_pcb();
-        *data = FilePrivateData::Cgroup(super::CgroupOpenState {
-            cred: current.cred(),
-            namespace: current.nsproxy().cgroup_ns.clone(),
-        });
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = (|| {
+            let current = ProcessManager::current_pcb();
+            let memory_events = {
+                let (cgroup, ty, generation) = {
+                    let inner = self.inner.lock();
+                    match &inner.kind {
+                        Cgroup2InodeKind::File {
+                            cgroup,
+                            ty,
+                            file_generation,
+                            ..
+                        } if matches!(
+                            ty,
+                            CgroupCoreFile::MemoryEvents | CgroupCoreFile::MemoryEventsLocal
+                        ) =>
+                        {
+                            (Some(cgroup.clone()), *ty, *file_generation)
+                        }
+                        _ => (None, CgroupCoreFile::Events, 0),
+                    }
+                };
+                if let Some(cgroup) = cgroup {
+                    let account = {
+                        let _update = crate::cgroup::lock();
+                        files::check_live_file(&cgroup, ty, generation)?;
+                        cgroup
+                            .local_memory_generation()
+                            .ok_or(SystemError::ENODEV)?
+                            .account
+                    };
+                    Some(super::memory_events::MemoryEventOpen::new(
+                        account,
+                        ty == CgroupCoreFile::MemoryEventsLocal,
+                    )?)
+                } else {
+                    None
+                }
+            };
+            *data = FilePrivateData::Cgroup(super::CgroupOpenState {
+                cred: current.cred(),
+                namespace: current.nsproxy().cgroup_ns.clone(),
+                memory_events,
+            });
+            Ok(())
+        })();
+        result.map_err(Into::into)
+    }
+
+    fn close(&self, data: MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
+        if let FilePrivateData::Cgroup(open) = &*data {
+            if let Some(events) = &open.memory_events {
+                events.close();
+            }
+        }
         Ok(())
     }
 
-    fn close(&self, _data: MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
-        Ok(())
+    fn as_pollable_inode(&self) -> Result<&dyn PollableInode, SystemError> {
+        Ok(self)
     }
 
     fn read_at(
@@ -590,24 +837,34 @@ impl IndexNode for Cgroup2Inode {
         len: usize,
         buf: &mut [u8],
         data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError> {
-        drop(data);
-        // Controller reads may acquire a sleeping mutex. Never retain the
-        // inode spinlock across controller calls (writes use the reverse order).
-        let (cgroup, ty, generation, file_generation) = {
-            let inner = self.inner.lock();
-            match &inner.kind {
-                Cgroup2InodeKind::File {
-                    cgroup,
-                    ty,
-                    cpuset_generation,
-                    file_generation,
-                    ..
-                } => (cgroup.clone(), *ty, *cpuset_generation, *file_generation),
-                _ => return Err(SystemError::EISDIR),
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = (|| {
+            let events = match &*data {
+                FilePrivateData::Cgroup(open) => open.memory_events.clone(),
+                _ => None,
+            };
+            drop(data);
+            // Controller reads may acquire a sleeping mutex. Never retain the
+            // inode spinlock across controller calls (writes use the reverse order).
+            let (cgroup, ty, generation, file_generation) = {
+                let inner = self.inner.lock();
+                match &inner.kind {
+                    Cgroup2InodeKind::File {
+                        cgroup,
+                        ty,
+                        cpuset_generation,
+                        file_generation,
+                        ..
+                    } => (cgroup.clone(), *ty, *cpuset_generation, *file_generation),
+                    _ => return Err(SystemError::EISDIR),
+                }
+            };
+            if let Some(events) = events {
+                return events.read(&cgroup, ty, file_generation, offset, len, buf);
             }
-        };
-        Cgroup2Inode::read_file(&cgroup, ty, generation, file_generation, offset, len, buf)
+            Cgroup2Inode::read_file(&cgroup, ty, generation, file_generation, offset, len, buf)
+        })();
+        result.map_err(Into::into)
     }
 
     fn write_at(
@@ -616,23 +873,28 @@ impl IndexNode for Cgroup2Inode {
         len: usize,
         buf: &[u8],
         data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError> {
-        let open = match &*data {
-            FilePrivateData::Cgroup(open) => open.clone(),
-            _ => return Err(SystemError::EINVAL),
-        };
-        drop(data);
-        let n = core::cmp::min(len, buf.len());
-        let this = self.self_ref.upgrade().unwrap();
-        Cgroup2Inode::write_file(&this, offset, &buf[..n], &open)
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = (|| {
+            let open = match &*data {
+                FilePrivateData::Cgroup(open) => open.clone(),
+                _ => return Err(SystemError::EINVAL),
+            };
+            drop(data);
+            let n = core::cmp::min(len, buf.len());
+            let this = self.self_ref.upgrade().unwrap();
+            Cgroup2Inode::write_file(&this, offset, &buf[..n], &open)
+        })();
+        result.map_err(Into::into)
     }
 
-    fn resize(&self, len: usize) -> Result<(), SystemError> {
-        match &self.inner.lock().kind {
-            Cgroup2InodeKind::File { .. } if len == 0 => Ok(()),
-            Cgroup2InodeKind::File { .. } => Err(SystemError::EINVAL),
-            Cgroup2InodeKind::Dir { .. } => Err(SystemError::EISDIR),
-        }
+    fn resize(&self, len: usize) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> =
+            match &self.inner.lock().kind {
+                Cgroup2InodeKind::File { .. } if len == 0 => Ok(()),
+                Cgroup2InodeKind::File { .. } => Err(SystemError::EINVAL),
+                Cgroup2InodeKind::Dir { .. } => Err(SystemError::EISDIR),
+            };
+        result.map_err(Into::into)
     }
 
     fn metadata(&self) -> Result<Metadata, SystemError> {
@@ -647,7 +909,10 @@ impl IndexNode for Cgroup2Inode {
         Ok(metadata)
     }
 
-    fn set_metadata(&self, metadata: &Metadata) -> Result<(), SystemError> {
+    fn set_metadata(
+        &self,
+        metadata: &Metadata,
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         self.set_metadata_masked(
             metadata,
             SetMetadataMask::MODE
@@ -663,15 +928,16 @@ impl IndexNode for Cgroup2Inode {
         &self,
         metadata: &Metadata,
         mask: SetMetadataMask,
-    ) -> Result<(), SystemError> {
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         let _update = crate::cgroup::lock();
         self.apply_metadata_locked(metadata, mask)
+            .map_err(Into::into)
     }
 
     fn update_metadata_masked(
         &self,
         update: &mut crate::filesystem::vfs::MetadataUpdate<'_>,
-    ) -> Result<SetMetadataMask, SystemError> {
+    ) -> Result<SetMetadataMask, crate::mm::allocation::MemoryAllocationError> {
         let _update = crate::cgroup::lock();
         // The VFS callback authorizes and computes changes from the same
         // canonical state that will be committed, across all mount views.
@@ -693,38 +959,37 @@ impl IndexNode for Cgroup2Inode {
         name: &str,
         file_type: FileType,
         mode: InodeMode,
-    ) -> Result<Arc<dyn IndexNode>, SystemError> {
-        if file_type != FileType::Dir {
-            return Err(SystemError::EINVAL);
-        }
-
-        if name.is_empty()
-            || name == "."
-            || name == ".."
-            || name.contains('/')
-            || name.contains('\n')
-        {
-            return Err(SystemError::EINVAL);
-        }
-
-        let this = self.self_ref.upgrade().unwrap();
-        Cgroup2Inode::prune_stale_dir_cache(&this)?;
-
-        let cgroup = {
-            let inner = self.inner.lock();
-            match &inner.kind {
-                Cgroup2InodeKind::Dir { cgroup, children } => {
-                    if children.contains_key(name) || cgroup.child(name).is_some() {
-                        return Err(SystemError::EEXIST);
-                    }
-                    cgroup.clone()
-                }
-                _ => return Err(SystemError::ENOTDIR),
+    ) -> Result<Arc<dyn IndexNode>, crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = (|| {
+            if file_type != FileType::Dir {
+                return Err(SystemError::EINVAL);
             }
-        };
 
-        let cred = ProcessManager::current_pcb().cred();
-        let child_cgroup =
+            if name.is_empty()
+                || name == "."
+                || name == ".."
+                || name.contains('/')
+                || name.contains('\n')
+            {
+                return Err(SystemError::EINVAL);
+            }
+
+            let this = self.self_ref.upgrade().unwrap();
+            let cgroup = {
+                let inner = self.inner.lock();
+                match &inner.kind {
+                    Cgroup2InodeKind::Dir { cgroup, .. } => {
+                        if cgroup.child(name).is_some() {
+                            return Err(SystemError::EEXIST);
+                        }
+                        cgroup.clone()
+                    }
+                    _ => return Err(SystemError::ENOTDIR),
+                }
+            };
+
+            let cred = ProcessManager::current_pcb().cred();
+            let mut prepared_inode = None;
             cgroup_root().create_child_exclusive_with_init(&cgroup, name, |node| {
                 // Parent metadata and child publication share UPDATE_LOCK.
                 let owner = crate::cgroup::core::CgroupFilePermissions::for_creation(
@@ -747,55 +1012,82 @@ impl IndexNode for Cgroup2Inode {
                         ),
                     );
                 }
+                let child = Cgroup2Inode::new_dir(name.to_string(), node.clone());
+                Self::bind_private_child(&this, &child);
+                let birth = (|| {
+                    Self::sync_managed_files_locked(&child)?;
+                    let key = Self::prepare_child_slot(&this, name)?;
+                    Self::insert_prepared_child(&this, key, child.clone());
+                    child.event_admitted.store(true, Ordering::Release);
+                    Self::admit_files(&child);
+                    Ok::<(), SystemError>(())
+                })();
+                if let Err(error) = birth {
+                    Self::cancel_private_files(&child);
+                    return Err(error);
+                }
+                prepared_inode = Some(child);
+                Ok(())
             })?;
-        let child = Cgroup2Inode::new_dir(name.to_string(), child_cgroup);
-        Cgroup2Inode::add_child(&this, name, child.clone())?;
-        Cgroup2Inode::populate_core_files(&child)?;
-        Ok(child)
+            Ok(prepared_inode.expect("successful private directory birth produced an inode"))
+        })();
+        result
+            .map(|inode| inode as Arc<dyn IndexNode>)
+            .map_err(Into::into)
     }
 
-    fn rmdir(&self, name: &str) -> Result<(), SystemError> {
-        if name == "." || name == ".." || name.starts_with("cgroup.") {
-            return Err(SystemError::EINVAL);
-        }
-        let this = self.self_ref.upgrade().unwrap();
-        Cgroup2Inode::prune_stale_dir_cache(&this)?;
-        let child = Cgroup2Inode::lookup_child(&this, name)?;
-
-        let child_cgroup = {
-            let inner = child.inner.lock();
-            match &inner.kind {
-                Cgroup2InodeKind::Dir { cgroup, .. } => cgroup.clone(),
-                _ => return Err(SystemError::ENOTDIR),
+    fn rmdir(&self, name: &str) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = (|| {
+            if name == "." || name == ".." || name.starts_with("cgroup.") {
+                return Err(SystemError::EINVAL);
             }
-        };
-        let parent_cgroup = this.cgroup().ok_or(SystemError::ENOTDIR)?;
-        // Do not hold an inode spin lock while waiting for the cgroup
-        // structure mutex. The core transaction checks tasks, reserved fork
-        // charges and online state together with removal.
-        cgroup_root().remove_child(&parent_cgroup, name, &child_cgroup)?;
+            let this = self.self_ref.upgrade().unwrap();
+            let child = Cgroup2Inode::lookup_child(&this, name)?;
 
-        let mut inner = self.inner.lock();
-        match &mut inner.kind {
-            Cgroup2InodeKind::Dir { children, .. } => {
-                if children
-                    .get(name)
-                    .is_some_and(|cached| Arc::ptr_eq(cached, &child))
-                {
-                    children.remove(name);
+            let child_cgroup = {
+                let inner = child.inner.lock();
+                match &inner.kind {
+                    Cgroup2InodeKind::Dir { cgroup, .. } => cgroup.clone(),
+                    _ => return Err(SystemError::ENOTDIR),
                 }
-                Ok(())
-            }
-            _ => Err(SystemError::ENOTDIR),
-        }
+            };
+            let parent_cgroup = this.cgroup().ok_or(SystemError::ENOTDIR)?;
+            // Do not hold an inode spin lock while waiting for the cgroup
+            // structure mutex. The core transaction checks tasks, reserved fork
+            // charges and online state together with removal.
+            cgroup_root().remove_child(&parent_cgroup, name, &child_cgroup)?;
+
+            let retired = {
+                let mut inner = self.inner.lock();
+                match &mut inner.kind {
+                    Cgroup2InodeKind::Dir { children, .. } => {
+                        if children
+                            .get(name)
+                            .is_some_and(|cached| Arc::ptr_eq(cached, &child))
+                        {
+                            children.remove_entry(name)
+                        } else {
+                            None
+                        }
+                    }
+                    _ => return Err(SystemError::ENOTDIR),
+                }
+            };
+            drop(retired);
+            Ok(())
+        })();
+        result.map_err(Into::into)
     }
 
     fn unlink(
         &self,
         _name: &str,
-    ) -> Result<crate::filesystem::vfs::LinkRemovalOutcome, SystemError> {
-        // cgroup core files are always present and managed by kernel.
-        Err(SystemError::EPERM)
+    ) -> Result<
+        crate::filesystem::vfs::LinkRemovalOutcome,
+        crate::mm::allocation::MemoryAllocationError,
+    > {
+        let result: core::result::Result<_, system_error::SystemError> = Err(SystemError::EPERM);
+        result.map_err(Into::into)
     }
 
     fn find(&self, name: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
@@ -813,9 +1105,10 @@ impl IndexNode for Cgroup2Inode {
     }
 
     fn list(&self) -> Result<Vec<String>, SystemError> {
+        let _update = crate::cgroup::lock();
         let this = self.self_ref.upgrade().unwrap();
         Cgroup2Inode::prune_stale_dir_cache(&this)?;
-        Cgroup2Inode::sync_managed_files(&this)?;
+        Cgroup2Inode::sync_managed_files_locked(&this)?;
         let inner = self.inner.lock();
         match &inner.kind {
             Cgroup2InodeKind::Dir { cgroup, children } => {
@@ -836,5 +1129,11 @@ impl IndexNode for Cgroup2Inode {
 
     fn dname(&self) -> Result<crate::filesystem::vfs::utils::DName, SystemError> {
         Ok(self.inner.lock().name.clone().into())
+    }
+}
+
+impl Drop for Cgroup2Inode {
+    fn drop(&mut self) {
+        self.cancel_event_registration();
     }
 }

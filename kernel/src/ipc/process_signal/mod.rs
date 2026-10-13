@@ -12,11 +12,12 @@ use system_error::SystemError;
 
 use crate::{
     arch::ipc::signal::{SigSet, Signal},
+    cgroup::memory::{accounting::KernelByteKind, object::ObjectAccount, owned::OwnedBox},
     ipc::signal_types::{SigCode, SigInfo, SigPending, SignalFlags},
     libs::rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
     libs::spinlock::{SpinLock, SpinLockGuard},
     libs::wait_queue::WaitQueue,
-    mm::ucontext::AddressSpace,
+    mm::{allocation::MemoryAllocationError, ucontext::AddressSpace},
     process::{
         pid::{Pid, PidType},
         ProcessControlBlock, RawPid,
@@ -63,6 +64,12 @@ pub enum ReapTransition {
 }
 
 pub struct ProcessSignalState {
+    body: OwnedBox<ProcessSignalStateData>,
+}
+
+/// The uniquely allocated thread-group entity. Observing its Arc identity
+/// does not create another entity or retain its storage after last strong drop.
+struct ProcessSignalStateData {
     inner: RwLock<InnerProcessSignalState>,
     group_exec_wait_queue: WaitQueue,
     /// Child state changes belong to the thread group, not its current leader.
@@ -70,7 +77,7 @@ pub struct ProcessSignalState {
     child_wait_queue: WaitQueue,
     pending: SpinLock<SigPending>,
     cpu_time_wait: Arc<cpu_time::CpuTimeWait>,
-    pub(crate) cpu_time_adjustment: SpinLock<crate::sched::cputime::AdjustedCpuTime>,
+    cpu_time_adjustment: SpinLock<crate::sched::cputime::AdjustedCpuTime>,
 }
 
 impl Debug for ProcessSignalState {
@@ -118,44 +125,56 @@ pub struct InnerProcessSignalState {
 }
 
 impl ProcessSignalState {
-    pub fn new() -> Arc<Self> {
-        Self::try_new().expect("failed to allocate thread-group signal state")
-    }
-
-    pub fn try_new() -> Result<Arc<Self>, SystemError> {
+    pub(crate) fn try_new_for(
+        creator: &Arc<ObjectAccount>,
+    ) -> Result<Arc<Self>, MemoryAllocationError> {
+        let storage = OwnedBox::prepare(creator, KernelByteKind::SlabUnreclaimable)?
+            .try_allocate()
+            .map_err(|_| SystemError::ENOMEM)?;
         let inner = InnerProcessSignalState::try_default()?;
-        Arc::try_new(Self {
+        let body = storage.init(ProcessSignalStateData {
             inner: RwLock::new(inner),
             group_exec_wait_queue: WaitQueue::default(),
             child_wait_queue: WaitQueue::default(),
             pending: SpinLock::new(SigPending::default()),
-            cpu_time_wait: cpu_time::CpuTimeWait::new(),
+            cpu_time_wait: cpu_time::CpuTimeWait::try_new_for(creator)?,
             cpu_time_adjustment: SpinLock::new(crate::sched::cputime::AdjustedCpuTime::default()),
-        })
-        .map_err(|_| SystemError::ENOMEM)
+        });
+        Ok(Arc::try_new(Self { body }).map_err(|_| SystemError::ENOMEM)?)
+    }
+
+    pub(crate) fn cpu_time_adjustment(&self) -> &SpinLock<crate::sched::cputime::AdjustedCpuTime> {
+        &self.body.cpu_time_adjustment
     }
 
     fn inner(&self) -> RwLockReadGuard<'_, InnerProcessSignalState> {
-        self.inner.read_irqsave()
+        self.body.inner.read_irqsave()
     }
 
     pub(crate) fn child_wait_queue(&self) -> &WaitQueue {
-        &self.child_wait_queue
+        &self.body.child_wait_queue
     }
 
     fn inner_mut(&self) -> RwLockWriteGuard<'_, InnerProcessSignalState> {
-        self.inner.write_irqsave()
+        self.body.inner.write_irqsave()
     }
 
     pub fn inner_read(&self) -> RwLockReadGuard<'_, InnerProcessSignalState> {
         self.inner()
     }
 
-    pub fn record_oom_victim_mm(&self, tgid: RawPid, mm: &Arc<AddressSpace>) {
+    /// Transfer the old strong mm reference to the caller. It may be the last
+    /// reference, so its destruction must happen outside signal/task locks.
+    #[must_use]
+    pub fn record_oom_victim_mm(
+        &self,
+        tgid: RawPid,
+        mm: &Arc<AddressSpace>,
+    ) -> Option<Arc<AddressSpace>> {
         let mut g = self.inner_mut();
         g.oom_tgid = Some(tgid);
         g.oom_mm_id = Some(mm.id());
-        g.oom_mm = Some(mm.clone());
+        g.oom_mm.replace(mm.clone())
     }
 
     pub fn clear_oom_mm_if(&self, tgid: RawPid, mm_id: u64) -> bool {
@@ -172,6 +191,18 @@ impl ProcessSignalState {
     pub fn oom_victim_mm_matches(&self, tgid: RawPid) -> bool {
         let g = self.inner();
         g.oom_tgid == Some(tgid) && g.oom_mm.is_some()
+    }
+
+    /// Observe the mm actually selected for this thread group, not a task's
+    /// possibly replaced current mm. The observer must not pin its final drop.
+    pub(crate) fn recorded_oom_victim(&self, tgid: RawPid) -> Option<(u64, Weak<AddressSpace>)> {
+        let g = self.inner();
+        if g.oom_tgid != Some(tgid) {
+            return None;
+        }
+        let mm = g.oom_mm.as_ref()?;
+        let id = g.oom_mm_id?;
+        (id == mm.id()).then(|| (id, Arc::downgrade(mm)))
     }
 
     pub fn curr_target(&self) -> Option<Arc<ProcessControlBlock>> {

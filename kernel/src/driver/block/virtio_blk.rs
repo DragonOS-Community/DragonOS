@@ -866,8 +866,10 @@ impl IndexNode for VirtIOBlkDevice {
         &self,
         _datasync: bool,
         _data: MutexGuard<FilePrivateData>,
-    ) -> Result<(), SystemError> {
-        <Self as BlockDevice>::sync(self)
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> =
+            <Self as BlockDevice>::sync(self);
+        result.map_err(Into::into)
     }
 
     fn read_at(
@@ -876,8 +878,9 @@ impl IndexNode for VirtIOBlkDevice {
         _len: usize,
         _buf: &mut [u8],
         _data: MutexGuard<crate::filesystem::vfs::FilePrivateData>,
-    ) -> Result<usize, SystemError> {
-        Err(SystemError::ENOSYS)
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = Err(SystemError::ENOSYS);
+        result.map_err(Into::into)
     }
     fn write_at(
         &self,
@@ -885,8 +888,9 @@ impl IndexNode for VirtIOBlkDevice {
         _len: usize,
         _buf: &[u8],
         _data: MutexGuard<crate::filesystem::vfs::FilePrivateData>,
-    ) -> Result<usize, SystemError> {
-        Err(SystemError::ENOSYS)
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = Err(SystemError::ENOSYS);
+        result.map_err(Into::into)
     }
     fn list(&self) -> Result<alloc::vec::Vec<alloc::string::String>, system_error::SystemError> {
         Err(SystemError::ENOSYS)
@@ -919,8 +923,9 @@ impl IndexNode for VirtIOBlkDevice {
         &self,
         _data: MutexGuard<crate::filesystem::vfs::FilePrivateData>,
         _mode: &crate::filesystem::vfs::file::FileFlags,
-    ) -> Result<(), SystemError> {
-        Ok(())
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = Ok(());
+        result.map_err(Into::into)
     }
 }
 

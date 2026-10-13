@@ -84,6 +84,16 @@ pub(crate) struct DaxAccessGuard {
     _admission: Option<DaxAdmissionGuard>,
 }
 
+/// A snapshot of the only current external user-PFN provider. It retains
+/// actual backing descriptors, not a promise that the user PTE stays present
+/// or writable. All holders must retire it outside their MM/PT guards.
+pub(crate) struct DaxUserWriteSnapshot {
+    _window: Arc<crate::driver::virtio::virtio_fs::VirtioFsCacheWindow>,
+    pub(crate) physical: Option<crate::mm::PhysAddr>,
+    _node: Arc<FuseNode>,
+    _mapping: Option<Arc<DaxMapping>>,
+}
+
 #[derive(Debug)]
 pub(crate) struct DaxReclaimTombstone {
     file_offset: u64,
@@ -190,7 +200,7 @@ impl Drop for DaxHostInvalidationBlocker {
 }
 
 impl FaultRetryWait for DaxHostInvalidationRetryWait {
-    fn wait(&self) -> Result<(), SystemError> {
+    fn wait(&self) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         self.gate.wait_unblocked();
         Ok(())
     }
@@ -297,9 +307,11 @@ pub struct FuseNode {
     dax_pte_epoch: AtomicU64,
     cached_metadata_deadline_ticks: AtomicU64,
     attr_version: AtomicU64,
-    /// Serializes SETATTR requests and publication of their returned attrs.
-    /// FUSE daemons may process requests concurrently, so without this lock an
-    /// older reply can overwrite a newer inode metadata snapshot in the cache.
+    /// Inode write transaction gate: serializes complete primary writes with
+    /// SETATTR/truncate/fallocate and publication of returned attributes.
+    /// Read faults and writeback do not acquire it. Bounded primary writes
+    /// copy each userspace chunk before entering mapping exclusion, while
+    /// retaining this gate across the complete operation.
     setattr_lock: Mutex<()>,
     link_mutation_coordinator: LinkMutationCoordinator,
     /// Version chain produced while short READ replies from one metadata
@@ -515,6 +527,38 @@ impl FuseNode {
     ) -> Result<DaxAccessGuard, SystemError> {
         let admission = self.conn.enter_dax()?;
         self.dax_access_inner(offset, writable, Some(admission))
+    }
+
+    /// Inspect an already established mapping only. No SETUPMAPPING, daemon
+    /// request, range admission or waiting is permitted with the caller's MM
+    /// locked. A concurrent tombstone is represented by physical=None, so the
+    /// caller can release the MM and use the ordinary fault/retry protocol.
+    pub(crate) fn snapshot_dax_user_write(
+        self: &Arc<Self>,
+        offset: usize,
+    ) -> Result<DaxUserWriteSnapshot, SystemError> {
+        let window = self.conn.dax_window()?;
+        let mapping = self.dax_mappings.try_read().and_then(|tree| {
+            tree.mappings
+                .get(&Self::dax_aligned_offset(offset as u64))
+                .cloned()
+        });
+        let physical = mapping.as_ref().and_then(|mapping| {
+            if !mapping.writable() || mapping.token.owner() != self.dax_mapping_owner() {
+                return None;
+            }
+            let in_mapping = offset & (DAX_RANGE_SIZE - 1);
+            let window_offset = mapping.window_offset().checked_add(in_mapping)?;
+            window
+                .checked_paddr(window_offset, crate::arch::MMArch::PAGE_SIZE)
+                .ok()
+        });
+        Ok(DaxUserWriteSnapshot {
+            _window: window,
+            physical,
+            _node: self.clone(),
+            _mapping: mapping,
+        })
     }
 
     fn dax_access_inner(

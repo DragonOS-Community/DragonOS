@@ -54,6 +54,43 @@ struct VirtioFsFs {
     session_id: u64,
 }
 
+/// Narrow authority for the sole production external-PFN installer. Neither
+/// VM_MIXEDMAP nor a filesystem name authorizes an arbitrary device PFN.
+pub(crate) fn snapshot_external_user_write(
+    file: &Arc<File>,
+    page_offset: usize,
+) -> Result<Option<super::super::inode::DaxUserWriteSnapshot>, SystemError> {
+    file.with_io_fs(|fs| {
+        let underlying = fs
+            .as_any_ref()
+            .downcast_ref::<MountFS>()
+            .map(MountFS::inner_filesystem);
+        let fs = underlying.as_deref().unwrap_or(fs);
+        let provider = fs
+            .as_any_ref()
+            .downcast_ref::<VirtioFsFs>()
+            .ok_or(SystemError::EFAULT)?;
+        let node = {
+            let Ok(private) = file.private_data.try_lock() else {
+                return Ok(None);
+            };
+            let FilePrivateData::Fuse(FuseFilePrivateData::File(private)) = &*private else {
+                return Err(SystemError::EFAULT);
+            };
+            private.node.clone()
+        };
+        if !Arc::ptr_eq(node.conn(), &provider.conn) || !node.dax_active() || node.nodeid() == 0 {
+            return Err(SystemError::EFAULT);
+        }
+        let offset = page_offset
+            .checked_mul(crate::arch::MMArch::PAGE_SIZE)
+            .ok_or(SystemError::EFAULT)?;
+        node.snapshot_dax_user_write(offset)
+            .map(Some)
+            .map_err(|_| SystemError::EFAULT)
+    })
+}
+
 impl VirtioFsFs {
     unsafe fn dax_fault(&self, pfm: &mut PageFaultMessage) -> Option<VmFaultReason> {
         let vma = pfm.vma();
@@ -314,7 +351,10 @@ impl MountableFileSystem for VirtioFsFs {
     fn make_mount_data(
         raw_data: Option<&str>,
         source: &str,
-    ) -> Result<Option<Arc<dyn FileSystemMakerData + 'static>>, SystemError> {
+    ) -> Result<
+        Option<Arc<dyn FileSystemMakerData + 'static>>,
+        crate::mm::allocation::MemoryAllocationError,
+    > {
         Self::make_mount_data_in_context(raw_data, source, &FsCreationContext::current())
     }
 
@@ -322,9 +362,12 @@ impl MountableFileSystem for VirtioFsFs {
         raw_data: Option<&str>,
         source: &str,
         context: &FsCreationContext,
-    ) -> Result<Option<Arc<dyn FileSystemMakerData + 'static>>, SystemError> {
+    ) -> Result<
+        Option<Arc<dyn FileSystemMakerData + 'static>>,
+        crate::mm::allocation::MemoryAllocationError,
+    > {
         if source.is_empty() {
-            return Err(SystemError::EINVAL);
+            return Err(SystemError::EINVAL.into());
         }
 
         let (rootmode, user_id, group_id, default_permissions, allow_other, dax_mode) =
@@ -336,7 +379,7 @@ impl MountableFileSystem for VirtioFsFs {
                 .as_ref()
                 .is_none_or(|window| window.len() < super::dax::DAX_RANGE_SIZE)
         {
-            return Err(SystemError::EINVAL);
+            return Err(SystemError::EINVAL.into());
         }
         let conn = FuseConn::new_for_virtiofs_with_dax_window(
             VIRTIOFS_MAX_REQUEST_SIZE,
@@ -345,7 +388,7 @@ impl MountableFileSystem for VirtioFsFs {
             dax_mode,
         )?;
         if dax_mode == DaxMountMode::Always && !conn.dax_enabled() {
-            return Err(SystemError::EINVAL);
+            return Err(SystemError::EINVAL.into());
         }
 
         Ok(Some(Arc::new(VirtioFsMountData {
@@ -424,11 +467,11 @@ mod tests {
         );
         assert_eq!(
             VirtioFsFs::parse_dax_mode(Some("")),
-            Err(SystemError::EINVAL)
+            Err(SystemError::EINVAL.into())
         );
         assert_eq!(
             VirtioFsFs::parse_dax_mode(Some("on")),
-            Err(SystemError::EINVAL)
+            Err(SystemError::EINVAL.into())
         );
     }
 

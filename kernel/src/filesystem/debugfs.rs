@@ -67,7 +67,10 @@ impl MountableFileSystem for DebugFs {
     fn make_mount_data(
         _raw_data: Option<&str>,
         _source: &str,
-    ) -> Result<Option<Arc<dyn FileSystemMakerData + 'static>>, SystemError> {
+    ) -> Result<
+        Option<Arc<dyn FileSystemMakerData + 'static>>,
+        crate::mm::allocation::MemoryAllocationError,
+    > {
         Ok(None)
     }
 

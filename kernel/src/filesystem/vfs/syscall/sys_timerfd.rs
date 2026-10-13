@@ -76,15 +76,27 @@ impl Syscall for SysTimerFdCreate {
         if flags.contains(TimerFdCreateFlags::TFD_NONBLOCK) {
             file_flags.insert(FileFlags::O_NONBLOCK);
         }
+        let storage = crate::filesystem::vfs::file::PreparedFile::new_recovering()?;
         let inode = TimerFdInode::new(clock_id);
-        let file =
-            File::new_with_private_data(inode, file_flags, FilePrivateData::TimerFd(file_flags))?;
+        let file = File::new_with_private_data_prepared_recovering(
+            inode,
+            file_flags,
+            FilePrivateData::TimerFd(file_flags),
+            storage,
+        )?;
         let cloexec = flags.contains(TimerFdCreateFlags::TFD_CLOEXEC);
         let current = ProcessManager::current_pcb();
-        current
-            .fd_table()
-            .alloc_fd(file, cloexec, current.nofile_soft_limit())
-            .map(|fd| fd as usize)
+        let file = alloc::sync::Arc::try_new(file).map_err(|_| SystemError::ENOMEM)?;
+        let table = current.fd_table();
+        File::recover_io(|| {
+            table.alloc_fd_arc(
+                file.clone(),
+                cloexec,
+                current.nofile_soft_limit(),
+                &crate::cgroup::memory::object_for_task(&current),
+            )
+        })
+        .map(|fd| fd as usize)
     }
 
     fn entry_format(&self, args: &[usize]) -> Vec<FormattedSyscallParam> {

@@ -89,18 +89,20 @@ impl Syscall for SysIoctlHandle {
             }
             _ => {
                 // 其他命令转发给inode处理
-                let r = file
-                    .inode()
-                    .ioctl(cmd, data, file.private_data.lock())
-                    .map_err(|e| {
-                        // 将内部错误码 ENOIOCTLCMD 转换为用户空间错误码 ENOTTY
-                        if e == SystemError::ENOIOCTLCMD {
-                            SystemError::ENOTTY
-                        } else {
-                            e
-                        }
-                    });
-                return r;
+                let mut recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::default();
+                loop {
+                    // The single attempt owns the private guard. It is gone
+                    // before recovery, and drivers admit resources before
+                    // their irreversible VM/peer/fd publication.
+                    let result = file.inode().ioctl(cmd, data, file.private_data.lock());
+                    match result {
+                        Ok(value) => return Ok(value),
+                        Err(crate::mm::allocation::MemoryAllocationError::System(
+                            SystemError::ENOIOCTLCMD,
+                        )) => return Err(SystemError::ENOTTY),
+                        Err(error) => error.recover(&mut recovery)?,
+                    }
+                }
             }
         }
     }

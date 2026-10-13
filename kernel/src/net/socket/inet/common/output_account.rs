@@ -52,9 +52,20 @@ impl<S: Socket + ?Sized> SocketOutputAccount<S> {
     }
 
     pub(crate) fn set_limit(&self, limit: usize) {
+        let became_writable = self.set_limit_quiet(limit);
+        self.notify_limit_changed(became_writable);
+    }
+
+    /// Publish only the authoritative scalar under a socket transaction.
+    /// Epoll/fasync notification may allocate and must happen after its guards.
+    pub(crate) fn set_limit_quiet(&self, limit: usize) -> bool {
         let was_writable = self.is_writable();
         self.limit.store(limit, Ordering::Release);
-        if !was_writable && self.is_writable() {
+        !was_writable && self.is_writable()
+    }
+
+    pub(crate) fn notify_limit_changed(&self, became_writable: bool) {
+        if became_writable {
             self.wake_writers();
         } else {
             self.wake_blocked_writers();

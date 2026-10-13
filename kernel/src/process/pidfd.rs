@@ -8,11 +8,12 @@ use crate::filesystem::{
     epoll::{EPollEventType, EPollItem},
     vfs::{
         fdtable::FdReservation,
-        file::{File, FileFlags, FilePrivateData},
+        file::{File, FileFlags, FilePrivateData, PreparedFile},
         FileSystem, IndexNode, InodeMode, Metadata, PollableInode,
     },
 };
 use crate::libs::mutex::MutexGuard;
+use crate::mm::allocation::MemoryAllocationError;
 
 use super::{
     pid::{Pid, PidPrivateData, PidType},
@@ -41,8 +42,9 @@ impl IndexNode for PidFdInode {
         &self,
         _data: MutexGuard<FilePrivateData>,
         _flags: &FileFlags,
-    ) -> Result<(), SystemError> {
-        Ok(())
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = Ok(());
+        result.map_err(Into::into)
     }
 
     fn close(&self, _data: MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
@@ -55,8 +57,9 @@ impl IndexNode for PidFdInode {
         _len: usize,
         _buf: &mut [u8],
         _data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError> {
-        Err(SystemError::EINVAL)
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = Err(SystemError::EINVAL);
+        result.map_err(Into::into)
     }
 
     fn write_at(
@@ -65,8 +68,9 @@ impl IndexNode for PidFdInode {
         _len: usize,
         _buf: &[u8],
         _data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError> {
-        Err(SystemError::EINVAL)
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = Err(SystemError::EINVAL);
+        result.map_err(Into::into)
     }
 
     fn fs(&self) -> Arc<dyn FileSystem> {
@@ -208,13 +212,33 @@ pub struct PidFd;
 impl PidFd {
     const PREPARE_ALLOWED_FLAGS: FileFlags = FileFlags::O_NONBLOCK;
 
-    pub fn create_file(pid: Arc<Pid>, flags: FileFlags) -> Result<File, SystemError> {
-        let file = File::new_with_private_data(
-            Arc::new(PidFdInode::new()),
-            FileFlags::O_RDWR | flags,
-            FilePrivateData::Pid(PidPrivateData::new(pid)),
-        )?;
+    pub(crate) fn create_file_prepared(
+        pid: Arc<Pid>,
+        flags: FileFlags,
+        storage: PreparedFile,
+    ) -> Result<File, MemoryAllocationError> {
+        let file = Self::create_unbound_file_prepared(flags, storage)?;
+        Self::bind_pid(&file, pid);
         Ok(file)
+    }
+
+    /// Complete all fallible File preparation while the object is private.
+    /// The pidfd inode hooks do not inspect the target. Fork can therefore
+    /// prepare this File before entering its namespace/publication barrier.
+    pub(crate) fn create_unbound_file_prepared(
+        flags: FileFlags,
+        storage: PreparedFile,
+    ) -> Result<File, MemoryAllocationError> {
+        let inode = Arc::try_new(PidFdInode::new()).map_err(|_| SystemError::ENOMEM)?;
+        File::new_pseudo_prepared(inode, FileFlags::O_RDWR | flags, storage)
+    }
+
+    /// Bind exactly once, before installing this private File into any table.
+    /// This step cannot allocate or fail after the child PID has been born.
+    pub(crate) fn bind_pid(file: &File, pid: Arc<Pid>) {
+        let mut private_data = file.private_data.lock();
+        debug_assert!(matches!(*private_data, FilePrivateData::Unused));
+        *private_data = FilePrivateData::Pid(PidPrivateData::new(pid));
     }
 
     pub fn prepare(
@@ -222,18 +246,21 @@ impl PidFd {
         pid: Arc<Pid>,
         flags: FileFlags,
         require_tgid: bool,
-    ) -> Result<PreparedPidFd, SystemError> {
+    ) -> Result<PreparedPidFd, MemoryAllocationError> {
         if flags.intersects(!Self::PREPARE_ALLOWED_FLAGS) {
-            return Err(SystemError::EINVAL);
+            return Err(SystemError::EINVAL.into());
         }
         if require_tgid && pid.pid_task(PidType::TGID).is_none() {
-            return Err(SystemError::EINVAL);
+            return Err(SystemError::EINVAL.into());
         }
 
-        let reservation = task
-            .fd_table()
-            .reserve::<1>(task.nofile_soft_limit(), 0, true)?;
-        let file = Arc::try_new(Self::create_file(pid, flags)?).map_err(|_| SystemError::ENOMEM)?;
+        let creator = crate::cgroup::memory::object_for_task(task);
+        let reservation =
+            task.fd_table()
+                .reserve::<1>(task.nofile_soft_limit(), 0, true, &creator)?;
+        let storage = PreparedFile::try_new_for(&creator)?;
+        let file = Arc::try_new(Self::create_file_prepared(pid, flags, storage)?)
+            .map_err(|_| SystemError::ENOMEM)?;
 
         Ok(PreparedPidFd { reservation, file })
     }

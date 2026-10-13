@@ -23,6 +23,7 @@ pub mod routing;
 pub(crate) mod rtnl;
 pub mod socket;
 pub mod syscall;
+pub(crate) mod tcp_bounds;
 pub mod tcp_close_defer;
 pub mod tcp_listener;
 pub mod tcp_stack;

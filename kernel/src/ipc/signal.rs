@@ -4,7 +4,7 @@ use core::{
     sync::atomic::{compiler_fence, Ordering},
 };
 
-use alloc::sync::Arc;
+use alloc::{sync::Arc, vec::Vec};
 use log::warn;
 use system_error::SystemError;
 
@@ -27,6 +27,72 @@ use crate::{
         Instant, PosixTimeSpec,
     },
 };
+
+/// An OOM kill prepares storage before publishing GROUP_EXIT. Dispatch only
+/// sets the unmaskable pending bit and wakes the captured threads; it cannot
+/// allocate a sigqueue or a thread-group snapshot after the kill is committed.
+pub(crate) struct PreparedOomSigkill {
+    target: Arc<ProcessControlBlock>,
+    tasks: Vec<Arc<ProcessControlBlock>>,
+}
+
+impl PreparedOomSigkill {
+    pub(crate) fn prepare(target: Arc<ProcessControlBlock>) -> Result<Self, SystemError> {
+        let mut tasks = Vec::new();
+        loop {
+            let guard = crate::process::pid::pid_membership_lock();
+            let result = ProcessManager::fill_thread_group_snapshot(&target, &mut tasks);
+            drop(guard);
+            match result {
+                Ok(_) => return Ok(Self { target, tasks }),
+                Err(required) => tasks
+                    .try_reserve(required)
+                    .map_err(|_| SystemError::ENOMEM)?,
+            }
+        }
+    }
+
+    /// Retire previous snapshot references before entering the transaction.
+    pub(crate) fn clear_snapshot(&mut self) {
+        self.tasks.clear();
+    }
+
+    /// The caller holds pid_membership_lock. Refresh every kill's snapshot
+    /// before committing any of them; insufficient capacity has no side effect.
+    pub(crate) fn refresh_snapshot_locked(&mut self) -> Result<(), ()> {
+        ProcessManager::fill_thread_group_snapshot(&self.target, &mut self.tasks)
+            .map(|_| ())
+            .map_err(|_| ())
+    }
+
+    /// Caller holds pid_membership_lock and has refreshed all snapshots. The
+    /// callbacks must not allocate, sleep or wake. Dispatch is always lock-free.
+    pub(crate) fn commit_if_locked(
+        &mut self,
+        validate: impl FnOnce(&Arc<ProcessControlBlock>) -> bool,
+        committed: impl FnOnce(&Arc<ProcessControlBlock>),
+    ) -> bool {
+        self.target.with_task_lock_irqsave(|| {
+            if !validate(&self.target) {
+                return false;
+            }
+            self.target
+                .process_signal()
+                .start_group_exit_for_fatal_signal(Signal::SIGKILL as usize);
+            committed(&self.target);
+            true
+        })
+    }
+
+    pub(crate) fn dispatch(self) {
+        Signal::queue_private_sigkill_to_thread(&self.target);
+        for task in self.tasks {
+            if !Arc::ptr_eq(&task, &self.target) {
+                Signal::queue_private_sigkill_to_thread(&task);
+            }
+        }
+    }
+}
 
 /// Send a kernel-originated signal to the current task.
 ///

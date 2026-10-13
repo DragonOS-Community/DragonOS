@@ -14,6 +14,24 @@ pub struct CpuMask {
 
 #[allow(dead_code)]
 impl CpuMask {
+    pub fn try_new() -> Result<Self, alloc::collections::TryReserveError> {
+        Ok(Self {
+            bmp: AllocBitmap::try_new(PerCpu::MAX_CPU_NUM as usize)?,
+        })
+    }
+
+    pub fn try_clone(&self) -> Result<Self, alloc::collections::TryReserveError> {
+        Ok(Self {
+            bmp: self.bmp.try_clone()?,
+        })
+    }
+
+    pub fn try_from_cpu(cpu: ProcessorId) -> Result<Self, alloc::collections::TryReserveError> {
+        let mut mask = Self::try_new()?;
+        mask.set(cpu, true);
+        Ok(mask)
+    }
+
     pub fn new() -> Self {
         let bmp = AllocBitmap::new(PerCpu::MAX_CPU_NUM as usize);
         Self { bmp }
@@ -204,8 +222,56 @@ impl AtomicCpuMask {
         (self.words[word].load(Ordering::Relaxed) & bit) != 0
     }
 
+    /// Iterate set CPUs without allocating a dynamic bitmap.
+    ///
+    /// Concurrent writers may be observed between individual bits. Callers
+    /// needing a stable target set must finish populating their private mask
+    /// before iterating it, as the TLB shootdown initiator does.
+    pub fn iter_cpu(&self) -> impl Iterator<Item = ProcessorId> + '_ {
+        (0..PerCpu::MAX_CPU_NUM).filter_map(|index| {
+            let cpu = ProcessorId::new(index);
+            self.get(cpu).then_some(cpu)
+        })
+    }
+
     #[allow(dead_code)]
     pub fn first_and(&self, rhs: &CpuMask) -> Option<ProcessorId> {
         rhs.iter_cpu().find(|&cpu| self.get(cpu))
+    }
+}
+
+#[cfg(test)]
+mod atomic_tests {
+    use super::*;
+
+    #[test]
+    fn fixed_iterator_empty_sparse_and_last_cpu() {
+        let mask = AtomicCpuMask::new();
+        assert!(mask.iter_cpu().next().is_none());
+        mask.set(ProcessorId::new(0));
+        let last = ProcessorId::new(PerCpu::MAX_CPU_NUM - 1);
+        mask.set(last);
+        let mut cpus = mask.iter_cpu();
+        assert_eq!(cpus.next(), Some(ProcessorId::new(0)));
+        if last.data() != 0 {
+            assert_eq!(cpus.next(), Some(last));
+        }
+        assert!(cpus.next().is_none());
+        mask.clear(last);
+        assert_eq!(mask.iter_cpu().count(), usize::from(last.data() != 0));
+    }
+
+    #[test]
+    fn fixed_iterator_visits_each_cpu_once_without_tail_bits() {
+        let mask = AtomicCpuMask::new();
+        for cpu in 0..PerCpu::MAX_CPU_NUM {
+            mask.set(ProcessorId::new(cpu));
+        }
+        let mut expected = 0;
+        for cpu in mask.iter_cpu() {
+            assert_eq!(cpu.data(), expected);
+            expected += 1;
+        }
+        assert_eq!(expected, PerCpu::MAX_CPU_NUM);
     }
 }

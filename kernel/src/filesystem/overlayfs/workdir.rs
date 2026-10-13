@@ -10,9 +10,15 @@ static OVL_TEMP_ID: AtomicUsize = AtomicUsize::new(0);
 type WorkdirTemp = (Arc<dyn IndexNode>, Arc<dyn IndexNode>, String);
 
 impl OvlInode {
-    pub(super) fn create_workdir_temp<F>(&self, create: F) -> Result<WorkdirTemp, SystemError>
+    pub(super) fn create_workdir_temp<F>(
+        &self,
+        create: F,
+    ) -> Result<WorkdirTemp, crate::mm::allocation::MemoryAllocationError>
     where
-        F: Fn(&Arc<dyn IndexNode>, &str) -> Result<Arc<dyn IndexNode>, SystemError>,
+        F: Fn(
+            &Arc<dyn IndexNode>,
+            &str,
+        ) -> Result<Arc<dyn IndexNode>, crate::mm::allocation::MemoryAllocationError>,
     {
         let workdir = self.workdir_inode()?;
         for _ in 0..32 {
@@ -20,18 +26,20 @@ impl OvlInode {
             let name = format!(".dragonos-ovl-{}", id);
             match create(&workdir, &name) {
                 Ok(inode) => return Ok((workdir, inode, name)),
-                Err(SystemError::EEXIST) => continue,
+                Err(crate::mm::allocation::MemoryAllocationError::System(SystemError::EEXIST)) => {
+                    continue
+                }
                 Err(err) => return Err(err),
             }
         }
 
-        Err(SystemError::EEXIST)
+        Err(SystemError::EEXIST.into())
     }
 
     pub(super) fn cleanup_workdir_temp(
         workdir: &Arc<dyn IndexNode>,
         name: &str,
-    ) -> Result<(), SystemError> {
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         Self::cleanup_workdir_temp_with_context(workdir, name, None)
     }
 
@@ -39,11 +47,11 @@ impl OvlInode {
         workdir: &Arc<dyn IndexNode>,
         name: &str,
         context: Option<&DentryMutationContext<'_>>,
-    ) -> Result<(), SystemError> {
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         let inode = match super::lookup::lookup_backing(workdir, name) {
             Ok(inode) => inode,
             Err(SystemError::ENOENT) => return Ok(()),
-            Err(err) => return Err(err),
+            Err(err) => return Err(err.into()),
         };
         let metadata = inode.metadata()?;
 

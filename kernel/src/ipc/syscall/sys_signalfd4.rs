@@ -47,6 +47,7 @@ impl Syscall for SysSignalFd4Handle {
         let mask = read_user_sigset(mask_ptr, mask_size)?;
 
         if fd == -1 {
+            let storage = crate::filesystem::vfs::file::PreparedFile::new_recovering()?;
             let inode = Arc::new(SignalFdInode::new(mask, flags));
             let mut file_flags = FileFlags::O_RDONLY;
             if flags.contains(SignalFdFlags::SFD_NONBLOCK) {
@@ -56,11 +57,19 @@ impl Syscall for SysSignalFd4Handle {
                 file_flags |= FileFlags::O_CLOEXEC;
             }
 
-            let file = File::new(inode, file_flags)?;
+            let file = File::new_prepared_recovering(inode, file_flags, storage)?;
             let cloexec = flags.contains(SignalFdFlags::SFD_CLOEXEC);
             let current = ProcessManager::current_pcb();
             let binding = current.fd_table();
-            let fd = binding.alloc_fd(file, cloexec, current.nofile_soft_limit())?;
+            let file = Arc::try_new(file).map_err(|_| SystemError::ENOMEM)?;
+            let fd = File::recover_io(|| {
+                binding.alloc_fd_arc(
+                    file.clone(),
+                    cloexec,
+                    current.nofile_soft_limit(),
+                    &crate::cgroup::memory::object_for_task(&current),
+                )
+            })?;
             return Ok(fd as usize);
         }
 

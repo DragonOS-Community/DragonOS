@@ -2,6 +2,7 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::sync::atomic::AtomicU64;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize};
+use system_error::SystemError;
 
 use crate::filesystem::vfs::{fasync::FAsyncItems, vcore::generate_inode_id, InodeId};
 use crate::libs::mutex::Mutex;
@@ -21,6 +22,9 @@ type EP = crate::filesystem::epoll::EPollEventType;
 
 #[derive(Debug)]
 pub struct TcpSocketOptions {
+    pub(crate) nagle_enabled: AtomicBool,
+    pub(crate) congestion_control:
+        crate::libs::spinlock::SpinLock<smoltcp::socket::tcp::CongestionControl>,
     /// Updates are serialized with bind/connect by `TcpSocket::inner`.
     pub(crate) ipv6_only: AtomicBool,
     /// SO_SNDTIMEO (microseconds). u64::MAX means "no timeout".
@@ -93,6 +97,10 @@ pub struct TcpSocketOptions {
 impl TcpSocketOptions {
     fn new() -> Self {
         Self {
+            nagle_enabled: AtomicBool::new(true),
+            congestion_control: crate::libs::spinlock::SpinLock::new(
+                smoltcp::socket::tcp::CongestionControl::Reno,
+            ),
             ipv6_only: AtomicBool::new(false),
             send_timeout_us: AtomicU64::new(u64::MAX),
             recv_timeout_us: AtomicU64::new(u64::MAX),
@@ -138,6 +146,70 @@ impl TcpSocketOptions {
 #[cast_to([sync] Socket)]
 #[derive(Debug)]
 pub struct TcpSocket {
+    data: crate::libs::lazy_init::Lazy<crate::cgroup::memory::owned::OwnedBox<TcpSocketData>>,
+}
+
+/// Fully born but unpublished accepted FD entity. No temporary protocol rings
+/// are allocated: the existing pending child supplies its Inner at commit.
+pub(super) struct PreparedAcceptedSocket {
+    socket: Arc<TcpSocket>,
+}
+
+impl PreparedAcceptedSocket {
+    pub(super) fn memory(&self) -> &crate::net::socket::buffer::SocketMemory {
+        &self.socket.memory
+    }
+
+    pub(super) fn commit(self, established: inner::Established) -> Arc<TcpSocket> {
+        let socket = self.socket;
+        let (send, recv, nagle, cc, keepalive) = established.with(|protocol| {
+            (
+                protocol.send_buffer_limit(),
+                protocol.receive_buffer_limit(),
+                protocol.nagle_enabled(),
+                protocol.congestion_control(),
+                protocol.keep_alive(),
+            )
+        });
+        socket
+            .options
+            .send_buf_size
+            .store(send, core::sync::atomic::Ordering::Relaxed);
+        socket
+            .options
+            .recv_buf_size
+            .store(recv, core::sync::atomic::Ordering::Relaxed);
+        socket
+            .options
+            .nagle_enabled
+            .store(nagle, core::sync::atomic::Ordering::Relaxed);
+        *socket.options.congestion_control.lock_irqsave() = cc;
+        socket
+            .options
+            .so_keepalive
+            .store(keepalive.is_some(), core::sync::atomic::Ordering::Relaxed);
+        let policies = established.pmtu_policies();
+        socket
+            .options
+            .ip_mtu_discover
+            .store(policies[0] as i32, core::sync::atomic::Ordering::Relaxed);
+        socket
+            .options
+            .ipv6_mtu_discover
+            .store(policies[1] as i32, core::sync::atomic::Ordering::Relaxed);
+        socket
+            .inner
+            .write()
+            .replace(inner::Inner::Established(established));
+        socket
+    }
+}
+
+/// The actual socket entity is freed with the last strong reference. Weak
+/// protocol identities retain only the thin Arc header, not this charged body.
+#[derive(Debug)]
+pub struct TcpSocketData {
+    pub(crate) memory: crate::net::socket::buffer::SocketMemory,
     pub(crate) inner: RwSem<Option<inner::Inner>>,
     pub(crate) shutdown: AtomicUsize,
     /// If SHUT_WR is requested while `cork_buf` still contains bytes that have not been
@@ -148,7 +220,7 @@ pub struct TcpSocket {
     pub(crate) inode_id: InodeId,
     pub(crate) open_files: AtomicUsize,
     pub(crate) fsnotify_watches: AtomicUsize,
-    pub(crate) self_ref: Weak<Self>,
+    pub(crate) self_ref: Weak<TcpSocket>,
     pub(crate) pollee: AtomicUsize,
     pub(crate) netns: Arc<NetNamespace>,
     pub(crate) device_binding: Arc<SocketDeviceBinding>,
@@ -161,29 +233,63 @@ pub struct TcpSocket {
     /// Serializes readers while a receive transaction temporarily drops the interface-wide
     /// SocketSet lock to copy data to userspace.
     pub(crate) recv_lock: Mutex<()>,
+    pub(crate) resize_lock: Mutex<()>,
     pub(crate) cork_flush_in_progress: AtomicBool,
     pub(crate) cork_timer_active: AtomicBool,
     pub(crate) ip_version: smoltcp::wire::IpVersion,
 }
 
 impl TcpSocket {
+    pub(super) fn prepare_bound_slot(
+        &self,
+    ) -> Result<crate::net::tcp_bounds::BoundSlotReservation, SystemError> {
+        let mut recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
+        loop {
+            let creator = crate::cgroup::memory::object_for_task(&ProcessManager::current_pcb());
+            match self.netns.tcp_stack().reserve_bound_slot(&creator) {
+                Ok(reserved) => return Ok(reserved),
+                Err(error) => error.recover(&mut recovery)?,
+            }
+        }
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Prepared owner, provenance and socket options have independent cancellation lifetimes"
+    )]
     fn new_common(
-        inner: inner::Inner,
+        inner: Option<inner::Inner>,
         nonblock: bool,
         netns: Arc<NetNamespace>,
         pollee_bits: usize,
         ip_version: smoltcp::wire::IpVersion,
         me: &Weak<Self>,
-    ) -> Self {
-        let port_owner = match &inner {
-            inner::Inner::Established(est) => est.port_owner(),
-            _ => netns
-                .tcp_ports()
-                .new_owner(Arc::new(SocketDeviceBinding::from_ifindex(0))),
+        memory: crate::net::socket::buffer::SocketMemory,
+        prepared_owner: Option<(TcpPortOwner, Arc<SocketDeviceBinding>)>,
+    ) -> TcpSocketData {
+        let port_owner = match prepared_owner.as_ref() {
+            Some((owner, _)) => owner.clone(),
+            None => match &inner {
+                Some(inner::Inner::Established(est)) => est.port_owner(),
+                _ => netns
+                    .tcp_ports()
+                    .new_owner(Arc::new(SocketDeviceBinding::from_ifindex(0))),
+            },
         };
-        let device_binding = port_owner.device_binding();
+        let device_binding =
+            prepared_owner.map_or_else(|| port_owner.device_binding(), |(_, device)| device);
         let options = TcpSocketOptions::new();
-        if let inner::Inner::Established(established) = &inner {
+        if let Some(inner) = &inner {
+            if let Some((nagle, cc)) =
+                inner.with_socket(|socket| (socket.nagle_enabled(), socket.congestion_control()))
+            {
+                options
+                    .nagle_enabled
+                    .store(nagle, core::sync::atomic::Ordering::Relaxed);
+                *options.congestion_control.lock_irqsave() = cc;
+            }
+        }
+        if let Some(inner::Inner::Established(established)) = &inner {
             let policies = established.pmtu_policies();
             options
                 .ip_mtu_discover
@@ -205,8 +311,9 @@ impl TcpSocket {
             };
             atomic.store(policy as i32, core::sync::atomic::Ordering::Relaxed);
         }
-        Self {
-            inner: RwSem::new(Some(inner)),
+        TcpSocketData {
+            memory,
+            inner: RwSem::new(inner),
             shutdown: AtomicUsize::new(0),
             send_fin_deferred: AtomicBool::new(false),
             nonblock: AtomicBool::new(nonblock),
@@ -224,47 +331,111 @@ impl TcpSocket {
             options,
             cork_buf: Mutex::new(Vec::new()),
             recv_lock: Mutex::new(()),
+            resize_lock: Mutex::new(()),
             cork_flush_in_progress: AtomicBool::new(false),
             cork_timer_active: AtomicBool::new(false),
             ip_version,
         }
     }
 
-    pub fn new(nonblock: bool, ver: smoltcp::wire::IpVersion) -> Arc<Self> {
+    pub fn new(nonblock: bool, ver: smoltcp::wire::IpVersion) -> Result<Arc<Self>, SystemError> {
         let netns = ProcessManager::current_netns();
-        Arc::new_cyclic(|me| {
-            Self::new_common(
-                inner::Inner::Init(inner::Init::new(ver)),
-                nonblock,
-                netns,
-                0,
-                ver,
-                me,
-            )
-        })
+        let mut recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
+        loop {
+            let task = ProcessManager::current_pcb();
+            let account = crate::cgroup::memory::account_for_task(&task);
+            let creator = crate::cgroup::memory::object_for_task(&task);
+            let prepared = (|| {
+                let memory = crate::net::socket::buffer::SocketMemory::prepare(&account, creator)?;
+                let data = crate::cgroup::memory::owned::OwnedBox::<TcpSocketData>::prepare(
+                    &memory.creator,
+                    crate::cgroup::memory::accounting::KernelByteKind::SlabUnreclaimable,
+                )?
+                .try_allocate()
+                .map_err(|_| SystemError::ENOMEM)?;
+                let init = inner::Init::new(ver, &memory)?;
+                let socket = Arc::try_new(Self {
+                    data: crate::libs::lazy_init::Lazy::new(),
+                })
+                .map_err(|_| SystemError::ENOMEM)?;
+                Ok::<_, crate::mm::allocation::MemoryAllocationError>((memory, data, init, socket))
+            })();
+            match prepared {
+                Ok((memory, data, init, socket)) => {
+                    // The only Weak is cloned into this private body. Nothing
+                    // registers, upgrades, or publishes it before Lazy.init.
+                    socket.data.init(data.init(Self::new_common(
+                        Some(inner::Inner::Init(init)),
+                        nonblock,
+                        netns,
+                        0,
+                        ver,
+                        &Arc::downgrade(&socket),
+                        memory,
+                        None,
+                    )));
+                    return Ok(socket);
+                }
+                Err(error) => error.recover(&mut recovery)?,
+            }
+        }
     }
 
-    pub fn new_established(
-        inner: inner::Established,
+    pub(super) fn prepare_accepted(
         nonblock: bool,
         netns: Arc<NetNamespace>,
         ip_version: smoltcp::wire::IpVersion,
-    ) -> Arc<Self> {
-        Arc::new_cyclic(|me| {
-            Self::new_common(
-                inner::Inner::Established(inner),
-                nonblock,
-                netns,
-                (EP::EPOLLIN.bits() | EP::EPOLLOUT.bits()) as usize,
-                ip_version,
-                me,
-            )
+        memory: crate::net::socket::buffer::SocketMemory,
+        binding: &crate::net::socket::inet::common::port::PreparedTcpAcceptBinding,
+    ) -> Result<PreparedAcceptedSocket, crate::mm::allocation::MemoryAllocationError> {
+        let data = crate::cgroup::memory::owned::OwnedBox::<TcpSocketData>::prepare(
+            &memory.creator,
+            crate::cgroup::memory::accounting::KernelByteKind::SlabUnreclaimable,
+        )?
+        .try_allocate()
+        .map_err(|_| SystemError::ENOMEM)?;
+        let socket = Arc::try_new(Self {
+            data: crate::libs::lazy_init::Lazy::new(),
         })
+        .map_err(|_| SystemError::ENOMEM)?;
+        socket.data.init(data.init(Self::new_common(
+            None,
+            nonblock,
+            netns,
+            (EP::EPOLLIN.bits() | EP::EPOLLOUT.bits()) as usize,
+            ip_version,
+            &Arc::downgrade(&socket),
+            memory,
+            Some((binding.owner.clone(), binding.device.clone())),
+        )));
+        Ok(PreparedAcceptedSocket { socket })
     }
 
     #[inline]
     pub fn is_listening(&self) -> bool {
         matches!(self.inner.read().as_ref(), Some(inner::Inner::Listening(_)))
+    }
+
+    /// Binding an unbound protocol value is the only Init transition that
+    /// needs a new table slot. Prepare the shared array before acquiring the
+    /// transaction's inner guard; a racing bind may make preparation obsolete.
+    pub(super) fn prepare_new_handle_capacity(&self) -> Result<(), SystemError> {
+        let needs_handle = || {
+            matches!(
+                self.inner.read().as_ref(),
+                Some(inner::Inner::Init(inner::Init::Unbound(_)))
+            )
+        };
+        let mut recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
+        while needs_handle() {
+            let creator = crate::cgroup::memory::object_for_task(&ProcessManager::current_pcb());
+            match self.netns.tcp_stack().prepare_socket_capacity(&creator) {
+                Ok(()) => return Ok(()),
+                Err(_) if !needs_handle() => return Ok(()),
+                Err(error) => error.recover(&mut recovery)?,
+            }
+        }
+        Ok(())
     }
 
     #[inline]
@@ -300,7 +471,7 @@ impl TcpSocket {
             .as_ref()
             .map(|inner| match inner {
                 inner::Inner::Closed(_) => 0,
-                _ => inner.with_socket(|s| s.recv_queue()),
+                _ => inner.with_socket(|s| s.recv_queue()).unwrap_or(0),
             })
             .unwrap_or(0)
     }
@@ -469,34 +640,116 @@ impl TcpSocket {
             .load(core::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Updates inner socket buffers for Init state.
-    pub(crate) fn update_inner_buffers(&self, tx_size: usize, rx_size: usize) {
-        let mut writer = self.inner.write();
-        match writer.as_mut() {
-            Some(inner::Inner::Init(init)) => {
-                let _ = init.resize_buffers(rx_size, tx_size);
+    pub(crate) fn update_send_buffer(&self, size: usize) -> Result<(), SystemError> {
+        self.update_socket_buffer(size, true)
+    }
+
+    pub(crate) fn update_receive_buffer(&self, size: usize) -> Result<(), SystemError> {
+        // The protocol's serial-number/window contract supports at most 1GiB.
+        if size as u64 > (1u64 << 30) {
+            return Err(SystemError::ENOBUFS);
+        }
+        self.update_socket_buffer(size, false)
+    }
+
+    fn update_socket_buffer(&self, size: usize, send: bool) -> Result<(), SystemError> {
+        let mut recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
+        loop {
+            // Domain lookup precedes even the task-only resize mutex.
+            let creator = crate::cgroup::memory::object_for_task(&ProcessManager::current_pcb());
+            let operation = self.resize_lock.lock();
+            let capacity = {
+                let inner = self.inner.read();
+                match inner.as_ref() {
+                    Some(inner::Inner::Closed(_) | inner::Inner::Listening(_)) | None => 0,
+                    Some(inner) => inner
+                        .with_socket(|socket| {
+                            if send {
+                                socket.send_capacity()
+                            } else {
+                                socket.recv_capacity()
+                            }
+                        })
+                        .unwrap_or(0),
+                }
+            };
+            let mut candidate = if capacity != 0 && size > capacity {
+                match crate::net::socket::buffer::try_owned_buffer(
+                    &self.memory.sock,
+                    &creator,
+                    size,
+                    0u8,
+                ) {
+                    Ok(buffer) => Some(smoltcp::socket::tcp::SocketBuffer::from_owned(buffer)),
+                    Err(error) => {
+                        drop(operation);
+                        error.recover(&mut recovery)?;
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
+            let mut retired = None;
+            let mut retry = false;
+            {
+                let mut writer = self.inner.write();
+                if let Some(inner) = writer.as_mut() {
+                    inner.with_data_socket_mut(|socket| {
+                        let capacity = if send {
+                            socket.send_capacity()
+                        } else {
+                            socket.recv_capacity()
+                        };
+                        if size > capacity {
+                            let Some(prepared) = candidate.take() else {
+                                retry = true;
+                                return;
+                            };
+                            match if send {
+                                socket.replace_prepared_send_buffer(prepared)
+                            } else {
+                                socket.replace_prepared_receive_buffer(prepared)
+                            } {
+                                Ok(old) => retired = Some(old),
+                                Err(prepared) => {
+                                    candidate = Some(prepared);
+                                    retry = true;
+                                    return;
+                                }
+                            }
+                        }
+                        // A shrink retains the real old stock and queued data;
+                        // future send/send_slice admission uses the new limit.
+                        assert!(if send {
+                            socket.set_send_buffer_limit(size)
+                        } else {
+                            socket.set_receive_buffer_limit(size)
+                        });
+                    });
+                }
+                if !retry {
+                    let option = if send {
+                        &self.options.send_buf_size
+                    } else {
+                        &self.options.recv_buf_size
+                    };
+                    option.store(size, core::sync::atomic::Ordering::Relaxed);
+                }
             }
-            Some(inner::Inner::Established(established)) => {
-                established.with_mut(|socket| {
-                    socket.set_send_buffer_size(tx_size);
-                    socket.set_recv_buffer_size(rx_size);
-                });
-                established.update_io_events(&self.pollee, self.shutdown_bits());
+            drop(operation);
+            drop(candidate);
+            drop(retired);
+            if !retry {
+                return Ok(());
             }
-            Some(inner::Inner::Connecting(connecting)) => {
-                connecting.with_mut(|socket| {
-                    socket.set_send_buffer_size(tx_size);
-                    socket.set_recv_buffer_size(rx_size);
-                });
-                let _ = connecting.update_io_events(&self.pollee);
-            }
-            _ => {}
         }
     }
 
     /// Applies congestion control setting to all applicable inner states.
     pub(crate) fn apply_congestion_control(&self, cc: smoltcp::socket::tcp::CongestionControl) {
         let mut writer = self.inner.write();
+        *self.options.congestion_control.lock_irqsave() = cc;
         if let Some(inner) = writer.as_mut() {
             inner.for_each_socket_mut(|s| s.set_congestion_control(cc));
         }
@@ -553,5 +806,13 @@ impl TcpSocket {
 
     pub fn netns(&self) -> Arc<NetNamespace> {
         self.netns.clone()
+    }
+}
+
+impl core::ops::Deref for TcpSocket {
+    type Target = TcpSocketData;
+
+    fn deref(&self) -> &TcpSocketData {
+        self.data.get()
     }
 }

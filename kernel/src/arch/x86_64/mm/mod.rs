@@ -243,11 +243,11 @@ impl MemoryManagementArch for X86_64MMArch {
     /// 该函数会创建页表并复制内核的映射到新的页表中
     ///
     /// @return 新的页表
-    fn setup_new_usermapper() -> Result<crate::mm::ucontext::UserMapper, SystemError> {
-        let new_umapper: crate::mm::page::PageMapper<X86_64MMArch, LockedFrameAllocator> = unsafe {
-            PageMapper::create(PageTableKind::User, LockedFrameAllocator)
-                .ok_or(SystemError::ENOMEM)?
-        };
+    fn setup_new_usermapper(
+        account: Option<&alloc::sync::Arc<crate::cgroup::memory::object::ObjectAccount>>,
+    ) -> Result<crate::mm::ucontext::UserMapper, crate::mm::allocation::MemoryAllocationError> {
+        let new_umapper: crate::mm::page::PageMapper<X86_64MMArch, LockedFrameAllocator> =
+            unsafe { PageMapper::create_user(account)?.ok_or(SystemError::ENOMEM)? };
 
         let current_ktable: KernelMapper = KernelMapper::lock();
         let copy_mapping = |pml4_entry_no| unsafe {
@@ -886,15 +886,19 @@ impl LowAddressRemapping {
     }
 
     /// 取消低地址的映射
-    pub unsafe fn unmap_at_low_address(mapper: &mut PageMapper, flush: bool) {
+    pub unsafe fn unmap_at_low_address(
+        mapper: &mut PageMapper,
+        gather: &mut crate::mm::mmu_gather::MmuGather<'_>,
+    ) {
         for i in 0..(Self::REMAP_SIZE / MMArch::PAGE_SIZE) {
             let vaddr = VirtAddr::new(i * MMArch::PAGE_SIZE);
             let (_, _, flusher) = mapper
-                .unmap_phys(vaddr, true)
+                .unmap_phys_gather(vaddr, true, gather)
                 .expect("Failed to unmap frame");
-            if !flush {
-                flusher.ignore();
-            }
+            // Identity-mapped leaf frames are not owned by this bootstrap mm.
+            // Only the detached intermediate-table receipts enter the gather.
+            flusher.ignore();
+            gather.accumulate_range(vaddr);
         }
     }
 }

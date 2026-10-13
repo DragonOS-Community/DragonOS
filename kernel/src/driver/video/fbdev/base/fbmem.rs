@@ -408,8 +408,9 @@ impl IndexNode for FbDevice {
         &self,
         _data: MutexGuard<FilePrivateData>,
         _flags: &FileFlags,
-    ) -> Result<(), SystemError> {
-        Ok(())
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = Ok(());
+        result.map_err(Into::into)
     }
 
     fn close(&self, _data: MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
@@ -421,9 +422,12 @@ impl IndexNode for FbDevice {
         len: usize,
         buf: &mut [u8],
         _data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError> {
-        let fb = self.inner.lock().fb.upgrade().unwrap();
-        return fb.fb_read(&mut buf[0..len], offset);
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = (|| {
+            let fb = self.inner.lock().fb.upgrade().unwrap();
+            return fb.fb_read(&mut buf[0..len], offset);
+        })();
+        result.map_err(Into::into)
     }
 
     fn write_at(
@@ -432,9 +436,12 @@ impl IndexNode for FbDevice {
         len: usize,
         buf: &[u8],
         _data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError> {
-        let fb = self.inner.lock().fb.upgrade().unwrap();
-        return fb.fb_write(&buf[0..len], offset);
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = (|| {
+            let fb = self.inner.lock().fb.upgrade().unwrap();
+            return fb.fb_write(&buf[0..len], offset);
+        })();
+        result.map_err(Into::into)
     }
 
     fn fs(&self) -> Arc<dyn FileSystem> {
@@ -459,8 +466,11 @@ impl IndexNode for FbDevice {
         Ok(self.inner.lock().devfs_metadata.clone())
     }
 
-    fn resize(&self, _len: usize) -> Result<(), SystemError> {
-        return Ok(());
+    fn resize(&self, _len: usize) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = (|| {
+            return Ok(());
+        })();
+        result.map_err(Into::into)
     }
 
     fn parent(&self) -> Result<Arc<dyn IndexNode>, SystemError> {

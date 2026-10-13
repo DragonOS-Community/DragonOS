@@ -22,7 +22,7 @@ impl OvlInode {
         &self,
         name: &str,
         context: Option<&DentryMutationContext<'_>>,
-    ) -> Result<(), SystemError> {
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         let whiteout_mode = vfs::InodeMode::S_IFCHR;
         if let Some(ref upper_inode) = *self.upper_inode.lock() {
             upper_inode.mknod(name, whiteout_mode, WHITEOUT_DEV)?;
@@ -38,7 +38,7 @@ impl OvlInode {
             upper_inode.mknod(name, whiteout_mode, WHITEOUT_DEV)?;
             return Ok(());
         }
-        Err(SystemError::EROFS)
+        Err(SystemError::EROFS.into())
     }
 
     pub(super) fn replace_upper_with_whiteout_locked(
@@ -46,7 +46,7 @@ impl OvlInode {
         name: &str,
         is_dir: bool,
         context: Option<&DentryMutationContext<'_>>,
-    ) -> Result<Option<vfs::LinkRemovalOutcome>, SystemError> {
+    ) -> Result<Option<vfs::LinkRemovalOutcome>, crate::mm::allocation::MemoryAllocationError> {
         let upper_dir = match context {
             Some(context) => self.writable_upper_inode_locked_with_context(context)?,
             None => self.writable_upper_inode_locked()?,
@@ -93,7 +93,7 @@ impl OvlInode {
                     replaced: Some(removed),
                 },
             ) => Ok(Some(removed)),
-            _ => Err(SystemError::EIO),
+            _ => Err(SystemError::EIO.into()),
         }
     }
 
@@ -183,7 +183,10 @@ impl OvlInode {
     }
 
     #[allow(dead_code)]
-    pub(super) fn remove_whiteout_if_present(&self, name: &str) -> Result<bool, SystemError> {
+    pub(super) fn remove_whiteout_if_present(
+        &self,
+        name: &str,
+    ) -> Result<bool, crate::mm::allocation::MemoryAllocationError> {
         let upper_inode = self.upper_inode.lock().clone().ok_or(SystemError::EROFS)?;
         match super::lookup::lookup_backing(&upper_inode, name) {
             Ok(inode) => {
@@ -195,7 +198,7 @@ impl OvlInode {
                 }
             }
             Err(SystemError::ENOENT) => Ok(false),
-            Err(err) => Err(err),
+            Err(err) => Err(err.into()),
         }
     }
 }

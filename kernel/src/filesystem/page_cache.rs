@@ -5,7 +5,7 @@ use core::{
 
 use alloc::{
     boxed::Box,
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    collections::{BTreeMap, VecDeque},
     sync::{Arc, Weak},
     vec::Vec,
 };
@@ -19,6 +19,7 @@ use super::vfs::{
 };
 use crate::exception::workqueue::{schedule_work, Work, WorkQueue};
 use crate::libs::errseq::{ErrSeq, ErrSeqValue};
+use crate::libs::lazy_init::Lazy;
 use crate::libs::mutex::MutexGuard;
 use crate::libs::rwsem::{RwSem, RwSemReadGuard, RwSemWriteGuard};
 use crate::libs::spinlock::SpinLock;
@@ -29,7 +30,6 @@ use crate::mm::page_cache_stats as pc_stats;
 use crate::mm::ucontext::LockedVMA;
 use crate::sched::completion::Completion;
 use crate::time::Duration;
-use crate::{arch::mm::LockedFrameAllocator, libs::lazy_init::Lazy};
 use crate::{
     arch::MMArch,
     libs::mutex::Mutex,
@@ -47,14 +47,23 @@ use crate::{libs::align::page_align_up, mm::page::PageType};
 use lazy_static::lazy_static;
 
 mod mapping;
+mod ordered_index;
 mod read_batch;
 mod read_dma;
 mod selftest;
 mod writeback;
+use crate::cgroup::memory::{
+    accounting::{KernelByteKind, MemoryAccount, MemoryKind},
+    object::{ObjectAccount, ObjectCharge},
+    owned::OwnedBox,
+};
+use crate::mm::allocation::MemoryAllocationError;
 use mapping::FileVmaIndex;
 pub(crate) use mapping::PageCacheFaultInvalidateRead;
 pub(crate) use mapping::PageCacheRangeResult;
+pub(crate) use mapping::PageCacheReclaimMapOutcome;
 pub use mapping::UnmapMappingMode;
+use ordered_index::{CacheIndex, Node as CacheIndexNode};
 pub use read_batch::{PageCacheReadBatchCompletion, PageCacheReadBatchRequest};
 pub use read_dma::PageCacheReadDmaReservation;
 pub(crate) use selftest::{run_accounting_debug_selftest, run_completion_domain_debug_selftest};
@@ -831,14 +840,16 @@ pub struct InnerPageCache {
     #[allow(unused)]
     id: usize,
     pages: HashMap<usize, Arc<PageEntry>>,
-    page_indices: BTreeSet<usize>,
-    dirty_pages: BTreeSet<usize>,
+    // The table allocation is physically freed before its byte receipt.
+    pages_charge: Option<ObjectCharge>,
+    page_indices: CacheIndex,
+    dirty_pages: CacheIndex,
     /// Page indices whose entries are currently in `PageState::Writeback`.
     ///
     /// This is maintained under the same `inner` lock as the entry state so
     /// range completion checks remain atomic without scanning every cached
     /// page while holding the lock.
-    writeback_pages: BTreeSet<usize>,
+    writeback_pages: CacheIndex,
     /// Next identity assigned to any Dirty -> Writeback transition. Legacy
     /// I/O needs this identity too, so it is distinct from token descriptor
     /// generations.
@@ -927,6 +938,12 @@ impl PageIoWaiter {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PageCacheFaultState {
+    pub(crate) cached: bool,
+    pub(crate) ready: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PageState {
     Loading = 0,
     UpToDate = 1,
@@ -945,7 +962,19 @@ impl PageState {
 }
 
 struct PageEntry {
+    storage: OwnedBox<PageEntryState>,
+}
+
+impl core::ops::Deref for PageEntry {
+    type Target = PageEntryState;
+    fn deref(&self) -> &Self::Target {
+        &self.storage
+    }
+}
+
+struct PageEntryState {
     page: Arc<Page>,
+    index_spares: SpinLock<[Option<OwnedBox<CacheIndexNode>>; 3]>,
     /// Never-reused identity for a certificate. Physical-page addresses and
     /// cache indices can both be reused after reclaim, so neither is enough
     /// to bind a delayed-writeback ticket across teardown races.
@@ -974,6 +1003,59 @@ struct PageEntry {
     wait_queue: WaitQueue,
 }
 
+struct CacheTableCapacity {
+    pages: HashMap<usize, Arc<PageEntry>>,
+    charge: Option<ObjectCharge>,
+}
+
+/// Backend quota reserved for an as-yet invisible range. Successful cache
+/// publication transfers each unit to remove_entry; every other exit refunds
+/// it before any reader can attach to a partial Loading range.
+struct BackendPageReservation {
+    backend: Option<Arc<dyn PageCacheBackend>>,
+    remaining: usize,
+}
+
+impl BackendPageReservation {
+    fn prepare(
+        backend: Option<Arc<dyn PageCacheBackend>>,
+        count: usize,
+    ) -> Result<Self, SystemError> {
+        let mut permit = Self {
+            backend,
+            remaining: 0,
+        };
+        if let Some(backend) = permit.backend.as_ref() {
+            for _ in 0..count {
+                backend.reserve_page()?;
+                permit.remaining += 1;
+            }
+        }
+        Ok(permit)
+    }
+
+    fn commit(&mut self) {
+        self.remaining = 0;
+    }
+}
+
+impl Drop for BackendPageReservation {
+    fn drop(&mut self) {
+        if let Some(backend) = self.backend.as_ref() {
+            for _ in 0..self.remaining {
+                backend.release_page();
+            }
+        }
+    }
+}
+
+impl Drop for CacheTableCapacity {
+    fn drop(&mut self) {
+        drop(mem::take(&mut self.pages));
+        drop(self.charge.take());
+    }
+}
+
 struct PageWritebackRetryWait {
     entry: Arc<PageEntry>,
 }
@@ -985,8 +1067,9 @@ impl core::fmt::Debug for PageWritebackRetryWait {
 }
 
 impl FaultRetryWait for PageWritebackRetryWait {
-    fn wait(&self) -> Result<(), SystemError> {
+    fn wait(&self) -> Result<(), MemoryAllocationError> {
         PageCacheManager::wait_writeback_entry(self.entry.clone())
+            .map_err(MemoryAllocationError::System)
     }
 }
 
@@ -1013,6 +1096,25 @@ pub struct PageCacheManager {
 }
 
 impl PageCacheManager {
+    pub(crate) fn try_commit_page_pinned(
+        &self,
+        page_index: usize,
+        owner: &Arc<MemoryAccount>,
+        creator: &Arc<ObjectAccount>,
+    ) -> Result<PageCachePagePin, MemoryAllocationError> {
+        self.upgrade()?
+            .try_get_or_create_page_pinned(page_index, true, owner, creator)
+    }
+
+    pub(crate) fn try_commit_overwrite_pinned(
+        &self,
+        page_index: usize,
+        owner: &Arc<MemoryAccount>,
+        creator: &Arc<ObjectAccount>,
+    ) -> Result<PageCachePagePin, MemoryAllocationError> {
+        self.upgrade()?
+            .try_get_or_create_page_pinned(page_index, false, owner, creator)
+    }
     fn new(owner: Weak<PageCache>) -> Self {
         Self { owner }
     }
@@ -1043,6 +1145,20 @@ impl PageCacheManager {
         self.upgrade()?.get_or_create_page_with(page_index, fill)
     }
 
+    pub(crate) fn try_commit_page_with<F>(
+        &self,
+        page_index: usize,
+        owner: &Arc<MemoryAccount>,
+        creator: &Arc<ObjectAccount>,
+        fill: F,
+    ) -> Result<Arc<Page>, MemoryAllocationError>
+    where
+        F: FnOnce(usize, &mut [u8]) -> Result<usize, SystemError>,
+    {
+        self.upgrade()?
+            .try_get_or_create_page_with(page_index, owner, creator, fill)
+    }
+
     pub fn commit_page_for_write_with<F>(
         &self,
         page_index: usize,
@@ -1053,6 +1169,20 @@ impl PageCacheManager {
     {
         self.upgrade()?
             .get_or_create_page_for_write_with(page_index, fill)
+    }
+
+    pub(crate) fn try_commit_page_for_write_with<F>(
+        &self,
+        page_index: usize,
+        owner: &Arc<MemoryAccount>,
+        creator: &Arc<ObjectAccount>,
+        fill: F,
+    ) -> Result<Arc<Page>, MemoryAllocationError>
+    where
+        F: FnOnce(usize, &mut [u8]) -> Result<usize, SystemError>,
+    {
+        self.upgrade()?
+            .try_get_or_create_page_for_write_with(page_index, owner, creator, fill)
     }
 
     pub fn commit_overwrite(&self, page_index: usize) -> Result<Arc<Page>, SystemError> {
@@ -1100,6 +1230,21 @@ impl PageCacheManager {
     /// On failure, discard only pages created here that have not been acquired,
     /// mapped or dirtied by another user; rollback is not a truncate operation.
     pub fn preallocate_range(&self, first: usize, last: usize) -> Result<(), SystemError> {
+        let task = crate::process::ProcessManager::current_pcb();
+        let owner = crate::cgroup::memory::account_for_task(&task);
+        let creator = crate::cgroup::memory::object_for_task(&task);
+        self.try_preallocate_range(first, last, &owner, &creator)
+            .map_err(PageCache::legacy_allocation_error)
+    }
+
+    pub(crate) fn try_preallocate_range(
+        &self,
+        first: usize,
+        last: usize,
+        owner: &Arc<MemoryAccount>,
+        creator: &Arc<ObjectAccount>,
+    ) -> Result<(), MemoryAllocationError> {
+        let cache = self.upgrade()?;
         let missing_pages = self.missing_pages_in_range(first, last)?;
         let mut created: Vec<(usize, Arc<Page>)> = Vec::new();
         created
@@ -1107,8 +1252,9 @@ impl PageCacheManager {
             .map_err(|_| SystemError::ENOMEM)?;
 
         for page_index in first..=last {
-            match self.commit_overwrite_pinned_with_status(page_index) {
-                Ok((pin, was_created)) => {
+            match cache.try_get_or_create_entry_pinned(page_index, false, owner, creator) {
+                Ok((entry, entry_pin, was_created)) => {
+                    let pin = PageCachePagePin::new(entry.page.clone(), entry_pin);
                     if was_created {
                         if created.len() == created.capacity() && created.try_reserve(1).is_err() {
                             let current_page = pin.page();
@@ -1117,7 +1263,7 @@ impl PageCacheManager {
                             for (created_index, created_page) in created.into_iter().rev() {
                                 let _ = self.discard_created_page(created_index, &created_page);
                             }
-                            return Err(SystemError::ENOMEM);
+                            return Err(SystemError::ENOMEM.into());
                         }
                         created.push((page_index, pin.page()));
                     }
@@ -1320,7 +1466,7 @@ impl PageCacheManager {
         }
     }
 
-    pub fn page_mkwrite_retry_wait(
+    pub(crate) fn page_mkwrite_retry_wait(
         &self,
         page_index: usize,
         page: &Arc<Page>,
@@ -1461,13 +1607,13 @@ impl PageCacheManager {
                 .get_entry(page_index)
                 .is_some_and(|entry| entry.active_users() == 0)
             {
-                inner.remove_page(page_index)
+                inner.remove_entry(page_index)
             } else {
                 None
             }
         };
         drop(cache.detach_dirty_retention_if_idle());
-        Ok(removed)
+        Ok(removed.map(|entry| entry.page.clone()))
     }
 
     /// Roll back a page newly inserted by a transactional cache operation.
@@ -1531,13 +1677,13 @@ impl PageCacheManager {
             {
                 return Ok(false);
             }
-            guard.remove_page(page_index)
+            guard.remove_entry(page_index)
         };
         drop(page_guard);
         let Some(page) = removed else {
             return Ok(false);
         };
-        cache.discard_unlinked_page(&page);
+        cache.discard_unlinked_page(&page.page);
         drop(cache.detach_dirty_retention_if_idle());
         Ok(true)
     }
@@ -1564,16 +1710,18 @@ impl PageCacheManager {
         let state = entry.state();
         if matches!(
             state,
-            PageState::Loading | PageState::Writeback | PageState::Error
+            PageState::Loading | PageState::Dirty | PageState::Writeback | PageState::Error
         ) {
             return Ok(None);
         }
-        let page_reclaimable = {
-            let page_guard = entry.page.write();
-            !page_guard.flags().intersects(
-                PageFlags::PG_DIRTY | PageFlags::PG_WRITEBACK | PageFlags::PG_UNEVICTABLE,
-            ) && page_guard.map_count() == 0
-        };
+        // Keep page -> cache locked through membership removal, as in
+        // discard_created_page. Otherwise dirty publication or rmap insertion
+        // can invalidate this check before the later cache-only commit.
+        let page_guard = entry.page.read();
+        let page_reclaimable = !page_guard
+            .flags()
+            .intersects(PageFlags::PG_DIRTY | PageFlags::PG_WRITEBACK | PageFlags::PG_UNEVICTABLE)
+            && page_guard.map_count() == 0;
         if !page_reclaimable {
             return Ok(None);
         }
@@ -1587,11 +1735,15 @@ impl PageCacheManager {
             || cache.mapping_unevictable()
             || current.active_users() != 0
             || current.state() != state
+            || guard.dirty_pages.contains(&page_index)
+            || guard.writeback_pages.contains(&page_index)
         {
             return Ok(None);
         }
-        let removed = guard.remove_page(page_index);
-        Ok(removed)
+        let removed = guard.remove_entry(page_index);
+        drop(guard);
+        drop(page_guard);
+        Ok(removed.map(|entry| entry.page.clone()))
     }
 }
 
@@ -1602,25 +1754,61 @@ impl core::fmt::Debug for PageCacheManager {
 }
 
 impl PageEntry {
+    /// Legacy selftest fixture construction; real cache birth uses try_new
+    /// before publication and preserves its typed admission error.
     fn new(page: Arc<Page>, state: PageState) -> Self {
+        let creator =
+            crate::cgroup::memory::object_for_task(&crate::process::ProcessManager::current_pcb());
+        Self::try_new(page, state, &creator).expect("selftest entry preparation failed")
+    }
+
+    fn try_new(
+        page: Arc<Page>,
+        state: PageState,
+        creator: &Arc<ObjectAccount>,
+    ) -> Result<Self, MemoryAllocationError> {
         let instance_id = PAGE_CACHE_ENTRY_INSTANCE_ID
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 current.checked_add(1)
             })
-            .expect("page-cache entry certificate identity exhausted");
-        Self {
-            page,
-            instance_id,
-            state: AtomicU8::new(state as u8),
-            dirty_incarnation: AtomicU64::new(0),
-            dirty_transition_kind: AtomicU8::new(0),
-            writeback_tag: AtomicU64::new(0),
-            writeback_incarnation: AtomicU64::new(0),
-            accounting: AtomicU8::new(PageEntryAccounting::Unaccounted as u8),
-            accounted_unevictable: AtomicBool::new(false),
-            active_users: AtomicUsize::new(0),
-            wait_queue: WaitQueue::default(),
-        }
+            .map_err(|_| MemoryAllocationError::System(SystemError::EOVERFLOW))?;
+        let nodes = [
+            Some(CacheIndexNode::try_new(creator)?),
+            Some(CacheIndexNode::try_new(creator)?),
+            Some(CacheIndexNode::try_new(creator)?),
+        ];
+        let storage = OwnedBox::prepare(creator, KernelByteKind::SlabUnreclaimable)
+            .map_err(MemoryAllocationError::Charge)?
+            .try_init(PageEntryState {
+                page,
+                index_spares: SpinLock::new(nodes),
+                instance_id,
+                state: AtomicU8::new(state as u8),
+                dirty_incarnation: AtomicU64::new(0),
+                dirty_transition_kind: AtomicU8::new(0),
+                writeback_tag: AtomicU64::new(0),
+                writeback_incarnation: AtomicU64::new(0),
+                accounting: AtomicU8::new(PageEntryAccounting::Unaccounted as u8),
+                accounted_unevictable: AtomicBool::new(false),
+                active_users: AtomicUsize::new(0),
+                wait_queue: WaitQueue::default(),
+            })
+            .map_err(|_| MemoryAllocationError::System(SystemError::ENOMEM))?;
+        Ok(Self { storage })
+    }
+
+    fn take_index_node(&self, slot: usize, index: usize) -> OwnedBox<CacheIndexNode> {
+        let mut node = self.index_spares.lock_irqsave()[slot]
+            .take()
+            .expect("entry index already linked");
+        node.key = index;
+        node
+    }
+
+    fn return_index_node(&self, slot: usize, node: OwnedBox<CacheIndexNode>) {
+        let mut spares = self.index_spares.lock_irqsave();
+        assert!(spares[slot].is_none(), "entry index returned twice");
+        spares[slot] = Some(node);
     }
 
     fn accounting(&self) -> PageEntryAccounting {
@@ -1890,6 +2078,62 @@ impl PageCachePagePin {
 }
 
 impl InnerPageCache {
+    /// Commit a capacity prepared without the cache lock. A racing insertion
+    /// can invalidate its size, never the current live entries or accounting.
+    fn install_capacity(
+        &mut self,
+        prepared: &mut Option<CacheTableCapacity>,
+        additional: usize,
+    ) -> Result<Option<CacheTableCapacity>, ()> {
+        let required = self.pages.len().checked_add(additional).ok_or(())?;
+        if required <= self.pages.capacity() {
+            return Ok(None);
+        }
+        let candidate = prepared.as_mut().ok_or(())?;
+        if required > candidate.pages.capacity() {
+            return Err(());
+        }
+        let mut retired = CacheTableCapacity {
+            pages: mem::take(&mut self.pages),
+            charge: self.pages_charge.take(),
+        };
+        for (key, entry) in retired.pages.drain() {
+            candidate.pages.insert(key, entry);
+        }
+        self.pages = mem::take(&mut candidate.pages);
+        self.pages_charge = candidate.charge.take();
+        Ok(Some(retired))
+    }
+    fn update_index(
+        index: &mut CacheIndex,
+        entry: &PageEntry,
+        slot: usize,
+        offset: usize,
+        linked: bool,
+    ) {
+        if linked {
+            if !index.contains(&offset) {
+                index.insert(entry.take_index_node(slot, offset));
+            }
+        } else if let Some(node) = index.remove(&offset) {
+            entry.return_index_node(slot, node);
+        }
+    }
+
+    fn set_index(&mut self, offset: usize, slot: usize, linked: bool) {
+        let entry = self
+            .pages
+            .get(&offset)
+            .expect("ordered index has no cache entry");
+        let index = match slot {
+            0 => &mut self.page_indices,
+            1 => &mut self.dirty_pages,
+            2 => &mut self.writeback_pages,
+            _ => unreachable!(),
+        };
+        Self::update_index(index, entry, slot, offset, linked);
+    }
+
     fn new(
         page_cache_ref: Weak<PageCache>,
         id: usize,
@@ -1899,9 +2143,10 @@ impl InnerPageCache {
         Self {
             id,
             pages: HashMap::new(),
-            page_indices: BTreeSet::new(),
-            dirty_pages: BTreeSet::new(),
-            writeback_pages: BTreeSet::new(),
+            pages_charge: None,
+            page_indices: CacheIndex::new(),
+            dirty_pages: CacheIndex::new(),
+            writeback_pages: CacheIndex::new(),
             next_writeback_incarnation: 1,
             next_writeback_generation: 1,
             dirty_retention: None,
@@ -1916,16 +2161,19 @@ impl InnerPageCache {
         self.pages.get(&offset).map(|entry| entry.page.clone())
     }
 
-    pub fn remove_page(&mut self, offset: usize) -> Option<Arc<Page>> {
-        let entry = self.pages.remove(&offset)?;
-        self.page_indices.remove(&offset);
-        self.dirty_pages.remove(&offset);
-        self.writeback_pages.remove(&offset);
+    fn remove_entry(&mut self, offset: usize) -> Option<Arc<PageEntry>> {
+        if !self.pages.contains_key(&offset) {
+            return None;
+        }
+        self.set_index(offset, 0, false);
+        self.set_index(offset, 1, false);
+        self.set_index(offset, 2, false);
+        let entry = self.pages.remove(&offset).unwrap();
         entry.account_remove();
         if let Some(backend) = self.accounting_backend.as_ref() {
             backend.release_page();
         }
-        Some(entry.page.clone())
+        Some(entry)
     }
 
     fn get_entry(&self, offset: usize) -> Option<Arc<PageEntry>> {
@@ -1949,22 +2197,28 @@ impl InnerPageCache {
     }
 
     fn insert_entry(&mut self, offset: usize, entry: Arc<PageEntry>) -> Result<(), SystemError> {
+        if let Some(backend) = self.accounting_backend.as_ref() {
+            backend.reserve_page()?;
+        }
+        self.insert_entry_reserved(offset, entry);
+        Ok(())
+    }
+
+    /// The caller owns an unpublished backend permit and has prepared table
+    /// capacity. No admission or metadata allocation can fail in this commit.
+    fn insert_entry_reserved(&mut self, offset: usize, entry: Arc<PageEntry>) {
         let mapping_unevictable = self
             .page_cache_ref
             .upgrade()
             .is_some_and(|cache| cache.mapping_unevictable());
         match self.pages.entry(offset) {
             Entry::Vacant(slot) => {
-                if let Some(backend) = self.accounting_backend.as_ref() {
-                    backend.reserve_page()?;
-                }
                 entry.account_insert(self.kind, mapping_unevictable);
                 slot.insert(entry);
             }
             Entry::Occupied(_) => panic!("page-cache insert requires a vacant slot"),
         }
-        self.page_indices.insert(offset);
-        Ok(())
+        self.set_index(offset, 0, true);
     }
 
     /// Insert an intrinsically unevictable, preallocated page without adding
@@ -2017,6 +2271,70 @@ impl Drop for InnerPageCache {
 }
 
 impl PageCache {
+    fn try_get_or_create_page_pinned(
+        &self,
+        page_index: usize,
+        populate_backend: bool,
+        owner: &Arc<MemoryAccount>,
+        creator: &Arc<ObjectAccount>,
+    ) -> Result<PageCachePagePin, MemoryAllocationError> {
+        loop {
+            let (entry, _) = self.try_get_or_create_entry_with_status(
+                page_index,
+                populate_backend,
+                owner,
+                creator,
+            )?;
+            let inner = self.inner.lock();
+            if inner
+                .pages
+                .get(&page_index)
+                .is_some_and(|current| Arc::ptr_eq(current, &entry))
+                && entry.state().is_ready()
+            {
+                let pin = entry.pin();
+                drop(inner);
+                return Ok(PageCachePagePin::new(entry.page.clone(), pin));
+            }
+        }
+    }
+    fn prepare_table_capacity(
+        &self,
+        additional: usize,
+        creator: &Arc<ObjectAccount>,
+    ) -> Result<Option<CacheTableCapacity>, MemoryAllocationError> {
+        let required = {
+            let inner = self.inner.lock();
+            let required = inner
+                .pages
+                .len()
+                .checked_add(additional)
+                .ok_or(SystemError::EOVERFLOW)?;
+            if required <= inner.pages.capacity() {
+                return Ok(None);
+            }
+            required
+        };
+        let mut pages = HashMap::new();
+        pages
+            .try_reserve(required)
+            .map_err(|_| MemoryAllocationError::System(SystemError::ENOMEM))?;
+        // Only inspect the pinned library's actual allocation layout. No raw
+        // bucket access or copied private capacity/layout formula is used.
+        let (_, layout) = pages.raw_table().allocation_info();
+        let charge = match creator.try_charge_allocation(KernelByteKind::SlabUnreclaimable, layout)
+        {
+            Ok(charge) => charge,
+            Err(error) => {
+                drop(pages);
+                return Err(MemoryAllocationError::Charge(error));
+            }
+        };
+        Ok(Some(CacheTableCapacity {
+            pages,
+            charge: Some(charge),
+        }))
+    }
     // Lock order: page_cache -> page_manager -> page_reclaimer.
     // Avoid holding page_cache lock while acquiring page_manager when possible.
     pub fn new_file(
@@ -2290,12 +2608,12 @@ impl PageCache {
                 return None;
             }
 
-            let page_reclaimable = {
-                let page_guard = entry.page.read();
-                !page_guard.flags().intersects(
-                    PageFlags::PG_DIRTY | PageFlags::PG_WRITEBACK | PageFlags::PG_UNEVICTABLE,
-                ) && page_guard.map_count() == 0
-            };
+            // Match reclaim's page -> cache commit. A newly mapped or dirtied
+            // page must not be detached after a stale unlocked flag check.
+            let page_guard = entry.page.read();
+            let page_reclaimable = !page_guard.flags().intersects(
+                PageFlags::PG_DIRTY | PageFlags::PG_WRITEBACK | PageFlags::PG_UNEVICTABLE,
+            ) && page_guard.map_count() == 0;
             if !page_reclaimable {
                 return None;
             }
@@ -2308,10 +2626,15 @@ impl PageCache {
             if self.mapping_unevictable()
                 || current.active_users() != 0
                 || !matches!(current.state(), PageState::UpToDate | PageState::Error)
+                || guard.dirty_pages.contains(&page_index)
+                || guard.writeback_pages.contains(&page_index)
             {
                 return None;
             }
-            return guard.remove_page(page_index);
+            let removed = guard.remove_entry(page_index);
+            drop(guard);
+            drop(page_guard);
+            return removed.map(|entry| entry.page.clone());
         }
     }
 
@@ -2319,9 +2642,9 @@ impl PageCache {
         let mut evicted = 0;
         for page_index in self.clean_evict_indices(range) {
             if let Some(page) = self.remove_clean_page_candidate(page_index, true) {
-                let paddr = page.phys_address();
-                page_manager_lock().remove_page(&paddr);
-                let _ = page_reclaimer_lock().remove_page(&paddr);
+                detach_pages_from_reclaimer_batched(core::iter::once(&page));
+                let removed = page_manager_lock().remove_page_if_same(&page);
+                drop(removed);
                 evicted += 1;
             }
         }
@@ -2404,13 +2727,9 @@ impl PageCache {
                     if !was_unevictable {
                         page_guard.add_flags(PageFlags::PG_UNEVICTABLE);
                     }
-                    let paddr = page.phys_address();
                     drop(page_guard);
                     entry.account_unevictable_if_needed();
                     drop(guard);
-                    if !was_unevictable {
-                        let _ = page_reclaimer_lock().remove_page(&paddr);
-                    }
                 } else {
                     let mut page_guard = page.write();
                     let guard = self.inner.lock();
@@ -2426,14 +2745,6 @@ impl PageCache {
                     entry.unaccount_unevictable_if_needed();
                     if !keep_unevictable && was_unevictable {
                         page_guard.remove_flags(PageFlags::PG_UNEVICTABLE);
-                        let paddr = page.phys_address();
-                        let should_reclaim =
-                            !self.is_shmem() && page_guard.flags().contains(PageFlags::PG_LRU);
-                        drop(page_guard);
-                        drop(guard);
-                        if should_reclaim {
-                            page_reclaimer_lock().insert_page(paddr, page);
-                        }
                     }
                 }
             }
@@ -2445,7 +2756,6 @@ impl PageCache {
 
     fn reconcile_entry_unevictable_for_insert(&self, entry: &PageEntry) {
         let mapping_unevictable = self.mapping_unevictable();
-        let paddr = entry.page.phys_address();
         if mapping_unevictable {
             let mut page_guard = entry.page.write();
             let was_unevictable = page_guard.flags().contains(PageFlags::PG_UNEVICTABLE);
@@ -2453,9 +2763,6 @@ impl PageCache {
                 page_guard.add_flags(PageFlags::PG_UNEVICTABLE);
             }
             drop(page_guard);
-            if !was_unevictable {
-                let _ = page_reclaimer_lock().remove_page(&paddr);
-            }
             return;
         }
 
@@ -2464,11 +2771,6 @@ impl PageCache {
         let was_unevictable = page_guard.flags().contains(PageFlags::PG_UNEVICTABLE);
         if was_unevictable && !page_guard.has_unevictable_source() {
             page_guard.remove_flags(PageFlags::PG_UNEVICTABLE);
-            let should_reclaim = page_guard.flags().contains(PageFlags::PG_LRU);
-            drop(page_guard);
-            if should_reclaim {
-                page_reclaimer_lock().insert_page(paddr, &entry.page);
-            }
         }
     }
 
@@ -2477,15 +2779,138 @@ impl PageCache {
         page_cache_ref: Weak<PageCache>,
         page_index: usize,
     ) -> Result<Arc<Page>, SystemError> {
-        let mut page_manager_guard = page_manager_lock();
-        page_manager_guard.create_one_page(
+        let owner =
+            crate::cgroup::memory::account_for_task(&crate::process::ProcessManager::current_pcb());
+        self.allocate_page_with_owner(page_cache_ref, page_index, &owner)
+            .map_err(Self::legacy_allocation_error)
+    }
+
+    fn legacy_allocation_error(error: MemoryAllocationError) -> SystemError {
+        match error {
+            MemoryAllocationError::Charge(_) => SystemError::ENOMEM,
+            MemoryAllocationError::System(error) => error,
+        }
+    }
+
+    fn allocate_page_with_owner(
+        &self,
+        page_cache_ref: Weak<PageCache>,
+        page_index: usize,
+        owner: &Arc<MemoryAccount>,
+    ) -> Result<Arc<Page>, MemoryAllocationError> {
+        let kind = if self.is_shmem() {
+            MemoryKind::Shmem
+        } else {
+            MemoryKind::File
+        };
+        let charge = owner
+            .try_charge(kind, 1)
+            .map_err(MemoryAllocationError::Charge)?;
+        crate::mm::page::allocate_registered_data_page(
             PageType::File(FileMapInfo {
                 page_cache: page_cache_ref,
                 index: page_index,
             }),
             self.page_flags(),
-            &mut LockedFrameAllocator,
+            Some(charge),
         )
+        .map_err(MemoryAllocationError::System)
+    }
+
+    fn prepare_entry(
+        &self,
+        page: &Arc<Page>,
+        state: PageState,
+        creator: &Arc<ObjectAccount>,
+    ) -> Result<Arc<PageEntry>, MemoryAllocationError> {
+        let result = PageEntry::try_new(page.clone(), state, creator).and_then(|entry| {
+            Arc::try_new(entry).map_err(|_| MemoryAllocationError::System(SystemError::ENOMEM))
+        });
+        if result.is_err() {
+            self.discard_unlinked_page(page);
+        }
+        result
+    }
+
+    fn publish_prepared_entry(
+        &self,
+        page_index: usize,
+        prepared_entry: &Arc<PageEntry>,
+        creator: &Arc<ObjectAccount>,
+    ) -> Result<(Arc<PageEntry>, bool), MemoryAllocationError> {
+        let mut capacity = None;
+        loop {
+            if capacity.is_none() {
+                match self.prepare_table_capacity(1, creator) {
+                    Ok(prepared) => capacity = prepared,
+                    Err(error) => {
+                        self.discard_unlinked_page(&prepared_entry.page);
+                        return Err(error);
+                    }
+                }
+            }
+            let mut inner = self.inner.lock();
+            if let Some(current) = inner.get_entry(page_index) {
+                drop(inner);
+                self.discard_unlinked_page(&prepared_entry.page);
+                return Ok((current, false));
+            }
+            let retired = match inner.install_capacity(&mut capacity, 1) {
+                Ok(retired) => retired,
+                Err(()) => {
+                    drop(inner);
+                    drop(capacity.take());
+                    continue;
+                }
+            };
+            let inserted = inner.insert_entry(page_index, prepared_entry.clone());
+            drop(inner);
+            drop(retired);
+            if let Err(error) = inserted {
+                self.discard_unlinked_page(&prepared_entry.page);
+                return Err(error.into());
+            }
+            return Ok((prepared_entry.clone(), true));
+        }
+    }
+
+    fn publish_prepared_range<'a, I>(
+        &self,
+        entries: I,
+        count: usize,
+        creator: &Arc<ObjectAccount>,
+    ) -> Result<(), MemoryAllocationError>
+    where
+        I: Iterator<Item = (usize, &'a Arc<PageEntry>)> + Clone,
+    {
+        let backend = self.inner.lock().accounting_backend.clone();
+        let mut permit = BackendPageReservation::prepare(backend, count)?;
+        loop {
+            let mut capacity = self.prepare_table_capacity(count, creator)?;
+            let mut inner = self.inner.lock();
+            if entries
+                .clone()
+                .any(|(index, _)| inner.pages.contains_key(&index))
+            {
+                drop(inner);
+                return Err(SystemError::EEXIST.into());
+            }
+            let retired = match inner.install_capacity(&mut capacity, count) {
+                Ok(retired) => retired,
+                Err(()) => {
+                    drop(inner);
+                    drop(capacity);
+                    continue;
+                }
+            };
+            for (index, entry) in entries.clone() {
+                inner.insert_entry_reserved(index, entry.clone());
+            }
+            permit.commit();
+            drop(inner);
+            drop(retired);
+            return Ok(());
+        }
     }
 
     fn populate_page_from_backend(
@@ -2541,6 +2966,21 @@ impl PageCache {
         page_index: usize,
         populate_backend: bool,
     ) -> Result<(Arc<PageEntry>, bool), SystemError> {
+        let owner =
+            crate::cgroup::memory::account_for_task(&crate::process::ProcessManager::current_pcb());
+        let creator =
+            crate::cgroup::memory::object_for_task(&crate::process::ProcessManager::current_pcb());
+        self.try_get_or_create_entry_with_status(page_index, populate_backend, &owner, &creator)
+            .map_err(Self::legacy_allocation_error)
+    }
+
+    fn try_get_or_create_entry_with_status(
+        &self,
+        page_index: usize,
+        populate_backend: bool,
+        owner: &Arc<MemoryAccount>,
+        creator: &Arc<ObjectAccount>,
+    ) -> Result<(Arc<PageEntry>, bool), MemoryAllocationError> {
         let mut page_cache_ref = None;
         let mut existing_entry = None;
         {
@@ -2558,7 +2998,7 @@ impl PageCache {
                 return Ok((entry, false));
             }
             if state == PageState::Error {
-                return Err(SystemError::EIO);
+                return Err(SystemError::EIO.into());
             }
             let _ = entry.wait_ready()?;
             return Ok((entry, false));
@@ -2570,23 +3010,13 @@ impl PageCache {
                 (entry, false)
             } else {
                 drop(guard);
-                let page = self.allocate_page(
+                let page = self.allocate_page_with_owner(
                     page_cache_ref.expect("page_cache_ref should exist"),
                     page_index,
+                    owner,
                 )?;
-                let mut guard = self.inner.lock();
-                if let Some(entry) = guard.get_entry(page_index) {
-                    self.discard_unlinked_page(&page);
-                    (entry, false)
-                } else {
-                    let entry = Arc::new(PageEntry::new(page, PageState::Loading));
-                    if let Err(error) = guard.insert_entry(page_index, entry.clone()) {
-                        drop(guard);
-                        self.discard_unlinked_page(&entry.page);
-                        return Err(error);
-                    }
-                    (entry, true)
-                }
+                let prepared_entry = self.prepare_entry(&page, PageState::Loading, creator)?;
+                self.publish_prepared_entry(page_index, &prepared_entry, creator)?
             }
         };
 
@@ -2596,7 +3026,7 @@ impl PageCache {
                 return Ok((entry, false));
             }
             if state == PageState::Error {
-                return Err(SystemError::EIO);
+                return Err(SystemError::EIO.into());
             }
             let _ = entry.wait_ready()?;
             return Ok((entry, false));
@@ -2619,7 +3049,7 @@ impl PageCache {
                 entry.set_state(PageState::Error);
                 entry.wait_queue.wake_all();
                 self.remove_failed_entry(page_index, &entry);
-                Err(e)
+                Err(e.into())
             }
         }
     }
@@ -2629,9 +3059,27 @@ impl PageCache {
         page_index: usize,
         populate_backend: bool,
     ) -> Result<(Arc<PageEntry>, PageEntryPin, bool), SystemError> {
+        let task = crate::process::ProcessManager::current_pcb();
+        let owner = crate::cgroup::memory::account_for_task(&task);
+        let creator = crate::cgroup::memory::object_for_task(&task);
+        self.try_get_or_create_entry_pinned(page_index, populate_backend, &owner, &creator)
+            .map_err(Self::legacy_allocation_error)
+    }
+
+    fn try_get_or_create_entry_pinned(
+        &self,
+        page_index: usize,
+        populate_backend: bool,
+        owner: &Arc<MemoryAccount>,
+        creator: &Arc<ObjectAccount>,
+    ) -> Result<(Arc<PageEntry>, PageEntryPin, bool), MemoryAllocationError> {
         loop {
-            let (entry, created) =
-                self.get_or_create_entry_with_status(page_index, populate_backend)?;
+            let (entry, created) = self.try_get_or_create_entry_with_status(
+                page_index,
+                populate_backend,
+                owner,
+                creator,
+            )?;
             let guard = self.inner.lock();
             let Some(current) = guard.get_entry(page_index) else {
                 continue;
@@ -2648,9 +3096,10 @@ impl PageCache {
         let mut guard = self.inner.lock();
         if let Some(current) = guard.get_entry(page_index) {
             if Arc::ptr_eq(&current, entry) {
-                guard.remove_page(page_index);
+                guard.remove_entry(page_index);
             }
         }
+        drop(guard);
         self.discard_unlinked_page(&entry.page);
     }
 
@@ -2663,11 +3112,11 @@ impl PageCache {
             if entry.state() != PageState::Error {
                 return;
             }
-            guard.remove_page(page_index)
+            guard.remove_entry(page_index)
         };
 
         if let Some(page) = removed {
-            self.discard_unlinked_page(&page);
+            self.discard_unlinked_page(&page.page);
         }
     }
 
@@ -2680,10 +3129,10 @@ impl PageCache {
             if !Arc::ptr_eq(&entry, expected) || entry.state() != PageState::Error {
                 return false;
             }
-            guard.remove_page(page_index)
+            guard.remove_entry(page_index)
         };
         if let Some(page) = removed {
-            self.discard_unlinked_page(&page);
+            self.discard_unlinked_page(&page.page);
             true
         } else {
             false
@@ -2691,19 +3140,32 @@ impl PageCache {
     }
 
     fn discard_unlinked_page(&self, page: &Arc<Page>) {
-        let paddr = page.phys_address();
         let can_remove_from_manager = {
             let mut page_guard = page.write();
             page_guard.clear_unlinked_file_mapping_unevictable();
             page_guard.can_deallocate()
         };
         if can_remove_from_manager {
-            page_manager_lock().remove_page(&paddr);
+            let removed = page_manager_lock().remove_page_if_same(page);
+            drop(removed);
         }
-        let _ = page_reclaimer_lock().remove_page(&paddr);
+        detach_pages_from_reclaimer_batched(core::iter::once(page));
     }
 
     fn start_async_read(&self, page_index: usize) -> Result<(), SystemError> {
+        let task = crate::process::ProcessManager::current_pcb();
+        let owner = crate::cgroup::memory::account_for_task(&task);
+        let creator = crate::cgroup::memory::object_for_task(&task);
+        self.try_start_async_read(page_index, &owner, &creator)
+            .map_err(Self::legacy_allocation_error)
+    }
+
+    fn try_start_async_read(
+        &self,
+        page_index: usize,
+        owner: &Arc<MemoryAccount>,
+        creator: &Arc<ObjectAccount>,
+    ) -> Result<(), MemoryAllocationError> {
         let mut existing_entry = None;
         let mut page_cache_ref = None;
         {
@@ -2734,20 +3196,15 @@ impl PageCache {
                 return Ok(());
             }
             drop(guard);
-            let page = self.allocate_page(
+            let page = self.allocate_page_with_owner(
                 page_cache_ref.expect("page_cache_ref should exist"),
                 page_index,
+                owner,
             )?;
-            let mut guard = self.inner.lock();
-            if guard.get_entry(page_index).is_some() {
-                self.discard_unlinked_page(&page);
+            let prepared = self.prepare_entry(&page, PageState::Loading, creator)?;
+            let (entry, created) = self.publish_prepared_entry(page_index, &prepared, creator)?;
+            if !created {
                 return Ok(());
-            }
-            let entry = Arc::new(PageEntry::new(page, PageState::Loading));
-            if let Err(error) = guard.insert_entry(page_index, entry.clone()) {
-                drop(guard);
-                self.discard_unlinked_page(&entry.page);
-                return Err(error);
             }
             entry
         };
@@ -2796,6 +3253,23 @@ impl PageCache {
 
     pub fn is_page_ready(&self, page_index: usize) -> bool {
         self.inner.lock().is_page_ready(page_index)
+    }
+
+    /// A cache miss is distinct from waiting for an existing Loading/Error
+    /// entry. Capture both predicates under one lock without pinning entries
+    /// or exposing their lifetime to the fault caller.
+    pub(crate) fn fault_page_state(&self, page_index: usize) -> PageCacheFaultState {
+        let inner = self.inner.lock();
+        match inner.pages.get(&page_index) {
+            Some(entry) => PageCacheFaultState {
+                cached: true,
+                ready: entry.state().is_ready(),
+            },
+            None => PageCacheFaultState {
+                cached: false,
+                ready: false,
+            },
+        }
     }
 
     /// Test an entire half-open page range while holding the cache lock once.
@@ -2850,6 +3324,23 @@ impl PageCache {
     where
         F: FnOnce(usize, &mut [u8]) -> Result<usize, SystemError>,
     {
+        let task = crate::process::ProcessManager::current_pcb();
+        let owner = crate::cgroup::memory::account_for_task(&task);
+        let creator = crate::cgroup::memory::object_for_task(&task);
+        self.try_get_or_create_page_with(page_index, &owner, &creator, fill)
+            .map_err(Self::legacy_allocation_error)
+    }
+
+    fn try_get_or_create_page_with<F>(
+        &self,
+        page_index: usize,
+        owner: &Arc<MemoryAccount>,
+        creator: &Arc<ObjectAccount>,
+        fill: F,
+    ) -> Result<Arc<Page>, MemoryAllocationError>
+    where
+        F: FnOnce(usize, &mut [u8]) -> Result<usize, SystemError>,
+    {
         let mut page_cache_ref = None;
         let mut existing_entry = None;
         {
@@ -2867,7 +3358,7 @@ impl PageCache {
                 return Ok(entry.page.clone());
             }
             if state == PageState::Error {
-                return Err(SystemError::EIO);
+                return Err(SystemError::EIO.into());
             }
             let page = entry.wait_ready()?;
             return Ok(page);
@@ -2879,23 +3370,13 @@ impl PageCache {
                 (entry, false)
             } else {
                 drop(guard);
-                let page = self.allocate_page(
+                let page = self.allocate_page_with_owner(
                     page_cache_ref.expect("page_cache_ref should exist"),
                     page_index,
+                    owner,
                 )?;
-                let mut guard = self.inner.lock();
-                if let Some(entry) = guard.get_entry(page_index) {
-                    self.discard_unlinked_page(&page);
-                    (entry, false)
-                } else {
-                    let entry = Arc::new(PageEntry::new(page, PageState::Loading));
-                    if let Err(error) = guard.insert_entry(page_index, entry.clone()) {
-                        drop(guard);
-                        self.discard_unlinked_page(&entry.page);
-                        return Err(error);
-                    }
-                    (entry, true)
-                }
+                let prepared = self.prepare_entry(&page, PageState::Loading, creator)?;
+                self.publish_prepared_entry(page_index, &prepared, creator)?
             }
         };
 
@@ -2905,14 +3386,14 @@ impl PageCache {
                 return Ok(entry.page.clone());
             }
             if state == PageState::Error {
-                return Err(SystemError::EIO);
+                return Err(SystemError::EIO.into());
             }
-            return entry.wait_ready();
+            return entry.wait_ready().map_err(MemoryAllocationError::System);
         }
         self.reconcile_entry_unevictable_for_insert(&entry);
 
         let populate_result = {
-            let mut tmp = vec![0; MMArch::PAGE_SIZE];
+            let mut tmp = [0u8; MMArch::PAGE_SIZE];
             match fill(page_index, &mut tmp) {
                 Ok(read_len) if read_len <= MMArch::PAGE_SIZE => {
                     let mut page_guard = entry.page.write();
@@ -2936,7 +3417,7 @@ impl PageCache {
                 entry.set_state(PageState::Error);
                 entry.wait_queue.wake_all();
                 self.remove_failed_entry(page_index, &entry);
-                Err(e)
+                Err(e.into())
             }
         }
     }
@@ -2949,6 +3430,23 @@ impl PageCache {
         page_index: usize,
         fill: F,
     ) -> Result<Arc<Page>, SystemError>
+    where
+        F: FnOnce(usize, &mut [u8]) -> Result<usize, SystemError>,
+    {
+        let task = crate::process::ProcessManager::current_pcb();
+        let owner = crate::cgroup::memory::account_for_task(&task);
+        let creator = crate::cgroup::memory::object_for_task(&task);
+        self.try_get_or_create_page_for_write_with(page_index, &owner, &creator, fill)
+            .map_err(Self::legacy_allocation_error)
+    }
+
+    fn try_get_or_create_page_for_write_with<F>(
+        &self,
+        page_index: usize,
+        owner: &Arc<MemoryAccount>,
+        creator: &Arc<ObjectAccount>,
+        fill: F,
+    ) -> Result<Arc<Page>, MemoryAllocationError>
     where
         F: FnOnce(usize, &mut [u8]) -> Result<usize, SystemError>,
     {
@@ -2979,38 +3477,26 @@ impl PageCache {
                             self.discard_error_entry_if_same(page_index, &entry);
                             continue;
                         }
-                        Err(e) => return Err(e),
+                        Err(e) => return Err(e.into()),
                     },
                     PageState::UpToDate | PageState::Dirty => unreachable!(),
                 }
             }
 
-            let page = self.allocate_page(
+            let page = self.allocate_page_with_owner(
                 page_cache_ref.expect("page_cache_ref should exist"),
                 page_index,
+                owner,
             )?;
-            let entry = Arc::new(PageEntry::new(page, PageState::Loading));
-            let inserted = {
-                let mut guard = self.inner.lock();
-                if guard.get_entry(page_index).is_some() {
-                    false
-                } else {
-                    if let Err(error) = guard.insert_entry(page_index, entry.clone()) {
-                        drop(guard);
-                        self.discard_unlinked_page(&entry.page);
-                        return Err(error);
-                    }
-                    true
-                }
-            };
+            let entry = self.prepare_entry(&page, PageState::Loading, creator)?;
+            let (_, inserted) = self.publish_prepared_entry(page_index, &entry, creator)?;
             if !inserted {
-                self.discard_unlinked_page(&entry.page);
                 continue;
             }
             self.reconcile_entry_unevictable_for_insert(&entry);
 
             let populate_result = {
-                let mut tmp = vec![0; MMArch::PAGE_SIZE];
+                let mut tmp = [0u8; MMArch::PAGE_SIZE];
                 match fill.take().expect("write page fill consumed once")(page_index, &mut tmp) {
                     Ok(read_len) if read_len <= MMArch::PAGE_SIZE => {
                         let mut page_guard = entry.page.write();
@@ -3034,7 +3520,7 @@ impl PageCache {
                     entry.set_state(PageState::Error);
                     entry.wait_queue.wake_all();
                     self.remove_failed_entry(page_index, &entry);
-                    return Err(e);
+                    return Err(e.into());
                 }
             }
         }
@@ -3189,13 +3675,13 @@ impl PageCache {
     /// lock before sampling the flag, so it cannot fold this write into an
     /// older writeback incarnation between flagging and publication.
     fn publish_front_dirty_locked(
-        dirty_pages: &mut BTreeSet<usize>,
+        dirty_pages: &mut CacheIndex,
         page_index: usize,
         entry: &Arc<PageEntry>,
     ) -> PageCacheDirtyPublication {
         let old_state = entry.state();
         let transition = entry.begin_front_dirty_transition(page_index, old_state);
-        dirty_pages.insert(page_index);
+        InnerPageCache::update_index(dirty_pages, entry, 1, page_index, true);
         if old_state != PageState::Writeback {
             entry.account_state_transition(old_state, PageState::Dirty);
             entry.set_state(PageState::Dirty);
@@ -3394,8 +3880,8 @@ impl PageCache {
                 .writeback_incarnation
                 .store(writeback_incarnation, Ordering::Release);
             entry.set_state(PageState::Writeback);
-            guard.dirty_pages.remove(&page_index);
-            guard.writeback_pages.insert(page_index);
+            guard.set_index(page_index, 1, false);
+            guard.set_index(page_index, 2, true);
             return true;
         }
         false
@@ -3407,8 +3893,8 @@ impl PageCache {
             let old_state = entry.state();
             entry.account_state_transition(old_state, PageState::UpToDate);
             entry.set_state(PageState::UpToDate);
-            guard.dirty_pages.remove(&page_index);
-            guard.writeback_pages.remove(&page_index);
+            guard.set_index(page_index, 1, false);
+            guard.set_index(page_index, 2, false);
         }
         drop(guard);
         drop(self.detach_dirty_retention_if_idle());
@@ -3420,8 +3906,8 @@ impl PageCache {
         if let Some(entry) = guard.get_entry(page_index) {
             let old_state = entry.state();
             entry.account_state_transition(old_state, PageState::Dirty);
-            guard.dirty_pages.insert(page_index);
-            guard.writeback_pages.remove(&page_index);
+            guard.set_index(page_index, 1, true);
+            guard.set_index(page_index, 2, false);
             entry.set_state(PageState::Dirty);
             entry.wait_queue.wake_all();
         }
@@ -3440,6 +3926,8 @@ impl PageCache {
         start_page_index: usize,
         batch: ManagedPageBatch,
     ) -> Result<(), SystemError> {
+        let creator =
+            crate::cgroup::memory::object_for_task(&crate::process::ProcessManager::current_pcb());
         let end_page_index = start_page_index
             .checked_add(batch.pages().len())
             .ok_or(SystemError::EOVERFLOW)?;
@@ -3456,33 +3944,42 @@ impl PageCache {
                 return Err(SystemError::EINVAL);
             }
             drop(page_guard);
-            entries.push(
-                Arc::try_new(PageEntry::new(page.clone(), PageState::UpToDate))
-                    .map_err(|_| SystemError::ENOMEM)?,
-            );
+            // ManagedPageBatch is the rollback authority until commit; entry
+            // preparation must not independently detach its registered frames.
+            let entry = PageEntry::try_new(page.clone(), PageState::UpToDate, &creator)
+                .map_err(Self::legacy_allocation_error)?;
+            entries.push(Arc::try_new(entry).map_err(|_| SystemError::ENOMEM)?);
         }
-
-        let _reclassify_guard = self.reclassify_lock.lock();
-        let mut guard = self.inner.lock();
-        if guard.accounting_backend.is_some() {
-            return Err(SystemError::EINVAL);
+        loop {
+            let mut prepared_capacity = self
+                .prepare_table_capacity(entries.len(), &creator)
+                .map_err(Self::legacy_allocation_error)?;
+            let reclassify = self.reclassify_lock.lock();
+            let mut guard = self.inner.lock();
+            if guard.accounting_backend.is_some() {
+                return Err(SystemError::EINVAL);
+            }
+            if (start_page_index..end_page_index).any(|index| guard.pages.contains_key(&index)) {
+                return Err(SystemError::EEXIST);
+            }
+            let retired = match guard.install_capacity(&mut prepared_capacity, entries.len()) {
+                Ok(retired) => retired,
+                Err(()) => {
+                    drop(guard);
+                    drop(reclassify);
+                    drop(prepared_capacity);
+                    continue;
+                }
+            };
+            for (index, entry) in (start_page_index..end_page_index).zip(&entries) {
+                entry.account_insert(guard.kind, true);
+                guard.pages.insert(index, entry.clone());
+            }
+            drop(guard);
+            drop(reclassify);
+            drop(retired);
+            break;
         }
-        guard
-            .pages
-            .try_reserve(entries.len())
-            .map_err(|_| SystemError::ENOMEM)?;
-        if (start_page_index..end_page_index).any(|index| guard.pages.contains_key(&index)) {
-            return Err(SystemError::EEXIST);
-        }
-
-        // Capacity and the complete target range were preflighted; publication
-        // below has no fallible step and therefore cannot expose a prefix.
-        for (index, entry) in (start_page_index..end_page_index).zip(entries) {
-            entry.account_insert(guard.kind, true);
-            guard.pages.insert(index, entry);
-        }
-        drop(guard);
-        drop(_reclassify_guard);
         batch.commit();
         Ok(())
     }
@@ -3494,6 +3991,8 @@ impl PageCache {
         page_index: usize,
         page: Arc<Page>,
     ) -> Result<(), SystemError> {
+        let creator =
+            crate::cgroup::memory::object_for_task(&crate::process::ProcessManager::current_pcb());
         let page_guard = page.read();
         if !page_guard.flags().contains(PageFlags::PG_UNEVICTABLE)
             || !matches!(page_guard.page_type(), PageType::Normal)
@@ -3501,37 +4000,50 @@ impl PageCache {
             return Err(SystemError::EINVAL);
         }
         drop(page_guard);
-        let entry = Arc::try_new(PageEntry::new(page, PageState::UpToDate))
-            .map_err(|_| SystemError::ENOMEM)?;
-        let _reclassify_guard = self.reclassify_lock.lock();
-        {
-            let guard = self.inner.lock();
+        let prepared = PageEntry::try_new(page.clone(), PageState::UpToDate, &creator)
+            .map_err(Self::legacy_allocation_error)?;
+        let entry = Arc::try_new(prepared).map_err(|_| SystemError::ENOMEM)?;
+        loop {
+            let mut prepared_capacity = self
+                .prepare_table_capacity(1, &creator)
+                .map_err(Self::legacy_allocation_error)?;
+            let reclassify = self.reclassify_lock.lock();
+            let mut guard = self.inner.lock();
             if guard.get_entry(page_index).is_some() {
                 return Err(SystemError::EEXIST);
             }
-        }
-        self.reconcile_entry_unevictable_for_insert(&entry);
-        let mut guard = self.inner.lock();
-        if guard.get_entry(page_index).is_some() {
+            let retired = match guard.install_capacity(&mut prepared_capacity, 1) {
+                Ok(retired) => retired,
+                Err(()) => {
+                    drop(guard);
+                    drop(reclassify);
+                    drop(prepared_capacity);
+                    continue;
+                }
+            };
+            let result = guard.insert_preallocated_entry(page_index, entry.clone());
             drop(guard);
-            self.discard_unlinked_page(&entry.page);
-            return Err(SystemError::EEXIST);
-        }
-        guard
-            .pages
-            .try_reserve(1)
-            .map_err(|_| SystemError::ENOMEM)?;
-        match guard.insert_preallocated_entry(page_index, entry.clone()) {
-            Ok(()) => Ok(()),
-            Err(error) => {
-                drop(guard);
-                self.discard_unlinked_page(&entry.page);
-                Err(error)
-            }
+            drop(reclassify);
+            drop(retired);
+            return result;
         }
     }
 
     pub fn read_pages(&self, start_page_index: usize, page_num: usize) -> Result<(), SystemError> {
+        let task = crate::process::ProcessManager::current_pcb();
+        let owner = crate::cgroup::memory::account_for_task(&task);
+        let creator = crate::cgroup::memory::object_for_task(&task);
+        self.try_read_pages(start_page_index, page_num, &owner, &creator)
+            .map_err(Self::legacy_allocation_error)
+    }
+
+    pub(crate) fn try_read_pages(
+        &self,
+        start_page_index: usize,
+        page_num: usize,
+        owner: &Arc<MemoryAccount>,
+        creator: &Arc<ObjectAccount>,
+    ) -> Result<(), MemoryAllocationError> {
         if page_num == 0 {
             return Ok(());
         }
@@ -3542,7 +4054,7 @@ impl PageCache {
         let cache = self.manager.upgrade()?;
         let Some(backend) = cache.backend() else {
             for offset in 0..page_num {
-                cache.start_async_read(start_page_index + offset)?;
+                cache.try_start_async_read(start_page_index + offset, owner, creator)?;
             }
             return Ok(());
         };
@@ -3579,17 +4091,18 @@ impl PageCache {
             }
 
             let domain_io = cache.try_acquire_domain_io()?;
-            let completion =
-                match PageCacheReadBatchCompletion::reserve(&cache, run.0, run.1, domain_io) {
-                    Ok(completion) => completion,
-                    // A racing reader installed one of these pages after the
-                    // scan. It owns the fill; a later cache read will wait on it.
-                    Err(SystemError::EEXIST) => {
-                        cursor = run.0;
-                        continue;
-                    }
-                    Err(error) => return Err(error),
-                };
+            let completion = match PageCacheReadBatchCompletion::try_reserve(
+                &cache, run.0, run.1, domain_io, owner, creator,
+            ) {
+                Ok(completion) => completion,
+                // A racing reader installed one of these pages after the
+                // scan. It owns the fill; a later cache read will wait on it.
+                Err(MemoryAllocationError::System(SystemError::EEXIST)) => {
+                    cursor = run.0;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             let relative_start = (run.0 - start_page_index) * MMArch::PAGE_SIZE;
             let run_capacity = run.1 * MMArch::PAGE_SIZE;
             let run_valid = valid_bytes.saturating_sub(relative_start).min(run_capacity);
@@ -3607,6 +4120,20 @@ impl PageCache {
 
     /// 两阶段读取：持锁收集拷贝项，解锁后拷贝到目标缓冲区，避免用户缺页导致自锁
     pub fn read(&self, offset: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
+        let task = crate::process::ProcessManager::current_pcb();
+        let owner = crate::cgroup::memory::account_for_task(&task);
+        let creator = crate::cgroup::memory::object_for_task(&task);
+        self.try_read(offset, buf, &owner, &creator)
+            .map_err(Self::legacy_allocation_error)
+    }
+
+    pub(crate) fn try_read(
+        &self,
+        offset: usize,
+        buf: &mut [u8],
+        owner: &Arc<MemoryAccount>,
+        creator: &Arc<ObjectAccount>,
+    ) -> Result<usize, MemoryAllocationError> {
         // Serialize cache lookup/fill with mapping removal, but release this
         // guard before touching a user destination: its fault may need this
         // same mapping while an invalidator is waiting for our entry pins.
@@ -3631,6 +4158,9 @@ impl PageCache {
         let end_page_index = (offset + len - 1) >> MMArch::PAGE_SHIFT;
 
         let mut copies: Vec<CopyItem> = Vec::new();
+        copies
+            .try_reserve_exact(end_page_index - start_page_index + 1)
+            .map_err(|_| SystemError::ENOMEM)?;
         let mut ret = 0usize;
 
         for page_index in start_page_index..=end_page_index {
@@ -3644,7 +4174,8 @@ impl PageCache {
                 continue;
             }
 
-            let (entry, pin, _) = self.get_or_create_entry_pinned(page_index, true)?;
+            let (entry, pin, _) =
+                self.try_get_or_create_entry_pinned(page_index, true, owner, creator)?;
             copies.push(CopyItem {
                 entry,
                 _pin: pin,
@@ -3675,7 +4206,21 @@ impl PageCache {
     }
 
     pub fn write(&self, offset: usize, buf: &[u8]) -> Result<usize, SystemError> {
-        let (mut copies, ret) = self.prepare_write_copies(offset, buf.len())?;
+        let task = crate::process::ProcessManager::current_pcb();
+        let owner = crate::cgroup::memory::account_for_task(&task);
+        let creator = crate::cgroup::memory::object_for_task(&task);
+        self.try_write(offset, buf, &owner, &creator)
+            .map_err(Self::legacy_allocation_error)
+    }
+
+    pub(crate) fn try_write(
+        &self,
+        offset: usize,
+        buf: &[u8],
+        owner: &Arc<MemoryAccount>,
+        creator: &Arc<ObjectAccount>,
+    ) -> Result<usize, MemoryAllocationError> {
+        let (mut copies, ret) = self.try_prepare_write_copies(offset, buf.len(), owner, creator)?;
         let mut dirty_reservation = if ret != 0 {
             Some(self.prepare_page_dirty()?)
         } else {
@@ -3813,6 +4358,32 @@ impl PageCache {
     where
         G: FnOnce(PageCacheDirtyTransition),
     {
+        let task = crate::process::ProcessManager::current_pcb();
+        let owner = crate::cgroup::memory::account_for_task(&task);
+        let creator = crate::cgroup::memory::object_for_task(&task);
+        self.try_write_single_page_segment_with_transition(
+            offset,
+            buf,
+            expected,
+            &owner,
+            &creator,
+            on_published,
+        )
+        .map_err(Self::legacy_allocation_error)
+    }
+
+    pub(crate) fn try_write_single_page_segment_with_transition<G>(
+        &self,
+        offset: usize,
+        buf: &[u8],
+        expected: PageCacheExpectedDirtyTransition,
+        owner: &Arc<MemoryAccount>,
+        creator: &Arc<ObjectAccount>,
+        on_published: G,
+    ) -> Result<usize, MemoryAllocationError>
+    where
+        G: FnOnce(PageCacheDirtyTransition),
+    {
         if buf.is_empty() {
             return Ok(0);
         }
@@ -3822,10 +4393,10 @@ impl PageCache {
             .checked_add(buf.len())
             .is_none_or(|end| end > MMArch::PAGE_SIZE)
         {
-            return Err(SystemError::EINVAL);
+            return Err(SystemError::EINVAL.into());
         }
 
-        let (mut copies, ret) = self.prepare_write_copies(offset, buf.len())?;
+        let (mut copies, ret) = self.try_prepare_write_copies(offset, buf.len(), owner, creator)?;
         let item = copies.items.first().ok_or(SystemError::EIO)?;
         if copies.items.len() != 1
             || ret != buf.len()
@@ -3833,7 +4404,7 @@ impl PageCache {
             || item.page_offset != page_offset
             || item.sub_len != buf.len()
         {
-            return Err(SystemError::EIO);
+            return Err(SystemError::EIO.into());
         }
 
         let _ = volatile_read!(buf[0]);
@@ -3848,7 +4419,7 @@ impl PageCache {
             .get_entry(item.page_index)
             .ok_or(SystemError::ESTALE)?;
         if !Arc::ptr_eq(&current, &item.entry) || !Arc::ptr_eq(&current.page, &item.entry.page) {
-            return Err(SystemError::ESTALE);
+            return Err(SystemError::ESTALE.into());
         }
 
         match expected {
@@ -3856,7 +4427,7 @@ impl PageCache {
                 if inner.dirty_pages.contains(&item.page_index)
                     || matches!(current.state(), PageState::Dirty | PageState::Writeback)
                 {
-                    return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+                    return Err(SystemError::EAGAIN_OR_EWOULDBLOCK.into());
                 }
             }
             PageCacheExpectedDirtyTransition::Merge(certificate) => {
@@ -3865,7 +4436,7 @@ impl PageCache {
                     || current.current_dirty_certificate(self.instance_id, item.page_index)?
                         != certificate
                 {
-                    return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+                    return Err(SystemError::EAGAIN_OR_EWOULDBLOCK.into());
                 }
             }
         }
@@ -3896,6 +4467,20 @@ impl PageCache {
         offset: usize,
         len: usize,
     ) -> Result<(PreparedWriteCopies<'_>, usize), SystemError> {
+        let task = crate::process::ProcessManager::current_pcb();
+        let owner = crate::cgroup::memory::account_for_task(&task);
+        let creator = crate::cgroup::memory::object_for_task(&task);
+        self.try_prepare_write_copies(offset, len, &owner, &creator)
+            .map_err(Self::legacy_allocation_error)
+    }
+
+    fn try_prepare_write_copies(
+        &self,
+        offset: usize,
+        len: usize,
+        owner: &Arc<MemoryAccount>,
+        creator: &Arc<ObjectAccount>,
+    ) -> Result<(PreparedWriteCopies<'_>, usize), MemoryAllocationError> {
         let mut copies = PreparedWriteCopies {
             cache: self,
             items: Vec::new(),
@@ -3922,7 +4507,7 @@ impl PageCache {
             let populate_backend = !self.is_shmem() && !full_page_overwrite;
             self.discard_error_entry(page_index);
             let (entry, pin, created) =
-                self.get_or_create_entry_pinned(page_index, populate_backend)?;
+                self.try_get_or_create_entry_pinned(page_index, populate_backend, owner, creator)?;
             copies.items.push(CopyItem {
                 entry,
                 _pin: pin,
@@ -3952,7 +4537,25 @@ impl PageCache {
     where
         F: FnOnce(usize) -> Result<(), SystemError>,
     {
-        let (mut copies, ret) = self.prepare_write_copies(offset, buf.len())?;
+        let task = crate::process::ProcessManager::current_pcb();
+        let owner = crate::cgroup::memory::account_for_task(&task);
+        let creator = crate::cgroup::memory::object_for_task(&task);
+        self.try_write_with_before_dirty(offset, buf, &owner, &creator, before_dirty)
+            .map_err(Self::legacy_allocation_error)
+    }
+
+    pub(crate) fn try_write_with_before_dirty<F>(
+        &self,
+        offset: usize,
+        buf: &[u8],
+        owner: &Arc<MemoryAccount>,
+        creator: &Arc<ObjectAccount>,
+        before_dirty: F,
+    ) -> Result<usize, MemoryAllocationError>
+    where
+        F: FnOnce(usize) -> Result<(), SystemError>,
+    {
+        let (mut copies, ret) = self.try_prepare_write_copies(offset, buf.len(), owner, creator)?;
         if ret == 0 {
             return Ok(0);
         }

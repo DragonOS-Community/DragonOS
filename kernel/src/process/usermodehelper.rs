@@ -170,11 +170,24 @@ fn run_child_prepare(
     if let Some(cred) = cred {
         child.install_cred(cred);
     }
-    let fd_table = match Arc::try_new(FileDescriptorTable::new(FdTableState::new())) {
-        Ok(table) => table,
-        Err(_) => {
-            *exec_error.lock() = Some(SystemError::ENOMEM);
-            return Err(SystemError::ENOMEM);
+    let mut recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
+    let fd_table = loop {
+        // No PCB basic-info, fd-table, or helper-result guard spans admission
+        // or recovery. Preserve the old table until the private one is ready.
+        let candidate = (|| {
+            let creator = crate::cgroup::memory::object_for_task(&child);
+            Arc::try_new(FileDescriptorTable::try_new(FdTableState::new(), &creator)?).map_err(
+                |_| crate::mm::allocation::MemoryAllocationError::System(SystemError::ENOMEM),
+            )
+        })();
+        match candidate {
+            Ok(table) => break table,
+            Err(error) => {
+                if let Err(error) = error.recover(&mut recovery) {
+                    *exec_error.lock() = Some(error.clone());
+                    return Err(error);
+                }
+            }
         }
     };
     let old_table = child.basic_mut().set_fd_table(Some(fd_table));

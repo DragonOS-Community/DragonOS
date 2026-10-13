@@ -97,7 +97,7 @@ impl IndexNode for LockedKvmInode {
         &self,
         _data: MutexGuard<FilePrivateData>,
         _mode: &FileMode,
-    ) -> Result<(), SystemError> {
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         debug!("file private data:{:?}", _data);
         return Ok(());
     }
@@ -115,10 +115,10 @@ impl IndexNode for LockedKvmInode {
     }
 
     fn list(&self) -> Result<Vec<String>, SystemError> {
-        Err(SystemError::ENOSYS)
+        Err(SystemError::ENOSYS.into())
     }
 
-    fn set_metadata(&self, metadata: &Metadata) -> Result<(), SystemError> {
+    fn set_metadata(&self, metadata: &Metadata) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         let mut inode = self.0.lock();
         inode.metadata.atime = metadata.atime;
         inode.metadata.mtime = metadata.mtime;
@@ -142,7 +142,7 @@ impl IndexNode for LockedKvmInode {
         cmd: u32,
         data: usize,
         _private_data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError> {
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
         match cmd {
             0xdeadbeef => {
                 debug!("kvm ioctl");
@@ -157,7 +157,7 @@ impl IndexNode for LockedKvmInode {
             | KVM_GET_VCPU_MMAP_SIZE
             | KVM_TRACE_ENABLE
             | KVM_TRACE_PAUSE
-            | KVM_TRACE_DISABLE => Err(SystemError::ENOSYS),
+            | KVM_TRACE_DISABLE => Err(SystemError::ENOSYS.into()),
             _ => KVMArch::kvm_arch_dev_ioctl(cmd, data),
         }
     }
@@ -168,8 +168,8 @@ impl IndexNode for LockedKvmInode {
         _len: usize,
         _buf: &mut [u8],
         _data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError> {
-        Err(SystemError::ENOSYS)
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        Err(SystemError::ENOSYS.into())
     }
 
     /// 写设备 - 应该调用设备的函数读写，而不是通过文件系统读写
@@ -179,8 +179,8 @@ impl IndexNode for LockedKvmInode {
         _len: usize,
         _buf: &[u8],
         _data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError> {
-        Err(SystemError::ENOSYS)
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        Err(SystemError::ENOSYS.into())
     }
 }
 

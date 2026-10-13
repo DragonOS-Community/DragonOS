@@ -308,7 +308,7 @@ impl IndexNode for BpfPerfEvent {
         _len: usize,
         _buf: &mut [u8],
         _data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize> {
+    ) -> core::result::Result<usize, crate::mm::allocation::MemoryAllocationError> {
         panic!("PerfEventInode does not support read")
     }
 
@@ -318,7 +318,7 @@ impl IndexNode for BpfPerfEvent {
         _len: usize,
         _buf: &[u8],
         _data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize> {
+    ) -> core::result::Result<usize, crate::mm::allocation::MemoryAllocationError> {
         panic!("PerfEventInode does not support write")
     }
 

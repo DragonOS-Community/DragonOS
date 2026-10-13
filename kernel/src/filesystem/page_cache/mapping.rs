@@ -1,10 +1,22 @@
+use crate::mm::allocation::MemoryAllocationError;
+
 use super::{
-    page_align_up, page_manager_lock, page_reclaimer_lock, AddressSpace, Arc, FaultRetryWait,
-    HashMap, LockedVMA, MMArch, MemoryManagementArch, MmuGather, Ordering, PageCache,
-    PageCacheManager, PageCachePagePin, PageEntry, PageState, RwSemReadGuard, RwSemWriteGuard,
-    SystemError, Vec, Weak,
+    detach_pages_from_reclaimer_batched, page_align_up, page_manager_lock, AddressSpace, Arc,
+    FaultRetryWait, HashMap, LockedVMA, MMArch, MemoryManagementArch, MmuGather, Ordering,
+    PageCache, PageCacheManager, PageCachePagePin, PageEntry, PageState, RwSemReadGuard,
+    RwSemWriteGuard, SystemError, Vec, Weak,
 };
-use crate::mm::page::PageFlags;
+use crate::mm::page::{Page, PageFlags};
+use crate::mm::VmFlags;
+
+/// Only removes mappings. Cache membership and the physical owner stay alive
+/// until the caller performs the final clean-cache retirement check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PageCacheReclaimMapOutcome {
+    Unmapped,
+    Dirty,
+    Busy,
+}
 
 /// Carries no entry pin or inode lock. Wait only after releasing invalidate_write.
 pub(crate) struct PageCacheRangeRetry {
@@ -121,7 +133,7 @@ impl core::fmt::Debug for PageCacheInvalidateRetryWait {
 }
 
 impl FaultRetryWait for PageCacheInvalidateRetryWait {
-    fn wait(&self) -> Result<(), SystemError> {
+    fn wait(&self) -> Result<(), MemoryAllocationError> {
         let _invalidate = self.cache.invalidate_read();
         Ok(())
     }
@@ -194,11 +206,11 @@ impl PageCacheManager {
         let mut discarded = 0;
         for page_index in indices {
             if let Some(page) = cache.remove_clean_page_candidate(page_index, wait_loading) {
-                let paddr = page.phys_address();
                 let can_remove_from_manager = page.read().can_deallocate();
-                let _ = page_reclaimer_lock().remove_page(&paddr);
+                detach_pages_from_reclaimer_batched(core::iter::once(&page));
                 if can_remove_from_manager {
-                    page_manager_lock().remove_page(&paddr);
+                    let removed = page_manager_lock().remove_page_if_same(&page);
+                    drop(removed);
                 }
                 discarded += 1;
             }
@@ -229,6 +241,189 @@ impl PageCacheManager {
 }
 
 impl PageCache {
+    /// A bounded, fallible snapshot; unlike the general mapping walker this
+    /// cannot allocate while holding the IRQ-safe VMA index lock.
+    fn try_reclaim_vma_snapshot(&self) -> Result<(u64, Vec<Arc<LockedVMA>>), SystemError> {
+        let _index_read = self.i_mmap_read();
+        let capacity = self.file_vmas.lock_irqsave().vmas.len();
+        let mut snapshot = Vec::new();
+        snapshot
+            .try_reserve_exact(capacity)
+            .map_err(|_| SystemError::ENOMEM)?;
+        {
+            let index = self.file_vmas.lock_irqsave();
+            for weak in index.vmas.values() {
+                if let Some(vma) = weak.upgrade() {
+                    snapshot.push(vma);
+                }
+            }
+        }
+        Ok((self.file_vma_seq(), snapshot))
+    }
+
+    /// Called with the page locked, preserving the existing page -> cache
+    /// publication order. An untracked dirty page must not cause a new dirty
+    /// index allocation in reclaim: leave it and its PTEs intact instead.
+    fn reclaim_mapping_state(
+        &self,
+        inner: &super::InnerPageCache,
+        index: usize,
+        expected: &Arc<Page>,
+        flags: PageFlags,
+    ) -> Option<PageCacheReclaimMapOutcome> {
+        let Some(entry) = inner.get_entry(index) else {
+            return Some(PageCacheReclaimMapOutcome::Busy);
+        };
+        if !Arc::ptr_eq(&entry.page, expected)
+            || entry.active_users() != 0
+            || self.mapping_unevictable()
+            || self.is_shmem()
+            || flags.intersects(PageFlags::PG_UNEVICTABLE | PageFlags::PG_WRITEBACK)
+            || inner.writeback_pages.contains(&index)
+        {
+            return Some(PageCacheReclaimMapOutcome::Busy);
+        }
+        let tracked_dirty = entry.state() == PageState::Dirty && inner.dirty_pages.contains(&index);
+        if tracked_dirty {
+            return Some(PageCacheReclaimMapOutcome::Dirty);
+        }
+        if entry.state() != PageState::UpToDate
+            || flags.contains(PageFlags::PG_DIRTY)
+            || inner.dirty_pages.contains(&index)
+        {
+            return Some(PageCacheReclaimMapOutcome::Busy);
+        }
+        None
+    }
+
+    /// Remove only this cache page's clean, managed file mappings. In
+    /// particular this is not truncate: private COW and raw PFN PTEs survive.
+    /// Preflight the complete snapshot before clearing anything; races in the
+    /// commit pass yield Busy and let the caller put the retained page back.
+    pub(crate) fn unmap_clean_page_for_reclaim(
+        self: &Arc<Self>,
+        index: usize,
+        expected: &Arc<Page>,
+    ) -> Result<PageCacheReclaimMapOutcome, SystemError> {
+        {
+            let page = expected.read();
+            let inner = self.lock();
+            if let Some(outcome) =
+                self.reclaim_mapping_state(&inner, index, expected, *page.flags())
+            {
+                return Ok(outcome);
+            }
+            if page.map_count() == 0 {
+                return Ok(PageCacheReclaimMapOutcome::Unmapped);
+            }
+        }
+        // Architectures without implemented leaf permission bits cannot prove
+        // clean read-only mappings. Do not treat a zero bit mask as evidence.
+        if MMArch::ENTRY_FLAG_WRITEABLE == 0 || MMArch::ENTRY_FLAG_DIRTY == 0 {
+            return Ok(PageCacheReclaimMapOutcome::Busy);
+        }
+        let (seq, snapshot) = self.try_reclaim_vma_snapshot()?;
+        let phys = expected.phys_address();
+        for commit in [false, true] {
+            if self.file_vma_seq() != seq {
+                return Ok(PageCacheReclaimMapOutcome::Busy);
+            }
+            for vma in &snapshot {
+                // Never wait for an MM while holding the VMA or page lock.
+                let Some(mm) = vma.lock().address_space().and_then(|space| space.upgrade()) else {
+                    continue;
+                };
+                let mm_guard = mm.read();
+                let _pt_edit = mm.page_table_edit();
+                let vma_guard = vma.lock();
+                if vma_guard
+                    .address_space()
+                    .and_then(|space| space.upgrade())
+                    .is_none_or(|current| !Arc::ptr_eq(&current, &mm))
+                    || vma_guard.backing_page_offset().is_none()
+                    || vma_guard
+                        .vm_file()
+                        .and_then(|file| file.inode().page_cache())
+                        .is_none_or(|cache| !Arc::ptr_eq(&cache, self))
+                {
+                    continue;
+                }
+                let Ok(virt) = vma_guard.page_address(index) else {
+                    continue;
+                };
+                // page_address historically accepts end(); reclaim must not
+                // touch the next VMA's first PTE at that exclusive boundary.
+                if virt >= vma_guard.region().end() {
+                    continue;
+                }
+                let Some((actual, pte_flags)) = mm_guard.user_mapper.utable.translate(virt) else {
+                    continue;
+                };
+                if actual != phys {
+                    continue;
+                }
+                if vma_guard.vm_flags().intersects(
+                    VmFlags::VM_LOCKED | VmFlags::VM_IO | VmFlags::VM_PFNMAP | VmFlags::VM_MIXEDMAP,
+                ) {
+                    return Ok(PageCacheReclaimMapOutcome::Busy);
+                }
+                if page_manager_lock()
+                    .get(&actual)
+                    .is_none_or(|managed| !Arc::ptr_eq(&managed, expected))
+                {
+                    return Ok(PageCacheReclaimMapOutcome::Busy);
+                }
+                let mut page = expected.write();
+                let inner = self.lock();
+                if let Some(outcome) =
+                    self.reclaim_mapping_state(&inner, index, expected, *page.flags())
+                {
+                    return Ok(outcome);
+                }
+                // Normal mkwrite publishes tracked dirty state before write
+                // permission; anomalous untracked writable/dirty PTEs stay.
+                if pte_flags.has_write() || pte_flags.has_flag(MMArch::ENTRY_FLAG_DIRTY) {
+                    return Ok(PageCacheReclaimMapOutcome::Busy);
+                }
+                if !commit {
+                    continue;
+                }
+                let Some((_actual, _flags, flush)) = (unsafe {
+                    mm_guard.user_mapper.utable.unmap_phys_preserve_tables_if(
+                        virt,
+                        |address, flags| {
+                            address == phys
+                                && !flags.has_write()
+                                && !flags.has_flag(MMArch::ENTRY_FLAG_DIRTY)
+                        },
+                    )
+                }) else {
+                    return Ok(PageCacheReclaimMapOutcome::Busy);
+                };
+                page.remove_vma(vma);
+                mm.account_present_pages_sub(1);
+                drop(inner);
+                drop(page);
+                drop(vma_guard);
+                unsafe { flush.ignore() };
+                let mut tlb = MmuGather::gather(&mm);
+                tlb.accumulate_range(virt);
+                tlb.finish();
+            }
+        }
+        // TLB acknowledgements precede this final page/cache check. A racing
+        // fault, dirty publication or pin leaves ownership with the caller.
+        let page = expected.read();
+        let inner = self.lock();
+        if let Some(outcome) = self.reclaim_mapping_state(&inner, index, expected, *page.flags()) {
+            return Ok(outcome);
+        }
+        if self.file_vma_seq() != seq || page.map_count() != 0 {
+            return Ok(PageCacheReclaimMapOutcome::Busy);
+        }
+        Ok(PageCacheReclaimMapOutcome::Unmapped)
+    }
+
     fn range_retry(&self, reason: RangeRetryReason) -> PageCacheRangeRetry {
         PageCacheRangeRetry {
             cache: self.manager.owner.clone(),
@@ -341,7 +536,7 @@ impl PageCache {
     /// failed. The caller must return to the architecture fault loop, which
     /// drops `AddressSpace::write()` before invoking the token's blocking
     /// `wait()` method.
-    pub fn invalidate_retry_wait(self: &Arc<Self>) -> Arc<dyn FaultRetryWait> {
+    pub(crate) fn invalidate_retry_wait(self: &Arc<Self>) -> Arc<dyn FaultRetryWait> {
         Arc::new(PageCacheInvalidateRetryWait {
             cache: self.clone(),
         })
@@ -809,7 +1004,7 @@ impl PageCache {
                             }
                             _ => {
                                 let tag = current.writeback_tag();
-                                guard.remove_page(page_index).map(|page| (page, tag))
+                                guard.remove_entry(page_index).map(|page| (page, tag))
                             }
                         }
                     }
@@ -822,7 +1017,7 @@ impl PageCache {
 
                 if let Some((page, tag)) = removed_page {
                     removed_tagged_page |= tag != 0;
-                    self.discard_unlinked_page(&page);
+                    self.discard_unlinked_page(&page.page);
                 }
                 drop(self.detach_dirty_retention_if_idle());
                 break;

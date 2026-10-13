@@ -60,6 +60,12 @@ unsafe fn exit_to_user_mode_loop(frame: &mut TrapFrame, mut process_flags_work: 
         if process_flags_work.contains(ProcessFlags::NEED_SCHEDULE) {
             schedule(SchedMode::SM_PREEMPT);
         } else {
+            if process_flags_work.contains(ProcessFlags::NEED_MEMORY_HIGH) {
+                CurrentIrqArch::interrupt_enable();
+                crate::cgroup::memory::high::handle_user_return();
+                CurrentIrqArch::interrupt_disable();
+                process_flags_work = ProcessManager::current_pcb().flags().load();
+            }
             // 优先处理 rseq，因为信号递送会保存 trapframe 到 sigframe
             // rseq 的 IP fixup 必须在信号递送之前完成
             if process_flags_work.contains(ProcessFlags::NEED_RSEQ) {

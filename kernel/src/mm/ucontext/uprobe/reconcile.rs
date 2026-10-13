@@ -1,5 +1,5 @@
 use super::*;
-use crate::mm::fault::{FaultFlags, PageFaultHandler, PageFaultMessage};
+use crate::mm::fault::{FaultFlags, PageFaultHandler, PageFaultMessage, VmFaultOutcome};
 use crate::mm::VmFaultReason;
 
 struct DisarmTarget {
@@ -204,13 +204,16 @@ impl PreparedUprobeChange {
         mut self,
         mm: &Arc<AddressSpace>,
         inner: &mut RwSemWriteGuard<'_, InnerAddressSpace>,
+        creator: &Arc<crate::cgroup::memory::object::ObjectAccount>,
+        data_account: &Arc<crate::cgroup::memory::MemoryAccount>,
     ) -> Option<Self> {
         let mut fallback = Vec::new();
         for region in core::mem::take(&mut self.prepared_ranges) {
             let vmas = inner.mappings.conflicts(region);
             let mut needs_fallback = false;
             for vma in &vmas {
-                needs_fallback |= uprobe_apply_vma_range_locked(mm, inner, vma, region);
+                needs_fallback |=
+                    uprobe_apply_vma_range_locked(mm, inner, vma, region, creator, data_account);
             }
             if needs_fallback {
                 fallback.push(region);
@@ -248,7 +251,9 @@ fn fault_in_probe_mapping_locked(
     mm: &Arc<AddressSpace>,
     inner: &mut RwSemWriteGuard<'_, InnerAddressSpace>,
     expected: &ExpectedProbeMapping,
-) -> Result<(), VmFaultReason> {
+    creator: &Arc<crate::cgroup::memory::object::ObjectAccount>,
+    data_account: &Arc<crate::cgroup::memory::MemoryAccount>,
+) -> Result<(), VmFaultOutcome> {
     let mut previous_page = None;
     for part in &expected.parts {
         let page = part.region.start().data() & !(MMArch::PAGE_SIZE - 1);
@@ -261,7 +266,7 @@ fn fault_in_probe_mapping_locked(
             continue;
         }
         let Some(vma) = part.vma.upgrade() else {
-            return Err(VmFaultReason::VM_FAULT_SIGBUS);
+            return Err(VmFaultOutcome::from_reason(VmFaultReason::VM_FAULT_SIGBUS));
         };
         let vm_flags = *vma.lock().vm_flags();
         let fault_flags = InnerAddressSpace::mlock_fault_flags(vm_flags)
@@ -274,6 +279,8 @@ fn fault_in_probe_mapping_locked(
                 fault_flags | FaultFlags::FAULT_FLAG_ALLOW_RETRY | FaultFlags::FAULT_FLAG_KILLABLE,
                 &mut inner.user_mapper.utable,
                 mm.clone(),
+                creator.clone(),
+                data_account.clone(),
             );
             PageFaultHandler::handle_mm_fault(message)
         };
@@ -281,7 +288,7 @@ fn fault_in_probe_mapping_locked(
         // published a present PTE; checking the mapper also accepts filesystem
         // implementations whose success reason is the empty bitset.
         if inner.user_mapper.utable.translate(address).is_none() {
-            return Err(outcome.reason);
+            return Err(outcome);
         }
     }
     Ok(())
@@ -297,9 +304,11 @@ pub(crate) fn uprobe_apply_new_vma_locked(
     mm: &Arc<AddressSpace>,
     inner: &mut RwSemWriteGuard<'_, InnerAddressSpace>,
     vma: &Arc<LockedVMA>,
+    creator: &Arc<crate::cgroup::memory::object::ObjectAccount>,
+    data_account: &Arc<crate::cgroup::memory::MemoryAccount>,
 ) -> bool {
     let region = *vma.lock().region();
-    uprobe_apply_vma_range_locked(mm, inner, vma, region)
+    uprobe_apply_vma_range_locked(mm, inner, vma, region, creator, data_account)
 }
 
 /// Range-scoped variant used by mremap executable-publication plans. Registry
@@ -311,6 +320,8 @@ pub(crate) fn uprobe_apply_vma_range_locked(
     inner: &mut RwSemWriteGuard<'_, InnerAddressSpace>,
     vma: &Arc<LockedVMA>,
     apply_region: VirtRegion,
+    creator: &Arc<crate::cgroup::memory::object::ObjectAccount>,
+    data_account: &Arc<crate::cgroup::memory::MemoryAccount>,
 ) -> bool {
     let mut needs_fallback = false;
     if uprobe_registry_is_empty() {
@@ -398,16 +409,31 @@ pub(crate) fn uprobe_apply_vma_range_locked(
                 // later protection or mapping change will reconcile it.
                 continue;
             };
-            if let Err(reason) = fault_in_probe_mapping_locked(mm, inner, &expected) {
+            if let Err(outcome) =
+                fault_in_probe_mapping_locked(mm, inner, &expected, creator, data_account)
+            {
                 needs_fallback = true;
+                // This optional locked installation never performs recovery.
+                // The existing unlocked fallback revalidates the mapping and
+                // faults through populate_range, which owns retry handling.
+                // Dropping this outcome releases its admission-failure pin;
+                // it must not be converted into global allocator OOM here.
                 log::debug!(
                     "uprobe locked mmap apply deferred at {:#x}: {:?}",
                     probe_vaddr,
-                    reason
+                    outcome.reason
                 );
                 continue;
             }
-            match uprobe_register_locked(mm, inner, probe_vaddr, &consumer, &expected) {
+            match uprobe_register_locked(
+                mm,
+                inner,
+                probe_vaddr,
+                &consumer,
+                &expected,
+                creator,
+                data_account,
+            ) {
                 Ok(Some(handle)) => {
                     // Pair publication of the reverse site index with the
                     // target's exec-time old-mm scan. If exec scanned before
@@ -437,6 +463,11 @@ pub(crate) fn uprobe_apply_vma_range_locked(
                         probe_vaddr,
                         error
                     );
+                }
+                Err(LockedRegisterError::Allocation(_)) => {
+                    // Optional locked reconciliation cannot wait. The normal
+                    // unlocked registration revalidates and owns recovery.
+                    needs_fallback = true;
                 }
             }
         }
@@ -479,8 +510,19 @@ fn uprobe_register_best_effort_once(
     consumer: &Arc<UprobeConsumer>,
     expected_mapping: &ExpectedProbeMapping,
 ) -> Result<(), SystemError> {
+    let creator =
+        crate::cgroup::memory::object_for_task(&crate::process::ProcessManager::current_pcb());
+    let data_account = mm.memory_account();
     let mut inner = mm.write();
-    match uprobe_register_locked(mm, &mut inner, probe_vaddr, consumer, expected_mapping) {
+    match uprobe_register_locked(
+        mm,
+        &mut inner,
+        probe_vaddr,
+        consumer,
+        expected_mapping,
+        &creator,
+        &data_account,
+    ) {
         Ok(Some(handle)) => {
             if consumer.scope.permits(mm) {
                 handle.persist();
@@ -492,6 +534,12 @@ fn uprobe_register_best_effort_once(
         Ok(None) => Ok(()),
         Err(LockedRegisterError::PageContended(_)) => Err(SystemError::EAGAIN_OR_EWOULDBLOCK),
         Err(LockedRegisterError::System(error)) => Err(error),
+        Err(LockedRegisterError::Allocation(
+            crate::mm::allocation::MemoryAllocationError::System(error),
+        )) => Err(error),
+        Err(LockedRegisterError::Allocation(
+            crate::mm::allocation::MemoryAllocationError::Charge(_),
+        )) => Err(SystemError::EAGAIN_OR_EWOULDBLOCK),
     }
 }
 
@@ -703,7 +751,8 @@ pub(crate) fn fork_restore_inherited_uprobes_locked(
     parent_mm: &Arc<AddressSpace>,
     child_mm: &Arc<AddressSpace>,
     inner: &mut InnerAddressSpace,
-) -> Result<(), SystemError> {
+    data_account: &Arc<crate::cgroup::memory::MemoryAccount>,
+) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
     // The child initially shares the parent's private breakpoint pages through
     // normal fork COW.  Restore every inherited 0xcc in one private copy per
     // physical page before the child can run.  Afterwards the registry applies
@@ -743,16 +792,13 @@ pub(crate) fn fork_restore_inherited_uprobes_locked(
             pages.get(&old_paddr).ok_or(SystemError::EFAULT)?
         };
         let new_page = {
-            let mapper = &mut inner.user_mapper.utable;
-            let mut pages = page_manager_lock();
-            pages
-                .copy_page_as_normal(&old_paddr, mapper.allocator_mut())
-                .map_err(|_| SystemError::ENOMEM)?
+            let charge = data_account.try_charge(crate::cgroup::memory::MemoryKind::Anon, 1)?;
+            crate::mm::page::copy_registered_normal_page(&old_page, charge)?
         };
-        for (offset, byte) in patches {
-            patch_byte_in_phys(&new_page, offset, byte)?;
-        }
-        {
+        let install = (|| -> Result<(), SystemError> {
+            for (offset, byte) in patches {
+                patch_byte_in_phys(&new_page, offset, byte)?;
+            }
             let _pt_edit = child_mm.page_table_edit();
             let mapper = &mut inner.user_mapper.utable;
             let table = mapper.get_table(address, 0).ok_or(SystemError::EFAULT)?;
@@ -760,6 +806,12 @@ pub(crate) fn fork_restore_inherited_uprobes_locked(
             unsafe {
                 table.set_entry(index, PageEntry::new(new_page.phys_address(), entry_flags));
             }
+            Ok(())
+        })();
+        if let Err(error) = install {
+            let retired = { page_manager_lock().remove_page_if_same(&new_page) };
+            drop(retired);
+            return Err(error.into());
         }
         let vm_locked = vma.lock().vm_flags().contains(VmFlags::VM_LOCKED);
         new_page.write().insert_vma(vma.clone(), vm_locked);

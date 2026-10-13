@@ -1,82 +1,80 @@
-//! Linearizes TCP connection-state publication with stack notification ownership.
-
+//! Pre-born notification ownership, linearized with connection publication.
+use crate::{
+    libs::mutex::Mutex,
+    net::{
+        socket::inet::InetSocket,
+        tcp_bounds::{BoundSlotReservation, PublishedBoundSlot},
+    },
+};
 use alloc::sync::{Arc, Weak};
-use core::sync::atomic::{AtomicUsize, Ordering};
-
-use crate::net::socket;
 use system_error::SystemError;
 
 #[derive(Debug)]
 pub(super) struct ConnectingRegistration {
-    state: Arc<ConnectingRegistrationState>,
+    state: Arc<RegistrationState>,
     retained: bool,
 }
-
 #[derive(Debug)]
-struct ConnectingRegistrationState {
-    stack: Arc<crate::net::tcp_stack::TcpStack>,
-    wrapper: Weak<dyn socket::inet::InetSocket>,
-    state: AtomicUsize,
+struct Publication {
+    reserved: Option<BoundSlotReservation>,
+    published: Option<PublishedBoundSlot>,
+    cancelled: bool,
 }
-
 #[derive(Debug)]
-pub(super) struct ConnectingRegistrationPublisher(Arc<ConnectingRegistrationState>);
-
+struct RegistrationState {
+    wrapper: Weak<dyn InetSocket>,
+    publication: Mutex<Publication>,
+}
 #[derive(Debug)]
-pub(super) struct ConnectingRegistrationLease(Arc<ConnectingRegistrationState>);
+pub(super) struct ConnectingRegistrationPublisher(Arc<RegistrationState>);
+#[derive(Debug)]
+pub(super) struct ConnectingRegistrationLease(Arc<RegistrationState>);
 
 impl ConnectingRegistration {
-    const PENDING: usize = 0;
-    const PUBLISHED: usize = 1;
-    const RETAINED: usize = 2;
-    const CANCELLED: usize = 3;
-
+    /// Task preparation before inner/SocketSet; no vacancy growth after SYN.
     pub(super) fn try_new(
-        stack: Arc<crate::net::tcp_stack::TcpStack>,
-        wrapper: Weak<dyn socket::inet::InetSocket>,
+        reserved: BoundSlotReservation,
+        wrapper: Weak<dyn InetSocket>,
     ) -> Result<Self, SystemError> {
         Ok(Self {
-            state: Arc::try_new(ConnectingRegistrationState {
-                stack,
+            state: Arc::try_new(RegistrationState {
                 wrapper,
-                state: AtomicUsize::new(Self::PENDING),
+                publication: Mutex::new(Publication {
+                    reserved: Some(reserved),
+                    published: None,
+                    cancelled: false,
+                }),
             })
             .map_err(|_| SystemError::ENOMEM)?,
             retained: false,
         })
     }
-
     pub(super) fn publisher(&self) -> ConnectingRegistrationPublisher {
         ConnectingRegistrationPublisher(self.state.clone())
     }
-
     pub(super) fn retain(&mut self) -> ConnectingRegistrationLease {
-        self.state.state.store(Self::RETAINED, Ordering::Release);
         self.retained = true;
         ConnectingRegistrationLease(self.state.clone())
     }
-
     pub(super) fn cancel(&self) {
         self.state.cancel();
     }
 }
-
-impl ConnectingRegistrationState {
+impl RegistrationState {
     fn cancel(&self) {
-        let previous = self
-            .state
-            .swap(ConnectingRegistration::CANCELLED, Ordering::AcqRel);
-        if matches!(
-            previous,
-            ConnectingRegistration::PUBLISHED | ConnectingRegistration::RETAINED
-        ) {
-            if let Some(wrapper) = self.wrapper.upgrade() {
-                self.stack.unbind_socket(wrapper);
-            }
+        let (reserved, published) = {
+            let mut state = self.publication.lock();
+            state.cancelled = true;
+            (state.reserved.take(), state.published.take())
+        };
+        // Exact slot/id cannot remove a newer attempt; last wrapper retirement
+        // occurs outside the publication guard.
+        drop(reserved);
+        if let Some(published) = published {
+            published.cancel();
         }
     }
 }
-
 impl Drop for ConnectingRegistration {
     fn drop(&mut self) {
         if !self.retained {
@@ -84,38 +82,23 @@ impl Drop for ConnectingRegistration {
         }
     }
 }
-
 impl ConnectingRegistrationPublisher {
-    /// Publishes after `TcpSocket::inner` has been released, then validates
-    /// that the connection attempt was not concurrently consumed or closed.
     pub(super) fn publish(self) {
         let Some(wrapper) = self.0.wrapper.upgrade() else {
-            self.0
-                .state
-                .store(ConnectingRegistration::CANCELLED, Ordering::Release);
+            self.0.cancel();
             return;
         };
-
-        // bind_socket is idempotent under one bounds lock, so an explicitly
-        // bound socket never observes an unregister/register gap here.
-        self.0.stack.bind_socket(wrapper.clone());
-        match self.0.state.compare_exchange(
-            ConnectingRegistration::PENDING,
-            ConnectingRegistration::PUBLISHED,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            Ok(_)
-            | Err(ConnectingRegistration::PUBLISHED)
-            | Err(ConnectingRegistration::RETAINED) => {}
-            Err(ConnectingRegistration::CANCELLED) => {
-                self.0.stack.unbind_socket(wrapper);
+        let mut state = self.0.publication.lock();
+        if !state.cancelled {
+            if let Some(reserved) = state.reserved.take() {
+                // State→registry short commit, no growth/resource callbacks.
+                state.published = reserved.publish(wrapper.clone());
             }
-            Err(_) => unreachable!(),
         }
+        drop(state);
+        drop(wrapper);
     }
 }
-
 impl ConnectingRegistrationLease {
     pub(super) fn cancel(&self) {
         self.0.cancel();

@@ -30,6 +30,67 @@ struct CloseAction {
 }
 
 impl TcpSocket {
+    pub(super) fn refill_listener_once(&self) {
+        use core::sync::atomic::Ordering;
+        let snapshot = {
+            let mut writer = self.inner.write();
+            match writer.as_mut() {
+                Some(inner::Inner::Listening(listener)) => listener.take_refill_snapshot(),
+                _ => None,
+            }
+        };
+        let Some(snapshot) = snapshot else {
+            return;
+        };
+        let parent_id = snapshot.parent_id;
+        let rx = self.options.recv_buf_size.load(Ordering::Relaxed);
+        let tx = self.options.send_buf_size.load(Ordering::Relaxed);
+        // TryOnly: insufficient listener stock applies TCP backpressure, never
+        // kills an unrelated namespace worker or the accepting task.
+        let prepared = inner::PreparedListenerRefill::prepare(snapshot, rx, tx);
+        let mut prepared = match prepared {
+            Ok(prepared) => prepared,
+            Err(_) => {
+                let mut writer = self.inner.write();
+                if let Some(inner::Inner::Listening(listener)) = writer.as_mut() {
+                    if listener.reservation.as_ref().map(|r| r.id) == Some(parent_id) {
+                        listener.defer_refill_retry();
+                    }
+                }
+                return;
+            }
+        };
+        {
+            let mut writer = self.inner.write();
+            if let Some(inner::Inner::Listening(listener)) = writer.as_mut() {
+                let socket = prepared.socket.as_mut().expect("prepared refill protocol");
+                let rx = self.options.recv_buf_size.load(Ordering::Relaxed);
+                let tx = self.options.send_buf_size.load(Ordering::Relaxed);
+                if socket.set_receive_buffer_limit(rx) && socket.set_send_buffer_limit(tx) {
+                    socket.set_nagle_enabled(self.options.nagle_enabled.load(Ordering::Relaxed));
+                    socket.set_congestion_control(*self.options.congestion_control.lock_irqsave());
+                    let keepalive = self.options.so_keepalive.load(Ordering::Relaxed).then(|| {
+                        smoltcp::time::Duration::from_secs(
+                            self.options
+                                .tcp_keepidle_secs
+                                .load(Ordering::Relaxed)
+                                .max(0) as u64,
+                        )
+                    });
+                    socket.set_keep_alive(keepalive);
+                    if !listener.commit_refill(&mut prepared) {
+                        listener.defer_refill_retry();
+                    }
+                } else {
+                    listener.defer_refill_retry();
+                }
+            }
+        }
+        // Original or losing protocol storage and replaced handle-array
+        // storage physically retire only after inner and SocketSet guards.
+        drop(prepared);
+    }
+
     /// Normalize mapped sockaddr input while holding `inner`, so a concurrent
     /// IPV6_V6ONLY update cannot change the domain between validation and bind.
     fn normalize_endpoint(
@@ -172,13 +233,22 @@ impl TcpSocket {
     }
 
     pub fn do_bind(&self, local_endpoint: smoltcp::wire::IpEndpoint) -> Result<(), SystemError> {
+        self.normalize_endpoint(local_endpoint, false)?;
+        if !matches!(
+            self.inner.read().as_ref(),
+            Some(inner::Inner::Init(inner::Init::Unbound(_)))
+        ) {
+            return Err(SystemError::EINVAL);
+        }
+        self.prepare_new_handle_capacity()?;
+        let reserved = self.prepare_bound_slot()?;
         let mut writer = self.inner.write();
         let local_endpoint = self.normalize_endpoint(local_endpoint, false)?;
         let v6_only = self
             .options
             .ipv6_only
             .load(core::sync::atomic::Ordering::Relaxed);
-        match writer.take().expect("Tcp inner::Inner is None") {
+        let result = match writer.take().expect("Tcp inner::Inner is None") {
             inner::Inner::Init(inner) => match inner.bind(
                 local_endpoint,
                 self.netns(),
@@ -195,9 +265,6 @@ impl TcpSocket {
                             .ipv6_only
                             .store(true, core::sync::atomic::Ordering::Relaxed);
                     }
-                    if let inner::Init::Bound((ref bound, _, _)) = bound {
-                        bound.stack().bind_socket(self.self_ref.upgrade().unwrap());
-                    }
                     writer.replace(inner::Inner::Init(bound));
                     Ok(())
                 }
@@ -211,107 +278,214 @@ impl TcpSocket {
                 log::error!("TcpSocket::do_bind: not Init");
                 Err(SystemError::EINVAL)
             }
+        };
+        drop(writer);
+        if result.is_ok() {
+            let _ = reserved.publish(self.self_ref.upgrade().unwrap());
+        } else {
+            drop(reserved);
         }
+        result
     }
 
     pub fn do_listen(&self, backlog: usize) -> Result<(), SystemError> {
-        let mut writer = self.inner.write();
-        let inner = writer.take().expect("Tcp inner::Inner is None");
-        let (listening, err) = match inner {
-            inner::Inner::Init(init) => {
-                let listen_result = init.listen(
-                    backlog,
-                    self.netns(),
-                    self.options
-                        .ipv6_only
-                        .load(core::sync::atomic::Ordering::Relaxed),
-                    self.device_binding.clone(),
-                    &self.port_owner,
-                    [
-                        self.options
-                            .ip_mtu_discover
-                            .load(core::sync::atomic::Ordering::Relaxed)
-                            as u8,
-                        self.options
-                            .ipv6_mtu_discover
-                            .load(core::sync::atomic::Ordering::Relaxed)
-                            as u8,
-                    ],
-                );
-                match listen_result {
-                    Ok(listening) => {
-                        // A logical listener remains live when all physical
-                        // accept slots are occupied. Publish its receive domain
-                        // for smoltcp's unmatched-SYN fallback.
-                        //
-                        let port = listening.get_name().port;
-                        let me = self.self_ref.upgrade().unwrap();
-                        let stack = self.netns().tcp_stack().clone();
-                        stack.register_tcp_listener(
-                            listening.reservation.as_ref().unwrap().id,
-                            listening.domain,
-                            port,
-                            self.device_binding.ifindex() as u32,
-                        );
-                        stack.bind_socket(me);
-                        (inner::Inner::Listening(listening), None)
+        let mut recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
+        loop {
+            let unbound = matches!(
+                self.inner.read().as_ref(),
+                Some(inner::Inner::Init(inner::Init::Unbound(_)))
+            );
+            if unbound {
+                let unspecified = match self.ip_version {
+                    smoltcp::wire::IpVersion::Ipv4 => {
+                        smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address::UNSPECIFIED)
                     }
-                    Err((init, err)) => (inner::Inner::Init(init), Some(err)),
+                    smoltcp::wire::IpVersion::Ipv6 => {
+                        smoltcp::wire::IpAddress::Ipv6(smoltcp::wire::Ipv6Address::UNSPECIFIED)
+                    }
+                };
+                if let Err(error) = self.do_bind(smoltcp::wire::IpEndpoint::new(unspecified, 0)) {
+                    if !matches!(
+                        self.inner.read().as_ref(),
+                        Some(inner::Inner::Init(inner::Init::Bound(_)))
+                            | Some(inner::Inner::Listening(_))
+                    ) {
+                        return Err(error);
+                    }
                 }
             }
-            inner::Inner::Listening(mut listening) => {
-                let err = listening.set_backlog(backlog).err();
-                (inner::Inner::Listening(listening), err)
-            }
-            _ => (inner, Some(SystemError::EINVAL)),
-        };
-        writer.replace(listening);
-        drop(writer);
+            let snapshot = {
+                let state = self.inner.read();
+                match state.as_ref() {
+                    Some(inner::Inner::Init(inner::Init::Bound((_, _, reservation)))) => Some((
+                        reservation.id,
+                        reservation.owner(),
+                        reservation.port,
+                        self.device_binding.ifindex(),
+                    )),
+                    Some(inner::Inner::Listening(_)) => None,
+                    _ => return Err(SystemError::EINVAL),
+                }
+            };
+            let mut prepared = if let Some((id, owner, port, device)) = snapshot {
+                let creator = crate::cgroup::memory::object_for_task(
+                    &crate::process::ProcessManager::current_pcb(),
+                );
+                let attempt = (|| {
+                    let slots = inner::ListenerSlots::prepare(&creator, 1)?;
+                    let binding = Arc::try_new(
+                        crate::net::socket::inet::common::SocketDeviceBinding::from_ifindex(device),
+                    )
+                    .map_err(|_| SystemError::ENOMEM)?;
+                    let observer = owner.prepare_child(port, binding)?;
+                    Ok::<_, crate::mm::allocation::MemoryAllocationError>(
+                        inner::PreparedListenerStart {
+                            parent_id: id,
+                            device,
+                            observer,
+                            slots: Some(slots),
+                        },
+                    )
+                })();
+                match attempt {
+                    Ok(prepared) => Some(prepared),
+                    Err(error) => {
+                        error.recover(&mut recovery)?;
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
+            let mut writer = self.inner.write();
+            let inner = writer.take().expect("Tcp inner::Inner is None");
+            let (listening, err) = match inner {
+                inner::Inner::Init(init) => {
+                    let listen_result = init.listen(
+                        backlog,
+                        self.device_binding.clone(),
+                        [
+                            self.options
+                                .ip_mtu_discover
+                                .load(core::sync::atomic::Ordering::Relaxed)
+                                as u8,
+                            self.options
+                                .ipv6_mtu_discover
+                                .load(core::sync::atomic::Ordering::Relaxed)
+                                as u8,
+                        ],
+                        prepared.as_mut().expect("prepared bound listener"),
+                        self.memory.clone(),
+                    );
+                    match listen_result {
+                        Ok(listening) => {
+                            // A logical listener remains live when all physical
+                            // accept slots are occupied. Publish its receive domain
+                            // for smoltcp's unmatched-SYN fallback.
+                            //
+                            let port = listening.get_name().port;
+                            let stack = self.netns().tcp_stack().clone();
+                            stack.register_tcp_listener(
+                                listening.reservation.as_ref().unwrap().id,
+                                listening.domain,
+                                port,
+                                self.device_binding.ifindex() as u32,
+                            );
+                            (inner::Inner::Listening(listening), None)
+                        }
+                        Err((init, err)) => (inner::Inner::Init(init), Some(err)),
+                    }
+                }
+                inner::Inner::Listening(mut listening) => {
+                    let err = listening.set_backlog(backlog).err();
+                    (inner::Inner::Listening(listening), err)
+                }
+                _ => (inner, Some(SystemError::EINVAL)),
+            };
+            writer.replace(listening);
+            drop(writer);
+            drop(prepared);
 
-        if let Some(err) = err {
-            return Err(err);
+            if let Some(err) = err {
+                if err == SystemError::EAGAIN_OR_EWOULDBLOCK {
+                    continue;
+                }
+                return Err(err);
+            }
+            return Ok(());
         }
-        return Ok(());
     }
 
     pub fn try_accept(&self) -> Result<(Arc<TcpSocket>, smoltcp::wire::IpEndpoint), SystemError> {
         // Poll outside `inner`: protocol notification may acquire it again.
         self.netns().tcp_stack().poll();
-
-        match self
-            .inner
-            .write()
-            .as_mut()
-            .expect("Tcp inner::Inner is None")
-        {
-            inner::Inner::Listening(listening) => {
-                let (socket, point) = listening.accept().map(|(stream, remote)| {
-                    (
-                        TcpSocket::new_established(
-                            stream,
-                            self.is_nonblock(),
-                            self.netns(),
-                            self.ip_version,
-                        ),
-                        remote,
-                    )
-                })?;
-                socket.options.ipv6_only.store(
-                    self.options
-                        .ipv6_only
-                        .load(core::sync::atomic::Ordering::Relaxed),
-                    core::sync::atomic::Ordering::Relaxed,
-                );
-                {
-                    let mut inner_guard = socket.inner.write();
-                    if let Some(inner::Inner::Established(established)) = inner_guard.as_mut() {
-                        established.stack().bind_socket(socket.clone());
-                    }
+        let mut recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
+        loop {
+            let (handle, identity) = {
+                let reader = self.inner.read();
+                let Some(inner::Inner::Listening(listening)) = reader.as_ref() else {
+                    return Err(SystemError::EINVAL);
+                };
+                listening
+                    .peek_accept()
+                    .ok_or(SystemError::EAGAIN_OR_EWOULDBLOCK)?
+            };
+            // Neither the passive handle nor its buffers are consumed until
+            // the complete accepted body/header and port identity are ready.
+            let binding = self.netns.tcp_ports().prepare_accept_binding(identity)?;
+            let current = crate::process::ProcessManager::current_pcb();
+            let account = crate::cgroup::memory::account_for_task(&current);
+            let creator = crate::cgroup::memory::object_for_task(&current);
+            let prepared = (|| {
+                let reserved = self.netns.tcp_stack().reserve_bound_slot(&creator)?;
+                let memory = crate::net::socket::buffer::SocketMemory::prepare(&account, creator)?;
+                let socket = TcpSocket::prepare_accepted(
+                    self.is_nonblock(),
+                    self.netns(),
+                    self.ip_version,
+                    memory,
+                    &binding,
+                )?;
+                Ok::<_, crate::mm::allocation::MemoryAllocationError>((socket, reserved))
+            })();
+            let (prepared, reserved) = match prepared {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    drop(binding);
+                    error.recover(&mut recovery)?;
+                    continue;
                 }
-
-                Ok((socket, point))
-            }
-            _ => Err(SystemError::EINVAL),
+            };
+            let result = {
+                let mut writer = self.inner.write();
+                match writer.as_mut() {
+                    Some(inner::Inner::Listening(listening)) => {
+                        listening.accept_prepared(handle, &binding, &prepared.memory().sock)
+                    }
+                    _ => Err(SystemError::EINVAL.into()),
+                }
+            };
+            let (established, point, retired_device) = match result {
+                Ok(result) => result,
+                Err(error) => {
+                    drop(prepared);
+                    drop(reserved);
+                    drop(binding);
+                    error.recover(&mut recovery)?;
+                    continue;
+                }
+            };
+            drop(retired_device);
+            drop(binding);
+            let socket = prepared.commit(established);
+            socket.options.ipv6_only.store(
+                self.options
+                    .ipv6_only
+                    .load(core::sync::atomic::Ordering::Relaxed),
+                core::sync::atomic::Ordering::Relaxed,
+            );
+            let _ = reserved.publish(socket.clone());
+            return Ok((socket, point));
         }
     }
 
@@ -320,7 +494,28 @@ impl TcpSocket {
         &self,
         remote_endpoint: smoltcp::wire::IpEndpoint,
     ) -> Result<(), SystemError> {
-        let mut writer = self.inner.write();
+        self.normalize_endpoint(remote_endpoint, true)?;
+        self.prepare_new_handle_capacity()?;
+        let mut prepared_registration = None;
+        let mut writer = loop {
+            if matches!(self.inner.read().as_ref(), Some(inner::Inner::Init(_)))
+                && prepared_registration.is_none()
+            {
+                let reserved = self.prepare_bound_slot()?;
+                prepared_registration = Some(super::registration::ConnectingRegistration::try_new(
+                    reserved,
+                    self.self_ref.clone(),
+                )?);
+            }
+            let writer = self.inner.write();
+            if matches!(writer.as_ref(), Some(inner::Inner::Init(_)))
+                && prepared_registration.is_none()
+            {
+                drop(writer);
+                continue;
+            }
+            break writer;
+        };
         let remote_endpoint = self.normalize_endpoint(remote_endpoint, true)?;
         let remote_endpoint =
             crate::net::socket::inet::common::normalize_unspecified_endpoint_to_loopback(
@@ -372,7 +567,7 @@ impl TcpSocket {
                 match init.connect(
                     remote_endpoint,
                     self.netns(),
-                    self.self_ref.clone(),
+                    &mut prepared_registration,
                     self.ip_version,
                     &self.port_owner,
                 ) {

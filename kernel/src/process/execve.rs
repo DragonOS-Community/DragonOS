@@ -155,13 +155,25 @@ fn do_execve_internal(
     ctx: ExecContext,
 ) -> Result<(), ExecFailure> {
     let exec_pcb = ProcessManager::current_pcb();
-    let exec_guard = exec_pcb.exec_update_write();
-    let address_space = AddressSpace::new(
-        true,
-        exec_pcb.cred().user_ns.clone(),
-        SUID_DUMP_DISABLE as u8,
-    )
-    .expect("Failed to create new address space");
+    crate::cgroup::memory::high::prepare_for_task(&exec_pcb)?;
+    // Prospective MM admission may reclaim or wait. Never do it while the
+    // exec-update lock protects the irreversible exec transaction.
+    let (address_space, exec_guard) = loop {
+        let captured_ns = exec_pcb.cred().user_ns.clone();
+        let mm = AddressSpace::new_for_task(
+            &exec_pcb,
+            true,
+            captured_ns.clone(),
+            SUID_DUMP_DISABLE as u8,
+        )?;
+        let guard = exec_pcb.exec_update_write();
+        let current_ns = exec_pcb.cred().user_ns.clone();
+        if Arc::ptr_eq(&captured_ns, &current_ns) {
+            break (mm, guard);
+        }
+        drop(guard);
+        drop(mm);
+    };
 
     let mut param = ExecParam::new(
         start.file(),
@@ -285,6 +297,7 @@ fn do_execve_internal(
             // The uprobe must first detach from the old mm before releasing the last user reference to that mm.
             if let Some(old_vm) = old_vm.as_ref() {
                 pcb.preserve_maxrss(old_vm);
+                old_vm.replace_departing_memory_owner(&pcb);
             }
             ProcessManager::release_old_user_vm_if_last(old_vm.as_ref());
             if let Some(completion) = pcb.thread.write_irqsave().vfork_done.take() {
@@ -395,10 +408,19 @@ fn finish_exec_error(
 /// # 错误处理
 /// 如果地址空间切换失败，函数会触发断言失败，并输出错误信息。
 fn do_execve_switch_user_vm(new_vm: Arc<AddressSpace>) -> Option<Arc<AddressSpace>> {
+    let pcb = ProcessManager::current_pcb();
+    // Serialize task->mm replacement with mm owner handoff, as exit_mm does.
+    // All callers are outside task_lock; no allocation or faultable cleanup is
+    // performed in this short installation/TLB publication critical section.
+    pcb.with_task_lock_irqsave(|| do_execve_switch_user_vm_locked(new_vm, &pcb))
+}
+
+fn do_execve_switch_user_vm_locked(
+    new_vm: Arc<AddressSpace>,
+    pcb: &Arc<ProcessControlBlock>,
+) -> Option<Arc<AddressSpace>> {
     // 关中断，防止在设置地址空间的时候，发生中断，然后进调度器，出现错误。
     let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
-    let pcb = ProcessManager::current_pcb();
-
     let cpu = crate::smp::core::smp_get_processor_id();
 
     let mut basic_info = pcb.basic_mut();

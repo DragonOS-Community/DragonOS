@@ -30,7 +30,7 @@ use crate::{
         ipi::{IpiKind, IpiTarget},
         InterruptArch,
     },
-    libs::cpumask::CpuMask,
+    libs::cpumask::AtomicCpuMask,
     mm::{percpu::PerCpuVar, ucontext::AddressSpace, MemoryManagementArch, VirtAddr},
     smp::{
         core::smp_get_processor_id,
@@ -360,17 +360,17 @@ pub fn remote_flush_tlb_on_ipi() {
 /// 2. `target_cpus` must not include this CPU (local flush is done by the caller after sending IPIs).
 ///
 /// Upon return, all CPUs in `target_cpus` have completed this shootdown (INV-4).
-fn flush_tlb_multi(target_cpus: &CpuMask, info: &FlushTlbInfo) {
+fn flush_tlb_multi(target_cpus: &AtomicCpuMask, info: &FlushTlbInfo) {
     // Filter out offline CPUs to avoid sending IPIs to not-yet-started / offline APICs.
-    let mut online = CpuMask::new();
+    // Capture online eligibility once. Every CSD preparation, IPI send and
+    // acknowledgement below uses this same private, immutable stack mask.
+    let active = AtomicCpuMask::new();
+    let my_cpu = smp_get_processor_id();
     for cpu in smp_cpu_manager().present_cpus().iter_cpu() {
-        if smp_cpu_manager().is_online_cpu(cpu) {
-            online.set(cpu, true);
+        if cpu != my_cpu && target_cpus.get(cpu) && smp_cpu_manager().is_online_cpu(cpu) {
+            active.set(cpu);
         }
     }
-    let active: CpuMask = target_cpus & &online;
-
-    let my_cpu = smp_get_processor_id();
 
     #[cfg(target_arch = "x86_64")]
     {
@@ -477,15 +477,19 @@ pub fn flush_tlb_mm_range(
     };
 
     // Snapshot the remote target set.
-    let remote_mask: CpuMask = {
+    let remote_mask = {
         let g = mm.active_cpus.lock();
-        let mut m = g.clone();
-        // Exclude this CPU; local flush is handled separately
-        m.set(this_cpu, false);
+        let m = AtomicCpuMask::new();
+        for cpu in g.iter_cpu() {
+            // Exclude this CPU; local flush is handled separately.
+            if cpu != this_cpu {
+                m.set(cpu);
+            }
+        }
         m
     };
 
-    if !remote_mask.is_empty() {
+    if remote_mask.iter_cpu().next().is_some() {
         flush_tlb_multi(&remote_mask, &info);
     }
 
@@ -535,13 +539,13 @@ pub fn flush_tlb_kernel_range(start: VirtAddr, end: VirtAddr, freed_tables: bool
         freed_tables,
         initiating_cpu: this_cpu,
     };
-    let mut remote_mask = CpuMask::new();
+    let remote_mask = AtomicCpuMask::new();
     for cpu in smp_cpu_manager().present_cpus().iter_cpu() {
-        if cpu != this_cpu && smp_cpu_manager().is_online_cpu(cpu) {
-            remote_mask.set(cpu, true);
+        if cpu != this_cpu {
+            remote_mask.set(cpu);
         }
     }
-    if !remote_mask.is_empty() {
+    if remote_mask.iter_cpu().next().is_some() {
         flush_tlb_multi(&remote_mask, &info);
     }
     local_flush_tlb_func(&info);

@@ -235,13 +235,13 @@ pub(super) fn run_async_writeback_budget_retry_selftest() -> bool {
         predecessor.account_state_transition(predecessor_old_state, PageState::Dirty);
         predecessor.set_state(PageState::Dirty);
         predecessor.set_writeback_tag(0x69ff);
-        inner.dirty_pages.insert(0);
+        inner.set_index(0, 1, true);
         entry.page.write().add_flags(PageFlags::PG_DIRTY);
         let old_state = entry.state();
         entry.account_state_transition(old_state, PageState::Dirty);
         entry.set_state(PageState::Dirty);
         entry.set_writeback_tag(0x6a00);
-        inner.dirty_pages.insert(1);
+        inner.set_index(1, 1, true);
     }
     let coalesced =
         PageCacheManager::arm_tagged_writeback_budget_retry(&cache, None, 0, 2, 0x6a00, 2)
@@ -293,7 +293,7 @@ pub(super) fn run_async_writeback_budget_retry_selftest() -> bool {
         entry.account_state_transition(old_state, PageState::Dirty);
         entry.set_state(PageState::Dirty);
         entry.set_writeback_tag(0x6a04);
-        inner.dirty_pages.insert(0);
+        inner.set_index(0, 1, true);
     }
     let drop_ticket =
         PageCacheManager::arm_tagged_writeback_budget_retry(&drop_cache, None, 0, 0, 0x6a04, 0)
@@ -652,7 +652,7 @@ pub(super) fn run_submitted_writeback_selftest() -> Result<bool, SystemError> {
             entry.account_state_transition(entry.state(), PageState::Dirty);
             entry.set_state(PageState::Dirty);
             entry.set_writeback_tag(epoch);
-            inner.dirty_pages.insert(0);
+            inner.set_index(0, 1, true);
             entry
         };
         let claim = {
@@ -1755,8 +1755,8 @@ impl PageCacheManager {
                     entry.set_writeback_tag(0);
                 }
                 entry.account_state_transition(PageState::Dirty, PageState::Writeback);
-                inner.dirty_pages.remove(&page_index);
-                inner.writeback_pages.insert(page_index);
+                inner.set_index(page_index, 1, false);
+                inner.set_index(page_index, 2, true);
                 let page = entry.page.clone();
                 guards.push(WritebackGuard::new(
                     cache.clone(),
@@ -1879,8 +1879,8 @@ impl PageCacheManager {
                     .is_some_and(|current| Arc::ptr_eq(current, entry));
                 if attached {
                     entry.account_state_transition(PageState::Writeback, PageState::Dirty);
-                    inner.writeback_pages.remove(page_index);
-                    inner.dirty_pages.insert(*page_index);
+                    inner.set_index(*page_index, 2, false);
+                    inner.set_index(*page_index, 1, true);
                     if let Some(tag) = batch.retry_writeback_tag {
                         entry.set_writeback_tag(tag);
                     }
@@ -4224,16 +4224,8 @@ impl PageCacheManager {
         let (preexisting_writeback_end, dirty_end) = {
             let inner = cache.inner.lock();
             (
-                inner
-                    .writeback_pages
-                    .range(start_index..=end_index)
-                    .next_back()
-                    .copied(),
-                inner
-                    .dirty_pages
-                    .range(start_index..=end_index)
-                    .next_back()
-                    .copied(),
+                inner.writeback_pages.last_in_range(start_index..=end_index),
+                inner.dirty_pages.last_in_range(start_index..=end_index),
             )
         };
         let epoch = {
@@ -4738,8 +4730,8 @@ impl PageCacheManager {
                     .is_some_and(|current| Arc::ptr_eq(current, &entry));
                 if attached {
                     entry.account_state_transition(PageState::Writeback, PageState::Dirty);
-                    inner.writeback_pages.remove(&page_index);
-                    inner.dirty_pages.insert(page_index);
+                    inner.set_index(page_index, 2, false);
+                    inner.set_index(page_index, 1, true);
                 }
                 entry.set_state(PageState::Dirty);
             }
@@ -4781,14 +4773,14 @@ impl PageCacheManager {
             // writeback paths acquire the page lock before updating the page
             // cache, so doing so would invert the established lock order.
             let redirtied = page_dirty || inner.dirty_pages.contains(&page_index);
-            inner.writeback_pages.remove(&page_index);
+            inner.set_index(page_index, 2, false);
             if redirtied {
                 entry.account_state_transition(PageState::Writeback, PageState::Dirty);
-                inner.dirty_pages.insert(page_index);
+                inner.set_index(page_index, 1, true);
                 entry.set_state(PageState::Dirty);
             } else {
                 entry.account_state_transition(PageState::Writeback, PageState::UpToDate);
-                inner.dirty_pages.remove(&page_index);
+                inner.set_index(page_index, 1, false);
                 entry.set_state(PageState::UpToDate);
             }
         }

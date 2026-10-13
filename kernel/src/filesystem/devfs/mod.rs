@@ -551,15 +551,14 @@ impl LockedDevFSInode {
                     .downcast_arc::<LockedDevFSInode>()
                     .ok_or(SystemError::ENOTDIR)?,
                 Err(SystemError::ENOENT) => {
-                    let inode = current.create_with_data(
+                    let inode = current.do_create_with_data(
                         component.as_ref(),
                         FileType::Dir,
                         InodeMode::from_bits_truncate(0o755),
                         0,
+                        Vec::new(),
+                        false,
                     )?;
-                    let inode = inode
-                        .downcast_arc::<LockedDevFSInode>()
-                        .ok_or(SystemError::EIO)?;
                     inode.0.lock().kernel_managed = true;
                     inode
                 }
@@ -798,8 +797,11 @@ impl IndexNode for LockedDevFSInode {
         &self,
         _data: MutexGuard<FilePrivateData>,
         _flags: &FileFlags,
-    ) -> Result<(), SystemError> {
-        return Ok(());
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = (|| {
+            return Ok(());
+        })();
+        result.map_err(Into::into)
     }
 
     fn close(&self, _data: MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
@@ -812,7 +814,7 @@ impl IndexNode for LockedDevFSInode {
         file_type: FileType,
         mode: InodeMode,
         data: usize,
-    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+    ) -> Result<Arc<dyn IndexNode>, crate::mm::allocation::MemoryAllocationError> {
         return Ok(self.do_create_with_data(name, file_type, mode, data, Vec::new(), false)?);
     }
 
@@ -844,56 +846,63 @@ impl IndexNode for LockedDevFSInode {
     fn unlink(
         &self,
         name: &str,
-    ) -> Result<crate::filesystem::vfs::LinkRemovalOutcome, SystemError> {
-        let mut inode = self.0.lock();
-        if inode.metadata.file_type != FileType::Dir {
-            return Err(SystemError::ENOTDIR);
-        }
+    ) -> Result<
+        crate::filesystem::vfs::LinkRemovalOutcome,
+        crate::mm::allocation::MemoryAllocationError,
+    > {
+        let result: core::result::Result<_, system_error::SystemError> = (|| {
+            let mut inode = self.0.lock();
+            if inode.metadata.file_type != FileType::Dir {
+                return Err(SystemError::ENOTDIR);
+            }
 
-        if name.is_empty() {
-            return Err(SystemError::ENOENT);
-        }
-        if name == "." || name == ".." {
-            return Err(SystemError::EISDIR);
-        }
-
-        let dname = DName::from(name);
-        let child = inode
-            .children
-            .get(&dname)
-            .cloned()
-            .ok_or(SystemError::ENOENT)?;
-
-        let outcome = if let Some(child) = child.as_any_ref().downcast_ref::<LockedDevFSInode>() {
-            let mut child_inode = child.0.lock();
-            if child_inode.metadata.file_type == FileType::Dir {
+            if name.is_empty() {
+                return Err(SystemError::ENOENT);
+            }
+            if name == "." || name == ".." {
                 return Err(SystemError::EISDIR);
             }
 
-            child_inode.metadata.nlinks = child_inode
-                .metadata
-                .nlinks
-                .checked_sub(1)
-                .ok_or(SystemError::EINVAL)?;
-            child_inode.metadata.ctime = PosixTimeSpec::now();
-            if child_inode.metadata.nlinks == 0 {
-                crate::filesystem::vfs::LinkRemovalOutcome::LastLink
+            let dname = DName::from(name);
+            let child = inode
+                .children
+                .get(&dname)
+                .cloned()
+                .ok_or(SystemError::ENOENT)?;
+
+            let outcome = if let Some(child) = child.as_any_ref().downcast_ref::<LockedDevFSInode>()
+            {
+                let mut child_inode = child.0.lock();
+                if child_inode.metadata.file_type == FileType::Dir {
+                    return Err(SystemError::EISDIR);
+                }
+
+                child_inode.metadata.nlinks = child_inode
+                    .metadata
+                    .nlinks
+                    .checked_sub(1)
+                    .ok_or(SystemError::EINVAL)?;
+                child_inode.metadata.ctime = PosixTimeSpec::now();
+                if child_inode.metadata.nlinks == 0 {
+                    crate::filesystem::vfs::LinkRemovalOutcome::LastLink
+                } else {
+                    crate::filesystem::vfs::LinkRemovalOutcome::StillLinked
+                }
+            } else if child.metadata()?.file_type == FileType::Dir {
+                return Err(SystemError::EISDIR);
             } else {
-                crate::filesystem::vfs::LinkRemovalOutcome::StillLinked
-            }
-        } else if child.metadata()?.file_type == FileType::Dir {
-            return Err(SystemError::EISDIR);
-        } else {
-            // Externally registered device nodes have a single devfs edge.
-            crate::filesystem::vfs::LinkRemovalOutcome::LastLink
-        };
+                // Externally registered device nodes have a single devfs edge.
+                crate::filesystem::vfs::LinkRemovalOutcome::LastLink
+            };
 
-        inode.children.remove(&dname);
-        let now = PosixTimeSpec::now();
-        inode.metadata.mtime = now;
-        inode.metadata.ctime = now;
+            inode.children.remove(&dname);
+            let now = PosixTimeSpec::now();
+            inode.metadata.mtime = now;
+            inode.metadata.ctime = now;
 
-        Ok(outcome)
+            Ok(outcome)
+        })();
+        result.map_err(Into::into)
     }
 
     fn fs(&self) -> Arc<dyn FileSystem> {
@@ -951,8 +960,9 @@ impl IndexNode for LockedDevFSInode {
         _cmd: u32,
         _data: usize,
         _private_data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError> {
-        Err(SystemError::ENOSYS)
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = Err(SystemError::ENOSYS);
+        result.map_err(Into::into)
     }
 
     fn list(&self) -> Result<Vec<String>, SystemError> {
@@ -981,17 +991,23 @@ impl IndexNode for LockedDevFSInode {
         return Ok(self.0.lock().metadata.clone());
     }
 
-    fn set_metadata(&self, metadata: &Metadata) -> Result<(), SystemError> {
-        let mut inode = self.0.lock();
-        inode.metadata.atime = metadata.atime;
-        inode.metadata.mtime = metadata.mtime;
-        inode.metadata.ctime = metadata.ctime;
-        inode.metadata.btime = metadata.btime;
-        inode.metadata.mode = metadata.mode;
-        inode.metadata.uid = metadata.uid;
-        inode.metadata.gid = metadata.gid;
+    fn set_metadata(
+        &self,
+        metadata: &Metadata,
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = (|| {
+            let mut inode = self.0.lock();
+            inode.metadata.atime = metadata.atime;
+            inode.metadata.mtime = metadata.mtime;
+            inode.metadata.ctime = metadata.ctime;
+            inode.metadata.btime = metadata.btime;
+            inode.metadata.mode = metadata.mode;
+            inode.metadata.uid = metadata.uid;
+            inode.metadata.gid = metadata.gid;
 
-        return Ok(());
+            return Ok(());
+        })();
+        result.map_err(Into::into)
     }
 
     fn update_atime(&self, now: PosixTimeSpec, relatime: bool) -> Result<(), SystemError> {
@@ -1007,39 +1023,42 @@ impl IndexNode for LockedDevFSInode {
         len: usize,
         buf: &mut [u8],
         _data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError> {
-        let meta = self.metadata()?;
-        match meta.file_type {
-            FileType::SymLink => {
-                if buf.len() < len {
-                    return Err(SystemError::EINVAL);
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = (|| {
+            let meta = self.metadata()?;
+            match meta.file_type {
+                FileType::SymLink => {
+                    if buf.len() < len {
+                        return Err(SystemError::EINVAL);
+                    }
+                    // 加锁
+                    let inode = self.0.lock();
+
+                    // 检查当前inode是否为一个文件夹，如果是的话，就返回错误
+                    if inode.metadata.file_type == FileType::Dir {
+                        return Err(SystemError::EISDIR);
+                    }
+
+                    let start = inode.data.len().min(offset);
+                    let end = inode.data.len().min(offset + len);
+
+                    // buffer空间不足
+                    if buf.len() < (end - start) {
+                        return Err(SystemError::ENOBUFS);
+                    }
+
+                    // 拷贝数据
+                    let src = &inode.data[start..end];
+                    buf[0..src.len()].copy_from_slice(src);
+                    return Ok(src.len());
                 }
-                // 加锁
-                let inode = self.0.lock();
-
-                // 检查当前inode是否为一个文件夹，如果是的话，就返回错误
-                if inode.metadata.file_type == FileType::Dir {
-                    return Err(SystemError::EISDIR);
+                _ => {
+                    error!("DevFS: read_at is not supported!");
+                    Err(SystemError::ENOSYS)
                 }
-
-                let start = inode.data.len().min(offset);
-                let end = inode.data.len().min(offset + len);
-
-                // buffer空间不足
-                if buf.len() < (end - start) {
-                    return Err(SystemError::ENOBUFS);
-                }
-
-                // 拷贝数据
-                let src = &inode.data[start..end];
-                buf[0..src.len()].copy_from_slice(src);
-                return Ok(src.len());
             }
-            _ => {
-                error!("DevFS: read_at is not supported!");
-                Err(SystemError::ENOSYS)
-            }
-        }
+        })();
+        result.map_err(Into::into)
     }
 
     /// 写设备 - 应该调用设备的函数读写，而不是通过文件系统读写，仅支持符号链接的写入
@@ -1049,35 +1068,38 @@ impl IndexNode for LockedDevFSInode {
         len: usize,
         buf: &[u8],
         _data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError> {
-        let meta = self.metadata()?;
-        match meta.file_type {
-            FileType::SymLink => {
-                if buf.len() < len {
-                    return Err(SystemError::EINVAL);
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = (|| {
+            let meta = self.metadata()?;
+            match meta.file_type {
+                FileType::SymLink => {
+                    if buf.len() < len {
+                        return Err(SystemError::EINVAL);
+                    }
+                    let mut inode = self.0.lock();
+
+                    if inode.metadata.file_type == FileType::Dir {
+                        return Err(SystemError::EISDIR);
+                    }
+
+                    let data: &mut Vec<u8> = &mut inode.data;
+
+                    // 如果文件大小比原来的大，那就resize这个数组
+                    if offset + len > data.len() {
+                        data.resize(offset + len, 0);
+                    }
+
+                    let target = &mut data[offset..offset + len];
+                    target.copy_from_slice(&buf[0..len]);
+                    return Ok(len);
                 }
-                let mut inode = self.0.lock();
-
-                if inode.metadata.file_type == FileType::Dir {
-                    return Err(SystemError::EISDIR);
+                _ => {
+                    error!("DevFS: read_at is not supported!");
+                    Err(SystemError::ENOSYS)
                 }
-
-                let data: &mut Vec<u8> = &mut inode.data;
-
-                // 如果文件大小比原来的大，那就resize这个数组
-                if offset + len > data.len() {
-                    data.resize(offset + len, 0);
-                }
-
-                let target = &mut data[offset..offset + len];
-                target.copy_from_slice(&buf[0..len]);
-                return Ok(len);
             }
-            _ => {
-                error!("DevFS: read_at is not supported!");
-                Err(SystemError::ENOSYS)
-            }
-        }
+        })();
+        result.map_err(Into::into)
     }
 
     fn parent(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
@@ -1097,10 +1119,10 @@ impl IndexNode for LockedDevFSInode {
         filename: &str,
         mode: InodeMode,
         dev_t: DeviceNumber,
-    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+    ) -> Result<Arc<dyn IndexNode>, crate::mm::allocation::MemoryAllocationError> {
         let inode = self.0.lock();
         if inode.metadata.file_type != FileType::Dir {
-            return Err(SystemError::ENOTDIR);
+            return Err(SystemError::ENOTDIR.into());
         }
 
         // 判断需要创建的类型
@@ -1109,7 +1131,7 @@ impl IndexNode for LockedDevFSInode {
             FileType::BlockDevice => FileType::BlockDevice,
             FileType::Pipe => FileType::Pipe,
             FileType::Socket => FileType::Socket,
-            _ => return Err(SystemError::EINVAL),
+            _ => return Err(SystemError::EINVAL.into()),
         };
 
         drop(inode);
@@ -1121,9 +1143,12 @@ impl MountableFileSystem for DevFS {
     fn make_mount_data(
         raw_data: Option<&str>,
         _source: &str,
-    ) -> Result<Option<Arc<dyn FileSystemMakerData + 'static>>, SystemError> {
+    ) -> Result<
+        Option<Arc<dyn FileSystemMakerData + 'static>>,
+        crate::mm::allocation::MemoryAllocationError,
+    > {
         if raw_data.is_some_and(|raw| !raw.trim().is_empty()) {
-            return Err(SystemError::EINVAL);
+            return Err(SystemError::EINVAL.into());
         }
         Ok(None)
     }

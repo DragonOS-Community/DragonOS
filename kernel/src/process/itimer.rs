@@ -1,10 +1,15 @@
 //! Traditional interval timers belong to a thread group, not to the thread
 //! which called setitimer. Lock order: itimers -> group pending/signal locks.
+use crate::cgroup::memory::owned::OwnedBox;
 use alloc::{
     boxed::Box,
     sync::{Arc, Weak},
 };
 use system_error::SystemError;
+
+/// Shared identity stays small; a callback Weak does not retain the actual
+/// accounted timer body after the last strong owner exits.
+pub(crate) type ItimerState = SpinLock<OwnedBox<ProcessItimers>>;
 
 use crate::{
     arch::ipc::signal::Signal,
@@ -129,7 +134,7 @@ impl ProcessItimers {
         }
     }
 
-    fn queue_real(&mut self, state: &Arc<SpinLock<Self>>, target: Weak<Pid>) {
+    fn queue_real(&mut self, state: &Arc<ItimerState>, target: Weak<Pid>) {
         let callback = Box::new(RealCallback {
             state: Arc::downgrade(state),
             target,
@@ -237,7 +242,7 @@ impl ProcessControlBlock {
 
 #[derive(Debug)]
 struct RealCallback {
-    state: Weak<SpinLock<ProcessItimers>>,
+    state: Weak<ItimerState>,
     target: Weak<Pid>,
     generation: u64,
 }

@@ -35,7 +35,7 @@ use crate::{
     },
     libs::mutex::Mutex,
     mm::{
-        page::{page_manager_lock, page_reclaimer_lock, Page, PageEntry, PageFlags, PageType},
+        page::{page_manager_lock, Page, PageEntry, PageFlags, PageType},
         syscall::{MapFlags, ProtFlags},
         MemoryManagementArch, PhysAddr, VirtAddr, VirtRegion, VmFlags,
     },

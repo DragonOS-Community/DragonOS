@@ -12,7 +12,7 @@ use smoltcp::phy::PacketMeta;
 use smoltcp::wire::IpRepr;
 
 use crate::driver::net::tcp_output::{new_transport_interface, TcpOutputQueue};
-use crate::libs::{mutex::Mutex, rwlock::RwLock, spinlock::SpinLock};
+use crate::libs::{mutex::Mutex, spinlock::SpinLock};
 use crate::net::nftables::{NftDeviceNames, RulesetSnapshot};
 use crate::net::socket::inet::{common::port::TcpBindDomain, InetSocket};
 use crate::net::tcp_close_defer::{DeferredTcpCloseRequest, TcpCloseDefer};
@@ -53,16 +53,17 @@ struct InputQueue {
 
 pub struct TcpStack {
     namespace: Weak<NetNamespace>,
-    sockets: Mutex<SocketSet<'static>>,
+    sockets: Mutex<SocketSet<'static, 'static>>,
     context: Mutex<Interface>,
     input: SpinLock<InputQueue>,
     output: TcpOutputQueue,
-    bounds: RwLock<Arc<Vec<Arc<dyn InetSocket>>>>,
+    bounds: Arc<crate::net::tcp_bounds::BoundRegistry>,
     close_defer: TcpCloseDefer,
     listeners: Arc<TcpListenerRegistry>,
     pending: AtomicBool,
     poll_lock: Mutex<()>,
     deadline: AtomicU64,
+    refill_requests: crate::net::tcp_bounds::RefillRequests,
 }
 
 impl core::fmt::Debug for TcpStack {
@@ -154,7 +155,10 @@ impl TcpStack {
         }
     }
 
-    pub(crate) fn new(namespace: Weak<NetNamespace>) -> Self {
+    pub(crate) fn new(
+        namespace: Weak<NetNamespace>,
+        bounds: Arc<crate::net::tcp_bounds::BoundRegistry>,
+    ) -> Self {
         let listeners = Arc::new(TcpListenerRegistry::new());
         let mut sockets = SocketSet::new(Vec::new());
         sockets.set_tcp_listen_registry(Some(listeners.clone()));
@@ -164,17 +168,68 @@ impl TcpStack {
             context: Mutex::new(new_transport_interface()),
             input: SpinLock::new(InputQueue::default()),
             output: TcpOutputQueue::new(),
-            bounds: RwLock::new(Arc::new(Vec::new())),
+            bounds,
             close_defer: TcpCloseDefer::new(),
             listeners,
             pending: AtomicBool::new(false),
             poll_lock: Mutex::new(()),
             deadline: AtomicU64::new(NO_DEADLINE),
+            refill_requests: crate::net::tcp_bounds::RefillRequests::new(),
         }
     }
 
-    pub fn sockets(&self) -> &Mutex<SocketSet<'static>> {
+    pub fn sockets(&self) -> &Mutex<SocketSet<'static, 'static>> {
         &self.sockets
+    }
+
+    /// Prepare shared protocol-table storage in task context. The table keeps
+    /// the allocating creator's receipt until that actual array is retired;
+    /// individual socket close does not refund retained table capacity.
+    pub(crate) fn prepare_socket_capacity(
+        &self,
+        creator: &Arc<crate::cgroup::memory::object::ObjectAccount>,
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        loop {
+            let slots = {
+                let sockets = self.sockets.lock();
+                if sockets.available_slots() != 0 {
+                    return Ok(());
+                }
+                sockets.storage_slots()
+            };
+            let capacity = slots.checked_mul(2).filter(|n| *n > slots).unwrap_or(4);
+            if capacity <= slots {
+                return Err(system_error::SystemError::EOVERFLOW.into());
+            }
+            // Admission and the backing allocator never run under SocketSet.
+            let prepared = crate::net::socket::buffer::try_socket_set_storage(creator, capacity);
+            let mut sockets = self.sockets.lock();
+            if sockets.available_slots() != 0 {
+                drop(sockets);
+                drop(prepared);
+                return Ok(());
+            }
+            let prepared = match prepared {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    drop(sockets);
+                    return Err(error);
+                }
+            };
+            if sockets.storage_slots() > capacity {
+                drop(sockets);
+                drop(prepared);
+                continue;
+            }
+            let retired = sockets
+                .replace_prepared_storage(prepared)
+                .unwrap_or_else(|_| {
+                    unreachable!("prepared empty SocketSet array covers live slots")
+                });
+            drop(sockets);
+            drop(retired);
+            return Ok(());
+        }
     }
 
     pub fn smol_iface(&self) -> &Mutex<Interface> {
@@ -185,27 +240,67 @@ impl TcpStack {
         self.namespace.upgrade()
     }
 
-    pub fn bind_socket(&self, socket: Arc<dyn InetSocket>) {
-        let mut bounds = self.bounds.write();
-        if !bounds.iter().any(|bound| Arc::ptr_eq(bound, &socket)) {
-            Arc::make_mut(&mut *bounds).push(socket);
-        }
+    pub(crate) fn reserve_bound_slot(
+        self: &Arc<Self>,
+        creator: &Arc<crate::cgroup::memory::object::ObjectAccount>,
+    ) -> Result<
+        crate::net::tcp_bounds::BoundSlotReservation,
+        crate::mm::allocation::MemoryAllocationError,
+    > {
+        self.bounds.reserve(creator)
+    }
+
+    pub(crate) fn publish_bound_slot(
+        &self,
+        index: usize,
+        id: u64,
+        socket: Arc<dyn InetSocket>,
+    ) -> bool {
+        self.bounds.publish(index, id, socket)
+    }
+
+    pub(crate) fn unpublish_bound_slot(&self, index: usize, id: u64) {
+        self.bounds.unpublish(index, id);
+    }
+
+    pub(crate) fn cancel_bound_slot(&self, index: usize, id: u64) {
+        self.bounds.cancel(index, id);
     }
 
     pub fn unbind_socket(&self, socket: Arc<dyn InetSocket>) {
-        let mut bounds = self.bounds.write();
-        if let Some(index) = bounds.iter().position(|bound| Arc::ptr_eq(bound, &socket)) {
-            Arc::make_mut(&mut *bounds).remove(index);
-        }
+        self.bounds.unbind(&socket);
     }
 
     pub fn notify_all_bound_sockets(&self) {
-        let bounds = self.bounds.read_irqsave().clone();
-        for socket in bounds.iter() {
-            socket.notify();
-            socket
-                .wait_queue()
-                .wakeup(Some(ProcessState::Blocked(true)));
+        let end = self.bounds.end();
+        for start in (0..end).step_by(crate::net::tcp_bounds::BOUND_BATCH) {
+            let pins = self.bounds.snapshot(start, end);
+            for socket in pins.iter().flatten() {
+                socket.notify();
+                socket
+                    .wait_queue()
+                    .wakeup(Some(ProcessState::Blocked(true)));
+            }
+        }
+    }
+
+    pub(crate) fn refill_listeners(&self) {
+        let Some(batch) = self.refill_requests.next_batch(self.bounds.end()) else {
+            return;
+        };
+        let pins = self.bounds.snapshot(batch.start, batch.end);
+        for socket in pins.iter().flatten() {
+            socket.refill_tcp_listener();
+        }
+        // This method is called before poll serialization, not from an IRQ.
+        drop(pins);
+        self.refill_requests.finish_batch(batch);
+    }
+
+    pub(crate) fn request_listener_refill(&self) {
+        self.refill_requests.request();
+        if let Some(namespace) = self.namespace.upgrade() {
+            namespace.notify_deadline_changed();
         }
     }
 
@@ -233,11 +328,13 @@ impl TcpStack {
     }
 
     pub(crate) fn poll_due(&self, now_us: u64) -> bool {
-        self.pending.load(Ordering::Acquire) || self.deadline.load(Ordering::Acquire) <= now_us
+        self.pending.load(Ordering::Acquire)
+            || self.refill_requests.pending()
+            || self.deadline.load(Ordering::Acquire) <= now_us
     }
 
     pub(crate) fn deadline_us(&self) -> Option<u64> {
-        if self.pending.load(Ordering::Acquire) {
+        if self.pending.load(Ordering::Acquire) || self.refill_requests.pending() {
             return Some(0);
         }
         let deadline = self.deadline.load(Ordering::Acquire);
@@ -287,11 +384,19 @@ impl TcpStack {
             // the same inner -> SocketSet order as listen/accept/shutdown.
             if let Ok(tcp) = smoltcp::wire::TcpPacket::new_checked(&packet.segment[..]) {
                 if tcp.syn() && !tcp.ack() && !tcp.rst() {
-                    let bounds = self.bounds.read_irqsave().clone();
                     let local =
                         smoltcp::wire::IpEndpoint::new(packet.ip.dst_addr(), tcp.dst_port());
-                    for socket in bounds.iter() {
-                        socket.prepare_tcp_syn(local, packet.meta.id);
+                    // Keep admission and dispatch serialized: another poller
+                    // must not consume the last Listen slot after preparation
+                    // but before this SYN is matched. Refill is task-context
+                    // TryOnly and takes no reclaim/OOM path; all preparation
+                    // and retirement remain outside inner/SocketSet/FIB locks.
+                    let end = self.bounds.end();
+                    for start in (0..end).step_by(crate::net::tcp_bounds::BOUND_BATCH) {
+                        let pins = self.bounds.snapshot(start, end);
+                        for socket in pins.iter().flatten() {
+                            socket.prepare_tcp_syn(local, packet.meta.id);
+                        }
                     }
                 }
             }

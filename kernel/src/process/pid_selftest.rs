@@ -5,8 +5,36 @@ use super::*;
 use crate::process::KernelStack;
 
 fn task() -> Result<Arc<ProcessControlBlock>, SystemError> {
-    let task =
-        ProcessControlBlock::new("pid-lifetime-selftest".into(), KernelStack::new()?, false)?;
+    let mut recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
+    let task = loop {
+        let birth = (|| {
+            let resources = crate::process::task::PreparedTaskResources::try_for_fork(
+                &ProcessManager::current_pcb(),
+                crate::process::fork::CloneFlags::empty(),
+                &crate::cgroup::memory::object_for_task(&ProcessManager::current_pcb()),
+            )?;
+            let task = ProcessControlBlock::new(
+                "pid-lifetime-selftest".into(),
+                KernelStack::new()?,
+                false,
+                resources,
+            )?;
+            let creator = crate::cgroup::memory::object_for_task(&ProcessManager::current_pcb());
+            let refs = crate::process::lock_fs_refs_copy();
+            let fs = crate::filesystem::fs::FsStruct::try_new_for(
+                task.nsproxy().mnt_namespace().root_inode(),
+                &creator,
+            )?;
+            let retired = task.set_fs_struct(fs, &refs);
+            assert!(retired.is_none());
+            drop(refs);
+            Ok::<_, crate::mm::allocation::MemoryAllocationError>(task)
+        })();
+        match birth {
+            Ok(task) => break task,
+            Err(error) => error.recover(&mut recovery)?,
+        }
+    };
     // PCB::new inherits a real parent; this fixture must not alter that
     // parent's children on Drop, including after a test PID has been reused.
     *task.parent_pcb.write() = Weak::new();

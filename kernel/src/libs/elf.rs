@@ -5,7 +5,7 @@ use core::{
     ops::Range,
 };
 
-use alloc::{ffi::CString, vec::Vec};
+use alloc::{ffi::CString, sync::Arc, vec::Vec};
 use elf::{
     abi::{ET_DYN, ET_EXEC, PT_GNU_PROPERTY, PT_INTERP, PT_LOAD},
     endian::AnyEndian,
@@ -22,7 +22,6 @@ use crate::{
     mm::{
         allocator::page_frame::{PageFrameCount, VirtPageFrame},
         syscall::{MapFlags, ProtFlags},
-        ucontext::InnerAddressSpace,
         MemoryManagementArch, VirtAddr,
     },
     process::{
@@ -35,8 +34,6 @@ use crate::{
     },
     syscall::user_access::{clear_user_protected, copy_to_user_protected},
 };
-
-use crate::libs::rwsem::RwSemWriteGuard;
 
 // 存放跟架构相关的Elf属性，
 pub trait ElfArch: Clone + Copy + Debug {
@@ -131,7 +128,7 @@ impl ElfLoader {
     /// - `prot_flags` - BSS 所属 PT_LOAD 段的权限
     fn set_elf_brk(
         &self,
-        user_vm_guard: &mut RwSemWriteGuard<'_, InnerAddressSpace>,
+        mm: &Arc<crate::mm::ucontext::AddressSpace>,
         start: VirtAddr,
         end: VirtAddr,
         prot_flags: ProtFlags,
@@ -140,20 +137,17 @@ impl ElfLoader {
         let end = Self::elf_page_align_up(end);
         // debug!("set_elf_brk: start={:?}, end={:?}", start, end);
         if end > start {
-            let r = user_vm_guard.map_anonymous(
+            mm.map_anonymous_wait(
                 start,
                 end - start,
                 Self::elf_brk_prot_flags(prot_flags),
                 MapFlags::MAP_ANONYMOUS | MapFlags::MAP_FIXED_NOREPLACE,
                 false,
                 true,
-            );
-            // debug!("set_elf_brk: map_anonymous: r={:?}", r);
-            if r.is_err() {
-                error!("set_elf_brk: map_anonymous failed, err={:?}", r);
-                return Err(ExecError::OutOfMemory);
-            }
+            )
+            .map_err(ExecError::SystemError)?;
         }
+        let mut user_vm_guard = mm.write();
         user_vm_guard.elf_brk_start = end;
         user_vm_guard.elf_brk = end;
         return Ok(());
@@ -444,8 +438,7 @@ impl ElfLoader {
             interp_elf_ex
                 .vm()
                 .clone()
-                .write()
-                .map_anonymous(
+                .map_anonymous_wait(
                     elf_bss,
                     last_bss - elf_bss,
                     bss_prot,
@@ -453,11 +446,7 @@ impl ElfLoader {
                     false,
                     true,
                 )
-                .map_err(|e| match e {
-                    SystemError::EINVAL => ExecError::InvalidParemeter,
-                    SystemError::ENOMEM => ExecError::OutOfMemory,
-                    _ => return ExecError::InvalidParemeter,
-                })?;
+                .map_err(ExecError::SystemError)?;
         }
         let interp_base = load_addr;
         let entry = load_addr + TryInto::<usize>::try_into(interp_hdr.e_entry).unwrap();
@@ -892,12 +881,14 @@ impl BinaryLoader for ElfLoader {
                 let bss_start_page = Self::elf_page_align_up(elf_bss);
                 let brk_end_page = Self::elf_page_align_up(elf_brk);
                 if brk_end_page > bss_start_page {
+                    drop(user_vm);
                     self.set_elf_brk(
-                        &mut user_vm,
+                        &binding,
                         bss_start_page + load_bias,
                         brk_end_page + load_bias,
                         bss_prot_flags,
                     )?;
+                    user_vm = binding.write();
                 }
 
                 // 处理“BSS 落在最后一个文件页内”的尾部清零（Linux: padzero）
@@ -1092,7 +1083,9 @@ impl BinaryLoader for ElfLoader {
         let bss_start_page = Self::elf_page_align_up(elf_bss);
         let brk_end_page = Self::elf_page_align_up(elf_brk);
         if brk_end_page > bss_start_page {
-            self.set_elf_brk(&mut user_vm, bss_start_page, brk_end_page, bss_prot_flags)?;
+            drop(user_vm);
+            self.set_elf_brk(&binding, bss_start_page, brk_end_page, bss_prot_flags)?;
+            user_vm = binding.write();
         }
         drop(user_vm);
         if let Some(mut interpreter) = interpreter {

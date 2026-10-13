@@ -40,6 +40,182 @@ use super::super::{
 };
 use super::FuseNode;
 
+impl FuseNode {
+    fn write_with_open(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &[u8],
+        private_data: &super::super::private_data::FuseOpenPrivateData,
+        owner: &Arc<crate::cgroup::memory::MemoryAccount>,
+        creator: &Arc<crate::cgroup::memory::object::ObjectAccount>,
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        self.check_not_stale()?;
+        self.ensure_regular()?;
+        if buf.len() < len {
+            return Err(SystemError::EINVAL.into());
+        }
+        if len > 0 {
+            let end = offset.checked_add(len).ok_or(SystemError::EOVERFLOW)?;
+            self.resolve_pending_short_read_truncate(end)?;
+        }
+        let fh = private_data.fh;
+        let file_flags = private_data.open_flags;
+        let fopen_flags = private_data.fopen_flags;
+        if self.dax_active() {
+            let lock_owner = crate::filesystem::vfs::vcore::current_file_lock_owner_id();
+            loop {
+                match self.dax_write_or_fuse_locked(offset, &buf[..len], private_data, lock_owner) {
+                    Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
+                        if self.dax_host_invalidation_blocked() {
+                            self.dax_wait_host_invalidation_interruptible()?;
+                        } else {
+                            self.conn().reclaim_one_dax_range_interruptible()?;
+                        }
+                    }
+                    result => return result.map_err(Into::into),
+                }
+            }
+        }
+        let max_write = core::cmp::min(self.conn().max_write(), self.max_pages_bytes());
+        if max_write == 0 {
+            return Err(SystemError::EIO.into());
+        }
+        let cached_write =
+            (fopen_flags & FOPEN_DIRECT_IO) == 0 && (file_flags & FileFlags::O_DIRECT.bits()) == 0;
+        let lock_owner = if cached_write {
+            0
+        } else {
+            crate::filesystem::vfs::vcore::current_file_lock_owner_id()
+        };
+        if cached_write && self.conn().has_init_flag(FUSE_WRITEBACK_CACHE) {
+            let mut total_written = 0usize;
+            while total_written < len {
+                let chunk = core::cmp::min(max_write, len - total_written);
+                let chunk_offset = offset
+                    .checked_add(total_written)
+                    .ok_or(SystemError::EOVERFLOW)?;
+                let result = {
+                    let _barrier = self.writeback_barrier.read();
+                    self.try_writeback_cache_write(
+                        chunk_offset,
+                        &buf[total_written..total_written + chunk],
+                        private_data,
+                        owner,
+                        creator,
+                    )
+                };
+                match result {
+                    Ok(wrote) => {
+                        total_written += wrote;
+                        if wrote < chunk {
+                            break;
+                        }
+                    }
+                    // Never reclaim under an outer File/Overlay transaction.
+                    // A committed prefix is reported once, not replayed after
+                    // admission recovery; zero-progress failure stays typed.
+                    Err(_) if total_written != 0 => return Ok(total_written),
+                    Err(error) => return Err(error),
+                }
+            }
+            return Ok(total_written);
+        }
+        let _writeback_guard = if cached_write {
+            Some(self.writeback_barrier.read())
+        } else {
+            None
+        };
+        let _direct_write_guard = if cached_write {
+            None
+        } else {
+            Some(self.writeback_barrier.write())
+        };
+        let mut total_written = 0usize;
+        if !cached_write {
+            self.prepare_direct_io_range(
+                offset,
+                len,
+                private_data,
+                true,
+                _direct_write_guard
+                    .as_ref()
+                    .expect("direct writeback admission guard"),
+            )?;
+        }
+        let cached_page_cache = if cached_write {
+            self.cached_page_cache()
+        } else {
+            None
+        };
+        let _cached_write_guard = cached_page_cache
+            .as_ref()
+            .map(|page_cache| page_cache.invalidate_write());
+        if let Some(page_cache) = cached_page_cache.as_ref() {
+            // Serialize ordinary cached writes against page-cache writeback so an older
+            // dirty mmap page cannot be written back after the daemon sees this write.
+            self.prepare_cached_write_range(page_cache, offset, len)?;
+        }
+
+        while total_written < len {
+            let chunk = core::cmp::min(max_write, len - total_written);
+            let chunk_offset = offset
+                .checked_add(total_written)
+                .ok_or(SystemError::EOVERFLOW)?;
+
+            let write_in = FuseWriteIn {
+                fh,
+                offset: chunk_offset as u64,
+                size: chunk as u32,
+                write_flags: if lock_owner != 0 {
+                    FUSE_WRITE_LOCKOWNER
+                } else {
+                    0
+                },
+                lock_owner,
+                flags: file_flags,
+                padding: 0,
+            };
+            let mut payload_in = Vec::with_capacity(size_of::<FuseWriteIn>() + chunk);
+            payload_in.extend_from_slice(fuse_pack_struct(&write_in));
+            payload_in.extend_from_slice(&buf[total_written..total_written + chunk]);
+            let payload = self.conn().request(FUSE_WRITE, self.nodeid, &payload_in)?;
+            let out: FuseWriteOut = fuse_read_struct(&payload)?;
+            if out.size as usize > chunk {
+                return if total_written > 0 {
+                    Ok(total_written)
+                } else {
+                    Err(SystemError::EIO.into())
+                };
+            }
+            let wrote = out.size as usize;
+            self.note_successful_write(chunk_offset, wrote)?;
+            let cache_result = if cached_write {
+                if let Some(page_cache) = cached_page_cache.as_ref() {
+                    self.update_cached_pages_after_write(
+                        page_cache,
+                        chunk_offset,
+                        &buf[total_written..total_written + wrote],
+                    )
+                } else {
+                    Ok(())
+                }
+            } else {
+                self.invalidate_cached_pages_after_direct_write(chunk_offset, wrote)
+            };
+            total_written += wrote;
+            if cache_result.is_err() {
+                break;
+            }
+            if wrote < chunk {
+                break;
+            }
+        }
+
+        Ok(total_written)
+    }
+}
+
 impl IndexNode for FuseNode {
     fn link_mutation_coordinator(&self) -> Option<&LinkMutationCoordinator> {
         Some(&self.link_mutation_coordinator)
@@ -85,17 +261,17 @@ impl IndexNode for FuseNode {
         len: usize,
         offset: usize,
         vm_flags: crate::mm::VmFlags,
-    ) -> Result<(), SystemError> {
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         let _ = (len, offset);
         self.check_not_stale()?;
         if file.file_type() != FileType::File {
-            return Err(SystemError::EINVAL);
+            return Err(SystemError::EINVAL.into());
         }
 
         let fopen_flags = {
             let data = file.private_data.lock();
             let FilePrivateData::Fuse(FuseFilePrivateData::File(p)) = &*data else {
-                return Err(SystemError::EINVAL);
+                return Err(SystemError::EINVAL.into());
             };
             p.fopen_flags
         };
@@ -104,7 +280,7 @@ impl IndexNode for FuseNode {
             && !self.dax_active()
             && vm_flags.contains(crate::mm::VmFlags::VM_MAYSHARE)
         {
-            return Err(SystemError::ENODEV);
+            return Err(SystemError::ENODEV.into());
         }
 
         Ok(())
@@ -129,24 +305,25 @@ impl IndexNode for FuseNode {
         len: usize,
         offset: usize,
         vm_flags: crate::mm::VmFlags,
-    ) -> Result<Arc<crate::filesystem::vfs::file::File>, SystemError> {
+    ) -> Result<Arc<crate::filesystem::vfs::file::File>, crate::mm::allocation::MemoryAllocationError>
+    {
         let _ = (start, len, offset);
         self.check_not_stale()?;
         if file.file_type() != FileType::File {
-            return Err(SystemError::EINVAL);
+            return Err(SystemError::EINVAL.into());
         }
 
         let fopen_flags = {
             let data = file.private_data.lock();
             let FilePrivateData::Fuse(FuseFilePrivateData::File(p)) = &*data else {
-                return Err(SystemError::EINVAL);
+                return Err(SystemError::EINVAL.into());
             };
             p.fopen_flags
         };
 
         if (fopen_flags & FOPEN_DIRECT_IO) != 0 && !self.dax_active() {
             if vm_flags.contains(crate::mm::VmFlags::VM_MAYSHARE) {
-                return Err(SystemError::ENODEV);
+                return Err(SystemError::ENODEV.into());
             }
             self.invalidate_clean_page_cache()?;
         }
@@ -186,13 +363,18 @@ impl IndexNode for FuseNode {
         Ok(payload.len())
     }
 
-    fn setxattr(&self, name: &str, value: &[u8], flags: XattrFlags) -> Result<usize, SystemError> {
+    fn setxattr(
+        &self,
+        name: &str,
+        value: &[u8],
+        flags: XattrFlags,
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
         self.check_not_stale()?;
         if self.conn.no_xattr(FUSE_SETXATTR) {
-            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP.into());
         }
         if value.len() > Self::XATTR_SIZE_MAX {
-            return Err(SystemError::E2BIG);
+            return Err(SystemError::E2BIG.into());
         }
         let inarg = FuseSetxattrInCompat {
             size: value.len() as u32,
@@ -202,8 +384,8 @@ impl IndexNode for FuseNode {
         payload_in.extend_from_slice(value);
         match self.conn().request(FUSE_SETXATTR, self.nodeid, &payload_in) {
             Ok(_) => Ok(0),
-            Err(SystemError::ENOSYS) => Err(self.fuse_xattr_unsupported(FUSE_SETXATTR)),
-            Err(err) => Err(err),
+            Err(SystemError::ENOSYS) => Err(self.fuse_xattr_unsupported(FUSE_SETXATTR).into()),
+            Err(err) => Err(err.into()),
         }
     }
 
@@ -242,15 +424,18 @@ impl IndexNode for FuseNode {
         Ok(payload.len())
     }
 
-    fn removexattr(&self, name: &str) -> Result<usize, SystemError> {
+    fn removexattr(
+        &self,
+        name: &str,
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
         self.check_not_stale()?;
         if self.conn.no_xattr(FUSE_REMOVEXATTR) {
-            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP.into());
         }
         match self.request_name(FUSE_REMOVEXATTR, self.nodeid, name) {
             Ok(_) => Ok(0),
-            Err(SystemError::ENOSYS) => Err(self.fuse_xattr_unsupported(FUSE_REMOVEXATTR)),
-            Err(err) => Err(err),
+            Err(SystemError::ENOSYS) => Err(self.fuse_xattr_unsupported(FUSE_REMOVEXATTR).into()),
+            Err(err) => Err(err.into()),
         }
     }
 
@@ -260,7 +445,7 @@ impl IndexNode for FuseNode {
         lock_owner: u64,
         data: MutexGuard<FilePrivateData>,
         context: &crate::filesystem::vfs::OpenTruncateContext,
-    ) -> Result<(), SystemError> {
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         if self
             .conn
             .has_init_flag(super::super::protocol::FUSE_ATOMIC_O_TRUNC)
@@ -279,13 +464,17 @@ impl IndexNode for FuseNode {
         &self,
         mut data: MutexGuard<FilePrivateData>,
         flags: &FileFlags,
-    ) -> Result<(), SystemError> {
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         self.check_not_stale()?;
         let md = self.cached_or_fetch_metadata()?;
         match md.file_type {
-            FileType::Dir => self.open_common(FUSE_OPENDIR, &mut data, flags),
-            FileType::File => self.open_common(FUSE_OPEN, &mut data, flags),
-            _ => Err(SystemError::EINVAL),
+            FileType::Dir => self
+                .open_common(FUSE_OPENDIR, &mut data, flags)
+                .map_err(Into::into),
+            FileType::File => self
+                .open_common(FUSE_OPEN, &mut data, flags)
+                .map_err(Into::into),
+            _ => Err(SystemError::EINVAL.into()),
         }
     }
 
@@ -314,7 +503,7 @@ impl IndexNode for FuseNode {
         &self,
         data: MutexGuard<FilePrivateData>,
         lock_owner: u64,
-    ) -> Result<(), SystemError> {
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         let fuse_data = match &*data {
             FilePrivateData::Fuse(data) => data.clone(),
             _ => return Ok(()),
@@ -322,7 +511,9 @@ impl IndexNode for FuseNode {
         drop(data);
 
         match fuse_data {
-            FuseFilePrivateData::File(p) => self.flush_open_file(&p, lock_owner),
+            FuseFilePrivateData::File(p) => {
+                self.flush_open_file(&p, lock_owner).map_err(Into::into)
+            }
             FuseFilePrivateData::Dir(_) | FuseFilePrivateData::Dev(_) => Ok(()),
         }
     }
@@ -375,10 +566,10 @@ impl IndexNode for FuseNode {
         len: usize,
         buf: &mut [u8],
         data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError> {
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
         self.check_not_stale()?;
         if buf.len() < len {
-            return Err(SystemError::EINVAL);
+            return Err(SystemError::EINVAL.into());
         }
         // Establish the stable inode type before taking a regular-file open
         // context. Attribute refresh belongs to buffered I/O below; Linux does
@@ -397,7 +588,7 @@ impl IndexNode for FuseNode {
             return Ok(n);
         }
         if cached_md.file_type != FileType::File {
-            return Err(SystemError::EINVAL);
+            return Err(SystemError::EINVAL.into());
         }
         let private_data = Self::fuse_file_private_snapshot(&data)?;
         drop(data);
@@ -415,7 +606,7 @@ impl IndexNode for FuseNode {
                             self.conn().reclaim_one_dax_range_interruptible()?;
                         }
                     }
-                    result => return result,
+                    result => return result.map_err(Into::into),
                 }
             }
         }
@@ -424,7 +615,9 @@ impl IndexNode for FuseNode {
             let _barrier = self.writeback_barrier.write();
             self.prepare_direct_io_range(offset, len, &private_data, false, &_barrier)?;
             let lock_owner = crate::filesystem::vfs::vcore::current_file_lock_owner_id();
-            return self.read_direct_with_open(offset, len, buf, fh, file_flags, lock_owner);
+            return self
+                .read_direct_with_open(offset, len, buf, fh, file_flags, lock_owner)
+                .map_err(Into::into);
         }
 
         // Match Linux fuse_cache_read_iter(): AUTO_INVAL_DATA always enters
@@ -441,7 +634,18 @@ impl IndexNode for FuseNode {
             self.update_cached_metadata_for_open_io(cached_md, fh)?
         };
 
-        self.read_cached_with_open(offset, len, buf, &private_data, md.size.max(0) as usize)
+        let task = crate::process::ProcessManager::current_pcb();
+        let owner = crate::cgroup::memory::account_for_task(&task);
+        let creator = crate::cgroup::memory::object_for_task(&task);
+        self.try_read_cached_with_open(
+            offset,
+            len,
+            buf,
+            &private_data,
+            md.size.max(0) as usize,
+            &owner,
+            &creator,
+        )
     }
 
     fn write_at(
@@ -450,162 +654,59 @@ impl IndexNode for FuseNode {
         len: usize,
         buf: &[u8],
         data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError> {
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        let mut noop = || {};
+        let mut stage = crate::filesystem::vfs::WritePrivilegeStage::new(&mut noop);
+        self.write_primary_with_privilege_stage(
+            offset,
+            len,
+            crate::filesystem::vfs::PrimaryWriteSource::Kernel(buf),
+            data,
+            &mut stage,
+        )
+    }
+
+    fn write_primary_with_privilege_stage(
+        &self,
+        offset: usize,
+        len: usize,
+        source: crate::filesystem::vfs::PrimaryWriteSource<'_, '_>,
+        data: MutexGuard<FilePrivateData>,
+        _stage: &mut crate::filesystem::vfs::WritePrivilegeStage<'_>,
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
         self.check_not_stale()?;
         self.ensure_regular()?;
-        if buf.len() < len {
-            return Err(SystemError::EINVAL);
+        if matches!(&source, crate::filesystem::vfs::PrimaryWriteSource::Kernel(buf) if buf.len() < len)
+        {
+            return Err(SystemError::EINVAL.into());
         }
-        if len > 0 {
-            let end = offset.checked_add(len).ok_or(SystemError::EOVERFLOW)?;
-            self.resolve_pending_short_read_truncate(end)?;
-        }
+        offset.checked_add(len).ok_or(SystemError::EOVERFLOW)?;
         let private_data = Self::fuse_file_private_snapshot(&data)?;
         drop(data);
-        let fh = private_data.fh;
-        let file_flags = private_data.open_flags;
-        let fopen_flags = private_data.fopen_flags;
-        if self.dax_active() {
-            let lock_owner = crate::filesystem::vfs::vcore::current_file_lock_owner_id();
-            loop {
-                match self.dax_write_or_fuse_locked(offset, &buf[..len], &private_data, lock_owner)
-                {
-                    Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
-                        if self.dax_host_invalidation_blocked() {
-                            self.dax_wait_host_invalidation_interruptible()?;
-                        } else {
-                            self.conn().reclaim_one_dax_range_interruptible()?;
-                        }
-                    }
-                    result => return result,
-                }
-            }
+        let task = crate::process::ProcessManager::current_pcb();
+        let owner = crate::cgroup::memory::account_for_task(&task);
+        let creator = crate::cgroup::memory::object_for_task(&task);
+
+        // One inode transaction spans all bounded chunks. User faults happen
+        // before each chunk's writeback/invalidation/layout exclusion, so a
+        // source mapping of this same inode can still be faulted in.
+        let _inode_write = self.setattr_lock.lock();
+        if len == 0 {
+            return self.write_with_open(offset, 0, &[], &private_data, &owner, &creator);
         }
-        let max_write = core::cmp::min(self.conn().max_write(), self.max_pages_bytes());
-        if max_write == 0 {
-            return Err(SystemError::EIO);
-        }
-        let cached_write =
-            (fopen_flags & FOPEN_DIRECT_IO) == 0 && (file_flags & FileFlags::O_DIRECT.bits()) == 0;
-        let lock_owner = if cached_write {
-            0
-        } else {
-            crate::filesystem::vfs::vcore::current_file_lock_owner_id()
-        };
-        let _writeback_guard = if cached_write {
-            Some(self.writeback_barrier.read())
-        } else {
-            None
-        };
-        let _direct_write_guard = if cached_write {
-            None
-        } else {
-            Some(self.writeback_barrier.write())
-        };
-        let mut total_written = 0usize;
-        if !cached_write {
-            self.prepare_direct_io_range(
-                offset,
-                len,
+        source.write_chunks(len, |relative, bytes| {
+            let position = offset.checked_add(relative).ok_or(SystemError::EOVERFLOW)?;
+            self.write_with_open(
+                position,
+                bytes.len(),
+                bytes,
                 &private_data,
-                true,
-                _direct_write_guard
-                    .as_ref()
-                    .expect("direct writeback admission guard"),
-            )?;
-        }
-        if cached_write && self.conn().has_init_flag(FUSE_WRITEBACK_CACHE) {
-            while total_written < len {
-                let chunk = core::cmp::min(max_write, len - total_written);
-                let chunk_offset = offset
-                    .checked_add(total_written)
-                    .ok_or(SystemError::EOVERFLOW)?;
-                let wrote = match self.writeback_cache_write(
-                    chunk_offset,
-                    &buf[total_written..total_written + chunk],
-                    &private_data,
-                ) {
-                    Ok(wrote) => wrote,
-                    Err(e) if total_written == 0 => return Err(e),
-                    Err(_) => return Ok(total_written),
-                };
-                total_written += wrote;
-                if wrote < chunk {
-                    break;
-                }
-            }
-            return Ok(total_written);
-        }
-        let cached_page_cache = if cached_write {
-            self.cached_page_cache()
-        } else {
-            None
-        };
-        let _cached_write_guard = cached_page_cache
-            .as_ref()
-            .map(|page_cache| page_cache.invalidate_write());
-        if let Some(page_cache) = cached_page_cache.as_ref() {
-            // Serialize ordinary cached writes against page-cache writeback so an older
-            // dirty mmap page cannot be written back after the daemon sees this write.
-            self.prepare_cached_write_range(page_cache, offset, len)?;
-        }
-
-        while total_written < len {
-            let chunk = core::cmp::min(max_write, len - total_written);
-            let chunk_offset = offset
-                .checked_add(total_written)
-                .ok_or(SystemError::EOVERFLOW)?;
-
-            let write_in = FuseWriteIn {
-                fh,
-                offset: chunk_offset as u64,
-                size: chunk as u32,
-                write_flags: if lock_owner != 0 {
-                    FUSE_WRITE_LOCKOWNER
-                } else {
-                    0
-                },
-                lock_owner,
-                flags: file_flags,
-                padding: 0,
-            };
-            let mut payload_in = Vec::with_capacity(size_of::<FuseWriteIn>() + chunk);
-            payload_in.extend_from_slice(fuse_pack_struct(&write_in));
-            payload_in.extend_from_slice(&buf[total_written..total_written + chunk]);
-            let payload = self.conn().request(FUSE_WRITE, self.nodeid, &payload_in)?;
-            let out: FuseWriteOut = fuse_read_struct(&payload)?;
-            if out.size as usize > chunk {
-                return if total_written > 0 {
-                    Ok(total_written)
-                } else {
-                    Err(SystemError::EIO)
-                };
-            }
-            let wrote = out.size as usize;
-            self.note_successful_write(chunk_offset, wrote)?;
-            let cache_result = if cached_write {
-                if let Some(page_cache) = cached_page_cache.as_ref() {
-                    self.update_cached_pages_after_write(
-                        page_cache,
-                        chunk_offset,
-                        &buf[total_written..total_written + wrote],
-                    )
-                } else {
-                    Ok(())
-                }
-            } else {
-                self.invalidate_cached_pages_after_direct_write(chunk_offset, wrote)
-            };
-            total_written += wrote;
-            if cache_result.is_err() {
-                break;
-            }
-            if wrote < chunk {
-                break;
-            }
-        }
-
-        Ok(total_written)
+                &owner,
+                &creator,
+            )
+        })
+        // Privilege finalization remains in File after the inode guard exits.
+        // Marking the stage handled here would recurse into SETATTR.
     }
 
     fn metadata(&self) -> Result<Metadata, SystemError> {
@@ -625,7 +726,10 @@ impl IndexNode for FuseNode {
         Ok(())
     }
 
-    fn set_metadata(&self, metadata: &Metadata) -> Result<(), SystemError> {
+    fn set_metadata(
+        &self,
+        metadata: &Metadata,
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         self.check_not_stale()?;
         let _setattr_guard = self.setattr_lock.lock();
         let old = self.cached_or_fetch_metadata()?;
@@ -751,12 +855,17 @@ impl IndexNode for FuseNode {
         Ok(())
     }
 
-    fn resize(&self, len: usize) -> Result<(), SystemError> {
-        self.setattr_size(len, None, None, None)
+    fn resize(&self, len: usize) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        self.setattr_size(len, None, None, None).map_err(Into::into)
     }
 
-    fn resize_with_lock_owner(&self, len: usize, lock_owner: u64) -> Result<(), SystemError> {
+    fn resize_with_lock_owner(
+        &self,
+        len: usize,
+        lock_owner: u64,
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         self.setattr_size(len, Some(lock_owner), None, None)
+            .map_err(Into::into)
     }
 
     fn resize_file(
@@ -764,7 +873,7 @@ impl IndexNode for FuseNode {
         len: usize,
         lock_owner: u64,
         data: MutexGuard<FilePrivateData>,
-    ) -> Result<(), SystemError> {
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         let fuse_data = match &*data {
             FilePrivateData::Fuse(data) => data.clone(),
             _ => {
@@ -775,9 +884,9 @@ impl IndexNode for FuseNode {
         drop(data);
 
         match fuse_data {
-            FuseFilePrivateData::File(p) => {
-                self.setattr_size(len, Some(lock_owner), Some(p.fh), None)
-            }
+            FuseFilePrivateData::File(p) => self
+                .setattr_size(len, Some(lock_owner), Some(p.fh), None)
+                .map_err(Into::into),
             _ => self.resize_with_lock_owner(len, lock_owner),
         }
     }
@@ -788,8 +897,9 @@ impl IndexNode for FuseNode {
         lock_owner: u64,
         metadata: &Metadata,
         mask: SetMetadataMask,
-    ) -> Result<(), SystemError> {
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         self.setattr_size(len, Some(lock_owner), None, Some((metadata, mask)))
+            .map_err(Into::into)
     }
 
     fn resize_file_with_metadata(
@@ -799,7 +909,7 @@ impl IndexNode for FuseNode {
         data: MutexGuard<FilePrivateData>,
         metadata: &Metadata,
         mask: SetMetadataMask,
-    ) -> Result<(), SystemError> {
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         let fuse_data = match &*data {
             FilePrivateData::Fuse(data) => data.clone(),
             _ => {
@@ -810,9 +920,9 @@ impl IndexNode for FuseNode {
         drop(data);
 
         match fuse_data {
-            FuseFilePrivateData::File(p) => {
-                self.setattr_size(len, Some(lock_owner), Some(p.fh), Some((metadata, mask)))
-            }
+            FuseFilePrivateData::File(p) => self
+                .setattr_size(len, Some(lock_owner), Some(p.fh), Some((metadata, mask)))
+                .map_err(Into::into),
             _ => self.resize_with_metadata(len, lock_owner, metadata, mask),
         }
     }
@@ -825,7 +935,7 @@ impl IndexNode for FuseNode {
         _lock_owner: u64,
         attrib: &mut crate::filesystem::vfs::AttribStageObserver<'_>,
         data: MutexGuard<FilePrivateData>,
-    ) -> Result<(), SystemError> {
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         const FALLOC_FL_KEEP_SIZE: u32 = 0x01;
         const FALLOC_FL_PUNCH_HOLE: u32 = 0x02;
         const FALLOC_FL_ZERO_RANGE: u32 = 0x10;
@@ -834,17 +944,17 @@ impl IndexNode for FuseNode {
 
         let mode_bits = mode as u32;
         if mode < 0 || mode_bits & !FUSE_FALLOC_SUPPORTED != 0 {
-            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP.into());
         }
         self.check_not_stale()?;
         let new_size = offset.checked_add(len).ok_or(SystemError::EFBIG)?;
         if self.conn().no_fallocate() {
-            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP.into());
         }
 
         let fuse_data = match &*data {
             FilePrivateData::Fuse(FuseFilePrivateData::File(data)) => data.clone(),
-            _ => return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP),
+            _ => return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP.into()),
         };
         drop(data);
 
@@ -967,9 +1077,9 @@ impl IndexNode for FuseNode {
             }
             Err(SystemError::ENOSYS) => {
                 self.conn().mark_no_fallocate();
-                Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
+                Err(SystemError::EOPNOTSUPP_OR_ENOTSUP.into())
             }
-            Err(e) => Err(e),
+            Err(e) => Err(e.into()),
         }
     }
 
@@ -989,12 +1099,12 @@ impl IndexNode for FuseNode {
         &self,
         datasync: bool,
         data: MutexGuard<FilePrivateData>,
-    ) -> Result<(), SystemError> {
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         let fuse_data = match &*data {
             FilePrivateData::Fuse(data) => data.clone(),
             _ => {
                 drop(data);
-                return self.fsync_common(datasync);
+                return self.fsync_common(datasync).map_err(Into::into);
             }
         };
         drop(data);
@@ -1007,9 +1117,12 @@ impl IndexNode for FuseNode {
                 sync_result?;
                 wb_error_result?;
                 self.fsync_with_fh(FUSE_FSYNC, p.fh, datasync)
+                    .map_err(Into::into)
             }
-            FuseFilePrivateData::Dir(p) => self.fsync_with_fh(FUSE_FSYNCDIR, p.fh, datasync),
-            FuseFilePrivateData::Dev(_) => self.fsync_common(datasync),
+            FuseFilePrivateData::Dir(p) => self
+                .fsync_with_fh(FUSE_FSYNCDIR, p.fh, datasync)
+                .map_err(Into::into),
+            FuseFilePrivateData::Dev(_) => self.fsync_common(datasync).map_err(Into::into),
         }
     }
 
@@ -1019,12 +1132,12 @@ impl IndexNode for FuseNode {
         end: usize,
         datasync: bool,
         data: MutexGuard<FilePrivateData>,
-    ) -> Result<(), SystemError> {
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         let fuse_data = match &*data {
             FilePrivateData::Fuse(data) => data.clone(),
             _ => {
                 drop(data);
-                return self.fsync_common(datasync);
+                return self.fsync_common(datasync).map_err(Into::into);
             }
         };
         drop(data);
@@ -1036,15 +1149,19 @@ impl IndexNode for FuseNode {
             self.sync_cached_range_admitted(start_index, end_index, &_barrier)?;
             if let FuseFilePrivateData::File(p) = fuse_data {
                 self.check_and_advance_open_wb_error(&p)?;
-                return self.fsync_with_fh(FUSE_FSYNC, p.fh, datasync);
+                return self
+                    .fsync_with_fh(FUSE_FSYNC, p.fh, datasync)
+                    .map_err(Into::into);
             }
             unreachable!();
         }
 
         match fuse_data {
             FuseFilePrivateData::File(_) => unreachable!(),
-            FuseFilePrivateData::Dir(p) => self.fsync_with_fh(FUSE_FSYNCDIR, p.fh, datasync),
-            FuseFilePrivateData::Dev(_) => self.fsync_common(datasync),
+            FuseFilePrivateData::Dir(p) => self
+                .fsync_with_fh(FUSE_FSYNCDIR, p.fh, datasync)
+                .map_err(Into::into),
+            FuseFilePrivateData::Dev(_) => self.fsync_common(datasync).map_err(Into::into),
         }
     }
 
@@ -1264,7 +1381,7 @@ impl IndexNode for FuseNode {
         name: &str,
         file_type: FileType,
         mode: InodeMode,
-    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+    ) -> Result<Arc<dyn IndexNode>, crate::mm::allocation::MemoryAllocationError> {
         self.check_not_stale()?;
         self.ensure_dir()?;
         if file_type != FileType::File {
@@ -1289,7 +1406,7 @@ impl IndexNode for FuseNode {
                 self.conn().mark_no_create();
                 return self.create_with_data(name, file_type, mode, 0);
             }
-            Err(e) => return Err(e),
+            Err(e) => return Err(e.into()),
         };
         let (entry, open_out) = Self::parse_create_reply(&payload)?;
         if entry.nodeid != 0 {
@@ -1302,6 +1419,7 @@ impl IndexNode for FuseNode {
             );
         }
         self.create_node_from_entry(&entry, Some(name), FileType::File)
+            .map_err(Into::into)
     }
 
     fn create_and_open(
@@ -1309,11 +1427,11 @@ impl IndexNode for FuseNode {
         name: &str,
         mode: InodeMode,
         flags: &FileFlags,
-    ) -> Result<PreopenedFile, SystemError> {
+    ) -> Result<PreopenedFile, crate::mm::allocation::MemoryAllocationError> {
         self.check_not_stale()?;
         self.ensure_dir()?;
         if self.conn().no_create() {
-            return Err(SystemError::ENOSYS);
+            return Err(SystemError::ENOSYS.into());
         }
 
         // Linux fuse_create_open() forwards creation flags, excluding the
@@ -1331,9 +1449,9 @@ impl IndexNode for FuseNode {
             Ok(payload) => payload,
             Err(SystemError::ENOSYS) => {
                 self.conn().mark_no_create();
-                return Err(SystemError::ENOSYS);
+                return Err(SystemError::ENOSYS.into());
             }
-            Err(err) => return Err(err),
+            Err(err) => return Err(err.into()),
         };
         let (entry, open_out) = Self::parse_create_reply(&payload)?;
 
@@ -1349,7 +1467,7 @@ impl IndexNode for FuseNode {
                         0,
                     );
                 }
-                return Err(err);
+                return Err(err.into());
             }
         };
         let fuse_inode = match inode.clone().downcast_arc::<FuseNode>() {
@@ -1362,7 +1480,7 @@ impl IndexNode for FuseNode {
                     file_flags,
                     0,
                 );
-                return Err(SystemError::EIO);
+                return Err(SystemError::EIO.into());
             }
         };
 
@@ -1376,7 +1494,7 @@ impl IndexNode for FuseNode {
             false,
         ) {
             self.release_common_for_node(FUSE_RELEASE, entry.nodeid, open_out.fh, file_flags, 0);
-            return Err(err);
+            return Err(err.into());
         }
 
         let preopened = PreopenedFile::new(inode, private_data);
@@ -1390,7 +1508,7 @@ impl IndexNode for FuseNode {
         file_type: FileType,
         mode: InodeMode,
         _data: usize,
-    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+    ) -> Result<Arc<dyn IndexNode>, crate::mm::allocation::MemoryAllocationError> {
         self.check_not_stale()?;
         self.ensure_dir()?;
 
@@ -1404,6 +1522,7 @@ impl IndexNode for FuseNode {
                 let payload = self.conn().request(FUSE_MKDIR, self.nodeid, &payload_in)?;
                 let entry: FuseEntryOut = fuse_read_struct(&payload)?;
                 self.create_node_from_entry(&entry, Some(name), FileType::Dir)
+                    .map_err(Into::into)
             }
             FileType::File => {
                 let inarg = FuseMknodIn {
@@ -1416,6 +1535,7 @@ impl IndexNode for FuseNode {
                 let payload = self.conn().request(FUSE_MKNOD, self.nodeid, &payload_in)?;
                 let entry: FuseEntryOut = fuse_read_struct(&payload)?;
                 self.create_node_from_entry(&entry, Some(name), FileType::File)
+                    .map_err(Into::into)
             }
             FileType::SymLink => {
                 let mut payload_in = Vec::with_capacity(name.len() + 2);
@@ -1427,12 +1547,17 @@ impl IndexNode for FuseNode {
                     .request(FUSE_SYMLINK, self.nodeid, &payload_in)?;
                 let entry: FuseEntryOut = fuse_read_struct(&payload)?;
                 self.create_node_from_entry(&entry, Some(name), FileType::SymLink)
+                    .map_err(Into::into)
             }
-            _ => Err(SystemError::ENOSYS),
+            _ => Err(SystemError::ENOSYS.into()),
         }
     }
 
-    fn symlink(&self, name: &str, target: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
+    fn symlink(
+        &self,
+        name: &str,
+        target: &str,
+    ) -> Result<Arc<dyn IndexNode>, crate::mm::allocation::MemoryAllocationError> {
         self.check_not_stale()?;
         self.ensure_dir()?;
         let payload_in = Self::pack_two_names_payload(target, name);
@@ -1441,9 +1566,14 @@ impl IndexNode for FuseNode {
             .request(FUSE_SYMLINK, self.nodeid, &payload_in)?;
         let entry: FuseEntryOut = fuse_read_struct(&payload)?;
         self.create_node_from_entry(&entry, Some(name), FileType::SymLink)
+            .map_err(Into::into)
     }
 
-    fn link(&self, name: &str, other: &Arc<dyn IndexNode>) -> Result<(), SystemError> {
+    fn link(
+        &self,
+        name: &str,
+        other: &Arc<dyn IndexNode>,
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         self.check_not_stale()?;
         self.ensure_dir()?;
         let target = other
@@ -1492,7 +1622,10 @@ impl IndexNode for FuseNode {
         result
     }
 
-    fn unlink(&self, name: &str) -> Result<LinkRemovalOutcome, SystemError> {
+    fn unlink(
+        &self,
+        name: &str,
+    ) -> Result<LinkRemovalOutcome, crate::mm::allocation::MemoryAllocationError> {
         self.check_not_stale()?;
         self.ensure_dir()?;
         let target = match self.lookup_cached_child(name) {
@@ -1504,10 +1637,10 @@ impl IndexNode for FuseNode {
         };
         let _ = self.request_name(FUSE_UNLINK, self.nodeid, name)?;
         self.invalidate_child_name(name);
-        target.note_link_removed(false)
+        target.note_link_removed(false).map_err(Into::into)
     }
 
-    fn rmdir(&self, name: &str) -> Result<(), SystemError> {
+    fn rmdir(&self, name: &str) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         self.check_not_stale()?;
         self.ensure_dir()?;
         let target = match self.lookup_cached_child(name) {
@@ -1530,7 +1663,7 @@ impl IndexNode for FuseNode {
         target: &Arc<dyn IndexNode>,
         new_name: &str,
         flag: RenameFlags,
-    ) -> Result<RenameOutcome, SystemError> {
+    ) -> Result<RenameOutcome, crate::mm::allocation::MemoryAllocationError> {
         self.check_not_stale()?;
         self.ensure_dir()?;
         let target_any = target
@@ -1571,7 +1704,7 @@ impl IndexNode for FuseNode {
             None => match target_any.find(new_name) {
                 Ok(inode) => Some(inode.downcast_arc::<FuseNode>().ok_or(SystemError::EIO)?),
                 Err(SystemError::ENOENT) => None,
-                Err(error) => return Err(error),
+                Err(error) => return Err(error.into()),
             },
         };
         if cached_old
@@ -1583,7 +1716,7 @@ impl IndexNode for FuseNode {
         }
         let r = self.conn().request(opcode, self.nodeid, &payload_in);
         if opcode == FUSE_RENAME2 && matches!(r, Err(SystemError::ENOSYS)) {
-            return Err(SystemError::EINVAL);
+            return Err(SystemError::EINVAL.into());
         }
         let _ = r?;
         self.invalidate_lookup_cache(old_name);

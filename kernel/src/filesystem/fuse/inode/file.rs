@@ -4,6 +4,8 @@ use alloc::{
 };
 use core::{mem::size_of, sync::atomic::Ordering};
 
+use crate::cgroup::memory::{object::ObjectAccount, MemoryAccount};
+use crate::mm::allocation::MemoryAllocationError;
 use system_error::SystemError;
 
 use crate::{
@@ -31,7 +33,7 @@ struct FuseWritebackAdmissionRetryWait {
 }
 
 impl FaultRetryWait for FuseWritebackAdmissionRetryWait {
-    fn wait(&self) -> Result<(), SystemError> {
+    fn wait(&self) -> Result<(), MemoryAllocationError> {
         drop(self.node.writeback_barrier.read());
         Ok(())
     }
@@ -469,12 +471,14 @@ impl FuseNode {
         }
     }
 
-    pub(super) fn writeback_cache_write(
+    pub(super) fn try_writeback_cache_write(
         &self,
         offset: usize,
         data: &[u8],
         open: &FuseOpenPrivateData,
-    ) -> Result<usize, SystemError> {
+        owner: &Arc<MemoryAccount>,
+        creator: &Arc<ObjectAccount>,
+    ) -> Result<usize, MemoryAllocationError> {
         if data.is_empty() {
             return Ok(0);
         }
@@ -495,9 +499,15 @@ impl FuseNode {
             let full_overwrite =
                 write_start == page_start && write_end - write_start == MMArch::PAGE_SIZE;
             if full_overwrite {
-                let _ = page_cache
-                    .manager()
-                    .commit_overwrite_for_write(page_index)?;
+                let _ = page_cache.manager().try_commit_page_for_write_with(
+                    page_index,
+                    owner,
+                    creator,
+                    |_, dst| {
+                        dst.fill(0);
+                        Ok(MMArch::PAGE_SIZE)
+                    },
+                )?;
                 continue;
             }
             if page_cache.manager().peek_page(page_index).is_some() {
@@ -505,9 +515,15 @@ impl FuseNode {
             }
 
             if page_start >= file_size {
-                let _ = page_cache
-                    .manager()
-                    .commit_overwrite_for_write(page_index)?;
+                let _ = page_cache.manager().try_commit_page_for_write_with(
+                    page_index,
+                    owner,
+                    creator,
+                    |_, dst| {
+                        dst.fill(0);
+                        Ok(MMArch::PAGE_SIZE)
+                    },
+                )?;
                 continue;
             }
 
@@ -517,22 +533,24 @@ impl FuseNode {
                 && generation != 0
                 && open.open_context.node_generation != generation
             {
-                return Err(SystemError::ESTALE);
+                return Err(SystemError::ESTALE.into());
             }
-            let _ = page_cache
-                .manager()
-                .commit_page_for_write_with(page_index, |idx, dst| {
-                    self.read_page_with_open(idx, dst, open.fh, open.open_flags)
-                })?;
+            let _ = page_cache.manager().try_commit_page_for_write_with(
+                page_index,
+                owner,
+                creator,
+                |idx, dst| self.read_page_with_open(idx, dst, open.fh, open.open_flags),
+            )?;
         }
 
         // Linux fuse_write_end() publishes the extended i_size before marking
         // the page dirty. Preserve the same invariant: writeback calculates
         // the last-page length from cached metadata, so it must never observe
         // dirty data while the old EOF is still visible.
-        let written = page_cache.write_with_before_dirty(offset, data, |written| {
-            self.note_successful_write(offset, written)
-        })?;
+        let written =
+            page_cache.try_write_with_before_dirty(offset, data, owner, creator, |written| {
+                self.note_successful_write(offset, written)
+            })?;
         Ok(written)
     }
 
@@ -1477,6 +1495,10 @@ impl FuseNode {
         )
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Keep cache, open identity and explicit allocation owner separate"
+    )]
     fn fill_page_cache_range_with_open(
         &self,
         page_cache: &Arc<PageCache>,
@@ -1484,7 +1506,9 @@ impl FuseNode {
         end_page: usize,
         demand_end_page: usize,
         file_ctx: &FillPagesFileCtx,
-    ) -> Result<(usize, Option<usize>, Option<SystemError>), SystemError> {
+        owner: &Arc<MemoryAccount>,
+        creator: &Arc<ObjectAccount>,
+    ) -> Result<(usize, Option<usize>, Option<SystemError>), MemoryAllocationError> {
         if start_page >= end_page || file_ctx.file_size == 0 {
             return Ok((0, None, None));
         }
@@ -1492,7 +1516,7 @@ impl FuseNode {
         let max_read = file_ctx.io_config.max_read;
         let max_pages_by_read = max_pages_for_read(max_read);
         if max_pages_by_read == 0 {
-            return Err(SystemError::EIO);
+            return Err(SystemError::EIO.into());
         }
         let max_pages = core::cmp::max(
             1,
@@ -1530,27 +1554,37 @@ impl FuseNode {
                 break;
             }
 
-            let read_pages_len = (run_end - run_start)
-                .checked_mul(MMArch::PAGE_SIZE)
-                .ok_or(SystemError::EOVERFLOW)?;
-            let read_len = core::cmp::min(
-                core::cmp::min(read_pages_len, max_read),
-                file_ctx.file_size - read_offset,
-            );
-            if read_len == 0 {
-                break;
-            }
-
             let speculative = run_start >= demand_end_page;
             let domain_io = page_cache.try_acquire_domain_io()?;
             let track_direct_read_stats = super::super::stats::optional_read_stats_enabled();
-            let target = match page_cache.manager().reserve_read_dma(
-                run_start,
-                run_end - run_start,
-                track_direct_read_stats,
-            ) {
-                Ok(target) => Arc::new(target),
-                Err(SystemError::EEXIST) => {
+            let prepare_target = |end: usize| {
+                let target = page_cache.manager().try_reserve_read_dma(
+                    run_start,
+                    end - run_start,
+                    track_direct_read_stats,
+                    owner,
+                    creator,
+                )?;
+                // Failed wrapping drops the unpublished reservation and
+                // rolls back its exact Loading markers and page receipts.
+                Arc::try_new(target).map_err(|_| MemoryAllocationError::from(SystemError::ENOMEM))
+            };
+            let candidate = match prepare_target(run_end) {
+                Err(_) if !speculative && run_end > demand_end_page => {
+                    // Preserve a single batched READ when its advisory pages
+                    // fit. TryOnly failure (including metadata or an advisory
+                    // conflict) has already retired the entire candidate;
+                    // retry only demand before exposing a foreground failure.
+                    // Optional admission must never send an otherwise fitting
+                    // fault into quota recovery/OOM.
+                    run_end = demand_end_page;
+                    prepare_target(run_end)
+                }
+                candidate => candidate,
+            };
+            let target = match candidate {
+                Ok(target) => target,
+                Err(MemoryAllocationError::System(SystemError::EEXIST)) => {
                     super::super::stats::on_readahead_reservation_conflict();
                     if speculative {
                         // The foreground read has no dependency on a conflicting
@@ -1565,8 +1599,19 @@ impl FuseNode {
                     let _ = page_cache.wait_read_dma_conflict(run_start, run_end - run_start)?;
                     continue;
                 }
+                Err(_) if speculative => break,
                 Err(error) => return Err(error),
             };
+            // A fallback can shrink the reservation. Derive every transport
+            // length from the successfully prepared range, never the rejected
+            // full window, so the daemon cannot overwrite its DMA destination.
+            let read_pages_len = (run_end - run_start)
+                .checked_mul(MMArch::PAGE_SIZE)
+                .ok_or(SystemError::EOVERFLOW)?;
+            let read_len = core::cmp::min(
+                core::cmp::min(read_pages_len, max_read),
+                file_ctx.file_size - read_offset,
+            );
             let read_in = FuseReadIn {
                 fh: file_ctx.fh,
                 offset: read_offset as u64,
@@ -1680,7 +1725,7 @@ impl FuseNode {
                 FuseReadPagesReply::Contiguous(reply) => reply.len(),
             };
             if bytes_read > read_len {
-                return Err(SystemError::EIO);
+                return Err(SystemError::EIO.into());
             }
             total_read += bytes_read.div_ceil(MMArch::PAGE_SIZE);
         }
@@ -1689,26 +1734,32 @@ impl FuseNode {
             if should_defer_foreground_read_error(async_read, total_read) {
                 return Ok((total_read, truncate_eof, Some(error)));
             }
-            return Err(error);
+            return Err(error.into());
         }
         if interrupted {
             if should_defer_foreground_read_error(async_read, total_read) {
                 return Ok((total_read, truncate_eof, Some(SystemError::EINTR)));
             }
-            return Err(SystemError::EINTR);
+            return Err(SystemError::EINTR.into());
         }
 
         Ok((total_read, truncate_eof, None))
     }
 
-    pub(super) fn read_cached_with_open(
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The cached read preserves explicit open and allocation provenance"
+    )]
+    pub(super) fn try_read_cached_with_open(
         &self,
         offset: usize,
         len: usize,
         buf: &mut [u8],
         open: &FuseOpenPrivateData,
         file_size: usize,
-    ) -> Result<usize, SystemError> {
+        owner: &Arc<MemoryAccount>,
+        creator: &Arc<ObjectAccount>,
+    ) -> Result<usize, MemoryAllocationError> {
         let fh = open.fh;
         let file_flags = open.open_flags;
         let ra_state = &open.readahead_state;
@@ -1767,6 +1818,8 @@ impl FuseNode {
                 fill_end,
                 plan.demand_end_for_wait,
                 &file_ctx,
+                owner,
+                creator,
             )?;
             truncate_eof = observed_eof;
             delayed_error = fill_error;
@@ -1802,13 +1855,20 @@ impl FuseNode {
                 // a later read, as generic_file_read_iter() does.
                 break;
             } else {
-                page_cache
-                    .manager()
-                    .commit_page_with(page_index, |idx, dst| {
+                match page_cache.manager().try_commit_page_with(
+                    page_index,
+                    owner,
+                    creator,
+                    |idx, dst| {
                         let read_len = self.read_page_with_open(idx, dst, fh, file_flags)?;
                         filled_len = Some(read_len);
                         Ok(read_len)
-                    })?
+                    },
+                ) {
+                    Ok(page) => page,
+                    Err(_) if dst_offset != 0 => break,
+                    Err(error) => return Err(error),
+                }
             };
 
             let mut copy_end = copy_end;
@@ -1869,35 +1929,38 @@ impl FuseNode {
 
         if dst_offset == 0 {
             if let Some(error) = delayed_error {
-                return Err(error);
+                return Err(error.into());
             }
         }
 
         Ok(dst_offset)
     }
 
-    pub(crate) fn fault_page_with_open(
+    pub(crate) fn try_fault_page_with_open(
         &self,
         page_index: usize,
         fh: u64,
         file_flags: u32,
-    ) -> Result<Arc<crate::mm::page::Page>, SystemError> {
+        owner: &Arc<MemoryAccount>,
+        creator: &Arc<ObjectAccount>,
+    ) -> Result<Arc<crate::mm::page::Page>, MemoryAllocationError> {
         let md = self.cached_metadata_snapshot().ok_or(SystemError::EIO)?;
         let file_size = md.size.max(0) as usize;
         self.resolve_pending_short_read_truncate(file_size)?;
         if file_size == 0 || page_index.saturating_mul(MMArch::PAGE_SIZE) >= file_size {
-            return Err(SystemError::EINVAL);
+            return Err(SystemError::EINVAL.into());
         }
         let page_cache = self.ensure_page_cache()?;
         let observed_attr_version = self.attr_version();
         let mut filled_len = None;
-        let page = page_cache
-            .manager()
-            .commit_page_with(page_index, |idx, dst| {
-                let read_len = self.read_page_with_open(idx, dst, fh, file_flags)?;
-                filled_len = Some(read_len);
-                Ok(read_len)
-            })?;
+        let page =
+            page_cache
+                .manager()
+                .try_commit_page_with(page_index, owner, creator, |idx, dst| {
+                    let read_len = self.read_page_with_open(idx, dst, fh, file_flags)?;
+                    filled_len = Some(read_len);
+                    Ok(read_len)
+                })?;
         if let Some(read_len) = filled_len {
             if read_len < MMArch::PAGE_SIZE {
                 let (eof, _) = self.note_short_read_eof(
@@ -1909,7 +1972,7 @@ impl FuseNode {
                 if page_index.saturating_mul(MMArch::PAGE_SIZE) >= eof {
                     drop(page);
                     page_cache.manager().discard_clean_page(page_index)?;
-                    return Err(SystemError::EINVAL);
+                    return Err(SystemError::EINVAL.into());
                 }
             }
         }
@@ -1920,12 +1983,16 @@ impl FuseNode {
         if page_index.saturating_mul(MMArch::PAGE_SIZE) >= current_size {
             drop(page);
             page_cache.manager().discard_clean_page(page_index)?;
-            return Err(SystemError::EINVAL);
+            return Err(SystemError::EINVAL.into());
         }
         Ok(page)
     }
 
-    pub(crate) fn mmap_readahead_with_open(
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Fault bounds, open identity and page owners are distinct inputs"
+    )]
+    pub(crate) fn try_mmap_readahead_with_open(
         &self,
         page_index: usize,
         req_pages: usize,
@@ -1933,7 +2000,9 @@ impl FuseNode {
         fh: u64,
         file_flags: u32,
         lifetime: Arc<FuseOpenLifetime>,
-    ) -> Result<usize, SystemError> {
+        owner: &Arc<MemoryAccount>,
+        creator: &Arc<ObjectAccount>,
+    ) -> Result<usize, MemoryAllocationError> {
         if req_pages == 0 {
             return Ok(0);
         }
@@ -1955,7 +2024,7 @@ impl FuseNode {
         let io_config = FuseOpenIoConfig::snapshot(&self.conn);
         let max_pages_by_read = max_pages_for_read(io_config.max_read);
         if max_pages_by_read == 0 {
-            return Err(SystemError::EIO);
+            return Err(SystemError::EIO.into());
         }
         let max_pages_by_conn = core::cmp::min(max_pages_by_read, io_config.max_pages);
         let max_pages = core::cmp::max(
@@ -1981,12 +2050,14 @@ impl FuseNode {
             end_page,
             page_index.saturating_add(req_pages),
             &file_ctx,
+            owner,
+            creator,
         )?;
         drop(_invalidate);
         if let Some(error) = delayed_error {
             let demand_end = page_index.saturating_add(req_pages);
             if !page_cache.is_range_ready(page_index, demand_end) {
-                return Err(error);
+                return Err(error.into());
             }
         }
 

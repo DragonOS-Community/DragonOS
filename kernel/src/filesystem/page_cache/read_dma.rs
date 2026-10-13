@@ -1,7 +1,8 @@
 use super::{
-    pc_stats, Arc, AtomicU64, AtomicU8, MMArch, ManuallyDrop, MemoryManagementArch, Ordering, Page,
-    PageCache, PageCacheManager, PageCacheReadDmaDescriptor, PageCacheReadDmaState, PageEntry,
-    PageFlags, PageState, SystemError, Vec,
+    pc_stats, Arc, AtomicU64, AtomicU8, MMArch, ManuallyDrop, MemoryAccount, MemoryAllocationError,
+    MemoryManagementArch, ObjectAccount, Ordering, Page, PageCache, PageCacheManager,
+    PageCacheReadDmaDescriptor, PageCacheReadDmaState, PageEntry, PageFlags, PageState,
+    SystemError, Vec,
 };
 
 static PAGE_CACHE_DMA_RESERVATION_ID: AtomicU64 = AtomicU64::new(1);
@@ -180,6 +181,16 @@ impl PageCacheReadDmaReservation {
             return Err(SystemError::EINVAL);
         }
 
+        // Completion cannot recover a quota or allocate under the cache lock.
+        // Prepare the returned owner list before editing any page/marker. The
+        // device has retired in Completed; a failed preparation can detach its
+        // Loading markers, while this reservation still pins the real frames.
+        let mut published = Vec::new();
+        if published.try_reserve_exact(self.items.len()).is_err() {
+            self.rollback_markers(SystemError::ENOMEM, true);
+            return Err(SystemError::ENOMEM);
+        }
+
         for (position, item) in self.items.iter().enumerate() {
             let page_payload_start = position * MMArch::PAGE_SIZE;
             let initialized = payload_len
@@ -209,7 +220,6 @@ impl PageCacheReadDmaReservation {
             }
         }
 
-        let mut published = Vec::with_capacity(self.items.len());
         for item in self.items.iter() {
             let current = inner
                 .get_entry(item.descriptor.page_index)
@@ -280,7 +290,7 @@ impl PageCacheReadDmaReservation {
                     })
                     .unwrap_or(false);
                 if matches {
-                    inner.remove_page(item.descriptor.page_index);
+                    inner.remove_entry(item.descriptor.page_index);
                     true
                 } else {
                     false
@@ -301,7 +311,7 @@ impl PageCacheReadDmaReservation {
             let mut inner = cache.inner.lock();
             if matches!(inner.get_entry(item.descriptor.page_index), Some(current) if Arc::ptr_eq(&current, &item.entry))
             {
-                inner.remove_page(item.descriptor.page_index);
+                inner.remove_entry(item.descriptor.page_index);
                 item.entry.set_state(PageState::Error);
                 item.entry.wait_queue.wake_all();
             }
@@ -357,8 +367,29 @@ impl PageCacheManager {
         page_count: usize,
         track_direct_read_stats: bool,
     ) -> Result<PageCacheReadDmaReservation, SystemError> {
+        let task = crate::process::ProcessManager::current_pcb();
+        let owner = crate::cgroup::memory::account_for_task(&task);
+        let creator = crate::cgroup::memory::object_for_task(&task);
+        self.try_reserve_read_dma(
+            start_page_index,
+            page_count,
+            track_direct_read_stats,
+            &owner,
+            &creator,
+        )
+        .map_err(PageCache::legacy_allocation_error)
+    }
+
+    pub fn try_reserve_read_dma(
+        &self,
+        start_page_index: usize,
+        page_count: usize,
+        track_direct_read_stats: bool,
+        owner: &Arc<MemoryAccount>,
+        creator: &Arc<ObjectAccount>,
+    ) -> Result<PageCacheReadDmaReservation, MemoryAllocationError> {
         if page_count == 0 || start_page_index.checked_add(page_count - 1).is_none() {
-            return Err(SystemError::EINVAL);
+            return Err(SystemError::EINVAL.into());
         }
 
         let cache = self.upgrade()?;
@@ -366,28 +397,38 @@ impl PageCacheManager {
         let page_cache_ref = {
             let inner = cache.inner.lock();
             if (0..page_count).any(|offset| inner.get_entry(start_page_index + offset).is_some()) {
-                return Err(SystemError::EEXIST);
+                return Err(SystemError::EEXIST.into());
             }
             inner.page_cache_ref.clone()
         };
-        let mut items: Vec<PageCacheReadDmaItem> = Vec::with_capacity(page_count);
+        let mut items: Vec<PageCacheReadDmaItem> = Vec::new();
+        items
+            .try_reserve_exact(page_count)
+            .map_err(|_| SystemError::ENOMEM)?;
 
         for offset in 0..page_count {
             let page_index = start_page_index + offset;
-            let page = match cache.allocate_page(page_cache_ref.clone(), page_index) {
-                Ok(page) => page,
+            let page =
+                match cache.allocate_page_with_owner(page_cache_ref.clone(), page_index, owner) {
+                    Ok(page) => page,
+                    Err(error) => {
+                        PageCacheReadDmaReservation::cleanup_unsubmitted_items(&cache, &items);
+                        return Err(error);
+                    }
+                };
+            let paddr = page.phys_address();
+            let Some(vaddr) = (unsafe { MMArch::phys_2_virt(paddr) }) else {
+                cache.discard_unlinked_page(&page);
+                PageCacheReadDmaReservation::cleanup_unsubmitted_items(&cache, &items);
+                return Err(SystemError::EFAULT.into());
+            };
+            let entry = match cache.prepare_entry(&page, PageState::Loading, creator) {
+                Ok(entry) => entry,
                 Err(error) => {
                     PageCacheReadDmaReservation::cleanup_unsubmitted_items(&cache, &items);
                     return Err(error);
                 }
             };
-            let paddr = page.phys_address();
-            let Some(vaddr) = (unsafe { MMArch::phys_2_virt(paddr) }) else {
-                cache.discard_unlinked_page(&page);
-                PageCacheReadDmaReservation::cleanup_unsubmitted_items(&cache, &items);
-                return Err(SystemError::EFAULT);
-            };
-            let entry = Arc::new(PageEntry::new(page.clone(), PageState::Loading));
             items.push(PageCacheReadDmaItem {
                 descriptor: PageCacheReadDmaDescriptor {
                     page_index,
@@ -399,26 +440,16 @@ impl PageCacheManager {
             });
         }
 
-        // Publish the complete Loading range atomically.  Exposing a prefix
-        // while allocating later pages lets a waiter attach to that prefix and
-        // then observe a synthetic EIO when a later-page conflict rolls it back.
-        let mut inner = cache.inner.lock();
-        if items
-            .iter()
-            .any(|item| inner.get_entry(item.descriptor.page_index).is_some())
-        {
-            drop(inner);
+        if let Err(error) = cache.publish_prepared_range(
+            items
+                .iter()
+                .map(|item| (item.descriptor.page_index, &item.entry)),
+            page_count,
+            creator,
+        ) {
             PageCacheReadDmaReservation::cleanup_unsubmitted_items(&cache, &items);
-            return Err(SystemError::EEXIST);
+            return Err(error);
         }
-        for item in &items {
-            if let Err(error) = inner.insert_entry(item.descriptor.page_index, item.entry.clone()) {
-                drop(inner);
-                PageCacheReadDmaReservation::cleanup_unsubmitted_items(&cache, &items);
-                return Err(error);
-            }
-        }
-        drop(inner);
         for item in &items {
             cache.reconcile_entry_unevictable_for_insert(&item.entry);
         }

@@ -62,17 +62,31 @@ impl Syscall for SysMemfdCreate {
             return Err(SystemError::ENOSYS);
         }
 
-        let file = create_memfd_file(
-            name,
-            flags & MFD_ALLOW_SEALING != 0,
-            flags & MFD_NOEXEC_SEAL != 0,
-        )?;
+        let mut recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
+        let file = loop {
+            let mut attempt_name = Vec::new();
+            attempt_name
+                .try_reserve_exact(name.len())
+                .map_err(|_| SystemError::ENOMEM)?;
+            attempt_name.extend_from_slice(&name);
+            match create_memfd_file(
+                attempt_name,
+                flags & MFD_ALLOW_SEALING != 0,
+                flags & MFD_NOEXEC_SEAL != 0,
+            ) {
+                Ok(file) => break file,
+                Err(error) => error.recover(&mut recovery)?,
+            }
+        };
         let current = ProcessManager::current_pcb();
-        let fd = current.fd_table().alloc_fd_arc(
-            file,
-            flags & MFD_CLOEXEC != 0,
-            current.nofile_soft_limit(),
-        )?;
+        let fd = crate::filesystem::vfs::file::File::recover_io(|| {
+            current.fd_table().alloc_fd_arc(
+                file.clone(),
+                flags & MFD_CLOEXEC != 0,
+                current.nofile_soft_limit(),
+                &crate::cgroup::memory::object_for_task(&current),
+            )
+        })?;
         Ok(fd as usize)
     }
 

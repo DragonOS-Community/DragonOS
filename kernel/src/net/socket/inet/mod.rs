@@ -35,6 +35,8 @@ pub const UNSPECIFIED_LOCAL_ENDPOINT_V6: IpEndpoint =
 pub trait InetSocket: Socket {
     /// Prepare bounded passive-open capacity before the transport store is locked.
     fn prepare_tcp_syn(&self, _local: smoltcp::wire::IpEndpoint, _device: u32) {}
+    /// Only the existing namespace task poller calls this outside poll locks.
+    fn refill_tcp_listener(&self) {}
 
     /// `on_iface_events`
     /// 通知socket发生的事件

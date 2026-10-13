@@ -7,6 +7,7 @@ use ::uprobe::UPROBE_INSN_COPY_SIZE;
 pub(super) struct PreparedMunmap {
     plans: Vec<MunmapVmaPlan>,
     locked_vm_after_commit: usize,
+    rollback_notifications: VmaCloseNotifications,
 }
 
 impl PreparedMunmap {
@@ -15,7 +16,7 @@ impl PreparedMunmap {
     }
 
     pub(super) fn rollback(self) -> VmaCloseNotifications {
-        let mut notifications = VmaCloseNotifications::default();
+        let mut notifications = self.rollback_notifications;
         for plan in self.plans {
             plan.split_lifecycle.rollback_into(&mut notifications);
         }
@@ -29,6 +30,7 @@ impl PreparedMunmap {
 
 pub(super) struct PreparedMprotect {
     plans: Vec<MprotectVmaPlan>,
+    rollback_notifications: VmaCloseNotifications,
 }
 
 impl PreparedMprotect {
@@ -58,7 +60,7 @@ impl PreparedMprotect {
     }
 
     pub(super) fn rollback(self) -> VmaCloseNotifications {
-        let mut notifications = VmaCloseNotifications::default();
+        let mut notifications = self.rollback_notifications;
         for plan in self.plans {
             plan.split_lifecycle.rollback_into(&mut notifications);
         }
@@ -218,29 +220,14 @@ impl InnerAddressSpace {
     /// - `EINVAL`: invalid argument
     /// - `ENOMEM`: out of memory
     /// - `EFAULT`: VMA state is invalid
-    pub fn munmap(
-        &mut self,
-        start_page: VirtPageFrame,
-        page_count: PageFrameCount,
-    ) -> Result<(), SystemError> {
-        match self.munmap_collect(start_page, page_count) {
-            Ok(notifications) => {
-                Self::notify_close_notifications(notifications);
-                Ok(())
-            }
-            Err(failure) => {
-                Self::notify_close_notifications(failure.notifications);
-                Err(failure.err)
-            }
-        }
-    }
-
     pub(super) fn munmap_collect(
         &mut self,
         start_page: VirtPageFrame,
         page_count: PageFrameCount,
+
+        creator: &Arc<ObjectAccount>,
     ) -> Result<VmaCloseNotifications, VmaOpFailure> {
-        let prepared = self.prepare_munmap(start_page, page_count)?;
+        let prepared = self.prepare_munmap(start_page, page_count, creator)?;
         Ok(self.commit_munmap(prepared))
     }
 
@@ -248,6 +235,8 @@ impl InnerAddressSpace {
         &mut self,
         start_page: VirtPageFrame,
         page_count: PageFrameCount,
+
+        creator: &Arc<ObjectAccount>,
     ) -> Result<PreparedMunmap, VmaOpFailure> {
         defer!({
             compiler_fence(Ordering::SeqCst);
@@ -258,6 +247,7 @@ impl InnerAddressSpace {
         let vmas_related: Vec<Arc<LockedVMA>> = self.mappings.conflicts(region_to_unmap);
 
         let mut notifications = VmaCloseNotifications::default();
+        notifications.prepare_split_retirement(vmas_related.len())?;
         let mut plans: Vec<MunmapVmaPlan> = Vec::with_capacity(vmas_related.len());
         let mut locked_vm_after_commit = self.locked_vm;
 
@@ -288,7 +278,7 @@ impl InnerAddressSpace {
                         plan.split_lifecycle.rollback_into(&mut notifications);
                     }
                     return Err(VmaOpFailure {
-                        err: SystemError::EFAULT,
+                        err: SystemError::EFAULT.into(),
                         notifications,
                     });
                 };
@@ -306,7 +296,7 @@ impl InnerAddressSpace {
                         plan.split_lifecycle.rollback_into(&mut notifications);
                     }
                     return Err(VmaOpFailure {
-                        err: SystemError::EFAULT,
+                        err: SystemError::EFAULT.into(),
                         notifications,
                     });
                 };
@@ -316,7 +306,7 @@ impl InnerAddressSpace {
                 None
             };
 
-            let split_lifecycle = match cur_vma.prepare_split_lifecycle(intersection) {
+            let split_lifecycle = match cur_vma.prepare_split_lifecycle(intersection, creator) {
                 Ok(lifecycle) => lifecycle,
                 Err(failure) => {
                     for plan in plans {
@@ -338,6 +328,7 @@ impl InnerAddressSpace {
         Ok(PreparedMunmap {
             plans,
             locked_vm_after_commit,
+            rollback_notifications: notifications,
         })
     }
 
@@ -349,11 +340,10 @@ impl InnerAddressSpace {
             .outer_addr_space()
             .expect("live munmap transaction lost its AddressSpace");
         let mut tlb = MmuGather::gather(&mm);
-        let mut notifications = VmaCloseNotifications::default();
-        let mut unmapped_vmas: Vec<Arc<LockedVMA>> = Vec::with_capacity(prepared.plans.len());
+        let mut notifications = prepared.rollback_notifications;
         prepared.plans.reverse();
         let mut plans = prepared.plans;
-        while let Some(plan) = plans.pop() {
+        while let Some(mut plan) = plans.pop() {
             let cur_vma = self
                 .mappings
                 .remove_vma(&plan.original_region)
@@ -361,7 +351,11 @@ impl InnerAddressSpace {
             let (before, after) = {
                 let _pt_edit = mm.page_table_edit();
                 let split_result = cur_vma
-                    .extract(plan.intersection, &self.user_mapper.utable)
+                    .extract(
+                        plan.intersection,
+                        &self.user_mapper.utable,
+                        &mut plan.split_lifecycle,
+                    )
                     .expect("prepared munmap intersection became invalid");
                 let before = split_result.prev;
                 let after = split_result.after;
@@ -373,9 +367,11 @@ impl InnerAddressSpace {
             };
 
             if let Some(notification) = Self::collect_vma_close(&cur_vma, plan.intersection) {
+                assert!(notifications.vma.len() < notifications.vma.capacity());
                 notifications.vma.push(notification);
             }
             if let Some(notification) = Self::collect_sysv_shm_close(&cur_vma) {
+                assert!(notifications.sysv.len() < notifications.sysv.capacity());
                 notifications.sysv.push(notification);
             }
 
@@ -387,15 +383,13 @@ impl InnerAddressSpace {
                 self.mappings.insert_vma(after);
             }
             plan.split_lifecycle.commit();
-            // Keep the removed VMA alive until after TLB shootdown.  Its drop may
-            // destroy the last shared-anon backing object, which can release
-            // physical pages that were just unmapped above.
-            unmapped_vmas.push(cur_vma);
+            // Keep its body/backing alive through shootdown AND until the outer
+            // owner releases MM. The prepared 2*N slots cover N originals.
+            notifications.retire_vma(cur_vma);
         }
 
         // Shootdown first, then free physical pages
         tlb.finish();
-        drop(unmapped_vmas);
 
         notifications
     }
@@ -573,8 +567,10 @@ impl InnerAddressSpace {
         start_page: VirtPageFrame,
         page_count: PageFrameCount,
         prot_flags: ProtFlags,
+
+        creator: &Arc<ObjectAccount>,
     ) -> Result<(), VmaOpFailure> {
-        let prepared = self.prepare_mprotect(start_page, page_count, prot_flags)?;
+        let prepared = self.prepare_mprotect(start_page, page_count, prot_flags, creator)?;
         let deferred_execute = self.commit_mprotect(prepared);
         #[cfg(target_arch = "x86_64")]
         {
@@ -593,6 +589,8 @@ impl InnerAddressSpace {
         start_page: VirtPageFrame,
         page_count: PageFrameCount,
         prot_flags: ProtFlags,
+
+        creator: &Arc<ObjectAccount>,
     ) -> Result<PreparedMprotect, VmaOpFailure> {
         #[cfg(target_arch = "x86_64")]
         let mm = self
@@ -614,6 +612,7 @@ impl InnerAddressSpace {
 
         let mut plans: Vec<MprotectVmaPlan> = Vec::with_capacity(regions.len());
         let mut rollback_notifications = VmaCloseNotifications::default();
+        rollback_notifications.prepare_split_retirement(regions.len())?;
         for r in &regions {
             // debug!("mprotect: r: {:?}", r);
             let (original_region, old_vm_flags, new_vm_flags, defer_uprobe_execute) = {
@@ -624,7 +623,7 @@ impl InnerAddressSpace {
                             .rollback_into(&mut rollback_notifications);
                     }
                     return Err(VmaOpFailure {
-                        err: SystemError::EACCES,
+                        err: SystemError::EACCES.into(),
                         notifications: rollback_notifications,
                     });
                 }
@@ -642,7 +641,7 @@ impl InnerAddressSpace {
                                 .rollback_into(&mut rollback_notifications);
                         }
                         return Err(VmaOpFailure {
-                            err,
+                            err: err.into(),
                             notifications: rollback_notifications,
                         });
                     }
@@ -690,7 +689,7 @@ impl InnerAddressSpace {
             #[cfg(not(target_arch = "x86_64"))]
             let _ = old_vm_flags;
             let intersection = original_region.intersect(&region).unwrap();
-            let split_lifecycle = match r.prepare_split_lifecycle(intersection) {
+            let split_lifecycle = match r.prepare_split_lifecycle(intersection, creator) {
                 Ok(lifecycle) => lifecycle,
                 Err(failure) => {
                     for plan in plans {
@@ -716,7 +715,10 @@ impl InnerAddressSpace {
             });
         }
 
-        Ok(PreparedMprotect { plans })
+        Ok(PreparedMprotect {
+            plans,
+            rollback_notifications,
+        })
     }
 
     pub(super) fn commit_mprotect(&mut self, prepared: PreparedMprotect) -> Vec<Arc<LockedVMA>> {
@@ -727,7 +729,7 @@ impl InnerAddressSpace {
         let mapper = &mut self.user_mapper.utable;
 
         let mut deferred_execute = Vec::new();
-        for plan in prepared.plans {
+        for mut plan in prepared.plans {
             let r = self
                 .mappings
                 .remove_vma(&plan.original_region)
@@ -736,7 +738,7 @@ impl InnerAddressSpace {
             let (before, after) = {
                 let _pt_edit = mm.page_table_edit();
                 let split_result = r
-                    .extract(plan.intersection, mapper)
+                    .extract(plan.intersection, mapper, &mut plan.split_lifecycle)
                     .expect("prepared mprotect intersection became invalid");
 
                 let mut r_guard = r.lock();
@@ -800,8 +802,10 @@ impl InnerAddressSpace {
         start_page: VirtPageFrame,
         page_count: PageFrameCount,
         prot_flags: ProtFlags,
-    ) -> Result<(), SystemError> {
-        match self.mprotect_collect(start_page, page_count, prot_flags) {
+
+        creator: &Arc<ObjectAccount>,
+    ) -> Result<(), MemoryAllocationError> {
+        match self.mprotect_collect(start_page, page_count, prot_flags, creator) {
             Ok(()) => Ok(()),
             Err(failure) => {
                 Self::notify_close_notifications(failure.notifications);
@@ -906,6 +910,8 @@ impl InnerAddressSpace {
     pub(crate) fn apply_mlockall_current_collect(
         &mut self,
         new_flags: VmFlags,
+
+        creator: &Arc<ObjectAccount>,
     ) -> VmaCloseNotifications {
         let ranges = self
             .mappings
@@ -918,7 +924,8 @@ impl InnerAddressSpace {
 
         let mut notifications = VmaCloseNotifications::default();
         for (start, len) in ranges {
-            if let Err(failure) = self.apply_vma_lock_flags_collect(start, len, new_flags) {
+            if let Err(failure) = self.apply_vma_lock_flags_collect(start, len, new_flags, creator)
+            {
                 notifications.extend(failure.notifications);
             }
         }
@@ -926,8 +933,12 @@ impl InnerAddressSpace {
         notifications
     }
 
-    pub fn apply_mlockall_current(&mut self, new_flags: VmFlags) -> Result<(), SystemError> {
-        let notifications = self.apply_mlockall_current_collect(new_flags);
+    pub fn apply_mlockall_current(
+        &mut self,
+        new_flags: VmFlags,
+        creator: &Arc<ObjectAccount>,
+    ) -> Result<(), SystemError> {
+        let notifications = self.apply_mlockall_current_collect(new_flags, creator);
         Self::notify_close_notifications(notifications);
         Ok(())
     }
@@ -936,7 +947,10 @@ impl InnerAddressSpace {
         self.mlock_future = flags;
     }
 
-    pub(crate) fn clear_all_vma_lock_flags_collect(&mut self) -> VmaCloseNotifications {
+    pub(crate) fn clear_all_vma_lock_flags_collect(
+        &mut self,
+        creator: &Arc<ObjectAccount>,
+    ) -> VmaCloseNotifications {
         self.mlock_future = VmFlags::VM_NONE;
         let ranges = self
             .mappings
@@ -956,7 +970,9 @@ impl InnerAddressSpace {
 
         let mut notifications = VmaCloseNotifications::default();
         for (start, len) in ranges {
-            if let Err(failure) = self.apply_vma_lock_flags_collect(start, len, VmFlags::VM_NONE) {
+            if let Err(failure) =
+                self.apply_vma_lock_flags_collect(start, len, VmFlags::VM_NONE, creator)
+            {
                 notifications.extend(failure.notifications);
             }
         }
@@ -964,8 +980,11 @@ impl InnerAddressSpace {
         notifications
     }
 
-    pub fn clear_all_vma_lock_flags(&mut self) -> Result<(), SystemError> {
-        let notifications = self.clear_all_vma_lock_flags_collect();
+    pub fn clear_all_vma_lock_flags(
+        &mut self,
+        creator: &Arc<ObjectAccount>,
+    ) -> Result<(), SystemError> {
+        let notifications = self.clear_all_vma_lock_flags_collect(creator);
         Self::notify_close_notifications(notifications);
         Ok(())
     }
@@ -975,6 +994,8 @@ impl InnerAddressSpace {
         start: VirtAddr,
         len: usize,
         new_flags: VmFlags,
+
+        creator: &Arc<ObjectAccount>,
     ) -> Result<(), VmaOpFailure> {
         let target = Self::checked_user_region(start, len)?;
         self.count_unlocked_pages_for_mlock(start, len)?;
@@ -983,6 +1004,7 @@ impl InnerAddressSpace {
         let mut vmas = self.mappings.conflicts(target);
         vmas.sort_by_key(|vma| vma.lock().region().start().data());
 
+        let mut notifications = VmaCloseNotifications::default();
         for cur_vma in vmas {
             let (original_region, intersection, old_flags) = {
                 let guard = cur_vma.lock();
@@ -1019,10 +1041,12 @@ impl InnerAddressSpace {
             } else {
                 None
             };
-            let split_lifecycle = match cur_vma.prepare_split_lifecycle(intersection) {
+            if intersection != original_region {
+                notifications.prepare_split_retirement(1)?;
+            }
+            let mut split_lifecycle = match cur_vma.prepare_split_lifecycle(intersection, creator) {
                 Ok(lifecycle) => lifecycle,
                 Err(failure) => {
-                    let mut notifications = VmaCloseNotifications::default();
                     let err = failure.rollback_into(&mut notifications);
                     return Err(VmaOpFailure { err, notifications });
                 }
@@ -1030,27 +1054,27 @@ impl InnerAddressSpace {
             let cur_vma = match self.mappings.remove_vma(&original_region) {
                 Some(vma) => vma,
                 None => {
-                    let mut notifications = VmaCloseNotifications::default();
                     split_lifecycle.rollback_into(&mut notifications);
                     return Err(VmaOpFailure {
-                        err: SystemError::EFAULT,
+                        err: SystemError::EFAULT.into(),
                         notifications,
                     });
                 }
             };
 
-            let split_result = match cur_vma.extract(intersection, &self.user_mapper.utable) {
-                Some(split_result) => split_result,
-                None => {
-                    self.mappings.insert_vma(cur_vma.clone());
-                    let mut notifications = VmaCloseNotifications::default();
-                    split_lifecycle.rollback_into(&mut notifications);
-                    return Err(VmaOpFailure {
-                        err: SystemError::EFAULT,
-                        notifications,
-                    });
-                }
-            };
+            let split_result =
+                match cur_vma.extract(intersection, &self.user_mapper.utable, &mut split_lifecycle)
+                {
+                    Some(split_result) => split_result,
+                    None => {
+                        self.mappings.insert_vma(cur_vma.clone());
+                        split_lifecycle.rollback_into(&mut notifications);
+                        return Err(VmaOpFailure {
+                            err: SystemError::EFAULT.into(),
+                            notifications,
+                        });
+                    }
+                };
             let (before, after) = (split_result.prev, split_result.after);
 
             {
@@ -1091,8 +1115,10 @@ impl InnerAddressSpace {
         start: VirtAddr,
         len: usize,
         new_flags: VmFlags,
-    ) -> Result<(), SystemError> {
-        match self.apply_vma_lock_flags_collect(start, len, new_flags) {
+
+        creator: &Arc<ObjectAccount>,
+    ) -> Result<(), MemoryAllocationError> {
+        match self.apply_vma_lock_flags_collect(start, len, new_flags, creator) {
             Ok(()) => Ok(()),
             Err(failure) => {
                 Self::notify_close_notifications(failure.notifications);
@@ -1149,12 +1175,6 @@ impl InnerAddressSpace {
         }
 
         page_guard.remove_flags(PageFlags::PG_UNEVICTABLE);
-        let paddr = page.phys_address();
-        let should_reclaim = page_guard.flags().contains(PageFlags::PG_LRU);
-        drop(page_guard);
-        if should_reclaim {
-            page_reclaimer_lock().insert_page(paddr, page);
-        }
     }
 
     fn madvise_uses_range_without_vma_split(behavior: MadvFlags) -> bool {
@@ -1236,6 +1256,8 @@ impl InnerAddressSpace {
         start_page: VirtPageFrame,
         page_count: PageFrameCount,
         behavior: MadvFlags,
+
+        creator: &Arc<ObjectAccount>,
     ) -> Result<(), VmaOpFailure> {
         let mm = self.outer_addr_space().ok_or(SystemError::EFAULT)?;
         let mut tlb = MmuGather::gather(&mm);
@@ -1280,6 +1302,7 @@ impl InnerAddressSpace {
         let mapper = &mut self.user_mapper.utable;
         let mut plans: Vec<MadviseVmaPlan> = Vec::with_capacity(regions.len());
         let mut rollback_notifications = VmaCloseNotifications::default();
+        rollback_notifications.prepare_split_retirement(regions.len())?;
         for r in &regions {
             let (original_region, old_flags) = {
                 let guard = r.lock();
@@ -1294,7 +1317,7 @@ impl InnerAddressSpace {
                             .rollback_into(&mut rollback_notifications);
                     }
                     return Err(VmaOpFailure {
-                        err,
+                        err: err.into(),
                         notifications: rollback_notifications,
                     });
                 }
@@ -1303,7 +1326,7 @@ impl InnerAddressSpace {
                 continue;
             };
             let intersection = original_region.intersect(&region).unwrap();
-            let split_lifecycle = match r.prepare_split_lifecycle(intersection) {
+            let split_lifecycle = match r.prepare_split_lifecycle(intersection, creator) {
                 Ok(lifecycle) => lifecycle,
                 Err(failure) => {
                     for plan in plans {
@@ -1324,14 +1347,14 @@ impl InnerAddressSpace {
             });
         }
 
-        for plan in plans {
+        for mut plan in plans {
             let r = match self.mappings.remove_vma(&plan.original_region) {
                 Some(vma) => vma,
                 None => {
                     plan.split_lifecycle
                         .rollback_into(&mut rollback_notifications);
                     return Err(VmaOpFailure {
-                        err: SystemError::EFAULT,
+                        err: SystemError::EFAULT.into(),
                         notifications: rollback_notifications,
                     });
                 }
@@ -1340,7 +1363,7 @@ impl InnerAddressSpace {
             let madvise_result: Result<VmaSplitSides, SystemError> = {
                 let _pt_edit = mm.page_table_edit();
                 let split_result = r
-                    .extract(plan.intersection, mapper)
+                    .extract(plan.intersection, mapper, &mut plan.split_lifecycle)
                     .expect("Failed to extract VMA");
                 r.do_madvise(behavior, mapper, &mut tlb);
                 Ok((split_result.prev, split_result.after))
@@ -1352,7 +1375,7 @@ impl InnerAddressSpace {
                     plan.split_lifecycle
                         .rollback_into(&mut rollback_notifications);
                     return Err(VmaOpFailure {
-                        err,
+                        err: err.into(),
                         notifications: rollback_notifications,
                     });
                 }
@@ -1379,8 +1402,10 @@ impl InnerAddressSpace {
         start_page: VirtPageFrame,
         page_count: PageFrameCount,
         behavior: MadvFlags,
-    ) -> Result<(), SystemError> {
-        match self.madvise_collect(start_page, page_count, behavior) {
+
+        creator: &Arc<ObjectAccount>,
+    ) -> Result<(), MemoryAllocationError> {
+        match self.madvise_collect(start_page, page_count, behavior, creator) {
             Ok(()) => Ok(()),
             Err(failure) => {
                 Self::notify_close_notifications(failure.notifications);
@@ -1416,9 +1441,14 @@ impl InnerAddressSpace {
     /// ## Parameters
     ///
     /// - `size`: the stack size
-    pub fn new_user_stack(&mut self, size: usize) -> Result<(), SystemError> {
+    pub fn new_user_stack(
+        &mut self,
+        size: usize,
+        creator: Option<&Arc<ObjectAccount>>,
+        data_account: &Arc<crate::cgroup::memory::MemoryAccount>,
+    ) -> Result<(), MemoryAllocationError> {
         assert!(self.user_stack.is_none(), "User stack already exists");
-        let stack = UserStack::new(self, None, size)?;
+        let stack = UserStack::new(self, None, size, creator, data_account)?;
         self.user_stack = Some(stack);
         return Ok(());
     }
@@ -1485,11 +1515,16 @@ impl InnerAddressSpace {
     ///
     /// The caller must release `AddressSpace::write()` before consuming the
     /// request.  See `AddressSpace::populate_range_post_commit`.
-    pub(super) unsafe fn set_brk(&mut self, new_brk: VirtAddr) -> Result<BrkOutcome, SystemError> {
+    pub(super) unsafe fn set_brk(
+        &mut self,
+        new_brk: VirtAddr,
+        creator: Option<&Arc<ObjectAccount>>,
+        data_account: &Arc<crate::cgroup::memory::MemoryAccount>,
+    ) -> Result<BrkOutcome, MmapFailure> {
         assert!(new_brk.check_aligned(MMArch::PAGE_SIZE));
 
         if !new_brk.check_user() || new_brk < self.brk_start {
-            return Err(SystemError::EFAULT);
+            return Err(SystemError::EFAULT.into());
         }
 
         // Soft limit: RLIMIT_DATA
@@ -1499,7 +1534,7 @@ impl InnerAddressSpace {
         if rlim != usize::MAX {
             let desired = new_brk.data().saturating_sub(self.brk_start.data());
             if desired > rlim {
-                return Err(SystemError::ENOMEM);
+                return Err(SystemError::ENOMEM.into());
             }
         }
 
@@ -1509,12 +1544,21 @@ impl InnerAddressSpace {
             let len = new_brk - self.brk;
             let brk_region = VirtRegion::new(self.brk, len);
             if self.mappings.has_conflict(brk_region) {
-                return Err(SystemError::ENOMEM);
+                return Err(SystemError::ENOMEM.into());
             }
             let prot_flags = ProtFlags::PROT_READ | ProtFlags::PROT_WRITE;
             let map_flags =
                 MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS | MapFlags::MAP_FIXED_NOREPLACE;
-            self.map_anonymous(old_brk, len, prot_flags, map_flags, true, false)?;
+            self.map_anonymous(
+                old_brk,
+                len,
+                prot_flags,
+                map_flags,
+                true,
+                false,
+                creator,
+                data_account,
+            )?;
 
             self.brk = new_brk;
             let post_commit_population = self.mappings.contains(old_brk).and_then(|vma| {
@@ -1526,6 +1570,7 @@ impl InnerAddressSpace {
             return Ok(BrkOutcome {
                 old_brk,
                 post_commit_population,
+                notifications: VmaCloseNotifications::default(),
             });
         } else {
             let unmap_len = self.brk - new_brk;
@@ -1534,25 +1579,34 @@ impl InnerAddressSpace {
                 return Ok(BrkOutcome {
                     old_brk,
                     post_commit_population: None,
+                    notifications: VmaCloseNotifications::default(),
                 });
             }
-            self.munmap(
+            let notifications = self.munmap_collect(
                 VirtPageFrame::new(unmap_start),
                 PageFrameCount::from_bytes(unmap_len).unwrap(),
+                creator.ok_or(SystemError::EINVAL)?,
             )?;
             self.brk = new_brk;
             return Ok(BrkOutcome {
                 old_brk,
                 post_commit_population: None,
+                notifications,
             });
         }
     }
 
-    pub(super) unsafe fn sbrk(&mut self, incr: isize) -> Result<BrkOutcome, SystemError> {
+    pub(super) unsafe fn sbrk(
+        &mut self,
+        incr: isize,
+        creator: Option<&Arc<ObjectAccount>>,
+        data_account: &Arc<crate::cgroup::memory::MemoryAccount>,
+    ) -> Result<BrkOutcome, MmapFailure> {
         if incr == 0 {
             return Ok(BrkOutcome {
                 old_brk: self.brk,
                 post_commit_population: None,
+                notifications: VmaCloseNotifications::default(),
             });
         }
 
@@ -1570,11 +1624,11 @@ impl InnerAddressSpace {
         if rlim != usize::MAX {
             let desired = new_brk.data().saturating_sub(self.brk_start.data());
             if desired > rlim {
-                return Err(SystemError::ENOMEM);
+                return Err(SystemError::ENOMEM.into());
             }
         }
 
-        return self.set_brk(new_brk);
+        return self.set_brk(new_brk, creator, data_account);
     }
 
     pub(super) fn find_free_at_prepare(
@@ -1583,8 +1637,10 @@ impl InnerAddressSpace {
         vaddr: VirtAddr,
         size: usize,
         flags: MapFlags,
-    ) -> Result<VirtRegion, SystemError> {
-        self.find_free_at_internal(min_vaddr, vaddr, size, flags, false)
+
+        creator: &Arc<ObjectAccount>,
+    ) -> Result<VirtRegion, MemoryAllocationError> {
+        self.find_free_at_internal(min_vaddr, vaddr, size, flags, false, creator)
             .map(|(region, _)| region)
             .map_err(|failure| {
                 debug_assert!(
@@ -1601,8 +1657,10 @@ impl InnerAddressSpace {
         vaddr: VirtAddr,
         size: usize,
         flags: MapFlags,
+
+        creator: &Arc<ObjectAccount>,
     ) -> Result<(VirtRegion, VmaCloseNotifications), VmaOpFailure> {
-        self.find_free_at_internal(min_vaddr, vaddr, size, flags, true)
+        self.find_free_at_internal(min_vaddr, vaddr, size, flags, true, creator)
     }
 
     pub(super) fn find_free_at_internal(
@@ -1612,6 +1670,8 @@ impl InnerAddressSpace {
         size: usize,
         flags: MapFlags,
         unmap_fixed: bool,
+
+        creator: &Arc<ObjectAccount>,
     ) -> Result<(VirtRegion, VmaCloseNotifications), VmaOpFailure> {
         // If no address was specified, search for a free virtual memory range in the current process's address space.
         if vaddr == VirtAddr::new(0)
@@ -1671,6 +1731,7 @@ impl InnerAddressSpace {
                 let notifications = self.munmap_collect(
                     VirtPageFrame::new(requested.start()),
                     PageFrameCount::from_bytes(requested.size()).unwrap(),
+                    creator,
                 )?;
                 return Ok((requested, notifications));
             }

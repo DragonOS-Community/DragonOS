@@ -189,7 +189,9 @@ pub fn do_mount(
         AtFlags::AT_FDCWD.bits(),
         requested_target,
     )?;
-    let inode = current_node.lookup_follow_symlink(&rest_path, VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
+    let inode = crate::filesystem::vfs::file::File::recover_io(|| {
+        current_node.lookup_follow_symlink(&rest_path, VFS_MAX_FOLLOW_SYMLINK_TIMES)
+    })?;
     path_mount(source, inode, filesystemtype, data, mount_flags)
 }
 
@@ -507,13 +509,15 @@ fn do_new_mount(
     loop {
         // Linux accepts a NULL source for nodev filesystems. Keep an
         // explicitly supplied empty string distinct from the display name.
-        let fs = produce_fs_in_context(
-            &fs_type_str,
-            data.as_deref(),
-            source.as_deref().unwrap_or(""),
-            creation_flags,
-            &creation,
-        )
+        let fs = crate::filesystem::vfs::file::File::recover_io(|| {
+            produce_fs_in_context(
+                &fs_type_str,
+                data.as_deref(),
+                source.as_deref().unwrap_or(""),
+                creation_flags,
+                &creation,
+            )
+        })
         .inspect_err(|e| {
             log::warn!("Failed to produce filesystem: {:?}", e);
         })?;
@@ -624,8 +628,9 @@ fn do_bind_mount(
         AtFlags::AT_FDCWD.bits(),
         &source_path,
     )?;
-    let source_inode =
-        current_node.lookup_follow_symlink(&rest_path, VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
+    let source_inode = crate::filesystem::vfs::file::File::recover_io(|| {
+        current_node.lookup_follow_symlink(&rest_path, VFS_MAX_FOLLOW_SYMLINK_TIMES)
+    })?;
 
     let source_is_dir = source_inode.metadata()?.file_type == FileType::Dir;
     let target_is_dir = target_inode.metadata()?.file_type == FileType::Dir;
@@ -776,7 +781,9 @@ fn do_move_mount(
         AtFlags::AT_FDCWD.bits(),
         &source_path,
     )?;
-    let source_inode = begin.lookup_follow_symlink(&rest, VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
+    let source_inode = crate::filesystem::vfs::file::File::recover_io(|| {
+        begin.lookup_follow_symlink(&rest, VFS_MAX_FOLLOW_SYMLINK_TIMES)
+    })?;
 
     let current_mntns = ProcessManager::current_mntns();
 

@@ -1,18 +1,25 @@
 use crate::{
     arch::ipc::signal::{SigFlags, SigSet, Signal, MAX_SIG_NUM},
+    cgroup::memory::{accounting::KernelByteKind, object::ObjectAccount, owned::OwnedBox},
     filesystem::epoll::event_poll::EPollItemList,
     ipc::signal_types::{SaHandlerType, Sigaction, SigactionType},
     libs::rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
     libs::wait_queue::WaitQueue,
+    mm::allocation::MemoryAllocationError,
     process::{ProcessControlBlock, ProcessManager},
 };
-use alloc::{sync::Arc, vec::Vec};
+use alloc::sync::Arc;
 use core::{fmt::Debug, sync::atomic::compiler_fence};
 use system_error::SystemError;
 
 /// Signal dispositions may be shared by distinct processes using CLONE_SIGHAND.
 /// Process-directed signals and lifecycle state live in ProcessSignalState.
 pub struct SigHand {
+    body: OwnedBox<SigHandData>,
+}
+
+#[derive(Debug)]
+struct SigHandData {
     inner: RwLock<InnerSigHand>,
     signalfd_wqh: WaitQueue,
     signalfd_epitems: EPollItemList,
@@ -24,40 +31,43 @@ impl Debug for SigHand {
     }
 }
 
+#[derive(Debug)]
 pub struct InnerSigHand {
-    pub handlers: Vec<Sigaction>,
+    pub handlers: [Sigaction; MAX_SIG_NUM],
     pub cnt: i64,
 }
 
 impl SigHand {
-    pub fn new() -> Arc<Self> {
-        Self::try_new().expect("failed to allocate signal-handler table")
-    }
-    pub fn try_new() -> Result<Arc<Self>, SystemError> {
-        Arc::try_new(Self {
+    pub(crate) fn try_new_for(
+        creator: &Arc<ObjectAccount>,
+    ) -> Result<Arc<Self>, MemoryAllocationError> {
+        let storage = OwnedBox::prepare(creator, KernelByteKind::SlabUnreclaimable)?
+            .try_allocate()
+            .map_err(|_| SystemError::ENOMEM)?;
+        let body = storage.init(SigHandData {
             inner: RwLock::new(InnerSigHand {
-                handlers: try_default_sighandlers()?,
+                handlers: default_sighandlers(),
                 cnt: 0,
             }),
             signalfd_wqh: WaitQueue::default(),
             signalfd_epitems: EPollItemList::default(),
-        })
-        .map_err(|_| SystemError::ENOMEM)
+        });
+        Ok(Arc::try_new(Self { body }).map_err(|_| SystemError::ENOMEM)?)
     }
     fn inner(&self) -> RwLockReadGuard<'_, InnerSigHand> {
-        self.inner.read_irqsave()
+        self.body.inner.read_irqsave()
     }
     fn inner_mut(&self) -> RwLockWriteGuard<'_, InnerSigHand> {
-        self.inner.write_irqsave()
+        self.body.inner.write_irqsave()
     }
     pub fn inner_read(&self) -> RwLockReadGuard<'_, InnerSigHand> {
         self.inner()
     }
     pub fn signalfd_wqh(&self) -> &WaitQueue {
-        &self.signalfd_wqh
+        &self.body.signalfd_wqh
     }
     pub fn signalfd_epitems(&self) -> &EPollItemList {
-        &self.signalfd_epitems
+        &self.body.signalfd_epitems
     }
     pub fn attach_task_ref(&self) {
         self.inner_mut().cnt += 1;
@@ -68,7 +78,7 @@ impl SigHand {
         g.cnt -= 1;
     }
     pub fn reset_handlers(&self) {
-        self.inner_mut().handlers = default_sighandlers();
+        initialize_default_sighandlers(&mut self.inner_mut().handlers);
     }
     pub fn handler(&self, sig: Signal) -> Option<Sigaction> {
         self.inner().handlers.get(Self::sig2idx(sig)).cloned()
@@ -95,15 +105,14 @@ impl SigHand {
     }
 }
 
-fn default_sighandlers() -> Vec<Sigaction> {
-    try_default_sighandlers().expect("failed to allocate signal actions")
+fn default_sighandlers() -> [Sigaction; MAX_SIG_NUM] {
+    let mut actions = [Sigaction::default(); MAX_SIG_NUM];
+    initialize_default_sighandlers(&mut actions);
+    actions
 }
 
-fn try_default_sighandlers() -> Result<Vec<Sigaction>, SystemError> {
-    let mut r = Vec::new();
-    r.try_reserve_exact(MAX_SIG_NUM)
-        .map_err(|_| SystemError::ENOMEM)?;
-    r.resize(MAX_SIG_NUM, Sigaction::default());
+fn initialize_default_sighandlers(r: &mut [Sigaction; MAX_SIG_NUM]) {
+    r.fill(Sigaction::default());
     let mut sig_ign = Sigaction::default();
     // 收到忽略的信号，重启系统调用
     // Linux ignores SIGURG/SIGWINCH by default; SIGCHLD is also ignored by default,
@@ -113,11 +122,9 @@ fn try_default_sighandlers() -> Result<Vec<Sigaction>, SystemError> {
 
     r[Signal::SIGURG as usize - 1] = sig_ign;
     r[Signal::SIGWINCH as usize - 1] = sig_ign;
-
-    Ok(r)
 }
 
-impl ProcessControlBlock {
+impl SigHand {
     /// 刷新指定进程的sighand的sigaction，将满足条件的sigaction恢复为默认状态。
     /// 除非某个信号被设置为忽略且 `force_default` 为 `false`，否则都不会将其恢复。
     ///
@@ -125,11 +132,10 @@ impl ProcessControlBlock {
     ///
     /// - `pcb`: 要被刷新的pcb。
     /// - `force_default`: 是否强制将sigaction恢复成默认状态。
-    pub fn flush_signal_handlers(&self, force_default: bool) {
+    pub(crate) fn flush_handlers(&self, force_default: bool) {
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
         // debug!("hand=0x{:018x}", hand as *const sighand_struct as usize);
-        let sighand = self.sighand();
-        let actions = &mut sighand.inner_mut().handlers;
+        let actions = &mut self.inner_mut().handlers;
 
         for sigaction in actions.iter_mut() {
             if force_default || !sigaction.is_ignore() {
@@ -142,6 +148,12 @@ impl ProcessControlBlock {
             compiler_fence(core::sync::atomic::Ordering::SeqCst);
         }
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl ProcessControlBlock {
+    pub fn flush_signal_handlers(&self, force_default: bool) {
+        self.sighand().flush_handlers(force_default);
     }
 }
 

@@ -64,7 +64,10 @@ pub(super) fn do_mlock(
 
     let vm = AddressSpace::current()?;
     let region = VirtRegion::new(start, len);
+    let mut charge_recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
     loop {
+        let creator =
+            crate::cgroup::memory::object_for_task(&crate::process::ProcessManager::current_pcb());
         let mut guard = vm.write_interruptible()?;
         if guard.mappings.first_reservation_conflict(region).is_some() {
             drop(guard);
@@ -75,7 +78,7 @@ pub(super) fn do_mlock(
         let new_pages = guard.count_unlocked_pages_for_mlock(start, len)?;
         check_mlock_rlimit(guard.locked_vm, new_pages)?;
 
-        match guard.apply_vma_lock_flags_collect(start, len, new_flags) {
+        match guard.apply_vma_lock_flags_collect(start, len, new_flags, &creator) {
             Ok(()) => {
                 drop(guard);
                 vm.populate_mlock_range_post_commit(start, len)?;
@@ -86,7 +89,8 @@ pub(super) fn do_mlock(
                 crate::mm::ucontext::InnerAddressSpace::notify_close_notifications(
                     failure.notifications,
                 );
-                return Err(failure.err);
+                failure.err.recover(&mut charge_recovery)?;
+                continue;
             }
         }
     }

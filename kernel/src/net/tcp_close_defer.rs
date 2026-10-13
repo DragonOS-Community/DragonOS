@@ -136,7 +136,7 @@ impl TcpCloseDefer {
     pub fn reap_closed(
         &self,
         now: smoltcp::time::Instant,
-        sockets: &mut smoltcp::iface::SocketSet<'static>,
+        sockets: &mut smoltcp::iface::SocketSet<'static, 'static>,
     ) -> Option<smoltcp::time::Instant> {
         let mut closing = self.closing.lock();
         if closing.is_empty() {

@@ -3,7 +3,7 @@ use crate::{
     net::{address::source_address_usable_on_iface, Iface},
     process::namespace::net_namespace::NetNamespace,
 };
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 
 pub(crate) mod error_queue;
 pub(crate) mod pmtu;
@@ -14,7 +14,36 @@ pub use device_binding::{DeviceBindingUpdate, SocketDeviceBinding};
 pub mod multicast;
 pub use multicast::{apply_ipv4_membership, apply_ipv4_multicast_if, Ipv4MulticastMembership};
 pub(crate) mod output_account;
+pub(crate) mod registration;
 use system_error::SystemError;
+
+/// Match the syscall-return network service opportunity for local datagrams.
+/// Advance already-admitted local output without retaining socket or routing
+/// guards. OUTPUT may select a different local input device from the source
+/// owner. This bounded service opportunity is not a remote-delivery guarantee;
+/// remaining work continues through the namespace poller.
+pub(crate) fn poll_local_output(
+    netns: &Arc<NetNamespace>,
+    source: &Arc<dyn Iface>,
+    target: &Arc<dyn Iface>,
+) {
+    const LOCAL_OUTPUT_POLL_ROUNDS: usize = 8;
+    let poll = |iface: &Arc<dyn Iface>| {
+        for _ in 0..LOCAL_OUTPUT_POLL_ROUNDS {
+            if !iface
+                .net_namespace()
+                .is_some_and(|owner| Arc::ptr_eq(&owner, netns))
+                || !iface.poll()
+            {
+                break;
+            }
+        }
+    };
+    poll(source);
+    if !Arc::ptr_eq(source, target) {
+        poll(target);
+    }
+}
 
 /**
  * 目前，以下设计仍然没有考虑多网卡的listen问题，仅只解决了socket在绑定单网卡下的问题。
@@ -26,6 +55,7 @@ pub struct BoundInner {
     iface: Arc<dyn Iface>,
     socket_set: crate::driver::net::InterfaceSocketSet,
     netns: Arc<NetNamespace>,
+    registry: Weak<crate::net::tcp_bounds::BoundRegistry>,
     // inner: Vec<(smoltcp::iface::SocketHandle, Arc<dyn Iface>)>
     // address: smoltcp::wire::IpAddress,
 }
@@ -37,6 +67,32 @@ pub struct BoundInner {
 pub(crate) struct EphemeralBindTarget {
     pub(crate) stack_owner: Arc<dyn Iface>,
     pub(crate) local_addr: smoltcp::wire::IpAddress,
+}
+
+pub(crate) fn explicit_bind_iface(
+    address: smoltcp::wire::IpAddress,
+    netns: &Arc<NetNamespace>,
+    device: Option<Arc<dyn Iface>>,
+) -> Result<Arc<dyn Iface>, SystemError> {
+    if !bind_address_uses_local_owner(address) {
+        if let Some(device) = device {
+            return Ok(device);
+        }
+    }
+    if address.is_unspecified() {
+        select_iface_for_unspecified(&address, netns)
+    } else {
+        get_iface_for_local_bind(&address, netns)
+            .ok_or_else(|| bind_addr_not_found_error(&address, netns))
+    }
+}
+
+pub(crate) fn ephemeral_bind_target(
+    remote: smoltcp::wire::IpAddress,
+    netns: &Arc<NetNamespace>,
+    device: Option<Arc<dyn Iface>>,
+) -> Result<EphemeralBindTarget, SystemError> {
+    tcp_connect_target(&remote, netns, device)
 }
 
 /// Returns whether a concrete bind address has a unique local-delivery owner.
@@ -52,137 +108,21 @@ pub(crate) fn bind_address_uses_local_owner(address: smoltcp::wire::IpAddress) -
 }
 
 impl BoundInner {
-    /// # `bind`
-    /// 将socket绑定到指定的地址上，置入指定的网络接口中
-    pub fn bind<T>(
-        socket: T,
-        // socket_type: Types,
-        address: &smoltcp::wire::IpAddress,
-        netns: Arc<NetNamespace>,
-    ) -> Result<Self, SystemError>
-    where
-        T: smoltcp::socket::AnySocket<'static>,
-    {
-        Self::bind_recoverable(socket, address, netns).map_err(|(_, err)| err)
-    }
-
-    pub fn bind_recoverable<T>(
-        socket: T,
-        address: &smoltcp::wire::IpAddress,
-        netns: Arc<NetNamespace>,
-    ) -> Result<Self, (T, SystemError)>
-    where
-        T: smoltcp::socket::AnySocket<'static>,
-    {
-        if address.is_unspecified() {
-            let iface = match select_iface_for_unspecified(address, &netns) {
-                Ok(iface) => iface,
-                Err(err) => return Err((socket, err)),
-            };
-            let (socket_set, handle) = iface.common().add_smol_socket_in_netns(socket, &netns)?;
-            return Ok(Self {
-                handle,
-                iface,
-                socket_set,
-                netns,
-            });
-        } else {
-            let iface = match get_iface_for_local_bind(address, &netns) {
-                Some(iface) => iface,
-                None => return Err((socket, bind_addr_not_found_error(address, &netns))),
-            };
-            // log::debug!(
-            //     "BoundInner::bind: binding to iface {} for address {:?}",
-            //     iface.iface_name(),
-            //     address
-            // );
-            let (socket_set, handle) = iface.common().add_smol_socket_in_netns(socket, &netns)?;
-            return Ok(Self {
-                handle,
-                iface,
-                socket_set,
-                netns,
-            });
-        }
-    }
-
-    /// Bind a socket to a specific iface without selecting by address.
-    ///
-    /// This is useful for sockets that conceptually listen on all local addresses
-    /// (e.g., unbound raw sockets) but still need to be attached to an iface so
-    /// that packets can be delivered.
-    pub fn bind_on_iface<T>(
-        socket: T,
+    pub(crate) fn from_registered(
+        handle: smoltcp::iface::SocketHandle,
         iface: Arc<dyn Iface>,
+        socket_set: crate::driver::net::InterfaceSocketSet,
         netns: Arc<NetNamespace>,
-    ) -> Result<Self, SystemError>
-    where
-        T: smoltcp::socket::AnySocket<'static>,
-    {
-        let (socket_set, handle) = iface
-            .common()
-            .add_smol_socket_in_netns(socket, &netns)
-            .map_err(|(_, error)| error)?;
-        Ok(Self {
+        registry: Weak<crate::net::tcp_bounds::BoundRegistry>,
+    ) -> Self {
+        Self {
             handle,
             iface,
             socket_set,
             netns,
-        })
+            registry,
+        }
     }
-
-    pub fn bind_ephemeral<T>(
-        socket: T,
-        // socket_type: Types,
-        remote: smoltcp::wire::IpAddress,
-        netns: Arc<NetNamespace>,
-    ) -> Result<(Self, smoltcp::wire::IpAddress), SystemError>
-    where
-        T: smoltcp::socket::AnySocket<'static>,
-    {
-        Self::bind_ephemeral_recoverable(socket, remote, netns).map_err(|(_, err)| err)
-    }
-
-    pub fn bind_ephemeral_recoverable<T>(
-        socket: T,
-        remote: smoltcp::wire::IpAddress,
-        netns: Arc<NetNamespace>,
-    ) -> Result<(Self, smoltcp::wire::IpAddress), (T, SystemError)>
-    where
-        T: smoltcp::socket::AnySocket<'static>,
-    {
-        Self::bind_ephemeral_recoverable_on_device(socket, remote, netns, None)
-    }
-
-    pub(crate) fn bind_ephemeral_recoverable_on_device<T>(
-        socket: T,
-        remote: smoltcp::wire::IpAddress,
-        netns: Arc<NetNamespace>,
-        device: Option<Arc<dyn Iface>>,
-    ) -> Result<(Self, smoltcp::wire::IpAddress), (T, SystemError)>
-    where
-        T: smoltcp::socket::AnySocket<'static>,
-    {
-        let target = match tcp_connect_target(&remote, &netns, device) {
-            Ok(result) => result,
-            Err(err) => return Err((socket, err)),
-        };
-        let (socket_set, handle) = target
-            .stack_owner
-            .common()
-            .add_smol_socket_in_netns(socket, &netns)?;
-        // let endpoint = smoltcp::wire::IpEndpoint::new(local_addr, bound_port);
-        Ok((
-            Self {
-                handle,
-                iface: target.stack_owner,
-                socket_set,
-                netns,
-            },
-            target.local_addr,
-        ))
-    }
-
     pub fn with_mut<T: smoltcp::socket::AnySocket<'static>, R, F: FnMut(&mut T) -> R>(
         &self,
         mut f: F,
@@ -198,36 +138,18 @@ impl BoundInner {
         &self.iface
     }
 
-    pub fn move_udp_to_iface(&mut self, iface: Arc<dyn Iface>) -> Result<(), SystemError> {
-        self.move_udp_to_iface_with(iface, || {})
-    }
-
-    /// Move a UDP socket between smoltcp interface socket sets. `detached` is
-    /// invoked after removal from the old set and before publication in the new
-    /// set, which gives callers one linearization point for related state.
-    pub fn move_udp_to_iface_with<F>(
-        &mut self,
-        iface: Arc<dyn Iface>,
-        detached: F,
-    ) -> Result<(), SystemError>
-    where
-        F: FnOnce(),
-    {
-        if Arc::ptr_eq(&self.iface, &iface) {
-            detached();
-            return Ok(());
+    pub(crate) fn retire_notification(
+        &self,
+        socket: Arc<dyn super::InetSocket>,
+    ) -> registration::RetiredIfaceBinding {
+        let registry = self.registry.upgrade();
+        let retired = registry
+            .as_ref()
+            .and_then(|registry| registry.take_bound(&socket));
+        registration::RetiredIfaceBinding {
+            socket: retired,
+            registry,
         }
-        let socket_set = iface.common().socket_set_in_netns(&self.netns)?;
-        let socket = self.socket_set.lock().remove(self.handle);
-        let smoltcp::socket::Socket::Udp(socket) = socket else {
-            return Err(SystemError::EINVAL);
-        };
-        detached();
-        let handle = socket_set.lock().add(socket);
-        self.iface = iface;
-        self.socket_set = socket_set;
-        self.handle = handle;
-        Ok(())
     }
 
     #[inline]

@@ -308,8 +308,10 @@ impl MountableFileSystem for ProcFS {
     fn make_mount_data(
         raw_data: Option<&str>,
         source: &str,
-    ) -> Result<Option<Arc<dyn crate::filesystem::vfs::FileSystemMakerData + 'static>>, SystemError>
-    {
+    ) -> Result<
+        Option<Arc<dyn crate::filesystem::vfs::FileSystemMakerData + 'static>>,
+        crate::mm::allocation::MemoryAllocationError,
+    > {
         Self::make_mount_data_in_context(raw_data, source, &FsCreationContext::current())
     }
 
@@ -317,7 +319,10 @@ impl MountableFileSystem for ProcFS {
         _raw_data: Option<&str>,
         _source: &str,
         context: &FsCreationContext,
-    ) -> Result<Option<Arc<dyn FileSystemMakerData + 'static>>, SystemError> {
+    ) -> Result<
+        Option<Arc<dyn FileSystemMakerData + 'static>>,
+        crate::mm::allocation::MemoryAllocationError,
+    > {
         Ok(Some(Arc::new(ProcMountData {
             pid_ns: context.pid_ns.clone(),
         })))

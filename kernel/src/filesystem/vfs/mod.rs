@@ -16,6 +16,7 @@ pub mod syscall;
 pub mod utils;
 pub mod vcore;
 pub mod write_access;
+mod write_buffer;
 pub mod writeback;
 
 use alloc::{boxed::Box, string::String, sync::Arc, vec::Vec};
@@ -182,50 +183,103 @@ pub struct WritePrivilegeStage<'a> {
 /// their canonical content guard but no metadata or namespace spin locks.
 pub enum PrimaryWriteSource<'a, 'b> {
     Kernel(&'a [u8]),
-    User(&'a UserBufferReader<'b>),
+    User(
+        &'a UserBufferReader<'b>,
+        &'a Arc<crate::cgroup::memory::object::ObjectAccount>,
+    ),
 }
 
 impl PrimaryWriteSource<'_, '_> {
     pub fn with_buffer<T>(
         self,
         len: usize,
-        publish: impl FnOnce(&[u8]) -> Result<T, SystemError>,
-    ) -> Result<T, SystemError> {
+        publish: impl FnOnce(&[u8]) -> Result<T, crate::mm::allocation::MemoryAllocationError>,
+    ) -> Result<T, crate::mm::allocation::MemoryAllocationError> {
         match self {
             Self::Kernel(buffer) => publish(buffer),
-            Self::User(reader) => {
-                let mut buffer = Vec::new();
+            Self::User(reader, creator) => {
+                let mut buffer = write_buffer::WriteBuffer::new();
                 // A scratch batch bounds speculative allocation; it is not a
                 // write limit. Grow the legacy contiguous staging buffer only
                 // for bytes actually copied from userspace.
                 const COPY_BATCH: usize = 64 * 1024;
-                let mut scratch = Vec::new();
+                let mut scratch = write_buffer::WriteBuffer::new();
                 let scratch_len = len.min(COPY_BATCH);
-                scratch
-                    .try_reserve_exact(scratch_len)
-                    .map_err(|_| SystemError::ENOMEM)?;
-                scratch.resize(scratch_len, 0);
-                while buffer.len() < len {
-                    let want = scratch.len().min(len - buffer.len());
-                    let copied =
-                        match reader.copy_from_user_prefix(&mut scratch[..want], buffer.len()) {
-                            Ok(copied) => copied,
-                            Err(SystemError::EFAULT) if !buffer.is_empty() => break,
-                            Err(error) => return Err(error),
-                        };
+                scratch.try_reserve(creator, scratch_len)?;
+                scratch.resize(scratch_len);
+                while buffer.bytes().len() < len {
+                    let want = scratch.bytes().len().min(len - buffer.bytes().len());
+                    let copied = match reader.copy_from_user_prefix(
+                        &mut scratch.bytes_mut()[..want],
+                        buffer.bytes().len(),
+                    ) {
+                        Ok(copied) => copied,
+                        Err(SystemError::EFAULT) if !buffer.bytes().is_empty() => break,
+                        Err(error) => return Err(error.into()),
+                    };
                     // No data has been published yet. Allocation failure must
                     // propagate, not masquerade as a committed short write.
-                    buffer
-                        .try_reserve(copied)
-                        .map_err(|_| SystemError::ENOMEM)?;
-                    buffer.extend_from_slice(&scratch[..copied]);
+                    buffer.try_reserve(
+                        creator,
+                        buffer
+                            .bytes()
+                            .len()
+                            .checked_add(copied)
+                            .ok_or(SystemError::ENOMEM)?,
+                    )?;
+                    buffer.extend(&scratch.bytes()[..copied]);
                     if copied < want {
                         break;
                     }
                 }
-                publish(&buffer)
+                publish(buffer.bytes())
             }
         }
+    }
+
+    /// Native regular-file primitive: one bounded scratch buffer inside the
+    /// caller's single content transaction. Record providers keep with_buffer.
+    pub(crate) fn write_chunks(
+        self,
+        len: usize,
+        mut write: impl FnMut(
+            usize,
+            &[u8],
+        ) -> Result<usize, crate::mm::allocation::MemoryAllocationError>,
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        let Self::User(reader, creator) = self else {
+            let Self::Kernel(bytes) = self else {
+                unreachable!()
+            };
+            return write(0, &bytes[..len.min(bytes.len())]);
+        };
+        if len == 0 {
+            return Ok(0);
+        }
+        let mut scratch = write_buffer::WriteBuffer::new();
+        scratch.try_reserve(creator, len.min(64 * 1024))?;
+        scratch.resize(len.min(64 * 1024));
+        let mut completed = 0;
+        while completed < len {
+            let want = scratch.bytes().len().min(len - completed);
+            let copied =
+                match reader.copy_from_user_prefix(&mut scratch.bytes_mut()[..want], completed) {
+                    Ok(copied) => copied,
+                    Err(SystemError::EFAULT) if completed > 0 => return Ok(completed),
+                    Err(error) => return Err(error.into()),
+                };
+            let written = match write(completed, &scratch.bytes()[..copied]) {
+                Ok(written) => written,
+                Err(_) if completed > 0 => return Ok(completed),
+                Err(error) => return Err(error),
+            };
+            assert!(written <= copied, "a primary write cannot exceed its input");
+            completed += written;
+            if written < copied || copied < want {
+                break;
+            }
+        }
+        Ok(completed)
     }
 }
 
@@ -805,7 +859,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         lock_owner: u64,
         data: MutexGuard<FilePrivateData>,
         context: &OpenTruncateContext,
-    ) -> Result<(), SystemError> {
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         self.resize_file_with_metadata(len, lock_owner, data, &context.requested, context.mask)
     }
 
@@ -816,9 +870,9 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         data: MutexGuard<FilePrivateData>,
         truncate: &OpenTruncateContext,
         context: &permission::InodeOpContext,
-    ) -> Result<SetMetadataMask, SystemError> {
+    ) -> Result<SetMetadataMask, crate::mm::allocation::MemoryAllocationError> {
         if context.is_idmapped() {
-            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP.into());
         }
         self.resize_open_truncate(len, lock_owner, data, truncate)
             .map(|_| truncate.mask)
@@ -830,7 +884,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         lock_owner: u64,
         data: MutexGuard<FilePrivateData>,
         context: &OpenTruncateContext,
-    ) -> Result<SetMetadataMask, SystemError> {
+    ) -> Result<SetMetadataMask, crate::mm::allocation::MemoryAllocationError> {
         self.resize_open_truncate(len, lock_owner, data, context)?;
         Ok(context.mask)
     }
@@ -845,7 +899,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         _len: usize,
         _offset: usize,
         _vm_flags: VmFlags,
-    ) -> Result<(), SystemError> {
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         Ok(())
     }
 
@@ -895,7 +949,10 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         false
     }
 
-    fn mmap_effective_file(&self, file: &Arc<File>) -> Result<Arc<File>, SystemError> {
+    fn mmap_effective_file(
+        &self,
+        file: &Arc<File>,
+    ) -> Result<Arc<File>, crate::mm::allocation::MemoryAllocationError> {
         Ok(file.clone())
     }
 
@@ -910,7 +967,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         len: usize,
         offset: usize,
         _vm_flags: VmFlags,
-    ) -> Result<Arc<File>, SystemError> {
+    ) -> Result<Arc<File>, crate::mm::allocation::MemoryAllocationError> {
         self.mmap(start, len, offset)?;
         Ok(file.clone())
     }
@@ -931,7 +988,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         &self,
         _data: MutexGuard<FilePrivateData>,
         _flags: &FileFlags,
-    ) -> Result<(), SystemError> {
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         Ok(())
     }
 
@@ -947,7 +1004,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         &self,
         _data: MutexGuard<FilePrivateData>,
         _lock_owner: u64,
-    ) -> Result<(), SystemError> {
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         Ok(())
     }
 
@@ -976,7 +1033,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         len: usize,
         buf: &mut [u8],
         _data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError>;
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError>;
 
     /// Whether this inode implements [`IndexNode::read_user_at`].
     ///
@@ -1018,7 +1075,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         len: usize,
         buf: &[u8],
         _data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError>;
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError>;
 
     /// Write to the inode from a userspace buffer.
     ///
@@ -1048,9 +1105,9 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         _lock_owner: u64,
         _attrib: &mut AttribStageObserver<'_>,
         data: MutexGuard<FilePrivateData>,
-    ) -> Result<(), SystemError> {
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         drop(data);
-        Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
+        Err(SystemError::EOPNOTSUPP_OR_ENOTSUP.into())
     }
 
     /// Atomically commit the write-side metadata and non-shrinking size stage
@@ -1065,8 +1122,8 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         _offset: usize,
         _requested_end: usize,
         _lock_owner: u64,
-    ) -> Result<SetMetadataMask, SystemError> {
-        Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
+    ) -> Result<SetMetadataMask, crate::mm::allocation::MemoryAllocationError> {
+        Err(SystemError::EOPNOTSUPP_OR_ENOTSUP.into())
     }
 
     // Identity and attribute publication are independent of the established
@@ -1081,9 +1138,9 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         attrib: &mut AttribStageObserver<'_>,
         data: MutexGuard<FilePrivateData>,
         context: &permission::InodeOpContext,
-    ) -> Result<(), SystemError> {
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         if context.is_idmapped() {
-            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP.into());
         }
         self.fallocate_file(mode, offset, len, lock_owner, attrib, data)
     }
@@ -1094,9 +1151,9 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         requested_end: usize,
         lock_owner: u64,
         context: &permission::InodeOpContext,
-    ) -> Result<SetMetadataMask, SystemError> {
+    ) -> Result<SetMetadataMask, crate::mm::allocation::MemoryAllocationError> {
         if context.is_idmapped() {
-            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP.into());
         }
         self.fallocate_resize_atomic(offset, requested_end, lock_owner)
     }
@@ -1134,8 +1191,8 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         _buf: &[u8],
         _sync_intent: WriteSyncIntent,
         _data: MutexGuard<FilePrivateData>,
-    ) -> Result<DelegatedWriteResult, SystemError> {
-        Err(SystemError::ENOSYS)
+    ) -> Result<DelegatedWriteResult, crate::mm::allocation::MemoryAllocationError> {
+        Err(SystemError::ENOSYS.into())
     }
 
     /// Primary content write with the identity of the selected mount.
@@ -1147,9 +1204,9 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         data: MutexGuard<FilePrivateData>,
         context: &permission::InodeOpContext,
         stage: &mut WritePrivilegeStage<'_>,
-    ) -> Result<usize, SystemError> {
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
         if context.is_idmapped() {
-            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP.into());
         }
         self.write_at_with_privilege_stage(offset, len, buf, data, stage)
     }
@@ -1176,7 +1233,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         buf: &[u8],
         data: MutexGuard<FilePrivateData>,
         _stage: &mut WritePrivilegeStage<'_>,
-    ) -> Result<usize, SystemError> {
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
         self.write_at(offset, len, buf, data)
     }
 
@@ -1187,7 +1244,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         source: PrimaryWriteSource<'_, '_>,
         data: MutexGuard<FilePrivateData>,
         stage: &mut WritePrivilegeStage<'_>,
-    ) -> Result<usize, SystemError> {
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
         source.with_buffer(len, |buffer| {
             self.write_at_with_privilege_stage(offset, len.min(buffer.len()), buffer, data, stage)
         })
@@ -1201,9 +1258,9 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         data: MutexGuard<FilePrivateData>,
         context: &permission::InodeOpContext,
         stage: &mut WritePrivilegeStage<'_>,
-    ) -> Result<usize, SystemError> {
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
         if context.is_idmapped() {
-            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP.into());
         }
         self.write_primary_with_privilege_stage(offset, len, source, data, stage)
     }
@@ -1227,7 +1284,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         sync: WriteSyncIntent,
         data: MutexGuard<FilePrivateData>,
         _stage: &mut WritePrivilegeStage<'_>,
-    ) -> Result<DelegatedWriteResult, SystemError> {
+    ) -> Result<DelegatedWriteResult, crate::mm::allocation::MemoryAllocationError> {
         self.write_at_with_sync(offset, len, buf, sync, data)
     }
 
@@ -1243,9 +1300,9 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         data: MutexGuard<FilePrivateData>,
         context: &permission::InodeOpContext,
         stage: &mut WritePrivilegeStage<'_>,
-    ) -> Result<DelegatedWriteResult, SystemError> {
+    ) -> Result<DelegatedWriteResult, crate::mm::allocation::MemoryAllocationError> {
         if context.is_idmapped() {
-            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP.into());
         }
         self.write_at_with_sync_with_privilege_stage(offset, len, buf, sync, data, stage)
     }
@@ -1329,9 +1386,12 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     ///
     /// @return 成功：Ok()
     ///         失败：Err(错误码)
-    fn set_metadata(&self, _metadata: &Metadata) -> Result<(), SystemError> {
+    fn set_metadata(
+        &self,
+        _metadata: &Metadata,
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         // 若文件系统没有实现此方法，则返回"不支持"
-        return Err(SystemError::ENOSYS);
+        return Err(SystemError::ENOSYS.into());
     }
 
     /// 仅更新 `mask` 指定的元数据字段。
@@ -1342,7 +1402,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         &self,
         metadata: &Metadata,
         mask: SetMetadataMask,
-    ) -> Result<(), SystemError> {
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         if mask.is_empty() {
             return Ok(());
         }
@@ -1357,7 +1417,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     fn update_metadata_masked(
         &self,
         update: &mut MetadataUpdate<'_>,
-    ) -> Result<SetMetadataMask, SystemError> {
+    ) -> Result<SetMetadataMask, crate::mm::allocation::MemoryAllocationError> {
         let current = self.metadata()?;
         let (requested, mask) = update(&current)?;
         self.set_metadata_masked(&requested, mask)?;
@@ -1380,16 +1440,20 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     ///
     /// @return 成功：Ok()
     ///         失败：Err(错误码)
-    fn resize(&self, _len: usize) -> Result<(), SystemError> {
+    fn resize(&self, _len: usize) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         // 若文件系统没有实现此方法，则返回"不支持"
-        return Err(SystemError::ENOSYS);
+        return Err(SystemError::ENOSYS.into());
     }
 
     /// 基于当前 files_struct lock owner 重新设置文件大小。
     ///
     /// 默认回退到 inode 级 resize；需要 mandatory-locking 协议语义的文件系统
     /// 可覆盖该方法。
-    fn resize_with_lock_owner(&self, len: usize, _lock_owner: u64) -> Result<(), SystemError> {
+    fn resize_with_lock_owner(
+        &self,
+        len: usize,
+        _lock_owner: u64,
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         self.resize(len)
     }
 
@@ -1402,7 +1466,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         len: usize,
         lock_owner: u64,
         data: MutexGuard<FilePrivateData>,
-    ) -> Result<(), SystemError> {
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         drop(data);
         self.resize_with_lock_owner(len, lock_owner)
     }
@@ -1420,7 +1484,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         lock_owner: u64,
         metadata: &Metadata,
         mask: SetMetadataMask,
-    ) -> Result<(), SystemError> {
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         self.resize_with_lock_owner(len, lock_owner)?;
         let mut current = self.metadata()?;
         merge_metadata_masked(&mut current, metadata, mask);
@@ -1435,7 +1499,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         data: MutexGuard<FilePrivateData>,
         metadata: &Metadata,
         mask: SetMetadataMask,
-    ) -> Result<(), SystemError> {
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         self.resize_file(len, lock_owner, data)?;
         let mut current = self.metadata()?;
         merge_metadata_masked(&mut current, metadata, mask);
@@ -1449,9 +1513,9 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         metadata: &Metadata,
         mask: SetMetadataMask,
         context: &permission::InodeOpContext,
-    ) -> Result<SetMetadataMask, SystemError> {
+    ) -> Result<SetMetadataMask, crate::mm::allocation::MemoryAllocationError> {
         if context.is_idmapped() {
-            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP.into());
         }
         self.resize_with_metadata(len, lock_owner, metadata, mask)
             .map(|_| mask)
@@ -1463,7 +1527,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         lock_owner: u64,
         metadata: &Metadata,
         mask: SetMetadataMask,
-    ) -> Result<SetMetadataMask, SystemError> {
+    ) -> Result<SetMetadataMask, crate::mm::allocation::MemoryAllocationError> {
         self.resize_with_metadata(len, lock_owner, metadata, mask)?;
         Ok(mask)
     }
@@ -1476,9 +1540,9 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         metadata: &Metadata,
         mask: SetMetadataMask,
         context: &permission::InodeOpContext,
-    ) -> Result<SetMetadataMask, SystemError> {
+    ) -> Result<SetMetadataMask, crate::mm::allocation::MemoryAllocationError> {
         if context.is_idmapped() {
-            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP.into());
         }
         self.resize_file_with_metadata(len, lock_owner, data, metadata, mask)
             .map(|_| mask)
@@ -1491,7 +1555,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         data: MutexGuard<FilePrivateData>,
         metadata: &Metadata,
         mask: SetMetadataMask,
-    ) -> Result<SetMetadataMask, SystemError> {
+    ) -> Result<SetMetadataMask, crate::mm::allocation::MemoryAllocationError> {
         self.resize_file_with_metadata(len, lock_owner, data, metadata, mask)?;
         Ok(mask)
     }
@@ -1509,7 +1573,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         name: &str,
         file_type: FileType,
         mode: InodeMode,
-    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+    ) -> Result<Arc<dyn IndexNode>, crate::mm::allocation::MemoryAllocationError> {
         // 若文件系统没有实现此方法，则默认调用其create_with_data方法。如果仍未实现，则会得到一个Err(-ENOSYS)的返回值
         return self.create_with_data(name, file_type, mode, 0);
     }
@@ -1522,8 +1586,8 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         _name: &str,
         _mode: InodeMode,
         _flags: &FileFlags,
-    ) -> Result<PreopenedFile, SystemError> {
-        Err(SystemError::ENOSYS)
+    ) -> Result<PreopenedFile, crate::mm::allocation::MemoryAllocationError> {
+        Err(SystemError::ENOSYS.into())
     }
 
     /// Create an unnamed regular file in this directory's filesystem.
@@ -1549,13 +1613,17 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         _file_type: FileType,
         _mode: InodeMode,
         _data: usize,
-    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+    ) -> Result<Arc<dyn IndexNode>, crate::mm::allocation::MemoryAllocationError> {
         // 若文件系统没有实现此方法，则返回"不支持"
-        return Err(SystemError::ENOSYS);
+        return Err(SystemError::ENOSYS.into());
     }
 
     /// @brief 在当前目录下创建符号链接（name -> target）
-    fn symlink(&self, name: &str, target: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
+    fn symlink(
+        &self,
+        name: &str,
+        target: &str,
+    ) -> Result<Arc<dyn IndexNode>, crate::mm::allocation::MemoryAllocationError> {
         let inode = self.create_with_data(name, FileType::SymLink, InodeMode::S_IRWXUGO, 0)?;
         let bytes = target.as_bytes();
         let len = bytes.len();
@@ -1571,9 +1639,9 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         file_type: FileType,
         mode: InodeMode,
         context: &permission::InodeOpContext,
-    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+    ) -> Result<Arc<dyn IndexNode>, crate::mm::allocation::MemoryAllocationError> {
         if context.is_idmapped() {
-            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP.into());
         }
         self.create(name, file_type, mode)
     }
@@ -1585,9 +1653,9 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         mode: InodeMode,
         data: usize,
         context: &permission::InodeOpContext,
-    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+    ) -> Result<Arc<dyn IndexNode>, crate::mm::allocation::MemoryAllocationError> {
         if context.is_idmapped() {
-            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP.into());
         }
         self.create_with_data(name, file_type, mode, data)
     }
@@ -1597,9 +1665,9 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         name: &str,
         mode: InodeMode,
         context: &permission::InodeOpContext,
-    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+    ) -> Result<Arc<dyn IndexNode>, crate::mm::allocation::MemoryAllocationError> {
         if context.is_idmapped() {
-            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP.into());
         }
         self.mkdir(name, mode)
     }
@@ -1609,9 +1677,9 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         name: &str,
         target: &str,
         context: &permission::InodeOpContext,
-    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+    ) -> Result<Arc<dyn IndexNode>, crate::mm::allocation::MemoryAllocationError> {
         if context.is_idmapped() {
-            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP.into());
         }
         self.symlink(name, target)
     }
@@ -1622,9 +1690,9 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         mode: InodeMode,
         dev: DeviceNumber,
         context: &permission::InodeOpContext,
-    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+    ) -> Result<Arc<dyn IndexNode>, crate::mm::allocation::MemoryAllocationError> {
         if context.is_idmapped() {
-            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP.into());
         }
         self.mknod(name, mode, dev)
     }
@@ -1647,9 +1715,9 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         mode: InodeMode,
         flags: &FileFlags,
         context: &permission::InodeOpContext,
-    ) -> Result<PreopenedFile, SystemError> {
+    ) -> Result<PreopenedFile, crate::mm::allocation::MemoryAllocationError> {
         if context.is_idmapped() {
-            return Err(SystemError::ENOSYS);
+            return Err(SystemError::ENOSYS.into());
         }
         self.create_and_open(name, mode, flags)
     }
@@ -1661,9 +1729,13 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     ///
     /// @return 成功：Ok()
     ///         失败：Err(错误码)
-    fn link(&self, _name: &str, _other: &Arc<dyn IndexNode>) -> Result<(), SystemError> {
+    fn link(
+        &self,
+        _name: &str,
+        _other: &Arc<dyn IndexNode>,
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         // 若文件系统没有实现此方法，则返回"不支持"
-        return Err(SystemError::ENOSYS);
+        return Err(SystemError::ENOSYS.into());
     }
 
     /// @brief 在当前目录下，删除一个名为Name的硬链接
@@ -1672,9 +1744,12 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     ///
     /// @return 成功：Ok()
     ///         失败：Err(错误码)
-    fn unlink(&self, _name: &str) -> Result<LinkRemovalOutcome, SystemError> {
+    fn unlink(
+        &self,
+        _name: &str,
+    ) -> Result<LinkRemovalOutcome, crate::mm::allocation::MemoryAllocationError> {
         // 若文件系统没有实现此方法，则返回"不支持"
-        return Err(SystemError::ENOSYS);
+        return Err(SystemError::ENOSYS.into());
     }
 
     /// Execute a namespace mutation as part of one layered VFS transaction.
@@ -1684,7 +1759,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         &self,
         name: &str,
         context: &mount::DentryMutationContext<'_>,
-    ) -> Result<LinkRemovalOutcome, SystemError> {
+    ) -> Result<LinkRemovalOutcome, crate::mm::allocation::MemoryAllocationError> {
         context.ensure_locked();
         self.unlink(name)
     }
@@ -1695,15 +1770,15 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     ///
     /// @return 成功 Ok(())
     /// @return 失败 Err(错误码)
-    fn rmdir(&self, _name: &str) -> Result<(), SystemError> {
-        return Err(SystemError::ENOSYS);
+    fn rmdir(&self, _name: &str) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        return Err(SystemError::ENOSYS.into());
     }
 
     fn rmdir_with_context(
         &self,
         name: &str,
         context: &mount::DentryMutationContext<'_>,
-    ) -> Result<(), SystemError> {
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         context.ensure_locked();
         self.rmdir(name)
     }
@@ -1713,9 +1788,9 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         name: &str,
         mutation: &mount::DentryMutationContext<'_>,
         context: &permission::InodeOpContext,
-    ) -> Result<LinkRemovalOutcome, SystemError> {
+    ) -> Result<LinkRemovalOutcome, crate::mm::allocation::MemoryAllocationError> {
         if context.is_idmapped() {
-            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP.into());
         }
         self.unlink_with_context(name, mutation)
     }
@@ -1725,9 +1800,9 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         name: &str,
         other: &Arc<dyn IndexNode>,
         context: &permission::InodeOpContext,
-    ) -> Result<(), SystemError> {
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         if context.is_idmapped() {
-            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP.into());
         }
         self.link(name, other)
     }
@@ -1737,9 +1812,9 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         name: &str,
         mutation: &mount::DentryMutationContext<'_>,
         context: &permission::InodeOpContext,
-    ) -> Result<(), SystemError> {
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         if context.is_idmapped() {
-            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP.into());
         }
         self.rmdir_with_context(name, mutation)
     }
@@ -1754,9 +1829,9 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         _target: &Arc<dyn IndexNode>,
         _new_name: &str,
         _flag: RenameFlags,
-    ) -> Result<RenameOutcome, SystemError> {
+    ) -> Result<RenameOutcome, crate::mm::allocation::MemoryAllocationError> {
         // 若文件系统没有实现此方法，则返回"不支持"
-        return Err(SystemError::ENOSYS);
+        return Err(SystemError::ENOSYS.into());
     }
 
     fn move_to_with_context(
@@ -1766,7 +1841,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         new_name: &str,
         flag: RenameFlags,
         context: &mount::DentryMutationContext<'_>,
-    ) -> Result<RenameOutcome, SystemError> {
+    ) -> Result<RenameOutcome, crate::mm::allocation::MemoryAllocationError> {
         context.ensure_locked();
         self.move_to(old_name, target, new_name, flag)
     }
@@ -1781,9 +1856,9 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         flag: RenameFlags,
         mutation: &mount::DentryMutationContext<'_>,
         context: &permission::InodeOpContext,
-    ) -> Result<RenameOutcome, SystemError> {
+    ) -> Result<RenameOutcome, crate::mm::allocation::MemoryAllocationError> {
         if context.is_idmapped() {
-            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP.into());
         }
         self.move_to_with_context(old_name, target, new_name, flag, mutation)
     }
@@ -1859,11 +1934,11 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         _cmd: u32,
         _data: usize,
         _private_data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError> {
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
         // Match Linux vfs_ioctl(): a file without an ioctl handler does not
         // support the command. sys_ioctl translates this internal error to
         // the userspace-visible ENOTTY.
-        Err(SystemError::ENOIOCTLCMD)
+        Err(SystemError::ENOIOCTLCMD.into())
     }
 
     /// @brief 获取inode所在的文件系统的指针
@@ -2034,8 +2109,8 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     /// @brief 截断当前inode到指定的长度。如果当前文件长度小于len,则不操作。
     ///
     /// @param len 要被截断到的目标长度
-    fn truncate(&self, _len: usize) -> Result<(), SystemError> {
-        return Err(SystemError::ENOSYS);
+    fn truncate(&self, _len: usize) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        return Err(SystemError::ENOSYS.into());
     }
 
     /// @brief 将当前inode的内容同步到具体设备上
@@ -2054,9 +2129,9 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         &self,
         datasync: bool,
         _data: MutexGuard<FilePrivateData>,
-    ) -> Result<(), SystemError> {
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         let _ = datasync;
-        Err(SystemError::EINVAL)
+        Err(SystemError::EINVAL.into())
     }
 
     /// 基于打开文件上下文同步指定文件字节范围（end 为包含端）。
@@ -2069,7 +2144,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         end: usize,
         datasync: bool,
         data: MutexGuard<FilePrivateData>,
-    ) -> Result<(), SystemError> {
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         let _ = (start, end);
         self.sync_file(datasync, data)
     }
@@ -2105,8 +2180,8 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         _filename: &str,
         _mode: InodeMode,
         _dev_t: DeviceNumber,
-    ) -> Result<Arc<dyn IndexNode>, SystemError> {
-        return Err(SystemError::ENOSYS);
+    ) -> Result<Arc<dyn IndexNode>, crate::mm::allocation::MemoryAllocationError> {
+        return Err(SystemError::ENOSYS.into());
     }
 
     /// # mkdir - 新建名称为`name`的目录项
@@ -2124,17 +2199,21 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     ///
     /// - `Ok(Arc<dyn IndexNode>)`: 成功时返回`name`目录项的共享引用。
     /// - `Err(SystemError)`: 出错时返回错误信息。
-    fn mkdir(&self, name: &str, mode: InodeMode) -> Result<Arc<dyn IndexNode>, SystemError> {
+    fn mkdir(
+        &self,
+        name: &str,
+        mode: InodeMode,
+    ) -> Result<Arc<dyn IndexNode>, crate::mm::allocation::MemoryAllocationError> {
         match self.find(name) {
             Ok(inode) => {
                 if inode.metadata()?.file_type == FileType::Dir {
                     Ok(inode)
                 } else {
-                    Err(SystemError::EEXIST)
+                    Err(SystemError::EEXIST.into())
                 }
             }
             Err(SystemError::ENOENT) => self.create(name, FileType::Dir, mode),
-            Err(err) => Err(err),
+            Err(err) => Err(err.into()),
         }
     }
 
@@ -2240,12 +2319,12 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         _name: &str,
         _value: &[u8],
         _flags: XattrFlags,
-    ) -> Result<usize, SystemError> {
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
         log::warn!(
             "setxattr not implemented for {}",
             crate::libs::name::get_type_name(&self)
         );
-        return Err(SystemError::ENOSYS);
+        return Err(SystemError::ENOSYS.into());
     }
 
     /// @brief 列出扩展属性名，返回实际列表长度。
@@ -2258,23 +2337,29 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     }
 
     /// @brief 删除指定扩展属性。
-    fn removexattr(&self, _name: &str) -> Result<usize, SystemError> {
+    fn removexattr(
+        &self,
+        _name: &str,
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
         log::warn!(
             "removexattr not implemented for {}",
             crate::libs::name::get_type_name(&self)
         );
-        return Err(SystemError::ENOSYS);
+        return Err(SystemError::ENOSYS.into());
     }
 
     /// Internal privilege removal after a content/ownership mutation has been
     /// authorized. This must not require the user's CAP_SETFCAP: it only
     /// removes privileges, never grants them. Mount and stacked filesystems
     /// must forward this operation without entering their user xattr API.
-    fn remove_security_privileges(&self) -> Result<(), SystemError> {
+    fn remove_security_privileges(
+        &self,
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         match self.removexattr("security.capability") {
             Ok(_)
-            | Err(SystemError::ENODATA | SystemError::ENOSYS)
-            | Err(SystemError::EOPNOTSUPP_OR_ENOTSUP) => Ok(()),
+            | Err(crate::mm::allocation::MemoryAllocationError::System(
+                SystemError::ENODATA | SystemError::ENOSYS | SystemError::EOPNOTSUPP_OR_ENOTSUP,
+            )) => Ok(()),
             Err(error) => Err(error),
         }
     }
@@ -2359,14 +2444,21 @@ impl dyn IndexNode {
     /// @return Ok(Arc<dyn IndexNode>) 要寻找的目录项的inode
     /// @return Err(SystemError) 错误码
     pub fn lookup(&self, path: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
-        return self.lookup_follow_symlink(path, 0);
+        // This legacy directory-only lookup has never read a symlink target.
+        // Keep its System-only contract without discarding a charge identity.
+        match self.walk_path::<SystemError>(path, 0, true, None, false, None, |_, _| {
+            Err(SystemError::ELOOP)
+        })? {
+            PathWalkOutcome::Found(inode, _) => Ok(inode),
+            PathWalkOutcome::MissingFinal { .. } => Err(SystemError::ENOENT),
+        }
     }
 
     pub fn lookup_follow_symlink(
         &self,
         path: &str,
         max_follow_times: usize,
-    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+    ) -> Result<Arc<dyn IndexNode>, crate::mm::allocation::MemoryAllocationError> {
         return self.do_lookup_follow_symlink(path, max_follow_times, true);
     }
 
@@ -2375,7 +2467,7 @@ impl dyn IndexNode {
         path: &str,
         max_follow_times: usize,
         follow_final_symlink: bool,
-    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+    ) -> Result<Arc<dyn IndexNode>, crate::mm::allocation::MemoryAllocationError> {
         return self.do_lookup_follow_symlink(path, max_follow_times, follow_final_symlink);
     }
 
@@ -2399,7 +2491,7 @@ impl dyn IndexNode {
         path: &str,
         max_follow_times: usize,
         follow_final_symlink: bool,
-    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+    ) -> Result<Arc<dyn IndexNode>, crate::mm::allocation::MemoryAllocationError> {
         match self.do_lookup_follow_symlink_owned(
             path,
             max_follow_times,
@@ -2409,7 +2501,7 @@ impl dyn IndexNode {
             None,
         )? {
             PathWalkOutcome::Found(inode, _) => Ok(inode),
-            PathWalkOutcome::MissingFinal { .. } => Err(SystemError::ENOENT),
+            PathWalkOutcome::MissingFinal { .. } => Err(SystemError::ENOENT.into()),
         }
     }
 
@@ -2421,7 +2513,7 @@ impl dyn IndexNode {
         path: &str,
         max_follow_times: usize,
         follow_final_symlink: bool,
-    ) -> Result<utils::ResolvedPath, SystemError> {
+    ) -> Result<utils::ResolvedPath, crate::mm::allocation::MemoryAllocationError> {
         match self.do_lookup_follow_symlink_owned(
             path,
             max_follow_times,
@@ -2430,8 +2522,8 @@ impl dyn IndexNode {
             false,
             None,
         )? {
-            PathWalkOutcome::Found(_, ownership) => ownership.ok_or(SystemError::ESTALE),
-            PathWalkOutcome::MissingFinal { .. } => Err(SystemError::ENOENT),
+            PathWalkOutcome::Found(_, ownership) => ownership.ok_or(SystemError::ESTALE.into()),
+            PathWalkOutcome::MissingFinal { .. } => Err(SystemError::ENOENT.into()),
         }
     }
 
@@ -2444,7 +2536,7 @@ impl dyn IndexNode {
         max_follow_times: usize,
         follow_final_symlink: bool,
         options: &utils::PathWalkOptions,
-    ) -> Result<utils::ResolvedPath, SystemError> {
+    ) -> Result<utils::ResolvedPath, crate::mm::allocation::MemoryAllocationError> {
         match self.do_lookup_follow_symlink_owned(
             path,
             max_follow_times,
@@ -2453,8 +2545,8 @@ impl dyn IndexNode {
             false,
             Some(options),
         )? {
-            PathWalkOutcome::Found(_, ownership) => ownership.ok_or(SystemError::ESTALE),
-            PathWalkOutcome::MissingFinal { .. } => Err(SystemError::ENOENT),
+            PathWalkOutcome::Found(_, ownership) => ownership.ok_or(SystemError::ESTALE.into()),
+            PathWalkOutcome::MissingFinal { .. } => Err(SystemError::ENOENT.into()),
         }
     }
 
@@ -2466,7 +2558,7 @@ impl dyn IndexNode {
         path: &str,
         max_follow_times: usize,
         follow_final_symlink: bool,
-    ) -> Result<utils::OwnedLookupOutcome, SystemError> {
+    ) -> Result<utils::OwnedLookupOutcome, crate::mm::allocation::MemoryAllocationError> {
         match self.do_lookup_follow_symlink_owned(
             path,
             max_follow_times,
@@ -2477,7 +2569,7 @@ impl dyn IndexNode {
         )? {
             PathWalkOutcome::Found(_, ownership) => ownership
                 .map(utils::OwnedLookupOutcome::Found)
-                .ok_or(SystemError::ESTALE),
+                .ok_or(SystemError::ESTALE.into()),
             PathWalkOutcome::MissingFinal {
                 ownership,
                 name,
@@ -2489,7 +2581,7 @@ impl dyn IndexNode {
                     name,
                     must_be_dir,
                 })
-                .ok_or(SystemError::ESTALE),
+                .ok_or(SystemError::ESTALE.into()),
         }
     }
 
@@ -2501,7 +2593,7 @@ impl dyn IndexNode {
         max_follow_times: usize,
         follow_final_symlink: bool,
         options: &utils::PathWalkOptions,
-    ) -> Result<utils::OwnedLookupOutcome, SystemError> {
+    ) -> Result<utils::OwnedLookupOutcome, crate::mm::allocation::MemoryAllocationError> {
         match self.do_lookup_follow_symlink_owned(
             path,
             max_follow_times,
@@ -2512,7 +2604,7 @@ impl dyn IndexNode {
         )? {
             PathWalkOutcome::Found(_, ownership) => ownership
                 .map(utils::OwnedLookupOutcome::Found)
-                .ok_or(SystemError::ESTALE),
+                .ok_or(SystemError::ESTALE.into()),
             PathWalkOutcome::MissingFinal {
                 ownership,
                 name,
@@ -2524,7 +2616,7 @@ impl dyn IndexNode {
                     name,
                     must_be_dir,
                 })
-                .ok_or(SystemError::ESTALE),
+                .ok_or(SystemError::ESTALE.into()),
         }
     }
 
@@ -2533,10 +2625,42 @@ impl dyn IndexNode {
         path: &str,
         max_follow_times: usize,
         follow_final_symlink: bool,
+        ownership: Option<utils::ResolvedPath>,
+        return_missing_final: bool,
+        options: Option<&utils::PathWalkOptions>,
+    ) -> Result<PathWalkOutcome, crate::mm::allocation::MemoryAllocationError> {
+        self.walk_path(
+            path,
+            max_follow_times,
+            follow_final_symlink,
+            ownership,
+            return_missing_final,
+            options,
+            |inode, content| {
+                inode.read_at(
+                    0,
+                    MAX_PATHLEN,
+                    content,
+                    Mutex::new(FilePrivateData::Unused).lock(),
+                )
+            },
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Path walk policy, retained path ownership and typed symlink reader are independent"
+    )]
+    fn walk_path<E: From<SystemError>>(
+        &self,
+        path: &str,
+        max_follow_times: usize,
+        follow_final_symlink: bool,
         mut ownership: Option<utils::ResolvedPath>,
         return_missing_final: bool,
         options: Option<&utils::PathWalkOptions>,
-    ) -> Result<PathWalkOutcome, SystemError> {
+        mut read_symlink: impl FnMut(&Arc<dyn IndexNode>, &mut [u8]) -> Result<usize, E>,
+    ) -> Result<PathWalkOutcome, E> {
         let cache_only = options.is_some_and(|options| {
             options
                 .resolve
@@ -2555,7 +2679,7 @@ impl dyn IndexNode {
             self.metadata()?
         };
         if start_metadata.file_type != FileType::Dir {
-            return Err(SystemError::ENOTDIR);
+            return Err(SystemError::ENOTDIR.into());
         }
 
         // Linux 语义：绝对路径应当以"进程 fs root"（可被 chroot 改变）为起点
@@ -2583,7 +2707,7 @@ impl dyn IndexNode {
                     .resolve
                     .contains(utils::OpenHowResolve::RESOLVE_BENEATH)
             }) {
-                return Err(SystemError::EXDEV);
+                return Err(SystemError::EXDEV.into());
             }
             if ownership.is_some() {
                 ownership = Some(
@@ -2613,7 +2737,7 @@ impl dyn IndexNode {
         while !rest_path.is_empty() {
             // 当前这一级不是文件夹
             if lookup_metadata(&result)?.file_type != FileType::Dir {
-                return Err(SystemError::ENOTDIR);
+                return Err(SystemError::ENOTDIR.into());
             }
 
             // 检查当前目录的执行权限（搜索权限）
@@ -2650,7 +2774,7 @@ impl dyn IndexNode {
                                 .resolve
                                 .contains(utils::OpenHowResolve::RESOLVE_BENEATH)
                             {
-                                return Err(SystemError::EXDEV);
+                                return Err(SystemError::EXDEV.into());
                             }
                             continue;
                         }
@@ -2713,7 +2837,7 @@ impl dyn IndexNode {
                         must_be_dir: trailing_slash,
                     });
                 }
-                Err(error) => return Err(error),
+                Err(error) => return Err(error.into()),
             };
             if parent_ownership.is_some() {
                 ownership = Some(utils::ResolvedPath::new(inode.clone())?);
@@ -2748,7 +2872,7 @@ impl dyn IndexNode {
                 // Linux 语义：超过最大符号链接层数应返回 ELOOP。
                 // 根据上面的约定：symlink_follows_remaining==1 表示计数已耗尽，不允许再跟随。
                 if need_follow && symlink_follows_remaining == 1 {
-                    return Err(SystemError::ELOOP);
+                    return Err(SystemError::ELOOP.into());
                 }
 
                 // 若不需要跟随（理论上只可能发生在"末尾 symlink + 不跟随 + 无 trailing '/'"），
@@ -2763,17 +2887,17 @@ impl dyn IndexNode {
                         .resolve
                         .contains(utils::OpenHowResolve::RESOLVE_NO_SYMLINKS)
                     {
-                        return Err(SystemError::ELOOP);
+                        return Err(SystemError::ELOOP.into());
                     }
                     if inode.is_magic_link() {
                         if options
                             .resolve
                             .contains(utils::OpenHowResolve::RESOLVE_NO_MAGICLINKS)
                         {
-                            return Err(SystemError::ELOOP);
+                            return Err(SystemError::ELOOP.into());
                         }
                         if options.scope_root.is_some() {
-                            return Err(SystemError::EXDEV);
+                            return Err(SystemError::EXDEV.into());
                         }
                     }
                 }
@@ -2785,7 +2909,7 @@ impl dyn IndexNode {
                 // only need the cached target; do not call special_node(),
                 // whose backing inode lock can wait for filesystem I/O.
                 if cache_only && inode.is_magic_link() {
-                    return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+                    return Err(SystemError::EAGAIN_OR_EWOULDBLOCK.into());
                 }
 
                 inode.check_symlink_access()?;
@@ -2818,7 +2942,7 @@ impl dyn IndexNode {
                             target_inode.clone().downcast_arc::<mount::MountFSInode>();
                         if !matches!((source_mount, target_mount), (Some(source), Some(target)) if Arc::ptr_eq(&source.mount_fs(), &target.mount_fs()))
                         {
-                            return Err(SystemError::EXDEV);
+                            return Err(SystemError::EXDEV.into());
                         }
                     }
                     if ownership.is_some() {
@@ -2851,21 +2975,16 @@ impl dyn IndexNode {
                     }
                     let content = symlink_buffer.as_mut().expect("symlink buffer initialized");
                     // TODO:We need to clarify which interfaces require private data and which do not
-                    let len = inode.read_at(
-                        0,
-                        MAX_PATHLEN,
-                        content,
-                        Mutex::new(FilePrivateData::Unused).lock(),
-                    )?;
+                    let len = read_symlink(&inode, content)?;
                     if len >= MAX_PATHLEN {
-                        return Err(SystemError::ENAMETOOLONG);
+                        return Err(SystemError::ENAMETOOLONG.into());
                     }
                     String::from(
                         ::core::str::from_utf8(&content[..len]).map_err(|_| SystemError::EINVAL)?,
                     )
                 };
                 if link_path.len() >= MAX_PATHLEN {
-                    return Err(SystemError::ENAMETOOLONG);
+                    return Err(SystemError::ENAMETOOLONG.into());
                 }
 
                 // 拼接路径：将 symlink 目标 + 剩余路径组合
@@ -2888,7 +3007,7 @@ impl dyn IndexNode {
                             .resolve
                             .contains(utils::OpenHowResolve::RESOLVE_BENEATH)
                     }) {
-                        return Err(SystemError::EXDEV);
+                        return Err(SystemError::EXDEV.into());
                     }
                     if options.is_some_and(|options| {
                         options
@@ -2901,7 +3020,7 @@ impl dyn IndexNode {
                             .downcast_arc::<mount::MountFSInode>();
                         if !matches!((from, to), (Some(from), Some(to)) if Arc::ptr_eq(&from.mount_fs(), &to.mount_fs()))
                         {
-                            return Err(SystemError::EXDEV);
+                            return Err(SystemError::EXDEV.into());
                         }
                     }
                     result = process_root_inode.clone();
@@ -2927,7 +3046,7 @@ impl dyn IndexNode {
         }
 
         if trailing_slash && lookup_metadata(&result)?.file_type != FileType::Dir {
-            return Err(SystemError::ENOTDIR);
+            return Err(SystemError::ENOTDIR.into());
         }
 
         return Ok(PathWalkOutcome::Found(result, ownership));
@@ -3481,16 +3600,19 @@ pub trait MountableFileSystem: FileSystem {
         _value: &str,
         previous: Option<&FsconfigPreparedData>,
         _owner: &crate::process::namespace::user_namespace::UserNamespace,
-    ) -> Result<Option<FsconfigPreparedData>, SystemError> {
+    ) -> Result<Option<FsconfigPreparedData>, crate::mm::allocation::MemoryAllocationError> {
         Ok(previous.cloned())
     }
 
     fn make_mount_data(
         _raw_data: Option<&str>,
         _source: &str,
-    ) -> Result<Option<Arc<dyn FileSystemMakerData + 'static>>, SystemError> {
+    ) -> Result<
+        Option<Arc<dyn FileSystemMakerData + 'static>>,
+        crate::mm::allocation::MemoryAllocationError,
+    > {
         log::error!("This filesystem does not support make_mount_data");
-        Err(SystemError::ENOSYS)
+        Err(SystemError::ENOSYS.into())
     }
 
     fn make_fs(
@@ -3514,7 +3636,10 @@ pub trait MountableFileSystem: FileSystem {
         raw_data: Option<&str>,
         source: &str,
         _context: &FsCreationContext,
-    ) -> Result<Option<Arc<dyn FileSystemMakerData + 'static>>, SystemError> {
+    ) -> Result<
+        Option<Arc<dyn FileSystemMakerData + 'static>>,
+        crate::mm::allocation::MemoryAllocationError,
+    > {
         Self::make_mount_data(raw_data, source)
     }
 
@@ -3551,7 +3676,10 @@ macro_rules! register_mountable_fs {
                 value: &str,
                 previous: Option<&$crate::filesystem::vfs::FsconfigPreparedData>,
                 owner: &$crate::process::namespace::user_namespace::UserNamespace,
-            ) -> Result<Option<$crate::filesystem::vfs::FsconfigPreparedData>, SystemError> {
+            ) -> Result<
+                Option<$crate::filesystem::vfs::FsconfigPreparedData>,
+                $crate::mm::allocation::MemoryAllocationError,
+            > {
                 <$fs as MountableFileSystem>::prepare_fsconfig_string(key, value, previous, owner)
             }
 
@@ -3565,7 +3693,10 @@ macro_rules! register_mountable_fs {
             fn make_mount_data_legacy_bridge(
                 raw_data: Option<&str>,
                 source: &str,
-            ) -> Result<Option<Arc<dyn FileSystemMakerData + 'static>>, SystemError> {
+            ) -> Result<
+                Option<Arc<dyn FileSystemMakerData + 'static>>,
+                $crate::mm::allocation::MemoryAllocationError,
+            > {
                 <$fs as MountableFileSystem>::make_mount_data(raw_data, source)
             }
 
@@ -3581,7 +3712,10 @@ macro_rules! register_mountable_fs {
                 raw_data: Option<&str>,
                 source: &str,
                 context: &$crate::filesystem::vfs::FsCreationContext,
-            ) -> Result<Option<Arc<dyn FileSystemMakerData + 'static>>, SystemError> {
+            ) -> Result<
+                Option<Arc<dyn FileSystemMakerData + 'static>>,
+                $crate::mm::allocation::MemoryAllocationError,
+            > {
                 <$fs as MountableFileSystem>::make_mount_data_in_context(raw_data, source, context)
             }
         }
@@ -3601,8 +3735,10 @@ macro_rules! register_mountable_fs {
                         Option<&str>,
                         &str,
                         &$crate::filesystem::vfs::FsCreationContext,
-                    )
-                        -> Result<Option<Arc<dyn FileSystemMakerData + 'static>>, SystemError>),
+                    ) -> Result<
+                        Option<Arc<dyn FileSystemMakerData + 'static>>,
+                        $crate::mm::allocation::MemoryAllocationError,
+                    >),
                 &($fs::make_fs_legacy_bridge
                     as fn(
                         Option<&dyn FileSystemMakerData>,
@@ -3612,8 +3748,10 @@ macro_rules! register_mountable_fs {
                     as fn(
                         Option<&str>,
                         &str,
-                    )
-                        -> Result<Option<Arc<dyn FileSystemMakerData + 'static>>, SystemError>),
+                    ) -> Result<
+                        Option<Arc<dyn FileSystemMakerData + 'static>>,
+                        $crate::mm::allocation::MemoryAllocationError,
+                    >),
                 $crate::filesystem::vfs::FsconfigParameterOps {
                     prepare_string: &($fs::prepare_fsconfig_string_bridge
                         as fn(
@@ -3623,7 +3761,7 @@ macro_rules! register_mountable_fs {
                             &$crate::process::namespace::user_namespace::UserNamespace,
                         ) -> Result<
                             Option<$crate::filesystem::vfs::FsconfigPreparedData>,
-                            SystemError,
+                            $crate::mm::allocation::MemoryAllocationError,
                         >),
                     validate: $fs::validate_fsconfig_parameter_bridge,
                 },
@@ -3744,7 +3882,7 @@ impl FileSystemMaker {
         value: &str,
         previous: Option<&FsconfigPreparedData>,
         owner: &crate::process::namespace::user_namespace::UserNamespace,
-    ) -> Result<Option<FsconfigPreparedData>, SystemError> {
+    ) -> Result<Option<FsconfigPreparedData>, crate::mm::allocation::MemoryAllocationError> {
         (self.fsconfig.prepare_string)(key, value, previous, owner)
     }
 
@@ -3798,33 +3936,38 @@ pub trait FileSystemMakerData: Send + Sync {
 
 /// Filesystem-owned, immutable state prepared at fsconfig parameter time.
 pub type FsconfigPreparedData = Arc<dyn Any + Send + Sync>;
-pub type FsconfigStringPreparer = fn(
-    key: &str,
-    value: &str,
-    previous: Option<&FsconfigPreparedData>,
-    owner: &crate::process::namespace::user_namespace::UserNamespace,
-) -> Result<Option<FsconfigPreparedData>, SystemError>;
+pub type FsconfigStringPreparer =
+    fn(
+        key: &str,
+        value: &str,
+        previous: Option<&FsconfigPreparedData>,
+        owner: &crate::process::namespace::user_namespace::UserNamespace,
+    ) -> Result<Option<FsconfigPreparedData>, crate::mm::allocation::MemoryAllocationError>;
 
 pub type FSMakerFunction = fn(
     data: Option<&dyn FileSystemMakerData>,
     mount_flags: MountFlags,
     context: &FsCreationContext,
 ) -> Result<Arc<dyn FileSystem>, SystemError>;
-pub type MountDataBuilder =
-    fn(
-        raw_data: Option<&str>,
-        source: &str,
-        context: &FsCreationContext,
-    ) -> Result<Option<Arc<dyn FileSystemMakerData + 'static>>, SystemError>;
+pub type MountDataBuilder = fn(
+    raw_data: Option<&str>,
+    source: &str,
+    context: &FsCreationContext,
+) -> Result<
+    Option<Arc<dyn FileSystemMakerData + 'static>>,
+    crate::mm::allocation::MemoryAllocationError,
+>;
 pub type LegacyFSMakerFunction = fn(
     data: Option<&dyn FileSystemMakerData>,
     mount_flags: MountFlags,
 ) -> Result<Arc<dyn FileSystem>, SystemError>;
-pub type LegacyMountDataBuilder =
-    fn(
-        raw_data: Option<&str>,
-        source: &str,
-    ) -> Result<Option<Arc<dyn FileSystemMakerData + 'static>>, SystemError>;
+pub type LegacyMountDataBuilder = fn(
+    raw_data: Option<&str>,
+    source: &str,
+) -> Result<
+    Option<Arc<dyn FileSystemMakerData + 'static>>,
+    crate::mm::allocation::MemoryAllocationError,
+>;
 
 #[macro_export]
 macro_rules! define_filesystem_maker_slice {
@@ -3854,16 +3997,18 @@ pub fn produce_fs(
     data: Option<&str>,
     source: &str,
     mount_flags: MountFlags,
-) -> Result<Arc<dyn FileSystem>, SystemError> {
+) -> Result<Arc<dyn FileSystem>, crate::mm::allocation::MemoryAllocationError> {
     match filesystem_maker(filesystem) {
         Some(maker) => {
             let mount_data = (maker.legacy_builder)(data, source)?;
             let mount_data_ref = mount_data.as_ref().map(|arc| arc.as_ref());
-            maker.build_legacy(mount_data_ref, mount_flags)
+            maker
+                .build_legacy(mount_data_ref, mount_flags)
+                .map_err(Into::into)
         }
         None => {
             log::error!("mismatch filesystem type : {}", filesystem);
-            Err(SystemError::ENODEV)
+            Err(SystemError::ENODEV.into())
         }
     }
 }
@@ -3884,7 +4029,7 @@ pub fn produce_fs_in_context(
     source: &str,
     mount_flags: MountFlags,
     context: &FsCreationContext,
-) -> Result<Arc<dyn FileSystem>, SystemError> {
+) -> Result<Arc<dyn FileSystem>, crate::mm::allocation::MemoryAllocationError> {
     match filesystem_maker(filesystem) {
         Some(maker) => {
             // Linux sget_fc's owner invariant is a construction failure,
@@ -3895,17 +4040,19 @@ pub fn produce_fs_in_context(
                     &crate::process::namespace::user_namespace::INIT_USER_NAMESPACE,
                 )
             {
-                return Err(SystemError::EPERM);
+                return Err(SystemError::EPERM.into());
             }
             let mount_data = (maker.builder)(data, source, context)?;
             let mount_data_ref = mount_data.as_ref().map(|arc| arc.as_ref());
-            maker.build(mount_data_ref, mount_flags, context)
+            maker
+                .build(mount_data_ref, mount_flags, context)
+                .map_err(Into::into)
         }
         None => {
             log::error!("mismatch filesystem type : {}", filesystem);
             // Linux get_fs_type() reports ENODEV when no filesystem driver is
             // registered for the requested type.
-            Err(SystemError::ENODEV)
+            Err(SystemError::ENODEV.into())
         }
     }
 }

@@ -145,6 +145,7 @@ pub(crate) fn submit_prepared_ipv6_with_pmtu(
             hint: None,
         },
     )
+    .map(|_| ())
 }
 
 pub(crate) fn submit_prepared_ipv4_with_pmtu(
@@ -202,7 +203,7 @@ pub(crate) fn submit_prepared_ipv6_raw(
     route: OutputRouteDecision,
     options: RawOutputPolicy,
     hint: &mut Option<SocketRouteHint>,
-) -> Result<(), PmtuOutputError> {
+) -> Result<Option<Arc<dyn Iface>>, PmtuOutputError> {
     submit_ipv6(
         netns,
         reservation,

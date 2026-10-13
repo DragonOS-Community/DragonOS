@@ -57,6 +57,20 @@ impl TcpSocket {
             }
             inner_guard = self.inner.read();
         }
+        if matches!(inner_guard.as_ref(), Some(inner::Inner::Listening(_))) {
+            // Rearming an idle slot and requesting task-context refill mutate
+            // listener state. Never upgrade while retaining the read guard.
+            drop(inner_guard);
+            let mut writer = self.inner.write();
+            if let Some(inner::Inner::Listening(listening)) = writer.as_mut() {
+                listening.update_io_events(&self.pollee);
+                return false;
+            }
+            drop(writer);
+            // Concurrent close changed the state; use a fresh read rather
+            // than recursively retrying a racing event notification.
+            inner_guard = self.inner.read();
+        }
         match inner_guard.as_ref() {
             None => false,
             Some(inner::Inner::Init(_)) => {
@@ -82,7 +96,7 @@ impl TcpSocket {
                 false
             }
             Some(inner::Inner::Listening(listening)) => {
-                listening.update_io_events(&self.pollee);
+                let _ = listening;
                 false
             }
         }

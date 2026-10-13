@@ -83,6 +83,7 @@ syscall_table_macros::declare_syscall!(SYS_EVENTFD2, SysEventFd2Handle);
 /// See: https://man7.org/linux/man-pages/man2/eventfd2.2.html
 pub fn do_eventfd(init_val: u32, flags: u32) -> Result<usize, SystemError> {
     let flags = EventFdFlags::from_bits(flags).ok_or(SystemError::EINVAL)?;
+    let storage = crate::filesystem::vfs::file::PreparedFile::new_recovering()?;
     let id = EVENTFD_ID_ALLOCATOR
         .lock()
         .alloc()
@@ -95,11 +96,18 @@ pub fn do_eventfd(init_val: u32, flags: u32) -> Result<usize, SystemError> {
         FileFlags::O_RDWR
     };
     let cloexec = flags.contains(EventFdFlags::EFD_CLOEXEC);
-    let file = File::new(inode, filemode)?;
+    let file = File::new_prepared_recovering(inode, filemode, storage)?;
     let current = ProcessManager::current_pcb();
     let binding = current.fd_table();
-    let fd = binding
-        .alloc_fd(file, cloexec, current.nofile_soft_limit())
-        .map(|x| x as usize);
+    let file = Arc::try_new(file).map_err(|_| SystemError::ENOMEM)?;
+    let fd = File::recover_io(|| {
+        binding.alloc_fd_arc(
+            file.clone(),
+            cloexec,
+            current.nofile_soft_limit(),
+            &crate::cgroup::memory::object_for_task(&current),
+        )
+    })
+    .map(|x| x as usize);
     return fd;
 }

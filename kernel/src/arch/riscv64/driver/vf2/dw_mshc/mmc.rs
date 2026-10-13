@@ -803,7 +803,7 @@ impl BlockDevice for MMC {
         let block_size = self.block_size();
         let required_size = count * block_size;
         if buf.len() < required_size {
-            return Err(SystemError::EIO);
+            return Err(SystemError::EIO.into());
         }
 
         for i in 0..count {
@@ -831,7 +831,7 @@ impl BlockDevice for MMC {
         let block_size = self.block_size();
         let required_size = count * block_size;
         if buf.len() < required_size {
-            return Err(SystemError::EIO);
+            return Err(SystemError::EIO.into());
         }
 
         for i in 0..count {
@@ -949,8 +949,10 @@ impl IndexNode for MMC {
         _len: usize,
         _buf: &mut [u8],
         _data: MutexGuard<crate::filesystem::vfs::FilePrivateData>,
-    ) -> Result<usize, SystemError> {
-        Err(SystemError::ENOSYS)
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> =
+            (|| Err(SystemError::ENOSYS.into()))();
+        result.map_err(Into::into)
     }
     fn write_at(
         &self,
@@ -958,11 +960,13 @@ impl IndexNode for MMC {
         _len: usize,
         _buf: &[u8],
         _data: MutexGuard<crate::filesystem::vfs::FilePrivateData>,
-    ) -> Result<usize, SystemError> {
-        Err(SystemError::ENOSYS)
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> =
+            (|| Err(SystemError::ENOSYS.into()))();
+        result.map_err(Into::into)
     }
     fn list(&self) -> Result<alloc::vec::Vec<alloc::string::String>, system_error::SystemError> {
-        Err(SystemError::ENOSYS)
+        Err(SystemError::ENOSYS.into())
     }
     fn metadata(&self) -> Result<crate::filesystem::vfs::Metadata, SystemError> {
         Ok(self.metadata.clone())

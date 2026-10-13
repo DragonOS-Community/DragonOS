@@ -17,6 +17,17 @@ pub fn do_dup3(
     }
 
     let cloexec = flags.contains(FileFlags::O_CLOEXEC);
-    let (res, dropped) = fd_table.duplicate_exact(oldfd, newfd, cloexec, soft_limit)?;
+    // dup2/dup3 read the source at the final table transaction after expansion,
+    // unlike ordinary dup's earlier fget snapshot.
+    let current = crate::process::ProcessManager::current_pcb();
+    let (res, dropped) = crate::filesystem::vfs::file::File::recover_io(|| {
+        fd_table.duplicate_exact(
+            oldfd,
+            newfd,
+            cloexec,
+            soft_limit,
+            &crate::cgroup::memory::object_for_task(&current),
+        )
+    })?;
     return Ok((res as usize, dropped));
 }

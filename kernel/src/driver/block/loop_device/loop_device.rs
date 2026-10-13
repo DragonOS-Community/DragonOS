@@ -1,3 +1,4 @@
+use crate::mm::allocation::MemoryAllocationError;
 use crate::{
     driver::base::{
         block::{
@@ -698,8 +699,8 @@ impl LoopDevice {
     ///
     /// ## 返回值
     /// - `Ok(())`: 状态设置成功。
-    /// - `Err(SystemError::EINVAL)`: 无效的参数或标志位。
-    /// - `Err(SystemError::ENXIO)`: 设备未绑定或已卸载。
+    /// - `Err(SystemError::EINVAL.into())`: 无效的参数或标志位。
+    /// - `Err(SystemError::ENXIO.into())`: 设备未绑定或已卸载。
     fn set_status64(&self, user_ptr: usize) -> Result<(), SystemError> {
         if user_ptr == 0 {
             return Err(SystemError::EINVAL);
@@ -916,7 +917,7 @@ impl LoopDevice {
     ///
     /// ## 返回值
     /// - `Ok(())`: 成功增加计数
-    /// - `Err(SystemError::ENODEV)`: 设备正在删除，拒绝新的 I/O
+    /// - `Err(SystemError::ENODEV.into())`: 设备正在删除，拒绝新的 I/O
     fn io_start(&self) -> Result<(), SystemError> {
         let inner = self.inner();
         if !matches!(inner.state(), LoopState::Bound) {
@@ -1087,8 +1088,8 @@ impl IndexNode for LoopDevice {
         &self,
         _datasync: bool,
         _data: MutexGuard<FilePrivateData>,
-    ) -> Result<(), SystemError> {
-        <Self as BlockDevice>::sync(self)
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        self.try_sync()
     }
 
     fn read_at(
@@ -1097,11 +1098,11 @@ impl IndexNode for LoopDevice {
         len: usize,
         buf: &mut [u8],
         _data: MutexGuard<crate::filesystem::vfs::FilePrivateData>,
-    ) -> Result<usize, SystemError> {
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
         if len > buf.len() {
-            return Err(SystemError::ENOBUFS);
+            return Err(SystemError::ENOBUFS.into());
         }
-        self.read_bytes_operation(offset, len, buf)
+        self.try_read_bytes_operation(offset, len, buf)
     }
 
     fn write_at(
@@ -1110,11 +1111,11 @@ impl IndexNode for LoopDevice {
         len: usize,
         buf: &[u8],
         _data: MutexGuard<crate::filesystem::vfs::FilePrivateData>,
-    ) -> Result<usize, SystemError> {
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
         if len > buf.len() {
-            return Err(SystemError::E2BIG);
+            return Err(SystemError::E2BIG.into());
         }
-        self.write_bytes_operation(offset, len, &buf[..len], WriteSyncIntent::None)
+        self.try_write_bytes_operation(offset, len, &buf[..len], WriteSyncIntent::None)
             .map(|result| result.written_len)
     }
 
@@ -1156,80 +1157,83 @@ impl IndexNode for LoopDevice {
         cmd: u32,
         data: usize,
         private_data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError> {
-        let ioctl_cmd = LoopIoctl::from_u32(cmd).ok_or(SystemError::ENOSYS)?;
-        let control_writable = matches!(
-            &*private_data,
-            FilePrivateData::Loop(data) if data.control_writable
-        );
-        let may_reconfigure = control_writable || capable(CAPFlags::CAP_SYS_ADMIN);
-        drop(private_data);
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = (|| {
+            let ioctl_cmd = LoopIoctl::from_u32(cmd).ok_or(SystemError::ENOSYS)?;
+            let control_writable = matches!(
+                &*private_data,
+                FilePrivateData::Loop(data) if data.control_writable
+            );
+            let may_reconfigure = control_writable || capable(CAPFlags::CAP_SYS_ADMIN);
+            drop(private_data);
 
-        match ioctl_cmd {
-            LoopIoctl::LoopSetFd => {
-                let file_fd = data as i32;
-                let fd_table = ProcessManager::current_pcb().fd_table();
-                let file = {
-                    let guard = fd_table.read();
-                    guard.get_file_by_fd(file_fd)
-                }
-                .ok_or(SystemError::EBADF)?;
-                let inode = file.inode();
-                let metadata = inode.metadata()?;
-                match metadata.file_type {
-                    FileType::File | FileType::BlockDevice => {}
-                    _ => return Err(SystemError::EINVAL),
-                }
+            match ioctl_cmd {
+                LoopIoctl::LoopSetFd => {
+                    let file_fd = data as i32;
+                    let fd_table = ProcessManager::current_pcb().fd_table();
+                    let file = {
+                        let guard = fd_table.read();
+                        guard.get_file_by_fd(file_fd)
+                    }
+                    .ok_or(SystemError::EBADF)?;
+                    let inode = file.inode();
+                    let metadata = inode.metadata()?;
+                    match metadata.file_type {
+                        FileType::File | FileType::BlockDevice => {}
+                        _ => return Err(SystemError::EINVAL),
+                    }
 
-                let read_only = file.flags().is_read_only() || !control_writable;
-                self.bind_file(file, read_only)?;
-                Ok(0)
-            }
-            LoopIoctl::LoopClrFd => {
-                if !may_reconfigure {
-                    return Err(SystemError::EPERM);
+                    let read_only = file.flags().is_read_only() || !control_writable;
+                    self.bind_file(file, read_only)?;
+                    Ok(0)
                 }
-                self.clear_file()?;
-                Ok(0)
-            }
-            LoopIoctl::LoopSetStatus => {
-                if !may_reconfigure {
-                    return Err(SystemError::EPERM);
+                LoopIoctl::LoopClrFd => {
+                    if !may_reconfigure {
+                        return Err(SystemError::EPERM);
+                    }
+                    self.clear_file()?;
+                    Ok(0)
                 }
-                self.set_status(data)?;
-                Ok(0)
-            }
-            LoopIoctl::LoopGetStatus => {
-                self.get_status(data)?;
-                Ok(0)
-            }
-            LoopIoctl::LoopSetStatus64 => {
-                if !may_reconfigure {
-                    return Err(SystemError::EPERM);
+                LoopIoctl::LoopSetStatus => {
+                    if !may_reconfigure {
+                        return Err(SystemError::EPERM);
+                    }
+                    self.set_status(data)?;
+                    Ok(0)
                 }
-                self.set_status64(data)?;
-                Ok(0)
-            }
-            LoopIoctl::LoopGetStatus64 => {
-                self.get_status64(data)?;
-                Ok(0)
-            }
-            LoopIoctl::LoopChangeFd => {
-                if !may_reconfigure {
-                    return Err(SystemError::EPERM);
+                LoopIoctl::LoopGetStatus => {
+                    self.get_status(data)?;
+                    Ok(0)
                 }
-                self.change_fd(data as i32)?;
-                Ok(0)
-            }
-            LoopIoctl::LoopSetCapacity => {
-                if !may_reconfigure {
-                    return Err(SystemError::EPERM);
+                LoopIoctl::LoopSetStatus64 => {
+                    if !may_reconfigure {
+                        return Err(SystemError::EPERM);
+                    }
+                    self.set_status64(data)?;
+                    Ok(0)
                 }
-                self.set_capacity(data)?;
-                Ok(0)
+                LoopIoctl::LoopGetStatus64 => {
+                    self.get_status64(data)?;
+                    Ok(0)
+                }
+                LoopIoctl::LoopChangeFd => {
+                    if !may_reconfigure {
+                        return Err(SystemError::EPERM);
+                    }
+                    self.change_fd(data as i32)?;
+                    Ok(0)
+                }
+                LoopIoctl::LoopSetCapacity => {
+                    if !may_reconfigure {
+                        return Err(SystemError::EPERM);
+                    }
+                    self.set_capacity(data)?;
+                    Ok(0)
+                }
+                _ => Err(SystemError::ENOSYS),
             }
-            _ => Err(SystemError::ENOSYS),
-        }
+        })();
+        result.map_err(Into::into)
     }
 }
 
@@ -1345,27 +1349,30 @@ impl LoopDevice {
         start: usize,
         end: usize,
         datasync: bool,
-    ) -> Result<(), SystemError> {
+    ) -> Result<(), MemoryAllocationError> {
         Self::normalize_backing_sync_result(
-            backing_file.sync_range_and_check_wb_error(start, end, datasync),
+            backing_file.try_sync_range_and_check_wb_error(start, end, datasync),
         )
     }
 
-    fn normalize_backing_sync_result(result: Result<(), SystemError>) -> Result<(), SystemError> {
+    fn normalize_backing_sync_result(
+        result: Result<(), MemoryAllocationError>,
+    ) -> Result<(), MemoryAllocationError> {
         match result {
-            Ok(()) | Err(SystemError::EINVAL) => Ok(()),
-            Err(_) => Err(SystemError::EIO),
+            Ok(()) | Err(MemoryAllocationError::System(SystemError::EINVAL)) => Ok(()),
+            Err(error @ MemoryAllocationError::Charge(_)) => Err(error),
+            Err(MemoryAllocationError::System(_)) => Err(SystemError::EIO.into()),
         }
     }
 
-    fn read_bytes_operation(
+    pub(crate) fn try_read_bytes_operation(
         &self,
         offset: usize,
         len: usize,
         buf: &mut [u8],
-    ) -> Result<usize, SystemError> {
+    ) -> Result<usize, MemoryAllocationError> {
         if len > buf.len() {
-            return Err(SystemError::EINVAL);
+            return Err(SystemError::EINVAL.into());
         }
         if len == 0 {
             return Ok(0);
@@ -1374,7 +1381,7 @@ impl LoopDevice {
         let _io_guard = IoGuard::new(self)?;
         let (backing_file, base_offset, limit_end) = self.io_snapshot(false)?;
         let file_offset = Self::translate_io_range(base_offset, limit_end, offset, len)?;
-        let read = backing_file.pread(file_offset, len, &mut buf[..len])?;
+        let read = backing_file.try_pread(file_offset, len, &mut buf[..len])?;
         if read < len {
             // Linux loop zero-fills a short backing read inside the advertised
             // device capacity rather than exposing stale destination bytes.
@@ -1384,20 +1391,21 @@ impl LoopDevice {
         Ok(read)
     }
 
-    fn write_bytes_operation(
+    pub(crate) fn try_write_bytes_operation(
         &self,
         offset: usize,
         len: usize,
         buf: &[u8],
         sync_intent: WriteSyncIntent,
-    ) -> Result<DelegatedWriteResult, SystemError> {
+    ) -> Result<DelegatedWriteResult, MemoryAllocationError> {
         if len > buf.len() {
-            return Err(SystemError::EINVAL);
+            return Err(SystemError::EINVAL.into());
         }
         if len == 0 {
             return Ok(DelegatedWriteResult {
                 written_len: 0,
                 sync_result: Ok(()),
+                sync_range: None,
             });
         }
 
@@ -1415,6 +1423,27 @@ impl LoopDevice {
             backing_file.pwrite_with_sync_intent(file_offset, len, &buf[..len], sync_intent)?;
         result.sync_result = Self::normalize_backing_sync_result(result.sync_result);
         Ok(result)
+    }
+
+    pub(crate) fn try_sync(&self) -> Result<(), MemoryAllocationError> {
+        let _io_guard = IoGuard::new(self)?;
+        let backing_file = self
+            .inner()
+            .backing_file
+            .clone()
+            .ok_or(SystemError::ENODEV)?;
+        Self::sync_backing_file(&backing_file, 0, usize::MAX, false)
+    }
+
+    /// The legacy synchronous BlockDevice ABI cannot carry a charge scope to
+    /// its FS caller. Fail this request without reclaiming under that caller's
+    /// locks. Full request-context/NOIO recovery is tracked separately (DKC-082).
+    /// Typed OFD operations must never use this terminal adapter.
+    fn legacy_io_terminal(error: MemoryAllocationError) -> SystemError {
+        match error {
+            MemoryAllocationError::System(error) => error,
+            MemoryAllocationError::Charge(_) => SystemError::ENOMEM,
+        }
     }
 }
 
@@ -1507,7 +1536,8 @@ impl BlockDevice for LoopDevice {
         let block_offset = lba_id_start
             .checked_mul(LBA_SIZE)
             .ok_or(SystemError::EOVERFLOW)?;
-        self.read_bytes_operation(block_offset, len, buf)
+        self.try_read_bytes_operation(block_offset, len, buf)
+            .map_err(Self::legacy_io_terminal)
     }
 
     fn write_at_sync(
@@ -1520,8 +1550,9 @@ impl BlockDevice for LoopDevice {
         let block_offset = lba_id_start
             .checked_mul(LBA_SIZE)
             .ok_or(SystemError::EOVERFLOW)?;
-        self.write_bytes_operation(block_offset, len, buf, WriteSyncIntent::None)
+        self.try_write_bytes_operation(block_offset, len, buf, WriteSyncIntent::None)
             .map(|result| result.written_len)
+            .map_err(Self::legacy_io_terminal)
     }
 
     fn read_at_bytes(
@@ -1530,7 +1561,8 @@ impl BlockDevice for LoopDevice {
         len: usize,
         buf: &mut [u8],
     ) -> Result<usize, SystemError> {
-        self.read_bytes_operation(offset, len, buf)
+        self.try_read_bytes_operation(offset, len, buf)
+            .map_err(Self::legacy_io_terminal)
     }
 
     fn uses_delegated_write_sync(&self) -> bool {
@@ -1544,17 +1576,19 @@ impl BlockDevice for LoopDevice {
         buf: &[u8],
         sync_intent: WriteSyncIntent,
     ) -> Result<DelegatedWriteResult, SystemError> {
-        self.write_bytes_operation(offset, len, buf, sync_intent)
+        let mut result = self
+            .try_write_bytes_operation(offset, len, buf, sync_intent)
+            .map_err(Self::legacy_io_terminal)?;
+        // Data already committed: retain its prefix and terminal sync errno;
+        // never expose a charge that could replay this legacy request.
+        result.sync_result = result
+            .sync_result
+            .map_err(|error| MemoryAllocationError::System(Self::legacy_io_terminal(error)));
+        Ok(result)
     }
 
     fn sync(&self) -> Result<(), SystemError> {
-        let _io_guard = IoGuard::new(self)?;
-        let backing_file = self
-            .inner()
-            .backing_file
-            .clone()
-            .ok_or(SystemError::ENODEV)?;
-        Self::sync_backing_file(&backing_file, 0, usize::MAX, false)
+        self.try_sync().map_err(Self::legacy_io_terminal)
     }
 
     fn supports_reliable_flush(&self) -> bool {

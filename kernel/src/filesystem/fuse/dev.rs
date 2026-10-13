@@ -123,15 +123,18 @@ impl IndexNode for LockedFuseDevInode {
         &self,
         mut data: MutexGuard<FilePrivateData>,
         flags: &FileFlags,
-    ) -> Result<(), SystemError> {
-        let nonblock = flags.contains(FileFlags::O_NONBLOCK);
-        let conn = FuseConn::new();
-        let conn_any: Arc<dyn core::any::Any + Send + Sync> = conn;
-        *data = FilePrivateData::Fuse(FuseFilePrivateData::Dev(FuseDevPrivateData {
-            conn: conn_any,
-            nonblock,
-        }));
-        Ok(())
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = {
+            let nonblock = flags.contains(FileFlags::O_NONBLOCK);
+            let conn = FuseConn::new();
+            let conn_any: Arc<dyn core::any::Any + Send + Sync> = conn;
+            *data = FilePrivateData::Fuse(FuseFilePrivateData::Dev(FuseDevPrivateData {
+                conn: conn_any,
+                nonblock,
+            }));
+            Ok(())
+        };
+        result.map_err(Into::into)
     }
 
     fn close(&self, data: MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
@@ -149,25 +152,28 @@ impl IndexNode for LockedFuseDevInode {
         len: usize,
         buf: &mut [u8],
         data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError> {
-        if buf.len() < len {
-            return Err(SystemError::EINVAL);
-        }
-        let (conn_any, nonblock) = {
-            let FilePrivateData::Fuse(FuseFilePrivateData::Dev(p)) = &*data else {
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = (|| {
+            if buf.len() < len {
                 return Err(SystemError::EINVAL);
+            }
+            let (conn_any, nonblock) = {
+                let FilePrivateData::Fuse(FuseFilePrivateData::Dev(p)) = &*data else {
+                    return Err(SystemError::EINVAL);
+                };
+                (p.conn.clone(), p.nonblock)
             };
-            (p.conn.clone(), p.nonblock)
-        };
-        // Drop private_data lock before potentially blocking in read_request().
-        drop(data);
-        let conn = conn_any
-            .downcast::<FuseConn>()
-            .map_err(|_| SystemError::EINVAL)?;
-        match conn.read_request(nonblock, &mut buf[..len]) {
-            Err(SystemError::ENOTCONN) => Err(SystemError::ENODEV),
-            x => x,
-        }
+            // Drop private_data lock before potentially blocking in read_request().
+            drop(data);
+            let conn = conn_any
+                .downcast::<FuseConn>()
+                .map_err(|_| SystemError::EINVAL)?;
+            match conn.read_request(nonblock, &mut buf[..len]) {
+                Err(SystemError::ENOTCONN) => Err(SystemError::ENODEV),
+                x => x,
+            }
+        })();
+        result.map_err(Into::into)
     }
 
     fn write_at(
@@ -176,41 +182,50 @@ impl IndexNode for LockedFuseDevInode {
         len: usize,
         buf: &[u8],
         data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError> {
-        if buf.len() < len {
-            return Err(SystemError::EINVAL);
-        }
-        let conn_any = {
-            let FilePrivateData::Fuse(FuseFilePrivateData::Dev(p)) = &*data else {
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = (|| {
+            if buf.len() < len {
                 return Err(SystemError::EINVAL);
+            }
+            let conn_any = {
+                let FilePrivateData::Fuse(FuseFilePrivateData::Dev(p)) = &*data else {
+                    return Err(SystemError::EINVAL);
+                };
+                p.conn.clone()
             };
-            p.conn.clone()
-        };
-        // Drop private_data lock before potentially blocking in write_reply().
-        drop(data);
-        let conn = conn_any
-            .downcast::<FuseConn>()
-            .map_err(|_| SystemError::EINVAL)?;
-        match conn.write_reply(&buf[..len]) {
-            Err(SystemError::ENOTCONN) => Err(SystemError::ENOENT),
-            x => x,
-        }
+            // Drop private_data lock before potentially blocking in write_reply().
+            drop(data);
+            let conn = conn_any
+                .downcast::<FuseConn>()
+                .map_err(|_| SystemError::EINVAL)?;
+            match conn.write_reply(&buf[..len]) {
+                Err(SystemError::ENOTCONN) => Err(SystemError::ENOENT),
+                x => x,
+            }
+        })();
+        result.map_err(Into::into)
     }
 
     fn metadata(&self) -> Result<Metadata, SystemError> {
         Ok(self.0.lock().metadata.clone())
     }
 
-    fn set_metadata(&self, metadata: &Metadata) -> Result<(), SystemError> {
-        let mut inode = self.0.lock();
-        inode.metadata.atime = metadata.atime;
-        inode.metadata.mtime = metadata.mtime;
-        inode.metadata.ctime = metadata.ctime;
-        inode.metadata.btime = metadata.btime;
-        inode.metadata.mode = metadata.mode;
-        inode.metadata.uid = metadata.uid;
-        inode.metadata.gid = metadata.gid;
-        Ok(())
+    fn set_metadata(
+        &self,
+        metadata: &Metadata,
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = {
+            let mut inode = self.0.lock();
+            inode.metadata.atime = metadata.atime;
+            inode.metadata.mtime = metadata.mtime;
+            inode.metadata.ctime = metadata.ctime;
+            inode.metadata.btime = metadata.btime;
+            inode.metadata.mode = metadata.mode;
+            inode.metadata.uid = metadata.uid;
+            inode.metadata.gid = metadata.gid;
+            Ok(())
+        };
+        result.map_err(Into::into)
     }
 
     fn fs(&self) -> Arc<dyn FileSystem> {
@@ -239,57 +254,64 @@ impl IndexNode for LockedFuseDevInode {
         cmd: u32,
         data: usize,
         mut private_data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError> {
-        match cmd {
-            FUSE_DEV_IOC_CLONE => {
-                if data == 0 {
-                    return Err(SystemError::EFAULT);
-                }
-
-                let reader =
-                    UserBufferReader::new(data as *const u32, core::mem::size_of::<u32>(), true)?;
-                let oldfd = reader.buffer_protected(0)?.read_one::<u32>(0)? as i32;
-
-                let old_file = ProcessManager::current_pcb()
-                    .fd_table()
-                    .read()
-                    .get_file_by_fd(oldfd)
-                    .ok_or(SystemError::EINVAL)?;
-
-                let old_conn = {
-                    let guard = old_file.private_data.lock();
-                    let FilePrivateData::Fuse(fuse_data) = &*guard else {
-                        return Err(SystemError::EINVAL);
-                    };
-                    let FuseFilePrivateData::Dev(p) = fuse_data else {
-                        return Err(SystemError::EINVAL);
-                    };
-                    p.conn.clone()
-                };
-
-                let FilePrivateData::Fuse(FuseFilePrivateData::Dev(p)) = &mut *private_data else {
-                    return Err(SystemError::EINVAL);
-                };
-                let old_fc = old_conn
-                    .clone()
-                    .downcast::<FuseConn>()
-                    .map_err(|_| SystemError::EINVAL)?;
-
-                // If this fd already points to the same connection, this is a no-op.
-                if let Ok(cur_fc) = p.conn.clone().downcast::<FuseConn>() {
-                    if Arc::ptr_eq(&cur_fc, &old_fc) {
-                        return Ok(0);
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = (|| {
+            match cmd {
+                FUSE_DEV_IOC_CLONE => {
+                    if data == 0 {
+                        return Err(SystemError::EFAULT);
                     }
-                    cur_fc.dev_release();
+
+                    let reader = UserBufferReader::new(
+                        data as *const u32,
+                        core::mem::size_of::<u32>(),
+                        true,
+                    )?;
+                    let oldfd = reader.buffer_protected(0)?.read_one::<u32>(0)? as i32;
+
+                    let old_file = ProcessManager::current_pcb()
+                        .fd_table()
+                        .read()
+                        .get_file_by_fd(oldfd)
+                        .ok_or(SystemError::EINVAL)?;
+
+                    let old_conn = {
+                        let guard = old_file.private_data.lock();
+                        let FilePrivateData::Fuse(fuse_data) = &*guard else {
+                            return Err(SystemError::EINVAL);
+                        };
+                        let FuseFilePrivateData::Dev(p) = fuse_data else {
+                            return Err(SystemError::EINVAL);
+                        };
+                        p.conn.clone()
+                    };
+
+                    let FilePrivateData::Fuse(FuseFilePrivateData::Dev(p)) = &mut *private_data
+                    else {
+                        return Err(SystemError::EINVAL);
+                    };
+                    let old_fc = old_conn
+                        .clone()
+                        .downcast::<FuseConn>()
+                        .map_err(|_| SystemError::EINVAL)?;
+
+                    // If this fd already points to the same connection, this is a no-op.
+                    if let Ok(cur_fc) = p.conn.clone().downcast::<FuseConn>() {
+                        if Arc::ptr_eq(&cur_fc, &old_fc) {
+                            return Ok(0);
+                        }
+                        cur_fc.dev_release();
+                    }
+
+                    old_fc.dev_acquire();
+                    p.conn = old_conn;
+
+                    Ok(0)
                 }
-
-                old_fc.dev_acquire();
-                p.conn = old_conn;
-
-                Ok(0)
+                _ => Err(SystemError::ENOTTY),
             }
-            _ => Err(SystemError::ENOTTY),
-        }
+        })();
+        result.map_err(Into::into)
     }
 
     fn absolute_path(&self) -> Result<String, SystemError> {

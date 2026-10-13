@@ -11,6 +11,7 @@ use system_error::SystemError;
 
 use crate::{
     arch::{mm::PageMapper, MMArch},
+    cgroup::memory::{ChargeFailure, MemoryAccount, MemoryKind, MemoryStat},
     filesystem::page_cache::{PageCacheFaultInvalidateRead, PageCachePagePin},
     libs::align::align_down,
     mm::{
@@ -57,23 +58,55 @@ fn fault_event_shard_for(pcb: &crate::process::ProcessControlBlock) -> &'static 
 
 /// Record a major-fault event at the point where backing I/O is required.
 #[inline]
-pub(crate) fn account_major_fault_event() {
+pub(crate) fn account_major_fault_event(account: &MemoryAccount) {
     let pcb = ProcessManager::current_pcb();
     fault_event_shard_for(&pcb)
         .major_faults
         .fetch_add(1, Ordering::Relaxed);
+    account.adjust_stat(MemoryStat::PgMajFault, 1, true);
 }
 
 /// Apply Linux mm_account_fault() semantics to one final MM fault outcome.
 #[inline]
-pub(crate) fn account_fault_result(flags: FaultFlags, reason: VmFaultReason) {
+pub(crate) fn account_fault_result(
+    account: &MemoryAccount,
+    flags: FaultFlags,
+    reason: VmFaultReason,
+) {
     let pcb = ProcessManager::current_pcb();
-    account_fault_result_for(&pcb, flags, reason);
+    account_fault_result_for(&pcb, account, flags, reason);
+}
+
+/// Complete admission recovery only after fault resource guards are gone.
+/// RETRY did not account this attempt; terminal allocation failure records
+/// PGFAULT, but an interrupted incomplete fault is not an OOM/minor/major fault.
+pub(crate) fn recover_fault_charge(
+    failure: ChargeFailure,
+    state: &mut crate::cgroup::memory::runtime::ChargeRecoveryState,
+    account: &MemoryAccount,
+    flags: FaultFlags,
+) -> Result<(), SystemError> {
+    let result = crate::mm::allocation::MemoryAllocationError::Charge(failure).recover(state);
+    if let Err(error) = &result {
+        account_fault_recovery_failure(account, flags, error.clone());
+    }
+    result
+}
+
+pub(crate) fn account_fault_recovery_failure(
+    account: &MemoryAccount,
+    flags: FaultFlags,
+    error: SystemError,
+) {
+    if !matches!(error, SystemError::EINTR | SystemError::ERESTARTSYS) {
+        account_fault_result(account, flags, VmFaultReason::VM_FAULT_OOM);
+    }
 }
 
 #[inline]
 fn account_fault_result_for(
     pcb: &crate::process::ProcessControlBlock,
+    account: &MemoryAccount,
     flags: FaultFlags,
     reason: VmFaultReason,
 ) {
@@ -84,6 +117,7 @@ fn account_fault_result_for(
     fault_event_shard_for(pcb)
         .faults
         .fetch_add(1, Ordering::Relaxed);
+    account.adjust_stat(MemoryStat::PgFault, 1, true);
     if reason.intersects(VmFaultReason::VM_FAULT_ERROR) {
         return;
     }
@@ -105,14 +139,30 @@ pub fn page_major_fault_count() -> u64 {
     })
 }
 
-pub trait FaultRetryWait: core::fmt::Debug + Send + Sync {
-    fn wait(&self) -> Result<(), SystemError>;
+pub(crate) trait FaultRetryWait: core::fmt::Debug + Send + Sync {
+    /// Runs after the caller releases its MM/resource guards. Preserve
+    /// admission provenance so the outer fault can retry with a fresh owner,
+    /// rather than mistaking a local quota failure for physical/global OOM.
+    fn wait(&self) -> Result<(), crate::mm::allocation::MemoryAllocationError>;
 }
 
 #[derive(Debug)]
 pub struct VmFaultOutcome {
     pub reason: VmFaultReason,
-    pub retry_wait: Option<Arc<dyn FaultRetryWait>>,
+    pub(crate) retry_wait: Option<Arc<dyn FaultRetryWait>>,
+    /// A memcg admission failure, distinct from physical/global allocator OOM.
+    /// The caller must release its mm/resource guards before handling this.
+    pub(crate) charge_failure: Option<ChargeFailure>,
+}
+
+impl VmFaultOutcome {
+    pub(crate) fn from_reason(reason: VmFaultReason) -> Self {
+        Self {
+            reason,
+            retry_wait: None,
+            charge_failure: None,
+        }
+    }
 }
 
 bitflags! {
@@ -147,6 +197,9 @@ pub struct PageFaultMessage<'a> {
     flags: FaultFlags,
     /// 页表映射器
     mapper: &'a mut PageMapper,
+    /// The allocating task's object account, captured before MM locks.
+    pub(crate) creator_object: Arc<crate::cgroup::memory::object::ObjectAccount>,
+    pub(crate) data_account: Arc<crate::cgroup::memory::MemoryAccount>,
     /// 缺页的后备对象页在后备对象中的偏移页号（文件/共享匿名）
     backing_pgoff: Option<usize>,
     /// 缺页对应PageCache中的文件页
@@ -160,6 +213,7 @@ pub struct PageFaultMessage<'a> {
     /// do_wp_page 等在修改 PTE 后需要走 mm-aware shootdown 的路径要依赖它（`AddressSpace::flush_tlb_range`）。
     mm: Arc<AddressSpace>,
     retry_wait: Option<Arc<dyn FaultRetryWait>>,
+    charge_failure: Option<ChargeFailure>,
 }
 
 impl<'a> PageFaultMessage<'a> {
@@ -169,6 +223,8 @@ impl<'a> PageFaultMessage<'a> {
         flags: FaultFlags,
         mapper: &'a mut PageMapper,
         mm: Arc<AddressSpace>,
+        creator_object: Arc<crate::cgroup::memory::object::ObjectAccount>,
+        data_account: Arc<crate::cgroup::memory::MemoryAccount>,
     ) -> Self {
         let guard = vma.lock();
         let vm_file = guard.vm_file();
@@ -187,9 +243,12 @@ impl<'a> PageFaultMessage<'a> {
             page: None,
             page_pin: None,
             mapper,
+            creator_object,
+            data_account,
             cow_page: None,
             mm,
             retry_wait: None,
+            charge_failure: None,
         }
     }
 
@@ -205,6 +264,14 @@ impl<'a> PageFaultMessage<'a> {
 
     pub fn vm_flags(&self) -> VmFlags {
         self.vm_flags
+    }
+
+    pub(crate) fn data_account(&self) -> &Arc<crate::cgroup::memory::MemoryAccount> {
+        &self.data_account
+    }
+
+    pub(crate) fn creator_object(&self) -> &Arc<crate::cgroup::memory::object::ObjectAccount> {
+        &self.creator_object
     }
 
     #[inline(always)]
@@ -241,8 +308,65 @@ impl<'a> PageFaultMessage<'a> {
         &self.mm
     }
 
-    pub fn set_retry_wait(&mut self, wait: Arc<dyn FaultRetryWait>) {
+    pub(crate) fn set_retry_wait(&mut self, wait: Arc<dyn FaultRetryWait>) {
         self.retry_wait = Some(wait);
+    }
+
+    /// Carry the limiting account out of the locked fault without constructing
+    /// an allocated waiter or converting admission failure to global OOM.
+    /// Actual charge sources and lock-free recovery are connected together in
+    /// the controller integration step, not by a provisional retry callback.
+    pub(crate) fn fail_charge(&mut self, failure: ChargeFailure) -> VmFaultReason {
+        self.charge_failure = Some(failure);
+        VmFaultReason::VM_FAULT_RETRY
+    }
+
+    pub(crate) fn allocation_failure(
+        &mut self,
+        error: crate::mm::allocation::MemoryAllocationError,
+    ) -> VmFaultReason {
+        match error {
+            crate::mm::allocation::MemoryAllocationError::Charge(failure) => {
+                self.fail_charge(failure)
+            }
+            crate::mm::allocation::MemoryAllocationError::System(SystemError::ENOMEM) => {
+                VmFaultReason::VM_FAULT_OOM
+            }
+            crate::mm::allocation::MemoryAllocationError::System(_) => {
+                VmFaultReason::VM_FAULT_SIGBUS
+            }
+        }
+    }
+
+    #[expect(
+        clippy::type_complexity,
+        reason = "Return the actual new page with its architecture-specific flush obligation"
+    )]
+    unsafe fn map_new_anonymous_page(
+        &mut self,
+        address: VirtAddr,
+        flags: EntryFlags<MMArch>,
+    ) -> Result<
+        Option<(Arc<Page>, crate::mm::page::PageFlush<MMArch>)>,
+        crate::mm::allocation::MemoryAllocationError,
+    > {
+        let charge = self.data_account.try_charge(MemoryKind::Anon, 1)?;
+        self.mapper.try_map_new_charged_page(
+            address,
+            flags,
+            Some(&self.creator_object),
+            Some(charge),
+        )
+    }
+
+    fn copy_anonymous_page(
+        source: &Arc<Page>,
+        account: &Arc<MemoryAccount>,
+    ) -> Result<Arc<Page>, crate::mm::allocation::MemoryAllocationError> {
+        let charge = account.try_charge(MemoryKind::Anon, 1)?;
+        Ok(crate::mm::page::copy_registered_normal_page(
+            source, charge,
+        )?)
     }
 
     /// Return the currently installed raw PFN at the fault address.
@@ -285,9 +409,15 @@ impl<'a> PageFaultMessage<'a> {
         if self.mapper.get_entry(address, 0).is_some() {
             return VmFaultReason::VM_FAULT_NOPAGE;
         }
-        let Some(flush) = self.mapper.map_phys(address, paddr, pte_flags) else {
-            return VmFaultReason::VM_FAULT_OOM;
-        };
+        let flush =
+            match self
+                .mapper
+                .try_map_phys(address, paddr, pte_flags, Some(&self.creator_object))
+            {
+                Ok(Some(flush)) => flush,
+                Ok(None) => return VmFaultReason::VM_FAULT_OOM,
+                Err(failure) => return self.fail_charge(failure),
+            };
         flush.flush();
         self.vma.lock().set_mapped(true);
         VmFaultReason::VM_FAULT_COMPLETED
@@ -353,16 +483,24 @@ impl<'a> PageFaultMessage<'a> {
             return VmFaultReason::VM_FAULT_SIGSEGV;
         }
 
-        let page = {
-            let mut page_manager = page_manager_lock();
-            let mut allocator = crate::arch::mm::LockedFrameAllocator;
-            match page_manager.create_one_page(PageType::Normal, PageFlags::empty(), &mut allocator)
-            {
-                Ok(page) => page,
-                Err(_) => return VmFaultReason::VM_FAULT_OOM,
-            }
+        let charge = match self.data_account.try_charge(MemoryKind::Anon, 1) {
+            Ok(charge) => charge,
+            Err(failure) => return self.fail_charge(failure),
         };
-        page.write().copy_from_slice(source);
+        let page = match crate::mm::page::allocate_registered_data_page_initialized(
+            PageType::Normal,
+            PageFlags::empty(),
+            Some(charge),
+            |paddr| {
+                let destination = MMArch::phys_2_virt(paddr).ok_or(SystemError::EFAULT)?;
+                (destination.data() as *mut u8)
+                    .copy_from_nonoverlapping(source.as_ptr(), source.len());
+                Ok(())
+            },
+        ) {
+            Ok(page) => page,
+            Err(error) => return self.allocation_failure(error.into()),
+        };
 
         let address = self.address_aligned_down();
         let mm = self.mm.clone();
@@ -398,17 +536,27 @@ impl<'a> PageFaultMessage<'a> {
             // The replaced external PFN was not RSS-accounted; the new
             // anonymous COW page is managed guest memory and must be.
             mm.account_present_page_add();
-        } else if let Some(flush) = self
-            .mapper
-            .map_phys(address, page.phys_address(), pte_flags)
-        {
-            flush.flush();
-            mm.account_present_page_add();
         } else {
-            PageFaultHandler::detach_fault_mapped_page(&page, &self.vma);
-            let mut page_manager = page_manager_lock();
-            page_manager.remove_page(&page.phys_address());
-            return VmFaultReason::VM_FAULT_OOM;
+            match self.mapper.try_map_phys(
+                address,
+                page.phys_address(),
+                pte_flags,
+                Some(&self.creator_object),
+            ) {
+                Ok(Some(flush)) => {
+                    flush.flush();
+                    mm.account_present_page_add();
+                }
+                result => {
+                    PageFaultHandler::detach_fault_mapped_page(&page, &self.vma);
+                    let retired = { page_manager_lock().remove_page_if_same(&page) };
+                    drop(retired);
+                    return match result {
+                        Err(failure) => self.fail_charge(failure),
+                        _ => VmFaultReason::VM_FAULT_OOM,
+                    };
+                }
+            }
         }
         self.vma.lock().set_mapped(true);
         VmFaultReason::VM_FAULT_COMPLETED | VmFaultReason::VM_FAULT_DONE_COW
@@ -494,8 +642,20 @@ impl PageFaultHandler {
         } else {
             let guard = vma.lock();
             let vm_flags = *guard.vm_flags();
+            let unstable_private = pfm.mm().is_oom_unstable()
+                && crate::mm::ucontext::oom_reap::is_reapable_vma(
+                    guard.vm_file().is_none(),
+                    vm_flags,
+                )
+                && (!vm_flags.contains(VmFlags::VM_MIXEDMAP)
+                    || flags
+                        .intersects(FaultFlags::FAULT_FLAG_WRITE | FaultFlags::FAULT_FLAG_UNSHARE));
             drop(guard);
-            if unlikely(vm_flags.contains(VmFlags::VM_HUGETLB)) {
+            if unstable_private {
+                // Every consumer retains the target MM write guard for this
+                // whole transaction; a reaper cannot change it mid-install.
+                VmFaultReason::VM_FAULT_SIGBUS
+            } else if unlikely(vm_flags.contains(VmFlags::VM_HUGETLB)) {
                 // TODO: 添加 handle_hugetlb_fault 处理大页缺页异常。
                 VmFaultReason::VM_FAULT_COMPLETED
             } else {
@@ -503,11 +663,23 @@ impl PageFaultHandler {
             }
         };
 
-        account_fault_result_for(&current_pcb, flags, reason);
+        // A failed private COW must not retain an unpublished registered frame
+        // (and its receipt) while the outer recovery waits for headroom.
+        if !reason.contains(VmFaultReason::VM_FAULT_COMPLETED) {
+            if let Some(page) = pfm.cow_page.take() {
+                let unmapped = page.read().map_count() == 0;
+                if unmapped {
+                    let retired = { page_manager_lock().remove_page_if_same(&page) };
+                    drop(retired);
+                }
+            }
+        }
+        account_fault_result_for(&current_pcb, pfm.data_account(), flags, reason);
 
         VmFaultOutcome {
             reason,
             retry_wait: pfm.retry_wait.take(),
+            charge_failure: pfm.charge_failure.take(),
         }
     }
 
@@ -530,9 +702,15 @@ impl PageFaultHandler {
                 .get_entry(address, MMArch::PAGE_LEVELS.saturating_sub(1))
                 .is_none()
             {
-                mapper
-                    .allocate_table(address, MMArch::PAGE_LEVELS.saturating_sub(2))
-                    .expect("failed to allocate second-level page table");
+                match mapper.try_allocate_table(
+                    address,
+                    MMArch::PAGE_LEVELS.saturating_sub(2),
+                    Some(&pfm.creator_object),
+                ) {
+                    Ok(Some(_)) => {}
+                    Ok(None) => return VmFaultReason::VM_FAULT_OOM,
+                    Err(failure) => return pfm.fail_charge(failure),
+                }
             }
         }
         let page_flags = vma.lock().flags();
@@ -546,8 +724,16 @@ impl PageFaultHandler {
                         if vma.is_anonymous() {
                             mapper.map_huge_page(address, page_flags);
                         }
-                    } else if mapper.allocate_table(address, level - 1).is_none() {
-                        return VmFaultReason::VM_FAULT_OOM;
+                    } else {
+                        match mapper.try_allocate_table(
+                            address,
+                            level - 1,
+                            Some(&pfm.creator_object),
+                        ) {
+                            Ok(Some(_)) => {}
+                            Ok(None) => return VmFaultReason::VM_FAULT_OOM,
+                            Err(failure) => return pfm.fail_charge(failure),
+                        }
                     }
                 }
             }
@@ -630,12 +816,15 @@ impl PageFaultHandler {
         }
         let mm = pfm.mm().clone();
         let _pt_edit = mm.page_table_edit();
-        let mapper = &mut pfm.mapper;
         let (flags, mlocked) = {
             let guard = vma.lock();
             (guard.flags(), guard.vm_flags().contains(VmFlags::VM_LOCKED))
         };
-        if let Some((page, flush)) = mapper.map_new_page(address, flags) {
+        let mapped = match pfm.map_new_anonymous_page(address, flags) {
+            Ok(mapped) => mapped,
+            Err(error) => return pfm.allocation_failure(error),
+        };
+        if let Some((page, flush)) = mapped {
             flush.flush();
             crate::debug::klog::mm::mm_debug_log(
                 klog_types::AllocatorLogType::LazyAlloc(klog_types::AllocLogItem::new(
@@ -715,16 +904,11 @@ impl PageFaultHandler {
         }
 
         let cache_page = pfm.page.clone().unwrap();
-        let mapper = &mut pfm.mapper;
-
-        let mut page_manager_guard = page_manager_lock();
-        if let Ok(page) = page_manager_guard
-            .copy_page_as_normal(&cache_page.phys_address(), mapper.allocator_mut())
-        {
-            pfm.cow_page = Some(page.clone());
-        } else {
-            return VmFaultReason::VM_FAULT_OOM;
-        }
+        let page = match PageFaultMessage::copy_anonymous_page(&cache_page, &pfm.data_account) {
+            Ok(page) => page,
+            Err(error) => return pfm.allocation_failure(error),
+        };
+        pfm.cow_page = Some(page);
         ret = ret.union(Self::finish_fault(pfm));
 
         ret
@@ -957,6 +1141,7 @@ impl PageFaultHandler {
         }
 
         let _pt_edit = mm.page_table_edit();
+        let data_account = pfm.data_account.clone();
         let mapper = &mut pfm.mapper;
         let Some(mut entry) = mapper.get_entry(address, 0) else {
             return VmFaultReason::VM_FAULT_NOPAGE;
@@ -1021,13 +1206,10 @@ impl PageFaultHandler {
                 mm.flush_tlb_range(address, end, MMArch::PAGE_SHIFT as u8, false);
                 VmFaultReason::VM_FAULT_COMPLETED
             } else {
-                let new_page = {
-                    let mut page_manager_guard = page_manager_lock();
-                    match page_manager_guard.copy_page_as_normal(&old_paddr, mapper.allocator_mut())
-                    {
-                        Ok(page) => page,
-                        Err(_) => return VmFaultReason::VM_FAULT_OOM,
-                    }
+                let new_page = match PageFaultMessage::copy_anonymous_page(&old_page, &data_account)
+                {
+                    Ok(page) => page,
+                    Err(error) => return pfm.allocation_failure(error),
                 };
                 let new_paddr = new_page.phys_address();
 
@@ -1050,12 +1232,9 @@ impl PageFaultHandler {
             }
         } else {
             // 私有文件映射，必须拷贝页面
-            let new_page = {
-                let mut page_manager_guard = page_manager_lock();
-                match page_manager_guard.copy_page_as_normal(&old_paddr, mapper.allocator_mut()) {
-                    Ok(page) => page,
-                    Err(_) => return VmFaultReason::VM_FAULT_OOM,
-                }
+            let new_page = match PageFaultMessage::copy_anonymous_page(&old_page, &data_account) {
+                Ok(page) => page,
+                Err(error) => return pfm.allocation_failure(error),
             };
             let new_paddr = new_page.phys_address();
 
@@ -1090,9 +1269,11 @@ impl PageFaultHandler {
             let _pt_edit = mm.page_table_edit();
             let mapper = &mut pfm.mapper;
             if mapper.get_table(address, 0).is_none() {
-                mapper
-                    .allocate_table(address, 0)
-                    .expect("failed to allocate pte table");
+                match mapper.try_allocate_table(address, 0, Some(&pfm.creator_object)) {
+                    Ok(Some(_)) => {}
+                    Ok(None) => return VmFaultReason::VM_FAULT_OOM,
+                    Err(failure) => return pfm.fail_charge(failure),
+                }
             }
         }
         let vma_guard = vma.lock();
@@ -1134,9 +1315,12 @@ impl PageFaultHandler {
         {
             let _pt_edit = mm.page_table_edit();
             let mapper = &mut pfm.mapper;
-            if mapper.get_table(address, 0).is_none() && mapper.allocate_table(address, 0).is_none()
-            {
-                return VmFaultReason::VM_FAULT_OOM;
+            if mapper.get_table(address, 0).is_none() {
+                match mapper.try_allocate_table(address, 0, Some(&pfm.creator_object)) {
+                    Ok(Some(_)) => {}
+                    Ok(None) => return VmFaultReason::VM_FAULT_OOM,
+                    Err(failure) => return pfm.fail_charge(failure),
+                }
             }
         }
 
@@ -1144,8 +1328,11 @@ impl PageFaultHandler {
         let start_pgoff = backing_pgoff - (pte_pgoff - from_pte);
         let end_pgoff = backing_pgoff + (to_pte - pte_pgoff);
         file.with_io_fs(|fs| fs.map_pages(pfm, start_pgoff, end_pgoff));
-
-        VmFaultReason::empty()
+        if pfm.charge_failure.is_some() {
+            VmFaultReason::VM_FAULT_RETRY
+        } else {
+            VmFaultReason::empty()
+        }
     }
 
     /// 通用的VMA文件映射页面映射函数，将PageCache中的页面映射到进程空间
@@ -1213,11 +1400,17 @@ impl PageFaultHandler {
                         flags = flags.set_write(false);
                     }
                     Self::attach_fault_mapped_page(&page, &vma, mlocked);
-                    if let Some(flush) = mapper.map_phys(address, phys, flags) {
-                        flush.flush();
-                        Self::account_new_present_mapping(&mm);
-                    } else {
-                        Self::detach_fault_mapped_page(&page, &vma);
+                    match mapper.try_map_phys(address, phys, flags, Some(&pfm.creator_object)) {
+                        Ok(Some(flush)) => {
+                            flush.flush();
+                            Self::account_new_present_mapping(&mm);
+                        }
+                        result => {
+                            Self::detach_fault_mapped_page(&page, &vma);
+                            if let Err(failure) = result {
+                                return pfm.fail_charge(failure);
+                            }
+                        }
                     }
                 }
             }
@@ -1281,23 +1474,22 @@ impl PageFaultHandler {
             }
         }
 
-        if !page_cache.is_page_ready(backing_pgoff) {
-            account_major_fault_event();
+        if !page_cache.fault_page_state(backing_pgoff).cached {
+            account_major_fault_event(pfm.data_account());
             ret = VmFaultReason::VM_FAULT_MAJOR;
         }
 
-        match page_cache.manager().commit_page_pinned(backing_pgoff) {
+        match page_cache.manager().try_commit_page_pinned(
+            backing_pgoff,
+            &pfm.data_account,
+            &pfm.creator_object,
+        ) {
             Ok(page_pin) => {
                 let page = page_pin.page();
                 pfm.page = Some(page);
                 pfm.page_pin = Some(page_pin);
             }
-            Err(SystemError::ENOMEM) => {
-                return VmFaultReason::VM_FAULT_OOM;
-            }
-            Err(_) => {
-                return VmFaultReason::VM_FAULT_SIGBUS;
-            }
+            Err(error) => return pfm.allocation_failure(error),
         }
         ret
     }
@@ -1408,15 +1600,18 @@ impl PageFaultHandler {
             }
         }
 
-        match page_cache.manager().commit_overwrite_pinned(backing_pgoff) {
+        match page_cache.manager().try_commit_overwrite_pinned(
+            backing_pgoff,
+            &pfm.data_account,
+            &pfm.creator_object,
+        ) {
             Ok(page_pin) => {
                 let page = page_pin.page();
                 pfm.page = Some(page);
                 pfm.page_pin = Some(page_pin);
                 VmFaultReason::empty()
             }
-            Err(SystemError::ENOMEM) => VmFaultReason::VM_FAULT_OOM,
-            Err(_) => VmFaultReason::VM_FAULT_SIGBUS,
+            Err(error) => pfm.allocation_failure(error),
         }
     }
 
@@ -1434,6 +1629,18 @@ impl PageFaultHandler {
         }
         let vma = pfm.vma();
         let vma_guard = vma.lock();
+        // Mixed raw-PFN read drivers return NOPAGE/COMPLETED without Linux's
+        // finish_fault. Only an ordinary private-Page fallback reaches here;
+        // it must not reconstruct content already discarded by the reaper.
+        if pfm.mm().is_oom_unstable()
+            && vma_guard.vm_flags().contains(VmFlags::VM_MIXEDMAP)
+            && crate::mm::ucontext::oom_reap::is_reapable_vma(
+                vma_guard.vm_file().is_none(),
+                *vma_guard.vm_flags(),
+            )
+        {
+            return VmFaultReason::VM_FAULT_SIGBUS;
+        }
         let flags = pfm.flags();
         let cache_page = pfm.page.clone();
         let cow_page = pfm.cow_page.clone();
@@ -1467,13 +1674,17 @@ impl PageFaultHandler {
         drop(vma_guard);
 
         Self::attach_fault_mapped_page(&page_to_map, &vma, mlocked);
-        let result = if let Some(flush) = mapper.map_phys(address, page_phys, map_flags) {
+        let mapped = mapper.try_map_phys(address, page_phys, map_flags, Some(&pfm.creator_object));
+        let result = if let Ok(Some(flush)) = mapped {
             flush.flush();
             Self::account_new_present_mapping(pfm.mm());
             VmFaultReason::VM_FAULT_COMPLETED
         } else {
             Self::detach_fault_mapped_page(&page_to_map, &vma);
-            VmFaultReason::VM_FAULT_OOM
+            match mapped {
+                Err(failure) => pfm.fail_charge(failure),
+                _ => VmFaultReason::VM_FAULT_OOM,
+            }
         };
         pfm.page_pin.take();
         result
@@ -1492,9 +1703,11 @@ impl PageFaultHandler {
         drop(guard);
         let mm = pfm.mm().clone();
         let _pt_edit = mm.page_table_edit();
-        let mapper = &mut pfm.mapper;
-
-        if let Some((page, flush)) = mapper.map_new_page(address, flags) {
+        let mapped = match pfm.map_new_anonymous_page(address, flags) {
+            Ok(mapped) => mapped,
+            Err(error) => return pfm.allocation_failure(error),
+        };
+        if let Some((page, flush)) = mapped {
             flush.flush();
             Self::account_new_present_mapping(pfm.mm());
             Self::attach_fault_mapped_page(&page, &vma, mlocked);
@@ -1526,13 +1739,16 @@ impl PageFaultHandler {
 
         let mm = pfm.mm().clone();
         let _pt_edit = mm.page_table_edit();
-        let mapper = &mut pfm.mapper;
         for pgoff in start_pgoff..end_pgoff {
             let addr = VirtAddr::new(base.data() + ((pgoff - backing_pgoff) << MMArch::PAGE_SHIFT));
-            if mapper.get_entry(addr, 0).is_some() {
+            if pfm.mapper.get_entry(addr, 0).is_some() {
                 continue;
             }
-            if let Some((page, flush)) = mapper.map_new_page(addr, flags) {
+            let mapped = match pfm.map_new_anonymous_page(addr, flags) {
+                Ok(mapped) => mapped,
+                Err(error) => return pfm.allocation_failure(error),
+            };
+            if let Some((page, flush)) = mapped {
                 flush.flush();
                 Self::account_new_present_mapping(&mm);
                 Self::attach_fault_mapped_page(&page, &vma, mlocked);

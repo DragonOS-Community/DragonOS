@@ -372,19 +372,11 @@ impl Socket for TcpSocket {
     }
 
     fn send_buffer_size(&self) -> usize {
-        self.inner
-            .read()
-            .as_ref()
-            .expect("Tcp inner::Inner is None")
-            .send_buffer_size()
+        self.send_buf_size_loaded()
     }
 
     fn recv_buffer_size(&self) -> usize {
-        self.inner
-            .read()
-            .as_ref()
-            .expect("Tcp inner::Inner is None")
-            .recv_buffer_size()
+        self.recv_buf_size_loaded()
     }
 
     fn recv_bytes_available(&self) -> usize {
@@ -603,15 +595,27 @@ impl Socket for TcpSocket {
 }
 
 impl InetSocket for TcpSocket {
+    fn refill_tcp_listener(&self) {
+        self.refill_listener_once();
+    }
     fn prepare_tcp_syn(&self, local: smoltcp::wire::IpEndpoint, device: u32) {
-        let mut inner = self.inner.write();
-        if let Some(inner::Inner::Listening(listener)) = inner.as_mut() {
-            listener.prepare_syn(local, device);
+        let needs_refill = {
+            let mut inner = self.inner.write();
+            match inner.as_mut() {
+                Some(inner::Inner::Listening(listener)) => listener.prepare_syn(local, device),
+                _ => false,
+            }
+        };
+        if needs_refill {
+            // Prepare outside inner/SocketSet guards, then revalidate and
+            // commit before the current SYN is dispatched. TcpStack retains
+            // poll serialization so competing ingress cannot steal this slot.
+            self.refill_listener_once();
         }
     }
 
     fn on_iface_events(&self) {
-        // TcpStack::poll() 在网络轮询线程/中断上下文中推进 smoltcp socket 状态。
+        // TcpStack::poll() 在网络轮询任务或系统调用上下文中推进 smoltcp socket 状态。
         // 这里负责把 smoltcp 的状态变化同步到 TcpSocket 的 pollee/Connecting 结果中，
         // 以便 connect/accept/epoll 等等待者能被正确唤醒并观察到状态前进。
         //

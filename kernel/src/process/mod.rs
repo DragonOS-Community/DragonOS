@@ -39,6 +39,7 @@ mod manager;
 mod sched_info;
 mod state;
 mod task;
+pub(crate) use task::run_resource_birth_selftest;
 
 int_like!(RawPid, AtomicRawPid, usize, AtomicUsize);
 
@@ -54,7 +55,7 @@ pub(crate) use manager::SchedChangeRequest;
 pub(crate) use manager::{
     account_context_switch, account_successful_fork, dec_visible_thread_count,
     inc_visible_thread_count, lock_fs_refs_copy, lock_fs_refs_pivot, snapshot_all_processes,
-    FsRefsReadGuard,
+    snapshot_all_processes_into, FsRefsReadGuard,
 };
 #[allow(unused_imports)]
 pub use manager::{

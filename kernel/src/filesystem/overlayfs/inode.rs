@@ -563,7 +563,7 @@ impl IndexNode for OvlInode {
         &self,
         data: crate::libs::mutex::MutexGuard<FilePrivateData>,
         flags: &FileFlags,
-    ) -> Result<(), SystemError> {
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         file::open(self, data, flags)
     }
 
@@ -573,7 +573,7 @@ impl IndexNode for OvlInode {
         len: usize,
         buf: &mut [u8],
         data: crate::libs::mutex::MutexGuard<vfs::FilePrivateData>,
-    ) -> Result<usize, system_error::SystemError> {
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
         file::read_at(self, offset, len, buf, data)
     }
 
@@ -583,7 +583,7 @@ impl IndexNode for OvlInode {
         len: usize,
         buf: &[u8],
         data: crate::libs::mutex::MutexGuard<vfs::FilePrivateData>,
-    ) -> Result<usize, SystemError> {
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
         file::write_at(self, offset, len, buf, data)
     }
 
@@ -594,7 +594,7 @@ impl IndexNode for OvlInode {
         buf: &[u8],
         sync_intent: vfs::WriteSyncIntent,
         data: crate::libs::mutex::MutexGuard<vfs::FilePrivateData>,
-    ) -> Result<vfs::DelegatedWriteResult, SystemError> {
+    ) -> Result<vfs::DelegatedWriteResult, crate::mm::allocation::MemoryAllocationError> {
         file::write_at_with_sync(self, offset, len, buf, sync_intent, data)
     }
 
@@ -602,7 +602,7 @@ impl IndexNode for OvlInode {
         &self,
         datasync: bool,
         data: crate::libs::mutex::MutexGuard<vfs::FilePrivateData>,
-    ) -> Result<(), SystemError> {
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         file::sync_file(self, datasync, data)
     }
 
@@ -612,7 +612,7 @@ impl IndexNode for OvlInode {
         end: usize,
         datasync: bool,
         data: crate::libs::mutex::MutexGuard<vfs::FilePrivateData>,
-    ) -> Result<(), SystemError> {
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         file::sync_file_range(self, start, end, datasync, data)
     }
 
@@ -620,7 +620,7 @@ impl IndexNode for OvlInode {
         &self,
         data: crate::libs::mutex::MutexGuard<FilePrivateData>,
         lock_owner: u64,
-    ) -> Result<(), SystemError> {
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         file::flush_file(self, data, lock_owner)
     }
 
@@ -637,11 +637,14 @@ impl IndexNode for OvlInode {
         len: usize,
         offset: usize,
         vm_flags: VmFlags,
-    ) -> Result<(), SystemError> {
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         file::check_mmap_file(self, file, len, offset, vm_flags)
     }
 
-    fn mmap_effective_file(&self, file: &Arc<File>) -> Result<Arc<File>, SystemError> {
+    fn mmap_effective_file(
+        &self,
+        file: &Arc<File>,
+    ) -> Result<Arc<File>, crate::mm::allocation::MemoryAllocationError> {
         file::mmap_effective_file(self, file)
     }
 
@@ -652,7 +655,7 @@ impl IndexNode for OvlInode {
         len: usize,
         offset: usize,
         vm_flags: VmFlags,
-    ) -> Result<Arc<File>, SystemError> {
+    ) -> Result<Arc<File>, crate::mm::allocation::MemoryAllocationError> {
         file::mmap_file(self, file, start, len, offset, vm_flags)
     }
 
@@ -669,7 +672,10 @@ impl IndexNode for OvlInode {
         super::metadata::metadata(self)
     }
 
-    fn set_metadata(&self, metadata: &Metadata) -> Result<(), SystemError> {
+    fn set_metadata(
+        &self,
+        metadata: &Metadata,
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         super::metadata::set_metadata_masked(
             self,
             metadata,
@@ -686,7 +692,7 @@ impl IndexNode for OvlInode {
         &self,
         metadata: &Metadata,
         mask: SetMetadataMask,
-    ) -> Result<(), SystemError> {
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         super::metadata::set_metadata_masked(self, metadata, mask)
     }
 
@@ -701,11 +707,15 @@ impl IndexNode for OvlInode {
         Ok(())
     }
 
-    fn resize(&self, len: usize) -> Result<(), SystemError> {
+    fn resize(&self, len: usize) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         super::metadata::resize_with_lock_owner(self, len, 0)
     }
 
-    fn resize_with_lock_owner(&self, len: usize, lock_owner: u64) -> Result<(), SystemError> {
+    fn resize_with_lock_owner(
+        &self,
+        len: usize,
+        lock_owner: u64,
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         super::metadata::resize_with_lock_owner(self, len, lock_owner)
     }
 
@@ -714,7 +724,7 @@ impl IndexNode for OvlInode {
         len: usize,
         lock_owner: u64,
         data: crate::libs::mutex::MutexGuard<vfs::FilePrivateData>,
-    ) -> Result<(), SystemError> {
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         super::metadata::resize_file(self, len, lock_owner, data)
     }
 
@@ -724,7 +734,7 @@ impl IndexNode for OvlInode {
         lock_owner: u64,
         metadata: &Metadata,
         mask: SetMetadataMask,
-    ) -> Result<(), SystemError> {
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         super::metadata::resize_with_metadata(self, len, lock_owner, metadata, mask)
     }
 
@@ -735,7 +745,7 @@ impl IndexNode for OvlInode {
         data: crate::libs::mutex::MutexGuard<vfs::FilePrivateData>,
         metadata: &Metadata,
         mask: SetMetadataMask,
-    ) -> Result<(), SystemError> {
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         super::metadata::resize_file_with_metadata(self, len, lock_owner, data, metadata, mask)
     }
 
@@ -745,7 +755,7 @@ impl IndexNode for OvlInode {
         lock_owner: u64,
         data: crate::libs::mutex::MutexGuard<vfs::FilePrivateData>,
         context: &vfs::OpenTruncateContext,
-    ) -> Result<(), SystemError> {
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         // Linux overlayfs clears ATTR_FILE/ATTR_OPEN before forwarding setattr
         // to the upper inode. The outer open file therefore must not leak its
         // backing file handle into an upper FUSE SETATTR request.
@@ -763,7 +773,12 @@ impl IndexNode for OvlInode {
         super::metadata::getxattr(self, name, buf)
     }
 
-    fn setxattr(&self, name: &str, value: &[u8], flags: XattrFlags) -> Result<usize, SystemError> {
+    fn setxattr(
+        &self,
+        name: &str,
+        value: &[u8],
+        flags: XattrFlags,
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
         super::metadata::setxattr(self, name, value, flags)
     }
 
@@ -771,11 +786,16 @@ impl IndexNode for OvlInode {
         super::metadata::listxattr(self, buf)
     }
 
-    fn removexattr(&self, name: &str) -> Result<usize, SystemError> {
+    fn removexattr(
+        &self,
+        name: &str,
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
         super::metadata::removexattr(self, name)
     }
 
-    fn remove_security_privileges(&self) -> Result<(), SystemError> {
+    fn remove_security_privileges(
+        &self,
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         super::metadata::remove_security_privileges(self)
     }
 
@@ -819,11 +839,11 @@ impl IndexNode for OvlInode {
         &self,
         name: &str,
         mode: vfs::InodeMode,
-    ) -> Result<Arc<dyn IndexNode>, system_error::SystemError> {
+    ) -> Result<Arc<dyn IndexNode>, crate::mm::allocation::MemoryAllocationError> {
         dir::mkdir(self, name, mode)
     }
 
-    fn rmdir(&self, name: &str) -> Result<(), SystemError> {
+    fn rmdir(&self, name: &str) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         dir::rmdir(self, name)
     }
 
@@ -831,11 +851,14 @@ impl IndexNode for OvlInode {
         &self,
         name: &str,
         context: &vfs::mount::DentryMutationContext<'_>,
-    ) -> Result<(), SystemError> {
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         dir::rmdir_with_context(self, name, context)
     }
 
-    fn unlink(&self, name: &str) -> Result<vfs::LinkRemovalOutcome, SystemError> {
+    fn unlink(
+        &self,
+        name: &str,
+    ) -> Result<vfs::LinkRemovalOutcome, crate::mm::allocation::MemoryAllocationError> {
         dir::unlink(self, name)
     }
 
@@ -843,7 +866,7 @@ impl IndexNode for OvlInode {
         &self,
         name: &str,
         context: &vfs::mount::DentryMutationContext<'_>,
-    ) -> Result<vfs::LinkRemovalOutcome, SystemError> {
+    ) -> Result<vfs::LinkRemovalOutcome, crate::mm::allocation::MemoryAllocationError> {
         dir::unlink_with_context(self, name, context)
     }
 
@@ -851,7 +874,7 @@ impl IndexNode for OvlInode {
         &self,
         name: &str,
         other: &Arc<dyn IndexNode>,
-    ) -> Result<(), system_error::SystemError> {
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         dir::link(self, name, other)
     }
 
@@ -860,7 +883,7 @@ impl IndexNode for OvlInode {
         name: &str,
         file_type: vfs::FileType,
         mode: vfs::InodeMode,
-    ) -> Result<Arc<dyn IndexNode>, system_error::SystemError> {
+    ) -> Result<Arc<dyn IndexNode>, crate::mm::allocation::MemoryAllocationError> {
         dir::create(self, name, file_type, mode)
     }
 
@@ -868,7 +891,7 @@ impl IndexNode for OvlInode {
         &self,
         name: &str,
         target: &str,
-    ) -> Result<Arc<dyn IndexNode>, system_error::SystemError> {
+    ) -> Result<Arc<dyn IndexNode>, crate::mm::allocation::MemoryAllocationError> {
         dir::symlink(self, name, target)
     }
 
@@ -878,7 +901,7 @@ impl IndexNode for OvlInode {
         target: &Arc<dyn IndexNode>,
         new_name: &str,
         flags: RenameFlags,
-    ) -> Result<vfs::RenameOutcome, SystemError> {
+    ) -> Result<vfs::RenameOutcome, crate::mm::allocation::MemoryAllocationError> {
         rename::move_to(self, old_name, target, new_name, flags)
     }
 
@@ -889,7 +912,7 @@ impl IndexNode for OvlInode {
         new_name: &str,
         flags: RenameFlags,
         context: &vfs::mount::DentryMutationContext<'_>,
-    ) -> Result<vfs::RenameOutcome, SystemError> {
+    ) -> Result<vfs::RenameOutcome, crate::mm::allocation::MemoryAllocationError> {
         rename::move_to_with_context(self, old_name, target, new_name, flags, context)
     }
 
@@ -902,7 +925,7 @@ impl IndexNode for OvlInode {
         filename: &str,
         mode: vfs::InodeMode,
         dev_t: DeviceNumber,
-    ) -> Result<Arc<dyn IndexNode>, system_error::SystemError> {
+    ) -> Result<Arc<dyn IndexNode>, crate::mm::allocation::MemoryAllocationError> {
         dir::mknod(self, filename, mode, dev_t)
     }
 }

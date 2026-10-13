@@ -4,7 +4,6 @@ use alloc::{
     sync::Arc,
     vec::Vec,
 };
-use core::sync::atomic::Ordering;
 
 use hashbrown::{HashMap, HashSet};
 use system_error::SystemError;
@@ -39,7 +38,10 @@ pub(super) enum CgroupCoreFile {
     MemoryLow,
     MemoryHigh,
     MemoryMax,
+    MemoryOomGroup,
+    MemoryReclaim,
     MemoryEvents,
+    MemoryEventsLocal,
     MemoryStat,
     MemorySwapCurrent,
     MemorySwapPeak,
@@ -213,7 +215,7 @@ const CPUSET_FILE_SPECS: [CgroupFileSpec; 4] = [
     },
 ];
 
-const MEMORY_FILE_SPECS: [CgroupFileSpec; 13] = [
+const MEMORY_FILE_SPECS: [CgroupFileSpec; 16] = [
     CgroupFileSpec {
         name: "memory.current",
         ty: CgroupCoreFile::MemoryCurrent,
@@ -259,6 +261,27 @@ const MEMORY_FILE_SPECS: [CgroupFileSpec; 13] = [
     CgroupFileSpec {
         name: "memory.events",
         ty: CgroupCoreFile::MemoryEvents,
+        init: b"",
+        mode: 0o444,
+        visibility: CgroupFileVisibility::NotOnRoot,
+    },
+    CgroupFileSpec {
+        name: "memory.oom.group",
+        ty: CgroupCoreFile::MemoryOomGroup,
+        init: b"0\n",
+        mode: 0o644,
+        visibility: CgroupFileVisibility::NotOnRoot,
+    },
+    CgroupFileSpec {
+        name: "memory.reclaim",
+        ty: CgroupCoreFile::MemoryReclaim,
+        init: b"",
+        mode: 0o200,
+        visibility: CgroupFileVisibility::All,
+    },
+    CgroupFileSpec {
+        name: "memory.events.local",
+        ty: CgroupCoreFile::MemoryEventsLocal,
         init: b"",
         mode: 0o444,
         visibility: CgroupFileVisibility::NotOnRoot,
@@ -394,6 +417,59 @@ pub(super) fn read_file(
     if let CgroupCoreFile::Cpuset(file) = ty {
         return cpuset::read(cgroup, generation, file);
     }
+    if matches!(
+        ty,
+        CgroupCoreFile::MemoryCurrent
+            | CgroupCoreFile::MemoryPeak
+            | CgroupCoreFile::MemoryEvents
+            | CgroupCoreFile::MemoryEventsLocal
+            | CgroupCoreFile::MemoryStat
+            | CgroupCoreFile::MemoryMin
+            | CgroupCoreFile::MemoryLow
+            | CgroupCoreFile::MemoryHigh
+            | CgroupCoreFile::MemoryMax
+            | CgroupCoreFile::MemoryOomGroup
+    ) {
+        // Pin and sample the exact generation admitted by the file epoch.
+        // Formatting can allocate, so it must run outside UPDATE. A concurrent
+        // disable after this linearization point does not redirect the read.
+        let (snapshot, policy) = {
+            let _guard = crate::cgroup::lock();
+            check_live_file(cgroup, ty, file_generation)?;
+            let account = cgroup
+                .local_memory_generation()
+                .ok_or(SystemError::ENODEV)?
+                .account;
+            (account.snapshot(), account.policy())
+        };
+        return match ty {
+            CgroupCoreFile::MemoryCurrent => {
+                crate::cgroup::memory::stats::format_page_count(snapshot.current)
+            }
+            CgroupCoreFile::MemoryPeak => {
+                crate::cgroup::memory::stats::format_page_count(snapshot.peak)
+            }
+            CgroupCoreFile::MemoryEvents => {
+                crate::cgroup::memory::stats::format_events(&snapshot, false)
+            }
+            CgroupCoreFile::MemoryEventsLocal => {
+                crate::cgroup::memory::stats::format_events(&snapshot, true)
+            }
+            CgroupCoreFile::MemoryStat => crate::cgroup::memory::stats::format_stats(&snapshot),
+            CgroupCoreFile::MemoryMin => crate::cgroup::memory::stats::format_limit(
+                (policy.min != crate::cgroup::memory::abi::PAGE_COUNTER_MAX).then_some(policy.min),
+            ),
+            CgroupCoreFile::MemoryLow => crate::cgroup::memory::stats::format_limit(
+                (policy.low != crate::cgroup::memory::abi::PAGE_COUNTER_MAX).then_some(policy.low),
+            ),
+            CgroupCoreFile::MemoryHigh => crate::cgroup::memory::stats::format_limit(policy.high),
+            CgroupCoreFile::MemoryMax => crate::cgroup::memory::stats::format_limit(policy.max),
+            CgroupCoreFile::MemoryOomGroup => {
+                crate::cgroup::memory::stats::format_oom_group(policy.oom_group)
+            }
+            _ => unreachable!(),
+        };
+    }
     let _guard = crate::cgroup::lock();
     check_live_file(cgroup, ty, file_generation)?;
     Ok(match ty {
@@ -431,13 +507,17 @@ pub(super) fn read_file(
             let (quota, period) = cgroup.cpu_state().max();
             encode_cpu_max(quota, period)
         }
-        CgroupCoreFile::MemoryCurrent | CgroupCoreFile::MemoryPeak => b"0\n".to_vec(),
-        CgroupCoreFile::MemoryMin => encode_max_u64(cgroup.memory_state().min()),
-        CgroupCoreFile::MemoryLow => encode_max_u64(cgroup.memory_state().low()),
-        CgroupCoreFile::MemoryHigh => encode_max_u64(cgroup.memory_state().high()),
-        CgroupCoreFile::MemoryMax => encode_max_u64(cgroup.memory_state().max()),
-        CgroupCoreFile::MemoryEvents => memory_events(),
-        CgroupCoreFile::MemoryStat => memory_stat(),
+        CgroupCoreFile::MemoryCurrent
+        | CgroupCoreFile::MemoryPeak
+        | CgroupCoreFile::MemoryEvents
+        | CgroupCoreFile::MemoryEventsLocal
+        | CgroupCoreFile::MemoryStat
+        | CgroupCoreFile::MemoryMin
+        | CgroupCoreFile::MemoryLow
+        | CgroupCoreFile::MemoryHigh
+        | CgroupCoreFile::MemoryMax
+        | CgroupCoreFile::MemoryOomGroup => unreachable!(),
+        CgroupCoreFile::MemoryReclaim => return Err(SystemError::EBADF),
         CgroupCoreFile::MemorySwapCurrent | CgroupCoreFile::MemorySwapPeak => b"0\n".to_vec(),
         CgroupCoreFile::MemorySwapHigh => encode_max_u64(cgroup.memory_state().swap_high()),
         CgroupCoreFile::MemorySwapMax => encode_max_u64(cgroup.memory_state().swap_max()),
@@ -465,14 +545,31 @@ pub(super) fn write_controller_file_locked(
         if input.trim() != "threaded" {
             return Err(SystemError::EINVAL);
         }
-        let _accounting = crate::cgroup::cgroup_accounting_lock().lock();
-        let had_memory =
-            !cgroup.is_threaded() && available_controllers_for(cgroup).contains(&"memory");
-        crate::cgroup::threaded::enable_threaded(cgroup)?;
+        let had_memory = !cgroup.is_threaded() && cgroup.local_memory_generation().is_some();
+        let mut permissions = Vec::new();
+        let mut retired_permissions = Vec::new();
         if had_memory {
+            permissions
+                .try_reserve_exact(MEMORY_FILE_SPECS.len())
+                .map_err(|_| SystemError::ENOMEM)?;
+            retired_permissions
+                .try_reserve_exact(MEMORY_FILE_SPECS.len())
+                .map_err(|_| SystemError::ENOMEM)?;
             for spec in MEMORY_FILE_SPECS {
-                cgroup.reset_file_permissions(spec.name, spec.mode as u32);
+                permissions
+                    .push(cgroup.prepare_file_permission_reset(spec.name, spec.mode as u32)?);
             }
+        }
+        let retired = {
+            let _accounting = crate::cgroup::cgroup_accounting_lock().lock();
+            crate::cgroup::threaded::enable_threaded(cgroup)?;
+            for permission in permissions.drain(..) {
+                retired_permissions.push(cgroup.commit_file_permission_reset(permission));
+            }
+            cgroup.replace_memory_generation(None)
+        };
+        if let Some(generation) = retired {
+            generation.retire();
         }
         return Ok(Vec::new());
     }
@@ -519,18 +616,9 @@ pub(super) fn write_controller_file_locked(
             crate::cgroup::cpu::set_bandwidth_locked(cgroup, state)?;
             Ok(encode_cpu_max(quota, period))
         }
-        CgroupCoreFile::MemoryMin
-        | CgroupCoreFile::MemoryLow
-        | CgroupCoreFile::MemoryHigh
-        | CgroupCoreFile::MemoryMax
-        | CgroupCoreFile::MemorySwapHigh
-        | CgroupCoreFile::MemorySwapMax => {
+        CgroupCoreFile::MemorySwapHigh | CgroupCoreFile::MemorySwapMax => {
             let value = parse_max_u64(input)?;
             match ty {
-                CgroupCoreFile::MemoryMin => cgroup.set_memory_min(value),
-                CgroupCoreFile::MemoryLow => cgroup.set_memory_low(value),
-                CgroupCoreFile::MemoryHigh => cgroup.set_memory_high(value),
-                CgroupCoreFile::MemoryMax => cgroup.set_memory_max(value),
                 CgroupCoreFile::MemorySwapHigh => cgroup.set_memory_swap_high(value),
                 CgroupCoreFile::MemorySwapMax => cgroup.set_memory_swap_max(value),
                 _ => unreachable!(),
@@ -549,15 +637,22 @@ pub(super) fn write_controller_file_locked(
         | CgroupCoreFile::MemoryCurrent
         | CgroupCoreFile::MemoryPeak
         | CgroupCoreFile::MemoryEvents
+        | CgroupCoreFile::MemoryEventsLocal
         | CgroupCoreFile::MemoryStat
         | CgroupCoreFile::MemorySwapCurrent
         | CgroupCoreFile::MemorySwapPeak
         | CgroupCoreFile::MemorySwapEvents
         | CgroupCoreFile::PidsCurrent
         | CgroupCoreFile::PidsEvents => Err(SystemError::EPERM),
-        CgroupCoreFile::Procs | CgroupCoreFile::Threads | CgroupCoreFile::SubtreeControl => {
-            Err(SystemError::EINVAL)
-        }
+        CgroupCoreFile::MemoryMin
+        | CgroupCoreFile::MemoryLow
+        | CgroupCoreFile::MemoryHigh
+        | CgroupCoreFile::MemoryMax
+        | CgroupCoreFile::MemoryOomGroup
+        | CgroupCoreFile::MemoryReclaim
+        | CgroupCoreFile::Procs
+        | CgroupCoreFile::Threads
+        | CgroupCoreFile::SubtreeControl => Err(SystemError::EINVAL),
     }
 }
 
@@ -569,14 +664,41 @@ pub(super) fn check_live_file(
     if !crate::cgroup::cgroup_root().is_online(cgroup) {
         return Err(SystemError::ENODEV);
     }
-    let spec = desired_file_specs(cgroup)
-        .into_iter()
-        .find(|spec| spec.ty == ty)
-        .ok_or(SystemError::ENODEV)?;
+    let spec = live_file_spec(cgroup, ty).ok_or(SystemError::ENODEV)?;
     if cgroup.file_generation(spec.name) != generation {
         return Err(SystemError::ENODEV);
     }
     Ok(())
+}
+
+/// Validate one static file without allocating a complete directory snapshot
+/// under UPDATE. Keep availability identical to desired_file_specs().
+fn live_file_spec(cgroup: &Arc<CgroupNode>, ty: CgroupCoreFile) -> Option<CgroupFileSpec> {
+    if let Some(spec) = BASE_FILE_SPECS
+        .iter()
+        .chain(NON_ROOT_CORE_FILE_SPECS.iter())
+        .find(|spec| spec.ty == ty)
+    {
+        return spec.visible_on(cgroup).then_some(*spec);
+    }
+    for controller in AVAILABLE_CONTROLLERS {
+        let Some(spec) = controller_specs(controller)
+            .iter()
+            .find(|spec| spec.ty == ty)
+        else {
+            continue;
+        };
+        let available = match cgroup.parent() {
+            None => true,
+            Some(parent) => {
+                parent.subtree_controller_enabled(controller)
+                    && (!cgroup.is_threaded()
+                        || crate::cgroup::threaded::is_threaded_controller(controller))
+            }
+        };
+        return (available && spec.visible_on(cgroup)).then_some(*spec);
+    }
+    None
 }
 
 /// Membership and PID identities share the accounting transaction with exec.
@@ -625,13 +747,16 @@ fn membership_list(cgroup: &Arc<CgroupNode>, processes: bool) -> Result<Vec<u8>,
     Ok(lines.into_bytes())
 }
 
-pub(super) fn apply_subtree_control(
+fn validated_subtree_control(
     cgroup: &Arc<CgroupNode>,
     input: &str,
-) -> Result<Vec<u8>, SystemError> {
+) -> Result<(HashSet<String>, HashSet<String>), SystemError> {
     let ops = fold_subtree_control_ops(input)?;
-    let mut enabled: HashSet<String> = cgroup.subtree_control().into_iter().collect();
-    let old_enabled = enabled.clone();
+    let mut enabled = cgroup.subtree_control_snapshot()?;
+    let old_enabled = clone_controller_set(&enabled)?;
+    enabled
+        .try_reserve(ops.len())
+        .map_err(|_| SystemError::ENOMEM)?;
 
     for (name, is_enable) in ops {
         if is_enable {
@@ -644,8 +769,8 @@ pub(super) fn apply_subtree_control(
             if !enabled.contains(&name) {
                 continue;
             }
-            for child in cgroup.children() {
-                if child.subtree_control().iter().any(|ctrl| ctrl == &name) {
+            for child in cgroup.children_snapshot()? {
+                if child.subtree_controller_enabled(&name) {
                     return Err(SystemError::EBUSY);
                 }
             }
@@ -653,14 +778,13 @@ pub(super) fn apply_subtree_control(
         }
     }
 
-    let newly_enabled: Vec<_> = enabled.difference(&old_enabled).collect();
-    if !newly_enabled.is_empty() {
+    if enabled.difference(&old_enabled).next().is_some() {
         if !cgroup.resource_domain().is_valid_domain() {
             return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
         }
         if cgroup.parent().is_some() {
-            let domain_enable = newly_enabled
-                .iter()
+            let domain_enable = enabled
+                .difference(&old_enabled)
                 .any(|name| DOMAIN_CONTROLLERS.contains(&name.as_str()));
             if domain_enable && (cgroup.is_thread_root() || cgroup.is_threaded()) {
                 return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
@@ -672,6 +796,14 @@ pub(super) fn apply_subtree_control(
             }
         }
     }
+    Ok((old_enabled, enabled))
+}
+
+pub(super) fn apply_subtree_control(
+    cgroup: &Arc<CgroupNode>,
+    input: &str,
+) -> Result<Vec<u8>, SystemError> {
+    let (old_enabled, enabled) = validated_subtree_control(cgroup, input)?;
     // Controller instances have independent lifetimes. Reset their state and
     // inode identity at the topology transaction, not at a mount's lazy lookup.
     for name in old_enabled.symmetric_difference(&enabled) {
@@ -688,9 +820,187 @@ pub(super) fn apply_subtree_control(
     Ok(encode_controller_list(&out))
 }
 
+struct PreparedMemoryChild {
+    node: Arc<CgroupNode>,
+    generation: Option<crate::cgroup::core::MemoryGeneration>,
+    object: Option<crate::cgroup::memory::object::PreparedObjectAccount>,
+    permissions: Vec<crate::cgroup::core::PreparedFilePermission>,
+}
+
+pub(super) struct PreparedSubtreeControl {
+    enabled: HashSet<String>,
+    changed: Vec<String>,
+    children: Vec<PreparedMemoryChild>,
+    retired: Vec<crate::cgroup::core::MemoryGeneration>,
+    retired_permissions: Vec<crate::cgroup::core::PreparedFilePermission>,
+    retired_enabled: Option<HashSet<String>>,
+    data: Vec<u8>,
+    memory_changed: bool,
+    cpu: Option<crate::cgroup::cpu::PreparedCpuControl>,
+}
+
+/// All resource/metadata preparation occurs outside the accounting spinlock.
+pub(super) fn prepare_subtree_control(
+    node: &Arc<CgroupNode>,
+    input: &str,
+) -> Result<Option<PreparedSubtreeControl>, SystemError> {
+    let (old, enabled) = validated_subtree_control(node, input)?;
+    let memory_changed = old.contains("memory") != enabled.contains("memory");
+    let cpu_changed = old.contains("cpu") != enabled.contains("cpu");
+    if !memory_changed && !cpu_changed {
+        return Ok(None);
+    }
+    let mut changed = Vec::new();
+    changed
+        .try_reserve_exact(old.len() + enabled.len())
+        .map_err(|_| SystemError::ENOMEM)?;
+    for name in old.symmetric_difference(&enabled) {
+        changed.push(copy_controller_name(name)?);
+    }
+    let nodes = node.children_snapshot()?;
+    let permission_count: usize = changed
+        .iter()
+        .map(|name| controller_specs(name).len())
+        .sum();
+    let mut children = Vec::new();
+    children
+        .try_reserve_exact(nodes.len())
+        .map_err(|_| SystemError::ENOMEM)?;
+    let mut retired = Vec::new();
+    retired
+        .try_reserve_exact(nodes.len())
+        .map_err(|_| SystemError::ENOMEM)?;
+    let mut retired_permissions = Vec::new();
+    let total_permissions = nodes
+        .len()
+        .checked_mul(permission_count)
+        .ok_or(SystemError::EOVERFLOW)?;
+    retired_permissions
+        .try_reserve_exact(total_permissions)
+        .map_err(|_| SystemError::ENOMEM)?;
+    let parent = node.memory_account();
+    for child in nodes {
+        let (generation, object) = if memory_changed
+            && enabled.contains("memory")
+            && !child.is_threaded()
+        {
+            let (generation, object) =
+                crate::cgroup::core::MemoryGeneration::prepare(child.id(), Some(parent.clone()))?;
+            (Some(generation), Some(object))
+        } else {
+            (None, None)
+        };
+        let mut permissions = Vec::new();
+        permissions
+            .try_reserve_exact(permission_count)
+            .map_err(|_| SystemError::ENOMEM)?;
+        for name in &changed {
+            for spec in controller_specs(name) {
+                permissions.push(child.prepare_file_permission_reset(spec.name, spec.mode as u32)?);
+            }
+        }
+        children.push(PreparedMemoryChild {
+            node: child,
+            generation,
+            object,
+            permissions,
+        });
+    }
+    let mut names = Vec::new();
+    names
+        .try_reserve_exact(enabled.len())
+        .map_err(|_| SystemError::ENOMEM)?;
+    for name in &enabled {
+        names.push(name.as_str());
+    }
+    names.sort();
+    let length = names
+        .iter()
+        .try_fold(1usize, |size, name| size.checked_add(name.len() + 1))
+        .ok_or(SystemError::EOVERFLOW)?;
+    let mut data = Vec::new();
+    data.try_reserve_exact(length)
+        .map_err(|_| SystemError::ENOMEM)?;
+    for (index, name) in names.into_iter().enumerate() {
+        if index != 0 {
+            data.push(b' ');
+        }
+        data.extend_from_slice(name.as_bytes());
+    }
+    data.push(b'\n');
+    let cpu = if cpu_changed {
+        Some(crate::cgroup::cpu::prepare_control_locked(
+            node,
+            enabled.contains("cpu"),
+        )?)
+    } else {
+        None
+    };
+    Ok(Some(PreparedSubtreeControl {
+        enabled,
+        changed,
+        children,
+        retired,
+        retired_permissions,
+        retired_enabled: None,
+        data,
+        memory_changed,
+        cpu,
+    }))
+}
+
+impl PreparedSubtreeControl {
+    /// Caller holds UPDATE_LOCK and accounting lock; only prepared moves.
+    pub(super) fn commit(&mut self, node: &Arc<CgroupNode>) {
+        for child in &mut self.children {
+            for name in &self.changed {
+                child.node.reset_controller(name);
+            }
+            for permission in child.permissions.drain(..) {
+                self.retired_permissions
+                    .push(child.node.commit_file_permission_reset(permission));
+            }
+            if self.memory_changed {
+                if let Some(old) = child
+                    .node
+                    .replace_memory_generation(child.generation.take())
+                {
+                    self.retired.push(old);
+                }
+            }
+        }
+        self.retired_enabled =
+            Some(node.replace_subtree_control(core::mem::take(&mut self.enabled)));
+    }
+
+    /// Accounting/structure/inode locks are released; UPDATE_LOCK still held.
+    pub(super) fn finish(
+        self,
+        node: &Arc<CgroupNode>,
+        tasks: &[Arc<crate::process::ProcessControlBlock>],
+    ) -> Vec<u8> {
+        for generation in &self.retired {
+            generation.retire();
+        }
+        for child in self.children {
+            if let Some(object) = child.object {
+                object.publish();
+            }
+        }
+        if let Some(cpu) = self.cpu {
+            crate::cgroup::cpu::controller_changed_locked(node, tasks, cpu);
+        }
+        self.data
+    }
+}
+
 fn validate_enable_controller(cgroup: &Arc<CgroupNode>, name: &str) -> Result<(), SystemError> {
-    let available = available_controllers_for(cgroup);
-    if !available.contains(&name) {
+    if !is_known_controller(name)
+        || cgroup.parent().is_some_and(|parent| {
+            !parent.subtree_controller_enabled(name)
+                || (cgroup.is_threaded() && !crate::cgroup::threaded::is_threaded_controller(name))
+        })
+    {
         return Err(SystemError::ENOENT);
     }
 
@@ -704,6 +1014,8 @@ fn parse_subtree_control_ops(input: &str) -> Result<Vec<(bool, &str)>, SystemErr
     }
 
     let mut ops = Vec::new();
+    ops.try_reserve_exact(trimmed.split_whitespace().count())
+        .map_err(|_| SystemError::ENOMEM)?;
     for token in trimmed.split_whitespace() {
         let mut chars = token.chars();
         let op = chars.next().ok_or(SystemError::EINVAL)?;
@@ -723,13 +1035,35 @@ fn parse_subtree_control_ops(input: &str) -> Result<Vec<(bool, &str)>, SystemErr
 
 fn fold_subtree_control_ops(input: &str) -> Result<HashMap<String, bool>, SystemError> {
     let mut folded = HashMap::new();
-    for (enable, name) in parse_subtree_control_ops(input)? {
+    let ops = parse_subtree_control_ops(input)?;
+    folded
+        .try_reserve(ops.len())
+        .map_err(|_| SystemError::ENOMEM)?;
+    for (enable, name) in ops {
         if !is_known_controller(name) {
             return Err(SystemError::EINVAL);
         }
-        folded.insert(name.to_string(), enable);
+        folded.insert(copy_controller_name(name)?, enable);
     }
     Ok(folded)
+}
+
+fn copy_controller_name(name: &str) -> Result<String, SystemError> {
+    let mut copy = String::new();
+    copy.try_reserve_exact(name.len())
+        .map_err(|_| SystemError::ENOMEM)?;
+    copy.push_str(name);
+    Ok(copy)
+}
+
+fn clone_controller_set(source: &HashSet<String>) -> Result<HashSet<String>, SystemError> {
+    let mut copy = HashSet::new();
+    copy.try_reserve(source.len())
+        .map_err(|_| SystemError::ENOMEM)?;
+    for name in source {
+        copy.insert(copy_controller_name(name)?);
+    }
+    Ok(copy)
 }
 
 fn encode_controller_list(items: &[String]) -> Vec<u8> {
@@ -885,23 +1219,12 @@ fn cpu_stat_local(cgroup: &Arc<CgroupNode>) -> Vec<u8> {
     }
 }
 
-fn memory_events() -> Vec<u8> {
-    b"low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n".to_vec()
-}
-
-fn memory_stat() -> Vec<u8> {
-    // P1 keeps memory controller knobs as compat state only. The keys
-    // mirror common Linux v2 memory.stat names while all counters stay 0.
-    b"anon 0\nfile 0\nkernel_stack 0\npagetables 0\npercpu 0\nsock 0\nshmem 0\nfile_mapped 0\nfile_dirty 0\nfile_writeback 0\nswapcached 0\nanon_thp 0\nfile_thp 0\nshmem_thp 0\ninactive_anon 0\nactive_anon 0\ninactive_file 0\nactive_file 0\nunevictable 0\nslab_reclaimable 0\nslab_unreclaimable 0\nslab 0\nworkingset_refault_anon 0\nworkingset_refault_file 0\nworkingset_activate_anon 0\nworkingset_activate_file 0\nworkingset_restore_anon 0\nworkingset_restore_file 0\nworkingset_nodereclaim 0\npgfault 0\npgmajfault 0\npgrefill 0\npgscan 0\npgsteal 0\npgactivate 0\npgdeactivate 0\npglazyfree 0\npglazyfreed 0\nthp_fault_alloc 0\nthp_collapse_alloc 0\n"
-        .to_vec()
-}
-
 fn memory_swap_events() -> Vec<u8> {
     b"high 0\nmax 0\nfail 0\n".to_vec()
 }
 
 fn is_populated(cgroup: &Arc<CgroupNode>) -> bool {
-    cgroup.has_tasks() || cgroup.subtree_task_counter().load(Ordering::Acquire) > 0
+    cgroup.is_populated()
 }
 
 #[cfg(test)]

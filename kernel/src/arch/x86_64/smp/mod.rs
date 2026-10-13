@@ -220,12 +220,21 @@ impl SMPArch for X86_64SMPArch {
 
     fn post_init() -> Result<(), SystemError> {
         // AP核心启动完毕，取消低地址映射
-        unsafe {
-            LowAddressRemapping::unmap_at_low_address(
-                &mut IDLE_PROCESS_ADDRESS_SPACE().write().user_mapper.utable,
-                true,
-            )
+        let mm = IDLE_PROCESS_ADDRESS_SPACE();
+        let mut gather = crate::mm::mmu_gather::MmuGather::gather_all_online();
+        {
+            let mut inner = mm.write();
+            let _pt_edit = mm.page_table_edit();
+            unsafe {
+                LowAddressRemapping::unmap_at_low_address(
+                    &mut inner.user_mapper.utable,
+                    &mut gather,
+                );
+            }
         }
+        // AP startup loads this CR3 directly. Do not rely on active_cpus or
+        // loaded-mm tracking, and never wait for remote CPUs under MM locks.
+        gather.finish();
         return Ok(());
     }
 

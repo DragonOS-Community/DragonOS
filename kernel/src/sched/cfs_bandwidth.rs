@@ -72,16 +72,10 @@ fn remaining_runtime(task: &Arc<ProcessControlBlock>) -> Option<i64> {
 /// task. Caller holds rq and passes the next task when rq.current is still old.
 pub(crate) fn refresh_runtime_event(rq: &mut CpuRunQueue, task: &Arc<ProcessControlBlock>) {
     let remaining = remaining_runtime(task);
-    let mut slot = RUNTIME_EVENTS[rq.cpu().data() as usize].lock_irqsave();
-    if remaining.is_some() && slot.is_none() {
-        *slot = Some(DeadlineEvent::new(
-            rq.cpu(),
-            Arc::new(RuntimeDeadline { cpu: rq.cpu() }),
-        ));
-    }
-    let Some(event) = slot.as_ref() else {
-        return;
-    };
+    let slot = RUNTIME_EVENTS[rq.cpu().data() as usize].lock_irqsave();
+    let event = slot
+        .as_ref()
+        .expect("runtime deadline events not initialized");
     match remaining {
         Some(remaining) if remaining > 0 => {
             let _ = event.arm(deadline::now_ns().saturating_add(remaining as u64));
@@ -91,6 +85,18 @@ pub(crate) fn refresh_runtime_event(rq: &mut CpuRunQueue, task: &Arc<ProcessCont
             rq.resched_current();
         }
         None => event.cancel(),
+    }
+}
+
+/// Boot preparation precedes process/IRQ startup. No event is created lazily
+/// while holding rq, and arm/cancel only move its preallocated queue node.
+pub(crate) fn init_runtime_events() {
+    for (cpu, runtime_event) in RUNTIME_EVENTS.iter().enumerate() {
+        let owner = ProcessorId::new(cpu as u32);
+        let event = DeadlineEvent::new(owner, Arc::new(RuntimeDeadline { cpu: owner }));
+        let mut slot = runtime_event.lock_irqsave();
+        assert!(slot.is_none(), "runtime deadline events initialized twice");
+        *slot = Some(event);
     }
 }
 
@@ -160,23 +166,23 @@ impl DeadlineCallback for Refill {
 }
 
 impl CfsBandwidth {
-    pub(crate) fn new(group: Weak<TaskGroup>) -> Arc<Self> {
+    pub(crate) fn try_new(group: Weak<TaskGroup>) -> Result<Arc<Self>, core::alloc::AllocError> {
         let owner = smp_get_processor_id();
-        Arc::new(Self {
-            period_event: DeadlineEvent::new(
+        Arc::try_new(Self {
+            period_event: DeadlineEvent::try_new(
                 owner,
-                Arc::new(Refill {
+                Arc::try_new(Refill {
                     group: group.clone(),
                     slack: false,
-                }),
-            ),
-            slack_event: DeadlineEvent::new(
+                })?,
+            )?,
+            slack_event: DeadlineEvent::try_new(
                 owner,
-                Arc::new(Refill {
+                Arc::try_new(Refill {
                     group: group.clone(),
                     slack: true,
-                }),
-            ),
+                })?,
+            )?,
             group,
             budget: SpinLock::new(Budget {
                 quota: None,

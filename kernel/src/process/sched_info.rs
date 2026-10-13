@@ -1,6 +1,6 @@
 use core::sync::atomic::{fence, AtomicBool, AtomicI32, AtomicU32, AtomicU8, Ordering};
 
-use alloc::sync::Arc;
+use alloc::{boxed::Box, sync::Arc};
 use system_error::SystemError;
 
 use crate::{
@@ -57,6 +57,9 @@ pub struct ProcessSchedulerInfo {
     sched_class: AtomicU8,
     /// CFS scheduling entity.
     pub sched_entity: Arc<FairSchedEntity>,
+    /// A task owns its empty RT node while detached. The owning runqueue
+    /// consumes it while queued, even when the task initially uses Fair.
+    rt_node: SpinLock<Option<Box<crate::sched::realtime::RtQueueNode>>>,
     pub on_rq: SpinLock<OnRq>,
     placement: SpinLock<NewTaskPlacement>,
     /// Effective CPU controller css. None uses the boot-safe root CFS rq.
@@ -126,23 +129,36 @@ impl PiProtected {
 }
 
 impl ProcessSchedulerInfo {
-    fn default_cpus_allowed() -> CpuMask {
+    fn default_cpus_allowed() -> Result<CpuMask, SystemError> {
         if crate::smp::cpu::smp_cpu_manager_initialized() {
-            return crate::smp::cpu::smp_cpu_manager().possible_cpus().clone();
+            return crate::smp::cpu::smp_cpu_manager()
+                .possible_cpus()
+                .try_clone()
+                .map_err(|_| SystemError::ENOMEM);
         }
 
         // Process management initialization happens before SMP topology
         // initialization. Fall back to “runnable on the current boot CPU” here,
         // and converge to a more precise mask later during explicit
         // initialization (e.g. idle/per-cpu kthread).
-        CpuMask::from_cpu(current_cpu_id())
+        CpuMask::try_from_cpu(current_cpu_id()).map_err(|_| SystemError::ENOMEM)
     }
 
     #[inline(never)]
     pub fn new(on_cpu: Option<ProcessorId>, initial_class: SchedClass) -> Self {
+        Self::try_new(on_cpu, initial_class).expect("bootstrap scheduler preparation failed")
+    }
+
+    pub fn try_new(
+        on_cpu: Option<ProcessorId>,
+        initial_class: SchedClass,
+    ) -> Result<Self, SystemError> {
         let cpu_id = on_cpu.unwrap_or(ProcessorId::INVALID);
-        let cpus_allowed = Self::default_cpus_allowed();
-        return Self {
+        let cpus_allowed = Self::default_cpus_allowed()?;
+        let sched_entity = FairSchedEntity::try_new().map_err(|_| SystemError::ENOMEM)?;
+        let rt_node =
+            crate::sched::realtime::RtQueueNode::try_new().map_err(|_| SystemError::ENOMEM)?;
+        Ok(Self {
             on_cpu: AtomicProcessorId::new(cpu_id),
             running: AtomicBool::new(false),
             migrate_to: AtomicProcessorId::new(ProcessorId::INVALID),
@@ -154,7 +170,8 @@ impl ProcessSchedulerInfo {
             sched_stat: RwLock::new(SchedInfo::default()),
             sched_policy: AtomicU8::new(LinuxSchedPolicy::Normal.to_u8()),
             sched_class: AtomicU8::new(initial_class.to_u8()),
-            sched_entity: FairSchedEntity::new(),
+            sched_entity,
+            rt_node: SpinLock::new(Some(rt_node)),
             on_rq: SpinLock::new(OnRq::None),
             placement: SpinLock::new(NewTaskPlacement::default()),
             cpu_group: SpinLock::new(None),
@@ -164,7 +181,22 @@ impl ProcessSchedulerInfo {
             prio: AtomicI32::new(DEFAULT_PRIO),
             static_prio: AtomicI32::new(DEFAULT_PRIO),
             normal_prio: AtomicI32::new(DEFAULT_PRIO),
-        };
+        })
+    }
+
+    /// Owner rq serializes all transfers; the spare lock is never held while
+    /// accessing a runqueue or dropping a queued task payload.
+    pub(crate) fn take_rt_node(&self) -> Box<crate::sched::realtime::RtQueueNode> {
+        self.rt_node
+            .lock_irqsave()
+            .take()
+            .expect("queued RT task has no spare node")
+    }
+
+    pub(crate) fn return_rt_node(&self, node: Box<crate::sched::realtime::RtQueueNode>) {
+        let mut spare = self.rt_node.lock_irqsave();
+        assert!(spare.is_none(), "duplicate RT spare node");
+        *spare = Some(node);
     }
 
     pub fn sched_entity(&self) -> Arc<FairSchedEntity> {
@@ -248,19 +280,19 @@ impl ProcessSchedulerInfo {
     }
 
     /// # Parameters
-    /// - `allowed`: The caller must pre-read cpus_allowed under pi_lock
-    ///   protection and pass it in to avoid re-entering pi_lock.
+    /// - `allowed`: Borrow cpus_allowed from the caller's held pi_lock. This
+    ///   avoids both re-entering pi_lock and allocating a mask on the wake path.
     pub fn consume_new_task_target_cpu(
         &self,
         current_cpu: ProcessorId,
-        allowed: CpuMask,
+        allowed: &CpuMask,
         default_selector: impl FnOnce(&CpuMask) -> Option<ProcessorId>,
     ) -> Result<ProcessorId, SystemError> {
         let mut placement = self.placement.lock_irqsave();
         if !placement.is_new_task {
             return Err(SystemError::EINVAL);
         }
-        let selected_cpu = default_selector(&allowed).filter(|&cpu| {
+        let selected_cpu = default_selector(allowed).filter(|&cpu| {
             allowed.get(cpu).unwrap_or(false)
                 && (!crate::smp::cpu::smp_cpu_manager_initialized() || cpu_is_online(cpu))
         });

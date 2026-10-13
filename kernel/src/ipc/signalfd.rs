@@ -242,8 +242,9 @@ impl IndexNode for SignalFdInode {
         &self,
         _data: MutexGuard<FilePrivateData>,
         _flags: &FileFlags,
-    ) -> Result<(), SystemError> {
-        Ok(())
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = Ok(());
+        result.map_err(Into::into)
     }
 
     fn close(&self, _data: MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
@@ -256,36 +257,39 @@ impl IndexNode for SignalFdInode {
         len: usize,
         buf: &mut [u8],
         data_guard: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError> {
-        // 释放 FilePrivateData 锁，避免在阻塞时持有锁导致 panic
-        drop(data_guard);
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = (|| {
+            // 释放 FilePrivateData 锁，避免在阻塞时持有锁导致 panic
+            drop(data_guard);
 
-        if len < size_of::<SignalFdSigInfo>() {
-            return Err(SystemError::EINVAL);
-        }
-
-        loop {
-            if let Some(siginfo) = self.dequeue_one() {
-                let info = SignalFdSigInfo::from_siginfo(&siginfo);
-                buf[0..size_of::<SignalFdSigInfo>()].copy_from_slice(&info.bytes);
-                return Ok(size_of::<SignalFdSigInfo>());
+            if len < size_of::<SignalFdSigInfo>() {
+                return Err(SystemError::EINVAL);
             }
 
-            let state_guard = self.state.lock_irqsave();
-            if self.nonblock(&state_guard) {
-                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-            }
-            drop(state_guard);
+            loop {
+                if let Some(siginfo) = self.dequeue_one() {
+                    let info = SignalFdSigInfo::from_siginfo(&siginfo);
+                    buf[0..size_of::<SignalFdSigInfo>()].copy_from_slice(&info.bytes);
+                    return Ok(size_of::<SignalFdSigInfo>());
+                }
 
-            // 阻塞等待：在 sighand 的共享 signalfd_wqh 上睡眠。
-            // 信号投递路径（含 hardirq）通过 signalfd_wqh.wakeup_all() 唤醒。
-            let pcb = ProcessManager::current_pcb();
-            let sighand = pcb.sighand();
-            let r = wq_wait_event_interruptible!(sighand.signalfd_wqh(), self.readable(), {});
-            if r.is_err() {
-                return Err(SystemError::ERESTARTSYS);
+                let state_guard = self.state.lock_irqsave();
+                if self.nonblock(&state_guard) {
+                    return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+                }
+                drop(state_guard);
+
+                // 阻塞等待：在 sighand 的共享 signalfd_wqh 上睡眠。
+                // 信号投递路径（含 hardirq）通过 signalfd_wqh.wakeup_all() 唤醒。
+                let pcb = ProcessManager::current_pcb();
+                let sighand = pcb.sighand();
+                let r = wq_wait_event_interruptible!(sighand.signalfd_wqh(), self.readable(), {});
+                if r.is_err() {
+                    return Err(SystemError::ERESTARTSYS);
+                }
             }
-        }
+        })();
+        result.map_err(Into::into)
     }
 
     fn write_at(
@@ -294,8 +298,9 @@ impl IndexNode for SignalFdInode {
         _len: usize,
         _buf: &[u8],
         _data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError> {
-        Err(SystemError::EINVAL)
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = Err(SystemError::EINVAL);
+        result.map_err(Into::into)
     }
 
     fn fs(&self) -> Arc<dyn FileSystem> {

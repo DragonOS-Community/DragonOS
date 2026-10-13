@@ -166,7 +166,41 @@ impl Drop for Identity {
 #[derive(Debug, Clone)]
 pub struct TcpPortOwner(Arc<Identity>);
 
+/// A passive child identity and its final FD device metadata, physically
+/// prepared before the listener's accept transaction. This does not claim the
+/// child or change its listener/protocol membership.
+#[derive(Debug)]
+pub(crate) struct PreparedTcpAcceptBinding {
+    pub owner: TcpPortOwner,
+    pub device: Arc<SocketDeviceBinding>,
+    pub id: u64,
+}
+
 impl TcpPortOwner {
+    /// Prepare one private passive-open child in task context. The caller must
+    /// revalidate this parent identity before publishing its protocol slot.
+    pub(crate) fn prepare_child(
+        &self,
+        port: u16,
+        device: Arc<SocketDeviceBinding>,
+    ) -> Result<Arc<dyn LifecycleObserver>, SystemError> {
+        let manager = &self.0.manager;
+        let owner = manager.new_owner(device);
+        {
+            let mut table = manager.bindings.lock();
+            table
+                .ports
+                .entry(port)
+                .or_default()
+                .try_reserve(1)
+                .map_err(|_| SystemError::ENOMEM)?;
+            let binding = table.owners.get_mut(&owner.0.id).unwrap();
+            binding.port = port;
+            binding.parent = Some(self.0.id);
+            table.ports.get_mut(&port).unwrap().insert(owner.0.id);
+        }
+        Ok(owner.0.observer())
+    }
     pub fn device_binding(&self) -> Arc<SocketDeviceBinding> {
         self.0.manager.bindings.lock().owners[&self.0.id]
             .device
@@ -254,22 +288,7 @@ impl TcpPortReservation {
         &self,
         device: Arc<SocketDeviceBinding>,
     ) -> Result<Arc<dyn LifecycleObserver>, SystemError> {
-        let manager = &self.identity.manager;
-        let owner = manager.new_owner(device);
-        {
-            let mut table = manager.bindings.lock();
-            table
-                .ports
-                .entry(self.port)
-                .or_default()
-                .try_reserve(1)
-                .map_err(|_| SystemError::ENOMEM)?;
-            let binding = table.owners.get_mut(&owner.0.id).unwrap();
-            binding.port = self.port;
-            binding.parent = Some(self.id);
-            table.ports.get_mut(&self.port).unwrap().insert(owner.0.id);
-        }
-        Ok(owner.0.observer())
+        self.owner().prepare_child(self.port, device)
     }
 
     pub fn promote_listener(&self) -> Result<ListenPromotion, SystemError> {
@@ -495,6 +514,76 @@ impl LifecycleObserver for PortObserver {
 }
 
 impl PortManager {
+    pub(crate) fn prepare_accept_binding(
+        &self,
+        id: u64,
+    ) -> Result<PreparedTcpAcceptBinding, SystemError> {
+        let (owner, device) = {
+            let table = self.bindings.lock();
+            let entry = table.owners.get(&id).ok_or(SystemError::EINVAL)?;
+            if entry.fd_bound
+                || entry.parent.is_none()
+                || !matches!(entry.protocol, Some(State::Established | State::CloseWait))
+            {
+                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+            }
+            (
+                TcpPortOwner(entry.identity.upgrade().ok_or(SystemError::EINVAL)?),
+                entry.protocol_device,
+            )
+        };
+        let device = Arc::try_new(SocketDeviceBinding::from_ifindex(device as usize))
+            .map_err(|_| SystemError::ENOMEM)?;
+        Ok(PreparedTcpAcceptBinding { owner, device, id })
+    }
+
+    /// Claim the same prepared child without allocating device metadata.
+    /// Return the replaced device reference for retirement after resource
+    /// guards; a failed claim leaves both the preparation and binding intact.
+    pub(crate) fn claim_fd_prepared<F>(
+        &self,
+        prepared: &PreparedTcpAcceptBinding,
+        transfer_stock: F,
+    ) -> Result<
+        (TcpPortReservation, Arc<SocketDeviceBinding>),
+        crate::mm::allocation::MemoryAllocationError,
+    >
+    where
+        F: FnOnce() -> Result<(), crate::cgroup::memory::ChargeFailure>,
+    {
+        let mut table = self.bindings.lock();
+        let entry = table
+            .owners
+            .get_mut(&prepared.id)
+            .ok_or(SystemError::EINVAL)?;
+        if entry.fd_bound
+            || entry.parent.is_none()
+            || entry.protocol_device as usize != prepared.device.ifindex()
+            || !matches!(entry.protocol, Some(State::Established | State::CloseWait))
+            || !core::ptr::eq(entry.identity.as_ptr(), Arc::as_ptr(&prepared.owner.0))
+        {
+            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK.into());
+        }
+        // The sole production operation here is the fixed receipt batch's
+        // fast SockAccount::transfer_birth_receipts. It must not allocate,
+        // recover, or look up any port/observer: SocketSet -> bindings ->
+        // pointer-ordered SockState -> short account policy locks. Admission
+        // rejection leaves the FD identity and device entirely unchanged.
+        transfer_stock()?;
+        let retired_device = core::mem::replace(&mut entry.device, prepared.device.clone());
+        entry.fd_bound = true;
+        Ok((
+            TcpPortReservation {
+                identity: prepared.owner.0.clone(),
+                id: prepared.id,
+                port: entry.port,
+                domain: entry.domain.unwrap(),
+                locked_bind_domain: entry.port_locked.then_some(entry.domain.unwrap()),
+            },
+            retired_device,
+        ))
+    }
+
     pub fn new_owner(self: &Arc<Self>, device: Arc<SocketDeviceBinding>) -> TcpPortOwner {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let identity = Arc::new(Identity {
@@ -715,6 +804,65 @@ mod tests {
             Err(SystemError::EADDRINUSE)
         ));
         assert!(reserve(&owner(&manager, true)).is_ok());
+    }
+
+    #[test]
+    fn prepared_accept_quota_rejection_keeps_binding_and_stock_unchanged() {
+        use crate::cgroup::memory::socket::SockAccount;
+        use crate::cgroup::memory::{MemoryAccount, MemoryPolicy};
+        let manager = manager();
+        let parent = owner(&manager, false);
+        let listener = reserve(&parent).unwrap();
+        listener.promote_listener().unwrap().commit();
+        let child = listener
+            .prepare_child(Arc::new(SocketDeviceBinding::default()))
+            .unwrap();
+        assert!(child.prepare_open(local(40000), local(41000), 2, None));
+        child.on_state_change(
+            State::Established,
+            Some(local(40000)),
+            Some(local(41000)),
+            2,
+        );
+        let prepared = manager.prepare_accept_binding(child.identity()).unwrap();
+        let original_device = prepared.owner.device_binding();
+        let root = MemoryAccount::new(1, None).unwrap();
+        let old_account = MemoryAccount::new(2, Some(root.clone())).unwrap();
+        let target_account = MemoryAccount::new(3, Some(root.clone())).unwrap();
+        let old = Arc::new(SockAccount::prepare(&old_account).unwrap());
+        let target = Arc::new(SockAccount::prepare(&target_account).unwrap());
+        let mut receipt = old.try_charge(4096).unwrap();
+        target_account.set_policy(MemoryPolicy {
+            max: Some(0),
+            ..Default::default()
+        });
+        assert!(manager
+            .claim_fd_prepared(&prepared, || {
+                SockAccount::transfer_birth_receipts(&mut [&mut receipt], &target)
+            })
+            .is_err());
+        assert!(Arc::ptr_eq(
+            &original_device,
+            &prepared.owner.device_binding()
+        ));
+        assert!(!manager.bindings.lock().owners[&prepared.id].fd_bound);
+        assert_eq!(old_account.snapshot().sock, 1);
+        assert_eq!(target_account.snapshot().sock, 0);
+        assert_eq!(root.snapshot().sock, 1);
+        target_account.set_policy(MemoryPolicy::default());
+        let (accepted, retired_device) = manager
+            .claim_fd_prepared(&prepared, || {
+                SockAccount::transfer_birth_receipts(&mut [&mut receipt], &target)
+            })
+            .unwrap();
+        assert!(Arc::ptr_eq(&retired_device, &original_device));
+        assert_eq!(accepted.owner().device_binding().ifindex(), 2);
+        assert_eq!(old_account.snapshot().sock, 0);
+        assert_eq!(target_account.snapshot().sock, 1);
+        assert_eq!(root.snapshot().sock, 1);
+        drop(retired_device);
+        drop(receipt);
+        assert_eq!(root.snapshot().sock, 0);
     }
 
     #[test]

@@ -12,7 +12,7 @@ use crate::{
             idmap::MountIdmap,
             is_mountpoint_root, MountFSInode, MountFlags,
         },
-        IndexNode, MAX_PATHLEN,
+        MAX_PATHLEN,
     },
     libs::casting::DowncastArc,
     process::{

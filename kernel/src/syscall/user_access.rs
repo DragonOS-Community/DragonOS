@@ -8,11 +8,11 @@ use core::{
     sync::atomic::{compiler_fence, Ordering},
 };
 
-use alloc::{ffi::CString, vec::Vec};
+use alloc::{ffi::CString, sync::Arc, vec::Vec};
 
-#[cfg(target_arch = "riscv64")]
 use crate::mm::{
     fault::{FaultFlags, PageFaultHandler, PageFaultMessage},
+    page::{page_manager_lock, Page},
     ucontext::AddressSpace,
     VmFaultReason,
 };
@@ -65,17 +65,26 @@ fn check_user_access_range(addr: VirtAddr, len: usize, write: bool) -> Result<()
 }
 
 fn prefault_user_range(addr: VirtAddr, len: usize, write: bool) -> Result<(), SystemError> {
-    if MMArch::PAGE_FAULT_ENABLED || len == 0 {
+    prefault_user_range_mode(addr, len, write, None)
+}
+
+fn prefault_user_range_mode(
+    addr: VirtAddr,
+    len: usize,
+    write: bool,
+    mut prepared: Option<&mut PreparedUserWriteState>,
+) -> Result<(), SystemError> {
+    if len == 0 || (prepared.is_none() && MMArch::PAGE_FAULT_ENABLED) {
         return Ok(());
     }
 
     #[cfg(not(target_arch = "riscv64"))]
     {
-        let _ = (addr, write);
-        return Ok(());
+        if prepared.is_none() {
+            return Ok(());
+        }
     }
 
-    #[cfg(target_arch = "riscv64")]
     {
         let end = addr.data().checked_add(len).ok_or(SystemError::EFAULT)?;
         let start_page = VirtAddr::new(addr.data() & !MMArch::PAGE_OFFSET_MASK);
@@ -87,10 +96,18 @@ fn prefault_user_range(addr: VirtAddr, len: usize, write: bool) -> Result<(), Sy
             .ok_or(SystemError::EFAULT)?;
         let region = VirtRegion::new(start_page, region_len);
 
-        let mm = AddressSpace::current()?;
+        let mm = match prepared.as_ref() {
+            Some(state) => state.mm.clone(),
+            None => AddressSpace::current()?,
+        };
         let mut current = start_page;
         let mut retried = false;
+        let mut charge_recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
         'retry: loop {
+            let creator = crate::cgroup::memory::object_for_task(
+                &crate::process::ProcessManager::current_pcb(),
+            );
+            let data_account = mm.memory_account();
             let mut space_guard = mm.write_guard_no_reservation_conflict(region);
             loop {
                 let vma = space_guard
@@ -107,52 +124,126 @@ fn prefault_user_range(addr: VirtAddr, len: usize, write: bool) -> Result<(), Sy
                     return Err(SystemError::EFAULT);
                 }
 
-                let mut fault_flags = if write {
-                    FaultFlags::FAULT_FLAG_WRITE
-                } else {
-                    FaultFlags::empty()
+                // Explicit preparation is not a synthetic fault on an already
+                // writable leaf. In particular it must not inflate PGFAULT or
+                // repeat a file mkwrite operation.
+                let ready = prepared.is_some() && {
+                    let _pt_edit = mm.page_table_edit();
+                    space_guard
+                        .user_mapper
+                        .utable
+                        .translate(current)
+                        .is_some_and(|(_, flags)| prepared_write_flags(flags))
                 };
-                if retried {
-                    fault_flags |= FaultFlags::FAULT_FLAG_TRIED;
-                }
-                let fault = unsafe {
-                    let message = PageFaultMessage::new(
-                        vma,
-                        current,
-                        fault_flags,
-                        &mut space_guard.user_mapper.utable,
-                        mm.clone(),
-                    );
-                    PageFaultHandler::handle_mm_fault(message)
-                };
-                if fault.reason.contains(VmFaultReason::VM_FAULT_OOM) {
-                    return Err(SystemError::ENOMEM);
-                }
-                if fault.reason.contains(VmFaultReason::VM_FAULT_RETRY) {
-                    retried = true;
-                    let wait = fault.retry_wait;
-                    drop(space_guard);
-                    if let Some(wait) = wait {
-                        if let Err(error) = wait.wait() {
-                            if !matches!(error, SystemError::EINTR | SystemError::ERESTARTSYS) {
-                                crate::mm::fault::account_fault_result(
-                                    fault_flags,
-                                    VmFaultReason::VM_FAULT_SIGBUS,
-                                );
-                            }
-                            return Err(SystemError::EFAULT);
-                        }
+                if !ready {
+                    let mut fault_flags = if write {
+                        FaultFlags::FAULT_FLAG_WRITE
+                    } else {
+                        FaultFlags::empty()
+                    };
+                    if retried {
+                        fault_flags |= FaultFlags::FAULT_FLAG_TRIED;
                     }
-                    continue 'retry;
+                    let fault = unsafe {
+                        let message = PageFaultMessage::new(
+                            vma,
+                            current,
+                            fault_flags,
+                            &mut space_guard.user_mapper.utable,
+                            mm.clone(),
+                            creator.clone(),
+                            data_account.clone(),
+                        );
+                        PageFaultHandler::handle_mm_fault(message)
+                    };
+                    if let Some(failure) = fault.charge_failure {
+                        drop(space_guard);
+                        crate::mm::fault::recover_fault_charge(
+                            failure,
+                            &mut charge_recovery,
+                            &data_account,
+                            fault_flags,
+                        )?;
+                        continue 'retry;
+                    }
+                    if fault.reason.contains(VmFaultReason::VM_FAULT_OOM) {
+                        return Err(SystemError::ENOMEM);
+                    }
+                    if fault.reason.contains(VmFaultReason::VM_FAULT_RETRY) {
+                        retried = true;
+                        let wait = fault.retry_wait;
+                        drop(space_guard);
+                        if let Some(wait) = wait {
+                            let result = match wait.wait() {
+                                Err(crate::mm::allocation::MemoryAllocationError::Charge(
+                                    failure,
+                                )) => {
+                                    crate::mm::fault::recover_fault_charge(
+                                        failure,
+                                        &mut charge_recovery,
+                                        &data_account,
+                                        fault_flags,
+                                    )?;
+                                    continue 'retry;
+                                }
+                                Err(crate::mm::allocation::MemoryAllocationError::System(
+                                    error,
+                                )) => Err(error),
+                                Ok(()) => Ok(()),
+                            };
+                            if let Err(error) = result {
+                                if matches!(error, SystemError::EINTR | SystemError::ERESTARTSYS) {
+                                    // Explicit preparation is a cancellable
+                                    // transaction before any user output.
+                                    // Preserve its signal outcome; do not defer
+                                    // it as a bad-pointer error to late commit.
+                                    if prepared.is_some() {
+                                        return Err(error);
+                                    }
+                                } else {
+                                    crate::mm::fault::account_fault_result(
+                                        &data_account,
+                                        fault_flags,
+                                        VmFaultReason::VM_FAULT_SIGBUS,
+                                    );
+                                }
+                                return Err(SystemError::EFAULT);
+                            }
+                        }
+                        continue 'retry;
+                    }
+                    if fault.reason.intersects(
+                        VmFaultReason::VM_FAULT_SIGBUS
+                            | VmFaultReason::VM_FAULT_SIGSEGV
+                            | VmFaultReason::VM_FAULT_HWPOISON
+                            | VmFaultReason::VM_FAULT_HWPOISON_LARGE
+                            | VmFaultReason::VM_FAULT_FALLBACK,
+                    ) {
+                        return Err(SystemError::EFAULT);
+                    }
                 }
-                if fault.reason.intersects(
-                    VmFaultReason::VM_FAULT_SIGBUS
-                        | VmFaultReason::VM_FAULT_SIGSEGV
-                        | VmFaultReason::VM_FAULT_HWPOISON
-                        | VmFaultReason::VM_FAULT_HWPOISON_LARGE
-                        | VmFaultReason::VM_FAULT_FALLBACK,
-                ) {
-                    return Err(SystemError::EFAULT);
+
+                if let Some(state) = prepared.as_deref_mut() {
+                    // Hold this very MM write guard until the physical owner
+                    // and cache active pin have been captured. There is no
+                    // clean-reclaim gap between the fault and retention.
+                    if !state.pin_leaf(&space_guard, current)? {
+                        drop(space_guard);
+                        // Normal DAX revocation can invalidate the provider
+                        // snapshot while retaining a leaf until its final zap.
+                        // Retire every candidate outside MM/PT, then let that
+                        // publisher finish before retrying ordinary faults.
+                        state.pages = [None, None];
+                        if crate::arch::ipc::signal::Signal::oom_fatal_signal_pending(
+                            &ProcessManager::current_pcb(),
+                        ) {
+                            return Err(SystemError::EINTR);
+                        }
+                        crate::sched::cond_resched();
+                        current = start_page;
+                        retried = false;
+                        continue 'retry;
+                    }
                 }
 
                 if current == end_page {
@@ -166,6 +257,262 @@ fn prefault_user_range(addr: VirtAddr, len: usize, write: bool) -> Result<(), Sy
                         .ok_or(SystemError::EFAULT)?,
                 );
             }
+        }
+    }
+}
+
+fn prepared_write_flags(flags: crate::mm::page::EntryFlags<MMArch>) -> bool {
+    MMArch::ENTRY_FLAG_PRESENT != 0
+        && MMArch::ENTRY_FLAG_USER != 0
+        && MMArch::ENTRY_FLAG_WRITEABLE != 0
+        && flags.has_flag(MMArch::ENTRY_FLAG_PRESENT)
+        && flags.has_flag(MMArch::ENTRY_FLAG_USER)
+        && flags.has_write()
+        // RISC-V has no lazy user A/D fault handler. Normal writable mappings
+        // already carry these bits; an incomplete leaf is not ready to store.
+        && (!cfg!(target_arch = "riscv64")
+            || (flags.has_flag(MMArch::ENTRY_FLAG_ACCESSED)
+                && flags.has_flag(MMArch::ENTRY_FLAG_DIRTY)))
+}
+
+struct PreparedUserPage {
+    address: VirtAddr,
+    source: PreparedUserPageSource,
+}
+
+enum PreparedUserPageSource {
+    Managed {
+        page: Arc<Page>,
+        _cache_pin: Option<crate::filesystem::page_cache::PageCachePagePin>,
+        _cache: Option<Arc<crate::filesystem::page_cache::PageCache>>,
+    },
+    External {
+        physical: crate::mm::PhysAddr,
+        vma: Arc<crate::mm::ucontext::LockedVMA>,
+        _file: Arc<crate::filesystem::vfs::file::File>,
+        _snapshot: Option<crate::filesystem::fuse::inode::DaxUserWriteSnapshot>,
+    },
+}
+
+impl PreparedUserPageSource {
+    fn matches(
+        &self,
+        physical: crate::mm::PhysAddr,
+        vma: &Arc<crate::mm::ucontext::LockedVMA>,
+    ) -> bool {
+        match self {
+            Self::Managed { page, .. } => page.phys_address() == physical,
+            Self::External {
+                physical: expected,
+                vma: original,
+                ..
+            } => *expected == physical && Arc::ptr_eq(original, vma),
+        }
+    }
+}
+
+struct PreparedUserWriteState {
+    mm: Arc<AddressSpace>,
+    pages: [Option<PreparedUserPage>; 2],
+}
+
+impl PreparedUserWriteState {
+    fn pin_leaf(
+        &mut self,
+        space: &crate::mm::ucontext::InnerAddressSpace,
+        address: VirtAddr,
+    ) -> Result<bool, SystemError> {
+        let _pt_edit = self.mm.page_table_edit();
+        let (physical, _flags) = space
+            .user_mapper
+            .utable
+            .translate(address)
+            .filter(|(_, flags)| prepared_write_flags(*flags))
+            .ok_or(SystemError::EFAULT)?;
+        let page = { page_manager_lock().get_registered(&physical) };
+        if page.is_none() {
+            let vma = space
+                .mappings
+                .contains(address)
+                .ok_or(SystemError::EFAULT)?;
+            let (file, page_offset) = {
+                let guard = vma.lock();
+                if !guard
+                    .vm_flags()
+                    .contains(VmFlags::VM_MIXEDMAP | VmFlags::VM_SHARED | VmFlags::VM_WRITE)
+                {
+                    return Err(SystemError::EFAULT);
+                }
+                let offset = address
+                    .data()
+                    .checked_sub(guard.region().start().data())
+                    .map(|bytes| bytes / MMArch::PAGE_SIZE)
+                    .and_then(|pages| guard.backing_page_offset()?.checked_add(pages))
+                    .ok_or(SystemError::EFAULT)?;
+                (guard.vm_file().ok_or(SystemError::EFAULT)?, offset)
+            };
+            let snapshot = crate::filesystem::fuse::virtiofs::snapshot_external_user_write(
+                &file,
+                page_offset,
+            )?;
+            let valid = snapshot
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.physical == Some(physical));
+            let slot = self
+                .pages
+                .iter_mut()
+                .find(|slot| slot.is_none())
+                .expect("checked two-page preparation visits each leaf once");
+            *slot = Some(PreparedUserPage {
+                address,
+                source: PreparedUserPageSource::External {
+                    physical,
+                    vma,
+                    _file: file,
+                    _snapshot: snapshot,
+                },
+            });
+            return Ok(valid);
+        }
+        let page = page.expect("managed branch retained the actual Page");
+        let file_info = {
+            let guard = page.read();
+            match guard.page_type() {
+                crate::mm::page::PageType::File(info) => Some(info.clone()),
+                _ => None,
+            }
+        };
+        let needs_cache_pin = file_info.is_some();
+        let cache = file_info
+            .as_ref()
+            .and_then(|info| info.page_cache.upgrade());
+        let cache_pin = match (&file_info, &cache) {
+            (Some(info), Some(cache)) => cache.get_ready_page_pinned(info.index),
+            _ => None,
+        };
+        let valid = (!needs_cache_pin || cache_pin.is_some())
+            && cache_pin
+                .as_ref()
+                .is_none_or(|pin| Arc::ptr_eq(&pin.page(), &page));
+        let slot = self
+            .pages
+            .iter_mut()
+            .find(|slot| slot.is_none())
+            .expect("checked two-page preparation visits each leaf once");
+        // The owner outlives this MM/PT guard, including identity failure.
+        // Never release a final page/cache pin from this critical section.
+        *slot = Some(PreparedUserPage {
+            address,
+            source: PreparedUserPageSource::Managed {
+                page,
+                _cache_pin: cache_pin,
+                _cache: cache,
+            },
+        });
+        Ok(valid)
+    }
+}
+
+/// A delayed single-value userspace write, with at most two retained pages.
+///
+/// Preparation may fault/COW/recover and must occur outside resource guards.
+/// `write` only validates and copies through the original user virtual address.
+/// Keep this owner outside any surrounding transaction guard so its Page/cache
+/// pins are also retired outside those guards, including on failure.
+pub(crate) struct PreparedUserWrite<T: Copy> {
+    state: PreparedUserWriteState,
+    address: VirtAddr,
+    value: core::marker::PhantomData<T>,
+}
+
+/// A valid writable VMA can lose its leaf or write permission through normal
+/// reclaim/writeback. That is a fault to retry outside the transaction, not a
+/// userspace EFAULT and not an allocator failure.
+pub(crate) enum UserWriteCommitError {
+    RefaultRequired,
+    System(SystemError),
+}
+
+impl From<SystemError> for UserWriteCommitError {
+    fn from(error: SystemError) -> Self {
+        Self::System(error)
+    }
+}
+
+impl<T: Copy> PreparedUserWrite<T> {
+    pub(crate) fn prepare(mm: &Arc<AddressSpace>, address: VirtAddr) -> Result<Self, SystemError> {
+        let len = size_of::<T>();
+        access_ok(address, len).map_err(|_| SystemError::EFAULT)?;
+        if len != 0 {
+            let end = address.data().checked_add(len).ok_or(SystemError::EFAULT)?;
+            let first = address.data() & !MMArch::PAGE_OFFSET_MASK;
+            let last = (end - 1) & !MMArch::PAGE_OFFSET_MASK;
+            if last
+                .checked_sub(first)
+                .is_none_or(|span| span >= 2 * MMArch::PAGE_SIZE)
+            {
+                return Err(SystemError::EINVAL);
+            }
+        }
+        // Zero placeholder encodings cannot prove an actual writable PTE.
+        // In particular the current LoongArch MM implementation is incomplete.
+        if MMArch::ENTRY_FLAG_PRESENT == 0
+            || MMArch::ENTRY_FLAG_WRITEABLE == 0
+            || MMArch::ENTRY_FLAG_USER == 0
+        {
+            return Err(SystemError::EFAULT);
+        }
+        let mut result = Self {
+            state: PreparedUserWriteState {
+                mm: mm.clone(),
+                pages: [None, None],
+            },
+            address,
+            value: core::marker::PhantomData,
+        };
+        prefault_user_range_mode(address, len, true, Some(&mut result.state))?;
+        Ok(result)
+    }
+
+    pub(crate) fn write(&self, value: &T) -> Result<(), UserWriteCommitError> {
+        let current = AddressSpace::current()?;
+        if !Arc::ptr_eq(&current, &self.state.mm) {
+            return Err(SystemError::EFAULT.into());
+        }
+        let space = self.state.mm.write();
+        let _pt_edit = self.state.mm.page_table_edit();
+        for retained in self.state.pages.iter().flatten() {
+            let vma = space
+                .mappings
+                .contains(retained.address)
+                .ok_or(SystemError::EFAULT)?;
+            if !vma.lock().vm_flags().contains(VmFlags::VM_WRITE) {
+                return Err(SystemError::EFAULT.into());
+            }
+            let (physical, flags) = space
+                .user_mapper
+                .utable
+                .translate(retained.address)
+                .ok_or(UserWriteCommitError::RefaultRequired)?;
+            if !retained.source.matches(physical, &vma) || !prepared_write_flags(flags) {
+                return Err(UserWriteCommitError::RefaultRequired);
+            }
+        }
+        let _no_fault = crate::process::preempt::PageFaultDisabledGuard::new();
+        // All leaves were validated before copying even the first byte. The
+        // MM/PT guards prevent concurrent unmap, write-protection and reclaim.
+        // An unexpected hardware exception is fixed up, never a sleeping fault.
+        let remaining = unsafe {
+            MMArch::copy_with_exception_table(
+                self.address.data() as *mut u8,
+                (value as *const T).cast::<u8>(),
+                size_of::<T>(),
+            )
+        };
+        if remaining != 0 {
+            Err(SystemError::EFAULT.into())
+        } else {
+            Ok(())
         }
     }
 }

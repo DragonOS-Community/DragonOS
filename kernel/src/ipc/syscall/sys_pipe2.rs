@@ -25,29 +25,45 @@ pub(super) fn do_kernel_pipe2(fd: *mut i32, flags: FileFlags) -> Result<usize, S
     }
 
     let mut user_buffer = UserBufferWriter::new(fd, core::mem::size_of::<[c_int; 2]>(), true)?;
-    let fd = user_buffer.buffer::<i32>(0)?;
     let cred = ProcessManager::current_pcb().cred();
-    let pipe_ptr = LockedPipeInode::new_anonymous(cred.fsuid.data(), cred.fsgid.data());
+    let read_storage = crate::filesystem::vfs::file::PreparedFile::new_recovering()?;
+    let write_storage = crate::filesystem::vfs::file::PreparedFile::new_recovering()?;
+    let pipe_ptr = File::recover_io(|| {
+        LockedPipeInode::try_new_anonymous(
+            cred.fsuid.data(),
+            cred.fsgid.data(),
+            &crate::cgroup::memory::object_for_task(&ProcessManager::current_pcb()),
+        )
+    })?;
 
-    let read_file = File::new(
+    let read_file = File::new_prepared_recovering(
         pipe_ptr.clone(),
         FileFlags::O_RDONLY | (flags & FileFlags::O_NONBLOCK),
+        read_storage,
     )?;
 
-    let write_file = File::new(
+    let write_file = File::new_prepared_recovering(
         pipe_ptr.clone(),
         FileFlags::O_WRONLY | (flags & (FileFlags::O_NONBLOCK | FileFlags::O_DIRECT)),
+        write_storage,
     )?;
     let read_file = Arc::try_new(read_file).map_err(|_| SystemError::ENOMEM)?;
     let write_file = Arc::try_new(write_file).map_err(|_| SystemError::ENOMEM)?;
 
     let cloexec = flags.contains(FileFlags::O_CLOEXEC);
     let current = ProcessManager::current_pcb();
-    let reservation = current
-        .fd_table()
-        .reserve::<2>(current.nofile_soft_limit(), 0, cloexec)?;
-    fd[0] = reservation.fd(0);
-    fd[1] = reservation.fd(1);
+    let table = current.fd_table();
+    let reservation = File::recover_io(|| {
+        table.reserve::<2>(
+            current.nofile_soft_limit(),
+            0,
+            cloexec,
+            &crate::cgroup::memory::object_for_task(&current),
+        )
+    })?;
+    // Keep the pair private until exception-table protected user output succeeds.
+    // A partial copy fault must cancel both reserved descriptors and endpoints.
+    user_buffer.copy_one_to_user(&[reservation.fd(0), reservation.fd(1)], 0)?;
     reservation.install_arc_pair(read_file, write_file)?;
     Ok(0)
 }

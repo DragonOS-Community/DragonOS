@@ -73,7 +73,9 @@ pub(super) fn path_getxattr(
 
     let pcb = ProcessManager::current_pcb();
     let (current_node, rest_path) = user_path_at(&pcb, AtFlags::AT_FDCWD.bits(), &path)?;
-    let inode = current_node.lookup_follow_symlink(&rest_path, lookup_flags)?;
+    let inode = crate::filesystem::vfs::file::File::recover_io(|| {
+        current_node.lookup_follow_symlink(&rest_path, lookup_flags)
+    })?;
 
     do_getxattr(inode, name_ptr, buf_ptr, size)
 }
@@ -110,7 +112,9 @@ pub(super) fn path_listxattr(
 
     let pcb = ProcessManager::current_pcb();
     let (current_node, rest_path) = user_path_at(&pcb, AtFlags::AT_FDCWD.bits(), &path)?;
-    let inode = current_node.lookup_follow_symlink(&rest_path, lookup_flags)?;
+    let inode = crate::filesystem::vfs::file::File::recover_io(|| {
+        current_node.lookup_follow_symlink(&rest_path, lookup_flags)
+    })?;
 
     do_listxattr(inode, buf_ptr, size)
 }
@@ -173,7 +177,9 @@ pub(super) fn path_removexattr(
 
     let pcb = ProcessManager::current_pcb();
     let (current_node, rest_path) = user_path_at(&pcb, AtFlags::AT_FDCWD.bits(), &path)?;
-    let inode = current_node.lookup_follow_symlink(&rest_path, lookup_flags)?;
+    let inode = crate::filesystem::vfs::file::File::recover_io(|| {
+        current_node.lookup_follow_symlink(&rest_path, lookup_flags)
+    })?;
 
     do_removexattr(inode, name_ptr)
 }
@@ -193,7 +199,7 @@ pub(super) fn fd_removexattr(fd: i32, name_ptr: *const u8) -> Result<usize, Syst
 fn do_removexattr(inode: Arc<dyn IndexNode>, name_ptr: *const u8) -> Result<usize, SystemError> {
     let name = clone_xattr_name(name_ptr)?;
 
-    let result = inode.removexattr(&name)?;
+    let result = crate::filesystem::vfs::file::File::recover_io(|| inode.removexattr(&name))?;
     fsnotify::fsnotify_inode(FsEvent::ATTRIB, &inode);
     Ok(result)
 }
@@ -253,7 +259,9 @@ pub(super) fn path_setxattr(
 
     let pcb = ProcessManager::current_pcb();
     let (current_node, rest_path) = user_path_at(&pcb, AtFlags::AT_FDCWD.bits(), &path)?;
-    let inode = current_node.lookup_follow_symlink(&rest_path, lookup_flags)?;
+    let inode = crate::filesystem::vfs::file::File::recover_io(|| {
+        current_node.lookup_follow_symlink(&rest_path, lookup_flags)
+    })?;
 
     do_setxattr(inode, xattr)
 }
@@ -278,7 +286,9 @@ pub(super) fn fd_setxattr(
 }
 
 fn do_setxattr(inode: Arc<dyn IndexNode>, xattr: SetxattrArgs) -> Result<usize, SystemError> {
-    let result = inode.setxattr(&xattr.name, &xattr.value, xattr.flags)?;
+    let result = crate::filesystem::vfs::file::File::recover_io(|| {
+        inode.setxattr(&xattr.name, &xattr.value, xattr.flags)
+    })?;
     fsnotify::fsnotify_inode(FsEvent::ATTRIB, &inode);
     Ok(result)
 }

@@ -297,11 +297,11 @@ impl MemoryManagementArch for RiscV64MMArch {
         unsafe { INITIAL_PGTABLE_VALUE }
     }
 
-    fn setup_new_usermapper() -> Result<UserMapper, SystemError> {
-        let new_umapper: crate::mm::page::PageMapper<MMArch, LockedFrameAllocator> = unsafe {
-            PageMapper::create(PageTableKind::User, LockedFrameAllocator)
-                .ok_or(SystemError::ENOMEM)?
-        };
+    fn setup_new_usermapper(
+        account: Option<&alloc::sync::Arc<crate::cgroup::memory::object::ObjectAccount>>,
+    ) -> Result<UserMapper, crate::mm::allocation::MemoryAllocationError> {
+        let new_umapper: crate::mm::page::PageMapper<MMArch, LockedFrameAllocator> =
+            unsafe { PageMapper::create_user(account)?.ok_or(SystemError::ENOMEM)? };
 
         let current_ktable: KernelMapper = KernelMapper::lock();
         let copy_mapping = |pml4_entry_no| unsafe {

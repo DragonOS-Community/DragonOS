@@ -1,4 +1,5 @@
-use alloc::{collections::VecDeque, sync::Arc, vec::Vec};
+use alloc::{boxed::Box, sync::Arc};
+use core::ptr::NonNull;
 
 use crate::{
     process::ProcessControlBlock,
@@ -22,13 +23,141 @@ const _: () = {
     assert!(RR_TIMESLICE_TICKS > 0);
 };
 
+/// One allocation per task, prepared before publication. Detached nodes have
+/// no task payload, so the task's spare cannot hold a strong self-reference.
+#[derive(Debug)]
+pub(crate) struct RtQueueNode {
+    task: Option<Arc<ProcessControlBlock>>,
+    next: Option<Box<RtQueueNode>>,
+}
+
+impl RtQueueNode {
+    pub(crate) fn try_new() -> Result<Box<Self>, core::alloc::AllocError> {
+        Box::try_new(Self {
+            task: None,
+            next: None,
+        })
+    }
+}
+
+impl Drop for RtQueueNode {
+    fn drop(&mut self) {
+        let mut next = self.next.take();
+        while let Some(mut node) = next {
+            next = node.next.take();
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct RtBucket {
+    head: Option<Box<RtQueueNode>>,
+    /// Non-owning pointer to the last Box in head's chain. It never escapes
+    /// this bucket and is accessed only through exclusive owner-rq mutation.
+    tail: Option<NonNull<RtQueueNode>>,
+    len: usize,
+}
+
+// Moving an exclusively owned bucket moves Box handles, not their pointees.
+// Its only raw pointer still names that same owned chain; shared mutation is
+// serialized by the existing runqueue lock, never by the pointer itself.
+unsafe impl Send for RtBucket {}
+unsafe impl Sync for RtBucket {}
+
+impl RtBucket {
+    fn is_empty(&self) -> bool {
+        self.head.is_none()
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn front(&self) -> Option<&Arc<ProcessControlBlock>> {
+        self.head.as_ref().and_then(|node| node.task.as_ref())
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &Arc<ProcessControlBlock>> {
+        let mut current = self.head.as_deref();
+        core::iter::from_fn(move || {
+            let node = current?;
+            current = node.next.as_deref();
+            Some(node.task.as_ref().expect("queued RT node has no task"))
+        })
+    }
+
+    fn push_back(&mut self, mut node: Box<RtQueueNode>) {
+        debug_assert!(node.next.is_none() && node.task.is_some());
+        let address = NonNull::from(&mut *node);
+        if let Some(mut tail) = self.tail {
+            // SAFETY: tail points to the live final Box exclusively owned by
+            // this chain, and exclusive &mut self prevents concurrent access.
+            unsafe { tail.as_mut().next = Some(node) };
+        } else {
+            debug_assert!(self.head.is_none());
+            self.head = Some(node);
+        }
+        self.tail = Some(address);
+        self.len += 1;
+    }
+
+    fn push_front(&mut self, mut node: Box<RtQueueNode>) {
+        debug_assert!(node.next.is_none() && node.task.is_some());
+        if self.head.is_none() {
+            debug_assert!(self.tail.is_none());
+            self.tail = Some(NonNull::from(&mut *node));
+        }
+        node.next = self.head.take();
+        self.head = Some(node);
+        self.len += 1;
+    }
+
+    fn remove(&mut self, task: &Arc<ProcessControlBlock>) -> Option<Box<RtQueueNode>> {
+        let mut link = &mut self.head;
+        let mut previous = None;
+        while let Some(node) = link.as_ref() {
+            if node
+                .task
+                .as_ref()
+                .is_some_and(|queued| Arc::ptr_eq(queued, task))
+            {
+                let mut removed = link.take().unwrap();
+                let address = NonNull::from(&mut *removed);
+                *link = removed.next.take();
+                if self.tail == Some(address) {
+                    self.tail = previous;
+                }
+                self.len -= 1;
+                return Some(removed);
+            }
+            let node = link.as_deref_mut().unwrap();
+            previous = Some(NonNull::from(&mut *node));
+            link = &mut node.next;
+        }
+        None
+    }
+
+    fn is_tail(&self, task: &Arc<ProcessControlBlock>) -> bool {
+        self.tail.is_some_and(|tail| {
+            // SAFETY: immutable access neither removes nor moves any owned
+            // node. The last node is kept live by head for the entire borrow.
+            unsafe {
+                tail.as_ref()
+                    .task
+                    .as_ref()
+                    .is_some_and(|queued| Arc::ptr_eq(queued, task))
+            }
+        })
+    }
+}
+
 /// Per-CPU runqueue shared by every policy in the realtime scheduling class.
 ///
 /// Lower numeric priorities run first. Tasks at the same priority keep FIFO
 /// order unless the class explicitly moves an existing task to the tail.
 #[derive(Debug)]
 pub struct RealtimeRunQueue {
-    queues: Vec<VecDeque<Arc<ProcessControlBlock>>>,
+    queues: [RtBucket; MAX_RT_PRIO as usize],
     active: u128,
     nr_running: usize,
     runtime_used: u64,
@@ -39,10 +168,8 @@ pub struct RealtimeRunQueue {
 
 impl RealtimeRunQueue {
     pub fn new() -> Self {
-        let mut queues = Vec::with_capacity(MAX_RT_PRIO as usize);
-        queues.resize_with(MAX_RT_PRIO as usize, VecDeque::new);
         Self {
-            queues,
+            queues: core::array::from_fn(|_| RtBucket::default()),
             active: 0,
             nr_running: 0,
             runtime_used: 0,
@@ -148,8 +275,7 @@ impl RealtimeRunQueue {
             !self
                 .queues
                 .iter()
-                .flatten()
-                .any(|queued| Arc::ptr_eq(queued, _pcb)),
+                .any(|queue| queue.iter().any(|queued| Arc::ptr_eq(queued, _pcb))),
             "realtime task is already queued"
         );
     }
@@ -166,7 +292,7 @@ impl RealtimeRunQueue {
                     expected_active |= 1u128 << prio;
                 }
                 expected_running += queue.len();
-                for task in queue {
+                for task in queue.iter() {
                     assert_eq!(
                         Self::prio_index(task),
                         prio,
@@ -186,7 +312,9 @@ impl RealtimeRunQueue {
     pub fn enqueue_tail(&mut self, pcb: Arc<ProcessControlBlock>) {
         let prio = Self::prio_index(&pcb);
         self.assert_not_queued(&pcb);
-        self.queues[prio].push_back(pcb);
+        let mut node = pcb.sched_info().take_rt_node();
+        node.task = Some(pcb);
+        self.queues[prio].push_back(node);
         self.set_active(prio);
         self.nr_running += 1;
         self.assert_consistent();
@@ -195,7 +323,9 @@ impl RealtimeRunQueue {
     pub fn enqueue_head(&mut self, pcb: Arc<ProcessControlBlock>) {
         let prio = Self::prio_index(&pcb);
         self.assert_not_queued(&pcb);
-        self.queues[prio].push_front(pcb);
+        let mut node = pcb.sched_info().take_rt_node();
+        node.task = Some(pcb);
+        self.queues[prio].push_front(node);
         self.set_active(prio);
         self.nr_running += 1;
         self.assert_consistent();
@@ -204,18 +334,19 @@ impl RealtimeRunQueue {
     pub fn dequeue(&mut self, pcb: &Arc<ProcessControlBlock>) -> bool {
         self.assert_consistent();
         let prio = Self::prio_index(pcb);
-        let position = self.queues[prio]
-            .iter()
-            .position(|queued| Arc::ptr_eq(queued, pcb));
+        let node = self.queues[prio].remove(pcb);
 
         #[cfg(any(debug_assertions, feature = "fifo_demo"))]
-        assert!(position.is_some(), "realtime task is not queued");
+        assert!(node.is_some(), "realtime task is not queued");
 
-        let Some(position) = position else {
+        let Some(mut node) = node else {
             return false;
         };
 
-        self.queues[prio].remove(position);
+        let payload = node.task.take().expect("queued RT node has no task");
+        pcb.sched_info().return_rt_node(node);
+        // The caller's Arc pins pcb. Drop only after the spare guard is gone.
+        drop(payload);
         self.nr_running -= 1;
         self.clear_active_if_empty(prio);
         self.assert_consistent();
@@ -226,23 +357,17 @@ impl RealtimeRunQueue {
     pub fn requeue_to_tail(&mut self, pcb: &Arc<ProcessControlBlock>) -> bool {
         self.assert_consistent();
         let prio = Self::prio_index(pcb);
-        let position = self.queues[prio]
-            .iter()
-            .position(|queued| Arc::ptr_eq(queued, pcb));
-
+        if self.queues[prio].is_tail(pcb) {
+            return true;
+        }
+        let node = self.queues[prio].remove(pcb);
         #[cfg(any(debug_assertions, feature = "fifo_demo"))]
-        assert!(position.is_some(), "realtime task is not queued");
-
-        let Some(position) = position else {
+        assert!(node.is_some(), "realtime task is not queued");
+        let Some(node) = node else {
             return false;
         };
 
-        if position + 1 != self.queues[prio].len() {
-            let task = self.queues[prio]
-                .remove(position)
-                .expect("realtime queue position disappeared");
-            self.queues[prio].push_back(task);
-        }
+        self.queues[prio].push_back(node);
         self.assert_consistent();
         true
     }

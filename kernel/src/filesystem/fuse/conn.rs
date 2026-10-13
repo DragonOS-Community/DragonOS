@@ -51,8 +51,10 @@ struct DaxRangeRetryWait {
 }
 
 impl FaultRetryWait for DaxRangeRetryWait {
-    fn wait(&self) -> Result<(), SystemError> {
-        self.conn.reclaim_one_dax_range_for_fault()
+    fn wait(&self) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        self.conn
+            .reclaim_one_dax_range_for_fault()
+            .map_err(crate::mm::allocation::MemoryAllocationError::System)
     }
 }
 use super::{stats, trace};

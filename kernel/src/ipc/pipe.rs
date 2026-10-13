@@ -24,13 +24,16 @@ use crate::{
     time::PosixTimeSpec,
 };
 use alloc::collections::BTreeMap;
-use alloc::string::String;
-use alloc::vec;
-use alloc::vec::Vec;
-use core::{any::Any, sync::atomic::AtomicUsize};
+use core::any::Any;
 
+use crate::cgroup::memory::{accounting::KernelByteKind, object::ObjectAccount, owned::OwnedBox};
+use crate::mm::allocation::MemoryAllocationError;
 use alloc::sync::{Arc, Weak};
 use system_error::SystemError;
+pub(crate) mod buffer;
+mod identity;
+use buffer::PipeBuffer;
+pub use identity::LockedPipeInode;
 
 /// 管道缓冲区默认大小（Linux 默认 65536 字节）
 pub const PIPE_BUFF_SIZE: usize = 65536;
@@ -187,7 +190,7 @@ impl FileSystem for PipeFS {
     fn root_inode(&self) -> Arc<dyn IndexNode> {
         // PipeFS 没有真正的根 inode，但我们需要实现这个方法
         // 返回一个空的 pipe inode 作为占位符
-        LockedPipeInode::new()
+        LockedPipeInode::new_fifo_shell()
     }
 
     fn info(&self) -> FsInfo {
@@ -220,11 +223,15 @@ impl PipeFS {
 #[derive(Debug, Clone)]
 pub struct PipeFsPrivateData {
     flags: FileFlags,
+    pub(crate) runtime: Option<Arc<PipeRuntime>>,
 }
 
 impl PipeFsPrivateData {
     pub fn new(flags: FileFlags) -> Self {
-        return PipeFsPrivateData { flags };
+        return PipeFsPrivateData {
+            flags,
+            runtime: None,
+        };
     }
 
     pub fn set_flags(&mut self, flags: FileFlags) {
@@ -234,10 +241,19 @@ impl PipeFsPrivateData {
 
 /// @brief 管道文件i节点(锁)
 #[derive(Debug)]
-pub struct LockedPipeInode {
-    /// Serializes attribute read/check/commit without holding the I/O spinlock
-    /// across VFS permission checks. Lock order: metadata_transaction -> inner.
-    metadata_transaction: Mutex<()>,
+pub struct PipeRuntime {
+    data: OwnedBox<PipeRuntimeData>,
+}
+
+impl core::ops::Deref for PipeRuntime {
+    type Target = PipeRuntimeData;
+    fn deref(&self) -> &Self::Target {
+        &self.data
+    }
+}
+
+#[derive(Debug)]
+pub struct PipeRuntimeData {
     /// Serializes writes and output-side splice operations for this pipe.
     ///
     /// Lock order is `writer_transaction` -> `inner`. A blocking writer drops
@@ -252,14 +268,12 @@ pub struct LockedPipeInode {
     epitems: EPollItemList,
     read_fasync_items: FAsyncItems,
     write_fasync_items: FAsyncItems,
-    /// Direct inotify marks reached through `/proc/<pid>/fd/<n>`.
-    fsnotify_watches: AtomicUsize,
 }
 
 /// A serialized writer transaction. Dropping it releases the writer mutex
 /// before passing the exclusive writer-wakeup baton.
 pub(crate) struct PipeWriterTransaction<'a> {
-    pipe: &'a LockedPipeInode,
+    pipe: &'a PipeRuntime,
     guard: Option<MutexGuard<'a, ()>>,
     pass_baton: bool,
 }
@@ -285,7 +299,7 @@ impl Drop for PipeWriterTransaction<'_> {
         if self.pass_baton {
             let writer_wake = {
                 let mut inner = self.pipe.inner.lock();
-                LockedPipeInode::writer_wake_action(&mut inner)
+                PipeRuntime::writer_wake_action(&mut inner)
             };
             self.pipe.wake_writers(writer_wake);
         }
@@ -295,22 +309,20 @@ impl Drop for PipeWriterTransaction<'_> {
 /// @brief 管道文件i节点(无锁)
 #[derive(Debug)]
 pub struct InnerPipeInode {
-    self_ref: Weak<LockedPipeInode>,
     /// 管道内可读的数据数
     valid_cnt: i32,
     read_pos: i32,
     write_pos: i32,
     splice_hold: usize,
     /// 管道缓冲区数据（使用 Vec 支持动态大小）
-    data: Vec<u8>,
+    data: PipeBuffer,
     /// 当前缓冲区大小
     buf_size: usize,
     /// INode 元数据
-    metadata: Metadata,
     reader: u32,
     writer: u32,
     /// Pipe-space predicates published by writers before they sleep.
-    /// Protected by `LockedPipeInode::inner`.
+    /// Protected by `PipeRuntime::inner`.
     write_waiters: PipeWriteWaiters,
     had_reader: bool,
     /// 是否为命名管道（FIFO）
@@ -327,7 +339,7 @@ impl InnerPipeInode {
     pub fn poll(&self, private_data: &FilePrivateData) -> Result<usize, SystemError> {
         let mut events = EPollEventType::empty();
 
-        let flags = if let FilePrivateData::Pipefs(PipeFsPrivateData { flags }) = private_data {
+        let flags = if let FilePrivateData::Pipefs(PipeFsPrivateData { flags, .. }) = private_data {
             flags
         } else {
             return Err(SystemError::EBADFD);
@@ -366,9 +378,11 @@ impl InnerPipeInode {
         // 为了正确唤醒同时监听读端/写端的 epoll，需要合并两侧视角的事件。
         let read_data = FilePrivateData::Pipefs(PipeFsPrivateData {
             flags: FileFlags::O_RDONLY,
+            runtime: None,
         });
         let write_data = FilePrivateData::Pipefs(PipeFsPrivateData {
             flags: FileFlags::O_WRONLY,
+            runtime: None,
         });
 
         let read_mask = self.poll(&read_data).unwrap_or(0);
@@ -404,9 +418,10 @@ impl InnerPipeInode {
         }
 
         // 确保目标缓冲区已分配
-        if self.data.is_empty() {
-            self.data = vec![0u8; self.buf_size];
-        }
+        assert!(
+            !self.data.is_empty(),
+            "transfer output storage prepared before input consumption"
+        );
 
         let src_buf_size = src.buf_size;
         let dst_buf_size = self.buf_size;
@@ -463,7 +478,60 @@ impl InnerPipeInode {
     }
 }
 
-impl LockedPipeInode {
+impl PipeRuntime {
+    pub(crate) fn run_accounting_selftest() -> Result<bool, MemoryAllocationError> {
+        use crate::cgroup::memory::{MemoryAccount, MemoryPolicy};
+        use crate::mm::allocator::kernel_allocator::allocation_footprint;
+        let root = MemoryAccount::new(0x77661f, None)?;
+        let account = MemoryAccount::new(0x776620, Some(root.clone()))?;
+        let creator = ObjectAccount::new(&account)?;
+        let body_layout = core::alloc::Layout::new::<PipeRuntimeData>();
+        let body_bytes = allocation_footprint(body_layout);
+        let kind = KernelByteKind::SlabUnreclaimable.for_allocation(body_layout) as usize;
+        let runtime = Self::try_new(false, &creator)?;
+        let weak = Arc::downgrade(&runtime);
+        let baseline = account.snapshot();
+        let mut ok = baseline.kernel_bytes[kind] == body_bytes;
+        account.set_policy(MemoryPolicy {
+            max: Some(baseline.current),
+            ..Default::default()
+        });
+        {
+            let transaction = runtime.begin_writer_transaction();
+            ok &= matches!(
+                runtime.prepare_output_storage(&transaction, &creator),
+                Err(MemoryAllocationError::Charge(_))
+            );
+            let inner = runtime.inner.lock();
+            ok &= inner.data.is_empty() && inner.valid_cnt == 0 && inner.buf_size == PIPE_BUFF_SIZE;
+        }
+        ok &= account.snapshot().kernel_bytes == baseline.kernel_bytes;
+        account.set_policy(MemoryPolicy::default());
+        {
+            let transaction = runtime.begin_writer_transaction();
+            runtime.prepare_output_storage(&transaction, &creator)?;
+        }
+        let ring_bytes = allocation_footprint(
+            core::alloc::Layout::array::<u8>(PIPE_BUFF_SIZE).map_err(|_| SystemError::ENOMEM)?,
+        );
+        ok &= account.snapshot().kernel_bytes[KernelByteKind::KernelOther as usize]
+            == baseline.kernel_bytes[KernelByteKind::KernelOther as usize] + ring_bytes;
+        drop(runtime);
+        ok &= weak.upgrade().is_none()
+            && account.current_pages() == 0
+            && root.current_pages() == 0
+            && account.snapshot().kernel_bytes
+                == [0; crate::cgroup::memory::accounting::KERNEL_BYTE_KIND_COUNT];
+        drop(weak);
+        Ok(ok)
+    }
+
+    #[cfg(test)]
+    fn new() -> Arc<Self> {
+        let account = crate::cgroup::memory::MemoryAccount::new(0, None).unwrap();
+        let creator = ObjectAccount::new(&account).unwrap();
+        Self::try_new(false, &creator).unwrap()
+    }
     #[inline]
     pub(crate) fn begin_writer_transaction(&self) -> PipeWriterTransaction<'_> {
         PipeWriterTransaction {
@@ -553,8 +621,8 @@ impl LockedPipeInode {
     /// 返回两个节点的锁保护对象
     /// 注意：p1 和 p2 必须不同，否则会发生死锁（如果尝试对同一个锁加锁两次）或返回不安全的别名引用
     fn lock_two<'a, 'b>(
-        p1: &'a LockedPipeInode,
-        p2: &'b LockedPipeInode,
+        p1: &'a PipeRuntime,
+        p2: &'b PipeRuntime,
     ) -> (
         crate::libs::spinlock::SpinLockGuard<'a, InnerPipeInode>,
         crate::libs::spinlock::SpinLockGuard<'b, InnerPipeInode>,
@@ -587,68 +655,40 @@ impl LockedPipeInode {
         total.saturating_sub(consumed_since_start)
     }
 
-    pub fn new() -> Arc<Self> {
-        Self::new_with_owner(0, 0, PosixTimeSpec::default())
-    }
-
-    /// Create an anonymous pipe with the creator's filesystem IDs and time.
-    pub fn new_anonymous(uid: usize, gid: usize) -> Arc<Self> {
-        Self::new_with_owner(uid, gid, PosixTimeSpec::now())
-    }
-
-    fn new_with_owner(uid: usize, gid: usize, time: PosixTimeSpec) -> Arc<Self> {
+    pub(super) fn try_new(
+        is_fifo: bool,
+        creator: &Arc<ObjectAccount>,
+    ) -> Result<Arc<Self>, MemoryAllocationError> {
+        let storage = OwnedBox::prepare(creator, KernelByteKind::SlabUnreclaimable)?
+            .try_allocate()
+            .map_err(|_| SystemError::ENOMEM)?;
         let inner = InnerPipeInode {
-            self_ref: Weak::default(),
             valid_cnt: 0,
             read_pos: 0,
             write_pos: 0,
             splice_hold: 0,
             had_reader: false,
-            data: Vec::new(), // 延迟分配：初始为空，第一次写入时分配
+            data: PipeBuffer::default(),
             buf_size: PIPE_BUFF_SIZE,
 
-            metadata: Metadata {
-                dev_id: 0,
-                inode_id: generate_inode_id(),
-                size: 0,
-                blk_size: 0,
-                blocks: 0,
-                atime: time,
-                mtime: time,
-                ctime: time,
-                btime: PosixTimeSpec::default(),
-                file_type: FileType::Pipe,
-                mode: InodeMode::S_IFIFO | InodeMode::from_bits_truncate(0o600),
-                nlinks: 1,
-                uid,
-                gid,
-                raw_dev: Default::default(),
-                flags: InodeFlags::empty(),
-            },
             reader: 0,
             writer: 0,
             write_waiters: PipeWriteWaiters::default(),
-            is_fifo: false, // 默认为匿名管道
-            r_counter: 0,   // 初始化读端计数器
-            w_counter: 0,   // 初始化写端计数器
+            is_fifo,
+            r_counter: 0, // 初始化读端计数器
+            w_counter: 0, // 初始化写端计数器
         };
-        let result = Arc::new(Self {
-            metadata_transaction: Mutex::new(()),
+        let data = storage.init(PipeRuntimeData {
             writer_transaction: Mutex::new(()),
             inner: SpinLock::new(inner),
             read_wait_queue: WaitQueue::default(),
             write_wait_queue: WaitQueue::default(),
             open_wait_queue: WaitQueue::default(),
-            fsnotify_watches: AtomicUsize::new(0),
             epitems: EPollItemList::default(),
             read_fasync_items: FAsyncItems::default(),
             write_fasync_items: FAsyncItems::default(),
         });
-        let mut guard = result.inner.lock();
-        guard.self_ref = Arc::downgrade(&result);
-        // 释放锁
-        drop(guard); //这一步其实不需要，只要离开作用域，guard生命周期结束，自会解锁
-        return result;
+        Arc::try_new(Self { data }).map_err(|_| SystemError::ENOMEM.into())
     }
 
     /// 标记此管道为命名管道（FIFO）
@@ -754,12 +794,12 @@ impl LockedPipeInode {
 
     /// 设置管道缓冲区大小
     /// 成功返回新的大小，失败返回错误
-    pub fn set_pipe_size(&self, size: usize) -> Result<usize, SystemError> {
+    pub fn set_pipe_size(&self, size: usize) -> Result<usize, MemoryAllocationError> {
         // 验证请求的大小
         // Linux 限制：不能超过 /proc/sys/fs/pipe-max-size（默认 1MB）
         // 大于 i32::MAX 的值是无效的（因为在 64 位系统上 long long 可能传入超大值）
         if size > PIPE_MAX_SIZE || size > i32::MAX as usize {
-            return Err(SystemError::EINVAL);
+            return Err(SystemError::EINVAL.into());
         }
 
         // 将请求的大小向上对齐到页面大小的倍数
@@ -777,11 +817,11 @@ impl LockedPipeInode {
         let new_size = new_size.min(PIPE_MAX_SIZE);
 
         let transaction = self.begin_writer_transaction();
-        let mut inner = self.inner.lock();
+        let inner = self.inner.lock();
 
         // 如果新大小小于当前数据量，返回 EBUSY
         if new_size < inner.valid_cnt as usize {
-            return Err(SystemError::EBUSY);
+            return Err(SystemError::EBUSY.into());
         }
 
         let old_size = inner.buf_size;
@@ -789,10 +829,19 @@ impl LockedPipeInode {
             return Ok(new_size);
         }
 
-        // 如果有数据，需要重新分配缓冲区并迁移数据
+        let allocated = !inner.data.is_empty();
+        drop(inner);
+        let actor =
+            crate::cgroup::memory::object_for_task(&crate::process::ProcessManager::current_pcb());
+        let mut new_data = if allocated {
+            PipeBuffer::try_new(new_size, &actor)?
+        } else {
+            PipeBuffer::default()
+        };
+        // The writer transaction excludes writes/resize/close. Readers can
+        // advance while allocation runs; copy only the current live range.
+        let mut inner = self.inner.lock();
         if inner.valid_cnt > 0 {
-            // 需要重新分配缓冲区
-            let mut new_data = vec![0u8; new_size];
             let data_len = inner.valid_cnt as usize;
             let read_pos = inner.read_pos as usize;
 
@@ -810,26 +859,24 @@ impl LockedPipeInode {
 
             // 重置读写位置
             inner.read_pos = 0;
-            inner.write_pos = data_len as i32;
-            inner.data = new_data;
+            inner.write_pos = (data_len % new_size) as i32;
         } else {
             // 没有数据，只需更新大小
             // 如果缓冲区已分配，需要重新分配（大小改变）
-            if !inner.data.is_empty() {
-                inner.data = vec![0u8; new_size];
-            }
             // 如果缓冲区未分配，保持 data 为空（延迟分配）
             // 重置读写位置（应该已经为0）
             inner.read_pos = 0;
             inner.write_pos = 0;
         }
 
+        let retired = core::mem::replace(&mut inner.data, new_data);
         inner.buf_size = new_size;
 
         let writer_wake = Self::writer_wake_action(&mut inner);
         let pollflag = inner.poll_both_ends();
         drop(inner);
         drop(transaction);
+        drop(retired);
 
         self.wake_writers(writer_wake);
         let _ = EventPoll::wakeup_epoll(&self.epitems, pollflag);
@@ -840,6 +887,32 @@ impl LockedPipeInode {
     /// 获取管道缓冲区大小
     pub fn get_pipe_size(&self) -> usize {
         self.inner.lock().buf_size
+    }
+
+    /// Reserve actual output storage before any input consumption. The caller
+    /// keeps its writer transaction, but no pipe spinlock crosses allocation.
+    pub(crate) fn prepare_output_storage(
+        &self,
+        transaction: &PipeWriterTransaction<'_>,
+        actor: &Arc<ObjectAccount>,
+    ) -> Result<(), MemoryAllocationError> {
+        debug_assert!(core::ptr::eq(transaction.pipe, self));
+        let size = {
+            let inner = self.inner.lock();
+            if !inner.data.is_empty() {
+                return Ok(());
+            }
+            inner.buf_size
+        };
+        let prepared = PipeBuffer::try_new(size, actor)?;
+        let retired = {
+            let mut inner = self.inner.lock();
+            assert_eq!(inner.buf_size, size);
+            assert!(inner.data.is_empty());
+            core::mem::replace(&mut inner.data, prepared)
+        };
+        drop(retired);
+        Ok(())
     }
 
     /// 当前管道中可读的字节数（不阻塞、不睡眠）
@@ -900,28 +973,29 @@ impl LockedPipeInode {
         len: usize,
         buf: &[u8],
         flags: FileFlags,
-    ) -> Result<usize, SystemError> {
+    ) -> Result<usize, MemoryAllocationError> {
         if buf.len() < len {
-            return Err(SystemError::EINVAL);
+            return Err(SystemError::EINVAL.into());
         }
         if len == 0 {
             return Ok(0);
         }
 
+        let actor =
+            crate::cgroup::memory::object_for_task(&crate::process::ProcessManager::current_pcb());
         let mut transaction = self.begin_writer_transaction();
-        let mut inner_guard = self.inner.lock();
+        let inner_guard = self.inner.lock();
         let atomic_write = len <= PIPE_BUF;
 
         if inner_guard.reader == 0 {
             drop(inner_guard);
             Self::send_sigpipe();
-            return Err(SystemError::EPIPE);
+            return Err(SystemError::EPIPE.into());
         }
 
-        if inner_guard.data.is_empty() {
-            let buf_size = inner_guard.buf_size;
-            inner_guard.data = vec![0u8; buf_size];
-        }
+        drop(inner_guard);
+        self.prepare_output_storage(&transaction, &actor)?;
+        let mut inner_guard = self.inner.lock();
 
         let mut total_written: usize = 0;
         let mut reader_wake = WakeMode::None;
@@ -938,7 +1012,7 @@ impl LockedPipeInode {
                 return if total_written > 0 {
                     Ok(total_written)
                 } else {
-                    Err(SystemError::EPIPE)
+                    Err(SystemError::EPIPE.into())
                 };
             }
 
@@ -965,7 +1039,7 @@ impl LockedPipeInode {
                     if total_written > 0 {
                         return Ok(total_written);
                     }
-                    return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+                    return Err(SystemError::EAGAIN_OR_EWOULDBLOCK.into());
                 }
 
                 let required = (atomic_write && total_written == 0).then_some(len);
@@ -982,7 +1056,7 @@ impl LockedPipeInode {
                     return if total_written > 0 {
                         Ok(total_written)
                     } else {
-                        Err(err)
+                        Err(err.into())
                     };
                 }
                 continue;
@@ -1035,10 +1109,10 @@ impl LockedPipeInode {
             return Err(SystemError::EPIPE);
         }
 
-        if inner_guard.data.is_empty() {
-            let buf_size = inner_guard.buf_size;
-            inner_guard.data = vec![0u8; buf_size];
-        }
+        assert!(
+            !inner_guard.data.is_empty(),
+            "splice output prepared before reading input"
+        );
 
         let buf_size = inner_guard.buf_size;
         let available = buf_size.saturating_sub(inner_guard.valid_cnt.max(0) as usize);
@@ -1413,8 +1487,8 @@ impl LockedPipeInode {
     ///
     /// Returns actual copied bytes. 0 means retry (buffers full/empty temporarily).
     fn transfer_chunk<F>(
-        src: &LockedPipeInode,
-        dst: &LockedPipeInode,
+        src: &PipeRuntime,
+        dst: &PipeRuntime,
         transaction: &mut PipeWriterTransaction<'_>,
         len: usize,
         consume: bool,
@@ -1511,15 +1585,15 @@ impl LockedPipeInode {
     /// 语义对齐 Linux fs/splice.c: splice_pipe_to_pipe()/wait_for_space()/ipipe_prep/opipe_prep。
     pub fn splice_to_pipe(
         &self,
-        out: &LockedPipeInode,
+        out: &PipeRuntime,
         len: usize,
         flags: SpliceFlags,
-    ) -> Result<usize, SystemError> {
+    ) -> Result<usize, MemoryAllocationError> {
         if len == 0 {
             return Ok(0);
         }
         if core::ptr::eq(self, out) {
-            return Err(SystemError::EINVAL);
+            return Err(SystemError::EINVAL.into());
         }
         let nonblock = flags.contains(SpliceFlags::SPLICE_F_NONBLOCK);
 
@@ -1534,6 +1608,10 @@ impl LockedPipeInode {
             // writer-mutex ABBA between opposite-direction splices.
             let mut transaction = out.begin_writer_transaction();
             out.wait_writable(&mut transaction, nonblock)?;
+            let actor = crate::cgroup::memory::object_for_task(
+                &crate::process::ProcessManager::current_pcb(),
+            );
+            out.prepare_output_storage(&transaction, &actor)?;
 
             // Try transfer
             let copied = Self::transfer_chunk(self, out, &mut transaction, len, true, |_| 0)?;
@@ -1549,15 +1627,15 @@ impl LockedPipeInode {
     /// 当 output 满且仍有 reader 时，阻塞或返回 EAGAIN。
     pub fn tee_to(
         &self,
-        out: &LockedPipeInode,
+        out: &PipeRuntime,
         len: usize,
         flags: crate::filesystem::vfs::syscall::SpliceFlags,
-    ) -> Result<usize, SystemError> {
+    ) -> Result<usize, MemoryAllocationError> {
         if len == 0 {
             return Ok(0);
         }
         if core::ptr::eq(self, out) {
-            return Err(SystemError::EINVAL);
+            return Err(SystemError::EINVAL.into());
         }
         let nonblock =
             flags.contains(crate::filesystem::vfs::syscall::SpliceFlags::SPLICE_F_NONBLOCK);
@@ -1593,7 +1671,7 @@ impl LockedPipeInode {
                 return if total > 0 {
                     Ok(total)
                 } else {
-                    Err(SystemError::EPIPE)
+                    Err(SystemError::EPIPE.into())
                 };
             }
             if out_space == 0 {
@@ -1601,10 +1679,16 @@ impl LockedPipeInode {
                     if total > 0 {
                         return Ok(total);
                     }
-                    return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+                    return Err(SystemError::EAGAIN_OR_EWOULDBLOCK.into());
                 }
                 // force blocking wait
                 out.wait_writable(&mut transaction, false)?;
+            }
+            let actor = crate::cgroup::memory::object_for_task(
+                &crate::process::ProcessManager::current_pcb(),
+            );
+            if let Err(error) = out.prepare_output_storage(&transaction, &actor) {
+                return if total > 0 { Ok(total) } else { Err(error) };
             }
 
             let transfer = Self::transfer_chunk(
@@ -1646,7 +1730,7 @@ impl LockedPipeInode {
             let copied = match transfer {
                 Ok(copied) => copied,
                 Err(SystemError::EPIPE) if total > 0 => return Ok(total),
-                Err(err) => return Err(err),
+                Err(err) => return Err(err.into()),
             };
 
             if copied == 0 {
@@ -1679,7 +1763,7 @@ impl LockedPipeInode {
 
 #[cfg(test)]
 mod tests {
-    use super::{LockedPipeInode, PipeWriteWaiters, PipeWriterWake, PIPE_MIN_SIZE};
+    use super::{PipeRuntime, PipeWriteWaiters, PipeWriterWake, PIPE_MIN_SIZE};
 
     #[test]
     fn writer_wake_action_targets_one_homogeneous_class() {
@@ -1722,33 +1806,37 @@ mod tests {
 
     #[test]
     fn tee_adjusted_skip_no_consumption() {
-        assert_eq!(LockedPipeInode::tee_adjusted_skip(0, 0, 100, 80, 50), 50);
+        assert_eq!(PipeRuntime::tee_adjusted_skip(0, 0, 100, 80, 50), 50);
     }
 
     #[test]
     fn tee_adjusted_skip_with_consumption() {
-        assert_eq!(LockedPipeInode::tee_adjusted_skip(0, 30, 100, 80, 50), 20);
+        assert_eq!(PipeRuntime::tee_adjusted_skip(0, 30, 100, 80, 50), 20);
     }
 
     #[test]
     fn tee_adjusted_skip_consumption_exceeds_total() {
-        assert_eq!(LockedPipeInode::tee_adjusted_skip(0, 80, 100, 80, 50), 0);
+        assert_eq!(PipeRuntime::tee_adjusted_skip(0, 80, 100, 80, 50), 0);
     }
 
     #[test]
     fn tee_adjusted_skip_wraparound() {
-        assert_eq!(LockedPipeInode::tee_adjusted_skip(90, 10, 100, 80, 50), 30);
+        assert_eq!(PipeRuntime::tee_adjusted_skip(90, 10, 100, 80, 50), 30);
     }
 
     #[test]
     fn transfer_does_not_consume_splice_held_data() {
-        let src = LockedPipeInode::new();
-        let dst = LockedPipeInode::new();
+        let src = PipeRuntime::new();
+        let dst = PipeRuntime::new();
+        let account = crate::cgroup::memory::MemoryAccount::new(1, None).unwrap();
+        let creator = ObjectAccount::new(&account).unwrap();
+        let buffer = PipeBuffer::try_new(PIPE_MIN_SIZE, &creator).unwrap();
         {
             let mut src_guard = src.inner.lock();
             src_guard.reader = 1;
             src_guard.writer = 1;
-            src_guard.data = alloc::vec![0u8; PIPE_MIN_SIZE];
+            src_guard.data = buffer;
+            src_guard.buf_size = PIPE_MIN_SIZE;
             src_guard.data[..4].copy_from_slice(b"held");
             src_guard.valid_cnt = 4;
             src_guard.write_pos = 4;
@@ -1767,7 +1855,7 @@ mod tests {
         assert_eq!(&held, b"held");
         let mut transaction = dst.begin_writer_transaction();
         assert_eq!(
-            LockedPipeInode::transfer_chunk(&src, &dst, &mut transaction, 4, true, |_| 0),
+            PipeRuntime::transfer_chunk(&src, &dst, &mut transaction, 4, true, |_| 0),
             Ok(0)
         );
         {
@@ -1778,14 +1866,14 @@ mod tests {
 
         src.splice_finish_hold(0);
         assert_eq!(
-            LockedPipeInode::transfer_chunk(&src, &dst, &mut transaction, 4, true, |_| 0),
+            PipeRuntime::transfer_chunk(&src, &dst, &mut transaction, 4, true, |_| 0),
             Ok(4)
         );
         assert_eq!(src.inner.lock().valid_cnt, 0);
     }
 }
 
-impl PollableInode for LockedPipeInode {
+impl PollableInode for PipeRuntime {
     fn poll(&self, private_data: &FilePrivateData) -> Result<usize, SystemError> {
         self.inner.lock().poll(private_data)
     }
@@ -1867,18 +1955,14 @@ impl PollableInode for LockedPipeInode {
     }
 }
 
-impl IndexNode for LockedPipeInode {
-    fn fsnotify_watch_count(&self) -> Option<&AtomicUsize> {
-        Some(&self.fsnotify_watches)
-    }
-
+impl PipeRuntime {
     fn read_at(
         &self,
         _offset: usize,
         len: usize,
         buf: &mut [u8],
         data_guard: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError> {
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
         let data = data_guard.clone();
         drop(data_guard);
         // 获取flags
@@ -1886,11 +1970,11 @@ impl IndexNode for LockedPipeInode {
         if let FilePrivateData::Pipefs(pdata) = &data {
             flags = pdata.flags;
         } else {
-            return Err(SystemError::EBADF);
+            return Err(SystemError::EBADF.into());
         }
 
         if buf.len() < len {
-            return Err(SystemError::EINVAL);
+            return Err(SystemError::EINVAL.into());
         }
         if len == 0 {
             return Ok(0);
@@ -1907,7 +1991,7 @@ impl IndexNode for LockedPipeInode {
 
             if flags.contains(FileFlags::O_NONBLOCK) {
                 drop(inner_guard);
-                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK.into());
             }
 
             drop(inner_guard);
@@ -1962,23 +2046,20 @@ impl IndexNode for LockedPipeInode {
         &self,
         mut data: MutexGuard<FilePrivateData>,
         flags: &crate::filesystem::vfs::file::FileFlags,
-    ) -> Result<(), SystemError> {
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         // O_PATH: 只获取文件描述符，不实际打开文件进行读写操作
         // 参考 Linux fs/open.c: do_dentry_open() 对 O_PATH 的处理
         // O_PATH 打开不应触发 FIFO 的阻塞等待语义
         if flags.contains(FileFlags::O_PATH) {
             log::debug!("pipe.rs: O_PATH detected, returning early");
-            *data = FilePrivateData::Pipefs(PipeFsPrivateData { flags: *flags });
+            *data = FilePrivateData::Pipefs(PipeFsPrivateData::new(*flags));
             return Ok(());
         }
 
         let accflags = flags.access_flags();
         let is_nonblock = flags.contains(FileFlags::O_NONBLOCK);
-        let flags_copy = *flags;
-
-        // 先设置 private_data（在可能的睡眠之前）
-        // 这样即使睡眠，数据也已经设置好了
-        *data = FilePrivateData::Pipefs(PipeFsPrivateData { flags: flags_copy });
+        // The shell already installed the exact runtime pin before admitting
+        // this open. Never overwrite it when a FIFO open starts waiting.
 
         // 检查是否为命名管道（FIFO）
         // 只有 FIFO 才需要阻塞等待另一端打开
@@ -2020,7 +2101,7 @@ impl IndexNode for LockedPipeInode {
                         let mut guard = self.inner.lock();
                         guard.reader -= 1;
                         drop(guard);
-                        return Err(SystemError::EINTR);
+                        return Err(SystemError::EINTR.into());
                     }
                 }
             }
@@ -2032,7 +2113,7 @@ impl IndexNode for LockedPipeInode {
                     // 非阻塞模式：如果没有读端，返回 ENXIO
                     let mut guard = self.inner.lock();
                     if guard.reader == 0 {
-                        return Err(SystemError::ENXIO);
+                        return Err(SystemError::ENXIO.into());
                     }
                     guard.w_counter += 1; // 增加写端计数器（永不减少）
                     guard.writer += 1;
@@ -2065,7 +2146,7 @@ impl IndexNode for LockedPipeInode {
                             let mut guard = self.inner.lock();
                             guard.writer -= 1;
                             drop(guard);
-                            return Err(SystemError::EINTR);
+                            return Err(SystemError::EINTR.into());
                         }
                     }
                 }
@@ -2100,32 +2181,6 @@ impl IndexNode for LockedPipeInode {
         return Ok(());
     }
 
-    fn metadata(&self) -> Result<crate::filesystem::vfs::Metadata, SystemError> {
-        let inode = self.inner.lock();
-        return Ok(inode.metadata.clone());
-    }
-
-    fn set_metadata_masked(
-        &self,
-        metadata: &Metadata,
-        mask: SetMetadataMask,
-    ) -> Result<(), SystemError> {
-        let _transaction = self.metadata_transaction.lock();
-        merge_metadata_masked(&mut self.inner.lock().metadata, metadata, mask);
-        Ok(())
-    }
-
-    fn update_metadata_masked(
-        &self,
-        update: &mut MetadataUpdate<'_>,
-    ) -> Result<SetMetadataMask, SystemError> {
-        let _transaction = self.metadata_transaction.lock();
-        let current = self.inner.lock().metadata.clone();
-        let (requested, mask) = update(&current)?;
-        merge_metadata_masked(&mut self.inner.lock().metadata, &requested, mask);
-        Ok(mask)
-    }
-
     fn close(&self, data: MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
         let flags: FileFlags;
         if let FilePrivateData::Pipefs(pipe_data) = &*data {
@@ -2134,6 +2189,7 @@ impl IndexNode for LockedPipeInode {
             return Err(SystemError::EBADF);
         }
         let accflags = flags.access_flags();
+        drop(data);
 
         // O_PATH: 只获取文件描述符，不需要reader/writer计数
         // 参考 Linux 对 O_PATH 的处理，close() 不应影响管道的读写端计数
@@ -2194,45 +2250,15 @@ impl IndexNode for LockedPipeInode {
         len: usize,
         buf: &[u8],
         data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError> {
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
         let flags: FileFlags;
         if let FilePrivateData::Pipefs(pdata) = &*data {
             flags = pdata.flags;
         } else {
-            return Err(SystemError::EBADF);
+            return Err(SystemError::EBADF.into());
         }
         drop(data);
         self.write_with_flags(len, buf, flags)
-    }
-
-    fn as_any_ref(&self) -> &dyn core::any::Any {
-        self
-    }
-
-    fn get_entry_name_and_metadata(
-        &self,
-        ino: crate::filesystem::vfs::InodeId,
-    ) -> Result<(alloc::string::String, crate::filesystem::vfs::Metadata), SystemError> {
-        // 如果有条件，请在文件系统中使用高效的方式实现本接口，而不是依赖这个低效率的默认实现。
-        let name = self.get_entry_name(ino)?;
-        let entry = self.find(&name)?;
-        return Ok((name, entry.metadata()?));
-    }
-
-    fn fs(&self) -> Arc<dyn FileSystem> {
-        PipeFS::instance()
-    }
-
-    fn list(&self) -> Result<alloc::vec::Vec<alloc::string::String>, SystemError> {
-        return Err(SystemError::ENOSYS);
-    }
-
-    fn as_pollable_inode(&self) -> Result<&dyn PollableInode, SystemError> {
-        Ok(self)
-    }
-
-    fn absolute_path(&self) -> Result<String, SystemError> {
-        Ok(String::from("pipe"))
     }
 
     fn ioctl(
@@ -2240,7 +2266,7 @@ impl IndexNode for LockedPipeInode {
         cmd: u32,
         data: usize,
         _private_data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError> {
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
         match cmd {
             FIONREAD => {
                 let inner = self.inner.lock();
@@ -2254,7 +2280,7 @@ impl IndexNode for LockedPipeInode {
                     .write_one::<i32>(0, &available)?;
                 Ok(0)
             }
-            _ => Err(SystemError::ENOSYS),
+            _ => Err(SystemError::ENOSYS.into()),
         }
     }
 }

@@ -1599,7 +1599,10 @@ impl MountableFileSystem for Ext4FileSystem {
     fn make_mount_data(
         raw_data: Option<&str>,
         source: &str,
-    ) -> Result<Option<Arc<dyn FileSystemMakerData + 'static>>, SystemError> {
+    ) -> Result<
+        Option<Arc<dyn FileSystemMakerData + 'static>>,
+        crate::mm::allocation::MemoryAllocationError,
+    > {
         let options = Ext4MountOptions::parse(raw_data)?;
         let mount_data = Ext4MountData::from_source(source, options).map_err(|e| {
             log::error!(
@@ -1627,12 +1630,15 @@ impl FileSystemMakerData for Ext4MountData {
 }
 
 impl Ext4MountData {
-    fn from_source(path: &str, options: Ext4MountOptions) -> Result<Self, SystemError> {
+    fn from_source(
+        path: &str,
+        options: Ext4MountOptions,
+    ) -> Result<Self, crate::mm::allocation::MemoryAllocationError> {
         let pcb = ProcessManager::current_pcb();
         let (current_node, rest_path) = user_path_at(&pcb, AtFlags::AT_FDCWD.bits(), path)?;
         let inode = current_node.lookup_follow_symlink(&rest_path, VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
         if !inode.metadata()?.file_type.eq(&vfs::FileType::BlockDevice) {
-            return Err(SystemError::ENOTBLK);
+            return Err(SystemError::ENOTBLK.into());
         }
 
         let disk = inode.dname()?;
@@ -1640,7 +1646,7 @@ impl Ext4MountData {
         if let Some(gendisk) = try_find_gendisk(disk.0.as_str()) {
             return Ok(Self { gendisk, options });
         }
-        Err(SystemError::ENOENT)
+        Err(SystemError::ENOENT.into())
     }
 }
 
@@ -1701,7 +1707,7 @@ mod mount_options_tests {
         assert!(read_only.validate_error_behavior().is_ok());
         assert_eq!(
             options.validate_error_behavior(),
-            Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
+            Err(SystemError::EOPNOTSUPP_OR_ENOTSUP.into())
         );
     }
 
@@ -1717,12 +1723,12 @@ mod mount_options_tests {
         let mut options = Ext4MountOptions::parse(Some("errors=panic")).unwrap();
         assert_eq!(
             options.validate_error_behavior(),
-            Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
+            Err(SystemError::EOPNOTSUPP_OR_ENOTSUP.into())
         );
         options.read_only = true;
         assert_eq!(
             options.validate_error_behavior(),
-            Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
+            Err(SystemError::EOPNOTSUPP_OR_ENOTSUP.into())
         );
     }
 }

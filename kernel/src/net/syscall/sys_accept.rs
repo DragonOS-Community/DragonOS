@@ -3,7 +3,7 @@ use system_error::SystemError;
 use super::socket_fd::SocketFdRef;
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_ACCEPT;
-use crate::filesystem::vfs::file::{File, FileFlags};
+use crate::filesystem::vfs::file::FileFlags;
 use crate::net::posix::SockAddr;
 use crate::process::ProcessManager;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
@@ -122,12 +122,11 @@ pub(crate) fn do_accept(
     // (`EBADF` to `close()`, `EBUSY` to `dup2()`), so it cannot be recycled
     // while the peer address is copied below. `Drop` releases it on every error
     // path; `install()` publishes the file once the syscall is ready to return.
-    let reservation = current
-        .fd_table()
-        .reserve::<1>(current.nofile_soft_limit(), 0, cloexec)?;
+    let reservation = super::reserve_socket_descriptors::<1>(&current, cloexec)?;
 
+    let prepared = super::prepare_socket_file()?;
     let (new_socket, remote_endpoint) = sock.socket()?.accept()?;
-    let new_file = File::new_socket(new_socket, file_mode)?;
+    let new_file = super::finish_socket_file(new_socket, file_mode, prepared)?;
 
     if !addr.is_null() {
         // Copy the peer address into user space.

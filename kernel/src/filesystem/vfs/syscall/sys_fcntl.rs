@@ -3,7 +3,6 @@ use crate::arch::syscall::nr::SYS_FCNTL;
 use crate::filesystem::vfs::fasync::{set_file_fasync, FAsyncHandlerPolicy};
 use crate::filesystem::vfs::FileType;
 use crate::filesystem::vfs::InodeFlags;
-use crate::ipc::pipe::LockedPipeInode;
 use crate::process::RawPid;
 use crate::{
     arch::interrupt::TrapFrame,
@@ -90,9 +89,20 @@ impl SysFcntlHandle {
                 let nofile = current.nofile_soft_limit();
                 let table = current.fd_table();
                 let cloexec = cmd == FcntlCommand::DupFdCloexec;
-                table
-                    .duplicate_min(fd, arg as i32, cloexec, nofile)
-                    .map(|newfd| newfd as usize)
+                let source = table.get_file_by_fd(fd).ok_or(SystemError::EBADF)?;
+                let minimum = arg as i32;
+                if minimum < 0 || minimum as usize >= nofile {
+                    return Err(SystemError::EINVAL);
+                }
+                let reservation = crate::filesystem::vfs::file::File::recover_io(|| {
+                    table.reserve::<1>(
+                        nofile,
+                        minimum as usize,
+                        cloexec,
+                        &crate::cgroup::memory::object_for_task(&current),
+                    )
+                })?;
+                Ok(reservation.commit_arc(source) as usize)
             }
             FcntlCommand::GetFd => {
                 // Get file descriptor flags (close_on_exec is per-fd).
@@ -316,11 +326,7 @@ impl SysFcntlHandle {
                 }
 
                 // 获取 pipe inode 并返回实际大小
-                let inode = file.inode();
-                let pipe_inode = inode
-                    .as_any_ref()
-                    .downcast_ref::<LockedPipeInode>()
-                    .ok_or(SystemError::EBADF)?;
+                let pipe_inode = file.pipe_runtime()?;
 
                 return Ok(pipe_inode.get_pipe_size());
             }
@@ -339,14 +345,12 @@ impl SysFcntlHandle {
                 }
 
                 // 获取 pipe inode 并设置大小
-                let inode = file.inode();
-                let pipe_inode = inode
-                    .as_any_ref()
-                    .downcast_ref::<LockedPipeInode>()
-                    .ok_or(SystemError::EBADF)?;
+                let pipe_inode = file.pipe_runtime()?;
 
                 // set_pipe_size 内部会验证大小是否合法
-                return pipe_inode.set_pipe_size(arg);
+                return crate::filesystem::vfs::file::File::recover_io(|| {
+                    pipe_inode.set_pipe_size(arg)
+                });
             }
             FcntlCommand::GetSeals | FcntlCommand::AddSeals => {
                 let binding = ProcessManager::current_pcb().fd_table();

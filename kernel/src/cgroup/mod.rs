@@ -2,6 +2,9 @@ pub mod controllers;
 pub mod core;
 pub(crate) mod cpu;
 pub(crate) mod cpuset;
+mod file_permissions;
+pub(crate) mod memory;
+mod pids_account;
 pub(crate) mod threaded;
 
 use crate::libs::mutex::{Mutex, MutexGuard};

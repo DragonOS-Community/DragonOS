@@ -3,7 +3,6 @@ use klog_types::{AllocLogItem, LogSource};
 use crate::{
     arch::mm::LockedFrameAllocator,
     debug::klog::mm::mm_debug_log,
-    libs::align::page_align_up,
     mm::{MMArch, MemoryManagementArch, VirtAddr},
 };
 
@@ -15,9 +14,12 @@ use core::{
 };
 
 use super::{
+    footprint::uses_buddy as allocator_select_condition,
     page_frame::{FrameAllocator, PageFrameCount},
-    slab::SLABALLOCATOR,
+    slab::{self, SLABALLOCATOR},
 };
+
+pub(crate) use super::footprint::{allocation_footprint, uses_buddy as allocation_uses_buddy};
 
 /// 类kmalloc的分配器应当实现的trait
 pub trait LocalAlloc {
@@ -35,7 +37,7 @@ static LARGE_ALLOCATION_BYTES: AtomicU64 = AtomicU64::new(0);
 
 #[inline]
 fn buddy_frame_count(layout: Layout) -> PageFrameCount {
-    let count = (page_align_up(layout.size()) / MMArch::PAGE_SIZE).next_power_of_two();
+    let count = super::footprint::buddy_frame_count(layout);
     PageFrameCount::new(count)
 }
 
@@ -118,11 +120,7 @@ impl LocalAlloc for KernelAllocator {
                 .map(|x| x.as_mut_ptr())
                 .unwrap_or_default();
         } else {
-            let mut guard = SLABALLOCATOR.lock_irqsave();
-            if let Some(ref mut slab) = *guard {
-                return slab.allocate(layout);
-            }
-            return core::ptr::null_mut();
+            return slab::allocate(layout);
         }
     }
 
@@ -137,16 +135,11 @@ impl LocalAlloc for KernelAllocator {
                 })
                 .unwrap_or_default();
         } else {
-            let mut guard = SLABALLOCATOR.lock_irqsave();
-            if let Some(ref mut slab) = *guard {
-                let ptr = slab.allocate(layout);
-                drop(guard);
-                if !ptr.is_null() {
-                    core::ptr::write_bytes(ptr, 0, layout.size());
-                }
-                return ptr;
+            let ptr = slab::allocate(layout);
+            if !ptr.is_null() {
+                core::ptr::write_bytes(ptr, 0, layout.size());
             }
-            return core::ptr::null_mut();
+            return ptr;
         }
     }
 
@@ -192,11 +185,6 @@ unsafe impl GlobalAlloc for KernelAllocator {
         }
         self.local_dealloc(ptr, layout);
     }
-}
-
-/// 判断选择buddy分配器还是slab分配器
-fn allocator_select_condition(layout: Layout) -> bool {
-    layout.size() > 2048
 }
 
 fn alloc_debug_log(source: LogSource, layout: Layout, ptr: *mut u8) {

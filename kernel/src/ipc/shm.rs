@@ -50,7 +50,10 @@ pub type SysVShmBackingRef = Arc<dyn SysVShmBacking>;
 pub trait SysVShmBacking: fmt::Debug + Send + Sync {
     fn inode_id(&self) -> InodeId;
 
-    fn open_file(&self, readonly: bool) -> Result<Arc<File>, SystemError>;
+    fn open_file(
+        &self,
+        readonly: bool,
+    ) -> Result<Arc<File>, crate::mm::allocation::MemoryAllocationError>;
 
     fn resident_pages(&self) -> Result<usize, SystemError>;
 
@@ -62,13 +65,16 @@ impl SysVShmBacking for TmpfsShmemFile {
         TmpfsShmemFile::inode_id(self)
     }
 
-    fn open_file(&self, readonly: bool) -> Result<Arc<File>, SystemError> {
+    fn open_file(
+        &self,
+        readonly: bool,
+    ) -> Result<Arc<File>, crate::mm::allocation::MemoryAllocationError> {
         let flags = if readonly {
             FileFlags::O_LARGEFILE
         } else {
             FileFlags::O_RDWR | FileFlags::O_LARGEFILE
         };
-        Ok(Arc::new(File::new_pseudo(self.inode(), flags)?))
+        Arc::try_new(File::new_pseudo(self.inode(), flags)?).map_err(|_| SystemError::ENOMEM.into())
     }
 
     fn resident_pages(&self) -> Result<usize, SystemError> {
@@ -226,8 +232,8 @@ impl SysVShmAttach {
         backing_inode_id: InodeId,
         size: usize,
         attach_file: Arc<File>,
-    ) -> Arc<Self> {
-        Arc::new(Self {
+    ) -> Result<Arc<Self>, SystemError> {
+        Arc::try_new(Self {
             attach_id: NEXT_SYSV_SHM_ATTACH_ID.fetch_add(1, Ordering::Relaxed),
             ipcns,
             shmid,
@@ -235,6 +241,7 @@ impl SysVShmAttach {
             size,
             attach_file,
         })
+        .map_err(|_| SystemError::ENOMEM)
     }
 
     pub fn attach_id(&self) -> u64 {
@@ -315,7 +322,10 @@ impl SysVShmAttachGuard {
         self.size
     }
 
-    pub fn create_attach(&self, readonly: bool) -> Result<Arc<SysVShmAttach>, SystemError> {
+    pub fn create_attach(
+        &self,
+        readonly: bool,
+    ) -> Result<Arc<SysVShmAttach>, crate::mm::allocation::MemoryAllocationError> {
         let attach_file = self.backing.open_file(readonly)?;
         Ok(SysVShmAttach::new(
             self.ipcns.clone(),
@@ -323,7 +333,7 @@ impl SysVShmAttachGuard {
             self.backing_inode_id,
             self.size,
             attach_file,
-        ))
+        )?)
     }
 
     pub fn finish(mut self) {
@@ -492,7 +502,7 @@ impl ShmManager {
     pub fn create_default_backing(
         key: ShmKey,
         size: usize,
-    ) -> Result<SysVShmBackingRef, SystemError> {
+    ) -> Result<SysVShmBackingRef, crate::mm::allocation::MemoryAllocationError> {
         let name = alloc::format!("SYSV{:08x}", key.data() as u32);
         Ok(create_unlinked_shmem_file(&name, size)?)
     }

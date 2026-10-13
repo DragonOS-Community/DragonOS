@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/mman.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
 #include <sys/wait.h>
@@ -18,6 +19,31 @@
 #include <string>
 
 namespace {
+
+class TwoPageOutput {
+ public:
+  ~TwoPageOutput() {
+    if (mapping_ != MAP_FAILED) munmap(mapping_, page_size_ * 2);
+  }
+
+  bool Create() {
+    const long size = sysconf(_SC_PAGESIZE);
+    if (size <= 0) return false;
+    page_size_ = static_cast<size_t>(size);
+    mapping_ = mmap(nullptr, page_size_ * 2, PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    return mapping_ != MAP_FAILED &&
+           mprotect(static_cast<char*>(mapping_) + page_size_, page_size_, PROT_NONE) == 0;
+  }
+
+  int* pair() {
+    return reinterpret_cast<int*>(static_cast<char*>(mapping_) + page_size_ - sizeof(int));
+  }
+
+ private:
+  void* mapping_ = MAP_FAILED;
+  size_t page_size_ = 0;
+};
 
 class PipeFds {
  public:
@@ -34,6 +60,36 @@ class PipeFds {
  private:
   int fds_[2] = {-1, -1};
 };
+
+TEST(PipeMetadata, FaultingDescriptorPairDoesNotPublishOrLeakDescriptors) {
+  TwoPageOutput output;
+  ASSERT_TRUE(output.Create()) << strerror(errno);
+  int baseline[2];
+  ASSERT_EQ(0, pipe2(baseline, O_CLOEXEC)) << strerror(errno);
+  ASSERT_EQ(0, close(baseline[0]));
+  ASSERT_EQ(0, close(baseline[1]));
+
+  // The first int is writable, but the second lies on a protected page.
+  // Do not close any partially copied number: the failed pair was not installed.
+  for (int attempt = 0; attempt < 16; ++attempt) {
+    errno = 0;
+    EXPECT_EQ(-1, pipe2(output.pair(), O_CLOEXEC | O_NONBLOCK));
+    EXPECT_EQ(EFAULT, errno);
+  }
+  errno = 0;
+  EXPECT_EQ(-1, pipe2(output.pair(), O_APPEND));
+  EXPECT_EQ(EINVAL, errno);  // Flags are rejected before attempting user output.
+
+  PipeFds final_pair;
+  ASSERT_TRUE(final_pair.Open()) << strerror(errno);
+  EXPECT_EQ(baseline[0], final_pair.read_fd());
+  EXPECT_EQ(baseline[1], final_pair.write_fd());
+  char byte = 'p';
+  ASSERT_EQ(1, write(final_pair.write_fd(), &byte, 1));
+  char received = 0;
+  ASSERT_EQ(1, read(final_pair.read_fd(), &received, 1));
+  EXPECT_EQ(byte, received);
+}
 
 class TempFifo {
  public:

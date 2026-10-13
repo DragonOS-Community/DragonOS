@@ -34,12 +34,14 @@ impl Syscall for SysStatfsHandle {
         let (start_path, remain_path) =
             user_resolved_path_at(&pcb, AtFlags::AT_FDCWD.bits(), &path)?;
         let inode_begin = start_path.inode();
-        let resolved = inode_begin.lookup_follow_symlink_owned(
-            &start_path,
-            &remain_path,
-            VFS_MAX_FOLLOW_SYMLINK_TIMES,
-            true,
-        )?;
+        let resolved = crate::filesystem::vfs::file::File::recover_io(|| {
+            inode_begin.lookup_follow_symlink_owned(
+                &start_path,
+                &remain_path,
+                VFS_MAX_FOLLOW_SYMLINK_TIMES,
+                true,
+            )
+        })?;
         let inode = resolved.inode();
         let sb = inode.fs().statfs(&inode)?;
         let statfs = PosixStatfs::from(sb);

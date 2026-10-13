@@ -43,9 +43,9 @@ pub fn do_symlinkat(from: &str, newdfd: Option<i32>, to: &str) -> Result<usize, 
     // 当路径只有文件名（没有目录部分）时，new_parent_path 为 None，
     // 此时父目录就是 new_begin_inode 本身（即 cwd 或 dirfd 指向的目录）
     let new_parent = match new_parent_path {
-        Some(parent_path) => {
-            new_begin_inode.lookup_follow_symlink(parent_path, VFS_MAX_FOLLOW_SYMLINK_TIMES)?
-        }
+        Some(parent_path) => crate::filesystem::vfs::file::File::recover_io(|| {
+            new_begin_inode.lookup_follow_symlink(parent_path, VFS_MAX_FOLLOW_SYMLINK_TIMES)
+        })?,
         None => new_begin_inode,
     };
 
@@ -73,9 +73,11 @@ pub fn do_symlinkat(from: &str, newdfd: Option<i32>, to: &str) -> Result<usize, 
         fsnotify::fsnotify(FsEvent::CREATE, Some((&new_parent, new_name)), None, 0);
     };
     if let Some(mounted) = new_parent.clone().downcast_arc::<MountFSInode>() {
-        mounted.symlink_with_post_commit(new_name, from, notify)?;
+        super::super::file::File::recover_io(|| {
+            mounted.symlink_with_post_commit(new_name, from, notify)
+        })?;
     } else {
-        new_parent.symlink(new_name, from)?;
+        super::super::file::File::recover_io(|| new_parent.symlink(new_name, from))?;
         notify();
     }
 

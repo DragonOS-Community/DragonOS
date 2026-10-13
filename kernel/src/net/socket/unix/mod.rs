@@ -381,7 +381,7 @@ impl UnixEndpoint {
         self,
         netns: &Arc<NetNamespace>,
         socket_type: UnixSocketType,
-    ) -> Result<UnixBinding, SystemError> {
+    ) -> Result<UnixBinding, crate::mm::allocation::MemoryAllocationError> {
         let bound = match self {
             Self::Unnamed => UnixBinding::abstract_name(
                 netns
@@ -410,7 +410,9 @@ impl UnixEndpoint {
                     .map_err(|e| match e {
                         // Linux/Posix bind 语义：地址已被占用应返回 EADDRINUSE。
                         // VFS 创建节点遇到同名条目通常返回 EEXIST，需要在 socket 层进行语义映射。
-                        SystemError::EEXIST => SystemError::EADDRINUSE,
+                        crate::mm::allocation::MemoryAllocationError::System(
+                            SystemError::EEXIST,
+                        ) => SystemError::EADDRINUSE.into(),
                         other => other,
                     })?;
                 UnixBinding::path(PathAddress::new(inode, DName::from(path))?)
@@ -453,8 +455,32 @@ impl UnixEndpoint {
                     crate::filesystem::vfs::fcntl::AtFlags::AT_FDCWD.bits(),
                     path.trim(),
                 )?;
-                let inode =
-                    inode_begin.lookup_follow_symlink(&path, VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
+                // All connect_in callers resolve before taking socket/backend
+                // guards. Lookup has not published the connection, so quota
+                // recovery may retry this read-only resolution stage only.
+                let mut recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
+                let inode = loop {
+                    match inode_begin.lookup_follow_symlink(&path, VFS_MAX_FOLLOW_SYMLINK_TIMES) {
+                        Ok(inode) => break inode,
+                        Err(crate::mm::allocation::MemoryAllocationError::System(error)) => {
+                            return Err(error);
+                        }
+                        Err(crate::mm::allocation::MemoryAllocationError::Charge(failure)) => {
+                            use crate::cgroup::memory::runtime::{
+                                recover_charge, MemoryAllocPolicy, RecoveryDecision,
+                            };
+                            match recover_charge(
+                                &failure,
+                                MemoryAllocPolicy::ReclaimThenOom,
+                                0,
+                                &mut recovery,
+                            )? {
+                                RecoveryDecision::RetryOperation => continue,
+                                RecoveryDecision::Exhausted => return Err(SystemError::ENOMEM),
+                            }
+                        }
+                    }
+                };
                 if inode.metadata()?.file_type != FileType::Socket {
                     return Err(SystemError::ECONNREFUSED);
                 }

@@ -328,8 +328,12 @@ fn fault_in_remote_page(
     force: bool,
 ) -> Result<PinnedRemotePage, SystemError> {
     let mut tried = false;
+    let mut charge_recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
     loop {
-        let retry_wait = {
+        let creator =
+            crate::cgroup::memory::object_for_task(&crate::process::ProcessManager::current_pcb());
+        let data_account = mm.memory_account();
+        let (retry_wait, retry_flags) = {
             let mut guard = mm.write();
             let vma = guard
                 .mappings
@@ -356,7 +360,15 @@ fn fault_in_remote_page(
                 if extension > max_stack || !guard.can_extend_stack(extension) {
                     return Err(SystemError::EFAULT);
                 }
-                let post_commit = guard.extend_stack(extension)?;
+                let post_commit = match guard.extend_stack(extension, Some(&creator), &data_account)
+                {
+                    Ok(request) => request,
+                    Err(error) => {
+                        drop(guard);
+                        error.recover(&mut charge_recovery)?;
+                        continue;
+                    }
+                };
                 drop(guard);
                 if let Some(request) = post_commit {
                     mm.populate_locked_vma_post_commit(request)?;
@@ -387,9 +399,21 @@ fn fault_in_remote_page(
                     flags,
                     &mut guard.user_mapper.utable,
                     mm.clone(),
+                    creator.clone(),
+                    data_account.clone(),
                 );
                 PageFaultHandler::handle_mm_fault(message)
             };
+            if let Some(failure) = outcome.charge_failure {
+                drop(guard);
+                crate::mm::fault::recover_fault_charge(
+                    failure,
+                    &mut charge_recovery,
+                    &data_account,
+                    flags,
+                )?;
+                continue;
+            }
             if outcome.reason.contains(VmFaultReason::VM_FAULT_COMPLETED) {
                 let page_addr = VirtAddr::new(address.data() & !(MMArch::PAGE_SIZE - 1));
                 let frame = guard
@@ -419,11 +443,34 @@ fn fault_in_remote_page(
             if !outcome.reason.contains(VmFaultReason::VM_FAULT_RETRY) {
                 return Err(SystemError::EFAULT);
             }
-            outcome.retry_wait
+            (outcome.retry_wait, flags)
         };
 
         if let Some(wait) = retry_wait {
-            wait.wait()?;
+            let result = match wait.wait() {
+                Err(crate::mm::allocation::MemoryAllocationError::Charge(failure)) => {
+                    crate::mm::fault::recover_fault_charge(
+                        failure,
+                        &mut charge_recovery,
+                        &data_account,
+                        retry_flags,
+                    )?;
+                    tried = true;
+                    continue;
+                }
+                Err(crate::mm::allocation::MemoryAllocationError::System(error)) => Err(error),
+                Ok(()) => Ok(()),
+            };
+            if let Err(error) = result {
+                if !matches!(error, SystemError::EINTR | SystemError::ERESTARTSYS) {
+                    crate::mm::fault::account_fault_result(
+                        &data_account,
+                        retry_flags,
+                        VmFaultReason::VM_FAULT_SIGBUS,
+                    );
+                }
+                return Err(error);
+            }
         } else {
             crate::sched::sched_yield();
         }

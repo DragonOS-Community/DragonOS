@@ -2,7 +2,7 @@ use crate::alloc::string::ToString;
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_PIDFD_OPEN;
 use crate::filesystem::vfs::file::FileFlags;
-use crate::process::pidfd::PidFd;
+use crate::process::{pid::PidType, pidfd::PidFd};
 use crate::process::{ProcessManager, RawPid};
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
@@ -48,7 +48,19 @@ impl Syscall for SysPidFdOpen {
         }
         let pid = ProcessManager::find_vpid(RawPid::new(pid as usize)).ok_or(SystemError::ESRCH)?;
         let current = ProcessManager::current_pcb();
-        let prepared = PidFd::prepare(&current, pid, file_flags, true)?;
+        // Validate the original target once, before admission can wait. The
+        // retained Arc is the operation's identity even if its numeric PID is
+        // later recycled or the target exits during memory recovery.
+        if pid.pid_task(PidType::TGID).is_none() {
+            return Err(SystemError::EINVAL);
+        }
+        let mut recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
+        let prepared = loop {
+            match PidFd::prepare(&current, pid.clone(), file_flags, false) {
+                Ok(prepared) => break prepared,
+                Err(error) => error.recover(&mut recovery)?,
+            }
+        };
 
         // 存入pcb
         // Linux 的 __pidfd_prepare() 无条件对 pidfd 设置 O_CLOEXEC，

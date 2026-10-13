@@ -21,11 +21,19 @@ pub(in crate::bpf) fn get_fd_by_id(attr: &bpf_attr) -> Result<usize> {
     }
     let id = unsafe { attr.__bindgen_anon_6.__bindgen_anon_1.prog_id };
     let program = program_by_id(id).ok_or(SystemError::ENOENT)?;
+    let storage = crate::filesystem::vfs::file::PreparedFile::new_recovering()?;
     let pcb = ProcessManager::current_pcb();
-    let file = File::new(program, FileFlags::O_RDWR)?;
-    pcb.fd_table()
-        .alloc_fd(file, false, pcb.nofile_soft_limit())
-        .map(|fd| fd as usize)
+    let file = File::new_prepared_recovering(program, FileFlags::O_RDWR, storage)?;
+    let file = alloc::sync::Arc::try_new(file).map_err(|_| SystemError::ENOMEM)?;
+    File::recover_io(|| {
+        pcb.fd_table().alloc_fd_arc(
+            file.clone(),
+            false,
+            pcb.nofile_soft_limit(),
+            &crate::cgroup::memory::object_for_task(&pcb),
+        )
+    })
+    .map(|fd| fd as usize)
 }
 
 fn write_info_len(user_attr: *mut u8, len: u32) -> Result<()> {

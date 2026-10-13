@@ -112,8 +112,11 @@ impl ProcessManager {
         // same saved stack/context.
         pcb.sched_info().wait_until_not_running();
 
-        let allowed = pi_guard.cpus_allowed.clone();
-        let target_cpu = select_task_rq(pcb, prev_cpu, WakeupFlags::WF_TTWU, &allowed);
+        // pi_lock already pins this affinity snapshot through enqueue. A
+        // borrowed mask avoids allocating an AllocBitmap while waking an OOM
+        // victim; it does not change the selection or locking protocol.
+        let target_cpu =
+            select_task_rq(pcb, prev_cpu, WakeupFlags::WF_TTWU, &pi_guard.cpus_allowed);
 
         if was_uninterruptible || pcb.flags().contains(ProcessFlags::IN_IOWAIT) {
             let prev_rq = cpu_rq(prev_cpu.data() as usize);
@@ -144,7 +147,7 @@ impl ProcessManager {
 
         let target_cpu = pcb.sched_info().consume_new_task_target_cpu(
             smp_get_processor_id(),
-            pi_guard.cpus_allowed.clone(),
+            &pi_guard.cpus_allowed,
             |allowed| {
                 let cpu =
                     select_task_rq(pcb, smp_get_processor_id(), WakeupFlags::WF_FORK, allowed);

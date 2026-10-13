@@ -42,8 +42,8 @@ impl CpuTimeSnapshot {
 
 impl ProcessControlBlock {
     #[inline(always)]
-    pub fn cputime(&self) -> Arc<ProcessCpuTime> {
-        self.cpu_time.clone()
+    pub fn cputime(&self) -> &ProcessCpuTime {
+        &self.cpu_time
     }
 
     /// Linux CPUCLOCK_SCHED: settle actual runtime, never project wall time.
@@ -68,7 +68,7 @@ impl ProcessControlBlock {
         let runtime = self.process_cputime_ns();
         let sample = self.process_cputime_snapshot();
         self.process_signal()
-            .cpu_time_adjustment
+            .cpu_time_adjustment()
             .lock_irqsave()
             .adjust(runtime, sample.user, sample.system)
     }

@@ -15,7 +15,7 @@ use alloc::{sync::Arc, vec::Vec};
 use crate::{
     arch::MMArch,
     mm::{
-        page::{page_manager_lock, Page},
+        page::{page_manager_lock, DetachedUserTables, Page},
         tlb::TLB_FLUSH_ALL,
         ucontext::AddressSpace,
         MemoryManagementArch, PhysAddr, VirtAddr,
@@ -31,15 +31,23 @@ use crate::{
 /// // ... call PageMapper to unmap, pass the returned PhysAddr to tlb.remove_page(paddr) ...
 /// tlb.finish(); // flush TLB first, then free pages
 /// ```
+enum GatherTarget<'mm> {
+    AddressSpace(&'mm Arc<AddressSpace>),
+    /// Bootstrap/shared kernel mappings may be loaded without mm tracking.
+    AllOnline,
+    /// An unpublished/inactive mm cannot have stale translations.
+    Inactive,
+}
+
 pub struct MmuGather<'mm> {
-    /// Target mm for shootdown.
+    /// Translation holders to invalidate before physical retirement.
     ///
-    /// `None` means "no shootdown needed" — used on the teardown path (`Drop for InnerAddressSpace`)
+    /// `Inactive` means "no shootdown needed" — used on the teardown path (`Drop for InnerAddressSpace`)
     /// where the `Arc<AddressSpace>` itself is being dropped, so its strong-count has already hit 0,
     /// `Weak::upgrade` can no longer obtain the Arc, and `active_cpus` has already been cleared by
     /// all process-exit paths. In this case there is literally no CPU holding a TLB entry for this mm,
     /// so `flush_mmu_tlbonly` becomes a no-op while the page-free bookkeeping still runs.
-    mm: Option<&'mm Arc<AddressSpace>>,
+    target: GatherTarget<'mm>,
     /// Range start (to be accumulated)
     start: VirtAddr,
     /// Range end (to be accumulated, exclusive)
@@ -50,6 +58,7 @@ pub struct MmuGather<'mm> {
     freed_tables: bool,
     /// Accumulated physical pages pending release (dropped after flush_mmu_tlbonly)
     pending_pages: Vec<Arc<Page>>,
+    pending_tables: DetachedUserTables,
     /// Stride shift (typically PAGE_SHIFT)
     stride_shift: u8,
     /// Whether finish() has been called, preventing double free
@@ -60,12 +69,13 @@ impl<'mm> MmuGather<'mm> {
     /// Start a gather. Initial range is empty; expand via `accumulate_range` later.
     pub fn gather(mm: &'mm Arc<AddressSpace>) -> Self {
         Self {
-            mm: Some(mm),
+            target: GatherTarget::AddressSpace(mm),
             start: VirtAddr::new(usize::MAX),
             end: VirtAddr::new(0),
             fullmm: false,
             freed_tables: false,
             pending_pages: Vec::new(),
+            pending_tables: DetachedUserTables::new(),
             stride_shift: MMArch::PAGE_SHIFT as u8,
             finished: false,
         }
@@ -78,15 +88,25 @@ impl<'mm> MmuGather<'mm> {
     /// `flush_mmu_tlbonly` is a no-op on this variant; `finish()` still drops stashed pages.
     pub fn gather_teardown() -> Self {
         Self {
-            mm: None,
+            target: GatherTarget::Inactive,
             start: VirtAddr::new(usize::MAX),
             end: VirtAddr::new(0),
             fullmm: false,
             freed_tables: false,
             pending_pages: Vec::new(),
+            pending_tables: DetachedUserTables::new(),
             stride_shift: MMArch::PAGE_SHIFT as u8,
             finished: false,
         }
+    }
+
+    /// Bootstrap mappings are installed by direct CR3 writes before normal
+    /// active-mm tracking. Retire their tables only after every online CPU
+    /// acknowledges the shootdown. The caller must finish outside MM/IRQ locks.
+    pub(crate) fn gather_all_online() -> Self {
+        let mut gather = Self::gather_teardown();
+        gather.target = GatherTarget::AllOnline;
+        gather
     }
 
     /// Mark the entire mm as needing a flush (full-segment munmap or exit path).
@@ -97,6 +117,13 @@ impl<'mm> MmuGather<'mm> {
     /// Mark that this gather also freed page-table pages.
     pub fn note_pt_table_freed(&mut self) {
         self.freed_tables = true;
+    }
+
+    pub(crate) fn stash_user_tables(&mut self, tables: DetachedUserTables) {
+        if !tables.is_empty() {
+            self.freed_tables = true;
+        }
+        self.pending_tables.append(tables);
     }
 
     /// Merge a `[vaddr, vaddr + (1 << stride_shift))` interval into the flush range.
@@ -136,7 +163,7 @@ impl<'mm> MmuGather<'mm> {
     /// After this call, `start/end/freed_tables` are reset, allowing a second round of accumulation
     /// within the same gather.
     pub fn flush_mmu_tlbonly(&mut self) {
-        if let Some(mm) = self.mm {
+        if let GatherTarget::AddressSpace(mm) = self.target {
             if self.fullmm || self.start == VirtAddr::new(usize::MAX) {
                 mm.flush_tlb_range(
                     VirtAddr::new(0),
@@ -147,8 +174,15 @@ impl<'mm> MmuGather<'mm> {
             } else if self.start < self.end {
                 mm.flush_tlb_range(self.start, self.end, self.stride_shift, self.freed_tables);
             }
+        } else if matches!(self.target, GatherTarget::AllOnline) {
+            let (start, end) = if self.fullmm || self.start == VirtAddr::new(usize::MAX) {
+                (VirtAddr::new(0), TLB_FLUSH_ALL)
+            } else {
+                (self.start, self.end)
+            };
+            crate::mm::tlb::flush_tlb_kernel_range(start, end, self.freed_tables || self.fullmm);
         }
-        // else: teardown path -- no CPU holds a TLB entry for this mm anymore, skip shootdown.
+        // Inactive: no CPU holds a translation, so retirement needs no shootdown.
 
         self.start = VirtAddr::new(usize::MAX);
         self.end = VirtAddr::new(0);
@@ -162,6 +196,7 @@ impl<'mm> MmuGather<'mm> {
     pub fn flush_mmu_free(&mut self) {
         // Drop all Arc<Page>, letting InnerPage::drop reach deallocate_page_frames
         self.pending_pages.clear();
+        unsafe { self.pending_tables.free_after_flush() };
     }
 
     /// Finish the gather: flush TLB first, then free pages.

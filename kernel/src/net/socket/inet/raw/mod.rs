@@ -56,6 +56,19 @@ pub(crate) use pmtu::handle_pmtu_feedback;
 #[cast_to([sync] crate::net::socket::Socket)]
 #[derive(Debug)]
 pub struct RawSocket {
+    data: crate::libs::lazy_init::Lazy<crate::cgroup::memory::owned::OwnedBox<RawSocketData>>,
+}
+
+impl core::ops::Deref for RawSocket {
+    type Target = RawSocketData;
+    fn deref(&self) -> &Self::Target {
+        self.data.get()
+    }
+}
+
+#[derive(Debug)]
+pub struct RawSocketData {
+    memory: crate::net::socket::buffer::SocketMemory,
     /// 内部状态
     inner: RwSem<Option<RawInner>>,
     /// socket 选项
@@ -70,13 +83,13 @@ pub struct RawSocket {
     open_files: AtomicUsize,
     fsnotify_watches: AtomicUsize,
     /// 自引用
-    self_ref: Weak<Self>,
+    self_ref: Weak<RawSocket>,
     /// 网络命名空间
     netns: Arc<NetNamespace>,
     /// SO_BINDTODEVICE authoritative interface index.
     device_binding: SocketDeviceBinding,
     /// Bytes of complete IPv4 datagrams retained by the output owner.
-    send_account: Arc<super::common::output_account::SocketOutputAccount<Self>>,
+    send_account: Arc<super::common::output_account::SocketOutputAccount<RawSocket>>,
     /// epoll 项
     epoll_items: EPollItems,
     /// fasync 项

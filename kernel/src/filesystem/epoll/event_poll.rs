@@ -143,7 +143,15 @@ impl EventPoll {
 
         let current_pcb = ProcessManager::current_pcb();
         let fd_table = current_pcb.fd_table();
-        let fd = fd_table.alloc_fd(ep_file, cloexec, current_pcb.nofile_soft_limit())?;
+        let ep_file = Arc::try_new(ep_file).map_err(|_| SystemError::ENOMEM)?;
+        let fd = File::recover_io(|| {
+            fd_table.alloc_fd_arc(
+                ep_file.clone(),
+                cloexec,
+                current_pcb.nofile_soft_limit(),
+                &crate::cgroup::memory::object_for_task(&current_pcb),
+            )
+        })?;
 
         Ok(fd as usize)
     }
@@ -155,14 +163,16 @@ impl EventPoll {
         }
 
         // 创建epoll
+        let storage = crate::filesystem::vfs::file::PreparedFile::new_recovering()?;
         let epoll = Self::do_create_epoll();
 
         // 创建epoll的inode对象
         let epoll_inode = EPollInode::new(epoll.clone());
 
-        let mut ep_file = File::new(
+        let mut ep_file = File::new_prepared_recovering(
             epoll_inode,
             FileFlags::O_RDWR | (flags & FileFlags::O_CLOEXEC),
+            storage,
         )?;
 
         // 设置ep_file的FilePrivateData
@@ -252,6 +262,60 @@ impl EventPoll {
             Self::ep_loop_check(&src_epoll, &dst_epoll)?;
         }
 
+        let key = EPollKey::new(&dst_file, dstfd);
+        let candidate = if op == EPollCtlOption::Add {
+            // Linux validates the target's poll operation before epitem
+            // allocation. Do not replace these errors with quota ENOMEM.
+            if dst_file.is_always_ready() {
+                return Err(SystemError::EPERM);
+            }
+            if !dst_file.supports_poll() {
+                return Err(SystemError::ENOSYS);
+            }
+            let mut recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
+            loop {
+                let (ready_state, poll_epitems) = {
+                    let guard = if nonblock {
+                        epoll_data
+                            .epoll
+                            .0
+                            .try_lock()
+                            .map_err(|_| SystemError::EAGAIN_OR_EWOULDBLOCK)?
+                    } else {
+                        epoll_data.epoll.0.lock()
+                    };
+                    // Existing registrations must fail before birth/charge.
+                    if guard.ep_items.get(&key).is_some() {
+                        return Err(SystemError::EEXIST);
+                    }
+                    (
+                        Arc::downgrade(&guard.ready_state),
+                        Arc::downgrade(&guard.poll_epitems),
+                    )
+                };
+                let creator =
+                    crate::cgroup::memory::object_for_task(&ProcessManager::current_pcb());
+                match EPollItem::try_new(
+                    &creator,
+                    Arc::downgrade(&epoll_data.epoll.0),
+                    ready_state,
+                    poll_epitems,
+                    key,
+                    epds,
+                    Arc::downgrade(&dst_file),
+                ) {
+                    Ok(item) => break Some(item),
+                    // The failed entity and all its receipts already dropped;
+                    // this is outside source/private/IRQ resource guards.
+                    Err(error) => error.recover(&mut recovery)?,
+                }
+            }
+        } else {
+            None
+        };
+        // Pins outlive the commit guard on every error/rollback path. In
+        // particular DEL must not free an accounted body under the mutex.
+        let mut retired = None;
         let notify_nested = {
             let mut epoll_guard = {
                 if nonblock {
@@ -266,7 +330,6 @@ impl EventPoll {
                 }
             };
 
-            let key = EPollKey::new(&dst_file, dstfd);
             let ep_item = epoll_guard.ep_items.get(&key).cloned();
             let notify_nested = match op {
                 EPollCtlOption::Add => {
@@ -275,21 +338,20 @@ impl EventPoll {
                         return Err(SystemError::EEXIST);
                     }
 
-                    // 设置epoll
-                    let epitem = Arc::new(EPollItem::new(
-                        Arc::downgrade(&epoll_data.epoll.0),
-                        Arc::downgrade(&epoll_guard.ready_state),
-                        Arc::downgrade(&epoll_guard.poll_epitems),
-                        key,
-                        epds,
-                        Arc::downgrade(&dst_file),
-                    ));
-                    Self::ep_insert(&mut epoll_guard, dst_file, epitem)?
+                    Self::ep_insert(
+                        &mut epoll_guard,
+                        dst_file.clone(),
+                        candidate
+                            .as_ref()
+                            .expect("ADD has prepared candidate")
+                            .clone(),
+                    )?
                 }
                 EPollCtlOption::Del => match ep_item {
                     Some(ref ep_item) => {
+                        retired = Some(ep_item.clone());
                         // 删除
-                        Self::ep_remove(&mut epoll_guard, key, Some(dst_file), ep_item)?;
+                        Self::ep_remove(&mut epoll_guard, key, Some(dst_file.clone()), ep_item)?;
                         false
                     }
                     None => {
@@ -321,6 +383,8 @@ impl EventPoll {
                 None
             }
         };
+        drop(retired);
+        drop(candidate);
 
         if let Some(poll_epitems) = notify_nested {
             let _ = Self::wakeup_epoll(

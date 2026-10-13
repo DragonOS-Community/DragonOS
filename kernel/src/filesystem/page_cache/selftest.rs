@@ -2803,7 +2803,9 @@ fn run_memcg_reclaim_scan_budget_selftest() -> Result<bool, SystemError> {
 /// Exercise the actual NOIO scanner/retirement path. Self-held resource locks
 /// are intentional: a blocking fallback would deadlock the proc selftest.
 fn run_memcg_noio_reclaim_selftest() -> Result<bool, SystemError> {
+    use crate::cgroup::memory::accounting::{ChargeFailure, ChargeFailureReason};
     use crate::cgroup::memory::{MemoryAccount, MemoryEvent, MemoryPolicy};
+    use crate::mm::allocation::MemoryAllocationError;
     use crate::mm::{
         allocator::page_frame::PageFrameCount,
         page::{EntryFlags, PageReclaimer},
@@ -2811,6 +2813,17 @@ fn run_memcg_noio_reclaim_selftest() -> Result<bool, SystemError> {
         VirtAddr, VirtRegion, VmFlags,
     };
     let root = MemoryAccount::new(0, None)?;
+    // The hard counter cap must terminate before task-local policy lookup.
+    // Keep the same outer allocation-error entry used by stacked I/O callers.
+    let overflow = MemoryAllocationError::Charge(ChargeFailure {
+        account: root.clone(),
+        reason: ChargeFailureReason::CounterOverflow,
+        request_kind: crate::cgroup::memory::MemoryKind::File,
+        requested_pages: 1,
+    });
+    if overflow.recover(&mut Default::default()) != Err(SystemError::ENOMEM) {
+        return Ok(false);
+    }
     let a = MemoryAccount::new(0, Some(root.clone()))?;
     let b = MemoryAccount::new(0, Some(root.clone()))?;
     let mut fixture = MemcgReclaimFixture::new();

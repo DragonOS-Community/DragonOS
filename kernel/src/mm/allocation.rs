@@ -3,7 +3,7 @@
 use system_error::SystemError;
 
 use crate::cgroup::memory::{
-    accounting::ChargeFailure,
+    accounting::{ChargeFailure, ChargeFailureReason},
     runtime::{recover_charge, ChargeRecoveryState, MemoryAllocPolicy, RecoveryDecision},
 };
 use crate::mm::oom_reaper::JobBirthError;
@@ -41,6 +41,11 @@ impl MemoryAllocationError {
     pub(crate) fn recover(self, state: &mut ChargeRecoveryState) -> Result<(), SystemError> {
         match self {
             Self::System(error) => Err(error),
+            // The hard counter cap is never reclaimable, including during
+            // bootstrap before a current task exists. Do not query NOIO first.
+            Self::Charge(failure) if failure.reason == ChargeFailureReason::CounterOverflow => {
+                Err(SystemError::ENOMEM)
+            }
             Self::Charge(failure) => {
                 let policy = if crate::cgroup::memory::io::noio_active() {
                     MemoryAllocPolicy::ReclaimNoIo

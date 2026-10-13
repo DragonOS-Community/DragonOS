@@ -416,6 +416,30 @@ impl TcpSocket {
         matches!(self.inner.read().as_ref(), Some(inner::Inner::Listening(_)))
     }
 
+    /// Capacity preparation is speculative: another socket may consume its
+    /// vacancy before commit. Retry only a full-table conflict that returned
+    /// the original Unbound protocol, before any connection was initiated.
+    /// The attempt must release all transaction guards before returning.
+    pub(super) fn with_new_handle_capacity(
+        &self,
+        mut attempt: impl FnMut() -> Result<(), SystemError>,
+    ) -> Result<(), SystemError> {
+        loop {
+            self.prepare_new_handle_capacity()?;
+            let result = attempt();
+            if result != Err(SystemError::ENOBUFS)
+                || !matches!(
+                    self.inner.read().as_ref(),
+                    Some(inner::Inner::Init(inner::Init::Unbound(_)))
+                )
+            {
+                return result;
+            }
+            // No inner, table, registration or port guard crosses recovery.
+            crate::sched::cond_resched();
+        }
+    }
+
     /// Binding an unbound protocol value is the only Init transition that
     /// needs a new table slot. Prepare the shared array before acquiring the
     /// transaction's inner guard; a racing bind may make preparation obsolete.

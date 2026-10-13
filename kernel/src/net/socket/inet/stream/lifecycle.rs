@@ -240,7 +240,10 @@ impl TcpSocket {
         ) {
             return Err(SystemError::EINVAL);
         }
-        self.prepare_new_handle_capacity()?;
+        self.with_new_handle_capacity(|| self.bind_once(local_endpoint))
+    }
+
+    fn bind_once(&self, local_endpoint: smoltcp::wire::IpEndpoint) -> Result<(), SystemError> {
         let reserved = self.prepare_bound_slot()?;
         let mut writer = self.inner.write();
         let local_endpoint = self.normalize_endpoint(local_endpoint, false)?;
@@ -489,13 +492,18 @@ impl TcpSocket {
         }
     }
 
-    // SHOULD refactor
     pub fn start_connect(
         &self,
         remote_endpoint: smoltcp::wire::IpEndpoint,
     ) -> Result<(), SystemError> {
         self.normalize_endpoint(remote_endpoint, true)?;
-        self.prepare_new_handle_capacity()?;
+        self.with_new_handle_capacity(|| self.start_connect_once(remote_endpoint))
+    }
+
+    fn start_connect_once(
+        &self,
+        remote_endpoint: smoltcp::wire::IpEndpoint,
+    ) -> Result<(), SystemError> {
         let mut prepared_registration = None;
         let mut writer = loop {
             if matches!(self.inner.read().as_ref(), Some(inner::Inner::Init(_)))

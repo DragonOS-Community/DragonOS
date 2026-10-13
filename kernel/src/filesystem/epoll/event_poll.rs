@@ -233,9 +233,7 @@ impl EventPoll {
 
             // 不支持嵌套的独占唤醒
             if op == EPollCtlOption::Add && Self::is_epoll_file(&dst_file)
-                || !events
-                    .difference(EPollEventType::EPOLLEXCLUSIVE_OK_BITS)
-                    .is_empty()
+                || epds.events & !EPollEventType::EPOLLEXCLUSIVE_OK_BITS.bits() != 0
             {
                 return Err(SystemError::EINVAL);
             }
@@ -366,11 +364,12 @@ impl EventPoll {
                     }
                     let ep_item = ep_item.unwrap().clone();
 
-                    // EPOLLEXCLUSIVE 只能在 ADD 时设置；如果已有该位，MOD 需要保留它。
+                    // Linux rejects MOD of an existing exclusive registration,
+                    // even when the new request omits EPOLLEXCLUSIVE.
                     if (ep_item.event.lock_irqsave().events & EPollEventType::EPOLLEXCLUSIVE.bits())
                         != 0
                     {
-                        epds.events |= EPollEventType::EPOLLEXCLUSIVE.bits();
+                        return Err(SystemError::EINVAL);
                     }
 
                     Self::ep_modify(&mut epoll_guard, ep_item, &epds)?
@@ -979,74 +978,115 @@ impl EventPoll {
         epitems: &EPollItemList,
         pollflags: EPollEventType,
     ) -> Result<(), SystemError> {
-        // 在 epitems 锁下复制一份快照，然后释放锁，再逐个处理。
-        // 避免持有 epitems 锁时再去获取其他锁导致 ABBA 死锁。
-        let epitems_snapshot = epitems.snapshot();
+        Self::dispatch_notifications(epitems, pollflags, false)
+    }
 
-        for epitem in epitems_snapshot.iter() {
-            // 通过 EPollItem 的 ready_state Weak 直接访问 ReadyState — 不需要 Mutex
-            let Some(rs_arc) = epitem.ready_state().upgrade() else {
-                continue;
-            };
+    /// A source broadcast (e.g. the last pipe endpoint closing) must visit
+    /// every exclusive registration, independently of callback wake success.
+    pub fn wakeup_epoll_all(
+        epitems: &EPollItemList,
+        pollflags: EPollEventType,
+    ) -> Result<(), SystemError> {
+        Self::dispatch_notifications(epitems, pollflags, true)
+    }
 
-            // 读取注册事件掩码（irqsave SpinLock — hardirq-safe）
-            let ep_events = {
-                let event_guard = epitem.event().lock_irqsave();
-                EPollEventType::from_bits_truncate(event_guard.events())
-            };
-
-            // 对齐 Linux 6.6 `ep_poll_callback()`：
-            // 1) 若该 epitem 不包含任何 poll(2) 事件（仅剩 EP_PRIVATE_BITS），视为"被禁用"
-            // 2) 若驱动/文件系统传入了具体的 pollflags（非空），则必须与已注册的事件掩码匹配才入队
-            let enabled_mask = ep_events.difference(EPollEventType::EP_PRIVATE_BITS);
-            if enabled_mask.is_empty() && !pollflags.contains(EPollEventType::POLLFREE) {
-                continue;
-            }
-
-            if !pollflags.is_empty()
-                && !pollflags.contains(EPollEventType::POLLFREE)
-                && pollflags.intersection(ep_events).is_empty()
-            {
-                continue;
-            }
-
-            {
-                // 仅获取 SpinLock（irqsave）— hardirq-safe
-                let mut rs = rs_arc.lock_irqsave();
-                if !epitem.is_active() {
+    fn dispatch_notifications(
+        epitems: &EPollItemList,
+        pollflags: EPollEventType,
+        broadcast: bool,
+    ) -> Result<(), SystemError> {
+        // Release the source lock before any callback or nested notification.
+        let snapshot = epitems.snapshot();
+        // Linux places ordinary callbacks before exclusive callbacks. The
+        // classification is immutable: exclusive may only be added, never MOD.
+        for exclusive in [false, true] {
+            for epitem in &snapshot {
+                let is_exclusive = epitem.event().lock_irqsave().events()
+                    & EPollEventType::EPOLLEXCLUSIVE.bits()
+                    != 0;
+                if is_exclusive != exclusive {
                     continue;
                 }
-
-                if let Some(ref mut ovflist) = rs.ovflist {
-                    // 扫描进行中 — 推入溢出列表
-                    if !ovflist.iter().any(|e| Arc::ptr_eq(e, epitem)) {
-                        ovflist.push(epitem.clone());
-                    }
-                } else {
-                    // 正常模式 — 推入 ready_list
-                    if !rs.ready_list.iter().any(|e| Arc::ptr_eq(e, epitem)) {
-                        rs.ready_list.push_back(epitem.clone());
-                    }
+                if Self::notify_epitem(epitem, pollflags) && !broadcast {
+                    break;
                 }
-
-                if ep_events.contains(EPollEventType::EPOLLEXCLUSIVE)
-                    && !pollflags.contains(EPollEventType::POLLFREE)
-                {
-                    // 避免惊群
-                    rs.epoll_wq.wakeup(None);
-                } else {
-                    rs.epoll_wq.wakeup_all(None);
-                }
-            }
-
-            if let Some(poll_epitems) = epitem.poll_epitems().upgrade() {
-                let _ = Self::wakeup_epoll(
-                    poll_epitems.as_ref(),
-                    EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM,
-                );
             }
         }
         Ok(())
+    }
+
+    /// Publish a single registration and report a consumed source wake quota.
+    /// Ordinary callbacks and POLLFREE never stop source traversal.
+    fn notify_epitem(epitem: &Arc<EPollItem>, pollflags: EPollEventType) -> bool {
+        // 通过 EPollItem 的 ready_state Weak 直接访问 ReadyState — 不需要 Mutex
+        let Some(rs_arc) = epitem.ready_state().upgrade() else {
+            return false;
+        };
+
+        // 读取注册事件掩码（irqsave SpinLock — hardirq-safe）
+        let ep_events = {
+            let event_guard = epitem.event().lock_irqsave();
+            EPollEventType::from_bits_truncate(event_guard.events())
+        };
+
+        // 对齐 Linux 6.6 `ep_poll_callback()`：
+        // 1) 若该 epitem 不包含任何 poll(2) 事件（仅剩 EP_PRIVATE_BITS），视为"被禁用"
+        // 2) 若驱动/文件系统传入了具体的 pollflags（非空），则必须与已注册的事件掩码匹配才入队
+        let enabled_mask = ep_events.difference(EPollEventType::EP_PRIVATE_BITS);
+        if enabled_mask.is_empty() && !pollflags.contains(EPollEventType::POLLFREE) {
+            return false;
+        }
+
+        if !pollflags.is_empty()
+            && !pollflags.contains(EPollEventType::POLLFREE)
+            && pollflags.intersection(ep_events).is_empty()
+        {
+            return false;
+        }
+
+        let consumed = {
+            // 仅获取 SpinLock（irqsave）— hardirq-safe
+            let mut rs = rs_arc.lock_irqsave();
+            if !epitem.is_active() {
+                return false;
+            }
+
+            if let Some(ref mut ovflist) = rs.ovflist {
+                // 扫描进行中 — 推入溢出列表
+                if !ovflist.iter().any(|e| Arc::ptr_eq(e, epitem)) {
+                    ovflist.push(epitem.clone());
+                }
+            } else {
+                // 正常模式 — 推入 ready_list
+                if !rs.ready_list.iter().any(|e| Arc::ptr_eq(e, epitem)) {
+                    rs.ready_list.push_back(epitem.clone());
+                }
+            }
+
+            if ep_events.contains(EPollEventType::EPOLLEXCLUSIVE)
+                && !pollflags.contains(EPollEventType::POLLFREE)
+            {
+                let woken = rs.epoll_wq.wake_one();
+                // ep_poll_callback's ewake: combined IN|OUT does not stop
+                // source traversal, and an absent/cancelled waiter costs no quota.
+                let direction = pollflags.intersection(EPollEventType::EPOLLINOUT_BITS);
+                woken
+                    && (direction.is_empty()
+                        || direction == EPollEventType::EPOLLIN && ep_events.contains(direction)
+                        || direction == EPollEventType::EPOLLOUT && ep_events.contains(direction))
+            } else {
+                rs.epoll_wq.wakeup_all(None);
+                false
+            }
+        };
+
+        if let Some(poll_epitems) = epitem.poll_epitems().upgrade() {
+            let _ = Self::wakeup_epoll(
+                poll_epitems.as_ref(),
+                EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM,
+            );
+        }
+        consumed
     }
 }
 

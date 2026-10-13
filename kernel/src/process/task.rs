@@ -158,6 +158,8 @@ impl core::ops::DerefMut for ProcessControlBlock {
 pub struct ProcessControlBlockData {
     pub(crate) memory_high_debt: AtomicU64,
     pub(crate) memory_high_wait: SpinLock<Option<Arc<crate::cgroup::memory::high::HighWait>>>,
+    /// Temporary stacked-I/O allocation ownership, not cgroup membership.
+    pub(crate) memory_io_context: SpinLock<Option<crate::cgroup::memory::io::MemoryIoContext>>,
     /// The PID of the current process.
     pub(super) pid: AtomicRawPid,
     /// The thread group ID of the current process (this value never changes
@@ -887,6 +889,7 @@ impl ProcessControlBlock {
                 task_cgroup: RwLock::new(task_cgroup),
                 cpu_accounting: SpinLock::new(cpu_accounting),
                 memory_high_debt: AtomicU64::new(0),
+                memory_io_context: SpinLock::new(None),
                 memory_high_wait: SpinLock::new(None),
                 sem_undo: SpinLock::new(None),
                 preempt_count,

@@ -97,8 +97,10 @@ class LoopExt4 {
         }
     }
 
-    void SetUp(const char* fixture = "ext4_inode_identity.img") {
-        image_ = "/tmp/ext4_inode_identity_" + std::to_string(getpid()) + ".img";
+    void SetUp(const char* fixture = "ext4_inode_identity.img",
+               const char* backing_directory = "/tmp") {
+        image_ = std::string(backing_directory) + "/ext4_inode_identity_"
+            + std::to_string(getpid()) + ".img";
         mount_point_ = "/tmp/ext4_inode_identity_" + std::to_string(getpid()) + "_mnt";
 
         ASSERT_EQ(0, mkdir(mount_point_.c_str(), 0700)) << strerror(errno);
@@ -208,6 +210,10 @@ class LoopExt4 {
 
     const std::string& loop_path() const {
         return loop_path_;
+    }
+
+    const std::string& backing_path() const {
+        return image_;
     }
 
     const std::string& mount_point() const {

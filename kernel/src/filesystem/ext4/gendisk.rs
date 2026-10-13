@@ -120,12 +120,16 @@ impl another_ext4::BlockDevice for GenDisk {
             .map_err(|_| another_ext4::Ext4Error::new(another_ext4::ErrCode::ENOMEM))?;
 
         let (_, lba_id_start, block_count) = self.convert_from_ext4_blkid(block_id);
-        self.block_device()
+        let completed = self
+            .block_device()
             .and_then(|bdev| bdev.read_at(lba_id_start, block_count, &mut *buf))
             .map_err(|e| {
                 log::error!("Ext4BlkDevice '{:?}' read_block failed: {:?}", block_id, e);
                 another_ext4::Ext4Error::new(Self::map_system_error_to_ext4(&e))
             })?;
+        if completed != another_ext4::BLOCK_SIZE {
+            return Err(another_ext4::Ext4Error::new(another_ext4::ErrCode::EIO));
+        }
         Ok(another_ext4::Block::new(block_id, buf))
     }
 
@@ -172,7 +176,8 @@ impl another_ext4::BlockDevice for GenDisk {
         block: &another_ext4::Block,
     ) -> core::result::Result<(), another_ext4::Ext4Error> {
         let (_, lba_id_start, block_count) = self.convert_from_ext4_blkid(block.id);
-        self.block_device()
+        let completed = self
+            .block_device()
             .and_then(|bdev| bdev.write_at(lba_id_start, block_count, &*block.data))
             .map_err(|e| {
                 let code = Self::map_system_error_to_ext4(&e);
@@ -187,6 +192,9 @@ impl another_ext4::BlockDevice for GenDisk {
                 }
                 another_ext4::Ext4Error::new(code)
             })?;
+        if completed != another_ext4::BLOCK_SIZE {
+            return Err(another_ext4::Ext4Error::new(another_ext4::ErrCode::EIO));
+        }
         Ok(())
     }
 

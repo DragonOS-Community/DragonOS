@@ -7,6 +7,7 @@
 pub(crate) mod abi;
 pub(crate) mod accounting;
 pub(crate) mod high;
+pub(crate) mod io;
 pub(crate) mod object;
 pub(crate) mod owned;
 mod ownership;

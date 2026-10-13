@@ -635,6 +635,21 @@ pub(crate) fn schedule_pagecache_io(work: Arc<Work>) {
     PAGECACHE_IO_WQS[idx].enqueue(work);
 }
 
+lazy_static! {
+    // Only harvest already submitted reads here. Workers which plan or
+    // execute filesystem I/O may wait for these publications, including
+    // final shutdown on SYSTEM_WQ and reclaim on PAGECACHE_IO_WQS.
+    static ref READ_COMPLETION_WQ: Arc<WorkQueue> = WorkQueue::new("pc-read-complete");
+}
+
+pub(crate) fn init_read_completion_queue() {
+    lazy_static::initialize(&READ_COMPLETION_WQ);
+}
+
+pub(crate) fn schedule_read_completion(work: Arc<Work>) {
+    READ_COMPLETION_WQ.enqueue(work);
+}
+
 // Registry membership follows the mapping's lifetime, not future allocations
 // or an explicit drop_caches request. A tree releases retired storage without
 // retaining a vector/hash table sized for the historical peak mapping count.
@@ -963,6 +978,22 @@ impl PageState {
 
 struct PageEntry {
     storage: OwnedBox<PageEntryState>,
+}
+
+/// Keeps removed entry/index storage alive until the reclaimer has released
+/// all cache and global registry guards. Its final drop may release charges.
+pub(crate) struct RetiredPageCacheEntry {
+    entry: Arc<PageEntry>,
+    backend: Option<Arc<dyn PageCacheBackend>>,
+}
+
+impl Drop for RetiredPageCacheEntry {
+    fn drop(&mut self) {
+        self.entry.account_remove();
+        if let Some(backend) = &self.backend {
+            backend.release_page();
+        }
+    }
 }
 
 impl core::ops::Deref for PageEntry {
@@ -1686,6 +1717,46 @@ impl PageCacheManager {
         cache.discard_unlinked_page(&page.page);
         drop(cache.detach_dirty_retention_if_idle());
         Ok(true)
+    }
+
+    /// The caller retains an exclusive page guard through cache and registry
+    /// retirement. NOIO must skip busy entries rather than wait for their owner.
+    pub(crate) fn try_remove_clean_page_for_reclaim(
+        &self,
+        page_index: usize,
+        expected_page: &Arc<Page>,
+        page_guard: &InnerPage,
+    ) -> Option<RetiredPageCacheEntry> {
+        let cache = self.upgrade().ok()?;
+        if cache.is_shmem() || cache.mapping_unevictable() {
+            return None;
+        }
+        let mut inner = cache.inner.try_lock().ok()?;
+        let entry = inner.pages.get(&page_index)?;
+        if !Arc::ptr_eq(&entry.page, expected_page)
+            || entry.active_users() != 0
+            || entry.state() != PageState::UpToDate
+            || page_guard.map_count() != 0
+            || page_guard.flags().intersects(
+                PageFlags::PG_DIRTY | PageFlags::PG_WRITEBACK | PageFlags::PG_UNEVICTABLE,
+            )
+            || inner.dirty_pages.contains(&page_index)
+            || inner.writeback_pages.contains(&page_index)
+        {
+            return None;
+        }
+        // Membership changes under the cache lock, but backend callbacks and
+        // entry/charge destruction belong after global registry retirement.
+        inner.set_index(page_index, 0, false);
+        inner.set_index(page_index, 1, false);
+        inner.set_index(page_index, 2, false);
+        inner
+            .pages
+            .remove(&page_index)
+            .map(|entry| RetiredPageCacheEntry {
+                entry,
+                backend: inner.accounting_backend.clone(),
+            })
     }
 
     pub fn remove_clean_page_for_reclaim(

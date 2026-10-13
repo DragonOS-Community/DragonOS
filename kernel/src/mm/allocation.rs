@@ -42,7 +42,12 @@ impl MemoryAllocationError {
         match self {
             Self::System(error) => Err(error),
             Self::Charge(failure) => {
-                match recover_charge(&failure, MemoryAllocPolicy::ReclaimThenOom, 0, state)? {
+                let policy = if crate::cgroup::memory::io::noio_active() {
+                    MemoryAllocPolicy::ReclaimNoIo
+                } else {
+                    MemoryAllocPolicy::ReclaimThenOom
+                };
+                match recover_charge(&failure, policy, 0, state)? {
                     RecoveryDecision::RetryOperation => Ok(()),
                     RecoveryDecision::Exhausted => Err(SystemError::ENOMEM),
                 }

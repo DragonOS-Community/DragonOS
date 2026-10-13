@@ -116,19 +116,13 @@ pub fn do_kernel_rt_sigtimedwait(
         // 第一步：准备进入可中断阻塞，先将当前线程标记为可中断阻塞，关闭中断，避免错过唤醒窗口
         let preempt_guard = PreemptGuard::new();
         // 第二步：在“已是可中断阻塞状态”下，重检是否已有目标信号，若有则不睡眠，恢复为 runnable 并返回
-        if has_pending_awaited_signal(&awaited) {
+        if let Some((sig, info)) = try_dequeue_signal(&awaited) {
             drop(preempt_guard);
-
-            if let Some((sig, info)) = try_dequeue_signal(&awaited) {
-                restore_sigtimedwait_mask();
-                if !uinfo.is_null() {
-                    copy_posix_siginfo_to_user(uinfo, &info, from_user)?;
-                }
-                return Ok(sig as usize);
-            }
-            // 有 pending 但未从 awaited 集取到（被其他信号打断）
             restore_sigtimedwait_mask();
-            return Err(SystemError::EINTR);
+            if !uinfo.is_null() {
+                copy_posix_siginfo_to_user(uinfo, &info, from_user)?;
+            }
+            return Ok(sig as usize);
         }
 
         // 第三步：检查是否已超时；若已超时则不睡眠，恢复为 runnable 并返回超时
@@ -143,9 +137,22 @@ pub fn do_kernel_rt_sigtimedwait(
         // 第四步：检查是否有其他未屏蔽的待处理信号打断，若被其他信号唤醒了，必须返回 EINTR 让内核去处理那个信号
         pcb.recalc_sigpending();
         if pcb.has_pending_signal_fast() {
-            drop(preempt_guard);
-            restore_sigtimedwait_mask();
-            return Err(SystemError::EINTR);
+            // An awaited signal can arrive after the first dequeue. Linux
+            // gives it priority over unrelated interruptions, including when
+            // the shared queue's earlier snapshot was consumed by a sibling.
+            if let Some((sig, info)) = try_dequeue_signal(&awaited) {
+                drop(preempt_guard);
+                restore_sigtimedwait_mask();
+                if !uinfo.is_null() {
+                    copy_posix_siginfo_to_user(uinfo, &info, from_user)?;
+                }
+                return Ok(sig as usize);
+            }
+            if has_other_unblocked_signal(&awaited) {
+                drop(preempt_guard);
+                restore_sigtimedwait_mask();
+                return Err(SystemError::EINTR);
+            }
         }
 
         // 第五步：释放中断，然后真正进入调度睡眠（窗口期内，线程保持可中断阻塞，发送侧会唤醒）
@@ -196,20 +203,14 @@ fn try_dequeue_signal(awaited: &SigSet) -> Option<(Signal, SigInfo)> {
 }
 
 /// 检查是否有未屏蔽的待处理信号
-fn has_pending_awaited_signal(awaited: &SigSet) -> bool {
+fn has_other_unblocked_signal(awaited: &SigSet) -> bool {
     let pcb = ProcessManager::current_pcb();
-    let _current_pid = pcb.raw_pid();
     let siginfo_guard = pcb.sig_info_irqsave();
     let pending_set = siginfo_guard.sig_pending().signal();
+    let blocked = *siginfo_guard.sig_blocked();
     drop(siginfo_guard);
-
     let shared_pending_set = pcb.process_signal().shared_pending_signal();
-    let result = pending_set.union(shared_pending_set);
-    // 只看 awaited 与 pending 的交集
-    let intersection = result.intersection(*awaited);
-    let has = !intersection.is_empty();
-
-    has
+    !(pending_set.union(shared_pending_set) & !blocked & !*awaited).is_empty()
 }
 
 /// 计算超时截止时间

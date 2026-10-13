@@ -4,14 +4,14 @@ use core::ffi::c_int;
 
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_RT_TGSIGQUEUEINFO;
-use crate::ipc::syscall::sys_tkill::do_tkill;
+use crate::ipc::signal_types::{copy_siginfo_from_user, SigCode, SigInfo};
+use crate::ipc::syscall::sys_tkill::do_send_specific;
+use crate::mm::VirtAddr;
+use crate::process::ProcessManager;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
 use system_error::SystemError;
 
-/// rt_tgsigqueueinfo 系统调用（最小兼容实现）
-///
-/// 语义上与 tgkill(tgid, tid, sig) 相近，这里直接复用 do_tkill 的
-/// 线程查找与权限检查逻辑，忽略用户态 siginfo 内容。
+/// Queue userspace siginfo to one exact thread in the caller's PID namespace.
 struct SysRtTgsigqueueinfoHandle;
 
 impl SysRtTgsigqueueinfoHandle {
@@ -31,7 +31,7 @@ impl SysRtTgsigqueueinfoHandle {
     }
 
     #[inline(always)]
-    fn _uinfo(args: &[usize]) -> usize {
+    fn uinfo(args: &[usize]) -> usize {
         args[3]
     }
 }
@@ -45,14 +45,20 @@ impl Syscall for SysRtTgsigqueueinfoHandle {
         let tgid = Self::tgid(args);
         let tid = Self::tid(args);
         let sig = Self::sig(args);
-        let _uinfo = Self::_uinfo(args);
+        // Copy/layout validation precedes IDs and si_code checks in Linux.
+        let user_info =
+            unsafe { copy_siginfo_from_user(VirtAddr::new(Self::uinfo(args)), Some(sig))? };
 
         if tgid <= 0 || tid <= 0 {
             return Err(SystemError::EINVAL);
         }
 
-        // 直接复用 do_tkill 的线程定位与权限检查逻辑。
-        do_tkill(tgid, tid, sig)
+        if (user_info.si_code >= 0 || user_info.si_code == SigCode::Tkill.as_i32())
+            && ProcessManager::current_pcb().task_pid_vnr().data() != tid as usize
+        {
+            return Err(SystemError::EPERM);
+        }
+        do_send_specific(tgid, tid, sig, &mut SigInfo::from_posix(&user_info))
     }
 
     fn entry_format(&self, args: &[usize]) -> Vec<FormattedSyscallParam> {
@@ -60,7 +66,7 @@ impl Syscall for SysRtTgsigqueueinfoHandle {
             FormattedSyscallParam::new("tgid", Self::tgid(args).to_string()),
             FormattedSyscallParam::new("tid", Self::tid(args).to_string()),
             FormattedSyscallParam::new("sig", Self::sig(args).to_string()),
-            FormattedSyscallParam::new("uinfo", format!("{:#x}", Self::_uinfo(args))),
+            FormattedSyscallParam::new("uinfo", format!("{:#x}", Self::uinfo(args))),
         ]
     }
 }

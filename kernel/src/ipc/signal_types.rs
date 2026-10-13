@@ -526,6 +526,8 @@ const TRAP_PERF: i32 = 6;
 const SI_DETHREAD: i32 = -7;
 const SI_ASYNCNL: i32 = -60;
 const KERNEL_SIGINFO_SIZE: usize = 48;
+const SIGINFO_HEADER_SIZE: usize = 3 * core::mem::size_of::<i32>();
+const OPAQUE_SIGINFO_SIZE: usize = KERNEL_SIGINFO_SIZE - SIGINFO_HEADER_SIZE;
 
 fn known_siginfo_layout(signal: Signal, code: i32) -> bool {
     if code == SigCode::Kernel.as_i32() {
@@ -566,27 +568,38 @@ pub(crate) unsafe fn copy_siginfo_from_user(
 ) -> Result<PosixSigInfo, SystemError> {
     let mut result = PosixSigInfo::default();
     {
+        let reader = crate::syscall::user_access::UserBufferReader::new(
+            address.data() as *const u8,
+            KERNEL_SIGINFO_SIZE,
+            true,
+        )?;
+        let copied = reader.read_one_from_user_checked::<[u8; KERNEL_SIGINFO_SIZE]>(0)?;
         let prefix = core::slice::from_raw_parts_mut(
             (&mut result as *mut PosixSigInfo).cast::<u8>(),
             KERNEL_SIGINFO_SIZE,
         );
-        crate::syscall::user_access::copy_from_user_protected(prefix, address)?;
+        prefix.copy_from_slice(&copied);
     }
     if let Some(signo) = forced_signo {
         result.si_signo = signo;
     }
     if !known_siginfo_layout(Signal::from(result.si_signo as usize), result.si_code) {
         {
+            const EXPANSION_SIZE: usize =
+                core::mem::size_of::<PosixSigInfo>() - KERNEL_SIGINFO_SIZE;
+            let reader = crate::syscall::user_access::UserBufferReader::new(
+                (address + KERNEL_SIGINFO_SIZE).data() as *const u8,
+                EXPANSION_SIZE,
+                true,
+            )?;
+            let copied = reader.read_one_from_user_checked::<[u8; EXPANSION_SIZE]>(0)?;
             let expansion = core::slice::from_raw_parts_mut(
                 (&mut result as *mut PosixSigInfo)
                     .cast::<u8>()
                     .add(KERNEL_SIGINFO_SIZE),
                 core::mem::size_of::<PosixSigInfo>() - KERNEL_SIGINFO_SIZE,
             );
-            crate::syscall::user_access::copy_from_user_protected(
-                expansion,
-                address + KERNEL_SIGINFO_SIZE,
-            )?;
+            expansion.copy_from_slice(&copied);
         }
         validate_user_siginfo(&result)?;
     }
@@ -612,6 +625,22 @@ pub(crate) fn sig_type_from_user_siginfo(
     code_enum: SigCode,
     user_info: &PosixSigInfo,
 ) -> SigType {
+    if !known_siginfo_layout(signal, code_enum.as_i32()) {
+        // An accepted unknown layout may use any bytes of the kernel prefix,
+        // including alignment padding. Preserve them rather than guessing a
+        // typed union member and losing future ABI fields.
+        let mut kernel_data = [0u8; OPAQUE_SIGINFO_SIZE];
+        let bytes = unsafe {
+            core::slice::from_raw_parts(
+                (user_info as *const PosixSigInfo)
+                    .cast::<u8>()
+                    .add(SIGINFO_HEADER_SIZE),
+                OPAQUE_SIGINFO_SIZE,
+            )
+        };
+        kernel_data.copy_from_slice(bytes);
+        return SigType::Opaque { kernel_data };
+    }
     match code_enum {
         SigCode::Timer => {
             let timer = unsafe { user_info._sifields._timer };
@@ -749,12 +778,53 @@ impl SigInfo {
     }
 
     pub fn has_pid_and_uid(&self) -> bool {
-        matches!(self.sig_type, SigType::Kill { .. } | SigType::Rt { .. })
+        matches!(
+            self.sig_type,
+            SigType::Kill { .. } | SigType::Rt { .. } | SigType::SigChild { .. }
+        ) || (matches!(self.sig_type, SigType::Opaque { .. }) && !self.opaque_uses_poll_layout())
+    }
+
+    /// Linux's unknown positive signal-specific codes up to NSIGPOLL use
+    /// the POLL fallback (e.g. SIGSYS code 3), not a PID/UID identity.
+    pub(crate) fn opaque_uses_poll_layout(&self) -> bool {
+        is_positive_sig_specific_code(self.sig_code.as_i32()) && self.sig_code.as_i32() <= NSIGPOLL
+    }
+
+    pub(crate) fn remap_sender_uid(
+        &mut self,
+        sender: &crate::process::namespace::user_namespace::UserNamespace,
+        target: &crate::process::namespace::user_namespace::UserNamespace,
+    ) {
+        use crate::process::namespace::user_namespace::{from_kuid_munged, make_kuid};
+        if !self.has_pid_and_uid() {
+            return;
+        }
+        if let SigType::Opaque { kernel_data } = &mut self.sig_type {
+            let uid = u32::from_ne_bytes(kernel_data[8..12].try_into().unwrap());
+            let kuid =
+                make_kuid(sender, uid).unwrap_or(crate::process::cred::Kuid::new(usize::MAX));
+            kernel_data[8..12].copy_from_slice(&from_kuid_munged(target, kuid).to_ne_bytes());
+            return;
+        }
+        let uid = match &mut self.sig_type {
+            SigType::Kill { uid, .. } | SigType::Rt { uid, .. } | SigType::SigChild { uid, .. } => {
+                uid
+            }
+            _ => return,
+        };
+        // Unmapped user metadata maps to the receiver's overflow UID, not a
+        // syscall failure. It is not used as the sender's permission identity.
+        let kuid = make_kuid(sender, *uid).unwrap_or(crate::process::cred::Kuid::new(usize::MAX));
+        *uid = from_kuid_munged(target, kuid);
     }
 
     pub fn clear_sender_pid(&mut self) {
+        if !self.has_pid_and_uid() {
+            return;
+        }
         match &mut self.sig_type {
-            SigType::Kill { pid, .. } | SigType::Rt { pid, .. } => {
+            SigType::Opaque { kernel_data } => kernel_data[4..8].fill(0),
+            SigType::Kill { pid, .. } | SigType::Rt { pid, .. } | SigType::SigChild { pid, .. } => {
                 *pid = RawPid::new(0);
             }
             _ => {}
@@ -827,6 +897,17 @@ impl SigInfo {
             ..PosixSigInfo::default()
         };
         match self.sig_type {
+            SigType::Opaque { kernel_data } => {
+                let bytes = unsafe {
+                    core::slice::from_raw_parts_mut(
+                        (&mut result as *mut PosixSigInfo)
+                            .cast::<u8>()
+                            .add(SIGINFO_HEADER_SIZE),
+                        OPAQUE_SIGINFO_SIZE,
+                    )
+                };
+                bytes.copy_from_slice(&kernel_data);
+            }
             SigType::Kill { pid, uid } => {
                 result._sifields._kill = PosixSiginfoKill {
                     si_pid: pid.data() as i32,
@@ -947,6 +1028,10 @@ impl SigInfo {
 
 #[derive(Copy, Clone, Debug)]
 pub enum SigType {
+    /// Validated unknown user layout, preserving the complete kernel prefix.
+    Opaque {
+        kernel_data: [u8; OPAQUE_SIGINFO_SIZE],
+    },
     /// kill/tgkill/tkill 等用户态发起的信号：携带发送者 pid/uid。
     Kill {
         pid: RawPid,
@@ -1025,6 +1110,25 @@ pub struct SigPending {
 }
 
 impl SigPending {
+    /// Caller holds the pending lock. Commit queue and bitmap together; a
+    /// failed real-time enqueue must leave neither a new entry nor a bit.
+    pub(crate) fn enqueue(&mut self, sig: Signal, info: SigInfo) -> Result<bool, SystemError> {
+        if !sig.is_rt_signal() && self.signal.contains(sig.into()) {
+            return Ok(false);
+        }
+        if self.queue.q.try_reserve(1).is_err() {
+            // Linux permits lossy bitmap-only delivery for standard/kill
+            // signals, but explicit real-time metadata cannot be discarded.
+            if sig.is_rt_signal() && info.sig_code() != SigCode::User {
+                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+            }
+        } else {
+            self.queue.q.push(info);
+        }
+        self.signal.insert(sig.into());
+        Ok(true)
+    }
+
     /// 判断是否有待处理的信号
     pub fn has_pending(&self) -> bool {
         return !self.signal.is_empty();
@@ -1207,30 +1311,12 @@ impl SigQueue {
     ///
     /// @return (第一个满足要求的siginfo; 从队列中删除前是否有多个满足条件的siginfo)
     pub fn find_and_delete(&mut self, sig: Signal) -> (Option<SigInfo>, bool) {
-        // 是否存在多个满足条件的siginfo
-        let mut still_pending = false;
-        let mut first = true; // 标记变量，记录当前是否已经筛选出了一个元素
-
-        let filter = |x: &mut SigInfo| {
-            if x.sig_no == sig as i32 {
-                if !first {
-                    // 如果之前已经筛选出了一个元素，则不把当前元素删除
-                    still_pending = true;
-                    return false;
-                } else {
-                    // 当前是第一个被筛选出来的元素
-                    first = false;
-                    return true;
-                }
-            }
-            return false;
+        let Some(index) = self.q.iter().position(|info| info.is_signal(sig)) else {
+            return (None, false);
         };
-        // 从sigqueue中过滤出结果
-        let mut filter_result: Vec<SigInfo> = self.q.extract_if(.., filter).collect();
-        // 筛选出的结果不能大于1个
-        assert!(filter_result.len() <= 1);
-
-        return (filter_result.pop(), still_pending);
+        let info = self.q.remove(index);
+        let still_pending = self.q.iter().any(|info| info.is_signal(sig));
+        (Some(info), still_pending)
     }
 
     /// @brief 从C的void*指针转换为static生命周期的可变引用

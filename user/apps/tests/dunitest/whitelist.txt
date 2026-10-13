@@ -102,6 +102,7 @@ normal/general_protection_signal
 normal/ioperm_semantics
 normal/seccomp
 normal/signal_sigqueueinfo
+normal/signal_tgsigqueueinfo
 normal/process_signal_fork
 normal/process_vm_writev_semantics
 normal/exec_dumpable_semantics

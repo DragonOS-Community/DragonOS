@@ -362,6 +362,24 @@ impl Signal {
     /// - `info`: 信号信息
     /// - `pcb`: 目标进程
     /// - `pt`: 信号类型，`PidType::PID` 表示线程级信号，`PidType::TGID` 表示进程级信号
+    ///
+    /// User ABI metadata expresses si_uid in the caller's user namespace.
+    /// Internal notifications may already express it in the receiver's view
+    /// and must continue to use send_signal_info_to_pcb directly.
+    pub(crate) fn send_user_signal_info_to_pcb(
+        &self,
+        info: &mut SigInfo,
+        pcb: Arc<ProcessControlBlock>,
+        pt: PidType,
+    ) -> Result<i32, SystemError> {
+        let sender = ProcessManager::current_pcb().cred();
+        let receiver = pcb.cred();
+        if !Arc::ptr_eq(&sender.user_ns, &receiver.user_ns) {
+            info.remap_sender_uid(&sender.user_ns, &receiver.user_ns);
+        }
+        self.send_signal_info_to_pcb(Some(info), pcb, pt)
+    }
+
     pub fn send_signal_info_to_pcb(
         &self,
         info: Option<&mut SigInfo>,
@@ -430,15 +448,14 @@ impl Signal {
         if is_thread_target {
             // Thread-level signal: add to the thread's sig_pending
             let mut pcb_info = pcb.sig_info_mut();
-            if !self.is_rt_signal() && pcb_info.sig_pending().queue().find(*self).0.is_some() {
+            if !pcb_info.sig_pending_mut().enqueue(*self, new_sig_info)? {
                 return Ok(0);
             }
-            pcb_info.sig_pending_mut().queue_mut().q.push(new_sig_info);
         } else {
             // Process-level signal: add to shared_pending
             if !pcb
                 .process_signal()
-                .shared_pending_push_dedup(*self, new_sig_info)
+                .shared_pending_push_dedup(*self, new_sig_info)?
             {
                 return Ok(0);
             }
@@ -476,6 +493,7 @@ impl Signal {
             // 线程级信号：添加到线程的 sig_pending
             let mut guard = siginfo_guard;
             guard.sig_pending_mut().queue_mut().q.push(info);
+            guard.sig_pending_mut().signal_mut().insert((*self).into());
             drop(guard);
         } else {
             // 进程级信号：添加到 shared_pending（不需要 siginfo_guard）
@@ -488,14 +506,14 @@ impl Signal {
     }
 
     /// @brief Complete signal delivery: set the pending bitmap, choose the delivery target, and wake up as needed.
-    /// @param shared_bitmap_set Whether the shared bitmap for process-level signals was already set at enqueue time
+    /// @param pending_bitmap_set Whether the private/shared bitmap was already committed with the queue
     /// (true on the normal enqueue path; false on the SIGKILL/KTHREAD fast path, where this function sets it)
     #[allow(clippy::if_same_then_else)]
     pub(crate) fn complete_signal(
         &self,
         pcb: Arc<ProcessControlBlock>,
         pt: PidType,
-        shared_bitmap_set: bool,
+        pending_bitmap_set: bool,
     ) {
         // 根据信号类型选择添加到线程级 pending 还是进程级 shared_pending
         let is_thread_target = matches!(pt, PidType::PID);
@@ -519,13 +537,13 @@ impl Signal {
             }
         }
 
-        if is_thread_target {
+        if is_thread_target && !pending_bitmap_set {
             // Thread-level signal: set the thread pending bitmap
             pcb.sig_info_mut()
                 .sig_pending_mut()
                 .signal_mut()
                 .insert((*self).into());
-        } else if !shared_bitmap_set {
+        } else if !is_thread_target && !pending_bitmap_set {
             // Process-level signal: on the normal path the enqueue function has already set the
             // bitmap inside the sighand write critical section; only non-enqueueing fast paths such as SIGKILL / KTHREAD set it here.
             pcb.process_signal().shared_pending_signal_insert(*self);
@@ -1169,16 +1187,13 @@ fn should_force_send(info: Option<&mut SigInfo>, target: &Arc<ProcessControlBloc
         return false;
     };
 
-    if matches!(info.sig_code(), SigCode::Kernel | SigCode::SysSeccomp) {
-        return true;
-    }
-
+    let force = matches!(info.sig_code(), SigCode::Kernel | SigCode::SysSeccomp);
     if info.has_pid_and_uid() && signal_from_ancestor_pid_namespace(target) {
         info.clear_sender_pid();
         return true;
     }
 
-    false
+    force
 }
 
 fn signal_from_ancestor_pid_namespace(target: &Arc<ProcessControlBlock>) -> bool {

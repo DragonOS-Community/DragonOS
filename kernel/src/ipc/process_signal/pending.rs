@@ -64,19 +64,20 @@ impl ProcessSignalState {
         pending.signal_mut().insert(sig.into());
     }
 
-    pub fn shared_pending_push_dedup(&self, sig: Signal, info: SigInfo) -> bool {
+    pub fn shared_pending_push_dedup(
+        &self,
+        sig: Signal,
+        info: SigInfo,
+    ) -> Result<bool, SystemError> {
         let mut pending = self.body.pending.lock_irqsave();
-        if !sig.is_rt_signal() && pending.queue().find(sig).0.is_some() {
-            return false;
-        }
-        pending.queue_mut().q.push(info);
-        pending.signal_mut().insert(sig.into());
-        true
+        pending.enqueue(sig, info)
     }
 
     pub fn shared_pending_push_posix_timer(&self, sig: Signal, info: SigInfo) -> bool {
         let mut pending = self.body.pending.lock_irqsave();
-        if pending.queue().find(sig).0.is_some() {
+        if pending.queue().find(sig).0.is_some()
+            || (!sig.is_rt_signal() && pending.signal().contains(sig.into()))
+        {
             return false;
         }
         pending.queue_mut().q.push(info);

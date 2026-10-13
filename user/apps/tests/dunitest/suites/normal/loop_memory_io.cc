@@ -249,6 +249,10 @@ class Reader {
 class LoopMemoryIo : public ::testing::Test {
   protected:
     void SetUp() override {
+        Configure(false);
+    }
+
+    void Configure(bool raw) {
         ASSERT_EQ(0u, geteuid());
         const char* parent = getenv("DUNITEST_MEMORY_PARENT");
         parent_ = parent ? parent : "/sys/fs/cgroup";
@@ -278,22 +282,40 @@ class LoopMemoryIo : public ::testing::Test {
         ASSERT_NE(nullptr, created) << strerror(errno);
         directory_ = created;
         ASSERT_NO_FATAL_FAILURE(loop_.SetUp("ext4_inode_identity.img", directory_.c_str()));
-        ASSERT_NO_FATAL_FAILURE(loop_.Mount());
-        target_path_ = loop_.mount_point() + "/cold-target";
-        ASSERT_EQ(0, Fill(target_path_, kTargetBytes)) << strerror(errno);
+        if (!raw) {
+            ASSERT_NO_FATAL_FAILURE(loop_.Mount());
+            target_path_ = loop_.mount_point() + "/cold-target";
+            ASSERT_EQ(0, Fill(target_path_, kTargetBytes)) << strerror(errno);
+        }
         donor_path_ = directory_ + "/donor";
         ASSERT_EQ(0, Fill(donor_path_, kDonorBytes)) << strerror(errno);
 
         backing_ = open(loop_.backing_path().c_str(), O_RDWR | O_CLOEXEC);
         ASSERT_GE(backing_, 0);
+        if (raw) {
+            // This image is intentionally not mounted as ext4. Overwrite an
+            // existing, bounded range without truncating its configured loop
+            // capacity; the raw request tests only the lower backing cache.
+            unsigned char buffer[kBlock];
+            memset(buffer, 0x5a, sizeof(buffer));
+            for (size_t offset = 0; offset < kTargetBytes;) {
+                const size_t remaining = kTargetBytes - offset;
+                const size_t length = remaining < sizeof(buffer) ? remaining : sizeof(buffer);
+                ssize_t count = pwrite(backing_, buffer, length, offset);
+                if (count < 0 && errno == EINTR) continue;
+                ASSERT_GT(count, 0) << strerror(errno);
+                offset += size_t(count);
+            }
+        }
         ASSERT_EQ(0, fsync(backing_)) << strerror(errno);
         ASSERT_EQ(0, posix_fadvise(backing_, 0, 0, POSIX_FADV_DONTNEED));
         donor_ = open(donor_path_.c_str(), O_RDONLY | O_CLOEXEC);
-        target_ = open(target_path_.c_str(), O_RDONLY | O_DIRECT | O_CLOEXEC);
-        writer_ = open(target_path_.c_str(), O_RDWR | O_CLOEXEC);
+        target_ = raw ? open(loop_.loop_path().c_str(), O_RDONLY | O_CLOEXEC)
+                      : open(target_path_.c_str(), O_RDONLY | O_DIRECT | O_CLOEXEC);
+        if (!raw) writer_ = open(target_path_.c_str(), O_RDWR | O_CLOEXEC);
         ASSERT_GE(donor_, 0);
         ASSERT_GE(target_, 0);
-        ASSERT_GE(writer_, 0);
+        if (!raw) { ASSERT_GE(writer_, 0); }
         ASSERT_TRUE(reader_.Start(donor_, target_, writer_));
         ASSERT_EQ(0, Set(group_ + "/cgroup.procs", std::to_string(reader_.pid())));
     }
@@ -351,6 +373,49 @@ class LoopMemoryIo : public ::testing::Test {
     int target_ = -1, writer_ = -1, donor_ = -1, backing_ = -1;
     bool enabled_ = false;
 };
+
+class RawLoopMemoryIo : public LoopMemoryIo {
+  protected:
+    void SetUp() override {
+        Configure(true);
+    }
+};
+
+TEST_F(RawLoopMemoryIo, ColdBackingReadsUseSubmittingMemoryAccount) {
+    const uint64_t before = FileBytes();
+    ASSERT_NE(UINT64_MAX, before);
+    PrintSample("raw-before-read");
+    Reply reply;
+    ASSERT_TRUE(reader_.Run('R', &reply));
+    EXPECT_EQ(0, reply.error) << strerror(reply.error);
+    EXPECT_EQ(kTargetBytes, reply.bytes);
+    EXPECT_EQ(kTargetBytes * 0x5au, reply.checksum);
+    PrintSample("raw-after-read");
+    EXPECT_GE(FileBytes(), before + kTargetBytes);
+}
+
+TEST_F(RawLoopMemoryIo, ColdBackingChargeReclaimsCleanUnmappedDonor) {
+    Reply donor;
+    ASSERT_TRUE(reader_.Run('D', &donor));
+    ASSERT_EQ(0, donor.error) << strerror(donor.error);
+    ASSERT_EQ(kDonorBytes, donor.bytes);
+    ASSERT_EQ(kDonorBytes * 0x5au, donor.checksum);
+    ASSERT_GE(FileBytes(), kDonorBytes);
+    const uint64_t current = Current();
+    const uint64_t events = MaxEvents();
+    ASSERT_NE(UINT64_MAX, current);
+    ASSERT_NE(UINT64_MAX, events);
+    ASSERT_EQ(0, Set(group_ + "/memory.max", std::to_string(current + 128 * 1024)));
+    PrintSample("raw-limited-before-read");
+    Reply reply;
+    ASSERT_TRUE(reader_.Run('R', &reply));
+    PrintSample("raw-limited-after-read");
+    EXPECT_EQ(0, reply.error) << strerror(reply.error) << "; completed=" << reply.bytes;
+    EXPECT_EQ(kTargetBytes, reply.bytes);
+    EXPECT_EQ(kTargetBytes * 0x5au, reply.checksum);
+    EXPECT_GT(MaxEvents(), events);
+    EXPECT_LE(Current(), current + 128 * 1024);
+}
 
 TEST_F(LoopMemoryIo, ColdBackingReadsUseSubmittingMemoryAccount) {
     const uint64_t before = FileBytes();

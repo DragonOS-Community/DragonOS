@@ -46,6 +46,22 @@ impl SignalFdSigInfo {
         bytes[8..12].copy_from_slice(&header.si_code.to_ne_bytes());
         // Fixed-width Linux signalfd ABI, not the siginfo_t union layout.
         match info.sig_type() {
+            SigType::Opaque { .. } => {
+                if info.opaque_uses_poll_layout() {
+                    let poll = unsafe { header._sifields._sigpoll };
+                    bytes[20..24].copy_from_slice(&poll.si_fd.to_ne_bytes());
+                    bytes[28..32].copy_from_slice(&(poll.si_band as u32).to_ne_bytes());
+                } else {
+                    let rt = unsafe { header._sifields._rt };
+                    bytes[12..16].copy_from_slice(&(rt.si_pid as u32).to_ne_bytes());
+                    bytes[16..20].copy_from_slice(&rt.si_uid.to_ne_bytes());
+                    if header.si_code < 0 {
+                        let pointer = unsafe { rt.si_sigval.sival_ptr };
+                        bytes[44..48].copy_from_slice(&(pointer as i32).to_ne_bytes());
+                        bytes[48..56].copy_from_slice(&pointer.to_ne_bytes());
+                    }
+                }
+            }
             SigType::Kill { pid, uid } => {
                 bytes[12..16].copy_from_slice(&(pid.data() as u32).to_ne_bytes());
                 bytes[16..20].copy_from_slice(&uid.to_ne_bytes());

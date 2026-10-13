@@ -97,7 +97,7 @@ impl Syscall for SysRtSigqueueinfoHandle {
 
         // rt_sigqueueinfo 发送进程级信号，使用 PidType::TGID
         signal
-            .send_signal_info_to_pcb(Some(&mut info), target, PidType::TGID)
+            .send_user_signal_info_to_pcb(&mut info, target, PidType::TGID)
             .map(|x| x as usize)
     }
 

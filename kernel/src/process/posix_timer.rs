@@ -415,6 +415,8 @@ impl TimerFunction for PosixTimerHelper {
                             bump,
                         );
                     } else if siginfo_guard.sig_pending().queue().find(signo).0.is_some()
+                        || (!signo.is_rt_signal()
+                            && siginfo_guard.sig_pending().signal().contains(signo.into()))
                         || ignored_and_unblocked
                     {
                         // signo already has pending signals from another source, or it is

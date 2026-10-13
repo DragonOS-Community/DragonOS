@@ -74,13 +74,12 @@ pub fn check_signal_permission_pcb_with_sig(
     let current_cred = current_pcb.cred();
     let target_cred = target.cred();
 
-    // CAP_KILL allows sending signal to any process
-    if current_cred.has_capability(CAPFlags::CAP_KILL) {
+    if Arc::ptr_eq(&current_pcb.process_signal(), &target.process_signal()) {
         return Ok(());
     }
-
-    // Root can signal any process
-    if current_cred.euid.data() == 0 {
+    // A capability must apply to the target's owner namespace. UID 0 and
+    // capabilities in a private child namespace are not global bypasses.
+    if current_cred.has_capability_in_ns(&target_cred.user_ns, CAPFlags::CAP_KILL) {
         return Ok(());
     }
 

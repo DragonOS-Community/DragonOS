@@ -265,7 +265,10 @@ pub struct PipeRuntimeData {
     write_wait_queue: WaitQueue,
     /// 用于 FIFO 打开时的阻塞等待（等待另一端打开）
     open_wait_queue: WaitQueue,
-    epitems: EPollItemList,
+    // Match pipe_poll's distinct rd_wait/wr_wait sources. Registrations follow
+    // the OFD access mode, not the requested event mask (O_RDWR uses both).
+    read_epitems: EPollItemList,
+    write_epitems: EPollItemList,
     read_fasync_items: FAsyncItems,
     write_fasync_items: FAsyncItems,
 }
@@ -370,24 +373,6 @@ impl InnerPipeInode {
         }
 
         Ok(events.bits() as usize)
-    }
-
-    #[inline]
-    fn poll_both_ends(&self) -> EPollEventType {
-        // poll() 的返回与 FileFlags 的读/写端有关。
-        // 为了正确唤醒同时监听读端/写端的 epoll，需要合并两侧视角的事件。
-        let read_data = FilePrivateData::Pipefs(PipeFsPrivateData {
-            flags: FileFlags::O_RDONLY,
-            runtime: None,
-        });
-        let write_data = FilePrivateData::Pipefs(PipeFsPrivateData {
-            flags: FileFlags::O_WRONLY,
-            runtime: None,
-        });
-
-        let read_mask = self.poll(&read_data).unwrap_or(0);
-        let write_mask = self.poll(&write_data).unwrap_or(0);
-        EPollEventType::from_bits_truncate((read_mask | write_mask) as u32)
     }
 
     fn buf_full(&self) -> bool {
@@ -611,10 +596,18 @@ impl PipeRuntime {
         }
     }
 
-    fn publish_write_progress(&self, reader_wake: WakeMode, pollflag: EPollEventType) {
+    fn publish_write_progress(&self, reader_wake: WakeMode) {
         Self::wake_waiters(&self.read_wait_queue, reader_wake);
-        let _ = EventPoll::wakeup_epoll(&self.epitems, pollflag);
+        self.notify_readers(EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM);
         self.read_fasync_items.send_sigio(FASYNC_POLL_IN);
+    }
+
+    fn notify_readers(&self, key: EPollEventType) {
+        let _ = EventPoll::wakeup_epoll(&self.read_epitems, key);
+    }
+
+    fn notify_writers(&self, key: EPollEventType) {
+        let _ = EventPoll::wakeup_epoll(&self.write_epitems, key);
     }
 
     /// 安全地锁定两个管道节点（避免死锁）
@@ -684,7 +677,8 @@ impl PipeRuntime {
             read_wait_queue: WaitQueue::default(),
             write_wait_queue: WaitQueue::default(),
             open_wait_queue: WaitQueue::default(),
-            epitems: EPollItemList::default(),
+            read_epitems: EPollItemList::default(),
+            write_epitems: EPollItemList::default(),
             read_fasync_items: FAsyncItems::default(),
             write_fasync_items: FAsyncItems::default(),
         });
@@ -873,13 +867,12 @@ impl PipeRuntime {
         inner.buf_size = new_size;
 
         let writer_wake = Self::writer_wake_action(&mut inner);
-        let pollflag = inner.poll_both_ends();
         drop(inner);
         drop(transaction);
         drop(retired);
 
         self.wake_writers(writer_wake);
-        let _ = EventPoll::wakeup_epoll(&self.epitems, pollflag);
+        self.notify_writers(EPollEventType::empty());
 
         Ok(new_size)
     }
@@ -1003,10 +996,10 @@ impl PipeRuntime {
 
         while total_written < len {
             if inner_guard.reader == 0 {
-                let pollflag = progress_pending.then(|| inner_guard.poll_both_ends());
+                let notify = progress_pending;
                 drop(inner_guard);
-                if let Some(pollflag) = pollflag {
-                    self.publish_write_progress(reader_wake, pollflag);
+                if notify {
+                    self.publish_write_progress(reader_wake);
                 }
                 Self::send_sigpipe();
                 return if total_written > 0 {
@@ -1026,15 +1019,15 @@ impl PipeRuntime {
             };
 
             if need_wait {
-                let pending_poll = progress_pending.then(|| inner_guard.poll_both_ends());
+                let pending_poll = progress_pending;
                 let pending_reader_wake = reader_wake;
                 progress_pending = false;
                 reader_wake = WakeMode::None;
 
                 if flags.contains(FileFlags::O_NONBLOCK) {
                     drop(inner_guard);
-                    if let Some(pollflag) = pending_poll {
-                        self.publish_write_progress(pending_reader_wake, pollflag);
+                    if pending_poll {
+                        self.publish_write_progress(pending_reader_wake);
                     }
                     if total_written > 0 {
                         return Ok(total_written);
@@ -1045,8 +1038,8 @@ impl PipeRuntime {
                 let required = (atomic_write && total_written == 0).then_some(len);
                 let (guard, wait_result) =
                     self.wait_for_write_space(inner_guard, required, &mut transaction, || {
-                        if let Some(pollflag) = pending_poll {
-                            self.publish_write_progress(pending_reader_wake, pollflag);
+                        if pending_poll {
+                            self.publish_write_progress(pending_reader_wake);
                         }
                     });
                 inner_guard = guard;
@@ -1077,10 +1070,9 @@ impl PipeRuntime {
             }
         }
 
-        let pollflag = inner_guard.poll_both_ends();
         drop(inner_guard);
         if progress_pending {
-            self.publish_write_progress(reader_wake, pollflag);
+            self.publish_write_progress(reader_wake);
         }
 
         Ok(total_written)
@@ -1139,11 +1131,10 @@ impl PipeRuntime {
             WakeMode::None
         };
 
-        let pollflag = inner_guard.poll_both_ends();
         transaction.pass_baton_if_waiters_remain(&inner_guard);
         drop(inner_guard);
         Self::wake_waiters(&self.read_wait_queue, reader_wake);
-        let _ = EventPoll::wakeup_epoll(&self.epitems, pollflag);
+        self.notify_readers(EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM);
         self.read_fasync_items.send_sigio(FASYNC_POLL_IN);
 
         Ok(to_write)
@@ -1394,10 +1385,14 @@ impl PipeRuntime {
         } else {
             PipeWriterWake::None
         };
-        let pollflag = guard.poll_both_ends();
         drop(guard);
         self.wake_pipe_waiters(reader_wake, writer_wake);
-        let _ = EventPoll::wakeup_epoll(&self.epitems, pollflag);
+        if consume > 0 {
+            self.notify_writers(EPollEventType::empty());
+        }
+        if reader_wake != WakeMode::None {
+            self.notify_readers(EPollEventType::empty());
+        }
         if reader_wake != WakeMode::None {
             self.read_fasync_items.send_sigio(FASYNC_POLL_IN);
         }
@@ -1560,18 +1555,19 @@ impl PipeRuntime {
             WakeMode::None
         };
 
-        let in_poll = consume.then(|| in_guard.poll_both_ends());
-        let out_poll = out_guard.poll_both_ends();
         transaction.pass_baton_if_waiters_remain(&out_guard);
         drop(in_guard);
         drop(out_guard);
 
         src.wake_pipe_waiters(src_reader_wake, src_writer_wake);
         Self::wake_waiters(&dst.read_wait_queue, dst_reader_wake);
-        if let Some(in_poll) = in_poll {
-            let _ = EventPoll::wakeup_epoll(&src.epitems, in_poll);
+        if consume {
+            src.notify_writers(EPollEventType::empty());
         }
-        let _ = EventPoll::wakeup_epoll(&dst.epitems, out_poll);
+        if src_reader_wake != WakeMode::None {
+            src.notify_readers(EPollEventType::empty());
+        }
+        dst.notify_readers(EPollEventType::empty());
         if consume {
             src.write_fasync_items.send_sigio(FASYNC_POLL_OUT);
         }
@@ -1881,18 +1877,35 @@ impl PollableInode for PipeRuntime {
     fn add_epitem(
         &self,
         epitem: Arc<EPollItem>,
-        _private_data: &FilePrivateData,
+        private_data: &FilePrivateData,
     ) -> Result<(), SystemError> {
-        self.epitems.add(epitem);
+        let FilePrivateData::Pipefs(data) = private_data else {
+            return Err(SystemError::EBADF);
+        };
+        if !data.flags.is_write_only() {
+            self.read_epitems.add(epitem.clone());
+        }
+        if !data.flags.is_read_only() {
+            self.write_epitems.add(epitem);
+        }
         Ok(())
     }
 
     fn remove_epitem(
         &self,
         epitem: &Arc<EPollItem>,
-        _private_data: &FilePrivateData,
+        private_data: &FilePrivateData,
     ) -> Result<(), SystemError> {
-        self.epitems.remove(epitem)
+        let FilePrivateData::Pipefs(data) = private_data else {
+            return Err(SystemError::EBADF);
+        };
+        let read = !data.flags.is_write_only() && self.read_epitems.remove(epitem).is_ok();
+        let write = !data.flags.is_read_only() && self.write_epitems.remove(epitem).is_ok();
+        if read || write {
+            Ok(())
+        } else {
+            Err(SystemError::ENOENT)
+        }
     }
 
     fn add_fasync(
@@ -2031,11 +2044,13 @@ impl PipeRuntime {
             WakeMode::None
         };
         let writer_wake = Self::writer_wake_action(&mut inner_guard);
-        let pollflag = inner_guard.poll_both_ends();
         drop(inner_guard);
         self.wake_pipe_waiters(reader_wake, writer_wake);
         // 唤醒epoll中等待的进程（忽略错误，因为状态已更新，这是尽力而为的通知）
-        let _ = EventPoll::wakeup_epoll(&self.epitems, pollflag);
+        self.notify_writers(EPollEventType::EPOLLOUT | EPollEventType::EPOLLWRNORM);
+        if reader_wake != WakeMode::None {
+            self.notify_readers(EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM);
+        }
         self.write_fasync_items.send_sigio(FASYNC_POLL_OUT);
 
         //返回读取的字节数
@@ -2220,11 +2235,6 @@ impl PipeRuntime {
         // Linux pipe_release() wakes both wait queues and notifies both fasync
         // sides only when close leaves exactly one endpoint class present.
         let release_notify = (guard.reader == 0) != (guard.writer == 0);
-        let pollflag = if release_notify {
-            guard.poll_both_ends()
-        } else {
-            EPollEventType::empty()
-        };
         let writer_wake = if release_notify {
             Self::writer_wake_action(&mut guard)
         } else {
@@ -2236,7 +2246,8 @@ impl PipeRuntime {
         if release_notify {
             self.read_wait_queue.wakeup_all(None);
             self.wake_writers(writer_wake);
-            let _ = EventPoll::wakeup_epoll(&self.epitems, pollflag);
+            let _ = EventPoll::wakeup_epoll_all(&self.read_epitems, EPollEventType::empty());
+            let _ = EventPoll::wakeup_epoll_all(&self.write_epitems, EPollEventType::empty());
             self.read_fasync_items.send_sigio(FASYNC_POLL_IN);
             self.write_fasync_items.send_sigio(FASYNC_POLL_OUT);
         }

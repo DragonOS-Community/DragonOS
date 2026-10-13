@@ -187,13 +187,23 @@ impl ProcessManager {
         let old_fs_root = child_fs.root();
         let old_fs_pwd = child_fs.pwd();
         let new_ns = create_new_namespaces(clone_flags, child_pcb, user_ns)?;
-        let rebound_fs = if clone_flags.contains(CloneFlags::CLONE_NEWNS) {
-            Some((
+        let rebound_fs = (|| {
+            if !clone_flags.contains(CloneFlags::CLONE_NEWNS) {
+                return Ok(None);
+            }
+            Ok(Some((
                 new_ns.mnt_ns.project_copy_source_inode(&old_fs_root)?,
                 new_ns.mnt_ns.project_copy_source_inode(&old_fs_pwd)?,
-            ))
-        } else {
-            None
+            )))
+        })();
+        let rebound_fs = match rebound_fs {
+            Ok(paths) => paths,
+            Err(error) => {
+                if clone_flags.contains(CloneFlags::CLONE_NEWPID) {
+                    new_ns.pid_ns_for_children.discard_unpublished();
+                }
+                return Err(error);
+            }
         };
 
         // All fallible mount/fs_struct projection completed before either
@@ -223,26 +233,31 @@ pub(super) fn create_new_namespaces(
         .pid_ns_for_children
         .copy_pid_ns(clone_flags, user_ns.clone())?;
 
-    let mnt_ns = nsproxy.mnt_ns.copy_mnt_ns(clone_flags, user_ns.clone())?;
-    let net_ns = nsproxy.net_ns.copy_net_ns(clone_flags, user_ns.clone())?;
+    let result = (|| {
+        let mnt_ns = nsproxy.mnt_ns.copy_mnt_ns(clone_flags, user_ns.clone())?;
+        let net_ns = nsproxy.net_ns.copy_net_ns(clone_flags, user_ns.clone())?;
 
-    let uts_ns = nsproxy.uts_ns.copy_uts_ns(clone_flags, user_ns.clone())?;
-    let ipc_ns = nsproxy.ipc_ns.copy_ipc_ns(clone_flags, user_ns.clone());
-    let cgroup_ns = nsproxy
-        .cgroup_ns
-        .copy_cgroup_ns(clone_flags, user_ns.clone())?;
+        let uts_ns = nsproxy.uts_ns.copy_uts_ns(clone_flags, user_ns.clone())?;
+        let ipc_ns = nsproxy.ipc_ns.copy_ipc_ns(clone_flags, user_ns.clone());
+        let cgroup_ns = nsproxy
+            .cgroup_ns
+            .copy_cgroup_ns(clone_flags, user_ns.clone())?;
 
-    let result = NsProxy {
-        pid_ns_for_children,
-        mnt_ns,
-        net_ns,
-        uts_ns,
-        ipc_ns,
-        cgroup_ns,
-    };
+        let result = NsProxy {
+            pid_ns_for_children: pid_ns_for_children.clone(),
+            mnt_ns,
+            net_ns,
+            uts_ns,
+            ipc_ns,
+            cgroup_ns,
+        };
 
-    let result = Arc::new(result);
-    return Ok(result);
+        Ok(Arc::new(result))
+    })();
+    if result.is_err() && clone_flags.contains(CloneFlags::CLONE_NEWPID) {
+        pid_ns_for_children.discard_unpublished();
+    }
+    result
 }
 
 /// https://code.dragonos.org.cn/xref/linux-6.6.21/include/linux/ns_common.h#9

@@ -1,5 +1,5 @@
 use core::fmt::Debug;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::filesystem::epoll::{
     event_poll::{EPollItemList, EventPoll},
@@ -24,6 +24,47 @@ pub(crate) use selftest::selftest_membership_lifetime;
 /// This is the DragonOS equivalent of the Linux tasklist lock coverage used by
 /// setpgid(), setsid(), de_thread(), exit unhashing, and process-group lookup.
 static PID_MEMBERSHIP_LOCK: SpinLock<()> = SpinLock::new(());
+
+// Distinct from task membership: free_pid can already run under that lock.
+// Order: membership -> map transaction -> one namespace inner at a time.
+static PID_MAP_LOCK: SpinLock<()> = SpinLock::new(());
+pub(super) fn pid_map_lock() -> SpinLockGuard<'static, ()> {
+    PID_MAP_LOCK.lock_irqsave()
+}
+
+pub(crate) const PID_MAX_LIMIT: usize = 4_194_304;
+static PID_MAX: AtomicUsize = AtomicUsize::new(32_768);
+static PID_MAX_MIN: AtomicUsize = AtomicUsize::new(301);
+
+pub(crate) fn init_pid_limits() {
+    let cpus = if crate::smp::cpu::smp_cpu_manager_initialized() {
+        crate::smp::cpu::smp_cpu_manager()
+            .possible_cpus_count()
+            .max(1) as usize
+    } else {
+        1
+    };
+    PID_MAX_MIN.store(
+        (cpus.saturating_mul(8)).clamp(301, PID_MAX_LIMIT),
+        Ordering::Release,
+    );
+    PID_MAX.store(
+        (cpus.saturating_mul(1024)).clamp(32_768, PID_MAX_LIMIT),
+        Ordering::Release,
+    );
+}
+
+pub(crate) fn pid_max() -> usize {
+    PID_MAX.load(Ordering::Acquire)
+}
+
+pub(crate) fn set_pid_max(value: usize) -> Result<(), SystemError> {
+    if !(PID_MAX_MIN.load(Ordering::Acquire)..=PID_MAX_LIMIT).contains(&value) {
+        return Err(SystemError::EINVAL);
+    }
+    PID_MAX.store(value, Ordering::Release);
+    Ok(())
+}
 
 pub(crate) fn pid_membership_lock() -> SpinLockGuard<'static, ()> {
     PID_MEMBERSHIP_LOCK.lock_irqsave()
@@ -270,7 +311,8 @@ impl Eq for Pid {}
 
 impl Drop for Pid {
     fn drop(&mut self) {
-        let numbers = self.numbers.lock();
+        // Do not acquire the map transaction while holding the identity lock.
+        let numbers = core::mem::take(&mut *self.numbers.lock());
         for (level, upid) in numbers.iter().enumerate() {
             if self.registered[level].swap(false, Ordering::AcqRel) {
                 let upid = upid
@@ -512,54 +554,94 @@ impl Clone for PidLink {
 ///
 /// 参考：https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/pid.c?fi=alloc_pid#162
 pub(super) fn alloc_pid(ns: &Arc<PidNamespace>) -> Result<Arc<Pid>, SystemError> {
-    let pid = Pid::new(ns.level());
-
-    // 用于记录已分配的PID，以便失败时清理
-    let mut allocated_upids: Vec<(isize, UPid)> = Vec::new();
-
-    // 获取当前namespace的引用链
-    let mut current_ns = Some(ns.clone());
-    let mut level = ns.level() as isize;
-
-    // 从最深层级开始向上分配PID
-    while level >= 0 {
-        if let Some(ref curr_ns) = current_ns {
-            // warn: 这里会造成Arc的循环引用，不过暂时没想到什么好办法
-            // 因此需要在进程退出的时候需要手动清理pid。
-            // 循环引用的路径： current_ns -> pid_map -> pid -> numbers -> upid -> ns(curr_ns)
-            match curr_ns.alloc_pid_in_ns(pid.clone()) {
-                Ok(nr) => {
-                    let upid = UPid::new(nr, curr_ns.clone());
-                    allocated_upids.push((level, upid.clone()));
-                    pid.numbers.lock()[level as usize] = Some(upid);
-                    pid.registered[level as usize].store(true, Ordering::Release);
-                    current_ns = curr_ns.parent();
-                }
-                Err(e) => {
-                    // 分配失败，需要清理已分配的PID
-                    cleanup_allocated_pids(pid, allocated_upids);
-                    return Err(e);
-                }
-            }
-        }
-        level -= 1;
-    }
-
-    // 如果分配成功，返回新创建的PID
-    Ok(pid)
+    alloc_pid_with_tids(ns, &[])
 }
 
-/// 清理已分配的PID
-fn cleanup_allocated_pids(pid: Arc<Pid>, mut allocated_upids: Vec<(isize, UPid)>) {
-    // 反转已分配的UPid列表，以便从最深层级开始清理
-    allocated_upids.reverse();
-    for (level, upid) in allocated_upids {
-        let curr_ns = upid.ns;
-        // 在当前namespace中释放UPid
-        curr_ns.release_pid_in_ns(upid.nr);
-        pid.registered[level as usize].store(false, Ordering::Release);
-        pid.numbers.lock()[level as usize] = None;
+/// Reserve all namespace IDs before publishing any mapping. The requesting
+/// caller's credentials, never a CLONE_NEWUSER child's credentials, authorize
+/// each requested level. Permission results are computed outside the map lock.
+pub(super) fn alloc_pid_with_tids(
+    ns: &Arc<PidNamespace>,
+    requested: &[i32],
+) -> Result<Arc<Pid>, SystemError> {
+    if requested.len() > ns.level() as usize + 1 {
+        return Err(SystemError::EINVAL);
     }
+    let mut chain = Vec::with_capacity(ns.level() as usize + 1);
+    let mut cursor = Some(ns.clone());
+    while let Some(current) = cursor {
+        cursor = current.parent();
+        chain.push(current);
+    }
+    if chain.len() != ns.level() as usize + 1 {
+        return Err(SystemError::ENOMEM);
+    }
+    let caller = (!requested.is_empty()).then(|| ProcessManager::current_pcb().cred());
+    let allowed: Vec<bool> = chain
+        .iter()
+        .take(requested.len())
+        .map(|namespace| {
+            let cred = caller
+                .as_ref()
+                .expect("requested IDs have caller credentials");
+            super::cred::cap_capable(
+                cred,
+                namespace.user_ns(),
+                super::cred::CAPFlags::CAP_SYS_ADMIN,
+            ) || super::cred::cap_capable(
+                cred,
+                namespace.user_ns(),
+                super::cred::CAPFlags::CAP_CHECKPOINT_RESTORE,
+            )
+        })
+        .collect();
+    let pid = Pid::new(ns.level());
+    let limit = pid_max();
+    let mut reserved = Vec::with_capacity(chain.len());
+    let transaction = pid_map_lock();
+    let result = (|| {
+        for (index, namespace) in chain.iter().enumerate() {
+            let wanted = requested.get(index).copied();
+            if let Some(tid) = wanted {
+                if tid < 1
+                    || tid as usize >= limit
+                    || tid != 1 && namespace.child_reaper().is_none()
+                {
+                    return Err(SystemError::EINVAL);
+                }
+                if !allowed[index] {
+                    return Err(SystemError::EPERM);
+                }
+            }
+            let nr = namespace.reserve_pid_in_ns(wanted.map(|tid| RawPid(tid as usize)), limit)?;
+            reserved.push(UPid::new(nr, namespace.clone()));
+        }
+        // Identity is complete before a find/collect can acquire any map owner.
+        {
+            let mut numbers = pid.numbers.lock();
+            for upid in &reserved {
+                numbers[upid.ns.level() as usize] = Some(upid.clone());
+            }
+        }
+        for upid in &reserved {
+            upid.ns.publish_reserved_pid(upid.nr, pid.clone());
+            pid.registered[upid.ns.level() as usize].store(true, Ordering::Release);
+        }
+        Ok(())
+    })();
+    if let Err(error) = result {
+        for upid in reserved.iter().rev() {
+            upid.ns.rollback_reserved_pid(upid.nr);
+        }
+        // Linux restores the initial cursor only for a failed first birth
+        // inside alloc_pid, not for a later copy_process/free_pid failure.
+        ns.reset_fresh_pid_cursor();
+        drop(transaction);
+        drop(reserved);
+        return Err(error);
+    }
+    drop(transaction);
+    Ok(pid)
 }
 
 /// 释放pid
@@ -568,6 +650,10 @@ fn cleanup_allocated_pids(pid: Arc<Pid>, mut allocated_upids: Vec<(isize, UPid)>
 pub(super) fn free_pid(pid: Arc<Pid>) {
     // 释放PID
     pid.set_dead();
+    let mut retired = Vec::with_capacity(pid.level as usize + 1);
+    let mut reapers = Vec::with_capacity(pid.level as usize + 1);
+    let mut dead_namespaces = Vec::with_capacity(pid.level as usize + 1);
+    let transaction = pid_map_lock();
     // let raw_pid = pid.pid_vnr().data();
     let mut level = 0;
     while level <= pid.level {
@@ -588,16 +674,26 @@ pub(super) fn free_pid(pid: Arc<Pid>) {
         let pid_allocated_after_free = ns_guard.do_pid_allocated() - 1;
         if pid_allocated_after_free == 1 || pid_allocated_after_free == 2 {
             if let Some(child_reaper) = ns_guard.child_reaper().as_ref().and_then(|x| x.upgrade()) {
-                ProcessManager::wakeup(&child_reaper).ok();
+                reapers.push(child_reaper);
             }
         }
-        ns_guard.do_release_pid_in_ns(upid.nr);
-        if ns_guard.dead() {
+        retired.push(ns_guard.do_release_pid_in_ns(upid.nr));
+        let dead = ns_guard.dead();
+        drop(ns_guard);
+        if dead {
             // log::debug!("Releasing pid namespace with level {}", level);
-            upid.ns.delete_current_pidns_in_parent();
+            dead_namespaces.push(upid.ns);
         }
         level += 1;
     }
+    drop(transaction);
+    for reaper in reapers {
+        ProcessManager::wakeup(&reaper).ok();
+    }
+    for namespace in dead_namespaces {
+        namespace.delete_current_pidns_in_parent();
+    }
+    drop(retired);
 }
 
 impl ProcessControlBlock {

@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <limits.h>
 #include <netinet/in.h>
+#include <net/if.h>
 #include <pthread.h>
 #include <poll.h>
 #include <sched.h>
@@ -11,6 +12,8 @@
 #include <signal.h>
 #include <stdint.h>
 #include <sys/socket.h>
+#include <sys/ioctl.h>
+#include <sys/wait.h>
 #include <sys/mman.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -693,6 +696,61 @@ TEST(TcpCloseSemantics, ReversedDualStackResetDuringCloseDoesNotStall) {
     }
 
     ExpectMmSignalPathResponsiveAfterTcpStorm();
+}
+
+TEST(TcpCloseSemantics, ColdNamespaceConcurrentBindAndConnectAdmission) {
+    // A private namespace starts with an empty protocol table. Keep every
+    // successful pair alive until all attempts complete so close cannot hide
+    // a prepare/commit capacity race by returning vacancies early.
+    pid_t child = fork();
+    ASSERT_GE(child, 0);
+    if (child == 0) {
+        alarm(30);
+        if (unshare(CLONE_NEWUSER | CLONE_NEWNET) != 0)
+            _exit(errno == EPERM ? 77 : 1);
+        FdGuard control(socket(AF_INET, SOCK_STREAM, 0));
+        if (control.Get() < 0) _exit(2);
+        ifreq request {};
+        strcpy(request.ifr_name, "lo");
+        if (ioctl(control.Get(), SIOCGIFFLAGS, &request) != 0) _exit(3);
+        request.ifr_flags |= IFF_UP;
+        if (ioctl(control.Get(), SIOCSIFFLAGS, &request) != 0) _exit(4);
+        struct Admission {
+            std::atomic<bool> start {false};
+            std::atomic<int> arrived {0};
+            int workers = 0;
+        } admission;
+        auto worker = [](void* argument) -> void* {
+            auto* admission = static_cast<Admission*>(argument);
+            while (!admission->start.load(std::memory_order_acquire)) sched_yield();
+            TcpPair pair;
+            bool success = InitTcpPair(&pair);
+            admission->arrived.fetch_add(1, std::memory_order_release);
+            while (admission->arrived.load(std::memory_order_acquire) != admission->workers)
+                sched_yield();
+            return success ? nullptr : reinterpret_cast<void*>(1);
+        };
+        constexpr int kWorkers = 100;
+        pthread_t threads[kWorkers] {};
+        while (admission.workers < kWorkers) {
+            if (pthread_create(&threads[admission.workers], nullptr, worker, &admission) != 0)
+                break;
+            ++admission.workers;
+        }
+        admission.start.store(true, std::memory_order_release);
+        bool success = admission.workers == kWorkers;
+        for (int i = 0; i < admission.workers; ++i) {
+            void* result = nullptr;
+            if (pthread_join(threads[i], &result) != 0 || result != nullptr) success = false;
+        }
+        _exit(success ? 0 : 5);
+    }
+    int status = 0;
+    ASSERT_EQ(waitpid(child, &status, 0), child);
+    if (WIFEXITED(status) && WEXITSTATUS(status) == 77)
+        GTEST_SKIP() << "user/network namespace creation is not permitted";
+    ASSERT_TRUE(WIFEXITED(status)) << status;
+    EXPECT_EQ(WEXITSTATUS(status), 0);
 }
 
 }  // namespace

@@ -54,6 +54,11 @@ pub fn ksys_unshare(flags: CloneFlags) -> Result<(), SystemError> {
             }
             Err(error) => {
                 drop(fs_refs);
+                if flags.contains(CloneFlags::CLONE_NEWPID) {
+                    if let Some(candidate) = new_nsproxy.as_ref() {
+                        candidate.pid_ns_for_children.discard_unpublished();
+                    }
+                }
                 drop(new_fs);
                 drop(new_nsproxy);
                 drop(new_cred);

@@ -55,6 +55,7 @@ normal/timekeeping_selftest
 normal/errseq_writeback_reporting
 normal/test_tlb_shootdown
 normal/pid_namespace_fork
+normal/clone3_set_tid
 normal/uts_namespace
 normal/tcp_bind_semantics
 normal/tcp_dual_stack_semantics

@@ -76,7 +76,7 @@ impl PidNamespace {
                 dead: false,
                 last_pid: RawPid(0),
                 child_reaper: None,
-                ida: IdAllocator::new(1, usize::MAX).unwrap(),
+                ida: IdAllocator::new(1, crate::process::pid::PID_MAX_LIMIT).unwrap(),
                 pid_map: HashMap::new(),
                 children: Vec::new(),
             }),
@@ -92,11 +92,53 @@ impl PidNamespace {
         &self.user_ns
     }
 
-    pub fn alloc_pid_in_ns(&self, pid: Arc<Pid>) -> Result<RawPid, SystemError> {
+    /// Caller owns PID_MAP_LOCK; reserve an invisible ID, not a Pid mapping.
+    pub(in crate::process) fn reserve_pid_in_ns(
+        &self,
+        requested: Option<RawPid>,
+        limit: usize,
+    ) -> Result<RawPid, SystemError> {
         let mut inner = self.inner();
-        let raw_pid = inner.do_alloc_pid_in_ns(pid)?;
+        if inner.dead {
+            return Err(SystemError::ENOMEM);
+        }
+        if let Some(nr) = requested {
+            return inner
+                .ida
+                .reserve_specific(nr.data())
+                .map(RawPid)
+                .ok_or(SystemError::EEXIST);
+        }
+        // Linux's IDR cursor is the next candidate; this namespace keeps
+        // its last automatic selection for /proc/loadavg instead.
+        let min = if inner.last_pid.data() >= 300 { 300 } else { 1 };
+        let next = inner.last_pid.data().saturating_add(1);
+        let nr = inner
+            .ida
+            .alloc_range_from(next, min, limit)
+            .ok_or(SystemError::EAGAIN_OR_EWOULDBLOCK)?;
+        inner.last_pid = RawPid(nr);
+        Ok(RawPid(nr))
+    }
+
+    pub(in crate::process) fn publish_reserved_pid(&self, nr: RawPid, pid: Arc<Pid>) {
+        let mut inner = self.inner();
+        debug_assert!(!inner.dead && inner.ida.exists(nr.data()));
+        debug_assert!(!inner.pid_map.contains_key(&nr));
+        inner.pid_map.insert(nr, pid);
         self.processes_created.fetch_add(1, Ordering::Relaxed);
-        Ok(raw_pid)
+    }
+
+    pub(in crate::process) fn rollback_reserved_pid(&self, nr: RawPid) {
+        self.inner().ida.free(nr.data());
+    }
+
+    pub(in crate::process) fn reset_fresh_pid_cursor(&self) {
+        let mut inner = self.inner();
+        if inner.pid_map.is_empty() && !inner.dead {
+            inner.ida.reset_cursor();
+            inner.last_pid = RawPid(0);
+        }
     }
 
     pub fn pid_allocated(&self) -> usize {
@@ -112,9 +154,12 @@ impl PidNamespace {
         self.inner().last_pid
     }
 
-    pub fn release_pid_in_ns(&self, raw_pid: RawPid) {
-        let mut inner = self.inner();
-        inner.do_release_pid_in_ns(raw_pid);
+    pub(in crate::process) fn release_pid_in_ns(&self, nr: RawPid) {
+        let retired = {
+            let _transaction = crate::process::pid::pid_map_lock();
+            self.inner().do_release_pid_in_ns(nr)
+        };
+        drop(retired);
     }
 
     pub fn find_pid_in_ns(&self, raw_pid: RawPid) -> Option<Arc<Pid>> {
@@ -172,7 +217,7 @@ impl PidNamespace {
                 child_reaper: None,
                 dead: false,
                 last_pid: RawPid(0),
-                ida: IdAllocator::new(1, usize::MAX).unwrap(),
+                ida: IdAllocator::new(1, crate::process::pid::PID_MAX_LIMIT).unwrap(),
                 pid_map: HashMap::new(),
                 children: Vec::new(),
             }),
@@ -193,11 +238,39 @@ impl PidNamespace {
     }
 
     pub fn set_child_reaper(&self, child_reaper: Weak<ProcessControlBlock>) {
+        let _transaction = crate::process::pid::pid_map_lock();
         self.inner().child_reaper = Some(child_reaper);
     }
 
     pub fn disable_pid_allocation(&self) {
+        let _transaction = crate::process::pid::pid_map_lock();
         self.inner().dead = true;
+    }
+
+    /// Cancel a namespace created by this failed fork/unshare attempt. The
+    /// caller must retain an Arc and must not pass an inherited namespace:
+    /// the parent's children list owns an extra reference even before PID 1.
+    pub(in crate::process) fn discard_unpublished(&self) {
+        self.disable_pid_allocation();
+        self.delete_current_pidns_in_parent();
+    }
+
+    pub(in crate::process) fn selftest_discard_unpublished() -> Result<bool, SystemError> {
+        let parent = Self::new_root();
+        for _ in 0..32 {
+            let child = parent.create_pid_namespace(parent.user_ns.clone())?;
+            let weak = Arc::downgrade(&child);
+            let retained = parent.inner().children.len() == 1;
+            child.discard_unpublished();
+            // Error cleanup can run again after PID cleanup removed the
+            // parent entry. It must remain safe and release the last owner.
+            child.discard_unpublished();
+            drop(child);
+            if !retained || weak.upgrade().is_some() || !parent.inner().children.is_empty() {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     pub fn parent(&self) -> Option<Arc<PidNamespace>> {
@@ -214,25 +287,15 @@ impl PidNamespace {
 }
 
 impl InnerPidNamespace {
-    pub fn do_alloc_pid_in_ns(&mut self, pid: Arc<Pid>) -> Result<RawPid, SystemError> {
-        if self.dead {
-            return Err(SystemError::ENOMEM);
-        }
-        let raw_pid = self.ida.alloc().ok_or(SystemError::ENOMEM)?;
-        let raw_pid = RawPid(raw_pid);
-        self.pid_map.insert(raw_pid, pid);
-        self.last_pid = raw_pid;
-        Ok(raw_pid)
-    }
-
-    pub fn do_release_pid_in_ns(&mut self, raw_pid: RawPid) {
+    pub fn do_release_pid_in_ns(&mut self, raw_pid: RawPid) -> Option<Arc<Pid>> {
         // log::debug!("do_release_pid_in_ns: raw_pid={}", raw_pid);
-        self.pid_map.remove(&raw_pid);
+        let retired = self.pid_map.remove(&raw_pid);
         self.ida.free(raw_pid.data());
         if self.pid_map.is_empty() {
             // 如果当前namespace中没有任何PID了，则标记为dead
             self.dead = true;
         }
+        retired
     }
 
     pub fn do_pid_allocated(&self) -> usize {

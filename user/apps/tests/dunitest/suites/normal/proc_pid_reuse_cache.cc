@@ -2,6 +2,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <linux/sched.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <string.h>
@@ -42,13 +43,17 @@ bool wait_for_zombie(pid_t child) {
     return result == 0 && info.si_pid == child;
 }
 
-pid_t fork_waiting_child(int* release_fd) {
+pid_t fork_waiting_child(int* release_fd, pid_t requested = 0) {
     int pipefd[2] = {-1, -1};
     if (pipe(pipefd) != 0) {
         return -1;
     }
 
-    pid_t child = fork();
+    struct clone_args args = {};
+    args.exit_signal = SIGCHLD;
+    args.set_tid = reinterpret_cast<uintptr_t>(&requested);
+    args.set_tid_size = 1;
+    pid_t child = requested == 0 ? fork() : syscall(SYS_clone3, &args, sizeof(args));
     if (child == 0) {
         close(pipefd[1]);
         char byte = 0;
@@ -132,21 +137,13 @@ TEST(ProcPidReuseCache, NumericProcDirRefreshesAfterPidReuse) {
 
     release_child(first, first_release);
 
-    pid_t reused = -1;
     int reused_release = -1;
-    for (int i = 0; i < 128; ++i) {
-        int release_fd = -1;
-        pid_t child = fork_waiting_child(&release_fd);
-        ASSERT_GT(child, 0) << "fork replacement child failed: errno=" << errno << " ("
-                            << strerror(errno) << ")";
-
-        if (child == first) {
-            reused = child;
-            reused_release = release_fd;
-            break;
-        }
-
-        release_child(child, release_fd);
+    // Linux cyclic allocation does not promise reuse within 128 forks.
+    // Request the retired ID explicitly so this tests cache identity, not
+    // a non-portable allocator timing assumption.
+    const pid_t reused = fork_waiting_child(&reused_release, first);
+    if (reused < 0 && (errno == EPERM || errno == ENOSYS)) {
+        GTEST_SKIP() << "deterministic PID reuse needs clone3 set_tid privilege";
     }
 
     ASSERT_EQ(first, reused) << "test requires PID reuse to exercise cached /proc/<pid> inode";

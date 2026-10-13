@@ -237,20 +237,25 @@ impl ProcessControlBlock {
                         }
                         self.flags().insert(ProcessFlags::PENDING_PTRACE_STOP);
                     } else {
-                        if self.exit_state() == ExitState::Running {
-                            if let Some(strong) = self.self_ref.upgrade() {
-                                let _ = ProcessManager::stop_task(&strong);
-                            }
-                        }
-                        if counted {
-                            completed_group_stop =
-                                group.complete_ptrace_group_stop(group_generation);
+                        if let Some(strong) = self.self_ref.upgrade() {
+                            let signal = Signal::from((exit_code & EXITCODE_SIG_MASK) as i32);
+                            let (_, completion) = lifecycle::handoff_group_stop_locked(
+                                &strong,
+                                group_generation,
+                                signal,
+                                counted,
+                                group,
+                            );
+                            completed_group_stop = completion.is_some();
                         }
                     }
                 });
             }
             drop(relation_guard);
             drop(irq);
+            if let Some(strong) = self.self_ref.upgrade() {
+                lifecycle::activate_group_stop_handoff(&strong);
+            }
             // A generation-bound pending record may belong to a session that
             // has already detached.  It must not clear TRAPPING published by
             // a later attach.  Ordinary current-session stops retain the old

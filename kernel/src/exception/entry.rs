@@ -77,6 +77,8 @@ unsafe fn exit_to_user_mode_loop(frame: &mut TrapFrame, mut process_flags_work: 
             if process_flags_work.contains(ProcessFlags::HAS_PENDING_SIGNAL)
                 || process_flags_work.contains(ProcessFlags::PENDING_PTRACE_STOP)
                 || process_flags_work.contains(ProcessFlags::PENDING_DEBUG)
+                || process_flags_work.contains(ProcessFlags::NEED_CGROUP_FREEZE)
+                || process_flags_work.contains(ProcessFlags::PENDING_GROUP_STOP)
             {
                 unsafe { CurrentSignalArch::do_signal_or_restart(frame) };
             }

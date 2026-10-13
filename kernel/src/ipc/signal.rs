@@ -258,13 +258,29 @@ impl Signal {
             return false;
         }
 
+        // A freezer-own park defers ordinary signals, but never group exit,
+        // SIGKILL or a debugger trap. This is not the policy of ordinary waits.
+        if pcb.freezer.parked.load(Ordering::Acquire) {
+            return pcb.process_signal().group_exiting()
+                || Self::fatal_signal_pending(pcb)
+                || pcb.flags().load().intersects(
+                    ProcessFlags::PENDING_PTRACE_STOP | ProcessFlags::PENDING_GROUP_STOP,
+                );
+        }
+
         // Linux ptrace_signal_wake_up() publishes TIF_SIGPENDING even though
         // PTRACE_INTERRUPT does not enqueue a signal. Treat DragonOS's
         // equivalent return-to-user work bit the same way for interruptible
         // sleeps, so a tracee cannot race the wakeup and block after the
         // tracer has requested an EVENT_STOP. Killable/uninterruptible waits
         // remain wakeable only by a fatal signal.
-        if interruptible && pcb.flags().contains(ProcessFlags::PENDING_PTRACE_STOP) {
+        if interruptible
+            && pcb.flags().load().intersects(
+                ProcessFlags::PENDING_PTRACE_STOP
+                    | ProcessFlags::PENDING_GROUP_STOP
+                    | ProcessFlags::NEED_CGROUP_FREEZE,
+            )
+        {
             return true;
         }
 
@@ -828,52 +844,12 @@ impl Signal {
             {
                 return !self.sig_ignored(&pcb, false);
             }
-            // Not traced: transactional group-stop (atomically set STOP_STOPPED | CLD_STOPPED +
-            // stop_signal while holding the sighand lock), matching Linux's sighand -> pi_lock
-            // -> rq_lock ordering to prevent a concurrent SIGCONT from tearing the transition.
-            let fresh_stop =
-                thread_group_leader
-                    .process_signal()
-                    .transition_group_stop(*self, || {
-                        // stop_task only rejects an already Exited task. Publishing
-                        // the group event therefore requires at least one live
-                        // member; every live member in this stable snapshot is
-                        // transitioned to Stopped before the callback returns.
-                        let mut has_live_member = false;
-                        ProcessManager::for_each_thread_in_group(
-                            thread_group_leader.clone(),
-                            |t| {
-                                has_live_member |= ProcessManager::stop_task(&t).is_ok();
-                                true
-                            },
-                        );
-                        has_live_member
-                    });
-
-            if fresh_stop {
-                if let Some(parent) = pcb.parent_pcb() {
-                    let _ = crate::ipc::kill::send_signal_to_pcb(parent.clone(), Signal::SIGCHLD);
-                    parent.wake_all_waiters();
-                }
-                // 唤醒等待在该子进程/线程上的等待者
-                thread_group_leader.wake_all_waiters();
-                ProcessManager::for_each_thread_in_group(thread_group_leader.clone(), |t| {
-                    t.wake_all_waiters();
-                    true
-                });
-            }
-
-            // SIGSTOP 是 kernel-only stop 信号：其效果是把线程组置为 stopped 并通知父进程，
-            // 不应作为“可传递到用户态”的 pending 信号继续入队。
-            // 否则在 SIGCONT 后可能错误地以 EINTR/ERESTART* 形式打断正在执行的系统调用（gVisor sigstop_test 即依赖这一点）。
-            if *self == Signal::SIGSTOP {
-                // DragonOS 采用异步 stop_task，因此需要在此处补上 schedule。
-                let current = ProcessManager::current_pcb();
-                let is_self_stop =
-                    Arc::ptr_eq(&current, &pcb) || Arc::ptr_eq(&current, &thread_group_leader);
-                if is_self_stop {
-                    crate::sched::schedule(crate::sched::SchedMode::SM_NONE);
-                }
+            // SIGSTOP is deferred task-context work, not sender-side scheduler
+            // suspension: a remote syscall may still own UPDATE or an FS lock.
+            // Catchable stop signals retain normal masking/disposition handling.
+            if *self == Signal::SIGSTOP
+                && crate::process::ptrace::request_untraced_group_stop(&thread_group_leader, *self)
+            {
                 return false;
             }
         } else if *self == Signal::SIGCONT {

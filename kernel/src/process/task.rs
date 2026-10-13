@@ -160,6 +160,11 @@ pub struct ProcessControlBlockData {
     pub(crate) memory_high_wait: SpinLock<Option<Arc<crate::cgroup::memory::high::HighWait>>>,
     /// Temporary stacked-I/O allocation ownership, not cgroup membership.
     pub(crate) memory_io_context: SpinLock<Option<crate::cgroup::memory::io::MemoryIoContext>>,
+    pub(crate) freezer: crate::cgroup::freezer::TaskState,
+    /// Generation-bound job-control ticket, written under the group signal lock.
+    pub(crate) pending_group_stop_generation: AtomicU64,
+    /// Whether this ticket owns one outstanding group-stop participant.
+    pub(crate) pending_group_stop_counted: AtomicBool,
     /// The PID of the current process.
     pub(super) pid: AtomicRawPid,
     /// The thread group ID of the current process (this value never changes
@@ -890,6 +895,9 @@ impl ProcessControlBlock {
                 cpu_accounting: SpinLock::new(cpu_accounting),
                 memory_high_debt: AtomicU64::new(0),
                 memory_io_context: SpinLock::new(None),
+                freezer: crate::cgroup::freezer::TaskState::default(),
+                pending_group_stop_generation: AtomicU64::new(0),
+                pending_group_stop_counted: AtomicBool::new(false),
                 memory_high_wait: SpinLock::new(None),
                 sem_undo: SpinLock::new(None),
                 preempt_count,
@@ -2442,9 +2450,7 @@ impl ProcessControlBlock {
         // Perform the migration without holding the task_cgroup lock; the caller
         // must hold cgroup_accounting_lock to guarantee that visible membership
         // and pids charging switch together.
-        let pid = self.raw_pid();
-        node.add_task(pid);
-        old.remove_task(pid);
+        crate::cgroup::freezer::migrate(self, &old, &node);
         CgroupNode::transfer_pids_charge(&old, &node, 1);
 
         // Use a write lock to update task_cgroup.

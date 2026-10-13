@@ -3,6 +3,7 @@ pub mod core;
 pub(crate) mod cpu;
 pub(crate) mod cpuset;
 mod file_permissions;
+pub(crate) mod freezer;
 pub(crate) mod memory;
 mod pids_account;
 pub(crate) mod threaded;
@@ -18,7 +19,7 @@ pub(crate) fn lock() -> MutexGuard<'static, ()> {
 }
 
 #[allow(unused_imports)]
-pub use controllers::{CgroupCpuState, CgroupFreezerState, CgroupMemoryState};
+pub use controllers::{CgroupCpuState, CgroupMemoryState};
 #[allow(unused_imports)]
 pub use core::{
     cgroup_accounting_lock, cgroup_can_fork_in, cgroup_common_ancestor, cgroup_migrate_vet_dst,

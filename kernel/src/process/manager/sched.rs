@@ -164,6 +164,7 @@ impl ProcessManager {
         // SIGCONT. wakeup_stop() will select and enqueue it normally later.
         if starts_stopped {
             debug_assert!(!pcb.sched_info().is_new_task());
+            crate::cgroup::freezer::stopped_off_cpu_locked(pcb);
             return Ok(());
         }
 
@@ -774,6 +775,7 @@ impl ProcessManager {
         }
 
         drop(rq_guard);
+        crate::cgroup::freezer::stopped_off_cpu_locked(pcb);
         drop(pi_guard);
         Ok(())
     }

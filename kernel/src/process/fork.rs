@@ -1291,7 +1291,7 @@ impl ProcessManager {
                         // Install it before publishing inherited stop/ptrace state.
                         let _accounting = cgroup_accounting_lock().lock();
                         let cgroup = pcb.task_cgroup_node();
-                        cgroup.add_task(pcb.raw_pid());
+                        crate::cgroup::freezer::publish(pcb, cgroup);
                         pcb.mark_visible_thread_accounted();
                         inc_visible_thread_count();
                         account_successful_fork();

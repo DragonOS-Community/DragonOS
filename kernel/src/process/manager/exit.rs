@@ -492,7 +492,7 @@ impl ProcessManager {
             // Hold cgroup_accounting_lock to avoid deadlock with cgroup.procs writes.
             {
                 let _cgroup_guard = crate::cgroup::cgroup_accounting_lock().lock();
-                pcb.task_cgroup_node().remove_task(raw_pid);
+                crate::cgroup::freezer::exit(&pcb);
             }
             if pcb.is_kthread() {
                 let exited_completion = {

@@ -107,7 +107,10 @@ pub fn do_clone(
     if flags.contains(CloneFlags::CLONE_VFORK) {
         // Wait for the child to exit or exec
         // Only a fatal signal can interrupt this wait
-        if vfork.wait_for_completion_killable().is_err() {
+        crate::cgroup::freezer::begin_safe_wait(&current_pcb);
+        let wait_result = vfork.wait_for_completion_killable();
+        crate::cgroup::freezer::end_safe_wait(&current_pcb);
+        if wait_result.is_err() {
             // Clear the child's vfork_done: the waiter has given up, so the child
             // must not complete() on a discarded completion during exec/exit.
             pcb.thread.write_irqsave().vfork_done = None;

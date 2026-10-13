@@ -464,14 +464,16 @@ fn sig_stop(sig: Signal) {
         drop(guard);
         return;
     }
-    // A normal non-ptraced process: go through transition_group_stop (atomically set
-    // STOP_STOPPED | CLD_STOPPED + stop_signal under the sighand lock) and report to real_parent.
-    let fresh_stop =
-        crate::process::ptrace::stop_mixed_ptrace_group(&pcb, sig).unwrap_or_else(|| {
-            pcb.process_signal()
-                .transition_group_stop(sig, || ProcessManager::mark_stop().is_ok())
-        });
+    // Ordinary members join the same generation/count transaction as ptraced
+    // members, and report to the real parent only once every participant stops.
+    let fresh_stop = crate::process::ptrace::stop_group_at_user_boundary(&pcb, sig);
     drop(guard);
+    // Completion is already committed. Notify before a subsequent ptrace
+    // attach can park this receiver waiting for its tracer to resume it.
+    if fresh_stop {
+        pcb.notify_natural_group_stop(sig);
+    }
+    pcb.handle_pending_group_stop();
     // attach may convert this task to ptraced during the schedule inside mark_stop()
     // and queue a trap. The STOPPED→TRACED transition must complete immediately before
     // returning to user mode; it cannot wait for the next kernel entry.
@@ -480,15 +482,6 @@ fn sig_stop(sig: Signal) {
         "sig_stop: pid={:?} entered Stopped; notifying parent and scheduler",
         pcb.raw_pid()
     );
-    // 向父进程报告 SIGCHLD 并唤醒父进程可能阻塞的 wait
-    if fresh_stop {
-        if let Some(parent) = pcb.parent_pcb() {
-            let _ = crate::ipc::kill::send_signal_to_pcb(parent.clone(), Signal::SIGCHLD);
-            parent.wake_all_waiters();
-        }
-        // 唤醒等待在该子进程等待队列上的等待者
-        pcb.wake_all_waiters();
-    }
     schedule(SchedMode::SM_NONE);
 }
 /// 信号默认处理函数——继续进程

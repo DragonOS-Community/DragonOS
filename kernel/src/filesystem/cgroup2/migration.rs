@@ -115,6 +115,7 @@ pub(super) fn write_locked(
     for task in &tasks {
         crate::cgroup::cpu::attach_locked(task);
         cpuset::attach_locked(task);
+        crate::cgroup::freezer::wake_for_request(task);
     }
     Ok(buf.len())
 }

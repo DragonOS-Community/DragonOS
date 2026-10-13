@@ -17,10 +17,10 @@ use crate::{
 use self::{inode::Cgroup2Inode, mount::Cgroup2Fs};
 
 pub(crate) mod event_notify;
+pub(crate) mod events;
 mod files;
 mod inode;
 mod memory;
-pub(crate) mod memory_events;
 mod migration;
 mod mount;
 mod permissions;
@@ -30,7 +30,7 @@ mod permissions;
 pub struct CgroupOpenState {
     pub(crate) cred: Arc<crate::process::cred::Cred>,
     pub(crate) namespace: Arc<crate::process::namespace::cgroup_namespace::CgroupNamespace>,
-    pub(crate) memory_events: Option<Arc<memory_events::MemoryEventOpen>>,
+    pub(crate) events: Option<Arc<events::CgroupEventOpen>>,
 }
 
 impl core::fmt::Debug for CgroupOpenState {

@@ -489,7 +489,12 @@ pub(super) fn read_file(
         }
         CgroupCoreFile::Events => {
             let populated = if is_populated(cgroup) { 1 } else { 0 };
-            format!("populated {}\nfrozen 0\n", populated).into_bytes()
+            format!(
+                "populated {}\nfrozen {}\n",
+                populated,
+                u8::from(cgroup.frozen())
+            )
+            .into_bytes()
         }
         CgroupCoreFile::Type => format!("{}\n", cgroup.type_name()).into_bytes(),
         CgroupCoreFile::Freeze => {
@@ -576,14 +581,16 @@ pub(super) fn write_controller_file_locked(
     match ty {
         CgroupCoreFile::Cpuset(_) | CgroupCoreFile::Type => unreachable!(),
         CgroupCoreFile::Freeze => {
-            let value = input
-                .trim()
-                .parse::<u32>()
-                .map_err(|_| SystemError::EINVAL)?;
-            if value > 1 {
+            let value = input.trim().parse::<i32>().map_err(|e| match e.kind() {
+                core::num::IntErrorKind::PosOverflow | core::num::IntErrorKind::NegOverflow => {
+                    SystemError::ERANGE
+                }
+                _ => SystemError::EINVAL,
+            })?;
+            if !(0..=1).contains(&value) {
                 return Err(SystemError::ERANGE);
             }
-            cgroup.set_freeze_requested(value == 1);
+            crate::cgroup::freezer::set_requested(cgroup, value == 1)?;
             Ok(format!("{}\n", value).into_bytes())
         }
         CgroupCoreFile::CpuWeight => {

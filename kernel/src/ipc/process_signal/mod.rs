@@ -5,6 +5,7 @@ mod job_control;
 mod pending;
 
 use core::fmt::Debug;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use alloc::sync::{Arc, Weak};
 
@@ -71,6 +72,9 @@ pub struct ProcessSignalState {
 /// does not create another entity or retain its storage after last strong drop.
 struct ProcessSignalStateData {
     inner: RwLock<InnerProcessSignalState>,
+    /// Monotonic observation of established GROUP_EXIT. Scheduler readers
+    /// cannot nest the authoritative inner lock underneath rq.
+    group_exit_started: AtomicBool,
     group_exec_wait_queue: WaitQueue,
     /// Child state changes belong to the thread group, not its current leader.
     /// Unlike the per-task trapping queue, this survives a leader's exit.
@@ -99,9 +103,8 @@ pub struct InnerProcessSignalState {
     /// for the initial state; begin/cancel transitions advance it so delayed
     /// ptrace participants cannot complete a later stop.
     group_stop_generation: u64,
-    /// Ptrace participants which still have to publish their group-stop. The
-    /// existing asynchronous `stop_task()` commits untraced siblings
-    /// immediately, so only ptraced siblings need a completion count.
+    /// Generation-bound participants which have yet to reach their own safe
+    /// stop boundary, including both ordinary and ptraced group members.
     group_stop_pending_ptraced: usize,
     /// 线程组 exec（de-thread）当前执行者
     pub group_exec_task: Option<Weak<ProcessControlBlock>>,
@@ -134,6 +137,7 @@ impl ProcessSignalState {
         let inner = InnerProcessSignalState::try_default()?;
         let body = storage.init(ProcessSignalStateData {
             inner: RwLock::new(inner),
+            group_exit_started: AtomicBool::new(false),
             group_exec_wait_queue: WaitQueue::default(),
             child_wait_queue: WaitQueue::default(),
             pending: SpinLock::new(SigPending::default()),
@@ -145,6 +149,10 @@ impl ProcessSignalState {
 
     pub(crate) fn cpu_time_adjustment(&self) -> &SpinLock<crate::sched::cputime::AdjustedCpuTime> {
         &self.body.cpu_time_adjustment
+    }
+
+    pub(crate) fn group_exiting(&self) -> bool {
+        self.body.group_exit_started.load(Ordering::Acquire)
     }
 
     fn inner(&self) -> RwLockReadGuard<'_, InnerProcessSignalState> {

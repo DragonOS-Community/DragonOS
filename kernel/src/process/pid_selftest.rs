@@ -142,5 +142,6 @@ pub(crate) fn selftest_membership_lifetime() -> Result<bool, SystemError> {
     drop(unpublished);
     let rollback = retired(&ns, &pid);
     free_pid(pid);
-    Ok(member_first && leader_first && rollback)
+    let namespace_rollback = PidNamespace::selftest_discard_unpublished()?;
+    Ok(member_first && leader_first && rollback && namespace_rollback)
 }

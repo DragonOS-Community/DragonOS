@@ -63,7 +63,6 @@ pub use manager::{
     SwitchResult, PROCESS_SWITCH_RESULT,
 };
 use manager::{PTRACE_RELATION_LOCK, __PROCESS_MANAGEMENT_INIT_DONE};
-use pid::alloc_pid;
 pub(crate) use process_group::Pgid;
 #[allow(unused_imports)]
 pub(crate) use sched_info::NewTaskPlacement;

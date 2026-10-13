@@ -93,6 +93,9 @@ fn do_start_kernel() {
     setup_arch().expect("setup_arch failed");
 
     CurrentSMPArch::prepare_cpus().expect("prepare_cpus failed");
+    // Bootstrap uses safe static PID limits; finalize CPU-scaled policy only
+    // after the possible CPU set is known, before userspace can write sysctl.
+    crate::process::pid::init_pid_limits();
 
     // sched_init();
     // 初始化中断下半部（softirq、bottom_half、tasklet）

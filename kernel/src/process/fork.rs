@@ -1,5 +1,5 @@
 use super::{
-    account_successful_fork, alloc_pid, inc_visible_thread_count,
+    account_successful_fork, inc_visible_thread_count,
     kthread::{KernelThreadFlags, KernelThreadPcbPrivate, WorkerPrivate},
     lock_fs_refs_copy,
     pid::{Pid, PidType},
@@ -180,7 +180,7 @@ pub struct KernelCloneArgs {
     pub pidfd: VirtAddr,
     pub child_tid: VirtAddr,
     pub parent_tid: VirtAddr,
-    pub set_tid: Vec<usize>,
+    pub set_tid: Vec<i32>,
 
     /// 进程退出时发送给父进程的信号。
     ///
@@ -417,6 +417,14 @@ impl ProcessManager {
                     assert!(!pcb.visible_thread_accounted.load(Ordering::Acquire));
                     pcb.detach_pid(PidType::PID);
                     pcb.flags().insert(ProcessFlags::PID_UNHASHED);
+                    if args.flags.contains(CloneFlags::CLONE_NEWPID) {
+                        let child_ns = pcb.nsproxy().pid_ns_for_children.clone();
+                        // copy_namespaces may fail before installing its
+                        // candidate. Never cancel the inherited namespace.
+                        if !Arc::ptr_eq(&child_ns, &current_pcb.nsproxy().pid_ns_for_children) {
+                            child_ns.discard_unpublished();
+                        }
+                    }
                     drop(pcb);
                     match error {
                         ForkAttemptError::Allocation(error) => error.recover(&mut recovery)?,
@@ -903,7 +911,7 @@ impl ProcessManager {
                 // 分层PID分配：在父进程的子PID namespace中为新任务分配PID
                 let ns = pcb.nsproxy().pid_namespace_for_children().clone();
 
-                let main_pid_arc = alloc_pid(&ns)?;
+                let main_pid_arc = super::pid::alloc_pid_with_tids(&ns, &clone_args.set_tid)?;
 
                 // 根namespace中的PID号作为RawPid
                 let root_pid_nr = main_pid_arc

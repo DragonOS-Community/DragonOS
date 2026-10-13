@@ -43,6 +43,11 @@ pub(crate) struct AllocatedBox<T> {
 }
 
 impl<T> OwnedBox<T> {
+    /// The receipt stays attached to this storage through its final drop.
+    pub(crate) fn object_account(&self) -> Option<&Arc<ObjectAccount>> {
+        self.charge.as_ref().map(ObjectCharge::owner)
+    }
+
     /// Borrow the entity address for an unpublished constructor's raw field
     /// initialization. Ownership and the charge receipt stay in this Box.
     ///

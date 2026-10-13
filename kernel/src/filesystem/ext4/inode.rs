@@ -1686,7 +1686,7 @@ impl PageCacheBackend for Ext4PageCacheBackend {
             }
         };
         *work_state.lock() = Some(state);
-        schedule_work(work);
+        crate::filesystem::page_cache::schedule_read_completion(work);
     }
 
     fn read_page(&self, index: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
@@ -2968,6 +2968,11 @@ impl IndexNode for LockedExt4Inode {
         datasync: bool,
         _data: PrivateData,
     ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        // This regular-file operation does not use OFD private state. A loop
+        // flush may wait for backing writeback queued behind a worker that
+        // needs to read through this same OFD: retaining its lock would make
+        // that worker and the flush wait for each other.
+        drop(_data);
         let _operation = self.begin_operation()?;
         let fs = self.inner.lock().concret_fs();
         let _journal_sync = fs.begin_journal_sync();

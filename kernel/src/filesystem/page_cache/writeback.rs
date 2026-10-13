@@ -1962,6 +1962,17 @@ impl PageCacheManager {
     pub(super) fn submit_writeback_batch(
         mut batch: ClaimedWritebackBatch,
     ) -> Result<WritebackSubmitOutcome, SystemError> {
+        // A worker's actual cgroup is not the producer of these dirty pages.
+        // Keep the first page/entry's existing receipts as the allocation
+        // source for stacked lower I/O, matching Linux's first-bio choice.
+        // Mixed-owner batches do not migrate already charged upper pages.
+        let source = batch.entries.first().and_then(|(_, entry, page)| {
+            Some(crate::cgroup::memory::io::MemoryIoSource::from_owners(
+                page.memory_account()?,
+                entry.storage.object_account()?,
+            ))
+        });
+        let _source_scope = source.as_ref().map(|source| source.enter());
         let submission = batch.submission.take();
         let submission_cache = batch.cache.clone();
         let submission_epoch = batch.retry_writeback_tag;

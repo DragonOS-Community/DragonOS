@@ -41,6 +41,13 @@ pub(crate) struct ObjectCharge {
     bytes: u64,
 }
 
+impl ObjectCharge {
+    /// Borrow the stable owner without creating a separate objcg budget.
+    pub(crate) fn owner(&self) -> &Arc<ObjectAccount> {
+        &self.owner
+    }
+}
+
 struct ObjectLink {
     owner: Weak<ObjectAccount>,
     next: Option<Box<Self>>,

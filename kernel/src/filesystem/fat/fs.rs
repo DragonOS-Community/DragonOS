@@ -45,6 +45,7 @@ use crate::filesystem::vfs::utils::DName;
 use crate::filesystem::vfs::{Magic, SpecialNodeData, SuperBlock};
 use crate::ipc::pipe::LockedPipeInode;
 use crate::libs::rwsem::RwSem;
+use crate::mm::allocation::MemoryAllocationError;
 use crate::mm::fault::{PageFaultHandler, PageFaultMessage};
 use crate::mm::VmFaultReason;
 use crate::{
@@ -2354,26 +2355,42 @@ impl FATFsInfo {
 }
 
 impl LockedFATInode {
-    fn try_read_pagecache(&self, offset: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
+    fn try_read_pagecache(
+        &self,
+        offset: usize,
+        buf: &mut [u8],
+    ) -> Result<usize, MemoryAllocationError> {
         let page_cache = self.0.lock().page_cache.clone();
         if let Some(page_cache) = page_cache {
-            return PageCache::read(&page_cache, offset, buf);
+            let task = crate::process::ProcessManager::current_pcb();
+            let owner = crate::cgroup::memory::account_for_task(&task);
+            let creator = crate::cgroup::memory::object_for_task(&task);
+            // Preserve admission scope for the lock-free File/NOIO retry
+            // boundary; the legacy cache wrapper would erase Charge here.
+            return page_cache.try_read(offset, buf, &owner, &creator);
         } else {
-            return self.read_sync(offset, buf);
+            return self.read_sync(offset, buf).map_err(Into::into);
         }
     }
 
-    fn try_write_pagecache(&self, offset: usize, buf: &[u8]) -> Result<usize, SystemError> {
+    fn try_write_pagecache(
+        &self,
+        offset: usize,
+        buf: &[u8],
+    ) -> Result<usize, MemoryAllocationError> {
         let _size_guard = self.1.read();
         let page_cache = self.0.lock().page_cache.clone();
         if let Some(page_cache) = page_cache {
-            let write_len = PageCache::write(&page_cache, offset, buf)?;
+            let task = crate::process::ProcessManager::current_pcb();
+            let owner = crate::cgroup::memory::account_for_task(&task);
+            let creator = crate::cgroup::memory::object_for_task(&task);
+            let write_len = page_cache.try_write(offset, buf, &owner, &creator)?;
             let mut guard = self.0.lock();
             let old_size = guard.metadata.size;
             guard.update_metadata(Some(core::cmp::max(old_size, (offset + write_len) as i64)));
             return Ok(write_len);
         } else {
-            return self.write_sync(offset, buf);
+            return self.write_sync(offset, buf).map_err(Into::into);
         }
     }
 }
@@ -2498,12 +2515,8 @@ impl IndexNode for LockedFATInode {
         buf: &mut [u8],
         _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
-        let result: core::result::Result<_, system_error::SystemError> = {
-            let len = core::cmp::min(len, buf.len());
-            let buf = &mut buf[0..len];
-            self.try_read_pagecache(offset, buf)
-        };
-        result.map_err(Into::into)
+        let len = core::cmp::min(len, buf.len());
+        self.try_read_pagecache(offset, &mut buf[0..len])
     }
 
     fn write_at(
@@ -2513,12 +2526,8 @@ impl IndexNode for LockedFATInode {
         buf: &[u8],
         _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
-        let result: core::result::Result<_, system_error::SystemError> = {
-            let len = core::cmp::min(len, buf.len());
-            let buf = &buf[0..len];
-            self.try_write_pagecache(offset, buf)
-        };
-        result.map_err(Into::into)
+        let len = core::cmp::min(len, buf.len());
+        self.try_write_pagecache(offset, &buf[0..len])
     }
 
     fn read_direct(

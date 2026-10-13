@@ -983,6 +983,10 @@ pub fn page_reclaimer_lock() -> MutexGuard<'static, PageReclaimer> {
     unsafe { PAGE_RECLAIMER.as_ref().unwrap().lock() }
 }
 
+fn try_page_reclaimer_lock() -> Option<MutexGuard<'static, PageReclaimer>> {
+    unsafe { PAGE_RECLAIMER.as_ref()?.try_lock().ok() }
+}
+
 /// 页面回收器
 pub struct PageReclaimer {
     lru: PageLru,
@@ -1043,7 +1047,7 @@ impl PageReclaimer {
         // Both production callers run after task/cgroup initialization and
         // outside MM/resource locks. Snapshot failure must not disable min.
         let root = crate::cgroup::cgroup_root_node().memory_account();
-        Self::shrink_protected(&root, count, true).unwrap_or_default()
+        Self::shrink_protected(&root, count, true, false).unwrap_or_default()
     }
 
     /// Protection/topology preparation happens before taking any resource
@@ -1052,22 +1056,34 @@ impl PageReclaimer {
         account: &Arc<MemoryAccount>,
         count: PageFrameCount,
     ) -> Result<ReclaimProgress, SystemError> {
-        Self::shrink_protected(account, count, false)
+        Self::shrink_protected(account, count, false, false)
+    }
+
+    /// A stacked I/O caller may retain filesystem/cache/MM locks. Only try
+    /// retirement of already clean, unmapped pages; never unmap or write back.
+    pub(crate) fn shrink_account_noio(
+        account: &Arc<MemoryAccount>,
+        count: PageFrameCount,
+    ) -> Result<ReclaimProgress, SystemError> {
+        Self::shrink_protected(account, count, false, true)
     }
 
     fn shrink_protected(
         account: &Arc<MemoryAccount>,
         count: PageFrameCount,
         allow_unowned: bool,
+        noio: bool,
     ) -> Result<ReclaimProgress, SystemError> {
         let mut protection = ProtectionSnapshot::new(account)?;
-        let mut progress = Self::shrink_pass(count.data(), &mut protection, false, allow_unowned);
+        let mut progress =
+            Self::shrink_pass(count.data(), &mut protection, false, allow_unowned, noio);
         if progress.reclaimed < count.data() && protection.low_skipped() {
             progress.accumulate(Self::shrink_pass(
                 count.data() - progress.reclaimed,
                 &mut protection,
                 true,
                 allow_unowned,
+                noio,
             ));
         }
         Ok(progress)
@@ -1095,13 +1111,21 @@ impl PageReclaimer {
         protection: &mut ProtectionSnapshot,
         low_reclaim: bool,
         allow_unowned: bool,
+        noio: bool,
     ) -> ReclaimProgress {
         let mut progress = ReclaimProgress::default();
         for priority in (0..=12).rev() {
             if progress.reclaimed >= goal {
                 break;
             }
-            let lru_len = page_reclaimer_lock().lru.len();
+            let lru_len = if noio {
+                let Some(reclaimer) = try_page_reclaimer_lock() else {
+                    break;
+                };
+                reclaimer.lru.len()
+            } else {
+                page_reclaimer_lock().lru.len()
+            };
             protection.prepare_scan(
                 priority,
                 low_reclaim,
@@ -1116,6 +1140,7 @@ impl PageReclaimer {
                 goal - progress.reclaimed,
                 protection,
                 low_reclaim,
+                noio,
             ));
             crate::sched::cond_resched();
         }
@@ -1126,18 +1151,40 @@ impl PageReclaimer {
         goal: usize,
         protection: &mut ProtectionSnapshot,
         low_reclaim: bool,
+        noio: bool,
     ) -> ReclaimProgress {
         let mut progress = ReclaimProgress::default();
-        let mut remaining = page_reclaimer_lock().lru.len();
+        let mut remaining = if noio {
+            let Some(reclaimer) = try_page_reclaimer_lock() else {
+                return progress;
+            };
+            // Bound this pass by its initial inventory. A fixed prefix of
+            // the global LRU can contain only unrelated accounts and would
+            // falsely exhaust a memcg with reclaimable pages near the MRU.
+            reclaimer.lru.len()
+        } else {
+            page_reclaimer_lock().lru.len()
+        };
         while remaining != 0 && progress.reclaimed < goal {
-            let slots = page_reclaimer_lock().reclaim_snapshot(remaining);
+            let slots = if noio {
+                let Some(mut reclaimer) = try_page_reclaimer_lock() else {
+                    break;
+                };
+                reclaimer.reclaim_snapshot(remaining)
+            } else {
+                page_reclaimer_lock().reclaim_snapshot(remaining)
+            };
             let mut visited = 0;
             for page in slots.into_iter().flatten() {
                 visited += 1;
                 // Unprocessed slots only release their snapshot Arc; the
                 // original LRU nodes never left the list.
                 if progress.reclaimed < goal {
-                    progress.accumulate(Self::evict_page(page, protection, low_reclaim));
+                    progress.accumulate(if noio {
+                        Self::evict_page_noio(page, protection, low_reclaim)
+                    } else {
+                        Self::evict_page(page, protection, low_reclaim)
+                    });
                 }
             }
             if visited == 0 {
@@ -1148,6 +1195,90 @@ impl PageReclaimer {
             crate::sched::cond_resched();
             if !protection.has_scan_budget() {
                 break;
+            }
+        }
+        progress
+    }
+
+    fn evict_page_noio(
+        page: Arc<Page>,
+        protection: &mut ProtectionSnapshot,
+        low_reclaim: bool,
+    ) -> ReclaimProgress {
+        let mut progress = ReclaimProgress::default();
+        // Declare pins before the page guard so every rejection unlocks the
+        // page before possibly destroying its cache/filesystem owner.
+        let cache;
+        let mut guard = match page.try_write() {
+            Some(guard) => guard,
+            None => return progress,
+        };
+        let PageType::File(info) = guard.page_type() else {
+            return progress;
+        };
+        if page.contiguous_owner.is_some()
+            || !guard.individually_owns_frame
+            || guard.map_count() != 0
+            || guard.flags().intersects(
+                PageFlags::PG_DIRTY | PageFlags::PG_WRITEBACK | PageFlags::PG_UNEVICTABLE,
+            )
+        {
+            return progress;
+        }
+        let index = info.index;
+        let account = page.memory_account().cloned();
+        cache = info.page_cache.upgrade();
+        if cache.as_ref().is_some_and(|cache| {
+            cache.mapping_unevictable() || !cache.manager().supports_clean_reclaim()
+        }) || !protection.take_scan(account.as_ref(), low_reclaim)
+        {
+            return progress;
+        }
+        progress.scanned = 1;
+        if let Some(account) = &account {
+            account.adjust_stat(MemoryStat::PgScan, 1, true);
+            if !protection.permits(account, low_reclaim) {
+                return progress;
+            }
+        }
+        // Obtain all registry guards before changing membership. Failure must
+        // leave the page on its original cache/LRU/manager, not half-retired.
+        let Some(mut reclaimer) = try_page_reclaimer_lock() else {
+            return progress;
+        };
+        let Some(mut manager) = try_page_manager_lock() else {
+            return progress;
+        };
+        let retired_entry = if let Some(cache) = &cache {
+            let Some(entry) = cache
+                .manager()
+                .try_remove_clean_page_for_reclaim(index, &page, &guard)
+            else {
+                return progress;
+            };
+            Some(entry)
+        } else {
+            None
+        };
+        let lru_owner = reclaimer.remove_page_if_same(&page);
+        let manager_owner = manager.remove_page_if_same(&page);
+        // Unlike finish_lru_retirement, this cannot reacquire a blocking page
+        // write lock: the exclusive guard has covered the entire commit.
+        guard.remove_flags(PageFlags::PG_LRU);
+        drop(manager);
+        drop(reclaimer);
+        drop(guard);
+        drop(retired_entry);
+        drop(lru_owner);
+        drop(manager_owner);
+        drop(cache);
+        progress.detached = 1;
+        if let Ok(owned) = Arc::try_unwrap(page) {
+            // Report only actual frame return, not merely detached ownership.
+            drop(owned);
+            progress.reclaimed = 1;
+            if let Some(account) = account {
+                account.adjust_stat(MemoryStat::PgSteal, 1, true);
             }
         }
         progress

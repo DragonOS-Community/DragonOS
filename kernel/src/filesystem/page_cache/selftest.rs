@@ -2800,6 +2800,181 @@ fn run_memcg_reclaim_scan_budget_selftest() -> Result<bool, SystemError> {
     Ok(ok)
 }
 
+/// Exercise the actual NOIO scanner/retirement path. Self-held resource locks
+/// are intentional: a blocking fallback would deadlock the proc selftest.
+fn run_memcg_noio_reclaim_selftest() -> Result<bool, SystemError> {
+    use crate::cgroup::memory::accounting::{ChargeFailure, ChargeFailureReason};
+    use crate::cgroup::memory::{MemoryAccount, MemoryEvent, MemoryPolicy};
+    use crate::mm::allocation::MemoryAllocationError;
+    use crate::mm::{
+        allocator::page_frame::PageFrameCount,
+        page::{EntryFlags, PageReclaimer},
+        ucontext::{LockedVMA, VMA},
+        VirtAddr, VirtRegion, VmFlags,
+    };
+    let root = MemoryAccount::new(0, None)?;
+    // The hard counter cap must terminate before task-local policy lookup.
+    // Keep the same outer allocation-error entry used by stacked I/O callers.
+    let overflow = MemoryAllocationError::Charge(ChargeFailure {
+        account: root.clone(),
+        reason: ChargeFailureReason::CounterOverflow,
+        request_kind: crate::cgroup::memory::MemoryKind::File,
+        requested_pages: 1,
+    });
+    if overflow.recover(&mut Default::default()) != Err(SystemError::ENOMEM) {
+        return Ok(false);
+    }
+    let a = MemoryAccount::new(0, Some(root.clone()))?;
+    let b = MemoryAccount::new(0, Some(root.clone()))?;
+    let mut fixture = MemcgReclaimFixture::new();
+    let mut sibling = MemcgReclaimFixture::new();
+    let mut ok = true;
+    let reclaim = || PageReclaimer::shrink_account_noio(&a, PageFrameCount::ONE);
+    macro_rules! fail_stage {
+        ($stage:expr) => {
+            if !ok {
+                log::error!(
+                    "NOIO selftest failed: stage={} a={} b={} root={}",
+                    $stage,
+                    a.current_pages(),
+                    b.current_pages(),
+                    root.current_pages()
+                );
+                return Ok(false);
+            }
+        };
+    }
+
+    let index = fixture.install(&a)?;
+    let page = fixture
+        .cache
+        .manager()
+        .peek_page(index)
+        .ok_or(SystemError::EIO)?;
+    {
+        let _page_guard = page.write();
+        let progress = reclaim()?;
+        ok &= progress.reclaimed == 0 && progress.detached == 0;
+    }
+    {
+        let _cache_guard = fixture.cache.inner.lock();
+        let progress = reclaim()?;
+        ok &= progress.reclaimed == 0 && progress.detached == 0;
+    }
+    ok &= fixture.linked(index) && a.current_pages() == 1;
+    fail_stage!("busy_locks");
+    let pin = fixture
+        .cache
+        .manager()
+        .peek_page_pinned(index)
+        .ok_or(SystemError::EIO)?;
+    ok &= reclaim()?.detached == 0 && fixture.linked(index);
+    drop(pin);
+    fail_stage!("active_pin");
+
+    // Install/remove the real page rmap source without touching any user MM:
+    // NOIO must reject mapped content before trying a reverse-map walker.
+    let creator =
+        crate::cgroup::memory::object_for_task(&crate::process::ProcessManager::current_pcb());
+    let vma = LockedVMA::try_new(
+        VMA::new(
+            VirtRegion::new(VirtAddr::new(MMArch::PAGE_SIZE), MMArch::PAGE_SIZE),
+            VmFlags::VM_NONE,
+            EntryFlags::new(),
+            None,
+            None,
+            false,
+        ),
+        &creator,
+    )
+    .map_err(PageCache::legacy_allocation_error)?;
+    page.write().insert_vma(vma.clone(), false);
+    ok &= reclaim()?.detached == 0 && fixture.linked(index) && page.read().map_count() == 1;
+    page.write().remove_vma(&vma);
+    drop(vma);
+    fail_stage!("mapped_rmap");
+    for flag in [
+        PageFlags::PG_DIRTY,
+        PageFlags::PG_WRITEBACK,
+        PageFlags::PG_UNEVICTABLE,
+    ] {
+        page.write().add_flags(flag);
+        let progress = reclaim()?;
+        ok &= progress.detached == 0 && progress.writeback_scheduled == 0 && fixture.linked(index);
+        page.write().remove_flags(flag);
+        fail_stage!("page_flags");
+    }
+    drop(page);
+    let progress = reclaim()?;
+    ok &= progress.reclaimed == 1
+        && progress.detached == 1
+        && progress.writeback_scheduled == 0
+        && a.current_pages() == 0
+        && fixture.identities[index].upgrade().is_none()
+        && !fixture.linked(index);
+    if !ok {
+        log::error!(
+            "NOIO selftest failed: stage=clean_retire progress={progress:?} a={}",
+            a.current_pages()
+        );
+        return Ok(false);
+    }
+
+    for state in [
+        PageState::Loading,
+        PageState::Dirty,
+        PageState::Writeback,
+        PageState::Error,
+    ] {
+        let mut rejected = MemcgReclaimFixture::new();
+        rejected.install_with_state(&a, state)?;
+        let progress = reclaim()?;
+        ok &= progress.detached == 0
+            && progress.reclaimed == 0
+            && progress.writeback_scheduled == 0
+            && a.current_pages() == 1;
+        drop(rejected);
+        ok &= a.current_pages() == 0;
+        fail_stage!("entry_state");
+    }
+
+    let index = fixture.install(&a)?;
+    let sibling_index = sibling.install(&b)?;
+    a.set_policy(MemoryPolicy {
+        min: 1,
+        ..Default::default()
+    });
+    b.set_policy(MemoryPolicy {
+        min: 1,
+        ..Default::default()
+    });
+    let progress = PageReclaimer::shrink_account_noio(&root, PageFrameCount::ONE)?;
+    ok &= progress.reclaimed == 0
+        && root.current_pages() == 2
+        && fixture.linked(index)
+        && sibling.linked(sibling_index);
+    fail_stage!("min_protection");
+    a.set_policy(MemoryPolicy {
+        low: 1,
+        ..Default::default()
+    });
+    let low_before = a.snapshot().events_local[MemoryEvent::Low as usize];
+    let progress = PageReclaimer::shrink_account_noio(&root, PageFrameCount::ONE)?;
+    ok &= progress.reclaimed == 1
+        && a.current_pages() == 0
+        && b.current_pages() == 1
+        && !fixture.linked(index)
+        && sibling.linked(sibling_index)
+        && a.snapshot().events_local[MemoryEvent::Low as usize] == low_before + 1;
+    if !ok {
+        log::error!("NOIO selftest failed: stage=low_reclaim progress={progress:?} a={} b={} low_before={} low_after={}", a.current_pages(), b.current_pages(), low_before, a.snapshot().events_local[MemoryEvent::Low as usize]);
+        return Ok(false);
+    }
+    drop(fixture);
+    drop(sibling);
+    Ok(ok && root.current_pages() == 0)
+}
+
 fn run_memcg_reclaim_selftest() -> Result<bool, SystemError> {
     use crate::cgroup::memory::{MemoryAccount, MemoryEvent, MemoryPolicy, MemoryStat};
     use crate::mm::{allocator::page_frame::PageFrameCount, page::PageReclaimer};
@@ -3078,6 +3253,10 @@ pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, S
 
     if !run_memcg_reclaim_scan_budget_selftest()? {
         return Ok("status=fail stage=memcg_reclaim_scan_budget\n".into());
+    }
+
+    if !run_memcg_noio_reclaim_selftest()? {
+        return Ok("status=fail stage=memcg_noio_reclaim\n".into());
     }
 
     if !run_page_fault_cache_snapshot_selftest()? {
@@ -5029,7 +5208,7 @@ pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, S
         ));
     }
 
-    Ok(fdtable_layout_report + &alloc::format!(
+    Ok(fdtable_layout_report + "memcg_noio_reclaim=ok\n" + &alloc::format!(
         "status=ok\nmemcg_as_body_lifetime=ok\nmemcg_vma_body_lifetime=ok\nmemcg_file_body_lifetime=ok\nfault_cache_snapshot=ok\nmemcg_page_state=ok\nmemcg_reclaim=ok\nmemcg_reclaim_scan_budget=ok\nregistry_churn=ok\nregistry_batch_retire=ok\nregistry_snapshot_lifetime=ok\nregistry_concurrent_snapshot=ok\nramfs_fallocate_range=ok\nwrite_prepare_rollback=ok\npreallocate_rollback=ok\nclean_unlink_liveness=ok\nwriteback_domain_lifecycle=ok\ndetached_read_batch_completion=ok\npreallocated_batch_lifecycle=ok\nfile_membership=ok\nshmem_membership=ok\ndirty_membership=ok\ndirty_incarnation=ok\nremote_dirty_publish=ok\nwriteback_membership=ok\nwriteback_admission_order=ok\nwriteback_submission_token=ok\nwriteback_defer_progress=ok\nwriteback_budget_retry=ok\nsubmitted_writeback=ok\nfault_invalidate_retry_order=ok\ntag_scan_chunk_release=ok\nunevictable_membership=ok\ninflight_teardown=ok\nlate_completion=ok\nglobal_wiring=ok\nlayout=ok\nfile_drop_drift={file_drop_drift}\nshmem_drop_drift={shmem_drop_drift}\ndirty_drop_drift={dirty_drop_drift}\nwriteback_drop_drift={writeback_drop_drift}\nunevictable_drop_drift={unevictable_drop_drift}\nentry_size={entry_size}\nbaseline_size={baseline_size}\n"
     ))
 }

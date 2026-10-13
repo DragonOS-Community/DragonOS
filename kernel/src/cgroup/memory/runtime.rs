@@ -29,6 +29,9 @@ pub(crate) enum MemoryAllocPolicy {
     TryOnly,
     ReclaimThenFail,
     ReclaimThenOom,
+    /// A stacked I/O caller may retain FS/MM resources. Never start I/O,
+    /// unmap a user MM, or wait for an OOM victim from this recovery path.
+    ReclaimNoIo,
 }
 
 /// Enforce a policy already committed by a memory.max writer. The caller has
@@ -133,6 +136,7 @@ pub(crate) struct ChargeRecoveryState {
     rechecks: u8,
     offline_retries: u8,
     max_event_recorded: bool,
+    noio_retries: u8,
 }
 
 impl ChargeRecoveryState {
@@ -144,6 +148,7 @@ impl ChargeRecoveryState {
             rechecks: MAX_RECLAIM_RETRIES,
             offline_retries: MAX_RECLAIM_RETRIES,
             max_event_recorded: false,
+            noio_retries: MAX_RECLAIM_RETRIES,
         }
     }
 }
@@ -187,6 +192,15 @@ pub(crate) fn recover_charge(
     if policy == MemoryAllocPolicy::TryOnly {
         return Ok(RecoveryDecision::Exhausted);
     }
+    // Count every NOIO retry, including a concurrently restored margin or
+    // offline routing. Those branches must not retain the upper I/O pin and
+    // its resource ancestry indefinitely without ever entering shrink.
+    if policy == MemoryAllocPolicy::ReclaimNoIo {
+        if state.noio_retries == 0 {
+            return Ok(RecoveryDecision::Exhausted);
+        }
+        state.noio_retries -= 1;
+    }
     if failure.reason == ChargeFailureReason::Offline || !failure.account.is_online() {
         if state.offline_retries == 0 {
             return Ok(RecoveryDecision::Exhausted);
@@ -200,7 +214,7 @@ pub(crate) fn recover_charge(
         .as_ref()
         .is_some_and(|scope| scope.ptr_eq(&Arc::downgrade(account)));
     let usage = account.current_pages();
-    if same_scope && usage < state.last_usage {
+    if same_scope && usage < state.last_usage && policy != MemoryAllocPolicy::ReclaimNoIo {
         // Actual usage decreased, not merely a reservation-cancellation epoch.
         state.remaining = MAX_RECLAIM_RETRIES;
         state.rechecks = MAX_RECLAIM_RETRIES;
@@ -224,12 +238,18 @@ pub(crate) fn recover_charge(
         }
         state.remaining -= 1;
         let count = usize::try_from(failure.requested_pages).map_err(|_| SystemError::ENOMEM)?;
-        let reclaimed = PageReclaimer::shrink_account(account, PageFrameCount::new(count))?;
+        let reclaimed = if policy == MemoryAllocPolicy::ReclaimNoIo {
+            PageReclaimer::shrink_account_noio(account, PageFrameCount::new(count))?
+        } else {
+            PageReclaimer::shrink_account(account, PageFrameCount::new(count))?
+        };
         if has_margin(failure) {
             return Ok(RecoveryDecision::RetryOperation);
         }
         if reclaimed.reclaimed != 0 {
-            state.remaining = MAX_RECLAIM_RETRIES;
+            if policy != MemoryAllocPolicy::ReclaimNoIo {
+                state.remaining = MAX_RECLAIM_RETRIES;
+            }
             state.last_usage = account.current_pages();
             return Ok(RecoveryDecision::RetryOperation);
         }

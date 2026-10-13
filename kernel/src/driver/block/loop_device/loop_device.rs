@@ -1381,7 +1381,9 @@ impl LoopDevice {
         let _io_guard = IoGuard::new(self)?;
         let (backing_file, base_offset, limit_end) = self.io_snapshot(false)?;
         let file_offset = Self::translate_io_range(base_offset, limit_end, offset, len)?;
-        let read = backing_file.try_pread(file_offset, len, &mut buf[..len])?;
+        let _noio = crate::cgroup::memory::io::MemoryIoScope::enter_noio();
+        let read =
+            Self::recover_backing_io(|| backing_file.try_pread(file_offset, len, &mut buf[..len]))?;
         if read < len {
             // Linux loop zero-fills a short backing read inside the advertised
             // device capacity rather than exposing stale destination bytes.
@@ -1414,13 +1416,30 @@ impl LoopDevice {
         let _io_guard = IoGuard::new(self)?;
         let (backing_file, base_offset, limit_end) = self.io_snapshot(true)?;
         let file_offset = Self::translate_io_range(base_offset, limit_end, offset, len)?;
+        let _noio = crate::cgroup::memory::io::MemoryIoScope::enter_noio();
         // Delegate the operation-level intent to the retained File itself.
         // This merges it with backing O_SYNC/S_SYNC/SB_SYNCHRONOUS exactly
         // once and preserves positive write progress if the following sync
         // fails. Calling plain pwrite() here would collapse that failure into
         // Err and make the outer loop file lose the completed byte count.
-        let mut result =
-            backing_file.pwrite_with_sync_intent(file_offset, len, &buf[..len], sync_intent)?;
+        let mut result = Self::recover_backing_io(|| {
+            backing_file.pwrite_with_sync_intent(file_offset, len, &buf[..len], sync_intent)
+        })?;
+        let mut recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::default();
+        while let Err(error) = core::mem::replace(&mut result.sync_result, Ok(())) {
+            // Payload has already committed: retry only the retained exact
+            // durability range, never replay the completed write.
+            if let Err(error) = error.recover(&mut recovery) {
+                result.sync_result = Err(error.into());
+                break;
+            }
+            let Some((start, end, datasync)) = result.sync_range else {
+                result.sync_result = Err(SystemError::EIO.into());
+                break;
+            };
+            result.sync_result =
+                backing_file.try_sync_range_and_check_wb_error(start, end, datasync);
+        }
         result.sync_result = Self::normalize_backing_sync_result(result.sync_result);
         Ok(result)
     }
@@ -1432,12 +1451,29 @@ impl LoopDevice {
             .backing_file
             .clone()
             .ok_or(SystemError::ENODEV)?;
-        Self::sync_backing_file(&backing_file, 0, usize::MAX, false)
+        let _noio = crate::cgroup::memory::io::MemoryIoScope::enter_noio();
+        Self::recover_backing_io(|| Self::sync_backing_file(&backing_file, 0, usize::MAX, false))
+    }
+
+    /// Keep admission retries inside the active I/O pin and NOIO scope.
+    /// Failed attempts have abandoned their unpublished backing state before
+    /// recovery; the inherited upper FS/MM locks must never enter ordinary
+    /// writeback, MM unmapping or OOM-victim waiting.
+    fn recover_backing_io<T>(
+        mut attempt: impl FnMut() -> Result<T, MemoryAllocationError>,
+    ) -> Result<T, MemoryAllocationError> {
+        let mut recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::default();
+        loop {
+            match attempt() {
+                Ok(value) => return Ok(value),
+                Err(error) => error.recover(&mut recovery)?,
+            }
+        }
     }
 
     /// The legacy synchronous BlockDevice ABI cannot carry a charge scope to
-    /// its FS caller. Fail this request without reclaiming under that caller's
-    /// locks. Full request-context/NOIO recovery is tracked separately (DKC-082).
+    /// its FS caller. Backing admission has already exhausted bounded NOIO
+    /// recovery; do not repeat ordinary reclaim under the caller's locks.
     /// Typed OFD operations must never use this terminal adapter.
     fn legacy_io_terminal(error: MemoryAllocationError) -> SystemError {
         match error {

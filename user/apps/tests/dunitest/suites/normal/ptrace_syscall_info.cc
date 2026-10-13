@@ -7,6 +7,7 @@
 #include <sys/syscall.h>
 #include <sys/user.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <chrono>
@@ -165,6 +166,90 @@ TEST(PtraceSyscallInfo, TracesysgoodReportsMatchingEntryAndExit) {
     ASSERT_EQ(child, info.data.exit.rval);
     ASSERT_EQ(0, info.data.exit.is_error);
 
+    ASSERT_EQ(0, ptrace_call(PTRACE_CONT, child, 0, 0));
+    ASSERT_TRUE(WaitPidUntil(child, &status));
+    ASSERT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(0, WEXITSTATUS(status));
+    guard.Release();
+#endif
+}
+
+TEST(PtraceSyscallInfo, SyscallResumeDoesNotInterruptAnOtherwiseBlockingRead) {
+#if !defined(__x86_64__)
+    GTEST_SKIP() << "DragonOS exposes PTRACE_GET_SYSCALL_INFO on x86_64";
+#else
+    int pipes[2];
+    ASSERT_EQ(0, pipe(pipes));
+    struct PipeGuard {
+        int reader;
+        int writer;
+        ~PipeGuard() {
+            if (reader >= 0) close(reader);
+            if (writer >= 0) close(writer);
+        }
+    } pipe_guard{pipes[0], pipes[1]};
+
+    pid_t child = fork();
+    ASSERT_GE(child, 0);
+    if (child == 0) {
+        close(pipes[1]);
+        alarm(10);
+        if (ptrace_call(PTRACE_TRACEME, 0, 0, 0) != 0) _exit(74);
+        raise(SIGSTOP);
+        char byte = 0;
+        long result = syscall(SYS_read, pipes[0], &byte, 1);
+        _exit(result == 1 && byte == 'X' ? 0 : 75);
+    }
+    ChildGuard guard(child);
+    close(pipe_guard.reader);
+    pipe_guard.reader = -1;
+
+    int status = 0;
+    ASSERT_TRUE(WaitPidUntil(child, &status));
+    ASSERT_TRUE(WIFSTOPPED(status));
+    ASSERT_EQ(SIGSTOP, WSTOPSIG(status));
+    ASSERT_EQ(0, ptrace_call(PTRACE_SETOPTIONS, child, 0,
+                             PTRACE_O_TRACESYSGOOD));
+    bool read_entry = false;
+    for (int stops = 0; stops < 32 && !read_entry; ++stops) {
+        ASSERT_EQ(0, ptrace_call(PTRACE_SYSCALL, child, 0, 0));
+        ASSERT_TRUE(WaitPidUntil(child, &status));
+        ASSERT_TRUE(WIFSTOPPED(status));
+        ASSERT_EQ(SIGTRAP | 0x80, WSTOPSIG(status));
+        PtraceSyscallInfo info{};
+        ASSERT_GE(ptrace_call(PTRACE_GET_SYSCALL_INFO, child, sizeof(info),
+                              reinterpret_cast<unsigned long>(&info)), 0);
+        read_entry = info.op == kSyscallInfoEntry && info.data.entry.nr == SYS_read;
+        if (read_entry) {
+            EXPECT_EQ(static_cast<uint64_t>(pipes[0]), info.data.entry.args[0]);
+            EXPECT_EQ(1U, info.data.entry.args[2]);
+        }
+    }
+    ASSERT_TRUE(read_entry);
+    ASSERT_EQ(0, ptrace_call(PTRACE_SYSCALL, child, 0, 0));
+
+    // No cgroup.freeze request and no data or delivered signal exist. The
+    // ptrace-stop acknowledgement must not manufacture a syscall interruption.
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(100);
+    do {
+        pid_t result = waitpid(child, &status, WNOHANG);
+        if (result < 0 && errno == EINTR) continue;
+        ASSERT_EQ(0, result) << "blocking read produced an unsolicited stop or exit";
+        timespec interval{0, 1000000};
+        while (nanosleep(&interval, &interval) < 0 && errno == EINTR) {}
+    } while (std::chrono::steady_clock::now() < deadline);
+
+    ASSERT_EQ(1, write(pipe_guard.writer, "X", 1));
+    ASSERT_TRUE(WaitPidUntil(child, &status));
+    ASSERT_TRUE(WIFSTOPPED(status));
+    ASSERT_EQ(SIGTRAP | 0x80, WSTOPSIG(status));
+    PtraceSyscallInfo info{};
+    ASSERT_EQ(33, ptrace_call(PTRACE_GET_SYSCALL_INFO, child, sizeof(info),
+                              reinterpret_cast<unsigned long>(&info)));
+    ASSERT_EQ(kSyscallInfoExit, info.op);
+    EXPECT_EQ(1, info.data.exit.rval);
+    EXPECT_EQ(0, info.data.exit.is_error);
     ASSERT_EQ(0, ptrace_call(PTRACE_CONT, child, 0, 0));
     ASSERT_TRUE(WaitPidUntil(child, &status));
     ASSERT_TRUE(WIFEXITED(status));

@@ -281,6 +281,22 @@ pub(crate) fn stopped_off_cpu_locked(task: &ProcessControlBlock) {
     }
 }
 
+/// Ptrace can resume into a syscall, before the final user-return gate.
+/// Drop the old stop acknowledgement there, like cgroup_leave_frozen(true),
+/// so it cannot masquerade as pending freeze work and cancel an ordinary wait.
+/// vfork's independent safe-wait acknowledgement remains valid until its end.
+pub(crate) fn leave_stopped(task: &ProcessControlBlock) {
+    let _state = STATE.lock_irqsave();
+    let mut member = task.freezer.membership.lock_irqsave();
+    if !member.safe_wait {
+        acknowledge(&mut member, false);
+    }
+    publish_work(task, &member);
+    if let Some(node) = &member.node {
+        revisit_tree(node);
+    }
+}
+
 /// vfork's completion wait is a Linux-defined safe wait, not ordinary D-state.
 pub(crate) fn begin_safe_wait(task: &ProcessControlBlock) {
     let _state = STATE.lock_irqsave();

@@ -393,6 +393,7 @@ impl ProcessControlBlock {
             PtraceReleaseOutcome::default()
         };
         drop(ps);
+        crate::cgroup::freezer::leave_stopped(self);
         if let Some(strong) = self.self_ref.upgrade() {
             release.apply(&strong);
         }

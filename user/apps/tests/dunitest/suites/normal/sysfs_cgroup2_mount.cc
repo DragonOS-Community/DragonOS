@@ -481,10 +481,12 @@ TEST(SysfsCgroup2Mount, Cgroup2P1ControllerFilesFollowSubtreeControl) {
         }
         expect_text_has(detail_fd, freeze.c_str(), "1\n");
         std::string events = child + "/cgroup.events";
-        expect_text_has(detail_fd, events.c_str(), "frozen 0\n");
+        // An empty group completes freezing immediately, like Linux cgroup v2.
+        expect_text_has(detail_fd, events.c_str(), "frozen 1\n");
         if (!write_text_file(freeze.c_str(), "0")) {
             child_fail(detail_fd, "write cgroup.freeze 0");
         }
+        expect_text_has(detail_fd, events.c_str(), "frozen 0\n");
         expect_write_errno(detail_fd, freeze.c_str(), "2", ERANGE);
 
         std::string memory_events = child + "/memory.events";

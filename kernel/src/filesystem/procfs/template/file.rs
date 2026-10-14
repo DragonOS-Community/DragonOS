@@ -72,6 +72,10 @@ impl<F: FileOps> ProcFile<F> {
 
 /// FileOps trait 定义了 procfs 文件需要实现的操作
 pub trait FileOps: Sync + Send + Sized + Debug {
+    /// Check dynamic backing identity before exposing inode attributes.
+    fn validate_inode(&self) -> Result<(), SystemError> {
+        Ok(())
+    }
     fn sysctl_access_bits(&self) -> Result<Option<u32>, SystemError> {
         Ok(None)
     }
@@ -189,7 +193,11 @@ impl<F: FileOps + 'static> IndexNode for ProcFile<F> {
 
     fn metadata(&self) -> Result<Metadata, SystemError> {
         let mut metadata = self.common.metadata()?;
-        if let Some((uid, gid)) = self.inner.owner() {
+        let owner = self.inner.owner();
+        // Capture identity before the final liveness check. A retired weak
+        // target must not turn a successful stat into default root ownership.
+        self.inner.validate_inode()?;
+        if let Some((uid, gid)) = owner {
             metadata.uid = uid;
             metadata.gid = gid;
         }

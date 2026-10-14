@@ -39,13 +39,15 @@ impl Syscall for SysFchdirHandle {
             .read()
             .get_file_by_fd(fd)
             .ok_or(SystemError::EBADF)?;
+        // Linux checks the immutable inode type before proc sysctl liveness
+        // or directory permissions, even for a retired O_PATH file.
+        if file.file_type() != crate::filesystem::vfs::FileType::Dir {
+            return Err(SystemError::ENOTDIR);
+        }
         let resolved = file.resolved_path()?;
         let inode = resolved.inode();
         let metadata = inode.metadata()?;
 
-        if metadata.file_type != crate::filesystem::vfs::FileType::Dir {
-            return Err(SystemError::ENOTDIR);
-        }
         crate::filesystem::vfs::permission::check_inode_permission(
             &inode,
             &metadata,

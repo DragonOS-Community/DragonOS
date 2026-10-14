@@ -9,6 +9,7 @@
 #include <sched.h>
 #include <sys/ioctl.h>
 #include <sys/mount.h>
+#include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
@@ -303,7 +304,12 @@ TEST(InetBindPolicy, ExpiredDirectoryNeverFallsBackToCurrentNamespace) {
   InNamespace([] {
     ASSERT_EQ(Write(kStart, "2048\n"), 0);
     Fd directory(open("/proc/sys/net/ipv4", O_RDONLY | O_DIRECTORY));
+    Fd leaf(open(kStart, O_PATH));
     ASSERT_GE(directory.get(), 0);
+    ASSERT_GE(leaf.get(), 0);
+    struct stat status {};
+    ASSERT_EQ(fstat(directory.get(), &status), 0);
+    ASSERT_EQ(fstat(leaf.get(), &status), 0);
     char entries[1024];
     // Read just the first entry, leaving the VFS iteration snapshot active.
     ASSERT_EQ(syscall(SYS_getdents64, directory.get(), entries, 24), 24);
@@ -327,6 +333,14 @@ TEST(InetBindPolicy, ExpiredDirectoryNeverFallsBackToCurrentNamespace) {
               ASSERT_EQ(lseek(directory.get(), 0, SEEK_SET), 0);
               EXPECT_EQ(syscall(SYS_getdents64, directory.get(), entries, sizeof(entries)), -1);
               EXPECT_EQ(errno, ENOENT);
+              EXPECT_EQ(fstat(directory.get(), &status), -1);
+              EXPECT_EQ(errno, ENOENT);
+              EXPECT_EQ(fchdir(directory.get()), -1);
+              EXPECT_EQ(errno, ENOENT);
+              EXPECT_EQ(fstat(leaf.get(), &status), -1);
+              EXPECT_EQ(errno, ENOENT);
+              EXPECT_EQ(fchdir(leaf.get()), -1);
+              EXPECT_EQ(errno, ENOTDIR);
               return;
             }
             usleep(1000);
@@ -347,6 +361,41 @@ TEST(InetBindPolicy, ChildUserNamespaceCannotAuthorizeAncestorSocket) {
     ASSERT_EQ(unshare(CLONE_NEWUSER), 0);
     EXPECT_EQ(Bind(fd.get(), AF_INET, 80), -1);
     EXPECT_EQ(errno, EACCES);
+  });
+}
+TEST(InetBindPolicy, OrdinarySysctlDescriptorsDoNotKeepNamespaceAlive) {
+  InNamespace([] {
+    Fd config(open(kStart, O_RDWR));
+    Fd range(open(kRange, O_RDWR));
+    Fd forward(open("/proc/sys/net/ipv4/ip_forward", O_RDWR));
+    ASSERT_GE(config.get(), 0);
+    ASSERT_GE(range.get(), 0);
+    ASSERT_GE(forward.get(), 0);
+    ASSERT_EQ(unshare(CLONE_NEWNET), 0);
+    char bytes[64];
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    // The forward table and port table unregister independently on Linux.
+    for (int fd : {config.get(), range.get(), forward.get()}) {
+      bool retired = false;
+      do {
+        if (read(fd, bytes, sizeof(bytes)) < 0) {
+          ASSERT_EQ(errno, ENOENT);
+          retired = true;
+          break;
+        }
+        usleep(1000);
+      } while (std::chrono::steady_clock::now() < deadline);
+      ASSERT_TRUE(retired) << "ordinary sysctl fd pinned the namespace";
+      EXPECT_EQ(read(fd, bytes, sizeof(bytes)), -1);
+      EXPECT_EQ(errno, ENOENT);
+      EXPECT_EQ(write(fd, "0\n", 2), -1);
+      EXPECT_EQ(errno, ENOENT);
+      struct stat status {};
+      EXPECT_EQ(fstat(fd, &status), -1);
+      EXPECT_EQ(errno, ENOENT);
+      EXPECT_EQ(lseek(fd, 0, SEEK_SET), 0);
+      EXPECT_EQ(lseek(fd, 0, SEEK_CUR), 0);
+    }
   });
 }
 TEST(InetBindPolicy, SysctlNumericParsingAndOffsetSemantics) {

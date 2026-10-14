@@ -44,12 +44,15 @@ impl Ipv4DirOps {
 }
 
 impl DirOps for Ipv4DirOps {
-    fn before_read_dir(&self) -> Result<(), SystemError> {
+    fn validate_inode(&self) -> Result<(), SystemError> {
         self.namespace.upgrade().map(|_| ())
+    }
+    fn before_read_dir(&self) -> Result<(), SystemError> {
+        self.validate_inode()
     }
     fn validate_child(&self, _child: &dyn IndexNode) -> bool {
         // Expired namespace tables must go through lookup_child's ENOENT path.
-        self.namespace.upgrade().is_ok()
+        self.validate_inode().is_ok()
     }
     fn lookup_child(
         &self,
@@ -108,6 +111,9 @@ impl IpForwardFileOps {
 }
 
 impl FileOps for IpForwardFileOps {
+    fn validate_inode(&self) -> Result<(), SystemError> {
+        self.namespace.upgrade().map(|_| ())
+    }
     fn sysctl_access_bits(&self) -> Result<Option<u32>, SystemError> {
         self.namespace.access_bits().map(Some)
     }
@@ -118,22 +124,23 @@ impl FileOps for IpForwardFileOps {
 
     fn open(
         &self,
-        data: &mut MutexGuard<FilePrivateData>,
+        _data: &mut MutexGuard<FilePrivateData>,
         _flags: &FileFlags,
     ) -> Result<(), SystemError> {
-        self.namespace.open(data)
+        self.validate_inode()
     }
     fn read_at(
         &self,
         offset: usize,
         len: usize,
         buf: &mut [u8],
-        data: MutexGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
+        let ns = self.namespace.upgrade()?;
         if offset != 0 {
             return Ok(0);
         }
-        let value = SysctlNamespace::opened(&data)?.ipv4_forwarding_value();
+        let value = ns.ipv4_forwarding_value();
         proc_read(0, len, buf, format!("{value}\n").as_bytes())
     }
 
@@ -142,9 +149,9 @@ impl FileOps for IpForwardFileOps {
         offset: usize,
         _len: usize,
         buf: &[u8],
-        data: MutexGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        let netns = SysctlNamespace::opened(&data)?;
+        let netns = self.namespace.upgrade()?;
         // devinet_sysctl_forward has an additional handler capability check,
         // even when global-root mode bits allowed opening the file.
         if !ns_capable(netns.user_ns(), CAPFlags::CAP_NET_ADMIN) {

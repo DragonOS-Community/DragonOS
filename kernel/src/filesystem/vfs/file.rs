@@ -2677,8 +2677,10 @@ impl File {
             return Err(SystemError::ESPIPE);
         }
 
-        let metadata = self.inode.metadata()?;
-        let file_type = metadata.file_type;
+        // Position-only seeks use the immutable open-file type. In particular,
+        // sysctl llseek remains usable after its table has been unregistered;
+        // attributes are needed only for size-dependent regular-file seeks.
+        let file_type = self.file_type();
         // Check for procfs private data. If this is a procfs pseudo-file, disallow SEEK_END
         // and other unsupported seek modes.
         {
@@ -2726,8 +2728,9 @@ impl File {
         let pos: i64 = match origin {
             SeekFrom::SeekSet(offset) => offset,
             SeekFrom::SeekCurrent(offset) => self.offset.load(Ordering::SeqCst) as i64 + offset,
-            SeekFrom::SeekEnd(offset) => metadata.size + offset,
+            SeekFrom::SeekEnd(offset) => self.inode.metadata()?.size + offset,
             SeekFrom::SeekData(offset) => {
+                let metadata = self.inode.metadata()?;
                 if file_type != FileType::File {
                     return Err(SystemError::EINVAL);
                 }
@@ -2737,6 +2740,7 @@ impl File {
                 offset
             }
             SeekFrom::SeekHole(offset) => {
+                let metadata = self.inode.metadata()?;
                 if file_type != FileType::File {
                     return Err(SystemError::EINVAL);
                 }

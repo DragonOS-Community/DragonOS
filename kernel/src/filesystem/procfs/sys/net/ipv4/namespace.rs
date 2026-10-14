@@ -3,16 +3,13 @@
 use alloc::sync::{Arc, Weak};
 use system_error::SystemError;
 
-use crate::{
-    filesystem::vfs::FilePrivateData,
-    process::{
-        cred::{ns_capable, CAPFlags},
-        namespace::{
-            net_namespace::NetNamespace,
-            user_namespace::{make_kgid, make_kuid},
-        },
-        ProcessManager,
+use crate::process::{
+    cred::{ns_capable, CAPFlags},
+    namespace::{
+        net_namespace::NetNamespace,
+        user_namespace::{make_kgid, make_kuid},
     },
+    ProcessManager,
 };
 
 /// Cached directories and inodes do not keep a namespace alive. A directory
@@ -55,21 +52,5 @@ impl SysctlNamespace {
             make_kuid(ns.user_ns(), 0).map_or(0, |id| id.data()),
             make_kgid(ns.user_ns(), 0).map_or(0, |id| id.data()),
         ))
-    }
-
-    pub(super) fn open(&self, data: &mut FilePrivateData) -> Result<(), SystemError> {
-        let ns = self.upgrade()?;
-        let FilePrivateData::Procfs(data) = data else {
-            return Err(SystemError::EINVAL);
-        };
-        data.net_ns = Some(ns);
-        Ok(())
-    }
-
-    pub(super) fn opened(data: &FilePrivateData) -> Result<&Arc<NetNamespace>, SystemError> {
-        match data {
-            FilePrivateData::Procfs(data) => data.net_ns.as_ref().ok_or(SystemError::ENOENT),
-            _ => Err(SystemError::EINVAL),
-        }
     }
 }

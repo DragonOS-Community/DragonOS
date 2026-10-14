@@ -59,6 +59,9 @@ impl PortFileOps {
 }
 
 impl FileOps for PortFileOps {
+    fn validate_inode(&self) -> Result<(), SystemError> {
+        self.namespace.upgrade().map(|_| ())
+    }
     fn sysctl_access_bits(&self) -> Result<Option<u32>, SystemError> {
         self.namespace.access_bits().map(Some)
     }
@@ -69,10 +72,10 @@ impl FileOps for PortFileOps {
 
     fn open(
         &self,
-        data: &mut MutexGuard<FilePrivateData>,
+        _data: &mut MutexGuard<FilePrivateData>,
         _flags: &FileFlags,
     ) -> Result<(), SystemError> {
-        self.namespace.open(data)
+        self.validate_inode()
     }
 
     fn read_at(
@@ -80,12 +83,12 @@ impl FileOps for PortFileOps {
         offset: usize,
         len: usize,
         buf: &mut [u8],
-        data: MutexGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
+        let ns = self.namespace.upgrade()?;
         if offset != 0 {
             return Ok(0);
         }
-        let ns = SysctlNamespace::opened(&data)?;
         let text = match self.kind {
             PortSysctl::LocalRange => {
                 let (min, max) = ns.local_port_range();
@@ -101,10 +104,10 @@ impl FileOps for PortFileOps {
         offset: usize,
         _len: usize,
         buf: &[u8],
-        data: MutexGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        let ns = SysctlNamespace::opened(&data)?;
-        if SysctlNamespace::access_bits_for(ns) & 2 == 0 {
+        let ns = self.namespace.upgrade()?;
+        if SysctlNamespace::access_bits_for(&ns) & 2 == 0 {
             return Err(SystemError::EPERM);
         }
         if buf.is_empty() {

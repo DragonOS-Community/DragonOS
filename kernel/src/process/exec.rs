@@ -363,6 +363,19 @@ impl ExecParam {
         // there were no sibling threads to signal.
         self.point_of_no_return = true;
 
+        // POSIX timer IDs belong to the old image's thread group. Detach the
+        // registry before cancelling events and releasing notification slots.
+        let group = me.process_signal();
+        let timers = group.posix_timers().lock_irqsave().take_all();
+        for (_, timer) in timers {
+            timer.delete();
+        }
+        {
+            let mut pending = group.lock_irqsave();
+            pending.flush_timer_signals();
+        }
+        me.sig_info_mut().sig_pending_mut().flush_timer_signals();
+
         if me.sighand().is_shared() {
             let old_sighand = me.sighand();
             let mut recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();

@@ -27,8 +27,8 @@ use crate::{
     process::{posix_timer::PosixItimerspec, ProcessManager},
     syscall::user_buffer::UserBuffer,
     time::{
-        syscall::{posix_clock_now, PosixClockID},
-        timekeeping::realtime_now_with_clock_set_seq,
+        syscall::PosixClockID,
+        timekeeping::{boottime_now, monotonic_now, realtime_now, realtime_now_with_clock_set_seq},
         timer::{next_n_us_timer_jiffies, Timer, TimerFunction},
         PosixTimeSpec, NSEC_PER_SEC,
     },
@@ -67,12 +67,12 @@ enum DeadlineDomain {
 
 impl DeadlineDomain {
     fn now_ns(self) -> u64 {
-        let clock = match self {
-            Self::Monotonic => PosixClockID::Monotonic,
-            Self::Realtime => PosixClockID::Realtime,
-            Self::Boottime => PosixClockID::Boottime,
-        };
-        posix_clock_now(clock).to_ktime_ns()
+        match self {
+            Self::Monotonic => monotonic_now(),
+            Self::Realtime => realtime_now(),
+            Self::Boottime => boottime_now(),
+        }
+        .to_ktime_ns()
     }
 }
 

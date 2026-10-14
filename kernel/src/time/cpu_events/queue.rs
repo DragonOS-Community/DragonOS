@@ -1,6 +1,6 @@
 //! CPU-clock wait registrations: one prepared node for sorting and wakeup.
 //! Tree operations move the original owned allocation and never allocate.
-use super::{Key, Registration};
+use super::{CpuEventRegistration, Key};
 use crate::cgroup::memory::{accounting::KernelByteKind, object::ObjectAccount, owned::OwnedBox};
 use crate::mm::allocation::MemoryAllocationError;
 use alloc::sync::Arc;
@@ -8,7 +8,7 @@ use system_error::SystemError;
 
 pub(super) struct Node {
     pub(super) key: Key,
-    pub(super) pending: Option<Arc<Registration>>,
+    pub(super) pending: Option<Arc<CpuEventRegistration>>,
     left: Option<OwnedBox<Node>>,
     right: Option<OwnedBox<Node>>,
     height: i32,

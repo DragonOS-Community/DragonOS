@@ -340,6 +340,15 @@ pub struct SigInfo {
     errno: i32,
     sig_code: SigCode,
     sig_type: SigType,
+    /// Kernel-only identity. Never copied from the user siginfo ABI.
+    timer_token: Option<TimerSignalToken>,
+}
+
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct TimerSignalToken {
+    pub(crate) incarnation: u64,
+    pub(crate) generation: u64,
+    pub(crate) delivery: u64,
 }
 
 /**
@@ -774,6 +783,7 @@ impl SigInfo {
             errno: posix.si_errno,
             sig_code,
             sig_type,
+            timer_token: None,
         }
     }
 
@@ -1099,7 +1109,16 @@ impl SigInfo {
             sig_code,
             errno: sig_errno,
             sig_type,
+            timer_token: None,
         }
+    }
+
+    pub(crate) fn timer_token(&self) -> Option<TimerSignalToken> {
+        self.timer_token
+    }
+
+    pub(crate) fn set_timer_token(&mut self, token: TimerSignalToken) {
+        self.timer_token = Some(token);
     }
 }
 
@@ -1116,7 +1135,7 @@ impl SigPending {
         if !sig.is_rt_signal() && self.signal.contains(sig.into()) {
             return Ok(false);
         }
-        if self.queue.q.try_reserve(1).is_err() {
+        if self.queue.reserve_normal().is_err() {
             // Linux permits lossy bitmap-only delivery for standard/kill
             // signals, but explicit real-time metadata cannot be discarded.
             if sig.is_rt_signal() && info.sig_code() != SigCode::User {
@@ -1269,12 +1288,37 @@ impl SigPending {
         // 同步清理位图中的相应位，避免仅删除队列项但仍因位图残留被视为pending
         self.signal.remove(*mask);
     }
+
+    /// exec drops SI_TIMER metadata from the old image, without flushing
+    /// unrelated signals which share a signum with a POSIX timer.
+    pub(crate) fn flush_timer_signals(&mut self) {
+        let removed = self
+            .queue
+            .q
+            .iter()
+            .filter(|info| info.sig_code() == SigCode::Timer)
+            .fold(SigSet::empty(), |bits, info| {
+                bits | Signal::from(info.sig_no as usize).into_sigset()
+            });
+        self.queue
+            .q
+            .retain(|info| info.sig_code() != SigCode::Timer);
+        for signo in 1..=MAX_SIG_NUM {
+            let sig = Signal::from(signo);
+            if removed.contains(sig.into_sigset()) && self.queue.find(sig).0.is_none() {
+                self.signal.remove(sig.into_sigset());
+            }
+        }
+    }
 }
 
 /// @brief 进程接收到的信号的队列
 #[derive(Debug, Clone, Default)]
 pub struct SigQueue {
     pub q: Vec<SigInfo>,
+    /// Each live CPU timer reserves one additional FIFO slot. Normal signal
+    /// producers preserve this spare capacity; timer expiry never allocates.
+    timer_reservations: usize,
 }
 
 #[allow(dead_code)]
@@ -1283,6 +1327,42 @@ impl SigQueue {
     pub fn new(capacity: usize) -> Self {
         SigQueue {
             q: Vec::with_capacity(capacity),
+            timer_reservations: 0,
+        }
+    }
+
+    pub(crate) fn reserve_normal(&mut self) -> Result<(), SystemError> {
+        let extra = self
+            .timer_reservations
+            .checked_add(1)
+            .ok_or(SystemError::ENOMEM)?;
+        self.q.try_reserve(extra).map_err(|_| SystemError::ENOMEM)
+    }
+
+    pub(crate) fn reserve_timer(&mut self) -> Result<(), SystemError> {
+        self.reserve_normal()?;
+        self.timer_reservations += 1;
+        Ok(())
+    }
+
+    pub(crate) fn release_timer(&mut self) {
+        debug_assert!(self.timer_reservations > 0);
+        self.timer_reservations = self.timer_reservations.saturating_sub(1);
+    }
+
+    /// Callers serialize one outstanding entry per reserved timer identity.
+    pub(crate) fn push_reserved_timer(&mut self, info: SigInfo) -> Result<(), SystemError> {
+        if self.timer_reservations == 0 || self.q.len() == self.q.capacity() {
+            return Err(SystemError::ENOMEM);
+        }
+        self.q.push(info);
+        Ok(())
+    }
+
+    pub(crate) fn push_normal(&mut self, info: SigInfo) {
+        // Existing lossy standard-signal callers retain their bitmap fallback.
+        if self.reserve_normal().is_ok() {
+            self.q.push(info);
         }
     }
 
@@ -1362,4 +1442,69 @@ impl SignalFlags {
     pub const STOP_MASK: SignalFlags = SignalFlags::CLD_MASK
         .union(SignalFlags::STOP_STOPPED)
         .union(SignalFlags::STOP_CONTINUED);
+}
+
+#[cfg(test)]
+mod timer_signal_tests {
+    use super::*;
+
+    fn timer_info(serial: u64) -> SigInfo {
+        let mut info = SigInfo::new(
+            Signal::SIGALRM,
+            0,
+            SigCode::Timer,
+            SigType::PosixTimer {
+                timerid: serial as i32,
+                overrun: 0,
+                sigval: PosixSigval::zero(),
+            },
+        );
+        info.set_timer_token(TimerSignalToken {
+            incarnation: serial,
+            generation: 1,
+            delivery: 1,
+        });
+        info
+    }
+
+    #[test]
+    fn reserved_timer_fifo_does_not_allocate_during_expiry() {
+        let mut queue = SigQueue::default();
+        for _ in 0..32 {
+            queue.reserve_timer().unwrap();
+        }
+        for round in 0..4 {
+            // Ordinary enqueues may grow but cannot consume timer guarantees.
+            for id in 0..9 {
+                queue.push_normal(timer_info(100 + id));
+            }
+            let capacity = queue.q.capacity();
+            for id in 0..32 {
+                queue.push_reserved_timer(timer_info(id)).unwrap();
+            }
+            assert_eq!(queue.q.capacity(), capacity);
+            assert_eq!(queue.q[9].timer_token().unwrap().incarnation, 0);
+            queue.q.clear();
+            if round == 0 {
+                queue.release_timer();
+                queue.reserve_timer().unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn reservation_release_keeps_old_pending_entry_but_other_timers_work() {
+        let mut queue = SigQueue::default();
+        queue.reserve_timer().unwrap();
+        queue.reserve_timer().unwrap();
+        queue.push_reserved_timer(timer_info(1)).unwrap();
+        queue.release_timer(); // deleted timer's already queued signal remains
+        queue.push_normal(timer_info(9));
+        let capacity = queue.q.capacity();
+        queue.push_reserved_timer(timer_info(2)).unwrap();
+        assert_eq!(queue.q.capacity(), capacity);
+        assert_eq!(queue.q[0].timer_token().unwrap().incarnation, 1);
+        queue.release_timer();
+        assert_eq!(queue.timer_reservations, 0);
+    }
 }

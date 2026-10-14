@@ -5,6 +5,7 @@ use crate::mm::VirtAddr;
 use crate::process::ProcessManager;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
 use crate::syscall::user_access::{UserBufferReader, UserBufferWriter};
+use crate::time::cpu_clock::CpuClockSleep;
 use crate::time::{sleep::nanosleep, PosixTimeSpec};
 use alloc::vec::Vec;
 use system_error::SystemError;
@@ -28,7 +29,7 @@ impl SysClockNanosleep {
     }
 
     #[inline]
-    fn ktime_now(clockid: PosixClockID) -> PosixTimeSpec {
+    fn ktime_now(clockid: PosixClockID) -> Result<PosixTimeSpec, SystemError> {
         super::posix_clock::posix_clock_now(clockid)
     }
 
@@ -57,26 +58,9 @@ impl SysClockNanosleep {
 
     fn do_wait_until(deadline: &PosixTimeSpec, clockid: PosixClockID) -> Result<(), SystemError> {
         match clockid {
-            ProcessCPUTimeID => {
-                let current = ProcessManager::current_pcb();
-                let leader = if current.is_thread_group_leader() {
-                    current
-                } else {
-                    current
-                        .threads_read_irqsave()
-                        .group_leader()
-                        .unwrap_or_else(ProcessManager::current_pcb)
-                };
-
-                let deadline_ns = Self::to_ns(deadline);
-                leader
-                    .process_signal()
-                    .wait_cpu_time(deadline_ns, || leader.process_cputime_ns() >= deadline_ns)?;
-                Ok(())
-            }
-            ThreadCPUTimeID => Err(SystemError::EOPNOTSUPP_OR_ENOTSUP),
+            ProcessCPUTimeID | ThreadCPUTimeID | DynamicCpuClock(_) => Err(SystemError::EINVAL),
             _ => {
-                let now = Self::ktime_now(clockid);
+                let now = Self::ktime_now(clockid)?;
                 let remain = Self::calc_remaining(deadline, &now);
                 if remain.tv_sec == 0 && remain.tv_nsec == 0 {
                     return Ok(());
@@ -84,7 +68,7 @@ impl SysClockNanosleep {
                 match nanosleep(remain) {
                     Ok(()) => Ok(()),
                     Err(SystemError::ERESTARTSYS) => {
-                        let remain = Self::calc_remaining(deadline, &Self::ktime_now(clockid));
+                        let remain = Self::calc_remaining(deadline, &Self::ktime_now(clockid)?);
                         if remain.is_empty() {
                             Ok(())
                         } else {
@@ -105,13 +89,9 @@ impl Syscall for SysClockNanosleep {
 
     fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         // 解析/校验参数
-        let clockid = PosixClockID::try_from(Self::which_clock(args))?.canonical_process_cpu_clock(
-            ProcessManager::current_pcb()
-                .task_tgid_vnr()
-                .map_or(0, |pid| pid.data()),
-        );
+        let clockid = PosixClockID::try_from(Self::which_clock(args))?;
         match clockid {
-            Realtime | Monotonic | Boottime | ProcessCPUTimeID => {}
+            Realtime | Monotonic | Boottime | ProcessCPUTimeID | DynamicCpuClock(_) => {}
             // CLOCK_THREAD_CPUTIME_ID is a valid POSIX clock but Linux has no
             // clock_nanosleep operation for it, so this is EOPNOTSUPP rather
             // than EINVAL.
@@ -137,6 +117,7 @@ impl Syscall for SysClockNanosleep {
             tv_sec: rq_user.tv_sec,
             tv_nsec: rq_user.tv_nsec,
         };
+        let cpu_sleep = CpuClockSleep::resolve(clockid)?;
 
         let rmtp = if !Self::rmtp(args).is_null() && !is_abstime {
             Some(VirtAddr::new(Self::rmtp(args) as usize))
@@ -156,13 +137,19 @@ impl Syscall for SysClockNanosleep {
                 tv_nsec: rq.tv_nsec,
             }
         } else {
-            let now = Self::ktime_now(deadline_clockid);
+            let now = match &cpu_sleep {
+                Some(cpu) => cpu.now(),
+                None => Self::ktime_now(deadline_clockid)?,
+            };
             Self::add_timespec(&now, &rq)
         };
 
         // 立即到期检查（ABS）
         if is_abstime {
-            let now = Self::ktime_now(clockid);
+            let now = match &cpu_sleep {
+                Some(cpu) => cpu.now(),
+                None => Self::ktime_now(clockid)?,
+            };
             let remain = Self::calc_remaining(&deadline, &now);
             if remain.tv_sec == 0 && remain.tv_nsec == 0 {
                 return Ok(0);
@@ -170,7 +157,10 @@ impl Syscall for SysClockNanosleep {
         }
 
         // 等待
-        let wait_res = Self::do_wait_until(&deadline, deadline_clockid);
+        let wait_res = match &cpu_sleep {
+            Some(cpu) => cpu.wait(Self::to_ns(&deadline)),
+            None => Self::do_wait_until(&deadline, deadline_clockid),
+        };
         match wait_res {
             Ok(()) => {
                 // log::debug!(
@@ -189,7 +179,10 @@ impl Syscall for SysClockNanosleep {
                 } else {
                     // 相对睡眠：写回剩余时间，并设置restart block
                     if let Some(rmtp) = rmtp {
-                        let now = Self::ktime_now(deadline_clockid);
+                        let now = match &cpu_sleep {
+                            Some(cpu) => cpu.now(),
+                            None => Self::ktime_now(deadline_clockid)?,
+                        };
                         let remain = Self::calc_remaining(&deadline, &now);
                         // log::debug!(
                         //     "clock_nanosleep: REL interrupted -> write rem {{sec={}, nsec={}}}",

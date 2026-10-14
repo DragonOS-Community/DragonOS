@@ -9,6 +9,7 @@ pub(crate) mod bind;
 pub(crate) mod error_queue;
 pub(crate) mod pmtu;
 pub mod port;
+pub(crate) mod port_policy;
 pub use port::PortManager;
 mod device_binding;
 pub use device_binding::{DeviceBindingUpdate, SocketDeviceBinding};

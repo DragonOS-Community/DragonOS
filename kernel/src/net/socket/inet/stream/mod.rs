@@ -126,6 +126,13 @@ impl TcpSocket {
 }
 
 impl Socket for TcpSocket {
+    fn bind_endpoint_from_user(
+        &self,
+        addr: *const crate::net::posix::SockAddr,
+        len: u32,
+    ) -> Result<Endpoint, SystemError> {
+        super::common::bind::endpoint_from_user_preserving_mapped(addr, len, self.ip_version)
+    }
     fn endpoint_from_user(
         &self,
         addr: *const crate::net::posix::SockAddr,

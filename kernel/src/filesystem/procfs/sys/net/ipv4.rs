@@ -3,49 +3,79 @@ use crate::filesystem::{
         template::{Builder, DirOps, FileOps, ProcDir, ProcDirBuilder, ProcFileBuilder},
         utils::proc_read,
     },
-    vfs::{FilePrivateData, IndexNode, InodeMode},
+    vfs::{file::FileFlags, FilePrivateData, IndexNode, InodeMode},
 };
 use crate::libs::mutex::MutexGuard;
-use crate::net::socket::inet::common::port::PortManager;
-use crate::process::{cred::CAPFlags, ProcessManager};
+use crate::process::cred::{ns_capable, CAPFlags};
 use alloc::{
     format,
-    string::{String, ToString},
+    string::ToString,
     sync::{Arc, Weak},
-    vec::Vec,
 };
 use system_error::SystemError;
 
 use super::super::numeric::parse_numeric_sysctl;
+mod namespace;
+mod ports;
+use namespace::SysctlNamespace;
+use ports::{PortFileOps, PortSysctl};
 
 #[derive(Debug)]
-pub struct Ipv4DirOps;
+pub struct Ipv4DirOps {
+    namespace: SysctlNamespace,
+}
 
 impl Ipv4DirOps {
     pub fn new_inode(parent: Weak<dyn IndexNode>) -> Arc<dyn IndexNode> {
-        ProcDirBuilder::new(Self, InodeMode::from_bits_truncate(0o555))
-            .parent(parent)
-            .build()
-            .unwrap()
+        ProcDirBuilder::new(
+            Self {
+                namespace: SysctlNamespace::current(),
+            },
+            InodeMode::from_bits_truncate(0o555),
+        )
+        .parent(parent)
+        .build()
+        .unwrap()
+    }
+
+    pub(super) fn is_current(&self) -> bool {
+        self.namespace.is_current()
     }
 }
 
 impl DirOps for Ipv4DirOps {
+    fn validate_inode(&self) -> Result<(), SystemError> {
+        self.namespace.upgrade().map(|_| ())
+    }
+    fn before_read_dir(&self) -> Result<(), SystemError> {
+        self.validate_inode()
+    }
+    fn validate_child(&self, _child: &dyn IndexNode) -> bool {
+        // Expired namespace tables must go through lookup_child's ENOENT path.
+        self.validate_inode().is_ok()
+    }
     fn lookup_child(
         &self,
         dir: &ProcDir<Self>,
         name: &str,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
-        if name == "ip_local_port_range" || name == "ip_forward" {
+        if PortSysctl::from_name(name).is_some() || name == "ip_forward" {
+            // A retained directory addresses its original table, never the
+            // calling task's new namespace. Check liveness before cached leaves.
+            let _target = self.namespace.upgrade()?;
             let mut cached_children = dir.cached_children().write();
             if let Some(child) = cached_children.get(name) {
                 return Ok(child.clone());
             }
 
             let inode = if name == "ip_forward" {
-                IpForwardFileOps::new_inode(dir.self_ref_weak().clone())
+                IpForwardFileOps::new_inode(dir.self_ref_weak().clone(), self.namespace.clone())
             } else {
-                IpLocalPortRangeFileOps::new_inode(dir.self_ref_weak().clone())
+                PortFileOps::new_inode(
+                    PortSysctl::from_name(name).unwrap(),
+                    dir.self_ref_weak().clone(),
+                    self.namespace.clone(),
+                )
             };
             cached_children.insert(name.to_string(), inode.clone());
             return Ok(inode);
@@ -55,74 +85,24 @@ impl DirOps for Ipv4DirOps {
     }
 
     fn populate_children(&self, dir: &ProcDir<Self>) {
-        let mut cached_children = dir.cached_children().write();
-        cached_children
-            .entry("ip_local_port_range".to_string())
-            .or_insert_with(|| IpLocalPortRangeFileOps::new_inode(dir.self_ref_weak().clone()));
-        cached_children
-            .entry("ip_forward".to_string())
-            .or_insert_with(|| IpForwardFileOps::new_inode(dir.self_ref_weak().clone()));
-    }
-}
-
-#[derive(Debug)]
-pub struct IpLocalPortRangeFileOps;
-
-impl IpLocalPortRangeFileOps {
-    pub fn new_inode(parent: Weak<dyn IndexNode>) -> Arc<dyn IndexNode> {
-        ProcFileBuilder::new(Self, InodeMode::from_bits_truncate(0o644))
-            .parent(parent)
-            .build()
-            .unwrap()
-    }
-
-    fn read_config() -> String {
-        let (min, max) = PortManager::local_port_range();
-        format!("{} {}\n", min, max)
-    }
-
-    fn write_config(data: &[u8]) -> Result<usize, SystemError> {
-        let input = core::str::from_utf8(data).map_err(|_| SystemError::EINVAL)?;
-        let parts: Vec<&str> = input.split_whitespace().collect();
-        if parts.len() < 2 {
-            return Err(SystemError::EINVAL);
+        for name in [
+            "ip_local_port_range",
+            "ip_unprivileged_port_start",
+            "ip_forward",
+        ] {
+            let _ = self.lookup_child(dir, name);
         }
-        let min: u16 = parts[0].parse().map_err(|_| SystemError::EINVAL)?;
-        let max: u16 = parts[1].parse().map_err(|_| SystemError::EINVAL)?;
-        PortManager::set_local_port_range(min, max)?;
-        Ok(data.len())
-    }
-}
-
-impl FileOps for IpLocalPortRangeFileOps {
-    fn read_at(
-        &self,
-        offset: usize,
-        len: usize,
-        buf: &mut [u8],
-        _data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError> {
-        let content = Self::read_config();
-        proc_read(offset, len, buf, content.as_bytes())
-    }
-
-    fn write_at(
-        &self,
-        _offset: usize,
-        _len: usize,
-        buf: &[u8],
-        _data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError> {
-        Self::write_config(buf)
     }
 }
 
 #[derive(Debug)]
-struct IpForwardFileOps;
+struct IpForwardFileOps {
+    namespace: SysctlNamespace,
+}
 
 impl IpForwardFileOps {
-    fn new_inode(parent: Weak<dyn IndexNode>) -> Arc<dyn IndexNode> {
-        ProcFileBuilder::new(Self, InodeMode::from_bits_truncate(0o644))
+    fn new_inode(parent: Weak<dyn IndexNode>, namespace: SysctlNamespace) -> Arc<dyn IndexNode> {
+        ProcFileBuilder::new(Self { namespace }, InodeMode::from_bits_truncate(0o644))
             .parent(parent)
             .sysctl_permissions()
             .build()
@@ -131,6 +111,24 @@ impl IpForwardFileOps {
 }
 
 impl FileOps for IpForwardFileOps {
+    fn validate_inode(&self) -> Result<(), SystemError> {
+        self.namespace.upgrade().map(|_| ())
+    }
+    fn sysctl_access_bits(&self) -> Result<Option<u32>, SystemError> {
+        self.namespace.access_bits().map(Some)
+    }
+
+    fn owner(&self) -> Option<(usize, usize)> {
+        self.namespace.owner()
+    }
+
+    fn open(
+        &self,
+        _data: &mut MutexGuard<FilePrivateData>,
+        _flags: &FileFlags,
+    ) -> Result<(), SystemError> {
+        self.validate_inode()
+    }
     fn read_at(
         &self,
         offset: usize,
@@ -138,10 +136,11 @@ impl FileOps for IpForwardFileOps {
         buf: &mut [u8],
         _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
+        let ns = self.namespace.upgrade()?;
         if offset != 0 {
             return Ok(0);
         }
-        let value = ProcessManager::current_netns().ipv4_forwarding_value();
+        let value = ns.ipv4_forwarding_value();
         proc_read(0, len, buf, format!("{value}\n").as_bytes())
     }
 
@@ -152,11 +151,10 @@ impl FileOps for IpForwardFileOps {
         buf: &[u8],
         _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        let netns = ProcessManager::current_netns();
-        if !ProcessManager::current_pcb()
-            .cred()
-            .has_capability_in_ns(netns.user_ns(), CAPFlags::CAP_NET_ADMIN)
-        {
+        let netns = self.namespace.upgrade()?;
+        // devinet_sysctl_forward has an additional handler capability check,
+        // even when global-root mode bits allowed opening the file.
+        if !ns_capable(netns.user_ns(), CAPFlags::CAP_NET_ADMIN) {
             return Err(SystemError::EPERM);
         }
         if buf.is_empty() {

@@ -605,13 +605,15 @@ pub fn check_inode_permission(
         // Linux proc_sys_permission uses global euid/egid and does not grant
         // CAP_DAC_OVERRIDE a bypass (including caps in a child userns).
         let mode = metadata.mode.bits();
-        let allowed = if cred.euid.data() == 0 {
-            (mode >> 6) & 7
-        } else if cred.egid.data() == 0 || cred.groups.iter().any(|gid| gid.data() == 0) {
-            (mode >> 3) & 7
-        } else {
-            mode & 7
-        };
+        let allowed = inode.sysctl_access_bits()?.unwrap_or_else(|| {
+            if cred.euid.data() == 0 {
+                (mode >> 6) & 7
+            } else if cred.egid.data() == 0 || cred.groups.iter().any(|gid| gid.data() == 0) {
+                (mode >> 3) & 7
+            } else {
+                mode & 7
+            }
+        });
         if mask.bits() & PermissionMask::MAY_RWX.bits() & !allowed != 0 {
             return Err(SystemError::EACCES);
         }

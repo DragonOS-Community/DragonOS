@@ -72,6 +72,13 @@ impl<F: FileOps> ProcFile<F> {
 
 /// FileOps trait 定义了 procfs 文件需要实现的操作
 pub trait FileOps: Sync + Send + Sized + Debug {
+    /// Check dynamic backing identity before exposing inode attributes.
+    fn validate_inode(&self) -> Result<(), SystemError> {
+        Ok(())
+    }
+    fn sysctl_access_bits(&self) -> Result<Option<u32>, SystemError> {
+        Ok(None)
+    }
     /// 从文件的指定偏移量读取数据
     ///
     /// # 参数
@@ -136,12 +143,17 @@ pub trait FileOps: Sync + Send + Sized + Debug {
 /// 使用 inherit_methods 宏从 common 继承通用方法
 #[inherit_methods(from = "self.common")]
 impl<F: FileOps + 'static> IndexNode for ProcFile<F> {
+    fn sysctl_access_bits(&self) -> Result<Option<u32>, SystemError> {
+        self.inner.sysctl_access_bits()
+    }
     fn configure_open_file(&self, _data: &FilePrivateData, behavior: &mut OpenFileBehavior) {
         behavior.post_write_sync = PostWriteSyncPolicy::NotApplicable;
     }
 
     fn fs(&self) -> Arc<dyn FileSystem>;
-    fn as_any_ref(&self) -> &dyn core::any::Any;
+    fn as_any_ref(&self) -> &dyn core::any::Any {
+        self
+    }
     fn set_metadata(
         &self,
         metadata: &Metadata,
@@ -181,7 +193,11 @@ impl<F: FileOps + 'static> IndexNode for ProcFile<F> {
 
     fn metadata(&self) -> Result<Metadata, SystemError> {
         let mut metadata = self.common.metadata()?;
-        if let Some((uid, gid)) = self.inner.owner() {
+        let owner = self.inner.owner();
+        // Capture identity before the final liveness check. A retired weak
+        // target must not turn a successful stat into default root ownership.
+        self.inner.validate_inode()?;
+        if let Some((uid, gid)) = owner {
             metadata.uid = uid;
             metadata.gid = gid;
         }

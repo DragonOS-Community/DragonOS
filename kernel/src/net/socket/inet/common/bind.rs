@@ -15,6 +15,23 @@ pub(crate) fn endpoint_from_user(
     len: u32,
     version: IpVersion,
 ) -> Result<Endpoint, SystemError> {
+    let mut endpoint = endpoint_from_user_preserving_mapped(addr, len, version)?;
+    if let Endpoint::Ip(endpoint) = &mut endpoint {
+        if let IpAddress::Ipv6(address) = endpoint.addr {
+            if let Some(mapped) = address.to_ipv4_mapped() {
+                endpoint.addr = IpAddress::Ipv4(mapped);
+            }
+        }
+    }
+    Ok(endpoint)
+}
+
+/// TCP keeps mapped input until its synchronized IPV6_V6ONLY check.
+pub(crate) fn endpoint_from_user_preserving_mapped(
+    addr: *const SockAddr,
+    len: u32,
+    version: IpVersion,
+) -> Result<Endpoint, SystemError> {
     if len == 0 || len > MAX_SOCKADDR_LEN {
         return Err(SystemError::EINVAL);
     }
@@ -49,9 +66,7 @@ pub(crate) fn endpoint_from_user(
             let mut octets = [0u8; 16];
             octets.copy_from_slice(&snapshot[8..24]);
             let address = Ipv6Address::from(octets);
-            address
-                .to_ipv4_mapped()
-                .map_or(IpAddress::Ipv6(address), IpAddress::Ipv4)
+            IpAddress::Ipv6(address)
         }
     };
     Ok(Endpoint::Ip(IpEndpoint::new(address, port)))

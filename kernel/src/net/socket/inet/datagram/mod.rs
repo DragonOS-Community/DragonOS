@@ -525,6 +525,7 @@ impl UdpSocket {
     }
 
     pub fn do_bind(&self, endpoint: smoltcp::wire::IpEndpoint) -> Result<(), SystemError> {
+        super::common::port_policy::check_bind_access(&self.netns, endpoint, self.ip_version)?;
         loop {
             {
                 let inner = self.inner.read();

@@ -742,6 +742,17 @@ pub trait PollableInode: Any + Sync + Send + Debug + CastFromSync {
 }
 
 pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
+    /// Namespace-specific proc sysctl mode bits for the current credentials.
+    /// None preserves the ordinary global-root proc sysctl permission policy.
+    fn sysctl_access_bits(&self) -> Result<Option<u32>, SystemError> {
+        Ok(None)
+    }
+
+    /// Validate dynamic backing before every directory iteration, including
+    /// cached snapshots and EOF. Ordinary filesystems need no extra check.
+    fn before_read_dir(&self) -> Result<(), SystemError> {
+        Ok(())
+    }
     /// Optional watch-presence hint for anonymous inodes that do not pass
     /// through MountFS object state. Implementations exposing this counter
     /// let hot I/O paths avoid the global fsnotify index when unwatched.

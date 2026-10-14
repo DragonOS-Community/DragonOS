@@ -96,6 +96,9 @@ impl<Ops: DirOps> ProcDir<Ops> {
 
 #[inherit_methods(from = "self.common")]
 impl<Ops: DirOps + 'static> IndexNode for ProcDir<Ops> {
+    fn before_read_dir(&self) -> Result<(), SystemError> {
+        self.inner.before_read_dir()
+    }
     fn fs(&self) -> Arc<dyn FileSystem>;
     fn set_metadata(
         &self,
@@ -110,7 +113,9 @@ impl<Ops: DirOps + 'static> IndexNode for ProcDir<Ops> {
 
     fn metadata(&self) -> Result<Metadata, SystemError> {
         let mut metadata = self.common.metadata()?;
-        if let Some((uid, gid)) = self.inner.owner() {
+        let owner = self.inner.owner();
+        self.inner.validate_inode()?;
+        if let Some((uid, gid)) = owner {
             metadata.uid = uid;
             metadata.gid = gid;
         }
@@ -126,6 +131,7 @@ impl<Ops: DirOps + 'static> IndexNode for ProcDir<Ops> {
         metadata: &Metadata,
         mask: crate::filesystem::vfs::permission::PermissionMask,
     ) -> Result<(), SystemError> {
+        self.inner.validate_inode()?;
         self.inner.check_dac_permission(metadata, mask)
     }
 
@@ -150,6 +156,7 @@ impl<Ops: DirOps + 'static> IndexNode for ProcDir<Ops> {
     }
 
     fn list(&self) -> Result<Vec<String>, SystemError> {
+        self.inner.before_read_dir()?;
         let mut keys = Vec::new();
         keys.push(String::from("."));
         keys.push(String::from(".."));
@@ -211,7 +218,7 @@ impl<Ops: DirOps + 'static> IndexNode for ProcDir<Ops> {
                     .read()
                     .iter()
                     .filter_map(|(k, v)| {
-                        if v.metadata().unwrap().inode_id.into() == ino {
+                        if v.metadata().ok()?.inode_id.into() == ino {
                             Some(k.to_string())
                         } else {
                             None
@@ -263,6 +270,16 @@ impl<Ops: DirOps + 'static> IndexNode for ProcDir<Ops> {
 }
 
 pub trait DirOps: Sync + Send + Sized + Debug {
+    /// Dynamic directories may outlive their backing table through retained
+    /// paths. Attributes and permissions must reject a retired identity too.
+    fn validate_inode(&self) -> Result<(), SystemError> {
+        Ok(())
+    }
+    /// Reject enumeration of a directory whose dynamic backing table is gone.
+    /// This also runs before emitting dot entries from the cached directory.
+    fn before_read_dir(&self) -> Result<(), SystemError> {
+        Ok(())
+    }
     fn check_dac_permission(
         &self,
         metadata: &Metadata,

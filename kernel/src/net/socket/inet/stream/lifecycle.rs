@@ -233,19 +233,39 @@ impl TcpSocket {
     }
 
     pub fn do_bind(&self, local_endpoint: smoltcp::wire::IpEndpoint) -> Result<(), SystemError> {
-        self.normalize_endpoint(local_endpoint, false)?;
+        if local_endpoint.addr.version() != self.ip_version {
+            return Err(SystemError::EAFNOSUPPORT);
+        }
+        if matches!(local_endpoint.addr, smoltcp::wire::IpAddress::Ipv6(addr) if addr.is_multicast())
+        {
+            return Err(SystemError::EINVAL);
+        }
+        super::super::common::port_policy::check_bind_access(
+            &self.netns(),
+            local_endpoint,
+            self.ip_version,
+        )?;
         if !matches!(
             self.inner.read().as_ref(),
             Some(inner::Inner::Init(inner::Init::Unbound(_)))
         ) {
             return Err(SystemError::EINVAL);
         }
+        // Reject invalid mapped/v6-only input before fallible capacity work;
+        // bind_once repeats this while holding inner against option changes.
+        self.normalize_endpoint(local_endpoint, false)?;
         self.with_new_handle_capacity(|| self.bind_once(local_endpoint))
     }
 
     fn bind_once(&self, local_endpoint: smoltcp::wire::IpEndpoint) -> Result<(), SystemError> {
         let reserved = self.prepare_bound_slot()?;
         let mut writer = self.inner.write();
+        if !matches!(
+            writer.as_ref(),
+            Some(inner::Inner::Init(inner::Init::Unbound(_)))
+        ) {
+            return Err(SystemError::EINVAL);
+        }
         let local_endpoint = self.normalize_endpoint(local_endpoint, false)?;
         let v6_only = self
             .options

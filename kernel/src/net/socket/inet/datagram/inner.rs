@@ -334,7 +334,11 @@ impl BoundUdp {
         let connection = *self.connection.lock();
         let filter = smoltcp::socket::udp::ReceiveFilter {
             remote: connection.map(|peer| peer.remote),
-            local_address: connection.and_then(|peer| peer.source),
+            local_address: self
+                .endpoint()
+                .addr
+                .filter(|address| !address.is_unspecified())
+                .or_else(|| connection.and_then(|peer| peer.source)),
             bound_device: core::num::NonZeroU32::new(bound_ifindex as u32),
             ingress_ifindex: self.inner.iface().nic_id() as u32,
         };

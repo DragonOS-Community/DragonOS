@@ -1249,6 +1249,13 @@ impl UdpSocket {
 
     pub fn try_send(&self, buf: &[u8], to: Option<IpEndpoint>) -> Result<usize, SystemError> {
         self.take_socket_error()?;
+        // Validate the supplied family before mapped-v4 normalization. Only
+        // AF_INET6 sockets may use an IPv6 sockaddr, including mapped addresses.
+        if self.ip_version == IpVersion::Ipv4
+            && to.is_some_and(|destination| matches!(destination.addr, Ipv6(_)))
+        {
+            return Err(SystemError::EAFNOSUPPORT);
+        }
         if to.is_some_and(|destination| destination.port == 0) {
             return Err(SystemError::EINVAL);
         }

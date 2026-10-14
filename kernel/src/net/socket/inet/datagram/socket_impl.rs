@@ -14,6 +14,20 @@ impl UdpSocket {
 }
 
 impl Socket for UdpSocket {
+    fn validate_sendto_addr(&self, addr: *const SockAddr, addrlen: u32) -> Result<(), SystemError> {
+        if self.ip_version == IpVersion::Ipv4 && !addr.is_null() {
+            // The generic decoder normalizes mapped-v4 addresses. Validate
+            // the original family through its protected user-buffer reader.
+            if matches!(
+                SockAddr::to_endpoint_preserving_mapped(addr, addrlen)?,
+                Endpoint::Ip(IpEndpoint { addr: Ipv6(_), .. })
+            ) {
+                return Err(SystemError::EAFNOSUPPORT);
+            }
+        }
+        Ok(())
+    }
+
     fn netns(&self) -> Arc<crate::process::namespace::net_namespace::NetNamespace> {
         UdpSocket::netns(self)
     }

@@ -555,6 +555,73 @@ TEST(UdpDisconnectAncillary, OriginalDestinationSurvivesDisconnectAndDifferentPo
     ASSERT_NO_FATAL_FAILURE(receive_original(false));
 }
 
+TEST(UdpSendAddressFamily, IPv4RejectsIPv6Destination) {
+    for (bool mapped : {false, true}) {
+        for (bool use_sendmsg : {false, true}) {
+            for (uint16_t port : {uint16_t(0), uint16_t(12345)}) {
+                SCOPED_TRACE(testing::Message() << "mapped=" << mapped
+                    << " sendmsg=" << use_sendmsg << " port=" << port);
+                Fd sender(socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0));
+                ASSERT_GE(sender.get(), 0);
+                sockaddr_in6 destination {};
+                destination.sin6_family = AF_INET6;
+                destination.sin6_port = htons(port);
+                ASSERT_EQ(inet_pton(AF_INET6, mapped ? "::ffff:127.0.0.1" : "::1",
+                                    &destination.sin6_addr), 1);
+                char payload = 'x';
+                iovec vector {&payload, sizeof(payload)};
+                msghdr message {};
+                message.msg_name = &destination;
+                message.msg_namelen = sizeof(destination);
+                message.msg_iov = &vector;
+                message.msg_iovlen = 1;
+                errno = 0;
+                const ssize_t result = use_sendmsg
+                    ? sendmsg(sender.get(), &message, 0)
+                    : sendto(sender.get(), &payload, sizeof(payload), 0,
+                             reinterpret_cast<sockaddr*>(&destination), sizeof(destination));
+                EXPECT_EQ(result, -1);
+                EXPECT_EQ(errno, EAFNOSUPPORT);
+                sockaddr_in local {};
+                socklen_t length = sizeof(local);
+                ASSERT_EQ(getsockname(sender.get(), reinterpret_cast<sockaddr*>(&local),
+                                      &length), 0);
+                EXPECT_EQ(local.sin_family, AF_INET);
+                EXPECT_EQ(local.sin_addr.s_addr, htonl(INADDR_ANY));
+            }
+        }
+    }
+}
+
+TEST(UdpReceiveAddressBinding, ExplicitUnicastBindRejectsBroadcast) {
+    Fd receiver(socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0));
+    Fd sender(socket(AF_INET, SOCK_DGRAM, 0));
+    ASSERT_GE(receiver.get(), 0);
+    ASSERT_GE(sender.get(), 0);
+    sockaddr_in local {};
+    local.sin_family = AF_INET;
+    local.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    ASSERT_EQ(bind(receiver.get(), reinterpret_cast<sockaddr*>(&local), sizeof(local)), 0);
+    socklen_t length = sizeof(local);
+    ASSERT_EQ(getsockname(receiver.get(), reinterpret_cast<sockaddr*>(&local), &length), 0);
+    int enabled = 1;
+    ASSERT_EQ(setsockopt(sender.get(), SOL_SOCKET, SO_BROADCAST, &enabled, sizeof(enabled)), 0);
+    sockaddr_in broadcast = local;
+    ASSERT_EQ(inet_pton(AF_INET, "127.255.255.255", &broadcast.sin_addr), 1);
+    ASSERT_EQ(sendto(sender.get(), "B", 1, 0, reinterpret_cast<sockaddr*>(&broadcast),
+                     sizeof(broadcast)), 1) << std::strerror(errno);
+    pollfd ready {receiver.get(), POLLIN, 0};
+    EXPECT_EQ(poll(&ready, 1, 100), 0);
+    ASSERT_EQ(sendto(sender.get(), "U", 1, 0, reinterpret_cast<sockaddr*>(&local),
+                     sizeof(local)), 1) << std::strerror(errno);
+    ASSERT_EQ(poll(&ready, 1, 2000), 1);
+    char payload = 0;
+    ASSERT_EQ(recv(receiver.get(), &payload, 1, MSG_DONTWAIT), 1);
+    EXPECT_EQ(payload, 'U');
+    EXPECT_EQ(recv(receiver.get(), &payload, 1, MSG_DONTWAIT), -1);
+    EXPECT_EQ(errno, EAGAIN);
+}
+
 INSTANTIATE_TEST_SUITE_P(IpFamilies, UdpDisconnectSemantics,
     testing::Values(AF_INET, AF_INET6), [](const testing::TestParamInfo<int>& info) {
         return info.param == AF_INET ? "IPv4" : "IPv6";

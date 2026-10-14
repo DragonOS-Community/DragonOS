@@ -3,7 +3,6 @@ use system_error::SystemError;
 use super::socket_fd::SocketFdRef;
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_BIND;
-use crate::mm::VirtAddr;
 use crate::net::posix::SockAddr;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
 use alloc::string::ToString;
@@ -34,18 +33,10 @@ impl Syscall for SysBindHandle {
     /// # Returns
     /// * `Ok(usize)` - 0 on success
     /// * `Err(SystemError)` - Error code if operation fails
-    fn handle(&self, args: &[usize], frame: &mut TrapFrame) -> Result<usize, SystemError> {
+    fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let fd = Self::fd(args);
         let addr = Self::addr(args);
         let addrlen = Self::addrlen(args);
-
-        // Verify address validity if from user space
-        if frame.is_from_user() {
-            let virt_addr = VirtAddr::new(addr as usize);
-            if crate::mm::access_ok(virt_addr, addrlen).is_err() {
-                return Err(SystemError::EFAULT);
-            }
-        }
 
         do_bind(fd, addr, addrlen as u32)
     }
@@ -102,7 +93,7 @@ pub(super) fn do_bind(
 ) -> Result<usize, SystemError> {
     let sock = SocketFdRef::from_fd(fd as i32)?;
     let socket = sock.socket()?;
-    let endpoint = socket.endpoint_from_user(addr, addrlen)?;
+    let endpoint = socket.bind_endpoint_from_user(addr, addrlen)?;
     socket.bind(endpoint)?;
     Ok(0)
 }

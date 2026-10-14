@@ -5,6 +5,7 @@ use crate::{
 };
 use alloc::sync::{Arc, Weak};
 
+pub(crate) mod bind;
 pub(crate) mod error_queue;
 pub(crate) mod pmtu;
 pub mod port;

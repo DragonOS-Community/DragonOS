@@ -107,6 +107,16 @@ pub trait Socket: PollableInode + IndexNode {
         crate::net::posix::SockAddr::to_endpoint(addr, len)
     }
 
+    /// Bind may interpret a sockaddr differently from connect. Keep existing
+    /// protocol decoders by default, including overrides preserving mapped IPs.
+    fn bind_endpoint_from_user(
+        &self,
+        addr: *const crate::net::posix::SockAddr,
+        len: u32,
+    ) -> Result<Endpoint, SystemError> {
+        self.endpoint_from_user(addr, len)
+    }
+
     /// # `close`
     /// 关闭socket
     fn do_close(&self) -> Result<(), SystemError>;

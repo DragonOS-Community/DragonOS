@@ -693,6 +693,57 @@ TEST_F(Freezer, EventsInotifyAndEpollReportFreezeCompletion) {
   Frozen(root_, true);
 }
 
+TEST_F(Freezer, RemovedDomainEventsDescriptorReportsOffline) {
+  std::string child = Make(root_ + "/removed");
+  ASSERT_FALSE(HasFatalFailure());
+  ScopedFd file(open((child + "/cgroup.events").c_str(), O_RDONLY | O_CLOEXEC));
+  ScopedFd epoll(epoll_create1(EPOLL_CLOEXEC));
+  ASSERT_GE(file.value, 0);
+  ASSERT_GE(epoll.value, 0);
+  char bytes[128];
+  ASSERT_GT(read(file.value, bytes, sizeof(bytes)), 0);
+  epoll_event entry{};
+  entry.events = EPOLLPRI;
+  entry.data.fd = file.value;
+  ASSERT_EQ(0, epoll_ctl(epoll.value, EPOLL_CTL_ADD, file.value, &entry));
+  epoll_event result{};
+  ASSERT_EQ(0, epoll_wait(epoll.value, &result, 1, 0));
+  ASSERT_EQ(0, rmdir(child.c_str()));
+  dirs_.pop_back();
+  // Linux does not notify an already sleeping epoll observer on removal.
+  // A fresh poll revalidates the retained descriptor and sees it offline.
+  pollfd probe{file.value, POLLPRI, 0};
+  ASSERT_EQ(1, poll(&probe, 1, 0));
+  EXPECT_NE(0, probe.revents & POLLPRI);
+  EXPECT_NE(0, probe.revents & POLLERR);
+  EXPECT_EQ(-1, read(file.value, bytes, sizeof(bytes)));
+  EXPECT_EQ(ENODEV, errno);
+}
+
+TEST_F(Freezer, RemovedThreadedEventsDescriptorReportsOffline) {
+  ASSERT_EQ(0, Write(root_ + "/cgroup.type", "threaded"));
+  ScopedFd file(open((root_ + "/cgroup.events").c_str(), O_RDONLY | O_CLOEXEC));
+  ScopedFd epoll(epoll_create1(EPOLL_CLOEXEC));
+  ASSERT_GE(file.value, 0);
+  ASSERT_GE(epoll.value, 0);
+  char bytes[128];
+  ASSERT_GT(read(file.value, bytes, sizeof(bytes)), 0);
+  epoll_event entry{};
+  entry.events = EPOLLPRI;
+  entry.data.fd = file.value;
+  ASSERT_EQ(0, epoll_ctl(epoll.value, EPOLL_CTL_ADD, file.value, &entry));
+  epoll_event result{};
+  ASSERT_EQ(0, epoll_wait(epoll.value, &result, 1, 0));
+  ASSERT_EQ(0, rmdir(root_.c_str()));
+  dirs_.pop_back();
+  pollfd probe{file.value, POLLPRI, 0};
+  ASSERT_EQ(1, poll(&probe, 1, 0));
+  EXPECT_NE(0, probe.revents & POLLPRI);
+  EXPECT_NE(0, probe.revents & POLLERR);
+  EXPECT_EQ(-1, read(file.value, bytes, sizeof(bytes)));
+  EXPECT_EQ(ENODEV, errno);
+}
+
 uint64_t CpuTicks(pid_t task) {
   std::string status = Read("/proc/" + std::to_string(task) + "/stat");
   size_t close = status.rfind(')');

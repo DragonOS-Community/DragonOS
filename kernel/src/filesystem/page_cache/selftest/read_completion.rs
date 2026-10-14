@@ -127,7 +127,10 @@ pub(super) fn run() -> Result<bool, SystemError> {
     }));
     if gate
         .wait
-        .wait_until_timeout(|| gate.started.load(Ordering::Acquire).then_some(()), TIMEOUT)
+        .wait_until_timeout(
+            || gate.started.load(Ordering::Acquire).then_some(()),
+            TIMEOUT,
+        )
         .is_err()
     {
         return Ok(false);
@@ -163,10 +166,24 @@ pub(super) fn run() -> Result<bool, SystemError> {
             && short_read_valid(&batch_good)
             && single_error.state() == PageState::Error
             && batch_error.state() == PageState::Error
-            && single_error.page.read().flags().contains(PageFlags::PG_ERROR)
-            && batch_error.page.read().flags().contains(PageFlags::PG_ERROR)
-            && single_backend.calls.iter().all(|call| call.load(Ordering::Acquire) == 1)
-            && batch_backend.calls.iter().all(|call| call.load(Ordering::Acquire) == 1)
+            && single_error
+                .page
+                .read()
+                .flags()
+                .contains(PageFlags::PG_ERROR)
+            && batch_error
+                .page
+                .read()
+                .flags()
+                .contains(PageFlags::PG_ERROR)
+            && single_backend
+                .calls
+                .iter()
+                .all(|call| call.load(Ordering::Acquire) == 1)
+            && batch_backend
+                .calls
+                .iter()
+                .all(|call| call.load(Ordering::Acquire) == 1)
             && !gate.release.load(Ordering::Acquire))
     })();
     // Release even on failure before dropping caches: old kernels can still
@@ -175,7 +192,10 @@ pub(super) fn run() -> Result<bool, SystemError> {
     drop(release);
     let released = gate
         .wait
-        .wait_until_timeout(|| gate.finished.load(Ordering::Acquire).then_some(()), TIMEOUT)
+        .wait_until_timeout(
+            || gate.finished.load(Ordering::Acquire).then_some(()),
+            TIMEOUT,
+        )
         .is_ok();
     drop(single);
     drop(batch);

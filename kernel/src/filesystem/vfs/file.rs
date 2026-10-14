@@ -2831,6 +2831,7 @@ impl File {
 
     fn read_dir_impl(&self, ctx: &mut FilldirContext) -> Result<(), SystemError> {
         let inode: &Arc<dyn IndexNode> = &self.inode;
+        inode.before_read_dir()?;
         // POSIX 标准要求readdir应该返回. 和 ..
         // 但是观察到在现有的子目录中已经包含，不做处理也能正常返回. 和 .. 这里先不做处理
 

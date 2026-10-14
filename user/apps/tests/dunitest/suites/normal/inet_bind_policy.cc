@@ -8,11 +8,13 @@
 #include <net/if.h>
 #include <sched.h>
 #include <sys/ioctl.h>
+#include <sys/mount.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #include <functional>
+#include <chrono>
 #include <string>
 #include <thread>
 
@@ -84,6 +86,7 @@ void InNamespace(const std::function<void()>& test, uid_t initial_uid = 0) {
     if (control.get() < 0 || ioctl(control.get(), SIOCGIFFLAGS, &request) != 0) _exit(3);
     request.ifr_flags |= IFF_UP;
     if (ioctl(control.get(), SIOCSIFFLAGS, &request) != 0) _exit(4);
+    control.reset();
     test();
     _exit(testing::Test::HasFailure() ? 1 : 0);
   }
@@ -239,6 +242,105 @@ TEST(InetBindPolicy, OldSysctlFdAndSocketRemainInTheirNetworkNamespace) {
     EXPECT_EQ(Bind(new_socket.get(), AF_INET, 80), 0);
   });
 }
+TEST(InetBindPolicy, RetainedSysctlDirectoryUsesOriginalNamespace) {
+  InNamespace([] {
+    // A real socket keeps A's sysctl table registered after switching to B.
+    Fd namespace_owner(socket(AF_INET, SOCK_DGRAM, 0));
+    ASSERT_GE(namespace_owner.get(), 0);
+    ASSERT_EQ(Write(kStart, "2048\n"), 0);
+    Fd directory(open("/proc/sys/net/ipv4", O_RDONLY | O_DIRECTORY));
+    Fd path_directory(open("/proc/sys/net/ipv4", O_PATH | O_DIRECTORY));
+    ASSERT_GE(directory.get(), 0);
+    ASSERT_GE(path_directory.get(), 0);
+    ASSERT_EQ(unshare(CLONE_NEWNET), 0);
+    ASSERT_EQ(Write(kStart, "0\n"), 0);
+    ASSERT_EQ(Write("/proc/sys/net/ipv4/ip_forward", "0\n"), 0);
+    Fd retained(openat(directory.get(), "ip_unprivileged_port_start", O_RDWR));
+    ASSERT_GE(retained.get(), 0);
+    EXPECT_EQ(ReadFd(retained.get()), "2048\n");
+    ASSERT_EQ(WriteFd(retained.get(), "4096\n"), 0);
+    EXPECT_EQ(Read(kStart), "0\n");
+    Fd path_file(openat(path_directory.get(), "ip_unprivileged_port_start", O_RDONLY));
+    ASSERT_GE(path_file.get(), 0);
+    EXPECT_EQ(ReadFd(path_file.get()), "4096\n");
+    Fd old_range(openat(directory.get(), "ip_local_port_range", O_RDWR));
+    ASSERT_GE(old_range.get(), 0);
+    ASSERT_EQ(WriteFd(old_range.get(), "5000 5010\n"), 0);
+    EXPECT_EQ(Read(kRange), "32768\t60999\n");
+    Fd old_forward(openat(directory.get(), "ip_forward", O_RDWR));
+    ASSERT_GE(old_forward.get(), 0);
+    ASSERT_EQ(WriteFd(old_forward.get(), "1\n"), 0);
+    EXPECT_EQ(ReadFd(old_forward.get()), "1\n");
+    EXPECT_EQ(Read("/proc/sys/net/ipv4/ip_forward"), "0\n");
+    ASSERT_EQ(fchdir(directory.get()), 0);
+    EXPECT_EQ(Read("ip_unprivileged_port_start"), "4096\n");
+  });
+}
+TEST(InetBindPolicy, BindMountedSysctlDirectoryKeepsNamespace) {
+  InNamespace([] {
+    Fd namespace_owner(socket(AF_INET, SOCK_DGRAM, 0));
+    ASSERT_GE(namespace_owner.get(), 0);
+    ASSERT_EQ(unshare(CLONE_NEWNS), 0);
+    char path[] = "/tmp/dkc091-dir-XXXXXX";
+    ASSERT_NE(mkdtemp(path), nullptr);
+    struct Cleanup {
+      const char* path;
+      bool mounted = false;
+      ~Cleanup() { if (mounted) umount2(path, MNT_DETACH); rmdir(path); }
+    } cleanup { path };
+    ASSERT_EQ(Write(kStart, "2048\n"), 0);
+    ASSERT_EQ(mount("/proc/sys/net/ipv4", path, nullptr, MS_BIND, nullptr), 0);
+    cleanup.mounted = true;
+    ASSERT_EQ(unshare(CLONE_NEWNET), 0);
+    ASSERT_EQ(Write(kStart, "0\n"), 0);
+    const std::string retained = std::string(path) + "/ip_unprivileged_port_start";
+    EXPECT_EQ(Read(retained.c_str()), "2048\n");
+    ASSERT_EQ(Write(retained.c_str(), "4096\n"), 0);
+    EXPECT_EQ(Read(kStart), "0\n");
+  });
+}
+TEST(InetBindPolicy, ExpiredDirectoryNeverFallsBackToCurrentNamespace) {
+  InNamespace([] {
+    ASSERT_EQ(Write(kStart, "2048\n"), 0);
+    Fd directory(open("/proc/sys/net/ipv4", O_RDONLY | O_DIRECTORY));
+    ASSERT_GE(directory.get(), 0);
+    char entries[1024];
+    // Read just the first entry, leaving the VFS iteration snapshot active.
+    ASSERT_EQ(syscall(SYS_getdents64, directory.get(), entries, 24), 24);
+    ASSERT_EQ(unshare(CLONE_NEWNET), 0);
+    ASSERT_EQ(Write(kStart, "0\n"), 0);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    // Linux unregisters a dying netns asynchronously. Cached directory/table
+    // references do not make it immortal, nor may they select B instead.
+    do {
+      {
+        Fd file(openat(directory.get(), "ip_unprivileged_port_start", O_RDONLY));
+        if (file.get() < 0) {
+          EXPECT_EQ(errno, ENOENT);
+          // Leaf and parent tables can retire at different times. Continue
+          // the cached iteration, including EOF, until the parent is gone;
+          // do not rebuild the snapshot to make this assertion pass.
+          do {
+            const long count = syscall(SYS_getdents64, directory.get(), entries, sizeof(entries));
+            if (count < 0) {
+              EXPECT_EQ(errno, ENOENT);
+              ASSERT_EQ(lseek(directory.get(), 0, SEEK_SET), 0);
+              EXPECT_EQ(syscall(SYS_getdents64, directory.get(), entries, sizeof(entries)), -1);
+              EXPECT_EQ(errno, ENOENT);
+              return;
+            }
+            usleep(1000);
+          } while (std::chrono::steady_clock::now() < deadline);
+          FAIL() << "cached iteration ignored namespace retirement";
+          return;
+        }
+        EXPECT_EQ(ReadFd(file.get()), "2048\n");
+      }
+      usleep(1000);
+    } while (std::chrono::steady_clock::now() < deadline);
+    FAIL() << "expired namespace directory stayed alive";
+  });
+}
 TEST(InetBindPolicy, ChildUserNamespaceCannotAuthorizeAncestorSocket) {
   InNamespace([] {
     Fd fd(socket(AF_INET, SOCK_DGRAM, 0));
@@ -312,10 +414,14 @@ TEST(InetBindPolicy, SysctlRechecksCapabilityRatherThanMappedRootOrOpener) {
   InNamespace([] {
     EXPECT_EQ(geteuid(), 0u);
     Fd fd(open(kStart, O_RDWR));
+    Fd forward(open("/proc/sys/net/ipv4/ip_forward", O_RDWR));
     ASSERT_GE(fd.get(), 0);
+    ASSERT_GE(forward.get(), 0);
     ASSERT_EQ(WriteFd(fd.get(), "2048\n"), 0);
+    ASSERT_EQ(WriteFd(forward.get(), "1\n"), 0);
     ASSERT_NO_FATAL_FAILURE(EffectiveCapability(CAP_NET_ADMIN, false));
     EXPECT_EQ(WriteFd(fd.get(), "0\n"), EPERM);
+    EXPECT_EQ(WriteFd(forward.get(), "0\n"), EPERM);
     EXPECT_EQ(syscall(SYS_faccessat2, AT_FDCWD, kStart, W_OK, AT_EACCESS), -1);
     EXPECT_EQ(errno, EACCES);
     Fd denied(open(kStart, O_WRONLY));
@@ -330,6 +436,7 @@ TEST(InetBindPolicy, GlobalRootSysctlModeDoesNotRequireNetAdmin) {
   InNamespace([] {
     ASSERT_NO_FATAL_FAILURE(EffectiveCapability(CAP_NET_ADMIN, false));
     ASSERT_EQ(Write(kStart, "0\n"), 0);
+    EXPECT_EQ(Write("/proc/sys/net/ipv4/ip_forward", "1\n"), EPERM);
     EXPECT_EQ(Read(kStart), "0\n");
   });
 }

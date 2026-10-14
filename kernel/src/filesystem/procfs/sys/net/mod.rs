@@ -26,6 +26,12 @@ impl NetDirOps {
 }
 
 impl DirOps for NetDirOps {
+    fn validate_child(&self, child: &dyn IndexNode) -> bool {
+        child
+            .as_any_ref()
+            .downcast_ref::<ProcDir<Ipv4DirOps>>()
+            .is_none_or(|inode| inode.ops().is_current())
+    }
     fn lookup_child(
         &self,
         dir: &ProcDir<Self>,
@@ -34,7 +40,9 @@ impl DirOps for NetDirOps {
         if name == "ipv4" {
             let mut cached_children = dir.cached_children().write();
             if let Some(child) = cached_children.get(name) {
-                return Ok(child.clone());
+                if self.validate_child(child.as_ref()) {
+                    return Ok(child.clone());
+                }
             }
 
             let inode = Ipv4DirOps::new_inode(dir.self_ref_weak().clone());
@@ -57,12 +65,8 @@ impl DirOps for NetDirOps {
     }
 
     fn populate_children(&self, dir: &ProcDir<Self>) {
-        let mut cached_children = dir.cached_children().write();
-        cached_children
-            .entry("ipv4".to_string())
-            .or_insert_with(|| Ipv4DirOps::new_inode(dir.self_ref_weak().clone()));
-        cached_children
-            .entry("ipv6".to_string())
-            .or_insert_with(|| Ipv6DirOps::new_inode(dir.self_ref_weak().clone()));
+        for name in ["ipv4", "ipv6"] {
+            let _ = self.lookup_child(dir, name);
+        }
     }
 }

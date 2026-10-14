@@ -96,6 +96,9 @@ impl<Ops: DirOps> ProcDir<Ops> {
 
 #[inherit_methods(from = "self.common")]
 impl<Ops: DirOps + 'static> IndexNode for ProcDir<Ops> {
+    fn before_read_dir(&self) -> Result<(), SystemError> {
+        self.inner.before_read_dir()
+    }
     fn fs(&self) -> Arc<dyn FileSystem>;
     fn set_metadata(
         &self,
@@ -150,6 +153,7 @@ impl<Ops: DirOps + 'static> IndexNode for ProcDir<Ops> {
     }
 
     fn list(&self) -> Result<Vec<String>, SystemError> {
+        self.inner.before_read_dir()?;
         let mut keys = Vec::new();
         keys.push(String::from("."));
         keys.push(String::from(".."));
@@ -263,6 +267,11 @@ impl<Ops: DirOps + 'static> IndexNode for ProcDir<Ops> {
 }
 
 pub trait DirOps: Sync + Send + Sized + Debug {
+    /// Reject enumeration of a directory whose dynamic backing table is gone.
+    /// This also runs before emitting dot entries from the cached directory.
+    fn before_read_dir(&self) -> Result<(), SystemError> {
+        Ok(())
+    }
     fn check_dac_permission(
         &self,
         metadata: &Metadata,

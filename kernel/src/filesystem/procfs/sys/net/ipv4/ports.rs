@@ -7,6 +7,7 @@ use alloc::{
 use system_error::SystemError;
 
 use super::super::super::numeric::parse_numeric_sysctl_values;
+use super::namespace::SysctlNamespace;
 use crate::{
     filesystem::{
         procfs::{
@@ -16,14 +17,6 @@ use crate::{
         vfs::{file::FileFlags, FilePrivateData, IndexNode, InodeMode},
     },
     libs::mutex::MutexGuard,
-    process::{
-        cred::{ns_capable, CAPFlags},
-        namespace::{
-            net_namespace::NetNamespace,
-            user_namespace::{make_kgid, make_kuid},
-        },
-        ProcessManager,
-    },
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -45,17 +38,17 @@ impl PortSysctl {
 #[derive(Debug)]
 pub(super) struct PortFileOps {
     kind: PortSysctl,
-    // Cached inodes must not retain a namespace after its last real owner.
-    netns: Weak<NetNamespace>,
+    namespace: SysctlNamespace,
 }
 
 impl PortFileOps {
-    pub(super) fn new_inode(kind: PortSysctl, parent: Weak<dyn IndexNode>) -> Arc<dyn IndexNode> {
+    pub(super) fn new_inode(
+        kind: PortSysctl,
+        parent: Weak<dyn IndexNode>,
+        namespace: SysctlNamespace,
+    ) -> Arc<dyn IndexNode> {
         ProcFileBuilder::new(
-            Self {
-                kind,
-                netns: Arc::downgrade(&ProcessManager::current_netns()),
-            },
+            Self { kind, namespace },
             InodeMode::from_bits_truncate(0o644),
         )
         .parent(parent)
@@ -63,42 +56,15 @@ impl PortFileOps {
         .build()
         .unwrap()
     }
-
-    pub(super) fn is_current(&self) -> bool {
-        self.netns
-            .upgrade()
-            .is_some_and(|ns| Arc::ptr_eq(&ns, &ProcessManager::current_netns()))
-    }
-
-    fn access_bits(netns: &Arc<NetNamespace>) -> u32 {
-        if ProcessManager::current_pcb().cred().euid.data() == 0
-            || ns_capable(netns.user_ns(), CAPFlags::CAP_NET_ADMIN)
-        {
-            6
-        } else {
-            4
-        }
-    }
-
-    fn fd_netns(data: &FilePrivateData) -> Result<&Arc<NetNamespace>, SystemError> {
-        match data {
-            FilePrivateData::Procfs(data) => data.net_ns.as_ref().ok_or(SystemError::ENOENT),
-            _ => Err(SystemError::EINVAL),
-        }
-    }
 }
 
 impl FileOps for PortFileOps {
-    fn sysctl_access_bits(&self) -> Option<u32> {
-        Some(self.netns.upgrade().map_or(0, |ns| Self::access_bits(&ns)))
+    fn sysctl_access_bits(&self) -> Result<Option<u32>, SystemError> {
+        self.namespace.access_bits().map(Some)
     }
 
     fn owner(&self) -> Option<(usize, usize)> {
-        let ns = self.netns.upgrade()?;
-        let user_ns = ns.user_ns();
-        let uid = make_kuid(user_ns, 0).map_or(0, |uid| uid.data());
-        let gid = make_kgid(user_ns, 0).map_or(0, |gid| gid.data());
-        Some((uid, gid))
+        self.namespace.owner()
     }
 
     fn open(
@@ -106,12 +72,7 @@ impl FileOps for PortFileOps {
         data: &mut MutexGuard<FilePrivateData>,
         _flags: &FileFlags,
     ) -> Result<(), SystemError> {
-        let ns = self.netns.upgrade().ok_or(SystemError::ENOENT)?;
-        let FilePrivateData::Procfs(data) = &mut **data else {
-            return Err(SystemError::EINVAL);
-        };
-        data.net_ns = Some(ns);
-        Ok(())
+        self.namespace.open(data)
     }
 
     fn read_at(
@@ -124,7 +85,7 @@ impl FileOps for PortFileOps {
         if offset != 0 {
             return Ok(0);
         }
-        let ns = Self::fd_netns(&data)?;
+        let ns = SysctlNamespace::opened(&data)?;
         let text = match self.kind {
             PortSysctl::LocalRange => {
                 let (min, max) = ns.local_port_range();
@@ -142,8 +103,8 @@ impl FileOps for PortFileOps {
         buf: &[u8],
         data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        let ns = Self::fd_netns(&data)?;
-        if Self::access_bits(ns) & 2 == 0 {
+        let ns = SysctlNamespace::opened(&data)?;
+        if SysctlNamespace::access_bits_for(ns) & 2 == 0 {
             return Err(SystemError::EPERM);
         }
         if buf.is_empty() {

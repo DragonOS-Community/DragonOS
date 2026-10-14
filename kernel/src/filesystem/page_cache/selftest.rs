@@ -1,6 +1,8 @@
 use super::*;
 use crate::arch::mm::LockedFrameAllocator;
 
+mod read_completion;
+
 static PAGECACHE_COMPLETION_SELFTEST_RUNNING: AtomicBool = AtomicBool::new(false);
 static PAGECACHE_ACCOUNTING_SELFTEST_RUNNING: AtomicBool = AtomicBool::new(false);
 
@@ -1254,8 +1256,12 @@ pub(crate) fn run_completion_domain_debug_selftest() -> Result<alloc::string::St
         ));
     }
 
+    if !read_completion::run()? {
+        return Ok("status=fail stage=global_worker_read_completion\n".into());
+    }
+
     Ok(alloc::format!(
-        "status=ok generic_waiters={} completion_domain=independent\n",
+        "status=ok generic_waiters={} completion_domain=independent\nglobal_worker_read_completion=ok\n",
         PAGECACHE_IO_WORKERS
     ))
 }

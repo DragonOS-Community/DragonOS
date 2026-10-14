@@ -1,7 +1,8 @@
 use super::{
-    schedule_work, Arc, AtomicUsize, MMArch, MemoryAccount, MemoryAllocationError,
+    schedule_read_completion, Arc, AtomicUsize, Box, MMArch, MemoryAccount, MemoryAllocationError,
     MemoryManagementArch, ObjectAccount, Ordering, Page, PageCache, PageCacheBackend,
-    PageCacheDomainIoPermit, PageEntry, PageFlags, PageState, SystemError, Vec, Work,
+    PageCacheDomainIoPermit, PageEntry, PageFlags, PageIoWaiter, PageState, SpinLock, SystemError,
+    Vec, Work,
 };
 
 /// Stable bounds passed to one backend submission. `valid_bytes` is relative
@@ -209,6 +210,24 @@ impl PageCacheReadBatchCompletion {
         self.inner.unfinished.load(Ordering::Acquire)
     }
 
+    /// Publish an already completed read into the reserved page. No source
+    /// I/O or waiter consumption is permitted on the completion queue.
+    fn complete_read_page(&self, slot_index: usize, len: usize) -> Result<(), SystemError> {
+        if len > MMArch::PAGE_SIZE {
+            return self.complete_error(slot_index, 1, SystemError::EIO);
+        }
+        self.validate_range(slot_index, 1)?;
+        let slot = &self.inner.slots[slot_index];
+        Self::claim(slot)?;
+        {
+            let mut page = slot.page.write();
+            unsafe { page.as_slice_mut()[len..].fill(0) };
+            page.add_flags(PageFlags::PG_UPTODATE);
+        }
+        self.publish_ready(slot);
+        Ok(())
+    }
+
     fn complete_one_data(
         &self,
         slot_index: usize,
@@ -354,23 +373,53 @@ pub(super) fn submit_default_read_batch<B: PageCacheBackend + ?Sized + 'static>(
     request: PageCacheReadBatchRequest,
     completion: PageCacheReadBatchCompletion,
 ) {
-    let work = Work::new(move || {
-        for offset in 0..request.page_count {
-            let mut payload = [0u8; MMArch::PAGE_SIZE];
-            let page_index = request.start_index + offset;
-            match backend.read_page(page_index, &mut payload) {
-                Ok(len) if len <= MMArch::PAGE_SIZE => {
-                    let valid = if len == 0 { MMArch::PAGE_SIZE } else { len };
-                    let _ = completion.complete_data(offset, 1, &payload, valid);
+    if request.page_count != completion.inner.slots.len() {
+        let _ = completion.complete_error(0, completion.inner.slots.len(), SystemError::EIO);
+        return;
+    }
+    let mut waiters = Vec::new();
+    if waiters.try_reserve_exact(request.page_count).is_err() {
+        let _ = completion.complete_error(0, request.page_count, SystemError::ENOMEM);
+        return;
+    }
+    // Prepare every terminal owner before starting any source read. The batch
+    // permit remains alive through the last publication, not just submission.
+    for offset in 0..request.page_count {
+        let owner = PageCacheReadBatchCompletion {
+            inner: completion.inner.clone(),
+        };
+        let result = Arc::new(SpinLock::new(None));
+        let work_result = result.clone();
+        let work = Work::new(move || {
+            let result = work_result.lock_irqsave().take();
+            match result {
+                Some(Ok(len)) => {
+                    let _ = owner.complete_read_page(offset, len);
                 }
-                Ok(_) => {
-                    let _ = completion.complete_error(offset, 1, SystemError::EIO);
+                Some(Err(error)) => {
+                    let _ = owner.complete_error(offset, 1, error);
                 }
-                Err(error) => {
-                    let _ = completion.complete_error(offset, 1, error);
+                None => {
+                    let _ = owner.complete_error(offset, 1, SystemError::EIO);
                 }
             }
+        });
+        let waiter = PageIoWaiter::new();
+        let registered = waiter.register_terminal(Box::new(move |read_result| {
+            *result.lock_irqsave() = Some(read_result);
+            schedule_read_completion(work);
+        }));
+        if let Err(error) = registered {
+            let _ = completion.complete_error(0, request.page_count, error);
+            return;
         }
-    });
-    schedule_work(work);
+        waiters.push(waiter);
+    }
+    for (offset, waiter) in waiters.iter().enumerate() {
+        backend.read_page_async(
+            request.start_index + offset,
+            &completion.inner.slots[offset].page,
+            waiter,
+        );
+    }
 }

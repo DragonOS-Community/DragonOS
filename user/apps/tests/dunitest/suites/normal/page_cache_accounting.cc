@@ -169,6 +169,17 @@ TEST(PageCacheAccounting, ConcurrentOpenCloseUsesOneTmpfsDentrySafely) {
     EXPECT_EQ(0, unlink(path.c_str())) << strerror(errno);
 }
 
+TEST(PageCacheCompletion, ReadPublicationProgressesWhileGlobalWorkerIsBlocked) {
+    // Repeat to verify every gate is released and no terminal work or global
+    // selftest-running state leaks into the next invocation.
+    for (int repeat = 0; repeat < 2; ++repeat) {
+        const std::string report = ReadAll("/sys/kernel/debug/page_cache/completion_domain_selftest");
+        ASSERT_NE(std::string::npos, report.find("status=ok ")) << report;
+        EXPECT_NE(std::string::npos, report.find("completion_domain=independent\n")) << report;
+        EXPECT_NE(std::string::npos, report.find("global_worker_read_completion=ok\n")) << report;
+    }
+}
+
 int main(int argc, char** argv) {
     ::testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();

@@ -977,15 +977,13 @@ pub trait PageCacheBackend: Send + Sync + core::fmt::Debug + 'static {
         Ok(PageCacheWritebackBindResult::Legacy)
     }
 
-    fn read_page_async(&self, index: usize, page: &Arc<Page>) -> Arc<PageIoWaiter> {
-        let waiter = PageIoWaiter::new();
+    fn read_page_async(&self, index: usize, page: &Arc<Page>, waiter: &Arc<PageIoWaiter>) {
         let result = {
             let mut guard = page.write();
             let dst = unsafe { guard.as_slice_mut() };
             self.read_page(index, dst)
         };
         waiter.complete(result);
-        waiter
     }
 
     fn write_page_async(&self, index: usize, page: &Arc<Page>, len: usize) -> Arc<PageIoWaiter> {
@@ -1072,8 +1070,7 @@ impl PageCacheBackend for AsyncPageCacheBackend {
         }
     }
 
-    fn read_page_async(&self, index: usize, page: &Arc<Page>) -> Arc<PageIoWaiter> {
-        let waiter = PageIoWaiter::new();
+    fn read_page_async(&self, index: usize, page: &Arc<Page>, waiter: &Arc<PageIoWaiter>) {
         let inode = self.inode.clone();
         let page = page.clone();
         let waiter_cb = waiter.clone();
@@ -1091,7 +1088,6 @@ impl PageCacheBackend for AsyncPageCacheBackend {
             waiter_cb.complete(res);
         });
         schedule_pagecache_io(work);
-        waiter
     }
 
     fn write_page_async(&self, index: usize, page: &Arc<Page>, len: usize) -> Arc<PageIoWaiter> {

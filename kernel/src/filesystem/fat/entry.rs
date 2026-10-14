@@ -16,6 +16,7 @@ use system_error::SystemError;
 
 use super::{
     fs::{AttachReservedError, Cluster, FATFileSystem, MAX_FILE_SIZE, ZERO_BUF_SIZE},
+    table::{read_exact_at, write_exact_at},
     utils::decode_u8_ascii,
 };
 
@@ -61,14 +62,56 @@ pub struct FATFile {
     /// on-disk chain has not been measured since this entry was loaded or
     /// truncated. The inode mutex serializes every update to this file.
     chain_extent: Option<(u64, Cluster)>,
-    /// Last logical/physical read position, protected by the inode mutex.
-    /// Forward cold-page reads resume here instead of rescanning the FAT chain.
-    read_cursor: Option<(u64, Cluster)>,
+    /// Shared logical/physical position for reads and writeback. The inode
+    /// mutex serializes users; append preserves the old reachable prefix.
+    mapping_cursor: Option<(u64, Cluster)>,
     /// The directory slot has been removed and may already belong to another file.
     detached: bool,
 }
 
 impl FATFile {
+    fn cluster_at(&mut self, fs: &FATFileSystem, index: u64) -> Result<Cluster, SystemError> {
+        // A finite volume cannot supply more distinct logical clusters than
+        // its data area. Bound resumed traversal too, not only each suffix.
+        if index >= fs.max_cluster_number().cluster_num.saturating_sub(1) {
+            return Err(SystemError::EIO);
+        }
+        let (cursor_index, cursor_cluster) = self
+            .mapping_cursor
+            .filter(|(cursor_index, _)| *cursor_index <= index)
+            .unwrap_or((0, self.first_cluster));
+        let cluster = fs.walk_cluster(cursor_cluster, index - cursor_index)?;
+        self.mapping_cursor = Some((index, cluster));
+        Ok(cluster)
+    }
+
+    /// Exact physical allocation, not the dirty pagecache's logical EOF.
+    /// A file owns its chain under the inode mutex, so unrelated FAT updates
+    /// cannot invalidate its count/tail or require another full traversal.
+    pub(super) fn allocated_sectors(&mut self, fs: &FATFileSystem) -> Result<usize, SystemError> {
+        if self.first_cluster.cluster_num == 0 {
+            return if self.size() == 0 {
+                Ok(0)
+            } else {
+                Err(SystemError::EIO)
+            };
+        }
+        let (count, _) = self.allocation_extent(fs)?;
+        let bytes = count
+            .checked_mul(fs.bytes_per_cluster())
+            .ok_or(SystemError::EOVERFLOW)?;
+        usize::try_from(bytes / 512).map_err(|_| SystemError::EOVERFLOW)
+    }
+
+    fn allocation_extent(&mut self, fs: &FATFileSystem) -> Result<(u64, Cluster), SystemError> {
+        if let Some(extent) = self.chain_extent {
+            return Ok(extent);
+        }
+        let extent = fs.chain_len_and_tail(self.first_cluster)?;
+        self.chain_extent = Some(extent);
+        Ok(extent)
+    }
+
     pub(super) fn detach(&mut self) {
         self.detached = true;
     }
@@ -115,25 +158,13 @@ impl FATFile {
         buf: &mut [u8],
         offset: u64,
     ) -> Result<usize, SystemError> {
-        if offset >= self.size() {
+        if buf.is_empty() || offset >= self.size() {
             return Ok(0);
         }
 
         let start_cluster_number: u64 = offset / fs.bytes_per_cluster();
-        let (cursor_index, cursor_cluster) = self
-            .read_cursor
-            .filter(|(index, _)| *index <= start_cluster_number)
-            .unwrap_or((0, self.first_cluster));
-        let mut current_cluster = if let Some(c) = fs.get_cluster_by_relative(
-            cursor_cluster,
-            (start_cluster_number - cursor_index) as usize,
-        ) {
-            c
-        } else {
-            return Ok(0);
-        };
+        let mut current_cluster = self.cluster_at(fs, start_cluster_number)?;
         let mut current_index = start_cluster_number;
-        self.read_cursor = Some((current_index, current_cluster));
 
         let bytes_remain: u64 = self.size() - offset;
 
@@ -147,14 +178,9 @@ impl FATFile {
         loop {
             // 当前簇已经读取完，尝试读取下一个簇
             if in_cluster_offset >= fs.bytes_per_cluster() {
-                if let Ok(FATEntry::Next(c)) = fs.get_fat_entry(current_cluster) {
-                    current_cluster = c;
-                    current_index += 1;
-                    self.read_cursor = Some((current_index, current_cluster));
-                    in_cluster_offset %= fs.bytes_per_cluster();
-                } else {
-                    break;
-                }
+                current_index += 1;
+                current_cluster = self.cluster_at(fs, current_index)?;
+                in_cluster_offset %= fs.bytes_per_cluster();
             }
 
             // 计算下一次读取，能够读多少字节
@@ -171,6 +197,9 @@ impl FATFile {
             let r = fs
                 .gendisk
                 .read_at_bytes(&mut buf[start..start + end_len], offset as usize)?;
+            if r == 0 || r > end_len {
+                return Err(SystemError::EIO);
+            }
 
             // 更新偏移量计数信息
             read_ok += r;
@@ -197,18 +226,16 @@ impl FATFile {
         buf: &[u8],
         offset: u64,
     ) -> Result<usize, SystemError> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
         self.ensure_len(fs, offset, buf.len() as u64)?;
 
         // 要写入的第一个簇的簇号
         let start_cluster_num = offset / fs.bytes_per_cluster();
         // 获取要写入的第一个簇
-        let mut current_cluster: Cluster = if let Some(c) =
-            fs.get_cluster_by_relative(self.first_cluster, start_cluster_num as usize)
-        {
-            c
-        } else {
-            return Ok(0);
-        };
+        let mut current_index = start_cluster_num;
+        let mut current_cluster = self.cluster_at(fs, current_index)?;
 
         let mut in_cluster_bytes_offset: u64 = offset % fs.bytes_per_cluster();
 
@@ -218,12 +245,9 @@ impl FATFile {
         // 循环写入数据
         loop {
             if in_cluster_bytes_offset >= fs.bytes_per_cluster() {
-                if let Ok(FATEntry::Next(c)) = fs.get_fat_entry(current_cluster) {
-                    current_cluster = c;
-                    in_cluster_bytes_offset %= fs.bytes_per_cluster();
-                } else {
-                    break;
-                }
+                current_index += 1;
+                current_cluster = self.cluster_at(fs, current_index)?;
+                in_cluster_bytes_offset %= fs.bytes_per_cluster();
             }
 
             let end_len = min(
@@ -237,7 +261,7 @@ impl FATFile {
             let w = fs
                 .gendisk
                 .write_at_bytes(&buf[start..start + end_len], offset as usize)?;
-            if w == 0 {
+            if w == 0 || w > end_len {
                 return Err(SystemError::EIO);
             }
 
@@ -297,16 +321,7 @@ impl FATFile {
         let cluster_size = fs.bytes_per_cluster();
         let old_chain_exists = self.first_cluster != Cluster::default();
         let (allocated_clusters, old_tail) = if old_chain_exists {
-            let extent = match self.chain_extent {
-                Some(extent) => extent,
-                None => {
-                    let extent = fs
-                        .chain_len_and_tail(self.first_cluster)
-                        .ok_or(SystemError::EIO)?;
-                    self.chain_extent = Some(extent);
-                    extent
-                }
-            };
+            let extent = self.allocation_extent(fs)?;
             (extent.0, Some(extent.1))
         } else {
             (0, None)
@@ -343,13 +358,13 @@ impl FATFile {
         // previous directory-entry I/O error.
         if old_size != 0 && zero_until > old_size && !old_size.is_multiple_of(cluster_size) {
             let tail_index = old_size / cluster_size;
-            let tail = match fs.get_cluster_by_relative(self.first_cluster, tail_index as usize) {
-                Some(cluster) => cluster,
-                None => {
+            let tail = match self.cluster_at(fs, tail_index) {
+                Ok(cluster) => cluster,
+                Err(error) => {
                     if let Some(first) = reserved_first {
                         fs.release_reserved_chain(first);
                     }
-                    return Err(SystemError::EIO);
+                    return Err(error);
                 }
             };
             let start = fs.cluster_bytes_offset(tail) + old_size % cluster_size;
@@ -375,7 +390,7 @@ impl FATFile {
                     }
                     Err(AttachReservedError::Ambiguous(error)) => {
                         self.chain_extent = None;
-                        self.read_cursor = None;
+                        self.mapping_cursor = None;
                         return Err(error);
                     }
                 }
@@ -385,7 +400,7 @@ impl FATFile {
         let resulting_first = if old_chain_exists {
             self.first_cluster
         } else {
-            self.read_cursor = None;
+            self.mapping_cursor = None;
             reserved_first.ok_or(SystemError::EIO)?
         };
         if let Some(tail) = reserved_last {
@@ -437,11 +452,11 @@ impl FATFile {
             let w = fs
                 .gendisk
                 .write_at_bytes(&zeroes[..write_size], offset as usize)?;
-            if w == 0 {
+            if w == 0 || w > write_size {
                 return Err(SystemError::EIO);
             }
-            offset += write_size as u64;
-            remain -= write_size;
+            offset += w as u64;
+            remain -= w;
         }
 
         return Ok(());
@@ -468,7 +483,7 @@ impl FATFile {
             proposed.set_first_cluster(Cluster::new(0));
         }
         self.commit_directory_entry(fs, &proposed, true)?;
-        self.read_cursor = None;
+        self.mapping_cursor = None;
         self.chain_extent = None;
         self.short_dir_entry = proposed;
         if new_size == 0 {
@@ -1307,14 +1322,18 @@ impl LongDirEntry {
         let _dirent_guard = fs.lock_dirent_io();
 
         // 从磁盘读取数据
-        let blk_offset = fs.get_in_block_offset(gendisk_bytes_offset);
-        let lba = fs.gendisk_lba_from_offset(fs.bytes_to_sector(gendisk_bytes_offset));
-        let buffer_len = fs.lba_per_sector() * LBA_SIZE;
+        let blk_offset = gendisk_bytes_offset % LBA_SIZE as u64;
+        let block_start = gendisk_bytes_offset - blk_offset;
+        let buffer_len = LBA_SIZE;
         let mut v = Vec::new();
         v.try_reserve_exact(buffer_len)
             .map_err(|_| SystemError::ENOMEM)?;
         v.resize(buffer_len, 0);
-        fs.gendisk.read_at(&mut v, lba)?;
+        read_exact_at(
+            &fs.gendisk,
+            &mut v,
+            usize::try_from(block_start).map_err(|_| SystemError::EOVERFLOW)?,
+        )?;
 
         let mut cursor: VecCursor = VecCursor::new(v);
         // 切换游标到对应位置
@@ -1341,7 +1360,11 @@ impl LongDirEntry {
         }
 
         // 把修改后的长目录项刷入磁盘
-        fs.gendisk.write_at(cursor.as_slice(), lba)?;
+        write_exact_at(
+            &fs.gendisk,
+            cursor.as_slice(),
+            usize::try_from(block_start).map_err(|_| SystemError::EOVERFLOW)?,
+        )?;
 
         Ok(())
     }
@@ -1449,7 +1472,7 @@ impl ShortDirEntry {
                 short_dir_entry: *self,
                 loc: (loc, loc),
                 chain_extent: None,
-                read_cursor: None,
+                mapping_cursor: None,
                 detached: false,
             };
 
@@ -1495,7 +1518,7 @@ impl ShortDirEntry {
                 loc,
                 short_dir_entry: *self,
                 chain_extent: None,
-                read_cursor: None,
+                mapping_cursor: None,
                 detached: false,
             };
 
@@ -1545,14 +1568,18 @@ impl ShortDirEntry {
         let _dirent_guard = fs.lock_dirent_io();
 
         // 从磁盘读取数据
-        let blk_offset = fs.get_in_block_offset(gendisk_bytes_offset);
-        let lba = fs.gendisk_lba_from_offset(fs.bytes_to_sector(gendisk_bytes_offset));
-        let buffer_len = fs.lba_per_sector() * LBA_SIZE;
+        let blk_offset = gendisk_bytes_offset % LBA_SIZE as u64;
+        let block_start = gendisk_bytes_offset - blk_offset;
+        let buffer_len = LBA_SIZE;
         let mut v = Vec::new();
         v.try_reserve_exact(buffer_len)
             .map_err(|_| SystemError::ENOMEM)?;
         v.resize(buffer_len, 0);
-        fs.gendisk.read_at(&mut v, lba)?;
+        read_exact_at(
+            &fs.gendisk,
+            &mut v,
+            usize::try_from(block_start).map_err(|_| SystemError::EOVERFLOW)?,
+        )?;
 
         let mut cursor: VecCursor = VecCursor::new(v);
         // 切换游标到对应位置
@@ -1571,7 +1598,11 @@ impl ShortDirEntry {
         cursor.write_u32(self.file_size)?;
 
         // 把修改后的长目录项刷入磁盘
-        fs.gendisk.write_at(cursor.as_slice(), lba)?;
+        write_exact_at(
+            &fs.gendisk,
+            cursor.as_slice(),
+            usize::try_from(block_start).map_err(|_| SystemError::EOVERFLOW)?,
+        )?;
 
         Ok(())
     }
@@ -2630,12 +2661,16 @@ pub fn get_raw_dir_entry(
     gendisk_bytes_offset: u64,
 ) -> Result<FATRawDirEntry, SystemError> {
     // 块内偏移量
-    let blk_offset: u64 = fs.get_in_block_offset(gendisk_bytes_offset);
-    let lba = fs.gendisk_lba_from_offset(fs.bytes_to_sector(gendisk_bytes_offset));
+    let blk_offset = gendisk_bytes_offset % LBA_SIZE as u64;
+    let block_start = gendisk_bytes_offset - blk_offset;
 
     let mut v: Vec<u8> = vec![0; LBA_SIZE];
 
-    fs.gendisk.read_at(&mut v, lba)?;
+    read_exact_at(
+        &fs.gendisk,
+        &mut v,
+        usize::try_from(block_start).map_err(|_| SystemError::EOVERFLOW)?,
+    )?;
 
     let mut cursor: VecCursor = VecCursor::new(v);
     // 切换游标到对应位置

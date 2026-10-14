@@ -24,6 +24,7 @@ EXT4_UNINIT_FIXTURE = $(BUILD_DIR)/fixtures/ext4_uninit_bitmap.img
 FAT_STAT_FIXTURE = $(BUILD_DIR)/fixtures/fat_stat_blocks.img
 FAT32_STAT_FIXTURE = $(BUILD_DIR)/fixtures/fat32_stat_blocks.img
 FAT12_DIRECTORY_FIXTURE = $(BUILD_DIR)/fixtures/fat12_directory.img
+FAT12_NEAR_LIMIT_FIXTURE = $(BUILD_DIR)/fixtures/fat12_near_limit.img
 FAT16_DIRECTORY_FIXTURE = $(BUILD_DIR)/fixtures/fat16_directory.img
 
 # 要编译的测试套件目录列表（suites/ 下的子目录名）
@@ -63,7 +64,15 @@ $(GTEST_SRC):
 	@mv "$(GTEST_TMP_ROOT)" "$(GTEST_ROOT)"
 	@test -f "$(GTEST_SRC)"
 
-build-suites: $(TEST_BINS) $(EXT4_FIXTURE) $(EXT4_UNINIT_FIXTURE) $(FAT_STAT_FIXTURE) $(FAT32_STAT_FIXTURE) $(FAT12_DIRECTORY_FIXTURE) $(FAT16_DIRECTORY_FIXTURE)
+build-suites: $(TEST_BINS) $(EXT4_FIXTURE) $(EXT4_UNINIT_FIXTURE) $(FAT_STAT_FIXTURE) $(FAT32_STAT_FIXTURE) $(FAT12_DIRECTORY_FIXTURE) $(FAT12_NEAR_LIMIT_FIXTURE) $(FAT16_DIRECTORY_FIXTURE)
+
+# 4108 sectors, 1 reserved, 2x12 FAT sectors, 2 root sectors: 4081 data
+# clusters. Highest index 4082 (0xff2) is a legal FAT12 link destination.
+# Explicit geometry prevents mkfs track/alignment rounding below 0xff0.
+$(FAT12_NEAR_LIMIT_FIXTURE):
+	@mkdir -p "$(dir $@)"
+	@truncate -s 2103296 "$@"
+	@mkfs.fat -F 12 -S 512 -s 1 -r 32 -a -g 1/1 "$@"
 
 $(FAT12_DIRECTORY_FIXTURE):
 	@mkdir -p "$(dir $@)"
@@ -154,7 +163,7 @@ install: build
 	@chmod +x $(INSTALL_DIR)/dunitest-runner
 	@cp -rf $(BIN_DIR) $(INSTALL_DIR)/
 	@mkdir -p $(INSTALL_DIR)/fixtures
-	@cp --sparse=always -f $(EXT4_FIXTURE) $(EXT4_UNINIT_FIXTURE) $(FAT_STAT_FIXTURE) $(FAT32_STAT_FIXTURE) $(FAT12_DIRECTORY_FIXTURE) $(FAT16_DIRECTORY_FIXTURE) $(INSTALL_DIR)/fixtures/
+	@cp --sparse=always -f $(EXT4_FIXTURE) $(EXT4_UNINIT_FIXTURE) $(FAT_STAT_FIXTURE) $(FAT32_STAT_FIXTURE) $(FAT12_DIRECTORY_FIXTURE) $(FAT12_NEAR_LIMIT_FIXTURE) $(FAT16_DIRECTORY_FIXTURE) $(INSTALL_DIR)/fixtures/
 	@cp -f whitelist.txt $(INSTALL_DIR)/whitelist.txt
 	@cp -f no_skip.txt $(INSTALL_DIR)/no_skip.txt
 	@cp -f scripts/run_tests.sh $(INSTALL_DIR)/run_tests.sh

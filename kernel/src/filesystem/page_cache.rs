@@ -926,25 +926,79 @@ impl Drop for PreparedWriteCopies<'_> {
 #[derive(Debug)]
 pub struct PageIoWaiter {
     completion: Completion,
-    result: SpinLock<Option<Result<usize, SystemError>>>,
+    state: SpinLock<PageIoWaiterState>,
+}
+
+type PageIoTerminal = Box<dyn FnOnce(Result<usize, SystemError>) + Send>;
+
+struct PageIoWaiterState {
+    result: Option<Result<usize, SystemError>>,
+    terminal: Option<PageIoTerminal>,
+    registered: bool,
+}
+
+impl core::fmt::Debug for PageIoWaiterState {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("PageIoWaiterState")
+            .field("result", &self.result)
+            .field("registered", &self.registered)
+            .finish()
+    }
 }
 
 impl PageIoWaiter {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             completion: Completion::new(),
-            result: SpinLock::new(None),
+            state: SpinLock::new(PageIoWaiterState {
+                result: None,
+                terminal: None,
+                registered: false,
+            }),
         })
     }
 
     pub fn complete(&self, result: Result<usize, SystemError>) {
-        *self.result.lock_irqsave() = Some(result);
+        let terminal = {
+            let mut state = self.state.lock_irqsave();
+            if state.result.is_some() {
+                return;
+            }
+            state.result = Some(result.clone());
+            state.terminal.take()
+        };
         self.completion.complete();
+        if let Some(terminal) = terminal {
+            terminal(result);
+        }
+    }
+
+    /// Register one terminal observer. It runs outside the waiter lock and
+    /// must only enqueue prepared publication work, never perform or wait for I/O.
+    pub fn register_terminal(&self, terminal: PageIoTerminal) -> Result<(), SystemError> {
+        let ready = {
+            let mut state = self.state.lock_irqsave();
+            if state.registered {
+                return Err(SystemError::EEXIST);
+            }
+            state.registered = true;
+            match state.result.clone() {
+                Some(result) => Some((terminal, result)),
+                None => {
+                    state.terminal = Some(terminal);
+                    None
+                }
+            }
+        };
+        if let Some((terminal, result)) = ready {
+            terminal(result);
+        }
+        Ok(())
     }
 
     pub fn wait(&self) -> Result<usize, SystemError> {
         self.completion.wait_for_completion()?;
-        match self.result.lock_irqsave().as_ref() {
+        match self.state.lock_irqsave().result.as_ref() {
             Some(Ok(len)) => Ok(*len),
             Some(Err(e)) => Err(e.clone()),
             None => Err(SystemError::EIO),
@@ -2992,7 +3046,8 @@ impl PageCache {
         let _domain_io = self.try_acquire_domain_io()?;
         let backend = self.backend();
         if let Some(backend) = backend {
-            let waiter = backend.read_page_async(page_index, page);
+            let waiter = PageIoWaiter::new();
+            backend.read_page_async(page_index, page, &waiter);
             let read_len = waiter.wait()?;
             if read_len < MMArch::PAGE_SIZE {
                 let mut page_guard = page.write();
@@ -3261,7 +3316,7 @@ impl PageCache {
 
         let domain_io = self.try_acquire_domain_io()?;
 
-        let entry = {
+        let prepared = {
             let guard = self.inner.lock();
             if guard.get_entry(page_index).is_some() {
                 return Ok(());
@@ -3272,37 +3327,26 @@ impl PageCache {
                 page_index,
                 owner,
             )?;
-            let prepared = self.prepare_entry(&page, PageState::Loading, creator)?;
-            let (entry, created) = self.publish_prepared_entry(page_index, &prepared, creator)?;
-            if !created {
-                return Ok(());
-            }
-            entry
+            self.prepare_entry(&page, PageState::Loading, creator)?
         };
-        self.reconcile_entry_unevictable_for_insert(&entry);
 
         let backend = self.backend();
         let inode = self.inode();
-        let entry_clone = entry.clone();
-        let page = entry.page.clone();
+        let entry_clone = prepared.clone();
+        let page = prepared.page.clone();
+        let source_page = page.clone();
+        let waiter = PageIoWaiter::new();
 
-        let work_state = Mutex::new(Some(domain_io));
+        let work_state = Arc::new(SpinLock::new(Some((domain_io, None))));
+        let terminal_state = work_state.clone();
         let work = Work::new(move || {
-            let Some(_domain_io) = work_state.lock().take() else {
+            let Some((_domain_io, read_len)) = work_state.lock_irqsave().take() else {
                 return;
             };
-            let read_len = if let Some(backend) = backend.as_ref() {
-                backend.read_page_async(page_index, &page).wait()
-            } else if let Some(inode) = inode.as_ref().and_then(|inode| inode.upgrade()) {
-                let mut guard = page.write();
-                let dst = unsafe { guard.as_slice_mut() };
-                inode.read_sync(page_index * MMArch::PAGE_SIZE, dst)
-            } else {
-                Err(SystemError::EIO)
-            };
+            let read_len = read_len.unwrap_or(Err(SystemError::EIO));
 
             match read_len {
-                Ok(len) => {
+                Ok(len) if len <= MMArch::PAGE_SIZE => {
                     if len < MMArch::PAGE_SIZE {
                         let mut guard = page.write();
                         let dst = unsafe { guard.as_slice_mut() };
@@ -3311,14 +3355,40 @@ impl PageCache {
                     page.write().add_flags(PageFlags::PG_UPTODATE);
                     entry_clone.set_state(PageState::UpToDate);
                 }
-                Err(_) => {
+                _ => {
                     page.write().add_flags(PageFlags::PG_ERROR);
                     entry_clone.set_state(PageState::Error);
                 }
             }
             entry_clone.wait_queue.wake_all();
         });
-        schedule_work(work);
+        waiter.register_terminal(Box::new(move |result| {
+            if let Some((_, read_len)) = terminal_state.lock_irqsave().as_mut() {
+                *read_len = Some(result);
+            }
+            schedule_read_completion(work);
+        }))?;
+        let (entry, created) = self.publish_prepared_entry(page_index, &prepared, creator)?;
+        if !created {
+            return Ok(());
+        }
+        self.reconcile_entry_unevictable_for_insert(&entry);
+        if let Some(backend) = backend {
+            backend.read_page_async(page_index, &source_page, &waiter);
+        } else {
+            let result = if let Some(inode) = inode.and_then(|inode| inode.upgrade()) {
+                match page_index.checked_mul(MMArch::PAGE_SIZE) {
+                    Some(offset) => {
+                        let mut guard = source_page.write();
+                        inode.read_sync(offset, unsafe { guard.as_slice_mut() })
+                    }
+                    None => Err(SystemError::EOVERFLOW),
+                }
+            } else {
+                Err(SystemError::EIO)
+            };
+            waiter.complete(result);
+        }
         Ok(())
     }
 

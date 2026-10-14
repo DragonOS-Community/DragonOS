@@ -72,7 +72,6 @@ use super::{
 };
 
 const FAT_MAX_NAMELEN: u64 = 255;
-const FAT_LRU_CACHE_SIZE: usize = 4096;
 const FAT_NEGATIVE_CHILDREN_CACHE_SIZE: usize = 256;
 
 impl Default for FATInodeLifetime {
@@ -101,11 +100,6 @@ pub struct Cluster {
 }
 
 pub type ClusterID = u64;
-
-// Cache sentinels: 0/1 are reserved clusters in FAT, MAX marks end-of-chain.
-const FAT_CACHE_UNUSED: ClusterID = 0;
-const FAT_CACHE_BAD: ClusterID = 1;
-const FAT_CACHE_EOC: ClusterID = ClusterID::MAX;
 
 impl PartialOrd for Cluster {
     /// @brief 根据当前簇号比较大小
@@ -142,18 +136,18 @@ pub struct FATFileSystem {
     pub fs_info: Arc<LockedFATFsInfo>,
     /// 文件系统的根inode
     root_inode: Arc<LockedFATInode>,
-    /// FAT表查询缓存（LRU）
-    fat_cache: Mutex<LruCache<ClusterID, ClusterID>>,
+    /// Bounded, preallocated FAT-sector write-through cache and table I/O lock.
+    pub(super) fat_cache: Mutex<super::table::FatSectorCache>,
     /// Serialize FAT chain allocation and release.
     ///
     /// Selecting a free cluster and publishing it in the FAT must be one
     /// filesystem-wide transaction.  Per-inode locking is insufficient
     /// because writeback for different files can run concurrently and select
     /// the same free entry.  This mirrors Linux's `msdos_sb_info::fat_lock`.
-    fat_lock: Mutex<()>,
+    pub(super) fat_lock: Mutex<()>,
     /// Invalidates allocation statistics when any FAT chain edge changes.
     /// Saturation disables memoization rather than allowing stamp reuse.
-    fat_chain_generation: AtomicU64,
+    pub(super) fat_chain_generation: AtomicU64,
     /// 目录项扇区读-改-写串行化锁。
     ///
     /// FAT 的 `ShortDirEntry`/`LongDirEntry` 只占 32 字节，而底层 gendisk 的写入粒度是
@@ -245,7 +239,7 @@ impl FATInode {
             return Ok(metadata);
         }
         let fs = self.fs.upgrade().ok_or(SystemError::EIO)?;
-        metadata.blocks = match &self.inode_type {
+        metadata.blocks = match &mut self.inode_type {
             FATDirEntry::File(file) | FATDirEntry::VolId(file) => {
                 // Cached logical EOF may grow before buffered writeback has
                 // allocated a chain. Only a nonempty disk dirent with no
@@ -253,8 +247,7 @@ impl FATInode {
                 if file.first_cluster.cluster_num == 0 && file.size() != 0 {
                     return Err(SystemError::EIO);
                 }
-                let head = file.first_cluster;
-                self.cached_chain_sectors(&fs, head)?
+                file.allocated_sectors(&fs)?
             }
             FATDirEntry::Dir(dir) if dir.root_offset.is_some() => {
                 let bytes = (fs.bpb.root_entries_cnt as u64)
@@ -652,7 +645,7 @@ pub struct FATFsInfo {
     trail_sig: u32,
     /// Dirty flag to flush to disk
     dirty: bool,
-    /// FsInfo Structure 在磁盘上的字节偏移量
+    /// FSInfo byte offset relative to this GenDisk (not the whole device).
     /// Not present for FAT12 and FAT16
     offset: Option<u64>,
 }
@@ -763,12 +756,21 @@ impl FileSystem for FATFileSystem {
         if wait {
             let epoch = EvictionEpoch::new(self.reclaim_queue.lock().next);
             let reclaim_result = self.drain_evictions_through(epoch);
+            // Commit the hints under their own lock, then release it before
+            // the device barrier. Failed writes remain dirty for a retry.
+            let info_result = self.fs_info.0.lock().flush(&self.gendisk);
             // A sticky reclamation error must not suppress durability for
             // other files whose writeback has already completed.
             let sync_result = self.gendisk.sync();
-            reclaim_result.and(sync_result)?;
+            reclaim_result.and(info_result).and(sync_result)?;
         }
         Ok(())
+    }
+
+    fn supports_reliable_flush(&self) -> bool {
+        self.gendisk
+            .block_device()
+            .is_ok_and(|device| device.supports_reliable_flush())
     }
 
     fn page_cache_writeback_domain(&self) -> Option<&Arc<PageCacheWritebackDomain>> {
@@ -978,6 +980,7 @@ impl FATFileSystem {
     pub fn new(gendisk: Arc<GenDisk>) -> Result<Arc<FATFileSystem>, SystemError> {
         let device_mount_holder = gendisk.acquire_mount_holder()?;
         let bpb = BiosParameterBlock::new(&gendisk)?;
+        Self::validate_table_geometry(&bpb)?;
         // 从磁盘上读取FAT32文件系统的FsInfo结构体
         let fs_info: FATFsInfo = match bpb.fat_type {
             FATType::FAT32(bpb32) => {
@@ -1060,9 +1063,7 @@ impl FATFileSystem {
             first_data_sector,
             fs_info: Arc::new(LockedFATFsInfo::new(fs_info)),
             root_inode,
-            fat_cache: Mutex::new(LruCache::new(
-                NonZeroUsize::new(FAT_LRU_CACHE_SIZE).unwrap(),
-            )),
+            fat_cache: Mutex::new(super::table::FatSectorCache::new()?),
             fat_lock: Mutex::new(()),
             fat_chain_generation: AtomicU64::new(0),
             dirent_io_lock: Mutex::new(()),
@@ -1096,195 +1097,6 @@ impl FATFileSystem {
     #[inline]
     pub(super) fn lock_dirent_io(&self) -> MutexGuard<'_, ()> {
         self.dirent_io_lock.lock()
-    }
-
-    #[inline]
-    fn fat_cache_lookup(&self, cluster: ClusterID) -> Option<ClusterID> {
-        self.fat_cache.lock().get(&cluster).cloned()
-    }
-
-    #[inline]
-    fn fat_cache_store(&self, cluster: ClusterID, value: ClusterID) {
-        self.fat_cache.lock().put(cluster, value);
-    }
-
-    #[inline]
-    fn fat_cache_encode(entry: &FATEntry) -> ClusterID {
-        match entry {
-            FATEntry::Unused => FAT_CACHE_UNUSED,
-            FATEntry::Bad => FAT_CACHE_BAD,
-            FATEntry::EndOfChain => FAT_CACHE_EOC,
-            FATEntry::Next(c) => c.cluster_num,
-        }
-    }
-
-    #[inline]
-    fn fat_cache_decode(current_cluster: ClusterID, value: ClusterID) -> FATEntry {
-        match value {
-            FAT_CACHE_UNUSED => FATEntry::Unused,
-            FAT_CACHE_BAD => FATEntry::Bad,
-            FAT_CACHE_EOC => FATEntry::EndOfChain,
-            _ => FATEntry::Next(Cluster {
-                cluster_num: value,
-                parent_cluster: current_cluster,
-            }),
-        }
-    }
-
-    /// @brief 读取当前簇在FAT表中存储的信息
-    ///
-    /// @param cluster 当前簇
-    ///
-    /// @return Ok(FATEntry) 当前簇在FAT表中，存储的信息。（详情见FATEntry的注释）
-    /// @return Err(SystemError) 错误码
-    pub fn get_fat_entry(&self, cluster: Cluster) -> Result<FATEntry, SystemError> {
-        let current_cluster = cluster.cluster_num;
-        if current_cluster < 2 {
-            // 0号簇和1号簇是保留簇，不允许用户使用
-            return Err(SystemError::EINVAL);
-        }
-
-        if let Some(cached) = self.fat_cache_lookup(current_cluster) {
-            return Ok(Self::fat_cache_decode(current_cluster, cached));
-        }
-
-        let fat_type: FATType = self.bpb.fat_type;
-        // 获取FAT表的起始扇区（相对分区起始扇区的偏移量）
-        let fat_start_sector = self.fat_start_sector();
-        let bytes_per_sec = self.bpb.bytes_per_sector as u64;
-
-        // cluster对应的FAT表项在分区内的字节偏移量
-        let fat_bytes_offset =
-            fat_type.get_fat_bytes_offset(cluster, fat_start_sector, bytes_per_sec);
-
-        // FAT表项所在的分区内LBA地址
-        let fat_ent_lba = fat_bytes_offset / LBA_SIZE as u64;
-
-        // FAT表项在逻辑块内的字节偏移量
-        let blk_offset = self.get_in_block_offset(fat_bytes_offset);
-
-        let mut v: Vec<u8> = vec![0; self.bpb.bytes_per_sector as usize];
-        self.gendisk.read_at(&mut v, fat_ent_lba as usize)?;
-
-        let mut cursor = VecCursor::new(v);
-        cursor.seek(SeekFrom::SeekSet(blk_offset as i64))?;
-
-        let res: FATEntry = match self.bpb.fat_type {
-            FATType::FAT12(_) => {
-                let mut entry = cursor.read_u16()?;
-                // 由于FAT12文件系统的FAT表，每个entry占用1.5字节，因此奇数的簇需要取高12位的值。
-                if (current_cluster & 1) > 0 {
-                    entry >>= 4;
-                } else {
-                    entry &= 0x0fff;
-                }
-
-                if entry == 0 {
-                    FATEntry::Unused
-                } else if entry == 0x0ff7 {
-                    FATEntry::Bad
-                } else if entry >= 0x0ff8 {
-                    FATEntry::EndOfChain
-                } else {
-                    FATEntry::Next(Cluster {
-                        cluster_num: entry as u64,
-                        parent_cluster: current_cluster,
-                    })
-                }
-            }
-            FATType::FAT16(_) => {
-                let entry = cursor.read_u16()?;
-
-                if entry == 0 {
-                    FATEntry::Unused
-                } else if entry == 0xfff7 {
-                    FATEntry::Bad
-                } else if entry >= 0xfff8 {
-                    FATEntry::EndOfChain
-                } else {
-                    FATEntry::Next(Cluster {
-                        cluster_num: entry as u64,
-                        parent_cluster: current_cluster,
-                    })
-                }
-            }
-            FATType::FAT32(_) => {
-                let entry = cursor.read_u32()? & 0x0fffffff;
-
-                match entry {
-                    _n if (0x0ffffff7..=0x0fffffff).contains(&current_cluster) => {
-                        // 当前簇号不是一个能被获得的簇（可能是文件系统出错了）
-                        error!(
-                            "FAT32 get fat entry: current cluster number [{}] is not an allocatable cluster number.",
-                            current_cluster
-                        );
-                        FATEntry::Bad
-                    }
-                    0 => FATEntry::Unused,
-                    0x0ffffff7 => FATEntry::Bad,
-                    0x0ffffff8..=0x0fffffff => FATEntry::EndOfChain,
-                    _n => FATEntry::Next(Cluster {
-                        cluster_num: entry as u64,
-                        parent_cluster: current_cluster,
-                    }),
-                }
-            }
-        };
-        self.fat_cache_store(current_cluster, Self::fat_cache_encode(&res));
-        return Ok(res);
-    }
-
-    /// @brief 读取当前簇在FAT表中存储的信息（直接返回读取到的值，而不加处理）
-    ///
-    /// @param cluster 当前簇
-    ///
-    /// @return Ok(u64) 当前簇在FAT表中，存储的信息。
-    /// @return Err(SystemError) 错误码
-    pub fn get_fat_entry_raw(&self, cluster: Cluster) -> Result<u64, SystemError> {
-        let current_cluster = cluster.cluster_num;
-
-        let fat_type: FATType = self.bpb.fat_type;
-        // 获取FAT表的起始扇区（相对分区起始扇区的偏移量）
-        let fat_start_sector = self.fat_start_sector();
-        let bytes_per_sec = self.bpb.bytes_per_sector as u64;
-
-        // cluster对应的FAT表项在分区内的字节偏移量
-        let fat_bytes_offset =
-            fat_type.get_fat_bytes_offset(cluster, fat_start_sector, bytes_per_sec);
-
-        // FAT表项所在的分区内LBA地址
-        let fat_ent_lba = self.gendisk_lba_from_offset(self.bytes_to_sector(fat_bytes_offset));
-
-        // FAT表项在逻辑块内的字节偏移量
-        let blk_offset = self.get_in_block_offset(fat_bytes_offset);
-
-        let mut v: Vec<u8> = vec![0; self.bpb.bytes_per_sector as usize];
-        self.gendisk.read_at(&mut v, fat_ent_lba)?;
-
-        let mut cursor = VecCursor::new(v);
-        cursor.seek(SeekFrom::SeekSet(blk_offset as i64))?;
-
-        let res = match self.bpb.fat_type {
-            FATType::FAT12(_) => {
-                let mut entry = cursor.read_u16()?;
-                entry = if (current_cluster & 0x0001) > 0 {
-                    entry >> 4
-                } else {
-                    entry & 0x0fff
-                };
-                entry as u64
-            }
-            FATType::FAT16(_) => {
-                let entry = (cursor.read_u16()?) as u64;
-                entry
-            }
-            FATType::FAT32(_) => {
-                let entry = cursor.read_u32()? & 0x0fff_ffff;
-                entry as u64
-            }
-        };
-
-        return Ok(res);
     }
 
     /// @brief 获取当前文件系统的root inode，在分区内的字节偏移量
@@ -1360,23 +1172,18 @@ impl FATFileSystem {
 
         let _fat_guard = self.fat_lock.lock();
         let end_cluster: Cluster = self.max_cluster_number();
-        let start_cluster: Cluster = match self.bpb.fat_type {
-            FATType::FAT32(_) => {
-                let next_free: u64 = self.fs_info.0.lock().next_free().unwrap_or(0xffffffff);
-                if next_free < end_cluster.cluster_num {
-                    Cluster::new(next_free)
-                } else {
-                    Cluster::new(RESERVED_CLUSTERS as u64)
-                }
-            }
-            _ => Cluster::new(RESERVED_CLUSTERS as u64),
-        };
+        let next_free = self.fs_info.0.lock().next_free().unwrap_or(2);
+        let start_cluster = Cluster::new(if (2..=end_cluster.cluster_num).contains(&next_free) {
+            next_free
+        } else {
+            2
+        });
 
         // 寻找一个空的簇
         let free_cluster: Cluster = match self.get_free_cluster(start_cluster, end_cluster) {
             Ok(c) => c,
-            Err(_) if start_cluster.cluster_num > RESERVED_CLUSTERS as u64 => {
-                self.get_free_cluster(Cluster::new(RESERVED_CLUSTERS as u64), end_cluster)?
+            Err(SystemError::ENOSPC) if start_cluster.cluster_num > 2 => {
+                self.get_free_cluster(Cluster::new(2), Cluster::new(start_cluster.cluster_num - 1))?
             }
             Err(e) => return Err(e),
         };
@@ -1552,7 +1359,24 @@ impl FATFileSystem {
     }
 
     fn deallocate_cluster_chain_locked(&self, start_cluster: Cluster) -> Result<(), SystemError> {
-        let clusters: Vec<Cluster> = self.clusters(start_cluster);
+        // Validate the whole bounded chain and reserve its release list before
+        // freeing any entry. I/O failure must not look like a successful EOF
+        // and a corrupt cycle must not allocate an unbounded Vec under fat_lock.
+        let (count, _) = self.chain_len_and_tail(start_cluster)?;
+        let count = usize::try_from(count).map_err(|_| SystemError::EOVERFLOW)?;
+        let mut clusters = Vec::new();
+        clusters
+            .try_reserve_exact(count)
+            .map_err(|_| SystemError::ENOMEM)?;
+        let mut current = start_cluster;
+        for index in 0..count {
+            clusters.push(current);
+            match self.get_fat_entry(current)? {
+                FATEntry::Next(next) if index + 1 < count => current = next,
+                FATEntry::EndOfChain if index + 1 == count => {}
+                _ => return Err(SystemError::EIO),
+            }
+        }
         for c in clusters {
             self.deallocate_cluster_locked(c)?;
         }
@@ -1644,9 +1468,7 @@ impl FATFileSystem {
             FATType::FAT32(bpb32) => {
                 return (bpb32.ext_flags & 0x80) == 0;
             }
-            _ => {
-                return false;
-            }
+            _ => true,
         }
     }
 
@@ -1693,23 +1515,10 @@ impl FATFileSystem {
 
     /// Ordinary metadata may read the device. Keep inode -> FAT lock order
     /// and reject malformed chains instead of swallowing iterator I/O errors.
-    fn allocated_chain_sectors(&self, mut cluster: Cluster) -> Result<(u64, usize), SystemError> {
+    fn allocated_chain_sectors(&self, cluster: Cluster) -> Result<(u64, usize), SystemError> {
         let _fat = self.fat_lock.lock();
         let generation = self.fat_chain_generation.load(AtomicOrdering::Acquire);
-        let max = self.max_cluster_number().cluster_num;
-        let limit = max.checked_sub(1).ok_or(SystemError::EIO)?;
-        let mut count = 0u64;
-        loop {
-            if cluster.cluster_num < 2 || cluster.cluster_num > max || count >= limit {
-                return Err(SystemError::EIO);
-            }
-            count = count.checked_add(1).ok_or(SystemError::EOVERFLOW)?;
-            match self.get_fat_entry(cluster)? {
-                FATEntry::EndOfChain => break,
-                FATEntry::Next(next) => cluster = next,
-                FATEntry::Unused | FATEntry::Bad => return Err(SystemError::EIO),
-            }
-        }
+        let (count, _) = self.chain_len_and_tail(cluster)?;
         let bytes = count
             .checked_mul(self.bytes_per_cluster())
             .ok_or(SystemError::EOVERFLOW)?;
@@ -1717,16 +1526,6 @@ impl FATFileSystem {
         Ok((generation, sectors))
     }
 
-    /// Return the number of clusters and the tail in one FAT traversal.
-    pub fn chain_len_and_tail(&self, start_cluster: Cluster) -> Option<(u64, Cluster)> {
-        let mut count = 0;
-        let mut tail = None;
-        for cluster in self.cluster_iter(start_cluster) {
-            count += 1;
-            tail = Some(cluster);
-        }
-        tail.map(|tail| (count, tail))
-    }
     /// @brief 获取一个簇迭代器对象
     ///
     /// @param start_cluster 整个FAT链的起始簇号
@@ -1740,7 +1539,7 @@ impl FATFileSystem {
     /// @brief 获取从start_cluster开始的簇链中，第n个簇的信息。（请注意，下标从0开始）
     #[inline]
     pub fn get_cluster_by_relative(&self, start_cluster: Cluster, n: usize) -> Option<Cluster> {
-        return self.cluster_iter(start_cluster).nth(n);
+        self.walk_cluster(start_cluster, n as u64).ok()
     }
 
     /// @brief 判断FAT文件系统的shut bit是否正常。
@@ -1880,280 +1679,6 @@ impl FATFileSystem {
         }
     }
 
-    /// @brief 在文件系统中寻找一个簇号在给定的范围（左闭右开区间）内的空闲簇
-    ///
-    /// @param start_cluster 起始簇号
-    /// @param end_cluster 终止簇号（不包含）
-    ///
-    /// @return Ok(Cluster) 寻找到的空闲簇
-    /// @return Err(SystemError) 错误码。如果磁盘无剩余空间，或者簇号达到给定的最大值，则返回-ENOSPC.
-    pub fn get_free_cluster(
-        &self,
-        start_cluster: Cluster,
-        end_cluster: Cluster,
-    ) -> Result<Cluster, SystemError> {
-        let max_cluster: Cluster = self.max_cluster_number();
-        let mut cluster: u64 = start_cluster.cluster_num;
-
-        let fat_type: FATType = self.bpb.fat_type;
-        let fat_start_sector: u64 = self.fat_start_sector();
-        let bytes_per_sec: u64 = self.bpb.bytes_per_sector as u64;
-
-        match fat_type {
-            FATType::FAT12(_) => {
-                let part_bytes_offset: u64 =
-                    fat_type.get_fat_bytes_offset(start_cluster, fat_start_sector, bytes_per_sec);
-                let in_block_offset = self.get_in_block_offset(part_bytes_offset);
-
-                let lba = self.gendisk_lba_from_offset(self.bytes_to_sector(part_bytes_offset));
-
-                // 由于FAT12的FAT表不大于6K，因此直接读取6K
-                let num_lba = (6 * 1024) / LBA_SIZE;
-                let mut v: Vec<u8> = vec![0; num_lba * LBA_SIZE];
-                self.gendisk.read_at(&mut v, lba)?;
-
-                let mut cursor: VecCursor = VecCursor::new(v);
-                cursor.seek(SeekFrom::SeekSet(in_block_offset as i64))?;
-
-                let mut packed_val: u16 = cursor.read_u16()?;
-                loop {
-                    let val = if (cluster & 0x1) > 0 {
-                        packed_val >> 4
-                    } else {
-                        packed_val & 0x0fff
-                    };
-                    if val == 0 {
-                        return Ok(Cluster::new(cluster));
-                    }
-
-                    cluster += 1;
-
-                    // 磁盘无剩余空间，或者簇号达到给定的最大值
-                    if cluster == end_cluster.cluster_num || cluster == max_cluster.cluster_num {
-                        return Err(SystemError::ENOSPC);
-                    }
-
-                    packed_val = match cluster & 1 {
-                        0 => cursor.read_u16()?,
-                        _ => {
-                            let next_byte = cursor.read_u8()? as u16;
-                            (packed_val >> 8) | (next_byte << 8)
-                        }
-                    };
-                }
-            }
-            FATType::FAT16(_) => {
-                // todo: 优化这里，减少读取磁盘的次数。
-                while cluster < end_cluster.cluster_num && cluster < max_cluster.cluster_num {
-                    let part_bytes_offset: u64 = fat_type.get_fat_bytes_offset(
-                        Cluster::new(cluster),
-                        fat_start_sector,
-                        bytes_per_sec,
-                    );
-                    let in_block_offset = self.get_in_block_offset(part_bytes_offset);
-
-                    let lba = self.gendisk_lba_from_offset(self.bytes_to_sector(part_bytes_offset));
-
-                    let mut v: Vec<u8> = vec![0; self.lba_per_sector() * LBA_SIZE];
-                    self.gendisk.read_at(&mut v, lba)?;
-
-                    let mut cursor: VecCursor = VecCursor::new(v);
-                    cursor.seek(SeekFrom::SeekSet(in_block_offset as i64))?;
-
-                    let val = cursor.read_u16()?;
-                    // 找到空闲簇
-                    if val == 0 {
-                        return Ok(Cluster::new(cluster));
-                    }
-                    cluster += 1;
-                }
-
-                // 磁盘无剩余空间，或者簇号达到给定的最大值
-                return Err(SystemError::ENOSPC);
-            }
-            FATType::FAT32(_) => {
-                // todo: 优化这里，减少读取磁盘的次数。
-                while cluster < end_cluster.cluster_num && cluster < max_cluster.cluster_num {
-                    let part_bytes_offset: u64 = fat_type.get_fat_bytes_offset(
-                        Cluster::new(cluster),
-                        fat_start_sector,
-                        bytes_per_sec,
-                    );
-                    let in_block_offset = self.get_in_block_offset(part_bytes_offset);
-
-                    let lba = self.gendisk_lba_from_offset(self.bytes_to_sector(part_bytes_offset));
-
-                    let mut v: Vec<u8> = vec![0; self.lba_per_sector() * LBA_SIZE];
-                    self.gendisk.read_at(&mut v, lba)?;
-
-                    let mut cursor: VecCursor = VecCursor::new(v);
-                    cursor.seek(SeekFrom::SeekSet(in_block_offset as i64))?;
-
-                    let val = cursor.read_u32()? & 0x0fffffff;
-
-                    if val == 0 {
-                        return Ok(Cluster::new(cluster));
-                    }
-                    cluster += 1;
-                }
-
-                // 磁盘无剩余空间，或者簇号达到给定的最大值
-                return Err(SystemError::ENOSPC);
-            }
-        }
-    }
-
-    /// @brief 在FAT表中，设置指定的簇的信息。
-    ///
-    /// @param cluster 目标簇
-    /// @param fat_entry 这个簇在FAT表中，存储的信息（下一个簇的簇号）
-    /// Data-chain callers (cluster >= 2) must hold `fat_lock`; reserved
-    /// volume-status entries do not participate in allocation statistics.
-    fn set_entry(&self, cluster: Cluster, fat_entry: FATEntry) -> Result<(), SystemError> {
-        if cluster.cluster_num >= RESERVED_CLUSTERS as u64 {
-            // Chain callers hold fat_lock. Invalidate before any device write:
-            // an error can leave a changed primary or only some mirror copies.
-            let generation = self.fat_chain_generation.load(AtomicOrdering::Relaxed);
-            self.fat_chain_generation
-                .store(generation.saturating_add(1), AtomicOrdering::Release);
-            self.fat_cache.lock().pop(&cluster.cluster_num);
-        }
-        let cache_val = Self::fat_cache_encode(&fat_entry);
-        // fat表项在分区上的字节偏移量
-        let fat_part_bytes_offset: u64 = self.bpb.fat_type.get_fat_bytes_offset(
-            cluster,
-            self.fat_start_sector(),
-            self.bpb.bytes_per_sector as u64,
-        );
-
-        match self.bpb.fat_type {
-            FATType::FAT12(_) => {
-                // 计算要写入的值
-                let raw_val: u16 = match fat_entry {
-                    FATEntry::Unused => 0,
-                    FATEntry::Bad => 0xff7,
-                    FATEntry::EndOfChain => 0xfff,
-                    FATEntry::Next(c) => c.cluster_num as u16,
-                };
-
-                let in_block_offset = self.get_in_block_offset(fat_part_bytes_offset);
-
-                let lba = self.gendisk_lba_from_offset(self.bytes_to_sector(fat_part_bytes_offset));
-
-                let mut v = Vec::new();
-                v.try_reserve_exact(LBA_SIZE)
-                    .map_err(|_| SystemError::ENOMEM)?;
-                v.resize(LBA_SIZE, 0);
-                self.gendisk.read_at(&mut v, lba)?;
-
-                let mut cursor: VecCursor = VecCursor::new(v);
-                cursor.seek(SeekFrom::SeekSet(in_block_offset as i64))?;
-
-                let old_val: u16 = cursor.read_u16()?;
-                let new_val: u16 = if (cluster.cluster_num & 0x1) > 0 {
-                    (old_val & 0x000f) | (raw_val << 4)
-                } else {
-                    (old_val & 0xf000) | raw_val
-                };
-
-                // 写回数据到磁盘上
-                cursor.seek(SeekFrom::SeekSet(in_block_offset as i64))?;
-                cursor.write_u16(new_val)?;
-                self.gendisk.write_at(cursor.as_slice(), lba)?;
-                self.fat_cache_store(cluster.cluster_num, cache_val);
-                return Ok(());
-            }
-            FATType::FAT16(_) => {
-                // 计算要写入的值
-                let raw_val: u16 = match fat_entry {
-                    FATEntry::Unused => 0,
-                    FATEntry::Bad => 0xfff7,
-                    FATEntry::EndOfChain => 0xffff,
-                    FATEntry::Next(c) => c.cluster_num as u16,
-                };
-
-                let in_block_offset = self.get_in_block_offset(fat_part_bytes_offset);
-
-                let lba = self.gendisk_lba_from_offset(self.bytes_to_sector(fat_part_bytes_offset));
-
-                let mut v = Vec::new();
-                v.try_reserve_exact(LBA_SIZE)
-                    .map_err(|_| SystemError::ENOMEM)?;
-                v.resize(LBA_SIZE, 0);
-                self.gendisk.read_at(&mut v, lba)?;
-
-                let mut cursor: VecCursor = VecCursor::new(v);
-                cursor.seek(SeekFrom::SeekSet(in_block_offset as i64))?;
-
-                cursor.write_u16(raw_val)?;
-                self.gendisk.write_at(cursor.as_slice(), lba)?;
-
-                self.fat_cache_store(cluster.cluster_num, cache_val);
-                return Ok(());
-            }
-            FATType::FAT32(_) => {
-                let fat_size: u64 = self.fat_size();
-                let bound: u64 = if self.mirroring_enabled() {
-                    1
-                } else {
-                    self.bpb.num_fats as u64
-                };
-                // debug!("set entry, bound={bound}, fat_size={fat_size}");
-                for i in 0..bound {
-                    // 当前操作的FAT表在磁盘上的字节偏移量
-                    let f_offset: u64 = fat_part_bytes_offset + i * fat_size;
-                    let in_block_offset: u64 = self.get_in_block_offset(f_offset);
-                    let lba = self.gendisk_lba_from_offset(self.bytes_to_sector(f_offset));
-
-                    // debug!("set entry, lba={lba}, in_block_offset={in_block_offset}");
-                    let mut v = Vec::new();
-                    v.try_reserve_exact(LBA_SIZE)
-                        .map_err(|_| SystemError::ENOMEM)?;
-                    v.resize(LBA_SIZE, 0);
-                    self.gendisk.read_at(&mut v, lba)?;
-
-                    let mut cursor: VecCursor = VecCursor::new(v);
-                    cursor.seek(SeekFrom::SeekSet(in_block_offset as i64))?;
-
-                    // FAT32的高4位保留
-                    let old_bits = cursor.read_u32()? & 0xf0000000;
-
-                    if fat_entry == FATEntry::Unused
-                        && cluster.cluster_num >= 0x0ffffff7
-                        && cluster.cluster_num <= 0x0fffffff
-                    {
-                        error!(
-                            "FAT32: Reserved Cluster {:?} cannot be marked as free",
-                            cluster
-                        );
-                        return Err(SystemError::EPERM);
-                    }
-
-                    // 计算要写入的值
-                    let mut raw_val: u32 = match fat_entry {
-                        FATEntry::Unused => 0,
-                        FATEntry::Bad => 0x0FFFFFF7,
-                        FATEntry::EndOfChain => 0x0FFFFFFF,
-                        FATEntry::Next(c) => c.cluster_num as u32,
-                    };
-
-                    // 恢复保留位
-                    raw_val |= old_bits;
-
-                    // debug!("sent entry, raw_val={raw_val}");
-
-                    cursor.seek(SeekFrom::SeekSet(in_block_offset as i64))?;
-                    cursor.write_u32(raw_val)?;
-
-                    self.gendisk.write_at(cursor.as_slice(), lba)?;
-                }
-
-                self.fat_cache_store(cluster.cluster_num, cache_val);
-                return Ok(());
-            }
-        }
-    }
-
     /// # 清空指定的簇
     ///
     /// # 参数
@@ -2172,7 +1697,7 @@ impl FATFileSystem {
     fn zero_cluster_with_buffer(&self, cluster: Cluster, zeros: &[u8]) -> Result<(), SystemError> {
         debug_assert_eq!(zeros.len(), self.bytes_per_cluster() as usize);
         let offset = self.cluster_bytes_offset(cluster) as usize;
-        self.gendisk.write_at_bytes(zeros, offset)?;
+        super::table::write_exact_at(&self.gendisk, zeros, offset)?;
         Ok(())
     }
 }
@@ -2209,7 +1734,7 @@ impl FATFsInfo {
         let mut v = vec![0; bytes_per_sec];
 
         // 读取磁盘上的FsInfo扇区
-        gendisk.read_at_bytes(&mut v, in_gendisk_fs_info_offset)?;
+        super::table::read_exact_at(gendisk, &mut v, in_gendisk_fs_info_offset)?;
 
         let mut cursor = VecCursor::new(v);
 
@@ -2226,7 +1751,7 @@ impl FATFsInfo {
 
         fsinfo.trail_sig = cursor.read_u32()?;
         fsinfo.dirty = false;
-        fsinfo.offset = Some(gendisk.disk_bytes_offset(in_gendisk_fs_info_offset) as u64);
+        fsinfo.offset = Some(in_gendisk_fs_info_offset as u64);
 
         if fsinfo.is_valid() {
             return Ok(fsinfo);
@@ -2268,6 +1793,7 @@ impl FATFsInfo {
     #[allow(dead_code)]
     pub fn update_free_count_abs(&mut self, new_count: u32) {
         self.free_count = new_count;
+        self.dirty = true;
     }
 
     /// @brief 更新FsInfo中的“空闲簇统计信息“，把它加上delta.
@@ -2278,7 +1804,11 @@ impl FATFsInfo {
         // FAT32 FSInfo 的 free_count 可能为 0xFFFFFFFF（表示不可用/未初始化）。
         // 在这种情况下不应做增量更新，否则会发生溢出并产生错误统计值。
         if self.free_count != 0xFFFF_FFFF {
-            self.free_count = (self.free_count as i32 + delta) as u32;
+            self.free_count = self
+                .free_count
+                .checked_add_signed(delta)
+                .unwrap_or(u32::MAX);
+            self.dirty = true;
         }
     }
 
@@ -2288,6 +1818,7 @@ impl FATFsInfo {
     pub fn update_next_free(&mut self, next_free: u32) {
         // 这个值是参考量，不一定要准确，仅供加速查找
         self.next_free = next_free;
+        self.dirty = true;
     }
 
     /// @brief 获取fs info 记载的第一个空闲簇。（不一定准确，仅供参考）
@@ -2302,14 +1833,19 @@ impl FATFsInfo {
     /// @brief 把fs info刷入磁盘
     ///
     /// @param partition fs info所在的分区
-    pub fn flush(&self, gendisk: &Arc<GenDisk>) -> Result<(), SystemError> {
+    pub fn flush(&mut self, gendisk: &Arc<GenDisk>) -> Result<(), SystemError> {
+        if !self.dirty {
+            return Ok(());
+        }
         if let Some(off) = self.offset {
             let in_block_offset = off % LBA_SIZE as u64;
 
             let lba = off as usize / LBA_SIZE;
 
             let mut v: Vec<u8> = vec![0; LBA_SIZE];
-            gendisk.read_at(&mut v, lba)?;
+            if gendisk.read_at(&mut v, lba)? != v.len() {
+                return Err(SystemError::EIO);
+            }
 
             let mut cursor: VecCursor = VecCursor::new(v);
             cursor.seek(SeekFrom::SeekSet(in_block_offset as i64))?;
@@ -2322,8 +1858,11 @@ impl FATFsInfo {
             cursor.seek(SeekFrom::SeekCurrent(12))?;
             cursor.write_u32(self.trail_sig)?;
 
-            gendisk.write_at(cursor.as_slice(), lba)?;
+            if gendisk.write_at(cursor.as_slice(), lba)? != cursor.as_slice().len() {
+                return Err(SystemError::EIO);
+            }
         }
+        self.dirty = false;
         return Ok(());
     }
 
@@ -2338,7 +1877,14 @@ impl FATFsInfo {
             let lba = off as usize / LBA_SIZE;
 
             let mut v: Vec<u8> = vec![0; LBA_SIZE];
-            partition.disk().read_at(lba, 1, &mut v)?;
+            let device_lba = partition
+                .lba_start
+                .checked_add(lba as u64)
+                .and_then(|value| usize::try_from(value).ok())
+                .ok_or(SystemError::EOVERFLOW)?;
+            if partition.disk().read_at(device_lba, 1, &mut v)? != v.len() {
+                return Err(SystemError::EIO);
+            }
             let mut cursor: VecCursor = VecCursor::new(v);
             cursor.seek(SeekFrom::SeekSet(in_block_offset as i64))?;
             self.lead_sig = cursor.read_u32()?;

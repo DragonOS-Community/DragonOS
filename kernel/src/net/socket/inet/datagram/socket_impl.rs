@@ -96,7 +96,8 @@ impl Socket for UdpSocket {
         if let Some(len) = self.receive_queue.first_len() {
             return len;
         }
-        match self.inner.read().as_ref() {
+        match self.inner.write().as_mut() {
+            Some(UdpInner::Unbound(unbound)) => unbound.recv_bytes_available(),
             Some(UdpInner::Bound(bound)) => {
                 // For UDP, FIONREAD should return the size of the first packet,
                 // not the total bytes in the queue
@@ -112,12 +113,6 @@ impl Socket for UdpSocket {
     fn connect(&self, endpoint: Endpoint) -> Result<(), SystemError> {
         match endpoint {
             Endpoint::Ip(remote) => {
-                // Port 0 is treated as disconnect (like AF_UNSPEC)
-                // This matches Linux behavior where connect() to port 0 succeeds but disconnects the socket
-                if remote.port == 0 {
-                    return self.disconnect_udp();
-                }
-
                 let remote = Self::normalize_unspecified_dest(remote);
                 loop {
                     // Like inet_autobind before prot->connect, this stage owns
@@ -134,18 +129,31 @@ impl Socket for UdpSocket {
                     };
                     let (required_oif, multicast_source) =
                         output_flow::socket_constraints(self, remote.addr)?;
-                    let connected_source = output_flow::resolve_ipv4_send_flow(
-                        &self.netns,
-                        local,
-                        remote.addr,
-                        required_oif,
-                        multicast_source,
-                    )?
-                    .map(|flow| flow.source);
+                    let connected_source = match remote.addr {
+                        Ipv4(_) => output_flow::resolve_ipv4_send_flow(
+                            &self.netns,
+                            local,
+                            remote.addr,
+                            required_oif,
+                            multicast_source,
+                        )?
+                        .map(|flow| flow.source),
+                        Ipv6(_) => Some(
+                            crate::net::route::resolve_ipv6_send_route(
+                                &self.netns,
+                                remote.addr,
+                                required_oif,
+                                local.addr,
+                            )?
+                            .source
+                            .into(),
+                        ),
+                    };
                     return match self.inner.read().as_ref() {
                         Some(UdpInner::Bound(inner)) => {
                             inner.connect(remote, connected_source);
                             self.receive_queue.connect(remote, connected_source);
+                            inner.update_receive_filter(self.bound_device_ifindex());
                             Ok(())
                         }
                         Some(_) => Err(SystemError::ENOTCONN),
@@ -455,7 +463,13 @@ impl Socket for UdpSocket {
 
     fn remote_endpoint(&self) -> Result<Endpoint, SystemError> {
         match self.inner.read().as_ref() {
-            Some(UdpInner::Bound(bound)) => Ok(self.name_endpoint(bound.remote_endpoint()?)),
+            Some(UdpInner::Bound(bound)) => {
+                let remote = bound.remote_endpoint()?;
+                if remote.port == 0 {
+                    return Err(SystemError::ENOTCONN);
+                }
+                Ok(self.name_endpoint(remote))
+            }
             Some(_) => Err(SystemError::ENOTCONN),
             None => Err(SystemError::EBADF),
         }
@@ -503,10 +517,10 @@ impl Socket for UdpSocket {
 
                 Ok(self.name_endpoint(IpEndpoint::new(local_addr, port)))
             }
-            Some(_) => match self.ip_version {
-                IpVersion::Ipv4 => Ok(Endpoint::Ip(UNSPECIFIED_LOCAL_ENDPOINT_V4)),
-                IpVersion::Ipv6 => Ok(Endpoint::Ip(UNSPECIFIED_LOCAL_ENDPOINT_V6)),
-            },
+            Some(UdpInner::Unbound(unbound)) => Ok(self.name_endpoint(IpEndpoint::new(
+                unbound.bound_address().unwrap_or(unspecified_addr),
+                0,
+            ))),
             None => Err(SystemError::EBADF),
         }
     }
@@ -550,60 +564,39 @@ impl Socket for UdpSocket {
         let buf_cap = buf.len();
 
         // Receive data from socket
-        let (copy_len, src_endpoint, orig_len, dst_addr, ifindex) = {
-            let peek = flags.contains(PMSG::PEEK);
-            if self.is_nonblock() || flags.contains(PMSG::DONTWAIT) {
-                let (copy_len, endpoint, orig_len, dst_addr, ifindex) =
-                    self.try_recv_with_meta(&mut buf, peek)?;
-                (
-                    copy_len,
-                    Endpoint::Ip(endpoint),
-                    orig_len,
-                    dst_addr,
-                    ifindex,
-                )
-            } else {
-                loop {
-                    // Re-check shutdown state inside the loop
-                    let shutdown_bits = self.shutdown.load(Ordering::Acquire);
-                    let is_recv_shutdown = shutdown_bits & 0x01 != 0;
-
-                    match self.try_recv_with_meta(&mut buf, peek) {
-                        Ok((copy_len, endpoint, orig_len, dst_addr, ifindex)) => {
-                            break (
-                                copy_len,
-                                Endpoint::Ip(endpoint),
-                                orig_len,
-                                dst_addr,
-                                ifindex,
-                            );
-                        }
-                        Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
-                            // If shutdown and no data available, return EOF
-                            if is_recv_shutdown {
-                                if let Some(UdpInner::Bound(bound)) = self.inner.read().as_ref() {
-                                    if let Ok(remote) = bound.remote_endpoint() {
-                                        break (
-                                            0,
-                                            Endpoint::Ip(remote),
-                                            0,
-                                            self.unspecified_addr(),
-                                            0,
-                                        );
-                                    }
-                                }
-                                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+        let peek = flags.contains(PMSG::PEEK);
+        let received = loop {
+            match self.try_recv_with_meta(&mut buf, peek) {
+                Ok(received) => break received,
+                Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
+                    if !self.is_nonblock() && !flags.contains(PMSG::DONTWAIT) =>
+                {
+                    if self.shutdown.load(Ordering::Acquire) & 0x01 != 0 {
+                        let inner = self.inner.read();
+                        if let Some(UdpInner::Bound(bound)) = inner.as_ref() {
+                            if let Ok(remote) = bound.remote_endpoint() {
+                                break inner::UdpReceived {
+                                    copied: 0,
+                                    source: remote,
+                                    original_len: 0,
+                                    destination: IpEndpoint::new(self.unspecified_addr(), 0),
+                                    ifindex: 0,
+                                };
                             }
-                            self.wait_queue.wait_event_io_interruptible_timeout(
-                                || self.can_recv(),
-                                self.recv_timeout(),
-                            )?;
                         }
-                        Err(e) => return Err(e),
+                        return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
                     }
+                    self.wait_queue.wait_event_io_interruptible_timeout(
+                        || self.can_recv(),
+                        self.recv_timeout(),
+                    )?;
                 }
+                Err(error) => return Err(error),
             }
         };
+        let copy_len = received.copied;
+        let orig_len = received.original_len;
+        let src_endpoint = Endpoint::Ip(received.source);
 
         // log::debug!(
         //     "recv_msg: received {} bytes from {:?}",
@@ -645,7 +638,12 @@ impl Socket for UdpSocket {
                 len: cmsg_len,
                 write_off: &mut write_off,
             };
-            self.build_udp_recv_cmsgs(&mut cmsg_buf, &mut msg.msg_flags, dst_addr, ifindex)?;
+            self.build_udp_recv_cmsgs(
+                &mut cmsg_buf,
+                &mut msg.msg_flags,
+                received.destination,
+                received.ifindex,
+            )?;
             msg.msg_controllen = write_off;
         }
 
@@ -689,36 +687,22 @@ impl Socket for UdpSocket {
         }
         let queued_data = !self.receive_queue.is_empty();
         match self.inner.read().as_ref() {
-            Some(UdpInner::Unbound(_)) => {
+            Some(UdpInner::Unbound(unbound)) => {
                 if self.send_account.is_writable() {
                     event.insert(EP::EPOLLOUT | EP::EPOLLWRNORM | EP::EPOLLWRBAND);
                 }
-                if queued_data {
+                if queued_data || unbound.can_recv() {
                     event.insert(EP::EPOLLIN | EP::EPOLLRDNORM);
                 }
             }
             Some(UdpInner::Bound(bound)) => {
-                let (can_recv, can_send) =
-                    bound.with_socket(|socket| (socket.can_recv(), socket.can_send()));
-                let remote = bound.remote_endpoint().ok();
-                let connected_native_ipv6 = self.ip_version == IpVersion::Ipv6
-                    && remote.is_some_and(uses_prepared_ipv6_output);
+                let can_recv = bound.with_socket(|socket| socket.can_recv());
 
                 if can_recv || queued_data {
                     event.insert(EP::EPOLLIN | EP::EPOLLRDNORM);
                 }
 
-                let writable = if self.ip_version == IpVersion::Ipv4 || connected_native_ipv6 {
-                    self.send_account.is_writable()
-                } else if remote.is_none() {
-                    // An unconnected socket can choose the prepared IPv6
-                    // path on its next sendto(). Do not report writable just
-                    // because the unrelated legacy queue has spare space.
-                    self.send_account.is_writable()
-                } else {
-                    can_send
-                };
-                if writable {
+                if self.send_account.is_writable() {
                     event.insert(EP::EPOLLOUT | EP::EPOLLWRNORM | EP::EPOLLWRBAND);
                 }
             }
@@ -735,23 +719,10 @@ impl Socket for UdpSocket {
     }
 
     fn send_bytes_available(&self) -> Result<usize, SystemError> {
-        if self.ip_version == IpVersion::Ipv4 {
-            return Ok(self.send_account.available());
-        }
-        Ok(match self.inner.read().as_ref() {
-            Some(UdpInner::Bound(bound)) => {
-                if bound
-                    .remote_endpoint()
-                    .ok()
-                    .is_some_and(uses_prepared_ipv6_output)
-                {
-                    self.send_account.available()
-                } else {
-                    bound.with_socket(|socket| socket.payload_send_capacity() - socket.send_queue())
-                }
-            }
-            Some(UdpInner::Unbound(_)) => self.send_account.available(),
-            None => 0,
+        Ok(if self.inner.read().is_some() {
+            self.send_account.available()
+        } else {
+            0
         })
     }
 }

@@ -108,6 +108,17 @@ impl SocketDeviceBinding {
         })
     }
 
+    /// Protocol disconnect clears sk_bound_dev_if without a new user option
+    /// authorization. Keep the same writer transaction and lock order.
+    pub(crate) fn prepare_clear(&self) -> DeviceBindingUpdate<'_> {
+        DeviceBindingUpdate {
+            binding: self,
+            _guard: self.update_lock.lock(),
+            target_ifindex: 0,
+            target_iface: None,
+        }
+    }
+
     pub fn get(&self, netns: &Arc<NetNamespace>, value: &mut [u8]) -> Result<usize, SystemError> {
         let ifindex = self.ifindex();
         if ifindex == 0 {

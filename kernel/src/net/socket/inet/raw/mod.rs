@@ -42,7 +42,6 @@ pub use constants::{SOCK_MIN_RCVBUF, SOCK_MIN_SNDBUF, SYSCTL_RMEM_MAX, SYSCTL_WM
 #[allow(unused_imports)]
 pub use options::{Icmp6Filter, IcmpFilter, RawSocketOptions};
 
-pub(crate) use loopback::deliver_udp_loopback_packet;
 pub(crate) use loopback::{snapshot_raw_ingress_listeners, RawIngressListener, RawIngressWork};
 pub(crate) use pmtu::handle_pmtu_feedback;
 

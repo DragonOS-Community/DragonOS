@@ -10,6 +10,8 @@ normal/ext4_xattr
 normal/ext4_inode_identity
 normal/fat_statfs
 normal/fat_concurrent_allocation
+normal/fat_loop_durability
+normal/fat_table_durability
 normal/fallocate_semantics
 normal/syncfs_semantics
 normal/fcntl_lock

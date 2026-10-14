@@ -194,3 +194,7 @@ normal/udp_source_route
 normal/udp_disconnect_semantics
 normal/udp_unspec_bind
 fuse/stat_blocks
+
+normal/ext4_truncate_dirty
+normal/ext4_truncate_synced
+normal/ext4_truncate_remounted

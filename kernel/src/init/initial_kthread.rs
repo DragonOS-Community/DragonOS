@@ -115,6 +115,7 @@ fn kenrel_init_freeable() -> Result<(), SystemError> {
     crate::exception::workqueue::workqueue_init();
     crate::filesystem::page_cache::init_read_completion_queue();
     crate::security::keys::object::init();
+    crate::filesystem::vfs::mount::init_shutdown_workqueue();
     crate::perf::release::init();
     return Ok(());
 }

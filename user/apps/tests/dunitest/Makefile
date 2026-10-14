@@ -20,6 +20,7 @@ RESULTS_DIR = results
 BIN_DIR = bin
 BUILD_DIR = build
 EXT4_FIXTURE = $(BUILD_DIR)/fixtures/ext4_inode_identity.img
+EXT4_TRUNCATE_FIXTURE = $(BUILD_DIR)/fixtures/ext4_truncate_delalloc.img
 EXT4_UNINIT_FIXTURE = $(BUILD_DIR)/fixtures/ext4_uninit_bitmap.img
 FAT_STAT_FIXTURE = $(BUILD_DIR)/fixtures/fat_stat_blocks.img
 FAT32_STAT_FIXTURE = $(BUILD_DIR)/fixtures/fat32_stat_blocks.img
@@ -63,7 +64,7 @@ $(GTEST_SRC):
 	@mv "$(GTEST_TMP_ROOT)" "$(GTEST_ROOT)"
 	@test -f "$(GTEST_SRC)"
 
-build-suites: $(TEST_BINS) $(EXT4_FIXTURE) $(EXT4_UNINIT_FIXTURE) $(FAT_STAT_FIXTURE) $(FAT32_STAT_FIXTURE) $(FAT12_DIRECTORY_FIXTURE) $(FAT16_DIRECTORY_FIXTURE)
+build-suites: $(TEST_BINS) $(EXT4_FIXTURE) $(EXT4_UNINIT_FIXTURE) $(FAT_STAT_FIXTURE) $(FAT32_STAT_FIXTURE) $(FAT12_DIRECTORY_FIXTURE) $(FAT16_DIRECTORY_FIXTURE) $(EXT4_TRUNCATE_FIXTURE)
 
 $(FAT12_DIRECTORY_FIXTURE):
 	@mkdir -p "$(dir $@)"
@@ -102,6 +103,20 @@ $(EXT4_FIXTURE):
 		esac; \
 	}
 
+# Preserve the original two 64 MiB file preparation on a disposable 1 GiB FS.
+$(EXT4_TRUNCATE_FIXTURE):
+	@mkdir -p "$(dir $@)"
+	@truncate -s 1G "$@"
+	@output=$$(mke2fs -q -t ext4 -F -O ^orphan_file "$@" 2>&1) || { \
+		case "$$output" in \
+			*"Invalid filesystem option set: ^orphan_file"*) \
+				rm -f "$@"; \
+				truncate -s 1G "$@"; \
+				mke2fs -q -t ext4 -F "$@" ;; \
+			*) printf '%s\n' "$$output" >&2; exit 1 ;; \
+		esac; \
+	}
+
 # Small block groups force a modest payload into legal BLOCK_UNINIT groups.
 # Keep lazy bitmap initialization enabled; never pre-mount this source image.
 $(EXT4_UNINIT_FIXTURE):
@@ -135,6 +150,8 @@ $(BIN_DIR)/normal/mount_idmap_test $(BIN_DIR)/normal/proc_fd_permission_test: su
 
 $(BIN_DIR)/fuse/stat_blocks_test: suites/fuse/fuse_gtest_common.h suites/fuse/fuse_test_simplefs_local.h
 
+$(addprefix $(BIN_DIR)/normal/ext4_truncate_,$(addsuffix _test,dirty synced remounted)): suites/normal/loop_ext4_test_support.h suites/normal/ext4_truncate_delalloc_test.h
+
 $(BIN_DIR)/normal/forward_mtu_test: suites/normal/forward_mtu_nft_support.h
 $(BIN_DIR)/normal/endpoint_pmtu_test $(BIN_DIR)/normal/udp_source_route_test: suites/normal/rtnetlink_route_test_support.h
 
@@ -154,7 +171,7 @@ install: build
 	@chmod +x $(INSTALL_DIR)/dunitest-runner
 	@cp -rf $(BIN_DIR) $(INSTALL_DIR)/
 	@mkdir -p $(INSTALL_DIR)/fixtures
-	@cp --sparse=always -f $(EXT4_FIXTURE) $(EXT4_UNINIT_FIXTURE) $(FAT_STAT_FIXTURE) $(FAT32_STAT_FIXTURE) $(FAT12_DIRECTORY_FIXTURE) $(FAT16_DIRECTORY_FIXTURE) $(INSTALL_DIR)/fixtures/
+	@cp --sparse=always -f $(EXT4_FIXTURE) $(EXT4_UNINIT_FIXTURE) $(FAT_STAT_FIXTURE) $(FAT32_STAT_FIXTURE) $(FAT12_DIRECTORY_FIXTURE) $(FAT16_DIRECTORY_FIXTURE) $(EXT4_TRUNCATE_FIXTURE) $(INSTALL_DIR)/fixtures/
 	@cp -f whitelist.txt $(INSTALL_DIR)/whitelist.txt
 	@cp -f no_skip.txt $(INSTALL_DIR)/no_skip.txt
 	@cp -f scripts/run_tests.sh $(INSTALL_DIR)/run_tests.sh

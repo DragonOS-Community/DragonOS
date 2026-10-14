@@ -40,10 +40,6 @@ impl Syscall for SysTimerSettimeHandle {
         let new_value_ptr = Self::new_value(args);
         let old_value_ptr = Self::old_value(args);
 
-        // 暂不支持 TIMER_ABSTIME 等 flag
-        if flags != 0 {
-            return Err(SystemError::EINVAL);
-        }
         if new_value_ptr.is_null() {
             return Err(SystemError::EINVAL);
         }
@@ -53,9 +49,9 @@ impl Syscall for SysTimerSettimeHandle {
         let new_value = reader.buffer_protected(0)?.read_one::<PosixItimerspec>(0)?;
 
         let pcb = ProcessManager::current_pcb();
-        let old = pcb
-            .posix_timers_irqsave()
-            .settime(&pcb, timerid, new_value)?;
+        let group = pcb.process_signal();
+        let timer = group.posix_timers().lock_irqsave().get_timer(timerid)?;
+        let old = timer.settime(flags, new_value)?;
 
         if !old_value_ptr.is_null() {
             let mut writer =

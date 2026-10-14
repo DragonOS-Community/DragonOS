@@ -4,7 +4,10 @@ use core::{
     sync::atomic::{compiler_fence, Ordering},
 };
 
-use alloc::{sync::Arc, vec::Vec};
+use alloc::{
+    sync::{Arc, Weak},
+    vec::Vec,
+};
 use log::warn;
 use system_error::SystemError;
 
@@ -508,7 +511,7 @@ impl Signal {
         if is_thread_target {
             // 线程级信号：添加到线程的 sig_pending
             let mut guard = siginfo_guard;
-            guard.sig_pending_mut().queue_mut().q.push(info);
+            guard.sig_pending_mut().queue_mut().push_normal(info);
             guard.sig_pending_mut().signal_mut().insert((*self).into());
             drop(guard);
         } else {
@@ -600,13 +603,21 @@ impl Signal {
             return false;
         }
 
-        // Preserve the old ordering: collect the group before the first wake
-        // can let another CPU change membership.  The explicit target below
-        // remains independent of this second group-leader lookup.
-        let tasks = ProcessManager::thread_group_tasks_snapshot(target.clone());
+        // Freeze published membership before the first wake, without an IRQ
+        // allocation. Reapers retain their PCB until they can remove its Weak
+        // under this list's write lock; the leader and target are pinned here.
+        // Signal/pending guards are released before wakeup's pi -> rq locks.
+        let leader = ProcessManager::thread_group_leader_of(&target);
+        let threads = leader.threads_read_irqsave();
         Self::queue_private_sigkill_to_thread(&target);
-        for task in tasks {
-            if Arc::ptr_eq(&task, &target) {
+        if !Arc::ptr_eq(&leader, &target) {
+            Self::queue_private_sigkill_to_thread(&leader);
+        }
+        for weak in threads.group_tasks() {
+            let Some(task) = weak.upgrade() else {
+                continue;
+            };
+            if Arc::ptr_eq(&task, &target) || Arc::ptr_eq(&task, &leader) {
                 continue;
             }
             Self::queue_private_sigkill_to_thread(&task);
@@ -667,31 +678,42 @@ impl Signal {
         }
 
         let leader = ProcessManager::thread_group_leader_of(&suggested);
-        // Zero-allocation probe: an empty group-task list means the leader is the only thread, so return without building a snapshot.
-        if leader.threads_read_irqsave().group_tasks_is_empty() {
-            return None;
-        }
-        let tasks = ProcessManager::thread_group_tasks_snapshot(leader.clone());
-
+        // inner -> threads is the group-exit/publication order. Read the
+        // round-robin cursor before borrowing membership, and update it only
+        // after dropping the list guard. No per-notification snapshot needed.
         let start = suggested
             .process_signal()
             .curr_target()
             .unwrap_or_else(|| leader.clone());
+        let threads = leader.threads_read_irqsave();
+        let tasks = threads.group_tasks();
         let start_index = tasks
             .iter()
-            .position(|task| Arc::ptr_eq(task, &start))
+            .position(|task| Weak::ptr_eq(task, &Arc::downgrade(&start)))
+            .map(|index| index + 1)
             .unwrap_or(0);
-
-        for offset in 0..tasks.len() {
-            let idx = (start_index + offset) % tasks.len();
-            let task = tasks[idx].clone();
+        let count = tasks.len() + 1;
+        let mut selected = None;
+        for offset in 0..count {
+            let idx = (start_index + offset) % count;
+            let task = if idx == 0 {
+                Some(leader.clone())
+            } else {
+                tasks[idx - 1].upgrade()
+            };
+            let Some(task) = task else {
+                continue;
+            };
             if self.wants_signal(task.clone()) {
-                suggested.process_signal().set_curr_target(&task);
-                return Some(task);
+                selected = Some(task);
+                break;
             }
         }
-
-        None
+        drop(threads);
+        if let Some(task) = &selected {
+            suggested.process_signal().set_curr_target(task);
+        }
+        selected
     }
 
     /// 本函数用于检测指定的进程是否想要接收SIG这个信号。
@@ -983,7 +1005,7 @@ impl ProcessControlBlock {
     /// 按“线程 pending -> 进程 shared pending”的顺序取出一个可见信号。
     /// Release the private queue before entering the process pending queue.
     pub fn dequeue_pending_signal(&self, sig_mask: &SigSet) -> (Signal, Option<SigInfo>) {
-        let res = {
+        let mut res = {
             let mut siginfo = self.sig_info_mut();
             let res = siginfo.sig_pending_mut().dequeue_signal(sig_mask);
             if res.0 != Signal::INVALID {
@@ -1000,6 +1022,21 @@ impl ProcessControlBlock {
                 res
             }
         };
+        // Pending locks are released before timer rearm. Expiry takes the
+        // timer lock before the pending lock; reversing it would deadlock.
+        if let Some(info) = &mut res.1 {
+            if let Some(token) = info.timer_token() {
+                if let crate::ipc::signal_types::SigType::PosixTimer { timerid, .. } =
+                    info.sig_type()
+                {
+                    let group = self.process_signal();
+                    let timer = group.posix_timers().lock_irqsave().get_timer(*timerid);
+                    if let Ok(timer) = timer {
+                        timer.signal_dequeued(token, info);
+                    }
+                }
+            }
+        }
         self.recalc_sigpending();
         res
     }
@@ -1306,7 +1343,7 @@ pub struct PollRestartBlockData {
     pub timeout_instant: Option<Instant>,
 }
 
-fn ktime_now(clockid: PosixClockID) -> PosixTimeSpec {
+fn ktime_now(clockid: PosixClockID) -> Result<PosixTimeSpec, SystemError> {
     posix_clock_now(clockid)
 }
 
@@ -1347,33 +1384,22 @@ impl RestartFn for RestartFnNanosleep {
             let deadline_ns = (deadline.tv_sec as u64)
                 .saturating_mul(1_000_000_000)
                 .saturating_add(deadline.tv_nsec as u64);
-            let wait_res = match *clockid {
-                PosixClockID::ProcessCPUTimeID => {
-                    let current = ProcessManager::current_pcb();
-                    let leader = if current.is_thread_group_leader() {
-                        current
-                    } else {
-                        current
-                            .threads_read_irqsave()
-                            .group_leader()
-                            .unwrap_or_else(ProcessManager::current_pcb)
-                    };
-                    if leader.process_cputime_ns() >= deadline_ns {
-                        Ok(())
-                    } else {
-                        leader.process_signal().wait_cpu_time(deadline_ns, || {
-                            leader.process_cputime_ns() >= deadline_ns
-                        })
-                    }
-                }
-                PosixClockID::ThreadCPUTimeID => return Err(SystemError::EINVAL),
-                _ => {
-                    let now = ktime_now(*clockid);
-                    let remain = calc_remaining(deadline, &now);
-                    if remain.tv_sec == 0 && remain.tv_nsec == 0 {
-                        Ok(())
-                    } else {
-                        nanosleep(remain)
+            let cpu_sleep = crate::time::cpu_clock::CpuClockSleep::resolve(*clockid)?;
+            let wait_res = if let Some(cpu) = &cpu_sleep {
+                cpu.wait(deadline_ns)
+            } else {
+                match *clockid {
+                    PosixClockID::ProcessCPUTimeID
+                    | PosixClockID::ThreadCPUTimeID
+                    | PosixClockID::DynamicCpuClock(_) => return Err(SystemError::EINVAL),
+                    _ => {
+                        let now = ktime_now(*clockid)?;
+                        let remain = calc_remaining(deadline, &now);
+                        if remain.tv_sec == 0 && remain.tv_nsec == 0 {
+                            Ok(())
+                        } else {
+                            nanosleep(remain)
+                        }
                     }
                 }
             };
@@ -1381,7 +1407,11 @@ impl RestartFn for RestartFnNanosleep {
             match wait_res {
                 Ok(()) => return Ok(0),
                 Err(SystemError::ERESTARTSYS) => {
-                    let remaining = calc_remaining(deadline, &ktime_now(*clockid));
+                    let now = match &cpu_sleep {
+                        Some(cpu) => cpu.now(),
+                        None => ktime_now(*clockid)?,
+                    };
+                    let remaining = calc_remaining(deadline, &now);
                     if remaining.is_empty() {
                         return Ok(0);
                     }

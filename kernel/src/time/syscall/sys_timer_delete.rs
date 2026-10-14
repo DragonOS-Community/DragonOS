@@ -23,7 +23,9 @@ impl Syscall for SysTimerDeleteHandle {
     fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let timerid = Self::timerid(args);
         let pcb = ProcessManager::current_pcb();
-        pcb.posix_timers_irqsave().delete(&pcb, timerid)?;
+        let group = pcb.process_signal();
+        let timer = group.posix_timers().lock_irqsave().remove(timerid)?;
+        timer.delete();
         Ok(0)
     }
 

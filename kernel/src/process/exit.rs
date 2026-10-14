@@ -1047,6 +1047,12 @@ impl ProcessControlBlock {
         // Settle before acquiring relation/membership locks. Their inner
         // aggregation below must not acquire pi/rq locks in reverse order.
         self.thread_cputime_ns();
+        // CPU timer measurement ends at PID unhash, not at the first exit
+        // notification. Retire registrations without fabricating expiry.
+        self.cpu_event_domain().retire();
+        if group_dead {
+            self.process_signal().cpu_event_domain().retire();
+        }
         let exit_rusage = self.exit_resource_snapshot();
         let mut notify_leader = None;
         if let Some(leader) = thread_group_leader {

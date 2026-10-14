@@ -60,7 +60,7 @@ impl ProcessSignalState {
 
     pub fn shared_pending_push(&self, sig: Signal, info: SigInfo) {
         let mut pending = self.body.pending.lock_irqsave();
-        pending.queue_mut().q.push(info);
+        pending.queue_mut().push_normal(info);
         pending.signal_mut().insert(sig.into());
     }
 
@@ -80,7 +80,7 @@ impl ProcessSignalState {
         {
             return false;
         }
-        pending.queue_mut().q.push(info);
+        pending.queue_mut().push_normal(info);
         pending.signal_mut().insert(sig.into());
         true
     }

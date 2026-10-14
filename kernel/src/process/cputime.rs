@@ -13,16 +13,20 @@ pub struct ProcessCpuTime {
     pub stime: AtomicU64,
     pub sum_exec_runtime: AtomicU64,
     adjusted: SpinLock<AdjustedCpuTime>,
+    events: Arc<crate::time::cpu_events::CpuEventDomain>,
 }
 
-impl Default for ProcessCpuTime {
-    fn default() -> Self {
-        Self {
+impl ProcessCpuTime {
+    pub(crate) fn try_new_for(
+        creator: &Arc<crate::cgroup::memory::object::ObjectAccount>,
+    ) -> Result<Self, crate::mm::allocation::MemoryAllocationError> {
+        Ok(Self {
             utime: AtomicU64::new(0),
             stime: AtomicU64::new(0),
             sum_exec_runtime: AtomicU64::new(0),
             adjusted: SpinLock::new(AdjustedCpuTime::default()),
-        }
+            events: crate::time::cpu_events::CpuEventDomain::try_new_for(creator)?,
+        })
     }
 }
 
@@ -41,6 +45,9 @@ impl CpuTimeSnapshot {
 }
 
 impl ProcessControlBlock {
+    pub(crate) fn cpu_event_domain(&self) -> Arc<crate::time::cpu_events::CpuEventDomain> {
+        self.cpu_time.events.clone()
+    }
     #[inline(always)]
     pub fn cputime(&self) -> &ProcessCpuTime {
         &self.cpu_time
@@ -80,10 +87,15 @@ impl ProcessControlBlock {
         }
     }
 
-    /// Keep the existing dynamic PROF-like clock separate from SCHED time.
-    pub(crate) fn thread_tick_cputime_ns(&self) -> u64 {
+    /// Tick-classified CPUCLOCK_VIRT/PROF inputs; no wall-time projection.
+    pub(crate) fn thread_tick_cputime(&self) -> (u64, u64) {
         let sample = self.settled_cputime();
-        sample.user.saturating_add(sample.system)
+        (sample.user, sample.system)
+    }
+
+    pub(crate) fn process_tick_cputime(&self) -> (u64, u64) {
+        let sample = self.process_cputime_snapshot();
+        (sample.user, sample.system)
     }
 
     /// 当前进程（线程组）的 CPU 时间（ns），语义对齐 Linux 的 CLOCK_PROCESS_CPUTIME_ID。
@@ -97,11 +109,6 @@ impl ProcessControlBlock {
             current.thread_cputime_ns();
         }
         self.process_signal().cpu_runtime()
-    }
-
-    pub(crate) fn process_tick_cputime_ns(&self) -> u64 {
-        let sample = self.process_cputime_snapshot();
-        sample.user.saturating_add(sample.system)
     }
 
     fn process_cputime_snapshot(&self) -> CpuTimeSnapshot {
@@ -173,6 +180,13 @@ impl ProcessControlBlock {
             return;
         }
         self.cpu_time.utime.fetch_add(ns, Ordering::Relaxed);
+        self.cpu_time
+            .events
+            .account(crate::time::cpu_clock::CpuClockKind::Virt, ns);
+        self.cpu_time
+            .events
+            .account(crate::time::cpu_clock::CpuClockKind::Prof, ns);
+        self.process_signal().account_cpu_user(ns);
     }
 
     #[inline(always)]
@@ -181,6 +195,10 @@ impl ProcessControlBlock {
             return;
         }
         self.cpu_time.stime.fetch_add(ns, Ordering::Relaxed);
+        self.cpu_time
+            .events
+            .account(crate::time::cpu_clock::CpuClockKind::Prof, ns);
+        self.process_signal().account_cpu_system(ns);
     }
 
     #[inline(always)]
@@ -192,5 +210,8 @@ impl ProcessControlBlock {
             .sum_exec_runtime
             .fetch_add(ns, Ordering::Relaxed);
         self.process_signal().account_cpu_runtime(ns);
+        self.cpu_time
+            .events
+            .account(crate::time::cpu_clock::CpuClockKind::Sched, ns);
     }
 }

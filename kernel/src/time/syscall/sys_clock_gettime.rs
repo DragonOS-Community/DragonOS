@@ -25,6 +25,8 @@ impl Syscall for SysClockGettime {
 
     fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let clock_id = PosixClockID::try_from(Self::clock_id(args))?;
+        // Linux resolves/samples the clock before accessing the output address.
+        let timespec = posix_clock_now(clock_id)?;
 
         let tp = Self::timespec_ptr(args);
         if tp.is_null() {
@@ -36,8 +38,6 @@ impl Syscall for SysClockGettime {
             core::mem::size_of::<PosixTimeSpec>(),
             true,
         )?;
-
-        let timespec = posix_clock_now(clock_id);
 
         tp_buf.buffer_protected(0)?.write_one(0, &timespec)?;
 

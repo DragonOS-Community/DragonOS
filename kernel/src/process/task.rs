@@ -53,7 +53,7 @@ use crate::{
 
 use crate::cgroup::memory::owned::OwnedBox;
 use crate::process::itimer::ItimerState;
-use crate::process::{posix_timer, ptrace, rseq, seccomp};
+use crate::process::{ptrace, rseq, seccomp};
 
 type TaskResourceLimits = RwLock<OwnedBox<[RLimit64; RLimitID::Nlimits as usize]>>;
 
@@ -312,7 +312,6 @@ pub struct ProcessControlBlockData {
     /// Alarm timer.
     pub(super) itimers: Arc<ItimerState>,
     /// POSIX interval timers (timer_create / timer_settime / ...).
-    pub(super) posix_timers: SpinLock<posix_timer::ProcessPosixTimers>,
 
     /// CPU time accounting.
     pub(super) cpu_time: ProcessCpuTime,
@@ -870,7 +869,7 @@ impl ProcessControlBlock {
             .map(|p| Arc::downgrade(&p))
             .unwrap_or_default();
 
-        let cpu_time = ProcessCpuTime::default();
+        let cpu_time = ProcessCpuTime::try_new_for(&creator)?;
         // No weak identity may escape or be upgraded before init. A failed
         // thin-header allocation drops an uninitialized PCB without entering
         // task cleanup; its still-private resources remain local RAII owners.
@@ -940,7 +939,6 @@ impl ProcessControlBlock {
                 fs: RwLock::new(initial_fs),
                 fs_slot_update_lock: Mutex::new(()),
                 itimers,
-                posix_timers: SpinLock::new(posix_timer::ProcessPosixTimers::default()),
                 cpu_time,
                 min_flt: AtomicU64::new(0),
                 maj_flt: AtomicU64::new(0),
@@ -2075,10 +2073,6 @@ impl ProcessControlBlock {
         return self.itimers.lock_irqsave();
     }
 
-    pub fn posix_timers_irqsave(&self) -> SpinLockGuard<'_, posix_timer::ProcessPosixTimers> {
-        return self.posix_timers.lock_irqsave();
-    }
-
     /// Clean up the timers of the current process/thread.
     ///
     /// References the timer cleanup logic in Linux's `do_exit()`:
@@ -2095,17 +2089,11 @@ impl ProcessControlBlock {
             self.itimers.lock_irqsave().exit();
         }
 
-        // POSIX timer_create storage has not been migrated to group ownership
-        // in this traditional-itimer change. Preserve its existing cleanup
-        // owner instead of accidentally cleaning a last worker's empty table.
-        if self.is_thread_group_leader() {
-            let mut posix_timers = self.posix_timers.lock_irqsave();
-            let timer_ids: alloc::vec::Vec<i32> = posix_timers.timer_ids().collect();
-            let self_arc = self.self_ref.upgrade();
-            if let Some(ref pcb) = self_arc {
-                for id in timer_ids {
-                    let _ = posix_timers.delete(pcb, id);
-                }
+        if group_dead {
+            let group = self.process_signal();
+            let timers = group.posix_timers().lock_irqsave().take_all();
+            for (_, timer) in timers {
+                timer.delete();
             }
         }
     }

@@ -80,7 +80,8 @@ struct ProcessSignalStateData {
     /// Unlike the per-task trapping queue, this survives a leader's exit.
     child_wait_queue: WaitQueue,
     pending: SpinLock<SigPending>,
-    cpu_time_wait: Arc<cpu_time::CpuTimeWait>,
+    posix_timers: SpinLock<crate::process::posix_timer::ProcessPosixTimers>,
+    cpu_events: Arc<crate::time::cpu_events::CpuEventDomain>,
     cpu_time_adjustment: SpinLock<crate::sched::cputime::AdjustedCpuTime>,
 }
 
@@ -141,7 +142,8 @@ impl ProcessSignalState {
             group_exec_wait_queue: WaitQueue::default(),
             child_wait_queue: WaitQueue::default(),
             pending: SpinLock::new(SigPending::default()),
-            cpu_time_wait: cpu_time::CpuTimeWait::try_new_for(creator)?,
+            posix_timers: SpinLock::new(crate::process::posix_timer::ProcessPosixTimers::default()),
+            cpu_events: crate::time::cpu_events::CpuEventDomain::try_new_for(creator)?,
             cpu_time_adjustment: SpinLock::new(crate::sched::cputime::AdjustedCpuTime::default()),
         });
         Ok(Arc::try_new(Self { body }).map_err(|_| SystemError::ENOMEM)?)
@@ -149,6 +151,12 @@ impl ProcessSignalState {
 
     pub(crate) fn cpu_time_adjustment(&self) -> &SpinLock<crate::sched::cputime::AdjustedCpuTime> {
         &self.body.cpu_time_adjustment
+    }
+
+    pub(crate) fn posix_timers(
+        &self,
+    ) -> &SpinLock<crate::process::posix_timer::ProcessPosixTimers> {
+        &self.body.posix_timers
     }
 
     pub(crate) fn group_exiting(&self) -> bool {

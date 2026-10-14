@@ -35,7 +35,9 @@ impl Syscall for SysTimerGettimeHandle {
             return Err(SystemError::EINVAL);
         }
         let pcb = ProcessManager::current_pcb();
-        let val = pcb.posix_timers_irqsave().gettime(timerid)?;
+        let group = pcb.process_signal();
+        let timer = group.posix_timers().lock_irqsave().get_timer(timerid)?;
+        let val = timer.gettime()?;
         let mut writer = UserBufferWriter::new(curr_value_ptr, size_of::<PosixItimerspec>(), true)?;
         // 用异常表保护版本写回，避免用户地址缺页/无效导致内核崩溃
         writer

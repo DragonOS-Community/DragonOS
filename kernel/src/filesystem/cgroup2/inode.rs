@@ -197,9 +197,7 @@ impl Cgroup2Inode {
                     local: ty == CgroupCoreFile::MemoryEventsLocal,
                 })
             }
-            CgroupCoreFile::Events => {
-                Some(super::event_notify::EventSource::Population(cgroup.clone()))
-            }
+            CgroupCoreFile::Events => Some(super::event_notify::EventSource::Core(cgroup.clone())),
             _ => None,
         };
         let seen = source.as_ref().map_or(0, |source| source.sequence());
@@ -723,9 +721,9 @@ impl PollableInode for Cgroup2Inode {
     fn poll(&self, data: &FilePrivateData) -> Result<usize, SystemError> {
         let flags = match data {
             FilePrivateData::Cgroup(open) => open
-                .memory_events
+                .events
                 .as_ref()
-                .map_or_else(super::memory_events::default_mask, |events| events.poll()),
+                .map_or_else(super::events::default_mask, |events| events.poll()),
             _ => return Err(SystemError::EINVAL),
         };
         Ok(flags.bits() as usize)
@@ -737,7 +735,7 @@ impl PollableInode for Cgroup2Inode {
         data: &FilePrivateData,
     ) -> Result<(), SystemError> {
         if let FilePrivateData::Cgroup(open) = data {
-            if let Some(events) = &open.memory_events {
+            if let Some(events) = &open.events {
                 events.add(item);
             }
             return Ok(());
@@ -751,7 +749,7 @@ impl PollableInode for Cgroup2Inode {
         data: &FilePrivateData,
     ) -> Result<(), SystemError> {
         if let FilePrivateData::Cgroup(open) = data {
-            if let Some(events) = &open.memory_events {
+            if let Some(events) = &open.events {
                 return events.remove(item);
             }
             return Ok(());
@@ -772,7 +770,7 @@ impl IndexNode for Cgroup2Inode {
     ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         let result: core::result::Result<_, system_error::SystemError> = (|| {
             let current = ProcessManager::current_pcb();
-            let memory_events = {
+            let events = {
                 let (cgroup, ty, generation) = {
                     let inner = self.inner.lock();
                     match &inner.kind {
@@ -783,7 +781,9 @@ impl IndexNode for Cgroup2Inode {
                             ..
                         } if matches!(
                             ty,
-                            CgroupCoreFile::MemoryEvents | CgroupCoreFile::MemoryEventsLocal
+                            CgroupCoreFile::MemoryEvents
+                                | CgroupCoreFile::MemoryEventsLocal
+                                | CgroupCoreFile::Events
                         ) =>
                         {
                             (Some(cgroup.clone()), *ty, *file_generation)
@@ -792,18 +792,12 @@ impl IndexNode for Cgroup2Inode {
                     }
                 };
                 if let Some(cgroup) = cgroup {
-                    let account = {
+                    let source = {
                         let _update = crate::cgroup::lock();
                         files::check_live_file(&cgroup, ty, generation)?;
-                        cgroup
-                            .local_memory_generation()
-                            .ok_or(SystemError::ENODEV)?
-                            .account
+                        self.event_source.clone().ok_or(SystemError::ENODEV)?
                     };
-                    Some(super::memory_events::MemoryEventOpen::new(
-                        account,
-                        ty == CgroupCoreFile::MemoryEventsLocal,
-                    )?)
+                    Some(super::events::CgroupEventOpen::new(source)?)
                 } else {
                     None
                 }
@@ -811,7 +805,7 @@ impl IndexNode for Cgroup2Inode {
             *data = FilePrivateData::Cgroup(super::CgroupOpenState {
                 cred: current.cred(),
                 namespace: current.nsproxy().cgroup_ns.clone(),
-                memory_events,
+                events,
             });
             Ok(())
         })();
@@ -820,7 +814,7 @@ impl IndexNode for Cgroup2Inode {
 
     fn close(&self, data: MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
         if let FilePrivateData::Cgroup(open) = &*data {
-            if let Some(events) = &open.memory_events {
+            if let Some(events) = &open.events {
                 events.close();
             }
         }
@@ -840,7 +834,7 @@ impl IndexNode for Cgroup2Inode {
     ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
         let result: core::result::Result<_, system_error::SystemError> = (|| {
             let events = match &*data {
-                FilePrivateData::Cgroup(open) => open.memory_events.clone(),
+                FilePrivateData::Cgroup(open) => open.events.clone(),
                 _ => None,
             };
             drop(data);

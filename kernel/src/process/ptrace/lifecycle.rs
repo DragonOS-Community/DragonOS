@@ -6,6 +6,7 @@ use super::{
     validate_ptrace_options, PtraceAccessCreds, PtraceFreezeToken, PtraceOptions,
     PtraceReleaseOutcome,
 };
+use crate::exception::InterruptArch;
 use crate::{
     arch::ipc::signal::{SigChildCode, SigFlags, Signal},
     ipc::{
@@ -18,6 +19,7 @@ use crate::{
     },
 };
 use alloc::sync::{Arc, Weak};
+use core::sync::atomic::Ordering;
 use system_error::SystemError;
 
 fn traceme_allowed(
@@ -59,9 +61,8 @@ fn traceme_parent_for(
 /// Join every already-published sibling to one shared group-stop transaction.
 /// The caller holds `PTRACE_RELATION_LOCK` and the shared sighand write lock;
 /// fork publication takes the same locks before adding a CLONE_THREAD child.
-/// Untraced siblings are committed synchronously by DragonOS' existing
-/// `stop_task`, while ptraced siblings receive one generation-bound ticket and
-/// complete it only after publishing their own reportable stop.
+/// Every sibling receives a generation-bound ticket and stops in its own
+/// context; sender-side suspension could strand a filesystem or cgroup lock.
 pub(super) fn arm_ptrace_group_stop_siblings_locked(
     current: &Arc<ProcessControlBlock>,
     signal: Signal,
@@ -78,7 +79,10 @@ pub(super) fn arm_ptrace_group_stop_siblings_locked(
     };
 
     let mut join = |task: &Arc<ProcessControlBlock>| {
-        if Arc::ptr_eq(task, current) || task.exit_state() != ExitState::Running {
+        if Arc::ptr_eq(task, current)
+            || task.exit_state() != ExitState::Running
+            || task.flags().contains(ProcessFlags::EXITING)
+        {
             return;
         }
         if is_ptraced_locked(task) {
@@ -104,7 +108,16 @@ pub(super) fn arm_ptrace_group_stop_siblings_locked(
                 ProcessManager::kick(task);
             }
         } else {
-            let _ = ProcessManager::stop_task(task);
+            if task.pending_group_stop_generation.load(Ordering::Acquire) != generation {
+                let added = group.add_ptrace_group_stop_participant(generation);
+                debug_assert!(added, "ordinary participant joined stale group stop");
+                task.pending_group_stop_generation
+                    .store(generation, Ordering::Release);
+                task.pending_group_stop_counted
+                    .store(true, Ordering::Release);
+            }
+            task.flags().insert(ProcessFlags::PENDING_GROUP_STOP);
+            wake_group_stop_request(task);
         }
     };
 
@@ -112,6 +125,129 @@ pub(super) fn arm_ptrace_group_stop_siblings_locked(
     let threads = leader.threads_read_irqsave();
     for sibling in threads.group_tasks().iter().filter_map(Weak::upgrade) {
         join(&sibling);
+    }
+}
+
+/// Publish work, never a remote scheduler stop. The persistent ticket closes
+/// wake-before-sleep races at the receiver's user-return boundary.
+fn wake_group_stop_request(task: &Arc<ProcessControlBlock>) {
+    if task.sched_info().state().is_stopped() {
+        let _ = ProcessManager::wakeup_stop_relation_locked(task);
+    } else if task.sched_info().state().is_blocked_interruptable() {
+        let _ = ProcessManager::wakeup(task);
+    }
+    ProcessManager::kick(task);
+}
+
+/// SIGSTOP has no userspace disposition. Ordinary catchable stop signals
+/// enter this transaction only after the receiving task chose the default
+/// action. Returns false when ptrace must first observe signal delivery.
+pub(crate) fn request_untraced_group_stop(
+    leader: &Arc<ProcessControlBlock>,
+    signal: Signal,
+) -> bool {
+    let _relation = PTRACE_RELATION_LOCK.lock_irqsave();
+    if group_has_ptraced_locked(leader) {
+        return false;
+    }
+    let initiator = if leader.exit_state() == ExitState::Running
+        && !leader.flags().contains(ProcessFlags::EXITING)
+    {
+        Some(leader.clone())
+    } else {
+        leader
+            .threads_read_irqsave()
+            .group_tasks()
+            .iter()
+            .filter_map(Weak::upgrade)
+            .find(|task| {
+                task.exit_state() == ExitState::Running
+                    && !task.flags().contains(ProcessFlags::EXITING)
+            })
+    };
+    let Some(initiator) = initiator else {
+        return true;
+    };
+    leader.process_signal().with_group_stop_state(|group| {
+        let Some(generation) = group.begin_ptrace_group_stop(signal) else {
+            return;
+        };
+        initiator
+            .pending_group_stop_generation
+            .store(generation, Ordering::Release);
+        initiator
+            .pending_group_stop_counted
+            .store(true, Ordering::Release);
+        initiator.flags().insert(ProcessFlags::PENDING_GROUP_STOP);
+        arm_ptrace_group_stop_siblings_locked(&initiator, signal, generation, group);
+        wake_group_stop_request(&initiator);
+    });
+    true
+}
+
+impl ProcessControlBlock {
+    /// A job-control stop can only commit after the target releases syscall
+    /// resources. Relation -> signal -> pi is the existing stop/continue order.
+    pub(crate) fn handle_pending_group_stop(&self) {
+        if !self.flags().contains(ProcessFlags::PENDING_GROUP_STOP) {
+            return;
+        }
+        let Some(task) = self.self_ref.upgrade() else {
+            return;
+        };
+        let (stopped, completion) = {
+            let _irq = unsafe { crate::arch::CurrentIrqArch::save_and_disable_irq() };
+            let _relation = PTRACE_RELATION_LOCK.lock_irqsave();
+            self.process_signal().with_group_stop_state(|group| {
+                let generation = self.pending_group_stop_generation.swap(0, Ordering::AcqRel);
+                let counted = self
+                    .pending_group_stop_counted
+                    .swap(false, Ordering::AcqRel);
+                self.flags().remove(ProcessFlags::PENDING_GROUP_STOP);
+                let current = if counted {
+                    group.ptrace_group_stop_in_progress(generation)
+                } else {
+                    group.ptrace_group_stop_is_current(generation)
+                };
+                if generation == 0 || !current {
+                    return (false, None);
+                }
+                let signal = group.stop_signal;
+                if is_ptraced_locked(&task) {
+                    let mut state = self.ptrace.state.lock_irqsave();
+                    let transferred = if counted {
+                        state.queue_pending_group_stop(
+                            signal,
+                            self.ptrace_session_generation(),
+                            generation,
+                        )
+                    } else {
+                        state.queue_completed_group_stop(
+                            signal,
+                            self.ptrace_session_generation(),
+                            generation,
+                        )
+                    };
+                    self.flags().insert(ProcessFlags::PENDING_PTRACE_STOP);
+                    // A same-generation ptrace ticket already owns its own
+                    // count; retire only the duplicate ordinary participant.
+                    let completion =
+                        (counted && !transferred && group.complete_ptrace_group_stop(generation))
+                            .then_some(signal);
+                    return (false, completion);
+                }
+                let stopped = ProcessManager::mark_stop().is_ok();
+                let completion =
+                    (counted && group.complete_ptrace_group_stop(generation)).then_some(signal);
+                (stopped, completion)
+            })
+        };
+        if let Some(signal) = completion {
+            self.notify_natural_group_stop(signal);
+        }
+        if stopped {
+            crate::sched::schedule(crate::sched::SchedMode::SM_NONE);
+        }
     }
 }
 
@@ -171,37 +307,36 @@ pub(crate) fn thread_group_has_ptraced(leader: &Arc<ProcessControlBlock>) -> boo
     group_has_ptraced_locked(leader)
 }
 
-/// Start the same generation/count transaction from an untraced delivery
-/// thread when another live member is ptraced. `None` leaves a fully-untraced
-/// group on the existing lightweight transition_group_stop path.
-pub(crate) fn stop_mixed_ptrace_group(
+/// Commit a selected default stop action in one relation/group transaction.
+/// An attach cannot fall between an ordinary/mixed routing check and request
+/// publication and thereby discard the receiving task's stop action.
+pub(crate) fn stop_group_at_user_boundary(
     current: &Arc<ProcessControlBlock>,
     signal: Signal,
-) -> Option<bool> {
+) -> bool {
     let _relation_guard = PTRACE_RELATION_LOCK.lock_irqsave();
-    let leader = if current.is_thread_group_leader() {
-        current.clone()
-    } else {
-        current
-            .threads_read_irqsave()
-            .group_leader()
-            .unwrap_or_else(|| current.clone())
-    };
-    if !group_has_ptraced_locked(&leader) {
-        return None;
-    }
-
-    Some(current.process_signal().with_group_stop_state(|group| {
+    current.process_signal().with_group_stop_state(|group| {
         let Some(generation) = group.begin_ptrace_group_stop(signal) else {
             return false;
         };
         arm_ptrace_group_stop_siblings_locked(current, signal, generation, group);
+        if is_ptraced_locked(current) {
+            let mut state = current.ptrace.state.lock_irqsave();
+            let queued = state.queue_pending_group_stop(
+                signal,
+                current.ptrace_session_generation(),
+                generation,
+            );
+            debug_assert!(queued, "new group-stop initiator already has this ticket");
+            current.flags().insert(ProcessFlags::PENDING_PTRACE_STOP);
+            return false;
+        }
         if ProcessManager::mark_stop().is_err() {
             group.cancel_group_stop();
             return false;
         }
         group.complete_ptrace_group_stop(generation)
-    }))
+    })
 }
 pub(crate) enum PtraceZombieClaim {
     Claimed { need_cascade: bool },
@@ -264,6 +399,7 @@ pub(crate) fn claim_and_unlink_wait_zombie(
     });
     drop(relation_guard);
     reset.freeze_release.apply(tracee);
+    activate_group_stop_handoff(tracee);
     if let Some(signal) = group_stop_completion {
         tracee.notify_natural_group_stop(signal);
     }
@@ -306,6 +442,7 @@ pub fn unlink_tracee(tracee: &Arc<ProcessControlBlock>) {
         (tracer, release, completion)
     };
     release.apply(tracee);
+    activate_group_stop_handoff(tracee);
     if let Some(signal) = group_stop_completion {
         tracee.notify_natural_group_stop(signal);
     }
@@ -336,6 +473,16 @@ pub(crate) fn settle_exiting_group_stop(tracee: &Arc<ProcessControlBlock>) {
     let completion = {
         let _relation_guard = PTRACE_RELATION_LOCK.lock_irqsave();
         tracee.process_signal().with_group_stop_state(|group| {
+            let ordinary = tracee
+                .pending_group_stop_generation
+                .swap(0, Ordering::AcqRel);
+            let counted = tracee
+                .pending_group_stop_counted
+                .swap(false, Ordering::AcqRel);
+            tracee.flags().remove(ProcessFlags::PENDING_GROUP_STOP);
+            let ordinary_completion =
+                (ordinary != 0 && counted && group.complete_ptrace_group_stop(ordinary))
+                    .then_some(group.stop_signal);
             let pending = {
                 let mut state = tracee.ptrace.state.lock_irqsave();
                 let pending = state.take_pending_stop();
@@ -350,7 +497,7 @@ pub(crate) fn settle_exiting_group_stop(tracee: &Arc<ProcessControlBlock>) {
                     },
                     signal,
                 )) if group.complete_ptrace_group_stop(generation) => Some(signal),
-                _ => None,
+                _ => ordinary_completion,
             }
         })
     };
@@ -385,10 +532,93 @@ struct PtraceUnlinkPending {
 impl PtraceUnlinkPending {
     fn finish(self) {
         self.freeze_release.apply(&self.tracee);
+        activate_group_stop_handoff(&self.tracee);
         if let Some(signal) = self.group_stop_completion {
             self.tracee.notify_natural_group_stop(signal);
         }
     }
+}
+
+/// Transfer a revoked ptrace ticket without ever suspending a remote kernel
+/// lock owner. Caller holds relation -> group; PI pins the safe-stop check.
+/// Returns whether the already committed scheduler stop must be preserved.
+pub(super) fn handoff_group_stop_locked(
+    tracee: &Arc<ProcessControlBlock>,
+    generation: u64,
+    signal: Signal,
+    counted: bool,
+    group: &mut InnerProcessSignalState,
+) -> (bool, Option<Signal>) {
+    let valid = if counted {
+        group.ptrace_group_stop_in_progress(generation)
+    } else {
+        group.ptrace_group_stop_is_current(generation)
+    };
+    if !valid {
+        return (false, None);
+    }
+    let mut completion = None;
+    let _pi = tracee.sched_info().pi_lock_irqsave();
+    let old_generation = tracee.pending_group_stop_generation.load(Ordering::Acquire);
+    let old_counted = tracee.pending_group_stop_counted.load(Ordering::Acquire);
+    let retiring =
+        tracee.exit_state() != ExitState::Running || tracee.flags().contains(ProcessFlags::EXITING);
+    let safe_stopped =
+        tracee.sched_info().state().is_stopped() && !tracee.sched_info().is_running();
+    if retiring || safe_stopped {
+        // Both representations may own one outstanding unit. A truly stopped
+        // or exiting target settles both; neither can require user execution.
+        if old_generation == generation {
+            tracee
+                .pending_group_stop_generation
+                .store(0, Ordering::Release);
+            tracee
+                .pending_group_stop_counted
+                .store(false, Ordering::Release);
+            tracee.flags().remove(ProcessFlags::PENDING_GROUP_STOP);
+            if old_counted && group.complete_ptrace_group_stop(generation) {
+                completion = Some(signal);
+            }
+        }
+        if counted && group.complete_ptrace_group_stop(generation) {
+            completion = Some(signal);
+        }
+        return (safe_stopped && !retiring, completion);
+    }
+    // Merge two pending representations without losing or duplicating their
+    // count. Uncounted tickets still carry a valid completed-stop obligation.
+    if old_generation == generation
+        && old_counted
+        && counted
+        && group.complete_ptrace_group_stop(generation)
+    {
+        completion = Some(signal);
+    }
+    tracee.pending_group_stop_counted.store(
+        counted || (old_generation == generation && old_counted),
+        Ordering::Release,
+    );
+    tracee
+        .pending_group_stop_generation
+        .store(generation, Ordering::Release);
+    tracee.flags().insert(ProcessFlags::PENDING_GROUP_STOP);
+    (false, completion)
+}
+
+/// Locked phase published the persistent ordinary work. Activate only after
+/// dropping group/ptrace-state locks, and never release a new ptrace stop.
+pub(super) fn activate_group_stop_handoff(tracee: &Arc<ProcessControlBlock>) {
+    let _relation = PTRACE_RELATION_LOCK.lock_irqsave();
+    if !tracee.flags().contains(ProcessFlags::PENDING_GROUP_STOP)
+        || tracee.flags().contains(ProcessFlags::EXITING)
+        || tracee.exit_state() != ExitState::Running
+    {
+        return;
+    }
+    if is_ptraced_locked(tracee) && tracee.ptrace.state.lock_irqsave().is_traced_stop() {
+        return;
+    }
+    wake_group_stop_request(tracee);
 }
 
 /// Settle the group-stop ownership removed by one ptrace session reset. The
@@ -405,23 +635,13 @@ fn settle_reset_group_stop_locked(
         .map(|generation| group.ptrace_group_stop_is_current(generation))
         .unwrap_or(false);
     let mut completed = None;
+    let mut preserve_pending = false;
     if let Some((generation, signal, counted)) = reset.pending_group_stop {
-        let current = if counted {
-            group.ptrace_group_stop_in_progress(generation)
-        } else {
-            group.ptrace_group_stop_is_current(generation)
-        };
-        if current {
-            if tracee.exit_state() == ExitState::Running {
-                let _ = ProcessManager::stop_task(tracee);
-            }
-            if counted && group.complete_ptrace_group_stop(generation) {
-                completed = Some(signal);
-            }
-        }
+        (preserve_pending, completed) =
+            handoff_group_stop_locked(tracee, generation, signal, counted, group);
     }
     (
-        preserve_active || group.flags.contains(SignalFlags::STOP_STOPPED),
+        preserve_active || preserve_pending || group.flags.contains(SignalFlags::STOP_STOPPED),
         completed,
     )
 }
@@ -559,6 +779,9 @@ pub fn exit_ptrace(tracer: &Arc<ProcessControlBlock>) {
             group_stop_completion,
         } = pending;
         freeze_release.apply(&tracee);
+        if !exitkill {
+            activate_group_stop_handoff(&tracee);
+        }
         if let Some(signal) = group_stop_completion {
             tracee.notify_natural_group_stop(signal);
         }
@@ -941,7 +1164,7 @@ impl ProcessControlBlock {
         pending.finish();
         Ok(0)
     }
-    pub(super) fn notify_natural_group_stop(&self, stop_signal: Signal) {
+    pub(crate) fn notify_natural_group_stop(&self, stop_signal: Signal) {
         let ptracer = self.ptracer_pcb();
         self.notify_natural_group_stop_bound(stop_signal, ptracer.as_ref());
     }
@@ -1010,6 +1233,11 @@ pub(crate) fn continue_group_with_ptrace(leader: &Arc<ProcessControlBlock>) -> (
         continue_committed = true;
 
         let publish_retrap = |task: &Arc<ProcessControlBlock>| {
+            task.pending_group_stop_counted
+                .store(false, Ordering::Release);
+            task.pending_group_stop_generation
+                .store(0, Ordering::Release);
+            task.flags().remove(ProcessFlags::PENDING_GROUP_STOP);
             if task.flags().contains(ProcessFlags::PT_SEIZED) {
                 let _ =
                     task.ptrace_publish_seized_stop_relation_locked(None, Signal::SIGTRAP, None);

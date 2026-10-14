@@ -16,20 +16,27 @@ use super::inode::Cgroup2Inode;
 
 pub(super) static INODES: WeakRegistry<Cgroup2Inode> = WeakRegistry::new();
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(super) enum EventSource {
     Memory {
         account: Arc<MemoryAccount>,
         local: bool,
     },
-    Population(Arc<CgroupNode>),
+    Core(Arc<CgroupNode>),
 }
 
 impl EventSource {
     pub(super) fn sequence(&self) -> u64 {
         match self {
             Self::Memory { account, local } => account.event_sequence(*local),
-            Self::Population(node) => node.population_sequence(),
+            Self::Core(node) => node.core_events_sequence(),
+        }
+    }
+
+    pub(super) fn is_online(&self) -> bool {
+        match self {
+            Self::Memory { account, .. } => account.is_online(),
+            Self::Core(node) => crate::cgroup::cgroup_root().is_online(node),
         }
     }
 
@@ -37,7 +44,7 @@ impl EventSource {
         match self {
             Self::Memory { local: false, .. } => "memory.events",
             Self::Memory { local: true, .. } => "memory.events.local",
-            Self::Population(_) => "cgroup.events",
+            Self::Core(_) => "cgroup.events",
         }
     }
 }

@@ -10,7 +10,7 @@ use system_error::SystemError;
 
 use crate::{
     bpf::prog::{device::DeviceAccess, BpfProg},
-    cgroup::{CgroupCpuState, CgroupFreezerState, CgroupMemoryState},
+    cgroup::{CgroupCpuState, CgroupMemoryState},
     include::bindings::linux_bpf::{
         bpf_prog_type, BPF_F_ALLOW_MULTI, BPF_F_ALLOW_OVERRIDE, BPF_F_REPLACE,
     },
@@ -100,13 +100,13 @@ pub struct CgroupNode {
     memory: RwLock<CgroupMemoryState>,
     /// Physical resource ownership outlives directory and task membership.
     memory_current: RwLock<Option<MemoryGeneration>>,
-    freezer: RwLock<CgroupFreezerState>,
+    pub(super) freezer: super::freezer::NodeState,
     pids_max: RwLock<Option<usize>>,
     pids_events_max: AtomicU64,
     pids_account: Arc<super::pids_account::PidsAccount>,
     /// Inclusive live population, serialized by cgroup_accounting_lock.
     populated_tasks: AtomicUsize,
-    population_sequence: AtomicU64,
+    core_events_sequence: AtomicU64,
     device_bpf: RwLock<DeviceBpfState>,
 }
 
@@ -161,13 +161,13 @@ impl CgroupNode {
             cpuset: RwLock::new(super::cpuset::CpusetState::default()),
             memory: RwLock::new(CgroupMemoryState::default()),
             memory_current: RwLock::new(Some(memory)),
-            freezer: RwLock::new(CgroupFreezerState::default()),
+            freezer: super::freezer::NodeState::default(),
             pids_max: RwLock::new(None),
             pids_events_max: AtomicU64::new(0),
             pids_account: super::pids_account::PidsAccount::try_new(None)
                 .expect("initial pids account allocation failed"),
             populated_tasks: AtomicUsize::new(0),
-            population_sequence: AtomicU64::new(0),
+            core_events_sequence: AtomicU64::new(0),
             device_bpf: RwLock::new(DeviceBpfState::empty()),
         })
     }
@@ -207,14 +207,14 @@ impl CgroupNode {
             cpuset: RwLock::new(super::cpuset::CpusetState::default()),
             memory: RwLock::new(CgroupMemoryState::default()),
             memory_current: RwLock::new(memory),
-            freezer: RwLock::new(CgroupFreezerState::default()),
+            freezer: super::freezer::NodeState::default(),
             pids_max: RwLock::new(None),
             pids_events_max: AtomicU64::new(0),
             pids_account: super::pids_account::PidsAccount::try_new(Some(
                 parent.pids_account.clone(),
             ))?,
             populated_tasks: AtomicUsize::new(0),
-            population_sequence: AtomicU64::new(0),
+            core_events_sequence: AtomicU64::new(0),
             device_bpf: RwLock::new(DeviceBpfState::empty()),
         })
         .map_err(|_| SystemError::ENOMEM)?;
@@ -401,7 +401,8 @@ impl CgroupNode {
         Ok(())
     }
 
-    pub fn add_task(&self, pid: RawPid) {
+    /// Caller holds accounting and the freezer publication transaction.
+    pub(super) fn add_task(&self, pid: RawPid) {
         let mut tasks = self.tasks.write();
         debug_assert!(tasks.len() < tasks.capacity());
         if !tasks.insert(pid) {
@@ -417,7 +418,8 @@ impl CgroupNode {
         }
     }
 
-    pub fn remove_task(&self, pid: RawPid) {
+    /// Caller holds accounting and the freezer publication transaction.
+    pub(super) fn remove_task(&self, pid: RawPid) {
         if !self.tasks.write().remove(&pid) {
             debug_assert!(false, "cgroup task {:?} does not exist", pid);
             return;
@@ -439,13 +441,17 @@ impl CgroupNode {
             old == 1
         };
         if edge {
-            self.population_sequence.fetch_add(1, Ordering::Release);
-            crate::mm::memory_notify::request_file_events();
+            self.notify_core_events();
         }
     }
 
-    pub(crate) fn population_sequence(&self) -> u64 {
-        self.population_sequence.load(Ordering::Acquire)
+    pub(crate) fn core_events_sequence(&self) -> u64 {
+        self.core_events_sequence.load(Ordering::Acquire)
+    }
+
+    pub(super) fn notify_core_events(&self) {
+        self.core_events_sequence.fetch_add(1, Ordering::Release);
+        crate::mm::memory_notify::request_file_events();
     }
 
     pub(crate) fn is_populated(&self) -> bool {
@@ -468,6 +474,16 @@ impl CgroupNode {
 
     pub fn tasks(&self) -> Vec<RawPid> {
         self.tasks.read().iter().cloned().collect()
+    }
+
+    pub(crate) fn tasks_snapshot(&self) -> Result<Vec<RawPid>, SystemError> {
+        let tasks = self.tasks.read();
+        let mut snapshot = Vec::new();
+        snapshot
+            .try_reserve_exact(tasks.len())
+            .map_err(|_| SystemError::ENOMEM)?;
+        snapshot.extend(tasks.iter().copied());
+        Ok(snapshot)
     }
 
     pub fn children_names(&self) -> Vec<String> {
@@ -641,11 +657,11 @@ impl CgroupNode {
     }
 
     pub fn freeze_requested(&self) -> bool {
-        self.freezer.read().freeze_requested()
+        self.freezer.requested()
     }
 
-    pub fn set_freeze_requested(&self, value: bool) {
-        self.freezer.write().set_freeze_requested(value);
+    pub fn frozen(&self) -> bool {
+        self.freezer.frozen()
     }
 
     pub fn pids_max(&self) -> Option<usize> {
@@ -868,6 +884,7 @@ impl CgroupRoot {
         }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (child, memory_prepared) = CgroupNode::new_child(id, child_name, parent)?;
+        super::freezer::initialize(&child, parent);
         child.device_bpf.write().effective = parent.device_bpf.read().effective.clone();
         super::cpu::initialize_node_locked(&child)?;
         init(&child)?;

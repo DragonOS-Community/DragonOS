@@ -610,6 +610,7 @@ impl ProcessManager {
         // The old CPU no longer uses prev_pcb's architecture context or
         // kernel stack. Publish that fact only after releasing arch_info so a
         // remote ttwu may safely enqueue and run the task on another CPU.
+        crate::cgroup::freezer::switched_out(&prev_pcb);
         prev_pcb.sched_info().finish_running();
         fence(Ordering::SeqCst);
 

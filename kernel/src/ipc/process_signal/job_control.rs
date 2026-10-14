@@ -12,32 +12,6 @@ impl ProcessSignalState {
         f(&mut guard)
     }
 
-    /// Apply a job-control stop and publish its wait event as one state
-    /// transition. The callback runs while the shared process signal state is locked, so a
-    /// concurrent SIGCONT cannot wake the group between the scheduler-state
-    /// update and the persistent stop-state publication.
-    ///
-    /// Returns whether this completed a fresh group stop which should be
-    /// reported to the parent. Repeated stop signals keep the existing event.
-    pub fn transition_group_stop<F>(&self, sig: Signal, stop_group: F) -> bool
-    where
-        F: FnOnce() -> bool,
-    {
-        let mut g = self.inner_mut();
-        if g.flags.contains(SignalFlags::GROUP_EXIT) || !stop_group() {
-            return false;
-        }
-        if g.flags.contains(SignalFlags::STOP_STOPPED) {
-            return false;
-        }
-
-        g.stop_signal = sig;
-        g.flags.remove(SignalFlags::STOP_MASK);
-        g.flags
-            .insert(SignalFlags::STOP_STOPPED | SignalFlags::CLD_STOPPED);
-        true
-    }
-
     /// Continue a job-control-stopped group as one transition. The callback is
     /// run whenever group exit has not started because SIGCONT resumes stopped
     /// tasks even when no parent notification is pending. A continued event is
@@ -268,6 +242,9 @@ impl ProcessSignalState {
             g.flags.remove(SignalFlags::STOP_MASK);
             g.flags.insert(SignalFlags::GROUP_EXIT);
             g.group_exit_code = exit_code;
+            self.body
+                .group_exit_started
+                .store(true, core::sync::atomic::Ordering::Release);
             exit_code
         }
     }
@@ -292,6 +269,9 @@ impl ProcessSignalState {
             g.flags.remove(SignalFlags::STOP_MASK);
             g.flags.insert(SignalFlags::GROUP_EXIT);
             g.group_exit_code = exit_code;
+            self.body
+                .group_exit_started
+                .store(true, core::sync::atomic::Ordering::Release);
             true
         }
     }
@@ -306,8 +286,8 @@ impl InnerProcessSignalState {
         self.group_stop_generation
     }
 
-    /// Begin a fresh group-stop with the current ptraced task as its first
-    /// asynchronous participant. Repeated stop signals do not restart a
+    /// Begin a fresh group-stop with the initiating task as its first
+    /// asynchronous participant (ordinary or ptraced). Repeated stop signals do not restart a
     /// completed or already in-flight transaction.
     pub(crate) fn begin_ptrace_group_stop(&mut self, signal: Signal) -> Option<u64> {
         if self.flags.contains(SignalFlags::GROUP_EXIT)
@@ -341,7 +321,7 @@ impl InnerProcessSignalState {
                 || self.flags.contains(SignalFlags::STOP_STOPPED))
     }
 
-    /// Complete exactly one generation-bound ptrace participant. The last
+    /// Complete exactly one generation-bound participant. The last
     /// participant publishes the existing wait-visible STOP flags.
     pub(crate) fn complete_ptrace_group_stop(&mut self, generation: u64) -> bool {
         if !self.ptrace_group_stop_in_progress(generation) {

@@ -55,7 +55,7 @@ pub(crate) fn request_oom_progress() {
     // not pass a preceding progress store (Release/Acquire alone is not enough).
     fence(Ordering::SeqCst);
     if !RECOVERY_WAITERS.has_registrations()
-        && !crate::filesystem::cgroup2::memory_events::has_watchers()
+        && !crate::filesystem::cgroup2::events::has_memory_watchers()
     {
         return;
     }
@@ -82,7 +82,7 @@ pub(crate) fn request_file_events() {
     }
     fence(Ordering::SeqCst);
     if !crate::filesystem::cgroup2::event_notify::has_watchers()
-        && !crate::filesystem::cgroup2::memory_events::has_watchers()
+        && !crate::filesystem::cgroup2::events::has_watchers()
     {
         return;
     }
@@ -153,7 +153,7 @@ fn notification_loop() -> i32 {
                 crate::cgroup::memory::high::notify_deadlines();
             }
             RECOVERY_WAITERS.wake_all();
-            crate::filesystem::cgroup2::memory_events::notify();
+            crate::filesystem::cgroup2::events::notify();
             if FILE_EVENTS_PENDING.swap(false, Ordering::AcqRel) {
                 crate::filesystem::cgroup2::event_notify::notify();
             }

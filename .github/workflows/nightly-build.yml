@@ -30,6 +30,30 @@ jobs:
         run: |
           find . -type f \( -name "*.toml" -o -name "Makefile" \) -exec sed -i 's/git\.mirrors\.dragonos\.org\.cn/github\.com/g' {} +
 
+      - name: Prepare Docker CLI for Ubuntu RootFS
+        shell: bash -eo pipefail {0}
+        run: |
+          # DADK exports the Ubuntu base image through the runner's existing
+          # daemon. The development container intentionally has no Docker CLI.
+          if ! command -v docker >/dev/null 2>&1; then
+            . /etc/os-release
+            test "$ID" = ubuntu
+            install -m 0755 -d /etc/apt/keyrings
+            curl -fsSL --retry 3 --max-time 60 \
+              https://download.docker.com/linux/ubuntu/gpg \
+              -o /etc/apt/keyrings/docker-rootfs.asc
+            chmod a+r /etc/apt/keyrings/docker-rootfs.asc
+            printf 'deb [arch=%s signed-by=/etc/apt/keyrings/docker-rootfs.asc] https://download.docker.com/linux/ubuntu %s stable\n' \
+              "$(dpkg --print-architecture)" "$VERSION_CODENAME" \
+              > /etc/apt/sources.list.d/docker-rootfs.list
+            apt-get update
+            apt-get install -y --no-install-recommends docker-ce-cli
+          fi
+          # GitHub Actions mounts this socket into job containers. Fail before
+          # the expensive build if the client cannot reach that daemon.
+          test -S /var/run/docker.sock
+          docker version
+
       - name: Build DragonOS
         shell: bash -ileo pipefail {0}
         run: |

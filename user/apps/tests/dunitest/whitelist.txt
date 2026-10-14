@@ -103,6 +103,7 @@ normal/ioperm_semantics
 normal/seccomp
 normal/signal_sigqueueinfo
 normal/signal_tgsigqueueinfo
+normal/cgroup_freezer
 normal/process_signal_fork
 normal/process_vm_writev_semantics
 normal/exec_dumpable_semantics

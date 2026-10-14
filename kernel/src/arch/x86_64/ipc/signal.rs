@@ -1038,13 +1038,41 @@ impl SignalArch for X86_64SignalArch {
         }
         // Before returning to user space, check PENDING_PTRACE_STOP and initiate a
         // PTRACE_EVENT_STOP ptrace_stop.
-        while pcb.ptrace_handle_pending_stop() {}
+        loop {
+            while pcb.ptrace_handle_pending_stop() {}
+            pcb.handle_pending_group_stop();
+            crate::cgroup::freezer::handle_user_return();
+            if !pcb
+                .flags()
+                .load()
+                .intersects(ProcessFlags::PENDING_PTRACE_STOP | ProcessFlags::PENDING_GROUP_STOP)
+            {
+                break;
+            }
+        }
 
         // A fatal default action does not return to this signal-entry frame.
         drop(pcb);
 
         let mut got_signal = false;
         do_signal(frame, &mut got_signal);
+
+        // A stop or ptrace signal-delivery-stop may resume inside do_signal.
+        // Recheck the freezer before executing even a newly built user handler.
+        loop {
+            {
+                let current = ProcessManager::current_pcb();
+                while current.ptrace_handle_pending_stop() {}
+                current.handle_pending_group_stop();
+            }
+            crate::cgroup::freezer::handle_user_return();
+            let flags = ProcessManager::current_pcb().flags().load();
+            if !flags
+                .intersects(ProcessFlags::PENDING_GROUP_STOP | ProcessFlags::PENDING_PTRACE_STOP)
+            {
+                break;
+            }
+        }
 
         if got_signal {
             return;

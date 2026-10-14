@@ -174,18 +174,3 @@ impl CgroupMemoryState {
         self.swap_max = value;
     }
 }
-
-#[derive(Debug, Clone, Copy, Default)]
-pub struct CgroupFreezerState {
-    freeze_requested: bool,
-}
-
-impl CgroupFreezerState {
-    pub fn freeze_requested(&self) -> bool {
-        self.freeze_requested
-    }
-
-    pub fn set_freeze_requested(&mut self, value: bool) {
-        self.freeze_requested = value;
-    }
-}

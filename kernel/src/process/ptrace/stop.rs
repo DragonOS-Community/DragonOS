@@ -292,17 +292,26 @@ impl PtraceState {
         generation: u64,
         counted: bool,
     ) -> bool {
-        if matches!(
-            self.pending_stop,
-            Some(PendingStopRecord {
-                kind: PendingStopKind::Group {
+        if let Some(PendingStopRecord {
+            kind:
+                PendingStopKind::Group {
                     generation: queued,
-                    ..
+                    counted: owned,
                 },
-                ..
-            }) if queued == generation
-        ) {
-            return false;
+            ..
+        }) = self.pending_stop.as_mut()
+        {
+            if *queued == generation {
+                // A true return accepts the incoming count ownership. An
+                // uncounted completed-stop ticket can acquire that ownership;
+                // an already counted ticket leaves a duplicate for the
+                // transfer caller to retire (or the arming caller not to add).
+                if counted && !*owned {
+                    *owned = true;
+                    return true;
+                }
+                return false;
+            }
         }
         self.pending_stop = Some(PendingStopRecord {
             signal,

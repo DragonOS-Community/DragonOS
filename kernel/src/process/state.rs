@@ -227,6 +227,10 @@ bitflags! {
         const PENDING_DEBUG = 1 << 25;
         /// Deferred memory.high reclaim/backpressure at a lock-free user boundary.
         const NEED_MEMORY_HIGH = 1 << 26;
+        /// cgroup freezer work at a lock-free user-return boundary.
+        const NEED_CGROUP_FREEZE = 1 << 27;
+        /// Job-control stop deferred until a lock-free task-context boundary.
+        const PENDING_GROUP_STOP = 1 << 28;
     }
 }
 
@@ -246,6 +250,8 @@ impl ProcessFlags {
             | Self::PENDING_PTRACE_STOP.bits
             | Self::PENDING_DEBUG.bits
             | Self::NEED_MEMORY_HIGH.bits
+            | Self::NEED_CGROUP_FREEZE.bits
+            | Self::PENDING_GROUP_STOP.bits
     }
 
     /// Test and clear flags.

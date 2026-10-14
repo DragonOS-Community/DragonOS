@@ -14,6 +14,14 @@ impl UdpSocket {
 }
 
 impl Socket for UdpSocket {
+    fn bind_endpoint_from_user(
+        &self,
+        addr: *const SockAddr,
+        len: u32,
+    ) -> Result<Endpoint, SystemError> {
+        crate::net::socket::inet::common::bind::endpoint_from_user(addr, len, self.ip_version)
+    }
+
     fn validate_sendto_addr(&self, addr: *const SockAddr, addrlen: u32) -> Result<(), SystemError> {
         if self.ip_version == IpVersion::Ipv4 && !addr.is_null() {
             // The generic decoder normalizes mapped-v4 addresses. Validate
@@ -52,12 +60,6 @@ impl Socket for UdpSocket {
     fn bind(&self, local_endpoint: Endpoint) -> Result<(), SystemError> {
         match local_endpoint {
             Endpoint::Ip(local_endpoint) => self.do_bind(local_endpoint),
-            Endpoint::Unspecified => {
-                // AF_UNSPEC on bind() is a no-op for AF_INET sockets (Linux compatibility)
-                // See: https://github.com/torvalds/linux/commit/29c486df6a208432b370bd4be99ae1369ede28d8
-                // log::debug!("UDP bind: AF_UNSPEC treated as no-op for compatibility");
-                Ok(())
-            }
             _ => Err(SystemError::EAFNOSUPPORT),
         }
     }

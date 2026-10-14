@@ -72,6 +72,9 @@ impl<F: FileOps> ProcFile<F> {
 
 /// FileOps trait 定义了 procfs 文件需要实现的操作
 pub trait FileOps: Sync + Send + Sized + Debug {
+    fn sysctl_access_bits(&self) -> Option<u32> {
+        None
+    }
     /// 从文件的指定偏移量读取数据
     ///
     /// # 参数
@@ -136,12 +139,17 @@ pub trait FileOps: Sync + Send + Sized + Debug {
 /// 使用 inherit_methods 宏从 common 继承通用方法
 #[inherit_methods(from = "self.common")]
 impl<F: FileOps + 'static> IndexNode for ProcFile<F> {
+    fn sysctl_access_bits(&self) -> Option<u32> {
+        self.inner.sysctl_access_bits()
+    }
     fn configure_open_file(&self, _data: &FilePrivateData, behavior: &mut OpenFileBehavior) {
         behavior.post_write_sync = PostWriteSyncPolicy::NotApplicable;
     }
 
     fn fs(&self) -> Arc<dyn FileSystem>;
-    fn as_any_ref(&self) -> &dyn core::any::Any;
+    fn as_any_ref(&self) -> &dyn core::any::Any {
+        self
+    }
     fn set_metadata(
         &self,
         metadata: &Metadata,

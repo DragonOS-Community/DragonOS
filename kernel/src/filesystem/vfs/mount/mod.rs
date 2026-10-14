@@ -6107,6 +6107,9 @@ impl MountFSInode {
 }
 
 impl IndexNode for MountFSInode {
+    fn sysctl_access_bits(&self) -> Option<u32> {
+        self.dentry.inode.sysctl_access_bits()
+    }
     fn retain(&self, kind: InodeRetentionKind) -> Result<(), SystemError> {
         self.dentry.inode.retain(kind)
     }

@@ -295,7 +295,7 @@ pub struct NetNamespace {
     /// AF_UNIX abstract namespace table (scoped to this netns).
     unix_abstract_table: Arc<UnixAbstractTable>,
     /// Per-netns IPv4 ephemeral port range (ip_local_port_range)
-    local_port_range: AtomicU32,
+    port_policy: crate::net::socket::inet::common::port_policy::InetPortPolicy,
     /// Linux /proc/sys/net/ipv4/ip_forward. Default is disabled in each netns.
     ipv4_forwarding: AtomicI32,
     /// Linux /proc/sys/net/ipv6/conf/all/forwarding. Never shares IPv4 state.
@@ -1275,9 +1275,7 @@ impl NetNamespace {
             nftables: Some(Box::new(NftNamespaceState::new())),
             netlink_kernel_socket: RwSem::new(generate_supported_netlink_kernel_sockets()),
             unix_abstract_table: unix_abstract_table.clone(),
-            local_port_range: AtomicU32::new(
-                crate::net::socket::inet::common::port::DEFAULT_LOCAL_PORT_RANGE,
-            ),
+            port_policy: crate::net::socket::inet::common::port_policy::InetPortPolicy::new(),
             ipv4_forwarding: AtomicI32::new(0),
             ipv6_forwarding: AtomicI32::new(0),
             loopback_iface: RcuOptionArcSlot::new_none(),
@@ -1331,9 +1329,7 @@ impl NetNamespace {
             nftables: Some(Box::new(NftNamespaceState::new())),
             netlink_kernel_socket: RwSem::new(generate_supported_netlink_kernel_sockets()),
             unix_abstract_table: unix_abstract_table.clone(),
-            local_port_range: AtomicU32::new(
-                crate::net::socket::inet::common::port::DEFAULT_LOCAL_PORT_RANGE,
-            ),
+            port_policy: crate::net::socket::inet::common::port_policy::InetPortPolicy::new(),
             ipv4_forwarding: AtomicI32::new(0),
             ipv6_forwarding: AtomicI32::new(0),
             loopback_iface: RcuOptionArcSlot::new_some(loopback.clone()),
@@ -1820,28 +1816,19 @@ impl NetNamespace {
 
     #[inline]
     pub fn local_port_range(&self) -> (u16, u16) {
-        let value = self.local_port_range.load(Ordering::Relaxed);
-        ((value >> 16) as u16, (value & 0xffff) as u16)
+        self.port_policy.local_range()
     }
 
     pub fn set_local_port_range(&self, min: u16, max: u16) -> Result<(), SystemError> {
-        if min == 0 || max == 0 || min > max {
-            return Err(SystemError::EINVAL);
-        }
-        let new_value = ((min as u32) << 16) | (max as u32);
-        loop {
-            let old_value = self.local_port_range.load(Ordering::Relaxed);
-            if old_value == new_value {
-                return Ok(());
-            }
-            if self
-                .local_port_range
-                .compare_exchange(old_value, new_value, Ordering::AcqRel, Ordering::Relaxed)
-                .is_ok()
-            {
-                return Ok(());
-            }
-        }
+        self.port_policy.set_local_range(min, max)
+    }
+
+    pub fn unprivileged_port_start(&self) -> u16 {
+        self.port_policy.unprivileged_start()
+    }
+
+    pub fn set_unprivileged_port_start(&self, start: u16) -> Result<(), SystemError> {
+        self.port_policy.set_unprivileged_start(start)
     }
 
     pub fn ipv4_forwarding_value(&self) -> i32 {

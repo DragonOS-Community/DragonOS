@@ -5,6 +5,15 @@ use system_error::SystemError;
 /// Linux consumes leading whitespace, one base-0 signed integer and the
 /// whitespace immediately following it. Later tokens are left for a short write.
 pub(super) fn parse_numeric_sysctl(buf: &[u8]) -> Result<(i64, usize), SystemError> {
+    let (values, consumed) = parse_numeric_sysctl_values::<1>(buf)?;
+    Ok((values[0].ok_or(SystemError::EINVAL)?, consumed))
+}
+
+/// Parse a bounded numeric vector using one Linux sysctl input window.
+/// Missing trailing values remain unchanged by the caller.
+pub(super) fn parse_numeric_sysctl_values<const N: usize>(
+    buf: &[u8],
+) -> Result<([Option<i64>; N], usize), SystemError> {
     use crate::{arch::MMArch, mm::MemoryManagementArch};
 
     // __do_proc_dointvec parses at most PAGE_SIZE-1 bytes. Linux still
@@ -12,6 +21,24 @@ pub(super) fn parse_numeric_sysctl(buf: &[u8]) -> Result<(i64, usize), SystemErr
     let parsed_len = buf.len().min(MMArch::PAGE_SIZE - 1);
     let excess = buf.len() - parsed_len;
     let buf = &buf[..parsed_len];
+    let mut values = [None; N];
+    let mut consumed = 0;
+    for slot in &mut values {
+        if buf[consumed..].iter().all(u8::is_ascii_whitespace) {
+            consumed = buf.len();
+            break;
+        }
+        let (value, count) = parse_numeric_token(&buf[consumed..])?;
+        *slot = Some(value);
+        consumed += count;
+    }
+    if values.first().is_none_or(Option::is_none) {
+        return Err(SystemError::EINVAL);
+    }
+    Ok((values, consumed + excess))
+}
+
+fn parse_numeric_token(buf: &[u8]) -> Result<(i64, usize), SystemError> {
     let mut cursor = 0;
     while cursor < buf.len() && buf[cursor].is_ascii_whitespace() {
         cursor += 1;
@@ -68,5 +95,5 @@ pub(super) fn parse_numeric_sysctl(buf: &[u8]) -> Result<(i64, usize), SystemErr
     while cursor < buf.len() && buf[cursor].is_ascii_whitespace() {
         cursor += 1;
     }
-    Ok((value, cursor + excess))
+    Ok((value, cursor))
 }

@@ -191,4 +191,5 @@ normal/stat_blocks
 normal/cgroup_cpuset
 normal/cgroup_threaded
 normal/udp_source_route
+normal/udp_disconnect_semantics
 fuse/stat_blocks

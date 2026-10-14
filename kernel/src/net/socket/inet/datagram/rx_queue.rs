@@ -22,7 +22,7 @@ struct ConnectedPeer {
 #[derive(Debug)]
 pub(super) struct UdpRxDatagram {
     pub source: IpEndpoint,
-    pub destination: IpAddress,
+    pub destination: IpEndpoint,
     pub ifindex: i32,
     pub meta: PacketMeta,
     pub payload: Vec<u8>,
@@ -119,7 +119,7 @@ impl UdpReceiveQueue {
         &self,
         generation: u64,
         source: IpEndpoint,
-        destination: IpAddress,
+        destination: IpEndpoint,
         ifindex: i32,
         meta: PacketMeta,
         payload: &[u8],
@@ -131,7 +131,7 @@ impl UdpReceiveQueue {
             let state = self.state.lock();
             if !state.accepting
                 || state.binding_generation != generation
-                || !peer_accepts(state.connected, source, destination)
+                || !peer_accepts(state.connected, source, destination.addr)
                 || accounted_bytes > state.capacity.saturating_sub(state.bytes)
             {
                 return None;
@@ -147,7 +147,7 @@ impl UdpReceiveQueue {
         owned.extend_from_slice(payload);
 
         let mut state = self.state.lock();
-        if !state.accepting || !peer_accepts(state.connected, source, destination) {
+        if !state.accepting || !peer_accepts(state.connected, source, destination.addr) {
             return None;
         }
         if state.binding_generation != generation {
@@ -190,7 +190,7 @@ impl UdpReceiveQueue {
         &self,
         buf: &mut [u8],
         peek: bool,
-    ) -> Option<(usize, usize, IpEndpoint, IpAddress, i32, PacketMeta)> {
+    ) -> Option<(usize, usize, IpEndpoint, IpEndpoint, i32, PacketMeta)> {
         let mut state = self.state.lock();
         let packet = state.packets.front()?;
         let copy_len = core::cmp::min(buf.len(), packet.payload.len());
@@ -214,6 +214,8 @@ impl UdpReceiveQueue {
 #[inline]
 fn peer_accepts(peer: Option<ConnectedPeer>, source: IpEndpoint, destination: IpAddress) -> bool {
     peer.is_none_or(|peer| {
-        peer.remote == source && peer.local.is_none_or(|local| local == destination)
+        peer.remote.addr == source.addr
+            && (peer.remote.port == 0 || peer.remote.port == source.port)
+            && peer.local.is_none_or(|local| local == destination)
     })
 }

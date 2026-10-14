@@ -426,7 +426,7 @@ impl UdpBindingTable {
                     candidate.socket.inject_ingress_packet(
                         candidate.generation,
                         src,
-                        dest.addr,
+                        dest,
                         ifindex,
                         meta,
                         payload,
@@ -438,7 +438,7 @@ impl UdpBindingTable {
                 candidate.socket.inject_ingress_packet(
                     candidate.generation,
                     src,
-                    dest.addr,
+                    dest,
                     ifindex,
                     meta,
                     payload,
@@ -450,7 +450,7 @@ impl UdpBindingTable {
                 socket.socket.inject_ingress_packet(
                     socket.generation,
                     src,
-                    dest.addr,
+                    dest,
                     ifindex,
                     meta,
                     payload,

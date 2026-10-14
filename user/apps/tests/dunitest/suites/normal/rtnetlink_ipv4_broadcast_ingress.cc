@@ -3,6 +3,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <linux/if_ether.h>
+#include <linux/if_addr.h>
 #include <linux/if_link.h>
 #include <linux/if_packet.h>
 #include <linux/netlink.h>
@@ -124,6 +125,64 @@ uint16_t Checksum(const uint8_t* data, size_t length) {
     return static_cast<uint16_t>(~sum);
 }
 
+int AddIpv6(int fd, uint32_t ifindex, uint32_t sequence, const char* address) {
+    std::vector<uint8_t> request(NLMSG_LENGTH(sizeof(ifaddrmsg)), 0);
+    auto* header = reinterpret_cast<nlmsghdr*>(request.data());
+    header->nlmsg_len = request.size();
+    header->nlmsg_type = RTM_NEWADDR;
+    header->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL;
+    header->nlmsg_seq = sequence;
+    auto* body = reinterpret_cast<ifaddrmsg*>(NLMSG_DATA(request.data()));
+    body->ifa_family = AF_INET6;
+    body->ifa_flags = IFA_F_NODAD;
+    body->ifa_prefixlen = 64;
+    body->ifa_index = ifindex;
+    in6_addr local {};
+    inet_pton(AF_INET6, address, &local);
+    AddRequestAttr(&request, IFA_ADDRESS, &local, sizeof(local));
+    return SendAck(fd, request);
+}
+
+int InjectUdp6(int fd, uint32_t ifindex, const char* destination,
+               uint16_t port, uint8_t payload) {
+    std::array<uint8_t, 49> packet {};
+    packet[0] = 0x60;
+    packet[5] = 9;
+    packet[6] = IPPROTO_UDP;
+    packet[7] = 64;
+    inet_pton(AF_INET6, "fd00:47::2", &packet[8]);
+    inet_pton(AF_INET6, destination, &packet[24]);
+    packet[40] = 0xa0;
+    packet[41] = 0x47;
+    packet[42] = port >> 8;
+    packet[43] = port;
+    packet[45] = 9;
+    packet[48] = payload;
+    std::array<uint8_t, 49> pseudo {};
+    std::memcpy(pseudo.data(), packet.data() + 8, 32);
+    pseudo[35] = 9;
+    pseudo[39] = IPPROTO_UDP;
+    std::memcpy(pseudo.data() + 40, packet.data() + 40, 9);
+    uint16_t checksum = Checksum(pseudo.data(), pseudo.size());
+    if (checksum == 0) checksum = 0xffff;
+    packet[46] = checksum >> 8;
+    packet[47] = checksum;
+    sockaddr_ll link_destination {};
+    link_destination.sll_family = AF_PACKET;
+    link_destination.sll_protocol = htons(ETH_P_IPV6);
+    link_destination.sll_ifindex = ifindex;
+    link_destination.sll_halen = ETH_ALEN;
+    std::memset(link_destination.sll_addr, 0xff, ETH_ALEN);
+    if (packet[24] == 0xff) {
+        link_destination.sll_addr[0] = 0x33;
+        link_destination.sll_addr[1] = 0x33;
+        std::memcpy(link_destination.sll_addr + 2, packet.data() + 36, 4);
+    }
+    return sendto(fd, packet.data(), packet.size(), 0,
+                  reinterpret_cast<sockaddr*>(&link_destination), sizeof(link_destination)) ==
+                   static_cast<ssize_t>(packet.size()) ? 0 : errno;
+}
+
 int InjectUdp(int fd, uint32_t ifindex, const char* source, const char* destination,
               uint16_t port, uint8_t payload) {
     std::array<uint8_t, 29> packet{};
@@ -214,6 +273,33 @@ int RunIngressCase() {
     if (recv(receiver.Get(), &received, 1, 0) >= 0 || (errno != EAGAIN && errno != EWOULDBLOCK)) {
         return 1300;
     }
+    // With no wildcard listener on this port, an address mismatch must not
+    // fall back to a protocol socket that accepts broadcast indiscriminately.
+    Fd unicast_receiver(socket(AF_INET, SOCK_DGRAM, 0));
+    if (unicast_receiver.Get() < 0) return 2200 + errno;
+    if (AddIpv4(route.Get(), first_index, 6, "10.49.0.1", "10.49.0.255") != 0) {
+        return 2250;
+    }
+    setsockopt(unicast_receiver.Get(), SOL_SOCKET, SO_RCVTIMEO, &receive_timeout,
+               sizeof(receive_timeout));
+    sockaddr_in unicast_local = local;
+    unicast_local.sin_port = htons(48549);
+    inet_pton(AF_INET, "10.49.0.1", &unicast_local.sin_addr);
+    if (bind(unicast_receiver.Get(), reinterpret_cast<sockaddr*>(&unicast_local),
+             sizeof(unicast_local)) != 0) return 2300 + errno;
+    if (const int error = InjectUdp(packet.Get(), peer_index, "10.49.0.2",
+                                    "10.49.0.255", 48549, 'E'); error != 0) {
+        return 2400 + error;
+    }
+    if (recv(unicast_receiver.Get(), &received, 1, 0) >= 0 ||
+        (errno != EAGAIN && errno != EWOULDBLOCK)) return 2500;
+    if (const int error = InjectUdp(packet.Get(), peer_index, "10.49.0.2",
+                                    "10.49.0.1", 48549, 'F'); error != 0) {
+        return 2600 + error;
+    }
+    if (recv(unicast_receiver.Get(), &received, 1, 0) != 1 || received != 'F') {
+        return 2700 + errno;
+    }
     // The explicit broadcast is owned by the peer stack, but this frame
     // enters on the first interface. It must survive the pre-routed handoff.
     Fd peer_receiver(socket(AF_INET, SOCK_DGRAM, 0));
@@ -246,6 +332,36 @@ int RunIngressCase() {
     if (recv(peer_receiver.Get(), &received, 1, 0) != 1 || received != 'D') {
         return 2100 + errno;
     }
+    if (AddIpv6(route.Get(), first_index, 7, "fd00:47::1") != 0) return 2800;
+    Fd packet6(socket(AF_PACKET, SOCK_DGRAM, htons(ETH_P_IPV6)));
+    Fd wildcard6(socket(AF_INET6, SOCK_DGRAM, 0));
+    Fd unicast6(socket(AF_INET6, SOCK_DGRAM, 0));
+    if (packet6.Get() < 0 || wildcard6.Get() < 0 || unicast6.Get() < 0) return 2900 + errno;
+    if (setsockopt(wildcard6.Get(), SOL_SOCKET, SO_BINDTODEVICE, first, sizeof(first)) != 0) {
+        return 2950 + errno;
+    }
+    setsockopt(wildcard6.Get(), SOL_SOCKET, SO_RCVTIMEO, &receive_timeout, sizeof(receive_timeout));
+    setsockopt(unicast6.Get(), SOL_SOCKET, SO_RCVTIMEO, &receive_timeout, sizeof(receive_timeout));
+    sockaddr_in6 local6 {};
+    local6.sin6_family = AF_INET6;
+    local6.sin6_port = htons(48550);
+    if (bind(wildcard6.Get(), reinterpret_cast<sockaddr*>(&local6), sizeof(local6)) != 0) {
+        return 3000 + errno;
+    }
+    local6.sin6_port = htons(48551);
+    inet_pton(AF_INET6, "fd00:47::1", &local6.sin6_addr);
+    if (bind(unicast6.Get(), reinterpret_cast<sockaddr*>(&local6), sizeof(local6)) != 0) {
+        return 3100 + errno;
+    }
+    // All-nodes multicast has implicit interface membership. The wildcard
+    // positive control ensures rejection is not explained by missing delivery.
+    if (InjectUdp6(packet6.Get(), peer_index, "ff02::1", 48550, 'M') != 0) return 3200;
+    if (recv(wildcard6.Get(), &received, 1, 0) != 1 || received != 'M') return 3300 + errno;
+    if (InjectUdp6(packet6.Get(), peer_index, "ff02::1", 48551, 'N') != 0) return 3400;
+    if (recv(unicast6.Get(), &received, 1, 0) >= 0 ||
+        (errno != EAGAIN && errno != EWOULDBLOCK)) return 3500;
+    if (InjectUdp6(packet6.Get(), peer_index, "fd00:47::1", 48551, 'U') != 0) return 3600;
+    if (recv(unicast6.Get(), &received, 1, 0) != 1 || received != 'U') return 3700 + errno;
     return 0;
 }
 

@@ -1,6 +1,6 @@
 use alloc::sync::Arc;
 
-use smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint};
+use smoltcp::wire::{IpAddress, IpListenEndpoint};
 use system_error::SystemError;
 
 use crate::{
@@ -109,25 +109,6 @@ pub(super) fn resolve_ipv4_send_route(
 ) -> Result<ResolvedIpv4Route, SystemError> {
     let fixed_source = bound_source_constraint(netns, local).or(fixed_source);
     crate::net::route::resolve_ipv4_route(netns, destination, required_oif, fixed_source)
-}
-
-pub(super) fn local_source_endpoint(
-    netns: &Arc<NetNamespace>,
-    local: IpListenEndpoint,
-    destination: IpAddress,
-    local_delivery_ifindex: Option<i32>,
-    output_flow: Option<Ipv4OutputFlow>,
-    unspecified: IpAddress,
-) -> IpEndpoint {
-    let address = bound_source_constraint(netns, local)
-        .or_else(|| output_flow.map(|flow| flow.source))
-        .or_else(|| {
-            let ifindex = usize::try_from(local_delivery_ifindex?).ok()?;
-            let iface = netns.device_list().get(&ifindex).cloned()?;
-            crate::net::socket::inet::common::pick_configured_source_addr(&iface, &destination)
-        })
-        .unwrap_or(unspecified);
-    IpEndpoint::new(address, local.port)
 }
 
 #[cfg(test)]

@@ -199,8 +199,23 @@ pub(crate) fn resolve_ipv6_send_route(
     let devices = netns.device_list();
     let router = netns.router();
     let fib = router.fib.read();
-    let selected = super::lookup_output_fib(&fib, destination, required_oif)
-        .ok_or(SystemError::ENETUNREACH)?;
+    let selected = super::lookup_output_fib(&fib, destination, required_oif).ok_or_else(|| {
+        // ip6_dst_lookup_tail still attempts automatic source selection
+        // after an initial route miss. No candidate takes precedence over
+        // that route error; an explicit or available source does not.
+        if fixed_source.is_none()
+            && !devices.values().any(|iface| {
+                iface.common().ip_addrs().iter().any(|cidr| {
+                    matches!(cidr.address(), IpAddress::Ipv6(source)
+                            if !source.is_unspecified() && !source.is_multicast())
+                })
+            })
+        {
+            SystemError::EADDRNOTAVAIL
+        } else {
+            SystemError::ENETUNREACH
+        }
+    })?;
     let egress = devices
         .get(&(selected.oif as usize))
         .ok_or(SystemError::ENETUNREACH)?;

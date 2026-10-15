@@ -99,6 +99,16 @@ impl StatusFileOps {
             .unwrap_or(RawPid::new(0));
         pdata.append(&mut format!("\nTgid:\t{}", tgid.data()).into());
 
+        // Like Linux task_sig(): all live records and timer reservations for
+        // this task's current real UID/user namespace, not its queue length.
+        let cred = pcb.cred();
+        let pending_signals =
+            crate::ipc::signal_quota::SignalAccount::usage(&cred.user_ns, cred.uid.data());
+        let pending_limit = pcb
+            .get_rlimit(crate::process::resource::RLimitID::Sigpending)
+            .rlim_cur;
+        pdata.append(&mut format!("\nSigQ:\t{}/{}", pending_signals, pending_limit).into());
+
         // Pid
         pdata.append(
             &mut format!("\nPid:\t{}", self.target.vpid().data())

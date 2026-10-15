@@ -58,33 +58,6 @@ impl ProcessSignalState {
         self.body.pending.lock_irqsave().dequeue_signal(mask)
     }
 
-    pub fn shared_pending_push(&self, sig: Signal, info: SigInfo) {
-        let mut pending = self.body.pending.lock_irqsave();
-        pending.queue_mut().push_normal(info);
-        pending.signal_mut().insert(sig.into());
-    }
-
-    pub fn shared_pending_push_dedup(
-        &self,
-        sig: Signal,
-        info: SigInfo,
-    ) -> Result<bool, SystemError> {
-        let mut pending = self.body.pending.lock_irqsave();
-        pending.enqueue(sig, info)
-    }
-
-    pub fn shared_pending_push_posix_timer(&self, sig: Signal, info: SigInfo) -> bool {
-        let mut pending = self.body.pending.lock_irqsave();
-        if pending.queue().find(sig).0.is_some()
-            || (!sig.is_rt_signal() && pending.signal().contains(sig.into()))
-        {
-            return false;
-        }
-        pending.queue_mut().push_normal(info);
-        pending.signal_mut().insert(sig.into());
-        true
-    }
-
     pub fn shared_pending_signal_insert(&self, sig: Signal) {
         self.body
             .pending

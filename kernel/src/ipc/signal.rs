@@ -18,10 +18,9 @@ use crate::{
         SIG_KERNEL_COREDUMP_MASK, SIG_KERNEL_IGNORE_MASK, SIG_KERNEL_ONLY_MASK,
         SIG_KERNEL_STOP_MASK,
     },
-    libs::rwlock::RwLockWriteGuard,
     mm::VirtAddr,
     process::{
-        pid::PidType, ProcessControlBlock, ProcessFlags, ProcessManager, ProcessSignalInfo, RawPid,
+        pid::PidType, resource::RLimitID, ProcessControlBlock, ProcessFlags, ProcessManager, RawPid,
     },
     syscall::user_access::UserBufferWriter,
     time::{
@@ -464,18 +463,32 @@ impl Signal {
             }
         };
 
+        // Resolve identity outside pending locks. The account pins the exact
+        // credential/namespace generation, including across later setuid.
+        let cred = pcb.cred();
+        let account =
+            crate::ipc::signal_quota::SignalAccount::get(&cred.user_ns, cred.uid.data()).ok();
+        let limit = pcb.get_rlimit(RLimitID::Sigpending).rlim_cur;
         if is_thread_target {
             // Thread-level signal: add to the thread's sig_pending
             let mut pcb_info = pcb.sig_info_mut();
-            if !pcb_info.sig_pending_mut().enqueue(*self, new_sig_info)? {
+            if pcb.flags().contains(ProcessFlags::PID_UNHASHED) {
+                return Ok(0);
+            }
+            if !pcb_info
+                .sig_pending_mut()
+                .enqueue(*self, new_sig_info, account.as_ref(), limit)?
+            {
                 return Ok(0);
             }
         } else {
             // Process-level signal: add to shared_pending
-            if !pcb
-                .process_signal()
-                .shared_pending_push_dedup(*self, new_sig_info)?
-            {
+            let group = pcb.process_signal();
+            let mut pending = group.lock_irqsave();
+            if pcb.flags().contains(ProcessFlags::PID_UNHASHED) {
+                return Ok(0);
+            }
+            if !pending.enqueue(*self, new_sig_info, account.as_ref(), limit)? {
                 return Ok(0);
             }
         }
@@ -483,45 +496,6 @@ impl Signal {
         // On the normal path the shared bitmap has already been set when the signal was enqueued.
         self.complete_signal(pcb.clone(), pt, true);
         Ok(0)
-    }
-
-    /// 在已持有 ProcessSignalInfo 锁的情况下，将信号入队
-    ///
-    /// 此方法专为 POSIX timer 等需要原子性检查并入队的场景设计，
-    /// 调用者负责在调用前检查去重条件，此方法只负责入队和后续处理。
-    ///
-    /// ## 参数
-    /// - `info`: 要入队的信号信息
-    /// - `pcb`: 目标进程
-    /// - `pt`: 信号类型，`PidType::PID` 表示线程级信号，`PidType::TGID` 表示进程级信号
-    /// - `siginfo_guard`: 已持有的 ProcessSignalInfo 锁（线程级信号时使用，进程级信号时会被忽略）
-    ///
-    /// ## 注意
-    /// 此方法会消耗 `siginfo_guard`，调用后锁会被释放
-    pub fn enqueue_signal_locked(
-        &self,
-        info: SigInfo,
-        pcb: Arc<ProcessControlBlock>,
-        pt: PidType,
-        siginfo_guard: RwLockWriteGuard<'_, ProcessSignalInfo>,
-    ) {
-        let is_thread_target = matches!(pt, PidType::PID);
-
-        // 根据信号类型选择添加到线程级 pending 还是进程级 shared_pending
-        if is_thread_target {
-            // 线程级信号：添加到线程的 sig_pending
-            let mut guard = siginfo_guard;
-            guard.sig_pending_mut().queue_mut().push_normal(info);
-            guard.sig_pending_mut().signal_mut().insert((*self).into());
-            drop(guard);
-        } else {
-            // 进程级信号：添加到 shared_pending（不需要 siginfo_guard）
-            drop(siginfo_guard);
-            pcb.process_signal().shared_pending_push(*self, info);
-        }
-
-        // complete_signal 会统一：设置对应 pending 位图、更新 HAS_PENDING_SIGNAL，并按需唤醒
-        self.complete_signal(pcb, pt, true);
     }
 
     /// @brief Complete signal delivery: set the pending bitmap, choose the delivery target, and wake up as needed.

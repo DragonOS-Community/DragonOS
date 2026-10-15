@@ -471,7 +471,7 @@ impl PreparedTaskResources {
         let (rlimits, itimers) = if flags.contains(CloneFlags::CLONE_THREAD) {
             (parent.rlimits.clone(), parent.itimers.clone())
         } else {
-            let snapshot = { **parent.rlimits.read() };
+            let snapshot = { **parent.rlimits.read_irqsave() };
             (
                 Self::try_limits(snapshot, creator)?,
                 Self::try_itimers(creator)?,
@@ -1047,12 +1047,20 @@ impl ProcessControlBlock {
             rlim_max: 64 * 1024,
         };
 
+        // Linux fork_init() derives this finite default from the boot-time
+        // thread capacity. Fork inherits the parent's limits afterwards.
+        let pending_signals = (super::max_threads() / 2).max(1) as u64;
+        arr[RLimitID::Sigpending as usize] = RLimit64 {
+            rlim_cur: pending_signals,
+            rlim_max: pending_signals,
+        };
+
         arr
     }
 
     #[inline(always)]
     pub fn get_rlimit(&self, res: RLimitID) -> crate::process::resource::RLimit64 {
-        self.rlimits.read()[res as usize]
+        self.rlimits.read_irqsave()[res as usize]
     }
 
     #[inline]
@@ -1089,7 +1097,9 @@ impl ProcessControlBlock {
         let can_raise_hard =
             crate::process::cred::capable(crate::process::cred::CAPFlags::CAP_SYS_RESOURCE);
         let cur = {
-            let mut rlimits = self.rlimits.write();
+            // Signal admission reads this lock from timer/IRQ callbacks.
+            // Readers and writers must both exclude same-CPU IRQ reentry.
+            let mut rlimits = self.rlimits.write_irqsave();
             let cur = rlimits[res as usize];
             if newv.rlim_max > cur.rlim_max && !can_raise_hard {
                 return Err(SystemError::EPERM);

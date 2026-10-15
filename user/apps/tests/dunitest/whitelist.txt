@@ -36,6 +36,7 @@ normal/overlayfs_semantics
 normal/overlayfs_mount_validation
 normal/test_fchown_o_path
 normal/proc_self_limits
+normal/signal_pending_limit
 normal/proc_fd_devfs_readlink
 normal/mlock_semantics
 normal/mmap_truncate_cow

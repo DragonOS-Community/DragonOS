@@ -4,7 +4,9 @@ use alloc::vec::Vec;
 use core::cmp::Ordering;
 use core::fmt::Debug;
 use core::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
+use hashbrown::HashMap;
 
+use crate::ipc::signal_quota::SignalAccount;
 use crate::libs::{mutex::Mutex, spinlock::SpinLock};
 use crate::process::{
     cred::{Kgid, Kuid},
@@ -254,6 +256,11 @@ pub struct UserNamespace {
     /// Named keyring lookup is scoped to this user namespace.  The register
     /// ring owns the per-UID links; this index is deliberately non-owning.
     pub(crate) keyrings: Mutex<UserNamespaceKeyrings>,
+    /// Non-owning per-real-UID signal accounts. Last account drop removes its
+    /// own entry; namespace creation pins only the fixed creator account.
+    pub(crate) signal_accounts: SpinLock<HashMap<usize, Weak<SignalAccount>>>,
+    pub(crate) signal_parent: Option<Arc<SignalAccount>>,
+    pub(crate) signal_limit: u64,
 }
 
 #[derive(Default)]
@@ -297,6 +304,9 @@ impl UserNamespace {
             nscommon: NsCommon::new(0, NamespaceType::User),
             parent: None,
             keyrings: Mutex::new(UserNamespaceKeyrings::default()),
+            signal_accounts: SpinLock::new(HashMap::new()),
+            signal_parent: None,
+            signal_limit: u64::MAX,
             inner: SpinLock::new(InnerUserNamespace {
                 uid_map: UidGidMap::new_identity(),
                 gid_map: UidGidMap::new_identity(),
@@ -371,6 +381,14 @@ impl UserNamespace {
             }
         }
 
+        // Linux create_user_ns() fixes the parent account to the creator's
+        // effective UID, and snapshots the current soft limit for descendants.
+        // Prepare before publishing the namespace, never in a pending lock.
+        let signal_parent = SignalAccount::get(&parent_ns, cred.euid.data())?;
+        let signal_limit = ProcessManager::current_pcb()
+            .get_rlimit(crate::process::resource::RLimitID::Sigpending)
+            .rlim_cur;
+
         // 4. 创建新的 UserNamespace
         let new_ns = Arc::new_cyclic(|self_ref| {
             let ns = Self {
@@ -378,6 +396,9 @@ impl UserNamespace {
                 nscommon: NsCommon::new(parent_ns.level() + 1, NamespaceType::User),
                 parent: Some(parent_ns.clone()),
                 keyrings: Mutex::new(UserNamespaceKeyrings::default()),
+                signal_accounts: SpinLock::new(HashMap::new()),
+                signal_parent: Some(signal_parent),
+                signal_limit,
                 inner: SpinLock::new(InnerUserNamespace {
                     uid_map: UidGidMap::default(),
                     gid_map: UidGidMap::default(),

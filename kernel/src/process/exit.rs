@@ -1008,6 +1008,9 @@ impl ProcessControlBlock {
 
         let group_dead = self.is_thread_group_leader();
         let mut sig_guard = self.sig_info_mut();
+        // Linux __exit_signal releases records at reap, not at the final PCB
+        // Arc drop. pidfd/ptrace observers must not retain user signal quota.
+        sig_guard.sig_pending_mut().flush();
         let mut tty: Option<Arc<TtyCore>> = None;
         // log::debug!(
         //     "Process {} is exiting, group_dead: {}, state: {:?}",
@@ -1026,6 +1029,10 @@ impl ProcessControlBlock {
         // lock order used by fork(), setpgid(), setsid(), and tty cleanup.
         drop(sig_guard);
         self.__unhash_process(group_dead);
+
+        if group_dead {
+            signal_state.lock_irqsave().flush();
+        }
 
         drop(tty);
     }

@@ -1,6 +1,6 @@
 use core::ffi::c_void;
 
-use alloc::vec::Vec;
+use alloc::{sync::Arc, vec::Vec};
 use system_error::SystemError;
 
 use crate::{
@@ -9,6 +9,7 @@ use crate::{
         interrupt::TrapFrame,
         ipc::signal::{SigFlags, SigSet, Signal, MAX_SIG_NUM},
     },
+    ipc::signal_quota::{SignalAccount, SignalCharge},
     mm::VirtAddr,
     process::RawPid,
 };
@@ -1122,7 +1123,7 @@ impl SigInfo {
     }
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default)]
 pub struct SigPending {
     signal: SigSet,
     queue: SigQueue,
@@ -1131,18 +1132,32 @@ pub struct SigPending {
 impl SigPending {
     /// Caller holds the pending lock. Commit queue and bitmap together; a
     /// failed real-time enqueue must leave neither a new entry nor a bit.
-    pub(crate) fn enqueue(&mut self, sig: Signal, info: SigInfo) -> Result<bool, SystemError> {
+    pub(crate) fn enqueue(
+        &mut self,
+        sig: Signal,
+        info: SigInfo,
+        account: Option<&Arc<SignalAccount>>,
+        limit: u64,
+    ) -> Result<bool, SystemError> {
         if !sig.is_rt_signal() && self.signal.contains(sig.into()) {
             return Ok(false);
         }
-        if self.queue.reserve_normal().is_err() {
+        let override_limit = !sig.is_rt_signal() && info.sig_code().as_i32() >= 0;
+        let charge = account
+            .ok_or(SystemError::EAGAIN_OR_EWOULDBLOCK)
+            .and_then(|account| SignalCharge::acquire(account, limit, override_limit))
+            .and_then(|charge| self.queue.reserve_normal().map(|()| charge));
+        if let Ok(charge) = charge {
+            self.queue.q.push(QueuedSignal {
+                info,
+                _charge: SignalQuotaOwner::Ordinary(charge),
+            });
+        } else {
             // Linux permits lossy bitmap-only delivery for standard/kill
             // signals, but explicit real-time metadata cannot be discarded.
             if sig.is_rt_signal() && info.sig_code() != SigCode::User {
                 return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
             }
-        } else {
-            self.queue.q.push(info);
         }
         self.signal.insert(sig.into());
         Ok(true)
@@ -1151,6 +1166,12 @@ impl SigPending {
     /// 判断是否有待处理的信号
     pub fn has_pending(&self) -> bool {
         return !self.signal.is_empty();
+    }
+
+    /// Reap-time cleanup, independent of observer references to the PCB.
+    pub(crate) fn flush(&mut self) {
+        self.queue.q.clear();
+        self.signal = SigSet::empty();
     }
 
     pub fn signal(&self) -> SigSet {
@@ -1283,7 +1304,7 @@ impl SigPending {
     /// @brief 从sigpending中删除mask中被置位的信号。也就是说，比如mask的第1位被置为1,那么就从sigqueue中删除所有signum为2的信号的信息。
     pub fn flush_by_mask(&mut self, mask: &SigSet) {
         // 定义过滤器，从sigqueue中删除mask中被置位的信号
-        let filter = |x: &SigInfo| !mask.contains(Signal::from(x.sig_no as usize).into());
+        let filter = |x: &QueuedSignal| !mask.contains(Signal::from(x.sig_no as usize).into());
         self.queue.q.retain(filter);
         // 同步清理位图中的相应位，避免仅删除队列项但仍因位图残留被视为pending
         self.signal.remove(*mask);
@@ -1313,12 +1334,41 @@ impl SigPending {
 }
 
 /// @brief 进程接收到的信号的队列
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 pub struct SigQueue {
-    pub q: Vec<SigInfo>,
+    pub(crate) q: Vec<QueuedSignal>,
     /// Each live CPU timer reserves one additional FIFO slot. Normal signal
     /// producers preserve this spare capacity; timer expiry never allocates.
     timer_reservations: usize,
+}
+
+/// Metadata copies never copy ownership. Only the queued record holds the
+/// ordinary charge; a timer record shares its creation-time reservation.
+#[derive(Debug)]
+pub(crate) struct QueuedSignal {
+    info: SigInfo,
+    _charge: SignalQuotaOwner,
+}
+
+#[derive(Debug)]
+#[allow(dead_code)] // Variants deliberately retain their RAII owners.
+enum SignalQuotaOwner {
+    Ordinary(SignalCharge),
+    Timer(Arc<SignalCharge>),
+    #[cfg(test)]
+    Uncharged,
+}
+
+impl core::ops::Deref for QueuedSignal {
+    type Target = SigInfo;
+    fn deref(&self) -> &SigInfo {
+        &self.info
+    }
+}
+impl core::ops::DerefMut for QueuedSignal {
+    fn deref_mut(&mut self) -> &mut SigInfo {
+        &mut self.info
+    }
 }
 
 #[allow(dead_code)]
@@ -1351,19 +1401,23 @@ impl SigQueue {
     }
 
     /// Callers serialize one outstanding entry per reserved timer identity.
-    pub(crate) fn push_reserved_timer(&mut self, info: SigInfo) -> Result<(), SystemError> {
+    pub(crate) fn push_reserved_timer(
+        &mut self,
+        info: SigInfo,
+        charge: Arc<SignalCharge>,
+    ) -> Result<(), SystemError> {
+        self.push_reserved_entry(QueuedSignal {
+            info,
+            _charge: SignalQuotaOwner::Timer(charge),
+        })
+    }
+
+    fn push_reserved_entry(&mut self, entry: QueuedSignal) -> Result<(), SystemError> {
         if self.timer_reservations == 0 || self.q.len() == self.q.capacity() {
             return Err(SystemError::ENOMEM);
         }
-        self.q.push(info);
+        self.q.push(entry);
         Ok(())
-    }
-
-    pub(crate) fn push_normal(&mut self, info: SigInfo) {
-        // Existing lossy standard-signal callers retain their bitmap fallback.
-        if self.reserve_normal().is_ok() {
-            self.q.push(info);
-        }
     }
 
     /// @brief 在信号队列中寻找第一个满足要求的siginfo, 并返回它的引用
@@ -1394,7 +1448,9 @@ impl SigQueue {
         let Some(index) = self.q.iter().position(|info| info.is_signal(sig)) else {
             return (None, false);
         };
-        let info = self.q.remove(index);
+        let entry = self.q.remove(index);
+        let info = entry.info;
+        drop(entry);
         let still_pending = self.q.iter().any(|info| info.is_signal(sig));
         (Some(info), still_pending)
     }
@@ -1448,6 +1504,18 @@ impl SignalFlags {
 mod timer_signal_tests {
     use super::*;
 
+    fn uncharged(info: SigInfo) -> QueuedSignal {
+        QueuedSignal {
+            info,
+            _charge: SignalQuotaOwner::Uncharged,
+        }
+    }
+
+    fn push_normal(queue: &mut SigQueue, info: SigInfo) {
+        queue.reserve_normal().unwrap();
+        queue.q.push(uncharged(info));
+    }
+
     fn timer_info(serial: u64) -> SigInfo {
         let mut info = SigInfo::new(
             Signal::SIGALRM,
@@ -1476,11 +1544,13 @@ mod timer_signal_tests {
         for round in 0..4 {
             // Ordinary enqueues may grow but cannot consume timer guarantees.
             for id in 0..9 {
-                queue.push_normal(timer_info(100 + id));
+                push_normal(&mut queue, timer_info(100 + id));
             }
             let capacity = queue.q.capacity();
             for id in 0..32 {
-                queue.push_reserved_timer(timer_info(id)).unwrap();
+                queue
+                    .push_reserved_entry(uncharged(timer_info(id)))
+                    .unwrap();
             }
             assert_eq!(queue.q.capacity(), capacity);
             assert_eq!(queue.q[9].timer_token().unwrap().incarnation, 0);
@@ -1497,11 +1567,11 @@ mod timer_signal_tests {
         let mut queue = SigQueue::default();
         queue.reserve_timer().unwrap();
         queue.reserve_timer().unwrap();
-        queue.push_reserved_timer(timer_info(1)).unwrap();
+        queue.push_reserved_entry(uncharged(timer_info(1))).unwrap();
         queue.release_timer(); // deleted timer's already queued signal remains
-        queue.push_normal(timer_info(9));
+        push_normal(&mut queue, timer_info(9));
         let capacity = queue.q.capacity();
-        queue.push_reserved_timer(timer_info(2)).unwrap();
+        queue.push_reserved_entry(uncharged(timer_info(2))).unwrap();
         assert_eq!(queue.q.capacity(), capacity);
         assert_eq!(queue.q[0].timer_token().unwrap().incarnation, 1);
         queue.release_timer();

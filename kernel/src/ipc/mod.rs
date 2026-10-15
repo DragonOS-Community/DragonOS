@@ -9,6 +9,7 @@ pub mod sem_undo;
 pub mod shm;
 pub mod sighand;
 pub mod signal;
+pub mod signal_quota;
 pub mod signal_types;
 pub mod signalfd;
 pub mod syscall;

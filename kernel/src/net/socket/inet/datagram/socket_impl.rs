@@ -159,7 +159,7 @@ impl Socket for UdpSocket {
                                 &self.netns,
                                 remote.addr,
                                 required_oif,
-                                local.addr,
+                                output_flow::bound_source_constraint(&self.netns, local),
                             )?
                             .source
                             .into(),
@@ -168,7 +168,11 @@ impl Socket for UdpSocket {
                     return match self.inner.read().as_ref() {
                         Some(UdpInner::Bound(inner)) => {
                             inner.connect(remote, connected_source);
-                            self.receive_queue.connect(remote, connected_source);
+                            let receive_local = local
+                                .addr
+                                .filter(|address| !address.is_unspecified())
+                                .or(connected_source);
+                            self.receive_queue.connect(remote, receive_local);
                             inner.update_receive_filter(self.bound_device_ifindex());
                             Ok(())
                         }

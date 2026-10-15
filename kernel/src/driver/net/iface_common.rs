@@ -165,7 +165,7 @@ pub struct IfaceCommon {
     /// Routes supplied by constructors before the interface joins a netns.
     /// Drained transactionally by netns registration; never authoritative.
     pub(super) bootstrap_routes: Mutex<Vec<BootstrapRoute>>,
-    pub(super) ipv4_multicast_refcnt: Mutex<Vec<(smoltcp::wire::Ipv4Address, usize)>>,
+    pub(super) multicast_refcnt: Mutex<Vec<(smoltcp::wire::IpAddress, usize)>>,
     /// Serializes configured receive-mode flags with AF_PACKET references.
     pub(super) receive_mode: Mutex<ReceiveModeState>,
 }
@@ -292,7 +292,7 @@ impl IfaceCommon {
             local_input_queue: LocalInputQueue::new(),
             address_metadata: Mutex::new(address_metadata),
             bootstrap_routes: Mutex::new(Vec::new()),
-            ipv4_multicast_refcnt: Mutex::new(Vec::new()),
+            multicast_refcnt: Mutex::new(Vec::new()),
             receive_mode: Mutex::new(ReceiveModeState {
                 configured_flags: flags.bits(),
                 packet_promiscuity: 0,
@@ -306,7 +306,15 @@ impl IfaceCommon {
         netns: &Arc<NetNamespace>,
         group: smoltcp::wire::Ipv4Address,
     ) -> Result<(), SystemError> {
-        let mut guard = self.ipv4_multicast_refcnt.lock();
+        self.multicast_join_ref(netns, group.into())
+    }
+
+    pub(crate) fn multicast_join_ref(
+        &self,
+        netns: &Arc<NetNamespace>,
+        group: smoltcp::wire::IpAddress,
+    ) -> Result<(), SystemError> {
+        let mut guard = self.multicast_refcnt.lock();
         if !self
             .net_namespace
             .read()
@@ -319,9 +327,10 @@ impl IfaceCommon {
             *cnt = cnt.saturating_add(1);
             return Ok(());
         }
+        guard.try_reserve(1).map_err(|_| SystemError::ENOMEM)?;
         self.smol_iface
             .lock()
-            .join_multicast_group(smoltcp::wire::IpAddress::Ipv4(group))
+            .join_multicast_group(group)
             .map_err(|error| match error {
                 smoltcp::iface::MulticastError::GroupTableFull => SystemError::ENOBUFS,
                 smoltcp::iface::MulticastError::Unaddressable => SystemError::EINVAL,
@@ -335,7 +344,15 @@ impl IfaceCommon {
         netns: &Arc<NetNamespace>,
         group: smoltcp::wire::Ipv4Address,
     ) -> Result<(), SystemError> {
-        let mut guard = self.ipv4_multicast_refcnt.lock();
+        self.multicast_leave_ref(netns, group.into())
+    }
+
+    pub(crate) fn multicast_leave_ref(
+        &self,
+        netns: &Arc<NetNamespace>,
+        group: smoltcp::wire::IpAddress,
+    ) -> Result<(), SystemError> {
+        let mut guard = self.multicast_refcnt.lock();
         if !self
             .net_namespace
             .read()
@@ -352,10 +369,7 @@ impl IfaceCommon {
             return Ok(());
         }
         guard.swap_remove(pos);
-        let _ = self
-            .smol_iface
-            .lock()
-            .leave_multicast_group(smoltcp::wire::IpAddress::Ipv4(group));
+        let _ = self.smol_iface.lock().leave_multicast_group(group);
         Ok(())
     }
 
@@ -2001,7 +2015,8 @@ impl IfaceCommon {
     }
 
     pub(crate) fn begin_netns_move(&self) {
-        debug_assert_eq!(self.namespace_epoch.fetch_add(1, Ordering::AcqRel) & 1, 0);
+        let previous = self.namespace_epoch.fetch_add(1, Ordering::AcqRel);
+        debug_assert_eq!(previous & 1, 0);
     }
 
     fn enter_poll_epoch(&self, expected: u64) -> Option<tx_admission::TxAdmissionGuard<'_>> {
@@ -2027,7 +2042,8 @@ impl IfaceCommon {
     }
 
     pub(crate) fn end_netns_move(&self) {
-        debug_assert_eq!(self.namespace_epoch.fetch_add(1, Ordering::Release) & 1, 1);
+        let previous = self.namespace_epoch.fetch_add(1, Ordering::Release);
+        debug_assert_eq!(previous & 1, 1);
         self.poll_admission.open();
     }
 

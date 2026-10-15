@@ -282,6 +282,45 @@ TEST_F(Ipv6MulticastNetwork, OutputInterfaceConflictDoesNotCommit) {
     ASSERT_EQ(getsockopt(rx.Get(), IPPROTO_IPV6, IPV6_MULTICAST_IF, &actual, &length), 0);
     EXPECT_EQ(actual, 0U);
 }
+TEST_F(Ipv6MulticastNetwork, GroupPortZeroDisconnectSendtoUsesUnicastSource) {
+    FdGuard rx(Receiver(31022, "::", "mc90b"));
+    FdGuard tx(Receiver(0, "ff02::9090", "mc90a"));
+    ASSERT_EQ(Member(rx.Get(), b), 0);
+    ASSERT_EQ(setsockopt(tx.Get(), IPPROTO_IPV6, IPV6_MULTICAST_IF, &a, sizeof(a)), 0);
+    const int loop = 0;
+    ASSERT_EQ(setsockopt(tx.Get(), IPPROTO_IPV6, IPV6_MULTICAST_LOOP, &loop, sizeof(loop)), 0);
+    auto destination = Address("ff02::9090", 31022);
+    ASSERT_EQ(connect(tx.Get(), reinterpret_cast<sockaddr*>(&destination), sizeof(destination)), 0)
+        << ErrnoString(errno);
+    sockaddr disconnect{};
+    disconnect.sa_family = AF_UNSPEC;
+    ASSERT_EQ(connect(tx.Get(), &disconnect, sizeof(disconnect)), 0) << errno;
+    sockaddr_in6 local{};
+    socklen_t length = sizeof(local);
+    ASSERT_EQ(getsockname(tx.Get(), reinterpret_cast<sockaddr*>(&local), &length), 0);
+    EXPECT_EQ(local.sin6_port, 0);
+    auto group = Address("ff02::9090");
+    EXPECT_EQ(memcmp(&local.sin6_addr, &group.sin6_addr, sizeof(in6_addr)), 0);
+    ASSERT_EQ(sendto(tx.Get(), "M", 1, 0, reinterpret_cast<sockaddr*>(&destination),
+                     sizeof(destination)), 1) << ErrnoString(errno);
+    pollfd ready{rx.Get(), POLLIN, 0};
+    ASSERT_EQ(poll(&ready, 1, 2000), 1);
+    sockaddr_in6 source{};
+    length = sizeof(source);
+    char byte = 0;
+    ASSERT_EQ(recvfrom(rx.Get(), &byte, 1, 0, reinterpret_cast<sockaddr*>(&source), &length), 1);
+    EXPECT_EQ(byte, 'M');
+    auto unicast = Address("fe80::90a");
+    EXPECT_EQ(memcmp(&source.sin6_addr, &unicast.sin6_addr, sizeof(in6_addr)), 0);
+    ASSERT_EQ(getsockname(tx.Get(), reinterpret_cast<sockaddr*>(&local), &length), 0);
+    EXPECT_NE(local.sin6_port, 0);
+    EXPECT_EQ(local.sin6_port, source.sin6_port);
+    EXPECT_EQ(memcmp(&local.sin6_addr, &group.sin6_addr, sizeof(in6_addr)), 0);
+    // A second send follows the now-bound path, with the same receive bind.
+    ASSERT_EQ(sendto(tx.Get(), "M", 1, 0, reinterpret_cast<sockaddr*>(&destination),
+                     sizeof(destination)), 1) << ErrnoString(errno);
+    Receive(rx.Get(), true);
+}
 TEST_F(Ipv6MulticastNetwork, ExplicitSolicitedGroupSurvivesAddressDeletion) {
     constexpr const char* group = "ff02::1:ff00:90b";
     FdGuard rx(Receiver(31016));

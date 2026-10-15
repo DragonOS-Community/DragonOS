@@ -1509,11 +1509,15 @@ impl UdpSocket {
                 return Err(SystemError::EINVAL);
             }
             let (required_oif, _) = output_flow::socket_constraints(self, destination.addr)?;
+            let receive_bind = IpListenEndpoint {
+                addr: fixed_address,
+                port: 0,
+            };
             let resolved = crate::net::route::resolve_ipv6_send_route(
                 &self.netns,
                 destination.addr,
                 required_oif,
-                fixed_address,
+                output_flow::bound_source_constraint(&self.netns, receive_bind),
             )?;
             let mut prepared = self.prepare_iface_socket(resolved.source_owner.clone())?;
             let _placement = self.iface_placement.write();

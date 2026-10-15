@@ -12,14 +12,35 @@ use crate::{
 };
 
 #[derive(Debug)]
-struct DmaAllocatorSelftestCallback;
+enum MmReportCallback {
+    #[cfg(feature = "mm_selftest")]
+    DmaSelftest,
+    AllocationStats,
+    #[cfg(feature = "mm_selftest")]
+    AllocationSelftest,
+    #[cfg(feature = "mm_selftest")]
+    VmallocSelftest,
+}
 
-impl KernFSCallback for DmaAllocatorSelftestCallback {
+impl KernFSCallback for MmReportCallback {
     fn open(&self, mut data: KernCallbackData) -> Result<(), SystemError> {
+        let report = match self {
+            #[cfg(feature = "mm_selftest")]
+            Self::DmaSelftest => crate::mm::dma::dma_allocator_selftest_report(),
+            Self::AllocationStats => {
+                let snapshot = crate::arch::mm::LockedFrameAllocator::diagnostic_snapshot()
+                    .ok_or(SystemError::ENODEV)?;
+                crate::mm::allocator::buddy::allocation_stats_report(snapshot)
+            }
+            #[cfg(feature = "mm_selftest")]
+            Self::AllocationSelftest => {
+                crate::mm::allocator::buddy::allocation_diagnostics_selftest_report()
+            }
+            #[cfg(feature = "mm_selftest")]
+            Self::VmallocSelftest => crate::mm::vmalloc::selftest_report(),
+        };
         data.file_private_data_mut()
-            .replace(KernFilePrivateData::DebugTextSnapshot(
-                crate::mm::dma::dma_allocator_selftest_report(),
-            ));
+            .replace(KernFilePrivateData::DebugTextSnapshot(report));
         Ok(())
     }
 
@@ -65,12 +86,36 @@ pub fn init_debugfs_mm() -> Result<(), SystemError> {
         None,
         None,
     )?;
+    #[cfg(feature = "mm_selftest")]
     mm.add_file(
         "dma_allocator_selftest".to_string(),
         InodeMode::S_IRUSR,
         Some(4096),
         None,
-        Some(&DmaAllocatorSelftestCallback),
+        Some(&MmReportCallback::DmaSelftest),
+    )?;
+    mm.add_file(
+        "allocation_stats".to_string(),
+        InodeMode::S_IRUSR,
+        Some(16384),
+        None,
+        Some(&MmReportCallback::AllocationStats),
+    )?;
+    #[cfg(feature = "mm_selftest")]
+    mm.add_file(
+        "allocation_selftest".to_string(),
+        InodeMode::S_IRUSR,
+        Some(4096),
+        None,
+        Some(&MmReportCallback::AllocationSelftest),
+    )?;
+    #[cfg(feature = "mm_selftest")]
+    mm.add_file(
+        "vmalloc_selftest".to_string(),
+        InodeMode::S_IRUSR,
+        Some(4096),
+        None,
+        Some(&MmReportCallback::VmallocSelftest),
     )?;
     Ok(())
 }

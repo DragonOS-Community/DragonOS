@@ -131,6 +131,8 @@ normal/sysfs_cgroup2_mount
 normal/devfs_ptmx_unlink
 normal/devtmpfs_semantics
 normal/dma_allocator_selftest
+normal/allocation_diagnostics
+normal/vmalloc_selftest
 normal/virtio_blk_backpressure
 normal/mknod_socket
 normal/pmem_block

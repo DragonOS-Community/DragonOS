@@ -9,7 +9,7 @@ use crate::{
         wait_queue::{TimeoutWaker, WaitQueue, Waiter},
     },
     process::ProcessManager,
-    time::timer::Timer,
+    time::timer::{clock, Timer},
 };
 
 const COMPLETE_ALL: u32 = u32::MAX;
@@ -46,14 +46,15 @@ impl Completion {
     fn do_wait_for_common(&self, timeout: i64, mode: WaitMode) -> Result<i64, SystemError> {
         let pcb = ProcessManager::current_pcb();
 
-        // None 代表无限等待；Some(jiffies) 代表还剩多少 jiffies
-        let mut remaining = if timeout == MAX_TIMEOUT {
-            None
-        } else {
-            Some(timeout)
-        };
+        // Timer consumes an absolute expiry, whereas this API accepts a duration.
+        // Keep one deadline across spurious wakeups instead of restarting the timeout.
+        let deadline =
+            (timeout != MAX_TIMEOUT).then(|| clock().saturating_add(timeout.max(0) as u64));
 
+        let mut wait_error = None;
         loop {
+            let remaining =
+                deadline.map(|end| end.saturating_sub(clock()).min(i64::MAX as u64) as i64);
             // 快路径：已完成直接消费
             {
                 let mut inner = self.inner.lock_irqsave();
@@ -67,6 +68,10 @@ impl Completion {
                         None => MAX_TIMEOUT,
                     });
                 }
+            }
+
+            if let Some(error) = wait_error.take() {
+                return Err(error);
             }
 
             // Interruptible mode checks any pending signal; killable only fatal ones; uninterruptible ignores signals.
@@ -104,9 +109,8 @@ impl Completion {
 
             // 可选定时器
             let mut timer = None;
-            if let Some(r) = remaining {
-                let jiffies = r as u64;
-                let t = Timer::new(TimeoutWaker::new(waker.clone()), jiffies);
+            if let Some(expiry) = deadline {
+                let t = Timer::new(TimeoutWaker::new(waker.clone()), expiry);
                 t.activate();
                 timer = Some(t);
             }
@@ -131,17 +135,9 @@ impl Completion {
                 inner.wait_queue.remove_waker(&waiter.waker());
             }
 
-            // 检查超时
-            if let Some(t) = timer {
-                if t.timeout() {
-                    return Ok(0);
-                }
-                if let Some(rem) = remaining.as_mut() {
-                    *rem = rem.saturating_sub(1);
-                }
-            }
-
-            wait_res?;
+            // Recheck done under the completion lock before reporting expiry.
+            // A completion racing its timer still consumes the event and returns >= 1.
+            wait_error = wait_res.err();
         }
     }
 

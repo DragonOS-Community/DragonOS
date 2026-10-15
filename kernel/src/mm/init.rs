@@ -54,6 +54,8 @@ pub unsafe fn mm_init() {
 
     // enable mmio
     mmio_init();
+    #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
+    crate::mm::vmalloc::init();
     // enable KMSG
     kmsg_init();
     // enable PAGE_MANAGER

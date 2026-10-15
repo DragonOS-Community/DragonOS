@@ -87,6 +87,7 @@ pub(crate) fn format_stats(snapshot: &MemorySnapshot) -> Result<Vec<u8>, SystemE
     let kernel = bytes(KernelByteKind::Stack)
         .saturating_add(bytes(KernelByteKind::PageTables))
         .saturating_add(bytes(KernelByteKind::KernelOther))
+        .saturating_add(bytes(KernelByteKind::Vmalloc))
         .saturating_add(slab);
     format_pairs(&[
         ("anon", pages(snapshot.anon)),
@@ -95,11 +96,11 @@ pub(crate) fn format_stats(snapshot: &MemorySnapshot) -> Result<Vec<u8>, SystemE
         ("kernel", kernel),
         ("kernel_stack", bytes(KernelByteKind::Stack)),
         ("pagetables", bytes(KernelByteKind::PageTables)),
-        // DragonOS has no secondary MMU/per-cpu/vmalloc memcg allocation class.
+        // DragonOS has no secondary MMU/per-cpu memcg allocation class.
         ("sec_pagetables", 0),
         ("percpu", 0),
         ("sock", pages(snapshot.sock)),
-        ("vmalloc", 0),
+        ("vmalloc", bytes(KernelByteKind::Vmalloc)),
         ("shmem", pages(snapshot.shmem)),
         ("file_mapped", pages(stat(MemoryStat::FileMapped))),
         ("file_dirty", pages(stat(MemoryStat::FileDirty))),

@@ -9,6 +9,7 @@ on:
 
 env:
   ARCH: x86_64
+  KERNEL_FEATURES: mm_selftest
   HOME: /root
   # The CI container has no Docker daemon; use the archive-backed manifest.
   ROOTFS_MANIFEST: default
@@ -31,6 +32,16 @@ jobs:
       - name: Change source
         run: |
           find . -type f \( -name "*.toml" -o -name "Makefile" \) -exec sed -i 's/git\.mirrors\.dragonos\.org\.cn/github\.com/g' {} +
+
+      - name: Require controlled MM selftests
+        shell: bash
+        run: |
+          # Optional selftests must execute in this opt-in CI kernel, never silently skip.
+          cat >> user/apps/tests/dunitest/no_skip.txt <<'EOF'
+          normal/vmalloc_selftest
+          normal/allocation_diagnostics
+          normal/dma_allocator_selftest
+          EOF
 
       - name: Build DragonOS
         shell: bash -ileo pipefail {0}

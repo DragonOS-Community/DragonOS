@@ -1,14 +1,23 @@
 use alloc::vec::Vec;
-#[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
+#[cfg(all(
+    feature = "mm_selftest",
+    any(target_arch = "x86_64", target_arch = "riscv64")
+))]
 use alloc::{format, string::String};
 use core::ptr::NonNull;
 use system_error::SystemError;
 
 use crate::arch::MMArch;
-#[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
+#[cfg(all(
+    feature = "mm_selftest",
+    any(target_arch = "x86_64", target_arch = "riscv64")
+))]
 use crate::libs::mutex::Mutex;
 use crate::libs::spinlock::SpinLock;
-#[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
+#[cfg(all(
+    feature = "mm_selftest",
+    any(target_arch = "x86_64", target_arch = "riscv64")
+))]
 use crate::mm::allocator::buddy::deterministic_buddy_selftest;
 use crate::mm::{
     allocator::page_frame::{
@@ -483,7 +492,10 @@ lazy_static! {
     static ref DMA_ALLOCATOR: DmaAllocator = DmaAllocator::new();
 }
 
-#[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
+#[cfg(all(
+    feature = "mm_selftest",
+    any(target_arch = "x86_64", target_arch = "riscv64")
+))]
 lazy_static! {
     static ref DMA_SELFTEST_LOCK: Mutex<()> = Mutex::new(());
 }
@@ -492,19 +504,28 @@ fn dma_allocator() -> &'static DmaAllocator {
     &DMA_ALLOCATOR
 }
 
-#[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
+#[cfg(all(
+    feature = "mm_selftest",
+    any(target_arch = "x86_64", target_arch = "riscv64")
+))]
 fn release_raw(raw: DmaRawAllocation) {
     unsafe {
         deallocate_page_frames(PhysPageFrame::new(raw.paddr), raw.page_count);
     }
 }
 
-#[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
+#[cfg(all(
+    feature = "mm_selftest",
+    any(target_arch = "x86_64", target_arch = "riscv64")
+))]
 fn raw_fits_mask(raw: &DmaRawAllocation, mask: u64) -> bool {
     allocation_fits_mask(raw, Some(mask))
 }
 
-#[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
+#[cfg(all(
+    feature = "mm_selftest",
+    any(target_arch = "x86_64", target_arch = "riscv64")
+))]
 fn selftest_bounded_orders() -> bool {
     let options = DmaAllocOptions {
         zeroed: false,
@@ -526,7 +547,10 @@ fn selftest_bounded_orders() -> bool {
     true
 }
 
-#[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
+#[cfg(all(
+    feature = "mm_selftest",
+    any(target_arch = "x86_64", target_arch = "riscv64")
+))]
 fn selftest_raw(paddr: usize, pages: usize) -> DmaRawAllocation {
     DmaRawAllocation {
         paddr: PhysAddr::new(paddr),
@@ -535,7 +559,10 @@ fn selftest_raw(paddr: usize, pages: usize) -> DmaRawAllocation {
     }
 }
 
-#[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
+#[cfg(all(
+    feature = "mm_selftest",
+    any(target_arch = "x86_64", target_arch = "riscv64")
+))]
 fn selftest_pool_mask_separation() -> bool {
     let mut pool = DmaPool::new(1, DMA_POOL_MAX_PER_DOMAIN);
 
@@ -600,7 +627,10 @@ fn selftest_pool_mask_separation() -> bool {
         && overflow_rejected
 }
 
-#[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
+#[cfg(all(
+    feature = "mm_selftest",
+    any(target_arch = "x86_64", target_arch = "riscv64")
+))]
 fn selftest_pool_domain_separation() -> bool {
     let key_selection_ok = DmaAllocator::pool_key_for(1, true, Some(u32::MAX as u64))
         == Some(DmaPoolKey {
@@ -703,7 +733,10 @@ fn selftest_pool_domain_separation() -> bool {
 /// Run allocator checks against the live buddy allocator.  Every successful
 /// allocation is released before the function returns, so reading the report
 /// does not reserve memory or grow the normal DMA pools.
-#[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
+#[cfg(all(
+    feature = "mm_selftest",
+    any(target_arch = "x86_64", target_arch = "riscv64")
+))]
 pub(crate) fn dma_allocator_selftest_report() -> String {
     let _guard = DMA_SELFTEST_LOCK.lock();
     let (

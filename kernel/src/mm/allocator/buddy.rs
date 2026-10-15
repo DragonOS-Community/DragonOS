@@ -7,7 +7,10 @@ use log::{debug, warn};
 /// @Description: 伙伴分配器
 use crate::arch::MMArch;
 use crate::mm::allocator::bump::BumpAllocator;
-#[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
+#[cfg(all(
+    feature = "mm_selftest",
+    any(target_arch = "x86_64", target_arch = "riscv64")
+))]
 use crate::mm::allocator::page_frame::{
     allocate_page_frames, deallocate_page_frames, PhysPageFrame,
 };
@@ -16,6 +19,7 @@ use crate::mm::{MemoryManagementArch, PhysAddr, PhysMemoryArea, VirtAddr};
 
 use core::cmp::min;
 use core::fmt::Debug;
+use core::fmt::Write;
 use core::intrinsics::{likely, unlikely};
 
 use core::{marker::PhantomData, mem};
@@ -24,6 +28,7 @@ use core::{marker::PhantomData, mem};
 const MAX_ORDER: usize = 31;
 // 4KB
 const MIN_ORDER: usize = 12;
+pub(crate) const BUDDY_ORDER_COUNT: usize = MAX_ORDER - MIN_ORDER;
 const DMA32_LIMIT: usize = u32::MAX as usize;
 /// Keep 16 MiB of low memory available for devices which cannot address
 /// Normal memory when an unrestricted allocation falls back to DMA32.
@@ -34,6 +39,59 @@ const DMA32_ALLOCATION_METADATA_HEADROOM: usize = MAX_ORDER - MIN_ORDER;
 enum BuddyZone {
     Dma32,
     Normal,
+}
+
+impl BuddyZone {
+    fn index(self) -> usize {
+        match self {
+            Self::Dma32 => 0,
+            Self::Normal => 1,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum AllocationFailure {
+    Capacity,
+    Fragmentation,
+    ZoneLimit,
+    Reserve,
+    AddressLimit,
+    InvalidOrder,
+}
+
+const FAILURE_REASONS: [(&str, AllocationFailure); 6] = [
+    ("capacity", AllocationFailure::Capacity),
+    ("fragmentation", AllocationFailure::Fragmentation),
+    ("zone_limit", AllocationFailure::ZoneLimit),
+    ("reserve", AllocationFailure::Reserve),
+    ("address_limit", AllocationFailure::AddressLimit),
+    ("invalid_order", AllocationFailure::InvalidOrder),
+];
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ZoneDiagnostics {
+    free_blocks: [usize; BUDDY_ORDER_COUNT],
+    attempts: [u64; BUDDY_ORDER_COUNT],
+    misses: [u64; BUDDY_ORDER_COUNT],
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct BuddyDiagnostics {
+    zones: [ZoneDiagnostics; 2],
+    requests: [u64; BUDDY_ORDER_COUNT],
+    failures: [u64; BUDDY_ORDER_COUNT],
+    failure_reasons: [u64; FAILURE_REASONS.len()],
+}
+
+/// A bounded, allocation-free copy made under the allocator's existing lock.
+/// Orders here count base pages (order 0 is one page), unlike the internal
+/// byte orders. Attempts include fallback zones, but exclude internal splits
+/// and metadata allocation. OOM retries are separate buddy requests.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct BuddySnapshot {
+    free_pages: [usize; 2],
+    diagnostics: BuddyDiagnostics,
 }
 
 /// 保存buddy算法中每一页存放的BuddyEntry的信息，占据每个页的起始位置
@@ -89,6 +147,7 @@ pub struct BuddyAllocator<A> {
     normal_empty_area: [PhysAddr; MAX_ORDER - MIN_ORDER],
     dma32_free_pages: usize,
     normal_free_pages: usize,
+    diagnostics: BuddyDiagnostics,
     /// Whether this allocator has ever managed memory above 4 GiB.  Most
     /// current systems are DMA32-only; avoid probing every empty Normal order
     /// on their hot allocation path.
@@ -137,6 +196,7 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
             normal_empty_area,
             dma32_free_pages: 0,
             normal_free_pages: 0,
+            diagnostics: BuddyDiagnostics::default(),
             has_normal_memory: false,
             total: PageFrameCount::new(0),
             phantom: PhantomData,
@@ -326,6 +386,49 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
         }
     }
 
+    pub(crate) fn diagnostic_snapshot(&self) -> BuddySnapshot {
+        BuddySnapshot {
+            free_pages: [self.dma32_free_pages, self.normal_free_pages],
+            diagnostics: self.diagnostics,
+        }
+    }
+
+    fn record_request(&mut self, count: PageFrameCount) -> Option<u8> {
+        assert!(count.data().is_power_of_two());
+        let order = log2(count.data());
+        if order >= BUDDY_ORDER_COUNT {
+            self.record_failure(None, AllocationFailure::InvalidOrder);
+            return None;
+        }
+        self.diagnostics.requests[order] = self.diagnostics.requests[order].saturating_add(1);
+        Some((order + MIN_ORDER) as u8)
+    }
+
+    fn record_failure(&mut self, order: Option<u8>, reason: AllocationFailure) {
+        if let Some(order) = order {
+            let failures = &mut self.diagnostics.failures[Self::order2index(order)];
+            *failures = failures.saturating_add(1);
+        }
+        let failures = &mut self.diagnostics.failure_reasons[reason as usize];
+        *failures = failures.saturating_add(1);
+    }
+
+    fn try_zone(&mut self, zone: BuddyZone, order: u8) -> Option<PhysAddr> {
+        let index = Self::order2index(order);
+        let attempts = &mut self.diagnostics.zones[zone.index()].attempts[index];
+        *attempts = attempts.saturating_add(1);
+        let result = self.pop_front(zone, order);
+        if result.is_none() {
+            let misses = &mut self.diagnostics.zones[zone.index()].misses[index];
+            *misses = misses.saturating_add(1);
+        }
+        result
+    }
+
+    fn lacks_capacity(&self, count: PageFrameCount) -> bool {
+        self.dma32_free_pages + self.normal_free_pages < count.data()
+    }
+
     fn recycle_empty_metadata(
         &mut self,
         zone: BuddyZone,
@@ -400,6 +503,7 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
         }
 
         self.adjust_free_pages(zone, 1usize << (order as usize - MIN_ORDER), false);
+        self.diagnostics.zones[zone.index()].free_blocks[Self::order2index(order)] -= 1;
         removed
     }
 
@@ -463,6 +567,7 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
         first.entry_num += 1;
         Self::write_page(first_addr, first);
         self.adjust_free_pages(zone, 1usize << (order as usize - MIN_ORDER), true);
+        self.diagnostics.zones[zone.index()].free_blocks[Self::order2index(order)] += 1;
     }
 
     /// 从空闲链表的开头，取出1个指定阶数的伙伴块，如果没有，则返回None
@@ -530,22 +635,13 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
     ///
     /// 返回分配的页面的物理地址和页面数
     fn buddy_alloc(&mut self, count: PageFrameCount) -> Option<(PhysAddr, PageFrameCount)> {
-        assert!(count.data().is_power_of_two());
-        // 计算需要分配的阶数
-        let mut order = log2(count.data());
-        if count.data() & ((1 << order) - 1) != 0 {
-            order += 1;
-        }
-        let order = (order + MIN_ORDER) as u8;
-        if order as usize >= MAX_ORDER {
-            return None;
-        }
+        let order = self.record_request(count)?;
 
         // debug!("buddy_alloc: order = {}", order);
         // 获取该阶数的一个空闲页面
         // Preserve scarce DMA32 memory while normal memory is available.
         let normal = if self.has_normal_memory {
-            self.pop_front(BuddyZone::Normal, order)
+            self.try_zone(BuddyZone::Normal, order)
         } else {
             None
         };
@@ -557,9 +653,21 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
                     .saturating_add(DMA32_ALLOCATION_METADATA_HEADROOM);
         let free_addr = normal.or_else(|| {
             dma32_fallback_allowed
-                .then(|| self.pop_front(BuddyZone::Dma32, order))
+                .then(|| self.try_zone(BuddyZone::Dma32, order))
                 .flatten()
         });
+        if free_addr.is_none() {
+            let reason = if self.lacks_capacity(count) {
+                AllocationFailure::Capacity
+            } else if !dma32_fallback_allowed && self.dma32_free_pages >= count.data() {
+                // The reserve prevented trying this zone. This does not claim
+                // that bypassing the reserve would find a contiguous block.
+                AllocationFailure::Reserve
+            } else {
+                AllocationFailure::Fragmentation
+            };
+            self.record_failure(Some(order), reason);
+        }
         // debug!(
         //     "buddy_alloc: order = {}, free_addr = {:?}",
         //     order,
@@ -578,20 +686,24 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
         count: PageFrameCount,
         max_phys_addr: PhysAddr,
     ) -> Option<(PhysAddr, PageFrameCount)> {
-        assert!(count.data().is_power_of_two());
-        let requested_bytes = count.data().checked_mul(A::PAGE_SIZE)?;
-        let requested_order = (log2(count.data()) + MIN_ORDER) as u8;
-        if requested_order as usize >= MAX_ORDER {
-            return None;
-        }
-
         if max_phys_addr.data() == usize::MAX {
             return self.buddy_alloc(count);
         }
+        let requested_order = self.record_request(count)?;
+        let requested_bytes = count.data() * A::PAGE_SIZE;
         if max_phys_addr.data() == DMA32_LIMIT {
-            return self
-                .pop_front(BuddyZone::Dma32, requested_order)
-                .map(|base| (base, count));
+            let result = self.try_zone(BuddyZone::Dma32, requested_order);
+            if result.is_none() {
+                let reason = if self.lacks_capacity(count) {
+                    AllocationFailure::Capacity
+                } else if self.dma32_free_pages < count.data() {
+                    AllocationFailure::ZoneLimit
+                } else {
+                    AllocationFailure::Fragmentation
+                };
+                self.record_failure(Some(requested_order), reason);
+            }
+            return result.map(|base| (base, count));
         }
 
         let zones: &[BuddyZone] = if max_phys_addr.data() < DMA32_LIMIT {
@@ -600,6 +712,9 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
             &[BuddyZone::Normal, BuddyZone::Dma32]
         };
         for &zone in zones {
+            let index = Self::order2index(requested_order);
+            let attempts = &mut self.diagnostics.zones[zone.index()].attempts[index];
+            *attempts = attempts.saturating_add(1);
             for current_order in requested_order as usize..MAX_ORDER {
                 let mut list_addr = self.free_area(zone, current_order as u8);
                 if list_addr.is_null() {
@@ -637,7 +752,17 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
                     list_addr = list.next_page;
                 }
             }
+            let misses = &mut self.diagnostics.zones[zone.index()].misses[index];
+            *misses = misses.saturating_add(1);
         }
+        // A limit inside a zone cannot be diagnosed precisely from zone-wide
+        // counters. Do not scan free lists again or invent eligible capacity.
+        let reason = if self.lacks_capacity(count) {
+            AllocationFailure::Capacity
+        } else {
+            AllocationFailure::AddressLimit
+        };
+        self.record_failure(Some(requested_order), reason);
         None
     }
 
@@ -713,16 +838,106 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
     }
 }
 
+/// Format only after releasing the frame allocator lock: formatting may itself
+/// allocate. This is a DragonOS debug report, not a Linux procfs ABI.
+pub(crate) fn allocation_stats_report(snapshot: BuddySnapshot) -> alloc::string::String {
+    let mut report = alloc::string::String::new();
+    writeln!(
+        report,
+        "version=1\norder_unit=base_pages\nrequest_unit=buddy_attempt"
+    )
+    .unwrap();
+    for (index, zone) in ["DMA32", "Normal"].iter().enumerate() {
+        writeln!(report, "free_pages {zone} {}", snapshot.free_pages[index]).unwrap();
+        let stats = &snapshot.diagnostics.zones[index];
+        for order in 0..BUDDY_ORDER_COUNT {
+            writeln!(
+                report,
+                "zone {zone} order {order} free_blocks {} attempts {} misses {}",
+                stats.free_blocks[order], stats.attempts[order], stats.misses[order],
+            )
+            .unwrap();
+        }
+    }
+    for order in 0..BUDDY_ORDER_COUNT {
+        writeln!(
+            report,
+            "request order {order} attempts {} failures {}",
+            snapshot.diagnostics.requests[order], snapshot.diagnostics.failures[order],
+        )
+        .unwrap();
+    }
+    for (name, reason) in FAILURE_REASONS {
+        writeln!(
+            report,
+            "failure {name} {}",
+            snapshot.diagnostics.failure_reasons[reason as usize],
+        )
+        .unwrap();
+    }
+    writeln!(report, "snapshot_end=1").unwrap();
+    report
+}
+
+#[cfg(all(
+    feature = "mm_selftest",
+    any(target_arch = "x86_64", target_arch = "riscv64")
+))]
+pub(crate) fn allocation_diagnostics_selftest_report() -> alloc::string::String {
+    let (bounded, split_merge, fragmentation, zones, metadata) = deterministic_buddy_selftest();
+    let checks = [
+        ("bounded_selection", bounded),
+        ("split_merge", split_merge),
+        ("fragmentation_and_capacity_diagnostics", fragmentation),
+        ("zone_reserve_and_address_diagnostics", zones),
+        ("metadata_count_conservation", metadata),
+    ];
+    let failures = checks.iter().filter(|(_, passed)| !passed).count();
+    let mut report = alloc::string::String::new();
+    writeln!(
+        report,
+        "status={}",
+        if failures == 0 { "ok" } else { "fail" }
+    )
+    .unwrap();
+    for (name, passed) in checks {
+        writeln!(report, "{name}={}", if passed { "ok" } else { "fail" }).unwrap();
+    }
+    writeln!(report, "summary_fail={failures}").unwrap();
+    report
+}
+
 /// Exercise bounded allocation, splitting, and merging on a private arena.
 ///
 /// The live allocator only supplies one aligned backing block.  All operations
 /// under test use a separate `BuddyAllocator`, so their exact addresses are
 /// deterministic and concurrent kernel allocations cannot affect the result.
-#[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
+#[cfg(all(
+    feature = "mm_selftest",
+    any(target_arch = "x86_64", target_arch = "riscv64")
+))]
 pub(crate) fn deterministic_buddy_selftest() -> (bool, bool, bool, bool, bool) {
     const BACKING_PAGES: usize = 128;
     const ARENA_OFFSET_PAGES: usize = 64;
     const ARENA_PAGES: usize = 16;
+
+    fn counts_match(allocator: &BuddyAllocator<MMArch>) -> bool {
+        let snapshot = allocator.diagnostic_snapshot();
+        snapshot
+            .diagnostics
+            .zones
+            .iter()
+            .enumerate()
+            .all(|(index, zone)| {
+                let pages: usize = zone
+                    .free_blocks
+                    .iter()
+                    .enumerate()
+                    .map(|(order, blocks)| blocks << order)
+                    .sum();
+                pages == snapshot.free_pages[index]
+            })
+    }
 
     let Some((backing, backing_count)) =
         (unsafe { allocate_page_frames(PageFrameCount::new(BACKING_PAGES)) })
@@ -755,6 +970,7 @@ pub(crate) fn deterministic_buddy_selftest() -> (bool, bool, bool, bool, bool) {
             normal_empty_area,
             dma32_free_pages: 0,
             normal_free_pages: 0,
+            diagnostics: BuddyDiagnostics::default(),
             has_normal_memory: false,
             total: PageFrameCount::new(ARENA_PAGES),
             phantom: PhantomData,
@@ -808,6 +1024,7 @@ pub(crate) fn deterministic_buddy_selftest() -> (bool, bool, bool, bool, bool) {
                 let merged = allocator.buddy_alloc_below(PageFrameCount::new(16), arena_max);
                 exact_split
                     && merged.is_some_and(|(base, count)| base == arena && count.data() == 16)
+                    && counts_match(&allocator)
             }
             _ => false,
         }
@@ -837,9 +1054,23 @@ pub(crate) fn deterministic_buddy_selftest() -> (bool, bool, bool, bool, bool) {
             for index in (0..ARENA_PAGES).step_by(2) {
                 unsafe { allocator.free(pages[index], PageFrameCount::ONE) };
             }
-            let fragmented_rejects_pair = allocator
-                .buddy_alloc_below(PageFrameCount::new(2), arena_max)
-                .is_none();
+            // The backing arena may be in Normal memory on large guests.
+            // Use an unrestricted request there so the expected diagnosis is
+            // fragmentation rather than a DMA32 address restriction.
+            let arena_zone = BuddyAllocator::<MMArch>::zone_for(arena, MIN_ORDER).index();
+            let fragmented_rejects_pair = if arena_zone == BuddyZone::Normal.index() {
+                allocator.buddy_alloc(PageFrameCount::new(2)).is_none()
+            } else {
+                allocator
+                    .buddy_alloc_below(PageFrameCount::new(2), PhysAddr::new(DMA32_LIMIT))
+                    .is_none()
+            };
+            let snapshot = allocator.diagnostic_snapshot();
+            let fragmentation_counted = snapshot.free_pages[arena_zone] == ARENA_PAGES / 2
+                && snapshot.diagnostics.zones[arena_zone].free_blocks[0] == ARENA_PAGES / 2
+                && snapshot.diagnostics.failure_reasons[AllocationFailure::Fragmentation as usize]
+                    == 1
+                && counts_match(&allocator);
 
             unsafe { allocator.free(pages[1], PageFrameCount::ONE) };
             let pair = allocator.buddy_alloc_below(PageFrameCount::new(2), arena_max);
@@ -851,9 +1082,21 @@ pub(crate) fn deterministic_buddy_selftest() -> (bool, bool, bool, bool, bool) {
                 unsafe { allocator.free(pages[index], PageFrameCount::ONE) };
             }
             let merged = allocator.buddy_alloc_below(PageFrameCount::new(16), arena_max);
+            let capacity_rejected = allocator.buddy_alloc(PageFrameCount::ONE).is_none();
+            let invalid_rejected = allocator
+                .buddy_alloc(PageFrameCount::new(1 << BUDDY_ORDER_COUNT))
+                .is_none();
+            let snapshot = allocator.diagnostic_snapshot();
             fragmented_rejects_pair
+                && fragmentation_counted
                 && exact_pair
                 && merged.is_some_and(|(base, count)| base == arena && count.data() == 16)
+                && capacity_rejected
+                && invalid_rejected
+                && snapshot.diagnostics.failure_reasons[AllocationFailure::Capacity as usize] == 1
+                && snapshot.diagnostics.failure_reasons[AllocationFailure::InvalidOrder as usize]
+                    == 1
+                && counts_match(&allocator)
         } else {
             false
         }
@@ -869,6 +1112,18 @@ pub(crate) fn deterministic_buddy_selftest() -> (bool, bool, bool, bool, bool) {
             allocator.free(high, count);
             allocator.free(low, count);
         }
+        let zone_limit_rejected = allocator
+            .buddy_alloc_below(PageFrameCount::new(16), PhysAddr::new(DMA32_LIMIT))
+            .is_none();
+        let address_limit_rejected = allocator
+            .buddy_alloc_below(count, low + 4 * MMArch::PAGE_SIZE - 1)
+            .is_none();
+        let snapshot = allocator.diagnostic_snapshot();
+        let restriction_diagnostics_ok = zone_limit_rejected
+            && address_limit_rejected
+            && snapshot.diagnostics.failure_reasons[AllocationFailure::ZoneLimit as usize] == 1
+            && snapshot.diagnostics.failure_reasons[AllocationFailure::AddressLimit as usize] == 1
+            && counts_match(&allocator);
         let dma32 = allocator.buddy_alloc_below(count, PhysAddr::new(DMA32_LIMIT));
         let normal = unsafe { allocator.allocate(count) };
         let selection_ok = dma32.is_some_and(|(base, allocated)| base == low && allocated == count)
@@ -888,9 +1143,12 @@ pub(crate) fn deterministic_buddy_selftest() -> (bool, bool, bool, bool, bool) {
             reserve_allocator.buddy_alloc_below(PageFrameCount::ONE, PhysAddr::new(DMA32_LIMIT));
         let reserve_ok = normal_first.is_some_and(|(base, _)| base == one_high)
             && reserve_blocks_fallback.is_none()
-            && dma_still_available.is_some_and(|(base, _)| base == reserve_low);
+            && dma_still_available.is_some_and(|(base, _)| base == reserve_low)
+            && reserve_allocator.diagnostics.failure_reasons[AllocationFailure::Reserve as usize]
+                == 1
+            && counts_match(&reserve_allocator);
 
-        selection_ok && reserve_ok
+        selection_ok && reserve_ok && restriction_diagnostics_ok
     };
 
     let metadata_reuse_ok = {
@@ -921,6 +1179,8 @@ pub(crate) fn deterministic_buddy_selftest() -> (bool, bool, bool, bool, bool) {
         }
         allocator.dma32_free_area[0] = list_pages[0];
         allocator.dma32_free_pages = list_pages.len() * BuddyAllocator::<MMArch>::BUDDY_ENTRIES;
+        allocator.diagnostics.zones[BuddyZone::Dma32.index()].free_blocks[0] =
+            allocator.dma32_free_pages;
 
         let mut drained = 0;
         while allocator
@@ -953,6 +1213,7 @@ pub(crate) fn deterministic_buddy_selftest() -> (bool, bool, bool, bool, bool) {
             && redrained == 16
             && allocator.dma32_free_area[0].is_null()
             && allocator.dma32_free_pages == 0
+            && counts_match(&allocator)
     };
 
     unsafe {

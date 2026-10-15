@@ -309,6 +309,9 @@ impl MemoryManagementArch for X86_64MMArch {
 
     unsafe fn phys_2_virt(phys: PhysAddr) -> Option<VirtAddr> {
         if let Some(vaddr) = phys.data().checked_add(Self::PHYS_OFFSET) {
+            if crate::mm::vmalloc::contains(VirtAddr::new(vaddr)) {
+                return None;
+            }
             return Some(VirtAddr::new(vaddr));
         } else {
             return None;
@@ -316,6 +319,9 @@ impl MemoryManagementArch for X86_64MMArch {
     }
 
     unsafe fn virt_2_phys(virt: VirtAddr) -> Option<PhysAddr> {
+        if crate::mm::vmalloc::contains(virt) {
+            return None;
+        }
         if let Some(paddr) = virt.data().checked_sub(Self::PHYS_OFFSET) {
             return Some(PhysAddr::new(paddr));
         } else {
@@ -785,6 +791,13 @@ pub fn test_buddy() {
 pub struct LockedFrameAllocator;
 
 impl LockedFrameAllocator {
+    pub(crate) fn diagnostic_snapshot() -> Option<crate::mm::allocator::buddy::BuddySnapshot> {
+        INNER_ALLOCATOR
+            .lock_irqsave()
+            .as_ref()
+            .map(BuddyAllocator::diagnostic_snapshot)
+    }
+
     unsafe fn allocate_inner(count: PageFrameCount) -> Option<(PhysAddr, PageFrameCount)> {
         if let Some(ref mut allocator) = *INNER_ALLOCATOR.lock_irqsave() {
             return allocator.allocate(count);

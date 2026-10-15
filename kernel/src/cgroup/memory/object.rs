@@ -19,6 +19,7 @@ const KINDS: [KernelByteKind; KERNEL_BYTE_KIND_COUNT] = [
     KernelByteKind::SlabReclaimable,
     KernelByteKind::SlabUnreclaimable,
     KernelByteKind::KernelOther,
+    KernelByteKind::Vmalloc,
 ];
 
 #[derive(Debug)]

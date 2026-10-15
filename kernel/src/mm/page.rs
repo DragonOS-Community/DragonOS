@@ -3247,6 +3247,81 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
         }
     }
 
+    /// Prepare a permanent shared kernel subtree before any user roots are copied.
+    /// The caller serializes edits and pins the resulting upper tables for boot lifetime.
+    pub(crate) unsafe fn prepare_kernel_subtree(
+        &mut self,
+        virt: VirtAddr,
+        level: usize,
+    ) -> Option<()> {
+        let mut table = self.table();
+        while table.level() > level {
+            let index = table.index_of(virt)?;
+            let entry = table.entry(index)?;
+            if entry.empty() {
+                let frame = self.allocate_owned_table(None).ok()??;
+                table.set_entry(
+                    index,
+                    PageEntry::new(frame, EntryFlags::new_page_table(false)),
+                )?;
+            } else if Arch::entry_is_leaf(table.level(), entry.flags().data()) {
+                return None;
+            }
+            table = table.next_level_table(index)?;
+        }
+        Some(())
+    }
+
+    /// Install a caller-owned, zeroed level-0 kernel table below a pinned level-1 table.
+    /// No allocation occurs while editing the shared page tables.
+    pub(crate) unsafe fn install_kernel_leaf_table(
+        &mut self,
+        virt: VirtAddr,
+        frame: PhysAddr,
+    ) -> Option<CreatedPageTable> {
+        let mut table = self.table();
+        while table.level() > 1 {
+            table = table.next_level_table(table.index_of(virt)?)?;
+        }
+        let index = table.index_of(virt)?;
+        if !table.entry(index)?.empty() {
+            return None;
+        }
+        table.set_entry(
+            index,
+            PageEntry::new(frame, EntryFlags::new_page_table(false)),
+        )?;
+        Some(CreatedPageTable {
+            parent_base: table.base(),
+            parent_phys: table.phys(),
+            parent_level: 1,
+            index,
+            child_phys: frame,
+        })
+    }
+
+    /// Detach an empty transaction table. Its frame remains owned by the caller
+    /// until a subsequent synchronous kernel shootdown has completed.
+    pub(crate) unsafe fn detach_empty_kernel_table(&mut self, owned: &CreatedPageTable) -> bool {
+        let parent =
+            PageTable::<Arch>::new(owned.parent_base, owned.parent_phys, owned.parent_level);
+        let Some(entry) = parent.entry(owned.index) else {
+            return false;
+        };
+        if !entry.present() || entry.address().ok() != Some(owned.child_phys) {
+            return false;
+        }
+        let Some(child) = parent.next_level_table(owned.index) else {
+            return false;
+        };
+        if !(0..Arch::PAGE_ENTRY_NUM).all(|i| child.entry(i).is_some_and(|e| e.empty())) {
+            return false;
+        }
+        parent
+            .set_entry(owned.index, PageEntry::from_usize(0))
+            .is_some()
+    }
+
     /// Map an existing physical range at a specific page-table leaf level.
     ///
     /// The target entry must be empty. Any intermediate tables allocated by this call are appended

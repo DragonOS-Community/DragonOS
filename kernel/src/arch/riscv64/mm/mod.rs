@@ -329,6 +329,9 @@ impl MemoryManagementArch for RiscV64MMArch {
         }
 
         if let Some(vaddr) = phys.data().checked_add(Self::PHYS_OFFSET) {
+            if crate::mm::vmalloc::contains(VirtAddr::new(vaddr)) {
+                return None;
+            }
             return Some(VirtAddr::new(vaddr));
         } else {
             return None;
@@ -336,6 +339,9 @@ impl MemoryManagementArch for RiscV64MMArch {
     }
 
     unsafe fn virt_2_phys(virt: VirtAddr) -> Option<PhysAddr> {
+        if crate::mm::vmalloc::contains(virt) {
+            return None;
+        }
         if virt >= KERNEL_BEGIN_VA && virt < KERNEL_END_VA {
             let r = KERNEL_BEGIN_PA + (virt - KERNEL_BEGIN_VA);
             return Some(r);
@@ -483,6 +489,15 @@ pub unsafe fn kernel_page_flags<A: MemoryManagementArch>(_virt: VirtAddr) -> Ent
 /// 全局的页帧分配器
 #[derive(Debug, Clone, Copy, Hash)]
 pub struct LockedFrameAllocator;
+
+impl LockedFrameAllocator {
+    pub(crate) fn diagnostic_snapshot() -> Option<crate::mm::allocator::buddy::BuddySnapshot> {
+        INNER_ALLOCATOR
+            .lock_irqsave()
+            .as_ref()
+            .map(BuddyAllocator::diagnostic_snapshot)
+    }
+}
 
 impl FrameAllocator for LockedFrameAllocator {
     unsafe fn allocate(&mut self, count: PageFrameCount) -> Option<(PhysAddr, PageFrameCount)> {

@@ -12,14 +12,29 @@ use crate::{
 };
 
 #[derive(Debug)]
-struct DmaAllocatorSelftestCallback;
+enum MmReportCallback {
+    DmaSelftest,
+    AllocationStats,
+    AllocationSelftest,
+    VmallocSelftest,
+}
 
-impl KernFSCallback for DmaAllocatorSelftestCallback {
+impl KernFSCallback for MmReportCallback {
     fn open(&self, mut data: KernCallbackData) -> Result<(), SystemError> {
+        let report = match self {
+            Self::DmaSelftest => crate::mm::dma::dma_allocator_selftest_report(),
+            Self::AllocationStats => {
+                let snapshot = crate::arch::mm::LockedFrameAllocator::diagnostic_snapshot()
+                    .ok_or(SystemError::ENODEV)?;
+                crate::mm::allocator::buddy::allocation_stats_report(snapshot)
+            }
+            Self::AllocationSelftest => {
+                crate::mm::allocator::buddy::allocation_diagnostics_selftest_report()
+            }
+            Self::VmallocSelftest => crate::mm::vmalloc::selftest_report(),
+        };
         data.file_private_data_mut()
-            .replace(KernFilePrivateData::DebugTextSnapshot(
-                crate::mm::dma::dma_allocator_selftest_report(),
-            ));
+            .replace(KernFilePrivateData::DebugTextSnapshot(report));
         Ok(())
     }
 
@@ -70,7 +85,28 @@ pub fn init_debugfs_mm() -> Result<(), SystemError> {
         InodeMode::S_IRUSR,
         Some(4096),
         None,
-        Some(&DmaAllocatorSelftestCallback),
+        Some(&MmReportCallback::DmaSelftest),
+    )?;
+    mm.add_file(
+        "allocation_stats".to_string(),
+        InodeMode::S_IRUSR,
+        Some(16384),
+        None,
+        Some(&MmReportCallback::AllocationStats),
+    )?;
+    mm.add_file(
+        "allocation_selftest".to_string(),
+        InodeMode::S_IRUSR,
+        Some(4096),
+        None,
+        Some(&MmReportCallback::AllocationSelftest),
+    )?;
+    mm.add_file(
+        "vmalloc_selftest".to_string(),
+        InodeMode::S_IRUSR,
+        Some(4096),
+        None,
+        Some(&MmReportCallback::VmallocSelftest),
     )?;
     Ok(())
 }

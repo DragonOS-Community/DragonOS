@@ -19,7 +19,7 @@ pub(crate) const PAGE_COUNTER_MAX: u64 = (isize::MAX as u64) / MMArch::PAGE_SIZE
 
 const KIND_COUNT: usize = 7;
 const EVENT_COUNT: usize = 6;
-pub(crate) const KERNEL_BYTE_KIND_COUNT: usize = 5;
+pub(crate) const KERNEL_BYTE_KIND_COUNT: usize = 6;
 const STAT_COUNT: usize = 15;
 
 /// Page-state counters are updated at their unique Page/rmap transition; event
@@ -54,6 +54,8 @@ pub(crate) enum KernelByteKind {
     SlabUnreclaimable,
     /// Buddy-backed kernel allocations, not slab and not socket data.
     KernelOther,
+    /// Actual ordinary RAM backing of explicit virtual allocations.
+    Vmalloc,
 }
 
 impl KernelByteKind {

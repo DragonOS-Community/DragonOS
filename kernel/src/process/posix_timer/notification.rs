@@ -2,9 +2,14 @@
 use super::{PosixSigevent, SIGEV_NONE, SIGEV_SIGNAL, SIGEV_THREAD, SIGEV_THREAD_ID};
 use crate::{
     arch::ipc::signal::Signal,
-    ipc::signal_types::{PosixSigval, SigCode, SigInfo, SigPending, SigType, TimerSignalToken},
+    ipc::{
+        signal_quota::{SignalAccount, SignalCharge},
+        signal_types::{PosixSigval, SigCode, SigInfo, SigPending, SigType, TimerSignalToken},
+    },
+    libs::spinlock::SpinLock,
     process::{
         pid::{Pid, PidType},
+        resource::RLimitID,
         ProcessControlBlock, ProcessFlags, ProcessManager, RawPid,
     },
 };
@@ -12,7 +17,14 @@ use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, Ordering};
 use system_error::SystemError;
 #[derive(Debug)]
-pub(super) enum Notification {
+pub(super) struct Notification {
+    destination: Destination,
+    /// The pending notification shares this preallocation, even after delete.
+    /// Explicit release must not depend on the last callback dropping the timer.
+    quota: SpinLock<Option<Arc<SignalCharge>>>,
+}
+#[derive(Debug)]
+enum Destination {
     None,
     Signal {
         pid: Arc<Pid>,
@@ -35,8 +47,24 @@ impl Notification {
             sigev_notify_thread_id: 0,
             _pad: [0; 44],
         });
+        // Linux alloc_posix_timer reserves a sigqueue even for SIGEV_NONE.
+        // The creator's identity is fixed here; later credential changes do not
+        // move the reservation or charge timer expiry a second time.
+        let cred = pcb.cred();
+        let account = SignalAccount::get(&cred.user_ns, cred.uid.data())
+            .map_err(|_| SystemError::EAGAIN_OR_EWOULDBLOCK)?;
+        let charge = SignalCharge::acquire(
+            &account,
+            pcb.get_rlimit(RLimitID::Sigpending).rlim_cur,
+            false,
+        )
+        .map_err(|_| SystemError::EAGAIN_OR_EWOULDBLOCK)?;
+        let quota = Arc::try_new(charge).map_err(|_| SystemError::EAGAIN_OR_EWOULDBLOCK)?;
         if event.sigev_notify == SIGEV_NONE {
-            return Ok(Self::None);
+            return Ok(Self {
+                destination: Destination::None,
+                quota: SpinLock::new(Some(quota)),
+            });
         }
         if !matches!(
             event.sigev_notify,
@@ -60,49 +88,57 @@ impl Notification {
         } else {
             pcb.task_pid_ptr(PidType::TGID).ok_or(SystemError::EINVAL)?
         };
-        let result = Self::Signal {
-            pid,
-            thread,
-            signo,
-            sigval: PosixSigval::from_ptr(event.sigev_value),
-            reserved: AtomicBool::new(false),
+        let result = Self {
+            destination: Destination::Signal {
+                pid,
+                thread,
+                signo,
+                sigval: PosixSigval::from_ptr(event.sigev_value),
+                reserved: AtomicBool::new(false),
+            },
+            quota: SpinLock::new(Some(quota)),
         };
         result
             .with_pending(|pending| pending.queue_mut().reserve_timer())
-            .ok_or(SystemError::EINVAL)??;
-        if let Self::Signal { reserved, .. } = &result {
+            .ok_or(SystemError::EINVAL)?
+            .map_err(|_| SystemError::EAGAIN_OR_EWOULDBLOCK)?;
+        if let Destination::Signal { reserved, .. } = &result.destination {
             reserved.store(true, Ordering::Release);
         }
         Ok(result)
     }
     pub(super) fn is_none(&self) -> bool {
-        matches!(self, Self::None)
+        matches!(self.destination, Destination::None)
     }
     fn target(&self) -> Option<Arc<ProcessControlBlock>> {
-        match self {
-            Self::None => None,
-            Self::Signal { pid, thread, .. } => {
+        match &self.destination {
+            Destination::None => None,
+            Destination::Signal { pid, thread, .. } => {
                 pid.pid_task(if *thread { PidType::PID } else { PidType::TGID })
             }
         }
     }
     fn with_pending<R>(&self, f: impl FnOnce(&mut SigPending) -> R) -> Option<R> {
         let target = self.target()?;
-        match self {
-            Self::Signal { thread: true, .. } => Some(f(target.sig_info_mut().sig_pending_mut())),
-            Self::Signal { .. } => Some(f(&mut target.process_signal().lock_irqsave())),
-            Self::None => None,
+        match &self.destination {
+            Destination::Signal { thread: true, .. } => {
+                Some(f(target.sig_info_mut().sig_pending_mut()))
+            }
+            Destination::Signal { .. } => Some(f(&mut target.process_signal().lock_irqsave())),
+            Destination::None => None,
         }
     }
     pub(super) fn release(&self) {
-        if let Self::Signal { reserved, .. } = self {
+        let quota = self.quota.lock_irqsave().take();
+        if let Destination::Signal { reserved, .. } = &self.destination {
             if reserved.swap(false, Ordering::AcqRel) {
                 self.with_pending(|pending| pending.queue_mut().release_timer());
             }
         }
+        drop(quota);
     }
     pub(super) fn ignored(&self) -> bool {
-        let Self::Signal { signo, .. } = self else {
+        let Destination::Signal { signo, .. } = &self.destination else {
             return false;
         };
         let Some(target) = self.target() else {
@@ -139,17 +175,27 @@ impl Notification {
         mut token: TimerSignalToken,
         overrun: i32,
     ) -> Option<u64> {
-        let Self::Signal {
+        let Destination::Signal {
             signo,
             sigval,
             thread,
             ..
-        } = self
+        } = &self.destination
         else {
             return None;
         };
+        // Never carry the quota lock into a pending lock. delete and expiry
+        // are serialized by the timer state lock; a released timer cannot
+        // create a new pending owner.
+        let quota = self.quota.lock_irqsave().as_ref().cloned()?;
         let target = self.target()?;
         let result = self.with_pending(|pending| {
+            // Reaping flushes this queue after setting PID_UNHASHED. A timer
+            // callback that pinned the task before that transaction must not
+            // repopulate an already released pending queue.
+            if target.flags().contains(ProcessFlags::PID_UNHASHED) {
+                return None;
+            }
             // Preallocated POSIX signals coalesce by timer, not by signo.
             for info in pending.queue_mut().q.iter_mut() {
                 if let Some(old) = info
@@ -173,7 +219,11 @@ impl Notification {
                 },
             );
             info.set_timer_token(token);
-            if pending.queue_mut().push_reserved_timer(info).is_err() {
+            if pending
+                .queue_mut()
+                .push_reserved_timer(info, quota)
+                .is_err()
+            {
                 return None;
             }
             pending.signal_mut().insert((*signo).into());

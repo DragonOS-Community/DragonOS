@@ -2,13 +2,13 @@ use crate::{
     arch::ipc::signal::{SigFlags, SigSet, Signal, MAX_SIG_NUM},
     cgroup::memory::{accounting::KernelByteKind, object::ObjectAccount, owned::OwnedBox},
     filesystem::epoll::event_poll::EPollItemList,
-    ipc::signal_types::{SaHandlerType, Sigaction, SigactionType},
+    ipc::signal_types::{SaHandlerType, Sigaction, SigactionType, SIG_KERNEL_IGNORE_MASK},
     libs::rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
     libs::wait_queue::WaitQueue,
     mm::allocation::MemoryAllocationError,
     process::{ProcessControlBlock, ProcessManager},
 };
-use alloc::sync::Arc;
+use alloc::{sync::Arc, vec::Vec};
 use core::{fmt::Debug, sync::atomic::compiler_fence};
 use system_error::SystemError;
 
@@ -167,6 +167,29 @@ pub(super) fn do_sigaction(
     }
 
     let pcb = ProcessManager::current_pcb();
+    let ignores = |action: &Sigaction| {
+        action.is_ignore() || (action.is_default() && SIG_KERNEL_IGNORE_MASK.contains(sig.into()))
+    };
+    // Stabilize group publication before changing a disposition that flushes
+    // every member. Reserve outside locks; pin all members until after the
+    // sighand guard is gone (last PCB drop itself detaches its sighand).
+    let mut tasks = Vec::new();
+    let membership = if act.as_ref().is_some_and(|action| ignores(action)) {
+        Some(loop {
+            let guard = crate::process::pid::pid_membership_lock();
+            match ProcessManager::fill_thread_group_snapshot(&pcb, &mut tasks) {
+                Ok(_) => break guard,
+                Err(required) => {
+                    drop(guard);
+                    tasks
+                        .try_reserve(required)
+                        .map_err(|_| SystemError::ENOMEM)?;
+                }
+            }
+        })
+    } else {
+        None
+    };
     let sighand = pcb.sighand();
     let mut sighand_guard = sighand.inner_mut();
     // 指向当前信号的action的引用
@@ -214,13 +237,18 @@ pub(super) fn do_sigaction(
         * 2.不管一个信号是否被阻塞，只要将其设置SIG_DFL，如果当前已经存在了正在pending的信号，
               并且对这个信号的默认处理方式是忽略它，那么就会把pending的信号忽略。
         */
-        if action.is_ignore() {
+        if ignores(action) {
             let mut mask: SigSet = SigSet::from_bits_truncate(0);
             mask.insert(sig.into());
-            pcb.sig_info_mut().sig_pending_mut().flush_by_mask(&mask);
-            // todo: 当有了多个线程后，在这里进行操作，把每个线程的sigqueue都进行刷新
+            pcb.process_signal().shared_pending_flush_by_mask(&mask);
+            for task in &tasks {
+                task.sig_info_mut().sig_pending_mut().flush_by_mask(&mask);
+            }
         }
     }
 
+    drop(sighand_guard);
+    drop(membership);
+    drop(tasks);
     return Ok(());
 }

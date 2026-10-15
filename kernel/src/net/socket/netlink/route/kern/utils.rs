@@ -2,18 +2,16 @@ use crate::net::socket::netlink::{
     addr::multicast::GroupIdSet,
     message::{
         segment::{
-            ack::DoneSegment,
             header::{CMsgSegHdr, SegHdrCommonFlags},
             CSegmentType,
         },
-        Message, ProtocolSegment,
+        Message,
     },
     route::message::{segment::RouteNlSegment, RouteNlPacket},
     table::{NetlinkRouteProtocol, SupportedNetlinkProtocol},
 };
 use crate::process::namespace::net_namespace::NetNamespace;
-use alloc::{sync::Arc, vec::Vec};
-use system_error::SystemError;
+use alloc::sync::Arc;
 
 pub const RTMGRP_LINK: u32 = 0x1;
 pub const RTMGRP_NEIGH: u32 = 0x4;
@@ -21,47 +19,6 @@ pub const RTMGRP_IPV4_IFADDR: u32 = 0x10;
 pub const RTMGRP_IPV4_ROUTE: u32 = 0x40;
 pub const RTMGRP_IPV6_IFADDR: u32 = 0x100;
 pub const RTMGRP_IPV6_ROUTE: u32 = 0x400;
-
-pub fn finish_response(
-    request_header: &CMsgSegHdr,
-    dump_all: bool,
-    response_segments: &mut Vec<RouteNlSegment>,
-) -> Result<(), SystemError> {
-    if !dump_all {
-        if response_segments.len() != 1 {
-            log::warn!(
-                "netlink route: expected exactly one response segment, got {}",
-                response_segments.len()
-            );
-        }
-        return Ok(());
-    }
-
-    append_done_segment(request_header, response_segments)?;
-    add_multi_flag(response_segments);
-    Ok(())
-}
-
-fn append_done_segment(
-    header: &CMsgSegHdr,
-    response_segments: &mut Vec<RouteNlSegment>,
-) -> Result<(), SystemError> {
-    response_segments
-        .try_reserve(1)
-        .map_err(|_| SystemError::ENOMEM)?;
-    let done_segment = DoneSegment::new_from_request(header, None);
-    response_segments.push(RouteNlSegment::Done(done_segment));
-    Ok(())
-}
-
-fn add_multi_flag(responce_segment: &mut [RouteNlSegment]) {
-    for segment in responce_segment.iter_mut() {
-        let header = segment.header_mut();
-        let mut flags = SegHdrCommonFlags::from_bits_truncate(header.flags);
-        flags |= SegHdrCommonFlags::MULTI;
-        header.flags = flags.bits();
-    }
-}
 
 pub fn kernel_notify_header(type_: CSegmentType) -> CMsgSegHdr {
     CMsgSegHdr {
@@ -77,11 +34,9 @@ pub fn multicast_notify(netns: Arc<NetNamespace>, group_mask: u32, segment: Rout
     let message = Message::new(vec![segment]);
     for group_index in GroupIdSet::new(group_mask).ids_iter() {
         let group_id = group_index + 1;
-        NetlinkRouteProtocol::notify_group(
-            group_id,
-            0,
-            RouteNlPacket::notification(message.clone(), 1 << group_index),
-            netns.clone(),
-        );
+        match RouteNlPacket::notification(message.clone(), 1 << group_index) {
+            Ok(packet) => NetlinkRouteProtocol::notify_group(group_id, 0, packet, netns.clone()),
+            Err(_) => NetlinkRouteProtocol::report_group_overrun(group_id, 0, netns.clone()),
+        }
     }
 }

@@ -3,13 +3,12 @@ use crate::{
     net::socket::{
         netlink::{
             message::segment::{
-                header::{CMsgSegHdr, GetRequestFlags, NewRequestFlags, SegHdrCommonFlags},
+                header::{CMsgSegHdr, NewRequestFlags, SegHdrCommonFlags},
                 CSegmentType,
             },
             route::{
                 kern::utils::{
-                    finish_response, kernel_notify_header, multicast_notify, RTMGRP_IPV4_IFADDR,
-                    RTMGRP_IPV6_IFADDR,
+                    kernel_notify_header, multicast_notify, RTMGRP_IPV4_IFADDR, RTMGRP_IPV6_IFADDR,
                 },
                 message::{
                     attr::{addr::AddrAttr, IFNAME_SIZE},
@@ -34,51 +33,6 @@ use alloc::vec::Vec;
 use core::num::NonZeroU32;
 use smoltcp::wire::{IpAddress, IpCidr, Ipv4Address, Ipv6Address};
 use system_error::SystemError;
-
-pub(super) fn do_get_addr(
-    request_segment: &AddrSegment,
-    netns: Arc<NetNamespace>,
-) -> Result<Vec<RouteNlSegment>, SystemError> {
-    let dump_all = {
-        let flags = GetRequestFlags::from_bits_truncate(request_segment.header().flags);
-        flags.contains(GetRequestFlags::DUMP)
-    };
-
-    if !dump_all {
-        log::error!("GetAddr request without DUMP flag is not supported yet");
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
-    }
-
-    let requested_index = request_segment.body().index.map(NonZeroU32::get);
-    let requested_family = AddressFamily::try_from(request_segment.body().family as u16)
-        .ok()
-        .filter(|family| *family != AddressFamily::Unspecified);
-
-    let mut responce: Vec<RouteNlSegment> = netns
-        .device_list()
-        .iter()
-        .filter(|(_, iface)| requested_index.is_none_or(|index| iface.nic_id() as u32 == index))
-        .flat_map(|(_, iface)| iface_to_new_addr(request_segment.header(), iface))
-        .filter(|segment| {
-            requested_family.is_none_or(|family| {
-                AddressFamily::try_from(segment.body().family as u16)
-                    .ok()
-                    .is_some_and(|segment_family| segment_family == family)
-            })
-        })
-        .map(RouteNlSegment::NewAddr)
-        .collect();
-
-    // getifaddrs(3) 期望全局地址列表按族排序：IPv4 在前、IPv6 在后。
-    responce.sort_by_key(|segment| match segment {
-        RouteNlSegment::NewAddr(addr) => addr.body().family,
-        _ => 0,
-    });
-
-    finish_response(request_segment.header(), dump_all, &mut responce)?;
-
-    Ok(responce)
-}
 
 pub(super) fn do_new_addr(
     rtnl: &RtnlGuard,
@@ -393,29 +347,7 @@ fn parse_ip_cidr(
     }
 }
 
-fn iface_to_new_addr(request_header: &CMsgSegHdr, iface: &Arc<dyn Iface>) -> Vec<AddrSegment> {
-    let mut segments = Vec::new();
-    let Ok(ip_addrs) = crate::net::address::address_snapshot(iface) else {
-        return segments;
-    };
-
-    for (cidr, label, broadcast) in ip_addrs {
-        if let Ok(segment) = addr_to_segment(
-            request_header,
-            iface,
-            cidr,
-            CSegmentType::NEWADDR,
-            Some(&label),
-            broadcast,
-        ) {
-            segments.push(segment);
-        }
-    }
-
-    segments
-}
-
-fn addr_to_segment(
+pub(super) fn addr_to_segment(
     request_header: &CMsgSegHdr,
     iface: &Arc<dyn Iface>,
     cidr: IpCidr,

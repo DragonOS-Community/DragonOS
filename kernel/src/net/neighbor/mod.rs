@@ -102,6 +102,10 @@ pub(crate) fn snapshot(netns: &Arc<NetNamespace>) -> Result<NeighborSnapshot, Sy
     netns.neighbor_table().snapshot()
 }
 
+pub(crate) fn dump_entry(netns: &Arc<NetNamespace>, index: usize) -> Option<NeighborEntry> {
+    netns.neighbor_table().dump_entry(index)
+}
+
 pub(crate) fn lookup(
     netns: &Arc<NetNamespace>,
     ifindex: u32,

@@ -110,7 +110,7 @@ impl CtDump {
                     .try_reserve(done.0.len())
                     .map_err(|_| SystemError::ENOMEM)?;
                 bytes.extend_from_slice(&done.0);
-                NetlinkNetfilterProtocol::unicast(
+                NetlinkNetfilterProtocol::enqueue_dump(
                     port,
                     NetfilterMessage::new(bytes)?,
                     netns.clone(),
@@ -129,7 +129,7 @@ impl CtDump {
                 }
             }
             if !bytes.is_empty() {
-                NetlinkNetfilterProtocol::unicast(
+                NetlinkNetfilterProtocol::enqueue_dump(
                     port,
                     NetfilterMessage::new(bytes)?,
                     netns.clone(),

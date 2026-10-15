@@ -182,7 +182,7 @@ impl Socket for TcpSocket {
         let inner = self.inner.read();
         let inner = inner.as_ref().ok_or(SystemError::ENOTCONN)?;
         inner
-            .remote_endpoint()
+            .peer_endpoint()
             .map(|endpoint| self.name_endpoint(endpoint))
             .ok_or(SystemError::ENOTCONN)
     }

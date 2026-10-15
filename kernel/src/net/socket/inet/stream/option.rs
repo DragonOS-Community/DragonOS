@@ -157,7 +157,9 @@ impl super::TcpSocket {
             }
             (
                 state.local_endpoint(),
-                state.remote_endpoint().ok_or(SystemError::ENOTCONN)?,
+                state
+                    .transport_remote_endpoint()
+                    .ok_or(SystemError::ENOTCONN)?,
             )
         };
         let netns = self.netns();

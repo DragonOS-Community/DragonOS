@@ -73,6 +73,9 @@ normal/endpoint_pmtu
 normal/icmp_transport_errors
 normal/icmp_datagram_error_policies
 normal/tcp_icmp_errors
+normal/tcp_peer_name
+normal/netlink_buffer
+normal/netlink_buffer_lifecycle
 normal/raw_icmp_filter_semantics
 normal/socket_nonblocking
 normal/tcp_self_connect_semantics

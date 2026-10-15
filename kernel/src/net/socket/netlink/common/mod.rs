@@ -8,18 +8,27 @@ use crate::{
         posix::SockAddr,
         socket::{
             common::EPollItems,
+            common::{
+                parse_socket_buffer_size, parse_socket_buffer_size_force, SOCK_MIN_RCVBUF,
+                SOCK_MIN_SNDBUF, SYSCTL_RMEM_MAX, SYSCTL_WMEM_MAX,
+            },
             common::{parse_timeval_opt, write_i32_getsockopt, write_timeval_opt},
             endpoint::Endpoint,
             netlink::{
                 addr::{multicast::GroupIdSet, NetlinkSocketAddr},
                 common::{bound::BoundNetlink, unbound::UnboundNetlink},
-                table::{StandardNetlinkProtocol, SupportedNetlinkProtocol},
+                receiver::MessageQueue,
+                table::SupportedNetlinkProtocol,
             },
-            utils::datagram_common::{select_remote_and_bind, Bound, Inner},
+            utils::datagram_common::{Bound, Inner},
             AddressFamily, Socket, PMSG, PSO, PSOCK, PSOL,
         },
     },
-    process::{namespace::net_namespace::NetNamespace, ProcessManager},
+    process::{
+        cred::CAPFlags,
+        namespace::{net_namespace::NetNamespace, user_namespace::INIT_USER_NAMESPACE},
+        ProcessManager,
+    },
     syscall::user_access::UserBufferReader,
 };
 use alloc::{sync::Arc, vec::Vec};
@@ -70,18 +79,51 @@ pub struct NetlinkSocket<P: SupportedNetlinkProtocol> {
     inode_id: InodeId,
     open_files: AtomicUsize,
     fsnotify_watches: AtomicUsize,
+    send_buffer: AtomicUsize,
+    receive_queue: MessageQueue<P::Message>,
 }
 
 impl<P: SupportedNetlinkProtocol> NetlinkSocket<P>
 where
     BoundNetlink<P>: Bound<Endpoint = NetlinkSocketAddr>,
 {
+    fn with_remote<R>(
+        &self,
+        to: Option<NetlinkSocketAddr>,
+        op: impl FnOnce(&BoundNetlink<P>, NetlinkSocketAddr) -> Result<R, SystemError>,
+    ) -> Result<R, SystemError> {
+        loop {
+            let inner = self.inner.read();
+            self.check_open()?;
+            if let Inner::Bound(bound) = &*inner {
+                let remote = to
+                    .or_else(|| bound.remote_endpoint())
+                    .ok_or(SystemError::EDESTADDRREQ)?;
+                return op(bound, remote);
+            }
+            drop(inner);
+            let mut inner = self.inner.write();
+            self.check_open()?;
+            inner.bind_ephemeral(
+                &NetlinkSocketAddr::new_unspecified(),
+                self.wait_queue.clone(),
+                self.netns(),
+            )?;
+        }
+    }
+
     pub fn new(is_nonblocking: bool, socket_type: PSOCK, protocol: u32) -> Arc<Self> {
         let wait_queue = Arc::new(WaitQueue::default());
         let epoll_items = Arc::new(EPollItems::default());
         let fasync_items = Arc::new(FAsyncItems::default());
         let opener_cred = ProcessManager::current_pcb().cred();
-        let unbound = UnboundNetlink::new(epoll_items.clone(), fasync_items.clone(), opener_cred);
+        let receive_queue = P::new_message_queue();
+        let unbound = UnboundNetlink::new(
+            epoll_items.clone(),
+            fasync_items.clone(),
+            opener_cred,
+            receive_queue.clone(),
+        );
         Arc::new(Self {
             inner: RwSem::new(Inner::Unbound(unbound)),
             is_nonblocking: AtomicBool::new(is_nonblocking),
@@ -97,6 +139,8 @@ where
             inode_id: generate_inode_id(),
             open_files: AtomicUsize::new(0),
             fsnotify_watches: AtomicUsize::new(0),
+            send_buffer: AtomicUsize::new(SYSCTL_WMEM_MAX as usize),
+            receive_queue,
         })
     }
 
@@ -109,23 +153,23 @@ where
         if flags.contains(PMSG::OOB) {
             return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
         }
-        Self::check_send_len(buf.len())?;
+        self.check_send_len(buf.len())?;
+        if P::userspace_send_supported() {
+            let mut bytes = Vec::new();
+            bytes
+                .try_reserve_exact(buf.len())
+                .map_err(|_| SystemError::ENOMEM)?;
+            bytes.extend_from_slice(buf);
+            return self.try_send_vec(bytes, to, flags);
+        }
         let destination_is_explicit = to.is_some();
         if let Some(destination) = to.as_ref() {
             P::check_explicit_send(destination, &self.netns)?;
         }
-        let send_bytes = select_remote_and_bind(
-            &self.inner,
-            to,
-            || {
-                self.inner.write().bind_ephemeral(
-                    &NetlinkSocketAddr::new_unspecified(),
-                    self.wait_queue.clone(),
-                    self.netns(),
-                )
-            },
-            |bound, remote| bound.try_send(buf, &remote, flags, destination_is_explicit),
-        )?;
+        let send_bytes = self.with_remote(to, |bound, remote| {
+            self.check_send_len(buf.len())?;
+            bound.try_send(buf, &remote, flags, destination_is_explicit)
+        })?;
         // todo pollee invalidate??
 
         Ok(send_bytes)
@@ -140,40 +184,40 @@ where
         if flags.contains(PMSG::OOB) {
             return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
         }
-        Self::check_send_len(buf.len())?;
+        self.check_send_len(buf.len())?;
         let destination_is_explicit = to.is_some();
         if let Some(destination) = to.as_ref() {
             P::check_explicit_send(destination, &self.netns)?;
         }
-        let send_bytes = select_remote_and_bind(
-            &self.inner,
-            to,
-            || {
-                self.inner.write().bind_ephemeral(
-                    &NetlinkSocketAddr::new_unspecified(),
-                    self.wait_queue.clone(),
-                    self.netns(),
-                )
-            },
-            |bound, remote| bound.try_send_vec(buf, &remote, flags, destination_is_explicit),
-        )?;
+        if P::userspace_send_supported() {
+            // Resolve while bound, then release the sender lock before the
+            // destination's receive-space wait. Close/connect need that lock.
+            let remote = self.with_remote(to, |_bound, remote| Ok(remote))?;
+            let timeout = self.send_timeout_us.load(Ordering::Relaxed);
+            self.check_send_len(buf.len())?;
+            return P::send_userspace(
+                buf,
+                remote,
+                self.netns(),
+                self.is_nonblocking() || flags.contains(PMSG::DONTWAIT),
+                (timeout != u64::MAX).then(|| crate::time::Duration::from_micros(timeout)),
+            );
+        }
+        let send_bytes = self.with_remote(to, |bound, remote| {
+            self.check_send_len(buf.len())?;
+            bound.try_send_vec(buf, &remote, flags, destination_is_explicit)
+        })?;
 
         Ok(send_bytes)
     }
 
-    fn try_recv(
-        &self,
-        buf: &mut [u8],
-        flags: crate::net::socket::PMSG,
-    ) -> Result<(usize, usize, Endpoint), SystemError> {
-        let (recv_bytes, orig_len, endpoint) = self.inner.read().try_recv(buf, flags).map(
-            |(recv_bytes, orig_len, remote_endpoint)| {
-                (recv_bytes, orig_len, remote_endpoint.into())
-            },
-        )?;
-        // todo self.pollee.invalidate();
-
-        Ok((recv_bytes, orig_len, endpoint))
+    fn try_recv_packet(&self, flags: PMSG) -> Result<P::Message, SystemError> {
+        let inner = self.inner.read();
+        self.check_open()?;
+        match &*inner {
+            Inner::Unbound(_) => Err(SystemError::EAGAIN_OR_EWOULDBLOCK),
+            Inner::Bound(bound) => bound.try_recv_packet(flags),
+        }
     }
 
     #[inline]
@@ -190,15 +234,24 @@ where
         reader: &UserBufferReader<'_>,
         len: usize,
     ) -> Result<alloc::vec::Vec<u8>, SystemError> {
-        Self::check_send_len(len)?;
+        self.check_send_len(len)?;
         crate::net::socket::base::copy_user_buffer_to_vec(reader, len)
     }
 
-    fn check_send_len(len: usize) -> Result<(), SystemError> {
+    fn check_open(&self) -> Result<(), SystemError> {
+        if self.receive_queue.is_closed() {
+            Err(SystemError::EBADF)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn check_send_len(&self, len: usize) -> Result<(), SystemError> {
+        self.check_open()?;
         if len == 0 {
             return Err(SystemError::ENODATA);
         }
-        if P::max_send_len().is_some_and(|limit| len > limit) {
+        if len > self.send_buffer.load(Ordering::Relaxed).saturating_sub(32) {
             return Err(SystemError::EMSGSIZE);
         }
         Ok(())
@@ -211,6 +264,18 @@ where
         address: Option<crate::net::socket::endpoint::Endpoint>,
     ) -> Result<(usize, usize, crate::net::socket::endpoint::Endpoint), system_error::SystemError>
     {
+        let packet = self.recv_packet(flags, address)?;
+        let bytes = P::message_bytes(&packet);
+        let copied = buffer.len().min(bytes.len());
+        buffer[..copied].copy_from_slice(&bytes[..copied]);
+        Ok((copied, bytes.len(), P::message_source(&packet).into()))
+    }
+
+    fn recv_packet(
+        &self,
+        flags: PMSG,
+        address: Option<Endpoint>,
+    ) -> Result<P::Message, SystemError> {
         // Netlink does not support out-of-band data, even before bind. Reject
         // it before the unbound state can report an empty receive queue.
         if flags.contains(PMSG::OOB) {
@@ -219,18 +284,27 @@ where
         if let Some(addr) = address {
             let endpoint = addr.try_into()?;
             P::check_connect(&endpoint, &self.netns)?;
-            self.inner
-                .write()
-                .connect(&endpoint, self.wait_queue.clone(), self.netns())?;
+            let mut inner = self.inner.write();
+            self.check_open()?;
+            inner.connect(&endpoint, self.wait_queue.clone(), self.netns())?;
         }
 
         if self.is_nonblocking() || flags.contains(PMSG::DONTWAIT) {
-            self.try_recv(buffer, flags)
+            self.try_recv_packet(flags)
         } else {
+            let timeout = self.recv_timeout_us.load(Ordering::Relaxed);
+            let started = crate::time::Instant::now();
             loop {
-                match self.try_recv(buffer, flags) {
+                match self.try_recv_packet(flags) {
                     Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
-                        wq_wait_event_interruptible!(self.wait_queue, self.can_recv(), {})?;
+                        let remaining = (timeout != u64::MAX).then(|| {
+                            let elapsed = crate::time::Instant::now().saturating_sub(started);
+                            crate::time::Duration::from_micros(
+                                timeout.saturating_sub(elapsed.total_micros()),
+                            )
+                        });
+                        self.wait_queue
+                            .wait_event_io_interruptible_timeout(|| self.can_recv(), remaining)?;
                     }
                     result => break result,
                 }
@@ -241,6 +315,9 @@ where
     /// 判断当前的netlink是否可以接收数据
     /// 目前netlink只是负责接收内核消息，所以暂时不用判断是否可以发送数据
     pub fn can_recv(&self) -> bool {
+        if self.receive_queue.is_closed() {
+            return true;
+        }
         self.inner
             .read()
             .check_io_events()
@@ -307,9 +384,9 @@ where
 
         P::check_connect(&endpoint, &self.netns)?;
 
-        self.inner
-            .write()
-            .connect(&endpoint, self.wait_queue.clone(), self.netns())
+        let mut inner = self.inner.write();
+        self.check_open()?;
+        inner.connect(&endpoint, self.wait_queue.clone(), self.netns())
     }
 
     fn bind(
@@ -320,9 +397,9 @@ where
         P::check_bind(&endpoint, &self.netns)?;
         self.update_membership_capacity_for_bind(&endpoint);
 
-        self.inner
-            .write()
-            .bind(&endpoint, self.wait_queue.clone(), self.netns())
+        let mut inner = self.inner.write();
+        self.check_open()?;
+        inner.bind(&endpoint, self.wait_queue.clone(), self.netns())
     }
 
     fn send_to(
@@ -355,15 +432,11 @@ where
     }
 
     fn send_buffer_size(&self) -> usize {
-        // log::warn!("send_buffer_size is implemented to 0");
-        // netlink sockets typically do not have a send buffer size like stream sockets.
-        0
+        self.send_buffer.load(Ordering::Relaxed)
     }
 
     fn recv_buffer_size(&self) -> usize {
-        // log::warn!("recv_buffer_size is implemented to 0");
-        // netlink sockets typically do not have a recv buffer size like stream sockets.
-        0
+        self.receive_queue.receive_buffer()
     }
 
     fn recv(&self, buffer: &mut [u8], flags: PMSG) -> Result<usize, SystemError> {
@@ -375,12 +448,11 @@ where
         &self,
         user_buffer: &mut crate::syscall::user_buffer::UserBuffer<'_>,
     ) -> Result<usize, SystemError> {
-        const NETLINK_READ_SCRATCH: usize = 64 * 1024;
-        crate::net::socket::base::read_to_user_buffer_via_kernel_buf(
-            self,
-            user_buffer,
-            NETLINK_READ_SCRATCH,
-        )
+        if user_buffer.is_empty() {
+            return Ok(0);
+        }
+        let packet = self.recv_packet(PMSG::empty(), None)?;
+        user_buffer.write_all(P::message_bytes(&packet))
     }
 
     fn recv_msg(
@@ -389,19 +461,12 @@ where
         flags: PMSG,
     ) -> Result<usize, SystemError> {
         let iovs = unsafe { IoVecs::from_user(msg.msg_iov, msg.msg_iovlen, true)? };
-        let mut buf = if let Some(limit) = P::max_recv_len() {
-            let len = iovs.total_len().min(limit);
-            let mut buf = Vec::new();
-            buf.try_reserve_exact(len)
-                .map_err(|_| SystemError::ENOMEM)?;
-            buf.resize(len, 0);
-            buf
-        } else {
-            iovs.new_buf(true)?
-        };
-
-        let (copy_len, orig_len, endpoint) = self.recv_from_inner(&mut buf, flags, None)?;
-        iovs.scatter_exact(&buf[..copy_len])?;
+        let packet = self.recv_packet(flags, None)?;
+        let bytes = P::message_bytes(&packet);
+        let orig_len = bytes.len();
+        let copy_len = iovs.total_len().min(orig_len);
+        iovs.scatter_exact(&bytes[..copy_len])?;
+        let endpoint: Endpoint = P::message_source(&packet).into();
 
         if !msg.msg_name.is_null() {
             let actual_len = endpoint.write_to_user_msghdr(msg.msg_name, msg.msg_namelen)?;
@@ -445,20 +510,8 @@ where
             PSOL::SOCKET => {
                 let opt = PSO::try_from(name as u32).map_err(|_| SystemError::ENOPROTOOPT)?;
                 match opt {
-                    PSO::ERROR
-                        if self.protocol == u32::from(StandardNetlinkProtocol::NETFILTER)
-                            || self.protocol == u32::from(StandardNetlinkProtocol::ROUTE) =>
-                    {
-                        let error = match &*self.inner.read() {
-                            Inner::Unbound(_) => None,
-                            Inner::Bound(bound) => {
-                                let error = bound.receive_queue.take_error();
-                                if self.protocol == u32::from(StandardNetlinkProtocol::ROUTE) {
-                                    bound.receive_queue.recover_if_empty();
-                                }
-                                error
-                            }
-                        };
+                    PSO::ERROR => {
+                        let error = self.receive_queue.take_error();
                         let value_errno = error.map_or(0, |error| -error.to_posix_errno());
                         Ok(write_i32_getsockopt(value, value_errno))
                     }
@@ -466,6 +519,8 @@ where
                         let v = self.socket_type as i32;
                         Ok(write_i32_getsockopt(value, v))
                     }
+                    PSO::SNDBUF => Ok(write_i32_getsockopt(value, self.send_buffer_size() as i32)),
+                    PSO::RCVBUF => Ok(write_i32_getsockopt(value, self.recv_buffer_size() as i32)),
                     PSO::DOMAIN => {
                         let v = AddressFamily::Netlink as i32;
                         Ok(write_i32_getsockopt(value, v))
@@ -515,7 +570,7 @@ where
 
     fn send_msg(&self, msg: &crate::net::posix::MsgHdr, flags: PMSG) -> Result<usize, SystemError> {
         let iovs = unsafe { IoVecs::from_user(msg.msg_iov, msg.msg_iovlen, false)? };
-        Self::check_send_len(iovs.total_len())?;
+        self.check_send_len(iovs.total_len())?;
         let data = iovs.gather()?;
         let sent = if msg.msg_name.is_null() || msg.msg_namelen == 0 {
             self.try_send_vec(data, None, flags)?
@@ -533,6 +588,45 @@ where
             PSOL::SOCKET => {
                 let opt = PSO::try_from(name as u32).map_err(|_| SystemError::ENOPROTOOPT)?;
                 match opt {
+                    PSO::SNDBUF | PSO::RCVBUF | PSO::SNDBUFFORCE | PSO::RCVBUFFORCE => {
+                        // As with Linux sock_setsockopt, validate optlen before
+                        // checking FORCE capability in the initial user namespace.
+                        if val.len() < size_of::<i32>() {
+                            return Err(SystemError::EINVAL);
+                        }
+                        let send = matches!(opt, PSO::SNDBUF | PSO::SNDBUFFORCE);
+                        let force = matches!(opt, PSO::SNDBUFFORCE | PSO::RCVBUFFORCE);
+                        let minimum = if send {
+                            SOCK_MIN_SNDBUF
+                        } else {
+                            SOCK_MIN_RCVBUF
+                        };
+                        let size = if force {
+                            if !ProcessManager::current_pcb()
+                                .cred()
+                                .has_capability_in_ns(&INIT_USER_NAMESPACE, CAPFlags::CAP_NET_ADMIN)
+                            {
+                                return Err(SystemError::EPERM);
+                            }
+                            parse_socket_buffer_size_force(val, minimum)?
+                        } else {
+                            parse_socket_buffer_size(
+                                val,
+                                if send {
+                                    SYSCTL_WMEM_MAX
+                                } else {
+                                    SYSCTL_RMEM_MAX
+                                },
+                                minimum,
+                            )?
+                        };
+                        if send {
+                            self.send_buffer.store(size, Ordering::Relaxed);
+                        } else {
+                            self.receive_queue.set_receive_buffer(size);
+                        }
+                        Ok(())
+                    }
                     PSO::SNDTIMEO_OLD | PSO::SNDTIMEO_NEW => {
                         let d = parse_timeval_opt(val)?;
                         let us = d.map(|v| v.total_micros()).unwrap_or(u64::MAX);
@@ -574,7 +668,23 @@ where
     }
 
     fn do_close(&self) -> Result<(), SystemError> {
-        //TODO close the socket properly
+        // Dead first: pinned receivers must stop accepting before the port is
+        // unregistered/reused. Drop the bound state to cancel dump work, too.
+        self.receive_queue.close();
+        let old = {
+            let mut inner = self.inner.write();
+            core::mem::replace(
+                &mut *inner,
+                Inner::Unbound(UnboundNetlink::new(
+                    self.epoll_items.clone(),
+                    self.fasync_items.clone(),
+                    ProcessManager::current_pcb().cred(),
+                    self.receive_queue.clone(),
+                )),
+            )
+        };
+        drop(old);
+        self.wait_queue.wake_all();
         Ok(())
     }
 

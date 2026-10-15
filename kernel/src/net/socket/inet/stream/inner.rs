@@ -1699,13 +1699,38 @@ impl Inner {
         }
     }
 
-    pub fn remote_endpoint(&self) -> Option<smoltcp::wire::IpEndpoint> {
+    /// The output path has a destination even while SYN_SENT has no public
+    /// peer. Keep this identity query independent of getpeername semantics.
+    pub(super) fn transport_remote_endpoint(&self) -> Option<smoltcp::wire::IpEndpoint> {
         match self {
             Inner::Init(_) => None,
             Inner::Listening(_) => None,
             Inner::Connecting(conn) => Some(conn.get_peer_name()),
             Inner::Established(est) => Some(est.get_peer_name()),
             Inner::Closed(_) => None,
+        }
+    }
+
+    /// Observe the live transport without completing connect or consuming an
+    /// error. The cached tuple alone does not establish a public peer.
+    pub(super) fn peer_endpoint(&self) -> Option<smoltcp::wire::IpEndpoint> {
+        let peer = |socket: &tcp::Socket, endpoint: smoltcp::wire::IpEndpoint| {
+            // Linux detaches an inet_timewait_sock and closes the user socket;
+            // smoltcp retains TIME_WAIT in the same handle instead.
+            (endpoint.port != 0
+                && !matches!(
+                    socket.state(),
+                    tcp::State::Closed
+                        | tcp::State::Listen
+                        | tcp::State::SynSent
+                        | tcp::State::TimeWait
+                ))
+            .then_some(endpoint)
+        };
+        match self {
+            Inner::Connecting(conn) => conn.with(|socket| peer(socket, conn.remote)),
+            Inner::Established(est) => est.with(|socket| peer(socket, est.peer)),
+            Inner::Init(_) | Inner::Listening(_) | Inner::Closed(_) => None,
         }
     }
 }

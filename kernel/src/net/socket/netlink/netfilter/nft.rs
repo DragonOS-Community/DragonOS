@@ -3101,15 +3101,21 @@ impl NftSocketState {
             return Ok(());
         };
         if let DumpSession::Conntrack(session) = session {
-            if session.drive(port, netns)? {
-                *slot = None;
+            match session.drive(port, netns) {
+                Ok(true) => *slot = None,
+                Ok(false) | Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {}
+                Err(error) => return Err(error),
             }
             return Ok(());
         }
         let snapshot = netns.nftables().snapshot();
         let (message, table_cursor, chain_cursor, rule_cursor, done) =
             session.next(&snapshot, port)?;
-        NetlinkNetfilterProtocol::unicast(port, message, netns.clone())?;
+        match NetlinkNetfilterProtocol::enqueue_dump(port, message, netns.clone()) {
+            Ok(()) => {}
+            Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => return Ok(()),
+            Err(error) => return Err(error),
+        }
         session.advance(table_cursor, chain_cursor, rule_cursor, snapshot.generation);
         // Match nl_dump_check_consistent(): advertise a generation transition
         // once, then use that generation as the baseline for the next page.

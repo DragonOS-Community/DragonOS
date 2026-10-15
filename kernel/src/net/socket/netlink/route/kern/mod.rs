@@ -25,6 +25,7 @@ use core::marker::PhantomData;
 use system_error::SystemError;
 
 pub(super) mod addr;
+pub(in crate::net::socket::netlink) mod dump;
 mod link;
 mod neigh;
 mod route;
@@ -133,7 +134,13 @@ impl NetlinkRouteKernelSocket {
         }
     }
 
-    pub(super) fn request(&self, request: &RouteNlMessage, context: &RtnlRequestContext) {
+    pub(super) fn request(
+        &self,
+        request: &RouteNlMessage,
+        context: &RtnlRequestContext,
+        state: &dump::RouteSocketState,
+        queue: &crate::net::socket::netlink::receiver::MessageQueue<RouteNlPacket>,
+    ) {
         let dst_port = context.port_id();
         let netns = context.netns();
         for segment in request.segments() {
@@ -142,24 +149,19 @@ impl NetlinkRouteKernelSocket {
             let Ok(seg_type) = CSegmentType::try_from(header.type_) else {
                 let err_segment = ErrorSegment::new_from_request(header, Some(SystemError::EINVAL));
                 let err_msg = RouteNlMessage::new(vec![RouteNlSegment::Error(err_segment)]);
-                if let Err(e) = NetlinkRouteProtocol::unicast(
-                    dst_port,
-                    RouteNlPacket::kernel(err_msg),
-                    netns.clone(),
-                ) {
-                    log::warn!(
-                        "netlink route: failed to deliver EINVAL ack to port {}: {:?}",
-                        dst_port,
-                        e
-                    );
-                }
+                deliver_response(dst_port, err_msg, netns.clone());
                 continue;
             };
 
             let request_flags = SegHdrCommonFlags::from_bits_truncate(header.flags);
             let need_ack = request_flags.contains(SegHdrCommonFlags::ACK);
 
-            let response_segments = {
+            let response_segments = if dump::RouteSocketState::is_dump(segment) {
+                match state.start(segment, dst_port, &netns, queue) {
+                    Ok(()) => continue,
+                    Err(error) => Err(error),
+                }
+            } else {
                 // Linux runs regular rtnetlink doit and dump handlers under
                 // RTNL unless a handler is explicitly registered as unlocked.
                 // Keep response delivery outside this scope so ACKs cannot
@@ -185,18 +187,17 @@ impl NetlinkRouteKernelSocket {
                 }
             };
 
-            if let Err(e) = NetlinkRouteProtocol::unicast(
-                dst_port,
-                RouteNlPacket::kernel(response),
-                netns.clone(),
-            ) {
-                log::warn!(
-                    "netlink route: failed to deliver response to port {}: {:?}",
-                    dst_port,
-                    e
-                );
-            }
+            deliver_response(dst_port, response, netns.clone());
         }
+    }
+}
+
+pub(super) fn deliver_response(dst_port: u32, message: RouteNlMessage, netns: Arc<NetNamespace>) {
+    match RouteNlPacket::kernel(message) {
+        Ok(packet) => {
+            let _ = NetlinkRouteProtocol::unicast(dst_port, packet, netns);
+        }
+        Err(_) => NetlinkRouteProtocol::report_overrun(dst_port, netns),
     }
 }
 
@@ -208,21 +209,24 @@ fn dispatch_request(
 ) -> Result<alloc::vec::Vec<RouteNlSegment>, SystemError> {
     let netns = context.netns();
     match segment {
-        RouteNlSegment::GetAddr(request) => addr::do_get_addr(request, netns),
+        // Dump requests have already been handed to the socket's bounded
+        // cursor. These non-dump operations retain their previous errno.
+        RouteNlSegment::GetAddr(_) | RouteNlSegment::GetNeigh(_) => {
+            Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
+        }
         RouteNlSegment::NewAddr(request) => addr::do_new_addr(rtnl, request, netns),
         RouteNlSegment::DelAddr(request) => addr::do_del_addr(rtnl, request, netns),
         RouteNlSegment::GetLink(request) => link::do_get_link(request, netns),
         RouteNlSegment::NewLink(request) => link::do_new_link(rtnl, request, context),
         RouteNlSegment::DelLink(request) => link::do_del_link(rtnl, request, netns),
         RouteNlSegment::SetLink(request) => link::do_set_link(rtnl, request, context),
-        RouteNlSegment::GetRoute(request) if seg_type == CSegmentType::GETRULE => {
-            route::do_get_rule(request, netns)
+        RouteNlSegment::GetRoute(_) if seg_type == CSegmentType::GETRULE => {
+            Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
         }
         RouteNlSegment::GetRoute(request) => route::do_get_route(request, netns),
         RouteNlSegment::NewRoute(request) => route::do_new_route(rtnl, request, netns),
         RouteNlSegment::DelRoute(request) => route::do_del_route(rtnl, request, netns),
         RouteNlSegment::NewNeigh(request) => neigh::do_new_neigh(rtnl, request, netns),
-        RouteNlSegment::GetNeigh(request) => neigh::do_get_neigh(request, netns),
         RouteNlSegment::DelNeigh(request) => neigh::do_del_neigh(rtnl, request, netns),
         _ => {
             log::warn!("Unsupported route request segment type: {:?}", seg_type);

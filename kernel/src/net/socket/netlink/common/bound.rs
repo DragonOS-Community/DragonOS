@@ -1,3 +1,4 @@
+use crate::net::socket::PMSG;
 use crate::{
     filesystem::epoll::EPollEventType,
     net::socket::netlink::{
@@ -21,6 +22,50 @@ pub struct BoundNetlink<P: SupportedNetlinkProtocol> {
 }
 
 impl<P: SupportedNetlinkProtocol> BoundNetlink<P> {
+    /// Take (or pin for PEEK) the actual datagram before inspecting userspace
+    /// capacity. No allocation is derived from an untrusted receive length.
+    pub fn try_recv_packet(&self, flags: PMSG) -> Result<P::Message, SystemError> {
+        if flags.contains(PMSG::OOB) {
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        }
+        if let Some(error) = self.receive_queue.take_error() {
+            self.receive_queue.recover_if_empty();
+            return Err(error);
+        }
+        if self.receive_queue.is_empty() {
+            self.receive_queue.recover_if_empty();
+            P::drive_receive(self);
+            if let Some(error) = self.receive_queue.take_error() {
+                self.receive_queue.recover_if_empty();
+                return Err(error);
+            }
+        }
+        let mut queue = self.receive_queue.0.lock();
+        let message = queue
+            .front()
+            .ok_or(SystemError::EAGAIN_OR_EWOULDBLOCK)?
+            .clone();
+        if !flags.contains(PMSG::PEEK) {
+            self.receive_queue.pop_front_locked(&mut queue);
+            drop(queue);
+            self.receive_queue.recover_if_empty();
+            P::drive_receive(self);
+        }
+        Ok(message)
+    }
+
+    pub fn try_recv_common(
+        &self,
+        writer: &mut [u8],
+        flags: PMSG,
+    ) -> Result<(usize, usize, NetlinkSocketAddr), SystemError> {
+        let message = self.try_recv_packet(flags)?;
+        let bytes = P::message_bytes(&message);
+        let copied = writer.len().min(bytes.len());
+        writer[..copied].copy_from_slice(&bytes[..copied]);
+        Ok((copied, bytes.len(), P::message_source(&message)))
+    }
+
     pub(super) fn new(
         handle: BoundHandle<P::Message>,
         message_queue: MessageQueue<P::Message>,

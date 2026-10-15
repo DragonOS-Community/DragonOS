@@ -6,19 +6,17 @@ use system_error::SystemError;
 use crate::{
     net::{
         neighbor::{
-            self, NeighborEntry, NeighborMutationOutcome, NeighborNewFlags, NeighborSnapshot,
-            NeighborUpdate, NUD_FAILED,
+            self, NeighborEntry, NeighborMutationOutcome, NeighborNewFlags, NeighborUpdate,
+            NUD_FAILED,
         },
         rtnl::RtnlGuard,
         socket::netlink::{
             message::segment::{
-                header::{CMsgSegHdr, GetRequestFlags, NewRequestFlags, SegHdrCommonFlags},
+                header::{CMsgSegHdr, NewRequestFlags, SegHdrCommonFlags},
                 CSegmentType,
             },
             route::{
-                kern::utils::{
-                    finish_response, kernel_notify_header, multicast_notify, RTMGRP_NEIGH,
-                },
+                kern::utils::{kernel_notify_header, multicast_notify, RTMGRP_NEIGH},
                 message::{
                     attr::neigh::{NeighAttr, NeighAttrClass},
                     segment::{
@@ -59,6 +57,35 @@ enum NeighborMasterFilter {
 struct NeighborDumpFilter {
     ifindex: Option<u32>,
     master: NeighborMasterFilter,
+}
+
+pub(super) fn dump_entry_segment(
+    request: &NeighSegment,
+    entry: NeighborEntry,
+) -> Result<Option<RouteNlSegment>, SystemError> {
+    if request.body().flags == NTF_PROXY {
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+    }
+    let filter = NeighborDumpFilter::from_attrs(
+        ParsedNeighborAttrs::from_policy_segment(request).unwrap_or_default(),
+    );
+    if !family_matches(request.body().family, entry.destination) || !filter.matches(entry) {
+        return Ok(None);
+    }
+    Ok(Some(RouteNlSegment::NewNeigh(neigh_to_segment(
+        request.header(),
+        entry,
+        CSegmentType::NEWNEIGH,
+        true,
+        filter.is_filtered(),
+    )?)))
+}
+
+pub(super) fn validate_dump(request: &NeighSegment) -> Result<(), SystemError> {
+    if request.body().flags == NTF_PROXY {
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+    }
+    Ok(())
 }
 
 impl NeighborDumpFilter {
@@ -170,54 +197,6 @@ fn read_u32(payload: &[u8]) -> Result<u32, SystemError> {
     Ok(u32::from_ne_bytes(
         bytes.try_into().map_err(|_| SystemError::EINVAL)?,
     ))
-}
-
-pub(super) fn do_get_neigh(
-    request: &NeighSegment,
-    netns: Arc<NetNamespace>,
-) -> Result<Vec<RouteNlSegment>, SystemError> {
-    if !GetRequestFlags::from_bits_truncate(request.header().flags).contains(GetRequestFlags::DUMP)
-    {
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
-    }
-
-    let family = request.body().family;
-    if request.body().flags == NTF_PROXY {
-        // Linux selects the separate proxy-neighbor table only for this exact
-        // flag value. DragonOS has no proxy table, so never expose normal
-        // configured entries as a proxy dump.
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
-    }
-    // DragonOS does not expose NETLINK_GET_STRICT_CHK yet. Linux's non-strict
-    // dump path discards filter-policy errors and continues unfiltered.
-    let attrs = ParsedNeighborAttrs::from_policy_segment(request).unwrap_or_default();
-    let filter = NeighborDumpFilter::from_attrs(attrs);
-    let filtered = filter.is_filtered();
-    let entries = if matches!(family, AF_UNSPEC | AF_INET | AF_INET6) {
-        neighbor::snapshot(&netns)?
-    } else {
-        NeighborSnapshot::empty()
-    };
-    let mut response = Vec::new();
-    response
-        .try_reserve_exact(entries.len().saturating_add(1))
-        .map_err(|_| SystemError::ENOMEM)?;
-
-    for entry in entries.iter().copied() {
-        if !family_matches(family, entry.destination) || !filter.matches(entry) {
-            continue;
-        }
-        response.push(RouteNlSegment::NewNeigh(neigh_to_segment(
-            request.header(),
-            entry,
-            CSegmentType::NEWNEIGH,
-            true,
-            filtered,
-        )?));
-    }
-
-    finish_response(request.header(), true, &mut response)?;
-    Ok(response)
 }
 
 pub(super) fn do_new_neigh(

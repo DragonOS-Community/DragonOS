@@ -1,6 +1,7 @@
 use crate::net::socket::netlink::{common::NetlinkSocket, table::NetlinkRouteProtocol};
 
 pub(super) mod bound;
+pub(super) use kern::dump;
 pub(super) mod kern;
 pub(super) mod message;
 

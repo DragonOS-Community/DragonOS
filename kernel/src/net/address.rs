@@ -170,6 +170,24 @@ pub(in crate::net) fn address_snapshot(
         .collect()
 }
 
+/// Read one live RTNL dump item without cloning all configured addresses.
+pub(in crate::net) fn address_at(
+    iface: &Arc<dyn Iface>,
+    index: usize,
+) -> Result<Option<(IpCidr, CString, Option<Ipv4Address>)>, SystemError> {
+    let smol_iface = iface.smol_iface().lock();
+    let Some(&cidr) = smol_iface.ip_addrs().get(index) else {
+        return Ok(None);
+    };
+    let metadata = iface.common().address_metadata().lock();
+    let entry = metadata.iter().find(|entry| entry.cidr == cidr);
+    let label = match entry.and_then(|entry| entry.label.as_ref()) {
+        Some(label) => try_clone_cstring(label)?,
+        None => try_default_label(iface)?,
+    };
+    Ok(Some((cidr, label, entry.and_then(|entry| entry.broadcast))))
+}
+
 /// A fully allocated IPv4 address-label rename.
 ///
 /// Construction is fallible, but publication only moves owned state. Holding

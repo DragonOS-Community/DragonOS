@@ -29,6 +29,10 @@ use crate::{
     KERNEL_ALLOCATOR,
 };
 
+#[cfg(feature = "mm_selftest")]
+type VirtualAllocate<'a> =
+    dyn FnMut(Layout, &Arc<ObjectAccount>) -> Result<VmAllocation, MemoryAllocationError> + 'a;
+
 enum Backend {
     Empty,
     Heap {
@@ -65,13 +69,7 @@ impl KernelBuffer {
         len: usize,
         owner: &Arc<ObjectAccount>,
         #[cfg(feature = "mm_selftest")] fail_heap: bool,
-        #[cfg(feature = "mm_selftest")] virtual_allocate: &mut dyn FnMut(
-            Layout,
-            &Arc<ObjectAccount>,
-        ) -> Result<
-            VmAllocation,
-            MemoryAllocationError,
-        >,
+        #[cfg(feature = "mm_selftest")] virtual_allocate: &mut VirtualAllocate<'_>,
     ) -> Result<Self, MemoryAllocationError> {
         if !vmalloc::task_context() {
             return Err(SystemError::EAGAIN_OR_EWOULDBLOCK.into());

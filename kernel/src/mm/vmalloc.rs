@@ -189,36 +189,30 @@ fn task_context() -> bool {
         && ProcessManager::current_pcb().preempt_count() == 0
 }
 
-// A transaction-local failure budget: never affects another allocation.
-struct FailureBudget(Option<usize>);
-impl FailureBudget {
-    fn step(&mut self) -> Result<(), SystemError> {
-        if let Some(left) = &mut self.0 {
-            if *left == 0 {
-                return Err(SystemError::ENOMEM);
-            }
-            *left -= 1;
-        }
-        Ok(())
-    }
-}
-
 impl VmAllocation {
     pub(crate) fn try_new_zeroed(layout: Layout) -> Result<Self, MemoryAllocationError> {
-        Self::allocate(layout, &mut FailureBudget(None))
+        Self::allocate_with(
+            layout,
+            #[cfg(feature = "mm_selftest")]
+            &mut FailureBudget(None),
+            #[cfg(feature = "mm_selftest")]
+            &mut frame_zeroed,
+        )
     }
 
+    #[cfg(feature = "mm_selftest")]
     fn allocate(
         layout: Layout,
-        failure: &mut FailureBudget,
+        #[cfg(feature = "mm_selftest")] failure: &mut FailureBudget,
     ) -> Result<Self, MemoryAllocationError> {
         Self::allocate_with(layout, failure, &mut frame_zeroed)
     }
 
     fn allocate_with(
         layout: Layout,
-        failure: &mut FailureBudget,
-        data_frame: &mut dyn FnMut() -> Result<PhysAddr, SystemError>,
+        #[cfg(feature = "mm_selftest")] failure: &mut FailureBudget,
+        #[cfg(feature = "mm_selftest")] data_frame: &mut dyn FnMut()
+            -> Result<PhysAddr, SystemError>,
     ) -> Result<Self, MemoryAllocationError> {
         if !task_context() {
             return Err(SystemError::EAGAIN_OR_EWOULDBLOCK.into());
@@ -239,16 +233,26 @@ impl VmAllocation {
             return Err(SystemError::ENOMEM.into());
         }
         let owner = object_for_task(&ProcessManager::current_pcb());
-        Self::allocate_owned(layout, pages, failure, data_frame, &owner)
+        Self::allocate_owned(
+            layout,
+            pages,
+            #[cfg(feature = "mm_selftest")]
+            failure,
+            #[cfg(feature = "mm_selftest")]
+            data_frame,
+            &owner,
+        )
     }
 
     fn allocate_owned(
         layout: Layout,
         pages: usize,
-        failure: &mut FailureBudget,
-        data_frame: &mut dyn FnMut() -> Result<PhysAddr, SystemError>,
+        #[cfg(feature = "mm_selftest")] failure: &mut FailureBudget,
+        #[cfg(feature = "mm_selftest")] data_frame: &mut dyn FnMut()
+            -> Result<PhysAddr, SystemError>,
         owner: &Arc<ObjectAccount>,
     ) -> Result<Self, MemoryAllocationError> {
+        #[cfg(feature = "mm_selftest")]
         failure.step()?;
         let charge =
             owner.try_charge(KernelByteKind::Vmalloc, (pages * MMArch::PAGE_SIZE) as u64)?;
@@ -264,8 +268,10 @@ impl VmAllocation {
             _charge: charge,
         };
         for offset in (0..pages).step_by(CHUNK) {
+            #[cfg(feature = "mm_selftest")]
             failure.step()?;
             let metadata = OwnedBox::<Chunk>::prepare(owner, KernelByteKind::SlabUnreclaimable)?;
+            #[cfg(feature = "mm_selftest")]
             failure.step()?;
             let mut chunk = metadata
                 .try_init(Chunk {
@@ -281,8 +287,13 @@ impl VmAllocation {
             result.chunks = Some(chunk);
             let chunk = result.chunks.as_mut().unwrap();
             for index in 0..CHUNK.min(pages - offset) {
+                #[cfg(feature = "mm_selftest")]
                 failure.step()?;
-                chunk.frames[index] = data_frame()?;
+                #[cfg(feature = "mm_selftest")]
+                let frame = data_frame()?;
+                #[cfg(not(feature = "mm_selftest"))]
+                let frame = frame_zeroed()?;
+                chunk.frames[index] = frame;
                 chunk.acquired += 1;
                 let page = start + offset + index;
                 let address = VirtAddr::new(BASE + page * MMArch::PAGE_SIZE);
@@ -291,6 +302,7 @@ impl VmAllocation {
                     address,
                     chunk.frames[index],
                     owner,
+                    #[cfg(feature = "mm_selftest")]
                     failure,
                 )?;
                 chunk.mapped += 1;
@@ -306,7 +318,7 @@ impl VmAllocation {
         address: VirtAddr,
         data: PhysAddr,
         owner: &Arc<ObjectAccount>,
-        failure: &mut FailureBudget,
+        #[cfg(feature = "mm_selftest")] failure: &mut FailureBudget,
     ) -> Result<(), MemoryAllocationError> {
         let map = |mapper: &mut crate::arch::mm::PageMapper| {
             let flush = unsafe {
@@ -326,17 +338,21 @@ impl VmAllocation {
         {
             let pool = POOL.lock_irqsave();
             if pool.tables[slot].is_some() {
+                #[cfg(feature = "mm_selftest")]
                 failure.step()?;
                 let mut mapper = KernelMapper::lock();
                 map(mapper.as_mut().expect("recursive vmalloc mapper"));
                 return Ok(());
             }
         }
+        #[cfg(feature = "mm_selftest")]
         failure.step()?;
         let charge = owner.try_charge(KernelByteKind::PageTables, MMArch::PAGE_SIZE as u64)?;
+        #[cfg(feature = "mm_selftest")]
         failure.step()?;
         let frame = frame_zeroed()?;
         let mut unused = Some((frame, charge));
+        #[cfg(feature = "mm_selftest")]
         let result;
         {
             let mut pool = POOL.lock_irqsave();
@@ -352,16 +368,24 @@ impl VmAllocation {
                     _charge: charge,
                 });
             }
-            result = failure.step();
-            if result.is_ok() {
-                map(mapper);
+            #[cfg(feature = "mm_selftest")]
+            {
+                result = failure.step();
+                if result.is_ok() {
+                    map(mapper);
+                }
             }
+            #[cfg(not(feature = "mm_selftest"))]
+            map(mapper);
         }
         if let Some((frame, charge)) = unused {
             unsafe { LockedFrameAllocator.free_one(frame) };
             drop(charge);
         }
-        result.map_err(Into::into)
+        #[cfg(feature = "mm_selftest")]
+        return result.map_err(Into::into);
+        #[cfg(not(feature = "mm_selftest"))]
+        Ok(())
     }
 
     pub fn address(&self) -> VirtAddr {
@@ -432,5 +456,9 @@ impl Drop for VmAllocation {
     }
 }
 
+#[cfg(feature = "mm_selftest")]
 mod selftest;
+#[cfg(feature = "mm_selftest")]
 pub(crate) use selftest::report as selftest_report;
+#[cfg(feature = "mm_selftest")]
+use selftest::FailureBudget;

@@ -24,6 +24,9 @@ driver_ps2_mouse = []
 # kprobe
 kprobe_test = []
 static_keys_test = []
+# Controlled MM/DMA stress tests and transaction-local fault injection.
+# Disabled in ordinary kernels; explicitly enabled by dunitest CI.
+mm_selftest = []
 
 # kstack_protect 开启该功能后，会开启内核栈保护功能。用于辅助检测栈溢出。(内核栈占用会*2)
 kstack_protect = []

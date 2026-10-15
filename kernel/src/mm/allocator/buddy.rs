@@ -7,7 +7,10 @@ use log::{debug, warn};
 /// @Description: 伙伴分配器
 use crate::arch::MMArch;
 use crate::mm::allocator::bump::BumpAllocator;
-#[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
+#[cfg(all(
+    feature = "mm_selftest",
+    any(target_arch = "x86_64", target_arch = "riscv64")
+))]
 use crate::mm::allocator::page_frame::{
     allocate_page_frames, deallocate_page_frames, PhysPageFrame,
 };
@@ -876,7 +879,10 @@ pub(crate) fn allocation_stats_report(snapshot: BuddySnapshot) -> alloc::string:
     report
 }
 
-#[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
+#[cfg(all(
+    feature = "mm_selftest",
+    any(target_arch = "x86_64", target_arch = "riscv64")
+))]
 pub(crate) fn allocation_diagnostics_selftest_report() -> alloc::string::String {
     let (bounded, split_merge, fragmentation, zones, metadata) = deterministic_buddy_selftest();
     let checks = [
@@ -906,7 +912,10 @@ pub(crate) fn allocation_diagnostics_selftest_report() -> alloc::string::String 
 /// The live allocator only supplies one aligned backing block.  All operations
 /// under test use a separate `BuddyAllocator`, so their exact addresses are
 /// deterministic and concurrent kernel allocations cannot affect the result.
-#[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
+#[cfg(all(
+    feature = "mm_selftest",
+    any(target_arch = "x86_64", target_arch = "riscv64")
+))]
 pub(crate) fn deterministic_buddy_selftest() -> (bool, bool, bool, bool, bool) {
     const BACKING_PAGES: usize = 128;
     const ARENA_OFFSET_PAGES: usize = 64;

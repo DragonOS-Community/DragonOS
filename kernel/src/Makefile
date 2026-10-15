@@ -49,8 +49,11 @@ else
 TOOLCHAIN ?= +nightly-2026-02-24
 endif
 
+# Optional, comma-separated Cargo features (for example: mm_selftest).
+KERNEL_FEATURES ?=
+
 kernel_rust:
-	DRAGONOS_ACTUAL_BUILD=1 RUSTFLAGS="$(RUSTFLAGS)" INITRAM_PATH="$(INITRAM_PATH)" cargo $(TOOLCHAIN) $(CARGO_ZBUILD) build --release --target $(TARGET_JSON)
+	DRAGONOS_ACTUAL_BUILD=1 RUSTFLAGS="$(RUSTFLAGS)" INITRAM_PATH="$(INITRAM_PATH)" cargo $(TOOLCHAIN) $(CARGO_ZBUILD) build --release --target $(TARGET_JSON) $(if $(strip $(KERNEL_FEATURES)),--features "$(KERNEL_FEATURES)")
 
 
 all: kernel

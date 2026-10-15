@@ -4,6 +4,7 @@
 #include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <array>
@@ -111,6 +112,14 @@ TEST(AllocationDiagnostics, SnapshotIsCompleteAndStableAcrossPartialReads) {
 }
 
 TEST(AllocationDiagnostics, PrivateArenaValidatesFailureClassesAndCountConservation) {
+    struct stat info;
+    if (stat(kSelftestPath, &info) < 0) {
+        const int error = errno;
+        if (error == ENOENT) {
+            GTEST_SKIP() << "build the kernel with KERNEL_FEATURES=mm_selftest";
+        }
+        FAIL() << "stat(" << kSelftestPath << "): " << strerror(error);
+    }
     const auto first = ReadPath(kSelftestPath);
     EXPECT_NE(first.find("status=ok\n"), std::string::npos) << first;
     EXPECT_NE(first.find("fragmentation_and_capacity_diagnostics=ok\n"), std::string::npos) << first;

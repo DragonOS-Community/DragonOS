@@ -3,6 +3,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <string>
@@ -10,6 +11,20 @@
 namespace {
 
 constexpr const char* kSelftestPath = "/sys/kernel/debug/mm/dma_allocator_selftest";
+
+class DmaAllocatorSelftest : public ::testing::Test {
+  protected:
+    void SetUp() override {
+        struct stat info;
+        if (stat(kSelftestPath, &info) < 0) {
+            const int error = errno;
+            if (error == ENOENT) {
+                GTEST_SKIP() << "build the kernel with KERNEL_FEATURES=mm_selftest";
+            }
+            FAIL() << "stat(" << kSelftestPath << "): " << strerror(error);
+        }
+    }
+};
 
 std::string ReadAll() {
     int fd = open(kSelftestPath, O_RDONLY);
@@ -51,13 +66,13 @@ void ExpectSuccessfulReport(const std::string& report) {
 
 }  // namespace
 
-TEST(DmaAllocatorSelftest, BoundedAllocationAndReusePass) {
+TEST_F(DmaAllocatorSelftest, BoundedAllocationAndReusePass) {
     const std::string report = ReadAll();
     ASSERT_FALSE(report.empty());
     ExpectSuccessfulReport(report);
 }
 
-TEST(DmaAllocatorSelftest, RepeatedRunsRemainSuccessful) {
+TEST_F(DmaAllocatorSelftest, RepeatedRunsRemainSuccessful) {
     const std::string first = ReadAll();
     const std::string second = ReadAll();
     ASSERT_FALSE(first.empty());

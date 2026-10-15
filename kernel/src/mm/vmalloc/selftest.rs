@@ -22,6 +22,20 @@ use crate::{
     time::{clocksource::HZ, timer::clock},
 };
 
+// A transaction-local failure budget: never affects another allocation.
+pub(super) struct FailureBudget(pub(super) Option<usize>);
+impl FailureBudget {
+    pub(super) fn step(&mut self) -> Result<(), SystemError> {
+        if let Some(left) = &mut self.0 {
+            if *left == 0 {
+                return Err(SystemError::ENOMEM);
+            }
+            *left -= 1;
+        }
+        Ok(())
+    }
+}
+
 static TEST_LOCK: Mutex<()> = Mutex::new(());
 
 fn used_pages() -> usize {

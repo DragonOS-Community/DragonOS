@@ -9,6 +9,7 @@ on:
 
 env:
   ARCH: x86_64
+  KERNEL_FEATURES: mm_selftest
   HOME: /root
   # The CI container has no Docker daemon; use the archive-backed manifest.
   ROOTFS_MANIFEST: default
@@ -35,6 +36,12 @@ jobs:
       - name: Build DragonOS
         shell: bash -ileo pipefail {0}
         run: |
+          # Optional selftests must execute in this opt-in CI kernel, never silently skip.
+          cat >> user/apps/tests/dunitest/no_skip.txt <<'EOF'
+          normal/vmalloc_selftest
+          normal/allocation_diagnostics
+          normal/dma_allocator_selftest
+          EOF
           make clean
           make -j$(nproc) all
 

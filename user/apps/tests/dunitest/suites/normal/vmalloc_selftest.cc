@@ -4,6 +4,7 @@
 #include <fcntl.h>
 #include <sched.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -15,6 +16,21 @@
 namespace {
 
 constexpr const char* kSelftestPath = "/sys/kernel/debug/mm/vmalloc_selftest";
+
+class VmallocSelftest : public ::testing::Test {
+  protected:
+    void SetUp() override {
+        struct stat info;
+        if (stat(kSelftestPath, &info) < 0) {
+            const int error = errno;
+            if (error == ENOENT) {
+                GTEST_SKIP() << "build the kernel with KERNEL_FEATURES=mm_selftest";
+            }
+            FAIL() << "stat(" << kSelftestPath << "): " << strerror(error);
+        }
+    }
+};
+
 constexpr std::array<const char*, 8> kChecks = {
     "zero_alignment_cross_page", "partial_failure_rollback", "noncontiguous_backing",
     "shared_table_lifetime", "layout_boundaries", "accounting", "smp_visibility_reuse",
@@ -89,7 +105,7 @@ bool BindCpu(int cpu) {
 
 }  // namespace
 
-TEST(VmallocSelftest, ChecksPassAndSnapshotIsStableAcrossPartialReads) {
+TEST_F(VmallocSelftest, ChecksPassAndSnapshotIsStableAcrossPartialReads) {
     const int fd = open(kSelftestPath, O_RDONLY);
     ASSERT_GE(fd, 0) << strerror(errno);
     const auto report = ReadFd(fd, 7);
@@ -101,7 +117,7 @@ TEST(VmallocSelftest, ChecksPassAndSnapshotIsStableAcrossPartialReads) {
     EXPECT_EQ(report, ReadReport());
 }
 
-TEST(VmallocSelftest, ConcurrentThreadsRunOnAllowedCpus) {
+TEST_F(VmallocSelftest, ConcurrentThreadsRunOnAllowedCpus) {
     const auto cpus = AllowedCpus();
     ASSERT_FALSE(cpus.empty()) << strerror(errno);
     constexpr size_t kWorkers = 4;
@@ -129,7 +145,7 @@ TEST(VmallocSelftest, ConcurrentThreadsRunOnAllowedCpus) {
     }
 }
 
-TEST(VmallocSelftest, ForkedAddressSpacesCanAllocateAndReuseSharedKernelMappings) {
+TEST_F(VmallocSelftest, ForkedAddressSpacesCanAllocateAndReuseSharedKernelMappings) {
     const auto cpus = AllowedCpus();
     ASSERT_FALSE(cpus.empty()) << strerror(errno);
     int gate[2];

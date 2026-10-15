@@ -13,24 +13,30 @@ use crate::{
 
 #[derive(Debug)]
 enum MmReportCallback {
+    #[cfg(feature = "mm_selftest")]
     DmaSelftest,
     AllocationStats,
+    #[cfg(feature = "mm_selftest")]
     AllocationSelftest,
+    #[cfg(feature = "mm_selftest")]
     VmallocSelftest,
 }
 
 impl KernFSCallback for MmReportCallback {
     fn open(&self, mut data: KernCallbackData) -> Result<(), SystemError> {
         let report = match self {
+            #[cfg(feature = "mm_selftest")]
             Self::DmaSelftest => crate::mm::dma::dma_allocator_selftest_report(),
             Self::AllocationStats => {
                 let snapshot = crate::arch::mm::LockedFrameAllocator::diagnostic_snapshot()
                     .ok_or(SystemError::ENODEV)?;
                 crate::mm::allocator::buddy::allocation_stats_report(snapshot)
             }
+            #[cfg(feature = "mm_selftest")]
             Self::AllocationSelftest => {
                 crate::mm::allocator::buddy::allocation_diagnostics_selftest_report()
             }
+            #[cfg(feature = "mm_selftest")]
             Self::VmallocSelftest => crate::mm::vmalloc::selftest_report(),
         };
         data.file_private_data_mut()
@@ -80,6 +86,7 @@ pub fn init_debugfs_mm() -> Result<(), SystemError> {
         None,
         None,
     )?;
+    #[cfg(feature = "mm_selftest")]
     mm.add_file(
         "dma_allocator_selftest".to_string(),
         InodeMode::S_IRUSR,
@@ -94,6 +101,7 @@ pub fn init_debugfs_mm() -> Result<(), SystemError> {
         None,
         Some(&MmReportCallback::AllocationStats),
     )?;
+    #[cfg(feature = "mm_selftest")]
     mm.add_file(
         "allocation_selftest".to_string(),
         InodeMode::S_IRUSR,
@@ -101,6 +109,7 @@ pub fn init_debugfs_mm() -> Result<(), SystemError> {
         None,
         Some(&MmReportCallback::AllocationSelftest),
     )?;
+    #[cfg(feature = "mm_selftest")]
     mm.add_file(
         "vmalloc_selftest".to_string(),
         InodeMode::S_IRUSR,

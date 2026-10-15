@@ -305,9 +305,8 @@ pub(crate) fn execute(netns: &Arc<NetNamespace>, feedback: IcmpErrorFeedback) {
     // the device poll. Its RAW subscribers are served by that same TCP event.
     debug_assert_ne!(feedback.protocol, IpProtocol::Tcp);
     super::socket::inet::raw::handle_icmp_feedback(netns, &feedback);
-    match feedback.protocol {
-        IpProtocol::Udp => netns.udp_bindings().handle_icmp_feedback(&feedback),
-        _ => {}
+    if feedback.protocol == IpProtocol::Udp {
+        netns.udp_bindings().handle_icmp_feedback(&feedback);
     }
 }
 

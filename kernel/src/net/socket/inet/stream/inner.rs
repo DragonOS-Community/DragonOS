@@ -99,6 +99,7 @@ pub(super) struct ListenerRefillSnapshot {
     pub stack: Arc<crate::net::tcp_stack::TcpStack>,
     pub array_capacity: usize,
     pub pmtu_policies: [u8; 2],
+    pub recv_error_policies: [bool; 2],
 }
 
 pub(super) struct PreparedListenerRefill {
@@ -131,6 +132,7 @@ impl PreparedListenerRefill {
         socket
             .set_listen_pmtu_policies(snapshot.pmtu_policies)
             .expect("validated listener policy");
+        socket.set_listen_recv_error_policies(snapshot.recv_error_policies);
         socket.set_listen_ip_version(snapshot.domain.ip_version);
         socket.set_listen_bound_device(NonZeroU32::new(snapshot.device as u32));
         socket.set_lifecycle_observer(Some(observer));
@@ -151,6 +153,26 @@ pub(super) fn reset_error(state: tcp::State) -> SystemError {
         tcp::State::SynSent => SystemError::ECONNREFUSED,
         tcp::State::CloseWait => SystemError::EPIPE,
         _ => SystemError::ECONNRESET,
+    }
+}
+
+pub(super) fn transport_error(error: tcp::PendingError) -> SystemError {
+    use tcp::{ErrorReason, NetworkError as N};
+    match error.reason {
+        ErrorReason::Reset => reset_error(error.state),
+        ErrorReason::TimedOut => SystemError::ETIMEDOUT,
+        ErrorReason::Network(reason) => match reason {
+            N::NetworkUnreachable => SystemError::ENETUNREACH,
+            N::HostUnreachable => SystemError::EHOSTUNREACH,
+            N::ProtocolUnreachable => SystemError::ENOPROTOOPT,
+            N::ConnectionRefused => SystemError::ECONNREFUSED,
+            N::PermissionDenied => SystemError::EACCES,
+            N::ProtocolError => SystemError::EPROTO,
+            N::HostDown => SystemError::EHOSTDOWN,
+            N::NoNetwork => SystemError::ENONET,
+            N::OperationNotSupported => SystemError::EOPNOTSUPP_OR_ENOTSUP,
+            N::MessageTooLarge => SystemError::EMSGSIZE,
+        },
     }
 }
 
@@ -565,6 +587,8 @@ impl Init {
         let backlog = Listening::slot_capacity(backlog);
 
         let stack = inner.stack().clone();
+        let recv_error_policies =
+            inner.with::<tcp::Socket, _, _>(|socket| socket.recv_error_policies());
         let mut inner = inner;
         inner.pmtu_policies = pmtu_policies;
         let mut inners = prepared
@@ -587,6 +611,7 @@ impl Init {
                 socket
                     .set_listen_pmtu_policies(pmtu_policies)
                     .expect("validated listener policies");
+                socket.set_listen_recv_error_policies(recv_error_policies);
                 socket.set_listen_bound_device(NonZeroU32::new(device_binding.ifindex() as u32));
                 socket.set_lifecycle_observer(Some(prepared.observer.clone()));
                 socket.listen(listen_addr).map_err(|err| match err {
@@ -615,6 +640,7 @@ impl Init {
             reservation: Some(reservation),
             device_binding,
             pmtu_policies,
+            recv_error_policies,
         });
     }
 
@@ -779,7 +805,7 @@ impl Connecting {
             return;
         }
         let state = socket.state();
-        let reset_state = socket.reset_state();
+        let reset_state = socket.pending_error().map(|error| error.state);
         let completed = matches!(
             reset_state.unwrap_or(state),
             tcp::State::Established
@@ -792,10 +818,10 @@ impl Connecting {
         );
         if completed {
             *result = ConnectResult::Connected;
-        } else if let Some(reset_state) = socket.take_reset() {
+        } else if let Some(error) = socket.take_error() {
             // Transfer a failed handshake's error into its result. It must not
             // remain independently consumable from the transport socket.
-            *result = ConnectResult::Failed(Some(reset_error(reset_state)));
+            *result = ConnectResult::Failed(Some(transport_error(error)));
         } else if !socket.is_open() {
             // Preserve the pre-existing non-RST connection failure behavior.
             *result = ConnectResult::Failed(Some(SystemError::ECONNREFUSED));
@@ -855,6 +881,33 @@ impl Connecting {
         self.take_error_inner(true)
     }
 
+    /// Serialize a Linux error-queue dequeue with transport ingress and the
+    /// handshake's transferred error. No second error owner is introduced.
+    pub(super) fn consume_error_queue<R>(
+        &self,
+        mut consume: impl FnMut(Option<SystemError>) -> Option<(Option<SystemError>, R)>,
+    ) -> Option<R> {
+        self.with_mut(|socket| {
+            let mut result = self.result.write();
+            Self::refresh_result(socket, &mut result);
+            let previous = match &*result {
+                ConnectResult::Failed(error) => error.clone(),
+                _ => socket.pending_error().map(transport_error),
+            };
+            let (next, value) = consume(previous)?;
+            socket.take_error();
+            match &mut *result {
+                ConnectResult::Failed(error) => *error = next,
+                _ => {
+                    if let Some(error) = next {
+                        socket.set_reported_network_error(super::icmp_error::network_reason(error));
+                    }
+                }
+            }
+            Some(value)
+        })
+    }
+
     /// A completed handshake must use the receive path, which drains data and
     /// honors a received FIN before considering a pending reset.
     pub fn take_connect_error(&self) -> Option<SystemError> {
@@ -868,7 +921,7 @@ impl Connecting {
             match &mut *result {
                 ConnectResult::Failed(error) => error.take(),
                 ConnectResult::Connected if include_connected => {
-                    socket.take_reset().map(reset_error)
+                    socket.take_error().map(transport_error)
                 }
                 _ => None,
             }
@@ -902,9 +955,25 @@ pub struct Listening {
     /// Future passive opens inherit the family-specific listener setting.
     /// Already-created children retain their own snapshot until accepted.
     pmtu_policies: [u8; 2],
+    recv_error_policies: [bool; 2],
 }
 
 impl Listening {
+    pub(super) fn set_recv_error_policy(
+        &mut self,
+        version: smoltcp::wire::IpVersion,
+        enabled: bool,
+    ) {
+        self.recv_error_policies[usize::from(version == smoltcp::wire::IpVersion::Ipv6)] = enabled;
+        let mut sockets = self.stack.sockets().lock();
+        for bound in &self.inners {
+            let socket = sockets.get_mut::<tcp::Socket>(bound.handle());
+            // The next passive open snapshots these values under protocol
+            // serialization; current children keep their inherited options.
+            socket.set_listen_recv_error_policies(self.recv_error_policies);
+        }
+    }
+
     pub(super) fn defer_refill_retry(&mut self) {
         self.refill_requested = false;
         self.refill_retry_at =
@@ -938,6 +1007,7 @@ impl Listening {
             stack: self.stack.clone(),
             array_capacity,
             pmtu_policies: self.pmtu_policies,
+            recv_error_policies: self.recv_error_policies,
         })
     }
 
@@ -965,6 +1035,11 @@ impl Listening {
             .expect("prepared refill protocol")
             .set_listen_pmtu_policies(self.pmtu_policies)
             .expect("validated listener policies");
+        prepared
+            .socket
+            .as_mut()
+            .expect("prepared refill protocol")
+            .set_listen_recv_error_policies(self.recv_error_policies);
         let socket = prepared.socket.take().expect("one pre-born refill socket");
         let mut bound = match super::bound::TcpBound::new(
             socket,
@@ -1384,7 +1459,7 @@ impl Established {
     ) -> (Inner, Result<(), SystemError>) {
         if !self.connect_confirmed && self.with(|socket| socket.state() == tcp::State::Closed) {
             let error = self
-                .with_mut(|socket| socket.take_reset().map(reset_error))
+                .with_mut(|socket| socket.take_error().map(transport_error))
                 .unwrap_or(SystemError::ECONNABORTED);
             self.cancel_connecting_registration();
             let reservation = self
@@ -1507,7 +1582,7 @@ impl Established {
                 if is_closed || (read_closed && write_closed) {
                     events |= EPollEventType::EPOLLHUP;
                 }
-                if socket.reset_state().is_some() {
+                if socket.pending_error().is_some() {
                     events |= EPollEventType::EPOLLERR;
                 }
                 // Publish one coherent snapshot while the transport lock is

@@ -799,10 +799,6 @@ impl IfaceCommon {
                 }
                 _ => crate::net::nftables::NftDeviceNames::empty(),
             };
-            let raw_listeners = netns
-                .as_ref()
-                .map(crate::net::socket::inet::raw::snapshot_raw_ingress_listeners)
-                .unwrap_or_default();
             let authoritative_output = force_authoritative
                 || netns
                     .as_ref()
@@ -933,7 +929,6 @@ impl IfaceCommon {
                 NetIngressFilter::new(NetIngressFilterInit {
                     ruleset: nft_ruleset.as_ref().unwrap(),
                     netns,
-                    raw_listeners: &raw_listeners,
                     owner_ifindex: self.iface_id as u32,
                     device_names: &nft_device_names,
                     stage: &ingress_stage,
@@ -1163,10 +1158,6 @@ impl IfaceCommon {
                 }
                 _ => crate::net::nftables::NftDeviceNames::empty(),
             };
-            let raw_listeners = netns
-                .as_ref()
-                .map(crate::net::socket::inet::raw::snapshot_raw_ingress_listeners)
-                .unwrap_or_default();
             let authoritative_output = force_authoritative
                 || netns
                     .as_ref()
@@ -1295,7 +1286,6 @@ impl IfaceCommon {
                     NetIngressFilter::new(NetIngressFilterInit {
                         ruleset: nft_ruleset.as_ref().unwrap(),
                         netns,
-                        raw_listeners: &raw_listeners,
                         owner_ifindex: self.iface_id as u32,
                         device_names: &nft_device_names,
                         stage: &ingress_stage,

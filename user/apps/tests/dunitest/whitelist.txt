@@ -70,6 +70,10 @@ normal/tcp_device_binding
 normal/ipv6_routed_output
 normal/forward_mtu
 normal/endpoint_pmtu
+normal/icmp_transport_errors
+normal/icmp_datagram_error_policies
+normal/tcp_icmp_errors
+normal/raw_icmp_filter_semantics
 normal/socket_nonblocking
 normal/tcp_self_connect_semantics
 normal/poll_timeout_semantics

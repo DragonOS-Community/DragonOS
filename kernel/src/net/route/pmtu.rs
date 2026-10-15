@@ -167,10 +167,11 @@ pub(crate) fn path_mtu(
 /// Called only after the quoted flow has matched a live transport socket.
 pub(crate) fn learn(
     netns: &Arc<NetNamespace>,
-    feedback: &crate::net::pmtu::PmtuFeedback,
+    feedback: &crate::net::icmp_error::IcmpErrorFeedback,
     required_oif: Option<u32>,
 ) -> Option<PathMtu> {
-    let (source, destination) = crate::net::pmtu::routed_quote_flow(netns, feedback);
+    let mtu = feedback.mtu()?;
+    let (source, destination) = crate::net::icmp_error::routed_quote_flow(netns, feedback);
     let router = netns.router();
     let routes = super::lock_output_routes(&router, netns.device_list());
     let route = routes.lookup(destination, required_oif)?;
@@ -183,7 +184,7 @@ pub(crate) fn learn(
     }
     let learned = router.pmtu.lock().learn(
         Key::new(route, source, destination),
-        feedback.mtu as usize,
+        mtu as usize,
         Instant::now(),
     );
     Some(learned)

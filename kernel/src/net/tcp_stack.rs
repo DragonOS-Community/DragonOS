@@ -46,7 +46,7 @@ struct InputPacket {
 #[derive(Debug, Default)]
 struct InputQueue {
     packets: VecDeque<InputPacket>,
-    feedback: VecDeque<crate::net::pmtu::PmtuFeedback>,
+    feedback: VecDeque<crate::net::icmp_error::IcmpErrorFeedback>,
     in_flight: usize,
     bytes: usize,
 }
@@ -76,7 +76,7 @@ impl core::fmt::Debug for TcpStack {
 }
 
 impl TcpStack {
-    pub(crate) fn queue_pmtu_feedback(&self, feedback: crate::net::pmtu::PmtuFeedback) {
+    pub(crate) fn queue_icmp_feedback(&self, feedback: crate::net::icmp_error::IcmpErrorFeedback) {
         let mut input = self.input.lock();
         let bytes = feedback.quote.capacity();
         if input.packets.len() + input.feedback.len() + input.in_flight >= MAX_INPUT_PACKETS
@@ -91,7 +91,7 @@ impl TcpStack {
         self.request_poll();
     }
 
-    fn process_pmtu_feedback(&self, namespace: &Arc<NetNamespace>) {
+    fn process_icmp_feedback(&self, namespace: &Arc<NetNamespace>) {
         // Do not let a stream of control packets starve ordinary TCP data.
         for _ in 0..POLL_BUDGET / 2 {
             let feedback = {
@@ -105,7 +105,21 @@ impl TcpStack {
             let Some(seq) = feedback.seq else {
                 continue;
             };
-            let (source, destination) = crate::net::pmtu::routed_quote_flow(namespace, &feedback);
+            let Some(mtu) = feedback.mtu() else {
+                // Pins are obtained in bounded batches without holding the
+                // registry lock. Owners acquire inner -> SocketSet and recheck
+                // the quote, preserving connect/accept/close lifetime rules.
+                let end = self.bounds.end();
+                for start in (0..end).step_by(crate::net::tcp_bounds::BOUND_BATCH) {
+                    let pins = self.bounds.snapshot(start, end);
+                    for owner in pins.iter().flatten() {
+                        owner.handle_tcp_icmp(&feedback);
+                    }
+                }
+                continue;
+            };
+            let (source, destination) =
+                crate::net::icmp_error::routed_quote_flow(namespace, &feedback);
             let router = namespace.router();
             let routes = crate::net::route::lock_output_routes(&router, namespace.device_list());
             let mut sockets = self.sockets.lock();
@@ -124,14 +138,19 @@ impl TcpStack {
                 ) {
                     continue;
                 }
+                if socket.is_passive_open() {
+                    // Linux handles SYNACK requests before the PMTU path and
+                    // never learns a path or retransmits data for that child.
+                    continue;
+                }
                 if socket.pmtu_discover() >= 4 {
                     continue;
                 }
                 if matches!(feedback.destination, smoltcp::wire::IpAddress::Ipv6(_))
-                    && (feedback.mtu < 1280
+                    && (mtu < 1280
                         || socket
                             .output_ip_mtu()
-                            .is_some_and(|old| feedback.mtu as usize >= old))
+                            .is_some_and(|old| mtu as usize >= old))
                 {
                     continue;
                 }
@@ -145,7 +164,7 @@ impl TcpStack {
                     route,
                     source,
                     destination,
-                    feedback.mtu,
+                    mtu,
                 );
                 // Cache sharing and this socket's PMTU cookie are separate:
                 // an unchanged exception can still require this TCP to shrink.
@@ -365,7 +384,7 @@ impl TcpStack {
         .any(|version| {
             ruleset.requires_masquerade(version, crate::net::nftables::NftIpv4Hook::PostRouting)
         });
-        self.process_pmtu_feedback(&namespace);
+        self.process_icmp_feedback(&namespace);
         let mut input_blocked = false;
         for _ in 0..POLL_BUDGET {
             let Ok(device_names) = device_names.as_ref() else {

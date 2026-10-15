@@ -14,7 +14,6 @@ use super::constants::{
     ICMPV6_CHECKSUM_OFFSET, ICMPV6_ECHO_REPLY, ICMPV6_ECHO_REQUEST, ICMP_ECHO_REPLY,
     ICMP_ECHO_REQUEST,
 };
-use super::inner::RawInner;
 use super::options::DEFAULT_IP_TTL;
 use super::packet::{
     build_ip_packet, checksum16, ipv6_icmpv6_checksum, ipv6_udp_checksum, IpPacketParams,
@@ -54,7 +53,7 @@ pub(super) fn register_raw_socket(sock: &Arc<RawSocket>) {
     let entry = reg.entry(netns_id).or_default();
     entry.push(Arc::downgrade(sock));
     // 轻量清理：避免条目无限增长。
-    entry.retain(|w| w.upgrade().is_some());
+    entry.retain(|w| w.strong_count() != 0);
 }
 
 pub(super) fn unregister_raw_socket(sock: &Arc<RawSocket>) {
@@ -63,24 +62,16 @@ pub(super) fn unregister_raw_socket(sock: &Arc<RawSocket>) {
     let Some(entry) = reg.get_mut(&netns_id) else {
         return;
     };
-    entry.retain(|w| w.upgrade().map(|s| !Arc::ptr_eq(&s, sock)).unwrap_or(false));
+    let socket = Arc::downgrade(sock);
+    entry.retain(|w| w.strong_count() != 0 && !Weak::ptr_eq(w, &socket));
     if entry.is_empty() {
         reg.remove(&netns_id);
     }
 }
 
-/// Listener state captured before entering an interface's smoltcp locks.
-/// Matching an ingress packet must not acquire `RawSocket::inner`: bind and
-/// send paths can hold that lock while waiting for the interface lock.
-pub(crate) struct RawIngressListener {
-    socket: Arc<RawSocket>,
-    local_addr: Option<IpAddress>,
-    remote_addr: Option<IpAddress>,
-    bound_ifindex: usize,
-}
-
-impl RawIngressListener {
-    pub(crate) fn matches(
+impl RawSocket {
+    /// Match the socket identity at packet admission, without attachment locks.
+    pub(crate) fn matches_ingress(
         &self,
         version: IpVersion,
         protocol: IpProtocol,
@@ -88,45 +79,23 @@ impl RawIngressListener {
         destination: IpAddress,
         ingress_ifindex: u32,
     ) -> bool {
-        self.socket.ip_version == version
-            && self.socket.protocol == protocol
-            && self
-                .local_addr
+        let addresses = self.addresses.read();
+        addresses.live
+            && self.ip_version == version
+            && self.protocol == protocol
+            && addresses
+                .local
                 .is_none_or(|addr| addr.is_unspecified() || addr == destination)
-            && self.remote_addr.is_none_or(|addr| addr == source)
-            && (self.bound_ifindex == 0 || self.bound_ifindex == ingress_ifindex as usize)
-    }
-
-    pub(crate) fn socket(&self) -> Arc<RawSocket> {
-        self.socket.clone()
+            && addresses.remote.is_none_or(|addr| addr == source)
+            && self.device_binding.allows(ingress_ifindex as usize)
     }
 }
 
-pub(crate) fn snapshot_raw_ingress_listeners(netns: &Arc<NetNamespace>) -> Vec<RawIngressListener> {
-    let sockets = raw_sockets_in_netns(netns);
-    let mut listeners = Vec::new();
-    if listeners.try_reserve_exact(sockets.len()).is_err() {
-        return listeners;
-    }
-    for socket in sockets {
-        let (local_addr, remote_addr) = match socket.inner.read().as_ref() {
-            Some(RawInner::Bound(bound) | RawInner::Wildcard(bound)) => {
-                (bound.local_addr(), bound.remote_addr())
-            }
-            _ => (None, None),
-        };
-        let bound_ifindex = socket.device_binding.ifindex();
-        listeners.push(RawIngressListener {
-            socket,
-            local_addr,
-            remote_addr,
-            bound_ifindex,
-        });
-    }
-    listeners
-}
-
-fn raw_sockets_in_netns(netns: &Arc<NetNamespace>) -> Vec<Arc<RawSocket>> {
+/// Snapshot candidates only when a packet actually arrives. The caller keeps
+/// every upgraded reference until after the device/protocol locks drop.
+pub(crate) fn snapshot_raw_ingress_sockets(
+    netns: &Arc<NetNamespace>,
+) -> Result<Vec<Arc<RawSocket>>, system_error::SystemError> {
     let netns_id = netns.ns_common().nsid.data();
 
     // Polling is a read-mostly hot path. Dead weak references are removed by
@@ -135,20 +104,20 @@ fn raw_sockets_in_netns(netns: &Arc<NetNamespace>) -> Vec<Arc<RawSocket>> {
     let reg = RAW_SOCKET_REGISTRY.read();
     let entry = match reg.get(&netns_id) {
         Some(v) => v,
-        None => return Vec::new(),
+        None => return Ok(Vec::new()),
     };
 
     let mut result = Vec::new();
-    if result.try_reserve_exact(entry.len()).is_err() {
-        return result;
-    }
+    result
+        .try_reserve_exact(entry.len())
+        .map_err(|_| system_error::SystemError::ENOMEM)?;
     for w in entry {
         if let Some(s) = w.upgrade() {
             result.push(s);
         }
     }
 
-    result
+    Ok(result)
 }
 
 /// 检查目标地址是否为 loopback
@@ -217,9 +186,12 @@ fn should_deliver_to_socket(
     }
 
     // 5. bind(2) 目的地址过滤
-    let (local, remote) = match s.inner.read().as_ref() {
-        Some(RawInner::Bound(b) | RawInner::Wildcard(b)) => (b.local_addr(), b.remote_addr()),
-        _ => (None, None),
+    let (local, remote) = {
+        let addresses = s.addresses.read();
+        if !addresses.live {
+            return false;
+        }
+        (addresses.local, addresses.remote)
     };
     if let Some(local) = local {
         if !local.is_unspecified() && local != ctx.dest {
@@ -262,7 +234,7 @@ fn should_deliver_to_socket(
 
 /// 向同一 netns 下所有匹配的 raw socket 投递 loopback 数据包
 pub(super) fn deliver_loopback_packet(ctx: &LoopbackDeliverContext) {
-    let sockets = raw_sockets_in_netns(ctx.netns);
+    let sockets = snapshot_raw_ingress_sockets(ctx.netns).unwrap_or_default();
     let ingress_ifindex = ctx
         .netns
         .loopback_iface()
@@ -324,6 +296,8 @@ fn deliver_raw_to_sockets(
 /// socket references. It is executed after smoltcp and routing locks drop.
 pub(crate) struct RawIngressWork {
     pub(crate) sockets: Vec<Arc<RawSocket>>,
+    /// Admission-time matches occupy the prefix; the suffix is retirement only.
+    pub(crate) matched: usize,
     pub(crate) packet: Vec<u8>,
     pub(crate) source: IpAddress,
     pub(crate) destination: IpAddress,
@@ -334,6 +308,10 @@ pub(crate) struct RawIngressWork {
 
 impl RawIngressWork {
     pub(crate) fn execute(self) {
+        // Empty bytes are retirement-only work after a failed packet copy.
+        if self.packet.is_empty() {
+            return;
+        }
         let ctx = LoopbackDeliverContext {
             packet: &self.packet,
             dest: self.destination,
@@ -341,7 +319,7 @@ impl RawIngressWork {
             protocol: self.protocol,
             netns: &self.netns,
         };
-        deliver_raw_to_sockets(&ctx, self.ingress_ifindex, &self.sockets);
+        deliver_raw_to_sockets(&ctx, self.ingress_ifindex, &self.sockets[..self.matched]);
     }
 }
 

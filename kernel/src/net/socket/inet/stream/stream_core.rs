@@ -40,6 +40,7 @@ pub struct TcpSocketOptions {
     pub(crate) ip_mtu_discover: core::sync::atomic::AtomicI32,
     /// IPV6_MTU_DISCOVER is independent of the IPv4 option on dual-stack sockets.
     pub(crate) ipv6_mtu_discover: AtomicI32,
+    pub(crate) recv_errors: [AtomicBool; 2],
 
     pub(crate) send_buf_size: AtomicUsize,
     pub(crate) recv_buf_size: AtomicUsize,
@@ -110,6 +111,7 @@ impl TcpSocketOptions {
             // Default: IP_PMTUDISC_WANT (1)
             ip_mtu_discover: core::sync::atomic::AtomicI32::new(1),
             ipv6_mtu_discover: AtomicI32::new(1),
+            recv_errors: [AtomicBool::new(false), AtomicBool::new(false)],
             send_buf_size: AtomicUsize::new(inner::DEFAULT_TX_BUF_SIZE),
             recv_buf_size: AtomicUsize::new(inner::DEFAULT_RX_BUF_SIZE),
             rcvlowat: AtomicI32::new(1),
@@ -189,6 +191,10 @@ impl PreparedAcceptedSocket {
             .so_keepalive
             .store(keepalive.is_some(), core::sync::atomic::Ordering::Relaxed);
         let policies = established.pmtu_policies();
+        let error_policies = established.with(|socket| socket.recv_error_policies());
+        for (option, value) in socket.options.recv_errors.iter().zip(error_policies) {
+            option.store(value, core::sync::atomic::Ordering::Relaxed);
+        }
         socket
             .options
             .ip_mtu_discover
@@ -230,6 +236,7 @@ pub struct TcpSocketData {
     pub(crate) fasync_items: FAsyncItems,
     pub(crate) options: TcpSocketOptions,
     pub(crate) cork_buf: Mutex<Vec<u8>>,
+    pub(super) error_queue: Mutex<super::super::common::error_queue::ErrorQueue>,
     /// Serializes readers while a receive transaction temporarily drops the interface-wide
     /// SocketSet lock to copy data to userspace.
     pub(crate) recv_lock: Mutex<()>,
@@ -330,6 +337,7 @@ impl TcpSocket {
             fasync_items: FAsyncItems::default(),
             options,
             cork_buf: Mutex::new(Vec::new()),
+            error_queue: Mutex::new(super::super::common::error_queue::ErrorQueue::default()),
             recv_lock: Mutex::new(()),
             resize_lock: Mutex::new(()),
             cork_flush_in_progress: AtomicBool::new(false),

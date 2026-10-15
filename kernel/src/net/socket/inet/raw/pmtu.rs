@@ -1,8 +1,8 @@
-//! Raw protocol PMTU feedback. Called after ingress/interface locks drop.
+//! Raw protocol ICMP feedback. Called after ingress/interface locks drop.
 use super::{inner::RawInner, RawSocket};
 use crate::{
     net::{
-        pmtu::PmtuFeedback,
+        icmp_error::IcmpErrorFeedback,
         socket::inet::{
             common::{
                 error_queue::{
@@ -31,7 +31,7 @@ pub(super) struct RawOutputPath {
     actual: crate::net::output::SocketRouteHint,
 }
 
-pub(crate) fn handle_pmtu_feedback(netns: &Arc<NetNamespace>, feedback: &PmtuFeedback) {
+pub(crate) fn handle_icmp_feedback(netns: &Arc<NetNamespace>, feedback: &IcmpErrorFeedback) {
     if feedback.protocol == IpProtocol::Unknown(255) {
         return;
     }
@@ -39,16 +39,19 @@ pub(crate) fn handle_pmtu_feedback(netns: &Arc<NetNamespace>, feedback: &PmtuFee
         IpAddress::Ipv4(_) => IpVersion::Ipv4,
         IpAddress::Ipv6(_) => IpVersion::Ipv6,
     };
-    for listener in super::loopback::snapshot_raw_ingress_listeners(netns) {
+    let Ok(sockets) = super::loopback::snapshot_raw_ingress_sockets(netns) else {
+        return;
+    };
+    for socket in sockets {
         // The quoted packet travels from local to remote, unlike normal RX.
-        if listener.matches(
+        if socket.matches_ingress(
             version,
             feedback.protocol,
             feedback.destination,
             feedback.source,
             feedback.ingress_ifindex,
         ) {
-            listener.socket().receive_pmtu(feedback);
+            socket.receive_icmp_feedback(feedback);
         }
     }
 }
@@ -104,7 +107,7 @@ impl RawSocket {
         }
     }
 
-    fn receive_pmtu(&self, feedback: &PmtuFeedback) {
+    fn receive_icmp_feedback(&self, feedback: &IcmpErrorFeedback) {
         let connected = match self.inner.read().as_ref() {
             Some(RawInner::Bound(bound) | RawInner::Wildcard(bound)) => {
                 if bound
@@ -142,7 +145,7 @@ impl RawSocket {
         if ipv6 && !connected && !recverr {
             return;
         }
-        if ipv6 || policy.accepts_updates() {
+        if feedback.mtu().is_some() && (ipv6 || policy.accepts_updates()) {
             let required_oif = match self.device_binding.ifindex() {
                 0 => None,
                 index => Some(index as u32),
@@ -152,10 +155,14 @@ impl RawSocket {
         if !connected && !recverr {
             return;
         }
-        let harderr = if ipv6 {
-            policy == PmtuPolicy::Do
+        let harderr = if feedback.mtu().is_some() {
+            if ipv6 {
+                policy == PmtuPolicy::Do
+            } else {
+                policy != PmtuPolicy::Dont
+            }
         } else {
-            policy != PmtuPolicy::Dont
+            feedback.hard_error()
         };
         if !harderr && !recverr {
             return;
@@ -173,15 +180,15 @@ impl RawSocket {
                 payload.extend_from_slice(data);
                 entry = Some(ErrorQueueEntry {
                     error: SockExtendedErr {
-                        ee_errno: (-SystemError::EMSGSIZE.to_posix_errno()) as u32,
+                        ee_errno: feedback.errno().to_posix_errno().unsigned_abs(),
                         ee_origin: if ipv6 {
                             SO_EE_ORIGIN_ICMP6
                         } else {
                             SO_EE_ORIGIN_ICMP
                         },
-                        ee_type: if ipv6 { 2 } else { 3 },
-                        ee_code: if ipv6 { 0 } else { 4 },
-                        ee_info: feedback.mtu,
+                        ee_type: feedback.icmp_type,
+                        ee_code: feedback.icmp_code,
+                        ee_info: feedback.info(),
                         ..Default::default()
                     },
                     offender: Some(feedback.offender),
@@ -198,11 +205,55 @@ impl RawSocket {
             }
         }
         {
-            let mut errors = self.errors.lock();
-            if let Some(entry) = entry {
-                errors.1.push(entry, options.sock_rcvbuf as usize);
+            // Serialize final delivery with bind/connect/close and device
+            // updates. IPv4 connect writes its peer under an inner read guard,
+            // so this must be exclusive even though we only inspect identity.
+            let device = self.device_binding.prepare_current();
+            let inner = self.inner.write();
+            if inner.is_none() {
+                return;
             }
-            errors.0 = -SystemError::EMSGSIZE.to_posix_errno();
+            // Close retires the address identity before taking inner. Retain
+            // this read guard through commit so it cannot become dead between
+            // the final tuple check and publishing an error.
+            let addresses = self.addresses.read();
+            if !addresses.live
+                || addresses
+                    .local
+                    .is_some_and(|address| !address.is_unspecified() && address != feedback.source)
+                || addresses
+                    .remote
+                    .is_some_and(|address| address != feedback.destination)
+            {
+                return;
+            }
+            let connected = addresses.remote.is_some();
+            if (device.target_ifindex() != 0
+                && device.target_ifindex() != feedback.ingress_ifindex as usize)
+                || (!recverr && (!connected || !harderr))
+            {
+                return;
+            }
+            let mut errors = self.errors.lock();
+            // The setter owns errors while updating RECVERR and purging.
+            // Options guards never span acquisition of this error lock.
+            let recverr = {
+                let current = self.options.read();
+                if ipv6 {
+                    current.recv_err_v6
+                } else {
+                    current.recv_err_v4
+                }
+            };
+            if !recverr && (!connected || !harderr) {
+                return;
+            }
+            if recverr {
+                if let Some(entry) = entry {
+                    errors.1.push(entry, options.sock_rcvbuf as usize);
+                }
+            }
+            errors.0 = -feedback.errno().to_posix_errno();
         }
         self.notify();
     }
@@ -239,11 +290,18 @@ impl RawSocket {
             ingress_ifindex: 0,
             packet: None,
         };
-        let queued = self
-            .errors
-            .lock()
-            .1
-            .push(entry, options.sock_rcvbuf as usize);
+        let queued = {
+            let mut errors = self.errors.lock();
+            let enabled = {
+                let current = self.options.read();
+                if ipv6 {
+                    current.recv_err_v6
+                } else {
+                    current.recv_err_v4
+                }
+            };
+            enabled && errors.1.push(entry, options.sock_rcvbuf as usize)
+        };
         if queued {
             self.notify();
         }

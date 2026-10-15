@@ -12,7 +12,7 @@ use super::{
         NftPacket, RulesetSnapshot,
     },
     route::{OutputRouteGuard, RTN_BROADCAST, RTN_LOCAL, RTN_UNICAST},
-    socket::inet::raw::{RawIngressListener, RawIngressWork},
+    socket::inet::raw::RawIngressWork,
 };
 use crate::driver::net::{
     inject_owned_local_ip_packet_if_epoch, types::InterfaceFlags, veth::VethInterface, Iface,
@@ -51,7 +51,6 @@ pub(crate) enum IngressStage {
 pub(crate) struct NetIngressFilter<'a> {
     ruleset: &'a Arc<RulesetSnapshot>,
     netns: &'a Arc<NetNamespace>,
-    raw_listeners: &'a [RawIngressListener],
     owner_ifindex: u32,
     device_names: &'a NftDeviceNames,
     stage: &'a Cell<IngressStage>,
@@ -66,8 +65,8 @@ pub(crate) struct NetIngressFilter<'a> {
     routes: Option<&'a OutputRouteGuard<'a>>,
     fib_routes: Option<&'a OutputRouteGuard<'a>>,
     work: &'a mut Vec<RoutedIngressWork>,
-    pmtu_items: usize,
-    pmtu_bytes: usize,
+    icmp_error_items: usize,
+    icmp_error_bytes: usize,
 }
 
 /// Named poll inputs keep the two direct/NAPI call sites in sync as receive
@@ -75,7 +74,6 @@ pub(crate) struct NetIngressFilter<'a> {
 pub(crate) struct NetIngressFilterInit<'a> {
     pub(crate) ruleset: &'a Arc<RulesetSnapshot>,
     pub(crate) netns: &'a Arc<NetNamespace>,
-    pub(crate) raw_listeners: &'a [RawIngressListener],
     pub(crate) owner_ifindex: u32,
     pub(crate) device_names: &'a NftDeviceNames,
     pub(crate) stage: &'a Cell<IngressStage>,
@@ -93,9 +91,9 @@ pub(crate) struct NetIngressFilterInit<'a> {
 /// smoltcp, socket-set, or FIB locks are held.
 pub(crate) enum RoutedIngressWork {
     Raw(RawIngressWork),
-    Pmtu {
+    IcmpError {
         netns: Arc<NetNamespace>,
-        feedback: super::pmtu::PmtuFeedback,
+        feedback: super::icmp_error::IcmpErrorFeedback,
     },
     Defrag {
         netns: Arc<NetNamespace>,
@@ -137,8 +135,8 @@ pub(crate) enum RoutedIngressWork {
 impl RoutedIngressWork {
     pub(crate) fn execute(self) {
         let result = match self {
-            Self::Pmtu { netns, feedback } => {
-                super::pmtu::execute(&netns, feedback);
+            Self::IcmpError { netns, feedback } => {
+                super::icmp_error::execute(&netns, feedback);
                 return;
             }
             Self::Raw(work) => {
@@ -276,7 +274,6 @@ impl<'a> NetIngressFilter<'a> {
         let NetIngressFilterInit {
             ruleset,
             netns,
-            raw_listeners,
             owner_ifindex,
             device_names,
             stage,
@@ -291,7 +288,6 @@ impl<'a> NetIngressFilter<'a> {
         Self {
             ruleset,
             netns,
-            raw_listeners,
             owner_ifindex,
             device_names,
             stage,
@@ -304,8 +300,8 @@ impl<'a> NetIngressFilter<'a> {
             routes,
             fib_routes,
             work,
-            pmtu_items: 0,
-            pmtu_bytes: 0,
+            icmp_error_items: 0,
+            icmp_error_bytes: 0,
         }
     }
 
@@ -1353,16 +1349,16 @@ impl IpIngressFilter for NetIngressFilter<'_> {
 
         let packet = packet.bytes();
         // Control admission precedes allocation. Ordinary raw delivery below
-        // remains independent when the PMTU control budget is exhausted.
+        // remains independent when the ICMP control budget is exhausted.
         if matches!(protocol, IpProtocol::Icmp | IpProtocol::Icmpv6)
-            && self.pmtu_items < 64
-            && packet.len() <= (64 * 1024usize).saturating_sub(self.pmtu_bytes)
+            && self.icmp_error_items < 64
+            && packet.len() <= (64 * 1024usize).saturating_sub(self.icmp_error_bytes)
             && self.work.try_reserve(1).is_ok()
         {
-            if let Some(feedback) = super::pmtu::parse(packet, ingress_ifindex) {
-                self.pmtu_items += 1;
-                self.pmtu_bytes += feedback.quote.capacity();
-                self.work.push(RoutedIngressWork::Pmtu {
+            if let Some(feedback) = super::icmp_error::parse(packet, ingress_ifindex) {
+                self.icmp_error_items += 1;
+                self.icmp_error_bytes += feedback.quote.capacity();
+                self.work.push(RoutedIngressWork::IcmpError {
                     netns: self.netns.clone(),
                     feedback,
                 });
@@ -1389,34 +1385,54 @@ impl IpIngressFilter for NetIngressFilter<'_> {
             }
         };
 
-        let mut recipients = Vec::new();
-        let mut matched = false;
-        for listener in self.raw_listeners {
-            if listener.matches(version, protocol, source, destination, ingress_ifindex) {
-                matched = true;
-                if recipients.try_reserve(1).is_ok() {
-                    recipients.push(listener.socket());
-                }
+        // Allocate retirement work before upgrading any socket reference.
+        // A poll-start listener snapshot can miss sockets registered before
+        // this actual packet arrived, even when the packet was sent by one.
+        if self.work.try_reserve(1).is_err() {
+            return LocalInputVerdict::Drop;
+        }
+        let Ok(mut sockets) = super::socket::inet::raw::snapshot_raw_ingress_sockets(self.netns)
+        else {
+            return LocalInputVerdict::Drop;
+        };
+        // Partition in place: only admission-time matches receive bytes, but
+        // unmatched strong pins also survive until lock-free retirement.
+        let mut matched = 0;
+        for index in 0..sockets.len() {
+            if sockets[index].matches_ingress(
+                version,
+                protocol,
+                source,
+                destination,
+                ingress_ifindex,
+            ) {
+                sockets.swap(index, matched);
+                matched += 1;
             }
         }
-        if !recipients.is_empty() && self.work.try_reserve(1).is_ok() {
+        if !sockets.is_empty() {
             let mut bytes = Vec::new();
-            if bytes.try_reserve_exact(packet.len()).is_ok() {
+            if matched != 0 && bytes.try_reserve_exact(packet.len()).is_ok() {
                 bytes.extend_from_slice(packet);
-                self.work.push(RoutedIngressWork::Raw(RawIngressWork {
-                    sockets: recipients,
-                    packet: bytes,
-                    source,
-                    destination,
-                    protocol,
-                    ingress_ifindex,
-                    netns: self.netns.clone(),
-                }));
             }
+            // Include nonmatching candidates and copy-failure paths: their
+            // final strong references must not die under interface locks.
+            self.work.push(RoutedIngressWork::Raw(RawIngressWork {
+                sockets,
+                matched,
+                packet: bytes,
+                source,
+                destination,
+                protocol,
+                ingress_ifindex,
+                netns: self.netns.clone(),
+            }));
         }
         // Linux considers a raw protocol matched even when allocation or the
         // receive queue fails; an unknown protocol must not emit ICMP then.
-        LocalInputVerdict::ExternalRaw { matched }
+        LocalInputVerdict::ExternalRaw {
+            matched: matched != 0,
+        }
     }
 
     fn route_fragment(

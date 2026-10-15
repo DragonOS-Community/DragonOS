@@ -161,7 +161,7 @@ impl super::TcpSocket {
             )
         };
         let netns = self.netns();
-        let (source, destination) = crate::net::pmtu::routed_output_flow(
+        let (source, destination) = crate::net::icmp_error::routed_output_flow(
             &netns,
             local,
             remote,
@@ -183,6 +183,13 @@ impl super::TcpSocket {
             return Err(SystemError::ENOPROTOOPT);
         }
         match name {
+            name if name == PIPV6::RECVERR as usize => {
+                self.set_recv_error_policy(
+                    smoltcp::wire::IpVersion::Ipv6,
+                    byte_parser::read_i32(val)? != 0,
+                );
+                Ok(())
+            }
             name if name == PIPV6::V6ONLY as usize => self.set_ipv6_only(val),
             name if name == PIPV6::MTU_DISCOVER as usize => {
                 self.set_pmtu_discover_option(smoltcp::wire::IpVersion::Ipv6, val)
@@ -204,6 +211,10 @@ impl super::TcpSocket {
             return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
         }
         match name {
+            name if name == PIPV6::RECVERR as usize => Self::write_i32_opt(
+                value,
+                i32::from(self.recv_error_policy(smoltcp::wire::IpVersion::Ipv6)),
+            ),
             name if name == PIPV6::V6ONLY as usize => self.get_ipv6_only(value),
             name if name == PIPV6::MTU_DISCOVER as usize => {
                 Self::write_atomic_i32(value, &self.options.ipv6_mtu_discover)
@@ -496,6 +507,13 @@ impl super::TcpSocket {
     /// Sets a SOL_IP option.
     pub(super) fn set_ip_option(&self, opt: IpOption, val: &[u8]) -> Result<(), SystemError> {
         match opt {
+            IpOption::RECVERR => {
+                self.set_recv_error_policy(
+                    smoltcp::wire::IpVersion::Ipv4,
+                    byte_parser::read_i32(val)? != 0,
+                );
+                Ok(())
+            }
             IpOption::MTU_DISCOVER => {
                 self.set_pmtu_discover_option(smoltcp::wire::IpVersion::Ipv4, val)
             }
@@ -682,7 +700,7 @@ impl super::TcpSocket {
             }
             PSO::ERROR => {
                 let err = self
-                    .take_pending_error()
+                    .take_socket_option_error()
                     .map(|error| -error.to_posix_errno())
                     .unwrap_or(0);
                 self.update_events();
@@ -747,6 +765,10 @@ impl super::TcpSocket {
         value: &mut [u8],
     ) -> Result<usize, SystemError> {
         match opt {
+            IpOption::RECVERR => Self::write_i32_opt(
+                value,
+                i32::from(self.recv_error_policy(smoltcp::wire::IpVersion::Ipv4)),
+            ),
             IpOption::MTU_DISCOVER => Self::write_atomic_i32(value, self.ip_mtu_discover()),
             IpOption::MTU => {
                 Self::write_i32_opt(value, self.socket_path_mtu()?.min(i32::MAX as usize) as i32)

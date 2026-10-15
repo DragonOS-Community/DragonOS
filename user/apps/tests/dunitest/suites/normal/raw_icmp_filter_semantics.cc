@@ -85,7 +85,14 @@ TEST_P(RawIcmp6Filter, PublicationAndIngressNeverBypassTypeMask) {
             ASSERT_EQ(static_cast<ssize_t>(sizeof(icmp6_hdr)), SendType(socket.fd(), type))
                 << errno;
         }
-        ASSERT_EQ(1, WaitReadable(socket.fd())) << errno;
+        const int readable = WaitReadable(socket.fd());
+        if (readable != 1) {
+            char name[128]{};
+            const ssize_t length = readlink("/proc/self/ns/net", name, sizeof(name) - 1);
+            ADD_FAILURE() << "RAW ingress timeout: netns=" << (length >= 0 ? name : "unavailable")
+                          << " type=" << static_cast<unsigned>(GetParam()) << " fd=" << socket.fd();
+        }
+        ASSERT_EQ(1, readable) << errno;
         icmp6_hdr packet {};
         ASSERT_EQ(static_cast<ssize_t>(sizeof(packet)),
                   recv(socket.fd(), &packet, sizeof(packet), MSG_DONTWAIT)) << errno;

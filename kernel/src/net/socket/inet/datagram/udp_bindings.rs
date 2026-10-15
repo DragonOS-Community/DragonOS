@@ -174,7 +174,10 @@ impl Default for UdpBindingTable {
 impl UdpBindingTable {
     /// ICMP quotes describe the transmitted packet, so reverse it into the
     /// existing namespace receive lookup rather than retaining datagram history.
-    pub(crate) fn handle_pmtu_feedback(&self, feedback: &crate::net::pmtu::PmtuFeedback) {
+    pub(crate) fn handle_icmp_feedback(
+        &self,
+        feedback: &crate::net::icmp_error::IcmpErrorFeedback,
+    ) {
         if feedback.protocol != smoltcp::wire::IpProtocol::Udp {
             return;
         }
@@ -191,7 +194,7 @@ impl UdpBindingTable {
         if let Some(candidate) = choose_unicast_socket(&candidates, local, remote) {
             candidate
                 .socket
-                .handle_pmtu_feedback(candidate.generation, feedback);
+                .handle_icmp_feedback(candidate.generation, feedback);
         }
     }
 
@@ -539,7 +542,7 @@ fn udp_addrs_conflict(a: IpAddress, b: IpAddress) -> bool {
 }
 
 #[inline]
-fn udp_addr_match(bound_addr: IpAddress, dest_addr: IpAddress) -> bool {
+pub(super) fn udp_addr_match(bound_addr: IpAddress, dest_addr: IpAddress) -> bool {
     if bound_addr.version() != dest_addr.version() {
         // DragonOS's AF_INET6 UDP wildcard is dual stack. In particular an
         // ICMP quote for a mapped send carries real IPv4 addresses, never

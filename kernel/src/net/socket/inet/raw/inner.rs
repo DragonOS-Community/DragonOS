@@ -1,13 +1,10 @@
 //! Raw socket 内部状态实现
 
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use smoltcp::wire::{IpAddress, IpProtocol, IpVersion};
 use system_error::SystemError;
 
-use crate::{
-    libs::mutex::Mutex,
-    net::socket::{inet::common::BoundInner, utils::extract_src_addr_from_ip_header},
-};
+use crate::net::socket::{inet::common::BoundInner, utils::extract_src_addr_from_ip_header};
 
 // 重新导出供 mod.rs 使用
 pub use crate::net::socket::utils::extract_dst_addr_from_ip_header;
@@ -42,11 +39,11 @@ impl UnboundRaw {
             let inner = prepared.attach(original.socket);
             let bound = BoundRaw {
                 inner,
-                local_addr,
-                remote_addr: Mutex::new(None),
+                owner: Arc::downgrade(&wrapper),
                 ip_version: original.ip_version,
                 protocol: original.protocol,
             };
+            wrapper.addresses.write().local = local_addr;
             prepared.publish(wrapper);
             bound
         }) {
@@ -97,8 +94,7 @@ impl UnboundRaw {
 #[derive(Debug)]
 pub struct BoundRaw {
     inner: BoundInner,
-    local_addr: Option<IpAddress>,
-    remote_addr: Mutex<Option<IpAddress>>,
+    owner: Weak<super::RawSocket>,
     ip_version: IpVersion,
     protocol: IpProtocol,
 }
@@ -119,15 +115,21 @@ impl BoundRaw {
     }
 
     pub fn local_addr(&self) -> Option<IpAddress> {
-        self.local_addr
+        self.owner
+            .upgrade()
+            .and_then(|owner| owner.addresses.read().local)
     }
 
     pub fn remote_addr(&self) -> Option<IpAddress> {
-        *self.remote_addr.lock()
+        self.owner
+            .upgrade()
+            .and_then(|owner| owner.addresses.read().remote)
     }
 
     pub fn connect(&self, remote: IpAddress) {
-        self.remote_addr.lock().replace(remote);
+        if let Some(owner) = self.owner.upgrade() {
+            owner.addresses.write().remote = Some(remote);
+        }
     }
 
     /// 尝试接收数据包
@@ -171,7 +173,7 @@ impl BoundRaw {
 
     /// 尝试发送数据包
     pub fn try_send(&self, buf: &[u8], to: Option<IpAddress>) -> Result<usize, SystemError> {
-        let dest_addr = to.or(*self.remote_addr.lock());
+        let dest_addr = to.or(self.remote_addr());
 
         // 对于 raw socket，目标地址可以从数据包中获取
         // 如果没有指定目标地址且没有连接的远程地址，
@@ -199,7 +201,9 @@ impl BoundRaw {
     }
 
     pub(crate) fn set_local_addr(&mut self, address: IpAddress) {
-        self.local_addr = Some(address);
+        if let Some(owner) = self.owner.upgrade() {
+            owner.addresses.write().local = Some(address);
+        }
     }
 
     pub fn close(&self) {

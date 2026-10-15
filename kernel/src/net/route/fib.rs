@@ -18,6 +18,10 @@ pub(in crate::net) struct FibTable {
 }
 
 impl FibTable {
+    pub(super) fn dump_entry(&self, index: usize) -> Option<RouteEntry> {
+        self.entries.get(index).copied()
+    }
+
     /// Creation rollback may skip route preparation only for devices that
     /// have never acquired an authoritative FIB entry.
     pub(in crate::net) fn has_oif(&self, ifindex: u32) -> bool {

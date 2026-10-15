@@ -3,7 +3,8 @@ mod query;
 
 pub(super) use create::do_new_link;
 pub(super) use query::do_get_link;
-use query::iface_to_link_message;
+pub(super) use query::iface_to_link_message;
+pub(super) use query::validate_dumplink_request;
 
 use crate::{
     driver::net::{
@@ -16,13 +17,11 @@ use crate::{
     net::socket::{
         netlink::{
             message::segment::{
-                header::{CMsgSegHdr, GetRequestFlags, NewRequestFlags, SegHdrCommonFlags},
+                header::{CMsgSegHdr, NewRequestFlags, SegHdrCommonFlags},
                 CSegmentType,
             },
             route::{
-                kern::utils::{
-                    finish_response, kernel_notify_header, multicast_notify, RTMGRP_LINK,
-                },
+                kern::utils::{kernel_notify_header, multicast_notify, RTMGRP_LINK},
                 message::{
                     attr::link::{append_nested_link_attr, parse_nested_link_attrs, LinkAttr},
                     segment::{

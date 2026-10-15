@@ -10,70 +10,63 @@ use system_error::SystemError;
 
 pub(in crate::net::socket::netlink) type RouteNlMessage = Message<RouteNlSegment>;
 
-/// A received rtnetlink datagram. Kernel replies are serialized from typed
-/// segments; userspace delivery retains the exact bytes supplied to sendmsg.
+/// Retained datagrams own wire bytes rather than a typed response tree.
+/// Multicast clones are charged to each subscriber, including entry overhead.
 #[derive(Debug, Clone)]
-pub enum RouteNlPacket {
-    Kernel {
-        message: RouteNlMessage,
-        group: u32,
-    },
-    User {
-        bytes: Arc<Vec<u8>>,
-        source: NetlinkSocketAddr,
-    },
+pub struct RouteNlPacket {
+    bytes: Arc<Vec<u8>>,
+    source: NetlinkSocketAddr,
 }
 
 impl RouteNlPacket {
-    pub fn kernel(message: RouteNlMessage) -> Self {
-        Self::Kernel { message, group: 0 }
+    pub fn kernel(message: RouteNlMessage) -> Result<Self, SystemError> {
+        Self::notification(message, 0)
     }
 
-    pub fn notification(message: RouteNlMessage, group: u32) -> Self {
-        Self::Kernel { message, group }
+    pub fn notification(message: RouteNlMessage, group: u32) -> Result<Self, SystemError> {
+        let mut bytes = Vec::new();
+        let length = message.total_len();
+        bytes
+            .try_reserve_exact(length)
+            .map_err(|_| SystemError::ENOMEM)?;
+        bytes.resize(length, 0);
+        let written = message.write_to(&mut bytes)?;
+        bytes.truncate(written);
+        Ok(Self::user(
+            Arc::try_new(bytes).map_err(|_| SystemError::ENOMEM)?,
+            NetlinkSocketAddr::new(
+                0,
+                crate::net::socket::netlink::addr::multicast::GroupIdSet::new(group),
+            ),
+        ))
     }
 
     pub fn user(bytes: Arc<Vec<u8>>, source: NetlinkSocketAddr) -> Self {
-        Self::User { bytes, source }
+        Self { bytes, source }
     }
 
     pub fn total_len(&self) -> usize {
-        match self {
-            Self::Kernel { message, .. } => message.total_len(),
-            Self::User { bytes, .. } => bytes.len(),
-        }
+        self.bytes.len()
     }
 
-    /// Limit newly supported userspace delivery without changing the
-    /// pre-existing, potentially multipart rtnetlink dump reply path. Include
-    /// a conservative per-entry charge so tiny datagrams cannot fill the
-    /// queue with hundreds of thousands of Arc/VecDeque nodes.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
     pub fn queue_charge(&self) -> usize {
-        match self {
-            Self::Kernel { .. } => 0,
-            Self::User { bytes, .. } => bytes.len().saturating_add(512),
-        }
+        self.bytes
+            .capacity()
+            .saturating_add(crate::net::socket::netlink::receiver::MESSAGE_OVERHEAD)
     }
 
     pub fn source(&self) -> NetlinkSocketAddr {
-        match self {
-            Self::Kernel { group, .. } => NetlinkSocketAddr::new(
-                0,
-                crate::net::socket::netlink::addr::multicast::GroupIdSet::new(*group),
-            ),
-            Self::User { source, .. } => *source,
-        }
+        self.source
     }
 
     pub fn write_to(&self, writer: &mut [u8]) -> Result<usize, SystemError> {
-        match self {
-            Self::Kernel { message, .. } => message.write_to(writer),
-            Self::User { bytes, .. } => {
-                let copy_len = bytes.len().min(writer.len());
-                writer[..copy_len].copy_from_slice(&bytes[..copy_len]);
-                Ok(copy_len)
-            }
-        }
+        let length = self.bytes.len().min(writer.len());
+        writer[..length].copy_from_slice(&self.bytes[..length]);
+        Ok(length)
     }
 }
 

@@ -234,9 +234,16 @@ TEST_P(TcpIcmpErrors, SynErrorCompletesConnectAndPreservesQuotedTcpHeader) {
     ASSERT_EQ(poll(&progress, 1, 1000), 1);
     EXPECT_NE(progress.revents & POLLERR, 0);
     EXPECT_NE(progress.revents & POLLHUP, 0);
+    auto expect_no_peer = [&] {
+        sockaddr_storage peer{}; socklen_t size = sizeof(peer);
+        ASSERT_EQ(getpeername(client.get(), reinterpret_cast<sockaddr*>(&peer), &size), -1);
+        ASSERT_EQ(errno, ENOTCONN);
+    };
+    ASSERT_NO_FATAL_FAILURE(expect_no_peer());
     int pending = 0; length = sizeof(pending);
     ASSERT_EQ(getsockopt(client.get(), SOL_SOCKET, SO_ERROR, &pending, &length), 0);
     EXPECT_EQ(pending, ECONNREFUSED);
+    ASSERT_NO_FATAL_FAILURE(expect_no_peer());
     std::array<char, 256> payload{}, control{};
     iovec iov{payload.data(), payload.size()}; msghdr message{};
     message.msg_iov = &iov; message.msg_iovlen = 1;
@@ -265,6 +272,7 @@ TEST_P(TcpIcmpErrors, SynErrorCompletesConnectAndPreservesQuotedTcpHeader) {
     pending = -1; length = sizeof(pending);
     ASSERT_EQ(getsockopt(client.get(), SOL_SOCKET, SO_ERROR, &pending, &length), 0);
     EXPECT_EQ(pending, 0);
+    ASSERT_NO_FATAL_FAILURE(expect_no_peer());
 }
 
 INSTANTIATE_TEST_SUITE_P(DualStack, TcpIcmpErrors,

@@ -89,6 +89,10 @@ impl NeighborReadGuard<'_> {
 }
 
 impl NeighborTable {
+    pub(super) fn dump_entry(&self, index: usize) -> Option<NeighborEntry> {
+        self.entries.read().get(index).copied()
+    }
+
     pub(crate) fn new() -> Self {
         Self {
             entries: RwSem::new(Vec::new()),

@@ -558,6 +558,11 @@ pub(crate) fn snapshot(
     netns.router().fib.read().snapshot()
 }
 
+/// One live-dump item, without cloning the FIB or its lookup index.
+pub(crate) fn dump_entry(netns: &Arc<NetNamespace>, index: usize) -> Option<RouteEntry> {
+    netns.router().fib.read().dump_entry(index)
+}
+
 pub(crate) fn resolve_gateway_oif(
     netns: &Arc<NetNamespace>,
     gateway: IpAddress,

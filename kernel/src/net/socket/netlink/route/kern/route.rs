@@ -9,12 +9,12 @@ use crate::{
         socket::{
             netlink::{
                 message::segment::{
-                    header::{CMsgSegHdr, GetRequestFlags, NewRequestFlags},
+                    header::{CMsgSegHdr, NewRequestFlags},
                     CSegmentType,
                 },
                 route::{
                     kern::utils::{
-                        finish_response, kernel_notify_header, multicast_notify, RTMGRP_IPV4_ROUTE,
+                        kernel_notify_header, multicast_notify, RTMGRP_IPV4_ROUTE,
                         RTMGRP_IPV6_ROUTE,
                     },
                     message::{
@@ -54,23 +54,7 @@ pub(super) fn do_get_route(
     request: &RouteSegment,
     netns: Arc<NetNamespace>,
 ) -> Result<Vec<RouteNlSegment>, SystemError> {
-    if GetRequestFlags::from_bits_truncate(request.header().flags).contains(GetRequestFlags::DUMP) {
-        return dump_routes(request, netns);
-    }
     lookup_route(request, netns)
-}
-
-pub(super) fn do_get_rule(
-    request: &RouteSegment,
-    _netns: Arc<NetNamespace>,
-) -> Result<Vec<RouteNlSegment>, SystemError> {
-    if !GetRequestFlags::from_bits_truncate(request.header().flags).contains(GetRequestFlags::DUMP)
-    {
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
-    }
-    let mut response = Vec::new();
-    finish_response(request.header(), true, &mut response)?;
-    Ok(response)
 }
 
 pub(super) fn do_new_route(
@@ -441,39 +425,6 @@ fn validate_prefix_lengths(request: &RouteSegment) -> Result<(), SystemError> {
     Ok(())
 }
 
-fn dump_routes(
-    request: &RouteSegment,
-    netns: Arc<NetNamespace>,
-) -> Result<Vec<RouteNlSegment>, SystemError> {
-    // Linux applies rtmsg header/attribute dump filters only when the socket
-    // enabled NETLINK_GET_STRICT_CHK. DragonOS does not expose that opt-in yet,
-    // so its default dump path follows Linux's lenient mode and ignores them.
-    let family = request.body().family;
-    let entries = route::snapshot(&netns)?;
-    let route_count = entries
-        .iter()
-        .filter(|entry| family_matches(family, family_of_ip(entry.destination.address())))
-        .count();
-    let mut response = Vec::new();
-    response
-        .try_reserve(route_count.checked_add(1).ok_or(SystemError::ENOMEM)?)
-        .map_err(|_| SystemError::ENOMEM)?;
-    for entry in entries {
-        if family_matches(family, family_of_ip(entry.destination.address())) {
-            response.push(RouteNlSegment::NewRoute(route_to_segment(
-                request.header(),
-                CSegmentType::NEWROUTE,
-                entry,
-                RouteFlags::empty(),
-                false,
-                0,
-            )?));
-        }
-    }
-    finish_response(request.header(), true, &mut response)?;
-    Ok(response)
-}
-
 fn lookup_route(
     request: &RouteSegment,
     netns: Arc<NetNamespace>,
@@ -597,7 +548,7 @@ fn notify_route_with_flags(
     );
 }
 
-fn route_to_segment(
+pub(super) fn route_to_segment(
     request_header: &CMsgSegHdr,
     msg_type: CSegmentType,
     route: RouteEntry,
@@ -672,10 +623,6 @@ impl FallibleRouteAttrs {
     fn into_inner(self) -> Vec<RouteAttr> {
         self.0
     }
-}
-
-fn family_matches(requested: AddressFamily, actual: AddressFamily) -> bool {
-    requested == AddressFamily::Unspecified || requested == actual
 }
 
 fn family_of_ip(ip: IpAddress) -> AddressFamily {

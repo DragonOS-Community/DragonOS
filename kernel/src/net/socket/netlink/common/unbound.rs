@@ -7,7 +7,7 @@ use crate::{
         netlink::{
             addr::{multicast::GroupIdSet, NetlinkSocketAddr},
             common::bound::BoundNetlink,
-            receiver::MessageReceiver,
+            receiver::{MessageQueue, MessageReceiver},
             table::SupportedNetlinkProtocol,
         },
         utils::datagram_common,
@@ -24,6 +24,7 @@ pub struct UnboundNetlink<P: SupportedNetlinkProtocol> {
     epoll_items: Arc<EPollItems>,
     fasync_items: Arc<FAsyncItems>,
     opener_cred: Arc<Cred>,
+    message_queue: MessageQueue<P::Message>,
     phantom: PhantomData<BoundNetlink<P>>,
 }
 
@@ -32,12 +33,14 @@ impl<P: SupportedNetlinkProtocol> UnboundNetlink<P> {
         epoll_items: Arc<EPollItems>,
         fasync_items: Arc<FAsyncItems>,
         opener_cred: Arc<Cred>,
+        message_queue: MessageQueue<P::Message>,
     ) -> Self {
         Self {
             groups: GroupIdSet::new_empty(),
             epoll_items,
             fasync_items,
             opener_cred,
+            message_queue,
             phantom: PhantomData,
         }
     }
@@ -65,7 +68,7 @@ impl<P: SupportedNetlinkProtocol> datagram_common::Unbound for UnboundNetlink<P>
         wait_queue: Arc<WaitQueue>,
         netns: Arc<NetNamespace>,
     ) -> Result<BoundNetlink<P>, SystemError> {
-        let message_queue = P::new_message_queue();
+        let message_queue = self.message_queue.clone();
         let bound_handle = {
             let endpoint = {
                 let mut endpoint = *endpoint;
@@ -95,7 +98,7 @@ impl<P: SupportedNetlinkProtocol> datagram_common::Unbound for UnboundNetlink<P>
         wait_queue: Arc<WaitQueue>,
         netns: Arc<NetNamespace>,
     ) -> Result<BoundNetlink<P>, SystemError> {
-        let message_queue = P::new_message_queue();
+        let message_queue = self.message_queue.clone();
 
         let bound_handle = {
             let endpoint = {

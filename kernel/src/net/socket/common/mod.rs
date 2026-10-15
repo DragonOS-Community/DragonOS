@@ -10,7 +10,8 @@ pub use getsockopt::{
 };
 pub use shutdown::{ShutdownBit, ShutdownState};
 pub use sockbuf::{
-    parse_socket_buffer_size, SOCK_MIN_RCVBUF, SOCK_MIN_SNDBUF, SYSCTL_RMEM_MAX, SYSCTL_WMEM_MAX,
+    parse_socket_buffer_size, parse_socket_buffer_size_force, SOCK_MIN_RCVBUF, SOCK_MIN_SNDBUF,
+    SYSCTL_RMEM_MAX, SYSCTL_WMEM_MAX,
 };
 pub use timeval::{
     parse_timeval_opt, parse_timeval_ticks, write_timeval_opt, write_timeval_ticks,

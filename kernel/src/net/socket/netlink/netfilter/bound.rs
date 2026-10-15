@@ -66,40 +66,7 @@ impl Bound for BoundNetlink<NetlinkNetfilterProtocol> {
         writer: &mut [u8],
         flags: PMSG,
     ) -> Result<(usize, usize, Self::Endpoint), SystemError> {
-        if flags.contains(PMSG::OOB) {
-            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
-        }
-        if let Some(error) = self.receive_queue.take_error() {
-            return Err(error);
-        }
-        if self.receive_queue.0.lock().is_empty() {
-            self.protocol_state.drive_if_queue_empty(
-                &self.receive_queue,
-                self.handle.port(),
-                &self.netns,
-            );
-            if let Some(error) = self.receive_queue.take_error() {
-                return Err(error);
-            }
-        }
-        let mut queue = self.receive_queue.0.lock();
-        let message = queue.front().ok_or(SystemError::EAGAIN_OR_EWOULDBLOCK)?;
-        let original = message.0.len();
-        let copied = original.min(writer.len());
-        writer[..copied].copy_from_slice(&message.0[..copied]);
-        if !flags.contains(PMSG::PEEK) {
-            self.receive_queue.pop_front_locked(&mut queue);
-            drop(queue);
-            self.receive_queue.recover_if_empty();
-            if self.receive_queue.0.lock().is_empty() {
-                self.protocol_state.drive_if_queue_empty(
-                    &self.receive_queue,
-                    self.handle.port(),
-                    &self.netns,
-                );
-            }
-        }
-        Ok((copied, original, NetlinkSocketAddr::new_unspecified()))
+        self.try_recv_common(writer, flags)
     }
 
     fn check_io_events(&self) -> EPollEventType {

@@ -14,28 +14,43 @@ use crate::{
 use alloc::vec::Vec;
 use system_error::SystemError;
 
-fn send_kobject_message(
-    message: KobjectUeventMessage,
-    sent_len: usize,
-    to: &NetlinkSocketAddr,
+pub(in crate::net::socket::netlink) fn send_userspace(
+    bytes: Vec<u8>,
+    to: NetlinkSocketAddr,
     netns: alloc::sync::Arc<crate::process::namespace::net_namespace::NetNamespace>,
+    nonblocking: bool,
+    timeout: Option<crate::time::Duration>,
 ) -> Result<usize, SystemError> {
+    let sent_len = bytes.len();
+    let message = KobjectUeventMessage::try_from_vec(bytes)?;
     if to.port() != 0 {
-        <NetlinkKobjectUeventProtocol as SupportedNetlinkProtocol>::unicast(
-            to.port(),
-            message.clone(),
-            netns.clone(),
-        )?;
+        let started = crate::time::Instant::now();
+        loop {
+            // Pin while attaching/waiting, not while holding the port table.
+            // Linux netlink_unicast repeats lookup after attachskb wakes. A
+            // replacement port may therefore accept the retried datagram.
+            let receiver = NetlinkKobjectUeventProtocol::receiver(to.port(), netns.clone())?;
+            let remaining = timeout.map(|budget| {
+                crate::time::Duration::from_micros(
+                    budget.total_micros().saturating_sub(
+                        crate::time::Instant::now()
+                            .saturating_sub(started)
+                            .total_micros(),
+                    ),
+                )
+            });
+            match receiver.enqueue_user(message.clone(), nonblocking, remaining) {
+                Err(SystemError::ECONNREFUSED) => continue,
+                result => {
+                    result?;
+                    break;
+                }
+            }
+        }
     }
-
     if !to.groups().is_empty() {
-        <NetlinkKobjectUeventProtocol as SupportedNetlinkProtocol>::multicast(
-            to.groups(),
-            message,
-            netns,
-        )?;
+        NetlinkKobjectUeventProtocol::multicast(to.groups(), message, netns)?;
     }
-
     Ok(sent_len)
 }
 
@@ -65,9 +80,12 @@ impl datagram_common::Bound for BoundNetlink<NetlinkKobjectUeventProtocol> {
         _flags: PMSG,
         _destination_is_explicit: bool,
     ) -> Result<usize, SystemError> {
-        let sent_len = buf.len();
-        let message = KobjectUeventMessage::try_new(buf)?;
-        send_kobject_message(message, sent_len, to, self.netns())
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(buf.len())
+            .map_err(|_| SystemError::ENOMEM)?;
+        bytes.extend_from_slice(buf);
+        send_userspace(bytes, *to, self.netns(), true, None)
     }
 
     fn try_send_vec(
@@ -77,9 +95,7 @@ impl datagram_common::Bound for BoundNetlink<NetlinkKobjectUeventProtocol> {
         _flags: PMSG,
         _destination_is_explicit: bool,
     ) -> Result<usize, SystemError> {
-        let sent_len = buf.len();
-        let message = KobjectUeventMessage::from_vec(buf);
-        send_kobject_message(message, sent_len, to, self.netns())
+        send_userspace(buf, *to, self.netns(), true, None)
     }
 
     fn try_recv(
@@ -87,22 +103,7 @@ impl datagram_common::Bound for BoundNetlink<NetlinkKobjectUeventProtocol> {
         writer: &mut [u8],
         flags: PMSG,
     ) -> Result<(usize, usize, Self::Endpoint), SystemError> {
-        let mut receive_queue = self.receive_queue.0.lock();
-        let Some(message) = receive_queue.front() else {
-            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-        };
-
-        let orig_len = message.as_bytes().len();
-        let copied = writer.len().min(orig_len);
-        if copied > 0 {
-            writer[..copied].copy_from_slice(&message.as_bytes()[..copied]);
-        }
-
-        if !flags.contains(PMSG::PEEK) {
-            receive_queue.pop_front();
-        }
-
-        Ok((copied, orig_len, NetlinkSocketAddr::new_unspecified()))
+        self.try_recv_common(writer, flags)
     }
 
     fn check_io_events(&self) -> EPollEventType {

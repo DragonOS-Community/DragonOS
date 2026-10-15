@@ -41,8 +41,6 @@ use system_error::SystemError;
 
 pub(super) type NetlinkNetfilterSocket = NetlinkSocket<NetlinkNetfilterProtocol>;
 
-const RECEIVE_BUDGET: usize = 212_992;
-const MAX_DATAGRAM: usize = RECEIVE_BUDGET - 32;
 const HEADER_LEN: usize = 16;
 const NFGEN_LEN: usize = 4;
 const BATCH_BEGIN: u16 = 16;
@@ -142,7 +140,9 @@ impl MulticastMessage for NetfilterMessage {}
 
 impl NetfilterMessage {
     fn charge(&self) -> usize {
-        self.0.capacity().max(1)
+        self.0
+            .capacity()
+            .saturating_add(super::receiver::MESSAGE_OVERHEAD)
     }
 }
 
@@ -158,6 +158,17 @@ impl SupportedNetlinkProtocol for NetlinkNetfilterProtocol {
     type Message = NetfilterMessage;
     type SocketState = NftSocketState;
 
+    fn message_bytes(message: &Self::Message) -> &[u8] {
+        &message.0
+    }
+    fn drive_receive(bound: &crate::net::socket::netlink::common::bound::BoundNetlink<Self>) {
+        bound.protocol_state.drive_if_queue_empty(
+            &bound.receive_queue,
+            bound.handle.port(),
+            &bound.netns,
+        );
+    }
+
     fn multicast_group_count() -> u32 {
         32
     }
@@ -167,15 +178,7 @@ impl SupportedNetlinkProtocol for NetlinkNetfilterProtocol {
     }
 
     fn new_message_queue() -> MessageQueue<Self::Message> {
-        MessageQueue::with_limits(128, RECEIVE_BUDGET, NetfilterMessage::charge)
-    }
-
-    fn max_send_len() -> Option<usize> {
-        Some(MAX_DATAGRAM)
-    }
-
-    fn max_recv_len() -> Option<usize> {
-        Some(RECEIVE_BUDGET)
+        MessageQueue::new(NetfilterMessage::charge)
     }
 
     fn check_bind(addr: &NetlinkSocketAddr, netns: &Arc<NetNamespace>) -> Result<(), SystemError> {

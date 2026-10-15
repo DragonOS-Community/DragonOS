@@ -39,6 +39,10 @@ impl KobjectUeventMessage {
     pub fn as_bytes(&self) -> &[u8] {
         self.bytes.as_ref()
     }
+
+    pub fn queue_charge(&self) -> usize {
+        self.bytes.capacity().saturating_add(512)
+    }
 }
 
 impl MulticastMessage for KobjectUeventMessage {}

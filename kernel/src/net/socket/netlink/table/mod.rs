@@ -20,6 +20,7 @@ use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::fmt::Debug;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::any::Any;
 use hashbrown::HashMap;
 use system_error::SystemError;
@@ -103,69 +104,27 @@ impl<Message: 'static + Debug> ProtocolSocketTable<Message> {
         Ok(BoundHandle::new(socket_table, port, addr.groups()))
     }
 
-    fn unicast(&self, dst_port: u32, message: Message) -> Result<(), SystemError> {
-        let Some(receiver) = self.unicast_sockets.get(&dst_port) else {
-            log::warn!(
-                "netlink unicast: destination port {} is not bound",
-                dst_port
-            );
-            return Err(SystemError::ECONNREFUSED);
-        };
-        receiver.enqueue_message(message)
-    }
-
-    fn multicast(&self, dst_groups: GroupIdSet, message: Message) -> Result<(), SystemError>
-    where
-        Message: MulticastMessage,
-    {
+    fn group_receivers(
+        &self,
+        dst_groups: GroupIdSet,
+        excluded_port: Option<u32>,
+    ) -> Result<Vec<MessageReceiver<Message>>, SystemError> {
+        let mut receivers = Vec::new();
         for group_id in dst_groups.ids_iter() {
             let Some(group) = self.multicast_groups.get(group_id as usize) else {
                 continue;
             };
             for member in group.members() {
+                if Some(*member) == excluded_port {
+                    continue;
+                }
                 if let Some(receiver) = self.unicast_sockets.get(member) {
-                    receiver.enqueue_message(message.clone())?;
+                    receivers.try_reserve(1).map_err(|_| SystemError::ENOMEM)?;
+                    receivers.push(receiver.clone());
                 }
             }
         }
-        Ok(())
-    }
-
-    /// Kernel notifications are best-effort per subscriber. A full queue has
-    /// already recorded ENOBUFS on that receiver and must not starve peers.
-    pub(super) fn notify_group(&self, group_id: u32, excluded_port: u32, message: Message)
-    where
-        Message: MulticastMessage,
-    {
-        let Some(index) = group_id.checked_sub(1) else {
-            return;
-        };
-        let Some(group) = self.multicast_groups.get(index as usize) else {
-            return;
-        };
-        for port in group.members() {
-            if *port != excluded_port {
-                if let Some(receiver) = self.unicast_sockets.get(port) {
-                    let _ = receiver.enqueue_message(message.clone());
-                }
-            }
-        }
-    }
-
-    fn report_group_overrun(&self, group_id: u32, excluded_port: u32) {
-        let Some(index) = group_id.checked_sub(1) else {
-            return;
-        };
-        let Some(group) = self.multicast_groups.get(index as usize) else {
-            return;
-        };
-        for port in group.members() {
-            if *port != excluded_port {
-                if let Some(receiver) = self.unicast_sockets.get(port) {
-                    receiver.report_overrun();
-                }
-            }
-        }
+        Ok(receivers)
     }
 
     fn has_group_listeners(&self, group_id: u32) -> bool {
@@ -257,21 +216,37 @@ impl<Message: 'static + Debug> Drop for BoundHandle<Message> {
 }
 
 pub trait SupportedNetlinkProtocol: Debug {
-    type Message: 'static + Send + Debug;
+    type Message: 'static + Send + Debug + Clone;
     type SocketState: Default + Debug + Send + Sync;
 
     fn multicast_group_count() -> u32;
 
-    fn new_message_queue() -> MessageQueue<Self::Message> {
-        MessageQueue::new()
+    fn new_message_queue() -> MessageQueue<Self::Message>;
+
+    fn message_bytes(message: &Self::Message) -> &[u8];
+
+    fn message_source(_message: &Self::Message) -> NetlinkSocketAddr {
+        NetlinkSocketAddr::new_unspecified()
     }
 
-    fn max_send_len() -> Option<usize> {
-        None
+    fn drive_receive(_bound: &crate::net::socket::netlink::common::bound::BoundNetlink<Self>)
+    where
+        Self: Sized,
+    {
     }
 
-    fn max_recv_len() -> Option<usize> {
-        None
+    fn userspace_send_supported() -> bool {
+        false
+    }
+
+    fn send_userspace(
+        _buf: Vec<u8>,
+        _to: NetlinkSocketAddr,
+        _netns: Arc<NetNamespace>,
+        _nonblocking: bool,
+        _timeout: Option<crate::time::Duration>,
+    ) -> Result<usize, SystemError> {
+        Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
     }
 
     fn check_bind(
@@ -316,13 +291,32 @@ pub trait SupportedNetlinkProtocol: Debug {
         message: Self::Message,
         netns: Arc<NetNamespace>,
     ) -> Result<(), SystemError> {
-        Self::socket_table(netns).read().unicast(dst_port, message)
+        Self::receiver(dst_port, netns)?.enqueue_message(message)
+    }
+
+    fn receiver(
+        dst_port: u32,
+        netns: Arc<NetNamespace>,
+    ) -> Result<MessageReceiver<Self::Message>, SystemError> {
+        Self::socket_table(netns)
+            .read()
+            .unicast_sockets
+            .get(&dst_port)
+            .filter(|receiver| !receiver.is_closed())
+            .cloned()
+            .ok_or(SystemError::ECONNREFUSED)
+    }
+
+    fn enqueue_dump(
+        dst_port: u32,
+        message: Self::Message,
+        netns: Arc<NetNamespace>,
+    ) -> Result<(), SystemError> {
+        Self::receiver(dst_port, netns)?.enqueue_dump(message)
     }
 
     fn report_overrun(dst_port: u32, netns: Arc<NetNamespace>) {
-        let table = Self::socket_table(netns);
-        let table = table.read();
-        if let Some(receiver) = table.unicast_sockets.get(&dst_port) {
+        if let Ok(receiver) = Self::receiver(dst_port, netns) {
             receiver.report_overrun();
         }
     }
@@ -335,15 +329,33 @@ pub trait SupportedNetlinkProtocol: Debug {
     ) where
         Self::Message: MulticastMessage,
     {
-        Self::socket_table(netns)
+        let Some(index) = group_id.checked_sub(1).filter(|index| *index < MAX_GROUPS) else {
+            return;
+        };
+        let table = Self::socket_table(netns);
+        let receivers = table
             .read()
-            .notify_group(group_id, excluded_port, message);
+            .group_receivers(GroupIdSet::new_u64(1u64 << index), Some(excluded_port));
+        if let Ok(receivers) = receivers {
+            for receiver in receivers {
+                let _ = receiver.enqueue_message(message.clone());
+            }
+        }
     }
 
     fn report_group_overrun(group_id: u32, excluded_port: u32, netns: Arc<NetNamespace>) {
-        Self::socket_table(netns)
+        let Some(index) = group_id.checked_sub(1).filter(|index| *index < MAX_GROUPS) else {
+            return;
+        };
+        let table = Self::socket_table(netns);
+        let receivers = table
             .read()
-            .report_group_overrun(group_id, excluded_port);
+            .group_receivers(GroupIdSet::new_u64(1u64 << index), Some(excluded_port));
+        if let Ok(receivers) = receivers {
+            for receiver in receivers {
+                receiver.report_overrun();
+            }
+        }
     }
 
     fn has_group_listeners(group_id: u32, netns: Arc<NetNamespace>) -> bool {
@@ -362,9 +374,15 @@ pub trait SupportedNetlinkProtocol: Debug {
     where
         Self::Message: MulticastMessage,
     {
-        Self::socket_table(netns)
-            .read()
-            .multicast(dst_groups, message)
+        let table = Self::socket_table(netns);
+        let receivers = table.read().group_receivers(dst_groups, None)?;
+        let mut result = Ok(());
+        for receiver in receivers {
+            if let Err(error) = receiver.enqueue_message(message.clone()) {
+                result = Err(error);
+            }
+        }
+        result
     }
 }
 
@@ -373,18 +391,28 @@ pub struct NetlinkRouteProtocol;
 
 impl SupportedNetlinkProtocol for NetlinkRouteProtocol {
     type Message = RouteNlPacket;
-    type SocketState = ();
+    type SocketState = crate::net::socket::netlink::route::dump::RouteSocketState;
+
+    fn message_bytes(message: &Self::Message) -> &[u8] {
+        message.as_bytes()
+    }
+    fn message_source(message: &Self::Message) -> NetlinkSocketAddr {
+        message.source()
+    }
+    fn drive_receive(bound: &crate::net::socket::netlink::common::bound::BoundNetlink<Self>) {
+        bound.protocol_state.drive_if_queue_empty(
+            &bound.receive_queue,
+            bound.handle.port(),
+            &bound.netns,
+        );
+    }
 
     fn multicast_group_count() -> u32 {
         33
     }
 
     fn new_message_queue() -> MessageQueue<Self::Message> {
-        MessageQueue::with_limits(usize::MAX, 256 * 1024, RouteNlPacket::queue_charge)
-    }
-
-    fn max_send_len() -> Option<usize> {
-        Some(256 * 1024)
+        MessageQueue::new(RouteNlPacket::queue_charge)
     }
 
     fn check_connect(
@@ -434,6 +462,28 @@ pub struct NetlinkNetfilterProtocol;
 impl SupportedNetlinkProtocol for NetlinkKobjectUeventProtocol {
     type Message = KobjectUeventMessage;
     type SocketState = ();
+
+    fn message_bytes(message: &Self::Message) -> &[u8] {
+        message.as_bytes()
+    }
+
+    fn new_message_queue() -> MessageQueue<Self::Message> {
+        MessageQueue::new(KobjectUeventMessage::queue_charge)
+    }
+
+    fn userspace_send_supported() -> bool {
+        true
+    }
+
+    fn send_userspace(
+        buf: Vec<u8>,
+        to: NetlinkSocketAddr,
+        netns: Arc<NetNamespace>,
+        nonblocking: bool,
+        timeout: Option<crate::time::Duration>,
+    ) -> Result<usize, SystemError> {
+        crate::net::socket::netlink::kobject::send_userspace(buf, to, netns, nonblocking, timeout)
+    }
 
     fn multicast_group_count() -> u32 {
         1

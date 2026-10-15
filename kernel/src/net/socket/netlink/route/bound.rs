@@ -82,9 +82,7 @@ impl datagram_common::Bound for BoundNetlink<NetlinkRouteProtocol> {
             let group_id = group_index + 1;
             let source = NetlinkSocketAddr::new(local_port, GroupIdSet::new(group_mask));
             let packet = RouteNlPacket::user(user_bytes.as_ref().unwrap().clone(), source);
-            NetlinkRouteProtocol::socket_table(netns.clone())
-                .read()
-                .notify_group(group_id, local_port, packet);
+            NetlinkRouteProtocol::notify_group(group_id, local_port, packet, netns.clone());
         }
 
         let context = RtnlRequestContext::new(
@@ -200,7 +198,12 @@ impl datagram_common::Bound for BoundNetlink<NetlinkRouteProtocol> {
                 }
             }
 
-            route_kernel_socket.request(&nlmsg, &context);
+            route_kernel_socket.request(
+                &nlmsg,
+                &context,
+                &self.protocol_state,
+                &self.receive_queue,
+            );
 
             // gVisor 测例常以 sizeof(req) 发送，nlmsg_len 之后多为结构体尾部零填充，勿当作下一条消息。
             if offset < buf.len() && buf[offset..].iter().all(|&b| b == 0) {
@@ -216,37 +219,7 @@ impl datagram_common::Bound for BoundNetlink<NetlinkRouteProtocol> {
         writer: &mut [u8],
         flags: crate::net::socket::PMSG,
     ) -> Result<(usize, usize, Self::Endpoint), SystemError> {
-        if let Some(error) = self.receive_queue.take_error() {
-            self.receive_queue.recover_if_empty();
-            return Err(error);
-        }
-        let mut receive_queue = self.receive_queue.0.lock();
-
-        let Some(res) = receive_queue.front() else {
-            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-        };
-
-        let orig_len = res.total_len();
-        let copied = if writer.len() >= orig_len {
-            res.write_to(writer)?
-        } else {
-            let mut full = alloc::vec![0u8; orig_len];
-            let written = res.write_to(&mut full)?;
-            let copy_len = written.min(writer.len());
-            if copy_len > 0 {
-                writer[..copy_len].copy_from_slice(&full[..copy_len]);
-            }
-            copy_len
-        };
-
-        let remote = res.source();
-        if !flags.contains(PMSG::PEEK) {
-            self.receive_queue.pop_front_locked(&mut receive_queue);
-            drop(receive_queue);
-            self.receive_queue.recover_if_empty();
-        }
-
-        Ok((copied, orig_len, remote))
+        self.try_recv_common(writer, flags)
     }
 
     fn check_io_events(&self) -> EPollEventType {
@@ -281,11 +254,5 @@ fn send_route_ack(
 
     let err_segment = ErrorSegment::new_from_request(request_header, error);
     let err_msg = RouteNlMessage::new(vec![RouteNlSegment::Error(err_segment)]);
-    if let Err(e) = NetlinkRouteProtocol::unicast(dst_port, RouteNlPacket::kernel(err_msg), netns) {
-        log::warn!(
-            "netlink route: failed to deliver ack to port {}: {:?}",
-            dst_port,
-            e
-        );
-    }
+    super::kern::deliver_response(dst_port, err_msg, netns);
 }

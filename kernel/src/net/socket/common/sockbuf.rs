@@ -24,3 +24,13 @@ pub fn parse_socket_buffer_size(
     let requested = requested.min(sysctl_max).min((i32::MAX as u32) / 2);
     Ok(requested.saturating_mul(2).max(minimum) as usize)
 }
+
+/// FORCE omits the sysctl ceiling, but Linux still clamps a signed negative
+/// hint to zero and limits doubling to the largest representable socket size.
+pub fn parse_socket_buffer_size_force(value: &[u8], minimum: u32) -> Result<usize, SystemError> {
+    if value.len() < core::mem::size_of::<i32>() {
+        return Err(SystemError::EINVAL);
+    }
+    let requested = i32::from_ne_bytes(value[..4].try_into().unwrap()).max(0) as u32;
+    parse_socket_buffer_size(&requested.to_ne_bytes(), (i32::MAX as u32) / 2, minimum)
+}

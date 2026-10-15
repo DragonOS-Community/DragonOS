@@ -277,6 +277,124 @@ TEST_F(Ipv6ScopeNetwork, FailedConnectRetainsScopeAndPerPacketScopeCanOverrideIt
         }
     }
 }
+TEST_F(Ipv6ScopeNetwork, FailedScopedConnectRejectsUnscopedReconnectWithRetainedDevice) {
+    for (int type : {SOCK_DGRAM, SOCK_STREAM, SOCK_RAW}) {
+        for (const char* text : {"::1", "::", "fd92::b"}) {
+            SCOPED_TRACE("type=" + std::to_string(type) + " destination=" + text);
+            FdGuard fd(socket(AF_INET6, type, type == SOCK_RAW ? 253 : 0));
+            ASSERT_GE(fd.Get(), 0);
+            auto missing = Address("fe80::92b", 0x7ffffffeU, type == SOCK_RAW ? 0 : 31201);
+            ASSERT_EQ(connect(fd.Get(), reinterpret_cast<sockaddr*>(&missing), sizeof(missing)), -1);
+            ASSERT_EQ(errno, ENETUNREACH);
+            auto destination = Address(text, 0, type == SOCK_RAW ? 0 : 31201);
+            EXPECT_EQ(connect(fd.Get(), reinterpret_cast<sockaddr*>(&destination), sizeof(destination)), -1);
+            EXPECT_EQ(errno, ENETUNREACH);
+            char name[IFNAMSIZ]{}; socklen_t size = sizeof(name);
+            EXPECT_EQ(getsockopt(fd.Get(), SOL_SOCKET, SO_BINDTODEVICE, name, &size), -1);
+            EXPECT_EQ(errno, ENODEV);
+        }
+    }
+}
+TEST_F(Ipv6ScopeNetwork, ConcurrentUdpScopedBindsPreserveSuccessfulCallScope) {
+    cpu_set_t allowed; CPU_ZERO(&allowed);
+    ASSERT_EQ(sched_getaffinity(0, sizeof(allowed), &allowed), 0);
+    int cpus[2] = {-1, -1};
+    for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+        if (!CPU_ISSET(cpu, &allowed)) continue;
+        if (cpus[0] == -1) cpus[0] = cpu;
+        else { cpus[1] = cpu; break; }
+    }
+    for (unsigned round = 0; round < 128; ++round) {
+        FdGuard fd(socket(AF_INET6, SOCK_DGRAM, 0)); ASSERT_GE(fd.Get(), 0);
+        auto first = Address("fe80::92a", a), second = Address("fe80::92a", c);
+        std::atomic<unsigned> ready{0}; std::atomic<bool> go{false};
+        int results[2]{}, errors[2]{};
+        auto attempt = [&](unsigned slot, sockaddr_in6 address) {
+            if (cpus[1] != -1) {
+                cpu_set_t selected; CPU_ZERO(&selected); CPU_SET(cpus[slot], &selected);
+                EXPECT_EQ(pthread_setaffinity_np(pthread_self(), sizeof(selected), &selected), 0);
+            }
+            ready.fetch_add(1);
+            while (!go.load()) std::this_thread::yield();
+            results[slot] = bind(fd.Get(), reinterpret_cast<sockaddr*>(&address), sizeof(address));
+            errors[slot] = errno;
+        };
+        std::thread left(attempt, 0, first), right(attempt, 1, second);
+        while (ready.load() != 2) std::this_thread::yield();
+        go.store(true); left.join(); right.join();
+        ASSERT_TRUE((results[0] == 0) != (results[1] == 0));
+        EXPECT_EQ(errors[results[0] == 0 ? 1 : 0], EINVAL);
+        sockaddr_in6 local{}; socklen_t size = sizeof(local);
+        ASSERT_EQ(getsockname(fd.Get(), reinterpret_cast<sockaddr*>(&local), &size), 0);
+        EXPECT_EQ(local.sin6_scope_id, results[0] == 0 ? a : c) << "round=" << round;
+    }
+}
+TEST_F(Ipv6ScopeNetwork, ConcurrentScopedBindAndConnectDoNotReplaceExplicitScope) {
+    for (int type : {SOCK_DGRAM, SOCK_RAW}) {
+        for (unsigned round = 0; round < 128; ++round) {
+            SCOPED_TRACE("type=" + std::to_string(type) + " round=" + std::to_string(round));
+            FdGuard fd(socket(AF_INET6, type, type == SOCK_RAW ? 253 : 0));
+            ASSERT_GE(fd.Get(), 0);
+            auto local = Address("fe80::92a", c);
+            auto peer = Address("fe80::92b", a, type == SOCK_RAW ? 0 : 31201);
+            std::atomic<unsigned> ready{0}; std::atomic<bool> go{false};
+            int results[2]{}, errors[2]{};
+            auto attempt = [&](unsigned slot) {
+                ready.fetch_add(1);
+                while (!go.load()) std::this_thread::yield();
+                results[slot] = slot == 0
+                    ? bind(fd.Get(), reinterpret_cast<sockaddr*>(&local), sizeof(local))
+                    : connect(fd.Get(), reinterpret_cast<sockaddr*>(&peer), sizeof(peer));
+                errors[slot] = errno;
+            };
+            std::thread left(attempt, 0), right(attempt, 1);
+            while (ready.load() != 2) std::this_thread::yield();
+            go.store(true); left.join(); right.join();
+            ASSERT_TRUE((results[0] == 0) != (results[1] == 0))
+                << "bind=" << results[0] << "/" << errors[0]
+                << " connect=" << results[1] << "/" << errors[1];
+            EXPECT_EQ(errors[results[0] == 0 ? 1 : 0], EINVAL);
+            sockaddr_in6 actual{}; socklen_t size = sizeof(actual);
+            ASSERT_EQ(getsockname(fd.Get(), reinterpret_cast<sockaddr*>(&actual), &size), 0);
+            EXPECT_EQ(actual.sin6_scope_id, results[0] == 0 ? c : a);
+        }
+    }
+}
+TEST_F(Ipv6ScopeNetwork, RawFailedUnscopedReconnectPreservesConcreteSourceAndPeer) {
+    FdGuard fd(Bound(SOCK_RAW, "fe80::92a", a));
+    auto peer = Address("fe80::92b", a);
+    ASSERT_EQ(connect(fd.Get(), reinterpret_cast<sockaddr*>(&peer), sizeof(peer)), 0);
+    auto unreachable = Address("2001:db8::92", 0);
+    EXPECT_EQ(connect(fd.Get(), reinterpret_cast<sockaddr*>(&unreachable), sizeof(unreachable)), -1);
+    EXPECT_EQ(errno, ENETUNREACH);
+    // RAW getpeername is ENOTCONN on Linux even after connect. Verify the
+    // retained receive peer using actual traffic instead of querying it.
+    sockaddr_in6 actual{}; socklen_t size = sizeof(actual);
+    FdGuard sender(Bound(SOCK_RAW, "fe80::92b", b));
+    auto destination = Address("fe80::92a", b);
+    ASSERT_EQ(sendto(sender.Get(), "S", 1, 0, reinterpret_cast<sockaddr*>(&destination), sizeof(destination)), 1);
+    pollfd ready{fd.Get(), POLLIN, 0}; ASSERT_EQ(poll(&ready, 1, 2000), 1);
+    char byte = 0; ASSERT_EQ(recv(fd.Get(), &byte, 1, 0), 1); EXPECT_EQ(byte, 'S');
+    size = sizeof(actual);
+    ASSERT_EQ(getsockname(fd.Get(), reinterpret_cast<sockaddr*>(&actual), &size), 0);
+    auto source = Address("fe80::92a", a);
+    EXPECT_EQ(memcmp(&actual.sin6_addr, &source.sin6_addr, sizeof(in6_addr)), 0);
+    EXPECT_EQ(actual.sin6_scope_id, a);
+}
+TEST_F(Ipv6ScopeNetwork, RawUnspecifiedConnectSelectsLoopbackAndIgnoresScope) {
+    for (bool bound : {false, true}) {
+        FdGuard fd(bound ? Bound(SOCK_RAW, "::1", 0) : socket(AF_INET6, SOCK_RAW, 253));
+        ASSERT_GE(fd.Get(), 0);
+        auto destination = Address("::", 0x7ffffffeU);
+        ASSERT_EQ(connect(fd.Get(), reinterpret_cast<sockaddr*>(&destination), sizeof(destination)), 0);
+        sockaddr_in6 local{}; socklen_t size = sizeof(local);
+        ASSERT_EQ(getsockname(fd.Get(), reinterpret_cast<sockaddr*>(&local), &size), 0);
+        EXPECT_TRUE(IN6_IS_ADDR_LOOPBACK(&local.sin6_addr)); EXPECT_EQ(local.sin6_scope_id, 0U);
+        ASSERT_EQ(send(fd.Get(), "S", 1, 0), 1);
+        pollfd ready{fd.Get(), POLLIN, 0}; ASSERT_EQ(poll(&ready, 1, 2000), 1);
+        char byte = 0; ASSERT_EQ(recv(fd.Get(), &byte, 1, 0), 1); EXPECT_EQ(byte, 'S');
+    }
+}
 TEST_F(Ipv6ScopeNetwork, UdpConnectNamesAndDisconnectClearScope) {
     FdGuard first(Bound(SOCK_DGRAM, "fe80::92b", b, 31098));
     FdGuard second(Bound(SOCK_DGRAM, "fe80::92b", d, 31098));

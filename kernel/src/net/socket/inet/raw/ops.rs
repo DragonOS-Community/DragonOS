@@ -76,10 +76,8 @@ impl crate::net::socket::Socket for RawSocket {
             if !self.addr_matches_ip_version(remote.addr) {
                 return Err(SystemError::EAFNOSUPPORT);
             }
-            if crate::net::socket::endpoint::needs_scope_id(remote.addr) {
-                self.device_binding
-                    .prepare_scope_connect(remote.scope_id, 0)?
-                    .commit();
+            if matches!(remote.addr, IpAddress::Ipv6(_)) {
+                return self.connect_ipv6(remote);
             }
 
             // Linux 语义：connect(2) 会为本端选择一个具体的可路由地址，
@@ -90,35 +88,10 @@ impl crate::net::socket::Socket for RawSocket {
                     .is_none_or(|address| address.is_unspecified()),
                 _ => true,
             };
-            let scoped_route = if crate::net::socket::endpoint::needs_scope_id(remote.addr) {
-                let device = self
-                    .device_binding
-                    .resolve_iface(&self.netns)
-                    .map_err(super::super::common::ipv6_connect_error)?;
-                let fixed_source = match self.inner.read().as_ref() {
-                    Some(RawInner::Bound(bound) | RawInner::Wildcard(bound)) => bound
-                        .local_addr()
-                        .filter(|address| !address.is_unspecified() && !address.is_multicast()),
-                    _ => None,
-                };
-                Some(crate::net::route::resolve_ipv6_send_route(
-                    &self.netns,
-                    remote.addr,
-                    device.map(|iface| iface.nic_id() as u32),
-                    fixed_source,
-                )?)
-            } else {
-                None
-            };
-
             // Select and publish a source for an any binding. The same route
             // path handles loopback; this is not a second explicit bind.
             if need_local {
-                if let Some(route) = scoped_route {
-                    self.bind_attachment(route.source_owner, route.source.into(), true)?;
-                } else {
-                    self.bind_ephemeral(remote.addr)?;
-                }
+                self.bind_ephemeral(remote.addr)?;
             }
             let guard = self.inner.read();
             return match guard.as_ref() {

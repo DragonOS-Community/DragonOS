@@ -541,16 +541,28 @@ impl UdpSocket {
         if self.ip_version == IpVersion::Ipv4 && matches!(endpoint.addr, Ipv6(_)) {
             return Err(SystemError::EAFNOSUPPORT);
         }
-        if crate::net::socket::endpoint::needs_scope_id(address.addr) {
-            let mut update = self.device_binding.prepare_scope_bind(address.scope_id)?;
-            let _placement = self.iface_placement.write();
-            match self.inner.read().as_ref() {
-                Some(UdpInner::Unbound(_)) => {}
-                None => return Err(SystemError::EBADF),
-                _ => return Err(SystemError::EINVAL),
+        let scope =
+            crate::net::socket::endpoint::needs_scope_id(address.addr).then_some(address.scope_id);
+        let bind_iface = |index| {
+            let device = if index == 0 {
+                None
+            } else {
+                Some(
+                    self.netns
+                        .device_list()
+                        .get(&index)
+                        .cloned()
+                        .ok_or(SystemError::ENODEV)?,
+                )
+            };
+            if device.is_some()
+                && !endpoint.addr.is_unspecified()
+                && super::common::get_iface_for_local_bind(&endpoint.addr, &self.netns).is_none()
+            {
+                return Err(SystemError::EADDRNOTAVAIL);
             }
-            update.commit();
-        }
+            super::common::explicit_bind_iface(endpoint.addr, &self.netns, device)
+        };
         loop {
             {
                 let inner = self.inner.read();
@@ -560,37 +572,51 @@ impl UdpSocket {
                     Some(UdpInner::Unbound(_)) => {}
                 }
             }
-            let device = self.device_binding.resolve_iface(&self.netns)?;
-            if device.is_some()
-                && !endpoint.addr.is_unspecified()
-                && super::common::get_iface_for_local_bind(&endpoint.addr, &self.netns).is_none()
-            {
-                return Err(SystemError::EADDRNOTAVAIL);
-            }
-            let iface = super::common::explicit_bind_iface(endpoint.addr, &self.netns, device)?;
-            let mut prepared = self.prepare_iface_socket(iface.clone())?;
-            let placement = self.iface_placement.write();
+            let candidate = scope
+                .filter(|index| *index != 0)
+                .map_or_else(|| self.device_binding.ifindex(), |index| index as usize);
+            let target = bind_iface(candidate);
+            let mut prepared = target
+                .as_ref()
+                .map_err(|error| error.clone())
+                .and_then(|iface| self.prepare_iface_socket(iface.clone()));
+            // Prepare/recover without socket guards. Keep all interface pins
+            // outside the short device -> placement -> state transaction too.
+            let current;
+            let mut update = scope
+                .map(|scope| self.device_binding.prepare_scope_bind(scope))
+                .transpose()?;
+            let _placement = self.iface_placement.write();
             let mut inner = self.inner.write();
             match inner.as_ref() {
                 None => return Err(SystemError::EBADF),
                 Some(UdpInner::Bound(_)) => return Err(SystemError::EINVAL),
                 Some(UdpInner::Unbound(_)) => {}
             }
-            let current = super::common::explicit_bind_iface(
-                endpoint.addr,
-                &self.netns,
-                self.device_binding.resolve_iface(&self.netns)?,
-            )?;
-            if !Arc::ptr_eq(&iface, &current) {
-                drop(inner);
-                drop(placement);
-                drop(prepared);
+            let effective = update.as_ref().map_or_else(
+                || self.device_binding.ifindex(),
+                |update| update.target_ifindex(),
+            );
+            if effective != candidate {
                 continue;
             }
+            if let Some(update) = update.as_mut() {
+                // State-race losers cannot change the winner's scope. Genuine
+                // address/device failures retain the accepted numeric scope.
+                update.commit();
+            }
+            current = bind_iface(effective)?;
+            if !target
+                .as_ref()
+                .is_ok_and(|initial| Arc::ptr_eq(initial, &current))
+            {
+                continue;
+            }
+            let prepared = prepared.as_mut().map_err(|error| error.clone())?;
             let Some(UdpInner::Unbound(unbound)) = inner.take() else {
                 unreachable!();
             };
-            match unbound.bind_prepared(endpoint, self.bind_context(), true, &mut prepared) {
+            match unbound.bind_prepared(endpoint, self.bind_context(), true, prepared) {
                 Ok(bound) => {
                     *inner = Some(UdpInner::Bound(bound));
                     return Ok(());

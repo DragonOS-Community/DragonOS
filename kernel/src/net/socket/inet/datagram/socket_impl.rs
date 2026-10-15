@@ -135,7 +135,7 @@ impl Socket for UdpSocket {
                 if self.ip_version == IpVersion::Ipv4 && matches!(remote.addr, Ipv6(_)) {
                     return Err(SystemError::EAFNOSUPPORT);
                 }
-                if crate::net::socket::endpoint::needs_scope_id(remote.addr) {
+                let requested_scope = if crate::net::socket::endpoint::needs_scope_id(remote.addr) {
                     let fallback = if remote.addr.is_multicast() {
                         self.ipv6_multicast_ifindex.load(Ordering::Acquire)
                     } else {
@@ -153,7 +153,10 @@ impl Socket for UdpSocket {
                     if let Some(UdpInner::Bound(bound)) = inner.as_ref() {
                         bound.update_receive_filter(self.bound_device_ifindex());
                     }
-                }
+                    Some((remote.scope_id, fallback))
+                } else {
+                    None
+                };
                 let remote = remote.wire();
                 let remote = Self::normalize_unspecified_dest(remote);
                 loop {
@@ -167,6 +170,14 @@ impl Socket for UdpSocket {
                             error
                         }
                     })?;
+                    // Autobind can race an explicit bind while preparing its
+                    // storage. Recheck the requested scope before publishing
+                    // the peer; never connect on the other bind's device.
+                    let mut update = requested_scope
+                        .map(|(scope, fallback)| {
+                            self.device_binding.prepare_scope_connect(scope, fallback)
+                        })
+                        .transpose()?;
                     let _placement = self.iface_placement.write();
                     let local = match self.inner.read().as_ref() {
                         Some(UdpInner::Bound(inner)) => inner.endpoint(),
@@ -175,6 +186,9 @@ impl Socket for UdpSocket {
                         Some(_) => continue,
                         None => return Err(SystemError::EBADF),
                     };
+                    if let Some(update) = update.as_mut() {
+                        update.commit();
+                    }
                     let (required_oif, multicast_source) =
                         output_flow::socket_constraints(self, remote.addr).map_err(|error| {
                             if matches!(remote.addr, Ipv6(_)) {

@@ -352,6 +352,103 @@ impl RawSocket {
         }
     }
 
+    pub(super) fn connect_ipv6(
+        &self,
+        mut remote: crate::net::socket::endpoint::InetEndpoint,
+    ) -> Result<(), SystemError> {
+        if remote.addr.is_unspecified() {
+            remote.addr = IpAddress::Ipv6(smoltcp::wire::Ipv6Address::LOCALHOST);
+        }
+        let scoped = crate::net::socket::endpoint::needs_scope_id(remote.addr);
+        let snapshot = |inner: &Option<RawInner>| {
+            let state = inner.as_ref().ok_or(SystemError::EINVAL)?;
+            let (local, peer) = match state {
+                RawInner::Unbound(_) => (None, None),
+                RawInner::Bound(bound) | RawInner::Wildcard(bound) => {
+                    (bound.local_addr(), bound.remote_addr())
+                }
+            };
+            Ok::<_, SystemError>((core::mem::discriminant(state), local, peer))
+        };
+        loop {
+            let observed = snapshot(&self.inner.read())?;
+            let candidate = if scoped {
+                self.device_binding
+                    .prepare_scope_connect(remote.scope_id, 0)?
+                    .target_ifindex()
+            } else {
+                self.device_binding.ifindex()
+            };
+            let resolve_route = || {
+                if candidate != 0 && !self.netns.device_list().contains_key(&candidate) {
+                    return Err(SystemError::ENETUNREACH);
+                }
+                crate::net::route::resolve_ipv6_send_route(
+                    &self.netns,
+                    remote.addr,
+                    (candidate != 0).then_some(candidate as u32),
+                    observed
+                        .1
+                        .filter(|address| !address.is_unspecified() && !address.is_multicast()),
+                )
+            };
+            let route = resolve_route();
+            let needs_source = observed.1.is_none_or(|address| address.is_unspecified());
+            let mut prepared = if needs_source {
+                Some(
+                    route
+                        .as_ref()
+                        .map_err(|error| error.clone())
+                        .and_then(|route| self.prepare_iface_socket(route.source_owner.clone())),
+                )
+            } else {
+                None
+            };
+            // All preparation/recovery and interface pins outlive the guards.
+            // A competing bind/connect must not split source and peer updates.
+            let mut retired = None;
+            let current;
+            let mut update = if scoped {
+                self.device_binding
+                    .prepare_scope_connect(remote.scope_id, 0)?
+            } else {
+                self.device_binding.prepare_current()
+            };
+            let mut inner = self.inner.write();
+            if snapshot(&inner)? != observed || update.target_ifindex() != candidate {
+                continue;
+            }
+            if scoped {
+                update.commit();
+            }
+            current = resolve_route()?;
+            if !route.as_ref().is_ok_and(|initial| {
+                initial.source == current.source
+                    && Arc::ptr_eq(&initial.source_owner, &current.source_owner)
+            }) {
+                continue;
+            }
+            if let Some(prepared) = prepared.as_mut() {
+                self.bind_prepared_attachment(
+                    &mut inner,
+                    prepared.as_mut().map_err(|error| error.clone())?,
+                    current.source.into(),
+                    true,
+                    &mut retired,
+                )?;
+            }
+            match inner.as_ref() {
+                Some(RawInner::Bound(bound) | RawInner::Wildcard(bound)) => {
+                    bound.connect(remote.addr)
+                }
+                _ => return Err(SystemError::EINVAL),
+            }
+            self.connected_port
+                .store(remote.port as u32, core::sync::atomic::Ordering::Release);
+            return Ok(());
+        }
+    }
+
     /// 绑定到临时地址（根据远程地址选择合适的本地地址）
     pub fn bind_ephemeral(&self, remote: smoltcp::wire::IpAddress) -> Result<(), SystemError> {
         if !self.addr_matches_ip_version(remote) {

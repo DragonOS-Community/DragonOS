@@ -171,6 +171,18 @@ impl SocketDeviceBinding {
         }
     }
 
+    /// Stabilize the existing device for a protocol transaction without
+    /// changing policy. Unlike a scoped address, an unscoped one permits 0.
+    pub(crate) fn prepare_current(&self) -> DeviceBindingUpdate<'_> {
+        let guard = self.update_lock.lock();
+        DeviceBindingUpdate {
+            binding: self,
+            _guard: guard,
+            target_ifindex: self.ifindex(),
+            target_iface: None,
+        }
+    }
+
     pub fn get(&self, netns: &Arc<NetNamespace>, value: &mut [u8]) -> Result<usize, SystemError> {
         let ifindex = self.ifindex();
         if ifindex == 0 {

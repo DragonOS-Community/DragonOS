@@ -9,7 +9,10 @@ impl UdpSocket {
                 endpoint.addr = Ipv6(addr.to_ipv6_mapped());
             }
         }
-        Endpoint::Ip(endpoint)
+        Endpoint::ip(
+            crate::net::socket::endpoint::InetEndpoint::from(endpoint)
+                .with_scope(self.bound_device_ifindex() as u32),
+        )
     }
 }
 
@@ -28,7 +31,7 @@ impl Socket for UdpSocket {
             // the original family through its protected user-buffer reader.
             if matches!(
                 SockAddr::to_endpoint_preserving_mapped(addr, addrlen)?,
-                Endpoint::Ip(IpEndpoint { addr: Ipv6(_), .. })
+                Endpoint::Ip(crate::net::socket::endpoint::InetEndpoint { addr: Ipv6(_), .. })
             ) {
                 return Err(SystemError::EAFNOSUPPORT);
             }
@@ -129,12 +132,41 @@ impl Socket for UdpSocket {
     fn connect(&self, endpoint: Endpoint) -> Result<(), SystemError> {
         match endpoint {
             Endpoint::Ip(remote) => {
+                if self.ip_version == IpVersion::Ipv4 && matches!(remote.addr, Ipv6(_)) {
+                    return Err(SystemError::EAFNOSUPPORT);
+                }
+                if crate::net::socket::endpoint::needs_scope_id(remote.addr) {
+                    let fallback = if remote.addr.is_multicast() {
+                        self.ipv6_multicast_ifindex.load(Ordering::Acquire)
+                    } else {
+                        0
+                    };
+                    let mut update = self
+                        .device_binding
+                        .prepare_scope_connect(remote.scope_id, fallback)?;
+                    let _placement = self.iface_placement.write();
+                    let inner = self.inner.read();
+                    if inner.is_none() {
+                        return Err(SystemError::EBADF);
+                    }
+                    update.commit();
+                    if let Some(UdpInner::Bound(bound)) = inner.as_ref() {
+                        bound.update_receive_filter(self.bound_device_ifindex());
+                    }
+                }
+                let remote = remote.wire();
                 let remote = Self::normalize_unspecified_dest(remote);
                 loop {
                     // Like inet_autobind before prot->connect, this stage owns
                     // its own placement transaction. Preparation/recovery must
                     // not run under the subsequent peer-publication lock.
-                    self.bind_ephemeral(remote.addr)?;
+                    self.bind_ephemeral(remote.addr).map_err(|error| {
+                        if matches!(remote.addr, Ipv6(_)) {
+                            super::super::common::ipv6_connect_error(error)
+                        } else {
+                            error
+                        }
+                    })?;
                     let _placement = self.iface_placement.write();
                     let local = match self.inner.read().as_ref() {
                         Some(UdpInner::Bound(inner)) => inner.endpoint(),
@@ -144,7 +176,13 @@ impl Socket for UdpSocket {
                         None => return Err(SystemError::EBADF),
                     };
                     let (required_oif, multicast_source) =
-                        output_flow::socket_constraints(self, remote.addr)?;
+                        output_flow::socket_constraints(self, remote.addr).map_err(|error| {
+                            if matches!(remote.addr, Ipv6(_)) {
+                                super::super::common::ipv6_connect_error(error)
+                            } else {
+                                error
+                            }
+                        })?;
                     let connected_source = match remote.addr {
                         Ipv4(_) => output_flow::resolve_ipv4_send_flow(
                             &self.netns,
@@ -353,7 +391,7 @@ impl Socket for UdpSocket {
             result.map(|(copy_len, endpoint, orig_len)| {
                 (
                     Self::recv_return_len(copy_len, orig_len, flags),
-                    Endpoint::Ip(endpoint),
+                    Endpoint::ip(endpoint),
                 )
             })
         } else {
@@ -366,7 +404,7 @@ impl Socket for UdpSocket {
                     Ok((copy_len, endpoint, orig_len)) => {
                         return Ok((
                             Self::recv_return_len(copy_len, orig_len, flags),
-                            Endpoint::Ip(endpoint),
+                            Endpoint::ip(endpoint),
                         ));
                     }
                     Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
@@ -375,7 +413,7 @@ impl Socket for UdpSocket {
                             // If connected, return EOF with remote endpoint
                             if let Some(UdpInner::Bound(bound)) = self.inner.read().as_ref() {
                                 if let Ok(remote) = bound.remote_endpoint() {
-                                    return Ok((0, Endpoint::Ip(remote)));
+                                    return Ok((0, self.name_endpoint(remote)));
                                 }
                             }
                             return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
@@ -616,7 +654,10 @@ impl Socket for UdpSocket {
         };
         let copy_len = received.copied;
         let orig_len = received.original_len;
-        let src_endpoint = Endpoint::Ip(received.source);
+        let src_endpoint = Endpoint::ip(
+            crate::net::socket::endpoint::InetEndpoint::from(received.source)
+                .with_scope(received.ifindex as u32),
+        );
 
         // log::debug!(
         //     "recv_msg: received {} bytes from {:?}",

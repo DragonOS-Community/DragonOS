@@ -10,6 +10,74 @@ use crate::{
 
 pub use smoltcp::wire::IpEndpoint;
 
+/// Socket ABI metadata, deliberately separate from the wire transport tuple.
+#[derive(Debug, Clone, Copy)]
+pub struct InetEndpoint {
+    pub addr: smoltcp::wire::IpAddress,
+    pub port: u16,
+    pub scope_id: u32,
+}
+
+pub fn needs_scope_id(address: smoltcp::wire::IpAddress) -> bool {
+    match address {
+        smoltcp::wire::IpAddress::Ipv6(address) => {
+            address.is_unicast_link_local()
+                || (address.is_multicast() && matches!(address.octets()[1] & 0x0f, 1 | 2))
+        }
+        _ => false,
+    }
+}
+
+impl InetEndpoint {
+    pub(crate) fn from_ipv6_sockaddr(bytes: &[u8]) -> Result<Self, system_error::SystemError> {
+        if bytes.len() < 24 {
+            return Err(system_error::SystemError::EINVAL);
+        }
+        if u16::from_ne_bytes(bytes[..2].try_into().unwrap()) != 10 {
+            return Err(system_error::SystemError::EAFNOSUPPORT);
+        }
+        Ok(Self {
+            addr: smoltcp::wire::IpAddress::Ipv6(core::net::Ipv6Addr::from(
+                <[u8; 16]>::try_from(&bytes[8..24]).unwrap(),
+            )),
+            port: u16::from_be_bytes(bytes[2..4].try_into().unwrap()),
+            scope_id: if bytes.len() >= 28 {
+                u32::from_ne_bytes(bytes[24..28].try_into().unwrap())
+            } else {
+                0
+            },
+        })
+    }
+
+    pub fn wire(self) -> IpEndpoint {
+        IpEndpoint::new(self.addr, self.port)
+    }
+
+    /// Only scoped IPv6 addresses expose an interface at the socket ABI.
+    pub fn with_scope(mut self, ifindex: u32) -> Self {
+        self.scope_id = if needs_scope_id(self.addr) {
+            ifindex
+        } else {
+            0
+        };
+        self
+    }
+
+    pub fn scope_oif(self) -> Option<u32> {
+        (needs_scope_id(self.addr) && self.scope_id != 0).then_some(self.scope_id)
+    }
+}
+
+impl From<IpEndpoint> for InetEndpoint {
+    fn from(endpoint: IpEndpoint) -> Self {
+        Self {
+            addr: endpoint.addr,
+            port: endpoint.port,
+            scope_id: 0,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum Endpoint {
     /// 未指定端点 (AF_UNSPEC) - 用于UDP断开连接
@@ -17,7 +85,7 @@ pub enum Endpoint {
     /// 链路层端点
     LinkLayer(LinkLayerEndpoint),
     /// 网络层端点
-    Ip(IpEndpoint),
+    Ip(InetEndpoint),
     /// Unix域套接字端点
     Unix(UnixEndpoint),
     /// Netlink端点
@@ -94,11 +162,15 @@ impl LinkLayerEndpoint {
 
 impl From<IpEndpoint> for Endpoint {
     fn from(endpoint: IpEndpoint) -> Self {
-        Self::Ip(endpoint)
+        Self::ip(endpoint)
     }
 }
 
 impl Endpoint {
+    pub fn ip(endpoint: impl Into<InetEndpoint>) -> Self {
+        Self::Ip(endpoint.into())
+    }
+
     fn sockaddr_len(&self) -> Result<u32, system_error::SystemError> {
         match self {
             Endpoint::Unspecified => Ok(SockAddr::from(self.clone()).len()?),

@@ -1,6 +1,6 @@
 //! Decode an IP bind address without applying connect's AF_UNSPEC semantics.
 
-use smoltcp::wire::{IpAddress, IpEndpoint, IpVersion, Ipv6Address};
+use smoltcp::wire::{IpAddress, IpEndpoint, IpVersion};
 use system_error::SystemError;
 
 use crate::net::posix::{SockAddr, SockAddrIn, MAX_SOCKADDR_LEN};
@@ -63,11 +63,12 @@ pub(crate) fn endpoint_from_user_preserving_mapped(
             if family != AddressFamily::INet6 as u16 {
                 return Err(SystemError::EAFNOSUPPORT);
             }
-            let mut octets = [0u8; 16];
-            octets.copy_from_slice(&snapshot[8..24]);
-            let address = Ipv6Address::from(octets);
-            IpAddress::Ipv6(address)
+            return Ok(Endpoint::Ip(
+                crate::net::socket::endpoint::InetEndpoint::from_ipv6_sockaddr(
+                    &snapshot[..len as usize],
+                )?,
+            ));
         }
     };
-    Ok(Endpoint::Ip(IpEndpoint::new(address, port)))
+    Ok(Endpoint::ip(IpEndpoint::new(address, port)))
 }

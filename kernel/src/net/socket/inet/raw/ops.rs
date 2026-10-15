@@ -13,6 +13,29 @@ use super::{InetSocket, RawSocket};
 type EP = crate::filesystem::epoll::EPollEventType;
 
 impl crate::net::socket::Socket for RawSocket {
+    fn bind_endpoint_from_user(
+        &self,
+        addr: *const crate::net::posix::SockAddr,
+        len: u32,
+    ) -> Result<Endpoint, SystemError> {
+        if self.is_ipv6() {
+            crate::net::socket::inet::common::bind::endpoint_from_user_preserving_mapped(
+                addr,
+                len,
+                self.ip_version,
+            )
+            .map_err(|error| {
+                if error == SystemError::EAFNOSUPPORT {
+                    SystemError::EINVAL
+                } else {
+                    error
+                }
+            })
+        } else {
+            crate::net::posix::SockAddr::to_endpoint(addr, len)
+        }
+    }
+
     fn netns(&self) -> Arc<crate::process::namespace::net_namespace::NetNamespace> {
         RawSocket::netns(self)
     }
@@ -31,7 +54,11 @@ impl crate::net::socket::Socket for RawSocket {
 
     fn bind(&self, local_endpoint: Endpoint) -> Result<(), SystemError> {
         if let Endpoint::Ip(endpoint) = local_endpoint {
-            return self.do_bind(endpoint.addr);
+            if matches!(endpoint.addr, IpAddress::Ipv6(address) if address.to_ipv4_mapped().is_some())
+            {
+                return Err(SystemError::EADDRNOTAVAIL);
+            }
+            return self.do_bind_scoped(endpoint);
         }
         Err(SystemError::EAFNOSUPPORT)
     }
@@ -49,24 +76,46 @@ impl crate::net::socket::Socket for RawSocket {
             if !self.addr_matches_ip_version(remote.addr) {
                 return Err(SystemError::EAFNOSUPPORT);
             }
+            if crate::net::socket::endpoint::needs_scope_id(remote.addr) {
+                self.device_binding
+                    .prepare_scope_connect(remote.scope_id, 0)?
+                    .commit();
+            }
 
             // Linux 语义：connect(2) 会为本端选择一个具体的可路由地址，
             // 使得 getsockname(2) 不返回 0.0.0.0/::。
             let need_local = match self.inner.read().as_ref() {
-                Some(RawInner::Bound(b) | RawInner::Wildcard(b)) => b.local_addr().is_none(),
+                Some(RawInner::Bound(b) | RawInner::Wildcard(b)) => b
+                    .local_addr()
+                    .is_none_or(|address| address.is_unspecified()),
                 _ => true,
             };
-
-            // Linux 语义（对本测例）：connect(2) 后 getsockname 应返回可路由的本地地址。
-            // 对 loopback 目标，直接绑定到 loopback 地址，避免返回 0.0.0.0/::。
-            if need_local {
-                let bind_local = match remote.addr {
-                    IpAddress::Ipv4(v4) if v4.is_loopback() => Some(IpAddress::Ipv4(v4)),
-                    IpAddress::Ipv6(v6) if v6.is_loopback() => Some(IpAddress::Ipv6(v6)),
+            let scoped_route = if crate::net::socket::endpoint::needs_scope_id(remote.addr) {
+                let device = self
+                    .device_binding
+                    .resolve_iface(&self.netns)
+                    .map_err(super::super::common::ipv6_connect_error)?;
+                let fixed_source = match self.inner.read().as_ref() {
+                    Some(RawInner::Bound(bound) | RawInner::Wildcard(bound)) => bound
+                        .local_addr()
+                        .filter(|address| !address.is_unspecified() && !address.is_multicast()),
                     _ => None,
                 };
-                if let Some(local) = bind_local {
-                    self.do_bind(local)?;
+                Some(crate::net::route::resolve_ipv6_send_route(
+                    &self.netns,
+                    remote.addr,
+                    device.map(|iface| iface.nic_id() as u32),
+                    fixed_source,
+                )?)
+            } else {
+                None
+            };
+
+            // Select and publish a source for an any binding. The same route
+            // path handles loopback; this is not a second explicit bind.
+            if need_local {
+                if let Some(route) = scoped_route {
+                    self.bind_attachment(route.source_owner, route.source.into(), true)?;
                 } else {
                     self.bind_ephemeral(remote.addr)?;
                 }
@@ -178,7 +227,12 @@ impl crate::net::socket::Socket for RawSocket {
         match self.inner.read().as_ref() {
             Some(RawInner::Bound(bound)) => {
                 if let Some(addr) = bound.local_addr() {
-                    Ok(Endpoint::Ip(smoltcp::wire::IpEndpoint::new(addr, proto)))
+                    Ok(Endpoint::ip(
+                        crate::net::socket::endpoint::InetEndpoint::from(
+                            smoltcp::wire::IpEndpoint::new(addr, proto),
+                        )
+                        .with_scope(self.device_binding.ifindex() as u32),
+                    ))
                 } else {
                     Ok(self.unspecified_endpoint(proto))
                 }

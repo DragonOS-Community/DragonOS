@@ -258,11 +258,15 @@ impl FibLookupKey {
         }
     }
 
-    fn ingress_local(destination: IpAddress, _ingress_oif: u32) -> Self {
+    fn ingress_local(destination: IpAddress, ingress_oif: u32) -> Self {
         Self {
             destination,
             table: super::RT_TABLE_LOCAL,
-            required_oif: None,
+            // Link-local unicast belongs to the arriving link, unlike the
+            // weak-host IPv4/global IPv6 local-table lookup below.
+            required_oif:
+                matches!(destination, IpAddress::Ipv6(address) if address.is_unicast_link_local())
+                    .then_some(ingress_oif),
             minimum_scope: None,
             // Linux's local table is weak-host: a directed broadcast remains
             // local even when it arrived through another interface. Limited

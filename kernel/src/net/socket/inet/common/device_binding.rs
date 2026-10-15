@@ -30,6 +30,58 @@ impl Default for SocketDeviceBinding {
 }
 
 impl SocketDeviceBinding {
+    /// Protocol scope updates carry an index, not a privileged device-name
+    /// option. Lookup happens after commit: Linux retains the accepted index
+    /// even when subsequent address/route validation fails.
+    pub(crate) fn prepare_scope_bind(
+        &self,
+        scope: u32,
+    ) -> Result<DeviceBindingUpdate<'_>, SystemError> {
+        let guard = self.update_lock.lock();
+        let index = if scope != 0 {
+            scope as usize
+        } else {
+            self.ifindex()
+        };
+        if index == 0 {
+            return Err(SystemError::EINVAL);
+        }
+        Ok(DeviceBindingUpdate {
+            binding: self,
+            _guard: guard,
+            target_ifindex: index,
+            target_iface: None,
+        })
+    }
+
+    pub(crate) fn prepare_scope_connect(
+        &self,
+        scope: u32,
+        multicast_default: u32,
+    ) -> Result<DeviceBindingUpdate<'_>, SystemError> {
+        let guard = self.update_lock.lock();
+        let old = self.ifindex();
+        if scope != 0 && old != 0 && old != scope as usize {
+            return Err(SystemError::EINVAL);
+        }
+        let index = if scope != 0 {
+            scope as usize
+        } else if old != 0 {
+            old
+        } else {
+            multicast_default as usize
+        };
+        if index == 0 {
+            return Err(SystemError::EINVAL);
+        }
+        Ok(DeviceBindingUpdate {
+            binding: self,
+            _guard: guard,
+            target_ifindex: index,
+            target_iface: None,
+        })
+    }
+
     /// Construct independent state for a connection inheriting a listener's
     /// SYN-time device constraint. Subsequent parent/child updates are separate.
     pub(crate) fn from_ifindex(ifindex: usize) -> Self {
@@ -150,6 +202,11 @@ pub struct DeviceBindingUpdate<'a> {
 }
 
 impl DeviceBindingUpdate<'_> {
+    #[inline]
+    pub(crate) fn target_ifindex(&self) -> usize {
+        self.target_ifindex
+    }
+
     #[inline]
     pub fn target_iface(&self) -> Option<Arc<dyn Iface>> {
         self.target_iface.clone()

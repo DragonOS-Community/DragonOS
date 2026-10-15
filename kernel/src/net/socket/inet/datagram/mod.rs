@@ -532,8 +532,25 @@ impl UdpSocket {
         )
     }
 
-    pub fn do_bind(&self, endpoint: smoltcp::wire::IpEndpoint) -> Result<(), SystemError> {
+    pub fn do_bind(
+        &self,
+        address: crate::net::socket::endpoint::InetEndpoint,
+    ) -> Result<(), SystemError> {
+        let endpoint = address.wire();
         super::common::port_policy::check_bind_access(&self.netns, endpoint, self.ip_version)?;
+        if self.ip_version == IpVersion::Ipv4 && matches!(endpoint.addr, Ipv6(_)) {
+            return Err(SystemError::EAFNOSUPPORT);
+        }
+        if crate::net::socket::endpoint::needs_scope_id(address.addr) {
+            let mut update = self.device_binding.prepare_scope_bind(address.scope_id)?;
+            let _placement = self.iface_placement.write();
+            match self.inner.read().as_ref() {
+                Some(UdpInner::Unbound(_)) => {}
+                None => return Err(SystemError::EBADF),
+                _ => return Err(SystemError::EINVAL),
+            }
+            update.commit();
+        }
         loop {
             {
                 let inner = self.inner.read();
@@ -868,9 +885,14 @@ impl UdpSocket {
         &self,
         buf: &mut [u8],
         peek: bool,
-    ) -> Result<(usize, smoltcp::wire::IpEndpoint, usize), SystemError> {
+    ) -> Result<(usize, crate::net::socket::endpoint::InetEndpoint, usize), SystemError> {
         let received = self.try_recv_with_meta(buf, peek)?;
-        Ok((received.copied, received.source, received.original_len))
+        Ok((
+            received.copied,
+            crate::net::socket::endpoint::InetEndpoint::from(received.source)
+                .with_scope(received.ifindex as u32),
+            received.original_len,
+        ))
     }
 
     pub(super) fn try_recv_with_meta(
@@ -993,11 +1015,15 @@ impl UdpSocket {
     /// A blocking sender waits on the resource its selected path actually
     /// charges. In particular, a full prepared-output account must not spin
     /// merely because the legacy smoltcp queue still has room.
-    fn can_send_to(&self, to: Option<IpEndpoint>, payload_len: usize) -> bool {
+    fn can_send_to(
+        &self,
+        to: Option<crate::net::socket::endpoint::InetEndpoint>,
+        payload_len: usize,
+    ) -> bool {
         if self.errqueue.lock().0 != 0 || self.shutdown.load(Ordering::Acquire) & 0x02 != 0 {
             return true;
         }
-        let destination = to.or_else(|| {
+        let destination = to.map(|endpoint| endpoint.wire()).or_else(|| {
             self.inner.read().as_ref().and_then(|inner| match inner {
                 UdpInner::Bound(bound) => bound.remote_endpoint().ok(),
                 _ => None,
@@ -1276,8 +1302,14 @@ impl UdpSocket {
         ))
     }
 
-    pub fn try_send(&self, buf: &[u8], to: Option<IpEndpoint>) -> Result<usize, SystemError> {
+    pub fn try_send(
+        &self,
+        buf: &[u8],
+        to: Option<crate::net::socket::endpoint::InetEndpoint>,
+    ) -> Result<usize, SystemError> {
         self.take_socket_error()?;
+        let scope_oif = to.and_then(|endpoint| endpoint.scope_oif());
+        let to = to.map(|endpoint| endpoint.wire());
         // Validate the supplied family before mapped-v4 normalization. Only
         // AF_INET6 sockets may use an IPv6 sockaddr, including mapped addresses.
         if self.ip_version == IpVersion::Ipv4
@@ -1299,7 +1331,7 @@ impl UdpSocket {
             .ok_or(SystemError::EDESTADDRREQ)?;
         match Self::normalize_unspecified_dest(destination).addr {
             Ipv4(_) => self.try_send_ipv4_prepared(buf, to),
-            Ipv6(_) => self.try_send_ipv6_prepared(buf, to),
+            Ipv6(_) => self.try_send_ipv6_prepared(buf, to, scope_oif),
         }
     }
 
@@ -1491,6 +1523,7 @@ impl UdpSocket {
         &self,
         payload: &[u8],
         to: Option<IpEndpoint>,
+        scope_oif: Option<u32>,
     ) -> Result<usize, SystemError> {
         let packet_len = ipv6_packet::packet_len(payload.len());
         let placement = self.iface_placement.read();
@@ -1508,7 +1541,10 @@ impl UdpSocket {
             if destination.port == 0 {
                 return Err(SystemError::EINVAL);
             }
-            let (required_oif, _) = output_flow::socket_constraints(self, destination.addr)?;
+            let required_oif = match scope_oif {
+                Some(index) => Some(index),
+                None => output_flow::socket_constraints(self, destination.addr)?.0,
+            };
             let receive_bind = IpListenEndpoint {
                 addr: fixed_address,
                 port: 0,
@@ -1572,7 +1608,10 @@ impl UdpSocket {
             let Ipv6(destination_addr) = destination.addr else {
                 return Err(SystemError::EAFNOSUPPORT);
             };
-            let (required_oif, _) = output_flow::socket_constraints(self, destination.addr)?;
+            let required_oif = match scope_oif {
+                Some(index) => Some(index),
+                None => output_flow::socket_constraints(self, destination.addr)?.0,
+            };
             let fixed_source =
                 output_flow::bound_source_constraint(&self.netns, local).or(connected_source);
             let resolved = crate::net::route::resolve_ipv6_send_route(

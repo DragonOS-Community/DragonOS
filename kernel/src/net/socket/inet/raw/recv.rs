@@ -4,11 +4,9 @@ use smoltcp::wire::{IpAddress, IpProtocol, IpVersion};
 use system_error::SystemError;
 
 use crate::filesystem::vfs::iov::IoVecs;
-use crate::net::posix::{SockAddrIn, SockAddrIn6};
 use crate::net::socket::unix::utils::CmsgBuffer;
 use crate::net::socket::utils::{IPV4_MIN_HEADER_LEN, IPV6_HEADER_LEN};
 use crate::net::socket::{IpOption, PIPV6, PSOL};
-use crate::syscall::user_access::UserBufferWriter;
 
 use super::inner;
 use super::inner::RawInner;
@@ -126,7 +124,7 @@ impl RawSocket {
                                     &buf[..(*size).min(buf.len())],
                                     self.ip_version,
                                 ) {
-                                    if dst != local {
+                                    if !local.is_unspecified() && dst != local {
                                         // 丢弃不匹配的包，继续尝试读取下一包。
                                         filter_retry_or_break!(retries, MAX_FILTER_RETRIES, result);
                                     }
@@ -214,9 +212,20 @@ impl RawSocket {
     pub(super) fn try_recv_user(
         &self,
         user_buf: &mut [u8],
-    ) -> Result<(usize, smoltcp::wire::IpAddress), SystemError> {
+    ) -> Result<(usize, crate::net::socket::endpoint::InetEndpoint), SystemError> {
         match self.ip_version {
-            IpVersion::Ipv4 => self.try_recv(user_buf),
+            IpVersion::Ipv4 => {
+                self.try_recv_with_ifindex(user_buf)
+                    .map(|(size, source, ifindex)| {
+                        (
+                            size,
+                            crate::net::socket::endpoint::InetEndpoint::from(
+                                smoltcp::wire::IpEndpoint::new(source, 0),
+                            )
+                            .with_scope(ifindex),
+                        )
+                    })
+            }
             IpVersion::Ipv6 => {
                 // 需要先接收完整 IPv6 包，用于解析 src addr / cmsg，随后只向用户拷贝 payload。
                 let mut tmp = vec![
@@ -226,12 +235,18 @@ impl RawSocket {
                         .saturating_add(IPV6_HEADER_LEN)
                         .max(IPV6_HEADER_LEN)
                 ];
-                let (recv_size, src_addr) = self.try_recv(&mut tmp)?;
+                let (recv_size, src_addr, ifindex) = self.try_recv_with_ifindex(&mut tmp)?;
                 let start = IPV6_HEADER_LEN.min(recv_size);
                 let payload = &tmp[start..recv_size];
                 let to_copy = core::cmp::min(payload.len(), user_buf.len());
                 user_buf[..to_copy].copy_from_slice(&payload[..to_copy]);
-                Ok((to_copy, src_addr))
+                Ok((
+                    to_copy,
+                    crate::net::socket::endpoint::InetEndpoint::from(
+                        smoltcp::wire::IpEndpoint::new(src_addr, 0),
+                    )
+                    .with_scope(ifindex),
+                ))
             }
         }
     }
@@ -243,49 +258,17 @@ impl RawSocket {
         &self,
         msg: &mut crate::net::posix::MsgHdr,
         src_addr: IpAddress,
+        ifindex: u32,
     ) -> Result<(), SystemError> {
-        if msg.msg_name.is_null() || msg.msg_namelen == 0 {
+        if msg.msg_name.is_null() {
             return Ok(());
         }
-
-        let port_be = 0u16.to_be();
-
-        match (self.ip_version, src_addr) {
-            (IpVersion::Ipv4, IpAddress::Ipv4(v4)) => {
-                let sa = SockAddrIn {
-                    sin_family: crate::net::socket::AddressFamily::INet as u16,
-                    sin_port: port_be,
-                    sin_addr: v4.to_bits().to_be(),
-                    sin_zero: [0; 8],
-                };
-                let want = core::mem::size_of::<SockAddrIn>().min(msg.msg_namelen as usize);
-                let mut w = UserBufferWriter::new(msg.msg_name as *mut u8, want, true)?;
-                let bytes = unsafe {
-                    core::slice::from_raw_parts((&sa as *const SockAddrIn) as *const u8, want)
-                };
-                w.buffer_protected(0)?.write_to_user(0, bytes)?;
-                msg.msg_namelen = want as u32;
-            }
-            (IpVersion::Ipv6, IpAddress::Ipv6(v6)) => {
-                let sa = SockAddrIn6 {
-                    sin6_family: crate::net::socket::AddressFamily::INet6 as u16,
-                    sin6_port: port_be,
-                    sin6_flowinfo: 0,
-                    sin6_addr: v6.octets(),
-                    sin6_scope_id: 0,
-                };
-                let want = core::mem::size_of::<SockAddrIn6>().min(msg.msg_namelen as usize);
-                let mut w = UserBufferWriter::new(msg.msg_name as *mut u8, want, true)?;
-                let bytes = unsafe {
-                    core::slice::from_raw_parts((&sa as *const SockAddrIn6) as *const u8, want)
-                };
-                w.buffer_protected(0)?.write_to_user(0, bytes)?;
-                msg.msg_namelen = want as u32;
-            }
-            _ => {
-                msg.msg_namelen = 0;
-            }
-        }
+        let endpoint = crate::net::socket::endpoint::InetEndpoint::from(
+            smoltcp::wire::IpEndpoint::new(src_addr, 0),
+        )
+        .with_scope(ifindex);
+        msg.msg_namelen = crate::net::socket::endpoint::Endpoint::ip(endpoint)
+            .write_to_user_msghdr(msg.msg_name, msg.msg_namelen)?;
         Ok(())
     }
 
@@ -536,7 +519,7 @@ impl RawSocket {
         msg.msg_flags = 0;
 
         // 填充 peer 地址
-        self.fill_peer_addr(msg, src_addr)?;
+        self.fill_peer_addr(msg, src_addr, ingress_ifindex)?;
 
         // 构建控制消息
         msg.msg_controllen = self.build_recv_cmsgs(msg, &tmp, recv_size, ingress_ifindex)?;
@@ -549,12 +532,8 @@ impl RawSocket {
         addr: *const crate::net::posix::SockAddr,
         addrlen: u32,
     ) -> Result<(), SystemError> {
-        // Linux 语义：对 AF_INET6 socket，若用户提供目标地址但 addrlen 小于 sockaddr_in6，返回 EINVAL。
-        // gVisor raw_socket_test: RawSocketTest.IPv6SendMsg
-        if !addr.is_null()
-            && self.is_ipv6()
-            && (addrlen as usize) < core::mem::size_of::<crate::net::posix::SockAddrIn6>()
-        {
+        // Linux also accepts RFC2133's 24-byte layout without a scope tail.
+        if !addr.is_null() && self.is_ipv6() && addrlen < 24 {
             return Err(SystemError::EINVAL);
         }
         Ok(())
@@ -589,16 +568,9 @@ impl RawSocket {
         _address: Option<crate::net::socket::endpoint::Endpoint>,
     ) -> Result<(usize, crate::net::socket::endpoint::Endpoint), SystemError> {
         // Linux 语义：raw socket 的 recvfrom(2) 返回的 sockaddr_{in,in6}.port 为 0。
-        let port = 0u16;
         if self.is_nonblock() || flags.contains(crate::net::socket::PMSG::DONTWAIT) {
-            self.try_recv_user(buffer).map(|(len, addr)| {
-                (
-                    len,
-                    crate::net::socket::endpoint::Endpoint::Ip(smoltcp::wire::IpEndpoint::new(
-                        addr, port,
-                    )),
-                )
-            })
+            self.try_recv_user(buffer)
+                .map(|(len, addr)| (len, crate::net::socket::endpoint::Endpoint::ip(addr)))
         } else {
             loop {
                 match self.try_recv_user(buffer) {
@@ -610,12 +582,7 @@ impl RawSocket {
                     }
                     result => {
                         return result.map(|(len, addr)| {
-                            (
-                                len,
-                                crate::net::socket::endpoint::Endpoint::Ip(
-                                    smoltcp::wire::IpEndpoint::new(addr, port),
-                                ),
-                            )
+                            (len, crate::net::socket::endpoint::Endpoint::ip(addr))
                         })
                     }
                 }

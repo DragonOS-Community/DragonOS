@@ -668,7 +668,8 @@ std::optional<Ipv6RouteMetadata> FindIpv6Route(int fd, const char* destination,
 }
 
 int SendIpv6AddrRequest(int fd, uint16_t type, uint16_t flags, uint32_t ifindex,
-                        const char* address, uint8_t prefix_len, uint32_t seq) {
+                        const char* address, uint8_t prefix_len, uint32_t seq,
+                        uint8_t scope = RT_SCOPE_UNIVERSE) {
     alignas(nlmsghdr) char buf[512] = {};
     auto* nlh = reinterpret_cast<nlmsghdr*>(buf);
     auto* ifa = reinterpret_cast<ifaddrmsg*>(NLMSG_DATA(nlh));
@@ -678,7 +679,7 @@ int SendIpv6AddrRequest(int fd, uint16_t type, uint16_t flags, uint32_t ifindex,
     nlh->nlmsg_seq = seq;
     ifa->ifa_family = AF_INET6;
     ifa->ifa_prefixlen = prefix_len;
-    ifa->ifa_scope = RT_SCOPE_UNIVERSE;
+    ifa->ifa_scope = scope;
     ifa->ifa_flags = IFA_F_NODAD;
     ifa->ifa_index = ifindex;
 

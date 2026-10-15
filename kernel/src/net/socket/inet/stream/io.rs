@@ -90,12 +90,12 @@ impl TcpSocket {
         report_error: bool,
     ) -> Result<usize, SystemError> {
         // A short successful read must leave the error for the next syscall.
-        if !report_error && socket.reset_state().is_some() {
+        if !report_error && socket.pending_error().is_some() {
             return Ok(0);
         }
         socket
-            .take_reset()
-            .map(inner::reset_error)
+            .take_error()
+            .map(inner::transport_error)
             .map_or(Ok(0), Err)
     }
 
@@ -109,6 +109,9 @@ impl TcpSocket {
         let current_buf = buf;
 
         if !socket.can_recv() {
+            if socket.may_recv() && socket.pending_error().is_some() {
+                return Self::recv_reset_result(socket, report_error);
+            }
             if !socket.may_recv() {
                 return match socket.recv(|_data| (0usize, ())) {
                     Ok(()) => Ok(0),
@@ -243,6 +246,9 @@ impl TcpSocket {
                 return Ok(true);
             }
             if socket.may_recv() {
+                if socket.pending_error().is_some() {
+                    return Self::recv_reset_result(socket, report_error).map(|_| false);
+                }
                 return if self.is_recv_shutdown() {
                     Ok(false)
                 } else {
@@ -322,6 +328,9 @@ impl TcpSocket {
                     return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
                 }
                 if socket.may_recv() {
+                    if socket.pending_error().is_some() {
+                        return Self::recv_reset_result(socket, report_error);
+                    }
                     return if self.is_recv_shutdown() {
                         Ok(0)
                     } else {
@@ -588,7 +597,7 @@ impl TcpSocket {
         match self.inner.read().as_ref() {
             Some(inner::Inner::Connecting(connecting)) => connecting.take_error(),
             Some(inner::Inner::Established(established)) => {
-                established.with_mut(|socket| socket.take_reset().map(inner::reset_error))
+                established.with_mut(|socket| socket.take_error().map(inner::transport_error))
             }
             _ => None,
         }

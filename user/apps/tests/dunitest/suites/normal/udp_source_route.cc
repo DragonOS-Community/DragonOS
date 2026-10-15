@@ -118,6 +118,95 @@ TEST_P(UdpSourceRoute, BoundSourceSurvivesSendAndConnectedMtuLookup) {
 }
 
 INSTANTIATE_TEST_SUITE_P(Destinations, UdpSourceRoute, testing::Bool());
+
+// Match ip6_dst_lookup_tail: automatic source selection can fail before a
+// missing route is reported. Keep missing-source and missing-route errors apart.
+class UdpIpv6MissingSource : public testing::TestWithParam<bool> {};
+
+void ExerciseMissingIpv6Source(bool connected, bool remove_address,
+                               bool bind_source, bool remote_destination = false) {
+    pid_t child = fork();
+    ASSERT_GE(child, 0);
+    if (child == 0) {
+        auto run = [&]() {
+            ASSERT_EQ(unshare(CLONE_NEWNET), 0) << ErrnoString(errno);
+            FdGuard route(OpenRouteSocket());
+            ASSERT_GE(route.Get(), 0);
+            unsigned loopback = if_nametoindex("lo");
+            ASSERT_NE(loopback, 0u);
+            ASSERT_EQ(SetLinkUp(route.Get(), loopback, true, 1), 0);
+            FdGuard sender(socket(AF_INET6, SOCK_DGRAM, 0));
+            ASSERT_GE(sender.Get(), 0);
+            sockaddr_in6 destination{};
+            destination.sin6_family = AF_INET6;
+            destination.sin6_addr = in6addr_loopback;
+            if (bind_source) {
+                ASSERT_EQ(bind(sender.Get(), reinterpret_cast<sockaddr*>(&destination),
+                               sizeof(destination)), 0) << ErrnoString(errno);
+            }
+            if (remove_address) {
+                ASSERT_EQ(SendIpv6AddrRequest(route.Get(), RTM_DELADDR,
+                    NLM_F_REQUEST | NLM_F_ACK, loopback, "::1", 128, 2, RT_SCOPE_HOST), 0);
+            }
+            if (remote_destination) {
+                ASSERT_EQ(inet_pton(AF_INET6, "2001:db8::93", &destination.sin6_addr), 1);
+            }
+            destination.sin6_port = htons(31093);
+            auto output = [&]() -> ssize_t {
+                if (connected) {
+                    return connect(sender.Get(), reinterpret_cast<sockaddr*>(&destination),
+                                   sizeof(destination));
+                }
+                return sendto(sender.Get(), "S", 1, 0,
+                              reinterpret_cast<sockaddr*>(&destination), sizeof(destination));
+            };
+            ASSERT_EQ(output(), -1);
+            ASSERT_EQ(errno, remove_address && !bind_source ? EADDRNOTAVAIL : ENETUNREACH)
+                << ErrnoString(errno);
+            sockaddr_in6 peer{};
+            socklen_t length = sizeof(peer);
+            EXPECT_EQ(getpeername(sender.Get(), reinterpret_cast<sockaddr*>(&peer), &length), -1);
+            EXPECT_EQ(errno, ENOTCONN);
+            if (remove_address && !bind_source && !remote_destination) {
+                ASSERT_EQ(SendIpv6AddrRequest(route.Get(), RTM_NEWADDR,
+                    NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL,
+                    loopback, "::1", 128, 3, RT_SCOPE_HOST), 0);
+                FdGuard receiver(socket(AF_INET6, SOCK_DGRAM, 0));
+                ASSERT_GE(receiver.Get(), 0);
+                ASSERT_EQ(bind(receiver.Get(), reinterpret_cast<sockaddr*>(&destination),
+                               sizeof(destination)), 0) << ErrnoString(errno);
+                ASSERT_EQ(output(), connected ? 0 : 1) << ErrnoString(errno);
+                sockaddr_in6 local{};
+                length = sizeof(local);
+                ASSERT_EQ(getsockname(sender.Get(), reinterpret_cast<sockaddr*>(&local), &length), 0);
+                if (connected) {
+                    EXPECT_EQ(memcmp(&local.sin6_addr, &in6addr_loopback, sizeof(in6_addr)), 0);
+                }
+                EXPECT_NE(local.sin6_port, 0);
+            }
+        };
+        run();
+        _exit(testing::Test::HasFailure() ? 1 : 0);
+    }
+    int status = 0;
+    ASSERT_EQ(waitpid(child, &status, 0), child);
+    ASSERT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(WEXITSTATUS(status), 0);
+}
+
+TEST_P(UdpIpv6MissingSource, DeletedAddressFailsSourceSelectionThenRecovers) {
+    ExerciseMissingIpv6Source(GetParam(), true, false);
+}
+TEST_P(UdpIpv6MissingSource, ExplicitSourceWithoutRouteFailsRouting) {
+    ExerciseMissingIpv6Source(GetParam(), false, true, true);
+}
+TEST_P(UdpIpv6MissingSource, RemoteDestinationWithoutAnySourceFailsSourceSelection) {
+    ExerciseMissingIpv6Source(GetParam(), true, false, true);
+}
+TEST_P(UdpIpv6MissingSource, RemoteDestinationWithSourceWithoutRouteFailsRouting) {
+    ExerciseMissingIpv6Source(GetParam(), false, false, true);
+}
+INSTANTIATE_TEST_SUITE_P(ConnectAndSendto, UdpIpv6MissingSource, testing::Bool());
 }  // namespace
 
 int main(int argc, char** argv) {

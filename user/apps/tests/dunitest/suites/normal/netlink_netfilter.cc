@@ -2,6 +2,7 @@
 
 #include <arpa/inet.h>
 #include <fcntl.h>
+#include <linux/errqueue.h>
 #include <linux/capability.h>
 #include <linux/if_ether.h>
 #include <linux/if_packet.h>
@@ -3401,6 +3402,131 @@ TEST(NetlinkNetfilter, NativeIpv4PreroutingRedirectUsesIngressAddress) {
   auto remove = TableBatch(kNftDeltable, seq + 5, table.c_str());
   ASSERT_EQ(static_cast<ssize_t>(remove.size()), Send(nft.get(), remove));
   Ack(nft.get(), seq + 6, 0, kNftDeltable);
+}
+
+TEST(NetlinkNetfilter, NativeIpv4NatReturnsIcmpErrorToOriginalUdpSocket) {
+  ASSERT_TRUE(NetAdmin()) << "requires CAP_NET_ADMIN";
+  for (bool snat : {false, true}) {
+    SCOPED_TRACE(snat ? "SNAT" : "DNAT");
+    Fd nft(Open());
+    Fd client(socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0));
+    Fd observer(socket(AF_INET, SOCK_RAW | SOCK_NONBLOCK, IPPROTO_UDP));
+    ASSERT_GE(nft.get(), 0);
+    ASSERT_GE(client.get(), 0);
+    ASSERT_GE(observer.get(), 0);
+    sockaddr_in client_address{}, closed_address{};
+    client_address.sin_family = closed_address.sin_family = AF_INET;
+    client_address.sin_addr.s_addr = inet_addr(snat ? "127.0.0.2" : "127.0.0.1");
+    closed_address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    ASSERT_EQ(0, bind(client.get(), reinterpret_cast<sockaddr*>(&client_address),
+                      sizeof(client_address)));
+    // Allocate then release the real destination port, rather than relying
+    // on a fixed port being unused on the test machine.
+    const int reservation = socket(AF_INET, SOCK_DGRAM, 0);
+    ASSERT_GE(reservation, 0);
+    ASSERT_EQ(0, bind(reservation, reinterpret_cast<sockaddr*>(&closed_address),
+                      sizeof(closed_address)));
+    socklen_t length = sizeof(closed_address);
+    ASSERT_EQ(0, getsockname(reservation, reinterpret_cast<sockaddr*>(&closed_address), &length));
+    ASSERT_EQ(0, close(reservation));
+    ASSERT_EQ(0, bind(observer.get(), reinterpret_cast<sockaddr*>(&closed_address),
+                      sizeof(closed_address)));
+    sockaddr_in original_address = closed_address;
+    if (!snat) {
+      original_address.sin_addr.s_addr = inet_addr("127.0.0.2");
+      original_address.sin_port = htons(ntohs(closed_address.sin_port) ^ 0x4000);
+    }
+
+    const std::string table = "dkc093_nat_err_" + std::to_string(getpid()) +
+                              (snat ? "_s" : "_d");
+    constexpr uint32_t seq = 19300;
+    auto batch = TableBatch(kNftNewtable, seq, table.c_str());
+    batch.resize(batch.size() - NLMSG_SPACE(sizeof(nfgenmsg)));
+    const char* chain_name = snat ? "postrouting" : "output";
+    auto chain = NewChain(seq + 2, table.c_str(), chain_name, true, NF_ACCEPT,
+                          snat ? NF_INET_POST_ROUTING : NF_INET_LOCAL_OUT,
+                          NFPROTO_IPV4, snat ? 100 : -100, "nat");
+    const in_addr translated{inet_addr("127.0.0.3")};
+    auto rule = snat
+        ? NativeIpv4SnatRule(seq + 3, table.c_str(), chain_name,
+                              client_address.sin_addr, translated)
+        : NativeIpv4DnatRule(seq + 3, table.c_str(), chain_name,
+                              original_address.sin_addr, ntohs(original_address.sin_port),
+                              closed_address.sin_addr, ntohs(closed_address.sin_port));
+    batch.insert(batch.end(), chain.begin(), chain.end());
+    batch.insert(batch.end(), rule.begin(), rule.end());
+    auto end = Request(NFNL_MSG_BATCH_END, seq + 4);
+    batch.insert(batch.end(), end.begin(), end.end());
+    ASSERT_EQ(static_cast<ssize_t>(batch.size()), Send(nft.get(), batch));
+    Ack(nft.get(), seq + 1, 0, kNftNewtable);
+    Ack(nft.get(), seq + 2, 0, kNftNewchain);
+    Ack(nft.get(), seq + 3, 0, kNftNewrule);
+
+    const int enabled = 1;
+    ASSERT_EQ(0, setsockopt(client.get(), IPPROTO_IP, IP_RECVERR, &enabled, sizeof(enabled)));
+    ASSERT_EQ(0, connect(client.get(), reinterpret_cast<sockaddr*>(&original_address),
+                         sizeof(original_address)));
+    constexpr std::array<uint8_t, 8> payload{0x44, 0x4b, 0x43, 0x30, 0x39, 0x33, 0xaa, 0x55};
+    ASSERT_EQ(static_cast<ssize_t>(payload.size()),
+              send(client.get(), payload.data(), payload.size(), 0));
+    // Prove translation actually happened. A closed original destination could
+    // otherwise produce the same error even if no NAT expression ran.
+    pollfd request_ready{observer.get(), POLLIN, 0};
+    ASSERT_EQ(1, poll(&request_ready, 1, 1000));
+    std::array<uint8_t, 128> wire{};
+    const ssize_t wire_length = recv(observer.get(), wire.data(), wire.size(), MSG_DONTWAIT);
+    ASSERT_GE(wire_length, 20);
+    const size_t header_length = static_cast<size_t>(wire[0] & 15) * 4;
+    ASSERT_GE(header_length, 20u);
+    ASSERT_GE(wire_length, static_cast<ssize_t>(header_length + 8 + payload.size()));
+    uint32_t wire_source = 0, wire_destination = 0;
+    uint16_t wire_destination_port = 0;
+    std::memcpy(&wire_source, wire.data() + 12, sizeof(wire_source));
+    std::memcpy(&wire_destination, wire.data() + 16, sizeof(wire_destination));
+    std::memcpy(&wire_destination_port, wire.data() + header_length + 2,
+                sizeof(wire_destination_port));
+    EXPECT_EQ(snat ? translated.s_addr : client_address.sin_addr.s_addr, wire_source);
+    EXPECT_EQ(closed_address.sin_addr.s_addr, wire_destination);
+    EXPECT_EQ(closed_address.sin_port, wire_destination_port);
+    EXPECT_EQ(0, std::memcmp(wire.data() + header_length + 8, payload.data(), payload.size()));
+    pollfd ready{client.get(), POLLERR, 0};
+    ASSERT_EQ(1, poll(&ready, 1, 1000));
+    ASSERT_NE(0, ready.revents & POLLERR);
+    int error = 0;
+    socklen_t error_length = sizeof(error);
+    ASSERT_EQ(0, getsockopt(client.get(), SOL_SOCKET, SO_ERROR, &error, &error_length));
+    EXPECT_EQ(ECONNREFUSED, error);
+
+    std::array<uint8_t, 32> received{};
+    alignas(cmsghdr) std::array<uint8_t, 256> control{};
+    sockaddr_in destination{};
+    iovec vector{received.data(), received.size()};
+    msghdr message{};
+    message.msg_name = &destination; message.msg_namelen = sizeof(destination);
+    message.msg_iov = &vector; message.msg_iovlen = 1;
+    message.msg_control = control.data(); message.msg_controllen = control.size();
+    ASSERT_EQ(static_cast<ssize_t>(payload.size()),
+              recvmsg(client.get(), &message, MSG_ERRQUEUE | MSG_DONTWAIT));
+    EXPECT_EQ(0, std::memcmp(received.data(), payload.data(), payload.size()));
+    EXPECT_EQ(AF_INET, destination.sin_family);
+    EXPECT_EQ(original_address.sin_addr.s_addr, destination.sin_addr.s_addr);
+    EXPECT_EQ(original_address.sin_port, destination.sin_port);
+    bool found = false;
+    for (auto* header = CMSG_FIRSTHDR(&message); header; header = CMSG_NXTHDR(&message, header)) {
+      if (header->cmsg_level != IPPROTO_IP || header->cmsg_type != IP_RECVERR) continue;
+      ASSERT_GE(header->cmsg_len, CMSG_LEN(sizeof(sock_extended_err)));
+      const auto* extended = reinterpret_cast<const sock_extended_err*>(CMSG_DATA(header));
+      EXPECT_EQ(static_cast<unsigned>(ECONNREFUSED), extended->ee_errno);
+      EXPECT_EQ(SO_EE_ORIGIN_ICMP, extended->ee_origin);
+      EXPECT_EQ(3, extended->ee_type);
+      EXPECT_EQ(3, extended->ee_code);
+      found = true;
+    }
+    EXPECT_TRUE(found);
+    auto remove = TableBatch(kNftDeltable, seq + 5, table.c_str());
+    ASSERT_EQ(static_cast<ssize_t>(remove.size()), Send(nft.get(), remove));
+    Ack(nft.get(), seq + 6, 0, kNftDeltable);
+  }
 }
 
 TEST(NetlinkNetfilter, NativeIpv4PostroutingSnatRewritesReplyDestination) {

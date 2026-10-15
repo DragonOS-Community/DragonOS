@@ -144,7 +144,7 @@ impl OutputBackendPolicy<'_> {
         remote: smoltcp::wire::IpEndpoint,
         meta: PacketMeta,
     ) -> usize {
-        let (source, destination) = crate::net::pmtu::routed_output_flow(
+        let (source, destination) = crate::net::icmp_error::routed_output_flow(
             self.netns,
             local,
             remote,

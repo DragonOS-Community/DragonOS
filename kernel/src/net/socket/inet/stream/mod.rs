@@ -15,6 +15,7 @@ use crate::time::syscall::PosixTimeval;
 
 mod bound;
 mod constants;
+mod icmp_error;
 mod info;
 mod inner;
 mod option;
@@ -453,6 +454,9 @@ impl Socket for TcpSocket {
         msg: &mut crate::net::posix::MsgHdr,
         flags: PMSG,
     ) -> Result<usize, SystemError> {
+        if flags.contains(PMSG::ERRQUEUE) {
+            return self.recv_icmp_error(msg);
+        }
         // TCP: 不返回 peer 地址。
         let iovs = unsafe { IoVecs::from_user(msg.msg_iov, msg.msg_iovlen, true)? };
         let total = iovs.total_len();
@@ -608,6 +612,9 @@ impl Socket for TcpSocket {
 }
 
 impl InetSocket for TcpSocket {
+    fn handle_tcp_icmp(&self, feedback: &crate::net::icmp_error::IcmpErrorFeedback) {
+        self.receive_icmp_error(feedback);
+    }
     fn refill_tcp_listener(&self) {
         self.refill_listener_once();
     }

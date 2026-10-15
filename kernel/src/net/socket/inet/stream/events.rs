@@ -71,7 +71,7 @@ impl TcpSocket {
             // than recursively retrying a racing event notification.
             inner_guard = self.inner.read();
         }
-        match inner_guard.as_ref() {
+        let changed = match inner_guard.as_ref() {
             None => false,
             Some(inner::Inner::Init(_)) => {
                 // Linux: POLLHUP is set on fresh socket.
@@ -99,7 +99,14 @@ impl TcpSocket {
                 let _ = listening;
                 false
             }
+        };
+        if self.error_queue_ready() {
+            self.pollee.fetch_or(
+                EP::EPOLLERR.bits() as usize,
+                core::sync::atomic::Ordering::Release,
+            );
         }
+        changed
     }
 
     #[inline]

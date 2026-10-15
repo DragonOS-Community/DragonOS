@@ -112,6 +112,11 @@ impl RawSocket {
             body.init(RawSocketData {
                 memory,
                 inner: crate::libs::rwsem::RwSem::new(Some(RawInner::Unbound(unbound))),
+                addresses: crate::libs::rwsem::RwSem::new(super::RawAddresses {
+                    local: None,
+                    remote: None,
+                    live: true,
+                }),
                 options: crate::libs::rwsem::RwSem::new(options),
                 nonblock: core::sync::atomic::AtomicBool::new(nonblock),
                 wait_queue: crate::libs::wait_queue::WaitQueue::default(),
@@ -540,6 +545,7 @@ impl RawSocket {
     }
 
     pub fn close(&self) {
+        self.addresses.write().live = false;
         if let Some(me) = self.self_ref.upgrade() {
             unregister_raw_socket(&me);
         }
@@ -564,7 +570,10 @@ impl RawSocket {
                 bound.close();
                 inner.take();
             }
-            _ => {}
+            Some(RawInner::Unbound(_)) => {
+                inner.take();
+            }
+            None => {}
         }
     }
 

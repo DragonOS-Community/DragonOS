@@ -284,9 +284,10 @@ impl UdpSocket {
                     return Err(SystemError::EINVAL);
                 }
                 let v = i32::from_ne_bytes([val[0], val[1], val[2], val[3]]) != 0;
+                let mut errors = self.errqueue.lock();
                 self.recv_err_v4.store(v, Ordering::Relaxed);
                 if !v {
-                    self.errqueue.lock().1.clear();
+                    errors.1.clear();
                 }
                 Ok(())
             }
@@ -525,9 +526,10 @@ impl UdpSocket {
                 Ok(())
             }
             PIPV6::RECVERR | PIPV6::RECVERR_RFC4884 => {
+                let mut errors = self.errqueue.lock();
                 self.recv_err_v6.store(v, Ordering::Relaxed);
                 if !v {
-                    self.errqueue.lock().1.clear();
+                    errors.1.clear();
                 }
                 Ok(())
             }

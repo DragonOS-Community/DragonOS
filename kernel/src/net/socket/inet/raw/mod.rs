@@ -42,8 +42,8 @@ pub use constants::{SOCK_MIN_RCVBUF, SOCK_MIN_SNDBUF, SYSCTL_RMEM_MAX, SYSCTL_WM
 #[allow(unused_imports)]
 pub use options::{Icmp6Filter, IcmpFilter, RawSocketOptions};
 
-pub(crate) use loopback::{snapshot_raw_ingress_listeners, RawIngressListener, RawIngressWork};
-pub(crate) use pmtu::handle_pmtu_feedback;
+pub(crate) use loopback::{snapshot_raw_ingress_sockets, RawIngressWork};
+pub(crate) use pmtu::handle_icmp_feedback;
 
 /// InetRawSocket - AF_INET/AF_INET6 SOCK_RAW 实现
 ///
@@ -70,6 +70,9 @@ pub struct RawSocketData {
     memory: crate::net::socket::buffer::SocketMemory,
     /// 内部状态
     inner: RwSem<Option<RawInner>>,
+    /// Address identity belongs to the socket, not its transport attachment.
+    /// Guards never span an attachment, route, or registry operation.
+    addresses: RwSem<RawAddresses>,
     /// socket 选项
     options: RwSem<options::RawSocketOptions>,
     /// 非阻塞标志
@@ -121,4 +124,11 @@ pub struct RawSocketData {
     send_timeout_us: AtomicU64,
     /// SO_RCVTIMEO (microseconds). u64::MAX means "no timeout".
     recv_timeout_us: AtomicU64,
+}
+
+#[derive(Debug)]
+struct RawAddresses {
+    local: Option<smoltcp::wire::IpAddress>,
+    remote: Option<smoltcp::wire::IpAddress>,
+    live: bool,
 }

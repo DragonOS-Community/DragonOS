@@ -1128,10 +1128,13 @@ impl UdpSocket {
         let _ = EventPoll::wakeup_epoll(self.epoll_items().as_ref(), EP::EPOLLERR);
     }
 
-    fn enqueue_errqueue(&self, entry: ErrorQueueEntry) -> bool {
+    fn enqueue_errqueue(&self, entry: ErrorQueueEntry, version: IpVersion) -> bool {
         let capacity = self.recv_buffer_size();
         let pushed = {
             let mut state = self.errqueue.lock();
+            if !self.recv_error_enabled(version) {
+                return false;
+            }
             // LOCAL errors have already been returned synchronously. Queue
             // readiness is independent of the asynchronous socket error.
             state.1.push(entry, capacity)
@@ -1153,56 +1156,66 @@ impl UdpSocket {
         if !self.recv_error_enabled(destination.addr.version()) {
             return;
         }
-        self.enqueue_errqueue(ErrorQueueEntry {
-            error: SockExtendedErr {
-                ee_errno: SystemError::EMSGSIZE.to_posix_errno().unsigned_abs(),
-                ee_origin: SO_EE_ORIGIN_LOCAL,
-                ee_info: mtu as u32,
-                ..SockExtendedErr::default()
+        self.enqueue_errqueue(
+            ErrorQueueEntry {
+                error: SockExtendedErr {
+                    ee_errno: SystemError::EMSGSIZE.to_posix_errno().unsigned_abs(),
+                    ee_origin: SO_EE_ORIGIN_LOCAL,
+                    ee_info: mtu as u32,
+                    ..SockExtendedErr::default()
+                },
+                offender: None,
+                destination: IpEndpoint::new(
+                    self.error_abi_address(destination.addr),
+                    destination.port,
+                ),
+                payload: Vec::new(),
+                ipv6: self.ip_version == IpVersion::Ipv6,
+                ingress_ifindex: 0,
+                packet: None,
             },
-            offender: None,
-            destination: IpEndpoint::new(
-                self.error_abi_address(destination.addr),
-                destination.port,
-            ),
-            payload: Vec::new(),
-            ipv6: self.ip_version == IpVersion::Ipv6,
-            ingress_ifindex: 0,
-            packet: None,
-        });
+            destination.addr.version(),
+        );
     }
 
     /// Invoked after the binding table selects the reverse quoted tuple.
     /// No binding-table or device/protocol-stack lock is held here.
-    fn handle_pmtu_feedback(&self, generation: u64, feedback: &crate::net::pmtu::PmtuFeedback) {
+    fn handle_icmp_feedback(
+        &self,
+        generation: u64,
+        feedback: &crate::net::icmp_error::IcmpErrorFeedback,
+    ) {
         let remote = IpEndpoint::new(feedback.destination, feedback.dst_port);
         let Some(connected) = self.ingress_match(generation, remote, feedback.source) else {
             return;
         };
         let version = feedback.source.version();
         let policy = self.pmtu_policy(version);
-        // Unlike IPv4 UDP, IPv6 UDP suppresses the entire error handler
-        // when the socket opts out of PMTU updates.
-        if version == IpVersion::Ipv6 && !policy.accepts_updates() {
-            return;
-        }
-        if policy.accepts_updates() {
-            let oif = self.bound_device_ifindex();
-            let _ = crate::net::route::pmtu::learn(
-                &self.netns,
-                feedback,
-                (oif != 0).then_some(oif as u32),
-            );
-        }
-        if version == IpVersion::Ipv4 && policy == PmtuPolicy::Dont {
-            return;
+        let mut hard = feedback.hard_error();
+        if feedback.mtu().is_some() {
+            // Only Packet Too Big is subject to the UDP PMTU policy; opting
+            // out must not suppress unrelated ICMP errors.
+            if version == IpVersion::Ipv6 && !policy.accepts_updates() {
+                return;
+            }
+            if policy.accepts_updates() {
+                let oif = self.bound_device_ifindex();
+                let _ = crate::net::route::pmtu::learn(
+                    &self.netns,
+                    feedback,
+                    (oif != 0).then_some(oif as u32),
+                );
+            }
+            if version == IpVersion::Ipv4 && policy == PmtuPolicy::Dont {
+                return;
+            }
+            hard = policy != PmtuPolicy::Dont;
         }
         let recverr = self.recv_error_enabled(version);
-        let hard = policy != PmtuPolicy::Dont;
         if !recverr && (!connected || !hard) {
             return;
         }
-        let errno = SystemError::EMSGSIZE.to_posix_errno().unsigned_abs();
+        let errno = feedback.errno().to_posix_errno().unsigned_abs();
         let mut error_entry = None;
         if recverr {
             let start = feedback.transport_offset.saturating_add(8);
@@ -1218,9 +1231,9 @@ impl UdpSocket {
                         } else {
                             SO_EE_ORIGIN_ICMP
                         },
-                        ee_type: if version == IpVersion::Ipv6 { 2 } else { 3 },
-                        ee_code: if version == IpVersion::Ipv6 { 0 } else { 4 },
-                        ee_info: feedback.mtu,
+                        ee_type: feedback.icmp_type,
+                        ee_code: feedback.icmp_code,
+                        ee_info: feedback.info(),
                         ..SockExtendedErr::default()
                     },
                     offender: Some(self.error_abi_address(feedback.offender)),
@@ -1238,9 +1251,42 @@ impl UdpSocket {
         }
         let capacity = self.recv_buffer_size();
         {
+            // All endpoint/peer/device writers take placement exclusively.
+            // Keep the existing identity stable until the error is committed,
+            // rather than trusting the earlier binding-table lookup.
+            let device = self.device_binding.prepare_current();
+            let _placement = self.iface_placement.read();
+            let inner = self.inner.read();
+            let Some(UdpInner::Bound(bound)) = inner.as_ref() else {
+                return;
+            };
+            let local = bound.endpoint();
+            if local.port != feedback.src_port
+                || local
+                    .addr
+                    .is_some_and(|address| !udp_bindings::udp_addr_match(address, feedback.source))
+                || (device.target_ifindex() != 0
+                    && device.target_ifindex() != feedback.ingress_ifindex as usize)
+            {
+                return;
+            }
+            let Some(connected) = self.ingress_match(generation, remote, feedback.source) else {
+                return;
+            };
+            if !recverr && (!connected || !hard) {
+                return;
+            }
             let mut state = self.errqueue.lock();
-            if let Some(entry) = error_entry {
-                state.1.push(entry, capacity);
+            // RECVERR disable and queue purge use this same lock. An entry
+            // prepared before disable must not repopulate the purged queue.
+            let recverr = self.recv_error_enabled(version);
+            if !recverr && (!connected || !hard) {
+                return;
+            }
+            if recverr {
+                if let Some(entry) = error_entry {
+                    state.1.push(entry, capacity);
+                }
             }
             // Linux reports the socket error even when allocating or queuing
             // the extended error failed. Serialize it with ERRQUEUE consume.
@@ -1309,7 +1355,7 @@ impl UdpSocket {
         local: IpEndpoint,
         remote: IpEndpoint,
     ) -> Result<crate::net::route::pmtu::PathMtu, SystemError> {
-        let (source, destination) = crate::net::pmtu::routed_output_flow(
+        let (source, destination) = crate::net::icmp_error::routed_output_flow(
             &self.netns,
             local,
             remote,

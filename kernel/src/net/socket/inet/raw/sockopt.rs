@@ -368,9 +368,10 @@ impl RawSocket {
                 if val.is_empty() {
                     return Err(SystemError::EINVAL);
                 }
+                let mut errors = self.errors.lock();
                 self.options.write().recv_err_v4 = enabled;
                 if !enabled {
-                    self.errors.lock().1.clear();
+                    errors.1.clear();
                 }
                 Ok(())
             }
@@ -479,9 +480,10 @@ impl RawSocket {
             }
             Ok(PIPV6::RECVERR) => {
                 let enabled = read_i32_opt(val).ok_or(SystemError::EINVAL)? != 0;
+                let mut errors = self.errors.lock();
                 self.options.write().recv_err_v6 = enabled;
                 if !enabled {
-                    self.errors.lock().1.clear();
+                    errors.1.clear();
                 }
                 Ok(())
             }

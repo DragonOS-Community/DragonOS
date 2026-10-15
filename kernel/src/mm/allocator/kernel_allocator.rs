@@ -55,11 +55,19 @@ pub(super) fn large_allocation_bytes() -> u64 {
 }
 
 impl KernelAllocator {
-    unsafe fn alloc_in_buddy(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+    unsafe fn alloc_in_buddy(
+        &self,
+        layout: Layout,
+        no_retry: bool,
+    ) -> Result<NonNull<[u8]>, AllocError> {
         let page_frame_count = buddy_frame_count(layout);
-        let (phy_addr, allocated_frame_count) = LockedFrameAllocator
-            .allocate(page_frame_count)
-            .ok_or(AllocError)?;
+        let allocation = if no_retry {
+            LockedFrameAllocator
+                .allocate_below(page_frame_count, crate::mm::PhysAddr::new(usize::MAX))
+        } else {
+            LockedFrameAllocator.allocate(page_frame_count)
+        };
+        let (phy_addr, allocated_frame_count) = allocation.ok_or(AllocError)?;
         if allocated_frame_count != page_frame_count {
             LockedFrameAllocator.free(phy_addr, allocated_frame_count);
             return Err(AllocError);
@@ -85,6 +93,23 @@ impl KernelAllocator {
             })
             .expect("large kernel allocation accounting overflow");
         return Ok(NonNull::from(slice));
+    }
+
+    /// Explicit CPU-buffer first attempt. Buddy allocation never invokes OOM
+    /// recovery; small size classes retain the normal slab refill policy.
+    /// The caller must use local_dealloc with this same layout.
+    pub(crate) unsafe fn alloc_buffer_zeroed(&self, layout: Layout) -> *mut u8 {
+        if allocator_select_condition(layout) {
+            self.alloc_in_buddy(layout, true)
+                .map(|allocation| {
+                    let ptr = allocation.as_mut_ptr();
+                    core::ptr::write_bytes(ptr, 0, allocation.len());
+                    ptr
+                })
+                .unwrap_or_default()
+        } else {
+            self.local_alloc_zeroed(layout)
+        }
     }
 
     /// Transfers a direct buddy allocation into the size-class slab domain.
@@ -116,7 +141,7 @@ impl LocalAlloc for KernelAllocator {
     unsafe fn local_alloc(&self, layout: Layout) -> *mut u8 {
         if allocator_select_condition(layout) {
             return self
-                .alloc_in_buddy(layout)
+                .alloc_in_buddy(layout, false)
                 .map(|x| x.as_mut_ptr())
                 .unwrap_or_default();
         } else {
@@ -127,7 +152,7 @@ impl LocalAlloc for KernelAllocator {
     unsafe fn local_alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         if allocator_select_condition(layout) {
             return self
-                .alloc_in_buddy(layout)
+                .alloc_in_buddy(layout, false)
                 .map(|x| {
                     let ptr: *mut u8 = x.as_mut_ptr();
                     core::ptr::write_bytes(ptr, 0, x.len());

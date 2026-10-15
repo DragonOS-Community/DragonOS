@@ -133,6 +133,7 @@ normal/devtmpfs_semantics
 normal/dma_allocator_selftest
 normal/allocation_diagnostics
 normal/vmalloc_selftest
+normal/kernel_buffer_selftest
 normal/virtio_blk_backpressure
 normal/mknod_socket
 normal/pmem_block

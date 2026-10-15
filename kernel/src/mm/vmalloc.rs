@@ -9,12 +9,14 @@ use alloc::sync::Arc;
 use core::alloc::Layout;
 use system_error::SystemError;
 
+#[cfg(feature = "mm_selftest")]
+use crate::cgroup::memory::object_for_task;
+
 use crate::{
     arch::{mm::LockedFrameAllocator, CurrentIrqArch, MMArch},
     cgroup::memory::{
         accounting::KernelByteKind,
         object::{ObjectAccount, ObjectCharge},
-        object_for_task,
         owned::OwnedBox,
     },
     exception::{in_interrupt, InterruptArch},
@@ -183,16 +185,28 @@ pub(crate) struct VmAllocation {
     _charge: ObjectCharge,
 }
 
-fn task_context() -> bool {
+pub(super) fn task_context() -> bool {
     CurrentIrqArch::is_irq_enabled()
         && !in_interrupt()
         && ProcessManager::current_pcb().preempt_count() == 0
 }
 
 impl VmAllocation {
+    #[cfg(feature = "mm_selftest")]
     pub(crate) fn try_new_zeroed(layout: Layout) -> Result<Self, MemoryAllocationError> {
-        Self::allocate_with(
+        if !task_context() {
+            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK.into());
+        }
+        Self::try_new_zeroed_in(layout, &object_for_task(&ProcessManager::current_pcb()))
+    }
+
+    pub(super) fn try_new_zeroed_in(
+        layout: Layout,
+        owner: &Arc<ObjectAccount>,
+    ) -> Result<Self, MemoryAllocationError> {
+        Self::allocate_with_owner(
             layout,
+            owner,
             #[cfg(feature = "mm_selftest")]
             &mut FailureBudget(None),
             #[cfg(feature = "mm_selftest")]
@@ -208,8 +222,29 @@ impl VmAllocation {
         Self::allocate_with(layout, failure, &mut frame_zeroed)
     }
 
+    #[cfg(feature = "mm_selftest")]
     fn allocate_with(
         layout: Layout,
+        #[cfg(feature = "mm_selftest")] failure: &mut FailureBudget,
+        #[cfg(feature = "mm_selftest")] data_frame: &mut dyn FnMut()
+            -> Result<PhysAddr, SystemError>,
+    ) -> Result<Self, MemoryAllocationError> {
+        if !task_context() {
+            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK.into());
+        }
+        Self::allocate_with_owner(
+            layout,
+            &object_for_task(&ProcessManager::current_pcb()),
+            #[cfg(feature = "mm_selftest")]
+            failure,
+            #[cfg(feature = "mm_selftest")]
+            data_frame,
+        )
+    }
+
+    fn allocate_with_owner(
+        layout: Layout,
+        owner: &Arc<ObjectAccount>,
         #[cfg(feature = "mm_selftest")] failure: &mut FailureBudget,
         #[cfg(feature = "mm_selftest")] data_frame: &mut dyn FnMut()
             -> Result<PhysAddr, SystemError>,
@@ -232,7 +267,6 @@ impl VmAllocation {
         if pages > PAGES || layout.align() > SIZE {
             return Err(SystemError::ENOMEM.into());
         }
-        let owner = object_for_task(&ProcessManager::current_pcb());
         Self::allocate_owned(
             layout,
             pages,
@@ -240,8 +274,17 @@ impl VmAllocation {
             failure,
             #[cfg(feature = "mm_selftest")]
             data_frame,
-            &owner,
+            owner,
         )
+    }
+
+    #[cfg(feature = "mm_selftest")]
+    pub(super) fn try_new_zeroed_in_with(
+        layout: Layout,
+        owner: &Arc<ObjectAccount>,
+        data_frame: &mut dyn FnMut() -> Result<PhysAddr, SystemError>,
+    ) -> Result<Self, MemoryAllocationError> {
+        Self::allocate_with_owner(layout, owner, &mut FailureBudget(None), data_frame)
     }
 
     fn allocate_owned(

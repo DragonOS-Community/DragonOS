@@ -1,0 +1,168 @@
+//! Fixed, zeroed CPU scratch storage. Callers may assume virtual continuity
+//! only; devices must use their own DMA ownership/mapping API.
+//!
+//! Construction AND destruction require preemptible task context, IRQs on,
+//! and no MM/allocator locks. No implicit reclaim or operation retries occur.
+
+use alloc::sync::Arc;
+use core::{
+    alloc::Layout,
+    ops::{Deref, DerefMut},
+    ptr::NonNull,
+};
+use system_error::SystemError;
+
+use crate::{
+    arch::MMArch,
+    cgroup::memory::{
+        accounting::KernelByteKind,
+        object::{ObjectAccount, ObjectCharge},
+        object_for_task,
+    },
+    mm::{
+        allocation::MemoryAllocationError,
+        allocator::kernel_allocator::LocalAlloc,
+        vmalloc::{self, VmAllocation},
+        MemoryManagementArch,
+    },
+    process::ProcessManager,
+    KERNEL_ALLOCATOR,
+};
+
+enum Backend {
+    Empty,
+    Heap {
+        pointer: NonNull<u8>,
+        layout: Layout,
+        _charge: ObjectCharge,
+    },
+    Virtual(VmAllocation),
+}
+
+/// Unique, fixed-size bytes. It deliberately has no Send/Sync implementation:
+/// audited local scratch owners must not escape into IRQ/last-Arc-drop paths.
+pub(crate) struct KernelBuffer {
+    backend: Backend,
+}
+
+impl KernelBuffer {
+    pub(crate) fn try_new_zeroed(len: usize) -> Result<Self, MemoryAllocationError> {
+        if !vmalloc::task_context() {
+            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK.into());
+        }
+        let owner = object_for_task(&ProcessManager::current_pcb());
+        Self::allocate_in(
+            len,
+            &owner,
+            #[cfg(feature = "mm_selftest")]
+            false,
+            #[cfg(feature = "mm_selftest")]
+            &mut VmAllocation::try_new_zeroed_in,
+        )
+    }
+
+    fn allocate_in(
+        len: usize,
+        owner: &Arc<ObjectAccount>,
+        #[cfg(feature = "mm_selftest")] fail_heap: bool,
+        #[cfg(feature = "mm_selftest")] virtual_allocate: &mut dyn FnMut(
+            Layout,
+            &Arc<ObjectAccount>,
+        ) -> Result<
+            VmAllocation,
+            MemoryAllocationError,
+        >,
+    ) -> Result<Self, MemoryAllocationError> {
+        if !vmalloc::task_context() {
+            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK.into());
+        }
+        if len == 0 {
+            return Ok(Self {
+                backend: Backend::Empty,
+            });
+        }
+        let layout = Layout::array::<u8>(len).map_err(|_| SystemError::ENOMEM)?;
+        // At most order-1. Larger requests bypass high-order pressure and
+        // power-of-two rounding waste entirely, without a speculative attempt.
+        if len <= 2 * MMArch::PAGE_SIZE {
+            let charge = owner.try_charge_allocation(KernelByteKind::SlabUnreclaimable, layout)?;
+            #[cfg(feature = "mm_selftest")]
+            let pointer = if fail_heap {
+                core::ptr::null_mut()
+            } else {
+                unsafe { KERNEL_ALLOCATOR.alloc_buffer_zeroed(layout) }
+            };
+            #[cfg(not(feature = "mm_selftest"))]
+            let pointer = unsafe { KERNEL_ALLOCATOR.alloc_buffer_zeroed(layout) };
+            if let Some(pointer) = NonNull::new(pointer) {
+                return Ok(Self {
+                    backend: Backend::Heap {
+                        pointer,
+                        layout,
+                        _charge: charge,
+                    },
+                });
+            }
+            // Never have both backends charged at once. A charge rejection
+            // above is propagated, not converted into a fallback opportunity.
+            drop(charge);
+            if len <= MMArch::PAGE_SIZE {
+                return Err(SystemError::ENOMEM.into());
+            }
+        }
+        #[cfg(feature = "mm_selftest")]
+        let allocation = virtual_allocate(layout, owner)?;
+        #[cfg(not(feature = "mm_selftest"))]
+        let allocation = VmAllocation::try_new_zeroed_in(layout, owner)?;
+        Ok(Self {
+            backend: Backend::Virtual(allocation),
+        })
+    }
+}
+
+impl Deref for KernelBuffer {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match &self.backend {
+            Backend::Empty => &[],
+            Backend::Heap {
+                pointer, layout, ..
+            } => unsafe { core::slice::from_raw_parts(pointer.as_ptr(), layout.size()) },
+            Backend::Virtual(allocation) => allocation.as_slice(),
+        }
+    }
+}
+
+impl DerefMut for KernelBuffer {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        match &mut self.backend {
+            Backend::Empty => &mut [],
+            Backend::Heap {
+                pointer, layout, ..
+            } => unsafe { core::slice::from_raw_parts_mut(pointer.as_ptr(), layout.size()) },
+            Backend::Virtual(allocation) => allocation.as_mut_slice(),
+        }
+    }
+}
+
+impl Drop for KernelBuffer {
+    fn drop(&mut self) {
+        assert!(
+            vmalloc::task_context(),
+            "CPU buffer freed outside task context"
+        );
+        if let Backend::Heap {
+            pointer, layout, ..
+        } = &self.backend
+        {
+            // The enum's charge is dropped only after this physical release.
+            unsafe { KERNEL_ALLOCATOR.local_dealloc(pointer.as_ptr(), *layout) };
+        }
+        // Virtual uses VmAllocation's unmap -> TLB completion -> free -> uncharge.
+    }
+}
+
+#[cfg(feature = "mm_selftest")]
+mod selftest;
+#[cfg(feature = "mm_selftest")]
+pub(crate) use selftest::report as selftest_report;

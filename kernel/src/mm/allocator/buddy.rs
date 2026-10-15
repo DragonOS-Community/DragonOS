@@ -1269,3 +1269,109 @@ fn log2(x: usize) -> usize {
     let log2x = 63 - leading_zeros;
     return log2x;
 }
+
+/// Runs a synchronous mapping test against real, isolated fragmented RAM.
+/// Donated frames are thereafter owned (and freed globally) by VmAllocation.
+#[cfg(all(
+    feature = "mm_selftest",
+    any(target_arch = "x86_64", target_arch = "riscv64")
+))]
+pub(crate) fn with_fragmented_buffer_arena(
+    test: impl FnOnce(&mut dyn FnMut() -> Result<PhysAddr, system_error::SystemError>) -> bool,
+) -> bool {
+    use crate::arch::mm::LockedFrameAllocator;
+    const BACKING: usize = 128;
+    const OFFSET: usize = 64;
+    const PAGES: usize = 16;
+    struct Backing {
+        base: PhysAddr,
+        donated: [bool; BACKING],
+    }
+    impl Drop for Backing {
+        fn drop(&mut self) {
+            for index in 0..BACKING {
+                if !self.donated[index] {
+                    unsafe { LockedFrameAllocator.free_one(self.base + index * MMArch::PAGE_SIZE) };
+                }
+            }
+        }
+    }
+    let Some((base, count)) = (unsafe {
+        LockedFrameAllocator.allocate_below(PageFrameCount::new(BACKING), PhysAddr::new(usize::MAX))
+    }) else {
+        return false;
+    };
+    assert_eq!(count.data(), BACKING);
+    let mut backing = Backing {
+        base,
+        donated: [false; BACKING],
+    };
+    let mut dma32_empty_area = [PhysAddr::new(0); BUDDY_ORDER_COUNT];
+    let mut normal_empty_area = [PhysAddr::new(0); BUDDY_ORDER_COUNT];
+    for (index, area) in dma32_empty_area
+        .iter_mut()
+        .chain(normal_empty_area.iter_mut())
+        .enumerate()
+    {
+        *area = base + index * MMArch::PAGE_SIZE;
+        unsafe {
+            core::ptr::write_bytes(
+                MMArch::phys_2_virt(*area).unwrap().as_ptr::<u8>(),
+                0,
+                MMArch::PAGE_SIZE,
+            );
+            BuddyAllocator::<MMArch>::write_page(*area, PageList::new(0, PhysAddr::new(0)));
+        }
+    }
+    let mut allocator = BuddyAllocator::<MMArch> {
+        dma32_free_area: [PhysAddr::new(0); BUDDY_ORDER_COUNT],
+        normal_free_area: [PhysAddr::new(0); BUDDY_ORDER_COUNT],
+        dma32_empty_area,
+        normal_empty_area,
+        dma32_free_pages: 0,
+        normal_free_pages: 0,
+        diagnostics: BuddyDiagnostics::default(),
+        has_normal_memory: false,
+        total: PageFrameCount::new(PAGES),
+        phantom: PhantomData,
+    };
+    // Odd pages remain owned by backing; only isolated even pages are free.
+    for index in (0..PAGES).step_by(2) {
+        unsafe {
+            allocator.free(
+                base + (OFFSET + index) * MMArch::PAGE_SIZE,
+                PageFrameCount::ONE,
+            )
+        };
+    }
+    let max = PhysAddr::new(usize::MAX);
+    if allocator
+        .buddy_alloc_below(PageFrameCount::new(2), max)
+        .is_some()
+    {
+        return false;
+    }
+    let snapshot = allocator.diagnostic_snapshot();
+    if snapshot.free_pages.iter().sum::<usize>() != PAGES / 2 {
+        return false;
+    }
+    // The closure must destroy its VmAllocation before returning. No private
+    // allocator access follows it: donated frames may already be globally reused.
+    test(&mut || {
+        let (frame, count) = allocator
+            .buddy_alloc_below(PageFrameCount::ONE, max)
+            .ok_or(system_error::SystemError::ENOMEM)?;
+        assert_eq!(count, PageFrameCount::ONE);
+        let index = (frame.data() - base.data()) / MMArch::PAGE_SIZE;
+        assert!((OFFSET..OFFSET + PAGES).contains(&index) && index.is_multiple_of(2));
+        backing.donated[index] = true;
+        unsafe {
+            core::ptr::write_bytes(
+                MMArch::phys_2_virt(frame).unwrap().as_ptr::<u8>(),
+                0,
+                MMArch::PAGE_SIZE,
+            )
+        };
+        Ok(frame)
+    })
+}

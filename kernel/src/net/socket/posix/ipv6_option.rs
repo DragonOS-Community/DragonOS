@@ -45,6 +45,9 @@ pub enum Ipv6Option {
     XFRM_POLICY = 35,
     HDRINCL = 36,
 
+    MCAST_JOIN_GROUP = 42,
+    MCAST_LEAVE_GROUP = 45,
+
     // RFC3542 (advanced API)
     RECVPKTINFO = 49,
     PKTINFO = 50,

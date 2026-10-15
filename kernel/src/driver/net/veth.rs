@@ -443,7 +443,7 @@ impl VethInterface {
         // Memberships belonged to the source namespace. Keep the established
         // refcount -> smoltcp lock order while replacing both pieces of state;
         // a target namespace must join its groups on the fresh stack itself.
-        let mut groups = self.common.ipv4_multicast_refcnt.lock();
+        let mut groups = self.common.multicast_refcnt.lock();
         *self.smol_iface().lock() = stack;
         groups.clear();
     }

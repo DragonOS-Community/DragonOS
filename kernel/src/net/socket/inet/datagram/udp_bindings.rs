@@ -47,15 +47,10 @@ impl smoltcp::iface::UdpIngressHandler for NetnsUdpIngress {
                 IpAddress::Ipv4(ipv4.src_addr),
                 IpAddress::Ipv4(ipv4.dst_addr),
             ),
-            smoltcp::wire::IpRepr::Ipv6(ipv6) if !ipv6.dst_addr.is_multicast() => (
+            smoltcp::wire::IpRepr::Ipv6(ipv6) => (
                 IpAddress::Ipv6(ipv6.src_addr),
                 IpAddress::Ipv6(ipv6.dst_addr),
             ),
-            // IPv6 multicast still uses the existing socket delivery path
-            // until its membership table is shared with this ingress handler.
-            smoltcp::wire::IpRepr::Ipv6(_) => {
-                return smoltcp::iface::UdpIngressResult::NotHandled;
-            }
         };
         let Some(netns) = self.netns.upgrade() else {
             return smoltcp::iface::UdpIngressResult::NotHandled;
@@ -94,6 +89,15 @@ impl smoltcp::iface::UdpIngressHandler for NetnsUdpIngress {
                 // single-socket demux or generate ICMP port unreachable.
                 return smoltcp::iface::UdpIngressResult::Consumed;
             }
+        }
+        if dest.addr.is_multicast() {
+            // IPv6 has already passed the actual ingress interface's group
+            // check in smoltcp (including implicit all-nodes/solicited-node).
+            // Never fall back to its single-socket inventory for multicast.
+            netns
+                .udp_bindings()
+                .deliver_ingress(dest, src, ingress_ifindex, false, meta, payload);
+            return smoltcp::iface::UdpIngressResult::Consumed;
         }
         if netns.udp_bindings().deliver_ingress(
             dest,
@@ -341,18 +345,9 @@ impl UdpBindingTable {
         let Ok(candidates) = self.match_bindings(dest.addr, dest.port, src, ifindex) else {
             return 0;
         };
-        let multiaddr = match dest.addr {
-            IpAddress::Ipv4(addr) => u32::from_ne_bytes(addr.octets()),
-            _ => return 0,
-        };
         candidates
             .into_iter()
-            .filter(|candidate| {
-                candidate.socket.ip_multicast_all.load(Ordering::Relaxed)
-                    || candidate
-                        .socket
-                        .has_ipv4_multicast_membership(multiaddr, ifindex)
-            })
+            .filter(|candidate| candidate.socket.accepts_multicast(dest.addr, ifindex))
             .filter(|candidate| {
                 candidate.socket.inject_loopback_packet(
                     candidate.generation,
@@ -413,16 +408,8 @@ impl UdpBindingTable {
             return false;
         }
         if dest.addr.is_multicast() {
-            let IpAddress::Ipv4(addr) = dest.addr else {
-                return false;
-            };
-            let multiaddr = u32::from_ne_bytes(addr.octets());
             for candidate in candidates {
-                if candidate.socket.ip_multicast_all.load(Ordering::Relaxed)
-                    || candidate
-                        .socket
-                        .has_ipv4_multicast_membership(multiaddr, ifindex)
-                {
+                if candidate.socket.accepts_multicast(dest.addr, ifindex) {
                     candidate.socket.inject_ingress_packet(
                         candidate.generation,
                         src,

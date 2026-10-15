@@ -1,5 +1,6 @@
 use inner::{BoundUdp, UdpBindContext, UdpInner, UnboundUdp};
 use smoltcp;
+use smoltcp::wire::IpAddress;
 use system_error::SystemError;
 
 use super::common::error_queue::{
@@ -46,6 +47,7 @@ mod rx_queue;
 mod socket_impl;
 
 pub mod inner;
+mod ipv6_multicast;
 pub mod multicast_loopback;
 pub(crate) mod udp_bindings;
 
@@ -167,6 +169,9 @@ pub struct UdpSocketData {
     ipv6_mtu: AtomicUsize,
     ipv6_multicast_loop: AtomicBool,
     ipv6_multicast_hops: AtomicI32,
+    ipv6_multicast_ifindex: AtomicU32,
+    ipv6_multicast_all: AtomicBool,
+    ipv6_multicast_groups: Mutex<Vec<ipv6_multicast::Membership>>,
     /// SO_LINGER
     linger_onoff: AtomicI32,
     linger_linger: AtomicI32,
@@ -283,6 +288,9 @@ impl UdpSocket {
                 ipv6_mtu: AtomicUsize::new(0),
                 ipv6_multicast_loop: AtomicBool::new(true),
                 ipv6_multicast_hops: AtomicI32::new(1),
+                ipv6_multicast_ifindex: AtomicU32::new(0),
+                ipv6_multicast_all: AtomicBool::new(true),
+                ipv6_multicast_groups: Mutex::new(Vec::new()),
                 linger_onoff: AtomicI32::new(0),
                 linger_linger: AtomicI32::new(0),
                 send_timeout_us: AtomicU64::new(u64::MAX),
@@ -598,9 +606,28 @@ impl UdpSocket {
             required_oif,
             multicast_source,
         )?;
-        let flow_target = flow
+        let mut flow_target = flow
             .map(|flow| output_flow::ephemeral_target(self, flow))
             .transpose()?;
+        if matches!(remote, IpAddress::Ipv6(_)) {
+            let local = IpListenEndpoint {
+                addr: fixed_address,
+                port: 0,
+            };
+            let resolved = crate::net::route::resolve_ipv6_send_route(
+                &self.netns,
+                remote,
+                required_oif,
+                output_flow::bound_source_constraint(&self.netns, local),
+            )?;
+            flow_target = Some(EphemeralBindTarget {
+                stack_owner: resolved.source_owner,
+                // Autobind selects an inventory, not a permanent source.
+                // Keep an explicit address lock retained across disconnect.
+                local_addr: fixed_address
+                    .unwrap_or(IpAddress::Ipv6(smoltcp::wire::Ipv6Address::UNSPECIFIED)),
+            });
+        }
         let fixed_target = fixed_address
             .map(|address| {
                 super::common::explicit_bind_iface(
@@ -772,6 +799,7 @@ impl UdpSocket {
         let mut retired_binding = None;
         let _placement = self.iface_placement.write();
         self.receive_queue.close();
+        self.drop_ipv6_memberships();
         multicast_loopback::multicast_registry().unregister_all(&self.self_ref);
         crate::net::socket::inet::common::multicast::drop_ipv4_memberships(
             &self.netns,
@@ -1480,15 +1508,16 @@ impl UdpSocket {
             if destination.port == 0 {
                 return Err(SystemError::EINVAL);
             }
-            let required_oif = self
-                .device_binding
-                .resolve_iface(&self.netns)?
-                .map(|iface| iface.nic_id() as u32);
+            let (required_oif, _) = output_flow::socket_constraints(self, destination.addr)?;
+            let receive_bind = IpListenEndpoint {
+                addr: fixed_address,
+                port: 0,
+            };
             let resolved = crate::net::route::resolve_ipv6_send_route(
                 &self.netns,
                 destination.addr,
                 required_oif,
-                fixed_address,
+                output_flow::bound_source_constraint(&self.netns, receive_bind),
             )?;
             let mut prepared = self.prepare_iface_socket(resolved.source_owner.clone())?;
             let _placement = self.iface_placement.write();
@@ -1543,14 +1572,9 @@ impl UdpSocket {
             let Ipv6(destination_addr) = destination.addr else {
                 return Err(SystemError::EAFNOSUPPORT);
             };
-            let required_oif = self
-                .device_binding
-                .resolve_iface(&self.netns)?
-                .map(|iface| iface.nic_id() as u32);
-            let fixed_source = local
-                .addr
-                .filter(|addr| !addr.is_unspecified())
-                .or(connected_source);
+            let (required_oif, _) = output_flow::socket_constraints(self, destination.addr)?;
+            let fixed_source =
+                output_flow::bound_source_constraint(&self.netns, local).or(connected_source);
             let resolved = crate::net::route::resolve_ipv6_send_route(
                 &self.netns,
                 destination.addr,

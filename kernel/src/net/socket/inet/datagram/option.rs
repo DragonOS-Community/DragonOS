@@ -465,6 +465,31 @@ impl UdpSocket {
         let v = i32::from_ne_bytes([val[0], val[1], val[2], val[3]]) != 0;
 
         match opt {
+            PIPV6::ADD_MEMBERSHIP
+            | PIPV6::DROP_MEMBERSHIP
+            | PIPV6::MCAST_JOIN_GROUP
+            | PIPV6::MCAST_LEAVE_GROUP => self.set_ipv6_membership(opt, val),
+            PIPV6::MULTICAST_IF => {
+                let index = byte_parser::read_i32(val)? as u32;
+                let _placement = self.iface_placement.write();
+                if index != 0 {
+                    crate::net::socket::inet::common::multicast::find_iface_by_ifindex(
+                        &self.netns,
+                        index as i32,
+                    )
+                    .ok_or(SystemError::ENODEV)?;
+                    let bound = self.device_binding.ifindex();
+                    if bound != 0 && bound != index as usize {
+                        return Err(SystemError::EINVAL);
+                    }
+                }
+                self.ipv6_multicast_ifindex.store(index, Ordering::Release);
+                Ok(())
+            }
+            PIPV6::MULTICAST_ALL => {
+                self.ipv6_multicast_all.store(v, Ordering::Release);
+                Ok(())
+            }
             PIPV6::MULTICAST_LOOP => {
                 let value = byte_parser::read_i32(val)?;
                 if !(0..=1).contains(&value) {
@@ -521,6 +546,8 @@ impl UdpSocket {
         value: &mut [u8],
     ) -> Result<usize, SystemError> {
         let v = match opt {
+            PIPV6::MULTICAST_IF => self.ipv6_multicast_ifindex.load(Ordering::Acquire) as i32,
+            PIPV6::MULTICAST_ALL => self.ipv6_multicast_all.load(Ordering::Acquire) as i32,
             PIPV6::MULTICAST_LOOP => self.ipv6_multicast_loop.load(Ordering::Acquire) as i32,
             PIPV6::MULTICAST_HOPS => self.ipv6_multicast_hops.load(Ordering::Acquire),
             PIPV6::MTU_DISCOVER => self.pmtu_v6.load(Ordering::Acquire),

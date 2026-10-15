@@ -10,7 +10,7 @@ use crate::{
 
 use super::{EphemeralBindTarget, UdpSocket};
 
-/// Returns the Linux IPv4 output constraints supplied by socket options.
+/// Returns the output constraints supplied by socket options.
 /// The SocketSet owner is deliberately absent: it is not an output-device
 /// constraint and must not override the namespace FIB.
 pub(super) fn socket_constraints(
@@ -21,6 +21,12 @@ pub(super) fn socket_constraints(
         .device_binding
         .resolve_iface(&socket.netns)?
         .map(|iface| iface.nic_id() as u32);
+    if matches!(destination, IpAddress::Ipv6(address) if address.is_multicast()) {
+        let oif = socket
+            .ipv6_multicast_ifindex
+            .load(core::sync::atomic::Ordering::Acquire);
+        return Ok((device_oif.or((oif != 0).then_some(oif)), None));
+    }
     if !matches!(destination, IpAddress::Ipv4(address) if address.is_multicast()) {
         return Ok((device_oif, None));
     }
@@ -71,7 +77,7 @@ fn needs_flow(destination: IpAddress) -> bool {
 /// multicast and broadcast bind addresses select received traffic, while the
 /// transmit source remains route-selected. Keep that distinction here instead
 /// of teaching the FIB that non-unicast addresses are locally owned sources.
-fn bound_source_constraint(
+pub(super) fn bound_source_constraint(
     netns: &Arc<NetNamespace>,
     local: IpListenEndpoint,
 ) -> Option<IpAddress> {

@@ -21,6 +21,7 @@ struct OptvalCopySpec {
     len: usize,
     fault_is_einval: bool,
     stop_at_nul: bool,
+    null_is_zero: bool,
 }
 
 impl OptvalCopySpec {
@@ -29,6 +30,7 @@ impl OptvalCopySpec {
             len,
             fault_is_einval: false,
             stop_at_nul: false,
+            null_is_zero: false,
         }
     }
 
@@ -37,6 +39,7 @@ impl OptvalCopySpec {
             len,
             fault_is_einval: true,
             stop_at_nul: false,
+            null_is_zero: false,
         }
     }
 
@@ -45,6 +48,15 @@ impl OptvalCopySpec {
             len,
             fault_is_einval: false,
             stop_at_nul: true,
+            null_is_zero: false,
+        }
+    }
+
+    /// IPv6's initial scalar read treats a NULL sockptr as integer zero.
+    const fn ipv6_scalar_prefix(len: usize) -> Self {
+        Self {
+            null_is_zero: true,
+            ..Self::bytes(len)
         }
     }
 
@@ -103,7 +115,9 @@ impl Syscall for SysSetsockoptHandle {
         let sol = PSOL::try_from(level as u32)?;
         let copy_spec = Self::optval_copy_spec(sol, optname, optlen)?;
         let mut storage = [0u8; Self::MAX_OPTVAL_COPY];
-        let copied = if copy_spec.stop_at_nul {
+        let copied = if copy_spec.null_is_zero && optval.is_null() {
+            copy_spec.len
+        } else if copy_spec.stop_at_nul {
             // Linux's string options stop at the first NUL. Read one protected
             // byte at a time so an inaccessible tail after that terminator is
             // never touched.
@@ -160,9 +174,9 @@ impl Syscall for SysSetsockoptHandle {
 
 impl SysSetsockoptHandle {
     /// Largest fixed UAPI object copied by a currently supported option
-    /// (Linux's 40-byte internal `packet_mreq_max`). Keeping it on the stack makes
+    /// (native Linux's 136-byte `group_req`). Keeping it on the stack makes
     /// userspace `optlen` incapable of driving kernel heap allocation.
-    const MAX_OPTVAL_COPY: usize = 8 + 32;
+    const MAX_OPTVAL_COPY: usize = 136;
 
     /// Return the prefix that the selected Linux 6.6 option actually consumes.
     /// Exact-width options are validated here so their EINVAL-before-EFAULT
@@ -226,7 +240,33 @@ impl SysSetsockoptHandle {
                     PIPV6::try_from(optname as u32),
                     Ok(PIPV6::ADD_MEMBERSHIP | PIPV6::DROP_MEMBERSHIP)
                 ) {
-                    OptvalCopySpec::bytes(optlen.min(IPV6_MREQ_LEN))
+                    if optlen >= IPV6_MREQ_LEN {
+                        OptvalCopySpec::bytes(IPV6_MREQ_LEN)
+                    } else {
+                        OptvalCopySpec::ipv6_scalar_prefix(if optlen >= INT_LEN {
+                            INT_LEN
+                        } else {
+                            0
+                        })
+                    }
+                } else if matches!(
+                    PIPV6::try_from(optname as u32),
+                    Ok(PIPV6::MCAST_JOIN_GROUP | PIPV6::MCAST_LEAVE_GROUP)
+                ) {
+                    if optlen >= 136 {
+                        OptvalCopySpec::bytes(136)
+                    } else {
+                        OptvalCopySpec::ipv6_scalar_prefix(if optlen >= INT_LEN {
+                            INT_LEN
+                        } else {
+                            0
+                        })
+                    }
+                } else if matches!(
+                    PIPV6::try_from(optname as u32),
+                    Ok(PIPV6::MULTICAST_IF | PIPV6::MULTICAST_ALL)
+                ) {
+                    OptvalCopySpec::ipv6_scalar_prefix(if optlen >= INT_LEN { INT_LEN } else { 0 })
                 } else {
                     OptvalCopySpec::bytes(optlen.min(INT_LEN))
                 }

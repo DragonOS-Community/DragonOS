@@ -68,6 +68,7 @@ TEST_F(KernelBufferSelftest, ChecksPassAndSnapshotIsStableAcrossPartialReads) {
         EXPECT_NE(std::string::npos, complete.find("summary_fail=0\n")) << complete;
         for (const char* check : {"strategy_zero_data_accounting=ok\n",
                                   "failure_fallback_admission=ok\n",
+                                  "unsupported_virtual_heap=ok\n",
                                   "context_size_rejection=ok\n",
                                   "fragmented_arena_buffer=ok\n"}) {
             EXPECT_NE(std::string::npos, complete.find(check)) << complete;

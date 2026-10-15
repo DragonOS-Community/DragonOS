@@ -209,6 +209,19 @@ pub(super) fn task_context() -> bool {
 }
 
 impl VmAllocation {
+    /// Whether this platform can provide the required writable, non-executable
+    /// mappings. This does not promise address space, memory, or task context.
+    pub(super) fn is_supported() -> bool {
+        #[cfg(target_arch = "x86_64")]
+        {
+            !crate::arch::mm::X86_64MMArch::is_xd_reserved()
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            true
+        }
+    }
+
     #[cfg(feature = "mm_selftest")]
     pub(crate) fn try_new_zeroed(layout: Layout) -> Result<Self, MemoryAllocationError> {
         if !task_context() {
@@ -273,8 +286,7 @@ impl VmAllocation {
         if !task_context() {
             return Err(SystemError::EAGAIN_OR_EWOULDBLOCK.into());
         }
-        #[cfg(target_arch = "x86_64")]
-        if crate::arch::mm::X86_64MMArch::is_xd_reserved() {
+        if !Self::is_supported() {
             return Err(SystemError::ENOSYS.into());
         }
         if layout.size() == 0 {

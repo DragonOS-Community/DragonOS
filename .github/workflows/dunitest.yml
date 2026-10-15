@@ -39,6 +39,7 @@ jobs:
           # Optional selftests must execute in this opt-in CI kernel, never silently skip.
           cat >> user/apps/tests/dunitest/no_skip.txt <<'EOF'
           normal/vmalloc_selftest
+          normal/kernel_buffer_selftest
           normal/allocation_diagnostics
           normal/dma_allocator_selftest
           EOF

@@ -22,11 +22,29 @@ use crate::{
     time::{clocksource::HZ, timer::clock},
 };
 
-// A transaction-local failure budget: never affects another allocation.
-pub(super) struct FailureBudget(pub(super) Option<usize>);
-impl FailureBudget {
+// Transaction-local controls: ordinary users never consume selftest VA or
+// injected failures. Selftests share the real allocator and teardown code.
+pub(super) struct AllocationTest {
+    remaining: Option<usize>,
+    pub(super) isolated: bool,
+}
+impl AllocationTest {
+    pub(super) const fn ordinary() -> Self {
+        Self {
+            remaining: None,
+            isolated: false,
+        }
+    }
+
+    pub(super) const fn isolated(remaining: Option<usize>) -> Self {
+        Self {
+            remaining,
+            isolated: true,
+        }
+    }
+
     pub(super) fn step(&mut self) -> Result<(), SystemError> {
-        if let Some(left) = &mut self.0 {
+        if let Some(left) = &mut self.remaining {
             if *left == 0 {
                 return Err(SystemError::ENOMEM);
             }
@@ -39,8 +57,7 @@ impl FailureBudget {
 static TEST_LOCK: Mutex<()> = Mutex::new(());
 
 fn used_pages() -> usize {
-    POOL.lock_irqsave()
-        .used
+    POOL.lock_irqsave().used[SELFTEST_START / 64..]
         .iter()
         .map(|word| word.count_ones() as usize)
         .sum()
@@ -66,6 +83,27 @@ fn basic() -> bool {
     })
 }
 
+fn allocation_domains() -> bool {
+    let Ok(mut ordinary) =
+        crate::mm::kernel_buffer::KernelBuffer::try_new_zeroed(3 * MMArch::PAGE_SIZE)
+    else {
+        return false;
+    };
+    let layout = Layout::from_size_align(MMArch::PAGE_SIZE, MMArch::PAGE_SIZE).unwrap();
+    let Ok(mut isolated) = VmAllocation::try_new_zeroed(layout) else {
+        return false;
+    };
+    let split = BASE + SELFTEST_START * MMArch::PAGE_SIZE;
+    let address = ordinary.as_ptr() as usize;
+    let separate =
+        address >= BASE && address + ordinary.len() <= split && isolated.start >= SELFTEST_START;
+    ordinary.fill(0x62);
+    isolated.as_mut_slice().fill(0x91);
+    separate
+        && ordinary.iter().all(|byte| *byte == 0x62)
+        && isolated.as_slice().iter().all(|byte| *byte == 0x91)
+}
+
 fn rollback() -> bool {
     let layout = Layout::from_size_align(65 * MMArch::PAGE_SIZE, 2 << 20).unwrap();
     let baseline = used_pages();
@@ -81,7 +119,7 @@ fn rollback() -> bool {
         let result = VmAllocation::allocate_owned(
             layout,
             65,
-            &mut FailureBudget(Some(step)),
+            &mut AllocationTest::isolated(Some(step)),
             &mut frame_zeroed,
             prepared.object_account(),
         );
@@ -128,20 +166,22 @@ fn noncontiguous() -> bool {
         count: 0,
     };
     let layout = Layout::from_size_align(4 * MMArch::PAGE_SIZE, MMArch::PAGE_SIZE).unwrap();
-    let allocation = VmAllocation::allocate_with(layout, &mut FailureBudget(None), &mut || {
-        let (even, count) = unsafe {
-            LockedFrameAllocator.allocate_below(PageFrameCount::new(2), PhysAddr::new(usize::MAX))
-        }
-        .ok_or(SystemError::ENOMEM)?;
-        assert_eq!(count, PageFrameCount::new(2));
-        // Splitting a globally allocated order-1 run into two order-0 owners is
-        // supported by buddy. Retain every odd page until the buffer is destroyed.
-        odd.frames[odd.count] = even + MMArch::PAGE_SIZE;
-        odd.count += 1;
-        let address = unsafe { MMArch::phys_2_virt(even) }.unwrap();
-        unsafe { core::ptr::write_bytes(address.as_ptr::<u8>(), 0, MMArch::PAGE_SIZE) };
-        Ok(even)
-    });
+    let allocation =
+        VmAllocation::allocate_with(layout, &mut AllocationTest::isolated(None), &mut || {
+            let (even, count) = unsafe {
+                LockedFrameAllocator
+                    .allocate_below(PageFrameCount::new(2), PhysAddr::new(usize::MAX))
+            }
+            .ok_or(SystemError::ENOMEM)?;
+            assert_eq!(count, PageFrameCount::new(2));
+            // Splitting a globally allocated order-1 run into two order-0 owners is
+            // supported by buddy. Retain every odd page until the buffer is destroyed.
+            odd.frames[odd.count] = even + MMArch::PAGE_SIZE;
+            odd.count += 1;
+            let address = unsafe { MMArch::phys_2_virt(even) }.unwrap();
+            unsafe { core::ptr::write_bytes(address.as_ptr::<u8>(), 0, MMArch::PAGE_SIZE) };
+            Ok(even)
+        });
     let Ok(mut allocation) = allocation else {
         return false;
     };
@@ -286,7 +326,22 @@ fn boundaries() -> bool {
         VmAllocation::try_new_zeroed(Layout::from_size_align(isize::MAX as usize, 1).unwrap()),
         Err(MemoryAllocationError::System(SystemError::ENOMEM))
     );
-    zero && too_large && too_aligned && huge && used_pages() == baseline
+    let window_too_large = matches!(
+        VmAllocation::try_new_zeroed(
+            Layout::from_size_align(SELFTEST_PAGES * MMArch::PAGE_SIZE + 1, 1).unwrap()
+        ),
+        Err(MemoryAllocationError::System(SystemError::ENOMEM))
+    );
+    let window_alignment = matches!(
+        VmAllocation::try_new_zeroed(Layout::from_size_align(1, SIZE).unwrap()),
+        Err(MemoryAllocationError::System(SystemError::ENOMEM))
+    );
+    zero && too_large
+        && too_aligned
+        && huge
+        && window_too_large
+        && window_alignment
+        && used_pages() == baseline
 }
 
 fn accounting() -> bool {
@@ -304,7 +359,7 @@ fn accounting() -> bool {
     let Ok(allocation) = VmAllocation::allocate_owned(
         layout,
         pages,
-        &mut FailureBudget(None),
+        &mut AllocationTest::isolated(None),
         &mut frame_zeroed,
         owner,
     ) else {
@@ -345,7 +400,7 @@ fn admission_failures(root: &Arc<MemoryAccount>, layout: Layout, pages: usize) -
         let result = VmAllocation::allocate_owned(
             layout,
             pages,
-            &mut FailureBudget(None),
+            &mut AllocationTest::isolated(None),
             &mut || {
                 data_calls += 1;
                 frame_zeroed()
@@ -477,15 +532,16 @@ fn smp_visibility() -> bool {
     let old_frame = allocation.chunks.as_ref().unwrap().frames[0];
     drop(allocation);
     let mut retained_old = None;
-    let replacement = VmAllocation::allocate_with(layout, &mut FailureBudget(None), &mut || {
-        let frame = frame_zeroed()?;
-        if frame == old_frame {
-            retained_old = Some(frame);
-            frame_zeroed()
-        } else {
-            Ok(frame)
-        }
-    });
+    let replacement =
+        VmAllocation::allocate_with(layout, &mut AllocationTest::isolated(None), &mut || {
+            let frame = frame_zeroed()?;
+            if frame == old_frame {
+                retained_old = Some(frame);
+                frame_zeroed()
+            } else {
+                Ok(frame)
+            }
+        });
     let reused = replacement
         .as_ref()
         .is_ok_and(|allocation| allocation.address().data() == address);
@@ -589,6 +645,7 @@ pub(crate) fn report() -> String {
     let _serial = TEST_LOCK.lock();
     let cases = [
         ("zero_alignment_cross_page", basic()),
+        ("allocation_domains", allocation_domains()),
         ("partial_failure_rollback", rollback()),
         ("noncontiguous_backing", noncontiguous()),
         ("shared_table_lifetime", shared_table()),

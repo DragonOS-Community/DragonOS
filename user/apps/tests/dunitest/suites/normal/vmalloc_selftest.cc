@@ -31,8 +31,8 @@ class VmallocSelftest : public ::testing::Test {
     }
 };
 
-constexpr std::array<const char*, 8> kChecks = {
-    "zero_alignment_cross_page", "partial_failure_rollback", "noncontiguous_backing",
+constexpr std::array<const char*, 9> kChecks = {
+    "zero_alignment_cross_page", "allocation_domains", "partial_failure_rollback", "noncontiguous_backing",
     "shared_table_lifetime", "layout_boundaries", "accounting", "smp_visibility_reuse",
     "completion_deadline",
 };

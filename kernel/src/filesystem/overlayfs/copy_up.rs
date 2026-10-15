@@ -571,6 +571,12 @@ impl OvlInode {
 
         let lower_file = File::new(lower_inode, FileFlags::O_RDONLY)?;
         let upper_file = File::new(upper_inode, FileFlags::O_WRONLY)?;
+        #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
+        let mut buffer =
+            crate::mm::kernel_buffer::KernelBuffer::try_new_zeroed(COPY_UP_CHUNK_SIZE.min(size))?;
+        // Architectures without the shared vmalloc subtree keep their existing
+        // heap contract until that mapping backend is implemented.
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "riscv64")))]
         let mut buffer = vec![0u8; COPY_UP_CHUNK_SIZE.min(size)];
         let mut offset = 0usize;
 

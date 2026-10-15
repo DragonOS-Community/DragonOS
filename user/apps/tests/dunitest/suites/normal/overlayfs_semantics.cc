@@ -243,6 +243,42 @@ bool validate_pattern_file(const std::string& path, size_t size) {
     return ok;
 }
 
+bool validate_complete_pattern_file(const std::string& path, size_t size) {
+    int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        return false;
+    }
+    struct stat st = {};
+    bool ok = fstat(fd, &st) == 0 && st.st_size == static_cast<off_t>(size);
+    size_t offset = 0;
+    char buffer[4096];
+    while (ok && offset < size) {
+        ssize_t count = read(fd, buffer, std::min(sizeof(buffer), size - offset));
+        if (count < 0 && errno == EINTR) {
+            continue;
+        }
+        if (count <= 0) {
+            ok = false;
+            break;
+        }
+        for (ssize_t i = 0; i < count; ++i) {
+            if (buffer[i] != static_cast<char>((offset + static_cast<size_t>(i)) & 0xff)) {
+                ok = false;
+                break;
+            }
+        }
+        offset += static_cast<size_t>(count);
+    }
+    if (ok) {
+        ssize_t count;
+        do {
+            count = read(fd, buffer, 1);
+        } while (count < 0 && errno == EINTR);
+        ok = count == 0;
+    }
+    return close(fd) == 0 && ok;
+}
+
 long renameat2_call(const std::string& old_path, const std::string& new_path, unsigned flags) {
     return syscall(__NR_renameat2, AT_FDCWD, old_path.c_str(), AT_FDCWD, new_path.c_str(), flags);
 }
@@ -1729,6 +1765,50 @@ TEST(OverlayFsSemantics, CopyUpLowerFilePublishesCompleteUpperFile) {
     EXPECT_EQ("lower-copy-up-data", read_text(upper_file));
     EXPECT_EQ("lower-copy-up-data", read_text(merged_file));
     EXPECT_EQ(0, overlay_temp_entry_count(env.work));
+}
+
+TEST(OverlayFsSemantics, CopyUpBufferBoundariesPreserveEveryByteAcrossRepeatedFiles) {
+    const size_t sizes[] = {
+        0, 1, 2048, 2049, 4096, 4097, 8192, 8193, 65536, 65537, 3 * 65536 + 137,
+    };
+    constexpr size_t kRounds = 3;
+    ScopedOverlayEnv scoped("overlayfs_copy_up_buffer_boundaries");
+    const auto& env = scoped.env;
+    prepare_overlay_env(env);
+
+    // Populate all lower files before mounting; each open below must perform
+    // a fresh copy-up rather than reuse an already-published upper inode.
+    for (size_t round = 0; round < kRounds; ++round) {
+        for (size_t size : sizes) {
+            const std::string name = std::to_string(round) + "_" + std::to_string(size);
+            ASSERT_TRUE(write_pattern_file(join_path(env.lower, name.c_str()), size))
+                << name << ": " << strerror(errno);
+        }
+    }
+    ASSERT_TRUE(setup_overlay_env(env)) << strerror(errno);
+
+    for (size_t round = 0; round < kRounds; ++round) {
+        for (size_t size : sizes) {
+            const std::string name = std::to_string(round) + "_" + std::to_string(size);
+            SCOPED_TRACE(name);
+            const std::string lower = join_path(env.lower, name.c_str());
+            const std::string upper = join_path(env.upper, name.c_str());
+            const std::string merged = join_path(env.merged, name.c_str());
+            ASSERT_FALSE(path_exists(upper));
+            // Metadata mutation on a read-only descriptor also triggers copy-up.
+            const int flags = round == 1 ? O_RDONLY : O_WRONLY;
+            const int fd = open(merged.c_str(), flags | O_CLOEXEC);
+            ASSERT_GE(fd, 0) << strerror(errno);
+            if (round == 1) {
+                ASSERT_EQ(0, fchmod(fd, 0640)) << strerror(errno);
+            }
+            ASSERT_EQ(0, close(fd)) << strerror(errno);
+            EXPECT_TRUE(validate_complete_pattern_file(upper, size)) << strerror(errno);
+            EXPECT_TRUE(validate_complete_pattern_file(merged, size)) << strerror(errno);
+            EXPECT_TRUE(validate_complete_pattern_file(lower, size)) << strerror(errno);
+            EXPECT_EQ(0, overlay_temp_entry_count(env.work));
+        }
+    }
 }
 
 TEST(OverlayFsSemantics, CopyUpDataTransferDoesNotPublishAccessOrModify) {

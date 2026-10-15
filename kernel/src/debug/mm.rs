@@ -20,6 +20,11 @@ enum MmReportCallback {
     AllocationSelftest,
     #[cfg(feature = "mm_selftest")]
     VmallocSelftest,
+    #[cfg(all(
+        feature = "mm_selftest",
+        any(target_arch = "x86_64", target_arch = "riscv64")
+    ))]
+    KernelBufferSelftest,
 }
 
 impl KernFSCallback for MmReportCallback {
@@ -38,6 +43,11 @@ impl KernFSCallback for MmReportCallback {
             }
             #[cfg(feature = "mm_selftest")]
             Self::VmallocSelftest => crate::mm::vmalloc::selftest_report(),
+            #[cfg(all(
+                feature = "mm_selftest",
+                any(target_arch = "x86_64", target_arch = "riscv64")
+            ))]
+            Self::KernelBufferSelftest => crate::mm::kernel_buffer::selftest_report(),
         };
         data.file_private_data_mut()
             .replace(KernFilePrivateData::DebugTextSnapshot(report));
@@ -116,6 +126,17 @@ pub fn init_debugfs_mm() -> Result<(), SystemError> {
         Some(4096),
         None,
         Some(&MmReportCallback::VmallocSelftest),
+    )?;
+    #[cfg(all(
+        feature = "mm_selftest",
+        any(target_arch = "x86_64", target_arch = "riscv64")
+    ))]
+    mm.add_file(
+        "kernel_buffer_selftest".to_string(),
+        InodeMode::S_IRUSR,
+        Some(4096),
+        None,
+        Some(&MmReportCallback::KernelBufferSelftest),
     )?;
     Ok(())
 }

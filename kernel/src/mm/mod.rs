@@ -29,6 +29,8 @@ pub mod early_ioremap;
 pub mod fault;
 pub mod ident_map;
 pub mod init;
+#[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
+pub(crate) mod kernel_buffer;
 pub mod kernel_mapper;
 pub mod madvise;
 pub mod memblock;

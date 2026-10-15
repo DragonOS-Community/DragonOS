@@ -233,6 +233,14 @@ impl TcpSocket {
     }
 
     pub fn do_bind(&self, local_endpoint: smoltcp::wire::IpEndpoint) -> Result<(), SystemError> {
+        self.do_bind_scoped(local_endpoint.into())
+    }
+
+    pub(super) fn do_bind_scoped(
+        &self,
+        address: crate::net::socket::endpoint::InetEndpoint,
+    ) -> Result<(), SystemError> {
+        let local_endpoint = address.wire();
         if local_endpoint.addr.version() != self.ip_version {
             return Err(SystemError::EAFNOSUPPORT);
         }
@@ -254,10 +262,14 @@ impl TcpSocket {
         // Reject invalid mapped/v6-only input before fallible capacity work;
         // bind_once repeats this while holding inner against option changes.
         self.normalize_endpoint(local_endpoint, false)?;
-        self.with_new_handle_capacity(|| self.bind_once(local_endpoint))
+        self.with_new_handle_capacity(|| self.bind_once(local_endpoint, address.scope_id))
     }
 
-    fn bind_once(&self, local_endpoint: smoltcp::wire::IpEndpoint) -> Result<(), SystemError> {
+    fn bind_once(
+        &self,
+        local_endpoint: smoltcp::wire::IpEndpoint,
+        scope: u32,
+    ) -> Result<(), SystemError> {
         let reserved = self.prepare_bound_slot()?;
         let mut writer = self.inner.write();
         if !matches!(
@@ -267,10 +279,31 @@ impl TcpSocket {
             return Err(SystemError::EINVAL);
         }
         let local_endpoint = self.normalize_endpoint(local_endpoint, false)?;
+        if crate::net::socket::endpoint::needs_scope_id(local_endpoint.addr) {
+            let mut update = self.device_binding.prepare_scope_bind(scope)?;
+            update.commit();
+            let device = core::num::NonZeroU32::new(self.device_binding.ifindex() as u32);
+            writer
+                .as_mut()
+                .expect("TCP state is present")
+                .for_each_socket_mut(|socket| socket.set_bound_device(device));
+        }
         let v6_only = self
             .options
             .ipv6_only
             .load(core::sync::atomic::Ordering::Relaxed);
+        if matches!(local_endpoint.addr, smoltcp::wire::IpAddress::Ipv6(address) if !address.is_unspecified())
+        {
+            let device = self.device_binding.resolve_iface(&self.netns)?;
+            if matches!(local_endpoint.addr, smoltcp::wire::IpAddress::Ipv6(address) if address.is_unicast_link_local())
+            {
+                super::super::common::explicit_bind_iface(
+                    local_endpoint.addr,
+                    &self.netns,
+                    device,
+                )?;
+            }
+        }
         let result = match writer.take().expect("Tcp inner::Inner is None") {
             inner::Inner::Init(inner) => match inner.bind(
                 local_endpoint,
@@ -516,13 +549,29 @@ impl TcpSocket {
         &self,
         remote_endpoint: smoltcp::wire::IpEndpoint,
     ) -> Result<(), SystemError> {
+        self.start_connect_scoped(remote_endpoint.into())
+    }
+
+    pub(super) fn start_connect_scoped(
+        &self,
+        address: crate::net::socket::endpoint::InetEndpoint,
+    ) -> Result<(), SystemError> {
+        let remote_endpoint = address.wire();
         self.normalize_endpoint(remote_endpoint, true)?;
-        self.with_new_handle_capacity(|| self.start_connect_once(remote_endpoint))
+        self.with_new_handle_capacity(|| self.start_connect_once(remote_endpoint, address.scope_id))
+            .map_err(|error| {
+                if matches!(remote_endpoint.addr, smoltcp::wire::IpAddress::Ipv6(_)) {
+                    super::super::common::ipv6_connect_error(error)
+                } else {
+                    error
+                }
+            })
     }
 
     fn start_connect_once(
         &self,
         remote_endpoint: smoltcp::wire::IpEndpoint,
+        scope: u32,
     ) -> Result<(), SystemError> {
         let mut prepared_registration = None;
         let mut writer = loop {
@@ -545,6 +594,21 @@ impl TcpSocket {
             break writer;
         };
         let remote_endpoint = self.normalize_endpoint(remote_endpoint, true)?;
+        if matches!(remote_endpoint.addr, smoltcp::wire::IpAddress::Ipv6(address) if address.is_multicast())
+        {
+            return Err(SystemError::ENETUNREACH);
+        }
+        if crate::net::socket::endpoint::needs_scope_id(remote_endpoint.addr)
+            && matches!(writer.as_ref(), Some(inner::Inner::Init(_)))
+        {
+            let mut update = self.device_binding.prepare_scope_connect(scope, 0)?;
+            update.commit();
+            let device = core::num::NonZeroU32::new(self.device_binding.ifindex() as u32);
+            writer
+                .as_mut()
+                .expect("TCP state is present")
+                .for_each_socket_mut(|socket| socket.set_bound_device(device));
+        }
         let remote_endpoint =
             crate::net::socket::inet::common::normalize_unspecified_endpoint_to_loopback(
                 remote_endpoint,

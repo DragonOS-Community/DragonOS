@@ -2,7 +2,6 @@ use core::sync::atomic::Ordering;
 use smoltcp::wire::{IpAddress, IpProtocol, IpVersion, Ipv4Packet};
 use system_error::SystemError;
 
-use crate::driver::net::Iface;
 use crate::filesystem::vfs::iov::IoVecs;
 use crate::net::posix::SockAddr;
 use crate::net::socket::endpoint::Endpoint;
@@ -12,7 +11,6 @@ use crate::net::socket::{IpOption, PIPV6, PMSG, PSOL};
 use crate::syscall::user_access::UserBufferReader;
 
 use super::inner::RawInner;
-use super::loopback::is_loopback_addr;
 use super::packet::{build_ip_packet, emit_ipv4_packet, IpPacketParams};
 use super::RawSocket;
 
@@ -58,6 +56,7 @@ impl RawSocket {
         buf: &[u8],
         to: Option<IpAddress>,
         options: &super::options::RawSocketOptions,
+        scope_oif: Option<u32>,
     ) -> Result<usize, SystemError> {
         self.take_pending_error()?;
         if self.protocol == IpProtocol::Unknown(255) {
@@ -72,20 +71,20 @@ impl RawSocket {
         if !matches!(destination, IpAddress::Ipv6(_)) {
             return Err(SystemError::EAFNOSUPPORT);
         }
-        self.ensure_not_loopback_wildcard_for_send(destination)?;
-        if !self.is_bound() {
-            self.bind_ephemeral(destination)?;
-        }
         let fixed_source = match self.inner.read().as_ref() {
             Some(RawInner::Bound(bound) | RawInner::Wildcard(bound)) => bound
                 .local_addr()
-                .filter(|address| !address.is_unspecified()),
-            _ => return Err(SystemError::ENOTCONN),
+                .filter(|address| !address.is_unspecified() && !address.is_multicast()),
+            Some(RawInner::Unbound(_)) => None,
+            None => return Err(SystemError::ENOTCONN),
         };
-        let required_oif = self
-            .device_binding
-            .resolve_iface(&self.netns)?
-            .map(|iface| iface.nic_id() as u32);
+        let required_oif = match scope_oif {
+            Some(index) => Some(index),
+            None => self
+                .device_binding
+                .resolve_iface(&self.netns)?
+                .map(|iface| iface.nic_id() as u32),
+        };
         let (route, owner, source) = if options.ip_hdrincl {
             let route = crate::net::route::resolve_ipv6_output_route(
                 &self.netns,
@@ -113,6 +112,15 @@ impl RawSocket {
                 Some(resolved.source),
             )
         };
+        if !self.is_bound() {
+            // Attachment is receive inventory, not a permanent output source.
+            // Keep per-message scope selection independent on later sends.
+            self.bind_attachment(
+                owner.clone(),
+                IpAddress::Ipv6(smoltcp::wire::Ipv6Address::UNSPECIFIED),
+                true,
+            )?;
+        }
         if options.ip_hdrincl {
             if buf.len() < crate::net::socket::utils::IPV6_HEADER_LEN {
                 return Err(SystemError::EINVAL);
@@ -397,38 +405,6 @@ impl RawSocket {
         Ok(buf.len())
     }
 
-    /// 发送前确保 socket 绑定在合适的 iface 上。
-    ///
-    /// 背景：raw socket 在创建时可能处于 Wildcard 状态并附着到 loopback 以便接收/唤醒。
-    /// 但对非 loopback 目的地址发送时，Linux 语义应根据目的地址选路/选出口网卡，
-    /// 而不是把发送也锁死在 loopback。
-    fn ensure_not_loopback_wildcard_for_send(&self, dest: IpAddress) -> Result<(), SystemError> {
-        // loopback 目的地址仍走 loopback 快速路径，不需要切换 iface
-        if is_loopback_addr(dest) {
-            return Ok(());
-        }
-
-        let needs_rebind = {
-            let guard = self.inner.read();
-            match guard.as_ref() {
-                Some(RawInner::Wildcard(bound)) => {
-                    if let Some(lo) = self.netns.loopback_iface() {
-                        bound.inner().iface().nic_id() == lo.nic_id()
-                    } else {
-                        false
-                    }
-                }
-                _ => false,
-            }
-        };
-
-        if needs_rebind {
-            // 从 Wildcard(lo) 切换为按目的地址选址的 Bound(iface)。
-            self.bind_ephemeral(dest)?;
-        }
-        Ok(())
-    }
-
     /// 尝试发送数据包
     pub fn try_send(
         &self,
@@ -453,7 +429,7 @@ impl RawSocket {
         }
 
         let options = self.options.read().clone();
-        self.try_send_ipv6_prepared(buf, to, &options)
+        self.try_send_ipv6_prepared(buf, to, &options, None)
     }
 
     fn can_retry_ipv4_send(&self, packet_len: usize) -> bool {
@@ -497,6 +473,15 @@ impl RawSocket {
         address: Endpoint,
     ) -> Result<usize, SystemError> {
         if let Endpoint::Ip(remote) = address {
+            if self.is_ipv6() {
+                let options = self.options.read().clone();
+                return self.try_send_ipv6_prepared(
+                    buffer,
+                    Some(remote.addr),
+                    &options,
+                    remote.scope_oif(),
+                );
+            }
             if flags.contains(PMSG::DONTWAIT) || self.is_nonblock() {
                 return self.try_send(buffer, Some(remote.addr));
             }
@@ -539,12 +524,16 @@ impl RawSocket {
         let buf = iovs.gather()?;
 
         // Parse destination address if provided.
+        let mut scope_oif = None;
         let mut to_ip: Option<IpAddress> = if msg.msg_name.is_null() {
             None
         } else {
             let ep = SockAddr::to_endpoint(msg.msg_name as *const SockAddr, msg.msg_namelen)?;
             match ep {
-                Endpoint::Ip(ip) => Some(ip.addr),
+                Endpoint::Ip(ip) => {
+                    scope_oif = ip.scope_oif();
+                    Some(ip.addr)
+                }
                 _ => return Err(SystemError::EAFNOSUPPORT),
             }
         };
@@ -660,6 +649,6 @@ impl RawSocket {
             }
         }
 
-        self.try_send_ipv6_prepared(&buf, Some(dest), &options)
+        self.try_send_ipv6_prepared(&buf, Some(dest), &options, scope_oif)
     }
 }

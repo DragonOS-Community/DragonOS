@@ -532,8 +532,37 @@ impl UdpSocket {
         )
     }
 
-    pub fn do_bind(&self, endpoint: smoltcp::wire::IpEndpoint) -> Result<(), SystemError> {
+    pub fn do_bind(
+        &self,
+        address: crate::net::socket::endpoint::InetEndpoint,
+    ) -> Result<(), SystemError> {
+        let endpoint = address.wire();
         super::common::port_policy::check_bind_access(&self.netns, endpoint, self.ip_version)?;
+        if self.ip_version == IpVersion::Ipv4 && matches!(endpoint.addr, Ipv6(_)) {
+            return Err(SystemError::EAFNOSUPPORT);
+        }
+        let scope =
+            crate::net::socket::endpoint::needs_scope_id(address.addr).then_some(address.scope_id);
+        let bind_iface = |index| {
+            let device = if index == 0 {
+                None
+            } else {
+                Some(
+                    self.netns
+                        .device_list()
+                        .get(&index)
+                        .cloned()
+                        .ok_or(SystemError::ENODEV)?,
+                )
+            };
+            if device.is_some()
+                && !endpoint.addr.is_unspecified()
+                && super::common::get_iface_for_local_bind(&endpoint.addr, &self.netns).is_none()
+            {
+                return Err(SystemError::EADDRNOTAVAIL);
+            }
+            super::common::explicit_bind_iface(endpoint.addr, &self.netns, device)
+        };
         loop {
             {
                 let inner = self.inner.read();
@@ -543,37 +572,51 @@ impl UdpSocket {
                     Some(UdpInner::Unbound(_)) => {}
                 }
             }
-            let device = self.device_binding.resolve_iface(&self.netns)?;
-            if device.is_some()
-                && !endpoint.addr.is_unspecified()
-                && super::common::get_iface_for_local_bind(&endpoint.addr, &self.netns).is_none()
-            {
-                return Err(SystemError::EADDRNOTAVAIL);
-            }
-            let iface = super::common::explicit_bind_iface(endpoint.addr, &self.netns, device)?;
-            let mut prepared = self.prepare_iface_socket(iface.clone())?;
-            let placement = self.iface_placement.write();
+            let candidate = scope
+                .filter(|index| *index != 0)
+                .map_or_else(|| self.device_binding.ifindex(), |index| index as usize);
+            let target = bind_iface(candidate);
+            let mut prepared = target
+                .as_ref()
+                .map_err(|error| error.clone())
+                .and_then(|iface| self.prepare_iface_socket(iface.clone()));
+            // Prepare/recover without socket guards. Keep all interface pins
+            // outside the short device -> placement -> state transaction too.
+            let current;
+            let mut update = scope
+                .map(|scope| self.device_binding.prepare_scope_bind(scope))
+                .transpose()?;
+            let _placement = self.iface_placement.write();
             let mut inner = self.inner.write();
             match inner.as_ref() {
                 None => return Err(SystemError::EBADF),
                 Some(UdpInner::Bound(_)) => return Err(SystemError::EINVAL),
                 Some(UdpInner::Unbound(_)) => {}
             }
-            let current = super::common::explicit_bind_iface(
-                endpoint.addr,
-                &self.netns,
-                self.device_binding.resolve_iface(&self.netns)?,
-            )?;
-            if !Arc::ptr_eq(&iface, &current) {
-                drop(inner);
-                drop(placement);
-                drop(prepared);
+            let effective = update.as_ref().map_or_else(
+                || self.device_binding.ifindex(),
+                |update| update.target_ifindex(),
+            );
+            if effective != candidate {
                 continue;
             }
+            if let Some(update) = update.as_mut() {
+                // State-race losers cannot change the winner's scope. Genuine
+                // address/device failures retain the accepted numeric scope.
+                update.commit();
+            }
+            current = bind_iface(effective)?;
+            if !target
+                .as_ref()
+                .is_ok_and(|initial| Arc::ptr_eq(initial, &current))
+            {
+                continue;
+            }
+            let prepared = prepared.as_mut().map_err(|error| error.clone())?;
             let Some(UdpInner::Unbound(unbound)) = inner.take() else {
                 unreachable!();
             };
-            match unbound.bind_prepared(endpoint, self.bind_context(), true, &mut prepared) {
+            match unbound.bind_prepared(endpoint, self.bind_context(), true, prepared) {
                 Ok(bound) => {
                     *inner = Some(UdpInner::Bound(bound));
                     return Ok(());
@@ -868,9 +911,14 @@ impl UdpSocket {
         &self,
         buf: &mut [u8],
         peek: bool,
-    ) -> Result<(usize, smoltcp::wire::IpEndpoint, usize), SystemError> {
+    ) -> Result<(usize, crate::net::socket::endpoint::InetEndpoint, usize), SystemError> {
         let received = self.try_recv_with_meta(buf, peek)?;
-        Ok((received.copied, received.source, received.original_len))
+        Ok((
+            received.copied,
+            crate::net::socket::endpoint::InetEndpoint::from(received.source)
+                .with_scope(received.ifindex as u32),
+            received.original_len,
+        ))
     }
 
     pub(super) fn try_recv_with_meta(
@@ -993,11 +1041,15 @@ impl UdpSocket {
     /// A blocking sender waits on the resource its selected path actually
     /// charges. In particular, a full prepared-output account must not spin
     /// merely because the legacy smoltcp queue still has room.
-    fn can_send_to(&self, to: Option<IpEndpoint>, payload_len: usize) -> bool {
+    fn can_send_to(
+        &self,
+        to: Option<crate::net::socket::endpoint::InetEndpoint>,
+        payload_len: usize,
+    ) -> bool {
         if self.errqueue.lock().0 != 0 || self.shutdown.load(Ordering::Acquire) & 0x02 != 0 {
             return true;
         }
-        let destination = to.or_else(|| {
+        let destination = to.map(|endpoint| endpoint.wire()).or_else(|| {
             self.inner.read().as_ref().and_then(|inner| match inner {
                 UdpInner::Bound(bound) => bound.remote_endpoint().ok(),
                 _ => None,
@@ -1276,8 +1328,14 @@ impl UdpSocket {
         ))
     }
 
-    pub fn try_send(&self, buf: &[u8], to: Option<IpEndpoint>) -> Result<usize, SystemError> {
+    pub fn try_send(
+        &self,
+        buf: &[u8],
+        to: Option<crate::net::socket::endpoint::InetEndpoint>,
+    ) -> Result<usize, SystemError> {
         self.take_socket_error()?;
+        let scope_oif = to.and_then(|endpoint| endpoint.scope_oif());
+        let to = to.map(|endpoint| endpoint.wire());
         // Validate the supplied family before mapped-v4 normalization. Only
         // AF_INET6 sockets may use an IPv6 sockaddr, including mapped addresses.
         if self.ip_version == IpVersion::Ipv4
@@ -1299,7 +1357,7 @@ impl UdpSocket {
             .ok_or(SystemError::EDESTADDRREQ)?;
         match Self::normalize_unspecified_dest(destination).addr {
             Ipv4(_) => self.try_send_ipv4_prepared(buf, to),
-            Ipv6(_) => self.try_send_ipv6_prepared(buf, to),
+            Ipv6(_) => self.try_send_ipv6_prepared(buf, to, scope_oif),
         }
     }
 
@@ -1491,6 +1549,7 @@ impl UdpSocket {
         &self,
         payload: &[u8],
         to: Option<IpEndpoint>,
+        scope_oif: Option<u32>,
     ) -> Result<usize, SystemError> {
         let packet_len = ipv6_packet::packet_len(payload.len());
         let placement = self.iface_placement.read();
@@ -1508,7 +1567,10 @@ impl UdpSocket {
             if destination.port == 0 {
                 return Err(SystemError::EINVAL);
             }
-            let (required_oif, _) = output_flow::socket_constraints(self, destination.addr)?;
+            let required_oif = match scope_oif {
+                Some(index) => Some(index),
+                None => output_flow::socket_constraints(self, destination.addr)?.0,
+            };
             let receive_bind = IpListenEndpoint {
                 addr: fixed_address,
                 port: 0,
@@ -1572,7 +1634,10 @@ impl UdpSocket {
             let Ipv6(destination_addr) = destination.addr else {
                 return Err(SystemError::EAFNOSUPPORT);
             };
-            let (required_oif, _) = output_flow::socket_constraints(self, destination.addr)?;
+            let required_oif = match scope_oif {
+                Some(index) => Some(index),
+                None => output_flow::socket_constraints(self, destination.addr)?.0,
+            };
             let fixed_source =
                 output_flow::bound_source_constraint(&self.netns, local).or(connected_source);
             let resolved = crate::net::route::resolve_ipv6_send_route(

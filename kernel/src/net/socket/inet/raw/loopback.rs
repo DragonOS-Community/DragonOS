@@ -222,7 +222,7 @@ fn should_deliver_to_socket(
         _ => (None, None),
     };
     if let Some(local) = local {
-        if local != ctx.dest {
+        if !local.is_unspecified() && local != ctx.dest {
             return false;
         }
     }

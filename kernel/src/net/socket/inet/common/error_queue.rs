@@ -69,22 +69,11 @@ impl ErrorQueueEntry {
             msg.msg_flags |= PMSG::TRUNC.bits() as i32;
         }
         if !msg.msg_name.is_null() {
-            let supplied_name_len = msg.msg_namelen;
-            msg.msg_namelen = Endpoint::Ip(self.destination)
-                .write_to_user_msghdr(msg.msg_name, msg.msg_namelen)?;
-            if supplied_name_len >= 28
-                && matches!(self.destination.addr,
-                IpAddress::Ipv6(address) if address.is_unicast_link_local())
-            {
-                let mut writer = crate::syscall::user_access::UserBufferWriter::new(
-                    msg.msg_name.cast::<u8>(),
-                    28,
-                    true,
-                )?;
-                writer
-                    .buffer_protected(0)?
-                    .write_to_user(24, &self.ingress_ifindex.to_ne_bytes())?;
-            }
+            msg.msg_namelen = Endpoint::ip(
+                crate::net::socket::endpoint::InetEndpoint::from(self.destination)
+                    .with_scope(self.ingress_ifindex),
+            )
+            .write_to_user_msghdr(msg.msg_name, msg.msg_namelen)?;
         } else {
             msg.msg_namelen = 0;
         }
@@ -98,14 +87,14 @@ impl ErrorQueueEntry {
         data[12..16].copy_from_slice(&self.error.ee_data.to_ne_bytes());
         let addr_len = if self.ipv6 { 28 } else { 16 };
         if let Some(address) = self.offender {
-            let sockaddr = SockAddr::from(Endpoint::Ip(IpEndpoint::new(address, 0)));
+            let sockaddr = SockAddr::from(Endpoint::ip(
+                crate::net::socket::endpoint::InetEndpoint::from(IpEndpoint::new(address, 0))
+                    .with_scope(self.ingress_ifindex),
+            ));
             let bytes = unsafe {
                 core::slice::from_raw_parts((&sockaddr as *const SockAddr).cast::<u8>(), addr_len)
             };
             data[16..16 + addr_len].copy_from_slice(bytes);
-            if matches!(address, IpAddress::Ipv6(address) if address.is_unicast_link_local()) {
-                data[40..44].copy_from_slice(&self.ingress_ifindex.to_ne_bytes());
-            }
         }
         let mut written = 0;
         let mut control = CmsgBuffer {

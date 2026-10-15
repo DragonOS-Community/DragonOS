@@ -19,6 +19,16 @@ pub(crate) mod output_account;
 pub(crate) mod registration;
 use system_error::SystemError;
 
+/// A nonexistent scope index is a missing route at IPv6 connect, unlike bind's
+/// explicit device validation. Preserve all other route/source errors.
+pub(crate) fn ipv6_connect_error(error: SystemError) -> SystemError {
+    if error == SystemError::ENODEV {
+        SystemError::ENETUNREACH
+    } else {
+        error
+    }
+}
+
 /// Match the syscall-return network service opportunity for local datagrams.
 /// Advance already-admitted local output without retaining socket or routing
 /// guards. OUTPUT may select a different local input device from the source
@@ -76,6 +86,14 @@ pub(crate) fn explicit_bind_iface(
     netns: &Arc<NetNamespace>,
     device: Option<Arc<dyn Iface>>,
 ) -> Result<Arc<dyn Iface>, SystemError> {
+    if matches!(address, smoltcp::wire::IpAddress::Ipv6(address) if address.is_unicast_link_local())
+    {
+        let iface = device.ok_or(SystemError::EINVAL)?;
+        if !source_address_usable_on_iface(netns, &iface, address) {
+            return Err(SystemError::EADDRNOTAVAIL);
+        }
+        return Ok(iface);
+    }
     if !bind_address_uses_local_owner(address) {
         if let Some(device) = device {
             return Ok(device);

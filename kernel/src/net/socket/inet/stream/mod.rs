@@ -121,7 +121,10 @@ impl TcpSocket {
                 endpoint.addr = smoltcp::wire::IpAddress::Ipv6(addr.to_ipv6_mapped());
             }
         }
-        Endpoint::Ip(endpoint)
+        Endpoint::ip(
+            crate::net::socket::endpoint::InetEndpoint::from(endpoint)
+                .with_scope(self.device_binding.ifindex() as u32),
+        )
     }
 }
 
@@ -205,7 +208,7 @@ impl Socket for TcpSocket {
 
     fn bind(&self, endpoint: Endpoint) -> Result<(), SystemError> {
         if let Endpoint::Ip(addr) = endpoint {
-            return self.do_bind(addr);
+            return self.do_bind_scoped(addr);
         }
         // log::debug!("TcpSocket::bind: invalid endpoint");
         return Err(SystemError::EINVAL);
@@ -216,7 +219,7 @@ impl Socket for TcpSocket {
             // log::debug!("TcpSocket::connect: invalid endpoint");
             return Err(SystemError::EINVAL);
         };
-        self.start_connect(endpoint)?; // Only Nonblock or error will return error.
+        self.start_connect_scoped(endpoint)?; // Only Nonblock or error will return error.
 
         return loop {
             match self.check_connect() {
@@ -280,7 +283,10 @@ impl Socket for TcpSocket {
                 }
             }
         }
-        .map(|(sock, ep)| (sock as Arc<dyn Socket>, self.name_endpoint(ep)))
+        .map(|(sock, ep)| {
+            let endpoint = sock.name_endpoint(ep);
+            (sock as Arc<dyn Socket>, endpoint)
+        })
     }
 
     fn recv(&self, buffer: &mut [u8], flags: PMSG) -> Result<usize, SystemError> {
@@ -437,7 +443,7 @@ impl Socket for TcpSocket {
         // 返回值仅用于统一接口；不会被写回给用户。
         let ep = self.remote_endpoint().unwrap_or_else(|_| {
             self.local_endpoint()
-                .unwrap_or(Endpoint::Ip(UNSPECIFIED_LOCAL_ENDPOINT_V4))
+                .unwrap_or(Endpoint::ip(UNSPECIFIED_LOCAL_ENDPOINT_V4))
         });
         Ok((n, ep))
     }

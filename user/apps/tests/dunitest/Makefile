@@ -147,6 +147,7 @@ $(BIN_DIR)/fuse/stat_blocks_test: suites/fuse/fuse_gtest_common.h suites/fuse/fu
 $(BIN_DIR)/normal/forward_mtu_test: suites/normal/forward_mtu_nft_support.h
 $(BIN_DIR)/normal/endpoint_pmtu_test $(BIN_DIR)/normal/udp_source_route_test: suites/normal/rtnetlink_route_test_support.h
 $(BIN_DIR)/normal/udp_ipv6_multicast_network_test: suites/normal/rtnetlink_route_test_support.h
+$(BIN_DIR)/normal/ipv6_scope_test $(BIN_DIR)/normal/ipv6_scope_network_test: suites/normal/rtnetlink_route_test_support.h
 
 run: build
 	@$(RUNNER_BIN) --bin-dir $(BIN_DIR) --results-dir $(RESULTS_DIR)

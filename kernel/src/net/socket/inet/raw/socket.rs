@@ -11,6 +11,7 @@ use crate::process::cred::CAPFlags;
 use crate::process::namespace::net_namespace::NetNamespace;
 use crate::process::ProcessManager;
 
+use super::super::common::registration::{IfaceSocketReturn, PreparedIfaceSocket};
 use super::constants::ICMPV6_CHECKSUM_OFFSET;
 use super::inner::{RawInner, UnboundRaw};
 use super::loopback::{register_raw_socket, unregister_raw_socket};
@@ -24,7 +25,12 @@ impl RawSocket {
             IpVersion::Ipv4 => IpAddress::Ipv4(smoltcp::wire::Ipv4Address::UNSPECIFIED),
             IpVersion::Ipv6 => IpAddress::Ipv6(smoltcp::wire::Ipv6Address::UNSPECIFIED),
         };
-        Endpoint::Ip(smoltcp::wire::IpEndpoint::new(addr, proto))
+        Endpoint::ip(
+            crate::net::socket::endpoint::InetEndpoint::from(smoltcp::wire::IpEndpoint::new(
+                addr, proto,
+            ))
+            .with_scope(self.device_binding.ifindex() as u32),
+        )
     }
 
     /// 创建新的 raw socket
@@ -258,6 +264,14 @@ impl RawSocket {
 
     /// 绑定到本地地址
     pub fn do_bind(&self, local_addr: smoltcp::wire::IpAddress) -> Result<(), SystemError> {
+        self.do_bind_scoped(smoltcp::wire::IpEndpoint::new(local_addr, 0).into())
+    }
+
+    pub(super) fn do_bind_scoped(
+        &self,
+        address: crate::net::socket::endpoint::InetEndpoint,
+    ) -> Result<(), SystemError> {
+        let local_addr = address.addr;
         if !self.addr_matches_ip_version(local_addr) {
             return Err(SystemError::EAFNOSUPPORT);
         }
@@ -267,8 +281,172 @@ impl RawSocket {
         ) {
             return Err(SystemError::EINVAL);
         }
-        let target = super::super::common::explicit_bind_iface(local_addr, &self.netns, None)?;
+        if crate::net::socket::endpoint::needs_scope_id(local_addr) {
+            return self.bind_scoped_attachment(address);
+        }
+        let device = self.device_binding.resolve_iface(&self.netns)?;
+        let target = super::super::common::explicit_bind_iface(local_addr, &self.netns, device)?;
         self.bind_attachment(target, local_addr, false)
+    }
+
+    fn bind_scoped_attachment(
+        &self,
+        address: crate::net::socket::endpoint::InetEndpoint,
+    ) -> Result<(), SystemError> {
+        loop {
+            let index = if address.scope_id != 0 {
+                address.scope_id as usize
+            } else {
+                self.device_binding.ifindex()
+            };
+            let target = if index == 0 {
+                Err(SystemError::EINVAL)
+            } else {
+                self.netns
+                    .device_list()
+                    .get(&index)
+                    .cloned()
+                    .ok_or(SystemError::ENODEV)
+            }
+            .and_then(|iface| {
+                super::super::common::explicit_bind_iface(address.addr, &self.netns, Some(iface))
+            });
+            // All allocation and charge recovery precede the short device/state
+            // transaction. Retired registrations also outlive both guards.
+            let mut prepared = target
+                .as_ref()
+                .map_err(|error| error.clone())
+                .and_then(|iface| self.prepare_iface_socket(iface.clone()));
+            let mut retired = None;
+            let mut update = self.device_binding.prepare_scope_bind(address.scope_id)?;
+            if update.target_ifindex() != index {
+                continue;
+            }
+            let mut inner = self.inner.write();
+            if !matches!(
+                inner.as_ref(),
+                Some(RawInner::Unbound(_) | RawInner::Wildcard(_))
+            ) {
+                return Err(SystemError::EINVAL);
+            }
+            // Linux retains a valid numeric scope on subsequent device/address
+            // failure, but an operation losing the state race must not set it.
+            update.commit();
+            let iface = target?;
+            if !self
+                .netns
+                .device_list()
+                .get(&index)
+                .is_some_and(|current| Arc::ptr_eq(current, &iface))
+            {
+                return Err(SystemError::ENODEV);
+            }
+            super::super::common::explicit_bind_iface(address.addr, &self.netns, Some(iface))?;
+            return self.bind_prepared_attachment(
+                &mut inner,
+                prepared.as_mut().map_err(|error| error.clone())?,
+                address.addr,
+                false,
+                &mut retired,
+            );
+        }
+    }
+
+    pub(super) fn connect_ipv6(
+        &self,
+        mut remote: crate::net::socket::endpoint::InetEndpoint,
+    ) -> Result<(), SystemError> {
+        if remote.addr.is_unspecified() {
+            remote.addr = IpAddress::Ipv6(smoltcp::wire::Ipv6Address::LOCALHOST);
+        }
+        let scoped = crate::net::socket::endpoint::needs_scope_id(remote.addr);
+        let snapshot = |inner: &Option<RawInner>| {
+            let state = inner.as_ref().ok_or(SystemError::EINVAL)?;
+            let (local, peer) = match state {
+                RawInner::Unbound(_) => (None, None),
+                RawInner::Bound(bound) | RawInner::Wildcard(bound) => {
+                    (bound.local_addr(), bound.remote_addr())
+                }
+            };
+            Ok::<_, SystemError>((core::mem::discriminant(state), local, peer))
+        };
+        loop {
+            let observed = snapshot(&self.inner.read())?;
+            let candidate = if scoped {
+                self.device_binding
+                    .prepare_scope_connect(remote.scope_id, 0)?
+                    .target_ifindex()
+            } else {
+                self.device_binding.ifindex()
+            };
+            let resolve_route = || {
+                if candidate != 0 && !self.netns.device_list().contains_key(&candidate) {
+                    return Err(SystemError::ENETUNREACH);
+                }
+                crate::net::route::resolve_ipv6_send_route(
+                    &self.netns,
+                    remote.addr,
+                    (candidate != 0).then_some(candidate as u32),
+                    observed
+                        .1
+                        .filter(|address| !address.is_unspecified() && !address.is_multicast()),
+                )
+            };
+            let route = resolve_route();
+            let needs_source = observed.1.is_none_or(|address| address.is_unspecified());
+            let mut prepared = if needs_source {
+                Some(
+                    route
+                        .as_ref()
+                        .map_err(|error| error.clone())
+                        .and_then(|route| self.prepare_iface_socket(route.source_owner.clone())),
+                )
+            } else {
+                None
+            };
+            // All preparation/recovery and interface pins outlive the guards.
+            // A competing bind/connect must not split source and peer updates.
+            let mut retired = None;
+            let current;
+            let mut update = if scoped {
+                self.device_binding
+                    .prepare_scope_connect(remote.scope_id, 0)?
+            } else {
+                self.device_binding.prepare_current()
+            };
+            let mut inner = self.inner.write();
+            if snapshot(&inner)? != observed || update.target_ifindex() != candidate {
+                continue;
+            }
+            if scoped {
+                update.commit();
+            }
+            current = resolve_route()?;
+            if !route.as_ref().is_ok_and(|initial| {
+                initial.source == current.source
+                    && Arc::ptr_eq(&initial.source_owner, &current.source_owner)
+            }) {
+                continue;
+            }
+            if let Some(prepared) = prepared.as_mut() {
+                self.bind_prepared_attachment(
+                    &mut inner,
+                    prepared.as_mut().map_err(|error| error.clone())?,
+                    current.source.into(),
+                    true,
+                    &mut retired,
+                )?;
+            }
+            match inner.as_ref() {
+                Some(RawInner::Bound(bound) | RawInner::Wildcard(bound)) => {
+                    bound.connect(remote.addr)
+                }
+                _ => return Err(SystemError::EINVAL),
+            }
+            self.connected_port
+                .store(remote.port as u32, core::sync::atomic::Ordering::Release);
+            return Ok(());
+        }
     }
 
     /// 绑定到临时地址（根据远程地址选择合适的本地地址）
@@ -276,14 +454,20 @@ impl RawSocket {
         if !self.addr_matches_ip_version(remote) {
             return Err(SystemError::EAFNOSUPPORT);
         }
-        if matches!(self.inner.read().as_ref(), Some(RawInner::Bound(_))) {
+        if matches!(self.inner.read().as_ref(), Some(RawInner::Bound(bound))
+            if bound.local_addr().is_some_and(|address| !address.is_unspecified()))
+        {
             return Ok(());
         }
-        let target = super::super::common::ephemeral_bind_target(remote, &self.netns, None)?;
+        let target = super::super::common::ephemeral_bind_target(
+            remote,
+            &self.netns,
+            self.device_binding.resolve_iface(&self.netns)?,
+        )?;
         self.bind_attachment(target.stack_owner, target.local_addr, true)
     }
 
-    fn bind_attachment(
+    pub(super) fn bind_attachment(
         &self,
         iface: Arc<dyn crate::net::Iface>,
         local: IpAddress,
@@ -293,16 +477,36 @@ impl RawSocket {
         // The original vacant slots and Strong pin die after the inner guard.
         let mut retired = None;
         let mut inner = self.inner.write();
+        self.bind_prepared_attachment(&mut inner, &mut prepared, local, allow_bound, &mut retired)
+    }
+
+    fn bind_prepared_attachment(
+        &self,
+        inner: &mut Option<RawInner>,
+        prepared: &mut PreparedIfaceSocket,
+        local: IpAddress,
+        allow_bound: bool,
+        retired: &mut Option<IfaceSocketReturn>,
+    ) -> Result<(), SystemError> {
         match inner.as_mut().ok_or(SystemError::EINVAL)? {
-            RawInner::Bound(_) => {
+            RawInner::Bound(bound) => {
                 if allow_bound {
+                    if bound
+                        .local_addr()
+                        .is_none_or(|address| address.is_unspecified())
+                        && !local.is_unspecified()
+                    {
+                        *retired = prepared
+                            .move_bound(bound.inner_mut(), self.self_ref.upgrade().unwrap())?;
+                        bound.set_local_addr(local);
+                    }
                     Ok(())
                 } else {
                     Err(SystemError::EINVAL)
                 }
             }
             RawInner::Wildcard(bound) => {
-                retired =
+                *retired =
                     prepared.move_bound(bound.inner_mut(), self.self_ref.upgrade().unwrap())?;
                 bound.set_local_addr(local);
                 let Some(RawInner::Wildcard(bound)) = inner.take() else {
@@ -315,11 +519,8 @@ impl RawSocket {
                 let Some(RawInner::Unbound(unbound)) = inner.take() else {
                     unreachable!()
                 };
-                match unbound.bind_prepared(
-                    Some(local),
-                    &mut prepared,
-                    self.self_ref.upgrade().unwrap(),
-                ) {
+                match unbound.bind_prepared(Some(local), prepared, self.self_ref.upgrade().unwrap())
+                {
                     Ok(bound) => {
                         *inner = Some(RawInner::Bound(bound));
                         Ok(())

@@ -6,6 +6,7 @@
 // Otherwise AF_PACKET exposes unfinished checksums and aggregated segments.
 #include <gtest/gtest.h>
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <linux/if_addr.h>
 #include <linux/if_packet.h>
 #include <linux/neighbour.h>
@@ -13,6 +14,7 @@
 #include <linux/rtnetlink.h>
 #include <net/ethernet.h>
 #include <net/if.h>
+#include <netinet/tcp.h>
 #include <poll.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
@@ -20,7 +22,9 @@
 
 #include <array>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
+#include <string>
 #include <vector>
 
 namespace {
@@ -333,6 +337,103 @@ class Ipv6RoutedOutput : public testing::Test {
         ASSERT_EQ(getsockopt(client_.get(), SOL_SOCKET, SO_ERROR, &error, &size), 0);
         ASSERT_EQ(error, 0);
     }
+    // Optional local diagnostic synchronization. CI exercises the actual wire
+    // path without a hook; a debugger can additionally hold TCP consumption
+    // until both ordered frames have reached the input queue. The done marker
+    // means sendto completed, not that the interface has consumed the frames.
+    void OrderGate(const std::string& prefix, const char* marker, const char* release) {
+        if (prefix.empty()) return;
+        Fd file(open((prefix + marker).c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600));
+        ASSERT_GE(file.get(), 0) << strerror(errno);
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+        while (access((prefix + release).c_str(), F_OK) != 0 &&
+               std::chrono::steady_clock::now() < deadline) usleep(10000);
+        ASSERT_EQ(access((prefix + release).c_str(), F_OK), 0)
+            << "diagnostic gate timed out: " << prefix << release;
+    }
+    void SynErrorFrame(const std::vector<unsigned char>& syn) {
+        ASSERT_GE(syn.size(), 14u + 40u + 20u);
+        const size_t quote_size = syn.size() - 14;
+        std::vector<unsigned char> frame(14 + 40 + 8 + quote_size);
+        memcpy(frame.data(), egress_mac_.data(), 6);
+        memcpy(frame.data() + 6, peer_mac_.data(), 6);
+        Put16(frame.data() + 12, ETH_P_IPV6);
+        auto* ip = frame.data() + 14;
+        ip[0] = 0x60; Put16(ip + 4, 8 + quote_size);
+        ip[6] = IPPROTO_ICMPV6; ip[7] = 64;
+        memcpy(ip + 8, &peer_, 16); memcpy(ip + 24, &source_, 16);
+        auto* icmp = ip + 40;
+        icmp[0] = 1; icmp[1] = 4;
+        memcpy(icmp + 8, syn.data() + 14, quote_size);
+        Put16(icmp + 2, Checksum(ip, icmp, 8 + quote_size, IPPROTO_ICMPV6));
+        SendFrame(frame);
+    }
+    void OrderedSynError(bool error_first) {
+        std::string prefix;
+        if (const char* directory = std::getenv("DRAGONOS_TCP_ICMP_GATE_DIR")) {
+            prefix = std::string(directory) + (error_first ? "/error-first" : "/synack-first");
+            for (const char* suffix : {".ready", ".inject", ".done", ".resume"})
+                ASSERT_TRUE(unlink((prefix + suffix).c_str()) == 0 || errno == ENOENT);
+        }
+        sockaddr_in6 local{}; local.sin6_family = AF_INET6; local.sin6_addr = source_;
+        client_.reset(socket(AF_INET6, SOCK_STREAM | SOCK_NONBLOCK, 0));
+        ASSERT_GE(client_.get(), 0);
+        ASSERT_EQ(bind(client_.get(), reinterpret_cast<sockaddr*>(&local), sizeof(local)), 0);
+        sockaddr_in6 remote{}; remote.sin6_family = AF_INET6;
+        remote.sin6_addr = peer_; remote.sin6_port = htons(kPeerPort);
+        ASSERT_EQ(connect(client_.get(), reinterpret_cast<sockaddr*>(&remote), sizeof(remote)), -1);
+        ASSERT_EQ(errno, EINPROGRESS);
+        socklen_t size = sizeof(local);
+        ASSERT_EQ(getsockname(client_.get(), reinterpret_cast<sockaddr*>(&local), &size), 0);
+        port_ = ntohs(local.sin6_port);
+        std::vector<unsigned char> syn;
+        ASSERT_TRUE(Receive(syn, 4000)) << "no real pending SYN";
+        ASSERT_EQ(syn[67] & 0x16, 2);
+        client_next_ = Get32(syn.data() + 58) + 1;
+        ASSERT_NO_FATAL_FAILURE(OrderGate(prefix, ".ready", ".inject"));
+        if (error_first) {
+            ASSERT_NO_FATAL_FAILURE(SynErrorFrame(syn));
+            ASSERT_NO_FATAL_FAILURE(Segment(0x12, kPeerSequence, client_next_));
+        } else {
+            ASSERT_NO_FATAL_FAILURE(Segment(0x12, kPeerSequence, client_next_));
+            ASSERT_NO_FATAL_FAILURE(SynErrorFrame(syn));
+        }
+        ASSERT_NO_FATAL_FAILURE(OrderGate(prefix, ".done", ".resume"));
+        pollfd progress{client_.get(), POLLOUT, 0};
+        ASSERT_EQ(poll(&progress, 1, 1000), 1);
+        int error = -1; size = sizeof(error);
+        ASSERT_EQ(getsockopt(client_.get(), SOL_SOCKET, SO_ERROR, &error, &size), 0);
+        ASSERT_EQ(error, error_first ? ECONNREFUSED : 0);
+        if (error_first) {
+            EXPECT_NE(progress.revents & POLLERR, 0);
+            EXPECT_NE(progress.revents & POLLHUP, 0);
+            tcp_info info{}; size = sizeof(info);
+            ASSERT_EQ(getsockopt(client_.get(), IPPROTO_TCP, TCP_INFO, &info, &size), 0);
+            EXPECT_EQ(info.tcpi_state, TCP_CLOSE);
+        } else {
+            EXPECT_EQ(progress.revents & (POLLERR | POLLHUP), 0);
+            // Exercise ordinary data after the obsolete SYN quotation, not
+            // merely a possibly transient POLLOUT notification.
+            ASSERT_EQ(send(client_.get(), "x", 1, MSG_NOSIGNAL), 1);
+            bool delivered = false;
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+            while (std::chrono::steady_clock::now() < deadline) {
+                std::vector<unsigned char> frame;
+                if (!Receive(frame, 100)) continue;
+                const auto* tcp = frame.data() + 54;
+                const size_t header = (tcp[12] >> 4) * 4;
+                if (frame.size() == 54 + header + 1 && tcp[header] == 'x') {
+                    delivered = true;
+                    ASSERT_NO_FATAL_FAILURE(Segment(0x10, kPeerSequence + 1, client_next_ + 1));
+                    break;
+                }
+            }
+            EXPECT_TRUE(delivered) << "connection failed after obsolete SYN error";
+        }
+        error = -1; size = sizeof(error);
+        ASSERT_EQ(getsockopt(client_.get(), SOL_SOCKET, SO_ERROR, &error, &size), 0);
+        EXPECT_EQ(error, 0);
+    }
     void Transfer(size_t length, size_t mtu) {
         std::vector<unsigned char> data(length);
         for (size_t i = 0; i < length; ++i) data[i] = (i * 17 + 9) % 251;
@@ -374,6 +475,14 @@ class Ipv6RoutedOutput : public testing::Test {
 TEST_F(Ipv6RoutedOutput, ExplicitSourceUsesFibEgressAndReceivesOnOwner) {
     ASSERT_NO_FATAL_FAILURE(Connect(false));
     ASSERT_NO_FATAL_FAILURE(Transfer(256, original_mtu_));
+}
+
+TEST_F(Ipv6RoutedOutput, SynAckBeforeOldSynErrorCompletesConnect) {
+    OrderedSynError(false);
+}
+
+TEST_F(Ipv6RoutedOutput, SynErrorBeforeSynAckCannotReviveConnect) {
+    OrderedSynError(true);
 }
 TEST_F(Ipv6RoutedOutput, BoundDeviceUsesEgressAndReceivesOnOwner) {
     ASSERT_NO_FATAL_FAILURE(Connect(true));

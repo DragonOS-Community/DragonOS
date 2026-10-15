@@ -1358,10 +1358,18 @@ impl IpIngressFilter for NetIngressFilter<'_> {
             if let Some(feedback) = super::icmp_error::parse(packet, ingress_ifindex) {
                 self.icmp_error_items += 1;
                 self.icmp_error_bytes += feedback.quote.capacity();
-                self.work.push(RoutedIngressWork::IcmpError {
-                    netns: self.netns.clone(),
-                    feedback,
-                });
+                if feedback.protocol == IpProtocol::Tcp {
+                    // TCP segments enter their protocol queue in this same
+                    // device poll. Publish control input now as well, or a
+                    // later segment could overtake deferred ICMP work. Only
+                    // enqueue here; all socket callbacks run in TCP task context.
+                    self.netns.tcp_stack().queue_icmp_feedback(feedback);
+                } else {
+                    self.work.push(RoutedIngressWork::IcmpError {
+                        netns: self.netns.clone(),
+                        feedback,
+                    });
+                }
             }
         }
         let (source, destination) = match version {

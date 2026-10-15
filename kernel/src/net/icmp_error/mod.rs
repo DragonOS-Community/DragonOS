@@ -1,6 +1,7 @@
 //! Validated ICMP error feedback shared by IPv4 and IPv6 transports.
-//! Parsing never acquires transport locks. Association and delivery run after
-//! the netdevice poll releases them; protocol-specific error policy stays there.
+//! Parsing never acquires transport locks. TCP control input is queued at IP
+//! admission and delivered by its task; other feedback is deferred until the
+//! netdevice poll releases its locks. Protocol-specific policy stays in sockets.
 
 use crate::process::namespace::net_namespace::NetNamespace;
 use alloc::{sync::Arc, vec::Vec};
@@ -300,12 +301,12 @@ pub(crate) fn parse(packet: &[u8], ingress_ifindex: u32) -> Option<IcmpErrorFeed
 }
 
 pub(crate) fn execute(netns: &Arc<NetNamespace>, feedback: IcmpErrorFeedback) {
+    // TCP feedback must join the segment FIFO at admission, not at the end of
+    // the device poll. Its RAW subscribers are served by that same TCP event.
+    debug_assert_ne!(feedback.protocol, IpProtocol::Tcp);
     super::socket::inet::raw::handle_icmp_feedback(netns, &feedback);
     match feedback.protocol {
         IpProtocol::Udp => netns.udp_bindings().handle_icmp_feedback(&feedback),
-        IpProtocol::Tcp => {
-            netns.tcp_stack().queue_icmp_feedback(feedback);
-        }
         _ => {}
     }
 }

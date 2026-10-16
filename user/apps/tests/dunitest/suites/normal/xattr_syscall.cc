@@ -1,5 +1,7 @@
 #include <gtest/gtest.h>
 
+#include "loop_ext4_test_support.h"
+
 #include <errno.h>
 #include <fcntl.h>
 #include <stdlib.h>
@@ -27,13 +29,13 @@ constexpr std::array<Access, 3> kAccess = {Access::Path, Access::Fd, Access::NoF
 class XattrSyscall : public ::testing::Test {
   protected:
     void SetUp() override {
+        ASSERT_NO_FATAL_FAILURE(filesystem.SetUp());
+        ASSERT_NO_FATAL_FAILURE(filesystem.Mount());
         struct statfs st = {};
-        ASSERT_EQ(0, statfs("/root", &st));
-        if (st.f_type != 0xEF53) {
-            GTEST_SKIP() << "/root must be ext4";
-        }
-        char pattern[] = "/root/dunitest_xattr_syscall_XXXXXX";
-        fd = mkstemp(pattern);
+        ASSERT_EQ(0, statfs(filesystem.mount_point().c_str(), &st));
+        ASSERT_EQ(0xEF53, st.f_type);
+        std::string pattern = filesystem.mount_point() + "/dunitest_xattr_syscall_XXXXXX";
+        fd = mkstemp(pattern.data());
         ASSERT_GE(fd, 0) << strerror(errno);
         path = pattern;
         ASSERT_EQ(0, Set(Access::Path, kValue, sizeof(kValue))) << strerror(errno);
@@ -64,6 +66,7 @@ class XattrSyscall : public ::testing::Test {
         ASSERT_EQ(static_cast<ssize_t>(value.size()), Get(Access::Path, value.data(), value.size()));
         EXPECT_EQ(0, memcmp(kValue, value.data(), value.size()));
     }
+    dunitest::LoopExt4 filesystem;
     int fd = -1;
     std::string path;
 };

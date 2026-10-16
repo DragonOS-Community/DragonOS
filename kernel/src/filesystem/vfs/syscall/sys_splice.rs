@@ -274,29 +274,29 @@ fn splice_file_to_pipe(
     {
         return Err(SystemError::ESPIPE);
     }
-    let mut position = offset.unwrap_or_else(|| file.pos());
-    let written = splice_read_to_pipe(file, &mut position, pipe, len, flags)?;
-    if offset.is_none() && written > 0 {
-        file.commit_transfer_position(position);
-    }
-    Ok(written)
+    let mut position = offset.unwrap_or(0);
+    splice_read_to_pipe(file, &mut position, offset.is_none(), pipe, len, flags)
 }
 
-/// Reserve pipe capacity before consuming input, while leaving f_pos and
-/// notifications to the caller. sendfile and splice share this transaction.
+/// Reserve pipe capacity before locking the implicit input position. Commit
+/// that position before releasing the reservation; callers own notifications.
 pub(super) fn splice_read_to_pipe(
     file: &File,
     position: &mut usize,
+    implicit_position: bool,
     pipe: &File,
     len: usize,
     flags: SpliceFlags,
 ) -> Result<usize, SystemError> {
-    File::recover_io(|| try_splice_read_to_pipe(file, position, pipe, len, flags))
+    File::recover_io(|| {
+        try_splice_read_to_pipe(file, position, implicit_position, pipe, len, flags)
+    })
 }
 
 fn try_splice_read_to_pipe(
     file: &File,
     position: &mut usize,
+    implicit_position: bool,
     pipe: &File,
     len: usize,
     flags: SpliceFlags,
@@ -304,43 +304,44 @@ fn try_splice_read_to_pipe(
     let pipe_inode = get_pipe_inode(pipe)?;
     let actor = crate::cgroup::memory::object_for_task(&ProcessManager::current_pcb());
 
-    // Cached splice sources preserve their source-page range. Copy-style
-    // sources instead populate a fresh scratch page beginning at offset zero.
-    // One output slot is reserved before the source can consume anything.
+    // A free logical slot admits an entire source page. Wait before taking
+    // f_pos so a consumer can splice the full pipe back into this same OFD.
+    let mut transaction = pipe_inode.begin_writer_transaction();
+    let space = if flags.contains(SpliceFlags::SPLICE_F_NONBLOCK) {
+        pipe_inode.writable_for_splice_nonblock(&transaction, None)?
+    } else {
+        pipe_inode.wait_writable_any_for_splice(&mut transaction)?
+    };
+    let _position_guard = if implicit_position {
+        file.lock_position()
+    } else {
+        None
+    };
+    if implicit_position {
+        *position = file.pos();
+    }
+    if len > isize::MAX as usize
+        || position
+            .checked_add(len)
+            .filter(|end| *end <= isize::MAX as usize)
+            .is_none()
+    {
+        return Err(SystemError::EINVAL.into());
+    }
     let page_size = <crate::arch::MMArch as crate::mm::MemoryManagementArch>::PAGE_SIZE;
     let source_offset = if file.inode().page_cache().is_some() {
         *position & (page_size - 1)
     } else {
         0
     };
-    let limit = len.min(page_size - source_offset);
-    let trusted_read_limit = splice_trusted_file_read_limit(file, Some(*position), limit);
-    let mut transaction = pipe_inode.begin_writer_transaction();
-    pipe_inode.ensure_splice_readers(&transaction)?;
-    // Linux checks pipe readiness even for a zero-count sendfile.
-    if trusted_read_limit == Some(0) {
-        if flags.contains(SpliceFlags::SPLICE_F_NONBLOCK) {
-            pipe_inode.writable_for_splice_nonblock(&transaction, None)?;
-        } else {
-            pipe_inode.wait_writable_any_for_splice(&mut transaction)?;
-        }
+    let limit = len.min(MAX_RW_COUNT).min(page_size - source_offset);
+    let buf_size = splice_trusted_file_read_limit(file, Some(*position), limit)
+        .unwrap_or(limit)
+        .min(space);
+    // Even zero-count/EOF requests perform pipe readiness checks above.
+    if buf_size == 0 {
         return Ok(0);
     }
-    let wanted = trusted_read_limit.unwrap_or(limit);
-
-    let space = if flags.contains(SpliceFlags::SPLICE_F_NONBLOCK) {
-        pipe_inode.writable_for_splice_nonblock(&transaction, trusted_read_limit.map(|_| wanted))?
-    } else if trusted_read_limit.is_some() {
-        pipe_inode.wait_writable_for_splice(&mut transaction, wanted)?
-    } else {
-        pipe_inode.wait_writable_any_for_splice(&mut transaction)?
-    };
-
-    let buf_size = if trusted_read_limit.is_some() && space == 0 {
-        wanted
-    } else {
-        wanted.min(space)
-    };
     // A pipe has no splice_read operation. Zero count above needs no reader.
     if file.file_type() == FileType::Pipe {
         return Err(SystemError::EINVAL.into());
@@ -365,6 +366,9 @@ fn try_splice_read_to_pipe(
     match written {
         Ok(write_len) => {
             *position += write_len;
+            if implicit_position {
+                file.commit_transfer_position(*position);
+            }
             Ok(write_len)
         }
         Err(e) => Err(e.into()),
@@ -409,32 +413,10 @@ fn splice_pipe_to_file(
     // Fast-path Linux ipipe_prep(): NONBLOCK + empty (with writers) => EAGAIN.
     nonblock_prep_pipe_read(pipe, flags)?;
 
-    // RLIMIT_FSIZE (gVisor: FromPipeMaxFileSize) 语义：
-    // 如果目标 regular file 的写入偏移已经到达/超过限制，则 splice 必须立刻失败 EFBIG，
-    // 并且不能消耗 input pipe 中的数据。
-    // 这里在“读取 pipe 之前”做预检查，避免先读后写失败导致 pipe 数据丢失。
-    let mut allowed_len = len;
-    if matches!(file.file_type(), FileType::File) {
-        let write_offset = offset.unwrap_or_else(|| file.pos());
-        let current_pcb = ProcessManager::current_pcb();
-        let fsize_limit = current_pcb.get_rlimit(RLimitID::Fsize);
-        if fsize_limit.rlim_cur != u64::MAX {
-            let limit = fsize_limit.rlim_cur as usize;
-            if write_offset >= limit {
-                if let Err(e) = send_signal_to_pid(current_pcb.raw_pid(), Signal::SIGXFSZ) {
-                    log::error!("Failed to send SIGXFSZ for RLIMIT_FSIZE violation: {:?}", e);
-                }
-                return Err(SystemError::EFBIG);
-            }
-            allowed_len = allowed_len.min(limit.saturating_sub(write_offset));
-        }
-    }
-
-    if allowed_len == 0 {
-        return Ok(0);
-    }
-
-    let buf_size = allowed_len.min(4096);
+    // Preserve early EFBIG without consuming pipe data. The authoritative
+    // check below uses the current position after the pipe becomes readable.
+    splice_write_limit(file, offset.unwrap_or_else(|| file.pos()), len)?;
+    let buf_size = len.min(4096);
     let mut buffer = File::recover_io(|| {
         let actor = crate::cgroup::memory::object_for_task(&ProcessManager::current_pcb());
         crate::ipc::pipe::buffer::PipeBuffer::try_new_bytes(buf_size, &actor)
@@ -444,12 +426,19 @@ fn splice_pipe_to_file(
         if read == 0 {
             return Ok(None);
         }
-        match file.try_write_for_transfer(
-            offset.unwrap_or_else(|| file.pos()),
-            read,
-            &buffer[..read],
-            offset.is_none(),
-        ) {
+        let _position_guard = if offset.is_none() {
+            file.lock_position()
+        } else {
+            None
+        };
+        let write_offset = offset.unwrap_or_else(|| file.pos());
+        // Always release the logical hold, including errors in the position
+        // dependent checks. No pipe bytes are consumed until a write succeeds.
+        let attempt = (|| {
+            let allowed = splice_write_limit(file, write_offset, read)?;
+            file.try_write_for_transfer(write_offset, allowed, &buffer[..allowed], offset.is_none())
+        })();
+        match attempt {
             Ok(result) => {
                 pipe_inode.splice_finish_hold(result.written_len);
                 Ok(Some(result))
@@ -470,6 +459,29 @@ fn splice_pipe_to_file(
         }
         None => Ok(0),
     }
+}
+
+/// Apply the regular-file size limit to a snapshotted output position.
+fn splice_write_limit(file: &File, position: usize, len: usize) -> Result<usize, SystemError> {
+    if file.file_type() != FileType::File {
+        return Ok(len);
+    }
+    let current = ProcessManager::current_pcb();
+    let limit = current.get_rlimit(RLimitID::Fsize).rlim_cur;
+    if limit == u64::MAX {
+        return Ok(len);
+    }
+    let limit = limit as usize;
+    if position >= limit {
+        if let Err(error) = send_signal_to_pid(current.raw_pid(), Signal::SIGXFSZ) {
+            log::error!(
+                "Failed to send SIGXFSZ for RLIMIT_FSIZE violation: {:?}",
+                error
+            );
+        }
+        return Err(SystemError::EFBIG);
+    }
+    Ok(len.min(limit - position))
 }
 
 syscall_table_macros::declare_syscall!(SYS_SPLICE, SysSpliceHandle);

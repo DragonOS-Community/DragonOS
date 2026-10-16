@@ -64,6 +64,9 @@ TEST_F(ReadBufferSelftest, ChecksPassAndSnapshotIsStableAcrossPartialReads) {
         ASSERT_TRUE(complete_ok) << strerror(errno);
         EXPECT_EQ(0, closed) << strerror(errno);
         EXPECT_EQ(partial, complete);
+#if defined(__x86_64__)
+        EXPECT_NE(std::string::npos, complete.find("mouse_read_contract=ok\n")) << complete;
+#endif
         EXPECT_NE(std::string::npos, complete.find("status=ok\n")) << complete;
         EXPECT_NE(std::string::npos, complete.find("summary_fail=0\n")) << complete;
         for (const char* check : {"lazy_reuse=ok\n",

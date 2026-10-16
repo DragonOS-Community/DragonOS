@@ -33,13 +33,14 @@ use crate::{
         kernfs::KernFSInode,
         vfs::{
             utils::DName, vcore::generate_inode_id, FilePrivateData, FileSystem, FileType,
-            IndexNode, InodeFlags, InodeMode, Metadata,
+            IndexNode, InodeFlags, InodeMode, Metadata, UserReadMode,
         },
     },
     libs::{
         rwsem::{RwSemReadGuard, RwSemWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
     },
+    syscall::user_buffer::UserBuffer,
     time::PosixTimeSpec,
 };
 
@@ -190,6 +191,7 @@ impl Ps2MouseDevice {
                 current_packet: 0,
                 current_state: MouseState::new(),
                 buf: AllocRingBuffer::new(MOUSE_BUFFER_CAPACITY),
+                read_packet_remaining: 0,
                 devfs_metadata: Metadata {
                     dev_id: 1,
                     inode_id: generate_inode_id(),
@@ -214,6 +216,27 @@ impl Ps2MouseDevice {
             kobj_state: LockedKObjectState::new(None),
         };
         return r;
+    }
+
+    /// Select at most one complete packet and preserve its unread suffix.
+    fn read_packet(&self, len: usize, buf: &mut [u8]) -> usize {
+        let count = len.min(buf.len()).min(3);
+        if count == 0 {
+            return 0;
+        }
+        let mut inner = self.inner.lock_irqsave();
+        if inner.read_packet_remaining == 0 {
+            if inner.buf.len() < 3 {
+                return 0;
+            }
+            inner.read_packet_remaining = 3;
+        }
+        let count = count.min(inner.read_packet_remaining);
+        for byte in &mut buf[..count] {
+            *byte = inner.buf.dequeue().expect("selected mouse packet");
+        }
+        inner.read_packet_remaining -= count;
+        count
     }
 
     pub fn init(&self) -> Result<(), SystemError> {
@@ -424,6 +447,8 @@ struct InnerPs2MouseDevice {
     current_packet: u8,
     /// 鼠标数据环形缓冲区
     buf: AllocRingBuffer<u8>,
+    /// Bytes still readable from a packet selected by a previous short read.
+    read_packet_remaining: usize,
 
     /// device inode要求的字段
     device_inode_fs: Option<Weak<DevFS>>,
@@ -606,6 +631,7 @@ impl IndexNode for Ps2MouseDevice {
         let result: core::result::Result<_, system_error::SystemError> = {
             let mut guard = self.inner.lock_irqsave();
             guard.buf.clear();
+            guard.read_packet_remaining = 0;
             Ok(())
         };
         result.map_err(Into::into)
@@ -614,29 +640,45 @@ impl IndexNode for Ps2MouseDevice {
     fn close(&self, _data: MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
         let mut guard = self.inner.lock_irqsave();
         guard.buf.clear();
+        guard.read_packet_remaining = 0;
         Ok(())
+    }
+
+    fn is_stream(&self) -> bool {
+        true
+    }
+
+    fn user_read_mode(&self) -> UserReadMode {
+        UserReadMode::Scalar
     }
 
     fn read_at(
         &self,
         _offset: usize,
-        _len: usize,
+        len: usize,
         buf: &mut [u8],
         _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
-        let result: core::result::Result<_, system_error::SystemError> = (|| {
-            let mut guard = self.inner.lock_irqsave();
+        Ok(self.read_packet(len, buf))
+    }
 
-            if guard.buf.len() >= 3 {
-                for item in buf.iter_mut().take(3) {
-                    *item = guard.buf.dequeue().unwrap();
-                }
-                return Ok(3);
-            } else {
-                return Ok(0);
-            }
-        })();
-        result.map_err(Into::into)
+    fn read_user_at(
+        &self,
+        _offset: usize,
+        len: usize,
+        writer: &mut UserBuffer<'_>,
+        data: MutexGuard<FilePrivateData>,
+    ) -> Result<Option<usize>, SystemError> {
+        drop(data);
+        if writer.len() < len {
+            return Err(SystemError::ENOBUFS);
+        }
+        let mut packet = [0u8; 3];
+        let count = self.read_packet(len, &mut packet);
+        // Linux mousedev_read consumes the selected bytes before user copy,
+        // and reports EFAULT even when only a later output byte faults. The
+        // packet spinlock must be released before that protected copy.
+        writer.write_to_user(0, &packet[..count]).map(Some)
     }
 
     fn write_at(
@@ -715,3 +757,6 @@ pub fn rs_ps2_mouse_device_init(dev_parent: Arc<dyn Device>) -> Result<(), Syste
     unsafe { PS2_MOUSE_DEVICE = Some(psmouse) };
     return Ok(());
 }
+
+#[cfg(feature = "mm_selftest")]
+pub(crate) mod selftest;

@@ -62,6 +62,7 @@ pub(super) fn readv_from_user(
     {
         return Err(SystemError::EBADF);
     }
+    let _position = file.lock_position();
     let iovecs = unsafe { IoVecs::from_user(iov, count, true) }?;
 
     read_iovecs(file.as_ref(), &iovecs)
@@ -69,6 +70,7 @@ pub(super) fn readv_from_user(
 
 /// Complete a non-positional vectored read after the iovec array is imported.
 /// Shared by readv and preadv2(offset = -1), as required by Linux semantics.
+/// The fd admission entry holds the position lock through import and this call.
 pub(super) fn read_iovecs(file: &File, iovecs: &IoVecs) -> Result<usize, SystemError> {
     file.readable()?;
     let max_rw_count = MAX_RW_COUNT;

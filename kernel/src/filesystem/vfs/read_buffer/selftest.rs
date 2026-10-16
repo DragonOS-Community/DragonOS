@@ -289,6 +289,11 @@ fn fragmented_staging() -> bool {
 pub(crate) fn report() -> String {
     let _serial = TEST_LOCK.lock();
     let cases = [
+        #[cfg(target_arch = "x86_64")]
+        (
+            "mouse_read_contract",
+            crate::driver::input::ps2_mouse::ps_mouse_device::selftest::run(),
+        ),
         ("lazy_reuse", lazy_reuse()),
         ("growth_release", growth_release()),
         ("errors_release", errors_release()),

@@ -214,119 +214,81 @@ fn copy_file_range_impl(
     pos_out: Option<usize>,
     len: usize,
 ) -> Result<usize, SystemError> {
-    // 获取源文件元数据
+    // Explicit offsets do not participate in the shared-position transaction.
+    // Sorting and deduplication also cover two descriptors of the same OFD.
+    let _positions = File::lock_position_pair(
+        use_in_file_offset.then_some(in_file.as_ref()),
+        use_out_file_offset.then_some(out_file.as_ref()),
+    );
+    let start_pos_in = pos_in.unwrap_or_else(|| in_file.pos());
+    let start_pos_out = pos_out.unwrap_or_else(|| out_file.pos());
     let md_in = in_file.metadata()?;
-    let size_in = md_in.size;
-
-    // 如果长度为 0，直接返回
-    if len == 0 {
-        return Ok(0);
+    if md_in.size < 0 {
+        return Err(SystemError::EINVAL);
     }
-
-    // 获取起始偏移
-    // 注意：如果 use_in/out_file_offset 为 true，这里的 start_pos_in/out (0) 仅用于溢出检查占位，
-    // 实际并不代表文件当前偏移。
-    let start_pos_in = pos_in.unwrap_or(0);
-    let start_pos_out = pos_out.unwrap_or(0);
-
-    // 检查偏移溢出
     start_pos_in
         .checked_add(len)
         .ok_or(SystemError::EOVERFLOW)?;
     start_pos_out
         .checked_add(len)
         .ok_or(SystemError::EOVERFLOW)?;
-
-    if size_in < 0 {
-        return Err(SystemError::EINVAL);
-    }
-    let size_in = size_in as usize;
-
-    // 如果起始位置已经超过文件大小，返回 0
-    // 注意：如果 use_in_file_offset 为 true，我们依赖 in_file.read() 返回 0 来处理 EOF，
-    // 因为此时我们不知道文件的当前偏移量。
-    if !use_in_file_offset && start_pos_in >= size_in {
-        return Ok(0);
-    }
-
-    // 计算实际可读取的长度
-    let actual_len = if use_in_file_offset {
-        // 使用文件当前偏移时，不能预先裁剪，因为我们不知道当前偏移
-        len
-    } else {
-        len.min(size_in.saturating_sub(start_pos_in))
-    };
-
+    let actual_len = len.min((md_in.size as usize).saturating_sub(start_pos_in));
     if actual_len == 0 {
         return Ok(0);
     }
 
-    // 检查同一文件的重叠写入
-    // 使用 metadata 的 inode_id 和 dev_id 来判断是否是同一文件
     let md_out = out_file.metadata()?;
-    if md_in.inode_id == md_out.inode_id && md_in.dev_id == md_out.dev_id {
-        // 同一文件，检查是否有重叠
-        // 注意：只有在两个偏移都是已知的情况下才能检查
-        if !use_in_file_offset
-            && !use_out_file_offset
-            && overlaps(start_pos_in, actual_len, start_pos_out, actual_len)
-        {
-            return Err(SystemError::EINVAL);
-        }
+    if md_in.inode_id == md_out.inode_id
+        && md_in.dev_id == md_out.dev_id
+        && overlaps(start_pos_in, actual_len, start_pos_out, actual_len)
+    {
+        return Err(SystemError::EINVAL);
     }
 
-    // 使用 4KB 缓冲区循环拷贝
     const BUF_SIZE: usize = 4096;
     let mut buffer = vec![0u8; BUF_SIZE].into_boxed_slice();
-    let mut total_copied: usize = 0;
+    let mut total_copied = 0usize;
     let mut current_pos_in = start_pos_in;
     let mut current_pos_out = start_pos_out;
+    let mut completion_error = None;
 
     while total_copied < actual_len {
-        let remaining = actual_len - total_copied;
-        let to_copy = remaining.min(BUF_SIZE);
-
-        // 读取数据
-        let read_len = match in_file.read_for_transfer(
-            (!use_in_file_offset).then_some(current_pos_in),
-            to_copy,
-            &mut buffer[..to_copy],
-        ) {
-            Ok(len) => len,
+        let to_copy = (actual_len - total_copied).min(BUF_SIZE);
+        let read_len =
+            match in_file.read_at_for_transfer(current_pos_in, to_copy, &mut buffer[..to_copy]) {
+                Ok(0) => break,
+                Ok(read) => read,
+                Err(_) if total_copied > 0 => break,
+                Err(error) => return Err(error),
+            };
+        let completed = match File::recover_io(|| {
+            out_file.try_write_for_transfer(current_pos_out, read_len, &buffer[..read_len], false)
+        }) {
+            Ok(completed) => completed,
             Err(_) if total_copied > 0 => break,
             Err(error) => return Err(error),
         };
-
-        if read_len == 0 {
-            break; // EOF
-        }
-
-        // 写入数据
-        let write_offset = if use_out_file_offset {
-            out_file.pos()
-        } else {
-            current_pos_out
-        };
-        let written = match out_file.write_for_transfer(
-            write_offset,
-            read_len,
-            &buffer[..read_len],
-            use_out_file_offset,
-        ) {
-            Ok(len) => len,
-            Err(_) if total_copied > 0 => break,
-            Err(error) => return Err(error),
-        };
-
+        let written = completed.written_len;
+        let previous_copied = total_copied;
         total_copied += written;
-        if use_in_file_offset {
-            in_file.advance_pos(written);
-        }
         current_pos_in += written;
         current_pos_out += written;
-
+        // Primary data has committed even when the following sync fails.
+        // Publish both cursors before entering synchronization recovery.
+        if use_in_file_offset {
+            in_file.commit_transfer_position(current_pos_in);
+        }
+        if use_out_file_offset {
+            out_file.commit_transfer_position(current_pos_out);
+        }
+        if let Err(error) = out_file.finish_write(completed) {
+            if previous_copied == 0 {
+                completion_error = Some(error);
+            }
+            break;
+        }
         if written < read_len {
-            break; // 短写
+            break;
         }
     }
 
@@ -334,8 +296,7 @@ fn copy_file_range_impl(
         in_file.notify_io_event(FsEvent::ACCESS);
         out_file.notify_io_event(FsEvent::MODIFY);
     }
-
-    Ok(total_copied)
+    completion_error.map_or(Ok(total_copied), Err)
 }
 
 /// 检查两个范围是否重叠

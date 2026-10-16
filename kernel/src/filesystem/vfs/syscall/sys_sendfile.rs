@@ -1,6 +1,10 @@
 use crate::arch::syscall::nr::SYS_SENDFILE;
 use crate::filesystem::fsnotify::FsEvent;
-use crate::filesystem::vfs::{file::FileMode, syscall::SpliceFlags, FileFlags, FileType};
+use crate::filesystem::vfs::{
+    file::{File, FileMode},
+    syscall::SpliceFlags,
+    FileFlags, FileType,
+};
 use crate::process::ProcessManager;
 use crate::syscall::table::Syscall;
 use crate::syscall::user_buffer::UserBuffer;
@@ -58,8 +62,8 @@ impl Syscall for SysSendfileHandle {
     }
 }
 
-/// Own the transfer cursors, not the file-table lock or a new pair of f_pos
-/// locks. Linux do_sendfile uses fdget rather than fdget_pos as well.
+/// Serialize implicit positions for the complete transfer. Pipe output takes
+/// the input lock only after reserving capacity, avoiding pipe/f_pos cycles.
 fn sendfile_transfer(
     out_fd: i32,
     in_fd: i32,
@@ -91,6 +95,7 @@ fn sendfile_transfer(
     {
         return Err(SystemError::EINVAL);
     }
+    let requested_count = count;
     let count = count.min(MAX_RW_COUNT);
     let output = table
         .read()
@@ -106,20 +111,35 @@ fn sendfile_transfer(
         let written = super::sys_splice::splice_read_to_pipe(
             &input,
             &mut input_position,
+            !explicit_offset,
             &output,
-            count,
+            requested_count,
             flags,
         )?;
         if written > 0 {
             if explicit_offset {
                 *position = input_position as i64;
-            } else {
-                input.commit_transfer_position(input_position);
             }
             input.notify_io_event(FsEvent::ACCESS);
             output.notify_io_event(FsEvent::MODIFY);
         }
         return Ok(written);
+    }
+    let _positions = File::lock_position_pair(
+        (!explicit_offset).then_some(input.as_ref()),
+        Some(output.as_ref()),
+    );
+    // Recheck the original range using the position protected by this
+    // transaction; the earlier snapshot only preserves fd/error admission.
+    if !explicit_offset {
+        input_position = input.pos();
+    }
+    if input_position
+        .checked_add(requested_count)
+        .filter(|end| *end <= i64::MAX as usize)
+        .is_none()
+    {
+        return Err(SystemError::EINVAL);
     }
     let output_stream = output.mode().contains(FileMode::FMODE_STREAM);
     let mut output_position = if output_stream { 0 } else { output.pos() };
@@ -161,9 +181,10 @@ fn sendfile_transfer(
                     }
                 }
             };
-        let written = match output.write_for_transfer(output_position, read, &buffer[..read], false)
-        {
-            Ok(written) => written,
+        let result = match File::recover_io(|| {
+            output.try_write_for_transfer(output_position, read, &buffer[..read], false)
+        }) {
+            Ok(result) => result,
             Err(error) => {
                 break if transferred > 0 {
                     Ok(transferred)
@@ -172,10 +193,29 @@ fn sendfile_transfer(
                 }
             }
         };
+        let written = result.written_len;
+        let had_progress = transferred != 0;
         transferred += written;
         input_position += written;
         if !output_stream {
             output_position += written;
+        }
+        if written != 0 {
+            // Data has committed even if its following synchronous flush
+            // fails. Never replay it or lose the real cursor progress.
+            output.commit_transfer_position(output_position);
+            if explicit_offset {
+                *position = input_position as i64;
+            } else {
+                input.commit_transfer_position(input_position);
+            }
+        }
+        if let Err(error) = output.finish_write(result) {
+            break if had_progress {
+                Ok(transferred)
+            } else {
+                Err(error)
+            };
         }
         if transferred == count || written < read {
             break Ok(transferred);
@@ -183,14 +223,6 @@ fn sendfile_transfer(
     };
 
     if transferred > 0 {
-        // Ordering matters when both descriptors share the same open file:
-        // the implicit input cursor is the final f_pos, never two additions.
-        output.commit_transfer_position(output_position);
-        if explicit_offset {
-            *position = input_position as i64;
-        } else {
-            input.commit_transfer_position(input_position);
-        }
         input.notify_io_event(FsEvent::ACCESS);
         output.notify_io_event(FsEvent::MODIFY);
     }

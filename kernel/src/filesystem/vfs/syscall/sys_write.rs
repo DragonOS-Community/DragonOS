@@ -105,21 +105,7 @@ impl SysWriteHandle {
 
 syscall_table_macros::declare_syscall!(SYS_WRITE, SysWriteHandle);
 
-/// Internal implementation of the write operation
-///
-/// # Arguments
-/// * `fd` - File descriptor to write to
-/// * `buf` - Buffer containing data to write
-///
-/// # Returns
-/// * `Ok(usize)` - Number of bytes successfully written
-/// * `Err(SystemError)` - Error code if operation fails
-pub(super) fn do_write(fd: i32, buf: &[u8]) -> Result<usize, SystemError> {
-    let file = get_file_by_fd(fd)?;
-    file.write(buf.len(), buf)
-}
-
-fn get_file_by_fd(fd: i32) -> Result<Arc<File>, SystemError> {
+pub(super) fn get_file_by_fd(fd: i32) -> Result<Arc<File>, SystemError> {
     let binding = ProcessManager::current_pcb().fd_table();
     let fd_table_guard = binding.read();
 

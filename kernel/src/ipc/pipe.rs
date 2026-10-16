@@ -1078,45 +1078,6 @@ impl PipeRuntime {
         Ok(to_write)
     }
 
-    /// Wait for pipe space before file->pipe splice reads from the input file.
-    ///
-    /// The caller bounds the input read by one logical source page. A free
-    /// descriptor slot admits that entire page range. The writer transaction
-    /// keeps the reservation valid through the input read and commit.
-    pub(crate) fn wait_writable_for_splice<'a>(
-        &'a self,
-        transaction: &mut PipeWriterTransaction<'a>,
-        len: usize,
-    ) -> Result<usize, SystemError> {
-        debug_assert!(core::ptr::eq(transaction.pipe, self));
-        if len == 0 {
-            return Ok(0);
-        }
-
-        let need_atomic = len <= PIPE_BUF;
-        let mut guard = self.inner.lock();
-        loop {
-            if guard.reader == 0 {
-                drop(guard);
-                Self::send_sigpipe();
-                return Err(SystemError::EPIPE);
-            }
-
-            let space = guard.writable_bytes();
-            if (need_atomic && space >= len) || (!need_atomic && space > 0) {
-                let writable = if need_atomic { len } else { len.min(space) };
-                return Ok(writable);
-            }
-
-            let (next_guard, wait_result) = self.wait_for_write_space(guard, transaction, || {});
-            guard = next_guard;
-            if let Err(err) = wait_result {
-                drop(guard);
-                return Err(err);
-            }
-        }
-    }
-
     /// Wait until the pipe has any writable byte for file->pipe splice.
     ///
     /// This matches Linux `wait_for_space()` for inputs whose exact readable
@@ -1169,20 +1130,6 @@ impl PipeRuntime {
             return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
         }
         Ok(wanted.map_or(space, |len| len.min(space)))
-    }
-
-    /// Validate the output endpoint before file->pipe splice consumes input.
-    pub(crate) fn ensure_splice_readers(
-        &self,
-        transaction: &PipeWriterTransaction<'_>,
-    ) -> Result<(), SystemError> {
-        debug_assert!(core::ptr::eq(transaction.pipe, self));
-        let has_readers = self.inner.lock().reader > 0;
-        if !has_readers {
-            Self::send_sigpipe();
-            return Err(SystemError::EPIPE);
-        }
-        Ok(())
     }
 
     /// 从管道中“窥视”最多 `len` 字节数据到 `buf`，但不消耗管道数据。

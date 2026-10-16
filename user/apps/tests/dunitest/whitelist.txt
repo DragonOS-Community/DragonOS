@@ -223,3 +223,5 @@ normal/read_buffer_semantics
 normal/read_fault_semantics
 normal/fuse_read_fault
 normal/read_buffer_selftest
+
+normal/shared_file_position

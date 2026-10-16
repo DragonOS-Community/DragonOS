@@ -36,15 +36,6 @@ impl File {
         self.pread_with_fsnotify(offset, len, buf, true)
     }
 
-    pub(crate) fn read_for_transfer(
-        &self,
-        offset: Option<usize>,
-        len: usize,
-        buf: &mut [u8],
-    ) -> Result<usize, SystemError> {
-        Self::recover_io(|| self.try_read_for_transfer(offset, len, buf))
-    }
-
     pub(crate) fn read_at_for_transfer(
         &self,
         offset: usize,
@@ -54,17 +45,6 @@ impl File {
         Self::recover_io(|| self.try_read_at_for_transfer(offset, len, buf))
     }
 
-    pub(crate) fn write_for_transfer(
-        &self,
-        offset: usize,
-        len: usize,
-        buf: &[u8],
-        update_offset: bool,
-    ) -> Result<usize, SystemError> {
-        let result =
-            Self::recover_io(|| self.try_write_for_transfer(offset, len, buf, update_offset))?;
-        self.finish_write(result)
-    }
     pub(crate) fn recover_io<T>(
         mut attempt: impl FnMut() -> Result<T, MemoryAllocationError>,
     ) -> Result<T, SystemError> {

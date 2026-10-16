@@ -5,9 +5,13 @@ use crate::filesystem::vfs::{
     InodeFlags, InodeId, InodeMode, Metadata, SetMetadataMask, XattrFlags,
 };
 use crate::libs::mutex::MutexGuard;
+use crate::mm::allocation::MemoryAllocationError;
+#[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
+use crate::mm::kernel_buffer::KernelBuffer as XattrStorage;
 use crate::process::{cred::CAPFlags, cred::Kgid, ProcessManager};
 use alloc::sync::Arc;
-use alloc::vec::Vec;
+#[cfg(not(any(target_arch = "x86_64", target_arch = "riscv64")))]
+type XattrStorage = alloc::vec::Vec<u8>;
 use system_error::SystemError;
 
 pub(super) const OVL_XATTR_ORIGIN: &str = "trusted.dragonos.overlay.origin";
@@ -230,56 +234,97 @@ fn metadata_change_kills_capability(mask: SetMetadataMask) -> bool {
     )
 }
 
-fn read_xattr_list(inode: &Arc<dyn IndexNode>) -> Result<Vec<u8>, SystemError> {
-    for _ in 0..XATTR_READ_RETRIES {
-        let size = inode.listxattr(&mut [])?;
-        if size > XATTR_MAX_SIZE {
-            return Err(SystemError::E2BIG);
-        }
-        if size == 0 {
-            return Ok(Vec::new());
-        }
-
-        let mut list = vec![0u8; size];
-        match inode.listxattr(&mut list) {
-            Ok(actual) => {
-                if actual > list.len() {
-                    return Err(SystemError::EIO);
-                }
-                list.truncate(actual);
-                return Ok(list);
-            }
-            Err(SystemError::ERANGE) => continue,
-            Err(err) => return Err(err),
-        }
-    }
-    Err(SystemError::ERANGE)
+/// One synchronous xattr scratch owner. Capacity may be reused between values;
+/// only the bytes actually returned by the backing are ever exposed.
+#[derive(Default)]
+struct XattrBuffer {
+    storage: Option<XattrStorage>,
+    len: usize,
 }
 
-fn read_xattr_value(inode: &Arc<dyn IndexNode>, name: &str) -> Result<Vec<u8>, SystemError> {
-    for _ in 0..XATTR_READ_RETRIES {
-        let size = inode.getxattr(name, &mut [])?;
-        if size > XATTR_MAX_SIZE {
-            return Err(SystemError::E2BIG);
-        }
-        if size == 0 {
-            return Ok(Vec::new());
-        }
-
-        let mut value = vec![0u8; size];
-        match inode.getxattr(name, &mut value) {
-            Ok(actual) => {
-                if actual > value.len() {
-                    return Err(SystemError::EIO);
-                }
-                value.truncate(actual);
-                return Ok(value);
-            }
-            Err(SystemError::ERANGE) => continue,
-            Err(err) => return Err(err),
-        }
+fn allocate_xattr_storage(size: usize) -> Result<XattrStorage, MemoryAllocationError> {
+    #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
+    {
+        XattrStorage::try_new_zeroed(size)
     }
-    Err(SystemError::ERANGE)
+    // Preserve the existing heap contract on architectures without vmalloc.
+    // This compatibility branch does not provide KernelBuffer's byte accounting.
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "riscv64")))]
+    {
+        let mut storage = XattrStorage::new();
+        storage
+            .try_reserve_exact(size)
+            .map_err(|_| SystemError::ENOMEM)?;
+        storage.resize(size, 0);
+        Ok(storage)
+    }
+}
+
+impl XattrBuffer {
+    fn as_slice(&self) -> &[u8] {
+        self.storage
+            .as_ref()
+            .map_or(&[], |storage| &storage[..self.len])
+    }
+
+    fn read(
+        &mut self,
+        read: impl FnMut(&mut [u8]) -> Result<usize, SystemError>,
+    ) -> Result<(), MemoryAllocationError> {
+        self.read_with(read, allocate_xattr_storage)
+    }
+
+    // The reader is shared by list/get; the allocator parameter also permits
+    // local, controlled accounting/fragmentation tests without global hooks.
+    fn read_with(
+        &mut self,
+        mut read: impl FnMut(&mut [u8]) -> Result<usize, SystemError>,
+        mut allocate: impl FnMut(usize) -> Result<XattrStorage, MemoryAllocationError>,
+    ) -> Result<(), MemoryAllocationError> {
+        self.len = 0;
+        for _ in 0..XATTR_READ_RETRIES {
+            let size = read(&mut [])?;
+            if size > XATTR_MAX_SIZE {
+                return Err(SystemError::E2BIG.into());
+            }
+            if size == 0 {
+                return Ok(());
+            }
+            if self
+                .storage
+                .as_ref()
+                .is_none_or(|storage| storage.len() < size)
+            {
+                // No published data needs preserving. Drop the old capacity
+                // before admitting its replacement, avoiding double charging.
+                self.storage = None;
+                self.storage = Some(allocate(size)?);
+            }
+            let storage = self.storage.as_mut().unwrap();
+            // A reused capacity can exceed this probe. It must not mask an
+            // invalid actual length or alter the backing's ERANGE semantics.
+            match read(&mut storage[..size]) {
+                Ok(actual) if actual <= size => {
+                    self.len = actual;
+                    return Ok(());
+                }
+                Ok(_) => return Err(SystemError::EIO.into()),
+                Err(SystemError::ERANGE) => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Err(SystemError::ERANGE.into())
+    }
+}
+
+/// Read-only IndexNode interfaces cannot carry admission recovery. Preserve
+/// backing errno, and report rejected scratch admission without reclaim/OOM
+/// under the caller's resource locks or overridden backing credentials.
+pub(super) fn xattr_read_error(error: MemoryAllocationError) -> SystemError {
+    match error {
+        MemoryAllocationError::System(error) => error,
+        MemoryAllocationError::Charge(_) => SystemError::ENOMEM,
+    }
 }
 
 fn for_each_xattr_name<E: From<SystemError>>(
@@ -307,18 +352,19 @@ pub(super) fn copy_xattrs(
     lower: &Arc<dyn IndexNode>,
     upper: &Arc<dyn IndexNode>,
 ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
-    let list = match read_xattr_list(lower) {
-        Ok(list) => list,
-        Err(err) if is_unsupported(&err) => return Ok(()),
-        Err(err) => return Err(err.into()),
-    };
-
-    for_each_xattr_name::<crate::mm::allocation::MemoryAllocationError>(&list, |name| {
+    let mut list = XattrBuffer::default();
+    match list.read(|buf| lower.listxattr(buf)) {
+        Ok(()) => {}
+        Err(MemoryAllocationError::System(error)) if is_unsupported(&error) => return Ok(()),
+        Err(error) => return Err(error),
+    }
+    let mut value = XattrBuffer::default();
+    for_each_xattr_name::<MemoryAllocationError>(list.as_slice(), |name| {
         if is_private_xattr(name) {
             return Ok(());
         }
-        let value = read_xattr_value(lower, name)?;
-        match upper.setxattr(name, &value, XattrFlags::empty()) {
+        value.read(|buf| lower.getxattr(name, buf))?;
+        match upper.setxattr(name, value.as_slice(), XattrFlags::empty()) {
             Ok(_) => Ok(()),
             Err(crate::mm::allocation::MemoryAllocationError::System(err))
                 if is_unsupported(&err) && !must_copy_xattr(name) =>
@@ -369,20 +415,23 @@ pub(super) fn prepare_origin(
 pub(super) fn load_origin(
     inode: &OvlInode,
     upper: &Arc<dyn IndexNode>,
-) -> Result<Option<OvlOrigin>, SystemError> {
+) -> Result<Option<OvlOrigin>, MemoryAllocationError> {
     let fs = inode.overlay_fs()?;
     let _cred_guard = CredOverrideGuard::new(fs.backing_cred.clone())?;
-    let value = match read_xattr_value(upper, OVL_XATTR_ORIGIN) {
-        Ok(value) => value,
-        Err(SystemError::ENODATA) => return Ok(None),
+    let mut value = XattrBuffer::default();
+    match value.read(|buf| upper.getxattr(OVL_XATTR_ORIGIN, buf)) {
+        Ok(()) => {}
+        Err(MemoryAllocationError::System(SystemError::ENODATA)) => return Ok(None),
         // Keep this symmetric with prepare_origin(): if the backing
         // filesystem cannot store the private origin xattr, a later inode
         // instantiation must use the upper identity instead of exposing the
         // backing xattr error through lookup/stat.
-        Err(err) if is_origin_xattr_unavailable(&err) => return Ok(None),
+        Err(MemoryAllocationError::System(err)) if is_origin_xattr_unavailable(&err) => {
+            return Ok(None);
+        }
         Err(err) => return Err(err),
-    };
-    let Some(origin) = decode_origin(&value) else {
+    }
+    let Some(origin) = decode_origin(value.as_slice()) else {
         return Ok(None);
     };
     if origin.file_type != inode.file_type
@@ -637,25 +686,47 @@ pub(super) fn listxattr(inode: &OvlInode, buf: &mut [u8]) -> Result<usize, Syste
     let fs = inode.overlay_fs()?;
     let _cred_guard = CredOverrideGuard::new(fs.backing_cred.clone())?;
     let real = inode.current_realdata_inode()?.0;
-    let list = read_xattr_list(&real)?;
-    let mut filtered = Vec::with_capacity(list.len());
-    for_each_xattr_name::<SystemError>(&list, |name| {
-        if is_private_xattr(name) || (!may_list_trusted && name.starts_with(XATTR_TRUSTED_PREFIX)) {
-            return Ok(());
+    let mut list = XattrBuffer::default();
+    list.read(|buf| real.listxattr(buf))
+        .map_err(xattr_read_error)?;
+    copy_visible_xattr_names(list.as_slice(), buf, may_list_trusted)
+}
+
+fn copy_visible_xattr_names(
+    list: &[u8],
+    buf: &mut [u8],
+    may_list_trusted: bool,
+) -> Result<usize, SystemError> {
+    let visible = |name: &str| {
+        !is_private_xattr(name) && (may_list_trusted || !name.starts_with(XATTR_TRUSTED_PREFIX))
+    };
+    // Fully validate even a size query or a too-small output before touching
+    // the caller's buffer. The same immutable list/credential snapshot is used
+    // in both passes, so no second full-size filtering allocation is needed.
+    let mut size = 0;
+    for_each_xattr_name::<SystemError>(list, |name| {
+        if visible(name) {
+            size += name.len() + 1;
         }
-        filtered.extend_from_slice(name.as_bytes());
-        filtered.push(0);
         Ok(())
     })?;
-
     if buf.is_empty() {
-        return Ok(filtered.len());
+        return Ok(size);
     }
-    if buf.len() < filtered.len() {
+    if buf.len() < size {
         return Err(SystemError::ERANGE);
     }
-    buf[..filtered.len()].copy_from_slice(&filtered);
-    Ok(filtered.len())
+    let mut offset = 0;
+    for_each_xattr_name::<SystemError>(list, |name| {
+        if visible(name) {
+            let end = offset + name.len();
+            buf[offset..end].copy_from_slice(name.as_bytes());
+            buf[end] = 0;
+            offset = end + 1;
+        }
+        Ok(())
+    })?;
+    Ok(size)
 }
 
 pub(super) fn removexattr(
@@ -702,3 +773,14 @@ pub(super) fn removexattr(
         Err(err) => Err(err),
     }
 }
+
+#[cfg(all(
+    feature = "mm_selftest",
+    any(target_arch = "x86_64", target_arch = "riscv64")
+))]
+mod selftest;
+#[cfg(all(
+    feature = "mm_selftest",
+    any(target_arch = "x86_64", target_arch = "riscv64")
+))]
+pub(crate) use selftest::report as selftest_report;

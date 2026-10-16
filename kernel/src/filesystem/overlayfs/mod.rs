@@ -25,3 +25,9 @@ use linkme::distributed_slice;
 use system_error::SystemError;
 
 register_mountable_fs!(OverlayFS, OVERLAYFSMAKER, "overlay");
+
+#[cfg(all(
+    feature = "mm_selftest",
+    any(target_arch = "x86_64", target_arch = "riscv64")
+))]
+pub(crate) use metadata::selftest_report as xattr_selftest_report;

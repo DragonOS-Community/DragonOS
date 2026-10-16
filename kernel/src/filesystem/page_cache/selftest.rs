@@ -1188,6 +1188,8 @@ pub(crate) fn run_completion_domain_debug_selftest() -> Result<alloc::string::St
     let _running = PageCacheCompletionSelftestGuard;
     let state = Arc::new(PageCacheCompletionSelftestState::new());
 
+    let completion_domain = PageCacheWritebackDomain::new();
+    let completion_executor = completion_domain.writeback_executor()?;
     // Place exactly one waiter on every generic page-cache worker. Direct queue
     // selection keeps the test deterministic even if unrelated page-cache work
     // advances the production round-robin counter concurrently. The waiters
@@ -1221,12 +1223,15 @@ pub(crate) fn run_completion_domain_debug_selftest() -> Result<alloc::string::St
     }
 
     let completion_state = state.clone();
-    PAGECACHE_WRITEBACK_WQS[0].enqueue(Work::new(move || {
-        completion_state
-            .completion_done
-            .store(true, Ordering::Release);
-        completion_state.wait.wake_all();
-    }));
+    writeback::schedule_pagecache_writeback(
+        &completion_executor,
+        Work::new(move || {
+            completion_state
+                .completion_done
+                .store(true, Ordering::Release);
+            completion_state.wait.wake_all();
+        }),
+    );
 
     let completion_result = state.wait.wait_until_timeout(
         || state.completion_done.load(Ordering::Acquire).then_some(()),
@@ -4631,53 +4636,60 @@ pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, S
     let tagged_worker_backend = submission_backend_dyn.clone();
     let tagged_worker_entry = tagged_submission_entry.clone();
     let tagged_worker_gate = tagged_submission_gate.clone();
-    PAGECACHE_WRITEBACK_WQS[0].enqueue(Work::new(move || {
-        let mut claimed = WritebackClaimOutcome::NoBatch;
-        let admission = PageCacheManager::with_writeback_admission(
-            &tagged_worker_cache,
-            &tagged_worker_backend,
-            &mut || {
-                claimed = PageCacheManager::claim_and_snapshot_locked_with(
-                    &tagged_worker_cache,
-                    WritebackBatchRange::new(0, 0),
-                    token_file_size,
-                    Some((0, &tagged_worker_entry, tagged_submission_epoch)),
-                    true,
-                    None,
-                    |batch| {
-                        tagged_worker_gate
-                            .snapshot_entered
-                            .store(true, Ordering::Release);
-                        tagged_worker_gate.wait.wake_all();
-                        tagged_worker_gate.wait.wait_until(|| {
+    let tagged_submit_executor = submission_cache.writeback_executor()?;
+    // This independent observer deliberately waits while the real submit
+    // executor is paused, so it must not occupy that executor itself.
+    let tagged_wait_worker = WorkQueue::try_new_owned("pc-wb-test-wait")?;
+    writeback::schedule_pagecache_writeback(
+        &tagged_submit_executor,
+        Work::new(move || {
+            let mut claimed = WritebackClaimOutcome::NoBatch;
+            let admission = PageCacheManager::with_writeback_admission(
+                &tagged_worker_cache,
+                &tagged_worker_backend,
+                &mut || {
+                    claimed = PageCacheManager::claim_and_snapshot_locked_with(
+                        &tagged_worker_cache,
+                        WritebackBatchRange::new(0, 0),
+                        token_file_size,
+                        Some((0, &tagged_worker_entry, tagged_submission_epoch)),
+                        true,
+                        None,
+                        |batch| {
                             tagged_worker_gate
-                                .release_snapshot
-                                .load(Ordering::Acquire)
-                                .then_some(())
-                        });
-                        PageCacheManager::snapshot_writeback_batch(batch)
-                    },
-                )?;
-                Ok(())
-            },
-        );
-        let submitted = match claimed {
-            WritebackClaimOutcome::Claimed(batch) => matches!(
-                PageCacheManager::submit_writeback_batch(batch),
-                Ok(WritebackSubmitOutcome::Completed)
-            ),
-            WritebackClaimOutcome::NoBatch
-            | WritebackClaimOutcome::Deferred(_)
-            | WritebackClaimOutcome::FailedRecorded(_) => false,
-        };
-        tagged_worker_gate
-            .worker_succeeded
-            .store(admission.is_ok() && submitted, Ordering::Release);
-        tagged_worker_gate
-            .worker_finished
-            .store(true, Ordering::Release);
-        tagged_worker_gate.wait.wake_all();
-    }));
+                                .snapshot_entered
+                                .store(true, Ordering::Release);
+                            tagged_worker_gate.wait.wake_all();
+                            tagged_worker_gate.wait.wait_until(|| {
+                                tagged_worker_gate
+                                    .release_snapshot
+                                    .load(Ordering::Acquire)
+                                    .then_some(())
+                            });
+                            PageCacheManager::snapshot_writeback_batch(batch)
+                        },
+                    )?;
+                    Ok(())
+                },
+            );
+            let submitted = match claimed {
+                WritebackClaimOutcome::Claimed(batch) => matches!(
+                    PageCacheManager::submit_writeback_batch(batch),
+                    Ok(WritebackSubmitOutcome::Completed)
+                ),
+                WritebackClaimOutcome::NoBatch
+                | WritebackClaimOutcome::Deferred(_)
+                | WritebackClaimOutcome::FailedRecorded(_) => false,
+            };
+            tagged_worker_gate
+                .worker_succeeded
+                .store(admission.is_ok() && submitted, Ordering::Release);
+            tagged_worker_gate
+                .worker_finished
+                .store(true, Ordering::Release);
+            tagged_worker_gate.wait.wake_all();
+        }),
+    );
     const TRACKED_SUBMISSION_SELFTEST_TIMEOUT: Duration = Duration::from_secs(2);
     const TRACKED_SUBMISSION_PROBE_TIMEOUT: Duration = Duration::from_millis(50);
     let snapshot_entered = tagged_submission_gate
@@ -4695,7 +4707,7 @@ pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, S
     let tagged_waiter_cache = submission_cache.clone();
     let tagged_waiter_gate = tagged_submission_gate.clone();
     if snapshot_entered {
-        PAGECACHE_WRITEBACK_WQS[1].enqueue(Work::new(move || {
+        tagged_wait_worker.enqueue(Work::new(move || {
             tagged_waiter_gate
                 .waiter_started
                 .store(true, Ordering::Release);

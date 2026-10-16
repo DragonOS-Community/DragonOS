@@ -1211,9 +1211,27 @@ impl PageCacheWritebackSubmission for Ext4EagerSubmission {
         let completed_end = offset
             .checked_add(data.len())
             .ok_or(SystemError::EOVERFLOW)?;
-        let written =
-            self.inode
-                .write_eager_data_with_completed_end(offset, data, completed_end)?;
+        let admission = self.inode.close_production_delalloc_admission()?;
+        let deferred = {
+            let guard = self.inode.inner.lock();
+            (!guard.delalloc.production.entries.is_empty()).then(|| {
+                self.inode.delalloc_progress.ticket(
+                    guard.self_ref.clone(),
+                    guard
+                        .page_cache
+                        .as_ref()
+                        .map(Arc::downgrade)
+                        .unwrap_or_default(),
+                )
+            })
+        };
+        if let Some(progress) = deferred {
+            drop(admission);
+            return Ok(PageCacheWritebackSubmitResult::Deferred(progress));
+        }
+        let written = self
+            .inode
+            .write_eager_data_admitted(offset, data, completed_end)?;
         if written != data.len() {
             return Err(SystemError::EIO);
         }
@@ -1329,7 +1347,6 @@ impl PageCacheWritebackSubmission for Ext4DelayedSubmission {
 
                 let mut writer_wait = None;
                 let outcome = loop {
-                    let observed = self.fs.fs.metadata_mutation_generation();
                     let outcome = self
                         .fs
                         .fs
@@ -1349,9 +1366,13 @@ impl PageCacheWritebackSubmission for Ext4DelayedSubmission {
                         // Preserve the exact claimed pages, reservations and
                         // pool while sleeping on the filesystem-wide owner
                         // which can actually make this transaction runnable.
-                        let (observed, intent) = self.fs.prepare_metadata_writer_wait(observed)?;
-                        writer_wait = intent;
-                        self.fs.wait_metadata_mutation_progress(observed)?;
+                        match self.fs.prepare_metadata_writer_wait()? {
+                            another_ext4::MetadataWriterRetry::Retry => continue,
+                            another_ext4::MetadataWriterRetry::Wait { observed, intent } => {
+                                writer_wait = intent;
+                                self.fs.wait_metadata_mutation_progress(observed)?;
+                            }
+                        }
                         continue;
                     }
                     break outcome;
@@ -1940,6 +1961,18 @@ impl PageCacheBackend for Ext4PageCacheBackend {
                     .delalloc_progress
                     .ticket(Arc::downgrade(&inode), page_cache),
             ));
+        }
+        if !guard.delalloc.production.entries.is_empty() {
+            let progress = inode.delalloc_progress.ticket(
+                guard.self_ref.clone(),
+                guard
+                    .page_cache
+                    .as_ref()
+                    .map(Arc::downgrade)
+                    .unwrap_or_default(),
+            );
+            drop(guard);
+            return Ok(PageCacheWritebackBindResult::Deferred(progress));
         }
         {
             drop(guard);
@@ -4605,6 +4638,18 @@ impl LockedExt4Inode {
         let _operation = self.begin_operation()?;
         let _delalloc_admission = self.close_production_delalloc_admission()?;
         self.drain_delalloc_before_eager()?;
+        self.write_eager_data_admitted(offset, buf, completed_end)
+    }
+
+    /// The caller keeps delayed admission closed and has established an
+    /// empty delayed queue. Background submission must defer instead of
+    /// waiting for another submission on its serial filesystem worker.
+    fn write_eager_data_admitted(
+        &self,
+        offset: usize,
+        buf: &[u8],
+        completed_end: usize,
+    ) -> Result<usize, SystemError> {
         let _io_guard = self.io_lock.lock();
         let _metadata_commit = self.metadata_commit_lock.lock();
         let (fs, inode_num) = {
@@ -6061,7 +6106,6 @@ impl LockedExt4Inode {
     ) -> Result<(), (another_ext4::Ext4Error, another_ext4::InodeReclaimHandle)> {
         let mut writer_wait = None;
         loop {
-            let observed = fs.fs.metadata_mutation_generation();
             let result = fs.fs.reclaim_inode(handle);
             drop(writer_wait.take());
             match result {
@@ -6072,8 +6116,9 @@ impl LockedExt4Inode {
                         return Err((error, returned_handle));
                     }
                     handle = returned_handle;
-                    let observed = match fs.prepare_metadata_writer_wait(observed) {
-                        Ok((observed, intent)) => {
+                    let observed = match fs.prepare_metadata_writer_wait() {
+                        Ok(another_ext4::MetadataWriterRetry::Retry) => continue,
+                        Ok(another_ext4::MetadataWriterRetry::Wait { observed, intent }) => {
                             writer_wait = intent;
                             observed
                         }
@@ -6102,7 +6147,6 @@ impl LockedExt4Inode {
         let _reuse = fs.begin_reclaim();
         let mut writer_wait = None;
         let handle = loop {
-            let observed = fs.fs.metadata_mutation_generation();
             let result = fs.fs.unlink(parent_inode_num, name);
             drop(writer_wait.take());
             match result {
@@ -6113,8 +6157,9 @@ impl LockedExt4Inode {
                     return Err(error);
                 }
                 Err(error) if error.code() == another_ext4::ErrCode::EAGAIN => {
-                    let observed = match fs.prepare_metadata_writer_wait(observed) {
-                        Ok((observed, intent)) => {
+                    let observed = match fs.prepare_metadata_writer_wait() {
+                        Ok(another_ext4::MetadataWriterRetry::Retry) => continue,
+                        Ok(another_ext4::MetadataWriterRetry::Wait { observed, intent }) => {
                             writer_wait = intent;
                             observed
                         }

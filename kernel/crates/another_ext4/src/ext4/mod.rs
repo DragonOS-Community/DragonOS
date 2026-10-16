@@ -21,7 +21,7 @@ mod metadata_gate;
 #[cfg(test)]
 use metadata_gate::METADATA_GATE_DIRECT_MAX;
 use metadata_gate::{MetadataMutationGate, MetadataMutationGuard};
-pub use metadata_gate::{MetadataMutationWaker, MetadataWriterWait};
+pub use metadata_gate::{MetadataMutationWaker, MetadataWriterRetry, MetadataWriterWait};
 mod journal;
 mod journal_batch;
 pub use journal_batch::BatchProgress;
@@ -951,10 +951,28 @@ impl Ext4 {
         }
     }
 
-    /// Hold across an exclusive operation's contention wait and next retry.
-    /// Read-only retries must not register a writer preference of their own.
-    pub fn begin_metadata_writer_wait(&self) -> Result<Option<MetadataWriterWait<'_>>> {
-        self.metadata_mutation_barrier.writer_wait()
+    /// Prepare a scheduler wait only after EAGAIN and after the caller has
+    /// dropped its previous writer intent. Sampling here excludes releases
+    /// caused by the failed attempt itself. The following owner recheck is
+    /// essential: an owner which already departed must result in Retry,
+    /// rather than waiting for a notification which will never arrive.
+    pub fn prepare_metadata_writer_retry(&self) -> Result<MetadataWriterRetry<'_>> {
+        if self.metadata_mutations_terminal() {
+            return Err(Ext4Error::new(ErrCode::EIO));
+        }
+        let observed = self.metadata_mutation_generation();
+        let intent = self.metadata_mutation_barrier.writer_wait()?;
+        let journal_blocked = match &self.metadata_mode {
+            MetadataMutationMode::Batched(core) => core.retry_is_blocked(),
+            MetadataMutationMode::Journal(core) => core.retry_is_blocked(),
+            MetadataMutationMode::Direct(core) => core.retry_is_blocked(),
+            MetadataMutationMode::ReadOnly => return Err(Ext4Error::new(ErrCode::EROFS)),
+        };
+        if self.metadata_mutation_barrier.has_owner() || journal_blocked {
+            Ok(MetadataWriterRetry::Wait { observed, intent })
+        } else {
+            Ok(MetadataWriterRetry::Retry)
+        }
     }
 
     /// Whether all future metadata mutations are terminally rejected.

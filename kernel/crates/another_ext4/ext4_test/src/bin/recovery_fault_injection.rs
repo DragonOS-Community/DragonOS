@@ -21,10 +21,17 @@ const ROOT_INO: u32 = EXT4_ROOT_INO;
 const IMAGE_SIZE: u64 = 64 * 1024 * 1024;
 const WRITE_LEN: usize = 4 * 4096;
 const PAYLOAD: &[u8; WRITE_LEN] = &[0xa5; WRITE_LEN];
+// One block per fragment avoids intermediate initialized/unwritten splits
+// changing the extent geometry while the fixture is being constructed.
+const FRAGMENT_LEN: usize = 4096;
+const FRAGMENT_PAYLOAD: &[u8; FRAGMENT_LEN] = &[0xa5; FRAGMENT_LEN];
 const INLINE_EXTENT_CAPACITY: usize = 4;
 // `ExtentHeader` (12 bytes) plus 340 extents (12 bytes each) leaves the
 // four-byte metadata-checksum tail at the end of a 4 KiB extent block.
 const EXTERNAL_LEAF_EXTENT_CAPACITY: usize = 340;
+// Root promotion splits the five entries into a left leaf of two entries
+// and a right leaf of three. Fill the right leaf, not merely 340 total entries.
+const FULL_LEAF_FRAGMENT_COUNT: usize = EXTERNAL_LEAF_EXTENT_CAPACITY + INLINE_EXTENT_CAPACITY / 2;
 const DELALLOC_BLOCK_LEN: usize = 4096;
 const DELALLOC_PAYLOAD: [u8; DELALLOC_BLOCK_LEN] = [0xb7; DELALLOC_BLOCK_LEN];
 // A child which reaches an armed persistence operation terminates from its
@@ -718,11 +725,11 @@ fn run_nojournal_io_error_matrix() {
 }
 
 fn segment_payload(segment: usize) -> Vec<u8> {
-    vec![0x20u8.wrapping_add(segment as u8); WRITE_LEN]
+    vec![0x20u8.wrapping_add(segment as u8); FRAGMENT_LEN]
 }
 
 fn assert_fragmented_prefix(ext4: &Ext4, inode: u32) {
-    let mut data = vec![0u8; INLINE_EXTENT_CAPACITY * WRITE_LEN];
+    let mut data = vec![0u8; INLINE_EXTENT_CAPACITY * FRAGMENT_LEN];
     assert_eq!(
         ext4.read(inode, 0, &mut data)
             .expect("read fragmented prefix failed"),
@@ -730,7 +737,7 @@ fn assert_fragmented_prefix(ext4: &Ext4, inode: u32) {
     );
     for segment in 0..INLINE_EXTENT_CAPACITY {
         assert_eq!(
-            &data[segment * WRITE_LEN..(segment + 1) * WRITE_LEN],
+            &data[segment * FRAGMENT_LEN..(segment + 1) * FRAGMENT_LEN],
             segment_payload(segment).as_slice(),
             "fragmented prefix segment {segment} changed"
         );
@@ -760,19 +767,25 @@ fn create_external_leaf_seed(path: &str) -> u32 {
     // ranges are therefore physically separated and consume the four inline
     // extent slots without relying on a filesystem-image byte offset.
     for segment in 0..INLINE_EXTENT_CAPACITY {
-        let offset = segment * WRITE_LEN;
-        ext4.write(target, offset, &segment_payload(segment))
-            .expect("external-leaf target seed write failed");
-        ext4.write(filler, offset, &[0x7c; WRITE_LEN])
-            .expect("external-leaf filler seed write failed");
+        let offset = segment * FRAGMENT_LEN;
+        assert_eq!(
+            ext4.write(target, offset, &segment_payload(segment))
+                .expect("external-leaf target seed write failed"),
+            FRAGMENT_LEN
+        );
+        assert_eq!(
+            ext4.write(filler, offset, &[0x7c; FRAGMENT_LEN])
+                .expect("external-leaf filler seed write failed"),
+            FRAGMENT_LEN
+        );
     }
     let attr = ext4
         .getattr(target)
         .expect("external-leaf target getattr failed");
-    assert_eq!(attr.size, (INLINE_EXTENT_CAPACITY * WRITE_LEN) as u64);
+    assert_eq!(attr.size, (INLINE_EXTENT_CAPACITY * FRAGMENT_LEN) as u64);
     assert_eq!(
         attr.blocks,
-        (INLINE_EXTENT_CAPACITY * WRITE_LEN / 512) as u64,
+        (INLINE_EXTENT_CAPACITY * FRAGMENT_LEN / 512) as u64,
         "fragmented seed unexpectedly allocated an extent-tree block"
     );
     ext4.shutdown_writable()
@@ -791,7 +804,7 @@ fn run_production_partial_eof_sparse_root_grow_test(persistence: PersistenceMode
     persistence.configure(&device);
     let ext4 =
         Ext4::load_writable(device.clone()).expect("partial-EOF sparse root-grow mount failed");
-    let partial_eof = INLINE_EXTENT_CAPACITY * WRITE_LEN - DELALLOC_BLOCK_LEN + 17;
+    let partial_eof = INLINE_EXTENT_CAPACITY * FRAGMENT_LEN - DELALLOC_BLOCK_LEN + 17;
     ext4.setattr(
         inode,
         another_ext4::SetAttr {
@@ -804,7 +817,7 @@ fn run_production_partial_eof_sparse_root_grow_test(persistence: PersistenceMode
         .getattr(inode)
         .expect("partial-EOF sparse root-grow getattr failed")
         .blocks;
-    let append_offset = INLINE_EXTENT_CAPACITY * WRITE_LEN + DELALLOC_BLOCK_LEN;
+    let append_offset = INLINE_EXTENT_CAPACITY * FRAGMENT_LEN + DELALLOC_BLOCK_LEN;
     let durable_eof = append_offset + DELALLOC_BLOCK_LEN;
     let steps = [ProductionProjectedStep {
         offset: append_offset,
@@ -818,8 +831,9 @@ fn run_production_partial_eof_sparse_root_grow_test(persistence: PersistenceMode
         .getattr(inode)
         .expect("partial-EOF sparse root-grow final getattr failed");
     assert_eq!(attr.size, durable_eof as u64);
-    assert!(
-        attr.blocks > blocks_before + (DELALLOC_BLOCK_LEN / 512) as u64,
+    assert_eq!(
+        attr.blocks,
+        blocks_before + (2 * DELALLOC_BLOCK_LEN / 512) as u64,
         "partial-EOF sparse append did not promote the extent root"
     );
     let mut data = vec![0u8; durable_eof];
@@ -829,8 +843,8 @@ fn run_production_partial_eof_sparse_root_grow_test(persistence: PersistenceMode
         data.len()
     );
     for segment in 0..INLINE_EXTENT_CAPACITY {
-        let start = segment * WRITE_LEN;
-        let end = ((segment + 1) * WRITE_LEN).min(partial_eof);
+        let start = segment * FRAGMENT_LEN;
+        let end = ((segment + 1) * FRAGMENT_LEN).min(partial_eof);
         if start == end {
             break;
         }
@@ -866,14 +880,14 @@ fn count_external_leaf_append_operations(
     let device = Arc::new(CrashBlockFile::new(work));
     let ext4 = Ext4::load_writable(device.clone()).expect("external-leaf count mount failed");
     persistence.configure(&device);
-    let old_size = INLINE_EXTENT_CAPACITY * WRITE_LEN;
+    let old_size = INLINE_EXTENT_CAPACITY * FRAGMENT_LEN;
     assert_fragmented_prefix(&ext4, inode);
     device.reset_operation_log();
     ext4.prepare_buffered_write(
         inode,
         old_size,
-        WRITE_LEN,
-        (old_size + WRITE_LEN) as u64,
+        FRAGMENT_LEN,
+        (old_size + FRAGMENT_LEN) as u64,
         None,
     )
     .expect("external-leaf append preparation failed");
@@ -881,8 +895,9 @@ fn count_external_leaf_append_operations(
         .getattr(inode)
         .expect("external-leaf prepared getattr failed");
     assert_eq!(attr.size, old_size as u64);
-    assert!(
-        attr.blocks > ((old_size + WRITE_LEN) / 512) as u64,
+    assert_eq!(
+        attr.blocks,
+        ((old_size + 3 * FRAGMENT_LEN) / 512) as u64,
         "fifth fragmented extent did not create an external extent-tree leaf"
     );
     let operations = device.operations();
@@ -900,7 +915,7 @@ fn recover_and_retry_external_leaf(
     let device = Arc::new(CrashBlockFile::new(work));
     let ext4 = Ext4::load_writable(device.clone()).expect("external-leaf recovery mount failed");
     persistence.configure(&device);
-    let old_size = INLINE_EXTENT_CAPACITY * WRITE_LEN;
+    let old_size = INLINE_EXTENT_CAPACITY * FRAGMENT_LEN;
     let attr = ext4
         .getattr(inode)
         .expect("external-leaf inode disappeared after recovery");
@@ -910,8 +925,8 @@ fn recover_and_retry_external_leaf(
     ext4.prepare_buffered_write(
         inode,
         old_size,
-        WRITE_LEN,
-        (old_size + WRITE_LEN) as u64,
+        FRAGMENT_LEN,
+        (old_size + FRAGMENT_LEN) as u64,
         None,
     )
     .unwrap_or_else(|error| {
@@ -921,30 +936,31 @@ fn recover_and_retry_external_leaf(
         ext4.write_data_only_with_completed_end(
             inode,
             old_size,
-            PAYLOAD,
-            (old_size + PAYLOAD.len()) as u64
+            FRAGMENT_PAYLOAD,
+            (old_size + FRAGMENT_PAYLOAD.len()) as u64
         )
         .expect("external-leaf retry data write failed"),
-        WRITE_LEN
+        FRAGMENT_LEN
     );
-    ext4.commit_inode_size(inode, (old_size + WRITE_LEN) as u64, None)
+    ext4.commit_inode_size(inode, (old_size + FRAGMENT_LEN) as u64, None)
         .expect("external-leaf retry inode-size commit failed");
     let attr = ext4
         .getattr(inode)
         .expect("external-leaf final getattr failed");
-    assert_eq!(attr.size, (old_size + WRITE_LEN) as u64);
-    assert!(
-        attr.blocks > ((old_size + WRITE_LEN) / 512) as u64,
+    assert_eq!(attr.size, (old_size + FRAGMENT_LEN) as u64);
+    assert_eq!(
+        attr.blocks,
+        ((old_size + 3 * FRAGMENT_LEN) / 512) as u64,
         "recovered external extent-tree leaf disappeared"
     );
     assert_fragmented_prefix(&ext4, inode);
-    let mut tail = [0u8; WRITE_LEN];
+    let mut tail = [0u8; FRAGMENT_LEN];
     assert_eq!(
         ext4.read(inode, old_size, &mut tail)
             .expect("external-leaf tail read failed"),
-        WRITE_LEN
+        FRAGMENT_LEN
     );
-    assert_eq!(tail, *PAYLOAD);
+    assert_eq!(tail, *FRAGMENT_PAYLOAD);
     ext4.shutdown_writable()
         .expect("external-leaf recovered clean shutdown failed");
 }
@@ -970,7 +986,7 @@ fn run_journal_external_leaf_matrix(persistence: PersistenceModel) {
         operations
     );
 
-    let old_size = INLINE_EXTENT_CAPACITY * WRITE_LEN;
+    let old_size = INLINE_EXTENT_CAPACITY * FRAGMENT_LEN;
     for crash_point in 0..operations.len() {
         copy_seed(&seed, &work);
         let device = Arc::new(CrashBlockFile::new(&work));
@@ -982,8 +998,8 @@ fn run_journal_external_leaf_matrix(persistence: PersistenceModel) {
             ext4.prepare_buffered_write(
                 inode,
                 old_size,
-                WRITE_LEN,
-                (old_size + WRITE_LEN) as u64,
+                FRAGMENT_LEN,
+                (old_size + FRAGMENT_LEN) as u64,
                 None,
             )
         });
@@ -1004,27 +1020,34 @@ fn create_existing_external_leaf_seed(path: &str) -> u32 {
     let inode = create_external_leaf_seed(path);
     let device = Arc::new(CrashBlockFile::new(path));
     let ext4 = Ext4::load_writable(device).expect("existing-leaf seed mount failed");
-    let offset = INLINE_EXTENT_CAPACITY * WRITE_LEN;
-    ext4.prepare_buffered_write(inode, offset, WRITE_LEN, (offset + WRITE_LEN) as u64, None)
-        .expect("existing-leaf seed root split prepare failed");
+    let offset = INLINE_EXTENT_CAPACITY * FRAGMENT_LEN;
+    ext4.prepare_buffered_write(
+        inode,
+        offset,
+        FRAGMENT_LEN,
+        (offset + FRAGMENT_LEN) as u64,
+        None,
+    )
+    .expect("existing-leaf seed root split prepare failed");
     assert_eq!(
         ext4.write_data_only_with_completed_end(
             inode,
             offset,
-            PAYLOAD,
-            (offset + PAYLOAD.len()) as u64
+            FRAGMENT_PAYLOAD,
+            (offset + FRAGMENT_PAYLOAD.len()) as u64
         )
         .expect("existing-leaf seed data write failed"),
-        WRITE_LEN
+        FRAGMENT_LEN
     );
-    ext4.commit_inode_size(inode, (offset + WRITE_LEN) as u64, None)
+    ext4.commit_inode_size(inode, (offset + FRAGMENT_LEN) as u64, None)
         .expect("existing-leaf seed inode-size commit failed");
     let attr = ext4
         .getattr(inode)
         .expect("existing-leaf seed getattr failed");
-    assert_eq!(attr.size, (offset + WRITE_LEN) as u64);
-    assert!(
-        attr.blocks > ((offset + WRITE_LEN) / 512) as u64,
+    assert_eq!(attr.size, (offset + FRAGMENT_LEN) as u64);
+    assert_eq!(
+        attr.blocks,
+        ((offset + 3 * FRAGMENT_LEN) / 512) as u64,
         "existing-leaf seed has no external extent-tree leaf"
     );
     ext4.shutdown_writable()
@@ -1034,14 +1057,14 @@ fn create_existing_external_leaf_seed(path: &str) -> u32 {
 
 fn assert_existing_external_leaf_data(ext4: &Ext4, inode: u32) {
     assert_fragmented_prefix(ext4, inode);
-    let offset = INLINE_EXTENT_CAPACITY * WRITE_LEN;
-    let mut data = [0u8; WRITE_LEN];
+    let offset = INLINE_EXTENT_CAPACITY * FRAGMENT_LEN;
+    let mut data = [0u8; FRAGMENT_LEN];
     assert_eq!(
         ext4.read(inode, offset, &mut data)
             .expect("existing external-leaf data read failed"),
-        WRITE_LEN
+        FRAGMENT_LEN
     );
-    assert_eq!(data, *PAYLOAD);
+    assert_eq!(data, *FRAGMENT_PAYLOAD);
 }
 
 fn count_existing_leaf_append_operations(
@@ -1052,11 +1075,17 @@ fn count_existing_leaf_append_operations(
     let device = Arc::new(CrashBlockFile::new(work));
     let ext4 = Ext4::load_writable(device.clone()).expect("existing-leaf count mount failed");
     persistence.configure(&device);
-    let offset = (INLINE_EXTENT_CAPACITY + 1) * WRITE_LEN;
+    let offset = (INLINE_EXTENT_CAPACITY + 1) * FRAGMENT_LEN;
     assert_existing_external_leaf_data(&ext4, inode);
     device.reset_operation_log();
-    ext4.prepare_buffered_write(inode, offset, WRITE_LEN, (offset + WRITE_LEN) as u64, None)
-        .expect("existing-leaf append preparation failed");
+    ext4.prepare_buffered_write(
+        inode,
+        offset,
+        FRAGMENT_LEN,
+        (offset + FRAGMENT_LEN) as u64,
+        None,
+    )
+    .expect("existing-leaf append preparation failed");
     let operations = device.operations();
     assert!(
         operations
@@ -1080,30 +1109,36 @@ fn recover_and_retry_existing_leaf(
         panic!("existing-leaf crash point {crash_point}: recovery mount failed: {error:?}")
     });
     persistence.configure(&device);
-    let offset = (INLINE_EXTENT_CAPACITY + 1) * WRITE_LEN;
+    let offset = (INLINE_EXTENT_CAPACITY + 1) * FRAGMENT_LEN;
     let attr = ext4
         .getattr(inode)
         .expect("existing external-leaf inode disappeared after recovery");
     assert_eq!(attr.size, offset as u64);
     assert_existing_external_leaf_data(&ext4, inode);
 
-    ext4.prepare_buffered_write(inode, offset, WRITE_LEN, (offset + WRITE_LEN) as u64, None)
-        .unwrap_or_else(|error| {
-            panic!("existing-leaf crash point {crash_point}: retry prepare failed: {error:?}")
-        });
-    let tail = [0x5d; WRITE_LEN];
+    ext4.prepare_buffered_write(
+        inode,
+        offset,
+        FRAGMENT_LEN,
+        (offset + FRAGMENT_LEN) as u64,
+        None,
+    )
+    .unwrap_or_else(|error| {
+        panic!("existing-leaf crash point {crash_point}: retry prepare failed: {error:?}")
+    });
+    let tail = [0x5d; FRAGMENT_LEN];
     assert_eq!(
         ext4.write_data_only_with_completed_end(inode, offset, &tail, (offset + tail.len()) as u64)
             .expect("existing-leaf retry data write failed"),
-        WRITE_LEN
+        FRAGMENT_LEN
     );
-    ext4.commit_inode_size(inode, (offset + WRITE_LEN) as u64, None)
+    ext4.commit_inode_size(inode, (offset + FRAGMENT_LEN) as u64, None)
         .expect("existing-leaf retry inode-size commit failed");
-    let mut read = [0u8; WRITE_LEN];
+    let mut read = [0u8; FRAGMENT_LEN];
     assert_eq!(
         ext4.read(inode, offset, &mut read)
             .expect("existing-leaf retry data read failed"),
-        WRITE_LEN
+        FRAGMENT_LEN
     );
     assert_eq!(read, tail);
     ext4.shutdown_writable()
@@ -1127,7 +1162,7 @@ fn run_journal_existing_leaf_matrix(persistence: PersistenceModel) {
         operations
     );
 
-    let offset = (INLINE_EXTENT_CAPACITY + 1) * WRITE_LEN;
+    let offset = (INLINE_EXTENT_CAPACITY + 1) * FRAGMENT_LEN;
     for crash_point in 0..operations.len() {
         copy_seed(&seed, &work);
         let device = Arc::new(CrashBlockFile::new(&work));
@@ -1136,7 +1171,13 @@ fn run_journal_existing_leaf_matrix(persistence: PersistenceModel) {
         device.reset_operation_log();
         device.arm_power_loss_at(crash_point);
         expect_power_loss(crash_point, || {
-            ext4.prepare_buffered_write(inode, offset, WRITE_LEN, (offset + WRITE_LEN) as u64, None)
+            ext4.prepare_buffered_write(
+                inode,
+                offset,
+                FRAGMENT_LEN,
+                (offset + FRAGMENT_LEN) as u64,
+                None,
+            )
         });
         device.crash();
         drop(ext4);
@@ -1152,22 +1193,17 @@ fn run_journal_existing_leaf_matrix(persistence: PersistenceModel) {
 }
 
 fn assert_full_external_leaf_samples(ext4: &Ext4, inode: u32) {
-    for segment in [
-        0,
-        1,
-        INLINE_EXTENT_CAPACITY,
-        EXTERNAL_LEAF_EXTENT_CAPACITY - 1,
-    ] {
-        let mut data = [0u8; WRITE_LEN];
+    for segment in [0, 1, INLINE_EXTENT_CAPACITY, FULL_LEAF_FRAGMENT_COUNT - 1] {
+        let mut data = [0u8; FRAGMENT_LEN];
         assert_eq!(
-            ext4.read(inode, segment * WRITE_LEN, &mut data)
+            ext4.read(inode, segment * FRAGMENT_LEN, &mut data)
                 .expect("full external-leaf sample read failed"),
-            WRITE_LEN,
+            FRAGMENT_LEN,
             "full external-leaf sample {segment} was truncated"
         );
         if segment == INLINE_EXTENT_CAPACITY {
             assert_eq!(
-                data, *PAYLOAD,
+                data, *FRAGMENT_PAYLOAD,
                 "full external-leaf sample {segment} changed"
             );
         } else {
@@ -1195,20 +1231,31 @@ fn create_full_external_leaf_seed(path: &str) -> u32 {
     // The seed already has five fragmented extents. Keep alternating the
     // target and filler so every remaining append consumes a distinct leaf
     // slot instead of merging with the previous physical extent.
-    for segment in (INLINE_EXTENT_CAPACITY + 1)..EXTERNAL_LEAF_EXTENT_CAPACITY {
-        let offset = segment * WRITE_LEN;
-        ext4.write(target, offset, &segment_payload(segment))
-            .expect("full external-leaf target seed write failed");
-        ext4.write(filler, offset, &[0x7d; WRITE_LEN])
-            .expect("full external-leaf filler seed write failed");
+    for segment in (INLINE_EXTENT_CAPACITY + 1)..FULL_LEAF_FRAGMENT_COUNT {
+        let offset = segment * FRAGMENT_LEN;
+        assert_eq!(
+            ext4.write(target, offset, &segment_payload(segment))
+                .expect("full external-leaf target seed write failed"),
+            FRAGMENT_LEN
+        );
+        assert_eq!(
+            ext4.write(filler, offset, &[0x7d; FRAGMENT_LEN])
+                .expect("full external-leaf filler seed write failed"),
+            FRAGMENT_LEN
+        );
     }
     let attr = ext4
         .getattr(target)
         .expect("full external-leaf target getattr failed");
     assert_eq!(
         attr.size,
-        (EXTERNAL_LEAF_EXTENT_CAPACITY * WRITE_LEN) as u64,
+        (FULL_LEAF_FRAGMENT_COUNT * FRAGMENT_LEN) as u64,
         "full external-leaf seed has an unexpected EOF"
+    );
+    assert_eq!(
+        attr.blocks,
+        ((FULL_LEAF_FRAGMENT_COUNT + 2) * FRAGMENT_LEN / 512) as u64,
+        "full external-leaf seed must contain two extent-tree blocks"
     );
     assert_full_external_leaf_samples(&ext4, target);
     ext4.shutdown_writable()
@@ -1224,11 +1271,24 @@ fn count_full_leaf_split_operations(
     let device = Arc::new(CrashBlockFile::new(work));
     let ext4 = Ext4::load_writable(device.clone()).expect("full leaf split count mount failed");
     persistence.configure(&device);
-    let offset = EXTERNAL_LEAF_EXTENT_CAPACITY * WRITE_LEN;
+    let offset = FULL_LEAF_FRAGMENT_COUNT * FRAGMENT_LEN;
     assert_full_external_leaf_samples(&ext4, inode);
     device.reset_operation_log();
-    ext4.prepare_buffered_write(inode, offset, WRITE_LEN, (offset + WRITE_LEN) as u64, None)
-        .expect("full external-leaf split preparation failed");
+    ext4.prepare_buffered_write(
+        inode,
+        offset,
+        FRAGMENT_LEN,
+        (offset + FRAGMENT_LEN) as u64,
+        None,
+    )
+    .expect("full external-leaf split preparation failed");
+    assert_eq!(
+        ext4.getattr(inode)
+            .expect("full leaf split getattr failed")
+            .blocks,
+        ((FULL_LEAF_FRAGMENT_COUNT + 4) * FRAGMENT_LEN / 512) as u64,
+        "full leaf append must allocate exactly one data and one split block"
+    );
     let operations = device.operations();
     assert!(
         operations
@@ -1252,32 +1312,45 @@ fn recover_and_retry_full_leaf_split(
         panic!("full leaf split crash point {crash_point}: recovery mount failed: {error:?}")
     });
     persistence.configure(&device);
-    let offset = EXTERNAL_LEAF_EXTENT_CAPACITY * WRITE_LEN;
+    let offset = FULL_LEAF_FRAGMENT_COUNT * FRAGMENT_LEN;
     let attr = ext4
         .getattr(inode)
         .expect("full leaf split inode disappeared after recovery");
     assert_eq!(attr.size, offset as u64);
     assert_full_external_leaf_samples(&ext4, inode);
 
-    ext4.prepare_buffered_write(inode, offset, WRITE_LEN, (offset + WRITE_LEN) as u64, None)
-        .unwrap_or_else(|error| {
-            panic!("full leaf split crash point {crash_point}: retry prepare failed: {error:?}")
-        });
-    let tail = [0x4c; WRITE_LEN];
+    ext4.prepare_buffered_write(
+        inode,
+        offset,
+        FRAGMENT_LEN,
+        (offset + FRAGMENT_LEN) as u64,
+        None,
+    )
+    .unwrap_or_else(|error| {
+        panic!("full leaf split crash point {crash_point}: retry prepare failed: {error:?}")
+    });
+    let tail = [0x4c; FRAGMENT_LEN];
     assert_eq!(
         ext4.write_data_only_with_completed_end(inode, offset, &tail, (offset + tail.len()) as u64)
             .expect("full leaf split retry data write failed"),
-        WRITE_LEN
+        FRAGMENT_LEN
     );
-    ext4.commit_inode_size(inode, (offset + WRITE_LEN) as u64, None)
+    ext4.commit_inode_size(inode, (offset + FRAGMENT_LEN) as u64, None)
         .expect("full leaf split retry inode-size commit failed");
-    let mut read = [0u8; WRITE_LEN];
+    let mut read = [0u8; FRAGMENT_LEN];
     assert_eq!(
         ext4.read(inode, offset, &mut read)
             .expect("full leaf split retry data read failed"),
-        WRITE_LEN
+        FRAGMENT_LEN
     );
     assert_eq!(read, tail);
+    assert_eq!(
+        ext4.getattr(inode)
+            .expect("recovered full leaf getattr failed")
+            .blocks,
+        ((FULL_LEAF_FRAGMENT_COUNT + 4) * FRAGMENT_LEN / 512) as u64,
+        "recovered full leaf split changed block accounting"
+    );
     assert_full_external_leaf_samples(&ext4, inode);
     ext4.shutdown_writable()
         .expect("full leaf split recovered clean shutdown failed");
@@ -1300,7 +1373,7 @@ fn run_journal_full_leaf_split_matrix(persistence: PersistenceModel) {
         operations
     );
 
-    let offset = EXTERNAL_LEAF_EXTENT_CAPACITY * WRITE_LEN;
+    let offset = FULL_LEAF_FRAGMENT_COUNT * FRAGMENT_LEN;
     for crash_point in 0..operations.len() {
         copy_seed(&seed, &work);
         let device = Arc::new(CrashBlockFile::new(&work));
@@ -1309,7 +1382,13 @@ fn run_journal_full_leaf_split_matrix(persistence: PersistenceModel) {
         device.reset_operation_log();
         device.arm_power_loss_at(crash_point);
         expect_power_loss(crash_point, || {
-            ext4.prepare_buffered_write(inode, offset, WRITE_LEN, (offset + WRITE_LEN) as u64, None)
+            ext4.prepare_buffered_write(
+                inode,
+                offset,
+                FRAGMENT_LEN,
+                (offset + FRAGMENT_LEN) as u64,
+                None,
+            )
         });
         device.crash();
         drop(ext4);
@@ -2132,8 +2211,9 @@ fn run_production_delalloc_extent_split_test(persistence: PersistenceModel) {
     persistence.configure(&root_device);
     let root_ext4 =
         Ext4::load_writable(root_device.clone()).expect("production root-split mount failed");
-    let root_offset = INLINE_EXTENT_CAPACITY * WRITE_LEN;
+    let root_offset = INLINE_EXTENT_CAPACITY * FRAGMENT_LEN;
     let root_payload = [0x8d; DELALLOC_BLOCK_LEN];
+    let root_blocks_before = root_ext4.getattr(root_inode).unwrap().blocks;
     let mut root_lease = root_ext4
         .reserve_delalloc_append_block(root_inode, root_offset)
         .expect("production root-split reservation failed");
@@ -2172,6 +2252,11 @@ fn run_production_delalloc_extent_split_test(persistence: PersistenceModel) {
             &mut root_lease,
         )
         .expect("production root-split retry failed");
+    assert_eq!(
+        root_ext4.getattr(root_inode).unwrap().blocks,
+        root_blocks_before + (2 * DELALLOC_BLOCK_LEN / 512) as u64,
+        "production root promotion must allocate one extent-tree block"
+    );
     assert_fragmented_prefix(&root_ext4, root_inode);
     let mut root_data = [0u8; DELALLOC_BLOCK_LEN];
     assert_eq!(
@@ -2194,8 +2279,9 @@ fn run_production_delalloc_extent_split_test(persistence: PersistenceModel) {
     persistence.configure(&leaf_device);
     let leaf_ext4 =
         Ext4::load_writable(leaf_device.clone()).expect("production leaf-split mount failed");
-    let leaf_offset = EXTERNAL_LEAF_EXTENT_CAPACITY * WRITE_LEN;
+    let leaf_offset = FULL_LEAF_FRAGMENT_COUNT * FRAGMENT_LEN;
     let leaf_payload = [0x8e; DELALLOC_BLOCK_LEN];
+    let leaf_blocks_before = leaf_ext4.getattr(leaf_inode).unwrap().blocks;
     let mut leaf_lease = leaf_ext4
         .reserve_delalloc_append_block(leaf_inode, leaf_offset)
         .expect("production leaf-split reservation failed");
@@ -2212,6 +2298,11 @@ fn run_production_delalloc_extent_split_test(persistence: PersistenceModel) {
             &mut leaf_lease,
         )
         .expect("production leaf-split append failed");
+    assert_eq!(
+        leaf_ext4.getattr(leaf_inode).unwrap().blocks,
+        leaf_blocks_before + (2 * DELALLOC_BLOCK_LEN / 512) as u64,
+        "production leaf split must allocate one extent-tree block"
+    );
     assert_full_external_leaf_samples(&leaf_ext4, leaf_inode);
     let mut leaf_data = [0u8; DELALLOC_BLOCK_LEN];
     assert_eq!(
@@ -2754,15 +2845,17 @@ fn recover_production_projected_scenario(
         ProductionProjectedShape::Plain => {}
         ProductionProjectedShape::RootGrow => {
             assert_fragmented_prefix(&ext4, inode);
-            assert!(
-                final_attr.blocks > blocks_before + (DELALLOC_BLOCK_LEN / 512) as u64,
+            assert_eq!(
+                final_attr.blocks,
+                blocks_before + (2 * DELALLOC_BLOCK_LEN / 512) as u64,
                 "production root grow did not allocate an extent-tree node"
             );
         }
         ProductionProjectedShape::FullLeafSplit => {
             assert_full_external_leaf_samples(&ext4, inode);
-            assert!(
-                final_attr.blocks > blocks_before + (DELALLOC_BLOCK_LEN / 512) as u64,
+            assert_eq!(
+                final_attr.blocks,
+                blocks_before + (2 * DELALLOC_BLOCK_LEN / 512) as u64,
                 "production full-leaf nonmerge did not allocate a split node"
             );
         }
@@ -3048,13 +3141,23 @@ fn main() {
         return;
     }
     if let Ok(case) = std::env::var("DRAGONOS_EXT4_RECOVERY_CASE") {
-        let persistence = PersistenceModel::WriteBack;
-        match case.as_str() {
-            "reserved-payload-retry" => run_reserved_delalloc_payload_retry_test(persistence),
-            "production-append" => run_production_delalloc_append_block_test(persistence),
-            "production-split" => run_production_delalloc_extent_split_test(persistence),
-            _ => panic!("unknown DRAGONOS_EXT4_RECOVERY_CASE: {case}"),
+        for persistence in [PersistenceModel::WriteBack, PersistenceModel::WriteThrough] {
+            match case.as_str() {
+                "reserved-payload-retry" => run_reserved_delalloc_payload_retry_test(persistence),
+                "production-append" => run_production_delalloc_append_block_test(persistence),
+                "production-split" => run_production_delalloc_extent_split_test(persistence),
+                "external-leaf" => run_journal_external_leaf_matrix(persistence),
+                "existing-leaf" => run_journal_existing_leaf_matrix(persistence),
+                "full-leaf-split" => run_journal_full_leaf_split_matrix(persistence),
+                "reclaim" => run_journal_reclaim_matrix(persistence),
+                "linked-tail" => {
+                    run_journal_linked_tail_final_unlink_matrix(persistence);
+                    run_journal_linked_tail_rename_matrix(persistence);
+                }
+                _ => panic!("unknown DRAGONOS_EXT4_RECOVERY_CASE: {case}"),
+            }
         }
+        println!("selected recovery matrix {case} completed in both persistence models");
         return;
     }
     for persistence in [PersistenceModel::WriteBack, PersistenceModel::WriteThrough] {
@@ -3099,8 +3202,8 @@ fn main() {
             "projected-root-grow",
             create_external_leaf_seed,
             DelallocCrashCase::ProductionProjectedSingle,
-            INLINE_EXTENT_CAPACITY * WRITE_LEN,
-            (INLINE_EXTENT_CAPACITY * WRITE_LEN + DELALLOC_BLOCK_LEN) as u64,
+            INLINE_EXTENT_CAPACITY * FRAGMENT_LEN,
+            (INLINE_EXTENT_CAPACITY * FRAGMENT_LEN + DELALLOC_BLOCK_LEN) as u64,
             ProductionProjectedShape::RootGrow,
         );
         run_journal_production_projected_matrix(
@@ -3108,8 +3211,8 @@ fn main() {
             "projected-full-leaf-split",
             create_full_external_leaf_seed,
             DelallocCrashCase::ProductionProjectedSingle,
-            EXTERNAL_LEAF_EXTENT_CAPACITY * WRITE_LEN,
-            (EXTERNAL_LEAF_EXTENT_CAPACITY * WRITE_LEN + DELALLOC_BLOCK_LEN) as u64,
+            FULL_LEAF_FRAGMENT_COUNT * FRAGMENT_LEN,
+            (FULL_LEAF_FRAGMENT_COUNT * FRAGMENT_LEN + DELALLOC_BLOCK_LEN) as u64,
             ProductionProjectedShape::FullLeafSplit,
         );
         run_journal_production_projected_matrix(
@@ -3117,8 +3220,8 @@ fn main() {
             "projected-full-leaf-merge",
             create_full_external_leaf_merge_seed,
             DelallocCrashCase::ProductionProjectedSingle,
-            EXTERNAL_LEAF_EXTENT_CAPACITY * WRITE_LEN,
-            (EXTERNAL_LEAF_EXTENT_CAPACITY * WRITE_LEN + DELALLOC_BLOCK_LEN) as u64,
+            FULL_LEAF_FRAGMENT_COUNT * FRAGMENT_LEN,
+            (FULL_LEAF_FRAGMENT_COUNT * FRAGMENT_LEN + DELALLOC_BLOCK_LEN) as u64,
             ProductionProjectedShape::FullLeafMerge,
         );
     }

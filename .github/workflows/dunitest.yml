@@ -51,6 +51,7 @@ jobs:
           normal/allocation_diagnostics
           normal/dma_allocator_selftest
           normal/ext4_orphan_recovery
+          normal/ext4_nested_writeback
           EOF
 
       - name: Build DragonOS

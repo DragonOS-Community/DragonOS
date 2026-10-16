@@ -287,6 +287,13 @@ impl JournalBatchCore {
         self.journal.validate_home(home)
     }
 
+    /// Owners which can still make an EAGAIN retry runnable. A Frozen
+    /// checkpoint may own retired resources even with no Running seal.
+    pub(super) fn retry_is_blocked(&self) -> bool {
+        let state = self.state.lock();
+        state.active || state.seal_requested || state.publishing || state.committing
+    }
+
     /// Reserve worst-case unique images before entering an operation. EAGAIN
     /// means release upper locks and wait/revalidate, never retry in a spin.
     pub fn start(&self, credits: usize) -> Result<Transaction<'_>> {
@@ -627,4 +634,45 @@ fn lookup(state: &State, home: PBlockId) -> Option<&StagedBlock> {
         .binary_search_by_key(&home, StagedBlock::home)
         .ok()
         .map(|index| &frozen.blocks[index])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retry_predicate_tracks_active_seal_and_frozen_checkpoint_without_seal() {
+        let core =
+            JournalBatchCore::new(super::super::journal_transaction::tests::context(), 2).unwrap();
+        assert!(!core.retry_is_blocked());
+        let operation = core.start(1).unwrap();
+        assert!(core.retry_is_blocked());
+        drop(operation);
+        assert!(!core.retry_is_blocked());
+        {
+            let mut state = core.state.lock();
+            state.seal_requested = true;
+        }
+        assert!(core.retry_is_blocked());
+        {
+            let mut state = core.state.lock();
+            state.seal_requested = false;
+            state.committing = true;
+            let mut frozen = state.spare.take().unwrap();
+            Arc::get_mut(&mut frozen)
+                .unwrap()
+                .retired
+                .push(RetiredRange::blocks(42, 1).unwrap());
+            state.frozen = Some(frozen);
+        }
+        assert!(core.retry_is_blocked());
+        assert!(core.request_retirement_progress());
+        assert!(!core.progress().seal_requested);
+        {
+            let mut state = core.state.lock();
+            state.frozen = None;
+            state.committing = false;
+        }
+        assert!(!core.retry_is_blocked());
+    }
 }

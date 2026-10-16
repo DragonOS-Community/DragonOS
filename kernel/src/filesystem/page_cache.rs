@@ -74,8 +74,8 @@ pub(crate) use writeback::{
 use writeback::{
     run_async_writeback_budget_retry_selftest, run_submitted_writeback_selftest,
     ClaimedWritebackBatch, TaggedWritebackBudgetRetry, TaggedWritebackIncarnationRetry,
-    TaggedWritebackSubmission, WritebackBatchRange, WritebackClaimOutcome, WritebackSubmitOutcome,
-    PAGECACHE_WRITEBACK_WQS,
+    TaggedWritebackSubmission, WritebackBatchRange, WritebackClaimOutcome, WritebackExecutor,
+    WritebackSubmitOutcome,
 };
 pub use writeback::{
     AsyncPageCacheBackend, PageCacheBackend, PageCacheWritebackAdmissionOrder,
@@ -393,6 +393,7 @@ pub struct PageCacheWritebackDomain {
     registry: Mutex<Vec<Weak<dyn PageCacheDomainMember>>>,
     state: SpinLock<PageCacheWritebackDomainState>,
     drained: Completion,
+    writeback_executor: Mutex<Option<Arc<WritebackExecutor>>>,
 }
 
 pub(crate) trait PageCacheDomainMember: Send + Sync {
@@ -423,7 +424,18 @@ impl PageCacheWritebackDomain {
                 registrations_in_flight: 0,
             }),
             drained: Completion::new(),
+            writeback_executor: Mutex::new(None),
         })
+    }
+
+    fn writeback_executor(&self) -> Result<Arc<WritebackExecutor>, SystemError> {
+        // Sleeping initialization lock: never hold domain state or page locks
+        // across kernel-thread creation. A failed creation leaves no executor.
+        let mut slot = self.writeback_executor.lock();
+        if slot.is_none() {
+            *slot = Some(WritebackExecutor::try_new()?);
+        }
+        Ok(slot.as_ref().expect("initialized executor").clone())
     }
 
     pub fn bind(
@@ -2609,6 +2621,16 @@ impl PageCache {
     pub fn has_dirty_or_writeback_pages(&self) -> bool {
         let inner = self.inner.lock();
         !inner.dirty_pages.is_empty() || !inner.writeback_pages.is_empty()
+    }
+
+    fn writeback_executor(&self) -> Result<Arc<WritebackExecutor>, SystemError> {
+        match self.writeback_domain.as_ref() {
+            Some(domain) => domain
+                .upgrade()
+                .ok_or(SystemError::ESTALE)?
+                .writeback_executor(),
+            None => writeback::unowned_writeback_executor(),
+        }
     }
 
     pub fn try_acquire_domain_io(&self) -> Result<Option<PageCacheDomainIoPermit>, SystemError> {

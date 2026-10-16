@@ -117,6 +117,10 @@ impl MetadataMutationGate {
         })
     }
 
+    pub(super) fn has_owner(&self) -> bool {
+        self.state.load(Ordering::Acquire) != 0
+    }
+
     /// Register only an actual gate wait, never a journal-capacity wait at an
     /// idle gate. The retry owner keeps this capability through its next
     /// operation attempt and drops it on success, cancellation or any error.
@@ -154,6 +158,16 @@ impl MetadataMutationGate {
         }
         Ok(guard)
     }
+}
+
+/// Decision after a writer returned EAGAIN and released its previous intent.
+/// The wait token is sampled before rechecking the actual blocking owners.
+pub enum MetadataWriterRetry<'a> {
+    Retry,
+    Wait {
+        observed: u64,
+        intent: Option<MetadataWriterWait<'a>>,
+    },
 }
 
 /// A scoped preference for an operation retry, not ownership of the gate.

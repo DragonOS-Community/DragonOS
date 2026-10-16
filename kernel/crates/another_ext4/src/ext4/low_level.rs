@@ -5012,6 +5012,65 @@ mod tests {
     }
 
     #[test]
+    fn writer_retry_filters_own_release_but_observes_live_owner_departure() {
+        use crate::ext4::MetadataWriterRetry;
+        let fs = make_test_fs(16);
+        let attempt = fs.lock_transactional_metadata_mutation().unwrap();
+        drop(attempt);
+        assert!(matches!(
+            fs.prepare_metadata_writer_retry().unwrap(),
+            MetadataWriterRetry::Retry
+        ));
+
+        let owner = fs.lock_direct_metadata_mutation().unwrap();
+        let MetadataWriterRetry::Wait { observed, intent } =
+            fs.prepare_metadata_writer_retry().unwrap()
+        else {
+            panic!("live gate owner must supply a wait");
+        };
+        assert_eq!(fs.metadata_mutation_generation(), observed);
+        assert!(fs.metadata_mutation_barrier.try_read_view().is_err());
+        drop(owner);
+        assert_ne!(fs.metadata_mutation_generation(), observed);
+        drop(intent);
+        assert!(fs.metadata_mutation_barrier.try_read_view().is_ok());
+        assert!(matches!(
+            fs.prepare_metadata_writer_retry().unwrap(),
+            MetadataWriterRetry::Retry
+        ));
+
+        fs.fail_stop_mutations();
+        assert!(
+            matches!(fs.prepare_metadata_writer_retry(), Err(error) if error.code() == ErrCode::EIO)
+        );
+    }
+
+    #[test]
+    fn writer_retry_does_not_sleep_after_journal_owner_already_left() {
+        use crate::ext4::MetadataWriterRetry;
+        let fs = make_test_fs(16);
+        let operation = fs.transaction_start(1).unwrap();
+        let MetadataWriterRetry::Wait { observed, intent } =
+            fs.prepare_metadata_writer_retry().unwrap()
+        else {
+            panic!("live direct transaction must supply a wait");
+        };
+        assert!(
+            intent.is_none(),
+            "capacity wait must not close reader admission"
+        );
+        drop(operation);
+        // A normal direct transaction is nested in a metadata guard. Its
+        // later guard release supplies the scheduler notification.
+        drop(fs.lock_direct_metadata_mutation().unwrap());
+        assert_ne!(fs.metadata_mutation_generation(), observed);
+        assert!(matches!(
+            fs.prepare_metadata_writer_retry().unwrap(),
+            MetadataWriterRetry::Retry
+        ));
+    }
+
+    #[test]
     fn metadata_mutation_barrier_separates_direct_and_transactional_writers() {
         let fs = make_test_fs(16);
         let waker = Arc::new(CountingMetadataWaker {

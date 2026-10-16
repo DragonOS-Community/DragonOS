@@ -9,7 +9,7 @@ use crate::syscall::table::Syscall;
 use alloc::string::ToString;
 use alloc::vec::Vec;
 
-use super::sys_write::do_write;
+use super::sys_write::get_file_by_fd;
 use crate::arch::interrupt::TrapFrame;
 /// System call handler for `writev` operation
 ///
@@ -43,6 +43,14 @@ impl Syscall for SysWriteVHandle {
         let iov = Self::iov(args);
         let count = Self::count(args);
 
+        // Retain this OFD through import and I/O; fd reuse cannot redirect it.
+        let file = get_file_by_fd(fd)?;
+        if file
+            .flags()
+            .contains(crate::filesystem::vfs::file::FileFlags::O_PATH)
+        {
+            return Err(SystemError::EBADF);
+        }
         // 将用户态传入的数据结构 `IoVecs` 重新在内核上构造
         let iovecs = unsafe { IoVecs::from_user(iov, count, false) }?;
         let data = iovecs.gather()?;
@@ -52,7 +60,7 @@ impl Syscall for SysWriteVHandle {
         // - 实现路径（linux）：wirtev --> vfs_writev --> do_iter_write --> do_loop_readv_writev/do_iter_readv_writev
         // - 目前内核文件子系统尚未实现分散写功能，即无法直接使用用户态的 IoVec 进行写操作
         // - 目前先将用户态的 IoVec 聚合成一个连续的内核缓冲区 `data`，然后进行写操作，避免多次发起写操作的开销。
-        do_write(fd, &data)
+        file.write(data.len(), &data)
     }
 
     /// Formats the system call parameters for display/debug purposes

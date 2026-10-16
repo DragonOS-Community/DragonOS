@@ -127,6 +127,7 @@ fn do_read_file(file: &File, buf: &mut [u8]) -> Result<usize, SystemError> {
 fn read_into_user_buffer(fd: i32, user_ptr: *mut u8, len: usize) -> Result<usize, SystemError> {
     let file = get_read_file(fd)?;
 
+    let _position = file.lock_position();
     file.readable()?;
     // Linux validates the original numerical range, not its VMA mappings, and
     // only then clamps the request. EOF need not touch a valid user address.
@@ -136,7 +137,9 @@ fn read_into_user_buffer(fd: i32, user_ptr: *mut u8, len: usize) -> Result<usize
     let mut output = unsafe { UserBuffer::new(VirtAddr::new(user_ptr as usize), len) };
 
     if file.user_read_mode() != UserReadMode::Buffered {
-        return file.read_user(len, &mut output)?.ok_or(SystemError::EIO);
+        return file
+            .read_user_at_current_position(len, &mut output, true)?
+            .ok_or(SystemError::EIO);
     }
     if len == 0 {
         return Ok(0);

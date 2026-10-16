@@ -18,6 +18,7 @@ use crate::mm::allocation::MemoryAllocationError;
 
 mod allocation;
 mod io;
+mod position;
 pub(crate) mod selftest;
 pub(crate) use allocation::PreparedFile;
 
@@ -764,8 +765,8 @@ pub struct FileData {
     file_type: FileType,
     /// Immutable write-operation policy selected for this open file description.
     post_write_sync: PostWriteSyncPolicy,
-    /// Per-open immutable directory snapshot and its next record index.
-    readdir_state: Mutex<ReaddirState>,
+    /// Serializes current-position operations; also owns directory iteration state.
+    position_state: Mutex<ReaddirState>,
     pub private_data: Mutex<FilePrivateData>,
     /// 文件的凭证
     cred: Arc<Cred>,
@@ -844,7 +845,7 @@ impl ReaddirSnapshot {
 }
 
 #[derive(Debug, Clone, Default)]
-struct ReaddirState {
+pub(crate) struct ReaddirState {
     snapshot: Option<ReaddirSnapshot>,
     next_index: usize,
 }
@@ -887,7 +888,11 @@ enum FileOpenOrigin {
 }
 
 impl File {
-    fn configure_base_open_mode(inode: &Arc<dyn IndexNode>, mode: &mut FileMode) {
+    fn configure_base_open_mode(
+        inode: &Arc<dyn IndexNode>,
+        file_type: FileType,
+        mode: &mut FileMode,
+    ) {
         mode.remove(
             FileMode::FMODE_STREAM
                 | FileMode::FMODE_LSEEK
@@ -901,7 +906,13 @@ impl File {
             mode.insert(FileMode::FMODE_STREAM);
         }
         if inode.supports_seek() {
-            mode.insert(FileMode::FMODE_LSEEK | FileMode::FMODE_ATOMIC_POS);
+            mode.insert(FileMode::FMODE_LSEEK);
+        }
+        // Anonymous stream inodes may also report FileType::File.
+        if !mode.contains(FileMode::FMODE_STREAM)
+            && matches!(file_type, FileType::File | FileType::Dir)
+        {
+            mode.insert(FileMode::FMODE_ATOMIC_POS);
         }
         if inode.supports_pread() {
             mode.insert(FileMode::FMODE_PREAD);
@@ -1666,7 +1677,7 @@ impl File {
             mode: RwSem::new(mode),
             file_type,
             post_write_sync: PostWriteSyncPolicy::NotApplicable,
-            readdir_state: Mutex::new(ReaddirState::default()),
+            position_state: Mutex::new(ReaddirState::default()),
             private_data,
             cred: ProcessManager::current_pcb().cred(),
             owner: Mutex::new(FileOwner::new()),
@@ -1717,7 +1728,7 @@ impl File {
             .map(|mounted| mounted.mount_fs().sample_wb_error())
             .unwrap_or(0);
         mode.remove(FileMode::FMODE_OPENED);
-        Self::configure_base_open_mode(&self.inode, &mut mode);
+        Self::configure_base_open_mode(&self.inode, self.file_type, &mut mode);
         let mut behavior = OpenFileBehavior::new(mode, self.file_type);
         self.inode
             .configure_open_file(&self.private_data.lock(), &mut behavior);
@@ -1837,6 +1848,7 @@ impl File {
     /// - `Ok(usize)`: 成功读取的字节数
     /// - `Err(SystemError)`: 错误码
     pub fn read(&self, len: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
+        let _position = self.lock_position();
         let stream = self.mode.read().contains(FileMode::FMODE_STREAM);
         let offset = if stream {
             0
@@ -1848,6 +1860,7 @@ impl File {
     }
 
     /// Read a bounded chunk without committing the position before user copy.
+    /// The syscall holds the position transaction across every chunk.
     /// Only the backing read is recoverable: copying and consumption must never
     /// be replayed by charge recovery.
     pub(crate) fn read_syscall_chunk(
@@ -1878,6 +1891,7 @@ impl File {
 
     /// Linux rw_verify_area's signed count/position checks. Stream descriptions
     /// have no position; address-range admission belongs to the syscall.
+    /// The caller holds the position transaction through verification and I/O.
     pub(crate) fn verify_read_range(&self, count: usize) -> Result<(), SystemError> {
         if count > isize::MAX as usize {
             return Err(SystemError::EINVAL);
@@ -1900,11 +1914,13 @@ impl File {
         len: usize,
         writer: &mut UserBuffer<'_>,
     ) -> Result<Option<usize>, SystemError> {
-        self.read_user_with_fsnotify(len, writer, true)
+        let _position = self.lock_position();
+        self.read_user_at_current_position(len, writer, true)
     }
 
     /// Read one userspace-buffer chunk for a vector syscall.
     ///
+    /// The caller holds the whole syscall position transaction.
     /// The vector syscall publishes ACCESS once at its completion boundary,
     /// rather than once per iovec processed by the fallback `.read` loop.
     pub(crate) fn read_user_syscall_chunk(
@@ -1912,10 +1928,11 @@ impl File {
         len: usize,
         writer: &mut UserBuffer<'_>,
     ) -> Result<Option<usize>, SystemError> {
-        self.read_user_with_fsnotify(len, writer, false)
+        self.read_user_at_current_position(len, writer, false)
     }
 
-    fn read_user_with_fsnotify(
+    /// Caller owns the whole current-position transaction.
+    pub(crate) fn read_user_at_current_position(
         &self,
         len: usize,
         writer: &mut UserBuffer<'_>,
@@ -1951,6 +1968,7 @@ impl File {
 
     /// Read from the current file position without advancing it.
     pub fn read_noadv(&self, len: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
+        let _position = self.lock_position();
         let offset = if self.mode.read().contains(FileMode::FMODE_STREAM) {
             0
         } else {
@@ -1971,6 +1989,7 @@ impl File {
     /// - `Ok(usize)`: 成功写入的字节数
     /// - `Err(SystemError)`: 错误码
     pub fn write(&self, len: usize, buf: &[u8]) -> Result<usize, SystemError> {
+        let _position = self.lock_position();
         let stream = self.mode.read().contains(FileMode::FMODE_STREAM);
         let offset = if stream {
             0
@@ -2175,6 +2194,7 @@ impl File {
     /// - 对常规文件：忽略当前偏移/给定偏移，追加到 EOF
     /// - 会推进本 fd 的文件偏移（类似 write）
     pub fn write_append(&self, len: usize, buf: &[u8]) -> Result<usize, SystemError> {
+        let _position = self.lock_position();
         self.do_write(
             self.offset.load(core::sync::atomic::Ordering::SeqCst),
             len,
@@ -2289,7 +2309,7 @@ impl File {
         Ok(())
     }
 
-    pub fn do_read(
+    fn do_read(
         &self,
         offset: usize,
         len: usize,
@@ -2403,7 +2423,7 @@ impl File {
             .update_atime(now, mount_flags.contains(MountFlags::RELATIME));
     }
 
-    pub fn do_write(
+    fn do_write(
         &self,
         offset: usize,
         len: usize,
@@ -2558,7 +2578,7 @@ impl File {
         Ok(result)
     }
 
-    pub fn do_write_user(
+    fn do_write_user(
         &self,
         offset: usize,
         len: usize,
@@ -2672,6 +2692,7 @@ impl File {
         len: usize,
         reader: &UserBufferReader<'_>,
     ) -> Result<usize, SystemError> {
+        let _position = self.lock_position();
         let stream = self.mode.read().contains(FileMode::FMODE_STREAM);
         let offset = if stream {
             0
@@ -2697,6 +2718,7 @@ impl File {
     ///
     /// @param origin 调整的起始位置
     pub fn lseek(&self, origin: SeekFrom) -> Result<usize, SystemError> {
+        let position = self.lock_position();
         let mode = self.mode();
         // Linux 语义：O_PATH fd 的 lseek 返回 EBADF（优先于 ESPIPE）。
         if mode.contains(FileMode::FMODE_PATH) {
@@ -2730,7 +2752,7 @@ impl File {
             }
         }
         if file_type == FileType::Dir {
-            let mut state = self.readdir_state.lock();
+            let mut state = position.unwrap_or_else(|| self.position_state.lock());
             let pos = match origin {
                 SeekFrom::SeekSet(offset) => offset,
                 SeekFrom::SeekCurrent(0) => return Ok(self.offset.load(Ordering::SeqCst)),
@@ -2848,11 +2870,14 @@ impl File {
             return Err(SystemError::ENOTDIR);
         }
 
-        let result = self.read_dir_impl(ctx);
+        // Directory iteration state also needs serialization for providers
+        // which opt out of FMODE_ATOMIC_POS (for example a FUSE stream).
+        let mut position = self.position_state.lock();
+        let result = self.read_dir_impl(ctx, &mut position);
         // Match Linux iterate_dir(): once filesystem iteration has started,
         // reaching EOF or returning an error both count as directory access.
-        // read_dir_impl has released readdir_state before this metadata update,
-        // avoiding a cross-filesystem lock-order dependency.
+        // Keep the position transaction through metadata/notification completion;
+        // the lock order remains position state before inode operations.
         self.touch_atime_after_access();
         if fsnotify::has_any_watch()
             && !self
@@ -2865,7 +2890,11 @@ impl File {
         result
     }
 
-    fn read_dir_impl(&self, ctx: &mut FilldirContext) -> Result<(), SystemError> {
+    fn read_dir_impl(
+        &self,
+        ctx: &mut FilldirContext,
+        state: &mut ReaddirState,
+    ) -> Result<(), SystemError> {
         let inode: &Arc<dyn IndexNode> = &self.inode;
         inode.before_read_dir()?;
         // POSIX 标准要求readdir应该返回. 和 ..
@@ -2875,7 +2904,6 @@ impl File {
         // 为了保证在目录内容动态变化（例如 /proc/self/fd）时不会因为重新
         // 创建列表而丢失尚未读取的目录项，这里缓存第一次生成的列表，在
         // 文件偏移被 seek 到 0 之前复用该缓存。
-        let mut state = self.readdir_state.lock();
         let current_cookie = self.offset.load(Ordering::SeqCst) as u64;
         if state.snapshot.is_none() {
             state.snapshot = Some(match inode.list_entries()? {
@@ -3001,6 +3029,7 @@ impl File {
     ///
     /// Allocation failures retain their admission scope until lock-free recovery.
     pub fn try_clone(&self) -> Result<File, MemoryAllocationError> {
+        let position = self.position_state.lock();
         let storage = PreparedFile::try_new()?;
         let inode_retention =
             InodeRetentionGuard::new(self.inode.clone(), InodeRetentionKind::OpenFileDescription)?;
@@ -3029,7 +3058,7 @@ impl File {
         let post_write_sync = if mode.contains(FileMode::FMODE_PATH) {
             PostWriteSyncPolicy::NotApplicable
         } else {
-            Self::configure_base_open_mode(&self.inode, &mut mode);
+            Self::configure_base_open_mode(&self.inode, self.file_type, &mut mode);
             let mut behavior = OpenFileBehavior::new(mode, self.file_type);
             self.inode
                 .configure_open_file(&private_data.lock(), &mut behavior);
@@ -3054,7 +3083,7 @@ impl File {
             mode: RwSem::new(mode),
             file_type: self.file_type,
             post_write_sync,
-            readdir_state: Mutex::new(self.readdir_state.lock().clone()),
+            position_state: Mutex::new(position.clone()),
             private_data,
             cred: self.cred.clone(),
             owner: Mutex::new(FileOwner::new()),
@@ -3097,20 +3126,11 @@ impl File {
     }
 
     /// Commit a syscall-owned transfer cursor. Stream objects have no file
-    /// position; this does not promise serialization against other I/O.
+    /// position. The caller owns the implicit-position transaction.
     pub(crate) fn commit_transfer_position(&self, position: usize) {
         if !self.mode().contains(FileMode::FMODE_STREAM) {
             self.offset.store(position, Ordering::SeqCst);
         }
-    }
-
-    /// 推进当前文件偏移。
-    #[inline]
-    pub fn advance_pos(&self, delta: usize) {
-        if delta == 0 {
-            return;
-        }
-        self.offset.fetch_add(delta, Ordering::SeqCst);
     }
 
     /// 检查文件是否为普通文件或目录

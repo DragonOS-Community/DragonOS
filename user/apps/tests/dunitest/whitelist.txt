@@ -218,3 +218,6 @@ normal/udp_source_route
 normal/udp_disconnect_semantics
 normal/udp_unspec_bind
 fuse/stat_blocks
+
+normal/read_buffer_semantics
+normal/read_buffer_selftest

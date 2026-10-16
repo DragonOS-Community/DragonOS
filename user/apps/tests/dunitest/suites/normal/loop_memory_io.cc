@@ -1,6 +1,6 @@
 #include "loop_ext4_test_support.h"
 
-#include <poll.h>
+#include <sched.h>
 #include <signal.h>
 #include <sys/mman.h>
 #include <sys/vfs.h>
@@ -24,25 +24,6 @@ uint64_t Now() {
     timespec time{};
     if (clock_gettime(CLOCK_MONOTONIC, &time)) return 0;
     return uint64_t(time.tv_sec) * kSecond + time.tv_nsec;
-}
-
-// EINTR and partial transfers consume the original absolute deadline.
-bool Transfer(int fd, void* data, size_t length, bool send, uint64_t end) {
-    auto* bytes = static_cast<char*>(data);
-    while (length) {
-        uint64_t now = Now();
-        if (!now || now >= end) return false;
-        pollfd event{fd, short(send ? POLLOUT : POLLIN), 0};
-        int ready = poll(&event, 1, int((end - now + 999999) / 1000000));
-        if (ready < 0 && errno == EINTR) continue;
-        if (ready <= 0 || !(event.revents & (send ? POLLOUT : POLLIN))) return false;
-        ssize_t count = send ? write(fd, bytes, length) : read(fd, bytes, length);
-        if (count < 0 && errno == EINTR) continue;
-        if (count <= 0) return false;
-        bytes += count;
-        length -= count;
-    }
-    return true;
 }
 
 int Set(const std::string& path, const std::string& value) {
@@ -119,6 +100,8 @@ struct Reply {
 };
 
 struct SharedReply {
+    uint32_t request_sequence;
+    char operation;
     uint32_t sequence;
     Reply reply;
 };
@@ -128,19 +111,17 @@ class Reader {
     ~Reader() { Stop(); }
 
     bool Start(int donor, int target, int writer) {
-        int request[2];
-        if (pipe(request)) return false;
-        // The reply channel must not require a fresh child allocation after
-        // a zero-headroom failure. Prefault shared control storage in the
-        // unlimited runner; otherwise reporting ENOMEM can itself enter OOM.
+        // Both control directions must avoid fresh child allocations under
+        // a zero-headroom limit. In particular, a pipe read would allocate
+        // accounted syscall scratch before reaching the intended NOIO read.
+        // Prefault this shared page in the unlimited runner before migration.
         void* shared = mmap(nullptr, kBlock, PROT_READ | PROT_WRITE,
                             MAP_SHARED | MAP_ANONYMOUS, -1, 0);
-        if (shared == MAP_FAILED) { close(request[0]); close(request[1]); return false; }
+        if (shared == MAP_FAILED) return false;
         memset(shared, 0, kBlock);
         shared_ = static_cast<SharedReply*>(shared);
         pid_ = fork();
         if (!pid_) {
-            close(request[1]);
             void* allocation = nullptr;
             int error = posix_memalign(&allocation, kBlock, kBlock);
             if (error) _exit(90);
@@ -151,9 +132,15 @@ class Reader {
             uint32_t sequence = 1;
             shared_->reply = reply;
             __atomic_store_n(&shared_->sequence, sequence, __ATOMIC_RELEASE);
-            char operation;
-            while (Transfer(request[0], &operation, 1, false, Now() + 30 * kSecond)) {
-                if (operation == 'Q') break;
+            for (;;) {
+                const uint64_t end = Now() + 30 * kSecond;
+                while (__atomic_load_n(&shared_->request_sequence, __ATOMIC_ACQUIRE)
+                       != sequence + 1) {
+                    const uint64_t now = Now();
+                    if (!now || now >= end) _exit(91);
+                    sched_yield();
+                }
+                const char operation = shared_->operation;
                 reply = {};
                 const bool writing = operation == 'W';
                 int fd = writing ? writer : (operation == 'D' ? donor : target);
@@ -170,16 +157,13 @@ class Reader {
                 if (writing && !reply.error && fsync(writer)) reply.error = errno;
                 shared_->reply = reply;
                 __atomic_store_n(&shared_->sequence, ++sequence, __ATOMIC_RELEASE);
-                // Do not start another poll admission after a zero-headroom
-                // failure. The operation result is already published; exit
-                // normally so the parent can distinguish it from OOM/SIGKILL.
+                // The result is already published. Exit normally on failure
+                // so the parent can distinguish ENOMEM from OOM/SIGKILL.
                 if (reply.error) break;
             }
             free(allocation);
             _exit(0);
         }
-        close(request[0]);
-        input_ = request[1];
         if (pid_ < 0) return false;
         Reply ready;
         return WaitReply(1, &ready, Now() + 10 * kSecond);
@@ -189,8 +173,11 @@ class Reader {
 
     bool Run(char operation, Reply* reply) {
         uint64_t end = Now() + 20 * kSecond;
-        return Transfer(input_, &operation, 1, true, end)
-            && WaitReply(++sequence_, reply, end);
+        // Only one request is outstanding: WaitReply acquires the previous
+        // result before this slot can be reused by the next Run call.
+        shared_->operation = operation;
+        __atomic_store_n(&shared_->request_sequence, ++sequence_, __ATOMIC_RELEASE);
+        return WaitReply(sequence_, reply, end);
     }
 
     bool ExitedNormally() {
@@ -224,8 +211,6 @@ class Reader {
             EXPECT_TRUE(reaped) << "loop child did not retire after SIGKILL";
             pid_ = -1;
         }
-        if (input_ >= 0) close(input_);
-        input_ = -1;
         if (shared_) munmap(shared_, kBlock);
         shared_ = nullptr;
     }
@@ -241,7 +226,6 @@ class Reader {
         return true;
     }
     pid_t pid_ = -1;
-    int input_ = -1;
     SharedReply* shared_ = nullptr;
     uint32_t sequence_ = 1;
 };
@@ -525,8 +509,6 @@ TEST_F(LoopMemoryIo, ParentQuotaNoioReclaimHonorsChildMemoryMin) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    // Closed worker pipes are failure evidence, not SIGPIPE for the runner.
-    signal(SIGPIPE, SIG_IGN);
     ::testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();
 }

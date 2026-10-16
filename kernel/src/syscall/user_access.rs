@@ -1492,6 +1492,55 @@ pub unsafe fn copy_to_user_protected(dest: VirtAddr, src: &[u8]) -> Result<usize
     }
 }
 
+/// Copy an output prefix, reporting bytes actually written before a fault.
+/// Unlike the whole-copy API, this is for byte-oriented reads whose position
+/// is committed after the copy. Record and socket owners keep their existing
+/// whole-copy transaction. A failed copy may still have changed user memory.
+///
+/// # Safety
+/// `dest` must designate userspace; accesses are exception-table protected.
+pub unsafe fn copy_to_user_prefix_protected(
+    dest: VirtAddr,
+    src: &[u8],
+) -> Result<usize, SystemError> {
+    if src.is_empty() {
+        return Ok(0);
+    }
+    access_ok(dest, src.len()).map_err(|_| SystemError::EFAULT)?;
+    let mut copied = 0;
+    while copied < src.len() {
+        let address = dest + copied;
+        let want = if MMArch::PAGE_FAULT_ENABLED {
+            src.len() - copied
+        } else {
+            // Prepare only the page about to be copied. A later bad page must
+            // not discard bytes already copied on non-faulting architectures.
+            (MMArch::PAGE_SIZE - (address.data() & MMArch::PAGE_OFFSET_MASK))
+                .min(src.len() - copied)
+        };
+        if check_user_access_range(address, want, true)
+            .and_then(|()| prefault_user_range(address, want, true))
+            .is_err()
+        {
+            break;
+        }
+        let remaining = MMArch::copy_with_exception_table(
+            address.data() as *mut u8,
+            src.as_ptr().add(copied),
+            want,
+        );
+        copied += want.saturating_sub(remaining);
+        if remaining != 0 {
+            break;
+        }
+    }
+    if copied == 0 {
+        Err(SystemError::EFAULT)
+    } else {
+        Ok(copied)
+    }
+}
+
 /// Write a single `Copy` value to user space with exception-table protection.
 pub unsafe fn write_one_to_user_protected<T: Copy>(
     dest: VirtAddr,

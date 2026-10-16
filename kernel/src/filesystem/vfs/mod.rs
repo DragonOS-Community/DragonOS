@@ -11,6 +11,7 @@ pub mod mount_api;
 pub mod open;
 pub mod permission;
 pub mod posix_lock;
+pub(crate) mod read_buffer;
 pub mod stat;
 pub mod syscall;
 pub mod utils;
@@ -741,6 +742,19 @@ pub trait PollableInode: Any + Sync + Send + Debug + CastFromSync {
     }
 }
 
+/// Linux's maximum byte count for a single read/write operation.
+pub(crate) const MAX_RW_COUNT: usize = (i32::MAX as usize)
+    & !(<crate::arch::MMArch as crate::mm::MemoryManagementArch>::PAGE_SIZE - 1);
+
+/// Userspace read dispatch: legacy `.read` is called per iovec, whereas
+/// `.read_iter` owns the whole logical buffer and its consumption boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UserReadMode {
+    Buffered,
+    Scalar,
+    Iterator,
+}
+
 pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     /// Namespace-specific proc sysctl mode bits for the current credentials.
     /// None preserves the ordinary global-root proc sysctl permission policy.
@@ -1046,12 +1060,10 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, crate::mm::allocation::MemoryAllocationError>;
 
-    /// Whether this inode implements [`IndexNode::read_user_at`].
-    ///
-    /// This explicit capability keeps the ordinary read hot path from taking
-    /// private-data locks merely to discover the default `None` result.
-    fn supports_read_user(&self) -> bool {
-        false
+    /// Select the protected userspace read contract without taking private
+    /// data locks merely to discover the default buffered fallback.
+    fn user_read_mode(&self) -> UserReadMode {
+        UserReadMode::Buffered
     }
 
     /// Read directly into a protected userspace buffer.

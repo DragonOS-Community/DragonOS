@@ -247,8 +247,8 @@ fn nonblock_prep_pipe_read(pipe_in: &File, flags: SpliceFlags) -> Result<(), Sys
 
 /// pipe 到 pipe 的数据传输
 ///
-/// 关键行为：splice 只传输一个缓冲区单位的数据后就返回，
-/// 不会循环传输直到达到 len。这是 Linux splice 的语义。
+/// Transfer immediately available logical buffers up to the requested count.
+/// Once progress is made, an empty input or full output returns that prefix.
 fn splice_pipe_to_pipe(
     pipe_in: &File,
     pipe_out: &File,
@@ -304,7 +304,16 @@ fn try_splice_read_to_pipe(
     let pipe_inode = get_pipe_inode(pipe)?;
     let actor = crate::cgroup::memory::object_for_task(&ProcessManager::current_pcb());
 
-    let limit = len.min(4096);
+    // Cached splice sources preserve their source-page range. Copy-style
+    // sources instead populate a fresh scratch page beginning at offset zero.
+    // One output slot is reserved before the source can consume anything.
+    let page_size = <crate::arch::MMArch as crate::mm::MemoryManagementArch>::PAGE_SIZE;
+    let source_offset = if file.inode().page_cache().is_some() {
+        *position & (page_size - 1)
+    } else {
+        0
+    };
+    let limit = len.min(page_size - source_offset);
     let trusted_read_limit = splice_trusted_file_read_limit(file, Some(*position), limit);
     let mut transaction = pipe_inode.begin_writer_transaction();
     pipe_inode.ensure_splice_readers(&transaction)?;
@@ -338,7 +347,7 @@ fn try_splice_read_to_pipe(
     }
     // All output inventory and the scratch are born before consuming input.
     pipe_inode.prepare_output_storage(&transaction, &actor)?;
-    let mut buffer = crate::ipc::pipe::buffer::PipeBuffer::try_new(buf_size, &actor)?;
+    let mut buffer = crate::ipc::pipe::buffer::PipeBuffer::try_new_bytes(buf_size, &actor)?;
 
     // 从文件读取
     // 为了满足 Linux 语义：若后续写入 pipe 被信号中断且未写入任何字节，
@@ -350,7 +359,8 @@ fn try_splice_read_to_pipe(
     }
 
     // 写入 pipe
-    let written = pipe_inode.write_from_splice_locked(&mut transaction, &buffer[..read_len]);
+    let written =
+        pipe_inode.write_from_splice_locked(&mut transaction, &buffer[..read_len], source_offset);
 
     match written {
         Ok(write_len) => {
@@ -427,7 +437,7 @@ fn splice_pipe_to_file(
     let buf_size = allowed_len.min(4096);
     let mut buffer = File::recover_io(|| {
         let actor = crate::cgroup::memory::object_for_task(&ProcessManager::current_pcb());
-        crate::ipc::pipe::buffer::PipeBuffer::try_new(buf_size, &actor)
+        crate::ipc::pipe::buffer::PipeBuffer::try_new_bytes(buf_size, &actor)
     })?;
     let result = File::recover_io(|| {
         let read = pipe_inode.splice_peek_hold_from_blocking(buf_size, &mut buffer, nonblock)?;

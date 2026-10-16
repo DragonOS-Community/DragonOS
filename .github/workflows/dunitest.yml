@@ -44,6 +44,8 @@ jobs:
           normal/xattr_syscall_selftest
           normal/xattr_syscall
           normal/read_buffer_semantics
+          normal/read_fault_semantics
+          normal/fuse_read_fault
           normal/read_buffer_selftest
           normal/allocation_diagnostics
           normal/dma_allocator_selftest

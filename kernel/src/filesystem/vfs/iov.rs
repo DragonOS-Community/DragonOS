@@ -103,7 +103,8 @@ impl IoVecs {
         let total_bytes = iovcnt.checked_mul(elem_size).ok_or(SystemError::EINVAL)?;
 
         // Only does range check (user range) here.
-        let iovs_reader = UserBufferReader::new(iov, total_bytes, true)?;
+        let iovs_reader =
+            UserBufferReader::new(iov, total_bytes, true).map_err(|_| SystemError::EFAULT)?;
 
         // Use exception-table protected copy to avoid kernel faults when userspace pointer is bad.
         let iovs_buf = iovs_reader.buffer_protected(0)?;
@@ -116,23 +117,25 @@ impl IoVecs {
             let offset = idx * elem_size;
             let one: IoVec = iovs_buf.read_one(offset)?;
 
-            // Linux behavior: always validate iov_base is a user pointer, even when iov_len==0.
-            // This matches Linux access_ok(addr, 0) behavior and is required by gVisor tests.
-            let base = VirtAddr::new(one.iov_base as usize);
-
-            // Only do lightweight address range check (like Linux's access_ok).
-            // This checks that the address range is within user space limits,
-            // but does NOT traverse page tables or check actual mappings.
-            // Actual page mapping/permission checks happen during copy operations.
-            access_ok(base, one.iov_len)?;
-
-            // Skip zero-length iovecs after validation
-            if one.iov_len == 0 {
-                continue;
+            if one.iov_len > isize::MAX as usize {
+                return Err(SystemError::EINVAL);
             }
-
             slices.push(one);
         }
+
+        // Linux's single-segment ITER_UBUF fast path clips before access_ok;
+        // multi-segment import validates each original range before clipping.
+        if iovcnt == 1 {
+            slices[0].iov_len = slices[0].iov_len.min(super::MAX_RW_COUNT);
+        }
+        let mut remaining = super::MAX_RW_COUNT;
+        for one in &mut slices {
+            access_ok(VirtAddr::new(one.iov_base as usize), one.iov_len)
+                .map_err(|_| SystemError::EFAULT)?;
+            one.iov_len = one.iov_len.min(remaining);
+            remaining -= one.iov_len;
+        }
+        slices.retain(|one| one.iov_len != 0);
 
         Ok(Self(slices))
     }

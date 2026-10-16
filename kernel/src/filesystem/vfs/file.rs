@@ -1847,15 +1847,14 @@ impl File {
         self.do_read(offset, len, buf, !stream)
     }
 
-    /// Read one bounded kernel-buffer chunk for a single read(2) operation.
-    ///
-    /// The syscall layer may need several chunks to cover the userspace
-    /// buffer, but Linux publishes ACCESS once for the whole successful
-    /// syscall rather than once per implementation chunk.
+    /// Read a bounded chunk without committing the position before user copy.
+    /// Only the backing read is recoverable: copying and consumption must never
+    /// be replayed by charge recovery.
     pub(crate) fn read_syscall_chunk(
         &self,
-        len: usize,
         buf: &mut [u8],
+        output: &mut UserBuffer<'_>,
+        output_offset: usize,
     ) -> Result<usize, SystemError> {
         let stream = self.mode.read().contains(FileMode::FMODE_STREAM);
         let offset = if stream {
@@ -1863,8 +1862,33 @@ impl File {
         } else {
             self.offset.load(Ordering::SeqCst)
         };
+        let read = Self::recover_io(|| self.read_backing(offset, buf.len(), buf))?;
+        let result = output.write_prefix_to_user(output_offset, &buf[..read]);
+        // file_accessed() also runs after a nonzero regular request which
+        // reaches EOF or faults on its first output byte. No ACCESS is emitted
+        // here: the syscall owns that notification boundary.
+        self.finalize_read(
+            offset,
+            result.as_ref().copied().unwrap_or(0),
+            !stream,
+            false,
+        );
+        result
+    }
 
-        Self::recover_io(|| self.do_read_with_fsnotify(offset, len, buf, !stream, false))
+    /// Linux rw_verify_area's signed count/position checks. Stream descriptions
+    /// have no position; address-range admission belongs to the syscall.
+    pub(crate) fn verify_read_range(&self, count: usize) -> Result<(), SystemError> {
+        if count > isize::MAX as usize {
+            return Err(SystemError::EINVAL);
+        }
+        if !self.mode.read().contains(FileMode::FMODE_STREAM) {
+            let offset = self.offset.load(Ordering::SeqCst);
+            if offset > isize::MAX as usize || count > isize::MAX as usize - offset {
+                return Err(SystemError::EINVAL);
+            }
+        }
+        Ok(())
     }
 
     /// Let an inode consume a protected userspace buffer as one read syscall.
@@ -1909,10 +1933,6 @@ impl File {
         if writer.len() < len {
             return Err(SystemError::ENOBUFS);
         }
-        if self.flags().contains(FileFlags::O_DIRECT) {
-            return Ok(None);
-        }
-
         let Some(read_len) =
             self.inode
                 .read_user_at(offset, len, writer, self.private_data.lock())?
@@ -1925,8 +1945,8 @@ impl File {
     }
 
     #[inline]
-    pub fn supports_read_user(&self) -> bool {
-        self.inode.supports_read_user()
+    pub fn user_read_mode(&self) -> super::UserReadMode {
+        self.inode.user_read_mode()
     }
 
     /// Read from the current file position without advancing it.
@@ -2287,6 +2307,19 @@ impl File {
         update_offset: bool,
         emit_fsnotify: bool,
     ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        let read = self.read_backing(offset, len, buf)?;
+        if len != 0 {
+            self.finalize_read(offset, read, update_offset, emit_fsnotify);
+        }
+        Ok(read)
+    }
+
+    fn read_backing(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &mut [u8],
+    ) -> Result<usize, MemoryAllocationError> {
         self.readable()?;
         // Linux/POSIX: count==0 must not touch the buffer and must not block.
         if len == 0 {
@@ -2309,7 +2342,6 @@ impl File {
                 .read_at(offset, len, buf, self.private_data.lock())
         }?;
 
-        self.finalize_read(offset, len, update_offset, emit_fsnotify);
         Ok(len)
     }
 

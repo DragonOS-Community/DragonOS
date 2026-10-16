@@ -22,9 +22,11 @@ use super::super::protocol::{
     FUSE_SETXATTR, FUSE_STATFS, FUSE_SYMLINK, FUSE_WRITEBACK_CACHE,
 };
 use super::{
-    stats, trace, wait_with_recheck, FuseConn, FuseConnInner, FuseInitNegotiated, FuseRequest,
+    stats, trace, wait_with_recheck, FuseConn, FuseConnInner, FuseInitNegotiated,
+    FuseReplyContract, FuseRequest,
 };
 use crate::filesystem::fuse::reply::FuseReply;
+use crate::syscall::user_buffer::UserBuffer;
 
 impl FuseConn {
     fn claim_pending_reply<F>(
@@ -196,9 +198,53 @@ impl FuseConn {
     fn complete_dequeued_request(
         &self,
         req: Arc<FuseRequest>,
-        out: &mut [u8],
+        copy: impl FnOnce(&[u8]) -> Result<(), SystemError>,
     ) -> Result<usize, SystemError> {
-        out[..req.bytes.len()].copy_from_slice(&req.bytes);
+        // Retain the exact pending owner across a sleeping userspace copy.
+        // Abort/reply may win while no connection lock is held.
+        let pending = {
+            let inner = self.inner.lock();
+            if !inner.connected {
+                return Err(SystemError::ENOTCONN);
+            }
+            match req.reply_contract {
+                FuseReplyContract::Reply { .. } => inner.processing.get(&req.unique).cloned(),
+                FuseReplyContract::NoReply => None,
+            }
+        };
+        let copied = copy(&req.bytes);
+        let failed_pending = {
+            let mut inner = self.inner.lock();
+            if !inner.connected {
+                return Err(SystemError::ENOTCONN);
+            }
+            if copied.is_err()
+                && pending.as_ref().is_some_and(|expected| {
+                    inner
+                        .processing
+                        .get(&req.unique)
+                        .is_some_and(|current| Arc::ptr_eq(expected, current))
+                })
+            {
+                inner.processing.remove(&req.unique)
+            } else {
+                None
+            }
+        };
+        if let Err(error) = copied {
+            if let Some(pending) = failed_pending {
+                Self::complete_claimed_reply_with_error(
+                    &pending,
+                    req.unique,
+                    SystemError::EIO,
+                    -SystemError::EIO.to_posix_errno(),
+                    0,
+                );
+            } else if matches!(req.reply_contract, FuseReplyContract::NoReply) {
+                stats::on_fuse_requests_aborted(1);
+            }
+            return Err(error);
+        }
         req.stats_mark_external_dequeued();
         self.account_dequeued_request(&req);
         Ok(req.bytes.len())
@@ -254,22 +300,24 @@ impl FuseConn {
         })
     }
 
-    fn read_dequeued_request<F>(
+    fn read_dequeued_request<F, C>(
         &self,
         nonblock: bool,
-        out: &mut [u8],
+        out_len: usize,
         context: &str,
         mut pop_request: F,
+        copy: C,
     ) -> Result<usize, SystemError>
     where
         F: FnMut() -> Result<Arc<FuseRequest>, SystemError>,
+        C: FnOnce(&[u8]) -> Result<(), SystemError>,
     {
         let min_read = self.min_read_buffer();
-        if out.len() < min_read {
+        if out_len < min_read {
             log::warn!(
                 "fuse: read buffer too small for {}: got={} min={} nonblock={}",
                 context,
-                out.len(),
+                out_len,
                 min_read,
                 nonblock
             );
@@ -279,7 +327,7 @@ impl FuseConn {
         let req = loop {
             let req = pop_request()?;
 
-            if out.len() >= req.bytes.len() {
+            if out_len >= req.bytes.len() {
                 break req;
             }
 
@@ -287,24 +335,52 @@ impl FuseConn {
             log::warn!(
                 "fuse: read buffer smaller than queued {} request: got={} need={}",
                 context,
-                out.len(),
+                out_len,
                 req.bytes.len()
             );
         };
 
-        self.complete_dequeued_request(req, out)
+        self.complete_dequeued_request(req, copy)
     }
 
     pub fn read_request(&self, nonblock: bool, out: &mut [u8]) -> Result<usize, SystemError> {
-        // Linux: require a sane minimum read buffer for all reads.
-        self.read_dequeued_request(nonblock, out, "request", || {
-            // Linux: if O_NONBLOCK and no pending request, return EAGAIN.
-            if nonblock {
-                self.pop_pending_nonblock()
-            } else {
-                self.pop_pending_blocking()
-            }
-        })
+        self.read_dequeued_request(
+            nonblock,
+            out.len(),
+            "request",
+            || {
+                if nonblock {
+                    self.pop_pending_nonblock()
+                } else {
+                    self.pop_pending_blocking()
+                }
+            },
+            |bytes| {
+                out[..bytes.len()].copy_from_slice(bytes);
+                Ok(())
+            },
+        )
+    }
+
+    pub fn read_request_to_user(
+        &self,
+        nonblock: bool,
+        len: usize,
+        out: &mut UserBuffer<'_>,
+    ) -> Result<usize, SystemError> {
+        self.read_dequeued_request(
+            nonblock,
+            len.min(out.len()),
+            "request",
+            || {
+                if nonblock {
+                    self.pop_pending_nonblock()
+                } else {
+                    self.pop_pending_blocking()
+                }
+            },
+            |bytes| out.write_to_user(0, bytes).map(|_| ()),
+        )
     }
 
     pub fn read_ordinary_request(
@@ -312,23 +388,42 @@ impl FuseConn {
         nonblock: bool,
         out: &mut [u8],
     ) -> Result<usize, SystemError> {
-        self.read_dequeued_request(nonblock, out, "ordinary request", || {
-            if nonblock {
-                self.pop_ordinary_pending_nonblock()
-            } else {
-                self.pop_ordinary_pending_blocking()
-            }
-        })
+        self.read_dequeued_request(
+            nonblock,
+            out.len(),
+            "ordinary request",
+            || {
+                if nonblock {
+                    self.pop_ordinary_pending_nonblock()
+                } else {
+                    self.pop_ordinary_pending_blocking()
+                }
+            },
+            |bytes| {
+                out[..bytes.len()].copy_from_slice(bytes);
+                Ok(())
+            },
+        )
     }
 
     pub fn read_high_priority_request(&self, out: &mut [u8]) -> Result<usize, SystemError> {
-        self.read_dequeued_request(true, out, "high-priority request", || {
-            let mut g = self.inner.lock();
-            if !g.connected {
-                return Err(SystemError::ENOTCONN);
-            }
-            Self::pop_high_priority_pending_locked(&mut g).ok_or(SystemError::EAGAIN_OR_EWOULDBLOCK)
-        })
+        self.read_dequeued_request(
+            true,
+            out.len(),
+            "high-priority request",
+            || {
+                let mut g = self.inner.lock();
+                if !g.connected {
+                    return Err(SystemError::ENOTCONN);
+                }
+                Self::pop_high_priority_pending_locked(&mut g)
+                    .ok_or(SystemError::EAGAIN_OR_EWOULDBLOCK)
+            },
+            |bytes| {
+                out[..bytes.len()].copy_from_slice(bytes);
+                Ok(())
+            },
+        )
     }
 
     fn fail_oversized_read_request(&self, req: &FuseRequest) {
@@ -1063,6 +1158,89 @@ mod tests {
         buf.resize(conn.min_read_buffer(), 0);
         let len = conn.read_request(true, &mut buf).unwrap();
         assert_eq!(read_opcode(&buf[..len]), FUSE_FORGET);
+    }
+
+    #[test]
+    fn daemon_copy_fault_completes_request_without_leaving_processing_owner() {
+        let conn = FuseConn::new_for_virtiofs(8192, 8192);
+        let (unique, _, pending) = queue_test_request(&conn, FUSE_LOOKUP, 1, &[], true);
+        let result = conn.read_dequeued_request(
+            true,
+            conn.min_read_buffer(),
+            "request",
+            || conn.pop_pending_nonblock(),
+            |_| Err(SystemError::EFAULT),
+        );
+        assert!(matches!(result, Err(SystemError::EFAULT)));
+        assert!(!conn.has_processing_request(unique));
+        assert!(!conn.has_pending_ordinary_requests());
+        assert!(matches!(
+            pending.unwrap().wait_complete(),
+            Err(SystemError::EIO)
+        ));
+    }
+
+    #[test]
+    fn daemon_copy_fault_retires_noreply_without_touching_other_request() {
+        let conn = FuseConn::new_for_virtiofs(8192, 8192);
+        queue_test_request(&conn, FUSE_FORGET, 1, &[], false);
+        let (unique, _, _) = queue_test_request(&conn, FUSE_LOOKUP, 1, &[], true);
+        assert!(matches!(
+            conn.read_dequeued_request(
+                true,
+                conn.min_read_buffer(),
+                "request",
+                || conn.pop_pending_nonblock(),
+                |_| Err(SystemError::EFAULT),
+            ),
+            Err(SystemError::EFAULT)
+        ));
+        assert!(!conn.has_pending_high_priority_requests());
+        assert!(conn.has_pending_ordinary_requests());
+        assert!(conn.has_processing_request(unique));
+    }
+
+    #[test]
+    fn reply_winning_daemon_copy_fault_is_not_completed_twice() {
+        let conn = FuseConn::new_for_virtiofs(8192, 8192);
+        let (unique, _, pending) = queue_test_request(&conn, FUSE_LOOKUP, 1, &[], true);
+        let pending = pending.unwrap();
+        let result = conn.read_dequeued_request(
+            true,
+            conn.min_read_buffer(),
+            "request",
+            || conn.pop_pending_nonblock(),
+            |_| {
+                conn.claim_pending_reply(unique, &pending, |_| {}).unwrap();
+                assert!(pending.complete_daemon_error(SystemError::EACCES));
+                Err(SystemError::EFAULT)
+            },
+        );
+        assert!(matches!(result, Err(SystemError::EFAULT)));
+        assert!(!conn.has_processing_request(unique));
+        assert!(matches!(pending.wait_complete(), Err(SystemError::EACCES)));
+    }
+
+    #[test]
+    fn disconnect_during_daemon_copy_keeps_disconnect_completion() {
+        let conn = FuseConn::new_for_virtiofs(8192, 8192);
+        let (unique, _, pending) = queue_test_request(&conn, FUSE_LOOKUP, 1, &[], true);
+        let result = conn.read_dequeued_request(
+            true,
+            conn.min_read_buffer(),
+            "request",
+            || conn.pop_pending_nonblock(),
+            |_| {
+                conn.abort();
+                Err(SystemError::EFAULT)
+            },
+        );
+        assert!(matches!(result, Err(SystemError::ENOTCONN)));
+        assert!(!conn.has_processing_request(unique));
+        assert!(matches!(
+            pending.unwrap().wait_complete(),
+            Err(SystemError::ENOTCONN)
+        ));
     }
 
     #[test]

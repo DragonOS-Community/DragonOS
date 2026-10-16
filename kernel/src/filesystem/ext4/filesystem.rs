@@ -240,6 +240,16 @@ pub enum Ext4ErrorsBehavior {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Ext4MountOptions {
+    /// Requested DAX mode.
+    ///
+    /// **Parsed and stored only** — actual DAX semantics (accessing file
+    /// contents directly from the underlying pmem device, bypassing the page
+    /// cache) are **not implemented yet**: all I/O still goes through the page
+    /// cache regardless of this value. The option is accepted so that
+    /// mount(2) behaves like Linux for callers that pass `dax` mount data
+    /// (e.g. `rootflags=dax`, or mounting a read-only virtio-pmem ext4 image),
+    /// and it mirrors what the kernel-internal root-mount path (vcore.rs)
+    /// records for the same option.
     pub dax: Option<Ext4DaxMode>,
     pub errors: Ext4ErrorsBehavior,
     pub read_only: bool,
@@ -290,6 +300,14 @@ impl Ext4MountOptions {
                 "errors=continue" => options.errors = Ext4ErrorsBehavior::Continue,
                 "errors=remount-ro" => options.errors = Ext4ErrorsBehavior::RemountRo,
                 "errors=panic" => options.errors = Ext4ErrorsBehavior::Panic,
+                // Linux accepts a bare "dax" as the deprecated alias for
+                // "dax=always" (fs/ext4/super.c), so mount(2) must accept it
+                // too. NOTE: like the root-mount path, the mode is recorded
+                // only — no page-cache bypass is performed yet (see the `dax`
+                // field doc above).
+                "dax" | "dax=always" => options.dax = Some(Ext4DaxMode::Always),
+                "dax=inode" => options.dax = Some(Ext4DaxMode::Inode),
+                "dax=never" => options.dax = Some(Ext4DaxMode::Never),
                 // Do not silently accept an option whose semantics ext4 does
                 // not implement. In particular, values other than 0/1 and
                 // journal-only options on a nojournal mount must fail here or
@@ -1691,9 +1709,36 @@ mod mount_options_tests {
         assert!(Ext4MountOptions::parse(Some("discard")).is_err());
         assert!(Ext4MountOptions::parse(Some("barrier=2")).is_err());
         assert!(Ext4MountOptions::parse(Some("barrier=")).is_err());
-        assert!(Ext4MountOptions::parse(Some("dax")).is_err());
         assert!(Ext4MountOptions::parse(Some("dax=invalid")).is_err());
         assert!(Ext4MountOptions::parse(Some("errors=invalid")).is_err());
+    }
+
+    #[test]
+    fn dax_options_follow_linux_semantics() {
+        use super::Ext4DaxMode;
+        assert_eq!(
+            Ext4MountOptions::parse(Some("dax")).unwrap().dax,
+            Some(Ext4DaxMode::Always)
+        );
+        assert_eq!(
+            Ext4MountOptions::parse(Some("dax=always")).unwrap().dax,
+            Some(Ext4DaxMode::Always)
+        );
+        assert_eq!(
+            Ext4MountOptions::parse(Some("dax=inode")).unwrap().dax,
+            Some(Ext4DaxMode::Inode)
+        );
+        assert_eq!(
+            Ext4MountOptions::parse(Some("dax=never")).unwrap().dax,
+            Some(Ext4DaxMode::Never)
+        );
+        // dax must compose with other options.
+        assert_eq!(
+            Ext4MountOptions::parse(Some("dax,errors=remount-ro"))
+                .unwrap()
+                .dax,
+            Some(Ext4DaxMode::Always)
+        );
     }
 
     #[test]

@@ -17,7 +17,10 @@ use crate::syscall::user_buffer::UserBuffer;
 use alloc::string::ToString;
 use alloc::vec::Vec;
 
-use super::sys_read::get_read_file;
+use super::{
+    read_buffer::{ReadScratch, MAX_CHUNK},
+    sys_read::get_read_file,
+};
 
 /// System call handler for `readv` operation
 ///
@@ -89,10 +92,8 @@ pub(super) fn read_iovecs(file: &File, iovecs: &IoVecs) -> Result<usize, SystemE
 
     let mut total_read: usize = 0;
 
-    // Keep kernel-side buffer modest to avoid huge allocations.
-    // Also used as the granularity for accessibility checks to avoid
-    // traversing huge address ranges at once.
-    const CHUNK: usize = 64 * 1024;
+    // Reuse one bounded CPU owner across implementation chunks and iovecs.
+    let mut scratch = ReadScratch::default();
 
     for one in iovecs.iovs().iter() {
         // Check if we've reached MAX_RW_COUNT limit
@@ -110,7 +111,7 @@ pub(super) fn read_iovecs(file: &File, iovecs: &IoVecs) -> Result<usize, SystemE
         while copied_this_iov < want {
             // Calculate how much to process in this iteration
             let remain_iov = want - copied_this_iov;
-            let chunk_len = core::cmp::min(CHUNK, remain_iov);
+            let chunk_len = core::cmp::min(MAX_CHUNK, remain_iov);
 
             let current_base = one.iov_base as usize + copied_this_iov;
 
@@ -127,8 +128,12 @@ pub(super) fn read_iovecs(file: &File, iovecs: &IoVecs) -> Result<usize, SystemE
 
             // Read into kernel buffer
             let to_read = core::cmp::min(accessible, chunk_len);
-            let mut kbuf = alloc::vec![0u8; to_read];
-            let n = match file.read_syscall_chunk(to_read, &mut kbuf[..]) {
+            let kbuf = match scratch.prepare(to_read) {
+                Ok(buffer) => buffer,
+                Err(_) if total_read != 0 => return finish_readv(file, total_read),
+                Err(error) => return Err(error),
+            };
+            let n = match file.read_syscall_chunk(to_read, kbuf) {
                 Ok(n) => n,
                 Err(_) if total_read != 0 => return finish_readv(file, total_read),
                 Err(error) => return Err(error),

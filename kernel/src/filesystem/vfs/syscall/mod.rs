@@ -8,6 +8,7 @@ mod mknod_utils;
 mod newfstat;
 mod open_utils;
 mod pread_pwrite_common;
+mod read_buffer;
 mod readlink_at;
 mod rename_utils;
 mod sys_chdir;
@@ -475,3 +476,9 @@ bitflags! {
     any(target_arch = "x86_64", target_arch = "riscv64")
 ))]
 pub(crate) use xattr_utils::selftest_report as xattr_syscall_selftest_report;
+
+#[cfg(all(
+    feature = "mm_selftest",
+    any(target_arch = "x86_64", target_arch = "riscv64")
+))]
+pub(crate) use read_buffer::selftest_report as read_buffer_selftest_report;

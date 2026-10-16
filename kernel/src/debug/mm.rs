@@ -35,6 +35,11 @@ enum MmReportCallback {
         any(target_arch = "x86_64", target_arch = "riscv64")
     ))]
     XattrSyscallSelftest,
+    #[cfg(all(
+        feature = "mm_selftest",
+        any(target_arch = "x86_64", target_arch = "riscv64")
+    ))]
+    ReadBufferSelftest,
 }
 
 impl KernFSCallback for MmReportCallback {
@@ -69,6 +74,13 @@ impl KernFSCallback for MmReportCallback {
             ))]
             Self::XattrSyscallSelftest => {
                 crate::filesystem::vfs::syscall::xattr_syscall_selftest_report()
+            }
+            #[cfg(all(
+                feature = "mm_selftest",
+                any(target_arch = "x86_64", target_arch = "riscv64")
+            ))]
+            Self::ReadBufferSelftest => {
+                crate::filesystem::vfs::syscall::read_buffer_selftest_report()
             }
         };
         data.file_private_data_mut()
@@ -181,6 +193,17 @@ pub fn init_debugfs_mm() -> Result<(), SystemError> {
         Some(4096),
         None,
         Some(&MmReportCallback::XattrSyscallSelftest),
+    )?;
+    #[cfg(all(
+        feature = "mm_selftest",
+        any(target_arch = "x86_64", target_arch = "riscv64")
+    ))]
+    mm.add_file(
+        "read_buffer_selftest".to_string(),
+        InodeMode::S_IRUSR,
+        Some(4096),
+        None,
+        Some(&MmReportCallback::ReadBufferSelftest),
     )?;
     Ok(())
 }

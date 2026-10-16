@@ -36,13 +36,15 @@ jobs:
       - name: Require MM regression tests
         shell: bash
         run: |
-          # MM selftests and xattr syscall coverage must execute, never silently skip.
+          # MM selftests and migrated syscall coverage must execute, never silently skip.
           cat >> user/apps/tests/dunitest/no_skip.txt <<'EOF'
           normal/vmalloc_selftest
           normal/kernel_buffer_selftest
           normal/overlay_xattr_selftest
           normal/xattr_syscall_selftest
           normal/xattr_syscall
+          normal/read_buffer_semantics
+          normal/read_buffer_selftest
           normal/allocation_diagnostics
           normal/dma_allocator_selftest
           EOF

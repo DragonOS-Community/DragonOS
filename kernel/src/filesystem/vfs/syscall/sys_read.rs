@@ -1,5 +1,7 @@
 use system_error::SystemError;
 
+use super::read_buffer::{ReadScratch, MAX_CHUNK};
+
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_READ;
 use crate::filesystem::fsnotify::FsEvent;
@@ -164,16 +166,21 @@ fn read_into_user_buffer(fd: i32, user_ptr: *mut u8, len: usize) -> Result<usize
         return read_socket_into_user_buffer(file.as_ref(), user_ptr, accessible);
     }
 
-    // Keep the kernel-side buffer modest to avoid huge allocations/long critical sections.
-    const CHUNK: usize = 64 * 1024;
+    // Reject invalid read modes before scratch admission can reclaim or OOM.
+    file.readable()?;
+    let mut scratch = ReadScratch::default();
     let mut total = 0usize;
 
     while total < accessible {
         let remain = accessible - total;
-        let chunk_len = core::cmp::min(CHUNK, remain);
+        let chunk_len = core::cmp::min(MAX_CHUNK, remain);
 
-        let mut kbuf = alloc::vec![0u8; chunk_len];
-        let n = match file.read_syscall_chunk(chunk_len, &mut kbuf[..]) {
+        let kbuf = match scratch.prepare(chunk_len) {
+            Ok(buffer) => buffer,
+            Err(_) if total != 0 => break,
+            Err(error) => return Err(error),
+        };
+        let n = match file.read_syscall_chunk(chunk_len, kbuf) {
             Ok(n) => n,
             Err(_) if total != 0 => break,
             Err(err) => return Err(err),

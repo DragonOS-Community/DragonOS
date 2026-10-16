@@ -3,6 +3,7 @@
 
 extern crate alloc;
 
+pub(crate) use alloc::alloc::handle_alloc_error;
 pub(crate) use alloc::borrow::ToOwned;
 pub(crate) use alloc::boxed::Box;
 pub(crate) use alloc::collections::BTreeMap;
@@ -33,3 +34,5 @@ pub(crate) type LBlockId = u32;
 pub(crate) type PBlockId = u64;
 pub(crate) type InodeId = u32;
 pub(crate) type BlockGroupId = u32;
+
+pub(crate) use crate::ext4_defs::{try_copy_bytes, try_filled_bytes};

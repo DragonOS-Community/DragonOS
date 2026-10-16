@@ -436,7 +436,7 @@ impl Ext4 {
             self.inode_cache.lock().entries.clear();
         }
 
-        let mut image = Box::new([0u8; 1024]);
+        let mut image = try_filled_bytes::<1024>(0)?;
         image.copy_from_slice(&self.block_device.read_block(mapping[0])?.data[..1024]);
         let head = if journal_sb.start == 0 {
             journal_sb.first

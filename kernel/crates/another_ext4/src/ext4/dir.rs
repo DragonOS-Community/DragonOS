@@ -94,7 +94,7 @@ impl Ext4 {
         for iblock in 0..Self::dir_data_block_count(dir)? {
             let fblock = self.transaction_extent_query(transaction, dir, iblock)?;
             let view = transaction.read(self, fblock)?;
-            let mut dir_block = DirBlock::new(Block::new(fblock, Box::new(*view)));
+            let mut dir_block = DirBlock::new(Block::new(fblock, try_copy_bytes(&view)?));
             let layout = self.validate_dir_block(dir, iblock, &dir_block)?;
             if layout == DirBlockLayout::Htree {
                 continue;
@@ -148,7 +148,7 @@ impl Ext4 {
         for _ in 0..node_count {
             nodes.push(self.transaction_alloc_metadata_block(transaction, dir.id, Some(home))?);
         }
-        let mut block = DirBlock::new(Block::new(home, Box::new([0; BLOCK_SIZE])));
+        let mut block = DirBlock::new(Block::new(home, try_filled_bytes(0)?));
         block.init(self.metadata_csum_enabled());
         if !block.insert(
             name,
@@ -327,7 +327,7 @@ impl Ext4 {
             // in a large directory. `read` still observes an already-staged
             // image if this helper is composed with another directory update.
             let view = transaction.read(self, fblock)?;
-            let mut dir_block = DirBlock::new(Block::new(fblock, Box::new(*view)));
+            let mut dir_block = DirBlock::new(Block::new(fblock, try_copy_bytes(&view)?));
             let layout = self.validate_dir_block(dir, iblock, &dir_block)?;
             if layout == DirBlockLayout::Htree {
                 continue;
@@ -391,7 +391,7 @@ impl Ext4 {
         for iblock in 0..total_blocks {
             let fblock = self.transaction_extent_query(transaction, dir, iblock)?;
             let view = transaction.read(self, fblock)?;
-            let mut dir_block = DirBlock::new(Block::new(fblock, Box::new(*view)));
+            let mut dir_block = DirBlock::new(Block::new(fblock, try_copy_bytes(&view)?));
             let layout = self.validate_dir_block(dir, iblock, &dir_block)?;
             if dir_block.replace(name, new_inode, new_type, self.metadata_csum_enabled()) {
                 self.set_dir_block_checksum(dir, &mut dir_block, layout)?;

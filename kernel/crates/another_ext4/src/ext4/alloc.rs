@@ -1078,7 +1078,7 @@ impl Ext4 {
         let first = Self::block_group_first_block(sb, bg.id);
         let count = Self::block_group_block_count(sb, bg.id);
         let end = first + count as u64;
-        let mut bytes = Box::new([0xff; BLOCK_SIZE]);
+        let mut bytes = try_filled_bytes(0xff)?;
         let mut bitmap = Bitmap::new(bytes.as_mut(), BLOCK_SIZE * 8);
         for bit in 0..count {
             bitmap.clear_bit(bit);
@@ -2387,7 +2387,7 @@ impl Ext4 {
     /// `alloc_block()` directly because their callers construct metadata
     /// images rather than exposing zero-filled file data.
     pub(super) fn alloc_zeroed_data_block(&self, inode: &mut InodeRef) -> Result<PBlockId> {
-        self.alloc_initialized_data_block(inode, Box::new([0; BLOCK_SIZE]))
+        self.alloc_initialized_data_block(inode, try_filled_bytes(0)?)
     }
 
     pub(super) fn alloc_initialized_data_block(

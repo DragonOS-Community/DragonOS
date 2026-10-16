@@ -265,7 +265,10 @@ impl MetadataBlockCache {
         // Block's owned return image is not part of cache capacity. Allocate it
         // before taking the set lock so allocator work never occurs in a cache
         // critical section.
-        let mut hit_image = Box::new([0; BLOCK_SIZE]);
+        let mut hit_image = match try_filled_bytes::<BLOCK_SIZE>(0) {
+            Ok(image) => image,
+            Err(error) => return MetadataCacheReadOutcome::error(error.code(), false),
+        };
         let ticket = {
             let mut set = set_lock.lock();
             if let Some(index) = set.find(home) {
@@ -633,6 +636,25 @@ mod tests {
         let cache = MetadataBlockCache::new(usize::MAX);
         assert!(!cache.enabled());
         assert_eq!(cache.capacity(), 0);
+    }
+
+    #[test]
+    fn image_allocation_failure_preserves_cold_and_resident_state() {
+        let cache = MetadataBlockCache::new(WAYS);
+        let device = TestDevice::plain();
+        for resident in [false, true] {
+            let scope = crate::test_allocator::FailureScope::new(0);
+            let failed = cache.read(&device, 7);
+            drop(scope);
+            assert_eq!(failed.result.unwrap_err().code(), ErrCode::ENOMEM);
+            assert!(!failed.notify_progress);
+            assert_eq!(device.reads.load(Ordering::SeqCst), usize::from(resident));
+
+            // A cold failure must not leave a Loading ticket, and a failed
+            // hit must preserve the existing image without another disk read.
+            assert_eq!(cache.read(&device, 7).result.unwrap().data[0], 7);
+            assert_eq!(device.reads.load(Ordering::SeqCst), 1);
+        }
     }
 
     #[test]

@@ -8,6 +8,7 @@ normal/loop_semantics
 normal/getrandom_bit_distribution
 normal/ext4_xattr
 normal/ext4_inode_identity
+normal/ext4_orphan_recovery
 normal/fat_statfs
 normal/fat_concurrent_allocation
 normal/fat_loop_durability

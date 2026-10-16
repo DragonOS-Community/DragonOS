@@ -50,6 +50,7 @@ jobs:
           normal/read_buffer_selftest
           normal/allocation_diagnostics
           normal/dma_allocator_selftest
+          normal/ext4_orphan_recovery
           EOF
 
       - name: Build DragonOS

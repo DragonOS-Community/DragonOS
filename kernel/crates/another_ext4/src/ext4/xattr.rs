@@ -1,6 +1,5 @@
 //! Extended attribute access and atomic journal-mode replacement.
 use super::Ext4;
-use crate::constants::*;
 use crate::ext4_defs::*;
 use crate::prelude::*;
 use crate::{format_error, return_error};
@@ -287,7 +286,7 @@ impl Ext4 {
             if replace || value.is_none() {
                 return Err(Ext4Error::new(ErrCode::ENODATA));
             }
-            let mut block = XattrBlock::new(Block::new(0, Box::new([0; BLOCK_SIZE])));
+            let mut block = XattrBlock::new(Block::new(0, try_filled_bytes(0)?));
             block.init();
             (block, false)
         } else {
@@ -297,7 +296,7 @@ impl Ext4 {
             if ea_inode {
                 return Err(Ext4Error::new(ErrCode::ENOTSUP));
             }
-            let block = XattrBlock::new(Block::new(old_home, Box::new(*image)));
+            let block = XattrBlock::new(Block::new(old_home, try_copy_bytes(&image)?));
             self.verify_xattr_block_checksum(old_home, &block)?;
             (block, header.refcount() > 1)
         };

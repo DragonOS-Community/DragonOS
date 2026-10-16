@@ -891,6 +891,11 @@ impl Ext4 {
             }));
         }
 
+        // Allocate the private payload before consuming any admitted lease.
+        // An allocation failure leaves the caller's reservation retryable.
+        let mut initialized = try_filled_bytes::<BLOCK_SIZE>(0)?;
+        initialized[..visible_len].copy_from_slice(request.payload);
+
         let _metadata_guard = self.lock_transactional_metadata_mutation()?;
         let _mutation_guard = self.inode_mutation_locks[self.inode_mutation_lock_index(id)].lock();
         let mut inode = self.read_inode(id)?;
@@ -1017,8 +1022,6 @@ impl Ext4 {
             }
         }
 
-        let mut initialized = [0u8; BLOCK_SIZE];
-        initialized[..visible_len].copy_from_slice(request.payload);
         if !strict_aligned {
             let tail_result = if transaction.is_batch() {
                 self.write_delalloc_append_eof_tail(&inode, on_disk_eof, request.offset)
@@ -1040,7 +1043,7 @@ impl Ext4 {
         // a recovery guarantee because the extent is still unpublished.
         if let Err(error) = self
             .block_device
-            .write_blocks(allocation.first, &initialized)
+            .write_blocks(allocation.first, &initialized[..])
         {
             let cleanup = self.abort_delalloc_append_block_transaction_many(
                 transaction,
@@ -1303,9 +1306,14 @@ impl Ext4 {
         certificates
             .try_reserve_exact(reservations.len())
             .map_err(|_| Ext4Error::new(ErrCode::ENOMEM))?;
+        let initialized_len = reservations
+            .len()
+            .checked_mul(BLOCK_SIZE)
+            .ok_or_else(|| Ext4Error::new(ErrCode::E2BIG))?;
         initialized_blocks
-            .try_reserve_exact(reservations.len())
+            .try_reserve_exact(initialized_len)
             .map_err(|_| Ext4Error::new(ErrCode::ENOMEM))?;
+        initialized_blocks.resize(initialized_len, 0);
         for (index, (reservation, publication)) in
             reservations.iter().zip(publications.iter()).enumerate()
         {
@@ -1343,9 +1351,9 @@ impl Ext4 {
                     return Err(Ext4Error::new(ErrCode::EINVAL));
                 }
             }
-            let mut initialized = [0u8; BLOCK_SIZE];
-            initialized[..publication.payload.len()].copy_from_slice(publication.payload);
-            initialized_blocks.push(initialized);
+            let block_start = index * BLOCK_SIZE;
+            initialized_blocks[block_start..block_start + publication.payload.len()]
+                .copy_from_slice(publication.payload);
             certificates.push(certificate);
         }
         let first_certificate = certificates[0];
@@ -1469,7 +1477,7 @@ impl Ext4 {
                 }
                 self.block_device.write_blocks(
                     data_allocations[run_start].first,
-                    initialized_blocks[run_start..run_end].as_flattened(),
+                    &initialized_blocks[run_start * BLOCK_SIZE..run_end * BLOCK_SIZE],
                 )?;
                 run_start = run_end;
             }
@@ -3322,7 +3330,7 @@ impl Ext4 {
         if target.len() < child.inode.inline_block().len() {
             child.inode.set_fast_symlink(target.as_bytes())?;
         } else {
-            let mut image = Box::new([0; BLOCK_SIZE]);
+            let mut image = try_filled_bytes::<BLOCK_SIZE>(0)?;
             image[..target.len()].copy_from_slice(target.as_bytes());
             let allocation =
                 self.transaction_alloc_metadata_block(&mut transaction, child.id, None)?;
@@ -3791,11 +3799,7 @@ impl Ext4 {
                     .map(|credits| self.transaction_start(credits))
                     .transpose()?;
                 let mut block = if extent.is_unwritten() {
-                    let image = Box::<[u8; BLOCK_SIZE]>::try_new_zeroed()
-                        .map_err(|_| Ext4Error::new(ErrCode::ENOMEM))?;
-                    // All bytes were zero-initialized on the heap, without a
-                    // block-sized stack image or an infallible allocation.
-                    Block::new(home, unsafe { image.assume_init() })
+                    Block::new(home, try_filled_bytes::<BLOCK_SIZE>(0)?)
                 } else {
                     self.block_device.read_block(home)?
                 };
@@ -4887,8 +4891,8 @@ mod tests {
             }
         }
 
-        fn write_block(&self, _block: &Block) -> Result<()> {
-            Ok(())
+        fn write_block(&self, block: &Block) -> Result<()> {
+            self.write_blocks(block.id, &block.data[..])
         }
 
         fn write_blocks(&self, _start: PBlockId, _data: &[u8]) -> Result<()> {
@@ -5385,6 +5389,88 @@ mod tests {
         );
         assert!(!data.active);
         assert!(!metadata.active);
+    }
+
+    #[test]
+    fn append_scratch_allocation_failure_preserves_reservation_for_retry() {
+        use crate::ext4::journal_transaction::{JournalContext, JournalTransactionCore};
+
+        let device = Arc::new(RangeInitDevice::new(64));
+        let mut fs = make_test_fs_with_device(64, device.clone());
+        let logical_blocks: Vec<PBlockId> = (32..48).collect();
+        let context = JournalContext {
+            superblock: crate::jbd2::Superblock {
+                block_size: BLOCK_SIZE as u32,
+                max_len: logical_blocks.len() as u32,
+                first: 1,
+                sequence: 1,
+                start: 0,
+                errno: 0,
+                features: crate::jbd2::Features::validate(0, 0, 0).unwrap(),
+                uuid: [0; 16],
+                checksum_type: 0,
+            },
+            journal_blocks: Arc::new(logical_blocks.iter().copied().collect()),
+            logical_blocks: logical_blocks.into(),
+            target_blocks: 64,
+            head: 1,
+            superblock_image: Box::new([0; 1024]),
+        };
+        fs.metadata_mode =
+            MetadataMutationMode::Journal(JournalTransactionCore::new(context).unwrap());
+        let mut lease = fs.test_reserve_clean_delalloc_lease_counts(1, 0).unwrap();
+        lease.bind_append_block_certificate(2, 1, 0, 0).unwrap();
+        let mut reservation = DelallocAppendBlockReservation::new(lease);
+        let identity = reservation.lease.id;
+        let certificate = reservation.lease.append_block_certificate;
+        let authority = DelallocAppendMapperAuthority {
+            mount_generation: fs.delalloc_mount_generation(),
+        };
+        let payload = [0xa5; BLOCK_SIZE];
+        // Stop after scratch preparation: no synthetic inode/journal I/O is
+        // needed to prove this new failure leaves the exact capability live.
+        let gate = fs.lock_transactional_metadata_mutation().unwrap();
+        let scope = crate::test_allocator::FailureScope::new(0);
+        let result = fs.submit_delalloc_append_block_authorized(
+            &authority,
+            &mut reservation,
+            &payload,
+            BLOCK_SIZE as u64,
+            None,
+        );
+        let attempts = scope.attempts();
+        drop(scope);
+        assert_eq!(
+            result,
+            DelallocAppendBlockSubmitOutcome::RetryableNotPublished(ErrCode::ENOMEM)
+        );
+        assert_eq!(attempts, 1);
+        assert!(reservation.lease.active);
+        assert_eq!(reservation.lease.id, identity);
+        assert_eq!(reservation.lease.append_block_certificate, certificate);
+        assert_eq!(fs.alloc_lock.lock().reserved_data_blocks, 1);
+        assert!(fs.poisoned.lock().is_none());
+        // The same reservation now passes allocation and reaches the existing
+        // retryable gate contention, rather than becoming consumed/terminal.
+        assert_eq!(
+            fs.submit_delalloc_append_block_authorized(
+                &authority,
+                &mut reservation,
+                &payload,
+                BLOCK_SIZE as u64,
+                None,
+            ),
+            DelallocAppendBlockSubmitOutcome::RetryableNotPublished(ErrCode::EAGAIN)
+        );
+        assert!(reservation.lease.active);
+        assert_eq!(reservation.lease.id, identity);
+        assert_eq!(device.writes.load(Ordering::SeqCst), 0);
+        assert_eq!(device.flushes.load(Ordering::SeqCst), 0);
+        drop(gate);
+        fs.test_release_clean_delalloc_lease(&mut reservation.lease, || {})
+            .unwrap();
+        assert!(!reservation.lease.active);
+        assert_eq!(fs.alloc_lock.lock().reserved_data_blocks, 0);
     }
 
     #[test]

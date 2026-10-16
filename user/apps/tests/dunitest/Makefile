@@ -20,6 +20,8 @@ RESULTS_DIR = results
 BIN_DIR = bin
 BUILD_DIR = build
 EXT4_FIXTURE = $(BUILD_DIR)/fixtures/ext4_inode_identity.img
+EXT4_ORPHAN_FIXTURE = $(BUILD_DIR)/fixtures/ext4_orphan_recovery.img
+EXT4_HOST_TEST_DIR = ../../../../kernel/crates/another_ext4/ext4_test
 EXT4_UNINIT_FIXTURE = $(BUILD_DIR)/fixtures/ext4_uninit_bitmap.img
 FAT_STAT_FIXTURE = $(BUILD_DIR)/fixtures/fat_stat_blocks.img
 FAT32_STAT_FIXTURE = $(BUILD_DIR)/fixtures/fat32_stat_blocks.img
@@ -64,7 +66,7 @@ $(GTEST_SRC):
 	@mv "$(GTEST_TMP_ROOT)" "$(GTEST_ROOT)"
 	@test -f "$(GTEST_SRC)"
 
-build-suites: $(TEST_BINS) $(EXT4_FIXTURE) $(EXT4_UNINIT_FIXTURE) $(FAT_STAT_FIXTURE) $(FAT32_STAT_FIXTURE) $(FAT12_DIRECTORY_FIXTURE) $(FAT12_NEAR_LIMIT_FIXTURE) $(FAT16_DIRECTORY_FIXTURE)
+build-suites: $(TEST_BINS) $(EXT4_ORPHAN_FIXTURE) $(EXT4_FIXTURE) $(EXT4_UNINIT_FIXTURE) $(FAT_STAT_FIXTURE) $(FAT32_STAT_FIXTURE) $(FAT12_DIRECTORY_FIXTURE) $(FAT12_NEAR_LIMIT_FIXTURE) $(FAT16_DIRECTORY_FIXTURE)
 
 # 4108 sectors, 1 reserved, 2x12 FAT sectors, 2 root sectors: 4081 data
 # clusters. Highest index 4082 (0xff2) is a legal FAT12 link destination.
@@ -111,6 +113,21 @@ $(EXT4_FIXTURE):
 		esac; \
 	}
 
+# Use production journaled unlink, retaining the orphan lifetime across a crash.
+# another_ext4 supports 4 KiB blocks; do not inherit mke2fs host defaults.
+.DELETE_ON_ERROR: $(EXT4_ORPHAN_FIXTURE)
+$(EXT4_ORPHAN_FIXTURE): $(EXT4_HOST_TEST_DIR)/src/bin/orphan_recovery_fixture.rs $(EXT4_HOST_TEST_DIR)/src/block_file.rs $(EXT4_HOST_TEST_DIR)/Cargo.toml $(EXT4_HOST_TEST_DIR)/Cargo.lock $(EXT4_HOST_TEST_DIR)/../Cargo.toml $(wildcard $(EXT4_HOST_TEST_DIR)/../src/*.rs $(EXT4_HOST_TEST_DIR)/../src/*/*.rs $(EXT4_HOST_TEST_DIR)/../src/*/*/*.rs)
+	@mkdir -p "$(dir $@)"
+	@truncate -s 8M "$@"
+	@output=$$(mke2fs -q -t ext4 -F -b 4096 -I 256 -O ^orphan_file "$@" 2>&1) || { \
+		case "$$output" in \
+			*"Invalid filesystem option set: ^orphan_file"*) \
+				mke2fs -q -t ext4 -F -b 4096 -I 256 "$@" ;; \
+			*) printf '%s\n' "$$output" >&2; exit 1 ;; \
+		esac; \
+	}
+	@cargo $(TOOLCHAIN) run --quiet --release --manifest-path $(EXT4_HOST_TEST_DIR)/Cargo.toml --bin orphan_recovery_fixture -- --in-place "$@"
+
 # Small block groups force a modest payload into legal BLOCK_UNINIT groups.
 # Keep lazy bitmap initialization enabled; never pre-mount this source image.
 $(EXT4_UNINIT_FIXTURE):
@@ -136,7 +153,7 @@ $(BIN_DIR)/%_test: suites/%.cc $(GTEST_OBJ)
 	@echo "编译测例: $< -> $@"
 	@$(CXX) $(CXXFLAGS) $(GTEST_INCLUDES) "$<" $(GTEST_OBJ) -o "$@"
 
-$(BIN_DIR)/normal/xattr_syscall_test $(BIN_DIR)/normal/ext4_inode_identity_test $(BIN_DIR)/normal/utimensat_symlink_test $(BIN_DIR)/normal/mount_idmap_test $(BIN_DIR)/normal/mount_filecaps_test $(BIN_DIR)/normal/ext4_fallocate_test $(BIN_DIR)/normal/stat_blocks_test $(BIN_DIR)/normal/fat_directory_entries_test $(BIN_DIR)/normal/loop_memory_io_test: suites/normal/loop_ext4_test_support.h
+$(BIN_DIR)/normal/ext4_orphan_recovery_test $(BIN_DIR)/normal/xattr_syscall_test $(BIN_DIR)/normal/ext4_inode_identity_test $(BIN_DIR)/normal/utimensat_symlink_test $(BIN_DIR)/normal/mount_idmap_test $(BIN_DIR)/normal/mount_filecaps_test $(BIN_DIR)/normal/ext4_fallocate_test $(BIN_DIR)/normal/stat_blocks_test $(BIN_DIR)/normal/fat_directory_entries_test $(BIN_DIR)/normal/loop_memory_io_test: suites/normal/loop_ext4_test_support.h
 
 $(BIN_DIR)/normal/mount_propagation_test $(BIN_DIR)/normal/test_pivot_root_test: suites/normal/user_namespace_test_support.h
 
@@ -165,7 +182,7 @@ install: build
 	@chmod +x $(INSTALL_DIR)/dunitest-runner
 	@cp -rf $(BIN_DIR) $(INSTALL_DIR)/
 	@mkdir -p $(INSTALL_DIR)/fixtures
-	@cp --sparse=always -f $(EXT4_FIXTURE) $(EXT4_UNINIT_FIXTURE) $(FAT_STAT_FIXTURE) $(FAT32_STAT_FIXTURE) $(FAT12_DIRECTORY_FIXTURE) $(FAT12_NEAR_LIMIT_FIXTURE) $(FAT16_DIRECTORY_FIXTURE) $(INSTALL_DIR)/fixtures/
+	@cp --sparse=always -f $(EXT4_ORPHAN_FIXTURE) $(EXT4_FIXTURE) $(EXT4_UNINIT_FIXTURE) $(FAT_STAT_FIXTURE) $(FAT32_STAT_FIXTURE) $(FAT12_DIRECTORY_FIXTURE) $(FAT12_NEAR_LIMIT_FIXTURE) $(FAT16_DIRECTORY_FIXTURE) $(INSTALL_DIR)/fixtures/
 	@cp -f whitelist.txt $(INSTALL_DIR)/whitelist.txt
 	@cp -f no_skip.txt $(INSTALL_DIR)/no_skip.txt
 	@cp -f scripts/run_tests.sh $(INSTALL_DIR)/run_tests.sh

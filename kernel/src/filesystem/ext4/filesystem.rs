@@ -527,24 +527,12 @@ impl Ext4FileSystem {
         self.retry_metadata_operation(operation, true)
     }
 
-    /// Sample after releasing the previous preference: its Drop itself wakes
-    /// readers. Waiting on the earlier token would otherwise self-wake a busy
-    /// retry loop while an unrelated reader is still doing I/O.
+    /// Writer retries distinguish live blocking owners from the failed
+    /// attempt's own release notifications in the lower metadata domain.
     pub(super) fn prepare_metadata_writer_wait(
         &self,
-        observed: u64,
-    ) -> core::result::Result<
-        (u64, Option<another_ext4::MetadataWriterWait<'_>>),
-        another_ext4::Ext4Error,
-    > {
-        let after_release = self.fs.metadata_mutation_generation();
-        let intent = self.fs.begin_metadata_writer_wait()?;
-        let observed = if intent.is_some() {
-            after_release
-        } else {
-            observed
-        };
-        Ok((observed, intent))
+    ) -> core::result::Result<another_ext4::MetadataWriterRetry<'_>, another_ext4::Ext4Error> {
+        self.fs.prepare_metadata_writer_retry()
     }
 
     pub(super) fn retry_metadata_read_contention<T>(
@@ -570,9 +558,13 @@ impl Ext4FileSystem {
                 Ok(value) => return Ok(value),
                 Err(error) if error.code() == another_ext4::ErrCode::EAGAIN => {
                     let observed = if writer {
-                        let (observed, intent) = self.prepare_metadata_writer_wait(observed)?;
-                        writer_wait = intent;
-                        observed
+                        match self.prepare_metadata_writer_wait()? {
+                            another_ext4::MetadataWriterRetry::Retry => continue,
+                            another_ext4::MetadataWriterRetry::Wait { observed, intent } => {
+                                writer_wait = intent;
+                                observed
+                            }
+                        }
                     } else {
                         observed
                     };

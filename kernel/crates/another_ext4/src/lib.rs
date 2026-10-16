@@ -23,7 +23,7 @@ pub use ext4::{
     BatchProgress, DelallocAppendBlockPublication, DelallocAppendBlockReservation,
     DelallocAppendBlockSubmitOutcome, DelallocAppendMapperAuthority, DelallocExtentNodePool,
     DelallocLease, ExistingBlockImageOutcome, Ext4, InodeOwner, MetadataMutationWaker,
-    MetadataWriterWait, PreallocationProgress, ReadPlan, ReadSegment, SetAttr,
+    MetadataWriterRetry, MetadataWriterWait, PreallocationProgress, ReadPlan, ReadSegment, SetAttr,
 };
 // The bounded append mapper implementation is compiled in normal builds, but
 // its raw facade remains test-only until the DragonOS VFS can supply the

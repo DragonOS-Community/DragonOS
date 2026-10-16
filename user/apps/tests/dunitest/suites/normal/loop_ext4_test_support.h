@@ -98,10 +98,12 @@ class LoopExt4 {
     }
 
     void SetUp(const char* fixture = "ext4_inode_identity.img",
-               const char* backing_directory = "/tmp") {
-        image_ = std::string(backing_directory) + "/ext4_inode_identity_"
+               const char* backing_directory = "/tmp",
+               const char* instance_name = "ext4_inode_identity") {
+        instance_name_ = instance_name;
+        image_ = std::string(backing_directory) + "/" + instance_name_ + "_"
             + std::to_string(getpid()) + ".img";
-        mount_point_ = "/tmp/ext4_inode_identity_" + std::to_string(getpid()) + "_mnt";
+        mount_point_ = "/tmp/" + instance_name_ + "_" + std::to_string(getpid()) + "_mnt";
 
         ASSERT_EQ(0, mkdir(mount_point_.c_str(), 0700)) << strerror(errno);
 
@@ -158,7 +160,7 @@ class LoopExt4 {
     void MountSecond(const char* options = nullptr) {
         ASSERT_TRUE(mounted_ || detached_);
         ASSERT_FALSE(second_mounted_);
-        second_mount_point_ = "/tmp/ext4_inode_identity_" + std::to_string(getpid())
+        second_mount_point_ = "/tmp/" + instance_name_ + "_" + std::to_string(getpid())
             + "_second_mnt";
         ASSERT_EQ(0, mkdir(second_mount_point_.c_str(), 0700)) << strerror(errno);
         ASSERT_EQ(0, mount(loop_path_.c_str(), second_mount_point_.c_str(), "ext4", 0, options))
@@ -225,6 +227,7 @@ class LoopExt4 {
     }
 
   private:
+    std::string instance_name_;
     std::string image_;
     std::string mount_point_;
     std::string second_mount_point_;

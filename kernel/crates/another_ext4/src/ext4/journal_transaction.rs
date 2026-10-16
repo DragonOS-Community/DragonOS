@@ -178,6 +178,10 @@ impl DirectTransactionCore {
         })
     }
 
+    pub(super) fn retry_is_blocked(&self) -> bool {
+        self.writer.load(Ordering::Acquire)
+    }
+
     pub fn is_poisoned(&self) -> bool {
         self.poison.load(Ordering::Acquire) != CLEAN
     }
@@ -233,6 +237,10 @@ impl JournalTransactionCore {
             poison: AtomicU8::new(CLEAN),
             context: spin::Mutex::new(context),
         })
+    }
+
+    pub(super) fn retry_is_blocked(&self) -> bool {
+        self.writer.load(Ordering::Acquire)
     }
 
     pub fn is_poisoned(&self) -> bool {
@@ -1324,7 +1332,7 @@ fn write_contiguous_blocks<'a>(
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use core::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1802,7 +1810,7 @@ mod tests {
         );
     }
 
-    fn context() -> JournalContext {
+    pub(crate) fn context() -> JournalContext {
         context_with_ring(8, 7)
     }
 

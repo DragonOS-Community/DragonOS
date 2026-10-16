@@ -68,6 +68,7 @@ fn boundaries() -> bool {
         let Ok(mut buffer) = KernelBuffer::allocate_in(
             len,
             prepared.object_account(),
+            true,
             false,
             &mut VmAllocation::try_new_zeroed_in,
         ) else {
@@ -116,7 +117,7 @@ fn failure_policy() -> bool {
     let owner = prepared.object_account();
     for len in [1, 2048, MMArch::PAGE_SIZE] {
         let mut calls = 0;
-        let result = KernelBuffer::allocate_in(len, owner, true, &mut |_, _| {
+        let result = KernelBuffer::allocate_in(len, owner, true, true, &mut |_, _| {
             calls += 1;
             Err(SystemError::ENOMEM.into())
         });
@@ -134,6 +135,7 @@ fn failure_policy() -> bool {
         MMArch::PAGE_SIZE + 1,
         owner,
         true,
+        true,
         &mut |layout, selected| {
             calls += 1;
             // Failed heap admission must already be fully returned.
@@ -150,9 +152,10 @@ fn failure_policy() -> bool {
     if !fallback || calls != 1 || !storage_released(&account) {
         return false;
     }
-    let result = KernelBuffer::allocate_in(MMArch::PAGE_SIZE + 1, owner, true, &mut |_, _| {
-        Err(SystemError::ENOMEM.into())
-    });
+    let result =
+        KernelBuffer::allocate_in(MMArch::PAGE_SIZE + 1, owner, true, true, &mut |_, _| {
+            Err(SystemError::ENOMEM.into())
+        });
     let failed = matches!(
         &result,
         Err(MemoryAllocationError::System(SystemError::ENOMEM))
@@ -180,7 +183,7 @@ fn failure_policy() -> bool {
     });
     for len in [1, MMArch::PAGE_SIZE + 1] {
         let mut calls = 0;
-        let result = KernelBuffer::allocate_in(len, owner, true, &mut |_, _| {
+        let result = KernelBuffer::allocate_in(len, owner, true, true, &mut |_, _| {
             calls += 1;
             Err(SystemError::EIO.into())
         });
@@ -191,6 +194,70 @@ fn failure_policy() -> bool {
         }
     }
     true
+}
+
+// A local capability input exercises the production selection policy without
+// changing global NX state or weakening VmAllocation's mapping contract.
+fn unsupported_virtual() -> bool {
+    let Ok(root) = MemoryAccount::new(u64::MAX - 17, None) else {
+        return false;
+    };
+    let Ok(account) = MemoryAccount::new(u64::MAX - 18, Some(root)) else {
+        return false;
+    };
+    let Ok(prepared) = ObjectAccount::prepare(&account) else {
+        return false;
+    };
+    let owner = prepared.object_account();
+    let mut calls = 0;
+    let mut unexpected = |_: Layout, _: &Arc<ObjectAccount>| {
+        calls += 1;
+        Err(SystemError::EIO.into())
+    };
+    for len in [1, MMArch::PAGE_SIZE + 1, 2 * MMArch::PAGE_SIZE + 1, 65537] {
+        let Ok(mut buffer) = KernelBuffer::allocate_in(len, owner, false, false, &mut unexpected)
+        else {
+            return false;
+        };
+        let snapshot = account.snapshot();
+        let expected = allocation_footprint(Layout::array::<u8>(len).unwrap());
+        let kind = if len > 2048 {
+            KernelByteKind::KernelOther
+        } else {
+            KernelByteKind::SlabUnreclaimable
+        };
+        let good = matches!(&buffer.backend, Backend::Heap { .. })
+            && snapshot.kernel_bytes[kind as usize] == expected
+            && snapshot.kernel_bytes.iter().sum::<u64>() == expected
+            && exercise(&mut buffer, len);
+        drop(buffer);
+        if !good || !empty(&account) {
+            return false;
+        }
+        let result = KernelBuffer::allocate_in(len, owner, false, true, &mut unexpected);
+        if !matches!(
+            result,
+            Err(MemoryAllocationError::System(SystemError::ENOMEM))
+        ) || !empty(&account)
+        {
+            return false;
+        }
+    }
+    // Even a valid Layout too large for buddy must fail without leaking charge.
+    let result = KernelBuffer::allocate_in(1usize << 32, owner, false, false, &mut unexpected);
+    if !matches!(
+        result,
+        Err(MemoryAllocationError::System(SystemError::ENOMEM))
+    ) || !empty(&account)
+    {
+        return false;
+    }
+    account.set_policy(MemoryPolicy {
+        max: Some(0),
+        ..MemoryPolicy::default()
+    });
+    let result = KernelBuffer::allocate_in(65537, owner, false, false, &mut unexpected);
+    matches!(result, Err(MemoryAllocationError::Charge(_))) && empty(&account) && calls == 0
 }
 
 fn invalid_context_and_size() -> bool {
@@ -208,7 +275,7 @@ fn invalid_context_and_size() -> bool {
     };
     let result = {
         let _guard = PreemptGuard::new();
-        KernelBuffer::allocate_in(0, owner, false, &mut unexpected)
+        KernelBuffer::allocate_in(0, owner, true, false, &mut unexpected)
     };
     let rejected = matches!(
         &result,
@@ -220,7 +287,7 @@ fn invalid_context_and_size() -> bool {
     if !rejected {
         return false;
     }
-    let result = KernelBuffer::allocate_in(usize::MAX, owner, false, &mut unexpected);
+    let result = KernelBuffer::allocate_in(usize::MAX, owner, true, false, &mut unexpected);
     let invalid = matches!(
         result,
         Err(MemoryAllocationError::System(SystemError::ENOMEM))
@@ -228,6 +295,7 @@ fn invalid_context_and_size() -> bool {
     let too_large = KernelBuffer::allocate_in(
         isize::MAX as usize,
         owner,
+        true,
         false,
         &mut VmAllocation::try_new_zeroed_in,
     );
@@ -254,6 +322,7 @@ fn fragmented_arena() -> bool {
         let result = KernelBuffer::allocate_in(
             len,
             prepared.object_account(),
+            true,
             false,
             &mut |layout, owner| {
                 VmAllocation::try_new_zeroed_in_with(layout, owner, &mut || {
@@ -279,6 +348,7 @@ pub(crate) fn report() -> String {
     let cases = [
         ("strategy_zero_data_accounting", boundaries()),
         ("failure_fallback_admission", failure_policy()),
+        ("unsupported_virtual_heap", unsupported_virtual()),
         ("context_size_rejection", invalid_context_and_size()),
         ("fragmented_arena_buffer", fragmented_arena()),
     ];

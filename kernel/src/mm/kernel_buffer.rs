@@ -58,6 +58,7 @@ impl KernelBuffer {
         Self::allocate_in(
             len,
             &owner,
+            VmAllocation::is_supported(),
             #[cfg(feature = "mm_selftest")]
             false,
             #[cfg(feature = "mm_selftest")]
@@ -68,6 +69,7 @@ impl KernelBuffer {
     fn allocate_in(
         len: usize,
         owner: &Arc<ObjectAccount>,
+        virtual_supported: bool,
         #[cfg(feature = "mm_selftest")] fail_heap: bool,
         #[cfg(feature = "mm_selftest")] virtual_allocate: &mut VirtualAllocate<'_>,
     ) -> Result<Self, MemoryAllocationError> {
@@ -80,9 +82,10 @@ impl KernelBuffer {
             });
         }
         let layout = Layout::array::<u8>(len).map_err(|_| SystemError::ENOMEM)?;
-        // At most order-1. Larger requests bypass high-order pressure and
-        // power-of-two rounding waste entirely, without a speculative attempt.
-        if len <= 2 * MMArch::PAGE_SIZE {
+        // When virtual mappings are supported, requests above order-1 bypass
+        // high-order pressure and rounding waste. Otherwise retain the heap
+        // backend for all sizes, with the same admission and no-retry policy.
+        if len <= 2 * MMArch::PAGE_SIZE || !virtual_supported {
             let charge = owner.try_charge_allocation(KernelByteKind::SlabUnreclaimable, layout)?;
             #[cfg(feature = "mm_selftest")]
             let pointer = if fail_heap {
@@ -104,7 +107,7 @@ impl KernelBuffer {
             // Never have both backends charged at once. A charge rejection
             // above is propagated, not converted into a fallback opportunity.
             drop(charge);
-            if len <= MMArch::PAGE_SIZE {
+            if len <= MMArch::PAGE_SIZE || !virtual_supported {
                 return Err(SystemError::ENOMEM.into());
             }
         }

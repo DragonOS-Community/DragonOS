@@ -105,7 +105,7 @@ impl Ext4 {
         let mut transaction =
             self.transaction_start(self.range_transaction_credits(&inode, false)?)?;
         let home = MetadataIo::transaction(self, &mut transaction)
-            .allocate_initialized_data(&mut inode, Box::new([0; BLOCK_SIZE]))?;
+            .allocate_initialized_data(&mut inode, try_filled_bytes(0)?)?;
         // Ext4 permits KEEP allocations beyond i_size as unwritten mappings.
         // Initialized mappings beyond EOF make e2fsck demand an enlarged size.
         let mut extent = Extent::new(logical, home, 1);
@@ -231,7 +231,7 @@ impl Ext4 {
             .checked_add(u64::from(logical - extent.start_lblock()))
             .ok_or_else(|| Ext4Error::new(ErrCode::EIO))?;
         self.block_device
-            .write_block(&Block::new(home, Box::new(*image)))?;
+            .write_block(&Block::new(home, try_copy_bytes(image)?))?;
         // An error cannot undo payload bytes. The caller must not publish SIZE
         // on error; no metadata/bitmap publication occurred in this operation.
         self.block_device.flush()?;

@@ -1216,7 +1216,7 @@ impl Ext4 {
         self.ensure_valid_pblock(inode_ref.id, pblock, "extent tree node")?;
         self.validate_data_blocks(pblock, 1)?;
         let block = match transaction {
-            Some(tx) => Block::new(pblock, Box::new(*tx.read(self, pblock)?)),
+            Some(tx) => Block::new(pblock, try_copy_bytes(&*tx.read(self, pblock)?)?),
             None => self.read_block(pblock)?,
         };
         self.prepare_stats.record_extent_io();
@@ -1838,7 +1838,7 @@ impl Ext4 {
             }
         }
         let home = super::rw::MetadataIo::transaction(self, transaction)
-            .allocate_initialized_data(inode_ref, Box::new([0; BLOCK_SIZE]))?;
+            .allocate_initialized_data(inode_ref, try_filled_bytes(0)?)?;
         let mut extent = Extent::new(iblock, home, 1);
         extent.mark_unwritten();
         self.transaction_insert_allocated_extent(transaction, inode_ref, &extent)?;
@@ -1903,7 +1903,7 @@ impl Ext4 {
                 let fblock = if let Some(image) = initial_image {
                     metadata.allocate_initialized_data(inode_ref, image)?
                 } else {
-                    metadata.allocate_initialized_data(inode_ref, Box::new([0; BLOCK_SIZE]))?
+                    metadata.allocate_initialized_data(inode_ref, try_filled_bytes(0)?)?
                 };
                 let new_ext = Extent::new(iblock, fblock, block_count as u16);
 

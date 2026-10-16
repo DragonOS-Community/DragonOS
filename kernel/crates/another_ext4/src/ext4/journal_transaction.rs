@@ -865,23 +865,24 @@ impl JournalTransactionCore {
             );
         }
 
-        // Copy the small allocation state, then release the spin guard before I/O.
-        let (sb, mapping, journal_blocks, target_blocks, head, sb_image) = {
+        // Allocate before locking, then copy directly into the heap image.
+        // Taking the array by value would retain a 1 KiB stack temporary.
+        let mut sb_image = try_filled_bytes::<1024>(0).map_err(|error| CommitError {
+            error,
+            failure: CommitFailure::BeforeCommit,
+            poisoned: false,
+        })?;
+        let (sb, mapping, journal_blocks, target_blocks, head) = {
             let context = core.context.lock();
+            sb_image.copy_from_slice(&context.superblock_image[..]);
             (
                 context.superblock,
                 Arc::clone(&context.logical_blocks),
                 Arc::clone(&context.journal_blocks),
                 context.target_blocks,
                 context.head,
-                *context.superblock_image,
             )
         };
-        let sb_image = Box::try_new(sb_image).map_err(|_| CommitError {
-            error: Ext4Error::new(ErrCode::ENOMEM),
-            failure: CommitFailure::BeforeCommit,
-            poisoned: false,
-        })?;
         let needed =
             required_log_blocks(images.len(), sb.features).map_err(|error| CommitError {
                 error,
@@ -932,8 +933,8 @@ impl JournalTransactionCore {
             failure: CommitFailure::BeforeCommit,
             poisoned: false,
         })?;
-        let mut active_sb_image = Box::try_new(*sb_image).map_err(|_| CommitError {
-            error: Ext4Error::new(ErrCode::ENOMEM),
+        let mut active_sb_image = try_copy_bytes(&sb_image).map_err(|error| CommitError {
+            error,
             failure: CommitFailure::BeforeCommit,
             poisoned: false,
         })?;
@@ -977,11 +978,12 @@ impl JournalTransactionCore {
         // Preserve bytes outside the 1024-byte superblock once, before the
         // first write. Neither active nor clean tail updates may allocate a
         // block by calling read_block after the journal becomes active.
-        let mut active_sb_block = Box::try_new([0; BLOCK_SIZE]).map_err(|_| CommitError {
-            error: Ext4Error::new(ErrCode::ENOMEM),
-            failure: CommitFailure::BeforeCommit,
-            poisoned: false,
-        })?;
+        let mut active_sb_block =
+            try_filled_bytes::<BLOCK_SIZE>(0).map_err(|error| CommitError {
+                error,
+                failure: CommitFailure::BeforeCommit,
+                poisoned: false,
+            })?;
         device
             .read_blocks(mapping[0], &mut active_sb_block[..])
             .map_err(|error| CommitError {
@@ -989,8 +991,8 @@ impl JournalTransactionCore {
                 failure: CommitFailure::BeforeCommit,
                 poisoned: false,
             })?;
-        let mut clean_sb_block = Box::try_new(*active_sb_block).map_err(|_| CommitError {
-            error: Ext4Error::new(ErrCode::ENOMEM),
+        let mut clean_sb_block = try_copy_bytes(&active_sb_block).map_err(|error| CommitError {
+            error,
             failure: CommitFailure::BeforeCommit,
             poisoned: false,
         })?;
@@ -1183,8 +1185,7 @@ fn encode_log_images<'a>(
         .try_reserve_exact(required_log_blocks(all.len(), sb.features)? - 1)
         .map_err(|_| Ext4Error::new(ErrCode::ENOMEM))?;
     for group in all.chunks(per_descriptor) {
-        let mut descriptor =
-            Box::try_new([0; BLOCK_SIZE]).map_err(|_| Ext4Error::new(ErrCode::ENOMEM))?;
+        let mut descriptor = try_filled_bytes::<BLOCK_SIZE>(0)?;
         Header {
             block_type: BlockType::Descriptor,
             sequence,
@@ -1204,8 +1205,7 @@ fn encode_log_images<'a>(
                     .map_err(|_| Ext4Error::new(ErrCode::EIO))?,
             ) == MAGIC
             {
-                let mut escaped =
-                    Box::try_new(*staged.bytes()).map_err(|_| Ext4Error::new(ErrCode::ENOMEM))?;
+                let mut escaped = try_copy_bytes(staged.bytes())?;
                 escaped[..4].fill(0);
                 image = EncodedBlock::Owned(escaped);
                 flags |= FLAG_ESCAPE;
@@ -1252,7 +1252,7 @@ fn encode_log_images<'a>(
 }
 
 fn encode_commit(sb: &Superblock, sequence: u32) -> Result<Box<[u8; BLOCK_SIZE]>> {
-    let mut block = Box::try_new([0; BLOCK_SIZE]).map_err(|_| Ext4Error::new(ErrCode::ENOMEM))?;
+    let mut block = try_filled_bytes::<BLOCK_SIZE>(0)?;
     Header {
         block_type: BlockType::Commit,
         sequence,
@@ -1282,7 +1282,7 @@ fn update_superblock(
 }
 
 fn write_bytes(device: &dyn BlockDevice, id: PBlockId, bytes: &[u8; BLOCK_SIZE]) -> Result<()> {
-    let image = Box::try_new(*bytes).map_err(|_| Ext4Error::new(ErrCode::ENOMEM))?;
+    let image = try_copy_bytes(bytes)?;
     device.write_block(&Block::new(id, image))
 }
 

@@ -23,6 +23,32 @@ where
     }
 }
 
+/// Allocate and initialize the destination directly, without a by-value array
+/// temporary on the caller's (potentially small kernel) stack.
+pub(crate) fn try_filled_bytes<const N: usize>(value: u8) -> Result<Box<[u8; N]>> {
+    let mut image =
+        Box::<[u8; N]>::try_new_uninit().map_err(|_| Ext4Error::new(ErrCode::ENOMEM))?;
+    // SAFETY: the allocation owns N writable bytes. Every byte is initialized
+    // before the box is exposed, and every bit pattern is valid for u8.
+    unsafe {
+        image.as_mut_ptr().cast::<u8>().write_bytes(value, N);
+        Ok(image.assume_init())
+    }
+}
+
+/// Copy a complete image into its final allocation, without copying the array
+/// by value through the stack.
+pub(crate) fn try_copy_bytes<const N: usize>(source: &[u8; N]) -> Result<Box<[u8; N]>> {
+    let mut image =
+        Box::<[u8; N]>::try_new_uninit().map_err(|_| Ext4Error::new(ErrCode::ENOMEM))?;
+    // SAFETY: source contains N initialized bytes. The new allocation is disjoint
+    // from source and is fully initialized by the copy.
+    unsafe {
+        core::ptr::copy_nonoverlapping(source.as_ptr(), image.as_mut_ptr().cast::<u8>(), N);
+        Ok(image.assume_init())
+    }
+}
+
 /// Common data block descriptor.
 #[derive(Debug, Clone)]
 pub struct Block {
@@ -36,12 +62,19 @@ impl Default for Block {
     fn default() -> Self {
         Self {
             id: 0,
-            data: Box::new([0; BLOCK_SIZE]),
+            data: Self::try_zeroed_data().unwrap_or_else(|_| {
+                handle_alloc_error(core::alloc::Layout::new::<[u8; BLOCK_SIZE]>())
+            }),
         }
     }
 }
 
 impl Block {
+    /// Allocate a zeroed filesystem block directly on the heap.
+    pub fn try_zeroed_data() -> Result<Box<[u8; BLOCK_SIZE]>> {
+        try_filled_bytes(0)
+    }
+
     /// Create new block with given physical block id and data.
     pub fn new(block_id: PBlockId, data: Box<[u8; BLOCK_SIZE]>) -> Self {
         Self { id: block_id, data }
@@ -105,8 +138,7 @@ pub trait BlockDevice: Send + Sync + Any {
             let block_id = start
                 .checked_add(index as PBlockId)
                 .ok_or_else(|| Ext4Error::new(ErrCode::EFBIG))?;
-            let mut image =
-                Box::try_new([0; BLOCK_SIZE]).map_err(|_| Ext4Error::new(ErrCode::ENOMEM))?;
+            let mut image = Block::try_zeroed_data()?;
             image.copy_from_slice(chunk);
             self.write_block(&Block::new(block_id, image))?;
         }
@@ -125,6 +157,32 @@ pub trait BlockDevice: Send + Sync + Any {
 mod block_device_tests {
     use super::*;
     use core::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn heap_images_are_fully_initialized_and_independent() {
+        let zero = Block::try_zeroed_data().unwrap();
+        assert!(zero.iter().all(|byte| *byte == 0));
+        let mut source = try_filled_bytes::<1024>(0xa5).unwrap();
+        let copy = try_copy_bytes(&source).unwrap();
+        source[0] = 7;
+        assert!(copy.iter().all(|byte| *byte == 0xa5));
+        let filled = try_filled_bytes::<BLOCK_SIZE>(0xff).unwrap();
+        assert!(filled.iter().all(|byte| *byte == 0xff));
+    }
+
+    #[test]
+    fn heap_image_allocation_failure_preserves_source() {
+        let source = try_filled_bytes::<BLOCK_SIZE>(0x5a).unwrap();
+        let scope = crate::test_allocator::FailureScope::new(0);
+        let filled = try_filled_bytes::<BLOCK_SIZE>(0);
+        let copied = try_copy_bytes(&source);
+        let attempts = scope.attempts();
+        drop(scope);
+        assert_eq!(attempts, 2);
+        assert_eq!(filled.unwrap_err().code(), ErrCode::ENOMEM);
+        assert_eq!(copied.unwrap_err().code(), ErrCode::ENOMEM);
+        assert!(source.iter().all(|byte| *byte == 0x5a));
+    }
 
     struct FlushDevice {
         reliable: bool,

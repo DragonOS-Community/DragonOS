@@ -384,8 +384,7 @@ impl Ext4 {
             unique_push(&mut claims, *home);
         }
         for home in &trace.touched_tree_homes {
-            let image = Box::try_new(*transaction.read(self, *home)?)
-                .map_err(|_| Ext4Error::new(ErrCode::ENOMEM))?;
+            let image = try_copy_bytes(&*transaction.read(self, *home)?)?;
             nodes.push(NodeImage {
                 old: *home,
                 home: *home,
@@ -426,8 +425,7 @@ impl Ext4 {
             .and_then(|blocks| blocks.checked_sub(removed_count))
             .ok_or_else(|| Ext4Error::new(ErrCode::EIO))?;
         inode.inode.set_fs_block_count(blocks);
-        let zero_image =
-            Box::try_new([0; BLOCK_SIZE]).map_err(|_| Ext4Error::new(ErrCode::ENOMEM))?;
+        let zero_image = try_filled_bytes(0)?;
         Ok(Prepared {
             inode,
             nodes,

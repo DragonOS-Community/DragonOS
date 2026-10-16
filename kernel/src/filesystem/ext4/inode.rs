@@ -3794,8 +3794,7 @@ impl LockedExt4Inode {
     ) -> Result<(), SystemError> {
         let mut offset = range.start;
         let end = range.end;
-        let mut image =
-            Box::try_new([0u8; another_ext4::BLOCK_SIZE]).map_err(|_| SystemError::ENOMEM)?;
+        let mut image = another_ext4::Block::try_zeroed_data()?;
         while offset < end {
             // MM locks and entry waits never nest inside size/io/mapping gates.
             let tail = (grow && size < end && !size.is_multiple_of(MMArch::PAGE_SIZE))
@@ -3876,8 +3875,7 @@ impl LockedExt4Inode {
         let full_end = end >> MMArch::PAGE_SHIFT;
         let first_block = u32::try_from(full_first).map_err(|_| SystemError::EFBIG)?;
         let end_block = u32::try_from(full_end).map_err(|_| SystemError::EFBIG)?;
-        let mut image =
-            Box::try_new([0u8; another_ext4::BLOCK_SIZE]).map_err(|_| SystemError::ENOMEM)?;
+        let mut image = another_ext4::Block::try_zeroed_data()?;
         loop {
             cache.unmap_mapping_pages(first, Some(limit))?;
             let invalidate = cache.invalidate_write();
@@ -4815,9 +4813,7 @@ impl LockedExt4Inode {
         };
         let first_full = len.div_ceil(MMArch::PAGE_SIZE);
         // Allocate the sole scratch image before any SIZE publication.
-        let image = Box::<[u8; another_ext4::BLOCK_SIZE]>::try_new_zeroed()
-            .map_err(|_| SystemError::ENOMEM)?;
-        let mut image = unsafe { image.assume_init() };
+        let mut image = another_ext4::Block::try_zeroed_data()?;
         let previous_size = || -> Result<u64, SystemError> {
             let cached = self.inner.lock().cached_file_size;
             match cached {

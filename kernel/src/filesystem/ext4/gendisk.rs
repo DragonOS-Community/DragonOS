@@ -1,4 +1,3 @@
-use alloc::boxed::Box;
 use alloc::sync::Arc;
 use kdepends::another_ext4;
 use system_error::SystemError;
@@ -116,8 +115,7 @@ impl another_ext4::BlockDevice for GenDisk {
         &self,
         block_id: u64,
     ) -> core::result::Result<another_ext4::Block, another_ext4::Ext4Error> {
-        let mut buf = Box::try_new([0u8; another_ext4::BLOCK_SIZE])
-            .map_err(|_| another_ext4::Ext4Error::new(another_ext4::ErrCode::ENOMEM))?;
+        let mut buf = another_ext4::Block::try_zeroed_data()?;
 
         let (_, lba_id_start, block_count) = self.convert_from_ext4_blkid(block_id);
         let completed = self

@@ -2408,7 +2408,7 @@ impl<Arch: MemoryManagementArch> PageEntry<Arch> {
         }
     }
     #[inline(always)]
-    pub fn from_usize(data: usize) -> Self {
+    pub const fn from_usize(data: usize) -> Self {
         Self {
             data,
             phantom: PhantomData,
@@ -2454,7 +2454,7 @@ impl<Arch: MemoryManagementArch> PageEntry<Arch> {
     }
 
     #[inline(always)]
-    pub fn flags(&self) -> EntryFlags<Arch> {
+    pub const fn flags(&self) -> EntryFlags<Arch> {
         unsafe { EntryFlags::from_data(self.data & Arch::ENTRY_FLAGS_MASK) }
     }
 
@@ -2467,7 +2467,7 @@ impl<Arch: MemoryManagementArch> PageEntry<Arch> {
     /// Like Linux pte_present(), this is a software lifetime predicate. Use
     /// flags().present() when testing the hardware PRESENT bit instead.
     #[inline(always)]
-    pub fn present(&self) -> bool {
+    pub const fn present(&self) -> bool {
         self.flags().present() || self.protnone()
     }
 
@@ -2477,9 +2477,11 @@ impl<Arch: MemoryManagementArch> PageEntry<Arch> {
     }
 
     #[inline(always)]
-    pub fn protnone(&self) -> bool {
-        return self.data & (Arch::ENTRY_FLAG_PRESENT | Arch::ENTRY_FLAG_GLOBAL)
-            == Arch::ENTRY_FLAG_GLOBAL;
+    pub const fn protnone(&self) -> bool {
+        // A zero placeholder mask must never turn an empty entry into PROT_NONE.
+        Arch::ENTRY_FLAG_GLOBAL != 0
+            && self.data & (Arch::ENTRY_FLAG_PRESENT | Arch::ENTRY_FLAG_GLOBAL)
+                == Arch::ENTRY_FLAG_GLOBAL
     }
 
     #[inline(always)]
@@ -2490,6 +2492,28 @@ impl<Arch: MemoryManagementArch> PageEntry<Arch> {
         return self.flags().has_write();
     }
 }
+
+// Check the production predicates for the native architecture at compile time.
+// In particular, zero placeholder masks must keep an empty PTE nonresident.
+const _: () = {
+    let empty = PageEntry::<MMArch>::from_usize(0);
+    assert!(!empty.present());
+    assert!(!empty.protnone());
+    assert!(!empty.flags().present());
+
+    if MMArch::ENTRY_FLAG_PRESENT != 0 {
+        let present = PageEntry::<MMArch>::from_usize(MMArch::ENTRY_FLAG_PRESENT);
+        assert!(present.present());
+        assert!(present.flags().present());
+        assert!(!present.protnone());
+    }
+    if MMArch::ENTRY_FLAG_GLOBAL != 0 {
+        let protnone = PageEntry::<MMArch>::from_usize(MMArch::ENTRY_FLAG_GLOBAL);
+        assert!(protnone.present());
+        assert!(protnone.protnone());
+        assert!(!protnone.flags().present());
+    }
+};
 
 /// 页表项的标志位
 #[derive(Copy, Clone, Hash)]
@@ -2633,8 +2657,10 @@ impl<Arch: MemoryManagementArch> EntryFlags<Arch> {
     }
 
     #[inline(always)]
-    pub fn present(&self) -> bool {
-        return self.has_flag(Arch::ENTRY_FLAG_PRESENT);
+    pub const fn present(&self) -> bool {
+        // Hardware presence requires a nonzero bit, including on architectures
+        // whose page-table encoding is not implemented yet.
+        self.data & Arch::ENTRY_FLAG_PRESENT != 0
     }
 
     /// 设置当前页表项的权限

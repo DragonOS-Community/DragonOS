@@ -262,6 +262,21 @@ impl Ext4 {
         }
     }
 
+    /// Commit one ordered nojournal phase, then publish its durable images.
+    pub(super) fn finish_direct_phase(
+        &self,
+        transaction: journal_transaction::Transaction<'_>,
+    ) -> Result<()> {
+        transaction
+            .commit_direct_flush_before_publish(self.block_device.as_ref(), self)
+            .map_err(|error| {
+                if error.poisoned {
+                    self.poison(ErrCode::EIO);
+                }
+                error.error
+            })
+    }
+
     pub(super) fn commit_metadata_operation(
         &self,
         transaction: journal_transaction::Transaction<'_>,

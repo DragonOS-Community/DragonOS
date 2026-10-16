@@ -2037,7 +2037,15 @@ impl Ext4 {
         generation: u32,
         require_orphan_membership: bool,
     ) -> Result<()> {
-        self.validate_reclaim_inode(inode_id, generation)?;
+        let initial = self.validate_reclaim_inode(inode_id, generation)?;
+        // Xattr detachment needs a durable inode boundary before old ownership
+        // can retire. Reject unsupported devices before reclaiming any extent.
+        if !self.uses_journal()
+            && initial.inode.xattr_block() != 0
+            && !self.block_device.supports_reliable_flush()
+        {
+            return Err(Ext4Error::new(ErrCode::ENOTSUP));
+        }
         if require_orphan_membership && !self.legacy_orphan_contains(inode_id)? {
             return_error!(ErrCode::EINVAL, "Inode {} is not orphaned", inode_id);
         }
@@ -2156,11 +2164,15 @@ impl Ext4 {
         // blocks update h_refcount; exclusive blocks also release allocation.
         let mut inode = self.validate_reclaim_inode(inode_id, generation)?;
         if inode.inode.xattr_block() != 0 {
-            let mut transaction = self.transaction_start(16)?;
-            if let Some(block) = self.transaction_release_xattr(&mut transaction, &mut inode)? {
-                self.transaction_dealloc_block_range(&mut transaction, block, 1)?;
+            if self.uses_journal() {
+                let mut transaction = self.transaction_start(16)?;
+                if let Some(block) = self.transaction_release_xattr(&mut transaction, &mut inode)? {
+                    self.transaction_dealloc_block_range(&mut transaction, block, 1)?;
+                }
+                self.commit_reclaim_transaction(transaction)?;
+            } else {
+                self.direct_detach_xattr_locked(&mut inode)?;
             }
-            self.commit_reclaim_transaction(transaction)?;
         }
 
         // Only the final transaction makes the orphan undiscoverable. It also

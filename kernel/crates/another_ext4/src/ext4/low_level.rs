@@ -5940,16 +5940,30 @@ mod tests {
     }
 
     #[test]
-    fn setxattr_rolls_back_when_new_xattr_block_read_fails() {
+    fn setxattr_initializes_new_block_without_reading_previous_contents() {
         let (block_device, fs) = load_failing_test_fs();
+        block_device.fill_block(TEST_XATTR_BLOCK, 0xa5);
         block_device.fail_once_on_read(TEST_XATTR_BLOCK);
 
-        let err = fs
-            .setxattr_with_flags(2, b"user.rollback", b"value", false, false)
-            .unwrap_err();
+        fs.setxattr_with_flags(2, b"user.initialized", b"value", false, false)
+            .unwrap();
 
-        assert_eq!(err.code(), ErrCode::EIO);
-        assert_xattr_alloc_rolled_back(&fs, &block_device);
+        // The injected read error is still armed: initializing a fresh claim
+        // must never need its prior disk contents.
+        assert!(block_device.fail_reads.lock().contains(&TEST_XATTR_BLOCK));
+        assert_allocation_state(&fs, &block_device, true, TEST_INITIAL_FREE_BLOCKS - 1);
+        assert_eq!(block_device.disk_inode_xattr_block(), TEST_XATTR_BLOCK);
+        assert!(!fs.metadata_mutations_terminal());
+        assert_eq!(
+            block_device
+                .read_block(TEST_XATTR_BLOCK)
+                .unwrap_err()
+                .code(),
+            ErrCode::EIO
+        );
+        let mut value = [0; 5];
+        assert_eq!(fs.getxattr(2, b"user.initialized", &mut value).unwrap(), 5);
+        assert_eq!(&value, b"value");
     }
 
     #[test]
@@ -5966,7 +5980,7 @@ mod tests {
     }
 
     #[test]
-    fn setxattr_rolls_back_when_inode_write_fails() {
+    fn setxattr_retains_claim_and_fail_stops_when_inode_write_is_uncertain() {
         let (block_device, fs) = load_failing_test_fs();
         block_device.fail_once_on_write(TEST_INODE_TABLE);
 
@@ -5975,7 +5989,13 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(err.code(), ErrCode::EIO);
-        assert_xattr_alloc_rolled_back(&fs, &block_device);
+        // A device error cannot prove the inode write did not reach disk. Keep
+        // the new claim even though this particular device failed beforehand.
+        assert_allocation_state(&fs, &block_device, true, TEST_INITIAL_FREE_BLOCKS - 1);
+        assert_eq!(block_device.disk_inode_xattr_block(), 0);
+        assert!(fs.metadata_mutations_terminal());
+        assert!(fs.setxattr(2, b"user.retry", b"unsafe").is_err());
+        assert_allocation_state(&fs, &block_device, true, TEST_INITIAL_FREE_BLOCKS - 1);
     }
 
     #[test]

@@ -52,6 +52,7 @@ jobs:
           normal/dma_allocator_selftest
           normal/ext4_orphan_recovery
           normal/ext4_nested_writeback
+          normal/ext4_shared_xattr
           EOF
 
       - name: Build DragonOS

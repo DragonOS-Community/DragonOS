@@ -437,17 +437,6 @@ impl Ext4 {
         })
     }
 
-    fn finish_direct_phase(&self, transaction: Transaction<'_>) -> Result<()> {
-        transaction
-            .commit_direct_flush_before_publish(self.block_device.as_ref(), self)
-            .map_err(|error| {
-                if error.poisoned {
-                    self.poison(ErrCode::EIO);
-                }
-                error.error
-            })
-    }
-
     fn direct_release_claims(
         &self,
         homes: &[PBlockId],

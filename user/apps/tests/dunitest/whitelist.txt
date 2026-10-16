@@ -227,3 +227,5 @@ normal/fuse_read_fault
 normal/read_buffer_selftest
 
 normal/shared_file_position
+
+normal/ext4_shared_xattr

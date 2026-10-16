@@ -101,7 +101,7 @@ fn main() {
                 .ino
             }
         };
-        retry(&fs, || fs.setxattr(inode, "user.retained", b"value"));
+        retry(&fs, || fs.setxattr(inode, b"user.retained", b"value"));
         assert_eq!(retry(&fs, || fs.getattr(inode)).blocks, 8);
         let handle = retry(&fs, || fs.unlink(directory, &name)).unwrap();
         reclaim(&fs, handle);
@@ -117,9 +117,11 @@ fn main() {
         assert_eq!(retry(&fs, || fs.write(file, 0, &payload)), payload.len());
         if index % 32 == 0 {
             assert_eq!(retry(&fs, || fs.write(file, 3 * 4096, b"tail")), 4);
-            retry(&fs, || fs.setxattr(file, "user.tag", b"stored"));
-            assert_eq!(retry(&fs, || fs.getxattr(file, "user.tag")), b"stored");
-            retry(&fs, || fs.removexattr(file, "user.tag"));
+            retry(&fs, || fs.setxattr(file, b"user.tag", b"stored"));
+            let mut value = [0; 6];
+            assert_eq!(retry(&fs, || fs.getxattr(file, b"user.tag", &mut value)), 6);
+            assert_eq!(&value, b"stored");
+            retry(&fs, || fs.removexattr(file, b"user.tag"));
         }
         assert_eq!(
             retry(&fs, || fs.lookup(directory, &name)),

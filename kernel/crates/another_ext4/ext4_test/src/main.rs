@@ -301,32 +301,31 @@ fn xattr_test(ext4: &mut Ext4) {
     let file = ext4
         .generic_create(ROOT_INO, "f2", file_mode)
         .expect("Create failed");
-    ext4.setxattr(file, "user.testone", "hello world".as_bytes())
+    ext4.setxattr(file, b"user.testone", "hello world".as_bytes())
         .expect("setxattr failed");
-    ext4.setxattr(file, "user.testtwo", "world hello".as_bytes())
+    ext4.setxattr(file, b"user.testtwo", "world hello".as_bytes())
         .expect("setxattr failed");
 
-    let names = ext4.listxattr(file).expect("listxattr failed");
-    assert_eq!(names, vec!["user.testone", "user.testtwo"]);
+    let mut names = [0u8; 128];
+    let size = ext4.listxattr(file, &mut names).expect("listxattr failed");
+    assert_eq!(&names[..size], b"user.testone\0user.testtwo\0");
 
-    let value = ext4
-        .getxattr(file, "user.testone")
+    let mut value = [0u8; 32];
+    let size = ext4
+        .getxattr(file, b"user.testone", &mut value)
         .expect("getxattr failed");
-    assert_eq!(value, "hello world".as_bytes());
-    let value = ext4
-        .getxattr(file, "user.testtwo")
+    assert_eq!(&value[..size], b"hello world");
+    let size = ext4
+        .getxattr(file, b"user.testtwo", &mut value)
         .expect("getxattr failed");
-    assert_eq!(value, "world hello".as_bytes());
+    assert_eq!(&value[..size], b"world hello");
 
-    let names = ext4.listxattr(file).expect("listxattr failed");
-    assert_eq!(names, vec!["user.testone", "user.testtwo"]);
-
-    ext4.removexattr(file, "user.testone")
+    ext4.removexattr(file, b"user.testone")
         .expect("removexattr failed");
-    ext4.getxattr(file, "user.testone")
-        .expect_err("getxattr failed");
-    let names = ext4.listxattr(file).expect("listxattr failed");
-    assert_eq!(names, vec!["user.testtwo"]);
+    ext4.getxattr(file, b"user.testone", &mut [])
+        .expect_err("attribute still exists");
+    let size = ext4.listxattr(file, &mut names).expect("listxattr failed");
+    assert_eq!(&names[..size], b"user.testtwo\0");
 }
 
 /// Simulate the apt update scenario: multiple files grow and dirty page-cache

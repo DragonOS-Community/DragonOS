@@ -332,7 +332,7 @@ impl IndexNode for FuseNode {
         Ok(file.clone())
     }
 
-    fn getxattr(&self, name: &str, buf: &mut [u8]) -> Result<usize, SystemError> {
+    fn getxattr(&self, name: &[u8], buf: &mut [u8]) -> Result<usize, SystemError> {
         self.check_not_stale()?;
         if self.conn.no_xattr(FUSE_GETXATTR) {
             return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
@@ -342,7 +342,7 @@ impl IndexNode for FuseNode {
             size: requested as u32,
             padding: 0,
         };
-        let payload_in = Self::pack_struct_and_name_payload(&inarg, name);
+        let payload_in = Self::pack_struct_and_name_bytes_payload(&inarg, name);
         let payload = match self.conn().request(FUSE_GETXATTR, self.nodeid, &payload_in) {
             Ok(payload) => payload,
             Err(SystemError::ENOSYS) => return Err(self.fuse_xattr_unsupported(FUSE_GETXATTR)),
@@ -365,7 +365,7 @@ impl IndexNode for FuseNode {
 
     fn setxattr(
         &self,
-        name: &str,
+        name: &[u8],
         value: &[u8],
         flags: XattrFlags,
     ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
@@ -380,7 +380,7 @@ impl IndexNode for FuseNode {
             size: value.len() as u32,
             flags: flags.bits() as u32,
         };
-        let mut payload_in = Self::pack_struct_and_name_payload(&inarg, name);
+        let mut payload_in = Self::pack_struct_and_name_bytes_payload(&inarg, name);
         payload_in.extend_from_slice(value);
         match self.conn().request(FUSE_SETXATTR, self.nodeid, &payload_in) {
             Ok(_) => Ok(0),
@@ -426,13 +426,13 @@ impl IndexNode for FuseNode {
 
     fn removexattr(
         &self,
-        name: &str,
+        name: &[u8],
     ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
         self.check_not_stale()?;
         if self.conn.no_xattr(FUSE_REMOVEXATTR) {
             return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP.into());
         }
-        match self.request_name(FUSE_REMOVEXATTR, self.nodeid, name) {
+        match self.request_name_bytes(FUSE_REMOVEXATTR, self.nodeid, name) {
             Ok(_) => Ok(0),
             Err(SystemError::ENOSYS) => Err(self.fuse_xattr_unsupported(FUSE_REMOVEXATTR).into()),
             Err(err) => Err(err.into()),

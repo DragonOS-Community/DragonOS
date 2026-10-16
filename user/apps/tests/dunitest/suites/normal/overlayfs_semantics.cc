@@ -1,5 +1,7 @@
 #include <gtest/gtest.h>
 
+#include "loop_ext4_test_support.h"
+
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -19,6 +21,7 @@
 #include <sys/wait.h>
 #include <sys/xattr.h>
 #include <algorithm>
+#include <array>
 #include <string>
 #include <utility>
 #include <vector>
@@ -3543,6 +3546,109 @@ TEST(OverlayFsSemantics, CopyUpPreservesLargeAndEmptyXattrsWithFilteredListBound
     errno = 0;
     EXPECT_EQ(-1, getxattr(upper.c_str(), kPrivate, nullptr, 0));
     EXPECT_EQ(ENODATA, errno);
+    EXPECT_EQ(0, overlay_temp_entry_count(env.work));
+}
+
+TEST(OverlayFsSemantics, CopyUpPreservesBinaryXattrNamesAcrossAllEntryPoints) {
+    dunitest::LoopExt4 backing;
+    ASSERT_NO_FATAL_FAILURE(backing.SetUp());
+    ASSERT_NO_FATAL_FAILURE(backing.Mount());
+    ScopedOverlayEnv scoped("overlayfs_binary_xattrs", backing.mount_point().c_str());
+    const auto& env = scoped.env;
+    ASSERT_NO_FATAL_FAILURE(prepare_overlay_env(env));
+    const std::string lower = join_path(env.lower, "file");
+    const std::string merged = join_path(env.merged, "file");
+    const std::string upper = join_path(env.upper, "file");
+    const std::array<std::string, 4> names = {
+        "user.byte_\xff", "user.byte_\xfe", "user.byte_\xef\xbf\xbd", "trusted.byte_\xfe"};
+    const std::string private_name = "trusted.overlay.byte_\xff";
+    ASSERT_EQ(0, write_text(lower, "binary-xattr-copy-up"));
+    for (size_t index = 0; index < names.size(); ++index) {
+        const char value = static_cast<char>('a' + index);
+        ASSERT_EQ(0, setxattr(lower.c_str(), names[index].c_str(), &value, 1, XATTR_CREATE))
+            << strerror(errno);
+    }
+    ASSERT_EQ(0, setxattr(lower.c_str(), private_name.c_str(), "hidden", 6, XATTR_CREATE));
+    ASSERT_TRUE(setup_overlay_env(env)) << strerror(errno);
+
+    // 0 = path, 1 = descriptor, 2 = nofollow. The inode is a regular file;
+    // each variant still traverses its own syscall and Overlay xattr path.
+    const auto check_merged = [&] {
+        for (int mode = 0; mode < 3; ++mode) {
+            const int fd = open(merged.c_str(), O_RDONLY | O_CLOEXEC);
+            ASSERT_GE(fd, 0) << strerror(errno);
+            for (size_t index = 0; index < names.size(); ++index) {
+                char value = 0;
+                const ssize_t count = mode == 0
+                    ? getxattr(merged.c_str(), names[index].c_str(), &value, 1)
+                    : mode == 1 ? fgetxattr(fd, names[index].c_str(), &value, 1)
+                                : lgetxattr(merged.c_str(), names[index].c_str(), &value, 1);
+                EXPECT_EQ(1, count) << strerror(errno);
+                EXPECT_EQ(static_cast<char>('a' + index), value);
+            }
+            std::array<char, 512> bytes = {};
+            const ssize_t count = mode == 0
+                ? listxattr(merged.c_str(), bytes.data(), bytes.size())
+                : mode == 1 ? flistxattr(fd, bytes.data(), bytes.size())
+                            : llistxattr(merged.c_str(), bytes.data(), bytes.size());
+            EXPECT_EQ(0, close(fd));
+            ASSERT_GT(count, 0) << strerror(errno);
+            ASSERT_LE(static_cast<size_t>(count), bytes.size());
+            std::vector<std::string> listed;
+            for (size_t offset = 0; offset < static_cast<size_t>(count);) {
+                const size_t remaining = static_cast<size_t>(count) - offset;
+                const size_t length = strnlen(bytes.data() + offset, remaining);
+                ASSERT_LT(length, remaining);
+                listed.emplace_back(bytes.data() + offset, length);
+                offset += length + 1;
+            }
+            std::sort(listed.begin(), listed.end());
+            std::vector<std::string> expected(names.begin(), names.end());
+            std::sort(expected.begin(), expected.end());
+            EXPECT_EQ(expected, listed);
+        }
+    };
+    ASSERT_NO_FATAL_FAILURE(check_merged());
+    EXPECT_FALSE(path_exists(upper));
+    const int copy_fd = open(merged.c_str(), O_WRONLY | O_CLOEXEC);
+    ASSERT_GE(copy_fd, 0) << strerror(errno);
+    ASSERT_EQ(0, close(copy_fd));
+    ASSERT_NO_FATAL_FAILURE(check_merged());
+    for (size_t index = 0; index < names.size(); ++index) {
+        const char value = static_cast<char>('a' + index);
+        ASSERT_NO_FATAL_FAILURE(expect_xattr(lower, names[index].c_str(), &value, 1));
+        ASSERT_NO_FATAL_FAILURE(expect_xattr(upper, names[index].c_str(), &value, 1));
+    }
+    ASSERT_NO_FATAL_FAILURE(expect_xattr(lower, private_name.c_str(), "hidden", 6));
+    errno = 0;
+    EXPECT_EQ(-1, getxattr(upper.c_str(), private_name.c_str(), nullptr, 0));
+    EXPECT_EQ(ENODATA, errno);
+
+    for (int mode = 0; mode < 3; ++mode) {
+        const std::string& name = names[mode];
+        const int fd = open(merged.c_str(), O_RDONLY | O_CLOEXEC);
+        ASSERT_GE(fd, 0) << strerror(errno);
+        const int replaced = mode == 0 ? setxattr(merged.c_str(), name.c_str(), "z", 1, XATTR_REPLACE)
+            : mode == 1 ? fsetxattr(fd, name.c_str(), "z", 1, XATTR_REPLACE)
+                        : lsetxattr(merged.c_str(), name.c_str(), "z", 1, XATTR_REPLACE);
+        EXPECT_EQ(0, replaced) << strerror(errno);
+        const int removed = mode == 0 ? removexattr(merged.c_str(), name.c_str())
+            : mode == 1 ? fremovexattr(fd, name.c_str())
+                        : lremovexattr(merged.c_str(), name.c_str());
+        EXPECT_EQ(0, removed) << strerror(errno);
+        const int created = mode == 0 ? setxattr(merged.c_str(), name.c_str(), "z", 1, XATTR_CREATE)
+            : mode == 1 ? fsetxattr(fd, name.c_str(), "z", 1, XATTR_CREATE)
+                        : lsetxattr(merged.c_str(), name.c_str(), "z", 1, XATTR_CREATE);
+        EXPECT_EQ(0, created) << strerror(errno);
+        EXPECT_EQ(0, close(fd));
+        ASSERT_NO_FATAL_FAILURE(expect_xattr(merged, name.c_str(), "z", 1));
+        ASSERT_NO_FATAL_FAILURE(expect_xattr(upper, name.c_str(), "z", 1));
+        const char original = static_cast<char>('a' + mode);
+        ASSERT_NO_FATAL_FAILURE(expect_xattr(lower, name.c_str(), &original, 1));
+    }
+    // A non-private trusted name is copied and remains separately addressable.
+    ASSERT_NO_FATAL_FAILURE(expect_xattr(merged, names.back().c_str(), "d", 1));
+    EXPECT_EQ("binary-xattr-copy-up", read_text(merged));
     EXPECT_EQ(0, overlay_temp_entry_count(env.work));
 }
 

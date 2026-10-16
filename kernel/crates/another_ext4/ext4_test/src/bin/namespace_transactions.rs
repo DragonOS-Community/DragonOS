@@ -6,7 +6,7 @@ mod block_file;
 
 use another_ext4::{ErrCode, Ext4, InodeMode, InodeOwner, EXT4_ROOT_INO};
 use block_file::BlockFile;
-use std::{fs::File, process::Command, sync::Arc};
+use std::{ffi::OsStr, fs::File, os::unix::ffi::OsStrExt, process::Command, sync::Arc};
 
 fn fsck(path: &str) {
     let output = Command::new("e2fsck").args(["-fn", path]).output().unwrap();
@@ -91,14 +91,15 @@ fn run(journal: bool) {
     let file = fs
         .create(directory, "xattrs", InodeMode::FILE | InodeMode::ALL_RW)
         .unwrap();
-    fs.setxattr(file, "user.payload", &vec![0x31; 1000])
+    fs.setxattr(file, b"user.payload", &vec![0x31; 1000])
         .unwrap();
-    fs.setxattr(file, "user.payload", &vec![0x32; 1700])
+    fs.setxattr(file, b"user.payload", &vec![0x32; 1700])
         .unwrap();
-    assert_eq!(fs.getxattr(file, "user.payload").unwrap(), vec![0x32; 1700]);
-    fs.setxattr(file, "user.other", b"retained").unwrap();
-    fs.removexattr(file, "user.payload").unwrap();
-    assert_eq!(fs.getxattr(file, "user.other").unwrap(), b"retained");
+    assert_eq!(get_value(&fs, file, b"user.payload"), vec![0x32; 1700]);
+    fs.setxattr(file, b"user.other", b"retained").unwrap();
+    fs.removexattr(file, b"user.payload").unwrap();
+    assert_eq!(get_value(&fs, file, b"user.other"), b"retained");
+    check_binary_xattrs(&fs, file, false);
     // Allocation after xattr creation must retain the external xattr block
     // in i_blocks, including the direct backend's extent-count recomputation.
     assert_eq!(fs.write(file, 0, b"payload").unwrap(), 7);
@@ -115,8 +116,9 @@ fn run(journal: bool) {
     );
     assert_eq!(bytes, target.as_bytes());
     assert_eq!(fs.getattr(device.ino).unwrap().rdev, (259, 1234));
-    assert_eq!(fs.getxattr(file, "user.other").unwrap(), b"retained");
-    fs.removexattr(file, "user.other").unwrap();
+    assert_eq!(get_value(&fs, file, b"user.other"), b"retained");
+    check_binary_xattrs(&fs, file, true);
+    fs.removexattr(file, b"user.other").unwrap();
     assert_eq!(fs.getattr(file).unwrap().blocks, 8);
     fs.shutdown_writable().unwrap();
     drop(fs);
@@ -159,6 +161,24 @@ fn crash_matrix() {
     let right = fs
         .create(b, "entry", InodeMode::FILE | InodeMode::ALL_RW)
         .unwrap();
+    // One shared seed covers first-block allocation, replacement and removal.
+    // Unrelated binary names must survive every interruption unchanged.
+    const KEY: &[u8] = b"user.\x80";
+    const OLD: &[u8] = b"old-value";
+    const NEW: &[u8] = b"new-value-with-a-different-padded-size";
+    let xattr_file = fs
+        .create(a, "xattrs", InodeMode::FILE | InodeMode::ALL_RW)
+        .unwrap();
+    let create_file = fs
+        .create(a, "empty-xattrs", InodeMode::FILE | InodeMode::ALL_RW)
+        .unwrap();
+    fs.setxattr(xattr_file, b"user.\xff", b"retained-ff")
+        .unwrap();
+    fs.setxattr(xattr_file, b"user.\xfe", b"retained-fe")
+        .unwrap();
+    fs.setxattr(xattr_file, KEY, OLD).unwrap();
+    assert_eq!(fs.getattr(xattr_file).unwrap().blocks, 8);
+    assert_eq!(fs.getattr(create_file).unwrap().blocks, 0);
     fs.shutdown_writable().unwrap();
     drop(fs);
     let perform = |fs: &Ext4, case| match case {
@@ -177,10 +197,29 @@ fn crash_matrix() {
         2 => {
             fs.rename_exchange(a, "entry", b, "entry").unwrap();
         }
+        3 => {
+            fs.setxattr_with_flags(create_file, KEY, NEW, true, false)
+                .unwrap();
+        }
+        4 => {
+            fs.setxattr_with_flags(xattr_file, KEY, NEW, false, true)
+                .unwrap();
+        }
+        5 => {
+            fs.removexattr(xattr_file, KEY).unwrap();
+        }
         _ => unreachable!(),
     };
+    let case_names = [
+        "mkdir",
+        "symlink",
+        "rename-exchange",
+        "xattr-create",
+        "xattr-replace",
+        "xattr-remove",
+    ];
     for write_through in [false, true] {
-        for case in 0..3 {
+        for (case, case_name) in case_names.iter().enumerate() {
             std::fs::copy(SEED, WORK).unwrap();
             let device = Arc::new(CrashBlockFile::new(WORK));
             let fs = Ext4::load_writable(device.clone()).unwrap();
@@ -229,6 +268,52 @@ fn crash_matrix() {
                         recovered.getattr(b).unwrap().links,
                         if moved { 3 } else { 2 }
                     );
+                } else if case >= 3 {
+                    assert_eq!(
+                        get_value(&recovered, xattr_file, b"user.\xff"),
+                        b"retained-ff"
+                    );
+                    assert_eq!(
+                        get_value(&recovered, xattr_file, b"user.\xfe"),
+                        b"retained-fe"
+                    );
+                    assert_eq!(recovered.getattr(xattr_file).unwrap().blocks, 8);
+                    let target_inode = if case == 3 { create_file } else { xattr_file };
+                    let target = match recovered.getxattr(target_inode, KEY, &mut []) {
+                        Ok(_) => Some(get_value(&recovered, target_inode, KEY)),
+                        Err(error) => {
+                            assert_eq!(error.code(), ErrCode::ENODATA);
+                            None
+                        }
+                    };
+                    let allowed = match case {
+                        3 => target.is_none() || target.as_deref() == Some(NEW),
+                        4 => target.as_deref() == Some(OLD) || target.as_deref() == Some(NEW),
+                        5 => target.is_none() || target.as_deref() == Some(OLD),
+                        _ => unreachable!(),
+                    };
+                    assert!(allowed, "partial {case_name} at point {point}: {target:?}");
+                    let mut names = [0; 128];
+                    let size = recovered.listxattr(target_inode, &mut names).unwrap();
+                    let contains = names[..size]
+                        .split(|byte| *byte == 0)
+                        .any(|name| name == KEY);
+                    assert_eq!(contains, target.is_some());
+                    assert_eq!(
+                        recovered.getattr(create_file).unwrap().blocks,
+                        if case == 3 && target.is_some() { 8 } else { 0 }
+                    );
+                    if case == 3 {
+                        assert_eq!(get_value(&recovered, xattr_file, KEY), OLD);
+                    } else {
+                        assert_eq!(
+                            recovered
+                                .getxattr(create_file, KEY, &mut [])
+                                .unwrap_err()
+                                .code(),
+                            ErrCode::ENODATA
+                        );
+                    }
                 } else {
                     match recovered.lookup(a, "new") {
                         Err(error) => assert_eq!(error.code(), ErrCode::ENOENT),
@@ -252,7 +337,7 @@ fn crash_matrix() {
                 fsck(WORK);
             }
             println!(
-                "namespace crash case {case} write_through={write_through}: {points} points passed"
+                "namespace crash {case_name} write_through={write_through}: {points} points passed"
             );
         }
     }
@@ -261,6 +346,10 @@ fn crash_matrix() {
 }
 
 fn main() {
+    if std::env::args().any(|arg| arg == "--gnu-interop-only") {
+        gnu_namespace_interop();
+        return;
+    }
     if std::env::args().any(|arg| arg == "--crash-only") {
         crash_matrix();
         return;
@@ -268,4 +357,190 @@ fn main() {
     run(true);
     run(false);
     crash_matrix();
+    gnu_namespace_interop();
+}
+
+fn get_value(fs: &Ext4, inode: u32, name: &[u8]) -> Vec<u8> {
+    let mut value = vec![0; fs.getxattr(inode, name, &mut []).unwrap()];
+    let count = fs.getxattr(inode, name, &mut value).unwrap();
+    assert_eq!(count, value.len());
+    value
+}
+
+/// Exercise the real direct/journal storage and remount path using raw bytes,
+/// including output atomicity and failed replacement accounting.
+fn check_binary_xattrs(fs: &Ext4, inode: u32, remounted: bool) {
+    const NAMES: [&[u8]; 3] = [b"user.\xff", b"user.\xfe", b"user.\xef\xbf\xbd"];
+    if !remounted {
+        for (index, name) in NAMES.iter().enumerate() {
+            fs.setxattr(inode, name, &[index as u8; 7]).unwrap();
+        }
+        fs.setxattr(inode, b"user.empty", b"").unwrap();
+    }
+    for (index, name) in NAMES.iter().enumerate() {
+        assert_eq!(fs.getxattr(inode, name, &mut []).unwrap(), 7);
+        let mut short = [0xa5; 6];
+        assert_eq!(
+            fs.getxattr(inode, name, &mut short).unwrap_err().code(),
+            ErrCode::ERANGE
+        );
+        assert_eq!(short, [0xa5; 6]);
+        let mut output = [0xa5; 9];
+        assert_eq!(fs.getxattr(inode, name, &mut output).unwrap(), 7);
+        assert_eq!(&output[..7], &[index as u8; 7]);
+        assert_eq!(&output[7..], &[0xa5; 2]);
+    }
+    assert_eq!(fs.getxattr(inode, b"user.empty", &mut []).unwrap(), 0);
+    let size = fs.listxattr(inode, &mut []).unwrap();
+    let mut short = vec![0xa5; size - 1];
+    assert_eq!(
+        fs.listxattr(inode, &mut short).unwrap_err().code(),
+        ErrCode::ERANGE
+    );
+    assert!(short.iter().all(|byte| *byte == 0xa5));
+    let mut list = vec![0xa5; size + 3];
+    assert_eq!(fs.listxattr(inode, &mut list).unwrap(), size);
+    assert_eq!(&list[size..], &[0xa5; 3]);
+    let listed: Vec<&[u8]> = list[..size]
+        .split(|byte| *byte == 0)
+        .filter(|name| !name.is_empty())
+        .collect();
+    for name in NAMES {
+        assert!(listed.contains(&name));
+    }
+    let blocks = fs.getattr(inode).unwrap().blocks;
+    assert_eq!(
+        fs.setxattr(inode, NAMES[0], &[0; 4096]).unwrap_err().code(),
+        ErrCode::ENOSPC
+    );
+    assert_eq!(get_value(fs, inode, NAMES[0]), [0; 7]);
+    assert_eq!(fs.getattr(inode).unwrap().blocks, blocks);
+    assert_eq!(
+        fs.setxattr_with_flags(inode, NAMES[0], b"bad", true, false)
+            .unwrap_err()
+            .code(),
+        ErrCode::EEXIST
+    );
+    assert_eq!(
+        fs.setxattr_with_flags(inode, b"user.missing", b"bad", false, true)
+            .unwrap_err()
+            .code(),
+        ErrCode::ENODATA
+    );
+    assert_eq!(
+        fs.setxattr(inode, b"system.unknown", b"bad")
+            .unwrap_err()
+            .code(),
+        ErrCode::ENOTSUP
+    );
+    if remounted {
+        fs.removexattr(inode, b"user.empty").unwrap();
+        for name in NAMES {
+            fs.removexattr(inode, name).unwrap();
+        }
+    }
+}
+
+/// e2fsprogs provides the independent namespace-to-disk-index oracle. A local
+/// create/get round trip alone cannot detect mutually wrong encode/decode maps.
+fn gnu_namespace_interop() {
+    const ORIGINAL: &[u8] = &[0x31; 300];
+    const REPLACED: &[u8] = b"gnu-replaced-by-library";
+    const CREATED: &[u8] = b"gnu-created-by-library";
+    const SYSTEM: &[u8] = &[0x53; 320];
+    const READBACK: &str = "gnu-namespace-readback.out";
+    const INPUT: &str = "gnu-namespace-input.bin";
+    for journal in [true, false] {
+        let path = if journal {
+            "gnu-namespace-journal.img"
+        } else {
+            "gnu-namespace-direct.img"
+        };
+        File::create(path)
+            .unwrap()
+            .set_len(32 * 1024 * 1024)
+            .unwrap();
+        let features = if journal {
+            "^orphan_file"
+        } else {
+            "^orphan_file,^has_journal"
+        };
+        // This library supports 256-byte inodes. Both seeded values exceed
+        // their entire inode-body capacity, forcing external xattr storage.
+        assert!(Command::new("mkfs.ext4")
+            .args(["-q", "-F", "-b", "4096", "-I", "256", "-O", features, path])
+            .status()
+            .unwrap()
+            .success());
+        let debugfs = |command: &[u8]| {
+            let output = Command::new("debugfs")
+                .args(["-w", "-R"])
+                .arg(OsStr::from_bytes(command))
+                .arg(path)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "debugfs failed: {output:?}");
+        };
+        let read_external = |name: &[u8], expected: &[u8]| {
+            if std::path::Path::new(READBACK).exists() {
+                std::fs::remove_file(READBACK).unwrap();
+            }
+            let mut command = format!("ea_get -f {READBACK} /gnu-file ").into_bytes();
+            command.extend_from_slice(name);
+            debugfs(&command);
+            // debugfs can return exit status zero for a failed command. Only
+            // newly created, byte-exact output is evidence that the key exists.
+            assert_eq!(std::fs::read(READBACK).unwrap(), expected);
+            std::fs::remove_file(READBACK).unwrap();
+        };
+        debugfs(b"write /dev/null /gnu-file");
+        for (name, value) in [
+            (b"gnu.\xff".as_slice(), ORIGINAL),
+            (b"system.keep".as_slice(), SYSTEM),
+        ] {
+            std::fs::write(INPUT, value).unwrap();
+            let mut command = format!("ea_set -f {INPUT} /gnu-file ").into_bytes();
+            command.extend_from_slice(name);
+            debugfs(&command);
+            std::fs::remove_file(INPUT).unwrap();
+        }
+        read_external(b"gnu.\xff", ORIGINAL);
+        read_external(b"system.keep", SYSTEM);
+
+        let fs = Ext4::load_writable(Arc::new(BlockFile::new(path))).unwrap();
+        let inode = fs.lookup(EXT4_ROOT_INO, "gnu-file").unwrap();
+        let mut original = vec![0; ORIGINAL.len()];
+        assert_eq!(
+            fs.getxattr(inode, b"gnu.\xff", &mut original)
+                .expect("read e2fsprogs GNU index 10"),
+            ORIGINAL.len()
+        );
+        assert_eq!(original, ORIGINAL);
+        assert_eq!(
+            fs.getxattr(inode, b"gnu.keep", &mut []).unwrap_err().code(),
+            ErrCode::ENODATA
+        );
+        assert_eq!(
+            fs.getxattr(inode, b"system.keep", &mut [])
+                .unwrap_err()
+                .code(),
+            ErrCode::ENOTSUP
+        );
+        let mut names = [0; 64];
+        let size = fs.listxattr(inode, &mut names).unwrap();
+        assert_eq!(&names[..size], b"gnu.\xff\0");
+        fs.setxattr_with_flags(inode, b"gnu.\xff", REPLACED, false, true)
+            .unwrap();
+        fs.setxattr_with_flags(inode, b"gnu.\xfe", CREATED, true, false)
+            .unwrap();
+        fs.shutdown_writable().unwrap();
+        drop(fs);
+
+        read_external(b"gnu.\xff", REPLACED);
+        read_external(b"gnu.\xfe", CREATED);
+        read_external(b"system.keep", SYSTEM);
+        fsck(path);
+        std::fs::remove_file(path).unwrap();
+        println!("GNU namespace e2fsprogs interoperability journal={journal}: passed");
+    }
 }

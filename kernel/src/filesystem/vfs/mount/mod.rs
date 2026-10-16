@@ -7201,7 +7201,7 @@ impl IndexNode for MountFSInode {
         self.dentry.inode.write_sync(offset, buf)
     }
 
-    fn getxattr(&self, name: &str, buf: &mut [u8]) -> Result<usize, SystemError> {
+    fn getxattr(&self, name: &[u8], buf: &mut [u8]) -> Result<usize, SystemError> {
         let context = self.op_context();
         if context.is_idmapped() && filecaps::is_acl(name) {
             return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
@@ -7214,7 +7214,7 @@ impl IndexNode for MountFSInode {
 
     fn setxattr(
         &self,
-        name: &str,
+        name: &[u8],
         value: &[u8],
         flags: XattrFlags,
     ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
@@ -7236,7 +7236,7 @@ impl IndexNode for MountFSInode {
 
     fn removexattr(
         &self,
-        name: &str,
+        name: &[u8],
     ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
         let _writer = self.ensure_mount_writable()?;
         let context = self.op_context();

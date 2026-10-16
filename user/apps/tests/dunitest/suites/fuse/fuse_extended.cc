@@ -1573,7 +1573,7 @@ fail_no_umount:
     return -1;
 }
 
-static int ext_test_xattr_ops() {
+static int ext_test_xattr_ops(const char* attribute_name = "user.dragonos") {
     const char *mp = "/tmp/test_fuse_xattr";
     char path[256];
     char list[64] = {};
@@ -1611,6 +1611,7 @@ static int ext_test_xattr_ops() {
     args.fd = fd;
     args.stop = &stop;
     args.init_done = &init_done;
+    args.xattr_name = attribute_name;
     args.getxattr_count = &getxattr_count;
     args.setxattr_count = &setxattr_count;
     args.listxattr_count = &listxattr_count;
@@ -1644,12 +1645,13 @@ static int ext_test_xattr_ops() {
     snprintf(path, sizeof(path), "%s/hello.txt", mp);
     errno = 0;
     n = listxattr(path, NULL, 0);
-    if (n <= 0) {
+    if (n != static_cast<ssize_t>(strlen(attribute_name) + 1)) {
         printf("[FAIL] listxattr size returned %zd errno=%d (%s)\n", n, errno, strerror(errno));
         goto fail;
     }
     n = listxattr(path, list, sizeof(list));
-    if (n <= 0 || memcmp(list, "user.dragonos", sizeof("user.dragonos")) != 0) {
+    if (n != static_cast<ssize_t>(strlen(attribute_name) + 1)
+        || memcmp(list, attribute_name, strlen(attribute_name) + 1) != 0) {
         printf("[FAIL] listxattr value n=%zd first='%s' errno=%d\n", n, list, errno);
         goto fail;
     }
@@ -1670,17 +1672,17 @@ static int ext_test_xattr_ops() {
     }
     args.force_listxattr_erange_at_max = 0;
 
-    n = getxattr(path, "user.dragonos", NULL, 0);
+    n = getxattr(path, attribute_name, NULL, 0);
     if (n != (ssize_t)strlen("virtiofs-xattr")) {
         printf("[FAIL] getxattr size n=%zd errno=%d (%s)\n", n, errno, strerror(errno));
         goto fail;
     }
     errno = 0;
-    if (getxattr(path, "user.dragonos", small, sizeof(small)) != -1 || errno != ERANGE) {
+    if (getxattr(path, attribute_name, small, sizeof(small)) != -1 || errno != ERANGE) {
         printf("[FAIL] getxattr small buffer errno=%d expected=%d\n", errno, ERANGE);
         goto fail;
     }
-    n = getxattr(path, "user.dragonos", value, sizeof(value));
+    n = getxattr(path, attribute_name, value, sizeof(value));
     if (n != (ssize_t)strlen("virtiofs-xattr") ||
         memcmp(value, "virtiofs-xattr", strlen("virtiofs-xattr")) != 0) {
         printf("[FAIL] getxattr value n=%zd value='%s' errno=%d\n", n, value, errno);
@@ -1693,7 +1695,7 @@ static int ext_test_xattr_ops() {
 
     args.force_getxattr_erange_at_max = 1;
     errno = 0;
-    if (getxattr(path, "user.dragonos", max_xattr_buf, sizeof(max_xattr_buf)) != -1 ||
+    if (getxattr(path, attribute_name, max_xattr_buf, sizeof(max_xattr_buf)) != -1 ||
         errno != E2BIG) {
         printf("[FAIL] getxattr max-size ERANGE errno=%d expected=%d\n", errno, E2BIG);
         goto fail;
@@ -1706,7 +1708,7 @@ static int ext_test_xattr_ops() {
 
     set_count_before = setxattr_count;
     errno = 0;
-    if (setxattr(path, "user.dragonos", "new", 3, 0x4) != -1 || errno != EINVAL) {
+    if (setxattr(path, attribute_name, "new", 3, 0x4) != -1 || errno != EINVAL) {
         printf("[FAIL] setxattr invalid flags errno=%d expected=%d\n", errno, EINVAL);
         goto fail;
     }
@@ -1717,7 +1719,7 @@ static int ext_test_xattr_ops() {
     }
 
     errno = 0;
-    if (setxattr(path, "user.dragonos", value_too_large, sizeof(value_too_large), 0) != -1 ||
+    if (setxattr(path, attribute_name, value_too_large, sizeof(value_too_large), 0) != -1 ||
         errno != E2BIG) {
         printf("[FAIL] setxattr oversized value errno=%d expected=%d\n", errno, E2BIG);
         goto fail;
@@ -1772,7 +1774,7 @@ static int ext_test_xattr_ops() {
         goto fail;
     }
 
-    if (setxattr(path, "user.dragonos", "new", 3, 0) != 0) {
+    if (setxattr(path, attribute_name, "new", 3, 0) != 0) {
         printf("[FAIL] setxattr failed errno=%d (%s)\n", errno, strerror(errno));
         goto fail;
     }
@@ -1781,7 +1783,7 @@ static int ext_test_xattr_ops() {
         goto fail;
     }
     errno = 0;
-    if (setxattr(path, "user.dragonos", "new", 3, XATTR_CREATE) != -1 || errno != EEXIST) {
+    if (setxattr(path, attribute_name, "new", 3, XATTR_CREATE) != -1 || errno != EEXIST) {
         printf("[FAIL] setxattr XATTR_CREATE errno=%d expected=%d\n", errno, EEXIST);
         goto fail;
     }
@@ -1800,7 +1802,7 @@ static int ext_test_xattr_ops() {
                last_setxattr_flags, XATTR_CREATE);
         goto fail;
     }
-    if (setxattr(path, "user.dragonos", "new", 3, XATTR_REPLACE) != 0) {
+    if (setxattr(path, attribute_name, "new", 3, XATTR_REPLACE) != 0) {
         printf("[FAIL] setxattr XATTR_REPLACE failed errno=%d (%s)\n", errno, strerror(errno));
         goto fail;
     }
@@ -1819,7 +1821,7 @@ static int ext_test_xattr_ops() {
                last_setxattr_flags, XATTR_REPLACE);
         goto fail;
     }
-    if (removexattr(path, "user.dragonos") != 0) {
+    if (removexattr(path, attribute_name) != 0) {
         printf("[FAIL] removexattr failed errno=%d (%s)\n", errno, strerror(errno));
         goto fail;
     }
@@ -11135,6 +11137,14 @@ TEST(FuseExtended, PositiveLookupCacheRespectsEntryTtl) {
 
 TEST(FuseExtended, XattrOps) {
     ASSERT_EQ(0, ext_test_xattr_ops());
+}
+
+TEST(FuseExtended, BinaryXattrOps) {
+    // Exercise the real FUSE request/reply framing with distinct raw byte keys.
+    for (const char* name : {"user.byte_\xff", "user.byte_\xfe", "user.byte_\xef\xbf\xbd"}) {
+        SCOPED_TRACE(name);
+        ASSERT_EQ(0, ext_test_xattr_ops(name));
+    }
 }
 
 TEST(FuseExtended, XattrEnosysIsCached) {

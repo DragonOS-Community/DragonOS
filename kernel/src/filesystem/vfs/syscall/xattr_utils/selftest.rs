@@ -8,6 +8,7 @@ use crate::{
     libs::mutex::Mutex,
     mm::MemoryManagementArch,
 };
+use alloc::string::String;
 use core::fmt::Write;
 
 static TEST_LOCK: Mutex<()> = Mutex::new(());

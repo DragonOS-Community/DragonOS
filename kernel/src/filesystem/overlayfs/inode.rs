@@ -770,13 +770,13 @@ impl IndexNode for OvlInode {
         )
     }
 
-    fn getxattr(&self, name: &str, buf: &mut [u8]) -> Result<usize, SystemError> {
+    fn getxattr(&self, name: &[u8], buf: &mut [u8]) -> Result<usize, SystemError> {
         super::metadata::getxattr(self, name, buf)
     }
 
     fn setxattr(
         &self,
-        name: &str,
+        name: &[u8],
         value: &[u8],
         flags: XattrFlags,
     ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
@@ -789,7 +789,7 @@ impl IndexNode for OvlInode {
 
     fn removexattr(
         &self,
-        name: &str,
+        name: &[u8],
     ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
         super::metadata::removexattr(self, name)
     }

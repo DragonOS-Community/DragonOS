@@ -752,6 +752,8 @@ struct fuse_daemon_args {
     volatile uint32_t *opendir_count;
     volatile uint32_t *setattr_count;
     volatile uint32_t *fallocate_count;
+    // Optional immutable key selected before the daemon thread starts.
+    const char *xattr_name;
     volatile uint32_t *getxattr_count;
     volatile uint32_t *setxattr_count;
     volatile uint32_t *listxattr_count;
@@ -2051,10 +2053,10 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
         const struct fuse_getxattr_in *in = (const struct fuse_getxattr_in *)payload;
         const char *name = (const char *)(payload + sizeof(*in));
         size_t name_len = payload_len - sizeof(*in);
-        if (name[name_len - 1] != '\0') {
+        if (name[name_len - 1] != '\0' || strnlen(name, name_len) + 1 != name_len) {
             return -1;
         }
-        if (strcmp(name, "user.dragonos") != 0) {
+        if (strcmp(name, a->xattr_name ? a->xattr_name : "user.dragonos") != 0) {
             return fuse_write_reply(a->fd, h->unique, -ENODATA, NULL, 0);
         }
         const char value[] = "virtiofs-xattr";
@@ -2084,8 +2086,8 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
             return -1;
         }
         const struct fuse_getxattr_in *in = (const struct fuse_getxattr_in *)payload;
-        const char list[] = "user.dragonos";
-        size_t list_len = sizeof(list);
+        const char *list = a->xattr_name ? a->xattr_name : "user.dragonos";
+        size_t list_len = strlen(list) + 1;
         if (in->size == 0) {
             struct fuse_getxattr_out out;
             memset(&out, 0, sizeof(out));
@@ -2120,7 +2122,16 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
         if (name_len >= payload_len - sizeof(struct fuse_setxattr_in_compat)) {
             return -1;
         }
-        if ((in->flags & XATTR_CREATE) && strcmp(name, "user.dragonos") == 0) {
+        // The value starts immediately after the exact byte name and NUL.
+        const size_t value_offset = sizeof(*in) + name_len + 1;
+        if (payload_len - value_offset != in->size) {
+            return -1;
+        }
+        if (a->xattr_name && strcmp(name, a->xattr_name) == 0 && in->size == 3
+            && memcmp(payload + value_offset, "new", 3) != 0) {
+            return -1;
+        }
+        if ((in->flags & XATTR_CREATE) && strcmp(name, a->xattr_name ? a->xattr_name : "user.dragonos") == 0) {
             return fuse_write_reply(a->fd, h->unique, -EEXIST, NULL, 0);
         }
         if ((in->flags & XATTR_REPLACE) && strcmp(name, "user.missing") == 0) {
@@ -2136,10 +2147,11 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
             return fuse_write_reply(a->fd, h->unique, -ENOSYS, NULL, 0);
         }
         const char *name = (const char *)payload;
-        if (payload_len == 0 || name[payload_len - 1] != '\0') {
+        if (payload_len == 0 || name[payload_len - 1] != '\0'
+            || strnlen(name, payload_len) + 1 != payload_len) {
             return -1;
         }
-        if (strcmp(name, "user.dragonos") != 0) {
+        if (strcmp(name, a->xattr_name ? a->xattr_name : "user.dragonos") != 0) {
             return fuse_write_reply(a->fd, h->unique, -ENODATA, NULL, 0);
         }
         return fuse_write_reply(a->fd, h->unique, 0, NULL, 0);

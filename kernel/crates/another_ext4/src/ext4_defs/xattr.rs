@@ -13,6 +13,9 @@ use crate::constants::*;
 use crate::prelude::*;
 use core::cmp::Ordering;
 
+// Linux fs/ext4/xattr.h: Hurd uses index 10; index 7 is reserved for SYSTEM.
+const XATTR_INDEX_HURD: u8 = 10;
+
 /// The beginning of an extended attribute block.
 #[repr(C)]
 #[derive(Debug)]
@@ -252,11 +255,11 @@ unsafe impl AsBytes for XattrEntry {
 
 impl XattrEntry {
     /// Create a new xattr entry.
-    pub fn new(name: &str, value_size: usize, value_offset: usize) -> Self {
+    pub fn new(name: &[u8], value_size: usize, value_offset: usize) -> Self {
         let mut name_bytes = [0u8; 255];
         let (name_index, name) = Self::match_name(name);
         let name_len = name.len();
-        name_bytes[..name_len].copy_from_slice(name.as_bytes());
+        name_bytes[..name_len].copy_from_slice(name);
         Self {
             name_len: name.len() as u8,
             name_index,
@@ -268,24 +271,21 @@ impl XattrEntry {
         }
     }
 
-    /// Get the name of the xattr entry
-    pub fn name(&self) -> String {
-        let prefix = match self.name_index {
-            1 => "user.",
-            2 => "system.posix_acl_access.",
-            3 => "system.posix_acl_default.",
-            4 => "trusted.",
-            6 => "security.",
-            7 => "system.",
-            _ => "",
-        };
-        let name_bytes = &self.name[..self.name_len as usize];
-        let name = unsafe { String::from_utf8_unchecked(name_bytes.to_vec()) };
-        prefix.to_string() + &name
+    /// Namespace prefixes are bytes: on-disk suffixes need not be UTF-8.
+    fn prefix(&self) -> Option<&'static [u8]> {
+        match self.name_index {
+            1 => Some(b"user."),
+            2 if self.name_len == 0 => Some(b"system.posix_acl_access"),
+            3 if self.name_len == 0 => Some(b"system.posix_acl_default"),
+            4 => Some(b"trusted."),
+            6 => Some(b"security."),
+            XATTR_INDEX_HURD => Some(b"gnu."),
+            _ => None,
+        }
     }
 
     /// Get the required size to save a xattr entry, 4-byte aligned
-    pub fn required_size(name: &str) -> usize {
+    pub fn required_size(name: &[u8]) -> usize {
         let (_, name) = Self::match_name(name);
         let name_len = name.len();
         // FakeXattrEntry + name -> align to 4
@@ -298,7 +298,7 @@ impl XattrEntry {
     }
 
     /// Compare the name of the xattr entry with a given name
-    pub fn compare_name(&self, name: &str) -> Ordering {
+    pub fn compare_name(&self, name: &[u8]) -> Ordering {
         let (name_index, name) = Self::match_name(name);
         match self.name_index.cmp(&name_index) {
             Ordering::Equal => {}
@@ -308,26 +308,45 @@ impl XattrEntry {
             Ordering::Equal => {}
             ordering => return ordering,
         }
-        self.name[..self.name_len as usize].cmp(name.as_bytes())
+        self.name[..self.name_len as usize].cmp(name)
     }
 
     /// Match the attribute name prefix to get name index. If one is found,
     /// return the name index and the string with the prefix removed.
-    fn match_name(name: &str) -> (u8, &str) {
-        let prefixes = [
-            ("user.", 1),
-            ("system.posix_acl_access.", 2),
-            ("system.posix_acl_default.", 3),
-            ("trusted.", 4),
-            ("security.", 6),
-            ("system.", 7),
+    fn match_name(name: &[u8]) -> (u8, &[u8]) {
+        if name == b"system.posix_acl_access" {
+            return (2, b"");
+        }
+        if name == b"system.posix_acl_default" {
+            return (3, b"");
+        }
+        let prefixes: &[(&[u8], u8)] = &[
+            (b"user.", 1),
+            (b"trusted.", 4),
+            (b"security.", 6),
+            (b"gnu.", XATTR_INDEX_HURD),
         ];
-        for (prefix, index) in prefixes {
-            if let Some(stripped) = name.strip_prefix(prefix) {
-                return (index, stripped);
+        for &(prefix, index) in prefixes {
+            if let Some(suffix) = name.strip_prefix(prefix) {
+                return (index, suffix);
             }
         }
         (0, name)
+    }
+
+    /// Full syscall names are limited to 255 bytes, including the namespace.
+    pub(crate) fn validate_name(name: &[u8]) -> Result<()> {
+        if name.is_empty() || name.len() > 255 || name.contains(&0) {
+            return Err(Ext4Error::new(ErrCode::ERANGE));
+        }
+        let (index, suffix) = Self::match_name(name);
+        if index == 0 {
+            return Err(Ext4Error::new(ErrCode::ENOTSUP));
+        }
+        if suffix.is_empty() && index != 2 && index != 3 {
+            return Err(Ext4Error::new(ErrCode::EINVAL));
+        }
+        Ok(())
     }
 }
 
@@ -380,133 +399,208 @@ impl XattrBlock {
         true
     }
 
-    /// Get a xattr by name, return the value.
-    pub fn get(&self, name: &str) -> Option<&[u8]> {
-        let mut entry_start = size_of::<XattrHeader>();
-        // Iterate over entry table
-        while entry_start < BLOCK_SIZE {
-            // Check `name_len`, 0 indicates the end of the entry table.
-            if self.0.data[entry_start] == 0 {
-                // Target xattr not found
-                break;
-            }
-            let entry: XattrEntry = self.0.read_offset_as(entry_start);
-            if entry.compare_name(name).is_eq() {
-                let offset = entry.value_offset as usize;
-                let size = entry.value_size as usize;
-                return Some(&self.0.data[offset..offset + size]);
-            }
-            entry_start += entry.used_size();
+    /// Decode one entry only after checking its variable-length disk bounds.
+    fn entry_at(&self, offset: usize) -> Result<Option<XattrEntry>> {
+        let bad = || Ext4Error::new(ErrCode::EIO);
+        let marker = self
+            .0
+            .data
+            .get(offset..offset.checked_add(4).ok_or_else(bad)?)
+            .ok_or_else(bad)?;
+        if marker == [0; 4] {
+            return Ok(None);
         }
-        None
+        let fixed_end = offset
+            .checked_add(size_of::<FakeXattrEntry>())
+            .ok_or_else(bad)?;
+        let fixed = self.0.data.get(offset..fixed_end).ok_or_else(bad)?;
+        let raw = FakeXattrEntry::from_bytes(fixed);
+        let end = fixed_end
+            .checked_add(raw.name_len as usize)
+            .ok_or_else(bad)?;
+        let name = self.0.data.get(fixed_end..end).ok_or_else(bad)?;
+        if name.contains(&0) {
+            return Err(bad());
+        }
+        let next = offset
+            .checked_add((size_of::<FakeXattrEntry>() + name.len()).div_ceil(4) * 4)
+            .ok_or_else(bad)?;
+        if next.checked_add(4).is_none_or(|end| end > BLOCK_SIZE) {
+            return Err(bad());
+        }
+        Ok(Some(XattrEntry::from_bytes(&self.0.data[offset..end])))
     }
 
-    /// List all xattr names
-    pub fn list(&self) -> Vec<String> {
-        let mut entry_start = size_of::<XattrHeader>();
-        let mut names = Vec::new();
-        // Iterate over entry table
-        while entry_start < BLOCK_SIZE {
-            // Check `name_len`, 0 indicates the end of the entry table.
-            if self.0.data[entry_start] == 0 {
-                break;
-            }
-            let entry: XattrEntry = self.0.read_offset_as(entry_start);
-            names.push(entry.name());
-            entry_start += entry.used_size();
-        }
-        names
-    }
-
-    /// Insert a xattr entry into the block. Return true if success.
-    pub fn insert(&mut self, name: &str, value: &[u8]) -> bool {
-        let mut p_entry = size_of::<XattrHeader>();
-        let mut p_value = BLOCK_SIZE;
-
-        let mut is_ins_pos_found = false;
-        let mut ins_entry_pos = p_entry;
-        let mut ins_value_pos = p_value;
-        let ins_entry_size = XattrEntry::required_size(name);
-        let Some(ins_value_size) = xattr_value_storage_size(value.len()) else {
-            return false;
-        };
-
-        // Iterate over entry table, find the position to insert entry
-        // and the end of entry table
-        while p_entry < BLOCK_SIZE {
-            // Check `name_len`, 0 indicates the end of the entry table.
-            if self.0.data[p_entry] == 0 {
-                // Reach the end of table
-                break;
-            }
-            let entry: XattrEntry = self.0.read_offset_as(p_entry);
-            if !is_ins_pos_found && entry.compare_name(name).is_gt() {
-                // Insert before this entry
-                ins_entry_pos = p_entry;
-                ins_value_pos = p_value;
-                is_ins_pos_found = true;
-            }
-            p_value = entry.value_offset as usize;
-            p_entry += entry.used_size();
-        }
-        if !is_ins_pos_found {
-            // Insert at the end of table
-            ins_entry_pos = p_entry;
-            ins_value_pos = p_value;
-        }
-
-        // `ins_entry_pos` points to the position to insert entry,
-        // `ins_value_pos - ins_value_size` points to the position to insert value.
-        // `p_entry` points to the start of blank area,
-        // `p_value` points to the last value,
-        // `[p_entry, p_value)` is the blank area.
-
-        // Check space, '+1' is reserved for blank area
-        let Some(required) = ins_entry_size
-            .checked_add(ins_value_size)
-            .and_then(|size| size.checked_add(size_of::<u32>()))
-        else {
-            return false;
-        };
-        if p_value
-            .checked_sub(p_entry)
-            .is_none_or(|free| free < required)
+    /// Validate once before accessing or moving table/value regions. No name
+    /// collection or value copy is needed; the block snapshot owns all bytes.
+    pub(crate) fn validate(&self) -> Result<()> {
+        let bad = || Ext4Error::new(ErrCode::EIO);
+        let header: XattrHeader = self.0.read_offset_as(0);
+        if header.magic() != XattrHeader::XATTR_MAGIC
+            || header.blocks() != 1
+            || header.refcount() == 0
         {
-            // Not enough space
+            return Err(bad());
+        }
+        let mut offset = size_of::<XattrHeader>();
+        let mut first_value = BLOCK_SIZE;
+        while let Some(entry) = self.entry_at(offset)? {
+            if entry.value_inum == 0 && entry.value_size != 0 {
+                let start = entry.value_offset as usize;
+                let padded = xattr_value_storage_size(entry.value_size as usize).ok_or_else(bad)?;
+                if start & 3 != 0 || start.checked_add(padded).is_none_or(|end| end > BLOCK_SIZE) {
+                    return Err(bad());
+                }
+                first_value = first_value.min(start);
+            } else if entry.value_inum != 0 && entry.value_size == 0 {
+                return Err(bad());
+            }
+            offset += entry.used_size();
+        }
+        if offset + 4 > first_value {
+            return Err(bad());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_inline(&self) -> Result<()> {
+        self.validate()?;
+        let mut offset = size_of::<XattrHeader>();
+        while let Some(entry) = self.entry_at(offset)? {
+            if entry.value_inum != 0 {
+                return Err(Ext4Error::new(ErrCode::ENOTSUP));
+            }
+            let next = offset + entry.used_size();
+            if entry.value_size != 0 {
+                let start = entry.value_offset as usize;
+                let end = start + xattr_value_storage_size(entry.value_size as usize).unwrap();
+                let mut later = next;
+                while let Some(other) = self.entry_at(later)? {
+                    if other.value_inum == 0 && other.value_size != 0 {
+                        let other_start = other.value_offset as usize;
+                        let other_end = other_start
+                            + xattr_value_storage_size(other.value_size as usize).unwrap();
+                        if start < other_end && other_start < end {
+                            return Err(Ext4Error::new(ErrCode::EIO));
+                        }
+                    }
+                    later += other.used_size();
+                }
+            }
+            offset = next;
+        }
+        Ok(())
+    }
+
+    pub fn is_empty(&self) -> Result<bool> {
+        self.validate()?;
+        Ok(self.entry_at(size_of::<XattrHeader>())?.is_none())
+    }
+
+    /// Get a borrowed inline value. External EA inode values are unsupported.
+    pub fn get(&self, name: &[u8]) -> Result<Option<&[u8]>> {
+        self.validate()?;
+        let mut offset = size_of::<XattrHeader>();
+        while let Some(entry) = self.entry_at(offset)? {
+            if entry.compare_name(name).is_eq() {
+                if entry.value_inum != 0 {
+                    return Err(Ext4Error::new(ErrCode::ENOTSUP));
+                }
+                let start = entry.value_offset as usize;
+                // Empty values do not require a meaningful disk offset.
+                return Ok(Some(if entry.value_size == 0 {
+                    &[]
+                } else {
+                    &self.0.data[start..start + entry.value_size as usize]
+                }));
+            }
+            offset += entry.used_size();
+        }
+        Ok(None)
+    }
+
+    /// Write NUL-separated names directly; an empty buffer is a size probe.
+    /// Validate and check total size before touching the caller's output.
+    pub fn list(&self, buf: &mut [u8]) -> Result<usize> {
+        self.validate()?;
+        let mut total = 0usize;
+        let mut offset = size_of::<XattrHeader>();
+        while let Some(entry) = self.entry_at(offset)? {
+            if let Some(prefix) = entry.prefix() {
+                total = total
+                    .checked_add(prefix.len() + entry.name_len as usize + 1)
+                    .ok_or_else(|| Ext4Error::new(ErrCode::E2BIG))?;
+            }
+            offset += entry.used_size();
+        }
+        if buf.is_empty() {
+            return Ok(total);
+        }
+        if buf.len() < total {
+            return Err(Ext4Error::new(ErrCode::ERANGE));
+        }
+        offset = size_of::<XattrHeader>();
+        let mut written = 0;
+        while let Some(entry) = self.entry_at(offset)? {
+            if let Some(prefix) = entry.prefix() {
+                buf[written..written + prefix.len()].copy_from_slice(prefix);
+                written += prefix.len();
+                let suffix = &entry.name[..entry.name_len as usize];
+                buf[written..written + suffix.len()].copy_from_slice(suffix);
+                written += suffix.len();
+                buf[written] = 0;
+                written += 1;
+            }
+            offset += entry.used_size();
+        }
+        Ok(total)
+    }
+
+    /// Insert a sorted entry, allocating its value from the free area's end.
+    /// Value placement is independent of entry ordering, as on Linux ext4.
+    pub fn insert(&mut self, name: &[u8], value: &[u8]) -> bool {
+        if XattrEntry::validate_name(name).is_err() || self.validate_inline().is_err() {
             return false;
         }
-
-        // Move the entries from `ins_entry_pos` to `p_entry`
-        // Copy `[ins_entry_pos, p_entry)` to `[ins_entry_pos+ins_entry_size, p_entry+ins_entry_size)`
-        self.0
-            .data
-            .copy_within(ins_entry_pos..p_entry, ins_entry_pos + ins_entry_size);
-        // Set `[ins_entry_pos..ins_entry_pos+entry_req_size)` to 0
-        self.0.data[ins_entry_pos..ins_entry_pos + ins_entry_size].fill(0);
-
-        // Move the corresponding values
-        // Copy `[p_value, ins_value_pos)` to `[p_value-ins_value_size, ins_value_pos-ins_value_size)`
-        self.0
-            .data
-            .copy_within(p_value..ins_value_pos, p_value - ins_value_size);
-        // Set `[ins_value_pos-ins_value_size, ins_value_pos)` to 0
-        self.0.data[ins_value_pos - ins_value_size..ins_value_pos].fill(0);
-
-        // Update the value offset of the moved entries
-        let mut p_entry2 = ins_entry_pos + ins_entry_size;
-        while p_entry2 < p_entry + ins_entry_size {
-            let mut entry: XattrEntry = self.0.read_offset_as(p_entry2);
-            entry.value_offset -= ins_value_size as u16;
-            self.0.write_offset_as(p_entry2, &entry);
-            p_entry2 += entry.used_size();
+        let mut table_end = size_of::<XattrHeader>();
+        let mut value_start = BLOCK_SIZE;
+        let mut insert_at = None;
+        while let Ok(Some(entry)) = self.entry_at(table_end) {
+            if insert_at.is_none() && entry.compare_name(name).is_gt() {
+                insert_at = Some(table_end);
+            }
+            if entry.value_size != 0 {
+                value_start = value_start.min(entry.value_offset as usize);
+            }
+            table_end += entry.used_size();
         }
-
-        // Insert entry to `[ins_entry_pos, ins_entry_pos+ins_entry_size)`
-        let entry = XattrEntry::new(name, value.len(), ins_value_pos - ins_value_size);
-        self.0.write_offset_as(ins_entry_pos, &entry);
-        // Insert value to `[ins_value_pos-ins_value_size, ins_value_pos)`
-        self.0.write_offset(ins_value_pos - ins_value_size, value);
-
+        let insert_at = insert_at.unwrap_or(table_end);
+        let entry_size = XattrEntry::required_size(name);
+        let Some(storage_size) = xattr_value_storage_size(value.len()) else {
+            return false;
+        };
+        let Some(new_value_start) = value_start.checked_sub(storage_size) else {
+            return false;
+        };
+        if table_end
+            .checked_add(entry_size + 4)
+            .is_none_or(|end| end > new_value_start)
+        {
+            return false;
+        }
+        // Include the four-byte terminator in the table move.
+        self.0
+            .data
+            .copy_within(insert_at..table_end + 4, insert_at + entry_size);
+        self.0.data[insert_at..insert_at + entry_size].fill(0);
+        self.0.data[new_value_start..value_start].fill(0);
+        let entry = XattrEntry::new(
+            name,
+            value.len(),
+            if value.is_empty() { 0 } else { new_value_start },
+        );
+        self.0.write_offset_as(insert_at, &entry);
+        self.0.write_offset(new_value_start, value);
         self.rehash();
         true
     }
@@ -518,16 +612,18 @@ impl XattrBlock {
         let mut offset = size_of::<XattrHeader>();
         let mut block_hash = 0u32;
         let mut shareable = true;
-        while self.0.data[offset] != 0 {
+        while self.0.data[offset..offset + 4] != [0; 4] {
             let mut entry: XattrEntry = self.0.read_offset_as(offset);
             let mut hash = 0u32;
             for byte in &entry.name[..entry.name_len as usize] {
                 hash = hash.rotate_left(5) ^ u32::from(*byte);
             }
-            let start = entry.value_offset as usize;
-            let end = start + (entry.value_size as usize).div_ceil(4) * 4;
-            for word in self.0.data[start..end].chunks_exact(4) {
-                hash = hash.rotate_left(16) ^ u32::from_le_bytes(word.try_into().unwrap());
+            if entry.value_size != 0 {
+                let start = entry.value_offset as usize;
+                let end = start + (entry.value_size as usize).div_ceil(4) * 4;
+                for word in self.0.data[start..end].chunks_exact(4) {
+                    hash = hash.rotate_left(16) ^ u32::from_le_bytes(word.try_into().unwrap());
+                }
             }
             entry.hash = hash;
             shareable &= hash != 0;
@@ -540,73 +636,49 @@ impl XattrBlock {
         self.0.write_offset_as(0, &header);
     }
 
-    /// Remove a xattr entry from the block. Return true if success.
-    pub fn remove(&mut self, name: &str) -> bool {
-        let mut p_entry = size_of::<XattrHeader>();
-        let mut p_value = BLOCK_SIZE;
-
-        let mut is_rem_pos_found = false;
-        let mut rem_entry_pos = p_entry;
-        let mut rem_value_pos = p_value;
-        let mut rem_entry_size = 0;
-        let mut rem_value_size = 0;
-
-        // Iterate over entry table, find the entry to remove
-        while p_entry < BLOCK_SIZE {
-            // Check `name_len`, 0 indicates the end of the entry table.
-            if self.0.data[p_entry] == 0 {
-                break;
-            }
-            let entry: XattrEntry = self.0.read_offset_as(p_entry);
-            p_value = entry.value_offset as usize;
-            // Compare name
-            if !is_rem_pos_found && entry.compare_name(name).is_eq() {
-                rem_entry_pos = p_entry;
-                rem_value_pos = p_value;
-                rem_entry_size = entry.used_size();
-                let Some(storage_size) = xattr_value_storage_size(entry.value_size as usize) else {
-                    return false;
-                };
-                rem_value_size = storage_size;
-                is_rem_pos_found = true;
-            }
-            p_entry += entry.used_size();
-        }
-        if !is_rem_pos_found {
+    /// Remove an entry and compact the physical value region independently
+    /// from the sorted entry table. Linux images need not order the two alike.
+    pub fn remove(&mut self, name: &[u8]) -> bool {
+        if self.validate_inline().is_err() {
             return false;
         }
-
-        // `rem_entry_pos` points to the entry to remove,
-        // `rem_value_pos` points to the value to remove.
-        // `p_entry` points to the start of blank area,
-        // `p_value` points to the last value,
-        // `[p_entry, p_value)` is the blank area.
-
-        // Move the following entries
-        // Copy `[rem_entry_pos + rem_entry_size, p_entry)` to `[rem_entry_pos, p_entry - rem_entry_size)`
-        self.0
-            .data
-            .copy_within(rem_entry_pos + rem_entry_size..p_entry, rem_entry_pos);
-        // Set `[p_entry - rem_entry_size, p_entry)` to 0
-        self.0.data[p_entry - rem_entry_size..p_entry].fill(0);
-
-        // Move the corresponding values
-        // Copy `[p_value, rem_value_pos)` to `[p_value + rem_value_size, rem_value_pos + rem_value_size)`
-        self.0
-            .data
-            .copy_within(p_value..rem_value_pos, p_value + rem_value_size);
-        // Set `[p_value, p_value + rem_value_size)` to 0
-        self.0.data[p_value..p_value + rem_value_size].fill(0);
-
-        // Update the value offset of the moved entries
-        let mut p_entry2 = rem_entry_pos;
-        while p_entry2 < p_entry - rem_entry_size {
-            let mut entry: XattrEntry = self.0.read_offset_as(p_entry2);
-            entry.value_offset += rem_value_size as u16;
-            self.0.write_offset_as(p_entry2, &entry);
-            p_entry2 += entry.used_size();
+        let mut table_end = size_of::<XattrHeader>();
+        let mut value_start = BLOCK_SIZE;
+        let mut removed = None;
+        while let Ok(Some(entry)) = self.entry_at(table_end) {
+            if entry.value_size != 0 {
+                value_start = value_start.min(entry.value_offset as usize);
+            }
+            let next = table_end + entry.used_size();
+            if entry.compare_name(name).is_eq() {
+                removed = Some((table_end, entry));
+            }
+            table_end = next;
         }
-
+        let Some((entry_start, entry)) = removed else {
+            return false;
+        };
+        let entry_size = entry.used_size();
+        let removed_start = entry.value_offset as usize;
+        let storage_size = xattr_value_storage_size(entry.value_size as usize).unwrap();
+        self.0
+            .data
+            .copy_within(entry_start + entry_size..table_end + 4, entry_start);
+        self.0.data[table_end + 4 - entry_size..table_end + 4].fill(0);
+        if storage_size != 0 {
+            self.0
+                .data
+                .copy_within(value_start..removed_start, value_start + storage_size);
+            self.0.data[value_start..value_start + storage_size].fill(0);
+            let mut offset = size_of::<XattrHeader>();
+            while let Some(mut other) = self.entry_at(offset).unwrap() {
+                if other.value_size != 0 && (other.value_offset as usize) < removed_start {
+                    other.value_offset += storage_size as u16;
+                    self.0.write_offset_as(offset, &other);
+                }
+                offset += other.used_size();
+            }
+        }
         self.rehash();
         true
     }
@@ -620,14 +692,14 @@ mod release_tests {
     fn mutation_hashes_name_suffix_and_padded_values_like_linux() {
         let mut block = XattrBlock::new(Block::new(9, Box::new([0; BLOCK_SIZE])));
         block.init();
-        assert!(block.insert("user.a", &[1, 2, 3]));
+        assert!(block.insert(b"user.a", &[1, 2, 3]));
         let first: XattrEntry = block.0.read_offset_as(size_of::<XattrHeader>());
         assert_eq!(first.hash, 0x0062_0201);
         let header: XattrHeader = block.0.read_offset_as(0);
         assert_eq!(header.hash, first.hash);
-        assert!(block.remove("user.a"));
+        assert!(block.remove(b"user.a"));
         assert_eq!(block.0.read_offset_as::<XattrHeader>(0).hash, 0);
-        assert!(block.insert("user.a", &[]));
+        assert!(block.insert(b"user.a", &[]));
         assert_eq!(
             block
                 .0
@@ -635,6 +707,256 @@ mod release_tests {
                 .hash,
             97
         );
+    }
+
+    #[test]
+    fn byte_names_list_without_conversion_and_preserve_output_on_range_error() {
+        let mut block = XattrBlock::new(Block::new(9, Box::new([0; BLOCK_SIZE])));
+        block.init();
+        assert!(block.insert(b"user.\xff", b"one"));
+        assert!(block.insert(b"user.\xfe", b"two"));
+        assert_eq!(block.get(b"user.\xff").unwrap(), Some(&b"one"[..]));
+        let size = block.list(&mut []).unwrap();
+        assert_eq!(size, 14);
+        let mut short = [0xa5; 13];
+        assert_eq!(block.list(&mut short).unwrap_err().code(), ErrCode::ERANGE);
+        assert_eq!(short, [0xa5; 13]);
+        let mut output = [0xa5; 18];
+        assert_eq!(block.list(&mut output).unwrap(), size);
+        assert_eq!(&output[..size], b"user.\xfe\0user.\xff\0");
+        assert_eq!(&output[size..], &[0xa5; 4]);
+    }
+
+    #[test]
+    fn mutation_uses_physical_value_offsets_and_accepts_empty_offset_zero() {
+        let mut block = XattrBlock::new(Block::new(9, Box::new([0; BLOCK_SIZE])));
+        block.init();
+        // A Linux-valid preexisting image: sorted entries, independently
+        // placed values with a gap, and an empty value with offset zero.
+        let next = add_inline_entry(&mut block.0.data, size_of::<XattrHeader>(), b"a", 4080, 5);
+        let next = add_inline_entry(&mut block.0.data, next, b"z", 4092, 4);
+        add_inline_entry(&mut block.0.data, next, b"empty", 0, 0);
+        block.0.data[4080..4085].copy_from_slice(b"first");
+        block.0.data[4092..4096].copy_from_slice(b"last");
+        assert!(block.insert(b"user.m", b"middle"));
+        assert_eq!(block.get(b"user.empty").unwrap(), Some(&b""[..]));
+        assert!(block.remove(b"user.z"));
+        assert_eq!(block.get(b"user.a").unwrap(), Some(&b"first"[..]));
+        assert_eq!(block.get(b"user.m").unwrap(), Some(&b"middle"[..]));
+        assert!(block.remove(b"user.empty"));
+        assert!(block.insert(b"user.b", b"new"));
+        assert!(block.remove(b"user.a"));
+        assert_eq!(block.get(b"user.m").unwrap(), Some(&b"middle"[..]));
+        assert_eq!(block.get(b"user.b").unwrap(), Some(&b"new"[..]));
+        assert!(validate_xattr_block_for_release(&block.0.data[..]).is_some());
+    }
+
+    #[test]
+    fn zero_suffix_acl_is_not_a_terminator_and_namespace_names_are_exact() {
+        let mut block = XattrBlock::new(Block::new(9, Box::new([0; BLOCK_SIZE])));
+        block.init();
+        assert!(block.insert(b"system.posix_acl_access", b"acl"));
+        assert!(block.insert(b"security.tail", b"present"));
+        assert!(block.insert(b"gnu.test", b"gnu"));
+        let mut names = [0; 128];
+        let size = block.list(&mut names).unwrap();
+        assert_eq!(
+            &names[..size],
+            b"system.posix_acl_access\0security.tail\0gnu.test\0"
+        );
+        assert_eq!(block.get(b"security.tail").unwrap(), Some(&b"present"[..]));
+        assert!(block.remove(b"system.posix_acl_access"));
+        assert_eq!(block.get(b"security.tail").unwrap(), Some(&b"present"[..]));
+        assert_eq!(
+            XattrEntry::validate_name(b"system.unknown")
+                .unwrap_err()
+                .code(),
+            ErrCode::ENOTSUP
+        );
+    }
+
+    #[test]
+    fn linux_hurd_raw_index_10_lists_and_reads_original_bytes() {
+        let mut block = XattrBlock::new(Block::new(9, Box::new([0; BLOCK_SIZE])));
+        block.init();
+        let offset = size_of::<XattrHeader>();
+        // Linux 6.6 fs/ext4/xattr.h assigns the on-disk Hurd namespace 10.
+        // Build its bytes independently of the production name encoder.
+        add_inline_entry(&mut block.0.data, offset, b"test\xff", 4084, 10);
+        block.0.data[offset + 1] = 10;
+        block.0.data[4084..4094].copy_from_slice(b"linux-hurd");
+        let mut names = [0xa5; 32];
+        let size = block.list(&mut names).unwrap();
+        assert_eq!(&names[..size], b"gnu.test\xff\0");
+        assert_eq!(
+            block.get(b"gnu.test\xff").unwrap(),
+            Some(&b"linux-hurd"[..])
+        );
+        assert!(names[size..].iter().all(|byte| *byte == 0xa5));
+    }
+
+    #[test]
+    fn linux_hurd_encoder_uses_numeric_index_10() {
+        let entry = XattrEntry::new(b"gnu.test", 4, 4092);
+        assert_eq!(entry.name_index, 10);
+        assert_eq!(&entry.name[..entry.name_len as usize], b"test");
+    }
+
+    #[test]
+    fn linux_system_raw_index_7_is_hidden_and_preserved_when_other_names_change() {
+        let mut block = XattrBlock::new(Block::new(9, Box::new([0; BLOCK_SIZE])));
+        block.init();
+        let offset = size_of::<XattrHeader>();
+        // Numeric index 7 is SYSTEM, not Hurd. It has no generic handler.
+        add_inline_entry(&mut block.0.data, offset, b"test", 4088, 6);
+        block.0.data[offset + 1] = 7;
+        block.0.data[4088..4094].copy_from_slice(b"system");
+        let mut names = [0xa5; 32];
+        assert_eq!(block.list(&mut names).unwrap(), 0);
+        assert_eq!(names, [0xa5; 32]);
+        assert_eq!(block.get(b"gnu.test").unwrap(), None);
+        assert!(block.insert(b"user.a", b"new"));
+        assert_eq!(block.get(b"user.a").unwrap(), Some(&b"new"[..]));
+        let mut cursor = offset;
+        let mut preserved = false;
+        while let Some(entry) = block.entry_at(cursor).unwrap() {
+            if entry.name_index == 7 {
+                assert_eq!(&entry.name[..entry.name_len as usize], b"test");
+                let start = entry.value_offset as usize;
+                assert_eq!(
+                    &block.0.data[start..start + entry.value_size as usize],
+                    b"system"
+                );
+                preserved = true;
+            }
+            cursor += entry.used_size();
+        }
+        assert!(preserved);
+        assert!(block.remove(b"user.a"));
+        let entry = block.entry_at(offset).unwrap().unwrap();
+        assert_eq!(entry.name_index, 7);
+        assert_eq!(&entry.name[..entry.name_len as usize], b"test");
+        let start = entry.value_offset as usize;
+        assert_eq!(
+            &block.0.data[start..start + entry.value_size as usize],
+            b"system"
+        );
+        assert_eq!(block.list(&mut []).unwrap(), 0);
+        assert_eq!(block.get(b"gnu.test").unwrap(), None);
+    }
+
+    #[test]
+    fn external_values_can_be_listed_but_are_never_read_as_inline_data() {
+        let mut block = XattrBlock::new(Block::new(9, Box::new([0; BLOCK_SIZE])));
+        block.init();
+        assert!(block.insert(b"user.external", b"data"));
+        let offset = size_of::<XattrHeader>();
+        let mut entry: XattrEntry = block.0.read_offset_as(offset);
+        entry.value_inum = 123;
+        entry.value_offset = 0;
+        block.0.write_offset_as(offset, &entry);
+        let mut names = [0; 32];
+        let size = block.list(&mut names).unwrap();
+        assert_eq!(&names[..size], b"user.external\0");
+        assert_eq!(
+            block.get(b"user.external").unwrap_err().code(),
+            ErrCode::ENOTSUP
+        );
+        assert_eq!(
+            block.validate_inline().unwrap_err().code(),
+            ErrCode::ENOTSUP
+        );
+    }
+
+    #[test]
+    fn malformed_blocks_fail_before_copy_or_mutation_and_unknown_indices_are_hidden() {
+        let mut block = XattrBlock::new(Block::new(9, Box::new([0; BLOCK_SIZE])));
+        block.init();
+        assert!(block.insert(b"user.a", b"value"));
+        let offset = size_of::<XattrHeader>();
+        let mut entry: XattrEntry = block.0.read_offset_as(offset);
+        entry.name_index = 99;
+        block.0.write_offset_as(offset, &entry);
+        assert_eq!(block.list(&mut []).unwrap(), 0);
+        entry.value_offset = 40; // Overlaps the table.
+        block.0.write_offset_as(offset, &entry);
+        let mut output = [0xa5; 32];
+        assert_eq!(block.list(&mut output).unwrap_err().code(), ErrCode::EIO);
+        assert_eq!(output, [0xa5; 32]);
+        assert!(!block.remove(b"user.a"));
+
+        block.init();
+        assert!(block.insert(b"user.empty", b""));
+        let mut empty: XattrEntry = block.0.read_offset_as(offset);
+        empty.value_offset = u16::MAX;
+        block.0.write_offset_as(offset, &empty);
+        assert!(block.insert(b"user.a", b"data"));
+        assert!(block.remove(b"user.a"));
+        assert!(block.remove(b"user.empty"));
+
+        block.init();
+        assert!(block.insert(b"user.a", b"data"));
+        assert!(block.insert(b"user.b", b"more"));
+        let first: XattrEntry = block.0.read_offset_as(offset);
+        let second_offset = offset + first.used_size();
+        let mut second: XattrEntry = block.0.read_offset_as(second_offset);
+        second.value_offset = first.value_offset;
+        block.0.write_offset_as(second_offset, &second);
+        assert_eq!(block.validate_inline().unwrap_err().code(), ErrCode::EIO);
+        assert!(!block.insert(b"user.c", b"new"));
+
+        // Walk a valid fixed-width prefix up to the end of the block. Unknown
+        // indices with empty suffixes are real entries, not terminators.
+        for (remaining, tail_name_len) in [(4, 0), (8, 0), (12, 0), (16, 0), (20, 5), (20, 4)] {
+            block.init();
+            let tail = BLOCK_SIZE - remaining;
+            let mut cursor = size_of::<XattrHeader>();
+            let extra = (tail - cursor) % size_of::<FakeXattrEntry>();
+            let mut raw = FakeXattrEntry {
+                name_len: extra as u8,
+                name_index: 99,
+                value_offset: 0,
+                value_inum: 0,
+                value_size: 0,
+                hash: 0,
+            };
+            if extra != 0 {
+                block.0.write_offset_as(cursor, &raw);
+                block.0.data[cursor + size_of::<FakeXattrEntry>()
+                    ..cursor + size_of::<FakeXattrEntry>() + extra]
+                    .fill(b'a');
+                cursor += size_of::<FakeXattrEntry>() + extra;
+            }
+            raw.name_len = 0;
+            while cursor < tail {
+                block.0.write_offset_as(cursor, &raw);
+                cursor += size_of::<FakeXattrEntry>();
+            }
+            assert_eq!(cursor, tail);
+            // The final item respectively lacks fixed bytes, name bytes, or
+            // the mandatory four bytes after its complete aligned entry.
+            raw.name_len = tail_name_len;
+            let fixed = raw.to_bytes();
+            let copied = remaining.min(fixed.len());
+            block.0.data[tail..tail + copied].copy_from_slice(&fixed[..copied]);
+            if remaining > fixed.len() {
+                block.0.data[tail + fixed.len()..].fill(b'b');
+            }
+            let mut output = [0xa5; 32];
+            assert_eq!(block.get(b"user.a").unwrap_err().code(), ErrCode::EIO);
+            assert_eq!(block.list(&mut output).unwrap_err().code(), ErrCode::EIO);
+            assert_eq!(output, [0xa5; 32]);
+        }
+
+        block.init();
+        assert!(block.insert(b"user.a", b"data"));
+        let mut entry: XattrEntry = block.0.read_offset_as(offset);
+        entry.value_size = 8; // Offset 4092 plus eight bytes exceeds the block.
+        block.0.write_offset_as(offset, &entry);
+        let mut output = [0xa5; 32];
+        assert_eq!(block.get(b"user.a").unwrap_err().code(), ErrCode::EIO);
+        assert_eq!(block.list(&mut output).unwrap_err().code(), ErrCode::EIO);
+        assert_eq!(output, [0xa5; 32]);
     }
 
     fn add_inline_entry(
@@ -712,12 +1034,12 @@ mod release_tests {
         let block_id = 17;
         let mut block = XattrBlock::new(Block::new(block_id, Box::new([0; BLOCK_SIZE])));
         block.init();
-        assert!(block.insert("user.test", b"value"));
+        assert!(block.insert(b"user.test", b"value"));
         assert!(validate_xattr_block_for_release(&block.0.data[..]).is_some());
         assert!(block.update_checksum(seed, block_id));
         assert!(block.verify_checksum(seed, block_id));
 
-        assert!(block.remove("user.test"));
+        assert!(block.remove(b"user.test"));
         assert!(validate_xattr_block_for_release(&block.0.data[..]).is_some());
         assert!(!block.verify_checksum(seed, block_id));
         assert!(block.update_checksum(seed, block_id));
@@ -730,19 +1052,19 @@ mod release_tests {
         let mut block = XattrBlock::new(Block::new(17, Box::new([0; BLOCK_SIZE])));
         block.init();
 
-        assert!(block.insert("user.first", b"1234567"));
-        assert!(block.insert("user.second", b"abc"));
-        assert!(block.insert("user.third", b"12345"));
-        assert_eq!(block.get("user.first"), Some(&b"1234567"[..]));
-        assert_eq!(block.get("user.second"), Some(&b"abc"[..]));
-        assert_eq!(block.get("user.third"), Some(&b"12345"[..]));
+        assert!(block.insert(b"user.first", b"1234567"));
+        assert!(block.insert(b"user.second", b"abc"));
+        assert!(block.insert(b"user.third", b"12345"));
+        assert_eq!(block.get(b"user.first").unwrap(), Some(&b"1234567"[..]));
+        assert_eq!(block.get(b"user.second").unwrap(), Some(&b"abc"[..]));
+        assert_eq!(block.get(b"user.third").unwrap(), Some(&b"12345"[..]));
         assert!(validate_xattr_block_for_release(&block.0.data[..]).is_some());
 
-        assert!(block.remove("user.first"));
-        assert!(block.remove("user.third"));
-        assert_eq!(block.get("user.first"), None);
-        assert_eq!(block.get("user.second"), Some(&b"abc"[..]));
-        assert_eq!(block.get("user.third"), None);
+        assert!(block.remove(b"user.first"));
+        assert!(block.remove(b"user.third"));
+        assert_eq!(block.get(b"user.first").unwrap(), None);
+        assert_eq!(block.get(b"user.second").unwrap(), Some(&b"abc"[..]));
+        assert_eq!(block.get(b"user.third").unwrap(), None);
         assert!(validate_xattr_block_for_release(&block.0.data[..]).is_some());
     }
 

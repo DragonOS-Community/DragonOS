@@ -14,14 +14,14 @@ use alloc::sync::Arc;
 type XattrStorage = alloc::vec::Vec<u8>;
 use system_error::SystemError;
 
-pub(super) const OVL_XATTR_ORIGIN: &str = "trusted.dragonos.overlay.origin";
-const OVL_XATTR_PRIVATE_PREFIX: &str = "trusted.overlay.";
-const XATTR_USER_PREFIX: &str = "user.";
-const XATTR_TRUSTED_PREFIX: &str = "trusted.";
-const XATTR_SECURITY_PREFIX: &str = "security.";
-const XATTR_POSIX_ACL_ACCESS: &str = "system.posix_acl_access";
-const XATTR_POSIX_ACL_DEFAULT: &str = "system.posix_acl_default";
-const XATTR_SECURITY_CAPABILITY: &str = "security.capability";
+pub(super) const OVL_XATTR_ORIGIN: &[u8] = b"trusted.dragonos.overlay.origin";
+const OVL_XATTR_PRIVATE_PREFIX: &[u8] = b"trusted.overlay.";
+const XATTR_USER_PREFIX: &[u8] = b"user.";
+const XATTR_TRUSTED_PREFIX: &[u8] = b"trusted.";
+const XATTR_SECURITY_PREFIX: &[u8] = b"security.";
+const XATTR_POSIX_ACL_ACCESS: &[u8] = b"system.posix_acl_access";
+const XATTR_POSIX_ACL_DEFAULT: &[u8] = b"system.posix_acl_default";
+const XATTR_SECURITY_CAPABILITY: &[u8] = b"security.capability";
 const XATTR_MAX_SIZE: usize = 65_536;
 const XATTR_READ_RETRIES: usize = 3;
 const ORIGIN_MAGIC: [u8; 4] = *b"DOVL";
@@ -114,18 +114,18 @@ fn is_origin_xattr_unavailable(err: &SystemError) -> bool {
     is_unsupported(err) || *err == SystemError::EPERM
 }
 
-fn is_private_xattr(name: &str) -> bool {
+fn is_private_xattr(name: &[u8]) -> bool {
     name.starts_with(OVL_XATTR_PRIVATE_PREFIX) || name == OVL_XATTR_ORIGIN
 }
 
-fn caller_may_access_xattr(name: &str) -> bool {
+fn caller_may_access_xattr(name: &[u8]) -> bool {
     !name.starts_with(XATTR_TRUSTED_PREFIX)
         || ProcessManager::current_pcb()
             .cred()
             .has_capability(CAPFlags::CAP_SYS_ADMIN)
 }
 
-fn check_xattr_mutation_permission(inode: &OvlInode, name: &str) -> Result<(), SystemError> {
+fn check_xattr_mutation_permission(inode: &OvlInode, name: &[u8]) -> Result<(), SystemError> {
     let cred = ProcessManager::current_pcb().cred();
     let metadata = inode.metadata()?;
     if metadata
@@ -140,7 +140,7 @@ fn check_xattr_mutation_permission(inode: &OvlInode, name: &str) -> Result<(), S
             .then_some(())
             .ok_or(SystemError::EPERM);
     }
-    if name == "security.capability" {
+    if name == XATTR_SECURITY_CAPABILITY {
         return cred
             .has_capability(CAPFlags::CAP_SETFCAP)
             .then_some(())
@@ -176,7 +176,7 @@ fn check_xattr_mutation_permission(inode: &OvlInode, name: &str) -> Result<(), S
     cred.inode_permission(&metadata, PermissionMask::MAY_WRITE.bits())
 }
 
-fn check_xattr_read_permission(inode: &OvlInode, name: &str) -> Result<(), SystemError> {
+fn check_xattr_read_permission(inode: &OvlInode, name: &[u8]) -> Result<(), SystemError> {
     if !name.starts_with(XATTR_USER_PREFIX) {
         return Ok(());
     }
@@ -189,7 +189,7 @@ fn check_xattr_read_permission(inode: &OvlInode, name: &str) -> Result<(), Syste
         .inode_permission(&metadata, PermissionMask::MAY_READ.bits())
 }
 
-fn must_copy_xattr(name: &str) -> bool {
+fn must_copy_xattr(name: &[u8]) -> bool {
     name == XATTR_POSIX_ACL_ACCESS
         || name == XATTR_POSIX_ACL_DEFAULT
         || name.starts_with(XATTR_SECURITY_PREFIX)
@@ -329,7 +329,7 @@ pub(super) fn xattr_read_error(error: MemoryAllocationError) -> SystemError {
 
 fn for_each_xattr_name<E: From<SystemError>>(
     list: &[u8],
-    mut visit: impl FnMut(&str) -> Result<(), E>,
+    mut visit: impl FnMut(&[u8]) -> Result<(), E>,
 ) -> Result<(), E> {
     let mut offset = 0usize;
     while offset < list.len() {
@@ -341,7 +341,7 @@ fn for_each_xattr_name<E: From<SystemError>>(
             return Err(SystemError::EIO.into());
         }
         let end = offset.checked_add(relative_end).ok_or(SystemError::E2BIG)?;
-        let name = core::str::from_utf8(&list[offset..end]).map_err(|_| SystemError::EIO)?;
+        let name = &list[offset..end];
         visit(name)?;
         offset = end.checked_add(1).ok_or(SystemError::E2BIG)?;
     }
@@ -643,7 +643,11 @@ pub(super) fn resize_file_with_metadata(
     super::file::resize_file_with_metadata(inode, data, len, lock_owner, &upper_metadata, mask)
 }
 
-pub(super) fn getxattr(inode: &OvlInode, name: &str, buf: &mut [u8]) -> Result<usize, SystemError> {
+pub(super) fn getxattr(
+    inode: &OvlInode,
+    name: &[u8],
+    buf: &mut [u8],
+) -> Result<usize, SystemError> {
     if is_private_xattr(name) {
         return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
     }
@@ -658,7 +662,7 @@ pub(super) fn getxattr(inode: &OvlInode, name: &str, buf: &mut [u8]) -> Result<u
 
 pub(super) fn setxattr(
     inode: &OvlInode,
-    name: &str,
+    name: &[u8],
     value: &[u8],
     flags: XattrFlags,
 ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
@@ -697,7 +701,7 @@ fn copy_visible_xattr_names(
     buf: &mut [u8],
     may_list_trusted: bool,
 ) -> Result<usize, SystemError> {
-    let visible = |name: &str| {
+    let visible = |name: &[u8]| {
         !is_private_xattr(name) && (may_list_trusted || !name.starts_with(XATTR_TRUSTED_PREFIX))
     };
     // Fully validate even a size query or a too-small output before touching
@@ -720,7 +724,7 @@ fn copy_visible_xattr_names(
     for_each_xattr_name::<SystemError>(list, |name| {
         if visible(name) {
             let end = offset + name.len();
-            buf[offset..end].copy_from_slice(name.as_bytes());
+            buf[offset..end].copy_from_slice(name);
             buf[end] = 0;
             offset = end + 1;
         }
@@ -731,7 +735,7 @@ fn copy_visible_xattr_names(
 
 pub(super) fn removexattr(
     inode: &OvlInode,
-    name: &str,
+    name: &[u8],
 ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
     if is_private_xattr(name) {
         return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP.into());

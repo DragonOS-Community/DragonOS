@@ -3463,7 +3463,7 @@ impl IndexNode for LockedExt4Inode {
         Ok(self.inner.lock().dname.clone())
     }
 
-    fn getxattr(&self, name: &str, buf: &mut [u8]) -> Result<usize, SystemError> {
+    fn getxattr(&self, name: &[u8], buf: &mut [u8]) -> Result<usize, SystemError> {
         let _operation = self.begin_operation()?;
         let guard = self.inner.lock();
         let fs = guard.concret_fs();
@@ -3478,29 +3478,12 @@ impl IndexNode for LockedExt4Inode {
             return Err(SystemError::EPERM);
         }
 
-        // 调用another_ext4库的getxattr接口
-        let value = fs.retry_metadata_read_contention(|| ext4.getxattr(inode_num, name))?;
-
-        // 如果缓冲区为空，只返回需要的长度
-        if buf.is_empty() {
-            return Ok(value.len());
-        }
-
-        // 检查缓冲区大小是否足够
-        if buf.len() < value.len() {
-            return Err(SystemError::ERANGE);
-        }
-
-        // 复制数据到缓冲区
-        let copy_len = core::cmp::min(buf.len(), value.len());
-        buf[..copy_len].copy_from_slice(&value[..copy_len]);
-
-        Ok(copy_len)
+        fs.retry_metadata_read_contention(|| ext4.getxattr(inode_num, name, buf))
     }
 
     fn setxattr(
         &self,
-        name: &str,
+        name: &[u8],
         value: &[u8],
         flags: XattrFlags,
     ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
@@ -3539,35 +3522,12 @@ impl IndexNode for LockedExt4Inode {
         let ext4 = &fs.fs;
         let inode_num = guard.inner_inode_num;
 
-        let names = fs.retry_metadata_read_contention(|| ext4.listxattr(inode_num))?;
-        let total_len = names.iter().try_fold(0usize, |acc, name| {
-            acc.checked_add(name.len())
-                .and_then(|len| len.checked_add(1))
-                .ok_or(SystemError::E2BIG)
-        })?;
-
-        if buf.is_empty() {
-            return Ok(total_len);
-        }
-        if buf.len() < total_len {
-            return Err(SystemError::ERANGE);
-        }
-
-        let mut offset = 0;
-        for name in names {
-            let name_bytes = name.as_bytes();
-            let next = offset + name_bytes.len();
-            buf[offset..next].copy_from_slice(name_bytes);
-            buf[next] = 0;
-            offset = next + 1;
-        }
-
-        Ok(total_len)
+        fs.retry_metadata_read_contention(|| ext4.listxattr(inode_num, buf))
     }
 
     fn removexattr(
         &self,
-        name: &str,
+        name: &[u8],
     ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
         let _operation = self.begin_operation()?;
         let _size_change = self.size_change_lock.write();
@@ -4599,8 +4559,10 @@ impl LockedExt4Inode {
         };
         // Linux cap_inode_need_killpriv treats only a positive raw xattr size
         // as a removal request, including malformed but nonempty values.
-        fs.retry_metadata_read_contention(|| fs.fs.getxattr(inode_num, "security.capability"))
-            .is_ok_and(|value| !value.is_empty())
+        fs.retry_metadata_read_contention(|| {
+            fs.fs.getxattr(inode_num, b"security.capability", &mut [])
+        })
+        .is_ok_and(|size| size > 0)
     }
 
     /// Caller holds size_change_lock (read or write) and has completed any
@@ -4614,7 +4576,8 @@ impl LockedExt4Inode {
             let guard = self.inner.lock();
             (guard.concret_fs(), guard.inner_inode_num)
         };
-        match fs.retry_metadata_contention(|| fs.fs.removexattr(inode_num, "security.capability")) {
+        match fs.retry_metadata_contention(|| fs.fs.removexattr(inode_num, b"security.capability"))
+        {
             Ok(()) | Err(SystemError::ENODATA) | Err(SystemError::EOPNOTSUPP_OR_ENOTSUP) => Ok(()),
             Err(error) => Err(error),
         }

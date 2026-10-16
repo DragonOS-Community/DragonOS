@@ -119,6 +119,10 @@ fn render_arp_slice(
 }
 
 impl FileOps for ArpFileOps {
+    fn supports_read_iter_flags(&self) -> bool {
+        false
+    }
+
     fn open(
         &self,
         data: &mut MutexGuard<FilePrivateData>,

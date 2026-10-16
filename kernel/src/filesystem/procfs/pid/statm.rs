@@ -37,6 +37,10 @@ impl StatmFileOps {
 }
 
 impl FileOps for StatmFileOps {
+    fn supports_read_iter_flags(&self) -> bool {
+        false
+    }
+
     fn read_at(
         &self,
         offset: usize,

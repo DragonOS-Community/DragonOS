@@ -80,7 +80,8 @@ pub fn do_preadv(fd: i32, iovecs: &IoVecs, offset: isize) -> Result<usize, Syste
 
     drop(fd_table_guard);
 
-    read_iovecs(file.as_ref(), iovecs, offset as usize)
+    file.verify_pread_access()?;
+    read_iovecs(file.as_ref(), iovecs, offset as usize, 0)
 }
 
 /// Complete one positional-vector read and publish ACCESS at the vector
@@ -90,7 +91,16 @@ pub(super) fn read_iovecs(
     file: &File,
     iovecs: &IoVecs,
     offset: usize,
+    flags: u32,
 ) -> Result<usize, SystemError> {
+    file.readable()?;
+    let requested = iovecs.total_len();
+    if requested == 0 {
+        file.notify_io_event(FsEvent::ACCESS);
+        return Ok(0);
+    }
+    file.verify_pread_range(offset, requested)?;
+    super::sys_preadv2::validate_read_flags(file, flags)?;
     // TODO: Support scatter-gather I/O directly in FS to avoid this copy.
     let mut data = iovecs.new_buf(true)?;
     let read_len = file.pread_syscall_chunk(offset, data.len(), &mut data)?;

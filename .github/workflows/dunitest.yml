@@ -53,6 +53,9 @@ jobs:
           normal/ext4_orphan_recovery
           normal/ext4_nested_writeback
           normal/ext4_shared_xattr
+          normal/pipe_write_fault
+          normal/pipe_empty_slot
+          normal/preadv2_flags
           EOF
 
       - name: Build DragonOS

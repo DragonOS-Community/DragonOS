@@ -920,6 +920,15 @@ impl File {
         if inode.supports_pwrite() {
             mode.insert(FileMode::FMODE_PWRITE);
         }
+        // Establish default I/O capabilities before the provider configures
+        // its operation table. Owners without a read/write method can clear
+        // these bits, including when an existing description is reopened.
+        if mode.contains(FileMode::FMODE_READ) {
+            mode.insert(FileMode::FMODE_CAN_READ);
+        }
+        if mode.contains(FileMode::FMODE_WRITE) {
+            mode.insert(FileMode::FMODE_CAN_WRITE);
+        }
     }
 
     pub fn resolved_path(&self) -> Result<super::utils::ResolvedPath, SystemError> {
@@ -1174,10 +1183,19 @@ impl File {
         &self,
         actual_offset: usize,
         actual_len: usize,
-        reader: &UserBufferReader<'_>,
+        input: &UserBuffer<'_>,
         config: WriteConfig,
         creator: &Arc<crate::cgroup::memory::object::ObjectAccount>,
     ) -> Result<DelegatedWriteResult, MemoryAllocationError> {
+        if let Some(result) =
+            self.write_user_buffer_at_and_finalize(actual_offset, actual_len, input, config)?
+        {
+            return Ok(result);
+        }
+        // Only the scalar entry reaches this fallback. Keep the old reader
+        // interface for sockets and native privilege-aware primary writes.
+        let reader =
+            UserBufferReader::new(input.user_addr().data() as *const u8, input.len(), true)?;
         let mut publish = || {
             if !self.mode.read().contains(FileMode::FMODE_NONOTIFY) {
                 self.notify_dentry_event(FsEvent::ATTRIB);
@@ -1187,7 +1205,7 @@ impl File {
         let (written_len, sync_result, sync_range) =
             if self.post_write_sync == PostWriteSyncPolicy::Delegated {
                 let result =
-                    PrimaryWriteSource::User(reader, creator).with_buffer(actual_len, |buf| {
+                    PrimaryWriteSource::User(&reader, creator).with_buffer(actual_len, |buf| {
                         self.inode.write_at_with_sync_with_privilege_stage(
                             actual_offset,
                             actual_len.min(buf.len()),
@@ -1206,14 +1224,14 @@ impl File {
                 let written_len = match self.inode.write_user_at(
                     actual_offset,
                     actual_len,
-                    reader,
+                    &reader,
                     self.private_data.lock(),
                 )? {
                     Some(written_len) => written_len,
                     None => self.inode.write_primary_with_privilege_stage(
                         actual_offset,
                         actual_len,
-                        PrimaryWriteSource::User(reader, creator),
+                        PrimaryWriteSource::User(&reader, creator),
                         self.private_data.lock(),
                         &mut stage,
                     )?,
@@ -1228,6 +1246,34 @@ impl File {
             sync_result: sync_result.unwrap_or(Ok(())),
             sync_range,
         })
+    }
+
+    fn write_user_buffer_at_and_finalize(
+        &self,
+        offset: usize,
+        len: usize,
+        input: &UserBuffer<'_>,
+        config: WriteConfig,
+    ) -> Result<Option<DelegatedWriteResult>, MemoryAllocationError> {
+        // Delegated native providers own their privilege and sync transaction.
+        if self.post_write_sync == PostWriteSyncPolicy::Delegated {
+            return Ok(None);
+        }
+        let Some(written) =
+            self.inode
+                .write_user_buffer_at(offset, len, input, self.private_data.lock())?
+        else {
+            return Ok(None);
+        };
+        if written > len {
+            return Err(SystemError::EIO.into());
+        }
+        let written_len = self.finalize_write(offset, written, config, false)?;
+        Ok(Some(DelegatedWriteResult {
+            written_len,
+            sync_result: Ok(()),
+            sync_range: None,
+        }))
     }
 
     fn finalize_write(
@@ -1733,12 +1779,6 @@ impl File {
         self.inode
             .configure_open_file(&self.private_data.lock(), &mut behavior);
         mode = behavior.mode;
-        if mode.contains(FileMode::FMODE_READ) {
-            mode.insert(FileMode::FMODE_CAN_READ);
-        }
-        if mode.contains(FileMode::FMODE_WRITE) {
-            mode.insert(FileMode::FMODE_CAN_WRITE);
-        }
         if self._mount_writer.is_some() {
             mode.insert(FileMode::FMODE_WRITER);
         }
@@ -1966,6 +2006,12 @@ impl File {
         self.inode.user_read_mode()
     }
 
+    pub(crate) fn supports_read_iter_flags(&self) -> bool {
+        // Linux directory operations expose legacy generic_read_dir, even
+        // when the filesystem's ordinary files implement read_iter.
+        self.file_type != FileType::Dir && self.inode.supports_read_iter_flags()
+    }
+
     /// Read from the current file position without advancing it.
     pub fn read_noadv(&self, len: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
         let _position = self.lock_position();
@@ -2013,6 +2059,39 @@ impl File {
         Self::recover_io(|| self.pread_with_fsnotify(offset, len, buf, true))
     }
 
+    pub(crate) fn verify_pread_access(&self) -> Result<(), SystemError> {
+        // Linux 语义：O_PATH fd 任何 I/O 都应返回 EBADF（优先于 ESPIPE）。
+        let mode = *self.mode.read();
+        if mode.contains(FileMode::FMODE_PATH) {
+            return Err(SystemError::EBADF);
+        }
+
+        // Linux 语义：对不可 seek 的“流式对象”（Pipe/Socket/部分伪文件等），
+        // pread/pwrite/preadv/pwritev 应返回 ESPIPE（优先于读写权限导致的 EBADF）。
+        // 这里用 FMODE_STREAM 作为 VFS 层收敛点，避免因 FMODE_PREAD/权限位组合导致误报 EBADF。
+        if mode.contains(FileMode::FMODE_STREAM) {
+            return Err(SystemError::ESPIPE);
+        }
+
+        // 对于不支持随机访问的文件（如管道），应该返回 ESPIPE，而不是因为权限问题返回 EBADF
+        if !mode.contains(FileMode::FMODE_PREAD) {
+            return Err(SystemError::ESPIPE);
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn verify_pread_range(
+        &self,
+        offset: usize,
+        count: usize,
+    ) -> Result<(), SystemError> {
+        if offset > isize::MAX as usize || count > isize::MAX as usize - offset {
+            return Err(SystemError::EINVAL);
+        }
+        Ok(())
+    }
+
     fn pread_with_fsnotify(
         &self,
         offset: usize,
@@ -2020,23 +2099,8 @@ impl File {
         buf: &mut [u8],
         emit_fsnotify: bool,
     ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
-        // Linux 语义：O_PATH fd 任何 I/O 都应返回 EBADF（优先于 ESPIPE）。
+        self.verify_pread_access()?;
         let mode = *self.mode.read();
-        if mode.contains(FileMode::FMODE_PATH) {
-            return Err(SystemError::EBADF.into());
-        }
-
-        // Linux 语义：对不可 seek 的“流式对象”（Pipe/Socket/部分伪文件等），
-        // pread/pwrite/preadv/pwritev 应返回 ESPIPE（优先于读写权限导致的 EBADF）。
-        // 这里用 FMODE_STREAM 作为 VFS 层收敛点，避免因 FMODE_PREAD/权限位组合导致误报 EBADF。
-        if mode.contains(FileMode::FMODE_STREAM) {
-            return Err(SystemError::ESPIPE.into());
-        }
-
-        // 对于不支持随机访问的文件（如管道），应该返回 ESPIPE，而不是因为权限问题返回 EBADF
-        if !mode.contains(FileMode::FMODE_PREAD) {
-            return Err(SystemError::ESPIPE.into());
-        }
 
         // 检查读权限
         if !mode.contains(FileMode::FMODE_READ) {
@@ -2582,12 +2646,12 @@ impl File {
         &self,
         offset: usize,
         len: usize,
-        reader: &UserBufferReader<'_>,
+        input: &UserBuffer<'_>,
         update_offset: bool,
         force_append: bool,
     ) -> Result<usize, SystemError> {
         let result = Self::recover_io(|| {
-            self.try_do_write_user(offset, len, reader, update_offset, force_append)
+            self.try_do_write_user(offset, len, input, update_offset, force_append)
         })?;
         self.finish_write(result)
     }
@@ -2596,9 +2660,34 @@ impl File {
         &self,
         offset: usize,
         len: usize,
-        reader: &UserBufferReader<'_>,
+        input: &UserBuffer<'_>,
         update_offset: bool,
         force_append: bool,
+    ) -> Result<DelegatedWriteResult, MemoryAllocationError> {
+        self.try_do_write_user_with(
+            offset,
+            len,
+            update_offset,
+            force_append,
+            |actual_offset, actual_len, config, creator| {
+                self.write_user_at_and_finalize(actual_offset, actual_len, input, config, creator)
+            },
+        )
+    }
+
+    /// Keep write policy independent of the input's scalar/vector shape.
+    fn try_do_write_user_with(
+        &self,
+        offset: usize,
+        len: usize,
+        update_offset: bool,
+        force_append: bool,
+        commit: impl Fn(
+            usize,
+            usize,
+            WriteConfig,
+            &Arc<crate::cgroup::memory::object::ObjectAccount>,
+        ) -> Result<DelegatedWriteResult, MemoryAllocationError>,
     ) -> Result<DelegatedWriteResult, MemoryAllocationError> {
         let creator = object_for_task(&ProcessManager::current_pcb());
         self.writeable()?;
@@ -2629,10 +2718,9 @@ impl File {
                 let actual_offset = md.size.max(0) as usize;
                 let actual_len = self.limit_write_len_by_fsize(file_type, actual_offset, len)?;
 
-                self.write_user_at_and_finalize(
+                commit(
                     actual_offset,
                     actual_len,
-                    reader,
                     WriteConfig {
                         update_offset,
                         offset_update: OffsetUpdate::StoreEnd,
@@ -2662,10 +2750,9 @@ impl File {
         let actual_offset = offset;
         let actual_len = self.limit_write_len_by_fsize(file_type, actual_offset, len)?;
 
-        let mut result = self.write_user_at_and_finalize(
+        let mut result = commit(
             actual_offset,
             actual_len,
-            reader,
             WriteConfig {
                 update_offset,
                 offset_update: OffsetUpdate::Add,
@@ -2686,12 +2773,8 @@ impl File {
         Ok(result)
     }
 
-    /// Write to the file from a userspace buffer.
-    pub fn write_user(
-        &self,
-        len: usize,
-        reader: &UserBufferReader<'_>,
-    ) -> Result<usize, SystemError> {
+    /// Write one scalar, contiguous userspace input. Vectors use the separate entry.
+    pub fn write_user(&self, len: usize, input: &UserBuffer<'_>) -> Result<usize, SystemError> {
         let _position = self.lock_position();
         let stream = self.mode.read().contains(FileMode::FMODE_STREAM);
         let offset = if stream {
@@ -2700,7 +2783,43 @@ impl File {
             self.offset.load(Ordering::SeqCst)
         };
 
-        self.do_write_user(offset, len, reader, !stream, false)
+        self.do_write_user(offset, len, input, !stream, false)
+    }
+
+    /// Preserve vector provenance until the owner chooses its copy units.
+    pub(crate) fn write_user_vectored(
+        &self,
+        vectors: &super::iov::IoVecs,
+    ) -> Result<usize, SystemError> {
+        let _position = self.lock_position();
+        self.writeable()?;
+        let len = vectors.total_len();
+        let segments = vectors.user_buffer_segments(len)?;
+        let input = unsafe { UserBuffer::new_vectored(&segments, len) };
+        let stream = self.mode.read().contains(FileMode::FMODE_STREAM);
+        let offset = if stream {
+            0
+        } else {
+            self.offset.load(Ordering::SeqCst)
+        };
+        let result = Self::recover_io(|| {
+            self.try_do_write_user_with(
+                offset,
+                len,
+                !stream,
+                false,
+                |offset, len, config, _creator| {
+                    if let Some(result) =
+                        self.write_user_buffer_at_and_finalize(offset, len, &input, config)?
+                    {
+                        return Ok(result);
+                    }
+                    let bytes = vectors.gather_prefix(len)?;
+                    self.write_at_and_finalize_split(offset, bytes.len(), &bytes, config)
+                },
+            )
+        })?;
+        self.finish_write(result)
     }
 
     /// @brief 获取文件的元数据
@@ -3063,12 +3182,6 @@ impl File {
             self.inode
                 .configure_open_file(&private_data.lock(), &mut behavior);
             mode = behavior.mode;
-            if mode.contains(FileMode::FMODE_READ) {
-                mode.insert(FileMode::FMODE_CAN_READ);
-            }
-            if mode.contains(FileMode::FMODE_WRITE) {
-                mode.insert(FileMode::FMODE_CAN_WRITE);
-            }
             behavior.post_write_sync
         };
 

@@ -14,7 +14,7 @@ use crate::{
             thread_self::NsFileType,
         },
         vfs::{
-            file::{FilePrivateData, NamespaceFilePrivateData},
+            file::{FileMode, FilePrivateData, NamespaceFilePrivateData, OpenFileBehavior},
             utils::DName,
             FileSystem, IndexNode, InodeId, InodeMode, SpecialNodeData,
         },
@@ -178,6 +178,15 @@ struct NamespaceFileOps {
 }
 
 impl FileOps for NamespaceFileOps {
+    fn configure_open_file(&self, _data: &FilePrivateData, behavior: &mut OpenFileBehavior) {
+        // Linux nsfs has ioctl operations and no read, write or llseek method.
+        // PREAD/PWRITE remain the generic open defaults; positional reads fail
+        // their missing-method check with EINVAL rather than ESPIPE.
+        behavior
+            .mode
+            .remove(FileMode::FMODE_CAN_READ | FileMode::FMODE_CAN_WRITE | FileMode::FMODE_LSEEK);
+    }
+
     fn read_at(
         &self,
         _offset: usize,

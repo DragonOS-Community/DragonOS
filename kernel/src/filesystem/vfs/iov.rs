@@ -155,6 +155,11 @@ impl IoVecs {
     /// inaccessible byte** and the remaining iovecs are ignored. If no data can be
     /// read at all, `Err(SystemError::EFAULT)` is returned.
     pub fn gather(&self) -> Result<Vec<u8>, SystemError> {
+        self.gather_prefix(self.total_len())
+    }
+
+    /// Materialize only the request admitted by the File write policy.
+    pub fn gather_prefix(&self, limit: usize) -> Result<Vec<u8>, SystemError> {
         const GATHER_SCRATCH_LEN: usize = 64 * 1024;
 
         let mut buf = Vec::new();
@@ -162,9 +167,13 @@ impl IoVecs {
         let mut read_any = false;
 
         for iov in self.0.iter() {
+            let len = iov.iov_len.min(limit.saturating_sub(buf.len()));
+            if len == 0 {
+                break;
+            }
             let base = VirtAddr::new(iov.iov_base as usize);
             // 检查从 iov_base 开始有多少 bytes 在 vma 内部且实际可以访问
-            let accessible = user_accessible_len(base, iov.iov_len, false /* read */);
+            let accessible = user_accessible_len(base, len, false /* read */);
 
             // 如果一个字节都不能访问
             if accessible == 0 {
@@ -207,7 +216,7 @@ impl IoVecs {
             }
 
             // 如果没有读取完整个 iov，说明遇到了不可访问的区域
-            if accessible < iov.iov_len {
+            if accessible < len {
                 return Ok(buf);
             }
         }

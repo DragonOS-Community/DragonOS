@@ -48,6 +48,10 @@ impl OomScoreFileOps {
 }
 
 impl FileOps for OomScoreFileOps {
+    fn supports_read_iter_flags(&self) -> bool {
+        false
+    }
+
     fn read_at(
         &self,
         offset: usize,
@@ -191,6 +195,10 @@ impl OomScoreAdjFileOps {
 }
 
 impl FileOps for OomScoreAdjFileOps {
+    fn supports_read_iter_flags(&self) -> bool {
+        false
+    }
+
     fn read_at(
         &self,
         offset: usize,

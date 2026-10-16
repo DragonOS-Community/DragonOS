@@ -32,6 +32,7 @@ use system_error::SystemError;
 pub(crate) mod buffer;
 mod identity;
 mod read;
+mod write;
 use buffer::{PipeBuffer, PipeSegment};
 pub use identity::LockedPipeInode;
 
@@ -44,6 +45,9 @@ pub const PIPE_MIN_SIZE: usize = 4096;
 /// PIPE_BUF: writes of <= PIPE_BUF must be atomic.
 /// Linux guarantees PIPE_BUF is at least a page (4096).
 pub const PIPE_BUF: usize = PIPE_MIN_SIZE;
+
+/// The sole writer waiting for an existing source-splice reservation.
+const HOLD_RELEASE_WAIT_TAG: usize = 1;
 
 /// 管道缓冲区最大大小（Linux 默认为 1MB）
 pub const PIPE_MAX_SIZE: usize = 1024 * 1024;
@@ -247,7 +251,8 @@ pub struct InnerPipeInode {
     valid_cnt: i32,
     read_pos: i32,
     write_pos: i32,
-    splice_hold: usize,
+    splice_hold: Option<usize>,
+    input_copy_active: bool,
     /// 管道缓冲区数据（使用 Vec 支持动态大小）
     data: PipeBuffer,
     /// 当前缓冲区大小
@@ -270,6 +275,19 @@ pub struct InnerPipeInode {
 }
 
 impl InnerPipeInode {
+    fn read_reserved(&self) -> bool {
+        self.splice_hold.is_some() || self.input_copy_active
+    }
+    fn has_slots(&self) -> bool {
+        self.data.segment_count() != 0
+    }
+    fn pop_empty(&mut self) -> Option<PipeSegment> {
+        if self.data.first_segment().is_some_and(|slot| slot.len == 0) {
+            self.data.pop_front()
+        } else {
+            None
+        }
+    }
     pub fn poll(&self, private_data: &FilePrivateData) -> Result<usize, SystemError> {
         let mut events = EPollEventType::empty();
 
@@ -280,7 +298,7 @@ impl InnerPipeInode {
         };
 
         if !flags.is_write_only() {
-            if self.valid_cnt != 0 && self.splice_hold == 0 {
+            if self.has_slots() && self.splice_hold.is_none() {
                 // 有数据可读
                 events.insert(EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM);
             }
@@ -593,22 +611,6 @@ impl PipeRuntime {
         }
     }
 
-    fn tee_adjusted_skip(
-        start_read_pos: usize,
-        cur_read_pos: usize,
-        buf_size: usize,
-        snapshot: usize,
-        total: usize,
-    ) -> usize {
-        let consumed_since_start = if cur_read_pos >= start_read_pos {
-            cur_read_pos - start_read_pos
-        } else {
-            buf_size - start_read_pos + cur_read_pos
-        }
-        .min(snapshot);
-        total.saturating_sub(consumed_since_start)
-    }
-
     pub(super) fn try_new(
         is_fifo: bool,
         creator: &Arc<ObjectAccount>,
@@ -620,7 +622,8 @@ impl PipeRuntime {
             valid_cnt: 0,
             read_pos: 0,
             write_pos: 0,
-            splice_hold: 0,
+            splice_hold: None,
+            input_copy_active: false,
             had_reader: false,
             data: PipeBuffer::default(),
             buf_size: PIPE_BUFF_SIZE,
@@ -663,10 +666,7 @@ impl PipeRuntime {
 
     fn readable(&self) -> bool {
         let inode = self.inner.lock();
-        if inode.valid_cnt == 0 {
-            return inode.writer == 0;
-        }
-        inode.splice_hold == 0
+        !inode.read_reserved() && (inode.has_slots() || inode.writer == 0)
     }
 
     fn writeable(&self) -> bool {
@@ -857,7 +857,7 @@ impl PipeRuntime {
     /// 当前管道中可读的字节数（不阻塞、不睡眠）
     pub fn readable_len(&self) -> usize {
         let guard = self.inner.lock();
-        if guard.splice_hold > 0 {
+        if guard.read_reserved() {
             return 0;
         }
         guard.valid_cnt.max(0) as usize
@@ -887,7 +887,7 @@ impl PipeRuntime {
     fn finish_interrupted_reader_wait(&self) {
         let reader_wake = {
             let inner = self.inner.lock();
-            if inner.valid_cnt > 0 && inner.splice_hold == 0 {
+            if inner.has_slots() && !inner.read_reserved() {
                 WakeMode::One
             } else if inner.valid_cnt == 0 && inner.writer == 0 {
                 WakeMode::All
@@ -904,109 +904,6 @@ impl PipeRuntime {
             self.finish_interrupted_reader_wait();
         }
         result
-    }
-
-    fn write_with_flags(
-        &self,
-        len: usize,
-        buf: &[u8],
-        flags: FileFlags,
-    ) -> Result<usize, MemoryAllocationError> {
-        if buf.len() < len {
-            return Err(SystemError::EINVAL.into());
-        }
-        if len == 0 {
-            return Ok(0);
-        }
-        let actor =
-            crate::cgroup::memory::object_for_task(&crate::process::ProcessManager::current_pcb());
-        let mut transaction = self.begin_writer_transaction();
-        if self.inner.lock().reader == 0 {
-            Self::send_sigpipe();
-            return Err(SystemError::EPIPE.into());
-        }
-        self.prepare_output_storage(&transaction, &actor)?;
-        let mut inner = self.inner.lock();
-        let mut total = 0;
-        let mut reader_wake = WakeMode::None;
-        let packet = flags.contains(FileFlags::O_DIRECT);
-        // Linux merges only the request's page remainder, once at entry.
-        let merge = len & (MMArch::PAGE_SIZE - 1);
-        if merge != 0
-            && !packet
-            && inner.data.last_segment().is_some_and(|last| {
-                last.mergeable && last.offset + last.len + merge <= MMArch::PAGE_SIZE
-            })
-        {
-            let was_readable = inner.valid_cnt > 0 && inner.splice_hold == 0;
-            Self::write_bytes(&mut inner, &buf[..merge], merge);
-            inner.data.extend_last(merge);
-            total = merge;
-            if !was_readable && inner.splice_hold == 0 {
-                reader_wake = WakeMode::One;
-            }
-        }
-        while total < len {
-            if inner.reader == 0 {
-                drop(inner);
-                if total != 0 {
-                    self.publish_write_progress(reader_wake);
-                }
-                Self::send_sigpipe();
-                return if total != 0 {
-                    Ok(total)
-                } else {
-                    Err(SystemError::EPIPE.into())
-                };
-            }
-            if inner.buf_full() {
-                if flags.contains(FileFlags::O_NONBLOCK) {
-                    drop(inner);
-                    if total != 0 {
-                        self.publish_write_progress(reader_wake);
-                        return Ok(total);
-                    }
-                    return Err(SystemError::EAGAIN_OR_EWOULDBLOCK.into());
-                }
-                let published = total != 0;
-                let wake = reader_wake;
-                reader_wake = WakeMode::None;
-                let (next, result) = self.wait_for_write_space(inner, &mut transaction, || {
-                    if published {
-                        self.publish_write_progress(wake);
-                    }
-                });
-                inner = next;
-                if let Err(error) = result {
-                    drop(inner);
-                    return if total != 0 {
-                        Ok(total)
-                    } else {
-                        Err(error.into())
-                    };
-                }
-                continue;
-            }
-            let count = (len - total).min(MMArch::PAGE_SIZE);
-            let was_readable = inner.valid_cnt > 0 && inner.splice_hold == 0;
-            Self::write_bytes(&mut inner, &buf[total..total + count], count);
-            inner.data.push_segment(PipeSegment {
-                offset: 0,
-                len: count,
-                mergeable: !packet,
-                packet,
-            });
-            total += count;
-            transaction.pass_baton_if_waiters_remain(&inner);
-            if !was_readable && inner.splice_hold == 0 {
-                reader_wake = WakeMode::One;
-            }
-        }
-        drop(inner);
-        if total != 0 {
-            self.publish_write_progress(reader_wake);
-        }
-        Ok(total)
     }
 
     /// Commit file data to this pipe while holding its writer transaction.
@@ -1054,7 +951,7 @@ impl PipeRuntime {
             len.min(available)
         };
 
-        let was_readable = inner_guard.valid_cnt > 0 && inner_guard.splice_hold == 0;
+        let was_readable = inner_guard.valid_cnt > 0 && !inner_guard.read_reserved();
         let to_write = to_write.min(MMArch::PAGE_SIZE - source_offset);
         Self::write_bytes(&mut inner_guard, buf, to_write);
         inner_guard.data.push_segment(PipeSegment {
@@ -1063,7 +960,7 @@ impl PipeRuntime {
             mergeable: false,
             packet: false,
         });
-        let reader_wake = if !was_readable && inner_guard.splice_hold == 0 {
+        let reader_wake = if !was_readable && !inner_guard.read_reserved() {
             WakeMode::One
         } else {
             WakeMode::None
@@ -1182,86 +1079,78 @@ impl PipeRuntime {
         buf: &mut [u8],
         nonblock: bool,
     ) -> Result<usize, SystemError> {
-        let mut did_wait = false;
         loop {
             let mut guard = self.inner.lock();
-            if guard.valid_cnt == 0 {
+            if !guard.read_reserved() {
+                let mut freed = false;
+                while guard.pop_empty().is_some() {
+                    freed = true;
+                }
+                if freed {
+                    let wake = Self::writer_wake_action(&mut guard);
+                    drop(guard);
+                    self.wake_writers(wake);
+                    self.notify_writers(EPollEventType::empty());
+                    self.write_fasync_items.send_sigio(FASYNC_POLL_OUT);
+                    continue;
+                }
+                if guard.valid_cnt > 0 {
+                    let num = (guard.valid_cnt as usize).min(len);
+                    if buf.len() < num {
+                        drop(guard);
+                        Self::wake_waiters(&self.read_wait_queue, WakeMode::One);
+                        return Err(SystemError::EINVAL);
+                    }
+                    let start = guard.read_pos as usize;
+                    let first = num.min(guard.buf_size - start);
+                    buf[..first].copy_from_slice(&guard.data[start..start + first]);
+                    if num > first {
+                        buf[first..num].copy_from_slice(&guard.data[..num - first]);
+                    }
+                    guard.splice_hold = Some(num);
+                    return Ok(num);
+                }
                 if guard.writer == 0 {
                     return Ok(0);
                 }
-                if nonblock {
-                    return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-                }
-                drop(guard);
-                self.wait_for_readable_event()?;
-                did_wait = true;
-                continue;
             }
-
-            if guard.splice_hold > 0 {
-                if nonblock {
-                    return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-                }
-                drop(guard);
-                self.wait_for_readable_event()?;
-                did_wait = true;
-                continue;
+            if nonblock {
+                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
             }
-
-            let mut num = guard.valid_cnt as usize;
-            if len < num {
-                num = len;
-            }
-            if buf.len() < num {
-                let pass_baton = did_wait && guard.splice_hold == 0;
-                drop(guard);
-                if pass_baton {
-                    Self::wake_waiters(&self.read_wait_queue, WakeMode::One);
-                }
-                return Err(SystemError::EINVAL);
-            }
-
-            let start = guard.read_pos as usize;
-            let buf_size = guard.buf_size;
-            let first = core::cmp::min(num, buf_size - start);
-            let second = num.saturating_sub(first);
-            buf[0..first].copy_from_slice(&guard.data[start..start + first]);
-            if second > 0 {
-                buf[first..num].copy_from_slice(&guard.data[0..second]);
-            }
-
-            guard.splice_hold = num;
-            return Ok(num);
+            drop(guard);
+            self.wait_for_readable_event()?;
         }
     }
 
     pub(crate) fn splice_finish_hold(&self, consumed: usize) {
         let mut guard = self.inner.lock();
-        let held = guard.splice_hold;
-        if held == 0 {
+        let Some(held) = guard.splice_hold else {
             return;
-        }
+        };
+        let slots_before = guard.data.segment_count();
 
         let consume = consumed.min(held);
         if consume > 0 {
             guard.consume(consume);
         }
-        guard.splice_hold = 0;
-        let reader_wake = if guard.valid_cnt > 0 {
+        guard.splice_hold = None;
+        let freed_slots = guard.data.segment_count() < slots_before;
+        let reader_wake = if guard.has_slots() {
             WakeMode::One
         } else if guard.writer == 0 {
             WakeMode::All
         } else {
             WakeMode::None
         };
-        let writer_wake = if consume > 0 {
+        let writer_wake = if freed_slots {
             Self::writer_wake_action(&mut guard)
         } else {
             PipeWriterWake::None
         };
         drop(guard);
+        self.read_wait_queue.wake_one_tagged(HOLD_RELEASE_WAIT_TAG);
         self.wake_pipe_waiters(reader_wake, writer_wake);
-        if consume > 0 {
+        if freed_slots {
             self.notify_writers(EPollEventType::empty());
         }
         if reader_wake != WakeMode::None {
@@ -1270,7 +1159,7 @@ impl PipeRuntime {
         if reader_wake != WakeMode::None {
             self.read_fasync_items.send_sigio(FASYNC_POLL_IN);
         }
-        if consume > 0 {
+        if freed_slots {
             self.write_fasync_items.send_sigio(FASYNC_POLL_OUT);
         }
     }
@@ -1283,30 +1172,27 @@ impl PipeRuntime {
     fn wait_readable(&self, nonblock: bool) -> Result<bool, SystemError> {
         let mut did_wait = false;
         loop {
-            let (avail, has_writer, held) = {
-                let guard = self.inner.lock();
-                (
-                    guard.valid_cnt.max(0) as usize,
-                    guard.writer > 0,
-                    guard.splice_hold > 0,
-                )
-            };
-
-            if avail > 0 && !held {
-                if did_wait {
-                    Self::wake_waiters(&self.read_wait_queue, WakeMode::One);
+            let inner = self.inner.lock();
+            if !inner.read_reserved() {
+                if inner.has_slots() {
+                    drop(inner);
+                    if did_wait {
+                        Self::wake_waiters(&self.read_wait_queue, WakeMode::One);
+                    }
+                    return Ok(true);
                 }
-                return Ok(true);
-            }
-            if avail == 0 && !has_writer {
-                if did_wait {
-                    Self::wake_waiters(&self.read_wait_queue, WakeMode::All);
+                if inner.writer == 0 {
+                    drop(inner);
+                    if did_wait {
+                        Self::wake_waiters(&self.read_wait_queue, WakeMode::All);
+                    }
+                    return Ok(false);
                 }
-                return Ok(false);
             }
             if nonblock {
                 return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
             }
+            drop(inner);
             self.wait_for_readable_event()?;
             did_wait = true;
         }
@@ -1346,109 +1232,83 @@ impl PipeRuntime {
         }
     }
 
-    /// Helper: Transfer a chunk of data from `src` to `dst`.
-    /// - `len`: Max bytes to transfer.
-    /// - `consume`: Whether to consume data from `src` (splice) or just peek (tee).
-    /// - `skip_calculator`: Closure to calculate skip amount based on `src` state (used for tee).
-    ///
-    /// Returns actual copied bytes. 0 means retry (buffers full/empty temporarily).
-    fn transfer_chunk<F>(
+    /// Copy one bounded slot snapshot under the established address-ordered
+    /// inner locks. No allocation, user access or waiting occurs here.
+    fn transfer_slots(
         src: &PipeRuntime,
         dst: &PipeRuntime,
         transaction: &mut PipeWriterTransaction<'_>,
         len: usize,
         consume: bool,
-        skip_calculator: F,
-    ) -> Result<usize, SystemError>
-    where
-        F: FnOnce(&InnerPipeInode) -> usize,
-    {
-        debug_assert!(core::ptr::eq(transaction.pipe, dst));
-        // Lock both pipes
-        let (mut in_guard, mut out_guard) = Self::lock_two(src, dst);
-
-        // Re-check conditions under lock
-        let in_avail = in_guard.valid_cnt.max(0) as usize;
-        let out_space = out_guard.writable_bytes();
-
-        if out_guard.reader == 0 {
-            drop(in_guard);
-            drop(out_guard);
+    ) -> Result<(usize, usize), SystemError> {
+        let (mut input, mut output) = Self::lock_two(src, dst);
+        if output.reader == 0 {
+            drop(input);
+            drop(output);
             Self::send_sigpipe();
             return Err(SystemError::EPIPE);
         }
-
-        if in_avail == 0 || in_guard.splice_hold > 0 || out_space == 0 {
-            return Ok(0);
+        if input.read_reserved() {
+            return Ok((0, 0));
         }
-
-        let skip = skip_calculator(&in_guard);
-        // Ensure skip doesn't exceed available data
-        if skip >= in_avail {
-            // Nothing to copy due to skip
-            return Ok(0);
+        let snapshot = input.data.segment_count();
+        let mut total = 0;
+        let mut slots = 0;
+        let mut skip = 0;
+        while slots < snapshot && total < len && !output.buf_full() {
+            let index = if consume { 0 } else { slots };
+            let segment = input.data.get_segment(index).expect("snapshot slot");
+            let count = segment.len.min(len - total);
+            if count != 0 {
+                let copied = output.copy_from_other(&input, count, skip);
+                assert_eq!(copied, count);
+            } else {
+                output.data.push_segment(segment);
+            }
+            output.data.set_last_segment(PipeSegment {
+                len: count,
+                mergeable: consume && count == segment.len && segment.mergeable,
+                ..segment
+            });
+            if consume {
+                if segment.len == 0 {
+                    input.data.pop_front();
+                } else {
+                    input.consume(count);
+                }
+            } else {
+                skip += count;
+            }
+            total += count;
+            slots += 1;
         }
-        let real_in_avail = in_avail - skip;
-
-        let want = len.min(4096);
-        let chunk = core::cmp::min(want, core::cmp::min(real_in_avail, out_space));
-
-        if chunk == 0 {
-            return Ok(0);
-        }
-
-        let out_was_readable = out_guard.valid_cnt > 0 && out_guard.splice_hold == 0;
-
-        // Copy data directly
-        let copied = out_guard.copy_from_other(&in_guard, chunk, skip);
-        if !consume && copied != 0 {
-            out_guard.data.clear_last_merge();
-        }
-
-        if consume {
-            in_guard.consume(copied);
-        }
-
-        let src_reader_wake = if consume && in_guard.valid_cnt == 0 && in_guard.writer == 0 {
+        let source_reader_wake = if consume && !input.has_slots() && input.writer == 0 {
             WakeMode::All
         } else {
             WakeMode::None
         };
-        let src_writer_wake = if consume {
-            Self::writer_wake_action(&mut in_guard)
+        let source_wake = if consume && slots != 0 {
+            Self::writer_wake_action(&mut input)
         } else {
             PipeWriterWake::None
         };
-        let dst_reader_wake = if !out_was_readable && out_guard.splice_hold == 0 {
-            WakeMode::One
-        } else {
-            WakeMode::None
-        };
-
-        transaction.pass_baton_if_waiters_remain(&out_guard);
-        drop(in_guard);
-        drop(out_guard);
-
-        src.wake_pipe_waiters(src_reader_wake, src_writer_wake);
-        Self::wake_waiters(&dst.read_wait_queue, dst_reader_wake);
-        if consume {
+        transaction.pass_baton_if_waiters_remain(&output);
+        drop(input);
+        drop(output);
+        src.wake_pipe_waiters(source_reader_wake, source_wake);
+        if consume && slots != 0 {
             src.notify_writers(EPollEventType::empty());
-        }
-        if src_reader_wake != WakeMode::None {
-            src.notify_readers(EPollEventType::empty());
-        }
-        dst.notify_readers(EPollEventType::empty());
-        if consume {
             src.write_fasync_items.send_sigio(FASYNC_POLL_OUT);
         }
-        dst.read_fasync_items.send_sigio(FASYNC_POLL_IN);
-
-        Ok(copied)
+        if source_reader_wake != WakeMode::None {
+            src.notify_readers(EPollEventType::empty());
+        }
+        if total != 0 {
+            dst.publish_write_progress(WakeMode::One);
+        }
+        Ok((total, slots))
     }
 
-    /// splice(2): 将本管道中的数据移动到目标管道（消耗输入数据）。
-    ///
-    /// 语义对齐 Linux fs/splice.c: splice_pipe_to_pipe()/wait_for_space()/ipipe_prep/opipe_prep。
     pub fn splice_to_pipe(
         &self,
         out: &PipeRuntime,
@@ -1462,48 +1322,49 @@ impl PipeRuntime {
             return Err(SystemError::EINVAL.into());
         }
         let nonblock = flags.contains(SpliceFlags::SPLICE_F_NONBLOCK);
-
+        let mut total = 0;
         loop {
-            // Wait for input data
-            if !self.wait_readable(nonblock)? {
-                return Ok(0); // EOF
+            match self.wait_readable(nonblock || total != 0) {
+                Ok(true) => {}
+                Ok(false) => return Ok(total),
+                Err(_) if total != 0 => return Ok(total),
+                Err(error) => return Err(error.into()),
             }
-
-            // Serialize only the destination writer side. The source pipe is
-            // protected by its inner lock during the actual transfer, avoiding
-            // writer-mutex ABBA between opposite-direction splices.
             let mut transaction = out.begin_writer_transaction();
-            out.wait_writable(&mut transaction, nonblock)?;
+            if let Err(error) = out.wait_writable(&mut transaction, nonblock || total != 0) {
+                return if total != 0 {
+                    Ok(total)
+                } else {
+                    Err(error.into())
+                };
+            }
             let actor = crate::cgroup::memory::object_for_task(
                 &crate::process::ProcessManager::current_pcb(),
             );
             out.prepare_output_storage(&transaction, &actor)?;
-
-            // Try transfer
-            let mut total = 0;
-            while total < len {
-                match Self::transfer_chunk(self, out, &mut transaction, len - total, true, |_| 0) {
-                    Ok(0) => break,
-                    Ok(copied) => total += copied,
+            let (bytes, slots) =
+                match Self::transfer_slots(self, out, &mut transaction, len - total, true) {
+                    Ok(progress) => progress,
                     Err(_) if total != 0 => return Ok(total),
                     Err(error) => return Err(error.into()),
-                }
-            }
-            if total != 0 {
+                };
+            total += bytes;
+            if total == len || total != 0 {
                 return Ok(total);
+            }
+            // Moving an empty slot is progress, but a zero byte return is EOF
+            // only after rechecking source writer presence, just like Linux.
+            if slots == 0 && nonblock {
+                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK.into());
             }
         }
     }
 
-    /// tee(2): 将本管道中的数据复制到目标管道，但不消耗本管道数据。
-    ///
-    /// 参考 Linux 语义：当 input 为空且仍有 writer 时，阻塞或返回 EAGAIN；
-    /// 当 output 满且仍有 reader 时，阻塞或返回 EAGAIN。
     pub fn tee_to(
         &self,
         out: &PipeRuntime,
         len: usize,
-        flags: crate::filesystem::vfs::syscall::SpliceFlags,
+        flags: SpliceFlags,
     ) -> Result<usize, MemoryAllocationError> {
         if len == 0 {
             return Ok(0);
@@ -1511,119 +1372,32 @@ impl PipeRuntime {
         if core::ptr::eq(self, out) {
             return Err(SystemError::EINVAL.into());
         }
-        let nonblock =
-            flags.contains(crate::filesystem::vfs::syscall::SpliceFlags::SPLICE_F_NONBLOCK);
-
-        let mut total: usize = 0;
-        let mut in_avail_snapshot: Option<usize> = None;
-        let mut in_read_pos_snapshot: Option<usize> = None;
-        let mut in_buf_size_snapshot: Option<usize> = None;
-
-        while total < len {
-            if let Some(snapshot) = in_avail_snapshot {
-                if total >= snapshot {
-                    return Ok(total);
-                }
-            } else {
-                // Check if readable
-                if !self.wait_readable(nonblock)? {
-                    // EOF
-                    return Ok(total);
-                }
+        let nonblock = flags.contains(SpliceFlags::SPLICE_F_NONBLOCK);
+        loop {
+            if !self.wait_readable(nonblock)? {
+                return Ok(0);
             }
-
-            // Check output space
-            // tee has special nonblock handling: return total if > 0
             let mut transaction = out.begin_writer_transaction();
-            let (out_space, out_has_readers) = {
-                let guard = out.inner.lock();
-                (guard.writable_bytes(), guard.reader > 0)
-            };
-            if !out_has_readers {
-                Self::send_sigpipe();
-                return if total > 0 {
-                    Ok(total)
-                } else {
-                    Err(SystemError::EPIPE.into())
-                };
-            }
-            if out_space == 0 {
-                if nonblock || total > 0 {
-                    if total > 0 {
-                        return Ok(total);
-                    }
-                    return Err(SystemError::EAGAIN_OR_EWOULDBLOCK.into());
-                }
-                // force blocking wait
-                out.wait_writable(&mut transaction, false)?;
-            }
+            out.wait_writable(&mut transaction, nonblock)?;
             let actor = crate::cgroup::memory::object_for_task(
                 &crate::process::ProcessManager::current_pcb(),
             );
-            if let Err(error) = out.prepare_output_storage(&transaction, &actor) {
-                return if total > 0 { Ok(total) } else { Err(error) };
+            out.prepare_output_storage(&transaction, &actor)?;
+            let (bytes, slots) = Self::transfer_slots(self, out, &mut transaction, len, false)?;
+            if slots != 0 {
+                return Ok(bytes);
             }
-
-            let transfer = Self::transfer_chunk(
-                self,
-                out,
-                &mut transaction,
-                len - total,
-                false,
-                |in_guard| {
-                    if in_avail_snapshot.is_none() {
-                        in_avail_snapshot = Some(in_guard.valid_cnt.max(0) as usize);
-                        in_read_pos_snapshot = Some(in_guard.read_pos.max(0) as usize);
-                        in_buf_size_snapshot = Some(in_guard.buf_size);
-                    }
-
-                    let snapshot = in_avail_snapshot.unwrap();
-                    if total >= snapshot {
-                        return usize::MAX; // Signal to skip everything
-                    }
-
-                    let mut skip = total;
-                    if let (Some(start_read_pos), Some(start_buf_size)) =
-                        (in_read_pos_snapshot, in_buf_size_snapshot)
-                    {
-                        if start_buf_size == in_guard.buf_size {
-                            let cur_read_pos = in_guard.read_pos.max(0) as usize;
-                            skip = Self::tee_adjusted_skip(
-                                start_read_pos,
-                                cur_read_pos,
-                                start_buf_size,
-                                snapshot,
-                                total,
-                            );
-                        }
-                    }
-                    skip
-                },
-            );
-            let copied = match transfer {
-                Ok(copied) => copied,
-                Err(_) if total > 0 => return Ok(total),
-                Err(err) => return Err(err.into()),
-            };
-
-            if copied == 0 {
-                // Snapshot may be stale if another reader drained the pipe; refresh on next loop.
-                in_avail_snapshot = None;
-                in_read_pos_snapshot = None;
-                in_buf_size_snapshot = None;
-                if total > 0 {
-                    return Ok(total);
-                }
-                continue;
+            if nonblock {
+                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK.into());
             }
-
-            total += copied;
         }
-
-        Ok(total)
     }
 
     /// 是否存在写端（用于判断空管道时返回 EOF 还是 EAGAIN）
+    pub fn has_buffered_slots(&self) -> bool {
+        self.inner.lock().has_slots()
+    }
+
     pub fn has_writers(&self) -> bool {
         self.inner.lock().writer > 0
     }
@@ -1636,7 +1410,10 @@ impl PipeRuntime {
 
 #[cfg(test)]
 mod tests {
-    use super::{PipeRuntime, PipeSegment, PipeWriteWaiters, PipeWriterWake, PIPE_MIN_SIZE};
+    use super::{
+        ObjectAccount, PipeBuffer, PipeRuntime, PipeSegment, PipeWriteWaiters, PipeWriterWake,
+        PIPE_MIN_SIZE,
+    };
 
     #[test]
     fn writer_wake_intent_tracks_exclusive_slot_waiters() {
@@ -1654,23 +1431,59 @@ mod tests {
     }
 
     #[test]
-    fn tee_adjusted_skip_no_consumption() {
-        assert_eq!(PipeRuntime::tee_adjusted_skip(0, 0, 100, 80, 50), 50);
-    }
-
-    #[test]
-    fn tee_adjusted_skip_with_consumption() {
-        assert_eq!(PipeRuntime::tee_adjusted_skip(0, 30, 100, 80, 50), 20);
-    }
-
-    #[test]
-    fn tee_adjusted_skip_consumption_exceeds_total() {
-        assert_eq!(PipeRuntime::tee_adjusted_skip(0, 80, 100, 80, 50), 0);
-    }
-
-    #[test]
-    fn tee_adjusted_skip_wraparound() {
-        assert_eq!(PipeRuntime::tee_adjusted_skip(90, 10, 100, 80, 50), 30);
+    fn transfer_preserves_empty_packet_slots_and_counts_capacity() {
+        let src = PipeRuntime::new();
+        let dst = PipeRuntime::new();
+        let account = crate::cgroup::memory::MemoryAccount::new(1, None).unwrap();
+        let creator = ObjectAccount::new(&account).unwrap();
+        let storage = PipeBuffer::try_new(PIPE_MIN_SIZE * 2, &creator).unwrap();
+        {
+            let mut inner = src.inner.lock();
+            inner.data = storage;
+            inner.buf_size = PIPE_MIN_SIZE * 2;
+            inner.reader = 1;
+            inner.writer = 1;
+            inner.data.push_segment(PipeSegment {
+                offset: 0,
+                len: 0,
+                mergeable: false,
+                packet: true,
+            });
+            inner.data[..3].copy_from_slice(b"abc");
+            inner.data.push_segment(PipeSegment {
+                offset: 7,
+                len: 3,
+                mergeable: true,
+                packet: false,
+            });
+            inner.valid_cnt = 3;
+            inner.write_pos = 3;
+            assert!(inner.buf_full());
+        }
+        dst.inner.lock().reader = 1;
+        let mut transaction = dst.begin_writer_transaction();
+        dst.prepare_output_storage(&transaction, &creator).unwrap();
+        assert_eq!(
+            PipeRuntime::transfer_slots(&src, &dst, &mut transaction, 3, false),
+            Ok((3, 2))
+        );
+        assert_eq!(src.inner.lock().data.segment_count(), 2);
+        {
+            let inner = dst.inner.lock();
+            let empty = inner.data.get_segment(0).unwrap();
+            assert_eq!(empty.len, 0);
+            assert!(empty.packet);
+            let data = inner.data.get_segment(1).unwrap();
+            assert_eq!(data.offset, 7);
+            assert!(!data.mergeable);
+            assert_eq!(&inner.data[..3], b"abc");
+        }
+        assert_eq!(
+            PipeRuntime::transfer_slots(&src, &dst, &mut transaction, 3, true),
+            Ok((3, 2))
+        );
+        assert_eq!(src.inner.lock().data.segment_count(), 0);
+        assert!(dst.inner.lock().data.get_segment(3).unwrap().mergeable);
     }
 
     #[test]
@@ -1711,8 +1524,8 @@ mod tests {
         let mut transaction = dst.begin_writer_transaction();
         dst.prepare_output_storage(&transaction, &creator).unwrap();
         assert_eq!(
-            PipeRuntime::transfer_chunk(&src, &dst, &mut transaction, 4, true, |_| 0),
-            Ok(0)
+            PipeRuntime::transfer_slots(&src, &dst, &mut transaction, 4, true),
+            Ok((0, 0))
         );
         {
             let src_guard = src.inner.lock();
@@ -1722,8 +1535,8 @@ mod tests {
 
         src.splice_finish_hold(0);
         assert_eq!(
-            PipeRuntime::transfer_chunk(&src, &dst, &mut transaction, 4, true, |_| 0),
-            Ok(4)
+            PipeRuntime::transfer_slots(&src, &dst, &mut transaction, 4, true),
+            Ok((4, 1))
         );
         assert_eq!(src.inner.lock().valid_cnt, 0);
     }
@@ -1857,8 +1670,8 @@ impl PipeRuntime {
         let mut inner_guard = self.inner.lock();
         let mut did_wait = false;
 
-        while inner_guard.valid_cnt == 0 || inner_guard.splice_hold > 0 {
-            if inner_guard.valid_cnt == 0 && inner_guard.writer == 0 {
+        while !inner_guard.has_slots() || inner_guard.read_reserved() {
+            if !inner_guard.has_slots() && inner_guard.writer == 0 {
                 return Ok(0);
             }
 
@@ -1875,11 +1688,39 @@ impl PipeRuntime {
         }
 
         let mut num = 0;
-        while num < len && inner_guard.valid_cnt != 0 {
+        while num < len && inner_guard.has_slots() {
             let segment = inner_guard
                 .data
                 .first_segment()
                 .expect("pipe bytes have provenance");
+            if segment.len == 0 {
+                inner_guard.data.pop_front();
+                if segment.packet {
+                    break;
+                }
+                if !inner_guard.has_slots() && num == 0 && inner_guard.writer != 0 {
+                    let writer_wake = Self::writer_wake_action(&mut inner_guard);
+                    drop(inner_guard);
+                    self.wake_writers(writer_wake);
+                    self.notify_writers(EPollEventType::empty());
+                    if flags.contains(FileFlags::O_NONBLOCK) {
+                        return Err(SystemError::EAGAIN_OR_EWOULDBLOCK.into());
+                    }
+                    self.wait_for_readable_event()?;
+                    did_wait = true;
+                    inner_guard = self.inner.lock();
+                    // The outer read invocation rechecks empty/held conditions.
+                    while !inner_guard.has_slots() || inner_guard.read_reserved() {
+                        if !inner_guard.has_slots() && inner_guard.writer == 0 {
+                            return Ok(0);
+                        }
+                        drop(inner_guard);
+                        self.wait_for_readable_event()?;
+                        inner_guard = self.inner.lock();
+                    }
+                }
+                continue;
+            }
             let count = segment.len.min(len - num);
             let start = inner_guard.read_pos as usize;
             let first = count.min(inner_guard.buf_size - start);
@@ -1894,9 +1735,9 @@ impl PipeRuntime {
             }
         }
 
-        let reader_wake = if inner_guard.valid_cnt == 0 && inner_guard.writer == 0 {
+        let reader_wake = if !inner_guard.has_slots() && inner_guard.writer == 0 {
             WakeMode::All
-        } else if did_wait && inner_guard.valid_cnt > 0 && inner_guard.splice_hold == 0 {
+        } else if did_wait && inner_guard.valid_cnt > 0 && !inner_guard.read_reserved() {
             WakeMode::One
         } else {
             WakeMode::None

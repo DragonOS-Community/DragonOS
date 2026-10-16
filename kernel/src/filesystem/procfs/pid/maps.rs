@@ -236,6 +236,10 @@ fn append_map_line(vma: &Arc<LockedVMA>, root_prefix: &str, out: &mut Vec<u8>) {
 }
 
 impl FileOps for MapsFileOps {
+    fn supports_read_iter_flags(&self) -> bool {
+        false
+    }
+
     fn open(
         &self,
         data: &mut MutexGuard<FilePrivateData>,

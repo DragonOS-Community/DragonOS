@@ -1066,6 +1066,13 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         UserReadMode::Buffered
     }
 
+    /// Whether read-vector flags follow Linux's `.read_iter` contract.
+    /// This is independent of the userspace copy strategy: a buffered proc
+    /// provider may expose a legacy `.read` ABI without a direct-user hook.
+    fn supports_read_iter_flags(&self) -> bool {
+        self.user_read_mode() != UserReadMode::Scalar
+    }
+
     /// Read directly into a protected userspace buffer.
     ///
     /// The default returns `None`, so ordinary inodes keep using the bounded
@@ -1113,6 +1120,22 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         _reader: &UserBufferReader<'_>,
         data: MutexGuard<FilePrivateData>,
     ) -> Result<Option<usize>, SystemError> {
+        drop(data);
+        Ok(None)
+    }
+
+    /// Consume one complete logical user request, including vector boundaries.
+    /// Owners such as pipes decide which copy units become visible. `None`
+    /// leaves the request untouched and selects the existing buffered fallback.
+    /// After publishing bytes or reserving observable slots, implementations
+    /// must not return a recoverable allocation request that replays this write.
+    fn write_user_buffer_at(
+        &self,
+        _offset: usize,
+        _len: usize,
+        _source: &UserBuffer<'_>,
+        data: MutexGuard<FilePrivateData>,
+    ) -> Result<Option<usize>, crate::mm::allocation::MemoryAllocationError> {
         drop(data);
         Ok(None)
     }

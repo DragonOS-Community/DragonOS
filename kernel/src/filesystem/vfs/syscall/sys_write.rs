@@ -4,11 +4,12 @@ use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_WRITE;
 use crate::arch::MMArch;
 use crate::filesystem::vfs::file::File;
-use crate::mm::MemoryManagementArch;
+use crate::mm::{access_ok, MemoryManagementArch, VirtAddr};
 use crate::process::ProcessManager;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
 use crate::syscall::user_access::UserBufferReader;
+use crate::syscall::user_buffer::UserBuffer;
 use alloc::string::ToString;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -54,17 +55,17 @@ impl Syscall for SysWriteHandle {
             return file.write(0, &[]);
         }
 
-        // Linux access_ok checks the numerical range, not VMA residency. Actual
-        // faults must occur in the backend's protected payload-copy stage, after
-        // required privilege removal. Reader's pre-existing nonempty NULL
-        // rejection is intentionally unchanged; do not construct a NULL slice.
-        let reader = UserBufferReader::new(buf_vaddr, len, frame.is_from_user())?;
         if frame.is_from_user() {
-            // Validate the original numerical range before Linux's MAX_RW_COUNT
-            // clamp. This bounds the accepted count, not native staging memory.
+            // Linux checks the original numerical range before MAX_RW_COUNT.
+            // NULL is numerical input too: only the owner may attempt payload
+            // copying, after its EPIPE/EAGAIN decisions. No NULL slice is made.
+            let address = VirtAddr::new(buf_vaddr as usize);
+            access_ok(address, len).map_err(|_| SystemError::EFAULT)?;
+            let input = unsafe { UserBuffer::new(address, len) };
             let count = len.min((i32::MAX as usize) & !(MMArch::PAGE_SIZE - 1));
-            file.write_user(count, &reader)
+            file.write_user(count, &input)
         } else {
+            let reader = UserBufferReader::new(buf_vaddr, len, false)?;
             let kernel_buf = reader.read_from_user(0)?.to_vec();
             file.write(kernel_buf.len(), &kernel_buf)
         }

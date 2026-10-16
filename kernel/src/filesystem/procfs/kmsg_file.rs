@@ -27,6 +27,10 @@ impl KmsgFileOps {
 }
 
 impl FileOps for KmsgFileOps {
+    fn supports_read_iter_flags(&self) -> bool {
+        false
+    }
+
     fn read_at(
         &self,
         _offset: usize,

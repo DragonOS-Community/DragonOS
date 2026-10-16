@@ -54,6 +54,10 @@ impl MemFileOps {
 }
 
 impl FileOps for MemFileOps {
+    fn supports_read_iter_flags(&self) -> bool {
+        false
+    }
+
     fn open(
         &self,
         data: &mut MutexGuard<FilePrivateData>,

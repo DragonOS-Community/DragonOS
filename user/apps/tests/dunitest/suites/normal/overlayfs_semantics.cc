@@ -84,8 +84,10 @@ std::vector<std::string> xattr_names(const std::string& path) {
 
     std::vector<char> list(static_cast<size_t>(needed));
     ssize_t actual = listxattr(path.c_str(), list.data(), list.size());
-    EXPECT_EQ(needed, actual) << path << ": " << strerror(errno);
-    if (actual != needed) {
+    // Overlay may include hidden backing names in its size-only estimate.
+    EXPECT_GE(actual, 0) << path << ": " << strerror(errno);
+    EXPECT_LE(actual, needed) << path << ": " << strerror(errno);
+    if (actual < 0 || actual > needed) {
         return {};
     }
 
@@ -3461,6 +3463,89 @@ TEST(OverlayFsSemantics, UserXattrOperationsAndPrivateNamespaceSemantics) {
     }
 }
 
+TEST(OverlayFsSemantics, CopyUpPreservesLargeAndEmptyXattrsWithFilteredListBoundaries) {
+    if (geteuid() != 0) {
+        GTEST_SKIP() << "requires root for trusted private xattrs";
+    }
+    if (!root_supports_ext4_xattrs()) {
+        GTEST_SKIP() << "requires the Ubuntu 24.04 ext4 rootfs backing";
+    }
+
+    ScopedOverlayEnv scoped("overlayfs_xattr_buffer_boundaries", "/root");
+    const auto& env = scoped.env;
+    prepare_overlay_env(env);
+    const std::string lower = join_path(env.lower, "file");
+    const std::string merged = join_path(env.merged, "file");
+    const std::string upper = join_path(env.upper, "file");
+    constexpr const char* kPrivate = "trusted.overlay.mm011_hidden";
+    // Leave room in the backing xattr block for copy-up's origin attribute.
+    std::vector<unsigned char> value(3500);
+    for (size_t i = 0; i < value.size(); ++i) {
+        value[i] = static_cast<unsigned char>((i * 37 + 11) & 0xff);
+    }
+    ASSERT_EQ(0, write_text(lower, "xattr-copy-up-content"));
+    ASSERT_EQ(0, setxattr(lower.c_str(), "user.large", value.data(), value.size(), 0))
+        << strerror(errno);
+    ASSERT_EQ(0, setxattr(lower.c_str(), kPrivate, "hidden", 6, 0)) << strerror(errno);
+    ASSERT_EQ(0, setxattr(lower.c_str(), "user.empty", "", 0, 0)) << strerror(errno);
+    ASSERT_EQ(0, setxattr(lower.c_str(), "user.after", "tail", 4, 0)) << strerror(errno);
+    ASSERT_TRUE(setup_overlay_env(env)) << strerror(errno);
+
+    const auto check_values = [&](const std::string& path) {
+        SCOPED_TRACE(path);
+        EXPECT_EQ(static_cast<ssize_t>(value.size()),
+                  getxattr(path.c_str(), "user.large", nullptr, 0)) << strerror(errno);
+        expect_xattr(path, "user.large", value.data(), value.size());
+        EXPECT_EQ(0, getxattr(path.c_str(), "user.empty", nullptr, 0)) << strerror(errno);
+        unsigned char empty = 0xa5;
+        EXPECT_EQ(0, getxattr(path.c_str(), "user.empty", &empty, 1)) << strerror(errno);
+        EXPECT_EQ(0xa5, empty);
+        expect_xattr(path, "user.after", "tail", 4);
+        std::vector<unsigned char> small(value.size() - 1, 0xa5);
+        errno = 0;
+        EXPECT_EQ(-1, getxattr(path.c_str(), "user.large", small.data(), small.size()));
+        EXPECT_EQ(ERANGE, errno);
+        EXPECT_TRUE(std::all_of(small.begin(), small.end(),
+                                [](unsigned char byte) { return byte == 0xa5; }));
+    };
+    const auto check_filtered_list = [&] {
+        const ssize_t needed = listxattr(merged.c_str(), nullptr, 0);
+        ASSERT_GT(needed, 0) << strerror(errno);
+        std::vector<char> list(static_cast<size_t>(needed), static_cast<char>(0xa5));
+        const ssize_t actual = listxattr(merged.c_str(), list.data(), list.size());
+        ASSERT_GT(actual, 1) << strerror(errno);
+        ASSERT_LE(actual, needed);
+        auto names = xattr_names(merged);
+        std::sort(names.begin(), names.end());
+        EXPECT_EQ((std::vector<std::string>{"user.after", "user.empty", "user.large"}), names);
+        // Use the actual visible length: Linux's query may include hidden names.
+        std::vector<unsigned char> small(static_cast<size_t>(actual) - 1, 0xa5);
+        errno = 0;
+        EXPECT_EQ(-1, listxattr(merged.c_str(), reinterpret_cast<char*>(small.data()),
+                               small.size()));
+        EXPECT_EQ(ERANGE, errno);
+        EXPECT_TRUE(std::all_of(small.begin(), small.end(),
+                                [](unsigned char byte) { return byte == 0xa5; }));
+    };
+
+    check_values(merged);
+    check_filtered_list();
+    EXPECT_FALSE(path_exists(upper));
+    const int fd = open(merged.c_str(), O_WRONLY | O_CLOEXEC);
+    ASSERT_GE(fd, 0) << strerror(errno);
+    ASSERT_EQ(0, close(fd)) << strerror(errno);
+    for (const auto& path : {lower, upper, merged}) {
+        check_values(path);
+        EXPECT_EQ("xattr-copy-up-content", read_text(path));
+    }
+    check_filtered_list();
+    expect_xattr(lower, kPrivate, "hidden", 6);
+    errno = 0;
+    EXPECT_EQ(-1, getxattr(upper.c_str(), kPrivate, nullptr, 0));
+    EXPECT_EQ(ENODATA, errno);
+    EXPECT_EQ(0, overlay_temp_entry_count(env.work));
+}
+
 TEST(OverlayFsSemantics, RemoveLowerXattrDroppedByUnsupportedUpperSucceeds) {
     if (!root_supports_ext4_xattrs()) {
         GTEST_SKIP() << "requires an ext4 lower and tmpfs upper";
@@ -3509,6 +3594,76 @@ TEST(OverlayFsSemantics, RemoveLowerXattrDroppedByUnsupportedUpperSucceeds) {
     EXPECT_EQ(-1, getxattr(merged_file.c_str(), "user.dropped", nullptr, 0));
     EXPECT_TRUE(errno == ENODATA || is_xattr_unsupported_errno(errno)) << strerror(errno);
     expect_xattr(lower_file, "user.dropped", "value", 5);
+}
+
+TEST(OverlayFsSemantics, CopyUpRequiredXattrFailureRollsBackAndCanRetry) {
+    if (geteuid() != 0) {
+        GTEST_SKIP() << "requires root for security xattr coverage";
+    }
+    if (!root_supports_ext4_xattrs()) {
+        GTEST_SKIP() << "requires an ext4 lower and an upper without xattr support";
+    }
+
+    const std::string suffix = std::to_string(getpid());
+    const std::string lower_root = "/root/overlayfs_xattr_rollback_lower_" + suffix;
+    const std::string upper_root = "/tmp/overlayfs_xattr_rollback_upper_" + suffix;
+    const std::string lower = join_path(lower_root, "l");
+    const std::string upper = join_path(upper_root, "u");
+    const std::string work = join_path(upper_root, "w");
+    const std::string merged = join_path(upper_root, "m");
+    const std::string lower_file = join_path(lower, "file");
+    const std::string upper_file = join_path(upper, "file");
+    const std::string merged_file = join_path(merged, "file");
+    const std::string probe = join_path(upper_root, "probe");
+    ScopedCustomMount lower_cleanup(lower_root, "");
+    ScopedCustomMount upper_cleanup(upper_root, merged);
+    for (const auto& dir : {lower_root, upper_root, lower, upper, work, merged}) {
+        ASSERT_EQ(0, ensure_dir(dir.c_str())) << dir << ": " << strerror(errno);
+    }
+    const unsigned char capability[] = {
+        0, 0, 0, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    ASSERT_EQ(0, write_text(probe, "probe"));
+    errno = 0;
+    const int supported = setxattr(probe.c_str(), "security.capability", capability,
+                                   sizeof(capability), 0);
+    if (supported == 0) {
+        GTEST_SKIP() << "requires an upper filesystem without capability xattr support";
+    }
+    const int unsupported_error = errno;
+    ASSERT_TRUE(is_xattr_unsupported_errno(unsupported_error)) << strerror(unsupported_error);
+    ASSERT_EQ(0, write_text(lower_file, "rollback-preserves-content"));
+    ASSERT_EQ(0, setxattr(lower_file.c_str(), "security.capability", capability,
+                         sizeof(capability), 0)) << strerror(errno);
+    const std::string options = "lowerdir=" + lower + ",upperdir=" + upper + ",workdir=" + work;
+    ASSERT_EQ(0, mount("overlay", merged.c_str(), "overlay", 0, options.c_str()))
+        << strerror(errno);
+    upper_cleanup.mounted = true;
+
+    for (int round = 0; round < 3; ++round) {
+        SCOPED_TRACE(round);
+        errno = 0;
+        const int fd = open(merged_file.c_str(), O_WRONLY | O_CLOEXEC);
+        const int error = errno;
+        if (fd >= 0) {
+            close(fd);
+        }
+        ASSERT_EQ(-1, fd);
+        EXPECT_EQ(unsupported_error, error) << strerror(error);
+        expect_path_enoent(upper_file);
+        EXPECT_EQ(0, overlay_temp_entry_count(work));
+        for (const auto& path : {lower_file, merged_file}) {
+            EXPECT_EQ("rollback-preserves-content", read_text(path));
+            expect_xattr(path, "security.capability", capability, sizeof(capability));
+        }
+    }
+    ASSERT_EQ(0, removexattr(lower_file.c_str(), "security.capability")) << strerror(errno);
+    const int fd = open(merged_file.c_str(), O_WRONLY | O_CLOEXEC);
+    ASSERT_GE(fd, 0) << strerror(errno);
+    ASSERT_EQ(0, close(fd)) << strerror(errno);
+    for (const auto& path : {lower_file, upper_file, merged_file}) {
+        EXPECT_EQ("rollback-preserves-content", read_text(path));
+    }
+    EXPECT_EQ(0, overlay_temp_entry_count(work));
 }
 
 TEST(OverlayFsSemantics, CallerPermissionsProtectTimestampsAndUserXattrs) {

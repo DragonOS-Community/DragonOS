@@ -523,7 +523,8 @@ impl OvlInode {
         let loaded = upper
             .as_ref()
             .map(|upper| super::metadata::load_origin(self, upper))
-            .transpose()?
+            .transpose()
+            .map_err(super::metadata::xattr_read_error)?
             .flatten();
         let mut state = self.origin.lock();
         if matches!(*state, OriginState::Unchecked) {

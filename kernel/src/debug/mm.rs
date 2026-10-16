@@ -25,6 +25,11 @@ enum MmReportCallback {
         any(target_arch = "x86_64", target_arch = "riscv64")
     ))]
     KernelBufferSelftest,
+    #[cfg(all(
+        feature = "mm_selftest",
+        any(target_arch = "x86_64", target_arch = "riscv64")
+    ))]
+    OverlayXattrSelftest,
 }
 
 impl KernFSCallback for MmReportCallback {
@@ -48,6 +53,11 @@ impl KernFSCallback for MmReportCallback {
                 any(target_arch = "x86_64", target_arch = "riscv64")
             ))]
             Self::KernelBufferSelftest => crate::mm::kernel_buffer::selftest_report(),
+            #[cfg(all(
+                feature = "mm_selftest",
+                any(target_arch = "x86_64", target_arch = "riscv64")
+            ))]
+            Self::OverlayXattrSelftest => crate::filesystem::overlayfs::xattr_selftest_report(),
         };
         data.file_private_data_mut()
             .replace(KernFilePrivateData::DebugTextSnapshot(report));
@@ -137,6 +147,17 @@ pub fn init_debugfs_mm() -> Result<(), SystemError> {
         Some(4096),
         None,
         Some(&MmReportCallback::KernelBufferSelftest),
+    )?;
+    #[cfg(all(
+        feature = "mm_selftest",
+        any(target_arch = "x86_64", target_arch = "riscv64")
+    ))]
+    mm.add_file(
+        "overlay_xattr_selftest".to_string(),
+        InodeMode::S_IRUSR,
+        Some(4096),
+        None,
+        Some(&MmReportCallback::OverlayXattrSelftest),
     )?;
     Ok(())
 }

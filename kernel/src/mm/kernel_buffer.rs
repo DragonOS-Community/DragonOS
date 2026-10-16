@@ -66,6 +66,39 @@ impl KernelBuffer {
         )
     }
 
+    #[cfg(feature = "mm_selftest")]
+    pub(crate) fn try_new_zeroed_in(
+        len: usize,
+        owner: &Arc<ObjectAccount>,
+    ) -> Result<Self, MemoryAllocationError> {
+        Self::allocate_in(
+            len,
+            owner,
+            VmAllocation::is_supported(),
+            false,
+            &mut VmAllocation::try_new_zeroed_in,
+        )
+    }
+
+    /// Controlled local backing for consumers testing the real selection and
+    /// mapping path. Successful frames transfer to VmAllocation's normal Drop.
+    #[cfg(feature = "mm_selftest")]
+    pub(crate) fn try_new_zeroed_in_with(
+        len: usize,
+        owner: &Arc<ObjectAccount>,
+        data_frame: &mut dyn FnMut() -> Result<super::PhysAddr, SystemError>,
+    ) -> Result<Self, MemoryAllocationError> {
+        Self::allocate_in(
+            len,
+            owner,
+            VmAllocation::is_supported(),
+            false,
+            &mut |layout, selected| {
+                VmAllocation::try_new_zeroed_in_with(layout, selected, data_frame)
+            },
+        )
+    }
+
     fn allocate_in(
         len: usize,
         owner: &Arc<ObjectAccount>,

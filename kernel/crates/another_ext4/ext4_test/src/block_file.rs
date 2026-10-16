@@ -2,6 +2,7 @@ use another_ext4::{Block, BlockDevice, BLOCK_SIZE};
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::FileExt;
 use std::panic::panic_any;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
@@ -22,22 +23,18 @@ impl BlockFile {
 
 impl BlockDevice for BlockFile {
     fn read_block(&self, block_id: u64) -> core::result::Result<Block, another_ext4::Ext4Error> {
-        let mut file = &self.0;
+        let file = &self.0;
         let mut buffer = [0u8; BLOCK_SIZE];
         // warn!("read_block {}", block_id);
-        file.seek(SeekFrom::Start(block_id * BLOCK_SIZE as u64))
-            .map_err(|_| another_ext4::Ext4Error::new(another_ext4::ErrCode::EIO))?;
-        file.read_exact(&mut buffer)
+        file.read_exact_at(&mut buffer, block_id * BLOCK_SIZE as u64)
             .map_err(|_| another_ext4::Ext4Error::new(another_ext4::ErrCode::EIO))?;
         Ok(Block::new(block_id, Box::new(buffer)))
     }
 
     fn write_block(&self, block: &Block) -> core::result::Result<(), another_ext4::Ext4Error> {
-        let mut file = &self.0;
-        // warn!("write_block {}", block.block_id);
-        file.seek(SeekFrom::Start(block.id * BLOCK_SIZE as u64))
-            .map_err(|_| another_ext4::Ext4Error::new(another_ext4::ErrCode::EIO))?;
-        file.write_all(&*block.data)
+        let file = &self.0;
+        // Position I/O keeps concurrent users from racing on File's seek offset.
+        file.write_all_at(&*block.data, block.id * BLOCK_SIZE as u64)
             .map_err(|_| another_ext4::Ext4Error::new(another_ext4::ErrCode::EIO))?;
         Ok(())
     }

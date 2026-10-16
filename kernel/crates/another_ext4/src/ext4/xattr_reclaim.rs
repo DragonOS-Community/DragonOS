@@ -1,6 +1,9 @@
-use super::{journal_transaction::Transaction, Ext4};
+use super::{
+    journal_transaction::{BlockView, Transaction},
+    Ext4,
+};
 use crate::ext4_defs::{
-    validate_xattr_block_for_release, xattr_block_checksum, AsBytes, InodeRef, SuperBlock,
+    validate_xattr_block_for_release, xattr_block_checksum, AsBytes, Block, InodeRef, SuperBlock,
     XattrHeader,
 };
 use crate::prelude::*;
@@ -65,13 +68,64 @@ impl Ext4 {
         Ok(())
     }
 
-    /// Release the external xattr reference owned by an inode as part of the
-    /// caller's final-reclaim transaction.
-    ///
-    /// A shared block is retained with a decremented reference count. An
-    /// exclusively owned block is detached from the inode and returned to the
-    /// caller, which must release it through the transaction allocator. This
-    /// method never commits and never changes allocation metadata directly.
+    /// Validate a live external block before any ownership mutation. All
+    /// callers hold the exclusive metadata gate, or run mount recovery alone.
+    pub(super) fn transaction_read_xattr_block(
+        &self,
+        transaction: &Transaction<'_>,
+        block_id: PBlockId,
+    ) -> Result<(XattrHeader, Block)> {
+        self.validate_xattr_block_allocation(transaction, block_id)?;
+        let image = match transaction.read(self, block_id)? {
+            BlockView::Device(block) => block,
+            BlockView::Staged(bytes) => Block::new(block_id, try_copy_bytes(bytes)?),
+        };
+        let (header, has_ea_inode) = validate_xattr_block_for_release(&*image.data)
+            .ok_or_else(|| Ext4Error::new(ErrCode::EIO))?;
+        if has_ea_inode {
+            return Err(Ext4Error::new(ErrCode::ENOTSUP));
+        }
+        let sb = self.read_super_block_cached();
+        if sb.has_read_only_compatible_feature(SuperBlock::FEATURE_RO_COMPAT_METADATA_CSUM) {
+            let expected =
+                xattr_block_checksum(sb.metadata_checksum_seed(), block_id, &*image.data)
+                    .ok_or_else(|| Ext4Error::new(ErrCode::EIO))?;
+            if header.checksum() != expected {
+                return Err(Ext4Error::new(ErrCode::EIO));
+            }
+        }
+        Ok((header, image))
+    }
+
+    /// Release an explicitly identified reference, without changing any inode.
+    /// The returned exclusive block must be freed by the caller's allocator.
+    /// Direct retirement calls this only after the old inode link is durable;
+    /// journal callers stage it together with the inode detach.
+    pub(super) fn transaction_release_xattr_block(
+        &self,
+        transaction: &mut Transaction<'_>,
+        block_id: PBlockId,
+    ) -> Result<Option<PBlockId>> {
+        let (mut header, mut block) = self.transaction_read_xattr_block(transaction, block_id)?;
+        if header.refcount() == 1 {
+            return Ok(Some(block_id));
+        }
+        header.set_refcount(header.refcount() - 1);
+        let sb = self.read_super_block_cached();
+        let image = &mut *block.data;
+        if sb.has_read_only_compatible_feature(SuperBlock::FEATURE_RO_COMPAT_METADATA_CSUM) {
+            header.set_checksum(0);
+            image[..core::mem::size_of::<XattrHeader>()].copy_from_slice(header.to_bytes());
+            let checksum = xattr_block_checksum(sb.metadata_checksum_seed(), block_id, image)
+                .ok_or_else(|| Ext4Error::new(ErrCode::EIO))?;
+            header.set_checksum(checksum);
+        }
+        image[..core::mem::size_of::<XattrHeader>()].copy_from_slice(header.to_bytes());
+        transaction.stage(block_id, block.data)?;
+        Ok(None)
+    }
+
+    /// Detach this inode and release its reference within one journal operation.
     pub(super) fn transaction_release_xattr(
         &self,
         transaction: &mut Transaction<'_>,
@@ -81,61 +135,60 @@ impl Ext4 {
         if block_id == 0 {
             return Ok(None);
         }
-        // Detaching one external reference releases this inode's block
-        // charge even when another inode still owns the shared block.
         let remaining_blocks = inode
             .inode
             .fs_block_count()
             .checked_sub(1)
             .ok_or_else(|| Ext4Error::new(ErrCode::EIO))?;
-        let sb = self.read_super_block_cached();
-        self.validate_xattr_block_allocation(transaction, block_id)?;
-        let image = transaction.read(self, block_id)?;
-        let (mut header, has_ea_inode) = validate_xattr_block_for_release(&*image)
-            .ok_or_else(|| Ext4Error::new(ErrCode::EIO))?;
-        if has_ea_inode {
+        let released = self.transaction_release_xattr_block(transaction, block_id)?;
+        inode.inode.set_xattr_block(0);
+        inode.inode.set_fs_block_count(remaining_blocks);
+        self.transaction_stage_inode_with_csum(transaction, inode)?;
+        Ok(released)
+    }
+
+    /// Retire an old reference after a durable Direct inode publication. Never
+    /// detach the current inode here: it may already own a different home.
+    pub(super) fn direct_release_xattr_block_locked(&self, block_id: PBlockId) -> Result<()> {
+        let result = (|| {
+            let mut transaction = self.transaction_start(6)?;
+            if let Some(home) = self.transaction_release_xattr_block(&mut transaction, block_id)? {
+                self.transaction_dealloc_block_range(&mut transaction, home, 1)?;
+            }
+            self.finish_direct_phase(transaction)
+        })();
+        if result.is_err() {
+            // The inode already committed its detach. Even a preparation error
+            // cannot restart the operation against its former ownership.
+            self.poison(ErrCode::EIO);
+        }
+        result
+    }
+
+    /// Called under the existing exclusive gate by remove-last and final
+    /// reclaim. Publish a durable detach before decrementing or freeing.
+    pub(super) fn direct_detach_xattr_locked(&self, inode: &mut InodeRef) -> Result<()> {
+        let home = inode.inode.xattr_block();
+        if home == 0 {
+            return Ok(());
+        }
+        if !self.block_device.supports_reliable_flush() {
             return Err(Ext4Error::new(ErrCode::ENOTSUP));
         }
-
-        // Linux verifies and updates h_checksum only with metadata_csum.
-        const FEATURE_RO_COMPAT_METADATA_CSUM: u32 = 0x0400;
-        let checksum_seed = if sb.has_read_only_compatible_feature(FEATURE_RO_COMPAT_METADATA_CSUM)
-        {
-            let seed = sb.metadata_checksum_seed();
-            let expected = xattr_block_checksum(seed, block_id, &*image)
-                .ok_or_else(|| Ext4Error::new(ErrCode::EIO))?;
-            if header.checksum() != expected {
-                return Err(Ext4Error::new(ErrCode::EIO));
-            }
-            Some(seed)
-        } else {
-            None
-        };
-
-        if header.refcount() > 1 {
-            header.set_refcount(header.refcount() - 1);
-            let image = self.transaction_block_for_update(transaction, block_id)?;
-            if let Some(seed) = checksum_seed {
-                header.set_checksum(0);
-                image[..core::mem::size_of::<XattrHeader>()].copy_from_slice(header.to_bytes());
-                let checksum = xattr_block_checksum(seed, block_id, image)
-                    .ok_or_else(|| Ext4Error::new(ErrCode::EIO))?;
-                header.set_checksum(checksum);
-            }
-            image[..core::mem::size_of::<XattrHeader>()].copy_from_slice(header.to_bytes());
-            // This inode no longer owns a reference.  Detach it in the same
-            // transaction as the shared reference-count decrement, otherwise
-            // a restartable reclaim would decrement the block repeatedly.
-            inode.inode.set_xattr_block(0);
-            inode.inode.set_fs_block_count(remaining_blocks);
-            self.transaction_stage_inode_with_csum(transaction, inode)?;
-            Ok(None)
-        } else {
-            inode.inode.set_xattr_block(0);
-            inode.inode.set_fs_block_count(remaining_blocks);
-            self.transaction_stage_inode_with_csum(transaction, inode)?;
-            Ok(Some(block_id))
-        }
+        let remaining = inode
+            .inode
+            .fs_block_count()
+            .checked_sub(1)
+            .ok_or_else(|| Ext4Error::new(ErrCode::EIO))?;
+        let mut detached = inode.clone();
+        let mut transaction = self.transaction_start(1)?;
+        self.transaction_read_xattr_block(&transaction, home)?;
+        detached.inode.set_xattr_block(0);
+        detached.inode.set_fs_block_count(remaining);
+        self.transaction_stage_inode_with_csum(&mut transaction, &mut detached)?;
+        self.finish_direct_phase(transaction)?;
+        *inode = detached;
+        self.direct_release_xattr_block_locked(home)
     }
 }
 

@@ -1,10 +1,22 @@
-//! Extended attribute access and atomic journal-mode replacement.
-use super::Ext4;
+//! External xattr access, journal replacement and ordered nojournal ownership.
+use super::{journal_transaction::Transaction, Ext4, MetadataMutationMode};
 use crate::ext4_defs::*;
 use crate::prelude::*;
-use crate::return_error;
 
 impl Ext4 {
+    /// Keep the inode's external block alive through its complete read. Direct
+    /// final detach uses the exclusive side of this same gate; a per-inode
+    /// snapshot alone cannot prevent the block from being freed and reused.
+    fn lock_xattr_read_view(
+        &self,
+    ) -> Result<Option<super::metadata_gate::MetadataMutationGuard<'_>>> {
+        if matches!(self.metadata_mode, MetadataMutationMode::Direct(_)) {
+            self.metadata_mutation_barrier.try_read_view().map(Some)
+        } else {
+            self.lock_metadata_read_view()
+        }
+    }
+
     fn xattr_checksum_seed(&self) -> Result<Option<MetadataChecksumSeed>> {
         let sb = self.read_super_block_cached();
         if !sb.has_read_only_compatible_feature(SuperBlock::FEATURE_RO_COMPAT_METADATA_CSUM) {
@@ -52,7 +64,7 @@ impl Ext4 {
     /// `ENODATA` - the attribute does not exist
     pub fn getxattr(&self, inode: InodeId, name: &[u8], buf: &mut [u8]) -> Result<usize> {
         XattrEntry::validate_name(name)?;
-        let _view = self.lock_metadata_read_view()?;
+        let _view = self.lock_xattr_read_view()?;
         let inode_ref = self.read_inode(inode)?;
         let home = inode_ref.inode.xattr_block();
         if home == 0 {
@@ -103,79 +115,7 @@ impl Ext4 {
     ) -> Result<()> {
         self.ensure_mutable()?;
         XattrEntry::validate_name(name)?;
-        if self.uses_journal() {
-            return self.update_xattr_transaction(inode, name, Some(value), create, replace);
-        }
-        let _metadata_guard = self.lock_direct_metadata_mutation()?;
-        let _mutation_guard =
-            self.inode_mutation_locks[self.inode_mutation_lock_index(inode)].lock();
-        let mut inode_ref = self.read_inode(inode)?;
-        let xattr_block_id = inode_ref.inode.xattr_block();
-        if xattr_block_id == 0 {
-            if replace {
-                return_error!(ErrCode::ENODATA, "Xattr {:?} does not exist", name);
-            }
-            // lazy allocate xattr block
-            let pblock = self.alloc_block(&mut inode_ref)?;
-            let old_xattr_block = xattr_block_id;
-            let result = (|| {
-                let mut xattr_block = XattrBlock::new(self.read_block(pblock)?);
-                xattr_block.init();
-                if !xattr_block.insert(name, value) {
-                    return_error!(
-                        ErrCode::ENOSPC,
-                        "Xattr block of Inode {} does not have enough space",
-                        inode
-                    );
-                }
-                self.update_xattr_block_checksum(pblock, &mut xattr_block)?;
-                self.write_block(&xattr_block.block())?;
-                inode_ref.inode.set_xattr_block(pblock);
-                let blocks = inode_ref
-                    .inode
-                    .fs_block_count()
-                    .checked_add(1)
-                    .ok_or_else(|| Ext4Error::new(ErrCode::EFBIG))?;
-                inode_ref.inode.set_fs_block_count(blocks);
-                self.write_inode_with_csum(&mut inode_ref)?;
-                Ok(())
-            })();
-            if let Err(err) = result {
-                inode_ref.inode.set_xattr_block(old_xattr_block);
-                return match self.dealloc_block(&mut inode_ref, pblock) {
-                    Ok(()) => Err(err),
-                    Err(rollback_err) => Err(rollback_err),
-                };
-            }
-            return Ok(());
-        }
-
-        let xattr_block = XattrBlock::new(self.read_block(xattr_block_id)?);
-        self.verify_xattr_block_checksum(xattr_block_id, &xattr_block)?;
-        xattr_block.validate_inline()?;
-        let exists = xattr_block.get(name)?.is_some();
-        if exists && create {
-            return_error!(ErrCode::EEXIST, "Xattr {:?} already exists", name);
-        }
-        if !exists && replace {
-            return_error!(ErrCode::ENODATA, "Xattr {:?} does not exist", name);
-        }
-
-        let mut new_xattr_block = xattr_block;
-        if exists {
-            let _ = new_xattr_block.remove(name);
-        }
-        if new_xattr_block.insert(name, value) {
-            self.update_xattr_block_checksum(xattr_block_id, &mut new_xattr_block)?;
-            self.write_block(&new_xattr_block.block())?;
-            Ok(())
-        } else {
-            return_error!(
-                ErrCode::ENOSPC,
-                "Xattr block of Inode {} does not have enough space",
-                inode
-            );
-        }
+        self.update_xattr(inode, name, Some(value), create, replace)
     }
 
     /// Remove extended attribute of a file.
@@ -191,66 +131,7 @@ impl Ext4 {
     pub fn removexattr(&self, inode: InodeId, name: &[u8]) -> Result<()> {
         self.ensure_mutable()?;
         XattrEntry::validate_name(name)?;
-        if self.uses_journal() {
-            return self.update_xattr_transaction(inode, name, None, false, true);
-        }
-        let _metadata_guard = self.lock_direct_metadata_mutation()?;
-        let _mutation_guard =
-            self.inode_mutation_locks[self.inode_mutation_lock_index(inode)].lock();
-        let mut inode_ref = self.read_inode(inode)?;
-        let xattr_block_id = inode_ref.inode.xattr_block();
-        if xattr_block_id == 0 {
-            return_error!(ErrCode::ENODATA, "Xattr {:?} does not exist", name);
-        }
-        let image = self.read_block(xattr_block_id)?;
-        let mut header = XattrHeader::from_bytes(&image.data[..]);
-        let mut xattr_block = XattrBlock::new(image);
-        self.verify_xattr_block_checksum(xattr_block_id, &xattr_block)?;
-        xattr_block.validate_inline()?;
-        if xattr_block.remove(name) {
-            if xattr_block.is_empty()? {
-                let blocks = inode_ref
-                    .inode
-                    .fs_block_count()
-                    .checked_sub(1)
-                    .ok_or_else(|| Ext4Error::new(ErrCode::EIO))?;
-                inode_ref.inode.set_xattr_block(0);
-                inode_ref.inode.set_fs_block_count(blocks);
-                self.write_inode_with_csum(&mut inode_ref)?;
-                // In nojournal mode detach durably before returning this block
-                // to the allocator; otherwise the old inode could reference a
-                // newly reused block after a crash.
-                if self.write_barrier {
-                    self.block_device.flush()?;
-                }
-                let released = if header.refcount() == 1 {
-                    self.dealloc_block(&mut inode_ref, xattr_block_id)
-                } else {
-                    // Detaching one owner must preserve the shared contents.
-                    let mut original = self.read_block(xattr_block_id)?;
-                    header.set_refcount(
-                        header
-                            .refcount()
-                            .checked_sub(1)
-                            .ok_or_else(|| Ext4Error::new(ErrCode::EIO))?,
-                    );
-                    original.data[..core::mem::size_of::<XattrHeader>()]
-                        .copy_from_slice(header.to_bytes());
-                    let mut original = XattrBlock::new(original);
-                    self.update_xattr_block_checksum(xattr_block_id, &mut original)?;
-                    self.write_block(&original.block())
-                };
-                if released.is_err() {
-                    self.poison(ErrCode::EIO);
-                }
-                return released;
-            }
-            self.update_xattr_block_checksum(xattr_block_id, &mut xattr_block)?;
-            self.write_block(&xattr_block.block())?;
-            Ok(())
-        } else {
-            return_error!(ErrCode::ENODATA, "Xattr {:?} does not exist", name);
-        }
+        self.update_xattr(inode, name, None, false, true)
     }
 
     /// List extended attributes of a file.
@@ -264,7 +145,7 @@ impl Ext4 {
     /// The length of the NUL-separated byte names. An empty buffer probes
     /// the size; copying uses the same checked block snapshot.
     pub fn listxattr(&self, inode: InodeId, buf: &mut [u8]) -> Result<usize> {
-        let _view = self.lock_metadata_read_view()?;
+        let _view = self.lock_xattr_read_view()?;
         let inode_ref = self.read_inode(inode)?;
         let home = inode_ref.inode.xattr_block();
         if home == 0 {
@@ -277,7 +158,7 @@ impl Ext4 {
     /// External xattr replacement is one allocation/reference/inode operation.
     /// Shared Linux xattr blocks are copied, never changed through another
     /// inode's reference. All fallible candidate construction precedes commit.
-    fn update_xattr_transaction(
+    fn update_xattr(
         &self,
         inode_id: InodeId,
         name: &[u8],
@@ -289,6 +170,9 @@ impl Ext4 {
         let _inode = self.inode_mutation_locks[self.inode_mutation_lock_index(inode_id)].lock();
         let mut inode = self.read_inode(inode_id)?;
         let old_home = inode.inode.xattr_block();
+        if old_home != 0 && inode.inode.fs_block_count() == 0 {
+            return Err(Ext4Error::new(ErrCode::EIO));
+        }
         // At most: inode table, old/new xattr, bitmap, GDT and superblock.
         let mut transaction = self.transaction_start(6)?;
         let (mut candidate, shared) = if old_home == 0 {
@@ -299,14 +183,8 @@ impl Ext4 {
             block.init();
             (block, false)
         } else {
-            let image = transaction.read(self, old_home)?;
-            let (header, ea_inode) = validate_xattr_block_for_release(&*image)
-                .ok_or_else(|| Ext4Error::new(ErrCode::EIO))?;
-            if ea_inode {
-                return Err(Ext4Error::new(ErrCode::ENOTSUP));
-            }
-            let block = XattrBlock::new(Block::new(old_home, try_copy_bytes(&image)?));
-            self.verify_xattr_block_checksum(old_home, &block)?;
+            let (header, image) = self.transaction_read_xattr_block(&transaction, old_home)?;
+            let block = XattrBlock::new(image);
             (block, header.refcount() > 1)
         };
         candidate.validate_inline()?;
@@ -325,14 +203,27 @@ impl Ext4 {
                 return Err(Ext4Error::new(ErrCode::ENOSPC));
             }
         }
-        if value.is_none() && candidate.is_empty()? {
+        let empty = value.is_none() && candidate.is_empty()?;
+        if !self.uses_journal() {
+            if empty {
+                transaction.abort();
+                return self.direct_detach_xattr_locked(&mut inode);
+            }
+            return self.update_xattr_direct(transaction, inode, candidate, shared);
+        }
+        if empty {
             if let Some(home) = self.transaction_release_xattr(&mut transaction, &mut inode)? {
                 self.transaction_dealloc_block_range(&mut transaction, home, 1)?;
             }
             return self
                 .commit_metadata_operation(transaction)
                 .map(|_| ())
-                .map_err(|error| error.error);
+                .map_err(|error| {
+                    if error.poisoned {
+                        self.poison(ErrCode::EIO);
+                    }
+                    error.error
+                });
         }
         let home = if old_home == 0 || shared {
             let home = self.transaction_alloc_metadata_block(&mut transaction, inode_id, None)?;
@@ -361,6 +252,108 @@ impl Ext4 {
         transaction.stage(home, candidate.block().data)?;
         self.commit_metadata_operation(transaction)
             .map(|_| ())
-            .map_err(|error| error.error)
+            .map_err(|error| {
+                if error.poisoned {
+                    self.poison(ErrCode::EIO);
+                }
+                error.error
+            })
+    }
+
+    /// The caller holds the exclusive metadata gate and inode shard. Only a
+    /// new home changes ownership; private, nonempty updates stay in place.
+    fn update_xattr_direct(
+        &self,
+        mut ownership: Transaction<'_>,
+        mut inode: InodeRef,
+        candidate: XattrBlock,
+        shared: bool,
+    ) -> Result<()> {
+        let old_home = inode.inode.xattr_block();
+        let needs_home = old_home == 0 || shared;
+        if needs_home && !self.block_device.supports_reliable_flush() {
+            return Err(Ext4Error::new(ErrCode::ENOTSUP));
+        }
+        let blocks = if old_home == 0 {
+            inode
+                .inode
+                .fs_block_count()
+                .checked_add(1)
+                .ok_or_else(|| Ext4Error::new(ErrCode::EFBIG))?
+        } else {
+            inode.inode.fs_block_count()
+        };
+        let home = if needs_home {
+            self.transaction_alloc_metadata_block(&mut ownership, inode.id, None)?
+        } else {
+            old_home
+        };
+        let mut image = candidate.block();
+        image.id = home;
+        let mut header = XattrHeader::from_bytes(&image.data[..]);
+        header.set_refcount(1);
+        image.data[..core::mem::size_of::<XattrHeader>()].copy_from_slice(header.to_bytes());
+        let mut candidate = XattrBlock::new(image);
+        self.update_xattr_block_checksum(home, &mut candidate)?;
+        let candidate = candidate.block();
+        if !needs_home {
+            ownership.stage(home, candidate.data)?;
+            return self
+                .commit_metadata_operation(ownership)
+                .map(|_| ())
+                .map_err(|error| {
+                    if error.poisoned {
+                        self.poison(ErrCode::EIO);
+                    }
+                    error.error
+                });
+        }
+
+        // Prepare the complete new inode image before committing any claims.
+        // The exclusive gate also protects other inodes in this table block.
+        inode.inode.set_xattr_block(home);
+        inode.inode.set_fs_block_count(blocks);
+        self.transaction_stage_inode_with_csum(&mut ownership, &mut inode)?;
+        let inode_home = self.inode_disk_pos(inode.id)?.0;
+        let inode_image = ownership
+            .take_direct_image(inode_home)?
+            .ok_or_else(|| Ext4Error::new(ErrCode::EIO))?;
+
+        // A: allocation ownership first, while the old inode still owns its
+        // old home. A failed phase is uncertain and already fail-stops.
+        self.finish_direct_phase(ownership)?;
+        let before_inode = (|| {
+            // B: complete, checksum-correct new image must be durable before
+            // any inode can make it reachable.
+            self.block_device.write_block(&candidate)?;
+            self.block_device.flush()?;
+            let mut root = self.transaction_start(1)?;
+            root.stage(inode_home, inode_image)?;
+            Ok(root)
+        })();
+        let root = match before_inode {
+            Ok(root) => root,
+            Err(error) => {
+                // No inode write was attempted: the new claim cannot be live.
+                let rollback = (|| {
+                    let mut transaction = self.transaction_start(3)?;
+                    self.transaction_dealloc_block_range(&mut transaction, home, 1)?;
+                    self.finish_direct_phase(transaction)
+                })();
+                if let Err(rollback_error) = rollback {
+                    self.poison(ErrCode::EIO);
+                    return Err(rollback_error);
+                }
+                return Err(error);
+            }
+        };
+        // C: an attempted inode write/flush can already have published the new
+        // home. Never roll back its claim after this boundary.
+        self.finish_direct_phase(root)?;
+        // D: use the explicit OLD home, not the now-published inode pointer.
+        if old_home != 0 {
+            self.direct_release_xattr_block_locked(old_home)?;
+        }
+        Ok(())
     }
 }

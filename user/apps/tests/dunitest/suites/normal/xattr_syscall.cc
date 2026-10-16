@@ -306,6 +306,44 @@ TEST_F(XattrSyscall, NamesPreserveArbitraryBytesAcrossAllEntryPoints) {
     ExpectOriginal();
 }
 
+TEST_F(XattrSyscall, GnuNamesRemainDistinctFromUserNames) {
+    const char gnu[] = "gnu.byte_\xff";
+    const char user[] = "user.byte_\xff";
+    for (Access mode : kAccess) {
+        SCOPED_TRACE(static_cast<int>(mode));
+        ASSERT_EQ(0, Set(mode, "gnu", 3, XATTR_CREATE, gnu)) << strerror(errno);
+        ASSERT_EQ(0, Set(mode, "user", 4, XATTR_CREATE, user)) << strerror(errno);
+        std::array<char, 8> value = {};
+        ASSERT_EQ(3, Get(mode, value.data(), value.size(), gnu));
+        EXPECT_EQ(0, memcmp(value.data(), "gnu", 3));
+        ASSERT_EQ(4, Get(mode, value.data(), value.size(), user));
+        EXPECT_EQ(0, memcmp(value.data(), "user", 4));
+        std::array<char, sizeof(kName) + sizeof(gnu) + sizeof(user)> names = {};
+        ASSERT_EQ(static_cast<ssize_t>(names.size()), List(mode, names.data(), names.size()));
+        for (const char* expected : {kName, gnu, user}) {
+            size_t matches = 0;
+            for (size_t offset = 0; offset < names.size();) {
+                const size_t size = strnlen(names.data() + offset, names.size() - offset);
+                ASSERT_LT(size, names.size() - offset);
+                matches += std::string(names.data() + offset, size) == expected;
+                offset += size + 1;
+            }
+            EXPECT_EQ(1U, matches);
+        }
+        ASSERT_EQ(0, Set(mode, "new", 3, XATTR_REPLACE, gnu));
+        ASSERT_EQ(3, Get(mode, value.data(), value.size(), gnu));
+        EXPECT_EQ(0, memcmp(value.data(), "new", 3));
+        ASSERT_EQ(0, Remove(mode, gnu));
+        errno = 0;
+        EXPECT_EQ(-1, Get(mode, nullptr, 0, gnu));
+        EXPECT_EQ(ENODATA, errno);
+        ASSERT_EQ(4, Get(mode, value.data(), value.size(), user));
+        EXPECT_EQ(0, memcmp(value.data(), "user", 4));
+        ASSERT_EQ(0, Remove(mode, user));
+    }
+    ExpectOriginal();
+}
+
 TEST_F(XattrSyscall, NameByteLimitIncludesNamespaceAndExcludesTerminator) {
     // Linux XATTR_NAME_MAX is 255 bytes for the complete namespace + suffix.
     std::string name = "user." + std::string(249, 'x') + char(0xff);

@@ -6,7 +6,7 @@ mod block_file;
 
 use another_ext4::{ErrCode, Ext4, InodeMode, InodeOwner, EXT4_ROOT_INO};
 use block_file::BlockFile;
-use std::{fs::File, process::Command, sync::Arc};
+use std::{ffi::OsStr, fs::File, os::unix::ffi::OsStrExt, process::Command, sync::Arc};
 
 fn fsck(path: &str) {
     let output = Command::new("e2fsck").args(["-fn", path]).output().unwrap();
@@ -346,6 +346,10 @@ fn crash_matrix() {
 }
 
 fn main() {
+    if std::env::args().any(|arg| arg == "--gnu-interop-only") {
+        gnu_namespace_interop();
+        return;
+    }
     if std::env::args().any(|arg| arg == "--crash-only") {
         crash_matrix();
         return;
@@ -353,6 +357,7 @@ fn main() {
     run(true);
     run(false);
     crash_matrix();
+    gnu_namespace_interop();
 }
 
 fn get_value(fs: &Ext4, inode: u32, name: &[u8]) -> Vec<u8> {
@@ -433,5 +438,109 @@ fn check_binary_xattrs(fs: &Ext4, inode: u32, remounted: bool) {
         for name in NAMES {
             fs.removexattr(inode, name).unwrap();
         }
+    }
+}
+
+/// e2fsprogs provides the independent namespace-to-disk-index oracle. A local
+/// create/get round trip alone cannot detect mutually wrong encode/decode maps.
+fn gnu_namespace_interop() {
+    const ORIGINAL: &[u8] = &[0x31; 300];
+    const REPLACED: &[u8] = b"gnu-replaced-by-library";
+    const CREATED: &[u8] = b"gnu-created-by-library";
+    const SYSTEM: &[u8] = &[0x53; 320];
+    const READBACK: &str = "gnu-namespace-readback.out";
+    const INPUT: &str = "gnu-namespace-input.bin";
+    for journal in [true, false] {
+        let path = if journal {
+            "gnu-namespace-journal.img"
+        } else {
+            "gnu-namespace-direct.img"
+        };
+        File::create(path)
+            .unwrap()
+            .set_len(32 * 1024 * 1024)
+            .unwrap();
+        let features = if journal {
+            "^orphan_file"
+        } else {
+            "^orphan_file,^has_journal"
+        };
+        // This library supports 256-byte inodes. Both seeded values exceed
+        // their entire inode-body capacity, forcing external xattr storage.
+        assert!(Command::new("mkfs.ext4")
+            .args(["-q", "-F", "-b", "4096", "-I", "256", "-O", features, path])
+            .status()
+            .unwrap()
+            .success());
+        let debugfs = |command: &[u8]| {
+            let output = Command::new("debugfs")
+                .args(["-w", "-R"])
+                .arg(OsStr::from_bytes(command))
+                .arg(path)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "debugfs failed: {output:?}");
+        };
+        let read_external = |name: &[u8], expected: &[u8]| {
+            if std::path::Path::new(READBACK).exists() {
+                std::fs::remove_file(READBACK).unwrap();
+            }
+            let mut command = format!("ea_get -f {READBACK} /gnu-file ").into_bytes();
+            command.extend_from_slice(name);
+            debugfs(&command);
+            // debugfs can return exit status zero for a failed command. Only
+            // newly created, byte-exact output is evidence that the key exists.
+            assert_eq!(std::fs::read(READBACK).unwrap(), expected);
+            std::fs::remove_file(READBACK).unwrap();
+        };
+        debugfs(b"write /dev/null /gnu-file");
+        for (name, value) in [
+            (b"gnu.\xff".as_slice(), ORIGINAL),
+            (b"system.keep".as_slice(), SYSTEM),
+        ] {
+            std::fs::write(INPUT, value).unwrap();
+            let mut command = format!("ea_set -f {INPUT} /gnu-file ").into_bytes();
+            command.extend_from_slice(name);
+            debugfs(&command);
+            std::fs::remove_file(INPUT).unwrap();
+        }
+        read_external(b"gnu.\xff", ORIGINAL);
+        read_external(b"system.keep", SYSTEM);
+
+        let fs = Ext4::load_writable(Arc::new(BlockFile::new(path))).unwrap();
+        let inode = fs.lookup(EXT4_ROOT_INO, "gnu-file").unwrap();
+        let mut original = vec![0; ORIGINAL.len()];
+        assert_eq!(
+            fs.getxattr(inode, b"gnu.\xff", &mut original)
+                .expect("read e2fsprogs GNU index 10"),
+            ORIGINAL.len()
+        );
+        assert_eq!(original, ORIGINAL);
+        assert_eq!(
+            fs.getxattr(inode, b"gnu.keep", &mut []).unwrap_err().code(),
+            ErrCode::ENODATA
+        );
+        assert_eq!(
+            fs.getxattr(inode, b"system.keep", &mut [])
+                .unwrap_err()
+                .code(),
+            ErrCode::ENOTSUP
+        );
+        let mut names = [0; 64];
+        let size = fs.listxattr(inode, &mut names).unwrap();
+        assert_eq!(&names[..size], b"gnu.\xff\0");
+        fs.setxattr_with_flags(inode, b"gnu.\xff", REPLACED, false, true)
+            .unwrap();
+        fs.setxattr_with_flags(inode, b"gnu.\xfe", CREATED, true, false)
+            .unwrap();
+        fs.shutdown_writable().unwrap();
+        drop(fs);
+
+        read_external(b"gnu.\xff", REPLACED);
+        read_external(b"gnu.\xfe", CREATED);
+        read_external(b"system.keep", SYSTEM);
+        fsck(path);
+        std::fs::remove_file(path).unwrap();
+        println!("GNU namespace e2fsprogs interoperability journal={journal}: passed");
     }
 }

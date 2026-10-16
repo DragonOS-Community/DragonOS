@@ -13,6 +13,9 @@ use crate::constants::*;
 use crate::prelude::*;
 use core::cmp::Ordering;
 
+// Linux fs/ext4/xattr.h: Hurd uses index 10; index 7 is reserved for SYSTEM.
+const XATTR_INDEX_HURD: u8 = 10;
+
 /// The beginning of an extended attribute block.
 #[repr(C)]
 #[derive(Debug)]
@@ -276,7 +279,7 @@ impl XattrEntry {
             3 if self.name_len == 0 => Some(b"system.posix_acl_default"),
             4 => Some(b"trusted."),
             6 => Some(b"security."),
-            7 => Some(b"gnu."),
+            XATTR_INDEX_HURD => Some(b"gnu."),
             _ => None,
         }
     }
@@ -321,7 +324,7 @@ impl XattrEntry {
             (b"user.", 1),
             (b"trusted.", 4),
             (b"security.", 6),
-            (b"gnu.", 7),
+            (b"gnu.", XATTR_INDEX_HURD),
         ];
         for &(prefix, index) in prefixes {
             if let Some(suffix) = name.strip_prefix(prefix) {
@@ -770,6 +773,76 @@ mod release_tests {
                 .code(),
             ErrCode::ENOTSUP
         );
+    }
+
+    #[test]
+    fn linux_hurd_raw_index_10_lists_and_reads_original_bytes() {
+        let mut block = XattrBlock::new(Block::new(9, Box::new([0; BLOCK_SIZE])));
+        block.init();
+        let offset = size_of::<XattrHeader>();
+        // Linux 6.6 fs/ext4/xattr.h assigns the on-disk Hurd namespace 10.
+        // Build its bytes independently of the production name encoder.
+        add_inline_entry(&mut block.0.data, offset, b"test\xff", 4084, 10);
+        block.0.data[offset + 1] = 10;
+        block.0.data[4084..4094].copy_from_slice(b"linux-hurd");
+        let mut names = [0xa5; 32];
+        let size = block.list(&mut names).unwrap();
+        assert_eq!(&names[..size], b"gnu.test\xff\0");
+        assert_eq!(
+            block.get(b"gnu.test\xff").unwrap(),
+            Some(&b"linux-hurd"[..])
+        );
+        assert!(names[size..].iter().all(|byte| *byte == 0xa5));
+    }
+
+    #[test]
+    fn linux_hurd_encoder_uses_numeric_index_10() {
+        let entry = XattrEntry::new(b"gnu.test", 4, 4092);
+        assert_eq!(entry.name_index, 10);
+        assert_eq!(&entry.name[..entry.name_len as usize], b"test");
+    }
+
+    #[test]
+    fn linux_system_raw_index_7_is_hidden_and_preserved_when_other_names_change() {
+        let mut block = XattrBlock::new(Block::new(9, Box::new([0; BLOCK_SIZE])));
+        block.init();
+        let offset = size_of::<XattrHeader>();
+        // Numeric index 7 is SYSTEM, not Hurd. It has no generic handler.
+        add_inline_entry(&mut block.0.data, offset, b"test", 4088, 6);
+        block.0.data[offset + 1] = 7;
+        block.0.data[4088..4094].copy_from_slice(b"system");
+        let mut names = [0xa5; 32];
+        assert_eq!(block.list(&mut names).unwrap(), 0);
+        assert_eq!(names, [0xa5; 32]);
+        assert_eq!(block.get(b"gnu.test").unwrap(), None);
+        assert!(block.insert(b"user.a", b"new"));
+        assert_eq!(block.get(b"user.a").unwrap(), Some(&b"new"[..]));
+        let mut cursor = offset;
+        let mut preserved = false;
+        while let Some(entry) = block.entry_at(cursor).unwrap() {
+            if entry.name_index == 7 {
+                assert_eq!(&entry.name[..entry.name_len as usize], b"test");
+                let start = entry.value_offset as usize;
+                assert_eq!(
+                    &block.0.data[start..start + entry.value_size as usize],
+                    b"system"
+                );
+                preserved = true;
+            }
+            cursor += entry.used_size();
+        }
+        assert!(preserved);
+        assert!(block.remove(b"user.a"));
+        let entry = block.entry_at(offset).unwrap().unwrap();
+        assert_eq!(entry.name_index, 7);
+        assert_eq!(&entry.name[..entry.name_len as usize], b"test");
+        let start = entry.value_offset as usize;
+        assert_eq!(
+            &block.0.data[start..start + entry.value_size as usize],
+            b"system"
+        );
+        assert_eq!(block.list(&mut []).unwrap(), 0);
+        assert_eq!(block.get(b"gnu.test").unwrap(), None);
     }
 
     #[test]

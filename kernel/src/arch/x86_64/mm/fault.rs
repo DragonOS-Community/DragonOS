@@ -57,7 +57,7 @@ impl X86_64MMArch {
         let Some(entry) = mapper.get_entry(address, 0) else {
             return false;
         };
-        entry.present()
+        entry.flags().present()
             && entry.flags().has_user()
             && (!error_code.contains(X86PfErrorCode::X86_PF_WRITE) || entry.write())
             && (!error_code.contains(X86PfErrorCode::X86_PF_INSTR) || entry.flags().has_execute())

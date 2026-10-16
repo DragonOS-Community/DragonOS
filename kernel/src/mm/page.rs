@@ -2463,9 +2463,12 @@ impl<Arch: MemoryManagementArch> PageEntry<Arch> {
         self.data = (self.data & !Arch::ENTRY_FLAGS_MASK) | flags.data();
     }
 
+    /// Whether this entry retains a resident mapping, including PROT_NONE.
+    /// Like Linux pte_present(), this is a software lifetime predicate. Use
+    /// flags().present() when testing the hardware PRESENT bit instead.
     #[inline(always)]
     pub fn present(&self) -> bool {
-        return self.data & Arch::ENTRY_FLAG_PRESENT != 0;
+        self.flags().present() || self.protnone()
     }
 
     #[inline(always)]

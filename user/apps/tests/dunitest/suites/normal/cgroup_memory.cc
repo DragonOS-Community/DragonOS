@@ -54,6 +54,7 @@ constexpr char CpuStart = 'i';
 constexpr char CpuStatus = 't';
 constexpr char CpuInterrupt = 'n';
 constexpr char CpuDestroy = 'o';
+constexpr char Protect = 'p';
 // Register every dispatched command here: duplicate wire values must fail
 // compilation rather than silently making a later if-branch unreachable.
 constexpr char All[] = {'G', InstallHighSignal, ReadHighSignal, 'M', 'S', 'D',
@@ -62,7 +63,7 @@ constexpr char All[] = {'G', InstallHighSignal, ReadHighSignal, 'M', 'S', 'D',
                        CloneVforkMm, 'Z', 'X', EpollSetup, EpollAdd,
                        EpollDuplicate, EpollModify, EpollDelete, EpollClose,
                        CpuFastClock, CpuSetup, CpuStart, CpuStatus, CpuInterrupt,
-                       CpuDestroy};
+                       CpuDestroy, Protect};
 constexpr bool Unique() {
   for (size_t i = 0; i < sizeof(All); ++i)
     for (size_t j = i + 1; j < sizeof(All); ++j)
@@ -450,6 +451,11 @@ int HoldVforkMm(void* argument) {
       else if (command.bytes > length) reply.error = EINVAL;
       else Touch(mapping, command.bytes ? command.bytes : length,
                  command.operation == 'T');
+    } else if (command.operation == worker_op::Protect) {
+      if (mapping == MAP_FAILED ||
+          (command.bytes & ~uint64_t(PROT_READ | PROT_WRITE | PROT_EXEC)))
+        reply.error = EINVAL;
+      else if (mprotect(mapping, length, int(command.bytes))) reply.error = errno;
     } else if (command.operation == 'Q') {
       if (mapping != MAP_FAILED) reply.error = EBUSY;
       else {
@@ -1310,6 +1316,30 @@ TEST_F(CgroupMemory, AnonymousFirstTouchUnmapAndPeak) {
   ASSERT_EQ(0, worker->Ask('U').error);
   EXPECT_TRUE(Eventually([&] { return Stat(leaf, "anon") < anon + MiB; }));
   EXPECT_GE(Scalar(leaf + "/memory.peak"), peak);
+}
+
+TEST_F(CgroupMemory, ProtectedAnonymousChargePersistsUntilUnmapOrExit) {
+  std::string leaf = Leaf();
+  auto* worker = Worker(leaf);
+  ASSERT_NE(nullptr, worker);
+  const uint64_t baseline = Stat(leaf, "anon");
+  ASSERT_NE(UINT64_MAX, baseline);
+  ASSERT_TRUE(Allocate(worker, 8 * MiB));
+  ASSERT_TRUE(Eventually([&] { return Stat(leaf, "anon") >= baseline + 8 * MiB; }));
+  ASSERT_EQ(0, worker->Ask(worker_op::Protect, PROT_NONE).error);
+  // Permissions do not change physical ownership or release resident pages.
+  EXPECT_GE(Stat(leaf, "anon"), baseline + 8 * MiB);
+  ASSERT_EQ(0, worker->Ask('U').error);
+  ASSERT_TRUE(Eventually([&] { return Stat(leaf, "anon") < baseline + MiB; }));
+
+  const uint64_t before_exit = Stat(leaf, "anon");
+  ASSERT_NE(UINT64_MAX, before_exit);
+  ASSERT_TRUE(Allocate(worker, 8 * MiB));
+  ASSERT_TRUE(Eventually([&] { return Stat(leaf, "anon") >= before_exit + 8 * MiB; }));
+  ASSERT_EQ(0, worker->Ask(worker_op::Protect, PROT_NONE).error);
+  EXPECT_GE(Stat(leaf, "anon"), before_exit + 8 * MiB);
+  worker->Stop();
+  EXPECT_TRUE(Eventually([&] { return Stat(leaf, "anon") < baseline + MiB; }));
 }
 
 TEST_F(CgroupMemory, ForkSharesPagesAndCowChargesNewOwner) {

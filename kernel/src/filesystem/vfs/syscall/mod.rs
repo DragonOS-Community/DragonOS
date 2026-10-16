@@ -469,3 +469,9 @@ bitflags! {
         const SPLICE_F_GIFT = 0x08;
     }
 }
+
+#[cfg(all(
+    feature = "mm_selftest",
+    any(target_arch = "x86_64", target_arch = "riscv64")
+))]
+pub(crate) use xattr_utils::selftest_report as xattr_syscall_selftest_report;

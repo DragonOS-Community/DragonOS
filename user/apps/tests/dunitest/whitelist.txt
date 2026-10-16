@@ -135,6 +135,8 @@ normal/allocation_diagnostics
 normal/vmalloc_selftest
 normal/kernel_buffer_selftest
 normal/overlay_xattr_selftest
+normal/xattr_syscall_selftest
+normal/xattr_syscall
 normal/virtio_blk_backpressure
 normal/mknod_socket
 normal/pmem_block

@@ -351,8 +351,9 @@ impl MemoryManagementArch for X86_64MMArch {
 
     const PROTECTION_MAP: [EntryFlags<MMArch>; 16] = protection_map();
 
-    const PAGE_NONE: usize =
-        Self::ENTRY_FLAG_PRESENT | Self::ENTRY_FLAG_ACCESSED | Self::ENTRY_FLAG_GLOBAL;
+    // PROT_NONE must fault even for supervisor reads. GLOBAL aliases the
+    // software PROTNONE bit while hardware PRESENT is clear (Linux PAGE_NONE).
+    const PAGE_NONE: usize = Self::ENTRY_FLAG_ACCESSED | Self::ENTRY_FLAG_GLOBAL;
 
     const PAGE_SHARED: usize = Self::ENTRY_FLAG_PRESENT
         | Self::ENTRY_FLAG_READWRITE

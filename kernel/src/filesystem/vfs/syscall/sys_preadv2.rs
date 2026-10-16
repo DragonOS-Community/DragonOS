@@ -8,8 +8,7 @@ use crate::filesystem::vfs::iov::{IoVec, IoVecs};
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
 
 use super::sys_preadv::do_preadv;
-use super::sys_read::get_read_file;
-use super::sys_readv::read_iovecs;
+use super::sys_readv::readv_from_user;
 
 // Linux 兼容的 RWF 标志位（preadv2 专用）
 const RWF_HIPRI: usize = 0x0000_0001;
@@ -52,10 +51,14 @@ impl Syscall for SysPreadV2Handle {
             return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
         }
 
+        if offset == -1 {
+            return readv_from_user(fd, iov, iov_count);
+        }
+
         // 构造 IoVecs（会验证用户缓冲区可写性）
         let iovecs = unsafe { IoVecs::from_user(iov, iov_count, true) }?;
 
-        do_preadv2(fd, &iovecs, offset, flags)
+        do_preadv(fd, &iovecs, offset)
     }
 
     fn entry_format(&self, args: &[usize]) -> Vec<FormattedSyscallParam> {
@@ -112,26 +115,4 @@ impl SysPreadV2Handle {
 ///
 /// - `offset == -1` 时行为等同于 `readv`，会推进文件偏移量
 /// - 其它非负 offset 走已有的 `preadv` 实现，不会修改文件偏移量
-pub fn do_preadv2(
-    fd: i32,
-    iovecs: &IoVecs,
-    offset: isize,
-    _flags: usize,
-) -> Result<usize, SystemError> {
-    // 仅支持 offset >= -1。其它负值返回 EINVAL（与 Linux 保持一致）
-    if offset < -1 {
-        return Err(SystemError::EINVAL);
-    }
-
-    // offset == -1 -> 使用当前文件偏移（行为与 readv 相同）
-    if offset == -1 {
-        let file = get_read_file(fd)?;
-        file.readable()?;
-        return read_iovecs(file.as_ref(), iovecs);
-    }
-
-    // offset 为非负时，直接复用现有的 preadv 实现，保持语义一致
-    do_preadv(fd, iovecs, offset)
-}
-
 syscall_table_macros::declare_syscall!(SYS_PREADV2, SysPreadV2Handle);

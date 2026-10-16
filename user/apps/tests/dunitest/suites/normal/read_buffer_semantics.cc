@@ -3,6 +3,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
@@ -231,6 +232,167 @@ TEST_F(ReadBufferSemantics, EmptyRequestsStillValidateDescriptor) {
         EXPECT_EQ(EBADF, errno);
     }
     close(write_only);
+}
+
+TEST_F(ReadBufferSemantics, EofDoesNotTouchInaccessibleDestination) {
+    const size_t page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    Mapping mapping(page);
+    ASSERT_NE(MAP_FAILED, mapping.bytes);
+    ASSERT_EQ(0, mprotect(mapping.bytes, page, PROT_NONE));
+    ASSERT_EQ(static_cast<off_t>(file_size), lseek(fd, 0, SEEK_END));
+    EXPECT_EQ(0, read(fd, mapping.bytes, page));
+    iovec iov = {mapping.bytes, page};
+    EXPECT_EQ(0, readv(fd, &iov, 1));
+    EXPECT_EQ(0, syscall(SYS_preadv2, fd, &iov, 1, -1L, -1L, 0L));
+    EXPECT_EQ(static_cast<off_t>(file_size), lseek(fd, 0, SEEK_CUR));
+}
+
+TEST_F(ReadBufferSemantics, ReadModePrecedesDestinationFault) {
+    const size_t page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    Mapping mapping(page);
+    ASSERT_NE(MAP_FAILED, mapping.bytes);
+    ASSERT_EQ(0, mprotect(mapping.bytes, page, PROT_NONE));
+    for (int flags : {O_WRONLY, O_PATH}) {
+        SCOPED_TRACE(flags);
+        int unreadable = open("/dev/null", flags | O_CLOEXEC);
+        ASSERT_GE(unreadable, 0) << strerror(errno);
+        iovec iov = {mapping.bytes, page};
+        errno = 0;
+        EXPECT_EQ(-1, read(unreadable, mapping.bytes, page));
+        EXPECT_EQ(EBADF, errno);
+        errno = 0;
+        EXPECT_EQ(-1, readv(unreadable, &iov, 1));
+        EXPECT_EQ(EBADF, errno);
+        EXPECT_EQ(0, close(unreadable));
+    }
+}
+
+TEST_F(ReadBufferSemantics, InvalidDescriptorPrecedesBadVectorForCurrentOffsetRead) {
+    int path_fd = open("/dev/null", O_PATH | O_CLOEXEC);
+    ASSERT_GE(path_fd, 0);
+    for (int unreadable : {-1, path_fd}) {
+        errno = 0;
+        EXPECT_EQ(-1, syscall(SYS_readv, unreadable, 1UL, 1UL));
+        EXPECT_EQ(EBADF, errno);
+        errno = 0;
+        EXPECT_EQ(-1, syscall(SYS_preadv2, unreadable, 1UL, 1UL, -1L, -1L, 0L));
+        EXPECT_EQ(EBADF, errno);
+    }
+    EXPECT_EQ(0, close(path_fd));
+}
+
+TEST_F(ReadBufferSemantics, SignedIovecLengthsPrecedeLaterMetadataAndDataRanges) {
+    const size_t page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    Mapping mapping(page * 2);
+    ASSERT_NE(MAP_FAILED, mapping.bytes);
+    auto* first = reinterpret_cast<iovec*>(mapping.bytes + page - sizeof(iovec));
+    *first = {mapping.bytes, static_cast<size_t>(-1)};
+    ASSERT_EQ(0, mprotect(mapping.bytes + page, page, PROT_NONE));
+    // Linux validates each imported descriptor's signed length before moving
+    // to the next descriptor, whose metadata is inaccessible here.
+    errno = 0;
+    EXPECT_EQ(-1, readv(fd, first, 2));
+    EXPECT_EQ(EINVAL, errno);
+    errno = 0;
+    EXPECT_EQ(-1, syscall(SYS_preadv2, fd, first, 2, -1L, -1L, 0L));
+    EXPECT_EQ(EINVAL, errno);
+    first->iov_len = 1;
+    errno = 0;
+    EXPECT_EQ(-1, readv(fd, first, 2));
+    EXPECT_EQ(EFAULT, errno);
+
+    // Signed lengths of all successfully imported descriptors are validated
+    // before any descriptor's data address range is examined.
+    iovec ranges[] = {{reinterpret_cast<void*>(static_cast<uintptr_t>(-1)), 1},
+                       {mapping.bytes, static_cast<size_t>(-1)}};
+    errno = 0;
+    EXPECT_EQ(-1, readv(fd, ranges, 2));
+    EXPECT_EQ(EINVAL, errno);
+    errno = 0;
+    EXPECT_EQ(-1, syscall(SYS_preadv2, fd, ranges, 2, -1L, -1L, 0L));
+    EXPECT_EQ(EINVAL, errno);
+    EXPECT_EQ(0, lseek(fd, 0, SEEK_CUR));
+}
+
+TEST_F(ReadBufferSemantics, PartialFaultWithinChunkCommitsOnlyCopiedBytes) {
+    const size_t page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    Mapping mapping(page * 2);
+    ASSERT_NE(MAP_FAILED, mapping.bytes);
+    ASSERT_EQ(0, mprotect(mapping.bytes + page, page, PROT_NONE));
+    unsigned char* output = mapping.bytes + page - 64;
+    for (int variant = 0; variant < 3; ++variant) {
+        SCOPED_TRACE(variant);
+        ASSERT_EQ(0, lseek(fd, 0, SEEK_SET));
+        memset(output, kCanary, 64);
+        std::array<unsigned char, 17> first = {};
+        iovec iovs[] = {{first.data(), first.size()}, {output, 128}};
+        ssize_t result = variant == 0 ? read(fd, output, 128)
+                         : variant == 1 ? readv(fd, &iovs[1], 1)
+                                        : readv(fd, iovs, 2);
+        const size_t prefix = variant == 2 ? first.size() : 0;
+        ASSERT_EQ(static_cast<ssize_t>(prefix + 64), result) << strerror(errno);
+        if (prefix != 0) {
+            ASSERT_NO_FATAL_FAILURE(ExpectPattern(first.data(), prefix));
+        }
+        ASSERT_NO_FATAL_FAILURE(ExpectPattern(output, 64, prefix));
+        EXPECT_EQ(static_cast<off_t>(prefix + 64), lseek(fd, 0, SEEK_CUR));
+        unsigned char next = 0;
+        ASSERT_EQ(1, read(fd, &next, 1));
+        EXPECT_EQ(Pattern(prefix + 64), next);
+    }
+}
+
+TEST_F(ReadBufferSemantics, OriginalNumericRangeIsCheckedBeforeClipping) {
+    unsigned char byte = kCanary;
+    const int null_fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+    ASSERT_GE(null_fd, 0) << strerror(errno);
+    // If clipping happened first, /dev/null could report EOF for this range.
+    errno = 0;
+    EXPECT_EQ(-1, syscall(SYS_read, null_fd, &byte, static_cast<size_t>(-1)));
+    EXPECT_EQ(EFAULT, errno);
+    EXPECT_EQ(kCanary, byte);
+    EXPECT_EQ(0, close(null_fd));
+}
+
+TEST_F(ReadBufferSemantics, SingleIovecClipsBeforeRangeCheckWhileMultipleDoNot) {
+    const int null_fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+    ASSERT_GE(null_fd, 0);
+    const size_t page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    const size_t maximum = static_cast<size_t>(INT32_MAX) & ~(page - 1);
+    uintptr_t low = 0;
+    uintptr_t high = static_cast<uintptr_t>(-1);
+    // A zero-byte scalar read checks only the numerical user range. Discover
+    // its boundary without assuming the host/guest virtual address width or
+    // mapping any of this range. This takes at most one syscall per address bit.
+    while (low != high) {
+        const uintptr_t distance = high - low;
+        const uintptr_t middle = low + distance / 2 + distance % 2;
+        errno = 0;
+        const long result = syscall(SYS_read, null_fd, middle, 0UL);
+        if (result == 0) {
+            low = middle;
+        } else {
+            EXPECT_EQ(-1, result);
+            EXPECT_EQ(EFAULT, errno);
+            high = middle - 1;
+        }
+    }
+    EXPECT_GT(low, maximum + page * 2);
+    if (low > maximum + page * 2) {
+        const uintptr_t base = low - maximum - page;
+        const size_t count = maximum + page * 2;
+        errno = 0;
+        EXPECT_EQ(-1, syscall(SYS_read, null_fd, base, count));
+        EXPECT_EQ(EFAULT, errno);
+        iovec iovs[] = {{reinterpret_cast<void*>(base), count}, {nullptr, 0}};
+        // Linux 6.6's one-segment import_ubuf clips first; multi-segment
+        // import_iovec validates each original data range before clipping.
+        EXPECT_EQ(0, readv(null_fd, iovs, 1));
+        errno = 0;
+        EXPECT_EQ(-1, readv(null_fd, iovs, 2));
+        EXPECT_EQ(EFAULT, errno);
+    }
+    EXPECT_EQ(0, close(null_fd));
 }
 
 TEST_F(ReadBufferSemantics, CpuOnlyDevicesPreserveZeroAndEofResults) {

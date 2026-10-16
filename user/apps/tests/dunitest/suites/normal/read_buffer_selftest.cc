@@ -70,7 +70,8 @@ TEST_F(ReadBufferSelftest, ChecksPassAndSnapshotIsStableAcrossPartialReads) {
                                   "growth_release=ok\n",
                                   "errors_release=ok\n",
                                   "charge_admission=ok\n",
-                                  "fragmented_staging=ok\n"}) {
+                                  "fragmented_staging=ok\n",
+                                  "read_count_admission=ok\n"}) {
             EXPECT_NE(std::string::npos, complete.find(check)) << complete;
         }
     }

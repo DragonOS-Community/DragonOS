@@ -33,15 +33,19 @@ use crate::{
         vfs::{
             fasync::FAsyncItem,
             file::{File, FileFlags},
+            read_buffer::{ReadScratch, MAX_CHUNK},
             utils::DName,
-            FilePrivateData, FileType, IndexNode, InodeMode, Metadata, PollableInode,
+            FilePrivateData, FileType, IndexNode, InodeMode, Metadata, PollableInode, UserReadMode,
         },
     },
     init::initcall::INITCALL_DEVICE,
     libs::{mutex::MutexGuard, rwlock::RwLock},
     mm::VirtAddr,
     process::ProcessManager,
-    syscall::user_access::{UserBufferReader, UserBufferWriter},
+    syscall::{
+        user_access::{UserBufferReader, UserBufferWriter},
+        user_buffer::UserBuffer,
+    },
     time::PosixTimeSpec,
 };
 
@@ -159,6 +163,68 @@ impl TtyDevice {
         } else {
             Err(SystemError::EIO)
         }
+    }
+
+    fn read_context(
+        data: MutexGuard<FilePrivateData>,
+    ) -> Result<Option<(Arc<TtyCore>, TtyLdiscFileContext)>, SystemError> {
+        let tty_file = Self::tty_file(&data)?;
+        if tty_file.is_hung_up() {
+            return Ok(None);
+        }
+        let tty = tty_file.tty();
+        let context = TtyLdiscFileContext {
+            flags: tty_file.flags,
+            hangup_generation: tty_file.hangup_generation,
+        };
+        drop(data);
+        Ok(Some((tty, context)))
+    }
+
+    fn read_with_context(
+        tty: Arc<TtyCore>,
+        file_context: TtyLdiscFileContext,
+        len: usize,
+        buf: &mut [u8],
+    ) -> Result<usize, SystemError> {
+        let ld = tty.ldisc();
+        let mut offset = 0;
+        let mut cookie = false;
+
+        // 边界检查：防止整数下溢
+        if len > buf.len() {
+            return Err(SystemError::EINVAL);
+        }
+
+        loop {
+            let mut size = (len - offset).min(buf.len() - offset);
+            size = ld.read(
+                tty.clone(),
+                &mut buf[offset..],
+                size,
+                &mut cookie,
+                0,
+                file_context,
+            )?;
+            // 本次迭代未读取到数据，可能是EOF或暂时无数据可读
+            if size == 0 {
+                break;
+            }
+
+            offset += size;
+
+            // 已满足读取请求或缓冲区已满
+            if offset >= len || offset >= buf.len() {
+                break;
+            }
+
+            // 没有更多数据
+            if !cookie {
+                break;
+            }
+        }
+
+        return Ok(offset);
     }
 
     /// tty_open_current_tty - get locked tty of current task
@@ -376,56 +442,36 @@ impl IndexNode for TtyDevice {
         buf: &mut [u8],
         data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
-        let tty_file = Self::tty_file(&data)?;
-        if tty_file.is_hung_up() {
+        let Some((tty, context)) = Self::read_context(data)? else {
             return Ok(0);
-        }
-        let tty = tty_file.tty();
-        let file_context = TtyLdiscFileContext {
-            flags: tty_file.flags,
-            hangup_generation: tty_file.hangup_generation,
         };
+        Self::read_with_context(tty, context, len, buf).map_err(Into::into)
+    }
 
-        drop(data);
+    fn user_read_mode(&self) -> UserReadMode {
+        UserReadMode::Iterator
+    }
 
-        let ld = tty.ldisc();
-        let mut offset = 0;
-        let mut cookie = false;
-
-        // 边界检查：防止整数下溢
-        if len > buf.len() {
-            return Err(SystemError::EINVAL.into());
+    fn read_user_at(
+        &self,
+        _offset: usize,
+        len: usize,
+        writer: &mut UserBuffer<'_>,
+        data: MutexGuard<FilePrivateData>,
+    ) -> Result<Option<usize>, SystemError> {
+        let Some((tty, context)) = Self::read_context(data)? else {
+            return Ok(Some(0));
+        };
+        if len == 0 {
+            return Ok(Some(0));
         }
-
-        loop {
-            let mut size = (len - offset).min(buf.len() - offset);
-            size = ld.read(
-                tty.clone(),
-                &mut buf[offset..],
-                size,
-                &mut cookie,
-                0,
-                file_context,
-            )?;
-            // 本次迭代未读取到数据，可能是EOF或暂时无数据可读
-            if size == 0 {
-                break;
-            }
-
-            offset += size;
-
-            // 已满足读取请求或缓冲区已满
-            if offset >= len || offset >= buf.len() {
-                break;
-            }
-
-            // 没有更多数据
-            if !cookie {
-                break;
-            }
-        }
-
-        return Ok(offset);
+        // One bounded ldisc request owns the entire logical user buffer.
+        // Repeating a request per iovec could wait for new input after the
+        // first segment already completed a short terminal read.
+        let mut scratch = ReadScratch::default();
+        let buffer = scratch.prepare(len.min(MAX_CHUNK))?;
+        let read = Self::read_with_context(tty, context, buffer.len(), buffer)?;
+        writer.write_prefix_to_user(0, &buffer[..read]).map(Some)
     }
 
     fn write_at(

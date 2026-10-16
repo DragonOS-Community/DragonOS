@@ -13,7 +13,7 @@ use crate::filesystem::epoll::event_poll::EventPoll;
 use crate::filesystem::epoll::{EPollEventType, EPollItem};
 use crate::filesystem::vfs::file::FileFlags;
 use crate::filesystem::vfs::{
-    FilePrivateData, FileSystem, IndexNode, InodeMode, Metadata, PollableInode,
+    FilePrivateData, FileSystem, IndexNode, InodeMode, Metadata, PollableInode, UserReadMode,
 };
 use crate::ipc::sighand::SigHand;
 use crate::ipc::signal_types::{SigFaultReason, SigInfo, SigType};
@@ -21,6 +21,7 @@ use crate::libs::mutex::MutexGuard;
 use crate::libs::spinlock::{SpinLock, SpinLockGuard};
 use crate::process::ProcessManager;
 use crate::syscall::user_access::UserBufferReader;
+use crate::syscall::user_buffer::UserBuffer;
 use system_error::SystemError;
 
 bitflags! {
@@ -184,6 +185,48 @@ impl SignalFdInode {
         }
     }
 
+    fn read_records(
+        &self,
+        len: usize,
+        mut copy: impl FnMut(usize, &[u8]) -> Result<(), SystemError>,
+    ) -> Result<usize, SystemError> {
+        let records = len / size_of::<SignalFdSigInfo>();
+        if records == 0 {
+            return Err(SystemError::EINVAL);
+        }
+        let mut total = 0;
+        for _ in 0..records {
+            let info = match self.wait_for_signal(total != 0) {
+                Ok(info) => SignalFdSigInfo::from_siginfo(&info),
+                Err(_) if total != 0 => break,
+                Err(error) => return Err(error),
+            };
+            match copy(total, &info.bytes) {
+                Ok(()) => total += size_of::<SignalFdSigInfo>(),
+                Err(_) if total != 0 => break,
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(total)
+    }
+
+    fn wait_for_signal(&self, nonblock: bool) -> Result<SigInfo, SystemError> {
+        loop {
+            if let Some(info) = self.dequeue_one() {
+                return Ok(info);
+            }
+            let state = self.state.lock_irqsave();
+            if nonblock || self.nonblock(&state) {
+                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+            }
+            drop(state);
+            let sighand = ProcessManager::current_pcb().sighand();
+            if wq_wait_event_interruptible!(sighand.signalfd_wqh(), self.readable(), {}).is_err() {
+                return Err(SystemError::ERESTARTSYS);
+            }
+        }
+    }
+
     fn nonblock(&self, state_guard: &SpinLockGuard<'_, SignalFdState>) -> bool {
         state_guard.flags.contains(SignalFdFlags::SFD_NONBLOCK)
     }
@@ -274,38 +317,33 @@ impl IndexNode for SignalFdInode {
         buf: &mut [u8],
         data_guard: MutexGuard<FilePrivateData>,
     ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
-        let result: core::result::Result<_, system_error::SystemError> = (|| {
-            // 释放 FilePrivateData 锁，避免在阻塞时持有锁导致 panic
-            drop(data_guard);
+        drop(data_guard);
+        if buf.len() < len {
+            return Err(SystemError::EINVAL.into());
+        }
+        self.read_records(len, |offset, record| {
+            buf[offset..offset + record.len()].copy_from_slice(record);
+            Ok(())
+        })
+        .map_err(Into::into)
+    }
 
-            if len < size_of::<SignalFdSigInfo>() {
-                return Err(SystemError::EINVAL);
-            }
+    fn user_read_mode(&self) -> UserReadMode {
+        UserReadMode::Scalar
+    }
 
-            loop {
-                if let Some(siginfo) = self.dequeue_one() {
-                    let info = SignalFdSigInfo::from_siginfo(&siginfo);
-                    buf[0..size_of::<SignalFdSigInfo>()].copy_from_slice(&info.bytes);
-                    return Ok(size_of::<SignalFdSigInfo>());
-                }
-
-                let state_guard = self.state.lock_irqsave();
-                if self.nonblock(&state_guard) {
-                    return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-                }
-                drop(state_guard);
-
-                // 阻塞等待：在 sighand 的共享 signalfd_wqh 上睡眠。
-                // 信号投递路径（含 hardirq）通过 signalfd_wqh.wakeup_all() 唤醒。
-                let pcb = ProcessManager::current_pcb();
-                let sighand = pcb.sighand();
-                let r = wq_wait_event_interruptible!(sighand.signalfd_wqh(), self.readable(), {});
-                if r.is_err() {
-                    return Err(SystemError::ERESTARTSYS);
-                }
-            }
-        })();
-        result.map_err(Into::into)
+    fn read_user_at(
+        &self,
+        _offset: usize,
+        len: usize,
+        writer: &mut UserBuffer<'_>,
+        data: MutexGuard<FilePrivateData>,
+    ) -> Result<Option<usize>, SystemError> {
+        drop(data);
+        self.read_records(len, |offset, record| {
+            writer.write_to_user(offset, record).map(|_| ())
+        })
+        .map(Some)
     }
 
     fn write_at(

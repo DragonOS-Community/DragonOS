@@ -23,7 +23,6 @@ use crate::{
     syscall::user_access::UserBufferWriter,
     time::PosixTimeSpec,
 };
-use alloc::collections::BTreeMap;
 use core::any::Any;
 
 use crate::cgroup::memory::{accounting::KernelByteKind, object::ObjectAccount, owned::OwnedBox};
@@ -32,7 +31,8 @@ use alloc::sync::{Arc, Weak};
 use system_error::SystemError;
 pub(crate) mod buffer;
 mod identity;
-use buffer::PipeBuffer;
+mod read;
+use buffer::{PipeBuffer, PipeSegment};
 pub use identity::LockedPipeInode;
 
 /// 管道缓冲区默认大小（Linux 默认 65536 字节）
@@ -59,111 +59,42 @@ enum WakeMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PipeWriterWake {
     None,
-    One(usize),
+    One,
     All,
 }
 
+/// Every writer waits for the same free-slot predicate. Intent publication
+/// remains under `inner` so exclusive wakeups cannot race waiter admission.
 #[derive(Debug, Default)]
 struct PipeWriteWaiters {
-    any_space: usize,
-    atomic: BTreeMap<usize, usize>,
-    /// Next class key considered for round-robin selection. Key 0 denotes
-    /// any-space writers; atomic classes use their required byte count.
-    next_class: usize,
+    count: usize,
 }
 
 impl PipeWriteWaiters {
-    fn register(&mut self, required: Option<usize>) -> usize {
-        match required {
-            Some(required) => {
-                debug_assert!((1..=PIPE_BUF).contains(&required));
-                let count = self.atomic.entry(required).or_insert(0);
-                *count = count
-                    .checked_add(1)
-                    .expect("pipe atomic writer wait-intent count overflowed");
-                required
-            }
-            None => {
-                self.any_space = self
-                    .any_space
-                    .checked_add(1)
-                    .expect("pipe writer wait-intent count overflowed");
-                0
-            }
-        }
+    fn register(&mut self) {
+        self.count = self
+            .count
+            .checked_add(1)
+            .expect("pipe writer wait count overflow");
     }
-
-    fn unregister(&mut self, required: Option<usize>) {
-        match required {
-            Some(required) => {
-                let count = self
-                    .atomic
-                    .get_mut(&required)
-                    .expect("missing pipe atomic writer wait intent");
-                *count = count
-                    .checked_sub(1)
-                    .expect("pipe atomic writer wait-intent count underflowed");
-                if *count == 0 {
-                    self.atomic.remove(&required);
-                }
-            }
-            None => {
-                self.any_space = self
-                    .any_space
-                    .checked_sub(1)
-                    .expect("pipe writer wait-intent count underflowed");
-            }
-        }
+    fn unregister(&mut self) {
+        self.count = self
+            .count
+            .checked_sub(1)
+            .expect("pipe writer wait count underflow");
     }
-
     fn is_empty(&self) -> bool {
-        self.any_space == 0 && self.atomic.is_empty()
+        self.count == 0
     }
-
-    fn class_count(&self) -> usize {
-        self.atomic.len() + usize::from(self.any_space > 0)
-    }
-
-    /// Select one currently eligible writer class. Tagged waiters let the
-    /// pipe-private policy skip writers whose free-space predicate is false.
-    fn wake_action(&mut self, available: usize, has_readers: bool) -> PipeWriterWake {
+    fn wake_action(&self, available: usize, has_readers: bool) -> PipeWriterWake {
         if self.is_empty() {
-            return PipeWriterWake::None;
-        }
-        if !has_readers {
-            return PipeWriterWake::All;
-        }
-        if available == 0 {
-            return PipeWriterWake::None;
-        }
-
-        let atomic_start = self.next_class.max(1);
-        let atomic_after_cursor = if atomic_start <= available {
-            self.atomic
-                .range(atomic_start..=available)
-                .next()
-                .map(|(required, _)| *required)
-        } else {
-            None
-        };
-        let selected = if self.next_class == 0 && self.any_space > 0 {
-            Some(0)
-        } else if let Some(atomic) = atomic_after_cursor {
-            Some(atomic)
-        } else if self.any_space > 0 {
-            Some(0)
-        } else {
-            self.atomic
-                .first_key_value()
-                .filter(|(required, _)| **required <= available)
-                .map(|(required, _)| *required)
-        };
-
-        if let Some(key) = selected {
-            self.next_class = if key >= PIPE_BUF { 0 } else { key + 1 };
-            PipeWriterWake::One(key)
-        } else {
             PipeWriterWake::None
+        } else if !has_readers {
+            PipeWriterWake::All
+        } else if available == 0 {
+            PipeWriterWake::None
+        } else {
+            PipeWriterWake::One
         }
     }
 }
@@ -362,7 +293,7 @@ impl InnerPipeInode {
 
         if !flags.is_read_only() {
             // 管道内数据未满
-            if self.valid_cnt as usize != self.buf_size {
+            if !self.buf_full() {
                 events.insert(EPollEventType::EPOLLOUT | EPollEventType::EPOLLWRNORM);
             }
 
@@ -375,8 +306,19 @@ impl InnerPipeInode {
         Ok(events.bits() as usize)
     }
 
+    fn free_slots(&self) -> usize {
+        self.buf_size / MMArch::PAGE_SIZE - self.data.segment_count()
+    }
+    fn writable_bytes(&self) -> usize {
+        self.free_slots() * MMArch::PAGE_SIZE
+    }
     fn buf_full(&self) -> bool {
-        return self.valid_cnt as usize == self.buf_size;
+        self.free_slots() == 0
+    }
+    fn consume(&mut self, len: usize) {
+        self.data.consume(len);
+        self.read_pos = (self.read_pos + len as i32) % self.buf_size as i32;
+        self.valid_cnt -= len as i32;
     }
 
     /// 从另一个管道复制数据到本管道（不消耗源数据）
@@ -395,8 +337,15 @@ impl InnerPipeInode {
         }
         let src_real_avail = src_avail - skip;
 
-        let dst_space = self.buf_size.saturating_sub(self.valid_cnt.max(0) as usize);
-        let actual_copy = count.min(src_real_avail).min(dst_space);
+        let dst_space = self.writable_bytes();
+        let source_segment = match src.data.segment_at(skip) {
+            Some(segment) => segment,
+            None => return 0,
+        };
+        let actual_copy = count
+            .min(src_real_avail)
+            .min(dst_space)
+            .min(source_segment.len);
 
         if actual_copy == 0 {
             return 0;
@@ -458,6 +407,11 @@ impl InnerPipeInode {
         // 更新目标写指针
         self.write_pos = (self.write_pos + actual_copy as i32) % dst_buf_size as i32;
         self.valid_cnt += actual_copy as i32;
+        self.data.push_segment(PipeSegment {
+            len: actual_copy,
+            mergeable: source_segment.mergeable && actual_copy == source_segment.len && skip == 0,
+            ..source_segment
+        });
 
         actual_copy
     }
@@ -475,8 +429,13 @@ impl PipeRuntime {
         let kind = KernelByteKind::SlabUnreclaimable.for_allocation(body_layout) as usize;
         let runtime = Self::try_new(false, &creator)?;
         let weak = Arc::downgrade(&runtime);
+        let mut ok = account.snapshot().kernel_bytes[kind] == body_bytes;
+        // Admission is page based across this owner's receipts. Fill the
+        // body's spare budget so the descriptor needs a distinct new page.
+        let padding_bytes = (MMArch::PAGE_SIZE as u64 - body_bytes % MMArch::PAGE_SIZE as u64)
+            % MMArch::PAGE_SIZE as u64;
+        let padding = creator.try_charge(KernelByteKind::SlabUnreclaimable, padding_bytes)?;
         let baseline = account.snapshot();
-        let mut ok = baseline.kernel_bytes[kind] == body_bytes;
         account.set_policy(MemoryPolicy {
             max: Some(baseline.current),
             ..Default::default()
@@ -490,17 +449,44 @@ impl PipeRuntime {
             let inner = runtime.inner.lock();
             ok &= inner.data.is_empty() && inner.valid_cnt == 0 && inner.buf_size == PIPE_BUFF_SIZE;
         }
-        ok &= account.snapshot().kernel_bytes == baseline.kernel_bytes;
+        let after_rejection = account.snapshot();
+        ok &= after_rejection.current == baseline.current
+            && after_rejection.kernel_bytes == baseline.kernel_bytes;
+        let ring_layout =
+            core::alloc::Layout::array::<u8>(PIPE_BUFF_SIZE).map_err(|_| SystemError::ENOMEM)?;
+        // Receipts report bytes, whereas the admission policy and current
+        // counter use pages. Only the ring fits; metadata must need a new page.
+        let ring_pages = allocation_footprint(ring_layout).div_ceil(MMArch::PAGE_SIZE as u64);
+        account.set_policy(MemoryPolicy {
+            max: Some(baseline.current + ring_pages),
+            ..Default::default()
+        });
+        {
+            let transaction = runtime.begin_writer_transaction();
+            ok &= matches!(
+                runtime.prepare_output_storage(&transaction, &creator),
+                Err(MemoryAllocationError::Charge(_))
+            );
+            ok &= runtime.inner.lock().data.is_empty();
+        }
+        let after_rejection = account.snapshot();
+        ok &= after_rejection.current == baseline.current
+            && after_rejection.kernel_bytes == baseline.kernel_bytes;
         account.set_policy(MemoryPolicy::default());
         {
             let transaction = runtime.begin_writer_transaction();
             runtime.prepare_output_storage(&transaction, &creator)?;
         }
-        let ring_bytes = allocation_footprint(
-            core::alloc::Layout::array::<u8>(PIPE_BUFF_SIZE).map_err(|_| SystemError::ENOMEM)?,
-        );
-        ok &= account.snapshot().kernel_bytes[KernelByteKind::KernelOther as usize]
-            == baseline.kernel_bytes[KernelByteKind::KernelOther as usize] + ring_bytes;
+        let segment_layout =
+            core::alloc::Layout::array::<PipeSegment>(PIPE_BUFF_SIZE / MMArch::PAGE_SIZE)
+                .map_err(|_| SystemError::ENOMEM)?;
+        let mut expected = baseline.kernel_bytes;
+        for layout in [ring_layout, segment_layout] {
+            let kind = KernelByteKind::SlabUnreclaimable.for_allocation(layout) as usize;
+            expected[kind] += allocation_footprint(layout);
+        }
+        ok &= account.snapshot().kernel_bytes == expected;
+        drop(padding);
         drop(runtime);
         ok &= weak.upgrade().is_none()
             && account.current_pages() == 0
@@ -528,8 +514,7 @@ impl PipeRuntime {
 
     #[inline]
     fn writer_wake_action(inner: &mut InnerPipeInode) -> PipeWriterWake {
-        let used = inner.valid_cnt.max(0) as usize;
-        let available = inner.buf_size.saturating_sub(used);
+        let available = inner.writable_bytes();
         inner.write_waiters.wake_action(available, inner.reader > 0)
     }
 
@@ -547,39 +532,15 @@ impl PipeRuntime {
     }
 
     #[inline]
-    fn wake_writers(&self, mut action: PipeWriterWake) {
+    fn wake_writers(&self, action: PipeWriterWake) {
         match action {
             PipeWriterWake::None => {}
             PipeWriterWake::All => {
                 self.write_wait_queue
                     .wakeup_all(Some(ProcessState::Blocked(true)));
             }
-            PipeWriterWake::One(_) => {
-                // Include the already-selected action: its class can disappear
-                // between selection and the tagged wakeup.
-                let max_attempts = self.inner.lock().write_waiters.class_count() + 1;
-                for attempt in 0..max_attempts {
-                    match action {
-                        PipeWriterWake::None => return,
-                        PipeWriterWake::All => {
-                            self.write_wait_queue
-                                .wakeup_all(Some(ProcessState::Blocked(true)));
-                            return;
-                        }
-                        PipeWriterWake::One(class) => {
-                            if self.write_wait_queue.wake_one_tagged(class) {
-                                return;
-                            }
-                        }
-                    }
-                    if attempt + 1 == max_attempts {
-                        return;
-                    }
-                    action = {
-                        let mut inner = self.inner.lock();
-                        Self::writer_wake_action(&mut inner)
-                    };
-                }
+            PipeWriterWake::One => {
+                self.write_wait_queue.wake_one_tagged(0);
             }
         }
     }
@@ -713,24 +674,12 @@ impl PipeRuntime {
         return !inode.buf_full() || inode.reader == 0;
     }
 
-    /// Whether the pipe has at least `need` bytes of free space.
-    /// Used to implement PIPE_BUF atomic write semantics.
-    fn writeable_len_at_least(&self, need: usize) -> bool {
-        let inode = self.inner.lock();
-        if inode.reader == 0 {
-            return true;
-        }
-        let used = inode.valid_cnt.max(0) as usize;
-        inode.buf_size.saturating_sub(used) >= need
-    }
-
     /// Sleep for pipe space after publishing the writer's intent under the
     /// pipe lock. Publishing before dropping the lock closes the gap where a
     /// reader could create space without observing the waiter.
     fn wait_for_write_space<'a, F>(
         &'a self,
         mut guard: crate::libs::spinlock::SpinLockGuard<'a, InnerPipeInode>,
-        required: Option<usize>,
         transaction: &mut PipeWriterTransaction<'a>,
         before_wait: F,
     ) -> (
@@ -740,22 +689,18 @@ impl PipeRuntime {
     where
         F: FnOnce(),
     {
-        let waiter_class = guard.write_waiters.register(required);
+        guard.write_waiters.register();
         drop(guard);
 
         before_wait();
         transaction.release_for_wait();
-        let result = if let Some(need) = required {
-            self.write_wait_queue
-                .wait_event_interruptible_tagged(waiter_class, || self.writeable_len_at_least(need))
-        } else {
-            self.write_wait_queue
-                .wait_event_interruptible_tagged(waiter_class, || self.writeable())
-        };
+        let result = self
+            .write_wait_queue
+            .wait_event_interruptible_tagged(0, || self.writeable());
 
         transaction.reacquire_after_wait();
         let mut guard = self.inner.lock();
-        guard.write_waiters.unregister(required);
+        guard.write_waiters.unregister();
         transaction.pass_baton_if_waiters_remain(&guard);
         let result = result.map_err(|_| SystemError::ERESTARTSYS);
         (guard, result)
@@ -814,7 +759,7 @@ impl PipeRuntime {
         let inner = self.inner.lock();
 
         // 如果新大小小于当前数据量，返回 EBUSY
-        if new_size < inner.valid_cnt as usize {
+        if new_size / page_size < inner.data.segment_count() {
             return Err(SystemError::EBUSY.into());
         }
 
@@ -863,6 +808,7 @@ impl PipeRuntime {
             inner.write_pos = 0;
         }
 
+        new_data.copy_segments_from(&inner.data);
         let retired = core::mem::replace(&mut inner.data, new_data);
         inner.buf_size = new_size;
 
@@ -917,11 +863,10 @@ impl PipeRuntime {
         guard.valid_cnt.max(0) as usize
     }
 
-    /// 当前管道中可写的空闲字节数（不阻塞、不睡眠）
+    /// Free logical-slot byte capacity, excluding possible tail merges.
     pub fn writable_len(&self) -> usize {
         let guard = self.inner.lock();
-        let used = guard.valid_cnt.max(0) as usize;
-        guard.buf_size.saturating_sub(used)
+        guard.writable_bytes()
     }
 
     fn write_bytes(inner_guard: &mut InnerPipeInode, buf: &[u8], to_write: usize) {
@@ -973,109 +918,95 @@ impl PipeRuntime {
         if len == 0 {
             return Ok(0);
         }
-
         let actor =
             crate::cgroup::memory::object_for_task(&crate::process::ProcessManager::current_pcb());
         let mut transaction = self.begin_writer_transaction();
-        let inner_guard = self.inner.lock();
-        let atomic_write = len <= PIPE_BUF;
-
-        if inner_guard.reader == 0 {
-            drop(inner_guard);
+        if self.inner.lock().reader == 0 {
             Self::send_sigpipe();
             return Err(SystemError::EPIPE.into());
         }
-
-        drop(inner_guard);
         self.prepare_output_storage(&transaction, &actor)?;
-        let mut inner_guard = self.inner.lock();
-
-        let mut total_written: usize = 0;
+        let mut inner = self.inner.lock();
+        let mut total = 0;
         let mut reader_wake = WakeMode::None;
-        let mut progress_pending = false;
-
-        while total_written < len {
-            if inner_guard.reader == 0 {
-                let notify = progress_pending;
-                drop(inner_guard);
-                if notify {
+        let packet = flags.contains(FileFlags::O_DIRECT);
+        // Linux merges only the request's page remainder, once at entry.
+        let merge = len & (MMArch::PAGE_SIZE - 1);
+        if merge != 0
+            && !packet
+            && inner.data.last_segment().is_some_and(|last| {
+                last.mergeable && last.offset + last.len + merge <= MMArch::PAGE_SIZE
+            })
+        {
+            let was_readable = inner.valid_cnt > 0 && inner.splice_hold == 0;
+            Self::write_bytes(&mut inner, &buf[..merge], merge);
+            inner.data.extend_last(merge);
+            total = merge;
+            if !was_readable && inner.splice_hold == 0 {
+                reader_wake = WakeMode::One;
+            }
+        }
+        while total < len {
+            if inner.reader == 0 {
+                drop(inner);
+                if total != 0 {
                     self.publish_write_progress(reader_wake);
                 }
                 Self::send_sigpipe();
-                return if total_written > 0 {
-                    Ok(total_written)
+                return if total != 0 {
+                    Ok(total)
                 } else {
                     Err(SystemError::EPIPE.into())
                 };
             }
-
-            let remaining = len - total_written;
-            let buf_size = inner_guard.buf_size;
-            let available_space = buf_size - inner_guard.valid_cnt as usize;
-            let need_wait = if atomic_write && total_written == 0 {
-                available_space < len
-            } else {
-                available_space == 0
-            };
-
-            if need_wait {
-                let pending_poll = progress_pending;
-                let pending_reader_wake = reader_wake;
-                progress_pending = false;
-                reader_wake = WakeMode::None;
-
+            if inner.buf_full() {
                 if flags.contains(FileFlags::O_NONBLOCK) {
-                    drop(inner_guard);
-                    if pending_poll {
-                        self.publish_write_progress(pending_reader_wake);
-                    }
-                    if total_written > 0 {
-                        return Ok(total_written);
+                    drop(inner);
+                    if total != 0 {
+                        self.publish_write_progress(reader_wake);
+                        return Ok(total);
                     }
                     return Err(SystemError::EAGAIN_OR_EWOULDBLOCK.into());
                 }
-
-                let required = (atomic_write && total_written == 0).then_some(len);
-                let (guard, wait_result) =
-                    self.wait_for_write_space(inner_guard, required, &mut transaction, || {
-                        if pending_poll {
-                            self.publish_write_progress(pending_reader_wake);
-                        }
-                    });
-                inner_guard = guard;
-
-                if let Err(err) = wait_result {
-                    drop(inner_guard);
-                    return if total_written > 0 {
-                        Ok(total_written)
+                let published = total != 0;
+                let wake = reader_wake;
+                reader_wake = WakeMode::None;
+                let (next, result) = self.wait_for_write_space(inner, &mut transaction, || {
+                    if published {
+                        self.publish_write_progress(wake);
+                    }
+                });
+                inner = next;
+                if let Err(error) = result {
+                    drop(inner);
+                    return if total != 0 {
+                        Ok(total)
                     } else {
-                        Err(err.into())
+                        Err(error.into())
                     };
                 }
                 continue;
             }
-
-            let to_write = core::cmp::min(remaining, available_space);
-            let was_readable = inner_guard.valid_cnt > 0 && inner_guard.splice_hold == 0;
-            Self::write_bytes(
-                &mut inner_guard,
-                &buf[total_written..total_written + to_write],
-                to_write,
-            );
-            total_written += to_write;
-            transaction.pass_baton_if_waiters_remain(&inner_guard);
-            progress_pending = true;
-            if !was_readable && inner_guard.splice_hold == 0 {
+            let count = (len - total).min(MMArch::PAGE_SIZE);
+            let was_readable = inner.valid_cnt > 0 && inner.splice_hold == 0;
+            Self::write_bytes(&mut inner, &buf[total..total + count], count);
+            inner.data.push_segment(PipeSegment {
+                offset: 0,
+                len: count,
+                mergeable: !packet,
+                packet,
+            });
+            total += count;
+            transaction.pass_baton_if_waiters_remain(&inner);
+            if !was_readable && inner.splice_hold == 0 {
                 reader_wake = WakeMode::One;
             }
         }
-
-        drop(inner_guard);
-        if progress_pending {
+        drop(inner);
+        if total != 0 {
             self.publish_write_progress(reader_wake);
         }
-
-        Ok(total_written)
+        Ok(total)
     }
 
     /// Commit file data to this pipe while holding its writer transaction.
@@ -1086,6 +1017,7 @@ impl PipeRuntime {
         &self,
         transaction: &mut PipeWriterTransaction<'_>,
         buf: &[u8],
+        source_offset: usize,
     ) -> Result<usize, SystemError> {
         debug_assert!(core::ptr::eq(transaction.pipe, self));
         let len = buf.len();
@@ -1106,8 +1038,7 @@ impl PipeRuntime {
             "splice output prepared before reading input"
         );
 
-        let buf_size = inner_guard.buf_size;
-        let available = buf_size.saturating_sub(inner_guard.valid_cnt.max(0) as usize);
+        let available = inner_guard.writable_bytes();
         let atomic_write = len <= PIPE_BUF;
 
         if atomic_write && available < len {
@@ -1124,7 +1055,14 @@ impl PipeRuntime {
         };
 
         let was_readable = inner_guard.valid_cnt > 0 && inner_guard.splice_hold == 0;
+        let to_write = to_write.min(MMArch::PAGE_SIZE - source_offset);
         Self::write_bytes(&mut inner_guard, buf, to_write);
+        inner_guard.data.push_segment(PipeSegment {
+            offset: source_offset,
+            len: to_write,
+            mergeable: false,
+            packet: false,
+        });
         let reader_wake = if !was_readable && inner_guard.splice_hold == 0 {
             WakeMode::One
         } else {
@@ -1142,12 +1080,9 @@ impl PipeRuntime {
 
     /// Wait for pipe space before file->pipe splice reads from the input file.
     ///
-    /// The caller must pass the maximum number of bytes it can actually read
-    /// from the input file for this splice attempt. DragonOS pipes are byte-ring
-    /// based, so requests up to PIPE_BUF wait for the complete readable chunk;
-    /// larger requests wait for any space and may complete partially. The
-    /// caller retains `transaction`, so the returned capacity remains valid
-    /// through the input read and non-waiting commit.
+    /// The caller bounds the input read by one logical source page. A free
+    /// descriptor slot admits that entire page range. The writer transaction
+    /// keeps the reservation valid through the input read and commit.
     pub(crate) fn wait_writable_for_splice<'a>(
         &'a self,
         transaction: &mut PipeWriterTransaction<'a>,
@@ -1167,16 +1102,13 @@ impl PipeRuntime {
                 return Err(SystemError::EPIPE);
             }
 
-            let used = guard.valid_cnt.max(0) as usize;
-            let space = guard.buf_size.saturating_sub(used);
+            let space = guard.writable_bytes();
             if (need_atomic && space >= len) || (!need_atomic && space > 0) {
                 let writable = if need_atomic { len } else { len.min(space) };
                 return Ok(writable);
             }
 
-            let required = need_atomic.then_some(len);
-            let (next_guard, wait_result) =
-                self.wait_for_write_space(guard, required, transaction, || {});
+            let (next_guard, wait_result) = self.wait_for_write_space(guard, transaction, || {});
             guard = next_guard;
             if let Err(err) = wait_result {
                 drop(guard);
@@ -1204,14 +1136,12 @@ impl PipeRuntime {
                 return Err(SystemError::EPIPE);
             }
 
-            let used = guard.valid_cnt.max(0) as usize;
-            let space = guard.buf_size.saturating_sub(used);
+            let space = guard.writable_bytes();
             if space > 0 {
                 return Ok(space);
             }
 
-            let (next_guard, wait_result) =
-                self.wait_for_write_space(guard, None, transaction, || {});
+            let (next_guard, wait_result) = self.wait_for_write_space(guard, transaction, || {});
             guard = next_guard;
             if let Err(err) = wait_result {
                 drop(guard);
@@ -1234,8 +1164,7 @@ impl PipeRuntime {
             Self::send_sigpipe();
             return Err(SystemError::EPIPE);
         }
-        let used = guard.valid_cnt.max(0) as usize;
-        let space = guard.buf_size.saturating_sub(used);
+        let space = guard.writable_bytes();
         if space == 0 || wanted.is_some_and(|len| len <= PIPE_BUF && space < len) {
             return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
         }
@@ -1368,9 +1297,7 @@ impl PipeRuntime {
 
         let consume = consumed.min(held);
         if consume > 0 {
-            let buf_size = guard.buf_size;
-            guard.read_pos = (guard.read_pos + consume as i32) % buf_size as i32;
-            guard.valid_cnt -= consume as i32;
+            guard.consume(consume);
         }
         guard.splice_hold = 0;
         let reader_wake = if guard.valid_cnt > 0 {
@@ -1456,17 +1383,14 @@ impl PipeRuntime {
                 Self::send_sigpipe();
                 return Err(SystemError::EPIPE);
             }
-            let space = guard
-                .buf_size
-                .saturating_sub(guard.valid_cnt.max(0) as usize);
+            let space = guard.writable_bytes();
             if space > 0 {
                 return Ok(());
             }
             if nonblock {
                 return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
             }
-            let (next_guard, wait_result) =
-                self.wait_for_write_space(guard, None, transaction, || {});
+            let (next_guard, wait_result) = self.wait_for_write_space(guard, transaction, || {});
             guard = next_guard;
             if let Err(err) = wait_result {
                 drop(guard);
@@ -1498,9 +1422,7 @@ impl PipeRuntime {
 
         // Re-check conditions under lock
         let in_avail = in_guard.valid_cnt.max(0) as usize;
-        let out_space = out_guard
-            .buf_size
-            .saturating_sub(out_guard.valid_cnt.max(0) as usize);
+        let out_space = out_guard.writable_bytes();
 
         if out_guard.reader == 0 {
             drop(in_guard);
@@ -1532,11 +1454,12 @@ impl PipeRuntime {
 
         // Copy data directly
         let copied = out_guard.copy_from_other(&in_guard, chunk, skip);
+        if !consume && copied != 0 {
+            out_guard.data.clear_last_merge();
+        }
 
         if consume {
-            let buf_size = in_guard.buf_size;
-            in_guard.read_pos = (in_guard.read_pos + copied as i32) % buf_size as i32;
-            in_guard.valid_cnt -= copied as i32;
+            in_guard.consume(copied);
         }
 
         let src_reader_wake = if consume && in_guard.valid_cnt == 0 && in_guard.writer == 0 {
@@ -1610,9 +1533,17 @@ impl PipeRuntime {
             out.prepare_output_storage(&transaction, &actor)?;
 
             // Try transfer
-            let copied = Self::transfer_chunk(self, out, &mut transaction, len, true, |_| 0)?;
-            if copied > 0 {
-                return Ok(copied);
+            let mut total = 0;
+            while total < len {
+                match Self::transfer_chunk(self, out, &mut transaction, len - total, true, |_| 0) {
+                    Ok(0) => break,
+                    Ok(copied) => total += copied,
+                    Err(_) if total != 0 => return Ok(total),
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            if total != 0 {
+                return Ok(total);
             }
         }
     }
@@ -1659,8 +1590,7 @@ impl PipeRuntime {
             let mut transaction = out.begin_writer_transaction();
             let (out_space, out_has_readers) = {
                 let guard = out.inner.lock();
-                let used = guard.valid_cnt.max(0) as usize;
-                (guard.buf_size.saturating_sub(used), guard.reader > 0)
+                (guard.writable_bytes(), guard.reader > 0)
             };
             if !out_has_readers {
                 Self::send_sigpipe();
@@ -1725,7 +1655,7 @@ impl PipeRuntime {
             );
             let copied = match transfer {
                 Ok(copied) => copied,
-                Err(SystemError::EPIPE) if total > 0 => return Ok(total),
+                Err(_) if total > 0 => return Ok(total),
                 Err(err) => return Err(err.into()),
             };
 
@@ -1734,7 +1664,7 @@ impl PipeRuntime {
                 in_avail_snapshot = None;
                 in_read_pos_snapshot = None;
                 in_buf_size_snapshot = None;
-                if nonblock && total > 0 {
+                if total > 0 {
                     return Ok(total);
                 }
                 continue;
@@ -1759,45 +1689,21 @@ impl PipeRuntime {
 
 #[cfg(test)]
 mod tests {
-    use super::{PipeRuntime, PipeWriteWaiters, PipeWriterWake, PIPE_MIN_SIZE};
+    use super::{PipeRuntime, PipeSegment, PipeWriteWaiters, PipeWriterWake, PIPE_MIN_SIZE};
 
     #[test]
-    fn writer_wake_action_targets_one_homogeneous_class() {
+    fn writer_wake_intent_tracks_exclusive_slot_waiters() {
         let mut waiters = PipeWriteWaiters::default();
-        let first_class = waiters.register(Some(4));
-        let second_class = waiters.register(Some(4));
-        assert_eq!(first_class, second_class);
-
-        assert!(matches!(waiters.wake_action(3, true), PipeWriterWake::None));
-        let PipeWriterWake::One(selected) = waiters.wake_action(4, true) else {
-            panic!("eligible writer class was not selected");
-        };
-        assert_eq!(selected, first_class);
-
-        waiters.unregister(Some(4));
-        waiters.unregister(Some(4));
-        assert!(waiters.is_empty());
-    }
-
-    #[test]
-    fn writer_wake_action_skips_ineligible_classes() {
-        let mut waiters = PipeWriteWaiters::default();
-        let any_class = waiters.register(None);
-        let atomic_class = waiters.register(Some(4));
-
-        let PipeWriterWake::One(selected) = waiters.wake_action(1, true) else {
-            panic!("any-space writer class was not selected");
-        };
-        assert_eq!(selected, any_class);
-        assert_ne!(selected, atomic_class);
-
-        assert_eq!(
-            waiters.wake_action(4, true),
-            PipeWriterWake::One(atomic_class)
-        );
-        assert_eq!(waiters.wake_action(1, true), PipeWriterWake::One(any_class));
-
+        assert_eq!(waiters.wake_action(4096, true), PipeWriterWake::None);
+        waiters.register();
+        waiters.register();
+        assert_eq!(waiters.wake_action(0, true), PipeWriterWake::None);
+        assert_eq!(waiters.wake_action(4096, true), PipeWriterWake::One);
         assert_eq!(waiters.wake_action(0, false), PipeWriterWake::All);
+        waiters.unregister();
+        assert_eq!(waiters.wake_action(4096, true), PipeWriterWake::One);
+        waiters.unregister();
+        assert!(waiters.is_empty());
     }
 
     #[test]
@@ -1834,6 +1740,12 @@ mod tests {
             src_guard.data = buffer;
             src_guard.buf_size = PIPE_MIN_SIZE;
             src_guard.data[..4].copy_from_slice(b"held");
+            src_guard.data.push_segment(PipeSegment {
+                offset: 0,
+                len: 4,
+                mergeable: true,
+                packet: false,
+            });
             src_guard.valid_cnt = 4;
             src_guard.write_pos = 4;
         }
@@ -1850,6 +1762,7 @@ mod tests {
         );
         assert_eq!(&held, b"held");
         let mut transaction = dst.begin_writer_transaction();
+        dst.prepare_output_storage(&transaction, &creator).unwrap();
         assert_eq!(
             PipeRuntime::transfer_chunk(&src, &dst, &mut transaction, 4, true, |_| 0),
             Ok(0)
@@ -2014,27 +1927,25 @@ impl PipeRuntime {
             inner_guard = self.inner.lock();
         }
 
-        let mut num = inner_guard.valid_cnt as usize;
-        // 决定要输出的字节数与起始位置
-        let start = inner_guard.read_pos as usize;
-        if len < inner_guard.valid_cnt as usize {
-            num = len;
+        let mut num = 0;
+        while num < len && inner_guard.valid_cnt != 0 {
+            let segment = inner_guard
+                .data
+                .first_segment()
+                .expect("pipe bytes have provenance");
+            let count = segment.len.min(len - num);
+            let start = inner_guard.read_pos as usize;
+            let first = count.min(inner_guard.buf_size - start);
+            buf[num..num + first].copy_from_slice(&inner_guard.data[start..start + first]);
+            if count > first {
+                buf[num + first..num + count].copy_from_slice(&inner_guard.data[..count - first]);
+            }
+            inner_guard.consume(if segment.packet { segment.len } else { count });
+            num += count;
+            if segment.packet {
+                break;
+            }
         }
-
-        let buf_size = inner_guard.buf_size;
-        // 采用两段复制，统一处理不跨尾、跨尾、以及 end==start 的写满/读空边界
-        let first = core::cmp::min(num, buf_size - start);
-        let second = num as isize - first as isize;
-        // 第1段：从 start 开始直到缓冲尾部或读取完
-        buf[0..first].copy_from_slice(&inner_guard.data[start..start + first]);
-        // 第2段：如需要，从缓冲头部继续
-        if second > 0 {
-            buf[first..num].copy_from_slice(&inner_guard.data[0..second as usize]);
-        }
-
-        //更新读位置以及valid_cnt
-        inner_guard.read_pos = (inner_guard.read_pos + num as i32) % buf_size as i32;
-        inner_guard.valid_cnt -= num as i32;
 
         let reader_wake = if inner_guard.valid_cnt == 0 && inner_guard.writer == 0 {
             WakeMode::All

@@ -2,7 +2,7 @@ use super::vfs::PollableInode;
 use crate::filesystem::anon_inode::{anon_inode_metadata, anon_inode_path, AnonInodeFs};
 use crate::filesystem::epoll::event_poll::EPollItemList;
 use crate::filesystem::vfs::file::FileFlags;
-use crate::filesystem::vfs::{InodeMode, OpenFileBehavior, PostWriteSyncPolicy};
+use crate::filesystem::vfs::{InodeMode, OpenFileBehavior, PostWriteSyncPolicy, UserReadMode};
 use crate::filesystem::{
     epoll::{event_poll::EventPoll, EPollEventType, EPollItem},
     vfs::{FilePrivateData, FileSystem, IndexNode, Metadata},
@@ -10,6 +10,7 @@ use crate::filesystem::{
 use crate::libs::mutex::{Mutex, MutexGuard};
 use crate::libs::wait_queue::WaitQueue;
 use crate::process::ProcessManager;
+use crate::syscall::user_buffer::UserBuffer;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -66,6 +67,44 @@ impl EventFdInode {
             epitems: EPollItemList::default(),
         }
     }
+    /// Consume the counter and publish writer readiness before userspace copying.
+    /// A later copy fault does not restore the counter, matching eventfd_read().
+    fn read_counter(&self, data: &FilePrivateData) -> Result<u64, SystemError> {
+        let mut lock_efd = self.eventfd.lock();
+        while lock_efd.count == 0 {
+            if lock_efd.flags.contains(EventFdFlags::EFD_NONBLOCK) {
+                drop(lock_efd);
+                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+            }
+
+            drop(lock_efd);
+
+            if ProcessManager::current_pcb().has_pending_signal_fast() {
+                return Err(SystemError::ERESTARTSYS);
+            }
+
+            wq_wait_event_interruptible!(self.wait_queue, self.readable(), {})?;
+
+            lock_efd = self.eventfd.lock();
+        }
+        let mut val = lock_efd.count;
+
+        let mut eventfd = lock_efd;
+        if eventfd.flags.contains(EventFdFlags::EFD_SEMAPHORE) {
+            eventfd.count -= 1;
+            val = 1;
+        } else {
+            eventfd.count = 0;
+        }
+        let pollflag = EPollEventType::from_bits_truncate(self.do_poll(data, &eventfd)? as u32);
+        drop(eventfd);
+
+        // 唤醒epoll中等待的进程
+        EventPoll::wakeup_epoll(&self.epitems, pollflag)?;
+
+        Ok(val)
+    }
+
     fn readable(&self) -> bool {
         let count = self.eventfd.lock().count;
         return count > 0;
@@ -153,50 +192,35 @@ impl IndexNode for EventFdInode {
         buf: &mut [u8],
         data_guard: MutexGuard<FilePrivateData>,
     ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
-        let result: core::result::Result<_, system_error::SystemError> = (|| {
-            let data = data_guard.clone();
-            drop(data_guard);
-            if len < 8 {
-                return Err(SystemError::EINVAL);
-            }
-            let mut lock_efd = self.eventfd.lock();
-            while lock_efd.count == 0 {
-                if lock_efd.flags.contains(EventFdFlags::EFD_NONBLOCK) {
-                    drop(lock_efd);
-                    return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-                }
+        let data = data_guard.clone();
+        drop(data_guard);
+        if len < 8 || buf.len() < 8 {
+            return Err(SystemError::EINVAL.into());
+        }
+        let value = self.read_counter(&data)?;
+        buf[..8].copy_from_slice(&value.to_ne_bytes());
+        Ok(8)
+    }
 
-                drop(lock_efd);
+    fn user_read_mode(&self) -> UserReadMode {
+        UserReadMode::Iterator
+    }
 
-                if ProcessManager::current_pcb().has_pending_signal_fast() {
-                    return Err(SystemError::ERESTARTSYS);
-                }
-
-                wq_wait_event_interruptible!(self.wait_queue, self.readable(), {})?;
-
-                lock_efd = self.eventfd.lock();
-            }
-            let mut val = lock_efd.count;
-
-            let mut eventfd = lock_efd;
-            if eventfd.flags.contains(EventFdFlags::EFD_SEMAPHORE) {
-                eventfd.count -= 1;
-                val = 1;
-            } else {
-                eventfd.count = 0;
-            }
-            let val_bytes = val.to_ne_bytes();
-            buf[..8].copy_from_slice(&val_bytes);
-            let pollflag =
-                EPollEventType::from_bits_truncate(self.do_poll(&data, &eventfd)? as u32);
-            drop(eventfd);
-
-            // 唤醒epoll中等待的进程
-            EventPoll::wakeup_epoll(&self.epitems, pollflag)?;
-
-            return Ok(8);
-        })();
-        result.map_err(Into::into)
+    fn read_user_at(
+        &self,
+        _offset: usize,
+        len: usize,
+        writer: &mut UserBuffer<'_>,
+        data_guard: MutexGuard<FilePrivateData>,
+    ) -> Result<Option<usize>, SystemError> {
+        let data = data_guard.clone();
+        drop(data_guard);
+        if len < 8 {
+            return Err(SystemError::EINVAL);
+        }
+        let value = self.read_counter(&data)?;
+        writer.write_one(0, &value)?;
+        Ok(Some(8))
     }
 
     /// # 把一个 8 字节的int值写入到 counter 里

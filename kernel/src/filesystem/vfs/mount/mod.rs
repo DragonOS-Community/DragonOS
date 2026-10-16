@@ -6344,6 +6344,20 @@ impl IndexNode for MountFSInode {
         return self.dentry.inode.truncate(len);
     }
 
+    fn user_read_mode(&self) -> super::UserReadMode {
+        self.dentry.inode.user_read_mode()
+    }
+
+    fn read_user_at(
+        &self,
+        offset: usize,
+        len: usize,
+        writer: &mut crate::syscall::user_buffer::UserBuffer<'_>,
+        data: MutexGuard<FilePrivateData>,
+    ) -> Result<Option<usize>, SystemError> {
+        self.dentry.inode.read_user_at(offset, len, writer, data)
+    }
+
     fn read_at(
         &self,
         offset: usize,

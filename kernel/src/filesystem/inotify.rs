@@ -948,8 +948,8 @@ impl IndexNode for InotifyInode {
         result.map_err(Into::into)
     }
 
-    fn supports_read_user(&self) -> bool {
-        true
+    fn user_read_mode(&self) -> crate::filesystem::vfs::UserReadMode {
+        crate::filesystem::vfs::UserReadMode::Scalar
     }
 
     fn read_user_at(

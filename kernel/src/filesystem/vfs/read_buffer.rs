@@ -8,18 +8,18 @@ use crate::mm::kernel_buffer::KernelBuffer as ReadStorage;
 #[cfg(not(any(target_arch = "x86_64", target_arch = "riscv64")))]
 type ReadStorage = alloc::vec::Vec<u8>;
 
-pub(super) const MAX_CHUNK: usize = 64 * 1024;
+pub(crate) const MAX_CHUNK: usize = 64 * 1024;
 
 /// One bounded, lazy owner, reused across chunks and iovecs. It never retains
 /// data for a caller: every returned active slice has the old Vec's zeroing
 /// contract, and growth discards storage whose data has already been copied.
 #[derive(Default)]
-pub(super) struct ReadScratch {
+pub(crate) struct ReadScratch {
     storage: Option<ReadStorage>,
 }
 
 impl ReadScratch {
-    pub(super) fn prepare(&mut self, want: usize) -> Result<&mut [u8], SystemError> {
+    pub(crate) fn prepare(&mut self, want: usize) -> Result<&mut [u8], SystemError> {
         if want == 0 {
             return Ok(&mut []);
         }

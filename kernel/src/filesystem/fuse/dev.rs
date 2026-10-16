@@ -13,12 +13,12 @@ use crate::{
         epoll::EPollItem,
         vfs::{
             file::FileFlags, vcore::generate_inode_id, FilePrivateData, FileSystem, FileType,
-            IndexNode, InodeFlags, InodeMode, Metadata, PollableInode,
+            IndexNode, InodeFlags, InodeMode, Metadata, PollableInode, UserReadMode,
         },
     },
     libs::mutex::{Mutex, MutexGuard},
     process::ProcessManager,
-    syscall::user_access::UserBufferReader,
+    syscall::{user_access::UserBufferReader, user_buffer::UserBuffer},
     time::PosixTimeSpec,
 };
 
@@ -174,6 +174,30 @@ impl IndexNode for LockedFuseDevInode {
             }
         })();
         result.map_err(Into::into)
+    }
+
+    fn user_read_mode(&self) -> UserReadMode {
+        UserReadMode::Iterator
+    }
+
+    fn read_user_at(
+        &self,
+        _offset: usize,
+        len: usize,
+        writer: &mut UserBuffer<'_>,
+        data: MutexGuard<FilePrivateData>,
+    ) -> Result<Option<usize>, SystemError> {
+        let (conn, nonblock) = {
+            let FilePrivateData::Fuse(FuseFilePrivateData::Dev(private)) = &*data else {
+                return Err(SystemError::EINVAL);
+            };
+            (private.conn_ref()?, private.nonblock)
+        };
+        drop(data);
+        match conn.read_request_to_user(nonblock, len, writer) {
+            Err(SystemError::ENOTCONN) => Err(SystemError::ENODEV),
+            result => result.map(Some),
+        }
     }
 
     fn write_at(

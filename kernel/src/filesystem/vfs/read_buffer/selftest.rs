@@ -294,6 +294,10 @@ pub(crate) fn report() -> String {
         ("errors_release", errors_release()),
         ("charge_admission", charge_admission()),
         ("fragmented_staging", fragmented_staging()),
+        (
+            "read_count_admission",
+            crate::filesystem::vfs::syscall::read_count_selftest(),
+        ),
     ];
     let failures = cases.iter().filter(|(_, ok)| !ok).count();
     let mut report = String::new();

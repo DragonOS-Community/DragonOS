@@ -6,12 +6,12 @@ use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_READ;
 use crate::filesystem::fsnotify::FsEvent;
 use crate::filesystem::vfs::file::{File, FileFlags};
-use crate::filesystem::vfs::FileType;
-use crate::mm::VirtAddr;
+use crate::filesystem::vfs::{FileType, UserReadMode, MAX_RW_COUNT};
+use crate::mm::{access_ok, VirtAddr};
 use crate::process::ProcessManager;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
-use crate::syscall::user_access::{copy_to_user_protected, user_accessible_len, UserBufferWriter};
+use crate::syscall::user_access::UserBufferWriter;
 use crate::syscall::user_buffer::UserBuffer;
 use alloc::string::ToString;
 use alloc::sync::Arc;
@@ -127,52 +127,29 @@ fn do_read_file(file: &File, buf: &mut [u8]) -> Result<usize, SystemError> {
 fn read_into_user_buffer(fd: i32, user_ptr: *mut u8, len: usize) -> Result<usize, SystemError> {
     let file = get_read_file(fd)?;
 
-    // Some record streams must own the whole userspace read boundary. In
-    // particular, inotify decides whether to wait again and consumes a record
-    // even when copying that record faults, matching Linux inotify_read().
-    // Use the original count here so a partially mapped range faults at the
-    // exact record copy instead of being silently shortened to `accessible`.
-    if file.supports_read_user() {
-        // Do not validate the complete `count` range here.  Linux record
-        // readers first apply their count rule and then touch only the bytes
-        // they actually return (timerfd, for example, always writes 8 bytes).
-        // Every access through UserBuffer remains exception-table protected.
-        let mut direct_buffer = unsafe { UserBuffer::new(VirtAddr::new(user_ptr as usize), len) };
-        if let Some(read_len) = file.read_user(len, &mut direct_buffer)? {
-            return Ok(read_len);
-        }
-        debug_assert!(
-            false,
-            "supports_read_user without read_user_at implementation"
-        );
-    }
+    file.readable()?;
+    // Linux validates the original numerical range, not its VMA mappings, and
+    // only then clamps the request. EOF need not touch a valid user address.
+    access_ok(VirtAddr::new(user_ptr as usize), len).map_err(|_| SystemError::EFAULT)?;
+    file.verify_read_range(len)?;
+    let len = len.min(MAX_RW_COUNT);
+    let mut output = unsafe { UserBuffer::new(VirtAddr::new(user_ptr as usize), len) };
 
-    // Linux still validates the descriptor and access mode for a zero-length
-    // read. Direct-user inodes above own any type-specific count==0 rule.
+    if file.user_read_mode() != UserReadMode::Buffered {
+        return file.read_user(len, &mut output)?.ok_or(SystemError::EIO);
+    }
     if len == 0 {
-        file.readable()?;
         return Ok(0);
     }
-
-    // Ordinary buffered reads may probe the mapped prefix up front. Record
-    // streams that require consume-before-copy semantics were dispatched above.
-    let accessible =
-        user_accessible_len(VirtAddr::new(user_ptr as usize), len, true /*write*/);
-    if accessible == 0 {
-        return Err(SystemError::EFAULT);
-    }
-
     if file.file_type() == FileType::Socket {
-        return read_socket_into_user_buffer(file.as_ref(), user_ptr, accessible);
+        return read_socket_into_user_buffer(file.as_ref(), &mut output);
     }
 
-    // Reject invalid read modes before scratch admission can reclaim or OOM.
-    file.readable()?;
     let mut scratch = ReadScratch::default();
     let mut total = 0usize;
 
-    while total < accessible {
-        let remain = accessible - total;
+    while total < len {
+        let remain = len - total;
         let chunk_len = core::cmp::min(MAX_CHUNK, remain);
 
         let kbuf = match scratch.prepare(chunk_len) {
@@ -180,7 +157,7 @@ fn read_into_user_buffer(fd: i32, user_ptr: *mut u8, len: usize) -> Result<usize
             Err(_) if total != 0 => break,
             Err(error) => return Err(error),
         };
-        let n = match file.read_syscall_chunk(chunk_len, kbuf) {
+        let n = match file.read_syscall_chunk(kbuf, &mut output, total) {
             Ok(n) => n,
             Err(_) if total != 0 => break,
             Err(err) => return Err(err),
@@ -189,20 +166,7 @@ fn read_into_user_buffer(fd: i32, user_ptr: *mut u8, len: usize) -> Result<usize
             break;
         }
 
-        let dst = VirtAddr::new(user_ptr as usize + total);
-        let write_res = unsafe { copy_to_user_protected(dst, &kbuf[..n]) };
-        match write_res {
-            Ok(_) => {
-                total += n;
-            }
-            Err(SystemError::EFAULT) => {
-                if total == 0 {
-                    return Err(SystemError::EFAULT);
-                }
-                break;
-            }
-            Err(e) => return Err(e),
-        }
+        total += n;
 
         if n < chunk_len {
             break;
@@ -218,17 +182,20 @@ fn read_into_user_buffer(fd: i32, user_ptr: *mut u8, len: usize) -> Result<usize
 
 fn read_socket_into_user_buffer(
     file: &File,
-    user_ptr: *mut u8,
-    accessible: usize,
+    output: &mut UserBuffer<'_>,
 ) -> Result<usize, SystemError> {
     let inode = file.inode();
     let socket = inode.as_socket().ok_or(SystemError::ENOTSOCK)?;
-
-    let mut writer = UserBufferWriter::new(user_ptr, accessible, true)?;
-    let mut user_buffer = writer.buffer_protected(0)?;
-    let read_len = socket.read_to_user_buffer(&mut user_buffer)?;
+    let read_len = socket.read_to_user_buffer(output)?;
     if read_len != 0 {
         file.notify_io_event(FsEvent::ACCESS);
     }
     Ok(read_len)
+}
+
+#[cfg(feature = "mm_selftest")]
+mod selftest;
+#[cfg(feature = "mm_selftest")]
+pub(crate) fn count_selftest() -> bool {
+    selftest::run()
 }

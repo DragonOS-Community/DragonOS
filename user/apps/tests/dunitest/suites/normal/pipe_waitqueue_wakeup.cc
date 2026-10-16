@@ -344,16 +344,16 @@ TEST(PipeWaitqueueWakeup, NonblockingSocketSpliceWithoutReaderDoesNotConsumeInpu
     close(destination[1]);
 }
 
-TEST(PipeWaitqueueWakeup, EligibleWriterIsNotBlockedBehindLargerWriter) {
+TEST(PipeWaitqueueWakeup, MixedWritersProgressAfterWholeSlotsAreReleased) {
     int data[2] = {-1, -1};
     int ready_large[2] = {-1, -1};
     int ready_small[2] = {-1, -1};
     ASSERT_EQ(0, pipe(data)) << strerror(errno);
     ASSERT_EQ(0, pipe(ready_large)) << strerror(errno);
     ASSERT_EQ(0, pipe(ready_small)) << strerror(errno);
-    ASSERT_EQ(4096, fcntl(data[1], F_SETPIPE_SZ, 4096)) << strerror(errno);
+    ASSERT_EQ(8192, fcntl(data[1], F_SETPIPE_SZ, 8192)) << strerror(errno);
     const int capacity = fcntl(data[1], F_GETPIPE_SZ);
-    ASSERT_EQ(4096, capacity) << strerror(errno);
+    ASSERT_EQ(8192, capacity) << strerror(errno);
     ASSERT_TRUE(FillPipeExactly(data[1], static_cast<size_t>(capacity))) << strerror(errno);
 
     pid_t large = fork();
@@ -412,34 +412,19 @@ TEST(PipeWaitqueueWakeup, EligibleWriterIsNotBlockedBehindLargerWriter) {
     char byte = 0;
     ASSERT_EQ(1, read(data[0], &byte, 1)) << strerror(errno);
 
+    // Free bytes inside an occupied page do not make a new pipe slot.
+    EXPECT_EQ(0, waitpid(small, nullptr, WNOHANG));
+    EXPECT_EQ(0, waitpid(large, nullptr, WNOHANG));
+    ASSERT_TRUE(ReadExactly(data[0], static_cast<size_t>(capacity - 1))) << strerror(errno);
+
     int small_status = 0;
-    const bool small_finished = WaitForChild(small, &small_status, 100);
-    if (!small_finished) {
-        small_guard.Cleanup();
-    } else {
-        small_guard.Release();
-    }
-
     int large_status = 0;
-    const bool large_finished_early = waitpid(large, &large_status, WNOHANG) == large;
-    if (!large_finished_early) {
-        const size_t buffered = small_finished ? static_cast<size_t>(capacity)
-                                               : static_cast<size_t>(capacity - 1);
-        ASSERT_TRUE(ReadExactly(data[0], buffered)) << strerror(errno);
-        if (!WaitForChild(large, &large_status)) {
-            FAIL() << "large writer did not finish after sufficient space was released";
-        }
-        large_guard.Release();
-    } else {
-        large_guard.Release();
-    }
-
-    EXPECT_TRUE(small_finished) << "eligible 1-byte writer remained asleep behind 4096-byte writer";
-    if (small_finished) {
-        ASSERT_TRUE(WIFEXITED(small_status));
-        EXPECT_EQ(0, WEXITSTATUS(small_status));
-    }
-    EXPECT_FALSE(large_finished_early);
+    ASSERT_TRUE(WaitForChild(small, &small_status)) << "small writer did not progress after slot release";
+    small_guard.Release();
+    ASSERT_TRUE(WaitForChild(large, &large_status)) << "large writer did not progress after slot release";
+    large_guard.Release();
+    ASSERT_TRUE(WIFEXITED(small_status));
+    EXPECT_EQ(0, WEXITSTATUS(small_status));
     ASSERT_TRUE(WIFEXITED(large_status));
     EXPECT_EQ(0, WEXITSTATUS(large_status));
 
@@ -447,13 +432,13 @@ TEST(PipeWaitqueueWakeup, EligibleWriterIsNotBlockedBehindLargerWriter) {
     close(data[1]);
 }
 
-TEST(PipeWaitqueueWakeup, HomogeneousWritersPassBatonAfterPartialDrain) {
+TEST(PipeWaitqueueWakeup, HomogeneousWritersPassBatonAfterWholeSlotDrain) {
     int data[2] = {-1, -1};
     int ready[2] = {-1, -1};
     ASSERT_EQ(0, pipe(data)) << strerror(errno);
     ASSERT_EQ(0, pipe(ready)) << strerror(errno);
-    ASSERT_EQ(4096, fcntl(data[1], F_SETPIPE_SZ, 4096)) << strerror(errno);
-    ASSERT_TRUE(FillPipeExactly(data[1], 4096)) << strerror(errno);
+    ASSERT_EQ(8192, fcntl(data[1], F_SETPIPE_SZ, 8192)) << strerror(errno);
+    ASSERT_TRUE(FillPipeExactly(data[1], 8192)) << strerror(errno);
 
     pid_t writers[2] = {-1, -1};
     ChildProcessGuard writer_guards[2];
@@ -487,6 +472,12 @@ TEST(PipeWaitqueueWakeup, HomogeneousWritersPassBatonAfterPartialDrain) {
 
     char drained[2] = {};
     ASSERT_EQ(2, read(data[0], drained, sizeof(drained))) << strerror(errno);
+    for (pid_t writer : writers) {
+        EXPECT_EQ(0, waitpid(writer, nullptr, WNOHANG));
+    }
+    // Release two complete slots: both exclusive waiters must make progress
+    // without another reader or an unrelated wakeup arriving.
+    ASSERT_TRUE(ReadExactly(data[0], 8192 - sizeof(drained))) << strerror(errno);
 
     for (size_t i = 0; i < 2; ++i) {
         int status = 0;

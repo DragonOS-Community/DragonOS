@@ -179,47 +179,65 @@ impl<'a> UserBuffer<'a> {
     /// - `Ok(len)`: 成功写入的字节数
     /// - `Err(SystemError)`: 写入失败（如地址不在VMA中）
     pub fn write_to_user(&mut self, offset: usize, src: &[u8]) -> Result<usize, SystemError> {
-        // offset == src.len is valid, as long as don't try to dereference it in &src[offset..]
+        self.write_output(offset, src, false)
+    }
+
+    /// Write a byte prefix and preserve progress across vector segments.
+    /// A record owner must use `write_to_user` instead, so a partial current
+    /// record cannot accidentally become a successful consumption commit.
+    pub fn write_prefix_to_user(
+        &mut self,
+        offset: usize,
+        src: &[u8],
+    ) -> Result<usize, SystemError> {
+        self.write_output(offset, src, true)
+    }
+
+    fn write_output(
+        &mut self,
+        offset: usize,
+        src: &[u8],
+        allow_partial: bool,
+    ) -> Result<usize, SystemError> {
         if offset > self.len {
             return Err(SystemError::EINVAL);
         }
-
-        let available = self.len - offset;
-        let copy_len = core::cmp::min(src.len(), available);
-
+        let copy_len = src.len().min(self.len - offset);
         if copy_len == 0 {
             return Ok(0);
         }
-
+        let copy = |address, bytes: &[u8]| unsafe {
+            if allow_partial {
+                crate::syscall::user_access::copy_to_user_prefix_protected(address, bytes)
+            } else {
+                crate::syscall::user_access::copy_to_user_protected(address, bytes)
+            }
+        };
         match &self.backing {
-            UserBufferBacking::Contiguous(addr) => unsafe {
-                crate::syscall::user_access::copy_to_user_protected(
-                    *addr + offset,
-                    &src[..copy_len],
-                )
-            },
+            UserBufferBacking::Contiguous(addr) => copy(*addr + offset, &src[..copy_len]),
             UserBufferBacking::Vectored(segments) => {
                 let mut skip = offset;
-                let mut copied = 0usize;
+                let mut copied = 0;
                 for segment in *segments {
                     if skip >= segment.len {
                         skip -= segment.len;
                         continue;
                     }
-                    let chunk = (segment.len - skip).min(copy_len - copied);
-                    unsafe {
-                        crate::syscall::user_access::copy_to_user_protected(
-                            segment.addr + skip,
-                            &src[copied..copied + chunk],
-                        )?;
+                    let want = (segment.len - skip).min(copy_len - copied);
+                    let n = match copy(segment.addr + skip, &src[copied..copied + want]) {
+                        Ok(n) => n,
+                        Err(_) if allow_partial && copied != 0 => return Ok(copied),
+                        Err(error) => return Err(error),
+                    };
+                    copied += n;
+                    if n < want || copied == copy_len {
+                        return Ok(copied);
                     }
-                    copied += chunk;
                     skip = 0;
-                    if copied == copy_len {
-                        break;
-                    }
                 }
-                if copied == copy_len {
+                // Construction guarantees enough logical capacity. Keep an
+                // error for a violated contract, rather than inventing bytes.
+                if allow_partial && copied != 0 {
                     Ok(copied)
                 } else {
                     Err(SystemError::EFAULT)

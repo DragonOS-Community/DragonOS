@@ -220,4 +220,6 @@ normal/udp_unspec_bind
 fuse/stat_blocks
 
 normal/read_buffer_semantics
+normal/read_fault_semantics
+normal/fuse_read_fault
 normal/read_buffer_selftest

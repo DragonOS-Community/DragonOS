@@ -148,6 +148,18 @@ impl IndexNode for LockedPipeInode {
     ) -> Result<usize, MemoryAllocationError> {
         Self::runtime(&data)?.read_at(offset, len, buf, data)
     }
+    fn user_read_mode(&self) -> crate::filesystem::vfs::UserReadMode {
+        crate::filesystem::vfs::UserReadMode::Iterator
+    }
+    fn read_user_at(
+        &self,
+        _offset: usize,
+        len: usize,
+        writer: &mut crate::syscall::user_buffer::UserBuffer<'_>,
+        data: MutexGuard<FilePrivateData>,
+    ) -> Result<Option<usize>, SystemError> {
+        Self::runtime(&data)?.read_user(len, writer, data).map(Some)
+    }
     fn write_at(
         &self,
         offset: usize,

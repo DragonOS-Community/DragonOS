@@ -5945,7 +5945,7 @@ mod tests {
         block_device.fail_once_on_read(TEST_XATTR_BLOCK);
 
         let err = fs
-            .setxattr_with_flags(2, "user.rollback", b"value", false, false)
+            .setxattr_with_flags(2, b"user.rollback", b"value", false, false)
             .unwrap_err();
 
         assert_eq!(err.code(), ErrCode::EIO);
@@ -5958,7 +5958,7 @@ mod tests {
         block_device.fail_once_on_write(TEST_XATTR_BLOCK);
 
         let err = fs
-            .setxattr_with_flags(2, "user.rollback", b"value", false, false)
+            .setxattr_with_flags(2, b"user.rollback", b"value", false, false)
             .unwrap_err();
 
         assert_eq!(err.code(), ErrCode::EIO);
@@ -5971,7 +5971,7 @@ mod tests {
         block_device.fail_once_on_write(TEST_INODE_TABLE);
 
         let err = fs
-            .setxattr_with_flags(2, "user.rollback", b"value", false, false)
+            .setxattr_with_flags(2, b"user.rollback", b"value", false, false)
             .unwrap_err();
 
         assert_eq!(err.code(), ErrCode::EIO);
@@ -5984,7 +5984,7 @@ mod tests {
         let value = vec![0x5au8; BLOCK_SIZE];
 
         let err = fs
-            .setxattr_with_flags(2, "user.rollback", &value, false, false)
+            .setxattr_with_flags(2, b"user.rollback", &value, false, false)
             .unwrap_err();
 
         assert_eq!(err.code(), ErrCode::ENOSPC);

@@ -12,13 +12,16 @@ use crate::{
     },
 };
 
-pub(super) const NAME: &str = "security.capability";
+pub(super) const NAME: &[u8] = b"security.capability";
 const REV2: u32 = 0x0200_0000;
 const REV3: u32 = 0x0300_0000;
 const EFFECTIVE: u32 = 1;
 
-pub(super) fn is_acl(name: &str) -> bool {
-    matches!(name, "system.posix_acl_access" | "system.posix_acl_default")
+pub(super) fn is_acl(name: &[u8]) -> bool {
+    matches!(
+        name,
+        b"system.posix_acl_access" | b"system.posix_acl_default"
+    )
 }
 
 pub(super) struct CapabilityValue {

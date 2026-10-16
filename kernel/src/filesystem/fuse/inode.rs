@@ -1457,9 +1457,13 @@ impl FuseNode {
     }
 
     fn pack_struct_and_name_payload<T: Copy>(inarg: &T, name: &str) -> Vec<u8> {
+        Self::pack_struct_and_name_bytes_payload(inarg, name.as_bytes())
+    }
+
+    fn pack_struct_and_name_bytes_payload<T: Copy>(inarg: &T, name: &[u8]) -> Vec<u8> {
         let mut payload = Vec::with_capacity(size_of::<T>() + name.len() + 1);
         payload.extend_from_slice(fuse_pack_struct(inarg));
-        payload.extend_from_slice(name.as_bytes());
+        payload.extend_from_slice(name);
         payload.push(0);
         payload
     }

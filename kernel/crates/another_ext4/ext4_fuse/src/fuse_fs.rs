@@ -24,6 +24,7 @@ use fuser::{
 };
 use std::collections::HashMap;
 use std::ffi::OsStr;
+use std::os::unix::ffi::OsStrExt;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -562,24 +563,15 @@ impl<T: 'static> Filesystem for StateExt4FuseFs<T> {
         size: u32,
         reply: fuser::ReplyXattr,
     ) {
-        let name = name.to_str().unwrap();
-        match self.fs.getxattr(ino as u32, name) {
-            Ok(value) => {
-                log::trace!(
-                    "Get xattr {} of inode {}: {:?}",
-                    name,
-                    ino,
-                    String::from_utf8_lossy(&value)
-                );
-                if size == 0 {
-                    reply.size(value.len() as u32);
-                } else if value.len() <= size as usize {
-                    reply.data(&value);
-                } else {
-                    reply.error(ErrCode::ERANGE as i32);
-                }
-            }
-            Err(e) => reply.error(e.code() as i32),
+        let mut buffer = Vec::new();
+        if buffer.try_reserve_exact(size as usize).is_err() {
+            return reply.error(ErrCode::ENOMEM as i32);
+        }
+        buffer.resize(size as usize, 0);
+        match self.fs.getxattr(ino as u32, name.as_bytes(), &mut buffer) {
+            Ok(count) if size == 0 => reply.size(count as u32),
+            Ok(count) => reply.data(&buffer[..count]),
+            Err(error) => reply.error(error.code() as i32),
         }
     }
 
@@ -593,9 +585,9 @@ impl<T: 'static> Filesystem for StateExt4FuseFs<T> {
         _position: u32,
         reply: ReplyEmpty,
     ) {
-        let name = name.to_str().unwrap();
+        let name = name.as_bytes();
         // Check conflict
-        if let Ok(_) = self.fs.getxattr(ino as u32, name) {
+        if let Ok(_) = self.fs.getxattr(ino as u32, name, &mut []) {
             return reply.error(ErrCode::EEXIST as i32);
         }
         match self.fs.setxattr(ino as u32, name, value) {
@@ -605,30 +597,22 @@ impl<T: 'static> Filesystem for StateExt4FuseFs<T> {
     }
 
     fn removexattr(&mut self, _req: &Request<'_>, ino: u64, name: &OsStr, reply: ReplyEmpty) {
-        let name = name.to_str().unwrap();
-        match self.fs.removexattr(ino as u32, name) {
+        match self.fs.removexattr(ino as u32, name.as_bytes()) {
             Ok(_) => reply.ok(),
             Err(e) => reply.error(e.code() as i32),
         }
     }
 
     fn listxattr(&mut self, _req: &Request<'_>, ino: u64, size: u32, reply: fuser::ReplyXattr) {
-        match self.fs.listxattr(ino as u32) {
-            Ok(names) => {
-                let mut buffer = Vec::new();
-                for name in names {
-                    buffer.extend_from_slice(name.as_bytes());
-                    buffer.push(0);
-                }
-                if size == 0 {
-                    reply.size(buffer.len() as u32);
-                } else if buffer.len() <= size as usize {
-                    reply.data(&buffer);
-                } else {
-                    reply.error(ErrCode::ERANGE as i32);
-                }
-            }
-            Err(e) => reply.error(e.code() as i32),
+        let mut buffer = Vec::new();
+        if buffer.try_reserve_exact(size as usize).is_err() {
+            return reply.error(ErrCode::ENOMEM as i32);
+        }
+        buffer.resize(size as usize, 0);
+        match self.fs.listxattr(ino as u32, &mut buffer) {
+            Ok(count) if size == 0 => reply.size(count as u32),
+            Ok(count) => reply.data(&buffer[..count]),
+            Err(error) => reply.error(error.code() as i32),
         }
     }
 }

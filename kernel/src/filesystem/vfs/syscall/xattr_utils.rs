@@ -14,7 +14,7 @@ use crate::{
         vfs_check_and_clone_cstr,
     },
 };
-use alloc::{string::String, sync::Arc};
+use alloc::{ffi::CString, sync::Arc};
 #[cfg(not(any(target_arch = "x86_64", target_arch = "riscv64")))]
 type XattrBuffer = alloc::vec::Vec<u8>;
 use system_error::SystemError;
@@ -24,18 +24,18 @@ const XATTR_NAME_MAX: usize = 255;
 const XATTR_SIZE_MAX: usize = 65536;
 
 struct SetxattrArgs {
-    name: String,
+    name: CString,
     value: Option<XattrBuffer>,
     flags: XattrFlags,
 }
 
-fn clone_xattr_name(name_ptr: *const u8) -> Result<String, SystemError> {
+fn clone_xattr_name(name_ptr: *const u8) -> Result<CString, SystemError> {
     let name = check_and_clone_cstr(name_ptr, Some(XATTR_NAME_MAX + 1))?;
     if name.as_bytes().is_empty() || name.as_bytes().len() > XATTR_NAME_MAX {
         return Err(SystemError::ERANGE);
     }
 
-    name.into_string().map_err(|_| SystemError::EINVAL)
+    Ok(name)
 }
 
 fn parse_setxattr_flags(flags: i32) -> Result<XattrFlags, SystemError> {
@@ -160,6 +160,9 @@ pub(super) fn path_removexattr(
     name_ptr: *const u8,
     lookup_flags: usize,
 ) -> Result<usize, SystemError> {
+    // Linux imports the name before touching the pathname. Keep this owned
+    // snapshot outside retries so userspace cannot change the selected key.
+    let name = clone_xattr_name(name_ptr)?;
     let path = vfs_check_and_clone_cstr(path_ptr, Some(MAX_PATHLEN))?
         .into_string()
         .map_err(|_| SystemError::EINVAL)?;
@@ -170,7 +173,7 @@ pub(super) fn path_removexattr(
         current_node.lookup_follow_symlink(&rest_path, lookup_flags)
     })?;
 
-    do_removexattr(inode, name_ptr)
+    do_removexattr(inode, name.as_bytes())
 }
 
 pub(super) fn fd_removexattr(fd: i32, name_ptr: *const u8) -> Result<usize, SystemError> {
@@ -182,13 +185,12 @@ pub(super) fn fd_removexattr(fd: i32, name_ptr: *const u8) -> Result<usize, Syst
         .ok_or(SystemError::EBADF)?;
     let inode = file.inode();
 
-    do_removexattr(inode, name_ptr)
+    let name = clone_xattr_name(name_ptr)?;
+    do_removexattr(inode, name.as_bytes())
 }
 
-fn do_removexattr(inode: Arc<dyn IndexNode>, name_ptr: *const u8) -> Result<usize, SystemError> {
-    let name = clone_xattr_name(name_ptr)?;
-
-    let result = crate::filesystem::vfs::file::File::recover_io(|| inode.removexattr(&name))?;
+fn do_removexattr(inode: Arc<dyn IndexNode>, name: &[u8]) -> Result<usize, SystemError> {
+    let result = crate::filesystem::vfs::file::File::recover_io(|| inode.removexattr(name))?;
     fsnotify::fsnotify_inode(FsEvent::ATTRIB, &inode);
     Ok(result)
 }
@@ -206,7 +208,7 @@ fn do_getxattr(
             size,
             XATTR_SIZE_MAX,
             allocate_xattr_buffer,
-            |buf| inode.getxattr(&name, buf),
+            |buf| inode.getxattr(name.as_bytes(), buf),
             |bytes| {
                 unsafe { copy_to_user_protected(VirtAddr::new(buf_ptr as usize), bytes) }
                     .map(|_| ())
@@ -261,7 +263,7 @@ pub(super) fn fd_setxattr(
 fn do_setxattr(inode: Arc<dyn IndexNode>, xattr: SetxattrArgs) -> Result<usize, SystemError> {
     let result = crate::filesystem::vfs::file::File::recover_io(|| {
         inode.setxattr(
-            &xattr.name,
+            xattr.name.as_bytes(),
             xattr.value.as_deref().unwrap_or(&[]),
             xattr.flags,
         )

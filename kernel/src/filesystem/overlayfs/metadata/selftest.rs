@@ -213,10 +213,16 @@ fn read_errors_retries() -> bool {
 
 fn list_filter_validation() -> bool {
     let list =
-        b"user.a\0trusted.overlay.hide\0trusted.dragonos.overlay.origin\0trusted.secret\0user.b\0";
+        b"user.a\0trusted.overlay.\xff\0trusted.dragonos.overlay.origin\0trusted.\xfe\0user.\xff\0user.\xfe\0user.\xef\xbf\xbd\0";
     for (trusted, expected) in [
-        (false, &b"user.a\0user.b\0"[..]),
-        (true, &b"user.a\0trusted.secret\0user.b\0"[..]),
+        (
+            false,
+            &b"user.a\0user.\xff\0user.\xfe\0user.\xef\xbf\xbd\0"[..],
+        ),
+        (
+            true,
+            &b"user.a\0trusted.\xfe\0user.\xff\0user.\xfe\0user.\xef\xbf\xbd\0"[..],
+        ),
     ] {
         if copy_visible_xattr_names(list, &mut [], trusted) != Ok(expected.len()) {
             return false;
@@ -235,11 +241,7 @@ fn list_filter_validation() -> bool {
             return false;
         }
     }
-    for malformed in [
-        &b"user.ok\0unterminated"[..],
-        &b"user.ok\0\0"[..],
-        &b"user.ok\0\xff\0"[..],
-    ] {
+    for malformed in [&b"user.ok\0unterminated"[..], &b"user.ok\0\0"[..]] {
         let mut output = [0xa5; 64];
         if copy_visible_xattr_names(malformed, &mut output, true) != Err(SystemError::EIO)
             || output.iter().any(|byte| *byte != 0xa5)

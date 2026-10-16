@@ -2316,12 +2316,12 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
 
     /// @brief 按文件名获取扩展属性
     ///
-    /// @param name 属性名称
+    /// @param name 非 NUL 原始字节属性名称，不要求 UTF-8
     /// @param buf 用于存储扩展属性值的缓冲区
     ///
     /// @return 成功：Ok(属性值的实际长度)
     ///         失败：Err(错误码)
-    fn getxattr(&self, _name: &str, _buf: &mut [u8]) -> Result<usize, SystemError> {
+    fn getxattr(&self, _name: &[u8], _buf: &mut [u8]) -> Result<usize, SystemError> {
         log::warn!(
             "getxattr not implemented for {}",
             crate::libs::name::get_type_name(&self)
@@ -2331,7 +2331,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
 
     /// @brief 按文件名设置扩展属性
     ///
-    /// @param name 属性名称
+    /// @param name 非 NUL 原始字节属性名称，不要求 UTF-8
     /// @param buf 用于存储扩展属性值的缓冲区
     /// @param value 要设置的扩展属性值
     ///
@@ -2339,7 +2339,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     ///         失败：Err(错误码)
     fn setxattr(
         &self,
-        _name: &str,
+        _name: &[u8],
         _value: &[u8],
         _flags: XattrFlags,
     ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
@@ -2362,7 +2362,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     /// @brief 删除指定扩展属性。
     fn removexattr(
         &self,
-        _name: &str,
+        _name: &[u8],
     ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
         log::warn!(
             "removexattr not implemented for {}",
@@ -2378,7 +2378,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     fn remove_security_privileges(
         &self,
     ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
-        match self.removexattr("security.capability") {
+        match self.removexattr(b"security.capability") {
             Ok(_)
             | Err(crate::mm::allocation::MemoryAllocationError::System(
                 SystemError::ENODATA | SystemError::ENOSYS | SystemError::EOPNOTSUPP_OR_ENOTSUP,

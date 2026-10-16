@@ -45,21 +45,27 @@ class XattrSyscall : public ::testing::Test {
         if (!path.empty()) unlink(path.c_str());
     }
     // Raw syscalls intentionally test invalid pointers without libc access annotations.
-    int Set(Access mode, const void* value, size_t size, int flags = 0) {
-        if (mode == Access::Fd) return syscall(SYS_fsetxattr, fd, kName, value, size, flags);
-        if (mode == Access::NoFollow) return syscall(SYS_lsetxattr, path.c_str(), kName, value, size, flags);
-        return syscall(SYS_setxattr, path.c_str(), kName, value, size, flags);
+    int Set(Access mode, const void* value, size_t size, int flags = 0,
+            const char* name = kName) {
+        if (mode == Access::Fd) return syscall(SYS_fsetxattr, fd, name, value, size, flags);
+        if (mode == Access::NoFollow) return syscall(SYS_lsetxattr, path.c_str(), name, value, size, flags);
+        return syscall(SYS_setxattr, path.c_str(), name, value, size, flags);
     }
-    ssize_t Get(Access mode, void* value, size_t size) {
-        if (mode == Access::Fd) return syscall(SYS_fgetxattr, fd, kName, value, size);
-        if (mode == Access::NoFollow) return syscall(SYS_lgetxattr, path.c_str(), kName, value, size);
-        return syscall(SYS_getxattr, path.c_str(), kName, value, size);
+    ssize_t Get(Access mode, void* value, size_t size, const char* name = kName) {
+        if (mode == Access::Fd) return syscall(SYS_fgetxattr, fd, name, value, size);
+        if (mode == Access::NoFollow) return syscall(SYS_lgetxattr, path.c_str(), name, value, size);
+        return syscall(SYS_getxattr, path.c_str(), name, value, size);
     }
     ssize_t List(Access mode, void* value, size_t size) {
         if (mode == Access::Fd) return syscall(SYS_flistxattr, fd, value, size);
         if (mode == Access::NoFollow)
             return syscall(SYS_llistxattr, path.c_str(), value, size);
         return syscall(SYS_listxattr, path.c_str(), value, size);
+    }
+    int Remove(Access mode, const char* name) {
+        if (mode == Access::Fd) return syscall(SYS_fremovexattr, fd, name);
+        if (mode == Access::NoFollow) return syscall(SYS_lremovexattr, path.c_str(), name);
+        return syscall(SYS_removexattr, path.c_str(), name);
     }
     void ExpectOriginal() {
         std::array<char, sizeof(kValue)> value = {};
@@ -199,6 +205,130 @@ TEST_F(XattrSyscall, NameAndPathErrorsRetainLinuxPrecedence) {
     errno = 0;
     EXPECT_EQ(-1, syscall(SYS_fgetxattr, fd, "", nullptr, 0));
     EXPECT_EQ(ERANGE, errno);
+    ExpectOriginal();
+}
+
+TEST_F(XattrSyscall, RemoveCopiesNameBeforePathButDescriptorBeforeName) {
+    const std::string missing = path + ".missing";
+    const std::string long_name(256, 'x');
+    // REMOVE copies the name before path resolution, unlike GET. Neither
+    // path lookup failure nor a bad pathname may hide a name-copy error.
+    for (long operation : {long(SYS_removexattr), long(SYS_lremovexattr)}) {
+        for (const char* pathname : {missing.c_str(), static_cast<const char*>(nullptr)}) {
+            for (const char* name : {"", long_name.c_str()}) {
+                errno = 0;
+                EXPECT_EQ(-1, syscall(operation, pathname, name));
+                EXPECT_EQ(ERANGE, errno);
+            }
+            errno = 0;
+            EXPECT_EQ(-1, syscall(operation, pathname, nullptr));
+            EXPECT_EQ(EFAULT, errno);
+        }
+        errno = 0;
+        EXPECT_EQ(-1, syscall(operation, missing.c_str(), kName));
+        EXPECT_EQ(ENOENT, errno);
+        errno = 0;
+        EXPECT_EQ(-1, syscall(operation, nullptr, kName));
+        EXPECT_EQ(EFAULT, errno);
+    }
+    for (const char* name : {static_cast<const char*>(nullptr), "", long_name.c_str()}) {
+        errno = 0;
+        EXPECT_EQ(-1, syscall(SYS_fremovexattr, -1, name));
+        EXPECT_EQ(EBADF, errno);
+    }
+    for (Access mode : kAccess) {
+        errno = 0;
+        EXPECT_EQ(-1, Remove(mode, ""));
+        EXPECT_EQ(ERANGE, errno);
+        errno = 0;
+        EXPECT_EQ(-1, Remove(mode, long_name.c_str()));
+        EXPECT_EQ(ERANGE, errno);
+    }
+    ExpectOriginal();
+}
+
+TEST_F(XattrSyscall, NamesPreserveArbitraryBytesAcrossAllEntryPoints) {
+    // The replacement-character name is deliberately distinct from each
+    // invalid UTF-8 byte sequence; lossy conversion would alias these keys.
+    const std::array<std::string, 3> names = {
+        std::string("user.byte_") + char(0xff),
+        std::string("user.byte_") + char(0xfe),
+        std::string("user.byte_\xef\xbf\xbd")};
+    const std::array<std::string, 3> values = {"first", "second", "replacement"};
+    for (size_t index = 0; index < names.size(); ++index) {
+        ASSERT_EQ(0, Set(kAccess[index], values[index].data(), values[index].size(),
+                         XATTR_CREATE, names[index].c_str())) << strerror(errno);
+    }
+    const auto check = [&] {
+        for (Access mode : kAccess) {
+            for (size_t index = 0; index < names.size(); ++index) {
+                std::array<char, 32> value = {};
+                ASSERT_EQ(static_cast<ssize_t>(values[index].size()),
+                          Get(mode, value.data(), value.size(), names[index].c_str()));
+                EXPECT_EQ(0, memcmp(value.data(), values[index].data(), values[index].size()));
+            }
+            const ssize_t size = List(mode, nullptr, 0);
+            ASSERT_GT(size, 0);
+            std::vector<char> listed(static_cast<size_t>(size));
+            ASSERT_EQ(size, List(mode, listed.data(), listed.size()));
+            std::vector<std::string> entries;
+            for (size_t offset = 0; offset < listed.size();) {
+                const size_t length = strnlen(listed.data() + offset, listed.size() - offset);
+                ASSERT_LT(length, listed.size() - offset) << "unterminated xattr list entry";
+                entries.emplace_back(listed.data() + offset, length);
+                offset += length + 1;
+            }
+            EXPECT_EQ(names.size() + 1, entries.size());
+            for (const auto& name : names) EXPECT_EQ(1, std::count(entries.begin(), entries.end(), name));
+            EXPECT_EQ(1, std::count(entries.begin(), entries.end(), std::string(kName)));
+        }
+    };
+    ASSERT_NO_FATAL_FAILURE(check());
+    ASSERT_EQ(0, close(fd));
+    fd = -1;
+    ASSERT_NO_FATAL_FAILURE(filesystem.Unmount());
+    ASSERT_NO_FATAL_FAILURE(filesystem.Mount());
+    fd = open(path.c_str(), O_RDWR);
+    ASSERT_GE(fd, 0) << strerror(errno);
+    ASSERT_NO_FATAL_FAILURE(check());
+    for (size_t index = 0; index < names.size(); ++index) {
+        ASSERT_EQ(0, Remove(kAccess[index], names[index].c_str()));
+        for (Access mode : kAccess) {
+            errno = 0;
+            EXPECT_EQ(-1, Get(mode, nullptr, 0, names[index].c_str()));
+            EXPECT_EQ(ENODATA, errno);
+            for (size_t remaining = index + 1; remaining < names.size(); ++remaining) {
+                EXPECT_EQ(static_cast<ssize_t>(values[remaining].size()),
+                          Get(mode, nullptr, 0, names[remaining].c_str()));
+            }
+        }
+    }
+    ExpectOriginal();
+}
+
+TEST_F(XattrSyscall, NameByteLimitIncludesNamespaceAndExcludesTerminator) {
+    // Linux XATTR_NAME_MAX is 255 bytes for the complete namespace + suffix.
+    std::string name = "user." + std::string(249, 'x') + char(0xff);
+    ASSERT_EQ(255U, name.size());
+    const std::string too_long = name + 'x';
+    for (Access mode : kAccess) {
+        ASSERT_EQ(0, Set(mode, kValue, sizeof(kValue), XATTR_CREATE, name.c_str()))
+            << strerror(errno);
+        std::array<char, sizeof(kValue)> value = {};
+        ASSERT_EQ(static_cast<ssize_t>(sizeof(kValue)),
+                  Get(mode, value.data(), value.size(), name.c_str()));
+        EXPECT_EQ(0, memcmp(value.data(), kValue, sizeof(kValue)));
+        errno = 0;
+        EXPECT_EQ(-1, Set(mode, kValue, sizeof(kValue), 0, too_long.c_str()));
+        EXPECT_EQ(ERANGE, errno);
+        errno = 0;
+        EXPECT_EQ(-1, Get(mode, nullptr, 0, too_long.c_str()));
+        EXPECT_EQ(ERANGE, errno);
+        errno = 0;
+        EXPECT_EQ(-1, Remove(mode, too_long.c_str()));
+        EXPECT_EQ(ERANGE, errno);
+        ASSERT_EQ(0, Remove(mode, name.c_str()));
+    }
     ExpectOriginal();
 }
 

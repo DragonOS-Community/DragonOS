@@ -2,7 +2,7 @@
 use super::Ext4;
 use crate::ext4_defs::*;
 use crate::prelude::*;
-use crate::{format_error, return_error};
+use crate::return_error;
 
 impl Ext4 {
     fn xattr_checksum_seed(&self) -> Result<Option<MetadataChecksumSeed>> {
@@ -44,28 +44,32 @@ impl Ext4 {
     ///
     /// # Return
     ///
-    /// `Ok(value)` - the value of the attribute
+    /// Return the value length. An empty buffer probes the size; a nonempty
+    /// buffer must fit the whole value and is left unchanged on ERANGE.
     ///
     /// # Error
     ///
     /// `ENODATA` - the attribute does not exist
-    pub fn getxattr(&self, inode: InodeId, name: &str) -> Result<Vec<u8>> {
+    pub fn getxattr(&self, inode: InodeId, name: &[u8], buf: &mut [u8]) -> Result<usize> {
+        XattrEntry::validate_name(name)?;
         let _view = self.lock_metadata_read_view()?;
         let inode_ref = self.read_inode(inode)?;
-        let xattr_block_id = inode_ref.inode.xattr_block();
-        if xattr_block_id == 0 {
-            return_error!(ErrCode::ENODATA, "Xattr {} does not exist", name);
+        let home = inode_ref.inode.xattr_block();
+        if home == 0 {
+            return Err(Ext4Error::new(ErrCode::ENODATA));
         }
-        let xattr_block = XattrBlock::new(self.read_block(xattr_block_id)?);
-        self.verify_xattr_block_checksum(xattr_block_id, &xattr_block)?;
-        match xattr_block.get(name) {
-            Some(value) => Ok(value.to_owned()),
-            None => Err(format_error!(
-                ErrCode::ENODATA,
-                "Xattr {} does not exist",
-                name
-            )),
+        let block = XattrBlock::new(self.read_block(home)?);
+        self.verify_xattr_block_checksum(home, &block)?;
+        let value = block
+            .get(name)?
+            .ok_or_else(|| Ext4Error::new(ErrCode::ENODATA))?;
+        if !buf.is_empty() {
+            if buf.len() < value.len() {
+                return Err(Ext4Error::new(ErrCode::ERANGE));
+            }
+            buf[..value.len()].copy_from_slice(value);
         }
+        Ok(value.len())
     }
 
     /// Set extended attribute of a file.
@@ -79,7 +83,7 @@ impl Ext4 {
     /// # Error
     ///
     /// `ENOSPC` - xattr block does not have enough space
-    pub fn setxattr(&self, inode: InodeId, name: &str, value: &[u8]) -> Result<()> {
+    pub fn setxattr(&self, inode: InodeId, name: &[u8], value: &[u8]) -> Result<()> {
         self.ensure_mutable()?;
         self.setxattr_with_flags(inode, name, value, false, false)
     }
@@ -92,12 +96,13 @@ impl Ext4 {
     pub fn setxattr_with_flags(
         &self,
         inode: InodeId,
-        name: &str,
+        name: &[u8],
         value: &[u8],
         create: bool,
         replace: bool,
     ) -> Result<()> {
         self.ensure_mutable()?;
+        XattrEntry::validate_name(name)?;
         if self.uses_journal() {
             return self.update_xattr_transaction(inode, name, Some(value), create, replace);
         }
@@ -108,7 +113,7 @@ impl Ext4 {
         let xattr_block_id = inode_ref.inode.xattr_block();
         if xattr_block_id == 0 {
             if replace {
-                return_error!(ErrCode::ENODATA, "Xattr {} does not exist", name);
+                return_error!(ErrCode::ENODATA, "Xattr {:?} does not exist", name);
             }
             // lazy allocate xattr block
             let pblock = self.alloc_block(&mut inode_ref)?;
@@ -147,12 +152,13 @@ impl Ext4 {
 
         let xattr_block = XattrBlock::new(self.read_block(xattr_block_id)?);
         self.verify_xattr_block_checksum(xattr_block_id, &xattr_block)?;
-        let exists = xattr_block.get(name).is_some();
+        xattr_block.validate_inline()?;
+        let exists = xattr_block.get(name)?.is_some();
         if exists && create {
-            return_error!(ErrCode::EEXIST, "Xattr {} already exists", name);
+            return_error!(ErrCode::EEXIST, "Xattr {:?} already exists", name);
         }
         if !exists && replace {
-            return_error!(ErrCode::ENODATA, "Xattr {} does not exist", name);
+            return_error!(ErrCode::ENODATA, "Xattr {:?} does not exist", name);
         }
 
         let mut new_xattr_block = xattr_block;
@@ -182,8 +188,9 @@ impl Ext4 {
     /// # Error
     ///
     /// `ENODATA` - the attribute does not exist
-    pub fn removexattr(&self, inode: InodeId, name: &str) -> Result<()> {
+    pub fn removexattr(&self, inode: InodeId, name: &[u8]) -> Result<()> {
         self.ensure_mutable()?;
+        XattrEntry::validate_name(name)?;
         if self.uses_journal() {
             return self.update_xattr_transaction(inode, name, None, false, true);
         }
@@ -193,14 +200,15 @@ impl Ext4 {
         let mut inode_ref = self.read_inode(inode)?;
         let xattr_block_id = inode_ref.inode.xattr_block();
         if xattr_block_id == 0 {
-            return_error!(ErrCode::ENODATA, "Xattr {} does not exist", name);
+            return_error!(ErrCode::ENODATA, "Xattr {:?} does not exist", name);
         }
         let image = self.read_block(xattr_block_id)?;
         let mut header = XattrHeader::from_bytes(&image.data[..]);
         let mut xattr_block = XattrBlock::new(image);
         self.verify_xattr_block_checksum(xattr_block_id, &xattr_block)?;
+        xattr_block.validate_inline()?;
         if xattr_block.remove(name) {
-            if xattr_block.list().is_empty() {
+            if xattr_block.is_empty()? {
                 let blocks = inode_ref
                     .inode
                     .fs_block_count()
@@ -241,7 +249,7 @@ impl Ext4 {
             self.write_block(&xattr_block.block())?;
             Ok(())
         } else {
-            return_error!(ErrCode::ENODATA, "Xattr {} does not exist", name);
+            return_error!(ErrCode::ENODATA, "Xattr {:?} does not exist", name);
         }
     }
 
@@ -253,17 +261,18 @@ impl Ext4 {
     ///
     /// # Returns
     ///
-    /// A list of extended attributes of the file.
-    pub fn listxattr(&self, inode: InodeId) -> Result<Vec<String>> {
+    /// The length of the NUL-separated byte names. An empty buffer probes
+    /// the size; copying uses the same checked block snapshot.
+    pub fn listxattr(&self, inode: InodeId, buf: &mut [u8]) -> Result<usize> {
         let _view = self.lock_metadata_read_view()?;
         let inode_ref = self.read_inode(inode)?;
-        let xattr_block_id = inode_ref.inode.xattr_block();
-        if xattr_block_id == 0 {
-            return Ok(Vec::new());
+        let home = inode_ref.inode.xattr_block();
+        if home == 0 {
+            return Ok(0);
         }
-        let xattr_block = XattrBlock::new(self.read_block(xattr_block_id)?);
-        self.verify_xattr_block_checksum(xattr_block_id, &xattr_block)?;
-        Ok(xattr_block.list())
+        let block = XattrBlock::new(self.read_block(home)?);
+        self.verify_xattr_block_checksum(home, &block)?;
+        block.list(buf)
     }
     /// External xattr replacement is one allocation/reference/inode operation.
     /// Shared Linux xattr blocks are copied, never changed through another
@@ -271,7 +280,7 @@ impl Ext4 {
     fn update_xattr_transaction(
         &self,
         inode_id: InodeId,
-        name: &str,
+        name: &[u8],
         value: Option<&[u8]>,
         create: bool,
         replace: bool,
@@ -300,7 +309,8 @@ impl Ext4 {
             self.verify_xattr_block_checksum(old_home, &block)?;
             (block, header.refcount() > 1)
         };
-        let exists = candidate.get(name).is_some();
+        candidate.validate_inline()?;
+        let exists = candidate.get(name)?.is_some();
         if exists && create {
             return Err(Ext4Error::new(ErrCode::EEXIST));
         }
@@ -315,7 +325,7 @@ impl Ext4 {
                 return Err(Ext4Error::new(ErrCode::ENOSPC));
             }
         }
-        if value.is_none() && candidate.list().is_empty() {
+        if value.is_none() && candidate.is_empty()? {
             if let Some(home) = self.transaction_release_xattr(&mut transaction, &mut inode)? {
                 self.transaction_dealloc_block_range(&mut transaction, home, 1)?;
             }

@@ -191,6 +191,8 @@ impl InnerAddressSpace {
                     let old_mapper = &mut self.user_mapper.utable;
                     let new_mapper = &mut new_guard.user_mapper.utable;
                     let new_vma_mlocked = new_vma.lock().vm_flags().contains(VmFlags::VM_LOCKED);
+                    // COW 写保护标志与具体页无关，VMA 级一次计算。
+                    let cow_flags = page_flags.set_write(false);
                     let mut page_manager_guard = page_manager_lock();
 
                     while current_page < end_page {
@@ -220,8 +222,6 @@ impl InnerAddressSpace {
                                         return Err(SystemError::ENOMEM.into());
                                     }
                                 } else {
-                                    let cow_flags = page_flags.set_write(false);
-
                                     if old_flags.has_write() {
                                         if let Some(flush) =
                                             old_mapper.remap(current_page, cow_flags)
@@ -246,8 +246,6 @@ impl InnerAddressSpace {
                                 }
                                 if let Some(page) = page_manager_guard.get(&phys_addr) {
                                     page.write().insert_vma(new_vma.clone(), new_vma_mlocked);
-                                }
-                                if page_manager_guard.get(&phys_addr).is_some() {
                                     child_present_pages += 1;
                                 }
                             }

@@ -2504,6 +2504,41 @@ impl IndexNode for LockedExt4Inode {
         }
     }
 
+    fn user_read_mode(&self) -> vfs::UserReadMode {
+        vfs::UserReadMode::Iterator
+    }
+
+    /// 直接把页缓存数据拷入受保护的用户缓冲区，省去内核弹跳缓冲。
+    ///
+    /// 仅覆盖有页缓存的常规读路径；无 page_cache 的文件（如 O_DIRECT
+    /// 场景）返回 `None`，回退到默认的内核缓冲路径（`read_at`）。
+    fn read_user_at(
+        &self,
+        offset: usize,
+        len: usize,
+        writer: &mut crate::syscall::user_buffer::UserBuffer<'_>,
+        data: PrivateData,
+    ) -> Result<Option<usize>, SystemError> {
+        let _operation = self.begin_operation()?;
+        let page_cache = {
+            let guard = self.inner.lock();
+            guard.page_cache.clone()
+        };
+
+        if let Some(page_cache) = page_cache {
+            drop(data);
+            let task = crate::process::ProcessManager::current_pcb();
+            let owner = crate::cgroup::memory::account_for_task(&task);
+            let creator = crate::cgroup::memory::object_for_task(&task);
+            let n = page_cache
+                .try_read_user(offset, len, writer, &owner, &creator)
+                .map_err(PageCache::legacy_allocation_error)?;
+            Ok(Some(n))
+        } else {
+            Ok(None)
+        }
+    }
+
     fn read_sync(&self, offset: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
         let _operation = self.begin_operation()?;
         let (fs, inode_num) = {

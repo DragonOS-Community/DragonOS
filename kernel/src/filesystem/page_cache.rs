@@ -2950,7 +2950,7 @@ impl PageCache {
             .map_err(Self::legacy_allocation_error)
     }
 
-    fn legacy_allocation_error(error: MemoryAllocationError) -> SystemError {
+    pub(crate) fn legacy_allocation_error(error: MemoryAllocationError) -> SystemError {
         match error {
             MemoryAllocationError::Charge(_) => SystemError::ENOMEM,
             MemoryAllocationError::System(error) => error,
@@ -4384,6 +4384,136 @@ impl PageCache {
         }
 
         Ok(ret)
+    }
+
+    /// 两阶段直读用户：与 `try_read` 相同的失效保护与收集协议，但解锁后
+    /// 逐页把数据直接拷入受保护的用户缓冲区，省去内核弹跳缓冲的一次
+    /// 中转拷贝。用户侧拷贝走异常表保护；中途缺页时返回已拷贝字节数
+    /// （Linux read 的部分 EFAULT 语义由 `write_prefix_to_user` 保证），
+    /// 一个字节都没拷到时向上报告 EFAULT。
+    pub(crate) fn try_read_user(
+        &self,
+        offset: usize,
+        len: usize,
+        writer: &mut crate::syscall::user_buffer::UserBuffer<'_>,
+        owner: &Arc<MemoryAccount>,
+        creator: &Arc<ObjectAccount>,
+    ) -> Result<usize, MemoryAllocationError> {
+        // 与 try_read 一致：持 invalidate 读锁收集页 pin，松锁后再触碰
+        // 用户地址——用户拷贝触发缺页时可能需要这条映射。
+        let invalidate = self.invalidate_read();
+        let inode = self
+            .inode()
+            .and_then(|inode| inode.upgrade())
+            .ok_or(SystemError::EIO)?;
+        let file_size = inode.metadata()?.size;
+
+        let len = if offset < file_size as usize {
+            core::cmp::min(file_size as usize, offset + len) - offset
+        } else {
+            0
+        };
+        let len = core::cmp::min(len, writer.len());
+        if len == 0 {
+            return Ok(0);
+        }
+
+        let start_page_index = offset >> MMArch::PAGE_SHIFT;
+        let end_page_index = (offset + len - 1) >> MMArch::PAGE_SHIFT;
+
+        // 单锁批量收集：热路径（页已缓存且 Ready）在持有一次 inner 锁的
+        // 情况下逐页 pin，避免每页两次全局 Mutex。缺失或未就绪的页记入
+        // slow 队列，锁外走原有的逐页慢路径（含后端填充与等待）。
+        let page_count = end_page_index - start_page_index + 1;
+        let mut items: Vec<(usize, CopyItem)> = Vec::new();
+        items
+            .try_reserve_exact(page_count)
+            .map_err(|_| SystemError::ENOMEM)?;
+        let mut slow: Vec<usize> = Vec::new();
+        {
+            let guard = self.inner.lock();
+            for page_index in start_page_index..=end_page_index {
+                let page_start = page_index * MMArch::PAGE_SIZE;
+                let page_end = page_start + MMArch::PAGE_SIZE;
+                let read_start = core::cmp::max(offset, page_start);
+                let read_end = core::cmp::min(offset + len, page_end);
+                let page_read_len = read_end.saturating_sub(read_start);
+                if page_read_len == 0 {
+                    continue;
+                }
+                match guard.get_entry(page_index) {
+                    Some(entry) if entry.state().is_ready() => {
+                        let pin = entry.pin();
+                        items.push((
+                            page_index,
+                            CopyItem {
+                                entry,
+                                _pin: pin,
+                                page_index,
+                                page_offset: read_start - page_start,
+                                sub_len: page_read_len,
+                                created: false,
+                            },
+                        ));
+                    }
+                    _ => slow.push(page_index),
+                }
+            }
+        }
+        for page_index in slow {
+            let page_start = page_index * MMArch::PAGE_SIZE;
+            let page_end = page_start + MMArch::PAGE_SIZE;
+            let read_start = core::cmp::max(offset, page_start);
+            let read_end = core::cmp::min(offset + len, page_end);
+            let (entry, pin, _) =
+                self.try_get_or_create_entry_pinned(page_index, true, owner, creator)?;
+            items.push((
+                page_index,
+                CopyItem {
+                    entry,
+                    _pin: pin,
+                    page_index,
+                    page_offset: read_start - page_start,
+                    sub_len: read_end.saturating_sub(read_start),
+                    created: false,
+                },
+            ));
+        }
+        // 热路径与慢路径分两段收集，按页索引重排保证拷贝顺序与文件偏移一致。
+        items.sort_unstable_by_key(|(index, _)| *index);
+        let mut copies: Vec<CopyItem> = Vec::new();
+        copies.try_reserve_exact(items.len()).map_err(|_| SystemError::ENOMEM)?;
+        for (_, item) in items {
+            copies.push(item);
+        }
+
+        drop(invalidate);
+        let mut dst_offset = 0;
+        let mut faulted = false;
+        for item in copies {
+            let page_guard = item.entry.page.read();
+            let src = unsafe {
+                &page_guard.as_slice()[item.page_offset..item.page_offset + item.sub_len]
+            };
+            match writer.write_prefix_to_user(dst_offset, src) {
+                Ok(n) => {
+                    dst_offset += n;
+                    if n < item.sub_len {
+                        faulted = true;
+                        break;
+                    }
+                }
+                Err(_) => {
+                    faulted = true;
+                    break;
+                }
+            }
+        }
+
+        if dst_offset == 0 && faulted {
+            return Err(SystemError::EFAULT.into());
+        }
+        Ok(dst_offset)
     }
 
     pub fn write(&self, offset: usize, buf: &[u8]) -> Result<usize, SystemError> {

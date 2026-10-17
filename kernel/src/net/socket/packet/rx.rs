@@ -9,7 +9,6 @@ use crate::bpf::classic::{
     SKF_AD_QUEUE, SKF_AD_RANDOM, SKF_AD_RXHASH, SKF_AD_VLAN_TAG, SKF_AD_VLAN_TAG_PRESENT,
     SKF_AD_VLAN_TPID, SKF_LL_OFF, SKF_NET_OFF,
 };
-use crate::filesystem::vfs::iov::IoVecs;
 use crate::net::socket::endpoint::{Endpoint, LinkLayerEndpoint};
 use crate::net::socket::unix::utils::CmsgBuffer;
 use crate::net::socket::PMSG;
@@ -1047,8 +1046,8 @@ impl PacketSocket {
         &self,
         msg: &mut crate::net::posix::MsgHdr,
         flags: PMSG,
+        iovs: &crate::syscall::iov::IoVecs,
     ) -> Result<usize, SystemError> {
-        let iovs = unsafe { IoVecs::from_user(msg.msg_iov, msg.msg_iovlen, true)? };
         let capacity = iovs.total_len();
         if capacity == usize::MAX {
             return Err(SystemError::EINVAL);

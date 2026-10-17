@@ -469,11 +469,14 @@ TEST_F(LoopMemoryIo, ColdBackingNoReclaimProgressReturnsEnomemWithoutOomKill) {
     const uint64_t max_events = MaxEvents();
     const uint64_t oom_kills = Field(Get(group_ + "/memory.events"), "oom_kill");
     ASSERT_NE(UINT64_MAX, current);
-    // There are no donor pages. NOIO cannot manufacture space, wait for an
-    // OOM victim, or bypass the exact current budget by charging root.
-    ASSERT_EQ(0, Set(group_ + "/memory.max", std::to_string(current)));
+    // Admit exactly the accounted 4KiB pread scratch allocated before lower
+    // NOIO begins. It stays live during the backing read, leaving no space
+    // for a cold lower page. There are no donor pages to reclaim.
+    ASSERT_EQ(0, Set(group_ + "/memory.max", std::to_string(current + kBlock)));
     PrintSample("no-progress-before-read");
     ASSERT_NO_FATAL_FAILURE(ExpectNoProgressWithoutOomKill(max_events, oom_kills));
+    EXPECT_EQ(0u, FileBytes());
+    EXPECT_EQ(current, Current()) << "syscall scratch must be released after ENOMEM";
 }
 
 TEST_F(LoopMemoryIo, ParentQuotaNoioReclaimHonorsChildMemoryMin) {

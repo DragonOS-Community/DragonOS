@@ -36,10 +36,9 @@ impl Syscall for SysPread64Handle {
         let len = Self::len(args);
         let offset = Self::offset(args);
 
-        // 检查offset + len是否溢出 同时检查offset是否为负数
-
-        let end_pos = offset.checked_add(len).ok_or(SystemError::EINVAL)?;
-        if offset > i64::MAX as usize || end_pos > i64::MAX as usize {
+        // Linux rejects a negative explicit position before fd admission.
+        // Count/range checks follow the selected file's read capabilities.
+        if offset > i64::MAX as usize {
             return Err(SystemError::EINVAL);
         }
 

@@ -1,20 +1,14 @@
-use alloc::vec::Vec;
+//! Positional scalar read admission. Data transfer uses the ordinary read core.
+use crate::{
+    filesystem::{
+        fsnotify::FsEvent,
+        vfs::{file::File, UserReadMode, MAX_RW_COUNT},
+    },
+    mm::{access_ok, VirtAddr},
+    syscall::user_buffer::UserBuffer,
+};
 use system_error::SystemError;
 
-use crate::{
-    filesystem::{fsnotify::FsEvent, vfs::file::File},
-    mm::VirtAddr,
-    syscall::user_access::{copy_to_user_protected, user_accessible_len},
-};
-
-/// Bounded pread64 implementation with partial bad-buffer semantics.
-///
-/// Key rules:
-/// - If `len == 0`, must not touch user memory.
-/// - If the user buffer is partially inaccessible, return the number of bytes successfully
-///   transferred; only return `EFAULT` if **0 bytes** were transferred.
-///
-/// `from_user` controls whether the pointer should be treated as a userspace pointer.
 pub(super) fn do_pread_at(
     file: &File,
     offset: usize,
@@ -22,85 +16,40 @@ pub(super) fn do_pread_at(
     len: usize,
     from_user: bool,
 ) -> Result<usize, SystemError> {
-    if len == 0 {
-        let mut empty: [u8; 0] = [];
-        return file.pread_syscall_chunk(offset, 0, &mut empty);
+    file.verify_pread_access()?;
+    file.readable()?;
+    if from_user {
+        access_ok(VirtAddr::new(user_ptr), len).map_err(|_| SystemError::EFAULT)?;
     }
-
-    if from_user && user_ptr == 0 {
-        return Err(SystemError::EFAULT);
-    }
-
-    const CHUNK: usize = 64 * 1024;
-    let mut total: usize = 0;
-    let mut cur_off: usize = offset;
-
-    while total < len {
-        let remain = len - total;
-        let want = core::cmp::min(CHUNK, remain);
-
-        let user_addr = VirtAddr::new(user_ptr.checked_add(total).ok_or(SystemError::EFAULT)?);
-
-        let accessible = if from_user {
-            user_accessible_len(user_addr, want, true)
+    file.verify_pread_range(offset, len)?;
+    let len = len.min(MAX_RW_COUNT);
+    if !from_user {
+        // The internal caller supplies a kernel-owned range, never a user slice.
+        if len != 0 && user_ptr == 0 {
+            return Err(SystemError::EFAULT);
+        }
+        let mut empty = [];
+        let buffer = if len == 0 {
+            &mut empty[..]
         } else {
-            want
+            unsafe { core::slice::from_raw_parts_mut(user_ptr as *mut u8, len) }
         };
-
-        if accessible == 0 {
-            if total == 0 {
-                return Err(SystemError::EFAULT);
-            }
-            break;
+        let read = file.pread_syscall_chunk(offset, len, buffer)?;
+        if read != 0 {
+            file.notify_io_event(FsEvent::ACCESS);
         }
-
-        let mut kbuf = Vec::new();
-        if kbuf.try_reserve_exact(accessible).is_err() {
-            if total == 0 {
-                return Err(SystemError::ENOMEM);
-            }
-            break;
-        }
-        kbuf.resize(accessible, 0);
-
-        let n = match file.pread_syscall_chunk(cur_off, accessible, &mut kbuf) {
-            Ok(n) => n,
-            Err(error) if total == 0 => return Err(error),
-            Err(_) => break,
-        };
-        if n == 0 {
-            break;
-        }
-
-        if from_user {
-            match unsafe { copy_to_user_protected(user_addr, &kbuf[..n]) } {
-                Ok(_) => {
-                    total = total.saturating_add(n);
-                    cur_off = cur_off.checked_add(n).ok_or(SystemError::EINVAL)?;
-                }
-                Err(SystemError::EFAULT) => {
-                    if total == 0 {
-                        return Err(SystemError::EFAULT);
-                    }
-                    break;
-                }
-                Err(e) => return Err(e),
-            }
-        } else {
-            let dst = unsafe { core::slice::from_raw_parts_mut(user_addr.data() as *mut u8, n) };
-            dst.copy_from_slice(&kbuf[..n]);
-            total = total.saturating_add(n);
-            cur_off = cur_off.checked_add(n).ok_or(SystemError::EINVAL)?;
-        }
-
-        // Stop on short file read (EOF) or when we intentionally clipped to accessible area.
-        if n < accessible || accessible < want {
-            break;
-        }
+        return Ok(read);
     }
-
-    if total > 0 {
-        file.notify_io_event(FsEvent::ACCESS);
+    // Numerical range validation does not probe VMAs. EOF need not access it.
+    let mut output = unsafe { UserBuffer::new(VirtAddr::new(user_ptr), len) };
+    if file.user_read_mode() != UserReadMode::Buffered {
+        let read = file
+            .pread_user_syscall_chunk(offset, len, &mut output)?
+            .ok_or(SystemError::EIO)?;
+        if read != 0 {
+            file.notify_io_event(FsEvent::ACCESS);
+        }
+        return Ok(read);
     }
-    Ok(total)
+    super::sys_read::read_buffered_into_user(file, &mut output, Some(offset))
 }

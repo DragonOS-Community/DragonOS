@@ -218,8 +218,9 @@ impl crate::net::socket::Socket for RawSocket {
         &self,
         msg: &mut crate::net::posix::MsgHdr,
         flags: PMSG,
+        iovs: &crate::syscall::iov::IoVecs,
     ) -> Result<usize, SystemError> {
-        RawSocket::recv_msg(self, msg, flags)
+        RawSocket::recv_msg(self, msg, flags, iovs)
     }
 
     fn send_msg(&self, msg: &crate::net::posix::MsgHdr, flags: PMSG) -> Result<usize, SystemError> {

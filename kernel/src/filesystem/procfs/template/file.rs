@@ -7,7 +7,8 @@ use crate::{
             file::{FileFlags, FileMode},
             vcore::generate_inode_id,
             FilePrivateData, FileSystem, FileType, IndexNode, InodeFlags, InodeMode, Metadata,
-            OpenFileBehavior, PostWriteSyncPolicy, SetMetadataMask,
+            OpenFileBehavior, PostWriteSyncPolicy, PrimaryWriteResult, PrimaryWriteSource,
+            SetMetadataMask, WritePrivilegeStage,
         },
     },
     time::PosixTimeSpec,
@@ -147,6 +148,20 @@ pub trait FileOps: Sync + Send + Sized + Debug {
         Err(SystemError::EIO)
     }
 
+    /// Return the position selected by this same owner invocation. Most
+    /// proc handlers advance by their returned byte count; callbacks that
+    /// preserve or conditionally change ppos override this result instead.
+    fn write_at_with_position(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &[u8],
+        data: MutexGuard<FilePrivateData>,
+    ) -> Result<PrimaryWriteResult, SystemError> {
+        self.write_at(offset, len, buf, data)
+            .map(PrimaryWriteResult::new)
+    }
+
     /// 打开文件时调用，可用于按 open 时上下文初始化 procfs 私有数据
     fn open(
         &self,
@@ -182,6 +197,7 @@ impl<F: FileOps + 'static> IndexNode for ProcFile<F> {
     }
     fn configure_open_file(&self, data: &FilePrivateData, behavior: &mut OpenFileBehavior) {
         behavior.post_write_sync = PostWriteSyncPolicy::NotApplicable;
+        behavior.data_file_write_checks = false;
         self.inner.configure_open_file(data, behavior);
     }
 
@@ -264,6 +280,21 @@ impl<F: FileOps + 'static> IndexNode for ProcFile<F> {
         self.inner
             .write_at(offset, len, buf, data)
             .map_err(Into::into)
+    }
+
+    fn write_primary_with_privilege_stage(
+        &self,
+        offset: usize,
+        len: usize,
+        source: PrimaryWriteSource<'_, '_>,
+        data: MutexGuard<FilePrivateData>,
+        _stage: &mut WritePrivilegeStage<'_>,
+    ) -> Result<PrimaryWriteResult, crate::mm::allocation::MemoryAllocationError> {
+        source.with_buffer(len, |buffer| {
+            self.inner
+                .write_at_with_position(offset, len.min(buffer.len()), buffer, data)
+                .map_err(Into::into)
+        })
     }
 
     fn list(&self) -> Result<Vec<String>, SystemError> {

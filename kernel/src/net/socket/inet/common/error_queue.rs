@@ -1,10 +1,7 @@
 //! Bounded inet extended-error storage and Linux MSG_ERRQUEUE serialization.
-use crate::{
-    filesystem::vfs::iov::IoVecs,
-    net::{
-        posix::{MsgHdr, SockAddr},
-        socket::{endpoint::Endpoint, unix::utils::CmsgBuffer, IpOption, PIPV6, PMSG, PSOL},
-    },
+use crate::net::{
+    posix::{MsgHdr, SockAddr},
+    socket::{endpoint::Endpoint, unix::utils::CmsgBuffer, IpOption, PIPV6, PMSG, PSOL},
 };
 use alloc::{collections::VecDeque, vec::Vec};
 use smoltcp::wire::{IpAddress, IpEndpoint};
@@ -60,8 +57,8 @@ impl ErrorQueueEntry {
         self,
         msg: &mut MsgHdr,
         options: ErrorCmsgOptions,
+        iovs: &crate::syscall::iov::IoVecs,
     ) -> Result<usize, SystemError> {
-        let iovs = unsafe { IoVecs::from_user(msg.msg_iov, msg.msg_iovlen, true)? };
         let copied = iovs.total_len().min(self.payload.len());
         iovs.scatter_exact(&self.payload[..copied])?;
         msg.msg_flags = PMSG::ERRQUEUE.bits() as i32;

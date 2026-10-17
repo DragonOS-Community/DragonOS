@@ -9,7 +9,7 @@ use crate::{
             template::{Builder, DirOps, FileOps, ProcDir, ProcDirBuilder, ProcFileBuilder},
             utils::proc_read,
         },
-        vfs::{FilePrivateData, IndexNode, InodeMode},
+        vfs::{FilePrivateData, IndexNode, InodeMode, PrimaryWriteResult},
     },
     libs::mutex::MutexGuard,
     process::{cred::CAP_LAST_CAP, namespace::uts_namespace::NewUtsName, ProcessManager},
@@ -344,6 +344,38 @@ impl UtsStringFileOps {
             UtsStringKind::Domainname => uts_ns.domainname(),
         }
     }
+    fn write_value(&self, offset: usize, buf: &[u8]) -> Result<PrimaryWriteResult, SystemError> {
+        if buf.is_empty() {
+            return Ok(PrimaryWriteResult::new(0));
+        }
+
+        let uts_ns = ProcessManager::current_utsns();
+        let old = match self.kind {
+            UtsStringKind::Hostname => uts_ns.hostname(),
+            UtsStringKind::Domainname => uts_ns.domainname(),
+        };
+        let old_len = old.iter().position(|byte| *byte == 0).unwrap_or(old.len());
+        if offset > old_len {
+            return Ok(PrimaryWriteResult {
+                written_len: buf.len(),
+                next_position: Some(offset),
+            });
+        }
+
+        let input_len = buf
+            .iter()
+            .position(|byte| *byte == 0 || *byte == b'\n')
+            .unwrap_or(buf.len());
+        let copy_len = input_len.min((NewUtsName::MAXLEN - 1).saturating_sub(offset));
+        let mut value = [0u8; NewUtsName::MAXLEN];
+        value[..offset].copy_from_slice(&old[..offset]);
+        value[offset..offset + copy_len].copy_from_slice(&buf[..copy_len]);
+        match self.kind {
+            UtsStringKind::Hostname => uts_ns.set_hostname(&value[..offset + copy_len])?,
+            UtsStringKind::Domainname => uts_ns.set_domainname(&value[..offset + copy_len])?,
+        }
+        Ok(PrimaryWriteResult::new(buf.len()))
+    }
 }
 
 impl FileOps for UtsStringFileOps {
@@ -376,33 +408,18 @@ impl FileOps for UtsStringFileOps {
         buf: &[u8],
         _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        if buf.is_empty() {
-            return Ok(0);
-        }
+        self.write_value(offset, buf)
+            .map(|result| result.written_len)
+    }
 
-        let uts_ns = ProcessManager::current_utsns();
-        let old = match self.kind {
-            UtsStringKind::Hostname => uts_ns.hostname(),
-            UtsStringKind::Domainname => uts_ns.domainname(),
-        };
-        let old_len = old.iter().position(|byte| *byte == 0).unwrap_or(old.len());
-        if offset > old_len {
-            return Ok(buf.len());
-        }
-
-        let input_len = buf
-            .iter()
-            .position(|byte| *byte == 0 || *byte == b'\n')
-            .unwrap_or(buf.len());
-        let copy_len = input_len.min((NewUtsName::MAXLEN - 1).saturating_sub(offset));
-        let mut value = [0u8; NewUtsName::MAXLEN];
-        value[..offset].copy_from_slice(&old[..offset]);
-        value[offset..offset + copy_len].copy_from_slice(&buf[..copy_len]);
-        match self.kind {
-            UtsStringKind::Hostname => uts_ns.set_hostname(&value[..offset + copy_len])?,
-            UtsStringKind::Domainname => uts_ns.set_domainname(&value[..offset + copy_len])?,
-        }
-        Ok(buf.len())
+    fn write_at_with_position(
+        &self,
+        offset: usize,
+        _len: usize,
+        buf: &[u8],
+        _data: MutexGuard<FilePrivateData>,
+    ) -> Result<PrimaryWriteResult, SystemError> {
+        self.write_value(offset, buf)
     }
 }
 

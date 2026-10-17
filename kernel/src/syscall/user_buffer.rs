@@ -6,25 +6,11 @@ use crate::mm::{access_ok, VirtAddr};
 use num::traits::FromBytes;
 use system_error::SystemError;
 
-/// 用户空间缓冲区的安全包装
-///
-/// 这个类型封装了对用户空间内存的访问，确保所有读写操作
-/// 都通过异常表机制处理可能的页错误
-#[derive(Clone, Copy)]
-pub struct UserBufferSegment {
-    addr: VirtAddr,
-    len: usize,
-}
-
-impl UserBufferSegment {
-    pub fn new(addr: VirtAddr, len: usize) -> Self {
-        Self { addr, len }
-    }
-}
+use super::iov::IoVecs;
 
 enum UserBufferBacking<'a> {
     Contiguous(VirtAddr),
-    Vectored(&'a [UserBufferSegment]),
+    Vectored(&'a IoVecs),
 }
 
 pub struct UserBuffer<'a> {
@@ -73,19 +59,15 @@ impl<'a> UserBuffer<'a> {
         }
     }
 
-    /// Create a protected logical buffer backed by multiple userspace ranges.
-    ///
-    /// The caller must keep `segments` alive and ensure their combined length
-    /// is at least `len`. Individual accesses remain exception-table protected.
-    pub(crate) unsafe fn new_vectored(segments: &'a [UserBufferSegment], len: usize) -> Self {
-        debug_assert!(
-            segments
-                .iter()
-                .fold(0usize, |total, segment| total.saturating_add(segment.len))
-                >= len
+    /// Borrow a validated snapshot without allocating a second segment table.
+    /// The caller retains `vectors` until this logical buffer is no longer used.
+    pub(crate) fn new_vectored(vectors: &'a IoVecs, len: usize) -> Self {
+        assert!(
+            len <= vectors.total_len(),
+            "logical buffer exceeds iovec snapshot"
         );
         Self {
-            backing: UserBufferBacking::Vectored(segments),
+            backing: UserBufferBacking::Vectored(vectors),
             len,
         }
     }
@@ -104,8 +86,9 @@ impl<'a> UserBuffer<'a> {
         match &self.backing {
             UserBufferBacking::Contiguous(addr) => *addr,
             UserBufferBacking::Vectored(segments) => segments
-                .first()
-                .map(|segment| segment.addr)
+                .iter()
+                .find(|segment| segment.iov_len != 0)
+                .map(|segment| VirtAddr::new(segment.iov_base as usize))
                 .unwrap_or_default(),
         }
     }
@@ -140,13 +123,16 @@ impl<'a> UserBuffer<'a> {
             UserBufferBacking::Vectored(segments) => {
                 let mut skip = offset;
                 let mut copied = 0;
-                for segment in *segments {
-                    if skip >= segment.len {
-                        skip -= segment.len;
+                for segment in segments.iter() {
+                    if skip >= segment.iov_len {
+                        skip -= segment.iov_len;
                         continue;
                     }
-                    let want = (segment.len - skip).min(copy_len - copied);
-                    let n = match copy(segment.addr + skip, &mut dst[copied..copied + want]) {
+                    let want = (segment.iov_len - skip).min(copy_len - copied);
+                    let n = match copy(
+                        VirtAddr::new(segment.iov_base as usize) + skip,
+                        &mut dst[copied..copied + want],
+                    ) {
                         Ok(n) => n,
                         Err(SystemError::EFAULT) if copied != 0 => return Ok(copied),
                         Err(error) => return Err(error),
@@ -199,16 +185,16 @@ impl<'a> UserBuffer<'a> {
             UserBufferBacking::Vectored(segments) => {
                 let mut skip = offset;
                 let mut copied = 0usize;
-                for segment in *segments {
-                    if skip >= segment.len {
-                        skip -= segment.len;
+                for segment in segments.iter() {
+                    if skip >= segment.iov_len {
+                        skip -= segment.iov_len;
                         continue;
                     }
-                    let chunk = (segment.len - skip).min(copy_len - copied);
+                    let chunk = (segment.iov_len - skip).min(copy_len - copied);
                     unsafe {
                         crate::syscall::user_access::copy_from_user_protected(
                             &mut dst[copied..copied + chunk],
-                            segment.addr + skip,
+                            VirtAddr::new(segment.iov_base as usize) + skip,
                         )?;
                     }
                     copied += chunk;
@@ -275,13 +261,16 @@ impl<'a> UserBuffer<'a> {
             UserBufferBacking::Vectored(segments) => {
                 let mut skip = offset;
                 let mut copied = 0;
-                for segment in *segments {
-                    if skip >= segment.len {
-                        skip -= segment.len;
+                for segment in segments.iter() {
+                    if skip >= segment.iov_len {
+                        skip -= segment.iov_len;
                         continue;
                     }
-                    let want = (segment.len - skip).min(copy_len - copied);
-                    let n = match copy(segment.addr + skip, &src[copied..copied + want]) {
+                    let want = (segment.iov_len - skip).min(copy_len - copied);
+                    let n = match copy(
+                        VirtAddr::new(segment.iov_base as usize) + skip,
+                        &src[copied..copied + want],
+                    ) {
                         Ok(n) => n,
                         Err(_) if allow_partial && copied != 0 => return Ok(copied),
                         Err(error) => return Err(error),
@@ -456,13 +445,18 @@ impl<'a> UserBuffer<'a> {
             UserBufferBacking::Vectored(segments) => {
                 let mut skip = offset;
                 let mut cleared = 0usize;
-                for segment in *segments {
-                    if skip >= segment.len {
-                        skip -= segment.len;
+                for segment in segments.iter() {
+                    if skip >= segment.iov_len {
+                        skip -= segment.iov_len;
                         continue;
                     }
-                    let chunk = (segment.len - skip).min(clear_len - cleared);
-                    unsafe { clear_user_cow_protected(segment.addr + skip, chunk)? };
+                    let chunk = (segment.iov_len - skip).min(clear_len - cleared);
+                    unsafe {
+                        clear_user_cow_protected(
+                            VirtAddr::new(segment.iov_base as usize) + skip,
+                            chunk,
+                        )?
+                    };
                     cleared += chunk;
                     skip = 0;
                     if cleared == clear_len {

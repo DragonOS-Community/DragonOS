@@ -664,6 +664,7 @@ impl IndexNode for FuseNode {
             data,
             &mut stage,
         )
+        .map(|result| result.written_len)
     }
 
     fn write_primary_with_privilege_stage(
@@ -673,7 +674,10 @@ impl IndexNode for FuseNode {
         source: crate::filesystem::vfs::PrimaryWriteSource<'_, '_>,
         data: MutexGuard<FilePrivateData>,
         _stage: &mut crate::filesystem::vfs::WritePrivilegeStage<'_>,
-    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+    ) -> Result<
+        crate::filesystem::vfs::PrimaryWriteResult,
+        crate::mm::allocation::MemoryAllocationError,
+    > {
         self.check_not_stale()?;
         self.ensure_regular()?;
         if matches!(&source, crate::filesystem::vfs::PrimaryWriteSource::Kernel(buf) if buf.len() < len)
@@ -692,19 +696,23 @@ impl IndexNode for FuseNode {
         // source mapping of this same inode can still be faulted in.
         let _inode_write = self.setattr_lock.lock();
         if len == 0 {
-            return self.write_with_open(offset, 0, &[], &private_data, &owner, &creator);
+            return self
+                .write_with_open(offset, 0, &[], &private_data, &owner, &creator)
+                .map(crate::filesystem::vfs::PrimaryWriteResult::new);
         }
-        source.write_chunks(len, |relative, bytes| {
-            let position = offset.checked_add(relative).ok_or(SystemError::EOVERFLOW)?;
-            self.write_with_open(
-                position,
-                bytes.len(),
-                bytes,
-                &private_data,
-                &owner,
-                &creator,
-            )
-        })
+        source
+            .write_chunks(len, |relative, bytes| {
+                let position = offset.checked_add(relative).ok_or(SystemError::EOVERFLOW)?;
+                self.write_with_open(
+                    position,
+                    bytes.len(),
+                    bytes,
+                    &private_data,
+                    &owner,
+                    &creator,
+                )
+            })
+            .map(crate::filesystem::vfs::PrimaryWriteResult::new)
         // Privilege finalization remains in File after the inode guard exits.
         // Marking the stage handled here would recurse into SETATTR.
     }

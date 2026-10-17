@@ -21,10 +21,8 @@ pub struct IoVec {
     pub iov_len: usize,
 }
 
-/// 用于存储多个来自用户空间的IoVec
-///
-/// 由于目前内核中的文件系统还不支持分散读写，所以暂时只支持将用户空间的IoVec聚合成一个缓冲区，然后进行操作。
-/// TODO：支持分散读写
+/// One validated userspace iovec snapshot, including empty segments.
+/// Iterator owners use a logical buffer; legacy owners retain call boundaries.
 #[derive(Debug)]
 pub struct IoVecs(Vec<IoVec>);
 
@@ -48,8 +46,10 @@ impl IoVecs {
         limit: usize,
     ) -> Result<Vec<UserBufferSegment>, SystemError> {
         let mut segments = Vec::new();
+        // Retaining empty iovecs must not inflate the iterator segment table.
+        let nonempty = self.0.iter().filter(|iov| iov.iov_len != 0).count();
         segments
-            .try_reserve(self.0.len())
+            .try_reserve(nonempty)
             .map_err(|_| SystemError::ENOMEM)?;
         let mut remaining = limit;
         for iov in &self.0 {
@@ -57,6 +57,9 @@ impl IoVecs {
                 break;
             }
             let len = iov.iov_len.min(remaining);
+            if len == 0 {
+                continue;
+            }
             segments.push(UserBufferSegment::new(
                 VirtAddr::new(iov.iov_base as usize),
                 len,
@@ -135,7 +138,6 @@ impl IoVecs {
             one.iov_len = one.iov_len.min(remaining);
             remaining -= one.iov_len;
         }
-        slices.retain(|one| one.iov_len != 0);
 
         Ok(Self(slices))
     }
@@ -167,9 +169,12 @@ impl IoVecs {
         let mut read_any = false;
 
         for iov in self.0.iter() {
-            let len = iov.iov_len.min(limit.saturating_sub(buf.len()));
-            if len == 0 {
+            if buf.len() == limit {
                 break;
+            }
+            let len = iov.iov_len.min(limit - buf.len());
+            if len == 0 {
+                continue;
             }
             let base = VirtAddr::new(iov.iov_base as usize);
             // 检查从 iov_base 开始有多少 bytes 在 vma 内部且实际可以访问

@@ -281,10 +281,10 @@ fn copy_file_range_impl(
         current_pos_in += written;
         current_pos_out += written;
         if use_in_file_offset {
-            in_file.commit_transfer_position(current_pos_in);
+            in_file.commit_position(current_pos_in);
         }
         if use_out_file_offset {
-            out_file.commit_transfer_position(current_pos_out);
+            out_file.commit_position(current_pos_out);
         }
         if written < read_len {
             break;

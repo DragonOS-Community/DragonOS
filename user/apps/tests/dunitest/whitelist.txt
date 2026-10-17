@@ -240,3 +240,5 @@ normal/primary_write_transaction
 
 normal/pwritev2_flags
 normal/pwritev2_sync
+
+normal/legacy_writev_semantics

@@ -90,6 +90,7 @@ TEST(PageCacheAccounting, MembershipLifecycleIsBalanced) {
     EXPECT_NE(std::string::npos, report.find("memcg_vma_body_lifetime=ok\n")) << report;
     EXPECT_NE(std::string::npos, report.find("memcg_file_body_lifetime=ok\n")) << report;
     EXPECT_NE(std::string::npos, report.find("file_write_completion=ok\n")) << report;
+    EXPECT_NE(std::string::npos, report.find("legacy_writev_completion=ok\n")) << report;
     EXPECT_NE(std::string::npos, report.find("memcg_fdtable_body_layout=ok\n")) << report;
     EXPECT_NE(std::string::npos, report.find("memcg_pipe_storage=ok\n")) << report;
     EXPECT_NE(std::string::npos, report.find("memcg_task_resources=ok\n")) << report;

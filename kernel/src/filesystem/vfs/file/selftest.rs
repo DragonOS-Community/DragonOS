@@ -394,3 +394,159 @@ pub(crate) fn run_write_completion() -> Result<bool, MemoryAllocationError> {
     }
     Ok(valid)
 }
+
+/// Synthetic storage hooks exercise the real legacy loop and charge recovery.
+/// They inspect operation boundaries without dereferencing userspace input;
+/// actual copy and record semantics are covered by legacy_writev_semantics.
+#[derive(Debug)]
+struct LegacyWriteProbe {
+    account: Arc<MemoryAccount>,
+    observed_file: crate::libs::spinlock::SpinLock<Option<alloc::sync::Weak<File>>>,
+    first_calls: AtomicUsize,
+    second_calls: AtomicUsize,
+    valid: AtomicBool,
+    terminal_error: bool,
+}
+
+impl IndexNode for LegacyWriteProbe {
+    fn supports_write_iter_flags(&self) -> bool {
+        false
+    }
+
+    fn configure_open_file(&self, _: &FilePrivateData, behavior: &mut super::OpenFileBehavior) {
+        behavior.post_write_sync = super::PostWriteSyncPolicy::NotApplicable;
+    }
+
+    fn write_user_buffer_at(
+        &self,
+        offset: usize,
+        len: usize,
+        _: &crate::syscall::user_buffer::UserBuffer<'_>,
+        data: MutexGuard<FilePrivateData>,
+    ) -> Result<Option<usize>, MemoryAllocationError> {
+        drop(data);
+        if self
+            .observed_file
+            .lock()
+            .as_ref()
+            .and_then(alloc::sync::Weak::upgrade)
+            .is_none_or(|file| file.pos() != 37)
+        {
+            self.valid.store(false, Ordering::Relaxed);
+        }
+        match (offset, len) {
+            (37, 3) => {
+                self.first_calls.fetch_add(1, Ordering::Relaxed);
+                Ok(Some(3))
+            }
+            (40, 5) => {
+                let attempt = self.second_calls.fetch_add(1, Ordering::Relaxed);
+                if self.terminal_error {
+                    return Err(SystemError::EIO.into());
+                }
+                if attempt == 0 {
+                    self.account.set_policy(MemoryPolicy {
+                        max: Some(0),
+                        ..Default::default()
+                    });
+                    let admission = self.account.try_charge(MemoryKind::Anon, 1);
+                    self.account.set_policy(MemoryPolicy::default());
+                    return match admission {
+                        Err(error) => Err(error.into()),
+                        Ok(charge) => {
+                            drop(charge);
+                            self.valid.store(false, Ordering::Relaxed);
+                            Err(SystemError::EINVAL.into())
+                        }
+                    };
+                }
+                Ok(Some(5))
+            }
+            _ => {
+                self.valid.store(false, Ordering::Relaxed);
+                Err(SystemError::EINVAL.into())
+            }
+        }
+    }
+
+    fn read_at(
+        &self,
+        _: usize,
+        _: usize,
+        _: &mut [u8],
+        _: MutexGuard<FilePrivateData>,
+    ) -> Result<usize, MemoryAllocationError> {
+        Err(SystemError::EINVAL.into())
+    }
+
+    fn write_at(
+        &self,
+        _: usize,
+        _: usize,
+        _: &[u8],
+        _: MutexGuard<FilePrivateData>,
+    ) -> Result<usize, MemoryAllocationError> {
+        // The direct-user hook must own each original legacy invocation.
+        self.valid.store(false, Ordering::Relaxed);
+        Err(SystemError::EINVAL.into())
+    }
+
+    fn metadata(&self) -> Result<Metadata, SystemError> {
+        Ok(anon_inode_metadata(InodeMode::from_bits_truncate(0o600)))
+    }
+    fn fs(&self) -> Arc<dyn FileSystem> {
+        AnonInodeFs::instance()
+    }
+    fn as_any_ref(&self) -> &dyn Any {
+        self
+    }
+}
+
+pub(crate) fn run_legacy_writev_completion() -> Result<bool, MemoryAllocationError> {
+    let mut valid = true;
+    for terminal_error in [false, true] {
+        let root = MemoryAccount::new(0x776604, None)?;
+        let account = MemoryAccount::new(0x776605, Some(root.clone()))?;
+        let inode = Arc::try_new(LegacyWriteProbe {
+            account: account.clone(),
+            observed_file: crate::libs::spinlock::SpinLock::new(None),
+            first_calls: AtomicUsize::new(0),
+            second_calls: AtomicUsize::new(0),
+            valid: AtomicBool::new(true),
+            terminal_error,
+        })
+        .map_err(|_| SystemError::ENOMEM)?;
+        let file = Arc::try_new(File::new(inode.clone(), FileFlags::O_RDWR)?)
+            .map_err(|_| SystemError::ENOMEM)?;
+        let weak = Arc::downgrade(&file);
+        *inode.observed_file.lock() = Some(weak.clone());
+        file.lseek(crate::driver::base::block::SeekFrom::SeekSet(37))?;
+        // These address-only ranges are never dereferenced by this fixture.
+        // No userspace import or copy primitive is replaced for the test.
+        let vectors = [
+            crate::filesystem::vfs::iov::IoVec {
+                iov_base: 0x1000 as *mut u8,
+                iov_len: 3,
+            },
+            crate::filesystem::vfs::iov::IoVec {
+                iov_base: 0x2000 as *mut u8,
+                iov_len: 5,
+            },
+        ];
+        let outcome = {
+            let _position = file.lock_position();
+            file.write_user_legacy_vectors_at(37, &vectors, true)
+        };
+        let expected = if terminal_error { 3 } else { 8 };
+        valid &= matches!(&outcome, Ok(written) if *written == expected)
+            && file.pos() == 37 + expected
+            && inode.first_calls.load(Ordering::Relaxed) == 1
+            && inode.second_calls.load(Ordering::Relaxed) == if terminal_error { 1 } else { 2 }
+            && inode.valid.load(Ordering::Relaxed)
+            && account.current_pages() == 0
+            && root.current_pages() == 0;
+        drop(file);
+        valid &= weak.upgrade().is_none();
+    }
+    Ok(valid)
+}

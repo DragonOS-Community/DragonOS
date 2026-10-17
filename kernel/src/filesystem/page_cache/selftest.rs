@@ -3224,6 +3224,16 @@ pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, S
         }
     }
 
+    match crate::filesystem::vfs::file::selftest::run_legacy_writev_completion() {
+        Ok(true) => {}
+        Ok(false) => return Ok("status=fail stage=legacy_writev_completion\n".into()),
+        Err(error) => {
+            return Ok(alloc::format!(
+                "status=fail stage=legacy_writev_completion error={error:?}\n"
+            ))
+        }
+    }
+
     match crate::filesystem::fs::run_accounting_selftest() {
         Ok(true) => {}
         Ok(false) => return Ok("status=fail stage=memcg_fs_context\n".into()),
@@ -5237,6 +5247,6 @@ pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, S
     }
 
     Ok(fdtable_layout_report + "memcg_noio_reclaim=ok\n" + &alloc::format!(
-        "status=ok\nmemcg_as_body_lifetime=ok\nmemcg_vma_body_lifetime=ok\nmemcg_file_body_lifetime=ok\nfile_write_completion=ok\nfault_cache_snapshot=ok\nmemcg_page_state=ok\nmemcg_reclaim=ok\nmemcg_reclaim_scan_budget=ok\nregistry_churn=ok\nregistry_batch_retire=ok\nregistry_snapshot_lifetime=ok\nregistry_concurrent_snapshot=ok\nramfs_fallocate_range=ok\nwrite_prepare_rollback=ok\npreallocate_rollback=ok\nclean_unlink_liveness=ok\nwriteback_domain_lifecycle=ok\ndetached_read_batch_completion=ok\npreallocated_batch_lifecycle=ok\nfile_membership=ok\nshmem_membership=ok\ndirty_membership=ok\ndirty_incarnation=ok\nremote_dirty_publish=ok\nwriteback_membership=ok\nwriteback_admission_order=ok\nwriteback_submission_token=ok\nwriteback_defer_progress=ok\nwriteback_budget_retry=ok\nsubmitted_writeback=ok\nfault_invalidate_retry_order=ok\ntag_scan_chunk_release=ok\nunevictable_membership=ok\ninflight_teardown=ok\nlate_completion=ok\nglobal_wiring=ok\nlayout=ok\nfile_drop_drift={file_drop_drift}\nshmem_drop_drift={shmem_drop_drift}\ndirty_drop_drift={dirty_drop_drift}\nwriteback_drop_drift={writeback_drop_drift}\nunevictable_drop_drift={unevictable_drop_drift}\nentry_size={entry_size}\nbaseline_size={baseline_size}\n"
+        "status=ok\nmemcg_as_body_lifetime=ok\nmemcg_vma_body_lifetime=ok\nmemcg_file_body_lifetime=ok\nfile_write_completion=ok\nlegacy_writev_completion=ok\nfault_cache_snapshot=ok\nmemcg_page_state=ok\nmemcg_reclaim=ok\nmemcg_reclaim_scan_budget=ok\nregistry_churn=ok\nregistry_batch_retire=ok\nregistry_snapshot_lifetime=ok\nregistry_concurrent_snapshot=ok\nramfs_fallocate_range=ok\nwrite_prepare_rollback=ok\npreallocate_rollback=ok\nclean_unlink_liveness=ok\nwriteback_domain_lifecycle=ok\ndetached_read_batch_completion=ok\npreallocated_batch_lifecycle=ok\nfile_membership=ok\nshmem_membership=ok\ndirty_membership=ok\ndirty_incarnation=ok\nremote_dirty_publish=ok\nwriteback_membership=ok\nwriteback_admission_order=ok\nwriteback_submission_token=ok\nwriteback_defer_progress=ok\nwriteback_budget_retry=ok\nsubmitted_writeback=ok\nfault_invalidate_retry_order=ok\ntag_scan_chunk_release=ok\nunevictable_membership=ok\ninflight_teardown=ok\nlate_completion=ok\nglobal_wiring=ok\nlayout=ok\nfile_drop_drift={file_drop_drift}\nshmem_drop_drift={shmem_drop_drift}\ndirty_drop_drift={dirty_drop_drift}\nwriteback_drop_drift={writeback_drop_drift}\nunevictable_drop_drift={unevictable_drop_drift}\nentry_size={entry_size}\nbaseline_size={baseline_size}\n"
     ))
 }

@@ -2725,9 +2725,9 @@ impl File {
         // No owner currently implements per-operation nonblocking write
         // admission across user faults, locks and allocation. Do not mutate
         // shared O_NONBLOCK or silently fall back to a blocking operation.
+        let write_iter = self.inode.supports_write_iter_flags();
         if flags.contains(WriteRequestFlags::NOWAIT)
-            || (!self.inode.supports_write_iter_flags()
-                && flags.bits() & !WriteRequestFlags::HIPRI.bits() != 0)
+            || (!write_iter && flags.bits() & !WriteRequestFlags::HIPRI.bits() != 0)
         {
             return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
         }
@@ -2738,6 +2738,9 @@ impl File {
         } else {
             WriteSyncIntent::None
         };
+        if !write_iter {
+            return self.write_user_legacy_vectors_at(offset, vectors.iovs(), update_offset);
+        }
         let segments = vectors.user_buffer_segments(len)?;
         let input = unsafe { UserBuffer::new_vectored(&segments, len) };
         self.do_write_user(
@@ -2748,6 +2751,73 @@ impl File {
             flags.contains(WriteRequestFlags::APPEND),
             sync,
         )
+    }
+
+    /// Linux's legacy vector loop: one owner call per current iovec, with
+    /// one successful-prefix publication for the complete syscall. Admission
+    /// and the implicit-position guard belong to the caller.
+    fn write_user_legacy_vectors_at(
+        &self,
+        offset: usize,
+        iovs: &[super::iov::IoVec],
+        update_offset: bool,
+    ) -> Result<usize, SystemError> {
+        let creator = object_for_task(&ProcessManager::current_pcb());
+        let mut total = 0;
+        let mut position = offset;
+        for (index, iov) in iovs.iter().enumerate() {
+            // iov_iter_init retains a leading empty segment. Only advance
+            // after a complete owner call skips subsequent empty segments.
+            if index != 0 && iov.iov_len == 0 {
+                continue;
+            }
+            let input = unsafe {
+                UserBuffer::new(crate::mm::VirtAddr::new(iov.iov_base as usize), iov.iov_len)
+            };
+            // Recovery is scoped to this unpublished segment. An outer retry
+            // would replay earlier successful owner calls.
+            let attempt = Self::recover_io(|| {
+                self.try_do_write_source(
+                    position,
+                    iov.iov_len,
+                    PrimaryWriteSource::User(&input, &creator),
+                    false,
+                    false,
+                    WriteCompletionPolicy {
+                        sync_intent: WriteSyncIntent::None,
+                        emit_data_fsnotify: false,
+                    },
+                )
+            })
+            .and_then(|result| {
+                let next = result.completion.as_ref().map(|completion| {
+                    match completion.config.offset_update {
+                        OffsetUpdate::Add => position + completion.written_len,
+                        OffsetUpdate::StoreEnd => completion.offset + completion.written_len,
+                    }
+                });
+                self.finish_write(result).map(|written| (written, next))
+            });
+            let (written, next) = match attempt {
+                Ok(completed) => completed,
+                Err(_) if total != 0 => break,
+                Err(error) => return Err(error),
+            };
+            total += written;
+            if let Some(next) = next {
+                position = next;
+            }
+            if written != iov.iov_len {
+                break;
+            }
+        }
+        if total != 0 {
+            if update_offset {
+                self.commit_position(position);
+            }
+            self.notify_io_event(FsEvent::MODIFY);
+        }
+        Ok(total)
     }
 
     /// Write one scalar, contiguous userspace input. Vectors use the separate entry.
@@ -3208,9 +3278,9 @@ impl File {
         self.offset.load(Ordering::SeqCst)
     }
 
-    /// Commit a syscall-owned transfer cursor. Stream objects have no file
+    /// Commit a syscall-owned cursor. Stream objects have no file
     /// position. The caller owns the implicit-position transaction.
-    pub(crate) fn commit_transfer_position(&self, position: usize) {
+    pub(crate) fn commit_position(&self, position: usize) {
         if !self.mode().contains(FileMode::FMODE_STREAM) {
             self.offset.store(position, Ordering::SeqCst);
         }

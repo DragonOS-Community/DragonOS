@@ -151,6 +151,18 @@ impl IndexNode for LockedFullInode {
         result.map_err(Into::into)
     }
 
+    fn write_user_buffer_at(
+        &self,
+        _offset: usize,
+        _len: usize,
+        _source: &crate::syscall::user_buffer::UserBuffer<'_>,
+        data: MutexGuard<FilePrivateData>,
+    ) -> Result<Option<usize>, crate::mm::allocation::MemoryAllocationError> {
+        drop(data);
+        // Linux write_full() rejects the operation without touching payload.
+        Err(SystemError::ENOSPC.into())
+    }
+
     fn write_at(
         &self,
         _offset: usize,

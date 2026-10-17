@@ -211,11 +211,11 @@ fn sendfile_transfer(
         if written != 0 {
             // A synchronous write can modify data and still fail. Only its
             // successful result commits the transfer's visible cursors.
-            output.commit_transfer_position(output_position);
+            output.commit_position(output_position);
             if explicit_offset {
                 *position = input_position as i64;
             } else {
-                input.commit_transfer_position(input_position);
+                input.commit_position(input_position);
             }
         }
         if transferred == count || written < read {

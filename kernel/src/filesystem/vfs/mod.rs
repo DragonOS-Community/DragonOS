@@ -1074,6 +1074,14 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         self.user_read_mode() != UserReadMode::Scalar
     }
 
+    /// Whether vector-write flags follow Linux's `.write_iter` contract.
+    /// This describes the selected operation, independently of read flags or
+    /// the strategy used to copy userspace buffers. Legacy `.write` owners
+    /// override this to retain Linux's HIPRI-only vector loop behavior.
+    fn supports_write_iter_flags(&self) -> bool {
+        true
+    }
+
     /// Read directly into a protected userspace buffer.
     ///
     /// The default returns `None`, so ordinary inodes keep using the bounded

@@ -5,7 +5,7 @@ use core::{
 };
 
 use crate::filesystem::fsnotify::{self, FsEvent};
-use alloc::{string::String, sync::Arc};
+use alloc::{string::String, sync::Arc, vec::Vec};
 use log::error;
 use system_error::SystemError;
 
@@ -220,7 +220,7 @@ impl FileOwner {
 }
 
 /// 写操作的配置参数
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 struct WriteConfig {
     /// 是否更新文件偏移量
     update_offset: bool,
@@ -288,17 +288,44 @@ impl WriteSyncIntent {
     }
 }
 
-/// A delegated write reports data progress separately from its sync result.
-///
-/// This preserves Linux's ordering: offset and write side effects are finalized
-/// after a positive write even when the following synchronous flush fails.
+/// Data progress survives sync errors, but successful-write effects do not.
 #[derive(Debug)]
 pub struct DelegatedWriteResult {
     pub written_len: usize,
     pub sync_result: Result<(), MemoryAllocationError>,
-    /// The completed data range, filled by File after dropping its append
-    /// guard. Recovery retries only synchronization, never the primary write.
     pub(crate) sync_range: Option<(usize, usize, bool)>,
+    completion: Option<WriteCompletion>,
+    // Only recoverable sync failures allocate entries for stacking owners.
+    deferred: Vec<(Arc<File>, WriteCompletion)>,
+}
+
+#[derive(Debug)]
+struct WriteCompletion {
+    offset: usize,
+    written_len: usize,
+    config: WriteConfig,
+}
+
+impl DelegatedWriteResult {
+    pub(crate) fn new(written_len: usize, sync_result: Result<(), MemoryAllocationError>) -> Self {
+        Self {
+            written_len,
+            sync_result,
+            sync_range: None,
+            completion: None,
+            deferred: Vec::new(),
+        }
+    }
+}
+
+bitflags::bitflags! {
+    struct WriteRequestFlags: u32 {
+        const HIPRI = 1;
+        const DSYNC = 2;
+        const SYNC = 4;
+        const NOWAIT = 8;
+        const APPEND = 16;
+    }
 }
 /// Namespace fd backing data, typically created from /proc/thread-self/ns/* files.
 #[derive(Clone)]
@@ -995,6 +1022,11 @@ impl File {
     ) -> Result<(), MemoryAllocationError> {
         let inode = self.inode();
         let sync_result = inode.sync_file_range(start, end, datasync, self.private_data.lock());
+        // Charge is an internal retry, not the final fsync result. Preserve
+        // the OFD cursor until synchronization reaches a terminal result.
+        if matches!(&sync_result, Err(MemoryAllocationError::Charge(_))) {
+            return sync_result;
+        }
         let wb_result = match inode.page_cache() {
             Some(page_cache) => self.check_and_advance_wb_error(&page_cache),
             None => Ok(()),
@@ -1132,7 +1164,7 @@ impl File {
     }
 
     #[inline(never)]
-    fn write_source_at_and_finalize(
+    fn write_source_at(
         &self,
         actual_offset: usize,
         actual_len: usize,
@@ -1141,7 +1173,7 @@ impl File {
     ) -> Result<DelegatedWriteResult, MemoryAllocationError> {
         if let PrimaryWriteSource::User(input, _) = source {
             if let Some(result) =
-                self.write_user_buffer_at_and_finalize(actual_offset, actual_len, input, config)?
+                self.write_user_buffer_at(actual_offset, actual_len, input, config)?
             {
                 return Ok(result);
             }
@@ -1152,47 +1184,41 @@ impl File {
             }
         };
         let mut stage = WritePrivilegeStage::new(&mut publish);
-        let (written_len, sync_result, sync_range) = match self.post_write_sync {
+        let mut result = match self.post_write_sync {
             PostWriteSyncPolicy::Delegated => {
-                let result = self.inode.write_primary_with_sync_with_privilege_stage(
+                self.inode.write_primary_with_sync_with_privilege_stage(
                     actual_offset,
                     actual_len,
                     source,
                     config.sync_intent,
                     self.private_data.lock(),
                     &mut stage,
-                )?;
-                (result.written_len, result.sync_result, result.sync_range)
+                )?
             }
-            PostWriteSyncPolicy::Generic | PostWriteSyncPolicy::NotApplicable => (
-                self.inode.write_primary_with_privilege_stage(
-                    actual_offset,
-                    actual_len,
-                    source,
-                    self.private_data.lock(),
-                    &mut stage,
-                )?,
-                Ok(()),
-                None,
-            ),
+            PostWriteSyncPolicy::Generic | PostWriteSyncPolicy::NotApplicable => {
+                DelegatedWriteResult::new(
+                    self.inode.write_primary_with_privilege_stage(
+                        actual_offset,
+                        actual_len,
+                        source,
+                        self.private_data.lock(),
+                        &mut stage,
+                    )?,
+                    Ok(()),
+                )
+            }
         };
-        let written_len =
-            self.finalize_write(actual_offset, written_len, config, stage.handled())?;
-        Ok(DelegatedWriteResult {
-            written_len,
-            sync_result,
-            sync_range,
-        })
+        self.prepare_write_completion(&mut result, actual_offset, config, stage.handled());
+        Ok(result)
     }
 
-    fn write_user_buffer_at_and_finalize(
+    fn write_user_buffer_at(
         &self,
         offset: usize,
         len: usize,
         input: &UserBuffer<'_>,
         config: WriteConfig,
     ) -> Result<Option<DelegatedWriteResult>, MemoryAllocationError> {
-        // Delegated native providers own their privilege and sync transaction.
         if self.post_write_sync == PostWriteSyncPolicy::Delegated {
             return Ok(None);
         }
@@ -1205,54 +1231,66 @@ impl File {
         if written > len {
             return Err(SystemError::EIO.into());
         }
-        let written_len = self.finalize_write(offset, written, config, false)?;
-        Ok(Some(DelegatedWriteResult {
-            written_len,
-            sync_result: Ok(()),
-            sync_range: None,
-        }))
+        let mut result = DelegatedWriteResult::new(written, Ok(()));
+        self.prepare_write_completion(&mut result, offset, config, false);
+        Ok(Some(result))
     }
 
-    fn finalize_write(
+    fn prepare_write_completion(
         &self,
-        actual_offset: usize,
-        written_len: usize,
+        result: &mut DelegatedWriteResult,
+        offset: usize,
         config: WriteConfig,
         privileges_handled: bool,
-    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
-        let mode_changed =
-            !privileges_handled && written_len > 0 && self.maybe_kill_suid_sgid_after_write()?;
+    ) {
+        if result.written_len == 0 {
+            return;
+        }
+        if !privileges_handled {
+            match self.maybe_kill_suid_sgid_after_write() {
+                Ok(true) => {
+                    if !self.mode().contains(FileMode::FMODE_NONOTIFY) {
+                        self.notify_fs_event(FsEvent::ATTRIB);
+                    }
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    // Data is already committed. Never let a metadata Charge
+                    // escape to the primary-write recovery loop and replay it.
+                    result.sync_result = Err(match error {
+                        MemoryAllocationError::Charge(_) => SystemError::ENOMEM.into(),
+                        error => error,
+                    });
+                    return;
+                }
+            }
+        }
+        result.completion = Some(WriteCompletion {
+            offset,
+            written_len: result.written_len,
+            config,
+        });
+    }
 
-        if config.update_offset && written_len > 0 {
+    fn publish_write_completion(&self, completion: WriteCompletion) {
+        let WriteCompletion {
+            offset,
+            written_len,
+            config,
+        } = completion;
+        if config.update_offset {
             match config.offset_update {
                 OffsetUpdate::StoreEnd => {
-                    self.offset.store(
-                        actual_offset + written_len,
-                        core::sync::atomic::Ordering::SeqCst,
-                    );
+                    self.offset.store(offset + written_len, Ordering::SeqCst);
                 }
                 OffsetUpdate::Add => {
-                    self.offset
-                        .fetch_add(written_len, core::sync::atomic::Ordering::SeqCst);
+                    self.offset.fetch_add(written_len, Ordering::SeqCst);
                 }
             }
         }
-
-        // fsnotify: deliver IN_MODIFY after a successful write (FMODE_NONOTIFY short-circuits, preventing inotify fd recursion).
-        if written_len > 0
-            && fsnotify::has_any_watch()
-            && !self.mode.read().contains(FileMode::FMODE_NONOTIFY)
-        {
-            // Linux publishes the ATTR_MODE change from file_remove_privs
-            // before the successful write's MODIFY event.
-            if mode_changed {
-                self.notify_fs_event(FsEvent::ATTRIB);
-            }
-            if config.emit_data_fsnotify {
-                self.notify_fs_event(FsEvent::MODIFY);
-            }
+        if config.emit_data_fsnotify {
+            self.notify_io_event(FsEvent::MODIFY);
         }
-        Ok(written_len)
     }
     /// @brief 创建一个新的文件对象
     ///
@@ -2108,7 +2146,7 @@ impl File {
     /// - `Ok(usize)`: 成功写入的字节数
     pub fn pwrite(&self, offset: usize, len: usize, buf: &[u8]) -> Result<usize, SystemError> {
         let result = Self::recover_io(|| {
-            self.pwrite_with_sync_intent(offset, len, buf, WriteSyncIntent::None)
+            self.pwrite_with_sync_intent_and_fsnotify(offset, len, buf, WriteSyncIntent::None, true)
         })?;
         self.finish_write(result)
     }
@@ -2119,13 +2157,32 @@ impl File {
     /// Data progress is returned separately from the synchronization result so
     /// stacking filesystems can preserve write side effects when fsync fails.
     pub fn pwrite_with_sync_intent(
-        &self,
+        self: &Arc<Self>,
         offset: usize,
         len: usize,
         buf: &[u8],
         requested_sync: WriteSyncIntent,
-    ) -> Result<DelegatedWriteResult, crate::mm::allocation::MemoryAllocationError> {
-        self.pwrite_with_sync_intent_and_fsnotify(offset, len, buf, requested_sync, true)
+    ) -> Result<DelegatedWriteResult, MemoryAllocationError> {
+        let mut result =
+            self.pwrite_with_sync_intent_and_fsnotify(offset, len, buf, requested_sync, true)?;
+        match &result.sync_result {
+            Ok(()) => self.complete_write_success(&mut result),
+            Err(MemoryAllocationError::System(_)) => {
+                result.completion = None;
+                result.deferred.clear();
+            }
+            Err(MemoryAllocationError::Charge(_)) => {
+                if let Some(completion) = result.completion.take() {
+                    if result.deferred.try_reserve(1).is_err() {
+                        result.sync_result = Err(SystemError::ENOMEM.into());
+                        result.deferred.clear();
+                    } else {
+                        result.deferred.push((self.clone(), completion));
+                    }
+                }
+            }
+        }
+        Ok(result)
     }
 
     fn pwrite_with_sync_intent_and_fsnotify(
@@ -2514,7 +2571,7 @@ impl File {
                 let actual_offset = md.size.max(0) as usize;
                 let actual_len = self.limit_primary_write_len(file_type, actual_offset, len)?;
 
-                self.write_source_at_and_finalize(
+                self.write_source_at(
                     actual_offset,
                     actual_len,
                     source,
@@ -2531,6 +2588,7 @@ impl File {
                 Some(domain) => with_inode_append_lock(domain.key(&md), append_write),
                 None => append_write(),
             }?;
+            let mut effective_sync = sync_intent;
             if result.sync_result.is_ok() {
                 // generic_write_sync() observes IS_SYNC after the write.
                 // Re-sample the cheap mount atomic here while reusing the
@@ -2538,20 +2596,21 @@ impl File {
                 let current_sync_intent = self
                     .post_write_sync_intent(flags, inode_flags)
                     .combine(completion.sync_intent);
+                effective_sync = current_sync_intent;
                 result.sync_result = self.generic_sync_after_write(
                     actual_offset,
                     result.written_len,
                     current_sync_intent,
                 );
             }
-            Self::set_completed_sync_range(&mut result, actual_offset, sync_intent);
+            Self::set_completed_sync_range(&mut result, actual_offset, effective_sync);
             return Ok(result);
         }
 
         let actual_offset = offset;
         let actual_len = self.limit_primary_write_len(file_type, actual_offset, len)?;
 
-        let mut result = self.write_source_at_and_finalize(
+        let mut result = self.write_source_at(
             actual_offset,
             actual_len,
             source,
@@ -2562,17 +2621,19 @@ impl File {
                 emit_data_fsnotify: completion.emit_data_fsnotify,
             },
         )?;
+        let mut effective_sync = sync_intent;
         if result.sync_result.is_ok() {
             let current_sync_intent = self
                 .post_write_sync_intent(flags, inode_flags)
                 .combine(completion.sync_intent);
+            effective_sync = current_sync_intent;
             result.sync_result = self.generic_sync_after_write(
                 actual_offset,
                 result.written_len,
                 current_sync_intent,
             );
         }
-        Self::set_completed_sync_range(&mut result, actual_offset, sync_intent);
+        Self::set_completed_sync_range(&mut result, actual_offset, effective_sync);
         Ok(result)
     }
 
@@ -2583,6 +2644,7 @@ impl File {
         input: &UserBuffer<'_>,
         update_offset: bool,
         force_append: bool,
+        requested_sync: WriteSyncIntent,
     ) -> Result<usize, SystemError> {
         let creator = object_for_task(&ProcessManager::current_pcb());
         let result = Self::recover_io(|| {
@@ -2593,7 +2655,7 @@ impl File {
                 update_offset,
                 force_append,
                 WriteCompletionPolicy {
-                    sync_intent: WriteSyncIntent::None,
+                    sync_intent: requested_sync,
                     emit_data_fsnotify: true,
                 },
             )
@@ -2622,17 +2684,25 @@ impl File {
         self.verify_pwrite_access()?;
         self.writeable()?;
         self.verify_pread_range(offset, len)?;
-        self.do_write_user(offset, len, input, false, false)
+        self.do_write_user(offset, len, input, false, false, WriteSyncIntent::None)
     }
 
     pub(crate) fn pwrite_user_vectored(
         &self,
         offset: usize,
         vectors: &super::iov::IoVecs,
-        force_append: bool,
+    ) -> Result<usize, SystemError> {
+        self.pwrite_user_vectored_with_flags(offset, vectors, 0)
+    }
+
+    pub(crate) fn pwrite_user_vectored_with_flags(
+        &self,
+        offset: usize,
+        vectors: &super::iov::IoVecs,
+        flags: u32,
     ) -> Result<usize, SystemError> {
         self.verify_pwrite_access()?;
-        self.write_user_vectors_at(offset, vectors, false, force_append)
+        self.write_user_vectors_at(offset, vectors, false, flags)
     }
 
     fn write_user_vectors_at(
@@ -2640,21 +2710,44 @@ impl File {
         offset: usize,
         vectors: &super::iov::IoVecs,
         update_offset: bool,
-        force_append: bool,
+        raw_flags: u32,
     ) -> Result<usize, SystemError> {
         self.writeable()?;
         let len = vectors.total_len();
-        // Linux vector I/O stops here; scalar zero-length writes still reach
-        // owners such as datagram sockets.
         if len == 0 {
             return Ok(0);
         }
         if !self.mode().contains(FileMode::FMODE_STREAM) {
             self.verify_pread_range(offset, len)?;
         }
+        let flags =
+            WriteRequestFlags::from_bits(raw_flags).ok_or(SystemError::EOPNOTSUPP_OR_ENOTSUP)?;
+        // No owner currently implements per-operation nonblocking write
+        // admission across user faults, locks and allocation. Do not mutate
+        // shared O_NONBLOCK or silently fall back to a blocking operation.
+        if flags.contains(WriteRequestFlags::NOWAIT)
+            || (!self.inode.supports_write_iter_flags()
+                && flags.bits() & !WriteRequestFlags::HIPRI.bits() != 0)
+        {
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        }
+        let sync = if flags.contains(WriteRequestFlags::SYNC) {
+            WriteSyncIntent::Full
+        } else if flags.contains(WriteRequestFlags::DSYNC) {
+            WriteSyncIntent::Data
+        } else {
+            WriteSyncIntent::None
+        };
         let segments = vectors.user_buffer_segments(len)?;
         let input = unsafe { UserBuffer::new_vectored(&segments, len) };
-        self.do_write_user(offset, len, &input, update_offset, force_append)
+        self.do_write_user(
+            offset,
+            len,
+            &input,
+            update_offset,
+            flags.contains(WriteRequestFlags::APPEND),
+            sync,
+        )
     }
 
     /// Write one scalar, contiguous userspace input. Vectors use the separate entry.
@@ -2669,7 +2762,7 @@ impl File {
 
         // Verify the original scalar count before MAX_RW_COUNT admission.
         self.verify_read_range(input.len())?;
-        self.do_write_user(offset, len, input, !stream, false)
+        self.do_write_user(offset, len, input, !stream, false, WriteSyncIntent::None)
     }
 
     /// Preserve vector provenance until the owner chooses its copy units.
@@ -2677,13 +2770,13 @@ impl File {
         &self,
         vectors: &super::iov::IoVecs,
     ) -> Result<usize, SystemError> {
-        self.write_user_vectored_with_append(vectors, false)
+        self.write_user_vectored_with_flags(vectors, 0)
     }
 
-    pub(crate) fn write_user_vectored_with_append(
+    pub(crate) fn write_user_vectored_with_flags(
         &self,
         vectors: &super::iov::IoVecs,
-        force_append: bool,
+        flags: u32,
     ) -> Result<usize, SystemError> {
         let _position = self.lock_position();
         let stream = self.mode().contains(FileMode::FMODE_STREAM);
@@ -2692,7 +2785,7 @@ impl File {
         } else {
             self.offset.load(Ordering::SeqCst)
         };
-        self.write_user_vectors_at(offset, vectors, !stream, force_append)
+        self.write_user_vectors_at(offset, vectors, !stream, flags)
     }
 
     /// @brief 获取文件的元数据

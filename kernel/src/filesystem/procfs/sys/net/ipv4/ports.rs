@@ -59,6 +59,10 @@ impl PortFileOps {
 }
 
 impl FileOps for PortFileOps {
+    fn supports_write_iter_flags(&self) -> bool {
+        true
+    }
+
     fn validate_inode(&self) -> Result<(), SystemError> {
         self.namespace.upgrade().map(|_| ())
     }

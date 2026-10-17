@@ -214,8 +214,8 @@ fn do_splice(
                 file_in.notify_io_event(FsEvent::ACCESS);
             }
             (true, false) => {
-                // The held-pipe path publishes its actual prefix before sync,
-                // including sync failure; do not duplicate those notifications.
+                // The held-pipe path publishes only after successful completion;
+                // do not duplicate those notifications.
             }
             (false, false) => unreachable!(),
         }
@@ -421,10 +421,10 @@ fn splice_pipe_to_file(
         let actor = crate::cgroup::memory::object_for_task(&ProcessManager::current_pcb());
         crate::ipc::pipe::buffer::PipeBuffer::try_new_bytes(buf_size, &actor)
     })?;
-    let result = File::recover_io(|| {
+    let written = File::recover_io(|| {
         let read = pipe_inode.splice_peek_hold_from_blocking(buf_size, &mut buffer, nonblock)?;
         if read == 0 {
-            return Ok(None);
+            return Ok(0);
         }
         let _position_guard = if offset.is_none() {
             file.lock_position()
@@ -432,16 +432,20 @@ fn splice_pipe_to_file(
             None
         };
         let write_offset = offset.unwrap_or_else(|| file.pos());
-        // Always release the logical hold, including errors in the position
-        // dependent checks. No pipe bytes are consumed until a write succeeds.
+        // Retain the same pipe head and position until synchronous completion.
+        // Unpublished primary failures release the hold before recovery.
         let attempt = (|| {
             let allowed = splice_write_limit(file, write_offset, read)?;
             file.try_write_for_transfer(write_offset, allowed, &buffer[..allowed], offset.is_none())
         })();
         match attempt {
             Ok(result) => {
-                pipe_inode.splice_finish_hold(result.written_len);
-                Ok(Some(result))
+                // Reclaim must not depend on the reserved pipe head. A sync
+                // allocation failure is terminal here; never replay its data
+                // or release and reacquire a potentially different head.
+                let completed = file.finish_write_no_recovery(result);
+                pipe_inode.splice_finish_hold(completed.as_ref().copied().unwrap_or(0));
+                completed.map_err(Into::into)
             }
             Err(error) => {
                 pipe_inode.splice_finish_hold(0);
@@ -449,16 +453,11 @@ fn splice_pipe_to_file(
             }
         }
     })?;
-    match result {
-        Some(result) => {
-            if result.written_len > 0 {
-                file.notify_io_event(FsEvent::MODIFY);
-                pipe.notify_io_event(FsEvent::ACCESS);
-            }
-            file.finish_write(result)
-        }
-        None => Ok(0),
+    if written > 0 {
+        file.notify_io_event(FsEvent::MODIFY);
+        pipe.notify_io_event(FsEvent::ACCESS);
     }
+    Ok(written)
 }
 
 /// Apply the regular-file size limit to a snapshotted output position.

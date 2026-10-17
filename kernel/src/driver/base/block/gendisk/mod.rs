@@ -328,7 +328,10 @@ impl IndexNode for GenDisk {
         if let Some(loop_device) = BlockDevice::as_any_ref(&*device).downcast_ref::<LoopDevice>() {
             return loop_device
                 .try_write_bytes_operation(disk_offset, len, &buf[..len], WriteSyncIntent::None)
-                .map(|result| result.written_len);
+                .and_then(|result| {
+                    result.sync_result?;
+                    Ok(result.written_len)
+                });
         }
         device
             .write_at_bytes(disk_offset, len, &buf[..len])

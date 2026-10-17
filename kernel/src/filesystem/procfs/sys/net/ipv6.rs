@@ -141,6 +141,10 @@ impl ForwardingFileOps {
 }
 
 impl FileOps for ForwardingFileOps {
+    fn supports_write_iter_flags(&self) -> bool {
+        true
+    }
+
     fn read_at(
         &self,
         offset: usize,

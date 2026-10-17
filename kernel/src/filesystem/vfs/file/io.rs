@@ -13,8 +13,13 @@ impl File {
         // A loop backing OFD may itself request O_SYNC even when its outer
         // block-device File does not. Retain that intent but translate the
         // range back to this File's coordinate system exactly once.
-        let datasync = match intent {
-            super::WriteSyncIntent::None => result.sync_range.map(|(_, _, datasync)| datasync),
+        let inherited = match result.sync_range {
+            Some((_, _, false)) => super::WriteSyncIntent::Full,
+            Some((_, _, true)) => super::WriteSyncIntent::Data,
+            None => super::WriteSyncIntent::None,
+        };
+        let datasync = match intent.combine(inherited) {
+            super::WriteSyncIntent::None => None,
             super::WriteSyncIntent::Data => Some(true),
             super::WriteSyncIntent::Full => Some(false),
         };
@@ -57,20 +62,51 @@ impl File {
         }
     }
 
-    /// Data and its notifications/f_pos have already committed. Do not invoke
-    /// the primary write again when a stacked backing's sync needs admission.
-    pub(crate) fn finish_write(&self, result: DelegatedWriteResult) -> Result<usize, SystemError> {
+    /// Called with resource guards released, retaining the caller's OFD
+    /// position mutex. Only synchronization may be retried after data commits.
+    pub(crate) fn finish_write(
+        &self,
+        mut result: DelegatedWriteResult,
+    ) -> Result<usize, SystemError> {
         let mut recovery = ChargeRecoveryState::default();
-        let mut sync = result.sync_result;
         loop {
-            match sync {
-                Ok(()) => return Ok(result.written_len),
+            match core::mem::replace(&mut result.sync_result, Ok(())) {
+                Ok(()) => {
+                    self.complete_write_success(&mut result);
+                    return Ok(result.written_len);
+                }
                 Err(error) => error.recover(&mut recovery)?,
             }
             let (start, end, datasync) = result
                 .sync_range
                 .expect("a completed synchronous File write retains its exact range");
-            sync = self.try_sync_range_and_check_wb_error(start, end, datasync);
+            result.sync_result = self.try_sync_range_and_check_wb_error(start, end, datasync);
+        }
+    }
+
+    /// Finish while a provider retains a resource transaction (e.g. pipe
+    /// hold or copy-up). Reclaim must not run under that transaction.
+    pub(crate) fn finish_write_no_recovery(
+        &self,
+        mut result: DelegatedWriteResult,
+    ) -> Result<usize, SystemError> {
+        match core::mem::replace(&mut result.sync_result, Ok(())) {
+            Ok(()) => {
+                self.complete_write_success(&mut result);
+                Ok(result.written_len)
+            }
+            Err(MemoryAllocationError::System(error)) => Err(error),
+            Err(MemoryAllocationError::Charge(_)) => Err(SystemError::ENOMEM),
+        }
+    }
+
+    pub(crate) fn complete_write_success(&self, result: &mut DelegatedWriteResult) {
+        debug_assert!(result.sync_result.is_ok());
+        for (file, completion) in result.deferred.drain(..) {
+            file.publish_write_completion(completion);
+        }
+        if let Some(completion) = result.completion.take() {
+            self.publish_write_completion(completion);
         }
     }
 }

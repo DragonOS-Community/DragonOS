@@ -87,6 +87,10 @@ impl MountMaxFileOps {
 }
 
 impl FileOps for MountMaxFileOps {
+    fn supports_write_iter_flags(&self) -> bool {
+        true
+    }
+
     fn read_at(
         &self,
         offset: usize,
@@ -143,6 +147,10 @@ impl NrOpenFileOps {
 }
 
 impl FileOps for NrOpenFileOps {
+    fn supports_write_iter_flags(&self) -> bool {
+        true
+    }
+
     fn read_at(
         &self,
         offset: usize,
@@ -190,6 +198,10 @@ impl SuidDumpableFileOps {
 }
 
 impl FileOps for SuidDumpableFileOps {
+    fn supports_write_iter_flags(&self) -> bool {
+        true
+    }
+
     fn read_at(
         &self,
         offset: usize,

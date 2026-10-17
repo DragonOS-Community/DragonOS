@@ -268,24 +268,23 @@ fn copy_file_range_impl(
             Err(_) if total_copied > 0 => break,
             Err(error) => return Err(error),
         };
-        let written = completed.written_len;
-        let previous_copied = total_copied;
+        let written = match out_file.finish_write(completed) {
+            Ok(written) => written,
+            Err(error) => {
+                if total_copied == 0 {
+                    completion_error = Some(error);
+                }
+                break;
+            }
+        };
         total_copied += written;
         current_pos_in += written;
         current_pos_out += written;
-        // Primary data has committed even when the following sync fails.
-        // Publish both cursors before entering synchronization recovery.
         if use_in_file_offset {
             in_file.commit_transfer_position(current_pos_in);
         }
         if use_out_file_offset {
             out_file.commit_transfer_position(current_pos_out);
-        }
-        if let Err(error) = out_file.finish_write(completed) {
-            if previous_copied == 0 {
-                completion_error = Some(error);
-            }
-            break;
         }
         if written < read_len {
             break;

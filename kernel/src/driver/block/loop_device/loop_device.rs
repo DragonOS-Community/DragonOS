@@ -1116,7 +1116,10 @@ impl IndexNode for LoopDevice {
             return Err(SystemError::E2BIG.into());
         }
         self.try_write_bytes_operation(offset, len, &buf[..len], WriteSyncIntent::None)
-            .map(|result| result.written_len)
+            .and_then(|result| {
+                result.sync_result?;
+                Ok(result.written_len)
+            })
     }
 
     fn list(&self) -> Result<alloc::vec::Vec<alloc::string::String>, system_error::SystemError> {
@@ -1404,11 +1407,7 @@ impl LoopDevice {
             return Err(SystemError::EINVAL.into());
         }
         if len == 0 {
-            return Ok(DelegatedWriteResult {
-                written_len: 0,
-                sync_result: Ok(()),
-                sync_range: None,
-            });
+            return Ok(DelegatedWriteResult::new(0, Ok(())));
         }
 
         // This guard and retained File snapshot cover both write and optional
@@ -1441,6 +1440,11 @@ impl LoopDevice {
                 backing_file.try_sync_range_and_check_wb_error(start, end, datasync);
         }
         result.sync_result = Self::normalize_backing_sync_result(result.sync_result);
+        if result.sync_result.is_ok() {
+            // The retained backing and active I/O generation own these
+            // completions, including any nested synchronization recovery.
+            backing_file.complete_write_success(&mut result);
+        }
         Ok(result)
     }
 
@@ -1587,7 +1591,10 @@ impl BlockDevice for LoopDevice {
             .checked_mul(LBA_SIZE)
             .ok_or(SystemError::EOVERFLOW)?;
         self.try_write_bytes_operation(block_offset, len, buf, WriteSyncIntent::None)
-            .map(|result| result.written_len)
+            .and_then(|result| {
+                result.sync_result?;
+                Ok(result.written_len)
+            })
             .map_err(Self::legacy_io_terminal)
     }
 

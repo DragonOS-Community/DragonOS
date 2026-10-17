@@ -130,6 +130,10 @@ impl KeySettingFileOps {
 }
 
 impl FileOps for KeySettingFileOps {
+    fn supports_write_iter_flags(&self) -> bool {
+        true
+    }
+
     fn read_at(
         &self,
         offset: usize,

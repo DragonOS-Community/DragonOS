@@ -193,29 +193,30 @@ fn sendfile_transfer(
                 }
             }
         };
-        let written = result.written_len;
-        let had_progress = transferred != 0;
+        let written = match output.finish_write(result) {
+            Ok(written) => written,
+            Err(error) => {
+                break if transferred > 0 {
+                    Ok(transferred)
+                } else {
+                    Err(error)
+                };
+            }
+        };
         transferred += written;
         input_position += written;
         if !output_stream {
             output_position += written;
         }
         if written != 0 {
-            // Data has committed even if its following synchronous flush
-            // fails. Never replay it or lose the real cursor progress.
+            // A synchronous write can modify data and still fail. Only its
+            // successful result commits the transfer's visible cursors.
             output.commit_transfer_position(output_position);
             if explicit_offset {
                 *position = input_position as i64;
             } else {
                 input.commit_transfer_position(input_position);
             }
-        }
-        if let Err(error) = output.finish_write(result) {
-            break if had_progress {
-                Ok(transferred)
-            } else {
-                Err(error)
-            };
         }
         if transferred == count || written < read {
             break Ok(transferred);

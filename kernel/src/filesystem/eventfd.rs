@@ -154,6 +154,10 @@ impl PollableInode for EventFdInode {
 }
 
 impl IndexNode for EventFdInode {
+    fn supports_write_iter_flags(&self) -> bool {
+        false
+    }
+
     fn configure_open_file(&self, _data: &FilePrivateData, behavior: &mut OpenFileBehavior) {
         behavior.post_write_sync = PostWriteSyncPolicy::NotApplicable;
     }

@@ -58,6 +58,7 @@ jobs:
           normal/preadv2_flags
           normal/pwritev2_flags
           normal/pwritev2_sync
+          normal/legacy_writev_semantics
           normal/page_cache_accounting
           normal/vector_write_privileges
           normal/write_capability_admission

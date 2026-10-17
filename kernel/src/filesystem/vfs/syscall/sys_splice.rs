@@ -367,7 +367,7 @@ fn try_splice_read_to_pipe(
         Ok(write_len) => {
             *position += write_len;
             if implicit_position {
-                file.commit_transfer_position(*position);
+                file.commit_position(*position);
             }
             Ok(write_len)
         }

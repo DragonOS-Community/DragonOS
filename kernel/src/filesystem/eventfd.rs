@@ -99,10 +99,49 @@ impl EventFdInode {
         let pollflag = EPollEventType::from_bits_truncate(self.do_poll(data, &eventfd)? as u32);
         drop(eventfd);
 
+        self.wait_queue.wakeup_all(None);
         // 唤醒epoll中等待的进程
         EventPoll::wakeup_epoll(&self.epitems, pollflag)?;
 
         Ok(val)
+    }
+
+    /// Counter admission, waiting and readiness publication shared by kernel
+    /// and protected userspace writes. No File private-data guard is retained.
+    fn write_counter(&self, val: u64, data: &FilePrivateData) -> Result<usize, SystemError> {
+        if val == u64::MAX {
+            return Err(SystemError::EINVAL);
+        }
+        let pollflag;
+        loop {
+            let mut eventfd = self.eventfd.lock();
+            // Allow write when count + val <= EVENTFD_MAX.
+            if EVENTFD_MAX.saturating_sub(eventfd.count) >= val {
+                eventfd.count += val;
+                pollflag = EPollEventType::from_bits_truncate(self.do_poll(data, &eventfd)? as u32);
+                break;
+            }
+            if eventfd.flags.contains(EventFdFlags::EFD_NONBLOCK) {
+                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+            }
+            drop(eventfd);
+            if ProcessManager::current_pcb().has_pending_signal() {
+                return Err(SystemError::ERESTARTSYS);
+            }
+            // 等待计数下降（被 read 消费）
+            self.wait_queue.wait_event_interruptible(
+                || {
+                    let ev = self.eventfd.lock();
+                    EVENTFD_MAX.saturating_sub(ev.count) >= val
+                },
+                None::<fn()>,
+            )?;
+        }
+        self.wait_queue.wakeup_all(None);
+
+        // 唤醒epoll中等待的进程
+        EventPoll::wakeup_epoll(&self.epitems, pollflag)?;
+        return Ok(8);
     }
 
     fn readable(&self) -> bool {
@@ -242,47 +281,33 @@ impl IndexNode for EventFdInode {
         buf: &[u8],
         data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
-        let result: core::result::Result<_, system_error::SystemError> = (|| {
-            if len < 8 {
-                return Err(SystemError::EINVAL);
-            }
-            let val = u64::from_ne_bytes(buf[..8].try_into().unwrap());
-            if val == u64::MAX {
-                return Err(SystemError::EINVAL);
-            }
-            let pollflag;
-            loop {
-                let mut eventfd = self.eventfd.lock();
-                // Allow write when count + val <= EVENTFD_MAX.
-                if EVENTFD_MAX.saturating_sub(eventfd.count) >= val {
-                    eventfd.count += val;
-                    pollflag =
-                        EPollEventType::from_bits_truncate(self.do_poll(&data, &eventfd)? as u32);
-                    break;
-                }
-                if eventfd.flags.contains(EventFdFlags::EFD_NONBLOCK) {
-                    return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-                }
-                drop(eventfd);
-                if ProcessManager::current_pcb().has_pending_signal() {
-                    return Err(SystemError::ERESTARTSYS);
-                }
-                // 等待计数下降（被 read 消费）
-                self.wait_queue.wait_event_interruptible(
-                    || {
-                        let ev = self.eventfd.lock();
-                        EVENTFD_MAX.saturating_sub(ev.count) >= val
-                    },
-                    None::<fn()>,
-                )?;
-            }
-            self.wait_queue.wakeup_all(None);
+        let snapshot = data.clone();
+        drop(data);
+        if len < 8 || buf.len() < 8 {
+            return Err(SystemError::EINVAL.into());
+        }
+        let value = u64::from_ne_bytes(buf[..8].try_into().unwrap());
+        self.write_counter(value, &snapshot).map_err(Into::into)
+    }
 
-            // 唤醒epoll中等待的进程
-            EventPoll::wakeup_epoll(&self.epitems, pollflag)?;
-            return Ok(8);
-        })();
-        result.map_err(Into::into)
+    fn write_user_buffer_at(
+        &self,
+        _offset: usize,
+        len: usize,
+        source: &UserBuffer<'_>,
+        data: MutexGuard<FilePrivateData>,
+    ) -> Result<Option<usize>, crate::mm::allocation::MemoryAllocationError> {
+        let snapshot = data.clone();
+        drop(data);
+        // eventfd_write() checks count before copying exactly one record.
+        if len < 8 {
+            return Err(SystemError::EINVAL.into());
+        }
+        let mut bytes = [0; 8];
+        source.read_from_user(0, &mut bytes)?;
+        self.write_counter(u64::from_ne_bytes(bytes), &snapshot)
+            .map(Some)
+            .map_err(Into::into)
     }
 
     fn metadata(&self) -> Result<Metadata, SystemError> {

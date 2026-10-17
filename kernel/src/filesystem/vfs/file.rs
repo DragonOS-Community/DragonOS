@@ -76,7 +76,7 @@ use crate::{
         resource::RLimitID,
         ProcessControlBlock, ProcessManager, RawPid,
     },
-    syscall::{user_access::UserBufferReader, user_buffer::UserBuffer},
+    syscall::user_buffer::UserBuffer,
 };
 
 use crate::filesystem::vfs::InodeMode;
@@ -148,6 +148,10 @@ fn is_plain_special_inode(inode: &Arc<dyn IndexNode>) -> bool {
         || inode
             .as_any_ref()
             .downcast_ref::<LockedFATInode>()
+            .is_some()
+        || inode
+            .as_any_ref()
+            .downcast_ref::<crate::filesystem::overlayfs::OvlInode>()
             .is_some()
 }
 
@@ -1055,13 +1059,13 @@ impl File {
     }
 
     #[inline(never)]
-    fn limit_write_len_by_fsize(
+    pub(crate) fn limit_write_len_by_fsize(
         &self,
         file_type: FileType,
         offset: usize,
         len: usize,
     ) -> Result<usize, SystemError> {
-        if !matches!(file_type, FileType::File) {
+        if len == 0 || !matches!(file_type, FileType::File) {
             return Ok(len);
         }
         let current_pcb = ProcessManager::current_pcb();
@@ -1128,13 +1132,20 @@ impl File {
     }
 
     #[inline(never)]
-    fn write_at_and_finalize_split(
+    fn write_source_at_and_finalize(
         &self,
         actual_offset: usize,
         actual_len: usize,
-        buf: &[u8],
+        source: PrimaryWriteSource<'_, '_>,
         config: WriteConfig,
-    ) -> Result<DelegatedWriteResult, crate::mm::allocation::MemoryAllocationError> {
+    ) -> Result<DelegatedWriteResult, MemoryAllocationError> {
+        if let PrimaryWriteSource::User(input, _) = source {
+            if let Some(result) =
+                self.write_user_buffer_at_and_finalize(actual_offset, actual_len, input, config)?
+            {
+                return Ok(result);
+            }
+        }
         let mut publish = || {
             if !self.mode.read().contains(FileMode::FMODE_NONOTIFY) {
                 self.notify_dentry_event(FsEvent::ATTRIB);
@@ -1143,107 +1154,33 @@ impl File {
         let mut stage = WritePrivilegeStage::new(&mut publish);
         let (written_len, sync_result, sync_range) = match self.post_write_sync {
             PostWriteSyncPolicy::Delegated => {
-                let result = self.inode.write_at_with_sync_with_privilege_stage(
+                let result = self.inode.write_primary_with_sync_with_privilege_stage(
                     actual_offset,
                     actual_len,
-                    buf,
+                    source,
                     config.sync_intent,
                     self.private_data.lock(),
                     &mut stage,
                 )?;
-                (
-                    result.written_len,
-                    Some(result.sync_result),
-                    result.sync_range,
-                )
+                (result.written_len, result.sync_result, result.sync_range)
             }
             PostWriteSyncPolicy::Generic | PostWriteSyncPolicy::NotApplicable => (
                 self.inode.write_primary_with_privilege_stage(
                     actual_offset,
                     actual_len,
-                    PrimaryWriteSource::Kernel(buf),
+                    source,
                     self.private_data.lock(),
                     &mut stage,
                 )?,
-                None,
+                Ok(()),
                 None,
             ),
         };
-
         let written_len =
             self.finalize_write(actual_offset, written_len, config, stage.handled())?;
         Ok(DelegatedWriteResult {
             written_len,
-            sync_result: sync_result.unwrap_or(Ok(())),
-            sync_range,
-        })
-    }
-
-    fn write_user_at_and_finalize(
-        &self,
-        actual_offset: usize,
-        actual_len: usize,
-        input: &UserBuffer<'_>,
-        config: WriteConfig,
-        creator: &Arc<crate::cgroup::memory::object::ObjectAccount>,
-    ) -> Result<DelegatedWriteResult, MemoryAllocationError> {
-        if let Some(result) =
-            self.write_user_buffer_at_and_finalize(actual_offset, actual_len, input, config)?
-        {
-            return Ok(result);
-        }
-        // Only the scalar entry reaches this fallback. Keep the old reader
-        // interface for sockets and native privilege-aware primary writes.
-        let reader =
-            UserBufferReader::new(input.user_addr().data() as *const u8, input.len(), true)?;
-        let mut publish = || {
-            if !self.mode.read().contains(FileMode::FMODE_NONOTIFY) {
-                self.notify_dentry_event(FsEvent::ATTRIB);
-            }
-        };
-        let mut stage = WritePrivilegeStage::new(&mut publish);
-        let (written_len, sync_result, sync_range) =
-            if self.post_write_sync == PostWriteSyncPolicy::Delegated {
-                let result =
-                    PrimaryWriteSource::User(&reader, creator).with_buffer(actual_len, |buf| {
-                        self.inode.write_at_with_sync_with_privilege_stage(
-                            actual_offset,
-                            actual_len.min(buf.len()),
-                            buf,
-                            config.sync_intent,
-                            self.private_data.lock(),
-                            &mut stage,
-                        )
-                    })?;
-                (
-                    result.written_len,
-                    Some(result.sync_result),
-                    result.sync_range,
-                )
-            } else {
-                let written_len = match self.inode.write_user_at(
-                    actual_offset,
-                    actual_len,
-                    &reader,
-                    self.private_data.lock(),
-                )? {
-                    Some(written_len) => written_len,
-                    None => self.inode.write_primary_with_privilege_stage(
-                        actual_offset,
-                        actual_len,
-                        PrimaryWriteSource::User(&reader, creator),
-                        self.private_data.lock(),
-                        &mut stage,
-                    )?,
-                };
-                (written_len, None, None)
-            };
-
-        let written_len =
-            self.finalize_write(actual_offset, written_len, config, stage.handled())?;
-        Ok(DelegatedWriteResult {
-            written_len,
-            sync_result: sync_result.unwrap_or(Ok(())),
+            sync_result,
             sync_range,
         })
     }
@@ -1286,7 +1223,7 @@ impl File {
         let mode_changed =
             !privileges_handled && written_len > 0 && self.maybe_kill_suid_sgid_after_write()?;
 
-        if config.update_offset {
+        if config.update_offset && written_len > 0 {
             match config.offset_update {
                 OffsetUpdate::StoreEnd => {
                     self.offset.store(
@@ -2199,26 +2136,8 @@ impl File {
         requested_sync: WriteSyncIntent,
         emit_data_fsnotify: bool,
     ) -> Result<DelegatedWriteResult, crate::mm::allocation::MemoryAllocationError> {
-        // Linux 语义：O_PATH fd 任何 I/O 都应返回 EBADF（优先于 ESPIPE）。
-        let mode = *self.mode.read();
-        if mode.contains(FileMode::FMODE_PATH) {
-            return Err(SystemError::EBADF.into());
-        }
-
-        // 同 pread：流式对象不支持随机偏移写入，返回 ESPIPE（优先于权限 EBADF）。
-        if mode.contains(FileMode::FMODE_STREAM) {
-            return Err(SystemError::ESPIPE.into());
-        }
-
-        // 对于不支持随机访问的文件（如管道），应该返回 ESPIPE，而不是因为权限问题返回 EBADF
-        if !mode.contains(FileMode::FMODE_PWRITE) {
-            return Err(SystemError::ESPIPE.into());
-        }
-
-        // 检查写权限
-        if !mode.contains(FileMode::FMODE_WRITE) {
-            return Err(SystemError::EBADF.into());
-        }
+        self.verify_pwrite_access()?;
+        self.writeable()?;
 
         self.do_write_split(
             offset,
@@ -2231,27 +2150,6 @@ impl File {
                 emit_data_fsnotify,
             },
         )
-    }
-
-    /// Write one internal `pwrite(2)` chunk while deferring its data-content
-    /// MODIFY notification until the syscall completion point. Metadata
-    /// changes such as setid removal remain visible at their commit point.
-    pub(crate) fn pwrite_syscall_chunk(
-        &self,
-        offset: usize,
-        len: usize,
-        buf: &[u8],
-    ) -> Result<usize, SystemError> {
-        let result = Self::recover_io(|| {
-            self.pwrite_with_sync_intent_and_fsnotify(
-                offset,
-                len,
-                buf,
-                WriteSyncIntent::None,
-                false,
-            )
-        })?;
-        self.finish_write(result)
     }
 
     /// 强制追加写（Linux `RWF_APPEND`/`IOCB_APPEND` 语义）：
@@ -2542,6 +2440,40 @@ impl File {
         update_offset: bool,
         force_append: bool,
         completion: WriteCompletionPolicy,
+    ) -> Result<DelegatedWriteResult, MemoryAllocationError> {
+        self.try_do_write_source(
+            offset,
+            len,
+            PrimaryWriteSource::Kernel(buf),
+            update_offset,
+            force_append,
+            completion,
+        )
+    }
+
+    // A delegated owner performs its backing admission after its own privilege
+    // transaction (notably OverlayFS). Native owners use the VFS size check.
+    fn limit_primary_write_len(
+        &self,
+        file_type: FileType,
+        offset: usize,
+        len: usize,
+    ) -> Result<usize, SystemError> {
+        if self.post_write_sync == PostWriteSyncPolicy::Delegated {
+            Ok(len)
+        } else {
+            self.limit_write_len_by_fsize(file_type, offset, len)
+        }
+    }
+
+    fn try_do_write_source(
+        &self,
+        offset: usize,
+        len: usize,
+        source: PrimaryWriteSource<'_, '_>,
+        update_offset: bool,
+        force_append: bool,
+        completion: WriteCompletionPolicy,
     ) -> Result<DelegatedWriteResult, crate::mm::allocation::MemoryAllocationError> {
         self.writeable()?;
 
@@ -2556,8 +2488,10 @@ impl File {
             return Err(SystemError::EPERM.into());
         }
 
-        if buf.len() < len {
-            return Err(SystemError::ENOBUFS.into());
+        if let PrimaryWriteSource::Kernel(buf) = source {
+            if buf.len() < len {
+                return Err(SystemError::ENOBUFS.into());
+            }
         }
         let md = self.inode.metadata()?;
         let file_type = md.file_type;
@@ -2578,12 +2512,12 @@ impl File {
                 // 在锁内刷新元数据，确保 EOF 是最新的。
                 let md = self.inode.metadata()?;
                 let actual_offset = md.size.max(0) as usize;
-                let actual_len = self.limit_write_len_by_fsize(file_type, actual_offset, len)?;
+                let actual_len = self.limit_primary_write_len(file_type, actual_offset, len)?;
 
-                self.write_at_and_finalize_split(
+                self.write_source_at_and_finalize(
                     actual_offset,
                     actual_len,
-                    buf,
+                    source,
                     WriteConfig {
                         update_offset,
                         offset_update: OffsetUpdate::StoreEnd,
@@ -2615,12 +2549,12 @@ impl File {
         }
 
         let actual_offset = offset;
-        let actual_len = self.limit_write_len_by_fsize(file_type, actual_offset, len)?;
+        let actual_len = self.limit_primary_write_len(file_type, actual_offset, len)?;
 
-        let mut result = self.write_at_and_finalize_split(
+        let mut result = self.write_source_at_and_finalize(
             actual_offset,
             actual_len,
-            buf,
+            source,
             WriteConfig {
                 update_offset,
                 offset_update: OffsetUpdate::Add,
@@ -2650,127 +2584,77 @@ impl File {
         update_offset: bool,
         force_append: bool,
     ) -> Result<usize, SystemError> {
+        let creator = object_for_task(&ProcessManager::current_pcb());
         let result = Self::recover_io(|| {
-            self.try_do_write_user(offset, len, input, update_offset, force_append)
+            self.try_do_write_source(
+                offset,
+                len,
+                PrimaryWriteSource::User(input, &creator),
+                update_offset,
+                force_append,
+                WriteCompletionPolicy {
+                    sync_intent: WriteSyncIntent::None,
+                    emit_data_fsnotify: true,
+                },
+            )
         })?;
         self.finish_write(result)
     }
 
-    fn try_do_write_user(
+    /// Positional capability admission precedes payload or iovec import.
+    pub(crate) fn verify_pwrite_access(&self) -> Result<(), SystemError> {
+        let mode = self.mode();
+        if mode.contains(FileMode::FMODE_PATH) {
+            return Err(SystemError::EBADF);
+        }
+        if mode.contains(FileMode::FMODE_STREAM) || !mode.contains(FileMode::FMODE_PWRITE) {
+            return Err(SystemError::ESPIPE);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn pwrite_user(
         &self,
         offset: usize,
         len: usize,
         input: &UserBuffer<'_>,
-        update_offset: bool,
-        force_append: bool,
-    ) -> Result<DelegatedWriteResult, MemoryAllocationError> {
-        self.try_do_write_user_with(
-            offset,
-            len,
-            update_offset,
-            force_append,
-            |actual_offset, actual_len, config, creator| {
-                self.write_user_at_and_finalize(actual_offset, actual_len, input, config, creator)
-            },
-        )
+    ) -> Result<usize, SystemError> {
+        self.verify_pwrite_access()?;
+        self.writeable()?;
+        self.verify_pread_range(offset, len)?;
+        self.do_write_user(offset, len, input, false, false)
     }
 
-    /// Keep write policy independent of the input's scalar/vector shape.
-    fn try_do_write_user_with(
+    pub(crate) fn pwrite_user_vectored(
         &self,
         offset: usize,
-        len: usize,
+        vectors: &super::iov::IoVecs,
+        force_append: bool,
+    ) -> Result<usize, SystemError> {
+        self.verify_pwrite_access()?;
+        self.write_user_vectors_at(offset, vectors, false, force_append)
+    }
+
+    fn write_user_vectors_at(
+        &self,
+        offset: usize,
+        vectors: &super::iov::IoVecs,
         update_offset: bool,
         force_append: bool,
-        commit: impl Fn(
-            usize,
-            usize,
-            WriteConfig,
-            &Arc<crate::cgroup::memory::object::ObjectAccount>,
-        ) -> Result<DelegatedWriteResult, MemoryAllocationError>,
-    ) -> Result<DelegatedWriteResult, MemoryAllocationError> {
-        let creator = object_for_task(&ProcessManager::current_pcb());
+    ) -> Result<usize, SystemError> {
         self.writeable()?;
-
-        let inode_flags = self.get_inode_flags()?;
-        let flags = self.flags();
-        // Check S_IMMUTABLE
-        if inode_flags.contains(InodeFlags::S_IMMUTABLE) {
-            return Err(SystemError::EPERM.into());
+        let len = vectors.total_len();
+        // Linux vector I/O stops here; scalar zero-length writes still reach
+        // owners such as datagram sockets.
+        if len == 0 {
+            return Ok(0);
         }
-        // Inodes with S_APPEND may only be appended to
-        if inode_flags.contains(InodeFlags::S_APPEND) && !flags.contains(FileFlags::O_APPEND) {
-            return Err(SystemError::EPERM.into());
+        if !self.mode().contains(FileMode::FMODE_STREAM) {
+            self.verify_pread_range(offset, len)?;
         }
-
-        let md = self.inode.metadata()?;
-        let file_type = md.file_type;
-        let sync_intent = self.post_write_sync_intent(flags, inode_flags);
-
-        let is_append = matches!(file_type, FileType::File)
-            && (flags.contains(FileFlags::O_APPEND) || force_append);
-
-        // Always select EOF for regular-file append semantics. Filesystems
-        // with a stable lock domain additionally serialize EOF lookup + write.
-        if is_append {
-            let append_write = || {
-                let md = self.inode.metadata()?;
-                let actual_offset = md.size.max(0) as usize;
-                let actual_len = self.limit_write_len_by_fsize(file_type, actual_offset, len)?;
-
-                commit(
-                    actual_offset,
-                    actual_len,
-                    WriteConfig {
-                        update_offset,
-                        offset_update: OffsetUpdate::StoreEnd,
-                        sync_intent,
-                        emit_data_fsnotify: true,
-                    },
-                    &creator,
-                )
-                .map(|result| (actual_offset, result))
-            };
-            let (actual_offset, mut result) = match self.append_lock_domain.as_ref() {
-                Some(domain) => with_inode_append_lock(domain.key(&md), append_write),
-                None => append_write(),
-            }?;
-            let current_sync_intent = self.post_write_sync_intent(flags, inode_flags);
-            if result.sync_result.is_ok() {
-                result.sync_result = self.generic_sync_after_write(
-                    actual_offset,
-                    result.written_len,
-                    current_sync_intent,
-                );
-            }
-            Self::set_completed_sync_range(&mut result, actual_offset, current_sync_intent);
-            return Ok(result);
-        }
-
-        let actual_offset = offset;
-        let actual_len = self.limit_write_len_by_fsize(file_type, actual_offset, len)?;
-
-        let mut result = commit(
-            actual_offset,
-            actual_len,
-            WriteConfig {
-                update_offset,
-                offset_update: OffsetUpdate::Add,
-                sync_intent,
-                emit_data_fsnotify: true,
-            },
-            &creator,
-        )?;
-        let current_sync_intent = self.post_write_sync_intent(flags, inode_flags);
-        if result.sync_result.is_ok() {
-            result.sync_result = self.generic_sync_after_write(
-                actual_offset,
-                result.written_len,
-                current_sync_intent,
-            );
-        }
-        Self::set_completed_sync_range(&mut result, actual_offset, current_sync_intent);
-        Ok(result)
+        let segments = vectors.user_buffer_segments(len)?;
+        let input = unsafe { UserBuffer::new_vectored(&segments, len) };
+        self.do_write_user(offset, len, &input, update_offset, force_append)
     }
 
     /// Write one scalar, contiguous userspace input. Vectors use the separate entry.
@@ -2783,6 +2667,8 @@ impl File {
             self.offset.load(Ordering::SeqCst)
         };
 
+        // Verify the original scalar count before MAX_RW_COUNT admission.
+        self.verify_read_range(input.len())?;
         self.do_write_user(offset, len, input, !stream, false)
     }
 
@@ -2791,35 +2677,22 @@ impl File {
         &self,
         vectors: &super::iov::IoVecs,
     ) -> Result<usize, SystemError> {
+        self.write_user_vectored_with_append(vectors, false)
+    }
+
+    pub(crate) fn write_user_vectored_with_append(
+        &self,
+        vectors: &super::iov::IoVecs,
+        force_append: bool,
+    ) -> Result<usize, SystemError> {
         let _position = self.lock_position();
-        self.writeable()?;
-        let len = vectors.total_len();
-        let segments = vectors.user_buffer_segments(len)?;
-        let input = unsafe { UserBuffer::new_vectored(&segments, len) };
-        let stream = self.mode.read().contains(FileMode::FMODE_STREAM);
+        let stream = self.mode().contains(FileMode::FMODE_STREAM);
         let offset = if stream {
             0
         } else {
             self.offset.load(Ordering::SeqCst)
         };
-        let result = Self::recover_io(|| {
-            self.try_do_write_user_with(
-                offset,
-                len,
-                !stream,
-                false,
-                |offset, len, config, _creator| {
-                    if let Some(result) =
-                        self.write_user_buffer_at_and_finalize(offset, len, &input, config)?
-                    {
-                        return Ok(result);
-                    }
-                    let bytes = vectors.gather_prefix(len)?;
-                    self.write_at_and_finalize_split(offset, bytes.len(), &bytes, config)
-                },
-            )
-        })?;
-        self.finish_write(result)
+        self.write_user_vectors_at(offset, vectors, !stream, force_append)
     }
 
     /// @brief 获取文件的元数据
@@ -2970,6 +2843,10 @@ impl File {
         // 检查写权限
         if !mode.contains(FileMode::FMODE_WRITE) {
             return Err(SystemError::EBADF);
+        }
+
+        if !mode.contains(FileMode::FMODE_CAN_WRITE) {
+            return Err(SystemError::EINVAL);
         }
 
         Ok(())

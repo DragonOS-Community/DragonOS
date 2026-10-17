@@ -1,3 +1,5 @@
+use crate::filesystem::vfs::file::FileMode;
+use crate::filesystem::vfs::OpenFileBehavior;
 use alloc::collections::LinkedList;
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
@@ -293,6 +295,10 @@ impl PollableInode for SignalFdInode {
 }
 
 impl IndexNode for SignalFdInode {
+    fn configure_open_file(&self, _data: &FilePrivateData, behavior: &mut OpenFileBehavior) {
+        behavior.mode.remove(FileMode::FMODE_CAN_WRITE);
+    }
+
     fn is_stream(&self) -> bool {
         true
     }

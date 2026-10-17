@@ -1,15 +1,14 @@
-use alloc::{string::ToString, sync::Arc, vec::Vec};
+use alloc::{string::ToString, vec::Vec};
 
 use system_error::SystemError;
 
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_PWRITEV2;
-use crate::filesystem::vfs::file::File;
+use crate::filesystem::vfs::file::FileFlags;
 use crate::filesystem::vfs::iov::{IoVec, IoVecs};
-use crate::process::ProcessManager;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
 
-use super::sys_pwrite64::validate_pwrite_range;
+use super::sys_write::get_file_by_fd;
 
 bitflags::bitflags! {
     /// Linux 兼容的 RWF 标志位（pwritev2 专用）
@@ -50,19 +49,24 @@ impl Syscall for SysPwriteV2Handle {
             return Err(SystemError::EINVAL);
         }
 
-        // 先检查 fd 合法性，以确保 iovcnt==0 且 fd 非法时仍返回 EBADF（与 Linux 一致）
-        let binding = ProcessManager::current_pcb().fd_table();
-        let fd_table_guard = binding.read();
-        let file = fd_table_guard
-            .get_file_by_fd(fd)
-            .ok_or(SystemError::EBADF)?;
-        drop(fd_table_guard);
+        let file = get_file_by_fd(fd)?;
+        if offset == -1 {
+            if file.flags().contains(FileFlags::O_PATH) {
+                return Err(SystemError::EBADF);
+            }
+        } else {
+            file.verify_pwrite_access()?;
+        }
 
-        // 构造 IoVecs（会验证用户缓冲区可读性）
+        // Import snapshots metadata and checks numerical ranges, without
+        // materializing payload before the owner's write transaction.
         let iovecs = unsafe { IoVecs::from_user(iov, iov_count, false) }?;
-        let data = iovecs.gather()?;
-
-        do_pwritev2(file, offset, flags, data)
+        let append = flags.contains(RwfFlags::APPEND);
+        if offset == -1 {
+            file.write_user_vectored_with_append(&iovecs, append)
+        } else {
+            file.pwrite_user_vectored(offset as usize, &iovecs, append)
+        }
     }
 
     fn entry_format(&self, args: &[usize]) -> Vec<FormattedSyscallParam> {
@@ -113,37 +117,6 @@ impl SysPwriteV2Handle {
             args[4]
         }
     }
-}
-
-/// pwritev2 的核心实现
-///
-/// - `offset == -1` 时行为等同于 `writev`，会推进文件偏移量
-/// - 其它非负 offset 走已有的 pwrite 语义，不会修改文件偏移量
-pub fn do_pwritev2(
-    file: Arc<File>,
-    offset: isize,
-    flags: RwfFlags,
-    data: Vec<u8>,
-) -> Result<usize, SystemError> {
-    // offset == -1 -> 使用当前文件偏移（行为与 writev 相同）
-    if offset == -1 {
-        // RWF_APPEND：强制追加写入（需满足“取 EOF + 写入”的原子性），并推进文件偏移
-        if flags.contains(RwfFlags::APPEND) {
-            return file.write_append(data.len(), &data);
-        }
-        return file.write(data.len(), &data);
-    }
-
-    // offset 为非负时，执行范围校验
-    let offset = validate_pwrite_range(offset as i64, data.len())?;
-
-    // 若指定 RWF_APPEND，忽略 offset，改为在文件末尾写入，但不更新文件偏移
-    if flags.contains(RwfFlags::APPEND) {
-        return file.pwrite_append(offset, data.len(), &data);
-    }
-
-    // 普通 pwrite 路径
-    file.pwrite(offset, data.len(), &data)
 }
 
 syscall_table_macros::declare_syscall!(SYS_PWRITEV2, SysPwriteV2Handle);

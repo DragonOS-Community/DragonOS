@@ -1,5 +1,7 @@
 //! /proc/[pid]/cgroup - cgroup membership (v2)
 
+use crate::filesystem::procfs::template::configure_readonly_seq_file;
+use crate::filesystem::vfs::OpenFileBehavior;
 use crate::libs::mutex::MutexGuard;
 use crate::{
     cgroup::cgroup_path_from_view,
@@ -49,6 +51,10 @@ impl CgroupFileOps {
 }
 
 impl FileOps for CgroupFileOps {
+    fn configure_open_file(&self, _data: &FilePrivateData, behavior: &mut OpenFileBehavior) {
+        configure_readonly_seq_file(behavior);
+    }
+
     fn supports_read_iter_flags(&self) -> bool {
         false
     }

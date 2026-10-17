@@ -103,19 +103,55 @@ pub(super) fn write_at_with_sync(
     sync_intent: vfs::WriteSyncIntent,
     data: crate::libs::mutex::MutexGuard<vfs::FilePrivateData>,
 ) -> Result<vfs::DelegatedWriteResult, crate::mm::allocation::MemoryAllocationError> {
+    let mut publish = || {};
+    let mut stage = vfs::WritePrivilegeStage::new(&mut publish);
+    write_primary_with_sync(
+        inode,
+        offset,
+        len,
+        vfs::PrimaryWriteSource::Kernel(buf),
+        sync_intent,
+        data,
+        &mut stage,
+    )
+}
+
+pub(super) fn write_primary_with_sync(
+    inode: &OvlInode,
+    offset: usize,
+    len: usize,
+    source: vfs::PrimaryWriteSource<'_, '_>,
+    sync_intent: vfs::WriteSyncIntent,
+    data: crate::libs::mutex::MutexGuard<vfs::FilePrivateData>,
+    stage: &mut vfs::WritePrivilegeStage<'_>,
+) -> Result<vfs::DelegatedWriteResult, crate::mm::allocation::MemoryAllocationError> {
     inode.overlay_fs()?.require_upper()?;
     if len == 0 {
         let (backing_file, _) = backing_file_for_io(inode, data)?;
-        return backing_file.pwrite_with_sync_intent(offset, len, buf, sync_intent);
+        return backing_file.pwrite_with_sync_intent(offset, 0, &[], sync_intent);
     }
 
+    let caller = crate::process::ProcessManager::current_pcb().cred();
     let _privilege_guard = inode.content_privilege_lock.lock();
     let (backing_file, _) = backing_file_for_io(inode, data)?;
     let fs = inode.overlay_fs()?;
     let _content_guard = fs.content_lock(&backing_file.inode())?.lock();
-    let _cred_guard = CredOverrideGuard::new(fs.backing_cred.clone())?;
-    super::metadata::remove_security_capability(&backing_file.inode())?;
-    backing_file.pwrite_with_sync_intent(offset, len, buf, sync_intent)
+    super::metadata::prepare_primary_write_locked(
+        &backing_file.inode(),
+        &fs.backing_cred,
+        &caller,
+        stage,
+    )?;
+    // Overlay removes caller privileges before the backing write checks.
+    // Admit the backing file-size limit before touching the user payload;
+    // the backing File rechecks it when committing the staged buffer.
+    let len = backing_file.limit_write_len_by_fsize(vfs::FileType::File, offset, len)?;
+    // Keep user faults under the caller credentials. Only the completed
+    // staging buffer enters the backing credential override, as before.
+    source.with_buffer(len, |buffer| {
+        let _cred_guard = CredOverrideGuard::new(fs.backing_cred.clone())?;
+        backing_file.pwrite_with_sync_intent(offset, len.min(buffer.len()), buffer, sync_intent)
+    })
 }
 
 pub(super) fn sync_file(

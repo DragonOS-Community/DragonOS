@@ -3,6 +3,8 @@
 //! 这个文件用于兼容 Aya 框架的内核版本识别
 //! 格式: DragonOS 6.0.0-generic 6.0.0
 
+use crate::filesystem::procfs::template::configure_seq_file;
+use crate::filesystem::vfs::OpenFileBehavior;
 use crate::filesystem::{
     procfs::{
         template::{Builder, FileOps, ProcFileBuilder},
@@ -30,6 +32,10 @@ impl VersionSignatureFileOps {
 }
 
 impl FileOps for VersionSignatureFileOps {
+    fn configure_open_file(&self, _data: &FilePrivateData, behavior: &mut OpenFileBehavior) {
+        configure_seq_file(behavior);
+    }
+
     fn read_at(
         &self,
         offset: usize,

@@ -68,8 +68,9 @@ pub use read_batch::{PageCacheReadBatchCompletion, PageCacheReadBatchRequest};
 pub use read_dma::PageCacheReadDmaReservation;
 pub(crate) use selftest::{run_accounting_debug_selftest, run_completion_domain_debug_selftest};
 pub(crate) use writeback::{
-    async_writeback_progress_snapshot, wait_for_async_writeback_progress, PageCacheDomainWriteback,
-    PageCacheWritebackDispatchOutcome, DOMAIN_WRITEBACK_WINDOW,
+    async_writeback_progress_snapshot, schedule_pagecache_writeback,
+    wait_for_async_writeback_progress, PageCacheDomainWriteback, PageCacheWritebackDispatchOutcome,
+    DOMAIN_WRITEBACK_WINDOW,
 };
 use writeback::{
     run_async_writeback_budget_retry_selftest, run_submitted_writeback_selftest,
@@ -616,6 +617,14 @@ impl Drop for PageCacheDomainIoPermit {
 }
 
 impl PageCacheDomainIoPermit {
+    /// Run admitted producer continuations in the same filesystem dependency
+    /// domain as writeback. In particular, final shutdown may wait on this
+    /// permit from SYSTEM_WQ, so these producers must never use that queue.
+    /// Do not reacquire admission: a closed domain must drain its accepted work.
+    pub(crate) fn writeback_executor(&self) -> Result<Arc<WritebackExecutor>, SystemError> {
+        self.domain.writeback_executor()
+    }
+
     pub(crate) fn belongs_to(&self, domain: &Arc<PageCacheWritebackDomain>) -> bool {
         Arc::ptr_eq(&self.domain, domain)
     }

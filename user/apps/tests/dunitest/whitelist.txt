@@ -233,3 +233,7 @@ normal/ext4_shared_xattr
 normal/pipe_write_fault
 normal/pipe_empty_slot
 normal/preadv2_flags
+
+normal/vector_write_privileges
+normal/write_capability_admission
+normal/primary_write_transaction

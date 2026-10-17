@@ -2,6 +2,8 @@
 //!
 //! 以单行格式返回进程的状态信息，兼容 Linux procfs 格式
 
+use crate::filesystem::procfs::template::configure_readonly_seq_file;
+use crate::filesystem::vfs::OpenFileBehavior;
 use core::fmt::Write;
 
 use crate::libs::mutex::MutexGuard;
@@ -337,6 +339,10 @@ impl StatFileOps {
 }
 
 impl FileOps for StatFileOps {
+    fn configure_open_file(&self, _data: &FilePrivateData, behavior: &mut OpenFileBehavior) {
+        configure_readonly_seq_file(behavior);
+    }
+
     fn supports_read_iter_flags(&self) -> bool {
         false
     }

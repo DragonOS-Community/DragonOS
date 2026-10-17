@@ -15,6 +15,7 @@ mod whiteout;
 mod workdir;
 
 pub use file::OverlayFilePrivateData;
+pub(crate) use inode::OvlInode;
 
 use self::fs::OverlayFS;
 use super::vfs::{FileSystem, MountableFileSystem, FSMAKER};

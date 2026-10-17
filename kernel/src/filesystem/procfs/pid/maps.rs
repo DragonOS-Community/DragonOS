@@ -2,6 +2,8 @@
 //!
 //! 返回进程的内存映射信息，格式兼容 Linux procfs
 
+use crate::filesystem::procfs::template::configure_readonly_seq_file;
+use crate::filesystem::vfs::OpenFileBehavior;
 use crate::libs::{casting::DowncastArc, mutex::MutexGuard};
 use crate::{
     arch::MMArch,
@@ -236,6 +238,10 @@ fn append_map_line(vma: &Arc<LockedVMA>, root_prefix: &str, out: &mut Vec<u8>) {
 }
 
 impl FileOps for MapsFileOps {
+    fn configure_open_file(&self, _data: &FilePrivateData, behavior: &mut OpenFileBehavior) {
+        configure_readonly_seq_file(behavior);
+    }
+
     fn supports_read_iter_flags(&self) -> bool {
         false
     }

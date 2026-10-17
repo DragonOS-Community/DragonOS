@@ -4,9 +4,10 @@ use crate::{
     filesystem::{
         procfs::{template::Common, ProcfsFilePrivateData},
         vfs::{
-            file::FileFlags, vcore::generate_inode_id, FilePrivateData, FileSystem, FileType,
-            IndexNode, InodeFlags, InodeMode, Metadata, OpenFileBehavior, PostWriteSyncPolicy,
-            SetMetadataMask,
+            file::{FileFlags, FileMode},
+            vcore::generate_inode_id,
+            FilePrivateData, FileSystem, FileType, IndexNode, InodeFlags, InodeMode, Metadata,
+            OpenFileBehavior, PostWriteSyncPolicy, SetMetadataMask,
         },
     },
     time::PosixTimeSpec,
@@ -70,6 +71,18 @@ impl<F: FileOps> ProcFile<F> {
     }
 }
 
+/// Apply Linux seq_open()'s historical positional-write restriction.
+pub(crate) fn configure_seq_file(behavior: &mut OpenFileBehavior) {
+    behavior.mode.remove(FileMode::FMODE_PWRITE);
+}
+
+/// Direct PID seq-file operation tables have no write method. Global proc
+/// wrappers retain CAN_WRITE even when their proc_write callback is absent.
+pub(crate) fn configure_readonly_seq_file(behavior: &mut OpenFileBehavior) {
+    configure_seq_file(behavior);
+    behavior.mode.remove(FileMode::FMODE_CAN_WRITE);
+}
+
 /// FileOps trait 定义了 procfs 文件需要实现的操作
 pub trait FileOps: Sync + Send + Sized + Debug {
     /// Apply provider-specific operation capabilities after the common open
@@ -108,7 +121,7 @@ pub trait FileOps: Sync + Send + Sized + Debug {
         data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError>;
 
-    /// 向文件的指定偏移量写入数据（可选，默认返回 EPERM）
+    /// 向文件的指定偏移量写入数据（可选，默认返回 EIO，与 proc_reg_write 一致）
     ///
     /// # 参数
     /// - `offset`: 写入的起始偏移量
@@ -126,7 +139,7 @@ pub trait FileOps: Sync + Send + Sized + Debug {
         _buf: &[u8],
         _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        Err(SystemError::EPERM)
+        Err(SystemError::EIO)
     }
 
     /// 打开文件时调用，可用于按 open 时上下文初始化 procfs 私有数据

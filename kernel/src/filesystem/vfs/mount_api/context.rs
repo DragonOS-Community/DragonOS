@@ -3,6 +3,8 @@
 //! The fd table owns the File; dup/fork therefore share one context.  No
 //! mount topology lock is held while a filesystem maker builds its root.
 
+use crate::filesystem::vfs::file::FileMode;
+use crate::filesystem::vfs::OpenFileBehavior;
 use alloc::{string::String, sync::Arc, vec::Vec};
 use core::{any::Any, fmt};
 use system_error::SystemError;
@@ -531,6 +533,10 @@ impl FsContextInode {
 }
 
 impl IndexNode for FsContextInode {
+    fn configure_open_file(&self, _data: &FilePrivateData, behavior: &mut OpenFileBehavior) {
+        behavior.mode.remove(FileMode::FMODE_CAN_WRITE);
+    }
+
     fn is_stream(&self) -> bool {
         true
     }

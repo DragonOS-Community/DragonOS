@@ -201,6 +201,36 @@ pub(super) fn remove_security_capability(
     inode.remove_security_privileges()
 }
 
+/// The caller holds the overlay and backing content guards. Work directly on
+/// the backing inode rather than reentering the public overlay metadata path.
+pub(super) fn prepare_primary_write_locked(
+    backing: &Arc<dyn IndexNode>,
+    backing_cred: &Arc<crate::process::Cred>,
+    caller: &Arc<crate::process::Cred>,
+    stage: &mut crate::filesystem::vfs::WritePrivilegeStage<'_>,
+) -> Result<(), MemoryAllocationError> {
+    let _cred_guard = CredOverrideGuard::new(backing_cred.clone())?;
+    let current = backing.metadata()?;
+    let (requested, derived) =
+        crate::filesystem::vfs::vcore::prepare_write_side_effect_metadata_with_cred(
+            current.clone(),
+            current.size.max(0) as usize,
+            caller,
+        );
+    // Linux setattr_prepare kills security privileges before committing the
+    // mode change. A failed killpriv must not clear setid or publish ATTRIB.
+    remove_security_capability(backing)?;
+    if derived.contains(SetMetadataMask::MODE) {
+        backing.set_metadata_masked(
+            &requested,
+            SetMetadataMask::MODE | SetMetadataMask::CTIME | SetMetadataMask::WRITE_SIDE_EFFECT,
+        )?;
+        stage.commit_attrib();
+    }
+    stage.complete();
+    Ok(())
+}
+
 /// Internal killpriv for a stacked overlay backing. Keep copy-up and backing
 /// credentials, but do not turn privilege removal into a CAP_SETFCAP request.
 pub(super) fn remove_security_privileges(

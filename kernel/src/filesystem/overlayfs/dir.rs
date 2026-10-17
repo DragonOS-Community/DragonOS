@@ -12,16 +12,15 @@ pub(super) fn mkdir(
 ) -> Result<Arc<dyn IndexNode>, crate::mm::allocation::MemoryAllocationError> {
     let state = inode.dir_state()?;
     let _mutation_guard = state.mutation_lock.lock();
-    let result = create_over_whiteout(
+    create_over_whiteout(
         inode,
         name,
         |dir, temp_name| dir.mkdir(temp_name, mode),
         true,
-    );
-    if result.is_ok() {
-        state.modified(&[name]);
-    }
-    result
+    )?;
+    state.modified(&[name]);
+    // Publish the merged namespace identity, never a raw upper/workdir inode.
+    super::lookup::find_locked(inode, name, &state).map_err(Into::into)
 }
 
 pub(super) fn rmdir(
@@ -235,16 +234,15 @@ pub(super) fn create(
 ) -> Result<Arc<dyn IndexNode>, crate::mm::allocation::MemoryAllocationError> {
     let state = inode.dir_state()?;
     let _mutation_guard = state.mutation_lock.lock();
-    let result = create_over_whiteout(
+    create_over_whiteout(
         inode,
         name,
         |dir, temp_name| dir.create(temp_name, file_type, mode),
         file_type == FileType::Dir,
-    );
-    if result.is_ok() {
-        state.modified(&[name]);
-    }
-    result
+    )?;
+    state.modified(&[name]);
+    // Publish the merged namespace identity, never a raw upper/workdir inode.
+    super::lookup::find_locked(inode, name, &state).map_err(Into::into)
 }
 
 pub(super) fn symlink(
@@ -278,16 +276,15 @@ pub(super) fn mknod(
         return Err(SystemError::EPERM.into());
     }
 
-    let result = create_over_whiteout(
+    create_over_whiteout(
         inode,
         filename,
         |dir, temp_name| dir.mknod(temp_name, mode, dev_t),
         FileType::from(mode) == FileType::Dir,
-    );
-    if result.is_ok() {
-        state.modified(&[filename]);
-    }
-    result
+    )?;
+    state.modified(&[filename]);
+    // Publish the merged namespace identity, never a raw upper/workdir inode.
+    super::lookup::find_locked(inode, filename, &state).map_err(Into::into)
 }
 
 pub(super) fn is_dir_empty_locked(inode: &OvlInode, state: &DirState) -> Result<bool, SystemError> {

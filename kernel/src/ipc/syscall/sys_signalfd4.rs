@@ -49,7 +49,7 @@ impl Syscall for SysSignalFd4Handle {
         if fd == -1 {
             let storage = crate::filesystem::vfs::file::PreparedFile::new_recovering()?;
             let inode = Arc::new(SignalFdInode::new(mask, flags));
-            let mut file_flags = FileFlags::O_RDONLY;
+            let mut file_flags = FileFlags::O_RDWR;
             if flags.contains(SignalFdFlags::SFD_NONBLOCK) {
                 file_flags |= FileFlags::O_NONBLOCK;
             }

@@ -6461,16 +6461,37 @@ impl IndexNode for MountFSInode {
         data: MutexGuard<FilePrivateData>,
         stage: &mut super::WritePrivilegeStage<'_>,
     ) -> Result<DelegatedWriteResult, crate::mm::allocation::MemoryAllocationError> {
-        let _writer = self.ensure_io_writable()?;
-        self.dentry.inode.write_at_with_sync_with_inode_context(
+        self.write_primary_with_sync_with_privilege_stage(
             offset,
             len,
-            buf,
+            super::PrimaryWriteSource::Kernel(buf),
             sync_intent,
             data,
-            &self.op_context(),
             stage,
         )
+    }
+
+    fn write_primary_with_sync_with_privilege_stage(
+        &self,
+        offset: usize,
+        len: usize,
+        source: super::PrimaryWriteSource<'_, '_>,
+        sync_intent: WriteSyncIntent,
+        data: MutexGuard<FilePrivateData>,
+        stage: &mut super::WritePrivilegeStage<'_>,
+    ) -> Result<DelegatedWriteResult, crate::mm::allocation::MemoryAllocationError> {
+        let _writer = self.ensure_io_writable()?;
+        self.dentry
+            .inode
+            .write_primary_with_sync_with_inode_context(
+                offset,
+                len,
+                source,
+                sync_intent,
+                data,
+                &self.op_context(),
+                stage,
+            )
     }
 
     fn read_direct(

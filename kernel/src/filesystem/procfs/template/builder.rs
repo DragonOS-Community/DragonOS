@@ -61,6 +61,12 @@ impl<F: FileOps> ProcFileBuilder<F> {
         self
     }
 
+    /// Namespace identity files are immutable, as in Linux nsfs.
+    pub fn immutable(mut self) -> Self {
+        self.flags.insert(InodeFlags::S_IMMUTABLE);
+        self
+    }
+
     /// Mark a proc sysctl as read-only even for callers with DAC override.
     pub fn read_only_sysctl(mut self) -> Self {
         self.flags.insert(InodeFlags::S_SYSCTL_READONLY);

@@ -2,6 +2,8 @@
 //!
 //! 以 Linux 兼容格式返回进程的 rlimit 快照。
 
+use crate::filesystem::procfs::template::configure_readonly_seq_file;
+use crate::filesystem::vfs::OpenFileBehavior;
 use core::fmt::Write;
 
 use crate::libs::mutex::MutexGuard;
@@ -154,6 +156,10 @@ impl LimitsFile {
 }
 
 impl FileOps for LimitsFile {
+    fn configure_open_file(&self, _data: &FilePrivateData, behavior: &mut OpenFileBehavior) {
+        configure_readonly_seq_file(behavior);
+    }
+
     fn supports_read_iter_flags(&self) -> bool {
         false
     }

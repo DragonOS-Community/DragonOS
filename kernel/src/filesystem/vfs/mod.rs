@@ -47,7 +47,7 @@ use crate::{
     mm::{fault::PageFaultMessage, VirtRegion, VmFaultReason, VmFlags},
     net::socket::Socket,
     process::ProcessManager,
-    syscall::{user_access::UserBufferReader, user_buffer::UserBuffer},
+    syscall::user_buffer::UserBuffer,
     time::PosixTimeSpec,
 };
 
@@ -182,10 +182,11 @@ pub struct WritePrivilegeStage<'a> {
 /// Input retained only for the duration of one primary write. Native local
 /// filesystems materialize user input after privilege removal, while holding
 /// their canonical content guard but no metadata or namespace spin locks.
+#[derive(Clone, Copy)]
 pub enum PrimaryWriteSource<'a, 'b> {
     Kernel(&'a [u8]),
     User(
-        &'a UserBufferReader<'b>,
+        &'a UserBuffer<'b>,
         &'a Arc<crate::cgroup::memory::object::ObjectAccount>,
     ),
 }
@@ -210,9 +211,9 @@ impl PrimaryWriteSource<'_, '_> {
                 scratch.resize(scratch_len);
                 while buffer.bytes().len() < len {
                     let want = scratch.bytes().len().min(len - buffer.bytes().len());
-                    let copied = match reader.copy_from_user_prefix(
-                        &mut scratch.bytes_mut()[..want],
+                    let copied = match reader.read_prefix_from_user(
                         buffer.bytes().len(),
+                        &mut scratch.bytes_mut()[..want],
                     ) {
                         Ok(copied) => copied,
                         Err(SystemError::EFAULT) if !buffer.bytes().is_empty() => break,
@@ -264,7 +265,7 @@ impl PrimaryWriteSource<'_, '_> {
         while completed < len {
             let want = scratch.bytes().len().min(len - completed);
             let copied =
-                match reader.copy_from_user_prefix(&mut scratch.bytes_mut()[..want], completed) {
+                match reader.read_prefix_from_user(completed, &mut scratch.bytes_mut()[..want]) {
                     Ok(copied) => copied,
                     Err(SystemError::EFAULT) if completed > 0 => return Ok(completed),
                     Err(error) => return Err(error.into()),
@@ -1107,23 +1108,6 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, crate::mm::allocation::MemoryAllocationError>;
 
-    /// Write to the inode from a userspace buffer.
-    ///
-    /// By default returns `None`, causing the VFS `File` layer to follow the
-    /// traditional path of first copying into a kernel buffer and then calling
-    /// `write_at()`. Inodes that need to avoid an upfront bulk copy (e.g. socket
-    /// streams) can override this method and consume the user buffer directly.
-    fn write_user_at(
-        &self,
-        _offset: usize,
-        _len: usize,
-        _reader: &UserBufferReader<'_>,
-        data: MutexGuard<FilePrivateData>,
-    ) -> Result<Option<usize>, SystemError> {
-        drop(data);
-        Ok(None)
-    }
-
     /// Consume one complete logical user request, including vector boundaries.
     /// Owners such as pipes decide which copy units become visible. `None`
     /// leaves the request untouched and selects the existing buffered fallback.
@@ -1351,6 +1335,46 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
             return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP.into());
         }
         self.write_at_with_sync_with_privilege_stage(offset, len, buf, sync, data, stage)
+    }
+
+    /// Preserve original user input until the delegated owner has completed
+    /// its privilege transaction. Legacy owners still materialize once.
+    fn write_primary_with_sync_with_privilege_stage(
+        &self,
+        offset: usize,
+        len: usize,
+        source: PrimaryWriteSource<'_, '_>,
+        sync: WriteSyncIntent,
+        data: MutexGuard<FilePrivateData>,
+        stage: &mut WritePrivilegeStage<'_>,
+    ) -> Result<DelegatedWriteResult, crate::mm::allocation::MemoryAllocationError> {
+        source.with_buffer(len, |buffer| {
+            self.write_at_with_sync_with_privilege_stage(
+                offset,
+                len.min(buffer.len()),
+                buffer,
+                sync,
+                data,
+                stage,
+            )
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn write_primary_with_sync_with_inode_context(
+        &self,
+        offset: usize,
+        len: usize,
+        source: PrimaryWriteSource<'_, '_>,
+        sync: WriteSyncIntent,
+        data: MutexGuard<FilePrivateData>,
+        context: &permission::InodeOpContext,
+        stage: &mut WritePrivilegeStage<'_>,
+    ) -> Result<DelegatedWriteResult, crate::mm::allocation::MemoryAllocationError> {
+        if context.is_idmapped() {
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP.into());
+        }
+        self.write_primary_with_sync_with_privilege_stage(offset, len, source, sync, data, stage)
     }
 
     /// # 在inode的指定偏移量开始，写入指定大小的数据，忽略PageCache

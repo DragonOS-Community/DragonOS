@@ -5,6 +5,8 @@
 //! IP address       HW type     Flags       HW address            Mask     Device
 //! <ip>             0x<hatype>  0x<flags>   <mac>                 *        <dev>
 
+use crate::filesystem::procfs::template::configure_seq_file;
+use crate::filesystem::vfs::OpenFileBehavior;
 use crate::filesystem::{
     procfs::{
         template::{Builder, FileOps, ProcFileBuilder},
@@ -119,6 +121,10 @@ fn render_arp_slice(
 }
 
 impl FileOps for ArpFileOps {
+    fn configure_open_file(&self, _data: &FilePrivateData, behavior: &mut OpenFileBehavior) {
+        configure_seq_file(behavior);
+    }
+
     fn supports_read_iter_flags(&self) -> bool {
         false
     }

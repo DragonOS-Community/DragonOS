@@ -4,13 +4,15 @@ use system_error::SystemError;
 
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_PWRITE64;
-use crate::process::ProcessManager;
+use crate::arch::MMArch;
+use crate::mm::{access_ok, MemoryManagementArch, VirtAddr};
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
+use crate::syscall::user_buffer::UserBuffer;
 use alloc::string::ToString;
 use alloc::vec::Vec;
 
-use super::pread_pwrite_common::{do_pread_pwrite_at, PreadPwriteDir};
+use super::sys_write::get_file_by_fd;
 
 /// System call handler for the `pwrite64` syscall
 ///
@@ -53,27 +55,34 @@ impl Syscall for SysPwrite64Handle {
         let len = Self::len(args);
         let offset = Self::offset(args);
 
-        let binding = ProcessManager::current_pcb().fd_table();
-        let fd_table_guard = binding.read();
-
-        let file = fd_table_guard.get_file_by_fd(fd);
-        if file.is_none() {
-            return Err(SystemError::EBADF);
+        // Linux rejects a negative position before looking up the descriptor.
+        if offset < 0 {
+            return Err(SystemError::EINVAL);
         }
-        // drop guard 以避免无法调度的问题
-        drop(fd_table_guard);
-        let file = file.unwrap();
+        let file = get_file_by_fd(fd)?;
+        file.verify_pwrite_access()?;
+        file.writeable()?;
 
-        // Linux/POSIX: count==0 must not touch the user buffer, but must still validate fd and flags.
+        // Numerical access validation precedes the position-range check and
+        // MAX_RW_COUNT clamp. Do not probe mappings or copy payload here:
+        // the owner must enter its privilege/content transaction first.
+        let address = VirtAddr::new(buf_vaddr as usize);
+        if frame.is_from_user() {
+            access_ok(address, len).map_err(|_| SystemError::EFAULT)?;
+        }
         let offset = validate_pwrite_range(offset, len)?;
-        do_pread_pwrite_at(
-            file.as_ref(),
-            offset,
-            buf_vaddr as usize,
-            len,
-            frame.is_from_user(),
-            PreadPwriteDir::Write,
-        )
+        let count = len.min((i32::MAX as usize) & !(MMArch::PAGE_SIZE - 1));
+        if frame.is_from_user() {
+            let input = unsafe { UserBuffer::new(address, len) };
+            file.pwrite_user(offset, count, &input)
+        } else {
+            let buffer = if count == 0 {
+                &[]
+            } else {
+                unsafe { core::slice::from_raw_parts(buf_vaddr, count) }
+            };
+            file.pwrite(offset, count, buffer)
+        }
     }
 
     /// Formats the syscall parameters for display/debug purposes

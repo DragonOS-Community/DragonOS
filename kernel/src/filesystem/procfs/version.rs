@@ -2,6 +2,8 @@
 //!
 //! 这个文件展示了内核版本、编译信息等
 
+use crate::filesystem::procfs::template::configure_seq_file;
+use crate::filesystem::vfs::OpenFileBehavior;
 use crate::libs::mutex::MutexGuard;
 use crate::{
     filesystem::{
@@ -52,6 +54,10 @@ impl VersionFileOps {
 }
 
 impl FileOps for VersionFileOps {
+    fn configure_open_file(&self, _data: &FilePrivateData, behavior: &mut OpenFileBehavior) {
+        configure_seq_file(behavior);
+    }
+
     fn read_at(
         &self,
         offset: usize,

@@ -66,7 +66,7 @@ static ASYNC_WRITEBACK_WAIT: WaitQueue = WaitQueue::default();
 /// filesystem. One lazy owned worker is sufficient because token submissions
 /// defer same-domain dependencies instead of waiting for queued successors.
 #[derive(Debug)]
-pub(super) struct WritebackExecutor {
+pub(crate) struct WritebackExecutor {
     queue: Arc<WorkQueue>,
     budget: Mutex<WritebackBudget>,
 }
@@ -106,7 +106,7 @@ pub(super) fn unowned_writeback_executor() -> Result<Arc<WritebackExecutor>, Sys
     Ok(slot.as_ref().expect("initialized executor").clone())
 }
 
-pub(super) fn schedule_pagecache_writeback(executor: &WritebackExecutor, work: Arc<Work>) {
+pub(crate) fn schedule_pagecache_writeback(executor: &WritebackExecutor, work: Arc<Work>) {
     executor.queue.enqueue(work);
 }
 

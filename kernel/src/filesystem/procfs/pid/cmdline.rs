@@ -2,6 +2,7 @@
 //!
 //! 返回进程的完整命令行，各参数之间以 \0 分隔
 
+use crate::filesystem::vfs::{file::FileMode, OpenFileBehavior};
 use crate::filesystem::{
     procfs::{
         pid::ProcPidTarget,
@@ -30,6 +31,10 @@ impl CmdlineFileOps {
 }
 
 impl FileOps for CmdlineFileOps {
+    fn configure_open_file(&self, _data: &FilePrivateData, behavior: &mut OpenFileBehavior) {
+        behavior.mode.remove(FileMode::FMODE_CAN_WRITE);
+    }
+
     fn supports_read_iter_flags(&self) -> bool {
         false
     }

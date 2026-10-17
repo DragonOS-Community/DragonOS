@@ -1432,7 +1432,7 @@ pub unsafe fn copy_from_user_protected(
 
 /// A write-stage-only variant of protected copying. Never infer successfully
 /// copied bytes from a VMA snapshot on architectures with faulting user access.
-unsafe fn copy_from_user_prefix_protected(
+pub(crate) unsafe fn copy_from_user_prefix_protected(
     dst: &mut [u8],
     src: VirtAddr,
 ) -> Result<usize, SystemError> {

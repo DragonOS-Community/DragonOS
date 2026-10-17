@@ -2576,6 +2576,7 @@ impl IndexNode for LockedExt4Inode {
             context,
             stage,
         )
+        .map(|result| result.written_len)
     }
 
     fn write_primary_with_privilege_stage(
@@ -2585,7 +2586,7 @@ impl IndexNode for LockedExt4Inode {
         source: vfs::PrimaryWriteSource<'_, '_>,
         data: PrivateData,
         stage: &mut vfs::WritePrivilegeStage<'_>,
-    ) -> Result<usize, MemoryAllocationError> {
+    ) -> Result<vfs::PrimaryWriteResult, MemoryAllocationError> {
         self.write_primary_with_inode_context(
             offset,
             len,
@@ -2604,13 +2605,13 @@ impl IndexNode for LockedExt4Inode {
         data: PrivateData,
         context: &vfs::permission::InodeOpContext,
         stage: &mut vfs::WritePrivilegeStage<'_>,
-    ) -> Result<usize, MemoryAllocationError> {
+    ) -> Result<vfs::PrimaryWriteResult, MemoryAllocationError> {
         let len = match &source {
             vfs::PrimaryWriteSource::Kernel(buffer) => len.min(buffer.len()),
             vfs::PrimaryWriteSource::User(..) => len,
         };
         if len == 0 {
-            return Ok(0);
+            return Ok(vfs::PrimaryWriteResult::new(0));
         }
         drop(data);
         let task = crate::process::ProcessManager::current_pcb();
@@ -2619,16 +2620,18 @@ impl IndexNode for LockedExt4Inode {
         let _operation = self.begin_operation()?;
         let size_change = self.size_change_lock.read();
         self.remove_write_privileges_locked(context, stage)?;
-        source.write_chunks(len, |relative, buffer| {
-            self.write_data_locked(
-                offset.checked_add(relative).ok_or(SystemError::EFBIG)?,
-                buffer.len(),
-                buffer,
-                &size_change,
-                &owner,
-                &creator,
-            )
-        })
+        source
+            .write_chunks(len, |relative, buffer| {
+                self.write_data_locked(
+                    offset.checked_add(relative).ok_or(SystemError::EFBIG)?,
+                    buffer.len(),
+                    buffer,
+                    &size_change,
+                    &owner,
+                    &creator,
+                )
+            })
+            .map(vfs::PrimaryWriteResult::new)
     }
 
     fn write_sync(&self, offset: usize, buf: &[u8]) -> Result<usize, SystemError> {

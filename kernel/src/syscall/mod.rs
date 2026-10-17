@@ -15,6 +15,7 @@ use crate::arch::interrupt::TrapFrame;
 
 use self::user_access::UserBufferWriter;
 
+pub mod iov;
 pub mod misc;
 mod sys_getrandom;
 mod sys_sysinfo;

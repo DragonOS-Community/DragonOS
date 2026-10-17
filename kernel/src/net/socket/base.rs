@@ -194,8 +194,15 @@ pub trait Socket: PollableInode + IndexNode {
         address: Option<Endpoint>,
     ) -> Result<(usize, Endpoint), SystemError>;
 
-    /// # `recv_msg`
-    fn recv_msg(&self, msg: &mut MsgHdr, flags: PMSG) -> Result<usize, SystemError>;
+    /// Receive using the syscall's validated iovec snapshot. Owners must not
+    /// reimport msg_iov: the borrowed snapshot stays alive across waiting and
+    /// error-queue processing, including message truncation and copy faults.
+    fn recv_msg(
+        &self,
+        msg: &mut MsgHdr,
+        flags: PMSG,
+        iovs: &crate::syscall::iov::IoVecs,
+    ) -> Result<usize, SystemError>;
 
     // select
     /// # `send`

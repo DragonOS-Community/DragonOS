@@ -827,14 +827,18 @@ impl Socket for UnixDatagramSocket {
         )
     }
 
-    fn recv_msg(&self, msg: &mut MsgHdr, flags: socket::PMSG) -> Result<usize, SystemError> {
+    fn recv_msg(
+        &self,
+        msg: &mut MsgHdr,
+        flags: socket::PMSG,
+        iovs: &crate::syscall::iov::IoVecs,
+    ) -> Result<usize, SystemError> {
         // recvmsg semantics:
         // - Deliver SCM_RIGHTS if present on the next datagram.
         // - If payload is truncated, set MSG_TRUNC.
         // - If control buffer is insufficient or missing, set MSG_CTRUNC.
         // - Fill msg_name/msg_namelen when provided.
 
-        let iovs = unsafe { IoVecs::from_user(msg.msg_iov, msg.msg_iovlen, true)? };
         let mut buf = iovs.new_buf(true)?;
         let buf_cap = buf.len();
 

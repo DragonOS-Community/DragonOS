@@ -148,6 +148,16 @@ fn read_into_user_buffer(fd: i32, user_ptr: *mut u8, len: usize) -> Result<usize
         return read_socket_into_user_buffer(file.as_ref(), &mut output);
     }
 
+    read_buffered_into_user(file.as_ref(), &mut output, None)
+}
+
+/// Shared bounded scalar transfer. An explicit cursor never updates the OFD.
+pub(super) fn read_buffered_into_user(
+    file: &File,
+    output: &mut UserBuffer<'_>,
+    position: Option<usize>,
+) -> Result<usize, SystemError> {
+    let len = output.len();
     let mut scratch = ReadScratch::default();
     let mut total = 0usize;
 
@@ -160,7 +170,11 @@ fn read_into_user_buffer(fd: i32, user_ptr: *mut u8, len: usize) -> Result<usize
             Err(_) if total != 0 => break,
             Err(error) => return Err(error),
         };
-        let n = match file.read_syscall_chunk(kbuf, &mut output, total) {
+        let read = match position {
+            Some(offset) => file.pread_into_user_syscall_chunk(offset + total, kbuf, output, total),
+            None => file.read_syscall_chunk(kbuf, output, total),
+        };
+        let n = match read {
             Ok(n) => n,
             Err(_) if total != 0 => break,
             Err(err) => return Err(err),

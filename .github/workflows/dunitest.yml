@@ -59,6 +59,9 @@ jobs:
           normal/pwritev2_flags
           normal/pwritev2_sync
           normal/legacy_writev_semantics
+          normal/position_read_semantics
+          normal/proc_write_position
+          normal/iov_snapshot_semantics
           normal/page_cache_accounting
           normal/vector_write_privileges
           normal/write_capability_admission

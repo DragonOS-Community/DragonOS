@@ -123,6 +123,7 @@ impl TcpSocket {
     pub(super) fn recv_icmp_error(
         &self,
         msg: &mut crate::net::posix::MsgHdr,
+        iovs: &crate::syscall::iov::IoVecs,
     ) -> Result<usize, SystemError> {
         let entry = {
             let guard = self.inner.read();
@@ -149,7 +150,7 @@ impl TcpSocket {
         }
         .ok_or(SystemError::EAGAIN_OR_EWOULDBLOCK)?;
         self.update_events();
-        let result = entry.recv_msg_with_options(msg, ErrorCmsgOptions::default());
+        let result = entry.recv_msg_with_options(msg, ErrorCmsgOptions::default(), iovs);
         msg.msg_flags |= PMSG::ERRQUEUE.bits() as i32;
         result
     }

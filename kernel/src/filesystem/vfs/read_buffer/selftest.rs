@@ -294,6 +294,10 @@ pub(crate) fn report() -> String {
             "mouse_read_contract",
             crate::driver::input::ps2_mouse::ps_mouse_device::selftest::run(),
         ),
+        (
+            "iov_accounting",
+            crate::syscall::iov::run_accounting_selftest().unwrap_or(false),
+        ),
         ("lazy_reuse", lazy_reuse()),
         ("growth_release", growth_release()),
         ("errors_release", errors_release()),

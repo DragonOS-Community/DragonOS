@@ -459,8 +459,8 @@ where
         &self,
         msg: &mut crate::net::posix::MsgHdr,
         flags: PMSG,
+        iovs: &crate::syscall::iov::IoVecs,
     ) -> Result<usize, SystemError> {
-        let iovs = unsafe { IoVecs::from_user(msg.msg_iov, msg.msg_iovlen, true)? };
         let packet = self.recv_packet(flags, None)?;
         let bytes = P::message_bytes(&packet);
         let orig_len = bytes.len();

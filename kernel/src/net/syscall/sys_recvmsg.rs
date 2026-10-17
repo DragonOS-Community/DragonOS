@@ -142,7 +142,7 @@ pub(super) fn do_recvmsg_with_sock(
         }
 
         // 优先使用 recv_msg 以便实现 msg_flags/msg_controllen 等语义。
-        match socket.recv_msg(&mut kmsg, pmsg_flags) {
+        match socket.recv_msg(&mut kmsg, pmsg_flags, &iovs) {
             Ok(recv_size) => (alloc::vec::Vec::new(), recv_size, true),
             Err(SystemError::ENOSYS) => {
                 let mut buf = iovs.new_buf(true)?;

@@ -6415,6 +6415,7 @@ impl IndexNode for MountFSInode {
             data,
             stage,
         )
+        .map(|result| result.written_len)
     }
 
     fn write_primary_with_privilege_stage(
@@ -6424,7 +6425,7 @@ impl IndexNode for MountFSInode {
         source: super::PrimaryWriteSource<'_, '_>,
         data: MutexGuard<FilePrivateData>,
         stage: &mut super::WritePrivilegeStage<'_>,
-    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+    ) -> Result<super::PrimaryWriteResult, crate::mm::allocation::MemoryAllocationError> {
         let _writer = self.ensure_io_writable()?;
         self.dentry.inode.write_primary_with_inode_context(
             offset,

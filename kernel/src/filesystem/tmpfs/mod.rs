@@ -2033,6 +2033,7 @@ impl IndexNode for LockedTmpfsInode {
             context,
             stage,
         )
+        .map(|result| result.written_len)
     }
 
     fn write_primary_with_privilege_stage(
@@ -2042,7 +2043,7 @@ impl IndexNode for LockedTmpfsInode {
         source: super::vfs::PrimaryWriteSource<'_, '_>,
         data: MutexGuard<FilePrivateData>,
         stage: &mut super::vfs::WritePrivilegeStage<'_>,
-    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+    ) -> Result<super::vfs::PrimaryWriteResult, crate::mm::allocation::MemoryAllocationError> {
         self.write_primary_with_inode_context(
             offset,
             len,
@@ -2061,14 +2062,14 @@ impl IndexNode for LockedTmpfsInode {
         _data: MutexGuard<FilePrivateData>,
         context: &super::vfs::permission::InodeOpContext,
         stage: &mut super::vfs::WritePrivilegeStage<'_>,
-    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+    ) -> Result<super::vfs::PrimaryWriteResult, crate::mm::allocation::MemoryAllocationError> {
         if let super::vfs::PrimaryWriteSource::Kernel(buffer) = &source {
             if buffer.len() < len {
                 return Err(SystemError::EINVAL.into());
             }
         }
         if len == 0 {
-            return Ok(0);
+            return Ok(super::vfs::PrimaryWriteResult::new(0));
         }
         drop(_data);
         let task = crate::process::ProcessManager::current_pcb();
@@ -2079,17 +2080,19 @@ impl IndexNode for LockedTmpfsInode {
             self.prepare_primary_write_locked(offset, len, context, stage)?;
         // Returning the typed inner result also unwinds content and any outer
         // append/copy-up guards before the caller may reclaim or wait.
-        source.write_chunks(permitted_len, |relative, buffer| {
-            self.write_data_locked(
-                offset.checked_add(relative).ok_or(SystemError::EFBIG)?,
-                buffer.len(),
-                buffer,
-                &page_cache,
-                &content,
-                &owner,
-                &creator,
-            )
-        })
+        source
+            .write_chunks(permitted_len, |relative, buffer| {
+                self.write_data_locked(
+                    offset.checked_add(relative).ok_or(SystemError::EFBIG)?,
+                    buffer.len(),
+                    buffer,
+                    &page_cache,
+                    &content,
+                    &owner,
+                    &creator,
+                )
+            })
+            .map(super::vfs::PrimaryWriteResult::new)
     }
 
     fn fs(&self) -> Arc<dyn FileSystem> {

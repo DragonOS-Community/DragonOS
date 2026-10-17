@@ -6,6 +6,7 @@
 #include <signal.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/epoll.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/wait.h>
@@ -163,6 +164,53 @@ TEST_F(PipeEmptySlot, TeeCopiesEmptySlotOnceWithoutConsumingInput) {
   EXPECT_EQ(0, read(output.reader(), &byte, 1));
   ExpectEmptyStreamRead(input);
   ExpectEmptyStreamRead(output);
+}
+
+TEST_F(PipeEmptySlot, ZeroOnlyTransfersDoNotQueueDestinationReadEvents) {
+  for (const bool consume : {false, true}) {
+    SCOPED_TRACE(consume ? "splice" : "tee");
+    PipePair input;
+    PipePair output;
+    ASSERT_TRUE(input.Open(O_DIRECT));
+    ASSERT_TRUE(output.Open());
+    ASSERT_EQ(2 * page_, fcntl(output.writer(), F_SETPIPE_SZ, 2 * page_));
+    const int events = epoll_create1(EPOLL_CLOEXEC);
+    ASSERT_GE(events, 0);
+    epoll_event registration = {};
+    registration.events = EPOLLIN;
+    registration.data.fd = output.reader();
+    // Register while empty, so a later fresh poll cannot be confused with a
+    // readiness event actually queued for an existing registration.
+    const int added = epoll_ctl(events, EPOLL_CTL_ADD, output.reader(), &registration);
+    if (added != 0) {
+      close(events);
+      FAIL() << strerror(errno);
+    }
+    AddEmptySlot(input);
+    errno = 0;
+    const ssize_t transferred = consume
+        ? splice(input.reader(), nullptr, output.writer(), nullptr, 1, SPLICE_F_NONBLOCK)
+        : tee(input.reader(), output.writer(), 1, SPLICE_F_NONBLOCK);
+    const int transfer_error = errno;
+    epoll_event observed = {};
+    const int zero_events = epoll_wait(events, &observed, 1, 0);
+    ExpectReady(output.reader(), POLLIN, true);
+    // Linux 6.6 splice_pipe_to_pipe/link_pipe notify only for positive bytes.
+    const ssize_t written = write(output.writer(), "x", 1);
+    const int data_events = epoll_wait(events, &observed, 1, 0);
+    close(events);
+    EXPECT_EQ(consume ? -1 : 0, transferred);
+    if (consume) EXPECT_EQ(EAGAIN, transfer_error);
+    EXPECT_EQ(0, zero_events);
+    EXPECT_EQ(1, written);
+    EXPECT_EQ(1, data_events);
+    EXPECT_EQ(static_cast<uint32_t>(EPOLLIN), observed.events);
+    EXPECT_EQ(output.reader(), observed.data.fd);
+    char byte = 0;
+    EXPECT_EQ(0, read(output.reader(), &byte, 1));
+    EXPECT_EQ(1, read(output.reader(), &byte, 1));
+    EXPECT_EQ('x', byte);
+  }
 }
 
 TEST_F(PipeEmptySlot, StreamReadSkipsEmptySlotAndReturnsFollowingData) {

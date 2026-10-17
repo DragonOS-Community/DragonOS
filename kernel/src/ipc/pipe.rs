@@ -1303,6 +1303,9 @@ impl PipeRuntime {
         if source_reader_wake != WakeMode::None {
             src.notify_readers(EPollEventType::empty());
         }
+        // Linux splice_pipe_to_pipe()/link_pipe() notify the destination only
+        // for positive bytes. A zero-only slot transfer changes fresh poll
+        // readiness, but does not queue a read event for existing waiters.
         if total != 0 {
             dst.publish_write_progress(WakeMode::One);
         }

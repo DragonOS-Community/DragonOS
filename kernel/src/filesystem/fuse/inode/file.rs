@@ -2039,7 +2039,23 @@ impl FuseNode {
                 core::cmp::min(max_pages_by_conn, io_config.max_readahead_pages),
             ),
         );
-        let pages_to_read = core::cmp::min(max_pages, core::cmp::max(req_pages, 16));
+        // 窗口增长：与 read() 路径 plan_fuse_readahead 同一算法的 mmap 侧接入。
+        // 顺序触碰（紧随上一窗口尾页）按 get_next_ra_size 增长，首次从
+        // get_init_ra_size 起步；随机触碰（如 ld.so 重定位散布）不增长，
+        // 保持 16 页基数避免放大填充量。始终受连接 max_read /
+        // max_readahead_pages 与 ra_pages 三重封顶。
+        let follows_previous = ra_state.prev_index >= 0
+            && (ra_state.prev_index as usize)
+                .checked_add(1)
+                .is_some_and(|next| page_index == next);
+        let window_pages = if ra_state.size == 0 {
+            ReadaheadControl::get_init_ra_size(core::cmp::max(req_pages, 1), max_pages)
+        } else if follows_previous {
+            ReadaheadControl::get_next_ra_size(ra_state.size, max_pages)
+        } else {
+            16
+        };
+        let pages_to_read = core::cmp::min(max_pages, core::cmp::max(window_pages, req_pages));
         let end_page = core::cmp::min(last_file_page + 1, page_index.saturating_add(pages_to_read));
 
         let file_ctx = FillPagesFileCtx {

@@ -11,15 +11,15 @@ use virtio_drivers::Error as VirtioError;
 use crate::driver::base::device::{Device, DeviceId};
 use crate::driver::virtio::transport::VirtIOTransport;
 use crate::driver::virtio::virtio_drivers_error_to_system_error;
+use crate::driver::virtio::virtio_impl::HalImpl;
 use crate::exception::irqdesc::IrqReturn;
 use crate::exception::IrqNumber;
-use crate::net::socket::vsock::wake_vsock_event_worker;
-use crate::driver::virtio::virtio_impl::HalImpl;
 use crate::libs::mutex::Mutex;
 use crate::net::socket::vsock::addr::VsockEndpoint;
 use crate::net::socket::vsock::transport::{
     VsockTransport, VsockTransportEvent, VsockTransportEventKind,
 };
+use crate::net::socket::vsock::wake_vsock_event_worker;
 use crate::net::socket::vsock::{ensure_transport_event_worker_started, register_transport};
 
 struct UnsafeVsockManager(VsockConnectionManager<HalImpl, VirtIOTransport>);
@@ -395,10 +395,9 @@ pub fn virtio_vsock(
                 );
             }
         }
-        if let Err(err) = super::irq::virtio_irq_manager().register_callback(
-            dev_id.clone(),
-            Arc::new(VsockIrqCallback),
-        ) {
+        if let Err(err) = super::irq::virtio_irq_manager()
+            .register_callback(dev_id.clone(), Arc::new(VsockIrqCallback))
+        {
             log::warn!(
                 "virtio-vsock irq callback registration failed for {:?}: {:?}",
                 dev_id.id(),

@@ -30,9 +30,9 @@ pub(super) fn validate_entry_on_iface(
     iface: &Arc<dyn Iface>,
     route: RouteEntry,
 ) -> Result<(), SystemError> {
-    if route.source.is_some() {
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
-    }
+    // Linux's IPv4 inet_rtm_newroute does not reject RTA_SRC selectors; an
+    // unhandled attribute is ignored and the route is still created. Accept
+    // and store it rather than failing with EOPNOTSUPP.
     if route.kind != RTN_UNICAST {
         return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
     }

@@ -817,11 +817,11 @@ impl VirtioInterface {
 
         let iface = iface::Interface::new(iface_config, &mut device_inner, Instant::now().into());
 
-        let flags = InterfaceFlags::UP
-            | InterfaceFlags::BROADCAST
-            | InterfaceFlags::RUNNING
-            | InterfaceFlags::MULTICAST
-            | InterfaceFlags::LOWER_UP;
+        // Linux registers netdevs administratively DOWN (BROADCAST|MULTICAST
+        // only); userspace — dragon-network or a guest agent — brings the
+        // link up. Baking UP/RUNNING/LOWER_UP in at probe time deviates from
+        // Linux and confuses clients that re-apply dumped flags.
+        let flags = InterfaceFlags::BROADCAST | InterfaceFlags::MULTICAST;
         let iface_name = format!("eth{}", iface_id);
         let iface = Arc::new(VirtioInterface {
             device_inner,

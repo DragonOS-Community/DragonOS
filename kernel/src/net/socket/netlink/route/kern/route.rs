@@ -273,11 +273,13 @@ fn validate_new_request(request: &RouteSegment) -> Result<(), SystemError> {
     {
         return Err(SystemError::EINVAL);
     }
-    if request.body().src_len != 0
-        || request
-            .attrs()
-            .iter()
-            .any(|attr| matches!(attr, RouteAttr::Src(_) | RouteAttr::Iif(_)))
+    // Linux's IPv4 fib_create_info does not consume RTA_SRC selectors; the
+    // attribute is ignored and the route is still created. Match that
+    // behaviour instead of failing with EOPNOTSUPP.
+    if request
+        .attrs()
+        .iter()
+        .any(|attr| matches!(attr, RouteAttr::Iif(_)))
     {
         return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
     }
@@ -305,11 +307,10 @@ fn validate_delete_request(request: &RouteSegment) -> Result<(), SystemError> {
     if request.body().type_ > RTN_MAX {
         return Err(SystemError::EINVAL);
     }
-    if request.body().src_len != 0
-        || request
-            .attrs()
-            .iter()
-            .any(|attr| matches!(attr, RouteAttr::Src(_) | RouteAttr::Iif(_)))
+    if request
+        .attrs()
+        .iter()
+        .any(|attr| matches!(attr, RouteAttr::Iif(_)))
     {
         return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
     }

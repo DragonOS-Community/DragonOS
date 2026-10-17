@@ -111,6 +111,10 @@ impl IpForwardFileOps {
 }
 
 impl FileOps for IpForwardFileOps {
+    fn supports_write_iter_flags(&self) -> bool {
+        true
+    }
+
     fn validate_inode(&self) -> Result<(), SystemError> {
         self.namespace.upgrade().map(|_| ())
     }

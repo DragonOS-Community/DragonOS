@@ -599,8 +599,9 @@ impl OvlInode {
                     &buffer[written..read_len],
                     false,
                 )?;
-                completed.sync_result?;
-                let n = completed.written_len;
+                // Copy-up holds filesystem resources. Complete pending
+                // notifications without starting reclaim under those guards.
+                let n = upper_file.finish_write_no_recovery(completed)?;
                 if n == 0 {
                     return Err(SystemError::EIO.into());
                 }

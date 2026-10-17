@@ -91,7 +91,13 @@ pub(super) fn write_at(
     data: crate::libs::mutex::MutexGuard<vfs::FilePrivateData>,
 ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
     let result = write_at_with_sync(inode, offset, len, buf, vfs::WriteSyncIntent::None, data)?;
-    result.sync_result?;
+    // The legacy scalar inode ABI cannot retain a completed write while
+    // unwinding for recovery. A backing sync charge is a terminal failure;
+    // returning it as recoverable would repeat the already committed data.
+    result.sync_result.map_err(|error| match error {
+        crate::mm::allocation::MemoryAllocationError::System(error) => error,
+        crate::mm::allocation::MemoryAllocationError::Charge(_) => SystemError::ENOMEM,
+    })?;
     Ok(result.written_len)
 }
 

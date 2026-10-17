@@ -121,6 +121,10 @@ impl DropCachesFileOps {
 }
 
 impl FileOps for DropCachesFileOps {
+    fn supports_write_iter_flags(&self) -> bool {
+        true
+    }
+
     fn read_at(
         &self,
         _offset: usize,
@@ -159,6 +163,10 @@ impl OomFaultInjectFileOps {
 }
 
 impl FileOps for OomFaultInjectFileOps {
+    fn supports_write_iter_flags(&self) -> bool {
+        true
+    }
+
     fn read_at(
         &self,
         offset: usize,

@@ -99,6 +99,11 @@ pub trait FileOps: Sync + Send + Sized + Debug {
     fn validate_inode(&self) -> Result<(), SystemError> {
         Ok(())
     }
+    /// Ordinary proc wrappers expose legacy `.write`, including files whose
+    /// reads use iterators. Sysctl providers explicitly select iterator writes.
+    fn supports_write_iter_flags(&self) -> bool {
+        false
+    }
     fn sysctl_access_bits(&self) -> Result<Option<u32>, SystemError> {
         Ok(None)
     }
@@ -168,6 +173,9 @@ pub trait FileOps: Sync + Send + Sized + Debug {
 impl<F: FileOps + 'static> IndexNode for ProcFile<F> {
     fn supports_read_iter_flags(&self) -> bool {
         self.inner.supports_read_iter_flags()
+    }
+    fn supports_write_iter_flags(&self) -> bool {
+        self.inner.supports_write_iter_flags()
     }
     fn sysctl_access_bits(&self) -> Result<Option<u32>, SystemError> {
         self.inner.sysctl_access_bits()

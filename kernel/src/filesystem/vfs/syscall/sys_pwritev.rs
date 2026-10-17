@@ -46,7 +46,7 @@ impl Syscall for SysPwriteVHandle {
         // WRITE/CAN_WRITE are checked after import, inside the File entry.
         file.verify_pwrite_access()?;
         let iovecs = unsafe { IoVecs::from_user(iov, iov_count, false) }?;
-        file.pwrite_user_vectored(offset as usize, &iovecs, false)
+        file.pwrite_user_vectored(offset as usize, &iovecs)
     }
 
     fn entry_format(&self, args: &[usize]) -> Vec<FormattedSyscallParam> {

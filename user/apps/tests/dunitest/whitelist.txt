@@ -237,3 +237,6 @@ normal/preadv2_flags
 normal/vector_write_privileges
 normal/write_capability_admission
 normal/primary_write_transaction
+
+normal/pwritev2_flags
+normal/pwritev2_sync

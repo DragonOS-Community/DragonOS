@@ -6352,6 +6352,10 @@ impl IndexNode for MountFSInode {
         self.dentry.inode.supports_read_iter_flags()
     }
 
+    fn supports_write_iter_flags(&self) -> bool {
+        self.dentry.inode.supports_write_iter_flags()
+    }
+
     fn read_user_at(
         &self,
         offset: usize,

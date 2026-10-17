@@ -185,6 +185,10 @@ impl CapLastCapFileOps {
 }
 
 impl FileOps for CapLastCapFileOps {
+    fn supports_write_iter_flags(&self) -> bool {
+        true
+    }
+
     fn read_at(
         &self,
         offset: usize,
@@ -216,6 +220,10 @@ impl ThreadsMaxFileOps {
 }
 
 impl FileOps for ThreadsMaxFileOps {
+    fn supports_write_iter_flags(&self) -> bool {
+        true
+    }
+
     fn read_at(
         &self,
         offset: usize,
@@ -267,6 +275,10 @@ impl PidMaxFileOps {
 }
 
 impl FileOps for PidMaxFileOps {
+    fn supports_write_iter_flags(&self) -> bool {
+        true
+    }
+
     fn read_at(
         &self,
         offset: usize,
@@ -335,6 +347,10 @@ impl UtsStringFileOps {
 }
 
 impl FileOps for UtsStringFileOps {
+    fn supports_write_iter_flags(&self) -> bool {
+        true
+    }
+
     fn read_at(
         &self,
         offset: usize,
@@ -436,6 +452,10 @@ impl PrintkFileOps {
 }
 
 impl FileOps for PrintkFileOps {
+    fn supports_write_iter_flags(&self) -> bool {
+        true
+    }
+
     fn read_at(
         &self,
         offset: usize,
@@ -479,6 +499,10 @@ impl OverflowIdFileOps {
 }
 
 impl FileOps for OverflowIdFileOps {
+    fn supports_write_iter_flags(&self) -> bool {
+        true
+    }
+
     fn read_at(
         &self,
         offset: usize,

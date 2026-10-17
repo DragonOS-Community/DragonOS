@@ -70,6 +70,10 @@ impl DeviceINode for LockedFullInode {
 }
 
 impl IndexNode for LockedFullInode {
+    fn supports_write_iter_flags(&self) -> bool {
+        false
+    }
+
     fn as_any_ref(&self) -> &dyn core::any::Any {
         self
     }

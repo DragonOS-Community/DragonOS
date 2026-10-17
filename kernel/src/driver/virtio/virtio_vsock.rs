@@ -11,6 +11,9 @@ use virtio_drivers::Error as VirtioError;
 use crate::driver::base::device::{Device, DeviceId};
 use crate::driver::virtio::transport::VirtIOTransport;
 use crate::driver::virtio::virtio_drivers_error_to_system_error;
+use crate::exception::irqdesc::IrqReturn;
+use crate::exception::IrqNumber;
+use crate::net::socket::vsock::wake_vsock_event_worker;
 use crate::driver::virtio::virtio_impl::HalImpl;
 use crate::libs::mutex::Mutex;
 use crate::net::socket::vsock::addr::VsockEndpoint;
@@ -297,6 +300,23 @@ fn map_vsock_error(error: VirtioError) -> SystemError {
     }
 }
 
+/// virtqueue 中断回调：事件到达时立即唤醒事件轮询线程。
+///
+/// 此前 vsock 事件完全依赖 10ms 定时轮询（无中断），每个宿主→guest 的
+/// 包平均要等 ~5ms，多帧往返累计出 ~40-50ms 的固定延迟。现在中断到达
+/// 即唤醒 worker，轮询保留为兜底（中断丢失/未启用时延迟上界仍为 10ms）。
+///
+/// MSI-X 为边沿消息中断，无需读写 ISR 状态寄存器（与 virtio-blk 的
+/// msix 分支一致，不在此 ack）。
+struct VsockIrqCallback;
+
+impl super::irq::VirtioIrqCallback for VsockIrqCallback {
+    fn handle_irq(&self, _irq: IrqNumber) -> Result<IrqReturn, SystemError> {
+        wake_vsock_event_worker();
+        Ok(IrqReturn::Handled)
+    }
+}
+
 /// 初始化并注册 virtio-vsock 设备。
 ///
 /// # 参数
@@ -313,6 +333,20 @@ pub fn virtio_vsock(
     dev_id: Arc<DeviceId>,
     _dev_parent: Option<Arc<dyn Device>>,
 ) {
+    // 在传输层被 VirtIOSocket 持有之前完成中断注册（与 virtio-blk 相同的
+    // 模式）：PCI 路径安装 MSI-X 向量并启用中断，MMIO 路径返回待延迟安装
+    // 的 irq。中断回调只负责唤醒事件线程，事件处理仍在 worker 上下文进行。
+    let irq_setup = match transport.setup_irq(dev_id.clone()) {
+        Ok(setup) => Some(setup),
+        Err(err) => {
+            log::warn!(
+                "virtio-vsock setup_irq failed for {:?}: {:?} (fallback to polling)",
+                dev_id.id(),
+                err
+            );
+            None
+        }
+    };
     let socket = match VirtIOSocket::<HalImpl, VirtIOTransport>::new(transport) {
         Ok(socket) => socket,
         Err(err) => {
@@ -349,4 +383,27 @@ pub fn virtio_vsock(
         return;
     }
     ensure_transport_event_worker_started();
+    if let Some(setup) = irq_setup {
+        // Installed(PCI) 变体经 into_deferred 泄漏化（永久保留安装，不回滚）；
+        // Deferred(MMIO) 变体在设备构造完成后立即安装。
+        if let Some(deferred) = setup.into_deferred() {
+            if let Err(err) = deferred.install(dev_id.clone()) {
+                log::warn!(
+                    "virtio-vsock deferred irq install failed for {:?}: {:?}",
+                    dev_id.id(),
+                    err
+                );
+            }
+        }
+        if let Err(err) = super::irq::virtio_irq_manager().register_callback(
+            dev_id.clone(),
+            Arc::new(VsockIrqCallback),
+        ) {
+            log::warn!(
+                "virtio-vsock irq callback registration failed for {:?}: {:?}",
+                dev_id.id(),
+                err
+            );
+        }
+    }
 }

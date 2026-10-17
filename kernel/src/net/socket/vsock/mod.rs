@@ -39,22 +39,31 @@ pub use transport::{
     VsockTransport, VsockTransportEvent,
 };
 
-// 当前仍是轮询模型。短期将空闲退避提高到 10ms，后续应迁移到中断驱动。
+// 事件到达现在以 virtqueue 中断唤醒为主（见 virtio_vsock.rs 的 IRQ 注册），
+// 下面的空闲睡眠保留为兜底：中断丢失或未启用的平台上，事件延迟上界仍为 10ms。
 const VSOCK_EVENT_WORKER_IDLE_SLEEP: Duration = Duration::from_millis(10);
 
 static VSOCK_EVENT_WORKER_STARTED: AtomicBool = AtomicBool::new(false);
 static VSOCK_EVENT_WORKER_SLEEP_QUEUE: WaitQueue = WaitQueue::default();
 
-/// 让 vsock 事件线程按给定超时时间休眠。
+/// 唤醒标志：中断回调置位后，worker 的条件等待立即返回。
 ///
-/// # 参数
-/// - `timeout`: 睡眠时长
-///
-/// # 行为
-/// - 通过 `WaitQueue` 的超时等待实现退避
+/// 不能只 `wakeup()` 队列而不给条件：`wait_event_*_timeout` 被唤醒后会重新
+/// 评估条件，条件仍为假就会继续睡到超时——唤醒会被静默丢弃。
+static VSOCK_EVENT_WORKER_WAKE: AtomicBool = AtomicBool::new(false);
+
+/// 让 vsock 事件线程按给定超时时间休眠：条件满足立即返回，否则最多睡满超时。
 fn vsock_event_worker_sleep(timeout: Duration) {
-    let _ =
-        VSOCK_EVENT_WORKER_SLEEP_QUEUE.wait_event_uninterruptible_timeout(|| false, Some(timeout));
+    let _ = VSOCK_EVENT_WORKER_SLEEP_QUEUE.wait_event_uninterruptible_timeout(
+        || VSOCK_EVENT_WORKER_WAKE.swap(false, core::sync::atomic::Ordering::AcqRel),
+        Some(timeout),
+    );
+}
+
+/// 由 virtqueue 中断上下文调用：立即唤醒事件轮询线程。
+pub(crate) fn wake_vsock_event_worker() {
+    VSOCK_EVENT_WORKER_WAKE.store(true, core::sync::atomic::Ordering::Release);
+    VSOCK_EVENT_WORKER_SLEEP_QUEUE.wakeup(None);
 }
 
 /// vsock transport 事件轮询线程主循环。

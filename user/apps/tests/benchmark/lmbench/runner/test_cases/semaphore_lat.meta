@@ -1,0 +1,12 @@
+# Extraction/metadata for semaphore_lat (KEY=VALUE; parsed by run.sh)
+CATEGORY=ipc
+BINARY=lat_sem
+METRIC_TYPE=latency
+UNIT=microseconds
+BIGGER_IS_BETTER=0
+# lat_sem prints "Semaphore latency: <N> microseconds" (prefix confirmed via
+# strings; lat_sem hung on host, to be confirmed in guest).
+SEARCH_PATTERN=Semaphore latency
+RESULT_INDEX=NF-1
+NTH_OCCURRENCE=1
+DESCRIPTION=Semaphore latency via lat_sem

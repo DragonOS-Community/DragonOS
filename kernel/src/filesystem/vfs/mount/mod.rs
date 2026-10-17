@@ -6348,6 +6348,10 @@ impl IndexNode for MountFSInode {
         self.dentry.inode.user_read_mode()
     }
 
+    fn supports_read_iter_flags(&self) -> bool {
+        self.dentry.inode.supports_read_iter_flags()
+    }
+
     fn read_user_at(
         &self,
         offset: usize,
@@ -6356,6 +6360,18 @@ impl IndexNode for MountFSInode {
         data: MutexGuard<FilePrivateData>,
     ) -> Result<Option<usize>, SystemError> {
         self.dentry.inode.read_user_at(offset, len, writer, data)
+    }
+
+    fn write_user_buffer_at(
+        &self,
+        offset: usize,
+        len: usize,
+        source: &crate::syscall::user_buffer::UserBuffer<'_>,
+        data: MutexGuard<FilePrivateData>,
+    ) -> Result<Option<usize>, crate::mm::allocation::MemoryAllocationError> {
+        self.dentry
+            .inode
+            .write_user_buffer_at(offset, len, source, data)
     }
 
     fn read_at(

@@ -427,6 +427,10 @@ mod extent_validation_tests {
 }
 
 impl FileOps for IdMapFileOps {
+    fn supports_read_iter_flags(&self) -> bool {
+        false
+    }
+
     fn owner(&self) -> Option<(usize, usize)> {
         self.target.owner_uid_gid()
     }
@@ -549,6 +553,10 @@ impl SetgroupsFileOps {
 }
 
 impl FileOps for SetgroupsFileOps {
+    fn supports_read_iter_flags(&self) -> bool {
+        false
+    }
+
     fn owner(&self) -> Option<(usize, usize)> {
         self.target.owner_uid_gid()
     }

@@ -150,6 +150,10 @@ impl ProtocolsFileOps {
 }
 
 impl FileOps for ProtocolsFileOps {
+    fn supports_read_iter_flags(&self) -> bool {
+        false
+    }
+
     fn read_at(
         &self,
         offset: usize,

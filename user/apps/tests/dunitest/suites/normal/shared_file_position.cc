@@ -89,11 +89,7 @@ class SharedFilePosition : public ::testing::Test {
                 if (operation == 0) count = read(copies[thread], data.data(), kBytes);
                 else if (operation == 1) count = readv(copies[thread], iovs, 3);
                 else {
-#if defined(__x86_64__)
                     count = syscall(SYS_preadv2, copies[thread], iovs, 3, -1L, -1L, 0L);
-#else
-                    count = syscall(SYS_preadv2, copies[thread], iovs, 3, -1L, 0L);
-#endif
                 }
                 if (count != static_cast<ssize_t>(kBytes)) {
                     valid[thread] = false;

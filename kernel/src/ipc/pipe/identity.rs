@@ -169,6 +169,17 @@ impl IndexNode for LockedPipeInode {
     ) -> Result<usize, MemoryAllocationError> {
         Self::runtime(&data)?.write_at(offset, len, buf, data)
     }
+    fn write_user_buffer_at(
+        &self,
+        _offset: usize,
+        len: usize,
+        source: &crate::syscall::user_buffer::UserBuffer<'_>,
+        data: MutexGuard<FilePrivateData>,
+    ) -> Result<Option<usize>, MemoryAllocationError> {
+        Self::runtime(&data)?
+            .write_user_buffer(len, source, data)
+            .map(Some)
+    }
     fn open(
         &self,
         mut data: MutexGuard<FilePrivateData>,

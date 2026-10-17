@@ -237,7 +237,7 @@ fn nonblock_prep_pipe_read(pipe_in: &File, flags: SpliceFlags) -> Result<(), Sys
     }
 
     let pipe_inode = get_pipe_inode(pipe_in)?;
-    if pipe_inode.readable_len() == 0 && pipe_inode.has_writers() {
+    if !pipe_inode.has_buffered_slots() && pipe_inode.has_writers() {
         return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
     }
     // no writers => EOF; allow read path to return 0

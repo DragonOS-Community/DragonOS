@@ -49,6 +49,10 @@ impl CgroupFileOps {
 }
 
 impl FileOps for CgroupFileOps {
+    fn supports_read_iter_flags(&self) -> bool {
+        false
+    }
+
     fn read_at(
         &self,
         offset: usize,

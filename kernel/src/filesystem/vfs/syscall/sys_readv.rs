@@ -53,6 +53,15 @@ pub(super) fn readv_from_user(
     iov: *const IoVec,
     count: usize,
 ) -> Result<usize, SystemError> {
+    readv_from_user_with_flags(fd, iov, count, 0)
+}
+
+pub(super) fn readv_from_user_with_flags(
+    fd: i32,
+    iov: *const IoVec,
+    count: usize,
+    flags: u32,
+) -> Result<usize, SystemError> {
     let file = get_read_file(fd)?;
     // Linux fdget excludes O_PATH before importing the vector; the other
     // mode checks belong after import_iovec in Linux 6.6.
@@ -65,13 +74,13 @@ pub(super) fn readv_from_user(
     let _position = file.lock_position();
     let iovecs = unsafe { IoVecs::from_user(iov, count, true) }?;
 
-    read_iovecs(file.as_ref(), &iovecs)
+    read_iovecs(file.as_ref(), &iovecs, flags)
 }
 
 /// Complete a non-positional vectored read after the iovec array is imported.
 /// Shared by readv and preadv2(offset = -1), as required by Linux semantics.
 /// The fd admission entry holds the position lock through import and this call.
-pub(super) fn read_iovecs(file: &File, iovecs: &IoVecs) -> Result<usize, SystemError> {
+pub(super) fn read_iovecs(file: &File, iovecs: &IoVecs, flags: u32) -> Result<usize, SystemError> {
     file.readable()?;
     let max_rw_count = MAX_RW_COUNT;
     let requested = iovecs.total_len().min(max_rw_count);
@@ -79,6 +88,7 @@ pub(super) fn read_iovecs(file: &File, iovecs: &IoVecs) -> Result<usize, SystemE
         return finish_readv(file, 0);
     }
     file.verify_read_range(requested)?;
+    super::sys_preadv2::validate_read_flags(file, flags)?;
 
     // Linux falls back to one `.read` call per iovec when an inode does
     // not implement `.read_iter`. Record readers that consume data before

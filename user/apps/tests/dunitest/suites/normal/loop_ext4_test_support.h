@@ -140,6 +140,19 @@ class LoopExt4 {
         mounted_ = false;
     }
 
+    void Rebind() {
+        ASSERT_FALSE(mounted_);
+        ASSERT_FALSE(second_mounted_);
+        ASSERT_FALSE(detached_);
+        ASSERT_GE(loop_fd_, 0);
+        ASSERT_GE(backing_fd_, 0);
+        // With no other device openers in the isolated guest, ordinary umount
+        // must release its holder before returning. SET_FD immediately exposes
+        // a deferred clear; never wait or retry.
+        ASSERT_EQ(0, ioctl(loop_fd_, kLoopClrFd, 0)) << strerror(errno);
+        ASSERT_EQ(0, ioctl(loop_fd_, kLoopSetFd, backing_fd_)) << strerror(errno);
+    }
+
     void RequestAutoclearAndCloseLoop() {
         ASSERT_GE(loop_fd_, 0);
         ASSERT_EQ(0, ioctl(loop_fd_, kLoopClrFd, 0)) << strerror(errno);

@@ -401,6 +401,46 @@ std::string ReadFile(const char* path) {
     return result;
 }
 
+TEST(Ext4InodeIdentity, ReadonlyAndWritableUnmountReleaseLoopBeforeReturn) {
+    LoopExt4 fs;
+    ASSERT_NO_FATAL_FAILURE(fs.SetUp());
+    ASSERT_NO_FATAL_FAILURE(fs.Mount());
+    const std::string path = fs.mount_point() + "/cold_rebind";
+    std::string expected(3 * 4096 + 37, '\0');
+    for (size_t i = 0; i < expected.size(); ++i) {
+        expected[i] = static_cast<char>((i * 37 + i / 4096) % 251);
+    }
+    int fd = open(path.c_str(), O_CREAT | O_EXCL | O_WRONLY, 0600);
+    ASSERT_GE(fd, 0) << strerror(errno);
+    ASSERT_NO_FATAL_FAILURE(WriteAll(fd, expected.data(), expected.size()));
+    ASSERT_EQ(0, close(fd)) << strerror(errno);
+    // No fsync: the writable final shutdown must persist these dirty bytes
+    // before releasing the mount's device holder and allowing a cold rebind.
+    ASSERT_NO_FATAL_FAILURE(fs.Unmount());
+    ASSERT_NO_FATAL_FAILURE(fs.Rebind());
+    ASSERT_NO_FATAL_FAILURE(fs.Mount(MS_RDONLY));
+    ASSERT_EQ(expected, ReadFile(path.c_str()));
+
+    // Readonly shutdown performs no final writes, but must still release its
+    // holder synchronously rather than leaving cleanup to delayed Arc drops.
+    ASSERT_NO_FATAL_FAILURE(fs.Unmount());
+    ASSERT_NO_FATAL_FAILURE(fs.Rebind());
+    ASSERT_NO_FATAL_FAILURE(fs.Mount());
+    ASSERT_EQ(expected, ReadFile(path.c_str()));
+    for (size_t i = 4093; i < 8197; ++i) {
+        expected[i] = static_cast<char>((i * 19 + 83) % 251);
+    }
+    fd = open(path.c_str(), O_WRONLY);
+    ASSERT_GE(fd, 0) << strerror(errno);
+    ASSERT_NO_FATAL_FAILURE(WriteAll(fd, expected.data(), expected.size()));
+    ASSERT_EQ(0, close(fd)) << strerror(errno);
+    ASSERT_NO_FATAL_FAILURE(fs.Unmount());
+    ASSERT_NO_FATAL_FAILURE(fs.Rebind());
+    ASSERT_NO_FATAL_FAILURE(fs.Mount(MS_RDONLY));
+    EXPECT_EQ(expected, ReadFile(path.c_str()));
+    ASSERT_NO_FATAL_FAILURE(fs.Unmount());
+}
+
 TEST(Ext4InodeIdentity, KernelLifecycleSelftestPasses) {
     LoopExt4 fs;
     ASSERT_NO_FATAL_FAILURE(fs.SetUp());

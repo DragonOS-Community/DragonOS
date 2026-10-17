@@ -126,8 +126,9 @@ pub struct FATFileSystem {
     reclaim_wait: WaitQueue,
     /// 当前文件系统所在的分区
     pub gendisk: Arc<GenDisk>,
-    /// Prevents loop clear/remove for the complete filesystem lifetime.
-    _device_mount_holder: GenDiskMountGuard,
+    /// Keeps the device bound until final shutdown completes. The lock also
+    /// serializes shutdown with the fallback performed by Drop.
+    device_mount_holder: Mutex<Option<GenDiskMountGuard>>,
     /// 当前文件系统的BOPB
     pub bpb: BiosParameterBlock,
     /// 当前文件系统的第一个数据扇区（相对分区开始位置）
@@ -737,6 +738,12 @@ impl LockedFATInode {
 }
 
 impl FileSystem for FATFileSystem {
+    fn on_umount(&self) {
+        if let Err(error) = self.shutdown() {
+            error!("Umount FAT filesystem failed: errno={error:?}, FS detail:{self:?}");
+        }
+    }
+
     fn seal_eviction_queue(&self) -> EvictionEpoch {
         let mut queue = self.reclaim_queue.lock();
         queue.sealed = true;
@@ -1058,7 +1065,7 @@ impl FATFileSystem {
             reclaim_worker: WorkQueue::try_new_owned("fat_evict")?,
             reclaim_wait: WaitQueue::default(),
             gendisk,
-            _device_mount_holder: device_mount_holder,
+            device_mount_holder: Mutex::new(Some(device_mount_holder)),
             bpb,
             first_data_sector,
             fs_info: Arc::new(LockedFATFsInfo::new(fs_info)),
@@ -1593,7 +1600,7 @@ impl FATFileSystem {
     ///
     /// @return Ok(()) 设置成功
     /// @return Err(SystemError) 在设置过程中，出现错误
-    pub fn set_shut_bit_ok(&mut self) -> Result<(), SystemError> {
+    pub fn set_shut_bit_ok(&self) -> Result<(), SystemError> {
         match self.bpb.fat_type {
             FATType::FAT32(_) => {
                 let raw_entry = self.get_fat_entry_raw(Cluster::new(1))? | 0x0800_0000;
@@ -1616,7 +1623,7 @@ impl FATFileSystem {
     ///
     /// @return Ok(()) 设置成功
     /// @return Err(SystemError) 在设置过程中，出现错误
-    pub fn set_hard_error_bit_ok(&mut self) -> Result<(), SystemError> {
+    pub fn set_hard_error_bit_ok(&self) -> Result<(), SystemError> {
         match self.bpb.fat_type {
             FATType::FAT32(_) => {
                 let raw_entry = self.get_fat_entry_raw(Cluster::new(1))? | 0x0400_0000;
@@ -1634,7 +1641,7 @@ impl FATFileSystem {
     }
 
     /// @brief 执行文件系统卸载前的一些准备工作：设置好对应的标志位，并把缓存中的数据刷入磁盘
-    pub fn umount(&mut self) -> Result<(), SystemError> {
+    pub fn umount(&self) -> Result<(), SystemError> {
         self.fs_info.0.lock().flush(&self.gendisk)?;
 
         self.set_shut_bit_ok()?;
@@ -1644,6 +1651,18 @@ impl FATFileSystem {
         self.gendisk.sync()?;
 
         return Ok(());
+    }
+
+    fn shutdown(&self) -> Result<(), SystemError> {
+        let mut holder = self.device_mount_holder.lock();
+        if holder.is_none() {
+            return Ok(());
+        }
+        let result = self.umount();
+        // Release the semantic device owner before VFS publishes shutdown
+        // completion. A later Drop must never write to a rebound loop device.
+        drop(holder.take());
+        result
     }
 
     /// @brief 获取文件系统的最大簇号
@@ -1704,7 +1723,7 @@ impl FATFileSystem {
 
 impl Drop for FATFileSystem {
     fn drop(&mut self) {
-        let r = self.umount();
+        let r = self.shutdown();
         if let Err(e) = r {
             error!(
                 "Umount FAT filesystem failed: errno={:?}, FS detail:{self:?}",

@@ -226,6 +226,10 @@ impl StatusFileOps {
 }
 
 impl FileOps for StatusFileOps {
+    fn supports_read_iter_flags(&self) -> bool {
+        false
+    }
+
     fn read_at(
         &self,
         offset: usize,

@@ -146,6 +146,10 @@ impl FdInfoFileOps {
 }
 
 impl FileOps for FdInfoFileOps {
+    fn supports_read_iter_flags(&self) -> bool {
+        false
+    }
+
     fn open(
         &self,
         _data: &mut MutexGuard<FilePrivateData>,

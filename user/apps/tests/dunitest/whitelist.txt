@@ -229,3 +229,7 @@ normal/read_buffer_selftest
 normal/shared_file_position
 
 normal/ext4_shared_xattr
+
+normal/pipe_write_fault
+normal/pipe_empty_slot
+normal/preadv2_flags

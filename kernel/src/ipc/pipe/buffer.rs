@@ -98,11 +98,14 @@ impl PipeBuffer {
         None
     }
     pub(super) fn push_segment(&mut self, segment: PipeSegment) {
-        assert!(segment.len != 0 && self.segments.len() < self.segments.capacity());
+        assert!(self.segments.len() < self.segments.capacity());
         self.segments.push_back(segment);
     }
-    pub(super) fn clear_last_merge(&mut self) {
-        self.segments.back_mut().expect("transfer target").mergeable = false;
+    pub(super) fn pop_front(&mut self) -> Option<PipeSegment> {
+        self.segments.pop_front()
+    }
+    pub(super) fn set_last_segment(&mut self, segment: PipeSegment) {
+        *self.segments.back_mut().expect("transfer target") = segment;
     }
     pub(super) fn extend_last(&mut self, len: usize) {
         self.segments.back_mut().expect("merge target").len += len;
@@ -113,6 +116,10 @@ impl PipeBuffer {
                 .segments
                 .front_mut()
                 .expect("pipe bytes have provenance");
+            if first.len == 0 {
+                self.segments.pop_front();
+                continue;
+            }
             let consumed = len.min(first.len);
             first.offset += consumed;
             first.len -= consumed;

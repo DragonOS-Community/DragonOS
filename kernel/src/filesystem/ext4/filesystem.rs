@@ -160,8 +160,9 @@ pub struct Ext4FileSystem {
     /// Strong device owner used by ext4 PageCache batch reads. Keeping this
     /// exact partition object avoids a late device-number lookup after submit.
     pub(super) gendisk: Arc<GenDisk>,
-    /// Prevents loop clear/remove for the complete filesystem lifetime.
-    _device_mount_holder: GenDiskMountGuard,
+    /// Keeps the device bound through final shutdown, independently of stale
+    /// in-memory references to the retired filesystem.
+    device_mount_holder: Mutex<Option<GenDiskMountGuard>>,
 
     /// 根 inode
     root_inode: Arc<LockedExt4Inode>,
@@ -463,6 +464,34 @@ impl FileSystem for Ext4FileSystem {
     }
 
     fn on_umount(&self) {
+        let mut holder = self.device_mount_holder.lock();
+        if holder.is_none() {
+            return;
+        }
+        self.shutdown_on_umount();
+        // All final filesystem I/O and journal workers have completed before
+        // VFS publishes shutdown completion and permits a new device binding.
+        drop(holder.take());
+    }
+
+    fn seal_eviction_queue(&self) -> EvictionEpoch {
+        let mut queue = self.eviction_queue.lock();
+        queue.sealed = true;
+        EvictionEpoch::new(queue.next_epoch)
+    }
+
+    fn drain_evictions_through(&self, epoch: EvictionEpoch) -> Result<(), SystemError> {
+        self.eviction_wait
+            .wait_until(|| {
+                let queue = self.eviction_queue.lock();
+                (queue.completed_epoch >= epoch.value()).then(|| queue.error.clone())
+            })
+            .map_or(Ok(()), Err)
+    }
+}
+
+impl Ext4FileSystem {
+    fn shutdown_on_umount(&self) {
         if self._mount_options.read_only {
             return;
         }
@@ -484,23 +513,6 @@ impl FileSystem for Ext4FileSystem {
         }
     }
 
-    fn seal_eviction_queue(&self) -> EvictionEpoch {
-        let mut queue = self.eviction_queue.lock();
-        queue.sealed = true;
-        EvictionEpoch::new(queue.next_epoch)
-    }
-
-    fn drain_evictions_through(&self, epoch: EvictionEpoch) -> Result<(), SystemError> {
-        self.eviction_wait
-            .wait_until(|| {
-                let queue = self.eviction_queue.lock();
-                (queue.completed_epoch >= epoch.value()).then(|| queue.error.clone())
-            })
-            .map_or(Ok(()), Err)
-    }
-}
-
-impl Ext4FileSystem {
     pub(super) fn wait_metadata_mutation_progress(&self, observed: u64) -> Result<(), SystemError> {
         if self.fs.metadata_mutations_terminal() || self.lifecycle_error.lock().is_some() {
             return Err(SystemError::EIO);
@@ -1460,7 +1472,7 @@ impl Ext4FileSystem {
             fs,
             raw_dev,
             gendisk: mount_data,
-            _device_mount_holder: device_mount_holder,
+            device_mount_holder: Mutex::new(Some(device_mount_holder)),
             root_inode,
             dirty_inodes: Mutex::new(Vec::new()),
             inode_table: Mutex::new(BTreeMap::new()),

@@ -72,6 +72,16 @@ impl<F: FileOps> ProcFile<F> {
 
 /// FileOps trait 定义了 procfs 文件需要实现的操作
 pub trait FileOps: Sync + Send + Sized + Debug {
+    /// Apply provider-specific operation capabilities after the common open
+    /// defaults have been established.
+    fn configure_open_file(&self, _data: &FilePrivateData, _behavior: &mut OpenFileBehavior) {}
+
+    /// Global seq/single and sysctl providers use Linux's iterator flags.
+    /// Providers backed by legacy proc `.read` operations override this
+    /// without changing their buffered copy implementation.
+    fn supports_read_iter_flags(&self) -> bool {
+        true
+    }
     /// Check dynamic backing identity before exposing inode attributes.
     fn validate_inode(&self) -> Result<(), SystemError> {
         Ok(())
@@ -143,11 +153,15 @@ pub trait FileOps: Sync + Send + Sized + Debug {
 /// 使用 inherit_methods 宏从 common 继承通用方法
 #[inherit_methods(from = "self.common")]
 impl<F: FileOps + 'static> IndexNode for ProcFile<F> {
+    fn supports_read_iter_flags(&self) -> bool {
+        self.inner.supports_read_iter_flags()
+    }
     fn sysctl_access_bits(&self) -> Result<Option<u32>, SystemError> {
         self.inner.sysctl_access_bits()
     }
-    fn configure_open_file(&self, _data: &FilePrivateData, behavior: &mut OpenFileBehavior) {
+    fn configure_open_file(&self, data: &FilePrivateData, behavior: &mut OpenFileBehavior) {
         behavior.post_write_sync = PostWriteSyncPolicy::NotApplicable;
+        self.inner.configure_open_file(data, behavior);
     }
 
     fn fs(&self) -> Arc<dyn FileSystem>;

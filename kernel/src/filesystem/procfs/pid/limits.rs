@@ -154,6 +154,10 @@ impl LimitsFile {
 }
 
 impl FileOps for LimitsFile {
+    fn supports_read_iter_flags(&self) -> bool {
+        false
+    }
+
     fn read_at(
         &self,
         offset: usize,

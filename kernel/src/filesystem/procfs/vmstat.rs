@@ -1,5 +1,7 @@
 //! /proc/vmstat - 虚拟内存统计信息
 
+use crate::filesystem::procfs::template::configure_seq_file;
+use crate::filesystem::vfs::OpenFileBehavior;
 use crate::libs::mutex::MutexGuard;
 use crate::{
     arch::MMArch,
@@ -493,6 +495,10 @@ impl VmstatFileOps {
 }
 
 impl FileOps for VmstatFileOps {
+    fn configure_open_file(&self, _data: &FilePrivateData, behavior: &mut OpenFileBehavior) {
+        configure_seq_file(behavior);
+    }
+
     fn read_at(
         &self,
         offset: usize,

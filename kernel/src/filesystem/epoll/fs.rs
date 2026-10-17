@@ -1,4 +1,5 @@
 use crate::filesystem::anon_inode::{anon_inode_metadata, anon_inode_path, AnonInodeFs};
+use crate::filesystem::vfs::file::FileMode;
 use alloc::string::String;
 
 use crate::{
@@ -32,6 +33,9 @@ impl EPollInode {
 
 impl IndexNode for EPollInode {
     fn configure_open_file(&self, _data: &FilePrivateData, behavior: &mut OpenFileBehavior) {
+        behavior
+            .mode
+            .remove(FileMode::FMODE_CAN_READ | FileMode::FMODE_CAN_WRITE);
         behavior.post_write_sync = PostWriteSyncPolicy::NotApplicable;
     }
 

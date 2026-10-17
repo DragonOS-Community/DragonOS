@@ -33,6 +33,8 @@ pub use self::{
     sym::{ProcSym, SymOps},
 };
 
+pub(crate) use file::{configure_readonly_seq_file, configure_seq_file};
+
 /// Common - 所有 procfs inode 共享的基础设施
 ///
 /// 包含：

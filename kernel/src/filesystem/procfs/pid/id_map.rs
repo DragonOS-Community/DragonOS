@@ -2,6 +2,8 @@
 //!
 //! 实现 User Namespace 的 UID/GID 映射和 setgroups 控制文件。
 
+use crate::filesystem::procfs::template::configure_seq_file;
+use crate::filesystem::vfs::OpenFileBehavior;
 use crate::libs::mutex::MutexGuard;
 use crate::{
     filesystem::{
@@ -427,6 +429,10 @@ mod extent_validation_tests {
 }
 
 impl FileOps for IdMapFileOps {
+    fn configure_open_file(&self, _data: &FilePrivateData, behavior: &mut OpenFileBehavior) {
+        configure_seq_file(behavior);
+    }
+
     fn supports_read_iter_flags(&self) -> bool {
         false
     }
@@ -553,6 +559,10 @@ impl SetgroupsFileOps {
 }
 
 impl FileOps for SetgroupsFileOps {
+    fn configure_open_file(&self, _data: &FilePrivateData, behavior: &mut OpenFileBehavior) {
+        configure_seq_file(behavior);
+    }
+
     fn supports_read_iter_flags(&self) -> bool {
         false
     }

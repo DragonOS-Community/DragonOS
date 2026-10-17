@@ -232,6 +232,7 @@ impl SymOps for NsSymOps {
             snapshot.nsid.data()
         ));
         let inode = ProcFileBuilder::new(NamespaceFileOps { snapshot }, InodeMode::S_IRUGO)
+            .immutable()
             .fs(self.fs.clone())
             .build()
             .ok()?;

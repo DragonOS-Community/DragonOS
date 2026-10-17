@@ -170,10 +170,18 @@ struct OvlInodeCache {
     insertions_since_prune: usize,
 }
 
+/// Weak owners shared by path-specific overlay inodes of one logical inode.
+/// Keeping FIFO identity here also survives copy-up and hardlink aliases.
+#[derive(Debug)]
+struct OvlInodeOwners {
+    coordinator: Weak<LinkMutationCoordinator>,
+    fifo: Weak<crate::ipc::pipe::LockedPipeInode>,
+}
+
 #[derive(Debug, Default)]
 struct OvlLinkStateCache {
     entries: HashMap<OvlLinkIdentity, Weak<OvlLinkState>>,
-    coordinators: HashMap<OvlLinkIdentity, Weak<LinkMutationCoordinator>>,
+    inode_owners: HashMap<OvlLinkIdentity, OvlInodeOwners>,
     /// Copy-up publishes this small identity connector before the new upper
     /// name becomes visible. It preserves a lower-origin seed without eagerly
     /// allocating the shared mutation state on lookup or open.
@@ -183,31 +191,54 @@ struct OvlLinkStateCache {
     /// authoritative union count can never allocate after namespace change.
     divergent: HashMap<OvlLinkIdentity, Arc<OvlLinkState>>,
     insertions_since_prune: usize,
-    coordinator_insertions_since_prune: usize,
+    owner_insertions_since_prune: usize,
 }
 
 impl OvlLinkStateCache {
-    fn intern_coordinator(
+    fn intern_inode_owners(
         &mut self,
         identity: OvlLinkIdentity,
-    ) -> Result<Arc<LinkMutationCoordinator>, SystemError> {
-        if let Some(coordinator) = self.coordinators.get(&identity).and_then(Weak::upgrade) {
-            return Ok(coordinator);
+        file_type: FileType,
+    ) -> Result<
+        (
+            Arc<LinkMutationCoordinator>,
+            Option<Arc<crate::ipc::pipe::LockedPipeInode>>,
+        ),
+        SystemError,
+    > {
+        let cached = self.inode_owners.get(&identity);
+        let coordinator = cached.and_then(|owners| owners.coordinator.upgrade());
+        let fifo = (file_type == FileType::Pipe).then(|| {
+            cached
+                .and_then(|owners| owners.fifo.upgrade())
+                .unwrap_or_else(crate::ipc::pipe::LockedPipeInode::new_fifo_shell)
+        });
+        if let Some(coordinator) = coordinator {
+            if let Some(fifo) = fifo.as_ref() {
+                self.inode_owners.get_mut(&identity).unwrap().fifo = Arc::downgrade(fifo);
+            }
+            return Ok((coordinator, fifo));
         }
-        if self.coordinator_insertions_since_prune >= INODE_CACHE_PRUNE_INTERVAL {
-            self.coordinators
-                .retain(|_, coordinator| coordinator.strong_count() != 0);
-            self.coordinator_insertions_since_prune = 0;
+        if self.owner_insertions_since_prune >= INODE_CACHE_PRUNE_INTERVAL {
+            self.inode_owners.retain(|_, owners| {
+                owners.coordinator.strong_count() != 0 || owners.fifo.strong_count() != 0
+            });
+            self.owner_insertions_since_prune = 0;
         }
-        self.coordinators
+        self.inode_owners
             .try_reserve(1)
             .map_err(|_| SystemError::ENOMEM)?;
         let coordinator =
             Arc::try_new(LinkMutationCoordinator::new()).map_err(|_| SystemError::ENOMEM)?;
-        self.coordinators
-            .insert(identity, Arc::downgrade(&coordinator));
-        self.coordinator_insertions_since_prune += 1;
-        Ok(coordinator)
+        self.inode_owners.insert(
+            identity,
+            OvlInodeOwners {
+                coordinator: Arc::downgrade(&coordinator),
+                fifo: fifo.as_ref().map(Arc::downgrade).unwrap_or_default(),
+            },
+        );
+        self.owner_insertions_since_prune += 1;
+        Ok((coordinator, fifo))
     }
 
     fn resolve(&self, identity: OvlLinkIdentity) -> Option<Arc<OvlLinkState>> {
@@ -589,12 +620,16 @@ impl OverlayFS {
                 // intern one when this lookup really needs a new inode; the
                 // cache comparison below decides which racing replacement is
                 // published, and the loser drops its temporary references.
-                let link_coordinator = match link_identity {
-                    Some(identity) if file_type != FileType::Dir => {
-                        self.link_state_cache.lock().intern_coordinator(identity)?
-                    }
-                    _ => Arc::try_new(LinkMutationCoordinator::new())
-                        .map_err(|_| SystemError::ENOMEM)?,
+                let (link_coordinator, fifo) = match link_identity {
+                    Some(identity) if file_type != FileType::Dir => self
+                        .link_state_cache
+                        .lock()
+                        .intern_inode_owners(identity, file_type)?,
+                    _ => (
+                        Arc::try_new(LinkMutationCoordinator::new())
+                            .map_err(|_| SystemError::ENOMEM)?,
+                        None,
+                    ),
                 };
                 let inode = Arc::new(OvlInode::new(
                     redirect.clone(),
@@ -603,6 +638,7 @@ impl OverlayFS {
                     lower_inodes.clone(),
                     fallback_id,
                     link_coordinator,
+                    fifo,
                 ));
                 inode.set_fs(Arc::downgrade(self));
                 inode
@@ -1044,6 +1080,7 @@ impl MountableFileSystem for OverlayFS {
                         None,
                         Arc::try_new(LinkMutationCoordinator::new())
                             .map_err(|_| SystemError::ENOMEM)?,
+                        None,
                     )),
                     index: 0,
                     fsid: 0,
@@ -1089,6 +1126,7 @@ impl MountableFileSystem for OverlayFS {
                         None,
                         Arc::try_new(LinkMutationCoordinator::new())
                             .map_err(|_| SystemError::ENOMEM)?,
+                        None,
                     )),
                     index: (i + 1) as u32,
                     fsid: (i + 1) as u32,
@@ -1165,6 +1203,7 @@ impl MountableFileSystem for OverlayFS {
                 .collect(),
             (!samefs).then(generate_inode_id),
             Arc::try_new(LinkMutationCoordinator::new()).map_err(|_| SystemError::ENOMEM)?,
+            None,
         ));
 
         let super_block = SuperBlock::new(vfs::Magic::OVERLAYFS_MAGIC, 4096, 255);

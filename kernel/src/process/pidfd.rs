@@ -1,3 +1,5 @@
+use crate::filesystem::vfs::file::FileMode;
+use crate::filesystem::vfs::OpenFileBehavior;
 use core::any::Any;
 
 use alloc::{string::String, sync::Arc, vec::Vec};
@@ -34,6 +36,12 @@ impl PidFdInode {
 }
 
 impl IndexNode for PidFdInode {
+    fn configure_open_file(&self, _data: &FilePrivateData, behavior: &mut OpenFileBehavior) {
+        behavior
+            .mode
+            .remove(FileMode::FMODE_CAN_READ | FileMode::FMODE_CAN_WRITE);
+    }
+
     fn is_stream(&self) -> bool {
         true
     }

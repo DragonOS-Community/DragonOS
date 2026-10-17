@@ -2,6 +2,8 @@
 //!
 //! 这个目录包含了进程打开的所有文件描述符的详细信息
 
+use crate::filesystem::procfs::template::configure_readonly_seq_file;
+use crate::filesystem::vfs::OpenFileBehavior;
 use crate::filesystem::{
     procfs::{
         pid::ProcPidTarget,
@@ -146,6 +148,10 @@ impl FdInfoFileOps {
 }
 
 impl FileOps for FdInfoFileOps {
+    fn configure_open_file(&self, _data: &FilePrivateData, behavior: &mut OpenFileBehavior) {
+        configure_readonly_seq_file(behavior);
+    }
+
     fn supports_read_iter_flags(&self) -> bool {
         false
     }

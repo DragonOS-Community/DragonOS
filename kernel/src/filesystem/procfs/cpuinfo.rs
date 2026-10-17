@@ -1,13 +1,15 @@
 //! `/proc/cpuinfo` 文件操作
 //! 提供 CPU 信息的只读接口
 
+use crate::filesystem::procfs::template::configure_seq_file;
+use crate::filesystem::vfs::OpenFileBehavior;
 use crate::{
     filesystem::{
         procfs::{
             template::{Builder, FileOps, ProcFileBuilder},
             utils::proc_read_snapshot,
         },
-        vfs::{IndexNode, InodeMode},
+        vfs::{FilePrivateData, IndexNode, InodeMode},
     },
     smp::cpu::smp_cpu_manager,
 };
@@ -29,6 +31,10 @@ impl CpuInfoFileOps {
 }
 
 impl FileOps for CpuInfoFileOps {
+    fn configure_open_file(&self, _data: &FilePrivateData, behavior: &mut OpenFileBehavior) {
+        configure_seq_file(behavior);
+    }
+
     fn read_at(
         &self,
         offset: usize,

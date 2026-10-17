@@ -1,5 +1,7 @@
 //! /proc/stat - 系统统计信息
 
+use crate::filesystem::procfs::template::configure_seq_file;
+use crate::filesystem::vfs::OpenFileBehavior;
 use crate::{
     filesystem::{
         procfs::{
@@ -130,6 +132,10 @@ impl StatFileOps {
 }
 
 impl FileOps for StatFileOps {
+    fn configure_open_file(&self, _data: &FilePrivateData, behavior: &mut OpenFileBehavior) {
+        configure_seq_file(behavior);
+    }
+
     fn read_at(
         &self,
         offset: usize,

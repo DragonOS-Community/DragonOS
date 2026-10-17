@@ -1,3 +1,5 @@
+use crate::filesystem::vfs::file::FileMode;
+use crate::filesystem::vfs::OpenFileBehavior;
 mod bpf;
 mod kprobe;
 pub(crate) mod release;
@@ -287,6 +289,18 @@ impl Deref for PerfEventInode {
 }
 
 impl IndexNode for PerfEventInode {
+    fn configure_open_file(&self, _data: &FilePrivateData, behavior: &mut OpenFileBehavior) {
+        behavior.mode.remove(FileMode::FMODE_CAN_WRITE);
+    }
+
+    fn supports_pread(&self) -> bool {
+        false
+    }
+
+    fn supports_pwrite(&self) -> bool {
+        false
+    }
+
     fn mmap(&self, start: usize, len: usize, offset: usize) -> Result<()> {
         self.core.event.mmap(start, len, offset)
     }

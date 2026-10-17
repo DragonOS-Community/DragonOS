@@ -5,6 +5,8 @@
 //! DragonOS 目前没有 1:1 的 proto_list，采用“静态能力表 + 可扩展注册点”的方式提供
 //! 兼容的输出格式。
 
+use crate::filesystem::procfs::template::configure_seq_file;
+use crate::filesystem::vfs::OpenFileBehavior;
 use crate::filesystem::{
     procfs::{
         template::{Builder, FileOps, ProcFileBuilder},
@@ -150,6 +152,10 @@ impl ProtocolsFileOps {
 }
 
 impl FileOps for ProtocolsFileOps {
+    fn configure_open_file(&self, _data: &FilePrivateData, behavior: &mut OpenFileBehavior) {
+        configure_seq_file(behavior);
+    }
+
     fn supports_read_iter_flags(&self) -> bool {
         false
     }

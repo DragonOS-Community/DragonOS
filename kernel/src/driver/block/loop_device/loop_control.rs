@@ -1,3 +1,5 @@
+use crate::filesystem::vfs::file::FileMode;
+use crate::filesystem::vfs::OpenFileBehavior;
 use crate::{
     driver::base::{
         class::Class,
@@ -102,6 +104,18 @@ impl Debug for LoopControlDevice {
 }
 
 impl IndexNode for LoopControlDevice {
+    fn configure_open_file(&self, _data: &FilePrivateData, behavior: &mut OpenFileBehavior) {
+        // Linux loop_ctl_fops has no read/write method and its
+        // nonseekable_open clears positional access after generic open setup.
+        behavior.mode.remove(
+            FileMode::FMODE_CAN_READ
+                | FileMode::FMODE_CAN_WRITE
+                | FileMode::FMODE_LSEEK
+                | FileMode::FMODE_PREAD
+                | FileMode::FMODE_PWRITE,
+        );
+    }
+
     fn open(
         &self,
         _data: MutexGuard<FilePrivateData>,

@@ -87,16 +87,22 @@ impl<T: Socket + 'static> IndexNode for T {
         self.write(buf).map_err(Into::into)
     }
 
-    fn write_user_at(
+    fn write_user_buffer_at(
         &self,
         _offset: usize,
         len: usize,
-        reader: &UserBufferReader<'_>,
+        source: &crate::syscall::user_buffer::UserBuffer<'_>,
         data: MutexGuard<FilePrivateData>,
-    ) -> Result<Option<usize>, SystemError> {
+    ) -> Result<Option<usize>, crate::mm::allocation::MemoryAllocationError> {
         drop(data);
-        self.send_user_buffer(reader, len, super::PMSG::empty(), None)
+        let Some(address) = source.as_contiguous_address() else {
+            // A vector retains the existing single-record kernel fallback.
+            return Ok(None);
+        };
+        let reader = UserBufferReader::new(address.data() as *const u8, source.len(), true)?;
+        self.send_user_buffer(&reader, len, super::PMSG::empty(), None)
             .map(Some)
+            .map_err(Into::into)
     }
 
     fn resize(&self, _len: usize) -> Result<(), crate::mm::allocation::MemoryAllocationError> {

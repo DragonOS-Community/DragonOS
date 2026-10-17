@@ -7,6 +7,8 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
+#include <sys/uio.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -157,6 +159,84 @@ TEST(PrimaryWriteTransaction, AppendAcrossChunksAdvancesOffsetOnce) {
         if (lseek(file.fd(), 0, SEEK_CUR) != static_cast<off_t>(2 * length)) return 5;
         return matches(file.fd(), 0, first) && matches(file.fd(), length, second) ? 0 : 6;
     });
+}
+
+namespace {
+ssize_t vector_write(int operation, int fd, const iovec* vectors, int count, off_t offset) {
+    if (operation == 0) return writev(fd, vectors, count);
+    if (operation == 1) return pwritev(fd, vectors, count, offset);
+    return syscall(SYS_pwritev2, fd, vectors, count, offset, 0UL, 0U);
+}
+}  // namespace
+
+TEST(PrimaryWriteTransaction, VectorSourceCrossesChunksWithoutLosingIovBoundaries) {
+    for (int operation : {0, 1, 2}) {
+        SCOPED_TRACE(operation);
+        TestFile file;
+        ASSERT_GE(file.fd(), 0);
+        run_child([&] {
+            const size_t length = 3 * kChunk + 31;
+            std::vector<unsigned char> bytes(length);
+            for (size_t i = 0; i < length; ++i) bytes[i] = (i * 17 + i / 4096) & 255;
+            iovec vectors[] = {{bytes.data(), 4093}, {bytes.data() + 4093, kChunk + 19},
+                              {bytes.data() + 4093 + kChunk + 19, length - 4093 - kChunk - 19}};
+            if (vector_write(operation, file.fd(), vectors, 3, 0) != static_cast<ssize_t>(length)) return 1;
+            if (lseek(file.fd(), 0, SEEK_CUR) != (operation == 0 ? static_cast<off_t>(length) : 0)) return 2;
+            return matches(file.fd(), 0, bytes) ? 0 : 3;
+        });
+    }
+}
+
+TEST(PrimaryWriteTransaction, VectorFaultAcrossChunksCommitsOnlyExactPrefix) {
+    for (int operation : {0, 1, 2}) {
+        SCOPED_TRACE(operation);
+        TestFile file;
+        ASSERT_GE(file.fd(), 0);
+        run_child([&] {
+            const size_t length = 3 * kChunk;
+            void* source = mmap(nullptr, length, PROT_READ | PROT_WRITE,
+                                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (source == MAP_FAILED) return 1;
+            memset(source, 'Q', 2 * kChunk);
+            if (mprotect(static_cast<char*>(source) + 2 * kChunk, kChunk, PROT_NONE) != 0) return 2;
+            iovec vectors[] = {{source, kChunk - 17},
+                              {static_cast<char*>(source) + kChunk - 17, kChunk + 17},
+                              {static_cast<char*>(source) + 2 * kChunk, kChunk}};
+            ssize_t result = vector_write(operation, file.fd(), vectors, 3, 0);
+            munmap(source, length);
+            if (result != static_cast<ssize_t>(2 * kChunk)) return 3;
+            struct stat metadata{};
+            if (fstat(file.fd(), &metadata) != 0 || metadata.st_size != static_cast<off_t>(2 * kChunk)) return 4;
+            if (lseek(file.fd(), 0, SEEK_CUR) != (operation == 0 ? static_cast<off_t>(2 * kChunk) : 0)) return 5;
+            return matches(file.fd(), 0, std::vector<unsigned char>(2 * kChunk, 'Q')) ? 0 : 6;
+        });
+    }
+}
+
+TEST(PrimaryWriteTransaction, VectorSameFileMappedSourceCanFaultInsideTransaction) {
+    for (int operation : {0, 1, 2}) {
+        SCOPED_TRACE(operation);
+        TestFile file;
+        ASSERT_GE(file.fd(), 0);
+        run_child([&] {
+            const size_t length = 3 * kChunk + 31;
+            std::vector<unsigned char> bytes(length);
+            for (size_t i = 0; i < length; ++i) bytes[i] = (i * 29 + i / 4096) & 255;
+            if (pwrite(file.fd(), bytes.data(), length, 0) != static_cast<ssize_t>(length)) return 1;
+            void* source = mmap(nullptr, length, PROT_READ, MAP_PRIVATE, file.fd(), 0);
+            if (source == MAP_FAILED) return 2;
+            if (madvise(source, length, MADV_DONTNEED) != 0) return 3;
+            iovec vectors[] = {{source, kChunk - 17},
+                              {static_cast<char*>(source) + kChunk - 17, kChunk + 35},
+                              {static_cast<char*>(source) + 2 * kChunk + 18, length - 2 * kChunk - 18}};
+            if (lseek(file.fd(), length, SEEK_SET) != static_cast<off_t>(length)) return 4;
+            ssize_t result = vector_write(operation, file.fd(), vectors, 3, length);
+            munmap(source, length);
+            if (result != static_cast<ssize_t>(length)) return 5;
+            if (lseek(file.fd(), 0, SEEK_CUR) != static_cast<off_t>((operation == 0 ? 2 : 1) * length)) return 6;
+            return matches(file.fd(), 0, bytes) && matches(file.fd(), length, bytes) ? 0 : 7;
+        });
+    }
 }
 
 int main(int argc, char** argv) {

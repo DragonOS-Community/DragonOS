@@ -7,6 +7,7 @@
 //!
 //! See `docs/kernel/filesystem/inotify.md` §4 for details.
 
+use crate::filesystem::vfs::OpenFileBehavior;
 use alloc::collections::VecDeque;
 use alloc::string::{String, ToString};
 use alloc::sync::{Arc, Weak};
@@ -879,6 +880,10 @@ impl PollableInode for InotifyInode {
 }
 
 impl IndexNode for InotifyInode {
+    fn configure_open_file(&self, _data: &FilePrivateData, behavior: &mut OpenFileBehavior) {
+        behavior.mode.remove(FileMode::FMODE_CAN_WRITE);
+    }
+
     /// An inotify fd is not seekable: pread/pwrite/lseek → ESPIPE.
     fn is_stream(&self) -> bool {
         true

@@ -1,3 +1,4 @@
+use crate::filesystem::vfs::file::FileMode;
 use alloc::{
     boxed::Box,
     collections::BTreeMap,
@@ -649,6 +650,7 @@ impl PollableInode for TimerFdInode {
 
 impl IndexNode for TimerFdInode {
     fn configure_open_file(&self, _data: &FilePrivateData, behavior: &mut OpenFileBehavior) {
+        behavior.mode.remove(FileMode::FMODE_CAN_WRITE);
         behavior.post_write_sync = PostWriteSyncPolicy::NotApplicable;
     }
 

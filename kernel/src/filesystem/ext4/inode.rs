@@ -3,18 +3,18 @@ use crate::mm::allocation::MemoryAllocationError;
 use crate::{
     arch::{CurrentTimeArch, MMArch},
     driver::base::device::device_number::{DeviceNumber, Major},
-    exception::workqueue::{schedule_work, Work},
+    exception::workqueue::Work,
     filesystem::{
         page_cache::{
-            AsyncPageCacheBackend, PageCache, PageCacheBackend, PageCacheDirtyCertificate,
-            PageCacheExpectedDirtyTransition, PageCacheRangeResult, PageCacheReadBatchCompletion,
-            PageCacheReadBatchRequest, PageCacheWritebackAdmissionOrder,
-            PageCacheWritebackBindResult, PageCacheWritebackCancellationContext,
-            PageCacheWritebackCompletion, PageCacheWritebackDescriptor,
-            PageCacheWritebackDispatchOutcome, PageCacheWritebackProgress,
-            PageCacheWritebackProgressOutcome, PageCacheWritebackProtocol,
-            PageCacheWritebackSnapshotPhase, PageCacheWritebackSubmission,
-            PageCacheWritebackSubmitResult,
+            schedule_pagecache_writeback, AsyncPageCacheBackend, PageCache, PageCacheBackend,
+            PageCacheDirtyCertificate, PageCacheExpectedDirtyTransition, PageCacheRangeResult,
+            PageCacheReadBatchCompletion, PageCacheReadBatchRequest,
+            PageCacheWritebackAdmissionOrder, PageCacheWritebackBindResult,
+            PageCacheWritebackCancellationContext, PageCacheWritebackCompletion,
+            PageCacheWritebackDescriptor, PageCacheWritebackDispatchOutcome,
+            PageCacheWritebackProgress, PageCacheWritebackProgressOutcome,
+            PageCacheWritebackProtocol, PageCacheWritebackSnapshotPhase,
+            PageCacheWritebackSubmission, PageCacheWritebackSubmitResult,
         },
         vfs::{
             self, syscall::RenameFlags, utils::DName, vcore::generate_inode_id, FilePrivateData,
@@ -559,10 +559,18 @@ impl Ext4DelallocProgress {
             progress.publish(PageCacheWritebackProgressOutcome::Cancelled);
             return;
         };
+        let executor = match domain_io.writeback_executor() {
+            Ok(executor) => executor,
+            Err(error) => {
+                progress.work_scheduled.store(false, Ordering::Release);
+                progress.publish(PageCacheWritebackProgressOutcome::Failed(error));
+                return;
+            }
+        };
         let progress = progress.clone();
         let inode_weak = Arc::downgrade(&inode);
         let work_state = Mutex::new(Some((inode, domain_io)));
-        schedule_work(Work::new(move || {
+        let work = Work::new(move || {
             let Some((inode, domain_io)) = work_state.lock().take() else {
                 return;
             };
@@ -661,7 +669,8 @@ impl Ext4DelallocProgress {
                 }
                 Ext4DelallocProducerRunOutcome::Passive => {}
             }
-        }));
+        });
+        schedule_pagecache_writeback(&executor, work);
     }
 }
 

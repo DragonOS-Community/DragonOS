@@ -1,3 +1,5 @@
+use crate::filesystem::procfs::template::configure_seq_file;
+use crate::filesystem::vfs::OpenFileBehavior;
 use crate::libs::mutex::MutexGuard;
 use crate::{
     filesystem::{
@@ -66,6 +68,10 @@ impl LoadavgFileOps {
 }
 
 impl FileOps for LoadavgFileOps {
+    fn configure_open_file(&self, _data: &FilePrivateData, behavior: &mut OpenFileBehavior) {
+        configure_seq_file(behavior);
+    }
+
     fn read_at(
         &self,
         offset: usize,

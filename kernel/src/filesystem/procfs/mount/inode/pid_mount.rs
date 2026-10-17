@@ -1,3 +1,5 @@
+use crate::filesystem::procfs::template::configure_readonly_seq_file;
+use crate::filesystem::vfs::OpenFileBehavior;
 use core::fmt::Debug;
 
 use crate::filesystem::{
@@ -38,6 +40,10 @@ impl MountProcFileOps {
 }
 
 impl FileOps for MountProcFileOps {
+    fn configure_open_file(&self, _data: &FilePrivateData, behavior: &mut OpenFileBehavior) {
+        configure_readonly_seq_file(behavior);
+    }
+
     fn owner(&self) -> Option<(usize, usize)> {
         self.target.owner_uid_gid()
     }

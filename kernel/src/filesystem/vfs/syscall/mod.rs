@@ -7,7 +7,7 @@ mod link_utils;
 mod mknod_utils;
 mod newfstat;
 mod open_utils;
-mod pread_pwrite_common;
+mod pread_common;
 use super::read_buffer;
 mod readlink_at;
 mod rename_utils;

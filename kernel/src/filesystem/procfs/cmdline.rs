@@ -2,6 +2,8 @@
 //!
 //! 这个文件展示了传递给内核的启动参数
 
+use crate::filesystem::procfs::template::configure_seq_file;
+use crate::filesystem::vfs::OpenFileBehavior;
 use alloc::string::ToString;
 
 use crate::libs::mutex::MutexGuard;
@@ -48,6 +50,10 @@ impl CmdlineFileOps {
 }
 
 impl FileOps for CmdlineFileOps {
+    fn configure_open_file(&self, _data: &FilePrivateData, behavior: &mut OpenFileBehavior) {
+        configure_seq_file(behavior);
+    }
+
     fn read_at(
         &self,
         offset: usize,

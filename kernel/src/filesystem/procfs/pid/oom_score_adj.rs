@@ -1,5 +1,7 @@
 //! /proc/[pid]/oom_score_adj - OOM killer score adjustment.
 
+use crate::filesystem::procfs::template::configure_readonly_seq_file;
+use crate::filesystem::vfs::OpenFileBehavior;
 use crate::libs::mutex::MutexGuard;
 use crate::{
     filesystem::{
@@ -48,6 +50,10 @@ impl OomScoreFileOps {
 }
 
 impl FileOps for OomScoreFileOps {
+    fn configure_open_file(&self, _data: &FilePrivateData, behavior: &mut OpenFileBehavior) {
+        configure_readonly_seq_file(behavior);
+    }
+
     fn supports_read_iter_flags(&self) -> bool {
         false
     }

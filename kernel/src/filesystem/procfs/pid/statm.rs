@@ -2,6 +2,8 @@
 //!
 //! 显示进程的内存使用统计（以页为单位）
 
+use crate::filesystem::procfs::template::configure_readonly_seq_file;
+use crate::filesystem::vfs::OpenFileBehavior;
 use crate::libs::mutex::MutexGuard;
 use crate::{
     arch::MMArch,
@@ -37,6 +39,10 @@ impl StatmFileOps {
 }
 
 impl FileOps for StatmFileOps {
+    fn configure_open_file(&self, _data: &FilePrivateData, behavior: &mut OpenFileBehavior) {
+        configure_readonly_seq_file(behavior);
+    }
+
     fn supports_read_iter_flags(&self) -> bool {
         false
     }

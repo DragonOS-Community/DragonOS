@@ -110,6 +110,63 @@ impl<'a> UserBuffer<'a> {
         }
     }
 
+    /// Only legacy scalar adapters may interpret this buffer as one range.
+    pub fn as_contiguous_address(&self) -> Option<VirtAddr> {
+        match self.backing {
+            UserBufferBacking::Contiguous(addr) => Some(addr),
+            UserBufferBacking::Vectored(_) => None,
+        }
+    }
+
+    /// Copy a byte prefix without changing whole-record copy semantics.
+    /// Inaccessible later segments stop the logical input at the actual fault.
+    pub fn read_prefix_from_user(
+        &self,
+        offset: usize,
+        dst: &mut [u8],
+    ) -> Result<usize, SystemError> {
+        if offset > self.len {
+            return Err(SystemError::EINVAL);
+        }
+        let copy_len = dst.len().min(self.len - offset);
+        if copy_len == 0 {
+            return Ok(0);
+        }
+        let copy = |address, bytes: &mut [u8]| unsafe {
+            crate::syscall::user_access::copy_from_user_prefix_protected(bytes, address)
+        };
+        match &self.backing {
+            UserBufferBacking::Contiguous(addr) => copy(*addr + offset, &mut dst[..copy_len]),
+            UserBufferBacking::Vectored(segments) => {
+                let mut skip = offset;
+                let mut copied = 0;
+                for segment in *segments {
+                    if skip >= segment.len {
+                        skip -= segment.len;
+                        continue;
+                    }
+                    let want = (segment.len - skip).min(copy_len - copied);
+                    let n = match copy(segment.addr + skip, &mut dst[copied..copied + want]) {
+                        Ok(n) => n,
+                        Err(SystemError::EFAULT) if copied != 0 => return Ok(copied),
+                        Err(error) => return Err(error),
+                    };
+                    copied += n;
+                    if n < want || copied == copy_len {
+                        return Ok(copied);
+                    }
+                    skip = 0;
+                }
+                // A constructed logical buffer must have sufficient capacity.
+                if copied != 0 {
+                    Ok(copied)
+                } else {
+                    Err(SystemError::EFAULT)
+                }
+            }
+        }
+    }
+
     /// 从用户缓冲区读取数据到内核缓冲区
     ///
     /// # 参数

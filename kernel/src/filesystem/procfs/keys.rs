@@ -4,6 +4,8 @@
 //! key/account tables, while the fd retains only the produced slice and its
 //! resume cursor.  Visibility uses the credential pinned by opening the fd.
 
+use crate::filesystem::procfs::template::configure_seq_file;
+use crate::filesystem::vfs::OpenFileBehavior;
 use alloc::{
     format,
     string::String,
@@ -257,6 +259,10 @@ impl KeysFileOps {
 }
 
 impl FileOps for KeysFileOps {
+    fn configure_open_file(&self, _data: &FilePrivateData, behavior: &mut OpenFileBehavior) {
+        configure_seq_file(behavior);
+    }
+
     fn read_at(
         &self,
         offset: usize,
@@ -332,6 +338,10 @@ impl KeyUsersFileOps {
 }
 
 impl FileOps for KeyUsersFileOps {
+    fn configure_open_file(&self, _data: &FilePrivateData, behavior: &mut OpenFileBehavior) {
+        configure_seq_file(behavior);
+    }
+
     fn read_at(
         &self,
         offset: usize,

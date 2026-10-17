@@ -67,6 +67,9 @@ impl Drop for OvlLinkMutation<'_> {
 pub struct OvlInode {
     pub(super) redirect: String, // Redirect path
     pub(super) file_type: FileType,
+    /// Logical FIFO identity belongs to the overlay, independently of backing
+    /// selection. The existing identity interner shares this across aliases.
+    fifo: Option<Arc<crate::ipc::pipe::LockedPipeInode>>,
     #[allow(dead_code)]
     pub(super) flags: Mutex<u64>,
     pub(super) upper_inode: Mutex<Option<Arc<dyn IndexNode>>>, // Read-write layer (upper)
@@ -252,6 +255,7 @@ impl OvlInode {
         lower_inodes: Vec<Arc<dyn IndexNode>>,
         overlay_inode_id: Option<InodeId>,
         link_mutation_coordinator: Arc<LinkMutationCoordinator>,
+        fifo: Option<Arc<crate::ipc::pipe::LockedPipeInode>>,
     ) -> Self {
         let backing_retentions = upper
             .iter()
@@ -262,6 +266,7 @@ impl OvlInode {
         Self {
             redirect,
             file_type,
+            fifo,
             flags: Mutex::new(0),
             upper_inode: Mutex::new(upper),
             lower_inodes,
@@ -556,6 +561,12 @@ impl IndexNode for OvlInode {
         }
     }
 
+    fn special_node(&self) -> Option<vfs::SpecialNodeData> {
+        self.fifo
+            .as_ref()
+            .map(|pipe| vfs::SpecialNodeData::Pipe(pipe.clone()))
+    }
+
     fn append_lock_fs(&self) -> Option<Arc<dyn FileSystem>> {
         Some(self.fs())
     }
@@ -597,6 +608,18 @@ impl IndexNode for OvlInode {
         data: crate::libs::mutex::MutexGuard<vfs::FilePrivateData>,
     ) -> Result<vfs::DelegatedWriteResult, crate::mm::allocation::MemoryAllocationError> {
         file::write_at_with_sync(self, offset, len, buf, sync_intent, data)
+    }
+
+    fn write_primary_with_sync_with_privilege_stage(
+        &self,
+        offset: usize,
+        len: usize,
+        source: vfs::PrimaryWriteSource<'_, '_>,
+        sync_intent: vfs::WriteSyncIntent,
+        data: crate::libs::mutex::MutexGuard<vfs::FilePrivateData>,
+        stage: &mut vfs::WritePrivilegeStage<'_>,
+    ) -> Result<vfs::DelegatedWriteResult, crate::mm::allocation::MemoryAllocationError> {
+        file::write_primary_with_sync(self, offset, len, source, sync_intent, data, stage)
     }
 
     fn sync_file(

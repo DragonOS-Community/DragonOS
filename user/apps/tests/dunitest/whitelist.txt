@@ -261,3 +261,8 @@ normal/recvmsg_record_buffer
 normal/tcp_receive_window_reopen
 
 normal/ext4_user_read
+
+# Original user I/O admission and owner error ordering
+normal/direct_read_semantics
+normal/directory_read_admission
+normal/proc_write_admission

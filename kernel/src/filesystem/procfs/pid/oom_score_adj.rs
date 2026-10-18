@@ -1,6 +1,7 @@
 //! /proc/[pid]/oom_score_adj - OOM killer score adjustment.
 
 use crate::filesystem::procfs::template::configure_readonly_seq_file;
+use crate::filesystem::procfs::template::ProcWriteCallback;
 use crate::filesystem::vfs::{OpenFileBehavior, PrimaryWriteResult};
 use crate::libs::mutex::MutexGuard;
 use crate::{
@@ -214,6 +215,10 @@ impl OomScoreAdjFileOps {
 }
 
 impl FileOps for OomScoreAdjFileOps {
+    fn write_callback(&self) -> Option<ProcWriteCallback<Self>> {
+        Some(Self::write_at_with_position)
+    }
+
     fn supports_read_iter_flags(&self) -> bool {
         false
     }
@@ -234,17 +239,9 @@ impl FileOps for OomScoreAdjFileOps {
         let content = format!("{}\n", score);
         proc_read(offset, len, buf, content.as_bytes())
     }
+}
 
-    fn write_at(
-        &self,
-        _offset: usize,
-        _len: usize,
-        buf: &[u8],
-        _data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError> {
-        self.write_score(buf)
-    }
-
+impl OomScoreAdjFileOps {
     fn write_at_with_position(
         &self,
         offset: usize,

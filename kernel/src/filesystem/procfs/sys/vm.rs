@@ -1,5 +1,6 @@
 //! /proc/sys/vm - 虚拟内存参数目录
 
+use crate::filesystem::procfs::template::ProcWriteCallback;
 use crate::libs::mutex::MutexGuard;
 use crate::{
     filesystem::{
@@ -121,6 +122,13 @@ impl DropCachesFileOps {
 }
 
 impl FileOps for DropCachesFileOps {
+    fn write_callback(&self) -> Option<ProcWriteCallback<Self>> {
+        Some(|ops, offset, len, buf, data| {
+            ops.write_at(offset, len, buf, data)
+                .map(crate::filesystem::vfs::PrimaryWriteResult::new)
+        })
+    }
+
     fn supports_write_iter_flags(&self) -> bool {
         true
     }
@@ -134,7 +142,9 @@ impl FileOps for DropCachesFileOps {
     ) -> Result<usize, SystemError> {
         Err(SystemError::EACCES)
     }
+}
 
+impl DropCachesFileOps {
     fn write_at(
         &self,
         _offset: usize,
@@ -163,6 +173,13 @@ impl OomFaultInjectFileOps {
 }
 
 impl FileOps for OomFaultInjectFileOps {
+    fn write_callback(&self) -> Option<ProcWriteCallback<Self>> {
+        Some(|ops, offset, len, buf, data| {
+            ops.write_at(offset, len, buf, data)
+                .map(crate::filesystem::vfs::PrimaryWriteResult::new)
+        })
+    }
+
     fn supports_write_iter_flags(&self) -> bool {
         true
     }
@@ -180,7 +197,9 @@ impl FileOps for OomFaultInjectFileOps {
         let content = crate::mm::oom::read_fault_inject_config();
         crate::filesystem::procfs::utils::proc_read(offset, len, buf, content.as_bytes())
     }
+}
 
+impl OomFaultInjectFileOps {
     fn write_at(
         &self,
         _offset: usize,

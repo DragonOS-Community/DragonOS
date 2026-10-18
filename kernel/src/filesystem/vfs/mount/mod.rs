@@ -6344,8 +6344,38 @@ impl IndexNode for MountFSInode {
         return self.dentry.inode.truncate(len);
     }
 
+    fn read_at_with_io_intent(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &mut [u8],
+        data: MutexGuard<FilePrivateData>,
+        intent: super::ReadIoIntent,
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        self.dentry
+            .inode
+            .read_at_with_io_intent(offset, len, buf, data, intent)
+    }
+
     fn user_read_mode(&self) -> super::UserReadMode {
         self.dentry.inode.user_read_mode()
+    }
+
+    fn user_read_mode_with_io_intent(&self, intent: super::ReadIoIntent) -> super::UserReadMode {
+        self.dentry.inode.user_read_mode_with_io_intent(intent)
+    }
+
+    fn read_user_with_io_intent(
+        &self,
+        offset: usize,
+        len: usize,
+        writer: &mut crate::syscall::user_buffer::UserBuffer<'_>,
+        data: MutexGuard<FilePrivateData>,
+        intent: super::ReadIoIntent,
+    ) -> Result<Option<usize>, SystemError> {
+        self.dentry
+            .inode
+            .read_user_with_io_intent(offset, len, writer, data, intent)
     }
 
     fn supports_read_iter_flags(&self) -> bool {

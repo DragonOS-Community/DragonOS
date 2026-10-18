@@ -21,7 +21,10 @@ use crate::{
             OpenFileBehavior, PostWriteSyncPolicy, WriteSyncIntent,
         },
     },
-    libs::{mutex::MutexGuard, rwlock::RwLock},
+    libs::{
+        mutex::{Mutex, MutexGuard},
+        rwlock::RwLock,
+    },
 };
 
 const MINORS_PER_DISK: u32 = 256;
@@ -349,6 +352,82 @@ impl IndexNode for GenDisk {
             return loop_device.try_sync();
         }
         device.sync().map_err(Into::into)
+    }
+
+    fn user_read_mode_with_io_intent(
+        &self,
+        intent: crate::filesystem::vfs::ReadIoIntent,
+    ) -> crate::filesystem::vfs::UserReadMode {
+        if intent == crate::filesystem::vfs::ReadIoIntent::Direct {
+            crate::filesystem::vfs::UserReadMode::Iterator
+        } else {
+            self.user_read_mode()
+        }
+    }
+
+    fn read_user_with_io_intent(
+        &self,
+        offset: usize,
+        len: usize,
+        writer: &mut crate::syscall::user_buffer::UserBuffer<'_>,
+        data: MutexGuard<FilePrivateData>,
+        intent: crate::filesystem::vfs::ReadIoIntent,
+    ) -> Result<Option<usize>, SystemError> {
+        use crate::filesystem::vfs::{file::File, ReadIoIntent};
+        if intent != ReadIoIntent::Direct {
+            return self.read_user_at(offset, len, writer, data);
+        }
+        drop(data);
+        let capacity = self
+            .range()
+            .len()
+            .checked_mul(LBA_SIZE)
+            .ok_or(SystemError::EOVERFLOW)?;
+        if offset >= capacity {
+            return Ok(Some(0));
+        }
+        let len = len.min(writer.len()).min(capacity - offset);
+        if len == 0 {
+            return Ok(Some(0));
+        }
+        let mask = (1usize << self.block_size_log2) - 1;
+        // Current block devices expose sector alignment, not a separate DMA
+        // alignment property. Keep address/length mask responsibilities clear.
+        if offset & mask != 0 || !writer.is_aligned_at(0, len, mask, mask) {
+            return Err(SystemError::EINVAL);
+        }
+        let mut scratch = crate::filesystem::vfs::read_buffer::ReadScratch::default();
+        let mut total = 0;
+        while total < len {
+            let want = (len - total).min(crate::filesystem::vfs::read_buffer::MAX_CHUNK);
+            let buffer = scratch.prepare(want)?;
+            // Only a not-yet-copied backing attempt participates in typed
+            // allocation recovery. Never replay the whole user operation.
+            let read = File::recover_io(|| {
+                IndexNode::read_at(
+                    self,
+                    offset + total,
+                    want,
+                    buffer,
+                    Mutex::new(FilePrivateData::Unused).lock(),
+                )
+            })?;
+            if read == 0 {
+                break;
+            }
+            let copied = match writer.write_prefix_to_user(total, &buffer[..read]) {
+                Ok(copied) => copied,
+                Err(SystemError::EFAULT) if total != 0 => return Ok(Some(total)),
+                Err(error) => return Err(error),
+            };
+            total += copied;
+            if copied != read {
+                // Legacy FAT DIO / a completed raw-device BIO retain the
+                // bytes transferred before a later destination-page fault.
+                return Ok(Some(total));
+            }
+        }
+        Ok(Some(total))
     }
 
     fn read_at(

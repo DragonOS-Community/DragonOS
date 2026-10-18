@@ -3,6 +3,7 @@
 //! 实现 User Namespace 的 UID/GID 映射和 setgroups 控制文件。
 
 use crate::filesystem::procfs::template::configure_seq_file;
+use crate::filesystem::procfs::template::ProcWriteCallback;
 use crate::filesystem::vfs::OpenFileBehavior;
 use crate::libs::mutex::MutexGuard;
 use crate::{
@@ -429,6 +430,13 @@ mod extent_validation_tests {
 }
 
 impl FileOps for IdMapFileOps {
+    fn write_callback(&self) -> Option<ProcWriteCallback<Self>> {
+        Some(|ops, offset, len, buf, data| {
+            ops.write_at(offset, len, buf, data)
+                .map(crate::filesystem::vfs::PrimaryWriteResult::new)
+        })
+    }
+
     fn configure_open_file(&self, _data: &FilePrivateData, behavior: &mut OpenFileBehavior) {
         configure_seq_file(behavior);
     }
@@ -487,7 +495,9 @@ impl FileOps for IdMapFileOps {
             Ok(self.generate_content(&map, &ctx).into_bytes())
         })
     }
+}
 
+impl IdMapFileOps {
     fn write_at(
         &self,
         offset: usize,
@@ -559,6 +569,13 @@ impl SetgroupsFileOps {
 }
 
 impl FileOps for SetgroupsFileOps {
+    fn write_callback(&self) -> Option<ProcWriteCallback<Self>> {
+        Some(|ops, offset, len, buf, data| {
+            ops.write_at(offset, len, buf, data)
+                .map(crate::filesystem::vfs::PrimaryWriteResult::new)
+        })
+    }
+
     fn configure_open_file(&self, _data: &FilePrivateData, behavior: &mut OpenFileBehavior) {
         configure_seq_file(behavior);
     }
@@ -609,7 +626,9 @@ impl FileOps for SetgroupsFileOps {
             })
         })
     }
+}
 
+impl SetgroupsFileOps {
     fn write_at(
         &self,
         offset: usize,

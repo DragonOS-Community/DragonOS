@@ -1,3 +1,5 @@
+mod direct_read;
+
 use crate::cgroup::memory::{object::ObjectAccount, MemoryAccount};
 use crate::mm::allocation::MemoryAllocationError;
 use crate::{
@@ -2509,6 +2511,22 @@ impl IndexNode for LockedExt4Inode {
             vfs::UserReadMode::Iterator
         } else {
             vfs::UserReadMode::Buffered
+        }
+    }
+
+    fn read_user_with_io_intent(
+        &self,
+        offset: usize,
+        len: usize,
+        writer: &mut crate::syscall::user_buffer::UserBuffer<'_>,
+        data: PrivateData,
+        intent: vfs::ReadIoIntent,
+    ) -> Result<Option<usize>, SystemError> {
+        if intent == vfs::ReadIoIntent::Direct {
+            drop(data);
+            self.read_direct_user(offset, len, writer).map(Some)
+        } else {
+            self.read_user_at(offset, len, writer, data)
         }
     }
 

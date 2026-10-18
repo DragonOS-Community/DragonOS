@@ -1,5 +1,6 @@
 //! Namespace-scoped IPv6 forwarding control.
 
+use crate::filesystem::procfs::template::ProcWriteCallback;
 use crate::filesystem::procfs::Builder;
 use crate::filesystem::{
     procfs::{
@@ -141,6 +142,13 @@ impl ForwardingFileOps {
 }
 
 impl FileOps for ForwardingFileOps {
+    fn write_callback(&self) -> Option<ProcWriteCallback<Self>> {
+        Some(|ops, offset, len, buf, data| {
+            ops.write_at(offset, len, buf, data)
+                .map(crate::filesystem::vfs::PrimaryWriteResult::new)
+        })
+    }
+
     fn supports_write_iter_flags(&self) -> bool {
         true
     }
@@ -158,7 +166,9 @@ impl FileOps for ForwardingFileOps {
         let value = ProcessManager::current_netns().ipv6_forwarding_value();
         proc_read(0, len, buf, format!("{value}\n").as_bytes())
     }
+}
 
+impl ForwardingFileOps {
     fn write_at(
         &self,
         offset: usize,

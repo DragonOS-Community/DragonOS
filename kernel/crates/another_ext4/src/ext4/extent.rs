@@ -40,8 +40,10 @@ impl ReadSegment {
 /// Stable lower-filesystem plan for one block-aligned read window.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReadPlan {
-    /// Bytes before the inode-size snapshot's EOF. The final planned block may
-    /// contain fewer valid bytes; its caller must zero the unread tail.
+    /// Bytes before the inode-size snapshot's EOF. Ordinary cached reads must
+    /// zero the unread final-block tail. Direct reads instead execute their
+    /// full planned transfer and clip only the reported completion to EOF;
+    /// their segments may be nonempty even when valid_bytes is zero.
     pub valid_bytes: usize,
     pub segments: Vec<ReadSegment>,
 }
@@ -1539,12 +1541,40 @@ impl Ext4 {
         self.build_read_plan_from_inode(&inode_ref, offset, len, max_segment_blocks)
     }
 
+    /// Resolve a bounded direct-I/O transfer window without clipping mappings
+    /// to EOF. Sparse/unwritten ranges after EOF still belong to the transfer;
+    /// only the user's final byte count is clipped to the initial file size.
+    /// Like plan_read, this observes one metadata view and requires the caller
+    /// to retain mapping exclusion through source I/O. It does not pin blocks.
+    pub fn plan_direct_read(
+        &self,
+        file: u32,
+        offset: usize,
+        len: usize,
+        max_segment_blocks: u32,
+    ) -> Result<ReadPlan> {
+        let _view = self.lock_metadata_read_view()?;
+        let inode_ref = self.read_inode(file)?;
+        self.build_read_plan_window(&inode_ref, offset, len, max_segment_blocks, true)
+    }
+
     fn build_read_plan_from_inode(
         &self,
         inode_ref: &InodeRef,
         offset: usize,
         len: usize,
         max_segment_blocks: u32,
+    ) -> Result<ReadPlan> {
+        self.build_read_plan_window(inode_ref, offset, len, max_segment_blocks, false)
+    }
+
+    fn build_read_plan_window(
+        &self,
+        inode_ref: &InodeRef,
+        offset: usize,
+        len: usize,
+        max_segment_blocks: u32,
+        whole_window: bool,
     ) -> Result<ReadPlan> {
         if !inode_ref.inode.is_file() {
             return Err(format_error!(
@@ -1571,16 +1601,17 @@ impl Ext4 {
 
         let file_size =
             usize::try_from(inode_ref.inode.size()).map_err(|_| Ext4Error::new(ErrCode::EFBIG))?;
-        if offset >= file_size {
+        if offset >= file_size && !whole_window {
             return Ok(ReadPlan {
                 valid_bytes: 0,
                 segments: Vec::new(),
             });
         }
-        let valid_bytes = min(len, file_size - offset);
+        let valid_bytes = min(len, file_size.saturating_sub(offset));
+        let coverage = if whole_window { len } else { valid_bytes };
         let start_lblock =
             u32::try_from(offset / BLOCK_SIZE).map_err(|_| Ext4Error::new(ErrCode::EFBIG))?;
-        let block_count = valid_bytes
+        let block_count = coverage
             .checked_add(BLOCK_SIZE - 1)
             .ok_or_else(|| Ext4Error::new(ErrCode::EFBIG))?
             / BLOCK_SIZE;
@@ -3090,6 +3121,108 @@ mod tests {
                 physical_start: 104,
                 blocks: 2,
             }]
+        );
+    }
+
+    #[test]
+    fn direct_read_plan_keeps_transfer_coverage_past_reported_eof() {
+        let fs = make_test_fs(1024);
+        let mut unwritten = Extent::new(2, 200, 1);
+        unwritten.mark_unwritten();
+        let inode_ref = make_read_inode(37, &[Extent::new(0, 100, 1), unwritten]);
+        let cached = fs
+            .build_read_plan_from_inode(&inode_ref, 0, 4 * BLOCK_SIZE, 16)
+            .unwrap();
+        let direct = fs
+            .build_read_plan_window(&inode_ref, 0, 4 * BLOCK_SIZE, 16, true)
+            .unwrap();
+        assert_eq!(cached.valid_bytes, 37);
+        assert_eq!(direct.valid_bytes, 37);
+        assert_eq!(
+            cached.segments,
+            vec![ReadSegment::Mapped {
+                logical_start: 0,
+                physical_start: 100,
+                blocks: 1,
+            }]
+        );
+        assert_eq!(
+            direct.segments,
+            vec![
+                ReadSegment::Mapped {
+                    logical_start: 0,
+                    physical_start: 100,
+                    blocks: 1
+                },
+                ReadSegment::Zero {
+                    logical_start: 1,
+                    blocks: 3
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn direct_read_plan_zero_valid_bytes_is_not_an_empty_transfer() {
+        let fs = make_test_fs(1024);
+        let inode_ref = make_read_inode(37, &[Extent::new(2, 200, 1)]);
+        let cached = fs
+            .build_read_plan_from_inode(&inode_ref, BLOCK_SIZE, 3 * BLOCK_SIZE, 16)
+            .unwrap();
+        let direct = fs
+            .build_read_plan_window(&inode_ref, BLOCK_SIZE, 3 * BLOCK_SIZE, 16, true)
+            .unwrap();
+        assert_eq!(cached.valid_bytes, 0);
+        assert!(cached.segments.is_empty());
+        assert_eq!(direct.valid_bytes, 0);
+        assert_eq!(
+            direct.segments,
+            vec![
+                ReadSegment::Zero {
+                    logical_start: 1,
+                    blocks: 1
+                },
+                ReadSegment::Mapped {
+                    logical_start: 2,
+                    physical_start: 200,
+                    blocks: 1
+                },
+                ReadSegment::Zero {
+                    logical_start: 3,
+                    blocks: 1
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn direct_read_plan_validates_ranges_even_past_eof() {
+        let fs = make_test_fs(128);
+        let inode_ref = make_read_inode(37, &[Extent::new(2, 127, 2)]);
+        assert_eq!(
+            fs.build_read_plan_window(&inode_ref, 1, BLOCK_SIZE, 1, true)
+                .unwrap_err()
+                .code(),
+            ErrCode::EINVAL
+        );
+        assert_eq!(
+            fs.build_read_plan_window(&inode_ref, BLOCK_SIZE, BLOCK_SIZE, 0, true)
+                .unwrap_err()
+                .code(),
+            ErrCode::EINVAL
+        );
+        assert_eq!(
+            fs.build_read_plan_window(&inode_ref, 2 * BLOCK_SIZE, 2 * BLOCK_SIZE, 16, true)
+                .unwrap_err()
+                .code(),
+            ErrCode::EIO
+        );
+        let last = usize::MAX & !(BLOCK_SIZE - 1);
+        assert_eq!(
+            fs.build_read_plan_window(&inode_ref, last, BLOCK_SIZE, 16, true)
+                .unwrap_err()
+                .code(),
+            ErrCode::EFBIG
         );
     }
 

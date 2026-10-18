@@ -1958,6 +1958,7 @@ impl File {
         buf: &mut [u8],
         output: &mut UserBuffer<'_>,
         output_offset: usize,
+        intent: super::ReadIoIntent,
     ) -> Result<usize, SystemError> {
         let stream = self.mode.read().contains(FileMode::FMODE_STREAM);
         let offset = if stream {
@@ -1965,7 +1966,7 @@ impl File {
         } else {
             self.offset.load(Ordering::SeqCst)
         };
-        self.read_syscall_chunk_at(offset, buf, output, output_offset, !stream)
+        self.read_syscall_chunk_at(offset, buf, output, output_offset, !stream, intent)
     }
 
     /// Read at a syscall-owned explicit cursor without changing the OFD.
@@ -1975,8 +1976,9 @@ impl File {
         buf: &mut [u8],
         output: &mut UserBuffer<'_>,
         output_offset: usize,
+        intent: super::ReadIoIntent,
     ) -> Result<usize, SystemError> {
-        self.read_syscall_chunk_at(offset, buf, output, output_offset, false)
+        self.read_syscall_chunk_at(offset, buf, output, output_offset, false, intent)
     }
 
     fn read_syscall_chunk_at(
@@ -1986,8 +1988,10 @@ impl File {
         output: &mut UserBuffer<'_>,
         output_offset: usize,
         update_offset: bool,
+        intent: super::ReadIoIntent,
     ) -> Result<usize, SystemError> {
-        let read = Self::recover_io(|| self.read_backing(offset, buf.len(), buf))?;
+        let read =
+            Self::recover_io(|| self.read_backing_with_io_intent(offset, buf.len(), buf, intent))?;
         let result = output.write_prefix_to_user(output_offset, &buf[..read]);
         // Backing access precedes protected copying, including EOF and faults.
         // Only copied bytes advance the caller's cursor; ACCESS is syscall-owned.
@@ -1998,6 +2002,13 @@ impl File {
             false,
         );
         result
+    }
+
+    /// Complete a buffered scalar zero-count request after syscall admission.
+    /// Preserve backing dispatch without allocating scratch, touching the user
+    /// buffer, or finalizing atime/position. Vector zero-count reads bypass this.
+    pub(crate) fn read_empty_syscall(&self) -> Result<usize, SystemError> {
+        Self::recover_io(|| self.read_backing(0, 0, &mut []))
     }
 
     /// Linux rw_verify_area's signed count/position checks. Stream descriptions
@@ -2049,6 +2060,21 @@ impl File {
         writer: &mut UserBuffer<'_>,
         emit_fsnotify: bool,
     ) -> Result<Option<usize>, SystemError> {
+        self.read_user_at_current_position_with_intent(
+            len,
+            writer,
+            emit_fsnotify,
+            self.read_io_intent(),
+        )
+    }
+
+    pub(crate) fn read_user_at_current_position_with_intent(
+        &self,
+        len: usize,
+        writer: &mut UserBuffer<'_>,
+        emit_fsnotify: bool,
+        intent: super::ReadIoIntent,
+    ) -> Result<Option<usize>, SystemError> {
         let mode = *self.mode.read();
         let stream = mode.contains(FileMode::FMODE_STREAM);
         let offset = if stream {
@@ -2057,7 +2083,7 @@ impl File {
             self.offset.load(Ordering::SeqCst)
         };
 
-        self.read_user_at_position(offset, len, writer, !stream, emit_fsnotify)
+        self.read_user_at_position(offset, len, writer, !stream, emit_fsnotify, intent)
     }
 
     /// One owner operation at an explicit cursor; the syscall owns ACCESS.
@@ -2067,7 +2093,17 @@ impl File {
         len: usize,
         writer: &mut UserBuffer<'_>,
     ) -> Result<Option<usize>, SystemError> {
-        self.read_user_at_position(offset, len, writer, false, false)
+        self.read_user_at_position(offset, len, writer, false, false, self.read_io_intent())
+    }
+
+    pub(crate) fn pread_user_syscall_with_intent(
+        &self,
+        offset: usize,
+        len: usize,
+        writer: &mut UserBuffer<'_>,
+        intent: super::ReadIoIntent,
+    ) -> Result<Option<usize>, SystemError> {
+        self.read_user_at_position(offset, len, writer, false, false, intent)
     }
 
     fn read_user_at_position(
@@ -2077,51 +2113,145 @@ impl File {
         writer: &mut UserBuffer<'_>,
         update_offset: bool,
         emit_fsnotify: bool,
+        intent: super::ReadIoIntent,
     ) -> Result<Option<usize>, SystemError> {
         self.readable()?;
         if writer.len() < len {
             return Err(SystemError::ENOBUFS);
         }
-        // Native direct I/O must retain read_backing/read_direct dispatch.
-        if self.file_type == FileType::Dir
-            || (self.flags().contains(FileFlags::O_DIRECT)
-                && self.direct_io == DirectIoPolicy::Native)
+        let result = self.read_user_provider_at(offset, len, writer, intent);
+        // Linux direct regular-file readers call file_accessed even when
+        // their nonempty request fails admission or faults. Position and
+        // ACCESS completion still require a successful operation.
+        if result.is_err()
+            && len != 0
+            && intent == super::ReadIoIntent::Direct
+            && self.file_type == FileType::File
         {
+            self.touch_atime_after_access();
+        }
+        let Some(read_len) = result? else {
+            return Ok(None);
+        };
+        if len != 0 {
+            self.finalize_read(offset, read_len, update_offset, emit_fsnotify);
+        }
+        Ok(Some(read_len))
+    }
+
+    pub(crate) fn read_io_intent(&self) -> super::ReadIoIntent {
+        if self.flags().contains(FileFlags::O_DIRECT) && self.direct_io != DirectIoPolicy::Buffered
+        {
+            super::ReadIoIntent::Direct
+        } else {
+            super::ReadIoIntent::Buffered
+        }
+    }
+
+    /// Provider-only stacking entry: retain the caller's original iterator,
+    /// without publishing a second position/atime/fsnotify completion.
+    pub(crate) fn read_user_provider_at(
+        &self,
+        offset: usize,
+        len: usize,
+        writer: &mut UserBuffer<'_>,
+        intent: super::ReadIoIntent,
+    ) -> Result<Option<usize>, SystemError> {
+        self.readable()?;
+        if self.file_type == FileType::Dir {
             return Ok(None);
         }
-        // A zero-count regular read must not perform backend work or atime
-        // completion. Scalar record owners keep their own zero-count contract.
         if self.file_type == FileType::File && len == 0 {
             return Ok(Some(0));
         }
-        if self.file_type == FileType::File
-            && len != 0
-            && self.user_read_mode() == super::UserReadMode::Iterator
+        let intent = if self.direct_io == DirectIoPolicy::Buffered {
+            super::ReadIoIntent::Buffered
+        } else {
+            intent
+        };
+        if intent == super::ReadIoIntent::Buffered
+            && self.file_type == FileType::File
+            && self.inode.user_read_mode() == super::UserReadMode::Iterator
         {
             self.file_readahead(offset, len.min(super::read_buffer::MAX_CHUNK))?;
         }
-        let Some(read_len) =
-            self.inode
-                .read_user_at(offset, len, writer, self.private_data.lock())?
-        else {
-            return Ok(None);
-        };
+        let read = self.inode.read_user_with_io_intent(
+            offset,
+            len,
+            writer,
+            self.private_data.lock(),
+            intent,
+        )?;
+        if read.is_some()
+            || self.file_type != FileType::File
+            || self.user_read_mode_with_io_intent(intent) != super::UserReadMode::Buffered
+        {
+            return Ok(read);
+        }
+        // A stacking owner can delegate to a buffered-only backing (including
+        // tmpfs, which intentionally ignores O_DIRECT). Complete its protected
+        // copy here, without a second File completion or losing the snapshot.
+        self.read_buffered_user_provider_at(offset, len, writer, intent)
+            .map(Some)
+    }
 
-        self.finalize_read(offset, read_len, update_offset, emit_fsnotify);
-        Ok(Some(read_len))
+    fn read_buffered_user_provider_at(
+        &self,
+        offset: usize,
+        len: usize,
+        writer: &mut UserBuffer<'_>,
+        intent: super::ReadIoIntent,
+    ) -> Result<usize, SystemError> {
+        let len = len.min(writer.len());
+        let mut scratch = super::read_buffer::ReadScratch::default();
+        let mut total = 0;
+        while total < len {
+            let want = (len - total).min(super::read_buffer::MAX_CHUNK);
+            let buffer = match scratch.prepare(want) {
+                Ok(buffer) => buffer,
+                Err(_) if total != 0 => break,
+                Err(error) => return Err(error),
+            };
+            let position = offset.checked_add(total).ok_or(SystemError::EOVERFLOW)?;
+            let read = match Self::recover_io(|| {
+                self.read_backing_with_io_intent(position, want, buffer, intent)
+            }) {
+                Ok(0) => break,
+                Ok(read) => read,
+                Err(_) if total != 0 => break,
+                Err(error) => return Err(error),
+            };
+            // Only buffered fallback retains the ordinary copy-fault prefix.
+            // Native direct/record owners returning None never reach this path.
+            let copied = match writer.write_prefix_to_user(total, &buffer[..read]) {
+                Ok(copied) => copied,
+                Err(_) if total != 0 => break,
+                Err(error) => return Err(error),
+            };
+            total += copied;
+            if copied != read || read < want {
+                break;
+            }
+        }
+        Ok(total)
     }
 
     #[inline]
     pub fn user_read_mode(&self) -> super::UserReadMode {
-        // Direct I/O and generic directory reads keep their existing backing
-        // operation even when an inode also offers a cached-user iterator.
-        if self.file_type == FileType::Dir
-            || (self.flags().contains(FileFlags::O_DIRECT)
-                && self.direct_io == DirectIoPolicy::Native)
-        {
+        self.user_read_mode_with_io_intent(self.read_io_intent())
+    }
+
+    pub(crate) fn user_read_mode_with_io_intent(
+        &self,
+        intent: super::ReadIoIntent,
+    ) -> super::UserReadMode {
+        if self.file_type == FileType::Dir {
             super::UserReadMode::Buffered
+        } else if intent == super::ReadIoIntent::Direct && self.direct_io == DirectIoPolicy::Native
+        {
+            super::UserReadMode::Iterator
         } else {
-            self.inode.user_read_mode()
+            self.inode.user_read_mode_with_io_intent(intent)
         }
     }
 
@@ -2566,6 +2696,16 @@ impl File {
         len: usize,
         buf: &mut [u8],
     ) -> Result<usize, MemoryAllocationError> {
+        self.read_backing_with_io_intent(offset, len, buf, self.read_io_intent())
+    }
+
+    pub(crate) fn read_backing_with_io_intent(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &mut [u8],
+        intent: super::ReadIoIntent,
+    ) -> Result<usize, MemoryAllocationError> {
         self.readable()?;
         // generic_read_dir is a file operation, not a page-cache read. In
         // particular a mounted ext4 root must not turn its backend EISDIR
@@ -2581,11 +2721,11 @@ impl File {
             return Err(SystemError::ENOBUFS.into());
         }
 
-        if self.file_type == FileType::File && !self.flags().contains(FileFlags::O_DIRECT) {
+        if self.file_type == FileType::File && intent == super::ReadIoIntent::Buffered {
             self.file_readahead(offset, len)?;
         }
 
-        let len = if self.flags().contains(FileFlags::O_DIRECT)
+        let len = if intent == super::ReadIoIntent::Direct
             && self.direct_io == DirectIoPolicy::Native
         {
             self.inode
@@ -2593,7 +2733,7 @@ impl File {
                 .map_err(MemoryAllocationError::System)
         } else {
             self.inode
-                .read_at(offset, len, buf, self.private_data.lock())
+                .read_at_with_io_intent(offset, len, buf, self.private_data.lock(), intent)
         }?;
 
         Ok(len)

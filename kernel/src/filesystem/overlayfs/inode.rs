@@ -599,6 +599,40 @@ impl IndexNode for OvlInode {
         file::read_at(self, offset, len, buf, data)
     }
 
+    fn read_at_with_io_intent(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &mut [u8],
+        data: crate::libs::mutex::MutexGuard<vfs::FilePrivateData>,
+        intent: vfs::ReadIoIntent,
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        file::read_at_with_io_intent(self, offset, len, buf, data, intent)
+    }
+
+    fn user_read_mode_with_io_intent(&self, intent: vfs::ReadIoIntent) -> vfs::UserReadMode {
+        if intent == vfs::ReadIoIntent::Direct && self.file_type == FileType::File {
+            vfs::UserReadMode::Iterator
+        } else {
+            self.user_read_mode()
+        }
+    }
+
+    fn read_user_with_io_intent(
+        &self,
+        offset: usize,
+        len: usize,
+        writer: &mut crate::syscall::user_buffer::UserBuffer<'_>,
+        data: crate::libs::mutex::MutexGuard<vfs::FilePrivateData>,
+        intent: vfs::ReadIoIntent,
+    ) -> Result<Option<usize>, SystemError> {
+        if intent == vfs::ReadIoIntent::Direct {
+            file::read_user_with_io_intent(self, offset, len, writer, data, intent)
+        } else {
+            self.read_user_at(offset, len, writer, data)
+        }
+    }
+
     fn write_at(
         &self,
         offset: usize,

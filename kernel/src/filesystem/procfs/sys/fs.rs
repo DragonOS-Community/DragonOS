@@ -1,5 +1,6 @@
 //! /proc/sys/fs - filesystem-wide kernel parameters.
 
+use crate::filesystem::procfs::template::ProcWriteCallback;
 use crate::{
     filesystem::{
         procfs::{
@@ -87,6 +88,13 @@ impl MountMaxFileOps {
 }
 
 impl FileOps for MountMaxFileOps {
+    fn write_callback(&self) -> Option<ProcWriteCallback<Self>> {
+        Some(|ops, offset, len, buf, data| {
+            ops.write_at(offset, len, buf, data)
+                .map(crate::filesystem::vfs::PrimaryWriteResult::new)
+        })
+    }
+
     fn supports_write_iter_flags(&self) -> bool {
         true
     }
@@ -106,7 +114,9 @@ impl FileOps for MountMaxFileOps {
         let content = format!("{}\n", mount_max());
         proc_read(offset, len, buf, content.as_bytes())
     }
+}
 
+impl MountMaxFileOps {
     fn write_at(
         &self,
         offset: usize,
@@ -147,6 +157,13 @@ impl NrOpenFileOps {
 }
 
 impl FileOps for NrOpenFileOps {
+    fn write_callback(&self) -> Option<ProcWriteCallback<Self>> {
+        Some(|ops, offset, len, buf, data| {
+            ops.write_at(offset, len, buf, data)
+                .map(crate::filesystem::vfs::PrimaryWriteResult::new)
+        })
+    }
+
     fn supports_write_iter_flags(&self) -> bool {
         true
     }
@@ -164,7 +181,9 @@ impl FileOps for NrOpenFileOps {
         let content = format!("{}\n", crate::filesystem::vfs::fdtable::nr_open());
         proc_read(offset, len, buf, content.as_bytes())
     }
+}
 
+impl NrOpenFileOps {
     fn write_at(
         &self,
         offset: usize,
@@ -198,6 +217,13 @@ impl SuidDumpableFileOps {
 }
 
 impl FileOps for SuidDumpableFileOps {
+    fn write_callback(&self) -> Option<ProcWriteCallback<Self>> {
+        Some(|ops, offset, len, buf, data| {
+            ops.write_at(offset, len, buf, data)
+                .map(crate::filesystem::vfs::PrimaryWriteResult::new)
+        })
+    }
+
     fn supports_write_iter_flags(&self) -> bool {
         true
     }
@@ -217,7 +243,9 @@ impl FileOps for SuidDumpableFileOps {
         let content = format!("{}\n", SUID_DUMPABLE.load(Ordering::SeqCst));
         proc_read(offset, len, buf, content.as_bytes())
     }
+}
 
+impl SuidDumpableFileOps {
     fn write_at(
         &self,
         offset: usize,

@@ -1,3 +1,4 @@
+use crate::filesystem::procfs::template::ProcWriteCallback;
 use crate::filesystem::{
     procfs::{
         template::{Builder, DirOps, FileOps, ProcDir, ProcDirBuilder, ProcFileBuilder},
@@ -111,6 +112,13 @@ impl IpForwardFileOps {
 }
 
 impl FileOps for IpForwardFileOps {
+    fn write_callback(&self) -> Option<ProcWriteCallback<Self>> {
+        Some(|ops, offset, len, buf, data| {
+            ops.write_at(offset, len, buf, data)
+                .map(crate::filesystem::vfs::PrimaryWriteResult::new)
+        })
+    }
+
     fn supports_write_iter_flags(&self) -> bool {
         true
     }
@@ -147,7 +155,9 @@ impl FileOps for IpForwardFileOps {
         let value = ns.ipv4_forwarding_value();
         proc_read(0, len, buf, format!("{value}\n").as_bytes())
     }
+}
 
+impl IpForwardFileOps {
     fn write_at(
         &self,
         offset: usize,

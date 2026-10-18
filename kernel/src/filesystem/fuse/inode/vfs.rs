@@ -876,6 +876,13 @@ impl IndexNode for FuseNode {
         self.cached_or_fetch_metadata()
     }
 
+    /// dev_id/inode_id 等 identity 字段在 inode 生命周期内不变，
+    /// 纯内存快照，不发起 FUSE GETATTR RPC（符合 trait 契约）。
+    fn cached_metadata(&self) -> Result<Metadata, SystemError> {
+        self.cached_metadata_snapshot()
+            .ok_or(SystemError::EAGAIN_OR_EWOULDBLOCK)
+    }
+
     fn check_access(&self, mask: PermissionMask) -> Result<(), SystemError> {
         self.check_not_stale()?;
         let inarg = FuseAccessIn {

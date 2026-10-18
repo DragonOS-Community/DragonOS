@@ -47,14 +47,6 @@ impl PipeRuntime {
         self.write_input(len, Input::User(source), flags)
     }
 
-    fn wait_for_input_hold(&self) -> Result<(), SystemError> {
-        self.read_wait_queue
-            .wait_event_interruptible_tagged(HOLD_RELEASE_WAIT_TAG, || {
-                self.inner.lock().splice_hold.is_none()
-            })
-            .map_err(|_| SystemError::ERESTARTSYS)
-    }
-
     fn write_input(
         &self,
         len: usize,
@@ -79,12 +71,7 @@ impl PipeRuntime {
         let mut allow_merge = true;
         // Check destination conditions before allocation or touching input.
         loop {
-            if inner.splice_hold.is_some() {
-                drop(inner);
-                self.wait_for_input_hold()?;
-                inner = self.inner.lock();
-                continue;
-            }
+            debug_assert!(inner.splice_hold.is_none());
             if inner.reader == 0 {
                 drop(inner);
                 Self::send_sigpipe();
@@ -120,18 +107,8 @@ impl PipeRuntime {
             if total == len {
                 break;
             }
-            // A pre-existing splice completion may retire the merge target.
-            // New reservations cannot enter once input_copy_active is set.
-            if inner.splice_hold.is_some() {
-                drop(inner);
-                let result = self.wait_for_input_hold();
-                inner = self.inner.lock();
-                if let Err(err) = result {
-                    error = Some(err);
-                    break;
-                }
-                continue;
-            }
+            // All read reservations own this same operation transaction.
+            debug_assert!(inner.splice_hold.is_none());
             if inner.reader == 0 {
                 error = Some(SystemError::EPIPE);
                 break;

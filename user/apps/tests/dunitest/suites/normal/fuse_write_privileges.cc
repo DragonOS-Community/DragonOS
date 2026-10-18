@@ -3,6 +3,7 @@
 #include "../fuse/fuse_gtest_common.h"
 
 #include <signal.h>
+#include <sys/ioctl.h>
 #include <sys/inotify.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
@@ -74,12 +75,29 @@ class WriteDaemon {
     std::vector<Request> requests;
     bool defer_write_reply = false;
     bool write_pending = false;
+    bool defer_read_reply = false;
+    bool read_pending = false;
+
+    bool CompleteRead() {
+        if (!read_pending) return false;
+        read_pending = false;
+        std::vector<unsigned char> data(pending_read_size_, 'p');
+        return Reply(pending_read_unique_, data.data(), data.size());
+    }
 
     bool CompleteWrite() {
+        return CompleteWrite(pending_size_, 0);
+    }
+
+    bool CompleteWrite(size_t accepted, int error) {
         if (!write_pending) return false;
+        if (accepted > pending_size_) return false;
         write_pending = false;
+        if (error) return ReplyError(pending_unique_, error);
+        size = std::max<uint64_t>(size, pending_offset_ + accepted);
+        committed_write_bytes += accepted;
         fuse_write_out out{};
-        out.size = pending_size_;
+        out.size = accepted;
         return Reply(pending_unique_, out);
     }
 
@@ -162,6 +180,13 @@ class WriteDaemon {
             fuse_read_in in{};
             memcpy(&in, payload, sizeof(in));
             size_t bytes = in.offset < size ? std::min<uint64_t>(in.size, size - in.offset) : 0;
+            if (defer_read_reply) {
+                if (read_pending) return false;
+                read_pending = true;
+                pending_read_unique_ = header.unique;
+                pending_read_size_ = bytes;
+                return true;
+            }
             std::vector<unsigned char> data(bytes, 'o');
             return Reply(header.unique, data.data(), data.size());
         }
@@ -178,8 +203,6 @@ class WriteDaemon {
                 return false;
             if (test_.input == Input::Good && in.offset == 0 && in.size && data[0] != 'p')
                 return false;
-            size = std::max<uint64_t>(size, in.offset + in.size);
-            committed_write_bytes += in.size;
             if ((test_.policy.handle_killpriv && header.uid != 0) ||
                 (in.write_flags & kKillSuidgid)) mode &= ~06000;
             capability = false;
@@ -188,8 +211,11 @@ class WriteDaemon {
                 write_pending = true;
                 pending_unique_ = header.unique;
                 pending_size_ = in.size;
+                pending_offset_ = in.offset;
                 return true;
             }
+            size = std::max<uint64_t>(size, in.offset + in.size);
+            committed_write_bytes += in.size;
             fuse_write_out out{};
             out.size = in.size;
             return Reply(header.unique, out);
@@ -270,6 +296,9 @@ class WriteDaemon {
     std::vector<unsigned char> buffer_;
     uint64_t pending_unique_ = 0;
     uint32_t pending_size_ = 0;
+    uint64_t pending_offset_ = 0;
+    uint64_t pending_read_unique_ = 0;
+    size_t pending_read_size_ = 0;
     unsigned write_attempts_ = 0;
 };
 
@@ -583,6 +612,285 @@ INSTANTIATE_TEST_SUITE_P(OwnerPolicies, FuseWritePolicy, testing::Values(
         return std::string(p.direct ? "Direct" : p.writeback ? "Writeback" : "Cached") +
                (p.handle_killpriv ? "HandleKillpriv" : "KernelKillpriv");
     });
+
+enum class HoldConsumer { Read, Readv, Tee, Splice, Available, FileSplice };
+struct HoldCase { HoldConsumer consumer; unsigned accepted; int error; bool input = false; };
+
+class FuseSpliceHold : public testing::TestWithParam<HoldCase> {};
+
+// A real deferred FUSE_WRITE establishes the reservation window. Each case
+// owns a fresh source, so only the selected competitor can consume its tail.
+TEST_P(FuseSpliceHold, InternalReservationDoesNotBecomeNonblockingEagain) {
+    struct Result {
+        int role = -1;
+        ssize_t count = -1;
+        int error = 0;
+        off_t position = -1;
+        int available = -1;
+        char byte = 0;
+    };
+    const HoldCase parameter = GetParam();
+    char mountpoint[128], path[160], options[256];
+    snprintf(mountpoint, sizeof(mountpoint), "/tmp/fuse_splice_hold_%d", getpid());
+    snprintf(path, sizeof(path), "%s/file", mountpoint);
+    ASSERT_EQ(0, mkdir(mountpoint, 0755)) << strerror(errno);
+    int fd = open("/dev/fuse", O_RDWR | O_CLOEXEC);
+    if (fd < 0) { int error = errno; rmdir(mountpoint); FAIL() << strerror(error); }
+    snprintf(options, sizeof(options),
+             "fd=%d,rootmode=040755,user_id=0,group_id=0,allow_other", fd);
+    if (mount("none", mountpoint, "fuse", 0, options)) {
+        int error = errno;
+        close(fd);
+        rmdir(mountpoint);
+        FAIL() << strerror(error);
+    }
+    Case test{};
+    test.input = Input::Good;
+    test.initial_mode = 0666;
+    // Linux may continue iter_file_splice_write after a short primary write.
+    // Fail that next request so both a short-return owner and Linux's loop
+    // report exactly the committed prefix without another deferred reply.
+    if (!parameter.input && !parameter.error && parameter.accepted == 2) {
+        test.input = Input::RpcFailure;
+        test.failure_ordinal = 2;
+    }
+    // Direct I/O makes the primary transfer wait for this exact WRITE reply.
+    test.policy.direct = true;
+    WriteDaemon daemon(fd, test);
+    daemon.defer_write_reply = !parameter.input;
+    daemon.defer_read_reply = parameter.input;
+    bool okay = fuseg_wait_readable(fd, 3000) == 0 && daemon.Serve();
+    int source[2]{-1, -1}, destination[2]{-1, -1}, start[2]{-1, -1};
+    int attempted[2]{-1, -1}, results[2]{-1, -1};
+    int* channels[]{source, destination, start, attempted, results};
+    for (int* channel : channels) {
+        if (okay && pipe2(channel, O_CLOEXEC)) okay = false;
+    }
+    const bool empty_input = parameter.input && parameter.consumer == HoldConsumer::FileSplice;
+    const std::string initial = parameter.input ? (empty_input ? "" : "TAIL") : "ppppTAIL";
+    if (okay) okay = fcntl(source[0], F_SETFL, O_NONBLOCK) == 0 &&
+        write(source[1], initial.data(), initial.size()) == static_cast<ssize_t>(initial.size());
+    char sink_name[] = "/tmp/fuse-splice-sink-XXXXXX";
+    int sink = okay ? mkstemp(sink_name) : -1;
+    if (sink < 0) okay = false;
+    else if (unlink(sink_name)) okay = false;
+    pid_t children[2]{-1, -1};
+    for (int role = 0; role < 2 && okay; ++role) {
+        children[role] = fork();
+        if (children[role] < 0) { okay = false; break; }
+        if (children[role] == 0) {
+            close(fd);
+            close(start[1]);
+            close(attempted[0]);
+            close(results[0]);
+            if (role != 0 || !parameter.input) close(source[1]);
+            alarm(15);
+            Result result{};
+            result.role = role;
+            if (role == 0) {
+                close(start[0]);
+                close(attempted[1]);
+                int file = open(path, parameter.input ? O_RDONLY : O_WRONLY);
+                if (file >= 0) {
+                    result.count = parameter.input
+                        ? splice(file, nullptr, source[1], nullptr, 4, SPLICE_F_NONBLOCK)
+                        : splice(source[0], nullptr, file, nullptr, 4, SPLICE_F_NONBLOCK);
+                    result.error = result.count < 0 ? errno : 0;
+                    result.position = lseek(file, 0, SEEK_CUR);
+                    // Report before close: RELEASE may require daemon service.
+                    if (write(results[1], &result, sizeof(result)) != sizeof(result)) _exit(2);
+                    close(file);
+                    _exit(0);
+                }
+                result.error = errno;
+            } else {
+                char token;
+                if (read(start[0], &token, 1) != 1 || write(attempted[1], "a", 1) != 1)
+                    _exit(3);
+                iovec vector{&result.byte, 1};
+                switch (parameter.consumer) {
+                case HoldConsumer::Read:
+                    result.count = read(source[0], &result.byte, 1);
+                    break;
+                case HoldConsumer::Readv:
+                    result.count = readv(source[0], &vector, 1);
+                    break;
+                case HoldConsumer::Tee:
+                    result.count = tee(source[0], destination[1], 1, SPLICE_F_NONBLOCK);
+                    break;
+                case HoldConsumer::Splice:
+                    result.count = splice(source[0], nullptr, destination[1], nullptr,
+                                          1, SPLICE_F_NONBLOCK);
+                    break;
+                case HoldConsumer::Available:
+                    result.count = ioctl(source[0], FIONREAD, &result.available);
+                    break;
+                case HoldConsumer::FileSplice:
+                    result.count = splice(source[0], nullptr, sink, nullptr, 1,
+                                          SPLICE_F_NONBLOCK);
+                    if (result.count == 1 && pread(sink, &result.byte, 1, 0) != 1) _exit(4);
+                    break;
+                }
+                result.error = result.count < 0 ? errno : 0;
+                if ((parameter.consumer == HoldConsumer::Tee ||
+                     parameter.consumer == HoldConsumer::Splice) && result.count == 1 &&
+                    read(destination[0], &result.byte, 1) != 1) _exit(4);
+            }
+            if (write(results[1], &result, sizeof(result)) != sizeof(result)) _exit(2);
+            _exit(0);
+        }
+    }
+    for (int descriptor : {start[0], attempted[1], results[1]}) if (descriptor >= 0) close(descriptor);
+    start[0] = attempted[1] = results[1] = -1;
+    bool complete[2]{false, false};
+    Result completions[2]{};
+    auto now_ms = [] {
+        timespec now{};
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        return static_cast<int64_t>(now.tv_sec) * 1000 + now.tv_nsec / 1000000;
+    };
+    const int64_t deadline = now_ms() + 12000;
+    auto receive_result = [&] {
+        Result result{};
+        if (read(results[0], &result, sizeof(result)) != sizeof(result) ||
+            result.role < 0 || result.role > 1 || complete[result.role]) {
+            okay = false;
+            return;
+        }
+        complete[result.role] = true;
+        completions[result.role] = result;
+    };
+    auto pump_until = [&](auto predicate) {
+        while (okay && !predicate()) {
+            int timeout = static_cast<int>(deadline - now_ms());
+            if (timeout <= 0) { okay = false; break; }
+            pollfd descriptors[2]{{fd, POLLIN, 0}, {results[0], POLLIN, 0}};
+            int count = poll(descriptors, 2, timeout);
+            if (count < 0 && errno == EINTR) continue;
+            if (count <= 0) { okay = false; break; }
+            if (descriptors[1].revents & POLLIN) receive_result();
+            if (descriptors[0].revents & POLLIN) okay &= daemon.Serve();
+            if ((descriptors[0].revents | descriptors[1].revents) &
+                (POLLERR | POLLNVAL)) okay = false;
+        }
+    };
+    auto pending = [&] { return parameter.input ? daemon.read_pending : daemon.write_pending; };
+    pump_until([&] { return pending() || complete[0]; });
+    // A kernel that rejects splice to this FUSE mode fails explicitly; this
+    // test never weakens the assertion by skipping an unsupported route.
+    okay &= pending() && !complete[0];
+    bool crossed = false;
+    short source_events = 0;
+    if (okay) {
+        okay = write(start[1], "s", 1) == 1;
+        pollfd acknowledgement{attempted[0], POLLIN, 0};
+        if (okay) okay = poll(&acknowledgement, 1, 3000) == 1 &&
+            (acknowledgement.revents & POLLIN);
+        char token;
+        if (okay) okay = read(attempted[0], &token, 1) == 1 && token == 'a';
+        // The competitor has announced its syscall while WRITE remains held.
+        // Keep polling finite even when the implementation returns too early.
+        pollfd completion{results[0], POLLIN, 0};
+        if (okay) {
+            const int count = poll(&completion, 1, 300);
+            if (count < 0) okay = false;
+            else if (count > 0 && (completion.revents & POLLIN)) {
+                receive_result();
+                crossed = complete[1];
+            }
+        }
+        pollfd ready{source[0], POLLIN, 0};
+        if (okay && poll(&ready, 1, 0) < 0) okay = false;
+        source_events = ready.revents;
+        if (okay) okay = parameter.input ? daemon.CompleteRead()
+            : daemon.CompleteWrite(parameter.accepted, parameter.error);
+        pump_until([&] { return complete[0] && complete[1]; });
+    }
+    // Closing the connection aborts outstanding FUSE RPCs on failure; do not
+    // perform a blocking waitpid on a regression in internal pipe locking.
+    close(fd);
+    if (sink >= 0) close(sink);
+    bool all_reaped = true;
+    for (pid_t child : children) {
+        if (child <= 0) continue;
+        if (!okay) kill(child, SIGKILL);
+        bool reaped = false;
+        int status = 0;
+        for (int attempt = 0; attempt < 200 && !reaped; ++attempt) {
+            pid_t waited = waitpid(child, &status, WNOHANG);
+            if (waited == child) reaped = true;
+            else if (waited < 0 && errno != EINTR) break;
+            else usleep(10000);
+        }
+        if (!reaped) kill(child, SIGKILL);
+        all_reaped &= reaped;
+        okay &= reaped && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    }
+    std::string remaining;
+    if (okay) {
+        char bytes[8];
+        ssize_t count = read(source[0], bytes, sizeof(bytes));
+        if (count < 0) okay = false;
+        else remaining.assign(bytes, count);
+    }
+    for (int* channel : channels) for (int descriptor : {channel[0], channel[1]})
+        if (descriptor >= 0) close(descriptor);
+    EXPECT_EQ(0, umount(mountpoint)) << strerror(errno);
+    EXPECT_EQ(0, rmdir(mountpoint)) << strerror(errno);
+    ASSERT_TRUE(okay) << "FUSE/child protocol failure; splicer=" << completions[0].count
+                      << " errno=" << completions[0].error << "; competitor="
+                      << completions[1].count << " errno=" << completions[1].error;
+    ASSERT_TRUE(all_reaped);
+    EXPECT_FALSE(crossed) << "NONBLOCK/FIONREAD bypassed an unfinished pipe reservation";
+    EXPECT_EQ(!initial.empty(), (source_events & POLLIN) != 0)
+        << "poll must reflect published slots independently of internal transactions";
+    const unsigned consumed = parameter.error ? 0 : parameter.accepted;
+    EXPECT_EQ(parameter.error ? -1 : static_cast<ssize_t>(consumed), completions[0].count);
+    EXPECT_EQ(parameter.error, completions[0].error);
+    EXPECT_EQ(consumed, completions[0].position);
+    const std::string tail = parameter.input ? initial + "pppp" : initial.substr(consumed);
+    if (parameter.consumer == HoldConsumer::Available) {
+        EXPECT_EQ(0, completions[1].count);
+        EXPECT_EQ(tail.size(), static_cast<size_t>(completions[1].available));
+    } else {
+        EXPECT_EQ(1, completions[1].count);
+        EXPECT_EQ(0, completions[1].error);
+        EXPECT_EQ(tail[0], completions[1].byte);
+    }
+    const bool reader_consumed = parameter.consumer == HoldConsumer::Read ||
+        parameter.consumer == HoldConsumer::Readv || parameter.consumer == HoldConsumer::Splice ||
+        parameter.consumer == HoldConsumer::FileSplice;
+    EXPECT_EQ(tail.substr(reader_consumed ? 1 : 0), remaining);
+    EXPECT_EQ(parameter.input ? 0 : consumed, daemon.committed_write_bytes);
+}
+
+std::vector<HoldCase> SpliceHoldCases() {
+    std::vector<HoldCase> cases;
+    for (HoldConsumer consumer : {HoldConsumer::Read, HoldConsumer::Readv,
+                                 HoldConsumer::Tee, HoldConsumer::Splice,
+                                 HoldConsumer::Available}) {
+        cases.push_back({consumer, 4, 0});
+        cases.push_back({consumer, 2, 0});
+        cases.push_back({consumer, 0, EIO});
+    }
+    // These windows own the pipe transaction without any reservation flag.
+    // The empty FileSplice case also exercises NONBLOCK's early input prep.
+    for (HoldConsumer consumer : {HoldConsumer::Read, HoldConsumer::Available,
+                                 HoldConsumer::FileSplice}) {
+        cases.push_back({consumer, 4, 0, true});
+    }
+    return cases;
+}
+
+std::string HoldCaseName(const testing::TestParamInfo<HoldCase>& parameter) {
+    const char* names[]{"Read", "Readv", "Tee", "Splice", "Available", "FileSplice"};
+    return std::string(parameter.param.input ? "Input" : "Output") +
+        names[static_cast<unsigned>(parameter.param.consumer)] +
+        (parameter.param.error ? "Error" : parameter.param.accepted == 4 ? "Full" : "Short");
+}
+
+INSTANTIATE_TEST_SUITE_P(Consumers, FuseSpliceHold, testing::ValuesIn(SpliceHoldCases()),
+                         HoldCaseName);
 
 // Hold a real WRITE reply while a separately opened root descriptor tries to
 // reinstall a capability. Both clients acknowledge readiness; the mutator also

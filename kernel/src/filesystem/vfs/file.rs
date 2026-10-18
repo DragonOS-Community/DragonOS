@@ -2161,15 +2161,15 @@ impl File {
         if self.file_type == FileType::Dir {
             return Ok(None);
         }
-        if self.file_type == FileType::File && len == 0 {
-            return Ok(Some(0));
-        }
+        // Internal FileType also covers anonymous record descriptors. Their
+        // owners must see empty scalar requests (e.g. timerfd returns EINVAL).
         let intent = if self.direct_io == DirectIoPolicy::Buffered {
             super::ReadIoIntent::Buffered
         } else {
             intent
         };
-        if intent == super::ReadIoIntent::Buffered
+        if len != 0
+            && intent == super::ReadIoIntent::Buffered
             && self.file_type == FileType::File
             && self.inode.user_read_mode() == super::UserReadMode::Iterator
         {

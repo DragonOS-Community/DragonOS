@@ -103,6 +103,10 @@ pub(super) fn read_user_with_io_intent(
     data: crate::libs::mutex::MutexGuard<FilePrivateData>,
     intent: vfs::ReadIoIntent,
 ) -> Result<Option<usize>, SystemError> {
+    // Like ovl_read_iter, an empty read needs no backing selection or reopen.
+    if len == 0 {
+        return Ok(Some(0));
+    }
     let FilePrivateData::Overlayfs(overlay_data) = &*data else {
         return Err(SystemError::EBADF);
     };

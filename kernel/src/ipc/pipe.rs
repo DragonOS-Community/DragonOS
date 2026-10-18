@@ -530,6 +530,27 @@ impl PipeRuntime {
         }
     }
 
+    /// Final pipe-to-pipe transfers serialize with both pipes' user copies.
+    /// Enter without either transaction held; use the same address order as
+    /// `lock_two` so simultaneous transfers in opposite directions cannot ABBA.
+    /// Readiness waits and output allocation belong before this boundary.
+    fn begin_transfer_transactions<'a, 'b>(
+        src: &'a Self,
+        dst: &'b Self,
+    ) -> (PipeWriterTransaction<'a>, PipeWriterTransaction<'b>) {
+        debug_assert!(!core::ptr::eq(src, dst));
+        if (src as *const Self as usize) < (dst as *const Self as usize) {
+            (
+                src.begin_writer_transaction(),
+                dst.begin_writer_transaction(),
+            )
+        } else {
+            let output = dst.begin_writer_transaction();
+            let input = src.begin_writer_transaction();
+            (input, output)
+        }
+    }
+
     #[inline]
     fn writer_wake_action(inner: &mut InnerPipeInode) -> PipeWriterWake {
         let available = inner.writable_bytes();
@@ -1253,11 +1274,16 @@ impl PipeRuntime {
     fn transfer_slots(
         src: &PipeRuntime,
         dst: &PipeRuntime,
+        source_transaction: &PipeWriterTransaction<'_>,
         transaction: &mut PipeWriterTransaction<'_>,
         len: usize,
         consume: bool,
     ) -> Result<(usize, usize), SystemError> {
+        debug_assert!(core::ptr::eq(source_transaction.pipe, src));
+        debug_assert!(core::ptr::eq(transaction.pipe, dst));
+        debug_assert!(source_transaction.guard.is_some() && transaction.guard.is_some());
         let (mut input, mut output) = Self::lock_two(src, dst);
+        debug_assert!(!input.input_copy_active);
         if output.reader == 0 {
             drop(input);
             drop(output);
@@ -1361,12 +1387,23 @@ impl PipeRuntime {
                 &crate::process::ProcessManager::current_pcb(),
             );
             out.prepare_output_storage(&transaction, &actor)?;
-            let (bytes, slots) =
-                match Self::transfer_slots(self, out, &mut transaction, len - total, true) {
-                    Ok(progress) => progress,
-                    Err(_) if total != 0 => return Ok(total),
-                    Err(error) => return Err(error.into()),
-                };
+            // Allocated storage survives consumption and resize. Release the
+            // single-end preparation before entering the ordered pair.
+            drop(transaction);
+            let (source_transaction, mut transaction) =
+                Self::begin_transfer_transactions(self, out);
+            let (bytes, slots) = match Self::transfer_slots(
+                self,
+                out,
+                &source_transaction,
+                &mut transaction,
+                len - total,
+                true,
+            ) {
+                Ok(progress) => progress,
+                Err(_) if total != 0 => return Ok(total),
+                Err(error) => return Err(error.into()),
+            };
             total += bytes;
             if total == len || total != 0 {
                 return Ok(total);
@@ -1402,7 +1439,13 @@ impl PipeRuntime {
                 &crate::process::ProcessManager::current_pcb(),
             );
             out.prepare_output_storage(&transaction, &actor)?;
-            let (bytes, slots) = Self::transfer_slots(self, out, &mut transaction, len, false)?;
+            // Allocated storage survives consumption and resize. Release the
+            // single-end preparation before entering the ordered pair.
+            drop(transaction);
+            let (source_transaction, mut transaction) =
+                Self::begin_transfer_transactions(self, out);
+            let (bytes, slots) =
+                Self::transfer_slots(self, out, &source_transaction, &mut transaction, len, false)?;
             if slots != 0 {
                 return Ok(bytes);
             }
@@ -1480,10 +1523,20 @@ mod tests {
             assert!(inner.buf_full());
         }
         dst.inner.lock().reader = 1;
-        let mut transaction = dst.begin_writer_transaction();
+        let transaction = dst.begin_writer_transaction();
         dst.prepare_output_storage(&transaction, &creator).unwrap();
+        drop(transaction);
+        let (source_transaction, mut transaction) =
+            PipeRuntime::begin_transfer_transactions(&src, &dst);
         assert_eq!(
-            PipeRuntime::transfer_slots(&src, &dst, &mut transaction, 3, false),
+            PipeRuntime::transfer_slots(
+                &src,
+                &dst,
+                &source_transaction,
+                &mut transaction,
+                3,
+                false
+            ),
             Ok((3, 2))
         );
         assert_eq!(src.inner.lock().data.segment_count(), 2);
@@ -1498,7 +1551,7 @@ mod tests {
             assert_eq!(&inner.data[..3], b"abc");
         }
         assert_eq!(
-            PipeRuntime::transfer_slots(&src, &dst, &mut transaction, 3, true),
+            PipeRuntime::transfer_slots(&src, &dst, &source_transaction, &mut transaction, 3, true),
             Ok((3, 2))
         );
         assert_eq!(src.inner.lock().data.segment_count(), 0);
@@ -1540,10 +1593,13 @@ mod tests {
             Ok(4)
         );
         assert_eq!(&held, b"held");
-        let mut transaction = dst.begin_writer_transaction();
+        let transaction = dst.begin_writer_transaction();
         dst.prepare_output_storage(&transaction, &creator).unwrap();
+        drop(transaction);
+        let (source_transaction, mut transaction) =
+            PipeRuntime::begin_transfer_transactions(&src, &dst);
         assert_eq!(
-            PipeRuntime::transfer_slots(&src, &dst, &mut transaction, 4, true),
+            PipeRuntime::transfer_slots(&src, &dst, &source_transaction, &mut transaction, 4, true),
             Ok((0, 0))
         );
         {
@@ -1554,7 +1610,7 @@ mod tests {
 
         src.splice_finish_hold(0);
         assert_eq!(
-            PipeRuntime::transfer_slots(&src, &dst, &mut transaction, 4, true),
+            PipeRuntime::transfer_slots(&src, &dst, &source_transaction, &mut transaction, 4, true),
             Ok((4, 1))
         );
         assert_eq!(src.inner.lock().valid_cnt, 0);

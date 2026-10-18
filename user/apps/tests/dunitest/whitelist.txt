@@ -246,3 +246,5 @@ normal/legacy_writev_semantics
 normal/position_read_semantics
 normal/proc_write_position
 normal/iov_snapshot_semantics
+
+normal/pipe_transfer_copy

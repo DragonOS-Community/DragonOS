@@ -8,7 +8,7 @@ size = "2G"
 partition = "mbr"
 
 [base]
-image = "ubuntu:24.04"
+image = "dragonos-rootfs:ubuntu2404"
 pull_policy = "if-not-present"
 
 [user]

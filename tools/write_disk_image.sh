@@ -5,7 +5,7 @@
 # 用法：bash write_disk_image.sh --bios legacy/uefi
 # 如果之前创建的 disk-${ARCH}.img 是MBR分区表，那么请这样运行它：bash write_disk_image.sh --bios legacy
 # 如果之前创建的 disk-${ARCH}.img 是GPT分区表，那么请这样运行它：bash write_disk_image.sh --bios uefi
-# 通过设置ARCH为x86_64/i386/riscv64，进行64/32位uefi的install，但是请记住该处的ARCH应与run-qemu.sh中的一致
+# 通过设置ARCH为x86_64/i386/riscv64，进行64/32位uefi的install，但是请记住该处的ARCH应与run-qemu.sh的一致
 ###############################################
 set -euo pipefail
 
@@ -118,6 +118,19 @@ if [ "${image_exists}" = "1" ]; then
     if [ "${schema_current}" != "${SYSCONFIG_SCHEMA_VERSION}" ]; then
         echo "sysconfig schema version changed (current='${schema_current:-none}', expected='${SYSCONFIG_SCHEMA_VERSION}'), removing the old disk image and rebuilding..."
         $DADK "${DADK_MANIFEST_ARGS[@]}" -w $root_folder rootfs delete || exit 1
+    fi
+fi
+
+# Build the base image from tools/docker-rootfs when the rootfs manifest
+# references it but it is not present locally (e.g. "dragonos-rootfs:ubuntu2404").
+# This keeps the rootfs content definition in one place: the Dockerfile.
+base_image="$(awk '/^\[base\]/{in_base=1;next} /^\[/{in_base=0} in_base && /^image[[:space:]]*=/{gsub(/[[:space:]"=]/,"",$0); print substr($0,6); exit}' "${root_folder}/config/rootfs.generated.toml" || true)"
+if [ -n "${base_image}" ] && ! docker image inspect "${base_image}" >/dev/null 2>&1; then
+    if [ -f "${root_folder}/tools/docker-rootfs/Dockerfile" ]; then
+        echo "Base image '${base_image}' not found locally, building from tools/docker-rootfs/Dockerfile..."
+        docker build -t "${base_image}" "${root_folder}/tools/docker-rootfs" || exit 1
+    else
+        echo "Base image '${base_image}' not found locally and no Dockerfile to build it; DADK will try to pull it."
     fi
 fi
 
@@ -270,7 +283,7 @@ import_sysconfig_ext4() {
     # inodes with the numeric owner/group/mode from the tar header instead
     # of inheriting ownership, permissions or link semantics from old
     # inodes. Directories are kept in place; tar only applies their
-    # metadata. Note: tar --unlink-first cannot be used here because it
+    # metadata. Note: tar --unlink-first cannot be used because it
     # would also try to unlink non-empty directories.
     python3 - "${SYSCONFIG_TAR}" "${mount_folder}" <<'PYEOF' || return 1
 import os

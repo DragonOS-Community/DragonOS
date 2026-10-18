@@ -6251,11 +6251,26 @@ fail:
     return -1;
 }
 
-static int ext_test_mmap_fault_batches_readaround_pages() {
+struct mmap_readaround_range {
+    size_t first_page;
+    size_t page_count;
+};
+
+struct mmap_readaround_request {
+    uint64_t offset;
+    uint32_t size;
+};
+
+// One mount/open description per trace: cached hits between misses must not
+// accidentally restart the sequential window or cause extra daemon requests.
+static int ext_test_mmap_readaround_trace(size_t file_size, uint32_t max_read,
+                                         uint16_t max_pages, uint32_t max_readahead,
+                                         const mmap_readaround_range *ranges, size_t range_count,
+                                         const mmap_readaround_request *requests,
+                                         size_t request_count) {
     const char *mp = "/tmp/test_fuse_mmap_readaround";
     const size_t page_size = 4096;
-    const size_t page_count = 8;
-    const size_t map_len = page_size * page_count;
+    const size_t map_len = ((file_size + page_size - 1) / page_size) * page_size;
     char path[256];
     int f = -1;
     void *addr = MAP_FAILED;
@@ -6276,8 +6291,8 @@ static int ext_test_mmap_fault_batches_readaround_pages() {
     volatile int stop = 0;
     volatile int init_done = 0;
     volatile uint32_t read_count = 0;
-    volatile uint64_t read_offsets[8] = {0};
-    volatile uint32_t read_sizes[8] = {0};
+    volatile uint64_t read_offsets[32] = {0};
+    volatile uint32_t read_sizes[32] = {0};
 
     struct fuse_daemon_args args;
     memset(&args, 0, sizeof(args));
@@ -6287,9 +6302,11 @@ static int ext_test_mmap_fault_batches_readaround_pages() {
     args.read_count = &read_count;
     args.read_offsets = read_offsets;
     args.read_sizes = read_sizes;
-    args.read_trace_capacity = 8;
-    args.hello_generated_size_override = map_len;
-    args.init_out_max_write_override = map_len;
+    args.read_trace_capacity = 32;
+    args.hello_generated_size_override = file_size;
+    args.init_out_max_write_override = max_read;
+    args.init_out_max_pages_override = max_pages;
+    args.init_out_max_readahead_override = max_readahead;
     args.stop_on_destroy = 1;
 
     pthread_t th;
@@ -6301,8 +6318,8 @@ static int ext_test_mmap_fault_batches_readaround_pages() {
     }
 
     char opts[256];
-    snprintf(opts, sizeof(opts), "fd=%d,rootmode=040755,user_id=0,group_id=0,max_read=32768",
-             fd);
+    snprintf(opts, sizeof(opts), "fd=%d,rootmode=040755,user_id=0,group_id=0,max_read=%u",
+             fd, max_read);
     if (mount("none", mp, "fuse", 0, opts) != 0) {
         printf("[FAIL] mount(fuse): %s (errno=%d)\n", strerror(errno), errno);
         stop = 1;
@@ -6328,27 +6345,54 @@ static int ext_test_mmap_fault_batches_readaround_pages() {
         goto fail;
     }
 
-    for (size_t i = 0; i < page_count; i++) {
-        size_t offset = i * page_size;
-        unsigned char c = ((volatile unsigned char *)addr)[offset];
-        unsigned char expected = (unsigned char)('A' + (offset % 26));
-        if (c != expected) {
-            printf("[FAIL] mmap data mismatch page=%zu got=%u expected=%u read_count=%u\n", i, c,
-                   expected, read_count);
-            goto fail;
+    for (size_t range = 0; range < range_count; range++) {
+        for (size_t i = 0; i < ranges[range].page_count; i++) {
+            size_t page = ranges[range].first_page + i;
+            size_t offset = page * page_size;
+            if (offset >= file_size) {
+                printf("[FAIL] invalid mmap trace page=%zu file_size=%zu\n", page, file_size);
+                goto fail;
+            }
+            // Check both ends of every demanded page, including a partial EOF
+            // page, rather than treating correct request sizes as data proof.
+            size_t tail = offset + page_size - 1;
+            if (tail >= file_size) {
+                tail = file_size - 1;
+            }
+            for (size_t byte : {offset, tail}) {
+                unsigned char c = ((volatile unsigned char *)addr)[byte];
+                unsigned char expected = (unsigned char)('A' + (byte % 26));
+                if (c != expected) {
+                    printf("[FAIL] mmap data mismatch offset=%zu got=%u expected=%u reads=%u\n",
+                           byte, c, expected, read_count);
+                    goto fail;
+                }
+                checksum += c;
+            }
         }
-        checksum += c;
     }
     if (checksum == 0) {
         printf("[FAIL] checksum unexpectedly zero\n");
         goto fail;
     }
+    if (file_size < map_len && ((volatile unsigned char *)addr)[map_len - 1] != 0) {
+        printf("[FAIL] mmap EOF page tail was not zero-filled\n");
+        goto fail;
+    }
 
-    if (read_count != 1 || read_offsets[0] != 0 || read_sizes[0] != map_len) {
-        printf("[FAIL] mmap readaround not batched: count=%u off0=%llu size0=%u off1=%llu size1=%u\n",
-               read_count, (unsigned long long)read_offsets[0], read_sizes[0],
+    if (read_count != request_count) {
+        printf("[FAIL] mmap readaround count=%u expected=%zu off0=%llu size0=%u off1=%llu size1=%u\n",
+               read_count, request_count, (unsigned long long)read_offsets[0], read_sizes[0],
                (unsigned long long)read_offsets[1], read_sizes[1]);
         goto fail;
+    }
+    for (size_t i = 0; i < request_count; i++) {
+        if (read_offsets[i] != requests[i].offset || read_sizes[i] != requests[i].size) {
+            printf("[FAIL] mmap READ[%zu] offset=%llu expected=%llu size=%u expected=%u\n",
+                   i, (unsigned long long)read_offsets[i],
+                   (unsigned long long)requests[i].offset, read_sizes[i], requests[i].size);
+            goto fail;
+        }
     }
 
     munmap(addr, map_len);
@@ -6375,6 +6419,52 @@ fail:
     pthread_join(th, NULL);
     rmdir(mp);
     return -1;
+}
+
+static int ext_test_mmap_fault_batches_readaround_pages() {
+    // Keep the original regression contract: all eight pages, one 32768-byte
+    // READ starting at zero, when max_read limits the connection to eight pages.
+    const mmap_readaround_range ranges[] = {{0, 8}};
+    const mmap_readaround_request requests[] = {{0, 32768}};
+    return ext_test_mmap_readaround_trace(32768, 32768, 0, 0, ranges, 1, requests, 1);
+}
+
+static int ext_test_mmap_sequential_readaround_grows() {
+    const mmap_readaround_range ranges[] = {{0, 176}};
+    const mmap_readaround_request requests[] = {
+        {0, 16 * 4096}, {16 * 4096, 32 * 4096},
+        {48 * 4096, 64 * 4096}, {112 * 4096, 64 * 4096},
+    };
+    return ext_test_mmap_readaround_trace(176 * 4096, 64 * 4096, 64, 64 * 4096,
+                                         ranges, 1, requests, 4);
+}
+
+static int ext_test_mmap_random_readaround_resets_window() {
+    const mmap_readaround_range ranges[] = {{0, 48}, {160, 16}, {80, 16}};
+    const mmap_readaround_request requests[] = {
+        {0, 16 * 4096}, {16 * 4096, 32 * 4096},
+        {160 * 4096, 16 * 4096}, {80 * 4096, 16 * 4096},
+    };
+    return ext_test_mmap_readaround_trace(256 * 4096, 64 * 4096, 64, 64 * 4096,
+                                         ranges, 3, requests, 4);
+}
+
+static int ext_test_mmap_readaround_connection_cap(uint32_t max_read, uint16_t max_pages,
+                                                 uint32_t max_readahead) {
+    const mmap_readaround_range ranges[] = {{0, 32}};
+    const mmap_readaround_request requests[] = {
+        {0, 8 * 4096}, {8 * 4096, 8 * 4096},
+        {16 * 4096, 8 * 4096}, {24 * 4096, 8 * 4096},
+    };
+    return ext_test_mmap_readaround_trace(32 * 4096, max_read, max_pages, max_readahead,
+                                         ranges, 1, requests, 4);
+}
+
+static int ext_test_mmap_readaround_clips_partial_eof() {
+    const mmap_readaround_range ranges[] = {{0, 21}};
+    const mmap_readaround_request requests[] = {{0, 16 * 4096}, {16 * 4096, 4 * 4096 + 137}};
+    return ext_test_mmap_readaround_trace(20 * 4096 + 137, 64 * 4096, 64, 64 * 4096,
+                                         ranges, 1, requests, 2);
 }
 
 static int ext_test_direct_io_read_bypasses_page_cache() {
@@ -11193,6 +11283,30 @@ TEST(FuseExtended, MmapFaultUsesOpenFhWithoutExtraOpen) {
 
 TEST(FuseExtended, MmapFaultBatchesReadaroundPages) {
     ASSERT_EQ(0, ext_test_mmap_fault_batches_readaround_pages());
+}
+
+TEST(FuseExtended, MmapSequentialReadaroundGrowsToConnectionCap) {
+    ASSERT_EQ(0, ext_test_mmap_sequential_readaround_grows());
+}
+
+TEST(FuseExtended, MmapRandomReadaroundResetsWindow) {
+    ASSERT_EQ(0, ext_test_mmap_random_readaround_resets_window());
+}
+
+TEST(FuseExtended, MmapReadaroundRespectsMaxRead) {
+    ASSERT_EQ(0, ext_test_mmap_readaround_connection_cap(8 * 4096, 64, 64 * 4096));
+}
+
+TEST(FuseExtended, MmapReadaroundRespectsMaxPages) {
+    ASSERT_EQ(0, ext_test_mmap_readaround_connection_cap(64 * 4096, 8, 64 * 4096));
+}
+
+TEST(FuseExtended, MmapReadaroundRespectsMaxReadahead) {
+    ASSERT_EQ(0, ext_test_mmap_readaround_connection_cap(64 * 4096, 64, 8 * 4096));
+}
+
+TEST(FuseExtended, MmapReadaroundClipsPartialEof) {
+    ASSERT_EQ(0, ext_test_mmap_readaround_clips_partial_eof());
 }
 
 TEST(FuseExtended, DirectIoReadBypassesPageCache) {

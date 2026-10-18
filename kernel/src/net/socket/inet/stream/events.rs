@@ -109,6 +109,19 @@ impl TcpSocket {
         changed
     }
 
+    /// Normal receive must not wake repeatedly for an extended error queue:
+    /// MSG_ERRQUEUE owns that queue, while transport errors still wake recv.
+    pub(super) fn recv_wait_ready(&self) -> bool {
+        let events = self.check_io_event();
+        if events.intersects(EP::EPOLLIN | EP::EPOLLHUP | EP::EPOLLRDHUP) {
+            return true;
+        }
+        events.contains(EP::EPOLLERR)
+            && self.inner.read().as_ref().is_some_and(|inner| {
+                inner.with_socket(|socket| socket.pending_error().is_some()) == Some(true)
+            })
+    }
+
     #[inline]
     pub fn incoming(&self) -> bool {
         let events = EP::from_bits_truncate(self.do_poll() as u32);

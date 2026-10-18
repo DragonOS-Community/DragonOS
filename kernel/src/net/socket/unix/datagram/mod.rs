@@ -1,3 +1,4 @@
+use crate::net::socket::recv_timeout::ReceiveTimeout;
 use crate::{
     filesystem::epoll::{event_poll::EventPoll, EPollEventType},
     filesystem::vfs::iov::IoVecs,
@@ -813,6 +814,7 @@ impl Socket for UnixDatagramSocket {
     fn recv(&self, buffer: &mut [u8], flags: socket::PMSG) -> Result<usize, SystemError> {
         let peek = flags.contains(PMSG::PEEK);
         let nonblock = self.is_nonblocking() || flags.contains(PMSG::DONTWAIT);
+        let mut timeout = ReceiveTimeout::new(self.recv_timeout());
 
         if nonblock {
             return self
@@ -828,10 +830,7 @@ impl Socket for UnixDatagramSocket {
                     return Ok(Self::recv_return_len(copy_len, orig_len, flags));
                 }
                 Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
-                    self.wait_queue.wait_event_interruptible_timeout(
-                        || self.can_recv(),
-                        self.recv_timeout(),
-                    )?;
+                    timeout.wait(&self.wait_queue, || self.can_recv())?;
                 }
                 Err(e) => return Err(e),
             }
@@ -846,6 +845,7 @@ impl Socket for UnixDatagramSocket {
     ) -> Result<(usize, Endpoint), SystemError> {
         let peek = flags.contains(PMSG::PEEK);
         let nonblock = self.is_nonblocking() || flags.contains(PMSG::DONTWAIT);
+        let mut timeout = ReceiveTimeout::new(self.recv_timeout());
 
         let do_recv = |buffer: &mut [u8]| -> Result<(usize, Endpoint), SystemError> {
             let (copy_len, addr, orig_len) = self.try_recv_from(buffer, peek)?;
@@ -864,10 +864,7 @@ impl Socket for UnixDatagramSocket {
             match do_recv(buffer) {
                 Ok(result) => return Ok(result),
                 Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
-                    self.wait_queue.wait_event_interruptible_timeout(
-                        || self.can_recv(),
-                        self.recv_timeout(),
-                    )?;
+                    timeout.wait(&self.wait_queue, || self.can_recv())?;
                 }
                 Err(e) => return Err(e),
             }
@@ -900,6 +897,7 @@ impl Socket for UnixDatagramSocket {
         let mut buf = RecvBuffer::default();
         let capacity = iovs.total_len();
         let nonblock = self.is_nonblocking() || flags.contains(PMSG::DONTWAIT);
+        let mut timeout = ReceiveTimeout::new(self.recv_timeout());
         let peek = flags.contains(PMSG::PEEK);
         let DatagramRecvMeta {
             copy_len: payload_copy_len,
@@ -912,10 +910,7 @@ impl Socket for UnixDatagramSocket {
                 Ok(ReceiveAttempt::Ready(meta)) => break meta,
                 Ok(ReceiveAttempt::NeedBuffer(required)) => buf.prepare(required)?,
                 Err(SystemError::EAGAIN_OR_EWOULDBLOCK) if !nonblock => {
-                    self.wait_queue.wait_event_interruptible_timeout(
-                        || self.can_recv(),
-                        self.recv_timeout(),
-                    )?;
+                    timeout.wait(&self.wait_queue, || self.can_recv())?;
                 }
                 Err(error) => return Err(error),
             }

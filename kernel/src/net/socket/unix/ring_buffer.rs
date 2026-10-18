@@ -111,6 +111,11 @@ impl<T: Pod> RingBuffer<T> {
             .store(true, core::sync::atomic::Ordering::Release);
     }
 
+    pub fn has_connreset_pending(&self) -> bool {
+        self.connreset_pending
+            .load(core::sync::atomic::Ordering::Acquire)
+    }
+
     pub fn take_connreset_pending(&self) -> bool {
         self.connreset_pending
             .swap(false, core::sync::atomic::Ordering::AcqRel)
@@ -590,6 +595,10 @@ impl<T: Pod, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
 }
 
 impl<T: Pod, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
+    pub fn has_connreset_pending(&self) -> bool {
+        self.ring_buffer.has_connreset_pending()
+    }
+
     pub fn take_connreset_pending(&self) -> bool {
         self.ring_buffer.take_connreset_pending()
     }

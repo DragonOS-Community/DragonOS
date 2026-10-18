@@ -1,3 +1,4 @@
+use crate::net::socket::recv_timeout::ReceiveTimeout;
 use smoltcp::wire::{IpAddress, IpProtocol, IpVersion};
 use system_error::SystemError;
 
@@ -223,6 +224,7 @@ impl RawSocket {
         flags: PMSG,
     ) -> Result<RawReceived, SystemError> {
         let nonblock = self.is_nonblock() || flags.contains(PMSG::DONTWAIT);
+        let mut timeout = ReceiveTimeout::new(self.recv_timeout());
         loop {
             match self.try_recv_packet(
                 &mut RawReceiveTarget::Staged(buffer),
@@ -231,10 +233,7 @@ impl RawSocket {
                 Ok(ReceiveAttempt::Ready(received)) => return Ok(received),
                 Ok(ReceiveAttempt::NeedBuffer(required)) => buffer.prepare(required)?,
                 Err(SystemError::EAGAIN_OR_EWOULDBLOCK) if !nonblock => {
-                    self.wait_queue.wait_event_io_interruptible_timeout(
-                        || self.can_recv(),
-                        self.recv_timeout(),
-                    )?;
+                    timeout.wait_io(&self.wait_queue, || self.can_recv())?;
                 }
                 Err(error) => return Err(error),
             }
@@ -570,16 +569,15 @@ impl RawSocket {
         buffer: &mut [u8],
         flags: crate::net::socket::PMSG,
     ) -> Result<usize, SystemError> {
-        if self.is_nonblock() || flags.contains(crate::net::socket::PMSG::DONTWAIT) {
+        let nonblock = self.is_nonblock() || flags.contains(crate::net::socket::PMSG::DONTWAIT);
+        let mut timeout = ReceiveTimeout::new(self.recv_timeout());
+        if nonblock {
             self.try_recv_user(buffer).map(|(len, _)| len)
         } else {
             loop {
                 match self.try_recv_user(buffer) {
                     Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
-                        self.wait_queue.wait_event_io_interruptible_timeout(
-                            || self.can_recv(),
-                            self.recv_timeout(),
-                        )?;
+                        timeout.wait_io(&self.wait_queue, || self.can_recv())?;
                     }
                     result => return result.map(|(len, _)| len),
                 }
@@ -594,17 +592,16 @@ impl RawSocket {
         _address: Option<crate::net::socket::endpoint::Endpoint>,
     ) -> Result<(usize, crate::net::socket::endpoint::Endpoint), SystemError> {
         // Linux 语义：raw socket 的 recvfrom(2) 返回的 sockaddr_{in,in6}.port 为 0。
-        if self.is_nonblock() || flags.contains(crate::net::socket::PMSG::DONTWAIT) {
+        let nonblock = self.is_nonblock() || flags.contains(crate::net::socket::PMSG::DONTWAIT);
+        let mut timeout = ReceiveTimeout::new(self.recv_timeout());
+        if nonblock {
             self.try_recv_user(buffer)
                 .map(|(len, addr)| (len, crate::net::socket::endpoint::Endpoint::ip(addr)))
         } else {
             loop {
                 match self.try_recv_user(buffer) {
                     Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
-                        self.wait_queue.wait_event_io_interruptible_timeout(
-                            || self.can_recv(),
-                            self.recv_timeout(),
-                        )?;
+                        timeout.wait_io(&self.wait_queue, || self.can_recv())?;
                     }
                     result => {
                         return result.map(|(len, addr)| {

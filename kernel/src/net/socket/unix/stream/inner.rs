@@ -690,6 +690,10 @@ impl Connected {
         let mut events = EPollEventType::empty();
 
         let reader = self.reader.lock();
+        if reader.has_connreset_pending() {
+            events |= EPollEventType::EPOLLERR;
+        }
+
         let has_data = !reader.is_empty();
         let recv_shutdown = reader.is_read_shutdown();
         if has_data {

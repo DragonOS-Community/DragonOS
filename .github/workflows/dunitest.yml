@@ -51,6 +51,7 @@ jobs:
           normal/fuse_write_privileges
           normal/read_buffer_selftest
           normal/recvmsg_record_buffer
+          normal/socket_receive_contracts
           normal/tcp_receive_window_reopen
           normal/allocation_diagnostics
           normal/dma_allocator_selftest

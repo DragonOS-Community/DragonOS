@@ -996,6 +996,56 @@ fn run_arc_slot_cross_thread_selftest() -> Result<(), &'static str> {
 }
 
 fn run_pr1_selftest() -> Result<(), &'static str> {
+    if ProcessManager::current_pcb().rcu_read_depth() != 0 {
+        return Err("initial rcu_read_depth was not zero");
+    }
+
+    // PR1's fixed schedules sample a remote reader and a local releaser on
+    // opposite sides of sleepable GP waits. Keep that coordinator on one CPU
+    // without changing the debugfs caller's concurrently managed affinity.
+    let coordinator_cpu = {
+        let _pin = PreemptGuard::new();
+        crate::smp::core::smp_get_processor_id()
+    };
+    let done = Arc::new(Completion::new());
+    let result = Arc::new(SpinLock::new(None));
+    let worker_done = done.clone();
+    let worker_result = result.clone();
+    let closure = KernelThreadClosure::EmptyClosure((
+        Box::new(move || {
+            let outcome = run_pr1_on_cpu();
+            let exit_code = i32::from(outcome.is_err());
+            *worker_result.lock_irqsave() = Some(outcome);
+            worker_done.complete();
+            exit_code
+        }),
+        (),
+    ));
+    let worker = KernelThreadMechanism::create_on_cpu(
+        closure,
+        "rcu-pr1-coordinator".to_string(),
+        coordinator_cpu,
+    )
+    .ok_or("RCU PR1 could not create its coordinator")?;
+    if ProcessManager::wakeup(&worker).is_err() {
+        KernelThreadMechanism::stop(&worker)
+            .map_err(|_| "RCU PR1 could not stop its coordinator after wake failure")?;
+        return Err("RCU PR1 could not wake its coordinator");
+    }
+
+    let completed = done.wait_for_completion().is_ok();
+    let stopped = KernelThreadMechanism::stop(&worker).is_ok();
+    if !completed || !stopped {
+        return Err("RCU PR1 coordinator did not finish");
+    }
+    let outcome = result
+        .lock_irqsave()
+        .take()
+        .ok_or("RCU PR1 coordinator did not publish its result")?;
+    outcome
+}
+
+fn run_pr1_on_cpu() -> Result<(), &'static str> {
     gp::run_state_machine_selftests()?;
     super::srcu::run_state_machine_selftests()?;
     super::srcu::run_runtime_selftests()?;

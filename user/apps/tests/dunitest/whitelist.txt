@@ -110,6 +110,7 @@ normal/proc_self_exec_cmdline
 normal/exec_string_layout
 normal/proc_thread_accounting
 normal/user_namespace_id_map
+normal/user_namespace_admission
 normal/tty_tcflush
 normal/tty_console_device
 normal/hvc_console_backpressure

@@ -163,7 +163,7 @@ $(BIN_DIR)/%_test: suites/%.cc $(GTEST_OBJ)
 
 $(BIN_DIR)/normal/pwritev2_sync_test $(BIN_DIR)/normal/vector_write_privileges_test $(BIN_DIR)/normal/ext4_shared_xattr_test $(BIN_DIR)/normal/overlayfs_semantics_test $(BIN_DIR)/normal/ext4_nested_writeback_test $(BIN_DIR)/normal/ext4_orphan_recovery_test $(BIN_DIR)/normal/xattr_syscall_test $(BIN_DIR)/normal/ext4_inode_identity_test $(BIN_DIR)/normal/ext4_user_read_test $(BIN_DIR)/normal/utimensat_symlink_test $(BIN_DIR)/normal/mount_idmap_test $(BIN_DIR)/normal/mount_filecaps_test $(BIN_DIR)/normal/ext4_fallocate_test $(BIN_DIR)/normal/stat_blocks_test $(BIN_DIR)/normal/fat_directory_entries_test $(BIN_DIR)/normal/loop_memory_io_test: suites/normal/loop_ext4_test_support.h
 
-$(BIN_DIR)/normal/mount_propagation_test $(BIN_DIR)/normal/test_pivot_root_test: suites/normal/user_namespace_test_support.h
+$(BIN_DIR)/normal/mount_propagation_test $(BIN_DIR)/normal/test_pivot_root_test $(BIN_DIR)/normal/user_namespace_admission_test: suites/normal/user_namespace_test_support.h
 
 $(BIN_DIR)/normal/mount_idmap_test $(BIN_DIR)/normal/proc_fd_permission_test: suites/normal/cap_common.h
 

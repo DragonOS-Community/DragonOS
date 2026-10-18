@@ -62,6 +62,7 @@ jobs:
           normal/pipe_transfer_state
           normal/pipe_metadata
           normal/user_namespace_id_map
+          normal/user_namespace_admission
           normal/direct_write_semantics
           normal/pipe_empty_slot
           normal/preadv2_flags

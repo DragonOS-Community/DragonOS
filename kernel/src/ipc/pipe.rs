@@ -35,6 +35,7 @@ mod read;
 mod write;
 use buffer::{PipeBuffer, PipeSegment};
 pub use identity::LockedPipeInode;
+use read::PipeReadHold;
 
 /// 管道缓冲区默认大小（Linux 默认 65536 字节）
 pub const PIPE_BUFF_SIZE: usize = 65536;
@@ -45,9 +46,6 @@ pub const PIPE_MIN_SIZE: usize = 4096;
 /// PIPE_BUF: writes of <= PIPE_BUF must be atomic.
 /// Linux guarantees PIPE_BUF is at least a page (4096).
 pub const PIPE_BUF: usize = PIPE_MIN_SIZE;
-
-/// The sole writer waiting for an existing source-splice reservation.
-const HOLD_RELEASE_WAIT_TAG: usize = 1;
 
 /// 管道缓冲区最大大小（Linux 默认为 1MB）
 pub const PIPE_MAX_SIZE: usize = 1024 * 1024;
@@ -198,7 +196,8 @@ impl core::ops::Deref for PipeRuntime {
 
 #[derive(Debug)]
 pub struct PipeRuntimeData {
-    /// Serializes writes and output-side splice operations for this pipe.
+    /// Serializes pipe operations, including reads reserved across user copies
+    /// and external file I/O. Poll only observes the published slot snapshot.
     ///
     /// Lock order is `writer_transaction` -> `inner`. A blocking writer drops
     /// this mutex only after publishing its wait predicate under `inner`, then
@@ -217,7 +216,7 @@ pub struct PipeRuntimeData {
     write_fasync_items: FAsyncItems,
 }
 
-/// A serialized writer transaction. Dropping it releases the writer mutex
+/// A serialized pipe operation. Dropping it releases the operation mutex
 /// before passing the exclusive writer-wakeup baton.
 pub(crate) struct PipeWriterTransaction<'a> {
     pipe: &'a PipeRuntime,
@@ -307,7 +306,7 @@ impl InnerPipeInode {
         };
 
         if !flags.is_write_only() {
-            if self.has_slots() && self.splice_hold.is_none() {
+            if self.has_slots() {
                 // 有数据可读
                 events.insert(EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM);
             }
@@ -1200,106 +1199,65 @@ impl PipeRuntime {
         len: usize,
         buf: &mut [u8],
         nonblock: bool,
-    ) -> Result<usize, SystemError> {
+    ) -> Result<Option<(usize, PipeReadHold<'_>)>, SystemError> {
         loop {
-            let mut guard = self.lock_read_state();
-            if !guard.read_reserved() {
-                let mut freed = false;
-                while guard.pop_empty().is_some() {
-                    freed = true;
-                }
-                if freed {
-                    let wake = Self::writer_wake_action(&mut guard);
+            let transaction = self.begin_writer_transaction();
+            let mut guard = self.inner.lock();
+            debug_assert!(!guard.read_reserved());
+            let mut freed = false;
+            while guard.pop_empty().is_some() {
+                freed = true;
+            }
+            if freed {
+                let wake = Self::writer_wake_action(&mut guard);
+                drop(guard);
+                drop(transaction);
+                self.wake_writers(wake);
+                self.notify_writers(EPollEventType::empty());
+                self.write_fasync_items.send_sigio(FASYNC_POLL_OUT);
+                continue;
+            }
+            if guard.valid_cnt > 0 {
+                let num = (guard.valid_cnt as usize).min(len);
+                if buf.len() < num {
                     drop(guard);
-                    self.wake_writers(wake);
-                    self.notify_writers(EPollEventType::empty());
-                    self.write_fasync_items.send_sigio(FASYNC_POLL_OUT);
-                    continue;
+                    drop(transaction);
+                    Self::wake_waiters(&self.read_wait_queue, WakeMode::One);
+                    return Err(SystemError::EINVAL);
                 }
-                if guard.valid_cnt > 0 {
-                    let num = (guard.valid_cnt as usize).min(len);
-                    if buf.len() < num {
-                        drop(guard);
-                        Self::wake_waiters(&self.read_wait_queue, WakeMode::One);
-                        return Err(SystemError::EINVAL);
-                    }
-                    let start = guard.read_pos as usize;
-                    let first = num.min(guard.buf_size - start);
-                    buf[..first].copy_from_slice(&guard.data[start..start + first]);
-                    if num > first {
-                        buf[first..num].copy_from_slice(&guard.data[..num - first]);
-                    }
-                    guard.splice_hold = Some(num);
-                    return Ok(num);
+                let start = guard.read_pos as usize;
+                let first = num.min(guard.buf_size - start);
+                buf[..first].copy_from_slice(&guard.data[start..start + first]);
+                if num > first {
+                    buf[first..num].copy_from_slice(&guard.data[..num - first]);
                 }
-                if guard.writer == 0 {
-                    return Ok(0);
-                }
+                guard.splice_hold = Some(num);
+                drop(guard);
+                return Ok(Some((num, PipeReadHold::new(self, transaction))));
+            }
+            if guard.writer == 0 {
+                return Ok(None);
             }
             if nonblock {
                 return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
             }
             drop(guard);
+            drop(transaction);
             self.wait_for_readable_event()?;
         }
     }
 
-    pub(crate) fn splice_finish_hold(&self, consumed: usize) {
-        let mut guard = self.inner.lock();
-        let Some(held) = guard.splice_hold else {
-            return;
-        };
-        let slots_before = guard.data.segment_count();
-
-        let consume = consumed.min(held);
-        if consume > 0 {
-            guard.consume(consume);
-        }
-        guard.splice_hold = None;
-        let freed_slots = guard.data.segment_count() < slots_before;
-        let reader_wake = if guard.has_slots() {
-            WakeMode::One
-        } else if guard.writer == 0 {
-            WakeMode::All
-        } else {
-            WakeMode::None
-        };
-        let writer_wake = if freed_slots {
-            Self::writer_wake_action(&mut guard)
-        } else {
-            PipeWriterWake::None
-        };
-        drop(guard);
-        self.read_wait_queue.wake_one_tagged(HOLD_RELEASE_WAIT_TAG);
-        self.wake_pipe_waiters(reader_wake, writer_wake);
-        if freed_slots {
-            self.notify_writers(EPollEventType::empty());
-        }
-        if reader_wake != WakeMode::None {
-            self.notify_readers(EPollEventType::empty());
-        }
-        if reader_wake != WakeMode::None {
-            self.read_fasync_items.send_sigio(FASYNC_POLL_IN);
-        }
-        if freed_slots {
-            self.write_fasync_items.send_sigio(FASYNC_POLL_OUT);
-        }
-    }
-
-    /// Readers wait for an in-flight writer copy just as Linux takes the
-    /// pipe mutex before testing O_NONBLOCK. Never wait with `inner` held.
-    /// Callers must not already own this pipe's writer transaction.
+    /// Linux takes the pipe mutex before examining O_NONBLOCK or FIONREAD.
+    /// Admit every operation, including file-to-pipe I/O which has no copy
+    /// reservation flag. Callers must not already own this transaction.
     fn lock_read_state(&self) -> crate::libs::spinlock::SpinLockGuard<'_, InnerPipeInode> {
-        loop {
-            let inner = self.inner.lock();
-            if !inner.input_copy_active {
-                return inner;
-            }
-            drop(inner);
-            // The active input copy owns this transaction until its data or
-            // fault is published. Recheck after releasing the barrier.
-            drop(self.begin_writer_transaction());
-        }
+        let transaction = self.writer_transaction.lock();
+        let inner = self.inner.lock();
+        // Use the raw mutex guard: PipeWriterTransaction's drop can take
+        // inner to pass the writer baton, which would reenter this lock.
+        drop(transaction);
+        debug_assert!(!inner.read_reserved());
+        inner
     }
 
     /// Helper: Wait until the pipe is readable (has data).
@@ -1307,7 +1265,7 @@ impl PipeRuntime {
     /// - Ok(true): Data is available.
     /// - Ok(false): EOF (no writers and no data).
     /// - Err(e): Interrupted or EAGAIN.
-    fn wait_readable(&self, nonblock: bool) -> Result<bool, SystemError> {
+    pub(crate) fn wait_readable(&self, nonblock: bool) -> Result<bool, SystemError> {
         let mut did_wait = false;
         loop {
             let inner = self.lock_read_state();
@@ -1697,35 +1655,25 @@ mod tests {
         }
 
         let mut held = [0u8; 4];
-        assert_eq!(
-            src.splice_peek_hold_from_blocking(held.len(), &mut held, true),
-            Ok(4)
-        );
+        let (count, hold) = src
+            .splice_peek_hold_from_blocking(held.len(), &mut held, true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(count, 4);
         assert_eq!(&held, b"held");
-        let transaction = dst.begin_writer_transaction();
-        dst.prepare_output_storage(&transaction, &creator).unwrap();
-        drop(transaction);
-        let (source_transaction, mut transaction) =
-            PipeRuntime::begin_transfer_transactions(&src, &dst);
-        assert_eq!(
-            PipeRuntime::transfer_slots(
-                &src,
-                &dst,
-                &source_transaction,
-                &mut transaction,
-                4,
-                true,
-                false
-            ),
-            Ok(PipeTransferOutcome::Retry)
-        );
+        assert!(src.writer_transaction.try_lock().is_err());
         {
             let src_guard = src.inner.lock();
             assert_eq!(src_guard.valid_cnt, 4);
             assert_eq!(src_guard.read_pos, 0);
         }
-
-        src.splice_finish_hold(0);
+        hold.finish(0);
+        assert!(src.writer_transaction.try_lock().is_ok());
+        let transaction = dst.begin_writer_transaction();
+        dst.prepare_output_storage(&transaction, &creator).unwrap();
+        drop(transaction);
+        let (source_transaction, mut transaction) =
+            PipeRuntime::begin_transfer_transactions(&src, &dst);
         assert_eq!(
             PipeRuntime::transfer_slots(
                 &src,
@@ -2177,9 +2125,10 @@ impl PipeRuntime {
         data: usize,
         _private_data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        drop(_private_data);
         match cmd {
             FIONREAD => {
-                let inner = self.inner.lock();
+                let inner = self.lock_read_state();
                 let available = inner.valid_cnt;
                 drop(inner);
 

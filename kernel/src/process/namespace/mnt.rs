@@ -955,6 +955,27 @@ impl MntNamespace {
         root.root_inode()
     }
 
+    /// Linux current_chrooted(): compare the task's root with the visible
+    /// mount-namespace root, following mounts stacked on the namespace root.
+    /// The caller retains this namespace outside the lifecycle lock so its
+    /// final destructor cannot reenter mount teardown while the lock is held.
+    pub(crate) fn is_chrooted(&self, fs: &crate::filesystem::fs::FsStruct) -> bool {
+        let lifecycle = lock_mount_lifecycle();
+        let namespace_root = self.root_mntfs().mountpoint_root_inode().overlaid_inode();
+        // This is only an Arc observer of an already-owned process path;
+        // deriving an external mount pin here would reacquire lifecycle.
+        let fs_root = fs.root();
+        // as_any_ref() intentionally exposes the backing inode, whereas Arc
+        // downcasting identifies the outer mount wrapper needed for path identity.
+        let mounted_root = fs_root.clone().downcast_arc::<MountFSInode>();
+        let chrooted = mounted_root
+            .as_ref()
+            .is_none_or(|root| !root.same_path_ref(&namespace_root));
+        // Keep both path observers alive until after lifecycle is released.
+        drop(lifecycle);
+        chrooted
+    }
+
     /// Project a path inode from the namespace that was copied to create this
     /// namespace. The mount context changes, while the shared dentry identity
     /// is retained exactly (including hard-link aliases and renamed parents).

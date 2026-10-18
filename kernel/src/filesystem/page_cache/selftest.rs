@@ -2154,6 +2154,144 @@ impl PageCacheBackend for PreallocateFailureBackend {
     }
 }
 
+/// Reproduce the pathname-snapshot/owner-commit interleaving without timing
+/// hooks: the stale request is prepared, chmod commits, then the real inode
+/// truncate entry point runs. No task credentials or global mount are changed.
+fn run_ramfs_truncate_metadata_selftest() -> Result<bool, MemoryAllocationError> {
+    use crate::filesystem::vfs::{
+        permission::InodeOpContext, FileType, InodeMode, OpenTruncateContext, SetMetadataMask,
+    };
+    use crate::process::cred::CAPFlags;
+
+    let fs = crate::filesystem::ramfs::RamFS::new();
+    let inode = fs.root_inode().create(
+        "truncate-metadata",
+        FileType::File,
+        InodeMode::from_bits_truncate(0o600),
+    )?;
+    let data = Mutex::new(FilePrivateData::Unused);
+    let mut unprivileged = (*crate::process::ProcessManager::current_pcb().cred()).clone();
+    unprivileged.cap_effective = CAPFlags::CAP_EMPTY_SET;
+    let unprivileged = Arc::new(unprivileged);
+    let mut ok = true;
+    for entry in 0..6 {
+        let mut context = InodeOpContext::legacy();
+        if entry < 3 {
+            context.cred = Some(unprivileged.clone());
+        }
+        let cred = context.cred.as_ref().ok_or(SystemError::EIO)?;
+        // Both directions matter: newly granted setid must be removed, and
+        // a stale MODE request must never restore unrelated chmod bits.
+        for (before, committed) in [(0o600, 0o6751), (0o6755, 0o640)] {
+            inode.resize(64)?;
+            let mut metadata = inode.metadata()?;
+            metadata.mode = InodeMode::from_bits_truncate(before);
+            inode.set_metadata_masked(&metadata, SetMetadataMask::MODE)?;
+            let (requested, mask) =
+                crate::filesystem::vfs::vcore::prepare_write_side_effect_metadata_with_cred(
+                    inode.metadata()?,
+                    17,
+                    cred,
+                );
+            metadata.mode = InodeMode::from_bits_truncate(committed);
+            inode.set_metadata_masked(&metadata, SetMetadataMask::MODE)?;
+            let (expected, expected_mask) =
+                crate::filesystem::vfs::vcore::prepare_write_side_effect_metadata_with_cred(
+                    inode.metadata()?,
+                    17,
+                    cred,
+                );
+            let truncate = OpenTruncateContext {
+                requested: requested.clone(),
+                mask,
+            };
+            let applied = match entry {
+                0 => inode.resize_with_metadata_context(17, 0, &requested, mask, &context)?,
+                1 => inode.resize_file_with_metadata_context(
+                    17,
+                    0,
+                    data.lock(),
+                    &requested,
+                    mask,
+                    &context,
+                )?,
+                2 => inode.resize_open_truncate_with_inode_context(
+                    17,
+                    0,
+                    data.lock(),
+                    &truncate,
+                    &context,
+                )?,
+                3 => inode.resize_with_metadata_result(17, 0, &requested, mask)?,
+                4 => {
+                    inode.resize_file_with_metadata_result(17, 0, data.lock(), &requested, mask)?
+                }
+                _ => inode.resize_open_truncate_result(17, 0, data.lock(), &truncate)?,
+            };
+            let actual = inode.metadata()?;
+            ok &= actual.size == 17
+                && actual.mode == expected.mode
+                && applied.contains(SetMetadataMask::MODE)
+                    == expected_mask.contains(SetMetadataMask::MODE);
+        }
+    }
+
+    // A preparation failure must leave EOF and mode untouched. This used to
+    // resize first and only then apply the metadata; the raw owner-ID check
+    // deliberately fails before a commit is possible.
+    let context = InodeOpContext::legacy();
+    let mut invalid = inode.metadata()?;
+    invalid.uid = u32::MAX as usize;
+    inode.set_metadata_masked(&invalid, SetMetadataMask::UID)?;
+    let before = inode.metadata()?;
+    let result = inode.resize_with_metadata_context(
+        2,
+        0,
+        &before,
+        SetMetadataMask::WRITE_SIDE_EFFECT,
+        &context,
+    );
+    ok &= matches!(
+        result,
+        Err(MemoryAllocationError::System(SystemError::EOVERFLOW))
+    ) && inode.metadata()?.size == before.size
+        && inode.metadata()?.mode == before.mode;
+    invalid.uid = 0;
+    inode.set_metadata_masked(&invalid, SetMetadataMask::UID)?;
+
+    // Track the real inode cache's page before any fallible write. Drop uses
+    // Page identity to retire cache/reclaimer/PageManager owners on all exits.
+    let mut cleanup = MemcgReclaimFixture {
+        cache: inode.page_cache().ok_or(SystemError::EIO)?,
+        addresses: Vec::new(),
+        identities: Vec::new(),
+    };
+    cleanup
+        .addresses
+        .try_reserve(1)
+        .map_err(|_| SystemError::ENOMEM)?;
+    cleanup
+        .identities
+        .try_reserve(1)
+        .map_err(|_| SystemError::ENOMEM)?;
+    let page = cleanup.cache.get_or_create_page_zero(0)?;
+    cleanup.addresses.push(page.phys_address());
+    cleanup.identities.push(Arc::downgrade(&page));
+    drop(page);
+
+    // Shrink/regrow must retain the existing EOF tail-zeroing semantics.
+    inode.resize(64)?;
+    inode.write_at(0, 64, &[0x5a; 64], data.lock())?;
+    inode.resize(17)?;
+    inode.resize(64)?;
+    let mut bytes = [0; 64];
+    let read = inode.read_at(0, bytes.len(), &mut bytes, data.lock())?;
+    ok &= read == 64
+        && bytes[..17].iter().all(|byte| *byte == 0x5a)
+        && bytes[17..].iter().all(|byte| *byte == 0);
+    Ok(ok)
+}
+
 fn run_ramfs_fallocate_range_selftest() -> Result<bool, MemoryAllocationError> {
     use crate::filesystem::vfs::{AttribStageObserver, FileType, InodeMode};
 
@@ -3452,6 +3590,16 @@ pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, S
 
     if !run_write_prepare_rollback_selftest()? {
         return Ok("status=fail stage=write_prepare_rollback\n".into());
+    }
+
+    match run_ramfs_truncate_metadata_selftest() {
+        Ok(true) => {}
+        Ok(false) => return Ok("status=fail stage=ramfs_truncate_metadata\n".into()),
+        Err(error) => {
+            return Ok(alloc::format!(
+                "status=fail stage=ramfs_truncate_metadata error={error:?}\n"
+            ))
+        }
     }
 
     match run_ramfs_fallocate_range_selftest() {
@@ -5391,6 +5539,6 @@ pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, S
     }
 
     Ok(fdtable_layout_report + "memcg_noio_reclaim=ok\n" + &alloc::format!(
-        "status=ok\nmemcg_as_body_lifetime=ok\nmemcg_vma_body_lifetime=ok\nmemcg_file_body_lifetime=ok\nfile_write_completion=ok\nlegacy_writev_completion=ok\nfault_cache_snapshot=ok\nmemcg_page_state=ok\nmemcg_reclaim=ok\nmemcg_reclaim_scan_budget=ok\nregistry_churn=ok\nregistry_batch_retire=ok\nregistry_snapshot_lifetime=ok\nregistry_concurrent_snapshot=ok\nramfs_fallocate_range=ok\nwrite_prepare_rollback=ok\npreallocate_rollback=ok\nclean_unlink_liveness=ok\nwriteback_domain_lifecycle=ok\ndetached_read_batch_completion=ok\nread_user_batch=ok\npreallocated_batch_lifecycle=ok\nfile_membership=ok\nshmem_membership=ok\ndirty_membership=ok\ndirty_incarnation=ok\nremote_dirty_publish=ok\nwriteback_membership=ok\nwriteback_admission_order=ok\nwriteback_submission_token=ok\nwriteback_defer_progress=ok\nwriteback_budget_retry=ok\nsubmitted_writeback=ok\nfault_invalidate_retry_order=ok\ntag_scan_chunk_release=ok\nunevictable_membership=ok\ninflight_teardown=ok\nlate_completion=ok\nglobal_wiring=ok\nlayout=ok\nfile_drop_drift={file_drop_drift}\nshmem_drop_drift={shmem_drop_drift}\ndirty_drop_drift={dirty_drop_drift}\nwriteback_drop_drift={writeback_drop_drift}\nunevictable_drop_drift={unevictable_drop_drift}\nentry_size={entry_size}\nbaseline_size={baseline_size}\n"
+        "status=ok\nmemcg_as_body_lifetime=ok\nmemcg_vma_body_lifetime=ok\nmemcg_file_body_lifetime=ok\nfile_write_completion=ok\nlegacy_writev_completion=ok\nfault_cache_snapshot=ok\nmemcg_page_state=ok\nmemcg_reclaim=ok\nmemcg_reclaim_scan_budget=ok\nregistry_churn=ok\nregistry_batch_retire=ok\nregistry_snapshot_lifetime=ok\nregistry_concurrent_snapshot=ok\nramfs_fallocate_range=ok\nramfs_truncate_metadata=ok\nwrite_prepare_rollback=ok\npreallocate_rollback=ok\nclean_unlink_liveness=ok\nwriteback_domain_lifecycle=ok\ndetached_read_batch_completion=ok\nread_user_batch=ok\npreallocated_batch_lifecycle=ok\nfile_membership=ok\nshmem_membership=ok\ndirty_membership=ok\ndirty_incarnation=ok\nremote_dirty_publish=ok\nwriteback_membership=ok\nwriteback_admission_order=ok\nwriteback_submission_token=ok\nwriteback_defer_progress=ok\nwriteback_budget_retry=ok\nsubmitted_writeback=ok\nfault_invalidate_retry_order=ok\ntag_scan_chunk_release=ok\nunevictable_membership=ok\ninflight_teardown=ok\nlate_completion=ok\nglobal_wiring=ok\nlayout=ok\nfile_drop_drift={file_drop_drift}\nshmem_drop_drift={shmem_drop_drift}\ndirty_drop_drift={dirty_drop_drift}\nwriteback_drop_drift={writeback_drop_drift}\nunevictable_drop_drift={unevictable_drop_drift}\nentry_size={entry_size}\nbaseline_size={baseline_size}\n"
     ))
 }

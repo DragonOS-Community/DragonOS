@@ -5,6 +5,7 @@ use crate::filesystem::page_cache::{PageCache, PageCacheBackend};
 use crate::filesystem::vfs::syscall::RenameFlags;
 use crate::filesystem::vfs::{FileSystemMakerData, FsCreationContext, FSMAKER};
 use crate::libs::rwsem::RwSem;
+use crate::mm::allocation::MemoryAllocationError;
 use crate::mm::fault::{PageFaultHandler, PageFaultMessage};
 use crate::mm::VmFaultReason;
 use crate::process::namespace::user_namespace::{UserNamespace, INIT_USER_NAMESPACE};
@@ -37,7 +38,8 @@ use super::vfs::{
 
 use linkme::distributed_slice;
 
-use super::vfs::{Magic, MountableFileSystem, SuperBlock};
+use super::vfs::permission::InodeOpContext;
+use super::vfs::{Magic, MountableFileSystem, OpenTruncateContext, SuperBlock};
 
 /// RamFS的inode名称的最大长度
 const RAMFS_MAX_NAMELEN: usize = 64;
@@ -495,6 +497,48 @@ impl MountableFileSystem for RamFS {
 register_mountable_fs!(RamFS, RAMFSMAKER, "ramfs");
 
 impl LockedRamFSInode {
+    /// Size and write-side metadata share the existing content transaction.
+    /// The inode mutex must not cross cache truncation, which takes MM locks.
+    fn resize_with_operation(
+        &self,
+        len: usize,
+        request: Option<(&Metadata, SetMetadataMask, &InodeOpContext)>,
+    ) -> Result<SetMetadataMask, MemoryAllocationError> {
+        if len > isize::MAX as usize {
+            return Err(SystemError::EFBIG.into());
+        }
+        if request.is_some_and(|(_, _, context)| context.is_idmapped()) {
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP.into());
+        }
+        let _content = self.2.write();
+        let (cache, applied) = {
+            let mut inode = self.0.lock();
+            if inode.metadata.file_type != FileType::File {
+                return Err(SystemError::EINVAL.into());
+            }
+            let cache = inode.page_cache.clone().ok_or(SystemError::EIO)?;
+            let mut applied = SetMetadataMask::empty();
+            if let Some((requested, mask, context)) = request {
+                let (metadata, mask) = super::vfs::vcore::prepare_backing_resize_metadata(
+                    context,
+                    &inode.metadata,
+                    requested,
+                    mask,
+                    len,
+                )?;
+                super::vfs::merge_metadata_masked(&mut inode.metadata, &metadata, mask);
+                applied = mask;
+            }
+            // merge_metadata_masked deliberately does not apply size.
+            inode.metadata.size = len as i64;
+            (cache, applied)
+        };
+        // EOF precedes unmapping and tail clearing, including equal-size and
+        // growing truncates. A later cache error retains that published EOF.
+        cache.manager().resize(len)?;
+        Ok(applied)
+    }
+
     /// Prepare private contents before publishing a child in the namespace.
     /// Ordinary create has no initializer; a symlink must finish its page
     /// admission and target write before another lookup can observe it.
@@ -939,25 +983,134 @@ impl IndexNode for LockedRamFSInode {
         Ok(())
     }
 
-    fn resize(&self, len: usize) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
-        if len > isize::MAX as usize {
-            return Err(SystemError::EFBIG.into());
-        }
-        let _size_guard = self.2.write();
-        let cache = {
-            let mut inode = self.0.lock();
-            if inode.metadata.file_type != FileType::File {
-                return Err(SystemError::EINVAL.into());
-            }
-            let cache = inode.page_cache.clone().ok_or(SystemError::EIO)?;
-            inode.metadata.size = len as i64;
-            cache
-        };
-        // Publish EOF before unmapping and invalidating pages. Never hold the
-        // inode mutex while acquiring MM locks through truncate.
-        // Linux truncate_setsize() also truncates the page cache when size is
-        // unchanged or grows, clearing mmap writes past the new partial EOF.
-        cache.manager().resize(len).map_err(Into::into)
+    fn resize(&self, len: usize) -> Result<(), MemoryAllocationError> {
+        self.resize_with_operation(len, None).map(|_| ())
+    }
+
+    fn resize_with_metadata(
+        &self,
+        len: usize,
+        lock_owner: u64,
+        metadata: &Metadata,
+        mask: SetMetadataMask,
+    ) -> Result<(), MemoryAllocationError> {
+        self.resize_with_metadata_result(len, lock_owner, metadata, mask)
+            .map(|_| ())
+    }
+
+    fn resize_with_metadata_result(
+        &self,
+        len: usize,
+        lock_owner: u64,
+        metadata: &Metadata,
+        mask: SetMetadataMask,
+    ) -> Result<SetMetadataMask, MemoryAllocationError> {
+        self.resize_with_metadata_context(
+            len,
+            lock_owner,
+            metadata,
+            mask,
+            &InodeOpContext::legacy(),
+        )
+    }
+
+    fn resize_with_metadata_context(
+        &self,
+        len: usize,
+        _lock_owner: u64,
+        metadata: &Metadata,
+        mask: SetMetadataMask,
+        context: &InodeOpContext,
+    ) -> Result<SetMetadataMask, MemoryAllocationError> {
+        self.resize_with_operation(len, Some((metadata, mask, context)))
+    }
+
+    fn resize_file_with_metadata(
+        &self,
+        len: usize,
+        lock_owner: u64,
+        data: MutexGuard<FilePrivateData>,
+        metadata: &Metadata,
+        mask: SetMetadataMask,
+    ) -> Result<(), MemoryAllocationError> {
+        self.resize_file_with_metadata_result(len, lock_owner, data, metadata, mask)
+            .map(|_| ())
+    }
+
+    fn resize_file_with_metadata_result(
+        &self,
+        len: usize,
+        lock_owner: u64,
+        data: MutexGuard<FilePrivateData>,
+        metadata: &Metadata,
+        mask: SetMetadataMask,
+    ) -> Result<SetMetadataMask, MemoryAllocationError> {
+        self.resize_file_with_metadata_context(
+            len,
+            lock_owner,
+            data,
+            metadata,
+            mask,
+            &InodeOpContext::legacy(),
+        )
+    }
+
+    fn resize_file_with_metadata_context(
+        &self,
+        len: usize,
+        lock_owner: u64,
+        data: MutexGuard<FilePrivateData>,
+        metadata: &Metadata,
+        mask: SetMetadataMask,
+        context: &InodeOpContext,
+    ) -> Result<SetMetadataMask, MemoryAllocationError> {
+        drop(data);
+        self.resize_with_metadata_context(len, lock_owner, metadata, mask, context)
+    }
+
+    fn resize_open_truncate(
+        &self,
+        len: usize,
+        lock_owner: u64,
+        data: MutexGuard<FilePrivateData>,
+        truncate: &OpenTruncateContext,
+    ) -> Result<(), MemoryAllocationError> {
+        self.resize_open_truncate_result(len, lock_owner, data, truncate)
+            .map(|_| ())
+    }
+
+    fn resize_open_truncate_result(
+        &self,
+        len: usize,
+        lock_owner: u64,
+        data: MutexGuard<FilePrivateData>,
+        truncate: &OpenTruncateContext,
+    ) -> Result<SetMetadataMask, MemoryAllocationError> {
+        self.resize_open_truncate_with_inode_context(
+            len,
+            lock_owner,
+            data,
+            truncate,
+            &InodeOpContext::legacy(),
+        )
+    }
+
+    fn resize_open_truncate_with_inode_context(
+        &self,
+        len: usize,
+        lock_owner: u64,
+        data: MutexGuard<FilePrivateData>,
+        truncate: &OpenTruncateContext,
+        context: &InodeOpContext,
+    ) -> Result<SetMetadataMask, MemoryAllocationError> {
+        self.resize_file_with_metadata_context(
+            len,
+            lock_owner,
+            data,
+            &truncate.requested,
+            truncate.mask,
+            context,
+        )
     }
 
     fn fallocate_resize_atomic(

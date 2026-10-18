@@ -237,10 +237,8 @@ fn nonblock_prep_pipe_read(pipe_in: &File, flags: SpliceFlags) -> Result<(), Sys
     }
 
     let pipe_inode = get_pipe_inode(pipe_in)?;
-    if !pipe_inode.has_buffered_slots() && pipe_inode.has_writers() {
-        return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-    }
-    // no writers => EOF; allow read path to return 0
+    pipe_inode.wait_readable(true)?;
+    // EOF remains a successful preparation for the authoritative transfer.
 
     Ok(())
 }
@@ -422,10 +420,11 @@ fn splice_pipe_to_file(
         crate::ipc::pipe::buffer::PipeBuffer::try_new_bytes(buf_size, &actor)
     })?;
     let written = File::recover_io(|| {
-        let read = pipe_inode.splice_peek_hold_from_blocking(buf_size, &mut buffer, nonblock)?;
-        if read == 0 {
+        let Some((read, hold)) =
+            pipe_inode.splice_peek_hold_from_blocking(buf_size, &mut buffer, nonblock)?
+        else {
             return Ok(0);
-        }
+        };
         let _position_guard = if offset.is_none() {
             file.lock_position()
         } else {
@@ -444,13 +443,10 @@ fn splice_pipe_to_file(
                 // allocation failure is terminal here; never replay its data
                 // or release and reacquire a potentially different head.
                 let completed = file.finish_write_no_recovery(result);
-                pipe_inode.splice_finish_hold(completed.as_ref().copied().unwrap_or(0));
+                hold.finish(completed.as_ref().copied().unwrap_or(0));
                 completed.map_err(Into::into)
             }
-            Err(error) => {
-                pipe_inode.splice_finish_hold(0);
-                Err(error)
-            }
+            Err(error) => Err(error),
         }
     })?;
     if written > 0 {

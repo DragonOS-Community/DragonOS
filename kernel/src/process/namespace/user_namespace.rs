@@ -359,13 +359,20 @@ impl UserNamespace {
     pub fn create_user_ns(cred: &Cred) -> Result<Arc<Self>, SystemError> {
         let parent_ns = cred.user_ns.clone();
 
-        // 1. 嵌套深度检查
-        if parent_ns.level() >= 32 {
+        // Linux permits creating level 33, but not a child of level 33.
+        if parent_ns.level() > 32 {
             return Err(SystemError::ENOSPC);
         }
 
-        // 2. chroot 检查（简化版：检查当前 fs.root 是否与 init 不同）
-        // TODO: 实现更严格的 chroot 检查
+        // Creation must preserve the caller's filesystem-root policy. Take
+        // namespace/fs owners before the VFS helper acquires lifecycle; their
+        // destructors must run outside that lock. setns has separate rules.
+        let current = ProcessManager::current_pcb();
+        let mount_namespace = current.nsproxy().mnt_ns.clone();
+        let fs = current.fs_struct();
+        if mount_namespace.is_chrooted(&fs) {
+            return Err(SystemError::EPERM);
+        }
 
         // Linux create_user_ns requires the creator's effective IDs to be
         // mapped in the parent namespace before granting capabilities in the
@@ -385,7 +392,7 @@ impl UserNamespace {
         // effective UID, and snapshots the current soft limit for descendants.
         // Prepare before publishing the namespace, never in a pending lock.
         let signal_parent = SignalAccount::get(&parent_ns, cred.euid.data())?;
-        let signal_limit = ProcessManager::current_pcb()
+        let signal_limit = current
             .get_rlimit(crate::process::resource::RLimitID::Sigpending)
             .rlim_cur;
 

@@ -2,12 +2,40 @@
 use super::*;
 use crate::{filesystem::vfs::file::File, syscall::user_buffer::UserBuffer};
 
-struct ReadHold<'a> {
+pub(crate) struct PipeReadHold<'a> {
     pipe: &'a PipeRuntime,
     _transaction: PipeWriterTransaction<'a>,
     freed_slots: bool,
 }
-impl Drop for ReadHold<'_> {
+impl<'a> PipeReadHold<'a> {
+    pub(super) fn new(pipe: &'a PipeRuntime, transaction: PipeWriterTransaction<'a>) -> Self {
+        Self {
+            pipe,
+            _transaction: transaction,
+            freed_slots: false,
+        }
+    }
+
+    /// Complete one external transfer. Only the successfully returned prefix
+    /// is consumed; dropping an unfinished owner leaves its source intact.
+    pub(crate) fn finish(mut self, consumed: usize) {
+        let mut inner = self.pipe.inner.lock();
+        let held = inner.splice_hold.expect("read reservation owns pipe head");
+        let before = inner.data.segment_count();
+        inner.consume(consumed.min(held));
+        self.freed_slots |= inner.data.segment_count() < before;
+        let notify_readers = inner.has_slots() || inner.writer == 0;
+        drop(inner);
+        let pipe = self.pipe;
+        drop(self);
+        if notify_readers {
+            pipe.notify_readers(EPollEventType::empty());
+            pipe.read_fasync_items.send_sigio(FASYNC_POLL_IN);
+        }
+    }
+}
+
+impl Drop for PipeReadHold<'_> {
     fn drop(&mut self) {
         let mut inner = self.pipe.inner.lock();
         inner.splice_hold = None;
@@ -24,9 +52,6 @@ impl Drop for ReadHold<'_> {
             WakeMode::None
         };
         drop(inner);
-        self.pipe
-            .read_wait_queue
-            .wake_one_tagged(HOLD_RELEASE_WAIT_TAG);
         self.pipe.wake_pipe_waiters(reader_wake, writer_wake);
         if self.freed_slots {
             self.pipe.notify_writers(EPollEventType::empty());
@@ -68,11 +93,7 @@ impl PipeRuntime {
             let slots = inner.data.segment_count();
             inner.splice_hold = Some(inner.valid_cnt.max(0) as usize);
             drop(inner);
-            let mut hold = ReadHold {
-                pipe: self,
-                _transaction: transaction,
-                freed_slots: false,
-            };
+            let mut hold = PipeReadHold::new(self, transaction);
             for _ in 0..slots {
                 let mut inner = self.inner.lock();
                 let segment = inner.data.first_segment().expect("reserved pipe slot");

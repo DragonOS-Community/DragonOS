@@ -82,6 +82,7 @@ TEST(PageCacheAccounting, MembershipLifecycleIsBalanced) {
     EXPECT_NE(std::string::npos, report.find("registry_snapshot_lifetime=ok\n")) << report;
     EXPECT_NE(std::string::npos, report.find("registry_concurrent_snapshot=ok\n")) << report;
     EXPECT_NE(std::string::npos, report.find("ramfs_fallocate_range=ok\n")) << report;
+    EXPECT_NE(std::string::npos, report.find("ramfs_truncate_metadata=ok\n")) << report;
     EXPECT_NE(std::string::npos, report.find("write_prepare_rollback=ok\n")) << report;
     EXPECT_NE(std::string::npos, report.find("preallocate_rollback=ok\n")) << report;
     EXPECT_NE(std::string::npos, report.find("clean_unlink_liveness=ok\n")) << report;

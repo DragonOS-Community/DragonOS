@@ -7,6 +7,7 @@
 #include <sys/inotify.h>
 #include <sys/resource.h>
 #include <sys/syscall.h>
+#include <sys/statvfs.h>
 #include <sys/sysmacros.h>
 #include <sys/uio.h>
 #include <sys/wait.h>
@@ -19,7 +20,11 @@ constexpr unsigned char kCapability[] = {
 
 class OverlayExt4 {
  public:
-    ~OverlayExt4() { if (mounted_) umount(merged.c_str()); }
+    ~OverlayExt4() {
+        if (mounted_) {
+            EXPECT_EQ(0, umount(merged.c_str())) << strerror(errno);
+        }
+    }
     void SetUp() {
         ASSERT_NO_FATAL_FAILURE(disk_.SetUp("ext4_inode_identity.img", "/tmp", "vector_write_overlay"));
         ASSERT_NO_FATAL_FAILURE(disk_.Mount());
@@ -36,6 +41,14 @@ class OverlayExt4 {
         ASSERT_EQ(0, mount("overlay", merged.c_str(), "overlay", 0, options.c_str())) << strerror(errno);
         mounted_ = true;
     }
+    const std::string& backing_mount_point() const { return disk_.mount_point(); }
+    void Unmount() {
+        ASSERT_TRUE(mounted_);
+        ASSERT_EQ(0, umount(merged.c_str())) << strerror(errno);
+        mounted_ = false;
+    }
+    void UnmountBacking() { ASSERT_NO_FATAL_FAILURE(disk_.Unmount()); }
+    void MountBackingReadOnly() { ASSERT_NO_FATAL_FAILURE(disk_.Mount(MS_RDONLY)); }
     std::string lower, upper, work, merged;
  private:
     dunitest::LoopExt4 disk_;
@@ -320,6 +333,50 @@ class VectorWritePrivileges : public testing::Test {
     long page_ = 0;
     void* memory_ = MAP_FAILED;
 };
+
+TEST(OverlayMountLifetime, OrdinaryUnmountReleasesBackingMount) {
+    OverlayExt4 overlay;
+    ASSERT_NO_FATAL_FAILURE(overlay.SetUp());
+    ASSERT_NO_FATAL_FAILURE(overlay.Mount());
+    errno = 0;
+    EXPECT_EQ(-1, umount(overlay.backing_mount_point().c_str()));
+    EXPECT_EQ(EBUSY, errno);
+
+    const int fd = open(overlay.merged.c_str(), O_RDONLY | O_DIRECTORY);
+    ASSERT_GE(fd, 0) << strerror(errno);
+    errno = 0;
+    EXPECT_EQ(-1, umount(overlay.merged.c_str()));
+    EXPECT_EQ(EBUSY, errno);
+    ASSERT_EQ(0, close(fd));
+    ASSERT_NO_FATAL_FAILURE(overlay.Unmount());
+    // No sleep/retry: successful ordinary unmount completes final shutdown.
+    ASSERT_NO_FATAL_FAILURE(overlay.UnmountBacking());
+}
+
+TEST(OverlayMountLifetime, UnmountReclaimsCachedUnlinkedUpperInode) {
+    OverlayExt4 overlay;
+    ASSERT_NO_FATAL_FAILURE(overlay.SetUp());
+    ASSERT_NO_FATAL_FAILURE(overlay.Mount());
+    // Overlay mount initialization may create persistent work directories.
+    // Measure after that, isolating the file inode allocated below.
+    struct statvfs before {};
+    ASSERT_EQ(0, statvfs(overlay.backing_mount_point().c_str(), &before));
+    const std::string path = overlay.merged + "/cached-unlinked";
+    const int fd = open(path.c_str(), O_CREAT | O_EXCL | O_RDWR, 0600);
+    ASSERT_GE(fd, 0) << strerror(errno);
+    ASSERT_EQ(1, write(fd, "x", 1));
+    ASSERT_EQ(0, close(fd));
+    ASSERT_EQ(0, unlink(path.c_str())) << strerror(errno);
+    ASSERT_NO_FATAL_FAILURE(overlay.Unmount());
+    ASSERT_NO_FATAL_FAILURE(overlay.UnmountBacking());
+    // Read-only reopen must see completed reclaim, not rely on orphan recovery
+    // during a later writable mount to finish Overlay's deferred cache drops.
+    ASSERT_NO_FATAL_FAILURE(overlay.MountBackingReadOnly());
+    struct statvfs after {};
+    ASSERT_EQ(0, statvfs(overlay.backing_mount_point().c_str(), &after));
+    EXPECT_EQ(before.f_ffree, after.f_ffree);
+    ASSERT_NO_FATAL_FAILURE(overlay.UnmountBacking());
+}
 
 TEST_F(VectorWritePrivileges, TmpfsRemovesSetidBeforeUserCopy) {
     char directory[] = "/tmp/vector-write-privileges-XXXXXX";

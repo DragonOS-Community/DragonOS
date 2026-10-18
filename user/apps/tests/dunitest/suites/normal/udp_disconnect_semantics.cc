@@ -112,6 +112,7 @@ class UdpDisconnectSemantics : public testing::TestWithParam<int> {
     // so a failed readiness assertion cannot leave the test stuck in recvfrom.
     void expect_packet(int receiver, const std::string& data,
                        const sockaddr_storage& sender, bool peek = false) const {
+        SCOPED_TRACE(data);
         pollfd ready {receiver, POLLIN, 0};
         ASSERT_EQ(poll(&ready, 1, 2000), 1) << std::strerror(errno);
         ASSERT_NE(ready.revents & POLLIN, 0);
@@ -125,17 +126,16 @@ class UdpDisconnectSemantics : public testing::TestWithParam<int> {
         EXPECT_EQ(size, length());
         expect_address(source, sender);
     }
-    void queue_packets(int receiver, int sender, const sockaddr_storage& destination) const {
-        for (const char* payload : {"first", "second", "third"}) {
-            ASSERT_NO_FATAL_FAILURE(send_packet(sender, destination, payload));
-        }
-        ASSERT_NO_FATAL_FAILURE(expect_packet(receiver, "first", local(sender), true));
+    void queue_packet(int receiver, int sender, const sockaddr_storage& destination) const {
+        // sendto() only accepts a datagram for transmission; asynchronous
+        // loopback delivery may still be pending. Only a positively peeked
+        // datagram is known to be queued before disconnect removes the binding.
+        ASSERT_NO_FATAL_FAILURE(send_packet(sender, destination, "queued"));
+        ASSERT_NO_FATAL_FAILURE(expect_packet(receiver, "queued", local(sender), true));
     }
-    void drain_packets(int receiver, const sockaddr_storage& sender) const {
-        for (const char* payload : {"first", "second", "third"}) {
-            ASSERT_NO_FATAL_FAILURE(expect_packet(receiver, payload, sender, true));
-            ASSERT_NO_FATAL_FAILURE(expect_packet(receiver, payload, sender));
-        }
+    void drain_packet(int receiver, const sockaddr_storage& sender) const {
+        ASSERT_NO_FATAL_FAILURE(expect_packet(receiver, "queued", sender, true));
+        ASSERT_NO_FATAL_FAILURE(expect_packet(receiver, "queued", sender));
         char byte;
         errno = 0;
         EXPECT_EQ(recv(receiver, &byte, sizeof(byte), MSG_DONTWAIT), -1);
@@ -152,11 +152,11 @@ TEST_P(UdpDisconnectSemantics, ImplicitDisconnectPreservesQueuedDatagrams) {
     ASSERT_EQ(connect_to(receiver.get(), local(sender.get())), 0);
     const auto destination = local(receiver.get());
     ASSERT_NE(port(destination), 0);
-    ASSERT_NO_FATAL_FAILURE(queue_packets(receiver.get(), sender.get(), destination));
+    ASSERT_NO_FATAL_FAILURE(queue_packet(receiver.get(), sender.get(), destination));
     ASSERT_NO_FATAL_FAILURE(disconnect(receiver.get()));
     expect_no_peer(receiver.get());
     EXPECT_EQ(port(local(receiver.get())), 0);
-    ASSERT_NO_FATAL_FAILURE(drain_packets(receiver.get(), local(sender.get())));
+    ASSERT_NO_FATAL_FAILURE(drain_packet(receiver.get(), local(sender.get())));
 }
 
 TEST_P(UdpDisconnectSemantics, RebindAndDifferentPeerDoNotRefilterQueuedDatagrams) {
@@ -170,7 +170,7 @@ TEST_P(UdpDisconnectSemantics, RebindAndDifferentPeerDoNotRefilterQueuedDatagram
     ASSERT_EQ(bind_at(other.get(), loopback()), 0);
     ASSERT_EQ(connect_to(receiver.get(), local(sender.get())), 0);
     const auto old = local(receiver.get());
-    ASSERT_NO_FATAL_FAILURE(queue_packets(receiver.get(), sender.get(), old));
+    ASSERT_NO_FATAL_FAILURE(queue_packet(receiver.get(), sender.get(), old));
     ASSERT_NO_FATAL_FAILURE(disconnect(receiver.get()));
     // Reserve the released port so the new bind must choose a different one.
     Fd reserve(socket(GetParam(), SOCK_DGRAM, 0));
@@ -179,7 +179,7 @@ TEST_P(UdpDisconnectSemantics, RebindAndDifferentPeerDoNotRefilterQueuedDatagram
     ASSERT_EQ(bind_at(receiver.get(), loopback()), 0) << std::strerror(errno);
     ASSERT_NE(port(local(receiver.get())), port(old));
     ASSERT_EQ(connect_to(receiver.get(), local(other.get())), 0);
-    ASSERT_NO_FATAL_FAILURE(drain_packets(receiver.get(), local(sender.get())));
+    ASSERT_NO_FATAL_FAILURE(drain_packet(receiver.get(), local(sender.get())));
     ASSERT_NO_FATAL_FAILURE(send_packet(other.get(), local(receiver.get()), "new-peer"));
     ASSERT_NO_FATAL_FAILURE(expect_packet(receiver.get(), "new-peer", local(other.get())));
 }
@@ -287,12 +287,12 @@ TEST_P(UdpDisconnectSemantics, RepeatedUnconnectedDisconnectPreservesQueue) {
     ASSERT_GE(sender.get(), 0);
     ASSERT_EQ(bind_at(receiver.get(), loopback()), 0);
     ASSERT_EQ(bind_at(sender.get(), loopback()), 0);
-    ASSERT_NO_FATAL_FAILURE(queue_packets(receiver.get(), sender.get(), local(receiver.get())));
+    ASSERT_NO_FATAL_FAILURE(queue_packet(receiver.get(), sender.get(), local(receiver.get())));
     for (int i = 0; i < 3; ++i) {
         ASSERT_NO_FATAL_FAILURE(disconnect(receiver.get()));
         expect_no_peer(receiver.get());
     }
-    ASSERT_NO_FATAL_FAILURE(drain_packets(receiver.get(), local(sender.get())));
+    ASSERT_NO_FATAL_FAILURE(drain_packet(receiver.get(), local(sender.get())));
 }
 
 TEST_P(UdpDisconnectSemantics, FailedRebindDoesNotDiscardQueue) {
@@ -305,13 +305,13 @@ TEST_P(UdpDisconnectSemantics, FailedRebindDoesNotDiscardQueue) {
     ASSERT_EQ(bind_at(sender.get(), loopback()), 0);
     ASSERT_EQ(bind_at(occupied.get(), loopback()), 0);
     ASSERT_EQ(connect_to(receiver.get(), local(sender.get())), 0);
-    ASSERT_NO_FATAL_FAILURE(queue_packets(receiver.get(), sender.get(), local(receiver.get())));
+    ASSERT_NO_FATAL_FAILURE(queue_packet(receiver.get(), sender.get(), local(receiver.get())));
     ASSERT_NO_FATAL_FAILURE(disconnect(receiver.get()));
     errno = 0;
     ASSERT_EQ(bind_at(receiver.get(), local(occupied.get())), -1);
     EXPECT_EQ(errno, EADDRINUSE);
     EXPECT_EQ(port(local(receiver.get())), 0);
-    ASSERT_NO_FATAL_FAILURE(drain_packets(receiver.get(), local(sender.get())));
+    ASSERT_NO_FATAL_FAILURE(drain_packet(receiver.get(), local(sender.get())));
 }
 
 TEST_P(UdpDisconnectSemantics, WildcardPortZeroDisconnectClearsSelectedAddressAndPort) {
@@ -384,9 +384,9 @@ TEST_P(UdpDisconnectSemantics, FirstConnectDoesNotRefilterPreviouslyQueuedDatagr
     ASSERT_EQ(bind_at(receiver.get(), loopback()), 0);
     ASSERT_EQ(bind_at(sender.get(), loopback()), 0);
     ASSERT_EQ(bind_at(other.get(), loopback()), 0);
-    ASSERT_NO_FATAL_FAILURE(queue_packets(receiver.get(), sender.get(), local(receiver.get())));
+    ASSERT_NO_FATAL_FAILURE(queue_packet(receiver.get(), sender.get(), local(receiver.get())));
     ASSERT_EQ(connect_to(receiver.get(), local(other.get())), 0);
-    ASSERT_NO_FATAL_FAILURE(drain_packets(receiver.get(), local(sender.get())));
+    ASSERT_NO_FATAL_FAILURE(drain_packet(receiver.get(), local(sender.get())));
     ASSERT_NO_FATAL_FAILURE(send_packet(other.get(), local(receiver.get()), "current-peer"));
     ASSERT_NO_FATAL_FAILURE(expect_packet(receiver.get(), "current-peer", local(other.get())));
 }

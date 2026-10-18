@@ -257,6 +257,30 @@ impl PrimaryWriteSource<'_, '_> {
         }
     }
 
+    /// Materialize a complete owner-selected control command before invoking
+    /// its callback. Owners must apply their write limit before this call.
+    pub(crate) fn with_exact_buffer<T>(
+        self,
+        len: usize,
+        publish: impl FnOnce(&[u8]) -> Result<T, crate::mm::allocation::MemoryAllocationError>,
+    ) -> Result<T, crate::mm::allocation::MemoryAllocationError> {
+        match self {
+            Self::Kernel(buffer) => {
+                let bytes = buffer.get(..len).ok_or(SystemError::ENOBUFS)?;
+                publish(bytes)
+            }
+            Self::User(reader, creator) => {
+                let mut buffer = write_buffer::WriteBuffer::new();
+                buffer.try_reserve(creator, len)?;
+                buffer.resize(len);
+                if reader.read_prefix_from_user(0, buffer.bytes_mut())? != len {
+                    return Err(SystemError::EFAULT.into());
+                }
+                publish(buffer.bytes())
+            }
+        }
+    }
+
     /// Native regular-file primitive: one bounded scratch buffer inside the
     /// caller's single content transaction. Record providers keep with_buffer.
     pub(crate) fn write_chunks(

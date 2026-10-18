@@ -1,0 +1,15 @@
+[package]
+name = "skillfs-probe"
+version = "0.1.0"
+edition = "2021"
+description = "Minimal control-socket test client for SkillFS (DragonOS port)"
+publish = false
+
+[[bin]]
+name = "skillfs-probe"
+path = "src/main.rs"
+
+[dependencies]
+
+[profile.release]
+panic = "abort"

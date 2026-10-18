@@ -1,0 +1,24 @@
+# 用户程序名称
+name = "skillfs-probe"
+# 版本号
+version = "0.1.0"
+# 用户程序描述信息
+description = "Minimal SkillFS control-socket test client"
+build-once = false
+install-once = false
+# 目标架构
+target-arch = ["x86_64"]
+# 任务源
+[task-source]
+type = "build-from-source"
+source = "local"
+source-path = "user/apps/skillfs-probe"
+# 构建相关信息
+[build]
+build-command = "make install -j8"
+# 安装相关信息
+[install]
+in-dragonos-path = "/bin"
+# 清除相关信息
+[clean]
+clean-command = "make clean"

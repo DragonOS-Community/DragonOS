@@ -1080,7 +1080,7 @@ impl PipeRuntime {
         nonblock: bool,
     ) -> Result<usize, SystemError> {
         loop {
-            let mut guard = self.inner.lock();
+            let mut guard = self.lock_read_state();
             if !guard.read_reserved() {
                 let mut freed = false;
                 while guard.pop_empty().is_some() {
@@ -1164,6 +1164,22 @@ impl PipeRuntime {
         }
     }
 
+    /// Readers wait for an in-flight writer copy just as Linux takes the
+    /// pipe mutex before testing O_NONBLOCK. Never wait with `inner` held.
+    /// Callers must not already own this pipe's writer transaction.
+    fn lock_read_state(&self) -> crate::libs::spinlock::SpinLockGuard<'_, InnerPipeInode> {
+        loop {
+            let inner = self.inner.lock();
+            if !inner.input_copy_active {
+                return inner;
+            }
+            drop(inner);
+            // The active input copy owns this transaction until its data or
+            // fault is published. Recheck after releasing the barrier.
+            drop(self.begin_writer_transaction());
+        }
+    }
+
     /// Helper: Wait until the pipe is readable (has data).
     /// Returns:
     /// - Ok(true): Data is available.
@@ -1172,7 +1188,7 @@ impl PipeRuntime {
     fn wait_readable(&self, nonblock: bool) -> Result<bool, SystemError> {
         let mut did_wait = false;
         loop {
-            let inner = self.inner.lock();
+            let inner = self.lock_read_state();
             if !inner.read_reserved() {
                 if inner.has_slots() {
                     drop(inner);
@@ -1670,7 +1686,7 @@ impl PipeRuntime {
         }
         // log::debug!("pipe flags: {:?}", flags);
         // 加锁
-        let mut inner_guard = self.inner.lock();
+        let mut inner_guard = self.lock_read_state();
         let mut did_wait = false;
 
         while !inner_guard.has_slots() || inner_guard.read_reserved() {
@@ -1687,7 +1703,7 @@ impl PipeRuntime {
             self.wait_for_readable_event()?;
             did_wait = true;
 
-            inner_guard = self.inner.lock();
+            inner_guard = self.lock_read_state();
         }
 
         let mut num = 0;
@@ -1711,7 +1727,7 @@ impl PipeRuntime {
                     }
                     self.wait_for_readable_event()?;
                     did_wait = true;
-                    inner_guard = self.inner.lock();
+                    inner_guard = self.lock_read_state();
                     // The outer read invocation rechecks empty/held conditions.
                     while !inner_guard.has_slots() || inner_guard.read_reserved() {
                         if !inner_guard.has_slots() && inner_guard.writer == 0 {
@@ -1719,7 +1735,7 @@ impl PipeRuntime {
                         }
                         drop(inner_guard);
                         self.wait_for_readable_event()?;
-                        inner_guard = self.inner.lock();
+                        inner_guard = self.lock_read_state();
                     }
                 }
                 continue;

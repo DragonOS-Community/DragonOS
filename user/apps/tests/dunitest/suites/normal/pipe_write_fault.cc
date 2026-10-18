@@ -352,6 +352,68 @@ TEST_F(PipeWriteFault, ConcurrentWritevKeepsWholePipeBufRecordsAtomic) {
   EXPECT_EQ(records_per_writer, b_records);
 }
 
+TEST_F(PipeWriteFault, NonblockingReadAfterPollWaitsForConcurrentWriterCopy) {
+  ASSERT_EQ(page_, fcntl(fds_[1], F_SETPIPE_SZ, page_));
+  ASSERT_EQ(0, fcntl(fds_[1], F_SETFL, 0));
+  constexpr size_t record_size = 257;
+  constexpr size_t records = 8192;
+  const size_t expected = record_size * records;
+  const pid_t writer = fork();
+  ASSERT_GE(writer, 0) << strerror(errno);
+  if (writer == 0) {
+    close(fds_[0]);
+    alarm(12);
+    const std::string record(record_size, 'm');
+    for (size_t index = 0; index < records; ++index) {
+      if (write(fds_[1], record.data(), record.size()) !=
+          static_cast<ssize_t>(record.size())) _exit(1);
+    }
+    _exit(0);
+  }
+  close(fds_[1]);
+  fds_[1] = -1;
+  // There is exactly one reader, so no other consumer can invalidate POLLIN.
+  // A writer's in-progress copy is internal serialization, not an empty pipe.
+  // Do not hide a readiness violation by retrying EAGAIN.
+  size_t received = 0;
+  ssize_t last_read = 0;
+  int read_error = 0;
+  short last_events = 0;
+  bool contents_match = true;
+  timespec start = {};
+  clock_gettime(CLOCK_MONOTONIC, &start);
+  while (received < expected) {
+    timespec now = {};
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    if (now.tv_sec - start.tv_sec >= 15) break;
+    pollfd ready = {fds_[0], POLLIN, 0};
+    const int count = poll(&ready, 1, 100);
+    if (count == 0 || (count < 0 && errno == EINTR)) continue;
+    last_events = ready.revents;
+    if (count != 1 || !(ready.revents & POLLIN)) break;
+    char bytes[113];
+    last_read = read(fds_[0], bytes, sizeof(bytes));
+    read_error = errno;
+    if (last_read <= 0) break;
+    for (ssize_t byte = 0; byte < last_read; ++byte) {
+      if (bytes[byte] != 'm') contents_match = false;
+    }
+    received += last_read;
+  }
+  // Reap before asserting, including the failure path where the producer is
+  // blocked on a full pipe. Its alarm also bounds a stuck kernel read call.
+  if (received != expected) kill(writer, SIGKILL);
+  int status = 0;
+  pid_t waited;
+  do { waited = waitpid(writer, &status, 0); } while (waited < 0 && errno == EINTR);
+  ASSERT_EQ(writer, waited) << strerror(errno);
+  ASSERT_EQ(expected, received) << "read=" << last_read << " errno=" << read_error
+                               << " (" << strerror(read_error) << ") revents=" << last_events;
+  EXPECT_TRUE(contents_match);
+  ASSERT_TRUE(WIFEXITED(status)) << "writer status=" << status;
+  EXPECT_EQ(0, WEXITSTATUS(status));
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {

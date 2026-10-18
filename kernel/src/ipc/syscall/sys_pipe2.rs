@@ -36,13 +36,13 @@ pub(super) fn do_kernel_pipe2(fd: *mut i32, flags: FileFlags) -> Result<usize, S
         )
     })?;
 
-    let read_file = File::new_prepared_recovering(
+    let read_file = File::new_pseudo_prepared_recovering(
         pipe_ptr.clone(),
         FileFlags::O_RDONLY | (flags & FileFlags::O_NONBLOCK),
         read_storage,
     )?;
 
-    let write_file = File::new_prepared_recovering(
+    let write_file = File::new_pseudo_prepared_recovering(
         pipe_ptr.clone(),
         FileFlags::O_WRONLY | (flags & (FileFlags::O_NONBLOCK | FileFlags::O_DIRECT)),
         write_storage,

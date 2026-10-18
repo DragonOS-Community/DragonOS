@@ -82,12 +82,12 @@ fn main() {
     loop {
         if EXIT_FLAG.get().is_some() {
             println!("Received Ctrl+C, exiting...");
-            if let Some(output) = &args.output {
-                println!("Save image {}", output);
-                block_mem.save(output);
-            }
             break;
         }
     }
     session.join();
+    if let Some(output) = &args.output {
+        println!("Save image {}", output);
+        block_mem.save(output);
+    }
 }

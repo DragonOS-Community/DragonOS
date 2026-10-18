@@ -10,6 +10,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
+#include <sys/prctl.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
 #include <sys/wait.h>
@@ -132,15 +133,24 @@ bool DropEffectiveCapability(unsigned int cap) {
   return syscall(SYS_capset, &header, data) == 0;
 }
 
-bool WriteUidMap(unsigned int parent_uid) {
+[[noreturn]] void UserNamespaceSetupFailed(const char* stage, int error) {
+  dprintf(STDERR_FILENO, "%s: errno=%d (%s)\n", stage, error, strerror(error));
+  _exit(10);
+}
+
+void EnterMappedUserNamespace(unsigned int parent_uid) {
+  alarm(10);
+  if (unshare(CLONE_NEWUSER) != 0) {
+    UserNamespaceSetupFailed("unshare(CLONE_NEWUSER)", errno);
+  }
   int fd = open("/proc/self/uid_map", O_WRONLY);
-  if (fd < 0) return false;
+  if (fd < 0) UserNamespaceSetupFailed("open uid_map", errno);
   char map[64] = {};
   const int size = snprintf(map, sizeof(map), "0 %u 1\n", parent_uid);
-  const bool written = size > 0 && size < static_cast<int>(sizeof(map)) &&
-                       write(fd, map, size) == size;
+  const ssize_t written = write(fd, map, size);
+  const int error = written < 0 ? errno : EIO;
   close(fd);
-  return written;
+  if (written != size) UserNamespaceSetupFailed("write uid_map", error);
 }
 
 }  // namespace
@@ -450,8 +460,7 @@ TEST(PipeMetadata, UnmappedInodeCannotBeChangedWithUsernsCapabilities) {
   const pid_t child = fork();
   ASSERT_GE(child, 0) << strerror(errno);
   if (child == 0) {
-    if (unshare(CLONE_NEWUSER) != 0) _exit(77);
-    if (!WriteUidMap(0)) _exit(77);
+    EnterMappedUserNamespace(0);
     struct timespec times[2] = {{1700000000, 0}, {1700000001, 0}};
     for (int fd : {pipe.read_fd(), fifo_fd}) {
       errno = 0;
@@ -466,10 +475,6 @@ TEST(PipeMetadata, UnmappedInodeCannotBeChangedWithUsernsCapabilities) {
   int status = 0;
   ASSERT_EQ(child, waitpid(child, &status, 0)) << strerror(errno);
   ASSERT_TRUE(WIFEXITED(status));
-  if (WEXITSTATUS(status) == 77) {
-    close(fifo_fd);
-    GTEST_SKIP() << "cannot create user namespace or write uid_map";
-  }
   EXPECT_EQ(0, WEXITSTATUS(status));
   close(fifo_fd);
 }
@@ -488,9 +493,32 @@ TEST(PipeMetadata, UserNamespaceChownTargetUsesMappedGlobalId) {
   const pid_t child = fork();
   ASSERT_GE(child, 0) << strerror(errno);
   if (child == 0) {
-    if (setgid(1000) != 0 || setuid(1000) != 0) _exit(2);
-    if (unshare(CLONE_NEWUSER) != 0) _exit(77);
-    if (!WriteUidMap(1000)) _exit(77);
+    alarm(10);
+    if (setgid(1000) != 0 || setuid(1000) != 0) {
+      UserNamespaceSetupFailed("drop credentials", errno);
+    }
+    // Credential changes can make the task non-dumpable. Its ordinary proc
+    // control files are then root-owned, so the original fixture correctly
+    // failed DAC before it could write a map. Preserve that protection.
+    const int dumpable = prctl(PR_GET_DUMPABLE);
+    if (dumpable < 0) UserNamespaceSetupFailed("PR_GET_DUMPABLE", errno);
+    // The system-wide suid_dumpable policy can be 0, 1 or 2. Establish the
+    // non-dumpable control explicitly so this test is policy-independent.
+    if (prctl(PR_SET_DUMPABLE, 0) != 0) {
+      UserNamespaceSetupFailed("PR_SET_DUMPABLE for DAC control", errno);
+    }
+    int map_fd = open("/proc/self/uid_map", O_WRONLY);
+    const int open_error = errno;
+    if (map_fd >= 0) close(map_fd);
+    if (map_fd >= 0 || open_error != EACCES) {
+      UserNamespaceSetupFailed("non-dumpable uid_map must reject write open",
+                               map_fd >= 0 ? EINVAL : open_error);
+    }
+    // Opt in only in this isolated child; do not bypass the proc DAC rules.
+    if (prctl(PR_SET_DUMPABLE, 1) != 0) {
+      UserNamespaceSetupFailed("PR_SET_DUMPABLE before self-mapping", errno);
+    }
+    EnterMappedUserNamespace(1000);
     for (int fd : {pipe.read_fd(), fifo_fd}) {
       // Namespace UID 0 denotes global UID 1000, not global UID 0.
       if (fchown(fd, 0, -1) != 0) _exit(3);
@@ -502,10 +530,6 @@ TEST(PipeMetadata, UserNamespaceChownTargetUsesMappedGlobalId) {
   int status = 0;
   ASSERT_EQ(child, waitpid(child, &status, 0)) << strerror(errno);
   ASSERT_TRUE(WIFEXITED(status));
-  if (WEXITSTATUS(status) == 77) {
-    close(fifo_fd);
-    GTEST_SKIP() << "cannot create user namespace or write uid_map";
-  }
   EXPECT_EQ(0, WEXITSTATUS(status));
   struct stat pipe_stat = {};
   struct stat fifo_stat = {};

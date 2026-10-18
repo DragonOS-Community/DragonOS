@@ -101,6 +101,31 @@ impl<'a> UserBuffer<'a> {
         }
     }
 
+    /// Alignment of the effective iterator, without accessing user payload.
+    pub(crate) fn alignment(&self, len: usize) -> usize {
+        let mut remaining = len.min(self.len);
+        if remaining == 0 {
+            return 0;
+        }
+        match &self.backing {
+            UserBufferBacking::Contiguous(address) => address.data() | remaining,
+            UserBufferBacking::Vectored(segments) => {
+                let mut alignment = 0;
+                for segment in segments.iter() {
+                    let count = remaining.min(segment.iov_len);
+                    if count != 0 {
+                        alignment |= segment.iov_base as usize | count;
+                    }
+                    remaining -= count;
+                    if remaining == 0 {
+                        break;
+                    }
+                }
+                alignment
+            }
+        }
+    }
+
     /// Copy a byte prefix without changing whole-record copy semantics.
     /// Inaccessible later segments stop the logical input at the actual fault.
     pub fn read_prefix_from_user(

@@ -252,6 +252,75 @@ impl GenDisk {
 }
 
 impl IndexNode for GenDisk {
+    fn write_primary_with_privilege_stage(
+        &self,
+        offset: usize,
+        len: usize,
+        source: crate::filesystem::vfs::PrimaryWriteSource<'_, '_>,
+        intent: crate::filesystem::vfs::WriteOperation,
+        data: MutexGuard<FilePrivateData>,
+        stage: &mut crate::filesystem::vfs::WritePrivilegeStage<'_>,
+    ) -> Result<
+        crate::filesystem::vfs::PrimaryWriteResult,
+        crate::mm::allocation::MemoryAllocationError,
+    > {
+        if len == 0 {
+            return Ok(crate::filesystem::vfs::PrimaryWriteResult::new(0));
+        }
+        intent
+            .io
+            .check_alignment(offset | len, 1usize << self.block_size_log2)?;
+        stage.complete();
+        source.with_buffer(len, |bytes| {
+            let count = if matches!(
+                intent.io,
+                crate::filesystem::vfs::WriteIoIntent::Direct { .. }
+            ) {
+                bytes.len().min(len) & !((1usize << self.block_size_log2) - 1)
+            } else {
+                bytes.len().min(len)
+            };
+            if count == 0 {
+                return Err(SystemError::EFAULT.into());
+            }
+            IndexNode::write_at(self, offset, count, &bytes[..count], data)
+                .map(crate::filesystem::vfs::PrimaryWriteResult::new)
+        })
+    }
+
+    fn write_primary_with_sync_with_privilege_stage(
+        &self,
+        offset: usize,
+        len: usize,
+        source: crate::filesystem::vfs::PrimaryWriteSource<'_, '_>,
+        intent: crate::filesystem::vfs::WriteOperation,
+        sync: WriteSyncIntent,
+        data: MutexGuard<FilePrivateData>,
+        stage: &mut crate::filesystem::vfs::WritePrivilegeStage<'_>,
+    ) -> Result<DelegatedWriteResult, crate::mm::allocation::MemoryAllocationError> {
+        if len == 0 {
+            return Ok(DelegatedWriteResult::new(0, Ok(())));
+        }
+        intent
+            .io
+            .check_alignment(offset | len, 1usize << self.block_size_log2)?;
+        stage.complete();
+        source.with_buffer(len, |bytes| {
+            let count = if matches!(
+                intent.io,
+                crate::filesystem::vfs::WriteIoIntent::Direct { .. }
+            ) {
+                bytes.len().min(len) & !((1usize << self.block_size_log2) - 1)
+            } else {
+                bytes.len().min(len)
+            };
+            if count == 0 {
+                return Err(SystemError::EFAULT.into());
+            }
+            self.write_at_with_sync(offset, count, &bytes[..count], sync, data)
+        })
+    }
+
     fn fs(&self) -> Arc<dyn crate::filesystem::vfs::FileSystem> {
         self.fs.read().upgrade().unwrap()
     }
@@ -261,6 +330,7 @@ impl IndexNode for GenDisk {
     }
 
     fn configure_open_file(&self, _data: &FilePrivateData, behavior: &mut OpenFileBehavior) {
+        behavior.direct_io = crate::filesystem::vfs::file::DirectIoPolicy::OwnerManaged;
         if self
             .block_device()
             .is_ok_and(|bdev| bdev.uses_delegated_write_sync())

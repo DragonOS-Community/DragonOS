@@ -1944,6 +1944,15 @@ impl LockedFATInode {
         buf: &[u8],
     ) -> Result<usize, MemoryAllocationError> {
         let _size_guard = self.1.read();
+        self.try_write_pagecache_locked(offset, buf)
+    }
+
+    /// Caller owns the inode size read transaction.
+    fn try_write_pagecache_locked(
+        &self,
+        offset: usize,
+        buf: &[u8],
+    ) -> Result<usize, MemoryAllocationError> {
         let page_cache = self.0.lock().page_cache.clone();
         if let Some(page_cache) = page_cache {
             let task = crate::process::ProcessManager::current_pcb();
@@ -1960,7 +1969,120 @@ impl LockedFATInode {
     }
 }
 
+impl LockedFATInode {
+    fn write_direct_data_locked(&self, offset: usize, bytes: &[u8]) -> Result<usize, SystemError> {
+        if bytes.is_empty() {
+            return Ok(0);
+        }
+        self.with_clean_direct_range(offset, bytes.len(), || self.write_sync(offset, bytes))
+    }
+
+    /// A single clean-cache publication boundary for native DIO and the
+    /// post-write buffered fallback. Flush errors are terminal SystemError:
+    /// data has already been published and must never enter charge replay.
+    fn with_clean_direct_range<T>(
+        &self,
+        offset: usize,
+        len: usize,
+        publish: impl FnOnce() -> Result<T, SystemError>,
+    ) -> Result<T, SystemError> {
+        let end = offset.checked_add(len).ok_or(SystemError::EFBIG)?;
+        let first = offset >> MMArch::PAGE_SHIFT;
+        let last = (end - 1) >> MMArch::PAGE_SHIFT;
+        let cache = self.0.lock().page_cache.clone().ok_or(SystemError::EIO)?;
+        loop {
+            cache.manager().writeback_range(first, last)?;
+            cache.unmap_mapping_pages(first, Some(last + 1))?;
+            let invalidate = cache.invalidate_write();
+            if cache.has_dirty_or_writeback_pages_in_range(first, last) {
+                drop(invalidate);
+                continue;
+            }
+            match cache.try_discard_range_locked(first, last + 1)? {
+                crate::filesystem::page_cache::PageCacheRangeResult::Retry(retry) => {
+                    drop(invalidate);
+                    retry.wait()?;
+                    continue;
+                }
+                crate::filesystem::page_cache::PageCacheRangeResult::Ready(()) => {}
+            }
+            return publish();
+        }
+    }
+}
+
 impl IndexNode for LockedFATInode {
+    fn write_primary_with_privilege_stage(
+        &self,
+        offset: usize,
+        len: usize,
+        source: crate::filesystem::vfs::PrimaryWriteSource<'_, '_>,
+        intent: crate::filesystem::vfs::WriteOperation,
+        data: MutexGuard<FilePrivateData>,
+        stage: &mut crate::filesystem::vfs::WritePrivilegeStage<'_>,
+    ) -> Result<crate::filesystem::vfs::PrimaryWriteResult, MemoryAllocationError> {
+        drop(data);
+        if len == 0 {
+            return Ok(crate::filesystem::vfs::PrimaryWriteResult::new(0));
+        }
+        let end = offset.checked_add(len).ok_or(SystemError::EFBIG)?;
+        let _size = self.1.read();
+        let (frontier, alignment) = {
+            let guard = self.0.lock();
+            let fs = guard.fs.upgrade().ok_or(SystemError::EIO)?;
+            let size = match &guard.inode_type {
+                FATDirEntry::File(file) | FATDirEntry::VolId(file) => file.size(),
+                FATDirEntry::Dir(_) => return Err(SystemError::EISDIR.into()),
+                FATDirEntry::UnInit => return Err(SystemError::EROFS.into()),
+            };
+            (size, 1usize << fs.gendisk.block_size_log2())
+        };
+        // As in fat_direct_IO(), mappings that would need chain expansion
+        // fall back for the complete request. Cached EOF is not allocation.
+        let direct = matches!(
+            intent.io,
+            crate::filesystem::vfs::WriteIoIntent::Direct { .. }
+        ) && end as u64 <= frontier;
+        stage.complete();
+        if direct {
+            self.0.lock().update_metadata(None);
+            intent.io.check_alignment(offset | len, alignment)?;
+        }
+        let written = source.write_chunks(len, |relative, bytes| {
+            let position = offset.checked_add(relative).ok_or(SystemError::EFBIG)?;
+            if direct {
+                let count = bytes.len() & !(alignment - 1);
+                if count == 0 {
+                    return Err(SystemError::EFAULT.into());
+                }
+                self.write_direct_data_locked(position, &bytes[..count])
+                    .map_err(Into::into)
+            } else {
+                self.try_write_pagecache_locked(position, bytes)
+            }
+        })?;
+        if !direct
+            && written != 0
+            && matches!(
+                intent.io,
+                crate::filesystem::vfs::WriteIoIntent::Direct { .. }
+            )
+        {
+            self.with_clean_direct_range(offset, written, || Ok(()))?;
+        }
+        Ok(crate::filesystem::vfs::PrimaryWriteResult::new(written))
+    }
+
+    fn configure_open_file(
+        &self,
+        _data: &FilePrivateData,
+        behavior: &mut crate::filesystem::vfs::file::OpenFileBehavior,
+    ) {
+        if behavior.data_file_write_checks {
+            behavior.direct_io = crate::filesystem::vfs::file::DirectIoPolicy::Native;
+        }
+    }
+
     fn retention_state(&self) -> Option<&InodeRetentionState> {
         Some(&self.3.retention)
     }
@@ -2116,9 +2238,11 @@ impl IndexNode for LockedFATInode {
         _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         let len = core::cmp::min(len, buf.len());
-        let r = self.write_sync(offset, &buf[0..len]);
-        // self.0.lock_irqsave().update_metadata();
-        return r;
+        let _size = self.1.read();
+        if len != 0 {
+            self.0.lock().update_metadata(None);
+        }
+        self.write_direct_data_locked(offset, &buf[..len])
     }
 
     fn create(

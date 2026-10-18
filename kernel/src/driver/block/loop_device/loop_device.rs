@@ -1422,7 +1422,7 @@ impl LoopDevice {
         // fails. Calling plain pwrite() here would collapse that failure into
         // Err and make the outer loop file lose the completed byte count.
         let mut result = Self::recover_backing_io(|| {
-            backing_file.pwrite_with_sync_intent(file_offset, len, &buf[..len], sync_intent)
+            backing_file.pwrite_backing_with_sync_intent(file_offset, len, &buf[..len], sync_intent)
         })?;
         let mut recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::default();
         while let Err(error) = core::mem::replace(&mut result.sync_result, Ok(())) {

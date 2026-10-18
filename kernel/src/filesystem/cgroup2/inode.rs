@@ -875,6 +875,7 @@ impl IndexNode for Cgroup2Inode {
         offset: usize,
         len: usize,
         source: crate::filesystem::vfs::PrimaryWriteSource<'_, '_>,
+        _intent: crate::filesystem::vfs::WriteOperation,
         data: MutexGuard<FilePrivateData>,
         stage: &mut crate::filesystem::vfs::WritePrivilegeStage<'_>,
     ) -> Result<

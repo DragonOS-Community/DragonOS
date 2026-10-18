@@ -197,6 +197,50 @@ impl PrimaryWriteResult {
     }
 }
 
+/// The direct request retains alignment of the original effective input,
+/// including every iovec boundary, across stacking and materialization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteIoIntent {
+    Buffered,
+    Direct { input_alignment: usize },
+}
+
+impl WriteIoIntent {
+    pub(crate) fn check_alignment(
+        self,
+        offset: usize,
+        alignment: usize,
+    ) -> Result<(), SystemError> {
+        if let Self::Direct { input_alignment } = self {
+            if (offset | input_alignment) & (alignment - 1) != 0 {
+                return Err(SystemError::EINVAL);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Only internal storage publication is independent of the initiating task's
+/// regular-file RLIMIT_FSIZE. All other write admission remains unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteAdmission {
+    User,
+    BackingStorage,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WriteOperation {
+    pub io: WriteIoIntent,
+    pub admission: WriteAdmission,
+}
+
+impl WriteOperation {
+    pub const USER_BUFFERED: Self = Self {
+        io: WriteIoIntent::Buffered,
+        admission: WriteAdmission::User,
+    };
+}
+
 /// Input retained only for the duration of one primary write. Native local
 /// filesystems materialize user input after privilege removal, while holding
 /// their canonical content guard but no metadata or namespace spin locks.
@@ -210,6 +254,13 @@ pub enum PrimaryWriteSource<'a, 'b> {
 }
 
 impl PrimaryWriteSource<'_, '_> {
+    pub(crate) fn alignment(&self, len: usize) -> usize {
+        match self {
+            Self::Kernel(_) => len,
+            Self::User(input, _) => input.alignment(len),
+        }
+    }
+
     pub fn with_buffer<T>(
         self,
         len: usize,
@@ -1323,6 +1374,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         offset: usize,
         len: usize,
         source: PrimaryWriteSource<'_, '_>,
+        _intent: crate::filesystem::vfs::WriteOperation,
         data: MutexGuard<FilePrivateData>,
         stage: &mut WritePrivilegeStage<'_>,
     ) -> Result<PrimaryWriteResult, crate::mm::allocation::MemoryAllocationError> {
@@ -1332,11 +1384,13 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn write_primary_with_inode_context(
         &self,
         offset: usize,
         len: usize,
         source: PrimaryWriteSource<'_, '_>,
+        operation: crate::filesystem::vfs::WriteOperation,
         data: MutexGuard<FilePrivateData>,
         context: &permission::InodeOpContext,
         stage: &mut WritePrivilegeStage<'_>,
@@ -1344,7 +1398,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         if context.is_idmapped() {
             return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP.into());
         }
-        self.write_primary_with_privilege_stage(offset, len, source, data, stage)
+        self.write_primary_with_privilege_stage(offset, len, source, operation, data, stage)
     }
 
     fn write_direct_with_privilege_stage(
@@ -1391,11 +1445,13 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
 
     /// Preserve original user input until the delegated owner has completed
     /// its privilege transaction. Legacy owners still materialize once.
+    #[allow(clippy::too_many_arguments)]
     fn write_primary_with_sync_with_privilege_stage(
         &self,
         offset: usize,
         len: usize,
         source: PrimaryWriteSource<'_, '_>,
+        _intent: crate::filesystem::vfs::WriteOperation,
         sync: WriteSyncIntent,
         data: MutexGuard<FilePrivateData>,
         stage: &mut WritePrivilegeStage<'_>,
@@ -1418,6 +1474,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         offset: usize,
         len: usize,
         source: PrimaryWriteSource<'_, '_>,
+        operation: crate::filesystem::vfs::WriteOperation,
         sync: WriteSyncIntent,
         data: MutexGuard<FilePrivateData>,
         context: &permission::InodeOpContext,
@@ -1426,7 +1483,9 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         if context.is_idmapped() {
             return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP.into());
         }
-        self.write_primary_with_sync_with_privilege_stage(offset, len, source, sync, data, stage)
+        self.write_primary_with_sync_with_privilege_stage(
+            offset, len, source, operation, sync, data, stage,
+        )
     }
 
     /// # 在inode的指定偏移量开始，写入指定大小的数据，忽略PageCache

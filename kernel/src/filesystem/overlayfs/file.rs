@@ -116,17 +116,20 @@ pub(super) fn write_at_with_sync(
         offset,
         len,
         vfs::PrimaryWriteSource::Kernel(buf),
+        vfs::WriteOperation::USER_BUFFERED,
         sync_intent,
         data,
         &mut stage,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn write_primary_with_sync(
     inode: &OvlInode,
     offset: usize,
     len: usize,
     source: vfs::PrimaryWriteSource<'_, '_>,
+    intent: vfs::WriteOperation,
     sync_intent: vfs::WriteSyncIntent,
     data: crate::libs::mutex::MutexGuard<vfs::FilePrivateData>,
     stage: &mut vfs::WritePrivilegeStage<'_>,
@@ -151,12 +154,31 @@ pub(super) fn write_primary_with_sync(
     // Overlay removes caller privileges before the backing write checks.
     // Admit the backing file-size limit before touching the user payload;
     // the backing File rechecks it when committing the staged buffer.
-    let len = backing_file.limit_write_len_by_fsize(vfs::FileType::File, offset, len)?;
+    let len = if intent.admission == vfs::WriteAdmission::User {
+        backing_file.limit_write_len_by_fsize(vfs::FileType::File, offset, len)?
+    } else {
+        len
+    };
     // Keep user faults under the caller credentials. Only the completed
     // staging buffer enters the backing credential override, as before.
+    let io = match (intent.io, &source) {
+        (vfs::WriteIoIntent::Direct { .. }, vfs::PrimaryWriteSource::User(..)) => {
+            vfs::WriteIoIntent::Direct {
+                input_alignment: source.alignment(len),
+            }
+        }
+        (io, _) => io,
+    };
+    let intent = vfs::WriteOperation { io, ..intent };
     source.with_buffer(len, |buffer| {
         let _cred_guard = CredOverrideGuard::new(fs.backing_cred.clone())?;
-        backing_file.pwrite_with_sync_intent(offset, len.min(buffer.len()), buffer, sync_intent)
+        backing_file.pwrite_with_io_intent(
+            offset,
+            len.min(buffer.len()),
+            buffer,
+            sync_intent,
+            Some(intent),
+        )
     })
 }
 

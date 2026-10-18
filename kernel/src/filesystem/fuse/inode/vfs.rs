@@ -606,6 +606,9 @@ impl IndexNode for FuseNode {
     }
 
     fn configure_open_file(&self, data: &FilePrivateData, behavior: &mut OpenFileBehavior) {
+        if behavior.data_file_write_checks {
+            behavior.direct_io = crate::filesystem::vfs::file::DirectIoPolicy::OwnerManaged;
+        }
         let mode = &mut behavior.mode;
         let fopen_flags = match data {
             FilePrivateData::Fuse(FuseFilePrivateData::File(p))
@@ -788,6 +791,7 @@ impl IndexNode for FuseNode {
             offset,
             len,
             crate::filesystem::vfs::PrimaryWriteSource::Kernel(buf),
+            crate::filesystem::vfs::WriteOperation::USER_BUFFERED,
             data,
             &mut stage,
         )
@@ -806,6 +810,7 @@ impl IndexNode for FuseNode {
             offset,
             len,
             crate::filesystem::vfs::PrimaryWriteSource::Kernel(buf),
+            crate::filesystem::vfs::WriteOperation::USER_BUFFERED,
             data,
             stage,
         )
@@ -817,6 +822,7 @@ impl IndexNode for FuseNode {
         offset: usize,
         len: usize,
         source: crate::filesystem::vfs::PrimaryWriteSource<'_, '_>,
+        _intent: crate::filesystem::vfs::WriteOperation,
         data: MutexGuard<FilePrivateData>,
         stage: &mut crate::filesystem::vfs::WritePrivilegeStage<'_>,
     ) -> Result<

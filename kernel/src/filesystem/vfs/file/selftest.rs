@@ -184,6 +184,7 @@ impl IndexNode for SyncProbeInode {
         offset: usize,
         len: usize,
         source: super::PrimaryWriteSource<'_, '_>,
+        _intent: crate::filesystem::vfs::WriteOperation,
         intent: super::WriteSyncIntent,
         _data: MutexGuard<FilePrivateData>,
         stage: &mut super::WritePrivilegeStage<'_>,

@@ -287,6 +287,7 @@ impl<F: FileOps + 'static> IndexNode for ProcFile<F> {
         offset: usize,
         len: usize,
         source: PrimaryWriteSource<'_, '_>,
+        _intent: crate::filesystem::vfs::WriteOperation,
         data: MutexGuard<FilePrivateData>,
         _stage: &mut WritePrivilegeStage<'_>,
     ) -> Result<PrimaryWriteResult, crate::mm::allocation::MemoryAllocationError> {

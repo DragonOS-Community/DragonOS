@@ -224,6 +224,7 @@ impl FileOwner {
 /// 写操作的配置参数
 #[derive(Debug, Clone, Copy)]
 struct WriteConfig {
+    operation: Option<super::WriteOperation>,
     /// 是否更新文件偏移量
     update_offset: bool,
     /// 偏移量更新方式
@@ -236,6 +237,7 @@ struct WriteConfig {
 
 #[derive(Clone, Copy)]
 struct WriteCompletionPolicy {
+    operation: Option<super::WriteOperation>,
     sync_intent: WriteSyncIntent,
     emit_data_fsnotify: bool,
 }
@@ -252,6 +254,18 @@ pub enum PostWriteSyncPolicy {
     NotApplicable,
 }
 
+/// Owner-selected direct I/O contract; no implicit fallback for unsupported inodes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectIoPolicy {
+    Unsupported,
+    /// Memory files deliberately ignore O_DIRECT.
+    Buffered,
+    /// The ordinary typed operations own direct dispatch (stacking/devices/FUSE).
+    OwnerManaged,
+    /// The inode retains the legacy direct read operation.
+    Native,
+}
+
 /// Per-open behavior selected after the inode has initialized private data.
 #[derive(Debug, Clone, Copy)]
 pub struct OpenFileBehavior {
@@ -259,6 +273,7 @@ pub struct OpenFileBehavior {
     pub post_write_sync: PostWriteSyncPolicy,
     /// Apply ordinary data-file EOF append and RLIMIT_FSIZE checks.
     pub data_file_write_checks: bool,
+    pub direct_io: DirectIoPolicy,
 }
 
 impl OpenFileBehavior {
@@ -271,6 +286,7 @@ impl OpenFileBehavior {
             mode,
             post_write_sync,
             data_file_write_checks: file_type == FileType::File,
+            direct_io: DirectIoPolicy::Unsupported,
         }
     }
 }
@@ -802,6 +818,9 @@ pub struct FileData {
     /// Immutable write-operation policy selected for this open file description.
     post_write_sync: PostWriteSyncPolicy,
     data_file_write_checks: bool,
+    direct_io: DirectIoPolicy,
+    /// Pseudo allocation bypasses pathname open admission, as in alloc_file_pseudo.
+    internal_pseudo: bool,
     /// Serializes current-position operations; also owns directory iteration state.
     position_state: Mutex<ReaddirState>,
     pub private_data: Mutex<FilePrivateData>,
@@ -931,7 +950,8 @@ impl File {
         mode: &mut FileMode,
     ) {
         mode.remove(
-            FileMode::FMODE_STREAM
+            FileMode::FMODE_CAN_ODIRECT
+                | FileMode::FMODE_STREAM
                 | FileMode::FMODE_LSEEK
                 | FileMode::FMODE_PREAD
                 | FileMode::FMODE_PWRITE
@@ -1184,6 +1204,10 @@ impl File {
                 return Ok(result);
             }
         }
+        let operation = config.operation.unwrap_or_else(|| super::WriteOperation {
+            io: self.write_io_intent(source, actual_len),
+            admission: super::WriteAdmission::User,
+        });
         let mut publish = || {
             if !self.mode.read().contains(FileMode::FMODE_NONOTIFY) {
                 self.notify_dentry_event(FsEvent::ATTRIB);
@@ -1196,6 +1220,7 @@ impl File {
                     actual_offset,
                     actual_len,
                     source,
+                    operation,
                     config.sync_intent,
                     self.private_data.lock(),
                     &mut stage,
@@ -1206,6 +1231,7 @@ impl File {
                     actual_offset,
                     actual_len,
                     source,
+                    operation,
                     self.private_data.lock(),
                     &mut stage,
                 )?;
@@ -1368,6 +1394,26 @@ impl File {
         flags: FileFlags,
         storage: PreparedFile,
     ) -> Result<Self, MemoryAllocationError> {
+        Self::prepare_pseudo(inode, flags, storage)
+            .map_err(MemoryAllocationError::System)
+            .and_then(Self::finish_open)
+    }
+
+    pub(crate) fn new_pseudo_prepared_recovering(
+        inode: Arc<dyn IndexNode>,
+        flags: FileFlags,
+        storage: PreparedFile,
+    ) -> Result<Self, SystemError> {
+        let mut candidate = Self::prepare_pseudo(inode, flags, storage)?;
+        Self::recover_io(|| candidate.complete_open())?;
+        Ok(candidate)
+    }
+
+    fn prepare_pseudo(
+        inode: Arc<dyn IndexNode>,
+        flags: FileFlags,
+        storage: PreparedFile,
+    ) -> Result<Self, SystemError> {
         Self::prepare_with_private_data_and_mount_guard(
             inode,
             flags,
@@ -1378,8 +1424,6 @@ impl File {
             FileOpenOrigin::InternalPseudo,
             storage,
         )
-        .map_err(MemoryAllocationError::System)
-        .and_then(Self::finish_open)
     }
 
     /// Create a new file object with an explicit initial FilePrivateData.
@@ -1528,6 +1572,7 @@ impl File {
         origin: FileOpenOrigin,
         storage: PreparedFile,
     ) -> Result<Self, SystemError> {
+        let internal_pseudo = matches!(&origin, FileOpenOrigin::InternalPseudo);
         let (cached_path_metadata, account_write_access, inherited_mount_writer) = match origin {
             FileOpenOrigin::Regular(metadata, writer) => (metadata, true, writer),
             FileOpenOrigin::InternalPseudo => (None, false, None),
@@ -1712,6 +1757,8 @@ impl File {
             file_type,
             post_write_sync: PostWriteSyncPolicy::NotApplicable,
             data_file_write_checks: false,
+            direct_io: DirectIoPolicy::Unsupported,
+            internal_pseudo,
             position_state: Mutex::new(ReaddirState::default()),
             private_data,
             cred: ProcessManager::current_pcb().cred(),
@@ -1767,11 +1814,24 @@ impl File {
         let mut behavior = OpenFileBehavior::new(mode, self.file_type);
         self.inode
             .configure_open_file(&self.private_data.lock(), &mut behavior);
+        if behavior.direct_io != DirectIoPolicy::Unsupported {
+            behavior.mode.insert(FileMode::FMODE_CAN_ODIRECT);
+        }
         mode = behavior.mode;
         if self._mount_writer.is_some() {
             mode.insert(FileMode::FMODE_WRITER);
         }
         mode.insert(FileMode::FMODE_OPENED);
+        // The open hook has transferred its handle. Record that ownership
+        // before any later fallible validation so cancellation closes it once.
+        *self.mode.write() = mode;
+        if self.flags().contains(FileFlags::O_DIRECT)
+            && !(self.internal_pseudo && self.file_type == FileType::Pipe)
+            && behavior.direct_io == DirectIoPolicy::Unsupported
+        {
+            return Err(SystemError::EINVAL.into());
+        }
+        self.direct_io = behavior.direct_io;
         self.post_write_sync = behavior.post_write_sync;
         self.data_file_write_checks = behavior.data_file_write_checks;
         *self.mode.write() = mode;
@@ -2220,8 +2280,70 @@ impl File {
         buf: &[u8],
         requested_sync: WriteSyncIntent,
     ) -> Result<DelegatedWriteResult, MemoryAllocationError> {
-        let mut result =
-            self.pwrite_with_sync_intent_and_fsnotify(offset, len, buf, requested_sync, true)?;
+        self.pwrite_with_io_intent(offset, len, buf, requested_sync, None)
+    }
+
+    fn write_io_intent(
+        &self,
+        source: PrimaryWriteSource<'_, '_>,
+        len: usize,
+    ) -> super::WriteIoIntent {
+        if self.flags().contains(FileFlags::O_DIRECT) && self.direct_io != DirectIoPolicy::Buffered
+        {
+            super::WriteIoIntent::Direct {
+                input_alignment: source.alignment(len),
+            }
+        } else {
+            super::WriteIoIntent::Buffered
+        }
+    }
+
+    /// Loop publishes an already admitted device range. Linux does this from
+    /// its worker, without inheriting the submitting process's file-size limit.
+    /// Keep the backing description's direct/sync flags and all owner checks.
+    pub(crate) fn pwrite_backing_with_sync_intent(
+        self: &Arc<Self>,
+        offset: usize,
+        len: usize,
+        buf: &[u8],
+        sync: WriteSyncIntent,
+    ) -> Result<DelegatedWriteResult, MemoryAllocationError> {
+        self.pwrite_with_io_intent(
+            offset,
+            len,
+            buf,
+            sync,
+            Some(super::WriteOperation {
+                io: self.write_io_intent(PrimaryWriteSource::Kernel(buf), len),
+                admission: super::WriteAdmission::BackingStorage,
+            }),
+        )
+    }
+
+    /// Stacking keeps the alignment of the original user iterator while
+    /// copying under caller credentials and publishing under backing credentials.
+    pub(crate) fn pwrite_with_io_intent(
+        self: &Arc<Self>,
+        offset: usize,
+        len: usize,
+        buf: &[u8],
+        requested_sync: WriteSyncIntent,
+        intent: Option<super::WriteOperation>,
+    ) -> Result<DelegatedWriteResult, MemoryAllocationError> {
+        self.verify_pwrite_access()?;
+        self.writeable()?;
+        let mut result = self.do_write_split(
+            offset,
+            len,
+            buf,
+            false,
+            false,
+            WriteCompletionPolicy {
+                operation: intent,
+                sync_intent: requested_sync,
+                emit_data_fsnotify: true,
+            },
+        )?;
         match &result.sync_result {
             Ok(()) => self.complete_write_success(&mut result),
             Err(MemoryAllocationError::System(_)) => {
@@ -2260,6 +2382,7 @@ impl File {
             false,
             false,
             WriteCompletionPolicy {
+                operation: None,
                 sync_intent: requested_sync,
                 emit_data_fsnotify,
             },
@@ -2429,7 +2552,9 @@ impl File {
             self.file_readahead(offset, len)?;
         }
 
-        let len = if self.flags().contains(FileFlags::O_DIRECT) {
+        let len = if self.flags().contains(FileFlags::O_DIRECT)
+            && self.direct_io == DirectIoPolicy::Native
+        {
             self.inode
                 .read_direct(offset, len, buf, self.private_data.lock())
                 .map_err(MemoryAllocationError::System)
@@ -2515,6 +2640,7 @@ impl File {
                 update_offset,
                 force_append,
                 WriteCompletionPolicy {
+                    operation: None,
                     sync_intent: WriteSyncIntent::None,
                     emit_data_fsnotify: true,
                 },
@@ -2540,6 +2666,7 @@ impl File {
             update_offset,
             false,
             WriteCompletionPolicy {
+                operation: None,
                 sync_intent: WriteSyncIntent::None,
                 emit_data_fsnotify: false,
             },
@@ -2572,8 +2699,12 @@ impl File {
         file_type: FileType,
         offset: usize,
         len: usize,
+        admission: super::WriteAdmission,
     ) -> Result<usize, SystemError> {
-        if !self.data_file_write_checks || self.post_write_sync == PostWriteSyncPolicy::Delegated {
+        if admission == super::WriteAdmission::BackingStorage
+            || !self.data_file_write_checks
+            || self.post_write_sync == PostWriteSyncPolicy::Delegated
+        {
             Ok(len)
         } else {
             self.limit_write_len_by_fsize(file_type, offset, len)
@@ -2616,6 +2747,9 @@ impl File {
             PostWriteSyncPolicy::NotApplicable => WriteSyncIntent::None,
         };
 
+        let admission = completion
+            .operation
+            .map_or(super::WriteAdmission::User, |operation| operation.admission);
         let is_append = self.data_file_write_checks
             && matches!(file_type, FileType::File)
             && (flags.contains(FileFlags::O_APPEND) || force_append);
@@ -2627,13 +2761,15 @@ impl File {
                 // 在锁内刷新元数据，确保 EOF 是最新的。
                 let md = self.inode.metadata()?;
                 let actual_offset = md.size.max(0) as usize;
-                let actual_len = self.limit_primary_write_len(file_type, actual_offset, len)?;
+                let actual_len =
+                    self.limit_primary_write_len(file_type, actual_offset, len, admission)?;
 
                 self.write_source_at(
                     actual_offset,
                     actual_len,
                     source,
                     WriteConfig {
+                        operation: completion.operation,
                         update_offset,
                         offset_update: OffsetUpdate::StoreEnd,
                         sync_intent,
@@ -2666,13 +2802,14 @@ impl File {
         }
 
         let actual_offset = offset;
-        let actual_len = self.limit_primary_write_len(file_type, actual_offset, len)?;
+        let actual_len = self.limit_primary_write_len(file_type, actual_offset, len, admission)?;
 
         let mut result = self.write_source_at(
             actual_offset,
             actual_len,
             source,
             WriteConfig {
+                operation: completion.operation,
                 update_offset,
                 offset_update: OffsetUpdate::Add,
                 sync_intent,
@@ -2713,6 +2850,7 @@ impl File {
                 update_offset,
                 force_append,
                 WriteCompletionPolicy {
+                    operation: None,
                     sync_intent: requested_sync,
                     emit_data_fsnotify: true,
                 },
@@ -2841,6 +2979,7 @@ impl File {
                     false,
                     false,
                     WriteCompletionPolicy {
+                        operation: None,
                         sync_intent: WriteSyncIntent::None,
                         emit_data_fsnotify: false,
                     },
@@ -3272,16 +3411,35 @@ impl File {
             self.inode.open(private_data.lock(), &flags)?;
         }
 
-        let (post_write_sync, data_file_write_checks) = if mode.contains(FileMode::FMODE_PATH) {
-            (PostWriteSyncPolicy::NotApplicable, false)
-        } else {
-            Self::configure_base_open_mode(&self.inode, self.file_type, &mut mode);
-            let mut behavior = OpenFileBehavior::new(mode, self.file_type);
-            self.inode
-                .configure_open_file(&private_data.lock(), &mut behavior);
-            mode = behavior.mode;
-            (behavior.post_write_sync, behavior.data_file_write_checks)
-        };
+        let (post_write_sync, data_file_write_checks, direct_io) =
+            if mode.contains(FileMode::FMODE_PATH) {
+                (
+                    PostWriteSyncPolicy::NotApplicable,
+                    false,
+                    DirectIoPolicy::Unsupported,
+                )
+            } else {
+                Self::configure_base_open_mode(&self.inode, self.file_type, &mut mode);
+                let mut behavior = OpenFileBehavior::new(mode, self.file_type);
+                self.inode
+                    .configure_open_file(&private_data.lock(), &mut behavior);
+                if behavior.direct_io != DirectIoPolicy::Unsupported {
+                    behavior.mode.insert(FileMode::FMODE_CAN_ODIRECT);
+                }
+                mode = behavior.mode;
+                if flags.contains(FileFlags::O_DIRECT)
+                    && !(self.internal_pseudo && self.file_type == FileType::Pipe)
+                    && behavior.direct_io == DirectIoPolicy::Unsupported
+                {
+                    self.inode.close(private_data.lock())?;
+                    return Err(SystemError::EINVAL.into());
+                }
+                (
+                    behavior.post_write_sync,
+                    behavior.data_file_write_checks,
+                    behavior.direct_io,
+                )
+            };
 
         let res = storage.init(|epitems| FileData {
             open_file_id: alloc_open_file_id(),
@@ -3295,6 +3453,8 @@ impl File {
             file_type: self.file_type,
             post_write_sync,
             data_file_write_checks,
+            direct_io,
+            internal_pseudo: self.internal_pseudo,
             position_state: Mutex::new(position.clone()),
             private_data,
             cred: self.cred.clone(),
@@ -3405,6 +3565,12 @@ impl File {
         let new_bits = (new_flags.bits() & SETFL_MASK) | (old_flags.bits() & !SETFL_MASK);
         new_flags = FileFlags::from_bits_truncate(new_bits);
 
+        if new_flags.contains(FileFlags::O_DIRECT)
+            && self.file_type != FileType::Pipe
+            && self.direct_io == DirectIoPolicy::Unsupported
+        {
+            return Err(SystemError::EINVAL);
+        }
         self.private_data.lock().update_flags(new_flags)?;
         // Socket operations such as accept consult their cached mode. Keep it
         // coherent for both F_SETFL and FIONBIO, under the same update lock.

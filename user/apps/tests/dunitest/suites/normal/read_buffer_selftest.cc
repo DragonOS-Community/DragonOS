@@ -70,6 +70,7 @@ TEST_F(ReadBufferSelftest, ChecksPassAndSnapshotIsStableAcrossPartialReads) {
         EXPECT_NE(std::string::npos, complete.find("status=ok\n")) << complete;
         EXPECT_NE(std::string::npos, complete.find("summary_fail=0\n")) << complete;
         for (const char* check : {"iov_accounting=ok\n",
+                                  "recv_record_storage=ok\n",
                                   "lazy_reuse=ok\n",
                                   "growth_release=ok\n",
                                   "errors_release=ok\n",

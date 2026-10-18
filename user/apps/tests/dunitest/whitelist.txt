@@ -255,3 +255,6 @@ normal/pipe_transfer_copy
 normal/pipe_transfer_state
 normal/debugfs_write_policy
 normal/direct_write_semantics
+
+normal/recvmsg_record_buffer
+normal/tcp_receive_window_reopen

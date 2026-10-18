@@ -117,7 +117,10 @@ TEST(TcpReceiveWindowReopen, ReceiverProgressMakesBlockedSenderWritable) {
         bool reached_backpressure = false;
         constexpr size_t kSafetyLimit = 8 * 1024 * 1024;
 
-        while (bytes_sent < kSafetyLimit) {
+        const auto fill_deadline =
+                std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (bytes_sent < kSafetyLimit &&
+               std::chrono::steady_clock::now() < fill_deadline) {
             FillPattern(&write_buffer, bytes_sent);
             const ssize_t written =
                     send(pair.sender.Get(), write_buffer.data(), write_buffer.size(), MSG_DONTWAIT);
@@ -126,18 +129,25 @@ TEST(TcpReceiveWindowReopen, ReceiverProgressMakesBlockedSenderWritable) {
                 continue;
             }
             if (written < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-                reached_backpressure = true;
-                break;
+                // EAGAIN describes send-buffer capacity at that instant. ACKs
+                // can free it before the peer's application reads anything.
+                // Keep filling while writable; establish stable backpressure
+                // before testing that receiver progress reopens the window.
+                pollfd blocked {.fd = pair.sender.Get(), .events = POLLOUT, .revents = 0};
+                const int ready = poll(&blocked, 1, 50);
+                ASSERT_GE(ready, 0) << ErrnoString(errno);
+                ASSERT_EQ(blocked.revents & (POLLERR | POLLHUP | POLLNVAL), 0);
+                if (ready == 0) {
+                    reached_backpressure = true;
+                    break;
+                }
+                ASSERT_NE(blocked.revents & POLLOUT, 0);
+                continue;
             }
             FAIL() << "send failed while filling the receive window: " << ErrnoString(errno);
         }
         ASSERT_TRUE(reached_backpressure)
-                << "sender did not observe backpressure before the safety limit";
-
-        pollfd blocked {.fd = pair.sender.Get(), .events = POLLOUT, .revents = 0};
-        ASSERT_EQ(poll(&blocked, 1, 50), 0)
-                << "sender did not remain backpressured while the receiver was idle, revents="
-                << blocked.revents;
+                << "sender did not observe stable backpressure before the safety limit/deadline";
 
         const int receiver_flags = fcntl(pair.receiver.Get(), F_GETFL, 0);
         ASSERT_GE(receiver_flags, 0) << ErrnoString(errno);

@@ -9,6 +9,7 @@ mod ioctl;
 pub mod netlink;
 pub mod packet;
 mod posix;
+pub(crate) mod recv_buffer;
 pub mod unix;
 mod utils;
 pub mod vsock;

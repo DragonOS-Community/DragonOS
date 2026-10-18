@@ -4,7 +4,7 @@ use alloc::sync::{Arc, Weak};
 use smoltcp::wire::{IpAddress, IpProtocol, IpVersion};
 use system_error::SystemError;
 
-use crate::net::socket::{inet::common::BoundInner, utils::extract_src_addr_from_ip_header};
+use crate::net::socket::inet::common::BoundInner;
 
 // 重新导出供 mod.rs 使用
 pub use crate::net::socket::utils::extract_dst_addr_from_ip_header;
@@ -130,45 +130,6 @@ impl BoundRaw {
         if let Some(owner) = self.owner.upgrade() {
             owner.addresses.write().remote = Some(remote);
         }
-    }
-
-    /// 尝试接收数据包
-    ///
-    /// # 返回
-    /// - `Ok((size, src_addr))`: 接收到的数据大小和源地址
-    /// - `Err(SystemError::EAGAIN_OR_EWOULDBLOCK)`: 没有数据可读
-    pub fn try_recv(
-        &self,
-        buf: &mut [u8],
-        ip_version: IpVersion,
-    ) -> Result<(usize, IpAddress), SystemError> {
-        self.with_mut_socket(|socket| {
-            if socket.can_recv() {
-                match socket.recv() {
-                    Ok(data) => {
-                        let len = data.len().min(buf.len());
-                        buf[..len].copy_from_slice(&data[..len]);
-
-                        // 从 IP 头解析源地址
-                        let src_addr = extract_src_addr_from_ip_header(data, ip_version).unwrap_or(
-                            match ip_version {
-                                IpVersion::Ipv4 => {
-                                    IpAddress::Ipv4(smoltcp::wire::Ipv4Address::UNSPECIFIED)
-                                }
-                                IpVersion::Ipv6 => {
-                                    IpAddress::Ipv6(smoltcp::wire::Ipv6Address::UNSPECIFIED)
-                                }
-                            },
-                        );
-
-                        Ok((len, src_addr))
-                    }
-                    Err(_) => Err(SystemError::EAGAIN_OR_EWOULDBLOCK),
-                }
-            } else {
-                Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
-            }
-        })
     }
 
     /// 尝试发送数据包

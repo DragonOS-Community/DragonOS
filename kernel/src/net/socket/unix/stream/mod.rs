@@ -1,3 +1,4 @@
+use crate::net::socket::recv_buffer::{ReceiveAttempt, RecvBuffer};
 use crate::{
     filesystem::epoll::{event_poll::EventPoll, EPollEventType},
     filesystem::vfs::{
@@ -1188,98 +1189,94 @@ impl Socket for UnixStreamSocket {
         let peek = _flags.contains(socket::PMSG::PEEK);
         let want_creds = self.passcred.load(core::sync::atomic::Ordering::Relaxed);
 
-        let (payload_copy_len, orig_len, truncated, ret_len, scm_cred, scm_rights) =
-            if self.is_seqpacket {
-                let mut buf = iovs.new_buf(true)?;
-                loop {
-                    let result = {
-                        let inner = self.inner.read();
-                        match inner.as_ref().expect("UnixStreamSocket inner is None") {
-                            Inner::Connected(connected) => {
-                                // IMPORTANT: snapshot SCM before consuming bytes.
-                                // try_recv_seqpacket_meta() consumes from the ring buffer
-                                // using pop_slice(), which discards record metadata.
-                                let snapshot = connected.scm_snapshot_for_recvmsg();
-                                connected
-                                    .try_recv_seqpacket_meta(&mut buf[..], peek)
-                                    .map(|record| (record, snapshot))
-                            }
-                            _ => Err(SystemError::ENOTCONN),
+        let (payload_copy_len, truncated, ret_len, scm_cred, scm_rights) = if self.is_seqpacket {
+            let mut buf = RecvBuffer::default();
+            loop {
+                let result = {
+                    let inner = self.inner.read();
+                    match inner.as_ref().expect("UnixStreamSocket inner is None") {
+                        Inner::Connected(connected) => {
+                            connected.try_recv_seqpacket_recvmsg(&mut buf, total, peek)
                         }
-                    };
-                    match result {
-                        Ok((Some(meta), snapshot)) => {
-                            if !peek {
-                                self.wake_peer_writable();
-                            }
-                            let copy_len = meta.copy_len;
-                            let orig_len = meta.orig_len;
-                            let truncated = meta.truncated;
-                            if copy_len != 0 {
-                                iovs.scatter_exact(&buf[..copy_len])?;
-                            }
-                            let ret_len = if _flags.contains(socket::PMSG::TRUNC) {
-                                orig_len
-                            } else {
-                                copy_len
-                            };
-                            let (scm_cred, scm_rights) =
-                                snapshot.scm_data.unwrap_or((None, alloc::vec::Vec::new()));
-                            break (copy_len, orig_len, truncated, ret_len, scm_cred, scm_rights);
-                        }
-                        Ok((None, _)) => break (0, 0, false, 0, None, alloc::vec::Vec::new()),
-                        Err(SystemError::EAGAIN_OR_EWOULDBLOCK) if !nonblock => {
-                            self.wait_queue.wait_event_interruptible_timeout(
-                                || self.can_recv(),
-                                self.recv_timeout(),
-                            )?;
-                        }
-                        Err(e) => return Err(e),
+                        _ => Err(SystemError::ENOTCONN),
                     }
-                }
-            } else {
-                let mut user_buffer =
-                    crate::syscall::user_buffer::UserBuffer::new_vectored(iovs, total);
-                loop {
-                    let result = {
-                        let inner = self.inner.read();
-                        match inner.as_ref().expect("UnixStreamSocket inner is None") {
-                            Inner::Connected(connected) => connected.try_recv_stream_recvmsg_meta(
-                                &mut user_buffer,
-                                peek,
-                                want_creds,
-                            ),
-                            _ => Err(SystemError::EINVAL),
+                };
+                match result {
+                    Ok(ReceiveAttempt::Ready(Some(meta))) => {
+                        if !peek {
+                            self.wake_peer_writable();
                         }
-                    };
-                    match result {
-                        Ok(StreamReadOutcome::Data(meta)) => {
-                            let n = meta.copy_len;
-                            break (n, n, false, n, meta.scm_cred, meta.scm_rights);
+                        let copy_len = meta.copy_len;
+                        let orig_len = meta.orig_len;
+                        let truncated = meta.truncated;
+                        if copy_len != 0 {
+                            iovs.scatter_exact(buf.bytes(copy_len))?;
                         }
-                        Ok(StreamReadOutcome::Eof) => {
-                            if self.take_pending_reset() {
-                                return Err(SystemError::ECONNRESET);
-                            }
-                            // scm_recv_unix emits zeroed SCM_CREDENTIALS on EOF
-                            // when SO_PASSCRED is enabled.
-                            let cred = want_creds.then_some(UCred {
-                                pid: 0,
-                                uid: 0,
-                                gid: 0,
-                            });
-                            break (0, 0, false, 0, cred, alloc::vec::Vec::new());
-                        }
-                        Err(SystemError::EAGAIN_OR_EWOULDBLOCK) if !nonblock => {
-                            self.wait_queue.wait_event_interruptible_timeout(
-                                || self.can_recv(),
-                                self.recv_timeout(),
-                            )?;
-                        }
-                        Err(e) => return Err(e),
+                        let ret_len = if _flags.contains(socket::PMSG::TRUNC) {
+                            orig_len
+                        } else {
+                            copy_len
+                        };
+                        break (copy_len, truncated, ret_len, meta.scm_cred, meta.scm_rights);
                     }
+                    Ok(ReceiveAttempt::Ready(None)) => {
+                        msg.msg_flags = 0;
+                        msg.msg_controllen = 0;
+                        return Ok(0);
+                    }
+                    Ok(ReceiveAttempt::NeedBuffer(required)) => buf.prepare(required)?,
+                    Err(SystemError::EAGAIN_OR_EWOULDBLOCK) if !nonblock => {
+                        self.wait_queue.wait_event_interruptible_timeout(
+                            || self.can_recv(),
+                            self.recv_timeout(),
+                        )?;
+                    }
+                    Err(e) => return Err(e),
                 }
-            };
+            }
+        } else {
+            let mut user_buffer =
+                crate::syscall::user_buffer::UserBuffer::new_vectored(iovs, total);
+            loop {
+                let result = {
+                    let inner = self.inner.read();
+                    match inner.as_ref().expect("UnixStreamSocket inner is None") {
+                        Inner::Connected(connected) => connected.try_recv_stream_recvmsg_meta(
+                            &mut user_buffer,
+                            peek,
+                            want_creds,
+                        ),
+                        _ => Err(SystemError::EINVAL),
+                    }
+                };
+                match result {
+                    Ok(StreamReadOutcome::Data(meta)) => {
+                        let n = meta.copy_len;
+                        break (n, false, n, meta.scm_cred, meta.scm_rights);
+                    }
+                    Ok(StreamReadOutcome::Eof) => {
+                        if self.take_pending_reset() {
+                            return Err(SystemError::ECONNRESET);
+                        }
+                        // scm_recv_unix emits zeroed SCM_CREDENTIALS on EOF
+                        // when SO_PASSCRED is enabled.
+                        let cred = want_creds.then_some(UCred {
+                            pid: 0,
+                            uid: 0,
+                            gid: 0,
+                        });
+                        break (0, false, 0, cred, alloc::vec::Vec::new());
+                    }
+                    Err(SystemError::EAGAIN_OR_EWOULDBLOCK) if !nonblock => {
+                        self.wait_queue.wait_event_interruptible_timeout(
+                            || self.can_recv(),
+                            self.recv_timeout(),
+                        )?;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+        };
 
         if !self.is_seqpacket && payload_copy_len != 0 && !peek {
             self.wake_peer_writable();
@@ -1293,13 +1290,6 @@ impl Socket for UnixStreamSocket {
         // Default: no control returned.
         msg.msg_controllen = 0;
 
-        // Preserve the existing seqpacket empty-record behavior. A stream
-        // recvmsg with a zero-length destination can still deliver SCM data.
-        if self.is_seqpacket && orig_len == 0 && payload_copy_len == 0 {
-            return Ok(0);
-        }
-
-        let (scm_cred, scm_rights) = (scm_cred, scm_rights);
         let has_rights = !scm_rights.is_empty();
         if !want_creds && !has_rights {
             // No ancillary to return.
@@ -1374,26 +1364,6 @@ impl Socket for UnixStreamSocket {
             self.passcred.load(core::sync::atomic::Ordering::Relaxed) || peer_passcred;
         let cred = auto_attach.then(current_ucred);
         let result = self.send_with_timeout(buffer, _flags, cred, &[]);
-
-        // Record boundaries + optional creds are needed for Linux-like recvmsg
-        // coalescing semantics.
-        if self.is_seqpacket {
-            if let Ok((sent, start, _written_len)) = result {
-                if sent != 0 {
-                    match self
-                        .inner
-                        .read()
-                        .as_ref()
-                        .expect("UnixStreamSocket inner is None")
-                    {
-                        Inner::Connected(connected) => {
-                            connected.push_scm_at(start, sent, cred, alloc::vec::Vec::new())
-                        }
-                        _ => return Err(SystemError::ENOTCONN),
-                    }
-                }
-            }
-        }
 
         // If send succeeded, notify peer's fasync_items for SIGIO
         if result
@@ -1490,23 +1460,8 @@ impl Socket for UnixStreamSocket {
             self.passcred.load(core::sync::atomic::Ordering::Relaxed) || peer_passcred;
         let cred = (force_creds || auto_attach).then(current_ucred);
 
-        // Stream chunks publish their data and SCM together in the ring.
-        let (sent, start, written_len) =
-            self.send_with_timeout(&buf, _flags, cred, &rights_files)?;
-
-        if self.is_seqpacket && sent != 0 {
-            match self
-                .inner
-                .read()
-                .as_ref()
-                .expect("UnixStreamSocket inner is None")
-            {
-                Inner::Connected(connected) => {
-                    connected.push_scm_at(start, sent, cred, rights_files);
-                }
-                _ => return Err(SystemError::ENOTCONN),
-            }
-        }
+        // Stream chunks and seqpacket records publish bytes and SCM together.
+        let (sent, _, written_len) = self.send_with_timeout(&buf, _flags, cred, &rights_files)?;
 
         if written_len > 0 {
             self.wake_peer_readable();

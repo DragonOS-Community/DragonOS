@@ -1,0 +1,34 @@
+# CNB (cnb.cool) CI configuration.
+#
+# Builds the DragonOS rootfs base image from tools/docker-rootfs/Dockerfile and
+# publishes it to the CNB docker registry, so that disk-image builds can pull a
+# ready-made image instead of building it locally:
+#
+#   docker.cnb.cool/dragonos-community/dragonos/dragonos-rootfs:ubuntu2404
+#
+# The registry artifact is public and can be pulled anonymously. GitHub master
+# is mirrored to this repository, so this pipeline goes live once the change
+# lands on master.
+main:
+  push:
+    - name: rootfs-base-image
+      ifModify:
+        - tools/docker-rootfs/**
+        - .cnb.yml
+      services:
+        - docker
+      runner:
+        tags: cnb:arch:amd64
+      stages:
+        - name: build and push
+          script: |
+            set -e
+            IMG="${CNB_DOCKER_REGISTRY}/${CNB_REPO_SLUG_LOWERCASE}/dragonos-rootfs"
+            docker build \
+              -t "${IMG}:ubuntu2404" \
+              -t "${IMG}:ubuntu2404-${CNB_COMMIT_SHORT}" \
+              tools/docker-rootfs
+            # Smoke-check the shipped runtimes before publishing.
+            docker run --rm "${IMG}:ubuntu2404" sh -c 'python3 --version && node --version'
+            docker push "${IMG}:ubuntu2404"
+            docker push "${IMG}:ubuntu2404-${CNB_COMMIT_SHORT}"

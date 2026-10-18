@@ -712,6 +712,7 @@ impl IndexNode for LockedRamFSInode {
             _data,
             &mut stage,
         )
+        .map(|result| result.written_len)
     }
 
     fn write_primary_with_privilege_stage(
@@ -721,7 +722,7 @@ impl IndexNode for LockedRamFSInode {
         source: super::vfs::PrimaryWriteSource<'_, '_>,
         data: MutexGuard<FilePrivateData>,
         _stage: &mut super::vfs::WritePrivilegeStage<'_>,
-    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+    ) -> Result<super::vfs::PrimaryWriteResult, crate::mm::allocation::MemoryAllocationError> {
         if let super::vfs::PrimaryWriteSource::Kernel(buffer) = &source {
             if buffer.len() < len {
                 return Err(SystemError::EINVAL.into());
@@ -745,17 +746,19 @@ impl IndexNode for LockedRamFSInode {
         // Retain the canonical size transaction across all bounded user-copy
         // batches. A kernel symlink initializer still executes one callback.
         let _size_guard = self.2.read();
-        source.write_chunks(len, |relative, bytes| {
-            let position = offset.checked_add(relative).ok_or(SystemError::EFBIG)?;
-            let end = position
-                .checked_add(bytes.len())
-                .ok_or(SystemError::EFBIG)?;
-            cache.try_write_with_before_dirty(position, bytes, &owner, &creator, |_| {
-                let mut inode = self.0.lock();
-                inode.metadata.size = inode.metadata.size.max(end as i64);
-                Ok(())
+        source
+            .write_chunks(len, |relative, bytes| {
+                let position = offset.checked_add(relative).ok_or(SystemError::EFBIG)?;
+                let end = position
+                    .checked_add(bytes.len())
+                    .ok_or(SystemError::EFBIG)?;
+                cache.try_write_with_before_dirty(position, bytes, &owner, &creator, |_| {
+                    let mut inode = self.0.lock();
+                    inode.metadata.size = inode.metadata.size.max(end as i64);
+                    Ok(())
+                })
             })
-        })
+            .map(super::vfs::PrimaryWriteResult::new)
     }
 
     fn fs(&self) -> Arc<dyn FileSystem> {

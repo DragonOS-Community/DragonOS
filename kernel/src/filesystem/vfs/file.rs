@@ -189,6 +189,8 @@ enum OffsetUpdate {
     Add,
     /// Append path: set file offset to end-of-write (actual_offset + written_len).
     StoreEnd,
+    /// The owner supplied the next position for this operation.
+    SetPosition(usize),
 }
 
 #[derive(Clone, Debug)]
@@ -255,6 +257,8 @@ pub enum PostWriteSyncPolicy {
 pub struct OpenFileBehavior {
     pub mode: FileMode,
     pub post_write_sync: PostWriteSyncPolicy,
+    /// Apply ordinary data-file EOF append and RLIMIT_FSIZE checks.
+    pub data_file_write_checks: bool,
 }
 
 impl OpenFileBehavior {
@@ -266,6 +270,7 @@ impl OpenFileBehavior {
         Self {
             mode,
             post_write_sync,
+            data_file_write_checks: file_type == FileType::File,
         }
     }
 }
@@ -796,6 +801,7 @@ pub struct FileData {
     file_type: FileType,
     /// Immutable write-operation policy selected for this open file description.
     post_write_sync: PostWriteSyncPolicy,
+    data_file_write_checks: bool,
     /// Serializes current-position operations; also owns directory iteration state.
     position_state: Mutex<ReaddirState>,
     pub private_data: Mutex<FilePrivateData>,
@@ -1169,7 +1175,7 @@ impl File {
         actual_offset: usize,
         actual_len: usize,
         source: PrimaryWriteSource<'_, '_>,
-        config: WriteConfig,
+        mut config: WriteConfig,
     ) -> Result<DelegatedWriteResult, MemoryAllocationError> {
         if let PrimaryWriteSource::User(input, _) = source {
             if let Some(result) =
@@ -1196,16 +1202,20 @@ impl File {
                 )?
             }
             PostWriteSyncPolicy::Generic | PostWriteSyncPolicy::NotApplicable => {
-                DelegatedWriteResult::new(
-                    self.inode.write_primary_with_privilege_stage(
-                        actual_offset,
-                        actual_len,
-                        source,
-                        self.private_data.lock(),
-                        &mut stage,
-                    )?,
-                    Ok(()),
-                )
+                let primary = self.inode.write_primary_with_privilege_stage(
+                    actual_offset,
+                    actual_len,
+                    source,
+                    self.private_data.lock(),
+                    &mut stage,
+                )?;
+                if primary.written_len > actual_len {
+                    return Err(SystemError::EIO.into());
+                }
+                if let Some(next_position) = primary.next_position {
+                    config.offset_update = OffsetUpdate::SetPosition(next_position);
+                }
+                DelegatedWriteResult::new(primary.written_len, Ok(()))
             }
         };
         self.prepare_write_completion(&mut result, actual_offset, config, stage.handled());
@@ -1282,6 +1292,9 @@ impl File {
             match config.offset_update {
                 OffsetUpdate::StoreEnd => {
                     self.offset.store(offset + written_len, Ordering::SeqCst);
+                }
+                OffsetUpdate::SetPosition(next) => {
+                    self.offset.store(next, Ordering::SeqCst);
                 }
                 OffsetUpdate::Add => {
                     self.offset.fetch_add(written_len, Ordering::SeqCst);
@@ -1698,6 +1711,7 @@ impl File {
             mode: RwSem::new(mode),
             file_type,
             post_write_sync: PostWriteSyncPolicy::NotApplicable,
+            data_file_write_checks: false,
             position_state: Mutex::new(ReaddirState::default()),
             private_data,
             cred: ProcessManager::current_pcb().cred(),
@@ -1759,6 +1773,7 @@ impl File {
         }
         mode.insert(FileMode::FMODE_OPENED);
         self.post_write_sync = behavior.post_write_sync;
+        self.data_file_write_checks = behavior.data_file_write_checks;
         *self.mode.write() = mode;
         drop(self.pending_truncate_writer.take());
         Ok(())
@@ -1890,15 +1905,36 @@ impl File {
         } else {
             self.offset.load(Ordering::SeqCst)
         };
+        self.read_syscall_chunk_at(offset, buf, output, output_offset, !stream)
+    }
+
+    /// Read at a syscall-owned explicit cursor without changing the OFD.
+    pub(crate) fn pread_into_user_syscall_chunk(
+        &self,
+        offset: usize,
+        buf: &mut [u8],
+        output: &mut UserBuffer<'_>,
+        output_offset: usize,
+    ) -> Result<usize, SystemError> {
+        self.read_syscall_chunk_at(offset, buf, output, output_offset, false)
+    }
+
+    fn read_syscall_chunk_at(
+        &self,
+        offset: usize,
+        buf: &mut [u8],
+        output: &mut UserBuffer<'_>,
+        output_offset: usize,
+        update_offset: bool,
+    ) -> Result<usize, SystemError> {
         let read = Self::recover_io(|| self.read_backing(offset, buf.len(), buf))?;
         let result = output.write_prefix_to_user(output_offset, &buf[..read]);
-        // file_accessed() also runs after a nonzero regular request which
-        // reaches EOF or faults on its first output byte. No ACCESS is emitted
-        // here: the syscall owns that notification boundary.
+        // Backing access precedes protected copying, including EOF and faults.
+        // Only copied bytes advance the caller's cursor; ACCESS is syscall-owned.
         self.finalize_read(
             offset,
             result.as_ref().copied().unwrap_or(0),
-            !stream,
+            update_offset,
             false,
         );
         result
@@ -1961,6 +1997,27 @@ impl File {
             self.offset.load(Ordering::SeqCst)
         };
 
+        self.read_user_at_position(offset, len, writer, !stream, emit_fsnotify)
+    }
+
+    /// One owner operation at an explicit cursor; the syscall owns ACCESS.
+    pub(crate) fn pread_user_syscall_chunk(
+        &self,
+        offset: usize,
+        len: usize,
+        writer: &mut UserBuffer<'_>,
+    ) -> Result<Option<usize>, SystemError> {
+        self.read_user_at_position(offset, len, writer, false, false)
+    }
+
+    fn read_user_at_position(
+        &self,
+        offset: usize,
+        len: usize,
+        writer: &mut UserBuffer<'_>,
+        update_offset: bool,
+        emit_fsnotify: bool,
+    ) -> Result<Option<usize>, SystemError> {
         self.readable()?;
         if writer.len() < len {
             return Err(SystemError::ENOBUFS);
@@ -1972,7 +2029,7 @@ impl File {
             return Ok(None);
         };
 
-        self.finalize_read(offset, read_len, !stream, emit_fsnotify);
+        self.finalize_read(offset, read_len, update_offset, emit_fsnotify);
         Ok(Some(read_len))
     }
 
@@ -2516,7 +2573,7 @@ impl File {
         offset: usize,
         len: usize,
     ) -> Result<usize, SystemError> {
-        if self.post_write_sync == PostWriteSyncPolicy::Delegated {
+        if !self.data_file_write_checks || self.post_write_sync == PostWriteSyncPolicy::Delegated {
             Ok(len)
         } else {
             self.limit_write_len_by_fsize(file_type, offset, len)
@@ -2559,7 +2616,8 @@ impl File {
             PostWriteSyncPolicy::NotApplicable => WriteSyncIntent::None,
         };
 
-        let is_append = matches!(file_type, FileType::File)
+        let is_append = self.data_file_write_checks
+            && matches!(file_type, FileType::File)
             && (flags.contains(FileFlags::O_APPEND) || force_append);
 
         // 普通文件始终按 EOF 执行 O_APPEND/RWF_APPEND；提供稳定锁域的文件系统
@@ -2739,10 +2797,9 @@ impl File {
             WriteSyncIntent::None
         };
         if !write_iter {
-            return self.write_user_legacy_vectors_at(offset, vectors.iovs(), update_offset);
+            return self.write_user_legacy_vectors_at(offset, vectors.iter(), update_offset);
         }
-        let segments = vectors.user_buffer_segments(len)?;
-        let input = unsafe { UserBuffer::new_vectored(&segments, len) };
+        let input = UserBuffer::new_vectored(vectors, len);
         self.do_write_user(
             offset,
             len,
@@ -2756,16 +2813,16 @@ impl File {
     /// Linux's legacy vector loop: one owner call per current iovec, with
     /// one successful-prefix publication for the complete syscall. Admission
     /// and the implicit-position guard belong to the caller.
-    fn write_user_legacy_vectors_at(
+    fn write_user_legacy_vectors_at<'a>(
         &self,
         offset: usize,
-        iovs: &[super::iov::IoVec],
+        iovs: impl Iterator<Item = &'a super::iov::IoVec>,
         update_offset: bool,
     ) -> Result<usize, SystemError> {
         let creator = object_for_task(&ProcessManager::current_pcb());
         let mut total = 0;
         let mut position = offset;
-        for (index, iov) in iovs.iter().enumerate() {
+        for (index, iov) in iovs.enumerate() {
             // iov_iter_init retains a leading empty segment. Only advance
             // after a complete owner call skips subsequent empty segments.
             if index != 0 && iov.iov_len == 0 {
@@ -2794,6 +2851,7 @@ impl File {
                     match completion.config.offset_update {
                         OffsetUpdate::Add => position + completion.written_len,
                         OffsetUpdate::StoreEnd => completion.offset + completion.written_len,
+                        OffsetUpdate::SetPosition(next) => next,
                     }
                 });
                 self.finish_write(result).map(|written| (written, next))
@@ -3214,15 +3272,15 @@ impl File {
             self.inode.open(private_data.lock(), &flags)?;
         }
 
-        let post_write_sync = if mode.contains(FileMode::FMODE_PATH) {
-            PostWriteSyncPolicy::NotApplicable
+        let (post_write_sync, data_file_write_checks) = if mode.contains(FileMode::FMODE_PATH) {
+            (PostWriteSyncPolicy::NotApplicable, false)
         } else {
             Self::configure_base_open_mode(&self.inode, self.file_type, &mut mode);
             let mut behavior = OpenFileBehavior::new(mode, self.file_type);
             self.inode
                 .configure_open_file(&private_data.lock(), &mut behavior);
             mode = behavior.mode;
-            behavior.post_write_sync
+            (behavior.post_write_sync, behavior.data_file_write_checks)
         };
 
         let res = storage.init(|epitems| FileData {
@@ -3236,6 +3294,7 @@ impl File {
             mode: RwSem::new(mode),
             file_type: self.file_type,
             post_write_sync,
+            data_file_write_checks,
             position_state: Mutex::new(position.clone()),
             private_data,
             cred: self.cred.clone(),

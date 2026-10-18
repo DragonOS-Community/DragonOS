@@ -535,7 +535,7 @@ pub(crate) fn run_legacy_writev_completion() -> Result<bool, MemoryAllocationErr
         ];
         let outcome = {
             let _position = file.lock_position();
-            file.write_user_legacy_vectors_at(37, &vectors, true)
+            file.write_user_legacy_vectors_at(37, vectors.iter(), true)
         };
         let expected = if terminal_error { 3 } else { 8 };
         valid &= matches!(&outcome, Ok(written) if *written == expected)

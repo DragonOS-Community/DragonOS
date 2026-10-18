@@ -1,7 +1,7 @@
 //! /proc/[pid]/oom_score_adj - OOM killer score adjustment.
 
 use crate::filesystem::procfs::template::configure_readonly_seq_file;
-use crate::filesystem::vfs::OpenFileBehavior;
+use crate::filesystem::vfs::{OpenFileBehavior, PrimaryWriteResult};
 use crate::libs::mutex::MutexGuard;
 use crate::{
     filesystem::{
@@ -198,6 +198,19 @@ impl OomScoreAdjFileOps {
             Self::set_score(&leader, score, min_update);
         }
     }
+    fn write_score(&self, buf: &[u8]) -> Result<usize, SystemError> {
+        let score = Self::parse_score(buf)?;
+        let pcb = self.target_process()?;
+        let has_cap_sys_resource = capable(CAPFlags::CAP_SYS_RESOURCE);
+        let _oom_score_adj_guard = ProcessManager::lock_oom_score_adj();
+        let min_score = pcb.sig_info_irqsave().oom_score_adj_min();
+        if score < min_score && !has_cap_sys_resource {
+            return Err(SystemError::EACCES);
+        }
+        let min_update = has_cap_sys_resource.then_some(score);
+        Self::set_score_for_shared_mm(&pcb, score, min_update);
+        Ok(buf.len().min(PROC_NUMBUF - 1))
+    }
 }
 
 impl FileOps for OomScoreAdjFileOps {
@@ -229,16 +242,19 @@ impl FileOps for OomScoreAdjFileOps {
         buf: &[u8],
         _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        let score = Self::parse_score(buf)?;
-        let pcb = self.target_process()?;
-        let has_cap_sys_resource = capable(CAPFlags::CAP_SYS_RESOURCE);
-        let _oom_score_adj_guard = ProcessManager::lock_oom_score_adj();
-        let min_score = pcb.sig_info_irqsave().oom_score_adj_min();
-        if score < min_score && !has_cap_sys_resource {
-            return Err(SystemError::EACCES);
-        }
-        let min_update = has_cap_sys_resource.then_some(score);
-        Self::set_score_for_shared_mm(&pcb, score, min_update);
-        Ok(buf.len().min(PROC_NUMBUF - 1))
+        self.write_score(buf)
+    }
+
+    fn write_at_with_position(
+        &self,
+        offset: usize,
+        _len: usize,
+        buf: &[u8],
+        _data: MutexGuard<FilePrivateData>,
+    ) -> Result<PrimaryWriteResult, SystemError> {
+        self.write_score(buf).map(|written_len| PrimaryWriteResult {
+            written_len,
+            next_position: Some(offset),
+        })
     }
 }

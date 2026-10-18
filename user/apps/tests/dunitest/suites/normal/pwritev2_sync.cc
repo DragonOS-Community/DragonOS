@@ -5,9 +5,11 @@
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/inotify.h>
 #include <sys/ioctl.h>
+#include <sys/mount.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/uio.h>
@@ -63,6 +65,33 @@ class Pwritev2Sync : public testing::Test {
         ASSERT_NO_FATAL_FAILURE(fs_.Mount());
     }
     dunitest::LoopExt4 fs_;
+};
+
+class Pwritev2TmpfsSync : public testing::Test {
+ protected:
+    void SetUp() override {
+        Descriptor inject(open(kInjectPath, O_WRONLY | O_CLOEXEC));
+        ASSERT_GE(inject.get(), 0) << "requires errseq injection interface: " << strerror(errno);
+        char path[] = "/tmp/pwritev2-sync-tmpfs-XXXXXX";
+        ASSERT_NE(nullptr, mkdtemp(path)) << strerror(errno);
+        path_ = path;
+        ASSERT_EQ(0, mount("tmpfs", path_.c_str(), "tmpfs", 0, nullptr)) << strerror(errno);
+        mounted_ = true;
+    }
+
+    void TearDown() override {
+        // TestBody's descriptors have already closed, including on a fatal
+        // assertion. A normal unmount also detects accidental resource leaks.
+        if (mounted_) {
+            ASSERT_EQ(0, umount(path_.c_str())) << strerror(errno);
+        }
+        if (!path_.empty()) {
+            EXPECT_EQ(0, rmdir(path_.c_str())) << strerror(errno);
+        }
+    }
+
+    std::string path_;
+    bool mounted_ = false;
 };
 
 TEST_F(Pwritev2Sync, Ext4PerOperationSyncReportsAndConsumesWritebackError) {
@@ -273,12 +302,15 @@ TEST_F(Pwritev2Sync, ScalarAndTransfersPublishSuccessOnlyAfterSynchronization) {
     }
 }
 
-TEST_F(Pwritev2Sync, TmpfsPerOperationSyncDoesNotInventGenericWriteSync) {
+TEST_F(Pwritev2TmpfsSync, TmpfsPerOperationSyncDoesNotInventGenericWriteSync) {
+    Descriptor shared_tmp(open("/tmp", O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+    ASSERT_GE(shared_tmp.get(), 0) << strerror(errno);
     for (unsigned sync : {kDsync, kSync}) {
-        char path[] = "/tmp/pwritev2-sync-tmpfs-XXXXXX";
-        Descriptor fd(mkstemp(path));
+        ASSERT_EQ(0, syscall(SYS_syncfs, shared_tmp.get())) << strerror(errno);
+        const std::string path = path_ + "/transaction";
+        Descriptor fd(open(path.c_str(), O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0600));
         ASSERT_GE(fd.get(), 0);
-        ASSERT_EQ(0, unlink(path));
+        ASSERT_EQ(0, unlink(path.c_str()));
         ASSERT_NO_FATAL_FAILURE(InjectMappingError(fd.get(), "EIO"));
         char byte = 'X';
         iovec vector = {&byte, 1};
@@ -290,6 +322,13 @@ TEST_F(Pwritev2Sync, TmpfsPerOperationSyncDoesNotInventGenericWriteSync) {
         EXPECT_EQ(-1, syscall(SYS_sync_file_range, fd.get(), 0, 0, 4));
         EXPECT_EQ(EIO, errno);
         EXPECT_EQ(0, syscall(SYS_sync_file_range, fd.get(), 0, 0, 4));
+        // Mapping injection also records a superblock event. Keep that event
+        // observable on this private mount without poisoning later /tmp tests.
+        errno = 0;
+        EXPECT_EQ(-1, syscall(SYS_syncfs, fd.get()));
+        EXPECT_EQ(EIO, errno);
+        EXPECT_EQ(0, syscall(SYS_syncfs, fd.get())) << strerror(errno);
+        EXPECT_EQ(0, syscall(SYS_syncfs, shared_tmp.get())) << strerror(errno);
     }
 }
 }  // namespace

@@ -601,6 +601,7 @@ impl Socket for UdpSocket {
         &self,
         msg: &mut crate::net::posix::MsgHdr,
         flags: PMSG,
+        iovs: &crate::syscall::iov::IoVecs,
     ) -> Result<usize, SystemError> {
         // log::debug!(
         //     "recv_msg: msg_name={:?}, msg_namelen={}, flags={:?}",
@@ -627,11 +628,10 @@ impl Socket for UdpSocket {
                     self.recv_tos.load(Ordering::Acquire)
                 },
             };
-            return entry.recv_msg_with_options(msg, options);
+            return entry.recv_msg_with_options(msg, options, iovs);
         }
 
         // Validate and create iovecs
-        let iovs = unsafe { IoVecs::from_user(msg.msg_iov, msg.msg_iovlen, true)? };
         let mut buf = iovs.new_buf(true)?;
         let buf_cap = buf.len();
 

@@ -1371,12 +1371,10 @@ impl Socket for VsockStreamSocket {
         &self,
         msg: &mut crate::net::posix::MsgHdr,
         flags: PMSG,
+        iovs: &crate::syscall::iov::IoVecs,
     ) -> Result<usize, SystemError> {
-        let iovs = unsafe { IoVecs::from_user(msg.msg_iov, msg.msg_iovlen, true)? };
         let total = min(iovs.total_len(), DEFAULT_RECV_BUF_SIZE);
-        let segments = iovs.user_buffer_segments(total)?;
-        let mut user_buffer =
-            unsafe { crate::syscall::user_buffer::UserBuffer::new_vectored(&segments, total) };
+        let mut user_buffer = crate::syscall::user_buffer::UserBuffer::new_vectored(iovs, total);
         let written = if flags.contains(PMSG::PEEK) {
             let mut tmp = vec![0u8; total];
             let n = self.recv(&mut tmp, flags)?;

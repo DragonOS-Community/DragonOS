@@ -3,7 +3,6 @@ use alloc::vec;
 use smoltcp::wire::{IpAddress, IpProtocol, IpVersion};
 use system_error::SystemError;
 
-use crate::filesystem::vfs::iov::IoVecs;
 use crate::net::socket::unix::utils::CmsgBuffer;
 use crate::net::socket::utils::{IPV4_MIN_HEADER_LEN, IPV6_HEADER_LEN};
 use crate::net::socket::{IpOption, PIPV6, PSOL};
@@ -442,6 +441,7 @@ impl RawSocket {
         &self,
         msg: &mut crate::net::posix::MsgHdr,
         flags: crate::net::socket::PMSG,
+        iovs: &crate::syscall::iov::IoVecs,
     ) -> Result<usize, SystemError> {
         if flags.contains(crate::net::socket::PMSG::ERRQUEUE) {
             let entry = {
@@ -471,9 +471,9 @@ impl RawSocket {
                         options.recv_tos
                     },
                 },
+                iovs,
             );
         }
-        let iovs = unsafe { IoVecs::from_user(msg.msg_iov, msg.msg_iovlen, true)? };
 
         // Linux 语义：IPv6 raw socket 接收时默认不向用户返回 IPv6 头；
         // 但控制消息(cmsg)需要从 IPv6 头提取，因此这里总是预留 IPv6 头空间。

@@ -453,12 +453,12 @@ impl Socket for TcpSocket {
         &self,
         msg: &mut crate::net::posix::MsgHdr,
         flags: PMSG,
+        iovs: &crate::syscall::iov::IoVecs,
     ) -> Result<usize, SystemError> {
         if flags.contains(PMSG::ERRQUEUE) {
-            return self.recv_icmp_error(msg);
+            return self.recv_icmp_error(msg, iovs);
         }
         // TCP: 不返回 peer 地址。
-        let iovs = unsafe { IoVecs::from_user(msg.msg_iov, msg.msg_iovlen, true)? };
         let total = iovs.total_len();
         let written = if flags.contains(PMSG::TRUNC) {
             // Linux TCP MSG_TRUNC reports/consumes bytes without copying the
@@ -466,9 +466,8 @@ impl Socket for TcpSocket {
             let mut tmp = vec![0u8; total];
             self.recv(&mut tmp, flags)?
         } else {
-            let segments = iovs.user_buffer_segments(total)?;
             let mut user_buffer =
-                unsafe { crate::syscall::user_buffer::UserBuffer::new_vectored(&segments, total) };
+                crate::syscall::user_buffer::UserBuffer::new_vectored(iovs, total);
 
             if flags.contains(PMSG::PEEK) {
                 // PEEK never consumes, so staging remains transactional while

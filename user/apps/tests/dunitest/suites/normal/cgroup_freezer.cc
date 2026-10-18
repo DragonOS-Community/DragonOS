@@ -916,7 +916,10 @@ TEST_F(Freezer, NonLeaderExecRacingFreezeCannotEscapeAfterAcknowledgement) {
     ASSERT_EQ(0, Write(root_ + "/cgroup.freeze", "0"));
     Frozen(root_, false);
     ASSERT_EQ(1, poll(&ready, 1, 5000));
-    ASSERT_GT(read(reader.value, bytes, sizeof(bytes)), 0);
+    const ssize_t resumed = read(reader.value, bytes, sizeof(bytes));
+    const int read_error = errno;
+    ASSERT_GT(resumed, 0) << "iteration=" << iteration << " revents=" << ready.revents
+                          << " errno=" << read_error << " (" << strerror(read_error) << ")";
     ASSERT_EQ(0, kill(worker_, SIGKILL));
     int status = 0;
     ASSERT_TRUE(Until([&] {

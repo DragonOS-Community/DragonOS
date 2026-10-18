@@ -1169,14 +1169,18 @@ impl Socket for UnixStreamSocket {
         }
     }
 
-    fn recv_msg(&self, _msg: &mut MsgHdr, _flags: socket::PMSG) -> Result<usize, SystemError> {
+    fn recv_msg(
+        &self,
+        _msg: &mut MsgHdr,
+        _flags: socket::PMSG,
+        iovs: &crate::syscall::iov::IoVecs,
+    ) -> Result<usize, SystemError> {
         let msg = _msg;
 
         let control_ptr = msg.msg_control;
         let control_len = msg.msg_controllen;
 
         // Scatter destination is described by msg_iov/msg_iovlen in user memory.
-        let iovs = unsafe { IoVecs::from_user(msg.msg_iov, msg.msg_iovlen, true)? };
         let total = iovs.total_len();
 
         // Read payload first.
@@ -1184,100 +1188,98 @@ impl Socket for UnixStreamSocket {
         let peek = _flags.contains(socket::PMSG::PEEK);
         let want_creds = self.passcred.load(core::sync::atomic::Ordering::Relaxed);
 
-        let (payload_copy_len, orig_len, truncated, ret_len, scm_cred, scm_rights) = if self
-            .is_seqpacket
-        {
-            let mut buf = iovs.new_buf(true)?;
-            loop {
-                let result = {
-                    let inner = self.inner.read();
-                    match inner.as_ref().expect("UnixStreamSocket inner is None") {
-                        Inner::Connected(connected) => {
-                            // IMPORTANT: snapshot SCM before consuming bytes.
-                            // try_recv_seqpacket_meta() consumes from the ring buffer
-                            // using pop_slice(), which discards record metadata.
-                            let snapshot = connected.scm_snapshot_for_recvmsg();
-                            connected
-                                .try_recv_seqpacket_meta(&mut buf[..], peek)
-                                .map(|record| (record, snapshot))
+        let (payload_copy_len, orig_len, truncated, ret_len, scm_cred, scm_rights) =
+            if self.is_seqpacket {
+                let mut buf = iovs.new_buf(true)?;
+                loop {
+                    let result = {
+                        let inner = self.inner.read();
+                        match inner.as_ref().expect("UnixStreamSocket inner is None") {
+                            Inner::Connected(connected) => {
+                                // IMPORTANT: snapshot SCM before consuming bytes.
+                                // try_recv_seqpacket_meta() consumes from the ring buffer
+                                // using pop_slice(), which discards record metadata.
+                                let snapshot = connected.scm_snapshot_for_recvmsg();
+                                connected
+                                    .try_recv_seqpacket_meta(&mut buf[..], peek)
+                                    .map(|record| (record, snapshot))
+                            }
+                            _ => Err(SystemError::ENOTCONN),
                         }
-                        _ => Err(SystemError::ENOTCONN),
-                    }
-                };
-                match result {
-                    Ok((Some(meta), snapshot)) => {
-                        if !peek {
-                            self.wake_peer_writable();
+                    };
+                    match result {
+                        Ok((Some(meta), snapshot)) => {
+                            if !peek {
+                                self.wake_peer_writable();
+                            }
+                            let copy_len = meta.copy_len;
+                            let orig_len = meta.orig_len;
+                            let truncated = meta.truncated;
+                            if copy_len != 0 {
+                                iovs.scatter_exact(&buf[..copy_len])?;
+                            }
+                            let ret_len = if _flags.contains(socket::PMSG::TRUNC) {
+                                orig_len
+                            } else {
+                                copy_len
+                            };
+                            let (scm_cred, scm_rights) =
+                                snapshot.scm_data.unwrap_or((None, alloc::vec::Vec::new()));
+                            break (copy_len, orig_len, truncated, ret_len, scm_cred, scm_rights);
                         }
-                        let copy_len = meta.copy_len;
-                        let orig_len = meta.orig_len;
-                        let truncated = meta.truncated;
-                        if copy_len != 0 {
-                            iovs.scatter_exact(&buf[..copy_len])?;
+                        Ok((None, _)) => break (0, 0, false, 0, None, alloc::vec::Vec::new()),
+                        Err(SystemError::EAGAIN_OR_EWOULDBLOCK) if !nonblock => {
+                            self.wait_queue.wait_event_interruptible_timeout(
+                                || self.can_recv(),
+                                self.recv_timeout(),
+                            )?;
                         }
-                        let ret_len = if _flags.contains(socket::PMSG::TRUNC) {
-                            orig_len
-                        } else {
-                            copy_len
-                        };
-                        let (scm_cred, scm_rights) =
-                            snapshot.scm_data.unwrap_or((None, alloc::vec::Vec::new()));
-                        break (copy_len, orig_len, truncated, ret_len, scm_cred, scm_rights);
+                        Err(e) => return Err(e),
                     }
-                    Ok((None, _)) => break (0, 0, false, 0, None, alloc::vec::Vec::new()),
-                    Err(SystemError::EAGAIN_OR_EWOULDBLOCK) if !nonblock => {
-                        self.wait_queue.wait_event_interruptible_timeout(
-                            || self.can_recv(),
-                            self.recv_timeout(),
-                        )?;
-                    }
-                    Err(e) => return Err(e),
                 }
-            }
-        } else {
-            let segments = iovs.user_buffer_segments(total)?;
-            let mut user_buffer =
-                unsafe { crate::syscall::user_buffer::UserBuffer::new_vectored(&segments, total) };
-            loop {
-                let result = {
-                    let inner = self.inner.read();
-                    match inner.as_ref().expect("UnixStreamSocket inner is None") {
-                        Inner::Connected(connected) => connected.try_recv_stream_recvmsg_meta(
-                            &mut user_buffer,
-                            peek,
-                            want_creds,
-                        ),
-                        _ => Err(SystemError::EINVAL),
-                    }
-                };
-                match result {
-                    Ok(StreamReadOutcome::Data(meta)) => {
-                        let n = meta.copy_len;
-                        break (n, n, false, n, meta.scm_cred, meta.scm_rights);
-                    }
-                    Ok(StreamReadOutcome::Eof) => {
-                        if self.take_pending_reset() {
-                            return Err(SystemError::ECONNRESET);
+            } else {
+                let mut user_buffer =
+                    crate::syscall::user_buffer::UserBuffer::new_vectored(iovs, total);
+                loop {
+                    let result = {
+                        let inner = self.inner.read();
+                        match inner.as_ref().expect("UnixStreamSocket inner is None") {
+                            Inner::Connected(connected) => connected.try_recv_stream_recvmsg_meta(
+                                &mut user_buffer,
+                                peek,
+                                want_creds,
+                            ),
+                            _ => Err(SystemError::EINVAL),
                         }
-                        // scm_recv_unix emits zeroed SCM_CREDENTIALS on EOF
-                        // when SO_PASSCRED is enabled.
-                        let cred = want_creds.then_some(UCred {
-                            pid: 0,
-                            uid: 0,
-                            gid: 0,
-                        });
-                        break (0, 0, false, 0, cred, alloc::vec::Vec::new());
+                    };
+                    match result {
+                        Ok(StreamReadOutcome::Data(meta)) => {
+                            let n = meta.copy_len;
+                            break (n, n, false, n, meta.scm_cred, meta.scm_rights);
+                        }
+                        Ok(StreamReadOutcome::Eof) => {
+                            if self.take_pending_reset() {
+                                return Err(SystemError::ECONNRESET);
+                            }
+                            // scm_recv_unix emits zeroed SCM_CREDENTIALS on EOF
+                            // when SO_PASSCRED is enabled.
+                            let cred = want_creds.then_some(UCred {
+                                pid: 0,
+                                uid: 0,
+                                gid: 0,
+                            });
+                            break (0, 0, false, 0, cred, alloc::vec::Vec::new());
+                        }
+                        Err(SystemError::EAGAIN_OR_EWOULDBLOCK) if !nonblock => {
+                            self.wait_queue.wait_event_interruptible_timeout(
+                                || self.can_recv(),
+                                self.recv_timeout(),
+                            )?;
+                        }
+                        Err(e) => return Err(e),
                     }
-                    Err(SystemError::EAGAIN_OR_EWOULDBLOCK) if !nonblock => {
-                        self.wait_queue.wait_event_interruptible_timeout(
-                            || self.can_recv(),
-                            self.recv_timeout(),
-                        )?;
-                    }
-                    Err(e) => return Err(e),
                 }
-            }
-        };
+            };
 
         if !self.is_seqpacket && payload_copy_len != 0 && !peek {
             self.wake_peer_writable();

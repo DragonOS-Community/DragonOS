@@ -81,30 +81,47 @@ pub(super) fn readv_from_user_with_flags(
 /// Shared by readv and preadv2(offset = -1), as required by Linux semantics.
 /// The fd admission entry holds the position lock through import and this call.
 pub(super) fn read_iovecs(file: &File, iovecs: &IoVecs, flags: u32) -> Result<usize, SystemError> {
+    read_iovecs_at(file, iovecs, flags, None)
+}
+
+/// An explicit position is a syscall-local cursor; the OFD is never changed.
+pub(super) fn read_iovecs_at(
+    file: &File,
+    iovecs: &IoVecs,
+    flags: u32,
+    position: Option<usize>,
+) -> Result<usize, SystemError> {
     file.readable()?;
     let max_rw_count = MAX_RW_COUNT;
     let requested = iovecs.total_len().min(max_rw_count);
     if requested == 0 {
         return finish_readv(file, 0);
     }
-    file.verify_read_range(requested)?;
+    match position {
+        Some(offset) => file.verify_pread_range(offset, requested)?,
+        None => file.verify_read_range(requested)?,
+    }
     super::sys_preadv2::validate_read_flags(file, flags)?;
 
     // Linux falls back to one `.read` call per iovec when an inode does
     // not implement `.read_iter`. Record readers that consume data before
     // copying it to userspace must keep that ordering for readv as well.
     if file.user_read_mode() == UserReadMode::Scalar {
-        return readv_user_chunks(file, iovecs, max_rw_count);
+        return readv_user_chunks(file, iovecs, max_rw_count, position);
     }
 
     if file.user_read_mode() == UserReadMode::Iterator || file.file_type() == FileType::Socket {
         // Socket readv is one underlying read, but ACCESS still belongs to
         // the readv completion boundary (including a zero-byte result).
-        let segments = iovecs.user_buffer_segments(requested)?;
-        let mut user_buffer = unsafe { UserBuffer::new_vectored(&segments, requested) };
+        let mut user_buffer = UserBuffer::new_vectored(iovecs, requested);
         let nread = if file.user_read_mode() == UserReadMode::Iterator {
-            file.read_user_syscall_chunk(requested, &mut user_buffer)?
-                .ok_or(SystemError::EIO)?
+            match position {
+                Some(offset) => {
+                    file.pread_user_syscall_chunk(offset, requested, &mut user_buffer)?
+                }
+                None => file.read_user_syscall_chunk(requested, &mut user_buffer)?,
+            }
+            .ok_or(SystemError::EIO)?
         } else {
             let inode = file.inode();
             let socket = inode.as_socket().ok_or(SystemError::ENOTSOCK)?;
@@ -118,7 +135,7 @@ pub(super) fn read_iovecs(file: &File, iovecs: &IoVecs, flags: u32) -> Result<us
     // Reuse one bounded CPU owner across implementation chunks and iovecs.
     let mut scratch = ReadScratch::default();
 
-    for one in iovecs.iovs().iter() {
+    for one in iovecs.iter() {
         // Check if we've reached MAX_RW_COUNT limit
         if total_read >= max_rw_count {
             break;
@@ -144,7 +161,13 @@ pub(super) fn read_iovecs(file: &File, iovecs: &IoVecs, flags: u32) -> Result<us
                 Err(error) => return Err(error),
             };
             let mut output = unsafe { UserBuffer::new(VirtAddr::new(current_base), chunk_len) };
-            let n = match file.read_syscall_chunk(kbuf, &mut output, 0) {
+            let read = match position {
+                Some(offset) => {
+                    file.pread_into_user_syscall_chunk(offset + total_read, kbuf, &mut output, 0)
+                }
+                None => file.read_syscall_chunk(kbuf, &mut output, 0),
+            };
+            let n = match read {
                 Ok(n) => n,
                 Err(_) if total_read != 0 => return finish_readv(file, total_read),
                 Err(error) => return Err(error),
@@ -181,10 +204,11 @@ fn readv_user_chunks(
     file: &crate::filesystem::vfs::file::File,
     iovecs: &IoVecs,
     max_rw_count: usize,
+    position: Option<usize>,
 ) -> Result<usize, SystemError> {
     let mut total_read = 0usize;
 
-    for one in iovecs.iovs() {
+    for one in iovecs.iter() {
         if total_read >= max_rw_count {
             break;
         }
@@ -194,7 +218,13 @@ fn readv_user_chunks(
         }
 
         let mut user_buffer = unsafe { UserBuffer::new(VirtAddr::new(one.iov_base as usize), len) };
-        let read_len = match file.read_user_syscall_chunk(len, &mut user_buffer) {
+        let read = match position {
+            Some(offset) => {
+                file.pread_user_syscall_chunk(offset + total_read, len, &mut user_buffer)
+            }
+            None => file.read_user_syscall_chunk(len, &mut user_buffer),
+        };
+        let read_len = match read {
             Ok(Some(read_len)) => read_len,
             Ok(None) => {
                 return Err(SystemError::EIO);

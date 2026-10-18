@@ -2311,6 +2311,63 @@ TEST(Ext4InodeIdentity, OverlayCopyUpRestoresNonRegularMetadataWithoutTruncation
     EXPECT_EQ(static_cast<mode_t>(0600), original.st_mode & 0777);
 }
 
+
+TEST(Ext4InodeIdentity, PositionalDirectReadsPreserveDataAndOpenPosition) {
+    LoopExt4 fs;
+    ASSERT_NO_FATAL_FAILURE(fs.SetUp());
+    ASSERT_NO_FATAL_FAILURE(fs.Mount());
+    constexpr size_t kChunk = 64 * 1024;
+    constexpr size_t kOffset = 4096;
+    constexpr size_t kLength = kChunk + 4096;
+    constexpr size_t kMappingSize = 2 * kChunk;
+    const std::string path = fs.mount_point() + "/positional_direct_reads";
+    // Keep cleanup local so a failed I/O assertion cannot leave descriptors
+    // pinning the fixture mount for the following tests.
+    struct Resources {
+        int buffered = -1;
+        int direct = -1;
+        void* output = MAP_FAILED;
+        ~Resources() {
+            if (output != MAP_FAILED) munmap(output, kMappingSize);
+            if (direct >= 0) close(direct);
+            if (buffered >= 0) close(buffered);
+        }
+    } resources;
+    resources.buffered = open(path.c_str(), O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0600);
+    ASSERT_GE(resources.buffered, 0) << strerror(errno);
+    std::vector<char> source(2 * kChunk + 8192);
+    for (size_t i = 0; i < source.size(); ++i) {
+        source[i] = static_cast<char>((i * 37 + i / 251 + 11) & 255);
+    }
+    ASSERT_NO_FATAL_FAILURE(WriteAll(resources.buffered, source.data(), source.size()));
+    ASSERT_EQ(0, fsync(resources.buffered)) << strerror(errno);
+    resources.direct = open(path.c_str(), O_RDONLY | O_DIRECT | O_CLOEXEC);
+    ASSERT_GE(resources.direct, 0) << strerror(errno);
+    ASSERT_EQ(17, lseek(resources.direct, 17, SEEK_SET));
+    resources.output = mmap(nullptr, kMappingSize, PROT_READ | PROT_WRITE,
+                            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    ASSERT_NE(MAP_FAILED, resources.output) << strerror(errno);
+    auto* bytes = static_cast<char*>(resources.output);
+    for (int operation = 0; operation < 3; ++operation) {
+        SCOPED_TRACE(operation);
+        memset(bytes, 0xcd, kMappingSize);
+        iovec vectors[] = {{bytes, kChunk}, {bytes + kChunk, 4096}};
+        ssize_t count;
+        if (operation == 0) {
+            count = pread(resources.direct, bytes, kLength, kOffset);
+        } else if (operation == 1) {
+            count = preadv(resources.direct, vectors, 2, kOffset);
+        } else {
+            count = syscall(SYS_preadv2, resources.direct, vectors, 2,
+                            static_cast<unsigned long>(kOffset), 0UL, 0U);
+        }
+        ASSERT_EQ(static_cast<ssize_t>(kLength), count) << strerror(errno);
+        EXPECT_EQ(0, memcmp(bytes, source.data() + kOffset, kLength));
+        EXPECT_EQ(17, lseek(resources.direct, 0, SEEK_CUR));
+        EXPECT_EQ(static_cast<unsigned char>(0xcd), static_cast<unsigned char>(bytes[kLength]));
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {

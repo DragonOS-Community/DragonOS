@@ -179,6 +179,24 @@ pub struct WritePrivilegeStage<'a> {
     attrib: AttribStageObserver<'a>,
 }
 
+/// One primary owner write, optionally overriding the normal position update.
+/// The override is produced with the data operation, before any completion or
+/// synchronization retry can observe a different owner state.
+#[derive(Debug, Clone, Copy)]
+pub struct PrimaryWriteResult {
+    pub written_len: usize,
+    pub next_position: Option<usize>,
+}
+
+impl PrimaryWriteResult {
+    pub fn new(written_len: usize) -> Self {
+        Self {
+            written_len,
+            next_position: None,
+        }
+    }
+}
+
 /// Input retained only for the duration of one primary write. Native local
 /// filesystems materialize user input after privilege removal, while holding
 /// their canonical content guard but no metadata or namespace spin locks.
@@ -1283,9 +1301,10 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         source: PrimaryWriteSource<'_, '_>,
         data: MutexGuard<FilePrivateData>,
         stage: &mut WritePrivilegeStage<'_>,
-    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+    ) -> Result<PrimaryWriteResult, crate::mm::allocation::MemoryAllocationError> {
         source.with_buffer(len, |buffer| {
             self.write_at_with_privilege_stage(offset, len.min(buffer.len()), buffer, data, stage)
+                .map(PrimaryWriteResult::new)
         })
     }
 
@@ -1297,7 +1316,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         data: MutexGuard<FilePrivateData>,
         context: &permission::InodeOpContext,
         stage: &mut WritePrivilegeStage<'_>,
-    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+    ) -> Result<PrimaryWriteResult, crate::mm::allocation::MemoryAllocationError> {
         if context.is_idmapped() {
             return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP.into());
         }

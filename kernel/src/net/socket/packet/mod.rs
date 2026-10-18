@@ -364,8 +364,13 @@ impl Socket for PacketSocket {
     fn local_endpoint(&self) -> Result<Endpoint, SystemError> {
         self.packet_local_endpoint()
     }
-    fn recv_msg(&self, m: &mut crate::net::posix::MsgHdr, f: PMSG) -> Result<usize, SystemError> {
-        self.recv_packet_msg(m, f)
+    fn recv_msg(
+        &self,
+        m: &mut crate::net::posix::MsgHdr,
+        f: PMSG,
+        iovs: &crate::syscall::iov::IoVecs,
+    ) -> Result<usize, SystemError> {
+        self.recv_packet_msg(m, f, iovs)
     }
     fn send_msg(&self, m: &crate::net::posix::MsgHdr, f: PMSG) -> Result<usize, SystemError> {
         self.send_packet_msg(m, f)

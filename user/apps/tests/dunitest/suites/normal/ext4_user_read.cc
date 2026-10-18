@@ -224,3 +224,8 @@ TEST_F(Ext4UserRead, AlignedDirectReadSmoke) {
     close(reader);
 }
 }  // namespace
+
+int main(int argc, char** argv) {
+    ::testing::InitGoogleTest(&argc, argv);
+    return RUN_ALL_TESTS();
+}

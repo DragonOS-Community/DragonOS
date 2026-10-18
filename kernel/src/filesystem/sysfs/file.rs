@@ -301,6 +301,10 @@ impl SysFS {
 struct PreallocKFOpsRW;
 
 impl KernFSCallback for PreallocKFOpsRW {
+    fn uses_kernfs_write_policy(&self) -> bool {
+        true
+    }
+
     fn open(&self, _data: KernCallbackData) -> Result<(), SystemError> {
         return Ok(());
     }
@@ -333,6 +337,10 @@ impl KernFSCallback for PreallocKFOpsRW {
 struct PreallocKFOpsReadOnly;
 
 impl KernFSCallback for PreallocKFOpsReadOnly {
+    fn uses_kernfs_write_policy(&self) -> bool {
+        true
+    }
+
     fn open(&self, _data: KernCallbackData) -> Result<(), SystemError> {
         return Ok(());
     }
@@ -365,6 +373,10 @@ impl KernFSCallback for PreallocKFOpsReadOnly {
 struct PreallocKFOpsWriteOnly;
 
 impl KernFSCallback for PreallocKFOpsWriteOnly {
+    fn uses_kernfs_write_policy(&self) -> bool {
+        true
+    }
+
     fn open(&self, _data: KernCallbackData) -> Result<(), SystemError> {
         return Ok(());
     }
@@ -397,6 +409,10 @@ impl KernFSCallback for PreallocKFOpsWriteOnly {
 struct PreallocKFOpsEmpty;
 
 impl KernFSCallback for PreallocKFOpsEmpty {
+    fn uses_kernfs_write_policy(&self) -> bool {
+        true
+    }
+
     fn open(&self, _data: KernCallbackData) -> Result<(), SystemError> {
         return Ok(());
     }

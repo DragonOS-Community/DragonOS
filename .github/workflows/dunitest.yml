@@ -66,6 +66,7 @@ jobs:
           normal/proc_write_position
           normal/kernfs_write_policy
           normal/sysfs_write_policy
+          normal/debugfs_write_policy
           normal/iov_snapshot_semantics
           normal/page_cache_accounting
           normal/vector_write_privileges

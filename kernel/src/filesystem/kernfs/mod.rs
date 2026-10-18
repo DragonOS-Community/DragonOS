@@ -355,7 +355,9 @@ pub struct InnerKernFSInode {
 impl IndexNode for KernFSInode {
     fn configure_open_file(&self, _data: &FilePrivateData, behavior: &mut OpenFileBehavior) {
         behavior.post_write_sync = PostWriteSyncPolicy::NotApplicable;
-        behavior.data_file_write_checks = false;
+        if self.uses_kernfs_write_policy() {
+            behavior.data_file_write_checks = false;
+        }
     }
 
     fn as_any_ref(&self) -> &dyn core::any::Any {
@@ -671,6 +673,12 @@ impl IndexNode for KernFSInode {
         data: MutexGuard<FilePrivateData>,
         stage: &mut super::vfs::WritePrivilegeStage<'_>,
     ) -> Result<super::vfs::PrimaryWriteResult, crate::mm::allocation::MemoryAllocationError> {
+        if !self.uses_kernfs_write_policy() {
+            return source.with_buffer(len, |buffer| {
+                self.write_at(offset, len.min(buffer.len()), buffer, data)
+                    .map(super::vfs::PrimaryWriteResult::new)
+            });
+        }
         let len = len.min(crate::arch::MMArch::PAGE_SIZE);
         source.with_exact_buffer(len, |buffer| {
             // kernfs writes are control operations, not generic data writes.
@@ -691,7 +699,11 @@ impl IndexNode for KernFSInode {
             if buf.len() < len {
                 return Err(SystemError::ENOBUFS);
             }
-            let len = len.min(crate::arch::MMArch::PAGE_SIZE);
+            let len = if self.uses_kernfs_write_policy() {
+                len.min(crate::arch::MMArch::PAGE_SIZE)
+            } else {
+                len
+            };
             if self.inode_type != KernInodeType::File {
                 return Err(SystemError::EISDIR);
             }
@@ -718,6 +730,12 @@ impl IndexNode for KernFSInode {
 }
 
 impl KernFSInode {
+    fn uses_kernfs_write_policy(&self) -> bool {
+        self.callback
+            .as_ref()
+            .is_some_and(|callback| callback.uses_kernfs_write_policy())
+    }
+
     fn check_active(&self) -> Result<(), SystemError> {
         if self.removed.load(Ordering::Acquire) {
             Err(SystemError::ENODEV)

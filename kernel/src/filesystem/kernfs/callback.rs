@@ -11,6 +11,13 @@ use system_error::SystemError;
 ///
 /// 当用户态程序打开、读取、写入、关闭文件时，kernfs会调用相应的回调函数。
 pub trait KernFSCallback: Send + Sync + Debug {
+    /// Select Linux kernfs write_iter admission: page truncation before exact
+    /// user copy, without ordinary data-file append, FSIZE or privilege work.
+    /// Other shared-inode users retain their existing callback write contract.
+    fn uses_kernfs_write_policy(&self) -> bool {
+        false
+    }
+
     fn open(&self, data: KernCallbackData) -> Result<(), SystemError>;
 
     fn read(

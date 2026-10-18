@@ -194,6 +194,38 @@ pub trait Socket: PollableInode + IndexNode {
         address: Option<Endpoint>,
     ) -> Result<(usize, Endpoint), SystemError>;
 
+    /// Side-effect-free receive admission, before legacy buffer borrowing or
+    /// an adapter's normal-queue wait. Owners may reject flags or requests for
+    /// receive sources they do not implement; never select or consume data.
+    fn check_recv_flags(&self, _flags: PMSG) -> Result<(), SystemError> {
+        Ok(())
+    }
+
+    /// Scalar userspace receive. Protocols with a protected receive engine
+    /// override this without ever borrowing a slice over userspace.
+    ///
+    /// The default preserves the legacy scalar path of the other families;
+    /// it does not provide fault protection. Only contiguous backing is valid.
+    fn recv_from_user_buffer(
+        &self,
+        buffer: &mut crate::syscall::user_buffer::UserBuffer<'_>,
+        flags: PMSG,
+    ) -> Result<(usize, Endpoint), SystemError> {
+        self.check_recv_flags(flags)?;
+        let address = buffer.as_contiguous_address().ok_or(SystemError::EINVAL)?;
+        let bytes = if buffer.is_empty() {
+            &mut []
+        } else {
+            if address.data() == 0 {
+                return Err(SystemError::EFAULT);
+            }
+            // The syscall has checked the scalar address range. This adapter
+            // retains the pre-existing legacy access contract of these owners.
+            unsafe { core::slice::from_raw_parts_mut(address.data() as *mut u8, buffer.len()) }
+        };
+        self.recv_from(bytes, flags, None)
+    }
+
     /// Receive using the syscall's validated iovec snapshot. Owners must not
     /// reimport msg_iov: the borrowed snapshot stays alive across waiting and
     /// error-queue processing, including message truncation and copy faults.

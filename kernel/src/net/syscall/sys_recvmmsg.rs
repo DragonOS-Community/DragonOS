@@ -98,7 +98,9 @@ impl Syscall for SysRecvmmsgHandle {
 
         for i in 0..vlen {
             // For i>0, force nonblocking if we're in WAITFORONE/timeout mode.
-            let mut this_flags = flags;
+            // WAITFORONE controls the batch, not the protocol's per-message
+            // receive allowlist (Linux do_recvmmsg()).
+            let mut this_flags = flags & !PMSG::WAITFORONE.bits();
             if received > 0 && wait_for_one {
                 this_flags |= PMSG::DONTWAIT.bits();
             }
@@ -108,6 +110,11 @@ impl Syscall for SysRecvmmsgHandle {
                 && !file_nonblock
                 && (this_flags & PMSG::DONTWAIT.bits()) == 0
                 && !timeout.is_null()
+                // Do not wait on the ordinary queue for a request the owner
+                // rejects. Import the message below before returning its error.
+                && socket
+                    .check_recv_flags(PMSG::from_bits_retain(this_flags))
+                    .is_ok()
                 && !socket.check_io_event().contains(EPollEventType::EPOLLIN)
             {
                 // Wait until readable or timeout.

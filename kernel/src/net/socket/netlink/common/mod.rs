@@ -373,6 +373,10 @@ impl<P: SupportedNetlinkProtocol + 'static> Socket for NetlinkSocket<P>
 where
     BoundNetlink<P>: Bound<Endpoint = NetlinkSocketAddr>,
 {
+    fn set_nonblocking(&self, nonblocking: bool) {
+        self.is_nonblocking.store(nonblocking, Ordering::Relaxed);
+    }
+
     fn netns(&self) -> Arc<NetNamespace> {
         NetlinkSocket::netns(self)
     }
@@ -728,11 +732,6 @@ where
 impl<P: SupportedNetlinkProtocol> NetlinkSocket<P> {
     pub fn is_nonblocking(&self) -> bool {
         self.is_nonblocking.load(Ordering::Relaxed)
-    }
-
-    #[allow(unused)]
-    pub fn set_nonblocking(&self, nonblocking: bool) {
-        self.is_nonblocking.store(nonblocking, Ordering::Relaxed);
     }
 }
 

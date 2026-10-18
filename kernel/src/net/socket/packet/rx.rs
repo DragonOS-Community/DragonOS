@@ -11,7 +11,7 @@ use crate::bpf::classic::{
 };
 use crate::net::socket::endpoint::{Endpoint, LinkLayerEndpoint};
 use crate::net::socket::unix::utils::CmsgBuffer;
-use crate::net::socket::PMSG;
+use crate::net::socket::{Socket, PMSG};
 
 use super::uapi::{SOL_PACKET, TP_STATUS_USER, TP_STATUS_VLAN_TPID_VALID, TP_STATUS_VLAN_VALID};
 use super::{
@@ -994,9 +994,7 @@ impl PacketSocket {
         Ok(packet)
     }
     fn wait_dequeue(&self, flags: PMSG) -> Result<ReceivedPacket, SystemError> {
-        if flags.contains(PMSG::OOB) {
-            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
-        }
+        self.check_recv_flags(flags)?;
         let peek = flags.contains(PMSG::PEEK);
         if self.is_nonblock() || flags.contains(PMSG::DONTWAIT) {
             return self.dequeue(peek);

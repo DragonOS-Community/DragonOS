@@ -127,7 +127,7 @@ pub(super) fn do_recvmsg_with_sock(
     // local socket handle bound below.
     let socket = sock.socket()?;
 
-    let mut pmsg_flags = PMSG::from_bits_truncate(flags);
+    let mut pmsg_flags = PMSG::from_bits_retain(flags);
     if sock.is_nonblocking() {
         pmsg_flags.insert(PMSG::DONTWAIT);
     }

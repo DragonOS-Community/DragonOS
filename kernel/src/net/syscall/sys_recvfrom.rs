@@ -70,14 +70,13 @@ impl Syscall for SysRecvfromHandle {
             }
         }
 
-        // Create mutable buffer slice
-        let buf_slice = if len == 0 {
-            &mut []
-        } else {
-            unsafe { core::slice::from_raw_parts_mut(buf, len) }
+        // Keep only the address until the protocol selects/copies data. NULL
+        // is valid for TCP TRUNC and for receives that never touch the payload.
+        // SAFETY: the user range was checked above; owners perform the access.
+        let mut buffer = unsafe {
+            crate::syscall::user_buffer::UserBuffer::new(VirtAddr::new(buf as usize), len)
         };
-
-        do_recvfrom(fd, buf_slice, flags, addr, addrlen)
+        do_recvfrom(fd, &mut buffer, flags, addr, addrlen)
     }
 
     /// Formats the syscall parameters for display/debug purposes
@@ -147,7 +146,7 @@ syscall_table_macros::declare_syscall!(SYS_RECVFROM, SysRecvfromHandle);
 /// * `Err(SystemError)` - Error code if operation fails
 pub(super) fn do_recvfrom(
     fd: usize,
-    buf: &mut [u8],
+    buf: &mut crate::syscall::user_buffer::UserBuffer<'_>,
     flags: u32,
     addr: *mut SockAddr,
     addr_len: *mut u32,
@@ -158,7 +157,7 @@ pub(super) fn do_recvfrom(
     let socket = sock.socket()?;
 
     // Honor O_NONBLOCK set via fcntl(F_SETFL) by translating it to MSG_DONTWAIT.
-    let mut pmsg_flags = PMSG::from_bits_truncate(flags);
+    let mut pmsg_flags = PMSG::from_bits_retain(flags);
     if sock.is_nonblocking() {
         pmsg_flags.insert(PMSG::DONTWAIT);
     }
@@ -169,18 +168,16 @@ pub(super) fn do_recvfrom(
 
     // Linux/gVisor 语义：某些 socket（如 TCP/SOCK_STREAM）会忽略源地址输出参数。
     // 具体行为由 socket 自身决定，避免在 syscall 层做类型特判。
+    let (recv_len, endpoint) = socket.recv_from_user_buffer(buf, pmsg_flags)?;
     if socket.recvfrom_addr_behavior() == RecvFromAddrBehavior::Ignore {
-        let n = socket.recv(buf, pmsg_flags)?;
         // 若用户提供了 addrlen，则写回 0；不得写 addr（gVisor 会检查 sockaddr_storage 保持全 0）。
         if !addr_len.is_null() {
             let mut writer = UserBufferWriter::new(addr_len, core::mem::size_of::<u32>(), true)?;
             let mut addrlen_buf = writer.buffer_protected(0)?;
             addrlen_buf.write_one::<u32>(0, &0u32)?;
         }
-        return Ok(n);
+        return Ok(recv_len);
     }
-
-    let (recv_len, endpoint) = socket.recv_from(buf, pmsg_flags, None)?;
 
     // Only write the source address if the caller provided addr and addr_len
     if !addr.is_null() && !addr_len.is_null() {

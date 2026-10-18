@@ -56,7 +56,8 @@ impl<T: 'static> StateExt4FuseFs<T> {
     ///
     /// `init` - If true, initialize the filesystem
     pub fn new(block_dev: Arc<dyn StateBlockDevice<T>>, init: bool) -> Self {
-        let mut fs = Ext4::load(block_dev.clone()).expect("Failed to load ext4 filesystem");
+        let mut fs = Ext4::load_writable(block_dev.clone())
+            .expect("Failed to load writable ext4 filesystem");
         if init {
             fs.init().expect("Failed to init ext4 filesystem");
         }
@@ -163,7 +164,13 @@ impl<T: 'static> Filesystem for StateExt4FuseFs<T> {
                     "failed to drain ext4 reclaim during FUSE destroy: {:?}",
                     error
                 );
+                // No-journal final unlinks need not be on the durable orphan
+                // list. Preserve the dirty mount marker when reclaim fails.
+                return;
             }
+        }
+        if let Err(error) = self.fs.shutdown_writable() {
+            log::error!("failed to cleanly shut down ext4 filesystem: {:?}", error);
         }
     }
 
@@ -581,16 +588,23 @@ impl<T: 'static> Filesystem for StateExt4FuseFs<T> {
         ino: u64,
         name: &OsStr,
         value: &[u8],
-        _flags: i32,
+        flags: i32,
         _position: u32,
         reply: ReplyEmpty,
     ) {
         let name = name.as_bytes();
-        // Check conflict
-        if let Ok(_) = self.fs.getxattr(ino as u32, name, &mut []) {
-            return reply.error(ErrCode::EEXIST as i32);
+        const XATTR_CREATE: i32 = 1;
+        const XATTR_REPLACE: i32 = 2;
+        if flags & !(XATTR_CREATE | XATTR_REPLACE) != 0 {
+            return reply.error(ErrCode::EINVAL as i32);
         }
-        match self.fs.setxattr(ino as u32, name, value) {
+        match self.fs.setxattr_with_flags(
+            ino as u32,
+            name,
+            value,
+            flags & XATTR_CREATE != 0,
+            flags & XATTR_REPLACE != 0,
+        ) {
             Ok(_) => reply.ok(),
             Err(e) => reply.error(e.code() as i32),
         }

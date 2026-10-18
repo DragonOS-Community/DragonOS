@@ -2627,6 +2627,15 @@ impl PageCache {
         }
     }
 
+    /// Nonblocking revalidation for a caller holding invalidate_write.
+    /// Flush outside that lock, then reject any concurrent redirty before
+    /// discarding clean pages for direct publication.
+    pub(crate) fn has_dirty_or_writeback_pages_in_range(&self, first: usize, last: usize) -> bool {
+        let inner = self.inner.lock();
+        inner.dirty_pages.range(first..=last).next().is_some()
+            || inner.writeback_pages.range(first..=last).next().is_some()
+    }
+
     pub fn has_dirty_or_writeback_pages(&self) -> bool {
         let inner = self.inner.lock();
         !inner.dirty_pages.is_empty() || !inner.writeback_pages.is_empty()

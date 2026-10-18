@@ -254,3 +254,4 @@ normal/pipe_transfer_copy
 
 normal/pipe_transfer_state
 normal/debugfs_write_policy
+normal/direct_write_semantics

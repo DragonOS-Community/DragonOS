@@ -670,6 +670,7 @@ impl IndexNode for KernFSInode {
         offset: usize,
         len: usize,
         source: super::vfs::PrimaryWriteSource<'_, '_>,
+        _intent: crate::filesystem::vfs::WriteOperation,
         data: MutexGuard<FilePrivateData>,
         stage: &mut super::vfs::WritePrivilegeStage<'_>,
     ) -> Result<super::vfs::PrimaryWriteResult, crate::mm::allocation::MemoryAllocationError> {

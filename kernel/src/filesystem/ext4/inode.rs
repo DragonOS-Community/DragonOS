@@ -1240,7 +1240,7 @@ impl PageCacheWritebackSubmission for Ext4EagerSubmission {
         }
         let written = self
             .inode
-            .write_eager_data_admitted(offset, data, completed_end)?;
+            .write_eager_data_admitted(offset, data, completed_end, false)?;
         if written != data.len() {
             return Err(SystemError::EIO);
         }
@@ -2181,6 +2181,16 @@ impl LockedExt4Inode {
 }
 
 impl IndexNode for LockedExt4Inode {
+    fn configure_open_file(
+        &self,
+        _data: &FilePrivateData,
+        behavior: &mut crate::filesystem::vfs::file::OpenFileBehavior,
+    ) {
+        if behavior.data_file_write_checks {
+            behavior.direct_io = crate::filesystem::vfs::file::DirectIoPolicy::Native;
+        }
+    }
+
     fn link_mutation_coordinator(&self) -> Option<&LinkMutationCoordinator> {
         Some(&self.link_mutation_coordinator)
     }
@@ -2572,6 +2582,7 @@ impl IndexNode for LockedExt4Inode {
             offset,
             len,
             vfs::PrimaryWriteSource::Kernel(buf),
+            crate::filesystem::vfs::WriteOperation::USER_BUFFERED,
             data,
             context,
             stage,
@@ -2584,6 +2595,7 @@ impl IndexNode for LockedExt4Inode {
         offset: usize,
         len: usize,
         source: vfs::PrimaryWriteSource<'_, '_>,
+        operation: crate::filesystem::vfs::WriteOperation,
         data: PrivateData,
         stage: &mut vfs::WritePrivilegeStage<'_>,
     ) -> Result<vfs::PrimaryWriteResult, MemoryAllocationError> {
@@ -2591,6 +2603,7 @@ impl IndexNode for LockedExt4Inode {
             offset,
             len,
             source,
+            operation,
             data,
             &vfs::permission::InodeOpContext::legacy(),
             stage,
@@ -2602,6 +2615,7 @@ impl IndexNode for LockedExt4Inode {
         offset: usize,
         len: usize,
         source: vfs::PrimaryWriteSource<'_, '_>,
+        operation: crate::filesystem::vfs::WriteOperation,
         data: PrivateData,
         context: &vfs::permission::InodeOpContext,
         stage: &mut vfs::WritePrivilegeStage<'_>,
@@ -2620,6 +2634,24 @@ impl IndexNode for LockedExt4Inode {
         let _operation = self.begin_operation()?;
         let size_change = self.size_change_lock.read();
         self.remove_write_privileges_locked(context, stage)?;
+        if matches!(operation.io, vfs::WriteIoIntent::Direct { .. }) {
+            self.prepare_direct_write_times()?;
+            let alignment = 1usize << self.inner.lock().concret_fs().gendisk.block_size_log2();
+            operation.io.check_alignment(offset | len, alignment)?;
+            return source
+                .write_chunks(len, |relative, buffer| {
+                    let count = buffer.len() & !(alignment - 1);
+                    if count == 0 {
+                        return Err(SystemError::EFAULT.into());
+                    }
+                    self.write_direct_data_locked(
+                        offset.checked_add(relative).ok_or(SystemError::EFBIG)?,
+                        &buffer[..count],
+                    )
+                    .map_err(Into::into)
+                })
+                .map(vfs::PrimaryWriteResult::new);
+        }
         source
             .write_chunks(len, |relative, buffer| {
                 self.write_data_locked(
@@ -2686,7 +2718,8 @@ impl IndexNode for LockedExt4Inode {
             return Ok(0);
         }
         self.remove_write_privileges_locked(context, stage)?;
-        self.write_eager_data(offset, &buf[0..len])
+        self.prepare_direct_write_times()?;
+        self.write_direct_data_locked(offset, &buf[0..len])
     }
 
     fn fs(&self) -> Arc<dyn vfs::FileSystem> {
@@ -4595,6 +4628,62 @@ impl LockedExt4Inode {
         }
     }
 
+    fn prepare_direct_write_times(&self) -> Result<(), SystemError> {
+        let _io = self.io_lock.lock();
+        let inode = self
+            .inner
+            .lock()
+            .self_ref
+            .upgrade()
+            .ok_or(SystemError::ENOENT)?;
+        Ext4FileSystem::mark_inode_modified(
+            &inode,
+            PosixTimeSpec::now().tv_sec.to_u32().unwrap_or(0),
+        )
+    }
+
+    /// Publish already copied primary data. Never called by background replay.
+    /// No user access or MM operation nests under invalidate/io/metadata locks.
+    fn write_direct_data_locked(&self, offset: usize, bytes: &[u8]) -> Result<usize, SystemError> {
+        if bytes.is_empty() {
+            return Ok(0);
+        }
+        let end = offset.checked_add(bytes.len()).ok_or(SystemError::EFBIG)?;
+        let first = offset >> MMArch::PAGE_SHIFT;
+        let last = (end - 1) >> MMArch::PAGE_SHIFT;
+        let cache = self
+            .inner
+            .lock()
+            .page_cache
+            .clone()
+            .ok_or(SystemError::EIO)?;
+        let _admission = self.close_production_delalloc_admission()?;
+        loop {
+            // Eager mapper admission requires the whole delayed queue empty;
+            // an unrelated FIFO tail can otherwise block ordinary writeback.
+            self.drain_delalloc_before_eager()?;
+            self.drain_delalloc_range_before_eager(offset, bytes.len())?;
+            cache.unmap_mapping_pages(first, Some(last + 1))?;
+            let invalidate = cache.invalidate_write();
+            // A concurrent buffered writer may have dirtied a neighbouring
+            // byte of these pages since the flush. Do not discard its data.
+            if cache.has_dirty_or_writeback_pages_in_range(first, last) {
+                drop(invalidate);
+                continue;
+            }
+            match cache.try_discard_range_locked(first, last + 1)? {
+                PageCacheRangeResult::Retry(retry) => {
+                    drop(invalidate);
+                    retry.wait()?;
+                    continue;
+                }
+                PageCacheRangeResult::Ready(()) => {}
+            }
+            let _size = self.size_lock.read();
+            return self.write_eager_data_admitted(offset, bytes, end, true);
+        }
+    }
+
     /// Eager data publication shared by primary writes and background
     /// writeback. Privilege admission belongs to the primary caller only.
     fn write_eager_data(&self, offset: usize, buf: &[u8]) -> Result<usize, SystemError> {
@@ -4613,7 +4702,7 @@ impl LockedExt4Inode {
         let _operation = self.begin_operation()?;
         let _delalloc_admission = self.close_production_delalloc_admission()?;
         self.drain_delalloc_before_eager()?;
-        self.write_eager_data_admitted(offset, buf, completed_end)
+        self.write_eager_data_admitted(offset, buf, completed_end, false)
     }
 
     /// The caller keeps delayed admission closed and has established an
@@ -4624,6 +4713,7 @@ impl LockedExt4Inode {
         offset: usize,
         buf: &[u8],
         completed_end: usize,
+        allocate: bool,
     ) -> Result<usize, SystemError> {
         let _io_guard = self.io_lock.lock();
         let _metadata_commit = self.metadata_commit_lock.lock();
@@ -4640,12 +4730,18 @@ impl LockedExt4Inode {
             // Replay data without rewriting a stale extent-tree inode snapshot.
             FileType::RegularFile => {
                 let written = fs.retry_metadata_contention(|| {
-                    fs.fs.write_data_only_with_completed_end(
-                        inode_num,
-                        offset,
-                        buf,
-                        completed_end as u64,
-                    )
+                    if allocate {
+                        // Foreground DIO may initialize holes and extend EOF.
+                        fs.fs.write(inode_num, offset, buf)
+                    } else {
+                        // Background replay never acquires mapper authority.
+                        fs.fs.write_data_only_with_completed_end(
+                            inode_num,
+                            offset,
+                            buf,
+                            completed_end as u64,
+                        )
+                    }
                 })?;
                 if written > buf.len() {
                     return Err(SystemError::EIO);

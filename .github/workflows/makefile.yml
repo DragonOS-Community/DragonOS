@@ -12,6 +12,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       kernel_changed: ${{ steps.filter.outputs.kernel }}
+      ext4_tool_changed: ${{ steps.filter.outputs.ext4_tool }}
     steps:
       - uses: actions/checkout@v3
         with:
@@ -23,6 +24,40 @@ jobs:
           filters: |
             kernel:
               - 'kernel/**'
+            ext4_tool:
+              - 'kernel/crates/another_ext4/**'
+              - '.github/workflows/makefile.yml'
+
+  ext4-fuse-test:
+    name: Ext4 host FUSE xattr regression
+    env:
+      CARGO_HOME: /root/.cargo
+      RUSTUP_HOME: /root/.rustup
+    needs: changes
+    if: needs.changes.outputs.ext4_tool_changed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    container:
+      image: dragonos/dragonos-dev:v1.24
+      options: --privileged -v /dev:/dev -v /lib/modules:/lib/modules:ro
+    steps:
+      - uses: actions/checkout@v3
+      - name: Change source
+        run: |
+          find . -type f \( -name "*.toml" -o -name "Makefile" \) -exec sed -i 's/git\.mirrors\.dragonos\.org\.cn/github\.com/g' {} +
+      - name: Prepare host FUSE
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends fuse3 kmod e2fsprogs python3
+          modprobe fuse
+          test -c /dev/fuse
+      - name: Build and test the host adapter
+        shell: bash -ileo pipefail {0}
+        run: |
+          source /root/.cargo/env
+          cargo build --manifest-path kernel/crates/another_ext4/ext4_fuse/Cargo.toml --locked --release --target-dir bin/ext4-fuse-build
+          mkdir -p bin/ext4-fuse-ci
+          python3 kernel/crates/another_ext4/ext4_fuse/tests/xattr_flags.py "$PWD/bin/ext4-fuse-build/release/ext4_fuse" "$PWD/bin/ext4-fuse-ci"
 
   sysconfig-payload-test:
     name: Sysconfig payload generator test

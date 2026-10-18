@@ -1757,6 +1757,9 @@ impl IndexNode for LockedTmpfsInode {
     }
 
     fn configure_open_file(&self, _data: &FilePrivateData, behavior: &mut OpenFileBehavior) {
+        if behavior.data_file_write_checks {
+            behavior.direct_io = crate::filesystem::vfs::file::DirectIoPolicy::Buffered;
+        }
         behavior.post_write_sync = PostWriteSyncPolicy::NotApplicable;
     }
 
@@ -2029,6 +2032,7 @@ impl IndexNode for LockedTmpfsInode {
             offset,
             len,
             super::vfs::PrimaryWriteSource::Kernel(buf),
+            crate::filesystem::vfs::WriteOperation::USER_BUFFERED,
             data,
             context,
             stage,
@@ -2041,6 +2045,7 @@ impl IndexNode for LockedTmpfsInode {
         offset: usize,
         len: usize,
         source: super::vfs::PrimaryWriteSource<'_, '_>,
+        operation: crate::filesystem::vfs::WriteOperation,
         data: MutexGuard<FilePrivateData>,
         stage: &mut super::vfs::WritePrivilegeStage<'_>,
     ) -> Result<super::vfs::PrimaryWriteResult, crate::mm::allocation::MemoryAllocationError> {
@@ -2048,6 +2053,7 @@ impl IndexNode for LockedTmpfsInode {
             offset,
             len,
             source,
+            operation,
             data,
             &super::vfs::permission::InodeOpContext::legacy(),
             stage,
@@ -2059,6 +2065,7 @@ impl IndexNode for LockedTmpfsInode {
         offset: usize,
         len: usize,
         source: super::vfs::PrimaryWriteSource<'_, '_>,
+        _intent: crate::filesystem::vfs::WriteOperation,
         _data: MutexGuard<FilePrivateData>,
         context: &super::vfs::permission::InodeOpContext,
         stage: &mut super::vfs::WritePrivilegeStage<'_>,

@@ -971,6 +971,34 @@ impl Ext4FileSystem {
         Self::mark_inode_dirty_with(inode, dirty, |_| {})
     }
 
+    /// Primary file_modified time publication, before user faults or DIO
+    /// alignment errors. Background data replay must not call this.
+    pub(super) fn mark_inode_modified(
+        inode: &Arc<LockedExt4Inode>,
+        time: u32,
+    ) -> Result<(), SystemError> {
+        Self::mark_inode_dirty_if(
+            inode,
+            InodeDirtyState::MTIME_DIRTY | InodeDirtyState::CTIME_DIRTY,
+            |_| true,
+            |guard| {
+                let mtime = guard
+                    .cached_mtime_version
+                    .checked_add(1)
+                    .ok_or(SystemError::EOVERFLOW)?;
+                let ctime = guard
+                    .cached_ctime_version
+                    .checked_add(1)
+                    .ok_or(SystemError::EOVERFLOW)?;
+                guard.cached_times.mtime = time;
+                guard.cached_times.ctime = time;
+                guard.cached_mtime_version = mtime;
+                guard.cached_ctime_version = ctime;
+                Ok(())
+            },
+        )
+    }
+
     pub(super) fn mark_inode_atime_dirty(
         inode: &Arc<LockedExt4Inode>,
         atime: u32,

@@ -563,6 +563,9 @@ impl IndexNode for OvlInode {
     }
 
     fn configure_open_file(&self, _data: &FilePrivateData, behavior: &mut OpenFileBehavior) {
+        if behavior.data_file_write_checks {
+            behavior.direct_io = crate::filesystem::vfs::file::DirectIoPolicy::OwnerManaged;
+        }
         if self.file_type == FileType::File {
             behavior.post_write_sync = PostWriteSyncPolicy::Delegated;
         }
@@ -622,11 +625,21 @@ impl IndexNode for OvlInode {
         offset: usize,
         len: usize,
         source: vfs::PrimaryWriteSource<'_, '_>,
+        operation: crate::filesystem::vfs::WriteOperation,
         sync_intent: vfs::WriteSyncIntent,
         data: crate::libs::mutex::MutexGuard<vfs::FilePrivateData>,
         stage: &mut vfs::WritePrivilegeStage<'_>,
     ) -> Result<vfs::DelegatedWriteResult, crate::mm::allocation::MemoryAllocationError> {
-        file::write_primary_with_sync(self, offset, len, source, sync_intent, data, stage)
+        file::write_primary_with_sync(
+            self,
+            offset,
+            len,
+            source,
+            operation,
+            sync_intent,
+            data,
+            stage,
+        )
     }
 
     fn sync_file(

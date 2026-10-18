@@ -40,7 +40,7 @@ use super::{
     protocol::{
         fuse_pack_struct, fuse_read_struct, FuseAttr, FuseAttrOut, FuseEntryOut, FuseGetattrIn,
         FuseWriteIn, FuseWriteOut, FUSE_GETATTR, FUSE_GETATTR_FH, FUSE_ROOT_ID, FUSE_WRITE,
-        FUSE_WRITE_LOCKOWNER,
+        FUSE_WRITE_KILL_SUIDGID, FUSE_WRITE_LOCKOWNER,
     },
 };
 
@@ -1110,11 +1110,7 @@ impl FuseNode {
                 fh: private.fh,
                 offset: current as u64,
                 size: chunk as u32,
-                write_flags: if lock_owner != 0 {
-                    FUSE_WRITE_LOCKOWNER
-                } else {
-                    0
-                },
+                write_flags: Self::direct_write_flags(lock_owner),
                 lock_owner,
                 flags: private.open_flags,
                 padding: 0,
@@ -1123,17 +1119,24 @@ impl FuseNode {
                 .checked_add(chunk)
                 .ok_or(SystemError::EOVERFLOW)?;
             let mut request = Vec::new();
-            request
-                .try_reserve_exact(payload_len)
-                .map_err(|_| SystemError::ENOMEM)?;
+            if request.try_reserve_exact(payload_len).is_err() {
+                return if done == 0 {
+                    Err(SystemError::ENOMEM)
+                } else {
+                    Ok(done)
+                };
+            }
             request.extend_from_slice(fuse_pack_struct(&input));
             request.extend_from_slice(&buf[done..done + chunk]);
-            let payload = match self.conn.request(FUSE_WRITE, self.nodeid, &request) {
-                Ok(payload) => payload,
+            let output: FuseWriteOut = match self
+                .conn
+                .request(FUSE_WRITE, self.nodeid, &request)
+                .and_then(|payload| fuse_read_struct(&payload))
+            {
+                Ok(output) => output,
                 Err(error) if done == 0 => return Err(error),
                 Err(_) => return Ok(done),
             };
-            let output: FuseWriteOut = fuse_read_struct(&payload)?;
             let wrote = output.size as usize;
             if wrote > chunk {
                 return if done == 0 {
@@ -1143,6 +1146,9 @@ impl FuseNode {
                 };
             }
             self.note_successful_write(current, wrote)?;
+            if wrote != 0 {
+                self.expire_attributes_after_daemon_write();
+            }
             done += wrote;
             if wrote < chunk {
                 break;
@@ -1570,6 +1576,26 @@ impl FuseNode {
             request_epoch,
             out.attr.flags,
         ))
+    }
+
+    /// Direct-I/O WRITE flags describe the primary caller, including DAX
+    /// growth fallback. Background WRITE_CACHE requests must not use them.
+    fn direct_write_flags(lock_owner: u64) -> u32 {
+        let mut flags = if lock_owner == 0 {
+            0
+        } else {
+            FUSE_WRITE_LOCKOWNER
+        };
+        if !crate::process::ProcessManager::current_pcb()
+            .cred()
+            .has_capability_in_ns(
+                &crate::process::namespace::user_namespace::INIT_USER_NAMESPACE,
+                crate::process::cred::CAPFlags::CAP_FSETID,
+            )
+        {
+            flags |= FUSE_WRITE_KILL_SUIDGID;
+        }
+        flags
     }
 
     fn fetch_attr(&self) -> Result<Metadata, SystemError> {

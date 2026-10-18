@@ -1126,6 +1126,11 @@ impl FuseNode {
             {
                 return Err(SystemError::ESTALE);
             }
+            if self.conn().has_init_flag(FUSE_HANDLE_KILLPRIV) {
+                // Background I/O has no primary note_successful_write fence.
+                self.bump_attr_version();
+                self.expire_attributes_after_daemon_write();
+            }
             total += chunk;
         }
 
@@ -2129,6 +2134,11 @@ impl FuseNode {
         page_cache
             .manager()
             .wait_writeback_range(start_page_index, end_page_index)
+    }
+
+    pub(super) fn expire_attributes_after_daemon_write(&self) {
+        self.cached_metadata_deadline_ticks
+            .store(0, Ordering::Release);
     }
 
     pub(super) fn note_successful_write(

@@ -110,6 +110,7 @@ pub const FOPEN_PARALLEL_DIRECT_WRITES: u32 = 1 << 6;
 // fuse_write_in.write_flags (Linux 6.6 uapi subset)
 pub const FUSE_WRITE_CACHE: u32 = 1 << 0;
 pub const FUSE_WRITE_LOCKOWNER: u32 = 1 << 1;
+pub const FUSE_WRITE_KILL_SUIDGID: u32 = 1 << 2;
 
 // fuse_read_in.read_flags (Linux 6.6 uapi subset)
 pub const FUSE_READ_LOCKOWNER: u32 = 1 << 1;

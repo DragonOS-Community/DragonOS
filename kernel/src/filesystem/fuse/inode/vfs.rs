@@ -35,12 +35,135 @@ use super::super::{
         FUSE_LISTXATTR, FUSE_LOOKUP, FUSE_MKDIR, FUSE_MKNOD, FUSE_OPEN, FUSE_OPENDIR, FUSE_READDIR,
         FUSE_READDIRPLUS, FUSE_READLINK, FUSE_RELEASE, FUSE_RELEASEDIR, FUSE_REMOVEXATTR,
         FUSE_RENAME, FUSE_RENAME2, FUSE_RMDIR, FUSE_SETATTR, FUSE_SETXATTR, FUSE_SYMLINK,
-        FUSE_UNLINK, FUSE_WRITE, FUSE_WRITEBACK_CACHE, FUSE_WRITE_LOCKOWNER,
+        FUSE_UNLINK, FUSE_WRITE, FUSE_WRITEBACK_CACHE,
     },
 };
 use super::FuseNode;
 
 impl FuseNode {
+    /// Called under setattr_lock by both public xattr removal and primary writes.
+    fn removexattr_locked(
+        &self,
+        name: &[u8],
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        self.check_not_stale()?;
+        if self.conn.no_xattr(FUSE_REMOVEXATTR) {
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP.into());
+        }
+        match self.request_name_bytes(FUSE_REMOVEXATTR, self.nodeid, name) {
+            Ok(_) => Ok(0),
+            Err(SystemError::ENOSYS) => Err(self.fuse_xattr_unsupported(FUSE_REMOVEXATTR).into()),
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    /// The caller holds setattr_lock across this stage and primary data I/O.
+    /// Do not call public metadata setters here: they acquire that same lock.
+    fn remove_write_privileges_locked(
+        &self,
+        stage: &mut crate::filesystem::vfs::WritePrivilegeStage<'_>,
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        let metadata = self.cached_or_fetch_metadata()?;
+        let context = crate::filesystem::vfs::permission::InodeOpContext::legacy();
+        let remove_mode = context.cred.as_ref().is_some_and(|cred| {
+            crate::filesystem::vfs::vcore::prepare_write_side_effect_metadata_with_cred(
+                metadata.clone(),
+                metadata.size.max(0) as usize,
+                cred,
+            )
+            .1
+            .contains(SetMetadataMask::MODE)
+        });
+        // Linux commoncap treats a nonpositive GETXATTR (including errors) as
+        // no capability. Only a real removal error can reject this write.
+        let remove_capability = self
+            .getxattr(b"security.capability", &mut [])
+            .is_ok_and(|size| size > 0);
+        if !remove_mode && !remove_capability {
+            stage.complete();
+            return Ok(());
+        }
+        // notify_change rechecks ATTR_KILL_PRIV before entering fuse_setattr.
+        let remove_capability = remove_capability
+            && self
+                .getxattr(b"security.capability", &mut [])
+                .is_ok_and(|size| size > 0);
+        let daemon_handles_mode = self.conn().has_init_flag(FUSE_HANDLE_KILLPRIV);
+        let mut mode = metadata.mode;
+        let mut valid = 0;
+        if remove_mode && !daemon_handles_mode {
+            // fuse_setattr recalculates automatic mode removal from fresh
+            // daemon attributes, retaining non-executable SGID.
+            mode = self.fetch_attr()?.mode;
+            let previous = mode;
+            mode.remove(InodeMode::S_ISUID);
+            if mode.contains(InodeMode::S_IXGRP) {
+                mode.remove(InodeMode::S_ISGID);
+            }
+            if mode != previous {
+                valid = FATTR_MODE;
+            }
+        }
+        if remove_capability {
+            match self.removexattr_locked(b"security.capability") {
+                Ok(_)
+                | Err(crate::mm::allocation::MemoryAllocationError::System(
+                    SystemError::EOPNOTSUPP_OR_ENOTSUP,
+                )) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        // Non-truncate MODE changes drain existing dirty data before SETATTR.
+        // Release this exclusion before faulting in any user source mapping.
+        let drain = valid != 0 && self.conn().has_init_flag(FUSE_WRITEBACK_CACHE);
+        if drain {
+            self.sync_dirty_cached_pages()?;
+        }
+        let barrier = drain.then(|| self.writeback_barrier.write());
+        if let Some(barrier) = barrier.as_ref() {
+            self.sync_dirty_cached_pages_admitted(barrier)?;
+        }
+        let input = FuseSetattrIn {
+            valid,
+            padding: 0,
+            fh: 0,
+            size: 0,
+            lock_owner: 0,
+            atime: 0,
+            mtime: 0,
+            ctime: 0,
+            atimensec: 0,
+            mtimensec: 0,
+            ctimensec: 0,
+            mode: mode.bits(),
+            unused4: 0,
+            uid: 0,
+            gid: 0,
+            unused5: 0,
+        };
+        let epoch = self.attr_version();
+        let payload = self
+            .conn()
+            .request(FUSE_SETATTR, self.nodeid, fuse_pack_struct(&input))?;
+        let output: FuseAttrOut = fuse_read_struct(&payload)?;
+        // In writeback mode the daemon may still report an older EOF/cmtime.
+        self.merge_cached_metadata_from_daemon(
+            Self::attr_to_metadata(&output.attr),
+            output.attr_valid,
+            output.attr_valid_nsec,
+            epoch,
+            output.attr.flags,
+        );
+        drop(barrier);
+        stage.complete();
+        // notify_change snapshots this mask before fuse_setattr strips MODE
+        // for a HANDLE_KILLPRIV daemon. Capability removal alone is silent.
+        if remove_mode {
+            stage.commit_attrib();
+        }
+        Ok(())
+    }
+
     fn write_with_open(
         &self,
         offset: usize,
@@ -167,10 +290,10 @@ impl FuseNode {
                 fh,
                 offset: chunk_offset as u64,
                 size: chunk as u32,
-                write_flags: if lock_owner != 0 {
-                    FUSE_WRITE_LOCKOWNER
-                } else {
+                write_flags: if cached_write {
                     0
+                } else {
+                    Self::direct_write_flags(lock_owner)
                 },
                 lock_owner,
                 flags: file_flags,
@@ -179,8 +302,15 @@ impl FuseNode {
             let mut payload_in = Vec::with_capacity(size_of::<FuseWriteIn>() + chunk);
             payload_in.extend_from_slice(fuse_pack_struct(&write_in));
             payload_in.extend_from_slice(&buf[total_written..total_written + chunk]);
-            let payload = self.conn().request(FUSE_WRITE, self.nodeid, &payload_in)?;
-            let out: FuseWriteOut = fuse_read_struct(&payload)?;
+            let out: FuseWriteOut = match self
+                .conn()
+                .request(FUSE_WRITE, self.nodeid, &payload_in)
+                .and_then(|payload| fuse_read_struct(&payload))
+            {
+                Ok(out) => out,
+                Err(_) if total_written != 0 => break,
+                Err(error) => return Err(error.into()),
+            };
             if out.size as usize > chunk {
                 return if total_written > 0 {
                     Ok(total_written)
@@ -190,6 +320,9 @@ impl FuseNode {
             }
             let wrote = out.size as usize;
             self.note_successful_write(chunk_offset, wrote)?;
+            if wrote != 0 && (!cached_write || self.conn().has_init_flag(FUSE_HANDLE_KILLPRIV)) {
+                self.expire_attributes_after_daemon_write();
+            }
             let cache_result = if cached_write {
                 if let Some(page_cache) = cached_page_cache.as_ref() {
                     self.update_cached_pages_after_write(
@@ -369,6 +502,7 @@ impl IndexNode for FuseNode {
         value: &[u8],
         flags: XattrFlags,
     ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        let _setattr_guard = self.setattr_lock.lock();
         self.check_not_stale()?;
         if self.conn.no_xattr(FUSE_SETXATTR) {
             return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP.into());
@@ -428,15 +562,8 @@ impl IndexNode for FuseNode {
         &self,
         name: &[u8],
     ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
-        self.check_not_stale()?;
-        if self.conn.no_xattr(FUSE_REMOVEXATTR) {
-            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP.into());
-        }
-        match self.request_name_bytes(FUSE_REMOVEXATTR, self.nodeid, name) {
-            Ok(_) => Ok(0),
-            Err(SystemError::ENOSYS) => Err(self.fuse_xattr_unsupported(FUSE_REMOVEXATTR).into()),
-            Err(err) => Err(err.into()),
-        }
+        let _setattr_guard = self.setattr_lock.lock();
+        self.removexattr_locked(name)
     }
 
     fn resize_open_truncate(
@@ -667,13 +794,31 @@ impl IndexNode for FuseNode {
         .map(|result| result.written_len)
     }
 
+    fn write_at_with_privilege_stage(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &[u8],
+        data: MutexGuard<FilePrivateData>,
+        stage: &mut crate::filesystem::vfs::WritePrivilegeStage<'_>,
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        self.write_primary_with_privilege_stage(
+            offset,
+            len,
+            crate::filesystem::vfs::PrimaryWriteSource::Kernel(buf),
+            data,
+            stage,
+        )
+        .map(|result| result.written_len)
+    }
+
     fn write_primary_with_privilege_stage(
         &self,
         offset: usize,
         len: usize,
         source: crate::filesystem::vfs::PrimaryWriteSource<'_, '_>,
         data: MutexGuard<FilePrivateData>,
-        _stage: &mut crate::filesystem::vfs::WritePrivilegeStage<'_>,
+        stage: &mut crate::filesystem::vfs::WritePrivilegeStage<'_>,
     ) -> Result<
         crate::filesystem::vfs::PrimaryWriteResult,
         crate::mm::allocation::MemoryAllocationError,
@@ -696,9 +841,14 @@ impl IndexNode for FuseNode {
         // source mapping of this same inode can still be faulted in.
         let _inode_write = self.setattr_lock.lock();
         if len == 0 {
-            return self
-                .write_with_open(offset, 0, &[], &private_data, &owner, &creator)
-                .map(crate::filesystem::vfs::PrimaryWriteResult::new);
+            return Ok(crate::filesystem::vfs::PrimaryWriteResult::new(0));
+        }
+        if self.dax_active() || private_data.fopen_flags & FOPEN_DIRECT_IO == 0 {
+            self.remove_write_privileges_locked(stage)?;
+        } else {
+            // FOPEN_DIRECT_IO delegates privilege removal to WRITE after user
+            // pages are copied; File must not run a second MODE transaction.
+            stage.complete();
         }
         source
             .write_chunks(len, |relative, bytes| {
@@ -713,8 +863,6 @@ impl IndexNode for FuseNode {
                 )
             })
             .map(crate::filesystem::vfs::PrimaryWriteResult::new)
-        // Privilege finalization remains in File after the inode guard exits.
-        // Marking the stage handled here would recurse into SETATTR.
     }
 
     fn metadata(&self) -> Result<Metadata, SystemError> {

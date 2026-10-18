@@ -47,6 +47,7 @@ jobs:
           normal/shared_file_position
           normal/read_fault_semantics
           normal/fuse_read_fault
+          normal/fuse_write_privileges
           normal/read_buffer_selftest
           normal/allocation_diagnostics
           normal/dma_allocator_selftest

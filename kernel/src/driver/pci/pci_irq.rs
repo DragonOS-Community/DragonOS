@@ -603,6 +603,18 @@ pub trait PciInterrupt: PciDeviceStructure {
                         volwrite!(msix_entry, msg_upper_addr, 0);
                         volwrite!(msix_entry, msg_addr, msg_address);
                     }
+                    // 全局使能后再对表项做一次 mask->unmask 翻转。
+                    //
+                    // 部分 VMM（如 Cloud Hypervisor 系）只在“全局已使能且表项
+                    // 未掩蔽”的表项写入上建立 KVM MSI 路由；若表项在使能前写入，
+                    // 该次写入的路由更新会被跳过，而之后单独置起全局使能位也不
+                    // 会回溯补建，中断将永远无法投递。Linux 的顺序是先全局使能、
+                    // 再解除表项掩码，这里用同样的可观察行为完成路由建立。
+                    self.irq_enable(true)?;
+                    unsafe {
+                        volwrite!(msix_entry, vector_control, 1);
+                        volwrite!(msix_entry, vector_control, 0);
+                    }
                     return Ok(0);
                 }
                 IrqType::Unused => {

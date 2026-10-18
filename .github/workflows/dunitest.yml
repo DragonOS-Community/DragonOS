@@ -44,6 +44,7 @@ jobs:
           normal/xattr_syscall_selftest
           normal/xattr_syscall
           normal/read_buffer_semantics
+          normal/ext4_user_read
           normal/shared_file_position
           normal/read_fault_semantics
           normal/fuse_read_fault

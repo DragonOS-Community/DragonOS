@@ -1541,6 +1541,34 @@ pub unsafe fn copy_to_user_prefix_protected(
     }
 }
 
+/// Copy an output prefix without resolving user faults or acquiring MM locks.
+///
+/// This may be used while a source page is locked. An inaccessible destination
+/// stops the copy and leaves any successfully written prefix committed; callers
+/// must release their source locks before retrying the remainder with the normal
+/// faulting copy API.
+///
+/// # Safety
+/// `dest` must designate userspace; accesses are exception-table protected.
+pub(crate) unsafe fn copy_to_user_prefix_nofault(
+    dest: VirtAddr,
+    src: &[u8],
+) -> Result<usize, SystemError> {
+    if src.is_empty() {
+        return Ok(0);
+    }
+    access_ok(dest, src.len()).map_err(|_| SystemError::EFAULT)?;
+    let _no_fault = crate::process::preempt::PageFaultDisabledGuard::new();
+    let remaining =
+        MMArch::copy_with_exception_table(dest.data() as *mut u8, src.as_ptr(), src.len());
+    let copied = src.len().saturating_sub(remaining);
+    if copied == 0 {
+        Err(SystemError::EFAULT)
+    } else {
+        Ok(copied)
+    }
+}
+
 /// Write a single `Copy` value to user space with exception-table protection.
 pub unsafe fn write_one_to_user_protected<T: Copy>(
     dest: VirtAddr,

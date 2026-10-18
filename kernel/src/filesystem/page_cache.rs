@@ -912,6 +912,45 @@ pub struct CopyItem {
     created: bool,
 }
 
+const READ_USER_BATCH_PAGES: usize = 16;
+
+/// Pins for one bounded user read. No inode operation, invalidation guard or
+/// page lock survives preparation; consuming the batch releases every pin.
+#[derive(Default)]
+pub(crate) struct ReadUserBatch {
+    items: [Option<CopyItem>; READ_USER_BATCH_PAGES],
+    len: usize,
+}
+
+impl ReadUserBatch {
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Attempt the resident destination fast path. The caller may fault or
+    /// recover only after this consumes the batch and drops all remaining pins.
+    pub(crate) fn copy_nofault(
+        self,
+        writer: &mut crate::syscall::user_buffer::UserBuffer<'_>,
+        dst_offset: usize,
+    ) -> usize {
+        let mut copied = 0;
+        for item in self.items.into_iter().flatten() {
+            let page = item.entry.page.read();
+            let source =
+                unsafe { &page.as_slice()[item.page_offset..item.page_offset + item.sub_len] };
+            let n = writer
+                .write_prefix_to_user_nofault(dst_offset + copied, source)
+                .unwrap_or(0);
+            copied += n;
+            if n != item.sub_len {
+                break;
+            }
+        }
+        copied
+    }
+}
+
 /// Own write preparation until publication, including its failure cleanup.
 /// Page locks and dirty reservations must be dropped before this owner.
 struct PreparedWriteCopies<'a> {
@@ -2950,7 +2989,7 @@ impl PageCache {
             .map_err(Self::legacy_allocation_error)
     }
 
-    pub(crate) fn legacy_allocation_error(error: MemoryAllocationError) -> SystemError {
+    fn legacy_allocation_error(error: MemoryAllocationError) -> SystemError {
         match error {
             MemoryAllocationError::Charge(_) => SystemError::ENOMEM,
             MemoryAllocationError::System(error) => error,
@@ -4386,134 +4425,83 @@ impl PageCache {
         Ok(ret)
     }
 
-    /// 两阶段直读用户：与 `try_read` 相同的失效保护与收集协议，但解锁后
-    /// 逐页把数据直接拷入受保护的用户缓冲区，省去内核弹跳缓冲的一次
-    /// 中转拷贝。用户侧拷贝走异常表保护；中途缺页时返回已拷贝字节数
-    /// （Linux read 的部分 EFAULT 语义由 `write_prefix_to_user` 保证），
-    /// 一个字节都没拷到时向上报告 EFAULT。
-    pub(crate) fn try_read_user(
+    /// Prepare one bounded, ordered cache window without touching userspace.
+    /// Allocation and backend failures retain their typed recovery information.
+    pub(crate) fn prepare_read_user_batch(
         &self,
         offset: usize,
         len: usize,
-        writer: &mut crate::syscall::user_buffer::UserBuffer<'_>,
         owner: &Arc<MemoryAccount>,
         creator: &Arc<ObjectAccount>,
-    ) -> Result<usize, MemoryAllocationError> {
-        // 与 try_read 一致：持 invalidate 读锁收集页 pin，松锁后再触碰
-        // 用户地址——用户拷贝触发缺页时可能需要这条映射。
-        let invalidate = self.invalidate_read();
-        let inode = self
-            .inode()
-            .and_then(|inode| inode.upgrade())
-            .ok_or(SystemError::EIO)?;
-        let file_size = inode.metadata()?.size;
-
-        let len = if offset < file_size as usize {
-            core::cmp::min(file_size as usize, offset + len) - offset
-        } else {
-            0
-        };
-        let len = core::cmp::min(len, writer.len());
-        if len == 0 {
-            return Ok(0);
-        }
-
-        let start_page_index = offset >> MMArch::PAGE_SHIFT;
-        let end_page_index = (offset + len - 1) >> MMArch::PAGE_SHIFT;
-
-        // 单锁批量收集：热路径（页已缓存且 Ready）在持有一次 inner 锁的
-        // 情况下逐页 pin，避免每页两次全局 Mutex。缺失或未就绪的页记入
-        // slow 队列，锁外走原有的逐页慢路径（含后端填充与等待）。
-        let page_count = end_page_index - start_page_index + 1;
-        let mut items: Vec<(usize, CopyItem)> = Vec::new();
-        items
-            .try_reserve_exact(page_count)
-            .map_err(|_| SystemError::ENOMEM)?;
-        let mut slow: Vec<usize> = Vec::new();
-        {
-            let guard = self.inner.lock();
-            for page_index in start_page_index..=end_page_index {
-                let page_start = page_index * MMArch::PAGE_SIZE;
-                let page_end = page_start + MMArch::PAGE_SIZE;
-                let read_start = core::cmp::max(offset, page_start);
-                let read_end = core::cmp::min(offset + len, page_end);
-                let page_read_len = read_end.saturating_sub(read_start);
-                if page_read_len == 0 {
-                    continue;
-                }
-                match guard.get_entry(page_index) {
-                    Some(entry) if entry.state().is_ready() => {
-                        let pin = entry.pin();
-                        items.push((
-                            page_index,
-                            CopyItem {
-                                entry,
-                                _pin: pin,
-                                page_index,
-                                page_offset: read_start - page_start,
-                                sub_len: page_read_len,
-                                created: false,
-                            },
-                        ));
-                    }
-                    _ => slow.push(page_index),
-                }
+    ) -> Result<ReadUserBatch, MemoryAllocationError> {
+        let mut wait_first = false;
+        loop {
+            let invalidate = self.invalidate_read();
+            let inode = self
+                .inode()
+                .and_then(|inode| inode.upgrade())
+                .ok_or(SystemError::EIO)?;
+            let file_size = inode.metadata()?.size.max(0) as usize;
+            let page_offset = offset & MMArch::PAGE_OFFSET_MASK;
+            let len = len
+                .min(file_size.saturating_sub(offset))
+                .min(READ_USER_BATCH_PAGES * MMArch::PAGE_SIZE - page_offset);
+            let mut batch = ReadUserBatch::default();
+            if len == 0 {
+                return Ok(batch);
             }
-        }
-        for page_index in slow {
-            let page_start = page_index * MMArch::PAGE_SIZE;
-            let page_end = page_start + MMArch::PAGE_SIZE;
-            let read_start = core::cmp::max(offset, page_start);
-            let read_end = core::cmp::min(offset + len, page_end);
-            let (entry, pin, _) =
-                self.try_get_or_create_entry_pinned(page_index, true, owner, creator)?;
-            items.push((
-                page_index,
-                CopyItem {
-                    entry,
-                    _pin: pin,
-                    page_index,
-                    page_offset: read_start - page_start,
-                    sub_len: read_end.saturating_sub(read_start),
-                    created: false,
-                },
-            ));
-        }
-        // 热路径与慢路径分两段收集，按页索引重排保证拷贝顺序与文件偏移一致。
-        items.sort_unstable_by_key(|(index, _)| *index);
-        let mut copies: Vec<CopyItem> = Vec::new();
-        copies.try_reserve_exact(items.len()).map_err(|_| SystemError::ENOMEM)?;
-        for (_, item) in items {
-            copies.push(item);
-        }
-
-        drop(invalidate);
-        let mut dst_offset = 0;
-        let mut faulted = false;
-        for item in copies {
-            let page_guard = item.entry.page.read();
-            let src = unsafe {
-                &page_guard.as_slice()[item.page_offset..item.page_offset + item.sub_len]
+            let first_index = offset >> MMArch::PAGE_SHIFT;
+            // After submitting a cold window, wait for its first page while
+            // excluding invalidation. Its temporary pin also prevents reclaim
+            // from removing it before the single-lock collection below.
+            let first = if wait_first {
+                Some(self.try_get_or_create_entry_pinned(first_index, true, owner, creator)?)
+            } else {
+                None
             };
-            match writer.write_prefix_to_user(dst_offset, src) {
-                Ok(n) => {
-                    dst_offset += n;
-                    if n < item.sub_len {
-                        faulted = true;
+            {
+                let inner = self.inner.lock();
+                for (slot, item) in batch.items.iter_mut().enumerate() {
+                    let page_index = first_index + slot;
+                    let Some(entry) = inner.get_entry(page_index) else {
+                        break;
+                    };
+                    if !entry.state().is_ready() {
+                        break;
+                    }
+                    let within_page = if slot == 0 { page_offset } else { 0 };
+                    let sub_len = (MMArch::PAGE_SIZE - within_page).min(len - batch.len);
+                    let pin = entry.pin();
+                    *item = Some(CopyItem {
+                        entry,
+                        _pin: pin,
+                        page_index,
+                        page_offset: within_page,
+                        sub_len,
+                        created: false,
+                    });
+                    batch.len += sub_len;
+                    if batch.len == len {
                         break;
                     }
                 }
-                Err(_) => {
-                    faulted = true;
-                    break;
-                }
             }
+            drop(first);
+            drop(invalidate);
+            if batch.len != 0 {
+                return Ok(batch);
+            }
+            // No pins or mapping guards cross the backend/recovery boundary.
+            // Existing backend batching supplies the cold window; a ready
+            // prefix is delivered immediately instead of waiting for its tail.
+            self.try_read_pages(
+                first_index,
+                (page_offset + len).div_ceil(MMArch::PAGE_SIZE),
+                owner,
+                creator,
+            )?;
+            wait_first = true;
         }
-
-        if dst_offset == 0 && faulted {
-            return Err(SystemError::EFAULT.into());
-        }
-        Ok(dst_offset)
     }
 
     pub fn write(&self, offset: usize, buf: &[u8]) -> Result<usize, SystemError> {

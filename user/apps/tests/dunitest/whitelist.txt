@@ -258,3 +258,5 @@ normal/direct_write_semantics
 
 normal/recvmsg_record_buffer
 normal/tcp_receive_window_reopen
+
+normal/ext4_user_read

@@ -2082,6 +2082,24 @@ impl File {
         if writer.len() < len {
             return Err(SystemError::ENOBUFS);
         }
+        // Native direct I/O must retain read_backing/read_direct dispatch.
+        if self.file_type == FileType::Dir
+            || (self.flags().contains(FileFlags::O_DIRECT)
+                && self.direct_io == DirectIoPolicy::Native)
+        {
+            return Ok(None);
+        }
+        // A zero-count regular read must not perform backend work or atime
+        // completion. Scalar record owners keep their own zero-count contract.
+        if self.file_type == FileType::File && len == 0 {
+            return Ok(Some(0));
+        }
+        if self.file_type == FileType::File
+            && len != 0
+            && self.user_read_mode() == super::UserReadMode::Iterator
+        {
+            self.file_readahead(offset, len.min(super::read_buffer::MAX_CHUNK))?;
+        }
         let Some(read_len) =
             self.inode
                 .read_user_at(offset, len, writer, self.private_data.lock())?
@@ -2095,7 +2113,16 @@ impl File {
 
     #[inline]
     pub fn user_read_mode(&self) -> super::UserReadMode {
-        self.inode.user_read_mode()
+        // Direct I/O and generic directory reads keep their existing backing
+        // operation even when an inode also offers a cached-user iterator.
+        if self.file_type == FileType::Dir
+            || (self.flags().contains(FileFlags::O_DIRECT)
+                && self.direct_io == DirectIoPolicy::Native)
+        {
+            super::UserReadMode::Buffered
+        } else {
+            self.inode.user_read_mode()
+        }
     }
 
     pub(crate) fn supports_read_iter_flags(&self) -> bool {
@@ -2540,6 +2567,12 @@ impl File {
         buf: &mut [u8],
     ) -> Result<usize, MemoryAllocationError> {
         self.readable()?;
+        // generic_read_dir is a file operation, not a page-cache read. In
+        // particular a mounted ext4 root must not turn its backend EISDIR
+        // into a failed cache entry and then EIO.
+        if self.file_type == FileType::Dir {
+            return Err(SystemError::EISDIR.into());
+        }
         // Linux/POSIX: count==0 must not touch the buffer and must not block.
         if len == 0 {
             return Ok(0);

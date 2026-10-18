@@ -100,6 +100,7 @@ TEST(PageCacheAccounting, MembershipLifecycleIsBalanced) {
     EXPECT_NE(std::string::npos, report.find("memcg_reclaim=ok\n")) << report;
     EXPECT_NE(std::string::npos, report.find("memcg_reclaim_scan_budget=ok\n")) << report;
     EXPECT_NE(std::string::npos, report.find("fault_cache_snapshot=ok\n")) << report;
+    EXPECT_NE(std::string::npos, report.find("read_user_batch=ok\n")) << report;
     EXPECT_NE(std::string::npos, report.find("status=ok\n")) << report;
     EXPECT_NE(std::string::npos, report.find("file_membership=ok\n")) << report;
     EXPECT_NE(std::string::npos, report.find("shmem_membership=ok\n")) << report;

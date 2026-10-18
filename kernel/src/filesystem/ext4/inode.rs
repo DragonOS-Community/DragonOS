@@ -2504,6 +2504,98 @@ impl IndexNode for LockedExt4Inode {
         }
     }
 
+    fn user_read_mode(&self) -> vfs::UserReadMode {
+        if self.inner.lock().page_cache.is_some() {
+            vfs::UserReadMode::Iterator
+        } else {
+            vfs::UserReadMode::Buffered
+        }
+    }
+
+    /// Copy resident cache pages directly, using one lazy page of scratch only
+    /// when the destination needs a fault. Recovery never replays a user copy.
+    fn read_user_at(
+        &self,
+        offset: usize,
+        len: usize,
+        writer: &mut crate::syscall::user_buffer::UserBuffer<'_>,
+        data: PrivateData,
+    ) -> Result<Option<usize>, SystemError> {
+        let page_cache = self.inner.lock().page_cache.clone();
+        let Some(page_cache) = page_cache else {
+            return Ok(None);
+        };
+        drop(data);
+        let len = len.min(writer.len());
+        let task = crate::process::ProcessManager::current_pcb();
+        let owner = crate::cgroup::memory::account_for_task(&task);
+        let creator = crate::cgroup::memory::object_for_task(&task);
+        let mut scratch = vfs::read_buffer::ReadScratch::default();
+        let mut total = 0;
+        while total < len {
+            let position = match offset.checked_add(total) {
+                Some(position) => position,
+                None if total != 0 => break,
+                None => return Err(SystemError::EOVERFLOW),
+            };
+            // The operation and every PageCache resource guard have returned
+            // before recover_io handles a typed charge failure.
+            let batch = match vfs::file::File::recover_io(|| {
+                let _operation = self.begin_operation()?;
+                page_cache.prepare_read_user_batch(position, len - total, &owner, &creator)
+            }) {
+                Ok(batch) => batch,
+                Err(_) if total != 0 => break,
+                Err(error) => return Err(error),
+            };
+            let available = batch.len();
+            if available == 0 {
+                break;
+            }
+            let copied = batch.copy_nofault(writer, total);
+            total += copied;
+            if copied == available {
+                continue;
+            }
+
+            // All batch pins are gone before allocating or faulting. Re-read
+            // just the not-yet-copied source-page suffix into existing scratch;
+            // concurrent file changes have ordinary read semantics.
+            let position = match offset.checked_add(total) {
+                Some(position) => position,
+                None if total != 0 => break,
+                None => return Err(SystemError::EOVERFLOW),
+            };
+            let want = (MMArch::PAGE_SIZE - (position & MMArch::PAGE_OFFSET_MASK)).min(len - total);
+            let buffer = match scratch.prepare(want) {
+                Ok(buffer) => buffer,
+                Err(_) if total != 0 => break,
+                Err(error) => return Err(error),
+            };
+            let snapshot = match vfs::file::File::recover_io(|| {
+                let _operation = self.begin_operation()?;
+                page_cache.try_read(position, buffer, &owner, &creator)
+            }) {
+                Ok(snapshot) => snapshot,
+                Err(_) if total != 0 => break,
+                Err(error) => return Err(error),
+            };
+            if snapshot == 0 {
+                break;
+            }
+            let copied = match writer.write_prefix_to_user(total, &buffer[..snapshot]) {
+                Ok(copied) => copied,
+                Err(_) if total != 0 => break,
+                Err(error) => return Err(error),
+            };
+            total += copied;
+            if copied != snapshot {
+                break;
+            }
+        }
+        Ok(Some(total))
+    }
+
     fn read_sync(&self, offset: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
         let _operation = self.begin_operation()?;
         let (fs, inode_num) = {

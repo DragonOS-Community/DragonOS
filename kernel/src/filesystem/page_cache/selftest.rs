@@ -3177,6 +3177,146 @@ fn run_memcg_reclaim_selftest() -> Result<bool, SystemError> {
     Ok(ok && root.current_pages() == 0)
 }
 
+/// Fail at backend admission, before allocating or submitting a cold page.
+/// A ready prefix must be returned without asking this backend about its tail.
+#[derive(Debug)]
+struct ReadUserErrorBackend;
+
+impl PageCacheBackend for ReadUserErrorBackend {
+    fn read_page(&self, _: usize, _: &mut [u8]) -> Result<usize, SystemError> {
+        Err(SystemError::EIO)
+    }
+
+    fn write_page(&self, _: usize, _: &[u8]) -> Result<usize, SystemError> {
+        Err(SystemError::EIO)
+    }
+
+    fn npages(&self) -> usize {
+        17
+    }
+
+    fn read_window_limit(&self, _: usize, _: usize) -> Result<usize, SystemError> {
+        Err(SystemError::EIO)
+    }
+}
+
+fn run_read_user_batch_selftest() -> Result<bool, SystemError> {
+    use crate::cgroup::memory::{object::ObjectAccount, MemoryAccount, MemoryPolicy};
+    use crate::filesystem::vfs::{FileType, InodeMode};
+
+    let fs = crate::filesystem::ramfs::RamFS::new();
+    let inode = fs
+        .root_inode()
+        .create(
+            "read-user-batch",
+            FileType::File,
+            InodeMode::from_bits_truncate(0o600),
+        )
+        .map_err(PageCache::legacy_allocation_error)?;
+    let page_size = MMArch::PAGE_SIZE;
+    inode
+        .resize(17 * page_size)
+        .map_err(PageCache::legacy_allocation_error)?;
+    let root = MemoryAccount::new(0, None)?;
+    let creator = ObjectAccount::new(&root)?;
+    let mut hot = MemcgReclaimFixture::new();
+    hot.cache = PageCache::new_unowned(Some(Arc::downgrade(&inode)), None);
+    for _ in 0..17 {
+        hot.install(&root)?;
+    }
+    let batch = hot
+        .cache
+        .prepare_read_user_batch(7, usize::MAX, &root, &creator)
+        .map_err(PageCache::legacy_allocation_error)?;
+    let bounded = batch.len() == 16 * page_size - 7
+        && batch.items.iter().flatten().count() == 16
+        && hot
+            .cache
+            .inner
+            .lock()
+            .get_entry(0)
+            .is_some_and(|entry| entry.active_users() == 1);
+    drop(batch);
+    let released = (0..17).all(|index| {
+        hot.cache
+            .inner
+            .lock()
+            .get_entry(index)
+            .is_some_and(|entry| entry.active_users() == 0)
+    });
+    let last = hot
+        .cache
+        .prepare_read_user_batch(17 * page_size - 3, usize::MAX, &root, &creator)
+        .map_err(PageCache::legacy_allocation_error)?;
+    let tail = last.len() == 3;
+    drop(last);
+    let eof = hot
+        .cache
+        .prepare_read_user_batch(usize::MAX, usize::MAX, &root, &creator)
+        .map_err(PageCache::legacy_allocation_error)?
+        .len()
+        == 0;
+    let empty = hot
+        .cache
+        .prepare_read_user_batch(0, 0, &root, &creator)
+        .map_err(PageCache::legacy_allocation_error)?
+        .len()
+        == 0;
+
+    let mut prefix = MemcgReclaimFixture::new();
+    prefix.cache = PageCache::new_unowned(
+        Some(Arc::downgrade(&inode)),
+        Some(Arc::new(ReadUserErrorBackend)),
+    );
+    prefix.install(&root)?;
+    let batch = prefix
+        .cache
+        .prepare_read_user_batch(0, 2 * page_size, &root, &creator)
+        .map_err(PageCache::legacy_allocation_error)?;
+    let prefix_first = batch.len() == page_size;
+    drop(batch);
+    let tail_error = matches!(
+        prefix
+            .cache
+            .prepare_read_user_batch(page_size, page_size, &root, &creator),
+        Err(MemoryAllocationError::System(SystemError::EIO))
+    );
+    let cold = PageCache::new_unowned(
+        Some(Arc::downgrade(&inode)),
+        Some(Arc::new(ReadUserErrorBackend)),
+    );
+    let first_error = matches!(
+        cold.prepare_read_user_batch(0, page_size, &root, &creator),
+        Err(MemoryAllocationError::System(SystemError::EIO))
+    );
+
+    // Data admission is isolated from descriptor charges, as in the existing
+    // DMA quota selftest. Refusal must remain typed and publish no Loading slot.
+    let rejected_owner = MemoryAccount::new(0, Some(root.clone()))?;
+    rejected_owner.set_policy(MemoryPolicy {
+        max: Some(0),
+        ..Default::default()
+    });
+    let rejected = PageCache::new_shmem(Some(Arc::downgrade(&inode)), None);
+    let rejected_charge = matches!(
+        rejected.prepare_read_user_batch(0, page_size, &rejected_owner, &creator),
+        Err(MemoryAllocationError::Charge(failure))
+            if Arc::ptr_eq(&failure.account, &rejected_owner)
+                && failure.reason == crate::cgroup::memory::ChargeFailureReason::Max
+    );
+    let no_receipt = rejected_owner.current_pages() == 0 && rejected.manager().pages_count()? == 0;
+    Ok(bounded
+        && released
+        && tail
+        && eof
+        && empty
+        && prefix_first
+        && tail_error
+        && first_error
+        && rejected_charge
+        && no_receipt)
+}
+
 pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, SystemError> {
     if PAGECACHE_ACCOUNTING_SELFTEST_RUNNING
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -3343,6 +3483,10 @@ pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, S
     if !run_batch_admission_atomicity_selftest()? {
         return Ok("status=fail stage=batch_admission_atomicity\n".into());
     }
+    if !run_read_user_batch_selftest()? {
+        return Ok("status=fail stage=read_user_batch\n".into());
+    }
+
     if !run_required_optional_dma_quota_selftest()? {
         return Ok("status=fail stage=required_optional_dma_quota\n".into());
     }
@@ -5247,6 +5391,6 @@ pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, S
     }
 
     Ok(fdtable_layout_report + "memcg_noio_reclaim=ok\n" + &alloc::format!(
-        "status=ok\nmemcg_as_body_lifetime=ok\nmemcg_vma_body_lifetime=ok\nmemcg_file_body_lifetime=ok\nfile_write_completion=ok\nlegacy_writev_completion=ok\nfault_cache_snapshot=ok\nmemcg_page_state=ok\nmemcg_reclaim=ok\nmemcg_reclaim_scan_budget=ok\nregistry_churn=ok\nregistry_batch_retire=ok\nregistry_snapshot_lifetime=ok\nregistry_concurrent_snapshot=ok\nramfs_fallocate_range=ok\nwrite_prepare_rollback=ok\npreallocate_rollback=ok\nclean_unlink_liveness=ok\nwriteback_domain_lifecycle=ok\ndetached_read_batch_completion=ok\npreallocated_batch_lifecycle=ok\nfile_membership=ok\nshmem_membership=ok\ndirty_membership=ok\ndirty_incarnation=ok\nremote_dirty_publish=ok\nwriteback_membership=ok\nwriteback_admission_order=ok\nwriteback_submission_token=ok\nwriteback_defer_progress=ok\nwriteback_budget_retry=ok\nsubmitted_writeback=ok\nfault_invalidate_retry_order=ok\ntag_scan_chunk_release=ok\nunevictable_membership=ok\ninflight_teardown=ok\nlate_completion=ok\nglobal_wiring=ok\nlayout=ok\nfile_drop_drift={file_drop_drift}\nshmem_drop_drift={shmem_drop_drift}\ndirty_drop_drift={dirty_drop_drift}\nwriteback_drop_drift={writeback_drop_drift}\nunevictable_drop_drift={unevictable_drop_drift}\nentry_size={entry_size}\nbaseline_size={baseline_size}\n"
+        "status=ok\nmemcg_as_body_lifetime=ok\nmemcg_vma_body_lifetime=ok\nmemcg_file_body_lifetime=ok\nfile_write_completion=ok\nlegacy_writev_completion=ok\nfault_cache_snapshot=ok\nmemcg_page_state=ok\nmemcg_reclaim=ok\nmemcg_reclaim_scan_budget=ok\nregistry_churn=ok\nregistry_batch_retire=ok\nregistry_snapshot_lifetime=ok\nregistry_concurrent_snapshot=ok\nramfs_fallocate_range=ok\nwrite_prepare_rollback=ok\npreallocate_rollback=ok\nclean_unlink_liveness=ok\nwriteback_domain_lifecycle=ok\ndetached_read_batch_completion=ok\nread_user_batch=ok\npreallocated_batch_lifecycle=ok\nfile_membership=ok\nshmem_membership=ok\ndirty_membership=ok\ndirty_incarnation=ok\nremote_dirty_publish=ok\nwriteback_membership=ok\nwriteback_admission_order=ok\nwriteback_submission_token=ok\nwriteback_defer_progress=ok\nwriteback_budget_retry=ok\nsubmitted_writeback=ok\nfault_invalidate_retry_order=ok\ntag_scan_chunk_release=ok\nunevictable_membership=ok\ninflight_teardown=ok\nlate_completion=ok\nglobal_wiring=ok\nlayout=ok\nfile_drop_drift={file_drop_drift}\nshmem_drop_drift={shmem_drop_drift}\ndirty_drop_drift={dirty_drop_drift}\nwriteback_drop_drift={writeback_drop_drift}\nunevictable_drop_drift={unevictable_drop_drift}\nentry_size={entry_size}\nbaseline_size={baseline_size}\n"
     ))
 }

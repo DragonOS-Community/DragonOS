@@ -247,7 +247,9 @@ impl<'a> UserBuffer<'a> {
     /// - `Ok(len)`: 成功写入的字节数
     /// - `Err(SystemError)`: 写入失败（如地址不在VMA中）
     pub fn write_to_user(&mut self, offset: usize, src: &[u8]) -> Result<usize, SystemError> {
-        self.write_output(offset, src, false)
+        self.write_output(offset, src, false, |address, bytes| unsafe {
+            crate::syscall::user_access::copy_to_user_protected(address, bytes)
+        })
     }
 
     /// Write a byte prefix and preserve progress across vector segments.
@@ -258,7 +260,22 @@ impl<'a> UserBuffer<'a> {
         offset: usize,
         src: &[u8],
     ) -> Result<usize, SystemError> {
-        self.write_output(offset, src, true)
+        self.write_output(offset, src, true, |address, bytes| unsafe {
+            crate::syscall::user_access::copy_to_user_prefix_protected(address, bytes)
+        })
+    }
+
+    /// Write a prefix without resolving user faults or taking MM locks.
+    /// Callers must release source locks before retrying an uncopied remainder
+    /// through `write_prefix_to_user`.
+    pub(crate) fn write_prefix_to_user_nofault(
+        &mut self,
+        offset: usize,
+        src: &[u8],
+    ) -> Result<usize, SystemError> {
+        self.write_output(offset, src, true, |address, bytes| unsafe {
+            crate::syscall::user_access::copy_to_user_prefix_nofault(address, bytes)
+        })
     }
 
     fn write_output(
@@ -266,6 +283,7 @@ impl<'a> UserBuffer<'a> {
         offset: usize,
         src: &[u8],
         allow_partial: bool,
+        copy: impl Fn(VirtAddr, &[u8]) -> Result<usize, SystemError>,
     ) -> Result<usize, SystemError> {
         if offset > self.len {
             return Err(SystemError::EINVAL);
@@ -274,13 +292,6 @@ impl<'a> UserBuffer<'a> {
         if copy_len == 0 {
             return Ok(0);
         }
-        let copy = |address, bytes: &[u8]| unsafe {
-            if allow_partial {
-                crate::syscall::user_access::copy_to_user_prefix_protected(address, bytes)
-            } else {
-                crate::syscall::user_access::copy_to_user_protected(address, bytes)
-            }
-        };
         match &self.backing {
             UserBufferBacking::Contiguous(addr) => copy(*addr + offset, &src[..copy_len]),
             UserBufferBacking::Vectored(segments) => {

@@ -912,6 +912,45 @@ pub struct CopyItem {
     created: bool,
 }
 
+const READ_USER_BATCH_PAGES: usize = 16;
+
+/// Pins for one bounded user read. No inode operation, invalidation guard or
+/// page lock survives preparation; consuming the batch releases every pin.
+#[derive(Default)]
+pub(crate) struct ReadUserBatch {
+    items: [Option<CopyItem>; READ_USER_BATCH_PAGES],
+    len: usize,
+}
+
+impl ReadUserBatch {
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Attempt the resident destination fast path. The caller may fault or
+    /// recover only after this consumes the batch and drops all remaining pins.
+    pub(crate) fn copy_nofault(
+        self,
+        writer: &mut crate::syscall::user_buffer::UserBuffer<'_>,
+        dst_offset: usize,
+    ) -> usize {
+        let mut copied = 0;
+        for item in self.items.into_iter().flatten() {
+            let page = item.entry.page.read();
+            let source =
+                unsafe { &page.as_slice()[item.page_offset..item.page_offset + item.sub_len] };
+            let n = writer
+                .write_prefix_to_user_nofault(dst_offset + copied, source)
+                .unwrap_or(0);
+            copied += n;
+            if n != item.sub_len {
+                break;
+            }
+        }
+        copied
+    }
+}
+
 /// Own write preparation until publication, including its failure cleanup.
 /// Page locks and dirty reservations must be dropped before this owner.
 struct PreparedWriteCopies<'a> {
@@ -4384,6 +4423,85 @@ impl PageCache {
         }
 
         Ok(ret)
+    }
+
+    /// Prepare one bounded, ordered cache window without touching userspace.
+    /// Allocation and backend failures retain their typed recovery information.
+    pub(crate) fn prepare_read_user_batch(
+        &self,
+        offset: usize,
+        len: usize,
+        owner: &Arc<MemoryAccount>,
+        creator: &Arc<ObjectAccount>,
+    ) -> Result<ReadUserBatch, MemoryAllocationError> {
+        let mut wait_first = false;
+        loop {
+            let invalidate = self.invalidate_read();
+            let inode = self
+                .inode()
+                .and_then(|inode| inode.upgrade())
+                .ok_or(SystemError::EIO)?;
+            let file_size = inode.metadata()?.size.max(0) as usize;
+            let page_offset = offset & MMArch::PAGE_OFFSET_MASK;
+            let len = len
+                .min(file_size.saturating_sub(offset))
+                .min(READ_USER_BATCH_PAGES * MMArch::PAGE_SIZE - page_offset);
+            let mut batch = ReadUserBatch::default();
+            if len == 0 {
+                return Ok(batch);
+            }
+            let first_index = offset >> MMArch::PAGE_SHIFT;
+            // After submitting a cold window, wait for its first page while
+            // excluding invalidation. Its temporary pin also prevents reclaim
+            // from removing it before the single-lock collection below.
+            let first = if wait_first {
+                Some(self.try_get_or_create_entry_pinned(first_index, true, owner, creator)?)
+            } else {
+                None
+            };
+            {
+                let inner = self.inner.lock();
+                for (slot, item) in batch.items.iter_mut().enumerate() {
+                    let page_index = first_index + slot;
+                    let Some(entry) = inner.get_entry(page_index) else {
+                        break;
+                    };
+                    if !entry.state().is_ready() {
+                        break;
+                    }
+                    let within_page = if slot == 0 { page_offset } else { 0 };
+                    let sub_len = (MMArch::PAGE_SIZE - within_page).min(len - batch.len);
+                    let pin = entry.pin();
+                    *item = Some(CopyItem {
+                        entry,
+                        _pin: pin,
+                        page_index,
+                        page_offset: within_page,
+                        sub_len,
+                        created: false,
+                    });
+                    batch.len += sub_len;
+                    if batch.len == len {
+                        break;
+                    }
+                }
+            }
+            drop(first);
+            drop(invalidate);
+            if batch.len != 0 {
+                return Ok(batch);
+            }
+            // No pins or mapping guards cross the backend/recovery boundary.
+            // Existing backend batching supplies the cold window; a ready
+            // prefix is delivered immediately instead of waiting for its tail.
+            self.try_read_pages(
+                first_index,
+                (page_offset + len).div_ceil(MMArch::PAGE_SIZE),
+                owner,
+                creator,
+            )?;
+            wait_first = true;
+        }
     }
 
     pub fn write(&self, offset: usize, buf: &[u8]) -> Result<usize, SystemError> {

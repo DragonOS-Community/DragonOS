@@ -78,7 +78,7 @@ impl Syscall for SysTeeHandle {
         let in_pipe = file_in.pipe_runtime()?;
         let out_pipe = file_out.pipe_runtime()?;
 
-        let copied = File::recover_io(|| in_pipe.tee_to(&out_pipe, len, splice_flags))?;
+        let copied = in_pipe.tee_to(&out_pipe, len, splice_flags)?;
         if copied > 0 {
             file_in.notify_io_event(FsEvent::ACCESS);
             file_out.notify_io_event(FsEvent::MODIFY);

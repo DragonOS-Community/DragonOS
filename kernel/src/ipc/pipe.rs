@@ -9,7 +9,7 @@ use crate::{
         },
         vfs::{
             fasync::{FAsyncItem, FAsyncItems, FASYNC_POLL_IN, FASYNC_POLL_OUT},
-            file::FileFlags,
+            file::{File, FileFlags},
             merge_metadata_masked,
             vcore::generate_inode_id,
             FilePrivateData, FileSystem, FileType, FsInfo, IndexNode, InodeFlags, InodeMode, Magic,
@@ -58,6 +58,15 @@ enum WakeMode {
     None,
     One,
     All,
+}
+
+/// Final transfer semantics stay inside the dual-pipe snapshot. Resource
+/// preparation and readiness retries run only after both transactions drop.
+#[derive(Debug, PartialEq, Eq)]
+enum PipeTransferOutcome {
+    Complete(usize),
+    Retry,
+    NeedsStorage,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -512,6 +521,98 @@ impl PipeRuntime {
             && account.snapshot().kernel_bytes
                 == [0; crate::cgroup::memory::accounting::KERNEL_BYTE_KIND_COUNT];
         drop(weak);
+        ok &= Self::run_transfer_state_selftest()?;
+        Ok(ok)
+    }
+
+    /// Private-account coverage for final snapshots and unpublished storage
+    /// rejection. The existing pipe accounting report runs this in the guest.
+    fn run_transfer_state_selftest() -> Result<bool, MemoryAllocationError> {
+        use crate::cgroup::memory::{MemoryAccount, MemoryPolicy};
+        let root = MemoryAccount::new(0x776621, None)?;
+        let account = MemoryAccount::new(0x776622, Some(root.clone()))?;
+        let creator = ObjectAccount::new(&account)?;
+        let src = Self::try_new(false, &creator)?;
+        let dst = Self::try_new(false, &creator)?;
+        {
+            let mut input = src.inner.lock();
+            input.reader = 1;
+            input.buf_size = PIPE_MIN_SIZE;
+            let mut output = dst.inner.lock();
+            output.reader = 1;
+            output.writer = 1;
+            output.buf_size = PIPE_MIN_SIZE;
+        }
+        {
+            let transaction = src.begin_writer_transaction();
+            src.prepare_output_storage(&transaction, &creator)?;
+        }
+        let baseline = account.snapshot();
+        account.set_policy(MemoryPolicy {
+            max: Some(baseline.current),
+            ..Default::default()
+        });
+        // Exercise the coordinator too: EOF must not prepare empty output.
+        let mut ok = src.splice_to_pipe(&dst, 1, SpliceFlags::SPLICE_F_NONBLOCK) == Ok(0)
+            && src.tee_to(&dst, 1, SpliceFlags::SPLICE_F_NONBLOCK) == Ok(0)
+            && dst.inner.lock().data.is_empty();
+        {
+            let mut input = src.inner.lock();
+            input.writer = 1;
+            input.data[..3].copy_from_slice(b"io!");
+            input.data.push_segment(PipeSegment {
+                offset: 0,
+                len: 3,
+                mergeable: true,
+                packet: false,
+            });
+            input.valid_cnt = 3;
+            input.write_pos = 3;
+        }
+        {
+            let (input, mut output) = Self::begin_transfer_transactions(&src, &dst);
+            ok &= Self::transfer_slots(&src, &dst, &input, &mut output, 3, true, true)
+                == Ok(PipeTransferOutcome::NeedsStorage);
+        }
+        {
+            let transaction = dst.begin_writer_transaction();
+            ok &= matches!(
+                dst.prepare_output_storage(&transaction, &creator),
+                Err(MemoryAllocationError::Charge(_))
+            );
+        }
+        let after = account.snapshot();
+        ok &= after.current == baseline.current
+            && after.kernel_bytes == baseline.kernel_bytes
+            && src.inner.lock().valid_cnt == 3
+            && dst.inner.lock().data.is_empty();
+        account.set_policy(MemoryPolicy::default());
+        {
+            let transaction = dst.begin_writer_transaction();
+            dst.prepare_output_storage(&transaction, &creator)?;
+        }
+        {
+            let (input, mut output) = Self::begin_transfer_transactions(&src, &dst);
+            ok &= Self::transfer_slots(&src, &dst, &input, &mut output, 3, true, true)
+                == Ok(PipeTransferOutcome::Complete(3));
+            // Final EOF must win even when the last transfer filled output.
+            src.inner.lock().writer = 0;
+            ok &= Self::transfer_slots(&src, &dst, &input, &mut output, 1, true, true)
+                == Ok(PipeTransferOutcome::Complete(0));
+            src.inner.lock().writer = 1;
+            ok &= Self::transfer_slots(&src, &dst, &input, &mut output, 1, true, true)
+                == Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+            ok &= Self::transfer_slots(&src, &dst, &input, &mut output, 1, false, true)
+                == Ok(PipeTransferOutcome::Complete(0));
+        }
+        ok &= src.inner.lock().valid_cnt == 0 && dst.inner.lock().data[..3] == *b"io!";
+        drop(src);
+        drop(dst);
+        drop(creator);
+        ok &= account.current_pages() == 0
+            && root.current_pages() == 0
+            && account.snapshot().kernel_bytes
+                == [0; crate::cgroup::memory::accounting::KERNEL_BYTE_KIND_COUNT];
         Ok(ok)
     }
 
@@ -1278,7 +1379,8 @@ impl PipeRuntime {
         transaction: &mut PipeWriterTransaction<'_>,
         len: usize,
         consume: bool,
-    ) -> Result<(usize, usize), SystemError> {
+        nonblock: bool,
+    ) -> Result<PipeTransferOutcome, SystemError> {
         debug_assert!(core::ptr::eq(source_transaction.pipe, src));
         debug_assert!(core::ptr::eq(transaction.pipe, dst));
         debug_assert!(source_transaction.guard.is_some() && transaction.guard.is_some());
@@ -1291,13 +1393,37 @@ impl PipeRuntime {
             return Err(SystemError::EPIPE);
         }
         if input.read_reserved() {
-            return Ok((0, 0));
+            return if nonblock {
+                Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
+            } else {
+                Ok(PipeTransferOutcome::Retry)
+            };
         }
         let snapshot = input.data.segment_count();
         let mut total = 0;
         let mut slots = 0;
         let mut skip = 0;
-        while slots < snapshot && total < len && !output.buf_full() {
+        let outcome = loop {
+            if total == len || (consume && !input.has_slots() && input.writer == 0) {
+                break Ok(PipeTransferOutcome::Complete(total));
+            }
+            if (!consume && slots == snapshot) || !input.has_slots() || output.buf_full() {
+                // link_pipe returns its final snapshot's byte count, even zero.
+                // splice must not report EOF while input writers still exist.
+                break if !consume || total != 0 {
+                    Ok(PipeTransferOutcome::Complete(total))
+                } else if nonblock {
+                    Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
+                } else {
+                    Ok(PipeTransferOutcome::Retry)
+                };
+            }
+            if output.data.is_empty() {
+                // No slot has moved: prepare storage outside the pair, then
+                // return directly to this final check, not source readiness.
+                debug_assert!(total == 0 && slots == 0);
+                break Ok(PipeTransferOutcome::NeedsStorage);
+            }
             let index = if consume { 0 } else { slots };
             let segment = input.data.get_segment(index).expect("snapshot slot");
             let count = segment.len.min(len - total);
@@ -1323,8 +1449,9 @@ impl PipeRuntime {
             }
             total += count;
             slots += 1;
-        }
-        let source_reader_wake = if consume && !input.has_slots() && input.writer == 0 {
+        };
+        let source_reader_wake = if consume && slots != 0 && !input.has_slots() && input.writer == 0
+        {
             WakeMode::All
         } else {
             WakeMode::None
@@ -1351,7 +1478,7 @@ impl PipeRuntime {
         if total != 0 {
             dst.publish_write_progress(WakeMode::One);
         }
-        Ok((total, slots))
+        outcome
     }
 
     pub fn splice_to_pipe(
@@ -1359,61 +1486,8 @@ impl PipeRuntime {
         out: &PipeRuntime,
         len: usize,
         flags: SpliceFlags,
-    ) -> Result<usize, MemoryAllocationError> {
-        if len == 0 {
-            return Ok(0);
-        }
-        if core::ptr::eq(self, out) {
-            return Err(SystemError::EINVAL.into());
-        }
-        let nonblock = flags.contains(SpliceFlags::SPLICE_F_NONBLOCK);
-        let mut total = 0;
-        loop {
-            match self.wait_readable(nonblock || total != 0) {
-                Ok(true) => {}
-                Ok(false) => return Ok(total),
-                Err(_) if total != 0 => return Ok(total),
-                Err(error) => return Err(error.into()),
-            }
-            let mut transaction = out.begin_writer_transaction();
-            if let Err(error) = out.wait_writable(&mut transaction, nonblock || total != 0) {
-                return if total != 0 {
-                    Ok(total)
-                } else {
-                    Err(error.into())
-                };
-            }
-            let actor = crate::cgroup::memory::object_for_task(
-                &crate::process::ProcessManager::current_pcb(),
-            );
-            out.prepare_output_storage(&transaction, &actor)?;
-            // Allocated storage survives consumption and resize. Release the
-            // single-end preparation before entering the ordered pair.
-            drop(transaction);
-            let (source_transaction, mut transaction) =
-                Self::begin_transfer_transactions(self, out);
-            let (bytes, slots) = match Self::transfer_slots(
-                self,
-                out,
-                &source_transaction,
-                &mut transaction,
-                len - total,
-                true,
-            ) {
-                Ok(progress) => progress,
-                Err(_) if total != 0 => return Ok(total),
-                Err(error) => return Err(error.into()),
-            };
-            total += bytes;
-            if total == len || total != 0 {
-                return Ok(total);
-            }
-            // Moving an empty slot is progress, but a zero byte return is EOF
-            // only after rechecking source writer presence, just like Linux.
-            if slots == 0 && nonblock {
-                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK.into());
-            }
-        }
+    ) -> Result<usize, SystemError> {
+        self.transfer_to_pipe(out, len, flags, true)
     }
 
     pub fn tee_to(
@@ -1421,36 +1495,62 @@ impl PipeRuntime {
         out: &PipeRuntime,
         len: usize,
         flags: SpliceFlags,
-    ) -> Result<usize, MemoryAllocationError> {
+    ) -> Result<usize, SystemError> {
+        self.transfer_to_pipe(out, len, flags, false)
+    }
+
+    fn transfer_to_pipe(
+        &self,
+        out: &PipeRuntime,
+        len: usize,
+        flags: SpliceFlags,
+        consume: bool,
+    ) -> Result<usize, SystemError> {
         if len == 0 {
             return Ok(0);
         }
         if core::ptr::eq(self, out) {
-            return Err(SystemError::EINVAL.into());
+            return Err(SystemError::EINVAL);
         }
         let nonblock = flags.contains(SpliceFlags::SPLICE_F_NONBLOCK);
         loop {
-            if !self.wait_readable(nonblock)? {
-                return Ok(0);
+            // EOF is a successful input preparation, not an early return:
+            // output capacity and EPIPE checks still precede the final EOF.
+            self.wait_readable(nonblock)?;
+            {
+                let mut transaction = out.begin_writer_transaction();
+                out.wait_writable(&mut transaction, nonblock)?;
             }
-            let mut transaction = out.begin_writer_transaction();
-            out.wait_writable(&mut transaction, nonblock)?;
-            let actor = crate::cgroup::memory::object_for_task(
-                &crate::process::ProcessManager::current_pcb(),
-            );
-            out.prepare_output_storage(&transaction, &actor)?;
-            // Allocated storage survives consumption and resize. Release the
-            // single-end preparation before entering the ordered pair.
-            drop(transaction);
-            let (source_transaction, mut transaction) =
-                Self::begin_transfer_transactions(self, out);
-            let (bytes, slots) =
-                Self::transfer_slots(self, out, &source_transaction, &mut transaction, len, false)?;
-            if slots != 0 {
-                return Ok(bytes);
-            }
-            if nonblock {
-                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK.into());
+            loop {
+                let outcome = {
+                    let (source_transaction, mut transaction) =
+                        Self::begin_transfer_transactions(self, out);
+                    Self::transfer_slots(
+                        self,
+                        out,
+                        &source_transaction,
+                        &mut transaction,
+                        len,
+                        consume,
+                        nonblock,
+                    )?
+                };
+                match outcome {
+                    PipeTransferOutcome::Complete(bytes) => return Ok(bytes),
+                    PipeTransferOutcome::Retry => break,
+                    PipeTransferOutcome::NeedsStorage => {
+                        // Retry only this unpublished resource preparation.
+                        // Every attempt drops its transaction before reclaim;
+                        // tee must not replay its initial source readiness.
+                        File::recover_io(|| {
+                            let actor = crate::cgroup::memory::object_for_task(
+                                &crate::process::ProcessManager::current_pcb(),
+                            );
+                            let transaction = out.begin_writer_transaction();
+                            out.prepare_output_storage(&transaction, &actor)
+                        })?;
+                    }
+                }
             }
         }
     }
@@ -1473,8 +1573,8 @@ impl PipeRuntime {
 #[cfg(test)]
 mod tests {
     use super::{
-        ObjectAccount, PipeBuffer, PipeRuntime, PipeSegment, PipeWriteWaiters, PipeWriterWake,
-        PIPE_MIN_SIZE,
+        ObjectAccount, PipeBuffer, PipeRuntime, PipeSegment, PipeTransferOutcome, PipeWriteWaiters,
+        PipeWriterWake, PIPE_MIN_SIZE,
     };
 
     #[test]
@@ -1535,9 +1635,10 @@ mod tests {
                 &source_transaction,
                 &mut transaction,
                 3,
+                false,
                 false
             ),
-            Ok((3, 2))
+            Ok(PipeTransferOutcome::Complete(3))
         );
         assert_eq!(src.inner.lock().data.segment_count(), 2);
         {
@@ -1551,8 +1652,16 @@ mod tests {
             assert_eq!(&inner.data[..3], b"abc");
         }
         assert_eq!(
-            PipeRuntime::transfer_slots(&src, &dst, &source_transaction, &mut transaction, 3, true),
-            Ok((3, 2))
+            PipeRuntime::transfer_slots(
+                &src,
+                &dst,
+                &source_transaction,
+                &mut transaction,
+                3,
+                true,
+                false
+            ),
+            Ok(PipeTransferOutcome::Complete(3))
         );
         assert_eq!(src.inner.lock().data.segment_count(), 0);
         assert!(dst.inner.lock().data.get_segment(3).unwrap().mergeable);
@@ -1599,8 +1708,16 @@ mod tests {
         let (source_transaction, mut transaction) =
             PipeRuntime::begin_transfer_transactions(&src, &dst);
         assert_eq!(
-            PipeRuntime::transfer_slots(&src, &dst, &source_transaction, &mut transaction, 4, true),
-            Ok((0, 0))
+            PipeRuntime::transfer_slots(
+                &src,
+                &dst,
+                &source_transaction,
+                &mut transaction,
+                4,
+                true,
+                false
+            ),
+            Ok(PipeTransferOutcome::Retry)
         );
         {
             let src_guard = src.inner.lock();
@@ -1610,8 +1727,16 @@ mod tests {
 
         src.splice_finish_hold(0);
         assert_eq!(
-            PipeRuntime::transfer_slots(&src, &dst, &source_transaction, &mut transaction, 4, true),
-            Ok((4, 1))
+            PipeRuntime::transfer_slots(
+                &src,
+                &dst,
+                &source_transaction,
+                &mut transaction,
+                4,
+                true,
+                false
+            ),
+            Ok(PipeTransferOutcome::Complete(4))
         );
         assert_eq!(src.inner.lock().valid_cnt, 0);
     }

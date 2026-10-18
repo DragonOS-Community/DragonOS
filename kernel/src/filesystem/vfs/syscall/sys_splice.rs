@@ -257,7 +257,7 @@ fn splice_pipe_to_pipe(
 ) -> Result<usize, SystemError> {
     let in_pipe = get_pipe_inode(pipe_in)?;
     let out_pipe = get_pipe_inode(pipe_out)?;
-    File::recover_io(|| in_pipe.splice_to_pipe(&out_pipe, len, flags))
+    in_pipe.splice_to_pipe(&out_pipe, len, flags)
 }
 
 /// file 到 pipe 的数据传输

@@ -248,3 +248,5 @@ normal/proc_write_position
 normal/iov_snapshot_semantics
 
 normal/pipe_transfer_copy
+
+normal/pipe_transfer_state

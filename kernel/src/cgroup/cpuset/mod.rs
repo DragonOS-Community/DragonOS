@@ -32,6 +32,19 @@ pub(crate) enum CpusetFile {
     EffectiveMems,
 }
 
+/// kernfs atomic command capacity, matching Linux cpuset cftypes. This is
+/// based on supported topology capacity, not the changing online CPU set.
+pub(crate) fn max_write_len(file: CpusetFile) -> usize {
+    let capacity = match file {
+        CpusetFile::Cpus | CpusetFile::EffectiveCpus => {
+            crate::mm::percpu::PerCpu::MAX_CPU_NUM as usize
+        }
+        // The allocator currently supports only memory node 0.
+        CpusetFile::Mems | CpusetFile::EffectiveMems => 1,
+    };
+    100 + 6 * capacity
+}
+
 fn cpu_indices(mask: &CpuMask) -> IndexSet {
     mask.iter_cpu().map(|c| c.data() as usize).collect()
 }

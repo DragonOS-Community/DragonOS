@@ -10,6 +10,7 @@
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
+#include <sys/uio.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #include <time.h>
@@ -321,6 +322,47 @@ class Cpuset : public ::testing::Test {
     EXPECT_EQ(mems_, Parse(report.mem_list));
   }
 
+  void CheckAtomicWriteLimit(const char* name, size_t limit) {
+    // These exact boundaries describe this DragonOS kernel configuration,
+    // rather than the unrelated NR_CPUS/MAX_NUMNODES of a Linux test host.
+    const std::string path = root_ + "/" + name;
+    const std::string original = Read(path);
+    ASSERT_FALSE(original.empty());
+    ASSERT_LT(original.size(), limit);
+    std::string command = original;
+    command.resize(limit, ' ');
+    void* inaccessible = mmap(nullptr, 4096, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    ASSERT_NE(MAP_FAILED, inaccessible);
+    for (bool vector : {false, true}) {
+      SCOPED_TRACE(vector);
+      int fd = open(path.c_str(), O_WRONLY | O_CLOEXEC);
+      EXPECT_GE(fd, 0);
+      if (fd < 0) continue;
+      iovec valid[] = {{command.data(), 1}, {command.data() + 1, limit - 1}};
+      EXPECT_EQ(static_cast<ssize_t>(limit),
+                vector ? writev(fd, valid, 2) : write(fd, command.data(), command.size()));
+      EXPECT_EQ(static_cast<off_t>(limit), lseek(fd, 0, SEEK_CUR));
+      EXPECT_EQ(original, Read(path));
+      const std::string oversized = command + " ";
+      iovec too_long[] = {{const_cast<char*>(oversized.data()), 1},
+                          {const_cast<char*>(oversized.data()) + 1, limit}};
+      errno = 0;
+      EXPECT_EQ(-1, vector ? pwritev(fd, too_long, 2, 0)
+                           : pwrite(fd, oversized.data(), oversized.size(), 0));
+      EXPECT_EQ(E2BIG, errno);
+      EXPECT_EQ(original, Read(path));
+      iovec fault[] = {{command.data(), 1}, {inaccessible, limit}};
+      errno = 0;
+      EXPECT_EQ(-1, vector ? pwritev(fd, fault, 2, 0)
+                           : pwrite(fd, inaccessible, limit + 1, 0));
+      EXPECT_EQ(E2BIG, errno);
+      EXPECT_EQ(original, Read(path));
+      EXPECT_EQ(static_cast<off_t>(limit), lseek(fd, 0, SEEK_CUR));
+      close(fd);
+    }
+    munmap(inaccessible, 4096);
+  }
+
   static unsigned sequence_;
   std::string parent_, root_, a_, b_;
   std::vector<std::string> dirs_;
@@ -332,6 +374,16 @@ class Cpuset : public ::testing::Test {
 };
 
 unsigned Cpuset::sequence_ = 0;
+
+TEST_F(Cpuset, CpuCommandAtomicLimitUsesConfiguredCapacity) {
+  // kernel/src/mm/percpu.rs: MAX_CPU_NUM=16; Linux cftype: 100+6*NR_CPUS.
+  CheckAtomicWriteLimit("cpuset.cpus", 100 + 6 * 16);
+}
+
+TEST_F(Cpuset, MemoryCommandAtomicLimitUsesConfiguredCapacity) {
+  // The allocator and cpuset topology currently support one memory node.
+  CheckAtomicWriteLimit("cpuset.mems", 100 + 6 * 1);
+}
 
 TEST_F(Cpuset, EmptyInheritanceAndAncestorIntersection) {
   EXPECT_EQ("", Read(a_ + "/cpuset.cpus"));

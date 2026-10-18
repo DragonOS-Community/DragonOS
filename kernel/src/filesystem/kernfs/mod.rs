@@ -20,6 +20,7 @@ use crate::{
     driver::base::device::device_number::DeviceNumber,
     filesystem::vfs::syscall::RenameFlags,
     libs::{casting::DowncastArc, rwsem::RwSem},
+    mm::MemoryManagementArch,
     time::PosixTimeSpec,
 };
 
@@ -354,6 +355,7 @@ pub struct InnerKernFSInode {
 impl IndexNode for KernFSInode {
     fn configure_open_file(&self, _data: &FilePrivateData, behavior: &mut OpenFileBehavior) {
         behavior.post_write_sync = PostWriteSyncPolicy::NotApplicable;
+        behavior.data_file_write_checks = false;
     }
 
     fn as_any_ref(&self) -> &dyn core::any::Any {
@@ -661,6 +663,23 @@ impl IndexNode for KernFSInode {
         result.map_err(Into::into)
     }
 
+    fn write_primary_with_privilege_stage(
+        &self,
+        offset: usize,
+        len: usize,
+        source: super::vfs::PrimaryWriteSource<'_, '_>,
+        data: MutexGuard<FilePrivateData>,
+        stage: &mut super::vfs::WritePrivilegeStage<'_>,
+    ) -> Result<super::vfs::PrimaryWriteResult, crate::mm::allocation::MemoryAllocationError> {
+        let len = len.min(crate::arch::MMArch::PAGE_SIZE);
+        source.with_exact_buffer(len, |buffer| {
+            // kernfs writes are control operations, not generic data writes.
+            stage.complete();
+            self.write_at(offset, len, buffer, data)
+                .map(super::vfs::PrimaryWriteResult::new)
+        })
+    }
+
     fn write_at(
         &self,
         offset: usize,
@@ -669,6 +688,10 @@ impl IndexNode for KernFSInode {
         data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
         let result: core::result::Result<_, system_error::SystemError> = (|| {
+            if buf.len() < len {
+                return Err(SystemError::ENOBUFS);
+            }
+            let len = len.min(crate::arch::MMArch::PAGE_SIZE);
             if self.inode_type != KernInodeType::File {
                 return Err(SystemError::EISDIR);
             }

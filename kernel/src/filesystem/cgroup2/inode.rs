@@ -18,6 +18,7 @@ use crate::{
         PollableInode, PostWriteSyncPolicy, SetMetadataMask,
     },
     libs::{mutex::MutexGuard, rwlock::RwLock, rwsem::RwSem, spinlock::SpinLock},
+    mm::MemoryManagementArch,
     process::ProcessManager,
     time::PosixTimeSpec,
 };
@@ -597,9 +598,27 @@ impl Cgroup2Inode {
         Ok(())
     }
 
+    fn check_write_len(&self, len: usize) -> Result<(), SystemError> {
+        let limit = {
+            let inner = self.inner.lock();
+            match inner.kind {
+                Cgroup2InodeKind::File {
+                    ty: CgroupCoreFile::Cpuset(file),
+                    ..
+                } => cpuset::max_write_len(file),
+                Cgroup2InodeKind::File { .. } => crate::arch::MMArch::PAGE_SIZE,
+                _ => return Err(SystemError::EISDIR),
+            }
+        };
+        if len > limit {
+            return Err(SystemError::E2BIG);
+        }
+        Ok(())
+    }
+
     fn write_file(
         this: &Arc<Cgroup2Inode>,
-        offset: usize,
+        _offset: usize,
         buf: &[u8],
         open: &super::CgroupOpenState,
     ) -> Result<usize, SystemError> {
@@ -624,14 +643,6 @@ impl Cgroup2Inode {
         // active reference, liveness precedes authorization and parsing.
         let _update = crate::cgroup::lock();
         files::check_live_file(&cgroup, ty, file_generation)?;
-        if offset != 0
-            && matches!(
-                ty,
-                CgroupCoreFile::Procs | CgroupCoreFile::Threads | CgroupCoreFile::SubtreeControl
-            )
-        {
-            return Err(SystemError::EINVAL);
-        }
 
         match ty {
             CgroupCoreFile::Procs | CgroupCoreFile::Threads => {
@@ -655,9 +666,6 @@ impl Cgroup2Inode {
                     && Arc::ptr_eq(open.namespace.root_cgroup(), &cgroup)
                 {
                     return Err(SystemError::EPERM);
-                }
-                if offset != 0 {
-                    return Err(SystemError::EINVAL);
                 }
                 if super::memory::is_memory_write(ty) {
                     let action = super::memory::prepare_write_locked(&cgroup, ty, buf)?;
@@ -761,6 +769,7 @@ impl PollableInode for Cgroup2Inode {
 impl IndexNode for Cgroup2Inode {
     fn configure_open_file(&self, _data: &FilePrivateData, behavior: &mut OpenFileBehavior) {
         behavior.post_write_sync = PostWriteSyncPolicy::NotApplicable;
+        behavior.data_file_write_checks = false;
     }
 
     fn open(
@@ -861,6 +870,25 @@ impl IndexNode for Cgroup2Inode {
         result.map_err(Into::into)
     }
 
+    fn write_primary_with_privilege_stage(
+        &self,
+        offset: usize,
+        len: usize,
+        source: crate::filesystem::vfs::PrimaryWriteSource<'_, '_>,
+        data: MutexGuard<FilePrivateData>,
+        stage: &mut crate::filesystem::vfs::WritePrivilegeStage<'_>,
+    ) -> Result<
+        crate::filesystem::vfs::PrimaryWriteResult,
+        crate::mm::allocation::MemoryAllocationError,
+    > {
+        self.check_write_len(len)?;
+        source.with_exact_buffer(len, |buffer| {
+            stage.complete();
+            self.write_at(offset, len, buffer, data)
+                .map(crate::filesystem::vfs::PrimaryWriteResult::new)
+        })
+    }
+
     fn write_at(
         &self,
         offset: usize,
@@ -869,14 +897,17 @@ impl IndexNode for Cgroup2Inode {
         data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
         let result: core::result::Result<_, system_error::SystemError> = (|| {
+            self.check_write_len(len)?;
+            if buf.len() < len {
+                return Err(SystemError::ENOBUFS);
+            }
             let open = match &*data {
                 FilePrivateData::Cgroup(open) => open.clone(),
                 _ => return Err(SystemError::EINVAL),
             };
             drop(data);
-            let n = core::cmp::min(len, buf.len());
             let this = self.self_ref.upgrade().unwrap();
-            Cgroup2Inode::write_file(&this, offset, &buf[..n], &open)
+            Cgroup2Inode::write_file(&this, offset, &buf[..len], &open)
         })();
         result.map_err(Into::into)
     }

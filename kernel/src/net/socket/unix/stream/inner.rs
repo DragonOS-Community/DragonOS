@@ -545,6 +545,22 @@ impl Connected {
         }
     }
 
+    /// Linux 6.6's default CONFIG_AF_UNIX_OOB skips exactly one empty head
+    /// record on close, including for seqpacket. Any following record still
+    /// causes reset, even when its payload is also empty. This differs from
+    /// FIONREAD's first-record payload length and receive readiness.
+    pub(super) fn has_unread_for_reset(&self, is_seqpacket: bool) -> bool {
+        let reader = self.reader.lock();
+        if !is_seqpacket {
+            return !reader.is_empty();
+        }
+        match Self::seqpacket_record_len_locked(&reader) {
+            Ok(Some(0)) => reader.len() > size_of::<u32>(),
+            Ok(Some(_)) => true,
+            _ => false,
+        }
+    }
+
     pub(super) fn outq_len(&self, _is_seqpacket: bool) -> usize {
         // Approximation: bytes sitting in the local-to-peer ring buffer,
         // i.e. written but not yet consumed by the peer.

@@ -267,3 +267,7 @@ normal/direct_read_semantics
 normal/directory_read_admission
 normal/proc_write_admission
 normal/socket_receive_contracts
+
+normal/tcp_waitall_flags
+normal/unix_close_record_reset
+normal/socket_receive_interrupt

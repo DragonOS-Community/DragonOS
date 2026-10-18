@@ -1665,9 +1665,9 @@ impl Socket for UnixStreamSocket {
 
         match inner {
             Inner::Connected(connected) => {
-                // Linux behavior: if this socket is closed with unread data in its
-                // receive queue, the peer should observe ECONNRESET on the next read.
-                if connected.readable_len(self.is_seqpacket) != 0 {
+                // Closing with unread records can reset the peer. The close
+                // predicate also handles Linux's empty-head record exception.
+                if connected.has_unread_for_reset(self.is_seqpacket) {
                     // Signal via the shared writer ring buffer so it works even when
                     // UnixStreamSocket.peer isn't wired up (e.g. filesystem/abstract bind).
                     connected.set_connreset_to_peer();

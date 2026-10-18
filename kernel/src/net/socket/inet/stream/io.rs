@@ -21,32 +21,109 @@ const USER_RECV_STAGING_SIZE: usize = 64 * 1024;
 
 /// Logical receive capacity is independent of payload storage: TCP TRUNC
 /// discards/counts bytes, and PEEK stages only bytes that are actually queued.
-pub(super) enum TcpReceiveTarget<'a> {
+pub(super) enum TcpReceiveTarget<'a, 'b> {
     Buffer(&'a mut [u8]),
     Discard(usize),
     Peek {
-        buffer: &'a mut RecvBuffer,
-        limit: usize,
+        user_buffer: &'a mut UserBuffer<'b>,
+        staging: RecvBuffer,
     },
 }
 
-impl TcpReceiveTarget<'_> {
+impl TcpReceiveTarget<'_, '_> {
     pub(super) fn len(&self) -> usize {
         match self {
             Self::Buffer(bytes) => bytes.len(),
-            Self::Discard(limit) | Self::Peek { limit, .. } => *limit,
+            Self::Discard(limit) => *limit,
+            Self::Peek { user_buffer, .. } => user_buffer.len(),
         }
     }
 
     pub(super) fn prepare(&mut self, required: usize) -> Result<(), SystemError> {
         match self {
-            Self::Peek { buffer, .. } => buffer.prepare(required),
+            Self::Peek { staging, .. } => staging.prepare(required),
             _ => unreachable!("only a lazy TCP peek needs storage admission"),
         }
     }
 }
 
+/// A call-local TCP peek sequence, distinct from the number of bytes already
+/// returned to the caller. The transport owns the receive-head sequence.
+#[derive(Default)]
+pub(super) struct TcpPeekCursor {
+    sequence: Option<smoltcp::wire::TcpSeqNumber>,
+    observed_head: Option<smoltcp::wire::TcpSeqNumber>,
+    after_wait: bool,
+}
+
+impl TcpPeekCursor {
+    fn sync(&mut self, head: smoltcp::wire::TcpSeqNumber, copied: usize) -> usize {
+        let reset = self.sequence.is_none()
+            || self.observed_head != Some(head)
+            || (self.after_wait
+                && self
+                    .sequence
+                    .is_some_and(|sequence| sequence.0.wrapping_sub(copied as i32) != head.0));
+        if reset {
+            self.sequence = Some(head);
+        }
+        self.observed_head = Some(head);
+        self.after_wait = false;
+        self.offset(head)
+    }
+
+    fn offset(&self, head: smoltcp::wire::TcpSeqNumber) -> usize {
+        // Do not use SeqNumber subtraction: stale cursors and large copied
+        // counts must never trigger its signed underflow/usize overflow panic.
+        self.sequence.map_or(0, |sequence| {
+            sequence.0.wrapping_sub(head.0).max(0) as usize
+        })
+    }
+
+    fn advance(&mut self, count: usize) {
+        if let Some(sequence) = self.sequence.as_mut() {
+            sequence.0 = sequence.0.wrapping_add(count as i32);
+        }
+    }
+
+    pub(super) fn waited(&mut self) {
+        self.after_wait = true;
+    }
+}
+
 impl TcpSocket {
+    fn peek_terminal(&self, socket: &smoltcp::socket::tcp::Socket) -> bool {
+        use smoltcp::socket::tcp::State;
+        self.is_recv_shutdown()
+            || socket.pending_error().is_some()
+            || matches!(
+                socket.state(),
+                State::CloseWait
+                    | State::LastAck
+                    | State::Closing
+                    | State::TimeWait
+                    | State::Closed
+            )
+    }
+
+    pub(super) fn recv_target_ready(&self, flags: PMSG, cursor: &TcpPeekCursor) -> bool {
+        if !flags.contains(PMSG::PEEK) {
+            return self.recv_wait_ready();
+        }
+        {
+            let inner = self.inner.read();
+            if let Some(inner::Inner::Established(established)) = inner.as_ref() {
+                return established.with_mut(|socket| {
+                    let head = socket.recv_head_seq();
+                    cursor.observed_head != Some(head)
+                        || socket.recv_queue() > cursor.offset(head)
+                        || self.peek_terminal(socket)
+                });
+            }
+        }
+        self.recv_wait_ready()
+    }
+
     fn maybe_schedule_cork_timeout(&self) {
         if !self
             .options
@@ -135,7 +212,21 @@ impl TcpSocket {
         limit: usize,
         flags: PMSG,
         report_error: bool,
+        peek_offset: usize,
     ) -> Result<usize, SystemError> {
+        if flags.contains(PMSG::PEEK) && socket.can_recv() && socket.recv_queue() <= peek_offset {
+            // Already-peeked bytes are not new readiness. Drain unseen bytes
+            // before observing FIN, local shutdown or a pending reset.
+            return if self.peek_terminal(socket) {
+                if socket.pending_error().is_some() {
+                    Self::recv_reset_result(socket, report_error)
+                } else {
+                    Ok(0)
+                }
+            } else {
+                Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
+            };
+        }
         if !socket.can_recv() {
             if socket.may_recv() && socket.pending_error().is_some() {
                 return Self::recv_reset_result(socket, report_error);
@@ -169,7 +260,7 @@ impl TcpSocket {
         // - With MSG_PEEK: do not consume.
         if flags.contains(PMSG::TRUNC) {
             if flags.contains(PMSG::PEEK) {
-                let queued = socket.recv_queue();
+                let queued = socket.recv_queue().saturating_sub(peek_offset);
                 return Ok(core::cmp::min(limit, queued));
             }
 
@@ -207,7 +298,7 @@ impl TcpSocket {
         }
 
         if flags.contains(PMSG::PEEK) {
-            return match socket.peek_slice(current_buf) {
+            return match socket.peek_slice_at(peek_offset, current_buf) {
                 Ok(size) => Ok(size),
                 Err(smoltcp::socket::tcp::RecvError::InvalidState) => {
                     Self::recv_reset_result(socket, report_error)
@@ -401,9 +492,10 @@ impl TcpSocket {
 
     pub(super) fn try_recv_target(
         &self,
-        target: &mut TcpReceiveTarget<'_>,
+        target: &mut TcpReceiveTarget<'_, '_>,
         offset: usize,
         flags: PMSG,
+        cursor: &mut TcpPeekCursor,
     ) -> Result<ReceiveAttempt<usize>, SystemError> {
         let recv_guard = self.recv_lock.lock();
         let mut total_read = 0;
@@ -425,23 +517,33 @@ impl TcpSocket {
             {
                 inner::Inner::Established(established) => established.with_mut(|socket| {
                     let remaining = target.len() - offset - total_read;
+                    let peek_offset = if flags.contains(PMSG::PEEK) {
+                        cursor.sync(socket.recv_head_seq(), offset + total_read)
+                    } else {
+                        0
+                    };
                     let bytes = match target {
                         TcpReceiveTarget::Buffer(bytes) => &mut bytes[offset + total_read..],
                         TcpReceiveTarget::Discard(_) => &mut [],
-                        TcpReceiveTarget::Peek { buffer, .. } => {
-                            let required = if socket.can_recv() {
-                                remaining.min(socket.recv_queue())
-                            } else {
-                                0
-                            };
-                            if socket.can_recv() && buffer.capacity() < required {
+                        TcpReceiveTarget::Peek { staging, .. } => {
+                            let required = remaining
+                                .min(socket.recv_queue().saturating_sub(peek_offset))
+                                .min(USER_RECV_STAGING_SIZE);
+                            if staging.capacity() < required {
                                 return Ok(ReceiveAttempt::NeedBuffer(required));
                             }
-                            buffer.bytes_mut(required)
+                            staging.bytes_mut(required)
                         }
                     };
-                    self.recv_established(socket, bytes, remaining, flags, total_read == 0)
-                        .map(ReceiveAttempt::Ready)
+                    self.recv_established(
+                        socket,
+                        bytes,
+                        remaining,
+                        flags,
+                        offset + total_read == 0,
+                        peek_offset,
+                    )
+                    .map(ReceiveAttempt::Ready)
                 }),
                 inner::Inner::Connecting(connecting) => {
                     if let Some(err) = connecting.take_connect_error() {
@@ -466,9 +568,17 @@ impl TcpSocket {
                     return Ok(ReceiveAttempt::NeedBuffer(required));
                 }
                 Ok(ReceiveAttempt::Ready(n)) => {
-                    // For PEEK, we don't loop/accumulate because we are not consuming.
-                    // Also for TRUNC+PEEK.
                     if flags.contains(PMSG::PEEK) {
+                        if let TcpReceiveTarget::Peek {
+                            user_buffer,
+                            staging,
+                        } = target
+                        {
+                            // No inner or SocketSet guard survives user access.
+                            // recv_lock protects this one snapshot/copy, never a wait.
+                            user_buffer.write_to_user(offset, staging.bytes(n))?;
+                        }
+                        cursor.advance(n);
                         return Ok(ReceiveAttempt::Ready(n));
                     }
 

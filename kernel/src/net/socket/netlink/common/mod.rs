@@ -12,7 +12,10 @@ use crate::{
                 parse_socket_buffer_size, parse_socket_buffer_size_force, SOCK_MIN_RCVBUF,
                 SOCK_MIN_SNDBUF, SYSCTL_RMEM_MAX, SYSCTL_WMEM_MAX,
             },
-            common::{parse_timeval_opt, write_i32_getsockopt, write_timeval_opt},
+            common::{
+                parse_timeval_opt, parse_timeval_ticks, write_i32_getsockopt, write_timeval_opt,
+                write_timeval_ticks, INFINITE_TIMEOUT_TICKS,
+            },
             endpoint::Endpoint,
             netlink::{
                 addr::{multicast::GroupIdSet, NetlinkSocketAddr},
@@ -74,7 +77,7 @@ pub struct NetlinkSocket<P: SupportedNetlinkProtocol> {
     protocol: u32,
     group_count: AtomicUsize,
     send_timeout_us: AtomicU64,
-    recv_timeout_us: AtomicU64,
+    recv_timeout_ticks: AtomicU64,
     fasync_items: Arc<FAsyncItems>,
     inode_id: InodeId,
     open_files: AtomicUsize,
@@ -134,7 +137,7 @@ where
             protocol,
             group_count: AtomicUsize::new(0),
             send_timeout_us: AtomicU64::new(u64::MAX),
-            recv_timeout_us: AtomicU64::new(u64::MAX),
+            recv_timeout_ticks: AtomicU64::new(INFINITE_TIMEOUT_TICKS),
             fasync_items,
             inode_id: generate_inode_id(),
             open_files: AtomicUsize::new(0),
@@ -292,19 +295,25 @@ where
         if self.is_nonblocking() || flags.contains(PMSG::DONTWAIT) {
             self.try_recv_packet(flags)
         } else {
-            let timeout = self.recv_timeout_us.load(Ordering::Relaxed);
-            let started = crate::time::Instant::now();
+            let timeout = self.recv_timeout_ticks.load(Ordering::Relaxed);
+            let started = crate::time::timer::clock();
             loop {
                 match self.try_recv_packet(flags) {
                     Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
-                        let remaining = (timeout != u64::MAX).then(|| {
-                            let elapsed = crate::time::Instant::now().saturating_sub(started);
-                            crate::time::Duration::from_micros(
-                                timeout.saturating_sub(elapsed.total_micros()),
+                        let finite = timeout != INFINITE_TIMEOUT_TICKS;
+                        let wait = if finite {
+                            let elapsed = crate::time::timer::clock().saturating_sub(started);
+                            self.wait_queue.wait_event_io_interruptible_timeout_ticks(
+                                || self.can_recv(),
+                                timeout.saturating_sub(elapsed),
                             )
-                        });
-                        self.wait_queue
-                            .wait_event_io_interruptible_timeout(|| self.can_recv(), remaining)?;
+                        } else {
+                            self.wait_queue
+                                .wait_event_io_interruptible_timeout(|| self.can_recv(), None)
+                        };
+                        wait.map_err(|error| {
+                            crate::net::socket::recv_timeout::map_wait_error(error, finite)
+                        })?;
                     }
                     result => break result,
                 }
@@ -535,9 +544,8 @@ where
                         Ok(write_timeval_opt(value, us))
                     }
                     PSO::RCVTIMEO_OLD | PSO::RCVTIMEO_NEW => {
-                        let us = self.recv_timeout_us.load(Ordering::Relaxed);
-                        let us = if us == u64::MAX { 0 } else { us };
-                        Ok(write_timeval_opt(value, us))
+                        let ticks = self.recv_timeout_ticks.load(Ordering::Relaxed);
+                        Ok(write_timeval_ticks(value, ticks))
                     }
                     _ => Err(SystemError::ENOPROTOOPT),
                 }
@@ -634,9 +642,8 @@ where
                         Ok(())
                     }
                     PSO::RCVTIMEO_OLD | PSO::RCVTIMEO_NEW => {
-                        let d = parse_timeval_opt(val)?;
-                        let us = d.map(|v| v.total_micros()).unwrap_or(u64::MAX);
-                        self.recv_timeout_us.store(us, Ordering::Relaxed);
+                        let ticks = parse_timeval_ticks(val)?.unwrap_or(INFINITE_TIMEOUT_TICKS);
+                        self.recv_timeout_ticks.store(ticks, Ordering::Relaxed);
                         Ok(())
                     }
                     _ => Err(SystemError::ENOPROTOOPT),

@@ -306,6 +306,63 @@ class VectorWritePrivileges : public testing::Test {
         }
     }
 
+    void CheckRamfsContentAndSetid(const std::string& directory) {
+        const size_t length = 128 * 1024 + 37;
+        const std::string bytes(length, 'R');
+        const std::string path = directory + "/mapped-source";
+        for (int mapping : {0, MAP_PRIVATE, MAP_SHARED}) {
+            SCOPED_TRACE(mapping);
+            for (Operation operation : {Operation::Writev, Operation::Pwritev,
+                                        Operation::Pwritev2, Operation::Pwrite64}) {
+                SCOPED_TRACE(kOperationNames[static_cast<size_t>(operation)]);
+                int fd = open(path.c_str(), O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0600);
+                ASSERT_GE(fd, 0) << strerror(errno);
+                struct File {
+                    int value;
+                    const std::string& path;
+                    ~File() { close(value); unlink(path.c_str()); }
+                } file{fd, path};
+                ASSERT_EQ(ssize_t(length), pwrite(fd, bytes.data(), length, 0));
+                ASSERT_EQ(0, fchmod(fd, 06777));
+                pid_t child = fork();
+                ASSERT_GE(child, 0);
+                if (child == 0) {
+                    alarm(10);
+                    void* source = const_cast<char*>(bytes.data());
+                    if (mapping != 0) {
+                        source = mmap(nullptr, length, PROT_READ, mapping, fd, 0);
+                        if (source == MAP_FAILED || madvise(source, length, MADV_DONTNEED) != 0) _exit(1);
+                        // Leave the source PTEs absent: the primary write must
+                        // fault this same inode while retaining its content guard.
+                    }
+                    if (lseek(fd, length, SEEK_SET) != off_t(length)) _exit(2);
+                    iovec vectors[] = {{source, 65519},
+                                      {static_cast<char*>(source) + 65519, length - 65519}};
+                    if (operation == Operation::Pwrite64) vectors[0].iov_len = length;
+                    ssize_t written = Write(operation, fd, vectors, 2, length);
+                    if (mapping != 0) munmap(source, length);
+                    if (written != ssize_t(length)) _exit(3);
+                    if (lseek(fd, 0, SEEK_CUR) != off_t((operation == Operation::Writev ? 2 : 1) * length)) _exit(4);
+                    _exit(0);
+                }
+                int status = 0;
+                pid_t waited;
+                do { waited = waitpid(child, &status, 0); } while (waited == -1 && errno == EINTR);
+                ASSERT_EQ(child, waited);
+                ASSERT_TRUE(WIFEXITED(status)) << status;
+                ASSERT_EQ(0, WEXITSTATUS(status));
+                std::string actual(2 * length, '\0');
+                ASSERT_EQ(ssize_t(actual.size()), pread(fd, actual.data(), actual.size(), 0));
+                EXPECT_EQ(bytes + bytes, actual);
+                struct stat metadata{};
+                ASSERT_EQ(0, fstat(fd, &metadata));
+                // The root caller retains CAP_FSETID. Successful normal and
+                // mapped-source writes must not clear its setid bits.
+                EXPECT_EQ(mode_t(06777), metadata.st_mode & 07777);
+            }
+        }
+    }
+
     void CheckFifoCommunication(const std::string& path, bool copy_up = false,
                                 const std::string& writer_path = "") {
         int reader = open(path.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC);
@@ -389,6 +446,17 @@ TEST_F(VectorWritePrivileges, TmpfsRemovesSetidBeforeUserCopy) {
     }
     Check(directory, false);
     CheckScalarZeroLimits(directory, false);
+    EXPECT_EQ(0, umount(directory)) << strerror(errno);
+    EXPECT_EQ(0, rmdir(directory));
+}
+
+TEST_F(VectorWritePrivileges, RamfsRemovesSetidBeforeUserCopy) {
+    char directory[] = "/tmp/ramfs-write-privileges-XXXXXX";
+    ASSERT_NE(nullptr, mkdtemp(directory));
+    ASSERT_EQ(0, mount("none", directory, "ramfs", 0, nullptr)) << strerror(errno);
+    Check(directory, false);
+    CheckScalarZeroLimits(directory, false);
+    CheckRamfsContentAndSetid(directory);
     EXPECT_EQ(0, umount(directory)) << strerror(errno);
     EXPECT_EQ(0, rmdir(directory));
 }

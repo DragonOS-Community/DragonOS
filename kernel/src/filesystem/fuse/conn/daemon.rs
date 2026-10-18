@@ -1019,7 +1019,10 @@ impl FuseConn {
             (opcode, SystemError::from_i32(errno)),
             (FUSE_LOOKUP, Some(SystemError::ENOENT))
                 | (FUSE_FLUSH, Some(SystemError::ENOSYS))
-                | (FUSE_GETXATTR, Some(SystemError::ENOSYS))
+                | (
+                    FUSE_GETXATTR,
+                    Some(SystemError::ENOSYS | SystemError::ENODATA)
+                )
                 | (FUSE_SETXATTR, Some(SystemError::ENOSYS))
                 | (FUSE_LISTXATTR, Some(SystemError::ENOSYS))
                 | (FUSE_REMOVEXATTR, Some(SystemError::ENOSYS))

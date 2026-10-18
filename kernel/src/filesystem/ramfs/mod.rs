@@ -32,7 +32,7 @@ use system_error::SystemError;
 use super::vfs::{
     file::FilePrivateData, utils::DName, FileSystem, FsInfo, FsReconfigureRequest, IndexNode,
     InodeFlags, InodeId, InodeMode, LinkMutationCoordinator, LinkRemovalOutcome, Metadata,
-    RenameOutcome, SetMetadataMask, SpecialNodeData,
+    MetadataUpdate, RenameOutcome, SetMetadataMask, SpecialNodeData,
 };
 
 use linkme::distributed_slice;
@@ -705,12 +705,43 @@ impl IndexNode for LockedRamFSInode {
     ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
         let mut publish = || {};
         let mut stage = super::vfs::WritePrivilegeStage::new(&mut publish);
-        self.write_primary_with_privilege_stage(
+        self.write_at_with_privilege_stage(offset, len, buf, _data, &mut stage)
+    }
+
+    fn write_at_with_privilege_stage(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &[u8],
+        data: MutexGuard<FilePrivateData>,
+        stage: &mut super::vfs::WritePrivilegeStage<'_>,
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        self.write_at_with_inode_context(
+            offset,
+            len,
+            buf,
+            data,
+            &super::vfs::permission::InodeOpContext::legacy(),
+            stage,
+        )
+    }
+
+    fn write_at_with_inode_context(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &[u8],
+        data: MutexGuard<FilePrivateData>,
+        context: &super::vfs::permission::InodeOpContext,
+        stage: &mut super::vfs::WritePrivilegeStage<'_>,
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        self.write_primary_with_inode_context(
             offset,
             len,
             super::vfs::PrimaryWriteSource::Kernel(buf),
-            _data,
-            &mut stage,
+            data,
+            context,
+            stage,
         )
         .map(|result| result.written_len)
     }
@@ -721,31 +752,84 @@ impl IndexNode for LockedRamFSInode {
         len: usize,
         source: super::vfs::PrimaryWriteSource<'_, '_>,
         data: MutexGuard<FilePrivateData>,
-        _stage: &mut super::vfs::WritePrivilegeStage<'_>,
+        stage: &mut super::vfs::WritePrivilegeStage<'_>,
     ) -> Result<super::vfs::PrimaryWriteResult, crate::mm::allocation::MemoryAllocationError> {
+        self.write_primary_with_inode_context(
+            offset,
+            len,
+            source,
+            data,
+            &super::vfs::permission::InodeOpContext::legacy(),
+            stage,
+        )
+    }
+
+    fn write_primary_with_inode_context(
+        &self,
+        offset: usize,
+        len: usize,
+        source: super::vfs::PrimaryWriteSource<'_, '_>,
+        data: MutexGuard<FilePrivateData>,
+        context: &super::vfs::permission::InodeOpContext,
+        stage: &mut super::vfs::WritePrivilegeStage<'_>,
+    ) -> Result<super::vfs::PrimaryWriteResult, crate::mm::allocation::MemoryAllocationError> {
+        if context.is_idmapped() {
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP.into());
+        }
         if let super::vfs::PrimaryWriteSource::Kernel(buffer) = &source {
             if buffer.len() < len {
                 return Err(SystemError::EINVAL.into());
             }
+        }
+        if len == 0 {
+            return Ok(super::vfs::PrimaryWriteResult::new(0));
         }
         offset
             .checked_add(len)
             .filter(|end| *end <= isize::MAX as usize)
             .ok_or(SystemError::EFBIG)?;
         drop(data);
-        let cache = {
-            let inode = self.0.lock();
+        // Metadata setters and truncate exclude the entire primary write.
+        // Faults only read short metadata snapshots, so a same-file mapped
+        // source can fault while this content guard is retained.
+        let _content = self.2.read();
+        let (cache, mode_changed) = {
+            let mut inode = self.0.lock();
             if inode.metadata.file_type == FileType::Dir {
                 return Err(SystemError::EISDIR.into());
             }
-            inode.page_cache.clone().ok_or(SystemError::EINVAL)?
+            let cache = inode.page_cache.clone().ok_or(SystemError::EINVAL)?;
+            let mut mode_changed = false;
+            if inode.metadata.file_type == FileType::File {
+                if let Some(cred) = &context.cred {
+                    let (requested, derived_mask) =
+                        super::vfs::vcore::prepare_write_side_effect_metadata_with_cred(
+                            context.view_metadata(&inode.metadata),
+                            inode.metadata.size.max(0) as usize,
+                            cred,
+                        );
+                    if derived_mask.contains(SetMetadataMask::MODE) {
+                        let mask = SetMetadataMask::MODE
+                            | SetMetadataMask::CTIME
+                            | SetMetadataMask::WRITE_SIDE_EFFECT;
+                        let backing =
+                            context.backing_metadata_request(&inode.metadata, &requested, mask)?;
+                        super::vfs::merge_metadata_masked(&mut inode.metadata, &backing, mask);
+                        mode_changed = true;
+                    }
+                }
+            }
+            (cache, mode_changed)
         };
+        // Publish committed permission changes even if the first user copy
+        // faults. File completion must not repeat this stage after data.
+        stage.complete();
+        if mode_changed {
+            stage.commit_attrib();
+        }
         let task = crate::process::ProcessManager::current_pcb();
         let owner = crate::cgroup::memory::account_for_task(&task);
         let creator = crate::cgroup::memory::object_for_task(&task);
-        // Retain the canonical size transaction across all bounded user-copy
-        // batches. A kernel symlink initializer still executes one callback.
-        let _size_guard = self.2.read();
         source
             .write_chunks(len, |relative, bytes| {
                 let position = offset.checked_add(relative).ok_or(SystemError::EFBIG)?;
@@ -809,6 +893,7 @@ impl IndexNode for LockedRamFSInode {
         &self,
         metadata: &Metadata,
     ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        let _content = self.2.write();
         let mut inode = self.0.lock();
         inode.metadata.atime = metadata.atime;
         inode.metadata.mtime = metadata.mtime;
@@ -826,9 +911,22 @@ impl IndexNode for LockedRamFSInode {
         metadata: &Metadata,
         mask: SetMetadataMask,
     ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        let _content = self.2.write();
         let mut inode = self.0.lock();
         super::vfs::merge_metadata_masked(&mut inode.metadata, metadata, mask);
         Ok(())
+    }
+
+    fn update_metadata_masked(
+        &self,
+        update: &mut MetadataUpdate<'_>,
+    ) -> Result<SetMetadataMask, crate::mm::allocation::MemoryAllocationError> {
+        let _content = self.2.write();
+        let current = self.0.lock().metadata.clone();
+        let (requested, mask) = update(&current)?;
+        let mut inode = self.0.lock();
+        super::vfs::merge_metadata_masked(&mut inode.metadata, &requested, mask);
+        Ok(mask)
     }
 
     fn update_atime(&self, now: PosixTimeSpec, relatime: bool) -> Result<(), SystemError> {

@@ -2039,7 +2039,21 @@ impl FuseNode {
                 core::cmp::min(max_pages_by_conn, io_config.max_readahead_pages),
             ),
         );
-        let pages_to_read = core::cmp::min(max_pages, core::cmp::max(req_pages, 16));
+        // Keep mmap's existing 16-page starting/readaround window. The
+        // read() initial-size heuristic can shrink a one-page fault to only
+        // one or two pages under a small connection limit, adding READ trips.
+        // Only a miss immediately after the previous window grows it; random
+        // faults return to the base window. All connection limits still apply.
+        let follows_previous = ra_state.prev_index >= 0
+            && (ra_state.prev_index as usize)
+                .checked_add(1)
+                .is_some_and(|next| page_index == next);
+        let window_pages = if ra_state.size != 0 && follows_previous {
+            ReadaheadControl::get_next_ra_size(ra_state.size, max_pages)
+        } else {
+            16
+        };
+        let pages_to_read = core::cmp::min(max_pages, core::cmp::max(window_pages, req_pages));
         let end_page = core::cmp::min(last_file_page + 1, page_index.saturating_add(pages_to_read));
 
         let file_ctx = FillPagesFileCtx {

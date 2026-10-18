@@ -835,6 +835,8 @@ struct fuse_daemon_args {
     uint64_t attr_valid_sec;
     uint32_t init_out_flags_override;
     uint32_t init_out_max_write_override;
+    uint16_t init_out_max_pages_override;
+    uint32_t init_out_max_readahead_override;
     uint64_t write_watch_offset;
     uint64_t write_watch_offset2;
     uint64_t hello_open_fh_override;
@@ -1009,7 +1011,8 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
         out.flags = init_flags;
         out.flags2 = 0;
         out.max_write = a->init_out_max_write_override ? a->init_out_max_write_override : 4096;
-        out.max_pages = 32;
+        out.max_pages = a->init_out_max_pages_override ? a->init_out_max_pages_override : 32;
+        out.max_readahead = a->init_out_max_readahead_override;
         if (fuse_write_reply(a->fd, h->unique, 0, &out, sizeof(out)) != 0) {
             return -1;
         }

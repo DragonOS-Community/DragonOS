@@ -1463,7 +1463,8 @@ impl PageFaultHandler {
         let size = match size_source {
             FilemapSize::FetchFromInode => file
                 .inode()
-                .metadata()
+                .cached_metadata()
+                .or_else(|_| file.inode().metadata())
                 .ok()
                 .map(|metadata| metadata.size.max(0) as usize),
             FilemapSize::Stable(size) => Some(size),
@@ -1474,22 +1475,31 @@ impl PageFaultHandler {
             }
         }
 
-        if !page_cache.fault_page_state(backing_pgoff).cached {
-            account_major_fault_event(pfm.data_account());
-            ret = VmFaultReason::VM_FAULT_MAJOR;
-        }
-
-        match page_cache.manager().try_commit_page_pinned(
-            backing_pgoff,
-            &pfm.data_account,
-            &pfm.creator_object,
-        ) {
-            Ok(page_pin) => {
-                let page = page_pin.page();
-                pfm.page = Some(page);
-                pfm.page_pin = Some(page_pin);
+        // 命中快路径：单次缓存锁直接取已就绪页（同时充当命中判定），
+        // 省去 fault_page_state 与 try_commit_page_pinned 的重复加锁。
+        // 未命中回退完整提交路径（处理 Loading 等待与后端填充），
+        // major 记账只在慢路径分支做。
+        if let Some(page_pin) = page_cache.manager().peek_page_pinned(backing_pgoff) {
+            pfm.page = Some(page_pin.page());
+            pfm.page_pin = Some(page_pin);
+        } else {
+            if !page_cache.fault_page_state(backing_pgoff).cached {
+                account_major_fault_event(pfm.data_account());
+                ret = VmFaultReason::VM_FAULT_MAJOR;
             }
-            Err(error) => return pfm.allocation_failure(error),
+
+            match page_cache.manager().try_commit_page_pinned(
+                backing_pgoff,
+                &pfm.data_account,
+                &pfm.creator_object,
+            ) {
+                Ok(page_pin) => {
+                    let page = page_pin.page();
+                    pfm.page = Some(page);
+                    pfm.page_pin = Some(page_pin);
+                }
+                Err(error) => return pfm.allocation_failure(error),
+            }
         }
         ret
     }

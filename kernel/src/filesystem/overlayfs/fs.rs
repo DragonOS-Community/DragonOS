@@ -27,7 +27,7 @@ const INODE_CACHE_PRUNE_INTERVAL: usize = 256;
 type LowerRoot = (String, Arc<dyn IndexNode>);
 
 /// Path objects fixed when each fsconfig parameter is supplied. The resulting
-/// overlay filesystem retains these pins for its entire lifetime.
+/// overlay filesystem retains its share of these pins until final shutdown.
 #[derive(Debug, Clone, Default)]
 struct OverlayFsconfigPaths {
     upper: Option<Arc<ResolvedPath>>,
@@ -440,6 +440,14 @@ pub(super) struct OvlSuperBlock {
     is_lower: bool,
 }
 
+/// Semantic backing-mount ownership ends at superblock shutdown, independently
+/// of the lifetime of cached inode wrappers and workqueue Arc references.
+#[derive(Debug)]
+struct OverlayBackingMounts {
+    write_mount: Option<vfs::mount::MountExternalGuard>,
+    _paths: Option<Arc<OverlayFsconfigPaths>>,
+}
+
 #[derive(Debug)]
 pub(super) struct OverlayFS {
     #[allow(dead_code)]
@@ -450,14 +458,13 @@ pub(super) struct OverlayFS {
     pub(super) numdatalayer: usize,
     pub(super) layers: Vec<OvlLayer>, // index 0 is upper when present; lowers have index >= 1
     pub(super) workdir: Option<Arc<dyn IndexNode>>,
-    // Immutable backing identity: admission must not take upper_inode or
-    // copy-up locks merely to find the mount on which it is about to write.
-    write_mount: Option<vfs::mount::MountExternalGuard>,
+    // Admission must not take upper_inode/copy-up locks to find its backing
+    // mount. None means final shutdown has released our semantic ownership.
+    backing_mounts: Mutex<Option<OverlayBackingMounts>>,
     pub(super) root_inode: Arc<OvlInode>,
     pub(super) super_block: SuperBlock,
     pub(super) mutation_lock: Mutex<()>,
     pub(super) backing_cred: Arc<Cred>,
-    _backing_paths: Option<Arc<OverlayFsconfigPaths>>,
     pub(super) samefs: bool,
     inode_cache: Mutex<OvlInodeCache>,
     link_state_cache: Mutex<OvlLinkStateCache>,
@@ -472,12 +479,45 @@ pub(super) struct OverlayFS {
 impl FileSystem for OverlayFS {
     fn prepare_write(&self) -> Result<Vec<vfs::mount::writer::MountWriteGuard>, SystemError> {
         let mut writers = Vec::new();
-        if let Some(mount) = &self.write_mount {
+        let backing = self.backing_mounts.lock();
+        let backing = backing.as_ref().ok_or(SystemError::EBUSY)?;
+        if let Some(mount) = &backing.write_mount {
             writers.try_reserve(1).map_err(|_| SystemError::ENOMEM)?;
             writers.push(mount.mount().want_write_from(mount)?);
         }
         Ok(writers)
     }
+    fn shrink_inode_cache_for_shutdown(&self) -> Result<(), SystemError> {
+        // Final shutdown has no active mounts or external operations. Detach
+        // the cache before releasing retentions: their zero-owner callbacks
+        // can publish work to the still-live backing filesystem.
+        let cache = core::mem::take(&mut *self.inode_cache.lock());
+        for inode in cache.entries.values().filter_map(Weak::upgrade) {
+            inode.release_backing_retentions_for_shutdown();
+        }
+        for inode in cache
+            .recent_lookups
+            .iter()
+            .chain(cache.recent_fallback_dirs.iter())
+        {
+            inode.release_backing_retentions_for_shutdown();
+        }
+        self.root_inode.release_backing_retentions_for_shutdown();
+        for layer in &self.layers {
+            layer.mnt.release_backing_retentions_for_shutdown();
+        }
+        drop(cache);
+        Ok(())
+    }
+
+    fn on_umount(&self) {
+        // Like Linux ovl_put_super(): ordinary umount must release backing
+        // mount pins before VFS publishes shutdown completion. Drop outside
+        // our lock because the last pin can start backing filesystem shutdown.
+        let backing = self.backing_mounts.lock().take();
+        drop(backing);
+    }
+
     fn required_superblock_flags(&self) -> crate::filesystem::vfs::mount::MountFlags {
         if self.ovl_upper_mnt().is_none() {
             crate::filesystem::vfs::mount::MountFlags::RDONLY
@@ -1220,12 +1260,14 @@ impl MountableFileSystem for OverlayFS {
                 numdatalayer: lower_roots.len(),
                 layers,
                 workdir: workdir_inode,
-                write_mount,
+                backing_mounts: Mutex::new(Some(OverlayBackingMounts {
+                    write_mount,
+                    _paths: prepared,
+                })),
                 root_inode,
                 super_block: super_block.clone(),
                 mutation_lock: Mutex::new(()),
                 backing_cred,
-                _backing_paths: prepared,
                 samefs,
                 inode_cache: Mutex::new(OvlInodeCache::default()),
                 link_state_cache: Mutex::new(OvlLinkStateCache::default()),

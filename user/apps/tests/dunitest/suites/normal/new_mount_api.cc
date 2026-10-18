@@ -562,6 +562,9 @@ TEST_F(NewMountApiTest, OverlayFsconfigPinsLayerAtParameterTime) {
         << strerror(errno);
     close(treefd);
     EXPECT_TRUE(exists(dst() + "/marker"));
+    ASSERT_EQ(0, umount(dst().c_str())) << strerror(errno);
+    // The closed fscontext and final overlay shutdown release their own pins.
+    ASSERT_EQ(0, umount(src().c_str())) << strerror(errno);
 }
 
 TEST_F(NewMountApiTest, OverlayLowerOnlyMountIsReadOnly) {
@@ -654,6 +657,9 @@ TEST_F(NewMountApiTest, OverlayLowerOnlyMountIsReadOnly) {
     ASSERT_EQ(0, stat((lower1 + "/marker").c_str(), &lower_stat));
     EXPECT_EQ(0644U, lower_stat.st_mode & 0777);
     EXPECT_EQ(1, lower_stat.st_size);
+    ASSERT_EQ(0, umount(dst().c_str())) << strerror(errno);
+    // Lower-only overlays have path pins even without a write_mount owner.
+    ASSERT_EQ(0, umount(src().c_str())) << strerror(errno);
 }
 
 TEST_F(NewMountApiTest, OverlayLowerOnlyLegacyMount) {

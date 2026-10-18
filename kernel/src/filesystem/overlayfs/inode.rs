@@ -237,6 +237,13 @@ enum OriginState {
 }
 
 impl OvlInode {
+    /// End cache retention before final Overlay shutdown releases backing
+    /// mounts. Publishing reclaim must precede the backing eviction queue seal.
+    pub(super) fn release_backing_retentions_for_shutdown(&self) {
+        let retentions = core::mem::take(&mut *self.backing_retentions.lock());
+        drop(retentions);
+    }
+
     pub(super) fn install_upper_inode(
         &self,
         slot: &mut Option<Arc<dyn IndexNode>>,

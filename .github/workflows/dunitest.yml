@@ -54,6 +54,7 @@ jobs:
           normal/ext4_nested_writeback
           normal/ext4_shared_xattr
           normal/pipe_write_fault
+          normal/pipe_transfer_copy
           normal/pipe_empty_slot
           normal/preadv2_flags
           normal/pwritev2_flags

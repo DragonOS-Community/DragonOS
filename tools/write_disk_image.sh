@@ -121,18 +121,22 @@ if [ "${image_exists}" = "1" ]; then
     fi
 fi
 
-# Build the base image from tools/docker-rootfs when the rootfs manifest
-# references it but it is not present locally (e.g. "dragonos-rootfs:ubuntu2404").
-# This keeps the rootfs content definition in one place: the Dockerfile.
+# Base images in the "dragonos-rootfs:" namespace are owned by this repo:
+# tools/docker-rootfs/Dockerfile is their single source of truth. Rebuild
+# them on every disk-image write (docker layer cache keeps unchanged builds
+# fast) so Dockerfile edits are always picked up instead of silently reusing
+# a stale local tag. Other base images are left to DADK (pull policy).
 base_image="$(awk '/^\[base\]/{in_base=1;next} /^\[/{in_base=0} in_base && /^image[[:space:]]*=/{gsub(/[[:space:]"=]/,"",$0); print substr($0,6); exit}' "${root_folder}/config/rootfs.generated.toml" || true)"
-if [ -n "${base_image}" ] && ! docker image inspect "${base_image}" >/dev/null 2>&1; then
-    if [ -f "${root_folder}/tools/docker-rootfs/Dockerfile" ]; then
-        echo "Base image '${base_image}' not found locally, building from tools/docker-rootfs/Dockerfile..."
+case "${base_image}" in
+    dragonos-rootfs:*)
+        if ! command -v docker >/dev/null 2>&1; then
+            echo "Error: base image '${base_image}' is built from tools/docker-rootfs/Dockerfile, which requires a working docker CLI/daemon." >&2
+            exit 1
+        fi
+        echo "Building base image '${base_image}' from tools/docker-rootfs/Dockerfile (layer cache keeps unchanged builds fast)..."
         docker build -t "${base_image}" "${root_folder}/tools/docker-rootfs" || exit 1
-    else
-        echo "Base image '${base_image}' not found locally and no Dockerfile to build it; DADK will try to pull it."
-    fi
-fi
+        ;;
+esac
 
 # 判断是否存在硬盘镜像文件，如果不存在，就创建一个
 echo "创建硬盘镜像文件..."

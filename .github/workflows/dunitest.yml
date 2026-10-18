@@ -64,6 +64,10 @@ jobs:
           normal/user_namespace_id_map
           normal/user_namespace_admission
           normal/direct_write_semantics
+          normal/direct_read_semantics
+          normal/directory_read_admission
+          normal/timerfd_semantics
+          normal/proc_write_admission
           normal/pipe_empty_slot
           normal/preadv2_flags
           normal/pwritev2_flags

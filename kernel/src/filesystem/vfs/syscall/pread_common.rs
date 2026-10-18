@@ -42,14 +42,15 @@ pub(super) fn do_pread_at(
     }
     // Numerical range validation does not probe VMAs. EOF need not access it.
     let mut output = unsafe { UserBuffer::new(VirtAddr::new(user_ptr), len) };
-    if file.user_read_mode() != UserReadMode::Buffered {
+    let intent = file.read_io_intent();
+    if file.user_read_mode_with_io_intent(intent) != UserReadMode::Buffered {
         let read = file
-            .pread_user_syscall_chunk(offset, len, &mut output)?
+            .pread_user_syscall_with_intent(offset, len, &mut output, intent)?
             .ok_or(SystemError::EIO)?;
         if read != 0 {
             file.notify_io_event(FsEvent::ACCESS);
         }
         return Ok(read);
     }
-    super::sys_read::read_buffered_into_user(file, &mut output, Some(offset))
+    super::sys_read::read_buffered_into_user(file, &mut output, Some(offset), intent)
 }

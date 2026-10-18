@@ -83,6 +83,41 @@ pub(super) fn read_at(
     backing_file.try_pread(offset, len, buf)
 }
 
+pub(super) fn read_at_with_io_intent(
+    inode: &OvlInode,
+    offset: usize,
+    len: usize,
+    buf: &mut [u8],
+    data: crate::libs::mutex::MutexGuard<FilePrivateData>,
+    intent: vfs::ReadIoIntent,
+) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+    let (backing_file, _) = backing_file_for_io(inode, data)?;
+    backing_file.read_backing_with_io_intent(offset, len, buf, intent)
+}
+
+pub(super) fn read_user_with_io_intent(
+    inode: &OvlInode,
+    offset: usize,
+    len: usize,
+    writer: &mut crate::syscall::user_buffer::UserBuffer<'_>,
+    data: crate::libs::mutex::MutexGuard<FilePrivateData>,
+    intent: vfs::ReadIoIntent,
+) -> Result<Option<usize>, SystemError> {
+    // Like ovl_read_iter, an empty read needs no backing selection or reopen.
+    if len == 0 {
+        return Ok(Some(0));
+    }
+    let FilePrivateData::Overlayfs(overlay_data) = &*data else {
+        return Err(SystemError::EBADF);
+    };
+    let overlay_data = overlay_data.clone();
+    drop(data);
+    // Recovery covers only backing selection/open, never user copying.
+    let (backing_file, _) =
+        File::recover_io(|| backing_file_from_data_for_io(inode, &overlay_data))?;
+    backing_file.read_user_provider_at(offset, len, writer, intent)
+}
+
 pub(super) fn write_at(
     inode: &OvlInode,
     offset: usize,
@@ -351,7 +386,13 @@ fn backing_file_for_io(
     };
     let overlay_data = overlay_data.clone();
     drop(data);
+    backing_file_from_data_for_io(inode, &overlay_data)
+}
 
+fn backing_file_from_data_for_io(
+    inode: &OvlInode,
+    overlay_data: &OverlayFilePrivateData,
+) -> Result<(Arc<File>, bool), crate::mm::allocation::MemoryAllocationError> {
     loop {
         let (current_real_inode, current_is_upper) = inode.current_realdata_inode()?;
         let (flags, cred) = {

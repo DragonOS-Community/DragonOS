@@ -84,6 +84,16 @@ pub(crate) fn configure_readonly_seq_file(behavior: &mut OpenFileBehavior) {
     behavior.mode.remove(FileMode::FMODE_CAN_WRITE);
 }
 
+/// A real proc write handler, including its owner-selected position update.
+/// The global proc wrapper itself remains writable even when this is absent.
+pub type ProcWriteCallback<F> = fn(
+    &F,
+    usize,
+    usize,
+    &[u8],
+    MutexGuard<'_, FilePrivateData>,
+) -> Result<PrimaryWriteResult, SystemError>;
+
 /// FileOps trait 定义了 procfs 文件需要实现的操作
 pub trait FileOps: Sync + Send + Sized + Debug {
     /// Apply provider-specific operation capabilities after the common open
@@ -127,39 +137,11 @@ pub trait FileOps: Sync + Send + Sized + Debug {
         data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError>;
 
-    /// 向文件的指定偏移量写入数据（可选，默认返回 EIO，与 proc_reg_write 一致）
-    ///
-    /// # 参数
-    /// - `offset`: 写入的起始偏移量
-    /// - `len`: 要写入的字节数
-    /// - `buf`: 包含要写入数据的缓冲区
-    /// - `data`: 文件私有数据
-    ///
-    /// # 返回值
-    /// - `Ok(usize)`: 实际写入的字节数
-    /// - `Err(SystemError)`: 错误码
-    fn write_at(
-        &self,
-        _offset: usize,
-        _len: usize,
-        _buf: &[u8],
-        _data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError> {
-        Err(SystemError::EIO)
-    }
-
-    /// Return the position selected by this same owner invocation. Most
-    /// proc handlers advance by their returned byte count; callbacks that
-    /// preserve or conditionally change ppos override this result instead.
-    fn write_at_with_position(
-        &self,
-        offset: usize,
-        len: usize,
-        buf: &[u8],
-        data: MutexGuard<FilePrivateData>,
-    ) -> Result<PrimaryWriteResult, SystemError> {
-        self.write_at(offset, len, buf, data)
-            .map(PrimaryWriteResult::new)
+    /// Return the real proc handler before any userspace payload staging.
+    /// An absent callback still leaves the wrapper's CAN_WRITE capability set,
+    /// matching Linux proc_reg_write(), which returns EIO without reading buf.
+    fn write_callback(&self) -> Option<ProcWriteCallback<Self>> {
+        None
     }
 
     /// 打开文件时调用，可用于按 open 时上下文初始化 procfs 私有数据
@@ -277,8 +259,9 @@ impl<F: FileOps + 'static> IndexNode for ProcFile<F> {
         buf: &[u8],
         data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
-        self.inner
-            .write_at(offset, len, buf, data)
+        let callback = self.inner.write_callback().ok_or(SystemError::EIO)?;
+        callback(&self.inner, offset, len, buf, data)
+            .map(|result| result.written_len)
             .map_err(Into::into)
     }
 
@@ -291,10 +274,11 @@ impl<F: FileOps + 'static> IndexNode for ProcFile<F> {
         data: MutexGuard<FilePrivateData>,
         _stage: &mut WritePrivilegeStage<'_>,
     ) -> Result<PrimaryWriteResult, crate::mm::allocation::MemoryAllocationError> {
+        // Callback admission precedes allocation and protected payload access.
+        // Numeric range and iovec metadata checks remain syscall-owned.
+        let callback = self.inner.write_callback().ok_or(SystemError::EIO)?;
         source.with_buffer(len, |buffer| {
-            self.inner
-                .write_at_with_position(offset, len.min(buffer.len()), buffer, data)
-                .map_err(Into::into)
+            callback(&self.inner, offset, len.min(buffer.len()), buffer, data).map_err(Into::into)
         })
     }
 

@@ -4,6 +4,7 @@
 //! access that address space. Reuses ptrace's batched cross-process memory access
 //! (page-table translation + fault-in on page faults).
 
+use crate::filesystem::procfs::template::ProcWriteCallback;
 use crate::{
     filesystem::{
         procfs::{
@@ -54,6 +55,13 @@ impl MemFileOps {
 }
 
 impl FileOps for MemFileOps {
+    fn write_callback(&self) -> Option<ProcWriteCallback<Self>> {
+        Some(|ops, offset, len, buf, data| {
+            ops.write_at(offset, len, buf, data)
+                .map(crate::filesystem::vfs::PrimaryWriteResult::new)
+        })
+    }
+
     fn supports_read_iter_flags(&self) -> bool {
         false
     }
@@ -107,6 +115,12 @@ impl FileOps for MemFileOps {
         Ok(n)
     }
 
+    fn owner(&self) -> Option<(usize, usize)> {
+        self.target.owner_uid_gid()
+    }
+}
+
+impl MemFileOps {
     fn write_at(
         &self,
         offset: usize,
@@ -135,9 +149,5 @@ impl FileOps for MemFileOps {
             return Err(SystemError::EIO);
         }
         Ok(n)
-    }
-
-    fn owner(&self) -> Option<(usize, usize)> {
-        self.target.owner_uid_gid()
     }
 }

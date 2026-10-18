@@ -103,23 +103,33 @@ pub(super) fn read_iovecs_at(
     }
     super::sys_preadv2::validate_read_flags(file, flags)?;
 
+    let intent = file.read_io_intent();
+    let read_mode = file.user_read_mode_with_io_intent(intent);
     // Linux falls back to one `.read` call per iovec when an inode does
     // not implement `.read_iter`. Record readers that consume data before
     // copying it to userspace must keep that ordering for readv as well.
-    if file.user_read_mode() == UserReadMode::Scalar {
+    if read_mode == UserReadMode::Scalar {
         return readv_user_chunks(file, iovecs, max_rw_count, position);
     }
 
-    if file.user_read_mode() == UserReadMode::Iterator || file.file_type() == FileType::Socket {
+    if read_mode == UserReadMode::Iterator || file.file_type() == FileType::Socket {
         // Socket readv is one underlying read, but ACCESS still belongs to
         // the readv completion boundary (including a zero-byte result).
         let mut user_buffer = UserBuffer::new_vectored(iovecs, requested);
-        let nread = if file.user_read_mode() == UserReadMode::Iterator {
+        let nread = if read_mode == UserReadMode::Iterator {
             match position {
-                Some(offset) => {
-                    file.pread_user_syscall_chunk(offset, requested, &mut user_buffer)?
-                }
-                None => file.read_user_syscall_chunk(requested, &mut user_buffer)?,
+                Some(offset) => file.pread_user_syscall_with_intent(
+                    offset,
+                    requested,
+                    &mut user_buffer,
+                    intent,
+                )?,
+                None => file.read_user_at_current_position_with_intent(
+                    requested,
+                    &mut user_buffer,
+                    false,
+                    intent,
+                )?,
             }
             .ok_or(SystemError::EIO)?
         } else {
@@ -162,10 +172,14 @@ pub(super) fn read_iovecs_at(
             };
             let mut output = unsafe { UserBuffer::new(VirtAddr::new(current_base), chunk_len) };
             let read = match position {
-                Some(offset) => {
-                    file.pread_into_user_syscall_chunk(offset + total_read, kbuf, &mut output, 0)
-                }
-                None => file.read_syscall_chunk(kbuf, &mut output, 0),
+                Some(offset) => file.pread_into_user_syscall_chunk(
+                    offset + total_read,
+                    kbuf,
+                    &mut output,
+                    0,
+                    intent,
+                ),
+                None => file.read_syscall_chunk(kbuf, &mut output, 0, intent),
             };
             let n = match read {
                 Ok(n) => n,

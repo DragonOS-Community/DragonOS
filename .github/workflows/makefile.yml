@@ -31,6 +31,7 @@ jobs:
   ext4-fuse-test:
     name: Ext4 host FUSE xattr regression
     env:
+      HOME: /root
       CARGO_HOME: /root/.cargo
       RUSTUP_HOME: /root/.rustup
     needs: changes

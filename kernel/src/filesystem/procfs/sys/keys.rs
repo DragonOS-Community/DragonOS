@@ -1,5 +1,6 @@
 //! Linux keyring quota and garbage-collection controls at /proc/sys/kernel/keys.
 
+use crate::filesystem::procfs::template::ProcWriteCallback;
 use alloc::{
     format,
     string::ToString,
@@ -130,6 +131,13 @@ impl KeySettingFileOps {
 }
 
 impl FileOps for KeySettingFileOps {
+    fn write_callback(&self) -> Option<ProcWriteCallback<Self>> {
+        Some(|ops, offset, len, buf, data| {
+            ops.write_at(offset, len, buf, data)
+                .map(crate::filesystem::vfs::PrimaryWriteResult::new)
+        })
+    }
+
     fn supports_write_iter_flags(&self) -> bool {
         true
     }
@@ -147,7 +155,9 @@ impl FileOps for KeySettingFileOps {
         let value = self.setting.value().load(Ordering::Relaxed);
         proc_read(0, len, buf, format!("{value}\n").as_bytes())
     }
+}
 
+impl KeySettingFileOps {
     fn write_at(
         &self,
         offset: usize,

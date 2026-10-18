@@ -29,7 +29,7 @@ mod sym;
 pub use self::{
     builder::{Builder, ProcDirBuilder, ProcFileBuilder, ProcSymBuilder},
     dir::{lookup_child_from_table, populate_children_from_table, DirOps, ProcDir},
-    file::{FileOps, ProcFile},
+    file::{FileOps, ProcFile, ProcWriteCallback},
     sym::{ProcSym, SymOps},
 };
 

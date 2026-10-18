@@ -101,27 +101,71 @@ impl<'a> UserBuffer<'a> {
         }
     }
 
-    /// Alignment of the effective iterator, without accessing user payload.
+    /// OR alignment used by legacy direct-I/O owners (notably FAT). Empty
+    /// segments do not contribute, matching Linux iov_iter_alignment().
     pub(crate) fn alignment(&self, len: usize) -> usize {
-        let mut remaining = len.min(self.len);
+        self.alignment_at(0, len)
+    }
+
+    pub(crate) fn alignment_at(&self, offset: usize, len: usize) -> usize {
+        let mut result = 0;
+        self.visit_range(offset, len, |address, count| {
+            if count != 0 {
+                result |= address | count;
+            }
+            true
+        });
+        result
+    }
+
+    /// Block direct I/O checks address and length masks separately, including
+    /// still-present empty segments. This intentionally differs from the OR
+    /// alignment above, as do Linux's bdev_iter_is_aligned() and legacy DIO.
+    pub(crate) fn is_aligned_at(
+        &self,
+        offset: usize,
+        len: usize,
+        address_mask: usize,
+        length_mask: usize,
+    ) -> bool {
+        let mut aligned = true;
+        self.visit_range(offset, len, |address, count| {
+            aligned = address & address_mask == 0 && count & length_mask == 0;
+            aligned
+        });
+        aligned
+    }
+
+    fn visit_range(&self, offset: usize, len: usize, mut visit: impl FnMut(usize, usize) -> bool) {
+        let mut remaining = len.min(self.len.saturating_sub(offset));
         if remaining == 0 {
-            return 0;
+            return;
         }
         match &self.backing {
-            UserBufferBacking::Contiguous(address) => address.data() | remaining,
+            UserBufferBacking::Contiguous(address) => {
+                visit(address.data() + offset, remaining);
+            }
             UserBufferBacking::Vectored(segments) => {
-                let mut alignment = 0;
+                let mut skip = offset;
                 for segment in segments.iter() {
-                    let count = remaining.min(segment.iov_len);
-                    if count != 0 {
-                        alignment |= segment.iov_base as usize | count;
+                    // Protected copy/zero iteration consumes the last positive
+                    // segment, then stops at its immediate successor. A zero
+                    // segment at that exact boundary remains in the suffix,
+                    // unlike Linux's separate explicit iov_iter_advance path.
+                    if skip != 0 && skip >= segment.iov_len {
+                        skip -= segment.iov_len;
+                        continue;
                     }
+                    let count = remaining.min(segment.iov_len - skip);
+                    if !visit(segment.iov_base as usize + skip, count) {
+                        break;
+                    }
+                    skip = 0;
                     remaining -= count;
                     if remaining == 0 {
                         break;
                     }
                 }
-                alignment
             }
         }
     }

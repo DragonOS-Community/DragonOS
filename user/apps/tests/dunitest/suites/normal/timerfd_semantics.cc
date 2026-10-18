@@ -5,6 +5,9 @@
 #include <poll.h>
 #include <stdint.h>
 #include <sys/epoll.h>
+#include <sys/eventfd.h>
+#include <sys/signalfd.h>
+#include <signal.h>
 #include <sys/syscall.h>
 #include <sys/timerfd.h>
 #include <sys/uio.h>
@@ -80,11 +83,55 @@ TEST(TimerFdSemantics, CreateValidationAndInitialState) {
     ASSERT_EQ(1, poll(&ready, 1, 1000));
     ASSERT_NE(0, ready.revents & POLLIN);
     errno = 0;
+    EXPECT_EQ(-1, read(fd.get(), nullptr, 0));
+    EXPECT_EQ(EINVAL, errno);
+    errno = 0;
     EXPECT_EQ(-1, syscall(SYS_read, fd.get(), nullptr, sizeof(ticks)));
     EXPECT_EQ(EFAULT, errno);
     errno = 0;
     EXPECT_EQ(-1, read(fd.get(), &ticks, sizeof(ticks)));
     EXPECT_EQ(EAGAIN, errno);
+}
+
+// Anonymous inode metadata uses the same internal FileType as data files.
+// Zero-count scalar reads must still reach each record owner's admission,
+// whereas a zero-total vector completes before invoking its read operation.
+TEST(ReadOwnerAdmission, EventFdEmptyScalarDoesNotConsumeCounter) {
+    for (int flags : {0, static_cast<int>(EFD_NONBLOCK)}) {
+        UniqueFd fd(eventfd(7, flags | EFD_CLOEXEC));
+        ASSERT_GE(fd.get(), 0) << strerror(errno);
+        errno = 0;
+        EXPECT_EQ(-1, read(fd.get(), nullptr, 0));
+        EXPECT_EQ(EINVAL, errno);
+        iovec empty = {nullptr, 0};
+        EXPECT_EQ(0, readv(fd.get(), &empty, 1));
+        uint64_t value = 0;
+        ASSERT_EQ(static_cast<ssize_t>(sizeof(value)), read(fd.get(), &value, sizeof(value)));
+        EXPECT_EQ(7u, value);
+        errno = 0;
+        EXPECT_EQ(-1, read(fd.get(), nullptr, 0));
+        EXPECT_EQ(EINVAL, errno);
+    }
+}
+
+TEST(ReadOwnerAdmission, SignalFdEmptyScalarValidatesRecordSize) {
+    sigset_t mask;
+    ASSERT_EQ(0, sigemptyset(&mask));
+    for (int flags : {0, static_cast<int>(SFD_NONBLOCK)}) {
+        UniqueFd fd(signalfd(-1, &mask, flags | SFD_CLOEXEC));
+        ASSERT_GE(fd.get(), 0) << strerror(errno);
+        errno = 0;
+        EXPECT_EQ(-1, read(fd.get(), nullptr, 0));
+        EXPECT_EQ(EINVAL, errno);
+        iovec empty = {nullptr, 0};
+        EXPECT_EQ(0, readv(fd.get(), &empty, 1));
+        if (flags & SFD_NONBLOCK) {
+            signalfd_siginfo record = {};
+            errno = 0;
+            EXPECT_EQ(-1, read(fd.get(), &record, sizeof(record)));
+            EXPECT_EQ(EAGAIN, errno);
+        }
+    }
 }
 
 TEST(TimerFdSemantics, OneShotPollReadAndReset) {

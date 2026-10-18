@@ -197,6 +197,14 @@ impl PrimaryWriteResult {
     }
 }
 
+/// Read dispatch preserves the original userspace iterator until the actual
+/// storage owner has applied its direct-I/O admission rules.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadIoIntent {
+    Buffered,
+    Direct,
+}
+
 /// The direct request retains alignment of the original effective input,
 /// including every iovec boundary, across stacking and materialization.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1154,10 +1162,29 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, crate::mm::allocation::MemoryAllocationError>;
 
+    /// Preserve one request's dispatch across stacking and concurrent F_SETFL.
+    /// Non-stacking owners keep their ordinary typed backing operation.
+    fn read_at_with_io_intent(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &mut [u8],
+        data: MutexGuard<FilePrivateData>,
+        _intent: ReadIoIntent,
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        self.read_at(offset, len, buf, data)
+    }
+
     /// Select the protected userspace read contract without taking private
     /// data locks merely to discover the default buffered fallback.
     fn user_read_mode(&self) -> UserReadMode {
         UserReadMode::Buffered
+    }
+
+    /// Direct-capable owners may select whole-iterator admission without
+    /// changing the buffered or record-oriented contract of other files.
+    fn user_read_mode_with_io_intent(&self, _intent: ReadIoIntent) -> UserReadMode {
+        self.user_read_mode()
     }
 
     /// Whether read-vector flags follow Linux's `.read_iter` contract.
@@ -1191,6 +1218,19 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     ) -> Result<Option<usize>, SystemError> {
         drop(data);
         Ok(None)
+    }
+
+    /// Execute one user read with its original I/O intent. Legacy owners keep
+    /// their existing protected-copy hook and need no parallel implementation.
+    fn read_user_with_io_intent(
+        &self,
+        offset: usize,
+        len: usize,
+        writer: &mut UserBuffer<'_>,
+        data: MutexGuard<FilePrivateData>,
+        _intent: ReadIoIntent,
+    ) -> Result<Option<usize>, SystemError> {
+        self.read_user_at(offset, len, writer, data)
     }
 
     /// @brief 在inode的指定偏移量开始，写入指定大小的数据（从buf的第0byte开始写入）

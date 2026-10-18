@@ -136,19 +136,20 @@ fn read_into_user_buffer(fd: i32, user_ptr: *mut u8, len: usize) -> Result<usize
     let len = len.min(MAX_RW_COUNT);
     let mut output = unsafe { UserBuffer::new(VirtAddr::new(user_ptr as usize), len) };
 
-    if file.user_read_mode() != UserReadMode::Buffered {
+    let intent = file.read_io_intent();
+    if file.user_read_mode_with_io_intent(intent) != UserReadMode::Buffered {
         return file
-            .read_user_at_current_position(len, &mut output, true)?
+            .read_user_at_current_position_with_intent(len, &mut output, true, intent)?
             .ok_or(SystemError::EIO);
     }
     if len == 0 {
-        return Ok(0);
+        return read_buffered_into_user(file.as_ref(), &mut output, None, intent);
     }
     if file.file_type() == FileType::Socket {
         return read_socket_into_user_buffer(file.as_ref(), &mut output);
     }
 
-    read_buffered_into_user(file.as_ref(), &mut output, None)
+    read_buffered_into_user(file.as_ref(), &mut output, None, intent)
 }
 
 /// Shared bounded scalar transfer. An explicit cursor never updates the OFD.
@@ -156,8 +157,14 @@ pub(super) fn read_buffered_into_user(
     file: &File,
     output: &mut UserBuffer<'_>,
     position: Option<usize>,
+    intent: crate::filesystem::vfs::ReadIoIntent,
 ) -> Result<usize, SystemError> {
     let len = output.len();
+    if len == 0 {
+        // Scalar reads still invoke the backing operation: generic directory
+        // reads fail even for count zero. Vector empty completion stays separate.
+        return file.read_empty_syscall();
+    }
     let mut scratch = ReadScratch::default();
     let mut total = 0usize;
 
@@ -171,8 +178,10 @@ pub(super) fn read_buffered_into_user(
             Err(error) => return Err(error),
         };
         let read = match position {
-            Some(offset) => file.pread_into_user_syscall_chunk(offset + total, kbuf, output, total),
-            None => file.read_syscall_chunk(kbuf, output, total),
+            Some(offset) => {
+                file.pread_into_user_syscall_chunk(offset + total, kbuf, output, total, intent)
+            }
+            None => file.read_syscall_chunk(kbuf, output, total, intent),
         };
         let n = match read {
             Ok(n) => n,

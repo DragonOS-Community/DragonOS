@@ -2,6 +2,7 @@
 //!
 //! 提供内核参数配置接口
 
+use crate::filesystem::procfs::template::ProcWriteCallback;
 use crate::{
     debug::klog::loglevel::KERNEL_LOG_LEVEL,
     filesystem::{
@@ -220,6 +221,13 @@ impl ThreadsMaxFileOps {
 }
 
 impl FileOps for ThreadsMaxFileOps {
+    fn write_callback(&self) -> Option<ProcWriteCallback<Self>> {
+        Some(|ops, offset, len, buf, data| {
+            ops.write_at(offset, len, buf, data)
+                .map(crate::filesystem::vfs::PrimaryWriteResult::new)
+        })
+    }
+
     fn supports_write_iter_flags(&self) -> bool {
         true
     }
@@ -237,7 +245,9 @@ impl FileOps for ThreadsMaxFileOps {
         let content = format!("{}\n", crate::process::max_threads());
         proc_read(0, len, buf, content.as_bytes())
     }
+}
 
+impl ThreadsMaxFileOps {
     fn write_at(
         &self,
         offset: usize,
@@ -275,6 +285,13 @@ impl PidMaxFileOps {
 }
 
 impl FileOps for PidMaxFileOps {
+    fn write_callback(&self) -> Option<ProcWriteCallback<Self>> {
+        Some(|ops, offset, len, buf, data| {
+            ops.write_at(offset, len, buf, data)
+                .map(crate::filesystem::vfs::PrimaryWriteResult::new)
+        })
+    }
+
     fn supports_write_iter_flags(&self) -> bool {
         true
     }
@@ -292,7 +309,9 @@ impl FileOps for PidMaxFileOps {
         let content = format!("{}\n", crate::process::pid::pid_max());
         proc_read(0, len, buf, content.as_bytes())
     }
+}
 
+impl PidMaxFileOps {
     fn write_at(
         &self,
         offset: usize,
@@ -379,6 +398,10 @@ impl UtsStringFileOps {
 }
 
 impl FileOps for UtsStringFileOps {
+    fn write_callback(&self) -> Option<ProcWriteCallback<Self>> {
+        Some(Self::write_at_with_position)
+    }
+
     fn supports_write_iter_flags(&self) -> bool {
         true
     }
@@ -400,18 +423,9 @@ impl FileOps for UtsStringFileOps {
         content.push(b'\n');
         proc_read(offset, len, buf, &content)
     }
+}
 
-    fn write_at(
-        &self,
-        offset: usize,
-        _len: usize,
-        buf: &[u8],
-        _data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError> {
-        self.write_value(offset, buf)
-            .map(|result| result.written_len)
-    }
-
+impl UtsStringFileOps {
     fn write_at_with_position(
         &self,
         offset: usize,
@@ -469,6 +483,13 @@ impl PrintkFileOps {
 }
 
 impl FileOps for PrintkFileOps {
+    fn write_callback(&self) -> Option<ProcWriteCallback<Self>> {
+        Some(|ops, offset, len, buf, data| {
+            ops.write_at(offset, len, buf, data)
+                .map(crate::filesystem::vfs::PrimaryWriteResult::new)
+        })
+    }
+
     fn supports_write_iter_flags(&self) -> bool {
         true
     }
@@ -483,7 +504,9 @@ impl FileOps for PrintkFileOps {
         let content = Self::read_config();
         proc_read(offset, len, buf, content.as_bytes())
     }
+}
 
+impl PrintkFileOps {
     fn write_at(
         &self,
         _offset: usize,
@@ -516,6 +539,13 @@ impl OverflowIdFileOps {
 }
 
 impl FileOps for OverflowIdFileOps {
+    fn write_callback(&self) -> Option<ProcWriteCallback<Self>> {
+        Some(|ops, offset, len, buf, data| {
+            ops.write_at(offset, len, buf, data)
+                .map(crate::filesystem::vfs::PrimaryWriteResult::new)
+        })
+    }
+
     fn supports_write_iter_flags(&self) -> bool {
         true
     }
@@ -534,7 +564,9 @@ impl FileOps for OverflowIdFileOps {
         let content = alloc::format!("{}\n", val);
         proc_read(offset, len, buf, content.as_bytes())
     }
+}
 
+impl OverflowIdFileOps {
     fn write_at(
         &self,
         offset: usize,

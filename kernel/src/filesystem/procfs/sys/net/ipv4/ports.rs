@@ -1,5 +1,6 @@
 //! The two related INET port sysctls share ownership, permissions and parsing.
 
+use crate::filesystem::procfs::template::ProcWriteCallback;
 use alloc::{
     format,
     sync::{Arc, Weak},
@@ -59,6 +60,13 @@ impl PortFileOps {
 }
 
 impl FileOps for PortFileOps {
+    fn write_callback(&self) -> Option<ProcWriteCallback<Self>> {
+        Some(|ops, offset, len, buf, data| {
+            ops.write_at(offset, len, buf, data)
+                .map(crate::filesystem::vfs::PrimaryWriteResult::new)
+        })
+    }
+
     fn supports_write_iter_flags(&self) -> bool {
         true
     }
@@ -102,7 +110,9 @@ impl FileOps for PortFileOps {
         };
         proc_read(0, len, buf, text.as_bytes())
     }
+}
 
+impl PortFileOps {
     fn write_at(
         &self,
         offset: usize,

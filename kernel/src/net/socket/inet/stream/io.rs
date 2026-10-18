@@ -6,6 +6,7 @@ use system_error::SystemError;
 use crate::exception::workqueue::{schedule_work, Work};
 use crate::net::socket::inet::InetSocket;
 use crate::net::socket::recv_buffer::{ReceiveAttempt, RecvBuffer};
+use crate::net::socket::recv_timeout::ReceiveTimeout;
 use crate::net::socket::PMSG;
 use crate::syscall::user_buffer::UserBuffer;
 use crate::time::timer::{next_n_us_timer_jiffies, Timer, TimerFunction};
@@ -588,6 +589,7 @@ impl TcpSocket {
             return self.try_read_to_user_buffer(user_buffer);
         }
 
+        let mut timeout = ReceiveTimeout::new(self.recv_timeout());
         let mut total_read = 0usize;
         loop {
             match self.try_recv_to_user_buffer(user_buffer, total_read) {
@@ -601,27 +603,7 @@ impl TcpSocket {
                     if let Some(iface) = self.stack_poll_snapshot() {
                         super::poll_util::poll_stack_batch(iface.as_ref());
                     }
-                    let events = self.check_io_event();
-                    if events.intersects(
-                        crate::filesystem::epoll::EPollEventType::EPOLLIN
-                            | crate::filesystem::epoll::EPollEventType::EPOLLHUP
-                            | crate::filesystem::epoll::EPollEventType::EPOLLRDHUP
-                            | crate::filesystem::epoll::EPollEventType::EPOLLERR,
-                    ) {
-                        continue;
-                    }
-
-                    let wait_ret = self.wait_queue.wait_event_io_interruptible_timeout(
-                        || {
-                            self.check_io_event().intersects(
-                                crate::filesystem::epoll::EPollEventType::EPOLLIN
-                                    | crate::filesystem::epoll::EPollEventType::EPOLLHUP
-                                    | crate::filesystem::epoll::EPollEventType::EPOLLRDHUP
-                                    | crate::filesystem::epoll::EPollEventType::EPOLLERR,
-                            )
-                        },
-                        self.recv_timeout(),
-                    );
+                    let wait_ret = timeout.wait_io(&self.wait_queue, || self.recv_wait_ready());
                     if let Err(error) = wait_ret {
                         if total_read > 0 {
                             return Ok(total_read);

@@ -1,4 +1,5 @@
 use super::*;
+use crate::net::socket::recv_timeout::ReceiveTimeout;
 
 impl UdpSocket {
     /// Keep the socket's address family at the name-query ABI boundary while
@@ -334,6 +335,8 @@ impl Socket for UdpSocket {
     }
 
     fn recv(&self, buffer: &mut [u8], flags: PMSG) -> Result<usize, SystemError> {
+        let nonblock = self.is_nonblock() || flags.contains(PMSG::DONTWAIT);
+        let mut timeout = ReceiveTimeout::new(self.recv_timeout());
         // Check if read is shutdown
         // Linux allows reading buffered data even after SHUT_RD, only returns EOF when buffer is empty
         let shutdown_bits = self.shutdown.load(Ordering::Acquire);
@@ -341,7 +344,7 @@ impl Socket for UdpSocket {
 
         let peek = flags.contains(PMSG::PEEK);
 
-        if self.is_nonblock() || flags.contains(PMSG::DONTWAIT) {
+        if nonblock {
             let result = self.try_recv(buffer, peek);
             // If shutdown and no data available, return EOF instead of EWOULDBLOCK
             if is_recv_shutdown && matches!(result, Err(SystemError::EAGAIN_OR_EWOULDBLOCK)) {
@@ -365,10 +368,7 @@ impl Socket for UdpSocket {
                         if is_recv_shutdown {
                             return Ok(0);
                         }
-                        self.wait_queue.wait_event_io_interruptible_timeout(
-                            || self.can_recv(),
-                            self.recv_timeout(),
-                        )?;
+                        timeout.wait_io(&self.wait_queue, || self.can_recv())?;
                     }
                     Err(e) => return Err(e),
                 }
@@ -393,12 +393,14 @@ impl Socket for UdpSocket {
         flags: PMSG,
         _address: Option<Endpoint>,
     ) -> Result<(usize, Endpoint), SystemError> {
+        let nonblock = self.is_nonblock() || flags.contains(PMSG::DONTWAIT);
+        let mut timeout = ReceiveTimeout::new(self.recv_timeout());
         // Linux allows reading buffered data even after SHUT_RD
         // For blocking mode, check shutdown state in the loop
 
         let peek = flags.contains(PMSG::PEEK);
 
-        return if self.is_nonblock() || flags.contains(PMSG::DONTWAIT) {
+        return if nonblock {
             let result = self.try_recv(buffer, peek);
             // For non-blocking sockets, always return EAGAIN when no data
             // Even after shutdown, don't convert to EOF
@@ -432,10 +434,7 @@ impl Socket for UdpSocket {
                             }
                             return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
                         }
-                        self.wait_queue.wait_event_io_interruptible_timeout(
-                            || self.can_recv(),
-                            self.recv_timeout(),
-                        )?;
+                        timeout.wait_io(&self.wait_queue, || self.can_recv())?;
                         // log::debug!("UdpSocket::recv_from: wake up");
                     }
                     Err(e) => return Err(e),
@@ -603,6 +602,8 @@ impl Socket for UdpSocket {
         flags: PMSG,
         iovs: &crate::syscall::iov::IoVecs,
     ) -> Result<usize, SystemError> {
+        let nonblock = self.is_nonblock() || flags.contains(PMSG::DONTWAIT);
+        let mut timeout = ReceiveTimeout::new(self.recv_timeout());
         // log::debug!(
         //     "recv_msg: msg_name={:?}, msg_namelen={}, flags={:?}",
         //     msg.msg_name,
@@ -646,9 +647,7 @@ impl Socket for UdpSocket {
                     // Admission can recover here without replaying a receive.
                     buf.prepare(required)?;
                 }
-                Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
-                    if !self.is_nonblock() && !flags.contains(PMSG::DONTWAIT) =>
-                {
+                Err(SystemError::EAGAIN_OR_EWOULDBLOCK) if !nonblock => {
                     if self.shutdown.load(Ordering::Acquire) & 0x01 != 0 {
                         let inner = self.inner.read();
                         if let Some(UdpInner::Bound(bound)) = inner.as_ref() {
@@ -664,10 +663,7 @@ impl Socket for UdpSocket {
                         }
                         return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
                     }
-                    self.wait_queue.wait_event_io_interruptible_timeout(
-                        || self.can_recv(),
-                        self.recv_timeout(),
-                    )?;
+                    timeout.wait_io(&self.wait_queue, || self.can_recv())?;
                 }
                 Err(error) => return Err(error),
             }

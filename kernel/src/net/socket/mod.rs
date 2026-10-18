@@ -10,6 +10,7 @@ pub mod netlink;
 pub mod packet;
 mod posix;
 pub(crate) mod recv_buffer;
+pub(crate) mod recv_timeout;
 pub mod unix;
 mod utils;
 pub mod vsock;

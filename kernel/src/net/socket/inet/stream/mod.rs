@@ -30,6 +30,7 @@ type EP = crate::filesystem::epoll::EPollEventType;
 mod events;
 mod io;
 use crate::net::socket::recv_buffer::{ReceiveAttempt, RecvBuffer};
+use crate::net::socket::recv_timeout::ReceiveTimeout;
 use io::TcpReceiveTarget;
 mod lifecycle;
 mod poll_util;
@@ -44,6 +45,7 @@ impl TcpSocket {
         flags: PMSG,
     ) -> Result<usize, SystemError> {
         let nonblock = self.is_nonblock() || flags.contains(PMSG::DONTWAIT);
+        let mut timeout = ReceiveTimeout::new(self.recv_timeout());
         let waitall = flags.contains(PMSG::WAITALL)
             && !flags.contains(PMSG::PEEK)
             && !flags.contains(PMSG::TRUNC);
@@ -89,23 +91,7 @@ impl TcpSocket {
                     if let Some(iface) = self.stack_poll_snapshot() {
                         poll_util::poll_stack_batch(iface.as_ref());
                     }
-                    // 与 connect() 同理，不能只依赖缓存的 pollee 位。
-                    // 否则若“最后一次 notify() 先发生、而当前线程尚未真正入睡”，
-                    // 后续没有新事件时就会因为错过唤醒而永久睡眠。
-                    // 这里在入睡前主动重新检查真实 socket 状态，避免先唤后睡。
-                    let events = self.check_io_event();
-                    if events.intersects(EP::EPOLLIN | EP::EPOLLHUP | EP::EPOLLRDHUP | EP::EPOLLERR)
-                    {
-                        continue; // Data available now, retry recv
-                    }
-                    let wait_ret = self.wait_queue.wait_event_io_interruptible_timeout(
-                        || {
-                            self.check_io_event().intersects(
-                                EP::EPOLLIN | EP::EPOLLHUP | EP::EPOLLRDHUP | EP::EPOLLERR,
-                            )
-                        },
-                        self.recv_timeout(),
-                    );
+                    let wait_ret = timeout.wait_io(&self.wait_queue, || self.recv_wait_ready());
                     if let Err(e) = wait_ret {
                         if total_read > 0 {
                             break Ok(total_read);

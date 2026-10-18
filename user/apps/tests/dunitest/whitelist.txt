@@ -266,3 +266,4 @@ normal/ext4_user_read
 normal/direct_read_semantics
 normal/directory_read_admission
 normal/proc_write_admission
+normal/socket_receive_contracts

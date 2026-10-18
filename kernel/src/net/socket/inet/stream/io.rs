@@ -5,6 +5,7 @@ use system_error::SystemError;
 
 use crate::exception::workqueue::{schedule_work, Work};
 use crate::net::socket::inet::InetSocket;
+use crate::net::socket::recv_buffer::{ReceiveAttempt, RecvBuffer};
 use crate::net::socket::PMSG;
 use crate::syscall::user_buffer::UserBuffer;
 use crate::time::timer::{next_n_us_timer_jiffies, Timer, TimerFunction};
@@ -16,6 +17,33 @@ use super::inner;
 use super::TcpSocket;
 
 const USER_RECV_STAGING_SIZE: usize = 64 * 1024;
+
+/// Logical receive capacity is independent of payload storage: TCP TRUNC
+/// discards/counts bytes, and PEEK stages only bytes that are actually queued.
+pub(super) enum TcpReceiveTarget<'a> {
+    Buffer(&'a mut [u8]),
+    Discard(usize),
+    Peek {
+        buffer: &'a mut RecvBuffer,
+        limit: usize,
+    },
+}
+
+impl TcpReceiveTarget<'_> {
+    pub(super) fn len(&self) -> usize {
+        match self {
+            Self::Buffer(bytes) => bytes.len(),
+            Self::Discard(limit) | Self::Peek { limit, .. } => *limit,
+        }
+    }
+
+    pub(super) fn prepare(&mut self, required: usize) -> Result<(), SystemError> {
+        match self {
+            Self::Peek { buffer, .. } => buffer.prepare(required),
+            _ => unreachable!("only a lazy TCP peek needs storage admission"),
+        }
+    }
+}
 
 impl TcpSocket {
     fn maybe_schedule_cork_timeout(&self) {
@@ -102,12 +130,11 @@ impl TcpSocket {
     fn recv_established(
         &self,
         socket: &mut smoltcp::socket::tcp::Socket,
-        buf: &mut [u8],
+        current_buf: &mut [u8],
+        limit: usize,
         flags: PMSG,
         report_error: bool,
     ) -> Result<usize, SystemError> {
-        let current_buf = buf;
-
         if !socket.can_recv() {
             if socket.may_recv() && socket.pending_error().is_some() {
                 return Self::recv_reset_result(socket, report_error);
@@ -130,6 +157,11 @@ impl TcpSocket {
             };
         }
 
+        // A zero-capacity request still observes empty-queue/error/EOF state.
+        if limit == 0 {
+            return Ok(0);
+        }
+
         // gVisor tcp_socket.cc MsgTrunc* tests: for TCP stream, MSG_TRUNC means
         // "report the length but don't copy payload into userspace".
         // - Without MSG_PEEK: also consume (discard) the bytes.
@@ -137,16 +169,16 @@ impl TcpSocket {
         if flags.contains(PMSG::TRUNC) {
             if flags.contains(PMSG::PEEK) {
                 let queued = socket.recv_queue();
-                return Ok(core::cmp::min(current_buf.len(), queued));
+                return Ok(core::cmp::min(limit, queued));
             }
 
             let mut total = 0usize;
-            while total < current_buf.len() {
+            while total < limit {
                 if !socket.can_recv() {
                     break;
                 }
 
-                let want = current_buf.len() - total;
+                let want = limit - total;
                 let got = match socket.recv(|data| {
                     let take = core::cmp::min(want, data.len());
                     // Discard without copying.
@@ -366,11 +398,12 @@ impl TcpSocket {
         }
     }
 
-    pub(super) fn try_recv_with_flags(
+    pub(super) fn try_recv_target(
         &self,
-        buf: &mut [u8],
+        target: &mut TcpReceiveTarget<'_>,
+        offset: usize,
         flags: PMSG,
-    ) -> Result<usize, SystemError> {
+    ) -> Result<ReceiveAttempt<usize>, SystemError> {
         let recv_guard = self.recv_lock.lock();
         let mut total_read = 0;
 
@@ -390,7 +423,24 @@ impl TcpSocket {
                 .expect("Tcp inner::Inner is None")
             {
                 inner::Inner::Established(established) => established.with_mut(|socket| {
-                    self.recv_established(socket, &mut buf[total_read..], flags, total_read == 0)
+                    let remaining = target.len() - offset - total_read;
+                    let bytes = match target {
+                        TcpReceiveTarget::Buffer(bytes) => &mut bytes[offset + total_read..],
+                        TcpReceiveTarget::Discard(_) => &mut [],
+                        TcpReceiveTarget::Peek { buffer, .. } => {
+                            let required = if socket.can_recv() {
+                                remaining.min(socket.recv_queue())
+                            } else {
+                                0
+                            };
+                            if socket.can_recv() && buffer.capacity() < required {
+                                return Ok(ReceiveAttempt::NeedBuffer(required));
+                            }
+                            buffer.bytes_mut(required)
+                        }
+                    };
+                    self.recv_established(socket, bytes, remaining, flags, total_read == 0)
+                        .map(ReceiveAttempt::Ready)
                 }),
                 inner::Inner::Connecting(connecting) => {
                     if let Some(err) = connecting.take_connect_error() {
@@ -398,7 +448,7 @@ impl TcpSocket {
                     } else if connecting.is_connected() {
                         continue;
                     } else if connecting.is_refused_consumed() {
-                        Ok(0)
+                        Ok(ReceiveAttempt::Ready(0))
                     } else {
                         Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
                     }
@@ -411,11 +461,14 @@ impl TcpSocket {
             // cached readiness after a possible error consumption.
             self.update_events();
             match iter_result {
-                Ok(n) => {
+                Ok(ReceiveAttempt::NeedBuffer(required)) => {
+                    return Ok(ReceiveAttempt::NeedBuffer(required));
+                }
+                Ok(ReceiveAttempt::Ready(n)) => {
                     // For PEEK, we don't loop/accumulate because we are not consuming.
                     // Also for TRUNC+PEEK.
                     if flags.contains(PMSG::PEEK) {
-                        return Ok(n);
+                        return Ok(ReceiveAttempt::Ready(n));
                     }
 
                     total_read += n;
@@ -425,7 +478,7 @@ impl TcpSocket {
                         break;
                     }
 
-                    if total_read == buf.len() {
+                    if offset + total_read == target.len() {
                         // Buffer full
                         break;
                     }
@@ -448,7 +501,7 @@ impl TcpSocket {
         drop(recv_guard);
         self.finish_recv_progress(total_read > 0 && !flags.contains(PMSG::PEEK));
 
-        Ok(total_read)
+        Ok(ReceiveAttempt::Ready(total_read))
     }
 
     fn try_recv_to_user_buffer(

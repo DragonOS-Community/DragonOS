@@ -17,6 +17,7 @@ use crate::libs::mutex::Mutex;
 use crate::libs::wait_queue::WaitQueue;
 use crate::net::posix::{SockAddr, SockAddrIn};
 use crate::net::socket::common::{EPollItems, ShutdownBit};
+use crate::net::socket::recv_buffer::{ReceiveAttempt, RecvBuffer};
 use crate::net::socket::unix::utils::CmsgBuffer;
 use crate::net::socket::{AddressFamily, Socket, PMSG, PSO, PSOL};
 use crate::net::socket::{IpOption, PIPV6};
@@ -520,16 +521,26 @@ impl UdpSocket {
         Ok(())
     }
 
-    fn try_recv_queued(&self, buf: &mut [u8], peek: bool) -> Option<inner::UdpReceived> {
-        self.receive_queue.recv(buf, peek).map(
-            |(copy_len, original_len, source, destination, ifindex, _)| inner::UdpReceived {
-                copied: copy_len,
-                original_len,
-                source,
-                destination,
-                ifindex,
-            },
-        )
+    fn try_recv_queued(
+        &self,
+        buf: &mut [u8],
+        peek: bool,
+        capacity: usize,
+    ) -> Option<ReceiveAttempt<inner::UdpReceived>> {
+        self.receive_queue
+            .recv(buf, peek, capacity)
+            .map(|attempt| match attempt {
+                ReceiveAttempt::Ready((copied, original_len, source, destination, ifindex, _)) => {
+                    ReceiveAttempt::Ready(inner::UdpReceived {
+                        copied,
+                        original_len,
+                        source,
+                        destination,
+                        ifindex,
+                    })
+                }
+                ReceiveAttempt::NeedBuffer(required) => ReceiveAttempt::NeedBuffer(required),
+            })
     }
 
     pub fn do_bind(
@@ -926,13 +937,30 @@ impl UdpSocket {
         buf: &mut [u8],
         peek: bool,
     ) -> Result<inner::UdpReceived, SystemError> {
+        // Scalar callers already provide their complete destination capacity.
+        // Reuse the record transaction without introducing a second consumer.
+        let capacity = buf.len();
+        match self.try_recv_record(buf, peek, capacity)? {
+            ReceiveAttempt::Ready(received) => Ok(received),
+            ReceiveAttempt::NeedBuffer(_) => unreachable!("scalar UDP buffer covers its capacity"),
+        }
+    }
+
+    fn try_recv_record(
+        &self,
+        buf: &mut [u8],
+        peek: bool,
+        capacity: usize,
+    ) -> Result<ReceiveAttempt<inner::UdpReceived>, SystemError> {
         self.take_socket_error()?;
-        if let Some(received) = self.try_recv_queued(buf, peek) {
-            return Ok(received);
+        // NeedBuffer means this queue has a record. Only an empty authoritative
+        // queue may fall through to the per-interface ring.
+        if let Some(attempt) = self.try_recv_queued(buf, peek, capacity) {
+            return Ok(attempt);
         }
         match self.inner.write().as_mut() {
-            Some(UdpInner::Bound(bound)) => bound.try_recv_with_metadata(buf, peek),
-            Some(UdpInner::Unbound(unbound)) => unbound.try_recv_with_metadata(buf, peek),
+            Some(UdpInner::Bound(bound)) => bound.try_recv_with_metadata(buf, peek, capacity),
+            Some(UdpInner::Unbound(unbound)) => unbound.try_recv_with_metadata(buf, peek, capacity),
             None => Err(SystemError::EBADF),
         }
     }

@@ -118,15 +118,7 @@ pub(super) fn do_recvmsg_with_sock(
     let reader = UserBufferReader::new(msg, core::mem::size_of::<MsgHdr>(), from_user)?;
     let mut kmsg = reader.buffer_protected(0)?.read_one::<MsgHdr>(0)?;
 
-    // log::debug!(
-    //     "do_recvmsg: fd={}, msg_iovlen={}, msg_iov={:?}, flags={:#x}",
-    //     fd,
-    //     kmsg.msg_iovlen,
-    //     kmsg.msg_iov,
-    //     flags
-    // );
-
-    // 检查每个缓冲区地址是否合法，生成iovecs（fallback path needs this).
+    // Import the destination once; protocol owners scatter the selected payload.
     let iovs = unsafe { IoVecs::from_user(kmsg.msg_iov, kmsg.msg_iovlen, true)? };
 
     // Honor O_NONBLOCK set via fcntl(F_SETFL) by translating it to MSG_DONTWAIT.
@@ -135,37 +127,13 @@ pub(super) fn do_recvmsg_with_sock(
     // local socket handle bound below.
     let socket = sock.socket()?;
 
-    let (buf, recv_size, used_recv_msg) = {
-        let mut pmsg_flags = PMSG::from_bits_truncate(flags);
-        if sock.is_nonblocking() {
-            pmsg_flags.insert(PMSG::DONTWAIT);
-        }
-
-        // 优先使用 recv_msg 以便实现 msg_flags/msg_controllen 等语义。
-        match socket.recv_msg(&mut kmsg, pmsg_flags, &iovs) {
-            Ok(recv_size) => (alloc::vec::Vec::new(), recv_size, true),
-            Err(SystemError::ENOSYS) => {
-                let mut buf = iovs.new_buf(true)?;
-                // 从socket中读取数据
-                let recv_size = socket.recv(&mut buf, pmsg_flags)?;
-                (buf, recv_size, false)
-            }
-            Err(e) => return Err(e),
-        }
-    };
-
-    // 将数据写入用户空间的iovecs（recv_msg 路径已自行处理散布写入）
-    if !buf.is_empty() {
-        iovs.scatter(&buf[..recv_size])?;
+    let mut pmsg_flags = PMSG::from_bits_truncate(flags);
+    if sock.is_nonblocking() {
+        pmsg_flags.insert(PMSG::DONTWAIT);
     }
-
-    // Fallback path does not produce control messages.
-    if !used_recv_msg {
-        // 最小保证：不产生控制消息时必须把 msg_controllen 写回 0
-        // 否则用户态 CMSG_FIRSTHDR 可能非空。
-        kmsg.msg_controllen = 0;
-        kmsg.msg_flags = 0;
-    }
+    // Every socket implements recv_msg. Repeating a protocol ENOSYS through
+    // recv would lose its message flags and could perform a second receive.
+    let recv_size = socket.recv_msg(&mut kmsg, pmsg_flags, &iovs)?;
 
     // Copy out only the result fields that Linux updates.
     let mut writer =

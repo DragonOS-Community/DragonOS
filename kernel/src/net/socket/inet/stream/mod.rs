@@ -29,6 +29,8 @@ type EP = crate::filesystem::epoll::EPollEventType;
 
 mod events;
 mod io;
+use crate::net::socket::recv_buffer::{ReceiveAttempt, RecvBuffer};
+use io::TcpReceiveTarget;
 mod lifecycle;
 mod poll_util;
 mod stream_core;
@@ -36,6 +38,98 @@ mod stream_core;
 pub use stream_core::TcpSocket;
 
 impl TcpSocket {
+    fn recv_with_target(
+        &self,
+        target: &mut TcpReceiveTarget<'_>,
+        flags: PMSG,
+    ) -> Result<usize, SystemError> {
+        let nonblock = self.is_nonblock() || flags.contains(PMSG::DONTWAIT);
+        let waitall = flags.contains(PMSG::WAITALL)
+            && !flags.contains(PMSG::PEEK)
+            && !flags.contains(PMSG::TRUNC);
+        let mut total_read = 0usize;
+
+        let ret = loop {
+            match self.try_recv_target(target, total_read, flags) {
+                Ok(ReceiveAttempt::NeedBuffer(required)) => {
+                    // No protocol bytes have been consumed; all receive and
+                    // SocketSet guards were released by the admission attempt.
+                    target.prepare(required)?;
+                    continue;
+                }
+                Ok(ReceiveAttempt::Ready(n)) => {
+                    total_read += n;
+                    if n == 0 {
+                        // EOF or no more bytes available.
+                        break Ok(total_read);
+                    }
+                    if total_read == target.len() {
+                        break Ok(total_read);
+                    }
+                    if nonblock || !waitall {
+                        break Ok(total_read);
+                    }
+                    continue;
+                }
+                Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
+                    if nonblock {
+                        break if total_read > 0 {
+                            Ok(total_read)
+                        } else {
+                            Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
+                        };
+                    }
+                    if total_read > 0 && !waitall {
+                        break Ok(total_read);
+                    }
+                    // Poll in a loop until no more events. This is critical for loopback:
+                    // - Poll 1: TX sends data to loopback queue, RX processes existing packets
+                    // - Poll 2: RX processes the data we just transmitted (loopback roundtrip)
+                    // Without this loop, we'd wait for the poll thread to complete the roundtrip.
+                    if let Some(iface) = self.stack_poll_snapshot() {
+                        poll_util::poll_stack_batch(iface.as_ref());
+                    }
+                    // 与 connect() 同理，不能只依赖缓存的 pollee 位。
+                    // 否则若“最后一次 notify() 先发生、而当前线程尚未真正入睡”，
+                    // 后续没有新事件时就会因为错过唤醒而永久睡眠。
+                    // 这里在入睡前主动重新检查真实 socket 状态，避免先唤后睡。
+                    let events = self.check_io_event();
+                    if events.intersects(EP::EPOLLIN | EP::EPOLLHUP | EP::EPOLLRDHUP | EP::EPOLLERR)
+                    {
+                        continue; // Data available now, retry recv
+                    }
+                    let wait_ret = self.wait_queue.wait_event_io_interruptible_timeout(
+                        || {
+                            self.check_io_event().intersects(
+                                EP::EPOLLIN | EP::EPOLLHUP | EP::EPOLLRDHUP | EP::EPOLLERR,
+                            )
+                        },
+                        self.recv_timeout(),
+                    );
+                    if let Err(e) = wait_ret {
+                        if total_read > 0 {
+                            break Ok(total_read);
+                        }
+                        break Err(e);
+                    }
+                }
+                Err(e) => {
+                    if total_read > 0 {
+                        break Ok(total_read);
+                    }
+                    break Err(e);
+                }
+            }
+        };
+
+        if let Ok(n) = ret {
+            if n > 0 {
+                self.notify();
+            }
+        }
+        ret
+    }
+
     fn send_with_progress(
         &self,
         buffer: &[u8],
@@ -291,87 +385,7 @@ impl Socket for TcpSocket {
     }
 
     fn recv(&self, buffer: &mut [u8], flags: PMSG) -> Result<usize, SystemError> {
-        if self.is_nonblock() || flags.contains(PMSG::DONTWAIT) {
-            let ret = self.try_recv_with_flags(buffer, flags);
-            if let Ok(n) = ret {
-                if n > 0 {
-                    self.notify();
-                }
-            }
-            return ret;
-        }
-
-        let waitall = flags.contains(PMSG::WAITALL)
-            && !flags.contains(PMSG::PEEK)
-            && !flags.contains(PMSG::TRUNC);
-        let mut total_read = 0usize;
-
-        let ret = loop {
-            match self.try_recv_with_flags(&mut buffer[total_read..], flags) {
-                Ok(n) => {
-                    total_read += n;
-                    if n == 0 {
-                        // EOF or no more bytes available.
-                        break Ok(total_read);
-                    }
-                    if total_read == buffer.len() {
-                        break Ok(total_read);
-                    }
-                    if !waitall {
-                        break Ok(total_read);
-                    }
-                    continue;
-                }
-                Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
-                    if total_read > 0 && !waitall {
-                        break Ok(total_read);
-                    }
-                    // Poll in a loop until no more events. This is critical for loopback:
-                    // - Poll 1: TX sends data to loopback queue, RX processes existing packets
-                    // - Poll 2: RX processes the data we just transmitted (loopback roundtrip)
-                    // Without this loop, we'd wait for the poll thread to complete the roundtrip.
-                    if let Some(iface) = self.stack_poll_snapshot() {
-                        poll_util::poll_stack_batch(iface.as_ref());
-                    }
-                    // 与 connect() 同理，不能只依赖缓存的 pollee 位。
-                    // 否则若“最后一次 notify() 先发生、而当前线程尚未真正入睡”，
-                    // 后续没有新事件时就会因为错过唤醒而永久睡眠。
-                    // 这里在入睡前主动重新检查真实 socket 状态，避免先唤后睡。
-                    let events = self.check_io_event();
-                    if events.intersects(EP::EPOLLIN | EP::EPOLLHUP | EP::EPOLLRDHUP | EP::EPOLLERR)
-                    {
-                        continue; // Data available now, retry recv
-                    }
-                    let wait_ret = self.wait_queue.wait_event_io_interruptible_timeout(
-                        || {
-                            self.check_io_event().intersects(
-                                EP::EPOLLIN | EP::EPOLLHUP | EP::EPOLLRDHUP | EP::EPOLLERR,
-                            )
-                        },
-                        self.recv_timeout(),
-                    );
-                    if let Err(e) = wait_ret {
-                        if total_read > 0 {
-                            break Ok(total_read);
-                        }
-                        break Err(e);
-                    }
-                }
-                Err(e) => {
-                    if total_read > 0 {
-                        break Ok(total_read);
-                    }
-                    break Err(e);
-                }
-            }
-        };
-
-        if let Ok(n) = ret {
-            if n > 0 {
-                self.notify();
-            }
-        }
-        ret
+        self.recv_with_target(&mut TcpReceiveTarget::Buffer(buffer), flags)
     }
 
     fn read_to_user_buffer(
@@ -463,8 +477,7 @@ impl Socket for TcpSocket {
         let written = if flags.contains(PMSG::TRUNC) {
             // Linux TCP MSG_TRUNC reports/consumes bytes without copying the
             // payload, so an inaccessible iovec must not cause EFAULT.
-            let mut tmp = vec![0u8; total];
-            self.recv(&mut tmp, flags)?
+            self.recv_with_target(&mut TcpReceiveTarget::Discard(total), flags)?
         } else {
             let mut user_buffer =
                 crate::syscall::user_buffer::UserBuffer::new_vectored(iovs, total);
@@ -472,9 +485,15 @@ impl Socket for TcpSocket {
             if flags.contains(PMSG::PEEK) {
                 // PEEK never consumes, so staging remains transactional while
                 // preserving its existing receive semantics.
-                let mut tmp = vec![0u8; total];
-                let n = self.recv(&mut tmp, flags)?;
-                user_buffer.write_to_user(0, &tmp[..n])?;
+                let mut scratch = RecvBuffer::default();
+                let n = self.recv_with_target(
+                    &mut TcpReceiveTarget::Peek {
+                        buffer: &mut scratch,
+                        limit: total,
+                    },
+                    flags,
+                )?;
+                user_buffer.write_to_user(0, scratch.bytes(n))?;
                 n
             } else {
                 let nonblock = self.is_nonblock() || flags.contains(PMSG::DONTWAIT);

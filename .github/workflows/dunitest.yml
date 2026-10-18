@@ -49,6 +49,8 @@ jobs:
           normal/fuse_read_fault
           normal/fuse_write_privileges
           normal/read_buffer_selftest
+          normal/recvmsg_record_buffer
+          normal/tcp_receive_window_reopen
           normal/allocation_diagnostics
           normal/dma_allocator_selftest
           normal/ext4_orphan_recovery

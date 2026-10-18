@@ -11,7 +11,11 @@ use smoltcp::{
     wire::{IpAddress, IpEndpoint},
 };
 
-use crate::libs::mutex::Mutex;
+use crate::{libs::mutex::Mutex, net::socket::recv_buffer::ReceiveAttempt};
+
+/// The copied length, original length and identity of one accepted datagram.
+/// Keep the receive metadata separate from the owned queue storage.
+type ReceivedDatagram = (usize, usize, IpEndpoint, IpEndpoint, i32, PacketMeta);
 
 #[derive(Clone, Copy, Debug)]
 struct ConnectedPeer {
@@ -190,10 +194,14 @@ impl UdpReceiveQueue {
         &self,
         buf: &mut [u8],
         peek: bool,
-    ) -> Option<(usize, usize, IpEndpoint, IpEndpoint, i32, PacketMeta)> {
+        capacity: usize,
+    ) -> Option<ReceiveAttempt<ReceivedDatagram>> {
         let mut state = self.state.lock();
         let packet = state.packets.front()?;
-        let copy_len = core::cmp::min(buf.len(), packet.payload.len());
+        let copy_len = core::cmp::min(capacity, packet.payload.len());
+        if buf.len() < copy_len {
+            return Some(ReceiveAttempt::NeedBuffer(copy_len));
+        }
         buf[..copy_len].copy_from_slice(&packet.payload[..copy_len]);
         let result = (
             copy_len,
@@ -207,7 +215,7 @@ impl UdpReceiveQueue {
             let packet = state.packets.pop_front().unwrap();
             state.bytes -= packet.accounted_bytes;
         }
-        Some(result)
+        Some(ReceiveAttempt::Ready(result))
     }
 }
 

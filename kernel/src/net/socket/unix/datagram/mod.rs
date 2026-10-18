@@ -18,6 +18,7 @@ use crate::{
                 EPollItems,
             },
             endpoint::Endpoint,
+            recv_buffer::{ReceiveAttempt, RecvBuffer},
             unix::{UnixBinding, UnixEndpoint, UnixEndpointBound, UnixSocketType},
             AddressFamily, Socket, PMSG, PSOCK, PSOL,
         },
@@ -62,6 +63,15 @@ struct DatagramMessage {
     sender_addr: Option<UnixEndpointBound>,
     /// 发送端 SO_SNDBUF 记账的长度
     sender_accounted_len: usize,
+}
+
+/// Identity and lengths of the single record selected by recvmsg.
+struct DatagramRecvMeta {
+    copy_len: usize,
+    orig_len: usize,
+    sender_addr: Option<UnixEndpointBound>,
+    rights: Vec<Arc<File>>,
+    creds: Option<UCred>,
 }
 
 impl DatagramMessage {
@@ -567,6 +577,54 @@ impl UnixDatagramSocket {
         Ok((copy_len, msg.sender_addr, orig_len))
     }
 
+    /// Admit storage before removing a record. A retry after lock-free buffer
+    /// preparation always selects the current head and its matching metadata.
+    fn try_recvmsg_record(
+        &self,
+        buffer: &mut RecvBuffer,
+        capacity: usize,
+        peek: bool,
+    ) -> Result<ReceiveAttempt<DatagramRecvMeta>, SystemError> {
+        let mut inner = self.inner.lock();
+        let msg = inner
+            .recv_queue
+            .front()
+            .ok_or(SystemError::EAGAIN_OR_EWOULDBLOCK)?;
+        let orig_len = msg.data.len();
+        let copy_len = capacity.min(orig_len);
+        if buffer.capacity() < copy_len {
+            return Ok(ReceiveAttempt::NeedBuffer(copy_len));
+        }
+        if peek {
+            buffer
+                .bytes_mut(copy_len)
+                .copy_from_slice(&msg.data[..copy_len]);
+            return Ok(ReceiveAttempt::Ready(DatagramRecvMeta {
+                copy_len,
+                orig_len,
+                sender_addr: msg.sender_addr.clone(),
+                rights: msg.rights.clone(),
+                creds: msg.creds,
+            }));
+        }
+
+        // Keep the existing short critical section: the owned message remains
+        // valid after dequeue, and sender wakeup must not retain our inner lock.
+        let msg = inner.pop_message().ok_or(SystemError::EIO)?;
+        drop(inner);
+        buffer
+            .bytes_mut(copy_len)
+            .copy_from_slice(&msg.data[..copy_len]);
+        Self::release_sender_accounting(&msg.sender_addr, msg.sender_accounted_len);
+        Ok(ReceiveAttempt::Ready(DatagramRecvMeta {
+            copy_len,
+            orig_len,
+            sender_addr: msg.sender_addr,
+            rights: msg.rights,
+            creds: msg.creds,
+        }))
+    }
+
     fn recv_return_len(copy_len: usize, orig_len: usize, flags: PMSG) -> usize {
         if flags.contains(PMSG::TRUNC) {
             orig_len
@@ -839,106 +897,31 @@ impl Socket for UnixDatagramSocket {
         // - If control buffer is insufficient or missing, set MSG_CTRUNC.
         // - Fill msg_name/msg_namelen when provided.
 
-        let mut buf = iovs.new_buf(true)?;
-        let buf_cap = buf.len();
-
+        let mut buf = RecvBuffer::default();
+        let capacity = iovs.total_len();
         let nonblock = self.is_nonblocking() || flags.contains(PMSG::DONTWAIT);
         let peek = flags.contains(PMSG::PEEK);
-
-        let (payload_copy_len, sender_addr, orig_len, rights, creds) = if nonblock {
-            if peek {
-                let inner = self.inner.lock();
-                let msg_in = inner
-                    .recv_queue
-                    .front()
-                    .ok_or(SystemError::EAGAIN_OR_EWOULDBLOCK)?;
-
-                let orig_len = msg_in.data.len();
-                let copy_len = core::cmp::min(buf_cap, orig_len);
-                buf[..copy_len].copy_from_slice(&msg_in.data[..copy_len]);
-
-                (
-                    copy_len,
-                    msg_in.sender_addr.clone(),
-                    orig_len,
-                    msg_in.rights.clone(),
-                    msg_in.creds,
-                )
-            } else {
-                // Pop first (short lock), then copy/compute outside.
-                let msg_in = {
-                    let mut inner = self.inner.lock();
-                    inner
-                        .pop_message()
-                        .ok_or(SystemError::EAGAIN_OR_EWOULDBLOCK)?
-                };
-
-                let orig_len = msg_in.data.len();
-                let copy_len = core::cmp::min(buf_cap, orig_len);
-                buf[..copy_len].copy_from_slice(&msg_in.data[..copy_len]);
-
-                Self::release_sender_accounting(&msg_in.sender_addr, msg_in.sender_accounted_len);
-
-                (
-                    copy_len,
-                    msg_in.sender_addr,
-                    orig_len,
-                    msg_in.rights,
-                    msg_in.creds,
-                )
-            }
-        } else {
-            loop {
-                if peek {
-                    let got = {
-                        let inner = self.inner.lock();
-                        inner.recv_queue.front().map(|msg_in| {
-                            let orig_len = msg_in.data.len();
-                            let copy_len = core::cmp::min(buf_cap, orig_len);
-                            buf[..copy_len].copy_from_slice(&msg_in.data[..copy_len]);
-                            (
-                                copy_len,
-                                msg_in.sender_addr.clone(),
-                                orig_len,
-                                msg_in.rights.clone(),
-                                msg_in.creds,
-                            )
-                        })
-                    };
-                    if let Some(v) = got {
-                        break v;
-                    }
-                } else {
-                    let popped = {
-                        let mut inner = self.inner.lock();
-                        inner.pop_message()
-                    };
-                    if let Some(msg_in) = popped {
-                        let orig_len = msg_in.data.len();
-                        let copy_len = core::cmp::min(buf_cap, orig_len);
-                        buf[..copy_len].copy_from_slice(&msg_in.data[..copy_len]);
-
-                        Self::release_sender_accounting(
-                            &msg_in.sender_addr,
-                            msg_in.sender_accounted_len,
-                        );
-
-                        break (
-                            copy_len,
-                            msg_in.sender_addr,
-                            orig_len,
-                            msg_in.rights,
-                            msg_in.creds,
-                        );
-                    }
+        let DatagramRecvMeta {
+            copy_len: payload_copy_len,
+            sender_addr,
+            orig_len,
+            rights,
+            creds,
+        } = loop {
+            match self.try_recvmsg_record(&mut buf, capacity, peek) {
+                Ok(ReceiveAttempt::Ready(meta)) => break meta,
+                Ok(ReceiveAttempt::NeedBuffer(required)) => buf.prepare(required)?,
+                Err(SystemError::EAGAIN_OR_EWOULDBLOCK) if !nonblock => {
+                    self.wait_queue.wait_event_interruptible_timeout(
+                        || self.can_recv(),
+                        self.recv_timeout(),
+                    )?;
                 }
-
-                self.wait_queue
-                    .wait_event_interruptible_timeout(|| self.can_recv(), self.recv_timeout())?;
+                Err(error) => return Err(error),
             }
         };
 
-        iovs.scatter_exact(&buf[..payload_copy_len])?;
+        iovs.scatter_exact(buf.bytes(payload_copy_len))?;
 
         // 写回来源地址
         let endpoint = sender_addr
@@ -947,7 +930,7 @@ impl Socket for UnixDatagramSocket {
         msg.msg_namelen = endpoint.write_to_user_msghdr(msg.msg_name, msg.msg_namelen)?;
 
         msg.msg_flags = 0;
-        if orig_len > buf_cap {
+        if orig_len > capacity {
             msg.msg_flags |= PMSG::TRUNC.bits() as i32;
         }
 

@@ -631,15 +631,21 @@ impl Socket for UdpSocket {
             return entry.recv_msg_with_options(msg, options, iovs);
         }
 
-        // Validate and create iovecs
-        let mut buf = iovs.new_buf(true)?;
-        let buf_cap = buf.len();
+        // User capacity is independent of the storage admitted for this record.
+        let buf_cap = iovs.total_len();
+        let mut buf = RecvBuffer::default();
 
         // Receive data from socket
         let peek = flags.contains(PMSG::PEEK);
         let received = loop {
-            match self.try_recv_with_meta(&mut buf, peek) {
-                Ok(received) => break received,
+            let storage_capacity = buf.capacity();
+            match self.try_recv_record(buf.bytes_mut(storage_capacity), peek, buf_cap) {
+                Ok(ReceiveAttempt::Ready(received)) => break received,
+                Ok(ReceiveAttempt::NeedBuffer(required)) => {
+                    // The attempt has released queue, inner and socket-set guards.
+                    // Admission can recover here without replaying a receive.
+                    buf.prepare(required)?;
+                }
                 Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
                     if !self.is_nonblock() && !flags.contains(PMSG::DONTWAIT) =>
                 {
@@ -680,7 +686,7 @@ impl Socket for UdpSocket {
         // );
 
         // Scatter received data to user iovecs
-        iovs.scatter_exact(&buf[..copy_len])?;
+        iovs.scatter_exact(buf.bytes(copy_len))?;
 
         // Write source address if requested
         if !msg.msg_name.is_null() {

@@ -5,6 +5,7 @@ use crate::libs::rwsem::RwSem;
 use crate::libs::wait_queue::WaitQueue;
 use crate::net::socket::common::{ShutdownBit, ShutdownState};
 use crate::net::socket::endpoint::Endpoint;
+use crate::net::socket::recv_buffer::{ReceiveAttempt, RecvBuffer};
 use crate::net::socket::unix::ring_buffer::{RbConsumer, RbProducer, RingBuffer};
 use crate::net::socket::unix::stream::UnixStreamSocket;
 use crate::net::socket::unix::{PeerCred, UCred};
@@ -23,12 +24,6 @@ use log::debug;
 use system_error::SystemError;
 
 pub(in crate::net) const UNIX_STREAM_DEFAULT_BUF_SIZE: usize = 65536;
-
-/// SCM snapshot for recvmsg containing ancillary data
-pub(super) struct ScmSnapshot {
-    /// SCM data at head (optional credentials and file rights)
-    pub(super) scm_data: Option<(Option<UCred>, Vec<Arc<File>>)>,
-}
 
 #[derive(Debug, Clone)]
 pub(super) struct StreamRecvmsgMeta {
@@ -49,6 +44,8 @@ pub(super) struct SeqpacketRecvMeta {
     pub(super) copy_len: usize,
     pub(super) orig_len: usize,
     pub(super) truncated: bool,
+    pub(super) scm_cred: Option<UCred>,
+    pub(super) scm_rights: Vec<Arc<File>>,
 }
 
 #[derive(Debug)]
@@ -331,7 +328,9 @@ impl Connected {
             let len = buf.len() as u32;
             buffer.extend_from_slice(&len.to_ne_bytes());
             buffer.extend_from_slice(buf);
-            guard.push_slice(&buffer);
+            guard
+                .push_slice_with_scm(&buffer, Some((cred, rights.to_vec())))
+                .ok_or(SystemError::EIO)?;
             return Ok((buf.len(), start, buffer.len()));
         }
 
@@ -387,19 +386,9 @@ impl Connected {
         *queue_consumed = false;
         let mut guard = self.reader.lock();
         if is_seqpacket {
-            if guard.len() < size_of::<u32>() {
-                if guard.is_read_shutdown() {
-                    return Ok(0);
-                }
-                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-            }
-
-            let mut len_buf = [0u8; 4];
-            guard.peek_slice(&mut len_buf).ok_or(SystemError::EFAULT)?;
-            let record_len = u32::from_ne_bytes(len_buf) as usize;
-            if guard.len() < size_of::<u32>() + record_len {
-                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-            }
+            let Some(record_len) = Self::seqpacket_record_len_locked(&guard)? else {
+                return Ok(0);
+            };
 
             let copy_len = out.len().min(record_len);
             let mut data = Vec::new();
@@ -446,102 +435,98 @@ impl Connected {
         Ok(copy_len)
     }
 
-    /// Receive exactly one SOCK_SEQPACKET record.
-    ///
-    /// Returns `Some` for a record (including an empty one), `None` for EOF.
-    /// - `copy_len` is the number of bytes copied into `buf`.
-    /// - `orig_len` is the record's original payload length.
-    /// - `truncated` is true if `buf` was smaller than the record.
-    ///
-    /// If `peek` is true, the record is not consumed.
+    /// Resolve a complete record while the caller holds the consumer lock.
+    /// `None` denotes EOF, never an empty queued record.
+    fn seqpacket_record_len_locked(reader: &RbConsumer<u8>) -> Result<Option<usize>, SystemError> {
+        if reader.len() < size_of::<u32>() {
+            return if reader.is_read_shutdown() {
+                Ok(None)
+            } else {
+                Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
+            };
+        }
+        let mut header = [0u8; size_of::<u32>()];
+        reader.peek_slice(&mut header).ok_or(SystemError::EIO)?;
+        let record_len = u32::from_ne_bytes(header) as usize;
+        if reader.len() < size_of::<u32>() + record_len {
+            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+        }
+        Ok(Some(record_len))
+    }
+
+    /// Copy and commit one already-admitted record, including its SCM identity.
+    fn recv_seqpacket_record(
+        reader: &mut RbConsumer<u8>,
+        buf: &mut [u8],
+        record_len: usize,
+        peek: bool,
+        want_scm: bool,
+    ) -> Result<SeqpacketRecvMeta, SystemError> {
+        let copy_len = buf.len().min(record_len);
+        let (scm_cred, scm_rights) = if want_scm {
+            reader
+                .peek_scm_at(reader.head())
+                .unwrap_or((None, Vec::new()))
+        } else {
+            (None, Vec::new())
+        };
+        if copy_len != 0 {
+            let payload = reader.head() + Wrapping(size_of::<u32>());
+            reader
+                .peek_slice_at(payload, &mut buf[..copy_len])
+                .ok_or(SystemError::EIO)?;
+        }
+        if !peek {
+            reader
+                .consume(size_of::<u32>() + record_len)
+                .ok_or(SystemError::EIO)?;
+        }
+        Ok(SeqpacketRecvMeta {
+            copy_len,
+            orig_len: record_len,
+            truncated: copy_len < record_len,
+            scm_cred,
+            scm_rights,
+        })
+    }
+
     pub(super) fn try_recv_seqpacket_meta(
         &self,
         buf: &mut [u8],
         peek: bool,
     ) -> Result<Option<SeqpacketRecvMeta>, SystemError> {
-        let mut guard = self.reader.lock();
-        if guard.len() < size_of::<u32>() {
-            // A complete record can never arrive after either read-side
-            // shutdown condition becomes final.
-            if guard.is_read_shutdown() {
-                return Ok(None);
-            }
-            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+        let mut reader = self.reader.lock();
+        let Some(record_len) = Self::seqpacket_record_len_locked(&reader)? else {
+            return Ok(None);
+        };
+        Self::recv_seqpacket_record(&mut reader, buf, record_len, peek, false).map(Some)
+    }
+
+    /// Buffer admission never consumes a record. The caller must prepare the
+    /// requested storage after releasing all socket and consumer locks, then
+    /// reselect the current head and its SCM together.
+    pub(super) fn try_recv_seqpacket_recvmsg(
+        &self,
+        buf: &mut RecvBuffer,
+        capacity: usize,
+        peek: bool,
+    ) -> Result<ReceiveAttempt<Option<SeqpacketRecvMeta>>, SystemError> {
+        let mut reader = self.reader.lock();
+        let Some(record_len) = Self::seqpacket_record_len_locked(&reader)? else {
+            return Ok(ReceiveAttempt::Ready(None));
+        };
+        let required = capacity.min(record_len);
+        if buf.capacity() < required {
+            return Ok(ReceiveAttempt::NeedBuffer(required));
         }
-
-        let mut len_buf = [0u8; 4];
-        if guard.peek_slice(&mut len_buf).is_none() {
-            return Err(SystemError::EFAULT);
-        }
-        let record_len = u32::from_ne_bytes(len_buf) as usize;
-
-        if guard.len() < size_of::<u32>() + record_len {
-            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-        }
-
-        let copy_len = core::cmp::min(buf.len(), record_len);
-        let truncated = copy_len < record_len;
-
-        if peek {
-            if copy_len != 0 {
-                let payload_off = guard.head() + Wrapping(size_of::<u32>());
-                if guard
-                    .peek_slice_at(payload_off, &mut buf[..copy_len])
-                    .is_none()
-                {
-                    return Err(SystemError::EFAULT);
-                }
-            }
-            return Ok(Some(SeqpacketRecvMeta {
-                copy_len,
-                orig_len: record_len,
-                truncated,
-            }));
-        }
-
-        // Consume header.
-        guard.pop_slice(&mut len_buf);
-        if record_len == 0 {
-            return Ok(Some(SeqpacketRecvMeta {
-                copy_len: 0,
-                orig_len: 0,
-                truncated: false,
-            }));
-        }
-
-        if copy_len != 0 {
-            guard.pop_slice(&mut buf[..copy_len]);
-        }
-
-        // Discard remaining bytes of this record.
-        let mut remaining = record_len - copy_len;
-        if remaining != 0 {
-            let mut trash = [0u8; 256];
-            while remaining != 0 {
-                let chunk = core::cmp::min(remaining, trash.len());
-                guard.pop_slice(&mut trash[..chunk]);
-                remaining -= chunk;
-            }
-        }
-
-        Ok(Some(SeqpacketRecvMeta {
-            copy_len,
-            orig_len: record_len,
-            truncated,
-        }))
+        Self::recv_seqpacket_record(&mut reader, buf.bytes_mut(required), record_len, peek, true)
+            .map(|meta| ReceiveAttempt::Ready(Some(meta)))
     }
 
     fn seqpacket_record_len(&self) -> Option<usize> {
-        let guard = self.reader.lock();
-        if guard.len() < size_of::<u32>() {
-            return None;
-        }
-
-        let mut len_buf = [0u8; 4];
-        guard.peek_slice(&mut len_buf)?;
-
-        let len = u32::from_ne_bytes(len_buf) as usize;
-        (guard.len() >= size_of::<u32>() + len).then_some(len)
+        Self::seqpacket_record_len_locked(&self.reader.lock())
+            .ok()
+            .flatten()
     }
 
     pub(super) fn recv_ready(&self, is_seqpacket: bool) -> bool {
@@ -635,16 +620,6 @@ impl Connected {
         self.reader.lock().is_read_shutdown()
     }
 
-    pub(super) fn push_scm_at(
-        &self,
-        offset: Wrapping<usize>,
-        len: usize,
-        cred: Option<UCred>,
-        rights: Vec<Arc<File>>,
-    ) {
-        self.writer.lock().push_scm_at(offset, len, cred, rights)
-    }
-
     #[allow(dead_code)]
     pub(super) fn peek_scm_at_head(&self) -> Option<(Option<UCred>, Vec<Arc<File>>)> {
         let guard = self.reader.lock();
@@ -662,12 +637,6 @@ impl Connected {
         let guard = self.reader.lock();
         let head = guard.head();
         guard.next_scm_offset_after(head)
-    }
-
-    pub(super) fn scm_snapshot_for_recvmsg(&self) -> ScmSnapshot {
-        let guard = self.reader.lock();
-        let scm_data = guard.peek_scm_at(guard.head());
-        ScmSnapshot { scm_data }
     }
 
     pub(super) fn try_recv_stream_recvmsg_meta(

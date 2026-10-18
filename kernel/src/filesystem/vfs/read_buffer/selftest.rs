@@ -298,6 +298,10 @@ pub(crate) fn report() -> String {
             "iov_accounting",
             crate::syscall::iov::run_accounting_selftest().unwrap_or(false),
         ),
+        (
+            "recv_record_storage",
+            crate::net::socket::recv_buffer::run_selftest(),
+        ),
         ("lazy_reuse", lazy_reuse()),
         ("growth_release", growth_release()),
         ("errors_release", errors_release()),

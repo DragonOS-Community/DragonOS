@@ -328,30 +328,6 @@ impl IoVecs {
         }
         Ok(())
     }
-
-    /// Contiguous staging retained for existing socket record/fallback owners.
-    /// Positional file reads use bounded ReadScratch instead. This payload
-    /// allocation is separate from the shared, page-sized iovec metadata.
-    ///
-    /// # Arguments
-    ///
-    /// * `set_len` - If true, sets the length of the returned Vec to the total length of all IoVecs.
-    ///   If false, the returned Vec will have length 0 but capacity equal to the total length.
-    ///
-    /// # Returns
-    ///
-    /// A new [`Vec<u8>`] with capacity (and potentially length) equal to the total length of all IoVecs.
-    pub fn new_buf(&self, set_len: bool) -> Result<Vec<u8>, SystemError> {
-        let total_len = self.total_len();
-        let mut buf: Vec<u8> = Vec::new();
-        buf.try_reserve(total_len)
-            .map_err(|_| SystemError::ENOMEM)?;
-
-        if set_len {
-            buf.resize(total_len, 0);
-        }
-        return Ok(buf);
-    }
 }
 
 /// Exercise actual metadata allocations and their charge rollback without

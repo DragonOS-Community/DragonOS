@@ -4,7 +4,8 @@ use smoltcp;
 use system_error::SystemError;
 
 use crate::{
-    libs::mutex::Mutex, net::socket::inet::common::BoundInner,
+    libs::mutex::Mutex,
+    net::socket::{inet::common::BoundInner, recv_buffer::ReceiveAttempt},
     process::namespace::net_namespace::NetNamespace,
 };
 
@@ -32,11 +33,15 @@ fn receive(
     socket: &mut SmolUdpSocket,
     buf: &mut [u8],
     peek: bool,
-) -> Result<UdpReceived, SystemError> {
+    capacity: usize,
+) -> Result<ReceiveAttempt<UdpReceived>, SystemError> {
     let (payload, meta) = socket
         .peek()
         .map_err(|_| SystemError::EAGAIN_OR_EWOULDBLOCK)?;
-    let copied = buf.len().min(payload.len());
+    let copied = capacity.min(payload.len());
+    if buf.len() < copied {
+        return Ok(ReceiveAttempt::NeedBuffer(copied));
+    }
     buf[..copied].copy_from_slice(&payload[..copied]);
     let result = UdpReceived {
         copied,
@@ -55,7 +60,7 @@ fn receive(
             .recv()
             .map_err(|_| SystemError::EAGAIN_OR_EWOULDBLOCK)?;
     }
-    Ok(result)
+    Ok(ReceiveAttempt::Ready(result))
 }
 
 pub struct UdpBindContext {
@@ -101,8 +106,9 @@ impl UnboundUdp {
         &mut self,
         buf: &mut [u8],
         peek: bool,
-    ) -> Result<UdpReceived, SystemError> {
-        receive(&mut self.socket, buf, peek)
+        capacity: usize,
+    ) -> Result<ReceiveAttempt<UdpReceived>, SystemError> {
+        receive(&mut self.socket, buf, peek, capacity)
     }
 
     pub(super) fn can_recv(&self) -> bool {
@@ -349,8 +355,9 @@ impl BoundUdp {
         &self,
         buf: &mut [u8],
         peek: bool,
-    ) -> Result<UdpReceived, SystemError> {
-        self.with_mut_socket(|socket| receive(socket, buf, peek))
+        capacity: usize,
+    ) -> Result<ReceiveAttempt<UdpReceived>, SystemError> {
+        self.with_mut_socket(|socket| receive(socket, buf, peek, capacity))
     }
 
     pub fn inner(&self) -> &BoundInner {

@@ -5,6 +5,16 @@ use system_error::SystemError;
 use crate::libs::wait_queue::WaitQueue;
 use crate::time::{Duration, Instant};
 
+/// Match Linux's sock_intr_errno(): only an infinite socket wait may restart.
+/// The caller supplies the timeout captured for this operation, rather than a
+/// socket option that another thread may have changed while it was waiting.
+pub(crate) fn map_wait_error(error: SystemError, finite: bool) -> SystemError {
+    match error {
+        SystemError::ERESTARTSYS if finite => SystemError::EINTR,
+        error => error,
+    }
+}
+
 /// Snapshot SO_RCVTIMEO once per operation. Only time spent in the wait
 /// primitive is charged, matching Linux's remaining schedule_timeout budget.
 /// Protocol owners retain responsibility for trying receive before waiting and
@@ -54,9 +64,6 @@ impl ReceiveTimeout {
         ));
         // Finite socket timeouts interrupt with EINTR even with SA_RESTART.
         // Restarting the syscall would otherwise create a fresh timeout budget.
-        result.map_err(|error| match error {
-            SystemError::ERESTARTSYS => SystemError::EINTR,
-            error => error,
-        })
+        result.map_err(|error| map_wait_error(error, true))
     }
 }

@@ -31,7 +31,7 @@ mod events;
 mod io;
 use crate::net::socket::recv_buffer::{ReceiveAttempt, RecvBuffer};
 use crate::net::socket::recv_timeout::ReceiveTimeout;
-use io::TcpReceiveTarget;
+use io::{TcpPeekCursor, TcpReceiveTarget};
 mod lifecycle;
 mod poll_util;
 mod stream_core;
@@ -41,22 +41,27 @@ pub use stream_core::TcpSocket;
 impl TcpSocket {
     fn recv_with_target(
         &self,
-        target: &mut TcpReceiveTarget<'_>,
+        target: &mut TcpReceiveTarget<'_, '_>,
         flags: PMSG,
     ) -> Result<usize, SystemError> {
         let nonblock = self.is_nonblock() || flags.contains(PMSG::DONTWAIT);
         let mut timeout = ReceiveTimeout::new(self.recv_timeout());
-        let waitall = flags.contains(PMSG::WAITALL)
-            && !flags.contains(PMSG::PEEK)
-            && !flags.contains(PMSG::TRUNC);
+        let waitall = flags.contains(PMSG::WAITALL);
+        let mut cursor = TcpPeekCursor::default();
         let mut total_read = 0usize;
 
         let ret = loop {
-            match self.try_recv_target(target, total_read, flags) {
+            match self.try_recv_target(target, total_read, flags, &mut cursor) {
                 Ok(ReceiveAttempt::NeedBuffer(required)) => {
                     // No protocol bytes have been consumed; all receive and
                     // SocketSet guards were released by the admission attempt.
-                    target.prepare(required)?;
+                    if let Err(error) = target.prepare(required) {
+                        break if total_read > 0 {
+                            Ok(total_read)
+                        } else {
+                            Err(error)
+                        };
+                    }
                     continue;
                 }
                 Ok(ReceiveAttempt::Ready(n)) => {
@@ -68,7 +73,10 @@ impl TcpSocket {
                     if total_read == target.len() {
                         break Ok(total_read);
                     }
-                    if nonblock || !waitall {
+                    // A bounded PEEK staging window is not a protocol short
+                    // read. Keep copying queued suffixes; only a real EAGAIN
+                    // decides whether this call may wait for more data.
+                    if !flags.contains(PMSG::PEEK) && (nonblock || !waitall) {
                         break Ok(total_read);
                     }
                     continue;
@@ -91,7 +99,9 @@ impl TcpSocket {
                     if let Some(iface) = self.stack_poll_snapshot() {
                         poll_util::poll_stack_batch(iface.as_ref());
                     }
-                    let wait_ret = timeout.wait_io(&self.wait_queue, || self.recv_wait_ready());
+                    let wait_ret = timeout
+                        .wait_io(&self.wait_queue, || self.recv_target_ready(flags, &cursor));
+                    cursor.waited();
                     if let Err(e) = wait_ret {
                         if total_read > 0 {
                             break Ok(total_read);
@@ -469,18 +479,13 @@ impl Socket for TcpSocket {
                 crate::syscall::user_buffer::UserBuffer::new_vectored(iovs, total);
 
             if flags.contains(PMSG::PEEK) {
-                // PEEK never consumes, so staging remains transactional while
-                // preserving its existing receive semantics.
-                let mut scratch = RecvBuffer::default();
-                let n = self.recv_with_target(
+                self.recv_with_target(
                     &mut TcpReceiveTarget::Peek {
-                        buffer: &mut scratch,
-                        limit: total,
+                        user_buffer: &mut user_buffer,
+                        staging: RecvBuffer::default(),
                     },
                     flags,
-                )?;
-                user_buffer.write_to_user(0, scratch.bytes(n))?;
-                n
+                )?
             } else {
                 let nonblock = self.is_nonblock() || flags.contains(PMSG::DONTWAIT);
                 let waitall = flags.contains(PMSG::WAITALL);

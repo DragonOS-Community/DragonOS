@@ -310,6 +310,25 @@ impl WaitQueue {
         )
     }
 
+    /// IO-accounted interruptible wait with a full-width scheduler-tick budget.
+    pub fn wait_event_io_interruptible_timeout_ticks<F>(
+        &self,
+        mut condition: F,
+        timeout_ticks: u64,
+    ) -> Result<(), SystemError>
+    where
+        F: FnMut() -> bool,
+    {
+        self.wait_until_impl(
+            || condition().then_some(()),
+            WaitSignalMode::Interruptible,
+            None,
+            Some(timeout_ticks),
+            None::<fn()>,
+            true,
+        )
+    }
+
     /// Core implementation for all wait_until variants.
     ///
     /// Key design:

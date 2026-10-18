@@ -1004,6 +1004,7 @@ impl PacketSocket {
         if let Some(timeout_ticks) = self.recv_timeout_ticks() {
             self.wait_queue
                 .wait_until_timeout_ticks(|| self.dequeue(peek).ok(), timeout_ticks)
+                .map_err(|error| crate::net::socket::recv_timeout::map_wait_error(error, true))
         } else {
             self.wait_queue
                 .wait_until_interruptible(|| self.dequeue(peek).ok())

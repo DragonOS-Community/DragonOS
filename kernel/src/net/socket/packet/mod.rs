@@ -286,6 +286,25 @@ pub fn deliver_ip_to_packet_sockets(iface: &Arc<dyn Iface>, packet: &[u8], pkt_t
 }
 
 impl Socket for PacketSocket {
+    fn check_recv_flags(&self, flags: PMSG) -> Result<(), SystemError> {
+        // Linux packet_recvmsg checks the raw allowlist before selecting a
+        // receive source. Unknown bits must survive syscall decoding.
+        let allowed = PMSG::PEEK | PMSG::DONTWAIT | PMSG::TRUNC | PMSG::ERRQUEUE;
+        if flags.bits() & !allowed.bits() != 0 {
+            return Err(SystemError::EINVAL);
+        }
+        if flags.contains(PMSG::ERRQUEUE) {
+            // There is currently no packet timestamp/error producer. The empty
+            // error queue never waits or consumes an ordinary queue packet.
+            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+        }
+        Ok(())
+    }
+
+    fn set_nonblocking(&self, nonblocking: bool) {
+        self.nonblock.store(nonblocking, Ordering::Relaxed);
+    }
+
     fn netns(&self) -> Arc<NetNamespace> {
         PacketSocket::netns(self)
     }

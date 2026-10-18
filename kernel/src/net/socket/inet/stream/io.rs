@@ -360,10 +360,6 @@ impl TcpSocket {
 
         let user_remaining = user_buffer.len() - offset;
 
-        if user_remaining == 0 {
-            return Ok(0);
-        }
-
         // Avoid allocating the staging buffer for the common nonblocking EAGAIN path.
         let readable = established.with_mut(|socket| {
             if socket.can_recv() {
@@ -387,6 +383,12 @@ impl TcpSocket {
             }
         })?;
         if !readable {
+            return Ok(0);
+        }
+
+        // recv/recvmsg with zero capacity still observe readiness or EOF.
+        // read(2)'s zero-length shortcut belongs to the read entry point.
+        if user_remaining == 0 {
             return Ok(0);
         }
 

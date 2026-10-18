@@ -126,6 +126,32 @@ impl TcpSocket {
         ret
     }
 
+    /// Shared scalar/vectored payload policy; recvmsg retains its own error
+    /// queue and ancillary-data handling around this receive operation.
+    fn recv_user_buffer(
+        &self,
+        buffer: &mut crate::syscall::user_buffer::UserBuffer<'_>,
+        flags: PMSG,
+    ) -> Result<usize, SystemError> {
+        if flags.contains(PMSG::TRUNC) {
+            self.recv_with_target(&mut TcpReceiveTarget::Discard(buffer.len()), flags)
+        } else if flags.contains(PMSG::PEEK) {
+            self.recv_with_target(
+                &mut TcpReceiveTarget::Peek {
+                    user_buffer: buffer,
+                    staging: RecvBuffer::default(),
+                },
+                flags,
+            )
+        } else {
+            self.recv_to_user_buffer_impl(
+                buffer,
+                self.is_nonblock() || flags.contains(PMSG::DONTWAIT),
+                flags.contains(PMSG::WAITALL),
+            )
+        }
+    }
+
     fn send_with_progress(
         &self,
         buffer: &[u8],
@@ -459,6 +485,20 @@ impl Socket for TcpSocket {
         Ok((n, ep))
     }
 
+    fn recv_from_user_buffer(
+        &self,
+        buffer: &mut crate::syscall::user_buffer::UserBuffer<'_>,
+        flags: PMSG,
+    ) -> Result<(usize, Endpoint), SystemError> {
+        let n = self.recv_user_buffer(buffer, flags)?;
+        // TCP ignores source-address output, as in the kernel-buffer adapter.
+        let endpoint = self.remote_endpoint().unwrap_or_else(|_| {
+            self.local_endpoint()
+                .unwrap_or(Endpoint::ip(UNSPECIFIED_LOCAL_ENDPOINT_V4))
+        });
+        Ok((n, endpoint))
+    }
+
     fn recv_msg(
         &self,
         msg: &mut crate::net::posix::MsgHdr,
@@ -470,28 +510,8 @@ impl Socket for TcpSocket {
         }
         // TCP: 不返回 peer 地址。
         let total = iovs.total_len();
-        let written = if flags.contains(PMSG::TRUNC) {
-            // Linux TCP MSG_TRUNC reports/consumes bytes without copying the
-            // payload, so an inaccessible iovec must not cause EFAULT.
-            self.recv_with_target(&mut TcpReceiveTarget::Discard(total), flags)?
-        } else {
-            let mut user_buffer =
-                crate::syscall::user_buffer::UserBuffer::new_vectored(iovs, total);
-
-            if flags.contains(PMSG::PEEK) {
-                self.recv_with_target(
-                    &mut TcpReceiveTarget::Peek {
-                        user_buffer: &mut user_buffer,
-                        staging: RecvBuffer::default(),
-                    },
-                    flags,
-                )?
-            } else {
-                let nonblock = self.is_nonblock() || flags.contains(PMSG::DONTWAIT);
-                let waitall = flags.contains(PMSG::WAITALL);
-                self.recv_to_user_buffer_impl(&mut user_buffer, nonblock, waitall)?
-            }
-        };
+        let mut user_buffer = crate::syscall::user_buffer::UserBuffer::new_vectored(iovs, total);
+        let written = self.recv_user_buffer(&mut user_buffer, flags)?;
 
         msg.msg_flags = 0;
         msg.msg_namelen = 0;

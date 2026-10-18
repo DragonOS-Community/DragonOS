@@ -302,6 +302,8 @@ TEST(InetBindPolicy, BindMountedSysctlDirectoryKeepsNamespace) {
 }
 TEST(InetBindPolicy, ExpiredDirectoryNeverFallsBackToCurrentNamespace) {
   InNamespace([] {
+    Fd namespace_owner(socket(AF_INET, SOCK_DGRAM, 0));
+    ASSERT_GE(namespace_owner.get(), 0);
     ASSERT_EQ(Write(kStart, "2048\n"), 0);
     Fd directory(open("/proc/sys/net/ipv4", O_RDONLY | O_DIRECTORY));
     Fd leaf(open(kStart, O_PATH));
@@ -315,40 +317,62 @@ TEST(InetBindPolicy, ExpiredDirectoryNeverFallsBackToCurrentNamespace) {
     ASSERT_EQ(syscall(SYS_getdents64, directory.get(), entries, 24), 24);
     ASSERT_EQ(unshare(CLONE_NEWNET), 0);
     ASSERT_EQ(Write(kStart, "0\n"), 0);
+    {
+      // A socket keeps the original namespace alive, so this read must
+      // succeed and must still select its policy rather than the new one.
+      Fd file(openat(directory.get(), "ip_unprivileged_port_start", O_RDONLY));
+      ASSERT_GE(file.get(), 0);
+      EXPECT_EQ(ReadFd(file.get()), "2048\n");
+    }
+    namespace_owner.reset();
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
     // Linux unregisters a dying netns asynchronously. Cached directory/table
     // references do not make it immortal, nor may they select B instead.
     do {
+      bool retired = false;
       {
         Fd file(openat(directory.get(), "ip_unprivileged_port_start", O_RDONLY));
         if (file.get() < 0) {
-          EXPECT_EQ(errno, ENOENT);
-          // Leaf and parent tables can retire at different times. Continue
-          // the cached iteration, including EOF, until the parent is gone;
-          // do not rebuild the snapshot to make this assertion pass.
-          do {
-            const long count = syscall(SYS_getdents64, directory.get(), entries, sizeof(entries));
-            if (count < 0) {
-              EXPECT_EQ(errno, ENOENT);
-              ASSERT_EQ(lseek(directory.get(), 0, SEEK_SET), 0);
-              EXPECT_EQ(syscall(SYS_getdents64, directory.get(), entries, sizeof(entries)), -1);
-              EXPECT_EQ(errno, ENOENT);
-              EXPECT_EQ(fstat(directory.get(), &status), -1);
-              EXPECT_EQ(errno, ENOENT);
-              EXPECT_EQ(fchdir(directory.get()), -1);
-              EXPECT_EQ(errno, ENOENT);
-              EXPECT_EQ(fstat(leaf.get(), &status), -1);
-              EXPECT_EQ(errno, ENOENT);
-              EXPECT_EQ(fchdir(leaf.get()), -1);
-              EXPECT_EQ(errno, ENOTDIR);
-              return;
-            }
-            usleep(1000);
-          } while (std::chrono::steady_clock::now() < deadline);
-          FAIL() << "cached iteration ignored namespace retirement";
-          return;
+          ASSERT_EQ(errno, ENOENT);
+          retired = true;
+        } else {
+          // Retirement may also occur between a successful open and read.
+          // An ordinary sysctl fd does not hold the namespace alive.
+          char value[128] {};
+          const ssize_t count = read(file.get(), value, sizeof(value));
+          if (count < 0) {
+            ASSERT_EQ(errno, ENOENT);
+            retired = true;
+          } else {
+            EXPECT_EQ(std::string(value, count), "2048\n");
+          }
         }
-        EXPECT_EQ(ReadFd(file.get()), "2048\n");
+      }
+      if (retired) {
+        // Leaf and parent tables can retire at different times. Continue
+        // the cached iteration, including EOF, until the parent is gone;
+        // do not rebuild the snapshot to make this assertion pass.
+        do {
+          const long count = syscall(SYS_getdents64, directory.get(), entries, sizeof(entries));
+          if (count < 0) {
+            EXPECT_EQ(errno, ENOENT);
+            ASSERT_EQ(lseek(directory.get(), 0, SEEK_SET), 0);
+            EXPECT_EQ(syscall(SYS_getdents64, directory.get(), entries, sizeof(entries)), -1);
+            EXPECT_EQ(errno, ENOENT);
+            EXPECT_EQ(fstat(directory.get(), &status), -1);
+            EXPECT_EQ(errno, ENOENT);
+            EXPECT_EQ(fchdir(directory.get()), -1);
+            EXPECT_EQ(errno, ENOENT);
+            EXPECT_EQ(fstat(leaf.get(), &status), -1);
+            EXPECT_EQ(errno, ENOENT);
+            EXPECT_EQ(fchdir(leaf.get()), -1);
+            EXPECT_EQ(errno, ENOTDIR);
+            return;
+          }
+          usleep(1000);
+        } while (std::chrono::steady_clock::now() < deadline);
+        FAIL() << "cached iteration ignored namespace retirement";
+        return;
       }
       usleep(1000);
     } while (std::chrono::steady_clock::now() < deadline);

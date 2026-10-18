@@ -1,9 +1,10 @@
-bitflags::bitflags! {
+bitflags2::bitflags! {
     /// # Message Flags
     /// Flags we can use with send/ and recv. \
     /// Added those for 1003.1g not all are supported yet
     /// ## Reference
     /// - [Linux Socket Flags](https://code.dragonos.org.cn/xref/linux-6.6.21/include/linux/socket.h#299)
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
     pub struct MessageFlag: u32 {
         /// `MSG_OOB`
         /// `0b0000_0001`\
@@ -85,7 +86,7 @@ bitflags::bitflags! {
         /// Sendpage: next message is batch.
         const BATCH     = 0x40000;
         /// `MSG_EOF`
-        const EOF       = Self::FIN.bits;
+        const EOF       = Self::FIN.bits();
         /// `MSG_NO_SHARED_FRAGS`
         const NO_SHARED_FRAGS = 0x80000;
         /// `MSG_SENDPAGE_DECRYPTED`
@@ -105,6 +106,6 @@ bitflags::bitflags! {
         const CMSG_COMPAT   = 0;
         /// `MSG_INTERNAL_SENDMSG_FLAGS`
         const INTERNAL_SENDMSG_FLAGS
-            = Self::SPLICE_PAGES.bits | Self::SENDPAGE_NOPOLICY.bits | Self::SENDPAGE_DECRYPTED.bits;
+            = Self::SPLICE_PAGES.bits() | Self::SENDPAGE_NOPOLICY.bits() | Self::SENDPAGE_DECRYPTED.bits();
     }
 }

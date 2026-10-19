@@ -41,6 +41,7 @@ jobs:
           cat >> user/apps/tests/dunitest/no_skip.txt <<'EOF'
           normal/vmalloc_selftest
           normal/page_migration_prerequisites
+          normal/page_migration
           normal/kernel_buffer_selftest
           normal/overlay_xattr_selftest
           normal/xattr_syscall_selftest

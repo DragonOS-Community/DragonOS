@@ -85,7 +85,7 @@ impl Fixture {
 // invariant or weaken the deliberate Busy assertions below.
 fn isolation_check(
     fixture: &Fixture,
-    mut check: impl FnMut(Result<PageIsolationGuard<'_>, PageIsolationError>) -> bool,
+    mut check: impl FnMut(Result<PageIsolationGuard<'_, '_>, PageIsolationError>) -> bool,
 ) -> bool {
     for _ in 0..64 {
         let outcome = {

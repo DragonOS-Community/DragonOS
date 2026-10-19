@@ -51,6 +51,8 @@ use super::{
 };
 
 pub(crate) mod access;
+#[cfg(target_arch = "x86_64")]
+pub(crate) mod migration;
 
 pub const PAGE_4K_SHIFT: usize = 12;
 #[allow(dead_code)]
@@ -3697,6 +3699,37 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
         //         table = table.next_level_table(i)?;
         //     }
         // }
+    }
+
+    /// Locate an existing order-0 leaf without descending through a huge page.
+    ///
+    /// # Safety
+    /// The caller holds this user MM's write guard and PT edit serialization.
+    /// The returned slot may only outlive PT serialization while that MM write
+    /// guard keeps this anonymous mapping's table hierarchy stable. No tables
+    /// are allocated or retired. Atomic exchange is required to retain A/D
+    /// updates made by hardware independently of software PT locks.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) unsafe fn migration_leaf(
+        &self,
+        virt: VirtAddr,
+    ) -> Option<&core::sync::atomic::AtomicUsize> {
+        let mut table = self.table();
+        loop {
+            let index = table.index_of(virt)?;
+            if table.level() == 0 {
+                return Some(
+                    &*table
+                        .entry_virt(index)?
+                        .as_ptr::<core::sync::atomic::AtomicUsize>(),
+                );
+            }
+            let entry = table.entry(index)?;
+            if !entry.flags().present() || entry.flags().has_flag(Arch::ENTRY_FLAG_HUGE_PAGE) {
+                return None;
+            }
+            table = table.next_level_table(index)?;
+        }
     }
 
     /// 将物理地址映射到具有线性偏移量的虚拟地址

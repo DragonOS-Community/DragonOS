@@ -15,9 +15,11 @@ use crate::{
         },
         MMArch,
     },
-    mm::PhysAddr,
+    mm::{page::access::PageAccessPin, ucontext::AddressSpace, PhysAddr, VirtAddr},
     virt::vm::kvm_host::{
-        mem::{LockedKvmMemSlot, LockedVmMemSlotSet, UserMemRegionFlag, __gfn_to_pfn_memslot},
+        mem::{
+            LockedKvmMemSlot, LockedVmMemSlotSet, UserMemRegionFlag, __gfn_to_hva_many, try_pin_hva,
+        },
         search_memslots,
         vcpu::VirtCpu,
         Vm,
@@ -86,6 +88,8 @@ pub struct KvmPageFault {
 
     // kvm_pfn_t 通常是一个 64 位地址,相当于知道了hpa
     pfn: u64,
+    // Keep the exact host frame pinned through this fault's PFN consumer.
+    host_page: Option<PageAccessPin>,
     hva: u64, // hva_t 通常是一个 64 位地址
     map_writable: bool,
 
@@ -223,11 +227,11 @@ impl VirtCpu {
         }
 
         let r = if page_fault.is_tdp {
-            self.tdp_page_fault(vm, &mut page_fault).unwrap()
+            self.tdp_page_fault(vm, &mut page_fault)?
         } else {
             //目前的处理page_fault的方法只有tdp_page_fault,所以这里是不会执行的
-            let handle = self.arch.mmu().page_fault.unwrap();
-            handle(self, &page_fault).unwrap()
+            let handle = self.arch.mmu().page_fault.ok_or(SystemError::EIO)?;
+            handle(self, &page_fault)?
         };
 
         if page_fault.write_fault_to_shadow_pgtable {
@@ -291,9 +295,7 @@ impl VirtCpu {
         //page_fault_handle_page_track(page_fault)
         //fast_page_fault(page_fault);
         //mmu_topup_memory_caches(false);
-        let mut r = self
-            .kvm_faultin_pfn(vm, page_fault, 1 | 1 << 1 | 1 << 2)
-            .unwrap();
+        let mut r = self.kvm_faultin_pfn(vm, page_fault, 1 | 1 << 1 | 1 << 2)?;
         if r != PFRet::Continue {
             return Ok(r.into());
         }
@@ -337,12 +339,11 @@ impl VirtCpu {
         self.__kvm_faultin_pfn(page_fault)
     }
     fn __kvm_faultin_pfn(&self, page_fault: &mut KvmPageFault) -> Result<PFRet, SystemError> {
-        let slot = &page_fault.slot;
-        let mut is_async = false;
-        if slot.is_none() {
-            return Err(SystemError::KVM_HVA_ERR_BAD);
-        }
-        let slot = slot.as_ref().unwrap().read();
+        let slot_owner = page_fault
+            .slot
+            .as_ref()
+            .ok_or(SystemError::KVM_HVA_ERR_BAD)?;
+        let slot = slot_owner.read();
 
         if slot.get_flags().bits() & UserMemRegionFlag::KVM_MEMSLOT_INVALID.bits() != 0 {
             return Ok(PFRet::Retry);
@@ -358,31 +359,19 @@ impl VirtCpu {
             }
         }
 
-        // 尝试将 GFN 转换为 PFN
-        page_fault.pfn = __gfn_to_pfn_memslot(
-            Some(&slot),
-            page_fault.gfn,
-            (false, &mut is_async),
-            false,
-            page_fault.write,
-            &mut page_fault.map_writable,
-            &mut page_fault.hva,
-        )?;
-
-        if !is_async {
-            return Ok(PFRet::Continue); /* *pfn 已经有正确的页面 */
-        }
-
-        // if !page_fault.prefetch && self.kvm_can_do_async_pf() {
-        //     self.trace_kvm_try_async_get_page(page_fault.addr, page_fault.gfn);
-        //     if self.kvm_find_async_pf_gfn(page_fault.gfn) {
-        //         self.trace_kvm_async_pf_repeated_fault(page_fault.addr, page_fault.gfn);
-        //         self.kvm_make_request(KVM_REQ_APF_HALT);
-        //         return Ok(PFRet::Retry);
-        //     } else if self.kvm_arch_setup_async_pf(page_fault.addr, page_fault.gfn) {
-        //         return Ok(PFRet::Retry);
-        //     }
-        // }
+        // Snapshot the slot before trying MM/PTE admission; even its read
+        // guard is a spin lock. The current VM/vCPU guards require the atomic
+        // resident-only HVA path, with no slow GUP/fault fallback.
+        let address = __gfn_to_hva_many(&Some(&slot), page_fault.gfn, None, page_fault.write)?;
+        let slot_writable = !slot.get_flags().contains(UserMemRegionFlag::READONLY);
+        drop(slot);
+        let mm = AddressSpace::current()?;
+        let (access, writable) =
+            try_pin_hva(&mm, VirtAddr::new(address as usize), page_fault.write)?;
+        page_fault.hva = address;
+        page_fault.pfn = (access.phys_address().data() >> PAGE_SHIFT) as u64;
+        page_fault.map_writable = slot_writable && writable;
+        page_fault.host_page = Some(access);
         Ok(PFRet::Continue)
     }
 }

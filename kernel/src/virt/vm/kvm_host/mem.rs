@@ -8,16 +8,20 @@ use log::debug;
 use system_error::SystemError;
 
 use crate::{
-    arch::{
-        vm::mmu::kvm_mmu::{PAGE_SHIFT, PAGE_SIZE},
-        MMArch,
-    },
+    arch::{vm::mmu::kvm_mmu::PAGE_SIZE, MMArch},
     libs::{
         rbtree::RBTree,
         rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
     },
-    mm::{kernel_mapper::KernelMapper, page::EntryFlags, MemoryManagementArch, VirtAddr},
+    mm::{
+        page::{
+            access::{PageAccessError, PageAccessPin},
+            try_page_manager_lock, PageFlags,
+        },
+        ucontext::AddressSpace,
+        MemoryManagementArch, VirtAddr, VirtRegion, VmFlags,
+    },
     virt::vm::{kvm_host::KVM_ADDRESS_SPACE_NUM, user_api::KvmUserspaceMemoryRegion},
 };
 
@@ -615,100 +619,110 @@ pub fn __gfn_to_hva_many(
         return Err(SystemError::KVM_HVA_ERR_BAD);
     }
 
-    // 如果 `nr_pages` 不为空，计算并更新页数
+    let page_offset = gfn
+        .checked_sub(slot.base_gfn)
+        .filter(|offset| *offset < slot.npages as u64)
+        .ok_or(SystemError::KVM_HVA_ERR_BAD)?;
+    let address = page_offset
+        .checked_mul(PAGE_SIZE)
+        .and_then(|offset| (slot.userspace_addr.data() as u64).checked_add(offset))
+        .ok_or(SystemError::KVM_HVA_ERR_BAD)?;
     if let Some(nr_pages) = nr_pages {
-        *nr_pages = slot.npages as u64 - (gfn - slot.base_gfn);
+        *nr_pages = slot.npages as u64 - page_offset;
     }
-
-    // 调用辅助函数将 GFN 转换为 HVA
-    return Ok(__gfn_to_hva_memslot(slot, gfn));
+    Ok(address)
 }
 
-/// 将给定的全局帧号（GFN）转换为用户空间虚拟地址（HVA）。
+/// Pin an already resident user RAM page without sleeping or faulting.
 ///
-/// # 参数
-/// - `slot`: `KvmMemSlot`，表示内存槽。
-/// - `gfn`: 全局帧号（GFN），表示要转换的帧号。
-///
-/// # 返回
-/// 转换后的用户空间虚拟地址（HVA）。
-fn __gfn_to_hva_memslot(slot: &KvmMemSlot, gfn: u64) -> u64 {
-    return slot.userspace_addr.data() as u64 + (gfn - slot.base_gfn) * PAGE_SIZE;
-}
-/// 将给定的全局帧号（GFN）转换为页帧号（PFN），并根据内存槽的状态和标志进行相应的检查。
-///
-/// # 参数
-/// - `slot`: 内存槽的引用。
-/// - `gfn`: 全局帧号（GFN），表示要转换的帧号。
-/// - `atomic`: 布尔值，表示是否为原子操作。
-/// - `interruptible`: 布尔值，表示操作是否可中断。
-/// - `async`: 可变引用，表示操作是否为异步。
-/// - `write_fault`: 布尔值，表示是否为写操作。
-/// - `writable`: 可变引用，表示是否可写。
-/// - `hva`: 可变引用，表示用户空间虚拟地址（HVA）。
-///
-/// # 返回
-/// 如果成功，返回转换后的页帧号（PFN）；如果失败，返回相应的错误。
-pub fn __gfn_to_pfn_memslot(
-    slot: Option<&KvmMemSlot>,
-    gfn: u64,
-    atomic_or_async: (bool, &mut bool),
-    interruptible: bool,
+/// KVM_RUN currently holds VM/vCPU spin locks. Like Linux atomic
+/// hva_to_pfn(), a missing or write-protected leaf must fail rather than
+/// fault under those locks. In particular, never use a borrowed kernel
+/// mapper to manufacture a user mapping. The returned owner excludes page
+/// migration until the fault's PFN consumer has finished.
+pub(crate) fn try_pin_hva(
+    mm: &Arc<AddressSpace>,
+    address: VirtAddr,
     write: bool,
-    writable: &mut bool,
-    hva: &mut u64,
-) -> Result<u64, SystemError> {
-    let addr = __gfn_to_hva_many(&slot, gfn, None, write)?;
-    *hva = addr;
-
-    //todo:检查地址是否为错误
-
-    // 如果内存槽为只读，且 writable 不为空，则更新 writable 的值
-    if slot.unwrap().flags.bits() & UserMemRegionFlag::READONLY.bits() != 0 {
-        *writable = false;
+) -> Result<(PageAccessPin, bool), SystemError> {
+    if address >= MMArch::USER_END_VADDR {
+        return Err(SystemError::EFAULT);
     }
-
-    let pfn = hva_to_pfn(addr, atomic_or_async, interruptible, write, writable)?;
-    return Ok(pfn);
-}
-/// 将用户空间虚拟地址（HVA）转换为页帧号（PFN）。
-///
-/// # 参数
-/// - `addr`: 用户空间虚拟地址（HVA）。
-/// - `atomic`: 布尔值，表示是否为原子操作。
-/// - `interruptible`: 布尔值，表示操作是否可中断。
-/// - `is_async`: 可变引用，表示操作是否为异步。
-/// - `write_fault`: 布尔值，表示是否为写操作。
-/// - `writable`: 可变引用，表示是否可写。
-///
-/// # 返回
-/// 如果成功，返回转换后的页帧号（PFN）；如果失败，返回相应的错误。
-// 正确性待验证
-pub fn hva_to_pfn(
-    addr: u64,
-    atomic_or_async: (bool, &mut bool),
-    _interruptible: bool,
-    _write_fault: bool,
-    _writable: &mut bool,
-) -> Result<u64, SystemError> {
-    // 我们可以原子地或异步地执行，但不能同时执行
-    assert!(
-        !(atomic_or_async.0 && *atomic_or_async.1),
-        "Cannot be both atomic and async"
-    );
-
-    debug!("hva_to_pfn");
-    // let hpa = MMArch::virt_2_phys(VirtAddr::new(addr)).unwrap().data() as u64;
-    let hva = VirtAddr::new(addr as usize);
-    let mut mapper = KernelMapper::lock();
-    let mapper = mapper.as_mut().unwrap();
-    if let Some((hpa, _)) = mapper.translate(hva) {
-        return Ok(hpa.data() as u64 >> PAGE_SHIFT);
+    let address = VirtAddr::new(address.data() & !MMArch::PAGE_OFFSET_MASK);
+    let space = mm.try_read().ok_or(SystemError::EAGAIN_OR_EWOULDBLOCK)?;
+    if mm.is_torn_down() || mm.is_oom_unstable() {
+        return Err(SystemError::EFAULT);
     }
-    debug!("hva_to_pfn NOT FOUND,try map a new pfn");
-    unsafe {
-        mapper.map(hva, EntryFlags::mmio_flags());
+    if space
+        .mappings
+        .first_reservation_conflict(VirtRegion::new(address, MMArch::PAGE_SIZE))
+        .is_some()
+    {
+        return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
     }
-    let (hpa, _) = mapper.translate(hva).unwrap();
-    return Ok(hpa.data() as u64 >> PAGE_SHIFT);
+    let vma = space
+        .mappings
+        .contains(address)
+        .ok_or(SystemError::EFAULT)?;
+    let snapshot = vma.try_lock().ok_or(SystemError::EAGAIN_OR_EWOULDBLOCK)?;
+    let vm_flags = *snapshot.vm_flags();
+    if vm_flags.intersects(
+        VmFlags::VM_IO | VmFlags::VM_PFNMAP | VmFlags::VM_MIXEDMAP | VmFlags::VM_HUGETLB,
+    ) || !vm_flags.contains(if write {
+        VmFlags::VM_WRITE
+    } else {
+        VmFlags::VM_READ
+    }) {
+        return Err(SystemError::EFAULT);
+    }
+    drop(snapshot);
+    let _pt = mm
+        .try_page_table_edit()
+        .ok_or(SystemError::EAGAIN_OR_EWOULDBLOCK)?;
+    // The generic get_table() walker does not reject huge upper-level
+    // leaves. Walk explicitly so no data frame can be interpreted as a PT.
+    let mut table = space.user_mapper.utable.table();
+    let mut writable = vm_flags.contains(VmFlags::VM_WRITE);
+    while table.level() != 0 {
+        let index = table.index_of(address).ok_or(SystemError::EFAULT)?;
+        let entry = unsafe { table.entry(index) }.ok_or(SystemError::EFAULT)?;
+        let flags = entry.flags();
+        writable &= flags.has_write();
+        if !flags.present()
+            || !flags.has_user()
+            || (write && !writable)
+            || MMArch::entry_is_leaf(table.level(), flags.data())
+        {
+            return Err(SystemError::EFAULT);
+        }
+        table = unsafe { table.next_level_table(index) }.ok_or(SystemError::EFAULT)?;
+    }
+    let index = table.index_of(address).ok_or(SystemError::EFAULT)?;
+    let entry = unsafe { table.entry(index) }.ok_or(SystemError::EFAULT)?;
+    let flags = entry.flags();
+    if !flags.present() || !flags.has_user() || (write && !flags.has_write()) {
+        return Err(SystemError::EFAULT);
+    }
+    let physical = entry.address().map_err(|_| SystemError::EFAULT)?;
+    let manager = try_page_manager_lock().ok_or(SystemError::EAGAIN_OR_EWOULDBLOCK)?;
+    let page = manager
+        .get_registered(&physical)
+        .ok_or(SystemError::EFAULT)?;
+    drop(manager);
+    let data = page.try_read().ok_or(SystemError::EAGAIN_OR_EWOULDBLOCK)?;
+    // All managed Page types are RAM. Special/device mappings are rejected
+    // above, and reserved allocator/kernel frames are not user RAM.
+    if data
+        .flags()
+        .intersects(PageFlags::PG_RESERVED | PageFlags::PG_SLAB | PageFlags::PG_HEAD)
+        || !data.has_vma(&vma)
+    {
+        return Err(SystemError::EFAULT);
+    }
+    let access = page.try_pin_access().map_err(|error| match error {
+        PageAccessError::Busy => SystemError::EAGAIN_OR_EWOULDBLOCK,
+        PageAccessError::Overflow => SystemError::EOVERFLOW,
+    })?;
+    drop(data);
+    Ok((access, writable && flags.has_write()))
 }

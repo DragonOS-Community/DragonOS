@@ -3241,7 +3241,10 @@ impl Vmx {
                 debug!("vmx: handled exit return {:?}\n", r);
                 return Ok(r);
             }
-            Some(Err(_)) | None => unexpected_vmexit(vcpu),
+            // A normal RAM/HVA failure is a recoverable KVM_RUN error, not
+            // an unknown VM-exit. Propagate it so the outer spin guards drop.
+            Some(Err(error)) => Err(error),
+            None => unexpected_vmexit(vcpu),
         }
     }
 

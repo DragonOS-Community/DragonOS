@@ -37,6 +37,7 @@ pub(crate) enum PageIsolationUnsupported {
     MultipleMappings,
     UnsupportedVma,
     SpecialPageFlags,
+    Lru,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,13 +75,14 @@ impl Drop for PageAccessPin {
 /// Admission guard, not a completed migration or a userspace access barrier.
 /// The borrowed MM write guard cannot be released while isolation survives.
 #[derive(Debug)]
-pub(crate) struct PageIsolationGuard<'a> {
-    page: &'a Page,
-    data: RwSemWriteGuard<'a, InnerPage>,
-    _mm_guard: &'a RwSemWriteGuard<'a, InnerAddressSpace>,
+pub(crate) struct PageIsolationGuard<'page, 'mm> {
+    page: &'page Arc<Page>,
+    data: RwSemWriteGuard<'page, InnerPage>,
+    _mm_guard: &'mm RwSemWriteGuard<'mm, InnerAddressSpace>,
+    reset_gate: bool,
 }
 
-impl Deref for PageIsolationGuard<'_> {
+impl Deref for PageIsolationGuard<'_, '_> {
     type Target = InnerPage;
 
     fn deref(&self) -> &Self::Target {
@@ -88,12 +90,62 @@ impl Deref for PageIsolationGuard<'_> {
     }
 }
 
-impl Drop for PageIsolationGuard<'_> {
+impl Drop for PageIsolationGuard<'_, '_> {
     fn drop(&mut self) {
         // The data write guard still excludes direct readers until its field
         // drops. A newly admitted pin may then wait for that existing guard.
-        let previous = self.page.access_state.swap(0, Ordering::Release);
-        debug_assert_eq!(previous, ISOLATED);
+        if self.reset_gate {
+            let previous = self.page.access_state.swap(0, Ordering::Release);
+            debug_assert_eq!(previous, ISOLATED);
+        }
+    }
+}
+
+/// A migration commit can relinquish the data borrow to consume the Page,
+/// without admitting a new physical user or releasing the MM write guard.
+/// Failure must restore registry/PTE ownership before dropping this token.
+#[cfg(target_arch = "x86_64")]
+pub(super) struct IsolatedPage<'a> {
+    page: Option<Arc<Page>>,
+    _mm_guard: &'a RwSemWriteGuard<'a, InnerAddressSpace>,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl<'page, 'mm> PageIsolationGuard<'page, 'mm> {
+    pub(super) fn into_owned_for_commit(mut self) -> IsolatedPage<'mm> {
+        let owned = IsolatedPage {
+            page: Some(self.page.clone()),
+            _mm_guard: self._mm_guard,
+        };
+        self.reset_gate = false;
+        owned
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+impl IsolatedPage<'_> {
+    pub(super) fn page(&self) -> &Arc<Page> {
+        self.page.as_ref().unwrap()
+    }
+
+    pub(super) fn try_into_page(mut self) -> Result<Page, Self> {
+        match Arc::try_unwrap(self.page.take().unwrap()) {
+            Ok(page) => Ok(page),
+            Err(page) => {
+                self.page = Some(page);
+                Err(self)
+            }
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+impl Drop for IsolatedPage<'_> {
+    fn drop(&mut self) {
+        if let Some(page) = &self.page {
+            let previous = page.access_state.swap(0, Ordering::Release);
+            debug_assert_eq!(previous, ISOLATED);
+        }
     }
 }
 
@@ -123,14 +175,15 @@ impl Page {
     ///
     /// Lock order: MM write -> VMA snapshot -> PT edit -> registry identity ->
     /// Page try-write -> atomic gate. All acquisitions here are nonblocking.
-    /// Never acquire another MM/PT/VMA/registry lock through the returned
-    /// guard. MM-005 needs a separate migration-PTE transaction before it can
-    /// release the MM lock or replace this fixed Page/PFN identity.
-    pub(crate) fn try_isolate_for_migration<'a>(
-        self: &'a Arc<Self>,
-        space: &'a RwSemWriteGuard<'_, InnerAddressSpace>,
+    /// Do not acquire blocking MM/PT/VMA/registry locks through the returned
+    /// guard. The page-internal migration transaction may only try PT/registry
+    /// locks, with restoration before isolation ends. This guard alone does
+    /// not revoke CPU translations or permit replacing the Page/PFN identity.
+    pub(crate) fn try_isolate_for_migration<'page, 'mm>(
+        self: &'page Arc<Self>,
+        space: &'mm RwSemWriteGuard<'_, InnerAddressSpace>,
         address: VirtAddr,
-    ) -> Result<PageIsolationGuard<'a>, PageIsolationError> {
+    ) -> Result<PageIsolationGuard<'page, 'mm>, PageIsolationError> {
         use PageIsolationError::{Busy, StaleMapping, Unsupported};
         use PageIsolationUnsupported as Reason;
 
@@ -220,6 +273,7 @@ impl Page {
             page: self,
             data,
             _mm_guard: space,
+            reset_gate: true,
         })
     }
 }

@@ -22,6 +22,10 @@ enum MmReportCallback {
     PageAccessSelftest,
     #[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
     TlbTeardownSelftest,
+    #[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
+    PageMigrationSelftest,
+    #[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
+    PageMigrationCommand,
     #[cfg(feature = "mm_selftest")]
     VmallocSelftest,
     #[cfg(all(
@@ -53,6 +57,10 @@ impl KernFSCallback for MmReportCallback {
             Self::PageAccessSelftest => crate::mm::page::access::selftest_report(),
             #[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
             Self::TlbTeardownSelftest => crate::mm::tlb::teardown_selftest_report(),
+            #[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
+            Self::PageMigrationSelftest => crate::mm::page::migration::selftest::report(),
+            #[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
+            Self::PageMigrationCommand => String::new(),
             #[cfg(feature = "mm_selftest")]
             Self::DmaSelftest => crate::mm::dma::dma_allocator_selftest_report(),
             Self::AllocationStats => {
@@ -117,14 +125,28 @@ impl KernFSCallback for MmReportCallback {
 
     fn write(
         &self,
-        _data: KernCallbackData,
-        _buf: &[u8],
-        _offset: usize,
+        #[allow(unused_mut, unused_variables)] mut data: KernCallbackData,
+        #[allow(unused_variables)] buf: &[u8],
+        #[allow(unused_variables)] offset: usize,
     ) -> Result<usize, SystemError> {
+        #[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
+        if matches!(self, Self::PageMigrationCommand) {
+            if offset != 0 {
+                return Err(SystemError::EINVAL);
+            }
+            let report = crate::mm::page::migration::selftest::command(buf)?;
+            data.file_private_data_mut()
+                .replace(KernFilePrivateData::DebugTextSnapshot(report));
+            return Ok(buf.len());
+        }
         Err(SystemError::EPERM)
     }
 
     fn poll(&self, _data: KernCallbackData) -> Result<PollStatus, SystemError> {
+        #[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
+        if matches!(self, Self::PageMigrationCommand) {
+            return Ok(PollStatus::READ | PollStatus::WRITE);
+        }
         Ok(PollStatus::READ)
     }
 }
@@ -177,6 +199,23 @@ pub fn init_debugfs_mm() -> Result<(), SystemError> {
         None,
         Some(&MmReportCallback::TlbTeardownSelftest),
     )?;
+    #[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
+    {
+        mm.add_file(
+            "page_migration_selftest".to_string(),
+            InodeMode::S_IRUSR,
+            Some(4096),
+            None,
+            Some(&MmReportCallback::PageMigrationSelftest),
+        )?;
+        mm.add_file(
+            "page_migration".to_string(),
+            InodeMode::S_IRUSR | InodeMode::S_IWUSR,
+            Some(4096),
+            None,
+            Some(&MmReportCallback::PageMigrationCommand),
+        )?;
+    }
     #[cfg(feature = "mm_selftest")]
     mm.add_file(
         "vmalloc_selftest".to_string(),

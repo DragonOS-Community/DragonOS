@@ -374,6 +374,8 @@ impl X86_64MMArch {
         'fault_retry: loop {
             let creator = crate::cgroup::memory::object_for_task(&ProcessManager::current_pcb());
             let data_account = current_address_space.memory_account();
+            #[cfg(feature = "mm_selftest")]
+            crate::mm::page::migration::selftest::fault_enter(&current_address_space, address);
             let mut space_guard = current_address_space.write();
             let mut fault;
             loop {

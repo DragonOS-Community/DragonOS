@@ -115,8 +115,14 @@
               testDir = "/opt/gvisor";
               version = "20251218";
             };
+            # dunitest's nix package is broken on master since cad60340 (#2434):
+            # its Makefile now generates ext4 fixtures from
+            # kernel/crates/another_ext4 sources that are not part of the
+            # derivation's sourceByRegex src, so `nix run .#rootfs-*` fails.
+            # Disable until the dunitest nix package ships the ext4 fixture
+            # generator (or its sources) properly.
             dunitest = {
-              enable = true;
+              enable = false;
               testDir = "/opt/tests/dunitest";
             };
           };

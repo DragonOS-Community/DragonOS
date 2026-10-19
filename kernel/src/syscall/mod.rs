@@ -17,6 +17,8 @@ use self::user_access::UserBufferWriter;
 
 pub mod iov;
 pub mod misc;
+pub mod trace;
+
 mod sys_getrandom;
 mod sys_sysinfo;
 pub mod table;
@@ -145,6 +147,20 @@ impl Syscall {
                     );
                 }
 
+                // Linux-style syscall tracepoints (aligned with
+                // include/trace/events/syscalls.h). Static-key guarded, so
+                // disabled events cost a single unlikely jump.
+                if dispatch_nr == SYS_EXECVE || dispatch_nr == SYS_WRITE {
+                    let mut tp_args = [0u64; 6];
+                    for (i, arg) in dispatch_args.iter().take(6).enumerate() {
+                        tp_args[i] = *arg as u64;
+                    }
+                    if dispatch_nr == SYS_EXECVE {
+                        trace::trace_sys_enter_execve(SYS_EXECVE as i32, tp_args);
+                    } else {
+                        trace::trace_sys_enter_write(SYS_WRITE as i32, tp_args);
+                    }
+                }
                 let r = handler.inner_handle.handle(&dispatch_args, frame);
                 if show {
                     log::debug!(
@@ -156,11 +172,19 @@ impl Syscall {
                 }
 
                 // Write the final return value into the return-value register
-                let rax_value: usize = match r {
-                    Ok(v) => v,
-                    Err(e) => e.to_posix_errno() as i64 as u64 as usize,
+                let (rax_value, ret_value) = match r {
+                    Ok(v) => (v, v as i64),
+                    Err(e) => {
+                        let errno = e.to_posix_errno() as i64;
+                        (errno as u64 as usize, -errno)
+                    }
                 };
                 frame.set_return_value(rax_value);
+                if dispatch_nr == SYS_EXECVE {
+                    // Match Linux sys_exit: the traced `ret` is the raw
+                    // syscall return value (-errno on failure).
+                    trace::trace_sys_exit_execve(ret_value);
+                }
             } else {
                 // fallback: an unregistered or unknown syscall.
                 let r = match dispatch_nr {

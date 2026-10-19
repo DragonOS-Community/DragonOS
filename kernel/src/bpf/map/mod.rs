@@ -2,9 +2,12 @@ pub(super) mod array_map;
 mod hash_map;
 mod lru;
 mod queue;
+pub(super) mod ringbuf;
 pub(super) mod util;
 
 use super::Result;
+use crate::arch::MMArch;
+use crate::mm::MemoryManagementArch;
 use crate::bpf::map::array_map::{ArrayMap, PerCpuArrayMap, PerfEventArrayMap};
 use crate::bpf::map::hash_map::PerCpuHashMap;
 use crate::bpf::map::util::{BpfMapGetNextKeyArg, BpfMapMeta, BpfMapUpdateArg};
@@ -119,7 +122,11 @@ impl DowncastArc for dyn BpfMapCommonOps {
 }
 impl BpfMap {
     pub fn new(map: Box<dyn BpfMapCommonOps>, meta: BpfMapMeta) -> Self {
-        assert_ne!(meta.key_size, 0);
+        // Linux ring buffers are key-less maps; every other map type keys
+        // its elements and must state a non-zero key size.
+        if meta.map_type != bpf_map_type::BPF_MAP_TYPE_RINGBUF {
+            assert_ne!(meta.key_size, 0);
+        }
         BpfMap {
             inner_map: SpinLock::new(map),
             meta,
@@ -129,6 +136,27 @@ impl BpfMap {
     pub fn inner_map(&self) -> &SpinLock<Box<dyn BpfMapCommonOps>> {
         &self.inner_map
     }
+
+    /// The ring-buffer core, when this map is a RINGBUF map.
+    pub fn ringbuf_core(&self) -> Option<alloc::sync::Arc<ringbuf::RingBufCore>> {
+        let inner = self.inner_map.lock();
+        (**inner)
+            .ref_any()
+            .downcast_ref::<ringbuf::RingBufMap>()
+            .map(|m| m.core().clone())
+    }
+
+    /// The ring-buffer page cache, when this map is a RINGBUF map.
+    pub fn ringbuf_page_cache(
+        &self,
+    ) -> Option<alloc::sync::Arc<crate::filesystem::page_cache::PageCache>> {
+        let inner = self.inner_map.lock();
+        (**inner)
+            .ref_any()
+            .downcast_ref::<ringbuf::RingBufMap>()
+            .map(|m| m.page_cache())
+    }
+
 
     pub fn key_size(&self) -> usize {
         self.meta.key_size as usize
@@ -187,6 +215,24 @@ impl IndexNode for BpfMap {
 
     fn stat_mode(&self, metadata: &Metadata) -> InodeMode {
         metadata.mode
+    }
+
+    fn mmap(&self, _start: usize, len: usize, offset: usize) -> Result<()> {
+        // Only RINGBUF maps are mappable. Layout (page-cache indices):
+        // 0 = consumer page, 1 = producer-pos page, 2.. = data ring.
+        let ring = self.ringbuf_core().ok_or(SystemError::ENOSYS)?;
+        let data_sz = ring.data_size();
+        let page = MMArch::PAGE_SIZE;
+        let ok = (offset == 0 && len == page)
+            || (offset == page && (len == page + data_sz || len == page + 2 * data_sz));
+        if !ok {
+            return Err(SystemError::EINVAL);
+        }
+        Ok(())
+    }
+
+    fn page_cache(&self) -> Option<Arc<crate::filesystem::page_cache::PageCache>> {
+        self.ringbuf_page_cache()
     }
 
     fn resize(
@@ -264,6 +310,10 @@ pub fn bpf_map_create(attr: &bpf_attr) -> Result<usize> {
         bpf_map_type::BPF_MAP_TYPE_LRU_PERCPU_HASH => {
             let lru_per_cpu_hash_map = lru::PerCpuLruMap::new(&map_meta)?;
             Box::new(lru_per_cpu_hash_map)
+        }
+        bpf_map_type::BPF_MAP_TYPE_RINGBUF => {
+            let ringbuf_map = ringbuf::RingBufMap::new(&map_meta)?;
+            Box::new(ringbuf_map)
         }
         _ => {
             // Linux map_create rejects map types without available map ops.

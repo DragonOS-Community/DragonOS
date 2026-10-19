@@ -63,6 +63,8 @@ pub struct MmuGather<'mm> {
     stride_shift: u8,
     /// Whether finish() has been called, preventing double free
     finished: bool,
+    #[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
+    observer: Option<Arc<crate::mm::tlb::selftest::Observer>>,
 }
 
 impl<'mm> MmuGather<'mm> {
@@ -78,6 +80,8 @@ impl<'mm> MmuGather<'mm> {
             pending_tables: DetachedUserTables::new(),
             stride_shift: MMArch::PAGE_SHIFT as u8,
             finished: false,
+            #[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
+            observer: crate::mm::tlb::selftest::observer_for(mm),
         }
     }
 
@@ -97,6 +101,8 @@ impl<'mm> MmuGather<'mm> {
             pending_tables: DetachedUserTables::new(),
             stride_shift: MMArch::PAGE_SHIFT as u8,
             finished: false,
+            #[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
+            observer: None,
         }
     }
 
@@ -163,6 +169,19 @@ impl<'mm> MmuGather<'mm> {
     /// After this call, `start/end/freed_tables` are reset, allowing a second round of accumulation
     /// within the same gather.
     pub fn flush_mmu_tlbonly(&mut self) {
+        #[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
+        if let (Some(observer), GatherTarget::AddressSpace(mm)) = (&self.observer, &self.target) {
+            // The caller owns the mm mutation lock. A borrowed, read-only
+            // mapper verifies the real leaf without recursively locking mm.
+            let mapper = unsafe {
+                crate::arch::mm::PageMapper::new(
+                    crate::mm::PageTableKind::User,
+                    mm.table_paddr(),
+                    crate::arch::mm::LockedFrameAllocator,
+                )
+            };
+            observer.cleared(mapper.translate(observer.start).is_none());
+        }
         if let GatherTarget::AddressSpace(mm) = self.target {
             if self.fullmm || self.start == VirtAddr::new(usize::MAX) {
                 mm.flush_tlb_range(
@@ -194,6 +213,48 @@ impl<'mm> MmuGather<'mm> {
     ///
     /// The caller must guarantee that TLB shootdown has already completed before calling this.
     pub fn flush_mmu_free(&mut self) {
+        #[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
+        if let Some(observer) = self.observer.clone() {
+            // This check is at the real retirement boundary. A skipped flush
+            // is detected before rescue, and rescue is never positive evidence.
+            if !observer.before_free() {
+                self.flush_mmu_tlbonly();
+            }
+            assert!(observer.before_free(), "unsafe selftest page retirement");
+            while let Some(page) = self.pending_pages.pop() {
+                if page.phys_address().data()
+                    == observer.frame.load(core::sync::atomic::Ordering::Acquire)
+                {
+                    match Arc::try_unwrap(page) {
+                        Ok(page) => {
+                            let owns_frame = page.read().individually_owns_frame();
+                            if !owns_frame {
+                                observer.fail();
+                            }
+                            assert!(observer.before_free());
+                            drop(page);
+                            if owns_frame {
+                                observer.frame_freed();
+                            }
+                        }
+                        Err(page) => {
+                            observer.fail();
+                            drop(page);
+                        }
+                    }
+                } else {
+                    observer.fail();
+                    drop(page);
+                }
+            }
+            let had_tables = !self.pending_tables.is_empty();
+            assert!(observer.before_free());
+            unsafe { self.pending_tables.free_after_flush() };
+            if had_tables {
+                observer.tables_freed();
+            }
+            return;
+        }
         // Drop all Arc<Page>, letting InnerPage::drop reach deallocate_page_frames
         self.pending_pages.clear();
         unsafe { self.pending_tables.free_after_flush() };
@@ -201,7 +262,16 @@ impl<'mm> MmuGather<'mm> {
 
     /// Finish the gather: flush TLB first, then free pages.
     pub fn finish(mut self) {
-        self.flush_mmu_tlbonly();
+        #[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
+        let skip = self
+            .observer
+            .as_ref()
+            .is_some_and(|observer| observer.skip_flush());
+        #[cfg(not(all(feature = "mm_selftest", target_arch = "x86_64")))]
+        let skip = false;
+        if !skip {
+            self.flush_mmu_tlbonly();
+        }
         self.flush_mmu_free();
         self.finished = true;
     }

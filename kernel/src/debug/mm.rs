@@ -19,6 +19,10 @@ enum MmReportCallback {
     #[cfg(feature = "mm_selftest")]
     AllocationSelftest,
     #[cfg(feature = "mm_selftest")]
+    PageAccessSelftest,
+    #[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
+    TlbTeardownSelftest,
+    #[cfg(feature = "mm_selftest")]
     VmallocSelftest,
     #[cfg(all(
         feature = "mm_selftest",
@@ -45,6 +49,10 @@ enum MmReportCallback {
 impl KernFSCallback for MmReportCallback {
     fn open(&self, mut data: KernCallbackData) -> Result<(), SystemError> {
         let report = match self {
+            #[cfg(feature = "mm_selftest")]
+            Self::PageAccessSelftest => crate::mm::page::access::selftest_report(),
+            #[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
+            Self::TlbTeardownSelftest => crate::mm::tlb::teardown_selftest_report(),
             #[cfg(feature = "mm_selftest")]
             Self::DmaSelftest => crate::mm::dma::dma_allocator_selftest_report(),
             Self::AllocationStats => {
@@ -152,6 +160,22 @@ pub fn init_debugfs_mm() -> Result<(), SystemError> {
         Some(4096),
         None,
         Some(&MmReportCallback::AllocationSelftest),
+    )?;
+    #[cfg(feature = "mm_selftest")]
+    mm.add_file(
+        "page_access_selftest".to_string(),
+        InodeMode::S_IRUSR,
+        Some(4096),
+        None,
+        Some(&MmReportCallback::PageAccessSelftest),
+    )?;
+    #[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
+    mm.add_file(
+        "tlb_teardown_selftest".to_string(),
+        InodeMode::S_IRUSR,
+        Some(4096),
+        None,
+        Some(&MmReportCallback::TlbTeardownSelftest),
     )?;
     #[cfg(feature = "mm_selftest")]
     mm.add_file(

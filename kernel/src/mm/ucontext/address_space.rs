@@ -980,7 +980,7 @@ impl AddressSpace {
         self.page_table_edit_lock.lock()
     }
 
-    pub(super) fn try_page_table_edit(&self) -> Option<MutexGuard<'_, ()>> {
+    pub(crate) fn try_page_table_edit(&self) -> Option<MutexGuard<'_, ()>> {
         self.page_table_edit_lock.try_lock().ok()
     }
 

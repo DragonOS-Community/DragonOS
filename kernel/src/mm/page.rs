@@ -5,7 +5,7 @@ use core::{
     marker::PhantomData,
     mem,
     ops::Add,
-    sync::atomic::{compiler_fence, Ordering},
+    sync::atomic::{compiler_fence, AtomicUsize, Ordering},
 };
 use system_error::SystemError;
 use unified_init::macros::unified_init;
@@ -49,6 +49,8 @@ use super::{
     ucontext::LockedVMA,
     MemoryManagementArch, PageTableKind, PhysAddr, VirtAddr,
 };
+
+pub(crate) mod access;
 
 pub const PAGE_4K_SHIFT: usize = 12;
 #[allow(dead_code)]
@@ -1638,6 +1640,9 @@ bitflags! {
 #[derive(Debug)]
 pub struct Page {
     inner: RwSem<InnerPage>,
+    /// Physical-access pins and migration admission share one atomic word.
+    /// Arc ownership alone only keeps this fixed PFN alive.
+    access_state: AtomicUsize,
     /// 页面所在物理地址
     phys_addr: PhysAddr,
     /// Pins a bulk allocation when this page is one member of a contiguous
@@ -1686,6 +1691,7 @@ impl Page {
         );
         let page = Arc::try_new(Self {
             inner: RwSem::new(inner),
+            access_state: AtomicUsize::new(0),
             phys_addr,
             contiguous_owner: None,
             memory_charge,
@@ -1714,6 +1720,7 @@ impl Page {
         );
         Arc::try_new(Self {
             inner: RwSem::new(inner),
+            access_state: AtomicUsize::new(0),
             phys_addr,
             contiguous_owner: Some(owner),
             memory_charge: None,
@@ -1776,6 +1783,7 @@ impl Page {
         raw.remaining = 0;
         Arc::try_new(Self {
             inner: RwSem::new(inner),
+            access_state: AtomicUsize::new(0),
             phys_addr: new_phys,
             contiguous_owner: None,
             memory_charge,

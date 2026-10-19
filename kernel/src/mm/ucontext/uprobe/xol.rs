@@ -1,4 +1,5 @@
 use super::*;
+use crate::mm::page::access::PageAccessPin;
 
 // ──────────────────────────── XOL area ────────────────────────────
 
@@ -45,11 +46,10 @@ fn take_reachable_slot(
 pub struct XolPage {
     /// Base address of the XOL page in user space.
     page_base: VirtAddr,
-    /// Physical address of the XOL page (for batch3 to write slot contents directly via
-    /// `phys_2_virt` on the interrupts-disabled path, without mapper / RwSem).
-    page_paddr: PhysAddr,
-    /// Keeps the XOL physical page alive for the whole lease lifetime; never keep only a raw paddr.
-    _page: Arc<Page>,
+    /// Retains physical access for the whole pool/slot lease lifetime. Slot
+    /// prefill exports its PFN through this token, rather than an Arc which
+    /// only keeps the frame alive. The hit path executes a prefilled slot.
+    access: PageAccessPin,
     /// Area generation: prevents an old lease from freeing the same-numbered slot in a new area.
     generation: u64,
     /// Slot allocation bitmap (bit=1 means occupied).
@@ -57,11 +57,10 @@ pub struct XolPage {
 }
 
 impl XolPage {
-    pub(super) fn new(page_base: VirtAddr, page_paddr: PhysAddr, page: Arc<Page>) -> Arc<Self> {
+    pub(super) fn new(page_base: VirtAddr, access: PageAccessPin) -> Arc<Self> {
         Arc::new(Self {
             page_base,
-            page_paddr,
-            _page: page,
+            access,
             generation: NEXT_XOL_GENERATION.fetch_add(1, Ordering::Relaxed),
             slot_bitmap: SpinLock::new([0u64; XOL_BITMAP_WORDS]),
         })
@@ -100,9 +99,9 @@ impl XolPage {
         self.page_base
     }
 
-    /// XOL page physical address (batch3 writes slot contents via `phys_2_virt` when interrupts are off).
+    /// XOL page physical address, stable throughout this owner's lifetime.
     pub fn page_paddr(&self) -> PhysAddr {
-        self.page_paddr
+        self.access.phys_address()
     }
 }
 

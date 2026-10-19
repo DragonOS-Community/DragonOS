@@ -91,9 +91,6 @@ pub(super) fn do_getsockname(
     addr: *mut SockAddr,
     addrlen: *mut u32,
 ) -> Result<usize, SystemError> {
-    if addr.is_null() {
-        return Err(SystemError::EINVAL);
-    }
     SocketFdRef::from_fd(fd as i32)?
         .socket()?
         .local_endpoint()?

@@ -9,7 +9,7 @@ use crate::{
     mm::{access_ok, allocation::MemoryAllocationError, VirtAddr},
     process::ProcessManager,
     syscall::user_access::{
-        copy_from_user_protected, user_accessible_len, UserBufferReader, UserBufferWriter,
+        copy_from_user_protected, copy_to_user_protected, user_accessible_len, UserBufferReader,
     },
 };
 
@@ -300,9 +300,9 @@ impl IoVecs {
                 break;
             }
 
-            let mut writer = UserBufferWriter::new(iov.iov_base, accessible, true)?;
-            let mut user_buf = writer.buffer_protected(0)?;
-            user_buf.write_to_user(0, &remaining[..accessible])?;
+            // SAFETY: the source is kernel-owned; the numeric user range is
+            // checked and copied with exception protection, also for mapped 0.
+            unsafe { copy_to_user_protected(base, &remaining[..accessible])? };
 
             written_any = true;
             total_written = total_written.saturating_add(accessible);

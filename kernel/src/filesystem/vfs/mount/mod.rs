@@ -6620,6 +6620,10 @@ impl IndexNode for MountFSInode {
         self.dentry.inode.cached_symlink_target()
     }
 
+    fn birth_time(&self, metadata: &super::Metadata) -> Option<crate::time::PosixTimeSpec> {
+        self.dentry.inode.birth_time(metadata)
+    }
+
     fn reported_ino(&self, metadata: &super::Metadata) -> InodeId {
         self.dentry.inode.reported_ino(metadata)
     }

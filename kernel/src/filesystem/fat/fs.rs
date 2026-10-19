@@ -67,7 +67,7 @@ use super::entry::FATFile;
 use super::utils::{to_search_name, to_search_name_string};
 use super::{
     bpb::{BiosParameterBlock, FATType},
-    entry::{FATDir, FATDirEntry, FATDirIter, FATEntry},
+    entry::{FATDir, FATDirEntry, FATDirIter, FATEntry, PublishedDirEntry},
     utils::RESERVED_CLUSTERS,
 };
 
@@ -312,17 +312,78 @@ impl FATInode {
         };
     }
 
-    /// 更新inode的元数据
+    /// Data-page completion changes logical EOF, not the write operation's
+    /// timestamp. In particular delayed writeback must not replace utimens.
     pub fn update_metadata(&mut self, size: Option<i64>) {
         if let Some(new_size) = size {
             self.metadata.size = new_size;
         }
-        self.update_time();
     }
 
-    /// 更新访问时间
-    pub fn update_time(&mut self) {
-        // log::warn!("update_time has not yet been implemented");
+    fn is_root(&self) -> bool {
+        self.self_ref.ptr_eq(&self.parent)
+    }
+
+    /// Commit only time fields from the current slot. Structure already
+    /// changed by a truncate/namespace operation is never rolled back here.
+    fn apply_metadata(
+        &mut self,
+        requested: &Metadata,
+        mask: SetMetadataMask,
+    ) -> Result<(), SystemError> {
+        let mut proposed = self.metadata.clone();
+        crate::filesystem::vfs::merge_metadata_masked(&mut proposed, requested, mask);
+        if self.is_root() {
+            proposed.atime = PosixTimeSpec::default();
+            proposed.mtime = PosixTimeSpec::default();
+            proposed.ctime = PosixTimeSpec::default();
+            proposed.btime = PosixTimeSpec::default();
+        } else {
+            if mask.contains(SetMetadataMask::ATIME) {
+                proposed.atime = super::time::truncate_atime(proposed.atime);
+            }
+            if mask.contains(SetMetadataMask::MTIME) {
+                proposed.mtime = super::time::truncate_mtime(proposed.mtime);
+                proposed.ctime = proposed.mtime;
+            } else {
+                // FAT has no independent POSIX change-time field.
+                proposed.ctime = self.metadata.ctime;
+            }
+            // Open-unlinked files and removed directories no longer own the
+            // slot, even when their descriptors still keep the inode alive.
+            if mask.intersects(SetMetadataMask::ATIME | SetMetadataMask::MTIME)
+                && self.metadata.nlinks != 0
+                && matches!(self.metadata.file_type, FileType::File | FileType::Dir)
+            {
+                let fs = self.fs.upgrade().ok_or(SystemError::EIO)?;
+                self.inode_type.commit_times(&fs, &proposed)?;
+            }
+        }
+        self.metadata = proposed;
+        Ok(())
+    }
+
+    fn touch_modified(&mut self) -> Result<(), SystemError> {
+        let mut requested = self.metadata.clone();
+        requested.mtime = crate::time::timekeeping::realtime_now();
+        self.apply_metadata(&requested, SetMetadataMask::MTIME)
+    }
+
+    /// vfat_unlink/rmdir update the removed inode after clear_nlink. The old
+    /// descriptor sees the deletion time, but it no longer owns any disk slot.
+    fn revoke_directory_slot(&mut self) {
+        if let FATDirEntry::File(file) | FATDirEntry::VolId(file) = &mut self.inode_type {
+            file.detach();
+        }
+        self.metadata.nlinks = 0;
+    }
+
+    fn touch_deleted(&mut self) -> Result<(), SystemError> {
+        let mut requested = self.metadata.clone();
+        let now = crate::time::timekeeping::realtime_now();
+        requested.atime = now;
+        requested.mtime = now;
+        self.apply_metadata(&requested, SetMetadataMask::ATIME | SetMetadataMask::MTIME)
     }
 
     fn negative_children_cache() -> LruCache<String, ()> {
@@ -457,7 +518,17 @@ impl LockedFATInode {
         inode.0.lock().self_ref = Arc::downgrade(&inode);
         *inode.3.owner.lock() = (Arc::downgrade(&inode), Arc::downgrade(&fs));
 
-        inode.0.lock().synchronize_metadata();
+        {
+            let mut guard = inode.0.lock();
+            guard.synchronize_metadata();
+            if let Some(entry) = guard.inode_type.short_dir_entry() {
+                let (atime, mtime, btime) = entry.times();
+                guard.metadata.atime = atime;
+                guard.metadata.mtime = mtime;
+                guard.metadata.ctime = mtime;
+                guard.metadata.btime = btime;
+            }
+        }
 
         Ok(inode)
     }
@@ -521,21 +592,39 @@ impl LockedFATInode {
             }
         };
         // remove entries
-        let renamed = old_dir.rename(fs, old_name, new_name, new_inode.clone());
+        let old_links = old_inode_guard.metadata.nlinks;
+        let renamed = old_dir.rename(fs, old_name, new_name, new_inode.clone(), || {
+            old_inode_guard.revoke_directory_slot();
+        });
         // Replacement may have detached the victim before a later directory
         // update fails. Never leave that dead name in the positive cache.
         if new_inode
             .as_ref()
-            .is_some_and(|inode| inode.3.detached.load(AtomicOrdering::Acquire))
+            .is_some_and(|inode| inode.0.lock().metadata.nlinks == 0)
         {
             guard.mark_child_absent(new_name);
         }
-        old_inode_guard.inode_type = renamed?;
+        let PublishedDirEntry { entry, sync_error } = match renamed {
+            Ok(published) => published,
+            Err(error) => {
+                if old_inode_guard.metadata.nlinks == 0 {
+                    guard.mark_child_absent(old_name);
+                }
+                return Err(error);
+            }
+        };
+        old_inode_guard.inode_type = entry;
+        old_inode_guard.metadata.nlinks = old_links;
         let old_inode = guard.children.remove(&old_key).unwrap();
         // the new_name should refer to old_inode
         guard.invalidate_negative_children();
         guard.mark_child_negative(old_key);
         guard.children.insert(new_key, old_inode);
+        let parent_time = guard.touch_modified();
+        if let Some(error) = sync_error {
+            return Err(error);
+        }
+        parent_time?;
 
         Ok(RenameOutcome::Moved {
             replaced: had_new.then_some(LinkRemovalOutcome::LastLink),
@@ -603,20 +692,32 @@ impl LockedFATInode {
             }
         };
 
+        let old_links = old_inode_guard.metadata.nlinks;
         let renamed = old_dir.rename_across(
             fs,
             new_dir,
             old_name,
             new_name,
             new_inode.clone().ok_or(SystemError::ENOENT),
+            || old_inode_guard.revoke_directory_slot(),
         );
         if new_inode
             .as_ref()
-            .is_some_and(|inode| inode.3.detached.load(AtomicOrdering::Acquire))
+            .is_some_and(|inode| inode.0.lock().metadata.nlinks == 0)
         {
             new_guard.mark_child_absent(new_name);
         }
-        old_inode_guard.inode_type = renamed?;
+        let PublishedDirEntry { entry, sync_error } = match renamed {
+            Ok(published) => published,
+            Err(error) => {
+                if old_inode_guard.metadata.nlinks == 0 {
+                    old_guard.mark_child_absent(old_name);
+                }
+                return Err(error);
+            }
+        };
+        old_inode_guard.inode_type = entry;
+        old_inode_guard.metadata.nlinks = old_links;
         // 将源节点从父目录中删除
         let old_key = to_search_name(old_name);
         let new_key = to_search_name(new_name);
@@ -625,6 +726,12 @@ impl LockedFATInode {
         old_guard.mark_child_negative(old_key);
         new_guard.invalidate_negative_children();
         new_guard.children.insert(new_key, old_inode);
+        let old_time = old_guard.touch_modified();
+        let new_time = new_guard.touch_modified();
+        if let Some(error) = sync_error {
+            return Err(error);
+        }
+        old_time.and(new_time)?;
         Ok(RenameOutcome::Moved {
             replaced: new_inode.map(|_| LinkRemovalOutcome::LastLink),
         })
@@ -652,6 +759,31 @@ pub struct FATFsInfo {
 }
 
 impl LockedFATInode {
+    pub(super) fn remove_directory_name(
+        &self,
+        parent: &FATDir,
+        fs: Arc<FATFileSystem>,
+        name: &str,
+    ) -> Result<(), SystemError> {
+        let result = {
+            let mut inode = self.0.lock();
+            if !matches!(inode.inode_type, FATDirEntry::Dir(_)) {
+                return Err(SystemError::ENOTDIR);
+            }
+            parent
+                .remove_entry(fs, name, true, || {
+                    inode.revoke_directory_slot();
+                    self.3.detached.store(true, AtomicOrdering::Release);
+                })
+                .map(|_| ())
+        };
+        // Like fat_evict_inode(), keep the chain allocated while an old
+        // directory descriptor owns retention. This is the same final-free
+        // queue as files, not a second directory lifetime or a stat snapshot.
+        self.schedule_reclaim();
+        result
+    }
+
     /// The caller serializes directory mutation. Keep the victim inode locked
     /// through slot removal and detachment so writeback cannot touch a reused slot.
     pub(super) fn remove_file_name(
@@ -660,19 +792,23 @@ impl LockedFATInode {
         fs: Arc<FATFileSystem>,
         name: &str,
     ) -> Result<(), SystemError> {
-        {
+        let result = {
             let mut inode = self.0.lock();
-            let file = match &mut inode.inode_type {
-                FATDirEntry::File(file) | FATDirEntry::VolId(file) => file,
-                _ => return Err(SystemError::EINVAL),
-            };
-            parent.remove(fs, name, false)?;
-            file.detach();
-            inode.metadata.nlinks = 0;
-            self.3.detached.store(true, AtomicOrdering::Release);
-        }
+            if !matches!(
+                inode.inode_type,
+                FATDirEntry::File(_) | FATDirEntry::VolId(_)
+            ) {
+                return Err(SystemError::EINVAL);
+            }
+            parent.remove(fs, name, false, || {
+                inode.revoke_directory_slot();
+                self.3.detached.store(true, AtomicOrdering::Release);
+            })
+        };
+        // Only a known unlink/replacement may arm final chain reclamation.
+        // A transient source rename handoff deliberately never sets this flag.
         self.schedule_reclaim();
-        Ok(())
+        result
     }
 
     fn schedule_reclaim(&self) {
@@ -1944,6 +2080,9 @@ impl LockedFATInode {
         buf: &[u8],
     ) -> Result<usize, MemoryAllocationError> {
         let _size_guard = self.1.read();
+        if !buf.is_empty() {
+            self.0.lock().touch_modified()?;
+        }
         self.try_write_pagecache_locked(offset, buf)
     }
 
@@ -2044,8 +2183,10 @@ impl IndexNode for LockedFATInode {
             crate::filesystem::vfs::WriteIoIntent::Direct { .. }
         ) && end as u64 <= frontier;
         stage.complete();
+        // One file_modified stage before content or user-copy progress. A
+        // timestamp I/O error cannot erase a later positive write prefix.
+        self.0.lock().touch_modified()?;
         if direct {
-            self.0.lock().update_metadata(None);
             intent.io.check_alignment(offset | len, alignment)?;
         }
         let written = source.write_chunks(len, |relative, bytes| {
@@ -2315,7 +2456,7 @@ impl IndexNode for LockedFATInode {
         let len = core::cmp::min(len, buf.len());
         let _size = self.1.read();
         if len != 0 {
-            self.0.lock().update_metadata(None);
+            self.0.lock().touch_modified()?;
         }
         self.write_direct_data_locked(offset, &buf[..len])
     }
@@ -2338,7 +2479,9 @@ impl IndexNode for LockedFATInode {
                 FileType::File => {
                     d.create_file(name, fs)?;
                     guard.invalidate_negative_children();
-                    return Ok(guard.find(name)?);
+                    let child = guard.find(name)?;
+                    guard.touch_modified()?;
+                    return Ok(child);
                 }
                 FileType::Dir => {
                     d.create_dir(name, fs)?;
@@ -2352,6 +2495,7 @@ impl IndexNode for LockedFATInode {
                     drop(child_md);
                     // 父目录因为新增子目录，多一个链接（来自子目录的 ".."）
                     guard.metadata.nlinks += 1;
+                    guard.touch_modified()?;
                     return Ok(child);
                 }
 
@@ -2360,7 +2504,9 @@ impl IndexNode for LockedFATInode {
                 FileType::Socket => {
                     d.create_file(name, fs)?;
                     guard.invalidate_negative_children();
-                    return Ok(guard.find(name)?);
+                    let child = guard.find(name)?;
+                    guard.touch_modified()?;
+                    return Ok(child);
                 }
 
                 _ => return Err(SystemError::EINVAL.into()),
@@ -2394,36 +2540,48 @@ impl IndexNode for LockedFATInode {
     fn metadata(&self) -> Result<Metadata, SystemError> {
         self.0.lock().metadata_with_allocated_blocks()
     }
+
+    fn birth_time(&self, metadata: &Metadata) -> Option<PosixTimeSpec> {
+        Some(metadata.btime)
+    }
     fn set_metadata(
         &self,
         metadata: &Metadata,
     ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
-        let result: core::result::Result<_, system_error::SystemError> = {
-            let inode = &mut self.0.lock();
-            inode.metadata.atime = metadata.atime;
-            inode.metadata.mtime = metadata.mtime;
-            inode.metadata.ctime = metadata.ctime;
-            inode.metadata.mode = metadata.mode;
-            inode.metadata.uid = metadata.uid;
-            inode.metadata.gid = metadata.gid;
-            Ok(())
-        };
-        result.map_err(Into::into)
+        self.0
+            .lock()
+            .apply_metadata(
+                metadata,
+                SetMetadataMask::ATIME
+                    | SetMetadataMask::MTIME
+                    | SetMetadataMask::CTIME
+                    | SetMetadataMask::MODE
+                    | SetMetadataMask::UID
+                    | SetMetadataMask::GID,
+            )
+            .map_err(Into::into)
     }
+
     fn set_metadata_masked(
         &self,
         metadata: &Metadata,
         mask: SetMetadataMask,
     ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
-        let inode = &mut self.0.lock();
-        crate::filesystem::vfs::merge_metadata_masked(&mut inode.metadata, metadata, mask);
-        Ok(())
+        self.0
+            .lock()
+            .apply_metadata(metadata, mask)
+            .map_err(Into::into)
     }
+
     fn update_atime(&self, now: PosixTimeSpec, relatime: bool) -> Result<(), SystemError> {
-        let inode = &mut self.0.lock();
-        crate::filesystem::vfs::update_atime_locked(&mut inode.metadata, now, relatime);
+        let mut inode = self.0.lock();
+        let mut proposed = inode.metadata.clone();
+        if crate::filesystem::vfs::update_atime_locked(&mut proposed, now, relatime) {
+            inode.apply_metadata(&proposed, SetMetadataMask::ATIME)?;
+        }
         Ok(())
     }
+
     fn resize(&self, len: usize) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         let result: core::result::Result<_, system_error::SystemError> = (|| {
             let _size_guard = self.1.write();
@@ -2544,9 +2702,9 @@ impl IndexNode for LockedFATInode {
         // Linux FAT's mode-0 fallocate does not call file_modified(), so it
         // neither performs killpriv nor publishes ATTRIB for a mode change.
         mask.remove(SetMetadataMask::MODE);
-        crate::filesystem::vfs::merge_metadata_masked(&mut guard.metadata, &metadata, mask);
         guard.metadata.size = requested_end as i64;
         guard.synchronize_metadata();
+        guard.apply_metadata(&metadata, mask)?;
         let inode_sync = guard.metadata.flags.contains(InodeFlags::S_SYNC);
         drop(guard);
         let mounted_fs: Arc<dyn FileSystem> = fs.clone();
@@ -2665,53 +2823,52 @@ impl IndexNode for LockedFATInode {
             _ => return Err(SystemError::ENOTDIR.into()),
         };
         dir.check_existence(name, Some(false), fs.clone())?;
-        target.remove_file_name(dir, fs, name)?;
-        guard.mark_child_absent(name);
+        let removed = target.remove_file_name(dir, fs, name);
+        let detached = {
+            let mut victim = target.0.lock();
+            if victim.metadata.nlinks == 0 {
+                victim.touch_deleted()?;
+                true
+            } else {
+                false
+            }
+        };
+        if detached {
+            guard.mark_child_absent(name);
+            let time = guard.touch_modified();
+            removed.and(time)?;
+        } else {
+            removed?;
+        }
         Ok(LinkRemovalOutcome::LastLink)
     }
 
     fn rmdir(&self, name: &str) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
-        let mut guard: MutexGuard<FATInode> = self.0.lock();
-        let target: Arc<LockedFATInode> = guard.find(name)?;
-        // 对目标inode上锁，以防更改
-        let target_guard: MutexGuard<FATInode> = target.0.lock();
-        // 先从缓存删除
-        guard.children.remove(&to_search_name(name));
-
+        let mut guard = self.0.lock();
+        let target = guard.find(name)?;
+        let fs = guard.fs.upgrade().ok_or(SystemError::EIO)?;
         let dir = match &guard.inode_type {
-            FATDirEntry::File(_) | FATDirEntry::VolId(_) => {
-                return Err(SystemError::ENOTDIR.into());
-            }
-            FATDirEntry::Dir(d) => d,
-            FATDirEntry::UnInit => {
-                error!("FATFS: param: Inode_type uninitialized.");
-                return Err(SystemError::EROFS.into());
+            FATDirEntry::Dir(dir) => dir,
+            FATDirEntry::UnInit => return Err(SystemError::EROFS.into()),
+            _ => return Err(SystemError::ENOTDIR.into()),
+        };
+        let removed = target.remove_directory_name(dir, fs, name);
+        let detached = {
+            let mut victim = target.0.lock();
+            if victim.metadata.nlinks == 0 {
+                victim.touch_deleted()?;
+                true
+            } else {
+                false
             }
         };
-        // 检查文件夹是否存在
-        dir.check_existence(name, Some(true), guard.fs.upgrade().unwrap())?;
-
-        // 再从磁盘删除
-        let r: Result<(), SystemError> =
-            dir.remove(guard.fs.upgrade().unwrap().clone(), name, true);
-        match r {
-            Ok(_) => {
-                // 删除子目录成功，父目录链接计数减少
-                if guard.metadata.nlinks > 0 {
-                    guard.metadata.nlinks -= 1;
-                }
-                guard.mark_child_absent(name);
-                return Ok(());
-            }
-            Err(r) => {
-                if r == SystemError::ENOTEMPTY {
-                    // 如果要删除的是目录，且不为空，则删除动作未发生，重新加入缓存
-                    guard.children.insert(to_search_name(name), target.clone());
-                    drop(target_guard);
-                }
-                Err(r.into())
-            }
+        if detached {
+            guard.metadata.nlinks = guard.metadata.nlinks.saturating_sub(1);
+            guard.mark_child_absent(name);
+            let time = guard.touch_modified();
+            return removed.and(time).map_err(Into::into);
         }
+        removed.map_err(Into::into)
     }
 
     fn move_to(

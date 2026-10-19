@@ -31,11 +31,55 @@ use std::time::Duration;
 type FId = u64;
 type StateKey = u64;
 
+// Node identities belong to one restored timeline. The root is the stable
+// control anchor; all other nodes become stale on a successful restore.
+#[derive(Default)]
+struct NodeEpoch(u32);
+
+impl NodeEpoch {
+    fn encode(&self, inode: u32) -> u64 {
+        if inode == 1 {
+            1
+        } else {
+            (u64::from(self.0) << 32) | u64::from(inode)
+        }
+    }
+
+    fn decode(&self, node: u64) -> Result<u32, i32> {
+        if node == 1 {
+            return Ok(1);
+        }
+        let inode = node as u32;
+        if inode <= 1 || node >> 32 != u64::from(self.0) {
+            Err(libc::ESTALE)
+        } else {
+            Ok(inode)
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Handle {
+    node: u64,
+    epoch: u32,
+}
+
+// Keep the FUSE reply/error handoff uniform at callback boundaries.
+macro_rules! fuse_result {
+    ($reply:ident, $value:expr) => {
+        match $value {
+            Ok(value) => value,
+            Err(error) => return $reply.error(error),
+        }
+    };
+}
+
 pub struct StateExt4FuseFs<T> {
     /// Block device
     block_dev: Arc<dyn StateBlockDevice<T>>,
     /// Ext4 filesystem
     fs: Ext4,
+    nodes: NodeEpoch,
     /// Checkpoint states
     states: HashMap<StateKey, T>,
     /// Next file handler id
@@ -43,14 +87,31 @@ pub struct StateExt4FuseFs<T> {
     /// Next directory handler id
     next_did: FId,
     lookup_counts: HashMap<u32, u64>,
-    open_handles: HashMap<FId, u32>,
-    open_dir_handles: HashMap<FId, u32>,
+    open_handles: HashMap<FId, Handle>,
+    open_dir_handles: HashMap<FId, Handle>,
     pending_reclaims: HashMap<u32, InodeReclaimHandle>,
 }
 
 impl<T: 'static> StateExt4FuseFs<T> {
     const CHECKPOINT_IOC: u32 = 1;
     const RESTORE_IOC: u32 = 2;
+    // Linux _IOW(0xe4, nr, u64): the direction and size let the kernel
+    // safely import the key. Legacy unencoded 1/2 cannot import a pointer.
+    const CHECKPOINT_IOW: u32 = 0x4008_e401;
+    const RESTORE_IOW: u32 = 0x4008_e402;
+
+    fn snapshot_key(cmd: u32, data: &[u8]) -> Result<(bool, StateKey), i32> {
+        let restore = match cmd {
+            Self::CHECKPOINT_IOC | Self::CHECKPOINT_IOW => false,
+            Self::RESTORE_IOC | Self::RESTORE_IOW => true,
+            _ => return Err(libc::ENOTTY),
+        };
+        let key = data
+            .try_into()
+            .map(StateKey::from_ne_bytes)
+            .map_err(|_| libc::EINVAL)?;
+        Ok((restore, key))
+    }
 
     /// Create a file system on a block device
     ///
@@ -64,6 +125,7 @@ impl<T: 'static> StateExt4FuseFs<T> {
         Self {
             fs,
             block_dev,
+            nodes: NodeEpoch::default(),
             states: HashMap::new(),
             next_fid: 0,
             next_did: 0,
@@ -74,49 +136,107 @@ impl<T: 'static> StateExt4FuseFs<T> {
         }
     }
 
-    /// Save a state
-    fn checkpoint(&mut self, key: StateKey) -> bool {
-        log::info!("Checkpoint {}", key);
-        // A reclaim capability cannot be duplicated across execution
-        // timelines. Refuse the checkpoint instead of creating a snapshot
-        // whose unlinked inode could no longer be reclaimed after restore.
+    /// Snapshot only committed synchronous filesystem operations. This tool
+    /// does not enable the asynchronous batching backend.
+    fn checkpoint(&mut self, key: StateKey) -> Result<(), i32> {
+        if self.states.contains_key(&key) {
+            return Err(libc::EEXIST);
+        }
         if !self.pending_reclaims.is_empty() {
-            log::warn!(
-                "Cannot checkpoint with {} pending inode reclaims",
-                self.pending_reclaims.len()
-            );
-            return false;
+            return Err(libc::EBUSY);
         }
-        self.states
-            .insert(key, self.block_dev.checkpoint())
-            .is_none()
+        self.fs.flush_device().map_err(|e| e.code() as i32)?;
+        self.states.insert(key, self.block_dev.checkpoint());
+        Ok(())
     }
 
-    /// Restore a state
-    fn restore(&mut self, key: StateKey) -> bool {
-        log::info!("Restore {}", key);
-        if let Some(state) = self.states.remove(&key) {
-            self.block_dev.restore(state);
-            // Reclaim handles are capabilities for inode lifetimes in the
-            // discarded block-device timeline. Drop them without reclaiming;
-            // lookup/open tracking still represents the live FUSE session.
-            self.pending_reclaims.clear();
-            true
-        } else {
-            false
-        }
+    fn restore(&mut self, key: StateKey) -> Result<(), i32> {
+        let target = self.states.get(&key).ok_or(libc::ENOENT)?;
+        let epoch = self.nodes.0.checked_add(1).ok_or(libc::EOVERFLOW)?;
+        let rollback = self.block_dev.checkpoint();
+        self.block_dev.restore(target);
+        let restored = match Ext4::load_writable(self.block_dev.clone()) {
+            Ok(fs) => fs,
+            Err(error) => {
+                self.block_dev.restore(&rollback);
+                return Err(error.code() as i32);
+            }
+        };
+        // Ext4 Drop does not perform I/O. Never shut down the discarded owner:
+        // its old cached metadata must not be written into the restored image.
+        self.fs = restored;
+        self.nodes.0 = epoch;
+        self.states.remove(&key);
+        self.lookup_counts.clear();
+        self.pending_reclaims.clear();
+        Ok(())
     }
 
-    /// Get file attribute and tranlate type
     fn get_attr(&self, inode: u32) -> Result<FileAttr, Ext4Error> {
-        match self.fs.getattr(inode) {
-            Ok(attr) => Ok(translate_attr(attr)),
-            Err(e) => Err(e),
+        let mut attr = translate_attr(self.fs.getattr(inode)?);
+        attr.ino = self.nodes.encode(inode);
+        Ok(attr)
+    }
+
+    fn allocate_handle(&mut self, directory: bool) -> Result<FId, i32> {
+        let next = if directory {
+            &mut self.next_did
+        } else {
+            &mut self.next_fid
+        };
+        let id = *next;
+        *next = next.checked_add(1).ok_or(libc::EOVERFLOW)?;
+        Ok(id)
+    }
+
+    fn handle(&self, node: u64) -> Handle {
+        Handle {
+            node,
+            epoch: self.nodes.0,
         }
+    }
+
+    fn check_handle(&self, handles: &HashMap<FId, Handle>, fh: FId, node: u64) -> Result<u32, i32> {
+        let inode = self.nodes.decode(node)?;
+        let handle = handles.get(&fh).ok_or(libc::ESTALE)?;
+        if handle.node != node || handle.epoch != self.nodes.0 {
+            return Err(libc::ESTALE);
+        }
+        Ok(inode)
+    }
+
+    fn release_handle(&mut self, fh: FId, node: u64, directory: bool) -> Result<(), i32> {
+        let handles = if directory {
+            &mut self.open_dir_handles
+        } else {
+            &mut self.open_handles
+        };
+        let handle = handles.get(&fh).ok_or(libc::ESTALE)?;
+        if handle.node != node {
+            return Err(libc::ESTALE);
+        }
+        let handle = handles.remove(&fh).unwrap();
+        if handle.epoch != self.nodes.0 {
+            return Ok(());
+        }
+        let inode = self.nodes.decode(node)?;
+        self.try_reclaim(inode).map_err(|e| e.code() as i32)
     }
 
     fn retain_lookup(&mut self, inode: u32) {
         *self.lookup_counts.entry(inode).or_insert(0) += 1;
+    }
+
+    fn forget_node(&mut self, node: u64, nlookup: u64) -> Result<(), Ext4Error> {
+        let Ok(inode) = self.nodes.decode(node) else {
+            return Ok(());
+        };
+        let count = self.lookup_counts.entry(inode).or_insert(0);
+        *count = count.saturating_sub(nlookup);
+        if *count == 0 {
+            self.lookup_counts.remove(&inode);
+        }
+        self.try_reclaim(inode)
     }
 
     fn queue_reclaim(&mut self, handle: InodeReclaimHandle) -> Result<(), Ext4Error> {
@@ -138,7 +258,9 @@ impl<T: 'static> StateExt4FuseFs<T> {
             .open_handles
             .values()
             .chain(self.open_dir_handles.values())
-            .any(|open_inode| *open_inode == inode);
+            .any(|handle| {
+                handle.epoch == self.nodes.0 && self.nodes.decode(handle.node) == Ok(inode)
+            });
         if !looked_up && !opened {
             if let Some(handle) = self.pending_reclaims.remove(&inode) {
                 if let Err(failure) = self.fs.reclaim_inode(handle) {
@@ -175,7 +297,8 @@ impl<T: 'static> Filesystem for StateExt4FuseFs<T> {
     }
 
     fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
-        match self.fs.lookup(parent as u32, name.to_str().unwrap()) {
+        let parent_inode = fuse_result!(reply, self.nodes.decode(parent));
+        match self.fs.lookup(parent_inode, name.to_str().unwrap()) {
             Ok(inode_id) => {
                 self.retain_lookup(inode_id);
                 reply.entry(&get_ttl(), &self.get_attr(inode_id).unwrap(), 0)
@@ -185,23 +308,14 @@ impl<T: 'static> Filesystem for StateExt4FuseFs<T> {
     }
 
     fn forget(&mut self, _req: &Request<'_>, ino: u64, nlookup: u64) {
-        let ino = ino as u32;
-        let count = self.lookup_counts.entry(ino).or_insert(0);
-        *count = count.saturating_sub(nlookup);
-        if *count == 0 {
-            self.lookup_counts.remove(&ino);
-        }
-        if let Err(error) = self.try_reclaim(ino) {
-            log::error!(
-                "failed to reclaim forgotten ext4 inode {}: {:?}",
-                ino,
-                error
-            );
+        if let Err(error) = self.forget_node(ino, nlookup) {
+            log::error!("failed to reclaim forgotten ext4 node {}: {:?}", ino, error);
         }
     }
 
     fn getattr(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyAttr) {
-        match self.get_attr(ino as u32) {
+        let inode = fuse_result!(reply, self.nodes.decode(ino));
+        match self.get_attr(inode) {
             Ok(attr) => reply.attr(&get_ttl(), &attr),
             Err(e) => reply.error(e.code() as i32),
         }
@@ -218,13 +332,17 @@ impl<T: 'static> Filesystem for StateExt4FuseFs<T> {
         atime: Option<fuser::TimeOrNow>,
         mtime: Option<fuser::TimeOrNow>,
         ctime: Option<std::time::SystemTime>,
-        _fh: Option<u64>,
+        fh: Option<u64>,
         crtime: Option<std::time::SystemTime>,
         _chgtime: Option<std::time::SystemTime>,
         _bkuptime: Option<std::time::SystemTime>,
         _flags: Option<u32>,
         reply: ReplyAttr,
     ) {
+        let inode = fuse_result!(reply, self.nodes.decode(ino));
+        if let Some(fh) = fh {
+            fuse_result!(reply, self.check_handle(&self.open_handles, fh, ino));
+        }
         let attr = SetAttr {
             mode: mode.map(|m| InodeMode::from_bits_truncate(m as u16)),
             uid,
@@ -235,8 +353,8 @@ impl<T: 'static> Filesystem for StateExt4FuseFs<T> {
             ctime: ctime.map(|t| sys_time2second(t)),
             crtime: crtime.map(|t| sys_time2second(t)),
         };
-        match self.fs.setattr(ino as u32, attr) {
-            Ok(_) => reply.attr(&get_ttl(), &self.get_attr(ino as u32).unwrap()),
+        match self.fs.setattr(inode, attr) {
+            Ok(_) => reply.attr(&get_ttl(), &self.get_attr(inode).unwrap()),
             Err(e) => reply.error(e.code() as i32),
         }
     }
@@ -251,33 +369,36 @@ impl<T: 'static> Filesystem for StateExt4FuseFs<T> {
         _flags: i32,
         reply: ReplyCreate,
     ) {
+        let parent_inode = fuse_result!(reply, self.nodes.decode(parent));
         // Check if name is already in use
-        if let Ok(_) = self.fs.lookup(parent as u32, name.to_str().unwrap()) {
+        if let Ok(_) = self.fs.lookup(parent_inode, name.to_str().unwrap()) {
             return reply.error(ErrCode::EEXIST as i32);
         }
+        let fh = fuse_result!(reply, self.allocate_handle(false));
         match self.fs.create(
-            parent as u32,
+            parent_inode,
             name.to_str().unwrap(),
             InodeMode::from_bits_truncate(mode as u16),
         ) {
             Ok(ino) => {
                 self.retain_lookup(ino);
-                self.open_handles.insert(self.next_fid, ino);
+                self.open_handles
+                    .insert(fh, self.handle(self.nodes.encode(ino)));
                 reply.created(
                     &get_ttl(),
                     &self.get_attr(ino).unwrap(),
                     0,
-                    self.next_fid,
-                    0,
+                    fh,
+                    fuser::consts::FOPEN_DIRECT_IO,
                 );
-                self.next_fid += 1;
             }
             Err(e) => reply.error(e.code() as i32),
         }
     }
 
     fn open(&mut self, _req: &Request<'_>, ino: u64, _flags: i32, reply: ReplyOpen) {
-        let attr = self.get_attr(ino as u32);
+        let inode = fuse_result!(reply, self.nodes.decode(ino));
+        let attr = self.get_attr(inode);
         match attr {
             Ok(attr) => {
                 if attr.kind != FileType::RegularFile {
@@ -286,24 +407,25 @@ impl<T: 'static> Filesystem for StateExt4FuseFs<T> {
             }
             Err(e) => return reply.error(e.code() as i32),
         }
-        reply.opened(self.next_fid, 0);
-        self.open_handles.insert(self.next_fid, ino as u32);
-        self.next_fid += 1;
+        let fh = fuse_result!(reply, self.allocate_handle(false));
+        self.open_handles.insert(fh, self.handle(ino));
+        reply.opened(fh, fuser::consts::FOPEN_DIRECT_IO);
     }
 
     fn read(
         &mut self,
         _req: &Request<'_>,
         ino: u64,
-        _fh: u64,
+        fh: u64,
         offset: i64,
         size: u32,
         _flags: i32,
         _lock_owner: Option<u64>,
         reply: ReplyData,
     ) {
+        let inode = fuse_result!(reply, self.check_handle(&self.open_handles, fh, ino));
         let mut data = vec![0; size as usize];
-        match self.fs.read(ino as u32, offset as usize, &mut data) {
+        match self.fs.read(inode, offset as usize, &mut data) {
             Ok(sz) => reply.data(&data[..sz]),
             Err(e) => reply.error(e.code() as i32),
         }
@@ -313,7 +435,7 @@ impl<T: 'static> Filesystem for StateExt4FuseFs<T> {
         &mut self,
         _req: &Request<'_>,
         ino: u64,
-        _fh: u64,
+        fh: u64,
         offset: i64,
         data: &[u8],
         _write_flags: u32,
@@ -321,7 +443,8 @@ impl<T: 'static> Filesystem for StateExt4FuseFs<T> {
         _lock_owner: Option<u64>,
         reply: ReplyWrite,
     ) {
-        match self.fs.write(ino as u32, offset as usize, data) {
+        let inode = fuse_result!(reply, self.check_handle(&self.open_handles, fh, ino));
+        match self.fs.write(inode, offset as usize, data) {
             Ok(sz) => reply.written(sz as u32),
             Err(e) => reply.error(e.code() as i32),
         }
@@ -337,10 +460,9 @@ impl<T: 'static> Filesystem for StateExt4FuseFs<T> {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        self.open_handles.remove(&fh);
-        match self.try_reclaim(ino as u32) {
+        match self.release_handle(fh, ino, false) {
             Ok(()) => reply.ok(),
-            Err(error) => reply.error(error.code() as i32),
+            Err(error) => reply.error(error),
         }
     }
 
@@ -352,24 +474,27 @@ impl<T: 'static> Filesystem for StateExt4FuseFs<T> {
         newname: &OsStr,
         reply: ReplyEntry,
     ) {
+        let inode = fuse_result!(reply, self.nodes.decode(ino));
+        let newparent_inode = fuse_result!(reply, self.nodes.decode(newparent));
         // Check if newname is already in use
-        if let Ok(_) = self.fs.lookup(newparent as u32, newname.to_str().unwrap()) {
+        if let Ok(_) = self.fs.lookup(newparent_inode, newname.to_str().unwrap()) {
             return reply.error(ErrCode::EEXIST as i32);
         }
         match self
             .fs
-            .link(ino as u32, newparent as u32, newname.to_str().unwrap())
+            .link(inode, newparent_inode, newname.to_str().unwrap())
         {
             Ok(_) => {
-                self.retain_lookup(ino as u32);
-                reply.entry(&get_ttl(), &self.get_attr(ino as u32).unwrap(), 0)
+                self.retain_lookup(inode);
+                reply.entry(&get_ttl(), &self.get_attr(inode).unwrap(), 0)
             }
             Err(e) => reply.error(e.code() as i32),
         }
     }
 
     fn unlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-        match self.fs.unlink(parent as u32, name.to_str().unwrap()) {
+        let parent_inode = fuse_result!(reply, self.nodes.decode(parent));
+        match self.fs.unlink(parent_inode, name.to_str().unwrap()) {
             Ok(Some(handle)) => match self.queue_reclaim(handle) {
                 Ok(()) => reply.ok(),
                 Err(e) => reply.error(e.code() as i32),
@@ -389,13 +514,15 @@ impl<T: 'static> Filesystem for StateExt4FuseFs<T> {
         _flags: u32,
         reply: ReplyEmpty,
     ) {
+        let parent_inode = fuse_result!(reply, self.nodes.decode(parent));
+        let newparent_inode = fuse_result!(reply, self.nodes.decode(newparent));
         if parent == newparent && name == newname {
             return reply.ok();
         }
         match self.fs.rename(
-            parent as u32,
+            parent_inode,
             name.to_str().unwrap(),
-            newparent as u32,
+            newparent_inode,
             newname.to_str().unwrap(),
         ) {
             Ok(Some(handle)) => match self.queue_reclaim(handle) {
@@ -416,12 +543,13 @@ impl<T: 'static> Filesystem for StateExt4FuseFs<T> {
         _umask: u32,
         reply: ReplyEntry,
     ) {
+        let parent_inode = fuse_result!(reply, self.nodes.decode(parent));
         // Check if name is already in use
-        if let Ok(_) = self.fs.lookup(parent as u32, name.to_str().unwrap()) {
+        if let Ok(_) = self.fs.lookup(parent_inode, name.to_str().unwrap()) {
             return reply.error(ErrCode::EEXIST as i32);
         }
         match self.fs.mkdir(
-            parent as u32,
+            parent_inode,
             name.to_str().unwrap(),
             InodeMode::from_bits_truncate(mode as u16),
         ) {
@@ -434,14 +562,15 @@ impl<T: 'static> Filesystem for StateExt4FuseFs<T> {
     }
 
     fn opendir(&mut self, _req: &Request<'_>, ino: u64, _flags: i32, reply: ReplyOpen) {
-        match self.get_attr(ino as u32) {
+        let inode = fuse_result!(reply, self.nodes.decode(ino));
+        match self.get_attr(inode) {
             Ok(attr) => {
                 if attr.kind != FileType::Directory {
                     return reply.error(ErrCode::ENOTDIR as i32);
                 }
-                self.open_dir_handles.insert(self.next_did, ino as u32);
-                reply.opened(self.next_did, 0);
-                self.next_did += 1;
+                let fh = fuse_result!(reply, self.allocate_handle(true));
+                self.open_dir_handles.insert(fh, self.handle(ino));
+                reply.opened(fh, 0);
             }
             Err(e) => reply.error(e.code() as i32),
         }
@@ -451,20 +580,27 @@ impl<T: 'static> Filesystem for StateExt4FuseFs<T> {
         &mut self,
         _req: &Request<'_>,
         ino: u64,
-        _fh: u64,
+        fh: u64,
         offset: i64,
         mut reply: ReplyDirectory,
     ) {
-        let entries = self.fs.listdir(ino as u32);
+        let inode = fuse_result!(reply, self.check_handle(&self.open_dir_handles, fh, ino));
+        let entries = self.fs.listdir(inode);
         match entries {
             Ok(entries) => {
                 let mut i = offset as usize;
                 while i < entries.len() {
                     let entry = &entries[i];
+                    let attr = fuse_result!(
+                        reply,
+                        self.fs
+                            .getattr(entry.inode())
+                            .map_err(|error| error.code() as i32)
+                    );
                     if reply.add(
-                        ino,
+                        self.nodes.encode(entry.inode()),
                         i as i64 + 1,
-                        translate_ftype(self.fs.getattr(entry.inode()).unwrap().ftype),
+                        translate_ftype(attr.ftype),
                         entry.name(),
                     ) {
                         break;
@@ -487,15 +623,15 @@ impl<T: 'static> Filesystem for StateExt4FuseFs<T> {
         _flags: i32,
         reply: ReplyEmpty,
     ) {
-        self.open_dir_handles.remove(&fh);
-        match self.try_reclaim(ino as u32) {
+        match self.release_handle(fh, ino, true) {
             Ok(()) => reply.ok(),
-            Err(error) => reply.error(error.code() as i32),
+            Err(error) => reply.error(error),
         }
     }
 
     fn rmdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-        match self.fs.rmdir(parent as u32, name.to_str().unwrap()) {
+        let parent_inode = fuse_result!(reply, self.nodes.decode(parent));
+        match self.fs.rmdir(parent_inode, name.to_str().unwrap()) {
             Ok(Some(handle)) => match self.queue_reclaim(handle) {
                 Ok(()) => reply.ok(),
                 Err(e) => reply.error(e.code() as i32),
@@ -506,7 +642,8 @@ impl<T: 'static> Filesystem for StateExt4FuseFs<T> {
     }
 
     fn access(&mut self, req: &Request<'_>, ino: u64, mask: i32, reply: ReplyEmpty) {
-        let attr = self.fs.getattr(ino as u32).unwrap();
+        let inode = fuse_result!(reply, self.nodes.decode(ino));
+        let attr = fuse_result!(reply, self.fs.getattr(inode).map_err(|e| e.code() as i32));
         let mask = mask as u16;
         // Check other
         if attr.perm.contains(InodeMode::from_bits_truncate(mask)) {
@@ -530,35 +667,42 @@ impl<T: 'static> Filesystem for StateExt4FuseFs<T> {
     fn ioctl(
         &mut self,
         _req: &Request<'_>,
-        _ino: u64,
-        _fh: u64,
+        ino: u64,
+        fh: u64,
         _flags: u32,
         cmd: u32,
         in_data: &[u8],
         _out_size: u32,
         reply: fuser::ReplyIoctl,
     ) {
-        match cmd {
-            Self::CHECKPOINT_IOC => {
-                let key = StateKey::from_ne_bytes(in_data[0..8].try_into().unwrap());
-                if self.checkpoint(key) {
-                    reply.ioctl(0, in_data);
+        // Root directory handles are stable control handles across restores.
+        // Other nodes must belong to the current timeline.
+        let inode = fuse_result!(reply, self.nodes.decode(ino));
+        let handles = if _flags & fuser::consts::FUSE_IOCTL_DIR != 0 {
+            &self.open_dir_handles
+        } else {
+            &self.open_handles
+        };
+        if inode == 1 {
+            if !handles.get(&fh).is_some_and(|handle| handle.node == ino) {
+                return reply.error(libc::ESTALE);
+            }
+        } else {
+            fuse_result!(reply, self.check_handle(handles, fh, ino));
+        }
+        let result = match Self::snapshot_key(cmd, in_data) {
+            Ok((restore, key)) => {
+                if restore {
+                    self.restore(key)
                 } else {
-                    reply.error(-1);
+                    self.checkpoint(key)
                 }
             }
-            Self::RESTORE_IOC => {
-                let key = StateKey::from_ne_bytes(in_data[0..8].try_into().unwrap());
-                if self.restore(key) {
-                    reply.ioctl(0, in_data);
-                } else {
-                    reply.error(-1);
-                }
-            }
-            _ => {
-                log::error!("Unknown ioctl command: {}", cmd);
-                reply.error(ErrCode::ENOTSUP as i32);
-            }
+            Err(error) => Err(error),
+        };
+        match result {
+            Ok(()) => reply.ioctl(0, &[]),
+            Err(error) => reply.error(error),
         }
     }
 
@@ -570,12 +714,13 @@ impl<T: 'static> Filesystem for StateExt4FuseFs<T> {
         size: u32,
         reply: fuser::ReplyXattr,
     ) {
+        let inode = fuse_result!(reply, self.nodes.decode(ino));
         let mut buffer = Vec::new();
         if buffer.try_reserve_exact(size as usize).is_err() {
             return reply.error(ErrCode::ENOMEM as i32);
         }
         buffer.resize(size as usize, 0);
-        match self.fs.getxattr(ino as u32, name.as_bytes(), &mut buffer) {
+        match self.fs.getxattr(inode, name.as_bytes(), &mut buffer) {
             Ok(count) if size == 0 => reply.size(count as u32),
             Ok(count) => reply.data(&buffer[..count]),
             Err(error) => reply.error(error.code() as i32),
@@ -592,6 +737,7 @@ impl<T: 'static> Filesystem for StateExt4FuseFs<T> {
         _position: u32,
         reply: ReplyEmpty,
     ) {
+        let inode = fuse_result!(reply, self.nodes.decode(ino));
         let name = name.as_bytes();
         const XATTR_CREATE: i32 = 1;
         const XATTR_REPLACE: i32 = 2;
@@ -599,7 +745,7 @@ impl<T: 'static> Filesystem for StateExt4FuseFs<T> {
             return reply.error(ErrCode::EINVAL as i32);
         }
         match self.fs.setxattr_with_flags(
-            ino as u32,
+            inode,
             name,
             value,
             flags & XATTR_CREATE != 0,
@@ -611,19 +757,21 @@ impl<T: 'static> Filesystem for StateExt4FuseFs<T> {
     }
 
     fn removexattr(&mut self, _req: &Request<'_>, ino: u64, name: &OsStr, reply: ReplyEmpty) {
-        match self.fs.removexattr(ino as u32, name.as_bytes()) {
+        let inode = fuse_result!(reply, self.nodes.decode(ino));
+        match self.fs.removexattr(inode, name.as_bytes()) {
             Ok(_) => reply.ok(),
             Err(e) => reply.error(e.code() as i32),
         }
     }
 
     fn listxattr(&mut self, _req: &Request<'_>, ino: u64, size: u32, reply: fuser::ReplyXattr) {
+        let inode = fuse_result!(reply, self.nodes.decode(ino));
         let mut buffer = Vec::new();
         if buffer.try_reserve_exact(size as usize).is_err() {
             return reply.error(ErrCode::ENOMEM as i32);
         }
         buffer.resize(size as usize, 0);
-        match self.fs.listxattr(ino as u32, &mut buffer) {
+        match self.fs.listxattr(inode, &mut buffer) {
             Ok(count) if size == 0 => reply.size(count as u32),
             Ok(count) => reply.data(&buffer[..count]),
             Err(error) => reply.error(error.code() as i32),
@@ -632,5 +780,8 @@ impl<T: 'static> Filesystem for StateExt4FuseFs<T> {
 }
 
 fn get_ttl() -> Duration {
-    Duration::from_secs(1)
+    Duration::ZERO
 }
+
+#[cfg(test)]
+mod snapshot_tests;

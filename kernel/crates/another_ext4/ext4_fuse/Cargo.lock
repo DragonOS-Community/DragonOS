@@ -167,6 +167,7 @@ dependencies = [
  "clap",
  "ctrlc",
  "fuser",
+ "libc",
  "log",
  "simple_logger",
 ]

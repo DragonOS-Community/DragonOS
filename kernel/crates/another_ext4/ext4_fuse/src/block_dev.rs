@@ -9,7 +9,7 @@ where
     T: Sized,
 {
     fn checkpoint(&self) -> T;
-    fn restore(&self, state: T);
+    fn restore(&self, state: &T);
 }
 
 /// An in-memory block device
@@ -109,7 +109,7 @@ impl StateBlockDevice<Vec<[u8; BLOCK_SIZE]>> for BlockMem {
     fn checkpoint(&self) -> Vec<[u8; BLOCK_SIZE]> {
         self.0.lock().unwrap().clone()
     }
-    fn restore(&self, state: Vec<[u8; BLOCK_SIZE]>) {
-        self.0.lock().unwrap().clone_from(&state);
+    fn restore(&self, state: &Vec<[u8; BLOCK_SIZE]>) {
+        self.0.lock().unwrap().clone_from(state);
     }
 }

@@ -167,7 +167,7 @@ pub fn vfs_statx(
         if dfd < 0 {
             return Err(SystemError::EBADF);
         }
-        return vfs_fstat(dfd);
+        return vfs_fstat_with_mask(dfd, request_mask, flags);
     }
 
     let inode = do_file_lookup_at(dfd, filename, lookup_flags)?;
@@ -306,9 +306,10 @@ pub fn vfs_getattr(
     }
 
     if request_mask.contains(PosixStatxMask::STATX_BTIME) {
-        // btime是文件创建时间
-        kstat.btime.tv_sec = metadata.btime.tv_sec;
-        kstat.btime.tv_nsec = metadata.btime.tv_nsec;
+        if let Some(btime) = inode.birth_time(&metadata) {
+            kstat.btime = btime;
+            kstat.result_mask.insert(PosixStatxMask::STATX_BTIME);
+        }
     }
 
     // 即便调用者未显式请求 STATX_ALL，也填充 rdev、dev 以符合 Linux 语义。
@@ -353,6 +354,14 @@ pub fn vfs_fstatat(dfd: i32, filename: &str, flags: AtFlags) -> Result<KStat, Sy
 ///
 /// 参考: https://code.dragonos.org.cn/xref/linux-6.6.21/fs/stat.c#190
 pub fn vfs_fstat(dfd: i32) -> Result<KStat, SystemError> {
+    vfs_fstat_with_mask(dfd, PosixStatxMask::STATX_BASIC_STATS, AtFlags::empty())
+}
+
+fn vfs_fstat_with_mask(
+    dfd: i32,
+    request_mask: PosixStatxMask,
+    flags: AtFlags,
+) -> Result<KStat, SystemError> {
     // Get the file from the file descriptor
     let pcb = ProcessManager::current_pcb();
     let fd_table = pcb.fd_table();
@@ -362,8 +371,7 @@ pub fn vfs_fstat(dfd: i32) -> Result<KStat, SystemError> {
         .ok_or(SystemError::EBADF)?;
     let inode = file.path_inode();
 
-    // Get attributes using vfs_getattr with basic stats mask
-    vfs_getattr(&inode, PosixStatxMask::STATX_BASIC_STATS, AtFlags::empty())
+    vfs_getattr(&inode, request_mask, flags)
 }
 
 pub(super) fn do_newfstatat(

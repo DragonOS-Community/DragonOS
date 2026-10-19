@@ -4543,14 +4543,7 @@ impl LockedExt4Inode {
         creator: &Arc<ObjectAccount>,
     ) -> Result<usize, MemoryAllocationError> {
         let buf = &buf[..len];
-        let (fs, inode_num, page_cache) = {
-            let guard = self.inner.lock();
-            (
-                guard.concret_fs(),
-                guard.inner_inode_num,
-                guard.page_cache.clone(),
-            )
-        };
+        let page_cache = self.inner.lock().page_cache.clone();
 
         if let Some(page_cache) = page_cache {
             let mut delayed_written = 0usize;
@@ -4594,117 +4587,151 @@ impl LockedExt4Inode {
                         .ok_or(SystemError::EOVERFLOW)?;
                     continue;
                 }
-                if delayed_written != 0 {
-                    return Ok(delayed_written);
-                }
-                let has_head = !self.inner.lock().delalloc.production.entries.is_empty();
-                if !has_head {
-                    break;
-                }
-                self.drain_delalloc_before_eager()?;
+                // Admission declining a page is a strategy change, not a
+                // short-I/O boundary. Publish the remaining suffix through the
+                // ordinary eager mapper without replaying the delayed prefix.
                 break;
             }
-            if delayed_written != 0 {
+            if delayed_written == buf.len() {
                 return Ok(delayed_written);
             }
-            let _invalidate = page_cache.invalidate_write();
-            let _size_guard = self.size_lock.read();
-            let _io_guard = self.io_lock.lock();
-
-            // 使用缓存的文件大小，避免 getattr 磁盘 I/O
-            let old_file_size = {
-                let cached_size = self.inner.lock().cached_file_size;
-                match cached_size {
-                    Some(size) => size,
-                    None => {
-                        let size = fs
-                            .retry_metadata_read_contention(|| fs.fs.getattr(inode_num))?
-                            .size;
-                        self.inner.lock().cached_file_size = Some(size);
-                        size
-                    }
-                }
-            };
-
-            let new_end = offset.checked_add(len).ok_or(SystemError::EFBIG)?;
-            let alloc_start = (offset >> MMArch::PAGE_SHIFT) << MMArch::PAGE_SHIFT;
-            let alloc_end = new_end
-                .checked_add(MMArch::PAGE_SIZE - 1)
-                .ok_or(SystemError::EFBIG)?
-                & !(MMArch::PAGE_SIZE - 1);
-            let alloc_len = alloc_end
-                .checked_sub(alloc_start)
-                .ok_or(SystemError::EFBIG)?;
-
-            let time = PosixTimeSpec::now().tv_sec.to_u32().unwrap_or_else(|| {
-                log::warn!("Failed to get current time, using 0");
-                0
-            });
-            // `io_lock` serializes every mtime/ctime publisher in this inode.
-            // Exhaustion must be rejected before lower metadata or PageCache
-            // data becomes visible; a post-publication EOVERFLOW cannot be
-            // rolled back as a normal buffered-write error.
-            let (mtime_version, ctime_version) = {
-                let guard = self.inner.lock();
-                (
-                    guard
-                        .cached_mtime_version
-                        .checked_add(1)
-                        .ok_or(SystemError::EOVERFLOW)?,
-                    guard
-                        .cached_ctime_version
-                        .checked_add(1)
-                        .ok_or(SystemError::EOVERFLOW)?,
-                )
-            };
-            let stats_start = fs
-                .fs
-                .prepare_stats_enabled()
-                .then(CurrentTimeArch::get_cycles);
-            let prepare_result = fs.retry_metadata_contention(|| {
-                fs.fs.prepare_buffered_write(
-                    inode_num,
-                    alloc_start,
-                    alloc_len,
-                    new_end as u64,
-                    Some(time),
-                )
-            });
-            if let Some(start) = stats_start {
-                fs.fs.record_prepare_elapsed_cycles(
-                    CurrentTimeArch::get_cycles().wrapping_sub(start),
-                );
+            let suffix = offset
+                .checked_add(delayed_written)
+                .ok_or(MemoryAllocationError::from(SystemError::EFBIG))
+                .and_then(|suffix_offset| {
+                    self.write_buffered_eager_data_locked(
+                        &page_cache,
+                        suffix_offset,
+                        &buf[delayed_written..],
+                        owner,
+                        creator,
+                    )
+                });
+            match suffix {
+                Ok(written) => Ok(delayed_written + written),
+                // A genuine allocation/copy/writeback failure still ends the
+                // call at its already published prefix; never retry an error.
+                Err(_) if delayed_written != 0 => Ok(delayed_written),
+                Err(error) => Err(error),
             }
-            prepare_result?;
-
-            // 写入范围的磁盘块已就绪，现在安全写入 page cache。
-            let write_len = page_cache.try_write(offset, buf, owner, creator)?;
-            if write_len > 0 {
-                let written_end = offset.checked_add(write_len).ok_or(SystemError::EFBIG)?;
-                let current_file_size = core::cmp::max(old_file_size, written_end as u64);
-                let self_arc = {
-                    let mut guard = self.inner.lock();
-                    guard.cached_file_size = Some(current_file_size);
-                    guard.cached_times.mtime = time;
-                    guard.cached_times.ctime = time;
-                    guard.cached_mtime_version = mtime_version;
-                    guard.cached_ctime_version = ctime_version;
-                    guard.self_ref.upgrade().ok_or(SystemError::ENOENT)?
-                };
-                Ext4FileSystem::mark_inode_dirty(
-                    &self_arc,
-                    InodeDirtyState::SIZE_DIRTY
-                        | InodeDirtyState::MTIME_DIRTY
-                        | InodeDirtyState::CTIME_DIRTY,
-                )?;
-            }
-
-            Ok(write_len)
         } else {
             let _size_guard = self.size_lock.read();
             self.write_eager_data(offset, buf)
                 .map_err(MemoryAllocationError::System)
         }
+    }
+
+    /// Continue a primary buffered write through the eager allocator. The
+    /// caller owns size_change_lock for read and has materialized user bytes.
+    fn write_buffered_eager_data_locked(
+        &self,
+        page_cache: &Arc<PageCache>,
+        offset: usize,
+        buf: &[u8],
+        owner: &Arc<MemoryAccount>,
+        creator: &Arc<ObjectAccount>,
+    ) -> Result<usize, MemoryAllocationError> {
+        // Close admission before draining, otherwise another delayed writer
+        // can insert a reservation between the empty check and eager mapping.
+        // This guard must outlive the I/O guard: its Drop takes io_lock.
+        let _admission = self.close_production_delalloc_admission()?;
+        self.drain_delalloc_before_eager()?;
+        let (fs, inode_num) = {
+            let guard = self.inner.lock();
+            (guard.concret_fs(), guard.inner_inode_num)
+        };
+        let _invalidate = page_cache.invalidate_write();
+        let _size_guard = self.size_lock.read();
+        let _io_guard = self.io_lock.lock();
+
+        // 使用缓存的文件大小，避免 getattr 磁盘 I/O
+        let old_file_size = {
+            let cached_size = self.inner.lock().cached_file_size;
+            match cached_size {
+                Some(size) => size,
+                None => {
+                    let size = fs
+                        .retry_metadata_read_contention(|| fs.fs.getattr(inode_num))?
+                        .size;
+                    self.inner.lock().cached_file_size = Some(size);
+                    size
+                }
+            }
+        };
+
+        let new_end = offset.checked_add(buf.len()).ok_or(SystemError::EFBIG)?;
+        let alloc_start = (offset >> MMArch::PAGE_SHIFT) << MMArch::PAGE_SHIFT;
+        let alloc_end = new_end
+            .checked_add(MMArch::PAGE_SIZE - 1)
+            .ok_or(SystemError::EFBIG)?
+            & !(MMArch::PAGE_SIZE - 1);
+        let alloc_len = alloc_end
+            .checked_sub(alloc_start)
+            .ok_or(SystemError::EFBIG)?;
+
+        let time = PosixTimeSpec::now().tv_sec.to_u32().unwrap_or_else(|| {
+            log::warn!("Failed to get current time, using 0");
+            0
+        });
+        // `io_lock` serializes every mtime/ctime publisher in this inode.
+        // Exhaustion must be rejected before lower metadata or PageCache
+        // data becomes visible; a post-publication EOVERFLOW cannot be
+        // rolled back as a normal buffered-write error.
+        let (mtime_version, ctime_version) = {
+            let guard = self.inner.lock();
+            (
+                guard
+                    .cached_mtime_version
+                    .checked_add(1)
+                    .ok_or(SystemError::EOVERFLOW)?,
+                guard
+                    .cached_ctime_version
+                    .checked_add(1)
+                    .ok_or(SystemError::EOVERFLOW)?,
+            )
+        };
+        let stats_start = fs
+            .fs
+            .prepare_stats_enabled()
+            .then(CurrentTimeArch::get_cycles);
+        let prepare_result = fs.retry_metadata_contention(|| {
+            fs.fs.prepare_buffered_write(
+                inode_num,
+                alloc_start,
+                alloc_len,
+                new_end as u64,
+                Some(time),
+            )
+        });
+        if let Some(start) = stats_start {
+            fs.fs
+                .record_prepare_elapsed_cycles(CurrentTimeArch::get_cycles().wrapping_sub(start));
+        }
+        prepare_result?;
+
+        // 写入范围的磁盘块已就绪，现在安全写入 page cache。
+        let write_len = page_cache.try_write(offset, buf, owner, creator)?;
+        if write_len > 0 {
+            let written_end = offset.checked_add(write_len).ok_or(SystemError::EFBIG)?;
+            let current_file_size = core::cmp::max(old_file_size, written_end as u64);
+            let self_arc = {
+                let mut guard = self.inner.lock();
+                guard.cached_file_size = Some(current_file_size);
+                guard.cached_times.mtime = time;
+                guard.cached_times.ctime = time;
+                guard.cached_mtime_version = mtime_version;
+                guard.cached_ctime_version = ctime_version;
+                guard.self_ref.upgrade().ok_or(SystemError::ENOENT)?
+            };
+            Ext4FileSystem::mark_inode_dirty(
+                &self_arc,
+                InodeDirtyState::SIZE_DIRTY
+                    | InodeDirtyState::MTIME_DIRTY
+                    | InodeDirtyState::CTIME_DIRTY,
+            )?;
+        }
+
+        Ok(write_len)
     }
 
     fn needs_security_privilege_removal_locked(&self) -> bool {

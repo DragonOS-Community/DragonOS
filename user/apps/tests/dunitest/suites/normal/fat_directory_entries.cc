@@ -3,6 +3,7 @@
 #include <dirent.h>
 #include <sys/statfs.h>
 #include <array>
+#include <cctype>
 #include <cstdio>
 #include <set>
 #include <vector>
@@ -109,6 +110,96 @@ TEST_P(FatDirectory, CreateLookupAndRemount) {
     ASSERT_EQ(512, pread(raw, after.data(), after.size(), 0));
     ASSERT_EQ(0, close(raw));
     EXPECT_EQ(boot_, after) << "allocation must never overwrite the volume header";
+}
+
+TEST_P(FatDirectory, ImportedShortAttributesDoNotConsumeFollowingEntries) {
+    // Reuse one genuinely allocated directory chain; raw regular files below
+    // are empty with cluster zero, so the imported image has no cross-links.
+    ASSERT_NO_FATAL_FAILURE(Mount());
+    ASSERT_EQ(0, mkdir(Path("template").c_str(), 0700)) << strerror(errno);
+    ASSERT_NO_FATAL_FAILURE(loop_.Unmount());
+    auto le16 = [&](unsigned n) {
+        return uint32_t(boot_[n]) | (uint32_t(boot_[n + 1]) << 8);
+    };
+    auto le32 = [&](unsigned n) {
+        return le16(n) | (le16(n + 2) << 16);
+    };
+    uint64_t root = geometry_.root;
+    if (geometry_.slots == 0) {
+        const uint64_t first_data = le16(14) + uint64_t(boot_[16]) * le32(36);
+        root = (first_data + uint64_t(le32(44) - 2) * boot_[13]) * le16(11);
+    }
+    ScopedFd raw {open(loop_.loop_path().c_str(), O_RDWR)};
+    ASSERT_GE(raw.value, 0) << strerror(errno);
+    std::array<unsigned char, 512> existing {};
+    ASSERT_EQ(512, pread(raw.value, existing.data(), existing.size(), root));
+    std::array<unsigned char, 32> directory {};
+    bool found_directory = false;
+    for (size_t offset = 0; offset != existing.size(); offset += 32) {
+        if (existing[offset + 11] == 0x10) {
+            memcpy(directory.data(), existing.data() + offset, directory.size());
+            found_directory = true;
+            break;
+        }
+    }
+    ASSERT_TRUE(found_directory);
+    std::array<unsigned char, 512> imported {};
+    auto slot = [&](unsigned index, const char* name, unsigned char attribute) {
+        unsigned char* entry = imported.data() + index * 32;
+        memcpy(entry, name, 11);
+        entry[11] = attribute;
+        // Canonical valid 1980-01-01 dates; this test isolates attribute parsing.
+        for (unsigned position : {16U, 18U, 24U}) entry[position] = 33;
+    };
+    slot(0, "IMPORT     ", 0x08); // Volume label is not a visible filename.
+    memcpy(imported.data() + 32, directory.data(), directory.size());
+    memcpy(imported.data() + 32, "SUBDIR     ", 11);
+    imported[32 + 12] = 0; // Imported SFN is intentionally uppercase.
+    slot(2, "PLAIN   TXT", 0x20);
+    slot(3, "READONLYTXT", 0x21);
+    slot(4, "HIDDEN  TXT", 0x22);
+    slot(5, "SYSTEM  TXT", 0x24);
+    slot(6, "SPECIAL TXT", 0x27);
+    slot(7, "AFTER   TXT", 0x20);
+    ASSERT_EQ(512, pwrite(raw.value, imported.data(), imported.size(), root));
+    ASSERT_EQ(0, fsync(raw.value)) << strerror(errno);
+    ASSERT_EQ(0, close(raw.value));
+    raw.value = -1;
+    ASSERT_NO_FATAL_FAILURE(Mount());
+    for (int pass = 0; pass != 2; ++pass) {
+        std::set<std::string> names;
+        for (std::string name : Names()) {
+            for (char& value : name) value = std::tolower(static_cast<unsigned char>(value));
+            names.insert(name);
+        }
+        EXPECT_EQ(0U, names.count("import"));
+        EXPECT_EQ(1U, names.count("subdir"));
+        struct stat status {};
+        ASSERT_EQ(0, stat(Path("SUBDIR").c_str(), &status)) << strerror(errno);
+        EXPECT_TRUE(S_ISDIR(status.st_mode));
+        for (const char* name : {"plain.txt", "readonly.txt", "hidden.txt",
+                                  "system.txt", "special.txt", "after.txt"}) {
+            EXPECT_EQ(1U, names.count(name)) << name;
+            ASSERT_EQ(0, stat(Path(name).c_str(), &status)) << name << ": " << strerror(errno);
+            EXPECT_TRUE(S_ISREG(status.st_mode)) << name;
+            EXPECT_EQ(0, status.st_size) << name;
+            ScopedFd readable {open(Path(name).c_str(), O_RDONLY)};
+            ASSERT_GE(readable.value, 0) << name << ": " << strerror(errno);
+            char value = 1;
+            EXPECT_EQ(0, read(readable.value, &value, 1)) << name;
+        }
+        if (pass == 0) {
+            ASSERT_NO_FATAL_FAILURE(Remount());
+        }
+    }
+    ASSERT_NO_FATAL_FAILURE(Create("appended"));
+    ASSERT_NO_FATAL_FAILURE(loop_.Unmount());
+    ScopedFd inspect {open(loop_.loop_path().c_str(), O_RDONLY)};
+    ASSERT_GE(inspect.value, 0) << strerror(errno);
+    std::array<unsigned char, 32> label {};
+    ASSERT_EQ(32, pread(inspect.value, label.data(), label.size(), root));
+    EXPECT_EQ(0, memcmp(label.data(), imported.data(), label.size()))
+        << "a volume label is occupied metadata, not a reusable directory slot";
 }
 
 TEST_P(FatDirectory, FixedRootCapacityAndReuse) {

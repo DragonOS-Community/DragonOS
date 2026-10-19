@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 use crate::filesystem::fat::fs::LockedFATInode;
-use crate::filesystem::vfs::IndexNode;
+use crate::filesystem::vfs::{IndexNode, Metadata};
+use crate::time::PosixTimeSpec;
 use crate::{
     driver::base::block::{block_device::LBA_SIZE, SeekFrom},
     libs::vec_cursor::VecCursor,
@@ -45,6 +46,22 @@ pub enum FATDirEntry {
     VolId(FATFile),
     Dir(FATDir),
     UnInit,
+}
+
+/// A submitted SFN already publishes its slot even when the following device
+/// barrier fails. Rename must install that concrete slot before reporting it.
+pub(super) struct PublishedDirEntry {
+    pub(super) entry: FATDirEntry,
+    pub(super) sync_error: Option<SystemError>,
+}
+
+impl PublishedDirEntry {
+    fn finish(self) -> Result<FATDirEntry, SystemError> {
+        match self.sync_error {
+            Some(error) => Err(error),
+            None => Ok(self.entry),
+        }
+    }
 }
 
 /// FAT文件系统中的文件
@@ -209,7 +226,6 @@ impl FATFile {
                 break;
             }
         }
-        // todo: 更新时间信息
         return Ok(read_ok);
     }
 
@@ -274,7 +290,6 @@ impl FATFile {
                 break;
             }
         }
-        // todo: 更新时间信息
         return Ok(write_ok);
     }
 
@@ -732,6 +747,8 @@ impl FATDir {
                 LongDirEntry::validate_long_name(name)?;
                 // 目标目录项
                 let mut short_entry = ShortDirEntry::default();
+                let now = crate::time::timekeeping::realtime_now();
+                short_entry.set_times(now, now, now);
 
                 // Reserve the complete parent range before owning a child cluster.
                 // A full fixed root must fail without consuming data clusters.
@@ -750,7 +767,7 @@ impl FATDir {
                 };
                 dot_entry.set_first_cluster(first_cluster);
 
-                // todo: 设置创建、访问时间
+                dot_entry.set_times(now, now, now);
                 if let Err(error) =
                     dot_entry.flush(fs, fs.cluster_bytes_offset(first_cluster) + offset)
                 {
@@ -768,7 +785,7 @@ impl FATDir {
                     ..Default::default()
                 };
                 dot_dot_entry.set_first_cluster(self.first_cluster);
-                // todo: 设置创建、访问时间
+                dot_dot_entry.set_times(now, now, now);
 
                 if let Err(error) =
                     dot_dot_entry.flush(fs, fs.cluster_bytes_offset(first_cluster) + offset)
@@ -790,6 +807,7 @@ impl FATDir {
                         fs.clone(),
                         offsets,
                     )
+                    .and_then(PublishedDirEntry::finish)
                     .map(|e| e.to_dir())?;
                 // debug!("create dentries ok");
                 return res;
@@ -861,6 +879,18 @@ impl FATDir {
         attrs: FileAttributes,
         fs: Arc<FATFileSystem>,
     ) -> Result<FATDirEntry, SystemError> {
+        self.publish_dir_entries(long_name, short_name, short_dentry, attrs, fs)?
+            .finish()
+    }
+
+    fn publish_dir_entries(
+        &self,
+        long_name: &str,
+        short_name: &[u8; 11],
+        short_dentry: Option<ShortDirEntry>,
+        attrs: FileAttributes,
+        fs: Arc<FATFileSystem>,
+    ) -> Result<PublishedDirEntry, SystemError> {
         let offsets = self.allocate_dir_entries(long_name, fs.clone())?;
         self.write_dir_entries(long_name, short_name, short_dentry, attrs, fs, offsets)
     }
@@ -890,12 +920,15 @@ impl FATDir {
         attrs: FileAttributes,
         fs: Arc<FATFileSystem>,
         offsets: Vec<(Cluster, u64)>,
-    ) -> Result<FATDirEntry, SystemError> {
-        let mut short_dentry: ShortDirEntry = short_dentry.unwrap_or_default();
+    ) -> Result<PublishedDirEntry, SystemError> {
+        let mut short_dentry: ShortDirEntry = short_dentry.unwrap_or_else(|| {
+            let mut entry = ShortDirEntry::default();
+            let now = crate::time::timekeeping::realtime_now();
+            entry.set_times(now, now, now);
+            entry
+        });
         short_dentry.name = *short_name;
         short_dentry.attributes = attrs;
-
-        // todo: 设置创建时间、修改时间
 
         let mut long_name_gen: LongNameEntryGenerator =
             LongNameEntryGenerator::new(long_name, short_dentry.checksum());
@@ -916,11 +949,13 @@ impl FATDir {
         let end: (Cluster, u64) = *offsets.last().unwrap();
         // 短目录项在分区内的字节偏移量
         let offset = fs.cluster_bytes_offset(end.0) + end.1;
-        short_dentry.flush(&fs, offset)?;
-
-        return Ok(
-            short_dentry.convert_to_dir_entry_with_long_name(long_name.to_string(), (start, end))
-        );
+        short_dentry.commit_without_barrier(&fs, offset)?;
+        let sync_error = fs.gendisk.sync().err();
+        Ok(PublishedDirEntry {
+            entry: short_dentry
+                .convert_to_dir_entry_with_long_name(long_name.to_string(), (start, end)),
+            sync_error,
+        })
     }
 
     /// @brief 判断当前目录是否为空
@@ -953,25 +988,31 @@ impl FATDir {
         fs: Arc<FATFileSystem>,
         name: &str,
         remove_clusters: bool,
+        on_removed: impl FnOnce(),
     ) -> Result<(), SystemError> {
-        let e: FATDirEntry = self.find_entry(name, None, None, fs.clone())?;
+        let entry = self.remove_entry(fs.clone(), name, remove_clusters, on_removed)?;
+        if entry.first_cluster().cluster_num >= 2 && remove_clusters {
+            fs.deallocate_cluster_chain(entry.first_cluster())?;
+        }
+        Ok(())
+    }
 
-        // 判断文件夹是否为空，如果空，则不删除，报错。
-        //  remove_clusters 为 false 时（即重命名/移动操作），不再检查目录是否为空，从而允许非空目录被“搬运”到新位置。
-        if e.is_dir() && remove_clusters && !(e.to_dir().unwrap().is_empty(fs.clone())?) {
+    /// Remove the namespace entry without freeing its chain. The inode owner
+    /// must revoke the removed slot before any later reclamation can fail.
+    pub(super) fn remove_entry(
+        &self,
+        fs: Arc<FATFileSystem>,
+        name: &str,
+        check_empty: bool,
+        on_removed: impl FnOnce(),
+    ) -> Result<FATDirEntry, SystemError> {
+        let entry = self.find_entry(name, None, None, fs.clone())?;
+        if entry.is_dir() && check_empty && !entry.to_dir().unwrap().is_empty(fs.clone())? {
             return Err(SystemError::ENOTEMPTY);
         }
-
-        if e.get_dir_range().is_some() {
-            self.remove_dir_entries(fs.clone(), e.get_dir_range().unwrap())?;
-        }
-
-        if e.first_cluster().cluster_num >= 2 && remove_clusters {
-            // Never free data while its short directory entry remains visible.
-            fs.deallocate_cluster_chain(e.first_cluster())?;
-        }
-
-        return Ok(());
+        let range = entry.get_dir_range().ok_or(SystemError::EIO)?;
+        self.remove_dir_entries(fs, range, on_removed)?;
+        Ok(entry)
     }
 
     /// @brief 在当前目录中删除多个目录项
@@ -982,6 +1023,7 @@ impl FATDir {
         &self,
         fs: Arc<FATFileSystem>,
         cluster_range: ((Cluster, u64), (Cluster, u64)),
+        on_removed: impl FnOnce(),
     ) -> Result<(), SystemError> {
         // 收集所有的要移除的目录项
         let offsets: Vec<(Cluster, u64)> =
@@ -992,14 +1034,19 @@ impl FATDir {
         }
         // 逐个设置这些目录项为“空闲”状态
         // Invalidate the publishing SFN first, then its LFN slots (Linux order).
+        let mut on_removed = Some(on_removed);
         for (index, off) in offsets.into_iter().rev().enumerate() {
             let gendisk_bytes_offset = fs.cluster_bytes_offset(off.0) + off.1;
             let mut short_entry = ShortDirEntry::default();
             short_entry.name[0] = 0xe5;
-            if let Err(error) = short_entry.flush(&fs, gendisk_bytes_offset) {
-                if index == 0 {
-                    return Err(error);
-                }
+            let submitted = short_entry.commit_without_barrier(&fs, gendisk_bytes_offset);
+            if index == 0 {
+                submitted?;
+                // The slot is no longer ours as soon as its SFN sector write
+                // completes, even if the following device barrier fails.
+                on_removed.take().unwrap()();
+                fs.gendisk.sync()?;
+            } else if let Err(error) = submitted.and_then(|()| fs.gendisk.sync()) {
                 // The SFN deletion has committed. As in Linux fat_remove_entries,
                 // orphaned LFN cleanup must not prevent inode/data reclamation.
                 warn!("FAT: failed to clean deleted long-name slot: {:?}", error);
@@ -1027,13 +1074,14 @@ impl FATDir {
 
     /// @brief 在当前目录内，重命名一个目录项
     ///
-    pub fn rename(
+    pub(super) fn rename(
         &self,
         fs: Arc<FATFileSystem>,
         old_name: &str,
         new_name: &str,
         new_inode: Option<Arc<LockedFATInode>>,
-    ) -> Result<FATDirEntry, SystemError> {
+        on_source_removed: impl FnOnce(),
+    ) -> Result<PublishedDirEntry, SystemError> {
         // 判断源目录项是否存在
         let old_dentry = if let FATDirEntryOrShortName::DirEntry(dentry) =
             self.check_existence(old_name, None, fs.clone())?
@@ -1050,7 +1098,10 @@ impl FATDir {
                 validate_rename_target(&old_dentry, &e, fs.clone())?;
 
                 if e.is_dir() {
-                    self.remove(fs.clone(), new_name, true)?;
+                    new_inode
+                        .as_ref()
+                        .ok_or(SystemError::EIO)?
+                        .remove_directory_name(self, fs.clone(), new_name)?;
                 } else {
                     let victim = new_inode.ok_or(SystemError::EIO)?;
                     victim.remove_file_name(self, fs.clone(), new_name)?;
@@ -1060,9 +1111,14 @@ impl FATDir {
         };
         let old_short_dentry = old_dentry.short_dir_entry();
         if let Some(se) = old_short_dentry {
-            self.remove(fs.clone(), old_dentry.name().as_str(), false)?;
+            self.remove(
+                fs.clone(),
+                old_dentry.name().as_str(),
+                false,
+                on_source_removed,
+            )?;
             // 创建新的目录项
-            let new_dentry = self.create_dir_entries(
+            let new_dentry = self.publish_dir_entries(
                 new_name,
                 &short_name,
                 Some(se),
@@ -1078,14 +1134,15 @@ impl FATDir {
 
     /// @brief 跨目录，重命名一个目录项
     ///
-    pub fn rename_across(
+    pub(super) fn rename_across(
         &self,
         fs: Arc<FATFileSystem>,
         target: &FATDir,
         old_name: &str,
         new_name: &str,
         new_inode: Result<Arc<LockedFATInode>, SystemError>,
-    ) -> Result<FATDirEntry, SystemError> {
+        on_source_removed: impl FnOnce(),
+    ) -> Result<PublishedDirEntry, SystemError> {
         // 判断源目录项是否存在
         let old_dentry: FATDirEntry = if let FATDirEntryOrShortName::DirEntry(dentry) =
             self.check_existence(old_name, None, fs.clone())?
@@ -1103,7 +1160,10 @@ impl FATDir {
                 validate_rename_target(&old_dentry, &e, fs.clone())?;
 
                 if e.is_dir() {
-                    target.remove(fs.clone(), new_name, true)?;
+                    new_inode
+                        .as_ref()
+                        .map_err(|error| error.clone())?
+                        .remove_directory_name(target, fs.clone(), new_name)?;
                 } else {
                     new_inode?.remove_file_name(target, fs.clone(), new_name)?;
                 }
@@ -1113,9 +1173,14 @@ impl FATDir {
 
         let old_short_dentry: Option<ShortDirEntry> = old_dentry.short_dir_entry();
         if let Some(se) = old_short_dentry {
-            self.remove(fs.clone(), old_dentry.name().as_str(), false)?;
+            self.remove(
+                fs.clone(),
+                old_dentry.name().as_str(),
+                false,
+                on_source_removed,
+            )?;
             // 创建新的目录项
-            let new_dentry: FATDirEntry = target.create_dir_entries(
+            let new_dentry = target.publish_dir_entries(
                 new_name,
                 &short_name,
                 Some(se),
@@ -1387,6 +1452,43 @@ impl LongDirEntry {
 }
 
 impl ShortDirEntry {
+    fn set_access_modified(&mut self, atime: PosixTimeSpec, mtime: PosixTimeSpec) {
+        let (_, date, _) = super::time::encode(atime);
+        self.lst_acc_date = date;
+        let (time, date, _) = super::time::encode(mtime);
+        self.wrt_time = time;
+        self.wrt_date = date;
+    }
+
+    fn set_times(&mut self, atime: PosixTimeSpec, mtime: PosixTimeSpec, btime: PosixTimeSpec) {
+        self.set_access_modified(
+            super::time::truncate_atime(atime),
+            super::time::truncate_mtime(mtime),
+        );
+        let (time, date, centiseconds) = super::time::encode(super::time::truncate_creation(btime));
+        self.crt_time = time;
+        self.crt_date = date;
+        self.crt_time_tenth = centiseconds;
+    }
+
+    pub(super) fn times(&self) -> (PosixTimeSpec, PosixTimeSpec, PosixTimeSpec) {
+        (
+            super::time::decode(0, self.lst_acc_date, 0),
+            super::time::decode(self.wrt_time, self.wrt_date, 0),
+            super::time::decode(self.crt_time, self.crt_date, self.crt_time_tenth),
+        )
+    }
+
+    fn time_fields(&self) -> (u16, u16, u16, u16, u16, u8) {
+        (
+            self.lst_acc_date,
+            self.wrt_time,
+            self.wrt_date,
+            self.crt_time,
+            self.crt_date,
+            self.crt_time_tenth,
+        )
+    }
     const PADDING: u8 = b' ';
 
     /// @brief 判断当前目录项是否为文件夹
@@ -1729,6 +1831,11 @@ impl FATDirIter {
                 FATRawDirEntry::Short(s) => {
                     // 当前找到一个短目录项，更新offset之后，直接返回
                     self.offset += FATRawDirEntry::DIR_ENTRY_LEN;
+                    // Volume labels occupy a slot but are not namespace
+                    // entries. Keep raw allocation scanning unchanged.
+                    if s.attributes.contains(FileAttributes::VOLUME_ID) {
+                        continue;
+                    }
                     return Ok((
                         self.current_cluster,
                         self.offset,
@@ -1848,6 +1955,36 @@ impl Iterator for FATDirIter {
 }
 
 impl FATDirEntry {
+    /// The inode mutex protects both the current directory position and these
+    /// structural fields. Do not write a metadata snapshot's size or cluster.
+    pub(super) fn commit_times(
+        &mut self,
+        fs: &Arc<FATFileSystem>,
+        metadata: &Metadata,
+    ) -> Result<(), SystemError> {
+        match self {
+            Self::File(file) | Self::VolId(file) => {
+                let mut entry = file.short_dir_entry;
+                entry.set_access_modified(metadata.atime, metadata.mtime);
+                if entry.time_fields() != file.short_dir_entry.time_fields() {
+                    file.commit_directory_entry(fs, &entry, false)?;
+                    file.short_dir_entry = entry;
+                }
+            }
+            Self::Dir(dir) => {
+                let mut entry = dir.short_dir_entry.ok_or(SystemError::EIO)?;
+                entry.set_access_modified(metadata.atime, metadata.mtime);
+                if entry.time_fields() != dir.short_dir_entry.unwrap().time_fields() {
+                    let (_, end) = dir.loc.ok_or(SystemError::EIO)?;
+                    entry.commit_without_barrier(fs, fs.cluster_bytes_offset(end.0) + end.1)?;
+                    dir.short_dir_entry = Some(entry);
+                }
+            }
+            Self::UnInit => return Err(SystemError::EIO),
+        }
+        Ok(())
+    }
+
     /// @brief 构建FATDirEntry枚举类型
     ///
     /// @param long_name_entries 长目录项的数组。
@@ -2692,7 +2829,10 @@ pub fn get_raw_dir_entry(
             // 指针回到目录项的开始处
             cursor.seek(SeekFrom::SeekSet(blk_offset as i64))?;
 
-            if file_attr.contains(FileAttributes::LONG_NAME) {
+            // LFN is the exact composite attribute, not any of its bits.
+            // Ordinary read-only/hidden/system files and volume labels must
+            // remain SFNs (Linux fat/dir.c: de->attr == ATTR_EXT).
+            if file_attr.value == FileAttributes::LONG_NAME {
                 // 当前目录项是一个长目录项
                 let mut long_dentry = LongDirEntry {
                     ord: cursor.read_u8()?,

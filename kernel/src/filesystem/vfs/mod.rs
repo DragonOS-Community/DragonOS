@@ -1571,6 +1571,12 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
     }
 
+    /// Creation time supported by this filesystem. A zero timestamp is valid;
+    /// default metadata values alone do not establish STATX_BTIME support.
+    fn birth_time(&self, _metadata: &Metadata) -> Option<PosixTimeSpec> {
+        None
+    }
+
     /// Mode exposed by stat(2). Most inodes store the permission bits and
     /// file type separately; Linux anon_inode objects deliberately report
     /// mode 0600 without a file type and override this default.

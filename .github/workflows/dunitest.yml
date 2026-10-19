@@ -90,6 +90,9 @@ jobs:
           normal/vector_write_privileges
           normal/write_capability_admission
           normal/primary_write_transaction
+          normal/fat_timestamps
+          normal/fat_directory_entries
+          normal/ext4_write_progress
           EOF
 
       - name: Build DragonOS

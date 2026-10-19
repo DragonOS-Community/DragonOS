@@ -37,28 +37,11 @@ impl GenDisk {
             .checked_mul(another_ext4::BLOCK_SIZE)
             .ok_or(SystemError::EOVERFLOW)?;
         let (lba_start, lba_count) = self.checked_ext4_range(start, ext4_block_count)?;
-        let bio = self.block_device()?.submit_bio_read(lba_start, lba_count)?;
+        let bio = self.submit_read(lba_start, lba_count)?;
         Ok(SubmittedExt4Read {
             bio,
             expected_bytes,
         })
-    }
-
-    fn convert_from_ext4_blkid(&self, ext4_blkid: u64) -> (usize, usize, usize) {
-        // another_ext4 的逻辑块固定为 4096 字节（another_ext4::BLOCK_SIZE）。
-        //
-        // DragonOS 块设备的“LBA”语义固定为 512 字节（LBA_SIZE）。
-        // GenDisk::block_offset_2_disk_blkid() 与 BlockDevice::read_at()/write_at()
-        // 都是以 512B LBA 为单位进行寻址的。
-        //
-        // 因此这里必须把 ext4 的 4K block id 转成“512B LBA 偏移”，
-        // 不能使用底层设备的 blk_size_log2（否则当设备上报 4K 物理块时会导致寻址单位混乱，
-        // 进而读到错误数据，表现为 extent tree 解析失败/随机 ENOENT）。
-        let blocks_per_ext4_block = another_ext4::BLOCK_SIZE / LBA_SIZE;
-        let start_lba_offset = ext4_blkid as usize * blocks_per_ext4_block;
-        let lba_id_start = self.block_offset_2_disk_blkid(start_lba_offset);
-        let block_count = blocks_per_ext4_block;
-        (start_lba_offset, lba_id_start, block_count)
     }
 
     fn checked_ext4_range(
@@ -77,18 +60,13 @@ impl GenDisk {
         let lba_count = ext4_block_count
             .checked_mul(blocks_per_ext4_block)
             .ok_or(SystemError::EOVERFLOW)?;
-        let lba_start = self
-            .range()
-            .lba_start
-            .checked_add(relative_lba)
-            .ok_or(SystemError::EOVERFLOW)?;
-        let lba_end = lba_start
+        let relative_end = relative_lba
             .checked_add(lba_count)
             .ok_or(SystemError::EOVERFLOW)?;
-        if lba_end > self.range().lba_end {
+        if relative_end > self.range().len() {
             return Err(SystemError::EFBIG);
         }
-        Ok((lba_start, lba_count))
+        Ok((relative_lba, lba_count))
     }
 
     fn map_system_error_to_ext4(e: &SystemError) -> another_ext4::ErrCode {
@@ -117,14 +95,13 @@ impl another_ext4::BlockDevice for GenDisk {
     ) -> core::result::Result<another_ext4::Block, another_ext4::Ext4Error> {
         let mut buf = another_ext4::Block::try_zeroed_data()?;
 
-        let (_, lba_id_start, block_count) = self.convert_from_ext4_blkid(block_id);
-        let completed = self
-            .block_device()
-            .and_then(|bdev| bdev.read_at(lba_id_start, block_count, &mut *buf))
-            .map_err(|e| {
-                log::error!("Ext4BlkDevice '{:?}' read_block failed: {:?}", block_id, e);
-                another_ext4::Ext4Error::new(Self::map_system_error_to_ext4(&e))
-            })?;
+        let (lba_start, _) = self.checked_ext4_range(block_id, 1).map_err(|error| {
+            another_ext4::Ext4Error::new(Self::map_system_error_to_ext4(&error))
+        })?;
+        let completed = self.read_at(&mut *buf, lba_start).map_err(|e| {
+            log::error!("Ext4BlkDevice '{:?}' read_block failed: {:?}", block_id, e);
+            another_ext4::Ext4Error::new(Self::map_system_error_to_ext4(&e))
+        })?;
         if completed != another_ext4::BLOCK_SIZE {
             return Err(another_ext4::Ext4Error::new(another_ext4::ErrCode::EIO));
         }
@@ -151,17 +128,14 @@ impl another_ext4::BlockDevice for GenDisk {
                 .checked_add(block_offset as u64)
                 .ok_or_else(|| another_ext4::Ext4Error::new(another_ext4::ErrCode::EFBIG))?;
             let ext4_blocks = chunk.len() / another_ext4::BLOCK_SIZE;
-            let (lba_start, lba_count) = self
-                .checked_ext4_range(chunk_start, ext4_blocks)
-                .map_err(|error| {
-                    another_ext4::Ext4Error::new(Self::map_system_error_to_ext4(&error))
-                })?;
-            let completed = self
-                .block_device()
-                .and_then(|bdev| bdev.read_at(lba_start, lba_count, chunk))
-                .map_err(|error| {
-                    another_ext4::Ext4Error::new(Self::map_system_error_to_ext4(&error))
-                })?;
+            let (lba_start, _) =
+                self.checked_ext4_range(chunk_start, ext4_blocks)
+                    .map_err(|error| {
+                        another_ext4::Ext4Error::new(Self::map_system_error_to_ext4(&error))
+                    })?;
+            let completed = self.read_at(chunk, lba_start).map_err(|error| {
+                another_ext4::Ext4Error::new(Self::map_system_error_to_ext4(&error))
+            })?;
             if completed != chunk.len() {
                 return Err(another_ext4::Ext4Error::new(another_ext4::ErrCode::EIO));
             }
@@ -173,23 +147,22 @@ impl another_ext4::BlockDevice for GenDisk {
         &self,
         block: &another_ext4::Block,
     ) -> core::result::Result<(), another_ext4::Ext4Error> {
-        let (_, lba_id_start, block_count) = self.convert_from_ext4_blkid(block.id);
-        let completed = self
-            .block_device()
-            .and_then(|bdev| bdev.write_at(lba_id_start, block_count, &*block.data))
-            .map_err(|e| {
-                let code = Self::map_system_error_to_ext4(&e);
-                if code == another_ext4::ErrCode::EROFS {
-                    log::trace!(
-                        "Ext4BlkDevice '{:?}' write_block on readonly media: {:?}",
-                        block.id,
-                        e
-                    );
-                } else {
-                    log::error!("Ext4BlkDevice '{:?}' write_block failed: {:?}", block.id, e);
-                }
-                another_ext4::Ext4Error::new(code)
-            })?;
+        let (lba_start, _) = self.checked_ext4_range(block.id, 1).map_err(|error| {
+            another_ext4::Ext4Error::new(Self::map_system_error_to_ext4(&error))
+        })?;
+        let completed = self.write_at(&*block.data, lba_start).map_err(|e| {
+            let code = Self::map_system_error_to_ext4(&e);
+            if code == another_ext4::ErrCode::EROFS {
+                log::trace!(
+                    "Ext4BlkDevice '{:?}' write_block on readonly media: {:?}",
+                    block.id,
+                    e
+                );
+            } else {
+                log::error!("Ext4BlkDevice '{:?}' write_block failed: {:?}", block.id, e);
+            }
+            another_ext4::Ext4Error::new(code)
+        })?;
         if completed != another_ext4::BLOCK_SIZE {
             return Err(another_ext4::Ext4Error::new(another_ext4::ErrCode::EIO));
         }
@@ -216,17 +189,14 @@ impl another_ext4::BlockDevice for GenDisk {
                 .checked_add(block_offset as u64)
                 .ok_or_else(|| another_ext4::Ext4Error::new(another_ext4::ErrCode::EFBIG))?;
             let ext4_blocks = chunk.len() / another_ext4::BLOCK_SIZE;
-            let (lba_start, lba_count) = self
-                .checked_ext4_range(chunk_start, ext4_blocks)
-                .map_err(|error| {
-                    another_ext4::Ext4Error::new(Self::map_system_error_to_ext4(&error))
-                })?;
-            let completed = self
-                .block_device()
-                .and_then(|bdev| bdev.write_at(lba_start, lba_count, chunk))
-                .map_err(|error| {
-                    another_ext4::Ext4Error::new(Self::map_system_error_to_ext4(&error))
-                })?;
+            let (lba_start, _) =
+                self.checked_ext4_range(chunk_start, ext4_blocks)
+                    .map_err(|error| {
+                        another_ext4::Ext4Error::new(Self::map_system_error_to_ext4(&error))
+                    })?;
+            let completed = self.write_at(chunk, lba_start).map_err(|error| {
+                another_ext4::Ext4Error::new(Self::map_system_error_to_ext4(&error))
+            })?;
             if completed != chunk.len() {
                 return Err(another_ext4::Ext4Error::new(another_ext4::ErrCode::EIO));
             }

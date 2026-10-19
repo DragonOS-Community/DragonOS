@@ -497,6 +497,36 @@ TEST_F(LoopBlockCache, FlushBufferRequiresAdministrativeCapability) {
     ASSERT_TRUE(WIFEXITED(status));
     EXPECT_EQ(0, WEXITSTATUS(status));
 }
+
+TEST_F(LoopBlockCache, CacheBlockSizeQueryWritesOnlyAnInt) {
+    struct {
+        int value;
+        uint32_t sentinel;
+    } output {-1, 0x59aeb731U};
+    ASSERT_EQ(0, ioctl(loop_, BLKBSZGET, &output.value)) << strerror(errno);
+    EXPECT_EQ(static_cast<int>(page_), output.value);
+    EXPECT_EQ(0x59aeb731U, output.sentinel);
+}
+
+TEST_F(LoopBlockCache, CacheBlockSizeQueryAcceptsFourBytesAtPageEnd) {
+    void* mapping = mmap(nullptr, 2 * page_, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    ASSERT_NE(MAP_FAILED, mapping);
+    if (mprotect(static_cast<char*>(mapping) + page_, page_, PROT_NONE) != 0) {
+        const int error = errno;
+        munmap(mapping, 2 * page_);
+        FAIL() << strerror(error);
+    }
+    int* output = reinterpret_cast<int*>(static_cast<char*>(mapping) + page_ - sizeof(int));
+    *output = -1;
+    const int result = ioctl(loop_, BLKBSZGET, output);
+    const int error = errno;
+    EXPECT_EQ(0, result) << strerror(error);
+    if (result == 0) {
+        EXPECT_EQ(static_cast<int>(page_), *output);
+    }
+    EXPECT_EQ(0, munmap(mapping, 2 * page_));
+}
 }  // namespace
 
 int main(int argc, char** argv) {

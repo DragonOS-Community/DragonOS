@@ -590,6 +590,11 @@ impl LoopDevice {
                 error.get_or_insert(failure);
             }
         }
+        // Final detach is a best-effort flush, as Linux final release is: any
+        // remaining dirty pages retire with this binding. A mapping change
+        // keeps the device alive and must instead preserve/reject such pages
+        // (prepare_raw_mapping_change_locked). Pending payload must always end
+        // before either path may release the old backing file.
         if nodes.iter().any(|node| node.has_raw_writeback_locked()) {
             return Err(error.unwrap_or(SystemError::EBUSY));
         }

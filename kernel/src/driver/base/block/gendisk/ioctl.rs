@@ -23,7 +23,7 @@ impl BlockIoctl {
         Some(match cmd {
             0x1260 => Self::SizeSectors,         // BLKGETSIZE: unsigned long
             0x8008_1272 => Self::SizeBytes,      // BLKGETSIZE64: u64
-            0x8008_1270 => Self::CacheBlockSize, // BLKBSZGET: size_t
+            0x8008_1270 => Self::CacheBlockSize, // BLKBSZGET: int (opcode encodes size_t)
             0x1268 => Self::LogicalBlockSize,    // BLKSSZGET: int
             0x127b => Self::PhysicalBlockSize,   // BLKPBSZGET: unsigned int
             0x1278 => Self::MinimumIo,           // BLKIOMIN: unsigned int
@@ -66,7 +66,7 @@ impl BlockIoctl {
                 use crate::mm::MemoryManagementArch;
                 // This mapping currently uses page-sized cache blocks. Queue
                 // logical sectors remain a separate property (BLKSSZGET).
-                put(output, crate::arch::MMArch::PAGE_SIZE)
+                put(output, crate::arch::MMArch::PAGE_SIZE as i32)
             }
             _ => {
                 let limits = device.io_limits();

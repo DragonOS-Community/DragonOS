@@ -376,9 +376,67 @@ impl GenDisk {
         if let Some(loop_device) = BlockDevice::as_any_ref(&*device).downcast_ref::<LoopDevice>() {
             return loop_device.try_write_bytes_operation(physical, len, &bytes[..len], sync);
         }
-        device
-            .write_at_bytes_with_sync(physical, len, &bytes[..len], sync)
-            .map_err(Into::into)
+        if device.uses_delegated_write_sync() {
+            return device
+                .write_at_bytes_with_sync(physical, len, &bytes[..len], sync)
+                .map_err(Into::into);
+        }
+        let written = device.write_at_bytes(physical, len, &bytes[..len])?;
+        // The raw-cache admission keeps this mapping stable across both calls.
+        // Flush failure belongs to the completed write: returning it as a
+        // submission error would allow recovery to replay committed payload.
+        let sync_result = if written != 0 && sync != WriteSyncIntent::None {
+            device.sync().map_err(Into::into)
+        } else {
+            Ok(())
+        };
+        Ok(DelegatedWriteResult::new(written, sync_result))
+    }
+
+    /// Submit a filesystem read without populating the raw-device cache.
+    /// Admission covers submission only: BIO owns its payload until completion.
+    pub(crate) fn submit_read(
+        &self,
+        relative_lba: usize,
+        count: usize,
+    ) -> Result<Arc<crate::driver::base::block::bio::BioRequest>, SystemError> {
+        if count == 0 {
+            return Err(SystemError::EINVAL);
+        }
+        let offset = relative_lba
+            .checked_mul(super::LBA_SIZE)
+            .ok_or(SystemError::EOVERFLOW)?;
+        let len = count
+            .checked_mul(super::LBA_SIZE)
+            .ok_or(SystemError::EOVERFLOW)?;
+        let end = offset.checked_add(len).ok_or(SystemError::EOVERFLOW)?;
+        let device = self.block_device()?;
+        let _noio = MemoryIoScope::enter_noio();
+        let checked_start = || {
+            self.check_online()?;
+            if end > self.byte_capacity()? {
+                return Err(SystemError::EFBIG);
+            }
+            self.range()
+                .lba_start
+                .checked_add(relative_lba)
+                .ok_or(SystemError::EOVERFLOW)
+        };
+        let gate = device.blkdev_meta().raw_cache_gate.read();
+        let start = checked_start()?;
+        if self.existing_raw_cache().is_none() {
+            // The first raw cache is installed under the exclusive gate, so a
+            // buffered write cannot publish dirty bytes before this submission.
+            return device.submit_bio_read(start, count);
+        }
+        drop(gate);
+        let _gate = device.blkdev_meta().raw_cache_gate.write();
+        let start = checked_start()?;
+        self.sync_raw_cache_range_locked(
+            offset >> MMArch::PAGE_SHIFT,
+            (end - 1) >> MMArch::PAGE_SHIFT,
+        )?;
+        device.submit_bio_read(start, count)
     }
 
     pub(super) fn coherent_read(

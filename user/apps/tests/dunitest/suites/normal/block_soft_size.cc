@@ -241,13 +241,17 @@ TEST_F(BlockSoftSize, PartitionHasOwnSizeAndKeepsWholeOpenLifetime) {
     ASSERT_NO_FATAL_FAILURE(ExpectSize(4096));
 }
 
-TEST_F(BlockSoftSize, MountedPartitionClaimsItsNodeAndWholeButNotAnotherPartition) {
+class BlockSoftPartitionClaims : public BlockSoftSize, public testing::WithParamInterface<bool> {};
+
+TEST_P(BlockSoftPartitionClaims, MountedPartitionClaimsItsNodeAndWholeButNotAnotherPartition) {
     Fd fixture {open(dunitest::FixturePath().c_str(), O_RDONLY)};
     ASSERT_GE(fixture.value, 0);
     struct stat metadata {}; ASSERT_EQ(0, fstat(fixture.value, &metadata));
     constexpr uint32_t start = 2048;
-    const uint32_t second_start = start + metadata.st_size / 512 + 8;
-    ASSERT_EQ(0, ftruncate(backing_.value, (second_start + 8) * 512));
+    // Exercise both ordinary siblings and a distinct node inside the mounted
+    // partition: Linux claims node identities, not physical intervals.
+    const uint32_t second_start = GetParam() ? start : start + metadata.st_size / 512 + 8;
+    ASSERT_EQ(0, ftruncate(backing_.value, (start + metadata.st_size / 512 + 16) * 512));
     std::array<char, 65536> data {};
     for (off_t offset = 0; offset < metadata.st_size;) {
         ssize_t count = pread(fixture.value, data.data(), data.size(), offset);
@@ -283,7 +287,10 @@ TEST_F(BlockSoftSize, MountedPartitionClaimsItsNodeAndWholeButNotAnotherPartitio
     }
     ASSERT_NO_FATAL_FAILURE(SetSize(512, other.value));
     ASSERT_NO_FATAL_FAILURE(ExpectSize(512, other.value));
+    ASSERT_NO_FATAL_FAILURE(ExpectSize(4096, first.value));
 }
+
+INSTANTIATE_TEST_SUITE_P(SeparateAndOverlapping, BlockSoftPartitionClaims, testing::Bool());
 
 class BlockSoftGranule : public BlockSoftSize, public testing::WithParamInterface<int> {};
 TEST_P(BlockSoftGranule, WritesExactlyTheConfiguredSoftBlockIncarnation) {

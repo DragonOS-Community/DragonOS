@@ -5,10 +5,9 @@ use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_RECVFROM;
 use crate::mm::VirtAddr;
 use crate::net::posix::SockAddr;
-use crate::net::socket::RecvFromAddrBehavior;
 use crate::net::socket::PMSG;
+use crate::net::socket::{endpoint::write_address_to_user, RecvFromAddrBehavior};
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
-use crate::syscall::user_access::UserBufferWriter;
 use alloc::string::ToString;
 use alloc::vec::Vec;
 
@@ -149,29 +148,16 @@ pub(super) fn do_recvfrom(
         pmsg_flags.insert(PMSG::DONTWAIT);
     }
 
-    // Linux 语义：recvfrom 的 addr/addrlen 是纯输出参数，内核不得读取 addr 缓冲区内容。
-    // 用户栈上的 sockaddr 可能是未初始化的；读取它会导致错误解析并返回 EINVAL。
-    // recv() passes NULL for both addr and addr_len, which is valid.
-
-    // Linux/gVisor 语义：某些 socket（如 TCP/SOCK_STREAM）会忽略源地址输出参数。
-    // 具体行为由 socket 自身决定，避免在 syscall 层做类型特判。
     let (recv_len, endpoint) = socket.recv_from_user_buffer(buf, pmsg_flags)?;
-    if socket.recvfrom_addr_behavior(pmsg_flags) == RecvFromAddrBehavior::Ignore {
-        // 若用户提供了 addrlen，则写回 0；不得写 addr（gVisor 会检查 sockaddr_storage 保持全 0）。
-        if !addr_len.is_null() {
-            let mut writer = UserBufferWriter::new(addr_len, core::mem::size_of::<u32>(), true)?;
-            let mut addrlen_buf = writer.buffer_protected(0)?;
-            addrlen_buf.write_one::<u32>(0, &0u32)?;
-        }
-        return Ok(recv_len);
-    }
-
-    // Only write the source address if the caller provided addr and addr_len
+    // Linux ignores addr_len entirely when addr is NULL. Otherwise even an
+    // empty protocol address result participates in move_addr_to_user's length
+    // protocol, after the payload has been copied/consumed (or peeked).
     if !addr.is_null() {
-        if addr_len.is_null() {
-            return Err(SystemError::EFAULT);
-        }
-        endpoint.write_to_user(addr, addr_len)?;
+        let address = match socket.recvfrom_addr_behavior(pmsg_flags) {
+            RecvFromAddrBehavior::Write => Some(&endpoint),
+            RecvFromAddrBehavior::Ignore => None,
+        };
+        write_address_to_user(address, addr, addr_len)?;
     }
 
     Ok(recv_len)

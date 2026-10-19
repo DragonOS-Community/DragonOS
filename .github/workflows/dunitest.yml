@@ -63,6 +63,7 @@ jobs:
           normal/dma_allocator_selftest
           normal/ext4_orphan_recovery
           normal/ext4_nested_writeback
+          normal/ext4_fallocate
           normal/ext4_shared_xattr
           normal/pipe_write_fault
           normal/pipe_transfer_copy
@@ -104,6 +105,7 @@ jobs:
           normal/inotify_read_order
           normal/file_owner_notifications
           normal/tcp_urgent
+          normal/socket_address_output
           normal/tcp_icmp_errors
           normal/loop_logical_block_size
           normal/block_soft_size

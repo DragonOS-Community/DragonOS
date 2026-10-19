@@ -776,21 +776,6 @@ impl GenDiskMap {
             data: HashMap::new(),
         }
     }
-
-    /// Check overlap between partitions.  The whole-disk entry intentionally
-    /// covers every partition and therefore does not participate in this
-    /// validation.
-    pub fn intersects_partition(&self, range: &GeneralBlockRange) -> bool {
-        for (idx, v) in self.iter() {
-            if *idx == GenDisk::ENTIRE_DISK_IDX {
-                continue;
-            }
-            if range.intersects_with(&v.range()).is_some() {
-                return true;
-            }
-        }
-        return false;
-    }
 }
 
 impl Deref for GenDiskMap {

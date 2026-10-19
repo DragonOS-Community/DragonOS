@@ -9,6 +9,8 @@
 #include <linux/fs.h>
 #include <linux/loop.h>
 #include <string>
+#include <tuple>
+#include <utility>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/mount.h>
@@ -136,7 +138,8 @@ protected:
         ASSERT_NO_FATAL_FAILURE(WriteMbr(fd->value, start, count));
     }
     void WriteGpt(uint64_t sectors = kSectors, uint32_t count = 128,
-                  uint64_t start = 2048, uint64_t end = 4095, bool boundary_entries = false, uint32_t logical = 512) {
+                  uint64_t start = 2048, uint64_t end = 4095, bool boundary_entries = false, uint32_t logical = 512,
+                  uint64_t second_start = 0, uint64_t second_end = 0) {
         ASSERT_EQ(0, ftruncate(backing_.value, sectors * logical));
         std::array<unsigned char, 512> mbr {};
         mbr[446 + 4] = 0xee; Le32(mbr.data() + 446 + 8, 1);
@@ -145,12 +148,13 @@ protected:
         ASSERT_EQ(512, pwrite(backing_.value, mbr.data(), mbr.size(), 0));
         std::vector<unsigned char> entries(size_t(count) * 128, 0);
         const unsigned char linux_type[] = {0xaf,0x3d,0xc6,0x0f,0x83,0x84,0x72,0x47,0x8e,0x79,0x3d,0x69,0xd8,0x47,0x7d,0xe4};
-        for (unsigned index : {0U, 254U, 255U}) {
-            if (index != 0 && !boundary_entries) continue;
+        for (unsigned index : {0U, 1U, 254U, 255U}) {
+            if (index == 1 ? second_start == 0 : index != 0 && !boundary_entries) continue;
             ASSERT_LT(index, count);
             unsigned char* entry = entries.data() + index * 128;
             memcpy(entry, linux_type, 16); entry[16] = index + 1;
-            Le64(entry + 32, start); Le64(entry + 40, end);
+            Le64(entry + 32, index == 1 ? second_start : start);
+            Le64(entry + 40, index == 1 ? second_end : end);
         }
         const uint64_t table_sectors = (entries.size() + logical - 1) / logical;
         const uint64_t backup_table = sectors - 1 - table_sectors;
@@ -178,6 +182,84 @@ protected:
     std::string backing_path_, second_path_, loop_path_;
     bool bound_ = false;
 };
+
+class LoopOverlappingPartitions : public LoopPartscan,
+                                  public testing::WithParamInterface<std::tuple<bool, bool>> {};
+
+TEST_P(LoopOverlappingPartitions, PublishesIndependentNodesWithExplicitAliasCacheBoundaries) {
+    const bool gpt = std::get<0>(GetParam());
+    const bool same_start = std::get<1>(GetParam());
+    constexpr uint32_t first_start = 2048;
+    constexpr uint32_t first_count = 32;
+    constexpr uint32_t second_count = 16;
+    const uint32_t second_start = first_start + (same_start ? 0 : 24);
+    SCOPED_TRACE(testing::Message() << "GPT=" << gpt << " identical start=" << same_start);
+    if (gpt) {
+        ASSERT_NO_FATAL_FAILURE(WriteGpt(kSectors, 128, first_start,
+                                       first_start + first_count - 1, false, 512,
+                                       second_start, second_start + second_count - 1));
+    } else {
+        std::array<unsigned char, 512> mbr {};
+        for (unsigned slot = 0; slot < 2; ++slot) {
+            unsigned char* entry = mbr.data() + 446 + slot * 16;
+            entry[4] = 0x83;
+            Le32(entry + 8, slot ? second_start : first_start);
+            Le32(entry + 12, slot ? second_count : first_count);
+        }
+        mbr[510] = 0x55; mbr[511] = 0xaa;
+        ASSERT_EQ(512, pwrite(backing_.value, mbr.data(), mbr.size(), 0));
+    }
+    std::array<unsigned char, 512> first_marker {}, second_marker {};
+    first_marker.fill(0x31); second_marker.fill(0x72);
+    ASSERT_EQ(512, pwrite(backing_.value, first_marker.data(), first_marker.size(), first_start * 512));
+    ASSERT_EQ(512, pwrite(backing_.value, second_marker.data(), second_marker.size(), second_start * 512));
+    ASSERT_EQ(0, fsync(backing_.value));
+    ASSERT_NO_FATAL_FAILURE(Bind());
+    ASSERT_NO_FATAL_FAILURE(Flags(LO_FLAGS_PARTSCAN));
+    ASSERT_NO_FATAL_FAILURE(ExpectCapacity(Part(1), first_count * 512));
+    ASSERT_NO_FATAL_FAILURE(ExpectCapacity(Part(2), second_count * 512));
+    Fd first {open(Part(1).c_str(), O_RDWR)};
+    Fd second {open(Part(2).c_str(), O_RDWR)};
+    ASSERT_GE(first.value, 0); ASSERT_GE(second.value, 0);
+    int block_size = 512;
+    ASSERT_EQ(0, ioctl(first.value, BLKBSZSET, &block_size));
+    ASSERT_EQ(0, ioctl(second.value, BLKBSZSET, &block_size));
+    std::array<unsigned char, 1024> bytes {};
+    ASSERT_EQ(512, pread(first.value, bytes.data(), 512, 0));
+    EXPECT_EQ(same_start ? second_marker[0] : first_marker[0], bytes[0]);
+    ASSERT_EQ(512, pread(second.value, bytes.data(), 512, 0));
+    EXPECT_EQ(second_marker[0], bytes[0]);
+    const off_t relative_overlap = (second_start - first_start) * 512;
+    ASSERT_EQ(512, pread(first.value, bytes.data(), 512, relative_overlap));
+    EXPECT_EQ(second_marker[0], bytes[0]);
+
+    // Linux has one mapping per node. Flush the writer and explicitly discard
+    // the clean reader alias; overlapping partitions do not share a cache.
+    first_marker.fill(0xa6);
+    ASSERT_EQ(512, pwrite(first.value, first_marker.data(), first_marker.size(), relative_overlap));
+    ASSERT_EQ(0, fsync(first.value));
+    ASSERT_EQ(0, ioctl(second.value, BLKFLSBUF, 0));
+    ASSERT_EQ(512, pread(second.value, bytes.data(), 512, 0));
+    EXPECT_EQ(0, memcmp(bytes.data(), first_marker.data(), 512));
+    second_marker.fill(0xc9);
+    ASSERT_EQ(512, pwrite(second.value, second_marker.data(), second_marker.size(), 0));
+    ASSERT_EQ(0, fsync(second.value));
+    ASSERT_EQ(0, ioctl(first.value, BLKFLSBUF, 0));
+    ASSERT_EQ(512, pread(first.value, bytes.data(), 512, relative_overlap));
+    EXPECT_EQ(0, memcmp(bytes.data(), second_marker.data(), 512));
+
+    for (auto node : {std::make_pair(first.value, first_count),
+                      std::make_pair(second.value, second_count)}) {
+        EXPECT_EQ(0, pread(node.first, bytes.data(), bytes.size(), node.second * 512));
+        EXPECT_EQ(512, pread(node.first, bytes.data(), bytes.size(), (node.second - 1) * 512));
+        errno = 0;
+        EXPECT_EQ(-1, pwrite(node.first, first_marker.data(), 512, node.second * 512));
+        EXPECT_EQ(ENOSPC, errno);
+    }
+}
+
+INSTANTIATE_TEST_SUITE_P(MbrAndGpt, LoopOverlappingPartitions,
+                        testing::Combine(testing::Bool(), testing::Bool()));
 
 TEST_F(LoopPartscan, ConfigureLargeLogicalMbrUsesLogicalSectorUnits) {
     loop_config config {}; config.fd = backing_.value;

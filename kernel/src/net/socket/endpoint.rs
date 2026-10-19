@@ -249,24 +249,10 @@ impl Endpoint {
         addr: *mut SockAddr,
         addr_len: *mut u32,
     ) -> Result<(), system_error::SystemError> {
-        if addr.is_null() || addr_len.is_null() {
+        if addr.is_null() {
             return Ok(());
         }
-
-        // 使用 UserBufferReader 读取用户提供的缓冲区长度
-        let addr_len_reader = UserBufferReader::new(addr_len, core::mem::size_of::<u32>(), true)?;
-        let user_len = addr_len_reader.buffer_protected(0)?.read_one::<u32>(0)? as usize;
-
-        let len = self.write_sockaddr_to_user(addr, user_len)?;
-
-        // 写回实际需要的长度
-        let mut addr_len_writer =
-            UserBufferWriter::new(addr_len, core::mem::size_of::<u32>(), true)?;
-        addr_len_writer
-            .buffer_protected(0)?
-            .write_one::<u32>(0, &len)?;
-
-        Ok(())
+        write_address_to_user(Some(self), addr, addr_len)
     }
 
     /// 将端点地址写入用户空间（用于 recvmsg 的 msghdr 风格）
@@ -288,4 +274,36 @@ impl Endpoint {
 
         self.write_sockaddr_to_user(addr, user_len as usize)
     }
+}
+
+/// Copy a receive/name result using Linux's `move_addr_to_user` ordering.
+///
+/// `None` represents an empty address result, such as ordinary TCP/VSOCK
+/// receives. Callers decide whether an address was requested; even an empty
+/// result must read the signed capacity and write back its actual length.
+/// Call this only after the operation that produced the result succeeds.
+pub(crate) fn write_address_to_user(
+    endpoint: Option<&Endpoint>,
+    addr: *mut SockAddr,
+    addr_len: *mut u32,
+) -> Result<(), system_error::SystemError> {
+    let user_len = {
+        let reader = UserBufferReader::new(addr_len, core::mem::size_of::<i32>(), true)?;
+        let length = reader.buffer_protected(0)?.read_one::<i32>(0)?;
+        length
+    };
+    if user_len < 0 {
+        return Err(system_error::SystemError::EINVAL);
+    }
+
+    let len = match endpoint {
+        Some(endpoint) => endpoint.write_sockaddr_to_user(addr, user_len as usize)?,
+        None => 0,
+    };
+
+    // Do not preflight writability: Linux copies the address before a fault in
+    // this final length store. The length may also overlap the address buffer.
+    let mut writer = UserBufferWriter::new(addr_len, core::mem::size_of::<u32>(), true)?;
+    writer.buffer_protected(0)?.write_one::<u32>(0, &len)?;
+    Ok(())
 }

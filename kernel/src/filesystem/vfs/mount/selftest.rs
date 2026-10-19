@@ -1,5 +1,69 @@
 use super::*;
 
+#[cfg(feature = "mm_selftest")]
+pub(crate) fn run_forced_readonly_debug_selftest() -> Result<String, SystemError> {
+    let inner: Arc<dyn FileSystem> = crate::filesystem::ramfs::RamFS::new();
+    let mount = MountFS::new(
+        inner,
+        None,
+        None,
+        MountPropagation::new_private(),
+        None,
+        MountFlags::SYNCHRONOUS,
+        None,
+    )?;
+    if let Err(error) = mount.activate() {
+        mount.deactivate();
+        return Err(error);
+    }
+    let writer_check = (|| {
+        // A filesystem reports the failure while its syscall still owns a
+        // writer. Forcing read-only must not wait for that same writer.
+        let held = mount.want_write()?;
+        let sb = mount.super_block_state();
+        sb.force_readonly();
+        let preserved_flags = sb
+            .flags()
+            .contains(MountFlags::RDONLY | MountFlags::SYNCHRONOUS);
+        let rejected = matches!(mount.want_write(), Err(SystemError::EROFS));
+        drop(held);
+        Ok::<_, SystemError>((preserved_flags, rejected))
+    })();
+    mount.deactivate();
+    let (held_writer, new_writer) = writer_check?;
+
+    // This is the actual production transition token, prepared before the
+    // backend error and committed afterward with a stale writable flag set.
+    let stale = Arc::new(SuperBlockState::new(
+        MountFlags::RDONLY | MountFlags::SYNCHRONOUS,
+    ));
+    let prepared = stale
+        .begin_readonly_transition(false, false)?
+        .ok_or(SystemError::EIO)?;
+    stale.force_readonly();
+    prepared.commit(MountFlags::SYNCHRONOUS);
+    let late_commit = stale
+        .flags()
+        .contains(MountFlags::RDONLY | MountFlags::SYNCHRONOUS);
+    stale.set_flags(MountFlags::empty());
+    let setter = stale.flags() == MountFlags::RDONLY && !stale.is_synchronous();
+    let new_rw = matches!(
+        stale.begin_readonly_transition(false, false),
+        Err(SystemError::EROFS)
+    );
+
+    let ok = |value| if value { "ok" } else { "fail" };
+    Ok(alloc::format!(
+        "status={}\nheld_writer={}\nnew_writer={}\nlate_commit={}\nflags_setter={}\nnew_rw_rejected={}\n",
+        ok(held_writer && new_writer && late_commit && setter && new_rw),
+        ok(held_writer),
+        ok(new_writer),
+        ok(late_commit),
+        ok(setter),
+        ok(new_rw),
+    ))
+}
+
 // Every held wrapper must remain the identity returned by real lookups, even
 // while another participant creates and drops wrappers for the same dentry.
 fn run_mount_wrapper_lookup_churn(mount: &Arc<MountFS>, dentry: &Arc<VfsDentry>) -> bool {

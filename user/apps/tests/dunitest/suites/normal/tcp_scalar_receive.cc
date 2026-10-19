@@ -246,6 +246,72 @@ TEST_F(TcpScalarReceive, ProtectionChangeWhileWaitingDoesNotConsumeData) {
     ASSERT_NO_FATAL_FAILURE(CheckQueued("abcd", 4));
 }
 
+// A large userspace capacity is not evidence that the stream has that much
+// data. Exercise every entry sharing the protected copy/consume engine.
+TEST_F(TcpScalarReceive, ShortQueueWithLargeCapacityAcrossReceiveEntries) {
+    constexpr size_t kCapacity = 256 * 1024;
+    Mapping output(kCapacity);
+    ASSERT_NE(MAP_FAILED, output.Get());
+    constexpr char payload[] = "short-payload";
+    constexpr size_t kLength = sizeof(payload) - 1;
+    for (int entry = 0; entry < 4; ++entry) {
+        SCOPED_TRACE(entry);
+        memset(output.Get(), '!', kCapacity);
+        ASSERT_NO_FATAL_FAILURE(Queue(payload, kLength));
+        iovec vectors[] = {{output.Get(), 3}, {output.Get() + 3, kCapacity - 3}};
+        msghdr message{};
+        message.msg_iov = vectors;
+        message.msg_iovlen = 2;
+        ssize_t count;
+        switch (entry) {
+            case 0: count = recv(reader_.Get(), output.Get(), kCapacity, MSG_DONTWAIT); break;
+            case 1: count = read(reader_.Get(), output.Get(), kCapacity); break;
+            case 2: count = readv(reader_.Get(), vectors, 2); break;
+            default: count = recvmsg(reader_.Get(), &message, MSG_DONTWAIT); break;
+        }
+        ASSERT_EQ(static_cast<ssize_t>(kLength), count) << strerror(errno);
+        EXPECT_EQ(0, memcmp(output.Get(), payload, kLength));
+        EXPECT_EQ('!', output.Get()[kLength]);
+        char byte;
+        errno = 0;
+        EXPECT_EQ(-1, recv(reader_.Get(), &byte, 1, MSG_DONTWAIT));
+        EXPECT_EQ(EAGAIN, errno);
+    }
+}
+
+TEST_F(TcpScalarReceive, WaitallPreservesPrefixAcrossLaterStorageGrowth) {
+    constexpr size_t kSuffix = 128 * 1024;
+    Mapping output(kSuffix + 1, PROT_READ | PROT_WRITE, MAP_SHARED);
+    ASSERT_NE(MAP_FAILED, output.Get());
+    memset(output.Get(), '!', kSuffix + 1);
+    ASSERT_NO_FATAL_FAILURE(Queue("a", 1));
+    const pid_t child = fork();
+    ASSERT_GE(child, 0);
+    if (child == 0) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (__atomic_load_n(output.Get(), __ATOMIC_RELAXED) != 'a' &&
+               std::chrono::steady_clock::now() < deadline) usleep(1000);
+        if (__atomic_load_n(output.Get(), __ATOMIC_RELAXED) != 'a') _exit(1);
+        std::vector<char> suffix(kSuffix, 'b');
+        size_t total = 0;
+        while (total < suffix.size()) {
+            const ssize_t count = send(writer_.Get(), suffix.data() + total,
+                                       suffix.size() - total, MSG_NOSIGNAL);
+            if (count <= 0) _exit(2);
+            total += static_cast<size_t>(count);
+        }
+        _exit(0);
+    }
+    const ssize_t count = recv(reader_.Get(), output.Get(), kSuffix + 1, MSG_WAITALL);
+    int status = 0;
+    EXPECT_EQ(child, waitpid(child, &status, 0));
+    ASSERT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(0, WEXITSTATUS(status));
+    ASSERT_EQ(static_cast<ssize_t>(kSuffix + 1), count) << strerror(errno);
+    EXPECT_EQ('a', output.Get()[0]);
+    for (size_t i = 1; i <= kSuffix; ++i) ASSERT_EQ('b', output.Get()[i]) << i;
+}
+
 class TcpScalarPartial : public TcpScalarReceive,
                          public ::testing::WithParamInterface<int> {};
 

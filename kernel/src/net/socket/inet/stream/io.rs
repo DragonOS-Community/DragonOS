@@ -1,5 +1,4 @@
 use alloc::boxed::Box;
-use alloc::vec;
 
 use system_error::SystemError;
 
@@ -353,7 +352,8 @@ impl TcpSocket {
         user_buffer: &mut UserBuffer<'_>,
         offset: usize,
         report_error: bool,
-    ) -> Result<usize, SystemError> {
+        staging: &mut RecvBuffer,
+    ) -> Result<ReceiveAttempt<usize>, SystemError> {
         if offset > user_buffer.len() {
             return Err(SystemError::EINVAL);
         }
@@ -383,40 +383,52 @@ impl TcpSocket {
             }
         })?;
         if !readable {
-            return Ok(0);
+            return Ok(ReceiveAttempt::Ready(0));
         }
 
         // recv/recvmsg with zero capacity still observe readiness or EOF.
         // read(2)'s zero-length shortcut belongs to the read entry point.
         if user_remaining == 0 {
-            return Ok(0);
+            return Ok(ReceiveAttempt::Ready(0));
         }
 
-        // User pages may fault and sleep. Copy through a bounded kernel buffer so the
-        // interface-wide SocketSet lock is never held while touching userspace.
-        let mut staging = vec![0u8; core::cmp::min(user_remaining, USER_RECV_STAGING_SIZE)];
-
+        // User pages may fault and sleep. The call-local storage is admitted
+        // outside every socket lock, sized from queued data rather than the
+        // user's declared capacity. Keep the existing copy/consume transaction.
         let mut total = 0usize;
         while total < user_remaining {
             let want = user_remaining - total;
             let staged = established.with_mut(|socket| {
                 if !socket.can_recv() {
-                    return 0;
+                    return ReceiveAttempt::Ready(0);
                 }
-                match socket.peek(core::cmp::min(want, staging.len())) {
+                let required = want.min(socket.recv_queue()).min(USER_RECV_STAGING_SIZE);
+                if staging.capacity() < required {
+                    return ReceiveAttempt::NeedBuffer(required);
+                }
+                match socket.peek(required) {
                     Ok(data) => {
                         let size = data.len();
-                        staging[..size].copy_from_slice(data);
-                        size
+                        staging.bytes_mut(size).copy_from_slice(data);
+                        ReceiveAttempt::Ready(size)
                     }
-                    Err(_) => 0,
+                    Err(_) => ReceiveAttempt::Ready(0),
                 }
             });
+            let staged = match staged {
+                ReceiveAttempt::NeedBuffer(required) if total == 0 => {
+                    return Ok(ReceiveAttempt::NeedBuffer(required));
+                }
+                // Publish completed copies before requesting storage growth.
+                // Retrying admission must never replay their user copy/consume.
+                ReceiveAttempt::NeedBuffer(_) => break,
+                ReceiveAttempt::Ready(size) => size,
+            };
             if staged == 0 {
                 break;
             }
 
-            if let Err(error) = user_buffer.write_to_user(offset + total, &staging[..staged]) {
+            if let Err(error) = user_buffer.write_to_user(offset + total, staging.bytes(staged)) {
                 if error == SystemError::EFAULT && total > 0 {
                     break;
                 }
@@ -449,29 +461,31 @@ impl TcpSocket {
         if total == 0 {
             // The stack may have processed FIN/RST after the allocation-time readiness probe.
             // Re-evaluate the terminal state instead of turning EOF into a spurious EAGAIN.
-            return established.with_mut(|socket| {
-                if socket.can_recv() {
-                    return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-                }
-                if socket.may_recv() {
-                    if socket.pending_error().is_some() {
-                        return Self::recv_reset_result(socket, report_error);
+            return established
+                .with_mut(|socket| {
+                    if socket.can_recv() {
+                        return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
                     }
-                    return if self.is_recv_shutdown() {
-                        Ok(0)
-                    } else {
-                        Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
-                    };
-                }
-                match socket.recv(|_data| (0usize, ())) {
-                    Ok(()) | Err(smoltcp::socket::tcp::RecvError::Finished) => Ok(0),
-                    Err(smoltcp::socket::tcp::RecvError::InvalidState) => {
-                        Self::recv_reset_result(socket, report_error)
+                    if socket.may_recv() {
+                        if socket.pending_error().is_some() {
+                            return Self::recv_reset_result(socket, report_error);
+                        }
+                        return if self.is_recv_shutdown() {
+                            Ok(0)
+                        } else {
+                            Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
+                        };
                     }
-                }
-            });
+                    match socket.recv(|_data| (0usize, ())) {
+                        Ok(()) | Err(smoltcp::socket::tcp::RecvError::Finished) => Ok(0),
+                        Err(smoltcp::socket::tcp::RecvError::InvalidState) => {
+                            Self::recv_reset_result(socket, report_error)
+                        }
+                    }
+                })
+                .map(ReceiveAttempt::Ready);
         }
-        Ok(total)
+        Ok(ReceiveAttempt::Ready(total))
     }
 
     fn finish_recv_progress(&self, consumed: bool) {
@@ -621,7 +635,8 @@ impl TcpSocket {
         &self,
         user_buffer: &mut UserBuffer<'_>,
         offset: usize,
-    ) -> Result<usize, SystemError> {
+        staging: &mut RecvBuffer,
+    ) -> Result<ReceiveAttempt<usize>, SystemError> {
         let recv_guard = self.recv_lock.lock();
         let mut total_read = offset;
 
@@ -645,6 +660,7 @@ impl TcpSocket {
                     user_buffer,
                     total_read,
                     total_read == 0,
+                    staging,
                 ),
                 inner::Inner::Connecting(connecting) => {
                     if let Some(err) = connecting.take_connect_error() {
@@ -652,7 +668,7 @@ impl TcpSocket {
                     } else if connecting.is_connected() {
                         continue;
                     } else if connecting.is_refused_consumed() {
-                        Ok(0)
+                        Ok(ReceiveAttempt::Ready(0))
                     } else {
                         Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
                     }
@@ -663,7 +679,13 @@ impl TcpSocket {
 
             self.update_events();
             match iter_result {
-                Ok(n) => {
+                Ok(ReceiveAttempt::NeedBuffer(required)) => {
+                    if total_read > offset {
+                        break;
+                    }
+                    return Ok(ReceiveAttempt::NeedBuffer(required));
+                }
+                Ok(ReceiveAttempt::Ready(n)) => {
                     total_read += n;
 
                     if n == 0 || total_read == user_buffer.len() {
@@ -681,14 +703,7 @@ impl TcpSocket {
 
         drop(recv_guard);
         self.finish_recv_progress(total_read > offset);
-        Ok(total_read - offset)
-    }
-
-    pub(super) fn try_read_to_user_buffer(
-        &self,
-        user_buffer: &mut UserBuffer<'_>,
-    ) -> Result<usize, SystemError> {
-        self.try_recv_to_user_buffer(user_buffer, 0)
+        Ok(ReceiveAttempt::Ready(total_read - offset))
     }
 
     pub(super) fn recv_to_user_buffer_impl(
@@ -697,21 +712,36 @@ impl TcpSocket {
         nonblock: bool,
         waitall: bool,
     ) -> Result<usize, SystemError> {
-        if nonblock {
-            return self.try_read_to_user_buffer(user_buffer);
-        }
-
         let mut timeout = ReceiveTimeout::new(self.recv_timeout());
         let mut total_read = 0usize;
+        let mut staging = RecvBuffer::default();
         loop {
-            match self.try_recv_to_user_buffer(user_buffer, total_read) {
-                Ok(n) => {
+            match self.try_recv_to_user_buffer(user_buffer, total_read, &mut staging) {
+                Ok(ReceiveAttempt::NeedBuffer(required)) => {
+                    // The receive, inner and SocketSet guards have all gone.
+                    // Recovery retries only allocation, not a committed read.
+                    if let Err(error) = staging.prepare(required) {
+                        return if total_read > 0 {
+                            Ok(total_read)
+                        } else {
+                            Err(error)
+                        };
+                    }
+                }
+                Ok(ReceiveAttempt::Ready(n)) => {
                     total_read += n;
-                    if n == 0 || total_read == user_buffer.len() || !waitall {
+                    if n == 0 || total_read == user_buffer.len() || !waitall || nonblock {
                         return Ok(total_read);
                     }
                 }
                 Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
+                    if nonblock {
+                        return if total_read > 0 {
+                            Ok(total_read)
+                        } else {
+                            Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
+                        };
+                    }
                     if let Some(iface) = self.stack_poll_snapshot() {
                         super::poll_util::poll_stack_batch(iface.as_ref());
                     }

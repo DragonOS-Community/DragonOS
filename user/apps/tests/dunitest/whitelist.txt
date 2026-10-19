@@ -276,3 +276,8 @@ normal/tcp_scalar_receive
 normal/fat_timestamps
 normal/ext4_write_progress
 normal/fat_directory_entries
+normal/sysfs_statfs
+normal/block_device_ioctl
+normal/fat_rename_atomicity
+normal/mount_forced_readonly_selftest
+normal/fat_rename_aliases

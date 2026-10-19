@@ -92,6 +92,11 @@ jobs:
           normal/primary_write_transaction
           normal/fat_timestamps
           normal/fat_directory_entries
+          normal/sysfs_statfs
+          normal/block_device_ioctl
+          normal/fat_rename_atomicity
+          normal/fat_rename_aliases
+          normal/mount_forced_readonly_selftest
           normal/ext4_write_progress
           EOF
 

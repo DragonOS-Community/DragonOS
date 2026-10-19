@@ -64,6 +64,62 @@ impl PublishedDirEntry {
     }
 }
 
+/// A bounded scratch sector, prepared before namespace modification. Every
+/// operation reads the current sector under dirent serialization and changes
+/// only its own slot, never overwriting adjacent inode writeback during undo.
+struct DirSlotIo {
+    sector: Vec<u8>,
+}
+
+impl DirSlotIo {
+    fn new() -> Result<Self, SystemError> {
+        let mut sector = Vec::new();
+        sector
+            .try_reserve_exact(LBA_SIZE)
+            .map_err(|_| SystemError::ENOMEM)?;
+        sector.resize(LBA_SIZE, 0);
+        Ok(Self { sector })
+    }
+
+    fn read(&mut self, fs: &FATFileSystem, offset: u64) -> Result<[u8; 32], SystemError> {
+        let _guard = fs.lock_dirent_io();
+        let within =
+            usize::try_from(offset % LBA_SIZE as u64).map_err(|_| SystemError::EOVERFLOW)?;
+        if within % 32 != 0 {
+            return Err(SystemError::EIO);
+        }
+        let start = usize::try_from(offset - within as u64).map_err(|_| SystemError::EOVERFLOW)?;
+        read_exact_at(&fs.storage, &mut self.sector, start)?;
+        self.sector[within..within + 32]
+            .try_into()
+            .map_err(|_| SystemError::EIO)
+    }
+
+    fn write(
+        &mut self,
+        fs: &FATFileSystem,
+        offset: u64,
+        bytes: &[u8; 32],
+    ) -> Result<(), SystemError> {
+        let _guard = fs.lock_dirent_io();
+        let within =
+            usize::try_from(offset % LBA_SIZE as u64).map_err(|_| SystemError::EOVERFLOW)?;
+        if within % 32 != 0 {
+            return Err(SystemError::EIO);
+        }
+        let start = usize::try_from(offset - within as u64).map_err(|_| SystemError::EOVERFLOW)?;
+        read_exact_at(&fs.storage, &mut self.sector, start)?;
+        self.sector[within..within + 32].copy_from_slice(bytes);
+        write_exact_at(&fs.storage, &self.sector, start)
+    }
+}
+
+struct SlotChange {
+    offset: u64,
+    before: [u8; 32],
+    after: [u8; 32],
+}
+
 /// FAT文件系统中的文件
 #[derive(Debug, Default, Clone)]
 pub struct FATFile {
@@ -212,7 +268,7 @@ impl FATFile {
             //  从磁盘上读取数据
             let offset = fs.cluster_bytes_offset(current_cluster) + in_cluster_offset;
             let r = fs
-                .gendisk
+                .storage
                 .read_at_bytes(&mut buf[start..start + end_len], offset as usize)?;
             if r == 0 || r > end_len {
                 return Err(SystemError::EIO);
@@ -275,7 +331,7 @@ impl FATFile {
             let offset = fs.cluster_bytes_offset(current_cluster) + in_cluster_bytes_offset;
             // 写入磁盘（防御性检查：若设备返回0字节写入视为IO错误）
             let w = fs
-                .gendisk
+                .storage
                 .write_at_bytes(&buf[start..start + end_len], offset as usize)?;
             if w == 0 || w > end_len {
                 return Err(SystemError::EIO);
@@ -465,7 +521,7 @@ impl FATFile {
         while remain > 0 {
             let write_size = core::cmp::min(remain, ZERO_BUF_SIZE);
             let w = fs
-                .gendisk
+                .storage
                 .write_at_bytes(&zeroes[..write_size], offset as usize)?;
             if w == 0 || w > write_size {
                 return Err(SystemError::EIO);
@@ -784,7 +840,11 @@ impl FATDir {
                     attributes: FileAttributes::new(FileAttributes::DIRECTORY),
                     ..Default::default()
                 };
-                dot_dot_entry.set_first_cluster(self.first_cluster);
+                dot_dot_entry.set_first_cluster(if self.short_dir_entry.is_none() {
+                    Cluster::new(0)
+                } else {
+                    self.first_cluster
+                });
                 dot_dot_entry.set_times(now, now, now);
 
                 if let Err(error) =
@@ -950,7 +1010,7 @@ impl FATDir {
         // 短目录项在分区内的字节偏移量
         let offset = fs.cluster_bytes_offset(end.0) + end.1;
         short_dentry.commit_without_barrier(&fs, offset)?;
-        let sync_error = fs.gendisk.sync().err();
+        let sync_error = fs.storage.sync().err();
         Ok(PublishedDirEntry {
             entry: short_dentry
                 .convert_to_dir_entry_with_long_name(long_name.to_string(), (start, end)),
@@ -1045,8 +1105,8 @@ impl FATDir {
                 // The slot is no longer ours as soon as its SFN sector write
                 // completes, even if the following device barrier fails.
                 on_removed.take().unwrap()();
-                fs.gendisk.sync()?;
-            } else if let Err(error) = submitted.and_then(|()| fs.gendisk.sync()) {
+                fs.storage.sync()?;
+            } else if let Err(error) = submitted.and_then(|()| fs.storage.sync()) {
                 // The SFN deletion has committed. As in Linux fat_remove_entries,
                 // orphaned LFN cleanup must not prevent inode/data reclamation.
                 warn!("FAT: failed to clean deleted long-name slot: {:?}", error);
@@ -1072,127 +1132,164 @@ impl FATDir {
         return self.find_entry(name, None, None, fs);
     }
 
-    /// @brief 在当前目录内，重命名一个目录项
-    ///
-    pub(super) fn rename(
-        &self,
-        fs: Arc<FATFileSystem>,
-        old_name: &str,
-        new_name: &str,
-        new_inode: Option<Arc<LockedFATInode>>,
-        on_source_removed: impl FnOnce(),
-    ) -> Result<PublishedDirEntry, SystemError> {
-        // 判断源目录项是否存在
-        let old_dentry = if let FATDirEntryOrShortName::DirEntry(dentry) =
-            self.check_existence(old_name, None, fs.clone())?
-        {
-            dentry
-        } else {
-            // 如果目标目录项不存在，则返回错误
-            return Err(SystemError::ENOENT);
-        };
-        let short_name = match self.check_existence(new_name, None, fs.clone())? {
-            FATDirEntryOrShortName::ShortName(s) => s,
-            // 目标已存在：根据类型关系决定是否允许覆盖
-            FATDirEntryOrShortName::DirEntry(e) => {
-                validate_rename_target(&old_dentry, &e, fs.clone())?;
-
-                if e.is_dir() {
-                    new_inode
-                        .as_ref()
-                        .ok_or(SystemError::EIO)?
-                        .remove_directory_name(self, fs.clone(), new_name)?;
-                } else {
-                    let victim = new_inode.ok_or(SystemError::EIO)?;
-                    victim.remove_file_name(self, fs.clone(), new_name)?;
-                }
-                e.short_name_raw()
-            }
-        };
-        let old_short_dentry = old_dentry.short_dir_entry();
-        if let Some(se) = old_short_dentry {
-            self.remove(
-                fs.clone(),
-                old_dentry.name().as_str(),
-                false,
-                on_source_removed,
-            )?;
-            // 创建新的目录项
-            let new_dentry = self.publish_dir_entries(
-                new_name,
-                &short_name,
-                Some(se),
-                se.attributes,
-                fs.clone(),
-            )?;
-            return Ok(new_dentry);
-        } else {
-            // 不允许对根目录项进行重命名
-            return Err(SystemError::EPERM);
-        }
-    }
-
-    /// @brief 跨目录，重命名一个目录项
-    ///
-    pub(super) fn rename_across(
+    /// One concrete namespace protocol for both same-parent and cross-parent
+    /// rename. The caller holds both parents and source/victim inode mutexes.
+    pub(super) fn rename_into(
         &self,
         fs: Arc<FATFileSystem>,
         target: &FATDir,
         old_name: &str,
         new_name: &str,
-        new_inode: Result<Arc<LockedFATInode>, SystemError>,
-        on_source_removed: impl FnOnce(),
-    ) -> Result<PublishedDirEntry, SystemError> {
-        // 判断源目录项是否存在
-        let old_dentry: FATDirEntry = if let FATDirEntryOrShortName::DirEntry(dentry) =
-            self.check_existence(old_name, None, fs.clone())?
-        {
-            dentry
-        } else {
-            // 如果目标目录项不存在，则返回错误
-            return Err(SystemError::ENOENT);
-        };
-
-        let short_name = match target.check_existence(new_name, None, fs.clone())? {
-            FATDirEntryOrShortName::ShortName(s) => s,
-            // 目标已存在：根据类型关系决定是否允许覆盖
-            FATDirEntryOrShortName::DirEntry(e) => {
-                validate_rename_target(&old_dentry, &e, fs.clone())?;
-
-                if e.is_dir() {
-                    new_inode
-                        .as_ref()
-                        .map_err(|error| error.clone())?
-                        .remove_directory_name(target, fs.clone(), new_name)?;
-                } else {
-                    new_inode?.remove_file_name(target, fs.clone(), new_name)?;
-                }
-                e.short_name_raw()
+        across: bool,
+    ) -> Result<FATDirEntry, SystemError> {
+        fs.storage.check_writable()?;
+        let source = self.get_dir_entry(fs.clone(), old_name)?;
+        let source_short = source.short_dir_entry().ok_or(SystemError::EPERM)?;
+        let source_range = source.get_dir_range().ok_or(SystemError::EPERM)?;
+        let found = target.check_existence(new_name, None, fs.clone())?;
+        let (short_name, name_case, offsets, published_name, existing_range) = match found {
+            FATDirEntryOrShortName::DirEntry(victim) => {
+                validate_rename_target(&source, &victim, fs.clone())?;
+                let range = victim.get_dir_range().ok_or(SystemError::EPERM)?;
+                // Existing target names keep their LFN/SFN range, including
+                // imported aliases. No new directory capacity is required.
+                (
+                    victim.short_name_raw(),
+                    victim.short_dir_entry().ok_or(SystemError::EIO)?.nt_res,
+                    vec![range.1],
+                    victim.name(),
+                    Some(range),
+                )
             }
+            FATDirEntryOrShortName::ShortName(short) => (
+                short,
+                0,
+                target.allocate_dir_entries(new_name, fs.clone())?,
+                new_name.to_string(),
+                None,
+            ),
         };
-
-        let old_short_dentry: Option<ShortDirEntry> = old_dentry.short_dir_entry();
-        if let Some(se) = old_short_dentry {
-            self.remove(
-                fs.clone(),
-                old_dentry.name().as_str(),
-                false,
-                on_source_removed,
-            )?;
-            // 创建新的目录项
-            let new_dentry = target.publish_dir_entries(
-                new_name,
-                &short_name,
-                Some(se),
-                se.attributes,
-                fs.clone(),
-            )?;
-
-            return Ok(new_dentry);
-        } else {
-            // 不允许对根目录项进行重命名
-            return Err(SystemError::EPERM);
+        let mut io = DirSlotIo::new()?;
+        let mut changes = Vec::new();
+        changes
+            .try_reserve_exact(offsets.len())
+            .map_err(|_| SystemError::ENOMEM)?;
+        let mut short = source_short;
+        short.name = short_name;
+        // SFN case belongs to the destination name, not the moved payload.
+        short.nt_res = name_case;
+        let mut long_names = LongNameEntryGenerator::new(new_name, short.checksum());
+        for (index, slot) in offsets.iter().enumerate() {
+            let offset = fs.cluster_bytes_offset(slot.0) + slot.1;
+            let after = if index + 1 == offsets.len() {
+                short.encode()
+            } else {
+                long_names.next().ok_or(SystemError::EIO)?.encode()
+            };
+            changes.push(SlotChange {
+                offset,
+                before: io.read(&fs, offset)?,
+                after,
+            });
         }
+        let target_end = *offsets.last().ok_or(SystemError::EIO)?;
+        let target_range = existing_range.unwrap_or((offsets[0], target_end));
+        let published = short.convert_to_dir_entry_with_long_name(published_name, target_range);
+        let source_offset = fs.cluster_bytes_offset(source_range.1 .0) + source_range.1 .1;
+        let source_before = io.read(&fs, source_offset)?;
+        let mut deleted = source_before;
+        deleted[0] = 0xe5;
+        let source_change = SlotChange {
+            offset: source_offset,
+            before: source_before,
+            after: deleted,
+        };
+        let dotdot = if across && source.is_dir() {
+            let offset =
+                fs.cluster_bytes_offset(source.first_cluster()) + FATRawDirEntry::DIR_ENTRY_LEN;
+            let before = io.read(&fs, offset)?;
+            if &before[..11] != b"..         " {
+                return Err(SystemError::EIO);
+            }
+            let mut after = before;
+            // FAT encodes every root parent as cluster zero, including FAT32.
+            let cluster = if target.short_dir_entry.is_none() {
+                0
+            } else {
+                target.first_cluster.cluster_num
+            };
+            after[20..22].copy_from_slice(&((cluster >> 16) as u16).to_le_bytes());
+            after[26..28].copy_from_slice(&(cluster as u16).to_le_bytes());
+            Some(SlotChange {
+                offset,
+                before,
+                after,
+            })
+        } else {
+            None
+        };
+        let mut target_written = 0;
+        let mut dotdot_written = false;
+        let mut source_written = false;
+        let result = (|| {
+            for change in &changes {
+                // A failed block write may still have changed bytes.
+                target_written += 1;
+                io.write(&fs, change.offset, &change.after)?;
+            }
+            fs.storage.sync()?;
+            if let Some(change) = &dotdot {
+                dotdot_written = true;
+                io.write(&fs, change.offset, &change.after)?;
+                fs.storage.sync()?;
+            }
+            source_written = true;
+            io.write(&fs, source_change.offset, &source_change.after)?;
+            fs.storage.sync()
+        })();
+        if let Err(error) = result {
+            // Restore the source first; it must retain a name until cancellation
+            // of the provisional target. Undo is explicit and allocation-free.
+            let undo = (|| {
+                if source_written {
+                    io.write(&fs, source_change.offset, &source_change.before)?;
+                }
+                if dotdot_written {
+                    let change = dotdot.as_ref().unwrap();
+                    io.write(&fs, change.offset, &change.before)?;
+                }
+                for change in changes[..target_written].iter().rev() {
+                    io.write(&fs, change.offset, &change.before)?;
+                }
+                fs.storage.sync()
+            })();
+            if let Err(undo_error) = undo {
+                fs.abort_metadata_io(undo_error);
+            }
+            return Err(error);
+        }
+        // The source SFN is gone. LFN cleanup cannot cancel a completed move;
+        // preserving an orphan LFN is preferable to reintroducing a shared chain.
+        for slot in FATDirEntryOffsetIter::new(fs.clone(), source_range.0, 21, Some(source_range.1))
+        {
+            match slot {
+                Ok(slot) if slot != source_range.1 => {
+                    let offset = fs.cluster_bytes_offset(slot.0) + slot.1;
+                    let mut deleted = [0; 32];
+                    deleted[0] = 0xe5;
+                    if let Err(error) = io.write(&fs, offset, &deleted) {
+                        warn!("FAT: failed to clean renamed long-name slot: {:?}", error);
+                        break;
+                    }
+                }
+                Ok(_) => break,
+                Err(error) => {
+                    warn!("FAT: renamed long-name traversal failed: {:?}", error);
+                    break;
+                }
+            }
+        }
+        Ok(published)
     }
 }
 
@@ -1275,6 +1372,25 @@ pub struct LongDirEntry {
     name3: [u16; 2],
 }
 impl LongDirEntry {
+    fn encode(&self) -> [u8; 32] {
+        let mut bytes = [0; 32];
+        bytes[0] = self.ord;
+        bytes[11] = self.file_attrs.value;
+        bytes[12] = self.dirent_type;
+        bytes[13] = self.checksum;
+        for (base, words) in [
+            (1, self.name1.as_slice()),
+            (14, self.name2.as_slice()),
+            (28, self.name3.as_slice()),
+        ] {
+            for (index, word) in words.iter().enumerate() {
+                bytes[base + index * 2..base + index * 2 + 2].copy_from_slice(&word.to_le_bytes());
+            }
+        }
+        bytes[26..28].copy_from_slice(&self.first_clus_low.to_le_bytes());
+        bytes
+    }
+
     /// 长目录项的字符串长度（单位：word）
     pub const LONG_NAME_STR_LEN: usize = 13;
 
@@ -1381,57 +1497,7 @@ impl LongDirEntry {
         fs: &Arc<FATFileSystem>,
         gendisk_bytes_offset: u64,
     ) -> Result<(), SystemError> {
-        // 目录项扇区 RMW 必须串行化，否则与并发的短/长目录项 flush 交错时，
-        // 后写入者会以自己先前读到的旧扇区覆盖对方的新目录项。详见
-        // `FATFileSystem::dirent_io_lock` 的注释。
-        let _dirent_guard = fs.lock_dirent_io();
-
-        // 从磁盘读取数据
-        let blk_offset = gendisk_bytes_offset % LBA_SIZE as u64;
-        let block_start = gendisk_bytes_offset - blk_offset;
-        let buffer_len = LBA_SIZE;
-        let mut v = Vec::new();
-        v.try_reserve_exact(buffer_len)
-            .map_err(|_| SystemError::ENOMEM)?;
-        v.resize(buffer_len, 0);
-        read_exact_at(
-            &fs.gendisk,
-            &mut v,
-            usize::try_from(block_start).map_err(|_| SystemError::EOVERFLOW)?,
-        )?;
-
-        let mut cursor: VecCursor = VecCursor::new(v);
-        // 切换游标到对应位置
-        cursor.seek(SeekFrom::SeekSet(blk_offset as i64))?;
-
-        // 写入数据
-        cursor.write_u8(self.ord)?;
-        for b in &self.name1 {
-            cursor.write_u16(*b)?;
-        }
-
-        cursor.write_u8(self.file_attrs.value)?;
-        cursor.write_u8(self.dirent_type)?;
-        cursor.write_u8(self.checksum)?;
-
-        for b in &self.name2 {
-            cursor.write_u16(*b)?;
-        }
-
-        cursor.write_u16(self.first_clus_low)?;
-
-        for b in &self.name3 {
-            cursor.write_u16(*b)?;
-        }
-
-        // 把修改后的长目录项刷入磁盘
-        write_exact_at(
-            &fs.gendisk,
-            cursor.as_slice(),
-            usize::try_from(block_start).map_err(|_| SystemError::EOVERFLOW)?,
-        )?;
-
-        Ok(())
+        DirSlotIo::new()?.write(fs, gendisk_bytes_offset, &self.encode())
     }
 
     /// @brief 把当前长目录项写入磁盘，并建立设备持久化边界
@@ -1447,11 +1513,32 @@ impl LongDirEntry {
         gendisk_bytes_offset: u64,
     ) -> Result<(), SystemError> {
         self.commit_without_barrier(&fs, gendisk_bytes_offset)?;
-        fs.gendisk.sync()
+        fs.storage.sync()
     }
 }
 
 impl ShortDirEntry {
+    fn encode(&self) -> [u8; 32] {
+        let mut bytes = [0; 32];
+        bytes[..11].copy_from_slice(&self.name);
+        bytes[11] = self.attributes.value;
+        bytes[12] = self.nt_res;
+        bytes[13] = self.crt_time_tenth;
+        for (offset, value) in [
+            (14, self.crt_time),
+            (16, self.crt_date),
+            (18, self.lst_acc_date),
+            (20, self.fst_clus_hi),
+            (22, self.wrt_time),
+            (24, self.wrt_date),
+            (26, self.fst_clus_lo),
+        ] {
+            bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+        }
+        bytes[28..].copy_from_slice(&self.file_size.to_le_bytes());
+        bytes
+    }
+
     fn set_access_modified(&mut self, atime: PosixTimeSpec, mtime: PosixTimeSpec) {
         let (_, date, _) = super::time::encode(atime);
         self.lst_acc_date = date;
@@ -1663,50 +1750,7 @@ impl ShortDirEntry {
         fs: &Arc<FATFileSystem>,
         gendisk_bytes_offset: u64,
     ) -> Result<(), SystemError> {
-        // 目录项扇区 RMW 必须串行化。典型 race：`FATFile::ensure_len` 触发的 pagecache
-        // 异步回写在扇区 S 上做 RMW；同时主线程在同扇区 S 里新建文件写入长/短目录项。
-        // 若不加锁，后写入者会用自己 read 阶段读到的旧扇区覆盖对方的新目录项，
-        // 导致新建的文件立刻“消失”，后续 `find` 返回 `ENOENT`。
-        let _dirent_guard = fs.lock_dirent_io();
-
-        // 从磁盘读取数据
-        let blk_offset = gendisk_bytes_offset % LBA_SIZE as u64;
-        let block_start = gendisk_bytes_offset - blk_offset;
-        let buffer_len = LBA_SIZE;
-        let mut v = Vec::new();
-        v.try_reserve_exact(buffer_len)
-            .map_err(|_| SystemError::ENOMEM)?;
-        v.resize(buffer_len, 0);
-        read_exact_at(
-            &fs.gendisk,
-            &mut v,
-            usize::try_from(block_start).map_err(|_| SystemError::EOVERFLOW)?,
-        )?;
-
-        let mut cursor: VecCursor = VecCursor::new(v);
-        // 切换游标到对应位置
-        cursor.seek(SeekFrom::SeekSet(blk_offset as i64))?;
-        cursor.write_exact(&self.name)?;
-        cursor.write_u8(self.attributes.value)?;
-        cursor.write_u8(self.nt_res)?;
-        cursor.write_u8(self.crt_time_tenth)?;
-        cursor.write_u16(self.crt_time)?;
-        cursor.write_u16(self.crt_date)?;
-        cursor.write_u16(self.lst_acc_date)?;
-        cursor.write_u16(self.fst_clus_hi)?;
-        cursor.write_u16(self.wrt_time)?;
-        cursor.write_u16(self.wrt_date)?;
-        cursor.write_u16(self.fst_clus_lo)?;
-        cursor.write_u32(self.file_size)?;
-
-        // 把修改后的长目录项刷入磁盘
-        write_exact_at(
-            &fs.gendisk,
-            cursor.as_slice(),
-            usize::try_from(block_start).map_err(|_| SystemError::EOVERFLOW)?,
-        )?;
-
-        Ok(())
+        DirSlotIo::new()?.write(fs, gendisk_bytes_offset, &self.encode())
     }
 
     /// # 把当前短目录项写入磁盘，并建立设备持久化边界
@@ -1725,7 +1769,7 @@ impl ShortDirEntry {
         gendisk_bytes_offset: u64,
     ) -> Result<(), SystemError> {
         self.commit_without_barrier(fs, gendisk_bytes_offset)?;
-        fs.gendisk.sync()
+        fs.storage.sync()
     }
 
     /// @brief 设置短目录项的“第一个簇”字段的值
@@ -2804,7 +2848,7 @@ pub fn get_raw_dir_entry(
     let mut v: Vec<u8> = vec![0; LBA_SIZE];
 
     read_exact_at(
-        &fs.gendisk,
+        &fs.storage,
         &mut v,
         usize::try_from(block_start).map_err(|_| SystemError::EOVERFLOW)?,
     )?;

@@ -23,6 +23,9 @@ use crate::{
     libs::mutex::MutexGuard,
 };
 
+mod geometry;
+pub use geometry::BlockDeviceIoLimits;
+
 // 该文件定义了 Device 和 BlockDevice 的接口
 // Notice 设备错误码使用 Posix 规定的 int32_t 的错误码表示，而不是自己定义错误enum
 
@@ -260,6 +263,17 @@ pub trait BlockDevice: Device {
 
     /// 获取设备的扇区范围
     fn disk_range(&self) -> GeneralBlockRange;
+
+    /// Queue geometry exposed by generic block-device queries.
+    ///
+    /// As in Linux's initial queue limits, the default makes no claim about
+    /// hardware topology: physical/minimum equal the logical block size and
+    /// no optimal size or alignment offset is specified. Drivers with actual
+    /// topology information override this snapshot instead of ioctl handlers.
+    fn io_limits(&self) -> BlockDeviceIoLimits {
+        let logical = 1u32.checked_shl(self.blk_size_log2().into()).unwrap_or(0);
+        BlockDeviceIoLimits::new(logical)
+    }
 
     /// @brief: 在块设备中，从第lba_id_start个块开始，读取count个块数据，存放到buf中
     ///

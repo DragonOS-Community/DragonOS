@@ -62,6 +62,8 @@ pub mod idmap;
 mod operations;
 mod selftest;
 pub mod writer;
+#[cfg(feature = "mm_selftest")]
+pub(crate) use selftest::run_forced_readonly_debug_selftest;
 pub(crate) use selftest::run_mount_wrapper_cache_debug_selftest;
 
 /// Serializes mount pin admission against multi-mount busy preflight and
@@ -834,6 +836,9 @@ pub struct SuperBlockState {
     /// Bind mounts and mount-namespace copies retain the same owner.
     owner_user_ns: Arc<UserNamespace>,
     flags: RwSem<MountFlags>,
+    /// Backend error protection is terminal for this superblock lifetime.
+    /// Every flags publisher merges this bit while holding writer_gate.
+    forced_readonly: AtomicBool,
     synchronous: AtomicBool,
     writer_gate: Mutex<writer::WriterAdmissionState>,
     writer_wait: WaitQueue,
@@ -1156,6 +1161,7 @@ impl SuperBlockState {
             fsnotify_link_epochs: core::array::from_fn(|_| AtomicUsize::new(0)),
             owner_user_ns,
             flags: RwSem::new(flags),
+            forced_readonly: AtomicBool::new(false),
             synchronous: AtomicBool::new(flags.contains(MountFlags::SYNCHRONOUS)),
             writer_gate: Mutex::new(writer::WriterAdmissionState::default()),
             writer_wait: WaitQueue::default(),
@@ -1694,8 +1700,24 @@ impl SuperBlockState {
         self.set_flags_under_writer_gate(flags);
     }
 
+    /// Publish a backend's terminal read-only state without waiting for the
+    /// writer reporting the error. Backend I/O must be stopped separately;
+    /// this prevents new VFS writers and late remount commits clearing RDONLY.
+    pub(crate) fn force_readonly(&self) {
+        {
+            let _gate = self.writer_gate.lock();
+            self.forced_readonly.store(true, Ordering::Relaxed);
+            let flags = self.flags();
+            self.set_flags_under_writer_gate(flags | MountFlags::RDONLY);
+        }
+        self.writer_wait.wake_all();
+    }
+
     fn set_flags_under_writer_gate(&self, flags: MountFlags) {
-        let flags = flags & MountFlags::SB_SETTABLE_MASK;
+        let mut flags = flags & MountFlags::SB_SETTABLE_MASK;
+        if self.forced_readonly.load(Ordering::Relaxed) {
+            flags |= MountFlags::RDONLY;
+        }
         let mut current = self.flags.write();
         *current = flags;
         self.synchronous

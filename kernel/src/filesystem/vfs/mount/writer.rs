@@ -209,6 +209,9 @@ impl SuperBlockState {
         force: bool,
     ) -> Result<Option<SuperBlockReadonlyTransition>, SystemError> {
         let mut gate = self.writer_gate.lock();
+        if !readonly && self.forced_readonly.load(Ordering::Relaxed) {
+            return Err(SystemError::EROFS);
+        }
         if self.flags().contains(MountFlags::RDONLY) == readonly {
             return Ok(None);
         }

@@ -5,6 +5,9 @@ normal/capability
 normal/close_range_semantics
 normal/fdatasync
 normal/loop_semantics
+normal/loop_lifecycle_io
+normal/loop_legacy_status
+normal/loop_backing_io
 normal/getrandom_bit_distribution
 normal/ext4_xattr
 normal/ext4_inode_identity

@@ -2103,6 +2103,50 @@ impl FATFsInfo {
 }
 
 impl LockedFATInode {
+    /// Shared legacy blockdev DIO admission for original user iterators and
+    /// kernel CPU slices. EOF precedes whole-iterator alignment checks.
+    fn direct_read_length(
+        &self,
+        offset: usize,
+        len: usize,
+        iterator_alignment: usize,
+    ) -> Result<usize, SystemError> {
+        if len == 0 {
+            return Ok(0);
+        }
+        let (size, alignment) = {
+            let _size = self.1.read();
+            let cache = self.0.lock().page_cache.clone();
+            if let Some(cache) = cache {
+                let end = offset.checked_add(len).ok_or(SystemError::EOVERFLOW)?;
+                cache.manager().writeback_range(
+                    offset >> MMArch::PAGE_SHIFT,
+                    (end - 1) >> MMArch::PAGE_SHIFT,
+                )?;
+            }
+            let guard = self.0.lock();
+            let fs = guard.fs.upgrade().ok_or(SystemError::EIO)?;
+            let size = match &guard.inode_type {
+                FATDirEntry::File(file) | FATDirEntry::VolId(file) => file.size(),
+                FATDirEntry::Dir(_) => return Err(SystemError::EISDIR),
+                FATDirEntry::UnInit => return Err(SystemError::EROFS),
+            };
+            (
+                usize::try_from(size).map_err(|_| SystemError::EOVERFLOW)?,
+                1usize << fs.storage.block_size_log2(),
+            )
+        };
+        // Legacy blockdev_direct_IO checks EOF before its whole-iterator OR
+        // alignment; unlike iomap, empty vector addresses do not contribute.
+        if offset >= size {
+            return Ok(0);
+        }
+        if (offset | iterator_alignment) & (alignment - 1) != 0 {
+            return Err(SystemError::EINVAL);
+        }
+        Ok(len.min(size - offset))
+    }
+
     fn try_read_pagecache(
         &self,
         offset: usize,
@@ -2405,6 +2449,27 @@ impl IndexNode for LockedFATInode {
         self.try_write_pagecache(offset, &buf[0..len])
     }
 
+    fn read_at_with_io_intent(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &mut [u8],
+        data: MutexGuard<FilePrivateData>,
+        intent: crate::filesystem::vfs::ReadIoIntent,
+    ) -> Result<usize, MemoryAllocationError> {
+        if intent != crate::filesystem::vfs::ReadIoIntent::Direct {
+            return self.read_at(offset, len, buf, data);
+        }
+        drop(data);
+        let len = len.min(buf.len());
+        let len = self.direct_read_length(offset, len, len)?;
+        if len == 0 {
+            return Ok(0);
+        }
+        let _size = self.1.read();
+        self.read_sync(offset, &mut buf[..len]).map_err(Into::into)
+    }
+
     fn read_user_with_io_intent(
         &self,
         offset: usize,
@@ -2421,37 +2486,7 @@ impl IndexNode for LockedFATInode {
         if len == 0 {
             return Ok(Some(0));
         }
-        let (size, alignment) = {
-            let _size = self.1.read();
-            let cache = self.0.lock().page_cache.clone();
-            if let Some(cache) = cache {
-                let end = offset.checked_add(len).ok_or(SystemError::EOVERFLOW)?;
-                cache.manager().writeback_range(
-                    offset >> MMArch::PAGE_SHIFT,
-                    (end - 1) >> MMArch::PAGE_SHIFT,
-                )?;
-            }
-            let guard = self.0.lock();
-            let fs = guard.fs.upgrade().ok_or(SystemError::EIO)?;
-            let size = match &guard.inode_type {
-                FATDirEntry::File(file) | FATDirEntry::VolId(file) => file.size(),
-                FATDirEntry::Dir(_) => return Err(SystemError::EISDIR),
-                FATDirEntry::UnInit => return Err(SystemError::EROFS),
-            };
-            (
-                usize::try_from(size).map_err(|_| SystemError::EOVERFLOW)?,
-                1usize << fs.storage.block_size_log2(),
-            )
-        };
-        // Legacy blockdev_direct_IO checks EOF before its whole-iterator OR
-        // alignment; unlike iomap, empty vector addresses do not contribute.
-        if offset >= size {
-            return Ok(Some(0));
-        }
-        if (offset | writer.alignment(len)) & (alignment - 1) != 0 {
-            return Err(SystemError::EINVAL);
-        }
-        let len = len.min(size - offset);
+        let len = self.direct_read_length(offset, len, writer.alignment(len))?;
         let mut scratch = crate::filesystem::vfs::read_buffer::ReadScratch::default();
         let mut total = 0;
         while total < len {

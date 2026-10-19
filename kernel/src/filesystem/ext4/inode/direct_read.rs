@@ -15,6 +15,22 @@ struct ReadBatch {
     checked_mapping: bool,
 }
 
+/// Alignment of the original destination iterator, independent of the batch
+/// scratch. Kernel callers supply CPU memory, with no user/DMA address mask.
+enum ReadDestination<'a, 'b> {
+    User(&'a UserBuffer<'b>),
+    Kernel,
+}
+
+impl ReadDestination<'_, '_> {
+    fn is_aligned_at(&self, offset: usize, len: usize, mask: usize) -> bool {
+        match self {
+            Self::User(writer) => writer.is_aligned_at(offset, len, mask, mask),
+            Self::Kernel => len & mask == 0,
+        }
+    }
+}
+
 impl LockedExt4Inode {
     pub(super) fn read_direct_user(
         &self,
@@ -49,7 +65,7 @@ impl LockedExt4Inode {
                     position,
                     len - total,
                     total,
-                    writer,
+                    ReadDestination::User(writer),
                     buffer,
                     initial_size,
                     checked_mapping,
@@ -74,13 +90,57 @@ impl LockedExt4Inode {
         Ok(total.min(initial_size - offset))
     }
 
+    /// Native kernel direct I/O uses the same mapped/hole admission as user
+    /// reads, filling the caller's CPU slice without another scratch buffer.
+    pub(super) fn read_direct_kernel(
+        &self,
+        offset: usize,
+        len: usize,
+        buffer: &mut [u8],
+    ) -> Result<usize, MemoryAllocationError> {
+        let len = len.min(buffer.len());
+        if len == 0 {
+            return Ok(0);
+        }
+        let initial_size = {
+            let _operation = self.begin_operation()?;
+            let _size = self.size_lock.read();
+            self.inner.lock().cached_file_size.ok_or(SystemError::EIO)? as usize
+        };
+        if offset >= initial_size {
+            return Ok(0);
+        }
+        let mut total = 0;
+        let mut checked_mapping = false;
+        while total < len {
+            let position = offset.checked_add(total).ok_or(SystemError::EOVERFLOW)?;
+            let block_offset = position % another_ext4::BLOCK_SIZE;
+            let want = (vfs::read_buffer::MAX_CHUNK - block_offset).min(len - total);
+            let batch = self.prepare_direct_read_batch(
+                position,
+                len - total,
+                total,
+                ReadDestination::Kernel,
+                &mut buffer[total..total + want],
+                initial_size,
+                checked_mapping,
+            )?;
+            if batch.count == 0 {
+                return Err(SystemError::EIO.into());
+            }
+            checked_mapping |= batch.checked_mapping;
+            total += batch.count;
+        }
+        Ok(total.min(initial_size - offset))
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn prepare_direct_read_batch(
         &self,
         position: usize,
         remaining: usize,
         output_offset: usize,
-        writer: &UserBuffer<'_>,
+        destination: ReadDestination<'_, '_>,
         buffer: &mut [u8],
         initial_size: usize,
         checked_mapping: bool,
@@ -139,7 +199,7 @@ impl LockedExt4Inode {
                 // no separate DMA mask. Keep the two iterator masks explicit.
                 if (position | mapped_len) & mask != 0
                     || (!checked_mapping
-                        && !writer.is_aligned_at(output_offset, remaining, mask, mask))
+                        && !destination.is_aligned_at(output_offset, remaining, mask))
                 {
                     return Err(SystemError::EINVAL.into());
                 }

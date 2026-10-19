@@ -8,7 +8,10 @@ use unified_init::macros::unified_init;
 use crate::{
     driver::base::{
         block::gendisk::GenDisk,
-        device::{device_number::Major, DevName},
+        device::{
+            device_number::{DeviceNumber, Major},
+            DevName,
+        },
         kobject::KObject,
     },
     filesystem::{
@@ -62,6 +65,22 @@ impl BlockDevManager {
 
     fn inner(&self) -> MutexGuard<'_, InnerBlockDevManager> {
         self.inner.lock()
+    }
+
+    /// Retain a published disk by its native device number. The returned
+    /// disk may be queried only after the registry and metadata locks drop:
+    /// its backend can itself depend on another registered block device.
+    pub fn lookup_gendisk_by_device_number(&self, number: DeviceNumber) -> Option<Arc<GenDisk>> {
+        let inner = self.inner();
+        for device in inner.disks.values() {
+            let metadata = device.blkdev_meta().inner();
+            for disk in metadata.gendisks.values() {
+                if disk.device_num() == number {
+                    return Some(disk.clone());
+                }
+            }
+        }
+        None
     }
 
     /// 注册磁盘设备

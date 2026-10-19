@@ -41,6 +41,18 @@ struct LoopInfo64 {
     uint64_t init[2];
 };
 
+void ExpectUnbound(int fd) {
+    unsigned char sector[512] = {};
+    EXPECT_EQ(0, pread(fd, sector, sizeof(sector), 0));
+    uint64_t capacity = UINT64_MAX;
+    EXPECT_EQ(0, ioctl(fd, BLKGETSIZE64, &capacity));
+    EXPECT_EQ(0U, capacity);
+    LoopInfo64 status {};
+    errno = 0;
+    EXPECT_EQ(-1, ioctl(fd, kLoopGetStatus64, &status));
+    EXPECT_EQ(ENXIO, errno);
+}
+
 class LoopDevice {
 public:
     ~LoopDevice() {
@@ -171,10 +183,7 @@ TEST(LoopSemantics, ZeroCapacityDeviceRegistersBeforeBackingIsAttached) {
         return;
     }
 
-    unsigned char sector[512] = {};
-    errno = 0;
-    EXPECT_EQ(pread(loop_fd, sector, sizeof(sector), 0), -1);
-    EXPECT_EQ(errno, ENODEV);
+    ExpectUnbound(loop_fd);
 
     EXPECT_EQ(close(loop_fd), 0) << strerror(errno);
     EXPECT_EQ(ioctl(control_fd, kLoopCtlRemove, minor), 0) << strerror(errno);
@@ -263,9 +272,7 @@ TEST(LoopSemantics, BusyClearDefersUntilLastOpener) {
 
     int probe_fd = open(device.loop_path().c_str(), O_RDWR);
     ASSERT_GE(probe_fd, 0) << strerror(errno);
-    errno = 0;
-    EXPECT_EQ(pread(probe_fd, block, sizeof(block), 0), -1);
-    EXPECT_EQ(errno, ENODEV);
+    ExpectUnbound(probe_fd);
     ASSERT_EQ(close(probe_fd), 0) << strerror(errno);
 
     ASSERT_NO_FATAL_FAILURE(device.RemoveLoop());

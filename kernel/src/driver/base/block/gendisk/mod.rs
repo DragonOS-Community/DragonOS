@@ -251,6 +251,29 @@ impl GenDisk {
         format!("{}:{}", major, minor)
     }
 
+    fn byte_capacity(&self) -> Result<usize, SystemError> {
+        self.range()
+            .len()
+            .checked_mul(LBA_SIZE)
+            .ok_or(SystemError::EOVERFLOW)
+    }
+
+    /// Block direct I/O clips against this node before checking alignment.
+    /// Kernel callers supply CPU slices; user address admission stays at the
+    /// original iterator entry below.
+    fn direct_read_length(&self, offset: usize, len: usize) -> Result<usize, SystemError> {
+        let capacity = self.byte_capacity()?;
+        if offset >= capacity || len == 0 {
+            return Ok(0);
+        }
+        let len = len.min(capacity - offset);
+        let mask = (1usize << self.block_size_log2) - 1;
+        if (offset | len) & mask != 0 {
+            return Err(SystemError::EINVAL);
+        }
+        Ok(len)
+    }
+
     pub fn block_size_log2(&self) -> u8 {
         self.block_size_log2
     }
@@ -271,6 +294,11 @@ impl IndexNode for GenDisk {
     > {
         if len == 0 {
             return Ok(crate::filesystem::vfs::PrimaryWriteResult::new(0));
+        }
+        // Capacity admission precedes direct alignment and protected payload
+        // copying, including an unbound zero-capacity whole-disk node.
+        if offset >= self.byte_capacity()? {
+            return Err(SystemError::ENOSPC.into());
         }
         intent
             .io
@@ -305,6 +333,11 @@ impl IndexNode for GenDisk {
     ) -> Result<DelegatedWriteResult, crate::mm::allocation::MemoryAllocationError> {
         if len == 0 {
             return Ok(DelegatedWriteResult::new(0, Ok(())));
+        }
+        // Capacity admission precedes direct alignment and protected payload
+        // copying, including an unbound zero-capacity whole-disk node.
+        if offset >= self.byte_capacity()? {
+            return Err(SystemError::ENOSPC.into());
         }
         intent
             .io
@@ -380,22 +413,14 @@ impl IndexNode for GenDisk {
             return self.read_user_at(offset, len, writer, data);
         }
         drop(data);
-        let capacity = self
-            .range()
-            .len()
-            .checked_mul(LBA_SIZE)
-            .ok_or(SystemError::EOVERFLOW)?;
-        if offset >= capacity {
-            return Ok(Some(0));
-        }
-        let len = len.min(writer.len()).min(capacity - offset);
+        let len = self.direct_read_length(offset, len.min(writer.len()))?;
         if len == 0 {
             return Ok(Some(0));
         }
         let mask = (1usize << self.block_size_log2) - 1;
         // Current block devices expose sector alignment, not a separate DMA
         // alignment property. Keep address/length mask responsibilities clear.
-        if offset & mask != 0 || !writer.is_aligned_at(0, len, mask, mask) {
+        if !writer.is_aligned_at(0, len, mask, mask) {
             return Err(SystemError::EINVAL);
         }
         let mut scratch = crate::filesystem::vfs::read_buffer::ReadScratch::default();
@@ -432,6 +457,27 @@ impl IndexNode for GenDisk {
         Ok(Some(total))
     }
 
+    fn read_at_with_io_intent(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &mut [u8],
+        data: MutexGuard<FilePrivateData>,
+        intent: crate::filesystem::vfs::ReadIoIntent,
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        if intent != crate::filesystem::vfs::ReadIoIntent::Direct {
+            return IndexNode::read_at(self, offset, len, buf, data);
+        }
+        if len > buf.len() {
+            return Err(SystemError::ENOBUFS.into());
+        }
+        let len = self.direct_read_length(offset, len)?;
+        if len == 0 {
+            return Ok(0);
+        }
+        IndexNode::read_at(self, offset, len, buf, data)
+    }
+
     fn read_at(
         &self,
         offset: usize,
@@ -444,6 +490,9 @@ impl IndexNode for GenDisk {
         }
         if len > buf.len() {
             return Err(SystemError::ENOBUFS.into());
+        }
+        if offset >= self.byte_capacity()? {
+            return Ok(0);
         }
         let disk_offset = self
             .disk_blkid_2_bytes(self.range().lba_start)

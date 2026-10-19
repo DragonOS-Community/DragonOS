@@ -5429,6 +5429,45 @@ pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, S
         cache.manager.resize(0)?;
     }
 
+    // Clearing detached media must discard the old errno without reusing an
+    // epoch retained by a still-open File. A second OFD can acknowledge the
+    // new error before the original OFD checks its cursor.
+    let media_cache = PageCache::new_unowned(None, None);
+    let mut original_media_cursor = media_cache.sample_writeback_error();
+    media_cache.record_writeback_error(SystemError::EIO);
+    if media_cache.check_and_advance_writeback_error(&mut original_media_cursor)
+        != Some(SystemError::EIO)
+    {
+        return Ok("status=fail stage=media_error_initial_cursor\n".into());
+    }
+    for _ in 0..4 {
+        media_cache.reset_writeback_error();
+        if media_cache
+            .check_writeback_error_since(original_media_cursor)
+            .is_some()
+        {
+            return Ok("status=fail stage=media_error_detach_reset\n".into());
+        }
+        let mut later_media_cursor = media_cache.sample_writeback_error();
+        if media_cache
+            .check_and_advance_writeback_error(&mut later_media_cursor)
+            .is_some()
+        {
+            return Ok("status=fail stage=media_error_clean_epoch\n".into());
+        }
+        media_cache.record_writeback_error(SystemError::EIO);
+        if media_cache.check_and_advance_writeback_error(&mut later_media_cursor)
+            != Some(SystemError::EIO)
+            || media_cache.check_and_advance_writeback_error(&mut original_media_cursor)
+                != Some(SystemError::EIO)
+            || media_cache
+                .check_and_advance_writeback_error(&mut original_media_cursor)
+                .is_some()
+        {
+            return Ok("status=fail stage=media_error_live_cursor_aba\n".into());
+        }
+    }
+
     // A backend's synchronous failure is a Completed(Failed) outcome, not
     // an Err from dispatch. Laundering must report it and stop after one
     // bounded pass even when a resource failure keeps the page dirty.

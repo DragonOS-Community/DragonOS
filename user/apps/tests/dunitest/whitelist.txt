@@ -11,6 +11,7 @@ normal/loop_backing_io
 normal/loop_admission
 normal/loop_partscan
 normal/loop_block_cache
+normal/block_ext4_cache
 normal/getrandom_bit_distribution
 normal/ext4_xattr
 normal/ext4_inode_identity

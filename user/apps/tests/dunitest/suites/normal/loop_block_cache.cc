@@ -421,6 +421,35 @@ TEST_F(LoopBlockDirectCache, NestedSyncBackingAndAsyncInnerWritebackComplete) {
     EXPECT_EQ(0, WEXITSTATUS(status));
 }
 
+// Linux currently also loses this error when invalidate_disk resets wb_err to
+// zero. Keep DragonOS's live OFD cursors distinct across detached media.
+TEST_F(LoopBlockDirectCache, RebindErrorRemainsVisibleAfterAnotherDescriptionConsumesIt) {
+    ASSERT_NO_FATAL_FAILURE(RequireDirectBacking());
+    ASSERT_NO_FATAL_FAILURE(SetOffset(513));
+    std::vector<char> bytes(page_, 'x');
+    ASSERT_EQ(static_cast<ssize_t>(page_), pwrite(loop_, bytes.data(), page_, 0));
+    errno = 0;
+    ASSERT_EQ(-1, fsync(loop_));
+    ASSERT_EQ(EIO, errno);
+    ASSERT_NO_FATAL_FAILURE(ClearAndWait());
+    ASSERT_EQ(0, ioctl(loop_, LOOP_SET_FD, backing_));
+    bound_ = true;
+    ASSERT_NO_FATAL_FAILURE(SetOffset(513));
+    CacheFd second {open(loop_path_.c_str(), O_RDWR | O_CLOEXEC)};
+    ASSERT_GE(second.value, 0);
+    bytes.assign(page_, 'y');
+    ASSERT_EQ(static_cast<ssize_t>(page_), pwrite(loop_, bytes.data(), page_, 0));
+    errno = 0;
+    ASSERT_EQ(-1, fsync(second.value));
+    ASSERT_EQ(EIO, errno);
+    // A different description's SEEN bit must not turn this generation into
+    // the same value consumed by the original description before detach.
+    errno = 0;
+    EXPECT_EQ(-1, fsync(loop_));
+    EXPECT_EQ(EIO, errno);
+    EXPECT_EQ(0, fsync(loop_));
+}
+
 TEST_F(LoopBlockDirectCache, FullCapacitySubpageWriteRetainsOriginalCacheBlockSize) {
     ASSERT_NO_FATAL_FAILURE(RequireDirectBacking());
     loop_info64 status {};

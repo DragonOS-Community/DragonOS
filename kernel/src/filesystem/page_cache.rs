@@ -2636,8 +2636,9 @@ impl PageCache {
         cache
     }
 
-    /// A raw device owner may reset the mapping error only after detaching
-    /// its medium and draining every writeback, like Linux invalidate_disk().
+    /// A raw device owner may retire the mapping error after detaching its
+    /// medium and draining every writeback. Preserve the epoch because open
+    /// file cursors can survive the media change.
     pub(crate) fn reset_writeback_error(&self) {
         self.writeback_error.clear();
     }

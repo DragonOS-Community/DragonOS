@@ -1,11 +1,14 @@
 use crate::{
+    mm::VirtAddr,
     net::{
         posix::SockAddr,
         socket::{
             netlink::addr::NetlinkSocketAddr, unix::UnixEndpoint, vsock::addr::VsockEndpoint,
         },
     },
-    syscall::user_access::{UserBufferReader, UserBufferWriter},
+    syscall::user_access::{
+        copy_to_user_protected, read_one_from_user_protected, write_one_to_user_protected,
+    },
 };
 
 pub use smoltcp::wire::IpEndpoint;
@@ -205,7 +208,7 @@ impl Endpoint {
     /// 内部函数：将 sockaddr 写入用户空间缓冲区
     ///
     /// # 参数
-    /// - `addr`: 用户空间的 sockaddr 缓冲区指针（调用方需保证非空）
+    /// - `addr`: 用户空间的 sockaddr 数值地址；仅在实际复制长度非零时访问
     /// - `max_len`: 用户提供的缓冲区最大长度
     ///
     /// # 返回值
@@ -220,7 +223,6 @@ impl Endpoint {
 
         let to_write = core::cmp::min(len as usize, max_len);
         if to_write > 0 {
-            let mut addr_writer = UserBufferWriter::new(addr as *mut u8, to_write, true)?;
             // 只能写入实际 sockaddr 的前 `to_write` 字节。
             // 注意：不能用 write_one::<SockAddr>()，因为 SockAddr 是 union，
             // 其大小通常大于某些地址族(如 AF_INET 的 sockaddr_in=16)。
@@ -231,9 +233,12 @@ impl Endpoint {
                 )
             };
 
-            addr_writer
-                .buffer_protected(0)?
-                .write_to_user(0, &kernel_bytes[..to_write])?;
+            // SAFETY: the source is a kernel buffer; the numeric user address
+            // is range/permission checked and copied with exception protection.
+            // A mapped address zero must not become a Rust slice/reference.
+            unsafe {
+                copy_to_user_protected(VirtAddr::new(addr as usize), &kernel_bytes[..to_write])?
+            };
         }
 
         Ok(len)
@@ -244,14 +249,14 @@ impl Endpoint {
     /// # 参数
     /// - `addr`: 用户空间的 sockaddr 缓冲区指针
     /// - `addr_len`: 用户空间的长度指针（in/out 参数）
+    ///
+    /// 可选地址输出的调用者必须自行判断是否请求输出。这里始终执行长度协议，
+    /// 即使 `addr` 为零；实际复制长度为零时不访问地址缓冲区。
     pub fn write_to_user(
         &self,
         addr: *mut SockAddr,
         addr_len: *mut u32,
     ) -> Result<(), system_error::SystemError> {
-        if addr.is_null() {
-            return Ok(());
-        }
         write_address_to_user(Some(self), addr, addr_len)
     }
 
@@ -287,11 +292,10 @@ pub(crate) fn write_address_to_user(
     addr: *mut SockAddr,
     addr_len: *mut u32,
 ) -> Result<(), system_error::SystemError> {
-    let user_len = {
-        let reader = UserBufferReader::new(addr_len, core::mem::size_of::<i32>(), true)?;
-        let length = reader.buffer_protected(0)?.read_one::<i32>(0)?;
-        length
-    };
+    let mut user_len = 0i32;
+    // SAFETY: read into a kernel local through the protected numeric-address
+    // API, including when the caller has a valid mapping at address zero.
+    unsafe { read_one_from_user_protected(VirtAddr::new(addr_len as usize), &mut user_len)? };
     if user_len < 0 {
         return Err(system_error::SystemError::EINVAL);
     }
@@ -303,7 +307,8 @@ pub(crate) fn write_address_to_user(
 
     // Do not preflight writability: Linux copies the address before a fault in
     // this final length store. The length may also overlap the address buffer.
-    let mut writer = UserBufferWriter::new(addr_len, core::mem::size_of::<u32>(), true)?;
-    writer.buffer_protected(0)?.write_one::<u32>(0, &len)?;
+    // SAFETY: the value lives in the kernel; the protected API validates and
+    // copies to the numeric user address without forming a user reference.
+    unsafe { write_one_to_user_protected(VirtAddr::new(addr_len as usize), &len)? };
     Ok(())
 }

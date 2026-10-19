@@ -1600,7 +1600,9 @@ pub fn user_accessible_len(addr: VirtAddr, size: usize, check_write: bool) -> us
     //     size,
     //     check_write
     // );
-    if size == 0 || addr.is_null() {
+    // This is a numeric mapping check, not a Rust reference constructor.
+    // Address zero can be mapped by a caller with permission to do so.
+    if size == 0 {
         return 0;
     }
 

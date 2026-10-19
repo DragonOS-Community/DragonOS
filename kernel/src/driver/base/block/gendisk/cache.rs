@@ -373,6 +373,13 @@ impl GenDisk {
             .checked_mul(super::LBA_SIZE)
             .and_then(|start| start.checked_add(offset))
             .ok_or(SystemError::EOVERFLOW)?;
+        // A synchronous raw-block write requests a device flush, even for
+        // O_DSYNC. Loop implements that flush with a full backing-file fsync.
+        let sync = if sync == WriteSyncIntent::None {
+            WriteSyncIntent::None
+        } else {
+            WriteSyncIntent::Full
+        };
         if let Some(loop_device) = BlockDevice::as_any_ref(&*device).downcast_ref::<LoopDevice>() {
             return loop_device.try_write_bytes_operation(physical, len, &bytes[..len], sync);
         }

@@ -4,12 +4,16 @@ mod consts;
 mod print;
 
 use crate::bpf::helper::print::trace_printf;
+use crate::bpf::map::ringbuf::{ringbuf_discard, ringbuf_reserve, ringbuf_submit};
 use crate::bpf::map::{BpfCallBackFn, BpfMap};
 use crate::include::bindings::linux_bpf::BPF_F_CURRENT_CPU;
 use crate::libs::lazy_init::Lazy;
 use crate::smp::core::smp_get_processor_id;
 use crate::syscall::user_access::check_and_clone_cstr;
 use crate::time::Instant;
+use crate::mm::VirtAddr;
+use crate::process::ProcessManager;
+use crate::syscall::user_access::copy_from_user_protected;
 use alloc::collections::BTreeMap;
 use core::ffi::c_void;
 use system_error::SystemError;
@@ -303,6 +307,99 @@ pub fn probe_read_user_str(dst: &mut [u8], src: *const u8) -> Result<usize> {
     Ok(copy_len + 1) // Return length including NULL terminator
 }
 
+/// A helper function that returns the process ID of the current process
+/// (upper 32 bits, the thread group id) and the thread ID of the current
+/// thread (lower 32 bits).
+///
+/// See https://docs.ebpf.io/linux/helper-function/bpf_get_current_pid_tgid/
+unsafe fn raw_get_current_pid_tgid() -> u64 {
+    let pcb = ProcessManager::current_pcb();
+    ((pcb.raw_tgid().data() as u64) << 32) | (pcb.raw_pid().data() as u64)
+}
+
+/// A helper function that returns the real UID (upper 32 bits) and the real
+/// GID (lower 32 bits) of the current task.
+///
+/// See https://docs.ebpf.io/linux/helper-function/bpf_get_current_uid_gid/
+unsafe fn raw_get_current_uid_gid() -> u64 {
+    let cred = ProcessManager::current_pcb().cred();
+    ((cred.uid.data() as u64) << 32) | (cred.gid.data() as u64)
+}
+
+/// Copy the comm attribute of the current task into buf (of size min(size,
+/// TASK_COMM_LEN)), NUL-terminated.
+///
+/// See https://docs.ebpf.io/linux/helper-function/bpf_get_current_comm/
+unsafe fn raw_get_current_comm(buf: *mut c_void, size: u64) -> i64 {
+    if size == 0 {
+        return 0;
+    }
+    let pcb = ProcessManager::current_pcb();
+    let dst = core::slice::from_raw_parts_mut(buf as *mut u8, size as usize);
+    let basic = pcb.basic();
+    let name = basic.name().as_bytes();
+    let copy_len = name.len().min(dst.len() - 1);
+    dst[..copy_len].copy_from_slice(&name[..copy_len]);
+    dst[copy_len] = 0;
+    0
+}
+
+/// Attempt to safely read size bytes from user space address unsafe_ptr and
+/// store the bytes in dst. Unlike `bpf_probe_read`, faults on the user address
+/// are caught (exception-table protected copy) and reported as -EFAULT instead
+/// of crashing the kernel.
+///
+/// See https://docs.ebpf.io/linux/helper-function/bpf_probe_read_user/
+unsafe fn raw_probe_read_user(dst: *mut c_void, size: u32, unsafe_ptr: *const c_void) -> i64 {
+    if size == 0 {
+        return 0;
+    }
+    let dst = core::slice::from_raw_parts_mut(dst as *mut u8, size as usize);
+    let res = copy_from_user_protected(dst, VirtAddr::new(unsafe_ptr as usize));
+    match res {
+        Ok(_) => 0,
+        Err(e) => e as i64,
+    }
+}
+
+/// See https://docs.ebpf.io/linux/helper-function/bpf_ringbuf_reserve/
+unsafe fn raw_ringbuf_reserve(map: *mut c_void, size: u64, flags: u64) -> u64 {
+    let map = unsafe { &*(map as *const BpfMap) };
+    ringbuf_reserve(map, size, flags) as u64
+}
+
+/// See https://docs.ebpf.io/linux/helper-function/bpf_ringbuf_submit/
+unsafe fn raw_ringbuf_submit(data: *mut c_void, flags: u64) -> u64 {
+    ringbuf_submit(data as *mut u8, flags);
+    0
+}
+
+/// See https://docs.ebpf.io/linux/helper-function/bpf_ringbuf_discard/
+unsafe fn raw_ringbuf_discard(data: *mut c_void, flags: u64) -> u64 {
+    ringbuf_discard(data as *mut u8, flags);
+    0
+}
+
+/// See https://docs.ebpf.io/linux/helper-function/bpf_ringbuf_output/
+unsafe fn raw_ringbuf_output(
+    map: *mut c_void,
+    data: *mut c_void,
+    size: u64,
+    _flags: u64,
+) -> u64 {
+    let map = unsafe { &*(map as *const BpfMap) };
+    let dst = ringbuf_reserve(map, size, 0);
+    if dst.is_null() {
+        return u64::MAX; // -EINVAL
+    }
+    let src = unsafe { core::slice::from_raw_parts(data as *const u8, size as usize) };
+    unsafe {
+        core::ptr::copy_nonoverlapping(src.as_ptr(), dst, src.len());
+    }
+    ringbuf_submit(dst, 0);
+    0
+}
+
 pub static BPF_HELPER_FUN_SET: Lazy<BTreeMap<u32, RawBPFHelperFn>> = Lazy::new();
 
 /// Initialize the helper functions.
@@ -341,10 +438,28 @@ pub fn init_helper_functions() {
         map.insert(HELPER_MAP_PEEK_ELEM, define_func!(raw_map_peek_elem));
 
         // User access helpers
+        map.insert(HELPER_PROBE_READ_USER, define_func!(raw_probe_read_user));
         map.insert(
             HELPER_PROBE_READ_USER_STR,
             define_func!(raw_probe_read_user_str),
         );
+
+        // Current task helpers
+        map.insert(
+            HELPER_GET_CURRENT_PID_TGID,
+            define_func!(raw_get_current_pid_tgid),
+        );
+        map.insert(
+            HELPER_GET_CURRENT_UID_GID,
+            define_func!(raw_get_current_uid_gid),
+        );
+        map.insert(HELPER_GET_CURRENT_COMM, define_func!(raw_get_current_comm));
+
+        // Ring buffer helpers
+        map.insert(HELPER_RINGBUF_OUTPUT, define_func!(raw_ringbuf_output));
+        map.insert(HELPER_RINGBUF_RESERVE, define_func!(raw_ringbuf_reserve));
+        map.insert(HELPER_RINGBUF_SUBMIT, define_func!(raw_ringbuf_submit));
+        map.insert(HELPER_RINGBUF_DISCARD, define_func!(raw_ringbuf_discard));
     }
     BPF_HELPER_FUN_SET.init(map);
 }

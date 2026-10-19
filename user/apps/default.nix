@@ -79,6 +79,7 @@ in
   # Simple C utilities
   (static.callPackage ./about { })
   (static.callPackage ./c_unitest { inherit target; })
+  (static.callPackage ./ebpf_smoke { inherit target; })
 
 ]
 ++ lib.optionals (target == "x86_64" && testOpt.syscall.enable) [

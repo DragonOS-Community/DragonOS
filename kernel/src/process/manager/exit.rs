@@ -372,6 +372,14 @@ impl ProcessManager {
             }
         }
 
+        // Linux fires trace_sched_process_exit(tsk) early in do_exit() for
+        // every exiting task; BPF consumers filter main threads themselves.
+        crate::process::trace::trace_sched_process_exit(
+            current_pcb.basic().name().as_bytes(),
+            current_pcb.raw_pid().data() as i32,
+            current_pcb.sched_info().prio(),
+        );
+
         current_pcb.ptrace_event(ptrace::PtraceEvent::Exit, exit_code);
 
         // Exit will not return to the old user context; release ActiveXol's strong

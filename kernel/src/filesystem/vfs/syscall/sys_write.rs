@@ -48,6 +48,12 @@ impl Syscall for SysWriteHandle {
         let file = get_file_by_fd(fd)?;
         file.writeable()?;
 
+        // Numerical user-range admission also applies to count==0. This
+        // checks no mappings and copies no payload: NULL+0 remains valid.
+        if frame.is_from_user() {
+            access_ok(VirtAddr::new(buf_vaddr as usize), len).map_err(|_| SystemError::EFAULT)?;
+        }
+
         // Linux/POSIX: count==0 must not touch the user buffer, but it still must validate
         // the fd and perform the file/socket write semantics.
         // In particular, datagram sockets must deliver a zero-length datagram (gVisor tests).
@@ -60,7 +66,6 @@ impl Syscall for SysWriteHandle {
             // NULL is numerical input too: only the owner may attempt payload
             // copying, after its EPIPE/EAGAIN decisions. No NULL slice is made.
             let address = VirtAddr::new(buf_vaddr as usize);
-            access_ok(address, len).map_err(|_| SystemError::EFAULT)?;
             let input = unsafe { UserBuffer::new(address, len) };
             let count = len.min((i32::MAX as usize) & !(MMArch::PAGE_SIZE - 1));
             file.write_user(count, &input)

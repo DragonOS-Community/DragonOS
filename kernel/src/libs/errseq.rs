@@ -20,6 +20,11 @@ impl ErrSeq {
         }
     }
 
+    /// Reset a detached mapping after all error producers have been drained.
+    pub(crate) fn clear(&self) {
+        self.value.store(0, Ordering::Release);
+    }
+
     pub fn sample(&self) -> ErrSeqValue {
         let old = self.value.load(Ordering::Acquire);
         if old & ERRSEQ_SEEN == 0 {

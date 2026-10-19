@@ -2636,6 +2636,12 @@ impl PageCache {
         cache
     }
 
+    /// A raw device owner may reset the mapping error only after detaching
+    /// its medium and draining every writeback, like Linux invalidate_disk().
+    pub(crate) fn reset_writeback_error(&self) {
+        self.writeback_error.clear();
+    }
+
     pub fn sample_writeback_error(&self) -> ErrSeqValue {
         self.writeback_error.sample()
     }
@@ -2673,6 +2679,12 @@ impl PageCache {
         let inner = self.inner.lock();
         inner.dirty_pages.range(first..=last).next().is_some()
             || inner.writeback_pages.range(first..=last).next().is_some()
+    }
+
+    /// Distinguish completed I/O errors from payload still owned by workers.
+    /// Mapping owners must exclude new admissions while using this result.
+    pub(crate) fn has_writeback_pages(&self) -> bool {
+        !self.inner.lock().writeback_pages.is_empty()
     }
 
     pub fn has_dirty_or_writeback_pages(&self) -> bool {

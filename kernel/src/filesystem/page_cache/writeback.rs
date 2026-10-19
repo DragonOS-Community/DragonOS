@@ -834,6 +834,21 @@ pub trait PageCacheBackend: Send + Sync + core::fmt::Debug + 'static {
     fn write_page(&self, index: usize, buf: &[u8]) -> Result<usize, SystemError>;
     fn npages(&self) -> usize;
 
+    /// Filesystems normally retain failed dirty data for retry. Raw block
+    /// mappings may complete a terminal failed write without resubmitting it,
+    /// while retaining the cached bytes and reporting the error through errseq.
+    fn retry_writeback_error(&self, _error: SystemError) -> bool {
+        true
+    }
+
+    /// A stacked Legacy mapping must claim and submit in the same worker:
+    /// preclaimed payload queued behind an upper I/O could deadlock that I/O.
+    /// Stable-size laundering may take over its still-tagged dirty pages.
+    /// Token backends retain their existing ordered admission protocol.
+    fn writeback_claim_in_worker(&self) -> bool {
+        false
+    }
+
     /// Clip a speculative read window against a stable backend EOF. PageCache
     /// calls this while holding invalidate_read, before it inserts Loading
     /// pages, so a backend whose size writers take invalidate_write can return
@@ -3008,6 +3023,18 @@ impl PageCacheManager {
         Self::wait_writeback_range_bounded(&cache, start_index, end_index)
     }
 
+    fn claims_in_worker(cache: &PageCache) -> Result<bool, SystemError> {
+        let Some(backend) = cache.backend() else {
+            return Ok(false);
+        };
+        let enabled = backend.writeback_claim_in_worker();
+        if enabled && backend.writeback_submission_protocol() != PageCacheWritebackProtocol::Legacy
+        {
+            return Err(SystemError::EIO);
+        }
+        Ok(enabled)
+    }
+
     /// Launder a complete range for best-effort cache invalidation.
     ///
     /// Ordinary range writeback is fail-fast. Invalidation instead mirrors
@@ -3023,14 +3050,43 @@ impl PageCacheManager {
             return Ok(());
         }
         let cache = self.upgrade()?;
+        let claims_in_worker = Self::claims_in_worker(&cache)?;
         let mut first_error = None;
         loop {
             let mut cursor = start_index;
             while cursor <= end_index {
                 let prepared = {
                     let _invalidate = cache.invalidate_read();
+                    // An exclusive mapping owner must not wait for queued
+                    // workers which need its admission gate. Take over tagged
+                    // Legacy work through the normal tag-to-submission handoff.
+                    let tagged = if claims_in_worker {
+                        let inner = cache.inner.lock();
+                        inner
+                            .dirty_pages
+                            .range(cursor..=end_index)
+                            .find_map(|index| {
+                                let entry = inner.pages.get(index)?;
+                                matches!(
+                                    entry.state(),
+                                    PageState::UpToDate | PageState::Dirty | PageState::Error
+                                )
+                                .then(|| (*index, entry.clone(), entry.writeback_tag()))
+                            })
+                            .filter(|(_, _, epoch)| *epoch != 0)
+                    } else {
+                        None
+                    };
                     match Self::claim_next_writeback_batch(
-                        &cache, cursor, end_index, file_size, None, false, None,
+                        &cache,
+                        cursor,
+                        end_index,
+                        file_size,
+                        tagged
+                            .as_ref()
+                            .map(|(index, entry, epoch)| (*index, entry, *epoch)),
+                        false,
+                        None,
                     ) {
                         Ok(WritebackClaimOutcome::Claimed(mut batch)) => {
                             pc_stats::record_invalidation_launder_batch(batch.entries.len());
@@ -3061,11 +3117,22 @@ impl PageCacheManager {
                 };
                 let result = match snapshot_result {
                     Ok(()) => Self::submit_writeback_batch(batch),
-                    Err(error) => Self::complete_writeback_batch(batch, Err(error))
-                        .map(|_| WritebackSubmitOutcome::Completed),
+                    Err(error) => {
+                        // A stable owner may have claimed a tagged raw batch.
+                        // Snapshot failure must retire its submission record as
+                        // well as complete the page/errseq state transition.
+                        Self::finish_submitted_writeback(batch, Err(error.clone()));
+                        Err(error)
+                    }
                 };
-                if let Err(error) = result {
-                    first_error.get_or_insert(error);
+                match result {
+                    Err(error) | Ok(WritebackSubmitOutcome::Failed(error)) => {
+                        first_error.get_or_insert(error);
+                    }
+                    Ok(WritebackSubmitOutcome::Completed | WritebackSubmitOutcome::Submitted) => {}
+                    Ok(WritebackSubmitOutcome::Deferred(_)) => {
+                        unreachable!("stable-size laundering cannot defer a token")
+                    }
                 }
                 if last_index == usize::MAX {
                     break;
@@ -4170,7 +4237,11 @@ impl PageCacheManager {
                         .last()
                         .map(|(index, _, _)| *index)
                         .unwrap_or(target_index);
-                    if batch.submission.is_none() {
+                    if batch.submission.is_none()
+                        && !cache
+                            .backend()
+                            .is_some_and(|backend| backend.writeback_claim_in_worker())
+                    {
                         // A Legacy backend has opted out of the token/defer
                         // protocol, so its write_pages() path cannot return
                         // Deferred. Legacy batches may all be queued, while
@@ -4497,6 +4568,31 @@ impl PageCacheManager {
                     return Err(error);
                 }
             };
+
+            let claims_in_worker = Self::claims_in_worker(&cache).inspect_err(|error| {
+                Self::abandon_tagged_writeback_generation(
+                    &cache,
+                    start_index,
+                    frozen_end,
+                    epoch,
+                    error.clone(),
+                );
+            })?;
+            if claims_in_worker {
+                // No raw Writeback page may depend on payload queued behind
+                // another stacked I/O. Leave the frozen tags Dirty until its
+                // worker can claim and synchronously submit them together.
+                Self::schedule_tagged_writeback_drain_with_permit(
+                    Arc::downgrade(&cache),
+                    Arc::downgrade(&inode),
+                    start_index,
+                    frozen_end,
+                    epoch,
+                    start_index,
+                    None,
+                );
+                return Ok(());
+            }
 
             // `SYNC_FILE_RANGE_WRITE` is an asynchronous writeout starter: it
             // publishes Dirty -> Writeback and queues legacy I/O, but must not
@@ -4862,6 +4958,22 @@ impl PageCacheManager {
             if record_error {
                 cache.record_writeback_error_with_superblock(e.clone());
             }
+            let retry = cache
+                .backend()
+                .is_none_or(|backend| backend.retry_writeback_error(e.clone()));
+            if !retry {
+                // The submitted incarnation is finished. Complete through the
+                // normal redirty check so a concurrent successor is preserved.
+                page.write().add_flags(PageFlags::PG_ERROR);
+                return Self::complete_writeback_entry_state(
+                    cache,
+                    page_index,
+                    entry,
+                    page,
+                    completed_incarnation,
+                    Err(e),
+                );
+            }
             {
                 let mut guard = page.write();
                 guard.add_flags(PageFlags::PG_ERROR | PageFlags::PG_DIRTY);
@@ -4889,6 +5001,24 @@ impl PageCacheManager {
             guard.remove_flags(PageFlags::PG_ERROR);
         }
 
+        Self::complete_writeback_entry_state(
+            cache,
+            page_index,
+            entry,
+            page,
+            completed_incarnation,
+            Ok(()),
+        )
+    }
+
+    fn complete_writeback_entry_state(
+        cache: Arc<PageCache>,
+        page_index: usize,
+        entry: Arc<PageEntry>,
+        page: Arc<Page>,
+        completed_incarnation: u64,
+        result: Result<(), SystemError>,
+    ) -> Result<(), SystemError> {
         let page_dirty = page.read().flags().contains(PageFlags::PG_DIRTY);
         {
             let mut inner = cache.inner.lock();
@@ -4906,7 +5036,7 @@ impl PageCacheManager {
                 entry.wait_queue.wake_all();
                 Self::dispatch_writeback_incarnation_retries(&cache, &entry, completed_incarnation);
                 drop(cache.detach_dirty_retention_if_idle());
-                return Ok(());
+                return result;
             }
             // `mark_page_dirty{,_prepared}()` publishes redirty through
             // `dirty_pages` while holding `inner`.  The PG_DIRTY sample above
@@ -4931,6 +5061,6 @@ impl PageCacheManager {
         entry.wait_queue.wake_all();
         Self::dispatch_writeback_incarnation_retries(&cache, &entry, completed_incarnation);
         drop(cache.detach_dirty_retention_if_idle());
-        Ok(())
+        result
     }
 }

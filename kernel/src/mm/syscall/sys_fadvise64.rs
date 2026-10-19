@@ -1,12 +1,14 @@
 use crate::arch::MMArch;
 use crate::arch::{interrupt::TrapFrame, syscall::nr::SYS_FADVISE64};
-use crate::filesystem::vfs::file::FileMode;
+use crate::filesystem::page_cache::PageCache;
+use crate::filesystem::vfs::file::{File, FileMode};
 use crate::filesystem::vfs::FileType;
 use crate::libs::align::page_align_up;
 use crate::mm::readahead::{force_page_cache_readahead, MAX_READAHEAD};
 use crate::mm::MemoryManagementArch;
 use crate::process::ProcessManager;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
+use alloc::sync::Arc;
 use system_error::SystemError;
 
 use alloc::vec::Vec;
@@ -102,7 +104,7 @@ pub fn do_fadvise(fd: i32, offset: i64, len: i64, advise: i32) -> Result<usize, 
         return Err(SystemError::ESPIPE);
     }
 
-    let advice = PosixFadviseFlag::from_i32(advise)?;
+    PosixFadviseFlag::from_i32(advise)?;
 
     // 根据POSIX规范，len == 0 表示从offset到文件结尾
     if offset < 0 || len < 0 {
@@ -113,6 +115,26 @@ pub fn do_fadvise(fd: i32, offset: i64, len: i64, advise: i32) -> Result<usize, 
     if res != Err(SystemError::ENOSYS) {
         return res;
     };
+
+    generic_fadvise(&file, offset, len, advise, |cache, first, last| {
+        cache.manager().writeback_range(first, last)
+    })
+}
+
+/// Shared advice semantics for mappings whose owner supplies a stronger I/O
+/// admission or stable-size writeback protocol than the generic inode path.
+pub(crate) fn generic_fadvise(
+    file: &Arc<File>,
+    offset: i64,
+    len: i64,
+    advise: i32,
+    sync_range: impl Fn(&PageCache, usize, usize) -> Result<(), SystemError>,
+) -> Result<usize, SystemError> {
+    let advice = PosixFadviseFlag::from_i32(advise)?;
+    if offset < 0 || len < 0 {
+        return Err(SystemError::EINVAL);
+    }
+    let inode = file.inode();
 
     // 后续需要考虑DAX和noop_backing_dev_info
 
@@ -195,9 +217,7 @@ pub fn do_fadvise(fd: i32, offset: i64, len: i64, advise: i32) -> Result<usize, 
 
             if end_index >= start_index {
                 // 先写回脏页
-                page_cache
-                    .manager()
-                    .writeback_range(start_index, end_index)?;
+                sync_range(&page_cache, start_index, end_index)?;
                 // 再驱逐干净页
                 page_cache
                     .manager()

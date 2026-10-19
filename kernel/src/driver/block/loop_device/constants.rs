@@ -63,6 +63,9 @@ bitflags! {
         const READ_ONLY = 1 << 0;
         /// Clear the backing file after the last opener and mount holder leave.
         const AUTOCLEAR = 1 << 2;
+        /// Enable partition scanning. Once enabled, status updates cannot
+        /// clear it; the complete binding teardown clears the flag.
+        const PARTSCAN = 1 << 3;
         /// Effective direct-I/O mode, published by the loop configuration owner.
         const DIRECT_IO = 1 << 4;
     }
@@ -182,6 +185,17 @@ impl Default for LoopStatus64 {
     }
 }
 
+/// Native Linux `struct loop_config`, shared by CONFIGURE and legacy SET_FD.
+/// All initial mapping/status fields are committed with the binding itself.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct LoopConfig {
+    pub fd: u32,
+    pub block_size: u32,
+    pub info: LoopStatus64,
+    pub reserved: [u64; 8],
+}
+
 impl LoopStatus64 {
     /// Native legacy input is normalized before the configuration owner checks
     /// state and parameters. Linux ignores its obsolete crypto fields and
@@ -247,6 +261,10 @@ const _: () = {
         assert!(offset_of!(LoopStatus, lo_init) == 136);
         assert!(offset_of!(LoopStatus, reserved) == 152);
     }
+    assert!(size_of::<LoopConfig>() == 304);
+    assert!(align_of::<LoopConfig>() == 8);
+    assert!(offset_of!(LoopConfig, info) == 8);
+    assert!(offset_of!(LoopConfig, reserved) == 240);
     assert!(size_of::<LoopStatus64>() == 232);
     assert!(align_of::<LoopStatus64>() == 8);
     assert!(offset_of!(LoopStatus64, lo_offset) == 24);

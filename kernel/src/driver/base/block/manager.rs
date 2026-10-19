@@ -16,17 +16,21 @@ use crate::{
     },
     filesystem::{
         devfs::{devfs_register, devfs_unregister},
-        mbr::MbrDiskPartionTable,
         vfs::{utils::DName, IndexNode},
     },
     init::initcall::INITCALL_POSTCORE,
-    libs::mutex::{Mutex, MutexGuard},
+    libs::{
+        mutex::{Mutex, MutexGuard},
+        rwsem::RwSem,
+    },
 };
 
 use super::{
     block_device::{BlockDevice, GeneralBlockRange},
     gendisk::GenDiskMap,
 };
+
+mod partition_table;
 
 static mut BLOCK_DEV_MANAGER: Option<BlockDevManager> = None;
 
@@ -85,6 +89,9 @@ impl BlockDevManager {
 
     /// 注册磁盘设备
     pub fn register(&self, dev: Arc<dyn BlockDevice>) -> Result<(), SystemError> {
+        // A node can be looked up by device number before devfs publication
+        // finishes. Keep its open admission behind the same namespace gate.
+        let _raw_gate = dev.blkdev_meta().raw_cache_gate.write();
         let dev_name = dev.dev_name();
         {
             let inner = self.inner();
@@ -114,6 +121,117 @@ impl BlockDevManager {
         Ok(())
     }
 
+    /// Retain every node across a mapping/namespace transition. The caller
+    /// holds this device's raw_cache_gate exclusively; no metadata lock spans
+    /// allocation, cache writeback, devfs work or backend I/O.
+    pub(crate) fn snapshot_raw_nodes_locked(
+        &self,
+        dev: &dyn BlockDevice,
+    ) -> Result<Vec<Arc<GenDisk>>, SystemError> {
+        let count = dev.blkdev_meta().inner().gendisks.len();
+        let mut nodes = Vec::new();
+        nodes
+            .try_reserve_exact(count)
+            .map_err(|_| SystemError::ENOMEM)?;
+        nodes.extend(dev.blkdev_meta().inner().gendisks.values().cloned());
+        Ok(nodes)
+    }
+
+    /// Drop only partition nodes. A failed devfs removal restores the same
+    /// node identities; neither part0 nor the driver's binding is removed.
+    /// The caller holds raw_cache_gate.write(), including through rollback.
+    pub(crate) fn remove_partitions_locked(
+        &self,
+        dev: &Arc<dyn BlockDevice>,
+    ) -> Result<(), SystemError> {
+        let mut nodes = self.snapshot_raw_nodes_locked(dev.as_ref())?;
+        nodes.retain(|node| node.idx() != GenDisk::ENTIRE_DISK_IDX);
+        if nodes.iter().any(|node| node.has_node_holders()) {
+            return Err(SystemError::EBUSY);
+        }
+        for node in &nodes {
+            node.set_online_locked(false);
+        }
+        for (index, node) in nodes.iter().enumerate() {
+            let name = node.dname()?;
+            if let Err(error) = devfs_unregister(name.as_ref(), node.clone()) {
+                for old in &nodes[..index] {
+                    if let Ok(name) = old.dname() {
+                        if let Err(rollback) = devfs_register(name.as_ref(), old.clone()) {
+                            log::error!(
+                                "Failed to restore partition {}: {:?}",
+                                name.as_ref(),
+                                rollback
+                            );
+                        }
+                    }
+                }
+                for old in &nodes {
+                    old.set_online_locked(true);
+                }
+                return Err(error);
+            }
+        }
+        {
+            let mut metadata = dev.blkdev_meta().inner();
+            for node in &nodes {
+                metadata.gendisks.remove(&node.idx());
+            }
+        }
+        for node in nodes {
+            self.emit_gendisk_uevent(dev, node.dname()?.as_ref(), "remove");
+        }
+        Ok(())
+    }
+
+    /// Runtime partition scan, serialized with mapping changes and partition
+    /// open admission by the caller's exclusive raw_cache_gate.
+    pub(crate) fn scan_partitions_locked(
+        &self,
+        dev: &Arc<dyn BlockDevice>,
+    ) -> Result<(), SystemError> {
+        let nodes = self.snapshot_raw_nodes_locked(dev.as_ref())?;
+        if nodes
+            .iter()
+            .any(|node| node.idx() != GenDisk::ENTIRE_DISK_IDX && node.has_node_holders())
+        {
+            return Err(SystemError::EBUSY);
+        }
+        let mut sync_error = None;
+        for node in &nodes {
+            if let Err(error) = node.sync_raw_cache_locked() {
+                sync_error.get_or_insert(error);
+            }
+        }
+        if nodes
+            .iter()
+            .any(|node| node.has_dirty_raw_cache_locked() || node.has_raw_writeback_locked())
+        {
+            return Err(sync_error.unwrap_or(SystemError::EBUSY));
+        }
+        if let Some(error) = sync_error {
+            // Linux bdev_disk_changed ignores sync_blockdev's terminal error,
+            // after the old requests have completed. Preserve its errseq.
+            log::warn!("Block cache sync before partition scan failed: {:?}", error);
+        }
+        for node in &nodes {
+            node.invalidate_raw_cache_locked()?;
+        }
+        self.remove_partitions_locked(dev)?;
+        let partitions = self.prepare_partition_gendisks(dev)?;
+        for partition in partitions {
+            if let Err(error) = self.publish_gendisk(dev, partition.clone()) {
+                log::warn!(
+                    "Failed to publish partition {} on {}: {:?}",
+                    partition.idx(),
+                    dev.dev_name().name(),
+                    error
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Detect partitions without holding the global block manager lock.
     fn prepare_gendisks(
         &self,
@@ -133,7 +251,7 @@ impl BlockDevManager {
             return Ok(gendisks);
         }
 
-        match self.prepare_gendisks_by_mbr(dev) {
+        match self.prepare_partition_gendisks(dev) {
             Ok(partitions) => gendisks.extend(partitions),
             Err(SystemError::EINVAL | SystemError::EEXIST) => {}
             Err(err) => {
@@ -147,33 +265,19 @@ impl BlockDevManager {
         Ok(gendisks)
     }
 
-    fn prepare_gendisks_by_mbr(
+    fn prepare_partition_gendisks(
         &self,
         dev: &Arc<dyn BlockDevice>,
     ) -> Result<Vec<Arc<GenDisk>>, SystemError> {
-        let mbr = MbrDiskPartionTable::from_disk(dev.clone())?;
-        let mut gendisks = Vec::new();
-        for p in mbr.partitions_raw() {
-            // MBR slots are numbered 1..=4.  Empty slots must not renumber
-            // later partitions (slot 2 is /dev/sda2, not /dev/sda1).
-            let idx = u32::from(p.partno) + 1;
-            let mut range: GeneralBlockRange = p.try_into()?;
-            let disk_range = dev.disk_range();
-            if range.lba_start >= disk_range.lba_end {
-                continue;
-            }
-            // Match Linux partition scanning: keep an in-range prefix rather
-            // than publishing I/O addresses beyond the end of the device.
-            range.lba_end = range.lba_end.min(disk_range.lba_end);
-            if gendisks
-                .iter()
-                .any(|gendisk: &Arc<GenDisk>| gendisk.range().intersects_with(&range).is_some())
-            {
-                return Err(SystemError::EEXIST);
-            }
-            gendisks.push(self.create_gendisk_with_range(dev, range, idx));
+        let descriptors = partition_table::read_partitions(dev.as_ref())?;
+        let mut disks = Vec::new();
+        disks
+            .try_reserve_exact(descriptors.len())
+            .map_err(|_| SystemError::ENOMEM)?;
+        for descriptor in descriptors {
+            disks.push(self.create_gendisk_with_range(dev, descriptor.range, descriptor.index));
         }
-        Ok(gendisks)
+        Ok(disks)
     }
 
     fn create_gendisk_with_range(
@@ -191,7 +295,22 @@ impl BlockDevManager {
         let dev_name = dev.dev_name();
         let (idx, dev_name) = match idx {
             GenDisk::ENTIRE_DISK_IDX => (None, DName::from(dev_name.name())),
-            id => (Some(id), DName::from(format!("{}{}", dev_name.name(), idx))),
+            id => {
+                let separator = if dev_name
+                    .name()
+                    .as_bytes()
+                    .last()
+                    .is_some_and(u8::is_ascii_digit)
+                {
+                    "p"
+                } else {
+                    ""
+                };
+                (
+                    Some(id),
+                    DName::from(format!("{}{}{}", dev_name.name(), separator, idx)),
+                )
+            }
         };
 
         GenDisk::new(weak_dev, range, idx, dev_name)
@@ -233,10 +352,7 @@ impl BlockDevManager {
         let idx = gendisk.idx();
         {
             let mut meta_inner = blk_meta.inner();
-            if meta_inner.gendisks.contains_key(&idx)
-                || (idx != GenDisk::ENTIRE_DISK_IDX
-                    && meta_inner.gendisks.intersects_partition(&gendisk.range()))
-            {
+            if meta_inner.gendisks.contains_key(&idx) {
                 return Err(SystemError::EEXIST);
             }
 
@@ -251,6 +367,7 @@ impl BlockDevManager {
         // 注册到devfs
         let dname = gendisk.dname()?;
         devfs_register(dname.as_ref(), gendisk.clone()).map_err(|e| {
+            gendisk.set_online_locked(false);
             blk_meta.inner().gendisks.remove(&idx);
             log::error!(
                 "Failed to register gendisk {:?} to devfs: {:?}",
@@ -390,75 +507,35 @@ impl BlockDevManager {
     /// - `path`: 分区路径 `/dev/sda1` 或者 `sda1`，或者是`/dev/sda`
     pub fn lookup_gendisk_by_path(&self, path: &str) -> Option<Arc<GenDisk>> {
         let raw = path.strip_prefix("/dev/").unwrap_or(path);
-        let (devname, partno) = self.path2devname(path)?;
         let inner = self.inner();
-
-        // 优先精确匹配整盘设备名，避免把数字结尾设备名（如 pmem0/loop0）误解析为分区号。
         for dev in inner.disks.values() {
-            if dev.dev_name().as_str() == raw {
-                return dev
-                    .blkdev_meta()
-                    .inner()
-                    .gendisks
-                    .get(&GenDisk::ENTIRE_DISK_IDX)
-                    .cloned();
-            }
-        }
-
-        // 精确匹配失败后再回退到传统“尾部数字=分区号”解析。
-        for dev in inner.disks.values() {
-            if dev.dev_name().as_str() == devname {
-                return dev.blkdev_meta().inner().gendisks.get(&partno).cloned();
+            let metadata = dev.blkdev_meta().inner();
+            for node in metadata.gendisks.values() {
+                // GenDisk::dname is an immutable stored-name clone, with no
+                // I/O or secondary lock. Match what was actually published:
+                // loop0p1/nvme0n1p1 and sda1 share no parsing convention.
+                if node.dname().is_ok_and(|name| name.as_ref() == raw) {
+                    return Some(node.clone());
+                }
             }
         }
         None
     }
 
-    /// 打印所有的gendisk的路径
+    /// 打印所有已发布gendisk的真实路径，不重新推导分区命名。
     pub fn print_gendisks(&self) {
         let mut disks = alloc::vec::Vec::new();
-
         let inner = self.inner();
         for dev in inner.disks.values() {
             let meta = dev.blkdev_meta().inner();
-            for idx in meta.gendisks.keys() {
-                if idx == &GenDisk::ENTIRE_DISK_IDX {
-                    disks.push(format!("/dev/{}", dev.dev_name()));
-                } else {
-                    disks.push(format!("/dev/{}{}", dev.dev_name(), idx));
+            for node in meta.gendisks.values() {
+                if let Ok(name) = node.dname() {
+                    disks.push(format!("/dev/{}", name.as_ref()));
                 }
             }
         }
-
+        drop(inner);
         log::debug!("All gendisks: {:?}", disks);
-    }
-
-    /// 将路径转换为设备名以及分区号
-    ///
-    /// 例如: sda1 -> (sda, 1)  nvme0n1p1 -> (nvme0n1, 1)
-    fn path2devname<'a>(&self, mut path: &'a str) -> Option<(&'a str, u32)> {
-        // 去除开头的"/dev/"
-        if path.starts_with("/dev/") {
-            path = path.strip_prefix("/dev/")?;
-        }
-
-        let mut partno = GenDisk::ENTIRE_DISK_IDX;
-        // 截取末尾数字
-        let mut last_digit = path.len();
-        while last_digit > 0 && path.chars().nth(last_digit - 1).unwrap().is_ascii_digit() {
-            last_digit -= 1;
-        }
-        if last_digit == 0 {
-            return (path, GenDisk::ENTIRE_DISK_IDX).into();
-        }
-
-        if last_digit < path.len() {
-            partno = path[last_digit..].parse().ok()?;
-        }
-
-        let path = &path[..last_digit];
-
-        Some((path, partno))
     }
 
     /// 获取对应major下一个可用的minor号
@@ -479,6 +556,10 @@ pub struct BlockDevMeta {
     pub major: Major,
     pub base_minor: u32,
     inner: Mutex<InnerBlockDevMeta>,
+    /// Serialize raw-cache frontends/claims with mapping and partition changes.
+    /// Backend payload never acquires this gate: an exclusive holder may flush
+    /// and wait for already claimed I/O using the still-valid old mapping.
+    pub(crate) raw_cache_gate: RwSem<()>,
 }
 
 pub struct InnerBlockDevMeta {
@@ -492,6 +573,7 @@ impl BlockDevMeta {
             devname,
             major,
             base_minor: block_dev_manager().next_minor(major),
+            raw_cache_gate: RwSem::new(()),
             inner: Mutex::new(InnerBlockDevMeta {
                 gendisks: GenDiskMap::new(),
                 dev_idx: 0, // 默认索引为0

@@ -264,6 +264,13 @@ pub trait BlockDevice: Device {
     /// 获取设备的扇区范围
     fn disk_range(&self) -> GeneralBlockRange;
 
+    /// Current device write protection, shared by whole-disk and partition
+    /// frontends. Drivers with immutable or binding-specific protection expose
+    /// their real state; this is independent of the caller's File access mode.
+    fn is_read_only(&self) -> bool {
+        false
+    }
+
     /// Queue geometry exposed by generic block-device queries.
     ///
     /// As in Linux's initial queue limits, the default makes no claim about

@@ -2,6 +2,7 @@ use core::{
     convert::TryFrom,
     fmt::{Debug, Formatter},
     ops::{Deref, DerefMut},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
 use alloc::{
@@ -25,15 +26,22 @@ use crate::{
         mutex::{Mutex, MutexGuard},
         rwlock::RwLock,
     },
+    mm::MemoryManagementArch,
 };
 
 const MINORS_PER_DISK: u32 = 256;
 
+mod cache;
 mod ioctl;
 
 #[derive(Debug)]
 pub struct GenDisk {
     bdev: Weak<dyn BlockDevice>,
+    self_ref: Weak<GenDisk>,
+    raw_cache: Mutex<Option<Arc<crate::filesystem::page_cache::PageCache>>>,
+    online: AtomicBool,
+    open_holders: AtomicUsize,
+    mount_holders: AtomicUsize,
     range: GeneralBlockRange,
     block_size_log2: u8,
     idx: Option<u32>,
@@ -49,6 +57,7 @@ pub struct GenDisk {
 
 pub struct GenDiskMountGuard {
     bdev: Arc<dyn BlockDevice>,
+    disk: Arc<GenDisk>,
 }
 
 impl Debug for GenDiskMountGuard {
@@ -61,6 +70,11 @@ impl Debug for GenDiskMountGuard {
 
 impl Drop for GenDiskMountGuard {
     fn drop(&mut self) {
+        {
+            let _gate = self.bdev.blkdev_meta().raw_cache_gate.write();
+            let _ = self.disk.sync_raw_cache_locked();
+            self.disk.mount_holders.fetch_sub(1, Ordering::Release);
+        }
         self.bdev.mount_holder_release();
     }
 }
@@ -92,8 +106,13 @@ impl GenDisk {
         // log::info!("New gendisk: major: {}, minor: {}", major, minor);
         let device_num = DeviceNumber::new(major, minor);
 
-        return Arc::new(GenDisk {
+        return Arc::new_cyclic(|weak| GenDisk {
             bdev,
+            self_ref: weak.clone(),
+            raw_cache: Mutex::new(None),
+            online: AtomicBool::new(true),
+            open_holders: AtomicUsize::new(0),
+            mount_holders: AtomicUsize::new(0),
             range,
             block_size_log2: bsizelog2,
             idx,
@@ -114,8 +133,38 @@ impl GenDisk {
 
     pub fn acquire_mount_holder(&self) -> Result<GenDiskMountGuard, SystemError> {
         let bdev = self.block_device()?;
+        let _gate = bdev.blkdev_meta().raw_cache_gate.read();
+        self.check_online()?;
+        let disk = self.self_ref.upgrade().ok_or(SystemError::ENODEV)?;
         bdev.mount_holder_acquire()?;
-        Ok(GenDiskMountGuard { bdev })
+        self.mount_holders.fetch_add(1, Ordering::Release);
+        drop(_gate);
+        Ok(GenDiskMountGuard { bdev, disk })
+    }
+
+    pub(crate) fn has_node_holders(&self) -> bool {
+        self.open_holders.load(Ordering::Acquire) != 0
+            || self.mount_holders.load(Ordering::Acquire) != 0
+    }
+
+    pub(crate) fn set_online_locked(&self, online: bool) {
+        self.online.store(online, Ordering::Release);
+    }
+
+    fn check_online(&self) -> Result<(), SystemError> {
+        if self.online.load(Ordering::Acquire) {
+            Ok(())
+        } else {
+            Err(SystemError::ENXIO)
+        }
+    }
+
+    fn check_writable(&self, device: &dyn BlockDevice) -> Result<(), SystemError> {
+        if device.is_read_only() {
+            Err(SystemError::EPERM)
+        } else {
+            Ok(())
+        }
     }
 
     /// # read_at
@@ -135,10 +184,13 @@ impl GenDisk {
             return Err(SystemError::EINVAL);
         }
 
-        let blocks = buf.len() / (1 << self.block_size_log2 as usize);
-        let lba = self.block_offset_2_disk_blkid(start_block_offset);
-
-        return self.block_device()?.read_at(lba, blocks, buf);
+        let offset = start_block_offset
+            .checked_mul(LBA_SIZE)
+            .ok_or(SystemError::EOVERFLOW)?;
+        // Filesystem adapters can retain upper FS resources across this
+        // legacy boundary. Recovery, as well as the attempt, must stay NOIO.
+        let _noio = crate::cgroup::memory::io::MemoryIoScope::enter_noio();
+        crate::filesystem::vfs::file::File::recover_io(|| self.coherent_read(offset, buf))
     }
 
     /// # read_at_bytes
@@ -150,11 +202,8 @@ impl GenDisk {
     /// - buf: 输出缓冲区
     /// - bytes_offset: 分区内的字节偏移量
     pub fn read_at_bytes(&self, buf: &mut [u8], bytes_offset: usize) -> Result<usize, SystemError> {
-        let start_lba = self.range.lba_start;
-        let bytes_offset = self.disk_blkid_2_bytes(start_lba) + bytes_offset;
-        return self
-            .block_device()?
-            .read_at_bytes(bytes_offset, buf.len(), buf);
+        let _noio = crate::cgroup::memory::io::MemoryIoScope::enter_noio();
+        crate::filesystem::vfs::file::File::recover_io(|| self.coherent_read(bytes_offset, buf))
     }
 
     /// # 分区内的字节偏移量转换为磁盘上的字节偏移量
@@ -172,11 +221,17 @@ impl GenDisk {
     /// - buf: 输入缓冲区
     /// - bytes_offset: 分区内的字节偏移量
     pub fn write_at_bytes(&self, buf: &[u8], bytes_offset: usize) -> Result<usize, SystemError> {
-        let start_lba = self.range.lba_start;
-        let bytes_offset = self.disk_blkid_2_bytes(start_lba) + bytes_offset;
-        return self
-            .block_device()?
-            .write_at_bytes(bytes_offset, buf.len(), buf);
+        let _noio = crate::cgroup::memory::io::MemoryIoScope::enter_noio();
+        let result = crate::filesystem::vfs::file::File::recover_io(|| {
+            self.coherent_write(bytes_offset, buf, WriteSyncIntent::None)
+        })?;
+        // The lower owner has already submitted this prefix and owns exact
+        // sync recovery. Its completion error must never replay the payload.
+        result.sync_result.map_err(|error| match error {
+            crate::mm::allocation::MemoryAllocationError::System(error) => error,
+            crate::mm::allocation::MemoryAllocationError::Charge(_) => SystemError::ENOMEM,
+        })?;
+        Ok(result.written_len)
     }
 
     /// # write_at
@@ -192,9 +247,10 @@ impl GenDisk {
             return Err(SystemError::EINVAL);
         }
 
-        let blocks = buf.len() / (1 << self.block_size_log2 as usize);
-        let lba = self.block_offset_2_disk_blkid(start_block_offset);
-        return self.block_device()?.write_at(lba, blocks, buf);
+        let offset = start_block_offset
+            .checked_mul(LBA_SIZE)
+            .ok_or(SystemError::EOVERFLOW)?;
+        self.write_at_bytes(buf, offset)
     }
 
     #[inline]
@@ -242,7 +298,8 @@ impl GenDisk {
     /// # sync
     /// 同步磁盘
     pub fn sync(&self) -> Result<(), SystemError> {
-        self.block_device()?.sync()
+        let _noio = crate::cgroup::memory::io::MemoryIoScope::enter_noio();
+        crate::filesystem::vfs::file::File::recover_io(|| self.sync_owner_range(0, usize::MAX))
     }
 
     pub fn symlink_name(&self) -> String {
@@ -292,33 +349,19 @@ impl IndexNode for GenDisk {
         crate::filesystem::vfs::PrimaryWriteResult,
         crate::mm::allocation::MemoryAllocationError,
     > {
-        if len == 0 {
-            return Ok(crate::filesystem::vfs::PrimaryWriteResult::new(0));
-        }
-        // Capacity admission precedes direct alignment and protected payload
-        // copying, including an unbound zero-capacity whole-disk node.
-        if offset >= self.byte_capacity()? {
-            return Err(SystemError::ENOSPC.into());
-        }
-        intent
-            .io
-            .check_alignment(offset | len, 1usize << self.block_size_log2)?;
-        stage.complete();
-        source.with_buffer(len, |bytes| {
-            let count = if matches!(
-                intent.io,
-                crate::filesystem::vfs::WriteIoIntent::Direct { .. }
-            ) {
-                bytes.len().min(len) & !((1usize << self.block_size_log2) - 1)
-            } else {
-                bytes.len().min(len)
-            };
-            if count == 0 {
-                return Err(SystemError::EFAULT.into());
-            }
-            IndexNode::write_at(self, offset, count, &bytes[..count], data)
-                .map(crate::filesystem::vfs::PrimaryWriteResult::new)
-        })
+        let result = self.write_primary_with_sync_with_privilege_stage(
+            offset,
+            len,
+            source,
+            intent,
+            WriteSyncIntent::None,
+            data,
+            stage,
+        )?;
+        result.sync_result?;
+        Ok(crate::filesystem::vfs::PrimaryWriteResult::new(
+            result.written_len,
+        ))
     }
 
     fn write_primary_with_sync_with_privilege_stage(
@@ -331,23 +374,26 @@ impl IndexNode for GenDisk {
         data: MutexGuard<FilePrivateData>,
         stage: &mut crate::filesystem::vfs::WritePrivilegeStage<'_>,
     ) -> Result<DelegatedWriteResult, crate::mm::allocation::MemoryAllocationError> {
+        drop(data);
+        self.check_writable(&*self.block_device()?)?;
         if len == 0 {
             return Ok(DelegatedWriteResult::new(0, Ok(())));
         }
-        // Capacity admission precedes direct alignment and protected payload
-        // copying, including an unbound zero-capacity whole-disk node.
-        if offset >= self.byte_capacity()? {
+        let capacity = self.byte_capacity()?;
+        if offset >= capacity {
             return Err(SystemError::ENOSPC.into());
         }
+        let len = len.min(capacity - offset);
         intent
             .io
             .check_alignment(offset | len, 1usize << self.block_size_log2)?;
         stage.complete();
         source.with_buffer(len, |bytes| {
-            let count = if matches!(
+            let direct = matches!(
                 intent.io,
                 crate::filesystem::vfs::WriteIoIntent::Direct { .. }
-            ) {
+            );
+            let count = if direct {
                 bytes.len().min(len) & !((1usize << self.block_size_log2) - 1)
             } else {
                 bytes.len().min(len)
@@ -355,7 +401,10 @@ impl IndexNode for GenDisk {
             if count == 0 {
                 return Err(SystemError::EFAULT.into());
             }
-            self.write_at_with_sync(offset, count, &bytes[..count], sync, data)
+            if direct {
+                return self.coherent_write(offset, &bytes[..count], sync);
+            }
+            self.buffered_write_operation(offset, &bytes[..count], sync)
         })
     }
 
@@ -369,12 +418,15 @@ impl IndexNode for GenDisk {
 
     fn configure_open_file(&self, _data: &FilePrivateData, behavior: &mut OpenFileBehavior) {
         behavior.direct_io = crate::filesystem::vfs::file::DirectIoPolicy::OwnerManaged;
-        if self
-            .block_device()
-            .is_ok_and(|bdev| bdev.uses_delegated_write_sync())
-        {
-            behavior.post_write_sync = PostWriteSyncPolicy::Delegated;
-        }
+        behavior.post_write_sync = PostWriteSyncPolicy::Delegated;
+    }
+
+    fn sync(&self) -> Result<(), SystemError> {
+        GenDisk::sync(self)
+    }
+
+    fn datasync(&self) -> Result<(), SystemError> {
+        GenDisk::sync(self)
     }
 
     fn sync_file(
@@ -382,22 +434,31 @@ impl IndexNode for GenDisk {
         _datasync: bool,
         _data: MutexGuard<FilePrivateData>,
     ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
-        let device = self.block_device()?;
-        if let Some(loop_device) = BlockDevice::as_any_ref(&*device).downcast_ref::<LoopDevice>() {
-            return loop_device.try_sync();
+        self.sync_owner_range(0, usize::MAX)
+    }
+
+    fn sync_file_range(
+        &self,
+        start: usize,
+        end: usize,
+        _datasync: bool,
+        _data: MutexGuard<FilePrivateData>,
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        if start > end {
+            return Ok(());
         }
-        device.sync().map_err(Into::into)
+        self.sync_owner_range(
+            start >> crate::arch::MMArch::PAGE_SHIFT,
+            end >> crate::arch::MMArch::PAGE_SHIFT,
+        )
     }
 
     fn user_read_mode_with_io_intent(
         &self,
         intent: crate::filesystem::vfs::ReadIoIntent,
     ) -> crate::filesystem::vfs::UserReadMode {
-        if intent == crate::filesystem::vfs::ReadIoIntent::Direct {
-            crate::filesystem::vfs::UserReadMode::Iterator
-        } else {
-            self.user_read_mode()
-        }
+        let _ = intent;
+        crate::filesystem::vfs::UserReadMode::Iterator
     }
 
     fn read_user_with_io_intent(
@@ -409,36 +470,53 @@ impl IndexNode for GenDisk {
         intent: crate::filesystem::vfs::ReadIoIntent,
     ) -> Result<Option<usize>, SystemError> {
         use crate::filesystem::vfs::{file::File, ReadIoIntent};
-        if intent != ReadIoIntent::Direct {
-            return self.read_user_at(offset, len, writer, data);
-        }
         drop(data);
-        let len = self.direct_read_length(offset, len.min(writer.len()))?;
+        let direct = intent == ReadIoIntent::Direct;
+        let len = if direct {
+            self.direct_read_length(offset, len.min(writer.len()))?
+        } else {
+            len.min(writer.len())
+                .min(self.byte_capacity()?.saturating_sub(offset))
+        };
         if len == 0 {
             return Ok(Some(0));
         }
         let mask = (1usize << self.block_size_log2) - 1;
         // Current block devices expose sector alignment, not a separate DMA
         // alignment property. Keep address/length mask responsibilities clear.
-        if !writer.is_aligned_at(0, len, mask, mask) {
+        if direct && !writer.is_aligned_at(0, len, mask, mask) {
             return Err(SystemError::EINVAL);
         }
         let mut scratch = crate::filesystem::vfs::read_buffer::ReadScratch::default();
         let mut total = 0;
         while total < len {
-            let want = (len - total).min(crate::filesystem::vfs::read_buffer::MAX_CHUNK);
-            let buffer = scratch.prepare(want)?;
+            let want = if direct {
+                (len - total).min(crate::filesystem::vfs::read_buffer::MAX_CHUNK)
+            } else {
+                (len - total).min(
+                    crate::arch::MMArch::PAGE_SIZE
+                        - ((offset + total) & crate::arch::MMArch::PAGE_OFFSET_MASK),
+                )
+            };
+            let buffer = match scratch.prepare(want) {
+                Ok(buffer) => buffer,
+                Err(_) if total != 0 => return Ok(Some(total)),
+                Err(error) => return Err(error),
+            };
             // Only a not-yet-copied backing attempt participates in typed
             // allocation recovery. Never replay the whole user operation.
-            let read = File::recover_io(|| {
-                IndexNode::read_at(
-                    self,
-                    offset + total,
-                    want,
-                    buffer,
-                    Mutex::new(FilePrivateData::Unused).lock(),
-                )
-            })?;
+            let result = File::recover_io(|| {
+                if direct {
+                    self.coherent_read(offset + total, buffer)
+                } else {
+                    self.buffered_read(offset + total, buffer)
+                }
+            });
+            let read = match result {
+                Ok(read) => read,
+                Err(_) if total != 0 => return Ok(Some(total)),
+                Err(error) => return Err(error),
+            };
             if read == 0 {
                 break;
             }
@@ -475,7 +553,8 @@ impl IndexNode for GenDisk {
         if len == 0 {
             return Ok(0);
         }
-        IndexNode::read_at(self, offset, len, buf, data)
+        drop(data);
+        self.coherent_read(offset, &mut buf[..len])
     }
 
     fn read_at(
@@ -485,26 +564,10 @@ impl IndexNode for GenDisk {
         buf: &mut [u8],
         _data: MutexGuard<crate::filesystem::vfs::FilePrivateData>,
     ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
-        if len == 0 {
-            return Ok(0);
-        }
         if len > buf.len() {
             return Err(SystemError::ENOBUFS.into());
         }
-        if offset >= self.byte_capacity()? {
-            return Ok(0);
-        }
-        let disk_offset = self
-            .disk_blkid_2_bytes(self.range().lba_start)
-            .checked_add(offset)
-            .ok_or(SystemError::EOVERFLOW)?;
-        let device = self.block_device()?;
-        if let Some(loop_device) = BlockDevice::as_any_ref(&*device).downcast_ref::<LoopDevice>() {
-            return loop_device.try_read_bytes_operation(disk_offset, len, &mut buf[..len]);
-        }
-        device
-            .read_at_bytes(disk_offset, len, &mut buf[..len])
-            .map_err(Into::into)
+        self.buffered_read(offset, &mut buf[..len])
     }
 
     fn write_at(
@@ -512,30 +575,12 @@ impl IndexNode for GenDisk {
         offset: usize,
         len: usize,
         buf: &[u8],
-        _data: MutexGuard<crate::filesystem::vfs::FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
-        if len == 0 {
-            return Ok(0);
-        }
         if len > buf.len() {
             return Err(SystemError::E2BIG.into());
         }
-        let disk_offset = self
-            .disk_blkid_2_bytes(self.range().lba_start)
-            .checked_add(offset)
-            .ok_or(SystemError::EOVERFLOW)?;
-        let device = self.block_device()?;
-        if let Some(loop_device) = BlockDevice::as_any_ref(&*device).downcast_ref::<LoopDevice>() {
-            return loop_device
-                .try_write_bytes_operation(disk_offset, len, &buf[..len], WriteSyncIntent::None)
-                .and_then(|result| {
-                    result.sync_result?;
-                    Ok(result.written_len)
-                });
-        }
-        device
-            .write_at_bytes(disk_offset, len, &buf[..len])
-            .map_err(Into::into)
+        self.buffered_write(offset, &buf[..len])
     }
 
     fn write_at_with_sync(
@@ -543,28 +588,37 @@ impl IndexNode for GenDisk {
         offset: usize,
         len: usize,
         buf: &[u8],
-        sync_intent: WriteSyncIntent,
-        _data: MutexGuard<FilePrivateData>,
+        sync: WriteSyncIntent,
+        data: MutexGuard<FilePrivateData>,
     ) -> Result<DelegatedWriteResult, crate::mm::allocation::MemoryAllocationError> {
+        drop(data);
         if len > buf.len() {
             return Err(SystemError::E2BIG.into());
         }
-        let disk_offset = self
-            .disk_blkid_2_bytes(self.range().lba_start)
-            .checked_add(offset)
-            .ok_or(SystemError::EOVERFLOW)?;
+        self.buffered_write_operation(offset, &buf[..len], sync)
+    }
+
+    fn page_cache(&self) -> Option<Arc<crate::filesystem::page_cache::PageCache>> {
+        self.existing_raw_cache()
+    }
+
+    fn fadvise(
+        &self,
+        file: &Arc<crate::filesystem::vfs::file::File>,
+        offset: i64,
+        len: i64,
+        advice: i32,
+    ) -> Result<usize, SystemError> {
         let device = self.block_device()?;
-        if let Some(loop_device) = BlockDevice::as_any_ref(&*device).downcast_ref::<LoopDevice>() {
-            return loop_device.try_write_bytes_operation(
-                disk_offset,
-                len,
-                &buf[..len],
-                sync_intent,
-            );
+        let _noio = crate::cgroup::memory::io::MemoryIoScope::enter_noio();
+        let _gate = device.blkdev_meta().raw_cache_gate.write();
+        self.check_online()?;
+        if advice == 3 && self.byte_capacity()? != 0 {
+            self.raw_cache();
         }
-        device
-            .write_at_bytes_with_sync(disk_offset, len, &buf[..len], sync_intent)
-            .map_err(Into::into)
+        crate::mm::syscall::generic_fadvise(file, offset, len, advice, |_, first, last| {
+            self.sync_raw_cache_range_locked(first, last)
+        })
     }
 
     fn list(&self) -> Result<alloc::vec::Vec<alloc::string::String>, system_error::SystemError> {
@@ -600,17 +654,29 @@ impl IndexNode for GenDisk {
         &self,
         data: MutexGuard<crate::filesystem::vfs::FilePrivateData>,
     ) -> Result<(), SystemError> {
-        self.block_device()?.file_close(data)
+        let device = self.block_device()?;
+        {
+            let _gate = device.blkdev_meta().raw_cache_gate.write();
+            if self.open_holders.load(Ordering::Acquire) == 1 {
+                let _ = self.sync_raw_cache_locked();
+            }
+            self.open_holders.fetch_sub(1, Ordering::Release);
+        }
+        // The last lower release can synchronously autoclear and take write.
+        device.file_close(data)
     }
 
     fn open(
         &self,
-        data: MutexGuard<crate::filesystem::vfs::FilePrivateData>,
+        data: MutexGuard<FilePrivateData>,
         mode: &crate::filesystem::vfs::file::FileFlags,
     ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
-        let result: core::result::Result<_, system_error::SystemError> =
-            (|| self.block_device()?.file_open(data, mode))();
-        result.map_err(Into::into)
+        let device = self.block_device()?;
+        let _gate = device.blkdev_meta().raw_cache_gate.read();
+        self.check_online()?;
+        device.file_open(data, mode)?;
+        self.open_holders.fetch_add(1, Ordering::Release);
+        Ok(())
     }
 
     fn ioctl(
@@ -620,6 +686,20 @@ impl IndexNode for GenDisk {
         private_data: MutexGuard<crate::filesystem::vfs::FilePrivateData>,
     ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
         let bdev = self.block_device()?;
+        if cmd == 0x1261 {
+            // BLKFLSBUF
+            drop(private_data);
+            if !crate::process::cred::capable(crate::process::cred::CAPFlags::CAP_SYS_ADMIN) {
+                return Err(SystemError::EACCES.into());
+            }
+            let _noio = crate::cgroup::memory::io::MemoryIoScope::enter_noio();
+            let _gate = bdev.blkdev_meta().raw_cache_gate.write();
+            self.check_online()?;
+            // Linux ignores sync_blockdev errors, but mapping errseq remains.
+            let _ = self.sync_raw_cache_locked();
+            self.invalidate_raw_cache_locked()?;
+            return Ok(0);
+        }
         if let Some(query) = ioctl::BlockIoctl::from_cmd(cmd) {
             // Generic queries do not use per-open driver state. In particular,
             // retain no such mutex while protected user copying may fault.

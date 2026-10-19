@@ -6,7 +6,11 @@ use system_error::SystemError;
 use crate::{
     cgroup::memory::io::MemoryIoScope,
     driver::base::{
-        block::{block_device::LBA_SIZE, gendisk::GenDisk, manager::block_dev_manager},
+        block::{
+            block_device::{BlockDevice, LBA_SIZE},
+            gendisk::GenDisk,
+            manager::block_dev_manager,
+        },
         device::device_number::DeviceNumber,
     },
     filesystem::vfs::file::File,
@@ -57,10 +61,11 @@ pub(super) fn sync_before_mode_change(file: &Arc<File>) {
 
 impl LoopDevice {
     pub(super) fn set_direct_io(&self, requested: bool) -> Result<(), SystemError> {
+        let _noio = MemoryIoScope::enter_noio();
+        // Raw-cache writeback may itself enter the loop I/O gate. Complete it
+        // before taking that gate exclusive, in the shared owner lock order.
+        let _raw = self.blkdev_meta().raw_cache_gate.write();
         for _ in 0..16 {
-            // Excludes payload I/O, not requests still preparing their scratch
-            // or waiting for this gate. Never drain active pins under it.
-            let gate = self.io_gate.write();
             let (backing, offset, generation, current) = {
                 let inner = self.inner();
                 match inner.state() {
@@ -79,6 +84,12 @@ impl LoopDevice {
             if requested && !enabled {
                 return Err(SystemError::EINVAL);
             }
+            if enabled != current {
+                self.prepare_raw_mapping_change_locked()?;
+            }
+            // Excludes payload, not requests preparing scratch. Never drain
+            // active pins under this gate: those pins may be waiting for it.
+            let gate = self.io_gate.write();
             if enabled != current {
                 // Linux synchronizes the retained backing OFD but deliberately
                 // ignores terminal fsync errors when changing effective mode.

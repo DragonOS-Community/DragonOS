@@ -181,6 +181,7 @@ TEST(PageCacheCompletion, ReadPublicationProgressesWhileGlobalWorkerIsBlocked) {
         ASSERT_NE(std::string::npos, report.find("status=ok ")) << report;
         EXPECT_NE(std::string::npos, report.find("completion_domain=independent\n")) << report;
         EXPECT_NE(std::string::npos, report.find("global_worker_read_completion=ok\n")) << report;
+        EXPECT_NE(std::string::npos, report.find("raw_stacked_writeback=ok\n")) << report;
     }
 }
 

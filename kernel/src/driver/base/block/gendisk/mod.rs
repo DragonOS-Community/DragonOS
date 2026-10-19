@@ -29,6 +29,8 @@ use crate::{
 
 const MINORS_PER_DISK: u32 = 256;
 
+mod ioctl;
+
 #[derive(Debug)]
 pub struct GenDisk {
     bdev: Weak<dyn BlockDevice>,
@@ -569,10 +571,16 @@ impl IndexNode for GenDisk {
         private_data: MutexGuard<crate::filesystem::vfs::FilePrivateData>,
     ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
         let bdev = self.block_device()?;
+        if let Some(query) = ioctl::BlockIoctl::from_cmd(cmd) {
+            // Generic queries do not use per-open driver state. In particular,
+            // retain no such mutex while protected user copying may fault.
+            drop(private_data);
+            return query.execute(self, bdev.as_ref(), data).map_err(Into::into);
+        }
         if let Some(loop_dev) = BlockDevice::as_any_ref(&*bdev).downcast_ref::<LoopDevice>() {
             loop_dev.ioctl(cmd, data, private_data)
         } else {
-            Err(SystemError::ENOSYS.into())
+            Err(SystemError::ENOTTY.into())
         }
     }
 }

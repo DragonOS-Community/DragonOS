@@ -3421,6 +3421,7 @@ bitflags! {
         const FUSE_MAGIC = 0x65735546;
         const TMPFS_MAGIC = 0x01021994;
         const KER_MAGIC = 0x3153464b;
+        const SYSFS_MAGIC = 0x62656572;
         const CGROUP2_SUPER_MAGIC = 0x63677270;
         const PROC_MAGIC = 0x9fa0;
         const RAMFS_MAGIC = 0x858458f6;

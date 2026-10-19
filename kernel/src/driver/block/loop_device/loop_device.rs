@@ -225,14 +225,14 @@ impl LoopDevice {
         offset: usize,
         size_limit: usize,
     ) -> Result<usize, SystemError> {
-        if offset > total_size {
-            return Err(SystemError::EINVAL);
-        }
-        let mut effective = total_size - offset;
+        let mut effective = total_size.saturating_sub(offset);
         if size_limit > 0 {
             effective = effective.min(size_limit);
         }
-        Ok(effective)
+        // The mapping parameters are byte based, but a block device only
+        // publishes complete 512-byte sectors. Use this same capacity for
+        // metadata, generic queries and the retained I/O snapshot.
+        Ok(effective / LBA_SIZE * LBA_SIZE)
     }
 
     fn set_file_locked(inner: &mut LoopDeviceInner, backing_file: Arc<File>, file_size: usize) {
@@ -412,6 +412,7 @@ impl LoopDevice {
             return Err(SystemError::EINVAL);
         }
         let total_size = metadata.size as usize;
+        let file_size = Self::calc_effective_size(total_size, 0, 0)?;
 
         let _topology = LOOP_BACKING_TOPOLOGY_LOCK.lock();
         let _config = self.config_mutex.lock();
@@ -427,7 +428,7 @@ impl LoopDevice {
         }
 
         inner.set_state(LoopState::Bound)?;
-        Self::set_file_locked(&mut inner, backing_file, total_size);
+        Self::set_file_locked(&mut inner, backing_file, file_size);
         inner.flags = if read_only {
             LoopFlags::READ_ONLY
         } else {
@@ -534,14 +535,14 @@ impl LoopDevice {
     }
 
     fn validate_loop_status64_params(info: &LoopStatus64) -> Result<(), SystemError> {
-        if !info.lo_offset.is_multiple_of(LBA_SIZE as u64) {
-            return Err(SystemError::EINVAL);
-        }
-        if info.lo_offset > usize::MAX as u64 || info.lo_sizelimit > usize::MAX as u64 {
-            return Err(SystemError::EINVAL);
-        }
-        if info.lo_sizelimit != 0 && !info.lo_sizelimit.is_multiple_of(LBA_SIZE as u64) {
-            return Err(SystemError::EINVAL);
+        // Linux stores these byte-granular parameters in signed loff_t.
+        // Alignment belongs to the submitted block I/O, not its backing offset.
+        if info.lo_offset > i64::MAX as u64
+            || info.lo_sizelimit > i64::MAX as u64
+            || info.lo_offset > usize::MAX as u64
+            || info.lo_sizelimit > usize::MAX as u64
+        {
+            return Err(SystemError::EOVERFLOW);
         }
         if LoopFlags::from_bits(info.lo_flags).is_none() {
             return Err(SystemError::EINVAL);
@@ -1162,7 +1163,7 @@ impl IndexNode for LoopDevice {
         private_data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
         let result: core::result::Result<_, system_error::SystemError> = (|| {
-            let ioctl_cmd = LoopIoctl::from_u32(cmd).ok_or(SystemError::ENOSYS)?;
+            let ioctl_cmd = LoopIoctl::from_u32(cmd).ok_or(SystemError::EINVAL)?;
             let control_writable = matches!(
                 &*private_data,
                 FilePrivateData::Loop(data) if data.control_writable
@@ -1233,7 +1234,7 @@ impl IndexNode for LoopDevice {
                     self.set_capacity(data)?;
                     Ok(0)
                 }
-                _ => Err(SystemError::ENOSYS),
+                _ => Err(SystemError::EINVAL),
             }
         })();
         result.map_err(Into::into)
@@ -1383,6 +1384,11 @@ impl LoopDevice {
 
         let _io_guard = IoGuard::new(self)?;
         let (backing_file, base_offset, limit_end) = self.io_snapshot(false)?;
+        let capacity = limit_end - base_offset;
+        if offset >= capacity {
+            return Ok(0);
+        }
+        let len = len.min(capacity - offset);
         let file_offset = Self::translate_io_range(base_offset, limit_end, offset, len)?;
         let _noio = crate::cgroup::memory::io::MemoryIoScope::enter_noio();
         let read =
@@ -1414,6 +1420,13 @@ impl LoopDevice {
         // flush, so CLEAR/DELETE cannot release the file between them.
         let _io_guard = IoGuard::new(self)?;
         let (backing_file, base_offset, limit_end) = self.io_snapshot(true)?;
+        let capacity = limit_end - base_offset;
+        if offset >= capacity {
+            return Err(SystemError::ENOSPC.into());
+        }
+        // Submit and synchronize only the published prefix. The hidden
+        // fractional sector must never be modified by a crossing write.
+        let len = len.min(capacity - offset);
         let file_offset = Self::translate_io_range(base_offset, limit_end, offset, len)?;
         let _noio = crate::cgroup::memory::io::MemoryIoScope::enter_noio();
         // Delegate the operation-level intent to the retained File itself.

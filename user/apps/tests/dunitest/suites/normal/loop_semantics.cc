@@ -2,6 +2,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <linux/fs.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -20,6 +21,7 @@ constexpr unsigned long kLoopSetFd = 0x4C00;
 constexpr unsigned long kLoopClrFd = 0x4C01;
 constexpr unsigned long kLoopSetStatus64 = 0x4C04;
 constexpr unsigned long kLoopGetStatus64 = 0x4C05;
+constexpr unsigned long kLoopSetCapacity = 0x4C07;
 constexpr uint32_t kLoopFlagAutoclear = 1U << 2;
 constexpr size_t kBackingSize = 1024 * 1024;
 
@@ -277,10 +279,17 @@ TEST(LoopSemantics, Status64UpdatesAutoclearFlag) {
     ASSERT_EQ(ioctl(device.loop_fd(), kLoopGetStatus64, &status), 0) << strerror(errno);
     EXPECT_EQ(status.flags & kLoopFlagAutoclear, 0U);
 
+    uint64_t capacity = 0;
+    ASSERT_EQ(0, ioctl(device.loop_fd(), BLKGETSIZE64, &capacity)) << strerror(errno);
+    EXPECT_EQ(kBackingSize, capacity);
+
     ASSERT_NO_FATAL_FAILURE(device.GrowBackingFile());
+    ASSERT_EQ(0, ioctl(device.loop_fd(), BLKGETSIZE64, &capacity)) << strerror(errno);
+    EXPECT_EQ(kBackingSize, capacity)
+        << "backing growth changed loop capacity without LOOP_SET_CAPACITY";
     unsigned char block[512] = {};
     errno = 0;
-    EXPECT_EQ(pread(device.loop_fd(), block, sizeof(block), kBackingSize), -1)
+    EXPECT_EQ(pread(device.loop_fd(), block, sizeof(block), kBackingSize), 0)
         << "backing growth changed loop capacity without LOOP_SET_CAPACITY";
 
     status.flags |= kLoopFlagAutoclear;
@@ -288,8 +297,11 @@ TEST(LoopSemantics, Status64UpdatesAutoclearFlag) {
     memset(&status, 0, sizeof(status));
     ASSERT_EQ(ioctl(device.loop_fd(), kLoopGetStatus64, &status), 0) << strerror(errno);
     EXPECT_EQ(status.flags & kLoopFlagAutoclear, kLoopFlagAutoclear);
+    ASSERT_EQ(0, ioctl(device.loop_fd(), BLKGETSIZE64, &capacity)) << strerror(errno);
+    EXPECT_EQ(kBackingSize, capacity)
+        << "flag-only LOOP_SET_STATUS64 unexpectedly refreshed loop capacity";
     errno = 0;
-    EXPECT_EQ(pread(device.loop_fd(), block, sizeof(block), kBackingSize), -1)
+    EXPECT_EQ(pread(device.loop_fd(), block, sizeof(block), kBackingSize), 0)
         << "flag-only LOOP_SET_STATUS64 unexpectedly refreshed loop capacity";
 
     status.flags &= ~kLoopFlagAutoclear;
@@ -297,6 +309,15 @@ TEST(LoopSemantics, Status64UpdatesAutoclearFlag) {
     memset(&status, 0, sizeof(status));
     ASSERT_EQ(ioctl(device.loop_fd(), kLoopGetStatus64, &status), 0) << strerror(errno);
     EXPECT_EQ(status.flags & kLoopFlagAutoclear, 0U);
+    ASSERT_EQ(0, ioctl(device.loop_fd(), BLKGETSIZE64, &capacity)) << strerror(errno);
+    EXPECT_EQ(kBackingSize, capacity);
+
+    ASSERT_EQ(0, ioctl(device.loop_fd(), kLoopSetCapacity, 0)) << strerror(errno);
+    ASSERT_EQ(0, ioctl(device.loop_fd(), BLKGETSIZE64, &capacity)) << strerror(errno);
+    EXPECT_EQ(2 * kBackingSize, capacity);
+    EXPECT_EQ(static_cast<ssize_t>(sizeof(block)),
+              pread(device.loop_fd(), block, sizeof(block), kBackingSize)) << strerror(errno);
+    EXPECT_EQ(0, pread(device.loop_fd(), block, sizeof(block), 2 * kBackingSize));
 }
 
 TEST(LoopSemantics, DeviceNodeRejectsUnprivilegedOpen) {

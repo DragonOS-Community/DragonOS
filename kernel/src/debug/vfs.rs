@@ -12,11 +12,23 @@ use crate::{
 };
 
 #[derive(Debug)]
-struct MountWrapperCacheSelftestCallback;
+enum VfsSelftestCallback {
+    MountWrapperCache,
+    #[cfg(feature = "mm_selftest")]
+    ForcedReadonly,
+}
 
-impl KernFSCallback for MountWrapperCacheSelftestCallback {
+impl KernFSCallback for VfsSelftestCallback {
     fn open(&self, mut data: KernCallbackData) -> Result<(), SystemError> {
-        let report = crate::filesystem::vfs::mount::run_mount_wrapper_cache_debug_selftest()?;
+        let report = match self {
+            Self::MountWrapperCache => {
+                crate::filesystem::vfs::mount::run_mount_wrapper_cache_debug_selftest()?
+            }
+            #[cfg(feature = "mm_selftest")]
+            Self::ForcedReadonly => {
+                crate::filesystem::vfs::mount::run_forced_readonly_debug_selftest()?
+            }
+        };
         data.file_private_data_mut()
             .replace(KernFilePrivateData::DebugTextSnapshot(report));
         Ok(())
@@ -69,7 +81,15 @@ pub fn init_debugfs_vfs() -> Result<(), SystemError> {
         InodeMode::S_IRUSR,
         Some(4096),
         None,
-        Some(&MountWrapperCacheSelftestCallback),
+        Some(&VfsSelftestCallback::MountWrapperCache),
+    )?;
+    #[cfg(feature = "mm_selftest")]
+    vfs.add_file(
+        "forced_readonly_selftest".to_string(),
+        InodeMode::S_IRUSR,
+        Some(4096),
+        None,
+        Some(&VfsSelftestCallback::ForcedReadonly),
     )?;
     Ok(())
 }

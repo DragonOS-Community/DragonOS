@@ -67,7 +67,7 @@ use super::entry::FATFile;
 use super::utils::{to_search_name, to_search_name_string};
 use super::{
     bpb::{BiosParameterBlock, FATType},
-    entry::{FATDir, FATDirEntry, FATDirIter, FATEntry, PublishedDirEntry},
+    entry::{FATDir, FATDirEntry, FATDirIter, FATEntry},
     utils::RESERVED_CLUSTERS,
 };
 
@@ -125,7 +125,7 @@ pub struct FATFileSystem {
     reclaim_worker: Arc<WorkQueue>,
     reclaim_wait: WaitQueue,
     /// 当前文件系统所在的分区
-    pub gendisk: Arc<GenDisk>,
+    pub(super) storage: super::io::FatStorage,
     /// Keeps the device bound until final shutdown completes. The lock also
     /// serializes shutdown with the fallback performed by Drop.
     device_mount_holder: Mutex<Option<GenDiskMountGuard>>,
@@ -398,11 +398,12 @@ impl FATInode {
         self.negative_children.put(search_name, ());
     }
 
-    fn mark_child_absent(&mut self, name: &str) {
-        let search_name = to_search_name(name);
-        self.children.remove(&search_name);
+    fn mark_child_absent(&mut self, name: &str, canonical_name: &str) {
+        let canonical_key = to_search_name(canonical_name);
+        self.children.remove(&canonical_key);
         self.invalidate_negative_children();
-        self.mark_child_negative(search_name);
+        self.mark_child_negative(canonical_key);
+        self.mark_child_negative(to_search_name(name));
     }
 
     fn find(&mut self, name: &str) -> Result<Arc<LockedFATInode>, SystemError> {
@@ -427,7 +428,14 @@ impl FATInode {
                         }
                         Err(e) => return Err(e),
                     };
-                let dname = DName::from(name);
+                // LFN and its short alias select one physical entry and must
+                // share its inode, page cache and directory-slot authority.
+                let canonical_name = fat_entry.name();
+                let canonical_key = to_search_name(&canonical_name);
+                if let Some(inode) = self.children.get(&canonical_key) {
+                    return Ok(inode.clone());
+                }
+                let dname = DName::from(canonical_name);
                 // 创建新的inode
                 let entry_inode: Arc<LockedFATInode> = LockedFATInode::new(
                     dname,
@@ -437,7 +445,8 @@ impl FATInode {
                 )?;
                 // 加入缓存区, 由于FAT文件系统的大小写不敏感问题，因此存入缓存区的key应当是全大写的
                 self.children
-                    .insert(search_name.clone(), entry_inode.clone());
+                    .insert(canonical_key.clone(), entry_inode.clone());
+                self.negative_children.pop(&canonical_key);
                 self.negative_children.pop(&search_name);
                 return Ok(entry_inode);
             }
@@ -578,6 +587,13 @@ impl LockedFATInode {
             return Err(SystemError::EINVAL);
         }
 
+        if new_inode
+            .as_ref()
+            .is_some_and(|inode| Arc::ptr_eq(inode, &old_inode))
+        {
+            return Ok(RenameOutcome::NoOp);
+        }
+
         // 对目标inode上锁，以防更改
         let mut old_inode_guard = old_inode.0.lock();
         let fs = old_inode_guard.fs.upgrade().unwrap();
@@ -591,40 +607,42 @@ impl LockedFATInode {
                 return Err(SystemError::EROFS);
             }
         };
-        // remove entries
-        let old_links = old_inode_guard.metadata.nlinks;
-        let renamed = old_dir.rename(fs, old_name, new_name, new_inode.clone(), || {
-            old_inode_guard.revoke_directory_slot();
-        });
-        // Replacement may have detached the victim before a later directory
-        // update fails. Never leave that dead name in the positive cache.
-        if new_inode
+        // Keep both inode owners stable until the complete disk protocol has
+        // committed. In particular the victim cannot enter reclamation early.
+        let mut victim_guard = new_inode.as_ref().map(|inode| inode.0.lock());
+        let old_key = to_search_name(&old_inode_guard.dname.0);
+        let new_dname = victim_guard
             .as_ref()
-            .is_some_and(|inode| inode.0.lock().metadata.nlinks == 0)
-        {
-            guard.mark_child_absent(new_name);
-        }
-        let PublishedDirEntry { entry, sync_error } = match renamed {
-            Ok(published) => published,
-            Err(error) => {
-                if old_inode_guard.metadata.nlinks == 0 {
-                    guard.mark_child_absent(old_name);
-                }
-                return Err(error);
-            }
-        };
+            .map_or_else(|| DName::from(new_name), |inode| inode.dname.clone());
+        let new_key = to_search_name(&new_dname.0);
+        let entry = old_dir.rename_into(fs.clone(), old_dir, old_name, new_name, false)?;
         old_inode_guard.inode_type = entry;
-        old_inode_guard.metadata.nlinks = old_links;
+        old_inode_guard.dname = new_dname;
+        if let Some(victim) = &mut victim_guard {
+            victim.revoke_directory_slot();
+            new_inode
+                .as_ref()
+                .unwrap()
+                .3
+                .detached
+                .store(true, AtomicOrdering::Release);
+        }
+        drop(victim_guard);
+        if let Some(victim) = &new_inode {
+            victim.schedule_reclaim();
+        }
         let old_inode = guard.children.remove(&old_key).unwrap();
-        // the new_name should refer to old_inode
         guard.invalidate_negative_children();
         guard.mark_child_negative(old_key);
         guard.children.insert(new_key, old_inode);
-        let parent_time = guard.touch_modified();
-        if let Some(error) = sync_error {
-            return Err(error);
+        if had_new && old_inode_guard.metadata.file_type == FileType::Dir {
+            guard.metadata.nlinks = guard.metadata.nlinks.saturating_sub(1);
         }
-        parent_time?;
+        // The namespace has committed. Metadata writeback errors must be
+        // reported through errseq, not turn success into a stale VFS rename.
+        if let Err(error) = guard.touch_modified() {
+            fs.writeback_domain.record_writeback_error(error);
+        }
 
         Ok(RenameOutcome::Moved {
             replaced: had_new.then_some(LinkRemovalOutcome::LastLink),
@@ -692,46 +710,58 @@ impl LockedFATInode {
             }
         };
 
-        let old_links = old_inode_guard.metadata.nlinks;
-        let renamed = old_dir.rename_across(
-            fs,
-            new_dir,
-            old_name,
-            new_name,
-            new_inode.clone().ok_or(SystemError::ENOENT),
-            || old_inode_guard.revoke_directory_slot(),
-        );
+        // A target equal to the already locked old parent contains the
+        // source, hence is nonempty. Do not recursively lock its mutex.
         if new_inode
             .as_ref()
-            .is_some_and(|inode| inode.0.lock().metadata.nlinks == 0)
+            .is_some_and(|inode| core::ptr::eq(self, Arc::as_ptr(inode)))
         {
-            new_guard.mark_child_absent(new_name);
+            return Err(if old_inode_guard.metadata.file_type == FileType::Dir {
+                SystemError::ENOTEMPTY
+            } else {
+                SystemError::EISDIR
+            });
         }
-        let PublishedDirEntry { entry, sync_error } = match renamed {
-            Ok(published) => published,
-            Err(error) => {
-                if old_inode_guard.metadata.nlinks == 0 {
-                    old_guard.mark_child_absent(old_name);
-                }
-                return Err(error);
-            }
-        };
+        let mut victim_guard = new_inode.as_ref().map(|inode| inode.0.lock());
+        let old_key = to_search_name(&old_inode_guard.dname.0);
+        let new_dname = victim_guard
+            .as_ref()
+            .map_or_else(|| DName::from(new_name), |inode| inode.dname.clone());
+        let new_key = to_search_name(&new_dname.0);
+        let entry = old_dir.rename_into(fs.clone(), new_dir, old_name, new_name, true)?;
         old_inode_guard.inode_type = entry;
-        old_inode_guard.metadata.nlinks = old_links;
-        // 将源节点从父目录中删除
-        let old_key = to_search_name(old_name);
-        let new_key = to_search_name(new_name);
+        old_inode_guard.parent = new_guard.self_ref.clone();
+        old_inode_guard.dname = new_dname;
+        if old_inode_guard.metadata.file_type == FileType::Dir {
+            old_guard.metadata.nlinks = old_guard.metadata.nlinks.saturating_sub(1);
+            if new_inode.is_none() {
+                new_guard.metadata.nlinks += 1;
+            }
+        }
+        if let Some(victim) = &mut victim_guard {
+            victim.revoke_directory_slot();
+            new_inode
+                .as_ref()
+                .unwrap()
+                .3
+                .detached
+                .store(true, AtomicOrdering::Release);
+        }
+        drop(victim_guard);
+        if let Some(victim) = &new_inode {
+            victim.schedule_reclaim();
+        }
         let old_inode = old_guard.children.remove(&old_key).unwrap();
         old_guard.invalidate_negative_children();
         old_guard.mark_child_negative(old_key);
         new_guard.invalidate_negative_children();
         new_guard.children.insert(new_key, old_inode);
-        let old_time = old_guard.touch_modified();
-        let new_time = new_guard.touch_modified();
-        if let Some(error) = sync_error {
-            return Err(error);
+        for result in [old_guard.touch_modified(), new_guard.touch_modified()] {
+            if let Err(error) = result {
+                fs.writeback_domain.record_writeback_error(error);
+            }
         }
-        old_time.and(new_time)?;
+
         Ok(RenameOutcome::Moved {
             replaced: new_inode.map(|_| LinkRemovalOutcome::LastLink),
         })
@@ -874,6 +904,13 @@ impl LockedFATInode {
 }
 
 impl FileSystem for FATFileSystem {
+    fn prepare_write(
+        &self,
+    ) -> Result<Vec<crate::filesystem::vfs::mount::writer::MountWriteGuard>, SystemError> {
+        self.storage.check_writable()?;
+        Ok(Vec::new())
+    }
+
     fn on_umount(&self) {
         if let Err(error) = self.shutdown() {
             error!("Umount FAT filesystem failed: errno={error:?}, FS detail:{self:?}");
@@ -901,19 +938,17 @@ impl FileSystem for FATFileSystem {
             let reclaim_result = self.drain_evictions_through(epoch);
             // Commit the hints under their own lock, then release it before
             // the device barrier. Failed writes remain dirty for a retry.
-            let info_result = self.fs_info.0.lock().flush(&self.gendisk);
+            let info_result = self.fs_info.0.lock().flush(&self.storage);
             // A sticky reclamation error must not suppress durability for
             // other files whose writeback has already completed.
-            let sync_result = self.gendisk.sync();
+            let sync_result = self.storage.sync();
             reclaim_result.and(info_result).and(sync_result)?;
         }
         Ok(())
     }
 
     fn supports_reliable_flush(&self) -> bool {
-        self.gendisk
-            .block_device()
-            .is_ok_and(|device| device.supports_reliable_flush())
+        self.storage.supports_reliable_flush()
     }
 
     fn page_cache_writeback_domain(&self) -> Option<&Arc<PageCacheWritebackDomain>> {
@@ -925,7 +960,7 @@ impl FileSystem for FATFileSystem {
 
     fn info(&self) -> crate::filesystem::vfs::FsInfo {
         crate::filesystem::vfs::FsInfo {
-            blk_dev_id: self.gendisk.device_num().data() as usize,
+            blk_dev_id: self.storage.device_num().data() as usize,
             max_name_len: FAT_MAX_NAMELEN as usize,
         }
     }
@@ -1099,7 +1134,7 @@ impl FATFileSystem {
             }
 
             let mut buf = vec![0u8; to_read];
-            self.gendisk
+            self.storage
                 .read_at_bytes(&mut buf, (fat_bytes_offset + cur) as usize)?;
 
             for i in (0..buf.len()).step_by(entry_bytes) {
@@ -1200,7 +1235,7 @@ impl FATFileSystem {
             reclaim_queue: SpinLock::new(FATReclaimQueue::default()),
             reclaim_worker: WorkQueue::try_new_owned("fat_evict")?,
             reclaim_wait: WaitQueue::default(),
-            gendisk,
+            storage: super::io::FatStorage::new(gendisk),
             device_mount_holder: Mutex::new(Some(device_mount_holder)),
             bpb,
             first_data_sector,
@@ -1230,6 +1265,16 @@ impl FATFileSystem {
     #[inline]
     pub fn bytes_per_cluster(&self) -> u64 {
         return (self.bpb.bytes_per_sector as u64) * (self.bpb.sector_per_cluster as u64);
+    }
+
+    /// Undo could not recover the namespace. Quarantine this filesystem's
+    /// writes before publishing the same hard-error state to its canonical SB.
+    pub(super) fn abort_metadata_io(&self, error: SystemError) {
+        self.storage.fail();
+        self.writeback_domain.record_writeback_error(error);
+        if let Some(sb) = self.writeback_domain.bound_superblock() {
+            sb.force_readonly();
+        }
     }
 
     /// 锁定目录项扇区 RMW 串行化互斥量。
@@ -1778,13 +1823,13 @@ impl FATFileSystem {
 
     /// @brief 执行文件系统卸载前的一些准备工作：设置好对应的标志位，并把缓存中的数据刷入磁盘
     pub fn umount(&self) -> Result<(), SystemError> {
-        self.fs_info.0.lock().flush(&self.gendisk)?;
+        self.fs_info.0.lock().flush(&self.storage)?;
 
         self.set_shut_bit_ok()?;
 
         self.set_hard_error_bit_ok()?;
 
-        self.gendisk.sync()?;
+        self.storage.sync()?;
 
         return Ok(());
     }
@@ -1852,7 +1897,7 @@ impl FATFileSystem {
     fn zero_cluster_with_buffer(&self, cluster: Cluster, zeros: &[u8]) -> Result<(), SystemError> {
         debug_assert_eq!(zeros.len(), self.bytes_per_cluster() as usize);
         let offset = self.cluster_bytes_offset(cluster) as usize;
-        super::table::write_exact_at(&self.gendisk, zeros, offset)?;
+        super::table::write_exact_at(&self.storage, zeros, offset)?;
         Ok(())
     }
 }
@@ -1889,7 +1934,9 @@ impl FATFsInfo {
         let mut v = vec![0; bytes_per_sec];
 
         // 读取磁盘上的FsInfo扇区
-        super::table::read_exact_at(gendisk, &mut v, in_gendisk_fs_info_offset)?;
+        if gendisk.read_at(&mut v, in_gendisk_fs_info_offset / LBA_SIZE)? != v.len() {
+            return Err(SystemError::EIO);
+        }
 
         let mut cursor = VecCursor::new(v);
 
@@ -1988,7 +2035,7 @@ impl FATFsInfo {
     /// @brief 把fs info刷入磁盘
     ///
     /// @param partition fs info所在的分区
-    pub fn flush(&mut self, gendisk: &Arc<GenDisk>) -> Result<(), SystemError> {
+    pub(super) fn flush(&mut self, gendisk: &super::io::FatStorage) -> Result<(), SystemError> {
         if !self.dirty {
             return Ok(());
         }
@@ -2174,7 +2221,7 @@ impl IndexNode for LockedFATInode {
                 FATDirEntry::Dir(_) => return Err(SystemError::EISDIR.into()),
                 FATDirEntry::UnInit => return Err(SystemError::EROFS.into()),
             };
-            (size, 1usize << fs.gendisk.block_size_log2())
+            (size, 1usize << fs.storage.block_size_log2())
         };
         // As in fat_direct_IO(), mappings that would need chain expansion
         // fall back for the complete request. Cached EOF is not allocation.
@@ -2291,7 +2338,7 @@ impl IndexNode for LockedFATInode {
             // Do not move this barrier into page writeback: a single file-level
             // sync must cover the related data, FAT chain, and directory entry,
             // and the device flush error must be visible to the caller.
-            fs.gendisk.sync()
+            fs.storage.sync()
         })();
         result.map_err(Into::into)
     }
@@ -2393,7 +2440,7 @@ impl IndexNode for LockedFATInode {
             };
             (
                 usize::try_from(size).map_err(|_| SystemError::EOVERFLOW)?,
-                1usize << fs.gendisk.block_size_log2(),
+                1usize << fs.storage.block_size_log2(),
             )
         };
         // Legacy blockdev_direct_IO checks EOF before its whole-iterator OR
@@ -2575,6 +2622,16 @@ impl IndexNode for LockedFATInode {
 
     fn update_atime(&self, now: PosixTimeSpec, relatime: bool) -> Result<(), SystemError> {
         let mut inode = self.0.lock();
+        if inode
+            .fs
+            .upgrade()
+            .ok_or(SystemError::EIO)?
+            .storage
+            .check_writable()
+            .is_err()
+        {
+            return Ok(());
+        }
         let mut proposed = inode.metadata.clone();
         if crate::filesystem::vfs::update_atime_locked(&mut proposed, now, relatime) {
             inode.apply_metadata(&proposed, SetMetadataMask::ATIME)?;
@@ -2623,7 +2680,7 @@ impl IndexNode for LockedFATInode {
                             drop(guard);
                             let mounted_fs: Arc<dyn FileSystem> = fs.clone();
                             if inode_sync || filesystem_is_synchronous(&mounted_fs) {
-                                fs.gendisk.sync()?;
+                                fs.storage.sync()?;
                             }
                             return Ok(());
                         }
@@ -2709,7 +2766,7 @@ impl IndexNode for LockedFATInode {
         drop(guard);
         let mounted_fs: Arc<dyn FileSystem> = fs.clone();
         if inode_sync || filesystem_is_synchronous(&mounted_fs) {
-            fs.gendisk.sync()?;
+            fs.storage.sync()?;
         }
         Ok(mask)
     }
@@ -2814,7 +2871,8 @@ impl IndexNode for LockedFATInode {
         let target = guard.find(name)?;
         let file_type = target.0.lock().metadata.file_type;
         if file_type == FileType::Pipe {
-            guard.mark_child_absent(name);
+            let canonical_name = target.0.lock().dname.0.clone();
+            guard.mark_child_absent(name, &canonical_name);
             return Ok(LinkRemovalOutcome::LastLink);
         }
         let fs = guard.fs.upgrade().ok_or(SystemError::EIO)?;
@@ -2834,7 +2892,8 @@ impl IndexNode for LockedFATInode {
             }
         };
         if detached {
-            guard.mark_child_absent(name);
+            let canonical_name = target.0.lock().dname.0.clone();
+            guard.mark_child_absent(name, &canonical_name);
             let time = guard.touch_modified();
             removed.and(time)?;
         } else {
@@ -2864,7 +2923,8 @@ impl IndexNode for LockedFATInode {
         };
         if detached {
             guard.metadata.nlinks = guard.metadata.nlinks.saturating_sub(1);
-            guard.mark_child_absent(name);
+            let canonical_name = target.0.lock().dname.0.clone();
+            guard.mark_child_absent(name, &canonical_name);
             let time = guard.touch_modified();
             return removed.and(time).map_err(Into::into);
         }

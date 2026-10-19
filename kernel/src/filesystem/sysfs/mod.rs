@@ -5,7 +5,7 @@ use super::{
     kernfs::{KernFS, KernFSInode, KernFSNamespaceTag},
     vfs::{
         DirectoryEntry, FileSystem, FileSystemMakerData, FsCreationContext, IndexNode, InodeMode,
-        MountableFileSystem, SuperBlock,
+        Magic, MountableFileSystem, SuperBlock,
     },
 };
 use crate::{
@@ -325,7 +325,9 @@ impl FileSystem for SysFS {
     }
 
     fn super_block(&self) -> SuperBlock {
-        self.kernfs.super_block()
+        let mut sb = self.kernfs.super_block();
+        sb.magic = Magic::SYSFS_MAGIC;
+        sb
     }
 }
 

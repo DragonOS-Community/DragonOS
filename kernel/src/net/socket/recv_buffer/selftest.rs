@@ -48,7 +48,7 @@ pub(crate) fn run() -> bool {
     {
         return false;
     }
-    for size in [1, 8192, 8193, 128 * 1024] {
+    for size in [1, 13, 8192, 8193, 64 * 1024, 128 * 1024] {
         if buffer
             .try_prepare_with(size, |size| {
                 if !released(&account) {

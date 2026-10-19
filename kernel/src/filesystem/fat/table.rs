@@ -7,7 +7,8 @@ use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 use system_error::SystemError;
 
-use crate::driver::base::block::{block_device::LBA_SIZE, gendisk::GenDisk};
+use super::io::FatStorage;
+use crate::driver::base::block::block_device::LBA_SIZE;
 
 use super::{
     bpb::{BiosParameterBlock, FATType},
@@ -16,7 +17,7 @@ use super::{
 };
 
 pub(super) fn read_exact_at(
-    disk: &GenDisk,
+    disk: &FatStorage,
     buffer: &mut [u8],
     offset: usize,
 ) -> Result<(), SystemError> {
@@ -32,7 +33,7 @@ pub(super) fn read_exact_at(
 }
 
 pub(super) fn write_exact_at(
-    disk: &GenDisk,
+    disk: &FatStorage,
     buffer: &[u8],
     offset: usize,
 ) -> Result<(), SystemError> {
@@ -134,7 +135,7 @@ impl FatSectorCache {
         // leave their previous key valid while loading directly into a slot.
         self.slots[index].offset = None;
         read_exact_at(
-            &fs.gendisk,
+            &fs.storage,
             &mut self.slots[index].bytes,
             usize::try_from(offset).map_err(|_| SystemError::EOVERFLOW)?,
         )?;
@@ -394,7 +395,7 @@ impl FATFileSystem {
                     }
                 }
                 write_exact_at(
-                    &self.gendisk,
+                    &self.storage,
                     window,
                     usize::try_from(aligned).map_err(|_| SystemError::EOVERFLOW)?,
                 )?;

@@ -29,7 +29,7 @@ jobs:
               - '.github/workflows/makefile.yml'
 
   ext4-fuse-test:
-    name: Ext4 host FUSE xattr regression
+    name: Ext4 host FUSE regression
     env:
       HOME: /root
       CARGO_HOME: /root/.cargo
@@ -59,6 +59,17 @@ jobs:
           cargo build --manifest-path kernel/crates/another_ext4/ext4_fuse/Cargo.toml --locked --release --target-dir bin/ext4-fuse-build
           mkdir -p bin/ext4-fuse-ci
           python3 kernel/crates/another_ext4/ext4_fuse/tests/xattr_flags.py "$PWD/bin/ext4-fuse-build/release/ext4_fuse" "$PWD/bin/ext4-fuse-ci"
+
+      - name: Test snapshot owner and rollback
+        shell: bash -ileo pipefail {0}
+        run: |
+          source /root/.cargo/env
+          cargo test --manifest-path kernel/crates/another_ext4/ext4_fuse/Cargo.toml --locked --target-dir bin/ext4-fuse-build snapshot_tests
+
+      - name: Test snapshot restore through FUSE
+        shell: bash -ileo pipefail {0}
+        run: |
+          python3 kernel/crates/another_ext4/ext4_fuse/tests/snapshot_restore.py "$PWD/bin/ext4-fuse-build/release/ext4_fuse" "$PWD/bin/ext4-snapshot-ci"
 
   sysconfig-payload-test:
     name: Sysconfig payload generator test

@@ -273,3 +273,6 @@ normal/unix_close_record_reset
 normal/socket_receive_interrupt
 normal/socket_receive_admission
 normal/tcp_scalar_receive
+normal/fat_timestamps
+normal/ext4_write_progress
+normal/fat_directory_entries

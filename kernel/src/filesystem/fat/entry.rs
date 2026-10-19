@@ -1518,6 +1518,9 @@ impl LongDirEntry {
 }
 
 impl ShortDirEntry {
+    const CASE_LOWER_BASE: u8 = 0x08;
+    const CASE_LOWER_EXT: u8 = 0x10;
+
     fn encode(&self) -> [u8; 32] {
         let mut bytes = [0; 32];
         bytes[..11].copy_from_slice(&self.name);
@@ -1624,11 +1627,19 @@ impl ShortDirEntry {
         let mut name = [ShortDirEntry::PADDING; 12];
         // 拷贝基础名
         name[..base_len].copy_from_slice(&self.name[..base_len]);
+        // NT case bits affect display only; retain the raw SFN for writes and
+        // the checksum of any associated long-name entries.
+        if self.nt_res & Self::CASE_LOWER_BASE != 0 {
+            name[..base_len].make_ascii_lowercase();
+        }
 
         // 拷贝扩展名，并计算总的长度
         let total_len = if ext_len > 0 {
             name[base_len] = b'.';
             name[base_len + 1..base_len + 1 + ext_len].copy_from_slice(&self.name[8..8 + ext_len]);
+            if self.nt_res & Self::CASE_LOWER_EXT != 0 {
+                name[base_len + 1..base_len + 1 + ext_len].make_ascii_lowercase();
+            }
             // 总长度为基础名长度+点号+扩展名长度
             base_len + 1 + ext_len
         } else {

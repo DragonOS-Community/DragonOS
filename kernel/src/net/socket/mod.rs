@@ -18,13 +18,13 @@ pub mod vsock;
 /// `recvfrom(2)` 源地址输出参数的语义。
 ///
 /// Linux 语义要点：
-/// - 对于面向连接的 stream socket（如 TCP），`recvfrom` 的 addr/addrlen 是可选输出参数，
-///   且通常会被忽略（gVisor 用例要求不要改写用户提供的 sockaddr 缓冲区；若提供了 addrlen，应写回 0）。
+/// - addr 为 NULL 时，完全忽略 addrlen；否则在接收成功后执行地址输出长度协议。
+/// - 普通 TCP/VSOCK 不产生源地址，不访问 sockaddr 内容，但仍校验并写回长度 0。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RecvFromAddrBehavior {
-    /// 正常写回源地址（仅当用户提供 addr + addrlen 时）。
+    /// 产生源地址，按用户容量截断复制并写回完整长度。
     Write,
-    /// 忽略源地址输出；若提供了 addrlen，则写回 0；不得写 addr。
+    /// 产生零长度地址结果；不写 addr 内容，仍执行共用的长度校验与写回。
     Ignore,
 }
 

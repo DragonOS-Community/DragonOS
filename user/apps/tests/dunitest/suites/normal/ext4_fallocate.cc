@@ -89,6 +89,35 @@ TEST_F(Ext4FallocateTest, KeepSizeReallyReservesBlocksAndExposesZeroesWithoutGro
     ASSERT_NO_FATAL_FAILURE(contents(fd.get(), std::vector<char>(block_ * 6, 0)));
 }
 
+TEST_F(Ext4FallocateTest, BufferedWritesReuseKeepSizeUnwrittenTailAcrossRemount) {
+    Fd fd(open(path_.c_str(), O_CREAT | O_EXCL | O_RDWR, 0600)); ASSERT_GE(fd.get(), 0);
+    ASSERT_EQ(0, fallocate(fd.get(), FALLOC_FL_KEEP_SIZE, 0, unit_ * 4));
+    ASSERT_EQ(0, fsync(fd.get()));
+    const auto reserved = status(fd.get());
+    EXPECT_EQ(0, reserved.st_size);
+    EXPECT_GE(reserved.st_blocks, static_cast<blkcnt_t>(unit_ * 4 / 512));
+    std::vector<char> expected;
+    for (size_t offset : {size_t{0}, unit_, unit_ * 3}) {
+        SCOPED_TRACE(offset);
+        const std::vector<char> payload(unit_, static_cast<char>('a' + offset / unit_));
+        ASSERT_EQ(static_cast<ssize_t>(payload.size()),
+                  pwrite(fd.get(), payload.data(), payload.size(), offset)) << strerror(errno);
+        expected.resize(offset + unit_, 0);
+        std::copy(payload.begin(), payload.end(), expected.begin() + offset);
+        ASSERT_EQ(0, fsync(fd.get())) << strerror(errno);
+        EXPECT_EQ(static_cast<off_t>(expected.size()), status(fd.get()).st_size);
+        EXPECT_EQ(reserved.st_blocks, status(fd.get()).st_blocks);
+        ASSERT_NO_FATAL_FAILURE(contents(fd.get(), expected));
+    }
+    fd.close_now();
+    ASSERT_NO_FATAL_FAILURE(loop_.Unmount());
+    ASSERT_NO_FATAL_FAILURE(loop_.Mount());
+    Fd reopened(open(path_.c_str(), O_RDONLY)); ASSERT_GE(reopened.get(), 0);
+    EXPECT_EQ(static_cast<off_t>(expected.size()), status(reopened.get()).st_size);
+    EXPECT_EQ(reserved.st_blocks, status(reopened.get()).st_blocks);
+    ASSERT_NO_FATAL_FAILURE(contents(reopened.get(), expected));
+}
+
 TEST_F(Ext4FallocateTest, AllocationGrowsAndRepeatedAllocationPreservesWrittenDataOnDisk) {
     Fd fd(open(path_.c_str(), O_CREAT | O_EXCL | O_RDWR, 0600)); ASSERT_GE(fd.get(), 0);
     std::vector<char> expected(block_ * 8, 0);

@@ -5653,6 +5653,14 @@ impl LockedExt4Inode {
                         fs.wait_metadata_mutation_progress(observed)?;
                         continue 'admission;
                     }
+                    Err(error) if error.code() == another_ext4::ErrCode::ENOTSUP => {
+                        // Pool construction only inspected the current extent
+                        // shape; no pool or reservation has been published.
+                        // An unwritten tail is valid for buffered writes but
+                        // cannot admit delayed append. Let the existing eager
+                        // mapping owner initialize/reuse that allocation.
+                        return Ok(None);
+                    }
                     Err(error) => return Err(SystemError::from(error).into()),
                 }
             }

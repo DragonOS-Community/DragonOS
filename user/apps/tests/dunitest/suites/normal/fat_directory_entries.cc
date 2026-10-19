@@ -34,6 +34,18 @@ protected:
         ASSERT_EQ(512, le16(11));
     }
 
+    uint64_t RootOffset() const {
+        if (geometry_.slots != 0) return geometry_.root;
+        const auto le16 = [&](unsigned n) {
+            return uint32_t(boot_[n]) | (uint32_t(boot_[n + 1]) << 8);
+        };
+        const auto le32 = [&](unsigned n) {
+            return le16(n) | (le16(n + 2) << 16);
+        };
+        const uint64_t first_data = le16(14) + uint64_t(boot_[16]) * le32(36);
+        return (first_data + uint64_t(le32(44) - 2) * boot_[13]) * le16(11);
+    }
+
     void Mount() { ASSERT_NO_FATAL_FAILURE(loop_.Mount(0, "vfat")); }
     std::string Path(const std::string& name) { return loop_.mount_point() + "/" + name; }
     void Create(const std::string& name, bool payload = true) {
@@ -118,17 +130,7 @@ TEST_P(FatDirectory, ImportedShortAttributesDoNotConsumeFollowingEntries) {
     ASSERT_NO_FATAL_FAILURE(Mount());
     ASSERT_EQ(0, mkdir(Path("template").c_str(), 0700)) << strerror(errno);
     ASSERT_NO_FATAL_FAILURE(loop_.Unmount());
-    auto le16 = [&](unsigned n) {
-        return uint32_t(boot_[n]) | (uint32_t(boot_[n + 1]) << 8);
-    };
-    auto le32 = [&](unsigned n) {
-        return le16(n) | (le16(n + 2) << 16);
-    };
-    uint64_t root = geometry_.root;
-    if (geometry_.slots == 0) {
-        const uint64_t first_data = le16(14) + uint64_t(boot_[16]) * le32(36);
-        root = (first_data + uint64_t(le32(44) - 2) * boot_[13]) * le16(11);
-    }
+    const uint64_t root = RootOffset();
     ScopedFd raw {open(loop_.loop_path().c_str(), O_RDWR)};
     ASSERT_GE(raw.value, 0) << strerror(errno);
     std::array<unsigned char, 512> existing {};
@@ -200,6 +202,173 @@ TEST_P(FatDirectory, ImportedShortAttributesDoNotConsumeFollowingEntries) {
     ASSERT_EQ(32, pread(inspect.value, label.data(), label.size(), root));
     EXPECT_EQ(0, memcmp(label.data(), imported.data(), label.size()))
         << "a volume label is occupied metadata, not a reusable directory slot";
+}
+
+// Import disk entries rather than creating names through the implementation
+// under test: either backend may choose to create an LFN for a lowercase name.
+TEST_P(FatDirectory, ImportedShortNameCaseBitsDisplayWithoutChangingDiskNames) {
+    ASSERT_NO_FATAL_FAILURE(Mount());
+    ASSERT_EQ(0, mkdir(Path("template").c_str(), 0700)) << strerror(errno);
+    ASSERT_NO_FATAL_FAILURE(loop_.Unmount());
+    const uint64_t root = RootOffset();
+    ScopedFd raw {open(loop_.loop_path().c_str(), O_RDWR)};
+    ASSERT_GE(raw.value, 0) << strerror(errno);
+    std::array<unsigned char, 512> existing {};
+    ASSERT_EQ(512, pread(raw.value, existing.data(), existing.size(), root));
+    std::array<unsigned char, 32> directory {};
+    bool found_directory = false;
+    for (size_t offset = 0; offset != existing.size(); offset += 32) {
+        if (existing[offset + 11] == 0x10) {
+            memcpy(directory.data(), existing.data() + offset, directory.size());
+            found_directory = true;
+            break;
+        }
+    }
+    ASSERT_TRUE(found_directory);
+    struct ImportedName {
+        const char* raw;
+        unsigned char bits;
+        const char* display;
+        const char* alternate;
+    };
+    const ImportedName cases[] = {
+        {"UPPER   TXT", 0x00, "UPPER.TXT", "upper.txt"},
+        {"BASELOW TXT", 0x08, "baselow.TXT", "BASELOW.txt"},
+        {"EXTLOW  TXT", 0x10, "EXTLOW.txt", "extlow.TXT"},
+        {"BOTHLOW TXT", 0x18, "bothlow.txt", "BOTHLOW.TXT"},
+        {"NOEXT      ", 0x08, "noext", "NOEXT"},
+        {"DIG1-3  A1 ", 0x18, "dig1-3.a1", "DIG1-3.A1"},
+        {"RESERVE TXT", 0xE7, "RESERVE.TXT", "reserve.txt"},
+        {"RESLOW  TXT", 0xFF, "reslow.txt", "RESLOW.TXT"},
+        {"CHILD      ", 0x08, "child", "CHILD"},
+    };
+    std::array<unsigned char, 512> imported {};
+    for (size_t index = 0; index != std::size(cases); ++index) {
+        auto* entry = imported.data() + index * 32;
+        if (index + 1 == std::size(cases)) {
+            // Reuse a real allocated directory, including its . and .. entries.
+            memcpy(entry, directory.data(), directory.size());
+        } else {
+            entry[11] = 0x20;
+            for (unsigned position : {16U, 18U, 24U}) entry[position] = 33;
+        }
+        memcpy(entry, cases[index].raw, 11);
+        entry[12] = cases[index].bits;
+    }
+    ASSERT_EQ(512, pwrite(raw.value, imported.data(), imported.size(), root));
+    ASSERT_EQ(0, fsync(raw.value));
+    ASSERT_EQ(0, close(raw.value));
+    raw.value = -1;
+    ASSERT_NO_FATAL_FAILURE(Mount());
+    for (unsigned pass = 0; pass != 2; ++pass) {
+        const auto names = Names();
+        for (size_t index = 0; index != std::size(cases); ++index) {
+            const auto& item = cases[index];
+            SCOPED_TRACE(item.display);
+            EXPECT_EQ(1U, names.count(item.display));
+            EXPECT_EQ(0U, names.count(item.alternate));
+            struct stat canonical {}, alternate {};
+            ASSERT_EQ(0, stat(Path(item.display).c_str(), &canonical)) << strerror(errno);
+            ASSERT_EQ(0, stat(Path(item.alternate).c_str(), &alternate)) << strerror(errno);
+            EXPECT_EQ(canonical.st_ino, alternate.st_ino);
+            EXPECT_EQ(canonical.st_dev, alternate.st_dev);
+            if (index + 1 == std::size(cases)) {
+                EXPECT_TRUE(S_ISDIR(canonical.st_mode));
+                EXPECT_EQ(1U, Names(item.display).count("."));
+                EXPECT_EQ(1U, Names(item.display).count(".."));
+            } else {
+                EXPECT_TRUE(S_ISREG(canonical.st_mode));
+                ScopedFd readable {open(Path(item.alternate).c_str(), O_RDONLY)};
+                ASSERT_GE(readable.value, 0) << strerror(errno);
+                char byte = 1;
+                EXPECT_EQ(0, read(readable.value, &byte, 1));
+            }
+        }
+        if (pass == 0) {
+            ASSERT_NO_FATAL_FAILURE(Remount());
+        }
+    }
+    ASSERT_NO_FATAL_FAILURE(loop_.Unmount());
+    raw.value = open(loop_.loop_path().c_str(), O_RDONLY);
+    ASSERT_GE(raw.value, 0);
+    std::array<unsigned char, 512> after {};
+    ASSERT_EQ(512, pread(raw.value, after.data(), after.size(), root));
+    for (size_t index = 0; index != std::size(cases); ++index) {
+        EXPECT_EQ(0, memcmp(after.data() + index * 32, cases[index].raw, 11));
+        EXPECT_EQ(cases[index].bits, after[index * 32 + 12]);
+    }
+}
+
+TEST_P(FatDirectory, ShortNameCaseBitsPreserveLongNamesAndRenameTargetEncoding) {
+    const uint64_t root = RootOffset();
+    std::array<unsigned char, 512> imported {};
+    const auto short_entry = [&](unsigned index, const char* name) {
+        auto* entry = imported.data() + index * 32;
+        memcpy(entry, name, 11);
+        entry[11] = 0x20;
+        entry[12] = 0x18;
+        for (unsigned position : {16U, 18U, 24U}) entry[position] = 33;
+    };
+    short_entry(0, "TARGET  TXT");
+    short_entry(2, "MIXED   TXT");
+    auto* lfn = imported.data() + 32;
+    lfn[0] = 0x41;
+    lfn[11] = 0x0F;
+    unsigned char checksum = 0;
+    for (unsigned index = 0; index != 11; ++index) {
+        checksum = static_cast<unsigned char>(((checksum & 1) << 7)
+            + (checksum >> 1) + imported[64 + index]);
+    }
+    lfn[13] = checksum;
+    const std::string mixed = "MiXeD.TxT";
+    unsigned character = 0;
+    for (unsigned offset : {1U, 3U, 5U, 7U, 9U, 14U, 16U, 18U, 20U, 22U, 24U, 28U, 30U}) {
+        const unsigned value = character < mixed.size()
+            ? static_cast<unsigned char>(mixed[character])
+            : character == mixed.size() ? 0 : 0xFFFF;
+        lfn[offset] = value & 0xFF;
+        lfn[offset + 1] = value >> 8;
+        ++character;
+    }
+    ScopedFd raw {open(loop_.loop_path().c_str(), O_RDWR)};
+    ASSERT_GE(raw.value, 0);
+    ASSERT_EQ(512, pwrite(raw.value, imported.data(), imported.size(), root));
+    ASSERT_EQ(0, fsync(raw.value));
+    ASSERT_EQ(0, close(raw.value));
+    raw.value = -1;
+    ASSERT_NO_FATAL_FAILURE(Mount());
+    ASSERT_NO_FATAL_FAILURE(Create("payload-source.txt"));
+    // Match an imported target through a case alias. Its spelling belongs to
+    // the destination entry, including the original SFN case bits.
+    ASSERT_EQ(0, rename(Path("payload-source.txt").c_str(), Path("TaRgEt.TxT").c_str()))
+        << strerror(errno);
+    for (unsigned pass = 0; pass != 2; ++pass) {
+        const auto names = Names();
+        EXPECT_EQ(1U, names.count("target.txt"));
+        EXPECT_EQ(0U, names.count("TARGET.TXT"));
+        EXPECT_EQ(1U, names.count(mixed));
+        EXPECT_EQ(0U, names.count("mixed.txt"));
+        EXPECT_EQ(0U, names.count("payload-source.txt"));
+        ASSERT_NO_FATAL_FAILURE(Read("TARGET.TXT"));
+        struct stat original {}, alias {};
+        ASSERT_EQ(0, stat(Path(mixed).c_str(), &original));
+        ASSERT_EQ(0, stat(Path("mixed.txt").c_str(), &alias));
+        EXPECT_EQ(original.st_ino, alias.st_ino);
+        if (pass == 0) {
+            ASSERT_NO_FATAL_FAILURE(Remount());
+        }
+    }
+    ASSERT_NO_FATAL_FAILURE(loop_.Unmount());
+    raw.value = open(loop_.loop_path().c_str(), O_RDONLY);
+    ASSERT_GE(raw.value, 0);
+    std::array<unsigned char, 512> after {};
+    ASSERT_EQ(512, pread(raw.value, after.data(), after.size(), root));
+    for (unsigned index : {0U, 2U}) {
+        EXPECT_EQ(0, memcmp(after.data() + index * 32, imported.data() + index * 32, 11));
+        EXPECT_EQ(0x18, after[index * 32 + 12]);
+    }
+    EXPECT_EQ(0, memcmp(after.data() + 32, imported.data() + 32, 32))
+        << "SFN case flags must not rewrite the LFN or its checksum";
 }
 
 TEST_P(FatDirectory, FixedRootCapacityAndReuse) {

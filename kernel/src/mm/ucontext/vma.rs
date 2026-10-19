@@ -151,7 +151,7 @@ impl LockedVMA {
         return self.vma.lock();
     }
 
-    pub(super) fn try_lock(&self) -> Option<MutexGuard<'_, VMA>> {
+    pub(crate) fn try_lock(&self) -> Option<MutexGuard<'_, VMA>> {
         self.vma.try_lock().ok()
     }
 

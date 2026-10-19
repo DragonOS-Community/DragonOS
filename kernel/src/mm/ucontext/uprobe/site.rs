@@ -855,7 +855,13 @@ fn ensure_xol_and_alloc_slot(
         pm.get(&page_paddr)
             .expect("fresh XOL page is absent from the page manager")
     };
-    let xol_page = XolPage::new(page.virt_address(), page_paddr, owned_page);
+    // This fresh page has no earlier access owner, and isolation requires
+    // the very MM write guard retained by this constructor. Neither Busy nor
+    // counter overflow can occur before publishing the XOL owner.
+    let access = owned_page
+        .try_pin_access()
+        .expect("fresh XOL page admission is protected by its MM write guard");
+    let xol_page = XolPage::new(page.virt_address(), access);
     let lease = xol_page
         .alloc_slot_in(reachable)
         .map(Arc::new)

@@ -200,6 +200,8 @@ pub(crate) struct VmAllocation {
     len: usize,
     chunks: Option<OwnedBox<Chunk>>,
     _charge: ObjectCharge,
+    #[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
+    teardown_observer: Option<Arc<crate::mm::tlb::selftest::Observer>>,
 }
 
 pub(super) fn task_context() -> bool {
@@ -347,6 +349,8 @@ impl VmAllocation {
             len: layout.size(),
             chunks: None,
             _charge: charge,
+            #[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
+            teardown_observer: None,
         };
         for offset in (0..pages).step_by(CHUNK) {
             #[cfg(feature = "mm_selftest")]
@@ -471,6 +475,19 @@ impl VmAllocation {
         Ok(())
     }
 
+    #[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
+    pub(crate) fn set_teardown_observer(
+        &mut self,
+        observer: Arc<crate::mm::tlb::selftest::Observer>,
+    ) {
+        assert_eq!(self.pages, 1);
+        observer.frame.store(
+            self.chunks.as_ref().unwrap().frames[0].data(),
+            core::sync::atomic::Ordering::Release,
+        );
+        self.teardown_observer = Some(observer);
+    }
+
     pub fn address(&self) -> VirtAddr {
         VirtAddr::new(BASE + self.start * MMArch::PAGE_SIZE)
     }
@@ -525,12 +542,63 @@ impl Drop for VmAllocation {
             }
             current = chunk.next.as_mut();
         }
+        #[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
+        if let Some(observer) = &self.teardown_observer {
+            let absent = {
+                let mut mapper = KernelMapper::lock();
+                mapper
+                    .as_mut()
+                    .expect("recursive vmalloc test")
+                    .translate(self.address())
+                    .is_none()
+            };
+            observer.cleared(absent);
+            if !observer.skip_flush() {
+                crate::mm::tlb::flush_tlb_kernel_range_observed(
+                    self.address(),
+                    self.end(),
+                    freed_tables,
+                    observer.clone(),
+                );
+            }
+            // Only a failing negative control rescues here. The nonblocking
+            // check precedes any rescue and the actual allocator call.
+            if !observer.before_free() {
+                crate::mm::tlb::flush_tlb_kernel_range_observed(
+                    self.address(),
+                    self.end(),
+                    freed_tables,
+                    observer.clone(),
+                );
+            }
+        } else {
+            flush_tlb_kernel_range(self.address(), self.end(), freed_tables);
+        }
+        #[cfg(not(all(feature = "mm_selftest", target_arch = "x86_64")))]
         flush_tlb_kernel_range(self.address(), self.end(), freed_tables);
         // No recursion and no allocations in destruction, even for the entire VA pool.
         while let Some(mut chunk) = self.chunks.take() {
             self.chunks = chunk.next.take();
             for frame in &chunk.frames[..chunk.acquired] {
+                #[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
+                if let Some(observer) = &self.teardown_observer {
+                    assert!(observer.before_free());
+                }
                 unsafe { LockedFrameAllocator.free_one(*frame) };
+                #[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
+                if let Some(observer) = &self.teardown_observer {
+                    observer.frame_freed();
+                }
+            }
+            #[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
+            if let Some(observer) = &self.teardown_observer {
+                for retired in &mut chunk.retired {
+                    if let Some(table) = retired.take() {
+                        assert!(observer.before_free());
+                        drop(table);
+                        observer.tables_freed();
+                    }
+                }
             }
             drop(chunk);
         }
@@ -545,3 +613,8 @@ mod selftest;
 pub(crate) use selftest::report as selftest_report;
 #[cfg(feature = "mm_selftest")]
 use selftest::AllocationTest;
+
+#[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
+pub(crate) fn lock_teardown_fixture() -> crate::libs::mutex::MutexGuard<'static, ()> {
+    selftest::TEST_LOCK.lock()
+}

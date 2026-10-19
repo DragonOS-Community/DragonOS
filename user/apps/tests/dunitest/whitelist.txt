@@ -294,3 +294,4 @@ normal/fat_rename_atomicity
 normal/mount_forced_readonly_selftest
 normal/fat_rename_aliases
 normal/socket_address_output
+normal/page_migration_prerequisites

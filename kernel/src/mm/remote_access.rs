@@ -1,7 +1,7 @@
 //! Unified entry for remote access to user memory across address spaces.
 //!
-//! Managed pages are pinned by `Arc<Page>` while the target mm and page-table
-//! edit locks make the PTE identity stable. Both mm guards are released before
+//! Managed pages acquire an owned physical-access pin while the target mm and
+//! page-table edit locks make the PTE identity stable. Both guards drop before
 //! copying. A remote write admits any exact PageCache dirty lifetime before it
 //! changes bytes and publishes its generation while holding the Page lock;
 //! writeback cannot snapshot that generation until the infallible copy and
@@ -18,8 +18,11 @@ use crate::{
     },
     mm::{
         fault::{FaultFlags, PageFaultHandler, PageFaultMessage},
-        page::{page_manager_lock, Page, PageFlags},
-        ucontext::{AddressSpace, LockedVMA},
+        page::{
+            access::{PageAccessError, PageAccessPin},
+            page_manager_lock, Page, PageFlags,
+        },
+        ucontext::{AddressSpace, InnerAddressSpace, LockedVMA},
         MemoryManagementArch, PhysAddr, VirtAddr, VmFaultReason, VmFlags,
     },
 };
@@ -57,8 +60,7 @@ struct RemoteVmaSnapshot {
 }
 
 struct PinnedRemotePage {
-    page: Arc<Page>,
-    frame: PhysAddr,
+    access: PageAccessPin,
     cache_entry: Option<PageCacheEntry>,
     _writer: Option<RemoteWriteReservation>,
 }
@@ -73,8 +75,11 @@ impl Drop for RemoteWriteReservation {
 
 enum PinRemoteError {
     Fault,
+    WriteProtect,
     Denied,
     UnsupportedSpecial,
+    Busy(Arc<Page>),
+    Overflow,
 }
 
 impl AddressSpace {
@@ -118,18 +123,35 @@ impl AddressSpace {
                 Err(PinRemoteError::Denied | PinRemoteError::UnsupportedSpecial) => {
                     return finish(copied)
                 }
-                Err(PinRemoteError::Fault) => {
+                Err(PinRemoteError::Fault | PinRemoteError::WriteProtect) => {
                     match fault_in_remote_page(self, VirtAddr::new(current), write, force) {
                         Ok(pinned) => pinned,
+                        Err(SystemError::EOVERFLOW) if copied == 0 => {
+                            return Err(SystemError::EOVERFLOW);
+                        }
                         Err(_) => return finish(copied),
                     }
+                }
+                Err(PinRemoteError::Busy(page)) => {
+                    // Isolation holds the Page write guard. No MM/PT/cache
+                    // resource is retained while waiting, and the old Page
+                    // is only a wait target: lookup must start over afterwards.
+                    drop(page.write());
+                    continue;
+                }
+                Err(PinRemoteError::Overflow) => {
+                    return if copied == 0 {
+                        Err(SystemError::EOVERFLOW)
+                    } else {
+                        finish(copied)
+                    };
                 }
             };
 
             let dirty = if write {
                 match pinned.cache_entry.as_ref() {
                     Some((cache, index)) => {
-                        match cache.prepare_remote_page_dirty(*index, &pinned.page) {
+                        match cache.prepare_remote_page_dirty(*index, pinned.access.page()) {
                             Ok(token) => token,
                             Err(_) => return finish(copied),
                         }
@@ -140,9 +162,9 @@ impl AddressSpace {
                 None
             };
 
-            copy_pinned_page(&mut dir, copied, page_offset, chunk, &pinned.page, dirty);
+            copy_pinned_page(&mut dir, copied, page_offset, chunk, &pinned.access, dirty);
             if write {
-                mark_remote_pte_dirty(self, page_addr, pinned.frame);
+                mark_remote_pte_dirty(self, page_addr, pinned.access.phys_address());
             }
             copied += chunk;
         }
@@ -157,7 +179,21 @@ fn pin_remote_page(
     force: bool,
 ) -> Result<PinnedRemotePage, PinRemoteError> {
     let guard = mm.read();
-    let vma = guard
+    pin_remote_page_locked(mm, &guard, address, write, force, false)
+}
+
+/// Both normal lookup and completed faults admit the exact Page while their
+/// caller retains the MM lock. A forced write may copy a COW-resolved page
+/// whose VMA still intentionally lacks VM_WRITE (ptrace/proc mem semantics).
+fn pin_remote_page_locked(
+    mm: &Arc<AddressSpace>,
+    space: &InnerAddressSpace,
+    address: VirtAddr,
+    write: bool,
+    force: bool,
+    fault_completed: bool,
+) -> Result<PinnedRemotePage, PinRemoteError> {
+    let vma = space
         .mappings
         .contains(address)
         .ok_or(PinRemoteError::Fault)?;
@@ -172,7 +208,7 @@ fn pin_remote_page(
 
     let page_addr = VirtAddr::new(address.data() & !(MMArch::PAGE_SIZE - 1));
     let _page_table_edit = mm.page_table_edit();
-    let (frame, flags) = guard
+    let (frame, flags) = space
         .user_mapper
         .utable
         .translate(page_addr)
@@ -183,10 +219,10 @@ fn pin_remote_page(
     let page = page_manager_lock()
         .get(&frame)
         .ok_or(PinRemoteError::UnsupportedSpecial)?;
-    if write && !flags.has_write() {
-        return Err(PinRemoteError::Fault);
+    if write && !flags.has_write() && !(force && fault_completed) {
+        return Err(PinRemoteError::WriteProtect);
     }
-    let (validated_frame, _) = guard
+    let (validated_frame, _) = space
         .user_mapper
         .utable
         .translate(page_addr)
@@ -194,6 +230,11 @@ fn pin_remote_page(
     if validated_frame != frame || page.phys_address() != frame {
         return Err(PinRemoteError::Fault);
     }
+    let access = match page.try_pin_access() {
+        Ok(pin) => pin,
+        Err(PageAccessError::Busy) => return Err(PinRemoteError::Busy(page)),
+        Err(PageAccessError::Overflow) => return Err(PinRemoteError::Overflow),
+    };
 
     // The mm guard still protects the VMA here.  A writer reservation then
     // covers the interval after this guard drops and before the copy ends.
@@ -204,8 +245,7 @@ fn pin_remote_page(
     });
 
     Ok(PinnedRemotePage {
-        page,
-        frame,
+        access,
         cache_entry: snapshot.cache_entry,
         _writer: writer,
     })
@@ -258,9 +298,10 @@ fn copy_pinned_page(
     buffer_offset: usize,
     page_offset: usize,
     len: usize,
-    page: &Arc<Page>,
+    access: &PageAccessPin,
     mut dirty: Option<PreparedRemotePageDirty>,
 ) {
+    let page = access.page();
     match direction {
         RemoteAccess::Read(buffer) => {
             let page = page.read();
@@ -415,27 +456,29 @@ fn fault_in_remote_page(
                 continue;
             }
             if outcome.reason.contains(VmFaultReason::VM_FAULT_COMPLETED) {
-                let page_addr = VirtAddr::new(address.data() & !(MMArch::PAGE_SIZE - 1));
-                let frame = guard
-                    .user_mapper
-                    .utable
-                    .translate(page_addr)
-                    .map(|(frame, _)| frame)
-                    .ok_or(SystemError::EFAULT)?;
-                let page = page_manager_lock().get(&frame).ok_or(SystemError::EFAULT)?;
-                let snapshot =
-                    remote_vma_snapshot(&vma, address, write).map_err(|_| SystemError::EFAULT)?;
-                let writer = snapshot.writer_inode.and_then(|inode| {
-                    inode
-                        .begin_remote_write()
-                        .then_some(RemoteWriteReservation(inode))
-                });
-                return Ok(PinnedRemotePage {
-                    page,
-                    frame,
-                    cache_entry: snapshot.cache_entry,
-                    _writer: writer,
-                });
+                match pin_remote_page_locked(mm, &guard, address, write, force, true) {
+                    Ok(pinned) => return Ok(pinned),
+                    Err(PinRemoteError::WriteProtect) => {
+                        // An initial anonymous fault can install PAGE_COPY.
+                        // Like GUP, follow again after fault completion and
+                        // resolve its write protection before admitting a
+                        // non-forced writer. A missing leaf is not this retry.
+                        drop(guard);
+                        crate::sched::cond_resched();
+                        continue;
+                    }
+                    Err(PinRemoteError::Busy(page)) => {
+                        drop(guard);
+                        drop(page.write());
+                        // Re-run fault/COW and lookup after waiting. In
+                        // particular a forced write must not reuse a former
+                        // COW result after fork changed its PTE identity.
+                        tried = false;
+                        continue;
+                    }
+                    Err(PinRemoteError::Overflow) => return Err(SystemError::EOVERFLOW),
+                    Err(_) => return Err(SystemError::EFAULT),
+                }
             }
             if outcome.reason.contains(VmFaultReason::VM_FAULT_OOM) {
                 return Err(SystemError::ENOMEM);

@@ -54,7 +54,7 @@ impl AllocationTest {
     }
 }
 
-static TEST_LOCK: Mutex<()> = Mutex::new(());
+pub(super) static TEST_LOCK: Mutex<()> = Mutex::new(());
 
 fn used_pages() -> usize {
     POOL.lock_irqsave().used[SELFTEST_START / 64..]

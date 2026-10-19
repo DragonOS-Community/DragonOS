@@ -20,6 +20,13 @@ use core::sync::atomic::{compiler_fence, Ordering};
 #[cfg(target_arch = "x86_64")]
 use core::{hint::spin_loop, sync::atomic::AtomicBool};
 
+#[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
+pub(crate) mod selftest;
+#[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
+pub(crate) fn teardown_selftest_report() -> alloc::string::String {
+    selftest::report()
+}
+
 use alloc::sync::Arc;
 #[allow(unused_imports)]
 use alloc::vec::Vec;
@@ -68,6 +75,8 @@ pub struct FlushTlbInfo {
     pub freed_tables: bool,
     /// Initiating CPU
     pub initiating_cpu: ProcessorId,
+    #[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
+    pub(crate) observer: Option<Arc<selftest::Observer>>,
 }
 
 impl FlushTlbInfo {
@@ -339,7 +348,15 @@ pub fn remote_flush_tlb_on_ipi() {
         // it will not be freed before done=true.
         let info = unsafe { &*info_ptr };
 
+        #[cfg(feature = "mm_selftest")]
+        if let Some(observer) = &info.observer {
+            observer.before_remote(info);
+        }
         local_flush_tlb_func(info);
+        #[cfg(feature = "mm_selftest")]
+        if let Some(observer) = &info.observer {
+            observer.after_remote();
+        }
 
         compiler_fence(Ordering::SeqCst);
         csd.done.store(true, Ordering::Release);
@@ -397,13 +414,37 @@ fn flush_tlb_multi(target_cpus: &AtomicCpuMask, info: &FlushTlbInfo) {
             send_ipi(IpiKind::FlushTLB, IpiTarget::Specified(cpu));
         }
 
+        #[cfg(feature = "mm_selftest")]
+        if let Some(observer) = &info.observer {
+            if observer.skip_ack() {
+                // Detect the prospective premature return while every CSD
+                // still points into this live stack frame; then rescue safely.
+                observer.missing_ack();
+            }
+        }
+
         // Poll for done
         for cpu in active.iter_cpu() {
             if cpu == my_cpu {
                 continue;
             }
             let csd = unsafe { csd_flush_tlb().force_get(cpu) };
+            #[cfg(feature = "mm_selftest")]
+            let mut test_spins = 0usize;
             while !csd.done.load(Ordering::Acquire) {
+                #[cfg(feature = "mm_selftest")]
+                if let Some(observer) = &info.observer {
+                    if !observer.skip_ack() {
+                        observer.wait_pending(cpu);
+                    }
+                    test_spins += 1;
+                    // Fail-stop rather than leave a live receiver with a
+                    // dangling FlushTlbInfo after an unrecoverable timeout.
+                    assert!(
+                        test_spins < 100_000_000,
+                        "selftest TLB acknowledgement timeout"
+                    );
+                }
                 spin_loop();
             }
             // Clean up CSD slot to prevent misuse
@@ -474,6 +515,8 @@ pub fn flush_tlb_mm_range(
         stride_shift,
         freed_tables,
         initiating_cpu: this_cpu,
+        #[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
+        observer: selftest::observer_for(mm),
     };
 
     // Snapshot the remote target set.
@@ -502,6 +545,10 @@ pub fn flush_tlb_mm_range(
         local_flush_tlb_func(&info);
     }
 
+    #[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
+    if let Some(observer) = &info.observer {
+        observer.flush_returned();
+    }
     compiler_fence(Ordering::SeqCst);
     drop(irq_guard);
 
@@ -518,6 +565,33 @@ pub fn flush_tlb_mm_range(
 /// changes before invoking this function and must not free intermediate page-table pages until it
 /// returns.
 pub fn flush_tlb_kernel_range(start: VirtAddr, end: VirtAddr, freed_tables: bool) {
+    flush_tlb_kernel_range_inner(
+        start,
+        end,
+        freed_tables,
+        #[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
+        None,
+    );
+}
+
+#[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
+pub(crate) fn flush_tlb_kernel_range_observed(
+    start: VirtAddr,
+    end: VirtAddr,
+    freed_tables: bool,
+    observer: Arc<selftest::Observer>,
+) {
+    flush_tlb_kernel_range_inner(start, end, freed_tables, Some(observer));
+}
+
+fn flush_tlb_kernel_range_inner(
+    start: VirtAddr,
+    end: VirtAddr,
+    freed_tables: bool,
+    #[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))] observer: Option<
+        Arc<selftest::Observer>,
+    >,
+) {
     #[cfg(target_arch = "x86_64")]
     let irq_was_enabled = CurrentIrqArch::is_irq_enabled();
     #[cfg(target_arch = "x86_64")]
@@ -538,6 +612,8 @@ pub fn flush_tlb_kernel_range(start: VirtAddr, end: VirtAddr, freed_tables: bool
         stride_shift: MMArch::PAGE_SHIFT as u8,
         freed_tables,
         initiating_cpu: this_cpu,
+        #[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
+        observer,
     };
     let remote_mask = AtomicCpuMask::new();
     for cpu in smp_cpu_manager().present_cpus().iter_cpu() {
@@ -549,6 +625,10 @@ pub fn flush_tlb_kernel_range(start: VirtAddr, end: VirtAddr, freed_tables: bool
         flush_tlb_multi(&remote_mask, &info);
     }
     local_flush_tlb_func(&info);
+    #[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
+    if let Some(observer) = &info.observer {
+        observer.flush_returned();
+    }
     compiler_fence(Ordering::SeqCst);
     drop(irq_guard);
 

@@ -3,8 +3,11 @@
 #include <gtest/gtest.h>
 
 #include <cerrno>
+#include <cstdint>
 #include <cstring>
 #include <fcntl.h>
+#include <linux/fs.h>
+#include <linux/loop.h>
 #include <string>
 #include <sys/ioctl.h>
 #include <sys/mount.h>
@@ -164,9 +167,14 @@ class LoopExt4 {
         int probe = open(loop_path_.c_str(), O_RDWR);
         ASSERT_GE(probe, 0) << strerror(errno);
         unsigned char block[512] = {};
+        EXPECT_EQ(0, pread(probe, block, sizeof(block), 0));
+        uint64_t capacity = UINT64_MAX;
+        EXPECT_EQ(0, ioctl(probe, BLKGETSIZE64, &capacity));
+        EXPECT_EQ(0U, capacity);
+        loop_info64 status {};
         errno = 0;
-        EXPECT_EQ(-1, pread(probe, block, sizeof(block), 0));
-        EXPECT_EQ(ENODEV, errno);
+        EXPECT_EQ(-1, ioctl(probe, LOOP_GET_STATUS64, &status));
+        EXPECT_EQ(ENXIO, errno);
         EXPECT_EQ(0, close(probe));
     }
 

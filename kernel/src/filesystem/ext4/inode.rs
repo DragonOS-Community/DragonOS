@@ -2506,6 +2506,22 @@ impl IndexNode for LockedExt4Inode {
         }
     }
 
+    fn read_at_with_io_intent(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &mut [u8],
+        data: PrivateData,
+        intent: vfs::ReadIoIntent,
+    ) -> Result<usize, MemoryAllocationError> {
+        if intent == vfs::ReadIoIntent::Direct {
+            drop(data);
+            self.read_direct_kernel(offset, len, buf)
+        } else {
+            self.read_at(offset, len, buf, data)
+        }
+    }
+
     fn user_read_mode(&self) -> vfs::UserReadMode {
         if self.inner.lock().page_cache.is_some() {
             vfs::UserReadMode::Iterator

@@ -13,10 +13,12 @@
 
 mod constants;
 mod driver;
+mod io;
 mod loop_control;
 #[allow(clippy::module_inception)]
 mod loop_device;
 mod manager;
+mod mode;
 
 use alloc::sync::Arc;
 use system_error::SystemError;

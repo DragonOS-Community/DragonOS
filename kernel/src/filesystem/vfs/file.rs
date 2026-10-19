@@ -2148,6 +2148,46 @@ impl File {
         }
     }
 
+    /// Whether this description accepts direct I/O. Buffered-only owners
+    /// such as tmpfs accept the intent and deliberately ignore it.
+    pub(crate) fn supports_direct_io(&self) -> bool {
+        self.direct_io != DirectIoPolicy::Unsupported
+    }
+
+    /// Positional backing read retaining the original OFD and typed admission.
+    /// A false force flag inherits O_DIRECT; it does not force buffered I/O.
+    pub(crate) fn try_pread_backing(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &mut [u8],
+        force_direct: bool,
+    ) -> Result<usize, MemoryAllocationError> {
+        self.verify_pread_access()?;
+        self.readable()?;
+        if force_direct && !self.supports_direct_io() {
+            return Err(SystemError::EINVAL.into());
+        }
+        let intent = if force_direct && self.direct_io != DirectIoPolicy::Buffered {
+            super::ReadIoIntent::Direct
+        } else {
+            self.read_io_intent()
+        };
+        let result = self.read_backing_with_io_intent(offset, len, buf, intent);
+        if result.is_err()
+            && len != 0
+            && intent == super::ReadIoIntent::Direct
+            && self.file_type == FileType::File
+        {
+            self.touch_atime_after_access();
+        }
+        let read = result?;
+        if len != 0 {
+            self.finalize_read(offset, read, false, true);
+        }
+        Ok(read)
+    }
+
     /// Provider-only stacking entry: retain the caller's original iterator,
     /// without publishing a second position/atime/fsnotify completion.
     pub(crate) fn read_user_provider_at(
@@ -2464,14 +2504,25 @@ impl File {
         len: usize,
         buf: &[u8],
         sync: WriteSyncIntent,
+        force_direct: bool,
     ) -> Result<DelegatedWriteResult, MemoryAllocationError> {
+        if force_direct && !self.supports_direct_io() {
+            return Err(SystemError::EINVAL.into());
+        }
+        let io = if force_direct && self.direct_io != DirectIoPolicy::Buffered {
+            super::WriteIoIntent::Direct {
+                input_alignment: PrimaryWriteSource::Kernel(buf).alignment(len),
+            }
+        } else {
+            self.write_io_intent(PrimaryWriteSource::Kernel(buf), len)
+        };
         self.pwrite_with_io_intent(
             offset,
             len,
             buf,
             sync,
             Some(super::WriteOperation {
-                io: self.write_io_intent(PrimaryWriteSource::Kernel(buf), len),
+                io,
                 admission: super::WriteAdmission::BackingStorage,
             }),
         )
@@ -2725,16 +2776,13 @@ impl File {
             self.file_readahead(offset, len)?;
         }
 
-        let len = if intent == super::ReadIoIntent::Direct
-            && self.direct_io == DirectIoPolicy::Native
-        {
-            self.inode
-                .read_direct(offset, len, buf, self.private_data.lock())
-                .map_err(MemoryAllocationError::System)
-        } else {
-            self.inode
-                .read_at_with_io_intent(offset, len, buf, self.private_data.lock(), intent)
-        }?;
+        let len = self.inode.read_at_with_io_intent(
+            offset,
+            len,
+            buf,
+            self.private_data.lock(),
+            intent,
+        )?;
 
         Ok(len)
     }

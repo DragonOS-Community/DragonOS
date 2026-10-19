@@ -3,8 +3,10 @@
 use super::*;
 
 pub(super) const CACHE_SECTOR_SIZE: usize = 512;
-pub(super) const CACHE_SECTORS: usize = MMArch::PAGE_SIZE / CACHE_SECTOR_SIZE;
-const _: () = assert!(MMArch::PAGE_SIZE.is_multiple_of(CACHE_SECTOR_SIZE) && CACHE_SECTORS <= 8);
+// Even a page smaller than a sector needs one whole-page validity/dirty bit.
+// This also preserves the nonempty mask for ports with placeholder geometry.
+pub(super) const CACHE_SECTORS: usize = MMArch::PAGE_SIZE.div_ceil(CACHE_SECTOR_SIZE);
+const _: () = assert!(CACHE_SECTORS > 0 && CACHE_SECTORS <= u8::BITS as usize);
 pub(super) const ALL_BLOCKS: u8 = ((1u16 << CACHE_SECTORS) - 1) as u8;
 
 pub(super) fn blocks_mask(start: usize, end: usize) -> u8 {

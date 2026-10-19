@@ -2,8 +2,7 @@
 //! lifetime protects only planning and source I/O; user faults run afterwards.
 use super::LockedExt4Inode;
 use crate::{
-    filesystem::vfs::{self, file::File, IndexNode},
-    libs::mutex::Mutex,
+    filesystem::vfs::{self, file::File},
     mm::allocation::MemoryAllocationError,
     syscall::user_buffer::UserBuffer,
 };
@@ -221,13 +220,9 @@ impl LockedExt4Inode {
                 // Only the current inode's validated mapped extent supplies
                 // this data, including its final block's EOF tail. Unwritten
                 // or unallocated blocks take the Zero branch instead.
-                let copied = IndexNode::read_at(
-                    &*fs.gendisk,
-                    physical,
-                    count,
-                    &mut buffer[..count],
-                    Mutex::new(vfs::FilePrivateData::Unused).lock(),
-                )?;
+                // This is filesystem block I/O, not a buffered read of the
+                // device file. Keep direct reads out of the raw user mapping.
+                let copied = fs.gendisk.read_at_bytes(&mut buffer[..count], physical)?;
                 if copied != count {
                     return Err(SystemError::EIO.into());
                 }

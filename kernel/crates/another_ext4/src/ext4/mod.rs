@@ -813,6 +813,11 @@ impl Ext4 {
         // TODO: if the main superblock is corrupted, should we load the backup?
         let block = block_device.read_block(0)?;
         let sb = block.read_offset_as::<SuperBlock>(BASE_OFFSET);
+        // Recognizing the filesystem is distinct from validating already
+        // recognized metadata. Keep actual device read errors unchanged.
+        if !sb.check_magic() {
+            return_error!(ErrCode::EINVAL, "Can't find ext4 filesystem");
+        }
         log::debug!("Load Ext4 Superblock: {:?}", sb);
         let cached_block_groups = Self::read_validated_block_groups(block_device.as_ref(), &sb)?;
         let system_metadata_ranges = Self::build_system_metadata_ranges(&sb, &cached_block_groups)?;
@@ -1136,6 +1141,28 @@ mod validation_tests {
 
     fn system_zone_test_fs() -> Ext4 {
         Ext4::load(validation_device(SuperBlock::validation_fixture())).unwrap()
+    }
+
+    #[test]
+    fn unrecognized_superblock_is_invalid_mount_argument() {
+        let mut device = validation_device(SuperBlock::validation_fixture());
+        Arc::get_mut(&mut device)
+            .unwrap()
+            .blocks
+            .get_mut(&0)
+            .unwrap()
+            .write_offset(BASE_OFFSET + 56, &[0, 0]);
+        let error = Ext4::load(device).err().expect("invalid magic must fail");
+        assert_eq!(error.code(), ErrCode::EINVAL);
+    }
+
+    #[test]
+    fn superblock_read_error_keeps_device_errno() {
+        let device = Arc::new(ValidationDevice {
+            blocks: BTreeMap::new(),
+        });
+        let error = Ext4::load(device).err().expect("device read must fail");
+        assert_eq!(error.code(), ErrCode::EIO);
     }
 
     #[test]

@@ -5,7 +5,7 @@ use crate::{
             block_device::{BlockDevice, BlockId, GeneralBlockRange, LBA_SIZE},
             disk_info::Partition,
             gendisk::GenDisk,
-            manager::BlockDevMeta,
+            manager::{block_dev_manager, BlockDevMeta},
         },
         class::Class,
         device::{
@@ -56,7 +56,7 @@ use num_traits::FromPrimitive;
 use system_error::SystemError;
 
 use super::constants::{
-    LoopFlags, LoopIoctl, LoopState, LoopStatus, LoopStatus64, LOOP_BASENAME,
+    LoopConfig, LoopFlags, LoopIoctl, LoopState, LoopStatus, LoopStatus64, LOOP_BASENAME,
     LOOP_IO_DRAIN_CHECK_INTERVAL_US, LOOP_IO_DRAIN_TIMEOUT_MS,
 };
 use super::mode::{effective_dio, sync_before_mode_change};
@@ -395,100 +395,246 @@ impl LoopDevice {
         }
     }
 
-    pub fn bind_file(&self, backing_file: Arc<File>, read_only: bool) -> Result<(), SystemError> {
-        {
-            let inner = self.inner();
-            match inner.state() {
-                LoopState::Unbound => {}
-                LoopState::Bound => return Err(SystemError::EBUSY),
-                _ => return Err(SystemError::ENODEV),
-            }
+    fn backing_file_from_fd(fd: i32) -> Result<Arc<File>, SystemError> {
+        let file = {
+            let table = ProcessManager::current_pcb().fd_table();
+            let guard = table.read();
+            guard.get_file_by_fd(fd)
         }
-        // Metadata can block; fetch it before taking loop configuration locks.
-        let metadata = backing_file.inode().metadata()?;
-        if metadata.size < 0 {
+        .ok_or(SystemError::EBADF)?;
+        // Linux fget() excludes FMODE_PATH before owner/state admission.
+        if file.flags().contains(FileFlags::O_PATH) {
+            return Err(SystemError::EBADF);
+        }
+        Ok(file)
+    }
+
+    fn validate_candidate_type(file: &Arc<File>) -> Result<(), SystemError> {
+        if !matches!(file.file_type(), FileType::File | FileType::BlockDevice) {
             return Err(SystemError::EINVAL);
         }
-        let total_size = metadata.size as usize;
-        let file_size = Self::calc_effective_size(total_size, 0, 0)?;
+        Ok(())
+    }
+
+    fn candidate_size(file: &Arc<File>) -> Result<usize, SystemError> {
+        Self::validate_candidate_type(file)?;
+        let metadata = file.inode().metadata()?;
+        if !matches!(metadata.file_type, FileType::File | FileType::BlockDevice)
+            || metadata.size < 0
+        {
+            return Err(SystemError::EINVAL);
+        }
+        Ok(metadata.size as usize)
+    }
+
+    fn admit_bind_locked(&self) -> Result<(), SystemError> {
+        if self.inner().state() != LoopState::Unbound {
+            return Err(SystemError::EBUSY);
+        }
+        Ok(())
+    }
+
+    /// Called with the device's raw-cache gate exclusive and while Bound.
+    /// Terminal block errors have retired their dirty incarnation and remain
+    /// in errseq; resources still Dirty or pending payload cannot cross a
+    /// mapping generation, even if the first reported error was different.
+    pub(super) fn prepare_raw_mapping_change_locked(&self) -> Result<(), SystemError> {
+        let manager = block_dev_manager();
+        let nodes = manager.snapshot_raw_nodes_locked(self)?;
+        let mut error = None;
+        for node in &nodes {
+            if let Err(failure) = node.sync_raw_cache_locked() {
+                error.get_or_insert(failure);
+            }
+        }
+        if nodes
+            .iter()
+            .any(|node| node.has_raw_writeback_locked() || node.has_dirty_raw_cache_locked())
+        {
+            return Err(error.unwrap_or(SystemError::EBUSY));
+        }
+        let mut first_error = None;
+        for node in &nodes {
+            if let Err(error) = node.invalidate_raw_cache_locked() {
+                first_error.get_or_insert(error);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    fn rescan_partitions_locked(&self) {
+        let Some(device) = self.self_ref.upgrade() else {
+            warn!("loop{}: partition scan lost its device owner", self.minor);
+            return;
+        };
+        let device: Arc<dyn BlockDevice> = device;
+        if let Err(error) = block_dev_manager().scan_partitions_locked(&device) {
+            // Linux commits the configuration first; partition scanning is
+            // best effort and cannot roll that published mapping back.
+            warn!("loop{}: partition scan failed: {:?}", self.minor, error);
+        }
+    }
+
+    pub fn bind_file(&self, backing_file: Arc<File>, read_only: bool) -> Result<(), SystemError> {
+        self.configure_file(backing_file, read_only, &LoopConfig::default())
+    }
+
+    fn configure_file(
+        &self,
+        backing_file: Arc<File>,
+        forced_read_only: bool,
+        config: &LoopConfig,
+    ) -> Result<(), SystemError> {
+        let _noio = crate::cgroup::memory::io::MemoryIoScope::enter_noio();
+        let _raw = self.block_dev_meta.raw_cache_gate.write();
+        self.admit_bind_locked()?;
+        Self::validate_candidate_type(&backing_file)?;
+        {
+            let _topology = LOOP_BACKING_TOPOLOGY_LOCK.lock();
+            let _config = self.config_mutex.lock();
+            self.admit_bind_locked()?;
+            self.validate_backing_chain(&backing_file)?;
+        }
+        // Unknown configure flags are not accepted (unlike status updates).
+        if config.info.lo_flags & !LoopFlags::all().bits() != 0 {
+            return Err(SystemError::EINVAL);
+        }
+        // Dynamic queue block-size changes are tracked separately as MM117.
+        if config.block_size != 0 && config.block_size != LBA_SIZE as u32 {
+            return Err(SystemError::EINVAL);
+        }
+        Self::validate_loop_status64_params(&config.info)?;
+        let total_size = Self::candidate_size(&backing_file)?;
+        let offset = config.info.lo_offset as usize;
+        let limit = config.info.lo_sizelimit as usize;
+        let file_size = Self::calc_effective_size(total_size, offset, limit)?;
         let use_dio = effective_dio(
             &backing_file,
-            0,
-            backing_file.flags().contains(FileFlags::O_DIRECT),
+            offset,
+            backing_file.flags().contains(FileFlags::O_DIRECT)
+                || config.info.lo_flags & LoopFlags::DIRECT_IO.bits() != 0,
         )?;
         if use_dio {
             sync_before_mode_change(&backing_file);
         }
-
-        let _topology = LOOP_BACKING_TOPOLOGY_LOCK.lock();
-        let _config = self.config_mutex.lock();
-        self.validate_backing_chain(&backing_file)?;
-
-        let mut inner = self.inner();
-        match inner.state() {
-            LoopState::Unbound => {}
-            LoopState::Bound => return Err(SystemError::EBUSY),
-            LoopState::Rundown | LoopState::Draining | LoopState::Deleting => {
-                return Err(SystemError::ENODEV);
-            }
+        let partscan = config.info.lo_flags & LoopFlags::PARTSCAN.bits() != 0;
+        {
+            let _topology = LOOP_BACKING_TOPOLOGY_LOCK.lock();
+            let _config = self.config_mutex.lock();
+            self.admit_bind_locked()?;
+            self.validate_backing_chain(&backing_file)?;
+            let mut inner = self.inner();
+            inner.set_state(LoopState::Bound)?;
+            Self::set_file_locked(&mut inner, backing_file, file_size);
+            inner.offset = offset;
+            inner.size_limit = limit;
+            inner.flags = LoopFlags::from_bits_truncate(config.info.lo_flags);
+            inner.flags.set(
+                LoopFlags::READ_ONLY,
+                forced_read_only || config.info.lo_flags & LoopFlags::READ_ONLY.bits() != 0,
+            );
+            inner.flags.set(LoopFlags::DIRECT_IO, use_dio);
+            inner.file_name = config.info.lo_file_name;
+            inner.file_name[63] = 0;
         }
-
-        inner.set_state(LoopState::Bound)?;
-        Self::set_file_locked(&mut inner, backing_file, file_size);
-        inner.flags = if read_only {
-            LoopFlags::READ_ONLY
-        } else {
-            LoopFlags::empty()
-        };
-        inner.flags.set(LoopFlags::DIRECT_IO, use_dio);
+        if partscan {
+            self.rescan_partitions_locked();
+        }
         Ok(())
     }
 
     pub fn clear_file(&self) -> Result<(), SystemError> {
+        self.clear_binding(false)
+    }
+
+    /// Frontend exclusion precedes all configuration locks. Flush the old
+    /// generation while Bound, then drain real payload and detach atomically.
+    fn clear_binding(&self, release: bool) -> Result<(), SystemError> {
+        let _noio = crate::cgroup::memory::io::MemoryIoScope::enter_noio();
+        let _raw = self.block_dev_meta.raw_cache_gate.write();
+        let generation = {
+            let _topology = LOOP_BACKING_TOPOLOGY_LOCK.lock();
+            let _config = self.config_mutex.lock();
+            let mut inner = self.inner();
+            if release
+                && (inner.state() != LoopState::Bound
+                    || !inner.flags.contains(LoopFlags::AUTOCLEAR)
+                    || self.open_count.load(Ordering::Acquire) != 0
+                    || self.mount_holder_count.load(Ordering::Acquire) != 0)
+            {
+                return Ok(());
+            }
+            match inner.state() {
+                LoopState::Unbound => return Err(SystemError::ENXIO),
+                LoopState::Bound => {}
+                _ => return Err(SystemError::EBUSY),
+            }
+            if self.open_count.load(Ordering::Acquire) > u32::from(!release)
+                || self.mount_holder_count.load(Ordering::Acquire) != 0
+            {
+                if !inner.flags.contains(LoopFlags::AUTOCLEAR) {
+                    inner.flags.insert(LoopFlags::AUTOCLEAR);
+                    inner.generation = inner.generation.wrapping_add(1);
+                }
+                return Ok(());
+            }
+            inner.generation
+        };
+        let manager = block_dev_manager();
+        // Keep removed partition nodes alive until all their old cache pages
+        // and error generations are retired, not just the surviving part0.
+        let nodes = manager.snapshot_raw_nodes_locked(self)?;
+        let mut error = None;
+        for node in &nodes {
+            if let Err(failure) = node.sync_raw_cache_locked() {
+                error.get_or_insert(failure);
+            }
+        }
+        // Final detach is a best-effort flush, as Linux final release is: any
+        // remaining dirty pages retire with this binding. A mapping change
+        // keeps the device alive and must instead preserve/reject such pages
+        // (prepare_raw_mapping_change_locked). Pending payload must always end
+        // before either path may release the old backing file.
+        if nodes.iter().any(|node| node.has_raw_writeback_locked()) {
+            return Err(error.unwrap_or(SystemError::EBUSY));
+        }
         let (epoch, generation) = {
             let _topology = LOOP_BACKING_TOPOLOGY_LOCK.lock();
             let _config = self.config_mutex.lock();
             let mut inner = self.inner();
-            match inner.state() {
-                LoopState::Unbound => return Err(SystemError::ENXIO),
-                LoopState::Bound => {
-                    // The ioctl file itself owns one open description. Any
-                    // additional open description includes nested-loop backing
-                    // Files; mounted filesystems are tracked separately.
-                    if self.open_count.load(Ordering::Acquire) > 1
-                        || self.mount_holder_count.load(Ordering::Acquire) != 0
-                    {
-                        // Linux LOOP_CLR_FD succeeds for a busy loop device and
-                        // defers the actual detach until the final user leaves.
-                        if !inner.flags.contains(LoopFlags::AUTOCLEAR) {
-                            inner.flags.insert(LoopFlags::AUTOCLEAR);
-                            // Invalidate reconfiguration snapshots that would
-                            // otherwise republish the old flag value.
-                            inner.generation = inner.generation.wrapping_add(1);
-                        }
-                        return Ok(());
-                    }
-                    inner.set_state(LoopState::Draining)?;
-                    Self::install_quiesce_owner(&mut inner, LoopQuiesceOwner::Clear)
-                }
-                LoopState::Rundown | LoopState::Draining | LoopState::Deleting => {
-                    return Err(SystemError::EBUSY);
-                }
+            if inner.state() != LoopState::Bound || inner.generation != generation {
+                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
             }
+            inner.set_state(LoopState::Draining)?;
+            Self::install_quiesce_owner(&mut inner, LoopQuiesceOwner::Clear)
         };
-
-        self.finish_clear(epoch, generation)
-    }
-
-    fn finish_clear(&self, epoch: u64, generation: u64) -> Result<(), SystemError> {
         if let Err(error) = self.wait_for_active_io() {
             self.rollback_bound_quiesce(epoch, generation, LoopQuiesceOwner::Clear);
             return Err(error);
         }
-
-        let topology = LOOP_BACKING_TOPOLOGY_LOCK.lock();
-        let config = self.config_mutex.lock();
+        let Some(device) = self.self_ref.upgrade() else {
+            self.rollback_bound_quiesce(epoch, generation, LoopQuiesceOwner::Clear);
+            return Err(SystemError::ENODEV);
+        };
+        let device: Arc<dyn BlockDevice> = device;
+        if let Err(error) = manager.remove_partitions_locked(&device) {
+            self.rollback_bound_quiesce(epoch, generation, LoopQuiesceOwner::Clear);
+            return Err(error);
+        }
+        for node in &nodes {
+            if let Err(error) = node.retire_raw_cache_locked() {
+                self.rollback_bound_quiesce(epoch, generation, LoopQuiesceOwner::Clear);
+                return Err(error);
+            }
+        }
+        // No fallible namespace or page retirement remains. Reset only this
+        // detached binding's errseq, outside all configuration/inner locks.
+        for node in &nodes {
+            node.reset_raw_cache_writeback_error_locked();
+        }
         let old_file = {
+            let _topology = LOOP_BACKING_TOPOLOGY_LOCK.lock();
+            let _config = self.config_mutex.lock();
             let mut inner = self.inner();
             if !Self::quiesce_still_owned(&inner, epoch, generation, LoopQuiesceOwner::Clear) {
                 return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
@@ -504,40 +650,14 @@ impl LoopDevice {
             inner.set_state(LoopState::Unbound)?;
             old
         };
-
-        drop(config);
-        drop(topology);
+        // File release may close a nested block device and enter its owner.
+        // The target gate remains exclusive, but no configuration lock does.
         drop(old_file);
         Ok(())
     }
 
     fn maybe_autoclear(&self) {
-        // file_open() and mount_holder_acquire() take config_mutex before
-        // incrementing their counters. Recheck both counters and publish
-        // Draining under that same mutex so a new user cannot race the final
-        // close and get detached after a successful open.
-        let owner = {
-            let _topology = LOOP_BACKING_TOPOLOGY_LOCK.lock();
-            let _config = self.config_mutex.lock();
-            let mut inner = self.inner();
-            if !matches!(inner.state(), LoopState::Bound)
-                || !inner.flags.contains(LoopFlags::AUTOCLEAR)
-                || self.open_count.load(Ordering::Acquire) != 0
-                || self.mount_holder_count.load(Ordering::Acquire) != 0
-            {
-                return;
-            }
-            if let Err(error) = inner.set_state(LoopState::Draining) {
-                warn!(
-                    "loop{}: cannot begin deferred autoclear: {:?}",
-                    self.minor, error
-                );
-                return;
-            }
-            Self::install_quiesce_owner(&mut inner, LoopQuiesceOwner::Clear)
-        };
-
-        if let Err(error) = self.finish_clear(owner.0, owner.1) {
+        if let Err(error) = self.clear_binding(true) {
             warn!("loop{}: deferred autoclear failed: {:?}", self.minor, error);
         }
     }
@@ -554,11 +674,6 @@ impl LoopDevice {
             || info.lo_sizelimit > usize::MAX as u64
         {
             return Err(SystemError::EOVERFLOW);
-        }
-        // Unknown bits are ignored by Linux. PARTSCAN needs a real partition
-        // lifecycle implementation (MM-112), so do not claim that capability.
-        if info.lo_flags & (1 << 3) != 0 {
-            return Err(SystemError::EINVAL);
         }
         Ok(())
     }
@@ -577,6 +692,9 @@ impl LoopDevice {
                 LoopFlags::AUTOCLEAR,
                 status.lo_flags & LoopFlags::AUTOCLEAR.bits() != 0,
             );
+            if status.lo_flags & LoopFlags::PARTSCAN.bits() != 0 {
+                inner.flags.insert(LoopFlags::PARTSCAN);
+            }
             inner.file_name = status.lo_file_name;
             inner.file_name[63] = 0;
         }
@@ -595,14 +713,14 @@ impl LoopDevice {
     /// For unmounted/raw users, the Draining interval waits for every request
     /// using the old translated range before publishing the new mapping.
     fn reconfigure_mapping(&self, status: Option<&LoopStatus64>) -> Result<(), SystemError> {
+        let _noio = crate::cgroup::memory::io::MemoryIoScope::enter_noio();
+        let _raw = self.block_dev_meta.raw_cache_gate.write();
         for _ in 0..16 {
-            let (backing_file, old_offset, old_limit, old_size, old_dio, generation) = {
+            let (backing_file, old_offset, old_limit, old_size, old_dio, old_partscan, generation) = {
                 let inner = self.inner();
                 if inner.state() != LoopState::Bound {
                     return Err(SystemError::ENXIO);
                 }
-                // Copyin precedes this owner/state check, which precedes
-                // parameter validation, matching both Linux status ABIs.
                 if let Some(status) = status {
                     Self::validate_loop_status64_params(status)?;
                 }
@@ -612,6 +730,7 @@ impl LoopDevice {
                     inner.size_limit,
                     inner.file_size,
                     inner.flags.contains(LoopFlags::DIRECT_IO),
+                    inner.flags.contains(LoopFlags::PARTSCAN),
                     inner.generation,
                 )
             };
@@ -622,44 +741,65 @@ impl LoopDevice {
             } else {
                 old_dio
             };
-            // A status/name-only update does not implicitly refresh capacity.
-            // SET_CAPACITY is represented by None and explicitly refreshes it.
             let effective =
                 if status.is_some() && new_offset == old_offset && new_limit == old_limit {
                     old_size
                 } else {
                     Self::compute_effective_size(&backing_file, new_offset, new_limit)?
                 };
+            let scan = status
+                .is_some_and(|status| status.lo_flags & LoopFlags::PARTSCAN.bits() != 0)
+                && !old_partscan;
+            if new_offset == old_offset
+                && new_limit == old_limit
+                && effective == old_size
+                && use_dio == old_dio
+            {
+                {
+                    let _topology = LOOP_BACKING_TOPOLOGY_LOCK.lock();
+                    let _config = self.config_mutex.lock();
+                    let mut inner = self.inner();
+                    if inner.state() != LoopState::Bound
+                        || inner.generation != generation
+                        || !inner
+                            .backing_file
+                            .as_ref()
+                            .is_some_and(|file| Arc::ptr_eq(file, &backing_file))
+                    {
+                        continue;
+                    }
+                    if Self::update_status_locked(&mut inner, status, use_dio) {
+                        inner.generation = inner.generation.wrapping_add(1);
+                    }
+                }
+                // Name/flag-only status does not flush/invalidate raw data.
+                // A first PARTSCAN requests its own Linux post-commit scan.
+                if scan {
+                    self.rescan_partitions_locked();
+                }
+                return Ok(());
+            }
+            if self.mount_holder_count.load(Ordering::Acquire) != 0 {
+                return Err(SystemError::EBUSY);
+            }
+            // The cache backend must still see Bound and the old capacity.
+            self.prepare_raw_mapping_change_locked()?;
             let owner = {
                 let _topology = LOOP_BACKING_TOPOLOGY_LOCK.lock();
                 let _config = self.config_mutex.lock();
                 let mut inner = self.inner();
-                let unchanged_snapshot = inner
-                    .backing_file
-                    .as_ref()
-                    .is_some_and(|current| Arc::ptr_eq(current, &backing_file))
-                    && inner.generation == generation
-                    && inner.state() == LoopState::Bound;
-                if !unchanged_snapshot {
-                    continue;
-                }
-                if new_offset == old_offset
-                    && new_limit == old_limit
-                    && effective == old_size
-                    && use_dio == old_dio
+                if inner.state() != LoopState::Bound
+                    || inner.generation != generation
+                    || !inner
+                        .backing_file
+                        .as_ref()
+                        .is_some_and(|file| Arc::ptr_eq(file, &backing_file))
                 {
-                    if Self::update_status_locked(&mut inner, status, use_dio) {
-                        inner.generation = inner.generation.wrapping_add(1);
-                    }
-                    return Ok(());
-                }
-                if self.mount_holder_count.load(Ordering::Acquire) != 0 {
-                    return Err(SystemError::EBUSY);
+                    continue;
                 }
                 inner.set_state(LoopState::Draining)?;
                 Self::install_quiesce_owner(&mut inner, LoopQuiesceOwner::Reconfigure)
             };
-
             if let Err(error) = self.wait_for_active_io() {
                 self.rollback_bound_quiesce(owner.0, owner.1, LoopQuiesceOwner::Reconfigure);
                 return Err(error);
@@ -667,23 +807,29 @@ impl LoopDevice {
             if use_dio != old_dio {
                 sync_before_mode_change(&backing_file);
             }
-
-            let _topology = LOOP_BACKING_TOPOLOGY_LOCK.lock();
-            let _config = self.config_mutex.lock();
-            let mut inner = self.inner();
-            if !Self::quiesce_still_owned(&inner, owner.0, owner.1, LoopQuiesceOwner::Reconfigure) {
-                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+            {
+                let _topology = LOOP_BACKING_TOPOLOGY_LOCK.lock();
+                let _config = self.config_mutex.lock();
+                let mut inner = self.inner();
+                if !Self::quiesce_still_owned(
+                    &inner,
+                    owner.0,
+                    owner.1,
+                    LoopQuiesceOwner::Reconfigure,
+                ) {
+                    return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+                }
+                inner.offset = new_offset;
+                inner.size_limit = new_limit;
+                inner.file_size = effective;
+                Self::update_status_locked(&mut inner, status, use_dio);
+                inner.generation = inner.generation.wrapping_add(1);
+                inner.quiesce_owner = None;
+                inner.set_state(LoopState::Bound)?;
             }
-            debug_assert_eq!(inner.offset, old_offset);
-            debug_assert_eq!(inner.size_limit, old_limit);
-            debug_assert_eq!(inner.file_size, old_size);
-            inner.offset = new_offset;
-            inner.size_limit = new_limit;
-            inner.file_size = effective;
-            Self::update_status_locked(&mut inner, status, use_dio);
-            inner.generation = inner.generation.wrapping_add(1);
-            inner.quiesce_owner = None;
-            inner.set_state(LoopState::Bound)?;
+            if scan {
+                self.rescan_partitions_locked();
+            }
             return Ok(());
         }
         Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
@@ -789,25 +935,9 @@ impl LoopDevice {
     /// - `Ok(())`: 成功切换。
     /// - `Err(SystemError)`: 切换失败原因。
     fn change_fd(&self, new_file_fd: i32) -> Result<(), SystemError> {
-        let fd_table = ProcessManager::current_pcb().fd_table();
-        let new_file = {
-            let guard = fd_table.read();
-            guard.get_file_by_fd(new_file_fd)
-        }
-        .ok_or(SystemError::EBADF)?;
-
-        let inode = new_file.inode();
-        let metadata = inode.metadata()?;
-        match metadata.file_type {
-            FileType::File | FileType::BlockDevice => {}
-            _ => return Err(SystemError::EINVAL),
-        }
-
-        if metadata.size < 0 {
-            return Err(SystemError::EINVAL);
-        }
-        let total_size = metadata.size as usize;
-
+        let new_file = Self::backing_file_from_fd(new_file_fd)?;
+        let _noio = crate::cgroup::memory::io::MemoryIoScope::enter_noio();
+        let _raw = self.block_dev_meta.raw_cache_gate.write();
         // Geometry lookup can recurse through a registered backing device.
         // Prepare without configuration/topology locks, then validate the
         // retained mapping generation before claiming the drain transaction.
@@ -815,7 +945,7 @@ impl LoopDevice {
             let (offset, limit, old_size, old_dio, snapshot_generation) = {
                 let inner = self.inner();
                 if inner.state() != LoopState::Bound {
-                    return Err(SystemError::ENODEV);
+                    return Err(SystemError::ENXIO);
                 }
                 if !inner.is_read_only() {
                     return Err(SystemError::EINVAL);
@@ -831,6 +961,20 @@ impl LoopDevice {
                     inner.generation,
                 )
             };
+            Self::validate_candidate_type(&new_file)?;
+            {
+                let _topology = LOOP_BACKING_TOPOLOGY_LOCK.lock();
+                let _config = self.config_mutex.lock();
+                {
+                    let inner = self.inner();
+                    if inner.state() != LoopState::Bound || inner.generation != snapshot_generation
+                    {
+                        continue;
+                    }
+                }
+                self.validate_backing_chain(&new_file)?;
+            }
+            let total_size = Self::candidate_size(&new_file)?;
             let effective = Self::calc_effective_size(total_size, offset, limit)?;
             if effective != old_size {
                 return Err(SystemError::EINVAL);
@@ -840,14 +984,19 @@ impl LoopDevice {
                 offset,
                 old_dio || new_file.flags().contains(FileFlags::O_DIRECT),
             )?;
+            self.prepare_raw_mapping_change_locked()?;
             let (epoch, generation) = {
                 let _topology = LOOP_BACKING_TOPOLOGY_LOCK.lock();
                 let _config = self.config_mutex.lock();
+                {
+                    let inner = self.inner();
+                    if inner.state() != LoopState::Bound || inner.generation != snapshot_generation
+                    {
+                        continue;
+                    }
+                }
                 self.validate_backing_chain(&new_file)?;
                 let mut inner = self.inner();
-                if inner.state() != LoopState::Bound || inner.generation != snapshot_generation {
-                    continue;
-                }
                 inner.set_state(LoopState::Draining)?;
                 Self::install_quiesce_owner(&mut inner, LoopQuiesceOwner::Change)
             };
@@ -883,6 +1032,10 @@ impl LoopDevice {
             drop(config);
             drop(topology);
             drop(old_file);
+            let partscan = self.inner().flags.contains(LoopFlags::PARTSCAN);
+            if partscan {
+                self.rescan_partitions_locked();
+            }
             return Ok(());
         }
         Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
@@ -922,6 +1075,7 @@ impl LoopDevice {
     }
 
     pub(super) fn prepare_delete(&self) -> Result<(), SystemError> {
+        let _raw = self.block_dev_meta.raw_cache_gate.write();
         let _topology = LOOP_BACKING_TOPOLOGY_LOCK.lock();
         let _config = self.config_mutex.lock();
         let mut inner = self.inner();
@@ -1157,22 +1311,21 @@ impl IndexNode for LoopDevice {
 
             match ioctl_cmd {
                 LoopIoctl::LoopSetFd => {
-                    let file_fd = data as i32;
-                    let fd_table = ProcessManager::current_pcb().fd_table();
-                    let file = {
-                        let guard = fd_table.read();
-                        guard.get_file_by_fd(file_fd)
-                    }
-                    .ok_or(SystemError::EBADF)?;
-                    let inode = file.inode();
-                    let metadata = inode.metadata()?;
-                    match metadata.file_type {
-                        FileType::File | FileType::BlockDevice => {}
-                        _ => return Err(SystemError::EINVAL),
-                    }
-
+                    let file = Self::backing_file_from_fd(data as i32)?;
                     let read_only = file.flags().is_read_only() || !control_writable;
                     self.bind_file(file, read_only)?;
+                    Ok(0)
+                }
+                LoopIoctl::LoopConfigure => {
+                    let reader = UserBufferReader::new::<LoopConfig>(
+                        data as *const LoopConfig,
+                        core::mem::size_of::<LoopConfig>(),
+                        true,
+                    )?;
+                    let config: LoopConfig = reader.buffer_protected(0)?.read_one(0)?;
+                    let file = Self::backing_file_from_fd(config.fd as i32)?;
+                    let read_only = file.flags().is_read_only() || !control_writable;
+                    self.configure_file(file, read_only, &config)?;
                     Ok(0)
                 }
                 LoopIoctl::LoopClrFd => {
@@ -1205,9 +1358,6 @@ impl IndexNode for LoopDevice {
                     Ok(0)
                 }
                 LoopIoctl::LoopChangeFd => {
-                    if !may_reconfigure {
-                        return Err(SystemError::EPERM);
-                    }
                     self.change_fd(data as i32)?;
                     Ok(0)
                 }
@@ -1218,6 +1368,21 @@ impl IndexNode for LoopDevice {
                     self.set_capacity(data)?;
                     Ok(0)
                 }
+                LoopIoctl::LoopSetBlockSize => {
+                    if !may_reconfigure {
+                        return Err(SystemError::EPERM);
+                    }
+                    let inner = self.inner();
+                    if inner.state() != LoopState::Bound {
+                        return Err(SystemError::ENXIO);
+                    }
+                    if data != LBA_SIZE {
+                        return Err(SystemError::EINVAL);
+                    }
+                    // The supported queue already has this logical block size.
+                    // Other sizes need the complete MM117 queue/cache contract.
+                    Ok(0)
+                }
                 LoopIoctl::LoopSetDirectIo => {
                     if !may_reconfigure {
                         return Err(SystemError::EPERM);
@@ -1225,7 +1390,6 @@ impl IndexNode for LoopDevice {
                     self.set_direct_io(data != 0)?;
                     Ok(0)
                 }
-                _ => Err(SystemError::EINVAL),
             }
         })();
         result.map_err(Into::into)
@@ -1376,6 +1540,10 @@ impl BlockDevice for LoopDevice {
 
     fn blkdev_meta(&self) -> &BlockDevMeta {
         &self.block_dev_meta
+    }
+
+    fn is_read_only(&self) -> bool {
+        self.inner().is_read_only()
     }
 
     fn disk_range(&self) -> GeneralBlockRange {

@@ -948,6 +948,13 @@ impl BlockDevice for VirtIOBlkDevice {
         &self.blkdev_meta
     }
 
+    fn is_read_only(&self) -> bool {
+        self.inner()
+            .device_inner
+            .as_ref()
+            .is_some_and(|device| device.readonly())
+    }
+
     fn disk_range(&self) -> GeneralBlockRange {
         let inner = self.inner();
         let blocks = inner.capacity_blocks;

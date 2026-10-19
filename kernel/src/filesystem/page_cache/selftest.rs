@@ -1,6 +1,7 @@
 use super::*;
 use crate::arch::mm::LockedFrameAllocator;
 
+mod raw_writeback;
 mod read_completion;
 
 static PAGECACHE_COMPLETION_SELFTEST_RUNNING: AtomicBool = AtomicBool::new(false);
@@ -596,6 +597,27 @@ impl PageCacheInvalidateRetrySelftestState {
 struct PageCacheQuotaSelftestBackend {
     reserved: AtomicUsize,
     released: AtomicUsize,
+}
+
+/// Exercise terminal block mapping errors separately from filesystem retries.
+#[derive(Debug)]
+struct TerminalWritebackSelftestBackend {
+    failure: Mutex<Option<SystemError>>,
+}
+
+impl PageCacheBackend for TerminalWritebackSelftestBackend {
+    fn read_page(&self, _index: usize, _buf: &mut [u8]) -> Result<usize, SystemError> {
+        Ok(0)
+    }
+    fn write_page(&self, _index: usize, buf: &[u8]) -> Result<usize, SystemError> {
+        self.failure.lock().take().map_or(Ok(buf.len()), Err)
+    }
+    fn npages(&self) -> usize {
+        1
+    }
+    fn retry_writeback_error(&self, error: SystemError) -> bool {
+        error == SystemError::EAGAIN_OR_EWOULDBLOCK
+    }
 }
 
 /// Test-only backend for the writeback claim lock-order contract.
@@ -1265,8 +1287,12 @@ pub(crate) fn run_completion_domain_debug_selftest() -> Result<alloc::string::St
         return Ok("status=fail stage=global_worker_read_completion\n".into());
     }
 
+    if !raw_writeback::run()? {
+        return Ok("status=fail stage=raw_stacked_writeback\n".into());
+    }
+
     Ok(alloc::format!(
-        "status=ok generic_waiters={} completion_domain=independent\nglobal_worker_read_completion=ok\n",
+        "status=ok generic_waiters={} completion_domain=independent\nglobal_worker_read_completion=ok\nraw_stacked_writeback=ok\n",
         PAGECACHE_IO_WORKERS
     ))
 }
@@ -5348,6 +5374,127 @@ pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, S
     let _ = page_reclaimer_lock().remove_page(&writeback_paddr);
     if !writeback_ok {
         return Ok("status=fail stage=writeback_teardown\n".into());
+    }
+
+    // Terminal block errors retire only the submitted incarnation; resource
+    // retries and a concurrently published successor must remain dirty.
+    for (error, successor, expect_dirty) in [
+        (SystemError::EIO, false, false),
+        (SystemError::EIO, true, true),
+        (SystemError::EAGAIN_OR_EWOULDBLOCK, false, true),
+    ] {
+        let cache = PageCache::new_unowned(
+            None,
+            Some(Arc::new(TerminalWritebackSelftestBackend {
+                failure: Mutex::new(None),
+            })),
+        );
+        let page = cache.get_or_create_page_zero(0)?;
+        let entry = cache.inner.lock().get_entry(0).ok_or(SystemError::EIO)?;
+        if !cache.try_mark_page_writeback(0, page.phys_address()) || !cache.has_writeback_pages() {
+            return Ok("status=fail stage=terminal_writeback_claim\n".into());
+        }
+        page.write().remove_flags(PageFlags::PG_DIRTY);
+        if successor {
+            page.write().add_flags(PageFlags::PG_DIRTY);
+            let mut inner = cache.inner.lock();
+            let _ = PageCache::publish_front_dirty_locked(&mut inner.dirty_pages, 0, &entry);
+        }
+        let result = PageCacheManager::finish_writeback_entry_state(
+            cache.clone(),
+            0,
+            entry.clone(),
+            page.clone(),
+            Err(error.clone()),
+            true,
+        );
+        if result != Err(error.clone())
+            || cache.has_writeback_pages()
+            || cache.has_dirty_pages() != expect_dirty
+            || entry.state()
+                != if expect_dirty {
+                    PageState::Dirty
+                } else {
+                    PageState::UpToDate
+                }
+            || !page.read().flags().contains(PageFlags::PG_ERROR)
+            || cache.check_writeback_error_since(0) != Some(error)
+        {
+            return Ok("status=fail stage=terminal_writeback_completion\n".into());
+        }
+        cache.reset_writeback_error();
+        if cache.check_writeback_error_since(0).is_some() {
+            return Ok("status=fail stage=terminal_writeback_reset\n".into());
+        }
+        cache.manager.resize(0)?;
+    }
+
+    // Clearing detached media must discard the old errno without reusing an
+    // epoch retained by a still-open File. A second OFD can acknowledge the
+    // new error before the original OFD checks its cursor.
+    let media_cache = PageCache::new_unowned(None, None);
+    let mut original_media_cursor = media_cache.sample_writeback_error();
+    media_cache.record_writeback_error(SystemError::EIO);
+    if media_cache.check_and_advance_writeback_error(&mut original_media_cursor)
+        != Some(SystemError::EIO)
+    {
+        return Ok("status=fail stage=media_error_initial_cursor\n".into());
+    }
+    for _ in 0..4 {
+        media_cache.reset_writeback_error();
+        if media_cache
+            .check_writeback_error_since(original_media_cursor)
+            .is_some()
+        {
+            return Ok("status=fail stage=media_error_detach_reset\n".into());
+        }
+        let mut later_media_cursor = media_cache.sample_writeback_error();
+        if media_cache
+            .check_and_advance_writeback_error(&mut later_media_cursor)
+            .is_some()
+        {
+            return Ok("status=fail stage=media_error_clean_epoch\n".into());
+        }
+        media_cache.record_writeback_error(SystemError::EIO);
+        if media_cache.check_and_advance_writeback_error(&mut later_media_cursor)
+            != Some(SystemError::EIO)
+            || media_cache.check_and_advance_writeback_error(&mut original_media_cursor)
+                != Some(SystemError::EIO)
+            || media_cache
+                .check_and_advance_writeback_error(&mut original_media_cursor)
+                .is_some()
+        {
+            return Ok("status=fail stage=media_error_live_cursor_aba\n".into());
+        }
+    }
+
+    // A backend's synchronous failure is a Completed(Failed) outcome, not
+    // an Err from dispatch. Laundering must report it and stop after one
+    // bounded pass even when a resource failure keeps the page dirty.
+    for error in [SystemError::EIO, SystemError::EAGAIN_OR_EWOULDBLOCK] {
+        let cache = PageCache::new_unowned(
+            None,
+            Some(Arc::new(TerminalWritebackSelftestBackend {
+                failure: Mutex::new(Some(error.clone())),
+            })),
+        );
+        let page = cache.get_or_create_page_zero(0)?;
+        let entry = cache.inner.lock().get_entry(0).ok_or(SystemError::EIO)?;
+        page.write().add_flags(PageFlags::PG_DIRTY);
+        {
+            let mut inner = cache.inner.lock();
+            let _ = PageCache::publish_front_dirty_locked(&mut inner.dirty_pages, 0, &entry);
+        }
+        let result = cache
+            .manager()
+            .launder_range_for_invalidate_with_stable_size(0, 0, MMArch::PAGE_SIZE);
+        if result != Err(error.clone())
+            || cache.has_writeback_pages()
+            || cache.has_dirty_pages() != (error == SystemError::EAGAIN_OR_EWOULDBLOCK)
+        {
+            return Ok("status=fail stage=launder_failed_outcome\n".into());
+        }
+        cache.manager.resize(0)?;
     }
 
     // Exhaustion must fail before publishing any Legacy state transition.

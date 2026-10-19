@@ -20,6 +20,17 @@ impl ErrSeq {
         }
     }
 
+    /// Retire a detached mapping's errno after draining all error producers.
+    /// Keep a distinct, sampled epoch: live file cursors can outlast a medium,
+    /// and resetting to zero would let a later error reuse their encoded value.
+    pub(crate) fn clear(&self) {
+        let _ = self
+            .value
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |old| {
+                Some((old & !(MAX_ERRNO | ERRSEQ_SEEN)).wrapping_add(ERRSEQ_CTR_INC) | ERRSEQ_SEEN)
+            });
+    }
+
     pub fn sample(&self) -> ErrSeqValue {
         let old = self.value.load(Ordering::Acquire);
         if old & ERRSEQ_SEEN == 0 {
@@ -130,6 +141,66 @@ mod tests {
         );
         assert_eq!(errseq.check_and_advance(&mut first), None);
         assert_eq!(errseq.check_and_advance(&mut second), None);
+    }
+
+    #[test]
+    fn detached_mapping_does_not_reuse_a_live_cursor() {
+        let errseq = ErrSeq::new();
+        let mut original = errseq.sample();
+        errseq.set(SystemError::EIO);
+        assert_eq!(
+            errseq.check_and_advance(&mut original),
+            Some(SystemError::EIO)
+        );
+        errseq.clear();
+        assert_eq!(errseq.check(original), None);
+        let mut second = errseq.sample();
+        errseq.set(SystemError::EIO);
+        assert_eq!(
+            errseq.check_and_advance(&mut second),
+            Some(SystemError::EIO)
+        );
+        assert_eq!(
+            errseq.check_and_advance(&mut original),
+            Some(SystemError::EIO)
+        );
+        assert_eq!(errseq.check_and_advance(&mut original), None);
+    }
+
+    #[test]
+    fn detach_discards_unseen_error_without_reporting_it_to_a_new_sample() {
+        let errseq = ErrSeq::new();
+        let mut original = errseq.sample();
+        errseq.set(SystemError::ENOSPC);
+        errseq.clear();
+        assert_eq!(errseq.check(original), None);
+        let mut late = errseq.sample();
+        assert_eq!(errseq.check_and_advance(&mut late), None);
+        errseq.set(SystemError::EIO);
+        assert_eq!(errseq.check_and_advance(&mut late), Some(SystemError::EIO));
+        assert_eq!(
+            errseq.check_and_advance(&mut original),
+            Some(SystemError::EIO)
+        );
+    }
+
+    #[test]
+    fn repeated_detaches_keep_same_errno_visible_to_live_watchers() {
+        let errseq = ErrSeq::new();
+        let mut original = errseq.sample();
+        for _ in 0..32 {
+            errseq.clear();
+            errseq.clear();
+            let mut late = errseq.sample();
+            assert_eq!(errseq.check_and_advance(&mut late), None);
+            errseq.set(SystemError::EIO);
+            assert_eq!(errseq.check_and_advance(&mut late), Some(SystemError::EIO));
+            assert_eq!(
+                errseq.check_and_advance(&mut original),
+                Some(SystemError::EIO)
+            );
+            assert_eq!(errseq.check_and_advance(&mut original), None);
+        }
     }
 
     #[test]

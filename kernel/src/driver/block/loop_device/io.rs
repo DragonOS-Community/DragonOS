@@ -329,8 +329,10 @@ impl LoopDevice {
     fn normalize_backing_sync_result(
         result: Result<(), MemoryAllocationError>,
     ) -> Result<(), MemoryAllocationError> {
+        // Linux keeps -EINVAL in lo_req_flush, but errno_to_blk_status maps
+        // it to BLK_STS_IOERR. No backing flush error is a successful flush.
         match result {
-            Ok(()) | Err(MemoryAllocationError::System(SystemError::EINVAL)) => Ok(()),
+            Ok(()) => Ok(()),
             Err(error @ MemoryAllocationError::Charge(_)) => Err(error),
             Err(MemoryAllocationError::System(_)) => Err(SystemError::EIO.into()),
         }

@@ -7971,6 +7971,8 @@ static int ext_test_loop_fuse_backing_sync_semantics() {
     int control_fd = -1;
     int loop_sync_fd = -1;
     int loop_dsync_fd = -1;
+    int loop_direct_dsync_fd = -1;
+    void *direct_block = NULL;
     int minor = -1;
     int mounted = 0;
     int loop_added = 0;
@@ -8101,12 +8103,13 @@ static int ext_test_loop_fuse_backing_sync_semantics() {
         goto fail;
     }
 
-    // Stage 2: O_DSYNC has an independent write+fsync boundary and sets FDATASYNC.
+    // Stage 2: buffered block O_DSYNC drains its raw mapping and issues a
+    // full device flush. Linux loop also calls vfs_fsync(backing, 0) here.
     memset(block, 0xa5, sizeof(block));
     if (pwrite(loop_dsync_fd, block, sizeof(block), 512) != (ssize_t)sizeof(block) ||
         shared->write_count != 2 || shared->fsync_count != 2 ||
         shared->last_write_fh != expected_fh || shared->last_fsync_fh != expected_fh ||
-        shared->last_fsync_flags != FUSE_FSYNC_FDATASYNC ||
+        shared->last_fsync_flags != 0 ||
         shared->write_count_at_fsync != 2) {
         printf("[FAIL] loop+fuse O_DSYNC write=%u fsync=%u wfh=%llu ffh=%llu flags=%u writes_at_fsync=%u errno=%d\n",
                shared->write_count, shared->fsync_count,
@@ -8125,8 +8128,7 @@ static int ext_test_loop_fuse_backing_sync_semantics() {
                shared->last_fsync_flags, shared->write_count_at_fsync, errno);
         goto fail;
     }
-    // Block-device fsync/fdatasync both use the device flush operation; unlike
-    // delegated O_DSYNC above, the explicit block-device operation is a full flush.
+    // Block-device fsync/fdatasync both use the same full device flush.
     if (fdatasync(loop_dsync_fd) != 0 || shared->fsync_count != 4 ||
         shared->last_fsync_fh != expected_fh || shared->last_fsync_flags != 0 ||
         shared->write_count_at_fsync != 2) {
@@ -8152,10 +8154,11 @@ static int ext_test_loop_fuse_backing_sync_semantics() {
     }
     shared->forced_fsync_errno = 0;
 
-    // Stage 5: Linux loop ignores EINVAL from a backing flush.
+    // Stage 5: loop's block-status boundary turns a backing flush EINVAL
+    // into EIO, just as for other unrecognized block errors.
     shared->forced_fsync_errno = EINVAL;
     errno = 0;
-    if (pwrite(loop_sync_fd, block, sizeof(block), 1536) != (ssize_t)sizeof(block) ||
+    if (pwrite(loop_sync_fd, block, sizeof(block), 1536) >= 0 || errno != EIO ||
         shared->write_count != 4 || shared->fsync_count != 6 ||
         shared->last_write_fh != expected_fh || shared->last_fsync_fh != expected_fh ||
         shared->last_fsync_flags != 0 || shared->write_count_at_fsync != 4) {
@@ -8182,6 +8185,48 @@ static int ext_test_loop_fuse_backing_sync_semantics() {
         goto fail;
     }
     shared->forced_fsync_errno = 0;
+
+    // Stage 7: bypassing the raw cache must preserve full block flush
+    // semantics as well. DragonOS completes the submitted payload with one
+    // retained-owner flush; Linux may perform two flushes for this direct path.
+    loop_direct_dsync_fd = open(loop_path, O_RDWR | O_DIRECT | O_DSYNC);
+    if (loop_direct_dsync_fd < 0 || posix_memalign(&direct_block, 4096, sizeof(block)) != 0) {
+        printf("[FAIL] loop+fuse prepare direct O_DSYNC: %s (errno=%d)\n", strerror(errno), errno);
+        goto fail;
+    }
+    memcpy(direct_block, block, sizeof(block));
+    if (pwrite(loop_direct_dsync_fd, direct_block, sizeof(block), 2560) != (ssize_t)sizeof(block) ||
+        shared->write_count != 6 || shared->fsync_count != 8 ||
+        shared->last_write_fh != expected_fh || shared->last_fsync_fh != expected_fh ||
+        shared->last_fsync_flags != 0 || shared->write_count_at_fsync != 6) {
+        printf("[FAIL] loop+fuse direct O_DSYNC write=%u fsync=%u wfh=%llu ffh=%llu flags=%u writes_at_fsync=%u errno=%d\n",
+               shared->write_count, shared->fsync_count,
+               (unsigned long long)shared->last_write_fh,
+               (unsigned long long)shared->last_fsync_fh, shared->last_fsync_flags,
+               shared->write_count_at_fsync, errno);
+        goto fail;
+    }
+
+    // A failed direct flush must report EIO after exactly one submitted write,
+    // without replaying that payload while recovering synchronization.
+    shared->forced_fsync_errno = EIO;
+    errno = 0;
+    if (pwrite(loop_direct_dsync_fd, direct_block, sizeof(block), 3072) >= 0 || errno != EIO ||
+        shared->write_count != 7 || shared->fsync_count != 9 ||
+        shared->last_write_fh != expected_fh || shared->last_fsync_fh != expected_fh ||
+        shared->last_fsync_flags != 0 || shared->write_count_at_fsync != 7) {
+        printf("[FAIL] loop+fuse direct injected EIO ret_errno=%d write=%u fsync=%u wfh=%llu ffh=%llu flags=%u writes_at_fsync=%u\n",
+               errno, shared->write_count, shared->fsync_count,
+               (unsigned long long)shared->last_write_fh,
+               (unsigned long long)shared->last_fsync_fh, shared->last_fsync_flags,
+               shared->write_count_at_fsync);
+        goto fail;
+    }
+    shared->forced_fsync_errno = 0;
+    free(direct_block);
+    direct_block = NULL;
+    close(loop_direct_dsync_fd);
+    loop_direct_dsync_fd = -1;
 
     close(loop_dsync_fd);
     loop_dsync_fd = -1;
@@ -8215,6 +8260,10 @@ static int ext_test_loop_fuse_backing_sync_semantics() {
 
 fail:
     shared->forced_fsync_errno = 0;
+    free(direct_block);
+    if (loop_direct_dsync_fd >= 0) {
+        close(loop_direct_dsync_fd);
+    }
     if (loop_dsync_fd >= 0) {
         close(loop_dsync_fd);
     }

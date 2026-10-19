@@ -1156,9 +1156,12 @@ impl FATFileSystem {
     }
 
     pub fn new(gendisk: Arc<GenDisk>) -> Result<Arc<FATFileSystem>, SystemError> {
-        let device_mount_holder = gendisk.acquire_mount_holder()?;
+        let device_mount_holder =
+            gendisk.acquire_mount_holder(crate::filesystem::vfs::Magic::FAT_MAGIC)?;
+        device_mount_holder.set_min_block_size(512)?;
         let bpb = BiosParameterBlock::new(&gendisk)?;
         Self::validate_table_geometry(&bpb)?;
+        device_mount_holder.set_block_size(bpb.bytes_per_sector as usize)?;
         // 从磁盘上读取FAT32文件系统的FsInfo结构体
         let fs_info: FATFsInfo = match bpb.fat_type {
             FATType::FAT32(bpb32) => {

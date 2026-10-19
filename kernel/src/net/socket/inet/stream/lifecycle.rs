@@ -68,6 +68,7 @@ impl TcpSocket {
                 let tx = self.options.send_buf_size.load(Ordering::Relaxed);
                 if socket.set_receive_buffer_limit(rx) && socket.set_send_buffer_limit(tx) {
                     socket.set_nagle_enabled(self.options.nagle_enabled.load(Ordering::Relaxed));
+                    socket.set_urgent_inline(self.options.so_oobinline.load(Ordering::Relaxed));
                     socket.set_congestion_control(*self.options.congestion_control.lock_irqsave());
                     let keepalive = self.options.so_keepalive.load(Ordering::Relaxed).then(|| {
                         smoltcp::time::Duration::from_secs(

@@ -830,6 +830,41 @@ pub trait PageCacheWritebackSubmission: Send {
 }
 
 pub trait PageCacheBackend: Send + Sync + core::fmt::Debug + 'static {
+    /// Buffer validity/dirty granule. Normal files retain whole-page I/O.
+    fn cache_block_size(&self) -> usize {
+        MMArch::PAGE_SIZE
+    }
+
+    fn read_page_range(
+        &self,
+        index: usize,
+        offset: usize,
+        bytes: &mut [u8],
+    ) -> Result<usize, SystemError> {
+        if offset != 0 || bytes.len() != MMArch::PAGE_SIZE {
+            return Err(SystemError::EINVAL);
+        }
+        self.read_page(index, bytes)
+    }
+
+    /// Clear only blocks whose payload has been confirmed. The caller owns
+    /// this mask through completion/cancellation, including partial failures.
+    fn write_page_blocks(
+        &self,
+        index: usize,
+        bytes: &[u8],
+        remaining: &mut u8,
+    ) -> Result<(), SystemError> {
+        if *remaining != super::ALL_BLOCKS {
+            return Err(SystemError::EINVAL);
+        }
+        if self.write_page(index, bytes)? != bytes.len() {
+            return Err(SystemError::EIO);
+        }
+        *remaining = 0;
+        Ok(())
+    }
+
     fn read_page(&self, index: usize, buf: &mut [u8]) -> Result<usize, SystemError>;
     fn write_page(&self, index: usize, buf: &[u8]) -> Result<usize, SystemError>;
     fn npages(&self) -> usize;
@@ -1296,6 +1331,7 @@ struct WritebackGuard {
     entry: Arc<PageEntry>,
     page: Arc<Page>,
     disarmed: bool,
+    remaining_blocks: u8,
 }
 
 impl WritebackGuard {
@@ -1304,6 +1340,7 @@ impl WritebackGuard {
         page_index: usize,
         entry: Arc<PageEntry>,
         page: Arc<Page>,
+        remaining_blocks: u8,
     ) -> Self {
         Self {
             cache,
@@ -1311,6 +1348,7 @@ impl WritebackGuard {
             entry,
             page,
             disarmed: false,
+            remaining_blocks,
         }
     }
 
@@ -1324,12 +1362,12 @@ impl Drop for WritebackGuard {
     fn drop(&mut self) {
         if !self.disarmed {
             // Page stuck in Writeback due to unexpected error; revert to Dirty for retry.
-            let _ = PageCacheManager::finish_writeback_entry(
+            PageCacheManager::cancel_writeback_entry(
                 self.cache.clone(),
                 self.page_index,
                 self.entry.clone(),
                 self.page.clone(),
-                Err(SystemError::EIO),
+                self.remaining_blocks,
             );
         }
     }
@@ -1834,6 +1872,18 @@ impl PageCacheManager {
                     page_index,
                     entry.clone(),
                     page.clone(),
+                    {
+                        let blocks = entry.dirty_blocks.swap(0, Ordering::Relaxed);
+                        if blocks == 0
+                            && backend.as_ref().is_none_or(|backend| {
+                                backend.cache_block_size() == MMArch::PAGE_SIZE
+                            })
+                        {
+                            super::ALL_BLOCKS
+                        } else {
+                            blocks
+                        }
+                    },
                 ));
                 prepared.push((page_index, entry, page));
             }
@@ -1895,6 +1945,7 @@ impl PageCacheManager {
                 page,
                 result.clone(),
                 false,
+                guard.remaining_blocks,
             ) {
                 first_error.get_or_insert(error);
             }
@@ -1943,20 +1994,17 @@ impl PageCacheManager {
 
         {
             let mut inner = batch.cache.inner.lock();
-            for (page_index, entry, _page) in batch.entries.iter() {
-                let attached = inner
-                    .pages
-                    .get(page_index)
-                    .is_some_and(|current| Arc::ptr_eq(current, entry));
-                if attached {
-                    entry.account_state_transition(PageState::Writeback, PageState::Dirty);
-                    inner.set_index(*page_index, 2, false);
-                    inner.set_index(*page_index, 1, true);
-                    if let Some(tag) = batch.retry_writeback_tag {
-                        entry.set_writeback_tag(tag);
-                    }
+            for ((page_index, entry, _page), guard) in batch.entries.iter().zip(batch.guards.iter())
+            {
+                Self::redirty_writeback_entry_locked(
+                    &mut inner,
+                    *page_index,
+                    entry,
+                    guard.remaining_blocks,
+                );
+                if let Some(tag) = batch.retry_writeback_tag {
+                    entry.set_writeback_tag(tag);
                 }
-                entry.set_state(PageState::Dirty);
             }
         }
 
@@ -1985,7 +2033,7 @@ impl PageCacheManager {
     pub(super) fn snapshot_writeback_batch(
         batch: &mut ClaimedWritebackBatch,
     ) -> Result<(), SystemError> {
-        for (page_index, entry, page) in batch.entries.iter() {
+        for ((page_index, entry, page), guard) in batch.entries.iter().zip(batch.guards.iter()) {
             let page_start = page_index
                 .checked_mul(MMArch::PAGE_SIZE)
                 .ok_or(SystemError::EOVERFLOW)?;
@@ -2020,6 +2068,9 @@ impl PageCacheManager {
             }
             if len == 0 {
                 continue;
+            }
+            if guard.remaining_blocks & !entry.valid_blocks.load(Ordering::Acquire) != 0 {
+                return Err(SystemError::EIO);
             }
             let src = unsafe { page_guard.as_slice() };
             batch.data.extend_from_slice(&src[..len]);
@@ -2059,9 +2110,30 @@ impl PageCacheManager {
         } else if batch.data.is_empty() {
             Ok(PageCacheWritebackSubmitResult::Completed)
         } else if let Some(backend) = batch.backend.as_ref() {
-            backend
-                .write_pages(batch.first_index, &batch.data)
-                .map(|_| PageCacheWritebackSubmitResult::Completed)
+            let result = if backend.cache_block_size() < MMArch::PAGE_SIZE {
+                let mut result = Ok(());
+                for ((page_index, _, _), guard) in batch.entries.iter().zip(batch.guards.iter_mut())
+                {
+                    let start = (page_index - batch.first_index) * MMArch::PAGE_SIZE;
+                    if start >= batch.data.len() {
+                        guard.remaining_blocks = 0;
+                        continue;
+                    }
+                    let end = (start + MMArch::PAGE_SIZE).min(batch.data.len());
+                    if let Err(error) = backend.write_page_blocks(
+                        *page_index,
+                        &batch.data[start..end],
+                        &mut guard.remaining_blocks,
+                    ) {
+                        result = Err(error);
+                        break;
+                    }
+                }
+                result
+            } else {
+                backend.write_pages(batch.first_index, &batch.data)
+            };
+            result.map(|_| PageCacheWritebackSubmitResult::Completed)
         } else {
             let inode = batch
                 .cache
@@ -4935,14 +5007,53 @@ impl PageCacheManager {
         }
     }
 
-    fn finish_writeback_entry(
+    fn redirty_writeback_entry_locked(
+        inner: &mut super::InnerPageCache,
+        page_index: usize,
+        entry: &Arc<PageEntry>,
+        remaining_blocks: u8,
+    ) {
+        let attached = inner
+            .pages
+            .get(&page_index)
+            .is_some_and(|current| Arc::ptr_eq(current, entry));
+        if attached {
+            entry
+                .dirty_blocks
+                .fetch_or(remaining_blocks, Ordering::Relaxed);
+            entry.account_state_transition(PageState::Writeback, PageState::Dirty);
+            inner.set_index(page_index, 2, false);
+            inner.set_index(page_index, 1, true);
+        }
+        entry.set_state(PageState::Dirty);
+    }
+
+    fn cancel_writeback_entry(
         cache: Arc<PageCache>,
         page_index: usize,
         entry: Arc<PageEntry>,
         page: Arc<Page>,
-        result: Result<(), SystemError>,
-    ) -> Result<(), SystemError> {
-        Self::finish_writeback_entry_state(cache, page_index, entry, page, result, true)
+        remaining_blocks: u8,
+    ) {
+        let completed = entry.writeback_incarnation.load(Ordering::Acquire);
+        if remaining_blocks == 0 {
+            let _ = Self::complete_writeback_entry_state(
+                cache,
+                page_index,
+                entry,
+                page,
+                completed,
+                Ok(()),
+            );
+            return;
+        }
+        page.write().add_flags(PageFlags::PG_DIRTY);
+        {
+            let mut inner = cache.inner.lock();
+            Self::redirty_writeback_entry_locked(&mut inner, page_index, &entry, remaining_blocks);
+        }
+        entry.wait_queue.wake_all();
+        Self::dispatch_writeback_incarnation_retries(&cache, &entry, completed);
     }
 
     pub(super) fn finish_writeback_entry_state(
@@ -4952,6 +5063,7 @@ impl PageCacheManager {
         page: Arc<Page>,
         result: Result<(), SystemError>,
         record_error: bool,
+        remaining_blocks: u8,
     ) -> Result<(), SystemError> {
         let completed_incarnation = entry.writeback_incarnation.load(Ordering::Acquire);
         if let Err(e) = result {
@@ -4961,7 +5073,7 @@ impl PageCacheManager {
             let retry = cache
                 .backend()
                 .is_none_or(|backend| backend.retry_writeback_error(e.clone()));
-            if !retry {
+            if !retry || remaining_blocks == 0 {
                 // The submitted incarnation is finished. Complete through the
                 // normal redirty check so a concurrent successor is preserved.
                 page.write().add_flags(PageFlags::PG_ERROR);
@@ -4980,16 +5092,12 @@ impl PageCacheManager {
             }
             {
                 let mut inner = cache.inner.lock();
-                let attached = inner
-                    .pages
-                    .get(&page_index)
-                    .is_some_and(|current| Arc::ptr_eq(current, &entry));
-                if attached {
-                    entry.account_state_transition(PageState::Writeback, PageState::Dirty);
-                    inner.set_index(page_index, 2, false);
-                    inner.set_index(page_index, 1, true);
-                }
-                entry.set_state(PageState::Dirty);
+                Self::redirty_writeback_entry_locked(
+                    &mut inner,
+                    page_index,
+                    &entry,
+                    remaining_blocks,
+                );
             }
             entry.wait_queue.wake_all();
             Self::dispatch_writeback_incarnation_retries(&cache, &entry, completed_incarnation);

@@ -62,6 +62,10 @@ pub trait Socket: PollableInode + IndexNode {
 
     fn epoll_items(&self) -> &EPollItems;
 
+    /// Associate the open description supplying socket SIGURG ownership.
+    /// O_ASYNC subscriptions remain independent.
+    fn set_owner_file(&self, _file: alloc::sync::Weak<crate::filesystem::vfs::file::File>) {}
+
     /// Get the fasync items for async I/O notification
     fn fasync_items(&self) -> &FAsyncItems;
 
@@ -136,7 +140,7 @@ pub trait Socket: PollableInode + IndexNode {
     ///
     /// 默认行为是写回源地址（若调用者提供了 addr/addrlen）。stream socket（如 TCP）
     /// 应覆盖为 `Ignore` 以符合 Linux/gVisor 语义。
-    fn recvfrom_addr_behavior(&self) -> super::RecvFromAddrBehavior {
+    fn recvfrom_addr_behavior(&self, _flags: PMSG) -> super::RecvFromAddrBehavior {
         super::RecvFromAddrBehavior::Write
     }
 
@@ -199,6 +203,13 @@ pub trait Socket: PollableInode + IndexNode {
     /// receive sources they do not implement; never select or consume data.
     fn check_recv_flags(&self, _flags: PMSG) -> Result<(), SystemError> {
         Ok(())
+    }
+
+    /// Whether recvmmsg's initial timeout wait uses ordinary read readiness.
+    /// Owners of immediate special receive sources bypass that adapter wait;
+    /// their recvmsg implementation still decides errors and consumption.
+    fn recv_needs_pre_wait(&self, _flags: PMSG) -> bool {
+        true
     }
 
     /// Scalar userspace receive. Protocols with a protected receive engine

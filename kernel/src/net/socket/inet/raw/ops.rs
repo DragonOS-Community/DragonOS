@@ -13,6 +13,10 @@ use super::{InetSocket, RawSocket};
 type EP = crate::filesystem::epoll::EPollEventType;
 
 impl crate::net::socket::Socket for RawSocket {
+    fn recv_needs_pre_wait(&self, flags: PMSG) -> bool {
+        !flags.contains(PMSG::ERRQUEUE)
+    }
+
     fn bind_endpoint_from_user(
         &self,
         addr: *const crate::net::posix::SockAddr,

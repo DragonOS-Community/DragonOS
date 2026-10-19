@@ -67,12 +67,13 @@ use crate::{
         MemoryManagementArch,
     },
     process::{
-        cred::{CAPFlags, Cred},
+        cred::{CAPFlags, Cred, Kuid},
         namespace::{
             cgroup_namespace::CgroupNamespace, ipc_namespace::IpcNamespace, mnt::MntNamespace,
             net_namespace::NetNamespace, pid_namespace::PidNamespace,
             user_namespace::UserNamespace, uts_namespace::UtsNamespace,
         },
+        pid::{Pid, PidType},
         resource::RLimitID,
         ProcessControlBlock, ProcessManager, RawPid,
     },
@@ -195,28 +196,40 @@ enum OffsetUpdate {
 
 #[derive(Clone, Debug)]
 pub struct FileOwnerSnapshot {
-    pub pcb: Option<Arc<ProcessControlBlock>>,
+    pub pid: Option<Arc<Pid>>,
+    pub pid_type: PidType,
     pub signum: i32,
+    pub uid: Kuid,
+    pub euid: Kuid,
 }
 
 #[derive(Debug)]
 struct FileOwner {
-    pcb: Option<Arc<ProcessControlBlock>>,
+    pid: Option<Arc<Pid>>,
+    pid_type: PidType,
     signum: i32,
+    uid: Kuid,
+    euid: Kuid,
 }
 
 impl FileOwner {
     fn new() -> Self {
         Self {
-            pcb: None,
+            pid: None,
+            pid_type: PidType::TGID,
             signum: 0,
+            uid: Kuid::from(0),
+            euid: Kuid::from(0),
         }
     }
 
     fn snapshot(&self) -> FileOwnerSnapshot {
         FileOwnerSnapshot {
-            pcb: self.pcb.clone(),
+            pid: self.pid.clone(),
+            pid_type: self.pid_type,
             signum: self.signum,
+            uid: self.uid,
+            euid: self.euid,
         }
     }
 }
@@ -3926,17 +3939,29 @@ impl File {
         self.inode.as_pollable_inode().is_ok()
     }
 
-    pub fn owner(&self) -> Option<RawPid> {
-        self.owner
-            .lock()
-            .pcb
-            .as_ref()
-            .map(|pcb| pcb.pid().pid_vnr())
+    pub fn owner(&self) -> i32 {
+        let (kind, pid) = self.owner_identity();
+        if kind == PidType::PGID {
+            -pid
+        } else {
+            pid
+        }
     }
 
     /// Get the owner process control block
     pub fn get_owner(&self) -> Option<Arc<ProcessControlBlock>> {
-        self.owner.lock().pcb.clone()
+        let owner = self.owner_snapshot();
+        owner.pid.as_ref()?.pid_task(owner.pid_type)
+    }
+
+    pub(crate) fn owner_identity(&self) -> (PidType, i32) {
+        let owner = self.owner_snapshot();
+        let nr = owner
+            .pid
+            .as_ref()
+            .filter(|pid| pid.has_task(owner.pid_type))
+            .map_or(0, |pid| pid.pid_vnr().data() as i32);
+        (owner.pid_type, nr)
     }
 
     pub fn owner_snapshot(&self) -> FileOwnerSnapshot {
@@ -3945,11 +3970,34 @@ impl File {
 
     /// Set a process (group) as owner of the file descriptor.
     ///
-    /// Such that this process (group) will receive `SIGIO` and `SIGURG` signals
-    /// for I/O events on the file descriptor, if `O_ASYNC` status flag is set
-    /// on this file.
-    pub fn set_owner(&self, pid: Option<Arc<ProcessControlBlock>>) -> Result<(), SystemError> {
-        self.owner.lock().pcb = pid;
+    /// SIGIO additionally requires O_ASYNC; SIGURG does not.
+    pub fn set_owner(self: &Arc<Self>, nr: i32) -> Result<(), SystemError> {
+        let pid = nr.checked_abs().ok_or(SystemError::EINVAL)?;
+        let kind = if nr < 0 { PidType::PGID } else { PidType::TGID };
+        self.set_owner_identity(kind, pid)
+    }
+
+    pub(crate) fn set_owner_identity(
+        self: &Arc<Self>,
+        kind: PidType,
+        nr: i32,
+    ) -> Result<(), SystemError> {
+        let pid = if nr == 0 {
+            None
+        } else {
+            Some(ProcessManager::find_vpid(RawPid::from(nr as usize)).ok_or(SystemError::ESRCH)?)
+        };
+        // Publish the weak notification route before the target becomes live.
+        // Socket callbacks must not run while the file owner lock is held.
+        if let Ok(pollable) = self.inode.as_pollable_inode() {
+            pollable.set_owner_file(Arc::downgrade(self));
+        }
+        let cred = ProcessManager::current_pcb().cred();
+        let mut owner = self.owner.lock();
+        owner.pid = pid;
+        owner.pid_type = kind;
+        owner.uid = cred.uid;
+        owner.euid = cred.euid;
         Ok(())
     }
 

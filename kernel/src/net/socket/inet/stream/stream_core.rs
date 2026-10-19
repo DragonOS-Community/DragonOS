@@ -1,5 +1,4 @@
 use alloc::sync::{Arc, Weak};
-use alloc::vec::Vec;
 use core::sync::atomic::AtomicU64;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize};
 use system_error::SystemError;
@@ -164,13 +163,14 @@ impl PreparedAcceptedSocket {
 
     pub(super) fn commit(self, established: inner::Established) -> Arc<TcpSocket> {
         let socket = self.socket;
-        let (send, recv, nagle, cc, keepalive) = established.with(|protocol| {
+        let (send, recv, nagle, cc, keepalive, urgent_inline) = established.with(|protocol| {
             (
                 protocol.send_buffer_limit(),
                 protocol.receive_buffer_limit(),
                 protocol.nagle_enabled(),
                 protocol.congestion_control(),
                 protocol.keep_alive(),
+                protocol.urgent_inline(),
             )
         });
         socket
@@ -190,6 +190,10 @@ impl PreparedAcceptedSocket {
             .options
             .so_keepalive
             .store(keepalive.is_some(), core::sync::atomic::Ordering::Relaxed);
+        socket
+            .options
+            .so_oobinline
+            .store(urgent_inline, core::sync::atomic::Ordering::Relaxed);
         let policies = established.pmtu_policies();
         let error_policies = established.with(|socket| socket.recv_error_policies());
         for (option, value) in socket.options.recv_errors.iter().zip(error_policies) {
@@ -235,7 +239,8 @@ pub struct TcpSocketData {
     pub(crate) epoll_items: EPollItems,
     pub(crate) fasync_items: FAsyncItems,
     pub(crate) options: TcpSocketOptions,
-    pub(crate) cork_buf: Mutex<Vec<u8>>,
+    pub(crate) cork_buf: Mutex<super::io::CorkBuffer>,
+    pub(super) owner_file: Mutex<Weak<crate::filesystem::vfs::file::File>>,
     pub(super) error_queue: Mutex<super::super::common::error_queue::ErrorQueue>,
     /// Serializes readers while a receive transaction temporarily drops the interface-wide
     /// SocketSet lock to copy data to userspace.
@@ -287,13 +292,20 @@ impl TcpSocket {
             prepared_owner.map_or_else(|| port_owner.device_binding(), |(_, device)| device);
         let options = TcpSocketOptions::new();
         if let Some(inner) = &inner {
-            if let Some((nagle, cc)) =
-                inner.with_socket(|socket| (socket.nagle_enabled(), socket.congestion_control()))
-            {
+            if let Some((nagle, cc, urgent_inline)) = inner.with_socket(|socket| {
+                (
+                    socket.nagle_enabled(),
+                    socket.congestion_control(),
+                    socket.urgent_inline(),
+                )
+            }) {
                 options
                     .nagle_enabled
                     .store(nagle, core::sync::atomic::Ordering::Relaxed);
                 *options.congestion_control.lock_irqsave() = cc;
+                options
+                    .so_oobinline
+                    .store(urgent_inline, core::sync::atomic::Ordering::Relaxed);
             }
         }
         if let Some(inner::Inner::Established(established)) = &inner {
@@ -336,7 +348,8 @@ impl TcpSocket {
             epoll_items: EPollItems::default(),
             fasync_items: FAsyncItems::default(),
             options,
-            cork_buf: Mutex::new(Vec::new()),
+            cork_buf: Mutex::new(super::io::CorkBuffer::default()),
+            owner_file: Mutex::new(Weak::new()),
             error_queue: Mutex::new(super::super::common::error_queue::ErrorQueue::default()),
             recv_lock: Mutex::new(()),
             resize_lock: Mutex::new(()),
@@ -497,13 +510,25 @@ impl TcpSocket {
             .load(core::sync::atomic::Ordering::Relaxed)
     }
 
+    /// TCP_INQ includes the urgent sequence byte and an accepted FIN; unlike
+    /// FIONREAD it must not stop at a non-inline urgent mark.
+    pub(super) fn tcp_inq_hint(&self) -> usize {
+        self.inner
+            .read()
+            .as_ref()
+            .and_then(|inner| {
+                inner.with_socket(|socket| socket.recv_queue() + usize::from(socket.received_fin()))
+            })
+            .unwrap_or(0)
+    }
+
     pub fn recv_queue_len(&self) -> usize {
         self.inner
             .read()
             .as_ref()
             .map(|inner| match inner {
                 inner::Inner::Closed(_) => 0,
-                _ => inner.with_socket(|s| s.recv_queue()).unwrap_or(0),
+                _ => inner.with_socket(|s| s.ordinary_queue()).unwrap_or(0),
             })
             .unwrap_or(0)
     }

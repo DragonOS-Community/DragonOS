@@ -62,12 +62,7 @@ impl BlockIoctl {
                     _ => unreachable!(),
                 }
             }
-            Self::CacheBlockSize => {
-                use crate::mm::MemoryManagementArch;
-                // This mapping currently uses page-sized cache blocks. Queue
-                // logical sectors remain a separate property (BLKSSZGET).
-                put(output, crate::arch::MMArch::PAGE_SIZE as i32)
-            }
+            Self::CacheBlockSize => put(output, disk.soft_block_size() as i32),
             _ => {
                 let limits = device.io_limits();
                 if !limits.is_valid() {

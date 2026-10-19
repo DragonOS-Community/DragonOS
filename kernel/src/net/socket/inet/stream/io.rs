@@ -16,6 +16,19 @@ use super::constants;
 use super::inner;
 use super::TcpSocket;
 
+/// Existing cork storage plus one logical urgent end; no second payload queue.
+#[derive(Debug, Default)]
+pub(crate) struct CorkBuffer {
+    bytes: alloc::vec::Vec<u8>,
+    urgent_end: Option<usize>,
+}
+impl core::ops::Deref for CorkBuffer {
+    type Target = alloc::vec::Vec<u8>;
+    fn deref(&self) -> &Self::Target {
+        &self.bytes
+    }
+}
+
 const USER_RECV_STAGING_SIZE: usize = 64 * 1024;
 
 /// Logical receive capacity is independent of payload storage: TCP TRUNC
@@ -53,6 +66,8 @@ pub(super) struct TcpPeekCursor {
     sequence: Option<smoltcp::wire::TcpSeqNumber>,
     observed_head: Option<smoltcp::wire::TcpSeqNumber>,
     after_wait: bool,
+    skipped: usize,
+    pub(super) boundary: bool,
 }
 
 impl TcpPeekCursor {
@@ -60,11 +75,15 @@ impl TcpPeekCursor {
         let reset = self.sequence.is_none()
             || self.observed_head != Some(head)
             || (self.after_wait
-                && self
-                    .sequence
-                    .is_some_and(|sequence| sequence.0.wrapping_sub(copied as i32) != head.0));
+                && self.sequence.is_some_and(|sequence| {
+                    sequence
+                        .0
+                        .wrapping_sub(copied.wrapping_add(self.skipped) as i32)
+                        != head.0
+                }));
         if reset {
             self.sequence = Some(head);
+            self.skipped = 0;
         }
         self.observed_head = Some(head);
         self.after_wait = false;
@@ -115,7 +134,7 @@ impl TcpSocket {
                 return established.with_mut(|socket| {
                     let head = socket.recv_head_seq();
                     cursor.observed_head != Some(head)
-                        || socket.recv_queue() > cursor.offset(head)
+                        || socket.receive_span(cursor.offset(head), usize::MAX).len != 0
                         || self.peek_terminal(socket)
                 });
             }
@@ -204,7 +223,70 @@ impl TcpSocket {
             .map_or(Ok(0), Err)
     }
 
+    fn ordinary_span(
+        socket: &mut smoltcp::socket::tcp::Socket,
+        offset: usize,
+        limit: usize,
+        peek: bool,
+    ) -> smoltcp::socket::tcp::ReceiveSpan {
+        let span = socket.receive_span(offset, limit);
+        if !peek && limit != 0 && span.offset != offset {
+            // This is a protocol hole, not user payload. Passing it clears the
+            // mark independently of an earlier OOB read of the saved byte.
+            let skip = span.offset - offset;
+            let _ = socket.recv(|bytes| {
+                let n = skip.min(bytes.len());
+                (n, ())
+            });
+            return socket.receive_span(0, limit);
+        }
+        span
+    }
+
     fn recv_established(
+        &self,
+        socket: &mut smoltcp::socket::tcp::Socket,
+        current_buf: &mut [u8],
+        limit: usize,
+        flags: PMSG,
+        report_error: bool,
+        cursor: &mut TcpPeekCursor,
+    ) -> Result<usize, SystemError> {
+        let peek_offset = if flags.contains(PMSG::PEEK) {
+            cursor.offset(socket.recv_head_seq())
+        } else {
+            0
+        };
+        let span = Self::ordinary_span(socket, peek_offset, limit, flags.contains(PMSG::PEEK));
+        if flags.contains(PMSG::PEEK) && span.len == 0 && limit != 0 && socket.can_recv() {
+            return if self.peek_terminal(socket) {
+                Ok(0)
+            } else {
+                Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
+            };
+        }
+        let copy_len = current_buf.len().min(span.len);
+        let result = self.recv_established_payload(
+            socket,
+            &mut current_buf[..copy_len],
+            span.len,
+            flags,
+            report_error,
+            span.offset,
+        );
+        if let Ok(count) = result {
+            if count != 0 {
+                if flags.contains(PMSG::PEEK) {
+                    cursor.skipped += span.offset.saturating_sub(peek_offset);
+                    cursor.sequence = Some(socket.recv_head_seq() + span.offset);
+                }
+                cursor.boundary = span.boundary && count == span.len;
+            }
+        }
+        result
+    }
+
+    fn recv_established_payload(
         &self,
         socket: &mut smoltcp::socket::tcp::Socket,
         current_buf: &mut [u8],
@@ -353,6 +435,7 @@ impl TcpSocket {
         offset: usize,
         report_error: bool,
         staging: &mut RecvBuffer,
+        boundary: &mut bool,
     ) -> Result<ReceiveAttempt<usize>, SystemError> {
         if offset > user_buffer.len() {
             return Err(SystemError::EINVAL);
@@ -362,6 +445,7 @@ impl TcpSocket {
 
         // Avoid allocating the staging buffer for the common nonblocking EAGAIN path.
         let readable = established.with_mut(|socket| {
+            Self::ordinary_span(socket, 0, user_remaining, false);
             if socket.can_recv() {
                 return Ok(true);
             }
@@ -398,17 +482,20 @@ impl TcpSocket {
         let mut total = 0usize;
         while total < user_remaining {
             let want = user_remaining - total;
+            let mut span_boundary = false;
             let staged = established.with_mut(|socket| {
+                let span = Self::ordinary_span(socket, 0, want, false);
                 if !socket.can_recv() {
                     return ReceiveAttempt::Ready(0);
                 }
-                let required = want.min(socket.recv_queue()).min(USER_RECV_STAGING_SIZE);
+                let required = span.len.min(USER_RECV_STAGING_SIZE);
                 if staging.capacity() < required {
                     return ReceiveAttempt::NeedBuffer(required);
                 }
                 match socket.peek(required) {
                     Ok(data) => {
                         let size = data.len();
+                        span_boundary = span.boundary && size == span.len;
                         staging.bytes_mut(size).copy_from_slice(data);
                         ReceiveAttempt::Ready(size)
                     }
@@ -453,6 +540,10 @@ impl TcpSocket {
             });
 
             total += staged;
+            if span_boundary {
+                *boundary = true;
+                break;
+            }
             if !committed {
                 break;
             }
@@ -557,7 +648,7 @@ impl TcpSocket {
                         remaining,
                         flags,
                         offset + total_read == 0,
-                        peek_offset,
+                        cursor,
                     )
                     .map(ReceiveAttempt::Ready)
                 }),
@@ -600,6 +691,9 @@ impl TcpSocket {
 
                     total_read += n;
 
+                    if cursor.boundary {
+                        break;
+                    }
                     if n == 0 {
                         // EOF
                         break;
@@ -636,6 +730,7 @@ impl TcpSocket {
         user_buffer: &mut UserBuffer<'_>,
         offset: usize,
         staging: &mut RecvBuffer,
+        boundary: &mut bool,
     ) -> Result<ReceiveAttempt<usize>, SystemError> {
         let recv_guard = self.recv_lock.lock();
         let mut total_read = offset;
@@ -661,6 +756,7 @@ impl TcpSocket {
                     total_read,
                     total_read == 0,
                     staging,
+                    boundary,
                 ),
                 inner::Inner::Connecting(connecting) => {
                     if let Some(err) = connecting.take_connect_error() {
@@ -688,7 +784,7 @@ impl TcpSocket {
                 Ok(ReceiveAttempt::Ready(n)) => {
                     total_read += n;
 
-                    if n == 0 || total_read == user_buffer.len() {
+                    if *boundary || n == 0 || total_read == user_buffer.len() {
                         break;
                     }
                 }
@@ -715,8 +811,10 @@ impl TcpSocket {
         let mut timeout = ReceiveTimeout::new(self.recv_timeout());
         let mut total_read = 0usize;
         let mut staging = RecvBuffer::default();
+        let mut boundary = false;
         loop {
-            match self.try_recv_to_user_buffer(user_buffer, total_read, &mut staging) {
+            match self.try_recv_to_user_buffer(user_buffer, total_read, &mut staging, &mut boundary)
+            {
                 Ok(ReceiveAttempt::NeedBuffer(required)) => {
                     // The receive, inner and SocketSet guards have all gone.
                     // Recovery retries only allocation, not a committed read.
@@ -730,7 +828,8 @@ impl TcpSocket {
                 }
                 Ok(ReceiveAttempt::Ready(n)) => {
                     total_read += n;
-                    if n == 0 || total_read == user_buffer.len() || !waitall || nonblock {
+                    if boundary || n == 0 || total_read == user_buffer.len() || !waitall || nonblock
+                    {
                         return Ok(total_read);
                     }
                 }
@@ -780,7 +879,12 @@ impl TcpSocket {
         }
     }
 
-    pub(super) fn try_send(&self, buf: &[u8], report_error: bool) -> Result<usize, SystemError> {
+    pub(super) fn try_send(
+        &self,
+        buf: &[u8],
+        flags: PMSG,
+        report_error: bool,
+    ) -> Result<usize, SystemError> {
         // Background cork flushes use try_send_direct and must leave the error
         // available to SO_ERROR or a subsequent user I/O operation.
         if report_error {
@@ -789,7 +893,7 @@ impl TcpSocket {
                 return Err(error);
             }
         }
-        let result = self.try_send_inner(buf);
+        let result = self.try_send_inner(buf, flags.contains(PMSG::OOB));
         if let Err(error) = result {
             let error = if report_error {
                 self.take_pending_error().unwrap_or(error)
@@ -802,7 +906,7 @@ impl TcpSocket {
         result
     }
 
-    fn try_send_inner(&self, buf: &[u8]) -> Result<usize, SystemError> {
+    fn try_send_inner(&self, buf: &[u8], urgent: bool) -> Result<usize, SystemError> {
         if buf.is_empty() {
             // Linux 语义：对 SOCK_STREAM，写入 0 字节应当立刻成功返回 0，且不阻塞。
             return Ok(0);
@@ -843,7 +947,10 @@ impl TcpSocket {
                     return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
                 }
                 let n = core::cmp::min(free, buf.len());
-                cork_buf.extend_from_slice(&buf[..n]);
+                cork_buf.bytes.extend_from_slice(&buf[..n]);
+                if urgent {
+                    cork_buf.urgent_end = Some(cork_buf.bytes.len());
+                }
                 Ok(n)
             };
             let accepted = match self.inner.read().as_ref() {
@@ -851,7 +958,8 @@ impl TcpSocket {
                 Some(inner::Inner::Connecting(connecting)) => connecting.with_mut(&mut enqueue),
                 _ => Err(SystemError::EPIPE),
             }?;
-            let flush = !cork_enabled
+            let flush = urgent
+                || !cork_enabled
                 || cork_buf.len()
                     >= self
                         .tcp_max_seg()
@@ -871,7 +979,7 @@ impl TcpSocket {
             return Ok(accepted);
         }
         drop(cork_buf);
-        self.try_send_direct(buf)
+        self.try_send_direct(buf, urgent.then_some(buf.len()))
     }
 
     pub(crate) fn flush_cork_buffer(&self) -> Result<(), SystemError> {
@@ -895,22 +1003,28 @@ impl TcpSocket {
                 self.maybe_complete_shutdown_wr_fin();
                 return Ok(());
             }
-            let data = cork_buf.clone();
+            let data = cork_buf.bytes.clone();
+            let urgent_end = cork_buf.urgent_end;
             drop(cork_buf);
 
             let to_send = data.len();
-            let sent = self.try_send_direct(data.as_slice())?;
+            let sent = self.try_send_direct(data.as_slice(), urgent_end)?;
 
             if sent == 0 {
                 return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
             }
 
             let mut cork_buf = self.cork_buf.lock();
-            cork_buf.drain(..core::cmp::min(sent, to_send));
+            let consumed = core::cmp::min(sent, to_send);
+            cork_buf.bytes.drain(..consumed);
+            cork_buf.urgent_end = cork_buf
+                .urgent_end
+                .and_then(|end| end.checked_sub(consumed))
+                .filter(|end| *end != 0);
         }
     }
 
-    fn try_send_direct(&self, buf: &[u8]) -> Result<usize, SystemError> {
+    fn try_send_direct(&self, buf: &[u8], urgent_end: Option<usize>) -> Result<usize, SystemError> {
         // TODO: add nonblock check of connecting socket
         //
         // IMPORTANT: to avoid "all sleepers, no pollers" stalls on loopback (gVisor BlockingLargeSend),
@@ -937,7 +1051,7 @@ impl TcpSocket {
         {
             let inner_guard = self.inner.read();
             if let Some(inner::Inner::Established(est)) = inner_guard.as_ref() {
-                result = Some(est.send_slice(buf));
+                result = Some(est.send_slice(buf, urgent_end));
             }
         }
         if let Some(ret) = result {
@@ -970,7 +1084,7 @@ impl TcpSocket {
                     let (new_inner, res) = conn.into_result();
                     match new_inner {
                         inner::Inner::Established(est) => {
-                            let r = est.send_slice(buf);
+                            let r = est.send_slice(buf, urgent_end);
                             writer.replace(inner::Inner::Established(est));
                             r
                         }
@@ -985,7 +1099,7 @@ impl TcpSocket {
                     }
                 }
                 inner::Inner::Established(est) => {
-                    let r = est.send_slice(buf);
+                    let r = est.send_slice(buf, urgent_end);
                     writer.replace(inner::Inner::Established(est));
                     r
                 }

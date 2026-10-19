@@ -1242,7 +1242,7 @@ impl Socket for VsockStreamSocket {
     ///
     /// # 行为
     /// - 对 stream socket 返回 `Ignore`，符合 Linux 语义
-    fn recvfrom_addr_behavior(&self) -> RecvFromAddrBehavior {
+    fn recvfrom_addr_behavior(&self, _flags: PMSG) -> RecvFromAddrBehavior {
         RecvFromAddrBehavior::Ignore
     }
 

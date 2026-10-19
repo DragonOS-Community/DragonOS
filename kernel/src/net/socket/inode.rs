@@ -200,6 +200,10 @@ impl<T: Socket + 'static> IndexNode for T {
 }
 
 impl<T: Socket + 'static> PollableInode for T {
+    fn set_owner_file(&self, file: alloc::sync::Weak<File>) {
+        Socket::set_owner_file(self, file);
+    }
+
     fn poll(&self, _: &FilePrivateData) -> Result<usize, SystemError> {
         Ok(self.check_io_event().bits() as usize)
     }

@@ -211,6 +211,32 @@ impl Pid {
         PidTaskIterator { guard, index: 0 }
     }
 
+    /// Snapshot stable task references without allocating or notifying tasks
+    /// under the PID membership spinlock. Membership can grow while reserving.
+    pub(crate) fn try_tasks_snapshot(
+        &self,
+        pid_type: PidType,
+    ) -> Result<Vec<Arc<ProcessControlBlock>>, SystemError> {
+        let mut tasks = Vec::new();
+        loop {
+            let members = self.tasks[pid_type as usize].lock_irqsave();
+            if tasks.capacity() < members.len() {
+                let required = members.len();
+                drop(members);
+                tasks
+                    .try_reserve(required)
+                    .map_err(|_| SystemError::ENOMEM)?;
+                continue;
+            }
+            for member in members.iter() {
+                if let Some(task) = member.upgrade() {
+                    tasks.push(task);
+                }
+            }
+            return Ok(tasks);
+        }
+    }
+
     /// 判断当前pid是否是当前命名空间的init进程(即child reaper)
     ///
     /// 由于在copy_process中可能在pid_ns->child_reaper被赋值前就需要检查，

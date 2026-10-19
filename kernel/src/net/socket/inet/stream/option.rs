@@ -9,6 +9,7 @@ use system_error::SystemError;
 use super::constants;
 use super::info;
 use super::inner;
+use crate::net::socket::inet::InetSocket;
 
 use crate::libs::byte_parser;
 use crate::net::socket::common::{parse_timeval_opt, write_timeval_opt, ShutdownBit};
@@ -501,7 +502,18 @@ impl super::TcpSocket {
                     .store(v, core::sync::atomic::Ordering::Relaxed);
                 Ok(())
             }
-            PSO::OOBINLINE => Self::set_bool_option(self.so_oobinline_enabled(), val, |_| Ok(())),
+            PSO::OOBINLINE => {
+                let enabled = byte_parser::read_bool_flag(val)?;
+                let mut inner = self.inner.write();
+                self.so_oobinline_enabled()
+                    .store(enabled, core::sync::atomic::Ordering::Relaxed);
+                if let Some(inner) = inner.as_mut() {
+                    inner.for_each_socket_mut(|socket| socket.set_urgent_inline(enabled));
+                }
+                drop(inner);
+                self.notify();
+                Ok(())
+            }
             _ => Ok(()), // Accept and ignore other SOL_SOCKET options
         }
     }

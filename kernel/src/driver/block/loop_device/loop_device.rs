@@ -2,7 +2,9 @@ use crate::mm::allocation::MemoryAllocationError;
 use crate::{
     driver::base::{
         block::{
-            block_device::{BlockDevice, BlockId, GeneralBlockRange, LBA_SIZE},
+            block_device::{
+                BlockDevice, BlockDeviceIoLimits, BlockId, GeneralBlockRange, LBA_SIZE,
+            },
             disk_info::Partition,
             gendisk::GenDisk,
             manager::{block_dev_manager, BlockDevMeta},
@@ -59,7 +61,10 @@ use super::constants::{
     LoopConfig, LoopFlags, LoopIoctl, LoopState, LoopStatus, LoopStatus64, LOOP_BASENAME,
     LOOP_IO_DRAIN_CHECK_INTERVAL_US, LOOP_IO_DRAIN_TIMEOUT_MS,
 };
-use super::mode::{effective_dio, sync_before_mode_change};
+use super::mode::{
+    configured_logical_block_size, effective_dio, sync_before_mode_change,
+    validate_logical_block_size,
+};
 
 /// Serializes loop backing topology validation and publication.
 ///
@@ -138,6 +143,8 @@ pub struct LoopDeviceInner {
     pub file_size: usize,
     pub offset: usize,
     pub size_limit: usize,
+    /// Queue logical geometry; all internal BlockIds remain 512-byte sectors.
+    pub(super) logical_block_size: u32,
     pub flags: LoopFlags,
     pub kobject_common: KObjectCommonData,
     pub device_common: DeviceCommonData,
@@ -247,6 +254,10 @@ impl LoopDevice {
         self.id
     }
 
+    pub(super) fn has_mount_holders(&self) -> bool {
+        self.mount_holder_count.load(Ordering::Acquire) != 0
+    }
+
     pub fn minor(&self) -> u32 {
         self.minor
     }
@@ -273,6 +284,7 @@ impl LoopDevice {
                 device_number: DeviceNumber::new(Major::LOOP_MAJOR, minor),
                 offset: 0,
                 size_limit: 0,
+                logical_block_size: LBA_SIZE as u32,
                 flags: LoopFlags::empty(),
                 kobject_common: KObjectCommonData::default(),
                 device_common: DeviceCommonData::default(),
@@ -499,18 +511,19 @@ impl LoopDevice {
         if config.info.lo_flags & !LoopFlags::all().bits() != 0 {
             return Err(SystemError::EINVAL);
         }
-        // Dynamic queue block-size changes are tracked separately as MM117.
-        if config.block_size != 0 && config.block_size != LBA_SIZE as u32 {
-            return Err(SystemError::EINVAL);
+        if config.block_size != 0 {
+            validate_logical_block_size(config.block_size as usize)?;
         }
         Self::validate_loop_status64_params(&config.info)?;
         let total_size = Self::candidate_size(&backing_file)?;
+        let logical = configured_logical_block_size(&backing_file, config.block_size)?;
         let offset = config.info.lo_offset as usize;
         let limit = config.info.lo_sizelimit as usize;
         let file_size = Self::calc_effective_size(total_size, offset, limit)?;
         let use_dio = effective_dio(
             &backing_file,
             offset,
+            logical,
             backing_file.flags().contains(FileFlags::O_DIRECT)
                 || config.info.lo_flags & LoopFlags::DIRECT_IO.bits() != 0,
         )?;
@@ -528,6 +541,7 @@ impl LoopDevice {
             Self::set_file_locked(&mut inner, backing_file, file_size);
             inner.offset = offset;
             inner.size_limit = limit;
+            inner.logical_block_size = logical;
             inner.flags = LoopFlags::from_bits_truncate(config.info.lo_flags);
             inner.flags.set(
                 LoopFlags::READ_ONLY,
@@ -643,6 +657,7 @@ impl LoopDevice {
             inner.file_size = 0;
             inner.offset = 0;
             inner.size_limit = 0;
+            inner.logical_block_size = LBA_SIZE as u32;
             inner.file_name = [0; 64];
             inner.flags = LoopFlags::empty();
             inner.generation = inner.generation.wrapping_add(1);
@@ -716,7 +731,16 @@ impl LoopDevice {
         let _noio = crate::cgroup::memory::io::MemoryIoScope::enter_noio();
         let _raw = self.block_dev_meta.raw_cache_gate.write();
         for _ in 0..16 {
-            let (backing_file, old_offset, old_limit, old_size, old_dio, old_partscan, generation) = {
+            let (
+                backing_file,
+                old_offset,
+                old_limit,
+                old_size,
+                old_dio,
+                old_partscan,
+                logical,
+                generation,
+            ) = {
                 let inner = self.inner();
                 if inner.state() != LoopState::Bound {
                     return Err(SystemError::ENXIO);
@@ -731,13 +755,14 @@ impl LoopDevice {
                     inner.file_size,
                     inner.flags.contains(LoopFlags::DIRECT_IO),
                     inner.flags.contains(LoopFlags::PARTSCAN),
+                    inner.logical_block_size,
                     inner.generation,
                 )
             };
             let new_offset = status.map_or(old_offset, |status| status.lo_offset as usize);
             let new_limit = status.map_or(old_limit, |status| status.lo_sizelimit as usize);
             let use_dio = if status.is_some() {
-                effective_dio(&backing_file, new_offset, old_dio)?
+                effective_dio(&backing_file, new_offset, logical, old_dio)?
             } else {
                 old_dio
             };
@@ -942,7 +967,7 @@ impl LoopDevice {
         // Prepare without configuration/topology locks, then validate the
         // retained mapping generation before claiming the drain transaction.
         for _ in 0..16 {
-            let (offset, limit, old_size, old_dio, snapshot_generation) = {
+            let (offset, limit, old_size, old_dio, logical, snapshot_generation) = {
                 let inner = self.inner();
                 if inner.state() != LoopState::Bound {
                     return Err(SystemError::ENXIO);
@@ -958,6 +983,7 @@ impl LoopDevice {
                     inner.size_limit,
                     inner.file_size,
                     inner.flags.contains(LoopFlags::DIRECT_IO),
+                    inner.logical_block_size,
                     inner.generation,
                 )
             };
@@ -982,6 +1008,7 @@ impl LoopDevice {
             let use_dio = effective_dio(
                 &new_file,
                 offset,
+                logical,
                 old_dio || new_file.flags().contains(FileFlags::O_DIRECT),
             )?;
             self.prepare_raw_mapping_change_locked()?;
@@ -1129,6 +1156,7 @@ impl LoopDevice {
             inner.file_size = 0;
             inner.offset = 0;
             inner.size_limit = 0;
+            inner.logical_block_size = LBA_SIZE as u32;
             inner.file_name = [0; 64];
             backing_file
         };
@@ -1372,15 +1400,7 @@ impl IndexNode for LoopDevice {
                     if !may_reconfigure {
                         return Err(SystemError::EPERM);
                     }
-                    let inner = self.inner();
-                    if inner.state() != LoopState::Bound {
-                        return Err(SystemError::ENXIO);
-                    }
-                    if data != LBA_SIZE {
-                        return Err(SystemError::EINVAL);
-                    }
-                    // The supported queue already has this logical block size.
-                    // Other sizes need the complete MM117 queue/cache contract.
+                    self.set_logical_block_size(data)?;
                     Ok(0)
                 }
                 LoopIoctl::LoopSetDirectIo => {
@@ -1645,6 +1665,10 @@ impl BlockDevice for LoopDevice {
 
     fn block_size(&self) -> usize {
         LBA_SIZE
+    }
+
+    fn io_limits(&self) -> BlockDeviceIoLimits {
+        BlockDeviceIoLimits::new(self.inner().logical_block_size)
     }
 
     fn partitions(&self) -> Vec<Arc<Partition>> {

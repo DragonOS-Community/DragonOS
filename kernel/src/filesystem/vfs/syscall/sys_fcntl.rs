@@ -3,11 +3,11 @@ use crate::arch::syscall::nr::SYS_FCNTL;
 use crate::filesystem::vfs::fasync::{set_file_fasync, FAsyncHandlerPolicy};
 use crate::filesystem::vfs::FileType;
 use crate::filesystem::vfs::InodeFlags;
-use crate::process::RawPid;
+use crate::process::pid::PidType;
 use crate::{
     arch::interrupt::TrapFrame,
     filesystem::vfs::{
-        fcntl::{FcntlCommand, PosixFlock, FD_CLOEXEC, F_UNLCK},
+        fcntl::{FcntlCommand, FileOwnerEx, PosixFlock, FD_CLOEXEC, F_UNLCK},
         file::FileFlags,
         posix_lock::{get_posix_lock, set_posix_lock},
     },
@@ -258,39 +258,60 @@ impl SysFcntlHandle {
                 }
                 Ok(0)
             }
-            FcntlCommand::SetOwn => {
-                // arg 作为 pid_t（有符号整数）处理
-                let arg_i32 = arg as i32;
-                let pid = arg_i32.unsigned_abs();
-                if pid > i32::MAX as u32 {
-                    return Err(SystemError::EINVAL);
+            FcntlCommand::SetOwn
+            | FcntlCommand::GetOwn
+            | FcntlCommand::SetOwnEx
+            | FcntlCommand::GetOwnEx => {
+                let file = ProcessManager::current_pcb()
+                    .fd_table()
+                    .get_file_by_fd(fd)
+                    .ok_or(SystemError::EBADF)?;
+                if file.flags().contains(FileFlags::O_PATH) {
+                    return Err(SystemError::EBADF);
                 }
-                let pb = if pid == 0 {
-                    None
-                } else {
-                    let pb = ProcessManager::find_task_by_vpid(RawPid::from(pid as _))
-                        .ok_or(SystemError::ESRCH)?;
-                    Some(pb)
-                };
-                let binding = ProcessManager::current_pcb().fd_table();
-                let file = binding
-                    .read()
-                    .get_file_by_fd(fd)
-                    .ok_or(SystemError::EBADF)?;
-                file.set_owner(pb)?;
-                Ok(0)
+                match cmd {
+                    FcntlCommand::SetOwn => {
+                        file.set_owner(arg as i32)?;
+                        Ok(0)
+                    }
+                    FcntlCommand::GetOwn => Ok(file.owner() as isize as usize),
+                    FcntlCommand::SetOwnEx => {
+                        let reader = UserBufferReader::new(
+                            arg as *const FileOwnerEx,
+                            size_of::<FileOwnerEx>(),
+                            true,
+                        )?;
+                        let owner = reader.buffer_protected(0)?.read_one::<FileOwnerEx>(0)?;
+                        let kind = match owner.kind {
+                            0 => PidType::PID,
+                            1 => PidType::TGID,
+                            2 => PidType::PGID,
+                            _ => return Err(SystemError::EINVAL),
+                        };
+                        file.set_owner_identity(kind, owner.pid)?;
+                        Ok(0)
+                    }
+                    FcntlCommand::GetOwnEx => {
+                        let (kind, pid) = file.owner_identity();
+                        let kind = match kind {
+                            PidType::PID => 0,
+                            PidType::TGID => 1,
+                            PidType::PGID => 2,
+                            _ => unreachable!("invalid asynchronous file owner type"),
+                        };
+                        let owner = FileOwnerEx { kind, pid };
+                        let mut writer = UserBufferWriter::new(
+                            arg as *mut FileOwnerEx,
+                            size_of::<FileOwnerEx>(),
+                            true,
+                        )?;
+                        writer.buffer_protected(0)?.write_one(0, &owner)?;
+                        Ok(0)
+                    }
+                    _ => unreachable!(),
+                }
             }
 
-            FcntlCommand::GetOwn => {
-                let binding = ProcessManager::current_pcb().fd_table();
-                let file = binding
-                    .read()
-                    .get_file_by_fd(fd)
-                    .ok_or(SystemError::EBADF)?;
-                let owner = file.owner().unwrap_or(RawPid::from(0));
-
-                return Ok(owner.data());
-            }
             FcntlCommand::SetSig => {
                 let binding = ProcessManager::current_pcb().fd_table();
                 let file = binding

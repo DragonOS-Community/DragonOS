@@ -1518,7 +1518,7 @@ impl Established {
             .unwrap_or(self.peer)
     }
 
-    pub fn send_slice(&self, buf: &[u8]) -> Result<usize, SystemError> {
+    pub fn send_slice(&self, buf: &[u8], urgent_end: Option<usize>) -> Result<usize, SystemError> {
         self.inner
             .with_mut::<smoltcp::socket::tcp::Socket, _, _>(|socket| {
                 // Background cork flushes also use this method. Return the
@@ -1526,7 +1526,7 @@ impl Established {
                 // user-facing boundary atomically substitutes a pending error.
                 if socket.can_send() {
                     socket
-                        .send_slice(buf)
+                        .send_slice_with_urgent(buf, urgent_end)
                         .map_err(|_| SystemError::ECONNABORTED)
                 } else {
                     match socket.state() {
@@ -1571,7 +1571,7 @@ impl Established {
                 if socket.can_send() || write_closed {
                     events |= EPollEventType::EPOLLOUT | EPollEventType::EPOLLWRNORM;
                 }
-                if socket.can_recv() || read_closed {
+                if socket.ordinary_can_recv() || read_closed {
                     events |= EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM;
                 }
                 if read_closed {
@@ -1581,6 +1581,9 @@ impl Established {
                 // SHUT_WR plus peer FIN is a full hangup even in CLOSING.
                 if is_closed || (read_closed && write_closed) {
                     events |= EPollEventType::EPOLLHUP;
+                }
+                if matches!(socket.urgent_state(), Some(tcp::UrgentState::Valid(_))) {
+                    events |= EPollEventType::EPOLLPRI;
                 }
                 if socket.pending_error().is_some() {
                     events |= EPollEventType::EPOLLERR;

@@ -486,20 +486,29 @@ TEST_F(LoopBlockDirectCache, ColdBufferedReadReturnsPrefixAfterDirectBackingTrun
     }
 }
 
-TEST_F(LoopBlockDirectCache, ReopenedSubpageCapacityRetainsCacheBlockSize) {
+TEST_F(LoopBlockDirectCache, ReopenedSubpageCapacityReinitializesCacheBlockSize) {
     ASSERT_NO_FATAL_FAILURE(RequireDirectBacking());
     loop_info64 status {};
     ASSERT_EQ(0, ioctl(loop_, LOOP_GET_STATUS64, &status));
     status.lo_offset = 513;
     status.lo_sizelimit = 512;
     ASSERT_EQ(0, ioctl(loop_, LOOP_SET_STATUS64, &status));
-    ASSERT_EQ(0, close(loop_));
-    loop_ = open(loop_path_.c_str(), O_RDWR | O_CLOEXEC);
-    ASSERT_GE(loop_, 0);
-    size_t block_size = 0;
-    ASSERT_EQ(0, ioctl(loop_, BLKBSZGET, &block_size));
+    int block_size = 0;
+    for (unsigned attempt = 0; attempt < 1000; ++attempt) {
+        const int closing = loop_;
+        loop_ = -1;
+        ASSERT_EQ(0, close(closing));
+        loop_ = open(loop_path_.c_str(), O_RDWR | O_CLOEXEC);
+        ASSERT_GE(loop_, 0);
+        ASSERT_EQ(0, ioctl(loop_, BLKBSZGET, &block_size));
+        if (block_size == 512) break;
+        // Capacity-change probes may briefly hold an extra Linux opener.
+        // Observe a real final-close/first-open transition without forcing
+        // its result through BLKBSZSET or changing the retained mapping.
+        usleep(1000);
+    }
     RecordProperty("cache_block_size", block_size);
-    EXPECT_EQ(page_, block_size);
+    ASSERT_EQ(512, block_size);
     std::array<char, 512> bytes;
     bytes.fill('t');
     errno = 0;
@@ -507,9 +516,15 @@ TEST_F(LoopBlockDirectCache, ReopenedSubpageCapacityRetainsCacheBlockSize) {
     int error = errno;
     RecordProperty("write_result", written);
     RecordProperty("write_errno", error);
-    EXPECT_EQ(-1, written);
-    EXPECT_EQ(EIO, error);
-    EXPECT_EQ(0, fsync(loop_));
+    EXPECT_EQ(512, written);
+    EXPECT_EQ(0, error);
+    errno = 0;
+    const int sync_result = fsync(loop_);
+    const int sync_error = errno;
+    RecordProperty("fsync_result", sync_result);
+    RecordProperty("fsync_errno", sync_error);
+    EXPECT_EQ(-1, sync_result);
+    EXPECT_EQ(EIO, sync_error);
 }
 
 TEST_F(LoopBlockCache, FlushBufferRequiresAdministrativeCapability) {

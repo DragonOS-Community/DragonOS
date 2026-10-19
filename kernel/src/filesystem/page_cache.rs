@@ -51,6 +51,8 @@ mod ordered_index;
 mod read_batch;
 mod read_dma;
 mod selftest;
+mod subpage;
+use subpage::ALL_BLOCKS;
 mod writeback;
 use crate::cgroup::memory::{
     accounting::{KernelByteKind, MemoryAccount, MemoryKind},
@@ -1138,6 +1140,8 @@ struct PageEntryState {
     /// updated under `inner` alongside `dirty_incarnation`; the atomic exists
     /// only because PageEntry is Arc-shared like the incarnation itself.
     dirty_transition_kind: AtomicU8,
+    valid_blocks: AtomicU8,
+    dirty_blocks: AtomicU8,
     writeback_tag: AtomicU64,
     /// Identity of the current (or most recently completed) Writeback
     /// incarnation. It is published under `InnerPageCache::inner`.
@@ -1452,7 +1456,10 @@ impl PageCacheManager {
             let inner = cache.inner.lock();
             inner
                 .get_entry(page_index)
-                .filter(|entry| entry.state() != PageState::Loading)
+                .filter(|entry| {
+                    entry.state() != PageState::Loading
+                        && entry.valid_blocks.load(Ordering::Acquire) == ALL_BLOCKS
+                })
                 .map(|entry| entry.page.clone())
         })
     }
@@ -1971,6 +1978,8 @@ impl PageEntry {
                 state: AtomicU8::new(state as u8),
                 dirty_incarnation: AtomicU64::new(0),
                 dirty_transition_kind: AtomicU8::new(0),
+                valid_blocks: AtomicU8::new(ALL_BLOCKS),
+                dirty_blocks: AtomicU8::new(0),
                 writeback_tag: AtomicU64::new(0),
                 writeback_incarnation: AtomicU64::new(0),
                 accounting: AtomicU8::new(PageEntryAccounting::Unaccounted as u8),
@@ -2343,7 +2352,10 @@ impl InnerPageCache {
     }
 
     pub fn get_page(&self, offset: usize) -> Option<Arc<Page>> {
-        self.pages.get(&offset).map(|entry| entry.page.clone())
+        self.pages
+            .get(&offset)
+            .filter(|entry| entry.valid_blocks.load(Ordering::Acquire) == ALL_BLOCKS)
+            .map(|entry| entry.page.clone())
     }
 
     fn remove_entry(&mut self, offset: usize) -> Option<Arc<PageEntry>> {
@@ -2431,7 +2443,7 @@ impl InnerPageCache {
     fn is_page_ready(&self, offset: usize) -> bool {
         self.pages
             .get(&offset)
-            .map(|entry| entry.state().is_ready())
+            .map(|entry| entry.is_read_ready())
             .unwrap_or(false)
     }
 
@@ -3199,6 +3211,17 @@ impl PageCache {
         owner: &Arc<MemoryAccount>,
         creator: &Arc<ObjectAccount>,
     ) -> Result<(Arc<PageEntry>, bool), MemoryAllocationError> {
+        self.try_get_or_create_entry_for_fill(page_index, populate_backend, None, owner, creator)
+    }
+
+    fn try_get_or_create_entry_for_fill(
+        &self,
+        page_index: usize,
+        populate_backend: bool,
+        overwrite: Option<(usize, usize)>,
+        owner: &Arc<MemoryAccount>,
+        creator: &Arc<ObjectAccount>,
+    ) -> Result<(Arc<PageEntry>, bool), MemoryAllocationError> {
         let mut page_cache_ref = None;
         let mut existing_entry = None;
         {
@@ -3213,12 +3236,14 @@ impl PageCache {
         if let Some(entry) = existing_entry {
             let state = entry.state();
             if state.is_ready() {
+                self.prepare_subpage_blocks(page_index, &entry, overwrite)?;
                 return Ok((entry, false));
             }
             if state == PageState::Error {
                 return Err(SystemError::EIO.into());
             }
             let _ = entry.wait_ready()?;
+            self.prepare_subpage_blocks(page_index, &entry, overwrite)?;
             return Ok((entry, false));
         }
 
@@ -3241,21 +3266,30 @@ impl PageCache {
         if !need_populate {
             let state = entry.state();
             if state.is_ready() {
+                self.prepare_subpage_blocks(page_index, &entry, overwrite)?;
                 return Ok((entry, false));
             }
             if state == PageState::Error {
                 return Err(SystemError::EIO.into());
             }
             let _ = entry.wait_ready()?;
+            self.prepare_subpage_blocks(page_index, &entry, overwrite)?;
             return Ok((entry, false));
         }
         self.reconcile_entry_unevictable_for_insert(&entry);
 
-        let populate_result = if populate_backend {
-            self.populate_page_from_backend(page_index, &entry.page)
-        } else {
-            self.populate_page_zero(&entry.page)
-        };
+        let populate_result =
+            if self.subpage_block_size().is_some() && (populate_backend || overwrite.is_some()) {
+                self.populate_page_zero(&entry.page).and_then(|()| {
+                    entry.page.write().remove_flags(PageFlags::PG_UPTODATE);
+                    entry.valid_blocks.store(0, Ordering::Release);
+                    self.prepare_subpage_blocks(page_index, &entry, overwrite)
+                })
+            } else if populate_backend {
+                self.populate_page_from_backend(page_index, &entry.page)
+            } else {
+                self.populate_page_zero(&entry.page)
+            };
 
         match populate_result {
             Ok(()) => {
@@ -3496,7 +3530,7 @@ impl PageCache {
         match inner.pages.get(&page_index) {
             Some(entry) => PageCacheFaultState {
                 cached: true,
-                ready: entry.state().is_ready(),
+                ready: entry.is_read_ready(),
             },
             None => PageCacheFaultState {
                 cached: false,
@@ -3524,14 +3558,14 @@ impl PageCache {
         let guard = self.inner.lock();
         guard
             .get_entry(page_index)
-            .filter(|entry| entry.state().is_ready())
+            .filter(|entry| entry.is_read_ready())
             .map(|entry| entry.page.clone())
     }
 
     pub fn get_ready_page_pinned(&self, page_index: usize) -> Option<PageCachePagePin> {
         let guard = self.inner.lock();
         let entry = guard.get_entry(page_index)?;
-        if !entry.state().is_ready() {
+        if !entry.is_read_ready() {
             return None;
         }
         let pin = entry.pin();
@@ -3588,12 +3622,14 @@ impl PageCache {
         if let Some(entry) = existing_entry {
             let state = entry.state();
             if state.is_ready() {
+                self.prepare_subpage_blocks(page_index, &entry, None)?;
                 return Ok(entry.page.clone());
             }
             if state == PageState::Error {
                 return Err(SystemError::EIO.into());
             }
             let page = entry.wait_ready()?;
+            self.prepare_subpage_blocks(page_index, &entry, None)?;
             return Ok(page);
         }
 
@@ -3616,12 +3652,15 @@ impl PageCache {
         if !need_populate {
             let state = entry.state();
             if state.is_ready() {
+                self.prepare_subpage_blocks(page_index, &entry, None)?;
                 return Ok(entry.page.clone());
             }
             if state == PageState::Error {
                 return Err(SystemError::EIO.into());
             }
-            return entry.wait_ready().map_err(MemoryAllocationError::System);
+            let page = entry.wait_ready()?;
+            self.prepare_subpage_blocks(page_index, &entry, None)?;
+            return Ok(page);
         }
         self.reconcile_entry_unevictable_for_insert(&entry);
 
@@ -3699,13 +3738,19 @@ impl PageCache {
 
             if let Some(entry) = existing_entry {
                 match entry.state() {
-                    state if state.is_ready() => return Ok(entry.page.clone()),
+                    state if state.is_ready() => {
+                        self.prepare_subpage_blocks(page_index, &entry, None)?;
+                        return Ok(entry.page.clone());
+                    }
                     PageState::Error => {
                         self.discard_error_entry_if_same(page_index, &entry);
                         continue;
                     }
                     PageState::Loading | PageState::Writeback => match entry.wait_ready() {
-                        Ok(page) => return Ok(page),
+                        Ok(page) => {
+                            self.prepare_subpage_blocks(page_index, &entry, None)?;
+                            return Ok(page);
+                        }
                         Err(_e) if entry.state() == PageState::Error => {
                             self.discard_error_entry_if_same(page_index, &entry);
                             continue;
@@ -3747,6 +3792,7 @@ impl PageCache {
                 Ok(()) => {
                     entry.set_state(PageState::UpToDate);
                     entry.wait_queue.wake_all();
+                    self.prepare_subpage_blocks(page_index, &entry, None)?;
                     return Ok(entry.page.clone());
                 }
                 Err(e) => {
@@ -3912,6 +3958,16 @@ impl PageCache {
         page_index: usize,
         entry: &Arc<PageEntry>,
     ) -> PageCacheDirtyPublication {
+        Self::publish_front_dirty_blocks_locked(dirty_pages, page_index, entry, ALL_BLOCKS)
+    }
+
+    fn publish_front_dirty_blocks_locked(
+        dirty_pages: &mut CacheIndex,
+        page_index: usize,
+        entry: &Arc<PageEntry>,
+        blocks: u8,
+    ) -> PageCacheDirtyPublication {
+        entry.dirty_blocks.fetch_or(blocks, Ordering::Relaxed);
         let old_state = entry.state();
         let transition = entry.begin_front_dirty_transition(page_index, old_state);
         InnerPageCache::update_index(dirty_pages, entry, 1, page_index, true);
@@ -4068,6 +4124,9 @@ impl PageCache {
         page_index: usize,
         expected_paddr: crate::mm::PhysAddr,
     ) -> bool {
+        if self.subpage_block_size().is_some() {
+            return false;
+        }
         if self.writeback_protocol.load(Ordering::Acquire)
             == PageCacheWritebackProtocolState::Token as u8
             || self.backend().as_ref().is_some_and(|backend| {
@@ -4123,6 +4182,7 @@ impl PageCache {
     pub fn mark_page_uptodate(&self, page_index: usize) {
         let mut guard = self.inner.lock();
         if let Some(entry) = guard.get_entry(page_index) {
+            entry.dirty_blocks.store(0, Ordering::Relaxed);
             let old_state = entry.state();
             entry.account_state_transition(old_state, PageState::UpToDate);
             entry.set_state(PageState::UpToDate);
@@ -4479,7 +4539,7 @@ impl PageCache {
                     let Some(entry) = inner.get_entry(page_index) else {
                         break;
                     };
-                    if !entry.state().is_ready() {
+                    if !entry.is_read_ready() {
                         break;
                     }
                     let within_page = if slot == 0 { page_offset } else { 0 };
@@ -4549,15 +4609,14 @@ impl PageCache {
             }
             page_guard.add_flags(PageFlags::PG_DIRTY);
             src_offset += item.sub_len;
-            if let Some(mut reservation) = dirty_reservation.take() {
-                self.mark_page_dirty_prepared_page_locked(
-                    item.page_index,
-                    &mut reservation,
-                    &page_guard,
-                )?;
-            } else {
-                self.mark_page_dirty_page_locked(item.page_index, &page_guard)?;
-            }
+            let mut inner = self.inner.lock();
+            let _ = self.publish_written_range_locked(
+                &mut inner,
+                item,
+                &mut page_guard,
+                dirty_reservation.as_mut(),
+            );
+            dirty_reservation = None;
         }
         copies.rollback = false;
         Ok(ret)
@@ -4637,11 +4696,11 @@ impl PageCache {
             page_guard.as_slice_mut().copy_from_slice(buf);
         }
         page_guard.add_flags(PageFlags::PG_DIRTY);
-        let publication = Self::publish_prepared_front_dirty_locked(
+        let publication = self.publish_written_range_locked(
             &mut inner,
-            item.page_index,
-            &current,
-            &mut dirty_reservation,
+            item,
+            &mut page_guard,
+            Some(&mut dirty_reservation),
         );
         // A `Started` transition temporarily clones `current.entry`. The
         // callback may drop it immediately, but this cannot be the final
@@ -4758,17 +4817,12 @@ impl PageCache {
                 .copy_from_slice(buf);
         }
         page_guard.add_flags(PageFlags::PG_DIRTY);
-        let publication = match dirty_reservation.as_mut() {
-            Some(reservation) => Self::publish_prepared_front_dirty_locked(
-                &mut inner,
-                item.page_index,
-                &current,
-                reservation,
-            ),
-            None => {
-                Self::publish_front_dirty_locked(&mut inner.dirty_pages, item.page_index, &current)
-            }
-        };
+        let publication = self.publish_written_range_locked(
+            &mut inner,
+            item,
+            &mut page_guard,
+            dirty_reservation.as_mut(),
+        );
         on_published(publication.into_transition(self.instance_id, &current));
         copies.rollback = false;
         Ok(ret)
@@ -4818,8 +4872,27 @@ impl PageCache {
                 write_start == page_start && page_write_len == MMArch::PAGE_SIZE;
             let populate_backend = !self.is_shmem() && !full_page_overwrite;
             self.discard_error_entry(page_index);
-            let (entry, pin, created) =
-                self.try_get_or_create_entry_pinned(page_index, populate_backend, owner, creator)?;
+            let (entry, pin, created) = if self.subpage_block_size().is_some() {
+                loop {
+                    let (entry, created) = self.try_get_or_create_entry_for_fill(
+                        page_index,
+                        populate_backend,
+                        Some((write_start - page_start, write_end - page_start)),
+                        owner,
+                        creator,
+                    )?;
+                    let inner = self.inner.lock();
+                    if inner
+                        .get_entry(page_index)
+                        .is_some_and(|current| Arc::ptr_eq(&current, &entry))
+                    {
+                        let pin = entry.pin();
+                        break (entry, pin, created);
+                    }
+                }
+            } else {
+                self.try_get_or_create_entry_pinned(page_index, populate_backend, owner, creator)?
+            };
             copies.items.push(CopyItem {
                 entry,
                 _pin: pin,
@@ -4902,16 +4975,20 @@ impl PageCache {
             page_guard.add_flags(PageFlags::PG_DIRTY);
             src_offset += item.sub_len;
         }
-        for (index, (item, page_guard)) in copies.items.iter().zip(page_guards.iter()).enumerate() {
-            if index == 0 {
-                self.mark_page_dirty_prepared_page_locked(
-                    item.page_index,
-                    &mut dirty_reservation,
-                    page_guard,
-                )?;
-            } else {
-                self.mark_page_dirty_page_locked(item.page_index, page_guard)?;
-            }
+        for (index, (item, page_guard)) in
+            copies.items.iter().zip(page_guards.iter_mut()).enumerate()
+        {
+            let mut inner = self.inner.lock();
+            let _ = self.publish_written_range_locked(
+                &mut inner,
+                item,
+                page_guard,
+                if index == 0 {
+                    Some(&mut dirty_reservation)
+                } else {
+                    None
+                },
+            );
         }
 
         copies.rollback = false;

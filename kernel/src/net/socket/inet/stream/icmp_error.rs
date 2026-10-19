@@ -120,11 +120,38 @@ impl TcpSocket {
         !self.error_queue.lock().is_empty()
     }
 
+    pub(super) fn recv_error_to_buffer(
+        &self,
+        buffer: &mut [u8],
+    ) -> Result<(usize, crate::net::socket::endpoint::Endpoint), SystemError> {
+        let entry = self.pop_icmp_error()?;
+        let len = buffer.len().min(entry.payload.len());
+        buffer[..len].copy_from_slice(&entry.payload[..len]);
+        Ok((len, entry.destination_endpoint()))
+    }
+
+    pub(super) fn recv_error_to_user(
+        &self,
+        buffer: &mut crate::syscall::user_buffer::UserBuffer<'_>,
+    ) -> Result<(usize, crate::net::socket::endpoint::Endpoint), SystemError> {
+        let entry = self.pop_icmp_error()?;
+        let len = buffer.len().min(entry.payload.len());
+        buffer.write_to_user(0, &entry.payload[..len])?;
+        Ok((len, entry.destination_endpoint()))
+    }
+
     pub(super) fn recv_icmp_error(
         &self,
         msg: &mut crate::net::posix::MsgHdr,
         iovs: &crate::syscall::iov::IoVecs,
     ) -> Result<usize, SystemError> {
+        let entry = self.pop_icmp_error()?;
+        let result = entry.recv_msg_with_options(msg, ErrorCmsgOptions::default(), iovs);
+        msg.msg_flags |= PMSG::ERRQUEUE.bits() as i32;
+        result
+    }
+
+    pub(super) fn pop_icmp_error(&self) -> Result<ErrorQueueEntry, SystemError> {
         let entry = {
             let guard = self.inner.read();
             let consume = |previous: Option<SystemError>| {
@@ -150,9 +177,7 @@ impl TcpSocket {
         }
         .ok_or(SystemError::EAGAIN_OR_EWOULDBLOCK)?;
         self.update_events();
-        let result = entry.recv_msg_with_options(msg, ErrorCmsgOptions::default(), iovs);
-        msg.msg_flags |= PMSG::ERRQUEUE.bits() as i32;
-        result
+        Ok(entry)
     }
 
     pub(crate) fn receive_icmp_error(&self, feedback: &IcmpErrorFeedback) {

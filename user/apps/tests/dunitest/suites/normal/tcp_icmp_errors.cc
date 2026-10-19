@@ -5,6 +5,7 @@
 #include <netinet/tcp.h>
 #include <poll.h>
 #include <sys/socket.h>
+#include <sys/mman.h>
 #include <unistd.h>
 #include <array>
 #include <chrono>
@@ -205,8 +206,9 @@ TEST_P(TcpIcmpErrors, PassiveOpenInheritsAtSynNotAccept) {
     EXPECT_EQ(value, enabled);
 }
 
-TEST_P(TcpIcmpErrors, SynErrorCompletesConnectAndPreservesQuotedTcpHeader) {
-    const auto [family, enabled] = GetParam();
+// All adapters consume the same transport-owned error queue. Reuse the real
+// outstanding-SYN fixture instead of synthesizing an unreachable queue entry.
+void CheckSynErrorQueue(int family, bool enabled, int scalar_mode) {
     Fd capture(socket(family, SOCK_RAW | SOCK_NONBLOCK, IPPROTO_TCP));
     Fd listener(socket(family, SOCK_STREAM, 0));
     Fd blocker(socket(family, SOCK_STREAM, 0));
@@ -248,31 +250,111 @@ TEST_P(TcpIcmpErrors, SynErrorCompletesConnectAndPreservesQuotedTcpHeader) {
     iovec iov{payload.data(), payload.size()}; msghdr message{};
     message.msg_iov = &iov; message.msg_iovlen = 1;
     message.msg_control = control.data(); message.msg_controllen = control.size();
-    const ssize_t got = recvmsg(client.get(), &message, MSG_ERRQUEUE | MSG_DONTWAIT);
-    if (family == AF_INET || enabled) {
-        ASSERT_GE(got, 20);
-        const uint16_t source_port = Port(source), destination_port = Port(address);
-        EXPECT_EQ(memcmp(payload.data(), &source_port, 2), 0);
-        EXPECT_EQ(memcmp(payload.data() + 2, &destination_port, 2), 0);
-        bool found = false;
-        for (auto* cmsg = CMSG_FIRSTHDR(&message); cmsg; cmsg = CMSG_NXTHDR(&message, cmsg)) {
-            if (cmsg->cmsg_level != (family == AF_INET ? SOL_IP : SOL_IPV6) ||
-                cmsg->cmsg_type != (family == AF_INET ? IP_RECVERR : IPV6_RECVERR)) continue;
-            ASSERT_GE(cmsg->cmsg_len, CMSG_LEN(sizeof(sock_extended_err)));
-            const auto* ee = reinterpret_cast<const sock_extended_err*>(CMSG_DATA(cmsg));
-            EXPECT_EQ(ee->ee_errno, static_cast<unsigned>(ECONNREFUSED));
-            EXPECT_EQ(ee->ee_type, family == AF_INET ? 3 : 1);
-            EXPECT_EQ(ee->ee_code, family == AF_INET ? 3 : 4);
-            found = true;
+    const bool queued = family == AF_INET || enabled;
+    sockaddr_storage error_destination{};
+    socklen_t error_destination_length = sizeof(error_destination);
+    ssize_t got;
+    if (scalar_mode == 0) {
+        got = recvmsg(client.get(), &message, MSG_ERRQUEUE | MSG_DONTWAIT);
+    } else if (scalar_mode == 1) {
+        got = recvfrom(client.get(), payload.data(), payload.size(), MSG_ERRQUEUE | MSG_OOB | MSG_PEEK,
+                       reinterpret_cast<sockaddr*>(&error_destination), &error_destination_length);
+    } else if (scalar_mode == 2) {
+        got = recv(client.get(), nullptr, 0, MSG_ERRQUEUE);
+    } else if (scalar_mode >= 4) {
+        sockaddr* destination = scalar_mode == 4 ? reinterpret_cast<sockaddr*>(~uintptr_t(0)) :
+                                scalar_mode == 5 ? reinterpret_cast<sockaddr*>(&error_destination) : nullptr;
+        socklen_t* destination_length = scalar_mode == 5 ? nullptr : scalar_mode == 6 ? reinterpret_cast<socklen_t*>(~uintptr_t(0)) : &error_destination_length;
+        got = recvfrom(client.get(), payload.data(), payload.size(), MSG_ERRQUEUE,
+                       destination, destination_length);
+    } else {
+        const size_t page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+        void* inaccessible = mmap(nullptr, page, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        ASSERT_NE(MAP_FAILED, inaccessible);
+        got = recv(client.get(), inaccessible, 20, MSG_ERRQUEUE);
+        const int error = errno;
+        EXPECT_EQ(0, munmap(inaccessible, page));
+        errno = error;
+    }
+    if (queued) {
+        if (scalar_mode == 3 || scalar_mode == 4 || scalar_mode == 5) {
+            EXPECT_EQ(got, -1); EXPECT_EQ(errno, EFAULT);
+        } else if (scalar_mode == 2) {
+            EXPECT_EQ(got, 0);
+        } else {
+            ASSERT_GE(got, 20);
+            const uint16_t source_port = Port(source), destination_port = Port(address);
+            EXPECT_EQ(memcmp(payload.data(), &source_port, 2), 0);
+            EXPECT_EQ(memcmp(payload.data() + 2, &destination_port, 2), 0);
         }
-        EXPECT_TRUE(found);
+        if (scalar_mode == 1) {
+            EXPECT_EQ(AddressLength(family), error_destination_length);
+            EXPECT_EQ(family, error_destination.ss_family);
+            EXPECT_EQ(Port(address), Port(error_destination));
+            if (family == AF_INET) {
+                EXPECT_EQ(reinterpret_cast<const sockaddr_in*>(&address)->sin_addr.s_addr,
+                          reinterpret_cast<const sockaddr_in*>(&error_destination)->sin_addr.s_addr);
+            } else {
+                EXPECT_EQ(0, memcmp(&reinterpret_cast<const sockaddr_in6*>(&address)->sin6_addr,
+                                    &reinterpret_cast<const sockaddr_in6*>(&error_destination)->sin6_addr, sizeof(in6_addr)));
+            }
+        }
+        if (scalar_mode == 0) {
+            bool found = false;
+            for (auto* cmsg = CMSG_FIRSTHDR(&message); cmsg; cmsg = CMSG_NXTHDR(&message, cmsg)) {
+                if (cmsg->cmsg_level != (family == AF_INET ? SOL_IP : SOL_IPV6) ||
+                    cmsg->cmsg_type != (family == AF_INET ? IP_RECVERR : IPV6_RECVERR)) continue;
+                ASSERT_GE(cmsg->cmsg_len, CMSG_LEN(sizeof(sock_extended_err)));
+                const auto* ee = reinterpret_cast<const sock_extended_err*>(CMSG_DATA(cmsg));
+                EXPECT_EQ(ee->ee_errno, static_cast<unsigned>(ECONNREFUSED));
+                EXPECT_EQ(ee->ee_type, family == AF_INET ? 3 : 1);
+                EXPECT_EQ(ee->ee_code, family == AF_INET ? 3 : 4);
+                found = true;
+            }
+            EXPECT_TRUE(found);
+        }
     } else {
         EXPECT_EQ(got, -1); EXPECT_EQ(errno, EAGAIN);
     }
+    // PEEK/TRUNC are not errorqueue retention requests. Fault/zero also consume
+    // a dequeued error packet, independently of ordinary receive fault policy.
+    errno = 0;
+    EXPECT_EQ(-1, recv(client.get(), payload.data(), payload.size(), MSG_ERRQUEUE));
+    EXPECT_EQ(EAGAIN, errno);
     pending = -1; length = sizeof(pending);
     ASSERT_EQ(getsockopt(client.get(), SOL_SOCKET, SO_ERROR, &pending, &length), 0);
     EXPECT_EQ(pending, 0);
     ASSERT_NO_FATAL_FAILURE(expect_no_peer());
+}
+
+TEST_P(TcpIcmpErrors, SynErrorCompletesConnectAndPreservesQuotedTcpHeader) {
+    const auto [family, enabled] = GetParam();
+    CheckSynErrorQueue(family, enabled, 0);
+}
+TEST_P(TcpIcmpErrors, ScalarSynErrorDequeuesTheRealQuoteBeforeOobOrPeek) {
+    const auto [family, enabled] = GetParam();
+    CheckSynErrorQueue(family, enabled, 1);
+}
+TEST_P(TcpIcmpErrors, ScalarZeroLengthConsumesQueuedError) {
+    const auto [family, enabled] = GetParam();
+    CheckSynErrorQueue(family, enabled, 2);
+}
+TEST_P(TcpIcmpErrors, ScalarFaultStillConsumesQueuedError) {
+    const auto [family, enabled] = GetParam();
+    CheckSynErrorQueue(family, enabled, 3);
+}
+
+TEST_P(TcpIcmpErrors, ScalarBadDestinationStillConsumesTheError) {
+    const auto [family, enabled] = GetParam();
+    CheckSynErrorQueue(family, enabled, 4);
+}
+TEST_P(TcpIcmpErrors, ScalarNullDestinationLengthFailsAfterDequeue) {
+    const auto [family, enabled] = GetParam();
+    CheckSynErrorQueue(family, enabled, 5);
+}
+TEST_P(TcpIcmpErrors, ScalarNullDestinationDoesNotAccessItsLength) {
+    const auto [family, enabled] = GetParam();
+    CheckSynErrorQueue(family, enabled, 6);
 }
 
 INSTANTIATE_TEST_SUITE_P(DualStack, TcpIcmpErrors,

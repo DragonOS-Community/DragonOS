@@ -48,25 +48,12 @@ impl Syscall for SysRecvfromHandle {
         let addr = Self::addr(args);
         let addrlen = Self::addrlen(args);
 
-        // Verify buffer and address validity if from user space
+        // Import payload capacity before owner admission; output addresses are
+        // copied only after receive consumption, as move_addr_to_user does.
         if frame.is_from_user() {
             let virt_buf = VirtAddr::new(buf as usize);
             if crate::mm::access_ok(virt_buf, len).is_err() {
                 return Err(SystemError::EFAULT);
-            }
-
-            if !addrlen.is_null() {
-                let virt_addrlen = VirtAddr::new(addrlen as usize);
-                if crate::mm::access_ok(virt_addrlen, core::mem::size_of::<u32>()).is_err() {
-                    return Err(SystemError::EFAULT);
-                }
-            }
-
-            if !addr.is_null() {
-                let virt_addr = VirtAddr::new(addr as usize);
-                if crate::mm::access_ok(virt_addr, core::mem::size_of::<SockAddr>()).is_err() {
-                    return Err(SystemError::EFAULT);
-                }
             }
         }
 
@@ -169,7 +156,7 @@ pub(super) fn do_recvfrom(
     // Linux/gVisor 语义：某些 socket（如 TCP/SOCK_STREAM）会忽略源地址输出参数。
     // 具体行为由 socket 自身决定，避免在 syscall 层做类型特判。
     let (recv_len, endpoint) = socket.recv_from_user_buffer(buf, pmsg_flags)?;
-    if socket.recvfrom_addr_behavior() == RecvFromAddrBehavior::Ignore {
+    if socket.recvfrom_addr_behavior(pmsg_flags) == RecvFromAddrBehavior::Ignore {
         // 若用户提供了 addrlen，则写回 0；不得写 addr（gVisor 会检查 sockaddr_storage 保持全 0）。
         if !addr_len.is_null() {
             let mut writer = UserBufferWriter::new(addr_len, core::mem::size_of::<u32>(), true)?;
@@ -180,7 +167,10 @@ pub(super) fn do_recvfrom(
     }
 
     // Only write the source address if the caller provided addr and addr_len
-    if !addr.is_null() && !addr_len.is_null() {
+    if !addr.is_null() {
+        if addr_len.is_null() {
+            return Err(SystemError::EFAULT);
+        }
         endpoint.write_to_user(addr, addr_len)?;
     }
 

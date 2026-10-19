@@ -565,10 +565,6 @@ impl InotifyInode {
         len: usize,
         mut write_record: impl FnMut(usize, &InotifyEventInfo) -> Result<(), SystemError>,
     ) -> Result<usize, SystemError> {
-        if len < 16 {
-            return Err(SystemError::EINVAL);
-        }
-
         loop {
             let mut written = 0usize;
             let mut blocked_by_size = false;

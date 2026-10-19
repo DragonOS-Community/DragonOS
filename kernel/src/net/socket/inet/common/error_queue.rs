@@ -53,6 +53,13 @@ impl ErrorQueueEntry {
         self.payload.len().saturating_add(256)
     }
 
+    pub(crate) fn destination_endpoint(&self) -> Endpoint {
+        Endpoint::ip(
+            crate::net::socket::endpoint::InetEndpoint::from(self.destination)
+                .with_scope(self.ingress_ifindex),
+        )
+    }
+
     pub(crate) fn recv_msg_with_options(
         self,
         msg: &mut MsgHdr,
@@ -66,11 +73,9 @@ impl ErrorQueueEntry {
             msg.msg_flags |= PMSG::TRUNC.bits() as i32;
         }
         if !msg.msg_name.is_null() {
-            msg.msg_namelen = Endpoint::ip(
-                crate::net::socket::endpoint::InetEndpoint::from(self.destination)
-                    .with_scope(self.ingress_ifindex),
-            )
-            .write_to_user_msghdr(msg.msg_name, msg.msg_namelen)?;
+            msg.msg_namelen = self
+                .destination_endpoint()
+                .write_to_user_msghdr(msg.msg_name, msg.msg_namelen)?;
         } else {
             msg.msg_namelen = 0;
         }

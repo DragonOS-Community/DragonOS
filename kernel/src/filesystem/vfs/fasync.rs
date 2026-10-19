@@ -19,7 +19,7 @@ use crate::{
 use alloc::sync::Arc;
 use system_error::SystemError;
 
-use super::file::File;
+use super::file::{File, FileOwnerSnapshot};
 
 pub const FASYNC_POLL_IN: i64 = 0x00000001 | 0x00000040;
 pub const FASYNC_POLL_OUT: i64 = 0x00000004 | 0x00000100 | 0x00000200;
@@ -61,10 +61,55 @@ pub fn fasync_band_from_epoll(events: EPollEventType) -> Option<i64> {
 }
 
 struct FAsyncSignalTarget {
-    pcb: Arc<crate::process::ProcessControlBlock>,
-    signum: i32,
+    owner: FileOwnerSnapshot,
     fd: i32,
     band: i64,
+}
+
+fn with_owner_targets(
+    owner: &FileOwnerSnapshot,
+    mut notify: impl FnMut(Arc<crate::process::ProcessControlBlock>, PidType),
+) {
+    let Some(pid) = &owner.pid else { return };
+    let permitted = |task: &crate::process::ProcessControlBlock| {
+        let cred = task.cred();
+        owner.euid.data() == 0
+            || owner.euid == cred.uid
+            || owner.euid == cred.suid
+            || owner.uid == cred.uid
+            || owner.uid == cred.suid
+    };
+    if owner.pid_type == PidType::PGID {
+        let Ok(tasks) = pid.try_tasks_snapshot(PidType::PGID) else {
+            return;
+        };
+        for task in tasks {
+            if task.is_thread_group_leader() && permitted(&task) {
+                notify(task, PidType::TGID);
+            }
+        }
+    } else if let Some(task) = pid.pid_task(PidType::PID) {
+        if permitted(&task) {
+            notify(task, owner.pid_type);
+        }
+    }
+}
+
+/// Urgent notification belongs to the socket owner, independently of O_ASYNC
+/// and F_SETSIG. Never attribute an incoming packet to the poll worker's uid.
+pub(crate) fn send_sigurg(owner: FileOwnerSnapshot) {
+    with_owner_targets(&owner, |task, kind| {
+        let mut info = SigInfo::new(
+            Signal::SIGURG,
+            0,
+            SigCode::Kernel,
+            SigType::Kill {
+                pid: crate::process::RawPid::from(0),
+                uid: 0,
+            },
+        );
+        let _ = Signal::SIGURG.send_signal_info_to_pcb(Some(&mut info), task, kind);
+    });
 }
 
 /// FAsyncItem represents a file that wants to receive SIGIO signals
@@ -188,10 +233,9 @@ impl FAsyncItems {
                 }
 
                 let owner = file.owner_snapshot();
-                if let Some(pcb) = owner.pcb {
+                if owner.pid.is_some() {
                     targets.push(FAsyncSignalTarget {
-                        pcb,
-                        signum: owner.signum,
+                        owner,
                         fd: item.fd(),
                         band,
                     });
@@ -201,13 +245,17 @@ impl FAsyncItems {
         drop(guard);
 
         for target in targets {
-            Self::send_sigio_to_process(target.pcb, target.signum, target.fd, target.band);
+            let signum = target.owner.signum;
+            with_owner_targets(&target.owner, |task, kind| {
+                Self::send_sigio_to_process(task, kind, signum, target.fd, target.band);
+            });
         }
     }
 
     /// Send SIGIO signal to a process
     fn send_sigio_to_process(
         pcb: Arc<crate::process::ProcessControlBlock>,
+        pid_type: PidType,
         signum: i32,
         fd: i32,
         band: i64,
@@ -225,7 +273,16 @@ impl FAsyncItems {
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
 
         if signum == 0 {
-            let _ = sig.send_signal_info_to_pcb(None, pcb, PidType::TGID);
+            let mut info = SigInfo::new(
+                sig,
+                0,
+                SigCode::Kernel,
+                SigType::Kill {
+                    pid: crate::process::RawPid::from(0),
+                    uid: 0,
+                },
+            );
+            let _ = sig.send_signal_info_to_pcb(Some(&mut info), pcb, pid_type);
         } else {
             let sig_code = if signal_has_specific_si_codes(sig) {
                 SigCode::SigIO
@@ -233,7 +290,7 @@ impl FAsyncItems {
                 poll_band_to_sig_code(band).unwrap_or(SigCode::SigIO)
             };
             let mut info = SigInfo::new(sig, 0, sig_code, SigType::SigPoll { fd, band });
-            let _ = sig.send_signal_info_to_pcb(Some(&mut info), pcb, PidType::TGID);
+            let _ = sig.send_signal_info_to_pcb(Some(&mut info), pcb, pid_type);
         }
 
         compiler_fence(core::sync::atomic::Ordering::SeqCst);

@@ -101,6 +101,12 @@ jobs:
           normal/loop_partscan
           normal/loop_block_cache
           normal/block_ext4_cache
+          normal/inotify_read_order
+          normal/file_owner_notifications
+          normal/tcp_urgent
+          normal/tcp_icmp_errors
+          normal/loop_logical_block_size
+          normal/block_soft_size
           normal/fat_rename_atomicity
           normal/fat_rename_aliases
           normal/mount_forced_readonly_selftest

@@ -799,6 +799,10 @@ bitflags! {
 
 /// The pollable inode trait
 pub trait PollableInode: Any + Sync + Send + Debug + CastFromSync {
+    /// Associate an owner notification route independent of O_ASYNC. Most
+    /// inodes only use fasync; TCP also needs this weak route for SIGURG.
+    fn set_owner_file(&self, _file: alloc::sync::Weak<file::File>) {}
+
     /// Return the poll status of the inode
     fn poll(&self, private_data: &FilePrivateData) -> Result<usize, SystemError>;
     /// Add an epoll item to the inode

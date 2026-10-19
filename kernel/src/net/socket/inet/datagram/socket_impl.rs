@@ -596,6 +596,10 @@ impl Socket for UdpSocket {
         }
     }
 
+    fn recv_needs_pre_wait(&self, flags: PMSG) -> bool {
+        !flags.contains(PMSG::ERRQUEUE)
+    }
+
     fn recv_msg(
         &self,
         msg: &mut crate::net::posix::MsgHdr,

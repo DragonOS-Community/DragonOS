@@ -1416,7 +1416,7 @@ impl Ext4FileSystem {
         mount_options: Ext4MountOptions,
     ) -> Result<Arc<dyn FileSystem>, SystemError> {
         mount_options.validate_error_behavior()?;
-        let device_mount_holder = mount_data.acquire_mount_holder()?;
+        let device_mount_holder = mount_data.acquire_mount_holder(Magic::EXT4_MAGIC)?;
 
         // Worker creation may sleep and must never happen from final-release
         // publication while inode/eviction locks are held.
@@ -1455,6 +1455,9 @@ impl Ext4FileSystem {
             // configuration and never replays a live filesystem's journal.
             return Ok(existing);
         }
+        // another_ext4 supports 4KiB filesystem blocks; negotiate that same
+        // geometry before its block-device adapter begins loading metadata.
+        device_mount_holder.set_min_block_size(4096)?;
         // Writable mounts recover the journal and the validated legacy orphan
         // chain before this filesystem is published to the VFS.
         let prospective = (|| {

@@ -110,6 +110,7 @@ impl Syscall for SysRecvmmsgHandle {
                 && !file_nonblock
                 && (this_flags & PMSG::DONTWAIT.bits()) == 0
                 && !timeout.is_null()
+                && socket.recv_needs_pre_wait(PMSG::from_bits_retain(this_flags))
                 // Do not wait on the ordinary queue for a request the owner
                 // rejects. Import the message below before returning its error.
                 && socket

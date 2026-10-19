@@ -2,7 +2,7 @@ use core::{
     convert::TryFrom,
     fmt::{Debug, Formatter},
     ops::{Deref, DerefMut},
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
 
 use alloc::{
@@ -33,6 +33,9 @@ const MINORS_PER_DISK: u32 = 256;
 
 mod cache;
 mod ioctl;
+mod lifecycle;
+#[cfg(feature = "mm_selftest")]
+pub(crate) use cache::run_raw_block_prefix_selftest;
 
 #[derive(Debug)]
 pub struct GenDisk {
@@ -42,8 +45,10 @@ pub struct GenDisk {
     online: AtomicBool,
     open_holders: AtomicUsize,
     mount_holders: AtomicUsize,
+    mount_claimant: AtomicU64,
     range: GeneralBlockRange,
     block_size_log2: u8,
+    soft_block_size: AtomicUsize,
     idx: Option<u32>,
 
     device_num: DeviceNumber,
@@ -58,6 +63,7 @@ pub struct GenDisk {
 pub struct GenDiskMountGuard {
     bdev: Arc<dyn BlockDevice>,
     disk: Arc<GenDisk>,
+    claimant: crate::filesystem::vfs::Magic,
 }
 
 impl Debug for GenDiskMountGuard {
@@ -72,8 +78,7 @@ impl Drop for GenDiskMountGuard {
     fn drop(&mut self) {
         {
             let _gate = self.bdev.blkdev_meta().raw_cache_gate.write();
-            let _ = self.disk.sync_raw_cache_locked();
-            self.disk.mount_holders.fetch_sub(1, Ordering::Release);
+            self.disk.release_holder_locked(&*self.bdev, true);
         }
         self.bdev.mount_holder_release();
     }
@@ -113,8 +118,10 @@ impl GenDisk {
             online: AtomicBool::new(true),
             open_holders: AtomicUsize::new(0),
             mount_holders: AtomicUsize::new(0),
+            mount_claimant: AtomicU64::new(0),
             range,
             block_size_log2: bsizelog2,
+            soft_block_size: AtomicUsize::new(crate::arch::MMArch::PAGE_SIZE),
             idx,
             device_num,
             parent: RwLock::new(Weak::default()),
@@ -131,15 +138,33 @@ impl GenDisk {
         self.bdev.upgrade().ok_or(SystemError::ENODEV)
     }
 
-    pub fn acquire_mount_holder(&self) -> Result<GenDiskMountGuard, SystemError> {
+    pub fn acquire_mount_holder(
+        &self,
+        claimant: crate::filesystem::vfs::Magic,
+    ) -> Result<GenDiskMountGuard, SystemError> {
         let bdev = self.block_device()?;
-        let _gate = bdev.blkdev_meta().raw_cache_gate.read();
+        let _gate = bdev.blkdev_meta().raw_cache_gate.write();
         self.check_online()?;
+        self.check_mount_topology_locked(&*bdev)?;
+        if claimant.is_empty() {
+            return Err(SystemError::EINVAL);
+        }
+        let owner = self.mount_claimant.load(Ordering::Acquire);
+        if owner != 0 && owner != claimant.bits() {
+            return Err(SystemError::EBUSY);
+        }
+        self.prepare_holder_locked(&*bdev)?;
         let disk = self.self_ref.upgrade().ok_or(SystemError::ENODEV)?;
         bdev.mount_holder_acquire()?;
-        self.mount_holders.fetch_add(1, Ordering::Release);
+        self.mount_claimant
+            .store(claimant.bits(), Ordering::Release);
+        self.add_holder_locked(&*bdev, true);
         drop(_gate);
-        Ok(GenDiskMountGuard { bdev, disk })
+        Ok(GenDiskMountGuard {
+            bdev,
+            disk,
+            claimant,
+        })
     }
 
     pub(crate) fn has_node_holders(&self) -> bool {
@@ -324,7 +349,7 @@ impl GenDisk {
             return Ok(0);
         }
         let len = len.min(capacity - offset);
-        let mask = (1usize << self.block_size_log2) - 1;
+        let mask = self.block_device()?.io_limits().logical_block_size as usize - 1;
         if (offset | len) & mask != 0 {
             return Err(SystemError::EINVAL);
         }
@@ -402,7 +427,7 @@ impl IndexNode for GenDisk {
                 return Err(SystemError::EFAULT.into());
             }
             if direct {
-                return self.coherent_write(offset, &bytes[..count], sync);
+                return self.coherent_write_operation(offset, &bytes[..count], sync, Some(len));
             }
             self.buffered_write_operation(offset, &bytes[..count], sync)
         })
@@ -481,9 +506,10 @@ impl IndexNode for GenDisk {
         if len == 0 {
             return Ok(Some(0));
         }
+        // DMA/user-address alignment remains sector-sized even when loop's
+        // queue logical block size is larger. Payload admission checks the
+        // dynamic logical offset/length under the configuration gate.
         let mask = (1usize << self.block_size_log2) - 1;
-        // Current block devices expose sector alignment, not a separate DMA
-        // alignment property. Keep address/length mask responsibilities clear.
         if direct && !writer.is_aligned_at(0, len, mask, mask) {
             return Err(SystemError::EINVAL);
         }
@@ -507,7 +533,7 @@ impl IndexNode for GenDisk {
             // allocation recovery. Never replay the whole user operation.
             let result = File::recover_io(|| {
                 if direct {
-                    self.coherent_read(offset + total, buffer)
+                    self.coherent_read_operation(offset + total, buffer, true)
                 } else {
                     self.buffered_read(offset + total, buffer)
                 }
@@ -554,7 +580,7 @@ impl IndexNode for GenDisk {
             return Ok(0);
         }
         drop(data);
-        self.coherent_read(offset, &mut buf[..len])
+        self.coherent_read_operation(offset, &mut buf[..len], true)
     }
 
     fn read_at(
@@ -657,10 +683,7 @@ impl IndexNode for GenDisk {
         let device = self.block_device()?;
         {
             let _gate = device.blkdev_meta().raw_cache_gate.write();
-            if self.open_holders.load(Ordering::Acquire) == 1 {
-                let _ = self.sync_raw_cache_locked();
-            }
-            self.open_holders.fetch_sub(1, Ordering::Release);
+            self.release_holder_locked(&*device, false);
         }
         // The last lower release can synchronously autoclear and take write.
         device.file_close(data)
@@ -672,10 +695,11 @@ impl IndexNode for GenDisk {
         mode: &crate::filesystem::vfs::file::FileFlags,
     ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         let device = self.block_device()?;
-        let _gate = device.blkdev_meta().raw_cache_gate.read();
+        let _gate = device.blkdev_meta().raw_cache_gate.write();
         self.check_online()?;
+        self.prepare_holder_locked(&*device)?;
         device.file_open(data, mode)?;
-        self.open_holders.fetch_add(1, Ordering::Release);
+        self.add_holder_locked(&*device, false);
         Ok(())
     }
 
@@ -686,6 +710,23 @@ impl IndexNode for GenDisk {
         private_data: MutexGuard<crate::filesystem::vfs::FilePrivateData>,
     ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
         let bdev = self.block_device()?;
+        if cmd == 0x4008_1271 {
+            drop(private_data);
+            if !crate::process::cred::capable(crate::process::cred::CAPFlags::CAP_SYS_ADMIN) {
+                return Err(SystemError::EACCES.into());
+            }
+            if data == 0 {
+                return Err(SystemError::EINVAL.into());
+            }
+            let reader = crate::syscall::user_access::UserBufferReader::new(
+                data as *const u8,
+                core::mem::size_of::<i32>(),
+                true,
+            )?;
+            let size: i32 = reader.buffer_protected(0)?.read_one(0)?;
+            self.set_soft_block_size(size as usize)?;
+            return Ok(0);
+        }
         if cmd == 0x1261 {
             // BLKFLSBUF
             drop(private_data);

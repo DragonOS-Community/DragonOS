@@ -20,6 +20,7 @@ mod info;
 mod inner;
 mod option;
 mod registration;
+mod urgent;
 pub use option::Options as TcpOption;
 use option::Options;
 
@@ -66,6 +67,9 @@ impl TcpSocket {
                 }
                 Ok(ReceiveAttempt::Ready(n)) => {
                     total_read += n;
+                    if cursor.boundary {
+                        break Ok(total_read);
+                    }
                     if n == 0 {
                         // EOF or no more bytes available.
                         break Ok(total_read);
@@ -126,13 +130,16 @@ impl TcpSocket {
         ret
     }
 
-    /// Shared scalar/vectored payload policy; recvmsg retains its own error
-    /// queue and ancillary-data handling around this receive operation.
+    /// Shared scalar/vectored receive-source admission and protected payload
+    /// policy; recvmsg adapts error-queue and urgent ancillary output.
     fn recv_user_buffer(
         &self,
         buffer: &mut crate::syscall::user_buffer::UserBuffer<'_>,
         flags: PMSG,
     ) -> Result<usize, SystemError> {
+        if flags.contains(PMSG::OOB) {
+            return self.recv_urgent_to_user(buffer, flags);
+        }
         if flags.contains(PMSG::TRUNC) {
             self.recv_with_target(&mut TcpReceiveTarget::Discard(buffer.len()), flags)
         } else if flags.contains(PMSG::PEEK) {
@@ -155,7 +162,7 @@ impl TcpSocket {
     fn send_with_progress(
         &self,
         buffer: &[u8],
-        _flags: PMSG,
+        flags: PMSG,
         report_error: bool,
     ) -> Result<usize, SystemError> {
         if buffer.is_empty() {
@@ -163,8 +170,8 @@ impl TcpSocket {
             return Ok(0);
         }
 
-        if self.is_nonblock() || _flags.contains(PMSG::DONTWAIT) {
-            let ret = self.try_send(buffer, report_error);
+        if self.is_nonblock() || flags.contains(PMSG::DONTWAIT) {
+            let ret = self.try_send(buffer, flags, report_error);
             if let Ok(n) = ret {
                 if n > 0 {
                     self.notify();
@@ -180,7 +187,11 @@ impl TcpSocket {
         let mut total_sent = 0usize;
 
         while total_sent < buffer.len() {
-            match self.try_send(&buffer[total_sent..], report_error && total_sent == 0) {
+            match self.try_send(
+                &buffer[total_sent..],
+                flags,
+                report_error && total_sent == 0,
+            ) {
                 Ok(n) => {
                     if n == 0 {
                         if total_sent > 0 {
@@ -274,10 +285,14 @@ impl Socket for TcpSocket {
             .store(nonblocking, core::sync::atomic::Ordering::Relaxed);
     }
 
-    fn recvfrom_addr_behavior(&self) -> crate::net::socket::RecvFromAddrBehavior {
-        // Linux/gVisor: for TCP (SOCK_STREAM), recvfrom(2) ignores the source
-        // address output parameters. If addrlen is provided, kernel writes back 0.
-        crate::net::socket::RecvFromAddrBehavior::Ignore
+    fn recvfrom_addr_behavior(&self, flags: PMSG) -> crate::net::socket::RecvFromAddrBehavior {
+        // Extended errors report the original destination. Keep the ordinary
+        // stream adapter's existing ignored-address contract independent.
+        if flags.contains(PMSG::ERRQUEUE) {
+            crate::net::socket::RecvFromAddrBehavior::Write
+        } else {
+            crate::net::socket::RecvFromAddrBehavior::Ignore
+        }
     }
 
     fn open_file_counter(&self) -> &AtomicUsize {
@@ -407,6 +422,21 @@ impl Socket for TcpSocket {
     }
 
     fn recv(&self, buffer: &mut [u8], flags: PMSG) -> Result<usize, SystemError> {
+        if flags.contains(PMSG::ERRQUEUE) {
+            return self.recv_error_to_buffer(buffer).map(|(len, _)| len);
+        }
+        if flags.contains(PMSG::OOB) {
+            let byte = self.take_urgent_for_receive(flags)?;
+            return Ok(match (byte, buffer.first_mut()) {
+                (Some(byte), Some(output)) => {
+                    if !flags.contains(PMSG::TRUNC) {
+                        *output = byte;
+                    }
+                    1
+                }
+                _ => 0,
+            });
+        }
         self.recv_with_target(&mut TcpReceiveTarget::Buffer(buffer), flags)
     }
 
@@ -474,7 +504,10 @@ impl Socket for TcpSocket {
         flags: PMSG,
         _address: Option<Endpoint>,
     ) -> Result<(usize, Endpoint), SystemError> {
-        // Linux 语义：对 SOCK_STREAM(TCP) 的 recvfrom(2)，addr 参数被忽略。
+        if flags.contains(PMSG::ERRQUEUE) {
+            return self.recv_error_to_buffer(buffer);
+        }
+        // Linux 语义：对普通 SOCK_STREAM(TCP) 的 recvfrom(2)，addr 参数被忽略。
         // “不写回 sockaddr” 的行为在 syscall 层做特殊处理，避免修改用户缓冲区。
         let n = self.recv(buffer, flags)?;
         // 返回值仅用于统一接口；不会被写回给用户。
@@ -490,6 +523,9 @@ impl Socket for TcpSocket {
         buffer: &mut crate::syscall::user_buffer::UserBuffer<'_>,
         flags: PMSG,
     ) -> Result<(usize, Endpoint), SystemError> {
+        if flags.contains(PMSG::ERRQUEUE) {
+            return self.recv_error_to_user(buffer);
+        }
         let n = self.recv_user_buffer(buffer, flags)?;
         // TCP ignores source-address output, as in the kernel-buffer adapter.
         let endpoint = self.remote_endpoint().unwrap_or_else(|_| {
@@ -497,6 +533,10 @@ impl Socket for TcpSocket {
                 .unwrap_or(Endpoint::ip(UNSPECIFIED_LOCAL_ENDPOINT_V4))
         });
         Ok((n, endpoint))
+    }
+
+    fn recv_needs_pre_wait(&self, flags: PMSG) -> bool {
+        !flags.intersects(PMSG::ERRQUEUE | PMSG::OOB)
     }
 
     fn recv_msg(
@@ -508,24 +548,31 @@ impl Socket for TcpSocket {
         if flags.contains(PMSG::ERRQUEUE) {
             return self.recv_icmp_error(msg, iovs);
         }
-        // TCP: 不返回 peer 地址。
+        // One logical buffer serves ordinary and urgent receives; ancillary
+        // TCP_INQ observes the protocol sequence space in both cases.
         let total = iovs.total_len();
         let mut user_buffer = crate::syscall::user_buffer::UserBuffer::new_vectored(iovs, total);
-        let written = self.recv_user_buffer(&mut user_buffer, flags)?;
-
-        msg.msg_flags = 0;
+        let (written, output_flags) = if flags.contains(PMSG::OOB) {
+            self.recv_urgent_msg(&mut user_buffer, flags)?
+        } else {
+            (
+                self.recv_user_buffer(&mut user_buffer, flags)?,
+                PMSG::empty(),
+            )
+        };
+        msg.msg_flags = output_flags.bits() as i32;
         msg.msg_namelen = 0;
 
         // Ancillary data: SO_TIMESTAMP and TCP_INQ.
         let mut cmsg_write_off = 0usize;
-        if !msg.msg_control.is_null() && msg.msg_controllen != 0 {
+        if (!msg.msg_control.is_null() && msg.msg_controllen != 0) || self.inq_enabled() {
             let mut cbuf = CmsgBuffer {
                 ptr: msg.msg_control,
                 len: msg.msg_controllen,
                 write_off: &mut cmsg_write_off,
             };
 
-            if self.timestamp_enabled() {
+            if self.timestamp_enabled() && !flags.contains(PMSG::OOB) {
                 let now_ns = crate::time::timekeeping::do_gettimeofday().to_ns();
                 let tv = PosixTimeval::from_ns(now_ns);
                 let tv_bytes: &[u8] = unsafe {
@@ -546,7 +593,7 @@ impl Socket for TcpSocket {
             }
 
             if self.inq_enabled() {
-                let inq = TcpSocket::clamp_usize_to_i32(self.recv_queue_len());
+                let inq = TcpSocket::clamp_usize_to_i32(self.tcp_inq_hint());
                 let inq_bytes = inq.to_ne_bytes();
                 cbuf.put(
                     &mut msg.msg_flags,
@@ -621,6 +668,10 @@ impl Socket for TcpSocket {
         &self.epoll_items
     }
 
+    fn set_owner_file(&self, file: alloc::sync::Weak<crate::filesystem::vfs::file::File>) {
+        *self.owner_file.lock() = file;
+    }
+
     fn fasync_items(&self) -> &FAsyncItems {
         &self.fasync_items
     }
@@ -632,10 +683,26 @@ impl Socket for TcpSocket {
 
     fn ioctl(
         &self,
-        _cmd: u32,
-        _arg: usize,
+        cmd: u32,
+        arg: usize,
         _private_data: &crate::filesystem::vfs::FilePrivateData,
     ) -> Result<usize, SystemError> {
+        if cmd == 0x8905 {
+            // SIOCATMARK
+            let at_mark = self
+                .inner
+                .read()
+                .as_ref()
+                .and_then(|inner| inner.with_socket(|socket| socket.at_urgent_mark()))
+                .unwrap_or(false) as i32;
+            let mut output = crate::syscall::user_access::UserBufferWriter::new(
+                arg as *mut i32,
+                core::mem::size_of::<i32>(),
+                true,
+            )?;
+            output.buffer_protected(0)?.write_one(0, &at_mark)?;
+            return Ok(0);
+        }
         Err(SystemError::ENOSYS)
     }
 }
@@ -671,5 +738,6 @@ impl InetSocket for TcpSocket {
         // 重要：driver/net/mod.rs 已保证 notify() 调用时不再持有 bounds 读锁，
         // 因此这里可以安全地获取 self.inner 的 RwLock 并更新事件。
         let _ = self.update_events();
+        self.notify_urgent_owner();
     }
 }

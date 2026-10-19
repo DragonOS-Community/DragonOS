@@ -136,8 +136,8 @@ protected:
         ASSERT_NO_FATAL_FAILURE(WriteMbr(fd->value, start, count));
     }
     void WriteGpt(uint64_t sectors = kSectors, uint32_t count = 128,
-                  uint64_t start = 2048, uint64_t end = 4095, bool boundary_entries = false) {
-        ASSERT_EQ(0, ftruncate(backing_.value, sectors * 512));
+                  uint64_t start = 2048, uint64_t end = 4095, bool boundary_entries = false, uint32_t logical = 512) {
+        ASSERT_EQ(0, ftruncate(backing_.value, sectors * logical));
         std::array<unsigned char, 512> mbr {};
         mbr[446 + 4] = 0xee; Le32(mbr.data() + 446 + 8, 1);
         Le32(mbr.data() + 446 + 12, sectors - 1);
@@ -152,18 +152,18 @@ protected:
             memcpy(entry, linux_type, 16); entry[16] = index + 1;
             Le64(entry + 32, start); Le64(entry + 40, end);
         }
-        const uint64_t table_sectors = (entries.size() + 511) / 512;
+        const uint64_t table_sectors = (entries.size() + logical - 1) / logical;
         const uint64_t backup_table = sectors - 1 - table_sectors;
-        ASSERT_EQ(static_cast<ssize_t>(entries.size()), pwrite(backing_.value, entries.data(), entries.size(), 2 * 512));
-        ASSERT_EQ(static_cast<ssize_t>(entries.size()), pwrite(backing_.value, entries.data(), entries.size(), backup_table * 512));
+        ASSERT_EQ(static_cast<ssize_t>(entries.size()), pwrite(backing_.value, entries.data(), entries.size(), 2 * logical));
+        ASSERT_EQ(static_cast<ssize_t>(entries.size()), pwrite(backing_.value, entries.data(), entries.size(), backup_table * logical));
         for (bool backup : {false, true}) {
-            std::array<unsigned char, 512> header {};
+            std::vector<unsigned char> header(logical, 0);
             memcpy(header.data(), "EFI PART", 8); Le32(header.data() + 8, 0x10000); Le32(header.data() + 12, 92);
             Le64(header.data() + 24, backup ? sectors - 1 : 1); Le64(header.data() + 32, backup ? 1 : sectors - 1);
             Le64(header.data() + 40, table_sectors + 2); Le64(header.data() + 48, backup_table - 1); header[56] = 2;
             Le64(header.data() + 72, backup ? backup_table : 2); Le32(header.data() + 80, count); Le32(header.data() + 84, 128);
             Le32(header.data() + 88, Crc32(entries.data(), entries.size())); Le32(header.data() + 16, Crc32(header.data(), 92));
-            ASSERT_EQ(512, pwrite(backing_.value, header.data(), header.size(), (backup ? sectors - 1 : 1) * 512));
+            ASSERT_EQ(logical, pwrite(backing_.value, header.data(), header.size(), (backup ? sectors - 1 : 1) * logical));
         }
         ASSERT_EQ(0, fsync(backing_.value));
     }
@@ -178,6 +178,26 @@ protected:
     std::string backing_path_, second_path_, loop_path_;
     bool bound_ = false;
 };
+
+TEST_F(LoopPartscan, ConfigureLargeLogicalMbrUsesLogicalSectorUnits) {
+    loop_config config {}; config.fd = backing_.value;
+    config.block_size = 4096; config.info.lo_flags = LO_FLAGS_PARTSCAN;
+    ASSERT_EQ(0, ioctl(loop_.value, LOOP_CONFIGURE, &config)) << strerror(errno);
+    bound_ = true;
+    ASSERT_NO_FATAL_FAILURE(ExpectCapacity(Part(1), 16 * 4096));
+    ASSERT_EQ(0, ioctl(loop_.value, LOOP_SET_BLOCK_SIZE, 512));
+    // Changing queue geometry alone never reinterprets the published table.
+    ASSERT_NO_FATAL_FAILURE(ExpectCapacity(Part(1), 16 * 4096));
+}
+
+TEST_F(LoopPartscan, ConfigureLargeLogicalGptReadsHeadersAndEntriesAtLogicalOffsets) {
+    ASSERT_NO_FATAL_FAILURE(WriteGpt(1024, 128, 64, 127, false, 4096));
+    loop_config config {}; config.fd = backing_.value;
+    config.block_size = 4096; config.info.lo_flags = LO_FLAGS_PARTSCAN;
+    ASSERT_EQ(0, ioctl(loop_.value, LOOP_CONFIGURE, &config)) << strerror(errno);
+    bound_ = true;
+    ASSERT_NO_FATAL_FAILURE(ExpectCapacity(Part(1), 64 * 4096));
+}
 
 TEST_F(LoopPartscan, StickyStatusPublishesSlotNumberAndClearRemovesNodes) {
     ASSERT_NO_FATAL_FAILURE(WriteMbr(backing_.value, 64, 8, 2));
@@ -346,6 +366,11 @@ TEST_F(LoopPartscan, MountedPartitionPinsMappingUntilUnmount) {
     ASSERT_NE(nullptr, mkdtemp(directory)); owner.path = directory;
     ASSERT_EQ(0, mount(Part(1).c_str(), owner.path.c_str(), "ext4", MS_RDONLY, nullptr)) << strerror(errno);
     owner.mounted = true;
+    for (unsigned size : {512U, 4096U, 768U}) {
+        errno = 0;
+        EXPECT_EQ(-1, ioctl(loop_.value, LOOP_SET_BLOCK_SIZE, size));
+        EXPECT_EQ(EBUSY, errno) << "mounted partition claim precedes size validation";
+    }
     ASSERT_EQ(0, ioctl(loop_.value, LOOP_CLR_FD, 0));
     loop_info64 status {}; ASSERT_EQ(0, ioctl(loop_.value, LOOP_GET_STATUS64, &status));
     EXPECT_NE(0U, status.lo_flags & LO_FLAGS_AUTOCLEAR);

@@ -32,7 +32,7 @@ impl OomReapAuthorization {
         self.mm_id
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "mm_selftest"))]
     pub(in crate::mm) fn test_authorization(mm_id: u64) -> Self {
         Self { mm_id }
     }

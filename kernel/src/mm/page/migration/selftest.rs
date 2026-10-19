@@ -312,13 +312,14 @@ impl Fixture {
                     .map_phys(address, page.phys_address(), flags)
             }
             .ok_or(SystemError::ENOMEM)?;
+            vma.lock().set_mapped(true);
             page.write().insert_vma(vma, false);
             mm.account_present_page_add();
             flush.flush();
             Ok::<(), SystemError>(())
         })();
         if let Err(error) = published {
-            crate::mm::page::retire_unmapped_normal_page(&page);
+            crate::mm::page::retire_unmapped_page(&page);
             return Err(error);
         }
         // Distinct bytes across the complete page catch partial copies.
@@ -487,18 +488,12 @@ fn unsupported_lru() -> bool {
         && f.valid()
         && f.page()
             .is_some_and(|page| page.read().flags().contains(PageFlags::PG_LRU));
-    // This fixture explicitly created an anonymous LRU owner. Production
-    // anonymous munmap does not yet retire that owner (tracked separately as
-    // MM-139), outside migration's supported range. First prove rejection
-    // preserved all state, then clean up only this private fixture's owner
-    // after real munmap has cleared PTEs and synchronously invalidated TLBs.
+    // Production unmap now retires the fixture's real LRU owner. Keep only
+    // this observation reference until synchronous PTE/TLB teardown finishes.
     let page = f.page().unwrap();
     let unmapped =
         f.mm.munmap_wait(VirtPageFrame::new(f.address), PageFrameCount::ONE)
             .is_ok();
-    if unmapped {
-        crate::mm::page::detach_pages_from_reclaimer_batched(core::iter::once(&page));
-    }
     drop(page);
     unsupported && unchanged && unmapped && f.account.current_pages() == 0
 }

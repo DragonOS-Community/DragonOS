@@ -337,7 +337,7 @@ impl LockedVMA {
                     let mut page_guard = page_arc.write();
                     page_guard.remove_vma(self);
                 }
-                pages_to_reclassify.push((paddr, page_arc));
+                pages_to_reclassify.push(page_arc);
 
                 // Local PTE cleared; no immediate invlpg. Final TLB invalidation is performed uniformly by MmuGather.
                 unsafe { flush.ignore() };
@@ -346,7 +346,7 @@ impl LockedVMA {
             }
         }
 
-        for (_, page_arc) in &pages_to_reclassify {
+        for page_arc in &pages_to_reclassify {
             InnerAddressSpace::remove_page_unevictable_if_unneeded(page_arc);
         }
 
@@ -354,19 +354,11 @@ impl LockedVMA {
             mm.account_present_pages_sub(unmapped_present_pages);
         }
 
-        let mut page_manager_guard = page_manager_lock();
-        for (paddr, page_arc) in pages_to_reclassify {
-            // The physical page's VMA list length is 0 and it is not marked as non-reclaimable, so it can be freed.
-            // TODO: LRU-based physical page reclamation in the future
-            let can_dealloc = page_arc.read().can_deallocate_after_vma_unmap();
-
-            if can_dealloc {
-                // Remove this `Arc<Page>` from page_manager, deferring the drop until after TLB shootdown.
-                // This guarantees INV-3: other cores can no longer reach the returned-to-buddy physical page via stale TLB.
-                if let Some(p) = page_manager_guard.remove_page(&paddr) {
-                    tlb.stash_page(p);
-                }
-            }
+        for page in pages_to_reclassify {
+            crate::mm::page::retire_unmapped_page(&page);
+            // Every revoked PTE needs this transaction's own TLB lifetime,
+            // even when another MM later removes the last reverse mapping.
+            tlb.stash_page(page);
         }
 
         // When the VMA corresponds to a shared file write mapping, wake up the dirty page writeback thread
@@ -457,7 +449,7 @@ impl LockedVMA {
                     let mut page_guard = page_arc.write();
                     page_guard.remove_vma(self);
                 }
-                pages_to_reclassify.push((paddr, page_arc));
+                pages_to_reclassify.push(page_arc);
 
                 unsafe { flush.ignore() };
                 tlb.accumulate_range(virt);
@@ -465,7 +457,7 @@ impl LockedVMA {
             }
         }
 
-        for (_, page_arc) in &pages_to_reclassify {
+        for page_arc in &pages_to_reclassify {
             InnerAddressSpace::remove_page_unevictable_if_unneeded(page_arc);
         }
 
@@ -473,14 +465,9 @@ impl LockedVMA {
             mm.account_present_pages_sub(unmapped_present_pages);
         }
 
-        let mut page_manager_guard = page_manager_lock();
-        for (paddr, page_arc) in pages_to_reclassify {
-            let can_dealloc = page_arc.read().can_deallocate_after_vma_unmap();
-            if can_dealloc {
-                if let Some(p) = page_manager_guard.remove_page(&paddr) {
-                    tlb.stash_page(p);
-                }
-            }
+        for page in pages_to_reclassify {
+            crate::mm::page::retire_unmapped_page(&page);
+            tlb.stash_page(page);
         }
     }
 

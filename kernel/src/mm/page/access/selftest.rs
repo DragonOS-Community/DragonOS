@@ -164,8 +164,10 @@ fn pin_and_isolation() -> bool {
         };
         let denied = matches!(f.page.try_pin_access(), Err(PageAccessError::Busy));
         let no_second = matches!(
-            f.page
-                .try_isolate_for_migration(isolation._mm_guard, f.address),
+            f.page.try_isolate_for_migration(
+                isolation._mm_guard.expect("strict MM isolation"),
+                f.address
+            ),
             Err(PageIsolationError::Busy)
         );
         denied && no_second

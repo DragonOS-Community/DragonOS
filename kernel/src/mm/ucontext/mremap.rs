@@ -889,7 +889,7 @@ impl InnerAddressSpace {
                         LockedVMA::classify_present_pfn(&mut page_manager_guard, paddr, vm_flags)
                     {
                         installed_target_present_pages += 1;
-                        page.write().insert_vma(new_vma.clone(), locked_source);
+                        page.write().insert_vma(new_vma.clone(), dst, locked_source);
                     }
 
                     migrated.push((src, dst, paddr, src_flags));

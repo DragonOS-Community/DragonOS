@@ -78,7 +78,12 @@ TEST_F(PageMigration, OwnershipAccountingAndRollbackSelftest) {
     EXPECT_NE(std::string::npos, report.find("status=ok\n")) << report;
     EXPECT_NE(std::string::npos, report.find("summary_fail=0\n")) << report;
     for (const char* key : {"identity_data_permissions", "unique_charge_full_limit", "offline_owner",
-            "pin_and_extra_arc", "rollback_stages", "unsupported_lru", "repeated_migration", "atomic_hva_pin"}) {
+            "pin_and_extra_arc", "rollback_stages", "unsupported_lru", "repeated_migration", "atomic_hva_pin",
+            "ownership_freeze_before_copy", "cached_file_clean", "cached_file_dirty",
+            "cached_shmem_clean", "cached_shmem_dirty", "cached_offline_charge",
+            "cached_entry_pin_busy", "cached_extra_arc_busy", "cached_access_pin_busy",
+            "cached_read_dma_reservation_busy", "cached_writeback_claim_busy",
+            "cached_reclaimer_snapshot_recency"}) {
         EXPECT_NE(std::string::npos, report.find(std::string(key) + "=ok\n")) << report;
     }
 }

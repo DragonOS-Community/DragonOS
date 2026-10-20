@@ -814,7 +814,7 @@ pub(crate) fn fork_restore_inherited_uprobes_locked(
             return Err(error.into());
         }
         let vm_locked = vma.lock().vm_flags().contains(VmFlags::VM_LOCKED);
-        new_page.write().insert_vma(vma.clone(), vm_locked);
+        new_page.write().insert_vma(vma.clone(), address, vm_locked);
         child_mm.flush_tlb_range(
             address,
             VirtAddr::new(page_base + MMArch::PAGE_SIZE),

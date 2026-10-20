@@ -407,7 +407,7 @@ fn run(user: bool, lru: bool, mode: Mode, cpu: ProcessorId, diagnostic: &mut Str
             fail!("lru_map", start);
         };
         vma.lock().set_mapped(true);
-        page.write().insert_vma(vma, false);
+        page.write().insert_vma(vma, start, false);
         mm.account_present_page_add();
         flush.flush();
         lru_account = Some(account);

@@ -47,6 +47,7 @@ use crate::{libs::align::page_align_up, mm::page::PageType};
 use lazy_static::lazy_static;
 
 mod mapping;
+mod migration;
 mod ordered_index;
 mod read_batch;
 mod read_dma;
@@ -65,6 +66,7 @@ pub(crate) use mapping::PageCacheFaultInvalidateRead;
 pub(crate) use mapping::PageCacheRangeResult;
 pub(crate) use mapping::PageCacheReclaimMapOutcome;
 pub use mapping::UnmapMappingMode;
+pub(crate) use migration::PageCacheMigrationGuard;
 use ordered_index::{CacheIndex, Node as CacheIndexNode};
 pub use read_batch::{PageCacheReadBatchCompletion, PageCacheReadBatchRequest};
 pub use read_dma::PageCacheReadDmaReservation;
@@ -2868,6 +2870,12 @@ impl PageCache {
     }
 
     fn evict_clean_pages_for_invalidate(&self, range: Option<(usize, usize)>) -> usize {
+        // Shmem cache pages are the backing store itself. Clean is not proof
+        // that they can be reloaded; advisory invalidation must preserve them.
+        // Explicit truncate/punch operations use their separate removal path.
+        if self.is_shmem() {
+            return 0;
+        }
         let mut evicted = 0;
         for page_index in self.clean_evict_indices(range) {
             if let Some(page) = self.remove_clean_page_candidate(page_index, true) {

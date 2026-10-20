@@ -11,6 +11,7 @@ use system_error::SystemError;
 use unified_init::macros::unified_init;
 
 use super::page_lru::{PageLru, PreparedPageLruCapacity};
+pub(crate) use super::page_rmap::PageMapping;
 use super::page_rmap::PageVmaSet;
 use alloc::sync::{Arc, Weak};
 use hashbrown::HashMap;
@@ -1875,11 +1876,11 @@ impl InnerPage {
     }
 
     /// 将vma加入anon_vma
-    pub fn insert_vma(&mut self, vma: Arc<LockedVMA>, vma_mlocked: bool) {
+    pub fn insert_vma(&mut self, vma: Arc<LockedVMA>, address: VirtAddr, vma_mlocked: bool) {
         let was_mapped = self.map_count() > 0;
-        let inserted = self.vma_set.insert(vma.clone());
+        let inserted = self.vma_set.insert(vma.clone(), address);
         if inserted && vma_mlocked {
-            self.mlocked_vmas.insert(vma);
+            self.mlocked_vmas.insert(vma, address);
             self.add_flags(PageFlags::PG_UNEVICTABLE);
         }
         if !was_mapped && matches!(self.page_type, PageType::File(_)) {
@@ -1908,7 +1909,7 @@ impl InnerPage {
     pub(crate) fn remove_vma_for_oom(
         &mut self,
         vma: &LockedVMA,
-    ) -> Option<HashMap<u64, Arc<LockedVMA>>> {
+    ) -> Option<HashMap<u64, PageMapping>> {
         let was_mapped = self.map_count() > 0;
         let (removed, retired) = self.vma_set.remove_deferred(vma);
         if removed {
@@ -1952,8 +1953,10 @@ impl InnerPage {
     }
 
     pub fn add_mlocked_vma_ref(&mut self, vma: &Arc<LockedVMA>) {
-        if self.vma_set.contains(vma.as_ref()) && self.mlocked_vmas.insert(vma.clone()) {
-            self.add_flags(PageFlags::PG_UNEVICTABLE);
+        if let Some(address) = self.vma_set.address(vma.as_ref()) {
+            if self.mlocked_vmas.insert(vma.clone(), address) {
+                self.add_flags(PageFlags::PG_UNEVICTABLE);
+            }
         }
     }
 
@@ -2030,6 +2033,12 @@ impl InnerPage {
 
     pub fn set_page_type(&mut self, page_type: PageType) {
         self.page_type = page_type;
+    }
+
+    /// Caller can reserve snapshot storage before locking this Page, then clone
+    /// these exact MM/VMA/VA identities without allocating in this iterator.
+    pub(crate) fn mappings(&self) -> impl Iterator<Item = &PageMapping> {
+        self.vma_set.iter()
     }
 
     #[inline(always)]

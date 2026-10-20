@@ -25,14 +25,19 @@ use core::{
 use system_error::SystemError;
 
 static TEST_LOCK: Mutex<()> = Mutex::new(());
+
 static NEXT_ACCOUNT: AtomicU64 = AtomicU64::new(0x0050_0000_0000_0000);
 static FAULT_OBSERVER: SpinLock<Option<Arc<FaultObserver>>> = SpinLock::new(None);
+
+mod ownership_freeze;
+mod shared;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Mode {
     Normal,
     Fail(MigrationStage),
     WaitFault,
+    LateOwnerWrite,
 }
 
 #[derive(Debug)]
@@ -52,6 +57,8 @@ pub(crate) struct Control {
     extra_owner: AtomicBool,
     old: AtomicUsize,
     new: AtomicUsize,
+    late_owner: Mutex<Option<Arc<Page>>>,
+    late_write_observed: AtomicBool,
 }
 
 impl Control {
@@ -69,6 +76,8 @@ impl Control {
             extra_owner: AtomicBool::new(false),
             old: AtomicUsize::new(0),
             new: AtomicUsize::new(0),
+            late_owner: Mutex::new(None),
+            late_write_observed: AtomicBool::new(false),
         }
     }
 
@@ -131,6 +140,24 @@ impl Control {
         self.extra_owner.store(true, Ordering::Release);
     }
 
+    /// Run a legal existing-Arc writer after the Page data guard is released.
+    /// This deterministic interleaving adds no production admission policy.
+    pub(crate) fn before_ownership_freeze(&self) {
+        if !matches!(self.mode, Mode::LateOwnerWrite) {
+            return;
+        }
+        let Some(page) = self.late_owner.lock().take() else {
+            return;
+        };
+        {
+            let mut data = page.write();
+            let bytes = unsafe { data.as_slice_mut() };
+            bytes[ownership_freeze::OFFSET] = ownership_freeze::VALUE;
+        }
+        drop(page);
+        self.late_write_observed.store(true, Ordering::Release);
+    }
+
     /// Called by the real transaction only after old Page/frame destruction.
     pub(crate) fn committed(&self, old: PhysAddr, new: PhysAddr) {
         self.old.store(old.data(), Ordering::Relaxed);
@@ -177,9 +204,22 @@ fn migrate(
     address: VirtAddr,
     control: &Control,
 ) -> Result<MigrationResult, MigrationError> {
+    migrate_scoped(mm, address, control, false)
+}
+
+fn migrate_scoped(
+    mm: &Arc<AddressSpace>,
+    address: VirtAddr,
+    control: &Control,
+    general: bool,
+) -> Result<MigrationResult, MigrationError> {
     // Retry only unrelated lock contention, outside every resource guard.
     for _ in 0..128 {
-        match migrate_with_control(mm, address, control) {
+        match if general {
+            super::migrate_data_with_control(mm, address, control)
+        } else {
+            migrate_with_control(mm, address, control)
+        } {
             Err(MigrationError::Busy) => crate::sched::sched_yield(),
             result => return result,
         }
@@ -201,12 +241,13 @@ pub(crate) fn command(bytes: &[u8]) -> Result<String, SystemError> {
     {
         return Err(SystemError::EINVAL);
     }
-    let mode = match mode_number {
+    let general = mode_number & 0x100 != 0;
+    let mode = match mode_number & !0x100 {
         0 => Mode::Normal,
         1 => Mode::Fail(MigrationStage::Prepared),
         2 => Mode::Fail(MigrationStage::Revoked),
         3 => Mode::Fail(MigrationStage::Flushed),
-        4 => Mode::Fail(MigrationStage::Copied),
+        4 => Mode::Fail(MigrationStage::CopyReady),
         5 => Mode::Fail(MigrationStage::BeforeCommit),
         6 => Mode::WaitFault,
         _ => return Err(SystemError::EINVAL),
@@ -216,7 +257,7 @@ pub(crate) fn command(bytes: &[u8]) -> Result<String, SystemError> {
         .user_vm()
         .ok_or(SystemError::EINVAL)?;
     let control = Control::new(mode);
-    let result = migrate(&mm, VirtAddr::new(address), &control);
+    let result = migrate_scoped(&mm, VirtAddr::new(address), &control, general);
     let (status, error) = match result {
         Ok(_) => ("ok", "none"),
         Err(MigrationError::Busy) => ("fail", "busy"),
@@ -313,7 +354,7 @@ impl Fixture {
             }
             .ok_or(SystemError::ENOMEM)?;
             vma.lock().set_mapped(true);
-            page.write().insert_vma(vma, false);
+            page.write().insert_vma(vma, address, false);
             mm.account_present_page_add();
             flush.flush();
             Ok::<(), SystemError>(())
@@ -459,7 +500,7 @@ fn rollback() -> bool {
         MigrationStage::Prepared,
         MigrationStage::Revoked,
         MigrationStage::Flushed,
-        MigrationStage::Copied,
+        MigrationStage::CopyReady,
         MigrationStage::BeforeCommit,
     ] {
         if !matches!(
@@ -606,7 +647,7 @@ fn atomic_hva(details: &mut String) -> bool {
 pub(crate) fn report() -> String {
     let _serial = TEST_LOCK.lock();
     let mut details = String::new();
-    let checks = [
+    let mut checks = alloc::vec![
         ("identity_data_permissions", identity_and_data()),
         ("unique_charge_full_limit", charge_at_limit(false)),
         ("offline_owner", charge_at_limit(true)),
@@ -615,7 +656,12 @@ pub(crate) fn report() -> String {
         ("unsupported_lru", unsupported_lru()),
         ("repeated_migration", repeated()),
         ("atomic_hva_pin", atomic_hva(&mut details)),
+        (
+            "ownership_freeze_before_copy",
+            ownership_freeze::latest_guarded_write_survives(&mut details),
+        ),
     ];
+    checks.extend(shared::checks());
     let failed = checks.iter().filter(|(_, ok)| !ok).count();
     let mut output = format!("status={}\n", if failed == 0 { "ok" } else { "fail" });
     for (key, ok) in checks {

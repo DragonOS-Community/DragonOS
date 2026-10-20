@@ -1,17 +1,38 @@
 //! Page-level VMA source identities. Splits replace an existing logical
 //! mapping's payload, while ordinary mapping births add a distinct lineage.
 //! Page state/statistics and all accounting remain in `mm::page`.
-use super::ucontext::LockedVMA;
+use super::{ucontext::LockedVMA, VirtAddr};
 use alloc::sync::Arc;
 use core::mem;
 use hashbrown::HashMap;
 
+/// One managed PFN has one virtual address in each source VMA.
+#[derive(Debug, Clone)]
+pub(crate) struct PageMapping {
+    pub(crate) vma: Arc<LockedVMA>,
+    pub(crate) address: VirtAddr,
+}
+
+impl core::ops::Deref for PageMapping {
+    type Target = LockedVMA;
+
+    fn deref(&self) -> &Self::Target {
+        &self.vma
+    }
+}
+
+impl AsRef<LockedVMA> for PageMapping {
+    fn as_ref(&self) -> &LockedVMA {
+        &self.vma
+    }
+}
+
 #[derive(Debug)]
 pub(super) enum PageVmaSet {
     Empty,
-    One(Arc<LockedVMA>),
-    Two(Arc<LockedVMA>, Arc<LockedVMA>),
-    Many(HashMap<u64, Arc<LockedVMA>>),
+    One(PageMapping),
+    Two(PageMapping, PageMapping),
+    Many(HashMap<u64, PageMapping>),
 }
 
 impl PageVmaSet {
@@ -28,6 +49,36 @@ impl PageVmaSet {
         }
     }
 
+    /// Borrow the inline or hashed payload without allocating under the Page lock.
+    pub(super) fn iter(&self) -> impl Iterator<Item = &PageMapping> {
+        let inline = match self {
+            Self::One(first) => [Some(first), None],
+            Self::Two(first, second) => [Some(first), Some(second)],
+            _ => [None, None],
+        };
+        let hashed = match self {
+            Self::Many(vmas) => Some(vmas.values()),
+            _ => None,
+        };
+        inline
+            .into_iter()
+            .flatten()
+            .chain(hashed.into_iter().flatten())
+    }
+
+    pub(super) fn address(&self, vma: &LockedVMA) -> Option<VirtAddr> {
+        match self {
+            Self::Many(vmas) => vmas
+                .get(&vma.lineage_id())
+                .filter(|entry| entry.id() == vma.id())
+                .map(|entry| entry.address),
+            _ => self
+                .iter()
+                .find(|entry| entry.id() == vma.id())
+                .map(|entry| entry.address),
+        }
+    }
+
     pub(super) fn contains(&self, vma: &LockedVMA) -> bool {
         match self {
             Self::Empty => false,
@@ -39,7 +90,8 @@ impl PageVmaSet {
         }
     }
 
-    pub(super) fn insert(&mut self, vma: Arc<LockedVMA>) -> bool {
+    pub(super) fn insert(&mut self, vma: Arc<LockedVMA>, address: VirtAddr) -> bool {
+        let vma = PageMapping { vma, address };
         match self {
             Self::Empty => {
                 *self = Self::One(vma);
@@ -47,6 +99,7 @@ impl PageVmaSet {
             }
             Self::One(existing) => {
                 if existing.as_ref() == vma.as_ref() {
+                    assert_eq!(existing.address, address, "one PFN has one VA per VMA");
                     false
                 } else {
                     assert_ne!(existing.lineage_id(), vma.lineage_id());
@@ -58,7 +111,11 @@ impl PageVmaSet {
                 }
             }
             Self::Two(first, second) => {
-                if first.as_ref() == vma.as_ref() || second.as_ref() == vma.as_ref() {
+                if let Some(existing) = [&*first, &*second]
+                    .into_iter()
+                    .find(|entry| entry.id() == vma.id())
+                {
+                    assert_eq!(existing.address, address, "one PFN has one VA per VMA");
                     return false;
                 }
                 assert_ne!(first.lineage_id(), vma.lineage_id());
@@ -83,6 +140,7 @@ impl PageVmaSet {
                         vma.id(),
                         "one PFN cannot belong to two fragments of the same VMA lineage"
                     );
+                    assert_eq!(existing.address, address, "one PFN has one VA per VMA");
                     false
                 } else {
                     vmas.insert(vma.lineage_id(), vma);
@@ -109,7 +167,7 @@ impl PageVmaSet {
         if let Some(slot) = slot {
             // The split caller pins old for the entire transaction, so this
             // cannot destroy a VMA body beneath the page lock.
-            *slot = new;
+            slot.vma = new;
             true
         } else {
             false
@@ -137,7 +195,7 @@ impl PageVmaSet {
     pub(super) fn remove_deferred(
         &mut self,
         vma: &LockedVMA,
-    ) -> (bool, Option<HashMap<u64, Arc<LockedVMA>>>) {
+    ) -> (bool, Option<HashMap<u64, PageMapping>>) {
         match self {
             Self::Empty => (false, None),
             Self::One(existing) => {

@@ -105,12 +105,26 @@ impl IndexNode for TracepointPerfEvent {
 
 pub struct TracePointPerfCallBack(BasicPerfEbpfCallBack);
 
-impl TracePointCallBackFunc for TracePointPerfCallBack {
+impl TracePointPerfCallBack {
     fn call(&self, entry: &[u8]) {
+        // rbpf passes an empty context slice as a NULL pointer to the JIT'd
+        // program; any ctx dereference then panics the kernel with a fault on
+        // a low address. Linux never gives a tracing program an empty ctx, so
+        // refuse to run instead of crashing.
+        if entry.is_empty() {
+            log::warn!("tracepoint BPF callback skipped: empty entry (NULL ctx)");
+            return;
+        }
         // rbpf requires an exclusive context. Never manufacture `&mut` from the
         // shared canonical record: each BPF program gets an isolated copy.
         let mut private_entry = entry.to_vec();
         self.0.call(&mut private_entry);
+    }
+}
+
+impl TracePointCallBackFunc for TracePointPerfCallBack {
+    fn call(&self, entry: &[u8]) {
+        TracePointPerfCallBack::call(self, entry)
     }
 }
 

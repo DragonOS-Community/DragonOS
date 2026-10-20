@@ -9,11 +9,10 @@ use crate::bpf::map::{BpfCallBackFn, BpfMap};
 use crate::include::bindings::linux_bpf::BPF_F_CURRENT_CPU;
 use crate::libs::lazy_init::Lazy;
 use crate::smp::core::smp_get_processor_id;
-use crate::syscall::user_access::check_and_clone_cstr;
+use crate::syscall::user_access::copy_from_user_protected;
 use crate::time::Instant;
 use crate::mm::VirtAddr;
 use crate::process::ProcessManager;
-use crate::syscall::user_access::copy_from_user_protected;
 use alloc::collections::BTreeMap;
 use core::ffi::c_void;
 use system_error::SystemError;
@@ -299,14 +298,24 @@ unsafe fn raw_probe_read_user_str(dst: *mut c_void, size: u32, unsafe_ptr: *cons
 }
 
 pub fn probe_read_user_str(dst: &mut [u8], src: *const u8) -> Result<usize> {
-    // A BPF program may pass any pointer; an unreadable source must surface
-    // as -EFAULT to the program, never as a kernel panic.
-    let str = check_and_clone_cstr(src, None).map_err(|_| SystemError::EFAULT)?;
-    let len = str.as_bytes().len();
-    let copy_len = len.min(dst.len() - 1); // Leave space for NULL terminator
-    dst[..copy_len].copy_from_slice(&str.as_bytes()[..copy_len]);
-    dst[copy_len] = 0; // Null-terminate the string
-    Ok(copy_len + 1) // Return length including NULL terminator
+    // A BPF program may pass any pointer. Route the copy through the
+    // exception-table protected path so every fault surfaces as -EFAULT to
+    // the program, never as a kernel panic.
+    if dst.is_empty() {
+        return Err(SystemError::EFAULT);
+    }
+    let mut scratch = alloc::vec![0u8; dst.len()];
+    let copied = unsafe { copy_from_user_protected(&mut scratch, VirtAddr::new(src as usize)) }
+        .map_err(|_| SystemError::EFAULT)?;
+    // Truncate at the first NUL, bounded by both the copy and dst.
+    let end = scratch[..copied]
+        .iter()
+        .position(|b| *b == 0)
+        .unwrap_or(copied)
+        .min(dst.len() - 1);
+    dst[..end].copy_from_slice(&scratch[..end]);
+    dst[end] = 0;
+    Ok(end + 1)
 }
 
 /// A helper function that returns the process ID of the current process

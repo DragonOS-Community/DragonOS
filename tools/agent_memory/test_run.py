@@ -492,6 +492,42 @@ class VMTests(unittest.TestCase):
 
 
 class RunCoverageTests(unittest.TestCase):
+    def test_restart_resume_inherits_case_policy(self):
+        with tempfile.TemporaryDirectory(prefix='am-restart-') as root:
+            root = Path(root)
+            artifact = root / 'artifact'
+            artifact.write_text('public fixture')
+            sdk = root / 'sdk'
+            sdk.mkdir()
+            (sdk / 'package.json').write_text('{}')
+            config = {key: str(artifact) for key in ('kernel', 'disk', 'opencode', 'node',
+                      'helper', 'qemu', 'qemu_img', 'virtiofsd')}
+            config.update(sdk=str(sdk), cases=[dict(vms=1, ram_mib=512,
+                          restart_resume=True, limit_bytes=64 * 1024**2, diagnostic=True)])
+            sampler = mock.Mock(rows=[], failure=None)
+            context = mock.MagicMock()
+            context.__enter__.return_value = sampler
+            original = mock.Mock(overlay=root / 'overlay', identity='first-vm')
+            restored = mock.Mock(overlay=root / 'overlay', identity='restored-vm')
+            for vm, name in ((original, 't0'), (restored, 'resume')):
+                vm.trial.return_value = dict(name=name, status='passed', admitted=True)
+            old_umask = RUN.os.umask(0o077)
+            try:
+                with mock.patch.object(RUN, 'validate_config'), \
+                     mock.patch.object(RUN, 'HostSampler', return_value=context), \
+                     mock.patch.object(RUN, 'GuestVM', side_effect=[original, restored]), \
+                     mock.patch.object(RUN.subprocess, 'check_output', return_value='fixture QEMU\n'), \
+                     mock.patch('builtins.print'):
+                    RUN.run(config, root / 'output')
+            finally:
+                RUN.os.umask(old_umask)
+            for vm in (original, restored):
+                self.assertEqual(vm.trial.call_args.kwargs['limit'], 64 * 1024**2)
+                self.assertTrue(vm.trial.call_args.kwargs['diagnostic'])
+            self.assertEqual(restored.trial.call_args.kwargs['mode'], 'resume')
+            self.assertEqual(restored.trial.call_args.kwargs['workspace'], '/root/agent-memory/t0')
+            self.assertEqual(len(json.loads((root / 'output/attempts.json').read_text())), 2)
+
     def test_cold_pair_preparation_and_execution_use_requested_mode(self):
         with tempfile.TemporaryDirectory(prefix='am-cold-') as root:
             root = Path(root)

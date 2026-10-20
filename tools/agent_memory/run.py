@@ -696,6 +696,8 @@ def run(config, output):
                             record(paired, index, number, case)
                         return
                     start = time.monotonic()
+                    trial_options = dict(limit=case.get('limit_bytes'),
+                                         diagnostic=case.get('diagnostic', False))
                     duration = case.get('duration_seconds', 0)
                     period = case.get('period_seconds', 50)
                     attempt = 0
@@ -704,8 +706,7 @@ def run(config, output):
                         task_mode = 'resume' if attempt and case.get('reuse_session') else case.get('mode', 'coding')
                         row = vm.trial(f't{attempt}', budget, mode=task_mode,
                                        workspace='/root/agent-memory/t0' if case.get('reuse_session') else None,
-                                       limit=case.get('limit_bytes'), diagnostic=case.get('diagnostic', False),
-                                       prepared=attempt == 0)
+                                       prepared=attempt == 0, **trial_options)
                         record(row, index, number, case)
                         attempt += 1
                         if row['status'] in ('infrastructure_failed', 'budget_exhausted', 'disk_budget_exhausted') or row.get('quarantine_vm'):
@@ -731,7 +732,8 @@ def run(config, output):
                         vm.close()
                         vm = GuestVM(config, output / f'c{index}v{number}r', sampler, case['ram_mib'], overlay)
                         vm.start()
-                        record(vm.trial('resume', budget, mode='resume', workspace='/root/agent-memory/t0'), index, number, case)
+                        record(vm.trial('resume', budget, mode='resume', workspace='/root/agent-memory/t0',
+                                        **trial_options), index, number, case)
                     write_json(output / f'c{index}v{number}-window.json',
                                {'elapsed_seconds': time.monotonic() - start,
                                 'requested_seconds': duration, 'last_status': row['status']})

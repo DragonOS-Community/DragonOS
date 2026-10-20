@@ -298,3 +298,4 @@ normal/page_migration_prerequisites
 normal/page_migration
 normal/page_retirement
 normal/shared_page_migration
+normal/page_compaction

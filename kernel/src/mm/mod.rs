@@ -23,6 +23,8 @@ use self::{
 
 pub(crate) mod allocation;
 pub mod allocator;
+#[cfg(target_arch = "x86_64")]
+pub(crate) mod compaction;
 pub mod device_linear;
 pub mod dma;
 pub mod early_ioremap;

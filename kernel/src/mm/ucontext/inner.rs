@@ -245,7 +245,11 @@ impl InnerAddressSpace {
                                     }
                                 }
                                 if let Some(page) = page_manager_guard.get(&phys_addr) {
-                                    page.write().insert_vma(new_vma.clone(), new_vma_mlocked);
+                                    page.write().insert_vma(
+                                        new_vma.clone(),
+                                        current_page,
+                                        new_vma_mlocked,
+                                    );
                                     child_present_pages += 1;
                                 }
                             }

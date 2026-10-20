@@ -16,6 +16,14 @@ struct Entry {
     next: Option<PhysAddr>,
 }
 
+/// Position of one temporarily detached page, without retaining its Arc.
+/// The caller must retain the same reclaimer mutex until restoration and
+/// must not otherwise edit this LRU while the position is outstanding.
+pub(crate) struct PageLruPosition {
+    prev: Option<PhysAddr>,
+    next: Option<PhysAddr>,
+}
+
 pub(crate) struct PreparedPageLruCapacity {
     entries: HashMap<PhysAddr, Entry>,
 }
@@ -175,6 +183,84 @@ impl PageLru {
         }
         self.detach_links(*key);
         self.entries.remove(key).map(|entry| entry.page)
+    }
+
+    /// Detach the known LRU owner for a source-reference freeze. Reserving one
+    /// growth slot before removal also covers hashbrown tombstones: removing
+    /// an entry from a full table need not make inserting a different key
+    /// allocation-free. Capacity preparation belongs before MM/Page locks.
+    pub(crate) fn take_for_migration(
+        &mut self,
+        key: &PhysAddr,
+    ) -> Option<(Arc<Page>, PageLruPosition)> {
+        if self.len() == self.capacity() {
+            return None;
+        }
+        let entry = self.entries.get(key)?;
+        let position = PageLruPosition {
+            prev: entry.prev,
+            next: entry.next,
+        };
+        self.detach_links(*key);
+        let entry = self
+            .entries
+            .remove(key)
+            .expect("migration LRU source missing");
+        Some((entry.page, position))
+    }
+
+    /// Restore either the original source or its committed replacement at the
+    /// exact previous position. No allocation, promotion or frame destruction
+    /// is allowed here, including when this follows a failed source freeze.
+    pub(crate) fn restore_migrated(
+        &mut self,
+        key: PhysAddr,
+        page: &Arc<Page>,
+        position: PageLruPosition,
+    ) {
+        assert!(!self.entries.contains_key(&key));
+        assert!(self.len() < self.capacity());
+        let PageLruPosition { prev, next } = position;
+        if let Some(prev) = prev {
+            assert_eq!(
+                self.entries
+                    .get(&prev)
+                    .expect("migration LRU prev missing")
+                    .next,
+                next
+            );
+        } else {
+            assert_eq!(self.head, next);
+        }
+        if let Some(next) = next {
+            assert_eq!(
+                self.entries
+                    .get(&next)
+                    .expect("migration LRU next missing")
+                    .prev,
+                prev
+            );
+        } else {
+            assert_eq!(self.tail, prev);
+        }
+        self.entries.insert(
+            key,
+            Entry {
+                page: page.clone(),
+                prev,
+                next,
+            },
+        );
+        if let Some(prev) = prev {
+            self.entries.get_mut(&prev).unwrap().next = Some(key);
+        } else {
+            self.head = Some(key);
+        }
+        if let Some(next) = next {
+            self.entries.get_mut(&next).unwrap().prev = Some(key);
+        } else {
+            self.tail = Some(key);
+        }
     }
 
     pub(crate) fn iter(&self) -> Iter<'_> {

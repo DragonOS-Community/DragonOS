@@ -3,8 +3,9 @@
 //! A pin excludes isolation, while an Arc only keeps the old frame alive.
 //! Isolation also retains the existing data write guard, so accesses already
 //! protected by Page::read/write need no additional pin. This is deliberately
-//! limited to one private anonymous mapping under its MM write lock: it does
-//! not revoke present PTEs, stop user CPUs, or permit moving/freeing the frame.
+//! an admission primitive: the migration coordinator must separately retain
+//! every relevant MM write lock, revoke PTEs, synchronize user CPUs and freeze
+//! all remaining owners before moving or freeing the frame.
 
 use alloc::sync::Arc;
 use core::{ops::Deref, sync::atomic::Ordering};
@@ -73,12 +74,14 @@ impl Drop for PageAccessPin {
 }
 
 /// Admission guard, not a completed migration or a userspace access barrier.
-/// The borrowed MM write guard cannot be released while isolation survives.
+/// Strict admission borrows its MM write guard. Shared relocation instead
+/// keeps the complete MM guard set in its private coordinator until commit or
+/// rollback; this guard never authorizes dropping that set early.
 #[derive(Debug)]
 pub(crate) struct PageIsolationGuard<'page, 'mm> {
     page: &'page Arc<Page>,
     data: RwSemWriteGuard<'page, InnerPage>,
-    _mm_guard: &'mm RwSemWriteGuard<'mm, InnerAddressSpace>,
+    _mm_guard: Option<&'mm RwSemWriteGuard<'mm, InnerAddressSpace>>,
     reset_gate: bool,
 }
 
@@ -107,7 +110,7 @@ impl Drop for PageIsolationGuard<'_, '_> {
 #[cfg(target_arch = "x86_64")]
 pub(super) struct IsolatedPage<'a> {
     page: Option<Arc<Page>>,
-    _mm_guard: &'a RwSemWriteGuard<'a, InnerAddressSpace>,
+    _mm_guard: Option<&'a RwSemWriteGuard<'a, InnerAddressSpace>>,
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -169,6 +172,57 @@ impl Page {
                 Err(current) => state = current,
             }
         }
+    }
+
+    /// Isolate a fixed-frame data page after the relocation coordinator has
+    /// locked and revalidated every reverse mapping. Registry/cache ownership
+    /// is frozen separately by actual unique consumption before copying.
+    /// No new MM lock may be taken while this guard is held.
+    #[cfg(target_arch = "x86_64")]
+    pub(super) fn try_isolate_shared<'page, 'mm>(
+        self: &'page Arc<Self>,
+    ) -> Result<PageIsolationGuard<'page, 'mm>, PageIsolationError> {
+        use PageIsolationError::{Busy, Unsupported};
+        use PageIsolationUnsupported as Reason;
+        let data = self.try_write().ok_or(Busy)?;
+        if !matches!(data.page_type, PageType::Normal | PageType::File(_)) {
+            return Err(Unsupported(Reason::NotNormal));
+        }
+        if self.contiguous_owner.is_some() {
+            return Err(Unsupported(Reason::ContiguousFrame));
+        }
+        if !data.individually_owns_frame {
+            return Err(Unsupported(Reason::NotIndividualFrame));
+        }
+        if data.backing_lifetime_pins != 0 {
+            return Err(Unsupported(Reason::BackingOwned));
+        }
+        if data.intrinsic_unevictable
+            || data.flags.contains(PageFlags::PG_UNEVICTABLE)
+            || data.has_mlocked_vma_refs()
+        {
+            return Err(Unsupported(Reason::Unevictable));
+        }
+        if data.flags.intersects(
+            PageFlags::PG_RESERVED
+                | PageFlags::PG_SLAB
+                | PageFlags::PG_HEAD
+                | PageFlags::PG_PRIVATE,
+        ) {
+            return Err(Unsupported(Reason::SpecialPageFlags));
+        }
+        if data.flags.contains(PageFlags::PG_WRITEBACK) {
+            return Err(Busy);
+        }
+        self.access_state
+            .compare_exchange(0, ISOLATED, Ordering::Acquire, Ordering::Relaxed)
+            .map_err(|_| Busy)?;
+        Ok(PageIsolationGuard {
+            page: self,
+            data,
+            _mm_guard: None,
+            reset_gate: true,
+        })
     }
 
     /// Try admission for a single-source, private anonymous order-0 user page.
@@ -272,7 +326,7 @@ impl Page {
         Ok(PageIsolationGuard {
             page: self,
             data,
-            _mm_guard: space,
+            _mm_guard: Some(space),
             reset_gate: true,
         })
     }

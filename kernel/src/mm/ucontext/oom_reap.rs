@@ -51,7 +51,7 @@ struct Retirement {
     page: Option<Arc<Page>>,
     owners: RetiredPageOwners,
     cache: Option<Arc<PageCache>>,
-    rmap_backing: Option<hashbrown::HashMap<u64, Arc<LockedVMA>>>,
+    rmap_backing: Option<hashbrown::HashMap<u64, crate::mm::page::PageMapping>>,
 }
 
 enum Walk {

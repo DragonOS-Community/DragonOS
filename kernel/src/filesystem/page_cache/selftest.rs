@@ -3066,7 +3066,8 @@ fn run_memcg_noio_reclaim_selftest() -> Result<bool, SystemError> {
         &creator,
     )
     .map_err(PageCache::legacy_allocation_error)?;
-    page.write().insert_vma(vma.clone(), false);
+    page.write()
+        .insert_vma(vma.clone(), VirtAddr::new(MMArch::PAGE_SIZE), false);
     ok &= reclaim()?.detached == 0 && fixture.linked(index) && page.read().map_count() == 1;
     page.write().remove_vma(&vma);
     drop(vma);

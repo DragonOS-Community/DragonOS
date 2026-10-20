@@ -297,3 +297,4 @@ normal/socket_address_output
 normal/page_migration_prerequisites
 normal/page_migration
 normal/page_retirement
+normal/shared_page_migration

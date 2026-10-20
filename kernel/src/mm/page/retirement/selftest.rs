@@ -137,7 +137,7 @@ fn attach(mm: &Arc<AddressSpace>, address: VirtAddr, page: &Arc<Page>) -> Result
     }
     .ok_or(SystemError::ENOMEM)?;
     vma.lock().set_mapped(true);
-    page.write().insert_vma(vma, false);
+    page.write().insert_vma(vma, address, false);
     mm.account_present_page_add();
     flush.flush();
     Ok(())

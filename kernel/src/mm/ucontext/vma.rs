@@ -1003,7 +1003,7 @@ impl VMA {
                     unsafe { mapper.try_map_phys(address, page.phys_address(), flags, creator) }?
                         .ok_or(SystemError::ENOMEM)?;
                 flush.flush();
-                page.write().insert_vma(vma.clone(), mlocked);
+                page.write().insert_vma(vma.clone(), address, mlocked);
                 mapped.push((address, pin));
             }
             Ok::<(), MemoryAllocationError>(())
@@ -1141,7 +1141,8 @@ impl VMA {
 
             // Add the VMA to anon_vma
             let page = page_manager_guard.get_unwrap(&paddr);
-            page.write().insert_vma(r.clone(), vma_mlocked);
+            page.write()
+                .insert_vma(r.clone(), frame.virt_address(), vma_mlocked);
         }
         // debug!("VMA::zeroed: done");
         return Ok(r);

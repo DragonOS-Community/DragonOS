@@ -519,7 +519,7 @@ impl<'a> PageFaultMessage<'a> {
             }
         }
 
-        PageFaultHandler::attach_fault_mapped_page(&page, &self.vma, mlocked);
+        PageFaultHandler::attach_fault_mapped_page(&page, &self.vma, address, mlocked);
         if current.is_some() {
             let table = self.mapper.get_table(address, 0).unwrap();
             let index = table.index_of(address).unwrap();
@@ -586,9 +586,14 @@ impl PageFaultHandler {
         )
     }
 
-    fn attach_fault_mapped_page(page: &Arc<Page>, vma: &Arc<LockedVMA>, mlocked: bool) {
+    fn attach_fault_mapped_page(
+        page: &Arc<Page>,
+        vma: &Arc<LockedVMA>,
+        address: VirtAddr,
+        mlocked: bool,
+    ) {
         let mut page_guard = page.write();
-        page_guard.insert_vma(vma.clone(), mlocked);
+        page_guard.insert_vma(vma.clone(), address, mlocked);
     }
 
     fn detach_fault_mapped_page(page: &Arc<Page>, vma: &Arc<LockedVMA>) {
@@ -835,7 +840,7 @@ impl PageFaultHandler {
                 klog_types::LogSource::Buddy,
             );
             Self::account_new_present_mapping(pfm.mm());
-            Self::attach_fault_mapped_page(&page, &vma, mlocked);
+            Self::attach_fault_mapped_page(&page, &vma, address, mlocked);
             VmFaultReason::VM_FAULT_COMPLETED
         } else {
             VmFaultReason::VM_FAULT_OOM
@@ -1225,6 +1230,7 @@ impl PageFaultHandler {
                 Self::attach_fault_mapped_page(
                     &new_page,
                     &vma,
+                    address,
                     vma.lock().vm_flags().contains(VmFlags::VM_LOCKED),
                 );
                 Self::detach_fault_mapped_page(&old_page, &vma);
@@ -1246,6 +1252,7 @@ impl PageFaultHandler {
             Self::attach_fault_mapped_page(
                 &new_page,
                 &vma,
+                address,
                 vma.lock().vm_flags().contains(VmFlags::VM_LOCKED),
             );
             Self::detach_fault_mapped_page(&old_page, &vma);
@@ -1399,7 +1406,7 @@ impl PageFaultHandler {
                     {
                         flags = flags.set_write(false);
                     }
-                    Self::attach_fault_mapped_page(&page, &vma, mlocked);
+                    Self::attach_fault_mapped_page(&page, &vma, address, mlocked);
                     match mapper.try_map_phys(address, phys, flags, Some(&pfm.creator_object)) {
                         Ok(Some(flush)) => {
                             flush.flush();
@@ -1683,7 +1690,7 @@ impl PageFaultHandler {
         }
         drop(vma_guard);
 
-        Self::attach_fault_mapped_page(&page_to_map, &vma, mlocked);
+        Self::attach_fault_mapped_page(&page_to_map, &vma, address, mlocked);
         let mapped = mapper.try_map_phys(address, page_phys, map_flags, Some(&pfm.creator_object));
         let result = if let Ok(Some(flush)) = mapped {
             flush.flush();
@@ -1720,7 +1727,7 @@ impl PageFaultHandler {
         if let Some((page, flush)) = mapped {
             flush.flush();
             Self::account_new_present_mapping(pfm.mm());
-            Self::attach_fault_mapped_page(&page, &vma, mlocked);
+            Self::attach_fault_mapped_page(&page, &vma, address, mlocked);
             VmFaultReason::VM_FAULT_COMPLETED
         } else {
             VmFaultReason::VM_FAULT_OOM
@@ -1761,7 +1768,7 @@ impl PageFaultHandler {
             if let Some((page, flush)) = mapped {
                 flush.flush();
                 Self::account_new_present_mapping(&mm);
-                Self::attach_fault_mapped_page(&page, &vma, mlocked);
+                Self::attach_fault_mapped_page(&page, &vma, addr, mlocked);
             } else {
                 return VmFaultReason::VM_FAULT_OOM;
             }

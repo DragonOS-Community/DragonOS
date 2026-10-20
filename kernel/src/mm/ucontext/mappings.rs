@@ -76,6 +76,16 @@ impl UserMappings {
         }
     }
 
+    /// Check only the address index identity, without recursively acquiring a
+    /// VMA lock. The caller checks the region under its existing VMA guard;
+    /// the containing MM guard keeps this index stable throughout the check.
+    pub(crate) fn indexes_vma(&self, address: VirtAddr, expected: &Arc<LockedVMA>) -> bool {
+        self.vmas_by_start
+            .range(..=address)
+            .next_back()
+            .is_some_and(|(_, actual)| Arc::ptr_eq(actual, expected))
+    }
+
     /// Find the VMA nearest to the given virtual address.
     /// ## Parameters
     ///

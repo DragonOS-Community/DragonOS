@@ -1111,7 +1111,7 @@ where
         // Complete all bookkeeping which may allocate before publishing the
         // hit metadata. mm.write keeps the original PTE stable throughout.
         let vm_locked = vma.lock().vm_flags().contains(VmFlags::VM_LOCKED);
-        new_guard.insert_vma(vma.clone(), vm_locked);
+        new_guard.insert_vma(vma.clone(), VirtAddr::new(page_base_addr), vm_locked);
         mm.uprobe_page_state
             .lock_irqsave()
             .insert(page_base_addr, UprobePageState { refcount: 1 });

@@ -299,7 +299,9 @@ unsafe fn raw_probe_read_user_str(dst: *mut c_void, size: u32, unsafe_ptr: *cons
 }
 
 pub fn probe_read_user_str(dst: &mut [u8], src: *const u8) -> Result<usize> {
-    let str = check_and_clone_cstr(src, None).unwrap();
+    // A BPF program may pass any pointer; an unreadable source must surface
+    // as -EFAULT to the program, never as a kernel panic.
+    let str = check_and_clone_cstr(src, None).map_err(|_| SystemError::EFAULT)?;
     let len = str.as_bytes().len();
     let copy_len = len.min(dst.len() - 1); // Leave space for NULL terminator
     dst[..copy_len].copy_from_slice(&str.as_bytes()[..copy_len]);
@@ -338,13 +340,18 @@ unsafe fn raw_get_current_comm(buf: *mut c_void, size: u64) -> i64 {
     let dst = core::slice::from_raw_parts_mut(buf as *mut u8, size as usize);
     let basic = pcb.basic();
     let name = basic.name().as_bytes();
-    let copy_len = name.len().min(dst.len() - 1);
-    dst[..copy_len].copy_from_slice(&name[..copy_len]);
+    // Linux comm is the basename of argv[0], truncated to TASK_COMM_LEN-1;
+    // DragonOS stores the full argv[0] here.
+    let basename = match name.iter().rposition(|b| *b == b'/') {
+        Some(pos) => &name[pos + 1..],
+        None => name,
+    };
+    let copy_len = basename.len().min((size as usize - 1).min(15));
+    dst[..copy_len].copy_from_slice(&basename[..copy_len]);
     dst[copy_len] = 0;
     0
 }
 
-/// Attempt to safely read size bytes from user space address unsafe_ptr and
 /// store the bytes in dst. Unlike `bpf_probe_read`, faults on the user address
 /// are caught (exception-table protected copy) and reported as -EFAULT instead
 /// of crashing the kernel.

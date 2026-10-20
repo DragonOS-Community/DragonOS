@@ -1,0 +1,24 @@
+[package]
+name = "dadk-user"
+version = "0.6.1"
+edition = "2021"
+description = "DragonOS Application Development Kit - user prog build"
+license = "GPL-2.0-only"
+
+[dependencies]
+anyhow = { version = "1.0.100", features = ["std", "backtrace"] }
+chrono = { version = "=0.4.35", features = ["serde"] }
+clap = { version = "=4.5.20", features = ["derive"] }
+dadk-config = { version = "0.6.1", path = "../dadk-config" }
+derive_builder = "0.20.0"
+lazy_static = "1.4.0"
+log = "0.4.17"
+regex = "1.9.1"
+reqwest = { version = "0.12", features = ["blocking", "json"] }
+serde = { version = "1.0.160", features = ["serde_derive"] }
+serde_json = "1.0.96"
+toml = "0.8.12"
+zip = "2.2"
+
+[dev-dependencies]
+test_base = { path = "../crates/test_base" }

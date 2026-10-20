@@ -1,0 +1,21 @@
+name = "app_all_target_arch"
+version = "0.2.0"
+description = "An app targets to all arch"
+build-once = false
+install-once = false
+target-arch = ["riscv64", "x86_64", "aarch64", "loongarch64"]
+
+[task-source]
+type = "build-from-source"
+source = "git"
+source-path = "1"
+branch = "1"
+
+[build]
+build-command = "1"
+
+[install]
+in-dragonos-path = "/"
+
+[clean]
+clean-command = "1"

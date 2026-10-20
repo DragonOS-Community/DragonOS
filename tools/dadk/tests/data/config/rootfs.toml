@@ -1,0 +1,14 @@
+[metadata]
+# Filesystem type (options: `fat32`)
+fs_type = "fat32"
+# Size of the rootfs disk image (eg, `1G`, `1024M`)
+size = "16M"
+
+[partition]
+# Partition type (options: "none", "mbr", "gpt")
+#
+# If "none" is specified, no partition table will be created, 
+# and the entire disk will be treated as a single partition.
+#
+# Note that the "none" option is incompatible with GRUB boot.
+type = "mbr"

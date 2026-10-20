@@ -1,0 +1,29 @@
+{
+  "name": "app_normal_with_env_fail",
+  "version": "0.1.0",
+  "description": "A normal app with env which should failed",
+  "task_type": {
+    "BuildFromSource": {
+      "Local": {
+        "path": "tests/data/apps/app_normal_with_env_fail"
+      }
+    }
+  },
+  "depends": [],
+  "build": {
+    "build_command": "bash build.sh"
+  },
+  "install": {
+    "in_dragonos_path": "/"
+  },
+  "clean": {
+    "clean_command": null
+  },
+  "envs": [
+    {
+      "key": "CC",
+      "value": "abc-gcc1"
+    }
+  ],
+  "build_once": false
+}

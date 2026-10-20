@@ -1,0 +1,12 @@
+{
+  "devDependencies": {
+    "@vuepress/bundler-vite": "^2.0.0-rc.18",
+    "@vuepress/theme-default": "^2.0.0-rc.60",
+    "sass-embedded": "^1.80.7",
+    "vuepress": "^2.0.0-rc.18"
+  },
+  "scripts": {
+    "docs:dev": "NODE_ENV=development vuepress dev",
+    "docs:build": "NODE_ENV=production vuepress build"
+  }
+}

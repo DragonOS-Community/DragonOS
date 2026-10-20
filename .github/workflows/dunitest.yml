@@ -42,6 +42,7 @@ jobs:
           normal/vmalloc_selftest
           normal/page_migration_prerequisites
           normal/page_migration
+          normal/page_compaction
           normal/shared_page_migration
           normal/page_retirement
           normal/kernel_buffer_selftest

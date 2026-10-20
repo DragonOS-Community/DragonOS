@@ -52,6 +52,8 @@ use super::{
 };
 
 pub(crate) mod access;
+#[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
+pub(crate) mod compaction_selftest;
 pub(crate) mod retirement;
 pub(crate) use retirement::retire_unmapped_page;
 #[cfg(target_arch = "x86_64")]

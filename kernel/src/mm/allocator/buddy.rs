@@ -35,6 +35,8 @@ const DMA32_LIMIT: usize = u32::MAX as usize;
 const DMA32_FALLBACK_RESERVE_PAGES: usize = (16 * 1024 * 1024) >> MIN_ORDER;
 const DMA32_ALLOCATION_METADATA_HEADROOM: usize = MAX_ORDER - MIN_ORDER;
 
+pub(crate) mod compaction;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BuddyZone {
     Dma32,
@@ -148,6 +150,8 @@ pub struct BuddyAllocator<A> {
     dma32_free_pages: usize,
     normal_free_pages: usize,
     diagnostics: BuddyDiagnostics,
+    isolation: Option<compaction::IsolationState>,
+    next_isolation_id: u64,
     /// Whether this allocator has ever managed memory above 4 GiB.  Most
     /// current systems are DMA32-only; avoid probing every empty Normal order
     /// on their hot allocation path.
@@ -197,6 +201,8 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
             dma32_free_pages: 0,
             normal_free_pages: 0,
             diagnostics: BuddyDiagnostics::default(),
+            isolation: None,
+            next_isolation_id: 1,
             has_normal_memory: false,
             total: PageFrameCount::new(0),
             phantom: PhantomData,
@@ -773,6 +779,9 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
     /// - `base` - 块的起始地址
     /// - `order` - 块的阶数
     unsafe fn buddy_free(&mut self, mut base: PhysAddr, order: u8) {
+        if self.quarantine_free(base, order) {
+            return;
+        }
         // debug!("buddy_free: base = {:?}, order = {}", base, order);
         let mut order = order as usize;
 
@@ -971,6 +980,8 @@ pub(crate) fn deterministic_buddy_selftest() -> (bool, bool, bool, bool, bool) {
             dma32_free_pages: 0,
             normal_free_pages: 0,
             diagnostics: BuddyDiagnostics::default(),
+            isolation: None,
+            next_isolation_id: 1,
             has_normal_memory: false,
             total: PageFrameCount::new(ARENA_PAGES),
             phantom: PhantomData,
@@ -1331,6 +1342,8 @@ pub(crate) fn with_fragmented_buffer_arena(
         dma32_free_pages: 0,
         normal_free_pages: 0,
         diagnostics: BuddyDiagnostics::default(),
+        isolation: None,
+        next_isolation_id: 1,
         has_normal_memory: false,
         total: PageFrameCount::new(PAGES),
         phantom: PhantomData,

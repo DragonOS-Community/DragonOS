@@ -792,6 +792,18 @@ pub fn test_buddy() {
 pub struct LockedFrameAllocator;
 
 impl LockedFrameAllocator {
+    /// Run a short allocator operation; never retain this guard across migration.
+    pub(crate) fn with_buddy<T>(
+        operation: impl FnOnce(&mut BuddyAllocator<MMArch>) -> T,
+    ) -> Option<T> {
+        INNER_ALLOCATOR.lock_irqsave().as_mut().map(operation)
+    }
+
+    /// Relocation must not start reclaim or retry through the OOM victim path.
+    pub(crate) unsafe fn allocate_one_no_reclaim() -> Option<PhysAddr> {
+        Self::allocate_inner(PageFrameCount::ONE).map(|(physical, _)| physical)
+    }
+
     pub(crate) fn diagnostic_snapshot() -> Option<crate::mm::allocator::buddy::BuddySnapshot> {
         INNER_ALLOCATOR
             .lock_irqsave()

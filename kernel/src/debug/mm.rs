@@ -27,6 +27,8 @@ enum MmReportCallback {
     #[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
     PageMigrationSelftest,
     #[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
+    PageCompactionSelftest,
+    #[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
     PageMigrationCommand,
     #[cfg(feature = "mm_selftest")]
     VmallocSelftest,
@@ -63,6 +65,8 @@ impl KernFSCallback for MmReportCallback {
             Self::TlbTeardownSelftest => crate::mm::tlb::teardown_selftest_report(),
             #[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
             Self::PageMigrationSelftest => crate::mm::page::migration::selftest::report(),
+            #[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
+            Self::PageCompactionSelftest => crate::mm::page::compaction_selftest::report(),
             #[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
             Self::PageMigrationCommand => String::new(),
             #[cfg(feature = "mm_selftest")]
@@ -213,6 +217,13 @@ pub fn init_debugfs_mm() -> Result<(), SystemError> {
     )?;
     #[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
     {
+        mm.add_file(
+            "page_compaction_selftest".to_string(),
+            InodeMode::S_IRUSR,
+            Some(4096),
+            None,
+            Some(&MmReportCallback::PageCompactionSelftest),
+        )?;
         mm.add_file(
             "page_migration_selftest".to_string(),
             InodeMode::S_IRUSR,

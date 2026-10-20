@@ -13,10 +13,7 @@ use crate::{
     exception::{in_interrupt, InterruptArch},
     filesystem::page_cache::PageCache,
     libs::mutex::Mutex,
-    mm::{
-        allocator::page_frame::FrameAllocator, ucontext::AddressSpace, MemoryManagementArch,
-        PhysAddr, VirtAddr, VirtRegion, VmFlags,
-    },
+    mm::{ucontext::AddressSpace, MemoryManagementArch, PhysAddr, VirtAddr, VirtRegion, VmFlags},
     process::ProcessManager,
 };
 use alloc::{sync::Arc, vec::Vec};
@@ -135,6 +132,36 @@ pub(crate) fn migrate_cached_page(
         source,
         None,
         Scope::Data,
+        usize::MAX,
+        #[cfg(feature = "mm_selftest")]
+        None,
+    )
+}
+
+/// Relocate one registered physical candidate without retaining a second
+/// observer Arc. The caller owns target-range isolation; this transaction
+/// owns its one destination frame and all mapping/ownership handoff.
+/// Mapping limits and contention refuse bounded work before PTE changes.
+pub(crate) fn migrate_frame(
+    physical: PhysAddr,
+    max_mappings: usize,
+) -> Result<MigrationResult, MigrationError> {
+    use MigrationError::{Busy, InvalidMapping};
+    if !context_allowed() {
+        return Err(Busy);
+    }
+    if !physical.check_aligned(MMArch::PAGE_SIZE) {
+        return Err(InvalidMapping);
+    }
+    let source = {
+        let manager = try_page_manager_lock().ok_or(Busy)?;
+        manager.get_registered(&physical).ok_or(InvalidMapping)?
+    };
+    relocate(
+        source,
+        None,
+        Scope::Data,
+        max_mappings,
         #[cfg(feature = "mm_selftest")]
         None,
     )
@@ -189,6 +216,7 @@ fn migrate_address(
         source,
         Some((mm, address)),
         scope,
+        usize::MAX,
         #[cfg(feature = "mm_selftest")]
         control,
     )
@@ -308,18 +336,22 @@ fn relocate(
     source: Arc<Page>,
     origin: Option<(&Arc<AddressSpace>, VirtAddr)>,
     scope: Scope,
+    max_mappings: usize,
     #[cfg(feature = "mm_selftest")] control: Option<&selftest::Control>,
 ) -> Result<MigrationResult, MigrationError> {
     use MigrationError::{Busy, InvalidMapping, NoMemory, Unsupported};
-    let _budget = MIGRATION.lock();
+    let _budget = MIGRATION.try_lock().map_err(|_| Busy)?;
     let old_phys = source.phys_address();
     let source_address = unsafe { MMArch::phys_2_virt(old_phys) }.ok_or(InvalidMapping)?;
     let mut mappings: Vec<PageMapping> = Vec::new();
     let count = source.try_read().ok_or(Busy)?.map_count();
+    if count > max_mappings {
+        return Err(Busy);
+    }
     mappings.try_reserve(count).map_err(|_| NoMemory)?;
     let (cache, was_lru) = {
         let data = source.try_read().ok_or(Busy)?;
-        if data.map_count() > mappings.capacity() {
+        if data.map_count() > max_mappings || data.map_count() > mappings.capacity() {
             return Err(Busy);
         }
         mappings.extend(data.mappings().cloned());
@@ -372,7 +404,7 @@ fn relocate(
     let mut prepared_pt = Vec::new();
     prepared_pt.try_reserve(mms.len()).map_err(|_| NoMemory)?;
     prepare_registries(was_lru)?;
-    let frame = unsafe { LockedFrameAllocator.allocate_one() }.ok_or(NoMemory)?;
+    let frame = unsafe { LockedFrameAllocator::allocate_one_no_reclaim() }.ok_or(NoMemory)?;
     let mut raw = RawFrameExtent {
         next: frame,
         remaining: 1,

@@ -65,7 +65,7 @@ fn memory_nodes() -> IndexSet {
 
 pub(crate) fn enabled(node: &Arc<CgroupNode>) -> bool {
     node.parent()
-        .is_none_or(|p| p.subtree_control().iter().any(|c| c == "cpuset"))
+        .is_none_or(|p| p.subtree_controller_enabled("cpuset"))
 }
 
 fn effective(node: &Arc<CgroupNode>) -> (IndexSet, IndexSet) {
@@ -99,10 +99,11 @@ pub(crate) fn allowed_locked(node: &Arc<CgroupNode>) -> CpuMask {
 }
 
 pub(crate) fn generation(node: &Arc<CgroupNode>) -> u64 {
-    node.cpuset_state().generation
+    node.cpuset_generation()
 }
 
-fn check_file(node: &Arc<CgroupNode>, gen: u64) -> Result<(), SystemError> {
+/// Caller serializes controller configuration with the cgroup update lock.
+pub(crate) fn check_file(node: &Arc<CgroupNode>, gen: u64) -> Result<(), SystemError> {
     if !cgroup_root().is_online(node) || !enabled(node) || generation(node) != gen {
         return Err(SystemError::ENODEV);
     }

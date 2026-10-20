@@ -1565,6 +1565,179 @@ TEST_F(CgroupMemory, ReclaimInsufficientAnonymousReturnsEagain) {
   EXPECT_GE(Stat(leaf, "anon"), 8 * MiB);
 }
 
+// MM149: mutate the live source between reads, without allocator pressure or
+// timing races. Each open description must still expose one coherent record.
+TEST_F(CgroupMemory, TextSnapshotPartialReadKeepsScalarRecord) {
+  const std::string leaf = Leaf();
+  ASSERT_EQ(0, WriteBounded(leaf + "/memory.max", "4096"));
+  int fd = OwnFd(open((leaf + "/memory.max").c_str(), O_RDONLY | O_CLOEXEC));
+  ASSERT_GE(fd, 0);
+  char data[64];
+  ASSERT_EQ(1, read(fd, data, 1));
+  ASSERT_EQ('4', data[0]);
+  ASSERT_EQ(0, WriteBounded(leaf + "/memory.max", "1048576"));
+  ssize_t n = read(fd, data + 1, sizeof(data) - 1);
+  ASSERT_GE(n, 0);
+  EXPECT_EQ("4096\n", std::string(data, size_t(n) + 1));
+  EXPECT_EQ(0, read(fd, data, sizeof(data)));
+}
+
+TEST_F(CgroupMemory, TextSnapshotEofDoesNotAppendNewTail) {
+  const std::string leaf = Leaf();
+  ASSERT_EQ(0, WriteBounded(leaf + "/memory.max", "4096"));
+  int fd = OwnFd(open((leaf + "/memory.max").c_str(), O_RDONLY | O_CLOEXEC));
+  ASSERT_GE(fd, 0);
+  char data[64];
+  ASSERT_EQ(5, read(fd, data, sizeof(data)));
+  ASSERT_EQ("4096\n", std::string(data, 5));
+  ASSERT_EQ(0, WriteBounded(leaf + "/memory.max", "1048576"));
+  EXPECT_EQ(0, read(fd, data, sizeof(data)));
+  ASSERT_EQ(0, lseek(fd, 0, SEEK_SET));
+  ASSERT_EQ(8, read(fd, data, sizeof(data)));
+  EXPECT_EQ("1048576\n", std::string(data, 8));
+}
+
+TEST_F(CgroupMemory, TextSnapshotDupSharesRecordAndPosition) {
+  const std::string leaf = Leaf();
+  ASSERT_EQ(0, WriteBounded(leaf + "/memory.max", "4096"));
+  int first = OwnFd(open((leaf + "/memory.max").c_str(), O_RDONLY | O_CLOEXEC));
+  ASSERT_GE(first, 0);
+  int duplicate = OwnFd(dup(first));
+  ASSERT_GE(duplicate, 0);
+  char data[64];
+  ASSERT_EQ(1, read(first, data, 1));
+  ASSERT_EQ(0, WriteBounded(leaf + "/memory.max", "1048576"));
+  EXPECT_EQ("1048576\n", Read(leaf + "/memory.max"));
+  ASSERT_EQ(4, read(duplicate, data, sizeof(data)));
+  EXPECT_EQ("096\n", std::string(data, 4));
+  EXPECT_EQ(5, lseek(first, 0, SEEK_CUR));
+  ASSERT_EQ(0, lseek(duplicate, 0, SEEK_SET));
+  ASSERT_EQ(8, read(first, data, sizeof(data)));
+  EXPECT_EQ("1048576\n", std::string(data, 8));
+  EXPECT_EQ(8, lseek(duplicate, 0, SEEK_CUR));
+}
+
+TEST_F(CgroupMemory, TextSnapshotPreadAndZeroLengthRespectSharedCursor) {
+  const std::string leaf = Leaf();
+  ASSERT_EQ(0, WriteBounded(leaf + "/memory.max", "4096"));
+  int fd = OwnFd(open((leaf + "/memory.max").c_str(), O_RDONLY | O_CLOEXEC));
+  ASSERT_GE(fd, 0);
+  char data[64];
+  ASSERT_EQ(1, read(fd, data, 1));
+  ASSERT_EQ(0, WriteBounded(leaf + "/memory.max", "1048576"));
+  EXPECT_EQ(0, read(fd, nullptr, 0));
+  EXPECT_EQ(0, pread(fd, nullptr, 0, 0));
+  EXPECT_EQ(1, lseek(fd, 0, SEEK_CUR));
+  ASSERT_EQ(4, read(fd, data, sizeof(data)));
+  EXPECT_EQ("096\n", std::string(data, 4));
+  ASSERT_EQ(8, pread(fd, data, sizeof(data), 0));
+  EXPECT_EQ("1048576\n", std::string(data, 8));
+  EXPECT_EQ(5, lseek(fd, 0, SEEK_CUR));
+  // pread changed seq state, but not f_pos: normal read regenerates at byte 5.
+  ASSERT_EQ(3, read(fd, data, sizeof(data)));
+  EXPECT_EQ("76\n", std::string(data, 3));
+  ASSERT_EQ(0, WriteBounded(leaf + "/memory.max", "4096"));
+  ASSERT_EQ(4, pread(fd, data, sizeof(data), 1));
+  EXPECT_EQ("096\n", std::string(data, 4));
+  EXPECT_EQ(8, lseek(fd, 0, SEEK_CUR));
+}
+
+TEST_F(CgroupMemory, TextSnapshotSameDescriptionWriteDoesNotReplaceReadBuffer) {
+  const std::string leaf = Leaf();
+  ASSERT_EQ(0, WriteBounded(leaf + "/memory.max", "4096"));
+  int fd = OwnFd(open((leaf + "/memory.max").c_str(), O_RDWR | O_CLOEXEC));
+  ASSERT_GE(fd, 0);
+  char data[64];
+  ASSERT_EQ(1, read(fd, data, 1));
+  const std::string longer = "1048576";
+  ASSERT_EQ(ssize_t(longer.size()), pwrite(fd, longer.data(), longer.size(), 0));
+  EXPECT_EQ(1, lseek(fd, 0, SEEK_CUR));
+  ASSERT_EQ(4, read(fd, data, sizeof(data)));
+  EXPECT_EQ("096\n", std::string(data, 4));
+  ASSERT_EQ(0, lseek(fd, 0, SEEK_SET));
+  ASSERT_EQ(8, read(fd, data, sizeof(data)));
+  EXPECT_EQ("1048576\n", std::string(data, 8));
+}
+
+TEST_F(CgroupMemory, TextSnapshotMemoryStatFreezesBeforeRealPageCharge) {
+  const std::string leaf = Leaf();
+  auto* worker = Worker(leaf);
+  ASSERT_NE(nullptr, worker);
+  ASSERT_EQ(0, worker->Ask('M', 4 * MiB).error);
+  int fd = OwnFd(open((leaf + "/memory.stat").c_str(), O_RDONLY | O_CLOEXEC));
+  ASSERT_GE(fd, 0);
+  char data[4096];
+  ASSERT_EQ(1, read(fd, data, 1));
+  std::string frozen(data, 1);
+  ASSERT_EQ(0, worker->Ask('T').error);
+  for (;;) {
+    ssize_t n = read(fd, data, sizeof(data));
+    if (n < 0 && errno == EINTR) continue;
+    ASSERT_GE(n, 0);
+    if (!n) break;
+    frozen.append(data, size_t(n));
+    ASSERT_LT(frozen.size(), 65536u);
+  }
+  uint64_t before = Field(frozen, "anon");
+  ASSERT_NE(UINT64_MAX, before) << frozen;
+  EXPECT_GE(Stat(leaf, "anon"), before + 4 * MiB);
+}
+
+TEST_F(CgroupMemory, TextSnapshotRemovedDescriptionCannotReadRecreatedEpoch) {
+  const std::string leaf = Leaf("snapshot-epoch");
+  ASSERT_EQ(0, WriteBounded(leaf + "/memory.max", "4096"));
+  int old = OwnFd(open((leaf + "/memory.max").c_str(), O_RDONLY | O_CLOEXEC));
+  ASSERT_GE(old, 0);
+  char data[64];
+  ASSERT_EQ(1, read(old, data, 1));
+  ASSERT_EQ('4', data[0]);
+
+  ASSERT_EQ(0, rmdir(leaf.c_str()));
+  ASSERT_EQ(leaf, Make(group_, "snapshot-epoch"));
+  ASSERT_EQ(0, WriteBounded(leaf + "/memory.max", "1048576"));
+  int current = OwnFd(open((leaf + "/memory.max").c_str(), O_RDONLY | O_CLOEXEC));
+  ASSERT_GE(current, 0);
+  // The old record's cached bytes do not require a new kernfs source entry.
+  ASSERT_EQ(4, read(old, data, sizeof(data)));
+  EXPECT_EQ("096\n", std::string(data, 4));
+  // EOF and rewind must validate the original node, not follow its pathname.
+  errno = 0;
+  EXPECT_EQ(-1, read(old, data, sizeof(data)));
+  EXPECT_EQ(ENODEV, errno);
+  ASSERT_EQ(0, lseek(old, 0, SEEK_SET));
+  errno = 0;
+  EXPECT_EQ(-1, read(old, data, sizeof(data)));
+  EXPECT_EQ(ENODEV, errno);
+  ASSERT_EQ(8, read(current, data, sizeof(data)));
+  EXPECT_EQ("1048576\n", std::string(data, 8));
+}
+
+TEST_F(CgroupMemory, TextSnapshotEventTailAndZeroReadDoNotAcknowledgeUpdate) {
+  const std::string leaf = Leaf();
+  int fd = OwnFd(open((leaf + "/cgroup.events").c_str(), O_RDONLY | O_CLOEXEC));
+  ASSERT_GE(fd, 0);
+  char data[128];
+  ASSERT_EQ(1, read(fd, data, 1));
+  std::string frozen(data, 1);
+  auto* worker = Worker(leaf);
+  ASSERT_NE(nullptr, worker);
+  ASSERT_TRUE(worker->Alive());
+  pollfd changed{fd, POLLPRI, 0};
+  ASSERT_EQ(1, poll(&changed, 1, 0));
+  EXPECT_EQ(0, read(fd, nullptr, 0));
+  EXPECT_EQ(0, pread(fd, nullptr, 0, 0));
+  EXPECT_EQ(1, poll(&changed, 1, 0));
+  ssize_t n = read(fd, data, sizeof(data));
+  ASSERT_GE(n, 0);
+  frozen.append(data, size_t(n));
+  EXPECT_EQ(0u, Field(frozen, "populated"));
+  EXPECT_EQ(0, read(fd, data, sizeof(data)));
+  EXPECT_EQ(1, poll(&changed, 1, 0));
+  ASSERT_EQ(0, lseek(fd, 0, SEEK_SET));
+  ASSERT_GT(read(fd, data, sizeof(data)), 0);
+  EXPECT_EQ(0, poll(&changed, 1, 0));
+}
+
 TEST_F(CgroupMemory, EventsPollUsesPerOpenAcknowledgement) {
   std::string leaf = Leaf();
   int first = OwnFd(open((leaf + "/memory.events").c_str(), O_RDONLY | O_CLOEXEC));

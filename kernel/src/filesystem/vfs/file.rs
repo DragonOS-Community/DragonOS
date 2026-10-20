@@ -3325,7 +3325,9 @@ impl File {
         // and other unsupported seek modes.
         {
             let pdata = self.private_data.lock();
-            if let FilePrivateData::Procfs(_) = &*pdata {
+            if matches!(&*pdata, FilePrivateData::Procfs(_))
+                || (file_type != FileType::Dir && matches!(&*pdata, FilePrivateData::Cgroup(_)))
+            {
                 match origin {
                     SeekFrom::SeekEnd(_)
                     | SeekFrom::SeekData(_)

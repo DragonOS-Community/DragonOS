@@ -79,6 +79,22 @@ jobs:
       - name: Run sysconfig payload generator unit tests
         run: python3 tools/test_build_sysconfig_payload.py
 
+  agent-memory-tools-test:
+    name: Agent memory acceptance tools
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Test allocation audit and VM evidence handling
+        run: python3 -m unittest discover -s tools/agent_memory -p 'test_*.py'
+      - name: Check reviewed allocation contracts
+        run: python3 tools/agent_memory/audit.py --output allocation-audit.json
+      - name: Test guest sampler parsing and cleanup
+        run: python3 user/apps/agent_memory/test_helper.py
+      - name: Test independent OpenCode result validation
+        run: |
+          bash -n tools/agent_memory/workloads/opencode.sh
+          node --test tools/agent_memory/workloads/test_check.cjs
+
   format-check:
     name: Format check ${{ matrix.arch }}
     runs-on: ubuntu-latest

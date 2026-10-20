@@ -827,6 +827,27 @@ TEST_F(CgroupCpuTest, CpuPlacementAndGroupMigrationCanRace) {
   worker.Stop();
 }
 
+// The same single-record contract applies outside the memory controller.
+TEST_F(CgroupCpuTest, TextSnapshotCpuWeightKeepsRecordUntilRewind) {
+  ASSERT_EQ(0, Write(node_ + "/cpu.weight", "100"));
+  int fd = open((node_ + "/cpu.weight").c_str(), O_RDONLY | O_CLOEXEC);
+  ASSERT_GE(fd, 0);
+  char data[64] = {};
+  // Nonfatal assertions below guarantee this descriptor is always closed.
+  EXPECT_EQ(1, read(fd, data, 1));
+  EXPECT_EQ('1', data[0]);
+  EXPECT_EQ(0, Write(node_ + "/cpu.weight", "9999"));
+  ssize_t n = read(fd, data + 1, sizeof(data) - 1);
+  EXPECT_EQ(3, n);
+  if (n >= 0) { EXPECT_EQ("100\n", std::string(data, size_t(n) + 1)); }
+  EXPECT_EQ(0, read(fd, data, sizeof(data)));
+  EXPECT_EQ(0, lseek(fd, 0, SEEK_SET));
+  n = read(fd, data, sizeof(data));
+  EXPECT_EQ(5, n);
+  if (n >= 0) { EXPECT_EQ("9999\n", std::string(data, size_t(n))); }
+  close(fd);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {

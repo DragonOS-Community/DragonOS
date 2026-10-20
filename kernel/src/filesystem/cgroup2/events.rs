@@ -26,7 +26,7 @@ pub(crate) struct CgroupEventOpen {
     registration: AtomicUsize,
     memory_registered: AtomicBool,
     epitems: EPollItemList,
-    snapshot: Mutex<Option<alloc::vec::Vec<u8>>>,
+    snapshot: Mutex<super::read_snapshot::TextSnapshot>,
 }
 
 impl CgroupEventOpen {
@@ -40,7 +40,7 @@ impl CgroupEventOpen {
             registration: AtomicUsize::new(0),
             memory_registered: AtomicBool::new(false),
             epitems: EPollItemList::default(),
-            snapshot: Mutex::new(None),
+            snapshot: Mutex::new(super::read_snapshot::TextSnapshot::default()),
         })
         .map_err(|_| SystemError::ENOMEM)?;
         WATCHERS.register(&state, |id| state.registration.store(id, Ordering::Release))?;
@@ -63,45 +63,78 @@ impl CgroupEventOpen {
         buf: &mut [u8],
     ) -> Result<usize, SystemError> {
         let mut stored = self.snapshot.lock();
-        // Preserve one generated record across partial reads and EOF. A new
-        // read from offset zero (including after lseek) regenerates it, like
-        // kernfs's single seq-file record; EOF must not consume a newer event.
-        let snapshot = {
-            let _update = crate::cgroup::lock();
-            super::files::check_live_file(cgroup, ty, generation)?;
-            match &self.source {
-                EventSource::Memory { account, local } => {
-                    let current = cgroup
-                        .local_memory_generation()
-                        .ok_or(SystemError::ENODEV)?;
-                    if !Arc::ptr_eq(&current.account, account) {
-                        return Err(SystemError::ENODEV);
-                    }
-                    if offset == 0 || stored.is_none() {
-                        (Some(account.snapshot()), None, *local)
-                    } else {
-                        (None, None, *local)
-                    }
-                }
-                EventSource::Core(node) => {
-                    if !Arc::ptr_eq(cgroup, node) {
-                        return Err(SystemError::ENODEV);
-                    }
-                    if offset == 0 || stored.is_none() {
-                        let (populated, frozen, sequence) =
-                            crate::cgroup::freezer::snapshot_events(node);
-                        (None, Some((populated, frozen, sequence)), false)
-                    } else {
-                        (None, None, false)
-                    }
+        let mut rendered_sequence = None;
+        let count = stored.read(
+            offset,
+            len,
+            buf,
+            || {
+                let (bytes, sequence) = self.render(cgroup, ty, generation)?;
+                rendered_sequence = Some(sequence);
+                Ok(bytes)
+            },
+            || {
+                let _update = crate::cgroup::lock();
+                self.check_source(cgroup, ty, generation)
+            },
+        )?;
+        // Acknowledge only a successfully committed record, not a cached tail,
+        // an empty request, continuous EOF, or failed rendering. Notifications racing with
+        // formatting remain pending because this is the captured sequence.
+        if let Some(sequence) = rendered_sequence {
+            self.seen.store(sequence, Ordering::Release);
+        }
+        Ok(count)
+    }
+
+    /// Caller holds UPDATE; identity must stay bound to the original epoch.
+    fn check_source(
+        &self,
+        cgroup: &Arc<crate::cgroup::CgroupNode>,
+        ty: super::files::CgroupCoreFile,
+        generation: u64,
+    ) -> Result<(), SystemError> {
+        super::files::check_live_file(cgroup, ty, generation)?;
+        match &self.source {
+            EventSource::Memory { account, .. } => {
+                let current = cgroup
+                    .local_memory_generation()
+                    .ok_or(SystemError::ENODEV)?;
+                if !Arc::ptr_eq(&current.account, account) {
+                    return Err(SystemError::ENODEV);
                 }
             }
+            EventSource::Core(node) => {
+                if !Arc::ptr_eq(cgroup, node) {
+                    return Err(SystemError::ENODEV);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn render(
+        &self,
+        cgroup: &Arc<crate::cgroup::CgroupNode>,
+        ty: super::files::CgroupCoreFile,
+        generation: u64,
+    ) -> Result<(alloc::vec::Vec<u8>, u64), SystemError> {
+        let snapshot = {
+            let _update = crate::cgroup::lock();
+            self.check_source(cgroup, ty, generation)?;
+            match &self.source {
+                EventSource::Memory { account, local } => (Some(account.snapshot()), None, *local),
+                EventSource::Core(node) => (
+                    None,
+                    Some(crate::cgroup::freezer::snapshot_events(node)),
+                    false,
+                ),
+            }
         };
-        // Rendering may allocate; keep it outside UPDATE and STATE just
-        // as the original memory-events implementation did. No new heap
-        // allocation is required to hold either kind of numeric snapshot.
-        let record = if let Some(memory) = snapshot.0 {
-            Some((
+        // Numeric capture and source identity are atomic under UPDATE; formatting
+        // may allocate and must run after releasing it.
+        if let Some(memory) = snapshot.0 {
+            Ok((
                 crate::cgroup::memory::stats::format_events(&memory, snapshot.2)?,
                 if snapshot.2 {
                     memory.local_event_sequence
@@ -110,27 +143,17 @@ impl CgroupEventOpen {
                 },
             ))
         } else {
-            snapshot.1.map(|(populated, frozen, sequence)| {
-                (
-                    alloc::format!(
-                        "populated {}\nfrozen {}\n",
-                        u8::from(populated),
-                        u8::from(frozen)
-                    )
-                    .into_bytes(),
-                    sequence,
+            let (populated, frozen, sequence) = snapshot.1.expect("core event snapshot");
+            Ok((
+                alloc::format!(
+                    "populated {}\nfrozen {}\n",
+                    u8::from(populated),
+                    u8::from(frozen)
                 )
-            })
-        };
-        if let Some((bytes, sequence)) = record {
-            *stored = Some(bytes);
-            self.seen.store(sequence, Ordering::Release);
+                .into_bytes(),
+                sequence,
+            ))
         }
-        let bytes = stored.as_ref().expect("event snapshot was initialized");
-        let start = offset.min(bytes.len());
-        let count = len.min(buf.len()).min(bytes.len() - start);
-        buf[..count].copy_from_slice(&bytes[start..start + count]);
-        Ok(count)
     }
 
     pub(super) fn poll(&self) -> EPollEventType {

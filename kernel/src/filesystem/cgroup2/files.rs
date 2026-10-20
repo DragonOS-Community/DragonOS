@@ -663,6 +663,21 @@ pub(super) fn write_controller_file_locked(
     }
 }
 
+/// Validate the original file epoch without rendering or allocating a record.
+pub(super) fn check_read_source(
+    cgroup: &Arc<CgroupNode>,
+    ty: CgroupCoreFile,
+    cpuset_generation: u64,
+    file_generation: u64,
+) -> Result<(), SystemError> {
+    let _update = crate::cgroup::lock();
+    check_live_file(cgroup, ty, file_generation)?;
+    if matches!(ty, CgroupCoreFile::Cpuset(_)) {
+        cpuset::check_file(cgroup, cpuset_generation)?;
+    }
+    Ok(())
+}
+
 pub(super) fn check_live_file(
     cgroup: &Arc<CgroupNode>,
     ty: CgroupCoreFile,

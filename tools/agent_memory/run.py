@@ -6,6 +6,7 @@ private to one qcow2 overlay; only an explicit restart reuses that overlay.
 """
 import argparse
 import concurrent.futures
+import errno
 import hashlib
 import json
 import math
@@ -22,6 +23,17 @@ import time
 import uuid
 
 CANCELLED = threading.Event()
+
+
+def link_or_copy(source, destination):
+    """Hard links save space; a payload may also live on a different device."""
+    try:
+        os.link(source, destination)
+    except OSError as error:
+        if error.errno not in (errno.EXDEV, errno.EOPNOTSUPP, errno.EPERM, errno.ENOSYS):
+            raise
+        shutil.copy2(source, destination)
+    return destination
 
 
 def write_json(path, value):
@@ -215,9 +227,9 @@ class GuestVM:
         payload = self.share / 'payload'
         (payload / 'bin').mkdir(parents=True)
         for key in ('opencode', 'node', 'helper'):
-            os.link(c[key], payload / 'bin' / key)
+            link_or_copy(c[key], payload / 'bin' / key)
         shutil.copytree(c.get('workload_dir', Path(__file__).parent / 'workloads'), payload / 'workloads')
-        shutil.copytree(c['sdk'], payload / 'sdk', copy_function=os.link)
+        shutil.copytree(c['sdk'], payload / 'sdk', copy_function=link_or_copy)
         # A bind mount enforces read-only at the host VFS boundary, including
         # guest root writes. Keep the results directory outside this mount.
         subprocess.run(['mount', '--bind', str(payload), str(payload)], check=True)
@@ -395,6 +407,11 @@ class GuestVM:
         result['sampled_guest_used_peak_bytes'] = max(used, default=None)
         result['memory_peak_bytes'] = helper['memory_peak_bytes']
         result['elapsed_ns'] = helper['task_elapsed_ns']
+        limit = result.get('limit_bytes')
+        result['limit_exceeded'] = (limit is not None and helper['memory_peak_bytes'] is not None and
+                                    helper['memory_peak_bytes'] > limit)
+        if result['limit_exceeded']:
+            result['status'] = 'failed'
         result['quarantine_vm'] = not helper['descendants_empty'] or helper['status'] == 'cleanup_failed'
         return result
 
@@ -412,12 +429,12 @@ class GuestVM:
         write_json(self.directory / (name + '.json'), result)
         return result
 
-    def pair(self, budget, limits):
+    def pair(self, budget, limits, mode='coding'):
         # Two real Agents in one guest, with independently owned writable state
         # and leaves. Only the victim receives the low quota.
         commands, rows = [], []
         for name, limit in zip(('victim', 'neighbor'), limits):
-            command, row = self.trial_command(name, budget, limit=limit, prepared=True)
+            command, row = self.trial_command(name, budget, limit=limit, mode=mode, prepared=True)
             rows.append(row)
             if command is not None:
                 exit_path = '/mnt/agent-memory/results/' + name + '.exit'
@@ -454,6 +471,7 @@ class GuestVM:
             if not isinstance(events, dict) or not isinstance(initial_events, dict):
                 events, initial_events = {}, {}
             if (limits[0] is not None and victim['status'] == 'failed' and
+                    not victim.get('limit_exceeded') and
                     not victim.get('quarantine_vm') and victim.get('helper_exit') == 1 and
                     v['status'] == 'workload_failed' and
                     v['sample_errors'] == 0 and v['diagnostic_errors'] == 0 and
@@ -594,6 +612,8 @@ def validate_config(config):
                     integer(limit, 0, 2**63-1, 'agent limit')
             if case.get('duration_seconds') or case.get('restart_resume'):
                 raise ValueError('pair is a separate single-run profile')
+            if case.get('reuse_session') or case.get('diagnostic') or 'limit_bytes' in case:
+                raise ValueError('pair does not support reuse_session, diagnostic or limit_bytes')
         if 'limit_bytes' in case:
             integer(case['limit_bytes'], 0, 2**63-1, 'limit_bytes')
         maximum_ram = max(maximum_ram, case['ram_mib'] * case['vms'])
@@ -613,11 +633,17 @@ def run(config, output):
     output.mkdir(mode=0o700)
     disk_need = (config.get('disk_reserve_mib', 1024) + max(c['vms'] for c in config['cases']) *
                  config.get('overlay_budget_mib', 256)) * 1024**2
-    if shutil.disk_usage(output).free < disk_need:
-        raise ValueError('insufficient free disk for configured reserve')
     required = ('kernel', 'disk', 'opencode', 'node', 'helper', 'sdk', 'qemu', 'qemu_img', 'virtiofsd')
     for key in required:
         config[key] = str(Path(config[key]).resolve(strict=True))
+    payload_sources = [Path(config[key]) for key in ('opencode', 'node', 'helper')]
+    payload_sources.extend(p for p in Path(config['sdk']).rglob('*') if p.is_file())
+    # Reserve the copy fallback even on the same device: a filesystem or
+    # protected source may reject hard links. Links are only a space saving.
+    payload_bytes = sum(p.stat().st_size for p in payload_sources)
+    disk_need += max(c['vms'] for c in config['cases']) * payload_bytes
+    if shutil.disk_usage(output).free < disk_need:
+        raise ValueError('insufficient free disk for payload copies and configured reserve')
     budget = Budget(config.get('max_attempts', 100))
     frozen_workloads = output / 'workloads-source'
     shutil.copytree(Path(__file__).parent / 'workloads', frozen_workloads)
@@ -651,18 +677,22 @@ def run(config, output):
             def worker(number):
                 vm = None
                 try:
-                    if shutil.disk_usage(output).free < (case['vms'] * config.get('overlay_budget_mib', 256) + 256) * 1024**2:
+                    case_need = (case['vms'] * config.get('overlay_budget_mib', 256) +
+                                 config.get('disk_reserve_mib', 1024)) * 1024**2
+                    case_need += case['vms'] * payload_bytes
+                    if shutil.disk_usage(output).free < case_need:
                         raise ValueError('insufficient disk reserve for this fleet')
                     vm = GuestVM(config, output / f'c{index}v{number}', sampler, case['ram_mib'])
                     vm.start()
+                    mode = case.get('mode', 'coding')
                     if 'agent_limits_bytes' in case:
-                        vm.prepare('victim')
-                        vm.prepare('neighbor')
+                        vm.prepare('victim', mode)
+                        vm.prepare('neighbor', mode)
                     else:
                         vm.prepare('t0', case.get('mode', 'coding'))
                     ready.wait()
                     if 'agent_limits_bytes' in case:
-                        for paired in vm.pair(budget, case['agent_limits_bytes']):
+                        for paired in vm.pair(budget, case['agent_limits_bytes'], mode=mode):
                             record(paired, index, number, case)
                         return
                     start = time.monotonic()

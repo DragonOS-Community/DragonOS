@@ -213,7 +213,8 @@ impl Cgroup2Inode {
                 parent: Weak::new(),
                 permissions,
                 metadata: Metadata {
-                    size: init.len() as i64,
+                    // Like kernfs cgroup files, generated text has zero logical inode size.
+                    size: 0,
                     mode: InodeMode::from_bits_truncate(mode as u32),
                     uid: 0,
                     gid: 0,
@@ -533,7 +534,8 @@ impl Cgroup2Inode {
             Cgroup2InodeKind::File { data, .. } => {
                 data.clear();
                 data.extend_from_slice(new_data);
-                inner.metadata.size = data.len() as i64;
+                // A controller record length is not the kernfs logical file size.
+                inner.metadata.size = 0;
                 Ok(())
             }
             _ => Err(SystemError::EISDIR),

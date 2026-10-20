@@ -1712,6 +1712,50 @@ TEST_F(CgroupMemory, TextSnapshotRemovedDescriptionCannotReadRecreatedEpoch) {
   EXPECT_EQ("1048576\n", std::string(data, 8));
 }
 
+// kernfs uses generic_file_llseek even when its read path uses seq_file.
+// The generated record has bytes, but cgroup regular inodes have i_size == 0.
+TEST_F(CgroupMemory, TextSnapshotKernfsSeekUsesZeroLogicalSize) {
+  const std::string leaf = Leaf("kernfs-seek");
+  for (const char* name : {"memory.max", "memory.stat", "cgroup.events", "cgroup.freeze"}) {
+    SCOPED_TRACE(name);
+    int fd = OwnFd(open((leaf + "/" + name).c_str(), O_RDONLY | O_CLOEXEC));
+    ASSERT_GE(fd, 0);
+    struct stat info{};
+    ASSERT_EQ(0, fstat(fd, &info));
+    EXPECT_EQ(0, info.st_size);
+    if (!std::strcmp(name, "cgroup.freeze")) {
+      ASSERT_EQ(0, WriteBounded(leaf + "/cgroup.freeze", "1"));
+      ASSERT_EQ(0, fstat(fd, &info));
+      EXPECT_EQ(0, info.st_size) << "controller writes must not publish text length";
+      ASSERT_EQ(0, WriteBounded(leaf + "/cgroup.freeze", "0"));
+    }
+    char byte;
+    ASSERT_EQ(1, read(fd, &byte, 1));
+    EXPECT_EQ(0, lseek(fd, 0, SEEK_END));
+    EXPECT_EQ(7, lseek(fd, 7, SEEK_END));
+    errno = 0;
+    EXPECT_EQ(-1, lseek(fd, -1, SEEK_END));
+    EXPECT_EQ(EINVAL, errno);
+    EXPECT_EQ(7, lseek(fd, 0, SEEK_CUR));
+    for (int whence : {SEEK_DATA, SEEK_HOLE}) {
+      for (off_t offset : {off_t(-1), off_t(0), off_t(7)}) {
+        errno = 0;
+        EXPECT_EQ(-1, lseek(fd, offset, whence));
+        EXPECT_EQ(ENXIO, errno);
+        EXPECT_EQ(7, lseek(fd, 0, SEEK_CUR));
+      }
+    }
+    errno = 0;
+    EXPECT_EQ(-1, lseek(fd, 0, 9999));
+    EXPECT_EQ(EINVAL, errno);
+    EXPECT_EQ(7, lseek(fd, 0, SEEK_CUR));
+    ASSERT_EQ(0, lseek(fd, 0, SEEK_SET));
+    EXPECT_EQ(1, read(fd, &byte, 1)) << "zero inode size is not an empty record";
+    ASSERT_EQ(0, fstat(fd, &info));
+    EXPECT_EQ(0, info.st_size);
+  }
+}
+
 TEST_F(CgroupMemory, TextSnapshotEventTailAndZeroReadDoNotAcknowledgeUpdate) {
   const std::string leaf = Leaf();
   int fd = OwnFd(open((leaf + "/cgroup.events").c_str(), O_RDONLY | O_CLOEXEC));

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Pure host tests: no QEMU, backend, model call or real process signalling."""
 import concurrent.futures
+import errno
 import importlib.util
 import json
 from pathlib import Path
@@ -39,6 +40,26 @@ def write_metrics(output):
             guest_meminfo=dict(MemTotal=1024, MemFree=free)))
     (output / 'metrics.jsonl').write_text(''.join(json.dumps(s) + '\n' for s in samples))
     return samples
+
+
+class PayloadTests(unittest.TestCase):
+    def test_link_copy_preserves_content_on_cross_device_or_unsupported_link(self):
+        with tempfile.TemporaryDirectory(prefix='am-payload-') as root:
+            root = Path(root)
+            source = root / 'source'
+            source.write_bytes(b'fixed public payload')
+            source.chmod(0o755)
+            for code in (errno.EXDEV, errno.EOPNOTSUPP, errno.EPERM):
+                target = root / str(code)
+                with mock.patch.object(RUN.os, 'link', side_effect=OSError(code, 'fixture')):
+                    RUN.link_or_copy(source, target)
+                self.assertEqual(target.read_bytes(), source.read_bytes())
+                self.assertEqual(target.stat().st_mode & 0o777, 0o755)
+            for code in (errno.ENOSPC, errno.EIO):
+                with mock.patch.object(RUN.os, 'link', side_effect=OSError(code, 'fixture')):
+                    with self.assertRaises(OSError) as error:
+                        RUN.link_or_copy(source, root / ('bad-' + str(code)))
+                    self.assertEqual(error.exception.errno, code)
 
 
 class ProcTests(unittest.TestCase):
@@ -170,6 +191,14 @@ class StatisticsTests(unittest.TestCase):
             config = {**valid, "cases": [{**valid["cases"][0], **update}]}
             with self.subTest(update=update), self.assertRaises(ValueError):
                 RUN.validate_config(config)
+
+    def test_pair_unsupported_combinations_are_rejected(self):
+        pair = dict(vms=1, ram_mib=512, agent_limits_bytes=[128, None])
+        for field, value in (('reuse_session', True), ('diagnostic', True),
+                             ('limit_bytes', 0), ('duration_seconds', 1800),
+                             ('restart_resume', True)):
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                RUN.validate_config(dict(cases=[{**pair, field: value}]))
 
 
 class VMTests(unittest.TestCase):
@@ -324,7 +353,7 @@ class VMTests(unittest.TestCase):
                     (vm.share / 'results' / name).mkdir()
                 for failure in ('none', 'missing_metrics', 'missing_phase', 'max_not_hit', 'oom_not_hit',
                                 'helper_list', 'unknown_schema', 'workload_list', 'null_events',
-                                'missing_final', 'bad_time', 'metrics_list'):
+                                'missing_final', 'bad_time', 'metrics_list', 'over_limit'):
                     with self.subTest(failure=failure):
                         for name, code in (('victim', 1), ('neighbor', 0)):
                             out = vm.share / 'results' / name
@@ -340,7 +369,9 @@ class VMTests(unittest.TestCase):
                                 baseline={'memory_events': {'max': 0, 'oom': 0, 'oom_kill': 0}},
                                 final={'memory_events': events})
                             if code:
-                                if failure == 'helper_list':
+                                if failure == 'over_limit':
+                                    helper['memory_peak_bytes'] = 128 * 1024**2 + 1
+                                elif failure == 'helper_list':
                                     helper = []
                                 elif failure == 'unknown_schema':
                                     helper['schema'] = 2
@@ -367,7 +398,7 @@ class VMTests(unittest.TestCase):
                                 elif failure == 'metrics_list':
                                     (out / 'metrics.jsonl').write_text('[[]]\n')
                         vm.trial_command = mock.Mock(side_effect=[
-                            ('victim-command', dict(name='victim', admitted=True)),
+                            ('victim-command', dict(name='victim', admitted=True, limit_bytes=128 * 1024**2)),
                             ('neighbor-command', dict(name='neighbor', admitted=True))])
                         vm.command = mock.Mock(return_value=0)
                         rows = vm.pair(RUN.Budget(2), [128 * 1024**2, None])
@@ -377,6 +408,47 @@ class VMTests(unittest.TestCase):
                         self.assertEqual(rows[0]['status'], expected)
                         self.assertEqual(rows[1]['status'], 'passed')
                         self.assertEqual(sum(r['admitted'] for r in rows), 2)
+            finally:
+                vm.close()
+
+    def test_finite_limit_rejects_successful_overcharge(self):
+        with tempfile.TemporaryDirectory(prefix="am-") as root:
+            vm = RUN.GuestVM(self.config(), Path(root) / "vm", mock.Mock(), 512)
+            try:
+                out = vm.share / 'results/task'
+                out.mkdir()
+                helper = dict(schema=1, status='ok', descendants_empty=True, cleanup_required=False,
+                              sample_errors=0, diagnostic_errors=0, memory_peak_bytes=4096,
+                              task_elapsed_ns=20)
+                (out / 'result.json').write_text(json.dumps(helper))
+                (out / 'workload.json').write_text('{"schema":1,"success":true}')
+                write_metrics(out)
+                for limit, expected in ((None, 'passed'), (4097, 'passed'), (4096, 'passed'), (4095, 'failed'), (0, 'failed')):
+                    with self.subTest(limit=limit):
+                        row = vm.collect(dict(name='task', limit_bytes=limit), 0)
+                        self.assertEqual(row['status'], expected)
+            finally:
+                vm.close()
+
+    def test_cold_pair_cannot_pass_over_limit(self):
+        with tempfile.TemporaryDirectory(prefix="am-") as root:
+            vm = RUN.GuestVM(self.config(), Path(root) / "vm", mock.Mock(), 512)
+            try:
+                for name in ('victim', 'neighbor'):
+                    out = vm.share / 'results' / name
+                    out.mkdir()
+                    helper = dict(schema=1, status='ok', descendants_empty=True, cleanup_required=False,
+                                  sample_errors=0, diagnostic_errors=0, memory_peak_bytes=100,
+                                  task_elapsed_ns=20, workload_start_ns=10, leader_exit_ns=30)
+                    (out / 'result.json').write_text(json.dumps(helper))
+                    (out / 'workload.json').write_text('{"schema":1,"success":true}')
+                    (vm.share / 'results' / (name + '.exit')).write_text('0')
+                    write_metrics(out)
+                vm.command = mock.Mock(return_value=0)
+                rows = vm.pair(RUN.Budget(2), [99, None], mode='cold')
+                self.assertEqual([r['status'] for r in rows], ['failed', 'passed'])
+                self.assertEqual([r['mode'] for r in rows], ['cold', 'cold'])
+                self.assertEqual(vm.command.call_args.args[0].count(' cold'), 2)
             finally:
                 vm.close()
 
@@ -420,6 +492,67 @@ class VMTests(unittest.TestCase):
 
 
 class RunCoverageTests(unittest.TestCase):
+    def test_cold_pair_preparation_and_execution_use_requested_mode(self):
+        with tempfile.TemporaryDirectory(prefix='am-cold-') as root:
+            root = Path(root)
+            artifact = root / 'artifact'
+            artifact.write_text('public fixture')
+            sdk = root / 'sdk'
+            sdk.mkdir()
+            (sdk / 'package.json').write_text('{}')
+            config = {key: str(artifact) for key in ('kernel', 'disk', 'opencode', 'node',
+                      'helper', 'qemu', 'qemu_img', 'virtiofsd')}
+            config.update(sdk=str(sdk), cases=[dict(vms=1, ram_mib=512,
+                          agent_limits_bytes=[128, None], mode='cold')])
+            sampler = mock.Mock(rows=[], failure=None)
+            context = mock.MagicMock()
+            context.__enter__.return_value = sampler
+            vm = mock.Mock(overlay=root / 'no-overlay', identity='fixture-vm')
+            vm.pair.return_value = [dict(name=name, status='passed', mode='cold', admitted=True)
+                                    for name in ('victim', 'neighbor')]
+            old_umask = RUN.os.umask(0o077)
+            try:
+                with mock.patch.object(RUN, 'validate_config'), \
+                     mock.patch.object(RUN, 'HostSampler', return_value=context), \
+                     mock.patch.object(RUN, 'GuestVM', return_value=vm), \
+                     mock.patch.object(RUN.subprocess, 'check_output', return_value='fixture QEMU\n'), \
+                     mock.patch('builtins.print'):
+                    RUN.run(config, root / 'output')
+            finally:
+                RUN.os.umask(old_umask)
+            self.assertEqual(vm.prepare.call_args_list,
+                             [mock.call('victim', 'cold'), mock.call('neighbor', 'cold')])
+            self.assertEqual(vm.pair.call_args.kwargs, dict(mode='cold'))
+            self.assertFalse(vm.trial.called)
+            self.assertEqual(len(json.loads((root / 'output/attempts.json').read_text())), 2)
+
+    def test_payload_copy_fallback_is_reserved_before_launch(self):
+        with tempfile.TemporaryDirectory(prefix='am-copy-budget-') as root:
+            root = Path(root)
+            artifact = root / 'artifact'
+            artifact.write_bytes(b'x' * 4096)
+            sdk = root / 'sdk'
+            sdk.mkdir()
+            package = sdk / 'package.json'
+            package.write_bytes(b'y' * 4096)
+            config = {key: str(artifact) for key in ('kernel', 'disk', 'opencode', 'node',
+                      'helper', 'qemu', 'qemu_img', 'virtiofsd')}
+            config.update(sdk=str(sdk), cases=[dict(vms=2, ram_mib=512)])
+            base_bytes = (1024 + 2 * 256) * 1024**2
+            free = base_bytes + 2 * 4 * 4096 - 1
+            old_umask = RUN.os.umask(0o077)
+            try:
+                with mock.patch.object(RUN, 'validate_config'), \
+                     mock.patch.object(RUN.shutil, 'disk_usage', return_value=mock.Mock(free=free)), \
+                     mock.patch.object(RUN, 'HostSampler') as sampler, \
+                     mock.patch.object(RUN, 'GuestVM') as guest:
+                    with self.assertRaisesRegex(ValueError, 'payload'):
+                        RUN.run(config, root / 'output')
+                    sampler.assert_not_called()
+                    guest.assert_not_called()
+            finally:
+                RUN.os.umask(old_umask)
+
     def test_missing_steady_worker_window_is_incomplete(self):
         with tempfile.TemporaryDirectory(prefix='am-coverage-') as root:
             root = Path(root)

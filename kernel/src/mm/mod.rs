@@ -34,6 +34,7 @@ pub mod init;
 #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
 pub(crate) mod kernel_buffer;
 pub mod kernel_mapper;
+pub(crate) mod lazy_mm_drop;
 pub mod madvise;
 pub mod memblock;
 pub(crate) mod memory_notify;

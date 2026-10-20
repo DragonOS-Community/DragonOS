@@ -52,6 +52,7 @@ pub struct RwSem<T: ?Sized> {
     waiters: AtomicUsize,
     writer_waiters: AtomicUsize,
     queue: WaitQueue,
+    resource_wait: bool,
     val: UnsafeCell<T>,
 }
 
@@ -101,17 +102,45 @@ unsafe impl<T: ?Sized + Sync> Sync for RwSemUpgradeableGuard<'_, T> {}
 impl<T> RwSem<T> {
     /// Creates a new read-write semaphore with an initial value.
     pub const fn new(val: T) -> Self {
+        Self::new_with_wait_mode(val, false)
+    }
+
+    /// Opt in lifecycle locks whose contention must not allocate a waiter.
+    /// Guards and writer-preference semantics are identical to ordinary RwSem.
+    pub(crate) const fn new_resource(val: T) -> Self {
+        Self::new_with_wait_mode(val, true)
+    }
+
+    const fn new_with_wait_mode(val: T, resource_wait: bool) -> Self {
         Self {
             val: UnsafeCell::new(val),
             lock: AtomicUsize::new(0),
             waiters: AtomicUsize::new(0),
             writer_waiters: AtomicUsize::new(0),
             queue: WaitQueue::default(),
+            resource_wait,
         }
     }
 }
 
 impl<T: ?Sized> RwSem<T> {
+    fn resource_key(&self) -> usize {
+        self as *const Self as *const () as usize
+    }
+
+    fn wake_waiters(&self) {
+        if self.resource_wait {
+            super::resource_wait::notify_resource_all(self.resource_key());
+        } else {
+            self.queue.wake_all();
+        }
+    }
+
+    #[cfg(feature = "mm_selftest")]
+    pub(crate) fn resource_key_for_test(&self) -> usize {
+        self.resource_key()
+    }
+
     /// Acquires a read mutex and sleep until it can be acquired.
     ///
     /// The calling thread will sleep until there are no writers or upgrading
@@ -193,7 +222,7 @@ impl<T: ?Sized> RwSem<T> {
             // active reader (lock transitions to 0), wake all waiters so a
             // pending writer is not missed — same rationale as ReadGuard::drop.
             if self.lock.fetch_sub(READER, Release) == READER {
-                self.queue.wake_all();
+                self.wake_waiters();
             }
             None
         }
@@ -234,7 +263,7 @@ impl<T: ?Sized> RwSem<T> {
         } else if (lock == 0 || lock == WRITER)
             && self.lock.fetch_sub(UPGRADEABLE_READER, Release) == UPGRADEABLE_READER
         {
-            self.queue.wake_all();
+            self.wake_waiters();
         }
         None
     }
@@ -249,6 +278,14 @@ impl<T: ?Sized> RwSem<T> {
 
     fn wait_read(&self, interruptible: bool) -> Result<RwSemReadGuard<'_, T>, SystemError> {
         self.waiters.fetch_add(1, AcqRel);
+        if self.resource_wait {
+            let result =
+                super::resource_wait::wait_for_resource(self.resource_key(), interruptible, || {
+                    self.try_read()
+                });
+            self.waiters.fetch_sub(1, Release);
+            return result;
+        }
         let (waiter, waker) = Waiter::new_pair();
 
         loop {
@@ -274,6 +311,17 @@ impl<T: ?Sized> RwSem<T> {
     fn wait_write(&self, interruptible: bool) -> Result<RwSemWriteGuard<'_, T>, SystemError> {
         let writer_waiter = self.begin_writer_wait();
         self.waiters.fetch_add(1, AcqRel);
+        if self.resource_wait {
+            let result =
+                super::resource_wait::wait_for_resource(self.resource_key(), interruptible, || {
+                    self.try_write()
+                });
+            self.waiters.fetch_sub(1, Release);
+            if result.is_ok() {
+                writer_waiter.finish();
+            }
+            return result;
+        }
         let (waiter, waker) = Waiter::new_pair();
 
         loop {
@@ -307,7 +355,7 @@ impl<T: ?Sized> RwSem<T> {
 
     fn end_writer_wait(&self) {
         if self.writer_waiters.fetch_sub(1, Release) == 1 {
-            self.queue.wake_all();
+            self.wake_waiters();
         }
     }
 
@@ -316,6 +364,14 @@ impl<T: ?Sized> RwSem<T> {
         interruptible: bool,
     ) -> Result<RwSemUpgradeableGuard<'_, T>, SystemError> {
         self.waiters.fetch_add(1, AcqRel);
+        if self.resource_wait {
+            let result =
+                super::resource_wait::wait_for_resource(self.resource_key(), interruptible, || {
+                    self.try_upread()
+                });
+            self.waiters.fetch_sub(1, Release);
+            return result;
+        }
         let (waiter, waker) = Waiter::new_pair();
 
         loop {
@@ -355,7 +411,7 @@ impl<T: ?Sized> Drop for RwSemReadGuard<'_, T> {
         // wake_one() might wake a different reader who then fails try_read()
         // and goes back to sleep, leaving the writer permanently un-woken.
         if self.inner.lock.fetch_sub(READER, Release) == READER {
-            self.inner.queue.wake_all();
+            self.inner.wake_waiters();
         }
     }
 }
@@ -398,7 +454,7 @@ impl<'a, T> RwSemWriteGuard<'a, T> {
         if res.is_ok() {
             core::mem::forget(self);
             // A writer->upread transition makes readers runnable again.
-            inner.queue.wake_all();
+            inner.wake_waiters();
             Ok(RwSemUpgradeableGuard {
                 inner,
                 _nosend: PhantomData,
@@ -417,7 +473,7 @@ impl<T: ?Sized> Drop for RwSemWriteGuard<'_, T> {
         // All awakened threads may include readers and writers.
         // Thanks to the `wait_until` method, either all readers
         // continue to execute or one writer continues to execute.
-        self.inner.queue.wake_all();
+        self.inner.wake_waiters();
     }
 }
 
@@ -476,7 +532,7 @@ impl<T: ?Sized> Drop for RwSemUpgradeableGuard<'_, T> {
     fn drop(&mut self) {
         let res = self.inner.lock.fetch_sub(UPGRADEABLE_READER, Release);
         if res == UPGRADEABLE_READER {
-            self.inner.queue.wake_all();
+            self.inner.wake_waiters();
         }
     }
 }

@@ -13,6 +13,7 @@ use unified_init::macros::unified_init;
 use super::page_lru::{PageLru, PreparedPageLruCapacity};
 pub(crate) use super::page_rmap::PageMapping;
 use super::page_rmap::PageVmaSet;
+use crate::libs::resource_wait::ResourceMutexGuard;
 use alloc::sync::{Arc, Weak};
 use hashbrown::HashMap;
 use log::{error, info};
@@ -27,19 +28,18 @@ use crate::{
     },
     filesystem::{
         page_cache::{
-            async_writeback_progress_snapshot, list_page_caches, wait_for_async_writeback_progress,
-            PageCache, PageCacheReclaimMapOutcome,
+            async_writeback_progress_snapshot, list_page_caches, PageCache,
+            PageCacheReclaimMapOutcome,
         },
         vfs::FilePrivateData,
     },
     init::initcall::INITCALL_CORE,
     libs::{
-        mutex::{Mutex, MutexGuard},
+        mutex::Mutex,
         rwsem::{RwSem, RwSemReadGuard, RwSemUpgradeableGuard, RwSemWriteGuard},
     },
     mm::page_cache_stats as pc_stats,
     process::{ProcessControlBlock, ProcessManager},
-    time::{sleep::nanosleep, PosixTimeSpec},
 };
 
 use super::{
@@ -54,6 +54,7 @@ use super::{
 pub(crate) mod access;
 #[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
 pub(crate) mod compaction_selftest;
+pub(crate) mod reclaim_wait;
 pub(crate) mod retirement;
 pub(crate) use retirement::retire_unmapped_page;
 #[cfg(target_arch = "x86_64")]
@@ -82,12 +83,12 @@ pub fn page_manager_init() {
     info!("page_manager_init done");
 }
 
-pub fn page_manager_lock() -> MutexGuard<'static, PageManager> {
-    unsafe { PAGE_MANAGER.as_ref().unwrap().lock() }
+pub fn page_manager_lock() -> ResourceMutexGuard<'static, PageManager> {
+    unsafe { ResourceMutexGuard::lock(PAGE_MANAGER.as_ref().unwrap()) }
 }
 
-pub(crate) fn try_page_manager_lock() -> Option<MutexGuard<'static, PageManager>> {
-    unsafe { PAGE_MANAGER.as_ref()?.try_lock().ok() }
+pub(crate) fn try_page_manager_lock() -> Option<ResourceMutexGuard<'static, PageManager>> {
+    unsafe { ResourceMutexGuard::try_lock(PAGE_MANAGER.as_ref()?) }
 }
 
 /// Maximum number of page identities changed while holding a global page
@@ -610,26 +611,27 @@ fn prepare_lru_capacity() -> Result<Option<PreparedPageLruCapacity>, SystemError
     }
 }
 
+#[cfg(target_arch = "x86_64")]
+const COMPACTION_DISCOVERY_BUCKETS: usize = 256;
+
 /// Bounded candidate discovery for the explicit DMA recovery service.
 /// Only physical identities leave this short registry/Page observation; a
 /// later migration must obtain its own single source Arc and revalidate it.
 #[cfg(target_arch = "x86_64")]
-pub(crate) fn compaction_candidates(
+pub(crate) fn compaction_candidate(
     cursor: &mut usize,
     min: PhysAddr,
     max: PhysAddr,
-) -> Result<[Option<PhysAddr>; 8], SystemError> {
+) -> Result<Option<PhysAddr>, SystemError> {
     let mut manager = try_page_manager_lock().ok_or(SystemError::EAGAIN_OR_EWOULDBLOCK)?;
     let table = manager.phys2page.raw_table();
     let buckets = table.buckets();
-    let mut found = [None; 8];
     if buckets == 0 {
         *cursor = 0;
-        return Ok(found);
+        return Ok(None);
     }
     *cursor %= buckets;
-    let mut count = 0;
-    for _ in 0..buckets.min(256) {
+    for _ in 0..buckets.min(COMPACTION_DISCOVERY_BUCKETS) {
         let index = *cursor;
         *cursor = (index + 1) % buckets;
         // The registry mutex keeps both occupancy and the borrowed bucket
@@ -640,7 +642,7 @@ pub(crate) fn compaction_candidates(
             }
             table.bucket(index).as_ref()
         };
-        // Off-domain pages must not consume the eight returned identities.
+        // Off-domain pages do not consume this call's single returned identity.
         if *physical < min || *physical > max {
             continue;
         }
@@ -664,13 +666,9 @@ pub(crate) fn compaction_candidates(
         {
             continue;
         }
-        found[count] = Some(*physical);
-        count += 1;
-        if count == found.len() {
-            break;
-        }
+        return Ok(Some(*physical));
     }
-    Ok(found)
+    Ok(None)
 }
 
 pub struct PageManager {
@@ -992,6 +990,7 @@ fn page_reclaimer_thread_init() -> Result<(), SystemError> {
 
 /// 页面回收线程执行的函数
 fn page_reclaim_thread() -> i32 {
+    let waits = reclaim_wait::ReclaimWait::new();
     loop {
         let usage = unsafe { LockedFrameAllocator.usage() };
         // log::info!("usage{:?}", usage);
@@ -1010,9 +1009,9 @@ fn page_reclaim_thread() -> i32 {
                 // immediately draining the same LRU again.  If there is no
                 // writeback to wait for, use a bounded retry backoff.
                 if progress.dirty_seen == 0
-                    || !wait_for_async_writeback_progress(writeback_generation)
+                    || !waits.wait_for_writeback_progress(writeback_generation)
                 {
-                    let _ = nanosleep(PosixTimeSpec::new(0, 1_000_000));
+                    waits.pause_us(1_000);
                 }
             }
         } else {
@@ -1022,18 +1021,18 @@ fn page_reclaim_thread() -> i32 {
             // Sleep 5 seconds, matching the Linux dirty_writeback_centisecs default.
             // Metadata writeback is handled by the VFS writeback thread. Keeping
             // sync_fs out of reclaim avoids coupling page reclaim to umount_lock.
-            let _ = nanosleep(PosixTimeSpec::new(5, 0));
+            waits.pause_us(5_000_000);
         }
     }
 }
 
 /// 获取页面回收器
-pub fn page_reclaimer_lock() -> MutexGuard<'static, PageReclaimer> {
-    unsafe { PAGE_RECLAIMER.as_ref().unwrap().lock() }
+pub fn page_reclaimer_lock() -> ResourceMutexGuard<'static, PageReclaimer> {
+    unsafe { ResourceMutexGuard::lock(PAGE_RECLAIMER.as_ref().unwrap()) }
 }
 
-pub(crate) fn try_page_reclaimer_lock() -> Option<MutexGuard<'static, PageReclaimer>> {
-    unsafe { PAGE_RECLAIMER.as_ref()?.try_lock().ok() }
+pub(crate) fn try_page_reclaimer_lock() -> Option<ResourceMutexGuard<'static, PageReclaimer>> {
+    unsafe { ResourceMutexGuard::try_lock(PAGE_RECLAIMER.as_ref()?) }
 }
 
 /// 页面回收器
@@ -1737,7 +1736,7 @@ impl Page {
                 .map(|charge| (charge.account().clone(), charge.kind())),
         );
         let page = Arc::try_new(Self {
-            inner: RwSem::new(inner),
+            inner: RwSem::new_resource(inner),
             access_state: AtomicUsize::new(0),
             phys_addr,
             contiguous_owner: None,
@@ -1766,7 +1765,7 @@ impl Page {
                 .map(|charge| (charge.account().clone(), charge.kind())),
         );
         Arc::try_new(Self {
-            inner: RwSem::new(inner),
+            inner: RwSem::new_resource(inner),
             access_state: AtomicUsize::new(0),
             phys_addr,
             contiguous_owner: Some(owner),
@@ -1829,7 +1828,7 @@ impl Page {
         );
         raw.remaining = 0;
         Arc::try_new(Self {
-            inner: RwSem::new(inner),
+            inner: RwSem::new_resource(inner),
             access_state: AtomicUsize::new(0),
             phys_addr: new_phys,
             contiguous_owner: None,

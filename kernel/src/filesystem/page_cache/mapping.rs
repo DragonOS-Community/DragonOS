@@ -38,7 +38,7 @@ pub(crate) enum PageCacheRangeResult<T> {
 impl PageCacheRangeRetry {
     pub(crate) fn wait(self) -> Result<(), SystemError> {
         match self.reason {
-            RangeRetryReason::Entry(entry) => entry.wait_queue.wait_until(|| match entry.state() {
+            RangeRetryReason::Entry(entry) => entry.wait_until(|| match entry.state() {
                 PageState::Loading | PageState::Writeback => None,
                 PageState::Error => Some(Err(SystemError::EIO)),
                 _ if entry.active_users() != 0 => None,
@@ -773,7 +773,7 @@ impl PageCache {
                     continue;
                 }
                 PageState::Writeback => {
-                    let _ = entry.wait_queue.wait_until(|| match entry.state() {
+                    let _ = entry.wait_until(|| match entry.state() {
                         PageState::Writeback => None,
                         PageState::Error => Some(Err(SystemError::EIO)),
                         _ => Some(Ok(())),
@@ -918,7 +918,7 @@ impl PageCache {
                             self.finish_removed_range_tags(removed_tagged_page);
                             return Ok(false);
                         }
-                        let _ = entry.wait_queue.wait_until(|| match entry.state() {
+                        let _ = entry.wait_until(|| match entry.state() {
                             PageState::Writeback => None,
                             PageState::Error => Some(Err(SystemError::EIO)),
                             _ => Some(Ok(())),
@@ -995,7 +995,7 @@ impl PageCache {
                                     self.finish_removed_range_tags(removed_tagged_page);
                                     return Ok(false);
                                 }
-                                let _ = current.wait_queue.wait_until(|| match current.state() {
+                                let _ = current.wait_until(|| match current.state() {
                                     PageState::Writeback => None,
                                     PageState::Error => Some(Err(SystemError::EIO)),
                                     _ => Some(Ok(())),
@@ -1045,7 +1045,7 @@ impl PageCache {
                         continue;
                     }
                     PageState::Writeback => {
-                        let _ = entry.wait_queue.wait_until(|| match entry.state() {
+                        let _ = entry.wait_until(|| match entry.state() {
                             PageState::Writeback => None,
                             PageState::Error => Some(Err(SystemError::EIO)),
                             _ => Some(Ok(())),

@@ -2,8 +2,8 @@
 
 extern crate alloc;
 
-use alloc::{boxed::Box, vec};
-use core::{mem::ManuallyDrop, slice};
+use alloc::{alloc::alloc_zeroed, boxed::Box};
+use core::{alloc::Layout, mem::ManuallyDrop, slice};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BufferState {
@@ -17,6 +17,7 @@ pub enum BufferState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BufferError {
+    OutOfMemory,
     InvalidLength,
     InvalidState,
     NotDirectMapped,
@@ -151,7 +152,17 @@ impl DeviceOutputBuffer {
         if len == 0 {
             return Err(BufferError::InvalidLength);
         }
-        let backing = vec![0u8; len].into_boxed_slice();
+        let layout = Layout::array::<u8>(len).map_err(|_| BufferError::InvalidLength)?;
+        // The Result constructor must not invoke the infallible allocation
+        // handler when a transport is trying to finish I/O under pressure.
+        let raw = unsafe { alloc_zeroed(layout) };
+        if raw.is_null() {
+            return Err(BufferError::OutOfMemory);
+        }
+        // SAFETY: Nonzero, validated slice layout, allocated by the same global
+        // allocator used by Box. Every byte is initialized; this is the sole
+        // owner. Keep ordinary Box cleanup until address translation succeeds.
+        let backing = unsafe { Box::from_raw(core::ptr::slice_from_raw_parts_mut(raw, len)) };
         let vaddr = backing.as_ptr() as usize;
         let paddr = virt_to_phys(vaddr).ok_or(BufferError::NotDirectMapped)?;
         Ok(Self {
@@ -356,6 +367,20 @@ mod tests {
 
     fn direct(vaddr: usize) -> Option<usize> {
         Some(vaddr.wrapping_sub(0x1000))
+    }
+
+    #[test]
+    fn validates_layout_before_translation_and_zeroes_backing() {
+        for len in [0, (isize::MAX as usize) + 1, usize::MAX] {
+            assert!(matches!(
+                DeviceOutputBuffer::new(len, |_| panic!("invalid layout translated")),
+                Err(BufferError::InvalidLength)
+            ));
+        }
+        let buf = DeviceOutputBuffer::new(4112, direct).unwrap();
+        // Inspect private backing before any descriptor exists. The public
+        // readable-prefix API still requires a validated device completion.
+        assert!(buf.backing.iter().all(|byte| *byte == 0));
     }
 
     #[test]

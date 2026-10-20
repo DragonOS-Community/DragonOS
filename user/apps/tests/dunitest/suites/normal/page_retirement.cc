@@ -32,7 +32,14 @@ TEST(PageRetirement, OwnershipAndLifecycle) {
     ASSERT_EQ(0, close(fd));
     EXPECT_NE(std::string::npos, report.find("status=ok\n")) << report;
     EXPECT_NE(std::string::npos, report.find("summary_fail=0\n")) << report;
-    for (const char* key : {"last_unmap", "partial_unmap", "madvise_range", "teardown", "inactive_teardown",
+    for (const char* key : {"last_unmap", "partial_unmap", "madvise_range", "teardown", "inactive_teardown", "multibatch_munmap", "multibatch_teardown", "multibatch_inactive_teardown", "heap_denied_teardown", "heap_denied_inactive_teardown",
+            "heap_denied_manager_contention", "heap_denied_reclaimer_contention",
+            "heap_denied_mm_write_contention", "heap_denied_pt_edit_contention",
+            "heap_denied_page_write_contention", "heap_denied_vma_contention",
+            "heap_denied_rwsem_mixed_broadcast",
+            "heap_denied_lazy_mm_queue", "heap_denied_futex_wake",
+            "heap_denied_page_entry_wait", "heap_denied_device_output_buffer",
+            "heap_denied_workqueue",
             "two_mm_interleaved_lru", "two_mm_interleaved_plain", "last_mapping_only", "access_pin_lifetime", "extra_arc_lifetime",
             "reclaimer_snapshot_lifetime", "file_backing_preserved", "shmem_backing_preserved",
             "shm_backing_pin", "normal_backing_pin", "unevictable_preserved", "oom_lru",

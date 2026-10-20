@@ -1,6 +1,9 @@
 use super::*;
 use crate::cgroup::memory::{accounting::KernelByteKind, owned::OwnedBox};
 use crate::filesystem::vfs::VmaOpenRollback;
+use crate::mm::mmu_gather::PAGE_BATCH;
+
+const UNMAP_SCAN_BATCH: usize = 256;
 
 /// Classification of a present user PTE in a VMA.
 ///
@@ -127,7 +130,7 @@ impl LockedVMA {
             vma,
         })
         .map_err(|_| SystemError::ENOMEM)?;
-        r.vma.lock().self_ref = Arc::downgrade(&r);
+        r.lock().self_ref = Arc::downgrade(&r);
         Ok(r)
     }
 
@@ -147,12 +150,14 @@ impl LockedVMA {
         self.state_seq.fetch_add(1, Ordering::AcqRel);
     }
 
-    pub fn lock(&self) -> MutexGuard<'_, VMA> {
-        return self.vma.lock();
+    pub fn lock(&self) -> crate::libs::resource_wait::ResourceMutexGuard<'_, VMA> {
+        return crate::libs::resource_wait::ResourceMutexGuard::lock(&self.vma);
     }
 
-    pub(crate) fn try_lock(&self) -> Option<MutexGuard<'_, VMA>> {
-        self.vma.try_lock().ok()
+    pub(crate) fn try_lock(
+        &self,
+    ) -> Option<crate::libs::resource_wait::ResourceMutexGuard<'_, VMA>> {
+        crate::libs::resource_wait::ResourceMutexGuard::try_lock(&self.vma)
     }
 
     #[expect(
@@ -313,52 +318,47 @@ impl LockedVMA {
             (region, should_wakeup_writeback, mm, *self_guard.vm_flags())
         };
 
-        let mut pages_to_reclassify = Vec::new();
-        let mut unmapped_present_pages = 0usize;
-        {
-            let mut page_manager_guard = page_manager_lock();
-            for page in region.pages() {
-                if mapper.translate(page.virt_address()).is_none() {
-                    continue;
-                }
-                let (paddr, _, flush) =
-                    unsafe { mapper.unmap_phys_gather(page.virt_address(), true, tlb) }
-                        .expect("Failed to unmap, beacuse of some page is not mapped");
+        let mut pages = region.pages();
+        loop {
+            let mut pending: [Option<Arc<Page>>; PAGE_BATCH] = core::array::from_fn(|_| None);
+            let mut used = 0;
+            let mut scanned = 0;
+            {
+                let mut page_manager_guard = page_manager_lock();
+                while used < PAGE_BATCH && scanned < UNMAP_SCAN_BATCH {
+                    let Some(page) = pages.next() else { break };
+                    scanned += 1;
+                    if mapper.translate(page.virt_address()).is_none() {
+                        continue;
+                    }
+                    let (paddr, _, flush) =
+                        unsafe { mapper.unmap_phys_gather(page.virt_address(), true, tlb) }
+                            .expect("Failed to unmap, beacuse of some page is not mapped");
 
-                // Remove the current VMA from anon_vma
-                let PresentPfn::Managed(page_arc) =
-                    Self::classify_present_pfn(&mut page_manager_guard, paddr, vm_flags)
-                else {
+                    // Remove the current VMA from anon_vma
+                    let PresentPfn::Managed(page_arc) =
+                        Self::classify_present_pfn(&mut page_manager_guard, paddr, vm_flags)
+                    else {
+                        unsafe { flush.ignore() };
+                        tlb.accumulate_range(page.virt_address());
+                        continue;
+                    };
+                    {
+                        let mut page_guard = page_arc.write();
+                        page_guard.remove_vma(self);
+                    }
+                    pending[used] = Some(page_arc);
+                    used += 1;
+
+                    // Local PTE cleared; no immediate invlpg. Final TLB invalidation is performed uniformly by MmuGather.
                     unsafe { flush.ignore() };
                     tlb.accumulate_range(page.virt_address());
-                    continue;
-                };
-                {
-                    let mut page_guard = page_arc.write();
-                    page_guard.remove_vma(self);
                 }
-                pages_to_reclassify.push(page_arc);
-
-                // Local PTE cleared; no immediate invlpg. Final TLB invalidation is performed uniformly by MmuGather.
-                unsafe { flush.ignore() };
-                tlb.accumulate_range(page.virt_address());
-                unmapped_present_pages += 1;
             }
-        }
-
-        for page_arc in &pages_to_reclassify {
-            InnerAddressSpace::remove_page_unevictable_if_unneeded(page_arc);
-        }
-
-        if let Some(mm) = mm.as_ref() {
-            mm.account_present_pages_sub(unmapped_present_pages);
-        }
-
-        for page in pages_to_reclassify {
-            crate::mm::page::retire_unmapped_page(&page);
-            // Every revoked PTE needs this transaction's own TLB lifetime,
-            // even when another MM later removes the last reverse mapping.
-            tlb.stash_page(page);
+            Self::retire_unmapped_batch(&mut pending[..used], mm.as_ref(), tlb);
+            if scanned == 0 {
+                break;
+            }
         }
 
         // When the VMA corresponds to a shared file write mapping, wake up the dirty page writeback thread
@@ -391,88 +391,108 @@ impl LockedVMA {
             .and_then(|file| file.inode().page_cache());
         drop(self_guard);
 
-        let mut pages_to_reclassify = Vec::new();
-        let mut unmapped_present_pages = 0usize;
-        {
-            let mut page_manager_guard = page_manager_lock();
-            for page in intersection.pages() {
-                let virt = page.virt_address();
-                let Some((paddr, _)) = mapper.translate(virt) else {
-                    continue;
-                };
+        let mut pages = intersection.pages();
+        loop {
+            let mut pending: [Option<Arc<Page>>; PAGE_BATCH] = core::array::from_fn(|_| None);
+            let mut used = 0;
+            let mut scanned = 0;
+            {
+                let mut page_manager_guard = page_manager_lock();
+                while used < PAGE_BATCH && scanned < UNMAP_SCAN_BATCH {
+                    let Some(page) = pages.next() else { break };
+                    scanned += 1;
+                    let virt = page.virt_address();
+                    let Some((paddr, _)) = mapper.translate(virt) else {
+                        continue;
+                    };
 
-                let PresentPfn::Managed(page_arc) =
-                    Self::classify_present_pfn(&mut page_manager_guard, paddr, vm_flags)
-                else {
-                    // A raw mixed PFN belongs to this file VMA. CacheOnly and
-                    // EvenCow both zap it; private COW pages are managed and are
-                    // filtered below by PageType.
-                    let Some((_paddr, _, flush)) =
+                    let PresentPfn::Managed(page_arc) =
+                        Self::classify_present_pfn(&mut page_manager_guard, paddr, vm_flags)
+                    else {
+                        // A raw mixed PFN belongs to this file VMA. CacheOnly and
+                        // EvenCow both zap it; private COW pages are managed and are
+                        // filtered below by PageType.
+                        let Some((_paddr, _, flush)) =
+                            (unsafe { mapper.unmap_phys_preserve_tables(virt) })
+                        else {
+                            continue;
+                        };
+                        unsafe { flush.ignore() };
+                        tlb.accumulate_range(virt);
+                        continue;
+                    };
+                    if let Some(page_cache) = file_page_cache.as_ref() {
+                        let Some(base_pgoff) = backing_pgoff else {
+                            continue;
+                        };
+                        let pgoff =
+                            base_pgoff + ((virt.data() - vma_start.data()) >> MMArch::PAGE_SHIFT);
+                        let page_guard = page_arc.read();
+                        let is_target_page = match page_guard.page_type() {
+                            PageType::File(info) if info.index == pgoff => info
+                                .page_cache
+                                .upgrade()
+                                .is_some_and(|mapped_cache| Arc::ptr_eq(&mapped_cache, page_cache)),
+                            // Truncate must also zap private COW pages. For file VMAs those pages are
+                            // represented as normal pages, while shared file mappings remain page-cache
+                            // backed and are covered by the PageType::File branch above.
+                            PageType::Normal if mode == UnmapMappingMode::EvenCow => true,
+                            _ => false,
+                        };
+                        drop(page_guard);
+                        if !is_target_page {
+                            continue;
+                        }
+                    }
+
+                    let Some((paddr, _, flush)) =
                         (unsafe { mapper.unmap_phys_preserve_tables(virt) })
                     else {
                         continue;
                     };
+
+                    {
+                        let mut page_guard = page_arc.write();
+                        page_guard.remove_vma(self);
+                    }
+                    pending[used] = Some(page_arc);
+                    used += 1;
+
                     unsafe { flush.ignore() };
                     tlb.accumulate_range(virt);
-                    continue;
-                };
-                if let Some(page_cache) = file_page_cache.as_ref() {
-                    let Some(base_pgoff) = backing_pgoff else {
-                        continue;
-                    };
-                    let pgoff =
-                        base_pgoff + ((virt.data() - vma_start.data()) >> MMArch::PAGE_SHIFT);
-                    let page_guard = page_arc.read();
-                    let is_target_page = match page_guard.page_type() {
-                        PageType::File(info) if info.index == pgoff => info
-                            .page_cache
-                            .upgrade()
-                            .is_some_and(|mapped_cache| Arc::ptr_eq(&mapped_cache, page_cache)),
-                        // Truncate must also zap private COW pages. For file VMAs those pages are
-                        // represented as normal pages, while shared file mappings remain page-cache
-                        // backed and are covered by the PageType::File branch above.
-                        PageType::Normal if mode == UnmapMappingMode::EvenCow => true,
-                        _ => false,
-                    };
-                    drop(page_guard);
-                    if !is_target_page {
-                        continue;
-                    }
                 }
-
-                let Some((paddr, _, flush)) = (unsafe { mapper.unmap_phys_preserve_tables(virt) })
-                else {
-                    continue;
-                };
-
-                {
-                    let mut page_guard = page_arc.write();
-                    page_guard.remove_vma(self);
-                }
-                pages_to_reclassify.push(page_arc);
-
-                unsafe { flush.ignore() };
-                tlb.accumulate_range(virt);
-                unmapped_present_pages += 1;
+            }
+            Self::retire_unmapped_batch(&mut pending[..used], mm.as_ref(), tlb);
+            if scanned == 0 {
+                break;
             }
         }
+    }
 
-        for page_arc in &pages_to_reclassify {
-            InnerAddressSpace::remove_page_unevictable_if_unneeded(page_arc);
+    /// All registry and Page guards have gone before classification, owner
+    /// retirement or a gather batch's synchronous TLB acknowledgement.
+    fn retire_unmapped_batch(
+        pages: &mut [Option<Arc<Page>>],
+        mm: Option<&Arc<AddressSpace>>,
+        tlb: &mut MmuGather<'_>,
+    ) {
+        for page in pages.iter().flatten() {
+            InnerAddressSpace::remove_page_unevictable_if_unneeded(page);
         }
-
-        if let Some(mm) = mm.as_ref() {
-            mm.account_present_pages_sub(unmapped_present_pages);
+        if let Some(mm) = mm {
+            mm.account_present_pages_sub(pages.len());
         }
-
-        for page in pages_to_reclassify {
+        for slot in pages {
+            let page = slot.take().expect("filled unmap batch slot");
             crate::mm::page::retire_unmapped_page(&page);
+            // This transaction keeps its own pin even if another MM removes
+            // the final rmap. That MM's barrier cannot substitute for ours.
             tlb.stash_page(page);
         }
     }
 
     pub fn mapped(&self) -> bool {
-        return self.vma.lock().mapped;
+        return self.lock().mapped;
     }
 
     /// Split the current VMA into at most three segments (before / middle / after).
@@ -704,6 +724,9 @@ pub struct VMA {
     pub(super) self_ref: Weak<LockedVMA>,
 
     pub(super) vm_file: Option<Arc<File>>,
+    /// The actual file-rmap registration owner. Keep it through PTE/TLB
+    /// retirement; terminal detach only borrows this pin and never queries FS.
+    pub(super) registered_file_cache: Option<Arc<crate::filesystem::page_cache::PageCache>>,
     /// The offset (in pages) of the VMA's backing object (file) relative to the entire backing object
     pub(super) backing_pgoff: Option<usize>,
 
@@ -745,6 +768,7 @@ impl VMA {
             self_ref: Weak::default(),
             provider: Provider::Allocated,
             vm_file: file,
+            registered_file_cache: None,
             backing_pgoff: pgoff,
             sysv_shm: None,
         }
@@ -826,6 +850,8 @@ impl VMA {
             provider: Provider::Allocated,
             backing_pgoff: self.backing_pgoff,
             vm_file: self.vm_file.clone(),
+            // A new VMA identity registers independently when attached.
+            registered_file_cache: None,
             sysv_shm: self.sysv_shm.clone(),
         };
     }
@@ -841,6 +867,8 @@ impl VMA {
             provider: Provider::Allocated,
             backing_pgoff: self.backing_pgoff,
             vm_file: self.vm_file.clone(),
+            // A new VMA identity registers independently when attached.
+            registered_file_cache: None,
             sysv_shm: self.sysv_shm.clone(),
         };
     }

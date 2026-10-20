@@ -584,3 +584,9 @@ pub fn send_to_default_serial8250_port(s: &[u8]) {
         serial8250_la64::send_to_default_serial8250_la64_port(s);
     }
 }
+
+/// Bounded OOM diagnostics use the existing UART emergency transaction.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn emergency_output(s: &[u8], deadline: crate::time::Instant) -> usize {
+    serial8250_pio::emergency_output(s, deadline)
+}

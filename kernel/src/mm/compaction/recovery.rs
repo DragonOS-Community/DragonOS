@@ -12,7 +12,7 @@ use crate::{
     mm::{
         allocator::buddy::DmaRecoveryZone,
         memblock::{mem_block_manager, MemoryAreaAttr},
-        page::compaction_candidates,
+        page::compaction_candidate,
         MemoryManagementArch, PhysAddr,
     },
     process::ProcessManager,
@@ -65,40 +65,53 @@ pub(crate) fn allocate(
     }
     let mut services = RECOVERY.try_lock().map_err(|_| Stop::Busy)?;
     let service = &mut services[order - 1];
-    // The same failed buddy attempt proved capacity in this one zone.
-    // Do not spend its evidence on a different, capacity-starved domain.
-    let normal = matches!(zone, DmaRecoveryZone::Normal);
-    let minimum = PhysAddr::new(if normal { DMA32_END } else { 0 });
-    let maximum = if normal {
-        max
-    } else {
-        PhysAddr::new(max.data().min(u32::MAX as usize))
-    };
-    if minimum > maximum {
-        return Err(Stop::Invalid);
-    }
-    let candidates =
-        compaction_candidates(&mut service.cursor, minimum, maximum).map_err(|_| Stop::Busy)?;
-    for physical in candidates.iter().flatten() {
-        if let Some(request) = candidate_request(*physical, order, max, normal) {
-            // One candidate per failed allocation. Changing only its seed
-            // leaves this domain/order's Compactor deferral intact.
-            let run = service.compactor.allocate(request).outcome?;
+    service.allocate(order, max, zone)
+}
+
+impl Service {
+    fn allocate(
+        &mut self,
+        order: usize,
+        max: PhysAddr,
+        zone: DmaRecoveryZone,
+    ) -> Result<CompactedFrames, Stop> {
+        // The same failed buddy attempt proved capacity in this one zone.
+        // Do not spend its evidence on a different, capacity-starved domain.
+        let normal = matches!(zone, DmaRecoveryZone::Normal);
+        let minimum = PhysAddr::new(if normal { DMA32_END } else { 0 });
+        let maximum = if normal {
+            max
+        } else {
+            PhysAddr::new(max.data().min(u32::MAX as usize))
+        };
+        if minimum > maximum {
+            return Err(Stop::Invalid);
+        }
+        let cursor_before = self.cursor;
+        let physical =
+            compaction_candidate(&mut self.cursor, minimum, maximum).map_err(|_| Stop::Busy)?;
+        if let Some(request) =
+            physical.and_then(|physical| candidate_request(physical, order, max, normal))
+        {
+            // Deferred work did not consume this candidate. Keep its discovery
+            // position so the next real attempt cannot skip it in lockstep with
+            // the domain's exponential backoff.
+            let outcome = self.compactor.allocate(request).outcome;
+            if matches!(&outcome, Err(Stop::Deferred)) {
+                self.cursor = cursor_before;
+            }
+            let run = outcome?;
             if matches!(zone, DmaRecoveryZone::Dma32Fallback)
                 && !LockedFrameAllocator::with_buddy(|buddy| buddy.dma32_fallback_allowed(0))
                     .unwrap_or(false)
             {
-                // The run is already excluded from free counters. Recheck
-                // the remaining reserve under the buddy lock before handing
-                // ownership to DMA, including the ordinary fast-path result.
-                // Constrained consumers may have spent it since the proof.
                 drop(run);
                 return Err(Stop::Busy);
             }
             return Ok(run);
         }
+        Err(Stop::Blocked)
     }
-    Err(Stop::Blocked)
 }
 
 fn candidate_request(
@@ -161,4 +174,38 @@ fn candidate_request(
             no_progress: 1,
         },
     })
+}
+
+/// Caller owns a fragmented prefix whose seeded target begins with a raw
+/// blocker. This local owner never resets or seeds the production RECOVERY.
+#[cfg(feature = "mm_selftest")]
+pub(crate) fn deferred_discovery_selftest(
+    physical: PhysAddr,
+    cursor: usize,
+    order: usize,
+    max: PhysAddr,
+) -> bool {
+    let Some(request) = candidate_request(physical, order, max, false) else {
+        return false;
+    };
+    let mut service = Service::new();
+    // Establish backoff with the real blocked target, not a synthetic flag.
+    if !matches!(
+        service.compactor.allocate(request).outcome,
+        Err(Stop::Blocked)
+    ) {
+        return false;
+    }
+    service.cursor = cursor;
+    let mut expected = cursor;
+    if !matches!(compaction_candidate(&mut expected, PhysAddr::new(0), max), Ok(Some(found)) if found == physical)
+    {
+        return false;
+    }
+    let deferred = service.allocate(order, max, DmaRecoveryZone::Dma32);
+    if !matches!(deferred, Err(Stop::Deferred)) || service.cursor != cursor {
+        return false;
+    }
+    let attempted = service.allocate(order, max, DmaRecoveryZone::Dma32);
+    matches!(attempted, Err(Stop::Blocked)) && service.cursor == expected
 }

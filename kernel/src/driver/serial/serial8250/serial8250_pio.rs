@@ -641,14 +641,22 @@ impl Serial8250PIOPort {
     }
 
     fn submit_emergency_output(&self, s: &[u8]) {
+        let _ =
+            self.submit_emergency_output_until(s, Instant::now() + SERIAL_8250_EMERGENCY_TIMEOUT);
+    }
+
+    fn submit_emergency_output_until(&self, s: &[u8], deadline: Instant) -> usize {
+        if Instant::now() >= deadline {
+            return 0;
+        }
         let Ok(mut tx_state) = self.tx_state.try_lock_irqsave() else {
-            return;
+            return 0;
         };
         let Ok(mut rx_state) = self.rx_state.try_lock_irqsave() else {
-            return;
+            return 0;
         };
         let Ok(_hw_guard) = self.hw_lock.try_lock_irqsave() else {
-            return;
+            return 0;
         };
 
         let inherited_console_active = tx_state.console_active;
@@ -660,7 +668,6 @@ impl Serial8250PIOPort {
         // Keep this independent of the configured baud rate: at B50 the
         // ordinary FIFO-sized timeout would otherwise grow to several
         // seconds. Linux's 8250 console likewise bounds an LSR wait to 10 ms.
-        let deadline = Instant::now() + SERIAL_8250_EMERGENCY_TIMEOUT;
         let mut ready = true;
         while self.serial_in_raw(5) & 0x20 == 0 {
             if Instant::now() >= deadline {
@@ -671,12 +678,15 @@ impl Serial8250PIOPort {
         }
         // Atomic diagnostics get one bounded FIFO batch. Longer output is
         // intentionally truncated rather than extending IRQ/exception time.
-        if ready {
+        let count = if ready {
             let count = s.len().min(self.tx_fifo_size.load(Ordering::Acquire));
             for byte in &s[..count] {
                 self.serial_out_raw(0, (*byte).into());
             }
-        }
+            count
+        } else {
+            0
+        };
 
         tx_state.console_active = inherited_console_active;
         if tx_state.irq_needed() && !inherited_console_active {
@@ -685,6 +695,7 @@ impl Serial8250PIOPort {
             rx_state.ier &= !SERIAL_8250_IER_TX_EMPTY;
         }
         self.sync_ier_hw_locked(&rx_state);
+        count
     }
 
     fn tx_batch_timeout(&self) -> Duration {
@@ -1144,6 +1155,12 @@ impl Serial8250PortBase {
             Self::COM5 | Self::COM6 | Self::COM7 | Self::COM8 => None,
         }
     }
+}
+
+/// Try-only, bounded diagnostics; bypass ordinary TTY wakeups and owner waits.
+pub(super) fn emergency_output(s: &[u8], deadline: Instant) -> usize {
+    unsafe { PIO_PORTS[0].as_ref() }
+        .map_or(0, |port| port.submit_emergency_output_until(s, deadline))
 }
 
 /// 临时函数，用于向COM1发送数据

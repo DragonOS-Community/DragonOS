@@ -10,7 +10,7 @@
 //! This guarantees that no matter how many other CPUs share the mm, they cannot hit a freed
 //! physical page through a stale TLB entry.
 
-use alloc::{sync::Arc, vec::Vec};
+use alloc::sync::Arc;
 
 use crate::{
     arch::MMArch,
@@ -39,6 +39,8 @@ enum GatherTarget<'mm> {
     Inactive,
 }
 
+pub(crate) const PAGE_BATCH: usize = 32;
+
 pub struct MmuGather<'mm> {
     /// Translation holders to invalidate before physical retirement.
     ///
@@ -57,7 +59,8 @@ pub struct MmuGather<'mm> {
     /// Whether page-table pages were freed (Linux freed_tables)
     freed_tables: bool,
     /// Accumulated physical pages pending release (dropped after flush_mmu_tlbonly)
-    pending_pages: Vec<Arc<Page>>,
+    pending_pages: [Option<Arc<Page>>; PAGE_BATCH],
+    pending_count: usize,
     pending_tables: DetachedUserTables,
     /// Stride shift (typically PAGE_SHIFT)
     stride_shift: u8,
@@ -76,7 +79,8 @@ impl<'mm> MmuGather<'mm> {
             end: VirtAddr::new(0),
             fullmm: false,
             freed_tables: false,
-            pending_pages: Vec::new(),
+            pending_pages: core::array::from_fn(|_| None),
+            pending_count: 0,
             pending_tables: DetachedUserTables::new(),
             stride_shift: MMArch::PAGE_SHIFT as u8,
             finished: false,
@@ -97,7 +101,8 @@ impl<'mm> MmuGather<'mm> {
             end: VirtAddr::new(0),
             fullmm: false,
             freed_tables: false,
-            pending_pages: Vec::new(),
+            pending_pages: core::array::from_fn(|_| None),
+            pending_count: 0,
             pending_tables: DetachedUserTables::new(),
             stride_shift: MMArch::PAGE_SHIFT as u8,
             finished: false,
@@ -152,17 +157,24 @@ impl<'mm> MmuGather<'mm> {
     /// remover's barrier cannot stand in for this MM's pending shootdown.
     /// Eligible registry ownership may already be detached by the Page layer;
     /// remaining mappings, cache/backing owners and access pins stay valid.
+    /// May flush a full batch. No Page, page-manager or reclaimer guard may
+    /// remain held: the barrier waits for remote CPUs before retiring owners.
     pub fn stash_page(&mut self, page: Arc<Page>) {
-        self.pending_pages.push(page);
+        self.pending_pages[self.pending_count] = Some(page);
+        self.pending_count += 1;
+        if self.pending_count == PAGE_BATCH {
+            self.flush_mmu_tlbonly();
+            self.flush_mmu_free();
+        }
     }
 
     /// Convenience: remove the `Arc<Page>` for `paddr` from the global page_manager and stash it.
     ///
     /// If `paddr` does not exist in the page_manager (e.g. a file page no longer in cache), this is a no-op.
     pub fn stash_paddr(&mut self, paddr: PhysAddr) {
-        let mut guard = page_manager_lock();
-        if let Some(p) = guard.remove_page(&paddr) {
-            self.pending_pages.push(p);
+        let page = { page_manager_lock().remove_page(&paddr) };
+        if let Some(page) = page {
+            self.stash_page(page);
         }
     }
 
@@ -223,7 +235,8 @@ impl<'mm> MmuGather<'mm> {
                 self.flush_mmu_tlbonly();
             }
             assert!(observer.before_free(), "unsafe selftest page retirement");
-            while let Some(page) = self.pending_pages.pop() {
+            for slot in &mut self.pending_pages[..self.pending_count] {
+                let Some(page) = slot.take() else { continue };
                 if page.phys_address().data()
                     == observer.frame.load(core::sync::atomic::Ordering::Acquire)
                 {
@@ -245,10 +258,12 @@ impl<'mm> MmuGather<'mm> {
                         }
                     }
                 } else {
-                    observer.fail();
+                    // The observer owns one real frame; unrelated members of
+                    // a multi-page batch follow ordinary retirement.
                     drop(page);
                 }
             }
+            self.pending_count = 0;
             let had_tables = !self.pending_tables.is_empty();
             assert!(observer.before_free());
             unsafe { self.pending_tables.free_after_flush() };
@@ -258,7 +273,10 @@ impl<'mm> MmuGather<'mm> {
             return;
         }
         // Drop all Arc<Page>, letting InnerPage::drop reach deallocate_page_frames
-        self.pending_pages.clear();
+        for slot in &mut self.pending_pages[..self.pending_count] {
+            drop(slot.take());
+        }
+        self.pending_count = 0;
         unsafe { self.pending_tables.free_after_flush() };
     }
 

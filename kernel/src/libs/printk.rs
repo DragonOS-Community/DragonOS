@@ -1,6 +1,6 @@
 use core::fmt::{self, Write};
 
-use alloc::string::ToString;
+use alloc::string::{String, ToString};
 use log::{info, Level, Log};
 
 use super::lib_ui::textui::{textui_putstr, FontColor};
@@ -67,6 +67,23 @@ pub fn __printk(args: fmt::Arguments) {
 pub struct Logger;
 
 impl Logger {
+    /// Best-effort insertion into the existing fixed ring. All allocation is
+    /// fallible and outside the log lock; a busy logger cannot block recovery.
+    pub(crate) fn try_log_text(&self, level: LogLevel, text: &str) {
+        let Some(kmsg) = (unsafe { KMSG.as_ref() }) else {
+            return;
+        };
+        let mut message = String::new();
+        if message.try_reserve_exact(text.len()).is_err() {
+            return;
+        }
+        message.push_str(text);
+        let record = LogMessage::new(PosixTimeSpec::now_cpu_time(), level, message);
+        if let Ok(mut kmsg) = kmsg.try_lock_irqsave() {
+            kmsg.push(record);
+        }
+    }
+
     pub fn log(&self, log_level: LogLevel, message: fmt::Arguments) {
         if unsafe { KMSG.is_some() } {
             let timestamp: PosixTimeSpec = PosixTimeSpec::now_cpu_time();

@@ -52,7 +52,7 @@ impl Kmsg {
 
     /// 添加日志消息
     pub fn push(&mut self, msg: LogMessage) {
-        self.buffer.push(msg.clone());
+        self.buffer.push(msg);
         self.is_changed = true;
     }
 

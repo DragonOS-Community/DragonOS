@@ -227,7 +227,7 @@ impl PageCacheReadDmaReservation {
             current.account_state_transition(PageState::Loading, PageState::UpToDate);
             current.set_state(PageState::UpToDate);
             published.push(item.page.clone());
-            current.wait_queue.wake_all();
+            current.notify_waiters();
         }
         drop(inner);
         Ok(published)
@@ -298,7 +298,7 @@ impl PageCacheReadDmaReservation {
             };
             if removed {
                 item.entry.set_state(PageState::Error);
-                item.entry.wait_queue.wake_all();
+                item.entry.notify_waiters();
                 if discard_pages {
                     self.cache.discard_unlinked_page(&item.page);
                 }
@@ -313,7 +313,7 @@ impl PageCacheReadDmaReservation {
             {
                 inner.remove_entry(item.descriptor.page_index);
                 item.entry.set_state(PageState::Error);
-                item.entry.wait_queue.wake_all();
+                item.entry.notify_waiters();
             }
             drop(inner);
             cache.discard_unlinked_page(&item.page);

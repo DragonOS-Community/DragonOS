@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -708,4 +709,534 @@ TEST(OomKiller, OtherProcessVictimAllowsTriggerRetry) {
 int main(int argc, char** argv) {
     ::testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();
+}
+
+namespace {
+
+// Exceed three 256-leaf scan windows and the 32-page retirement window,
+// and necessarily span a 2 MiB page-table boundary before injection starts.
+constexpr size_t kHeapDenialResidentPages = 3 * 256 + 513;
+
+int read_heap_denial_config(bool* supported, unsigned long long* rejections) {
+    *supported = false;
+    int fd = open(kOomFaultInjectPath, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        return errno == ENOENT ? 0 : errno;
+    }
+    char buffer[512];
+    ssize_t count;
+    do {
+        count = read(fd, buffer, sizeof(buffer) - 1);
+    } while (count < 0 && errno == EINTR);
+    int error = count < 0 ? errno : 0;
+    close(fd);
+    if (error != 0) {
+        return error;
+    }
+    if (count == static_cast<ssize_t>(sizeof(buffer) - 1)) {
+        return EOVERFLOW;
+    }
+    buffer[count] = 0;
+    const char* support = strstr(buffer, "heap_denial_supported=");
+    if (support == nullptr) {
+        return 0;
+    }
+    if (strncmp(support, "heap_denial_supported=1 ", strlen("heap_denial_supported=1 ")) != 0) {
+        return EINVAL;
+    }
+    const char* field = strstr(buffer, "heap_rejections=");
+    if (field == nullptr) {
+        return EINVAL;
+    }
+    field += strlen("heap_rejections=");
+    if (*field < '0' || *field > '9') {
+        return EINVAL;
+    }
+    char* end = nullptr;
+    errno = 0;
+    unsigned long long value = strtoull(field, &end, 10);
+    if (errno != 0 || (*end != '\n' && *end != ' ' && *end != '\0')) {
+        return EINVAL;
+    }
+    *supported = true;
+    *rejections = value;
+    return 0;
+}
+
+int inject_heap_denial(pid_t target) {
+    char text[96];
+    int len = snprintf(text, sizeof(text), "%d 0 1 1\n", target);
+    if (len <= 0 || len >= static_cast<int>(sizeof(text))) {
+        return EINVAL;
+    }
+    int fd = open(kOomFaultInjectPath, O_WRONLY | O_CLOEXEC);
+    if (fd < 0) {
+        return errno;
+    }
+    int error = write_exact(fd, text, static_cast<size_t>(len));
+    close(fd);
+    return error;
+}
+
+class HeapDenialParentProtection {
+public:
+    int Protect() {
+        int error = read_oom_score_adj(&previous_);
+        if (error != 0) {
+            return error;
+        }
+        error = write_oom_score_adj_errno(-1000);
+        if (error != 0) {
+            return error;
+        }
+        restore_ = true;
+        return expect_current_score(-1000);
+    }
+    ~HeapDenialParentProtection() {
+        if (restore_) {
+            int error = write_oom_score_adj_errno(previous_);
+            EXPECT_EQ(0, error) << "restore parent oom_score_adj";
+            if (error == 0) {
+                EXPECT_EQ(0, expect_current_score(previous_));
+            }
+        }
+    }
+private:
+    int previous_ = 0;
+    bool restore_ = false;
+};
+
+// Own only this test's unreaped child. Cleanup never turns its forced SIGKILL
+// into evidence that the normal OOM transaction succeeded.
+class HeapDenialChild {
+public:
+    explicit HeapDenialChild(pid_t pid) : pid_(pid) {}
+    pid_t Poll(int* status) {
+        pid_t result = waitpid(pid_, status, WNOHANG);
+        if (result == pid_ || (result < 0 && errno == ECHILD)) {
+            pid_ = -1;
+        }
+        return result;
+    }
+    bool Wait(int* status) {
+        if (!wait_for_sigkill_with_timeout(pid_, status)) {
+            return false;
+        }
+        pid_ = -1;
+        return true;
+    }
+    ~HeapDenialChild() {
+        if (pid_ > 0) {
+            (void)kill(pid_, SIGKILL);
+            int status = 0;
+            (void)Wait(&status);
+        }
+    }
+private:
+    pid_t pid_;
+};
+
+int wait_heap_victim_ready(int fd) {
+    int flags = fcntl(fd, F_GETFL);
+    if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+        return errno;
+    }
+    for (int i = 0; i < kWaitVictimPolls; ++i) {
+        char byte = 0;
+        ssize_t count = read(fd, &byte, 1);
+        if (count == 1) {
+            return byte == 'r' ? 0 : EINVAL;
+        }
+        if (count == 0) {
+            return EPIPE;
+        }
+        if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
+            return errno;
+        }
+        usleep(kWaitVictimPollUs);
+    }
+    return ETIMEDOUT;
+}
+
+void heap_denial_selfkill() {
+    if (write_oom_score_adj_errno(1000) != 0 || expect_current_score(1000) != 0 ||
+        map_and_touch_pages(kHeapDenialResidentPages) == MAP_FAILED ||
+        inject_heap_denial(getpid()) != 0) {
+        _exit(2);
+    }
+    (void)fault_one_page();
+    _exit(3);
+}
+
+void heap_denial_victim(int ready) {
+    if (write_oom_score_adj_errno(1000) != 0 || expect_current_score(1000) != 0 ||
+        map_and_touch_pages(kHeapDenialResidentPages) == MAP_FAILED ||
+        write_exact(ready, "r", 1) != 0) {
+        _exit(2);
+    }
+    close(ready);
+    for (;;) {
+        pause();
+    }
+}
+
+void heap_denial_retry() {
+    if (expect_current_score(-1000) != 0 || inject_heap_denial(getpid()) != 0) {
+        _exit(2);
+    }
+    auto* page = static_cast<volatile uint8_t*>(fault_one_page());
+    if (page == nullptr) {
+        _exit(3);
+    }
+    page[0] = 0xa5;
+    page[kPageSize - 1] = 0x6c;
+    _exit(page[0] == 0xa5 && page[kPageSize - 1] == 0x6c ? 0 : 4);
+}
+
+}  // namespace
+
+TEST(OomKiller, HeapDenialSelfVictimRetiresLargeAddressSpace) {
+    bool supported = false;
+    unsigned long long before = 0;
+    ASSERT_EQ(0, read_heap_denial_config(&supported, &before));
+    if (!supported) {
+        GTEST_SKIP() << "requires mm_selftest heap-denial fault injection";
+    }
+    OomFaultInjectGuard injection;
+    HeapDenialParentProtection protection;
+    ASSERT_EQ(0, protection.Protect());
+    pid_t pid = fork();
+    ASSERT_GE(pid, 0);
+    if (pid == 0) {
+        heap_denial_selfkill();
+    }
+    HeapDenialChild child(pid);
+    int status = 0;
+    ASSERT_TRUE(child.Wait(&status)) << "self victim did not finish real MM teardown";
+    ASSERT_TRUE(WIFSIGNALED(status));
+    EXPECT_EQ(SIGKILL, WTERMSIG(status));
+    unsigned long long after = 0;
+    ASSERT_EQ(0, read_heap_denial_config(&supported, &after));
+    ASSERT_TRUE(supported);
+    ASSERT_GE(after, before);
+    EXPECT_GE(after - before, 2ULL) << "GlobalAlloc and alloc_zeroed must both return null";
+}
+
+TEST(OomKiller, HeapDenialOtherVictimAllowsProtectedTriggerRetry) {
+    bool supported = false;
+    unsigned long long before = 0;
+    ASSERT_EQ(0, read_heap_denial_config(&supported, &before));
+    if (!supported) {
+        GTEST_SKIP() << "requires mm_selftest heap-denial fault injection";
+    }
+    OomFaultInjectGuard injection;
+    HeapDenialParentProtection protection;
+    ASSERT_EQ(0, protection.Protect());
+    int ready[2] = {-1, -1};
+    ASSERT_EQ(0, pipe(ready));
+    pid_t victim_pid = fork();
+    if (victim_pid < 0) {
+        close(ready[0]);
+        close(ready[1]);
+        FAIL() << "fork victim failed: " << errno;
+    }
+    if (victim_pid == 0) {
+        close(ready[0]);
+        heap_denial_victim(ready[1]);
+    }
+    HeapDenialChild victim(victim_pid);
+    close(ready[1]);
+    int ready_error = wait_heap_victim_ready(ready[0]);
+    close(ready[0]);
+    ASSERT_EQ(0, ready_error) << "victim must have resident pages before injection";
+    pid_t trigger_pid = fork();
+    ASSERT_GE(trigger_pid, 0);
+    if (trigger_pid == 0) {
+        heap_denial_retry();
+    }
+    HeapDenialChild trigger(trigger_pid);
+    int trigger_status = 0;
+    ASSERT_TRUE(trigger.Wait(&trigger_status)) << "protected OOM trigger failed to recover";
+    ASSERT_TRUE(WIFEXITED(trigger_status));
+    EXPECT_EQ(0, WEXITSTATUS(trigger_status));
+    int victim_status = 0;
+    ASSERT_TRUE(victim.Wait(&victim_status)) << "committed victim did not finish MM teardown";
+    ASSERT_TRUE(WIFSIGNALED(victim_status));
+    EXPECT_EQ(SIGKILL, WTERMSIG(victim_status));
+    unsigned long long after = 0;
+    ASSERT_EQ(0, read_heap_denial_config(&supported, &after));
+    ASSERT_TRUE(supported);
+    ASSERT_GE(after, before);
+    EXPECT_GE(after - before, 2ULL) << "page-fault injection alone cannot satisfy this test";
+}
+
+
+namespace {
+
+struct HeapDenialThreadReady {
+    pid_t tid;
+    int prepared;
+};
+
+void* heap_denial_resident_worker(void* argument) {
+    int ready_fd = *static_cast<int*>(argument);
+    HeapDenialThreadReady ready = {};
+    ready.tid = static_cast<pid_t>(syscall(SYS_gettid));
+    ready.prepared = map_and_touch_pages(kHeapDenialResidentPages) != MAP_FAILED;
+    if (write_exact(ready_fd, &ready, sizeof(ready)) != 0) {
+        _exit(2);
+    }
+    close(ready_fd);
+    if (!ready.prepared) {
+        _exit(2);
+    }
+    for (;;) {
+        pause();
+    }
+}
+
+int wait_heap_thread_ready(int fd, HeapDenialThreadReady* ready) {
+    int flags = fcntl(fd, F_GETFL);
+    if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+        return errno;
+    }
+    size_t received = 0;
+    for (int i = 0; i < kWaitVictimPolls; ++i) {
+        ssize_t count = read(fd, reinterpret_cast<char*>(ready) + received,
+                             sizeof(*ready) - received);
+        if (count > 0) {
+            received += static_cast<size_t>(count);
+            if (received == sizeof(*ready)) {
+                return ready->prepared == 1 && ready->tid > 0 ? 0 : EINVAL;
+            }
+        } else if (count == 0) {
+            return EPIPE;
+        } else if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
+            return errno;
+        }
+        usleep(kWaitVictimPollUs);
+    }
+    return ETIMEDOUT;
+}
+
+int wait_heap_thread_sleeping(pid_t tid) {
+    char path[96];
+    int length = snprintf(path, sizeof(path), "/proc/self/task/%d/stat", tid);
+    if (length <= 0 || length >= static_cast<int>(sizeof(path))) {
+        return EINVAL;
+    }
+    for (int i = 0; i < kWaitVictimPolls; ++i) {
+        int fd = open(path, O_RDONLY | O_CLOEXEC);
+        if (fd < 0) {
+            return errno;
+        }
+        char buffer[512];
+        ssize_t count;
+        do {
+            count = read(fd, buffer, sizeof(buffer) - 1);
+        } while (count < 0 && errno == EINTR);
+        int error = count < 0 ? errno : 0;
+        close(fd);
+        if (error != 0) {
+            return error;
+        }
+        if (count == static_cast<ssize_t>(sizeof(buffer) - 1)) {
+            return EOVERFLOW;
+        }
+        buffer[count] = 0;
+        const char* end_comm = strrchr(buffer, ')');
+        if (end_comm == nullptr || end_comm[1] != ' ' || end_comm[2] == 0) {
+            return EINVAL;
+        }
+        if (end_comm[2] == 'S') {
+            return 0;
+        }
+        usleep(kWaitVictimPollUs);
+    }
+    return ETIMEDOUT;
+}
+
+void heap_denial_multithread_selfkill() {
+    if (write_oom_score_adj_errno(1000) != 0 || expect_current_score(1000) != 0) {
+        _exit(2);
+    }
+    int ready[2] = {-1, -1};
+    if (pipe(ready) != 0) {
+        _exit(2);
+    }
+    pthread_t thread;
+    if (pthread_create(&thread, nullptr, heap_denial_resident_worker, &ready[1]) != 0) {
+        _exit(2);
+    }
+    // Threads share descriptors: only the worker closes its write end.
+    HeapDenialThreadReady worker = {};
+    int error = wait_heap_thread_ready(ready[0], &worker);
+    close(ready[0]);
+    if (error != 0 || wait_heap_thread_sleeping(worker.tid) != 0 ||
+        inject_heap_denial(getpid()) != 0) {
+        _exit(2);
+    }
+    (void)fault_one_page();
+    _exit(3);
+}
+
+}  // namespace
+
+TEST(OomKiller, HeapDenialMultithreadSelfVictimWakesSleepingWorker) {
+    bool supported = false;
+    unsigned long long before = 0;
+    ASSERT_EQ(0, read_heap_denial_config(&supported, &before));
+    if (!supported) {
+        GTEST_SKIP() << "requires mm_selftest heap-denial fault injection";
+    }
+    OomFaultInjectGuard injection;
+    HeapDenialParentProtection protection;
+    ASSERT_EQ(0, protection.Protect());
+    pid_t pid = fork();
+    ASSERT_GE(pid, 0);
+    if (pid == 0) {
+        heap_denial_multithread_selfkill();
+    }
+    HeapDenialChild child(pid);
+    int status = 0;
+    ASSERT_TRUE(child.Wait(&status)) << "OOM must terminate the real sleeping thread group";
+    ASSERT_TRUE(WIFSIGNALED(status));
+    EXPECT_EQ(SIGKILL, WTERMSIG(status));
+    unsigned long long after = 0;
+    ASSERT_EQ(0, read_heap_denial_config(&supported, &after));
+    ASSERT_TRUE(supported);
+    ASSERT_GE(after, before);
+    EXPECT_GE(after - before, 2ULL);
+}
+
+namespace {
+
+struct OomExitedLeaderWorker {
+    int ready_fd;
+    int go_fd;
+};
+
+int wait_oom_leader_zombie() {
+    char path[96];
+    int length = snprintf(path, sizeof(path), "/proc/%d/stat", getpid());
+    if (length <= 0 || length >= static_cast<int>(sizeof(path))) {
+        return EINVAL;
+    }
+    for (int i = 0; i < kWaitVictimPolls; ++i) {
+        int fd = open(path, O_RDONLY | O_CLOEXEC);
+        if (fd < 0) {
+            return errno;
+        }
+        char buffer[512];
+        ssize_t count;
+        do {
+            count = read(fd, buffer, sizeof(buffer) - 1);
+        } while (count < 0 && errno == EINTR);
+        int error = count < 0 ? errno : 0;
+        close(fd);
+        if (error != 0) {
+            return error;
+        }
+        if (count == static_cast<ssize_t>(sizeof(buffer) - 1)) {
+            return EOVERFLOW;
+        }
+        buffer[count] = 0;
+        const char* end_comm = strrchr(buffer, ')');
+        if (end_comm == nullptr || end_comm[1] != ' ' || end_comm[2] == 0) {
+            return EINVAL;
+        }
+        if (end_comm[2] == 'Z') {
+            return 0;
+        }
+        usleep(kWaitVictimPollUs);
+    }
+    return ETIMEDOUT;
+}
+
+void* oom_live_worker_after_leader_exit(void* argument) {
+    // The raw-exited leader's user stack remains mapped while this MM is live;
+    // copy the fixed fd values now rather than borrowing its stack afterwards.
+    const auto args = *static_cast<OomExitedLeaderWorker*>(argument);
+    if (map_and_touch_pages(kHeapDenialResidentPages) == MAP_FAILED ||
+        wait_oom_leader_zombie() != 0 || write_exact(args.ready_fd, "r", 1) != 0) {
+        _exit(2);
+    }
+    close(args.ready_fd);
+    char go = 0;
+    if (read_exact(args.go_fd, &go, 1) != 0 || go != 'g' ||
+        write_oom_fault_inject(getpid(), 0, 1) != 0) {
+        _exit(2);
+    }
+    close(args.go_fd);
+    (void)fault_one_page();
+    _exit(3);
+}
+
+void oom_leader_exits_leaving_worker(int ready_fd, int go_fd) {
+    if (write_oom_score_adj_errno(1000) != 0 || expect_current_score(1000) != 0) {
+        _exit(2);
+    }
+    OomExitedLeaderWorker args = {ready_fd, go_fd};
+    pthread_t thread;
+    if (pthread_create(&thread, nullptr, oom_live_worker_after_leader_exit, &args) != 0) {
+        _exit(2);
+    }
+    // libc _exit is exit_group. Only this raw syscall leaves a live worker.
+    syscall(SYS_exit, 0);
+    _exit(2);
+}
+
+}  // namespace
+
+TEST(OomKiller, LiveWorkerAfterLeaderExitRemainsEligible) {
+    if (access(kOomFaultInjectPath, F_OK) != 0 && errno == ENOENT) {
+        GTEST_SKIP() << "requires DragonOS OOM fault injection";
+    }
+    OomFaultInjectGuard injection;
+    HeapDenialParentProtection protection;
+    ASSERT_EQ(0, protection.Protect());
+    int ready[2] = {-1, -1};
+    int go[2] = {-1, -1};
+    ASSERT_EQ(0, pipe(ready));
+    if (pipe(go) != 0) {
+        int error = errno;
+        close(ready[0]);
+        close(ready[1]);
+        FAIL() << "create worker gate: " << error;
+    }
+    pid_t pid = fork();
+    if (pid < 0) {
+        int error = errno;
+        close(ready[0]);
+        close(ready[1]);
+        close(go[0]);
+        close(go[1]);
+        FAIL() << "fork live-worker group: " << error;
+    }
+    if (pid == 0) {
+        close(ready[0]);
+        close(go[1]);
+        oom_leader_exits_leaving_worker(ready[1], go[0]);
+    }
+    HeapDenialChild child(pid);
+    close(ready[1]);
+    close(go[0]);
+    int ready_error = wait_heap_victim_ready(ready[0]);
+    close(ready[0]);
+    if (ready_error != 0) {
+        close(go[1]);
+        FAIL() << "worker must observe resident MM and Zombie leader: " << ready_error;
+    }
+    int status = 0;
+    pid_t early = child.Poll(&status);
+    if (early != 0) {
+        close(go[1]);
+        FAIL() << "a Zombie leader with a live worker must not be reaped: " << early;
+    }
+    int go_error = write_exact(go[1], "g", 1);
+    close(go[1]);
+    ASSERT_EQ(0, go_error);
+    ASSERT_TRUE(child.Wait(&status)) << "live worker was not OOM-selected after leader exit";
+    ASSERT_TRUE(WIFSIGNALED(status)) << "group SIGKILL must override the leader's earlier exit(0)";
+    EXPECT_EQ(SIGKILL, WTERMSIG(status));
 }

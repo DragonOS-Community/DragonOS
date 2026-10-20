@@ -353,7 +353,9 @@ pub fn update_timer_jiffies(add_jiffies: u64) -> u64 {
     update_wall_time();
 
     compiler_fence(Ordering::SeqCst);
-    return prev + add_jiffies;
+    let now = prev + add_jiffies;
+    crate::mm::page::reclaim_wait::tick(now);
+    return now;
 }
 
 pub fn clock() -> u64 {

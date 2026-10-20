@@ -1,11 +1,12 @@
 use super::{
-    pc_stats, schedule_pagecache_io, Arc, AtomicBool, AtomicU64, AtomicUsize, Box, Duration,
-    FilePrivateData, IndexNode, InodeRetentionGuard, InodeRetentionKind, MMArch,
-    MemoryManagementArch, Mutex, Ordering, Page, PageCache, PageCacheDirtyCertificate,
-    PageCacheManager, PageCacheWritebackProtocol, PageCacheWritebackProtocolState,
-    PageCacheWritebackRange, PageEntry, PageFlags, PageIoWaiter, PageState, SystemError, Vec,
-    VecDeque, WaitQueue, Weak, Work, WorkQueue, WritebackControl, PAGECACHE_IO_WORKERS,
+    pc_stats, schedule_pagecache_io, Arc, AtomicBool, AtomicU64, AtomicUsize, Box, FilePrivateData,
+    IndexNode, InodeRetentionGuard, InodeRetentionKind, MMArch, MemoryManagementArch, Mutex,
+    Ordering, Page, PageCache, PageCacheDirtyCertificate, PageCacheManager,
+    PageCacheWritebackProtocol, PageCacheWritebackProtocolState, PageCacheWritebackRange,
+    PageEntry, PageFlags, PageIoWaiter, PageState, SystemError, Vec, VecDeque, WaitQueue, Weak,
+    Work, WorkQueue, WritebackControl, PAGECACHE_IO_WORKERS,
 };
+use crate::libs::resource_wait::ResourceMutexGuard;
 
 static PAGE_CACHE_WRITEBACK_TAG_EPOCH: AtomicU64 = AtomicU64::new(1);
 const MAX_ASYNC_WRITEBACK_BATCHES: usize = PAGECACHE_IO_WORKERS * 2;
@@ -79,18 +80,22 @@ struct WritebackBudget {
 
 impl WritebackExecutor {
     pub(super) fn try_new() -> Result<Arc<Self>, SystemError> {
-        Ok(Arc::new(Self {
+        Arc::try_new(Self {
             queue: WorkQueue::try_new_owned("pagecache-wb")?,
             budget: Mutex::new(WritebackBudget {
                 in_flight: 0,
                 retries: VecDeque::new(),
             }),
-        }))
+        })
+        .map_err(|_| SystemError::ENOMEM)
+    }
+
+    fn budget(&self) -> ResourceMutexGuard<'_, WritebackBudget> {
+        ResourceMutexGuard::lock(&self.budget)
     }
 
     fn cancel_retry(&self, ticket: &Arc<AsyncWritebackRetryTicket>) {
-        self.budget
-            .lock()
+        self.budget()
             .retries
             .retain(|queued| !Arc::ptr_eq(ticket, queued));
     }
@@ -106,6 +111,14 @@ pub(super) fn unowned_writeback_executor() -> Result<Arc<WritebackExecutor>, Sys
     Ok(slot.as_ref().expect("initialized executor").clone())
 }
 
+pub(super) fn existing_unowned_writeback_executor() -> Option<Arc<WritebackExecutor>> {
+    UNOWNED_WRITEBACK_EXECUTOR
+        .try_lock()
+        .ok()?
+        .as_ref()
+        .cloned()
+}
+
 pub(crate) fn schedule_pagecache_writeback(executor: &WritebackExecutor, work: Arc<Work>) {
     executor.queue.enqueue(work);
 }
@@ -116,7 +129,7 @@ struct AsyncWritebackPermit {
 
 impl AsyncWritebackPermit {
     fn try_acquire(executor: &Arc<WritebackExecutor>) -> Option<Self> {
-        let mut budget = executor.budget.lock();
+        let mut budget = ResourceMutexGuard::try_lock(&executor.budget)?;
         if !budget.retries.is_empty() {
             return None;
         }
@@ -139,7 +152,7 @@ impl AsyncWritebackPermit {
 
     fn acquire_all_for_selftest(executor: &Arc<WritebackExecutor>) -> Vec<Self> {
         ASYNC_WRITEBACK_WAIT.wait_until(|| {
-            let mut budget = executor.budget.lock();
+            let mut budget = executor.budget();
             if !budget.retries.is_empty() || budget.in_flight != 0 {
                 return None;
             }
@@ -159,7 +172,7 @@ impl AsyncWritebackPermit {
             return;
         };
         let permit = {
-            let mut budget = executor.budget.lock();
+            let mut budget = executor.budget();
             if retry.cancelled.load(Ordering::Acquire) {
                 None
             } else if budget.retries.is_empty() {
@@ -184,7 +197,7 @@ impl AsyncWritebackPermit {
 impl Drop for AsyncWritebackPermit {
     fn drop(&mut self) {
         let retry = {
-            let mut budget = self.executor.budget.lock();
+            let mut budget = self.executor.budget();
             let mut next = None;
             while let Some(candidate) = budget.retries.pop_front() {
                 if !candidate.cancelled.load(Ordering::Acquire) {
@@ -201,6 +214,7 @@ impl Drop for AsyncWritebackPermit {
         };
         ASYNC_WRITEBACK_COMPLETIONS.fetch_add(1, Ordering::AcqRel);
         ASYNC_WRITEBACK_WAIT.wake_all();
+        crate::mm::page::reclaim_wait::request_writeback_progress();
         if let Some(retry) = retry {
             // Transfer this exact domain slot, without decrement/reacquire.
             retry.dispatch(AsyncWritebackPermit {
@@ -290,7 +304,7 @@ pub(super) fn run_async_writeback_budget_retry_selftest() -> bool {
         && exact_epoch_rejected
         && coalesced.cancelled.load(Ordering::Acquire)
         && cache.tagged_writeback_budget_retries.lock().is_empty()
-        && executor.budget.lock().retries.is_empty();
+        && executor.budget().retries.is_empty();
     drop(predecessor_page);
     drop(tagged_page);
     drop(cache);
@@ -324,7 +338,7 @@ pub(super) fn run_async_writeback_budget_retry_selftest() -> bool {
     drop(drop_page);
     drop(drop_cache);
     let cache_drop_cancelled =
-        drop_ticket.cancelled.load(Ordering::Acquire) && executor.budget.lock().retries.is_empty();
+        drop_ticket.cancelled.load(Ordering::Acquire) && executor.budget().retries.is_empty();
 
     let first = Arc::new(AsyncWritebackRetryTicket::new(
         &executor,
@@ -339,7 +353,7 @@ pub(super) fn run_async_writeback_budget_retry_selftest() -> bool {
     AsyncWritebackPermit::register_retry(first.clone());
     AsyncWritebackPermit::register_retry(second.clone());
     let queued_fifo = {
-        let budget = executor.budget.lock();
+        let budget = executor.budget();
         let retries = &budget.retries;
         retries.len() == 2
             && retries
@@ -358,7 +372,7 @@ pub(super) fn run_async_writeback_budget_retry_selftest() -> bool {
     drop(permits.pop());
     let fifo_handoff = first.dispatches.load(Ordering::Acquire) == 1
         && second.dispatches.load(Ordering::Acquire) == 1
-        && executor.budget.lock().retries.is_empty();
+        && executor.budget().retries.is_empty();
     drop(permits);
 
     let mut cancel_permits = Vec::with_capacity(MAX_ASYNC_WRITEBACK_BATCHES);
@@ -377,8 +391,8 @@ pub(super) fn run_async_writeback_budget_retry_selftest() -> bool {
     AsyncWritebackPermit::register_retry(cancelled.clone());
     cancelled.cancelled.store(true, Ordering::Release);
     drop(cancel_permits.pop());
-    let cancelled_not_granted = cancelled.dispatches.load(Ordering::Acquire) == 0
-        && executor.budget.lock().retries.is_empty();
+    let cancelled_not_granted =
+        cancelled.dispatches.load(Ordering::Acquire) == 0 && executor.budget().retries.is_empty();
     drop(cancel_permits);
 
     independent
@@ -388,46 +402,20 @@ pub(super) fn run_async_writeback_budget_retry_selftest() -> bool {
         && queued_fifo
         && fifo_handoff
         && cancelled_not_granted
-        && executor.budget.lock().in_flight == 0
+        && executor.budget().in_flight == 0
 }
 
 /// Capture the completion generation before a reclaim scan schedules dirty
-/// writeback.  Pair this with [`wait_for_async_writeback_progress`] so a fast
+/// writeback. The fixed reclaimer pairs it with its prepared progress wait so a fast
 /// completion between the scan and the wait cannot be lost.
 pub(crate) fn async_writeback_progress_snapshot() -> u64 {
     ASYNC_WRITEBACK_COMPLETIONS.load(Ordering::Acquire)
 }
 
-/// Throttle a no-progress reclaim pass until asynchronous writeback advances.
-///
-/// The wait is bounded: a stuck backend must not pin the global reclaimer
-/// forever, because another cache may become reclaimable meanwhile.  Returning
-/// `false` means no blocking wait was performed (the sampled generation had
-/// already advanced, no writeback remained in flight, or the wait was
-/// interrupted); callers should apply a short retry backoff instead of
-/// immediately rescanning the same LRU.
-pub(crate) fn wait_for_async_writeback_progress(observed: u64) -> bool {
-    if ASYNC_WRITEBACK_COMPLETIONS.load(Ordering::Acquire) != observed {
-        return false;
-    }
-    if ASYNC_WRITEBACK_BATCHES.load(Ordering::Acquire) == 0 {
-        return false;
-    }
-
-    const RECLAIM_WRITEBACK_WAIT: Duration = Duration::from_millis(10);
-    let result = ASYNC_WRITEBACK_WAIT.wait_until_timeout(
-        || {
-            if ASYNC_WRITEBACK_COMPLETIONS.load(Ordering::Acquire) != observed
-                || ASYNC_WRITEBACK_BATCHES.load(Ordering::Acquire) == 0
-            {
-                Some(())
-            } else {
-                None
-            }
-        },
-        RECLAIM_WRITEBACK_WAIT,
-    );
-    !matches!(result, Err(SystemError::ERESTARTSYS))
+/// Snapshot only: the fixed background reclaimer owns its prepared waiting
+/// resources and bounded pause policy, rather than allocating an I/O timer here.
+pub(crate) fn async_writeback_in_flight() -> bool {
+    ASYNC_WRITEBACK_BATCHES.load(Ordering::Acquire) != 0
 }
 
 struct ReclaimerRunnerGuard {
@@ -2009,7 +1997,7 @@ impl PageCacheManager {
         }
 
         for (_page_index, entry, _page) in batch.entries.drain(..) {
-            entry.wait_queue.wake_all();
+            entry.notify_waiters();
             Self::dispatch_writeback_incarnation_retries(
                 &batch.cache,
                 &entry,
@@ -4882,8 +4870,7 @@ impl PageCacheManager {
         let Some(runner) = ReclaimerRunnerGuard::try_acquire(&cache) else {
             return Ok(false);
         };
-        let executor = cache.writeback_executor()?;
-        let Some(permit) = AsyncWritebackPermit::try_acquire(&executor) else {
+        let Some(executor) = cache.existing_writeback_executor()? else {
             return Ok(false);
         };
         let inode = cache
@@ -4891,82 +4878,89 @@ impl PageCacheManager {
             .and_then(|inode| inode.upgrade())
             .ok_or(SystemError::EIO)?;
         let manager = self.clone();
-        let work_state = Mutex::new(Some((runner, permit, domain_io, cache, inode)));
-        schedule_pagecache_writeback(
-            &executor,
-            Work::new(move || {
-                let Some((runner, permit, domain_io, cache, inode)) = work_state.lock().take()
-                else {
-                    return;
+        // Every fallible object is prepared before owning a domain slot. An
+        // allocation failure must not enter Permit::drop and dispatch a retry.
+        let work_state = Arc::try_new(Mutex::new(None)).map_err(|_| SystemError::ENOMEM)?;
+        let prepared_state = work_state.clone();
+        let work = Work::try_new(move || {
+            let Some((runner, permit, domain_io, cache, inode)) = prepared_state.lock().take()
+            else {
+                return;
+            };
+            let _runner = runner;
+            let _permit = permit;
+            let _domain_io: Option<super::PageCacheDomainIoPermit> = domain_io;
+            // Drain the caller's bounded scan range in file-offset order.
+            // Keeping one runner per cache prevents overlapping reclaimer
+            // workers, while advancing after each submitted batch avoids the
+            // former one-batch-per-5-second throughput ceiling. A page dirtied
+            // again behind the cursor is intentionally left for a later scan.
+            let mut cursor = start_index;
+            while cursor <= end_index {
+                let claim = match manager.try_claim_next_batch_with_admission(
+                    &cache,
+                    &inode,
+                    cursor,
+                    end_index,
+                    _domain_io.as_ref(),
+                ) {
+                    Ok(claim) => claim,
+                    Err(_) => break,
                 };
-                let _runner = runner;
-                let _permit = permit;
-                let _domain_io = domain_io;
-                // Drain the caller's bounded scan range in file-offset order.
-                // Keeping one runner per cache prevents overlapping reclaimer
-                // workers, while advancing after each submitted batch avoids the
-                // former one-batch-per-5-second throughput ceiling. A page dirtied
-                // again behind the cursor is intentionally left for a later scan.
-                let mut cursor = start_index;
-                while cursor <= end_index {
-                    let claim = match manager.try_claim_next_batch_with_admission(
-                        &cache,
-                        &inode,
-                        cursor,
-                        end_index,
-                        _domain_io.as_ref(),
-                    ) {
-                        Ok(claim) => claim,
-                        Err(_) => break,
-                    };
-                    let batch = match claim {
-                        WritebackClaimOutcome::Claimed(batch) => batch,
-                        WritebackClaimOutcome::NoBatch => break,
-                        WritebackClaimOutcome::Deferred(progress) => {
-                            // Reclaim must not wait, but it must not discard the
-                            // producer edge either.  Re-enter this try-only path
-                            // after progress so WRITE-only users are not reliant
-                            // on an unrelated future reclaim round.
-                            Self::schedule_reclaimer_deferred_retry(
-                                progress,
-                                manager.clone(),
-                                start_index,
-                                end_index,
-                            );
-                            break;
-                        }
-                        // The failure was already published and the claimed
-                        // pages returned to Dirty; reclaim has no additional
-                        // completion or errseq work to perform.
-                        WritebackClaimOutcome::FailedRecorded(_) => break,
-                    };
-                    let Some(last_index) = batch.entries.last().map(|(index, _, _)| *index) else {
+                let batch = match claim {
+                    WritebackClaimOutcome::Claimed(batch) => batch,
+                    WritebackClaimOutcome::NoBatch => break,
+                    WritebackClaimOutcome::Deferred(progress) => {
+                        // Reclaim must not wait, but it must not discard the
+                        // producer edge either.  Re-enter this try-only path
+                        // after progress so WRITE-only users are not reliant
+                        // on an unrelated future reclaim round.
+                        Self::schedule_reclaimer_deferred_retry(
+                            progress,
+                            manager.clone(),
+                            start_index,
+                            end_index,
+                        );
                         break;
-                    };
-                    match Self::submit_writeback_batch(batch) {
-                        Ok(
-                            WritebackSubmitOutcome::Completed | WritebackSubmitOutcome::Submitted,
-                        ) if last_index != usize::MAX => {
-                            cursor = last_index + 1;
-                        }
-                        Ok(
-                            WritebackSubmitOutcome::Completed | WritebackSubmitOutcome::Submitted,
-                        ) => break,
-                        Ok(WritebackSubmitOutcome::Failed(_)) => break,
-                        Ok(WritebackSubmitOutcome::Deferred(progress)) => {
-                            Self::schedule_reclaimer_deferred_retry(
-                                progress,
-                                manager.clone(),
-                                start_index,
-                                end_index,
-                            );
-                            break;
-                        }
-                        Err(_) => break,
                     }
+                    // The failure was already published and the claimed
+                    // pages returned to Dirty; reclaim has no additional
+                    // completion or errseq work to perform.
+                    WritebackClaimOutcome::FailedRecorded(_) => break,
+                };
+                let Some(last_index) = batch.entries.last().map(|(index, _, _)| *index) else {
+                    break;
+                };
+                match Self::submit_writeback_batch(batch) {
+                    Ok(WritebackSubmitOutcome::Completed | WritebackSubmitOutcome::Submitted)
+                        if last_index != usize::MAX =>
+                    {
+                        cursor = last_index + 1;
+                    }
+                    Ok(WritebackSubmitOutcome::Completed | WritebackSubmitOutcome::Submitted) => {
+                        break
+                    }
+                    Ok(WritebackSubmitOutcome::Failed(_)) => break,
+                    Ok(WritebackSubmitOutcome::Deferred(progress)) => {
+                        Self::schedule_reclaimer_deferred_retry(
+                            progress,
+                            manager.clone(),
+                            start_index,
+                            end_index,
+                        );
+                        break;
+                    }
+                    Err(_) => break,
                 }
-            }),
-        );
+            }
+        })?;
+        let Some(permit) = AsyncWritebackPermit::try_acquire(&executor) else {
+            return Ok(false);
+        };
+        // Admission is the last step: no allocation or fallible operation
+        // occurs between storing the permit and publishing the prepared work.
+        *work_state.lock() = Some((runner, permit, domain_io, cache, inode));
+        schedule_pagecache_writeback(&executor, work);
         Ok(true)
     }
 }
@@ -4977,7 +4971,7 @@ impl PageCacheManager {
     }
 
     pub(super) fn wait_writeback_entry(entry: Arc<PageEntry>) -> Result<(), SystemError> {
-        entry.wait_queue.wait_until(|| match entry.state() {
+        entry.wait_until(|| match entry.state() {
             PageState::Writeback => None,
             PageState::Error => Some(Err(SystemError::EIO)),
             _ => Some(Ok(())),
@@ -4988,9 +4982,7 @@ impl PageCacheManager {
         entry: Arc<PageEntry>,
         observed_incarnation: u64,
     ) -> Result<(), SystemError> {
-        entry
-            .wait_queue
-            .wait_until(|| Self::writeback_incarnation_result(&entry, observed_incarnation))
+        entry.wait_until(|| Self::writeback_incarnation_result(&entry, observed_incarnation))
     }
 
     pub(super) fn writeback_incarnation_result(
@@ -5052,7 +5044,7 @@ impl PageCacheManager {
             let mut inner = cache.inner.lock();
             Self::redirty_writeback_entry_locked(&mut inner, page_index, &entry, remaining_blocks);
         }
-        entry.wait_queue.wake_all();
+        entry.notify_waiters();
         Self::dispatch_writeback_incarnation_retries(&cache, &entry, completed);
     }
 
@@ -5099,7 +5091,7 @@ impl PageCacheManager {
                     remaining_blocks,
                 );
             }
-            entry.wait_queue.wake_all();
+            entry.notify_waiters();
             Self::dispatch_writeback_incarnation_retries(&cache, &entry, completed_incarnation);
             return Err(e);
         }
@@ -5141,7 +5133,7 @@ impl PageCacheManager {
                     PageState::UpToDate
                 });
                 drop(inner);
-                entry.wait_queue.wake_all();
+                entry.notify_waiters();
                 Self::dispatch_writeback_incarnation_retries(&cache, &entry, completed_incarnation);
                 drop(cache.detach_dirty_retention_if_idle());
                 return result;
@@ -5166,7 +5158,7 @@ impl PageCacheManager {
                 entry.set_state(PageState::UpToDate);
             }
         }
-        entry.wait_queue.wake_all();
+        entry.notify_waiters();
         Self::dispatch_writeback_incarnation_retries(&cache, &entry, completed_incarnation);
         drop(cache.detach_dirty_retention_if_idle());
         result

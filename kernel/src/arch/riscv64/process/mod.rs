@@ -194,6 +194,8 @@ impl ProcessManager {
             _ => false,
         };
 
+        let retire_lazy_mm = prev_user_vm.is_none() && next_addr_space.is_some() && !same_mm;
+
         if let Some(next_mm) = next_addr_space {
             if !same_mm {
                 next_mm.active_cpus_set(cpu);
@@ -212,6 +214,15 @@ impl ProcessManager {
                 }
             }
             unsafe { crate::mm::tlb::tlb_state_set_loaded_mm(next_mm.clone()) };
+        }
+        // Do not strand temporary owners on a terminal switched-out stack.
+        drop(prev_user_vm);
+        if retire_lazy_mm {
+            if let Some(mm) = prev_active_mm {
+                crate::mm::lazy_mm_drop::enqueue(mm);
+            }
+        } else {
+            drop(prev_active_mm);
         }
         compiler_fence(Ordering::SeqCst);
 

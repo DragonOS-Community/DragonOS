@@ -21,6 +21,7 @@ use crate::exception::workqueue::{schedule_work, Work, WorkQueue};
 use crate::libs::errseq::{ErrSeq, ErrSeqValue};
 use crate::libs::lazy_init::Lazy;
 use crate::libs::mutex::MutexGuard;
+use crate::libs::resource_wait;
 use crate::libs::rwsem::{RwSem, RwSemReadGuard, RwSemWriteGuard};
 use crate::libs::spinlock::SpinLock;
 use crate::libs::wait_queue::WaitQueue;
@@ -70,11 +71,12 @@ pub(crate) use migration::PageCacheMigrationGuard;
 use ordered_index::{CacheIndex, Node as CacheIndexNode};
 pub use read_batch::{PageCacheReadBatchCompletion, PageCacheReadBatchRequest};
 pub use read_dma::PageCacheReadDmaReservation;
+#[cfg(feature = "mm_selftest")]
+pub(crate) use selftest::heap_denied_entry_wait_selftest;
 pub(crate) use selftest::{run_accounting_debug_selftest, run_completion_domain_debug_selftest};
 pub(crate) use writeback::{
-    async_writeback_progress_snapshot, schedule_pagecache_writeback,
-    wait_for_async_writeback_progress, PageCacheDomainWriteback, PageCacheWritebackDispatchOutcome,
-    DOMAIN_WRITEBACK_WINDOW,
+    async_writeback_in_flight, async_writeback_progress_snapshot, schedule_pagecache_writeback,
+    PageCacheDomainWriteback, PageCacheWritebackDispatchOutcome, DOMAIN_WRITEBACK_WINDOW,
 };
 use writeback::{
     run_async_writeback_budget_retry_selftest, run_submitted_writeback_selftest,
@@ -399,6 +401,7 @@ pub struct PageCacheWritebackDomain {
     state: SpinLock<PageCacheWritebackDomainState>,
     drained: Completion,
     writeback_executor: Mutex<Option<Arc<WritebackExecutor>>>,
+    prepare_writeback_on_bind: bool,
 }
 
 pub(crate) trait PageCacheDomainMember: Send + Sync {
@@ -420,6 +423,17 @@ impl core::fmt::Debug for PageCacheWritebackDomain {
 
 impl PageCacheWritebackDomain {
     pub fn new() -> Arc<Self> {
+        Self::with_writeback_preparation(true)
+    }
+
+    /// Shmem keeps the same identity/admission domain, without reserving a
+    /// backing-I/O worker at mount time (including early bootstrap mounts).
+    /// Explicit normal writeback retains the existing lazy accessor behavior.
+    pub fn new_shmem() -> Arc<Self> {
+        Self::with_writeback_preparation(false)
+    }
+
+    fn with_writeback_preparation(prepare_writeback_on_bind: bool) -> Arc<Self> {
         Arc::new(Self {
             registry: Mutex::new(Vec::new()),
             state: SpinLock::new(PageCacheWritebackDomainState {
@@ -430,6 +444,7 @@ impl PageCacheWritebackDomain {
             }),
             drained: Completion::new(),
             writeback_executor: Mutex::new(None),
+            prepare_writeback_on_bind,
         })
     }
 
@@ -443,11 +458,27 @@ impl PageCacheWritebackDomain {
         Ok(slot.as_ref().expect("initialized executor").clone())
     }
 
+    fn existing_writeback_executor(&self) -> Option<Arc<WritebackExecutor>> {
+        self.writeback_executor.try_lock().ok()?.as_ref().cloned()
+    }
+
     pub fn bind(
         &self,
         owner: &Arc<dyn FileSystem>,
         superblock: &Arc<SuperBlockState>,
     ) -> Result<(), SystemError> {
+        let prepare = {
+            let state = self.state.lock_irqsave();
+            if state.binding.is_none() && state.admission != DomainAdmission::Active {
+                return Err(SystemError::EINVAL);
+            }
+            state.binding.is_none()
+        };
+        // Prepare this dependency domain's original worker before making the
+        // binding visible to reclaim. Never create it under the state spinlock.
+        if prepare && self.prepare_writeback_on_bind {
+            self.writeback_executor()?;
+        }
         let mut state = self.state.lock_irqsave();
         match state.binding.as_ref() {
             None if state.admission == DomainAdmission::Active => {
@@ -669,6 +700,11 @@ lazy_static! {
 
 pub(crate) fn init_read_completion_queue() {
     lazy_static::initialize(&READ_COMPLETION_WQ);
+}
+
+/// The fallback has its own dependency domain, prepared before user workloads.
+pub(crate) fn init_writeback_executor() -> Result<(), SystemError> {
+    writeback::unowned_writeback_executor().map(|_| ())
 }
 
 pub(crate) fn schedule_read_completion(work: Arc<Work>) {
@@ -1151,7 +1187,6 @@ struct PageEntryState {
     accounting: AtomicU8,
     accounted_unevictable: AtomicBool,
     active_users: AtomicUsize,
-    wait_queue: WaitQueue,
 }
 
 struct CacheTableCapacity {
@@ -1987,7 +2022,6 @@ impl PageEntry {
                 accounting: AtomicU8::new(PageEntryAccounting::Unaccounted as u8),
                 accounted_unevictable: AtomicBool::new(false),
                 active_users: AtomicUsize::new(0),
-                wait_queue: WaitQueue::default(),
             })
             .map_err(|_| MemoryAllocationError::System(SystemError::ENOMEM))?;
         Ok(Self { storage })
@@ -2200,8 +2234,26 @@ impl PageEntry {
         self.active_users.load(Ordering::Acquire)
     }
 
+    /// The state byte is an owner-stable, non-ZST identity in OwnedBox storage.
+    /// Callers pin this entry for the complete registration; no wait may outlive
+    /// that borrow. Sharing the key across predicates requires broadcast wakes.
+    fn wait_key(&self) -> usize {
+        &self.state as *const AtomicU8 as usize
+    }
+
+    /// Loading, writeback and active-user waits must not allocate a waiter at
+    /// the point where a fault or reclaim has already exhausted memory.
+    fn wait_until<R>(&self, condition: impl FnMut() -> Option<R>) -> R {
+        resource_wait::wait_for_resource(self.wait_key(), false, condition)
+            .expect("uninterruptible page-entry wait failed")
+    }
+
+    fn notify_waiters(&self) {
+        resource_wait::notify_resource_all(self.wait_key());
+    }
+
     fn wait_inactive(&self) {
-        self.wait_queue.wait_until(|| {
+        self.wait_until(|| {
             if self.active_users() == 0 {
                 Some(())
             } else {
@@ -2218,7 +2270,7 @@ impl PageEntry {
     }
 
     fn wait_ready(&self) -> Result<Arc<Page>, SystemError> {
-        self.wait_queue.wait_until(|| match self.state() {
+        self.wait_until(|| match self.state() {
             PageState::Loading => None,
             PageState::Error => Some(Err(SystemError::EIO)),
             _ => Some(Ok(self.page.clone())),
@@ -2252,7 +2304,7 @@ impl core::fmt::Debug for PageEntryPin {
 impl Drop for PageEntryPin {
     fn drop(&mut self) {
         if self.entry.active_users.fetch_sub(1, Ordering::AcqRel) == 1 {
-            self.entry.wait_queue.wake_all();
+            self.entry.notify_waiters();
         }
     }
 }
@@ -2627,7 +2679,7 @@ impl PageCache {
                 v
             },
             writeback_domain,
-            i_mmap_rwsem: RwSem::new(()),
+            i_mmap_rwsem: RwSem::new_resource(()),
             invalidate_lock: RwSem::new(()),
             file_vma_seq: AtomicU64::new(0),
             file_vmas: SpinLock::new(FileVmaIndex::default()),
@@ -2714,6 +2766,16 @@ impl PageCache {
                 .ok_or(SystemError::ESTALE)?
                 .writeback_executor(),
             None => writeback::unowned_writeback_executor(),
+        }
+    }
+
+    fn existing_writeback_executor(&self) -> Result<Option<Arc<WritebackExecutor>>, SystemError> {
+        match self.writeback_domain.as_ref() {
+            Some(domain) => Ok(domain
+                .upgrade()
+                .ok_or(SystemError::ESTALE)?
+                .existing_writeback_executor()),
+            None => Ok(writeback::existing_unowned_writeback_executor()),
         }
     }
 
@@ -3302,12 +3364,12 @@ impl PageCache {
         match populate_result {
             Ok(()) => {
                 entry.set_state(PageState::UpToDate);
-                entry.wait_queue.wake_all();
+                entry.notify_waiters();
                 Ok((entry, true))
             }
             Err(e) => {
                 entry.set_state(PageState::Error);
-                entry.wait_queue.wake_all();
+                entry.notify_waiters();
                 self.remove_failed_entry(page_index, &entry);
                 Err(e.into())
             }
@@ -3494,7 +3556,7 @@ impl PageCache {
                     entry_clone.set_state(PageState::Error);
                 }
             }
-            entry_clone.wait_queue.wake_all();
+            entry_clone.notify_waiters();
         });
         waiter.register_terminal(Box::new(move |result| {
             if let Some((_, read_len)) = terminal_state.lock_irqsave().as_mut() {
@@ -3690,12 +3752,12 @@ impl PageCache {
         match populate_result {
             Ok(()) => {
                 entry.set_state(PageState::UpToDate);
-                entry.wait_queue.wake_all();
+                entry.notify_waiters();
                 Ok(entry.page.clone())
             }
             Err(e) => {
                 entry.set_state(PageState::Error);
-                entry.wait_queue.wake_all();
+                entry.notify_waiters();
                 self.remove_failed_entry(page_index, &entry);
                 Err(e.into())
             }
@@ -3799,13 +3861,13 @@ impl PageCache {
             match populate_result {
                 Ok(()) => {
                     entry.set_state(PageState::UpToDate);
-                    entry.wait_queue.wake_all();
+                    entry.notify_waiters();
                     self.prepare_subpage_blocks(page_index, &entry, None)?;
                     return Ok(entry.page.clone());
                 }
                 Err(e) => {
                     entry.set_state(PageState::Error);
-                    entry.wait_queue.wake_all();
+                    entry.notify_waiters();
                     self.remove_failed_entry(page_index, &entry);
                     return Err(e.into());
                 }
@@ -4210,7 +4272,7 @@ impl PageCache {
             guard.set_index(page_index, 1, true);
             guard.set_index(page_index, 2, false);
             entry.set_state(PageState::Dirty);
-            entry.wait_queue.wake_all();
+            entry.notify_waiters();
         }
     }
 

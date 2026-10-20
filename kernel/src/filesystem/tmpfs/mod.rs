@@ -1272,7 +1272,7 @@ impl Tmpfs {
         Self::new_with_size_limit(
             mount_data.mode.unwrap_or_else(Self::default_root_mode),
             size_limit,
-            Some(PageCacheWritebackDomain::new()),
+            Some(PageCacheWritebackDomain::new_shmem()),
             mount_data.uid.unwrap_or(uid),
             mount_data.gid.unwrap_or(gid),
             owner,

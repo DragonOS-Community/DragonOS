@@ -27,7 +27,7 @@ use crate::{
     process::{
         exit::wstatus_to_waitid_exit_info, kthread::KernelThreadMechanism,
         namespace::user_namespace::from_kuid_munged, pid::PidType, ptrace, ProcessControlBlock,
-        ProcessFlags, ProcessManager, ProcessState, RawPid,
+        ProcessManager, ProcessState, RawPid,
     },
     sched::{cputime::ns_to_clock_t, SchedMode, __schedule_with_current},
     smp::core::smp_get_processor_id,
@@ -454,6 +454,10 @@ impl ProcessManager {
             }
             Self::release_old_user_vm_if_last(old_user_vm.as_ref());
             drop(old_user_vm);
+            // Shared-MM non-last users do not enter unmap_all; their core
+            // participation is complete before ordinary file-close callbacks.
+            #[cfg(feature = "mm_selftest")]
+            crate::mm::oom::denial::end_victim_core_retirement();
 
             pcb.exit_files();
             // Linux exit_fs() follows exit_files(). A zombie must not keep
@@ -564,55 +568,13 @@ impl ProcessManager {
             //    shared signal_state. If another thread has already set it, reuse
             //    the existing exit code.
             let signal_state = current_pcb.process_signal();
-            final_exit_code = signal_state.start_group_exit(exit_code);
-
-            // 2. Send SIGKILL to other threads in the same thread group,
-            //    waking and forcefully terminating them. Mirroring Linux
-            //    zap_other_threads semantics, this only delivers SIGKILL; the
-            //    actual exit happens in each thread's own context.
-            {
-                let send_sigkill_thread = |task: Arc<ProcessControlBlock>| {
-                    if task.flags().contains(ProcessFlags::EXITING) {
-                        return;
-                    }
-                    Signal::queue_private_sigkill_to_thread(&task);
-                };
-
-                // Obtain the full thread list from the thread group leader's
-                // ThreadInfo to avoid missing threads when viewed from a
-                // non-leader thread (where group_tasks may be empty).
-                let leader = {
-                    let ti = current_pcb.thread.read_irqsave();
-                    ti.group_leader().unwrap_or_else(|| current_pcb.clone())
-                };
-
-                let group_tasks = {
-                    let ti = leader.threads_read_irqsave();
-                    ti.group_tasks.clone()
-                };
-
-                // First, send SIGKILL to the group leader (if the current
-                // thread is not the leader).
-                if !Arc::ptr_eq(&leader, &current_pcb)
-                    && !leader.flags().contains(ProcessFlags::EXITING)
-                {
-                    send_sigkill_thread(leader.clone());
-                }
-
-                // Then iterate over the group_tasks maintained by the leader
-                // and send SIGKILL to other threads.
-                for weak in group_tasks {
-                    if let Some(task) = weak.upgrade() {
-                        // Skip the current thread itself.
-                        if task.raw_pid() == current_pcb.raw_pid() {
-                            continue;
-                        }
-                        if task.flags().contains(ProcessFlags::EXITING) {
-                            continue;
-                        }
-                        send_sigkill_thread(task);
-                    }
-                }
+            let (code, started) = signal_state.start_group_exit(exit_code);
+            final_exit_code = code;
+            // Linux only zaps on the first GROUP_EXIT transition. OOM/fatal
+            // signal commit has already broadcast; later exiting threads must
+            // not allocate another snapshot or repeat an O(n) broadcast each.
+            if started {
+                Signal::zap_other_threads(&current_pcb);
             }
 
             drop(current_pcb);

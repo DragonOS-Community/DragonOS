@@ -127,7 +127,10 @@ impl ResponseBufferPool {
             return Ok(buf);
         }
 
-        let buf = DeviceOutputBuffer::new(len, virt_to_phys).map_err(|_| SystemError::EIO)?;
+        let buf = DeviceOutputBuffer::new(len, virt_to_phys).map_err(|error| match error {
+            BufferError::OutOfMemory => SystemError::ENOMEM,
+            _ => SystemError::EIO,
+        })?;
         stats::on_virtiofs_response_buffer_alloc(opcode, len);
         stats::on_virtiofs_response_buffer_zero(opcode, len);
         Ok(buf)

@@ -12,6 +12,7 @@ pub mod lib_ui;
 pub mod mutex;
 pub mod notifier;
 pub mod once;
+pub(crate) mod resource_wait;
 #[macro_use]
 pub mod printk;
 pub mod rbtree;

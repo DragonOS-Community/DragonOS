@@ -207,6 +207,8 @@ pub struct ProcessControlBlockData {
     /// Serializes task-local pointer publication for RCU-protected metadata
     /// such as `cred`, `nsproxy`, and `sighand`.
     pub(super) task_lock: SpinLock<()>,
+    /// Intrusive allocation-free global OOM wait registration.
+    pub(crate) resource_wait_link: SpinLock<crate::libs::resource_wait::ResourceWaitLink>,
     pub(super) worker_private: SpinLock<Option<WorkerPrivate>>,
     /// Kernel stack of the process.
     pub(super) kernel_stack: RwLock<KernelStack>,
@@ -908,6 +910,7 @@ impl ProcessControlBlock {
                 flags,
                 visible_thread_accounted: AtomicBool::new(false),
                 task_lock: SpinLock::new(()),
+                resource_wait_link: SpinLock::new(Default::default()),
                 kernel_stack: RwLock::new(kstack),
                 syscall_stack: RwLock::new(syscall_stack),
                 worker_private: SpinLock::new(None),

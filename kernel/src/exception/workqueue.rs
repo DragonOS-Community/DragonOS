@@ -1,6 +1,6 @@
 use alloc::{
     boxed::Box,
-    string::ToString,
+    string::{String, ToString},
     sync::{Arc, Weak},
 };
 use core::{
@@ -12,12 +12,21 @@ use log;
 use system_error::SystemError;
 
 use crate::{
-    libs::{spinlock::SpinLock, wait_queue::WaitQueue},
+    libs::{resource_wait, spinlock::SpinLock},
     process::{
         kthread::{KernelThreadClosure, KernelThreadMechanism},
         ProcessControlBlock,
     },
 };
+
+#[cfg(feature = "mm_selftest")]
+#[path = "workqueue/selftest.rs"]
+mod selftest;
+
+#[cfg(feature = "mm_selftest")]
+pub(crate) fn heap_denied_workqueue_selftest() -> Result<bool, SystemError> {
+    selftest::run()
+}
 
 /// Represents a work item to be executed in a workqueue.
 pub struct Work {
@@ -37,6 +46,20 @@ impl Work {
             next: SpinLock::new(None),
             pending: AtomicBool::new(false),
         })
+    }
+
+    /// Prepare a work item before acquiring resources needed by its callback.
+    pub fn try_new<F>(f: F) -> Result<Arc<Self>, SystemError>
+    where
+        F: Fn() + Send + Sync + 'static,
+    {
+        let func: Box<dyn Fn() + Send + Sync> = Box::try_new(f).map_err(|_| SystemError::ENOMEM)?;
+        Arc::try_new(Self {
+            func,
+            next: SpinLock::new(None),
+            pending: AtomicBool::new(false),
+        })
+        .map_err(|_| SystemError::ENOMEM)
     }
 
     /// Execute the work item.
@@ -62,7 +85,7 @@ struct WorkList {
 /// A workqueue that manages a list of works and a worker thread.
 pub struct WorkQueue {
     queue: SpinLock<WorkList>,
-    wait_queue: Arc<WaitQueue>,
+    wake_token: Arc<AtomicBool>,
     worker: SpinLock<Option<Arc<ProcessControlBlock>>>,
 }
 
@@ -78,7 +101,7 @@ impl WorkQueue {
     pub fn new(name: &str) -> Arc<Self> {
         let wq = Arc::new(Self {
             queue: SpinLock::new(WorkList::default()),
-            wait_queue: Arc::new(WaitQueue::default()),
+            wake_token: Arc::new(AtomicBool::new(false)),
             worker: SpinLock::new(None),
         });
 
@@ -101,17 +124,25 @@ impl WorkQueue {
     /// retain its owner for this purpose. Unlike `new`, the sleeping worker
     /// does not keep the queue or its owner alive indefinitely.
     pub fn try_new_owned(name: &str) -> Result<Arc<Self>, SystemError> {
-        let wq = Arc::new(Self {
+        let wake_token = Arc::try_new(AtomicBool::new(false)).map_err(|_| SystemError::ENOMEM)?;
+        let wq = Arc::try_new(Self {
             queue: SpinLock::new(WorkList::default()),
-            wait_queue: Arc::new(WaitQueue::default()),
+            wake_token,
             worker: SpinLock::new(None),
-        });
+        })
+        .map_err(|_| SystemError::ENOMEM)?;
         let queue = Arc::downgrade(&wq);
-        let wait_queue = wq.wait_queue.clone();
-        let closure = Box::new(move || owned_worker_loop(queue.clone(), wait_queue.clone()));
+        let wake_token = wq.wake_token.clone();
+        let closure = Box::try_new(move || owned_worker_loop(queue.clone(), wake_token.clone()))
+            .map_err(|_| SystemError::ENOMEM)?;
+        let mut worker_name = String::new();
+        worker_name
+            .try_reserve_exact(name.len())
+            .map_err(|_| SystemError::ENOMEM)?;
+        worker_name.push_str(name);
         KernelThreadMechanism::create_and_run(
             KernelThreadClosure::EmptyClosure((closure, ())),
-            name.to_string(),
+            worker_name,
         )
         .ok_or(SystemError::ENOMEM)?;
         Ok(wq)
@@ -134,7 +165,7 @@ impl WorkQueue {
         }
         queue.tail = Some(new_tail);
         drop(queue);
-        self.wait_queue.wakeup(None);
+        self.notify_worker();
     }
 
     fn pop(&self) -> Option<Arc<Work>> {
@@ -150,50 +181,55 @@ impl WorkQueue {
         Some(work)
     }
 
-    fn is_empty(&self) -> bool {
-        self.queue.lock().head.is_none()
+    fn notify_worker(&self) {
+        self.wake_token.store(true, Ordering::Release);
+        resource_wait::notify_resource_all(Arc::as_ptr(&self.wake_token) as usize);
     }
 }
 
 impl Drop for WorkQueue {
     fn drop(&mut self) {
         // An owned worker waits without holding a strong queue reference.
-        self.wait_queue.wakeup(None);
+        self.notify_worker();
     }
 }
 
-fn owned_worker_loop(queue: Weak<WorkQueue>, wait_queue: Arc<WaitQueue>) -> i32 {
+fn wait_for_work(wake_token: &AtomicBool, interruptible: bool) -> Result<(), SystemError> {
+    // Only the scalar token is examined under the wait protocol. In particular,
+    // a temporary last queue owner must not be destroyed in this predicate.
+    resource_wait::wait_for_resource(
+        wake_token as *const AtomicBool as usize,
+        interruptible,
+        || wake_token.swap(false, Ordering::AcqRel).then_some(()),
+    )
+}
+
+fn owned_worker_loop(queue: Weak<WorkQueue>, wake_token: Arc<AtomicBool>) -> i32 {
     loop {
-        // Acquire the work in the predicate, then drop the temporary queue
-        // owner before sleeping or running it. Register-before-check in
-        // wait_until covers both enqueue and last-owner destruction wakeups.
-        let work = wait_queue.wait_until(|| match queue.upgrade() {
-            Some(queue) => queue.pop().map(Some),
-            None => Some(None),
-        });
-        match work {
-            Some(work) => work.run(),
-            None => return 0,
+        let Some(owner) = queue.upgrade() else {
+            return 0;
+        };
+        let work = owner.pop();
+        // Weak ownership lets dropping the last external queue owner wake and
+        // terminate an idle worker. All owner retirement stays outside wait.
+        drop(owner);
+        if let Some(work) = work {
+            work.run();
+            continue;
         }
+        wait_for_work(&wake_token, false).expect("owned workqueue wait failed");
     }
 }
 
-/// The main loop for the worker thread.
+/// The main loop for the permanently owned worker thread.
 fn worker_loop(wq: Arc<WorkQueue>) -> i32 {
     loop {
-        // Wait for work
-        let _ = wq
-            .wait_queue
-            .wait_event_interruptible(|| !wq.is_empty(), None::<fn()>);
-
-        // Process works
-        loop {
-            let work = wq.pop();
-            match work {
-                Some(w) => w.run(),
-                None => break,
-            }
+        while let Some(work) = wq.pop() {
+            work.run();
         }
+        // Preserve the ordinary worker's interruptible wait. A notification
+        // remembered between the empty check and registration avoids lost work.
+        let _ = wait_for_work(&wq.wake_token, true);
     }
 }
 

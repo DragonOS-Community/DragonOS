@@ -41,26 +41,31 @@ impl UserMappings {
     }
 
     fn attach_vma(&self, vma: &Arc<LockedVMA>) {
-        let vm_file = {
+        let (registered, vm_file) = {
             let mut guard = vma.lock();
             if guard.user_address_space.is_none() {
                 guard.user_address_space = Some(self.owner.clone());
             }
-            guard.vm_file.clone()
+            (guard.registered_file_cache.clone(), guard.vm_file.clone())
         };
-        if let Some(file) = vm_file {
-            if let Some(page_cache) = file.inode().page_cache() {
-                page_cache.register_file_vma(vma);
-            }
+        if let Some(page_cache) = registered {
+            // set_owner/reinsertion may attach the same identity again. Keep
+            // its original registration owner, even if the inode cache changed.
+            page_cache.register_file_vma(vma);
+        } else if let Some(page_cache) = vm_file.and_then(|file| file.inode().page_cache()) {
+            page_cache.register_file_vma(vma);
+            // No VMA guard covers i_mmap acquisition. MM publication serializes
+            // this identity's attach/detach; the local Arc pins the new owner.
+            vma.lock().registered_file_cache = Some(page_cache);
         }
     }
 
     fn detach_vma(&self, vma: &Arc<LockedVMA>) {
-        let vm_file = { vma.lock().vm_file.clone() };
-        if let Some(file) = vm_file {
-            if let Some(page_cache) = file.inode().page_cache() {
-                page_cache.unregister_file_vma(vma.id());
-            }
+        let registered = { vma.lock().registered_file_cache.clone() };
+        if let Some(page_cache) = registered {
+            page_cache.unregister_file_vma(vma.id());
+            // Do not take the VMA's pin. This temporary is not a last owner
+            // under MM/PT locks; phase-two VMA retirement releases that pin.
         }
     }
 
@@ -378,13 +383,13 @@ impl UserMappings {
         return Some(vma);
     }
 
-    pub(super) fn take_all_vmas(&mut self) -> Vec<Arc<LockedVMA>> {
-        let vmas = self.vmas.drain().collect::<Vec<_>>();
+    /// Terminal teardown consumes the existing backing without allocating a
+    /// second VMA list or rebuilding a hole tree for an MM with no users.
+    pub(super) fn take_all_vmas_for_teardown(&mut self) -> HashSet<Arc<LockedVMA>> {
+        let vmas = core::mem::take(&mut self.vmas);
         self.vmas_by_start.clear();
         self.reservations.clear();
         self.vm_holes.clear();
-        self.vm_holes
-            .insert(VirtAddr::new(0), MMArch::USER_END_VADDR.data());
         for vma in &vmas {
             self.detach_vma(vma);
         }

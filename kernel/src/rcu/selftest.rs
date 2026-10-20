@@ -10,7 +10,6 @@ use crate::{
     exception::InterruptArch,
     ipc::sighand::SigHand,
     libs::{
-        cpumask::CpuMask,
         notifier::{AtomicNotifierChain, NotifierBlock, NotifyResult},
         spinlock::SpinLock,
     },
@@ -1045,8 +1044,28 @@ fn run_pr1_selftest() -> Result<(), &'static str> {
     outcome
 }
 
-fn run_pr1_on_cpu() -> Result<(), &'static str> {
+// Only private GP/pump state is exercised here: no worker birth, formatting,
+// global context mutation or sleepable synchronize_rcu belongs in this scope.
+fn run_gp_coordination_selftests() -> Result<(), &'static str> {
+    #[cfg(feature = "mm_selftest")]
+    let _scope = crate::mm::oom::denial::Scope::enter(true);
+    #[cfg(feature = "mm_selftest")]
+    if !crate::mm::oom::denial::probe_denied() {
+        return Err("RCU GP heap-denial entry probes succeeded unexpectedly");
+    }
+    cpu_mask::run_selftests()?;
     gp::run_state_machine_selftests()?;
+    run_callback_generation_selftest()?;
+    run_immediate_gp_accounting_selftest()?;
+    #[cfg(feature = "mm_selftest")]
+    if !crate::mm::oom::denial::probe_denied() {
+        return Err("RCU GP heap-denial exit probes succeeded unexpectedly");
+    }
+    Ok(())
+}
+
+fn run_pr1_on_cpu() -> Result<(), &'static str> {
+    run_gp_coordination_selftests()?;
     super::srcu::run_state_machine_selftests()?;
     super::srcu::run_runtime_selftests()?;
     progress::run_progress_selftests()?;
@@ -1072,11 +1091,9 @@ fn run_pr1_on_cpu() -> Result<(), &'static str> {
     }
     context::run_context_selftests()?;
     callback::run_segmented_callback_selftests()?;
-    run_callback_generation_selftest()?;
     run_duplicate_claim_selftest()?;
     run_cpu_hotplug_lifecycle_selftest()?;
     run_cpu_hotplug_concurrent_selftest()?;
-    run_immediate_gp_accounting_selftest()?;
     run_callback_flood_selftest()?;
     run_slow_callback_budget_selftest()?;
     run_reschedule_escalation_selftest()?;
@@ -1277,10 +1294,10 @@ fn run_callback_generation_selftest() -> Result<(), &'static str> {
     let second_head = RcuHead::new();
 
     let first_gp = inner.gp.request_future();
-    if inner
-        .gp
-        .start_requested(CpuMask::from_cpu(cpu0), [0; PerCpu::MAX_CPU_NUM as usize])
-        != first_gp
+    if inner.gp.start_requested(
+        RcuCpuMask::from_cpu(cpu0),
+        [0; PerCpu::MAX_CPU_NUM as usize],
+    ) != first_gp
     {
         return Err("callback generation selftest failed to start its first GP");
     }
@@ -1309,10 +1326,10 @@ fn run_callback_generation_selftest() -> Result<(), &'static str> {
         return Err("callbacks became ready during the GP that preceded admission");
     }
     callbacks.prepare_gp_start(expected_second_gp);
-    if inner
-        .gp
-        .start_requested(CpuMask::from_cpu(cpu1), [0; PerCpu::MAX_CPU_NUM as usize])
-        != expected_second_gp
+    if inner.gp.start_requested(
+        RcuCpuMask::from_cpu(cpu1),
+        [0; PerCpu::MAX_CPU_NUM as usize],
+    ) != expected_second_gp
         || !inner.gp.is_waiting_for(cpu1)
         || callbacks.depth().wait != 2
         || callbacks.has_ready()
@@ -1350,8 +1367,8 @@ fn pump_cpu_lifecycle_model(inner: &mut RcuStateInner) -> bool {
         inner,
         1,
         GracePeriodPumpHooks {
-            waiting_snapshot: |participants: &CpuMask| {
-                (participants.clone(), [0; PerCpu::MAX_CPU_NUM as usize])
+            waiting_snapshot: |participants: &RcuCpuMask| {
+                (*participants, [0; PerCpu::MAX_CPU_NUM as usize])
             },
             credit_context: |_: &mut GracePeriodState| false,
             publish_active: |_| {},
@@ -1372,7 +1389,9 @@ fn run_immediate_gp_accounting_selftest() -> Result<(), &'static str> {
         &mut inner,
         42,
         GracePeriodPumpHooks {
-            waiting_snapshot: |_: &CpuMask| (CpuMask::new(), [0; PerCpu::MAX_CPU_NUM as usize]),
+            waiting_snapshot: |_: &RcuCpuMask| {
+                (RcuCpuMask::new(), [0; PerCpu::MAX_CPU_NUM as usize])
+            },
             credit_context: |_: &mut GracePeriodState| false,
             publish_active: |_| {},
             complete_callbacks: |_| false,
@@ -1648,6 +1667,25 @@ fn run_pr2_selftest() -> Result<(), &'static str> {
     rcu_barrier();
     if new_drops.load(Ordering::SeqCst) != 1 {
         return Err("current slot object was not dropped after slot destruction grace period");
+    }
+
+    let terminal_drops = Arc::new(AtomicUsize::new(0));
+    let mut terminal_slot = RcuArcSlot::new(Arc::new(RcuSelftestDropProbe {
+        id: 13,
+        drops: terminal_drops.clone(),
+    }));
+    // SAFETY: this local slot was never read/published to another context;
+    // this task may retire the probe now and never accesses the slot again.
+    let terminal_owner =
+        unsafe { terminal_slot.take_for_drop() }.ok_or("terminal slot lost its unique owner")?;
+    drop(terminal_owner);
+    if terminal_drops.load(Ordering::SeqCst) != 1 {
+        return Err("terminal exclusive slot owner was not retired synchronously");
+    }
+    drop(terminal_slot);
+    rcu_barrier();
+    if terminal_drops.load(Ordering::SeqCst) != 1 {
+        return Err("terminal slot drop released its owner twice");
     }
 
     let prepared_old_drops = Arc::new(AtomicUsize::new(0));
@@ -1961,13 +1999,35 @@ fn run_pr3_selftest() -> Result<(), &'static str> {
     if prepared_old_drops.load(Ordering::SeqCst) != 1 {
         return Err("prepared optional RCU replacement retained the old object");
     }
-    // SAFETY: transfer the removed slot-owned reference to RCU immediately.
-    let removed = unsafe { prepared_slot.swap(None) }
+    let pinned_current = prepared_slot
+        .load()
         .ok_or("prepared optional RCU slot unexpectedly empty at exit")?;
-    rcu_defer_drop(removed);
+    let final_retire = PreparedRcuArcRetire::prepare()
+        .map_err(|_| "final optional RCU retirement reservation failed")?;
+    let final_retirement = prepared_slot
+        .clear_prepared(final_retire)
+        .ok_or("final optional RCU clear did not retain its owner")?;
+    if prepared_slot.load().is_some() || prepared_new_drops.load(Ordering::SeqCst) != 0 {
+        return Err("prepared optional clear lost its live reader before enqueue");
+    }
+    final_retirement.enqueue();
     rcu_barrier();
-    if prepared_slot.load().is_some() || prepared_new_drops.load(Ordering::SeqCst) != 1 {
-        return Err("prepared optional RCU slot did not release its final owner at exit");
+    if prepared_new_drops.load(Ordering::SeqCst) != 0 {
+        return Err("prepared optional clear dropped a pinned reader");
+    }
+    drop(pinned_current);
+    if prepared_new_drops.load(Ordering::SeqCst) != 1 {
+        return Err("prepared optional clear retained its final reader owner");
+    }
+    let unused_retire = PreparedRcuArcRetire::prepare()
+        .map_err(|_| "empty optional RCU clear reservation failed")?;
+    if prepared_slot.clear_prepared(unused_retire).is_some() {
+        return Err("empty optional RCU clear created a duplicate retirement");
+    }
+    drop(prepared_slot);
+    rcu_barrier();
+    if prepared_new_drops.load(Ordering::SeqCst) != 1 {
+        return Err("prepared optional slot drop retired a cleared owner twice");
     }
 
     run_option_slot_cross_thread_lifecycle_selftest()?;

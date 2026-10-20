@@ -81,6 +81,18 @@ impl UprobeSiteTable {
     }
 }
 
+impl Drop for UprobeSiteTable {
+    fn drop(&mut self) {
+        // SAFETY: this private slot dies with the last AddressSpace owner.
+        // The only with_hit reader (#BP) retains a strong MM reference across
+        // its entire RCU lookup. No such raw reader can survive this Drop;
+        // captured participant/XOL Arcs and historical roots own their pins.
+        // Final MM forgetting already withdrew shared participant roots, and
+        // no table/control/IRQ lock is held while retiring this current root.
+        drop(unsafe { self.hit_snapshot.take_for_drop() });
+    }
+}
+
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UprobeSiteState {
@@ -114,6 +126,8 @@ pub(super) struct UprobeSiteMember {
 
 #[derive(Default)]
 struct UprobeParticipantControl {
+    /// One-shot final-MM withdrawal; ordinary unregister leaves it available.
+    final_retire: Option<crate::rcu::PreparedRcuArcRetire<UprobeParticipantNode>>,
     head: Option<Arc<UprobeParticipantNode>>,
     active: usize,
     stale: usize,
@@ -248,6 +262,25 @@ impl UprobeSite {
     /// Withdraw the published root after the caller has made the breakpoint
     /// unreachable and completed the required TLB rendezvous. Already pinned
     /// roots remain valid through RCU and preserve the old-hit semantics.
+    /// The MM's last owner excludes installation/unregistration writers, but
+    /// external Site/snapshot owners still require the normal RCU grace period.
+    fn withdraw_participants_final(&self) {
+        let (head, prepared) = {
+            let mut control = self.participant_control.lock();
+            let head = control.head.take();
+            control.active = 0;
+            control.stale = 0;
+            (head, control.final_retire.take())
+        };
+        // Final forgetting is terminal. A repeated withdrawal sees both the
+        // consumed spare and an already empty published root, so is a no-op.
+        let retirement = prepared.and_then(|prepared| self.participants.clear_prepared(prepared));
+        drop(head);
+        if let Some(retirement) = retirement {
+            retirement.enqueue();
+        }
+    }
+
     pub(super) fn withdraw_participants(&self) {
         let mut control = self.participant_control.lock();
         control.head = None;
@@ -591,6 +624,14 @@ pub(super) fn uprobe_register_locked(
         return Ok(None);
     }
 
+    // Reserve terminal withdrawal before creating any XOL resources. Failure
+    // therefore leaves no newly exposed mapping/slot requiring rollback.
+    let final_retire = if existing_site.is_none() {
+        Some(crate::rcu::PreparedRcuArcRetire::prepare().map_err(|_| SystemError::ENOMEM)?)
+    } else {
+        None
+    };
+
     let (old_instruction, analysis) = if let Some(site) = existing_site.as_ref() {
         if !Arc::ptr_eq(&site.definition, &consumer.definition) {
             return Err(SystemError::EINVAL.into());
@@ -663,7 +704,10 @@ pub(super) fn uprobe_register_locked(
             insn_analysis: analysis,
             xol_lease: xol_lease.clone(),
             members: Mutex::new(BTreeMap::new()),
-            participant_control: Mutex::new(UprobeParticipantControl::default()),
+            participant_control: Mutex::new(UprobeParticipantControl {
+                final_retire,
+                ..UprobeParticipantControl::default()
+            }),
             participants: crate::rcu::RcuOptionArcSlot::new_none(),
             state: AtomicU8::new(UprobeSiteState::Prepared as u8),
         })
@@ -1338,7 +1382,7 @@ pub(crate) fn uprobe_forget_address_space(mm: &AddressSpace) {
         for member in members.into_values() {
             member.consumer.forget_site(mm.id(), vaddr, &site);
         }
-        site.withdraw_participants();
+        site.withdraw_participants_final();
         site.state
             .store(UprobeSiteState::Dead as u8, Ordering::Release);
     }

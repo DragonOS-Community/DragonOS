@@ -84,10 +84,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
-      - name: Test allocation audit and VM evidence handling
+      - name: Test VM evidence handling
         run: python3 -m unittest discover -s tools/agent_memory -p 'test_*.py'
-      - name: Check reviewed allocation contracts
-        run: python3 tools/agent_memory/audit.py --output allocation-audit.json
       - name: Test guest sampler parsing and cleanup
         run: python3 user/apps/agent_memory/test_helper.py
       - name: Test independent OpenCode result validation

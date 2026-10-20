@@ -319,8 +319,8 @@ impl FuseConn {
                 requested: ctx.requested,
                 observed_size: ctx.observed_size,
                 observed_attr_version: ctx.observed_attr_version,
-                open_pin: crate::libs::mutex::Mutex::new(Some(ctx.open_pin)),
-                domain_io: crate::libs::mutex::Mutex::new(ctx.domain_io),
+                open_pin: crate::libs::spinlock::SpinLock::new(Some(ctx.open_pin)),
+                domain_io: crate::libs::spinlock::SpinLock::new(ctx.domain_io),
             }),
         ));
         let req = self.build_request(

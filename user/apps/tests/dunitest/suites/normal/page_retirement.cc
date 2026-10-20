@@ -39,7 +39,7 @@ TEST(PageRetirement, OwnershipAndLifecycle) {
             "heap_denied_rwsem_mixed_broadcast",
             "heap_denied_lazy_mm_queue", "heap_denied_futex_wake",
             "heap_denied_page_entry_wait", "heap_denied_device_output_buffer",
-            "heap_denied_workqueue",
+            "heap_denied_workqueue", "heap_denied_irq_dispatch", "heap_denied_clocksource_watchdog", "heap_denied_fuse_wait", "heap_denied_rcu_slot_drop",
             "two_mm_interleaved_lru", "two_mm_interleaved_plain", "last_mapping_only", "access_pin_lifetime", "extra_arc_lifetime",
             "reclaimer_snapshot_lifetime", "file_backing_preserved", "shmem_backing_preserved",
             "shm_backing_pin", "normal_backing_pin", "unevictable_preserved", "oom_lru",

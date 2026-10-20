@@ -1,7 +1,4 @@
-use alloc::{
-    string::ToString,
-    sync::{Arc, Weak},
-};
+use alloc::sync::{Arc, Weak};
 use log::{error, info};
 use system_error::SystemError;
 
@@ -63,7 +60,7 @@ impl Clocksource for ClocksourceJiffies {
 impl ClocksourceJiffies {
     pub fn new() -> Arc<Self> {
         let data = ClocksourceData {
-            name: "jiffies".to_string(),
+            name: "jiffies".into(),
             rating: 1,
             mask: ClocksourceMask::new(0xffffffff),
             mult: NSEC_PER_JIFFY << JIFFIES_SHIFT,

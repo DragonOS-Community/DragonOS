@@ -107,7 +107,7 @@ impl IrqDesc {
                 irq_data,
                 desc_internal_state: IrqDescState::empty(),
                 line_status: IrqLineStatus::empty(),
-                actions: Vec::new(),
+                actions: Arc::new(Vec::new()),
                 name,
                 parent_irq: None,
                 depth: 1,
@@ -181,8 +181,8 @@ impl IrqDesc {
         self.inner.lock_irqsave()
     }
 
-    pub fn actions(&self) -> Vec<Arc<IrqAction>> {
-        self.inner().actions.clone()
+    pub fn actions(&self) -> Arc<Vec<Arc<IrqAction>>> {
+        self.inner().actions_snapshot()
     }
 
     /// 对中断请求过程加锁
@@ -358,7 +358,8 @@ pub struct InnerIrqDesc {
     /// per irq and chip data passed down to chip functions
     common_data: Arc<IrqCommonData>,
     irq_data: Arc<IrqData>,
-    actions: Vec<Arc<IrqAction>>,
+    // Dispatch shares a prepared list; only registration/removal may copy it.
+    actions: Arc<Vec<Arc<IrqAction>>>,
     name: Option<String>,
     parent_irq: Option<IrqNumber>,
     /// nested irq disables
@@ -479,25 +480,30 @@ impl InnerIrqDesc {
         return true;
     }
 
-    pub fn actions(&self) -> &Vec<Arc<IrqAction>> {
-        &self.actions
+    pub fn actions(&self) -> &[Arc<IrqAction>] {
+        self.actions.as_slice()
+    }
+
+    /// Pin one immutable list without allocating in hardirq context.
+    pub fn actions_snapshot(&self) -> Arc<Vec<Arc<IrqAction>>> {
+        self.actions.clone()
     }
 
     pub fn add_action(&mut self, action: Arc<IrqAction>) {
-        self.actions.push(action);
+        Arc::make_mut(&mut self.actions).push(action);
     }
 
     pub fn clear_actions(&mut self) {
-        self.actions.clear();
+        Arc::make_mut(&mut self.actions).clear();
     }
 
     #[allow(dead_code)]
     pub fn remove_action(&mut self, action: &Arc<IrqAction>) {
-        self.actions.retain(|a| !Arc::ptr_eq(a, action));
+        Arc::make_mut(&mut self.actions).retain(|a| !Arc::ptr_eq(a, action));
     }
 
     pub fn remove_action_at(&mut self, index: usize) -> Arc<IrqAction> {
-        self.actions.remove(index)
+        Arc::make_mut(&mut self.actions).remove(index)
     }
 
     pub fn internal_state(&self) -> &IrqDescState {

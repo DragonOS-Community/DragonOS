@@ -1032,6 +1032,22 @@ pub(crate) fn report() -> String {
     type Check = fn() -> Result<bool, SystemError>;
     let tests: &[(&str, Check)] = &[
         (
+            "heap_denied_rcu_slot_drop",
+            crate::rcu::heap_denied_slot_drop_selftest,
+        ),
+        (
+            "heap_denied_fuse_wait",
+            crate::filesystem::fuse::conn::heap_denied_fuse_wait_selftest,
+        ),
+        (
+            "heap_denied_clocksource_watchdog",
+            crate::time::clocksource::heap_denied_watchdog,
+        ),
+        (
+            "heap_denied_irq_dispatch",
+            crate::exception::handle::heap_denied_irq_dispatch_selftest,
+        ),
+        (
             "heap_denied_workqueue",
             crate::exception::workqueue::heap_denied_workqueue_selftest,
         ),

@@ -1,4 +1,3 @@
-use alloc::string::ToString;
 use alloc::{sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
@@ -68,7 +67,7 @@ struct InnerKvmClock {
 impl KvmClock {
     pub fn new() -> Arc<Self> {
         let data = ClocksourceData {
-            name: "kvm-clock".to_string(),
+            name: "kvm-clock".into(),
             rating: 400,
             mask: ClocksourceMask::new(u64::MAX),
             mult: 0,

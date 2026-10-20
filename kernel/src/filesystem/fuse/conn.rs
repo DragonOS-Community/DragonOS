@@ -19,6 +19,8 @@ use crate::{
     filesystem::epoll::{event_poll::EPollItemList, event_poll::EventPoll, EPollEventType},
     libs::{
         mutex::Mutex,
+        resource_wait,
+        spinlock::SpinLock,
         wait_queue::{WaitQueue, Waiter},
     },
     mm::MemoryManagementArch,
@@ -284,9 +286,8 @@ impl FuseRequestCred {
 pub struct FusePendingState {
     unique: u64,
     opcode: u32,
-    response: Mutex<PendingCompletion>,
-    wait: WaitQueue,
-    background_credit: Mutex<Option<FuseBackgroundCredit>>,
+    response: SpinLock<PendingCompletion>,
+    background_credit: SpinLock<Option<FuseBackgroundCredit>>,
     read_completion: Option<FuseReadCompletion>,
     outcome_unknown: AtomicBool,
     processing_owner: AtomicBool,
@@ -300,21 +301,23 @@ struct FuseReadCompletion {
     requested: usize,
     observed_size: usize,
     observed_attr_version: u64,
-    open_pin: Mutex<Option<super::private_data::FuseOpenLifetimePin>>,
-    domain_io: Mutex<Option<PageCacheDomainIoPermit>>,
+    open_pin: SpinLock<Option<super::private_data::FuseOpenLifetimePin>>,
+    domain_io: SpinLock<Option<PageCacheDomainIoPermit>>,
 }
 
 impl FuseReadCompletion {
     fn belongs_to_domain(&self, domain: &Arc<PageCacheWritebackDomain>) -> bool {
         self.domain_io
-            .lock()
+            .lock_irqsave()
             .as_ref()
             .is_some_and(|permit| permit.belongs_to(domain))
     }
 
     fn release_io_ownership(&self) {
-        self.open_pin.lock().take();
-        self.domain_io.lock().take();
+        let open_pin = self.open_pin.lock_irqsave().take();
+        drop(open_pin);
+        let domain_io = self.domain_io.lock_irqsave().take();
+        drop(domain_io);
     }
 
     fn finish(&self, result: &Result<FusePendingResult, SystemError>) -> Result<(), SystemError> {
@@ -382,8 +385,7 @@ struct FuseBackgroundInner {
 
 #[derive(Debug)]
 struct FuseBackgroundState {
-    inner: Mutex<FuseBackgroundInner>,
-    wait: WaitQueue,
+    inner: SpinLock<FuseBackgroundInner>,
 }
 
 #[derive(Debug)]
@@ -393,68 +395,90 @@ struct FuseBackgroundCredit {
 
 impl Drop for FuseBackgroundCredit {
     fn drop(&mut self) {
-        let mut inner = self.state.inner.lock();
+        let mut inner = self.state.inner.lock_irqsave();
         inner.inflight = inner.inflight.saturating_sub(1);
         drop(inner);
         stats::on_background_released();
-        self.state.wait.wakeup(None);
+        self.state.notify_waiters();
     }
 }
 
 impl FuseBackgroundState {
     fn new() -> Arc<Self> {
         Arc::new(Self {
-            inner: Mutex::new(FuseBackgroundInner {
+            inner: SpinLock::new(FuseBackgroundInner {
                 connected: true,
                 max: FuseConn::DEFAULT_MAX_BACKGROUND,
                 congestion: FuseConn::DEFAULT_CONGESTION_THRESHOLD,
                 inflight: 0,
             }),
-            wait: WaitQueue::default(),
         })
     }
 
+    fn wait_key(&self) -> usize {
+        &self.inner as *const SpinLock<FuseBackgroundInner> as usize
+    }
+
+    fn notify_waiters(&self) {
+        resource_wait::notify_resource_all(self.wait_key());
+    }
+
     fn configure(&self, max: usize, congestion: usize) {
-        let mut inner = self.inner.lock();
+        let mut inner = self.inner.lock_irqsave();
         inner.max = core::cmp::max(1, max);
         inner.congestion = core::cmp::min(core::cmp::max(1, congestion), inner.max);
         drop(inner);
-        self.wait.wakeup(None);
+        self.notify_waiters();
     }
 
     fn disconnect(&self) {
-        self.inner.lock().connected = false;
-        self.wait.wakeup(None);
+        self.inner.lock_irqsave().connected = false;
+        self.notify_waiters();
+    }
+
+    /// None is an exhausted mandatory gate; Some(None) suppresses speculation.
+    fn try_acquire(
+        self: &Arc<Self>,
+        speculative: bool,
+    ) -> Result<Option<Option<FuseBackgroundCredit>>, SystemError> {
+        let mut inner = self.inner.lock_irqsave();
+        if !inner.connected {
+            return Err(SystemError::ENOTCONN);
+        }
+        let limit = if speculative {
+            inner.congestion
+        } else {
+            inner.max
+        };
+        if inner.inflight < limit {
+            inner.inflight += 1;
+            stats::on_background_acquired();
+            return Ok(Some(Some(FuseBackgroundCredit {
+                state: self.clone(),
+            })));
+        }
+        stats::on_background_pressure(speculative);
+        Ok(speculative.then_some(None))
     }
 
     fn acquire(
         self: &Arc<Self>,
         speculative: bool,
     ) -> Result<Option<FuseBackgroundCredit>, SystemError> {
-        wait_with_recheck(&self.wait, || {
-            let mut inner = self.inner.lock();
-            if !inner.connected {
-                return Err(SystemError::ENOTCONN);
-            }
-            let limit = if speculative {
-                inner.congestion
-            } else {
-                inner.max
-            };
-            if inner.inflight < limit {
-                inner.inflight += 1;
-                stats::on_background_acquired();
-                return Ok(Some(Some(FuseBackgroundCredit {
-                    state: self.clone(),
-                })));
-            }
-            if speculative {
-                stats::on_background_pressure(true);
-                return Ok(Some(None));
-            }
-            stats::on_background_pressure(false);
-            Ok(None)
-        })
+        if let Some(result) = self.try_acquire(speculative)? {
+            return Ok(result);
+        }
+        // Only mandatory reads reach this wait. Neither its predicate nor
+        // its registration allocates; the Arc borrow pins the key throughout.
+        match resource_wait::wait_for_resource(self.wait_key(), true, || {
+            self.try_acquire(false).transpose()
+        }) {
+            Ok(result) => result,
+            Err(error) => match self.try_acquire(false)? {
+                Some(result) => Ok(result),
+                None => Err(error),
+            },
+        }
     }
 }
 
@@ -506,9 +530,8 @@ impl FusePendingState {
         Self {
             unique,
             opcode,
-            response: Mutex::new(PendingCompletion::Waiting),
-            wait: WaitQueue::default(),
-            background_credit: Mutex::new(background_credit),
+            response: SpinLock::new(PendingCompletion::Waiting),
+            background_credit: SpinLock::new(background_credit),
             read_completion,
             outcome_unknown: AtomicBool::new(false),
             processing_owner: AtomicBool::new(false),
@@ -570,7 +593,7 @@ impl FusePendingState {
         mut v: Result<FusePendingResult, SystemError>,
         mut kind: FuseCompletionKind,
     ) -> bool {
-        let mut guard = self.response.lock();
+        let mut guard = self.response.lock_irqsave();
         if !matches!(*guard, PendingCompletion::Waiting) {
             // Duplicate replies are ignored (Linux does similarly).
             return false;
@@ -584,7 +607,7 @@ impl FusePendingState {
             }
             completion.release_io_ownership();
         }
-        let mut guard = self.response.lock();
+        let mut guard = self.response.lock_irqsave();
         *guard = PendingCompletion::Ready(v, kind);
         drop(guard);
         if self.processing_owner.swap(false, Ordering::AcqRel) {
@@ -593,8 +616,9 @@ impl FusePendingState {
         // Linux releases a background slot at request completion, not when a
         // waiter later consumes the result.  Taking the token makes this
         // exactly-once across replies, abort and teardown.
-        self.background_credit.lock().take();
-        self.wait.wakeup(None);
+        let credit = self.background_credit.lock_irqsave().take();
+        drop(credit);
+        resource_wait::notify_resource_all(self.wait_key());
         true
     }
 
@@ -617,97 +641,65 @@ impl FusePendingState {
         }
     }
 
-    fn wait_read_pages_once(&self) -> FuseReadWaitOutcome {
-        let take_ready = || {
-            let mut guard = self.response.lock();
-            if matches!(*guard, PendingCompletion::Ready(_, _)) {
-                let ready = core::mem::replace(&mut *guard, PendingCompletion::Consumed);
-                if let PendingCompletion::Ready(result, _) = ready {
-                    return Some(result.map(|result| match result {
-                        FusePendingResult::Reply(reply) => FuseReadPagesReply::Contiguous(reply),
-                        FusePendingResult::ReadPagesDirect { bytes } => {
-                            FuseReadPagesReply::Direct { bytes }
-                        }
-                    }));
-                }
+    fn wait_key(&self) -> usize {
+        &self.response as *const SpinLock<PendingCompletion> as usize
+    }
+
+    fn take_ready(&self) -> Option<(Result<FusePendingResult, SystemError>, FuseCompletionKind)> {
+        let mut guard = self.response.lock_irqsave();
+        if matches!(*guard, PendingCompletion::Ready(_, _)) {
+            let ready = core::mem::replace(&mut *guard, PendingCompletion::Consumed);
+            if let PendingCompletion::Ready(result, kind) = ready {
+                return Some((result, kind));
             }
-            None
-        };
-        if let Some(result) = take_ready() {
-            return FuseReadWaitOutcome::Complete(result);
         }
-        loop {
-            let (waiter, waker) = Waiter::new_pair();
-            if let Err(error) = self.wait.register_waker(waker.clone()) {
-                return FuseReadWaitOutcome::Complete(Err(error));
-            }
-            if let Some(result) = take_ready() {
-                self.wait.remove_waker(&waker);
-                return FuseReadWaitOutcome::Complete(result);
-            }
-            if waiter.wait(true).is_err() {
-                self.wait.remove_waker(&waker);
-                return FuseReadWaitOutcome::Interrupted;
-            }
+        None
+    }
+
+    fn wait_terminal(
+        &self,
+        interruptible: bool,
+    ) -> Result<(Result<FusePendingResult, SystemError>, FuseCompletionKind), SystemError> {
+        // Like Linux wait_event, an already published terminal result wins
+        // over interruption. The post-error recheck covers concurrent publish.
+        if let Some(ready) = self.take_ready() {
+            return Ok(ready);
+        }
+        match resource_wait::wait_for_resource(self.wait_key(), interruptible, || self.take_ready())
+        {
+            Ok(ready) => Ok(ready),
+            Err(error) => self.take_ready().ok_or(error),
+        }
+    }
+
+    fn wait_read_pages_once(&self) -> FuseReadWaitOutcome {
+        match self.wait_terminal(true) {
+            Ok((result, _)) => FuseReadWaitOutcome::Complete(result.map(|result| match result {
+                FusePendingResult::Reply(reply) => FuseReadPagesReply::Contiguous(reply),
+                FusePendingResult::ReadPagesDirect { bytes } => {
+                    FuseReadPagesReply::Direct { bytes }
+                }
+            })),
+            Err(_) => FuseReadWaitOutcome::Interrupted,
         }
     }
 
     fn wait_result(&self) -> Result<FusePendingResult, SystemError> {
-        wait_with_recheck(&self.wait, || {
-            let mut guard = self.response.lock();
-            if matches!(*guard, PendingCompletion::Ready(_, _)) {
-                let ready = core::mem::replace(&mut *guard, PendingCompletion::Consumed);
-                if let PendingCompletion::Ready(res, _) = ready {
-                    return Ok(Some(res));
-                }
-            }
-            Ok(None)
-        })?
+        self.wait_terminal(true)?.0
     }
 
     #[cfg(test)]
     pub(crate) fn wait_result_with_kind(
         &self,
     ) -> Result<(Result<FusePendingResult, SystemError>, FuseCompletionKind), SystemError> {
-        wait_with_recheck(&self.wait, || {
-            let mut guard = self.response.lock();
-            if matches!(*guard, PendingCompletion::Ready(_, _)) {
-                let ready = core::mem::replace(&mut *guard, PendingCompletion::Consumed);
-                if let PendingCompletion::Ready(result, kind) = ready {
-                    return Ok(Some((result, kind)));
-                }
-            }
-            Ok(None)
-        })
+        self.wait_terminal(true)
     }
 
     pub(crate) fn wait_result_with_kind_uninterruptible(
         &self,
     ) -> Result<(Result<FusePendingResult, SystemError>, FuseCompletionKind), SystemError> {
-        let take_ready = || {
-            let mut guard = self.response.lock();
-            if matches!(*guard, PendingCompletion::Ready(_, _)) {
-                let ready = core::mem::replace(&mut *guard, PendingCompletion::Consumed);
-                if let PendingCompletion::Ready(result, kind) = ready {
-                    return Some((result, kind));
-                }
-            }
-            None
-        };
-        if let Some(result) = take_ready() {
-            return Ok(result);
-        }
-        loop {
-            let (waiter, waker) = Waiter::new_pair();
-            self.wait.register_waker(waker.clone())?;
-            if let Some(result) = take_ready() {
-                self.wait.remove_waker(&waker);
-                return Ok(result);
-            }
-            // Mapping lifecycle state may not be released until the request has
-            // a terminal result. Signals are therefore deliberately ignored.
-            waiter.wait(false)?;
-        }
+        // Mapping/DMA lifecycle ownership stays live until a terminal result.
+        self.wait_terminal(false)
     }
 }
 
@@ -1867,6 +1859,15 @@ impl FuseConn {
         }
         self.background.acquire(speculative)
     }
+}
+
+#[cfg(feature = "mm_selftest")]
+#[path = "conn/selftest_wait.rs"]
+mod selftest_wait;
+
+#[cfg(feature = "mm_selftest")]
+pub(crate) fn heap_denied_fuse_wait_selftest() -> Result<bool, SystemError> {
+    selftest_wait::run()
 }
 
 #[cfg(test)]

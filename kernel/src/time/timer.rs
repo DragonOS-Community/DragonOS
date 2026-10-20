@@ -213,6 +213,7 @@ impl SoftirqVec for DoTimerSoftirq {
         if !self.set_run() {
             return;
         }
+        super::clocksource::run_due_watchdog();
         // 最多只处理TIMER_RUN_CYCLE_THRESHOLD个计时器
         for _ in 0..TIMER_RUN_CYCLE_THRESHOLD {
             // debug!("DoTimerSoftirq run");
@@ -333,6 +334,10 @@ pub fn timer_get_first_expire() -> Result<u64, SystemError> {
 
 /// 检查是否需要触发定时器软中断，如果需要则触发
 pub fn try_raise_timer_softirq() {
+    if super::clocksource::watchdog_due(clock()) {
+        softirq_vectors().raise_softirq(SoftirqNumber::TIMER);
+        return;
+    }
     if let Ok(first_expire) = timer_get_first_expire() {
         if first_expire <= clock() {
             softirq_vectors().raise_softirq(SoftirqNumber::TIMER);

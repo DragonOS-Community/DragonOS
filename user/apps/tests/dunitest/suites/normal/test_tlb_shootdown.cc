@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <errno.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <setjmp.h>
 #include <signal.h>
@@ -13,6 +14,7 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <string>
 
 namespace {
 
@@ -566,6 +568,40 @@ TEST(TlbShootdown, MunmapAccessFaultsAfterUnmap) {
 
 TEST(TlbShootdown, ForkCowNoStaleTlbLeak) {
     EXPECT_EQ(0, case_fork_cow_stale_tlb());
+}
+
+// Keep this in the TLB suite: the ordinary COW/permission workloads above
+// precede the two-CPU teardown and its missing-flush/missing-ack controls.
+TEST(TlbShootdown, TeardownRetainsRemoteHolderUntilAcknowledged) {
+    constexpr const char* path = "/sys/kernel/debug/mm/tlb_teardown_selftest";
+    const int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        if (errno == ENOENT) GTEST_SKIP() << "requires x86_64 KERNEL_FEATURES=mm_selftest";
+        FAIL() << "open teardown report: " << strerror(errno);
+    }
+    std::string report;
+    char buffer[127];
+    for (;;) {
+        const ssize_t count = read(fd, buffer, sizeof(buffer));
+        if (count < 0 && errno == EINTR) continue;
+        if (count < 0) {
+            const int error = errno;
+            close(fd);
+            FAIL() << "read teardown report: " << strerror(error);
+        }
+        if (count == 0) break;
+        report.append(buffer, static_cast<size_t>(count));
+    }
+    ASSERT_EQ(0, close(fd));
+    EXPECT_NE(std::string::npos, report.find("status=ok\n")) << report;
+    EXPECT_NE(std::string::npos, report.find("summary_fail=0\n")) << report;
+    for (const char* key : {
+            "smp_available", "holder_admission",
+            "kernel_teardown_order", "kernel_missing_flush_detected", "kernel_missing_ack_detected",
+            "user_teardown_order", "user_missing_flush_detected", "user_missing_ack_detected",
+            "user_lru_teardown_order", "user_lru_missing_flush_detected", "user_lru_missing_ack_detected"}) {
+        EXPECT_NE(std::string::npos, report.find(std::string(key) + "=ok\n")) << report;
+    }
 }
 
 }  // namespace

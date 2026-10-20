@@ -42,6 +42,16 @@ pub enum DmaCachePolicy {
     Cached,
 }
 
+/// Permission for bounded synchronous compaction after a fragmented allocation.
+/// The caller must be in a sleepable task, outside MM, page/cache, allocator and
+/// device locks. This permission never applies to streaming share/bounce paths.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DmaCompaction {
+    #[default]
+    Disabled,
+    Allowed,
+}
+
 #[derive(Clone, Copy, Debug)]
 #[allow(dead_code)]
 pub struct DmaAllocOptions {
@@ -50,6 +60,7 @@ pub struct DmaAllocOptions {
     pub zeroed: bool,
     pub dma_mask: Option<u64>,
     pub use_pool: bool,
+    pub compaction: DmaCompaction,
 }
 
 impl Default for DmaAllocOptions {
@@ -60,6 +71,7 @@ impl Default for DmaAllocOptions {
             zeroed: true,
             dma_mask: None,
             use_pool: true,
+            compaction: DmaCompaction::Disabled,
         }
     }
 }
@@ -163,6 +175,21 @@ struct DmaRawAllocation {
 }
 
 unsafe impl Send for DmaRawAllocation {}
+
+enum RawAllocationFailure {
+    System(SystemError),
+    #[cfg(target_arch = "x86_64")]
+    Frame(super::allocator::buddy::DmaAllocationFailure),
+}
+impl RawAllocationFailure {
+    fn errno(&self) -> SystemError {
+        match self {
+            Self::System(error) => error.clone(),
+            #[cfg(target_arch = "x86_64")]
+            Self::Frame(_) => SystemError::ENOMEM,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DmaPoolDomain {
@@ -315,64 +342,124 @@ impl DmaAllocator {
                 return Ok(raw);
             }
         }
-        match self.try_alloc_raw(page_count, options) {
-            Ok(raw) => Ok(raw),
-            Err(SystemError::ENOMEM)
-                if pool_key.is_some_and(|key| key.domain == DmaPoolDomain::Dma32) =>
-            {
-                // Preserve the normal hot-path partition between wide and
-                // DMA32 users. Only after the constrained buddy allocation is
-                // exhausted may a DMA32 request reclaim a compatible low
-                // buffer cached by a wide request. The caller's Dma32 key then
-                // makes this a one-way migration on Drop.
-                let key = DmaPoolKey {
-                    pages: page_count.data(),
-                    domain: DmaPoolDomain::Unrestricted,
-                };
-                let raw = self
-                    .take_from_pool(key, options.dma_mask)
-                    .ok_or(SystemError::ENOMEM)?;
+        let failure = match self.try_alloc_raw_attempt(page_count, options) {
+            Ok(raw) => return Ok(raw),
+            Err(failure) => failure,
+        };
+        // Exhaust every compatible cache before moving any pages. In
+        // particular preserve the one-way wide -> DMA32 cache fallback.
+        if failure.errno() == SystemError::ENOMEM
+            && pool_key.is_some_and(|key| key.domain == DmaPoolDomain::Dma32)
+        {
+            let key = DmaPoolKey {
+                pages: page_count.data(),
+                domain: DmaPoolDomain::Unrestricted,
+            };
+            if let Some(raw) = self.take_from_pool(key, options.dma_mask) {
                 if options.zeroed {
                     self.zero_raw(&raw);
                 }
-                Ok(raw)
+                return Ok(raw);
             }
-            Err(err) => Err(err),
         }
+        #[cfg(target_arch = "x86_64")]
+        if options.compaction == DmaCompaction::Allowed {
+            if let RawAllocationFailure::Frame(evidence) = &failure {
+                if let Some(zone) = evidence.zone.filter(|_| {
+                    evidence.reason == super::allocator::buddy::AllocationFailure::Fragmentation
+                }) {
+                    let order = page_count.data().trailing_zeros() as usize;
+                    let max = PhysAddr::new(
+                        options
+                            .dma_mask
+                            .and_then(|mask| usize::try_from(mask).ok())
+                            .unwrap_or(usize::MAX),
+                    );
+                    if let Ok(run) = super::compaction::recovery::allocate(order, max, zone) {
+                        let (physical, count) = run.into_raw_parts();
+                        return self.finish_raw(physical, count, options);
+                    }
+                }
+            }
+        }
+        Err(failure.errno())
     }
 
+    #[cfg(all(
+        feature = "mm_selftest",
+        any(target_arch = "x86_64", target_arch = "riscv64")
+    ))]
     fn try_alloc_raw(
         &self,
         page_count: PageFrameCount,
         options: &DmaAllocOptions,
     ) -> Result<DmaRawAllocation, SystemError> {
-        validate_cache_policy(options.cache_policy)?;
+        self.try_alloc_raw_attempt(page_count, options)
+            .map_err(|error| error.errno())
+    }
+
+    fn try_alloc_raw_attempt(
+        &self,
+        page_count: PageFrameCount,
+        options: &DmaAllocOptions,
+    ) -> Result<DmaRawAllocation, RawAllocationFailure> {
+        validate_cache_policy(options.cache_policy).map_err(RawAllocationFailure::System)?;
+        #[cfg(target_arch = "x86_64")]
+        if options.compaction == DmaCompaction::Allowed {
+            let max = PhysAddr::new(
+                options
+                    .dma_mask
+                    .and_then(|mask| usize::try_from(mask).ok())
+                    .unwrap_or(usize::MAX),
+            );
+            let (physical, count) = crate::arch::mm::LockedFrameAllocator::with_buddy(|buddy| {
+                buddy.try_allocate_for_dma(page_count, max)
+            })
+            .ok_or(RawAllocationFailure::System(SystemError::ENOMEM))?
+            .map_err(RawAllocationFailure::Frame)?;
+            return self
+                .finish_raw(physical, count, options)
+                .map_err(RawAllocationFailure::System);
+        }
         let allocation = if let Some(mask) = options.dma_mask {
             let max = usize::try_from(mask).unwrap_or(usize::MAX);
             unsafe { allocate_page_frames_below(page_count, PhysAddr::new(max)) }
         } else {
             unsafe { allocate_page_frames(page_count) }
         };
-        let (paddr, count) = allocation.ok_or(SystemError::ENOMEM)?;
-        let virt = match unsafe { MMArch::phys_2_virt(paddr) } {
-            Some(virt) => virt,
-            None => {
-                unsafe {
-                    deallocate_page_frames(PhysPageFrame::new(paddr), count);
-                }
-                return Err(SystemError::ENOMEM);
-            }
+        let (paddr, count) = allocation.ok_or(RawAllocationFailure::System(SystemError::ENOMEM))?;
+        self.finish_raw(paddr, count, options)
+            .map_err(RawAllocationFailure::System)
+    }
+
+    // Both ordinary allocation and compaction transfer exclusive frame
+    // ownership here. An invalid mapping or bound releases exactly that run.
+    fn finish_raw(
+        &self,
+        paddr: PhysAddr,
+        count: PageFrameCount,
+        options: &DmaAllocOptions,
+    ) -> Result<DmaRawAllocation, SystemError> {
+        let mapping = unsafe { MMArch::phys_2_virt(paddr) };
+        let end = count
+            .data()
+            .checked_mul(MMArch::PAGE_SIZE)
+            .and_then(|bytes| paddr.data().checked_add(bytes.checked_sub(1)?));
+        if mapping.is_none()
+            || end.is_none_or(|end| options.dma_mask.is_some_and(|mask| end as u64 > mask))
+        {
+            unsafe { deallocate_page_frames(PhysPageFrame::new(paddr), count) };
+            return Err(SystemError::ENOMEM);
+        }
+        let raw = DmaRawAllocation {
+            paddr,
+            vaddr: NonNull::new(mapping.unwrap().data() as *mut u8).unwrap(),
+            page_count: count,
         };
         if options.zeroed {
-            unsafe {
-                core::ptr::write_bytes(virt.data() as *mut u8, 0, count.data() * MMArch::PAGE_SIZE);
-            }
+            self.zero_raw(&raw);
         }
-        Ok(DmaRawAllocation {
-            paddr,
-            vaddr: NonNull::new(virt.data() as *mut u8).unwrap(),
-            page_count: count,
-        })
+        Ok(raw)
     }
 
     fn zero_raw(&self, alloc: &DmaRawAllocation) {
@@ -444,13 +531,21 @@ fn allocation_fits_mask(allocation: &DmaRawAllocation, mask: Option<u64>) -> boo
     mask.is_none_or(|mask| end <= mask)
 }
 
-pub fn dma_alloc_pages_raw(pages: usize, mut options: DmaAllocOptions) -> (usize, NonNull<u8>) {
+pub fn dma_alloc_pages_raw(pages: usize, options: DmaAllocOptions) -> (usize, NonNull<u8>) {
+    try_dma_alloc_pages_raw(pages, options).expect("dma alloc pages failed")
+}
+
+/// Fallible raw ownership transfer for HALs whose queue creation returns errors.
+/// On success the caller must pair it with `dma_dealloc_pages_raw` using the
+/// original requested pages; both interfaces apply the same power-of-two rounding.
+pub fn try_dma_alloc_pages_raw(
+    pages: usize,
+    mut options: DmaAllocOptions,
+) -> Result<(usize, NonNull<u8>), SystemError> {
     options.use_pool = false;
-    let page_count = page_count_from_pages(pages).expect("invalid dma page count");
-    let raw = dma_allocator()
-        .try_alloc_raw(page_count, &options)
-        .expect("dma alloc pages failed");
-    (raw.paddr.data(), raw.vaddr)
+    let page_count = page_count_from_pages(pages).ok_or(SystemError::EINVAL)?;
+    let raw = dma_allocator().try_alloc_from_pool_or_raw(page_count, None, &options)?;
+    Ok((raw.paddr.data(), raw.vaddr))
 }
 
 pub unsafe fn dma_dealloc_pages_raw(paddr: usize, vaddr: NonNull<u8>, pages: usize) -> i32 {

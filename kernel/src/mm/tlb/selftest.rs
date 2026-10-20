@@ -203,6 +203,57 @@ fn wait(c: &Completion) -> bool {
         .is_ok_and(|n| n > 0)
 }
 
+/// Admission and holder lifetime are separate from the readiness completion.
+/// A late completion cannot authorize teardown after the holder has left.
+struct HolderSession(AtomicUsize);
+impl HolderSession {
+    const READY: usize = 0;
+    const ACTIVE: usize = 1;
+    const CANCELLED: usize = 2;
+    const DONE: usize = 3;
+
+    fn new() -> Self {
+        Self(AtomicUsize::new(Self::READY))
+    }
+    fn activate(&self) -> bool {
+        self.0
+            .compare_exchange(
+                Self::READY,
+                Self::ACTIVE,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+    fn cancel(&self) -> bool {
+        self.0
+            .compare_exchange(
+                Self::READY,
+                Self::CANCELLED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+    fn finish(&self) {
+        self.0.store(Self::DONE, Ordering::Release);
+    }
+    fn done(&self) -> bool {
+        self.0.load(Ordering::Acquire) == Self::DONE
+    }
+}
+
+fn holder_admission_check() -> bool {
+    // Model a completion delivered after the holder's admission deadline.
+    let late = HolderSession::new();
+    let late_rejected = late.cancel() && !late.activate();
+    // Once accepted, a deadline must not release the borrowed hardware root.
+    let active = HolderSession::new();
+    let held_until_done = active.activate() && !active.cancel() && !active.done();
+    active.finish();
+    late_rejected && held_until_done && active.done()
+}
+
 /// Only this fixture borrows a hardware mm: never scheduled while borrowed,
 /// with actual root/active/loaded tracking restored before preemption resumes.
 struct BorrowDiagnostic {
@@ -429,7 +480,7 @@ fn run(user: bool, lru: bool, mode: Mode, cpu: ProcessorId, diagnostic: &mut Str
         drop(guard);
     }
     let ready = Arc::new(Completion::new());
-    let done = Arc::new(AtomicBool::new(false));
+    let session = Arc::new(HolderSession::new());
     let read_ok = Arc::new(AtomicBool::new(false));
     // One bounded diagnostic per fixture, never an IPI/event log:
     // 1=no saved mm, 21=saved root mismatch, 22=saved active bit missing,
@@ -441,7 +492,7 @@ fn run(user: bool, lru: bool, mode: Mode, cpu: ProcessorId, diagnostic: &mut Str
     });
     let worker_borrow_stage = borrow_stage.clone();
     let worker_ready = ready.clone();
-    let worker_done = done.clone();
+    let worker_session = session.clone();
     let worker_ok = read_ok.clone();
     let worker_mm = private.clone();
     let closure = KernelThreadClosure::EmptyClosure((
@@ -451,6 +502,7 @@ fn run(user: bool, lru: bool, mode: Mode, cpu: ProcessorId, diagnostic: &mut Str
                 Some(mm) => match BorrowedMm::enter(mm, &worker_borrow_stage) {
                     Some(mm) => Some(mm),
                     None => {
+                        worker_session.cancel();
                         worker_ready.complete();
                         return 1;
                     }
@@ -464,17 +516,21 @@ fn run(user: bool, lru: bool, mode: Mode, cpu: ProcessorId, diagnostic: &mut Str
                 Ordering::Release,
             );
             worker_ready.complete();
-            let mut completed = false;
-            // Outer worker wait is IRQ-enabled; use a deadline rather than
-            // schedule away and accidentally erase the old translation.
+            // A deadline can cancel admission, but cannot withdraw a holder
+            // already accepted by the initiator. IRQs remain enabled so the
+            // actual shootdown can run while the borrowed root stays loaded.
             let began = crate::time::timer::clock();
-            while crate::time::timer::clock().wrapping_sub(began) < 5 * HZ {
-                if worker_done.load(Ordering::Acquire) {
-                    completed = true;
-                    break;
+            let completed = loop {
+                if worker_session.done() {
+                    break true;
+                }
+                if crate::time::timer::clock().wrapping_sub(began) >= 5 * HZ
+                    && worker_session.cancel()
+                {
+                    break false;
                 }
                 spin_loop();
-            }
+            };
             drop(borrowed);
             drop(preempt);
             i32::from(!completed)
@@ -487,11 +543,11 @@ fn run(user: bool, lru: bool, mode: Mode, cpu: ProcessorId, diagnostic: &mut Str
         return false;
     };
     if ProcessManager::wakeup(&worker).is_err() {
-        done.store(true, Ordering::Release);
+        session.finish();
         let _ = KernelThreadMechanism::stop(&worker);
         return false;
     }
-    let ready_ok = wait(&ready) && read_ok.load(Ordering::Acquire);
+    let ready_ok = wait(&ready) && read_ok.load(Ordering::Acquire) && session.activate();
     if ready_ok {
         if let Some(mm) = &private {
             *USER_FIXTURE.lock() = Some(observer.clone());
@@ -511,7 +567,7 @@ fn run(user: bool, lru: bool, mode: Mode, cpu: ProcessorId, diagnostic: &mut Str
             drop(allocation.take());
         }
     }
-    done.store(true, Ordering::Release);
+    session.finish();
     let stopped = matches!(KernelThreadMechanism::stop(&worker), Ok(0));
     let passed = ready_ok
         && stopped
@@ -540,22 +596,18 @@ fn run(user: bool, lru: bool, mode: Mode, cpu: ProcessorId, diagnostic: &mut Str
     passed
 }
 
-pub(super) fn report() -> String {
-    let _serial = TEST_LOCK.lock();
+fn run_report(target: ProcessorId) -> String {
     let _vmalloc_serial = crate::mm::vmalloc::lock_teardown_fixture();
-    let here = smp_get_processor_id();
-    let target = smp_cpu_manager()
-        .present_cpus()
-        .iter_cpu()
-        .find(|cpu| *cpu != here && smp_cpu_manager().is_online_cpu(*cpu));
     let mut report = String::new();
     use core::fmt::Write;
+    let admission_ok = holder_admission_check();
+    let _ = writeln!(report, "smp_available=ok");
     let _ = writeln!(
         report,
-        "smp_available={}",
-        if target.is_some() { "ok" } else { "fail" }
+        "holder_admission={}",
+        if admission_ok { "ok" } else { "fail" }
     );
-    let mut failures = usize::from(target.is_none());
+    let mut failures = usize::from(!admission_ok);
     for (user, lru, mode, key) in [
         (false, false, Mode::Normal, "kernel_teardown_order"),
         (
@@ -578,7 +630,7 @@ pub(super) fn report() -> String {
         (true, true, Mode::SkipAck, "user_lru_missing_ack_detected"),
     ] {
         let mut diagnostic = String::new();
-        let ok = target.is_some_and(|cpu| run(user, lru, mode, cpu, &mut diagnostic));
+        let ok = run(user, lru, mode, target, &mut diagnostic);
         if !diagnostic.is_empty() {
             let _ = write!(report, "{key}_diagnostic={diagnostic}");
         }
@@ -591,4 +643,54 @@ pub(super) fn report() -> String {
         report,
         failures
     )
+}
+
+/// The report caller can sleep or migrate. Run all teardown initiations on a
+/// dedicated fixed CPU, distinct from the non-preemptible translation holder.
+/// In particular, never disable preemption across the sleepable munmap path.
+pub(super) fn report() -> String {
+    let _serial = TEST_LOCK.lock();
+    let mut online = smp_cpu_manager()
+        .present_cpus()
+        .iter_cpu()
+        .filter(|cpu| smp_cpu_manager().is_online_cpu(*cpu));
+    let Some(initiator_cpu) = online.next() else {
+        return "status=fail\nsmp_available=fail\nsummary_fail=1\n".to_string();
+    };
+    let Some(target) = online.next() else {
+        return "status=fail\nsmp_available=fail\nsummary_fail=1\n".to_string();
+    };
+    let result = Arc::new(Mutex::new(None));
+    let complete = Arc::new(Completion::new());
+    let worker_result = result.clone();
+    let worker_complete = complete.clone();
+    let closure = KernelThreadClosure::EmptyClosure((
+        Box::new(move || {
+            *worker_result.lock() = Some(run_report(target));
+            worker_complete.complete();
+            0
+        }),
+        (),
+    ));
+    let Some(initiator) =
+        KernelThreadMechanism::create_on_cpu(closure, "tlb-initiator".to_string(), initiator_cpu)
+    else {
+        return "status=fail\ninitiator_create=fail\nsummary_fail=1\n".to_string();
+    };
+    if ProcessManager::wakeup(&initiator).is_err() {
+        let _ = KernelThreadMechanism::stop(&initiator);
+        return "status=fail\ninitiator_wakeup=fail\nsummary_fail=1\n".to_string();
+    }
+    // Uninterruptible completion: retain every fixture owner until the pinned
+    // initiator has finished, then reap it before publishing the report.
+    let waited = complete.wait_for_completion().is_ok();
+    let stopped = matches!(KernelThreadMechanism::stop(&initiator), Ok(0));
+    if !waited || !stopped {
+        return "status=fail\ninitiator_complete=fail\nsummary_fail=1\n".to_string();
+    }
+    let report = result
+        .lock()
+        .take()
+        .expect("TLB initiator completed without report");
+    report
 }

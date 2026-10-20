@@ -17,6 +17,8 @@ use crate::{
     process::ProcessManager,
 };
 
+pub(crate) mod recovery;
+
 static EXECUTION: Mutex<()> = Mutex::new(());
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -170,6 +172,9 @@ pub(crate) struct Request {
     pub start: PhysAddr,
     pub end: PhysAddr,
     pub order: usize,
+    /// Optional first scan address within this stable domain. Changing only
+    /// the seed preserves the domain/order failure deferral history.
+    pub start_at: Option<PhysAddr>,
     pub limits: Limits,
 }
 #[derive(Clone, Copy, Debug, Default)]
@@ -259,6 +264,7 @@ impl Compactor {
             start,
             end,
             order,
+            start_at,
             limits,
         } = request;
         if order == 0
@@ -278,8 +284,15 @@ impl Compactor {
         {
             return Err(Stop::Invalid);
         }
+        let scan_start = start_at.unwrap_or(start);
+        if scan_start < start
+            || scan_start >= end
+            || scan_start.data() & MMArch::PAGE_OFFSET_MASK != 0
+        {
+            return Err(Stop::Invalid);
+        }
         let bytes = MMArch::PAGE_SIZE << order;
-        let mut candidate = start
+        let mut candidate = scan_start
             .data()
             .checked_add(bytes - 1)
             .map(|address| address & !(bytes - 1))

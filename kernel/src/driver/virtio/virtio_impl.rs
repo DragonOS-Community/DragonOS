@@ -136,3 +136,53 @@ unsafe impl Hal for HalImpl {
         dma_dealloc_pages_raw(_paddr, bounce.vaddr, bounce.pages);
     }
 }
+
+/// Coherent ring allocation for virtio-fs queue construction, before the bridge
+/// starts. Runtime sharing delegates to HalImpl and never opts into compaction.
+/// Other drivers must audit their construction lock chain before using this HAL.
+pub struct VirtioFsQueueHal;
+
+// SAFETY: successful coherent allocations are exclusive, zeroed and page
+// aligned; failure returns no pointer. All other contracts delegate unchanged.
+unsafe impl Hal for VirtioFsQueueHal {
+    fn dma_alloc(pages: usize, direction: BufferDirection) -> (usize, NonNull<u8>) {
+        HalImpl::dma_alloc(pages, direction)
+    }
+
+    fn try_dma_alloc(
+        pages: usize,
+        direction: BufferDirection,
+    ) -> virtio_drivers::Result<(usize, NonNull<u8>)> {
+        let direction = match direction {
+            BufferDirection::DriverToDevice => DmaDirection::ToDevice,
+            BufferDirection::DeviceToDriver => DmaDirection::FromDevice,
+            BufferDirection::Both => DmaDirection::Bidirectional,
+        };
+        crate::mm::dma::try_dma_alloc_pages_raw(
+            pages,
+            DmaAllocOptions {
+                direction,
+                use_pool: false,
+                compaction: crate::mm::dma::DmaCompaction::Allowed,
+                ..Default::default()
+            },
+        )
+        .map_err(|_| virtio_drivers::Error::DmaError)
+    }
+
+    unsafe fn dma_dealloc(paddr: usize, vaddr: NonNull<u8>, pages: usize) -> i32 {
+        HalImpl::dma_dealloc(paddr, vaddr, pages)
+    }
+
+    unsafe fn mmio_phys_to_virt(paddr: usize, size: usize) -> NonNull<u8> {
+        HalImpl::mmio_phys_to_virt(paddr, size)
+    }
+
+    unsafe fn share(buffer: NonNull<[u8]>, direction: BufferDirection) -> usize {
+        HalImpl::share(buffer, direction)
+    }
+
+    unsafe fn unshare(paddr: usize, buffer: NonNull<[u8]>, direction: BufferDirection) {
+        HalImpl::unshare(paddr, buffer, direction)
+    }
+}

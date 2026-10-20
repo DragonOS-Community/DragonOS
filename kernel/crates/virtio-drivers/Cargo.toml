@@ -1,0 +1,30 @@
+# Vendored from DragonOS-Community/virtio-drivers at
+# 82d783c935084a67c2e0a3bead0266a66aed80fd (MIT).
+# Local extensions: fallible coherent DMA; avoid inflated modern ring orders.
+[package]
+name = "virtio-drivers"
+version = "0.7.2"
+license = "MIT"
+authors = [
+  "Jiajie Chen <noc@jiegec.ac.cn>",
+  "Runji Wang <wangrunji0408@163.com>",
+  "Yuekai Jia <equation618@gmail.com>",
+  "Andrew Walbran <qwandor@google.com>",
+]
+edition = "2018"
+description = "VirtIO guest drivers."
+repository = "https://github.com/rcore-os/virtio-drivers"
+keywords = ["virtio"]
+categories = ["hardware-support", "no-std"]
+
+[dependencies]
+log = "0.4"
+bitflags = "2.3.0"
+zerocopy = { version = "0.7.5", features = ["derive"] }
+
+[features]
+default = ["alloc"]
+alloc = ["zerocopy/alloc"]
+
+[dev-dependencies]
+zerocopy = { version = "0.7.5", features = ["alloc"] }

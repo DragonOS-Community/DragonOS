@@ -7,7 +7,7 @@ use virtio_drivers::{
 };
 
 use crate::driver::virtio::{
-    transport::VirtIOTransport, virtio_drivers_error_to_system_error, virtio_impl::HalImpl,
+    transport::VirtIOTransport, virtio_drivers_error_to_system_error, virtio_impl::VirtioFsQueueHal,
 };
 
 const VIRTIOFS_QUEUE_SIZE_MIN: usize = 8;
@@ -15,14 +15,14 @@ const VIRTIOFS_QUEUE_SIZE_MAX: usize = 1024;
 const VIRTIOFS_RESET_WAIT_SPINS: usize = 100_000;
 
 pub(super) enum VirtioFsQueue {
-    Q8(Box<VirtQueue<HalImpl, 8>>),
-    Q16(Box<VirtQueue<HalImpl, 16>>),
-    Q32(Box<VirtQueue<HalImpl, 32>>),
-    Q64(Box<VirtQueue<HalImpl, 64>>),
-    Q128(Box<VirtQueue<HalImpl, 128>>),
-    Q256(Box<VirtQueue<HalImpl, 256>>),
-    Q512(Box<VirtQueue<HalImpl, 512>>),
-    Q1024(Box<VirtQueue<HalImpl, 1024>>),
+    Q8(Box<VirtQueue<VirtioFsQueueHal, 8>>),
+    Q16(Box<VirtQueue<VirtioFsQueueHal, 16>>),
+    Q32(Box<VirtQueue<VirtioFsQueueHal, 32>>),
+    Q64(Box<VirtQueue<VirtioFsQueueHal, 64>>),
+    Q128(Box<VirtQueue<VirtioFsQueueHal, 128>>),
+    Q256(Box<VirtQueue<VirtioFsQueueHal, 256>>),
+    Q512(Box<VirtQueue<VirtioFsQueueHal, 512>>),
+    Q1024(Box<VirtQueue<VirtioFsQueueHal, 1024>>),
 }
 
 impl VirtioFsQueue {
@@ -173,7 +173,8 @@ fn create_queue_with_size(
 ) -> Result<VirtioFsQueue, VirtioError> {
     macro_rules! new_queue {
         ($size:expr, $variant:ident) => {{
-            let mut queue = VirtQueue::<HalImpl, $size>::new_boxed(transport, idx, false, false)?;
+            let mut queue =
+                VirtQueue::<VirtioFsQueueHal, $size>::new_boxed(transport, idx, false, false)?;
             queue.set_dev_notify(true);
             Ok(VirtioFsQueue::$variant(queue))
         }};

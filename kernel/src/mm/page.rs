@@ -51,6 +51,8 @@ use super::{
 };
 
 pub(crate) mod access;
+pub(crate) mod retirement;
+pub(crate) use retirement::retire_unmapped_page;
 #[cfg(target_arch = "x86_64")]
 pub(crate) mod migration;
 
@@ -376,16 +378,6 @@ pub fn detach_pages_from_manager_batched<'a>(pages: impl IntoIterator<Item = &'a
     }
 }
 
-/// Retire an unmapped private page only after old translations are invalidated,
-/// or if no PTE was published. The caller retains a page reference throughout.
-pub(crate) fn retire_unmapped_normal_page(page: &Arc<Page>) {
-    let removed = page_manager_lock().remove_unmapped_normal_page(page);
-    if removed.is_some() {
-        detach_pages_from_reclaimer_batched(core::iter::once(page));
-    }
-    drop(removed);
-}
-
 /// Identity-safe, bounded counterpart for the global page reclaimer registry.
 pub fn detach_pages_from_reclaimer_batched<'a>(pages: impl IntoIterator<Item = &'a Arc<Page>>) {
     let mut pages = pages.into_iter();
@@ -675,19 +667,6 @@ impl PageManager {
             return None;
         }
         self.phys2page.remove(&paddr)
-    }
-
-    /// Retire a private page after its PTE was replaced and the old TLB entry
-    /// invalidated (or after an unpublished mapping failed). The caller keeps
-    /// the page alive and must drop the returned owner outside the manager lock.
-    /// File/Shm pages retain their separate backing lifetime authorities.
-    pub(crate) fn remove_unmapped_normal_page(&mut self, page: &Arc<Page>) -> Option<Arc<Page>> {
-        let guard = page.read();
-        if !matches!(guard.page_type(), PageType::Normal) || !guard.can_deallocate_after_vma_unmap()
-        {
-            return None;
-        }
-        self.remove_page_if_same(page)
     }
 
     /// # 创建一个新页面并加入管理器
@@ -987,7 +966,7 @@ pub fn page_reclaimer_lock() -> MutexGuard<'static, PageReclaimer> {
     unsafe { PAGE_RECLAIMER.as_ref().unwrap().lock() }
 }
 
-fn try_page_reclaimer_lock() -> Option<MutexGuard<'static, PageReclaimer>> {
+pub(crate) fn try_page_reclaimer_lock() -> Option<MutexGuard<'static, PageReclaimer>> {
     unsafe { PAGE_RECLAIMER.as_ref()?.try_lock().ok() }
 }
 

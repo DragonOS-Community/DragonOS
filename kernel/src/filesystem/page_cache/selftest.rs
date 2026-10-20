@@ -3313,7 +3313,7 @@ fn run_memcg_reclaim_selftest() -> Result<bool, SystemError> {
                 | PageFlags::PG_WRITEBACK,
         )
         && page_reclaimer_lock().get(&copied.phys_address()).is_none();
-    crate::mm::page::retire_unmapped_normal_page(&copied);
+    crate::mm::page::retire_unmapped_page(&copied);
     drop(copied);
     retained
         .write()

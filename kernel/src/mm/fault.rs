@@ -599,7 +599,7 @@ impl PageFaultHandler {
         // All callers have either replaced the PTE and completed shootdown,
         // or failed to publish a mapping. A last private COW mapping must also
         // release PageManager ownership; no future VMA unmap can find this page.
-        super::page::retire_unmapped_normal_page(page);
+        super::page::retire_unmapped_page(page);
     }
 
     fn file_page_cache(

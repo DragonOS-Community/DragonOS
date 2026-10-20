@@ -77,7 +77,8 @@ TEST_F(PageMigrationPrerequisites, PhysicalAccessAndIsolationContract) {
 TEST_F(PageMigrationPrerequisites, TeardownCompletesBeforePhysicalRelease) {
     Check("tlb_teardown_selftest", {"smp_available", "kernel_teardown_order", "kernel_missing_flush_detected",
           "kernel_missing_ack_detected", "user_teardown_order", "user_missing_flush_detected",
-          "user_missing_ack_detected"});
+          "user_missing_ack_detected", "user_lru_teardown_order", "user_lru_missing_flush_detected",
+          "user_lru_missing_ack_detected"});
 }
 #endif
 

@@ -823,7 +823,7 @@ pub(crate) fn fork_restore_inherited_uprobes_locked(
         );
         old_page.write().remove_vma(vma.as_ref());
         InnerAddressSpace::remove_page_unevictable_if_unneeded(&old_page);
-        crate::mm::page::retire_unmapped_normal_page(&old_page);
+        crate::mm::page::retire_unmapped_page(&old_page);
     }
     Ok(())
 }

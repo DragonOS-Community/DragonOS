@@ -1149,7 +1149,7 @@ where
         drop(second_guard.take());
         drop(first_guard.take());
         drop(new_guard);
-        crate::mm::page::retire_unmapped_normal_page(&old_page);
+        crate::mm::page::retire_unmapped_page(&old_page);
         Ok(())
     })();
 

@@ -302,7 +302,23 @@ impl Drop for BorrowedMm {
     }
 }
 
-fn run(user: bool, mode: Mode, cpu: ProcessorId, diagnostic: &mut String) -> bool {
+// Weak-only cleanup for failed LRU fixtures: it cannot influence the real
+// observer's unique-owner/frame-free verdict. Declared before the private MM,
+// so normal MM teardown completes before rescuing a leaked baseline owner.
+struct LruRescue(Option<alloc::sync::Weak<crate::mm::page::Page>>);
+impl Drop for LruRescue {
+    fn drop(&mut self) {
+        if let Some(page) = self.0.as_ref().and_then(alloc::sync::Weak::upgrade) {
+            if page.read().map_count() != 0 {
+                return;
+            }
+            crate::mm::page::detach_pages_from_manager_batched(core::iter::once(&page));
+            crate::mm::page::detach_pages_from_reclaimer_batched(core::iter::once(&page));
+        }
+    }
+}
+
+fn run(user: bool, lru: bool, mode: Mode, cpu: ProcessorId, diagnostic: &mut String) -> bool {
     use core::fmt::Write;
     macro_rules! fail {
         ($stage:literal, $error:expr) => {{
@@ -310,6 +326,8 @@ fn run(user: bool, mode: Mode, cpu: ProcessorId, diagnostic: &mut String) -> boo
             return false;
         }};
     }
+    let mut lru_rescue = LruRescue(None);
+    let mut lru_account = None;
     let current = ProcessManager::current_pcb();
     let private = if user {
         match AddressSpace::new(false, current.cred().user_ns.clone(), 0) {
@@ -327,7 +345,7 @@ fn run(user: bool, mode: Mode, cpu: ProcessorId, diagnostic: &mut String) -> boo
             ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
             MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS,
             true,
-            true,
+            !lru,
         ) {
             Ok(page) => page.virt_address(),
             Err(error) => fail!("map_anonymous", error),
@@ -343,6 +361,57 @@ fn run(user: bool, mode: Mode, cpu: ProcessorId, diagnostic: &mut String) -> boo
             Err(error) => fail!("vmalloc", error),
         }
     };
+    if lru {
+        use crate::{
+            cgroup::memory::{MemoryAccount, MemoryKind},
+            mm::page::{allocate_registered_data_page, EntryFlags, PageFlags, PageType},
+        };
+        let mm = private.as_ref().expect("LRU fixture requires a user MM");
+        let account = match MemoryAccount::new(0x0139_1000_0000_0000, None) {
+            Ok(account) => account,
+            Err(error) => fail!("lru_account", error),
+        };
+        let charge = match account.try_charge(MemoryKind::Anon, 1) {
+            Ok(charge) => charge,
+            Err(error) => fail!("lru_charge", error),
+        };
+        let page = match allocate_registered_data_page(
+            PageType::Normal,
+            PageFlags::PG_LRU,
+            Some(charge),
+        ) {
+            Ok(page) => page,
+            Err(error) => fail!("lru_allocate", error),
+        };
+        lru_rescue.0 = Some(Arc::downgrade(&page));
+        unsafe {
+            page.write().as_slice_mut().fill(0);
+        }
+        let mut space = mm.write();
+        let vma = space
+            .mappings
+            .contains(start)
+            .expect("new lazy VMA disappeared");
+        let _pt = mm.page_table_edit();
+        let flags = EntryFlags::<MMArch>::from_prot_flags(
+            ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+            true,
+        )
+        .set_write(true);
+        let Some(flush) = (unsafe {
+            space
+                .user_mapper
+                .utable
+                .map_phys(start, page.phys_address(), flags)
+        }) else {
+            fail!("lru_map", start);
+        };
+        vma.lock().set_mapped(true);
+        page.write().insert_vma(vma, false);
+        mm.account_present_page_add();
+        flush.flush();
+        lru_account = Some(account);
+    }
     let observer = Observer::new(start, private.as_ref(), cpu, mode);
     if let Some(mm) = &private {
         let guard = mm.read();
@@ -444,7 +513,12 @@ fn run(user: bool, mode: Mode, cpu: ProcessorId, diagnostic: &mut String) -> boo
     }
     done.store(true, Ordering::Release);
     let stopped = matches!(KernelThreadMechanism::stop(&worker), Ok(0));
-    let passed = ready_ok && stopped && observer.passed();
+    let passed = ready_ok
+        && stopped
+        && observer.passed()
+        && lru_account
+            .as_ref()
+            .is_none_or(|account| account.current_pages() == 0);
     if !passed {
         let _ = writeln!(diagnostic,
             "stage=teardown ready={} stopped={} borrow={} saved_is_idle={} saved_active={} cleared={} pending={} remote={} returned={} negative={} failed={} frees={} tables={}",
@@ -482,16 +556,29 @@ pub(super) fn report() -> String {
         if target.is_some() { "ok" } else { "fail" }
     );
     let mut failures = usize::from(target.is_none());
-    for (user, mode, key) in [
-        (false, Mode::Normal, "kernel_teardown_order"),
-        (false, Mode::SkipFlush, "kernel_missing_flush_detected"),
-        (false, Mode::SkipAck, "kernel_missing_ack_detected"),
-        (true, Mode::Normal, "user_teardown_order"),
-        (true, Mode::SkipFlush, "user_missing_flush_detected"),
-        (true, Mode::SkipAck, "user_missing_ack_detected"),
+    for (user, lru, mode, key) in [
+        (false, false, Mode::Normal, "kernel_teardown_order"),
+        (
+            false,
+            false,
+            Mode::SkipFlush,
+            "kernel_missing_flush_detected",
+        ),
+        (false, false, Mode::SkipAck, "kernel_missing_ack_detected"),
+        (true, false, Mode::Normal, "user_teardown_order"),
+        (true, false, Mode::SkipFlush, "user_missing_flush_detected"),
+        (true, false, Mode::SkipAck, "user_missing_ack_detected"),
+        (true, true, Mode::Normal, "user_lru_teardown_order"),
+        (
+            true,
+            true,
+            Mode::SkipFlush,
+            "user_lru_missing_flush_detected",
+        ),
+        (true, true, Mode::SkipAck, "user_lru_missing_ack_detected"),
     ] {
         let mut diagnostic = String::new();
-        let ok = target.is_some_and(|cpu| run(user, mode, cpu, &mut diagnostic));
+        let ok = target.is_some_and(|cpu| run(user, lru, mode, cpu, &mut diagnostic));
         if !diagnostic.is_empty() {
             let _ = write!(report, "{key}_diagnostic={diagnostic}");
         }

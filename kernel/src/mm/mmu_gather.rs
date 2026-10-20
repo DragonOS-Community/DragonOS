@@ -145,11 +145,13 @@ impl<'mm> MmuGather<'mm> {
         }
     }
 
-    /// Add a physical page pending release to the pending list; actual release happens after TLB flush.
+    /// Retain a revoked managed PTE's Page through this transaction's barrier.
     ///
-    /// `paddr` points to a physical page already unmapped from the page table. The caller must ensure
-    /// that the anon_vma reverse mapping for this page has been cleaned up (e.g. by obtaining the
-    /// `Arc<Page>` via `PageManagerRef::remove_page` before passing it in).
+    /// Callers have removed this mapping's rmap. They must stash every revoked
+    /// managed page, including one still mapped by another MM: the last rmap
+    /// remover's barrier cannot stand in for this MM's pending shootdown.
+    /// Eligible registry ownership may already be detached by the Page layer;
+    /// remaining mappings, cache/backing owners and access pins stay valid.
     pub fn stash_page(&mut self, page: Arc<Page>) {
         self.pending_pages.push(page);
     }

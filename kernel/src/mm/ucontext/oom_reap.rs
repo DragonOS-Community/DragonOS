@@ -3,7 +3,10 @@
 use super::*;
 use crate::{
     filesystem::page_cache::PageCache,
-    mm::page::{try_page_manager_lock, PageTable},
+    mm::page::{
+        retirement::{detach_unmapped_page_locked, RetiredPageOwners},
+        try_page_manager_lock, try_page_reclaimer_lock, PageTable,
+    },
 };
 
 const BATCH: usize = 32;
@@ -46,7 +49,7 @@ pub(crate) enum OomReapBatchResult {
 #[derive(Default)]
 struct Retirement {
     page: Option<Arc<Page>>,
-    manager_owner: Option<Arc<Page>>,
+    owners: RetiredPageOwners,
     cache: Option<Arc<PageCache>>,
     rmap_backing: Option<hashbrown::HashMap<u64, Arc<LockedVMA>>>,
 }
@@ -260,6 +263,21 @@ impl AddressSpace {
                     if !page_guard.has_vma(&candidate) {
                         break Stop::Incomplete;
                     }
+                    let normal_frame = is_normal && page_guard.individually_owns_frame();
+                    // Page exclusivity stabilizes PG_LRU. Ordinary anonymous
+                    // pages need no reclaimer lock; only an LRU owner requires
+                    // it. Acquire before changing this PTE so contention leaves
+                    // the current mapping intact, while earlier batch entries
+                    // still pass through the common TLB barrier below.
+                    let mut reclaimer =
+                        if normal_frame && page_guard.flags().contains(PageFlags::PG_LRU) {
+                            let Some(reclaimer) = try_page_reclaimer_lock() else {
+                                break Stop::Busy;
+                            };
+                            Some(reclaimer)
+                        } else {
+                            None
+                        };
                     let cleared = unsafe {
                         inner
                             .user_mapper
@@ -284,12 +302,13 @@ impl AddressSpace {
                     if !still_unevictable {
                         page_guard.remove_flags(PageFlags::PG_UNEVICTABLE);
                     }
-                    if is_normal
-                        && page_guard.individually_owns_frame()
-                        && !page_guard.flags().contains(PageFlags::PG_LRU)
-                        && page_guard.can_deallocate_after_vma_unmap()
-                    {
-                        slot.manager_owner = manager.remove_page_if_same(&page);
+                    if normal_frame {
+                        slot.owners = detach_unmapped_page_locked(
+                            &page,
+                            &mut page_guard,
+                            &mut manager,
+                            reclaimer.as_deref_mut(),
+                        );
                     }
                     self.account_present_page_sub();
                     unmapped += 1;

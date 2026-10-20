@@ -11,8 +11,10 @@ RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 # 设置工作目录
 WORKDIR /tmp
 
-# 将本地的脚本复制到工作目录
+# 将本地的脚本和 dadk 源码复制到工作目录。
+# bootstrap.sh 按自身位置寻找 ./dadk，安装结果写入 cargo bin。
 COPY *.sh ./
+COPY dadk /tmp/dadk
 
 # 设置sudo免密码
 RUN apt update && \

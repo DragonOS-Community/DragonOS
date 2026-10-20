@@ -228,13 +228,13 @@ impl ProcessSignalState {
         }
     }
 
-    /// 启动线程组退出：
+    /// 启动线程组退出，返回（最终退出码，是否首次转换）：
     /// - 若此前尚未标记 GROUP_EXIT，则设置标志与退出码，并返回本次传入的退出码
     /// - 若已经有线程设置了 GROUP_EXIT，则直接返回已存在的 group_exit_code
-    pub fn start_group_exit(&self, exit_code: usize) -> usize {
+    pub fn start_group_exit(&self, exit_code: usize) -> (usize, bool) {
         let mut g = self.inner_mut();
         if g.flags.contains(SignalFlags::GROUP_EXIT) {
-            g.group_exit_code
+            (g.group_exit_code, false)
         } else {
             // Linux do_group_exit() replaces signal->flags with
             // SIGNAL_GROUP_EXIT, discarding all job-control wait state.
@@ -245,7 +245,7 @@ impl ProcessSignalState {
             self.body
                 .group_exit_started
                 .store(true, core::sync::atomic::Ordering::Release);
-            exit_code
+            (exit_code, true)
         }
     }
 

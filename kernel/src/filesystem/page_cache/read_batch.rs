@@ -200,7 +200,7 @@ impl PageCacheReadBatchCompletion {
             }
             slot.page.write().add_flags(PageFlags::PG_ERROR);
             slot.entry.set_state(PageState::Error);
-            slot.entry.wait_queue.wake_all();
+            slot.entry.notify_waiters();
             self.remove_failed(slot);
         }
         Ok(())
@@ -267,14 +267,14 @@ impl PageCacheReadBatchCompletion {
             slot.entry
                 .account_state_transition(PageState::Loading, PageState::UpToDate);
             slot.entry.set_state(PageState::UpToDate);
-            slot.entry.wait_queue.wake_all();
+            slot.entry.notify_waiters();
         } else {
             // The mapping may have been torn down after a reader captured this
             // Loading entry. Identity validation must prevent stale data from
             // being republished, but the detached entry still owns its wait
             // protocol and therefore needs an observable terminal state.
             slot.entry.set_state(PageState::Error);
-            slot.entry.wait_queue.wake_all();
+            slot.entry.notify_waiters();
         }
         drop(inner);
         self.finish_one();
@@ -331,7 +331,7 @@ impl PageCacheReadBatchCompletion {
             };
             if removed {
                 slot.entry.set_state(PageState::Error);
-                slot.entry.wait_queue.wake_all();
+                slot.entry.notify_waiters();
             }
             cache.discard_unlinked_page(&slot.page);
         }
@@ -346,7 +346,7 @@ impl Drop for LoadingBatch {
             }
             slot.page.write().add_flags(PageFlags::PG_ERROR);
             slot.entry.set_state(PageState::Error);
-            slot.entry.wait_queue.wake_all();
+            slot.entry.notify_waiters();
             let removed = {
                 let mut inner = self.cache.inner.lock();
                 if inner

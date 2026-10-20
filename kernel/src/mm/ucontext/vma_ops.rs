@@ -1469,36 +1469,39 @@ impl InnerAddressSpace {
         //    so we use `MmuGather::gather_teardown()`, skipping cross-core shootdown, only tearing down PTEs
         //    and releasing physical pages in INV-3 order ("flush first, release later").
         let mm_arc = self.outer_addr_space();
-        let _pt_edit = mm_arc.as_ref().map(|mm| mm.page_table_edit());
+        let pt_edit = mm_arc.as_ref().map(|mm| mm.page_table_edit());
         let mut tlb = match mm_arc.as_ref() {
             Some(mm) => MmuGather::gather(mm),
             None => MmuGather::gather_teardown(),
         };
         // Full-mm flush (fullmm); no need to accumulate ranges.
         tlb.set_fullmm();
-        let mut vma_close_notifications = Vec::new();
-        let mut sysv_close_notifications = Vec::new();
-        let unmapped_vmas = self.mappings.take_all_vmas();
+        let unmapped_vmas = self.mappings.take_all_vmas_for_teardown();
         for vma in &unmapped_vmas {
-            let region = *vma.lock().region();
-            if let Some(notification) = Self::collect_vma_close(vma, region) {
-                vma_close_notifications.push(notification);
-            }
-            let sysv_close = Self::collect_sysv_shm_close(vma);
-            if let Some(notification) = sysv_close {
-                sysv_close_notifications.push(notification);
-            }
             if vma.mapped() {
                 vma.unmap(&mut self.user_mapper.utable, &mut tlb);
             }
         }
         tlb.finish();
-        drop(unmapped_vmas);
-        for notification in vma_close_notifications {
-            Self::notify_vma_close(notification);
-        }
-        for notification in sysv_close_notifications {
-            Self::notify_sysv_shm_close(notification);
+        drop(pt_edit);
+        // The core has retired all detached PTE/Page/PT owners. Test-only
+        // denial stops here; VMA callbacks may legitimately perform FS I/O.
+        #[cfg(feature = "mm_selftest")]
+        crate::mm::oom::denial::end_victim_core_retirement();
+        // The original set retains each VMA and its unchanged file/flags/SysV
+        // metadata until every PTE has crossed its TLB barrier. Consume it
+        // directly, without another full-MM notification collection.
+        for vma in unmapped_vmas {
+            let region = *vma.lock().region();
+            let file_close = Self::collect_vma_close(&vma, region);
+            let sysv_close = Self::collect_sysv_shm_close(&vma);
+            drop(vma);
+            if let Some(notification) = file_close {
+                Self::notify_vma_close(notification);
+            }
+            if let Some(notification) = sysv_close {
+                Self::notify_sysv_shm_close(notification);
+            }
         }
     }
 

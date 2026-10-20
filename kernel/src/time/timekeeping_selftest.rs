@@ -1,6 +1,6 @@
 use alloc::{
     format,
-    string::{String, ToString},
+    string::String,
     sync::{Arc, Weak},
 };
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -30,7 +30,7 @@ impl FakeClock {
         let clock = Arc::new(Self {
             inner: SpinLock::new(FakeClockInner {
                 data: ClocksourceData {
-                    name: name.to_string(),
+                    name: name.into(),
                     rating: 100,
                     mask: ClocksourceMask::new(mask),
                     mult,

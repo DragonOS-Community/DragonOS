@@ -51,6 +51,7 @@ pub struct AddressSpaceData {
     /// This ID remains unchanged throughout the address space's lifecycle and is never reused
     id: u64,
     oom_reap_slot: crate::mm::oom_reaper::OomReapSlot,
+    pub(crate) lazy_drop_link: SpinLock<crate::mm::lazy_mm_drop::LazyMmDropLink>,
     /// Page table physical address (unchanged after creation, lock-free access)
     /// Used for fast page table switching in scheduler context without acquiring the RwSem lock
     table_paddr: PhysAddr,
@@ -497,6 +498,7 @@ impl AddressSpace {
         let data = AddressSpaceData {
             id,
             oom_reap_slot: prepared.bind(id),
+            lazy_drop_link: SpinLock::new(Default::default()),
             table_paddr,
             active_cpus: SpinLock::new(active_cpus),
             #[cfg(target_arch = "riscv64")]
@@ -518,7 +520,7 @@ impl AddressSpace {
             dumpable: AtomicU8::new(dumpable),
             user_ns: SpinLock::new(user_ns),
             exec_enforce_nondump: AtomicBool::new(false),
-            inner: RwSem::new(inner),
+            inner: RwSem::new_resource(inner),
             reservation_wait: WaitQueue::default(),
             #[cfg(target_arch = "x86_64")]
             uprobe_list,
@@ -971,17 +973,24 @@ impl AddressSpace {
         crate::mm::tlb::flush_tlb_mm(self);
     }
 
+    #[cfg(feature = "mm_selftest")]
+    pub(crate) fn inner_resource_key_for_test(&self) -> usize {
+        self.inner.resource_key_for_test()
+    }
+
     #[inline]
-    pub fn page_table_edit(&self) -> MutexGuard<'_, ()> {
+    pub fn page_table_edit(&self) -> crate::libs::resource_wait::ResourceMutexGuard<'_, ()> {
         debug_assert!(
             CurrentIrqArch::is_irq_enabled(),
             "page_table_edit_lock must not be taken with interrupts disabled"
         );
-        self.page_table_edit_lock.lock()
+        crate::libs::resource_wait::ResourceMutexGuard::lock(&self.page_table_edit_lock)
     }
 
-    pub(crate) fn try_page_table_edit(&self) -> Option<MutexGuard<'_, ()>> {
-        self.page_table_edit_lock.try_lock().ok()
+    pub(crate) fn try_page_table_edit(
+        &self,
+    ) -> Option<crate::libs::resource_wait::ResourceMutexGuard<'_, ()>> {
+        crate::libs::resource_wait::ResourceMutexGuard::try_lock(&self.page_table_edit_lock)
     }
 
     pub(crate) fn is_oom_unstable(&self) -> bool {

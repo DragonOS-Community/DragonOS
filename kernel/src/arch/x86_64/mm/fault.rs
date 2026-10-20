@@ -734,14 +734,14 @@ impl X86_64MMArch {
                         continue;
                     }
 
-                    error!(
-                        "page fault OOM: pid={:?}, addr={:#x}, rip={:#x}, fault={:?}",
+                    drop(space_guard);
+                    crate::mm::oom::report::report(format_args!(
+                        "page fault OOM: pid={:?}, addr={:#x}, rip={:#x}, fault={:?}\n",
                         ProcessManager::current_pid(),
                         address.data(),
                         regs.rip,
                         fault
-                    );
-                    drop(space_guard);
+                    ));
                     let ctx = OomContext {
                         trigger_pid: ProcessManager::current_pid(),
                         trigger_tgid: ProcessManager::current_pcb().raw_tgid(),

@@ -21,6 +21,8 @@ pub(crate) mod recovery;
 
 static EXECUTION: Mutex<()> = Mutex::new(());
 
+pub(crate) const MAX_DEFER_SHIFT: u8 = 6;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Stop {
     Invalid,
@@ -215,7 +217,7 @@ impl Compactor {
             self.defer_shift = 0;
             self.defer_left = 0;
         } else if stats.moved == 0 && matches!(result, Err(Stop::Blocked | Stop::NoMemory)) {
-            self.defer_shift = (self.defer_shift + 1).min(6);
+            self.defer_shift = (self.defer_shift + 1).min(MAX_DEFER_SHIFT);
             self.defer_left = (1u8 << self.defer_shift) - 1;
         }
         Attempt {

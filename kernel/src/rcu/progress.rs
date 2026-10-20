@@ -4,7 +4,8 @@
 //! coordinator supplies a timestamp and the authoritative holdout mask, then
 //! executes the returned actions after dropping its lock.
 
-use crate::{libs::cpumask::CpuMask, mm::percpu::PerCpu, smp::cpu::ProcessorId};
+use super::cpu_mask::RcuCpuMask;
+use crate::smp::cpu::ProcessorId;
 
 use super::gp::RcuSequence;
 
@@ -16,91 +17,6 @@ pub(super) const STALL_REPEAT_NS: u64 = 63_000_000_000;
 const STALL_RETRY_NS: u64 = 1_000_000_000;
 
 const HALF_RANGE: u64 = 1_u64 << 63;
-const MASK_WORDS: usize = (PerCpu::MAX_CPU_NUM as usize).div_ceil(u64::BITS as usize);
-
-/// Allocation-free holdout snapshot used by timer-interrupt escalation.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct ProgressCpuMask {
-    words: [u64; MASK_WORDS],
-}
-
-impl ProgressCpuMask {
-    pub(super) const fn new() -> Self {
-        Self {
-            words: [0; MASK_WORDS],
-        }
-    }
-
-    pub(super) fn from_cpu_mask(mask: &CpuMask) -> Self {
-        let mut result = Self::new();
-        for cpu in mask.iter_cpu() {
-            result.set(cpu, true);
-        }
-        result
-    }
-
-    fn from_cpu(cpu: ProcessorId) -> Self {
-        let mut result = Self::new();
-        result.set(cpu, true);
-        result
-    }
-
-    pub(super) fn set(&mut self, cpu: ProcessorId, value: bool) {
-        let index = cpu.data() as usize;
-        debug_assert!(index < PerCpu::MAX_CPU_NUM as usize);
-        let word = index / u64::BITS as usize;
-        let bit = 1u64 << (index % u64::BITS as usize);
-        if value {
-            self.words[word] |= bit;
-        } else {
-            self.words[word] &= !bit;
-        }
-    }
-
-    fn get(&self, cpu: ProcessorId) -> bool {
-        let index = cpu.data() as usize;
-        let word = index / u64::BITS as usize;
-        let bit = 1u64 << (index % u64::BITS as usize);
-        self.words[word] & bit != 0
-    }
-
-    pub(super) fn is_empty(&self) -> bool {
-        self.words.iter().all(|word| *word == 0)
-    }
-
-    fn intersect(&mut self, other: &Self) {
-        for (word, other_word) in self.words.iter_mut().zip(other.words.iter()) {
-            *word &= *other_word;
-        }
-    }
-
-    pub(super) fn iter_cpu(&self) -> ProgressCpuMaskIter<'_> {
-        ProgressCpuMaskIter {
-            mask: self,
-            next: 0,
-        }
-    }
-}
-
-pub(super) struct ProgressCpuMaskIter<'a> {
-    mask: &'a ProgressCpuMask,
-    next: u32,
-}
-
-impl Iterator for ProgressCpuMaskIter<'_> {
-    type Item = ProcessorId;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        while self.next < PerCpu::MAX_CPU_NUM {
-            let cpu = ProcessorId::new(self.next);
-            self.next += 1;
-            if self.mask.get(cpu) {
-                return Some(cpu);
-            }
-        }
-        None
-    }
-}
 
 #[inline]
 pub(super) const fn elapsed_at_least(now: u64, origin: u64, interval: u64) -> bool {
@@ -117,13 +33,13 @@ pub(super) struct StallCandidate {
     pub(super) seq: RcuSequence,
     pub(super) started_at: u64,
     pub(super) last_progress_at: u64,
-    pub(super) holdouts: ProgressCpuMask,
+    pub(super) holdouts: RcuCpuMask,
     pub(super) report_number: u64,
 }
 
 pub(super) struct ProgressActions {
-    pub(super) soft: ProgressCpuMask,
-    pub(super) resched: ProgressCpuMask,
+    pub(super) soft: RcuCpuMask,
+    pub(super) resched: RcuCpuMask,
     pub(super) stall: Option<StallCandidate>,
     pub(super) next_deadline: u64,
 }
@@ -195,7 +111,7 @@ impl ActiveGpProgress {
         now.wrapping_add(soft_remaining.min(resched_remaining).min(stall_remaining))
     }
 
-    pub(super) fn actions(&mut self, now: u64, holdouts: ProgressCpuMask) -> ProgressActions {
+    pub(super) fn actions(&mut self, now: u64, holdouts: RcuCpuMask) -> ProgressActions {
         let soft_due =
             !self.soft_requested && elapsed_at_least(now, self.started_at, SOFT_REQUEST_NS);
         if soft_due {
@@ -236,12 +152,12 @@ impl ActiveGpProgress {
             soft: if soft_due {
                 holdouts
             } else {
-                ProgressCpuMask::new()
+                RcuCpuMask::new()
             },
             resched: if resched_due {
                 holdouts
             } else {
-                ProgressCpuMask::new()
+                RcuCpuMask::new()
             },
             stall,
             next_deadline: self.next_deadline(now),
@@ -271,7 +187,7 @@ impl ActiveGpProgress {
 /// report-rate-limit state.
 pub(super) fn validate_and_commit_stall(
     current_seq: RcuSequence,
-    current_holdouts: ProgressCpuMask,
+    current_holdouts: RcuCpuMask,
     progress: &mut ActiveGpProgress,
     mut candidate: StallCandidate,
     now: u64,
@@ -314,7 +230,7 @@ fn run_stall_validation_selftest() -> Result<(), &'static str> {
     let old_seq = RcuSequence::from_raw(9);
     let cpu0 = ProcessorId::new(0);
     let cpu1 = ProcessorId::new(1);
-    let mut original = ProgressCpuMask::from_cpu(cpu0);
+    let mut original = RcuCpuMask::from_cpu(cpu0);
     original.set(cpu1, true);
 
     let mut stale_progress = ActiveGpProgress::new(seq, 0);
@@ -341,7 +257,7 @@ fn run_stall_validation_selftest() -> Result<(), &'static str> {
         .unwrap();
     if validate_and_commit_stall(
         seq,
-        ProgressCpuMask::new(),
+        RcuCpuMask::new(),
         &mut empty_progress,
         empty,
         STALL_TIMEOUT_NS,
@@ -357,7 +273,7 @@ fn run_stall_validation_selftest() -> Result<(), &'static str> {
         .actions(STALL_TIMEOUT_NS, original)
         .stall
         .unwrap();
-    let current = ProgressCpuMask::from_cpu(cpu1);
+    let current = RcuCpuMask::from_cpu(cpu1);
     let committed =
         validate_and_commit_stall(seq, current, &mut valid_progress, valid, STALL_TIMEOUT_NS)
             .ok_or("RCU stall validation rejected a current candidate")?;
@@ -381,7 +297,7 @@ fn run_stall_validation_selftest() -> Result<(), &'static str> {
 fn run_deadline_wrap_selftest() -> Result<(), &'static str> {
     let seq = RcuSequence::from_raw(9);
     let started_at = 0u64.wrapping_sub(SOFT_REQUEST_NS);
-    let holdout = ProgressCpuMask::from_cpu(ProcessorId::new(0));
+    let holdout = RcuCpuMask::from_cpu(ProcessorId::new(0));
     let mut progress = ActiveGpProgress::new(seq, started_at);
     if progress.next_deadline(started_at) != 0 {
         return Err("RCU progress selftest did not construct a zero wrapping deadline");
@@ -396,7 +312,7 @@ fn run_deadline_wrap_selftest() -> Result<(), &'static str> {
 #[inline(never)]
 fn run_escalation_selftest() -> Result<(), &'static str> {
     let seq = RcuSequence::from_raw(7);
-    let mut holdouts = ProgressCpuMask::from_cpu(ProcessorId::new(0));
+    let mut holdouts = RcuCpuMask::from_cpu(ProcessorId::new(0));
     holdouts.set(ProcessorId::new(1), true);
     let mut progress = ActiveGpProgress::new(seq, 100);
 
@@ -420,7 +336,7 @@ fn run_stall_repeat_selftest() -> Result<(), &'static str> {
     // Force both independent actions due in one evaluation. A mutually
     // exclusive implementation would silently starve the stall report.
     let seq = RcuSequence::from_raw(7);
-    let mut holdouts = ProgressCpuMask::from_cpu(ProcessorId::new(0));
+    let mut holdouts = RcuCpuMask::from_cpu(ProcessorId::new(0));
     holdouts.set(ProcessorId::new(1), true);
     let mut simultaneous = ActiveGpProgress::new(seq, 0);
     simultaneous.last_resched_at = Some(STALL_TIMEOUT_NS - RESCHED_REPEAT_NS);
@@ -472,9 +388,9 @@ fn run_stall_repeat_selftest() -> Result<(), &'static str> {
 fn run_partial_progress_selftest() -> Result<(), &'static str> {
     let seq = RcuSequence::from_raw(7);
     let mut progress = ActiveGpProgress::new(seq, 100);
-    let initial = ProgressCpuMask::from_cpu(ProcessorId::new(1));
+    let initial = RcuCpuMask::from_cpu(ProcessorId::new(1));
     let _ = progress.actions(100 + RESCHED_DELAY_NS, initial);
-    let mut remaining_holdout = ProgressCpuMask::from_cpu(ProcessorId::new(1));
+    let mut remaining_holdout = RcuCpuMask::from_cpu(ProcessorId::new(1));
     progress.note_progress(100 + RESCHED_DELAY_NS + 1);
     let repeated = progress.actions(
         100 + RESCHED_DELAY_NS + RESCHED_REPEAT_NS,

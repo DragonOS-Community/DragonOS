@@ -1,6 +1,6 @@
 use core::fmt::{self, Write};
 
-use alloc::string::ToString;
+use alloc::string::{String, ToString};
 use log::{info, Level, Log};
 
 use super::lib_ui::textui::{textui_putstr, FontColor};
@@ -64,9 +64,75 @@ pub fn __printk(args: fmt::Arguments) {
     PrintkWriter.write_fmt(args).unwrap();
 }
 
+const BOUNDED_LOG_CAPACITY: usize = 384;
+
+/// Stack-only diagnostic formatting for allocation-constrained paths.
+/// Arguments must not allocate from their own Display/Debug implementations.
+pub(crate) struct BoundedLogRecord {
+    bytes: [u8; BOUNDED_LOG_CAPACITY],
+    len: usize,
+}
+
+impl BoundedLogRecord {
+    pub(crate) fn new() -> Self {
+        Self {
+            bytes: [0; BOUNDED_LOG_CAPACITY],
+            len: 0,
+        }
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        core::str::from_utf8(self.as_bytes()).expect("UTF-8 diagnostic record")
+    }
+
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
+}
+
+impl Write for BoundedLogRecord {
+    fn write_str(&mut self, text: &str) -> fmt::Result {
+        let mut count = text.len().min(BOUNDED_LOG_CAPACITY - self.len);
+        while !text.is_char_boundary(count) {
+            count -= 1;
+        }
+        self.bytes[self.len..self.len + count].copy_from_slice(&text.as_bytes()[..count]);
+        self.len += count;
+        if count == text.len() {
+            Ok(())
+        } else {
+            Err(fmt::Error)
+        }
+    }
+}
+
 pub struct Logger;
 
 impl Logger {
+    /// Format without growing a buffer, then use the fallible existing sink.
+    pub(crate) fn try_log_fmt(&self, level: LogLevel, arguments: fmt::Arguments<'_>) {
+        let mut record = BoundedLogRecord::new();
+        let _ = record.write_fmt(arguments);
+        self.try_log_text(level, record.as_str());
+    }
+
+    /// Best-effort insertion into the existing fixed ring. All allocation is
+    /// fallible and outside the log lock; a busy logger cannot block recovery.
+    pub(crate) fn try_log_text(&self, level: LogLevel, text: &str) {
+        let Some(kmsg) = (unsafe { KMSG.as_ref() }) else {
+            return;
+        };
+        let mut message = String::new();
+        if message.try_reserve_exact(text.len()).is_err() {
+            return;
+        }
+        message.push_str(text);
+        let record = LogMessage::new(PosixTimeSpec::now_cpu_time(), level, message);
+        if let Ok(mut kmsg) = kmsg.try_lock_irqsave() {
+            kmsg.push(record);
+        }
+    }
+
     pub fn log(&self, log_level: LogLevel, message: fmt::Arguments) {
         if unsafe { KMSG.is_some() } {
             let timestamp: PosixTimeSpec = PosixTimeSpec::now_cpu_time();
@@ -173,4 +239,22 @@ pub fn early_init_logging() {
     log::set_logger(&KernelLogger).unwrap();
     log::set_max_level(log::LevelFilter::Debug);
     info!("Logging initialized");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncates_on_utf8_boundary_without_allocation() {
+        let mut record = BoundedLogRecord::new();
+        for _ in 0..127 {
+            record.write_str("中").unwrap();
+        }
+        assert!(record.write_str("中文").is_err());
+        assert_eq!(record.as_bytes().len(), BOUNDED_LOG_CAPACITY);
+        assert!(core::str::from_utf8(record.as_bytes()).is_ok());
+        assert_eq!(record.as_str().as_bytes(), record.as_bytes());
+        assert!(record.write_str("x").is_err());
+    }
 }

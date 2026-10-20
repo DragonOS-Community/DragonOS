@@ -32,7 +32,7 @@ use log::warn;
 
 use crate::{
     exception::softirq::{softirq_vectors, SoftirqNumber, SoftirqVec},
-    libs::{cpumask::CpuMask, mutex::Mutex, spinlock::SpinLock, wait_queue::WaitQueue},
+    libs::{mutex::Mutex, spinlock::SpinLock, wait_queue::WaitQueue},
     mm::percpu::PerCpu,
     process::{
         kthread::KernelThreadClosure, kthread::KernelThreadMechanism, preempt::PreemptGuard,
@@ -48,9 +48,14 @@ use crate::{
 
 mod callback;
 mod context;
+mod cpu_mask;
 mod gp;
 mod progress;
 mod selftest;
+#[cfg(feature = "mm_selftest")]
+mod selftest_slot_drop;
+#[cfg(feature = "mm_selftest")]
+pub(crate) use selftest_slot_drop::heap_denied_slot_drop_selftest;
 pub mod srcu;
 mod torture;
 pub use callback::RcuHead;
@@ -59,10 +64,9 @@ use context::{
     BaseContext, ContextTransition, ContextTransitionError, IdleTransition, IrqDisposition,
     IrqEntry, RcuContextTracker,
 };
+use cpu_mask::RcuCpuMask;
 use gp::{GracePeriodState, RcuSequence};
-use progress::{
-    validate_and_commit_stall, ActiveGpProgress, ProgressActions, ProgressCpuMask, StallCandidate,
-};
+use progress::{validate_and_commit_stall, ActiveGpProgress, ProgressActions, StallCandidate};
 pub use selftest::run_debug_selftests;
 pub(crate) use torture::{run_torture, RcuTortureConfig};
 
@@ -188,9 +192,10 @@ impl<T: Send + Sync + 'static> Drop for RcuArcRetirement<T> {
 #[derive(Debug)]
 /// An RCU-published non-null `Arc` slot.
 ///
-/// Deferred updates and destruction allocate callback storage, so this type
-/// must be updated and dropped only from a task context where allocation is
-/// permitted. Its read-side operations do not inherit that restriction.
+/// Deferred updates allocate callback storage and require an allocating task
+/// context. Terminal destruction releases only the current slot-owned `Arc`:
+/// readers borrow this slot until they acquire a strong pin or finish their
+/// callback. The payload destructor retains its own context requirements.
 pub struct RcuArcSlot<T>
 where
     T: Send + Sync + 'static,
@@ -198,22 +203,6 @@ where
     ptr: AtomicPtr<T>,
     #[cfg(test)]
     unprepared_stores: AtomicUsize,
-}
-
-unsafe fn defer_drop_slot_arc_raw<T>(raw: *mut T)
-where
-    T: Send + Sync + 'static,
-{
-    if raw.is_null() {
-        return;
-    }
-
-    // SAFETY: callers pass a non-null pointer previously created by
-    // Arc::into_raw() for the slot-owned reference. Removing that pointer from
-    // an RCU-visible slot is a publication removal, so the reference must be
-    // released only after a grace period.
-    let old = unsafe { Arc::from_raw(raw) };
-    rcu_defer_drop(old);
 }
 
 impl<T> RcuArcSlot<T>
@@ -225,6 +214,27 @@ where
             ptr: AtomicPtr::new(Arc::into_raw(initial) as *mut T),
             #[cfg(test)]
             unprepared_stores: AtomicUsize::new(0),
+        }
+    }
+
+    /// Transfer the slot-owned reference during terminal destruction.
+    /// The emptied slot may only be dropped afterwards; it cannot be loaded
+    /// or published again. Ordinary slot destruction also releases its current
+    /// owner synchronously.
+    ///
+    /// # Safety
+    /// No raw RCU reader may still access this slot's current pointer, and
+    /// the caller must be able to retire the last `T` in its current context.
+    /// Any unsafe reader must obey the same slot-borrow lifetime as the safe
+    /// read methods; this operation does not extend an escaped raw pointer.
+    pub(crate) unsafe fn take_for_drop(&mut self) -> Option<Arc<T>> {
+        let raw = self.ptr.swap(ptr::null_mut(), Ordering::AcqRel);
+        if raw.is_null() {
+            None
+        } else {
+            // SAFETY: the pointer is the unique reference owned by this slot;
+            // the caller establishes that no unpinned raw reader remains.
+            Some(unsafe { Arc::from_raw(raw) })
         }
     }
 
@@ -322,19 +332,24 @@ where
 {
     fn drop(&mut self) {
         let raw = self.ptr.swap(ptr::null_mut(), Ordering::AcqRel);
-        // SAFETY: `raw` was removed from this slot exactly once. Even though
-        // `Drop` has exclusive access to the slot, an RCU reader may have
-        // already dereferenced the old pointer and not yet pinned its own Arc.
-        unsafe { defer_drop_slot_arc_raw(raw) };
+        // SAFETY: every raw read is confined to a method borrowing this slot.
+        // load() acquires its own Arc before returning; with_read() finishes
+        // using the raw reference before releasing that borrow. Neither can
+        // overlap this exclusive terminal destruction. Replaced owners still
+        // follow their separate deferred-retirement protocol.
+        if !raw.is_null() {
+            drop(unsafe { Arc::from_raw(raw) });
+        }
     }
 }
 
 #[derive(Debug)]
 /// An RCU-published optional `Arc` slot.
 ///
-/// Deferred updates and destruction allocate callback storage, so this type
-/// must be updated and dropped only from a task context where allocation is
-/// permitted. Its read-side operations do not inherit that restriction.
+/// Deferred updates allocate callback storage and require an allocating task
+/// context. Terminal destruction releases only the current slot-owned `Arc`:
+/// readers borrow this slot until they acquire a strong pin or finish their
+/// callback. The payload destructor retains its own context requirements.
 pub struct RcuOptionArcSlot<T>
 where
     T: Send + Sync + 'static,
@@ -441,6 +456,18 @@ where
         prepared.bind_removed(old)
     }
 
+    /// Clear a publication using already prepared callback storage. An empty
+    /// slot needs no callback; callers retire the unused storage outside locks.
+    pub(crate) fn clear_prepared(
+        &self,
+        prepared: PreparedRcuArcRetire<T>,
+    ) -> Option<RcuArcRetirement<T>> {
+        // SAFETY: the prepared callback retains any removed owner through
+        // its grace period. A returned retirement also submits itself on Drop.
+        let old = unsafe { self.swap(None) }?;
+        Some(prepared.bind_removed(old))
+    }
+
     #[cfg(test)]
     pub(crate) fn unprepared_store_count_for_test(&self) -> usize {
         self.unprepared_stores.load(Ordering::Relaxed)
@@ -488,10 +515,13 @@ where
 {
     fn drop(&mut self) {
         let raw = self.ptr.swap(ptr::null_mut(), Ordering::AcqRel);
-        // SAFETY: `raw` was removed from this slot exactly once. Dropping a
-        // slot is still a removal from an RCU-visible publication point, so the
-        // slot-owned Arc reference must be released after a grace period.
-        unsafe { defer_drop_slot_arc_raw(raw) };
+        // SAFETY: load() pins its Arc and clear_if_deferred() completes its
+        // raw predicate while borrowing this slot. No such borrow can overlap
+        // terminal Drop. Concurrent replacements still retire their removed
+        // owners through a grace period; this releases only the current owner.
+        if !raw.is_null() {
+            drop(unsafe { Arc::from_raw(raw) });
+        }
     }
 }
 
@@ -502,7 +532,7 @@ struct RcuStateInner {
     pending_stall: Option<StallCandidate>,
     /// CPUs that have executed the RCU starting hook and are eligible for
     /// future GP snapshots. The active GP keeps its own immutable snapshot.
-    participating_cpus: CpuMask,
+    participating_cpus: RcuCpuMask,
 }
 
 struct GracePeriodPumpHooks<W, C, P, CC, PC, NS, NC> {
@@ -521,7 +551,7 @@ impl RcuStateInner {
             gp: GracePeriodState::new(),
             progress: None,
             pending_stall: None,
-            participating_cpus: CpuMask::new(),
+            participating_cpus: RcuCpuMask::new(),
         }
     }
 }
@@ -729,7 +759,7 @@ impl RcuState {
         hooks: GracePeriodPumpHooks<W, C, P, CC, PC, NS, NC>,
     ) -> bool
     where
-        W: FnMut(&CpuMask) -> (CpuMask, [u64; PerCpu::MAX_CPU_NUM as usize]),
+        W: FnMut(&RcuCpuMask) -> (RcuCpuMask, [u64; PerCpu::MAX_CPU_NUM as usize]),
         C: FnMut(&mut GracePeriodState) -> bool,
         P: FnMut(bool),
         CC: FnMut(RcuSequence) -> bool,
@@ -964,12 +994,10 @@ impl RcuState {
             return None;
         }
 
-        let holdouts = ProgressCpuMask::from_cpu_mask(
-            inner
-                .gp
-                .waiting_cpus_ref()
-                .expect("active RCU GP has no holdout state"),
-        );
+        let holdouts = *inner
+            .gp
+            .waiting_cpus_ref()
+            .expect("active RCU GP has no holdout state");
         let active_seq = inner.gp.current();
         let progress = inner
             .progress
@@ -1022,12 +1050,10 @@ impl RcuState {
             return;
         }
         let current_seq = inner.gp.current();
-        let current_holdouts = ProgressCpuMask::from_cpu_mask(
-            inner
-                .gp
-                .waiting_cpus_ref()
-                .expect("active RCU GP has no holdout state"),
-        );
+        let current_holdouts = *inner
+            .gp
+            .waiting_cpus_ref()
+            .expect("active RCU GP has no holdout state");
         let Some(progress) = inner.progress.as_mut() else {
             return;
         };
@@ -1370,9 +1396,9 @@ fn scheduler_tick_slow(now: u64) {
 }
 
 fn participating_context_snapshot(
-    participating_cpus: &CpuMask,
-) -> (CpuMask, [u64; PerCpu::MAX_CPU_NUM as usize]) {
-    let mut waiting = CpuMask::new();
+    participating_cpus: &RcuCpuMask,
+) -> (RcuCpuMask, [u64; PerCpu::MAX_CPU_NUM as usize]) {
+    let mut waiting = RcuCpuMask::new();
     let mut generations = [0; PerCpu::MAX_CPU_NUM as usize];
 
     for cpu in participating_cpus.iter_cpu() {
@@ -2252,8 +2278,8 @@ pub(crate) fn state_debug_report() -> String {
     let holdouts = inner
         .gp
         .waiting_cpus_ref()
-        .map(ProgressCpuMask::from_cpu_mask)
-        .unwrap_or_else(ProgressCpuMask::new);
+        .copied()
+        .unwrap_or_else(RcuCpuMask::new);
     let progress = inner.progress.as_ref().map(|progress| {
         (
             progress.started_at(),

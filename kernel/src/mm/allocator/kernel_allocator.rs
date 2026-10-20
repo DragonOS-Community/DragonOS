@@ -183,6 +183,11 @@ impl LocalAlloc for KernelAllocator {
 /// 为内核slab分配器实现GlobalAlloc特性
 unsafe impl GlobalAlloc for KernelAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        #[cfg(feature = "mm_selftest")]
+        if crate::mm::oom::denial::is_current_denied() {
+            crate::mm::oom::denial::note_rejection();
+            return core::ptr::null_mut();
+        }
         let r = self.local_alloc_zeroed(layout);
         if allocator_select_condition(layout) {
             alloc_debug_log(klog_types::LogSource::Buddy, layout, r);
@@ -193,6 +198,11 @@ unsafe impl GlobalAlloc for KernelAllocator {
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        #[cfg(feature = "mm_selftest")]
+        if crate::mm::oom::denial::is_current_denied() {
+            crate::mm::oom::denial::note_rejection();
+            return core::ptr::null_mut();
+        }
         let r = self.local_alloc_zeroed(layout);
         if allocator_select_condition(layout) {
             alloc_debug_log(klog_types::LogSource::Buddy, layout, r);

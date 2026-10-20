@@ -110,14 +110,29 @@ impl Fixture {
         unknown: bool,
         range: Option<(PhysAddr, PhysAddr)>,
     ) -> Result<Self, SystemError> {
+        let mut phase = "fixture";
+        let mut range_error = None;
+        Self::with_range_detail(alias, unknown, range, &mut phase, &mut range_error)
+    }
+
+    fn with_range_detail(
+        alias: bool,
+        unknown: bool,
+        range: Option<(PhysAddr, PhysAddr)>,
+        phase: &mut &'static str,
+        range_error: &mut Option<Stop>,
+    ) -> Result<Self, SystemError> {
+        *phase = "fixture_mm_birth";
         let mm = AddressSpace::new(false, INIT_USER_NAMESPACE.clone(), 1)
             .map_err(|_| SystemError::ENOMEM)?;
+        *phase = "fixture_account_birth";
         let account =
             MemoryAccount::new(NEXT_ACCOUNT.fetch_add(1, Ordering::Relaxed) as u64, None)?;
         account.set_policy(MemoryPolicy {
             max: Some(SOURCES as u64),
             ..MemoryPolicy::default()
         });
+        *phase = "fixture_vma";
         let address = mm
             .map_anonymous_wait(
                 VirtAddr::new(0),
@@ -128,6 +143,7 @@ impl Fixture {
                 false,
             )?
             .virt_address();
+        *phase = "fixture_alias_vma";
         let alias_address = if alias {
             Some(
                 mm.map_anonymous_wait(
@@ -154,15 +170,23 @@ impl Fixture {
             sources: Vec::new(),
             unknown,
         };
+        *phase = "fixture_source_metadata";
         fixture
             .sources
             .try_reserve_exact(SOURCES)
             .map_err(|_| SystemError::ENOMEM)?;
+        *phase = "fixture_backing_run";
         let (base, count) = if let Some((start, end)) = range {
             let mut entries = 65_536;
             try_allocate_in_range(start, end, ORDER + 1, &mut entries)
-                .map_err(|_| SystemError::ENOMEM)?
-                .ok_or(SystemError::ENOMEM)?
+                .map_err(|error| {
+                    *range_error = Some(error);
+                    SystemError::ENOMEM
+                })?
+                .ok_or_else(|| {
+                    *phase = "fixture_backing_unavailable";
+                    SystemError::ENOMEM
+                })?
                 .into_raw_parts()
         } else {
             unsafe {
@@ -183,12 +207,14 @@ impl Fixture {
             }
             let physical = base + 2 * index * MMArch::PAGE_SIZE;
             let address = fixture.address + index * MMArch::PAGE_SIZE;
+            *phase = "fixture_source_charge";
             let charge = fixture
                 .account
                 .try_charge(MemoryKind::Anon, 1)
                 .map_err(|_| SystemError::ENOMEM)?;
             // The Page constructor consumes its frame even if Arc allocation fails.
             fixture.held[2 * index] = false;
+            *phase = "fixture_source_page";
             let page = Page::try_new_with_charge(
                 physical,
                 PageType::Normal,
@@ -206,7 +232,9 @@ impl Fixture {
                 address,
                 weak: Arc::downgrade(&page),
             });
+            *phase = "fixture_source_register";
             register(&page)?;
+            *phase = "fixture_source_mapping";
             fixture.attach(address, &page)?;
             if index == 0 {
                 if let Some(alias) = fixture.alias {
@@ -773,10 +801,10 @@ fn cold_workspace_outside_target() -> Result<(bool, alloc::string::String), Syst
     )))
 }
 
-// The consumer still requests the entire inclusive DMA mask. These owners
-// create real pressure in that domain; they do not change allocator policy.
-const DMA_PREFIX_BYTES: usize = 64 * 1024 * 1024;
-const DMA_PREFIX_PAGES: usize = DMA_PREFIX_BYTES / MMArch::PAGE_SIZE;
+// The consumer requests one derived inclusive DMA prefix. Its bound comes
+// from a run the fixture really owns, never a fixed boot physical layout.
+const DMA_HEADROOM_PAGES: usize = 64 * 1024 * 1024 / MMArch::PAGE_SIZE;
+const DMA32_END: usize = 1usize << 32;
 // Sixteen real holes leave eight pages of ordinary allocator headroom for
 // recovery metadata/destinations while every eight-page run remains split by
 // managed source pages. No recovery owner is prewarmed by this fixture.
@@ -785,20 +813,24 @@ const DMA_REQUEST_PAGES: usize = TARGET / 2;
 struct PrefixReservations {
     runs: Vec<(PhysAddr, PageFrameCount)>,
     pages: usize,
+    end: usize,
 }
 
 impl PrefixReservations {
-    fn new() -> Result<Self, SystemError> {
+    fn new(end: usize) -> Result<Self, SystemError> {
         let mut runs = Vec::new();
-        // Reserve before consuming any low memory, including the worst case
-        // in which every remaining eligible frame is a separate owner.
-        runs.try_reserve_exact(DMA_PREFIX_PAGES)
+        // Prepare the worst-case owner count before consuming the prefix.
+        runs.try_reserve_exact(end / MMArch::PAGE_SIZE)
             .map_err(|_| SystemError::ENOMEM)?;
-        Ok(Self { runs, pages: 0 })
+        Ok(Self {
+            runs,
+            pages: 0,
+            end,
+        })
     }
 
     fn hold_remaining(&mut self) -> Result<(), SystemError> {
-        let max = PhysAddr::new(DMA_PREFIX_BYTES - 1);
+        let max = PhysAddr::new(self.end - 1);
         for order in (0..=14).rev() {
             let count = PageFrameCount::new(1 << order);
             loop {
@@ -813,8 +845,8 @@ impl PrefixReservations {
                 self.runs.push((base, actual));
                 self.pages += actual.data();
                 if actual != count
-                    || self.pages > DMA_PREFIX_PAGES
-                    || base.data() + actual.data() * MMArch::PAGE_SIZE > DMA_PREFIX_BYTES
+                    || self.pages > self.end / MMArch::PAGE_SIZE
+                    || base.data() + actual.data() * MMArch::PAGE_SIZE > self.end
                 {
                     return Err(SystemError::EIO);
                 }
@@ -832,114 +864,496 @@ impl Drop for PrefixReservations {
     }
 }
 
-// baseline, atomic exclusion, NOIO exclusion, recovery/ownership respectively.
-fn dma_automatic_recovery() -> Result<(bool, bool, bool, bool), SystemError> {
-    // Do not run this controlled-domain pressure on a nearly exhausted guest.
-    // Even the maximal prefix reservation must leave at least 64 MiB free.
-    if unsafe { LockedFrameAllocator.usage() }.free().data() < 2 * DMA_PREFIX_PAGES {
-        return Err(SystemError::ENOMEM);
+fn dma_recovery_attempt_bound(buckets: usize, mask_entries: usize) -> Option<usize> {
+    if buckets == 0 || mask_entries == 0 {
+        return None;
     }
-    let mut prefix = PrefixReservations::new()?;
-    let mut fixture = Fixture::with_range(
-        false,
-        false,
-        Some((
-            PhysAddr::new(32 * 1024 * 1024),
-            PhysAddr::new(DMA_PREFIX_BYTES),
-        )),
-    )?;
-    prefix.hold_remaining()?;
-    if unsafe { LockedFrameAllocator.usage() }.free().data() < DMA_PREFIX_PAGES {
-        return Err(SystemError::ENOMEM);
-    }
-    fixture.release_holes();
-    let mut entries = 65_536;
-    let domain = Isolation::begin(fixture.base.unwrap(), ORDER + 1, &mut entries)
-        .map_err(|_| SystemError::EBUSY)?;
-    let enough = domain.free_pages() == TARGET;
-    drop(domain);
-    let ordinary = DmaAllocOptions {
-        dma_mask: Some((DMA_PREFIX_BYTES - 1) as u64),
-        use_pool: false,
-        ..DmaAllocOptions::default()
-    };
-    let original_identities = || {
-        fixture
-            .sources
-            .iter()
-            .all(|source| source.weak.upgrade().is_some())
-    };
-    let baseline = enough
-        && matches!(
-            DmaBuffer::try_alloc_pages(DMA_REQUEST_PAGES, ordinary),
-            Err(SystemError::ENOMEM)
-        )
-        && original_identities()
-        && fixture.valid();
-    if !baseline {
-        return Ok((false, false, false, false));
-    }
-    let allowed = DmaAllocOptions {
-        compaction: DmaCompaction::Allowed,
-        ..ordinary
-    };
-    let irq = unsafe { CurrentIrqArch::save_and_disable_irq() };
-    let atomic_result = DmaBuffer::try_alloc_pages(DMA_REQUEST_PAGES, allowed);
-    drop(irq);
-    let atomic = matches!(atomic_result, Err(SystemError::ENOMEM))
-        && original_identities()
-        && fixture.valid();
-    let scope = crate::cgroup::memory::io::MemoryIoScope::enter_noio();
-    let noio_result = DmaBuffer::try_alloc_pages(DMA_REQUEST_PAGES, allowed);
-    drop(scope);
-    let noio =
-        matches!(noio_result, Err(SystemError::ENOMEM)) && original_identities() && fixture.valid();
+    let deferred_attempts =
+        1usize.checked_shl(u32::from(crate::mm::compaction::MAX_DEFER_SHIFT))?;
+    mask_entries
+        .checked_mul(deferred_attempts)?
+        .checked_add(buckets.div_ceil(COMPACTION_DISCOVERY_BUCKETS))?
+        .checked_add(1)
+}
 
-    // Each production attempt examines a bounded registry window and at most
-    // one candidate. Repeated callers advance its real cursor/defer state;
-    // there is no fixture seed or forced allocation failure.
-    let mut recovered = None;
-    for _ in 0..512 {
-        match DmaBuffer::try_alloc_pages(DMA_REQUEST_PAGES, allowed) {
-            Ok(buffer) => {
-                recovered = Some(buffer);
+/// This snapshot is an acceptance budget for the controlled fixture, not an
+/// arbitrary concurrent workload's liveness guarantee. No Page owner escapes.
+fn dma_recovery_inventory(max: PhysAddr) -> Result<(usize, usize, usize, usize), SystemError> {
+    let mut manager = page_manager_lock();
+    let len = manager.phys2page.len();
+    let buckets = manager.phys2page.raw_table().buckets();
+    // Count every same-mask identity as an upper bound. Repeating the runtime
+    // try-read/eligibility filter could miss a temporarily busy future source.
+    let mask_entries = manager
+        .phys2page
+        .keys()
+        .filter(|physical| **physical <= max)
+        .count();
+    let bound = dma_recovery_attempt_bound(buckets, mask_entries).ok_or(SystemError::EOVERFLOW)?;
+    Ok((len, buckets, mask_entries, bound))
+}
+
+/// Exercise actual registry discovery and the real Service implementation with
+/// a private owner. The global DMA consumer's cursor/backoff is never changed.
+fn dma_discovery_deferral_progress() -> Result<bool, SystemError> {
+    let free = unsafe { LockedFrameAllocator.usage() }.free().data();
+    if free < 2 * DMA_HEADROOM_PAGES {
+        return Err(SystemError::ENOMEM);
+    }
+    let end = (free / 2)
+        .checked_mul(MMArch::PAGE_SIZE)
+        .ok_or(SystemError::ENOMEM)?
+        .min(DMA32_END);
+    let mut fixture =
+        Fixture::with_range(false, true, Some((PhysAddr::new(0), PhysAddr::new(end))))?;
+    let base = fixture.base.unwrap();
+    let end = base + BACKING * MMArch::PAGE_SIZE;
+    let mut prefix = PrefixReservations::new(end.data())?;
+    prefix.hold_remaining()?;
+    fixture.release_holes();
+    let source = fixture.sources[0].physical;
+    let (buckets, seeded_cursor) = {
+        let mut manager = page_manager_lock();
+        let table = manager.phys2page.raw_table();
+        let buckets = table.buckets();
+        let mut seeded_cursor = None;
+        for index in 0..buckets {
+            if unsafe { table.is_bucket_full(index) && table.bucket(index).as_ref().0 == source } {
+                seeded_cursor = Some(index);
                 break;
             }
-            Err(SystemError::ENOMEM) => {}
-            Err(error) => return Err(error),
         }
-    }
-    let Some(mut buffer) = recovered else {
-        return Ok((baseline, atomic, noio, false));
+        (buckets, seeded_cursor)
     };
-    let start = PhysAddr::new(buffer.paddr());
-    let end = start + buffer.page_count().data() * MMArch::PAGE_SIZE;
-    let mut moved = 0;
-    let mut checked = buffer.page_count().data() == DMA_REQUEST_PAGES
-        && buffer.len() == DMA_REQUEST_PAGES * MMArch::PAGE_SIZE
-        && start
-            .data()
-            .is_multiple_of(DMA_REQUEST_PAGES * MMArch::PAGE_SIZE)
-        && end.data() <= DMA_PREFIX_BYTES
-        && buffer.as_slice().iter().all(|byte| *byte == 0)
-        && fixture.valid();
-    for source in &fixture.sources {
-        if (start..end).contains(&source.physical) {
-            moved += 1;
-            let index = (source.address.data() - fixture.address.data()) / MMArch::PAGE_SIZE;
-            checked &= source.weak.upgrade().is_none()
-                && fixture
-                    .source_page(index)
-                    .is_some_and(|page| !(start..end).contains(&page.phys_address()));
+    let Some(seeded_cursor) = seeded_cursor else {
+        return Ok(false);
+    };
+    let mut seen = [false; SOURCES];
+    let mut cursor = 0;
+    let mut visited = 0;
+    // Empty windows consume up to 256 buckets; each returned source adds at
+    // most one interrupted window. This bound follows the real scan contract.
+    for _ in 0..buckets.div_ceil(COMPACTION_DISCOVERY_BUCKETS) + SOURCES + 1 {
+        let before = cursor;
+        let found = super::compaction_candidate(&mut cursor, base, end - 1)?;
+        let advanced = (cursor + buckets - before) % buckets;
+        visited += if advanced == 0 { buckets } else { advanced };
+        if let Some(physical) = found {
+            let offset = physical.data() - base.data();
+            if !offset.is_multiple_of(2 * MMArch::PAGE_SIZE) {
+                return Ok(false);
+            }
+            let index = offset / (2 * MMArch::PAGE_SIZE);
+            if index >= SOURCES || index == 0 {
+                return Ok(false);
+            }
+            if seen[index] {
+                break;
+            }
+            seen[index] = true;
+        }
+        if visited >= buckets {
+            break;
         }
     }
-    checked &= moved != 0;
-    buffer.as_mut_slice().fill(0xa7);
-    checked &= buffer.as_slice().iter().all(|byte| *byte == 0xa7) && fixture.valid();
-    drop(buffer);
-    let passed = fixture.finish(checked);
+    let consumed = !seen[0] && seen[1..].iter().all(|seen| *seen);
+    let deferred = crate::mm::compaction::recovery::deferred_discovery_selftest(
+        source,
+        seeded_cursor,
+        ORDER + 1,
+        end - 1,
+    );
+    let budget_edges = dma_recovery_attempt_bound(0, SOURCES).is_none()
+        && dma_recovery_attempt_bound(buckets, 0).is_none()
+        && dma_recovery_attempt_bound(buckets, usize::MAX).is_none();
+    let passed = fixture.finish(consumed && deferred && budget_edges);
     drop(prefix);
-    Ok((baseline, atomic, noio, passed))
+    Ok(passed)
+}
+
+#[derive(Default)]
+struct DmaRecoveryDetail {
+    phase: &'static str,
+    error: Option<SystemError>,
+    free_before: usize,
+    search_end: usize,
+    prefix_end: Option<usize>,
+    free_after_reservation: Option<usize>,
+    prefix_pages: usize,
+    foreign_limit: usize,
+    foreign_runs: usize,
+    fixture_base: Option<PhysAddr>,
+    fixture_range_stop: Option<Stop>,
+    isolated_free: Option<usize>,
+    baseline_allocation: Option<Result<(usize, usize), SystemError>>,
+    baseline_identities: Option<bool>,
+    baseline_valid: Option<bool>,
+    atomic_allocation: Option<Result<(usize, usize), SystemError>>,
+    noio_allocation: Option<Result<(usize, usize), SystemError>>,
+    registry_len: Option<usize>,
+    registry_buckets: Option<usize>,
+    registry_mask_entries: Option<usize>,
+    recovery_attempt_bound: Option<usize>,
+    recovery_attempts: usize,
+    recovery_last_error: Option<SystemError>,
+    recovered_start: Option<usize>,
+    recovered_pages: Option<usize>,
+    recovered_moved: Option<usize>,
+    recovered_zero: Option<bool>,
+    recovered_alignment: Option<bool>,
+    recovered_valid_before: Option<bool>,
+    recovered_valid_after: Option<bool>,
+    recovered_checked: Option<bool>,
+    finish_account_pages: Option<u64>,
+}
+
+fn dma_allocation_detail(
+    result: &Result<DmaBuffer, SystemError>,
+) -> Result<(usize, usize), SystemError> {
+    result
+        .as_ref()
+        .map(|buffer| (buffer.paddr(), buffer.page_count().data()))
+        .map_err(|error| error.clone())
+}
+
+/// Setup only reserves frames that are free at that instant. Background owners
+/// can later release another legal run under the same DMA mask. Retain each
+/// such success (never free-and-retry) until an attempt reaches this fixture.
+/// Every extra owner consumes a distinct eight-page run in a finite prefix.
+fn dma_fixture_allocation(
+    fixture: &Fixture,
+    foreign: &mut Vec<DmaBuffer>,
+    prefix_end: usize,
+    mut allocate: impl FnMut() -> Result<DmaBuffer, SystemError>,
+) -> Result<DmaBuffer, SystemError> {
+    loop {
+        let mut buffer = allocate()?;
+        let start = buffer.paddr();
+        let bytes = DMA_REQUEST_PAGES * MMArch::PAGE_SIZE;
+        let end = start.checked_add(bytes).ok_or(SystemError::EOVERFLOW)?;
+        if buffer.page_count().data() != DMA_REQUEST_PAGES
+            || buffer.len() != bytes
+            || !start.is_multiple_of(bytes)
+            || end > prefix_end
+            || !buffer.as_slice().iter().all(|byte| *byte == 0)
+            || !fixture.valid()
+        {
+            return Err(SystemError::EIO);
+        }
+        if fixture
+            .sources
+            .iter()
+            .any(|source| (start..end).contains(&source.physical.data()))
+        {
+            return Ok(buffer);
+        }
+        if foreign.len() >= prefix_end / bytes || foreign.len() == foreign.capacity() {
+            return Err(SystemError::EOVERFLOW);
+        }
+        buffer.as_mut_slice().fill(0x63);
+        if !fixture.valid() {
+            return Err(SystemError::EIO);
+        }
+        foreign.push(buffer);
+    }
+}
+
+// baseline, atomic exclusion, NOIO exclusion, recovery/ownership respectively.
+fn dma_automatic_recovery(
+    reservation_limit: Option<usize>,
+) -> ((bool, bool, bool, bool), alloc::string::String) {
+    let mut detail = DmaRecoveryDetail::default();
+    let result = (|| -> Result<(bool, bool, bool, bool), SystemError> {
+        detail.phase = "initial_headroom";
+        detail.free_before = unsafe { LockedFrameAllocator.usage() }.free().data();
+        // This is a controlled pressure fixture, not permission to consume
+        // arbitrary low memory. Include external layout owners in its limit.
+        if detail.free_before < 2 * DMA_HEADROOM_PAGES {
+            return Err(SystemError::ENOMEM);
+        }
+        let budget = (detail.free_before / 2)
+            .min(detail.free_before - DMA_HEADROOM_PAGES)
+            .min(reservation_limit.unwrap_or(usize::MAX));
+        detail.search_end = budget
+            .checked_mul(MMArch::PAGE_SIZE)
+            .ok_or(SystemError::ENOMEM)?
+            .min(DMA32_END);
+        let mut fixture = Fixture::with_range_detail(
+            false,
+            false,
+            Some((PhysAddr::new(0), PhysAddr::new(detail.search_end))),
+            &mut detail.phase,
+            &mut detail.fixture_range_stop,
+        )?;
+        detail.fixture_base = fixture.base;
+        let prefix_end = fixture
+            .base
+            .unwrap()
+            .data()
+            .checked_add(BACKING * MMArch::PAGE_SIZE)
+            .ok_or(SystemError::ENOMEM)?;
+        detail.prefix_end = Some(prefix_end);
+        detail.phase = "prefix_metadata";
+        // Prepare all incidental owners before consuming any prefix frames.
+        // No success can grow this vector during a pressure/IRQ-policy check.
+        let foreign_limit = prefix_end / (DMA_REQUEST_PAGES * MMArch::PAGE_SIZE);
+        let mut foreign = Vec::new();
+        foreign
+            .try_reserve_exact(foreign_limit)
+            .map_err(|_| SystemError::ENOMEM)?;
+        detail.foreign_limit = foreign_limit;
+        let mut prefix = PrefixReservations::new(prefix_end)?;
+        detail.phase = "prefix_reservation";
+        let reservation = prefix.hold_remaining();
+        detail.prefix_pages = prefix.pages;
+        detail.free_after_reservation = Some(unsafe { LockedFrameAllocator.usage() }.free().data());
+        reservation?;
+        detail.phase = "post_reservation_headroom";
+        if unsafe { LockedFrameAllocator.usage() }.free().data() < DMA_HEADROOM_PAGES {
+            return Err(SystemError::ENOMEM);
+        }
+        fixture.release_holes();
+        detail.phase = "fixture_isolation";
+        let mut entries = 65_536;
+        let domain = Isolation::begin(fixture.base.unwrap(), ORDER + 1, &mut entries)
+            .map_err(|_| SystemError::EBUSY)?;
+        detail.isolated_free = Some(domain.free_pages());
+        let enough = domain.free_pages() == TARGET;
+        drop(domain);
+        let ordinary = DmaAllocOptions {
+            dma_mask: Some((prefix_end - 1) as u64),
+            use_pool: false,
+            ..DmaAllocOptions::default()
+        };
+        let original_identities = || {
+            fixture
+                .sources
+                .iter()
+                .all(|source| source.weak.upgrade().is_some())
+        };
+        detail.phase = "baseline";
+        // Keep every predicate observable instead of letting && hide the reason.
+        // Formatting happens only after all real frame owners have been released.
+        let baseline_allocation =
+            dma_fixture_allocation(&fixture, &mut foreign, prefix_end, || {
+                DmaBuffer::try_alloc_pages(DMA_REQUEST_PAGES, ordinary)
+            });
+        detail.foreign_runs = foreign.len();
+        detail.baseline_allocation = Some(dma_allocation_detail(&baseline_allocation));
+        let allocation_failed = matches!(baseline_allocation, Err(SystemError::ENOMEM));
+        drop(baseline_allocation);
+        let identities = original_identities();
+        let valid = fixture.valid();
+        detail.baseline_identities = Some(identities);
+        detail.baseline_valid = Some(valid);
+        let baseline = enough && allocation_failed && identities && valid;
+        if !baseline {
+            return Ok((false, false, false, false));
+        }
+        let allowed = DmaAllocOptions {
+            compaction: DmaCompaction::Allowed,
+            ..ordinary
+        };
+        detail.phase = "atomic";
+        let atomic_result = dma_fixture_allocation(&fixture, &mut foreign, prefix_end, || {
+            let irq = unsafe { CurrentIrqArch::save_and_disable_irq() };
+            let allocation = DmaBuffer::try_alloc_pages(DMA_REQUEST_PAGES, allowed);
+            drop(irq);
+            allocation
+        });
+        detail.foreign_runs = foreign.len();
+        detail.atomic_allocation = Some(dma_allocation_detail(&atomic_result));
+        let atomic = matches!(atomic_result, Err(SystemError::ENOMEM))
+            && original_identities()
+            && fixture.valid();
+        detail.phase = "noio";
+        let noio_result = dma_fixture_allocation(&fixture, &mut foreign, prefix_end, || {
+            let scope = crate::cgroup::memory::io::MemoryIoScope::enter_noio();
+            let allocation = DmaBuffer::try_alloc_pages(DMA_REQUEST_PAGES, allowed);
+            drop(scope);
+            allocation
+        });
+        detail.foreign_runs = foreign.len();
+        detail.noio_allocation = Some(dma_allocation_detail(&noio_result));
+        let noio = matches!(noio_result, Err(SystemError::ENOMEM))
+            && original_identities()
+            && fixture.valid();
+
+        // Each production attempt examines a bounded registry window and at most
+        // one candidate. Repeated callers advance its real cursor/defer state;
+        // there is no fixture seed or forced allocation failure.
+        detail.phase = "recovery_inventory";
+        let (len, buckets, mask_entries, attempt_bound) =
+            dma_recovery_inventory(PhysAddr::new(prefix_end - 1))?;
+        detail.registry_len = Some(len);
+        detail.registry_buckets = Some(buckets);
+        detail.registry_mask_entries = Some(mask_entries);
+        detail.recovery_attempt_bound = Some(
+            attempt_bound
+                .checked_add(foreign_limit)
+                .ok_or(SystemError::EOVERFLOW)?,
+        );
+        detail.phase = "automatic_recovery";
+        let mut recovered = None;
+        for _ in 0..attempt_bound {
+            let allocation = dma_fixture_allocation(&fixture, &mut foreign, prefix_end, || {
+                detail.recovery_attempts += 1;
+                DmaBuffer::try_alloc_pages(DMA_REQUEST_PAGES, allowed)
+            });
+            detail.foreign_runs = foreign.len();
+            match allocation {
+                Ok(buffer) => {
+                    recovered = Some(buffer);
+                    break;
+                }
+                Err(SystemError::ENOMEM) => detail.recovery_last_error = Some(SystemError::ENOMEM),
+                Err(error) => {
+                    detail.recovery_last_error = Some(error.clone());
+                    return Err(error);
+                }
+            }
+        }
+        let Some(mut buffer) = recovered else {
+            return Ok((baseline, atomic, noio, false));
+        };
+        detail.phase = "recovered_ownership";
+        let start = PhysAddr::new(buffer.paddr());
+        let end = start + buffer.page_count().data() * MMArch::PAGE_SIZE;
+        let mut moved = 0;
+        detail.recovered_start = Some(start.data());
+        detail.recovered_pages = Some(buffer.page_count().data());
+        detail.recovered_zero = Some(buffer.as_slice().iter().all(|byte| *byte == 0));
+        detail.recovered_alignment = Some(
+            start
+                .data()
+                .is_multiple_of(DMA_REQUEST_PAGES * MMArch::PAGE_SIZE),
+        );
+        detail.recovered_valid_before = Some(fixture.valid());
+        let mut checked = buffer.page_count().data() == DMA_REQUEST_PAGES
+            && buffer.len() == DMA_REQUEST_PAGES * MMArch::PAGE_SIZE
+            && start
+                .data()
+                .is_multiple_of(DMA_REQUEST_PAGES * MMArch::PAGE_SIZE)
+            && end.data() <= prefix_end
+            && buffer.as_slice().iter().all(|byte| *byte == 0)
+            && fixture.valid();
+        for source in &fixture.sources {
+            if (start..end).contains(&source.physical) {
+                moved += 1;
+                let index = (source.address.data() - fixture.address.data()) / MMArch::PAGE_SIZE;
+                checked &= source.weak.upgrade().is_none()
+                    && fixture
+                        .source_page(index)
+                        .is_some_and(|page| !(start..end).contains(&page.phys_address()));
+            }
+        }
+        detail.recovered_moved = Some(moved);
+        checked &= moved != 0;
+        buffer.as_mut_slice().fill(0xa7);
+        checked &= buffer.as_slice().iter().all(|byte| *byte == 0xa7)
+            && fixture.valid()
+            && foreign
+                .iter()
+                .all(|held| held.as_slice().iter().all(|byte| *byte == 0x63));
+        detail.recovered_valid_after = Some(fixture.valid());
+        detail.recovered_checked = Some(checked);
+        drop(buffer);
+        let account = fixture.account.clone();
+        let passed = fixture.finish(checked);
+        detail.finish_account_pages = Some(account.current_pages());
+        drop(prefix);
+        detail.phase = "complete";
+        Ok((baseline, atomic, noio, passed))
+    })();
+    if let Err(ref error) = result {
+        detail.error = Some(error.clone());
+    }
+    // The closure's fixture, reservations and allocation owners are all gone.
+    (
+        result.unwrap_or((false, false, false, false)),
+        alloc::format!(
+            "phase={} error={:?} free_before={} search_end={} prefix_end={:?} free_after={:?} prefix_pages={} foreign_limit={} foreign_runs={} fixture_base={:?} range_stop={:?} isolated_free={:?} baseline_allocation={:?} baseline_identities={:?} baseline_valid={:?} atomic_allocation={:?} noio_allocation={:?} registry_len={:?} registry_buckets={:?} registry_mask_entries={:?} recovery_attempt_bound={:?} recovery_attempts={} recovery_last_error={:?} recovered_start={:?} recovered_pages={:?} recovered_moved={:?} recovered_zero={:?} recovered_alignment={:?} recovered_valid_before={:?} recovered_valid_after={:?} recovered_checked={:?} finish_account_pages={:?}",
+            detail.phase, detail.error, detail.free_before, detail.search_end, detail.prefix_end, detail.free_after_reservation,
+            detail.prefix_pages, detail.foreign_limit, detail.foreign_runs,
+            detail.fixture_base, detail.fixture_range_stop, detail.isolated_free,
+            detail.baseline_allocation, detail.baseline_identities, detail.baseline_valid,
+            detail.atomic_allocation, detail.noio_allocation, detail.registry_len,
+            detail.registry_buckets, detail.registry_mask_entries, detail.recovery_attempt_bound,
+            detail.recovery_attempts, detail.recovery_last_error, detail.recovered_start, detail.recovered_pages,
+            detail.recovered_moved, detail.recovered_zero, detail.recovered_alignment,
+            detail.recovered_valid_before, detail.recovered_valid_after,
+            detail.recovered_checked, detail.finish_account_pages,
+        ),
+    )
+}
+
+/// Occupying an ordinary low RAM interval must not prevent the test from
+/// constructing its independent domain. The same real DMA consumer is used.
+fn dma_occupied_layout() -> ((bool, bool, bool, bool, bool), alloc::string::String) {
+    const START: usize = 32 * 1024 * 1024;
+    const END: usize = 64 * 1024 * 1024;
+    const RUNS: usize = (END - START) / (BACKING * MMArch::PAGE_SIZE);
+    let initial_free = unsafe { LockedFrameAllocator.usage() }.free().data();
+    let mut held = Vec::new();
+    let mut held_pages = 0;
+    let mut phase = "layout_metadata";
+    let mut range_error = None;
+    let mut unavailable = false;
+    let mut recovery_detail = alloc::string::String::new();
+    let result = (|| -> Result<(bool, bool, bool, bool, bool), SystemError> {
+        held.try_reserve_exact(RUNS)
+            .map_err(|_| SystemError::ENOMEM)?;
+        phase = "layout_ownership";
+        for _ in 0..=RUNS {
+            let mut entries = 65_536;
+            let run = try_allocate_in_range(
+                PhysAddr::new(START),
+                PhysAddr::new(END),
+                ORDER + 1,
+                &mut entries,
+            )
+            .map_err(|error| {
+                range_error = Some(error);
+                SystemError::ENOMEM
+            })?;
+            let Some(run) = run else { break };
+            // A layout probe must also obey the aggregate pressure budget.
+            if held.len() == RUNS || held_pages + run.pages() > initial_free / 2 {
+                drop(run);
+                return Err(SystemError::ENOMEM);
+            }
+            held_pages += run.pages();
+            held.push(run);
+        }
+        // This is the original fixed-range setup, not a consumer failure
+        // injection. Its actual phase proves the legal occupied layout.
+        let fixed = Fixture::with_range_detail(
+            false,
+            false,
+            Some((PhysAddr::new(START), PhysAddr::new(END))),
+            &mut phase,
+            &mut range_error,
+        );
+        unavailable =
+            matches!(fixed, Err(SystemError::ENOMEM)) && phase == "fixture_backing_unavailable";
+        drop(fixed);
+        if !unavailable {
+            return Ok((false, false, false, false, false));
+        }
+        let limit = (initial_free / 2)
+            .checked_sub(held_pages)
+            .ok_or(SystemError::ENOMEM)?;
+        let ((baseline, atomic, noio, recovered), detail) = dma_automatic_recovery(Some(limit));
+        recovery_detail = detail;
+        phase = "complete";
+        Ok((unavailable, baseline, atomic, noio, recovered))
+    })();
+    // No retained raw owner or arbitrary test failure changes consumer policy.
+    drop(held);
+    let error = result.as_ref().err().cloned();
+    (result.unwrap_or((false, false, false, false, false)), alloc::format!(
+        "phase={phase} error={error:?} held_pages={held_pages} range_stop={range_error:?} fixed_unavailable={unavailable} recovery=[{recovery_detail}]"
+    ))
 }
 
 pub(crate) fn report() -> alloc::string::String {
@@ -990,13 +1404,25 @@ pub(crate) fn report() -> alloc::string::String {
         Err(error) => (false, alloc::format!("setup_error={error:?}")),
     };
     checks.push(("cold_workspace_outside_target", cold_workspace));
-    let (baseline, atomic, noio, recovered) =
-        dma_automatic_recovery().unwrap_or((false, false, false, false));
+    let ((baseline, atomic, noio, recovered), dma_detail) = dma_automatic_recovery(None);
     checks.extend([
+        (
+            "dma_discovery_deferral_progress",
+            dma_discovery_deferral_progress().unwrap_or(false),
+        ),
         ("dma_same_mask_fragmentation", baseline),
         ("dma_atomic_no_recovery", atomic),
         ("dma_noio_no_recovery", noio),
         ("dma_automatic_recovery", recovered),
+    ]);
+    let ((layout, layout_baseline, layout_atomic, layout_noio, layout_recovered), layout_detail) =
+        dma_occupied_layout();
+    checks.extend([
+        ("dma_occupied_range_unavailable", layout),
+        ("dma_occupied_same_mask_fragmentation", layout_baseline),
+        ("dma_occupied_atomic_no_recovery", layout_atomic),
+        ("dma_occupied_noio_no_recovery", layout_noio),
+        ("dma_occupied_automatic_recovery", layout_recovered),
     ]);
     checks.extend(crate::mm::allocator::buddy::compaction::selftest_checks());
     let failed = checks.iter().filter(|(_, passed)| !passed).count();
@@ -1006,6 +1432,8 @@ pub(crate) fn report() -> alloc::string::String {
     }
     let _ = writeln!(output, "deferred_free_detail={deferred_detail}");
     let _ = writeln!(output, "cold_workspace_detail={cold_detail}");
+    let _ = writeln!(output, "dma_recovery_detail={dma_detail}");
+    let _ = writeln!(output, "dma_occupied_layout_detail={layout_detail}");
     let _ = writeln!(output, "summary_fail={failed}");
     output
 }

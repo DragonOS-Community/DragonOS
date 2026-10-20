@@ -114,6 +114,7 @@ fn kenrel_init_freeable() -> Result<(), SystemError> {
     let _ = crate::text_patch::init_live();
     crate::exception::workqueue::workqueue_init();
     crate::filesystem::page_cache::init_read_completion_queue();
+    crate::filesystem::page_cache::init_writeback_executor()?;
     crate::security::keys::object::init();
     crate::perf::release::init();
     return Ok(());

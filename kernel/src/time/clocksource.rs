@@ -4,22 +4,21 @@ use core::{
 };
 
 use alloc::{
-    boxed::Box,
     collections::LinkedList,
     string::{String, ToString},
     sync::Arc,
     vec::Vec,
 };
-use lazy_static::__Deref;
 use log::{debug, info, warn};
 use system_error::SystemError;
 use unified_init::macros::unified_init;
 
 use crate::{
     arch::CurrentIrqArch,
+    debug::klog::loglevel::LogLevel,
     exception::InterruptArch,
     init::initcall::INITCALL_LATE,
-    libs::spinlock::SpinLock,
+    libs::{printk::Logger, spinlock::SpinLock},
     process::{
         kthread::{KernelThreadClosure, KernelThreadMechanism},
         ProcessControlBlock, ProcessManager,
@@ -27,11 +26,7 @@ use crate::{
     sched::{schedule, SchedMode},
 };
 
-use super::{
-    timekeeping,
-    timer::{clock, Timer, TimerFunction},
-    NSEC_PER_SEC, NSEC_PER_USEC,
-};
+use super::{timekeeping, timer::clock, NSEC_PER_SEC, NSEC_PER_USEC};
 
 kernel_cmdline_param_kv!(CLOCKSOURCE_PARAM, clocksource, "");
 
@@ -202,15 +197,17 @@ impl ClocksourceWatchdog {
         }
     }
 
+    fn is_due(&self, now: u64) -> bool {
+        self.is_running && self.watchdog.is_some() && now >= self.timer_expires
+    }
+
     /// 启用检查器
     pub fn clocksource_start_watchdog(&mut self, has_sources: bool) {
         // 如果watchdog未被设置或者已经启用了就退出
         if self.is_running || self.watchdog.is_none() || !has_sources {
             return;
         }
-        // 生成一个定时器
-        let wd_timer_func: Box<WatchdogTimerFunc> = Box::new(WatchdogTimerFunc {});
-        // `Timer` takes an absolute jiffies deadline.  A restart must be based
+        // A restart must use an absolute jiffies deadline based
         // on the current clock, not on a stale deadline left by the previous
         // watchdog generation.
         self.timer_expires = watchdog_next_expiry(clock());
@@ -224,8 +221,6 @@ impl ClocksourceWatchdog {
             warn!("clocksource watchdog could not initialize reference state: {error:?}");
             return;
         }
-        let wd_timer = Timer::new(wd_timer_func, self.timer_expires);
-        wd_timer.activate();
         self.is_running = true;
     }
 
@@ -234,17 +229,7 @@ impl ClocksourceWatchdog {
         if !self.is_running || (self.watchdog.is_some() && has_sources) {
             return;
         }
-        // TODO 当实现了周期性的定时器后 需要将监视用的定时器删除
         self.is_running = false;
-    }
-}
-
-/// 定时检查器
-#[derive(Debug)]
-pub struct WatchdogTimerFunc;
-impl TimerFunction for WatchdogTimerFunc {
-    fn run(&mut self) -> Result<(), SystemError> {
-        return clocksource_watchdog();
     }
 }
 
@@ -780,9 +765,12 @@ impl dyn Clocksource {
     fn mark_unstable_from_watchdog(&self, delta: i64) -> Result<i32, SystemError> {
         let cs_data = self.clocksource_data();
         // 打印出unstable的时钟源信息
-        debug!(
-            "clocksource :{:?} is unstable, its delta is {:?}",
-            cs_data.name, delta
+        Logger.try_log_fmt(
+            LogLevel::DEBUG,
+            format_args!(
+                "clocksource :{:?} is unstable, its delta is {:?}",
+                cs_data.name, delta
+            ),
         );
         self.update_clocksource_data(ClocksourceUpdate::MarkUnstable)?;
 
@@ -897,7 +885,7 @@ impl dyn Clocksource {
 #[derive(Debug, Clone)]
 pub struct ClocksourceData {
     /// 时钟源名字
-    pub name: String,
+    pub name: Arc<str>,
     /// 时钟精度
     pub rating: i32,
     pub mask: ClocksourceMask,
@@ -930,7 +918,7 @@ impl ClocksourceData {
         maxadj: u32,
     ) -> Self {
         let csd = ClocksourceData {
-            name,
+            name: name.into(),
             rating,
             mask,
             mult,
@@ -988,30 +976,52 @@ pub fn clocksource_suspend() {
     }
 }
 
-/// # 根据watchdog的精度，来检查被监视的时钟源的误差
-///
-/// ## 返回值
-///
-/// * `Ok()` - 检查完成
-/// * `Err(SystemError)` - 错误码
-pub fn clocksource_watchdog() -> Result<(), SystemError> {
-    let mut cs_watchdog = CLOCKSOURCE_WATCHDOG.lock_irqsave();
-    // debug!("clocksource_watchdog start");
+/// Cheap bounded check used by the existing timer IRQ/softirq path. A busy
+/// watchdog transaction leaves the deadline armed for a later tick.
+pub(super) fn watchdog_due(now: u64) -> bool {
+    CLOCKSOURCE_WATCHDOG
+        .try_lock_irqsave()
+        .is_ok_and(|state| state.is_due(now))
+}
 
-    // watchdog没有在运行的话直接退出
-    if !cs_watchdog.is_running || cs_watchdog.watchdog.is_none() {
-        // debug!("is_running = {:?},watchdog = {:?}", cs_watchdog.is_running, cs_watchdog.watchdog);
+pub(super) fn run_due_watchdog() {
+    let Ok(mut state) = CLOCKSOURCE_WATCHDOG.try_lock_irqsave() else {
+        return;
+    };
+    if state.is_due(clock()) {
+        if let Err(error) = run_watchdog(&mut state, &WATCHDOG_LIST.lock_irqsave()) {
+            Logger.try_log_fmt(
+                LogLevel::WARN,
+                format_args!("clocksource watchdog sample failed: {error:?}"),
+            );
+        }
+    }
+}
+
+fn run_watchdog(
+    state: &mut ClocksourceWatchdog,
+    list: &LinkedList<Arc<dyn Clocksource>>,
+) -> Result<(), SystemError> {
+    if !state.is_running {
         return Ok(());
     }
-
-    let watchdog = cs_watchdog.watchdog.as_ref().cloned().unwrap();
-    let watchdog_list: Vec<_> = {
-        let list = WATCHDOG_LIST.lock_irqsave();
-        list.iter().cloned().collect()
+    let Some(watchdog) = &state.watchdog else {
+        return Ok(());
     };
+    let result = sample_watchdog(watchdog, list);
+    // Errors must not silently stop a periodic service. Serialize rearm with
+    // start/stop/reference replacement in the original watchdog transaction.
+    state.timer_expires = watchdog_next_expiry(clock());
+    result
+}
+
+fn sample_watchdog(
+    watchdog: &Arc<dyn Clocksource>,
+    watchdog_list: &LinkedList<Arc<dyn Clocksource>>,
+) -> Result<(), SystemError> {
     let wd_now_data = watchdog.clocksource_data();
     for cs in watchdog_list.iter() {
-        if Arc::ptr_eq(cs, &watchdog) {
+        if Arc::ptr_eq(cs, watchdog) {
             continue;
         }
         let cs_data = cs.clocksource_data();
@@ -1079,10 +1089,10 @@ pub fn clocksource_watchdog() -> Result<(), SystemError> {
             if FINISHED_BOOTING.load(Ordering::Relaxed)
                 && should_report_long_watchdog_interval(wd_dev_nsec)
             {
-                warn!(
+                Logger.try_log_fmt(LogLevel::WARN, format_args!(
                     "clocksource watchdog: long readout interval, skip check: cs_nsec={} wd_nsec={}",
                     cs_dev_nsec, wd_dev_nsec
-                );
+                ));
             }
             continue;
         }
@@ -1090,8 +1100,13 @@ pub fn clocksource_watchdog() -> Result<(), SystemError> {
         if cs_dev_nsec.abs_diff(wd_dev_nsec) > WATCHDOG_THRESHOLD.into() {
             // debug!("set_unstable");
             // 误差过大，标记为unstable
-            info!("cs_dev_nsec = {}", cs_dev_nsec);
-            info!("wd_dev_nsec = {}", wd_dev_nsec);
+            Logger.try_log_fmt(
+                LogLevel::INFO,
+                format_args!(
+                    "clocksource watchdog skew: cs_dev_nsec={} wd_dev_nsec={}",
+                    cs_dev_nsec, wd_dev_nsec
+                ),
+            );
             cs.mark_unstable_from_watchdog(
                 cs_dev_nsec
                     .abs_diff(wd_dev_nsec)
@@ -1116,15 +1131,7 @@ pub fn clocksource_watchdog() -> Result<(), SystemError> {
             // TODO 通知tick机制 切换为高精度模式
         }
     }
-    // Rearm against the current absolute jiffies value.  Keep the watchdog
-    // generation locked until all samples and the next deadline are
-    // committed.
-    cs_watchdog.timer_expires = watchdog_next_expiry(clock());
-    let expires = cs_watchdog.timer_expires;
-    drop(cs_watchdog);
-    let watchdog_timer = Timer::new(Box::new(WatchdogTimerFunc {}), expires);
-    watchdog_timer.activate();
-    return Ok(());
+    Ok(())
 }
 
 fn __clocksource_watchdog_kthread() {
@@ -1234,7 +1241,7 @@ fn clocksource_select_locked() -> Result<(), SystemError> {
         let override_name = OVERRIDE_NAME.lock();
         for ele in list_guard.iter() {
             let data = ele.clocksource_data();
-            if data.name.eq(override_name.deref())
+            if data.name.as_ref() == override_name.as_str()
                 && !data.flags.contains(ClocksourceFlags::CLOCK_SOURCE_UNSTABLE)
             {
                 best = ele.clone();
@@ -1293,3 +1300,6 @@ pub fn init_watchdog_kthread() -> Result<(), SystemError> {
 mod selftest;
 
 pub(crate) use selftest::run_clocksource_selftests;
+
+#[cfg(feature = "mm_selftest")]
+pub(crate) use selftest::heap_denied_watchdog;

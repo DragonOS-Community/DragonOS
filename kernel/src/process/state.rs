@@ -231,6 +231,12 @@ bitflags! {
         const NEED_CGROUP_FREEZE = 1 << 27;
         /// Job-control stop deferred until a lock-free task-context boundary.
         const PENDING_GROUP_STOP = 1 << 28;
+        /// Selftest-only ordinary heap denial; never inherited by fork.
+        #[cfg(feature = "mm_selftest")]
+        const OOM_HEAP_DENIED = 1 << 29;
+        /// A committed selftest OOM victim remains denied through exit.
+        #[cfg(feature = "mm_selftest")]
+        const OOM_HEAP_VICTIM = 1 << 30;
     }
 }
 
@@ -280,6 +286,24 @@ impl AtomicProcessFlags {
         Self {
             bits: AtomicUsize::new(0),
         }
+    }
+
+    /// Restore a selftest scope without clearing a concurrently committed
+    /// victim's sticky denial, or briefly exposing its heap to an interrupt.
+    #[cfg(feature = "mm_selftest")]
+    pub(crate) fn finish_oom_heap_scope(&self, was_denied: bool) {
+        if was_denied {
+            return;
+        }
+        let _ = self
+            .bits
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |bits| {
+                Some(if bits & ProcessFlags::OOM_HEAP_VICTIM.bits() != 0 {
+                    bits | ProcessFlags::OOM_HEAP_DENIED.bits()
+                } else {
+                    bits & !ProcessFlags::OOM_HEAP_DENIED.bits()
+                })
+            });
     }
 
     #[inline]

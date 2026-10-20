@@ -1,5 +1,4 @@
 use crate::{
-    alloc::string::ToString,
     arch::{io::PortIOArch, CurrentPortIOArch},
     driver::acpi::{
         acpi_manager,
@@ -83,7 +82,7 @@ struct InnerAcpipm {
 impl Acpipm {
     pub fn new() -> Arc<Self> {
         let data = ClocksourceData {
-            name: "acpi_pm".to_string(),
+            name: "acpi_pm".into(),
             rating: 200,
             mask: ClocksourceMask::new(ACPI_PM_MASK),
             mult: 0,

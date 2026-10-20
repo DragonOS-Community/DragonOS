@@ -599,7 +599,7 @@ TEST(TlbShootdown, TeardownRetainsRemoteHolderUntilAcknowledged) {
             "smp_available", "holder_admission",
             "kernel_teardown_order", "kernel_missing_flush_detected", "kernel_missing_ack_detected",
             "user_teardown_order", "user_missing_flush_detected", "user_missing_ack_detected",
-            "user_lru_teardown_order", "user_lru_missing_flush_detected", "user_lru_missing_ack_detected"}) {
+            "user_lru_teardown_order", "user_lru_missing_flush_detected", "user_lru_missing_ack_detected", "user_multibatch_teardown_order"}) {
         EXPECT_NE(std::string::npos, report.find(std::string(key) + "=ok\n")) << report;
     }
 }

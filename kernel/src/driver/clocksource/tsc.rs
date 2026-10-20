@@ -1,7 +1,4 @@
-use alloc::{
-    string::ToString,
-    sync::{Arc, Weak},
-};
+use alloc::sync::{Arc, Weak};
 use log::warn;
 use system_error::SystemError;
 
@@ -36,7 +33,7 @@ struct InnerTscClocksource {
 impl TscClocksource {
     pub fn new() -> Arc<Self> {
         let data = ClocksourceData {
-            name: "tsc".to_string(),
+            name: "tsc".into(),
             rating: 300,
             mask: ClocksourceMask::new(u64::MAX),
             mult: 0,

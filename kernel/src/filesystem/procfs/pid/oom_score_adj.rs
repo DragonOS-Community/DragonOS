@@ -142,7 +142,8 @@ impl OomScoreAdjFileOps {
         task: &Arc<ProcessControlBlock>,
         mm: &Arc<crate::mm::ucontext::AddressSpace>,
     ) -> bool {
-        task.basic()
+        let basic = task.basic();
+        basic
             .user_vm()
             .is_some_and(|task_mm| task_mm.id() == mm.id() || Arc::ptr_eq(&task_mm, mm))
     }
@@ -155,42 +156,25 @@ impl OomScoreAdjFileOps {
         }
     }
 
+    /// Publication is serialized by the caller. Repeated writes to a group's
+    /// leader are idempotent, so no per-call TGID set is needed.
     fn set_score_for_shared_mm(
         pcb: &Arc<ProcessControlBlock>,
         score: i16,
         min_update: Option<i16>,
+        mm: Option<&Arc<crate::mm::ucontext::AddressSpace>>,
+        tasks: &[Arc<ProcessControlBlock>],
     ) {
         Self::set_score(pcb, score, min_update);
-        if pcb.is_active_vfork() {
-            return;
-        }
-
-        let Some(mm) = pcb.basic().user_vm() else {
-            return;
-        };
-
+        let Some(mm) = mm else { return };
         let target_tgid = pcb.raw_tgid();
-        let mut seen_tgids = alloc::vec::Vec::new();
-        for pid in ProcessManager::get_all_processes() {
-            let Some(task) = ProcessManager::find(pid) else {
-                continue;
-            };
-            if !Self::task_shares_mm(&task, &mm) {
+        for task in tasks {
+            if task.raw_tgid() == target_tgid || !Self::task_shares_mm(task, mm) {
                 continue;
             }
-
-            let leader = ProcessManager::find(task.raw_tgid()).unwrap_or(task);
-            let tgid = leader.raw_tgid();
-            if tgid == target_tgid {
-                continue;
-            }
-            if seen_tgids.contains(&tgid) {
-                continue;
-            }
-            seen_tgids.push(tgid);
-
+            let leader = ProcessManager::find(task.raw_tgid()).unwrap_or_else(|| task.clone());
             if leader.raw_pid().data() == 0
-                || leader.raw_pid().data() == 1
+                || leader.raw_tgid().data() == 1
                 || leader.flags().contains(ProcessFlags::KTHREAD)
                 || leader.is_active_vfork()
             {
@@ -199,18 +183,50 @@ impl OomScoreAdjFileOps {
             Self::set_score(&leader, score, min_update);
         }
     }
+
     fn write_score(&self, buf: &[u8]) -> Result<usize, SystemError> {
         let score = Self::parse_score(buf)?;
         let pcb = self.target_process()?;
         let has_cap_sys_resource = capable(CAPFlags::CAP_SYS_RESOURCE);
-        let _oom_score_adj_guard = ProcessManager::lock_oom_score_adj();
-        let min_score = pcb.sig_info_irqsave().oom_score_adj_min();
-        if score < min_score && !has_cap_sys_resource {
-            return Err(SystemError::EACCES);
+        // Ordinary control writes may allocate, but never while owning the
+        // adjustment lock an OOM coordinator needs to make recovery progress.
+        let mut tasks = crate::process::snapshot_all_processes()?;
+        tasks.clear();
+        loop {
+            // Declare the MM owner before the guards so its last reference
+            // cannot be retired inside the publication/adjustment transaction.
+            let mut shared_mm = None;
+            let adjustment = ProcessManager::lock_oom_score_adj();
+            let membership = crate::process::pid::pid_membership_lock();
+            if crate::process::snapshot_all_processes_into(&mut tasks).is_err() {
+                drop(membership);
+                drop(adjustment);
+                tasks = crate::process::snapshot_all_processes()?;
+                tasks.clear();
+                continue;
+            }
+            let min_score = pcb.sig_info_irqsave().oom_score_adj_min();
+            let result = if score < min_score && !has_cap_sys_resource {
+                Err(SystemError::EACCES)
+            } else {
+                if !pcb.is_active_vfork() {
+                    shared_mm = pcb.basic().user_vm();
+                }
+                Self::set_score_for_shared_mm(
+                    &pcb,
+                    score,
+                    has_cap_sys_resource.then_some(score),
+                    shared_mm.as_ref(),
+                    &tasks,
+                );
+                Ok(buf.len().min(PROC_NUMBUF - 1))
+            };
+            drop(membership);
+            drop(adjustment);
+            drop(shared_mm);
+            drop(tasks);
+            return result;
         }
-        let min_update = has_cap_sys_resource.then_some(score);
-        Self::set_score_for_shared_mm(&pcb, score, min_update);
-        Ok(buf.len().min(PROC_NUMBUF - 1))
     }
 }
 

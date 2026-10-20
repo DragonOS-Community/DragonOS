@@ -4,7 +4,8 @@
 //! or callback invocation. Callers serialize it with `RcuState::inner` and are
 //! responsible for the full memory barriers documented in `rcu/mod.rs`.
 
-use crate::{libs::cpumask::CpuMask, mm::percpu::PerCpu, smp::cpu::ProcessorId};
+use super::cpu_mask::RcuCpuMask;
+use crate::{mm::percpu::PerCpu, smp::cpu::ProcessorId};
 
 const SEQUENCE_HALF_RANGE: u64 = 1_u64 << 63;
 
@@ -42,7 +43,7 @@ impl RcuSequence {
 
 struct ActiveGracePeriod {
     seq: RcuSequence,
-    waiting_cpus: CpuMask,
+    waiting_cpus: RcuCpuMask,
     context_generations: [u64; PerCpu::MAX_CPU_NUM as usize],
 }
 
@@ -92,7 +93,7 @@ impl GracePeriodState {
     /// Starts the requested GP with a freshly collected CPU snapshot.
     pub(super) fn start_requested(
         &mut self,
-        waiting_cpus: CpuMask,
+        waiting_cpus: RcuCpuMask,
         context_generations: [u64; PerCpu::MAX_CPU_NUM as usize],
     ) -> RcuSequence {
         self.assert_invariants();
@@ -120,7 +121,7 @@ impl GracePeriodState {
             .unwrap_or(false)
     }
 
-    pub(super) fn waiting_cpus_ref(&self) -> Option<&CpuMask> {
+    pub(super) fn waiting_cpus_ref(&self) -> Option<&RcuCpuMask> {
         self.active.as_ref().map(|active| &active.waiting_cpus)
     }
 
@@ -213,8 +214,8 @@ impl GracePeriodState {
     }
 }
 
-fn one_cpu_mask(cpu: u32) -> CpuMask {
-    CpuMask::from_cpu(ProcessorId::new(cpu))
+fn one_cpu_mask(cpu: u32) -> RcuCpuMask {
+    RcuCpuMask::from_cpu(ProcessorId::new(cpu))
 }
 
 fn zero_context_generations() -> [u64; PerCpu::MAX_CPU_NUM as usize] {
@@ -276,7 +277,7 @@ pub(super) fn run_state_machine_selftests() -> Result<(), &'static str> {
 
     let mut empty_gp = GracePeriodState::new();
     let empty_target = empty_gp.request_future();
-    empty_gp.start_requested(CpuMask::new(), zero_context_generations());
+    empty_gp.start_requested(RcuCpuMask::new(), zero_context_generations());
     if !empty_gp.ready_to_complete()
         || empty_gp.complete_ready() != empty_target
         || empty_gp.is_active()
@@ -286,12 +287,12 @@ pub(super) fn run_state_machine_selftests() -> Result<(), &'static str> {
 
     let mut wrapping_gp = GracePeriodState::with_completed(RcuSequence(u64::MAX.wrapping_sub(1)));
     let max_target = wrapping_gp.request_future();
-    wrapping_gp.start_requested(CpuMask::new(), zero_context_generations());
+    wrapping_gp.start_requested(RcuCpuMask::new(), zero_context_generations());
     if max_target.raw() != u64::MAX || wrapping_gp.complete_ready() != max_target {
         return Err("RCU GP did not advance to u64::MAX");
     }
     let zero_target = wrapping_gp.request_future();
-    wrapping_gp.start_requested(CpuMask::new(), zero_context_generations());
+    wrapping_gp.start_requested(RcuCpuMask::new(), zero_context_generations());
     if zero_target.raw() != 0
         || wrapping_gp.complete_ready() != zero_target
         || !wrapping_gp.has_completed(max_target)

@@ -32,6 +32,7 @@ pub(crate) static RECOVERY_WAITERS: OomWaitQueue = OomWaitQueue::new();
 
 static READY: AtomicBool = AtomicBool::new(false);
 static WORK_PENDING: AtomicBool = AtomicBool::new(false);
+static RECLAIM_PENDING: AtomicBool = AtomicBool::new(false);
 static HIGH_PENDING: AtomicBool = AtomicBool::new(false);
 static FILE_EVENTS_PENDING: AtomicBool = AtomicBool::new(false);
 static STARTED: Completion = Completion::new();
@@ -55,12 +56,22 @@ pub(crate) fn request_oom_progress() {
     // not pass a preceding progress store (Release/Acquire alone is not enough).
     fence(Ordering::SeqCst);
     if !RECOVERY_WAITERS.has_registrations()
+        && !crate::libs::resource_wait::has_waiters()
         && !crate::filesystem::cgroup2::events::has_memory_watchers()
     {
         return;
     }
     WORK_PENDING.store(true, Ordering::Release);
     softirq_vectors().raise_softirq(SoftirqNumber::MEMORY_NOTIFY);
+}
+
+/// Lazy-MM retirement is work even without OOM/event waiters. Keep pending
+/// before bootstrap readiness so the first worker round drains early owners.
+pub(crate) fn request_lazy_mm_drop() {
+    WORK_PENDING.store(true, Ordering::Release);
+    if is_ready() {
+        softirq_vectors().raise_softirq(SoftirqNumber::MEMORY_NOTIFY);
+    }
 }
 
 /// Deadline IRQ callbacks only wake the pinned infrastructure worker. User
@@ -72,6 +83,16 @@ pub(crate) fn request_high_deadline() {
     HIGH_PENDING.store(true, Ordering::Release);
     WORK_PENDING.store(true, Ordering::Release);
     softirq_vectors().raise_softirq(SoftirqNumber::MEMORY_NOTIFY);
+}
+
+/// The one permanent reclaimer uses a reusable waiter and a tick deadline.
+/// Retain an early deadline until bootstrap, just like lazy-MM retirement.
+pub(crate) fn request_reclaim_deadline() {
+    RECLAIM_PENDING.store(true, Ordering::Release);
+    WORK_PENDING.store(true, Ordering::Release);
+    if is_ready() {
+        softirq_vectors().raise_softirq(SoftirqNumber::MEMORY_NOTIFY);
+    }
 }
 
 /// Real file-source changes only. Ordinary page release must not scan inode
@@ -149,10 +170,15 @@ fn notification_loop() -> i32 {
     STARTED.complete();
     loop {
         if WORK_PENDING.swap(false, Ordering::AcqRel) {
+            if RECLAIM_PENDING.swap(false, Ordering::AcqRel) {
+                crate::mm::page::reclaim_wait::notify_deadline();
+            }
             if HIGH_PENDING.swap(false, Ordering::AcqRel) {
                 crate::cgroup::memory::high::notify_deadlines();
             }
+            crate::mm::lazy_mm_drop::drain();
             RECOVERY_WAITERS.wake_all();
+            crate::libs::resource_wait::wake_all();
             crate::filesystem::cgroup2::events::notify();
             if FILE_EVENTS_PENDING.swap(false, Ordering::AcqRel) {
                 crate::filesystem::cgroup2::event_notify::notify();

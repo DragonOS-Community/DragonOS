@@ -1,6 +1,8 @@
 use super::*;
 use crate::arch::mm::LockedFrameAllocator;
 
+#[cfg(feature = "mm_selftest")]
+mod entry_wait;
 mod raw_writeback;
 mod read_completion;
 mod subpage;
@@ -2980,6 +2982,39 @@ fn run_memcg_reclaim_scan_budget_selftest() -> Result<bool, SystemError> {
 
 /// Exercise the actual NOIO scanner/retirement path. Self-held resource locks
 /// are intentional: a blocking fallback would deadlock the proc selftest.
+fn noio_reclaim_unstarted(progress: &crate::mm::page::ReclaimProgress) -> bool {
+    progress.reclaimed == 0
+        && progress.detached == 0
+        && progress.scanned == 0
+        && progress.dirty_seen == 0
+        && progress.writeback_scheduled == 0
+}
+
+/// NOIO is try-only: an unrelated owner of the global LRU can reject a pass
+/// before scanning. Retry only that unchanged outcome, never a failed scan or
+/// partial retirement. All temporary identity pins leave before the next call.
+fn retry_unstarted_noio_reclaim(
+    account: &Arc<crate::cgroup::memory::MemoryAccount>,
+    unchanged: impl Fn() -> bool,
+) -> Result<(crate::mm::page::ReclaimProgress, usize), SystemError> {
+    let began = crate::time::timer::clock();
+    for calls in 1..=4096 {
+        let progress = crate::mm::page::PageReclaimer::shrink_account_noio(
+            account,
+            crate::mm::allocator::page_frame::PageFrameCount::ONE,
+        )?;
+        if !noio_reclaim_unstarted(&progress)
+            || !unchanged()
+            || calls == 4096
+            || crate::time::timer::clock().wrapping_sub(began) >= 5 * crate::time::clocksource::HZ
+        {
+            return Ok((progress, calls));
+        }
+        crate::sched::cond_resched();
+    }
+    unreachable!("bounded NOIO reclaim loop always returns")
+}
+
 fn run_memcg_noio_reclaim_selftest() -> Result<bool, SystemError> {
     use crate::cgroup::memory::accounting::{ChargeFailure, ChargeFailureReason};
     use crate::cgroup::memory::{MemoryAccount, MemoryEvent, MemoryPolicy};
@@ -3084,7 +3119,15 @@ fn run_memcg_noio_reclaim_selftest() -> Result<bool, SystemError> {
         fail_stage!("page_flags");
     }
     drop(page);
-    let progress = reclaim()?;
+    let clean_low_before = a.snapshot().events_local[MemoryEvent::Low as usize];
+    let (progress, clean_calls) = retry_unstarted_noio_reclaim(&a, || {
+        a.current_pages() == 1
+            && b.current_pages() == 0
+            && root.current_pages() == 1
+            && fixture.identities[index].upgrade().is_some()
+            && fixture.linked(index)
+            && a.snapshot().events_local[MemoryEvent::Low as usize] == clean_low_before
+    })?;
     ok &= progress.reclaimed == 1
         && progress.detached == 1
         && progress.writeback_scheduled == 0
@@ -3093,7 +3136,7 @@ fn run_memcg_noio_reclaim_selftest() -> Result<bool, SystemError> {
         && !fixture.linked(index);
     if !ok {
         log::error!(
-            "NOIO selftest failed: stage=clean_retire progress={progress:?} a={}",
+            "NOIO selftest failed: stage=clean_retire progress={progress:?} calls={clean_calls} a={}",
             a.current_pages()
         );
         return Ok(false);
@@ -3138,7 +3181,25 @@ fn run_memcg_noio_reclaim_selftest() -> Result<bool, SystemError> {
         ..Default::default()
     });
     let low_before = a.snapshot().events_local[MemoryEvent::Low as usize];
-    let progress = PageReclaimer::shrink_account_noio(&root, PageFrameCount::ONE)?;
+    let low_unchanged = || {
+        a.current_pages() == 1
+            && b.current_pages() == 1
+            && root.current_pages() == 2
+            && fixture.identities[index].upgrade().is_some()
+            && sibling.identities[sibling_index].upgrade().is_some()
+            && fixture.linked(index)
+            && sibling.linked(sibling_index)
+            && a.snapshot().events_local[MemoryEvent::Low as usize] == low_before
+    };
+    // Deterministically prove the allowed no-scan outcome. Inspect membership
+    // only after releasing this guard: linked() reacquires the global LRU.
+    let blocked = {
+        let _held = page_reclaimer_lock();
+        PageReclaimer::shrink_account_noio(&root, PageFrameCount::ONE)?
+    };
+    ok &= noio_reclaim_unstarted(&blocked) && low_unchanged();
+    fail_stage!("busy_lru");
+    let (progress, low_calls) = retry_unstarted_noio_reclaim(&root, low_unchanged)?;
     ok &= progress.reclaimed == 1
         && a.current_pages() == 0
         && b.current_pages() == 1
@@ -3146,7 +3207,7 @@ fn run_memcg_noio_reclaim_selftest() -> Result<bool, SystemError> {
         && sibling.linked(sibling_index)
         && a.snapshot().events_local[MemoryEvent::Low as usize] == low_before + 1;
     if !ok {
-        log::error!("NOIO selftest failed: stage=low_reclaim progress={progress:?} a={} b={} low_before={} low_after={}", a.current_pages(), b.current_pages(), low_before, a.snapshot().events_local[MemoryEvent::Low as usize]);
+        log::error!("NOIO selftest failed: stage=low_reclaim progress={progress:?} calls={low_calls} a={} b={} low_before={} low_after={}", a.current_pages(), b.current_pages(), low_before, a.snapshot().events_local[MemoryEvent::Low as usize]);
         return Ok(false);
     }
     drop(fixture);
@@ -5700,4 +5761,10 @@ pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, S
     Ok(fdtable_layout_report + "memcg_noio_reclaim=ok\n" + &alloc::format!(
         "status=ok\nsubpage_buffers=ok\nmemcg_as_body_lifetime=ok\nmemcg_vma_body_lifetime=ok\nmemcg_file_body_lifetime=ok\nfile_write_completion=ok\nlegacy_writev_completion=ok\nfault_cache_snapshot=ok\nmemcg_page_state=ok\nmemcg_reclaim=ok\nmemcg_reclaim_scan_budget=ok\nregistry_churn=ok\nregistry_batch_retire=ok\nregistry_snapshot_lifetime=ok\nregistry_concurrent_snapshot=ok\nramfs_fallocate_range=ok\nramfs_truncate_metadata=ok\nwrite_prepare_rollback=ok\npreallocate_rollback=ok\nclean_unlink_liveness=ok\nwriteback_domain_lifecycle=ok\ndetached_read_batch_completion=ok\nread_user_batch=ok\npreallocated_batch_lifecycle=ok\nfile_membership=ok\nshmem_membership=ok\ndirty_membership=ok\ndirty_incarnation=ok\nremote_dirty_publish=ok\nwriteback_membership=ok\nwriteback_admission_order=ok\nwriteback_submission_token=ok\nwriteback_defer_progress=ok\nwriteback_budget_retry=ok\nsubmitted_writeback=ok\nfault_invalidate_retry_order=ok\ntag_scan_chunk_release=ok\nunevictable_membership=ok\ninflight_teardown=ok\nlate_completion=ok\nglobal_wiring=ok\nlayout=ok\nfile_drop_drift={file_drop_drift}\nshmem_drop_drift={shmem_drop_drift}\ndirty_drop_drift={dirty_drop_drift}\nwriteback_drop_drift={writeback_drop_drift}\nunevictable_drop_drift={unevictable_drop_drift}\nentry_size={entry_size}\nbaseline_size={baseline_size}\n"
     ))
+}
+
+/// Allocation-free entry predicates after an actual scheduler sleep.
+#[cfg(feature = "mm_selftest")]
+pub(crate) fn heap_denied_entry_wait_selftest() -> Result<bool, SystemError> {
+    entry_wait::run()
 }

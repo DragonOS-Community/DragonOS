@@ -111,6 +111,12 @@ impl Observer {
         if smp_get_processor_id() != self.target {
             return;
         }
+        // The single observed frame already crossed its checked barrier and
+        // was physically freed. Later batches cover different addresses; do
+        // not require them to invalidate that old frame's address again.
+        if self.frees.load(Ordering::Acquire) != 0 {
+            return;
+        }
         let identity = info.mm.as_ref().map_or(0, |mm| Arc::as_ptr(mm) as usize);
         let loaded = info.mm.as_ref().is_none_or(|mm| {
             tlb_state_force(self.target).loaded_is(mm)
@@ -369,7 +375,14 @@ impl Drop for LruRescue {
     }
 }
 
-fn run(user: bool, lru: bool, mode: Mode, cpu: ProcessorId, diagnostic: &mut String) -> bool {
+fn run(
+    user: bool,
+    lru: bool,
+    mode: Mode,
+    cpu: ProcessorId,
+    diagnostic: &mut String,
+    pages: usize,
+) -> bool {
     use core::fmt::Write;
     macro_rules! fail {
         ($stage:literal, $error:expr) => {{
@@ -392,7 +405,7 @@ fn run(user: bool, lru: bool, mode: Mode, cpu: ProcessorId, diagnostic: &mut Str
     let start = if let Some(mm) = &private {
         match mm.map_anonymous_wait(
             VirtAddr::new(0x4000_0000),
-            MMArch::PAGE_SIZE,
+            pages * MMArch::PAGE_SIZE,
             ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
             MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS,
             true,
@@ -553,7 +566,7 @@ fn run(user: bool, lru: bool, mode: Mode, cpu: ProcessorId, diagnostic: &mut Str
             *USER_FIXTURE.lock() = Some(observer.clone());
             let result = mm.munmap_wait(
                 crate::mm::allocator::page_frame::VirtPageFrame::new(start),
-                PageFrameCount::new(1),
+                PageFrameCount::new(pages),
             );
             *USER_FIXTURE.lock() = None;
             if result.is_err() {
@@ -630,13 +643,27 @@ fn run_report(target: ProcessorId) -> String {
         (true, true, Mode::SkipAck, "user_lru_missing_ack_detected"),
     ] {
         let mut diagnostic = String::new();
-        let ok = run(user, lru, mode, target, &mut diagnostic);
+        let ok = run(user, lru, mode, target, &mut diagnostic, 1);
         if !diagnostic.is_empty() {
             let _ = write!(report, "{key}_diagnostic={diagnostic}");
         }
         failures += usize::from(!ok);
         let _ = writeln!(report, "{key}={}", if ok { "ok" } else { "fail" });
     }
+    let mut diagnostic = String::new();
+    let multibatch = run(true, false, Mode::Normal, target, &mut diagnostic, 65);
+    if !diagnostic.is_empty() {
+        let _ = write!(
+            report,
+            "user_multibatch_teardown_order_diagnostic={diagnostic}"
+        );
+    }
+    failures += usize::from(!multibatch);
+    let _ = writeln!(
+        report,
+        "user_multibatch_teardown_order={}",
+        if multibatch { "ok" } else { "fail" }
+    );
     format!(
         "status={}\n{}summary_fail={}\n",
         if failures == 0 { "ok" } else { "fail" },

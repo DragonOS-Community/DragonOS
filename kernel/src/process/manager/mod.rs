@@ -11,7 +11,7 @@ use system_error::SystemError;
 
 use crate::{
     libs::{
-        mutex::{Mutex, MutexGuard},
+        mutex::Mutex,
         rwsem::{RwSem, RwSemReadGuard, RwSemWriteGuard},
         spinlock::SpinLock,
     },
@@ -201,6 +201,9 @@ pub(super) static mut __PROCESS_MANAGEMENT_INIT_DONE: bool = false;
 /// mm with another thread group must not miss a concurrent oom_score_adj update
 /// while it is becoming visible.
 static OOM_SCORE_ADJ_LOCK: Mutex<()> = Mutex::new(());
+
+/// The adjustment lock shares the allocation-free memory-resource protocol.
+pub(crate) type OomScoreAdjGuard = crate::libs::resource_wait::ResourceMutexGuard<'static, ()>;
 /// Allows concurrent fs_struct copy-and-publish operations while excluding
 /// pivot_root's topology commit and chroot_fs_refs-style migration.
 static FS_REFS_PUBLICATION_BARRIER: RwSem<()> = RwSem::new(());
@@ -241,8 +244,13 @@ impl SwitchResult {
 }
 
 impl ProcessManager {
-    pub fn lock_oom_score_adj() -> MutexGuard<'static, ()> {
-        OOM_SCORE_ADJ_LOCK.lock()
+    pub(crate) fn lock_oom_score_adj() -> OomScoreAdjGuard {
+        OomScoreAdjGuard::lock(&OOM_SCORE_ADJ_LOCK)
+    }
+
+    /// The OOM path must not allocate an ordinary mutex wait registration.
+    pub(crate) fn lock_oom_score_adj_for_oom() -> Result<OomScoreAdjGuard, SystemError> {
+        OomScoreAdjGuard::lock_killable(&OOM_SCORE_ADJ_LOCK)
     }
 
     pub fn is_current(pcb: &Arc<ProcessControlBlock>) -> bool {
@@ -434,6 +442,7 @@ impl ProcessManager {
                 (map.len(), map.capacity())
             };
             let needed = len.checked_add(1).ok_or(SystemError::ENOMEM)?;
+            crate::mm::oom::reserve_task_capacity(needed)?;
             if capacity >= needed {
                 return Ok(());
             }
@@ -468,10 +477,31 @@ impl ProcessManager {
         }
     }
 
+    /// Fill preallocated records under the registry lock. `record` must only
+    /// clone the published owner and initialize scalar fields: no allocation,
+    /// task action, nested resource locking or owner retirement is permitted.
+    /// Insufficient capacity leaves the destination empty.
+    pub(crate) fn fill_snapshot_records<T>(
+        records: &mut Vec<T>,
+        capacity_limit: usize,
+        mut record: impl FnMut(&Arc<ProcessControlBlock>) -> T,
+    ) -> Result<(), usize> {
+        assert!(records.is_empty());
+        let all = ALL_PROCESS.lock_irqsave();
+        let map = all.as_ref().expect("process registry initialized");
+        if records.capacity().min(capacity_limit) < map.len() {
+            return Err(map.len());
+        }
+        records.extend(map.values().map(&mut record));
+        Ok(())
+    }
+
     /// Rechecked inside final PID publication before any irreversible attach.
     pub(crate) fn has_process_slot() -> bool {
         let all = ALL_PROCESS.lock_irqsave();
-        all.as_ref().is_some_and(|map| map.len() < map.capacity())
+        all.as_ref().is_some_and(|map| {
+            map.len() < map.capacity() && crate::mm::oom::has_task_capacity(map.len() + 1)
+        })
     }
 
     /// Caller owns final PID membership and checked prepared capacity.
@@ -481,6 +511,10 @@ impl ProcessManager {
         assert!(
             map.len() < map.capacity(),
             "process publication has prepared capacity"
+        );
+        assert!(
+            crate::mm::oom::has_task_capacity(map.len() + 1),
+            "process publication has OOM control capacity"
         );
         assert!(
             !map.contains_key(&pcb.raw_pid()),

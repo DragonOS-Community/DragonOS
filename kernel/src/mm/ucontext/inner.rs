@@ -521,7 +521,6 @@ impl InnerAddressSpace {
             return;
         }
 
-        let mut pages_to_reclassify = Vec::new();
         let mut vaddr = start;
         while vaddr < end {
             if let Some((paddr, _)) = self.user_mapper.utable.translate(vaddr) {
@@ -547,14 +546,10 @@ impl InnerAddressSpace {
                     }
                 }
                 if !new_locked {
-                    pages_to_reclassify.push(page);
+                    Self::remove_page_unevictable_if_unneeded(&page);
                 }
             }
             vaddr = VirtAddr::new(vaddr.data() + MMArch::PAGE_SIZE);
-        }
-
-        for page in pages_to_reclassify {
-            Self::remove_page_unevictable_if_unneeded(&page);
         }
     }
 }

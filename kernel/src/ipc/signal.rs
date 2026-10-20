@@ -4,10 +4,7 @@ use core::{
     sync::atomic::{compiler_fence, Ordering},
 };
 
-use alloc::{
-    sync::{Arc, Weak},
-    vec::Vec,
-};
+use alloc::sync::{Arc, Weak};
 use log::warn;
 use system_error::SystemError;
 
@@ -29,72 +26,6 @@ use crate::{
         Instant, PosixTimeSpec,
     },
 };
-
-/// An OOM kill prepares storage before publishing GROUP_EXIT. Dispatch only
-/// sets the unmaskable pending bit and wakes the captured threads; it cannot
-/// allocate a sigqueue or a thread-group snapshot after the kill is committed.
-pub(crate) struct PreparedOomSigkill {
-    target: Arc<ProcessControlBlock>,
-    tasks: Vec<Arc<ProcessControlBlock>>,
-}
-
-impl PreparedOomSigkill {
-    pub(crate) fn prepare(target: Arc<ProcessControlBlock>) -> Result<Self, SystemError> {
-        let mut tasks = Vec::new();
-        loop {
-            let guard = crate::process::pid::pid_membership_lock();
-            let result = ProcessManager::fill_thread_group_snapshot(&target, &mut tasks);
-            drop(guard);
-            match result {
-                Ok(_) => return Ok(Self { target, tasks }),
-                Err(required) => tasks
-                    .try_reserve(required)
-                    .map_err(|_| SystemError::ENOMEM)?,
-            }
-        }
-    }
-
-    /// Retire previous snapshot references before entering the transaction.
-    pub(crate) fn clear_snapshot(&mut self) {
-        self.tasks.clear();
-    }
-
-    /// The caller holds pid_membership_lock. Refresh every kill's snapshot
-    /// before committing any of them; insufficient capacity has no side effect.
-    pub(crate) fn refresh_snapshot_locked(&mut self) -> Result<(), ()> {
-        ProcessManager::fill_thread_group_snapshot(&self.target, &mut self.tasks)
-            .map(|_| ())
-            .map_err(|_| ())
-    }
-
-    /// Caller holds pid_membership_lock and has refreshed all snapshots. The
-    /// callbacks must not allocate, sleep or wake. Dispatch is always lock-free.
-    pub(crate) fn commit_if_locked(
-        &mut self,
-        validate: impl FnOnce(&Arc<ProcessControlBlock>) -> bool,
-        committed: impl FnOnce(&Arc<ProcessControlBlock>),
-    ) -> bool {
-        self.target.with_task_lock_irqsave(|| {
-            if !validate(&self.target) {
-                return false;
-            }
-            self.target
-                .process_signal()
-                .start_group_exit_for_fatal_signal(Signal::SIGKILL as usize);
-            committed(&self.target);
-            true
-        })
-    }
-
-    pub(crate) fn dispatch(self) {
-        Signal::queue_private_sigkill_to_thread(&self.target);
-        for task in self.tasks {
-            if !Arc::ptr_eq(&task, &self.target) {
-                Signal::queue_private_sigkill_to_thread(&task);
-            }
-        }
-    }
-}
 
 /// Send a kernel-originated signal to the current task.
 ///
@@ -577,27 +508,34 @@ impl Signal {
             return false;
         }
 
-        // Freeze published membership before the first wake, without an IRQ
-        // allocation. Reapers retain their PCB until they can remove its Weak
-        // under this list's write lock; the leader and target are pinned here.
-        // Signal/pending guards are released before wakeup's pi -> rq locks.
-        let leader = ProcessManager::thread_group_leader_of(&target);
-        let threads = leader.threads_read_irqsave();
         Self::queue_private_sigkill_to_thread(&target);
-        if !Arc::ptr_eq(&leader, &target) {
+        Self::zap_other_threads(&target);
+
+        true
+    }
+
+    /// Allocation-free fatal broadcast shared by signal delivery and exit_group.
+    /// GROUP_EXIT must already be published. Reapers retain their PCB until its
+    /// Weak can be removed under this group's write lock; the read guard pins
+    /// membership across wakeups without a heap snapshot or a registry lock.
+    pub(crate) fn zap_other_threads(target: &Arc<ProcessControlBlock>) {
+        let leader = ProcessManager::thread_group_leader_of(target);
+        let threads = leader.threads_read_irqsave();
+        if !Arc::ptr_eq(&leader, target) && !leader.flags().contains(ProcessFlags::EXITING) {
             Self::queue_private_sigkill_to_thread(&leader);
         }
         for weak in threads.group_tasks() {
             let Some(task) = weak.upgrade() else {
                 continue;
             };
-            if Arc::ptr_eq(&task, &target) || Arc::ptr_eq(&task, &leader) {
+            if Arc::ptr_eq(&task, target)
+                || Arc::ptr_eq(&task, &leader)
+                || task.flags().contains(ProcessFlags::EXITING)
+            {
                 continue;
             }
             Self::queue_private_sigkill_to_thread(&task);
         }
-
-        true
     }
 
     fn should_start_fatal_group_exit(

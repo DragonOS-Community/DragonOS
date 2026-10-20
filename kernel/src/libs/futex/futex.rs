@@ -23,7 +23,8 @@ use system_error::SystemError;
 use crate::{
     arch::MMArch,
     libs::{
-        mutex::{Mutex, MutexGuard},
+        mutex::Mutex,
+        resource_wait::ResourceMutexGuard,
         wait_queue::{Waiter, Waker},
     },
     mm::{
@@ -42,6 +43,10 @@ use crate::{
 
 use super::constant::*;
 
+#[cfg(feature = "mm_selftest")]
+#[path = "wake_selftest.rs"]
+mod selftest;
+
 static mut FUTEX_DATA: Option<FutexData> = None;
 
 pub struct FutexData {
@@ -49,13 +54,13 @@ pub struct FutexData {
 }
 
 impl FutexData {
-    pub fn futex_map() -> MutexGuard<'static, HashMap<FutexKey, FutexHashBucket>> {
-        unsafe { FUTEX_DATA.as_ref().unwrap().data.lock() }
+    pub fn futex_map() -> ResourceMutexGuard<'static, HashMap<FutexKey, FutexHashBucket>> {
+        unsafe { ResourceMutexGuard::lock(&FUTEX_DATA.as_ref().unwrap().data) }
     }
 
     pub fn try_remove(key: &FutexKey) -> Option<FutexHashBucket> {
         unsafe {
-            let mut guard = FUTEX_DATA.as_ref().unwrap().data.lock();
+            let mut guard = ResourceMutexGuard::lock(&FUTEX_DATA.as_ref().unwrap().data);
             if let Some(futex) = guard.get(key) {
                 if futex.chain.is_empty() && futex.pi_waiters.is_empty() && futex.pi_owner == 0 {
                     return guard.remove(key);
@@ -111,40 +116,18 @@ impl FutexHashBucket {
         nr_wake: u32,
     ) -> Result<usize, SystemError> {
         let mut count = 0;
-        // 记录初始队列长度，确保只遍历一次
-        let initial_len = self.chain.len();
-        let mut processed = 0;
-
-        while processed < initial_len && count < nr_wake {
-            if let Some(futex_q) = self.chain.pop_front() {
-                // 检查key是否匹配
-                if futex_q.key != key {
-                    // key不匹配，放回队列尾部
-                    self.chain.push_back(futex_q);
-                    processed += 1;
-                    continue;
-                }
-
-                // 检查bitset是否匹配
-                if let Some(bitset) = bitset {
-                    if futex_q.bitset & bitset == 0 {
-                        // bitset不匹配，放回队列尾部
-                        self.chain.push_back(futex_q);
-                        processed += 1;
-                        continue;
-                    }
-                }
-
-                // key和bitset都匹配，尝试唤醒
-                // 注意：pop_front已经将futex_q从队列中移除，无需再次调用remove
-                if futex_q.waker.wake() {
-                    count += 1;
-                }
-                // 如果pcb已经被释放，也算处理了一个，继续下一个
-                processed += 1;
-            } else {
-                // 队列为空，退出
-                break;
+        // Leave nonmatching nodes in place: pop/push would allocate a fresh
+        // LinkedList node on this wake-only path.
+        let mut matching = self.chain.extract_if(|waiter| {
+            waiter.key == key && bitset.is_none_or(|mask| waiter.bitset & mask != 0)
+        });
+        while count < nr_wake {
+            let Some(waiter) = matching.next() else { break };
+            // A stale/notified waker is removed but does not consume the
+            // successful-wakeup budget. Dropping the iterator preserves the
+            // remaining nodes and their original order.
+            if waiter.waker.wake() {
+                count += 1;
             }
         }
 
@@ -511,24 +494,39 @@ impl Futex {
         )?;
 
         let mut binding = FutexData::futex_map();
-        let bucket_mut = binding.entry(key.clone()).or_insert(FutexHashBucket::new());
-
-        // 确保后面的唤醒操作是有意义的
-        if bucket_mut.chain.is_empty() {
+        let Some(count) = Self::wake_existing(&mut binding, &key, nr_wake, bitset)? else {
             return Ok(0);
-        }
-
-        // Linux 行为：即使 nr_wake 为 0，也至少唤醒一个等待者
-        let effective_nr_wake = if nr_wake == 0 { 1 } else { nr_wake };
-
-        // 从队列中唤醒
-        let count = bucket_mut.wake_up(key.clone(), Some(bitset), effective_nr_wake)?;
+        };
 
         drop(binding);
 
         FutexData::try_remove(&key);
 
         Ok(count)
+    }
+
+    /// Wake only an already registered key. Some(0) also covers an existing
+    /// empty/PI-only bucket: the caller must still run ordinary empty cleanup.
+    fn wake_existing(
+        map: &mut HashMap<FutexKey, FutexHashBucket>,
+        key: &FutexKey,
+        nr_wake: u32,
+        bitset: u32,
+    ) -> Result<Option<usize>, SystemError> {
+        let Some(bucket) = map.get_mut(key) else {
+            return Ok(None);
+        };
+        // Preserve Linux FUTEX_WAKE's nr_wake == 0 behavior. Other bucket
+        // users (for example requeue) retain their literal zero-wake budget.
+        let effective_nr_wake = nr_wake.max(1);
+        bucket
+            .wake_up(key.clone(), Some(bitset), effective_nr_wake)
+            .map(Some)
+    }
+
+    #[cfg(feature = "mm_selftest")]
+    pub(crate) fn heap_denied_wake_selftest() -> Result<bool, SystemError> {
+        selftest::run()
     }
 
     /// ### 唤醒制定uaddr1上的最多nr_wake个进程，然后将uaddr1最多nr_requeue个进程移动到uaddr2绑定的futex上
@@ -1925,29 +1923,30 @@ impl RobustListHead {
                     }
                 }
 
-                let next_waiter = bucket.pi_waiters.pop_front();
+                let next_waiter = bucket.pi_waiters.front().cloned();
                 if let Some(next_waiter) = next_waiter {
-                    let has_more = !bucket.pi_waiters.is_empty();
+                    // Keep the list node until the user-word transition is
+                    // committed; a CAS retry must not allocate a replacement.
+                    let has_more = bucket.pi_waiters.len() > 1;
                     let new_val = next_waiter.tid
                         | FUTEX_OWNER_DIED
                         | if has_more { FUTEX_WAITERS } else { 0 };
                     match Futex::futex_cmpxchg_user(futex_uaddr, uval, new_val) {
                         Ok(observed) if observed == uval => {
+                            let removed =
+                                bucket.pi_waiters.pop_front().expect("observed PI waiter");
+                            assert!(Arc::ptr_eq(&removed, &next_waiter));
                             bucket.pi_owner = next_waiter.tid;
                             drop(futex_map_guard);
                             next_waiter.waker.wake();
                             return Ok(true);
                         }
                         Ok(observed) => {
-                            bucket.pi_waiters.push_front(next_waiter);
                             drop(futex_map_guard);
                             uval = observed;
                             continue;
                         }
-                        Err(err) => {
-                            bucket.pi_waiters.push_front(next_waiter);
-                            return Err(err);
-                        }
+                        Err(err) => return Err(err),
                     }
                 }
 

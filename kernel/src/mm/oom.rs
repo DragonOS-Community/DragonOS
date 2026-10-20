@@ -5,7 +5,6 @@ use alloc::{
     vec::Vec,
 };
 use core::sync::atomic::{AtomicU64, Ordering};
-use log::{error, warn};
 use system_error::SystemError;
 
 use crate::{
@@ -13,13 +12,25 @@ use crate::{
     cgroup::memory::{
         account_for_task, ChargeFailure, ChargeFailureReason, MemoryAccount, MemoryEvent,
     },
-    ipc::signal::PreparedOomSigkill,
-    libs::{spinlock::SpinLock, wait_queue::WaitQueue},
+    libs::spinlock::SpinLock,
     mm::{allocator::page_frame::FrameAllocator, MemoryManagementArch},
     process::{ProcessControlBlock, ProcessFlags, ProcessManager, RawPid},
 };
 
 use super::ucontext::AddressSpace;
+
+#[cfg(feature = "mm_selftest")]
+pub(crate) mod denial;
+pub(crate) mod report;
+mod workspace;
+use workspace::{KilledMm, Lease, TaskRecord, Workspace};
+
+pub(crate) fn reserve_task_capacity(required: usize) -> Result<(), SystemError> {
+    workspace::reserve(required)
+}
+pub(crate) fn has_task_capacity(required: usize) -> bool {
+    workspace::has_capacity(required)
+}
 
 /// Permission issued only after a committed kill and shared-init exclusion.
 /// Keep its field private to this publisher; an MM id alone is not permission.
@@ -38,7 +49,6 @@ impl OomReapAuthorization {
     }
 }
 
-static OOM_WAITQ: WaitQueue = WaitQueue::default();
 static OOM_STATE: SpinLock<OomState> = SpinLock::new(OomState::new());
 static OOM_FAULT_INJECT: SpinLock<OomFaultInject> = SpinLock::new(OomFaultInject::disabled());
 static OOM_KILL_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -78,7 +88,7 @@ pub(crate) enum MemoryOomOutcome {
 enum OomSelection {
     Candidate(OomCandidate),
     ExistingVictim(MemoryOomVictim),
-    None,
+    None(SelectionStats),
 }
 
 struct CommittedOomVictim {
@@ -106,6 +116,8 @@ struct OomFaultInject {
     fail_after: usize,
     seen: usize,
     remaining_failures: Option<usize>,
+    #[cfg(feature = "mm_selftest")]
+    deny_heap: bool,
 }
 
 impl OomState {
@@ -125,6 +137,8 @@ impl OomFaultInject {
             fail_after: 0,
             seen: 0,
             remaining_failures: Some(0),
+            #[cfg(feature = "mm_selftest")]
+            deny_heap: false,
         }
     }
 
@@ -141,13 +155,6 @@ struct OomCandidate {
     score: isize,
     resident_pages: usize,
     oom_score_adj: i16,
-}
-
-struct OomKillTarget {
-    tgid: RawPid,
-    signal: PreparedOomSigkill,
-    committed: bool,
-    event_account: Option<Arc<MemoryAccount>>,
 }
 
 const OOM_SCORE_ADJ_MIN: i16 = -1000;
@@ -171,7 +178,7 @@ mod scoped_score_tests {
 }
 
 fn wake_oom_waiters() {
-    OOM_WAITQ.wake_all();
+    crate::mm::memory_notify::request_oom_progress();
 }
 
 fn current_is_killed_or_exiting() -> bool {
@@ -271,8 +278,19 @@ fn clear_inflight_for_mm(mm_id: u64) -> bool {
     }
 }
 
-fn select_victim(scope: Option<&Arc<MemoryAccount>>) -> Result<OomSelection, SystemError> {
-    let tasks = crate::process::snapshot_all_processes()?;
+#[derive(Debug, Default)]
+struct SelectionStats {
+    tasks: usize,
+    outside_scope: usize,
+    no_mm: usize,
+    retired_mm: usize,
+    protected: usize,
+    exiting: usize,
+    vfork: usize,
+    eligible: usize,
+}
+
+fn select_victim(records: &mut [TaskRecord], scope: Option<&Arc<MemoryAccount>>) -> OomSelection {
     let total_pages = scope.map_or_else(total_system_pages, |scope| {
         scope
             .policy()
@@ -281,29 +299,26 @@ fn select_victim(scope: Option<&Arc<MemoryAccount>>) -> Result<OomSelection, Sys
             .max(1)
             .min(isize::MAX as u64) as isize
     });
-    let mut seen_tgids = Vec::new();
-    seen_tgids
-        .try_reserve(tasks.len())
-        .map_err(|_| SystemError::ENOMEM)?;
+    let mut stats = SelectionStats::default();
     let mut best: Option<OomCandidate> = None;
-
-    for task in tasks {
-        if scope.is_some_and(|scope| !account_for_task(&task).is_descendant_of(scope)) {
+    for record in records {
+        stats.tasks += 1;
+        let task = &record.task;
+        if scope.is_some_and(|scope| !account_for_task(task).is_descendant_of(scope)) {
+            stats.outside_scope += 1;
             continue;
         }
         let leader = leader_of(task.clone());
-        let tgid = leader.raw_tgid();
-        if seen_tgids.contains(&tgid) {
-            continue;
-        }
+        let tgid = record.tgid;
         if scope.is_some() {
             if is_global_init_or_kthread(&leader) {
+                stats.protected += 1;
                 continue;
             }
             if let Some((mm_id, mm)) = leader.process_signal().recorded_oom_victim(tgid) {
-                // Linux checks signal->oom_mm before badness. An exec may have
-                // replaced the task's current mm; never wait on that new image.
-                let unfinished = mm.upgrade().is_some_and(|mm| {
+                // Keep any upgraded observer until after the IRQ transaction.
+                record.observed_oom_mm = mm.upgrade();
+                let unfinished = record.observed_oom_mm.as_ref().is_some_and(|mm| {
                     !mm.is_torn_down()
                         && !matches!(
                             mm.oom_reap_slot().status(),
@@ -311,14 +326,14 @@ fn select_victim(scope: Option<&Arc<MemoryAccount>>) -> Result<OomSelection, Sys
                         )
                 });
                 if unfinished {
-                    return Ok(OomSelection::ExistingVictim(MemoryOomVictim { mm, mm_id }));
+                    return OomSelection::ExistingVictim(MemoryOomVictim { mm, mm_id });
                 }
-                // A completed recorded victim is like MMF_OOM_SKIP. Do not
-                // count or select it again, even if its adjustment changed.
+                stats.retired_mm += 1;
                 continue;
             }
         }
-        let Some(mm) = task.basic().user_vm() else {
+        let Some(mm) = record.observed_mm.as_ref() else {
+            stats.no_mm += 1;
             continue;
         };
         if mm.is_torn_down()
@@ -327,18 +342,29 @@ fn select_victim(scope: Option<&Arc<MemoryAccount>>) -> Result<OomSelection, Sys
                 super::oom_reaper::ReapStatus::Finished(_)
             )
         {
+            stats.retired_mm += 1;
             continue;
         }
-        // A leader without an mm must not hide a remaining mm-holding worker.
-        seen_tgids.push(tgid);
         let oom_score_adj = leader.sig_info_irqsave().oom_score_adj();
-        if should_skip_candidate(&task, oom_score_adj) {
+        if is_global_init_or_kthread(&leader) || oom_score_adj == OOM_SCORE_ADJ_MIN {
+            stats.protected += 1;
             continue;
         }
-
+        if task.flags().contains(ProcessFlags::EXITING) {
+            stats.exiting += 1;
+            continue;
+        }
+        if task.is_active_vfork() {
+            stats.vfork += 1;
+            continue;
+        }
+        // Considering each eligible TID is idempotent for a stable group and
+        // does not let an exited/mm-less thread hide a live worker.
+        stats.eligible += 1;
         let candidate = OomCandidate {
-            task,
+            task: task.clone(),
             tgid,
+            mm: mm.clone(),
             score: if scope.is_some() {
                 scoped_badness(
                     mm.resident_pages(),
@@ -347,21 +373,19 @@ fn select_victim(scope: Option<&Arc<MemoryAccount>>) -> Result<OomSelection, Sys
                     total_pages,
                 )
             } else {
-                oom_score(&mm, oom_score_adj, total_pages)
+                oom_score(mm, oom_score_adj, total_pages)
             },
             resident_pages: mm.resident_pages(),
             oom_score_adj,
-            mm,
         };
         if best
             .as_ref()
-            .is_none_or(|current| better_candidate(&candidate, current))
+            .is_none_or(|old| better_candidate(&candidate, old))
         {
             best = Some(candidate);
         }
     }
-
-    Ok(best.map_or(OomSelection::None, OomSelection::Candidate))
+    best.map_or(OomSelection::None(stats), OomSelection::Candidate)
 }
 
 fn begin_selection(scoped: bool) -> Result<u64, ()> {
@@ -400,275 +424,243 @@ pub(crate) fn note_oom_reaping_finished(mm_id: u64) {
     crate::mm::memory_notify::request_oom_progress();
 }
 
-fn send_oom_sigkill(
+/// Return the end of a contiguous TGID group in the prepared task snapshot.
+fn group_end(records: &[TaskRecord], start: usize) -> usize {
+    let tgid = records[start].tgid;
+    start + records[start..].partition_point(|record| record.tgid == tgid)
+}
+
+/// Only the task-locked actual commit can create an MM reaping permission.
+fn commit_group(records: &mut [TaskRecord], target: usize, mm: Option<&Arc<AddressSpace>>) {
+    let task = records[target].task.clone();
+    task.process_signal()
+        .start_group_exit_for_fatal_signal(Signal::SIGKILL as usize);
+    if let Some(mm) = mm {
+        assert!(
+            records[target].retired_mm.is_none(),
+            "each OOM group commits once"
+        );
+        records[target].retired_mm = task
+            .process_signal()
+            .record_oom_victim_mm(records[target].tgid, mm);
+        records[target].killed_mm = Some(mm.clone());
+    }
+    for record in records {
+        record.dispatch = true;
+        #[cfg(feature = "mm_selftest")]
+        denial::mark_victim(&record.task);
+    }
+}
+
+fn mm_index(mms: &[KilledMm], mm: &Arc<AddressSpace>) -> Option<usize> {
+    mms.binary_search_by_key(&mm.id(), |entry| entry.mm.id())
+        .ok()
+}
+
+/// Called once with adjustment and PID membership serialized. All backing was
+/// prepared before task publication; no signal dispatch/owner retirement here.
+fn commit_oom_kill(
     generation: u64,
     candidate: &OomCandidate,
     scope: Option<&Arc<MemoryAccount>>,
     requested_pages: u64,
+    work: &mut Workspace,
 ) -> Result<CommittedOomVictim, SystemError> {
-    let mut preparation_retries = 16;
-    loop {
-        let tasks = crate::process::snapshot_all_processes()?;
-        let victim = candidate.task.clone();
-        if victim.raw_tgid() != candidate.tgid || !task_uses_mm(&victim, &candidate.mm) {
-            return Err(SystemError::ESRCH);
+    let victim_account = account_for_task(&candidate.task);
+    let mut group = None;
+    let mut account = victim_account.clone();
+    if scope.is_none_or(|scope| account.is_descendant_of(scope)) {
+        loop {
+            if account.policy().oom_group {
+                group = Some(account.clone());
+            }
+            if scope.is_some_and(|scope| Arc::ptr_eq(scope, &account)) {
+                break;
+            }
+            match account.parent() {
+                Some(parent) => account = parent.clone(),
+                None => break,
+            }
         }
-        let victim_tgid = victim.raw_tgid();
-        let victim_account = account_for_task(&victim);
-        let mut group = None;
-        let mut account = victim_account.clone();
-        if scope.is_none_or(|scope| account.is_descendant_of(scope)) {
-            loop {
-                if account.policy().oom_group {
-                    group = Some(account.clone());
-                }
-                if scope.is_some_and(|scope| Arc::ptr_eq(scope, &account)) {
+    }
+    let primary = work
+        .tasks
+        .iter()
+        .position(|r| Arc::ptr_eq(&r.task, &candidate.task))
+        .ok_or(SystemError::ESRCH)?;
+    let start = work
+        .tasks
+        .partition_point(|r| r.tgid.data() < candidate.tgid.data());
+    let end = group_end(&work.tasks, start);
+    let target = candidate.task.clone();
+    let committed = target.with_task_lock_irqsave(|| {
+        if target.raw_tgid() != candidate.tgid
+            || !task_uses_mm(&target, &candidate.mm)
+            || !Arc::ptr_eq(&account_for_task(&target), &victim_account)
+            || should_skip_candidate(
+                &target,
+                leader_of(target.clone()).sig_info_irqsave().oom_score_adj(),
+            )
+            || scope.is_some_and(|scope| {
+                !scope.is_online()
+                    || !account_for_task(&target).is_descendant_of(scope)
+                    || scope.policy().max.is_none_or(|max| {
+                        scope.snapshot().current.saturating_add(requested_pages) <= max
+                    })
+            })
+        {
+            return false;
+        }
+        commit_group(
+            &mut work.tasks[start..end],
+            primary - start,
+            Some(&candidate.mm),
+        );
+        if scope.is_none() {
+            OOM_STATE.lock_irqsave().inflight = Some(OomVictimState {
+                generation,
+                tgid: candidate.tgid,
+                mm_id: candidate.mm.id(),
+            });
+        }
+        true
+    });
+    if !committed {
+        return Err(SystemError::ESRCH);
+    }
+
+    // Ordinary group victims retain -1000 protection. Visit each group once;
+    // a live worker may own its MM even if the leader has already exited.
+    let mut start = 0;
+    while start < work.tasks.len() {
+        let end = group_end(&work.tasks, start);
+        if !work.tasks[start].dispatch {
+            for index in start..end {
+                let target = work.tasks[index].task.clone();
+                let committed = target.with_task_lock_irqsave(|| {
+                    if is_global_init_or_kthread(&leader_of(target.clone()))
+                        || target.is_exited()
+                        || leader_of(target.clone()).sig_info_irqsave().oom_score_adj()
+                            == OOM_SCORE_ADJ_MIN
+                        || !group
+                            .as_ref()
+                            .is_some_and(|group| account_for_task(&target).is_descendant_of(group))
+                    {
+                        return false;
+                    }
+                    // Basic guard outlives the temporary MM owner on rejection.
+                    let basic = target.basic();
+                    let Some(mm) = basic.user_vm() else {
+                        return false;
+                    };
+                    commit_group(&mut work.tasks[start..end], index - start, Some(&mm));
+                    true
+                });
+                if committed {
                     break;
                 }
-                match account.parent() {
-                    Some(parent) => account = parent.clone(),
-                    None => break,
-                }
             }
         }
-        // All process-group signal storage is prepared before the first kill.
-        // This also permits cleanup of every group victim's real mm, without
-        // authorizing cleanup using an uncommitted, stale snapshot source.
-        let mut primary = PreparedOomSigkill::prepare(victim.clone())?;
-        let mut secondary: Vec<OomKillTarget> = Vec::new();
-        secondary
-            .try_reserve(tasks.len())
-            .map_err(|_| SystemError::ENOMEM)?;
-        let mut authorization_tasks = Vec::new();
-        authorization_tasks
-            .try_reserve(tasks.len())
-            .map_err(|_| SystemError::ENOMEM)?;
-        let mut prospective_mms = Vec::new();
-        prospective_mms
-            .try_reserve(tasks.len().saturating_add(1))
-            .map_err(|_| SystemError::ENOMEM)?;
-        let mut killed_mms = Vec::new();
-        killed_mms
-            .try_reserve(tasks.len().saturating_add(1))
-            .map_err(|_| SystemError::ENOMEM)?;
-        let mut retired_mms = Vec::new();
-        retired_mms
-            .try_reserve(tasks.len().saturating_add(1))
-            .map_err(|_| SystemError::ENOMEM)?;
-        for task in &tasks {
-            let task = task.clone();
-            let leader = leader_of(task.clone());
-            if leader.raw_tgid() == victim_tgid
-                || is_global_init_or_kthread(&leader)
-                || task.basic().user_vm().is_none()
-                || secondary.iter().any(|kill| kill.tgid == task.raw_tgid())
-            {
-                continue;
-            }
-            secondary.push(OomKillTarget {
-                tgid: task.raw_tgid(),
-                signal: PreparedOomSigkill::prepare(task)?,
-                committed: false,
-                event_account: None,
+        start = end;
+    }
+    for record in &work.tasks {
+        if let Some(mm) = &record.killed_mm {
+            work.mms.push(KilledMm {
+                mm: mm.clone(),
+                shared_init: false,
             });
         }
-        primary.clear_snapshot();
-        for kill in &mut secondary {
-            kill.signal.clear_snapshot();
-        }
-        // Mutex before IRQ locks; all wakeups and batch reference retirement
-        // happen after both publication and adjustment locks are released.
-        let adj_guard = ProcessManager::lock_oom_score_adj();
-        let membership = crate::process::pid::pid_membership_lock();
-        if crate::process::snapshot_all_processes_into(&mut authorization_tasks).is_err()
-            || authorization_tasks
-                .len()
-                .checked_add(1)
-                .is_none_or(|required| required > prospective_mms.capacity())
-            || primary.refresh_snapshot_locked().is_err()
-            || secondary
-                .iter_mut()
-                .any(|kill| kill.signal.refresh_snapshot_locked().is_err())
-        {
-            drop(membership);
-            drop(adj_guard);
-            if preparation_retries == 0 {
-                return Err(SystemError::ESRCH);
-            }
-            preparation_retries -= 1;
-            continue;
-        }
-        prospective_mms.push(candidate.mm.clone());
-        for task in &authorization_tasks {
-            let mm = task.with_task_lock_irqsave(|| {
-                if !is_global_init_or_kthread(&leader_of(task.clone()))
-                    && task.sig_info_irqsave().oom_score_adj() != OOM_SCORE_ADJ_MIN
-                    && group
-                        .as_ref()
-                        .is_some_and(|group| account_for_task(task).is_descendant_of(group))
-                {
-                    task.basic().user_vm()
-                } else {
-                    None
-                }
-            });
-            if let Some(mm) = mm {
-                prospective_mms.push(mm);
-            }
-        }
-        // A CLONE_VM TGID published during preparation must also have signal
-        // storage before any kill/reap. Unrelated new independent MMs do not
-        // force this retry. Fork publication is blocked until commit ends;
-        // an exec can introduce only its fresh, independently born MM.
-        let missing_target = authorization_tasks.iter().any(|task| {
-            task.raw_tgid() != victim_tgid
-                && !is_global_init_or_kthread(&leader_of(task.clone()))
-                && !secondary.iter().any(|kill| kill.tgid == task.raw_tgid())
-                && task.with_task_lock_irqsave(|| {
-                    prospective_mms.iter().any(|mm| task_uses_mm(task, mm))
-                })
-        });
-        if missing_target {
-            drop(membership);
-            drop(adj_guard);
-            if preparation_retries == 0 {
-                return Err(SystemError::ESRCH);
-            }
-            preparation_retries -= 1;
-            continue;
-        }
-        let mut primary_event = None;
-        let committed = primary.commit_if_locked(
-            |target| {
-                task_uses_mm(target, &candidate.mm)
-                    && target.raw_tgid() == candidate.tgid
-                    && Arc::ptr_eq(&account_for_task(target), &victim_account)
-                    && !should_skip_candidate(target, target.sig_info_irqsave().oom_score_adj())
-                    && scope.is_none_or(|scope| {
-                        scope.is_online()
-                            && account_for_task(target).is_descendant_of(scope)
-                            && scope.policy().max.is_some_and(|max| {
-                                scope.snapshot().current.saturating_add(requested_pages) > max
-                            })
-                    })
-            },
-            |target| {
-                killed_mms.push(candidate.mm.clone());
-                primary_event = Some(candidate.mm.memory_account());
-                if let Some(retired) = target
-                    .process_signal()
-                    .record_oom_victim_mm(victim_tgid, &candidate.mm)
-                {
-                    retired_mms.push(retired);
-                }
-                if scope.is_none() {
-                    OOM_STATE.lock_irqsave().inflight = Some(OomVictimState {
-                        generation,
-                        tgid: victim_tgid,
-                        mm_id: candidate.mm.id(),
-                    });
-                }
-            },
-        );
-        if !committed {
-            drop(membership);
-            drop(adj_guard);
-            return Err(SystemError::ESRCH);
-        }
-        // First commit still-valid group members and retain their actual mm.
-        for kill in &mut secondary {
-            let mut event_account = None;
-            kill.committed = kill.signal.commit_if_locked(
-                |target| {
-                    target.raw_tgid() == kill.tgid
-                        && !is_global_init_or_kthread(&leader_of(target.clone()))
-                        && target.basic().user_vm().is_some()
-                        && target.sig_info_irqsave().oom_score_adj() != OOM_SCORE_ADJ_MIN
-                        && group
-                            .as_ref()
-                            .is_some_and(|group| account_for_task(target).is_descendant_of(group))
-                },
-                |target| {
-                    if let Some(mm) = target.basic().user_vm() {
-                        event_account = Some(mm.memory_account());
-                        if let Some(retired) = target
-                            .process_signal()
-                            .record_oom_victim_mm(target.raw_tgid(), &mm)
-                        {
-                            retired_mms.push(retired);
-                        }
-                        killed_mms.push(mm);
+    }
+    work.mms.sort_unstable_by_key(|entry| entry.mm.id());
+    // Every actual committed MM is still pinned by its TaskRecord. Removing
+    // duplicate set owners therefore cannot run MM destruction under IRQ locks.
+    work.mms.dedup_by_key(|entry| entry.mm.id());
+
+    // Linux's shared-MM exception can kill a protected sibling TGID, but can
+    // never authorize reaping a different image or a still-shared init MM.
+    let mut start = 0;
+    while start < work.tasks.len() {
+        let end = group_end(&work.tasks, start);
+        if !work.tasks[start].dispatch {
+            for index in start..end {
+                let target = work.tasks[index].task.clone();
+                let committed = target.with_task_lock_irqsave(|| {
+                    if is_global_init_or_kthread(&leader_of(target.clone())) {
+                        return false;
                     }
-                },
-            );
-            kill.event_account = event_account;
-        }
-        // Only actual killed mm authorize the Linux cross-TGID exception.
-        // -1000 protects ordinary group victims, not shared-mm cleanup.
-        for kill in &mut secondary {
-            if kill.committed {
-                continue;
-            }
-            kill.committed = kill.signal.commit_if_locked(
-                |target| {
-                    target.raw_tgid() == kill.tgid
-                        && !is_global_init_or_kthread(&leader_of(target.clone()))
-                        && killed_mms.iter().any(|mm| task_uses_mm(target, mm))
-                },
-                |_| {},
-            );
-        }
-        // Use a fresh full snapshot from this publication transaction, not
-        // the earlier preparation snapshot. A just-published init thread may
-        // retain an old MM after its parent exec/exit. Inspect its actual MM
-        // under task_lock; PID membership blocks another fork publication.
-        // Exec installs only its newly born MM, never one of these killed MMs.
-        for mm in &killed_mms {
-            let shared_init = authorization_tasks.iter().any(|task| {
-                task.raw_tgid().data() == 1
-                    && task.with_task_lock_irqsave(|| task_uses_mm(task, mm))
-            });
-            if shared_init {
-                mm.oom_reap_slot().deny_before_execution();
-            } else {
-                super::oom_reaper::queue_committed_mm(mm, OomReapAuthorization { mm_id: mm.id() });
-            }
-        }
-        drop(membership);
-        drop(adj_guard);
-        drop(retired_mms);
-        for mm in &killed_mms {
-            if matches!(
-                mm.oom_reap_slot().status(),
-                super::oom_reaper::ReapStatus::Finished(_)
-            ) {
-                note_oom_reaping_finished(mm.id());
-            }
-        }
-        super::oom_reaper::wake_worker();
-        if let Some(account) = primary_event {
-            account.record_event(MemoryEvent::OomKill);
-        }
-        primary.dispatch();
-        for kill in secondary {
-            if kill.committed {
-                if let Some(account) = kill.event_account {
-                    account.record_event(MemoryEvent::OomKill);
-                    count_oom_kill();
+                    let basic = target.basic();
+                    let shares = basic
+                        .user_vm()
+                        .is_some_and(|mm| mm_index(&work.mms, &mm).is_some());
+                    if shares {
+                        commit_group(&mut work.tasks[start..end], index - start, None);
+                    }
+                    shares
+                });
+                if committed {
+                    break;
                 }
-                kill.signal.dispatch();
             }
         }
-        if let Some(group) = group {
-            group.record_event(MemoryEvent::OomGroupKill);
+        start = end;
+    }
+    for record in &work.tasks {
+        if record.tgid.data() == 1 {
+            record.task.with_task_lock_irqsave(|| {
+                let basic = record.task.basic();
+                if let Some(mm) = basic.user_vm() {
+                    if let Some(index) = mm_index(&work.mms, &mm) {
+                        work.mms[index].shared_init = true;
+                    }
+                }
+            });
         }
-        return Ok(CommittedOomVictim {
-            tgid: victim_tgid,
-            identity: MemoryOomVictim {
-                mm: Arc::downgrade(&candidate.mm),
-                mm_id: candidate.mm.id(),
-            },
-        });
+    }
+    for entry in &work.mms {
+        if entry.shared_init {
+            entry.mm.oom_reap_slot().deny_before_execution();
+        } else {
+            super::oom_reaper::queue_committed_mm(
+                &entry.mm,
+                OomReapAuthorization {
+                    mm_id: entry.mm.id(),
+                },
+            );
+        }
+    }
+    if let Some(group) = group {
+        // Store no new owner in the work queue. Account events are counters.
+        group.record_event(MemoryEvent::OomGroupKill);
+    }
+    Ok(CommittedOomVictim {
+        tgid: candidate.tgid,
+        identity: MemoryOomVictim {
+            mm: Arc::downgrade(&candidate.mm),
+            mm_id: candidate.mm.id(),
+        },
+    })
+}
+
+/// All registry/publication/adjustment guards are gone before scheduling or
+/// retiring the snapshots. GROUP_EXIT already prevents late thread publication.
+fn dispatch_oom_kill(work: &Workspace) {
+    super::oom_reaper::wake_worker();
+    for entry in &work.mms {
+        if matches!(
+            entry.mm.oom_reap_slot().status(),
+            super::oom_reaper::ReapStatus::Finished(_)
+        ) {
+            note_oom_reaping_finished(entry.mm.id());
+        }
+    }
+    for record in &work.tasks {
+        if let Some(mm) = &record.killed_mm {
+            mm.memory_account().record_event(MemoryEvent::OomKill);
+            count_oom_kill();
+        }
+        if record.dispatch {
+            Signal::queue_private_sigkill_to_thread(&record.task);
+        }
     }
 }
 
@@ -685,47 +677,46 @@ pub fn current_is_oom_victim() -> bool {
 }
 
 fn wait_for_oom_slot() -> Result<(), SystemError> {
-    OOM_WAITQ.wait_event_killable(
-        || {
-            if current_is_killed_or_exiting() {
-                return true;
-            }
-            let state = OOM_STATE.lock_irqsave();
-            if state.selecting {
-                return false;
-            }
-            state.inflight.as_ref().is_none()
-        },
-        None::<fn()>,
-    )
+    crate::libs::resource_wait::wait_until_killable(|| {
+        if current_is_killed_or_exiting() {
+            return Some(());
+        }
+        let state = OOM_STATE.lock_irqsave();
+        if state.selecting {
+            return None;
+        }
+        state.inflight.as_ref().is_none().then_some(())
+    })
 }
 
 fn wait_until_recoverable(generation: u64) -> Result<(), SystemError> {
-    OOM_WAITQ.wait_event_killable(
-        || {
-            if current_is_killed_or_exiting() {
-                return true;
-            }
-            let state = OOM_STATE.lock_irqsave();
-            if state.selecting {
-                return false;
-            }
-            match state.inflight.as_ref() {
-                None => true,
-                Some(victim) if victim.generation == generation => false,
-                Some(_) => true,
-            }
-        },
-        None::<fn()>,
-    )
+    crate::libs::resource_wait::wait_until_killable(|| {
+        if current_is_killed_or_exiting() {
+            return Some(());
+        }
+        let state = OOM_STATE.lock_irqsave();
+        if state.selecting {
+            return None;
+        }
+        match state.inflight.as_ref() {
+            None => Some(()),
+            Some(victim) if victim.generation == generation => None,
+            Some(_) => Some(()),
+        }
+    })
 }
 
 pub fn pagefault_out_of_memory(ctx: OomContext) -> OomOutcome {
+    #[cfg(feature = "mm_selftest")]
+    let _heap_scope = denial::Scope::enter(test_heap_denial_requested());
+    #[cfg(feature = "mm_selftest")]
+    if test_heap_denial_requested() {
+        assert!(denial::probe_denied(), "OOM heap-denial probes are active");
+    }
     loop {
         if current_is_killed_or_exiting() {
             return OomOutcome::CurrentTaskKilled;
         }
-
         let generation = match begin_selection(false) {
             Ok(generation) => generation,
             Err(()) => {
@@ -733,74 +724,73 @@ pub fn pagefault_out_of_memory(ctx: OomContext) -> OomOutcome {
                 continue;
             }
         };
-
-        let candidate = match select_victim(None) {
-            Ok(OomSelection::Candidate(candidate)) => candidate,
-            Ok(OomSelection::None | OomSelection::ExistingVictim(_)) | Err(_) => {
+        let mut work = Lease::checkout();
+        let adjustment = match ProcessManager::lock_oom_score_adj_for_oom() {
+            Ok(guard) => guard,
+            Err(_) => {
+                drop(work);
                 finish_selection_none();
-                error!(
-                    "oom: no victim for trigger pid={} tgid={} addr={:#x} ip={:#x}",
+                return OomOutcome::CurrentTaskKilled;
+            }
+        };
+        let membership = crate::process::pid::pid_membership_lock();
+        work.fill();
+        let candidate = match select_victim(&mut work.tasks, None) {
+            OomSelection::Candidate(candidate) => candidate,
+            OomSelection::None(stats) => {
+                drop(membership);
+                drop(adjustment);
+                drop(work);
+                finish_selection_none();
+                report::report(format_args!(
+                    "oom: no eligible victim pid={} tgid={} addr={:#x} ip={:#x} filters={:?}\n",
                     ctx.trigger_pid,
                     ctx.trigger_tgid,
                     ctx.fault_address.data(),
-                    ctx.fault_ip
-                );
+                    ctx.fault_ip,
+                    stats
+                ));
                 return OomOutcome::NoVictim;
             }
+            OomSelection::ExistingVictim(_) => unreachable!("recorded-victim lookup is scoped"),
         };
-
         let current = ProcessManager::current_pcb();
         let current_leader = leader_of(current.clone());
         let current_is_victim = candidate.tgid == current_leader.raw_tgid()
             || (task_uses_mm(&current, &candidate.mm)
                 && !is_global_init_or_kthread(&current_leader));
-        let candidate_tgid = candidate.tgid;
-        let victim_score = candidate.score;
-        let victim_oom_score_adj = candidate.oom_score_adj;
-        let victim_resident_pages = candidate.resident_pages;
-        match send_oom_sigkill(generation, &candidate, None, 0) {
+        let result = commit_oom_kill(generation, &candidate, None, 0, &mut work);
+        drop(membership);
+        drop(adjustment);
+        match result {
             Ok(killed) => {
-                finish_selection_none();
-                count_oom_kill();
-                error!(
-                        "oom-kill: trigger_pid={} trigger_tgid={} victim_tgid={} score={} adj={} rss={} order={} addr={:#x} ip={:#x}",
-                        ctx.trigger_pid,
-                        ctx.trigger_tgid,
-                        killed.tgid,
-                        victim_score,
-                        victim_oom_score_adj,
-                        victim_resident_pages,
-                        ctx.order,
-                        ctx.fault_address.data(),
-                        ctx.fault_ip
-                );
+                dispatch_oom_kill(&work);
+                report::report(format_args!(
+                    "oom-kill: trigger_pid={} trigger_tgid={} victim_tgid={} score={} adj={} rss={} order={} addr={:#x} ip={:#x}\n",
+                    ctx.trigger_pid, ctx.trigger_tgid, killed.tgid, candidate.score,
+                    candidate.oom_score_adj, candidate.resident_pages, ctx.order,
+                    ctx.fault_address.data(), ctx.fault_ip));
                 drop(candidate);
+                drop(work);
+                finish_selection_none();
                 if current_is_victim {
                     return OomOutcome::CurrentTaskKilled;
                 }
-                match wait_until_recoverable(generation) {
-                    Ok(()) if current_is_killed_or_exiting() => {
-                        return OomOutcome::CurrentTaskKilled
-                    }
-                    Ok(()) => return OomOutcome::Retry,
-                    Err(_) if current_is_killed_or_exiting() => {
-                        return OomOutcome::CurrentTaskKilled
-                    }
-                    Err(_) => return OomOutcome::Retry,
-                }
+                let _ = wait_until_recoverable(generation);
+                return if current_is_killed_or_exiting() {
+                    OomOutcome::CurrentTaskKilled
+                } else {
+                    OomOutcome::Retry
+                };
             }
             Err(SystemError::ESRCH) => {
+                // An exec or policy transition invalidated the actual commit;
+                // this is not an allocation failure or evidence of no victim.
+                drop(candidate);
+                drop(work);
                 finish_selection_none();
-                continue;
             }
-            Err(err) => {
-                finish_selection_none();
-                warn!(
-                    "oom: failed to SIGKILL victim tgid={} for trigger pid={} err={:?}",
-                    candidate_tgid, ctx.trigger_pid, err
-                );
-                return OomOutcome::NoVictim;
-            }
+            Err(_) => unreachable!("OOM commit has no resource allocation failure"),
         }
     }
 }
@@ -848,33 +838,54 @@ fn scoped_out_of_memory(
         Ok(generation) => generation,
         Err(()) => return Ok(MemoryOomOutcome::Recheck),
     };
-    let result = (|| {
-        scope.record_event(MemoryEvent::Oom);
-        let candidate = match select_victim(Some(scope))? {
-            OomSelection::Candidate(candidate) => candidate,
-            OomSelection::ExistingVictim(victim) => {
-                return Ok(if current_is_killed_or_exiting() {
-                    MemoryOomOutcome::CurrentTaskKilled
-                } else {
-                    MemoryOomOutcome::Victim(victim)
-                });
+    let mut work = Lease::checkout();
+    let adjustment = match ProcessManager::lock_oom_score_adj_for_oom() {
+        Ok(guard) => guard,
+        Err(error) => {
+            drop(work);
+            finish_selection_none();
+            return Err(error);
+        }
+    };
+    let membership = crate::process::pid::pid_membership_lock();
+    work.fill();
+    scope.record_event(MemoryEvent::Oom);
+    let mut committed = false;
+    let result = match select_victim(&mut work.tasks, Some(scope)) {
+        OomSelection::Candidate(candidate) => {
+            let killed = commit_oom_kill(
+                generation,
+                &candidate,
+                Some(scope),
+                requested_pages,
+                &mut work,
+            );
+            // The workspace pins candidate's task and observed MM until guards
+            // are gone, so dropping this extra owner cannot retire the MM here.
+            match killed {
+                Ok(killed) => {
+                    committed = true;
+                    Ok(MemoryOomOutcome::Victim(killed.identity))
+                }
+                Err(SystemError::ESRCH) => Ok(MemoryOomOutcome::Recheck),
+                Err(error) => Err(error),
             }
-            OomSelection::None => return Ok(MemoryOomOutcome::NoVictim),
-        };
-        let killed = match send_oom_sigkill(generation, &candidate, Some(scope), requested_pages) {
-            Ok(killed) => killed,
-            Err(SystemError::ESRCH) => return Ok(MemoryOomOutcome::Recheck),
-            Err(error) => return Err(error),
-        };
-        count_oom_kill();
-        Ok(if current_is_killed_or_exiting() {
-            MemoryOomOutcome::CurrentTaskKilled
-        } else {
-            MemoryOomOutcome::Victim(killed.identity)
-        })
-    })();
+        }
+        OomSelection::ExistingVictim(victim) => Ok(MemoryOomOutcome::Victim(victim)),
+        OomSelection::None(_) => Ok(MemoryOomOutcome::NoVictim),
+    };
+    drop(membership);
+    drop(adjustment);
+    if committed {
+        dispatch_oom_kill(&work);
+    }
+    drop(work);
     finish_selection_none();
-    result
+    if current_is_killed_or_exiting() {
+        Ok(MemoryOomOutcome::CurrentTaskKilled)
+    } else {
+        result
+    }
 }
 
 pub fn notify_mm_drop(mm_id: u64) {
@@ -917,10 +928,21 @@ pub fn read_fault_inject_config() -> alloc::string::String {
         .remaining_failures
         .map(|count| count.to_string())
         .unwrap_or_else(|| "persistent".to_string());
-    format!(
+    let output = format!(
         "target_tgid={} fail_after={} seen={} remaining={}\n",
         target, cfg.fail_after, cfg.seen, remaining
-    )
+    );
+    #[cfg(feature = "mm_selftest")]
+    let output = output + &format!(
+        "heap_denial_supported=1 heap_rejections={} task_record_bytes={} killed_mm_bytes={} pcb_wait_node_bytes={} mm_drop_node_bytes={} rwsem_lock_bytes={}\n",
+        denial::rejected_count(),
+        core::mem::size_of::<TaskRecord>(),
+        core::mem::size_of::<KilledMm>(),
+        core::mem::size_of::<SpinLock<crate::libs::resource_wait::ResourceWaitLink>>(),
+        core::mem::size_of::<SpinLock<super::lazy_mm_drop::LazyMmDropLink>>(),
+        core::mem::size_of::<crate::libs::rwsem::RwSem<()>>(),
+    );
+    output
 }
 
 pub fn write_fault_inject_config(data: &[u8]) -> Result<usize, SystemError> {
@@ -950,7 +972,22 @@ pub fn write_fault_inject_config(data: &[u8]) -> Result<usize, SystemError> {
         .parse()
         .map_err(|_| SystemError::EINVAL)?;
 
+    #[cfg(feature = "mm_selftest")]
+    let deny_heap = match parts.get(3).copied().unwrap_or("0") {
+        "0" => false,
+        "1" => true,
+        _ => return Err(SystemError::EINVAL),
+    };
+    #[cfg(not(feature = "mm_selftest"))]
+    if parts.len() > 3 {
+        return Err(SystemError::EINVAL);
+    }
+    if parts.len() > 4 {
+        return Err(SystemError::EINVAL);
+    }
     *cfg = OomFaultInject {
+        #[cfg(feature = "mm_selftest")]
+        deny_heap,
         target_tgid: Some(RawPid::new(target)),
         fail_after,
         seen: 0,
@@ -961,4 +998,10 @@ pub fn write_fault_inject_config(data: &[u8]) -> Result<usize, SystemError> {
         },
     };
     Ok(data.len())
+}
+
+#[cfg(feature = "mm_selftest")]
+fn test_heap_denial_requested() -> bool {
+    let cfg = OOM_FAULT_INJECT.lock_irqsave();
+    cfg.deny_heap && cfg.target_tgid == Some(ProcessManager::current_pcb().raw_tgid())
 }

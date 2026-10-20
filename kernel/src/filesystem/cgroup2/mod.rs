@@ -20,17 +20,37 @@ pub(crate) mod event_notify;
 pub(crate) mod events;
 mod files;
 mod inode;
+mod membership;
 mod memory;
 mod migration;
 mod mount;
 mod permissions;
+mod read_snapshot;
 
 /// Security identity attached to an open cgroup file description.
 #[derive(Clone)]
 pub struct CgroupOpenState {
     pub(crate) cred: Arc<crate::process::cred::Cred>,
     pub(crate) namespace: Arc<crate::process::namespace::cgroup_namespace::CgroupNamespace>,
-    pub(crate) events: Option<Arc<events::CgroupEventOpen>>,
+    read: CgroupReadState,
+}
+
+/// State belongs to the open description; dup/fork share the inner Arc.
+#[derive(Clone, Debug)]
+enum CgroupReadState {
+    None,
+    Text(Arc<crate::libs::mutex::Mutex<read_snapshot::TextSnapshot>>),
+    Members(Arc<crate::libs::mutex::Mutex<membership::MembershipRead>>),
+    Events(Arc<events::CgroupEventOpen>),
+}
+
+impl CgroupReadState {
+    fn events(&self) -> Option<&Arc<events::CgroupEventOpen>> {
+        match self {
+            Self::Events(events) => Some(events),
+            _ => None,
+        }
+    }
 }
 
 impl core::fmt::Debug for CgroupOpenState {

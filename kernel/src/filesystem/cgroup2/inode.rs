@@ -213,7 +213,8 @@ impl Cgroup2Inode {
                 parent: Weak::new(),
                 permissions,
                 metadata: Metadata {
-                    size: init.len() as i64,
+                    // Like kernfs cgroup files, generated text has zero logical inode size.
+                    size: 0,
                     mode: InodeMode::from_bits_truncate(mode as u32),
                     uid: 0,
                     gid: 0,
@@ -527,34 +528,14 @@ impl Cgroup2Inode {
         Ok(())
     }
 
-    fn read_file(
-        cgroup: &Arc<CgroupNode>,
-        ty: CgroupCoreFile,
-        generation: u64,
-        file_generation: u64,
-        offset: usize,
-        len: usize,
-        buf: &mut [u8],
-    ) -> Result<usize, SystemError> {
-        let bytes = files::read_file(cgroup, ty, generation, file_generation)?;
-
-        let start = core::cmp::min(offset, bytes.len());
-        let end = core::cmp::min(offset + len, bytes.len());
-        let n = end.saturating_sub(start);
-        if n > buf.len() {
-            return Err(SystemError::ENOBUFS);
-        }
-        buf[..n].copy_from_slice(&bytes[start..end]);
-        Ok(n)
-    }
-
     fn replace_file_data(this: &Arc<Cgroup2Inode>, new_data: &[u8]) -> Result<(), SystemError> {
         let mut inner = this.inner.lock();
         match &mut inner.kind {
             Cgroup2InodeKind::File { data, .. } => {
                 data.clear();
                 data.extend_from_slice(new_data);
-                inner.metadata.size = data.len() as i64;
+                // A controller record length is not the kernfs logical file size.
+                inner.metadata.size = 0;
                 Ok(())
             }
             _ => Err(SystemError::EISDIR),
@@ -729,8 +710,8 @@ impl PollableInode for Cgroup2Inode {
     fn poll(&self, data: &FilePrivateData) -> Result<usize, SystemError> {
         let flags = match data {
             FilePrivateData::Cgroup(open) => open
-                .events
-                .as_ref()
+                .read
+                .events()
                 .map_or_else(super::events::default_mask, |events| events.poll()),
             _ => return Err(SystemError::EINVAL),
         };
@@ -743,7 +724,7 @@ impl PollableInode for Cgroup2Inode {
         data: &FilePrivateData,
     ) -> Result<(), SystemError> {
         if let FilePrivateData::Cgroup(open) = data {
-            if let Some(events) = &open.events {
+            if let Some(events) = open.read.events() {
                 events.add(item);
             }
             return Ok(());
@@ -757,7 +738,7 @@ impl PollableInode for Cgroup2Inode {
         data: &FilePrivateData,
     ) -> Result<(), SystemError> {
         if let FilePrivateData::Cgroup(open) = data {
-            if let Some(events) = &open.events {
+            if let Some(events) = open.read.events() {
                 return events.remove(item);
             }
             return Ok(());
@@ -775,46 +756,59 @@ impl IndexNode for Cgroup2Inode {
     fn open(
         &self,
         mut data: MutexGuard<FilePrivateData>,
-        _flags: &FileFlags,
+        flags: &FileFlags,
     ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         let result: core::result::Result<_, system_error::SystemError> = (|| {
             let current = ProcessManager::current_pcb();
-            let events = {
-                let (cgroup, ty, generation) = {
-                    let inner = self.inner.lock();
-                    match &inner.kind {
-                        Cgroup2InodeKind::File {
-                            cgroup,
-                            ty,
-                            file_generation,
-                            ..
-                        } if matches!(
-                            ty,
-                            CgroupCoreFile::MemoryEvents
-                                | CgroupCoreFile::MemoryEventsLocal
-                                | CgroupCoreFile::Events
-                        ) =>
-                        {
-                            (Some(cgroup.clone()), *ty, *file_generation)
-                        }
-                        _ => (None, CgroupCoreFile::Events, 0),
-                    }
-                };
-                if let Some(cgroup) = cgroup {
+            let file = {
+                let inner = self.inner.lock();
+                match &inner.kind {
+                    Cgroup2InodeKind::File {
+                        cgroup,
+                        ty,
+                        file_generation,
+                        ..
+                    } => Some((cgroup.clone(), *ty, *file_generation)),
+                    _ => None,
+                }
+            };
+            let read = if let Some((cgroup, ty, generation)) = file {
+                if matches!(
+                    ty,
+                    CgroupCoreFile::MemoryEvents
+                        | CgroupCoreFile::MemoryEventsLocal
+                        | CgroupCoreFile::Events
+                ) {
                     let source = {
                         let _update = crate::cgroup::lock();
                         files::check_live_file(&cgroup, ty, generation)?;
                         self.event_source.clone().ok_or(SystemError::ENODEV)?
                     };
-                    Some(super::events::CgroupEventOpen::new(source)?)
+                    super::CgroupReadState::Events(super::events::CgroupEventOpen::new(source)?)
+                } else if flags.access_flags() == FileFlags::O_WRONLY {
+                    super::CgroupReadState::None
+                } else if matches!(ty, CgroupCoreFile::Procs | CgroupCoreFile::Threads) {
+                    super::CgroupReadState::Members(
+                        Arc::try_new(crate::libs::mutex::Mutex::new(
+                            super::membership::MembershipRead::default(),
+                        ))
+                        .map_err(|_| SystemError::ENOMEM)?,
+                    )
                 } else {
-                    None
+                    super::CgroupReadState::Text(
+                        Arc::try_new(crate::libs::mutex::Mutex::new(
+                            super::read_snapshot::TextSnapshot::default(),
+                        ))
+                        .map_err(|_| SystemError::ENOMEM)?,
+                    )
                 }
+            } else {
+                super::CgroupReadState::None
             };
             *data = FilePrivateData::Cgroup(super::CgroupOpenState {
                 cred: current.cred(),
                 namespace: current.nsproxy().cgroup_ns.clone(),
-                events,
+                read,
             });
             Ok(())
         })();
@@ -823,7 +817,7 @@ impl IndexNode for Cgroup2Inode {
 
     fn close(&self, data: MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
         if let FilePrivateData::Cgroup(open) = &*data {
-            if let Some(events) = &open.events {
+            if let Some(events) = open.read.events() {
                 events.close();
             }
         }
@@ -842,9 +836,9 @@ impl IndexNode for Cgroup2Inode {
         data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
         let result: core::result::Result<_, system_error::SystemError> = (|| {
-            let events = match &*data {
-                FilePrivateData::Cgroup(open) => open.events.clone(),
-                _ => None,
+            let read = match &*data {
+                FilePrivateData::Cgroup(open) => open.read.clone(),
+                _ => return Err(SystemError::EINVAL),
             };
             drop(data);
             // Controller reads may acquire a sleeping mutex. Never retain the
@@ -862,10 +856,24 @@ impl IndexNode for Cgroup2Inode {
                     _ => return Err(SystemError::EISDIR),
                 }
             };
-            if let Some(events) = events {
-                return events.read(&cgroup, ty, file_generation, offset, len, buf);
+            match read {
+                super::CgroupReadState::Members(members) => {
+                    members
+                        .lock()
+                        .read(&cgroup, ty, file_generation, offset, len, buf)
+                }
+                super::CgroupReadState::Events(events) => {
+                    events.read(&cgroup, ty, file_generation, offset, len, buf)
+                }
+                super::CgroupReadState::Text(snapshot) => snapshot.lock().read(
+                    offset,
+                    len,
+                    buf,
+                    || files::read_file(&cgroup, ty, generation, file_generation),
+                    || files::check_read_source(&cgroup, ty, generation, file_generation),
+                ),
+                super::CgroupReadState::None => Err(SystemError::EINVAL),
             }
-            Cgroup2Inode::read_file(&cgroup, ty, generation, file_generation, offset, len, buf)
         })();
         result.map_err(Into::into)
     }

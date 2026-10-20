@@ -266,6 +266,14 @@ impl Pid {
         }
     }
 
+    /// Copy an observer while locked; upgrade and retire it outside PID locks.
+    pub(crate) fn first_task_weak(&self, pid_type: PidType) -> Option<Weak<ProcessControlBlock>> {
+        self.tasks[pid_type as usize]
+            .lock_irqsave()
+            .first()
+            .cloned()
+    }
+
     pub fn thread_group_leader_task(&self) -> Option<Arc<ProcessControlBlock>> {
         self.tasks_iter(PidType::TGID)
             .find(|task| task.is_thread_group_leader())

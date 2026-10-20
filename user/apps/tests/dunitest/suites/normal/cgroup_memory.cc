@@ -1565,6 +1565,383 @@ TEST_F(CgroupMemory, ReclaimInsufficientAnonymousReturnsEagain) {
   EXPECT_GE(Stat(leaf, "anon"), 8 * MiB);
 }
 
+TEST_F(CgroupMemory, MemberStreamDupPreadAndRewindKeepBytePositions) {
+  const std::string leaf = Leaf();
+  auto* first = Worker(leaf);
+  auto* second = Worker(leaf);
+  ASSERT_NE(nullptr, first); ASSERT_NE(nullptr, second);
+  std::vector<pid_t> pids{first->pid(), second->pid()};
+  std::sort(pids.begin(), pids.end());
+  for (const char* name : {"cgroup.procs", "cgroup.threads"}) {
+    const std::string expected = Read(leaf + "/" + name);
+    std::istringstream parsed(expected);
+    std::vector<pid_t> actual;
+    for (pid_t pid; parsed >> pid;) actual.push_back(pid);
+    std::sort(actual.begin(), actual.end());
+    ASSERT_EQ(pids, actual);
+    int fd = OwnFd(open((leaf + "/" + name).c_str(), O_RDONLY | O_CLOEXEC));
+    ASSERT_GE(fd, 0);
+    int duplicate = OwnFd(dup(fd));
+    ASSERT_GE(duplicate, 0);
+    char bytes[128];
+    ASSERT_EQ(1, read(fd, bytes, 1));
+    EXPECT_EQ(expected[0], bytes[0]);
+    EXPECT_EQ(1, lseek(duplicate, 0, SEEK_CUR));
+    EXPECT_EQ(0, pread(duplicate, nullptr, 0, 0));
+    ASSERT_EQ(3, pread(duplicate, bytes, 3, 1));
+    EXPECT_EQ(expected.substr(1, 3), std::string(bytes, 3));
+    EXPECT_EQ(1, lseek(fd, 0, SEEK_CUR));
+    // pread disturbed the shared iterator, so read must replay to f_pos=1.
+    std::string tail;
+    ssize_t n;
+    while ((n = read(duplicate, bytes, 2)) > 0) tail.append(bytes, n);
+    ASSERT_EQ(0, n);
+    EXPECT_EQ(expected.substr(1), tail);
+    EXPECT_EQ(0, pread(fd, bytes, sizeof(bytes), 1 << 20));
+    ASSERT_EQ(0, lseek(fd, 0, SEEK_SET));
+    ASSERT_EQ(ssize_t(expected.size()), read(fd, bytes, sizeof(bytes)));
+    EXPECT_EQ(expected, std::string(bytes, expected.size()));
+  }
+}
+
+TEST_F(CgroupMemory, MemberStreamCachedTailCannotEnterRecreatedSource) {
+  const std::string leaf = Leaf(), moved = Leaf("moved");
+  auto* worker = Worker(leaf);
+  ASSERT_NE(nullptr, worker);
+  const std::string expected = std::to_string(worker->pid()) + "\n";
+  int old = OwnFd(open((leaf + "/cgroup.procs").c_str(), O_RDONLY | O_CLOEXEC));
+  ASSERT_GE(old, 0);
+  char bytes[64];
+  ASSERT_EQ(1, read(old, bytes, 1));
+  EXPECT_EQ(expected[0], bytes[0]);
+  ASSERT_EQ(0, Write(moved + "/cgroup.procs", std::to_string(worker->pid())));
+  ASSERT_EQ(0, rmdir(leaf.c_str()));
+  ASSERT_EQ(0, mkdir(leaf.c_str(), 0755));
+  ASSERT_EQ(0, Write(leaf + "/cgroup.procs", std::to_string(worker->pid())));
+  ASSERT_EQ(ssize_t(expected.size() - 1), read(old, bytes, sizeof(bytes)));
+  EXPECT_EQ(expected.substr(1), std::string(bytes, expected.size() - 1));
+  errno = 0;
+  EXPECT_EQ(-1, read(old, bytes, sizeof(bytes)));
+  EXPECT_EQ(ENODEV, errno);
+  EXPECT_EQ(0, lseek(old, 0, SEEK_SET));
+  errno = 0;
+  EXPECT_EQ(-1, read(old, bytes, sizeof(bytes)));
+  EXPECT_EQ(ENODEV, errno);
+  int fresh = OwnFd(open((leaf + "/cgroup.procs").c_str(), O_RDONLY | O_CLOEXEC));
+  ASSERT_GE(fresh, 0);
+  ASSERT_EQ(ssize_t(expected.size()), read(fresh, bytes, sizeof(bytes)));
+  EXPECT_EQ(expected, std::string(bytes, expected.size()));
+}
+
+TEST_F(CgroupMemory, MemberStreamEnumeratesMultiplePagesWithoutLosingThreads) {
+  const std::string leaf = Leaf();
+  int ready[2], gate[2];
+  ASSERT_EQ(0, pipe(ready));
+  const int gate_error = pipe(gate);
+  if (gate_error) { close(ready[0]); close(ready[1]); }
+  ASSERT_EQ(0, gate_error);
+  struct ChildCleanup {
+    pid_t pid = -1;
+    int gate = -1, ready = -1;
+    ~ChildCleanup() {
+      if (gate >= 0) close(gate);
+      if (ready >= 0) close(ready);
+      if (pid > 0) {
+        kill(pid, SIGKILL);
+        int status;
+        EXPECT_TRUE(Reap(pid, &status, Now() + 10 * kSecond));
+      }
+    }
+  } child;
+  child.pid = fork();
+  if (child.pid < 0) {
+    for (int fd : {ready[0], ready[1], gate[0], gate[1]}) close(fd);
+  }
+  ASSERT_GE(child.pid, 0);
+  constexpr size_t kThreads = 1100;
+  if (!child.pid) {
+    alarm(90);
+    close(ready[0]); close(gate[1]);
+    if (Write(leaf + "/cgroup.procs", "0")) _exit(20);
+    pid_t leader = getpid();
+    if (write(ready[1], &leader, sizeof(leader)) != sizeof(leader)) _exit(21);
+    struct ThreadGate { int ready, gate; } channels{ready[1], gate[0]};
+    const auto blocked = [](void* opaque) -> void* {
+      auto* channels = static_cast<ThreadGate*>(opaque);
+      pid_t tid = syscall(SYS_gettid);
+      ssize_t n;
+      do { n = write(channels->ready, &tid, sizeof(tid)); } while (n < 0 && errno == EINTR);
+      if (n != sizeof(tid)) _exit(22);
+      char ignored;
+      do { n = read(channels->gate, &ignored, 1); } while (n < 0 && errno == EINTR);
+      if (n != 0) _exit(23);
+      return nullptr;
+    };
+    pthread_attr_t attributes;
+    if (pthread_attr_init(&attributes) ||
+        pthread_attr_setstacksize(&attributes, 128 * 1024)) _exit(24);
+    std::vector<pthread_t> threads(kThreads);
+    for (auto& thread : threads)
+      if (pthread_create(&thread, &attributes, blocked, &channels)) _exit(25);
+    pthread_attr_destroy(&attributes);
+    for (auto thread : threads) if (pthread_join(thread, nullptr)) _exit(26);
+    _exit(0);
+  }
+  close(ready[1]); close(gate[0]);
+  child.ready = ready[0]; child.gate = gate[1];
+  std::vector<pid_t> expected(kThreads + 1);
+  ASSERT_TRUE(Transfer(child.ready, expected.data(), expected.size() * sizeof(pid_t),
+                       false, Now() + 60 * kSecond));
+  std::sort(expected.begin(), expected.end());
+  ASSERT_EQ(expected.end(), std::unique(expected.begin(), expected.end()));
+  size_t text_bytes = 0;
+  for (pid_t tid : expected) text_bytes += std::to_string(tid).size() + 1;
+  ASSERT_GT(text_bytes, 4096u);
+  // Independent opens and different user buffers must traverse every window.
+  for (size_t chunk : {size_t(1), size_t(17), size_t(65536)}) {
+    int fd = OwnFd(open((leaf + "/cgroup.threads").c_str(), O_RDONLY | O_CLOEXEC));
+    ASSERT_GE(fd, 0);
+    std::string text;
+    std::vector<char> bytes(chunk);
+    ssize_t n;
+    while ((n = read(fd, bytes.data(), bytes.size())) > 0) {
+      text.append(bytes.data(), n);
+      ASSERT_LE(text.size(), text_bytes);
+    }
+    ASSERT_EQ(0, n);
+    ASSERT_EQ(text_bytes, text.size());
+    std::istringstream input(text);
+    std::vector<pid_t> actual;
+    for (pid_t tid; input >> tid;) actual.push_back(tid);
+    std::sort(actual.begin(), actual.end());
+    EXPECT_EQ(expected, actual);
+  }
+  EXPECT_EQ(std::to_string(child.pid) + "\n", Read(leaf + "/cgroup.procs"));
+  close(child.gate); child.gate = -1;
+  int status;
+  ASSERT_TRUE(Reap(child.pid, &status, Now() + 30 * kSecond));
+  child.pid = -1;
+  ASSERT_TRUE(WIFEXITED(status));
+  EXPECT_EQ(0, WEXITSTATUS(status));
+}
+
+// MM149: mutate the live source between reads, without allocator pressure or
+// timing races. Each open description must still expose one coherent record.
+TEST_F(CgroupMemory, TextSnapshotPartialReadKeepsScalarRecord) {
+  const std::string leaf = Leaf();
+  ASSERT_EQ(0, WriteBounded(leaf + "/memory.max", "4096"));
+  int fd = OwnFd(open((leaf + "/memory.max").c_str(), O_RDONLY | O_CLOEXEC));
+  ASSERT_GE(fd, 0);
+  char data[64];
+  ASSERT_EQ(1, read(fd, data, 1));
+  ASSERT_EQ('4', data[0]);
+  ASSERT_EQ(0, WriteBounded(leaf + "/memory.max", "1048576"));
+  ssize_t n = read(fd, data + 1, sizeof(data) - 1);
+  ASSERT_GE(n, 0);
+  EXPECT_EQ("4096\n", std::string(data, size_t(n) + 1));
+  EXPECT_EQ(0, read(fd, data, sizeof(data)));
+}
+
+TEST_F(CgroupMemory, TextSnapshotEofDoesNotAppendNewTail) {
+  const std::string leaf = Leaf();
+  ASSERT_EQ(0, WriteBounded(leaf + "/memory.max", "4096"));
+  int fd = OwnFd(open((leaf + "/memory.max").c_str(), O_RDONLY | O_CLOEXEC));
+  ASSERT_GE(fd, 0);
+  char data[64];
+  ASSERT_EQ(5, read(fd, data, sizeof(data)));
+  ASSERT_EQ("4096\n", std::string(data, 5));
+  ASSERT_EQ(0, WriteBounded(leaf + "/memory.max", "1048576"));
+  EXPECT_EQ(0, read(fd, data, sizeof(data)));
+  ASSERT_EQ(0, lseek(fd, 0, SEEK_SET));
+  ASSERT_EQ(8, read(fd, data, sizeof(data)));
+  EXPECT_EQ("1048576\n", std::string(data, 8));
+}
+
+TEST_F(CgroupMemory, TextSnapshotDupSharesRecordAndPosition) {
+  const std::string leaf = Leaf();
+  ASSERT_EQ(0, WriteBounded(leaf + "/memory.max", "4096"));
+  int first = OwnFd(open((leaf + "/memory.max").c_str(), O_RDONLY | O_CLOEXEC));
+  ASSERT_GE(first, 0);
+  int duplicate = OwnFd(dup(first));
+  ASSERT_GE(duplicate, 0);
+  char data[64];
+  ASSERT_EQ(1, read(first, data, 1));
+  ASSERT_EQ(0, WriteBounded(leaf + "/memory.max", "1048576"));
+  EXPECT_EQ("1048576\n", Read(leaf + "/memory.max"));
+  ASSERT_EQ(4, read(duplicate, data, sizeof(data)));
+  EXPECT_EQ("096\n", std::string(data, 4));
+  EXPECT_EQ(5, lseek(first, 0, SEEK_CUR));
+  ASSERT_EQ(0, lseek(duplicate, 0, SEEK_SET));
+  ASSERT_EQ(8, read(first, data, sizeof(data)));
+  EXPECT_EQ("1048576\n", std::string(data, 8));
+  EXPECT_EQ(8, lseek(duplicate, 0, SEEK_CUR));
+}
+
+TEST_F(CgroupMemory, TextSnapshotPreadAndZeroLengthRespectSharedCursor) {
+  const std::string leaf = Leaf();
+  ASSERT_EQ(0, WriteBounded(leaf + "/memory.max", "4096"));
+  int fd = OwnFd(open((leaf + "/memory.max").c_str(), O_RDONLY | O_CLOEXEC));
+  ASSERT_GE(fd, 0);
+  char data[64];
+  ASSERT_EQ(1, read(fd, data, 1));
+  ASSERT_EQ(0, WriteBounded(leaf + "/memory.max", "1048576"));
+  EXPECT_EQ(0, read(fd, nullptr, 0));
+  EXPECT_EQ(0, pread(fd, nullptr, 0, 0));
+  EXPECT_EQ(1, lseek(fd, 0, SEEK_CUR));
+  ASSERT_EQ(4, read(fd, data, sizeof(data)));
+  EXPECT_EQ("096\n", std::string(data, 4));
+  ASSERT_EQ(8, pread(fd, data, sizeof(data), 0));
+  EXPECT_EQ("1048576\n", std::string(data, 8));
+  EXPECT_EQ(5, lseek(fd, 0, SEEK_CUR));
+  // pread changed seq state, but not f_pos: normal read regenerates at byte 5.
+  ASSERT_EQ(3, read(fd, data, sizeof(data)));
+  EXPECT_EQ("76\n", std::string(data, 3));
+  ASSERT_EQ(0, WriteBounded(leaf + "/memory.max", "4096"));
+  ASSERT_EQ(4, pread(fd, data, sizeof(data), 1));
+  EXPECT_EQ("096\n", std::string(data, 4));
+  EXPECT_EQ(8, lseek(fd, 0, SEEK_CUR));
+}
+
+TEST_F(CgroupMemory, TextSnapshotSameDescriptionWriteDoesNotReplaceReadBuffer) {
+  const std::string leaf = Leaf();
+  ASSERT_EQ(0, WriteBounded(leaf + "/memory.max", "4096"));
+  int fd = OwnFd(open((leaf + "/memory.max").c_str(), O_RDWR | O_CLOEXEC));
+  ASSERT_GE(fd, 0);
+  char data[64];
+  ASSERT_EQ(1, read(fd, data, 1));
+  const std::string longer = "1048576";
+  ASSERT_EQ(ssize_t(longer.size()), pwrite(fd, longer.data(), longer.size(), 0));
+  EXPECT_EQ(1, lseek(fd, 0, SEEK_CUR));
+  ASSERT_EQ(4, read(fd, data, sizeof(data)));
+  EXPECT_EQ("096\n", std::string(data, 4));
+  ASSERT_EQ(0, lseek(fd, 0, SEEK_SET));
+  ASSERT_EQ(8, read(fd, data, sizeof(data)));
+  EXPECT_EQ("1048576\n", std::string(data, 8));
+}
+
+TEST_F(CgroupMemory, TextSnapshotMemoryStatFreezesBeforeRealPageCharge) {
+  const std::string leaf = Leaf();
+  auto* worker = Worker(leaf);
+  ASSERT_NE(nullptr, worker);
+  ASSERT_EQ(0, worker->Ask('M', 4 * MiB).error);
+  int fd = OwnFd(open((leaf + "/memory.stat").c_str(), O_RDONLY | O_CLOEXEC));
+  ASSERT_GE(fd, 0);
+  char data[4096];
+  ASSERT_EQ(1, read(fd, data, 1));
+  std::string frozen(data, 1);
+  ASSERT_EQ(0, worker->Ask('T').error);
+  for (;;) {
+    ssize_t n = read(fd, data, sizeof(data));
+    if (n < 0 && errno == EINTR) continue;
+    ASSERT_GE(n, 0);
+    if (!n) break;
+    frozen.append(data, size_t(n));
+    ASSERT_LT(frozen.size(), 65536u);
+  }
+  uint64_t before = Field(frozen, "anon");
+  ASSERT_NE(UINT64_MAX, before) << frozen;
+  EXPECT_GE(Stat(leaf, "anon"), before + 4 * MiB);
+}
+
+TEST_F(CgroupMemory, TextSnapshotRemovedDescriptionCannotReadRecreatedEpoch) {
+  const std::string leaf = Leaf("snapshot-epoch");
+  ASSERT_EQ(0, WriteBounded(leaf + "/memory.max", "4096"));
+  int old = OwnFd(open((leaf + "/memory.max").c_str(), O_RDONLY | O_CLOEXEC));
+  ASSERT_GE(old, 0);
+  char data[64];
+  ASSERT_EQ(1, read(old, data, 1));
+  ASSERT_EQ('4', data[0]);
+
+  ASSERT_EQ(0, rmdir(leaf.c_str()));
+  ASSERT_EQ(leaf, Make(group_, "snapshot-epoch"));
+  ASSERT_EQ(0, WriteBounded(leaf + "/memory.max", "1048576"));
+  int current = OwnFd(open((leaf + "/memory.max").c_str(), O_RDONLY | O_CLOEXEC));
+  ASSERT_GE(current, 0);
+  // The old record's cached bytes do not require a new kernfs source entry.
+  ASSERT_EQ(4, read(old, data, sizeof(data)));
+  EXPECT_EQ("096\n", std::string(data, 4));
+  // EOF and rewind must validate the original node, not follow its pathname.
+  errno = 0;
+  EXPECT_EQ(-1, read(old, data, sizeof(data)));
+  EXPECT_EQ(ENODEV, errno);
+  ASSERT_EQ(0, lseek(old, 0, SEEK_SET));
+  errno = 0;
+  EXPECT_EQ(-1, read(old, data, sizeof(data)));
+  EXPECT_EQ(ENODEV, errno);
+  ASSERT_EQ(8, read(current, data, sizeof(data)));
+  EXPECT_EQ("1048576\n", std::string(data, 8));
+}
+
+// kernfs uses generic_file_llseek even when its read path uses seq_file.
+// The generated record has bytes, but cgroup regular inodes have i_size == 0.
+TEST_F(CgroupMemory, TextSnapshotKernfsSeekUsesZeroLogicalSize) {
+  const std::string leaf = Leaf("kernfs-seek");
+  for (const char* name : {"memory.max", "memory.stat", "cgroup.events", "cgroup.freeze"}) {
+    SCOPED_TRACE(name);
+    int fd = OwnFd(open((leaf + "/" + name).c_str(), O_RDONLY | O_CLOEXEC));
+    ASSERT_GE(fd, 0);
+    struct stat info{};
+    ASSERT_EQ(0, fstat(fd, &info));
+    EXPECT_EQ(0, info.st_size);
+    if (!std::strcmp(name, "cgroup.freeze")) {
+      ASSERT_EQ(0, WriteBounded(leaf + "/cgroup.freeze", "1"));
+      ASSERT_EQ(0, fstat(fd, &info));
+      EXPECT_EQ(0, info.st_size) << "controller writes must not publish text length";
+      ASSERT_EQ(0, WriteBounded(leaf + "/cgroup.freeze", "0"));
+    }
+    char byte;
+    ASSERT_EQ(1, read(fd, &byte, 1));
+    EXPECT_EQ(0, lseek(fd, 0, SEEK_END));
+    EXPECT_EQ(7, lseek(fd, 7, SEEK_END));
+    errno = 0;
+    EXPECT_EQ(-1, lseek(fd, -1, SEEK_END));
+    EXPECT_EQ(EINVAL, errno);
+    EXPECT_EQ(7, lseek(fd, 0, SEEK_CUR));
+    for (int whence : {SEEK_DATA, SEEK_HOLE}) {
+      for (off_t offset : {off_t(-1), off_t(0), off_t(7)}) {
+        errno = 0;
+        EXPECT_EQ(-1, lseek(fd, offset, whence));
+        EXPECT_EQ(ENXIO, errno);
+        EXPECT_EQ(7, lseek(fd, 0, SEEK_CUR));
+      }
+    }
+    errno = 0;
+    EXPECT_EQ(-1, lseek(fd, 0, 9999));
+    EXPECT_EQ(EINVAL, errno);
+    EXPECT_EQ(7, lseek(fd, 0, SEEK_CUR));
+    ASSERT_EQ(0, lseek(fd, 0, SEEK_SET));
+    EXPECT_EQ(1, read(fd, &byte, 1)) << "zero inode size is not an empty record";
+    ASSERT_EQ(0, fstat(fd, &info));
+    EXPECT_EQ(0, info.st_size);
+  }
+}
+
+TEST_F(CgroupMemory, TextSnapshotEventTailAndZeroReadDoNotAcknowledgeUpdate) {
+  const std::string leaf = Leaf();
+  int fd = OwnFd(open((leaf + "/cgroup.events").c_str(), O_RDONLY | O_CLOEXEC));
+  ASSERT_GE(fd, 0);
+  char data[128];
+  ASSERT_EQ(1, read(fd, data, 1));
+  std::string frozen(data, 1);
+  auto* worker = Worker(leaf);
+  ASSERT_NE(nullptr, worker);
+  ASSERT_TRUE(worker->Alive());
+  pollfd changed{fd, POLLPRI, 0};
+  ASSERT_EQ(1, poll(&changed, 1, 0));
+  EXPECT_EQ(0, read(fd, nullptr, 0));
+  EXPECT_EQ(0, pread(fd, nullptr, 0, 0));
+  EXPECT_EQ(1, poll(&changed, 1, 0));
+  ssize_t n = read(fd, data, sizeof(data));
+  ASSERT_GE(n, 0);
+  frozen.append(data, size_t(n));
+  EXPECT_EQ(0u, Field(frozen, "populated"));
+  EXPECT_EQ(0, read(fd, data, sizeof(data)));
+  EXPECT_EQ(1, poll(&changed, 1, 0));
+  ASSERT_EQ(0, lseek(fd, 0, SEEK_SET));
+  ASSERT_GT(read(fd, data, sizeof(data)), 0);
+  EXPECT_EQ(0, poll(&changed, 1, 0));
+}
+
 TEST_F(CgroupMemory, EventsPollUsesPerOpenAcknowledgement) {
   std::string leaf = Leaf();
   int first = OwnFd(open((leaf + "/memory.events").c_str(), O_RDONLY | O_CLOEXEC));

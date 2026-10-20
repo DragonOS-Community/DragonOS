@@ -36,6 +36,8 @@ pub struct PidNamespace {
 pub struct InnerPidNamespace {
     dead: bool,
     last_pid: RawPid,
+    /// Highest successfully published ID, independent of cyclic allocation.
+    published_high_water: usize,
     ida: IdAllocator,
     /// PID到进程的映射表
     pid_map: HashMap<RawPid, Arc<Pid>>,
@@ -75,6 +77,7 @@ impl PidNamespace {
             inner: SpinLock::new(InnerPidNamespace {
                 dead: false,
                 last_pid: RawPid(0),
+                published_high_water: 0,
                 child_reaper: None,
                 ida: IdAllocator::new(1, crate::process::pid::PID_MAX_LIMIT).unwrap(),
                 pid_map: HashMap::new(),
@@ -126,6 +129,7 @@ impl PidNamespace {
         debug_assert!(!inner.dead && inner.ida.exists(nr.data()));
         debug_assert!(!inner.pid_map.contains_key(&nr));
         inner.pid_map.insert(nr, pid);
+        inner.published_high_water = inner.published_high_water.max(nr.data());
         self.processes_created.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -170,6 +174,34 @@ impl PidNamespace {
     pub fn collect_pids(&self) -> Vec<Arc<Pid>> {
         let inner = self.inner();
         inner.pid_map.values().cloned().collect()
+    }
+
+    /// Fixed traversal bound: later forks cannot indefinitely extend a reader.
+    pub(crate) fn published_pid_bound(&self) -> usize {
+        self.inner().published_high_water
+    }
+
+    /// Advance through published numeric identities with bounded lock work.
+    /// The caller supplies empty slots and retires returned owners outside locks.
+    /// No task/PID-link/cgroup lock is acquired while holding the namespace lock.
+    pub(crate) fn read_pid_batch(
+        &self,
+        next: &mut usize,
+        bound: usize,
+        batch: &mut [Option<Arc<Pid>>],
+    ) -> usize {
+        let inner = self.inner();
+        let mut count = 0;
+        let end = next.saturating_add(256).min(bound.saturating_add(1));
+        while *next < end && count < batch.len() {
+            if let Some(pid) = inner.pid_map.get(&RawPid(*next)) {
+                debug_assert!(batch[count].is_none());
+                batch[count] = Some(pid.clone());
+                count += 1;
+            }
+            *next += 1;
+        }
+        count
     }
 
     /// https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/pid_namespace.c#145
@@ -217,6 +249,7 @@ impl PidNamespace {
                 child_reaper: None,
                 dead: false,
                 last_pid: RawPid(0),
+                published_high_water: 0,
                 ida: IdAllocator::new(1, crate::process::pid::PID_MAX_LIMIT).unwrap(),
                 pid_map: HashMap::new(),
                 children: Vec::new(),

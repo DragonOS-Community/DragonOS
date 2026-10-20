@@ -605,6 +605,10 @@ impl CgroupNode {
         self.cpuset.read().clone()
     }
 
+    pub(crate) fn cpuset_generation(&self) -> u64 {
+        self.cpuset.read().generation
+    }
+
     pub(crate) fn set_cpuset_state(&self, state: super::cpuset::CpusetState) {
         *self.cpuset.write() = state;
     }

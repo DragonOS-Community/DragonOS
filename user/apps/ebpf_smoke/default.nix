@@ -2,10 +2,13 @@
   stdenv,
   target ? "x86_64",
 }:
-
 stdenv.mkDerivation {
   pname = "ebpf-smoke";
   version = "0.1.0";
+  # Nix's default hardening (stack protector, fortify, ...) links against a
+  # toolchain whose startup/instrumentation does not survive the basic QEMU
+  # CPU model DragonOS boots with; this is a raw syscall test binary.
+  hardeningDisable = [ "all" ];
 
   src = ./.;
 

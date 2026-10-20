@@ -462,8 +462,13 @@ class GuestVM:
             # different VMs. Require genuine execution overlap and an OOM event.
             ends = [v.get('leader_exit_ns'), n.get('leader_exit_ns')]
             starts = [v.get('workload_start_ns'), n.get('workload_start_ns')]
-            overlap = (min(ends) - max(starts)) if all(type(x) is int and x >= 0 for x in ends + starts) else None
+            valid_times = (all(type(x) is int and x >= 0 for x in ends + starts) and
+                           all(end >= start for start, end in zip(starts, ends)))
+            overlap = (min(ends) - max(starts)) if valid_times else None
             victim['overlap_ns'] = neighbor['overlap_ns'] = overlap
+            if all(row['status'] == 'passed' for row in rows) and (overlap is None or overlap <= 0):
+                for row in rows:
+                    row.update(status='failed', error='pair_not_concurrent')
             final = v.get('final')
             baseline = v.get('baseline')
             events = final.get('memory_events', {}) if isinstance(final, dict) else {}
@@ -626,13 +631,24 @@ def validate_config(config):
         raise ValueError('insufficient available host memory for configured fleet')
 
 
+def case_disk_need(config, case, payload_bytes):
+    # Restart reuses the overlay, but both share/payload directories remain.
+    payload_copies = case['vms'] * (2 if case.get('restart_resume') else 1)
+    return ((config.get('disk_reserve_mib', 1024) +
+             case['vms'] * config.get('overlay_budget_mib', 256)) * 1024**2 +
+            payload_copies * payload_bytes)
+
+
 def run(config, output):
     os.umask(0o077)
     validate_config(config)
     output = output.resolve()
+    workload_source = (Path(__file__).parent / 'workloads').resolve(strict=True)
+    sdk_source = Path(config['sdk']).resolve(strict=True)
+    for source in (workload_source, sdk_source):
+        if output.is_relative_to(source) or source.is_relative_to(output):
+            raise ValueError('output must not overlap SDK or workload source trees')
     output.mkdir(mode=0o700)
-    disk_need = (config.get('disk_reserve_mib', 1024) + max(c['vms'] for c in config['cases']) *
-                 config.get('overlay_budget_mib', 256)) * 1024**2
     required = ('kernel', 'disk', 'opencode', 'node', 'helper', 'sdk', 'qemu', 'qemu_img', 'virtiofsd')
     for key in required:
         config[key] = str(Path(config[key]).resolve(strict=True))
@@ -641,21 +657,21 @@ def run(config, output):
     # Reserve the copy fallback even on the same device: a filesystem or
     # protected source may reject hard links. Links are only a space saving.
     payload_bytes = sum(p.stat().st_size for p in payload_sources)
-    disk_need += max(c['vms'] for c in config['cases']) * payload_bytes
+    disk_need = max(case_disk_need(config, case, payload_bytes) for case in config['cases'])
     if shutil.disk_usage(output).free < disk_need:
         raise ValueError('insufficient free disk for payload copies and configured reserve')
     budget = Budget(config.get('max_attempts', 100))
     frozen_workloads = output / 'workloads-source'
-    shutil.copytree(Path(__file__).parent / 'workloads', frozen_workloads)
+    shutil.copytree(workload_source, frozen_workloads)
     config['workload_dir'] = str(frozen_workloads)
-    hashes = {key: digest(config[key]) for key in ('kernel', 'disk', 'opencode', 'node', 'helper')}
+    hashes = {key: digest(config[key]) for key in required if key != 'sdk'}
     sdk_hash = tree_digest(config['sdk'])
     write_json(output / 'manifest.json', {'schema': 1, 'config': config,
                'artifacts_sha256': hashes,
                'sdk_tree_sha256': sdk_hash,
                'runner_sha256': digest(__file__),
                'qemu_version': subprocess.check_output([config['qemu'], '--version'], text=True).splitlines()[0],
-               'virtiofsd_sha256': digest(config['virtiofsd']),
+               'virtiofsd_sha256': hashes['virtiofsd'],
                'workload_sha256': {p.name: digest(p) for p in frozen_workloads.iterdir() if p.is_file()},
                'clock_ticks_per_second': os.sysconf('SC_CLK_TCK'),
                'host_kernel': os.uname().release, 'host_machine': os.uname().machine,
@@ -673,15 +689,22 @@ def run(config, output):
             write_json(output / 'attempts.json', results)
     with HostSampler(output / 'host.jsonl') as sampler:
         for index, case in enumerate(config['cases']):
+            # Admit the whole fleet once, before any worker can consume its
+            # already-budgeted payload/overlay space. Previous shares remain
+            # on disk and are reflected in this case's actual free capacity.
+            try:
+                if shutil.disk_usage(output).free < case_disk_need(config, case, payload_bytes):
+                    raise ValueError('insufficient disk reserve for this fleet')
+            except (OSError, ValueError) as error:
+                for number in range(case['vms']):
+                    record({'status': 'infrastructure_failed', 'admitted': False,
+                            'vm': None, 'error': type(error).__name__ + ': ' + str(error)},
+                           index, number, case)
+                continue
             ready = threading.Barrier(case['vms'], timeout=240)
             def worker(number):
                 vm = None
                 try:
-                    case_need = (case['vms'] * config.get('overlay_budget_mib', 256) +
-                                 config.get('disk_reserve_mib', 1024)) * 1024**2
-                    case_need += case['vms'] * payload_bytes
-                    if shutil.disk_usage(output).free < case_need:
-                        raise ValueError('insufficient disk reserve for this fleet')
                     vm = GuestVM(config, output / f'c{index}v{number}', sampler, case['ram_mib'])
                     vm.start()
                     mode = case.get('mode', 'coding')

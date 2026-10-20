@@ -20,6 +20,7 @@ pub(crate) mod event_notify;
 pub(crate) mod events;
 mod files;
 mod inode;
+mod membership;
 mod memory;
 mod migration;
 mod mount;
@@ -39,6 +40,7 @@ pub struct CgroupOpenState {
 enum CgroupReadState {
     None,
     Text(Arc<crate::libs::mutex::Mutex<read_snapshot::TextSnapshot>>),
+    Members(Arc<crate::libs::mutex::Mutex<membership::MembershipRead>>),
     Events(Arc<events::CgroupEventOpen>),
 }
 

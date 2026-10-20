@@ -787,6 +787,13 @@ impl IndexNode for Cgroup2Inode {
                     super::CgroupReadState::Events(super::events::CgroupEventOpen::new(source)?)
                 } else if flags.access_flags() == FileFlags::O_WRONLY {
                     super::CgroupReadState::None
+                } else if matches!(ty, CgroupCoreFile::Procs | CgroupCoreFile::Threads) {
+                    super::CgroupReadState::Members(
+                        Arc::try_new(crate::libs::mutex::Mutex::new(
+                            super::membership::MembershipRead::default(),
+                        ))
+                        .map_err(|_| SystemError::ENOMEM)?,
+                    )
                 } else {
                     super::CgroupReadState::Text(
                         Arc::try_new(crate::libs::mutex::Mutex::new(
@@ -850,6 +857,11 @@ impl IndexNode for Cgroup2Inode {
                 }
             };
             match read {
+                super::CgroupReadState::Members(members) => {
+                    members
+                        .lock()
+                        .read(&cgroup, ty, file_generation, offset, len, buf)
+                }
                 super::CgroupReadState::Events(events) => {
                     events.read(&cgroup, ty, file_generation, offset, len, buf)
                 }

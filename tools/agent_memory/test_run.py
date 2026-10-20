@@ -452,6 +452,40 @@ class VMTests(unittest.TestCase):
             finally:
                 vm.close()
 
+    def test_successful_pair_requires_real_execution_overlap(self):
+        with tempfile.TemporaryDirectory(prefix='am-pair-time-') as root:
+            vm = RUN.GuestVM(self.config(), Path(root) / 'vm', mock.Mock(), 512)
+            try:
+                for name in ('victim', 'neighbor'):
+                    (vm.share / 'results' / name).mkdir()
+                for start, end, neighbor_start, expected in (
+                        (10, 30, 20, 'passed'), (10, 30, 30, 'failed'),
+                        (10, 30, 31, 'failed'), (None, 30, 20, 'failed'),
+                        ('bad', 30, 20, 'failed'), (30, 10, 0, 'failed')):
+                    with self.subTest(start=start, end=end, neighbor_start=neighbor_start):
+                        for name in ('victim', 'neighbor'):
+                            out = vm.share / 'results' / name
+                            helper = dict(schema=1, status='ok', descendants_empty=True,
+                                cleanup_required=False, sample_errors=0, diagnostic_errors=0,
+                                memory_peak_bytes=4096, task_elapsed_ns=20,
+                                workload_start_ns=start if name == 'victim' else neighbor_start,
+                                leader_exit_ns=end if name == 'victim' else 50)
+                            (out / 'result.json').write_text(json.dumps(helper))
+                            (out / 'workload.json').write_text('{"schema":1,"success":true}')
+                            (vm.share / 'results' / (name + '.exit')).write_text('0')
+                            write_metrics(out)
+                        vm.trial_command = mock.Mock(side_effect=[
+                            ('victim-command', dict(name='victim', admitted=True)),
+                            ('neighbor-command', dict(name='neighbor', admitted=True))])
+                        vm.command = mock.Mock(return_value=0)
+                        rows = vm.pair(RUN.Budget(2), [None, None])
+                        self.assertEqual([row['status'] for row in rows], [expected, expected])
+                        self.assertEqual(sum(row['admitted'] for row in rows), 2)
+                        if expected == 'failed':
+                            self.assertTrue(all(row['error'] == 'pair_not_concurrent' for row in rows))
+            finally:
+                vm.close()
+
     def test_pair_retains_both_admitted_attempts_on_transport_or_result_failure(self):
         with tempfile.TemporaryDirectory(prefix="am-") as root:
             vm = RUN.GuestVM(self.config(), Path(root) / "vm", mock.Mock(), 512)
@@ -491,6 +525,116 @@ class VMTests(unittest.TestCase):
             self.assertEqual(sampler.unregister.call_count, 2)
 
 
+class DiskAdmissionTests(unittest.TestCase):
+    def fixture(self, root, cases):
+        artifact = root / 'artifact'
+        artifact.write_bytes(b'x' * 4096)
+        sdk = root / 'sdk'
+        sdk.mkdir()
+        (sdk / 'package.json').write_bytes(b'y' * 4096)
+        config = {key: str(artifact) for key in ('kernel', 'disk', 'opencode', 'node',
+                  'helper', 'qemu', 'qemu_img', 'virtiofsd')}
+        config.update(sdk=str(sdk), cases=cases)
+        return config, 4 * 4096
+
+    def vm(self, root, name):
+        vm = mock.Mock(overlay=root / 'absent-overlay', identity=name)
+        vm.trial.return_value = dict(name=name, status='passed', admitted=True)
+        return vm
+
+    def invoke(self, root, config, free, constructor):
+        sampler = mock.Mock(rows=[], failure=None)
+        context = mock.MagicMock()
+        context.__enter__.return_value = sampler
+        old_umask = RUN.os.umask(0o077)
+        try:
+            with mock.patch.object(RUN, 'validate_config'), \
+                 mock.patch.object(RUN.shutil, 'disk_usage', side_effect=lambda _: mock.Mock(free=free())), \
+                 mock.patch.object(RUN, 'HostSampler', return_value=context), \
+                 mock.patch.object(RUN, 'GuestVM', constructor), \
+                 mock.patch.object(RUN.subprocess, 'check_output', return_value='fixture QEMU\n'), \
+                 mock.patch('builtins.print'):
+                return RUN.run(config, root / 'output')
+        finally:
+            RUN.os.umask(old_umask)
+
+    def test_restart_reserves_both_retained_payloads_before_launch(self):
+        with tempfile.TemporaryDirectory(prefix='am-disk-restart-') as directory:
+            root = Path(directory)
+            config, payload = self.fixture(root, [dict(vms=1, ram_mib=512, restart_resume=True)])
+            free = (1024 + 256) * 1024**2 + 2 * payload - 1
+            constructor = mock.Mock(side_effect=[self.vm(root, 'first'), self.vm(root, 'restored')])
+            with self.assertRaisesRegex(ValueError, 'payload'):
+                self.invoke(root, config, lambda: free, constructor)
+            constructor.assert_not_called()
+
+    def test_fleet_is_admitted_once_before_workers_consume_space(self):
+        with tempfile.TemporaryDirectory(prefix='am-disk-fleet-') as directory:
+            root = Path(directory)
+            config, payload = self.fixture(root, [dict(vms=2, ram_mib=512)])
+            free = [(1024 + 2 * 256) * 1024**2 + 2 * payload]
+            guests = [self.vm(root, 'first'), self.vm(root, 'second')]
+            for guest in guests:
+                guest.start.side_effect = lambda: free.__setitem__(0, free[0] - payload)
+            constructor = mock.Mock(side_effect=guests)
+            # Model the valid schedule where the first worker copies its payload
+            # before the next worker enters. No real thread timing or barrier.
+            pool = mock.MagicMock()
+            pool.__enter__.return_value = pool
+            def submit(function, *args):
+                future = concurrent.futures.Future()
+                future.set_result(function(*args))
+                return future
+            pool.submit.side_effect = submit
+            with mock.patch.object(RUN.concurrent.futures, 'ThreadPoolExecutor', return_value=pool), \
+                 mock.patch.object(RUN.threading, 'Barrier'):
+                self.invoke(root, config, lambda: free[0], constructor)
+            attempts = json.loads((root / 'output/attempts.json').read_text())
+            self.assertEqual([row['status'] for row in attempts], ['passed', 'passed'])
+            self.assertEqual(constructor.call_count, 2)
+
+    def test_later_restart_capacity_failure_preserves_prior_results_without_workers(self):
+        with tempfile.TemporaryDirectory(prefix='am-disk-later-') as directory:
+            root = Path(directory)
+            config, payload = self.fixture(root, [dict(vms=1, ram_mib=512),
+                                                   dict(vms=1, ram_mib=512, restart_resume=True)])
+            base = (1024 + 256) * 1024**2
+            free = [1 << 40]
+            first = self.vm(root, 'first')
+            first.start.side_effect = lambda: free.__setitem__(0, base + 2 * payload - 1)
+            constructor = mock.Mock(side_effect=[first, self.vm(root, 'second'), self.vm(root, 'restored')])
+            real_pool = concurrent.futures.ThreadPoolExecutor
+            with mock.patch.object(RUN.concurrent.futures, 'ThreadPoolExecutor', wraps=real_pool) as pools:
+                self.invoke(root, config, lambda: free[0], constructor)
+            attempts = json.loads((root / 'output/attempts.json').read_text())
+            self.assertEqual([row['status'] for row in attempts], ['passed', 'infrastructure_failed'])
+            self.assertFalse(attempts[1]['admitted'])
+            self.assertIsNone(attempts[1]['vm'])
+            self.assertEqual(constructor.call_count, 1)
+            self.assertEqual(pools.call_count, 1)
+            self.assertTrue((root / 'output/summary.json').is_file())
+
+    def test_later_disk_stat_error_keeps_prior_results(self):
+        with tempfile.TemporaryDirectory(prefix='am-disk-error-') as directory:
+            root = Path(directory)
+            config, _ = self.fixture(root, [dict(vms=1, ram_mib=512), dict(vms=1, ram_mib=512)])
+            failed = [False]
+            first = self.vm(root, 'first')
+            first.start.side_effect = lambda: failed.__setitem__(0, True)
+            constructor = mock.Mock(return_value=first)
+            def free():
+                if failed[0]:
+                    raise OSError(errno.EIO, 'fixture disk stat failure')
+                return 1 << 40
+            self.invoke(root, config, free, constructor)
+            attempts = json.loads((root / 'output/attempts.json').read_text())
+            self.assertEqual([row['status'] for row in attempts], ['passed', 'infrastructure_failed'])
+            self.assertIn('OSError', attempts[1]['error'])
+            self.assertFalse(attempts[1]['admitted'])
+            self.assertEqual(constructor.call_count, 1)
+            self.assertTrue((root / 'output/summary.json').is_file())
+
+
 class RunCoverageTests(unittest.TestCase):
     def test_restart_resume_inherits_case_policy(self):
         with tempfile.TemporaryDirectory(prefix='am-restart-') as root:
@@ -514,6 +658,7 @@ class RunCoverageTests(unittest.TestCase):
             old_umask = RUN.os.umask(0o077)
             try:
                 with mock.patch.object(RUN, 'validate_config'), \
+                     mock.patch.object(RUN.shutil, 'disk_usage', return_value=mock.Mock(free=1 << 40)), \
                      mock.patch.object(RUN, 'HostSampler', return_value=context), \
                      mock.patch.object(RUN, 'GuestVM', side_effect=[original, restored]), \
                      mock.patch.object(RUN.subprocess, 'check_output', return_value='fixture QEMU\n'), \
@@ -549,6 +694,7 @@ class RunCoverageTests(unittest.TestCase):
             old_umask = RUN.os.umask(0o077)
             try:
                 with mock.patch.object(RUN, 'validate_config'), \
+                     mock.patch.object(RUN.shutil, 'disk_usage', return_value=mock.Mock(free=1 << 40)), \
                      mock.patch.object(RUN, 'HostSampler', return_value=context), \
                      mock.patch.object(RUN, 'GuestVM', return_value=vm), \
                      mock.patch.object(RUN.subprocess, 'check_output', return_value='fixture QEMU\n'), \
@@ -608,6 +754,7 @@ class RunCoverageTests(unittest.TestCase):
             old_umask = RUN.os.umask(0o077)
             try:
                 with mock.patch.object(RUN, 'validate_config'), \
+                     mock.patch.object(RUN.shutil, 'disk_usage', return_value=mock.Mock(free=1 << 40)), \
                      mock.patch.object(RUN, 'HostSampler', return_value=context), \
                      mock.patch.object(RUN, 'GuestVM', return_value=vm), \
                      mock.patch.object(RUN.subprocess, 'check_output', return_value='fixture QEMU\n'), \
@@ -620,6 +767,95 @@ class RunCoverageTests(unittest.TestCase):
             self.assertEqual(report['steady_workers_expected'], 1)
             self.assertEqual(report['steady_windows'], [])
             self.assertFalse(report['steady_complete'])
+
+
+class ArtifactBoundaryTests(unittest.TestCase):
+    def fixture(self, root):
+        artifact = root / 'artifact'
+        artifact.write_text('public fixture')
+        sdk = root / 'sdk'
+        sdk.mkdir()
+        (sdk / 'package.json').write_text('{}')
+        runner = root / 'source' / 'run.py'
+        runner.parent.mkdir()
+        runner.write_text('fixture runner')
+        workloads = runner.parent / 'workloads'
+        workloads.mkdir()
+        (workloads / 'input.json').write_text('{}')
+        config = {key: str(artifact) for key in ('kernel', 'disk', 'opencode', 'node',
+                  'helper', 'qemu', 'qemu_img', 'virtiofsd')}
+        config.update(sdk=str(sdk), cases=[dict(vms=1, ram_mib=512)])
+        return config, runner
+
+    def test_output_rejects_recursive_source_overlap_before_creation(self):
+        for variant in ('sdk-child', 'workloads-child', 'sdk-same', 'source-parent', 'symlink-child'):
+            with self.subTest(variant=variant), tempfile.TemporaryDirectory(prefix='am-path-') as tmp:
+                root = Path(tmp)
+                config, runner = self.fixture(root)
+                sdk, workloads = root / 'sdk', runner.parent / 'workloads'
+                link = root / 'sdk-link'
+                link.symlink_to(sdk, target_is_directory=True)
+                output = {'sdk-child': sdk / 'output', 'workloads-child': workloads / 'output',
+                          'sdk-same': sdk, 'source-parent': root,
+                          'symlink-child': link / 'output'}[variant]
+                existed = output.exists()
+                old_umask = RUN.os.umask(0o077)
+                try:
+                    with mock.patch.object(RUN, '__file__', str(runner)), \
+                         mock.patch.object(RUN, 'validate_config'), \
+                         mock.patch.object(RUN.shutil, 'disk_usage', return_value=mock.Mock(free=1 << 40)), \
+                         mock.patch.object(RUN.shutil, 'copytree', side_effect=RuntimeError('recursive copy reached')) as copy, \
+                         mock.patch.object(RUN, 'GuestVM') as guest:
+                        with self.assertRaisesRegex(ValueError, 'overlap'):
+                            RUN.run(config, output)
+                        copy.assert_not_called()
+                        guest.assert_not_called()
+                finally:
+                    RUN.os.umask(old_umask)
+                self.assertEqual(output.exists(), existed)
+
+    def test_virtualization_tools_are_in_initial_and_final_hash_checks(self):
+        for changed in (None, 'qemu', 'qemu_img', 'virtiofsd'):
+            with self.subTest(changed=changed), tempfile.TemporaryDirectory(prefix='am-tools-') as tmp:
+                root = Path(tmp)
+                config, runner = self.fixture(root)
+                for key in ('qemu', 'qemu_img', 'virtiofsd'):
+                    tool = root / key
+                    tool.write_text('original ' + key)
+                    config[key] = str(tool)
+                # Match execution: resolve a launcher symlink once, then check
+                # the actual configured executable rather than its link text.
+                launcher = root / 'qemu-link'
+                launcher.symlink_to(root / 'qemu')
+                config['qemu'] = str(launcher)
+                initial = {key: RUN.digest(config[key]) for key in ('qemu', 'qemu_img', 'virtiofsd')}
+                vm = mock.Mock(overlay=root / 'no-overlay', identity='fixture-vm')
+                def trial(*args, **kwargs):
+                    if changed:
+                        Path(config[changed]).write_text('replacement ' + changed)
+                    return dict(name='t0', status='passed', admitted=True)
+                vm.trial.side_effect = trial
+                context = mock.MagicMock()
+                context.__enter__.return_value = mock.Mock(
+                    rows=[dict(processes=[], errors=[], fleet_pss_bytes=0)], failure=None)
+                old_umask = RUN.os.umask(0o077)
+                try:
+                    with mock.patch.object(RUN, '__file__', str(runner)), \
+                         mock.patch.object(RUN, 'validate_config'), \
+                         mock.patch.object(RUN.shutil, 'disk_usage', return_value=mock.Mock(free=1 << 40)), \
+                         mock.patch.object(RUN, 'HostSampler', return_value=context), \
+                         mock.patch.object(RUN, 'GuestVM', return_value=vm), \
+                         mock.patch.object(RUN.subprocess, 'check_output', return_value='fixture QEMU\n'), \
+                         mock.patch('builtins.print'):
+                        code = RUN.run(config, root / 'output')
+                finally:
+                    RUN.os.umask(old_umask)
+                report = json.loads((root / 'output/summary.json').read_text())
+                manifest = json.loads((root / 'output/manifest.json').read_text())
+                self.assertEqual(report['artifacts_unchanged'], changed is None)
+                self.assertEqual(code, 0 if changed is None else 1)
+                for key, value in initial.items():
+                    self.assertEqual(manifest['artifacts_sha256'][key], value)
 
 
 if __name__ == "__main__":

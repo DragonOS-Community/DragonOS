@@ -474,8 +474,8 @@ pub(super) fn read_file(
     check_live_file(cgroup, ty, file_generation)?;
     Ok(match ty {
         CgroupCoreFile::Cpuset(_) => unreachable!(),
-        CgroupCoreFile::Procs => membership_list(cgroup, true)?,
-        CgroupCoreFile::Threads => membership_list(cgroup, false)?,
+        // Members are streamed by their dedicated bounded open state.
+        CgroupCoreFile::Procs | CgroupCoreFile::Threads => return Err(SystemError::EINVAL),
         CgroupCoreFile::Controllers => {
             let items: Vec<String> = available_controllers_for(cgroup)
                 .into_iter()
@@ -721,52 +721,6 @@ fn live_file_spec(cgroup: &Arc<CgroupNode>, ty: CgroupCoreFile) -> Option<Cgroup
         return (available && spec.visible_on(cgroup)).then_some(*spec);
     }
     None
-}
-
-/// Membership and PID identities share the accounting transaction with exec.
-/// Aggregate threaded descendants in this resource domain. Invalid ordinary
-/// nodes can separate them after an ancestor is converted to threaded mode.
-fn membership_list(cgroup: &Arc<CgroupNode>, processes: bool) -> Result<Vec<u8>, SystemError> {
-    if processes && cgroup.is_threaded() {
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
-    }
-    let _accounting = crate::cgroup::cgroup_accounting_lock().lock();
-    let mut nodes = alloc::vec![cgroup.clone()];
-    let mut ids = alloc::collections::BTreeMap::new();
-    while let Some(node) = nodes.pop() {
-        let in_domain = !processes
-            || Arc::ptr_eq(&node, cgroup)
-            || (node.is_threaded() && Arc::ptr_eq(&node.resource_domain(), cgroup));
-        for pid in node.tasks().into_iter().filter(|_| in_domain) {
-            let Some(task) = crate::process::ProcessManager::find(pid) else {
-                continue;
-            };
-            if task.is_exited() {
-                continue;
-            }
-            if processes {
-                if let Some(pid) = task.task_pid_ptr(crate::process::pid::PidType::TGID) {
-                    if let Some(raw) = pid.first_upid() {
-                        ids.insert(raw.nr.data(), pid.pid_vnr().data());
-                    }
-                }
-            } else {
-                ids.insert(task.raw_pid().data(), task.task_pid_vnr().data());
-            }
-        }
-        if processes {
-            nodes.extend(
-                node.children()
-                    .into_iter()
-                    .filter(|child| !child.is_valid_domain()),
-            );
-        }
-    }
-    let mut lines = String::new();
-    for id in ids.into_values() {
-        lines.push_str(&format!("{}\n", id));
-    }
-    Ok(lines.into_bytes())
 }
 
 fn validated_subtree_control(

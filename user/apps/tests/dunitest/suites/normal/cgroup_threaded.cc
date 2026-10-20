@@ -117,6 +117,15 @@ void* ThreadLoop(void* opaque) {
   Request request{};
   while (Transfer(fd, &request, sizeof(request), false)) {
     if (request.operation == 'Q') return nullptr;
+    if (request.operation == 'L') {
+      reply = {};
+      if (!Transfer(fd, &reply, sizeof(reply), true)) _exit(96);
+      // This forked main thread still has GTest frames on its stack. A raw
+      // per-thread exit exercises the kernel without forced C++ unwinding
+      // through GTest's catch-all exception handler.
+      syscall(SYS_exit, 0);
+      _exit(97);
+    }
     if (request.operation == 'M') {
       reply = Inspect();
       reply.error = Write(std::string(request.path) + "/cgroup.threads", "0");
@@ -464,6 +473,28 @@ TEST_F(ThreadedCgroup, ListsAggregateProcessesButSeparateThreads) {
   EXPECT_EQ((std::set<pid_t>{tids_[0], tids_[2]}), Members(a_ + "/cgroup.threads"));
   EXPECT_EQ((std::set<pid_t>{tids_[1]}), Members(b_ + "/cgroup.threads"));
   EXPECT_TRUE(Members(root_ + "/cgroup.threads").empty());
+}
+
+TEST_F(ThreadedCgroup, ExitedLeaderUsesLiveThreadsMembershipAfterMigration) {
+  a_ = Make(root_, "old");
+  b_ = Make(root_, "new");
+  Start(a_);
+  ASSERT_EQ(0, Command(0, 'L').error);
+  timespec start{}, now{};
+  ASSERT_EQ(0, clock_gettime(CLOCK_MONOTONIC, &start));
+  const std::set<pid_t> live{tids_[1], tids_[2]};
+  while (Members(a_ + "/cgroup.threads") != live) {
+    ASSERT_EQ(0, clock_gettime(CLOCK_MONOTONIC, &now));
+    ASSERT_LT(now.tv_sec - start.tv_sec, 10);
+    sched_yield();
+  }
+  EXPECT_EQ((std::set<pid_t>{worker_}), Members(a_ + "/cgroup.procs"));
+  ASSERT_EQ(0, Write(b_ + "/cgroup.procs", std::to_string(tids_[1])));
+  EXPECT_TRUE(Members(a_ + "/cgroup.procs").empty());
+  EXPECT_EQ((std::set<pid_t>{worker_}), Members(b_ + "/cgroup.procs"));
+  EXPECT_EQ(live, Members(b_ + "/cgroup.threads"));
+  EXPECT_EQ(0, Command(1).error);
+  EXPECT_EQ(0, Command(2).error);
 }
 
 TEST_F(ThreadedCgroup, ProcsSameLeafStillGathersEntireThreadGroup) {

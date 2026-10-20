@@ -1,0 +1,28 @@
+{
+  "name": "app_target_arch_empty_should_fail",
+  "version": "0.1.0",
+  "description": "An app targets empty, which should failed when parsing",
+  "task_type": {
+    "BuildFromSource": {
+      "Git": {
+        "url": "1",
+        "branch": "1",
+        "revision": null
+      }
+    }
+  },
+  "depends": [],
+  "build": {
+    "build_command": "1"
+  },
+  "install": {
+    "in_dragonos_path": "/"
+  },
+  "clean": {
+    "clean_command": "1"
+  },
+  "envs": [],
+  "build_once": false,
+  "install_once": false,
+  "target_arch": []
+}

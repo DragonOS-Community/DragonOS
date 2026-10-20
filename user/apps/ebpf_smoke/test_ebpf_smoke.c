@@ -1153,11 +1153,11 @@ static void test_ringbuf(void)
     volatile uint64_t *producer_pos = (volatile uint64_t *)producer_area;
     const uint8_t *data = (const uint8_t *)producer_area + 4096;
 
-    /* prog: r2 = map; call 131 reserve(16) -> r0; if r0==0 exit;
-     * *(u64*)r0 = 0xRINGBEEF; *(u64*)(r0+8) = pid_tgid; call 132 submit(r0) */
+    /* prog: reserve(map=r1, size=r2=16, flags=r3=0) -> r0; if r0==0 skip;
+     * *(u64*)r0 = magic; *(u64*)(r0+8) = pid_tgid; submit(data=r1=r0, r2=0) */
     struct bpf_insn prog[] = {
-        LD_MAP_FD(2, mfd),
-        { .code = BPF_MOV64_K, .dst_reg = 1, .imm = 16 },
+        LD_MAP_FD(1, mfd),
+        { .code = BPF_MOV64_K, .dst_reg = 2, .imm = 16 },
         { .code = BPF_MOV64_K, .dst_reg = 3, .imm = 0 },
         { .code = BPF_CALL, .imm = 131 }, /* bpf_ringbuf_reserve */
         { .code = BPF_JEQ_K, .dst_reg = 0, .imm = 0, .off = 8 },

@@ -646,6 +646,16 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
         self.buddy_alloc_result(count).ok()
     }
 
+    /// Whether an unrestricted allocation may consume low memory. A run
+    /// already held outside the free lists passes zero at final handoff.
+    pub(crate) fn dma32_fallback_allowed(&self, needed: usize) -> bool {
+        !self.has_normal_memory
+            || self.dma32_free_pages
+                >= needed
+                    .saturating_add(DMA32_FALLBACK_RESERVE_PAGES)
+                    .saturating_add(DMA32_ALLOCATION_METADATA_HEADROOM)
+    }
+
     fn buddy_alloc_result(
         &mut self,
         count: PageFrameCount,
@@ -662,12 +672,7 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
         } else {
             None
         };
-        let dma32_fallback_allowed = !self.has_normal_memory
-            || self.dma32_free_pages
-                >= count
-                    .data()
-                    .saturating_add(DMA32_FALLBACK_RESERVE_PAGES)
-                    .saturating_add(DMA32_ALLOCATION_METADATA_HEADROOM);
+        let dma32_fallback_allowed = self.dma32_fallback_allowed(count.data());
         let free_addr = normal.or_else(|| {
             dma32_fallback_allowed
                 .then(|| self.try_zone(BuddyZone::Dma32, order))

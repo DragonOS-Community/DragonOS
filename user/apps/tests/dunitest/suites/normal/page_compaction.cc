@@ -34,12 +34,12 @@ void CheckReport(const std::string& report) {
             "unknown_blocker", "rmap_budget", "deferred_free_fastpath",
             "scan_budget_no_mutation", "isolation_allocation_free_window",
             "atomic_rejected", "seed_boundaries_no_mutation", "repeated_capture",
-            "dma_same_mask_fragmentation", "dma_atomic_no_recovery",
+            "cold_workspace_outside_target", "dma_same_mask_fragmentation", "dma_atomic_no_recovery",
             "dma_noio_no_recovery", "dma_automatic_recovery",
             "buddy_compaction_split_capture", "buddy_compaction_metadata_slots",
             "buddy_compaction_abort_stale", "buddy_compaction_cross_free",
             "buddy_compaction_budget_rollback", "buddy_compaction_range_validation",
-            "buddy_compaction_alloc_exclusion", "buddy_compaction_zone_scratch_reuse"}) {
+            "buddy_compaction_alloc_exclusion", "buddy_compaction_zone_reuse"}) {
         EXPECT_NE(std::string::npos, report.find(std::string(key) + "=ok\n")) << report;
     }
 }

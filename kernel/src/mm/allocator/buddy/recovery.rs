@@ -7,6 +7,9 @@ const CAPACITY_SCAN_BUDGET: usize = 4096;
 pub(crate) enum DmaRecoveryZone {
     Normal,
     Dma32,
+    /// An unrestricted request admitted into DMA32 above its reserve. Unlike
+    /// a hard low-address mask, this contract needs a live handoff check.
+    Dma32Fallback,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -57,10 +60,14 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
             }
             Err(AllocationFailure::Fragmentation) => {
                 if max.data() == usize::MAX && self.has_normal_memory {
-                    if self.normal_free_pages < count.data() {
-                        Err(DmaAllocationFailure::plain(AllocationFailure::ZoneLimit))
-                    } else {
+                    if self.normal_free_pages >= count.data() {
                         Err(DmaAllocationFailure::fragmented(DmaRecoveryZone::Normal))
+                    } else if self.dma32_fallback_allowed(count.data()) {
+                        Err(DmaAllocationFailure::fragmented(
+                            DmaRecoveryZone::Dma32Fallback,
+                        ))
+                    } else {
+                        Err(DmaAllocationFailure::plain(AllocationFailure::ZoneLimit))
                     }
                 } else {
                     Err(DmaAllocationFailure::fragmented(DmaRecoveryZone::Dma32))
@@ -126,6 +133,17 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
     any(target_arch = "x86_64", target_arch = "riscv64")
 ))]
 pub(super) fn typed_allocation_selftest(fresh: impl Fn() -> BuddyAllocator<MMArch>) -> bool {
+    // Sibling calls keep each fixture's allocator locals out of the other's
+    // stack frame. Do not call the fallback case from inside the base case.
+    typed_base_allocation_selftest(&fresh) && fallback_allocation_selftest(&fresh)
+}
+
+#[cfg(all(
+    feature = "mm_selftest",
+    any(target_arch = "x86_64", target_arch = "riscv64")
+))]
+#[inline(never)]
+fn typed_base_allocation_selftest(fresh: &impl Fn() -> BuddyAllocator<MMArch>) -> bool {
     fn attempt(
         allocator: &mut BuddyAllocator<MMArch>,
         count: PageFrameCount,
@@ -282,4 +300,53 @@ pub(super) fn typed_allocation_selftest(fresh: impl Fn() -> BuddyAllocator<MMArc
         && finite_cross_zone
         && finite_low_proof
         && finite_normal_proof
+}
+
+#[cfg(all(
+    feature = "mm_selftest",
+    any(target_arch = "x86_64", target_arch = "riscv64")
+))]
+#[inline(never)]
+fn fallback_allocation_selftest(fresh: &impl Fn() -> BuddyAllocator<MMArch>) -> bool {
+    let page = MMArch::PAGE_SIZE;
+    let low = PhysAddr::new(0x0200_0000);
+    let high = PhysAddr::new(1usize << 32);
+    // A wide request may use DMA32 above its protected reserve when Normal
+    // lacks capacity. Fragmentation in that admitted fallback zone is still
+    // recoverable; combined-zone counters must not erase its identity.
+    let mut allocator = fresh();
+    unsafe { allocator.free(high, PageFrameCount::ONE) };
+    for index in 0..19 {
+        unsafe {
+            allocator.free(low + index * 512 * page, PageFrameCount::new(256));
+        }
+    }
+    let fallback =
+        allocator.try_allocate_for_dma(PageFrameCount::new(512), PhysAddr::new(usize::MAX));
+    let eligible_low_fallback = fallback
+        == Err(DmaAllocationFailure::fragmented(
+            DmaRecoveryZone::Dma32Fallback,
+        ))
+        && allocator.diagnostics.failure_reasons[AllocationFailure::Fragmentation as usize] == 1
+        && allocator.diagnostics.zones[BuddyZone::Normal.index()].attempts[9] == 1
+        && allocator.diagnostics.zones[BuddyZone::Dma32.index()].attempts[9] == 1
+        && allocator.dma32_free_pages == 19 * 256
+        && allocator.normal_free_pages == 1;
+
+    // Model the live counter after a captured run is no longer on free lists.
+    // A competing constrained consumer can move it across this boundary.
+    let mut live = fresh();
+    let no_normal_unrestricted = live.dma32_fallback_allowed(512);
+    unsafe { live.free(high, PageFrameCount::ONE) };
+    let floor = DMA32_FALLBACK_RESERVE_PAGES + DMA32_ALLOCATION_METADATA_HEADROOM;
+    live.dma32_free_pages = floor - 1;
+    let below_floor = !live.dma32_fallback_allowed(0);
+    live.dma32_free_pages = floor;
+    let at_floor = live.dma32_fallback_allowed(0) && !live.dma32_fallback_allowed(1);
+    live.dma32_free_pages = floor + 1;
+    let additional_page = live.dma32_fallback_allowed(1);
+    let live_reserve_boundary =
+        no_normal_unrestricted && below_floor && at_floor && additional_page;
+
+    eligible_low_fallback && live_reserve_boundary
 }

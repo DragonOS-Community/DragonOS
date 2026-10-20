@@ -15,10 +15,15 @@ use std::{sync::Mutex, thread};
 /// A fake implementation of [`Transport`] for unit tests.
 #[derive(Debug)]
 pub struct FakeTransport<C: 'static> {
+    /// Device type reported to the driver.
     pub device_type: DeviceType,
+    /// Maximum descriptor count reported for every queue.
     pub max_queue_size: u32,
+    /// Feature bits offered by the simulated device.
     pub device_features: u64,
+    /// Borrowed configuration backing, which must outlive the transport.
     pub config_space: NonNull<C>,
+    /// Mutable device state shared with the simulated device thread.
     pub state: Arc<Mutex<State>>,
 }
 
@@ -106,12 +111,18 @@ impl<C> Transport for FakeTransport<C> {
     }
 }
 
+/// Device state observed and updated by the driver and simulated device.
 #[derive(Debug, Default)]
 pub struct State {
+    /// Most recently written device status.
     pub status: DeviceStatus,
+    /// Feature bits selected by the driver.
     pub driver_features: u64,
+    /// Guest page size written by the driver, in bytes.
     pub guest_page_size: u32,
+    /// Pending interrupt indication consumed by interrupt acknowledgement.
     pub interrupt_pending: bool,
+    /// Queue state indexed by the device's queue number.
     pub queues: Vec<QueueStatus>,
 }
 
@@ -187,11 +198,17 @@ impl State {
     }
 }
 
+/// Driver-programmed addresses and notification state of one split queue.
 #[derive(Debug, Default)]
 pub struct QueueStatus {
+    /// Configured descriptor count, or zero after the queue is unset.
     pub size: u32,
+    /// Descriptor table address, or zero when the queue is unused.
     pub descriptors: PhysAddr,
+    /// Driver-owned available ring address.
     pub driver_area: PhysAddr,
+    /// Device-owned used ring address.
     pub device_area: PhysAddr,
+    /// Pending driver notification consumed by the simulated device waiter.
     pub notified: AtomicBool,
 }

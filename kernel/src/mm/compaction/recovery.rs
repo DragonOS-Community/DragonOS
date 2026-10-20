@@ -5,7 +5,7 @@
 //! it never changes the ordinary heap/frame allocator's failure policy.
 use super::{CompactedFrames, Compactor, Limits, Request, Stop, MAX_COMPACT_ORDER};
 use crate::{
-    arch::{CurrentIrqArch, MMArch},
+    arch::{mm::LockedFrameAllocator, CurrentIrqArch, MMArch},
     cgroup::memory::io::noio_active,
     exception::{in_interrupt, InterruptArch},
     libs::mutex::Mutex,
@@ -34,7 +34,7 @@ impl Service {
 }
 
 // A fixed order-indexed owner, not an unbounded map keyed by device or mask.
-// Try admission also prevents recursive DMA recovery while preparing metadata.
+// Try admission also prevents recursive DMA recovery during migration allocations.
 static RECOVERY: Mutex<[Service; MAX_COMPACT_ORDER]> =
     Mutex::new([const { Service::new() }; MAX_COMPACT_ORDER]);
 
@@ -83,7 +83,19 @@ pub(crate) fn allocate(
         if let Some(request) = candidate_request(*physical, order, max, normal) {
             // One candidate per failed allocation. Changing only its seed
             // leaves this domain/order's Compactor deferral intact.
-            return service.compactor.allocate(request).outcome;
+            let run = service.compactor.allocate(request).outcome?;
+            if matches!(zone, DmaRecoveryZone::Dma32Fallback)
+                && !LockedFrameAllocator::with_buddy(|buddy| buddy.dma32_fallback_allowed(0))
+                    .unwrap_or(false)
+            {
+                // The run is already excluded from free counters. Recheck
+                // the remaining reserve under the buddy lock before handing
+                // ownership to DMA, including the ordinary fast-path result.
+                // Constrained consumers may have spent it since the proof.
+                drop(run);
+                return Err(Stop::Busy);
+            }
+            return Ok(run);
         }
     }
     Err(Stop::Blocked)
@@ -102,7 +114,7 @@ fn candidate_request(
         return None;
     }
     // Only copy a physical RAM descriptor. The memblock spin guard is gone
-    // before any allocator preparation, isolation, migration or TLB operation.
+    // before any isolation, migration or TLB operation.
     let area = {
         let mut regions = mem_block_manager().to_iter();
         regions.find(|area| {

@@ -1,5 +1,6 @@
 //! VirtIO transports.
 
+/// Simulated transport and shared device state for unit tests.
 #[cfg(test)]
 pub mod fake;
 pub mod mmio;

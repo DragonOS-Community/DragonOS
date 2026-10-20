@@ -4,7 +4,7 @@
 //! This coordinator owns only work limits, candidate selection and deferral.
 use super::{
     allocator::{
-        buddy::compaction::{IsolationKey, IsolationScratch, RangeError, MAX_COMPACT_ORDER},
+        buddy::compaction::{IsolationKey, RangeError, MAX_COMPACT_ORDER},
         page_frame::{FrameAllocator, PageFrameCount},
     },
     page::migration::{migrate_frame, MigrationError},
@@ -16,6 +16,8 @@ use crate::{
     libs::mutex::Mutex,
     process::ProcessManager,
 };
+
+pub(crate) mod recovery;
 
 static EXECUTION: Mutex<()> = Mutex::new(());
 
@@ -34,7 +36,6 @@ impl From<RangeError> for Stop {
             RangeError::Invalid => Self::Invalid,
             RangeError::Busy => Self::Busy,
             RangeError::Budget => Self::Budget,
-            RangeError::NoMemory => Self::NoMemory,
         }
     }
 }
@@ -78,16 +79,10 @@ pub(crate) struct Isolation {
     pages: usize,
 }
 impl Isolation {
-    pub(crate) fn begin(
-        start: PhysAddr,
-        order: usize,
-        scratch: &mut IsolationScratch,
-        entries: &mut usize,
-    ) -> Result<Self, Stop> {
-        let key = LockedFrameAllocator::with_buddy(|buddy| {
-            buddy.begin_isolation(start, order, scratch, entries)
-        })
-        .ok_or(Stop::NoMemory)??;
+    pub(crate) fn begin(start: PhysAddr, order: usize, entries: &mut usize) -> Result<Self, Stop> {
+        let key =
+            LockedFrameAllocator::with_buddy(|buddy| buddy.begin_isolation(start, order, entries))
+                .ok_or(Stop::NoMemory)??;
         Ok(Self {
             key: Some(key),
             start,
@@ -170,6 +165,9 @@ pub(crate) struct Request {
     pub start: PhysAddr,
     pub end: PhysAddr,
     pub order: usize,
+    /// Optional first scan address within this stable domain. Changing only
+    /// the seed preserves the domain/order failure deferral history.
+    pub start_at: Option<PhysAddr>,
     pub limits: Limits,
 }
 #[derive(Clone, Copy, Debug, Default)]
@@ -197,8 +195,6 @@ struct Domain {
 /// State belongs to a requesting service, which decides when to call again.
 /// No worker, timer, or globally retained per-region allocation is introduced.
 pub(crate) struct Compactor {
-    scratch: Option<IsolationScratch>,
-    prepared_order: usize,
     domain: Option<Domain>,
     defer_shift: u8,
     defer_left: u8,
@@ -206,25 +202,10 @@ pub(crate) struct Compactor {
 impl Compactor {
     pub(crate) const fn new() -> Self {
         Self {
-            scratch: None,
-            prepared_order: 0,
             domain: None,
             defer_shift: 0,
             defer_left: 0,
         }
-    }
-    /// Prepare fallible metadata outside allocator, MM and Page locks.
-    /// Keeping it in this service amortizes repeated requests and avoids
-    /// allocating scratch from holes in a region a caller is preparing.
-    pub(crate) fn prepare(&mut self, order: usize) -> Result<(), Stop> {
-        if order == 0 || order > MAX_COMPACT_ORDER {
-            return Err(Stop::Invalid);
-        }
-        if self.scratch.is_none() || self.prepared_order < order {
-            self.scratch = Some(IsolationScratch::try_new(order)?);
-            self.prepared_order = order;
-        }
-        Ok(())
     }
     pub(crate) fn allocate(&mut self, request: Request) -> Attempt {
         let mut stats = Stats::default();
@@ -259,6 +240,7 @@ impl Compactor {
             start,
             end,
             order,
+            start_at,
             limits,
         } = request;
         if order == 0
@@ -278,8 +260,15 @@ impl Compactor {
         {
             return Err(Stop::Invalid);
         }
+        let scan_start = start_at.unwrap_or(start);
+        if scan_start < start
+            || scan_start >= end
+            || scan_start.data() & MMArch::PAGE_OFFSET_MASK != 0
+        {
+            return Err(Stop::Invalid);
+        }
         let bytes = MMArch::PAGE_SIZE << order;
-        let mut candidate = start
+        let mut candidate = scan_start
             .data()
             .checked_add(bytes - 1)
             .map(|address| address & !(bytes - 1))
@@ -309,7 +298,6 @@ impl Compactor {
             self.defer_left -= 1;
             return Err(Stop::Deferred);
         }
-        self.prepare(order)?;
         let mut no_progress = 0;
         let mut saw_busy = false;
         while candidate
@@ -320,12 +308,7 @@ impl Compactor {
                 return Err(if saw_busy { Stop::Busy } else { Stop::Budget });
             }
             stats.targets += 1;
-            let lease = Isolation::begin(
-                PhysAddr::new(candidate),
-                order,
-                self.scratch.as_mut().unwrap(),
-                &mut remaining,
-            );
+            let lease = Isolation::begin(PhysAddr::new(candidate), order, &mut remaining);
             stats.entries = limits.entries - remaining;
             let mut lease = lease?;
             let before = lease.free_pages();

@@ -43,6 +43,7 @@ jobs:
           normal/page_migration_prerequisites
           normal/page_migration
           normal/page_compaction
+          normal/test_tlb_shootdown
           normal/shared_page_migration
           normal/page_retirement
           normal/kernel_buffer_selftest

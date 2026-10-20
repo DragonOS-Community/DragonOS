@@ -7,9 +7,9 @@ use crate::{
     cgroup::memory::accounting::MemoryPolicy,
     exception::InterruptArch,
     mm::{
-        allocator::buddy::compaction::IsolationScratch,
         allocator::page_frame::VirtPageFrame,
         compaction::{try_allocate_in_range, Compactor, Isolation, Limits, Request, Stop},
+        dma::{DmaAllocOptions, DmaBuffer, DmaCompaction},
         syscall::{MapFlags, ProtFlags},
         ucontext::AddressSpace,
     },
@@ -102,6 +102,14 @@ fn pattern(source: usize, offset: usize) -> u8 {
 
 impl Fixture {
     fn new(alias: bool, unknown: bool) -> Result<Self, SystemError> {
+        Self::with_range(alias, unknown, None)
+    }
+
+    fn with_range(
+        alias: bool,
+        unknown: bool,
+        range: Option<(PhysAddr, PhysAddr)>,
+    ) -> Result<Self, SystemError> {
         let mm = AddressSpace::new(false, INIT_USER_NAMESPACE.clone(), 1)
             .map_err(|_| SystemError::ENOMEM)?;
         let account =
@@ -150,11 +158,19 @@ impl Fixture {
             .sources
             .try_reserve_exact(SOURCES)
             .map_err(|_| SystemError::ENOMEM)?;
-        let (base, count) = unsafe {
-            LockedFrameAllocator
-                .allocate_below(PageFrameCount::new(BACKING), PhysAddr::new(usize::MAX))
-        }
-        .ok_or(SystemError::ENOMEM)?;
+        let (base, count) = if let Some((start, end)) = range {
+            let mut entries = 65_536;
+            try_allocate_in_range(start, end, ORDER + 1, &mut entries)
+                .map_err(|_| SystemError::ENOMEM)?
+                .ok_or(SystemError::ENOMEM)?
+                .into_raw_parts()
+        } else {
+            unsafe {
+                LockedFrameAllocator
+                    .allocate_below(PageFrameCount::new(BACKING), PhysAddr::new(usize::MAX))
+            }
+            .ok_or(SystemError::ENOMEM)?
+        };
         if count.data() != BACKING {
             unsafe { LockedFrameAllocator.free(base, count) };
             return Err(SystemError::EIO);
@@ -229,7 +245,7 @@ impl Fixture {
         Ok(())
     }
 
-    // Call only after all fixture/test metadata and allocator scratch exist.
+    // Call only after the fixture metadata exists; compaction itself stays cold.
     fn release_holes(&mut self) {
         let base = self.base.unwrap();
         for index in (1..BACKING).step_by(2) {
@@ -244,6 +260,7 @@ impl Fixture {
             start,
             end: start + BACKING * MMArch::PAGE_SIZE,
             order: ORDER,
+            start_at: None,
             limits: Limits::default(),
         }
     }
@@ -358,23 +375,16 @@ fn stats_bounded(stats: &crate::mm::compaction::Stats, limits: &Limits) -> bool 
         && stats.moved <= stats.migrations
 }
 
-fn prepared_compactor() -> Result<Compactor, SystemError> {
-    let mut compactor = Compactor::new();
-    compactor.prepare(ORDER).map_err(|_| SystemError::ENOMEM)?;
-    Ok(compactor)
-}
-
 fn real_fragmented_capture() -> Result<bool, SystemError> {
     let mut fixture = Fixture::new(false, false)?;
-    let mut compactor = prepared_compactor()?;
+    let mut compactor = Compactor::new();
     let request = fixture.request();
-    let mut evidence = IsolationScratch::try_new(ORDER + 1).map_err(|_| SystemError::ENOMEM)?;
     let mut entries = request.limits.entries;
     fixture.release_holes();
     // Measure actual eligible free ownership in the entire 2N domain, not
     // guest-wide counters or merely the number of free calls made by setup.
-    let domain = Isolation::begin(request.start, ORDER + 1, &mut evidence, &mut entries)
-        .map_err(|_| SystemError::EBUSY)?;
+    let domain =
+        Isolation::begin(request.start, ORDER + 1, &mut entries).map_err(|_| SystemError::EBUSY)?;
     let enough_free = domain.free_pages() == TARGET;
     drop(domain);
     entries = request.limits.entries;
@@ -420,7 +430,7 @@ fn real_fragmented_capture() -> Result<bool, SystemError> {
 
 fn partial_failure(pin: bool) -> Result<bool, SystemError> {
     let mut fixture = Fixture::new(false, false)?;
-    let mut compactor = prepared_compactor()?;
+    let mut compactor = Compactor::new();
     let mut request = fixture.request();
     request.limits.targets = 1;
     request.limits.no_progress = 1;
@@ -460,7 +470,7 @@ fn partial_failure(pin: bool) -> Result<bool, SystemError> {
 
 fn blocked_unknown() -> Result<bool, SystemError> {
     let mut fixture = Fixture::new(false, true)?;
-    let mut compactor = prepared_compactor()?;
+    let mut compactor = Compactor::new();
     let mut request = fixture.request();
     request.limits.targets = 1;
     request.limits.no_progress = 1;
@@ -475,7 +485,7 @@ fn blocked_unknown() -> Result<bool, SystemError> {
 
 fn rmap_limit() -> Result<bool, SystemError> {
     let mut fixture = Fixture::new(true, false)?;
-    let mut compactor = prepared_compactor()?;
+    let mut compactor = Compactor::new();
     let mut request = fixture.request();
     request.limits.targets = 1;
     request.limits.rmaps = 1;
@@ -489,32 +499,99 @@ fn rmap_limit() -> Result<bool, SystemError> {
     Ok(fixture.finish(passed))
 }
 
-fn deferred_allocation_fastpath() -> Result<bool, SystemError> {
+fn deferred_allocation_fastpath() -> Result<(bool, alloc::string::String), SystemError> {
     let mut fixture = Fixture::new(false, true)?;
-    let mut compactor = prepared_compactor()?;
+    let mut compactor = Compactor::new();
     let mut request = fixture.request();
     request.limits.targets = 1;
     request.limits.no_progress = 1;
     fixture.release_holes();
     let first = compactor.allocate(request);
     if !matches!(first.outcome, Err(Stop::Blocked)) || first.stats.moved != 0 {
-        return Ok(false);
+        let passed = fixture.finish(false);
+        return Ok((
+            passed,
+            alloc::format!(
+                "phase=first stop={:?} stats={:?}",
+                first.outcome.as_ref().err(),
+                first.stats
+            ),
+        ));
     }
+    // A different candidate in the same domain must retain deferral. The
+    // second half is genuinely migratable; resetting on seed would move it.
+    request.start_at = Some(request.start + TARGET * MMArch::PAGE_SIZE);
     let deferred = compactor.allocate(request);
-    let deferred_ok = matches!(deferred.outcome, Err(Stop::Deferred)) && deferred.stats.moved == 0;
+    let deferred_ok = matches!(deferred.outcome, Err(Stop::Deferred))
+        && deferred.stats.targets == 0
+        && deferred.stats.moved == 0;
+    // munmap/split metadata is allowed to allocate. Protect existing holes
+    // during that operation, and collect the retiring pages through the real
+    // Buddy quarantine, instead of assuming free calls establish ownership.
+    let mut entries = request.limits.entries;
+    let mut retirement =
+        Isolation::begin(request.start, ORDER, &mut entries).map_err(|_| SystemError::EBUSY)?;
     if !fixture.retire_first_target() {
-        return Ok(false);
+        drop(retirement);
+        let passed = fixture.finish(false);
+        return Ok((
+            passed,
+            alloc::format!(
+                "phase=retire first={:?}/{:?} deferred={:?}/{:?}",
+                first.outcome.as_ref().err(),
+                first.stats,
+                deferred.outcome.as_ref().err(),
+                deferred.stats
+            ),
+        ));
     }
+    let retired_free = retirement.free_pages();
+    let Some(ready_run) = retirement.capture() else {
+        drop(retirement);
+        let passed = fixture.finish(false);
+        return Ok((
+            passed,
+            alloc::format!("phase=capture retired_free={retired_free}"),
+        ));
+    };
+    let complete =
+        retired_free == TARGET && ready_run.start() == request.start && ready_run.pages() == TARGET;
+    drop(retirement);
+    drop(ready_run);
     let ready = compactor.allocate(request);
-    let passed =
-        deferred_ok && ready.outcome.is_ok() && ready.stats.migrations == 0 && fixture.valid();
+    // The freed first target differs from the second-half seed: ordinary
+    // allocation must still search the whole original domain before defer.
+    let valid = fixture.valid();
+    let passed = deferred_ok
+        && complete
+        && ready
+            .outcome
+            .as_ref()
+            .is_ok_and(|run| run.start() == request.start)
+        && ready.stats.migrations == 0
+        && valid;
+    // Capture scalars only. Formatting occurs after all fixture owners retire,
+    // so diagnostics cannot allocate from the holes under investigation.
+    let ready_stop = ready.outcome.as_ref().err().copied();
+    let ready_start = ready.outcome.as_ref().ok().map(|run| run.start());
+    let ready_stats = ready.stats;
+    let expected_start = request.start;
     drop(ready);
-    Ok(fixture.finish(passed))
+    let account = fixture.account.clone();
+    let passed = fixture.finish(passed);
+    let released = account.current_pages() == 0;
+    let detail = alloc::format!(
+        "phase=complete first={:?}/{:?} deferred={:?}/{:?} ready={:?}/{:?} run={:?} expected={:?} retired_free={} valid={} released={}",
+        first.outcome.as_ref().err(), first.stats,
+        deferred.outcome.as_ref().err(), deferred.stats,
+        ready_stop, ready_stats, ready_start, expected_start, retired_free, valid, released,
+    );
+    Ok((passed, detail))
 }
 
 fn small_budget() -> Result<bool, SystemError> {
     let mut fixture = Fixture::new(false, false)?;
-    let mut compactor = prepared_compactor()?;
+    let mut compactor = Compactor::new();
     let mut request = fixture.request();
     request.limits.entries = 1;
     fixture.release_holes();
@@ -532,15 +609,14 @@ fn small_budget() -> Result<bool, SystemError> {
 
 fn isolation_allocation_free_window() -> Result<bool, SystemError> {
     let mut fixture = Fixture::new(false, false)?;
-    let mut scratch = IsolationScratch::try_new(ORDER).map_err(|_| SystemError::ENOMEM)?;
     let request = fixture.request();
     let mut entries = request.limits.entries;
     fixture.release_holes();
-    let mut lease = Isolation::begin(request.start, ORDER, &mut scratch, &mut entries)
-        .map_err(|_| SystemError::EBUSY)?;
+    let mut lease =
+        Isolation::begin(request.start, ORDER, &mut entries).map_err(|_| SystemError::EBUSY)?;
     let initial_free = lease.free_pages();
     let second_busy = matches!(
-        Isolation::begin(request.start, ORDER, &mut scratch, &mut entries),
+        Isolation::begin(request.start, ORDER, &mut entries),
         Err(Stop::Busy)
     );
     let allocated = unsafe { LockedFrameAllocator.allocate_one() }.ok_or(SystemError::ENOMEM)?;
@@ -575,6 +651,7 @@ fn atomic_rejected() -> bool {
         start: PhysAddr::new(0),
         end: PhysAddr::new(32 * MMArch::PAGE_SIZE),
         order: ORDER,
+        start_at: None,
         limits: Limits::default(),
     };
     let irq = unsafe { CurrentIrqArch::save_and_disable_irq() };
@@ -587,8 +664,287 @@ fn atomic_rejected() -> bool {
         && attempt.stats.migrations == 0
 }
 
+fn invalid_seeds() -> bool {
+    let mut compactor = Compactor::new();
+    let start = PhysAddr::new(TARGET * MMArch::PAGE_SIZE);
+    let end = start + BACKING * MMArch::PAGE_SIZE;
+    // Below domain, at its exclusive end, unaligned, and a page-aligned seed
+    // whose order alignment would leave no complete target inside the domain.
+    [
+        start - MMArch::PAGE_SIZE,
+        end,
+        start + 1,
+        end - MMArch::PAGE_SIZE,
+    ]
+    .into_iter()
+    .all(|seed| {
+        let attempt = compactor.allocate(Request {
+            start,
+            end,
+            order: ORDER,
+            start_at: Some(seed),
+            limits: Limits::default(),
+        });
+        matches!(attempt.outcome, Err(Stop::Invalid))
+            && attempt.stats.targets == 0
+            && attempt.stats.entries == 0
+            && attempt.stats.pages == 0
+            && attempt.stats.migrations == 0
+    })
+}
+
+// Cold-call metadata ownership only: the tail deliberately remains raw.
+// Real Page/PTE/charge migration is covered by the independent cases above.
+fn cold_workspace_outside_target() -> Result<(bool, alloc::string::String), SystemError> {
+    const COLD_ORDER: usize = 9;
+    const COLD_PAGES: usize = 1 << COLD_ORDER;
+    const HEAD_PAGES: usize = 4;
+    let (base, count) = unsafe {
+        LockedFrameAllocator
+            .allocate_below(PageFrameCount::new(COLD_PAGES), PhysAddr::new(usize::MAX))
+    }
+    .ok_or(SystemError::ENOMEM)?;
+    let mut tail = RawFrameExtent {
+        next: base,
+        remaining: count.data(),
+    };
+    if count.data() != COLD_PAGES {
+        return Err(SystemError::EIO);
+    }
+    tail.next = base + HEAD_PAGES * MMArch::PAGE_SIZE;
+    tail.remaining -= HEAD_PAGES;
+    unsafe { LockedFrameAllocator.free(base, PageFrameCount::new(HEAD_PAGES)) };
+    let mut entries = 65_536;
+    let before =
+        Isolation::begin(base, COLD_ORDER, &mut entries).map_err(|_| SystemError::EBUSY)?;
+    let before_free = before.free_pages();
+    drop(before);
+    let request = Request {
+        start: base,
+        end: base + COLD_PAGES * MMArch::PAGE_SIZE,
+        order: COLD_ORDER,
+        start_at: None,
+        limits: Limits {
+            targets: 1,
+            no_progress: 1,
+            ..Limits::default()
+        },
+    };
+    let (stop, stats, reached, cold_free, mut retirement, initial_capture) = {
+        // Both measurement and production isolation are allocation-free. This
+        // production owner is genuinely cold, with no prepared workspace.
+        let mut cold = Compactor::new();
+        let attempt = cold.allocate(request);
+        let stop = attempt.outcome.as_ref().err().copied();
+        let stats = attempt.stats;
+        // The raw tail is a real blocker. A working cold API must reach it with
+        // bounded work rather than fail to allocate its own metadata.
+        let reached = matches!(attempt.outcome, Err(Stop::Blocked))
+            && stats.targets == 1
+            && stats.moved == 0
+            && stats_bounded(&stats, &request.limits);
+        drop(attempt);
+        entries = 65_536;
+        let mut retirement =
+            Isolation::begin(base, COLD_ORDER, &mut entries).map_err(|_| SystemError::EBUSY)?;
+        let cold_free = retirement.free_pages();
+        // Protect all free target pages while the raw tail is returned; ordinary
+        // Buddy metadata cannot consume the ownership being measured.
+        drop(tail);
+        let initial_capture = retirement.capture();
+        (stop, stats, reached, cold_free, retirement, initial_capture)
+    }; // The old workspace owner retired here; new Compactors own no frames.
+    let captured_while_cold = initial_capture.is_some();
+    // A second capture after retiring the cold owner is cleanup evidence only,
+    // never a passing substitute for capturing while it was still alive.
+    let cleanup_run = initial_capture.or_else(|| retirement.capture());
+    let cleaned = cleanup_run
+        .as_ref()
+        .is_some_and(|run| run.start() == base && run.pages() == COLD_PAGES);
+    drop(retirement);
+    drop(cleanup_run);
+    let passed = before_free == HEAD_PAGES
+        && cold_free == HEAD_PAGES
+        && reached
+        && captured_while_cold
+        && cleaned;
+    Ok((passed, alloc::format!(
+        "before_free={before_free} cold_free={cold_free} capture_while_cold={captured_while_cold} cleanup={cleaned} stop={stop:?} stats={stats:?}"
+    )))
+}
+
+// The consumer still requests the entire inclusive DMA mask. These owners
+// create real pressure in that domain; they do not change allocator policy.
+const DMA_PREFIX_BYTES: usize = 64 * 1024 * 1024;
+const DMA_PREFIX_PAGES: usize = DMA_PREFIX_BYTES / MMArch::PAGE_SIZE;
+// Sixteen real holes leave eight pages of ordinary allocator headroom for
+// recovery metadata/destinations while every eight-page run remains split by
+// managed source pages. No recovery owner is prewarmed by this fixture.
+const DMA_REQUEST_PAGES: usize = TARGET / 2;
+
+struct PrefixReservations {
+    runs: Vec<(PhysAddr, PageFrameCount)>,
+    pages: usize,
+}
+
+impl PrefixReservations {
+    fn new() -> Result<Self, SystemError> {
+        let mut runs = Vec::new();
+        // Reserve before consuming any low memory, including the worst case
+        // in which every remaining eligible frame is a separate owner.
+        runs.try_reserve_exact(DMA_PREFIX_PAGES)
+            .map_err(|_| SystemError::ENOMEM)?;
+        Ok(Self { runs, pages: 0 })
+    }
+
+    fn hold_remaining(&mut self) -> Result<(), SystemError> {
+        let max = PhysAddr::new(DMA_PREFIX_BYTES - 1);
+        for order in (0..=14).rev() {
+            let count = PageFrameCount::new(1 << order);
+            loop {
+                if self.runs.len() == self.runs.capacity() {
+                    return Err(SystemError::ENOMEM);
+                }
+                let Some((base, actual)) =
+                    (unsafe { LockedFrameAllocator.allocate_below(count, max) })
+                else {
+                    break;
+                };
+                self.runs.push((base, actual));
+                self.pages += actual.data();
+                if actual != count
+                    || self.pages > DMA_PREFIX_PAGES
+                    || base.data() + actual.data() * MMArch::PAGE_SIZE > DMA_PREFIX_BYTES
+                {
+                    return Err(SystemError::EIO);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for PrefixReservations {
+    fn drop(&mut self) {
+        for (base, count) in self.runs.drain(..).rev() {
+            unsafe { LockedFrameAllocator.free(base, count) };
+        }
+    }
+}
+
+// baseline, atomic exclusion, NOIO exclusion, recovery/ownership respectively.
+fn dma_automatic_recovery() -> Result<(bool, bool, bool, bool), SystemError> {
+    // Do not run this controlled-domain pressure on a nearly exhausted guest.
+    // Even the maximal prefix reservation must leave at least 64 MiB free.
+    if unsafe { LockedFrameAllocator.usage() }.free().data() < 2 * DMA_PREFIX_PAGES {
+        return Err(SystemError::ENOMEM);
+    }
+    let mut prefix = PrefixReservations::new()?;
+    let mut fixture = Fixture::with_range(
+        false,
+        false,
+        Some((
+            PhysAddr::new(32 * 1024 * 1024),
+            PhysAddr::new(DMA_PREFIX_BYTES),
+        )),
+    )?;
+    prefix.hold_remaining()?;
+    if unsafe { LockedFrameAllocator.usage() }.free().data() < DMA_PREFIX_PAGES {
+        return Err(SystemError::ENOMEM);
+    }
+    fixture.release_holes();
+    let mut entries = 65_536;
+    let domain = Isolation::begin(fixture.base.unwrap(), ORDER + 1, &mut entries)
+        .map_err(|_| SystemError::EBUSY)?;
+    let enough = domain.free_pages() == TARGET;
+    drop(domain);
+    let ordinary = DmaAllocOptions {
+        dma_mask: Some((DMA_PREFIX_BYTES - 1) as u64),
+        use_pool: false,
+        ..DmaAllocOptions::default()
+    };
+    let original_identities = || {
+        fixture
+            .sources
+            .iter()
+            .all(|source| source.weak.upgrade().is_some())
+    };
+    let baseline = enough
+        && matches!(
+            DmaBuffer::try_alloc_pages(DMA_REQUEST_PAGES, ordinary),
+            Err(SystemError::ENOMEM)
+        )
+        && original_identities()
+        && fixture.valid();
+    if !baseline {
+        return Ok((false, false, false, false));
+    }
+    let allowed = DmaAllocOptions {
+        compaction: DmaCompaction::Allowed,
+        ..ordinary
+    };
+    let irq = unsafe { CurrentIrqArch::save_and_disable_irq() };
+    let atomic_result = DmaBuffer::try_alloc_pages(DMA_REQUEST_PAGES, allowed);
+    drop(irq);
+    let atomic = matches!(atomic_result, Err(SystemError::ENOMEM))
+        && original_identities()
+        && fixture.valid();
+    let scope = crate::cgroup::memory::io::MemoryIoScope::enter_noio();
+    let noio_result = DmaBuffer::try_alloc_pages(DMA_REQUEST_PAGES, allowed);
+    drop(scope);
+    let noio =
+        matches!(noio_result, Err(SystemError::ENOMEM)) && original_identities() && fixture.valid();
+
+    // Each production attempt examines a bounded registry window and at most
+    // one candidate. Repeated callers advance its real cursor/defer state;
+    // there is no fixture seed or forced allocation failure.
+    let mut recovered = None;
+    for _ in 0..512 {
+        match DmaBuffer::try_alloc_pages(DMA_REQUEST_PAGES, allowed) {
+            Ok(buffer) => {
+                recovered = Some(buffer);
+                break;
+            }
+            Err(SystemError::ENOMEM) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    let Some(mut buffer) = recovered else {
+        return Ok((baseline, atomic, noio, false));
+    };
+    let start = PhysAddr::new(buffer.paddr());
+    let end = start + buffer.page_count().data() * MMArch::PAGE_SIZE;
+    let mut moved = 0;
+    let mut checked = buffer.page_count().data() == DMA_REQUEST_PAGES
+        && buffer.len() == DMA_REQUEST_PAGES * MMArch::PAGE_SIZE
+        && start
+            .data()
+            .is_multiple_of(DMA_REQUEST_PAGES * MMArch::PAGE_SIZE)
+        && end.data() <= DMA_PREFIX_BYTES
+        && buffer.as_slice().iter().all(|byte| *byte == 0)
+        && fixture.valid();
+    for source in &fixture.sources {
+        if (start..end).contains(&source.physical) {
+            moved += 1;
+            let index = (source.address.data() - fixture.address.data()) / MMArch::PAGE_SIZE;
+            checked &= source.weak.upgrade().is_none()
+                && fixture
+                    .source_page(index)
+                    .is_some_and(|page| !(start..end).contains(&page.phys_address()));
+        }
+    }
+    checked &= moved != 0;
+    buffer.as_mut_slice().fill(0xa7);
+    checked &= buffer.as_slice().iter().all(|byte| *byte == 0xa7) && fixture.valid();
+    drop(buffer);
+    let passed = fixture.finish(checked);
+    drop(prefix);
+    Ok((baseline, atomic, noio, passed))
+}
+
 pub(crate) fn report() -> alloc::string::String {
     let _serial = TEST_LOCK.lock();
+    let mut deferred_detail = alloc::string::String::new();
     let mut checks = alloc::vec![
         (
             "real_fragmented_capture",
@@ -606,7 +962,16 @@ pub(crate) fn report() -> alloc::string::String {
         ("rmap_budget", rmap_limit().unwrap_or(false)),
         (
             "deferred_free_fastpath",
-            deferred_allocation_fastpath().unwrap_or(false),
+            match deferred_allocation_fastpath() {
+                Ok((passed, detail)) => {
+                    deferred_detail = detail;
+                    passed
+                }
+                Err(error) => {
+                    deferred_detail = alloc::format!("phase=setup error={error:?}");
+                    false
+                }
+            },
         ),
         ("scan_budget_no_mutation", small_budget().unwrap_or(false)),
         (
@@ -614,17 +979,33 @@ pub(crate) fn report() -> alloc::string::String {
             isolation_allocation_free_window().unwrap_or(false),
         ),
         ("atomic_rejected", atomic_rejected()),
+        ("seed_boundaries_no_mutation", invalid_seeds()),
         (
             "repeated_capture",
             real_fragmented_capture().unwrap_or(false),
         ),
     ];
+    let (cold_workspace, cold_detail) = match cold_workspace_outside_target() {
+        Ok(result) => result,
+        Err(error) => (false, alloc::format!("setup_error={error:?}")),
+    };
+    checks.push(("cold_workspace_outside_target", cold_workspace));
+    let (baseline, atomic, noio, recovered) =
+        dma_automatic_recovery().unwrap_or((false, false, false, false));
+    checks.extend([
+        ("dma_same_mask_fragmentation", baseline),
+        ("dma_atomic_no_recovery", atomic),
+        ("dma_noio_no_recovery", noio),
+        ("dma_automatic_recovery", recovered),
+    ]);
     checks.extend(crate::mm::allocator::buddy::compaction::selftest_checks());
     let failed = checks.iter().filter(|(_, passed)| !passed).count();
     let mut output = alloc::format!("status={}\n", if failed == 0 { "ok" } else { "fail" });
     for (name, passed) in checks {
         let _ = writeln!(output, "{name}={}", if passed { "ok" } else { "fail" });
     }
+    let _ = writeln!(output, "deferred_free_detail={deferred_detail}");
+    let _ = writeln!(output, "cold_workspace_detail={cold_detail}");
     let _ = writeln!(output, "summary_fail={failed}");
     output
 }

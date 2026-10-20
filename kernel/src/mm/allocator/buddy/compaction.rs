@@ -4,6 +4,10 @@
 
 use super::{BuddyAllocator, BuddyZone, PageList, MAX_ORDER, MIN_ORDER};
 use crate::mm::{MemoryManagementArch, PhysAddr};
+#[cfg(all(
+    feature = "mm_selftest",
+    any(target_arch = "x86_64", target_arch = "riscv64")
+))]
 use alloc::vec::Vec;
 
 pub(crate) const MAX_COMPACT_ORDER: usize = 9;
@@ -14,31 +18,6 @@ pub(crate) enum RangeError {
     Invalid,
     Busy,
     Budget,
-    NoMemory,
-}
-
-struct FreeBlock {
-    base: PhysAddr,
-    order: u8,
-    metadata: PhysAddr,
-    index: usize,
-}
-
-/// Scratch allocation is fallible and must precede acquiring the buddy lock.
-pub(crate) struct IsolationScratch {
-    order: usize,
-    blocks: Vec<FreeBlock>,
-}
-
-impl IsolationScratch {
-    pub(crate) fn try_new(order: usize) -> Result<Self, RangeError> {
-        let pages = request_pages(order)?;
-        let mut blocks = Vec::new();
-        blocks
-            .try_reserve_exact(pages)
-            .map_err(|_| RangeError::NoMemory)?;
-        Ok(Self { order, blocks })
-    }
 }
 
 /// A non-cloneable identity, not an independently releasable copy of a range.
@@ -186,19 +165,17 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
         Ok(None)
     }
 
-    /// Discover without side effects, then remove all intersecting blocks.
-    /// No insertion may occur between discovery and the final removal: slot
-    /// stability relies on head-to-tail pages and descending entry indices.
+    /// Validate and prepay a read-only scan, then remove intersecting blocks
+    /// in a second pass under the same buddy lock. No allocation is needed.
     pub(crate) fn begin_isolation(
         &mut self,
         start: PhysAddr,
         order: usize,
-        scratch: &mut IsolationScratch,
         remaining_scan: &mut usize,
     ) -> Result<IsolationKey, RangeError> {
         let pages = request_pages(order)?;
         let end = checked_end(start, pages)?;
-        if !start.check_aligned(pages << MIN_ORDER) || scratch.order < order {
+        if !start.check_aligned(pages << MIN_ORDER) {
             return Err(RangeError::Invalid);
         }
         let zone = Self::zone_for(start, MIN_ORDER + order);
@@ -209,7 +186,9 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
             .next_isolation_id
             .checked_add(1)
             .ok_or(RangeError::Invalid)?;
-        scratch.blocks.clear();
+        let before_scan = *remaining_scan;
+        let mut blocks = 0;
+        let mut containing = None;
         for current in MIN_ORDER..MAX_ORDER {
             charge(remaining_scan, 1)?;
             let mut metadata = self.free_area(zone, current as u8);
@@ -224,26 +203,33 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
                         .checked_add(1 << current)
                         .ok_or(RangeError::Invalid)?;
                     if base.data() < end && block_end > start.data() {
-                        if scratch.blocks.len() == pages {
+                        if blocks == pages {
                             return Err(RangeError::Invalid);
                         }
-                        scratch.blocks.push(FreeBlock {
-                            base,
-                            order: current as u8,
-                            metadata,
-                            index,
-                        });
+                        blocks += 1;
+                        // Aligned power-of-two intervals are either disjoint
+                        // or nested. A larger free block contains the entire
+                        // target, and disjoint free blocks permit at most one.
+                        if current > MIN_ORDER + order {
+                            if containing.is_some() || base > start || block_end < end {
+                                return Err(RangeError::Invalid);
+                            }
+                            containing = Some((base, current));
+                        }
                     }
                 }
                 metadata = list.next_page;
             }
         }
-        let splits = scratch
-            .blocks
-            .iter()
-            .map(|block| (block.order as usize).saturating_sub(MIN_ORDER + order))
-            .sum::<usize>();
-        charge(remaining_scan, scratch.blocks.len() + splits)?;
+        let scan_cost = before_scan - *remaining_scan;
+        let splits = containing.map_or(0, |(_, current)| current - (MIN_ORDER + order));
+        // Pay for every visit and mutation before changing any ownership.
+        // Removal can shorten metadata chains, never add another scan entry.
+        let commit_cost = scan_cost
+            .checked_add(blocks)
+            .and_then(|cost| cost.checked_add(splits))
+            .ok_or(RangeError::Invalid)?;
+        charge(remaining_scan, commit_cost)?;
         let mut state = IsolationState {
             id: self.next_isolation_id,
             start,
@@ -251,30 +237,38 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
             free: [0; BITMAP_WORDS],
             free_pages: 0,
         };
-        // With page/index order above, a head-last replacement is never a
-        // future selected entry: earlier pages and higher indices are done.
-        for block in &scratch.blocks {
-            let removed = self.remove_entry(zone, block.order, block.metadata, block.index);
-            assert_eq!(removed, block.base, "isolation discovery slot changed");
-            let first = start.data().max(block.base.data());
-            let last = end.min(block.base.data() + (1 << block.order));
-            state.mark_free(PhysAddr::new(first), (last - first) >> MIN_ORDER);
+        // No insertion is allowed until every target block is removed. A
+        // head-last replacement comes from an already scanned position and
+        // is therefore outside the target. Descending indices stay valid.
+        for current in MIN_ORDER..MAX_ORDER {
+            let mut metadata = self.free_area(zone, current as u8);
+            while !metadata.is_null() {
+                let list: PageList<A> = Self::read_page(metadata);
+                // remove_entry may recycle this page into the empty chain.
+                // Keep its original successor before that overwrites next.
+                let next = list.next_page;
+                for index in (0..list.entry_num).rev() {
+                    let base: PhysAddr = unsafe { A::read(Self::entry_virt_addr(metadata, index)) };
+                    // Every original block, including replacement donors,
+                    // was checked in the read-only pass under this same lock.
+                    let block_end = base.data() + (1 << current);
+                    if base.data() < end && block_end > start.data() {
+                        let removed = self.remove_entry(zone, current as u8, metadata, index);
+                        assert_eq!(removed, base, "isolation removal slot changed");
+                        let first = start.data().max(base.data());
+                        let last = end.min(block_end);
+                        state.mark_free(PhysAddr::new(first), (last - first) >> MIN_ORDER);
+                    }
+                }
+                metadata = next;
+            }
         }
         self.next_isolation_id = next_id;
         self.isolation = Some(state);
-        // The target is now absent from every list, including the metadata
-        // allocator's source lists. Only outside siblings may be inserted.
-        for block in &scratch.blocks {
-            if block.order as usize > MIN_ORDER + order {
-                unsafe {
-                    self.return_outside_halves(
-                        block.base,
-                        block.order as usize,
-                        start,
-                        MIN_ORDER + order,
-                    )
-                };
-            }
+        // Only after the target is absent from every list can insertion's
+        // metadata allocator safely consume free outside siblings.
+        if let Some((base, current)) = containing {
+            unsafe { self.return_outside_halves(base, current, start, MIN_ORDER + order) };
         }
         Ok(IsolationKey {
             id: next_id - 1,

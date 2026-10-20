@@ -36,6 +36,8 @@ const DMA32_FALLBACK_RESERVE_PAGES: usize = (16 * 1024 * 1024) >> MIN_ORDER;
 const DMA32_ALLOCATION_METADATA_HEADROOM: usize = MAX_ORDER - MIN_ORDER;
 
 pub(crate) mod compaction;
+mod recovery;
+pub(crate) use recovery::{DmaAllocationFailure, DmaRecoveryZone};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BuddyZone {
@@ -52,8 +54,8 @@ impl BuddyZone {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-enum AllocationFailure {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AllocationFailure {
     Capacity,
     Fragmentation,
     ZoneLimit,
@@ -641,7 +643,26 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
     ///
     /// 返回分配的页面的物理地址和页面数
     fn buddy_alloc(&mut self, count: PageFrameCount) -> Option<(PhysAddr, PageFrameCount)> {
-        let order = self.record_request(count)?;
+        self.buddy_alloc_result(count).ok()
+    }
+
+    /// Whether an unrestricted allocation may consume low memory. A run
+    /// already held outside the free lists passes zero at final handoff.
+    pub(crate) fn dma32_fallback_allowed(&self, needed: usize) -> bool {
+        !self.has_normal_memory
+            || self.dma32_free_pages
+                >= needed
+                    .saturating_add(DMA32_FALLBACK_RESERVE_PAGES)
+                    .saturating_add(DMA32_ALLOCATION_METADATA_HEADROOM)
+    }
+
+    fn buddy_alloc_result(
+        &mut self,
+        count: PageFrameCount,
+    ) -> Result<(PhysAddr, PageFrameCount), AllocationFailure> {
+        let order = self
+            .record_request(count)
+            .ok_or(AllocationFailure::InvalidOrder)?;
 
         // debug!("buddy_alloc: order = {}", order);
         // 获取该阶数的一个空闲页面
@@ -651,12 +672,7 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
         } else {
             None
         };
-        let dma32_fallback_allowed = !self.has_normal_memory
-            || self.dma32_free_pages
-                >= count
-                    .data()
-                    .saturating_add(DMA32_FALLBACK_RESERVE_PAGES)
-                    .saturating_add(DMA32_ALLOCATION_METADATA_HEADROOM);
+        let dma32_fallback_allowed = self.dma32_fallback_allowed(count.data());
         let free_addr = normal.or_else(|| {
             dma32_fallback_allowed
                 .then(|| self.try_zone(BuddyZone::Dma32, order))
@@ -673,14 +689,17 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
                 AllocationFailure::Fragmentation
             };
             self.record_failure(Some(order), reason);
+            return Err(reason);
         }
         // debug!(
         //     "buddy_alloc: order = {}, free_addr = {:?}",
         //     order,
         //     free_addr
         // );
-        return free_addr
-            .map(|addr| (addr, PageFrameCount::new(1 << (order as usize - MIN_ORDER))));
+        Ok((
+            free_addr.unwrap(),
+            PageFrameCount::new(1 << (order as usize - MIN_ORDER)),
+        ))
     }
 
     /// Allocate from a free block whose returned range fits below a physical
@@ -692,10 +711,20 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
         count: PageFrameCount,
         max_phys_addr: PhysAddr,
     ) -> Option<(PhysAddr, PageFrameCount)> {
+        self.buddy_alloc_below_result(count, max_phys_addr).ok()
+    }
+
+    fn buddy_alloc_below_result(
+        &mut self,
+        count: PageFrameCount,
+        max_phys_addr: PhysAddr,
+    ) -> Result<(PhysAddr, PageFrameCount), AllocationFailure> {
         if max_phys_addr.data() == usize::MAX {
-            return self.buddy_alloc(count);
+            return self.buddy_alloc_result(count);
         }
-        let requested_order = self.record_request(count)?;
+        let requested_order = self
+            .record_request(count)
+            .ok_or(AllocationFailure::InvalidOrder)?;
         let requested_bytes = count.data() * A::PAGE_SIZE;
         if max_phys_addr.data() == DMA32_LIMIT {
             let result = self.try_zone(BuddyZone::Dma32, requested_order);
@@ -708,8 +737,9 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
                     AllocationFailure::Fragmentation
                 };
                 self.record_failure(Some(requested_order), reason);
+                return Err(reason);
             }
-            return result.map(|base| (base, count));
+            return Ok((result.unwrap(), count));
         }
 
         let zones: &[BuddyZone] = if max_phys_addr.data() < DMA32_LIMIT {
@@ -750,7 +780,7 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
                                 )
                             };
                         }
-                        return Some((base, count));
+                        return Ok((base, count));
                     }
                     if list.next_page.is_null() {
                         break;
@@ -769,7 +799,7 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
             AllocationFailure::AddressLimit
         };
         self.record_failure(Some(requested_order), reason);
-        None
+        Err(reason)
     }
 
     /// 释放一个块
@@ -1162,6 +1192,9 @@ pub(crate) fn deterministic_buddy_selftest() -> (bool, bool, bool, bool, bool) {
         selection_ok && reserve_ok && restriction_diagnostics_ok
     };
 
+    let typed_dma_ok =
+        recovery::typed_allocation_selftest(|| unsafe { empty_isolated_allocator(backing) });
+
     let metadata_reuse_ok = {
         let mut allocator = unsafe { empty_isolated_allocator(backing) };
         let list_pages = [
@@ -1234,7 +1267,7 @@ pub(crate) fn deterministic_buddy_selftest() -> (bool, bool, bool, bool, bool) {
         bounded_selection_ok,
         split_merge_ok,
         fragmented_ok,
-        dma32_zone_ok,
+        dma32_zone_ok && typed_dma_ok,
         metadata_reuse_ok,
     )
 }

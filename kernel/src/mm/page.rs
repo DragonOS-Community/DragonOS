@@ -610,6 +610,69 @@ fn prepare_lru_capacity() -> Result<Option<PreparedPageLruCapacity>, SystemError
     }
 }
 
+/// Bounded candidate discovery for the explicit DMA recovery service.
+/// Only physical identities leave this short registry/Page observation; a
+/// later migration must obtain its own single source Arc and revalidate it.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn compaction_candidates(
+    cursor: &mut usize,
+    min: PhysAddr,
+    max: PhysAddr,
+) -> Result<[Option<PhysAddr>; 8], SystemError> {
+    let mut manager = try_page_manager_lock().ok_or(SystemError::EAGAIN_OR_EWOULDBLOCK)?;
+    let table = manager.phys2page.raw_table();
+    let buckets = table.buckets();
+    let mut found = [None; 8];
+    if buckets == 0 {
+        *cursor = 0;
+        return Ok(found);
+    }
+    *cursor %= buckets;
+    let mut count = 0;
+    for _ in 0..buckets.min(256) {
+        let index = *cursor;
+        *cursor = (index + 1) % buckets;
+        // The registry mutex keeps both occupancy and the borrowed bucket
+        // stable. No raw pointer or table borrow is retained after it drops.
+        let (physical, page) = unsafe {
+            if !table.is_bucket_full(index) {
+                continue;
+            }
+            table.bucket(index).as_ref()
+        };
+        // Off-domain pages must not consume the eight returned identities.
+        if *physical < min || *physical > max {
+            continue;
+        }
+        let Some(data) = page.try_read() else {
+            continue;
+        };
+        if page.contiguous_owner.is_some()
+            || !data.individually_owns_frame
+            || data.backing_lifetime_pins != 0
+            || data.intrinsic_unevictable
+            || data.flags.intersects(
+                PageFlags::PG_RESERVED
+                    | PageFlags::PG_SLAB
+                    | PageFlags::PG_HEAD
+                    | PageFlags::PG_PRIVATE
+                    | PageFlags::PG_UNEVICTABLE
+                    | PageFlags::PG_WRITEBACK,
+            )
+            || !matches!(data.page_type, PageType::Normal | PageType::File(_))
+            || (data.map_count() == 0 && matches!(data.page_type, PageType::Normal))
+        {
+            continue;
+        }
+        found[count] = Some(*physical);
+        count += 1;
+        if count == found.len() {
+            break;
+        }
+    }
+    Ok(found)
+}
+
 pub struct PageManager {
     phys2page: HashMap<PhysAddr, Arc<Page>>,
 }

@@ -560,7 +560,7 @@ class CommandTransportTests(unittest.TestCase):
         self.vm.console.recv.side_effect = list(logs)
         self.vm.completion.recv.side_effect = control
         events = [event for _ in logs for event in ([self.vm.console], [])] + [
-            [self.vm.completion] for _ in control]
+            [self.vm.completion] for _ in control] + [[]]
         with mock.patch.object(RUN.select, 'select', side_effect=[(e, [], []) for e in events]):
             return self.vm.command('true', **kwargs)
 
@@ -649,6 +649,60 @@ class CommandTransportTests(unittest.TestCase):
                 self.vm.command('true')
         self.vm.completion.recv.assert_not_called()
 
+    def test_completion_first_still_drains_newly_ready_console(self):
+        for logs in ([b'Kernel Panic Occurred', b''],
+                     [b'Kernel Panic Occ', b'urred', b''],
+                     [b'x' * 65536, b'Kernel Panic Occurred', b''], [b'']):
+            with self.subTest(logs=[len(x) for x in logs]):
+                self.vm.command_ready = True
+                self.vm.completion_buffer = b''
+                self.vm.console.recv.side_effect = logs
+                self.vm.completion.recv.return_value = self.token + b':0\n'
+                with mock.patch.object(RUN.select, 'select', side_effect=[
+                        ([self.vm.completion], [], [])] +
+                        [([self.vm.console], [], [])] * len(logs)):
+                    with self.assertRaisesRegex(RuntimeError, 'kernel panic|disconnected'):
+                        self.vm.command('true')
+                self.assert_quarantined()
+
+    def test_completion_first_preserves_newly_ready_logs(self):
+        self.vm.console.recv.side_effect = [b'late log\n']
+        self.vm.completion.recv.return_value = self.token + b':0\n'
+        with mock.patch.object(RUN.select, 'select', side_effect=[
+                ([self.vm.completion], [], []), ([self.vm.console], [], []), ([], [], [])]):
+            self.assertEqual(self.vm.command('true'), 0)
+        self.vm.serial.flush()
+        self.assertEqual((self.vm.directory / 'serial.log').read_bytes(), b'late log\n')
+        self.assertTrue(self.vm.command_ready)
+
+    def test_cancellation_during_completion_drain_is_not_success(self):
+        self.vm.completion_buffer = self.token + b':0\n'
+        def log_then_cancel(size):
+            RUN.CANCELLED.set()
+            return b'last log\n'
+        self.vm.console.recv.side_effect = log_then_cancel
+        with mock.patch.object(RUN.select, 'select', side_effect=[
+                ([self.vm.console], [], []), ([], [], [])]):
+            with self.assertRaises(InterruptedError):
+                self.vm.command('true')
+        self.assert_quarantined()
+
+    def test_completion_drain_budget_is_not_success(self):
+        self.vm.completion_buffer = self.token + b':0\n'
+        with mock.patch.object(RUN.time, 'monotonic', side_effect=[100, 100, 100, 102, 102]), \
+             mock.patch.object(RUN.select, 'select', return_value=([self.vm.console], [], [])):
+            with self.assertRaises(TimeoutError):
+                self.vm.command('true', timeout=1)
+        self.vm.console.recv.assert_not_called()
+        self.assert_quarantined()
+
+    def test_buffered_completion_still_checks_health(self):
+        self.vm.completion_buffer = self.token + b':0\n'
+        self.vm.sampler.failure = 'fixture'
+        with self.assertRaisesRegex(RuntimeError, 'host sampling failed'):
+            self.vm.command('true')
+        self.assert_quarantined()
+
     def test_panic_prefix_survives_command_log_consumption(self):
         self.assertEqual(self.replay([b'Kernel Panic Occ']), 0)
         self.assertEqual(self.vm.buffer, b'')
@@ -687,7 +741,7 @@ class CommandTransportTests(unittest.TestCase):
 
     def test_continuous_logs_cannot_extend_command_deadline(self):
         self.vm.console.recv.return_value = b'ongoing log'
-        with mock.patch.object(RUN.time, 'monotonic', side_effect=[100, 100, 100, 100, 102, 102]), \
+        with mock.patch.object(RUN.time, 'monotonic', side_effect=[100, 100, 100, 100, 100, 102, 102]), \
              mock.patch.object(RUN.select, 'select', side_effect=[
                  ([self.vm.console, self.vm.completion], [], []),
                  ([self.vm.console], [], [])]):
@@ -701,7 +755,8 @@ class CommandTransportTests(unittest.TestCase):
         def wire(command):
             self.vm.console.sendall.reset_mock()
             with mock.patch.object(self.vm, 'receive', side_effect=lambda _: setattr(
-                    self.vm, 'completion_buffer', self.token + b':0\n')):
+                    self.vm, 'completion_buffer', self.token + b':0\n')), \
+                 mock.patch.object(RUN.select, 'select', return_value=([], [], [])):
                 self.vm.command(command)
             return b''.join(c.args[0] for c in self.vm.console.sendall.call_args_list).decode()
         first = wire('MM191_STATE=ready; cd /')

@@ -49,7 +49,8 @@ impl Syscall for SysOpenatHandle {
         let path = vfs_check_and_clone_cstr(path_ptr, Some(MAX_PATHLEN))?
             .into_string()
             .map_err(|_| SystemError::EINVAL)?;
-        let open_flags = FileFlags::from_bits(o_flags).ok_or(SystemError::EINVAL)?;
+        // Linux语义：未定义的flag位被静默忽略而非报EINVAL
+        let open_flags = FileFlags::from_bits_truncate(o_flags);
         let mode_type = InodeMode::from_bits(mode).ok_or(SystemError::EINVAL)?;
         return do_sys_open(dirfd, &path, open_flags, mode_type);
     }

@@ -5,7 +5,7 @@
 # 用法：bash write_disk_image.sh --bios legacy/uefi
 # 如果之前创建的 disk-${ARCH}.img 是MBR分区表，那么请这样运行它：bash write_disk_image.sh --bios legacy
 # 如果之前创建的 disk-${ARCH}.img 是GPT分区表，那么请这样运行它：bash write_disk_image.sh --bios uefi
-# 通过设置ARCH为x86_64/i386/riscv64，进行64/32位uefi的install，但是请记住该处的ARCH应与run-qemu.sh中的一致
+# 通过设置ARCH为x86_64/i386/riscv64，进行64/32位uefi的install，但是请记住该处的ARCH应与run-qemu.sh的一致
 ###############################################
 set -euo pipefail
 
@@ -121,8 +121,45 @@ if [ "${image_exists}" = "1" ]; then
     fi
 fi
 
-# 判断是否存在硬盘镜像文件，如果不存在，就创建一个
-echo "创建硬盘镜像文件..."
+# Base images in the "dragonos-rootfs:" namespace are owned by this repo:
+# tools/docker-rootfs/Dockerfile is their single source of truth.
+#
+# Resolution order:
+#   1. Local tag already present (from a previous build): rebuild it on every
+#      disk-image write (docker layer cache keeps unchanged builds fast) so
+#      Dockerfile edits are always picked up instead of silently reusing a
+#      stale local tag.
+#   2. No local tag: pull the published image from the CNB registry
+#      (built by the CI in .cnb.yml; the artifact is public, no credentials
+#      needed) and retag it to the local name.
+#   3. Pull failed (offline, or the CI has not published yet): fall back to a
+#      local docker build, keeping offline builds working.
+#
+# The registry namespace can be overridden with DRAGONOS_ROOTFS_REGISTRY.
+# Other base images are left to DADK (pull policy).
+base_image="$(awk '/^\[base\]/{in_base=1;next} /^\[/{in_base=0} in_base && /^image[[:space:]]*=/{gsub(/[[:space:]"=]/,"",$0); print substr($0,6); exit}' "${root_folder}/config/rootfs.generated.toml" || true)"
+case "${base_image}" in
+    dragonos-rootfs:*)
+        if ! command -v docker >/dev/null 2>&1; then
+            echo "Error: base image '${base_image}' is built from tools/docker-rootfs/Dockerfile, which requires a working docker CLI/daemon." >&2
+            exit 1
+        fi
+        rootfs_registry="${DRAGONOS_ROOTFS_REGISTRY:-docker.cnb.cool/dragonos-community/dragonos}"
+        if docker image inspect "${base_image}" >/dev/null 2>&1; then
+            echo "Building base image '${base_image}' from tools/docker-rootfs/Dockerfile (layer cache keeps unchanged builds fast)..."
+            docker build -t "${base_image}" "${root_folder}/tools/docker-rootfs" || exit 1
+        else
+            remote_image="${rootfs_registry}/${base_image}"
+            echo "Base image '${base_image}' not found locally, trying to pull '${remote_image}'..."
+            if docker pull "${remote_image}"; then
+                docker tag "${remote_image}" "${base_image}"
+            else
+                echo "Pull failed, falling back to a local build from tools/docker-rootfs/Dockerfile..."
+                docker build -t "${base_image}" "${root_folder}/tools/docker-rootfs" || exit 1
+            fi
+        fi
+        ;;
+esac
 $DADK "${DADK_MANIFEST_ARGS[@]}" -w $root_folder rootfs create --skip-if-exists || exit 1
 
 $DADK "${DADK_MANIFEST_ARGS[@]}" -w $root_folder rootfs mount || exit 1
@@ -270,7 +307,7 @@ import_sysconfig_ext4() {
     # inodes with the numeric owner/group/mode from the tar header instead
     # of inheriting ownership, permissions or link semantics from old
     # inodes. Directories are kept in place; tar only applies their
-    # metadata. Note: tar --unlink-first cannot be used here because it
+    # metadata. Note: tar --unlink-first cannot be used because it
     # would also try to unlink non-empty directories.
     python3 - "${SYSCONFIG_TAR}" "${mount_folder}" <<'PYEOF' || return 1
 import os

@@ -145,8 +145,7 @@ impl Logger {
 
             // to_string 的分配在锁外完成；push 返回的驱逐消息也必须
             // 在 KMSG 锁释放后再 drop，锁内只做无分配的槽位操作。
-            let evicted =
-                unsafe { KMSG.as_ref().unwrap().lock_irqsave().push(log_message) };
+            let evicted = unsafe { KMSG.as_ref().unwrap().lock_irqsave().push(log_message) };
             drop(evicted);
         }
     }

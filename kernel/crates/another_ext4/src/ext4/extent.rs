@@ -2004,7 +2004,11 @@ impl Ext4 {
                 inode_ref.id
             ));
         }
-        let last = ex_node.header().entries_count() as usize - 1;
+        let last = (ex_node.header().entries_count() as usize)
+            .checked_sub(1)
+            .ok_or_else(|| {
+                format_error!(ErrCode::EIO, "empty extent child on inode {}", inode_ref.id)
+            })?;
         if ex_node.header().depth() == 0 {
             // Leaf: return start_lblock + block_count of the last extent
             let ex = ex_node.extent_at(last);
@@ -2968,6 +2972,53 @@ impl Ext4 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cyclic_extent_children_fail_all_tree_walks() {
+        let mut node_data = [0u8; BLOCK_SIZE];
+        let mut node = ExtentNodeMut::from_bytes(&mut node_data);
+        node.init(1, 0);
+        node.insert_extent_index(&ExtentIndex::new(0, 10), 0)
+            .unwrap();
+        let mut blocks = BTreeMap::new();
+        blocks.insert(10, Block::new(10, Box::new(node_data)));
+        let fs = make_test_fs_with_device(Arc::new(PlanBlockDevice {
+            base: StubBlockDevice::with_block_count(100),
+            blocks,
+        }));
+        let mut inode = make_read_inode(BLOCK_SIZE as u64, &[]);
+        let mut root = inode.inode.extent_root_mut();
+        root.init(2, 0);
+        root.insert_extent_index(&ExtentIndex::new(0, 10), 0)
+            .unwrap();
+        assert_eq!(
+            fs.extent_next_data_lblock(&inode).unwrap_err().code(),
+            ErrCode::EIO
+        );
+        assert_eq!(
+            fs.extent_all_data_blocks(&inode).unwrap_err().code(),
+            ErrCode::EIO
+        );
+        assert_eq!(
+            fs.extent_all_tree_blocks(&inode).unwrap_err().code(),
+            ErrCode::EIO
+        );
+        assert_eq!(fs.extent_query(&inode, 0).unwrap_err().code(), ErrCode::EIO);
+    }
+
+    #[test]
+    fn rightmost_empty_child_is_rejected_without_underflow() {
+        let fs = make_test_fs(100);
+        let inode = make_read_inode(0, &[]);
+        let node = inode.inode.extent_root();
+        assert_eq!(
+            fs.extent_last_lblock_recursive(&inode, &node, 0)
+                .unwrap_err()
+                .code(),
+            ErrCode::EIO
+        );
+        assert_eq!(fs.extent_next_data_lblock(&inode).unwrap(), 0);
+    }
 
     #[test]
     fn range_edit_trace_is_explicit_bounded_and_deduplicated() {

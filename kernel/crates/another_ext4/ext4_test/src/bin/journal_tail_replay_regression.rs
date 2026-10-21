@@ -1,22 +1,8 @@
-//! Host regression: a disk whose JBD2 log tail is non-empty while the ext4
-//! superblock no longer carries `EXT4_FEATURE_INCOMPAT_RECOVER`.
-//!
-//! Such a state is legal on real hardware: the write that clears RECOVER at
-//! clean shutdown and the write that empties the journal tail of the final
-//! transaction are independent, and a power cut (or host page-cache loss for
-//! a file-backed virtio disk) may persist either one without the other.
-//! Linux jbd2 replays a non-empty log tail regardless of the RECOVER bit;
-//! DragonOS used to fail the mount with EIO, bricking the rootfs.
-//!
-//! Usage:
-//!   journal_tail_replay_regression <image>   mount an existing image
-//!                                           writable and report whether
-//!                                           journal replay succeeded
-//!   journal_tail_replay_regression --craft [image]
-//!                                           build the poisoned state on a
-//!                                           fresh mkfs image, then prove
-//!                                           that a writable mount repairs
-//!                                           it and e2fsck accepts it
+//! Clean ext4 state with a stale nonempty JBD2 tail must discard old
+//! transactions, preserving newer home metadata. Dirty ext4 recovery remains
+//! covered by the journal fault-injection tests.
+//! Run with --craft <private image> to create the state and verify readonly
+//! access, writable discard, permissions and e2fsck consistency.
 
 #[path = "../block_file.rs"]
 #[allow(dead_code)]
@@ -33,7 +19,9 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
         Some("--craft") => craft_and_repair_regression(
-            args.get(2).map(String::as_str).unwrap_or("journal-tail-regression.img"),
+            args.get(2)
+                .map(String::as_str)
+                .unwrap_or("journal-tail-regression.img"),
         ),
         Some(path) => mount_dirty_image(path),
         _ => {
@@ -43,9 +31,7 @@ fn main() {
     }
 }
 
-/// Mount an existing image writable and report whether journal replay made
-/// the mount succeed. This is the direct check against a real dirty disk
-/// captured from a crashed system.
+/// Mount an explicitly supplied image writable using its ext4 recovery state.
 fn mount_dirty_image(path: &str) {
     let device = Arc::new(CrashBlockFile::new(path));
     match Ext4::load_writable(device) {
@@ -54,7 +40,7 @@ fn mount_dirty_image(path: &str) {
                 .getattr(ROOT_INO)
                 .expect("root getattr failed after recovery mount");
             println!(
-                "DIRTY-TAIL MOUNT OK: root ino {ROOT_INO} size {} (journal replayed)",
+                "DIRTY-TAIL MOUNT OK: root ino {ROOT_INO} size {} (journal initialized)",
                 attr.size
             );
         }
@@ -65,19 +51,8 @@ fn mount_dirty_image(path: &str) {
     }
 }
 
-/// Deterministically construct the poisoned on-disk state on a fresh image:
-///
-/// 1. A normal writable session commits a metadata transaction.
-/// 2. The commit's final "empty journal tail" superblock write is turned
-///    into an I/O error, so the durable journal superblock keeps the active
-///    (non-empty) tail while the transaction itself is fully checkpointed.
-/// 3. The ext4 RECOVER feature bit is then cleared with debugfs, modelling
-///    the real-world subset write loss in which the shutdown-time RECOVER
-///    clear survived while the journal tail update did not.
-///
-/// The regression expectation is that a following writable mount replays
-/// the tail (idempotently) instead of failing with EIO, and that e2fsck
-/// accepts the repaired image.
+/// Checkpoint a transaction while failing the clean-tail write, then model a
+/// clean ext4/offline update by clearing RECOVER and changing home permissions.
 fn craft_and_repair_regression(path: &str) {
     let status = Command::new("mkfs.ext4")
         .args([
@@ -98,7 +73,8 @@ fn craft_and_repair_regression(path: &str) {
     // The persistence-operation index of the commit's clean-tail write is
     // found on an identical probe copy, so the armed run replays the same
     // deterministic operation sequence.
-    let probe = "journal-tail-regression-probe.img";
+    let probe_path = format!("{path}.probe");
+    let probe = probe_path.as_str();
     std::fs::copy(path, probe).expect("probe copy failed");
     let tail_write_index = {
         let device = Arc::new(CrashBlockFile::new(probe));
@@ -155,14 +131,39 @@ fn craft_and_repair_regression(path: &str) {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    // Regression expectation: the mount must replay the non-empty tail.
+    // An offline metadata update is newer than this clean filesystem's stale
+    // journal. Wiping must preserve it; replaying would restore the old mode.
+    let output = Command::new("debugfs")
+        .args(["-w", "-R", "set_inode_field / mode 040700", path])
+        .output()
+        .expect("debugfs mode update failed");
+    assert!(output.status.success());
+    let readonly_device = Arc::new(CrashBlockFile::new(path));
+    let readonly = Ext4::load_read_only_checked(readonly_device.clone())
+        .expect("clean ext4 with stale tail must permit readonly access");
+    assert_eq!(
+        readonly.getattr(ROOT_INO).unwrap().perm.bits() & 0o7777,
+        0o700
+    );
+    drop(readonly);
+    assert!(
+        readonly_device.operations().is_empty(),
+        "readonly mount must not write or flush"
+    );
     let device = Arc::new(CrashBlockFile::new(path));
     let fs = Ext4::load_writable(device)
-        .expect("writable mount must replay a non-empty journal tail without RECOVER");
+        .expect("writable mount must discard a stale journal tail without RECOVER");
     let attr = fs
         .getattr(ROOT_INO)
         .expect("root getattr failed after replay mount");
-    println!("POISONED-TAIL REPLAY OK: root size {}", attr.size);
+    assert_eq!(
+        attr.perm.bits() & 0o7777,
+        0o700,
+        "stale journal must not overwrite newer home inode permissions"
+    );
+    println!("STALE-TAIL WIPE OK: root size {}", attr.size);
+    fs.shutdown_writable()
+        .expect("clean shutdown after stale journal discard");
     drop(fs);
 
     let output = Command::new("e2fsck")
@@ -175,5 +176,5 @@ fn craft_and_repair_regression(path: &str) {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    println!("journal tail replay regression done");
+    println!("journal tail discard regression done");
 }

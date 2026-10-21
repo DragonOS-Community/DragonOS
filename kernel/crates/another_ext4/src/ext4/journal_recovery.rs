@@ -48,6 +48,16 @@ enum Pass {
 /// An empty (`s_start == 0`) journal is left untouched. On any error the
 /// journal superblock is not changed, so a later mount can retry recovery.
 pub(super) fn recover<I: JournalRecoveryIo>(io: &I) -> Result<RecoveryStats> {
+    process_journal(io, true)
+}
+
+/// Clean ext4 filesystems must discard old transactions, never replay them.
+/// Scan only to advance the transaction sequence before clearing the tail.
+pub(super) fn discard<I: JournalRecoveryIo>(io: &I) -> Result<()> {
+    process_journal(io, false).map(|_| ())
+}
+
+fn process_journal<I: JournalRecoveryIo>(io: &I, replay: bool) -> Result<RecoveryStats> {
     let mut raw_sb = io.read_journal(0)?;
     if raw_sb.len() != io.block_size() {
         return Err(Ext4Error::new(ErrCode::EIO));
@@ -62,13 +72,12 @@ pub(super) fn recover<I: JournalRecoveryIo>(io: &I) -> Result<RecoveryStats> {
     // 进度日志：脏日志重放可能持续数十秒（取决于日志长度与内容），
     // 启动现场需要区分“慢”与“卡死”。
     log::warn!(
-        "ext4: journal recovery begins: start={}, first={}, max_len={}, sequence={}",
+        "ext4: journal scan begins: start={}, first={}, max_len={}, sequence={}",
         sb.start,
         sb.first,
         sb.max_len,
         sb.sequence
     );
-
 
     let seed = jbd2::checksum_seed(&sb.uuid);
     let end_sequence = walk(
@@ -80,31 +89,33 @@ pub(super) fn recover<I: JournalRecoveryIo>(io: &I) -> Result<RecoveryStats> {
         None,
         &mut RecoveryStats::default(),
     )?;
-    let mut revokes = BTreeMap::<u64, u32>::new();
-    walk(
-        io,
-        &sb,
-        seed,
-        Pass::Revoke,
-        Some(end_sequence),
-        Some(&mut revokes),
-        &mut RecoveryStats::default(),
-    )?;
     let mut stats = RecoveryStats::default();
-    walk(
-        io,
-        &sb,
-        seed,
-        Pass::Replay,
-        Some(end_sequence),
-        Some(&mut revokes),
-        &mut stats,
-    )?;
+    if replay {
+        let mut revokes = BTreeMap::<u64, u32>::new();
+        walk(
+            io,
+            &sb,
+            seed,
+            Pass::Revoke,
+            Some(end_sequence),
+            Some(&mut revokes),
+            &mut RecoveryStats::default(),
+        )?;
+        walk(
+            io,
+            &sb,
+            seed,
+            Pass::Replay,
+            Some(end_sequence),
+            Some(&mut revokes),
+            &mut stats,
+        )?;
 
-    // Linux orders recovered home blocks before invalidating the log. Never
-    // advertise a clean journal if a home write or its durability barrier
-    // failed.
-    io.flush_home()?;
+        // Linux orders recovered home blocks before invalidating the log. Never
+        // advertise a clean journal if a home write or its durability barrier
+        // failed.
+        io.flush_home()?;
+    }
     put_be32(&mut raw_sb, 24, end_sequence.wrapping_add(1))?;
     put_be32(&mut raw_sb, 28, 0)?;
     if sb.features.checksum == ChecksumMode::V3 {
@@ -116,7 +127,8 @@ pub(super) fn recover<I: JournalRecoveryIo>(io: &I) -> Result<RecoveryStats> {
     io.flush_journal()?;
     stats.transactions = end_sequence.wrapping_sub(sb.sequence);
     log::warn!(
-        "ext4: journal recovery done: {} transactions, {} blocks replayed, {} revoke hits",
+        "ext4: journal {} done: {} transactions, {} blocks replayed, {} revoke hits",
+        if replay { "recovery" } else { "discard" },
         stats.transactions,
         stats.replayed,
         stats.revoke_hits
@@ -478,6 +490,31 @@ mod tests {
             journal_physical: 900,
             events: RefCell::new(Vec::new()),
         }
+    }
+
+    #[test]
+    fn discarding_stale_transactions_preserves_newer_home_metadata() {
+        let mut blocks = vec![vec![0; 1024]; 8];
+        blocks[0] = superblock(8, 7, 42);
+        blocks[7] = descriptor(42, 77, false);
+        blocks[1] = vec![0x33; 1024];
+        blocks[2] = commit(42);
+        let io = memory(blocks);
+        io.home.borrow_mut().insert(77, vec![0x77; 1024]);
+        discard(&io).unwrap();
+        assert_eq!(io.home.borrow()[&77], vec![0x77; 1024]);
+        assert_eq!(&*io.events.borrow(), &["journal-write", "journal-flush"]);
+        assert_eq!(be32(&io.journal.borrow()[0], 28).unwrap(), 0);
+        assert_eq!(be32(&io.journal.borrow()[0], 24).unwrap(), 44);
+    }
+
+    #[test]
+    fn discarding_an_empty_journal_does_not_write() {
+        let mut blocks = vec![vec![0; 1024]; 8];
+        blocks[0] = superblock(8, 0, 42);
+        let io = memory(blocks);
+        discard(&io).unwrap();
+        assert!(io.events.borrow().is_empty());
     }
 
     #[test]

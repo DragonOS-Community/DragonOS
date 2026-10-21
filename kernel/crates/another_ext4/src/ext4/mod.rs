@@ -861,7 +861,6 @@ impl Ext4 {
         if sb.last_orphan() != 0
             || sb.has_read_only_compatible_feature(SuperBlock::FEATURE_RO_COMPAT_ORPHAN_PRESENT)
             || sb.has_incompatible_feature(SuperBlock::FEATURE_INCOMPAT_RECOVER)
-            || Self::journal_tail_is_dirty(&fs, &sb)?
         {
             return_error!(
                 ErrCode::EROFS,
@@ -869,29 +868,6 @@ impl Ext4 {
             );
         }
         Ok(fs)
-    }
-
-    /// 只读探测 JBD2 日志尾是否非空。
-    ///
-    /// 与 Linux 一致，RECOVER 特性位只是提示，日志尾本身才是“存在待重放
-    /// 事务”的权威依据。只读挂载不能重放日志，因此必须以 EROFS 拒绝，而不
-    /// 是静默呈现过期的元数据。
-    fn journal_tail_is_dirty(fs: &Self, sb: &SuperBlock) -> Result<bool> {
-        if !sb.has_compatible_feature(SuperBlock::FEATURE_COMPAT_HAS_JOURNAL)
-            || sb.journal_inode_number() == 0
-        {
-            return Ok(false);
-        }
-        let journal_inode = fs.read_inode_uncached(sb.journal_inode_number())?;
-        let journal_zero = fs.extent_query(&journal_inode, 0)?;
-        if journal_zero == 0 || journal_zero >= sb.block_count() {
-            // 无法定位日志超块的畸形日志交由可写挂载路径做完整校验。
-            return Ok(false);
-        }
-        let raw_journal_sb = fs.block_device.read_block(journal_zero)?;
-        let journal_sb =
-            crate::jbd2::Superblock::parse(&raw_journal_sb.data[..], BLOCK_SIZE as u32)?;
-        Ok(journal_sb.start != 0)
     }
 
     pub fn load_writable_with_options(

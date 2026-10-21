@@ -244,6 +244,10 @@ impl NftRule {
                     RuleResult::Continue => {}
                     other => return other,
                 },
+                NftExpression::XtUdp(udp) => match udp.evaluate(packet) {
+                    RuleResult::Continue => {}
+                    other => return other,
+                },
                 NftExpression::XtAddrtype(matcher) => match matcher.evaluate(context) {
                     Some(true) => {}
                     Some(false) => return RuleResult::Break,
@@ -705,6 +709,7 @@ pub(crate) enum NftExpressionInput<'a> {
         invert: bool,
     },
     XtTcp(&'a [u8]),
+    XtUdp(&'a [u8]),
     XtAddrtype(&'a [u8]),
     XtConntrack {
         revision: u32,
@@ -823,6 +828,7 @@ pub(crate) enum NftExpression {
         invert: bool,
     },
     XtTcp(NftXtTcp),
+    XtUdp(NftXtUdp),
     XtAddrtype(NftXtAddrtype),
     XtConntrack(NftXtConntrack),
     CtState {
@@ -1170,6 +1176,151 @@ impl NftXtTcp {
             }
         }
         RuleResult::Continue
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct NftXtUdp {
+    source_ports: [u16; 2],
+    dest_ports: [u16; 2],
+    invert: u8,
+}
+
+impl NftXtUdp {
+    pub(super) fn from_info(info: &[u8]) -> Result<Self, SystemError> {
+        // xt_check_match compares XT_ALIGN(user length) with the aligned
+        // 10-byte xt_udp matchsize: any length from the 10-byte struct up to
+        // the NLA-padded tail is accepted, like Linux's aligned compare.
+        // Its four port bounds are host-endian, like xt_tcp's.
+        if !(10..=16).contains(&info.len()) {
+            return Err(SystemError::EINVAL);
+        }
+        if info[8] & !0x03 != 0 {
+            return Err(SystemError::EINVAL);
+        }
+        let port = |index| u16::from_ne_bytes([info[index], info[index + 1]]);
+        Ok(Self {
+            source_ports: [port(0), port(2)],
+            dest_ports: [port(4), port(6)],
+            invert: info[8],
+        })
+    }
+
+    pub(crate) fn info(&self) -> [u8; 16] {
+        let mut info = [0u8; 16];
+        for (index, port) in self
+            .source_ports
+            .iter()
+            .chain(self.dest_ports.iter())
+            .enumerate()
+        {
+            info[index * 2..index * 2 + 2].copy_from_slice(&port.to_ne_bytes());
+        }
+        info[8] = self.invert;
+        info
+    }
+
+    fn evaluate(&self, packet: &[u8]) -> RuleResult {
+        let Some(first) = packet.first() else {
+            return RuleResult::Break;
+        };
+        let header_len = usize::from(first & 0x0f) * 4;
+        if first >> 4 != 4 || header_len < 20 || packet.len() < header_len {
+            return RuleResult::Break;
+        }
+        let total_len = u16::from_be_bytes([packet[2], packet[3]]) as usize;
+        if total_len < header_len || total_len > packet.len() {
+            return RuleResult::Break;
+        }
+        let packet = &packet[..total_len];
+        let Some(fragment_bytes) = packet.get(6..8) else {
+            return RuleResult::Break;
+        };
+        let fragment = u16::from_be_bytes(fragment_bytes.try_into().unwrap()) & 0x1fff;
+        if fragment != 0 {
+            return RuleResult::Break;
+        }
+        let Some(udp) = packet.get(header_len..header_len + 8) else {
+            return RuleResult::Verdict(NftRuleVerdict::Drop);
+        };
+        for (offset, range, invert) in [
+            (0, self.source_ports, self.invert & 0x01 != 0),
+            (2, self.dest_ports, self.invert & 0x02 != 0),
+        ] {
+            let port = u16::from_be_bytes([udp[offset], udp[offset + 1]]);
+            if !((range[0] <= port && port <= range[1]) ^ invert) {
+                return RuleResult::Break;
+            }
+        }
+        RuleResult::Continue
+    }
+}
+
+#[cfg(test)]
+mod xt_udp_tests {
+    use super::*;
+
+    fn matcher() -> NftXtUdp {
+        let mut info = [0u8; 16];
+        info[2..4].copy_from_slice(&u16::MAX.to_ne_bytes());
+        info[4..6].copy_from_slice(&53u16.to_ne_bytes());
+        info[6..8].copy_from_slice(&53u16.to_ne_bytes());
+        NftXtUdp::from_info(&info).unwrap()
+    }
+
+    fn packet(fragment: u16, port: u16, length: usize) -> Vec<u8> {
+        let mut bytes = vec![0u8; length];
+        bytes[0] = 0x45;
+        bytes[2..4].copy_from_slice(&(length as u16).to_be_bytes());
+        bytes[6..8].copy_from_slice(&fragment.to_be_bytes());
+        bytes[9] = 17;
+        if length >= 24 {
+            bytes[22..24].copy_from_slice(&port.to_be_bytes());
+        }
+        bytes
+    }
+
+    #[test]
+    fn nonfirst_fragments_break_without_hotdrop() {
+        for offset in [1, 2, 8191] {
+            assert!(matches!(
+                matcher().evaluate(&packet(offset, 53, 28)),
+                RuleResult::Break
+            ));
+        }
+        assert!(matches!(
+            matcher().evaluate(&packet(0x2000, 53, 28)),
+            RuleResult::Continue
+        ));
+        assert!(matches!(
+            matcher().evaluate(&packet(0, 54, 28)),
+            RuleResult::Break
+        ));
+        assert!(matches!(
+            matcher().evaluate(&packet(0, 53, 24)),
+            RuleResult::Verdict(NftRuleVerdict::Drop)
+        ));
+        let mut inverted = matcher();
+        inverted.invert = 2;
+        assert!(matches!(
+            inverted.evaluate(&packet(0, 54, 28)),
+            RuleResult::Continue
+        ));
+        assert!(matches!(
+            inverted.evaluate(&packet(0, 53, 28)),
+            RuleResult::Break
+        ));
+    }
+
+    #[test]
+    fn match_info_respects_struct_and_aligned_size() {
+        assert!(NftXtUdp::from_info(&[0; 9]).is_err());
+        assert!(NftXtUdp::from_info(&[0; 10]).is_ok());
+        assert!(NftXtUdp::from_info(&[0; 16]).is_ok());
+        assert!(NftXtUdp::from_info(&[0; 17]).is_err());
+        let mut bad = [0; 16];
+        bad[8] = 4;
+        assert!(NftXtUdp::from_info(&bad).is_err());
     }
 }
 

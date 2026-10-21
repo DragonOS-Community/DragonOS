@@ -331,6 +331,16 @@ pub(super) fn xt_tcp_compatible(compat: Option<&[u8]>) -> Result<(), SystemError
     Ok(())
 }
 
+pub(super) fn xt_udp_compatible(compat: Option<&[u8]>) -> Result<(), SystemError> {
+    // nft_compat pairs an l4 match with the rule's declared protocol; the
+    // udp match requires IPPROTO_UDP without inversion.
+    let (proto, flags) = xt_compat_fields(compat)?;
+    if flags != 0 || proto != 17 {
+        return Err(SystemError::EINVAL);
+    }
+    Ok(())
+}
+
 pub(super) fn xt_addrtype_compatible(compat: Option<&[u8]>) -> Result<(), SystemError> {
     // nft_compat defaults these validation-only fields to zero when the
     // optional rule attribute is absent. addrtype itself is not L4-specific.
@@ -411,6 +421,7 @@ fn xt_match(bytes: &[u8]) -> Result<NftExpressionInput<'_>, SystemError> {
     let (name, revision, info) = xt_extension(bytes)?;
     match (name, revision) {
         (b"tcp", 0) => Ok(NftExpressionInput::XtTcp(info)),
+        (b"udp", 0) => Ok(NftExpressionInput::XtUdp(info)),
         (b"addrtype", 1) => Ok(NftExpressionInput::XtAddrtype(info)),
         (b"conntrack", 1..=3) => Ok(NftExpressionInput::XtConntrack { revision, info }),
         _ => Err(SystemError::ENOENT),
@@ -1254,6 +1265,29 @@ mod expression_decoder_tests {
             _ => panic!("valid target expression was not decoded"),
         }
     }
+
+    #[test]
+    fn udp_match_decodes_and_rejects_bad_revision_or_inverse_flags() {
+        // xt_udp: spts, dpts host-endian, invflags; ports 53..53.
+        let mut info = Vec::new();
+        info.extend_from_slice(&[0, 0, 0xff, 0xff]); // spts 0..65535
+        info.extend_from_slice(&53u16.to_ne_bytes());
+        info.extend_from_slice(&53u16.to_ne_bytes()); // dpts 53..53
+        info.push(0); // invflags
+        info.resize(12, 0); // XT_ALIGN(sizeof(xt_udp)) padding
+        let mut data = Vec::new();
+        append_attr(&mut data, MATCH_NAME, b"udp\0").unwrap();
+        append_attr(&mut data, MATCH_REV, &0u32.to_be_bytes()).unwrap();
+        append_attr(&mut data, MATCH_INFO, &info).unwrap();
+        assert!(matches!(xt_match(&data), Ok(NftExpressionInput::XtUdp(_))));
+
+        // An unknown revision keeps the compat lookup ENOENT contract.
+        let mut revised = Vec::new();
+        append_attr(&mut revised, MATCH_NAME, b"udp\0").unwrap();
+        append_attr(&mut revised, MATCH_REV, &1u32.to_be_bytes()).unwrap();
+        append_attr(&mut revised, MATCH_INFO, &info).unwrap();
+        assert!(matches!(xt_match(&revised), Err(SystemError::ENOENT)));
+    }
 }
 
 pub(super) fn rule_attrs<'a>(request: &'a Request<'_>) -> Result<RuleAttrs<'a>, SystemError> {
@@ -1549,10 +1583,12 @@ pub(super) fn compat_match_reply(
         b"MASQUERADE" | b"DNAT" | b"SNAT" if kind == 1 => return Err(SystemError::EPROTONOSUPPORT),
         _ if kind == 1 => return Err(SystemError::ENOENT),
         b"tcp" if revision == 0 && family == 2 => b"tcp\0",
+        b"udp" if revision == 0 && family == 2 => b"udp\0",
         b"addrtype" if revision == 1 => b"addrtype\0",
         b"conntrack" if (1..=3).contains(&revision) => b"conntrack\0",
         b"tcp" if family == 10 => return Err(SystemError::ENOENT),
-        b"tcp" | b"addrtype" | b"conntrack" => {
+        b"udp" if family == 10 => return Err(SystemError::ENOENT),
+        b"tcp" | b"udp" | b"addrtype" | b"conntrack" => {
             return Err(SystemError::EPROTONOSUPPORT);
         }
         _ => return Err(SystemError::ENOENT),
@@ -2248,6 +2284,12 @@ pub(super) fn rule_message(
                 append_attr(&mut data, MATCH_NAME, b"tcp\0")?;
                 append_attr(&mut data, MATCH_REV, &0u32.to_be_bytes())?;
                 append_attr(&mut data, MATCH_INFO, &tcp.info())?;
+                b"match\0"
+            }
+            NftExpression::XtUdp(udp) => {
+                append_attr(&mut data, MATCH_NAME, b"udp\0")?;
+                append_attr(&mut data, MATCH_REV, &0u32.to_be_bytes())?;
+                append_attr(&mut data, MATCH_INFO, &udp.info())?;
                 b"match\0"
             }
             NftExpression::XtAddrtype(matcher) => {
